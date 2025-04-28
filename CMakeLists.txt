@@ -1,0 +1,47 @@
+cmake_minimum_required(VERSION 3.19)
+
+set(CMAKE_CXX_FLAGS_DEBUG "-O1")
+set(CMAKE_CXX_FLAGS_DEBUG "-g")
+set(CMAKE_CXX_FLAGS_RELEASE "-O1")
+
+set(CMAKE_BUILD_TYPE Debug)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+option(USE_ROCM "Whether to use rocm" ON)
+option(BUILD_EXAMPLES "Whether to build examples" OFF)
+option(BUILD_APPLICATION "Whether to build application library" OFF)
+
+if (USE_ROCM)
+    set(CMAKE_PREFIX_PATH /opt/rocm)
+    project(
+        mori
+        LANGUAGES HIP CXX C
+    )
+    find_package(hip REQUIRED)
+else()
+    set(CUDA_HOME /usr/local/cuda)
+    message(STATUS "CUDA_HOME: ${CUDA_HOME}")
+    set(CUDAToolkit_Root ${CUDA_HOME} CACHE PATH "Root of Cuda Toolkit." FORCE)
+    set(CMAKE_CUDA_COMPILER "${CUDA_HOME}/bin/nvcc" CACHE PATH "Root of Cuda Toolkit." FORCE)
+    set(CMAKE_CUDA_FLAGS "--generate-code=arch=compute_70,code=[sm_70] --generate-code=arch=compute_80,code=[sm_80]")
+    message(STATUS "CMAKE_CUDA_ARCHITECTURES: ${CMAKE_CUDA_ARCHITECTURES}")
+
+    project(
+        mori
+        LANGUAGES CUDA CXX C
+    )
+    find_package(CUDAToolkit REQUIRED)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -expt-relaxed-constexpr")
+endif()
+
+if (BUILD_EXAMPLES)
+    SET(BUILD_APPLICATION ON)
+endif()
+
+if (BUILD_APPLICATION)
+    add_subdirectory(src/application)
+endif()
+
+if (BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif()
