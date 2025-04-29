@@ -1,7 +1,10 @@
 #pragma once
 
+#include <unistd.h>
+
 #include <cassert>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -18,28 +21,33 @@ enum RdmaDeviceVendorId {
   // Broadcom =
 };
 
+#define PAGESIZE uint32_t(sysconf(_SC_PAGE_SIZE))
+
 // TODO: set defalut values
 struct RdmaEndpointConfig {
-  size_t sq_max_wqe_num;
-  size_t rq_max_wqe_num;
-  size_t max_cqe_num;
-  size_t alignment;
+  uint32_t port_id{1};
+  uint32_t gid_index{1};  // TODO: auto detect?
+  uint32_t max_recv_sge{128};
+  uint32_t max_msgs_num{128};
+  uint32_t max_cqe_num{128};
+  uint32_t alignment{PAGESIZE};
 };
 
 struct InfiniBandEndpointHandle {
-  uint32_t qpn;
   uint32_t lid;
 };
 
 struct EthernetEndpointHandle {
-  char gid[16];
-  char mac[ETHERNET_LL_SIZE];
+  uint8_t gid[16];
+  uint8_t mac[ETHERNET_LL_SIZE];
 };
 
+// TODO: add gid type
 struct RdmaEndpointHandle {
   uint32_t psn;
-  struct InfiniBandEndpointHandle;
-  struct EthernetEndpointHandle;
+  uint32_t qpn;
+  struct InfiniBandEndpointHandle ib;
+  struct EthernetEndpointHandle eth;
 };
 
 struct RdmaEndpoint {
@@ -56,7 +64,11 @@ class RdmaDeviceContext {
   virtual void RegisterMemoryRegion(void* ptr, size_t size, int access_flag);
   virtual void DeRegisterMemoryRegion(void* ptr);
 
+  // TODO: query gid entry by ibv_query_gid_table
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) {
+    assert(false && "not implementd");
+  }
+  virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote) {
     assert(false && "not implementd");
   }
 
@@ -115,3 +127,22 @@ class RdmaContext {
 }  // namespace transport
 }  // namespace application
 }  // namespace mori
+
+namespace std {
+
+static std::ostream& operator<<(
+    std::ostream& s, const mori::application::transport::rdma::EthernetEndpointHandle handle) {
+  std::stringstream ss;
+  ss << "gid: " << std::hex;
+  for (int i = 0; i < sizeof(handle.gid); i++) {
+    ss << int(handle.gid[i]);
+  }
+  ss << ", mac: " << std::hex;
+  for (int i = 0; i < sizeof(handle.mac); i++) {
+    ss << int(handle.mac[i]);
+  }
+  s << ss.str();
+  return s;
+}
+
+}  // namespace std
