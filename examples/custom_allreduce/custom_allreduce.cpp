@@ -1,56 +1,143 @@
+#include <hip/hip_runtime.h>
+
 #include "mori/application/application.hpp"
+#include "mori/application/utils/udma_barrier.h"
+#include "mori/core/transport/ibgda/ibgda.hpp"
 
 using namespace mori;
 using namespace mori::application;
+using namespace mori::core::transport;
 
-__global__ void AllReduceOverRdmaKernel() {}
+#define MR_ACCESS_FLAG                                                        \
+  IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | \
+      IBV_ACCESS_REMOTE_ATOMIC
+
+struct AllReduceParams {
+  size_t allreduce_size;
+  int local_rank{0};
+  int world_size{0};
+  ibgda::QueuePairHandle qp;
+  ibgda::MemoryRegion* mrs{nullptr};
+  ibgda::CompletionQueueHandle cq;
+};
+
+__global__ void AllReduceOverRdmaKernel(AllReduceParams params) {
+  int local_rank = params.local_rank;
+
+  for (int i = 0; i < params.world_size; i++) {
+    if (i == local_rank) continue;
+    ibgda::IbgdaWriteReq wreq;
+    wreq.qp_handle = params.qp;
+    wreq.local_mr = params.mrs[local_rank];
+    wreq.remote_mr = params.mrs[i];
+    wreq.bytes_count = params.allreduce_size;
+
+    uint64_t dbr_val = ibgda::PostWrite<ibgda::ProviderType::MLX5>(wreq);
+    ibgda::UpdateSendDbrRecord<ibgda::ProviderType::MLX5>(params.qp.dbr_rec_addr,
+                                                          params.qp.post_idx);
+    ibgda::RingDoorbell<ibgda::ProviderType::MLX5>(params.qp.dbr_addr, dbr_val);
+    int opcode = ibgda::PoolCq<ibgda::ProviderType::MLX5>(params.cq);
+  }
+}
+
+void AllReduceOverRdmaCpu(AllReduceParams params) {
+  int local_rank = params.local_rank;
+
+  for (int i = 0; i < params.world_size; i++) {
+    if (i == local_rank) continue;
+    ibgda::IbgdaWriteReq wreq;
+    wreq.qp_handle = params.qp;
+    wreq.local_mr = params.mrs[local_rank];
+    wreq.remote_mr = params.mrs[i];
+    wreq.bytes_count = params.allreduce_size;
+
+    uint64_t dbr_val = ibgda::PostWrite<ibgda::ProviderType::MLX5>(wreq);
+    udma_to_device_barrier();
+    ibgda::UpdateSendDbrRecord<ibgda::ProviderType::MLX5>(params.qp.dbr_rec_addr,
+                                                          params.qp.post_idx);
+    udma_to_device_barrier();
+    ibgda::RingDoorbell<ibgda::ProviderType::MLX5>(params.qp.dbr_addr, dbr_val);
+    int opcode = ibgda::PoolCq<ibgda::ProviderType::MLX5>(params.cq);
+  }
+}
 
 void AllReduceOverRdma() {
   MpiBootstrapNetwork bootstrap_net;
   bootstrap_net.Initialize();
 
+  bool on_gpu = true;
+  int allreduce_size = 1024;
   int local_rank = bootstrap_net.GetLocalRank();
   int world_size = bootstrap_net.GetWorldSize();
-  std::cout << "Local Rank: " << local_rank << std::endl;
-  std::cout << "World Size: " << world_size << std::endl;
 
   // RDMA initialization
   // 1 Create device
   transport::rdma::RdmaContext rdma_context;
   transport::rdma::RdmaDeviceList rdma_devices = rdma_context.GetRdmaDeviceList();
-  transport::rdma::RdmaDevice* device_0 = rdma_devices[0];
-
-  // 2 Register buffer
-  void* mem = malloc(1024);
+  transport::rdma::RdmaDevice* device_0 = rdma_devices[1];
   transport::rdma::RdmaDeviceContext* device_0_context = device_0->CreateRdmaDeviceContext();
-  device_0_context->RegisterMemoryRegion(mem, 1024,
-                                         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-                                             IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
 
-  // 3 Create an endpoint
+  // 2 Create an endpoint
   transport::rdma::RdmaEndpointConfig config;
   config.port_id = 1;
   config.gid_index = 1;
-  config.max_msgs_num = 16;
-  config.max_recv_sge = 16;
-  config.max_cqe_num = 16;
+  config.max_msgs_num = 1;
+  config.max_recv_sge = 1;
+  config.max_cqe_num = 256;
   config.alignment = 4096;
-  transport::rdma::RdmaEndpoint endpoint = device_0_context->CreateRdmaEndpoint(config);
+  config.on_gpu = on_gpu;
+  transport::rdma::RdmaEndpoint local_endpoint = device_0_context->CreateRdmaEndpoint(config);
 
-  // 4 Allgather global endpoint
+  // 3 Allgather global endpoint and connect
   transport::rdma::RdmaEndpointHandle global_rdma_ep_handles[world_size];
-  bootstrap_net.Allgather(&endpoint.handle, global_rdma_ep_handles, sizeof(endpoint.handle));
+  bootstrap_net.Allgather(&local_endpoint.handle, global_rdma_ep_handles,
+                          sizeof(local_endpoint.handle));
 
-  printf("Rank %d ready to connect, qpn %d\n", local_rank, endpoint.handle.qpn);
+  std::cout << "Local rank " << local_rank << " " << local_endpoint.handle << std::endl;
+
   for (int i = 0; i < world_size; i++) {
     if (i == local_rank) continue;
-    device_0_context->ConnectEndpoint(endpoint.handle, global_rdma_ep_handles[i]);
+    device_0_context->ConnectEndpoint(local_endpoint.handle, global_rdma_ep_handles[i]);
+    std::cout << "Local rank " << local_rank << " received " << global_rdma_ep_handles[i]
+              << std::endl;
   }
 
-  device_0_context->DeRegisterMemoryRegion(mem);
+  // 4 Register buffer
+  void* buffer;
+  HIP_RUNTIME_CHECK(hipMalloc(&buffer, allreduce_size));
+  ibgda::MemoryRegion local_mr_handle =
+      device_0_context->RegisterMemoryRegion(buffer, allreduce_size, MR_ACCESS_FLAG);
+
+  ibgda::MemoryRegion global_mr_handles[world_size];
+  bootstrap_net.Allgather(&local_mr_handle, global_mr_handles, sizeof(local_mr_handle));
+  global_mr_handles[local_rank] = local_mr_handle;
 
   // 5 Prepare kernel argument
+  AllReduceParams params;
+  params.local_rank = local_rank;
+  params.world_size = world_size;
+  params.qp.qpn = local_endpoint.handle.qpn;
+  params.qp.post_idx = 0;
+  params.qp.next_wqe_addr = local_endpoint.wq_handle.sq_addr;
+  params.qp.dbr_rec_addr = local_endpoint.wq_handle.dbr_rec_addr;
+  params.qp.dbr_addr = local_endpoint.wq_handle.dbr_addr;
+  HIP_RUNTIME_CHECK(hipMalloc(&params.mrs, sizeof(global_mr_handles)));
+  HIP_RUNTIME_CHECK(
+      hipMemcpy(params.mrs, global_mr_handles, sizeof(global_mr_handles), hipMemcpyHostToDevice));
+  params.cq = local_endpoint.cq_handle;
 
+  // 6 Launch kernel
+  if (on_gpu) {
+    AllReduceOverRdmaKernel<<<1, 1>>>(params);
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  } else {
+    AllReduceOverRdmaCpu(params);
+  }
+
+  // 7 Check correctness
+
+  // 8 Finalize
+  device_0_context->DeRegisterMemoryRegion(buffer);
   bootstrap_net.Finalize();
 }
 

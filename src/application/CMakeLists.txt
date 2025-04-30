@@ -10,4 +10,4 @@ add_library(
 
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(mori_application MPI::MPI_CXX ibverbs hip::host mlx5)
+target_link_libraries(mori_application MPI::MPI_CXX ibverbs hip::host hip::device mlx5)

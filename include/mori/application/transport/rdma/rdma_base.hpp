@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "infiniband/verbs.h"
+#include "mori/core/transport/ibgda/ibgda.hpp"
 
 namespace mori {
 namespace application {
@@ -31,10 +32,11 @@ struct RdmaEndpointConfig {
   uint32_t max_msgs_num{128};
   uint32_t max_cqe_num{128};
   uint32_t alignment{PAGESIZE};
+  bool on_gpu{false};
 };
 
 struct InfiniBandEndpointHandle {
-  uint32_t lid;
+  uint32_t lid{0};
 };
 
 struct EthernetEndpointHandle {
@@ -44,14 +46,23 @@ struct EthernetEndpointHandle {
 
 // TODO: add gid type
 struct RdmaEndpointHandle {
-  uint32_t psn;
-  uint32_t qpn;
+  uint32_t psn{0};
+  uint32_t qpn{0};
   struct InfiniBandEndpointHandle ib;
   struct EthernetEndpointHandle eth;
 };
 
+struct WorkQueueHandle {
+  void* sq_addr{nullptr};
+  void* rq_addr{nullptr};
+  void* dbr_rec_addr{nullptr};
+  void* dbr_addr{nullptr};
+};
+
 struct RdmaEndpoint {
   RdmaEndpointHandle handle;
+  WorkQueueHandle wq_handle;
+  core::transport::ibgda::CompletionQueueHandle cq_handle;
 };
 
 class RdmaDevice;
@@ -61,7 +72,8 @@ class RdmaDeviceContext {
   RdmaDeviceContext(RdmaDevice* rdma_device, ibv_pd* in_pd);
   ~RdmaDeviceContext();
 
-  virtual void RegisterMemoryRegion(void* ptr, size_t size, int access_flag);
+  virtual core::transport::ibgda::MemoryRegion RegisterMemoryRegion(void* ptr, size_t size,
+                                                                    int access_flag);
   virtual void DeRegisterMemoryRegion(void* ptr);
 
   // TODO: query gid entry by ibv_query_gid_table
@@ -141,6 +153,14 @@ static std::ostream& operator<<(
   for (int i = 0; i < sizeof(handle.mac); i++) {
     ss << int(handle.mac[i]);
   }
+  s << ss.str();
+  return s;
+}
+
+static std::ostream& operator<<(
+    std::ostream& s, const mori::application::transport::rdma::RdmaEndpointHandle handle) {
+  std::stringstream ss;
+  ss << "psn: " << handle.psn << " qpn: " << handle.qpn;
   s << ss.str();
   return s;
 }

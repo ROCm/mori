@@ -23,8 +23,8 @@ static size_t GetMlx5SqWqeSize() {
 static size_t GetMlx5RqWqeSize() { return sizeof(mlx5_wqe_data_seg); }
 
 struct HcaCapability {
-  uint32_t port_type;
-  uint32_t dbr_reg_size;
+  uint32_t port_type{0};
+  uint32_t dbr_reg_size{0};
 
   bool IsEthernet() const { return port_type == MLX5_CAP_PORT_TYPE_ETH; }
   bool IsInfiniBand() const { return port_type == MLX5_CAP_PORT_TYPE_IB; }
@@ -40,6 +40,10 @@ class Mlx5CqContainer {
  public:
   Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig& config);
   ~Mlx5CqContainer();
+
+ public:
+  RdmaEndpointConfig config;
+  uint32_t cqe_num;
 
  public:
   uint32_t cqn{0};
@@ -70,6 +74,9 @@ class Mlx5QpContainer {
   void ModifyRst2Init();
   void ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle);
   void ModifyRtr2Rts(const RdmaEndpointHandle& local_handle);
+
+  void* GetSqAddress();
+  void* GetRqAddress();
 
  private:
   void ComputeQueueAttrs(const RdmaEndpointConfig& config);
@@ -111,8 +118,11 @@ class Mlx5DeviceContext : public RdmaDeviceContext {
  private:
   uint32_t pdn;
 
-  std::unordered_map<uint32_t, std::unique_ptr<Mlx5CqContainer>> cq_pool;
-  std::unordered_map<uint32_t, std::unique_ptr<Mlx5QpContainer>> qp_pool;
+  // std::unordered_map<uint32_t, std::unique_ptr<Mlx5CqContainer>> cq_pool;
+  // std::unordered_map<uint32_t, std::unique_ptr<Mlx5QpContainer>> qp_pool;
+
+  std::unordered_map<uint32_t, Mlx5CqContainer*> cq_pool;
+  std::unordered_map<uint32_t, Mlx5QpContainer*> qp_pool;
 };
 
 class Mlx5Device : public RdmaDevice {
@@ -127,3 +137,17 @@ class Mlx5Device : public RdmaDevice {
 }  // namespace transport
 }  // namespace application
 }  // namespace mori
+
+namespace std {
+
+static std::ostream& operator<<(std::ostream& s,
+                                const mori::application::transport::rdma::WorkQueueAttrs wq_attrs) {
+  std::stringstream ss;
+  ss << "wqe_num: " << wq_attrs.wqe_num << " wqe_size: " << wq_attrs.wqe_size
+     << " wq_size: " << wq_attrs.wq_size << " post_idx: " << wq_attrs.post_idx
+     << " wqe_shift: " << wq_attrs.wqe_shift << " offset: " << wq_attrs.offset;
+  s << ss.str();
+  return s;
+}
+
+}  // namespace std
