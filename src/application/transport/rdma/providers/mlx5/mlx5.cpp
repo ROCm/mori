@@ -137,8 +137,8 @@ Mlx5QpContainer::Mlx5QpContainer(ibv_context* context, const RdmaEndpointConfig&
 Mlx5QpContainer::~Mlx5QpContainer() { DestroyQueuePair(); }
 
 void Mlx5QpContainer::ComputeQueueAttrs(const RdmaEndpointConfig& config) {
-  // Receive queue attributes
-  rq_attrs.wqe_size = RoundUpPowOfTwo(GetMlx5RqWqeSize() * config.max_recv_sge);
+  // Receive queue attributes//
+  rq_attrs.wqe_size = GetMlx5RqWqeSize();
   uint32_t max_msgs_num = RoundUpPowOfTwo(config.max_msgs_num);
   rq_attrs.wq_size = std::max(rq_attrs.wqe_size * max_msgs_num, uint32_t(MLX5_SEND_WQE_BB));
   rq_attrs.wqe_num = ceil(rq_attrs.wq_size / rq_attrs.wqe_size);
@@ -407,11 +407,14 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   endpoint.wq_handle.rq_addr = qp->GetRqAddress();
   endpoint.wq_handle.dbr_rec_addr = qp->qp_dbr_umem_addr;
   endpoint.wq_handle.dbr_addr = qp->qp_uar_ptr;
+  endpoint.wq_handle.sq_wqe_num = qp->sq_attrs.wqe_num;
+  endpoint.wq_handle.rq_wqe_num = qp->rq_attrs.wqe_num;
 
   endpoint.cq_handle.cq_addr = cq->cq_umem_addr;
   endpoint.cq_handle.consumer_idx = 0;
   endpoint.cq_handle.cqe_num = cq->cqe_num;
   endpoint.cq_handle.cqe_size = GetMlx5CqeSize();
+  endpoint.cq_handle.dbr_rec_addr = cq->cq_dbr_umem_addr;
 
   // cq_pool.insert({cq->cqn, std::move(std::unique_ptr<Mlx5CqContainer>(cq))});
   // qp_pool.insert({qp->qpn, std::move(std::unique_ptr<Mlx5QpContainer>(qp))});

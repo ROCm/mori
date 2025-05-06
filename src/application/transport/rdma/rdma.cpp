@@ -25,8 +25,9 @@ ibv_context* RdmaDeviceContext::GetIbvContext() { return GetRdmaDevice()->defaul
 core::transport::ibgda::MemoryRegion RdmaDeviceContext::RegisterMemoryRegion(void* ptr, size_t size,
                                                                              int access_flag) {
   ibv_mr* mr = ibv_reg_mr(pd, ptr, size, access_flag);
+  mr_pool.insert({ptr, mr});
   core::transport::ibgda::MemoryRegion handle;
-  handle.addr = reinterpret_cast<uintptr_t>(handle.addr);
+  handle.addr = reinterpret_cast<uintptr_t>(ptr);
   handle.lkey = mr->lkey;
   handle.rkey = mr->rkey;
   handle.length = mr->length;

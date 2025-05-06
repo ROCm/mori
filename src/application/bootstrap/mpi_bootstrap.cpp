@@ -25,5 +25,10 @@ void MpiBootstrapNetwork::Allgather(void* sendbuf, void* recvbuf, size_t sendcou
   assert(!status);
 }
 
+void MpiBootstrapNetwork::Barrier() {
+  int status = MPI_Barrier(MPI_COMM_WORLD);
+  assert(!status);
+}
+
 }  // namespace application
 }  // namespace mori

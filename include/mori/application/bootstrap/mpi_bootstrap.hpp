@@ -16,6 +16,7 @@ class MpiBootstrapNetwork : public BootstrapNetwork {
   void Finalize();
 
   void Allgather(void* sendbuf, void* recvbuf, size_t sendcount);
+  void Barrier();
 };
 
 }  // namespace application

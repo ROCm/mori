@@ -11,10 +11,16 @@ namespace ibgda {
 /* ---------------------------------------------------------------------------------------------- */
 
 template <ProviderType PrvdType>
-static __device__ uint64_t PostWrite(const IbgdaWriteReq& req);
+static __device__ uint64_t PostSend(IbgdaReadWriteReq& req);
 
-// template <ProviderType PrvdType>
-// static __device__ void PostRead(const IbgdaWriteReq& req);
+template <ProviderType PrvdType>
+static __device__ void PostRecv(IbgdaReadWriteReq& req);
+
+template <ProviderType PrvdType>
+static __device__ uint64_t PostWrite(IbgdaReadWriteReq& req);
+
+template <ProviderType PrvdType>
+static __device__ uint64_t PostRead(IbgdaReadWriteReq& req);
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Doorbell                                            */
@@ -36,6 +42,9 @@ static __device__ int PollCqOnce(CompletionQueueHandle cq);
 
 template <ProviderType PrvdType>
 static __device__ int PoolCq(CompletionQueueHandle cq);
+
+template <ProviderType PrvdType>
+static __device__ void UpdateCqDbrRecord(void* dbr_rec_addr, uint32_t cons_idx);
 
 }  // namespace ibgda
 }  // namespace transport

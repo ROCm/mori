@@ -28,7 +28,6 @@ enum RdmaDeviceVendorId {
 struct RdmaEndpointConfig {
   uint32_t port_id{1};
   uint32_t gid_index{1};  // TODO: auto detect?
-  uint32_t max_recv_sge{128};
   uint32_t max_msgs_num{128};
   uint32_t max_cqe_num{128};
   uint32_t alignment{PAGESIZE};
@@ -57,6 +56,8 @@ struct WorkQueueHandle {
   void* rq_addr{nullptr};
   void* dbr_rec_addr{nullptr};
   void* dbr_addr{nullptr};
+  uint32_t sq_wqe_num{0};
+  uint32_t rq_wqe_num{0};
 };
 
 struct RdmaEndpoint {

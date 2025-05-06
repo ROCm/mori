@@ -46,7 +46,8 @@ enum ProviderType {
 struct QueuePairHandle {
   uint32_t qpn;
   uint32_t post_idx;
-  void* next_wqe_addr;
+  uint32_t wqe_num;
+  void* queue_buff_addr;
   void* dbr_rec_addr;
   void* dbr_addr;
 };
@@ -58,7 +59,7 @@ struct MemoryRegion {
   size_t length;
 };
 
-struct IbgdaWriteReq {
+struct IbgdaReadWriteReq {
   QueuePairHandle qp_handle;
   MemoryRegion local_mr;
   MemoryRegion remote_mr;
@@ -67,6 +68,7 @@ struct IbgdaWriteReq {
 
 struct CompletionQueueHandle {
   void* cq_addr{nullptr};
+  void* dbr_rec_addr{nullptr};
   // TODO: consumer_idx should be tracked globally
   uint32_t consumer_idx{0};
   uint32_t cqe_num{0};

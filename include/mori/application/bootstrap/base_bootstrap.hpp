@@ -17,6 +17,7 @@ class BootstrapNetwork {
   int GetWorldSize() const { return world_size; }
 
   virtual void Allgather(void* sendbuf, void* recvbuf, size_t sendcount) = 0;
+  virtual void Barrier() = 0;
 
  protected:
   int local_rank{0};
