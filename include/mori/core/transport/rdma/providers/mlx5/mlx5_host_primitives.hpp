@@ -129,9 +129,10 @@ __host__ void RingDoorbell<ProviderType::MLX5>(void* dbr_addr, uint64_t dbr_val)
 /*                                        Completion Queue                                        */
 /* ---------------------------------------------------------------------------------------------- */
 template <>
-inline __host__ int PollCqOnce<ProviderType::MLX5>(CompletionQueueHandle cq) {
-  int idx = cq.consIdx % cq.cqeNum;
-  void* cqe_addr = reinterpret_cast<char*>(cq.cqAddr) + idx * cq.cqeSize;
+inline __host__ int PollCqOnce<ProviderType::MLX5>(void* cqAddr, uint32_t cqeSize, uint32_t cqeNum,
+                                                   uint32_t& consIdx) {
+  int idx = consIdx % cqeNum;
+  void* cqe_addr = reinterpret_cast<char*>(cqAddr) + idx * cqeSize;
 
   mlx5_cqe64* cqe = reinterpret_cast<mlx5_cqe64*>(cqe_addr);
 
@@ -147,7 +148,7 @@ inline __host__ int PollCqOnce<ProviderType::MLX5>(CompletionQueueHandle cq) {
   }
 
   // TODO: check if cqeNum should be power of 2?
-  int cq_owner_flip = !!(cq.consIdx & cq.cqeNum);
+  int cq_owner_flip = !!(consIdx & cqeNum);
   if ((opcode == MLX5_CQE_INVALID) || (owner ^ cq_owner_flip) || is_empty) {
     return -1;
   }
@@ -156,17 +157,18 @@ inline __host__ int PollCqOnce<ProviderType::MLX5>(CompletionQueueHandle cq) {
 }
 
 template <>
-inline __host__ int PoolCq<ProviderType::MLX5>(CompletionQueueHandle cq) {
+inline __host__ int PoolCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeSize, uint32_t cqeNum,
+                                               uint32_t& consIdx) {
   int opcode = -1;
   do {
-    opcode = PollCqOnce<ProviderType::MLX5>(cq);
+    opcode = PollCqOnce<ProviderType::MLX5>(cqAddr, cqeSize, cqeNum, consIdx);
     // printf("op code %d\n", opcode);
   } while (opcode < 0);
   udma_from_device_barrier();
 
   if (opcode == MLX5_CQE_RESP_ERR || opcode == MLX5_CQE_REQ_ERR) {
-    int idx = cq.consIdx % cq.cqeNum;
-    void* cqe_addr = reinterpret_cast<char*>(cq.cqAddr) + idx * cq.cqeSize;
+    int idx = consIdx % cqeNum;
+    void* cqe_addr = reinterpret_cast<char*>(cqAddr) + idx * cqeSize;
     mlx5_err_cqe* ecqe = reinterpret_cast<mlx5_err_cqe*>(cqe_addr);
     auto error = Mlx5HandleErrorCqe(ecqe);
     printf("%s\n", IbvWcStatusString(error));

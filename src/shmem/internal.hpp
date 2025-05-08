@@ -15,9 +15,18 @@ struct BootStates {
   application::BootstrapNetwork* bootNet{nullptr};
 };
 
+constexpr int MaxRdmaEndpointNum = 1024;
+extern __constant__ application::RdmaEndpoint* epsStartAddr;
+
+using RdmaEndpointList = std::vector<application::RdmaEndpoint>;
+using RdmaEndpointHandleList = std::vector<application::RdmaEndpointHandle>;
+
 struct RdmaStates {
   application::RdmaContext* context{nullptr};
   application::RdmaDeviceContext* deviceContext{nullptr};
+  RdmaEndpointList localEps;
+  application::RdmaEndpoint* localEpsGpu;
+  std::vector<RdmaEndpointHandleList> remoteEpHandles;
 };
 
 struct MemoryStates {

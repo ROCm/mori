@@ -5,7 +5,6 @@
 #include <unordered_map>
 
 #include "mori/application/transport/rdma/rdma.hpp"
-#include "mori/core/core.hpp"
 
 namespace mori {
 namespace application {

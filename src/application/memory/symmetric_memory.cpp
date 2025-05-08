@@ -59,6 +59,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
   cpuMemObj->peerRkeys[rank] = mr.rkey;
   bootNet.Allgather(&mr.rkey, cpuMemObj->peerRkeys, sizeof(uintptr_t));
 
+  // Copy memory object to GPU memory, we need to access it from GPU directly
   SymmMemObj* gpuMemObj;
   HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj, sizeof(SymmMemObj)));
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj, cpuMemObj, sizeof(SymmMemObj), hipMemcpyHostToDevice));

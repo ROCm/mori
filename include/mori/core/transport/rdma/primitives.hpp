@@ -43,14 +43,5 @@ enum ProviderType {
 #define LE64TOH(x) BSWAP64(x)
 #endif
 
-struct CompletionQueueHandle {
-  void* cqAddr{nullptr};
-  void* dbrRecAddr{nullptr};
-  // TODO: consIdx should be tracked globally
-  uint32_t consIdx{0};
-  uint32_t cqeNum{0};
-  uint32_t cqeSize{0};
-};
-
 }  // namespace core
 }  // namespace mori

@@ -35,18 +35,7 @@ void* ShmemMalloc(size_t size);
 void ShmemFree(void*);
 
 int ShmemBufferRegister(void* ptr, size_t size);
-int ShmemBufferUnRegister(void* ptr, size_t size);
-
-/* ---------------------------------------------------------------------------------------------- */
-/*                                         Point-to-Point                                         */
-/* ---------------------------------------------------------------------------------------------- */
-
-__device__ void ShmemPutMemNbiThread(const application::SymmMemObj* dest,
-                                     const application::MemoryRegion& source, size_t nelems,
-                                     int pe);
-
-__device__ void ShmemPutMemNbiWarp(const application::SymmMemObj* dest,
-                                   const application::MemoryRegion& source, size_t nelems, int pe);
+int ShmemBufferDeRegister(void* ptr, size_t size);
 
 }  // namespace shmem
 }  // namespace mori

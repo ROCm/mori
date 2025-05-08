@@ -32,7 +32,9 @@ __device__ void SendThreadKernel(RdmaEndpoint& endpoint_1, MemoryRegion mr, int 
     RingDoorbell<ProviderType::MLX5>(endpoint_1.wqHandle.dbrAddr, dbr_val);
     __threadfence_system();
 
-    int snd_opcode = PoolCq<ProviderType::MLX5>(endpoint_1.cqHandle);
+    int snd_opcode =
+        PoolCq<ProviderType::MLX5>(endpoint_1.cqHandle.cqAddr, endpoint_1.cqHandle.cqeSize,
+                                   endpoint_1.cqHandle.cqeNum, endpoint_1.cqHandle.consIdx);
     endpoint_1.cqHandle.consIdx += 1;
     UpdateCqDbrRecord<ProviderType::MLX5>(endpoint_1.cqHandle.dbrRecAddr,
                                           endpoint_1.cqHandle.consIdx);
@@ -54,7 +56,9 @@ __device__ void RecvThreadKernel(RdmaEndpoint& endpoint_2, MemoryRegion mr, int 
     UpdateRecvDbrRecord<ProviderType::MLX5>(endpoint_2.wqHandle.dbrRecAddr, postIdx);
     __threadfence_system();
 
-    int rcv_opcode = PoolCq<ProviderType::MLX5>(endpoint_2.cqHandle);
+    int rcv_opcode =
+        PoolCq<ProviderType::MLX5>(endpoint_2.cqHandle.cqAddr, endpoint_2.cqHandle.cqeSize,
+                                   endpoint_2.cqHandle.cqeNum, endpoint_2.cqHandle.consIdx);
     endpoint_2.cqHandle.consIdx += 1;
     UpdateCqDbrRecord<ProviderType::MLX5>(endpoint_2.cqHandle.dbrRecAddr,
                                           endpoint_2.cqHandle.consIdx);

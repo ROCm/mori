@@ -27,7 +27,7 @@ int ShmemBufferRegister(void* ptr, size_t size) {
   return 0;
 }
 
-int ShmemBufferUnRegister(void* ptr, size_t size) {
+int ShmemBufferDeRegister(void* ptr, size_t size) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
   states->memoryStates->mrMgr->DeRegisterBuffer(ptr);
   return 0;

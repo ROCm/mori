@@ -7,6 +7,8 @@
 
 using namespace mori::shmem;
 
+__global__ void TestShmemPutMemNbiThread() { printf("%p\n", GetEpsStartAddr()); }
+
 void PutWarpExample() {
   int status;
   status = ShmemMpiInit(MPI_COMM_WORLD);
@@ -16,14 +18,13 @@ void PutWarpExample() {
   int myPe = ShmemMyPe();
   int npes = ShmemNPes();
 
-  // Set device
-  HIP_RUNTIME_CHECK(hipSetDevice(myPe));
-
   // Alloc memory
   int buffSize = 2048;
   void* buff = ShmemMalloc(buffSize);
 
   // Run put
+  TestShmemPutMemNbiThread<<<1, 1>>>();
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
   // Finalize
   ShmemFree(buff);

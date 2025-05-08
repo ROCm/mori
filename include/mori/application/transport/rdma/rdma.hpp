@@ -10,7 +10,6 @@
 #include <vector>
 
 #include "infiniband/verbs.h"
-#include "mori/core/core.hpp"
 
 namespace mori {
 namespace application {
@@ -54,6 +53,7 @@ struct RdmaEndpointHandle {
 };
 
 struct WorkQueueHandle {
+  uint32_t postIdx{0};
   void* sqAddr{nullptr};
   void* rqAddr{nullptr};
   void* dbrRecAddr{nullptr};
@@ -62,10 +62,18 @@ struct WorkQueueHandle {
   uint32_t rqWqeNum{0};
 };
 
+struct CompletionQueueHandle {
+  void* cqAddr{nullptr};
+  void* dbrRecAddr{nullptr};
+  uint32_t consIdx{0};
+  uint32_t cqeNum{0};
+  uint32_t cqeSize{0};
+};
+
 struct RdmaEndpoint {
   RdmaEndpointHandle handle;
   WorkQueueHandle wqHandle;
-  core::CompletionQueueHandle cqHandle;
+  CompletionQueueHandle cqHandle;
 };
 
 class RdmaDevice;
@@ -89,6 +97,9 @@ class RdmaDeviceContext {
   // TODO: query gid entry by ibv_query_gid_table
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) {
     assert(false && "not implementd");
+  }
+  void ConnectEndpoint(const RdmaEndpoint& local, const RdmaEndpoint& remote) {
+    ConnectEndpoint(local.handle, remote.handle);
   }
   virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote) {
     assert(false && "not implementd");
