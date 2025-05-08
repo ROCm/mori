@@ -1,13 +1,11 @@
 #pragma once
 
 #include "infiniband/mlx5dv.h"
-#include "mori/application/transport/rdma/rdma_base.hpp"
+#include "mori/application/transport/rdma/rdma.hpp"
 #include "src/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
 
 namespace mori {
 namespace application {
-namespace transport {
-namespace rdma {
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Device Attributes                                       */
@@ -23,11 +21,11 @@ static size_t GetMlx5SqWqeSize() {
 static size_t GetMlx5RqWqeSize() { return sizeof(mlx5_wqe_data_seg); }
 
 struct HcaCapability {
-  uint32_t port_type{0};
-  uint32_t dbr_reg_size{0};
+  uint32_t portType{0};
+  uint32_t dbrRegSize{0};
 
-  bool IsEthernet() const { return port_type == MLX5_CAP_PORT_TYPE_ETH; }
-  bool IsInfiniBand() const { return port_type == MLX5_CAP_PORT_TYPE_IB; }
+  bool IsEthernet() const { return portType == MLX5_CAP_PORT_TYPE_ETH; }
+  bool IsInfiniBand() const { return portType == MLX5_CAP_PORT_TYPE_IB; }
 };
 
 HcaCapability QueryHcaCap(ibv_context* context);
@@ -43,25 +41,25 @@ class Mlx5CqContainer {
 
  public:
   RdmaEndpointConfig config;
-  uint32_t cqe_num;
+  uint32_t cqeNum;
 
  public:
   uint32_t cqn{0};
-  void* cq_umem_addr{nullptr};
-  void* cq_dbr_umem_addr{nullptr};
-  mlx5dv_devx_umem* cq_umem{nullptr};
-  mlx5dv_devx_umem* cq_dbr_umem{nullptr};
+  void* cqUmemAddr{nullptr};
+  void* cqDbrUmemAddr{nullptr};
+  mlx5dv_devx_umem* cqUmem{nullptr};
+  mlx5dv_devx_umem* cqDbrUmem{nullptr};
   mlx5dv_devx_uar* uar{nullptr};
   mlx5dv_devx_obj* cq{nullptr};
 };
 
 struct WorkQueueAttrs {
-  uint32_t wqe_num{0};
-  uint32_t wqe_size{0};
-  uint64_t wq_size{0};
+  uint32_t wqeNum{0};
+  uint32_t wqeSize{0};
+  uint64_t wqSize{0};
   uint32_t head{0};
-  uint32_t post_idx{0};
-  uint32_t wqe_shift{0};
+  uint32_t postIdx{0};
+  uint32_t wqeShift{0};
   uint32_t offset{0};
 };
 
@@ -88,18 +86,18 @@ class Mlx5QpContainer {
 
  public:
   RdmaEndpointConfig config;
-  WorkQueueAttrs rq_attrs;
-  WorkQueueAttrs sq_attrs;
-  size_t qp_total_size{0};
+  WorkQueueAttrs rqAttrs;
+  WorkQueueAttrs sqAttrs;
+  size_t qpTotalSize{0};
 
  public:
   size_t qpn{0};
-  void* qp_umem_addr{nullptr};
-  void* qp_dbr_umem_addr{nullptr};
-  mlx5dv_devx_umem* qp_umem{nullptr};
-  mlx5dv_devx_umem* qp_dbr_umem{nullptr};
-  mlx5dv_devx_uar* qp_uar{nullptr};
-  void* qp_uar_ptr{nullptr};
+  void* qpUmemAddr{nullptr};
+  void* qpDbrUmemAddr{nullptr};
+  mlx5dv_devx_umem* qpUmem{nullptr};
+  mlx5dv_devx_umem* qpDbrUmem{nullptr};
+  mlx5dv_devx_uar* qpUar{nullptr};
+  void* qpUarPtr{nullptr};
   mlx5dv_devx_obj* qp{nullptr};
 };
 
@@ -108,7 +106,7 @@ class Mlx5QpContainer {
 /* ---------------------------------------------------------------------------------------------- */
 class Mlx5DeviceContext : public RdmaDeviceContext {
  public:
-  Mlx5DeviceContext(RdmaDevice* rdma_device, ibv_pd* in_pd);
+  Mlx5DeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd);
   ~Mlx5DeviceContext();
 
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) override;
@@ -121,8 +119,8 @@ class Mlx5DeviceContext : public RdmaDeviceContext {
   // std::unordered_map<uint32_t, std::unique_ptr<Mlx5CqContainer>> cq_pool;
   // std::unordered_map<uint32_t, std::unique_ptr<Mlx5QpContainer>> qp_pool;
 
-  std::unordered_map<uint32_t, Mlx5CqContainer*> cq_pool;
-  std::unordered_map<uint32_t, Mlx5QpContainer*> qp_pool;
+  std::unordered_map<uint32_t, Mlx5CqContainer*> cqPool;
+  std::unordered_map<uint32_t, Mlx5QpContainer*> qpPool;
 };
 
 class Mlx5Device : public RdmaDevice {
@@ -133,19 +131,16 @@ class Mlx5Device : public RdmaDevice {
   RdmaDeviceContext* CreateRdmaDeviceContext() override;
 };
 
-}  // namespace rdma
-}  // namespace transport
 }  // namespace application
 }  // namespace mori
 
 namespace std {
 
-static std::ostream& operator<<(std::ostream& s,
-                                const mori::application::transport::rdma::WorkQueueAttrs wq_attrs) {
+static std::ostream& operator<<(std::ostream& s, const mori::application::WorkQueueAttrs wq_attrs) {
   std::stringstream ss;
-  ss << "wqe_num: " << wq_attrs.wqe_num << " wqe_size: " << wq_attrs.wqe_size
-     << " wq_size: " << wq_attrs.wq_size << " post_idx: " << wq_attrs.post_idx
-     << " wqe_shift: " << wq_attrs.wqe_shift << " offset: " << wq_attrs.offset;
+  ss << "wqeNum: " << wq_attrs.wqeNum << " wqeSize: " << wq_attrs.wqeSize
+     << " wqSize: " << wq_attrs.wqSize << " postIdx: " << wq_attrs.postIdx
+     << " wqeShift: " << wq_attrs.wqeShift << " offset: " << wq_attrs.offset;
   s << ss.str();
   return s;
 }

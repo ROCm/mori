@@ -13,8 +13,6 @@
 
 namespace mori {
 namespace application {
-namespace transport {
-namespace rdma {
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Device Attributes                                       */
@@ -37,11 +35,11 @@ HcaCapability QueryHcaCap(ibv_context* context) {
 
   HcaCapability hca_cap;
 
-  hca_cap.port_type = DEVX_GET(query_hca_cap_out, cmd_cap_out, capability.cmd_hca_cap.port_type);
+  hca_cap.portType = DEVX_GET(query_hca_cap_out, cmd_cap_out, capability.cmd_hca_cap.port_type);
 
-  uint32_t log_bf_reg_size =
+  uint32_t logBfRegSize =
       DEVX_GET(query_hca_cap_out, cmd_cap_out, capability.cmd_hca_cap.log_bf_reg_size);
-  hca_cap.dbr_reg_size = 1LLU << log_bf_reg_size;
+  hca_cap.dbrRegSize = 1LLU << logBfRegSize;
 
   return hca_cap;
 }
@@ -61,35 +59,35 @@ Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig&
 
   // Allocate user memory for CQ
   // TODO: accept memory allocated by user?
-  cqe_num = config.max_cqe_num;
-  int cq_size = RoundUpPowOfTwo(GetMlx5CqeSize() * cqe_num);
+  cqeNum = config.maxCqeNum;
+  int cqSize = RoundUpPowOfTwo(GetMlx5CqeSize() * cqeNum);
   // TODO: adjust cqe_num after aligning?
-  cq_size = (cq_size + config.alignment - 1) / config.alignment * config.alignment;
+  cqSize = (cqSize + config.alignment - 1) / config.alignment * config.alignment;
 
-  if (config.on_gpu) {
-    HIP_RUNTIME_CHECK(hipMalloc(&cq_umem_addr, cq_size));
-    HIP_RUNTIME_CHECK(hipMemset(cq_umem_addr, 0, cq_size));
+  if (config.onGpu) {
+    HIP_RUNTIME_CHECK(hipMalloc(&cqUmemAddr, cqSize));
+    HIP_RUNTIME_CHECK(hipMemset(cqUmemAddr, 0, cqSize));
   } else {
-    int status = posix_memalign(&cq_umem_addr, config.alignment, cq_size);
-    memset(cq_umem_addr, 0, cq_size);
+    int status = posix_memalign(&cqUmemAddr, config.alignment, cqSize);
+    memset(cqUmemAddr, 0, cqSize);
     assert(!status);
   }
 
-  cq_umem = mlx5dv_devx_umem_reg(context, cq_umem_addr, cq_size, IBV_ACCESS_LOCAL_WRITE);
-  assert(cq_umem);
+  cqUmem = mlx5dv_devx_umem_reg(context, cqUmemAddr, cqSize, IBV_ACCESS_LOCAL_WRITE);
+  assert(cqUmem);
 
   // Allocate user memory for CQ DBR (doorbell?)
-  if (config.on_gpu) {
-    HIP_RUNTIME_CHECK(hipMalloc(&cq_dbr_umem_addr, 8));
-    HIP_RUNTIME_CHECK(hipMemset(cq_dbr_umem_addr, 0, 8));
+  if (config.onGpu) {
+    HIP_RUNTIME_CHECK(hipMalloc(&cqDbrUmemAddr, 8));
+    HIP_RUNTIME_CHECK(hipMemset(cqDbrUmemAddr, 0, 8));
   } else {
-    int status = posix_memalign(&cq_dbr_umem_addr, 8, 8);
-    memset(cq_dbr_umem_addr, 0, 8);
+    int status = posix_memalign(&cqDbrUmemAddr, 8, 8);
+    memset(cqDbrUmemAddr, 0, 8);
     assert(!status);
   }
 
-  cq_dbr_umem = mlx5dv_devx_umem_reg(context, cq_dbr_umem_addr, 8, IBV_ACCESS_LOCAL_WRITE);
-  assert(cq_dbr_umem);
+  cqDbrUmem = mlx5dv_devx_umem_reg(context, cqDbrUmemAddr, 8, IBV_ACCESS_LOCAL_WRITE);
+  assert(cqDbrUmem);
 
   // Allocate user access region
   uar = mlx5dv_devx_alloc_uar(context, MLX5DV_UAR_ALLOC_TYPE_NC);
@@ -98,12 +96,12 @@ Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig&
   // Initialize CQ
   DEVX_SET(create_cq_in, cmd_in, opcode, MLX5_CMD_OP_CREATE_CQ);
   DEVX_SET(create_cq_in, cmd_in, cq_umem_valid, 0x1);
-  DEVX_SET(create_cq_in, cmd_in, cq_umem_id, cq_umem->umem_id);
+  DEVX_SET(create_cq_in, cmd_in, cq_umem_id, cqUmem->umem_id);
 
   void* cq_context = DEVX_ADDR_OF(create_cq_in, cmd_in, cq_context);
   DEVX_SET(cqc, cq_context, dbr_umem_valid, 0x1);
-  DEVX_SET(cqc, cq_context, dbr_umem_id, cq_dbr_umem->umem_id);
-  DEVX_SET(cqc, cq_context, log_cq_size, LogCeil2(cqe_num));
+  DEVX_SET(cqc, cq_context, dbr_umem_id, cqDbrUmem->umem_id);
+  DEVX_SET(cqc, cq_context, log_cq_size, LogCeil2(cqeNum));
   DEVX_SET(cqc, cq_context, uar_page, uar->page_id);
 
   uint32_t eqn;
@@ -118,8 +116,8 @@ Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig&
 }
 
 Mlx5CqContainer::~Mlx5CqContainer() {
-  mlx5dv_devx_umem_dereg(cq_umem);
-  mlx5dv_devx_umem_dereg(cq_dbr_umem);
+  mlx5dv_devx_umem_dereg(cqUmem);
+  mlx5dv_devx_umem_dereg(cqDbrUmem);
   mlx5dv_devx_free_uar(uar);
   mlx5dv_devx_obj_destroy(cq);
 }
@@ -138,25 +136,25 @@ Mlx5QpContainer::~Mlx5QpContainer() { DestroyQueuePair(); }
 
 void Mlx5QpContainer::ComputeQueueAttrs(const RdmaEndpointConfig& config) {
   // Receive queue attributes//
-  rq_attrs.wqe_size = GetMlx5RqWqeSize();
-  uint32_t max_msgs_num = RoundUpPowOfTwo(config.max_msgs_num);
-  rq_attrs.wq_size = std::max(rq_attrs.wqe_size * max_msgs_num, uint32_t(MLX5_SEND_WQE_BB));
-  rq_attrs.wqe_num = ceil(rq_attrs.wq_size / rq_attrs.wqe_size);
-  rq_attrs.wqe_shift = log2(rq_attrs.wqe_size - 1) + 1;
-  rq_attrs.offset = 0;
+  rqAttrs.wqeSize = GetMlx5RqWqeSize();
+  uint32_t maxMsgsNum = RoundUpPowOfTwo(config.maxMsgsNum);
+  rqAttrs.wqSize = std::max(rqAttrs.wqeSize * maxMsgsNum, uint32_t(MLX5_SEND_WQE_BB));
+  rqAttrs.wqeNum = ceil(rqAttrs.wqSize / rqAttrs.wqeSize);
+  rqAttrs.wqeShift = log2(rqAttrs.wqeSize - 1) + 1;
+  rqAttrs.offset = 0;
 
   // Send queue attributes
-  sq_attrs.offset = rq_attrs.wq_size;
-  sq_attrs.wqe_size = GetMlx5SqWqeSize();
-  sq_attrs.wq_size = RoundUpPowOfTwo(sq_attrs.wqe_size * config.max_msgs_num);
-  sq_attrs.wqe_num = ceil(sq_attrs.wq_size / MLX5_SEND_WQE_BB);
-  sq_attrs.wqe_shift = MLX5_SEND_WQE_SHIFT;
+  sqAttrs.offset = rqAttrs.wqSize;
+  sqAttrs.wqeSize = GetMlx5SqWqeSize();
+  sqAttrs.wqSize = RoundUpPowOfTwo(sqAttrs.wqeSize * config.maxMsgsNum);
+  sqAttrs.wqeNum = ceil(sqAttrs.wqSize / MLX5_SEND_WQE_BB);
+  sqAttrs.wqeShift = MLX5_SEND_WQE_SHIFT;
 
   // Queue pair attributes
-  qp_total_size = RoundUpPowOfTwo(rq_attrs.wq_size + sq_attrs.wq_size);
-  qp_total_size = (qp_total_size + config.alignment - 1) / config.alignment * config.alignment;
+  qpTotalSize = RoundUpPowOfTwo(rqAttrs.wqSize + sqAttrs.wqSize);
+  qpTotalSize = (qpTotalSize + config.alignment - 1) / config.alignment * config.alignment;
 
-  std::cout << "rq[ " << rq_attrs << "] sq[ " << sq_attrs << "]" << std::endl;
+  std::cout << "rq[ " << rqAttrs << "] sq[ " << sqAttrs << "]" << std::endl;
 }
 
 void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
@@ -170,52 +168,52 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
 
   // Allocate user memory for QP
 
-  if (config.on_gpu) {
-    HIP_RUNTIME_CHECK(hipMalloc(&qp_umem_addr, qp_total_size));
-    HIP_RUNTIME_CHECK(hipMemset(qp_umem_addr, 0, qp_total_size));
+  if (config.onGpu) {
+    HIP_RUNTIME_CHECK(hipMalloc(&qpUmemAddr, qpTotalSize));
+    HIP_RUNTIME_CHECK(hipMemset(qpUmemAddr, 0, qpTotalSize));
   } else {
-    status = posix_memalign(&qp_umem_addr, config.alignment, qp_total_size);
-    memset(qp_umem_addr, 0, qp_total_size);
+    status = posix_memalign(&qpUmemAddr, config.alignment, qpTotalSize);
+    memset(qpUmemAddr, 0, qpTotalSize);
     assert(!status);
   }
 
-  qp_umem = mlx5dv_devx_umem_reg(context, qp_umem_addr, qp_total_size, IBV_ACCESS_LOCAL_WRITE);
-  assert(qp_umem);
+  qpUmem = mlx5dv_devx_umem_reg(context, qpUmemAddr, qpTotalSize, IBV_ACCESS_LOCAL_WRITE);
+  assert(qpUmem);
 
   // Allocate user memory for DBR (doorbell?)
-  if (config.on_gpu) {
-    HIP_RUNTIME_CHECK(hipMalloc(&qp_dbr_umem_addr, 8));
-    HIP_RUNTIME_CHECK(hipMemset(qp_dbr_umem_addr, 0, 8));
+  if (config.onGpu) {
+    HIP_RUNTIME_CHECK(hipMalloc(&qpDbrUmemAddr, 8));
+    HIP_RUNTIME_CHECK(hipMemset(qpDbrUmemAddr, 0, 8));
   } else {
-    status = posix_memalign(&qp_dbr_umem_addr, 8, 8);
-    memset(qp_dbr_umem_addr, 0, 8);
+    status = posix_memalign(&qpDbrUmemAddr, 8, 8);
+    memset(qpDbrUmemAddr, 0, 8);
     assert(!status);
   }
 
-  qp_dbr_umem = mlx5dv_devx_umem_reg(context, qp_dbr_umem_addr, 8, IBV_ACCESS_LOCAL_WRITE);
-  assert(qp_dbr_umem);
+  qpDbrUmem = mlx5dv_devx_umem_reg(context, qpDbrUmemAddr, 8, IBV_ACCESS_LOCAL_WRITE);
+  assert(qpDbrUmem);
 
   // Allocate user access region
-  qp_uar = mlx5dv_devx_alloc_uar(context, MLX5DV_UAR_ALLOC_TYPE_NC);
-  assert(qp_uar);
-  assert(qp_uar->page_id != 0);
+  qpUar = mlx5dv_devx_alloc_uar(context, MLX5DV_UAR_ALLOC_TYPE_NC);
+  assert(qpUar);
+  assert(qpUar->page_id != 0);
 
-  if (config.on_gpu) {
+  if (config.onGpu) {
     uint32_t flag = hipHostRegisterPortable | hipHostRegisterMapped | hipHostRegisterIoMemory;
-    HIP_RUNTIME_CHECK(hipHostRegister(qp_uar->reg_addr, QueryHcaCap(context).dbr_reg_size, flag));
-    HIP_RUNTIME_CHECK(hipHostGetDevicePointer(&qp_uar_ptr, qp_uar->reg_addr, 0));
+    HIP_RUNTIME_CHECK(hipHostRegister(qpUar->reg_addr, QueryHcaCap(context).dbrRegSize, flag));
+    HIP_RUNTIME_CHECK(hipHostGetDevicePointer(&qpUarPtr, qpUar->reg_addr, 0));
   } else {
-    qp_uar_ptr = qp_uar->reg_addr;
+    qpUarPtr = qpUar->reg_addr;
   }
 
   // TODO: check for correctness
-  uint32_t log_rq_size = int(log2(rq_attrs.wqe_num - 1)) + 1;
-  uint32_t log_rq_stride = rq_attrs.wqe_shift - 4;
-  uint32_t log_sq_size = int(log2(sq_attrs.wqe_num - 1)) + 1;
+  uint32_t logRqSize = int(log2(rqAttrs.wqeNum - 1)) + 1;
+  uint32_t logRqStride = rqAttrs.wqeShift - 4;
+  uint32_t logSqSize = int(log2(sqAttrs.wqeNum - 1)) + 1;
 
   // Initialize QP
   DEVX_SET(create_qp_in, cmd_in, opcode, MLX5_CMD_OP_CREATE_QP);
-  DEVX_SET(create_qp_in, cmd_in, wq_umem_id, qp_umem->umem_id);
+  DEVX_SET(create_qp_in, cmd_in, wq_umem_id, qpUmem->umem_id);
   DEVX_SET64(create_qp_in, cmd_in, wq_umem_offset, 0);
   DEVX_SET(create_qp_in, cmd_in, wq_umem_valid, 0x1);
 
@@ -223,19 +221,19 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   DEVX_SET(qpc, qp_context, st, MLX5_QPC_ST_RC);
   DEVX_SET(qpc, qp_context, pm_state, MLX5_QPC_PM_STATE_MIGRATED);
   DEVX_SET(qpc, qp_context, pd, pdn);
-  DEVX_SET(qpc, qp_context, uar_page, qp_uar->page_id);  // BF register
+  DEVX_SET(qpc, qp_context, uar_page, qpUar->page_id);  // BF register
   DEVX_SET(qpc, qp_context, cqn_snd, cqn);
   DEVX_SET(qpc, qp_context, cqn_rcv, cqn);
-  DEVX_SET(qpc, qp_context, log_sq_size, log_sq_size);
-  DEVX_SET(qpc, qp_context, log_rq_size, log_rq_size);
-  DEVX_SET(qpc, qp_context, log_rq_stride, log_rq_stride);
+  DEVX_SET(qpc, qp_context, log_sq_size, logSqSize);
+  DEVX_SET(qpc, qp_context, log_rq_size, logRqSize);
+  DEVX_SET(qpc, qp_context, log_rq_stride, logRqStride);
   DEVX_SET(qpc, qp_context, ts_format, 0x1);
   DEVX_SET(qpc, qp_context, cs_req, 0);
   DEVX_SET(qpc, qp_context, cs_res, 0);
   DEVX_SET(qpc, qp_context, dbr_umem_valid, 0x1);  // Enable dbr_umem_id
   DEVX_SET64(qpc, qp_context, dbr_addr,
              0);  // Offset of dbr_umem_id (behavior changed because of dbr_umem_valid)
-  DEVX_SET(qpc, qp_context, dbr_umem_id, qp_dbr_umem->umem_id);  // DBR buffer
+  DEVX_SET(qpc, qp_context, dbr_umem_id, qpDbrUmem->umem_id);  // DBR buffer
   DEVX_SET(qpc, qp_context, page_offset, 0);
 
   qp = mlx5dv_devx_obj_create(context, cmd_in, sizeof(cmd_in), cmd_out, sizeof(cmd_out));
@@ -245,19 +243,19 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
 }
 
 void Mlx5QpContainer::DestroyQueuePair() {
-  if (qp_umem_addr) HIP_RUNTIME_CHECK(hipFree(qp_umem_addr));
-  if (qp_dbr_umem_addr) HIP_RUNTIME_CHECK(hipFree(qp_dbr_umem_addr));
-  if (qp_dbr_umem) mlx5dv_devx_umem_dereg(qp_dbr_umem);
-  if (qp_uar) {
-    mlx5dv_devx_free_uar(qp_uar);
-    HIP_RUNTIME_CHECK(hipHostUnregister(qp_uar->reg_addr));
+  if (qpUmemAddr) HIP_RUNTIME_CHECK(hipFree(qpUmemAddr));
+  if (qpDbrUmemAddr) HIP_RUNTIME_CHECK(hipFree(qpDbrUmemAddr));
+  if (qpDbrUmem) mlx5dv_devx_umem_dereg(qpDbrUmem);
+  if (qpUar) {
+    mlx5dv_devx_free_uar(qpUar);
+    HIP_RUNTIME_CHECK(hipHostUnregister(qpUar->reg_addr));
   }
   if (qp) mlx5dv_devx_obj_destroy(qp);
 }
 
-void* Mlx5QpContainer::GetSqAddress() { return static_cast<char*>(qp_umem_addr) + sq_attrs.offset; }
+void* Mlx5QpContainer::GetSqAddress() { return static_cast<char*>(qpUmemAddr) + sqAttrs.offset; }
 
-void* Mlx5QpContainer::GetRqAddress() { return static_cast<char*>(qp_umem_addr) + rq_attrs.offset; }
+void* Mlx5QpContainer::GetRqAddress() { return static_cast<char*>(qpUmemAddr) + rqAttrs.offset; }
 
 void Mlx5QpContainer::ModifyRst2Init() {
   uint8_t rst2init_cmd_in[DEVX_ST_SZ_BYTES(rst2init_qp_in)] = {
@@ -273,7 +271,7 @@ void Mlx5QpContainer::ModifyRst2Init() {
   void* qpc = DEVX_ADDR_OF(rst2init_qp_in, rst2init_cmd_in, qpc);
   DEVX_SET(qpc, qpc, rwe, 1); /* remote write access */
   DEVX_SET(qpc, qpc, rre, 1); /* remote read access */
-  DEVX_SET(qpc, qpc, primary_address_path.vhca_port_num, config.port_id);
+  DEVX_SET(qpc, qpc, primary_address_path.vhca_port_num, config.portId);
   int status = mlx5dv_devx_obj_modify(qp, rst2init_cmd_in, sizeof(rst2init_cmd_in),
                                       rst2init_cmd_out, sizeof(rst2init_cmd_out));
   assert(!status);
@@ -298,7 +296,7 @@ void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle) {
   DEVX_SET(qpc, qpc, min_rnr_nak, 12);
 
   qpc = DEVX_ADDR_OF(init2rtr_qp_in, init2rtr_cmd_in, qpc);
-  DEVX_SET(qpc, qpc, primary_address_path.vhca_port_num, config.port_id);
+  DEVX_SET(qpc, qpc, primary_address_path.vhca_port_num, config.portId);
 
   HcaCapability hca_cap = QueryHcaCap(context);
   if (hca_cap.IsEthernet()) {
@@ -308,7 +306,7 @@ void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle) {
     memcpy(DEVX_ADDR_OF(qpc, qpc, primary_address_path.rmac_47_32), remote_handle.eth.mac,
            sizeof(remote_handle.eth.mac));
     DEVX_SET(qpc, qpc, primary_address_path.hop_limit, 64);
-    DEVX_SET(qpc, qpc, primary_address_path.src_addr_index, config.gid_index);
+    DEVX_SET(qpc, qpc, primary_address_path.src_addr_index, config.gidIdx);
     DEVX_SET(qpc, qpc, primary_address_path.udp_sport, 0xC000);
   } else if (hca_cap.IsInfiniBand()) {
     DEVX_SET(qpc, qpc, primary_address_path.rlid, remote_handle.ib.lid);
@@ -338,7 +336,7 @@ void Mlx5QpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle) {
   DEVX_SET(qpc, qpc, retry_count, 7);
   DEVX_SET(qpc, qpc, rnr_retry, 7);
   DEVX_SET(qpc, qpc, primary_address_path.ack_timeout, 14);
-  DEVX_SET(qpc, qpc, primary_address_path.vhca_port_num, config.port_id);
+  DEVX_SET(qpc, qpc, primary_address_path.vhca_port_num, config.portId);
 
   int status = mlx5dv_devx_obj_modify(qp, rtr2rts_cmd_in, sizeof(rtr2rts_cmd_in), rtr2rts_cmd_out,
                                       sizeof(rtr2rts_cmd_out));
@@ -381,8 +379,8 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
     uint32_t in[DEVX_ST_SZ_DW(query_roce_address_in)] = {};
 
     DEVX_SET(query_roce_address_in, in, opcode, MLX5_CMD_OP_QUERY_ROCE_ADDRESS);
-    DEVX_SET(query_roce_address_in, in, roce_address_index, config.gid_index);
-    DEVX_SET(query_roce_address_in, in, vhca_port_num, config.port_id);
+    DEVX_SET(query_roce_address_in, in, roce_address_index, config.gidIdx);
+    DEVX_SET(query_roce_address_in, in, vhca_port_num, config.portId);
 
     int status = mlx5dv_devx_general_cmd(context, in, sizeof(in), out, sizeof(out));
     assert(!status);
@@ -396,31 +394,31 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
            sizeof(endpoint.handle.eth.mac));
   } else if (hca_cap.IsInfiniBand()) {
     ibv_port_attr port_attr;
-    int status = ibv_query_port(context, config.port_id, &port_attr);
+    int status = ibv_query_port(context, config.portId, &port_attr);
     assert(!status);
     endpoint.handle.ib.lid = port_attr.lid;
   } else {
     assert(false);
   }
 
-  endpoint.wq_handle.sq_addr = qp->GetSqAddress();
-  endpoint.wq_handle.rq_addr = qp->GetRqAddress();
-  endpoint.wq_handle.dbr_rec_addr = qp->qp_dbr_umem_addr;
-  endpoint.wq_handle.dbr_addr = qp->qp_uar_ptr;
-  endpoint.wq_handle.sq_wqe_num = qp->sq_attrs.wqe_num;
-  endpoint.wq_handle.rq_wqe_num = qp->rq_attrs.wqe_num;
+  endpoint.wqHandle.sqAddr = qp->GetSqAddress();
+  endpoint.wqHandle.rqAddr = qp->GetRqAddress();
+  endpoint.wqHandle.dbrRecAddr = qp->qpDbrUmemAddr;
+  endpoint.wqHandle.dbrAddr = qp->qpUarPtr;
+  endpoint.wqHandle.sqWqeNum = qp->sqAttrs.wqeNum;
+  endpoint.wqHandle.rqWqeNum = qp->rqAttrs.wqeNum;
 
-  endpoint.cq_handle.cq_addr = cq->cq_umem_addr;
-  endpoint.cq_handle.consumer_idx = 0;
-  endpoint.cq_handle.cqe_num = cq->cqe_num;
-  endpoint.cq_handle.cqe_size = GetMlx5CqeSize();
-  endpoint.cq_handle.dbr_rec_addr = cq->cq_dbr_umem_addr;
+  endpoint.cqHandle.cqAddr = cq->cqUmemAddr;
+  endpoint.cqHandle.consIdx = 0;
+  endpoint.cqHandle.cqeNum = cq->cqeNum;
+  endpoint.cqHandle.cqeSize = GetMlx5CqeSize();
+  endpoint.cqHandle.dbrRecAddr = cq->cqDbrUmemAddr;
 
   // cq_pool.insert({cq->cqn, std::move(std::unique_ptr<Mlx5CqContainer>(cq))});
-  // qp_pool.insert({qp->qpn, std::move(std::unique_ptr<Mlx5QpContainer>(qp))});
+  // qpPool.insert({qp->qpn, std::move(std::unique_ptr<Mlx5QpContainer>(qp))});
 
-  cq_pool.insert({cq->cqn, cq});
-  qp_pool.insert({qp->qpn, qp});
+  cqPool.insert({cq->cqn, cq});
+  qpPool.insert({qp->qpn, qp});
 
   return endpoint;
 }
@@ -428,8 +426,8 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
 void Mlx5DeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
                                         const RdmaEndpointHandle& remote) {
   uint32_t local_qpn = local.qpn;
-  assert(qp_pool.find(local_qpn) != qp_pool.end());
-  Mlx5QpContainer* qp = qp_pool.at(local_qpn);  //.get();
+  assert(qpPool.find(local_qpn) != qpPool.end());
+  Mlx5QpContainer* qp = qpPool.at(local_qpn);
   qp->ModifyRst2Init();
   qp->ModifyInit2Rtr(remote);
   qp->ModifyRtr2Rts(local);
@@ -442,11 +440,9 @@ Mlx5Device::Mlx5Device(ibv_device* in_device) : RdmaDevice(in_device) {}
 Mlx5Device::~Mlx5Device() {}
 
 RdmaDeviceContext* Mlx5Device::CreateRdmaDeviceContext() {
-  ibv_pd* pd = ibv_alloc_pd(default_context);
+  ibv_pd* pd = ibv_alloc_pd(defaultContext);
   return new Mlx5DeviceContext(this, pd);
 }
 
-}  // namespace rdma
-}  // namespace transport
 }  // namespace application
 }  // namespace mori

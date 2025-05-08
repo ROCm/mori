@@ -1,48 +1,46 @@
 #include <hip/hip_runtime.h>
 
-#include "examples/local_rdma_ops/utils.hpp"
 #include "mori/application/application.hpp"
 #include "mori/application/utils/udma_barrier.h"
-#include "mori/core/transport/ibgda/ibgda.hpp"
+#include "mori/core/core.hpp"
 
 using namespace mori;
 using namespace mori::application;
-using namespace mori::core::transport;
+using namespace mori::core;
 
 #define MR_ACCESS_FLAG                                                        \
   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | \
       IBV_ACCESS_REMOTE_ATOMIC
 
-void SendRecvOnCpu(ibgda::IbgdaReadWriteReq& send_req, ibgda::IbgdaReadWriteReq& recv_req,
-                   transport::rdma::RdmaEndpoint& endpoint_1,
-                   transport::rdma::RdmaEndpoint& endpoint_2) {
+void SendRecvOnCpu(IbgdaReadWriteReq& send_req, IbgdaReadWriteReq& recv_req,
+                   RdmaEndpoint& endpoint_1, RdmaEndpoint& endpoint_2) {
   // Recv
   udma_to_device_barrier();
-  ibgda::PostRecv<ibgda::ProviderType::MLX5>(recv_req);
+  PostRecv<ProviderType::MLX5>(recv_req);
   udma_to_device_barrier();
-  ibgda::UpdateRecvDbrRecord<ibgda::ProviderType::MLX5>(endpoint_2.wq_handle.dbr_rec_addr,
-                                                        recv_req.qp_handle.post_idx);
+  UpdateRecvDbrRecord<ProviderType::MLX5>(endpoint_2.wq_handle.dbr_rec_addr,
+                                          recv_req.qp_handle.post_idx);
 
   // Send
-  uint64_t dbr_val = ibgda::PostSend<ibgda::ProviderType::MLX5>(send_req);
+  uint64_t dbr_val = PostSend<ProviderType::MLX5>(send_req);
   udma_to_device_barrier();
-  ibgda::UpdateSendDbrRecord<ibgda::ProviderType::MLX5>(endpoint_1.wq_handle.dbr_rec_addr,
-                                                        send_req.qp_handle.post_idx);
+  UpdateSendDbrRecord<ProviderType::MLX5>(endpoint_1.wq_handle.dbr_rec_addr,
+                                          send_req.qp_handle.post_idx);
   udma_to_device_barrier();
-  ibgda::RingDoorbell<ibgda::ProviderType::MLX5>(endpoint_1.wq_handle.dbr_addr, dbr_val);
+  RingDoorbell<ProviderType::MLX5>(endpoint_1.wq_handle.dbr_addr, dbr_val);
   udma_to_device_barrier();
 
   // Poll CQ
-  int snd_opcode = ibgda::PoolCq<ibgda::ProviderType::MLX5>(endpoint_1.cq_handle);
-  int rcv_opcode = ibgda::PoolCq<ibgda::ProviderType::MLX5>(endpoint_2.cq_handle);
+  int snd_opcode = PoolCq<ProviderType::MLX5>(endpoint_1.cq_handle);
+  int rcv_opcode = PoolCq<ProviderType::MLX5>(endpoint_2.cq_handle);
   udma_from_device_barrier();
 
   endpoint_1.cq_handle.consumer_idx += 1;
   endpoint_2.cq_handle.consumer_idx += 1;
-  ibgda::UpdateCqDbrRecord<ibgda::ProviderType::MLX5>(endpoint_1.cq_handle.dbr_rec_addr,
-                                                      endpoint_1.cq_handle.consumer_idx);
-  ibgda::UpdateCqDbrRecord<ibgda::ProviderType::MLX5>(endpoint_2.cq_handle.dbr_rec_addr,
-                                                      endpoint_2.cq_handle.consumer_idx);
+  UpdateCqDbrRecord<ProviderType::MLX5>(endpoint_1.cq_handle.dbr_rec_addr,
+                                        endpoint_1.cq_handle.consumer_idx);
+  UpdateCqDbrRecord<ProviderType::MLX5>(endpoint_2.cq_handle.dbr_rec_addr,
+                                        endpoint_2.cq_handle.consumer_idx);
   udma_to_device_barrier();
 }
 
@@ -53,22 +51,22 @@ void LocalRdmaOps() {
 
   // RDMA initialization
   // 1 Create device
-  transport::rdma::RdmaContext rdma_context;
-  transport::rdma::RdmaDeviceList rdma_devices = rdma_context.GetRdmaDeviceList();
-  transport::rdma::RdmaDevice* device = rdma_devices[0];
-  transport::rdma::RdmaDeviceContext* device_context_1 = device->CreateRdmaDeviceContext();
-  transport::rdma::RdmaDeviceContext* device_context_2 = device->CreateRdmaDeviceContext();
+  RdmaContext rdma_context;
+  RdmaDeviceList rdma_devices = rdma_context.GetRdmaDeviceList();
+  RdmaDevice* device = rdma_devices[0];
+  RdmaDeviceContext* device_context_1 = device->CreateRdmaDeviceContext();
+  RdmaDeviceContext* device_context_2 = device->CreateRdmaDeviceContext();
 
   // 2 Create an endpoint
-  transport::rdma::RdmaEndpointConfig config;
+  RdmaEndpointConfig config;
   config.port_id = 1;
   config.gid_index = 1;
   config.max_msgs_num = 1000;
   config.max_cqe_num = 256;
   config.alignment = 4096;
   config.on_gpu = on_gpu;
-  transport::rdma::RdmaEndpoint endpoint_1 = device_context_1->CreateRdmaEndpoint(config);
-  transport::rdma::RdmaEndpoint endpoint_2 = device_context_2->CreateRdmaEndpoint(config);
+  RdmaEndpoint endpoint_1 = device_context_1->CreateRdmaEndpoint(config);
+  RdmaEndpoint endpoint_2 = device_context_2->CreateRdmaEndpoint(config);
 
   // 3 Allgather global endpoint and connect
   device_context_1->ConnectEndpoint(endpoint_1.handle, endpoint_2.handle);
@@ -78,15 +76,15 @@ void LocalRdmaOps() {
   // 4 Register buffer
   void* send_buff;
   HIP_RUNTIME_CHECK(hipMalloc(&send_buff, msg_size));
-  ibgda::MemoryRegion mr_handle_1 =
+  MemoryRegion mr_handle_1 =
       device_context_1->RegisterMemoryRegion(send_buff, msg_size, MR_ACCESS_FLAG);
 
   void* recv_buff;
   HIP_RUNTIME_CHECK(hipMalloc(&recv_buff, msg_size));
-  ibgda::MemoryRegion mr_handle_2 =
+  MemoryRegion mr_handle_2 =
       device_context_2->RegisterMemoryRegion(recv_buff, msg_size, MR_ACCESS_FLAG);
 
-  ibgda::IbgdaReadWriteReq send_req;
+  IbgdaReadWriteReq send_req;
   send_req.qp_handle.qpn = endpoint_1.handle.qpn;
   send_req.qp_handle.post_idx = 0;
   send_req.qp_handle.queue_buff_addr = endpoint_1.wq_handle.sq_addr;
@@ -97,7 +95,7 @@ void LocalRdmaOps() {
   send_req.remote_mr = mr_handle_2;
   send_req.bytes_count = msg_size;
 
-  ibgda::IbgdaReadWriteReq recv_req;
+  IbgdaReadWriteReq recv_req;
   recv_req.qp_handle.qpn = endpoint_2.handle.qpn;
   recv_req.qp_handle.post_idx = 0;
   recv_req.qp_handle.queue_buff_addr = endpoint_2.wq_handle.rq_addr;

@@ -8,8 +8,9 @@ set(CMAKE_BUILD_TYPE Debug)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(USE_ROCM "Whether to use rocm" ON)
-option(BUILD_EXAMPLES "Whether to build examples" OFF)
-option(BUILD_APPLICATION "Whether to build application library" OFF)
+option(BUILD_EXAMPLES "Whether to build examples" ON)
+option(BUILD_APPLICATION "Whether to build application library" ON)
+option(BUILD_SHMEM "Whether to build shmem library" ON)
 
 if (USE_ROCM)
     set(CMAKE_PREFIX_PATH /opt/rocm)
@@ -36,12 +37,13 @@ endif()
 
 if (BUILD_EXAMPLES)
     SET(BUILD_APPLICATION ON)
+    add_subdirectory(examples)
 endif()
 
 if (BUILD_APPLICATION)
     add_subdirectory(src/application)
 endif()
 
-if (BUILD_EXAMPLES)
-    add_subdirectory(examples)
+if (BUILD_SHMEM)
+    add_subdirectory(src/shmem)
 endif()

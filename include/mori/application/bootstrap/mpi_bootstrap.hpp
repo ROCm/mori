@@ -9,7 +9,7 @@ namespace application {
 
 class MpiBootstrapNetwork : public BootstrapNetwork {
  public:
-  MpiBootstrapNetwork();
+  MpiBootstrapNetwork(MPI_Comm mpi_comm);
   ~MpiBootstrapNetwork();
 
   void Initialize();
@@ -17,6 +17,9 @@ class MpiBootstrapNetwork : public BootstrapNetwork {
 
   void Allgather(void* sendbuf, void* recvbuf, size_t sendcount);
   void Barrier();
+
+ private:
+  MPI_Comm mpi_comm;
 };
 
 }  // namespace application

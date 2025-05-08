@@ -1,11 +1,11 @@
 #pragma once
 
 #include <stdint.h>
+// TODO: remove application dependencies
+#include "mori/application/transport/rdma/rdma.hpp"
 
 namespace mori {
 namespace core {
-namespace transport {
-namespace ibgda {
 
 enum ProviderType {
   MLX5 = 1,
@@ -43,39 +43,14 @@ enum ProviderType {
 #define LE64TOH(x) BSWAP64(x)
 #endif
 
-struct QueuePairHandle {
-  uint32_t qpn;
-  uint32_t post_idx;
-  uint32_t wqe_num;
-  void* queue_buff_addr;
-  void* dbr_rec_addr;
-  void* dbr_addr;
-};
-
-struct MemoryRegion {
-  uintptr_t addr;
-  uint32_t lkey;
-  uint32_t rkey;
-  size_t length;
-};
-
-struct IbgdaReadWriteReq {
-  QueuePairHandle qp_handle;
-  MemoryRegion local_mr;
-  MemoryRegion remote_mr;
-  size_t bytes_count;
-};
-
 struct CompletionQueueHandle {
-  void* cq_addr{nullptr};
-  void* dbr_rec_addr{nullptr};
-  // TODO: consumer_idx should be tracked globally
-  uint32_t consumer_idx{0};
-  uint32_t cqe_num{0};
-  uint32_t cqe_size{0};
+  void* cqAddr{nullptr};
+  void* dbrRecAddr{nullptr};
+  // TODO: consIdx should be tracked globally
+  uint32_t consIdx{0};
+  uint32_t cqeNum{0};
+  uint32_t cqeSize{0};
 };
 
-}  // namespace ibgda
-}  // namespace transport
 }  // namespace core
 }  // namespace mori

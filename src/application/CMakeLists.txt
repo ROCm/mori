@@ -6,6 +6,8 @@ add_library(
     bootstrap/mpi_bootstrap.cpp
     transport/rdma/rdma.cpp
     transport/rdma/providers/mlx5/mlx5.cpp
+    memory/symmetric_memory.cpp
+    memory/memory_region.cpp
 )
 
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR}/include)

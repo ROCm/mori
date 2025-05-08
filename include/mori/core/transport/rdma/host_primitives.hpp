@@ -4,32 +4,36 @@
 
 namespace mori {
 namespace core {
-namespace transport {
-namespace ibgda {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           Post Tasks                                           */
 /* ---------------------------------------------------------------------------------------------- */
 
 template <ProviderType PrvdType>
-static __host__ uint64_t PostSend(IbgdaReadWriteReq& req);
+static __host__ uint64_t PostSend(void* queue_buff_addr, uint32_t& post_idx, uint32_t wqe_num,
+                                  uint32_t qpn, uintptr_t laddr, uint64_t lkey, size_t bytes_count);
 
 template <ProviderType PrvdType>
-static __host__ void PostRecv(IbgdaReadWriteReq& req);
+static __host__ void PostRecv(void* queue_buff_addr, uint32_t wqe_num, uint32_t& post_idx,
+                              uintptr_t laddr, uint64_t lkey, size_t bytes_count);
 
 template <ProviderType PrvdType>
-static __host__ uint64_t PostWrite(IbgdaReadWriteReq& req);
+static __host__ uint64_t PostWrite(void* queue_buff_addr, uint32_t wqe_num, uint32_t& post_idx,
+                                   uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
+                                   uint64_t rkey, size_t bytes_count);
 
 template <ProviderType PrvdType>
-static __host__ uint64_t PostRead(IbgdaReadWriteReq& req);
+static __host__ uint64_t PostRead(void* queue_buff_addr, uint32_t wqe_num, uint32_t& post_idx,
+                                  uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
+                                  uint64_t rkey, size_t bytes_count);
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Doorbell                                            */
 /* ---------------------------------------------------------------------------------------------- */
 template <ProviderType PrvdType>
-static __host__ void UpdateSendDbrRecord(void* dbr_rec_addr, uint32_t wqe_idx);
+static __host__ void UpdateSendDbrRecord(void* dbrRecAddr, uint32_t wqe_idx);
 
 template <ProviderType PrvdType>
-static __host__ void UpdateRecvDbrRecord(void* dbr_rec_addr, uint32_t wqe_idx);
+static __host__ void UpdateRecvDbrRecord(void* dbrRecAddr, uint32_t wqe_idx);
 
 template <ProviderType PrvdType>
 static __host__ void RingDoorbell(void* dbr_addr, uint64_t dbr_val);
@@ -44,9 +48,7 @@ template <ProviderType PrvdType>
 static __host__ int PoolCq(CompletionQueueHandle cq);
 
 template <ProviderType PrvdType>
-static __host__ void UpdateCqDbrRecord(void* dbr_rec_addr, uint32_t cons_idx);
+static __host__ void UpdateCqDbrRecord(void* dbrRecAddr, uint32_t cons_idx);
 
-}  // namespace ibgda
-}  // namespace transport
 }  // namespace core
 }  // namespace mori

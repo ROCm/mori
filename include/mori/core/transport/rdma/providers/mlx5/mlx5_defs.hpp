@@ -2,8 +2,6 @@
 
 namespace mori {
 namespace core {
-namespace transport {
-namespace ibgda {
 
 enum {
   MLX5_CQ_SET_CI = 0,
@@ -15,7 +13,5 @@ enum ibv_gid_type_sysfs {
   IBV_GID_TYPE_SYSFS_ROCE_V2,
 };
 
-}  // namespace ibgda
-}  // namespace transport
 }  // namespace core
 }  // namespace mori
