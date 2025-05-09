@@ -11,7 +11,11 @@ namespace application {
 SymmMemManager::SymmMemManager(BootstrapNetwork& bootNet, RdmaDeviceContext& context)
     : bootNet(bootNet), context(context) {}
 
-SymmMemManager::~SymmMemManager() {}
+SymmMemManager::~SymmMemManager() {
+  while (!memObjPool.empty()) {
+    DeRegisterSymmMemObj(memObjPool.begin()->first);
+  }
+}
 
 SymmMemObjPtr SymmMemManager::HostMalloc(size_t size, size_t alignment) {
   void* ptr = nullptr;
@@ -51,13 +55,13 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
 
   // Exchange pointers
   cpuMemObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
-  cpuMemObj->peerPtrs[rank] = reinterpret_cast<uintptr_t>(cpuMemObj->localPtr);
   bootNet.Allgather(&localPtr, cpuMemObj->peerPtrs, sizeof(uintptr_t));
+  cpuMemObj->peerPtrs[rank] = reinterpret_cast<uintptr_t>(cpuMemObj->localPtr);
 
   // Exchange rkeys
   cpuMemObj->peerRkeys = static_cast<uint32_t*>(calloc(worldSize, sizeof(uint32_t)));
+  bootNet.Allgather(&mr.rkey, cpuMemObj->peerRkeys, sizeof(uint32_t));
   cpuMemObj->peerRkeys[rank] = mr.rkey;
-  bootNet.Allgather(&mr.rkey, cpuMemObj->peerRkeys, sizeof(uintptr_t));
 
   // Copy memory object to GPU memory, we need to access it from GPU directly
   SymmMemObj* gpuMemObj;
@@ -72,13 +76,14 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerRkeys, cpuMemObj->peerRkeys,
                               sizeof(uint32_t) * worldSize, hipMemcpyHostToDevice));
 
-  SymmMemObjPtr memObjPtr{cpuMemObj, gpuMemObj};
-  memObjPool.insert({cpuMemObj->localPtr, memObjPtr});
-  return memObjPtr;
+  memObjPool.insert({localPtr, SymmMemObjPtr{cpuMemObj, gpuMemObj}});
+  return memObjPool.at(localPtr);
 }
 
 void SymmMemManager::DeRegisterSymmMemObj(void* localPtr) {
   if (memObjPool.find(localPtr) == memObjPool.end()) return;
+
+  context.DeRegisterMemoryRegion(localPtr);
 
   SymmMemObjPtr memObjPtr = memObjPool.at(localPtr);
   free(memObjPtr.cpu->peerPtrs);

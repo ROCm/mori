@@ -15,9 +15,6 @@ struct BootStates {
   application::BootstrapNetwork* bootNet{nullptr};
 };
 
-constexpr int MaxRdmaEndpointNum = 1024;
-extern __constant__ application::RdmaEndpoint* epsStartAddr;
-
 using RdmaEndpointList = std::vector<application::RdmaEndpoint>;
 using RdmaEndpointHandleList = std::vector<application::RdmaEndpointHandle>;
 
@@ -39,6 +36,16 @@ struct ShmemStates {
   RdmaStates* rdmaStates{nullptr};
   MemoryStates* memoryStates{nullptr};
 };
+
+constexpr int MaxRdmaEndpointNum = 1024;
+
+struct GpuStates {
+  int rank;
+  int worldSize;
+  application::RdmaEndpoint* epsStartAddr;
+};
+
+extern __constant__ GpuStates globalGpuStates;
 
 class ShmemStatesSingleton {
  public:

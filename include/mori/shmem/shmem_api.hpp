@@ -12,6 +12,7 @@ namespace shmem {
 /* ---------------------------------------------------------------------------------------------- */
 
 int ShmemMpiInit(MPI_Comm);
+int ShmemMpiFinalize();
 
 int ShmemMyPe();
 int ShmemNPes();
@@ -33,6 +34,9 @@ enum ShmemTeamType {
 
 void* ShmemMalloc(size_t size);
 void ShmemFree(void*);
+
+// Note: temporary API for testing
+application::SymmMemObjPtr ShmemQueryMemObjPtr(void*);
 
 int ShmemBufferRegister(void* ptr, size_t size);
 int ShmemBufferDeRegister(void* ptr, size_t size);

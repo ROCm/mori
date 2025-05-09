@@ -13,14 +13,33 @@ using namespace mori::core;
   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | \
       IBV_ACCESS_REMOTE_ATOMIC
 
+__global__ void Write(RdmaEndpoint endpoint, MemoryRegion localMr, MemoryRegion remoteMr,
+                      int msg_size) {
+  uint32_t postIdx = 0;
+  printf("in kernel %p\n", endpoint.wqHandle.sqAddr);
+  uint64_t dbr_val = PostWrite<ProviderType::MLX5>(
+      endpoint.wqHandle.sqAddr, endpoint.wqHandle.sqWqeNum, &postIdx, endpoint.handle.qpn,
+      localMr.addr, localMr.lkey, remoteMr.addr, remoteMr.rkey, msg_size);
+  __threadfence_system();
+  UpdateSendDbrRecord<ProviderType::MLX5>(endpoint.wqHandle.dbrRecAddr, postIdx);
+  __threadfence_system();
+  RingDoorbell<ProviderType::MLX5>(endpoint.wqHandle.dbrAddr, dbr_val);
+  __threadfence_system();
+
+  uint32_t consIdx = 0;
+  int snd_opcode = PollCq<ProviderType::MLX5>(endpoint.cqHandle.cqAddr, endpoint.cqHandle.cqeSize,
+                                              endpoint.cqHandle.cqeNum, &consIdx);
+}
+
 void LocalRdmaOps() {
   MpiBootstrapNetwork bootstrap_net(MPI_COMM_WORLD);
   bootstrap_net.Initialize();
 
-  bool on_gpu = false;
+  bool on_gpu = true;
   int allreduce_size = 1024;
   int local_rank = bootstrap_net.GetLocalRank();
   int world_size = bootstrap_net.GetWorldSize();
+  HIP_RUNTIME_CHECK(hipSetDevice(local_rank));
 
   // RDMA initialization
   // 1 Create device
@@ -31,17 +50,17 @@ void LocalRdmaOps() {
 
   // 2 Create an endpoint
   RdmaEndpointConfig config;
-  config.port_id = 1;
-  config.gid_index = 1;
-  config.max_msgs_num = 10;
-  config.max_cqe_num = 256;
+  config.portId = 1;
+  config.gidIdx = 1;
+  config.maxMsgsNum = 10;
+  config.maxCqeNum = 256;
   config.alignment = 4096;
-  config.on_gpu = on_gpu;
+  config.onGpu = on_gpu;
   RdmaEndpoint endpoint = device_context->CreateRdmaEndpoint(config);
 
   // 3 Allgather global endpoint and connect
   RdmaEndpointHandle global_rdma_ep_handles[world_size];
-  bootstrap_net.Allgather(&endpoint.handle, global_rdma_ep_handles, sizeof(endpoint.handle));
+  bootstrap_net.Allgather(&endpoint.handle, global_rdma_ep_handles, sizeof(RdmaEndpointHandle));
 
   std::cout << "Local rank " << local_rank << " " << endpoint.handle << std::endl;
 
@@ -69,34 +88,16 @@ void LocalRdmaOps() {
   printf("Before: Local rank %d val %d\n", local_rank, ((char*)buffer)[256]);
 
   if (local_rank == 0) {
-    IbgdaReadWriteReq rreq;
-    rreq.qp_handle.qpn = endpoint.handle.qpn;
-    rreq.qp_handle.post_idx = 0;
-    rreq.qp_handle.queue_buff_addr = endpoint.wq_handle.sq_addr;
-    rreq.qp_handle.dbr_rec_addr = endpoint.wq_handle.dbr_rec_addr;
-    rreq.qp_handle.dbr_addr = endpoint.wq_handle.dbr_addr;
-    rreq.local_mr = mr_handle;
-    rreq.remote_mr = global_mr_handles[1];
-    rreq.bytes_count = allreduce_size;
-
-    uint64_t dbr_val = PostRead<ProviderType::MLX5>(rreq);
-    // rreq.qp_handle.post_idx = 1;
-    udma_to_device_barrier();
-    UpdateSendDbrRecord<ProviderType::MLX5>(endpoint.wq_handle.dbr_rec_addr,
-                                            rreq.qp_handle.post_idx);
-    udma_to_device_barrier();
-    RingDoorbell<ProviderType::MLX5>(endpoint.wq_handle.dbr_addr, dbr_val);
-    udma_to_device_barrier();
-
-    endpoint.cq_handle.consumer_idx = 0;
-    int snd_opcode = PoolCq<ProviderType::MLX5>(endpoint.cq_handle);
-    printf("snd opcode %d\n", snd_opcode);
+    printf("out kernel %p\n", endpoint.wqHandle.sqAddr);
+    Write<<<1, 1>>>(endpoint, global_mr_handles[0], global_mr_handles[1], allreduce_size);
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   }
+  bootstrap_net.Barrier();
 
   printf("After: Local rank %d val %d\n", local_rank, ((char*)buffer)[256]);
-
-  bootstrap_net.Barrier();
   bootstrap_net.Finalize();
+
+  MPI_Finalize();
 }
 
 int main() { LocalRdmaOps(); }

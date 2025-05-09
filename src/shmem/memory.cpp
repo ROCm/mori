@@ -21,6 +21,11 @@ void ShmemFree(void* localPtr) {
   states->memoryStates->symmMemMgr->Free(localPtr);
 }
 
+application::SymmMemObjPtr ShmemQueryMemObjPtr(void* localPtr) {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  return states->memoryStates->symmMemMgr->Get(localPtr);
+}
+
 int ShmemBufferRegister(void* ptr, size_t size) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
   states->memoryStates->mrMgr->RegisterBuffer(ptr, size);

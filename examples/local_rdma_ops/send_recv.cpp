@@ -31,8 +31,8 @@ void SendRecvOnCpu(IbgdaReadWriteReq& send_req, IbgdaReadWriteReq& recv_req,
   udma_to_device_barrier();
 
   // Poll CQ
-  int snd_opcode = PoolCq<ProviderType::MLX5>(endpoint_1.cq_handle);
-  int rcv_opcode = PoolCq<ProviderType::MLX5>(endpoint_2.cq_handle);
+  int snd_opcode = PollCq<ProviderType::MLX5>(endpoint_1.cq_handle);
+  int rcv_opcode = PollCq<ProviderType::MLX5>(endpoint_2.cq_handle);
   udma_from_device_barrier();
 
   endpoint_1.cq_handle.consumer_idx += 1;

@@ -1,8 +1,6 @@
 #pragma once
 
 #include <stdint.h>
-// TODO: remove application dependencies
-#include "mori/application/transport/rdma/rdma.hpp"
 
 namespace mori {
 namespace core {

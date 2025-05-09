@@ -24,7 +24,7 @@ __device__ void SendThreadKernel(RdmaEndpoint& endpoint_1, MemoryRegion mr, int 
 
     __threadfence_system();
     uint64_t dbr_val = PostSend<ProviderType::MLX5>(
-        endpoint_1.wqHandle.sqAddr, postIdx, endpoint_1.wqHandle.sqWqeNum, endpoint_1.handle.qpn,
+        endpoint_1.wqHandle.sqAddr, &postIdx, endpoint_1.wqHandle.sqWqeNum, endpoint_1.handle.qpn,
         mr.addr, mr.lkey, msg_size);
     __threadfence_system();
     UpdateSendDbrRecord<ProviderType::MLX5>(endpoint_1.wqHandle.dbrRecAddr, postIdx);
@@ -33,9 +33,9 @@ __device__ void SendThreadKernel(RdmaEndpoint& endpoint_1, MemoryRegion mr, int 
     __threadfence_system();
 
     int snd_opcode =
-        PoolCq<ProviderType::MLX5>(endpoint_1.cqHandle.cqAddr, endpoint_1.cqHandle.cqeSize,
-                                   endpoint_1.cqHandle.cqeNum, endpoint_1.cqHandle.consIdx);
-    endpoint_1.cqHandle.consIdx += 1;
+        PollCq<ProviderType::MLX5>(endpoint_1.cqHandle.cqAddr, endpoint_1.cqHandle.cqeSize,
+                                   endpoint_1.cqHandle.cqeNum, &endpoint_1.cqHandle.consIdx);
+    // endpoint_1.cqHandle.consIdx += 1;
     UpdateCqDbrRecord<ProviderType::MLX5>(endpoint_1.cqHandle.dbrRecAddr,
                                           endpoint_1.cqHandle.consIdx);
     // printf("snd_opcode %d val %d\n", snd_opcode, reinterpret_cast<char*>(mr_handle_1.addr)[0]);
@@ -50,16 +50,16 @@ __device__ void RecvThreadKernel(RdmaEndpoint& endpoint_2, MemoryRegion mr, int 
     uint8_t send_val = i;
 
     __threadfence_system();
-    PostRecv<ProviderType::MLX5>(endpoint_2.wqHandle.rqAddr, endpoint_2.wqHandle.rqWqeNum, postIdx,
+    PostRecv<ProviderType::MLX5>(endpoint_2.wqHandle.rqAddr, endpoint_2.wqHandle.rqWqeNum, &postIdx,
                                  mr.addr, mr.lkey, msg_size);
     __threadfence_system();
     UpdateRecvDbrRecord<ProviderType::MLX5>(endpoint_2.wqHandle.dbrRecAddr, postIdx);
     __threadfence_system();
 
     int rcv_opcode =
-        PoolCq<ProviderType::MLX5>(endpoint_2.cqHandle.cqAddr, endpoint_2.cqHandle.cqeSize,
-                                   endpoint_2.cqHandle.cqeNum, endpoint_2.cqHandle.consIdx);
-    endpoint_2.cqHandle.consIdx += 1;
+        PollCq<ProviderType::MLX5>(endpoint_2.cqHandle.cqAddr, endpoint_2.cqHandle.cqeSize,
+                                   endpoint_2.cqHandle.cqeNum, &endpoint_2.cqHandle.consIdx);
+    // endpoint_2.cqHandle.consIdx += 1;
     UpdateCqDbrRecord<ProviderType::MLX5>(endpoint_2.cqHandle.dbrRecAddr,
                                           endpoint_2.cqHandle.consIdx);
 

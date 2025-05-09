@@ -10,24 +10,21 @@ namespace shmem {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          Intialization                                         */
 /* ---------------------------------------------------------------------------------------------- */
-__constant__ application::RdmaEndpoint* epsStartAddr;
-
-__global__ void Test(int rank) { printf("%d %p\n", rank, epsStartAddr); }
+__constant__ GpuStates globalGpuStates;
 
 void RdmaStatesInit() {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
   states->rdmaStates = new RdmaStates();
   RdmaStates* rdmaStates = states->rdmaStates;
 
-  rdmaStates->context = new application::RdmaContext();
-
-  // TODO: select device and port
-  const application::RdmaDeviceList& devices = rdmaStates->context->GetRdmaDeviceList();
-  rdmaStates->deviceContext = devices[0]->CreateRdmaDeviceContext();
-
   int rank = states->bootStates->rank;
   int worldSize = states->bootStates->worldSize;
   assert(worldSize * worldSize <= MaxRdmaEndpointNum);
+
+  // TODO: select device and port
+  rdmaStates->context = new application::RdmaContext();
+  const application::RdmaDeviceList& devices = rdmaStates->context->GetRdmaDeviceList();
+  rdmaStates->deviceContext = devices[1]->CreateRdmaDeviceContext();
 
   application::RdmaEndpointConfig config;
   config.portId = 1;
@@ -41,12 +38,10 @@ void RdmaStatesInit() {
   for (int i = 0; i < worldSize; i++) {
     if (rank == i) {
       rdmaStates->localEps.push_back({});
-      rdmaStates->remoteEpHandles.push_back(RdmaEndpointHandleList(worldSize));
-      continue;
-    };
-
-    application::RdmaEndpoint ep = rdmaStates->deviceContext->CreateRdmaEndpoint(config);
-    rdmaStates->localEps.push_back(ep);
+    } else {
+      application::RdmaEndpoint ep = rdmaStates->deviceContext->CreateRdmaEndpoint(config);
+      rdmaStates->localEps.push_back(ep);
+    }
 
     rdmaStates->remoteEpHandles.push_back(RdmaEndpointHandleList(worldSize));
     states->bootStates->bootNet->Allgather(&(rdmaStates->localEps.data()[i].handle),
@@ -60,14 +55,12 @@ void RdmaStatesInit() {
                                                rdmaStates->remoteEpHandles[rank][i]);
   }
 
-  // Move ep handle to constant gpu memory
+  // Copy endpoints to GPU
   HIP_RUNTIME_CHECK(
       hipMalloc(&rdmaStates->localEpsGpu, sizeof(application::RdmaEndpoint) * worldSize));
   HIP_RUNTIME_CHECK(hipMemcpy(rdmaStates->localEpsGpu, rdmaStates->localEps.data(),
                               sizeof(application::RdmaEndpoint) * worldSize,
                               hipMemcpyHostToDevice));
-  HIP_RUNTIME_CHECK(hipMemcpyToSymbol(epsStartAddr, &rdmaStates->localEpsGpu, sizeof(void*), 0,
-                                      hipMemcpyHostToDevice));
 }
 
 void MemoryStatesInit() {
@@ -77,6 +70,20 @@ void MemoryStatesInit() {
       *states->bootStates->bootNet, *states->rdmaStates->deviceContext);
   states->memoryStates->mrMgr =
       new application::MemoryRegionManager(*states->rdmaStates->deviceContext);
+}
+
+void GpuStateInit() {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  int rank = states->bootStates->rank;
+  int worldSize = states->bootStates->worldSize;
+
+  GpuStates gpuStates;
+  gpuStates.rank = rank;
+  gpuStates.worldSize = worldSize;
+  gpuStates.epsStartAddr = states->rdmaStates->localEpsGpu;
+
+  HIP_RUNTIME_CHECK(
+      hipMemcpyToSymbol(globalGpuStates, &gpuStates, sizeof(GpuStates), 0, hipMemcpyHostToDevice));
 }
 
 int ShmemMpiInit(MPI_Comm mpi_comm) {
@@ -95,6 +102,23 @@ int ShmemMpiInit(MPI_Comm mpi_comm) {
 
   RdmaStatesInit();
   MemoryStatesInit();
+  GpuStateInit();
+  return 0;
+}
+
+int ShmemMpiFinalize() {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+
+  delete states->memoryStates->symmMemMgr;
+  delete states->memoryStates->mrMgr;
+  delete states->memoryStates;
+
+  delete states->rdmaStates->deviceContext;
+  delete states->rdmaStates->context;
+  delete states->rdmaStates;
+
+  states->bootStates->bootNet->Finalize();
+  delete states->bootStates->bootNet;
   return 0;
 }
 

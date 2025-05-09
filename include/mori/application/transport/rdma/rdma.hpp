@@ -48,8 +48,8 @@ struct EthernetEndpointHandle {
 struct RdmaEndpointHandle {
   uint32_t psn{0};
   uint32_t qpn{0};
-  struct InfiniBandEndpointHandle ib;
-  struct EthernetEndpointHandle eth;
+  InfiniBandEndpointHandle ib;
+  EthernetEndpointHandle eth;
 };
 
 struct WorkQueueHandle {
@@ -179,7 +179,8 @@ static std::ostream& operator<<(std::ostream& s,
 static std::ostream& operator<<(std::ostream& s,
                                 const mori::application::RdmaEndpointHandle handle) {
   std::stringstream ss;
-  ss << "psn: " << handle.psn << " qpn: " << handle.qpn;
+  ss << "psn: " << handle.psn << " qpn: " << handle.qpn << " ib [" << handle.ib.lid << "] "
+     << " eth [" << handle.eth << "]";
   s << ss.str();
   return s;
 }
