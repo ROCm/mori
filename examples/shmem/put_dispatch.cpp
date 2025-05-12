@@ -119,7 +119,6 @@ void CheckTestResult(EpDispatchConfig config, EpDispatchHandle handle) {
   void* globalInpTokBufCpu = malloc(config.worldSize * inpTokSize);
   MPI_Allgather(inpTokBufCpu, inpTokSize, MPI_CHAR, globalInpTokBufCpu, inpTokSize, MPI_CHAR,
                 MPI_COMM_WORLD);
-  printf("====%d\n", reinterpret_cast<uint32_t*>(globalInpTokBufCpu)[8197]);
 
   // Check result
   for (int i = 0; i < config.worldSize; i++) {
@@ -133,9 +132,9 @@ void CheckTestResult(EpDispatchConfig config, EpDispatchHandle handle) {
       printf("rank %d ep %d token id %d offset %d ep offset %d\n", config.rank, i, tokenId,
              tokenOffset, i * maxNumTokenIndices);
       for (int k = 0; k < config.hiddenDim; k++) {
-        printf("%d %d %d\n", tokenOffset + k,
-               reinterpret_cast<uint32_t*>(globalInpTokBufCpu)[tokenOffset + k],
-               reinterpret_cast<uint32_t*>(handle.outTokMemObj.cpu->localPtr)[tokenOffset + k]);
+        // printf("%d %d %d\n", tokenOffset + k,
+        //        reinterpret_cast<uint32_t*>(globalInpTokBufCpu)[tokenOffset + k],
+        //        reinterpret_cast<uint32_t*>(handle.outTokMemObj.cpu->localPtr)[tokenOffset + k]);
         assert(reinterpret_cast<uint32_t*>(globalInpTokBufCpu)[tokenOffset + k] ==
                reinterpret_cast<uint32_t*>(handle.outTokMemObj.cpu->localPtr)[tokenOffset + k]);
       }
@@ -161,7 +160,7 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
     int tokenId = i / config.numExpertPerToken;
 
     int tokenOffset = tokenId * config.hiddenDim * sizeof(uint32_t);
-    int destEpOffset = destExpert * config.maxNumTokenPerRank * config.hiddenDim * sizeof(uint32_t);
+    int destEpOffset = myPe * config.maxNumTokenPerRank * config.hiddenDim * sizeof(uint32_t);
 
     if (laneId == 0) {
       MemoryRegion srcMr = handle.inpTokMemObj.gpu->GetMemoryRegion(myPe);
@@ -175,7 +174,7 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
 
 void LaunchEpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatchHandle handle) {
   dim3 grid(config.warpNum);
-  dim3 block(warpSize);
+  dim3 block(1);
   EpDispatchWithPutMemAPIKernel<<<grid, block>>>(config, handle);
 }
 
@@ -196,8 +195,8 @@ void EpDispatchWithPutMemAPI() {
   config.rank = myPe;
   config.worldSize = npes;
   config.hiddenDim = 4096;
-  config.numExpertPerToken = 1;
-  config.maxNumTokenPerRank = 2;
+  config.numExpertPerToken = 2;
+  config.maxNumTokenPerRank = 4;
   config.warpNum = 1;
 
   // Intialize data
