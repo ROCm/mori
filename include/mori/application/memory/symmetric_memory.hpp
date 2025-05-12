@@ -18,6 +18,15 @@ struct SymmMemObj {
   size_t size{0};
   uint32_t lkey{0};
   uint32_t* peerRkeys{nullptr};
+
+  __device__ MemoryRegion GetMemoryRegion(int pe) {
+    MemoryRegion mr;
+    mr.addr = peerPtrs[pe];
+    mr.lkey = lkey;
+    mr.rkey = peerRkeys[pe];
+    mr.length = size;
+    return mr;
+  }
 };
 
 struct SymmMemObjPtr {
