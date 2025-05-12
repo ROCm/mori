@@ -33,7 +33,7 @@ add_executable(
 target_link_libraries(moe_all2all_dispatch hip::host hip::device)
 
 add_executable(
-    put_warp
-    shmem/put_warp.cpp
+    put_thread
+    shmem/put_thread.cpp
 )
-target_link_libraries(put_warp mori_shmem hip::host hip::device)
+target_link_libraries(put_thread mori_shmem hip::host hip::device)

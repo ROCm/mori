@@ -124,6 +124,9 @@ class RdmaDevice {
   virtual ~RdmaDevice();
 
   int GetDevicePortNum() const;
+  std::vector<int> GetActivePortIds() const;
+
+  std::string Name() const;
 
   virtual RdmaDeviceContext* CreateRdmaDeviceContext();
 

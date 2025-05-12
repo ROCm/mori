@@ -24,7 +24,18 @@ void RdmaStatesInit() {
   // TODO: select device and port
   rdmaStates->context = new application::RdmaContext();
   const application::RdmaDeviceList& devices = rdmaStates->context->GetRdmaDeviceList();
-  rdmaStates->deviceContext = devices[1]->CreateRdmaDeviceContext();
+
+  // Find the first device with active port
+  int portId = 0;
+  application::RdmaDevice* selectedDevice = nullptr;
+  for (auto* device : devices) {
+    std::vector<int> activePorts = device->GetActivePortIds();
+    if (activePorts.empty()) continue;
+    portId = activePorts[0];
+    selectedDevice = device;
+  }
+  assert(portId > 0);
+  rdmaStates->deviceContext = selectedDevice->CreateRdmaDeviceContext();
 
   application::RdmaEndpointConfig config;
   config.portId = 1;

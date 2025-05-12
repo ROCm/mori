@@ -43,6 +43,8 @@ void RdmaDeviceContext::DeRegisterMemoryRegion(void* ptr) {
 /*                                           RdmaDevice                                           */
 /* ---------------------------------------------------------------------------------------------- */
 RdmaDevice::RdmaDevice(ibv_device* device) : device(device) {
+  assert(device);
+
   defaultContext = ibv_open_device(device);
   assert(defaultContext);
 
@@ -54,6 +56,22 @@ RdmaDevice::RdmaDevice(ibv_device* device) : device(device) {
 RdmaDevice::~RdmaDevice() { ibv_close_device(defaultContext); }
 
 int RdmaDevice::GetDevicePortNum() const { return deviceAttr->orig_attr.phys_port_cnt; }
+
+std::vector<int> RdmaDevice::GetActivePortIds() const {
+  std::vector<int> activePorts;
+  for (int port = 1; port <= deviceAttr->orig_attr.phys_port_cnt; ++port) {
+    ibv_port_attr portAttr;
+    int status = ibv_query_port(defaultContext, port, &portAttr);
+    assert(!status);
+
+    if (portAttr.state == IBV_PORT_ACTIVE) {
+      activePorts.push_back(port);
+    }
+  }
+  return activePorts;
+}
+
+std::string RdmaDevice::Name() const { return device->name; }
 
 RdmaDeviceContext* RdmaDevice::CreateRdmaDeviceContext() {
   ibv_pd* pd = ibv_alloc_pd(defaultContext);
