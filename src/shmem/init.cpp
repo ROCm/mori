@@ -38,10 +38,11 @@ void RdmaStatesInit() {
   rdmaStates->deviceContext = selectedDevice->CreateRdmaDeviceContext();
 
   application::RdmaEndpointConfig config;
-  config.portId = 1;
+  config.portId = portId;
   config.gidIdx = 1;
+  // TODO: expose cqe / wqe numfig con
   config.maxMsgsNum = 1024;
-  config.maxCqeNum = 256;
+  config.maxCqeNum = 1024;
   config.alignment = 4096;
   config.onGpu = true;
 
@@ -65,13 +66,6 @@ void RdmaStatesInit() {
     rdmaStates->deviceContext->ConnectEndpoint(rdmaStates->localEps[i].handle,
                                                rdmaStates->remoteEpHandles[rank][i]);
   }
-
-  // Copy endpoints to GPU
-  HIP_RUNTIME_CHECK(
-      hipMalloc(&rdmaStates->localEpsGpu, sizeof(application::RdmaEndpoint) * worldSize));
-  HIP_RUNTIME_CHECK(hipMemcpy(rdmaStates->localEpsGpu, rdmaStates->localEps.data(),
-                              sizeof(application::RdmaEndpoint) * worldSize,
-                              hipMemcpyHostToDevice));
 }
 
 void MemoryStatesInit() {
@@ -85,13 +79,29 @@ void MemoryStatesInit() {
 
 void GpuStateInit() {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  RdmaStates* rdmaStates = states->rdmaStates;
+
   int rank = states->bootStates->rank;
   int worldSize = states->bootStates->worldSize;
 
+  // Copy endpoints to GPU
+  HIP_RUNTIME_CHECK(
+      hipMalloc(&rdmaStates->localEpsGpu, sizeof(application::RdmaEndpoint) * worldSize));
+  HIP_RUNTIME_CHECK(hipMemcpy(rdmaStates->localEpsGpu, rdmaStates->localEps.data(),
+                              sizeof(application::RdmaEndpoint) * worldSize,
+                              hipMemcpyHostToDevice));
+
+  // Allocate locks
+  HIP_RUNTIME_CHECK(hipMalloc(&rdmaStates->epCqLockMemGpu, MaxRdmaEndpointNum * sizeof(uint32_t)));
+  HIP_RUNTIME_CHECK(
+      hipMemset(rdmaStates->epCqLockMemGpu, 0, MaxRdmaEndpointNum * sizeof(uint32_t)));
+
+  // Copy to gpu constance memory
   GpuStates gpuStates;
   gpuStates.rank = rank;
   gpuStates.worldSize = worldSize;
-  gpuStates.epsStartAddr = states->rdmaStates->localEpsGpu;
+  gpuStates.epsStartAddr = rdmaStates->localEpsGpu;
+  gpuStates.epCqLockMemGpu = rdmaStates->epCqLockMemGpu;
 
   HIP_RUNTIME_CHECK(
       hipMemcpyToSymbol(globalGpuStates, &gpuStates, sizeof(GpuStates), 0, hipMemcpyHostToDevice));

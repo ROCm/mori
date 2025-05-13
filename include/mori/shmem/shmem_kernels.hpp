@@ -53,14 +53,24 @@ __device__ void ShmemQuietThread() {
   int worldSize = globalGpuStates->worldSize;
 
   for (int i = 0; i < worldSize; i++) {
+    // This assume we do not have endpoint to self
     if (i == rank) continue;
+
     application::CompletionQueueHandle& cq = ep[i].cqHandle;
     application::WorkQueueHandle& wq = ep[i].wqHandle;
-    if (cq.consIdx < wq.postIdx) {
+
+    // Assume every wqe generates a cqe, so we can use work queue postIdx
+    // TODO: 1 Should not use postIdx since 1 wqe can inc postIdx by > 1
+    // TODO: 2 How to prevent cqe overflow?
+    int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
+    while ((core::atomicLoadSeqCst(&cq.consIdx) + 1) < core::atomicLoadSeqCst(&wq.postIdx)) {
       int opcode = core::PollCq<PrvdType>(cq.cqAddr, cq.cqeSize, cq.cqeNum, &cq.consIdx);
       if (opcode == MLX5_CQE_RESP_ERR || opcode == MLX5_CQE_REQ_ERR) {
         printf("rank %d opcode %d\n", rank, opcode);
+        assert(false);
       }
+
+      core::UpdateCqDbrRecord<PrvdType>(cq.dbrRecAddr, core::atomicLoadSeqCst(&cq.consIdx));
     }
   }
 }

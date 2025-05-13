@@ -43,3 +43,9 @@ add_executable(
     shmem/put_dispatch.cpp
 )
 target_link_libraries(put_dispatch mori_shmem hip::host hip::device)
+
+add_executable(
+    concurrent_put_thread
+    shmem/concurrent_put_thread.cpp
+)
+target_link_libraries(concurrent_put_thread mori_shmem hip::host hip::device)

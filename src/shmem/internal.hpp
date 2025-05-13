@@ -23,6 +23,7 @@ struct RdmaStates {
   application::RdmaDeviceContext* deviceContext{nullptr};
   RdmaEndpointList localEps;
   application::RdmaEndpoint* localEpsGpu;
+  uint32_t* epCqLockMemGpu;
   std::vector<RdmaEndpointHandleList> remoteEpHandles;
 };
 
@@ -43,6 +44,7 @@ struct GpuStates {
   int rank;
   int worldSize;
   application::RdmaEndpoint* epsStartAddr;
+  uint32_t* epCqLockMemGpu;
 };
 
 extern __constant__ GpuStates globalGpuStates;

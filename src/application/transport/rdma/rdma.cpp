@@ -78,6 +78,17 @@ RdmaDeviceContext* RdmaDevice::CreateRdmaDeviceContext() {
   return new RdmaDeviceContext(this, pd);
 }
 
+ActiveDevicePortList GetActiveDevicePortList(const RdmaDeviceList& devices) {
+  ActiveDevicePortList activeDevPortList;
+  for (RdmaDevice* device : devices) {
+    std::vector<int> activePorts = device->GetActivePortIds();
+    for (int port : activePorts) {
+      activeDevPortList.push_back({device, port});
+    }
+  }
+  return activeDevPortList;
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           RdmaContext                                          */
 /* ---------------------------------------------------------------------------------------------- */

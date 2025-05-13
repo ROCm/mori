@@ -14,7 +14,7 @@
 namespace mori {
 namespace application {
 
-#define MR_DEFAULT_accessFlag                                                 \
+#define MR_DEFAULT_ACCESS_FLAG                                                \
   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | \
       IBV_ACCESS_REMOTE_ATOMIC
 
@@ -25,7 +25,9 @@ enum RdmaDeviceVendorId {
 
 #define PAGESIZE uint32_t(sysconf(_SC_PAGE_SIZE))
 
-// TODO: set defalut values
+/* -------------------------------------------------------------------------- */
+/*                             Rdma Data Structure                            */
+/* -------------------------------------------------------------------------- */
 struct RdmaEndpointConfig {
   uint32_t portId{1};
   uint32_t gidIdx{1};  // TODO: auto detect?
@@ -85,13 +87,16 @@ struct MemoryRegion {
   size_t length;
 };
 
+/* -------------------------------------------------------------------------- */
+/*                              RdmaDeviceContext                             */
+/* -------------------------------------------------------------------------- */
 class RdmaDeviceContext {
  public:
   RdmaDeviceContext(RdmaDevice* rdma_device, ibv_pd* in_pd);
   ~RdmaDeviceContext();
 
   virtual MemoryRegion RegisterMemoryRegion(void* ptr, size_t size,
-                                            int accessFlag = MR_DEFAULT_accessFlag);
+                                            int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual void DeRegisterMemoryRegion(void* ptr);
 
   // TODO: query gid entry by ibv_query_gid_table
@@ -118,6 +123,9 @@ class RdmaDeviceContext {
   std::unordered_map<void*, ibv_mr*> mrPool;
 };
 
+/* -------------------------------------------------------------------------- */
+/*                                 RdmaDevice                                 */
+/* -------------------------------------------------------------------------- */
 class RdmaDevice {
  public:
   RdmaDevice(ibv_device* device);
@@ -133,16 +141,21 @@ class RdmaDevice {
  protected:
   friend class RdmaDeviceContext;
 
-  // managed by RdmaContext
   ibv_device* device;
   ibv_context* defaultContext;
 
-  // Managed by this object
   std::unique_ptr<ibv_device_attr_ex> deviceAttr;
 };
 
 using RdmaDeviceList = std::vector<RdmaDevice*>;
+using ActiveDevicePort = std::pair<RdmaDevice*, int>;
+using ActiveDevicePortList = std::vector<ActiveDevicePort>;
 
+ActiveDevicePortList GetActiveDevicePortList(const RdmaDeviceList&);
+
+/* -------------------------------------------------------------------------- */
+/*                                 RdmaContext                                */
+/* -------------------------------------------------------------------------- */
 class RdmaContext {
  public:
   RdmaContext();
