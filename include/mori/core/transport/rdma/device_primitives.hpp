@@ -27,6 +27,11 @@ static __device__ uint64_t PostRead(void* queue_buff_addr, uint32_t wqe_num, uin
                                     uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
                                     uint64_t rkey, size_t bytes_count);
 
+template <ProviderType PrvdType>
+static __device__ uint64_t PostWriteInline(void* queue_buff_addr, uint32_t wqe_num,
+                                           uint32_t* postIdx, uint32_t qpn, void* val,
+                                           uintptr_t raddr, uint64_t rkey, size_t bytes_count);
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Doorbell                                            */
 /* ---------------------------------------------------------------------------------------------- */

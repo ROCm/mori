@@ -105,6 +105,47 @@ __device__ uint64_t PostRead<ProviderType::MLX5>(void* queueBuffAddr, uint32_t w
   return PostReadWrite(queueBuffAddr, wqeNum, postIdx, qpn, laddr, lkey, raddr, rkey, bytes, true);
 }
 
+template <ProviderType PrvdType>
+static __device__ uint64_t PostWriteInline(void* queueBuffAddr, uint32_t wqeNum, uint32_t* postIdx,
+                                           uint32_t qpn, void* val, uintptr_t raddr, uint64_t rkey,
+                                           size_t bytes) {
+  constexpr int sendWqeSize =
+      sizeof(mlx5_wqe_ctrl_seg) + sizeof(mlx5_wqe_raddr_seg) + sizeof(mlx5_wqe_data_seg);
+  assert(bytes <= (sizeof(mlx5_wqe_data_seg) - sizeof(mlx5_wqe_inl_data_seg)));
+
+  constexpr int numOctoWords = CeilDiv(sendWqeSize, 16);
+  constexpr int numWqeBb = CeilDiv(numOctoWords * 16, int(MLX5_SEND_WQE_BB));
+
+  uint32_t curPostIdx = atomicAdd(postIdx, numWqeBb);
+
+  uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
+  uintptr_t wqeAddr = reinterpret_cast<uintptr_t>(queueBuffAddr) + (wqeIdx << MLX5_SEND_WQE_SHIFT);
+
+  mlx5_wqe_ctrl_seg* wqeCtrlSeg = reinterpret_cast<mlx5_wqe_ctrl_seg*>(wqeAddr);
+  wqeCtrlSeg->opmod_idx_opcode = HTOBE32(((curPostIdx & 0xffff) << 8) | MLX5_OPCODE_RDMA_WRITE);
+  wqeCtrlSeg->qpn_ds = HTOBE32((qpn << 8) | numOctoWords);
+  wqeCtrlSeg->fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
+
+  mlx5_wqe_raddr_seg* wqeRaddrSeg =
+      reinterpret_cast<mlx5_wqe_raddr_seg*>(wqeAddr + sizeof(mlx5_wqe_ctrl_seg));
+  wqeRaddrSeg->raddr = HTOBE64(raddr);
+  wqeRaddrSeg->rkey = HTOBE32(rkey);
+
+  mlx5_wqe_inl_data_seg* wqeInlDataSeg = reinterpret_cast<mlx5_wqe_inl_data_seg*>(
+      wqeAddr + sizeof(mlx5_wqe_ctrl_seg) + sizeof(mlx5_wqe_raddr_seg));
+  wqeInlDataSeg->byte_count = HTOBE32(bytes | MLX5_INLINE_SEG);
+
+  void* wqeDataPtr =
+      reinterpret_cast<void*>(wqeAddr + sizeof(mlx5_wqe_ctrl_seg) + sizeof(mlx5_wqe_raddr_seg) +
+                              sizeof(mlx5_wqe_inl_data_seg));
+
+  for (int i = 0; i < bytes; i++) {
+    reinterpret_cast<uint8_t*>(wqeDataPtr)[i] = reinterpret_cast<uint8_t*>(val)[i];
+  }
+
+  return reinterpret_cast<uint64_t*>(wqeCtrlSeg)[0];
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Doorbell                                            */
 /* ---------------------------------------------------------------------------------------------- */
