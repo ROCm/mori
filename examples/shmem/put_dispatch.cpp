@@ -161,10 +161,9 @@ void CheckTestResult(EpDispatchConfig config, EpDispatchHandle handle) {
         }
       }
     }
-    uint32_t recvTokenNum = reinterpret_cast<uint32_t*>(handle.recvTokenNumMemObj.cpu->localPtr)[i];
-    printf("source pe %d my pe %d expected %d got %d\n", i, config.rank, peTokenOffset,
-           recvTokenNum);
-    assert(recvTokenNum == peTokenOffset);
+    uint32_t recvTokenNumSignal =
+        reinterpret_cast<uint32_t*>(handle.recvTokenNumMemObj.cpu->localPtr)[i];
+    assert((recvTokenNumSignal - 1) == peTokenOffset);
   }
 }
 
@@ -187,8 +186,7 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
   uint32_t* outTokenBuf = reinterpret_cast<uint32_t*>(handle.outTokMemObj.gpu->localPtr);
 
   // Send out tokens
-  // TODO: 2 token id -> expert id
-  // TODO: 3 rank token num
+  // TODO: token id -> expert id
   extern __shared__ char sharedMem[];
 
   // Phase1: send token
@@ -220,24 +218,27 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
       MemoryRegion srcMr = handle.inpTokMemObj.gpu->GetMemoryRegion(myPe);
       ShmemPutMemNbiThread<PrvdType>(handle.outTokMemObj.gpu, destEpOffset + destEpTokOffset, srcMr,
                                      tokenOffset, config.hiddenDim * sizeof(uint32_t), destPe);
-      // printf("mype %d warp %d exprt %d dest pe %d tokenId %d offset %u\n", myPe, globalWarpId,
-      //        destExpert, destPe, tokenId, peTokenIdx);
     }
   }
+  __syncthreads();
 
   // Send token num to other ranks
-  if ((globalThdId < npes) && (globalThdId != myPe)) {
-    uint32_t destPe = globalThdId;
-    atomicStoreSeqCstSystem(
-        reinterpret_cast<uint32_t*>(handle.recvTokenNumMemObj.gpu->localPtr) + destPe,
-        peTokenOffset[destPe]);
-    MemoryRegion srcMr = handle.recvTokenNumMemObj.gpu->GetMemoryRegion(myPe);
-    ShmemPutMemNbiThread<PrvdType>(handle.recvTokenNumMemObj.gpu, myPe * sizeof(uint32_t), srcMr,
-                                   destPe * sizeof(uint32_t), sizeof(uint32_t), destPe);
-    printf("mype %d destpe %d token num %d\n", myPe, destPe, peTokenOffset[destPe]);
+  for (int destPe = globalWarpId; destPe < npes; destPe++) {
+    if (destPe == myPe) continue;
+    if (laneId != 0) continue;
+    // Add 1 so that when token number == 0, receiver side still know the signal is sent
+    uint32_t numTokenSignal = peTokenOffset[destPe] + 1;
+    ShmemPutUint32NbiThread<PrvdType>(handle.recvTokenNumMemObj.gpu, myPe * sizeof(uint32_t),
+                                      numTokenSignal, destPe);
   }
 
   // Phase 2: recv token
+  // Wait until sender finished
+  if ((globalThdId < npes) && (globalThdId != myPe)) {
+    uint32_t srcPe = globalThdId;
+    uint32_t* signal = reinterpret_cast<uint32_t*>(handle.recvTokenNumMemObj.gpu->localPtr) + srcPe;
+    ShmemUint32WaitUntilGreaterThan<PrvdType>(signal, uint32_t{0});
+  }
 }
 
 void LaunchEpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatchHandle handle) {

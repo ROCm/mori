@@ -12,6 +12,16 @@ __device__ T atomicLoadSeqCst(T* ptr) {
 }
 
 template <typename T>
+__device__ T atomicLoadRelaxed(T* ptr) {
+  return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+template <typename T>
+__device__ T atomicLoadRelaxedSystem(T* ptr) {
+  return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+template <typename T>
 __device__ T atomicLoadSeqCstSystem(T* ptr) {
   return __hip_atomic_load(ptr, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_SYSTEM);
 }

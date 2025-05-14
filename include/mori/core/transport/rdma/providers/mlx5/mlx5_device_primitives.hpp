@@ -105,13 +105,16 @@ __device__ uint64_t PostRead<ProviderType::MLX5>(void* queueBuffAddr, uint32_t w
   return PostReadWrite(queueBuffAddr, wqeNum, postIdx, qpn, laddr, lkey, raddr, rkey, bytes, true);
 }
 
+constexpr uint32_t MaxInlineDataSizePerWqe =
+    sizeof(mlx5_wqe_data_seg) - sizeof(mlx5_wqe_inl_data_seg);
+
 template <ProviderType PrvdType>
 static __device__ uint64_t PostWriteInline(void* queueBuffAddr, uint32_t wqeNum, uint32_t* postIdx,
                                            uint32_t qpn, void* val, uintptr_t raddr, uint64_t rkey,
                                            size_t bytes) {
   constexpr int sendWqeSize =
       sizeof(mlx5_wqe_ctrl_seg) + sizeof(mlx5_wqe_raddr_seg) + sizeof(mlx5_wqe_data_seg);
-  assert(bytes <= (sizeof(mlx5_wqe_data_seg) - sizeof(mlx5_wqe_inl_data_seg)));
+  assert(bytes <= MaxInlineDataSizePerWqe);
 
   constexpr int numOctoWords = CeilDiv(sendWqeSize, 16);
   constexpr int numWqeBb = CeilDiv(numOctoWords * 16, int(MLX5_SEND_WQE_BB));
@@ -139,10 +142,16 @@ static __device__ uint64_t PostWriteInline(void* queueBuffAddr, uint32_t wqeNum,
       reinterpret_cast<void*>(wqeAddr + sizeof(mlx5_wqe_ctrl_seg) + sizeof(mlx5_wqe_raddr_seg) +
                               sizeof(mlx5_wqe_inl_data_seg));
 
-  for (int i = 0; i < bytes; i++) {
-    reinterpret_cast<uint8_t*>(wqeDataPtr)[i] = reinterpret_cast<uint8_t*>(val)[i];
+  // TODO: support other size
+  if (bytes == 4) {
+    atomicStoreRelaxed(reinterpret_cast<uint32_t*>(wqeDataPtr),
+                       reinterpret_cast<uint32_t*>(val)[0]);
+  } else {
+    for (int i = 0; i < bytes; i++) {
+      atomicStoreRelaxed(reinterpret_cast<uint8_t*>(wqeDataPtr) + i,
+                         reinterpret_cast<uint8_t*>(val)[i]);
+    }
   }
-
   return reinterpret_cast<uint64_t*>(wqeCtrlSeg)[0];
 }
 
