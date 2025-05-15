@@ -139,8 +139,8 @@ void CheckTestResult(EpDispatchConfig config, EpDispatchHandle handle) {
   int inpTokEleNum = config.maxNumInpTokenPerRank * config.hiddenDim;
   int inpTokSize = inpTokEleNum * sizeof(uint32_t);
   void* inpTokBufCpu = malloc(inpTokSize);
-  HIP_RUNTIME_CHECK(hipMemcpy(inpTokBufCpu, handle.inpTokMemObj.cpu->localPtr, inpTokSize,
-                              hipMemcpyDeviceToHost));
+  HIP_RUNTIME_CHECK(
+      hipMemcpy(inpTokBufCpu, handle.inpTokMemObj->Get(), inpTokSize, hipMemcpyDeviceToHost));
 
   void* globalInpTokBufCpu = malloc(config.worldSize * inpTokSize);
   MPI_Allgather(inpTokBufCpu, inpTokSize, MPI_CHAR, globalInpTokBufCpu, inpTokSize, MPI_CHAR,
@@ -166,8 +166,7 @@ void CheckTestResult(EpDispatchConfig config, EpDispatchHandle handle) {
       //        tokenId, peTokenOffset );
       for (int k = 0; k < config.hiddenDim; k++) {
         uint32_t expected = reinterpret_cast<uint32_t*>(globalInpTokBufCpu)[srcTokenOffset + k];
-        uint32_t got =
-            reinterpret_cast<uint32_t*>(handle.outTokMemObj.cpu->localPtr)[destTokenOffset + k];
+        uint32_t got = handle.outTokMemObj->GetAs<uint32_t*>()[destTokenOffset + k];
         bool equal = (expected == got);
         if (!equal) {
           printf(
@@ -178,20 +177,16 @@ void CheckTestResult(EpDispatchConfig config, EpDispatchHandle handle) {
         }
       }
 
-      uint32_t* outTokToExptMapBuf =
-          reinterpret_cast<uint32_t*>(handle.outTokToExptMapMemObj.cpu->localPtr);
+      uint32_t* outTokToExptMapBuf = handle.outTokToExptMapMemObj->GetAs<uint32_t*>();
       uint32_t gotExptId = outTokToExptMapBuf[i * maxNumOutTokenPerRank + peTokenOffset];
-      // TODO: uncomment condition (gotExptId != 0), this is used to exclude wrong result caused by
-      // unfinished rdma op
-      if ((gotExptId != expertId) && (gotExptId != 0)) {
+      if ((gotExptId != expertId)) {
         printf("Wrong: srcpe %d mype %d token offset %d expected %d got %d\n", i, config.rank,
                peTokenOffset, expertId, gotExptId);
         assert(false);
       }
       peTokenOffset += 1;
     }
-    uint32_t recvTokenNumSignal =
-        reinterpret_cast<uint32_t*>(handle.recvTokenNumMemObj.cpu->localPtr)[i];
+    uint32_t recvTokenNumSignal = handle.recvTokenNumMemObj->GetAs<uint32_t*>()[i];
     assert((recvTokenNumSignal - 1) == peTokenOffset);
   }
 }
@@ -211,9 +206,9 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
   int myPe = config.rank;
   int npes = config.worldSize;
 
-  uint32_t* inpTokenBuf = reinterpret_cast<uint32_t*>(handle.inpTokMemObj.gpu->localPtr);
-  uint32_t* outTokenBuf = reinterpret_cast<uint32_t*>(handle.outTokMemObj.gpu->localPtr);
-  uint32_t* tokToExptBuf = reinterpret_cast<uint32_t*>(handle.inpTokToExptMapMemObj.gpu->localPtr);
+  uint32_t* inpTokenBuf = handle.inpTokMemObj->GetAs<uint32_t*>();
+  uint32_t* outTokenBuf = handle.outTokMemObj->GetAs<uint32_t*>();
+  uint32_t* tokToExptBuf = handle.inpTokToExptMapMemObj->GetAs<uint32_t*>();
 
   size_t maxNumOutTokenPerRank = config.maxNumInpTokenPerRank * config.numExpertPerToken;
 
@@ -235,45 +230,49 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
     uint32_t peTokenIdx = peTokenOffset[destPe];
     if (laneId == 0) {
       peTokenOffset[destPe] += 1;
+
+      // We must update token to expert mapping using the same warp as the one that sends it,
+      // otherwise the data might not be visible to the warp that send it
+      if (destPe == globalWarpId) {
+        tokToExptBuf[destPe * maxNumOutTokenPerRank + peTokenIdx] = destExpert;
+      }
     }
+
     if (destPe == myPe) continue;                       // skip sending token to self
     if ((i % globalWarpNum) != globalWarpId) continue;  // skip token not assigned for this warp
 
     int tokenId = i / config.numExpertPerToken;
-
     int tokenOffset = tokenId * config.hiddenDim;
+
     int destEpOffset = myPe * maxNumOutTokenPerRank * config.hiddenDim;
     int destEpTokOffset = peTokenIdx * config.hiddenDim;
 
     if (laneId == 0) {
-      MemoryRegion srcMr = handle.inpTokMemObj.gpu->GetMemoryRegion(myPe);
-      ShmemPutUint32NbiThread<PrvdType>(handle.outTokMemObj.gpu, destEpOffset + destEpTokOffset,
-                                        srcMr, tokenOffset, config.hiddenDim, destPe);
-      tokToExptBuf[destPe * maxNumOutTokenPerRank + peTokenIdx] = destExpert;
+      ShmemPutUint32NbiThread<PrvdType>(handle.outTokMemObj, destEpOffset + destEpTokOffset,
+                                        handle.inpTokMemObj, tokenOffset, config.hiddenDim, destPe);
     }
   }
 
   // Send token num & token to expert mapping to other ranks
   for (int destPe = globalWarpId; destPe < npes; destPe++) {
     if (destPe == myPe) continue;
-    if (laneId != 0) continue;
-    MemoryRegion srcMr = handle.inpTokToExptMapMemObj.gpu->GetMemoryRegion(myPe);
-    ShmemPutUint32NbiThread<PrvdType>(
-        handle.outTokToExptMapMemObj.gpu, myPe * maxNumOutTokenPerRank, srcMr,
-        destPe * maxNumOutTokenPerRank, peTokenOffset[destPe], destPe);
+    if (laneId == 0) {
+      ShmemPutUint32NbiThread<PrvdType>(
+          handle.outTokToExptMapMemObj, myPe * maxNumOutTokenPerRank, handle.inpTokToExptMapMemObj,
+          destPe * maxNumOutTokenPerRank, peTokenOffset[destPe], destPe);
 
-    // Add 1 so that when token number == 0, receiver side still know the signal is sent
-    uint32_t numTokenSignal = peTokenOffset[destPe] + 1;
-    ShmemPutUint32ImmNbiThread<PrvdType>(handle.recvTokenNumMemObj.gpu, myPe * sizeof(uint32_t),
-                                         numTokenSignal, destPe);
+      // Add 1 so that when token number == 0, receiver side still know the signal is sent
+      uint32_t numTokenSignal = peTokenOffset[destPe] + 1;
+      ShmemPutUint32ImmNbiThread<PrvdType>(handle.recvTokenNumMemObj, myPe * sizeof(uint32_t),
+                                           numTokenSignal, destPe);
+    }
   }
 
   // Phase 2: recv token
   // Wait until sender finished
   if ((globalThdId < npes) && (globalThdId != myPe)) {
-    uint32_t srcPe = globalThdId;
-    uint32_t* signal = reinterpret_cast<uint32_t*>(handle.recvTokenNumMemObj.gpu->localPtr) + srcPe;
-    ShmemUint32WaitUntilGreaterThan<PrvdType>(signal, uint32_t{0});
+    uint32_t* signal = handle.recvTokenNumMemObj->GetAs<uint32_t*>() + globalThdId;
+    ShmemUint32WaitUntilGreaterThan<PrvdType>(signal, 0);
   }
 }
 
@@ -303,9 +302,9 @@ void EpDispatchWithPutMemAPI() {
   config.numExpertPerRank = 4;
   config.hiddenDim = 4096;
   config.numExpertPerToken = 4;
-  config.maxNumInpTokenPerRank = 32;
-  config.warpNumPerBlock = 5;
-  config.blockNum = 2;
+  config.maxNumInpTokenPerRank = 64;
+  config.warpNumPerBlock = 3;
+  config.blockNum = 4;
 
   // Intialize data
   EpDispatchHandle handle = IntializeTestHandle(config);

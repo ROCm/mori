@@ -11,7 +11,7 @@ using namespace mori::application;
 
 constexpr ProviderType PrvdType = ProviderType::MLX5;
 
-__global__ void RingAllGatherWithPutMemAPIKernel(int myPe, int npes, SymmMemObj* memObj) {
+__global__ void RingAllGatherWithPutMemAPIKernel(int myPe, int npes, const SymmMemObjPtr memObj) {
   int nextPeer = (myPe + 1) % npes;
   int peChunkSize = memObj->size / npes;
 
@@ -66,7 +66,7 @@ void RingAllGatherWithPutMemAPI() {
            reinterpret_cast<uint32_t*>(buff)[i * peChunkSize], i);
   }
   // Run put
-  RingAllGatherWithPutMemAPIKernel<<<1, 1>>>(myPe, npes, buffObj.gpu);
+  RingAllGatherWithPutMemAPIKernel<<<1, 1>>>(myPe, npes, buffObj);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
 

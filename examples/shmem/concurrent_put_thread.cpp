@@ -11,7 +11,7 @@ using namespace mori::application;
 
 constexpr ProviderType PrvdType = ProviderType::MLX5;
 
-__global__ void ConcurrentPutThreadKernel(int myPe, SymmMemObj* memObj) {
+__global__ void ConcurrentPutThreadKernel(int myPe, const SymmMemObjPtr memObj) {
   constexpr int sendPe = 0;
   constexpr int recvPe = 1;
 
@@ -60,7 +60,7 @@ void ConcurrentPutThread() {
   assert(buffObj.IsValid());
 
   // Run put
-  ConcurrentPutThreadKernel<<<blockNum, threadNum>>>(myPe, buffObj.gpu);
+  ConcurrentPutThreadKernel<<<blockNum, threadNum>>>(myPe, buffObj);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
 

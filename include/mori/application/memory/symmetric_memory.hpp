@@ -19,13 +19,26 @@ struct SymmMemObj {
   uint32_t lkey{0};
   uint32_t* peerRkeys{nullptr};
 
-  __device__ MemoryRegion GetMemoryRegion(int pe) {
+  __device__ __host__ MemoryRegion GetMemoryRegion(int pe) const {
     MemoryRegion mr;
     mr.addr = peerPtrs[pe];
     mr.lkey = lkey;
     mr.rkey = peerRkeys[pe];
     mr.length = size;
     return mr;
+  }
+
+  // Get pointers
+  __device__ __host__ void* Get() const { return localPtr; }
+  __device__ __host__ void* Get(int pe) const { return reinterpret_cast<void*>(peerPtrs[pe]); }
+
+  template <typename T>
+  __device__ __host__ T GetAs() const {
+    return reinterpret_cast<T>(localPtr);
+  }
+  template <typename T>
+  __device__ __host__ T GetAs(int pe) const {
+    return reinterpret_cast<T>(peerPtrs[pe]);
   }
 };
 
@@ -34,6 +47,11 @@ struct SymmMemObjPtr {
   SymmMemObj* gpu{nullptr};
 
   bool IsValid() { return (cpu != nullptr) && (gpu != nullptr); }
+
+  __host__ SymmMemObj* operator->() { return cpu; }
+  __device__ SymmMemObj* operator->() { return gpu; }
+  __host__ const SymmMemObj* operator->() const { return cpu; }
+  __device__ const SymmMemObj* operator->() const { return gpu; }
 };
 
 class SymmMemManager {
