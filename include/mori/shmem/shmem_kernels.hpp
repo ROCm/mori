@@ -19,7 +19,7 @@ __device__ GpuStates* GetGlobalGpuStatesPtr() { return &globalGpuStates; }
 template <core::ProviderType PrvdType>
 __device__ void ShmemPutMemNbiThread(const application::SymmMemObj* dest, size_t destOffset,
                                      const application::MemoryRegion& source, size_t sourceOffset,
-                                     size_t nelems, int pe) {
+                                     size_t bytes, int pe) {
   uintptr_t laddr = source.addr + sourceOffset;
   uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
   uintptr_t rkey = dest->peerRkeys[pe];
@@ -31,17 +31,41 @@ __device__ void ShmemPutMemNbiThread(const application::SymmMemObj* dest, size_t
   int rank = globalGpuStates->rank;
   uint64_t dbrVal =
       core::PostWrite<PrvdType>(wq.sqAddr, wq.sqWqeNum, &wq.postIdx, ep[pe].handle.qpn, laddr,
-                                source.lkey, raddr, rkey, nelems);
+                                source.lkey, raddr, rkey, bytes);
   core::UpdateSendDbrRecord<PrvdType>(wq.dbrRecAddr, wq.postIdx);
   __threadfence_system();
   core::RingDoorbell<PrvdType>(wq.dbrAddr, dbrVal);
   __threadfence_system();
 }
 
+template <core::ProviderType PrvdType, typename T>
+__device__ void ShmemPutTypeNbiThread(const application::SymmMemObj* dest, size_t destElmOffset,
+                                      const application::MemoryRegion& source, size_t srcElmOffset,
+                                      size_t nelems, int pe) {
+  constexpr size_t typeSize = sizeof(T);
+  ShmemPutMemNbiThread<PrvdType>(dest, destElmOffset * typeSize, source, srcElmOffset * typeSize,
+                                 nelems * typeSize, pe);
+}
+
+#define DEFINE_SHMEM_PUT_TYPE_NBI_THREAD_API(TypeName, T)                                      \
+  template <core::ProviderType PrvdType>                                                       \
+  __device__ void ShmemPut##TypeName##NbiThread(                                               \
+      const application::SymmMemObj* dest, size_t destElmOffset,                               \
+      const application::MemoryRegion& source, size_t srcElmOffset, size_t nelems, int pe) {   \
+    ShmemPutTypeNbiThread<PrvdType, T>(dest, destElmOffset, source, srcElmOffset, nelems, pe); \
+  }
+
+DEFINE_SHMEM_PUT_TYPE_NBI_THREAD_API(Uint8, uint8_t)
+DEFINE_SHMEM_PUT_TYPE_NBI_THREAD_API(Uint16, uint16_t)
+DEFINE_SHMEM_PUT_TYPE_NBI_THREAD_API(Uint32, uint32_t)
+DEFINE_SHMEM_PUT_TYPE_NBI_THREAD_API(Uint64, uint64_t)
+DEFINE_SHMEM_PUT_TYPE_NBI_THREAD_API(Float, float)
+DEFINE_SHMEM_PUT_TYPE_NBI_THREAD_API(Double, double)
+
 // TODO: deal with bytes count limit
 template <core::ProviderType PrvdType, uint32_t SIZE>
-__device__ void ShmemPutSizeNbiThread(const application::SymmMemObj* dest, size_t destOffset,
-                                      void* val, int pe) {
+__device__ void ShmemPutSizeImmNbiThread(const application::SymmMemObj* dest, size_t destOffset,
+                                         void* val, int pe) {
   uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
   uintptr_t rkey = dest->peerRkeys[pe];
 
@@ -59,22 +83,23 @@ __device__ void ShmemPutSizeNbiThread(const application::SymmMemObj* dest, size_
 }
 
 template <core::ProviderType PrvdType, typename T>
-__device__ void ShmemPutTypeNbiThread(const application::SymmMemObj* dest, size_t destOffset, T val,
-                                      int pe) {
+__device__ void ShmemPutTypeImmNbiThread(const application::SymmMemObj* dest, size_t destOffset,
+                                         T val, int pe) {
   static_assert(sizeof(T) <= core::MaxInlineDataSizePerWqe);
-  ShmemPutSizeNbiThread<PrvdType, sizeof(T)>(dest, destOffset, &val, pe);
+  ShmemPutSizeImmNbiThread<PrvdType, sizeof(T)>(dest, destOffset, &val, pe);
 }
 
-#define DEFINE_SHMEM_PUT_TYPE_NBI_THREAD_API(TypeName, T)                                  \
-  template <core::ProviderType PrvdType>                                                   \
-  __device__ void ShmemPut##TypeName##NbiThread(const application::SymmMemObj* dest,       \
-                                                size_t destOffset, uint32_t val, int pe) { \
-    ShmemPutTypeNbiThread<PrvdType, uint32_t>(dest, destOffset, val, pe);                  \
+#define DEFINE_SHMEM_PUT_TYPE_IMM_NBI_THREAD_API(TypeName, T)                                 \
+  template <core::ProviderType PrvdType>                                                      \
+  __device__ void ShmemPut##TypeName##ImmNbiThread(const application::SymmMemObj* dest,       \
+                                                   size_t destOffset, uint32_t val, int pe) { \
+    ShmemPutTypeImmNbiThread<PrvdType, uint32_t>(dest, destOffset, val, pe);                  \
   }
-DEFINE_SHMEM_PUT_TYPE_NBI_THREAD_API(Uint8, uint8_t)
-DEFINE_SHMEM_PUT_TYPE_NBI_THREAD_API(Uint16, uint16_t)
-DEFINE_SHMEM_PUT_TYPE_NBI_THREAD_API(Uint32, uint32_t)
-DEFINE_SHMEM_PUT_TYPE_NBI_THREAD_API(Uint64, uint64_t)
+
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_THREAD_API(Uint8, uint8_t)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_THREAD_API(Uint16, uint16_t)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_THREAD_API(Uint32, uint32_t)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_THREAD_API(Uint64, uint64_t)
 
 __device__ void ShmemPutMemNbiWarp(const application::SymmMemObj* dest,
                                    const application::MemoryRegion& source, size_t nelems, int pe);
