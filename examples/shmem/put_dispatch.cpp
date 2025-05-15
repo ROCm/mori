@@ -28,11 +28,18 @@ struct EpDispatchConfig {
 };
 
 struct EpDispatchHandle {
-  int curRankNumToken;
-  uint32_t* tokenIndicies;
-  SymmMemObjPtr inpTokMemObj;
-  SymmMemObjPtr outTokMemObj;
+  int curRankNumToken{-1};
+  // Routed expert indices for tokens
+  uint32_t* tokenIndicies{nullptr};
+  // Compact output token buffer, this is the final output of dispatch
+  uint32_t* outTokenBuf{nullptr};
+  // Store input token for shmem ops
+  SymmMemObjPtr shmemInpTokMemObj;
+  // Temporary output token buffer, only used for shmem ops
+  SymmMemObjPtr shmemOutTokMemObj;
+  // Record number of tokens that will be received from other PE
   SymmMemObjPtr recvTokenNumMemObj;
+  // Buffers for token to expert mapping, only used for shmem ops
   SymmMemObjPtr inpTokToExptMapMemObj;
   SymmMemObjPtr outTokToExptMapMemObj;
 };
@@ -79,8 +86,8 @@ EpDispatchHandle IntializeTestHandle(EpDispatchConfig config) {
   int inpTokSize = inpTokEleNum * sizeof(uint32_t);
   void* inpTokBuf = ShmemMalloc(inpTokSize);
   HIP_RUNTIME_CHECK(hipMemset(inpTokBuf, 0, inpTokSize));
-  handle.inpTokMemObj = ShmemQueryMemObjPtr(inpTokBuf);
-  assert(handle.inpTokMemObj.IsValid());
+  handle.shmemInpTokMemObj = ShmemQueryMemObjPtr(inpTokBuf);
+  assert(handle.shmemInpTokMemObj.IsValid());
   uniform_int_distribution<> tokValDist(0, config.hiddenDim);
   for (int i = 0; i < inpTokEleNum; i++) {
     reinterpret_cast<uint32_t*>(inpTokBuf)[i] = tokValDist(gen);
@@ -89,10 +96,13 @@ EpDispatchHandle IntializeTestHandle(EpDispatchConfig config) {
   // Allocate token output buffer
   int outTokSize = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken *
                    config.hiddenDim * sizeof(uint32_t);
-  void* outTokBuf = ShmemMalloc(outTokSize);
-  HIP_RUNTIME_CHECK(hipMemset(outTokBuf, 0, outTokSize));
-  handle.outTokMemObj = ShmemQueryMemObjPtr(outTokBuf);
-  assert(handle.outTokMemObj.IsValid());
+  void* shmemOutTokBuf = ShmemMalloc(outTokSize);
+  HIP_RUNTIME_CHECK(hipMemset(shmemOutTokBuf, 0, outTokSize));
+  handle.shmemOutTokMemObj = ShmemQueryMemObjPtr(shmemOutTokBuf);
+  assert(handle.shmemOutTokMemObj.IsValid());
+
+  HIP_RUNTIME_CHECK(hipMalloc(&handle.outTokenBuf, outTokSize));
+  HIP_RUNTIME_CHECK(hipMemset(handle.outTokenBuf, 0, outTokSize));
 
   // Allocate recv token num buffer
   int recvTokenNumSize = config.worldSize * sizeof(uint32_t);
@@ -140,11 +150,13 @@ void CheckTestResult(EpDispatchConfig config, EpDispatchHandle handle) {
   int inpTokSize = inpTokEleNum * sizeof(uint32_t);
   void* inpTokBufCpu = malloc(inpTokSize);
   HIP_RUNTIME_CHECK(
-      hipMemcpy(inpTokBufCpu, handle.inpTokMemObj->Get(), inpTokSize, hipMemcpyDeviceToHost));
+      hipMemcpy(inpTokBufCpu, handle.shmemInpTokMemObj->Get(), inpTokSize, hipMemcpyDeviceToHost));
 
   void* globalInpTokBufCpu = malloc(config.worldSize * inpTokSize);
   MPI_Allgather(inpTokBufCpu, inpTokSize, MPI_CHAR, globalInpTokBufCpu, inpTokSize, MPI_CHAR,
                 MPI_COMM_WORLD);
+
+  std::vector<uint32_t> expertCount(config.numExpertPerRank, 0);
 
   // Check result
   for (int i = 0; i < config.worldSize; i++) {
@@ -157,6 +169,8 @@ void CheckTestResult(EpDispatchConfig config, EpDispatchHandle handle) {
       int rankId = expertId / config.numExpertPerRank;
       if (rankId != config.rank) continue;
 
+      expertCount[expertId % config.numExpertPerRank] += 1;
+
       int tokenId = j / config.numExpertPerToken;
       int srcTokenOffset = i * inpTokEleNum + tokenId * config.hiddenDim;
 
@@ -166,7 +180,7 @@ void CheckTestResult(EpDispatchConfig config, EpDispatchHandle handle) {
       //        tokenId, peTokenOffset );
       for (int k = 0; k < config.hiddenDim; k++) {
         uint32_t expected = reinterpret_cast<uint32_t*>(globalInpTokBufCpu)[srcTokenOffset + k];
-        uint32_t got = handle.outTokMemObj->GetAs<uint32_t*>()[destTokenOffset + k];
+        uint32_t got = handle.shmemOutTokMemObj->GetAs<uint32_t*>()[destTokenOffset + k];
         bool equal = (expected == got);
         if (!equal) {
           printf(
@@ -189,6 +203,32 @@ void CheckTestResult(EpDispatchConfig config, EpDispatchHandle handle) {
     uint32_t recvTokenNumSignal = handle.recvTokenNumMemObj->GetAs<uint32_t*>()[i];
     assert((recvTokenNumSignal - 1) == peTokenOffset);
   }
+
+  for (int i = 0; i < expertCount.size(); i++) {
+    std::cout << "Rank " << config.rank << " expert " << i << " token " << expertCount[i]
+              << std::endl;
+  }
+}
+
+template <typename T>
+__device__ T WarpReduceSumToRight(T sum) {
+  for (int i = warpSize / 2; i > 0; i /= 2) {
+    sum += __shfl_up(sum, i);
+  }
+  return sum;
+}
+
+template <typename T>
+__device__ T WarpPrefixSum(T val, size_t laneNum) {
+  int laneId = threadIdx.x & (warpSize - 1);
+  uint32_t prefixSum = 0;
+  if (laneId < laneNum) {
+    for (int i = 0; i <= laneId; i++) {
+      uint32_t targetLaneVal = __shfl(val, i);
+      if (laneId > i) prefixSum += targetLaneVal;
+    }
+  }
+  return prefixSum;
 }
 
 __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatchHandle handle) {
@@ -206,9 +246,9 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
   int myPe = config.rank;
   int npes = config.worldSize;
 
-  uint32_t* inpTokenBuf = handle.inpTokMemObj->GetAs<uint32_t*>();
-  uint32_t* outTokenBuf = handle.outTokMemObj->GetAs<uint32_t*>();
-  uint32_t* tokToExptBuf = handle.inpTokToExptMapMemObj->GetAs<uint32_t*>();
+  uint32_t* inpTokenBuf = handle.shmemInpTokMemObj->GetAs<uint32_t*>();
+  uint32_t* inpTokToExptBuf = handle.inpTokToExptMapMemObj->GetAs<uint32_t*>();
+  uint32_t* outTokToExptBuf = handle.outTokToExptMapMemObj->GetAs<uint32_t*>();
 
   size_t maxNumOutTokenPerRank = config.maxNumInpTokenPerRank * config.numExpertPerToken;
 
@@ -234,7 +274,7 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
       // We must update token to expert mapping using the same warp as the one that sends it,
       // otherwise the data might not be visible to the warp that send it
       if (destPe == globalWarpId) {
-        tokToExptBuf[destPe * maxNumOutTokenPerRank + peTokenIdx] = destExpert;
+        inpTokToExptBuf[destPe * maxNumOutTokenPerRank + peTokenIdx] = destExpert;
       }
     }
 
@@ -248,8 +288,9 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
     int destEpTokOffset = peTokenIdx * config.hiddenDim;
 
     if (laneId == 0) {
-      ShmemPutUint32NbiThread<PrvdType>(handle.outTokMemObj, destEpOffset + destEpTokOffset,
-                                        handle.inpTokMemObj, tokenOffset, config.hiddenDim, destPe);
+      ShmemPutUint32NbiThread<PrvdType>(handle.shmemOutTokMemObj, destEpOffset + destEpTokOffset,
+                                        handle.shmemInpTokMemObj, tokenOffset, config.hiddenDim,
+                                        destPe);
     }
   }
 
@@ -269,17 +310,95 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
   }
 
   // Phase 2: recv token
-  // Wait until sender finished
-  if ((globalThdId < npes) && (globalThdId != myPe)) {
-    uint32_t* signal = handle.recvTokenNumMemObj->GetAs<uint32_t*>() + globalThdId;
-    ShmemUint32WaitUntilGreaterThan<PrvdType>(signal, 0);
+  // Each warp wait until sender finished by waiting token number signal
+  uint32_t* recvTokenNum = reinterpret_cast<uint32_t*>(sharedMem) + warpId * npes;
+  uint32_t* accumExpertTokOffsets = reinterpret_cast<uint32_t*>(sharedMem) + warpNum * npes;
+  uint32_t* expertTokOff = reinterpret_cast<uint32_t*>(sharedMem) + warpNum * npes +
+                           config.numExpertPerRank + warpId * config.numExpertPerRank;
+  for (int i = thdId; i < config.numExpertPerRank; i += thdNum) {
+    accumExpertTokOffsets[i] = 0;
+  }
+  __syncthreads();
+
+  uint32_t totalNumRecvToken = 0;
+  for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+    if (destPe != myPe) {
+      uint32_t* signal = handle.recvTokenNumMemObj->GetAs<uint32_t*>() + destPe;
+      ShmemUint32WaitUntilGreaterThan<PrvdType>(signal, 0);
+      recvTokenNum[destPe] = *signal - 1;
+      totalNumRecvToken += *signal - 1;
+    }
+  }
+
+  // TODO: calculate expert offset
+  for (int srcPe = warpId; srcPe < npes; srcPe += warpNum) {
+    if (srcPe == myPe) continue;
+    for (int tokId = laneId; tokId < recvTokenNum[srcPe]; tokId += warpSize) {
+      uint32_t expertId = outTokToExptBuf[srcPe * maxNumOutTokenPerRank + tokId];
+      uint32_t localExpertId = expertId % config.numExpertPerRank;
+      // TODO: this assert fails occasionally, probably caused by incorrect RDMA memory order
+      if ((expertId / config.numExpertPerRank) != myPe) {
+        printf("mype %d expertId %d\n", myPe, expertId);
+        assert(false);
+      }
+      atomicAdd(accumExpertTokOffsets + localExpertId, 1);
+    }
+  }
+  __syncthreads();
+
+  // Calculate prefix sum of expert token offset
+  assert(config.numExpertPerRank < warpSize);
+  if (thdId < config.numExpertPerRank) {
+    uint32_t expertTokNum = accumExpertTokOffsets[thdId];
+    uint32_t accumOffset = WarpPrefixSum(expertTokNum, config.numExpertPerRank);
+    if ((myPe == 1) && (blockIdx.x == 0))
+      printf("mype %d expert id %d expert token %d accum offset %d\n", myPe, thdId, expertTokNum,
+             accumOffset);
+    accumExpertTokOffsets[thdId] = accumOffset;
+  }
+  __syncthreads();
+
+  for (int i = laneId; i < config.numExpertPerRank; i += warpSize) {
+    expertTokOff[i] = 0;
+  }
+
+  uint32_t* outTokenBuf = handle.outTokenBuf;
+  uint32_t* shmemOutTokenBuf = handle.shmemOutTokMemObj->GetAs<uint32_t*>();
+
+  for (int i = 0, tokId = 0, srcPe = 0; srcPe < npes; tokId++, i++) {
+    // Tokens from srcPe are all copied
+    // TODO: also copy tokens from my pe
+    if ((tokId == recvTokenNum[srcPe]) || (srcPe == myPe)) {
+      srcPe++;
+      tokId = 0;
+      continue;
+    }
+
+    uint32_t localExpertId =
+        outTokToExptBuf[srcPe * maxNumOutTokenPerRank + tokId] % config.numExpertPerRank;
+    if (laneId == 0) {
+      expertTokOff[localExpertId] += 1;
+    }
+
+    if ((i % globalWarpNum) != globalWarpId) continue;  // skip token not assigned for this warp
+
+    // Copy token
+    uint32_t srcTokenOff = i * config.hiddenDim;
+    uint32_t destTokenOff =
+        (accumExpertTokOffsets[localExpertId] + expertTokOff[localExpertId] - 1) * config.hiddenDim;
+
+    constexpr int vecSize = 16 / sizeof(uint32_t);
+    for (int offset = laneId * vecSize; offset < config.hiddenDim; offset += warpSize * vecSize) {
+      reinterpret_cast<uint4*>(outTokenBuf + destTokenOff + offset)[0] =
+          reinterpret_cast<uint4*>(shmemOutTokenBuf + srcTokenOff + offset)[0];
+    }
   }
 }
 
 void LaunchEpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatchHandle handle) {
   dim3 grid(config.blockNum);
   dim3 block(warpSize * config.warpNumPerBlock);
-  size_t sharedMemSize = config.worldSize * 1 * sizeof(uint32_t);
+  size_t sharedMemSize = 2 * config.worldSize * config.warpNumPerBlock * sizeof(uint32_t);
   EpDispatchWithPutMemAPIKernel<<<grid, block, sharedMemSize>>>(config, handle);
 }
 
