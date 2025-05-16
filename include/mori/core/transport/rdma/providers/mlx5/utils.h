@@ -74,5 +74,18 @@ static __device__ __host__ const char* IbvWcStatusString(enum ibv_wc_status stat
   return wc_status_str[status];
 }
 
+// TODO: write a better verison
+static __device__ __host__ void DumpWqe(void* wqeBaseAddr, uint32_t idx) {
+  uintptr_t wqeAddr = reinterpret_cast<uintptr_t>(wqeBaseAddr) + (idx << MLX5_SEND_WQE_SHIFT);
+  mlx5_wqe_ctrl_seg* wqeCtrlSeg = reinterpret_cast<mlx5_wqe_ctrl_seg*>(wqeAddr);
+  uint32_t opmodIdxOpCode = BE32TOH(wqeCtrlSeg->opmod_idx_opcode);
+
+  mlx5_wqe_data_seg* wqeDataSeg = reinterpret_cast<mlx5_wqe_data_seg*>(
+      wqeAddr + sizeof(mlx5_wqe_ctrl_seg) + sizeof(mlx5_wqe_raddr_seg));
+  uint32_t bytes = BE32TOH(wqeDataSeg->byte_count);
+  printf("Wqe: post idx %d opcode %d bytes %d\n", opmodIdxOpCode >> 24, opmodIdxOpCode & 0xff,
+         bytes);
+}
+
 }  // namespace core
 }  // namespace mori

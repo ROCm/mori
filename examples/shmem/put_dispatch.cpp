@@ -15,6 +15,19 @@ using namespace std;
 
 constexpr ProviderType PrvdType = ProviderType::MLX5;
 
+#define DEBUG 0
+
+__device__ void SyncIfDebugEnabled(const char* msg) {
+#if DEBUG == 1
+  __syncthreads();
+  if ((threadIdx.x == 0) && (blockIdx.x == 0)) {
+    ShmemQuietThread<PrvdType>();
+    printf("%s\n", msg);
+  }
+  __syncthreads();
+#endif
+}
+
 struct EpDispatchConfig {
   int randomSeed{0};
   int rank{0};
@@ -176,7 +189,6 @@ void CheckTestResult(EpDispatchConfig config, EpDispatchHandle handle) {
   for (int srcPe = 0; srcPe < config.worldSize; srcPe++) {
     if (srcPe == config.rank) continue;
 
-    // printf("on rank %d got rank %d token num %d\n", config.rank, i, globalTokenNum[i]);
     uint32_t* tokenIndiciesAddr = globalInpTokBuf + srcPe * maxNumOutTokenPerRank;
     uint32_t peTokenOffset = 0;
 
@@ -240,10 +252,6 @@ void CheckTestResult(EpDispatchConfig config, EpDispatchHandle handle) {
         int tokenId = tokIdx / config.numExpertPerToken;
 
         srcTokInfoList.push_back({srcPe, tokenId});
-        // if (config.rank == 0) {
-        //   printf("mype %d expert id %d srcPe %d tokId %d\n", config.rank, expertId, srcPe,
-        //   tokenId);
-        // }
       }
     }
   }
@@ -263,10 +271,10 @@ void CheckTestResult(EpDispatchConfig config, EpDispatchHandle handle) {
     CompareTokenFunc(srcTokBuf, localTokBuf, config.hiddenDim, msg.str());
   }
 
-  for (int i = 0; i < expertCount.size(); i++) {
-    std::cout << "Rank " << config.rank << " expert " << i << " token " << expertCount[i]
-              << std::endl;
-  }
+  // for (int i = 0; i < expertCount.size(); i++) {
+  //   std::cout << "Rank " << config.rank << " expert " << i << " token " << expertCount[i]
+  //             << std::endl;
+  // }
 }
 
 template <typename T>
@@ -320,13 +328,9 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
     uint32_t destPe = destExpert / config.numExpertPerRank;
     uint32_t peTokenIdx = peTokenOffset[destPe];
     if (laneId == 0) {
-      peTokenOffset[destPe] += 1;
-
-      // We must update token to expert mapping using the same warp as the one that sends it,
-      // otherwise the data might not be visible to the warp that send it
-      if (destPe == globalWarpId) {
-        inpTokToExptBuf[destPe * maxNumOutTokenPerRank + peTokenIdx] = destExpert;
-      }
+      // peTokenOffset[destPe] += 1;
+      atomicAdd(peTokenOffset + destPe, 1);
+      inpTokToExptBuf[destPe * maxNumOutTokenPerRank + peTokenIdx] = destExpert;
     }
 
     if (destPe == myPe) continue;                       // skip sending token to self
@@ -344,9 +348,10 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
                                         destPe);
     }
   }
+  SyncIfDebugEnabled("finished send token");
 
   // Send token num & token to expert mapping to other ranks
-  for (int destPe = globalWarpId; destPe < npes; destPe++) {
+  for (int destPe = globalWarpId; destPe < npes; destPe += globalWarpNum) {
     if (destPe == myPe) continue;
     if (laneId == 0) {
       ShmemPutUint32NbiThread<PrvdType>(
@@ -359,6 +364,7 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
                                            numTokenSignal, destPe);
     }
   }
+  SyncIfDebugEnabled("finish sending tok2expt mapping & num token signal");
 
   // Phase 2: recv token
   // Each warp wait until sender finished by waiting token number signal
@@ -380,6 +386,7 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
       totalNumRecvToken += *signal - 1;
     }
   }
+  SyncIfDebugEnabled("finish waiting num token signal");
 
   // TODO: calculate expert offset
   for (int srcPe = warpId; srcPe < npes; srcPe += warpNum) {
@@ -467,11 +474,11 @@ void EpDispatchWithPutMemAPI() {
   config.randomSeed = myPe;
   config.rank = myPe;
   config.worldSize = npes;
-  config.numExpertPerRank = 4;
+  config.numExpertPerRank = 8;
   config.hiddenDim = 4096;
-  config.numExpertPerToken = 4;
-  config.maxNumInpTokenPerRank = 64;
-  config.warpNumPerBlock = 3;
+  config.numExpertPerToken = 8;
+  config.maxNumInpTokenPerRank = 128;
+  config.warpNumPerBlock = 4;
   config.blockNum = 4;
 
   // Intialize data

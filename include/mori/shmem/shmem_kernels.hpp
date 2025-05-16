@@ -20,6 +20,7 @@ template <core::ProviderType PrvdType>
 __device__ void ShmemPutMemNbiThread(const application::SymmMemObjPtr dest, size_t destOffset,
                                      const application::MemoryRegion& source, size_t sourceOffset,
                                      size_t bytes, int pe) {
+  if (bytes == 0) return;
   uintptr_t laddr = source.addr + sourceOffset;
   uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
   uintptr_t rkey = dest->peerRkeys[pe];
@@ -150,13 +151,17 @@ __device__ void ShmemQuietThread() {
     // TODO: 1 Should not use postIdx since 1 wqe can inc postIdx by > 1
     // TODO: 2 How to prevent cqe overflow?
     int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
-    while ((core::atomicLoadSeqCst(&cq.consIdx) + 1) < core::atomicLoadSeqCst(&wq.postIdx)) {
+    while (true) {
+      uint32_t consIdx = core::atomicLoadSeqCst(&cq.consIdx);
+      uint32_t postIdx = core::atomicLoadSeqCst(&wq.postIdx);
+      if ((consIdx + 1) >= postIdx) break;
       int opcode = core::PollCq<PrvdType>(cq.cqAddr, cq.cqeSize, cq.cqeNum, &cq.consIdx);
       if (opcode == MLX5_CQE_RESP_ERR || opcode == MLX5_CQE_REQ_ERR) {
-        printf("rank %d opcode %d\n", rank, opcode);
+        printf("rank %d dest pe %d consIdx %d opcode %d\n", rank, i, consIdx, opcode);
+        core::DumpWqe(wq.sqAddr, consIdx);
         assert(false);
       }
-      core::UpdateCqDbrRecord<PrvdType>(cq.dbrRecAddr, core::atomicLoadSeqCst(&cq.consIdx));
+      core::UpdateCqDbrRecord<PrvdType>(cq.dbrRecAddr, consIdx);
     }
   }
 }
