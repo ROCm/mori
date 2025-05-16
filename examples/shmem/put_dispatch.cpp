@@ -158,64 +158,115 @@ void CheckTestResult(EpDispatchConfig config, EpDispatchHandle handle) {
 
   std::vector<uint32_t> expertCount(config.numExpertPerRank, 0);
 
+  auto CompareTokenFunc = [](uint32_t* expected, uint32_t* got, uint32_t hiddenDim,
+                             std::string msg) {
+    for (int k = 0; k < hiddenDim; k++) {
+      uint32_t expectedVal = expected[k];
+      uint32_t gotVal = got[k];
+      bool equal = (expectedVal == gotVal);
+      if (!equal) {
+        std::cout << "Wrong result at pos " << k << ": " << msg << " expected " << expectedVal
+                  << " got " << gotVal << std::endl;
+        assert(false);
+      }
+    }
+  };
+
   // Check result
-  for (int i = 0; i < config.worldSize; i++) {
-    if (i == config.rank) continue;
+  for (int srcPe = 0; srcPe < config.worldSize; srcPe++) {
+    if (srcPe == config.rank) continue;
+
     // printf("on rank %d got rank %d token num %d\n", config.rank, i, globalTokenNum[i]);
-    uint32_t* tokenIndiciesAddr = globalInpTokBuf + i * maxNumOutTokenPerRank;
+    uint32_t* tokenIndiciesAddr = globalInpTokBuf + srcPe * maxNumOutTokenPerRank;
     uint32_t peTokenOffset = 0;
-    for (int j = 0; j < config.numExpertPerToken * globalTokenNum[i]; j++) {
-      int expertId = tokenIndiciesAddr[j];
+
+    for (int tokIdx = 0; tokIdx < config.numExpertPerToken * globalTokenNum[srcPe]; tokIdx++) {
+      int expertId = tokenIndiciesAddr[tokIdx];
       int rankId = expertId / config.numExpertPerRank;
       if (rankId != config.rank) continue;
 
       expertCount[expertId % config.numExpertPerRank] += 1;
 
-      int tokenId = j / config.numExpertPerToken;
-      int srcTokenOffset = i * inpTokEleNum + tokenId * config.hiddenDim;
+      int tokenId = tokIdx / config.numExpertPerToken;
+      int srcTokenOffset = srcPe * inpTokEleNum + tokenId * config.hiddenDim;
 
       int outTokEleNum = maxNumOutTokenPerRank * config.hiddenDim;
-      int destTokenOffset = i * outTokEleNum + peTokenOffset * config.hiddenDim;
-      // printf("source pe %d mype %d expert %d tokenId %d offset %d\n", i, config.rank, expertId,
-      //        tokenId, peTokenOffset );
-      for (int k = 0; k < config.hiddenDim; k++) {
-        uint32_t expected = reinterpret_cast<uint32_t*>(globalInpTokBufCpu)[srcTokenOffset + k];
-        uint32_t got = handle.shmemOutTokMemObj->GetAs<uint32_t*>()[destTokenOffset + k];
-        bool equal = (expected == got);
-        if (!equal) {
-          printf(
-              "Wrong: source pe %d dest pe %d expertId %d srcTokenId %d destTokenId %d pos %d "
-              "expected %u got %u\n",
-              i, config.rank, expertId, tokenId, peTokenOffset, k, expected, got);
-          assert(false);
-        }
-      }
+      int destTokenOffset = srcPe * outTokEleNum + peTokenOffset * config.hiddenDim;
 
+      // Check shmem out token buffer
+      std::stringstream ss;
+      ss << "source pe " << srcPe << " dest pe " << config.rank << " expertId " << expertId
+         << " srcTokenId " << tokenId << " destTokenId " << peTokenOffset;
+      CompareTokenFunc(reinterpret_cast<uint32_t*>(globalInpTokBufCpu) + srcTokenOffset,
+                       handle.shmemOutTokMemObj->GetAs<uint32_t*>() + destTokenOffset,
+                       config.hiddenDim, ss.str());
+
+      // Check token to expert mapping buffer
       uint32_t* outTokToExptMapBuf = handle.outTokToExptMapMemObj->GetAs<uint32_t*>();
-      uint32_t gotExptId = outTokToExptMapBuf[i * maxNumOutTokenPerRank + peTokenOffset];
+      uint32_t gotExptId = outTokToExptMapBuf[srcPe * maxNumOutTokenPerRank + peTokenOffset];
       if ((gotExptId != expertId)) {
-        printf("Wrong: srcpe %d mype %d token offset %d expected %d got %d\n", i, config.rank,
+        printf("Wrong: srcpe %d mype %d token offset %d expected %d got %d\n", srcPe, config.rank,
                peTokenOffset, expertId, gotExptId);
         assert(false);
       }
       peTokenOffset += 1;
     }
-    uint32_t recvTokenNumSignal = handle.recvTokenNumMemObj->GetAs<uint32_t*>()[i];
+
+    // Check recv token num signal
+    uint32_t recvTokenNumSignal = handle.recvTokenNumMemObj->GetAs<uint32_t*>()[srcPe];
     assert((recvTokenNumSignal - 1) == peTokenOffset);
+  }
+
+  // Check out token buffer
+  struct SrcTokInfo {
+    int pe;
+    int tokenId;
+  };
+  std::vector<SrcTokInfo> srcTokInfoList;
+  for (int exptId = 0; exptId < config.numExpertPerRank; exptId++) {
+    for (int srcPe = 0; srcPe < config.worldSize; srcPe++) {
+      if (srcPe == config.rank) continue;
+
+      uint32_t* tokenIndiciesAddr = globalInpTokBuf + srcPe * maxNumOutTokenPerRank;
+
+      for (int tokIdx = 0; tokIdx < config.numExpertPerToken * globalTokenNum[srcPe]; tokIdx++) {
+        int expertId = tokenIndiciesAddr[tokIdx];
+        int rankId = expertId / config.numExpertPerRank;
+        if (rankId != config.rank) continue;
+
+        int localExptId = expertId % config.numExpertPerRank;
+        if (localExptId != exptId) continue;
+
+        int tokenId = tokIdx / config.numExpertPerToken;
+
+        srcTokInfoList.push_back({srcPe, tokenId});
+        // if (config.rank == 0) {
+        //   printf("mype %d expert id %d srcPe %d tokId %d\n", config.rank, expertId, srcPe,
+        //   tokenId);
+        // }
+      }
+    }
+  }
+
+  for (int localTokId = 0; localTokId < srcTokInfoList.size(); localTokId++) {
+    uint32_t* localTokBuf = handle.outTokenBuf + localTokId * config.hiddenDim;
+
+    int srcPe = srcTokInfoList[localTokId].pe;
+    int srcTokId = srcTokInfoList[localTokId].tokenId;
+    int srcTokenOffset = srcPe * inpTokEleNum + srcTokId * config.hiddenDim;
+    uint32_t* srcTokBuf = reinterpret_cast<uint32_t*>(globalInpTokBufCpu) + srcTokenOffset;
+
+    std::stringstream msg;
+    msg << "mype " << config.rank << " localTokId " << localTokId << " srcpe " << srcPe
+        << " srcTokId " << srcTokId;
+
+    CompareTokenFunc(srcTokBuf, localTokBuf, config.hiddenDim, msg.str());
   }
 
   for (int i = 0; i < expertCount.size(); i++) {
     std::cout << "Rank " << config.rank << " expert " << i << " token " << expertCount[i]
               << std::endl;
   }
-}
-
-template <typename T>
-__device__ T WarpReduceSumToRight(T sum) {
-  for (int i = warpSize / 2; i > 0; i /= 2) {
-    sum += __shfl_up(sum, i);
-  }
-  return sum;
 }
 
 template <typename T>
@@ -351,9 +402,6 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
   if (thdId < config.numExpertPerRank) {
     uint32_t expertTokNum = accumExpertTokOffsets[thdId];
     uint32_t accumOffset = WarpPrefixSum(expertTokNum, config.numExpertPerRank);
-    if ((myPe == 1) && (blockIdx.x == 0))
-      printf("mype %d expert id %d expert token %d accum offset %d\n", myPe, thdId, expertTokNum,
-             accumOffset);
     accumExpertTokOffsets[thdId] = accumOffset;
   }
   __syncthreads();
@@ -370,7 +418,7 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
     // TODO: also copy tokens from my pe
     if ((tokId == recvTokenNum[srcPe]) || (srcPe == myPe)) {
       srcPe++;
-      tokId = 0;
+      tokId = -1;
       continue;
     }
 
@@ -383,7 +431,8 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
     if ((i % globalWarpNum) != globalWarpId) continue;  // skip token not assigned for this warp
 
     // Copy token
-    uint32_t srcTokenOff = i * config.hiddenDim;
+    uint32_t srcTokenOff =
+        srcPe * maxNumOutTokenPerRank * config.hiddenDim + tokId * config.hiddenDim;
     uint32_t destTokenOff =
         (accumExpertTokOffsets[localExpertId] + expertTokOff[localExpertId] - 1) * config.hiddenDim;
 
