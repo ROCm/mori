@@ -49,9 +49,9 @@ __device__ void RecvThreadKernel(RdmaEndpoint& epRecv, MemoryRegion mr) {
   for (int i = 1; i <= MAX_INLINE_DATA_SIZE; i++) {
     uint8_t sendVal = i;
     for (int j = 0; j < i; j++) {
-      while (core::atomicLoadSeqCst(addr + j) != sendVal) {
+      while (core::AtomicLoadSeqCst(addr + j) != sendVal) {
       }
-      //   printf("%d %d %d\n", i, j, core::atomicLoadSeqCst(addr + j));
+      //   printf("%d %d %d\n", i, j, core::AtomicLoadSeqCst(addr + j));
     }
     printf("round %d pass\n", i);
     addr += i;

@@ -144,11 +144,11 @@ static __device__ uint64_t PostWriteInline(void* queueBuffAddr, uint32_t wqeNum,
 
   // TODO: support other size
   if (bytes == 4) {
-    atomicStoreRelaxed(reinterpret_cast<uint32_t*>(wqeDataPtr),
+    AtomicStoreRelaxed(reinterpret_cast<uint32_t*>(wqeDataPtr),
                        reinterpret_cast<uint32_t*>(val)[0]);
   } else {
     for (int i = 0; i < bytes; i++) {
-      atomicStoreRelaxed(reinterpret_cast<uint8_t*>(wqeDataPtr) + i,
+      AtomicStoreRelaxed(reinterpret_cast<uint8_t*>(wqeDataPtr) + i,
                          reinterpret_cast<uint8_t*>(val)[i]);
     }
   }

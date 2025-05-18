@@ -152,8 +152,8 @@ __device__ void ShmemQuietThread() {
     // TODO: 2 How to prevent cqe overflow?
     int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
     while (true) {
-      uint32_t consIdx = core::atomicLoadSeqCst(&cq.consIdx);
-      uint32_t postIdx = core::atomicLoadSeqCst(&wq.postIdx);
+      uint32_t consIdx = core::AtomicLoadSeqCst(&cq.consIdx);
+      uint32_t postIdx = core::AtomicLoadSeqCst(&wq.postIdx);
       if ((consIdx + 1) >= postIdx) break;
       int opcode = core::PollCq<PrvdType>(cq.cqAddr, cq.cqeSize, cq.cqeNum, &cq.consIdx);
       if (opcode == MLX5_CQE_RESP_ERR || opcode == MLX5_CQE_REQ_ERR) {
@@ -168,7 +168,7 @@ __device__ void ShmemQuietThread() {
 
 template <core::ProviderType PrvdType, typename T>
 __device__ void ShmemTypeWaitUntilGreaterThan(T* addr, T val) {
-  while (core::atomicLoadRelaxed(addr) == val) {
+  while (core::AtomicLoadRelaxed(addr) == val) {
   }
 }
 

@@ -7,37 +7,37 @@ namespace core {
 /*                              Atomic Operations                             */
 /* -------------------------------------------------------------------------- */
 template <typename T>
-__device__ T atomicLoadSeqCst(T* ptr) {
+__device__ T AtomicLoadSeqCst(T* ptr) {
   return __hip_atomic_load(ptr, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 template <typename T>
-__device__ T atomicLoadRelaxed(T* ptr) {
+__device__ T AtomicLoadRelaxed(T* ptr) {
   return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 template <typename T>
-__device__ T atomicLoadRelaxedSystem(T* ptr) {
+__device__ T AtomicLoadRelaxedSystem(T* ptr) {
   return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 template <typename T>
-__device__ T atomicLoadSeqCstSystem(T* ptr) {
+__device__ T AtomicLoadSeqCstSystem(T* ptr) {
   return __hip_atomic_load(ptr, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 template <typename T>
-__device__ void atomicStoreRelaxed(T* ptr, T val) {
+__device__ void AtomicStoreRelaxed(T* ptr, T val) {
   return __hip_atomic_store(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 template <typename T>
-__device__ void atomicStoreSeqCst(T* ptr, T val) {
+__device__ void AtomicStoreSeqCst(T* ptr, T val) {
   return __hip_atomic_store(ptr, val, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 template <typename T>
-__device__ void atomicStoreSeqCstSystem(T* ptr, T val) {
+__device__ void AtomicStoreSeqCstSystem(T* ptr, T val) {
   return __hip_atomic_store(ptr, val, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
