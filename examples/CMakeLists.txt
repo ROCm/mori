@@ -44,10 +44,10 @@ add_executable(
 target_link_libraries(put_thread_allgather mori_shmem hip::host hip::device)
 
 add_executable(
-    put_dispatch
-    shmem/put_dispatch.cpp
+    dispatch_combine
+    shmem/dispatch_combine.cpp
 )
-target_link_libraries(put_dispatch mori_shmem hip::host hip::device)
+target_link_libraries(dispatch_combine mori_shmem hip::host hip::device)
 
 add_executable(
     concurrent_put_thread

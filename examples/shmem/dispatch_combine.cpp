@@ -28,7 +28,7 @@ __device__ void SyncIfDebugEnabled(const char* msg) {
 #endif
 }
 
-struct EpDispatchConfig {
+struct EpDispatchCombineConfig {
   int randomSeed{0};
   int rank{0};
   int worldSize{0};
@@ -41,16 +41,16 @@ struct EpDispatchConfig {
 };
 
 template <typename T>
-class EpDispatchHandle {
+class EpDispatchCombineHandle {
  public:
-  EpDispatchHandle(EpDispatchConfig config) : config(config) {}
+  EpDispatchCombineHandle(EpDispatchCombineConfig config) : config(config) {}
 
   void Intialize() {
     IntializeTokenIndiciesBuf();
-    IntializeShmemInpTokBuf();
-    IntializeShmemOutTokBuf();
-    IntializeRecvTokenNumBuf();
+    IntializeShmemInpOutTokBuf();
+    IntializeTokenNumSignalBuf();
     IntializeTokToExptBuf();
+    IntializeOrderMapBuf();
   }
 
  private:
@@ -61,30 +61,33 @@ class EpDispatchHandle {
     HIP_RUNTIME_CHECK(hipMemset(tokenIndicies, 0, tokenIndiciesSize));
   }
 
-  void IntializeShmemInpTokBuf() {
-    int inpTokEleNum = config.maxNumInpTokenPerRank * config.hiddenDim;
-    int inpTokSize = inpTokEleNum * sizeof(T);
-    void* inpTokBuf = ShmemMalloc(inpTokSize);
-    HIP_RUNTIME_CHECK(hipMemset(inpTokBuf, 0, inpTokSize));
-    shmemInpTokMemObj = ShmemQueryMemObjPtr(inpTokBuf);
-    assert(shmemInpTokMemObj.IsValid());
-  }
+  void IntializeShmemInpOutTokBuf() {
+    int maxTokenSize = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken *
+                       config.hiddenDim * sizeof(T);
 
-  void IntializeShmemOutTokBuf() {
-    int outTokSize = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken *
-                     config.hiddenDim * sizeof(T);
-    void* shmemOutTokBuf = ShmemMalloc(outTokSize);
-    HIP_RUNTIME_CHECK(hipMemset(shmemOutTokBuf, 0, outTokSize));
+    void* shmemInpTokBuf = ShmemMalloc(maxTokenSize);
+    HIP_RUNTIME_CHECK(hipMemset(shmemInpTokBuf, 0, maxTokenSize));
+    shmemInpTokMemObj = ShmemQueryMemObjPtr(shmemInpTokBuf);
+    assert(shmemInpTokMemObj.IsValid());
+
+    void* shmemOutTokBuf = ShmemMalloc(maxTokenSize);
+    HIP_RUNTIME_CHECK(hipMemset(shmemOutTokBuf, 0, maxTokenSize));
     shmemOutTokMemObj = ShmemQueryMemObjPtr(shmemOutTokBuf);
     assert(shmemOutTokMemObj.IsValid());
   }
 
-  void IntializeRecvTokenNumBuf() {
-    int recvTokenNumSize = config.worldSize * sizeof(uint32_t);
-    void* recvTokenNumBuf = ShmemMalloc(recvTokenNumSize);
-    HIP_RUNTIME_CHECK(hipMemset(recvTokenNumBuf, 0, recvTokenNumSize));
+  void IntializeTokenNumSignalBuf() {
+    int tokenNumSignalSize = config.worldSize * sizeof(uint32_t);
+
+    void* recvTokenNumBuf = ShmemMalloc(tokenNumSignalSize);
+    HIP_RUNTIME_CHECK(hipMemset(recvTokenNumBuf, 0, tokenNumSignalSize));
     recvTokenNumMemObj = ShmemQueryMemObjPtr(recvTokenNumBuf);
     assert(recvTokenNumMemObj.IsValid());
+
+    void* sendTokenNumBuf = ShmemMalloc(tokenNumSignalSize);
+    HIP_RUNTIME_CHECK(hipMemset(sendTokenNumBuf, 0, tokenNumSignalSize));
+    sendTokenNumMemObj = ShmemQueryMemObjPtr(sendTokenNumBuf);
+    assert(sendTokenNumMemObj.IsValid());
   }
 
   void IntializeTokToExptBuf() {
@@ -101,13 +104,22 @@ class EpDispatchHandle {
     assert(outTokToExptMapMemObj.IsValid());
   }
 
+  void IntializeOrderMapBuf() {
+    int maxNumOutToken = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken;
+    HIP_RUNTIME_CHECK(hipMalloc(&exptSortedToPeSortedBuf, maxNumOutToken * sizeof(uint32_t)));
+    HIP_RUNTIME_CHECK(hipMemset(exptSortedToPeSortedBuf, 0, maxNumOutToken * sizeof(uint32_t)));
+
+    HIP_RUNTIME_CHECK(hipMalloc(&tokenIndicesToPeSortedBuf, maxNumOutToken * sizeof(uint32_t)));
+    HIP_RUNTIME_CHECK(hipMemset(tokenIndicesToPeSortedBuf, 0, maxNumOutToken * sizeof(uint32_t)));
+  }
+
  public:
   // Number of tokens on this rank, updated at each round of inference
   int curRankNumToken{-1};
 
  public:
   // Config
-  EpDispatchConfig config;
+  EpDispatchCombineConfig config;
   // Routed expert indices for tokens
   uint32_t* tokenIndicies{nullptr};
   // Kernel input/output buffer
@@ -118,10 +130,27 @@ class EpDispatchHandle {
   SymmMemObjPtr shmemOutTokMemObj;
   // Record number of tokens that will be received from other PE
   SymmMemObjPtr recvTokenNumMemObj;
-  // Buffers for token to expert mapping, only used for shmem ops
+  SymmMemObjPtr sendTokenNumMemObj;
+  // Buffers for token to expert mapping, only used for shmem ops at dispatch phase
   SymmMemObjPtr inpTokToExptMapMemObj;
   SymmMemObjPtr outTokToExptMapMemObj;
+
+  // Recover from expert sorted order to pe sorted order, filled at dispatch recv phase and used at
+  // combine send phase
+  uint32_t* exptSortedToPeSortedBuf{nullptr};
+  // Recover from pe sorted order to original order, filled at dispatch send phase and used at
+  // combine recv phase
+  uint32_t* tokenIndicesToPeSortedBuf{nullptr};
 };
+
+template <typename T>
+__device__ T WarpReduceSum(T val) {
+  int laneId = threadIdx.x & (warpSize - 1);
+  for (int delta = (warpSize >> 1); delta > 0; delta = (delta >> 1)) {
+    val += __shfl_down(val, delta);
+  }
+  return val;
+}
 
 template <typename T>
 __device__ T WarpPrefixSum(T val, size_t laneNum) {
@@ -154,7 +183,30 @@ __device__ void WarpCopy(T* dst, T* src, size_t nelems) {
 }
 
 template <typename T>
-__global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatchHandle<T> handle) {
+__device__ void WarpAccum(T* accum, T* src, size_t nelems) {
+  constexpr int vecSize = 16 / sizeof(T);
+  int laneId = threadIdx.x & (warpSize - 1);
+  int offset = laneId * vecSize;
+
+  while ((offset + vecSize) < nelems) {
+    uint4 srcVal = reinterpret_cast<uint4*>(src + offset)[0];
+    uint4 accumVal = reinterpret_cast<uint4*>(accum + offset)[0];
+    for (int i = 0; i < vecSize; i++) {
+      reinterpret_cast<T*>(&accumVal)[i] += reinterpret_cast<T*>(&srcVal)[i];
+    }
+    reinterpret_cast<uint4*>(accum + offset)[0] = accumVal;
+    offset += warpSize * vecSize;
+  }
+
+  while (offset < nelems) {
+    accum[offset] += src[offset];
+    offset += 1;
+  }
+}
+
+template <typename T>
+__global__ void EpDispatchKernel(EpDispatchCombineConfig config,
+                                 EpDispatchCombineHandle<T> handle) {
   int thdId = threadIdx.x;
   int thdNum = blockDim.x;
 
@@ -197,16 +249,22 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
 
     if ((i % globalWarpNum) != globalWarpId) continue;  // skip token not assigned for this warp
 
-    int tokenId = i / config.numExpertPerToken;
-    int tokenOffset = tokenId * config.hiddenDim;
+    uint32_t tokenId = i / config.numExpertPerToken;
+    uint32_t tokenOffset = tokenId * config.hiddenDim;
 
-    int destEpOffset = myPe * maxNumOutTokenPerRank * config.hiddenDim;
-    int destEpTokOffset = peTokenIdx * config.hiddenDim;
+    uint32_t peSortedId = myPe * maxNumOutTokenPerRank + peTokenIdx;
+    uint32_t peSortedOffset = peSortedId * config.hiddenDim;
+
+    if (laneId == 0) {
+      handle.tokenIndicesToPeSortedBuf[i] = destPe * maxNumOutTokenPerRank + peTokenIdx;
+      printf("dispatch mype %d token index id %d pe sort id %d\n", myPe, i,
+             handle.tokenIndicesToPeSortedBuf[i]);
+    }
 
     // TODO: call copy since we don't build queue pair to self for now, we should consider
     // calling shmem api directly and let it decide how to transfer data based on transport type
     if (destPe == myPe) {
-      WarpCopy(handle.shmemOutTokMemObj->template GetAs<T*>() + destEpOffset + destEpTokOffset,
+      WarpCopy(handle.shmemOutTokMemObj->template GetAs<T*>() + peSortedOffset,
                handle.inpTokenBuf + tokenOffset, config.hiddenDim);
       continue;
     }
@@ -214,7 +272,7 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
     WarpCopy(handle.shmemInpTokMemObj->template GetAs<T*>() + tokenOffset,
              handle.inpTokenBuf + tokenOffset, config.hiddenDim);
     if (laneId == 0) {
-      ShmemPutTypeNbiThread<PrvdType, T>(handle.shmemOutTokMemObj, destEpOffset + destEpTokOffset,
+      ShmemPutTypeNbiThread<PrvdType, T>(handle.shmemOutTokMemObj, peSortedOffset,
                                          handle.shmemInpTokMemObj, tokenOffset, config.hiddenDim,
                                          destPe);
     }
@@ -258,12 +316,10 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
   }
   __syncthreads();
 
-  uint32_t totalNumRecvToken = 0;
   for (int destPe = laneId; destPe < npes; destPe += warpSize) {
     uint32_t* signal = handle.recvTokenNumMemObj->template GetAs<uint32_t*>() + destPe;
     ShmemUint32WaitUntilGreaterThan<PrvdType>(signal, 0);
     recvTokenNum[destPe] = *signal - 1;
-    totalNumRecvToken += *signal - 1;
   }
   SyncIfDebugEnabled("finish waiting num token signal");
 
@@ -296,15 +352,15 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
   T* outTokenBuf = handle.outTokenBuf;
   T* shmemOutTokenBuf = handle.shmemOutTokMemObj->template GetAs<T*>();
 
-  for (int i = 0, tokId = 0, srcPe = 0; srcPe < npes; tokId++, i++) {
-    if (tokId == recvTokenNum[srcPe]) {
+  for (int i = 0, srcTokId = 0, srcPe = 0; srcPe < npes; srcTokId++, i++) {
+    if (srcTokId == recvTokenNum[srcPe]) {
       srcPe++;
-      tokId = -1;
+      srcTokId = -1;
       continue;
     }
 
     uint32_t localExpertId =
-        outTokToExptBuf[srcPe * maxNumOutTokenPerRank + tokId] % config.numExpertPerRank;
+        outTokToExptBuf[srcPe * maxNumOutTokenPerRank + srcTokId] % config.numExpertPerRank;
     if (laneId == 0) {
       expertTokOff[localExpertId] += 1;
     }
@@ -312,12 +368,118 @@ __global__ void EpDispatchWithPutMemAPIKernel(EpDispatchConfig config, EpDispatc
     if ((i % globalWarpNum) != globalWarpId) continue;  // skip token not assigned for this warp
 
     // Copy token
-    uint32_t srcTokenOff =
-        srcPe * maxNumOutTokenPerRank * config.hiddenDim + tokId * config.hiddenDim;
-    uint32_t destTokenOff =
-        (accumExpertTokOffsets[localExpertId] + expertTokOff[localExpertId] - 1) * config.hiddenDim;
+    uint32_t peSortedId = srcPe * maxNumOutTokenPerRank + srcTokId;
+    uint32_t srcTokenOff = peSortedId * config.hiddenDim;
+
+    uint32_t exptSortedId = accumExpertTokOffsets[localExpertId] + expertTokOff[localExpertId] - 1;
+    uint32_t destTokenOff = exptSortedId * config.hiddenDim;
 
     WarpCopy(outTokenBuf + destTokenOff, shmemOutTokenBuf + srcTokenOff, config.hiddenDim);
+
+    if (laneId == 0) {
+      handle.exptSortedToPeSortedBuf[exptSortedId] = peSortedId;
+      printf("dispatch mype %d expt sort id %d pe sort id %d\n", myPe, exptSortedId, peSortedId);
+    }
+  }
+}
+
+template <typename T>
+__global__ void EpCombineKernel(EpDispatchCombineConfig config, EpDispatchCombineHandle<T> handle) {
+  int thdId = threadIdx.x;
+  int thdNum = blockDim.x;
+
+  int laneId = threadIdx.x & (warpSize - 1);
+  int warpId = thdId / warpSize;
+  int warpNum = blockDim.x / warpSize;
+
+  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
+  int globalWarpId = blockIdx.x * warpNum + warpId;
+  int globalWarpNum = gridDim.x * warpNum;
+
+  int myPe = config.rank;
+  int npes = config.worldSize;
+
+  T* inpTokenBuf = handle.inpTokenBuf;
+  T* shmemInpTokenBuf = handle.shmemInpTokMemObj->template GetAs<T*>();
+  T* shmemOutTokenBuf = handle.shmemOutTokMemObj->template GetAs<T*>();
+
+  size_t maxNumOutTokenPerRank = config.maxNumInpTokenPerRank * config.numExpertPerToken;
+
+  // Phase 1: recover tokens from expert sorted order to pe sorted order and send token back
+  // Each warp compute total number of recveid tokens
+  uint32_t* recvTokenNumBuf = handle.recvTokenNumMemObj->template GetAs<uint32_t*>();
+  uint32_t totalNumRecvToken = 0;
+  for (int i = laneId; i < npes; i += warpSize) {
+    totalNumRecvToken += recvTokenNumBuf[i] - 1;
+  }
+  totalNumRecvToken = WarpReduceSum(totalNumRecvToken);
+  totalNumRecvToken = __shfl(totalNumRecvToken, 0);
+  if (laneId == 0) printf("mype %d total recv num token %d\n", myPe, totalNumRecvToken);
+
+  // Recover pe sorted order and send back
+  for (int exptSortedId = 0; exptSortedId < totalNumRecvToken; exptSortedId++) {
+    if ((exptSortedId % globalWarpNum) != globalWarpId) continue;
+
+    uint32_t peSortedId = handle.exptSortedToPeSortedBuf[exptSortedId];
+    uint32_t peSortedOffset = peSortedId * config.hiddenDim;
+
+    uint32_t exptSortedOffset = exptSortedId * config.hiddenDim;
+    WarpCopy(shmemInpTokenBuf + peSortedOffset, inpTokenBuf + exptSortedOffset, config.hiddenDim);
+    if (laneId == 0)
+      printf("mype %d expt sort id %d pe sort id %d val %d %d \n", myPe, exptSortedId, peSortedId,
+             inpTokenBuf[exptSortedOffset], exptSortedOffset);
+  }
+
+  for (int destPe = globalWarpId; destPe < npes; destPe += globalWarpNum) {
+    uint32_t recvTokenNum = recvTokenNumBuf[destPe] - 1;
+    uint32_t numTokenSignal = recvTokenNum + 1;
+    if (laneId == 0)
+      printf("combine mype %d destpe %d recv token num %d val %d %d \n", myPe, destPe, recvTokenNum,
+             shmemInpTokenBuf[destPe * maxNumOutTokenPerRank], destPe * maxNumOutTokenPerRank);
+
+    if (destPe == myPe) {
+      WarpCopy(shmemOutTokenBuf + myPe * maxNumOutTokenPerRank * config.hiddenDim,
+               shmemInpTokenBuf + destPe * maxNumOutTokenPerRank * config.hiddenDim,
+               recvTokenNum * config.hiddenDim);
+      __threadfence();
+      AtomicStoreRelaxed(handle.sendTokenNumMemObj->template GetAs<uint32_t*>() + myPe,
+                         numTokenSignal);
+      continue;
+    }
+    if (laneId == 0) {
+      ShmemPutTypeNbiThread<PrvdType, T>(
+          handle.shmemOutTokMemObj, myPe * maxNumOutTokenPerRank * config.hiddenDim,
+          handle.shmemInpTokMemObj, destPe * maxNumOutTokenPerRank * config.hiddenDim,
+          recvTokenNum * config.hiddenDim, destPe);
+      // Set token number signal, note that this signal is only used for notifying dest Pe that
+      // tokens have been sent, the dest pe itself know exactly how many token it sends to my pe.
+      ShmemPutUint32ImmNbiThread<PrvdType>(handle.sendTokenNumMemObj, myPe * sizeof(uint32_t),
+                                           numTokenSignal, destPe);
+    }
+  }
+  __threadfence();
+
+  // Phase 2: recv pe sorted token, reduce accross expert and recover original order
+  for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+    uint32_t* signal = handle.sendTokenNumMemObj->template GetAs<uint32_t*>() + destPe;
+    ShmemUint32WaitUntilGreaterThan<PrvdType>(signal, 0);
+  }
+  SyncIfDebugEnabled("finish waiting num token signal");
+
+  T* outTokenBuf = handle.outTokenBuf;
+  for (int i = 0; i < handle.curRankNumToken; i++) {
+    if ((i % globalWarpNum) != globalWarpId) continue;
+    uint32_t tokenOffset = i * config.hiddenDim;
+
+    for (int j = 0; j < config.numExpertPerToken; j++) {
+      uint32_t peSortedId = handle.tokenIndicesToPeSortedBuf[i * config.numExpertPerToken + j];
+      uint32_t peSortedOffset = peSortedId * config.hiddenDim;
+      WarpAccum(handle.outTokenBuf + tokenOffset, shmemOutTokenBuf + peSortedOffset,
+                config.hiddenDim);
+      if (laneId == 0)
+        printf("mype %d token index id %d pe sort id %d val %d\n", myPe,
+               i * config.numExpertPerToken + j, peSortedId, shmemOutTokenBuf[peSortedOffset]);
+    }
   }
 }
 
@@ -326,47 +488,59 @@ class EpDispatchCombineTestCase {
  public:
   EpDispatchCombineTestCase() {
     gen = mt19937(rd());
-    gen.seed(0);
+    gen.seed(ShmemMyPe());
   }
   ~EpDispatchCombineTestCase() = default;
 
-  void RandomInitializeHandle(EpDispatchHandle<T>& handle) {
-    EpDispatchConfig& config = handle.config;
+  void RandomInitializeHandle(EpDispatchCombineHandle<T>& handle) {
+    EpDispatchCombineConfig& config = handle.config;
 
     // Set kernel input/output token buffer
-    int inpTokSize = config.maxNumInpTokenPerRank * config.hiddenDim * sizeof(T);
-    HIP_RUNTIME_CHECK(hipMalloc(&handle.inpTokenBuf, inpTokSize));
-    HIP_RUNTIME_CHECK(hipMemset(handle.inpTokenBuf, 0, inpTokSize));
-
-    int outTokSize = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken *
-                     config.hiddenDim * sizeof(T);
-    HIP_RUNTIME_CHECK(hipMalloc(&handle.outTokenBuf, outTokSize));
-    HIP_RUNTIME_CHECK(hipMemset(handle.outTokenBuf, 0, outTokSize));
+    int maxTokenSize = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken *
+                       config.hiddenDim * sizeof(T);
+    HIP_RUNTIME_CHECK(hipMalloc(&handle.inpTokenBuf, maxTokenSize));
+    HIP_RUNTIME_CHECK(hipMemset(handle.inpTokenBuf, 0, maxTokenSize));
+    HIP_RUNTIME_CHECK(hipMalloc(&handle.outTokenBuf, maxTokenSize));
+    HIP_RUNTIME_CHECK(hipMemset(handle.outTokenBuf, 0, maxTokenSize));
 
     RandomIntializeNumToken(handle);
     RandomIntializeDispatch(handle);
     RandomInitializeToken(handle);
   }
 
-  void Run(EpDispatchHandle<T>& handle) {
-    EpDispatchConfig& config = handle.config;
+  void CompareToken(T* expected, T* got, uint32_t hiddenDim, std::string msg) {
+    for (int k = 0; k < hiddenDim; k++) {
+      T expectedVal = expected[k];
+      T gotVal = got[k];
+      bool equal = (expectedVal == gotVal);
+      if (!equal) {
+        std::cout << "Wrong result at pos " << k << ": " << msg << " expected " << expectedVal
+                  << " got " << gotVal << std::endl;
+        assert(false);
+      }
+    }
+  };
+
+  void RunDispatch(EpDispatchCombineHandle<T>& handle) {
+    EpDispatchCombineConfig& config = handle.config;
     dim3 grid(config.blockNum);
     dim3 block(warpSize * config.warpNumPerBlock);
     size_t sharedMemSize = 2 * config.worldSize * config.warpNumPerBlock * sizeof(uint32_t);
-    EpDispatchWithPutMemAPIKernel<<<grid, block, sharedMemSize>>>(config, handle);
+    EpDispatchKernel<<<grid, block, sharedMemSize>>>(config, handle);
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   }
 
-  void CehckResult(EpDispatchHandle<T>& handle) {
-    EpDispatchConfig& config = handle.config;
+  void CheckDispatchResult(EpDispatchCombineHandle<T>& handle) {
+    EpDispatchCombineConfig& config = handle.config;
 
     // Copy token indices to CPU
     int maxNumOutTokenPerRank = config.maxNumInpTokenPerRank * config.numExpertPerToken;
     int tokenIndiciesSize = maxNumOutTokenPerRank * sizeof(uint32_t);
 
+    // Collect token indices from all ranks
     uint32_t* tokenIndicesCpu = reinterpret_cast<uint32_t*>(malloc(tokenIndiciesSize));
     HIP_RUNTIME_CHECK(
         hipMemcpy(tokenIndicesCpu, handle.tokenIndicies, tokenIndiciesSize, hipMemcpyDeviceToHost));
-    // Collect token indices from all ranks
     uint32_t* globalTokIndiciesCpu =
         reinterpret_cast<uint32_t*>(malloc(config.worldSize * tokenIndiciesSize));
     MPI_Allgather(tokenIndicesCpu, tokenIndiciesSize, MPI_CHAR, globalTokIndiciesCpu,
@@ -382,7 +556,7 @@ class EpDispatchCombineTestCase {
     // Collect tokens from all ranks
     int inpTokEleNum = config.maxNumInpTokenPerRank * config.hiddenDim;
     int inpTokSize = inpTokEleNum * sizeof(T);
-    void* inpTokBufCpu = malloc(inpTokSize);
+    inpTokBufCpu = malloc(inpTokSize);
     HIP_RUNTIME_CHECK(
         hipMemcpy(inpTokBufCpu, handle.inpTokenBuf, inpTokSize, hipMemcpyDeviceToHost));
 
@@ -393,19 +567,6 @@ class EpDispatchCombineTestCase {
            inpTokSize);
 
     std::vector<uint32_t> expertCount(config.numExpertPerRank, 0);
-
-    auto CompareTokenFunc = [](T* expected, T* got, uint32_t hiddenDim, std::string msg) {
-      for (int k = 0; k < hiddenDim; k++) {
-        T expectedVal = expected[k];
-        T gotVal = got[k];
-        bool equal = (expectedVal == gotVal);
-        if (!equal) {
-          std::cout << "Wrong result at pos " << k << ": " << msg << " expected " << expectedVal
-                    << " got " << gotVal << std::endl;
-          assert(false);
-        }
-      }
-    };
 
     // Check result
     for (int srcPe = 0; srcPe < config.worldSize; srcPe++) {
@@ -429,9 +590,9 @@ class EpDispatchCombineTestCase {
         std::stringstream ss;
         ss << "source pe " << srcPe << " dest pe " << config.rank << " expertId " << expertId
            << " srcTokenId " << tokenId << " destTokenId " << peTokenOffset;
-        CompareTokenFunc(reinterpret_cast<T*>(globalInpTokBufCpu) + srcTokenOffset,
-                         handle.shmemOutTokMemObj->template GetAs<T*>() + destTokenOffset,
-                         config.hiddenDim, ss.str());
+        CompareToken(reinterpret_cast<T*>(globalInpTokBufCpu) + srcTokenOffset,
+                     handle.shmemOutTokMemObj->template GetAs<T*>() + destTokenOffset,
+                     config.hiddenDim, ss.str());
 
         // Check token to expert mapping buffer
         uint32_t* outTokToExptMapBuf = handle.outTokToExptMapMemObj->template GetAs<uint32_t*>();
@@ -485,28 +646,63 @@ class EpDispatchCombineTestCase {
       std::stringstream msg;
       msg << "mype " << config.rank << " localTokId " << localTokId << " srcpe " << srcPe
           << " srcTokId " << srcTokId;
+      printf("check dispatch mype %d token id %d val %d\n", config.rank, localTokId,
+             localTokBuf[0]);
+      CompareToken(srcTokBuf, localTokBuf, config.hiddenDim, msg.str());
+    }
+  }
 
-      CompareTokenFunc(srcTokBuf, localTokBuf, config.hiddenDim, msg.str());
+  void RunCombine(EpDispatchCombineHandle<T>& handle) {
+    EpDispatchCombineConfig& config = handle.config;
+
+    int maxNumOutTokenPerRank = config.maxNumInpTokenPerRank * config.numExpertPerToken;
+
+    HIP_RUNTIME_CHECK(hipMemcpy(handle.inpTokenBuf, handle.outTokenBuf,
+                                maxNumOutTokenPerRank * config.hiddenDim * sizeof(T),
+                                hipMemcpyDeviceToDevice));
+    HIP_RUNTIME_CHECK(
+        hipMemset(handle.outTokenBuf, 0, maxNumOutTokenPerRank * config.hiddenDim * sizeof(T)));
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+    if (config.rank == 0) {
+      printf("before run combine token 1 %d %d\n", handle.inpTokenBuf[config.hiddenDim],
+             handle.outTokenBuf[config.hiddenDim]);
     }
 
-    // for (int i = 0; i < expertCount.size(); i++) {
-    //   std::cout << "Rank " << config.rank << " expert " << i << " token " << expertCount[i]
-    //             << std::endl;
-    // }
+    dim3 grid(config.blockNum);
+    dim3 block(warpSize * config.warpNumPerBlock);
+    size_t sharedMemSize = 2 * config.worldSize * config.warpNumPerBlock * sizeof(uint32_t);
+    EpCombineKernel<<<grid, block, sharedMemSize>>>(config, handle);
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  }
+
+  void CheckCombineResult(EpDispatchCombineHandle<T>& handle) {
+    EpDispatchCombineConfig& config = handle.config;
+
+    for (int i = 0; i < handle.curRankNumToken; i++) {
+      uint32_t tokenOffset = i * config.hiddenDim;
+      for (int j = 0; j < config.hiddenDim; j++) {
+        T expected = reinterpret_cast<T*>(inpTokBufCpu)[tokenOffset + j] * config.numExpertPerToken;
+        T got = handle.outTokenBuf[tokenOffset + j];
+        if (got != expected) {
+          printf("Wrong result at pos %d: mype %d tokenId %d expected %d got %d\n", j, config.rank,
+                 i, expected, got);
+          assert(false);
+        }
+      }
+    }
   }
 
  private:
-  void RandomIntializeNumToken(EpDispatchHandle<T>& handle) {
-    EpDispatchConfig& config = handle.config;
+  void RandomIntializeNumToken(EpDispatchCombineHandle<T>& handle) {
+    EpDispatchCombineConfig& config = handle.config;
     uniform_int_distribution<> dist(0, config.maxNumInpTokenPerRank);
     handle.curRankNumToken = dist(gen);
   }
 
-  void RandomIntializeDispatch(EpDispatchHandle<T>& handle) {
-    EpDispatchConfig& config = handle.config;
-
+  void RandomIntializeDispatch(EpDispatchCombineHandle<T>& handle) {
+    EpDispatchCombineConfig& config = handle.config;
     int totalNumExperts = config.worldSize * config.numExpertPerRank;
-    uniform_int_distribution<> distTokIndex(0, totalNumExperts - 1);
 
     std::vector<int> epRange;
     for (int i = 0; i < config.worldSize * config.numExpertPerRank; i++) epRange.push_back(i);
@@ -525,8 +721,8 @@ class EpDispatchCombineTestCase {
     std::cout << ss.str() << std::endl;
   }
 
-  void RandomInitializeToken(EpDispatchHandle<T>& handle) {
-    EpDispatchConfig& config = handle.config;
+  void RandomInitializeToken(EpDispatchCombineHandle<T>& handle) {
+    EpDispatchCombineConfig& config = handle.config;
 
     int inpTokEleNum = config.maxNumInpTokenPerRank * config.hiddenDim;
     uniform_int_distribution<> tokValDist(0, config.hiddenDim);
@@ -538,6 +734,8 @@ class EpDispatchCombineTestCase {
  private:
   random_device rd;
   mt19937 gen;
+
+  void* inpTokBufCpu{nullptr};
 };
 
 // A simple MoE-EP dispatch kernel example, assume dp rank is equal to ep rank
@@ -552,26 +750,29 @@ void EpDispatchWithPutMemAPI() {
   int npes = ShmemNPes();
 
   // Setup config
-  EpDispatchConfig config;
+  EpDispatchCombineConfig config;
   config.randomSeed = myPe;
   config.rank = myPe;
   config.worldSize = npes;
-  config.numExpertPerRank = 8;
+  config.numExpertPerRank = 1;
   config.hiddenDim = 4096;
-  config.numExpertPerToken = 8;
-  config.maxNumInpTokenPerRank = 128;
-  config.warpNumPerBlock = 4;
-  config.blockNum = 8;
+  config.numExpertPerToken = 1;
+  config.maxNumInpTokenPerRank = 2;
+  config.warpNumPerBlock = 1;
+  config.blockNum = 1;
 
-  // Intialize EpDispatchHandle
+  // Intialize EpDispatchCombineHandle
   using DataType = uint32_t;
-  EpDispatchHandle<DataType> handle(config);
+  EpDispatchCombineHandle<DataType> handle(config);
   handle.Intialize();
 
   EpDispatchCombineTestCase<DataType> testCase;
   testCase.RandomInitializeHandle(handle);
-  testCase.Run(handle);
-  testCase.CehckResult(handle);
+  testCase.RunDispatch(handle);
+  testCase.CheckDispatchResult(handle);
+  MPI_Barrier(MPI_COMM_WORLD);
+  testCase.RunCombine(handle);
+  testCase.CheckCombineResult(handle);
 
   ShmemMpiFinalize();
   MPI_Finalize();
