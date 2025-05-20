@@ -88,6 +88,9 @@ class EpDispatchCombineHandle {
     HIP_RUNTIME_CHECK(hipMemset(sendTokenNumBuf, 0, tokenNumSignalSize));
     sendTokenNumMemObj = ShmemQueryMemObjPtr(sendTokenNumBuf);
     assert(sendTokenNumMemObj.IsValid());
+
+    HIP_RUNTIME_CHECK(hipMalloc(&gridCopyTokenBarrier, tokenNumSignalSize));
+    HIP_RUNTIME_CHECK(hipMemset(gridCopyTokenBarrier, 0, tokenNumSignalSize));
   }
 
   void IntializeTokToExptBuf() {
@@ -131,6 +134,7 @@ class EpDispatchCombineHandle {
   // Record number of tokens that will be received from other PE
   SymmMemObjPtr recvTokenNumMemObj;
   SymmMemObjPtr sendTokenNumMemObj;
+  uint32_t* gridCopyTokenBarrier{nullptr};
   // Buffers for token to expert mapping, only used for shmem ops at dispatch phase
   SymmMemObjPtr inpTokToExptMapMemObj;
   SymmMemObjPtr outTokToExptMapMemObj;
@@ -417,7 +421,8 @@ __global__ void EpCombineKernel(EpDispatchCombineConfig config, EpDispatchCombin
   totalNumRecvToken = __shfl(totalNumRecvToken, 0);
 
   // Recover pe sorted order and send back
-  // TODO: copy tokens into shmem out token buffer in this loop to avoid multi-device cache coherence bug
+  // TODO: copy tokens into shmem out token buffer in this loop to avoid multi-device cache
+  // coherence bug
   for (int exptSortedId = 0; exptSortedId < totalNumRecvToken; exptSortedId++) {
     if ((exptSortedId % globalWarpNum) != globalWarpId) continue;
 
@@ -426,12 +431,20 @@ __global__ void EpCombineKernel(EpDispatchCombineConfig config, EpDispatchCombin
 
     uint32_t exptSortedOffset = exptSortedId * config.hiddenDim;
     WarpCopy(shmemInpTokenBuf + peSortedOffset, inpTokenBuf + exptSortedOffset, config.hiddenDim);
+
+    __threadfence();
+    if (laneId == 0) {
+      uint32_t destPe = peSortedId / maxNumOutTokenPerRank;
+      uint32_t destPeCopyCnt = atomicAdd(handle.gridCopyTokenBarrier + destPe, 1);
+    }
   }
   SyncIfDebugEnabled("Combine kernel: finish recovering from expert sorted to pe sorted");
 
   for (int destPe = globalWarpId; destPe < npes; destPe += globalWarpNum) {
     uint32_t numTokenSignal = recvTokenNumBuf[destPe];
     uint32_t recvTokenNum = numTokenSignal - 1;
+
+    ShmemUint32WaitUntilEquals<PrvdType>(handle.gridCopyTokenBarrier + destPe, recvTokenNum);
 
     if (destPe == myPe) {
       WarpCopy(shmemOutTokenBuf + myPe * maxNumOutTokenPerRank * config.hiddenDim,

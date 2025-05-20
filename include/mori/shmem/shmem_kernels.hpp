@@ -168,7 +168,7 @@ __device__ void ShmemQuietThread() {
 
 template <core::ProviderType PrvdType, typename T>
 __device__ void ShmemTypeWaitUntilGreaterThan(T* addr, T val) {
-  while (core::AtomicLoadRelaxed(addr) == val) {
+  while (core::AtomicLoadRelaxed(addr) <= val) {
   }
 }
 
@@ -182,6 +182,23 @@ DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Uint8, uint8_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Uint16, uint16_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Uint32, uint32_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Uint64, uint64_t)
+
+template <core::ProviderType PrvdType, typename T>
+__device__ void ShmemTypeWaitUntilEquals(T* addr, T val) {
+  while (core::AtomicLoadRelaxed(addr) != val) {
+  }
+}
+
+#define DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(TypeName, T)              \
+  template <core::ProviderType PrvdType>                             \
+  __device__ void Shmem##TypeName##WaitUntilEquals(T* addr, T val) { \
+    ShmemTypeWaitUntilEquals<PrvdType, T>(addr, val);                \
+  }
+
+DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Uint8, uint8_t)
+DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Uint16, uint16_t)
+DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Uint32, uint32_t)
+DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Uint64, uint64_t)
 
 }  // namespace shmem
 }  // namespace mori
