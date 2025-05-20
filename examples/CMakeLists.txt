@@ -54,3 +54,9 @@ add_executable(
     shmem/concurrent_put_thread.cpp
 )
 target_link_libraries(concurrent_put_thread mori_shmem hip::host hip::device)
+
+add_executable(
+    context
+    application/context.cpp
+)
+target_link_libraries(context mori_application hip::host hip::device)

@@ -26,7 +26,7 @@ __device__ void ShmemPutMemNbiThread(const application::SymmMemObjPtr dest, size
   uintptr_t rkey = dest->peerRkeys[pe];
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  application::RdmaEndpoint* ep = globalGpuStates->epsStartAddr;
+  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   application::WorkQueueHandle& wq = ep[pe].wqHandle;
 
   int rank = globalGpuStates->rank;
@@ -95,7 +95,7 @@ __device__ void ShmemPutSizeImmNbiThread(const application::SymmMemObjPtr dest, 
   uintptr_t rkey = dest->peerRkeys[pe];
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  application::RdmaEndpoint* ep = globalGpuStates->epsStartAddr;
+  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   application::WorkQueueHandle& wq = ep[pe].wqHandle;
 
   int rank = globalGpuStates->rank;
@@ -135,7 +135,7 @@ __device__ void ShmemPutMemNbiWarp(const application::SymmMemObj* dest,
 template <core::ProviderType PrvdType>
 __device__ void ShmemQuietThread() {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  application::RdmaEndpoint* ep = globalGpuStates->epsStartAddr;
+  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
 
   int rank = globalGpuStates->rank;
   int worldSize = globalGpuStates->worldSize;

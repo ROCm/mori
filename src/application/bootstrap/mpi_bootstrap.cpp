@@ -9,7 +9,7 @@ namespace application {
 
 MpiBootstrapNetwork::MpiBootstrapNetwork(MPI_Comm mpi_comm) : mpi_comm(mpi_comm) {}
 
-MpiBootstrapNetwork::~MpiBootstrapNetwork() {}
+MpiBootstrapNetwork::~MpiBootstrapNetwork() { Finalize(); }
 
 void MpiBootstrapNetwork::Initialize() {
   int initialized;
@@ -22,10 +22,21 @@ void MpiBootstrapNetwork::Initialize() {
   MPI_Comm_rank(mpi_comm, &local_rank);
 }
 
-void MpiBootstrapNetwork::Finalize() {}
+void MpiBootstrapNetwork::Finalize() {
+  int finalized = false;
+  int status = MPI_Finalized(&finalized);
+  assert(!status);
+
+  if (!finalized) MPI_Finalize();
+}
 
 void MpiBootstrapNetwork::Allgather(void* sendbuf, void* recvbuf, size_t sendcount) {
   int status = MPI_Allgather(sendbuf, sendcount, MPI_CHAR, recvbuf, sendcount, MPI_CHAR, mpi_comm);
+  assert(!status);
+}
+
+void MpiBootstrapNetwork::AllToAll(void* sendbuf, void* recvbuf, size_t sendcount) {
+  int status = MPI_Alltoall(sendbuf, sendcount, MPI_CHAR, recvbuf, sendcount, MPI_CHAR, mpi_comm);
   assert(!status);
 }
 

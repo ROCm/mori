@@ -756,6 +756,7 @@ void EpDispatchWithPutMemAPI() {
   EpDispatchCombineHandle<DataType> handle(config);
   handle.Intialize();
 
+  // Run tests
   EpDispatchCombineTestCase<DataType> testCase(handle);
   for (int i = 0; i < 10; i++) {
     testCase.RandomInitializeHandle();
@@ -768,7 +769,6 @@ void EpDispatchWithPutMemAPI() {
   }
 
   ShmemMpiFinalize();
-  MPI_Finalize();
 }
 
 int main() {

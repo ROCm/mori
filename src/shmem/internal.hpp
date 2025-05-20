@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -19,12 +20,7 @@ using RdmaEndpointList = std::vector<application::RdmaEndpoint>;
 using RdmaEndpointHandleList = std::vector<application::RdmaEndpointHandle>;
 
 struct RdmaStates {
-  application::RdmaContext* context{nullptr};
-  application::RdmaDeviceContext* deviceContext{nullptr};
-  RdmaEndpointList localEps;
-  application::RdmaEndpoint* localEpsGpu;
-  uint32_t* epCqLockMemGpu;
-  std::vector<RdmaEndpointHandleList> remoteEpHandles;
+  application::Context* commContext{nullptr};
 };
 
 struct MemoryStates {
@@ -41,10 +37,10 @@ struct ShmemStates {
 constexpr int MaxRdmaEndpointNum = 1024;
 
 struct GpuStates {
-  int rank;
-  int worldSize;
-  application::RdmaEndpoint* epsStartAddr;
-  uint32_t* epCqLockMemGpu;
+  int rank{-1};
+  int worldSize{-1};
+  application::TransportType* transportTypes{nullptr};
+  application::RdmaEndpoint* rdmaEndpoints{nullptr};
 };
 
 extern __constant__ GpuStates globalGpuStates;

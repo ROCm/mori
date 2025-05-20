@@ -21,60 +21,18 @@ void RdmaStatesInit() {
   int worldSize = states->bootStates->worldSize;
   assert(worldSize * worldSize <= MaxRdmaEndpointNum);
 
-  // TODO: select device and port
-  rdmaStates->context = new application::RdmaContext();
-  const application::RdmaDeviceList& devices = rdmaStates->context->GetRdmaDeviceList();
-
-  // Find the first device with active port
-  int portId = 0;
-  application::RdmaDevice* selectedDevice = nullptr;
-  for (auto* device : devices) {
-    std::vector<int> activePorts = device->GetActivePortIds();
-    if (activePorts.empty()) continue;
-    portId = activePorts[0];
-    selectedDevice = device;
-  }
-  assert(portId > 0);
-  rdmaStates->deviceContext = selectedDevice->CreateRdmaDeviceContext();
-
-  application::RdmaEndpointConfig config;
-  config.portId = portId;
-  config.gidIdx = 1;
-  // TODO: expose cqe / wqe numfig con
-  config.maxMsgsNum = 4096;
-  config.maxCqeNum = 4096;
-  config.alignment = 4096;
-  config.onGpu = true;
-
-  // Create ep for each other rank and connect
-  for (int i = 0; i < worldSize; i++) {
-    if (rank == i) {
-      rdmaStates->localEps.push_back({});
-    } else {
-      application::RdmaEndpoint ep = rdmaStates->deviceContext->CreateRdmaEndpoint(config);
-      rdmaStates->localEps.push_back(ep);
-    }
-
-    rdmaStates->remoteEpHandles.push_back(RdmaEndpointHandleList(worldSize));
-    states->bootStates->bootNet->Allgather(&(rdmaStates->localEps.data()[i].handle),
-                                           rdmaStates->remoteEpHandles[i].data(),
-                                           sizeof(application::RdmaEndpointHandle));
-  }
-
-  for (int i = 0; i < worldSize; i++) {
-    if (rank == i) continue;
-    rdmaStates->deviceContext->ConnectEndpoint(rdmaStates->localEps[i].handle,
-                                               rdmaStates->remoteEpHandles[rank][i]);
-  }
+  rdmaStates->commContext = new application::Context(*states->bootStates->bootNet);
 }
 
 void MemoryStatesInit() {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  application::RdmaDeviceContext* deviceContext =
+      states->rdmaStates->commContext->GetRdmaDeviceContext();
+
   states->memoryStates = new MemoryStates();
-  states->memoryStates->symmMemMgr = new application::SymmMemManager(
-      *states->bootStates->bootNet, *states->rdmaStates->deviceContext);
-  states->memoryStates->mrMgr =
-      new application::MemoryRegionManager(*states->rdmaStates->deviceContext);
+  states->memoryStates->symmMemMgr =
+      new application::SymmMemManager(*states->bootStates->bootNet, *deviceContext);
+  states->memoryStates->mrMgr = new application::MemoryRegionManager(*deviceContext);
 }
 
 void GpuStateInit() {
@@ -84,24 +42,24 @@ void GpuStateInit() {
   int rank = states->bootStates->rank;
   int worldSize = states->bootStates->worldSize;
 
-  // Copy endpoints to GPU
-  HIP_RUNTIME_CHECK(
-      hipMalloc(&rdmaStates->localEpsGpu, sizeof(application::RdmaEndpoint) * worldSize));
-  HIP_RUNTIME_CHECK(hipMemcpy(rdmaStates->localEpsGpu, rdmaStates->localEps.data(),
-                              sizeof(application::RdmaEndpoint) * worldSize,
-                              hipMemcpyHostToDevice));
-
-  // Allocate locks
-  HIP_RUNTIME_CHECK(hipMalloc(&rdmaStates->epCqLockMemGpu, MaxRdmaEndpointNum * sizeof(uint32_t)));
-  HIP_RUNTIME_CHECK(
-      hipMemset(rdmaStates->epCqLockMemGpu, 0, MaxRdmaEndpointNum * sizeof(uint32_t)));
-
   // Copy to gpu constance memory
   GpuStates gpuStates;
   gpuStates.rank = rank;
   gpuStates.worldSize = worldSize;
-  gpuStates.epsStartAddr = rdmaStates->localEpsGpu;
-  gpuStates.epCqLockMemGpu = rdmaStates->epCqLockMemGpu;
+
+  // Copy transport types to GPU
+  HIP_RUNTIME_CHECK(
+      hipMalloc(&gpuStates.transportTypes, sizeof(application::TransportType) * worldSize));
+  HIP_RUNTIME_CHECK(
+      hipMemcpy(gpuStates.transportTypes, rdmaStates->commContext->GetTransportTypes().data(),
+                sizeof(application::TransportType) * worldSize, hipMemcpyHostToDevice));
+
+  // Copy endpoints to GPU
+  HIP_RUNTIME_CHECK(
+      hipMalloc(&gpuStates.rdmaEndpoints, sizeof(application::RdmaEndpoint) * worldSize));
+  HIP_RUNTIME_CHECK(
+      hipMemcpy(gpuStates.rdmaEndpoints, rdmaStates->commContext->GetRdmaEndpoints().data(),
+                sizeof(application::RdmaEndpoint) * worldSize, hipMemcpyHostToDevice));
 
   HIP_RUNTIME_CHECK(
       hipMemcpyToSymbol(globalGpuStates, &gpuStates, sizeof(GpuStates), 0, hipMemcpyHostToDevice));
@@ -130,12 +88,14 @@ int ShmemMpiInit(MPI_Comm mpi_comm) {
 int ShmemMpiFinalize() {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
 
+  HIP_RUNTIME_CHECK(hipFree(globalGpuStates.transportTypes));
+  HIP_RUNTIME_CHECK(hipFree(globalGpuStates.rdmaEndpoints));
+
   delete states->memoryStates->symmMemMgr;
   delete states->memoryStates->mrMgr;
   delete states->memoryStates;
 
-  delete states->rdmaStates->deviceContext;
-  delete states->rdmaStates->context;
+  delete states->rdmaStates->commContext;
   delete states->rdmaStates;
 
   states->bootStates->bootNet->Finalize();

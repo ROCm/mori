@@ -32,13 +32,13 @@ __global__ void Write(RdmaEndpoint endpoint, MemoryRegion localMr, MemoryRegion 
 }
 
 void LocalRdmaOps() {
-  MpiBootstrapNetwork bootstrap_net(MPI_COMM_WORLD);
-  bootstrap_net.Initialize();
+  MpiBootstrapNetwork bootNet(MPI_COMM_WORLD);
+  bootNet.Initialize();
 
   bool on_gpu = true;
   int allreduce_size = 1024;
-  int local_rank = bootstrap_net.GetLocalRank();
-  int world_size = bootstrap_net.GetWorldSize();
+  int local_rank = bootNet.GetLocalRank();
+  int world_size = bootNet.GetWorldSize();
   HIP_RUNTIME_CHECK(hipSetDevice(local_rank));
 
   // RDMA initialization
@@ -60,7 +60,7 @@ void LocalRdmaOps() {
 
   // 3 Allgather global endpoint and connect
   RdmaEndpointHandle global_rdma_ep_handles[world_size];
-  bootstrap_net.Allgather(&endpoint.handle, global_rdma_ep_handles, sizeof(RdmaEndpointHandle));
+  bootNet.Allgather(&endpoint.handle, global_rdma_ep_handles, sizeof(RdmaEndpointHandle));
 
   std::cout << "Local rank " << local_rank << " " << endpoint.handle << std::endl;
 
@@ -80,7 +80,7 @@ void LocalRdmaOps() {
   MemoryRegion mr_handle =
       device_context->RegisterMemoryRegion(buffer, allreduce_size, MR_ACCESS_FLAG);
   MemoryRegion global_mr_handles[world_size];
-  bootstrap_net.Allgather(&mr_handle, global_mr_handles, sizeof(mr_handle));
+  bootNet.Allgather(&mr_handle, global_mr_handles, sizeof(mr_handle));
   global_mr_handles[local_rank] = mr_handle;
   //   printf("Before Buffer 2 0th %d 512th %d\n", ((char*)buffer_2)[0], ((char*)buffer_2)[512]);
 
@@ -92,10 +92,10 @@ void LocalRdmaOps() {
     Write<<<1, 1>>>(endpoint, global_mr_handles[0], global_mr_handles[1], allreduce_size);
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   }
-  bootstrap_net.Barrier();
+  bootNet.Barrier();
 
   printf("After: Local rank %d val %d\n", local_rank, ((char*)buffer)[256]);
-  bootstrap_net.Finalize();
+  bootNet.Finalize();
 
   MPI_Finalize();
 }
