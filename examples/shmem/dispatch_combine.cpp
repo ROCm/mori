@@ -421,25 +421,41 @@ __global__ void EpCombineKernel(EpDispatchCombineConfig config, EpDispatchCombin
   totalNumRecvToken = __shfl(totalNumRecvToken, 0);
 
   // Recover pe sorted order and send back
-  // TODO: copy tokens into shmem out token buffer in this loop to avoid multi-device cache
-  // coherence bug
   for (int exptSortedId = 0; exptSortedId < totalNumRecvToken; exptSortedId++) {
     if ((exptSortedId % globalWarpNum) != globalWarpId) continue;
 
     uint32_t peSortedId = handle.exptSortedToPeSortedBuf[exptSortedId];
     uint32_t peSortedOffset = peSortedId * config.hiddenDim;
 
+    uint32_t destPe = peSortedId / maxNumOutTokenPerRank;
+    uint32_t peerPeSortedOffset =
+        (peSortedId - destPe * maxNumOutTokenPerRank + myPe * maxNumOutTokenPerRank) *
+        config.hiddenDim;
+
     uint32_t exptSortedOffset = exptSortedId * config.hiddenDim;
-    WarpCopy(shmemInpTokenBuf + peSortedOffset, inpTokenBuf + exptSortedOffset, config.hiddenDim);
+
+    if (destPe == myPe) {
+      WarpCopy(shmemOutTokenBuf + peerPeSortedOffset, inpTokenBuf + exptSortedOffset,
+               config.hiddenDim);
+    } else {
+      WarpCopy(shmemInpTokenBuf + peSortedOffset, inpTokenBuf + exptSortedOffset, config.hiddenDim);
+      if (laneId == 0) {
+        ShmemPutTypeNbiThread<PrvdType, T>(handle.shmemOutTokMemObj, peerPeSortedOffset,
+                                           handle.shmemInpTokMemObj, peSortedOffset,
+                                           config.hiddenDim, destPe);
+      }
+    }
 
     __threadfence();
     if (laneId == 0) {
-      uint32_t destPe = peSortedId / maxNumOutTokenPerRank;
       uint32_t destPeCopyCnt = atomicAdd(handle.gridCopyTokenBarrier + destPe, 1);
     }
   }
   SyncIfDebugEnabled("Combine kernel: finish recovering from expert sorted to pe sorted");
 
+  // TODO: since we don't have atomic yet, we have to wait untill all tokens are sent, then set
+  // the remote flag; once we have atomic operation, we can send an atomic rdma op after each
+  // token and the remote peer polling the flag to know if the token is finished sent
   for (int destPe = globalWarpId; destPe < npes; destPe += globalWarpNum) {
     uint32_t numTokenSignal = recvTokenNumBuf[destPe];
     uint32_t recvTokenNum = numTokenSignal - 1;
@@ -447,19 +463,11 @@ __global__ void EpCombineKernel(EpDispatchCombineConfig config, EpDispatchCombin
     ShmemUint32WaitUntilEquals<PrvdType>(handle.gridCopyTokenBarrier + destPe, recvTokenNum);
 
     if (destPe == myPe) {
-      WarpCopy(shmemOutTokenBuf + myPe * maxNumOutTokenPerRank * config.hiddenDim,
-               shmemInpTokenBuf + destPe * maxNumOutTokenPerRank * config.hiddenDim,
-               recvTokenNum * config.hiddenDim);
-      __threadfence();
       AtomicStoreRelaxed(handle.sendTokenNumMemObj->template GetAs<uint32_t*>() + myPe,
                          numTokenSignal);
       continue;
     }
     if (laneId == 0) {
-      ShmemPutTypeNbiThread<PrvdType, T>(
-          handle.shmemOutTokMemObj, myPe * maxNumOutTokenPerRank * config.hiddenDim,
-          handle.shmemInpTokMemObj, destPe * maxNumOutTokenPerRank * config.hiddenDim,
-          recvTokenNum * config.hiddenDim, destPe);
       // Set token number signal, note that this signal is only used for notifying dest Pe that
       // tokens have been sent, the dest pe itself know exactly how many token it sends to my pe.
       ShmemPutUint32ImmNbiThread<PrvdType>(handle.sendTokenNumMemObj, myPe * sizeof(uint32_t),
@@ -755,12 +763,12 @@ void EpDispatchWithPutMemAPI() {
   config.randomSeed = myPe;
   config.rank = myPe;
   config.worldSize = npes;
-  config.numExpertPerRank = 2;
+  config.numExpertPerRank = 8;
   config.hiddenDim = 4096;
-  config.numExpertPerToken = 2;
-  config.maxNumInpTokenPerRank = 32;
-  config.warpNumPerBlock = 2;
-  config.blockNum = 2;
+  config.numExpertPerToken = 8;
+  config.maxNumInpTokenPerRank = 128;
+  config.warpNumPerBlock = 4;
+  config.blockNum = 4;
 
   // Intialize EpDispatchCombineHandle
   using DataType = uint32_t;

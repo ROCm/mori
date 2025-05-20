@@ -41,8 +41,8 @@ void RdmaStatesInit() {
   config.portId = portId;
   config.gidIdx = 1;
   // TODO: expose cqe / wqe numfig con
-  config.maxMsgsNum = 1024;
-  config.maxCqeNum = 1024;
+  config.maxMsgsNum = 4096;
+  config.maxCqeNum = 4096;
   config.alignment = 4096;
   config.onGpu = true;
 
