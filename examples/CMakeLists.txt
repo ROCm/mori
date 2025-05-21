@@ -30,6 +30,11 @@ add_executable(
 )
 target_link_libraries(write_inline_gpu mori_application hip::host hip::device)
 
+add_executable(
+    atomic_gpu
+    local_rdma_ops/atomic_gpu.cpp
+)
+target_link_libraries(atomic_gpu mori_application hip::host hip::device)
 
 add_executable(
     moe_all2all_dispatch

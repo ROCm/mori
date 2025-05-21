@@ -155,6 +155,284 @@ static __device__ uint64_t PostWriteInline(void* queueBuffAddr, uint32_t wqeNum,
   return reinterpret_cast<uint64_t*>(wqeCtrlSeg)[0];
 }
 
+__device__ uint64_t mlx5PrepareAtomicWqe(void* queue_buff_addr, uint32_t wqe_num, uint32_t* postIdx,
+                                     uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
+                                     uint64_t rkey, void* val_1, void* val_2, uint32_t bytes,
+                                     atomicType amo_op) {
+  uint32_t wqeIdx = *postIdx & (wqe_num - 1);
+  void* wqeAddr = reinterpret_cast<char*>(queue_buff_addr) + (wqeIdx << MLX5_SEND_WQE_SHIFT);
+
+  uint32_t numWqesPerCmd = get_num_wqes_in_atomic(amo_op, bytes);
+  void* addition_wqe_addr = reinterpret_cast<char*>(queue_buff_addr) + ((wqeIdx + 1) << MLX5_SEND_WQE_SHIFT);
+
+  int atomicWqeSize = sizeof(mlx5_wqe_ctrl_seg) + sizeof(mlx5_wqe_raddr_seg) + 2 * sizeof(mlx5_wqe_atomic_seg);
+
+  struct mlx5_wqe_ctrl_seg* wqeCtrlSeg = reinterpret_cast<mlx5_wqe_ctrl_seg*>(wqeAddr);
+  struct mlx5_wqe_raddr_seg* wqeRaddrSeg = reinterpret_cast<mlx5_wqe_raddr_seg*>(
+      reinterpret_cast<char*>(wqeAddr) + sizeof(mlx5_wqe_ctrl_seg));
+  struct mlx5_wqe_atomic_seg* wqeAtomicSeg1 = reinterpret_cast<mlx5_wqe_atomic_seg*>(
+      reinterpret_cast<char*>(wqeAddr) + sizeof(mlx5_wqe_ctrl_seg) +
+      sizeof(mlx5_wqe_raddr_seg));
+  struct mlx5_wqe_atomic_seg* wqeAtomicSeg2 = reinterpret_cast<mlx5_wqe_atomic_seg*>(
+      reinterpret_cast<char*>(wqeAddr) + sizeof(mlx5_wqe_ctrl_seg) +
+      sizeof(mlx5_wqe_raddr_seg) + sizeof(mlx5_wqe_atomic_seg));
+  
+  struct mlx5_wqe_data_seg *wqeDataSeg =  (struct mlx5_wqe_data_seg *)wqeAtomicSeg2;
+
+  wqeRaddrSeg->raddr = HTOBE64(raddr);
+  wqeRaddrSeg->rkey = HTOBE32(rkey);
+  wqeRaddrSeg->reserved = 0;
+
+  switch (amo_op) {
+    case AMO_FETCH_INC:
+    case AMO_INC: {
+      if (bytes == 4) {
+        wqeCtrlSeg->opmod_idx_opcode =
+            HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_FA | (wqeIdx << 8) | IBGDA_4_BYTE_EXT_AMO_OPMOD);
+
+        ibgda_atomic_32_masked_fa_seg_t* atomic_32_masked_fa_seg =
+            (ibgda_atomic_32_masked_fa_seg_t*)wqeAtomicSeg1;
+        atomic_32_masked_fa_seg->add_data = HTOBE32((uint32_t)1);
+        atomic_32_masked_fa_seg->field_boundary = 0;
+      } else {
+        wqeCtrlSeg->opmod_idx_opcode =
+            HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_FA | (wqeIdx << 8) | IBGDA_8_BYTE_EXT_AMO_OPMOD);
+
+        ibgda_atomic_64_masked_fa_seg_t* atomic_64_masked_fa_seg =
+            (ibgda_atomic_64_masked_fa_seg_t*)wqeAtomicSeg1;
+        atomic_64_masked_fa_seg->add_data = HTOBE64((uint64_t)1);
+        atomic_64_masked_fa_seg->field_boundary = 0;
+      }
+      break;
+    }
+    case AMO_SIGNAL:
+    case AMO_SIGNAL_SET:
+    case AMO_SWAP:
+    case AMO_SET: {
+      if (bytes == 4) {
+        wqeCtrlSeg->opmod_idx_opcode =
+            HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_CS | (wqeIdx << 8) | IBGDA_4_BYTE_EXT_AMO_OPMOD);
+
+        ibgda_atomic_32_masked_cs_seg_t* atomic_32_masked_cs_seg =
+            (ibgda_atomic_32_masked_cs_seg_t*)wqeAtomicSeg1;
+        atomic_32_masked_cs_seg->swap_data = HTOBE32(*(uint32_t*)val_1);
+        atomic_32_masked_cs_seg->compare_data = 0;
+        atomic_32_masked_cs_seg->compare_mask = 0;
+        atomic_32_masked_cs_seg->swap_mask = UINT32_MAX;
+      } else {
+        atomicWqeSize += sizeof(mlx5_wqe_data_seg);
+        wqeCtrlSeg->opmod_idx_opcode =
+            HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_CS | (wqeIdx << 8) | IBGDA_8_BYTE_EXT_AMO_OPMOD);
+
+        ibgda_atomic_64_masked_cs_seg_t* atomic_64_masked_cs_data_seg =
+            (ibgda_atomic_64_masked_cs_seg_t*)wqeAtomicSeg1;
+        atomic_64_masked_cs_data_seg->swap = HTOBE64(*(uint64_t*)val_1);
+        atomic_64_masked_cs_data_seg->compare = 0;
+
+        ibgda_atomic_64_masked_cs_seg_t* atomic_64_masked_cs_mask_seg =
+            (ibgda_atomic_64_masked_cs_seg_t*)wqeAtomicSeg2;
+        atomic_64_masked_cs_mask_seg->swap = UINT64_MAX;
+        atomic_64_masked_cs_mask_seg->compare = 0;
+
+        wqeDataSeg = (struct mlx5_wqe_data_seg*)addition_wqe_addr;
+      }
+      break;
+    }
+    case AMO_SIGNAL_ADD:
+    case AMO_ADD: {
+      if (bytes == 4) {
+        wqeCtrlSeg->opmod_idx_opcode =
+            HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_FA | (wqeIdx << 8) | IBGDA_4_BYTE_EXT_AMO_OPMOD);
+
+        ibgda_atomic_32_masked_fa_seg_t* atomic_32_masked_fa_seg =
+            (ibgda_atomic_32_masked_fa_seg_t*)wqeAtomicSeg1;
+        atomic_32_masked_fa_seg->add_data = HTOBE32(*(uint32_t*)val_1);
+        atomic_32_masked_fa_seg->field_boundary = 0;
+      } else {
+        wqeCtrlSeg->opmod_idx_opcode =
+            HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_FA | (wqeIdx << 8) | IBGDA_8_BYTE_EXT_AMO_OPMOD);
+
+        ibgda_atomic_64_masked_fa_seg_t* atomic_64_masked_fa_seg =
+            (ibgda_atomic_64_masked_fa_seg_t*)wqeAtomicSeg1;
+        atomic_64_masked_fa_seg->add_data = HTOBE64(*(uint64_t*)val_1);
+        atomic_64_masked_fa_seg->field_boundary = 0;
+      }
+      break;
+    }
+    case AMO_FETCH_AND:
+    case AMO_AND: {
+      if (bytes == 4) {
+        wqeCtrlSeg->opmod_idx_opcode =
+            HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_CS | (wqeIdx << 8) | IBGDA_4_BYTE_EXT_AMO_OPMOD);
+
+        ibgda_atomic_32_masked_cs_seg_t* atomic_32_masked_cs_seg =
+            (ibgda_atomic_32_masked_cs_seg_t*)wqeAtomicSeg1;
+        atomic_32_masked_cs_seg->swap_data = HTOBE32(*(uint32_t*)val_1);
+        atomic_32_masked_cs_seg->compare_data = 0;
+        atomic_32_masked_cs_seg->compare_mask = 0;
+        atomic_32_masked_cs_seg->swap_mask = HTOBE32(~(*(uint32_t*)val_1));
+      } else {
+        atomicWqeSize += sizeof(mlx5_wqe_data_seg);
+        wqeCtrlSeg->opmod_idx_opcode =
+            HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_CS | (wqeIdx << 8) | IBGDA_8_BYTE_EXT_AMO_OPMOD);
+
+        ibgda_atomic_64_masked_cs_seg_t* atomic_64_masked_cs_data_seg =
+            (ibgda_atomic_64_masked_cs_seg_t*)wqeAtomicSeg1;
+        atomic_64_masked_cs_data_seg->swap = HTOBE64(*(uint64_t*)val_1);
+        atomic_64_masked_cs_data_seg->compare = 0;
+
+        ibgda_atomic_64_masked_cs_seg_t* atomic_64_masked_cs_mask_seg =
+            (ibgda_atomic_64_masked_cs_seg_t*)wqeAtomicSeg2;
+        atomic_64_masked_cs_mask_seg->swap = HTOBE64(~(*(uint64_t*)val_1));
+        atomic_64_masked_cs_mask_seg->compare = 0;
+        wqeDataSeg = (struct mlx5_wqe_data_seg*)addition_wqe_addr;
+      }
+      break;
+    }
+    case AMO_FETCH_OR:
+    case AMO_OR: {
+      if (bytes == 4) {
+        wqeCtrlSeg->opmod_idx_opcode =
+            HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_CS | (wqeIdx << 8) | IBGDA_4_BYTE_EXT_AMO_OPMOD);
+
+        ibgda_atomic_32_masked_cs_seg_t* atomic_32_masked_cs_seg =
+            (ibgda_atomic_32_masked_cs_seg_t*)wqeAtomicSeg1;
+        atomic_32_masked_cs_seg->swap_data = HTOBE32(*(uint32_t*)val_1);
+        atomic_32_masked_cs_seg->compare_data = 0;
+        atomic_32_masked_cs_seg->compare_mask = 0;
+        atomic_32_masked_cs_seg->swap_mask = HTOBE32(*(uint32_t*)val_1);
+      } else {
+        atomicWqeSize += sizeof(mlx5_wqe_data_seg);
+        wqeCtrlSeg->opmod_idx_opcode =
+            HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_CS | (wqeIdx << 8) | IBGDA_8_BYTE_EXT_AMO_OPMOD);
+
+        ibgda_atomic_64_masked_cs_seg_t* atomic_64_masked_cs_data_seg =
+            (ibgda_atomic_64_masked_cs_seg_t*)wqeAtomicSeg1;
+        atomic_64_masked_cs_data_seg->swap = HTOBE64(*(uint64_t*)val_1);
+        atomic_64_masked_cs_data_seg->compare = 0;
+
+        ibgda_atomic_64_masked_cs_seg_t* atomic_64_masked_cs_mask_seg =
+            (ibgda_atomic_64_masked_cs_seg_t*)wqeAtomicSeg2;
+        atomic_64_masked_cs_mask_seg->swap = HTOBE64(*(uint64_t*)val_1);
+        atomic_64_masked_cs_mask_seg->compare = 0;
+        wqeDataSeg = (struct mlx5_wqe_data_seg*)addition_wqe_addr;
+      }
+      break;
+    }
+    case AMO_FETCH_XOR:
+    case AMO_XOR: {
+      if (bytes == 4) {
+        wqeCtrlSeg->opmod_idx_opcode =
+            HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_FA | (wqeIdx << 8) | IBGDA_4_BYTE_EXT_AMO_OPMOD);
+
+        ibgda_atomic_32_masked_fa_seg_t* atomic_32_masked_fa_seg =
+            (ibgda_atomic_32_masked_fa_seg_t*)wqeAtomicSeg1;
+        atomic_32_masked_fa_seg->add_data = HTOBE32(*(uint32_t*)val_1);
+        atomic_32_masked_fa_seg->field_boundary = UINT32_MAX;
+      } else {
+        wqeCtrlSeg->opmod_idx_opcode =
+            HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_FA | (wqeIdx << 8) | IBGDA_8_BYTE_EXT_AMO_OPMOD);
+
+        ibgda_atomic_64_masked_fa_seg_t* atomic_64_masked_fa_seg =
+            (ibgda_atomic_64_masked_fa_seg_t*)wqeAtomicSeg1;
+        atomic_64_masked_fa_seg->add_data = HTOBE64(*(uint64_t*)val_1);
+        atomic_64_masked_fa_seg->field_boundary = UINT64_MAX;
+      }
+      break;
+    }
+    case AMO_FETCH: {
+      if (bytes == 4) {
+        wqeCtrlSeg->opmod_idx_opcode =
+            HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_FA | (wqeIdx << 8) | IBGDA_4_BYTE_EXT_AMO_OPMOD);
+
+        ibgda_atomic_32_masked_fa_seg_t* atomic_32_masked_fa_seg =
+            (ibgda_atomic_32_masked_fa_seg_t*)wqeAtomicSeg1;
+        atomic_32_masked_fa_seg->add_data = 0;
+        atomic_32_masked_fa_seg->field_boundary = 0;
+      } else {
+        wqeCtrlSeg->opmod_idx_opcode =
+            HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_FA | (wqeIdx << 8) | IBGDA_8_BYTE_EXT_AMO_OPMOD);
+
+        ibgda_atomic_64_masked_fa_seg_t* atomic_64_masked_fa_seg =
+            (ibgda_atomic_64_masked_fa_seg_t*)wqeAtomicSeg1;
+        atomic_64_masked_fa_seg->add_data = 0;
+        atomic_64_masked_fa_seg->field_boundary = 0;
+      }
+      break;
+    }
+    case AMO_FETCH_ADD: {
+      if (bytes == 4) {
+        wqeCtrlSeg->opmod_idx_opcode =
+            HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_FA | (wqeIdx << 8) | IBGDA_4_BYTE_EXT_AMO_OPMOD);
+
+        ibgda_atomic_32_masked_fa_seg_t* atomic_32_masked_fa_seg =
+            (ibgda_atomic_32_masked_fa_seg_t*)wqeAtomicSeg1;
+        atomic_32_masked_fa_seg->add_data = HTOBE32(*(uint32_t*)val_1);
+        atomic_32_masked_fa_seg->field_boundary = 0;
+      } else {
+        wqeCtrlSeg->opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_FA | (wqeIdx << 8));
+        wqeAtomicSeg1->swap_add = HTOBE64(*(uint64_t*)val_1);
+      }
+      break;
+    }
+    case AMO_COMPARE_SWAP: {
+      if (bytes == 4) {
+        wqeCtrlSeg->opmod_idx_opcode =
+            HTOBE32(MLX5_OPCODE_ATOMIC_MASKED_CS | (wqeIdx << 8) | IBGDA_4_BYTE_EXT_AMO_OPMOD);
+
+        ibgda_atomic_32_masked_cs_seg_t* atomic_32_masked_cs_seg =
+            (ibgda_atomic_32_masked_cs_seg_t*)wqeAtomicSeg1;
+        atomic_32_masked_cs_seg->swap_data = HTOBE32(*(uint32_t*)val_1);
+        atomic_32_masked_cs_seg->compare_data = HTOBE32(*(uint32_t*)val_2);
+        atomic_32_masked_cs_seg->compare_mask = UINT32_MAX;
+        atomic_32_masked_cs_seg->swap_mask = UINT32_MAX;
+      } else {
+        wqeCtrlSeg->opmod_idx_opcode = HTOBE32(MLX5_OPCODE_ATOMIC_CS | (wqeIdx << 8));
+        wqeAtomicSeg1->swap_add = HTOBE64(*(uint64_t*)val_1);
+        wqeAtomicSeg1->compare = HTOBE64(*(uint64_t*)val_2);
+      }
+      break;
+    }
+    default: {
+      assert(0);
+    }
+  }
+
+  int numOctoWords = CeilDiv(atomicWqeSize, 16);
+  int numWqeBb = CeilDiv(numOctoWords * 16, int(MLX5_SEND_WQE_BB));
+  assert(numWqeBb == numWqesPerCmd);
+  wqeCtrlSeg->qpn_ds = HTOBE32((qpn << 8) | numOctoWords);
+  wqeCtrlSeg->fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
+
+  if (numWqesPerCmd > 1){
+    wqeDataSeg->byte_count = HTOBE32(bytes);
+    wqeDataSeg->addr = HTOBE64(laddr);
+    wqeDataSeg->lkey = HTOBE32(lkey);
+  }
+
+  atomicAdd(postIdx, numWqeBb);
+  return reinterpret_cast<uint64_t*>(wqeCtrlSeg)[0];
+}
+
+
+#define DEFINE_POST_ATOMIC_SPEC(TYPE)                             \
+template <>                                                                 \
+__device__ uint64_t PostAtomic<ProviderType::MLX5, TYPE>(void* queue_buff_addr, uint32_t wqe_num, \
+                                                         uint32_t* postIdx, uint32_t qpn,         \
+                                                         uintptr_t laddr, uint64_t lkey,        \
+                                                         uintptr_t raddr, uint64_t rkey,        \
+                                                         const TYPE val_1, const TYPE val_2,    \
+                                                         atomicType amo_op) {                   \
+    return mlx5PrepareAtomicWqe(queue_buff_addr, wqe_num, postIdx, qpn, laddr, lkey,            \
+                                raddr, rkey, (void *)&val_1, (void *)&val_2, sizeof(TYPE), amo_op); \
+}
+
+DEFINE_POST_ATOMIC_SPEC(uint32_t)
+DEFINE_POST_ATOMIC_SPEC(uint64_t)
+DEFINE_POST_ATOMIC_SPEC(int32_t)
+DEFINE_POST_ATOMIC_SPEC(int64_t)
+
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Doorbell                                            */
 /* ---------------------------------------------------------------------------------------------- */
