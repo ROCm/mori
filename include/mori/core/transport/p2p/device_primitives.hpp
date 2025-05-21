@@ -8,12 +8,12 @@ __device__ void ThreadCopy(T* dst, T* src, size_t nelems) {
   constexpr int vecSize = 16 / sizeof(T);
   int offset = 0;
 
-  printf("tid %d before thread copy\n", threadIdx.x);
+  // printf("tid %d before thread copy\n", threadIdx.x);
   while ((offset + vecSize) < nelems) {
     reinterpret_cast<uint4*>(dst + offset)[0] = reinterpret_cast<uint4*>(src + offset)[0];
     offset += vecSize;
   }
-  printf("tid %d after thread copy\n", threadIdx.x);
+  // printf("tid %d after thread copy\n", threadIdx.x);
 
   while (offset < nelems) {
     dst[offset] = src[offset];

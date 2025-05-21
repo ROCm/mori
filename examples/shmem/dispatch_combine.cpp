@@ -258,20 +258,10 @@ __global__ void EpDispatchKernel(EpDispatchCombineConfig config,
       handle.tokenIndicesToPeSortedBuf[i] = destPe * maxNumOutTokenPerRank + peTokenIdx;
     }
 
-    // TODO: call copy since we don't build queue pair to self for now, we should consider
-    // calling shmem api directly and let it decide how to transfer data based on transport type
-    if (destPe == myPe) {
-      WarpCopy(handle.shmemOutTokMemObj->template GetAs<T*>() + peSortedOffset,
-               handle.inpTokenBuf + tokenOffset, config.hiddenDim);
-      continue;
-    }
-    // First copy into shmem inp token buffer, then put with shmem
     WarpCopy(handle.shmemInpTokMemObj->template GetAs<T*>() + tokenOffset,
              handle.inpTokenBuf + tokenOffset, config.hiddenDim);
-    if (laneId == 0) {
-      ShmemPutTypeNbiThread<T>(handle.shmemOutTokMemObj, peSortedOffset, handle.shmemInpTokMemObj,
-                               tokenOffset, config.hiddenDim, destPe);
-    }
+    ShmemPutTypeNbiWarp<T>(handle.shmemOutTokMemObj, peSortedOffset, handle.shmemInpTokMemObj,
+                           tokenOffset, config.hiddenDim, destPe);
   }
   SyncIfDebugEnabled("Dispatch kernel: finished send token");
   // Make sure WarCopy is visible to other blocks
@@ -281,23 +271,12 @@ __global__ void EpDispatchKernel(EpDispatchCombineConfig config,
   for (int destPe = globalWarpId; destPe < npes; destPe += globalWarpNum) {
     // Add 1 so that when token number == 0, receiver side still know the signal is sent
     uint32_t numTokenSignal = peTokenOffset[destPe] + 1;
-    if (destPe == myPe) {
-      WarpCopy(outTokToExptBuf + myPe * maxNumOutTokenPerRank,
-               inpTokToExptBuf + destPe * maxNumOutTokenPerRank, peTokenOffset[destPe]);
-      __threadfence();  // numTokenSignal should be visible after token to expert mapping is visible
-      AtomicStoreRelaxed(handle.recvTokenNumMemObj->template GetAs<uint32_t*>() + myPe,
-                         numTokenSignal);
-      continue;
-    }
-    if (laneId == 0) {
-      // According to RDMA speces, ops in the same queue pair is properly ordered, hence when
-      // numTokenSignal is visible to a pe, token to expert mapping is also visible
-      ShmemPutUint32NbiThread(handle.outTokToExptMapMemObj, myPe * maxNumOutTokenPerRank,
-                              handle.inpTokToExptMapMemObj, destPe * maxNumOutTokenPerRank,
-                              peTokenOffset[destPe], destPe);
-      ShmemPutUint32ImmNbiThread(handle.recvTokenNumMemObj, myPe * sizeof(uint32_t), numTokenSignal,
-                                 destPe);
-    }
+    ShmemPutUint32NbiWarp(handle.outTokToExptMapMemObj, myPe * maxNumOutTokenPerRank,
+                          handle.inpTokToExptMapMemObj, destPe * maxNumOutTokenPerRank,
+                          peTokenOffset[destPe], destPe);
+    __threadfence();
+    ShmemPutUint32ImmNbiWarp(handle.recvTokenNumMemObj, myPe * sizeof(uint32_t), numTokenSignal,
+                             destPe);
   }
   SyncIfDebugEnabled("Dispatch kernel: finish sending tok2expt mapping & num token signal");
 
@@ -424,17 +403,9 @@ __global__ void EpCombineKernel(EpDispatchCombineConfig config, EpDispatchCombin
 
     uint32_t exptSortedOffset = exptSortedId * config.hiddenDim;
 
-    if (destPe == myPe) {
-      WarpCopy(shmemOutTokenBuf + peerPeSortedOffset, inpTokenBuf + exptSortedOffset,
-               config.hiddenDim);
-    } else {
-      WarpCopy(shmemInpTokenBuf + peSortedOffset, inpTokenBuf + exptSortedOffset, config.hiddenDim);
-      if (laneId == 0) {
-        ShmemPutTypeNbiThread<T>(handle.shmemOutTokMemObj, peerPeSortedOffset,
-                                 handle.shmemInpTokMemObj, peSortedOffset, config.hiddenDim,
-                                 destPe);
-      }
-    }
+    WarpCopy(shmemInpTokenBuf + peSortedOffset, inpTokenBuf + exptSortedOffset, config.hiddenDim);
+    ShmemPutTypeNbiWarp<T>(handle.shmemOutTokMemObj, peerPeSortedOffset, handle.shmemInpTokMemObj,
+                           peSortedOffset, config.hiddenDim, destPe);
 
     __threadfence();
     if (laneId == 0) {
@@ -451,18 +422,8 @@ __global__ void EpCombineKernel(EpDispatchCombineConfig config, EpDispatchCombin
     uint32_t recvTokenNum = numTokenSignal - 1;
 
     ShmemUint32WaitUntilEquals(handle.gridCopyTokenBarrier + destPe, recvTokenNum);
-
-    if (destPe == myPe) {
-      AtomicStoreRelaxed(handle.sendTokenNumMemObj->template GetAs<uint32_t*>() + myPe,
-                         numTokenSignal);
-      continue;
-    }
-    if (laneId == 0) {
-      // Set token number signal, note that this signal is only used for notifying dest Pe that
-      // tokens have been sent, the dest pe itself know exactly how many token it sends to my pe.
-      ShmemPutUint32ImmNbiThread(handle.sendTokenNumMemObj, myPe * sizeof(uint32_t), numTokenSignal,
-                                 destPe);
-    }
+    ShmemPutUint32ImmNbiWarp(handle.sendTokenNumMemObj, myPe * sizeof(uint32_t), numTokenSignal,
+                             destPe);
   }
   SyncIfDebugEnabled("Combine kernel: finish sending tokens");
 
@@ -726,12 +687,12 @@ void EpDispatchWithPutMemAPI() {
   config.randomSeed = myPe;
   config.rank = myPe;
   config.worldSize = npes;
-  config.numExpertPerRank = 1;
+  config.numExpertPerRank = 2;
   config.hiddenDim = 4096;
-  config.numExpertPerToken = 1;
-  config.maxNumInpTokenPerRank = 4;
-  config.warpNumPerBlock = 1;
-  config.blockNum = 1;
+  config.numExpertPerToken = 2;
+  config.maxNumInpTokenPerRank = 16;
+  config.warpNumPerBlock = 2;
+  config.blockNum = 2;
 
   // Intialize EpDispatchCombineHandle
   using DataType = uint32_t;
@@ -740,7 +701,7 @@ void EpDispatchWithPutMemAPI() {
 
   // Run tests
   EpDispatchCombineTestCase<DataType> testCase(handle);
-  for (int i = 0; i < 1; i++) {
+  for (int i = 0; i < 2; i++) {
     testCase.RandomInitializeHandle();
     MPI_Barrier(MPI_COMM_WORLD);
     testCase.RunDispatch();

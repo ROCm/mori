@@ -38,19 +38,41 @@ __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMemObjPtr 
   __threadfence_system();
 }
 
+#define DISPATCH_PROVIDER_TYPE(func, ...)                         \
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();           \
+  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints; \
+  core::ProviderType prvdType = ep[pe].GetProviderType();         \
+  if (prvdType == core::ProviderType::MLX5) {                     \
+    func<core::ProviderType::MLX5>(__VA_ARGS__);                  \
+  } else {                                                        \
+    assert(false);                                                \
+  }
+
 template <>
 __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::MemoryRegion& source, size_t sourceOffset, size_t bytes, int pe) {
-  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
-  core::ProviderType prvdType = ep[pe].GetProviderType();
-  if (prvdType == core::ProviderType::MLX5) {
-    ShmemPutMemNbiThreadKernelImpl<core::ProviderType::MLX5>(dest, destOffset, source, sourceOffset,
-                                                             bytes, pe);
-  } else {
-    assert(false);
+  DISPATCH_PROVIDER_TYPE(ShmemPutMemNbiThreadKernelImpl, dest, destOffset, source, sourceOffset,
+                         bytes, pe);
+}
+
+template <core::ProviderType PrvdType>
+__device__ void ShmemPutMemNbiWarpKernelImpl(const application::SymmMemObjPtr dest,
+                                             size_t destOffset,
+                                             const application::MemoryRegion& source,
+                                             size_t sourceOffset, size_t bytes, int pe) {
+  int laneId = threadIdx.x & (warpSize - 1);
+  if (laneId == 0) {
+    ShmemPutMemNbiThreadKernelImpl<PrvdType>(dest, destOffset, source, sourceOffset, bytes, pe);
   }
+}
+
+template <>
+__device__ void ShmemPutMemNbiWarpKernel<application::TransportType::RDMA>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::MemoryRegion& source, size_t sourceOffset, size_t bytes, int pe) {
+  DISPATCH_PROVIDER_TYPE(ShmemPutMemNbiWarpKernelImpl, dest, destOffset, source, sourceOffset,
+                         bytes, pe);
 }
 
 // TODO: deal with bytes count limit
@@ -77,19 +99,24 @@ __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::SymmMemObj
 template <>
 __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe) {
-  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
-  core::ProviderType prvdType = ep[pe].GetProviderType();
-  if (prvdType == core::ProviderType::MLX5) {
-    ShmemPutSizeImmNbiThreadKernelImpl<core::ProviderType::MLX5>(dest, destOffset, val, bytes, pe);
-  } else {
-    assert(false);
+  DISPATCH_PROVIDER_TYPE(ShmemPutSizeImmNbiThreadKernelImpl, dest, destOffset, val, bytes, pe);
+}
+
+template <core::ProviderType PrvdType>
+__device__ void ShmemPutSizeImmNbiWarpKernelImpl(const application::SymmMemObjPtr dest,
+                                                 size_t destOffset, void* val, size_t bytes,
+                                                 int pe) {
+  int laneId = threadIdx.x & (warpSize - 1);
+  if (laneId == 0) {
+    ShmemPutSizeImmNbiThreadKernelImpl<PrvdType>(dest, destOffset, val, bytes, pe);
   }
 }
 
-__device__ void ShmemIbgdaPutMemNbiWarp(const application::SymmMemObj* dest,
-                                        const application::MemoryRegion& source, size_t nelems,
-                                        int pe);
+template <>
+__device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::RDMA>(
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe) {
+  DISPATCH_PROVIDER_TYPE(ShmemPutSizeImmNbiWarpKernelImpl, dest, destOffset, val, bytes, pe);
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Synchronization                                        */
