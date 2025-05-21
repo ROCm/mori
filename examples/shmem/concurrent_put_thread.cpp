@@ -9,8 +9,6 @@ using namespace mori::core;
 using namespace mori::shmem;
 using namespace mori::application;
 
-constexpr ProviderType PrvdType = ProviderType::MLX5;
-
 __global__ void ConcurrentPutThreadKernel(int myPe, const SymmMemObjPtr memObj) {
   constexpr int sendPe = 0;
   constexpr int recvPe = 1;
@@ -21,11 +19,10 @@ __global__ void ConcurrentPutThreadKernel(int myPe, const SymmMemObjPtr memObj) 
   if (myPe == sendPe) {
     MemoryRegion source = memObj->GetMemoryRegion(myPe);
 
-    ShmemPutMemNbiThread<PrvdType>(memObj, threadOffset, source, threadOffset, sizeof(uint32_t),
-                                   recvPe);
+    ShmemPutMemNbiThread(memObj, threadOffset, source, threadOffset, sizeof(uint32_t), recvPe);
     __threadfence_system();
 
-    if (globalTid == 0) ShmemQuietThread<PrvdType>();
+    if (globalTid == 0) ShmemQuietThread();
     // __syncthreads();
   } else {
     while (atomicAdd(reinterpret_cast<uint32_t*>(memObj->localPtr) + globalTid, 0) != sendPe) {

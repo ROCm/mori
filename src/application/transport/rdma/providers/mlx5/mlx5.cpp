@@ -401,6 +401,8 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
     assert(false);
   }
 
+  endpoint.vendorId = RdmaDeviceVendorId::Mellanox;
+
   endpoint.wqHandle.sqAddr = qp->GetSqAddress();
   endpoint.wqHandle.rqAddr = qp->GetRqAddress();
   endpoint.wqHandle.dbrRecAddr = qp->qpDbrUmemAddr;

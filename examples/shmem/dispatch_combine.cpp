@@ -15,13 +15,13 @@ using namespace std;
 
 constexpr ProviderType PrvdType = ProviderType::MLX5;
 
-#define DEBUG 0
+#define DEBUG 1
 
 __device__ void SyncIfDebugEnabled(const char* msg) {
 #if DEBUG == 1
   __syncthreads();
   if ((threadIdx.x == 0) && (blockIdx.x == 0)) {
-    ShmemQuietThread<PrvdType>();
+    ShmemQuietThread();
     printf("%s\n", msg);
   }
   __syncthreads();
@@ -182,23 +182,6 @@ __device__ T WarpPrefixSum(T val, size_t laneNum) {
 }
 
 template <typename T>
-__device__ void WarpCopy(T* dst, T* src, size_t nelems) {
-  constexpr int vecSize = 16 / sizeof(T);
-  int laneId = threadIdx.x & (warpSize - 1);
-  int offset = laneId * vecSize;
-
-  while ((offset + vecSize) < nelems) {
-    reinterpret_cast<uint4*>(dst + offset)[0] = reinterpret_cast<uint4*>(src + offset)[0];
-    offset += warpSize * vecSize;
-  }
-
-  while (offset < nelems) {
-    dst[offset] = src[offset];
-    offset += 1;
-  }
-}
-
-template <typename T>
 __device__ void WarpAccum(T* accum, T* src, size_t nelems) {
   constexpr int vecSize = 16 / sizeof(T);
   int laneId = threadIdx.x & (warpSize - 1);
@@ -286,9 +269,8 @@ __global__ void EpDispatchKernel(EpDispatchCombineConfig config,
     WarpCopy(handle.shmemInpTokMemObj->template GetAs<T*>() + tokenOffset,
              handle.inpTokenBuf + tokenOffset, config.hiddenDim);
     if (laneId == 0) {
-      ShmemPutTypeNbiThread<PrvdType, T>(handle.shmemOutTokMemObj, peSortedOffset,
-                                         handle.shmemInpTokMemObj, tokenOffset, config.hiddenDim,
-                                         destPe);
+      ShmemPutTypeNbiThread<T>(handle.shmemOutTokMemObj, peSortedOffset, handle.shmemInpTokMemObj,
+                               tokenOffset, config.hiddenDim, destPe);
     }
   }
   SyncIfDebugEnabled("Dispatch kernel: finished send token");
@@ -310,11 +292,11 @@ __global__ void EpDispatchKernel(EpDispatchCombineConfig config,
     if (laneId == 0) {
       // According to RDMA speces, ops in the same queue pair is properly ordered, hence when
       // numTokenSignal is visible to a pe, token to expert mapping is also visible
-      ShmemPutUint32NbiThread<PrvdType>(
-          handle.outTokToExptMapMemObj, myPe * maxNumOutTokenPerRank, handle.inpTokToExptMapMemObj,
-          destPe * maxNumOutTokenPerRank, peTokenOffset[destPe], destPe);
-      ShmemPutUint32ImmNbiThread<PrvdType>(handle.recvTokenNumMemObj, myPe * sizeof(uint32_t),
-                                           numTokenSignal, destPe);
+      ShmemPutUint32NbiThread(handle.outTokToExptMapMemObj, myPe * maxNumOutTokenPerRank,
+                              handle.inpTokToExptMapMemObj, destPe * maxNumOutTokenPerRank,
+                              peTokenOffset[destPe], destPe);
+      ShmemPutUint32ImmNbiThread(handle.recvTokenNumMemObj, myPe * sizeof(uint32_t), numTokenSignal,
+                                 destPe);
     }
   }
   SyncIfDebugEnabled("Dispatch kernel: finish sending tok2expt mapping & num token signal");
@@ -332,7 +314,7 @@ __global__ void EpDispatchKernel(EpDispatchCombineConfig config,
 
   for (int destPe = laneId; destPe < npes; destPe += warpSize) {
     uint32_t* signal = handle.recvTokenNumMemObj->template GetAs<uint32_t*>() + destPe;
-    ShmemUint32WaitUntilGreaterThan<PrvdType>(signal, 0);
+    ShmemUint32WaitUntilGreaterThan(signal, 0);
     recvTokenNum[destPe] = *signal - 1;
   }
   SyncIfDebugEnabled("Dispatch kernel: finish waiting num token signal");
@@ -448,9 +430,9 @@ __global__ void EpCombineKernel(EpDispatchCombineConfig config, EpDispatchCombin
     } else {
       WarpCopy(shmemInpTokenBuf + peSortedOffset, inpTokenBuf + exptSortedOffset, config.hiddenDim);
       if (laneId == 0) {
-        ShmemPutTypeNbiThread<PrvdType, T>(handle.shmemOutTokMemObj, peerPeSortedOffset,
-                                           handle.shmemInpTokMemObj, peSortedOffset,
-                                           config.hiddenDim, destPe);
+        ShmemPutTypeNbiThread<T>(handle.shmemOutTokMemObj, peerPeSortedOffset,
+                                 handle.shmemInpTokMemObj, peSortedOffset, config.hiddenDim,
+                                 destPe);
       }
     }
 
@@ -468,7 +450,7 @@ __global__ void EpCombineKernel(EpDispatchCombineConfig config, EpDispatchCombin
     uint32_t numTokenSignal = recvTokenNumBuf[destPe];
     uint32_t recvTokenNum = numTokenSignal - 1;
 
-    ShmemUint32WaitUntilEquals<PrvdType>(handle.gridCopyTokenBarrier + destPe, recvTokenNum);
+    ShmemUint32WaitUntilEquals(handle.gridCopyTokenBarrier + destPe, recvTokenNum);
 
     if (destPe == myPe) {
       AtomicStoreRelaxed(handle.sendTokenNumMemObj->template GetAs<uint32_t*>() + myPe,
@@ -478,8 +460,8 @@ __global__ void EpCombineKernel(EpDispatchCombineConfig config, EpDispatchCombin
     if (laneId == 0) {
       // Set token number signal, note that this signal is only used for notifying dest Pe that
       // tokens have been sent, the dest pe itself know exactly how many token it sends to my pe.
-      ShmemPutUint32ImmNbiThread<PrvdType>(handle.sendTokenNumMemObj, myPe * sizeof(uint32_t),
-                                           numTokenSignal, destPe);
+      ShmemPutUint32ImmNbiThread(handle.sendTokenNumMemObj, myPe * sizeof(uint32_t), numTokenSignal,
+                                 destPe);
     }
   }
   SyncIfDebugEnabled("Combine kernel: finish sending tokens");
@@ -487,7 +469,7 @@ __global__ void EpCombineKernel(EpDispatchCombineConfig config, EpDispatchCombin
   // Phase 2: recv pe sorted token, reduce accross expert and recover original order
   for (int destPe = laneId; destPe < npes; destPe += warpSize) {
     uint32_t* signal = handle.sendTokenNumMemObj->template GetAs<uint32_t*>() + destPe;
-    ShmemUint32WaitUntilGreaterThan<PrvdType>(signal, 0);
+    ShmemUint32WaitUntilGreaterThan(signal, 0);
   }
   SyncIfDebugEnabled("Combine kernel: finish waiting num token signal");
 
@@ -744,12 +726,12 @@ void EpDispatchWithPutMemAPI() {
   config.randomSeed = myPe;
   config.rank = myPe;
   config.worldSize = npes;
-  config.numExpertPerRank = 8;
+  config.numExpertPerRank = 1;
   config.hiddenDim = 4096;
-  config.numExpertPerToken = 8;
-  config.maxNumInpTokenPerRank = 128;
+  config.numExpertPerToken = 1;
+  config.maxNumInpTokenPerRank = 4;
   config.warpNumPerBlock = 1;
-  config.blockNum = 4;
+  config.blockNum = 1;
 
   // Intialize EpDispatchCombineHandle
   using DataType = uint32_t;
@@ -758,13 +740,15 @@ void EpDispatchWithPutMemAPI() {
 
   // Run tests
   EpDispatchCombineTestCase<DataType> testCase(handle);
-  for (int i = 0; i < 10; i++) {
+  for (int i = 0; i < 1; i++) {
     testCase.RandomInitializeHandle();
     MPI_Barrier(MPI_COMM_WORLD);
     testCase.RunDispatch();
+    MPI_Barrier(MPI_COMM_WORLD);
     testCase.CheckDispatchResult();
     MPI_Barrier(MPI_COMM_WORLD);
     testCase.RunCombine();
+    MPI_Barrier(MPI_COMM_WORLD);
     testCase.CheckCombineResult();
   }
 

@@ -15,9 +15,10 @@ namespace core {
 /*                                           Post Tasks                                           */
 /* ---------------------------------------------------------------------------------------------- */
 template <>
-__device__ uint64_t PostSend<ProviderType::MLX5>(void* queueBuffAddr, uint32_t* postIdx,
-                                                 uint32_t wqeNum, uint32_t qpn, uintptr_t laddr,
-                                                 uint64_t lkey, size_t bytes) {
+inline __device__ uint64_t PostSend<ProviderType::MLX5>(void* queueBuffAddr, uint32_t* postIdx,
+                                                        uint32_t wqeNum, uint32_t qpn,
+                                                        uintptr_t laddr, uint64_t lkey,
+                                                        size_t bytes) {
   constexpr int sendWqeSize = sizeof(mlx5_wqe_ctrl_seg) + sizeof(mlx5_wqe_data_seg);
   constexpr int numOctoWords = CeilDiv(sendWqeSize, 16);
   constexpr int numWqeBb = CeilDiv(numOctoWords * 16, int(MLX5_SEND_WQE_BB));
@@ -42,9 +43,9 @@ __device__ uint64_t PostSend<ProviderType::MLX5>(void* queueBuffAddr, uint32_t* 
 }
 
 template <>
-__device__ void PostRecv<ProviderType::MLX5>(void* queueBuffAddr, uint32_t wqeNum,
-                                             uint32_t* postIdx, uintptr_t laddr, uint64_t lkey,
-                                             size_t bytes) {
+inline __device__ void PostRecv<ProviderType::MLX5>(void* queueBuffAddr, uint32_t wqeNum,
+                                                    uint32_t* postIdx, uintptr_t laddr,
+                                                    uint64_t lkey, size_t bytes) {
   uint32_t curPostIdx = atomicAdd(postIdx, 1);
   uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
 
@@ -55,9 +56,10 @@ __device__ void PostRecv<ProviderType::MLX5>(void* queueBuffAddr, uint32_t wqeNu
   wqe_data_seg->addr = HTOBE64(laddr);
 }
 
-__device__ uint64_t PostReadWrite(void* queueBuffAddr, uint32_t wqeNum, uint32_t* postIdx,
-                                  uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
-                                  uint64_t rkey, size_t bytes, bool isRead) {
+inline __device__ uint64_t PostReadWrite(void* queueBuffAddr, uint32_t wqeNum, uint32_t* postIdx,
+                                         uint32_t qpn, uintptr_t laddr, uint64_t lkey,
+                                         uintptr_t raddr, uint64_t rkey, size_t bytes,
+                                         bool isRead) {
   uint32_t opcode = isRead ? MLX5_OPCODE_RDMA_READ : MLX5_OPCODE_RDMA_WRITE;
 
   constexpr int sendWqeSize =
@@ -90,18 +92,20 @@ __device__ uint64_t PostReadWrite(void* queueBuffAddr, uint32_t wqeNum, uint32_t
 }
 
 template <>
-__device__ uint64_t PostWrite<ProviderType::MLX5>(void* queueBuffAddr, uint32_t wqeNum,
-                                                  uint32_t* postIdx, uint32_t qpn, uintptr_t laddr,
-                                                  uint64_t lkey, uintptr_t raddr, uint64_t rkey,
-                                                  size_t bytes) {
+inline __device__ uint64_t PostWrite<ProviderType::MLX5>(void* queueBuffAddr, uint32_t wqeNum,
+                                                         uint32_t* postIdx, uint32_t qpn,
+                                                         uintptr_t laddr, uint64_t lkey,
+                                                         uintptr_t raddr, uint64_t rkey,
+                                                         size_t bytes) {
   return PostReadWrite(queueBuffAddr, wqeNum, postIdx, qpn, laddr, lkey, raddr, rkey, bytes, false);
 }
 
 template <>
-__device__ uint64_t PostRead<ProviderType::MLX5>(void* queueBuffAddr, uint32_t wqeNum,
-                                                 uint32_t* postIdx, uint32_t qpn, uintptr_t laddr,
-                                                 uint64_t lkey, uintptr_t raddr, uint64_t rkey,
-                                                 size_t bytes) {
+inline __device__ uint64_t PostRead<ProviderType::MLX5>(void* queueBuffAddr, uint32_t wqeNum,
+                                                        uint32_t* postIdx, uint32_t qpn,
+                                                        uintptr_t laddr, uint64_t lkey,
+                                                        uintptr_t raddr, uint64_t rkey,
+                                                        size_t bytes) {
   return PostReadWrite(queueBuffAddr, wqeNum, postIdx, qpn, laddr, lkey, raddr, rkey, bytes, true);
 }
 
@@ -109,7 +113,7 @@ constexpr uint32_t MaxInlineDataSizePerWqe =
     sizeof(mlx5_wqe_data_seg) - sizeof(mlx5_wqe_inl_data_seg);
 
 template <ProviderType PrvdType>
-static __device__ uint64_t PostWriteInline(void* queueBuffAddr, uint32_t wqeNum, uint32_t* postIdx,
+inline __device__ uint64_t PostWriteInline(void* queueBuffAddr, uint32_t wqeNum, uint32_t* postIdx,
                                            uint32_t qpn, void* val, uintptr_t raddr, uint64_t rkey,
                                            size_t bytes) {
   constexpr int sendWqeSize =
@@ -159,17 +163,17 @@ static __device__ uint64_t PostWriteInline(void* queueBuffAddr, uint32_t wqeNum,
 /*                                            Doorbell                                            */
 /* ---------------------------------------------------------------------------------------------- */
 template <>
-__device__ void UpdateSendDbrRecord<ProviderType::MLX5>(void* dbrRecAddr, uint32_t wqeIdx) {
+inline __device__ void UpdateSendDbrRecord<ProviderType::MLX5>(void* dbrRecAddr, uint32_t wqeIdx) {
   reinterpret_cast<uint32_t*>(dbrRecAddr)[MLX5_SND_DBR] = HTOBE32(wqeIdx & 0xffff);
 }
 
 template <>
-__device__ void UpdateRecvDbrRecord<ProviderType::MLX5>(void* dbrRecAddr, uint32_t wqeIdx) {
+inline __device__ void UpdateRecvDbrRecord<ProviderType::MLX5>(void* dbrRecAddr, uint32_t wqeIdx) {
   reinterpret_cast<uint32_t*>(dbrRecAddr)[MLX5_RCV_DBR] = HTOBE32(wqeIdx & 0xffff);
 }
 
 template <>
-__device__ void RingDoorbell<ProviderType::MLX5>(void* dbrAddr, uint64_t dbrVal) {
+inline __device__ void RingDoorbell<ProviderType::MLX5>(void* dbrAddr, uint64_t dbrVal) {
   reinterpret_cast<uint64_t*>(dbrAddr)[0] = dbrVal;
 }
 
@@ -177,8 +181,8 @@ __device__ void RingDoorbell<ProviderType::MLX5>(void* dbrAddr, uint64_t dbrVal)
 /*                                        Completion Queue                                        */
 /* ---------------------------------------------------------------------------------------------- */
 template <>
-__device__ int PollCqOnce<ProviderType::MLX5>(void* cqeAddr, uint32_t cqeSize, uint32_t cqeNum,
-                                              uint32_t consIdx) {
+inline __device__ int PollCqOnce<ProviderType::MLX5>(void* cqeAddr, uint32_t cqeSize,
+                                                     uint32_t cqeNum, uint32_t consIdx) {
   uint64_t lastDword = atomicAdd(reinterpret_cast<uint64_t*>(cqeAddr) + 7, 0);
   uint8_t opOwn = reinterpret_cast<char*>(&lastDword)[7];
 
@@ -203,8 +207,8 @@ __device__ int PollCqOnce<ProviderType::MLX5>(void* cqeAddr, uint32_t cqeSize, u
 }
 
 template <>
-__device__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeSize, uint32_t cqeNum,
-                                          uint32_t* consIdx) {
+inline __device__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeSize, uint32_t cqeNum,
+                                                 uint32_t* consIdx) {
   uint32_t curConsIdx = atomicAdd(consIdx, 1);
   int cqeIdx = curConsIdx % cqeNum;
   void* cqeAddr = reinterpret_cast<char*>(cqAddr) + cqeIdx * cqeSize;

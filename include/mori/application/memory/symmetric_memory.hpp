@@ -1,5 +1,6 @@
 #pragma once
 
+#include <hip/hip_runtime_api.h>
 #include <linux/types.h>
 #include <stdint.h>
 
@@ -7,7 +8,8 @@
 #include <vector>
 
 #include "mori/application/bootstrap/bootstrap.hpp"
-#include "mori/application/transport/rdma/rdma.hpp"
+#include "mori/application/context/context.hpp"
+#include "mori/application/transport/transport.hpp"
 
 namespace mori {
 namespace application {
@@ -16,8 +18,11 @@ struct SymmMemObj {
   void* localPtr{nullptr};
   uintptr_t* peerPtrs{nullptr};
   size_t size{0};
+  // For Rdma
   uint32_t lkey{0};
   uint32_t* peerRkeys{nullptr};
+  // For IPC
+  hipIpcMemHandle_t* ipcMemHandles{nullptr};  // should only placed on cpu
 
   __device__ __host__ MemoryRegion GetMemoryRegion(int pe) const {
     MemoryRegion mr;
@@ -56,7 +61,7 @@ struct SymmMemObjPtr {
 
 class SymmMemManager {
  public:
-  SymmMemManager(BootstrapNetwork& bootNet, RdmaDeviceContext& context);
+  SymmMemManager(BootstrapNetwork& bootNet, Context& context);
   ~SymmMemManager();
 
   SymmMemObjPtr HostMalloc(size_t size, size_t alignment = sysconf(_SC_PAGE_SIZE));
@@ -72,7 +77,7 @@ class SymmMemManager {
 
  private:
   BootstrapNetwork& bootNet;
-  RdmaDeviceContext& context;
+  Context& context;
   std::unordered_map<void*, SymmMemObjPtr> memObjPool;
 };
 

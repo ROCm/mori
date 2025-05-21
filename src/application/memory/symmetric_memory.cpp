@@ -8,7 +8,7 @@
 namespace mori {
 namespace application {
 
-SymmMemManager::SymmMemManager(BootstrapNetwork& bootNet, RdmaDeviceContext& context)
+SymmMemManager::SymmMemManager(BootstrapNetwork& bootNet, Context& context)
     : bootNet(bootNet), context(context) {}
 
 SymmMemManager::~SymmMemManager() {
@@ -46,7 +46,8 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
   int worldSize = bootNet.GetWorldSize();
   int rank = bootNet.GetLocalRank();
 
-  application::MemoryRegion mr = context.RegisterMemoryRegion(localPtr, size);
+  application::MemoryRegion mr =
+      context.GetRdmaDeviceContext()->RegisterMemoryRegion(localPtr, size);
 
   SymmMemObj* cpuMemObj = new SymmMemObj();
   cpuMemObj->localPtr = localPtr;
@@ -57,6 +58,21 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
   cpuMemObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
   bootNet.Allgather(&localPtr, cpuMemObj->peerPtrs, sizeof(uintptr_t));
   cpuMemObj->peerPtrs[rank] = reinterpret_cast<uintptr_t>(cpuMemObj->localPtr);
+
+  // Exchange ipc pointers
+  hipIpcMemHandle_t handle;
+  HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&handle, localPtr));
+  cpuMemObj->ipcMemHandles =
+      static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
+  bootNet.Allgather(&handle, cpuMemObj->ipcMemHandles, sizeof(hipIpcMemHandle_t));
+  for (int i = 0; i < worldSize; i++) {
+    if (context.GetTransportType(i) != TransportType::P2P) continue;
+    if (i == rank) continue;
+
+    HIP_RUNTIME_CHECK(hipIpcOpenMemHandle(reinterpret_cast<void**>(&cpuMemObj->peerPtrs[i]),
+                                          cpuMemObj->ipcMemHandles[i],
+                                          hipIpcMemLazyEnablePeerAccess));
+  }
 
   // Exchange rkeys
   cpuMemObj->peerRkeys = static_cast<uint32_t*>(calloc(worldSize, sizeof(uint32_t)));
@@ -83,11 +99,12 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
 void SymmMemManager::DeRegisterSymmMemObj(void* localPtr) {
   if (memObjPool.find(localPtr) == memObjPool.end()) return;
 
-  context.DeRegisterMemoryRegion(localPtr);
+  context.GetRdmaDeviceContext()->DeRegisterMemoryRegion(localPtr);
 
   SymmMemObjPtr memObjPtr = memObjPool.at(localPtr);
   free(memObjPtr.cpu->peerPtrs);
   free(memObjPtr.cpu->peerRkeys);
+  free(memObjPtr.cpu->ipcMemHandles);
   free(memObjPtr.cpu);
   HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerPtrs));
   HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerRkeys));

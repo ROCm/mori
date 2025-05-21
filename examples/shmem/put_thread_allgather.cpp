@@ -22,8 +22,8 @@ __global__ void RingAllGatherWithPutMemAPIKernel(int myPe, int npes, const SymmM
   for (int i = 0; i < npes - 1; i++) {
     int sendDataRank = ((myPe - i) + npes) % npes;
     int sendOffset = sendDataRank * peChunkSize;
-    ShmemPutMemNbiThread<PrvdType>(memObj, sendOffset, source, sendOffset, peChunkSize, nextPeer);
-    ShmemQuietThread<PrvdType>();
+    ShmemPutMemNbiThread(memObj, sendOffset, source, sendOffset, peChunkSize, nextPeer);
+    ShmemQuietThread();
 
     int recvDataRank = ((sendDataRank - 1) + npes) % npes;
     int recvOffset = recvDataRank * peChunkSize;

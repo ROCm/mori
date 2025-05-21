@@ -1,3 +1,5 @@
+#pragma once
+
 #include "mori/application/transport/p2p/p2p.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
 

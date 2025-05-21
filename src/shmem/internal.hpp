@@ -45,6 +45,8 @@ struct GpuStates {
 
 extern __constant__ GpuStates globalGpuStates;
 
+static __device__ GpuStates* GetGlobalGpuStatesPtr() { return &globalGpuStates; }
+
 class ShmemStatesSingleton {
  public:
   ShmemStatesSingleton(const ShmemStatesSingleton& obj) = delete;

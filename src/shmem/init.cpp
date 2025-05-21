@@ -26,13 +26,13 @@ void RdmaStatesInit() {
 
 void MemoryStatesInit() {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
-  application::RdmaDeviceContext* deviceContext =
-      states->rdmaStates->commContext->GetRdmaDeviceContext();
+  application::Context* context = states->rdmaStates->commContext;
 
   states->memoryStates = new MemoryStates();
   states->memoryStates->symmMemMgr =
-      new application::SymmMemManager(*states->bootStates->bootNet, *deviceContext);
-  states->memoryStates->mrMgr = new application::MemoryRegionManager(*deviceContext);
+      new application::SymmMemManager(*states->bootStates->bootNet, *context);
+  states->memoryStates->mrMgr =
+      new application::MemoryRegionManager(*context->GetRdmaDeviceContext());
 }
 
 void GpuStateInit() {
@@ -61,6 +61,7 @@ void GpuStateInit() {
       hipMemcpy(gpuStates.rdmaEndpoints, rdmaStates->commContext->GetRdmaEndpoints().data(),
                 sizeof(application::RdmaEndpoint) * worldSize, hipMemcpyHostToDevice));
 
+  // Copy gpu states to constant memory
   HIP_RUNTIME_CHECK(
       hipMemcpyToSymbol(globalGpuStates, &gpuStates, sizeof(GpuStates), 0, hipMemcpyHostToDevice));
 }

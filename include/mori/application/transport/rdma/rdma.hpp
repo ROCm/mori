@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "infiniband/verbs.h"
+#include "mori/core/transport/rdma/rdma.hpp"
 
 namespace mori {
 namespace application {
@@ -19,6 +20,7 @@ namespace application {
       IBV_ACCESS_REMOTE_ATOMIC
 
 enum RdmaDeviceVendorId {
+  Unknown = 0,
   Mellanox = 0x02c9,
   // Broadcom =
 };
@@ -73,9 +75,18 @@ struct CompletionQueueHandle {
 };
 
 struct RdmaEndpoint {
+  RdmaDeviceVendorId vendorId{RdmaDeviceVendorId::Unknown};
   RdmaEndpointHandle handle;
   WorkQueueHandle wqHandle;
   CompletionQueueHandle cqHandle;
+
+  __device__ __host__ core::ProviderType GetProviderType() {
+    if (vendorId == Mellanox) {
+      return core::ProviderType::MLX5;
+    }
+    assert(false);
+    return core::ProviderType::Unknown;
+  }
 };
 
 class RdmaDevice;

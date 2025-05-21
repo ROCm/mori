@@ -39,6 +39,7 @@ void Context::IntializePossibleTransports() {
   int gpuCount;
   HIP_RUNTIME_CHECK(hipGetDeviceCount(&gpuCount));
   assert(rankInNode < gpuCount);
+  HIP_RUNTIME_CHECK(hipSetDevice(rankInNode));
 
   // Init rdma context
   rdmaContext.reset(new RdmaContext());
@@ -53,22 +54,21 @@ void Context::IntializePossibleTransports() {
   int peerRankInNode = -1;
   for (int i = 0; i < WorldSize(); i++) {
     // Check P2P availability
-    // if (HostName() == hostnames[i]) {
-    //   peerRankInNode++;
+    if (HostName() == hostnames[i]) {
+      peerRankInNode++;
 
-    //   int canAccessPeer;
-    //   HIP_RUNTIME_CHECK(hipDeviceCanAccessPeer(&canAccessPeer, rankInNode, peerRankInNode));
+      int canAccessPeer;
+      HIP_RUNTIME_CHECK(hipDeviceCanAccessPeer(&canAccessPeer, rankInNode, peerRankInNode));
 
-    //   if ((i == LocalRank()) || !!(canAccessPeer)) {
-    //     transportTypes.push_back(TransportType::P2P);
-    //     rdmaEps.push_back({});
-    //     continue;
-    //   }
-    // }
-    if (i == LocalRank()) {
-      transportTypes.push_back(TransportType::P2P);
-      rdmaEps.push_back({});
-      continue;
+      if (canAccessPeer) {
+        HIP_RUNTIME_CHECK(hipDeviceEnablePeerAccess(peerRankInNode, 0));
+      }
+
+      if ((i == LocalRank()) || canAccessPeer) {
+        transportTypes.push_back(TransportType::P2P);
+        rdmaEps.push_back({});
+        continue;
+      }
     }
 
     application::RdmaEndpointConfig config;
