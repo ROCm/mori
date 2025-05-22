@@ -59,7 +59,7 @@ class EpDispatchCombineTestCase {
   };
 
   void RandomInitializeHandle() {
-    handle.Reset();
+    handle.LaunchReset();
     RandomIntializeNumToken();
     RandomIntializeDispatch();
     RandomInitializeToken();
@@ -71,7 +71,6 @@ class EpDispatchCombineTestCase {
     handle.LaunchDispatch();
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
     int tokenNumSignalSize = handle.config.worldSize * sizeof(uint32_t);
-    handle.ResetBarrier();
   }
 
   void CheckDispatchResult() {
@@ -266,21 +265,23 @@ void EpDispatchWithPutMemAPI() {
   config.blockNum = 4;
 
   // Intialize EpDispatchCombineHandle
-  using DataType = uint32_t;
-  EpDispatchCombineHandle<DataType> handle(config);
+  {
+    using DataType = uint32_t;
+    EpDispatchCombineHandle<DataType> handle(config);
 
-  // Run tests
-  EpDispatchCombineTestCase<DataType> testCase(handle);
-  for (int i = 0; i < 2; i++) {
-    testCase.RandomInitializeHandle();
-    MPI_Barrier(MPI_COMM_WORLD);
-    testCase.RunDispatch();
-    MPI_Barrier(MPI_COMM_WORLD);
-    testCase.CheckDispatchResult();
-    MPI_Barrier(MPI_COMM_WORLD);
-    // testCase.RunCombine();
-    // MPI_Barrier(MPI_COMM_WORLD);
-    // testCase.CheckCombineResult();
+    // Run tests
+    EpDispatchCombineTestCase<DataType> testCase(handle);
+    for (int i = 0; i < 100; i++) {
+      testCase.RandomInitializeHandle();
+      MPI_Barrier(MPI_COMM_WORLD);
+      testCase.RunDispatch();
+      MPI_Barrier(MPI_COMM_WORLD);
+      testCase.CheckDispatchResult();
+      MPI_Barrier(MPI_COMM_WORLD);
+      testCase.RunCombine();
+      MPI_Barrier(MPI_COMM_WORLD);
+      testCase.CheckCombineResult();
+    }
   }
 
   ShmemMpiFinalize();

@@ -83,6 +83,7 @@ int ShmemMpiInit(MPI_Comm mpi_comm) {
   RdmaStatesInit();
   MemoryStatesInit();
   GpuStateInit();
+  states->status = ShmemStatesStatus::Initialized;
   return 0;
 }
 
@@ -101,6 +102,8 @@ int ShmemMpiFinalize() {
 
   states->bootStates->bootNet->Finalize();
   delete states->bootStates->bootNet;
+
+  states->status = ShmemStatesStatus::Finalized;
   return 0;
 }
 

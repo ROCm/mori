@@ -33,6 +33,7 @@ enum ShmemTeamType {
 /* ---------------------------------------------------------------------------------------------- */
 
 void* ShmemMalloc(size_t size);
+void* ShmemExtMallocWithFlags(size_t size, unsigned int flags);
 void ShmemFree(void*);
 
 // Note: temporary API for testing

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -28,10 +29,31 @@ struct MemoryStates {
   application::MemoryRegionManager* mrMgr{nullptr};
 };
 
+enum ShmemStatesStatus {
+  New = 0,
+  Initialized = 1,
+  Finalized = 2,
+};
+
 struct ShmemStates {
+  ShmemStatesStatus status{ShmemStatesStatus::New};
   BootStates* bootStates{nullptr};
   RdmaStates* rdmaStates{nullptr};
   MemoryStates* memoryStates{nullptr};
+
+  // This is a temporary API for debugging only
+  void CheckStatusValid() {
+    if (status == ShmemStatesStatus::New) {
+      std::cout
+          << "Shmem state is not initialized, initialize it by calling ShmemMpiIntialize first."
+          << std::endl;
+      assert(false);
+    }
+    if (status == ShmemStatesStatus::Finalized) {
+      std::cout << "Shmem state has been finalized." << std::endl;
+      assert(false);
+    }
+  }
 };
 
 constexpr int MaxRdmaEndpointNum = 1024;

@@ -9,7 +9,18 @@ namespace shmem {
 
 void* ShmemMalloc(size_t size) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
   application::SymmMemObjPtr obj = states->memoryStates->symmMemMgr->Malloc(size);
+  if (obj.IsValid()) {
+    return obj.cpu->localPtr;
+  }
+  return nullptr;
+}
+
+void* ShmemExtMallocWithFlags(size_t size, unsigned int flags) {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
+  application::SymmMemObjPtr obj = states->memoryStates->symmMemMgr->ExtMallocWihFlags(size, flags);
   if (obj.IsValid()) {
     return obj.cpu->localPtr;
   }
@@ -18,22 +29,26 @@ void* ShmemMalloc(size_t size) {
 
 void ShmemFree(void* localPtr) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
   states->memoryStates->symmMemMgr->Free(localPtr);
 }
 
 application::SymmMemObjPtr ShmemQueryMemObjPtr(void* localPtr) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
   return states->memoryStates->symmMemMgr->Get(localPtr);
 }
 
 int ShmemBufferRegister(void* ptr, size_t size) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
   states->memoryStates->mrMgr->RegisterBuffer(ptr, size);
   return 0;
 }
 
 int ShmemBufferDeRegister(void* ptr, size_t size) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
   states->memoryStates->mrMgr->DeRegisterBuffer(ptr);
   return 0;
 }

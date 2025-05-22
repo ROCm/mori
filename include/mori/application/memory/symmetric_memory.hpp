@@ -68,6 +68,8 @@ class SymmMemManager {
   void HostFree(void* localPtr);
 
   SymmMemObjPtr Malloc(size_t size);
+  // See hipExtMallocWithFlags for flags settings
+  SymmMemObjPtr ExtMallocWihFlags(size_t size, unsigned int flags);
   void Free(void* localPtr);
 
   SymmMemObjPtr RegisterSymmMemObj(void* localPtr, size_t size);

@@ -30,24 +30,9 @@ class EpDispatchCombineHandle {
     this->curRankNumToken = numToken;
   }
 
-  void Reset() {
-    int tokenNumSignalSize = config.worldSize * sizeof(uint32_t);
-    HIP_RUNTIME_CHECK(hipMemset(recvTokenNumMemObj->localPtr, 0, tokenNumSignalSize));
-    HIP_RUNTIME_CHECK(hipMemset(sendTokenNumMemObj->localPtr, 0, tokenNumSignalSize));
-    HIP_RUNTIME_CHECK(hipMemset(gridCopyTokenBarrier, 0, tokenNumSignalSize));
-    printf("reset input obj ptr %p\n", shmemInpTokMemObj->localPtr);
-  }
-
-  void ResetBarrier() {
-    int device;
-    HIP_RUNTIME_CHECK(hipGetDevice(&device));
-    printf("reset %d %p\n", device, gridCopyTokenBarrier);
-    int tokenNumSignalSize = config.worldSize * sizeof(uint32_t);
-    HIP_RUNTIME_CHECK(hipMemset(gridCopyTokenBarrier, 0, tokenNumSignalSize));
-  }
-
   void LaunchDispatch();
   void LaunchCombine();
+  void LaunchReset();
 
  private:
   void IntializeShmemInpOutTokBuf();

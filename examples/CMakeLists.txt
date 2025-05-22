@@ -29,12 +29,6 @@ add_executable(
 target_link_libraries(put_thread_allgather mori_shmem hip::host hip::device)
 
 add_executable(
-    dispatch_combine
-    shmem/dispatch_combine.cpp
-)
-target_link_libraries(dispatch_combine mori_shmem hip::host hip::device)
-
-add_executable(
     concurrent_put_thread
     shmem/concurrent_put_thread.cpp
 )
@@ -53,5 +47,3 @@ add_executable(
 )
 target_link_libraries(test_dispatch_combine mori_application mori_shmem hip::host hip::device)
 target_include_directories(test_dispatch_combine PUBLIC ${CMAKE_SOURCE_DIR}/examples/moe)
-target_compile_options(test_dispatch_combine PUBLIC "-fgpu-rdc")
-target_link_options(test_dispatch_combine PUBLIC "-fgpu-rdc")
