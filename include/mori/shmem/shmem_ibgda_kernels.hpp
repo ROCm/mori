@@ -15,10 +15,10 @@ namespace shmem {
 /*                                         Point-to-Point                                         */
 /* ---------------------------------------------------------------------------------------------- */
 template <core::ProviderType PrvdType>
-__device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMemObjPtr dest,
-                                               size_t destOffset,
-                                               const application::MemoryRegion& source,
-                                               size_t sourceOffset, size_t bytes, int pe) {
+inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMemObjPtr dest,
+                                                      size_t destOffset,
+                                                      const application::MemoryRegion& source,
+                                                      size_t sourceOffset, size_t bytes, int pe) {
   if (bytes == 0) return;
   uintptr_t laddr = source.addr + sourceOffset;
   uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
@@ -49,7 +49,7 @@ __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMemObjPtr 
   }
 
 template <>
-__device__ void ShmemPutMemNbiThreadKernel<application::TransportType::RDMA>(
+inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::MemoryRegion& source, size_t sourceOffset, size_t bytes, int pe) {
   DISPATCH_PROVIDER_TYPE(ShmemPutMemNbiThreadKernelImpl, dest, destOffset, source, sourceOffset,
@@ -57,10 +57,10 @@ __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::RDMA>(
 }
 
 template <core::ProviderType PrvdType>
-__device__ void ShmemPutMemNbiWarpKernelImpl(const application::SymmMemObjPtr dest,
-                                             size_t destOffset,
-                                             const application::MemoryRegion& source,
-                                             size_t sourceOffset, size_t bytes, int pe) {
+inline __device__ void ShmemPutMemNbiWarpKernelImpl(const application::SymmMemObjPtr dest,
+                                                    size_t destOffset,
+                                                    const application::MemoryRegion& source,
+                                                    size_t sourceOffset, size_t bytes, int pe) {
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {
     ShmemPutMemNbiThreadKernelImpl<PrvdType>(dest, destOffset, source, sourceOffset, bytes, pe);
@@ -68,7 +68,7 @@ __device__ void ShmemPutMemNbiWarpKernelImpl(const application::SymmMemObjPtr de
 }
 
 template <>
-__device__ void ShmemPutMemNbiWarpKernel<application::TransportType::RDMA>(
+inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::MemoryRegion& source, size_t sourceOffset, size_t bytes, int pe) {
   DISPATCH_PROVIDER_TYPE(ShmemPutMemNbiWarpKernelImpl, dest, destOffset, source, sourceOffset,
@@ -77,9 +77,9 @@ __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::RDMA>(
 
 // TODO: deal with bytes count limit
 template <core::ProviderType PrvdType>
-__device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::SymmMemObjPtr dest,
-                                                   size_t destOffset, void* val, size_t bytes,
-                                                   int pe) {
+inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::SymmMemObjPtr dest,
+                                                          size_t destOffset, void* val,
+                                                          size_t bytes, int pe) {
   uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
   uintptr_t rkey = dest->peerRkeys[pe];
 
@@ -97,15 +97,15 @@ __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::SymmMemObj
 }
 
 template <>
-__device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::RDMA>(
+inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe) {
   DISPATCH_PROVIDER_TYPE(ShmemPutSizeImmNbiThreadKernelImpl, dest, destOffset, val, bytes, pe);
 }
 
 template <core::ProviderType PrvdType>
-__device__ void ShmemPutSizeImmNbiWarpKernelImpl(const application::SymmMemObjPtr dest,
-                                                 size_t destOffset, void* val, size_t bytes,
-                                                 int pe) {
+inline __device__ void ShmemPutSizeImmNbiWarpKernelImpl(const application::SymmMemObjPtr dest,
+                                                        size_t destOffset, void* val, size_t bytes,
+                                                        int pe) {
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {
     ShmemPutSizeImmNbiThreadKernelImpl<PrvdType>(dest, destOffset, val, bytes, pe);
@@ -113,7 +113,7 @@ __device__ void ShmemPutSizeImmNbiWarpKernelImpl(const application::SymmMemObjPt
 }
 
 template <>
-__device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::RDMA>(
+inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe) {
   DISPATCH_PROVIDER_TYPE(ShmemPutSizeImmNbiWarpKernelImpl, dest, destOffset, val, bytes, pe);
 }
@@ -121,7 +121,7 @@ __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::RDMA>(
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Synchronization                                        */
 /* ---------------------------------------------------------------------------------------------- */
-__device__ void ShmemQuietThreadKernelImpl() {
+inline __device__ void ShmemQuietThreadKernelImpl() {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
 
@@ -160,7 +160,7 @@ __device__ void ShmemQuietThreadKernelImpl() {
 }
 
 template <>
-__device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>() {
+inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>() {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   ShmemQuietThreadKernelImpl();

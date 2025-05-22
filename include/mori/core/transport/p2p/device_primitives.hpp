@@ -8,12 +8,10 @@ __device__ void ThreadCopy(T* dst, T* src, size_t nelems) {
   constexpr int vecSize = 16 / sizeof(T);
   int offset = 0;
 
-  // printf("tid %d before thread copy\n", threadIdx.x);
   while ((offset + vecSize) < nelems) {
     reinterpret_cast<uint4*>(dst + offset)[0] = reinterpret_cast<uint4*>(src + offset)[0];
     offset += vecSize;
   }
-  // printf("tid %d after thread copy\n", threadIdx.x);
 
   while (offset < nelems) {
     dst[offset] = src[offset];
@@ -34,6 +32,50 @@ __device__ void WarpCopy(T* dst, T* src, size_t nelems) {
 
   while (offset < nelems) {
     dst[offset] = src[offset];
+    offset += 1;
+  }
+}
+
+template <typename T>
+__device__ T WarpReduceSum(T val) {
+  int laneId = threadIdx.x & (warpSize - 1);
+  for (int delta = (warpSize >> 1); delta > 0; delta = (delta >> 1)) {
+    val += __shfl_down(val, delta);
+  }
+  return val;
+}
+
+template <typename T>
+__device__ T WarpPrefixSum(T val, size_t laneNum) {
+  int laneId = threadIdx.x & (warpSize - 1);
+  uint32_t prefixSum = 0;
+  if (laneId < laneNum) {
+    for (int i = 0; i <= laneId; i++) {
+      uint32_t targetLaneVal = __shfl(val, i);
+      if (laneId > i) prefixSum += targetLaneVal;
+    }
+  }
+  return prefixSum;
+}
+
+template <typename T>
+__device__ void WarpAccum(T* accum, T* src, size_t nelems) {
+  constexpr int vecSize = 16 / sizeof(T);
+  int laneId = threadIdx.x & (warpSize - 1);
+  int offset = laneId * vecSize;
+
+  while ((offset + vecSize) < nelems) {
+    uint4 srcVal = reinterpret_cast<uint4*>(src + offset)[0];
+    uint4 accumVal = reinterpret_cast<uint4*>(accum + offset)[0];
+    for (int i = 0; i < vecSize; i++) {
+      reinterpret_cast<T*>(&accumVal)[i] += reinterpret_cast<T*>(&srcVal)[i];
+    }
+    reinterpret_cast<uint4*>(accum + offset)[0] = accumVal;
+    offset += warpSize * vecSize;
+  }
+
+  while (offset < nelems) {
+    accum[offset] += src[offset];
     offset += 1;
   }
 }

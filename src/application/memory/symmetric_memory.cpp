@@ -38,6 +38,7 @@ SymmMemObjPtr SymmMemManager::Malloc(size_t size) {
 }
 
 void SymmMemManager::Free(void* localPtr) {
+  printf("%p localPtr\n", localPtr);
   HIP_RUNTIME_CHECK(hipFree(localPtr));
   DeRegisterSymmMemObj(localPtr);
 }

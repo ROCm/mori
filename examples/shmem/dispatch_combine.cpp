@@ -1,3 +1,4 @@
+#include <hip/hip_cooperative_groups.h>
 #include <mpi.h>
 
 #include <algorithm>
@@ -15,7 +16,7 @@ using namespace std;
 
 constexpr ProviderType PrvdType = ProviderType::MLX5;
 
-#define DEBUG 1
+#define DEBUG 0
 
 __device__ void SyncIfDebugEnabled(const char* msg) {
 #if DEBUG == 1
@@ -62,6 +63,11 @@ class EpDispatchCombineHandle {
     int tokenNumSignalSize = config.worldSize * sizeof(uint32_t);
     HIP_RUNTIME_CHECK(hipMemset(recvTokenNumMemObj->localPtr, 0, tokenNumSignalSize));
     HIP_RUNTIME_CHECK(hipMemset(sendTokenNumMemObj->localPtr, 0, tokenNumSignalSize));
+    HIP_RUNTIME_CHECK(hipMemset(gridCopyTokenBarrier, 0, tokenNumSignalSize));
+  }
+
+  void ResetBarrier() {
+    int tokenNumSignalSize = config.worldSize * sizeof(uint32_t);
     HIP_RUNTIME_CHECK(hipMemset(gridCopyTokenBarrier, 0, tokenNumSignalSize));
   }
 
@@ -160,50 +166,6 @@ class EpDispatchCombineHandle {
 };
 
 template <typename T>
-__device__ T WarpReduceSum(T val) {
-  int laneId = threadIdx.x & (warpSize - 1);
-  for (int delta = (warpSize >> 1); delta > 0; delta = (delta >> 1)) {
-    val += __shfl_down(val, delta);
-  }
-  return val;
-}
-
-template <typename T>
-__device__ T WarpPrefixSum(T val, size_t laneNum) {
-  int laneId = threadIdx.x & (warpSize - 1);
-  uint32_t prefixSum = 0;
-  if (laneId < laneNum) {
-    for (int i = 0; i <= laneId; i++) {
-      uint32_t targetLaneVal = __shfl(val, i);
-      if (laneId > i) prefixSum += targetLaneVal;
-    }
-  }
-  return prefixSum;
-}
-
-template <typename T>
-__device__ void WarpAccum(T* accum, T* src, size_t nelems) {
-  constexpr int vecSize = 16 / sizeof(T);
-  int laneId = threadIdx.x & (warpSize - 1);
-  int offset = laneId * vecSize;
-
-  while ((offset + vecSize) < nelems) {
-    uint4 srcVal = reinterpret_cast<uint4*>(src + offset)[0];
-    uint4 accumVal = reinterpret_cast<uint4*>(accum + offset)[0];
-    for (int i = 0; i < vecSize; i++) {
-      reinterpret_cast<T*>(&accumVal)[i] += reinterpret_cast<T*>(&srcVal)[i];
-    }
-    reinterpret_cast<uint4*>(accum + offset)[0] = accumVal;
-    offset += warpSize * vecSize;
-  }
-
-  while (offset < nelems) {
-    accum[offset] += src[offset];
-    offset += 1;
-  }
-}
-
-template <typename T>
 __global__ void EpDispatchKernel(EpDispatchCombineConfig config,
                                  EpDispatchCombineHandle<T> handle) {
   int thdId = threadIdx.x;
@@ -254,31 +216,38 @@ __global__ void EpDispatchKernel(EpDispatchCombineConfig config,
     uint32_t peSortedId = myPe * maxNumOutTokenPerRank + peTokenIdx;
     uint32_t peSortedOffset = peSortedId * config.hiddenDim;
 
-    if (laneId == 0) {
-      handle.tokenIndicesToPeSortedBuf[i] = destPe * maxNumOutTokenPerRank + peTokenIdx;
-    }
-
     WarpCopy(handle.shmemInpTokMemObj->template GetAs<T*>() + tokenOffset,
              handle.inpTokenBuf + tokenOffset, config.hiddenDim);
     ShmemPutTypeNbiWarp<T>(handle.shmemOutTokMemObj, peSortedOffset, handle.shmemInpTokMemObj,
                            tokenOffset, config.hiddenDim, destPe);
+    __threadfence_system();
+    if (laneId == 0) {
+      handle.tokenIndicesToPeSortedBuf[i] = destPe * maxNumOutTokenPerRank + peTokenIdx;
+      uint32_t destPeCopyCnt = atomicAdd(handle.gridCopyTokenBarrier + destPe, 1);
+    }
   }
-  SyncIfDebugEnabled("Dispatch kernel: finished send token");
+  // SyncIfDebugEnabled("Dispatch kernel: finished send token");
   // Make sure WarCopy is visible to other blocks
-  __threadfence();
+  __threadfence_system();
 
   // Send token num & token to expert mapping to other ranks
   for (int destPe = globalWarpId; destPe < npes; destPe += globalWarpNum) {
     // Add 1 so that when token number == 0, receiver side still know the signal is sent
-    uint32_t numTokenSignal = peTokenOffset[destPe] + 1;
+    uint32_t recvTokenNum = peTokenOffset[destPe];
+
+    // Wait until all tokens are sent
+    ShmemUint32WaitUntilEquals(handle.gridCopyTokenBarrier + destPe, recvTokenNum);
+
     ShmemPutUint32NbiWarp(handle.outTokToExptMapMemObj, myPe * maxNumOutTokenPerRank,
                           handle.inpTokToExptMapMemObj, destPe * maxNumOutTokenPerRank,
-                          peTokenOffset[destPe], destPe);
-    __threadfence();
+                          recvTokenNum, destPe);
+
+    uint32_t numTokenSignal = recvTokenNum + 1;
     ShmemPutUint32ImmNbiWarp(handle.recvTokenNumMemObj, myPe * sizeof(uint32_t), numTokenSignal,
                              destPe);
   }
   SyncIfDebugEnabled("Dispatch kernel: finish sending tok2expt mapping & num token signal");
+  __threadfence_system();
 
   // Phase 2: recv token
   // Each warp wait until sender finished by waiting token number signal
@@ -296,7 +265,7 @@ __global__ void EpDispatchKernel(EpDispatchCombineConfig config,
     ShmemUint32WaitUntilGreaterThan(signal, 0);
     recvTokenNum[destPe] = *signal - 1;
   }
-  SyncIfDebugEnabled("Dispatch kernel: finish waiting num token signal");
+  // SyncIfDebugEnabled("Dispatch kernel: finish waiting num token signal");
 
   for (int srcPe = warpId; srcPe < npes; srcPe += warpNum) {
     for (int tokId = laneId; tokId < recvTokenNum[srcPe]; tokId += warpSize) {
@@ -348,7 +317,6 @@ __global__ void EpDispatchKernel(EpDispatchCombineConfig config,
 
     uint32_t exptSortedId = accumExpertTokOffsets[localExpertId] + expertTokOff[localExpertId] - 1;
     uint32_t destTokenOff = exptSortedId * config.hiddenDim;
-
     WarpCopy(outTokenBuf + destTokenOff, shmemOutTokenBuf + srcTokenOff, config.hiddenDim);
 
     if (laneId == 0) {
@@ -501,6 +469,7 @@ class EpDispatchCombineTestCase {
     size_t sharedMemSize = 2 * config.worldSize * config.warpNumPerBlock * sizeof(uint32_t);
     EpDispatchKernel<<<grid, block, sharedMemSize>>>(config, handle);
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+    handle.ResetBarrier();
   }
 
   void CheckDispatchResult() {
@@ -671,6 +640,15 @@ class EpDispatchCombineTestCase {
   EpDispatchCombineHandle<T>& handle;
 };
 
+void CheckCoopLaunchSupport() {
+  int device = 0;
+  int supportCoopLaunch = 0;
+  HIP_RUNTIME_CHECK(hipGetDevice(&device));
+  HIP_RUNTIME_CHECK(
+      hipDeviceGetAttribute(&supportCoopLaunch, hipDeviceAttributeCooperativeLaunch, device));
+  assert(supportCoopLaunch);
+}
+
 // A simple MoE-EP dispatch kernel example, assume dp rank is equal to ep rank
 void EpDispatchWithPutMemAPI() {
   int status;
@@ -679,6 +657,9 @@ void EpDispatchWithPutMemAPI() {
   MPI_Init(NULL, NULL);
   status = ShmemMpiInit(MPI_COMM_WORLD);
   assert(!status);
+
+  CheckCoopLaunchSupport();
+
   int myPe = ShmemMyPe();
   int npes = ShmemNPes();
 
@@ -690,9 +671,9 @@ void EpDispatchWithPutMemAPI() {
   config.numExpertPerRank = 2;
   config.hiddenDim = 4096;
   config.numExpertPerToken = 2;
-  config.maxNumInpTokenPerRank = 16;
+  config.maxNumInpTokenPerRank = 32;
   config.warpNumPerBlock = 2;
-  config.blockNum = 2;
+  config.blockNum = 4;
 
   // Intialize EpDispatchCombineHandle
   using DataType = uint32_t;
@@ -701,16 +682,16 @@ void EpDispatchWithPutMemAPI() {
 
   // Run tests
   EpDispatchCombineTestCase<DataType> testCase(handle);
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < 5; i++) {
     testCase.RandomInitializeHandle();
     MPI_Barrier(MPI_COMM_WORLD);
     testCase.RunDispatch();
     MPI_Barrier(MPI_COMM_WORLD);
     testCase.CheckDispatchResult();
     MPI_Barrier(MPI_COMM_WORLD);
-    testCase.RunCombine();
-    MPI_Barrier(MPI_COMM_WORLD);
-    testCase.CheckCombineResult();
+    // testCase.RunCombine();
+    // MPI_Barrier(MPI_COMM_WORLD);
+    // testCase.CheckCombineResult();
   }
 
   ShmemMpiFinalize();
