@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <random>
 #include <sstream>
 
@@ -15,12 +16,19 @@ using namespace mori::core;
 using namespace mori::application;
 using namespace mori::shmem;
 
+struct EpDispatchCombineTestConfig {
+  int repeat{10};
+  EpDispatchCombineConfig config;
+};
+
 template <typename T>
 class EpDispatchCombineTestCase {
  public:
   EpDispatchCombineTestCase(EpDispatchCombineHandle<T>& handle) : handle(handle) {
-    gen = mt19937(rd());
-    gen.seed(ShmemMyPe());
+    const auto timestamp = std::chrono::system_clock::now();
+    gen = mt19937(
+        std::chrono::duration_cast<std::chrono::seconds>(timestamp.time_since_epoch()).count() +
+        handle.config.rank);
 
     EpDispatchCombineConfig& config = handle.config;
 
@@ -65,6 +73,7 @@ class EpDispatchCombineTestCase {
     RandomInitializeToken();
     handle.PrepareInference(inpTokBuf, outTokBuf, tokenIndicies, numToken);
     PrintDispatch();
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   }
 
   void RunDispatch() {
@@ -144,6 +153,9 @@ class EpDispatchCombineTestCase {
       msg << "mype " << config.rank << " localTokId " << localTokId << " srcpe " << srcPe
           << " srcTokId " << srcTokId;
       CompareToken(srcTokBuf, localTokBuf, config.hiddenDim, msg.str());
+      // printf("mype %d loalTokId %d srcPe %d val %d exptSotredOffset %d \n", config.rank,
+      // localTokId,
+      //        srcPe, localTokBuf[0], localTokId * config.hiddenDim);
     }
 
     free(globalInpTokBufCpu);
@@ -154,8 +166,8 @@ class EpDispatchCombineTestCase {
   void RunCombine() {
     EpDispatchCombineConfig& config = handle.config;
 
-    int maxNumOutTokenPerRank = config.maxNumInpTokenPerRank * config.numExpertPerToken;
-
+    int maxNumOutTokenPerRank =
+        config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken;
     // Use the output of dispatch as the input of combine
     HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, outTokBuf,
                                 maxNumOutTokenPerRank * config.hiddenDim * sizeof(T),
@@ -188,7 +200,7 @@ class EpDispatchCombineTestCase {
  private:
   void RandomIntializeNumToken() {
     EpDispatchCombineConfig& config = handle.config;
-    uniform_int_distribution<> dist(0, config.maxNumInpTokenPerRank);
+    uniform_int_distribution<> dist(1, config.maxNumInpTokenPerRank);
     numToken = dist(gen);
   }
 
@@ -241,7 +253,7 @@ class EpDispatchCombineTestCase {
 };
 
 // A simple MoE-EP dispatch kernel example, assume dp rank is equal to ep rank
-void EpDispatchWithPutMemAPI() {
+void EpDispatchWithPutMemAPI(EpDispatchCombineTestConfig testConfig) {
   int status;
 
   // Initialize shmem
@@ -253,25 +265,18 @@ void EpDispatchWithPutMemAPI() {
   int npes = ShmemNPes();
 
   // Setup config
-  EpDispatchCombineConfig config;
-  config.randomSeed = myPe;
-  config.rank = myPe;
-  config.worldSize = npes;
-  config.numExpertPerRank = 2;
-  config.hiddenDim = 4096;
-  config.numExpertPerToken = 2;
-  config.maxNumInpTokenPerRank = 32;
-  config.warpNumPerBlock = 2;
-  config.blockNum = 4;
+  testConfig.config.rank = myPe;
+  testConfig.config.worldSize = npes;
 
+  if (testConfig.config.rank == 0) std::cout << testConfig.config << std::endl;
   // Intialize EpDispatchCombineHandle
   {
     using DataType = uint32_t;
-    EpDispatchCombineHandle<DataType> handle(config);
+    EpDispatchCombineHandle<DataType> handle(testConfig.config);
 
     // Run tests
-    EpDispatchCombineTestCase<DataType> testCase(handle);
-    for (int i = 0; i < 100; i++) {
+    for (int i = 0; i < testConfig.repeat; i++) {
+      EpDispatchCombineTestCase<DataType> testCase(handle);
       testCase.RandomInitializeHandle();
       MPI_Barrier(MPI_COMM_WORLD);
       testCase.RunDispatch();
@@ -281,13 +286,36 @@ void EpDispatchWithPutMemAPI() {
       testCase.RunCombine();
       MPI_Barrier(MPI_COMM_WORLD);
       testCase.CheckCombineResult();
+      if (testConfig.config.rank == 0) std::cout << "Round " << i << " PASS" << std::endl;
     }
   }
 
   ShmemMpiFinalize();
 }
 
-int main() {
-  EpDispatchWithPutMemAPI();
+EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
+  EpDispatchCombineTestConfig testConfig;
+
+  testConfig.config.hiddenDim = 4096;
+  testConfig.config.maxNumInpTokenPerRank = 32;
+  testConfig.config.numExpertPerRank = 2;
+  testConfig.config.numExpertPerToken = 4;
+  testConfig.config.warpNumPerBlock = 4;
+  testConfig.config.blockNum = 4;
+
+  if (argc > 1) testConfig.config.hiddenDim = std::stoi(argv[1]);
+  if (argc > 2) testConfig.config.maxNumInpTokenPerRank = std::stoi(argv[2]);
+  if (argc > 3) testConfig.config.numExpertPerRank = std::stoi(argv[3]);
+  if (argc > 4) testConfig.config.numExpertPerToken = std::stoi(argv[4]);
+  if (argc > 5) testConfig.config.warpNumPerBlock = std::stoi(argv[5]);
+  if (argc > 6) testConfig.config.blockNum = std::stoi(argv[6]);
+  if (argc > 7) testConfig.repeat = std::stoi(argv[7]);
+
+  return testConfig;
+}
+
+int main(int argc, char* argv[]) {
+  EpDispatchCombineTestConfig config = ParseArguments(argc, argv);
+  EpDispatchWithPutMemAPI(config);
   return 0;
 }

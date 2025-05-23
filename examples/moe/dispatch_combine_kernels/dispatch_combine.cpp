@@ -131,7 +131,7 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
   }
   SyncIfDebugEnabled("Dispatch kernel: finished send token");
   // Make sure WarCopy is visible to other blocks
-  __threadfence();
+  __threadfence_system();
 
   // Send token num & token to expert mapping to other ranks
   for (int destPe = globalWarpId; destPe < npes; destPe += globalWarpNum) {
@@ -171,7 +171,6 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
     recvTokenNum[destPe] = *signal - 1;
   }
   SyncIfDebugEnabled("Dispatch kernel: finish waiting num token signal");
-  __threadfence_system();
 
   for (int srcPe = warpId; srcPe < npes; srcPe += warpNum) {
     for (int tokId = laneId; tokId < recvTokenNum[srcPe]; tokId += warpSize) {
@@ -224,11 +223,13 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
     uint32_t exptSortedId = accumExpertTokOffsets[localExpertId] + expertTokOff[localExpertId] - 1;
     uint32_t destTokenOff = exptSortedId * config.hiddenDim;
     WarpCopy(outTokenBuf + destTokenOff, shmemOutTokenBuf + srcTokenOff, config.hiddenDim);
+    assert((outTokenBuf[destTokenOff] != 0) && (shmemOutTokenBuf[srcTokenOff] != 0));
 
     if (laneId == 0) {
       args.exptSortedToPeSortedBuf[exptSortedId] = peSortedId;
     }
   }
+  SyncIfDebugEnabled("Dispatch kernel: kernel end");
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -284,13 +285,15 @@ __global__ void EpCombineKernel(EpDispatchCombineArgs<T> args) {
     WarpCopy(shmemInpTokenBuf + peSortedOffset, inpTokenBuf + exptSortedOffset, config.hiddenDim);
     ShmemPutTypeNbiWarp<T>(args.shmemOutTokMemObj, peerPeSortedOffset, args.shmemInpTokMemObj,
                            peSortedOffset, config.hiddenDim, destPe);
-
     if (laneId == 0) {
       uint32_t destPeCopyCnt = atomicAdd(args.gridCopyTokenBarrier + destPe, 1);
+      // printf(
+      //     "mype %d tokenId %d destPe %d out val %d in val %d inpTok val %d exptSortedOffset
+      //     %d\n", myPe, peSortedId, destPe, shmemOutTokenBuf[peerPeSortedOffset],
+      //     shmemInpTokenBuf[peSortedOffset], inpTokenBuf[exptSortedOffset], exptSortedOffset);
     }
   }
   SyncIfDebugEnabled("Combine kernel: finish recovering from expert sorted to pe sorted");
-  __threadfence();
 
   // TODO: since we don't have atomic yet, we have to wait untill all tokens are sent, then set
   // the remote flag; once we have atomic operation, we can send an atomic rdma op after each
@@ -305,6 +308,7 @@ __global__ void EpCombineKernel(EpDispatchCombineArgs<T> args) {
                              destPe);
   }
   SyncIfDebugEnabled("Combine kernel: finish sending tokens");
+  __threadfence_system();
 
   // Phase 2: recv pe sorted token, reduce accross expert and recover original order
   for (int destPe = laneId; destPe < npes; destPe += warpSize) {
@@ -329,8 +333,8 @@ __global__ void EpCombineKernel(EpDispatchCombineArgs<T> args) {
 
 template <typename T>
 __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
-  int laneId = threadIdx.x;
-  for (int destPe = laneId; destPe < args.config.worldSize; destPe += blockDim.x) {
+  int thdId = threadIdx.x;
+  for (int destPe = thdId; destPe < args.config.worldSize; destPe += blockDim.x) {
     args.recvTokenNumMemObj->template GetAs<uint32_t*>()[destPe] = 0;
     args.sendTokenNumMemObj->template GetAs<uint32_t*>()[destPe] = 0;
   }

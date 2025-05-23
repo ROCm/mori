@@ -1,18 +1,19 @@
 #pragma once
 
+#include <sstream>
+
 #include "mori/application/application.hpp"
 
 namespace mori {
 namespace moe {
 
 struct EpDispatchCombineConfig {
-  int randomSeed{0};
   int rank{0};
   int worldSize{0};
-  int numExpertPerRank{1};
   int hiddenDim{4096};
-  int numExpertPerToken{2};
   int maxNumInpTokenPerRank{128};
+  int numExpertPerRank{1};
+  int numExpertPerToken{2};
   int warpNumPerBlock{1};
   int blockNum{1};
 };
@@ -80,3 +81,21 @@ class EpDispatchCombineHandle {
 
 }  // namespace moe
 }  // namespace mori
+
+namespace std {
+
+static std::ostream& operator<<(std::ostream& s, mori::moe::EpDispatchCombineConfig config) {
+  std::stringstream ss;
+  ss << "EpDispatchCombineConfig: " << std::endl
+     << "  WorlSize: " << config.worldSize << std::endl
+     << "  hiddenDim: " << config.hiddenDim << std::endl
+     << "  maxNumInpTokenPerRank: " << config.maxNumInpTokenPerRank << std::endl
+     << "  numExpertPerRank: " << config.numExpertPerRank << std::endl
+     << "  numExpertPerToken: " << config.numExpertPerToken << std::endl
+     << "  warpNumPerBlock: " << config.warpNumPerBlock << std::endl
+     << "  blockNum: " << config.blockNum;
+  s << ss.str();
+  return s;
+}
+
+}  // namespace std
