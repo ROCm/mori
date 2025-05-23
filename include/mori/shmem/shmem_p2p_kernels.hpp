@@ -37,7 +37,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe) {
   uint8_t* srcPtr = reinterpret_cast<uint8_t*>(val);
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
-  core::ThreadCopy<uint8_t>(destPtr, srcPtr, bytes);
+  core::ThreadCopyAtomic<uint8_t>(destPtr, srcPtr, bytes);
 }
 
 template <>
@@ -45,7 +45,7 @@ inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe) {
   uint8_t* srcPtr = reinterpret_cast<uint8_t*>(val);
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
-  core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
+  core::WarpCopyAtomic<uint8_t>(destPtr, srcPtr, bytes);
 }
 
 /* ---------------------------------------------------------------------------------------------- */

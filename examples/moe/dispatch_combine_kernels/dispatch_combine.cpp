@@ -168,7 +168,7 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
   for (int destPe = laneId; destPe < npes; destPe += warpSize) {
     uint32_t* signal = args.recvTokenNumMemObj->template GetAs<uint32_t*>() + destPe;
     ShmemUint32WaitUntilGreaterThan(signal, 0);
-    recvTokenNum[destPe] = *signal - 1;
+    recvTokenNum[destPe] = AtomicLoadRelaxedSystem(signal) - 1;
   }
   SyncIfDebugEnabled("Dispatch kernel: finish waiting num token signal");
 
@@ -213,7 +213,6 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
     if (laneId == 0) {
       expertTokOff[localExpertId] += 1;
     }
-
     if ((i % globalWarpNum) != globalWarpId) continue;  // skip token not assigned for this warp
 
     // Copy token
@@ -223,7 +222,6 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
     uint32_t exptSortedId = accumExpertTokOffsets[localExpertId] + expertTokOff[localExpertId] - 1;
     uint32_t destTokenOff = exptSortedId * config.hiddenDim;
     WarpCopy(outTokenBuf + destTokenOff, shmemOutTokenBuf + srcTokenOff, config.hiddenDim);
-    assert((outTokenBuf[destTokenOff] != 0) && (shmemOutTokenBuf[srcTokenOff] != 0));
 
     if (laneId == 0) {
       args.exptSortedToPeSortedBuf[exptSortedId] = peSortedId;
@@ -287,10 +285,6 @@ __global__ void EpCombineKernel(EpDispatchCombineArgs<T> args) {
                            peSortedOffset, config.hiddenDim, destPe);
     if (laneId == 0) {
       uint32_t destPeCopyCnt = atomicAdd(args.gridCopyTokenBarrier + destPe, 1);
-      // printf(
-      //     "mype %d tokenId %d destPe %d out val %d in val %d inpTok val %d exptSortedOffset
-      //     %d\n", myPe, peSortedId, destPe, shmemOutTokenBuf[peerPeSortedOffset],
-      //     shmemInpTokenBuf[peSortedOffset], inpTokenBuf[exptSortedOffset], exptSortedOffset);
     }
   }
   SyncIfDebugEnabled("Combine kernel: finish recovering from expert sorted to pe sorted");
@@ -448,7 +442,10 @@ template <typename T>
 void EpDispatchCombineHandle<T>::LaunchDispatch() {
   dim3 grid(config.blockNum);
   dim3 block(warpSize * config.warpNumPerBlock);
-  size_t sharedMemSize = 2 * config.worldSize * config.warpNumPerBlock * sizeof(uint32_t);
+  size_t sharedMemSize =
+      (config.worldSize * config.warpNumPerBlock +
+       config.numExpertPerRank * config.warpNumPerBlock + config.numExpertPerRank) *
+      sizeof(uint32_t);
   EpDispatchKernel<<<grid, block, sharedMemSize>>>(GetEpDispatchCombineArgs(*this));
 }
 

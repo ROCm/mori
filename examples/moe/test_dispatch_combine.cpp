@@ -53,19 +53,6 @@ class EpDispatchCombineTestCase {
     free(inpTokBufCpu);
   }
 
-  void CompareToken(T* expected, T* got, uint32_t hiddenDim, std::string msg) {
-    for (int k = 0; k < hiddenDim; k++) {
-      T expectedVal = expected[k];
-      T gotVal = got[k];
-      bool equal = (expectedVal == gotVal);
-      if (!equal) {
-        std::cout << "Wrong result at pos " << k << ": " << msg << " expected " << expectedVal
-                  << " got " << gotVal << std::endl;
-        assert(false);
-      }
-    }
-  };
-
   void RandomInitializeHandle() {
     handle.LaunchReset();
     RandomIntializeNumToken();
@@ -152,10 +139,16 @@ class EpDispatchCombineTestCase {
       std::stringstream msg;
       msg << "mype " << config.rank << " localTokId " << localTokId << " srcpe " << srcPe
           << " srcTokId " << srcTokId;
-      CompareToken(srcTokBuf, localTokBuf, config.hiddenDim, msg.str());
-      // printf("mype %d loalTokId %d srcPe %d val %d exptSotredOffset %d \n", config.rank,
-      // localTokId,
-      //        srcPe, localTokBuf[0], localTokId * config.hiddenDim);
+      for (int k = 0; k < config.hiddenDim; k++) {
+        T expectedVal = srcTokBuf[k];
+        T gotVal = localTokBuf[k];
+        bool equal = (expectedVal == gotVal);
+        if (!equal) {
+          std::cout << "Wrong result at pos " << k << ": " << msg.str() << " expected "
+                    << expectedVal << " got " << gotVal << std::endl;
+          assert(false);
+        }
+      }
     }
 
     free(globalInpTokBufCpu);
