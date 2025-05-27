@@ -113,6 +113,7 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
     uint32_t peTokenIdx = peTokenOffset[destPe];
     if (laneId == 0) {
       atomicAdd(peTokenOffset + destPe, 1);
+      assert(destPe < npes);  // for debug purpose
       inpTokToExptBuf[destPe * maxNumOutTokenPerRank + peTokenIdx] = destExpert;
     }
 
@@ -133,6 +134,7 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
       uint32_t destPeCopyCnt = atomicAdd(args.gridCopyTokenBarrier + destPe, 1);
     }
   }
+
   SyncIfDebugEnabled("Dispatch kernel: finished send token");
   // Make sure WarCopy is visible to other blocks
   __threadfence_system();

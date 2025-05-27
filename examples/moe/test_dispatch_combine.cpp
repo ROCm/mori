@@ -1,3 +1,4 @@
+#include <getopt.h>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
 #include <mpi.h>
@@ -24,6 +25,11 @@ enum DataType {
   FP8_E4M3 = 2,
 };
 
+enum TestType {
+  Accuracy = 0,
+  Benchmark = 1,
+};
+
 namespace std {
 static std::ostream& operator<<(std::ostream& s, DataType dataType) {
   if (dataType == DataType::FP32) {
@@ -37,24 +43,37 @@ static std::ostream& operator<<(std::ostream& s, DataType dataType) {
   }
   return s;
 };
+
+static std::ostream& operator<<(std::ostream& s, TestType testType) {
+  if (testType == TestType::Accuracy) {
+    s << "accuracy";
+  } else if (testType == TestType::Benchmark) {
+    s << "benchmark";
+  } else {
+    assert(false);
+  }
+  return s;
+};
 }  // namespace std
 
-struct AccuracyConfig {
+struct RunConfig {
+  TestType testType{Accuracy};
+  int warmup{3};
+  int repeat{5};
   float atol{1e-2};
 };
 
 struct EpDispatchCombineTestConfig {
   DataType dataType{DataType::BF16};
-  int repeat{10};
-  AccuracyConfig accConfig;
+  RunConfig runConfig;
   EpDispatchCombineConfig config;
 };
 
 template <typename T>
 class EpDispatchCombineTestCase {
  public:
-  EpDispatchCombineTestCase(EpDispatchCombineHandle<T>& handle, AccuracyConfig accConfig)
-      : handle(handle), accConfig(accConfig) {
+  EpDispatchCombineTestCase(EpDispatchCombineHandle<T>& handle, RunConfig runConfig)
+      : handle(handle), runConfig(runConfig) {
     const auto timestamp = std::chrono::system_clock::now();
     gen = mt19937(
         std::chrono::duration_cast<std::chrono::seconds>(timestamp.time_since_epoch()).count() +
@@ -88,20 +107,28 @@ class EpDispatchCombineTestCase {
     free(inpTokBufCpu);
   }
 
-  void RandomInitializeHandle() {
+  void InitializeHandle() {
     handle.LaunchReset();
-    RandomIntializeNumToken();
-    RandomIntializeDispatchAndWeights();
+    if (runConfig.testType == TestType::Accuracy) {
+      RandomInitializeNumToken();
+      RandomInitializeDispatch();
+    } else if (runConfig.testType == TestType::Benchmark) {
+      InitializeNumToken();
+      RandomInitializeDispatch();
+    } else {
+      assert(false);
+    }
+    RandomInitializeWeights();
     RandomInitializeToken();
     handle.PrepareInference(inpTokBuf, outTokBuf, weightsBuf, tokenIndicies, numToken);
     // PrintDispatch();
+    // PrintDispatchStats();
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   }
 
   void RunDispatch() {
     handle.LaunchDispatch();
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    int tokenNumSignalSize = handle.config.worldSize * sizeof(uint32_t);
   }
 
   void CheckDispatchResult() {
@@ -222,7 +249,7 @@ class EpDispatchCombineTestCase {
       for (int j = 0; j < config.hiddenDim; j++) {
         float expected = float(reinterpret_cast<T*>(inpTokBufCpu)[tokenOffset + j]) * weightSum;
         float got = float(handle.outTokenBuf[tokenOffset + j]);
-        if (abs(got - expected) > accConfig.atol) {
+        if (abs(got - expected) > runConfig.atol) {
           std::cout << "Wrong result at pos " << j << ": mype " << config.rank << " tokenId " << i
                     << " expected " << expected << " got " << got << " weight sum " << weightSum
                     << std::endl;
@@ -233,39 +260,47 @@ class EpDispatchCombineTestCase {
   }
 
  private:
-  void RandomIntializeNumToken() {
+  void RandomInitializeNumToken() {
     EpDispatchCombineConfig& config = handle.config;
     uniform_int_distribution<> dist(1, config.maxNumInpTokenPerRank);
     numToken = dist(gen);
   }
 
-  void RandomIntializeDispatchAndWeights() {
+  void InitializeNumToken() {
+    EpDispatchCombineConfig& config = handle.config;
+    numToken = config.maxNumInpTokenPerRank;
+  }
+
+  void RandomInitializeDispatch() {
     EpDispatchCombineConfig& config = handle.config;
     std::vector<int> epRange;
     for (int i = 0; i < config.worldSize * config.numExpertPerRank; i++) epRange.push_back(i);
 
-    uniform_real_distribution<> tokValDist(1, 2);
+    std::vector<int> rankCount(config.worldSize, 0);
+
     for (int i = 0; i < numToken; i++) {
       std::shuffle(epRange.begin(), epRange.end(), gen);
       for (int j = 0; j < config.numExpertPerToken; j++) {
+        assert(epRange[j] < config.numExpertPerRank * config.worldSize);
         tokenIndicies[i * config.numExpertPerRank + j] = epRange[j];
-        weightsBuf[i * config.numExpertPerRank + j] = tokValDist(gen);
+        int rank = epRange[j] / config.numExpertPerRank;
+        rankCount[rank]++;
       }
+    }
+
+    for (int i = 0; i < config.worldSize; i++) {
+      std::cout << " Dispatch " << rankCount[i] << " tokens to rank " << i << std::endl;
     }
   }
 
-  void PrintDispatch() {
+  void RandomInitializeWeights() {
     EpDispatchCombineConfig& config = handle.config;
-    stringstream ss;
-    for (int i = 0; i < handle.curRankNumToken; i++) {
-      ss << "  Token " << i << " dispatch to ";
+    uniform_real_distribution<> tokValDist(1, 2);
+    for (int i = 0; i < numToken; i++) {
       for (int j = 0; j < config.numExpertPerToken; j++) {
-        ss << handle.tokenIndicies[i * config.numExpertPerRank + j] << " ";
+        weightsBuf[i * config.numExpertPerRank + j] = tokValDist(gen);
       }
-      ss << std::endl;
     }
-    std::cout << "Rank " << config.rank << ":" << std::endl;
-    std::cout << ss.str() << std::endl;
   }
 
   void RandomInitializeToken() {
@@ -275,6 +310,20 @@ class EpDispatchCombineTestCase {
     for (int i = 0; i < inpTokEleNum; i++) {
       reinterpret_cast<T*>(inpTokBuf)[i] = tokValDist(gen);
     }
+  }
+
+  void PrintDispatch() {
+    EpDispatchCombineConfig& config = handle.config;
+    stringstream ss;
+    for (int i = 0; i < handle.curRankNumToken; i++) {
+      ss << "  Token " << i << " dispatch to ";
+      for (int j = 0; j < config.numExpertPerToken; j++) {
+        ss << tokenIndicies[i * config.numExpertPerRank + j] << " ";
+      }
+      ss << std::endl;
+    }
+    std::cout << "Rank " << config.rank << ":" << std::endl;
+    std::cout << ss.str() << std::endl;
   }
 
  private:
@@ -288,8 +337,7 @@ class EpDispatchCombineTestCase {
   uint32_t* tokenIndicies{nullptr};
   int numToken{-1};
   EpDispatchCombineHandle<T>& handle;
-
-  AccuracyConfig accConfig;
+  RunConfig runConfig;
 };
 
 // A simple MoE-EP dispatch kernel example, assume dp rank is equal to ep rank
@@ -308,13 +356,13 @@ void EpDispatchWithPutMemAPI(EpDispatchCombineTestConfig testConfig) {
   using DType = float;
   if (testConfig.dataType == DataType::FP32) {
     using DType = float;
-    testConfig.accConfig.atol = 1e-3;
+    testConfig.runConfig.atol = 1e-3;
   } else if (testConfig.dataType == DataType::BF16) {
     using DType = hip_bfloat16;
-    testConfig.accConfig.atol = 1e-1;
+    testConfig.runConfig.atol = 1e-1;
   } else if (testConfig.dataType == DataType::FP8_E4M3) {
     using DType = __hip_fp8_e4m3_fnuz;
-    testConfig.accConfig.atol = 3e-1;
+    testConfig.runConfig.atol = 3e-1;
   } else {
     std::cout << "Unknown datatype: " << testConfig.dataType << std::endl;
     assert(false);
@@ -324,7 +372,8 @@ void EpDispatchWithPutMemAPI(EpDispatchCombineTestConfig testConfig) {
   testConfig.config.worldSize = npes;
   if (testConfig.config.rank == 0) {
     std::cout << "DataType: " << testConfig.dataType << std::endl;
-    std::cout << "Atol: " << testConfig.accConfig.atol << std::endl;
+    std::cout << "TestType: " << testConfig.runConfig.testType << std::endl;
+    std::cout << "Atol: " << testConfig.runConfig.atol << std::endl;
     std::cout << testConfig.config << std::endl;
   }
 
@@ -333,9 +382,9 @@ void EpDispatchWithPutMemAPI(EpDispatchCombineTestConfig testConfig) {
     EpDispatchCombineHandle<DType> handle(testConfig.config);
 
     // Run tests
-    for (int i = 0; i < testConfig.repeat; i++) {
-      EpDispatchCombineTestCase<DType> testCase(handle, testConfig.accConfig);
-      testCase.RandomInitializeHandle();
+    for (int i = 0; i < testConfig.runConfig.repeat; i++) {
+      EpDispatchCombineTestCase<DType> testCase(handle, testConfig.runConfig);
+      testCase.InitializeHandle();
       MPI_Barrier(MPI_COMM_WORLD);
       testCase.RunDispatch();
       MPI_Barrier(MPI_COMM_WORLD);
@@ -354,22 +403,76 @@ void EpDispatchWithPutMemAPI(EpDispatchCombineTestConfig testConfig) {
 EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
   EpDispatchCombineTestConfig testConfig;
 
-  testConfig.config.hiddenDim = 4096;
-  testConfig.config.maxNumInpTokenPerRank = 32;
-  testConfig.config.numExpertPerRank = 2;
-  testConfig.config.numExpertPerToken = 4;
-  testConfig.config.warpNumPerBlock = 4;
-  testConfig.config.blockNum = 4;
+  static struct option long_options[] = {{"help", no_argument, NULL, 'h'},
+                                         {"cmd", required_argument, NULL, 0},
+                                         {"data_type", required_argument, NULL, 0},
+                                         {"hdim", optional_argument, NULL, 'd'},
+                                         {"max_tokens", optional_argument, NULL, 'm'},
+                                         {"expert_per_rank", optional_argument, NULL, 'r'},
+                                         {"expert_per_token", optional_argument, NULL, 't'},
+                                         {"warp_per_blk", optional_argument, NULL, 'w'},
+                                         {"block_num", optional_argument, NULL, 'b'},
+                                         {"num", optional_argument, NULL, 'n'},
+                                         {0, 0, 0, 0}};
+  int option_index = 0;
+  int opt;
+  while ((opt = getopt_long(argc, argv, "d::m::r::t::w::b::n::h", long_options, &option_index)) !=
+         -1) {
+    if (opt == -1) break;
 
-  if (argc > 1) testConfig.config.hiddenDim = std::stoi(argv[1]);
-  if (argc > 2) testConfig.config.maxNumInpTokenPerRank = std::stoi(argv[2]);
-  if (argc > 3) testConfig.config.numExpertPerRank = std::stoi(argv[3]);
-  if (argc > 4) testConfig.config.numExpertPerToken = std::stoi(argv[4]);
-  if (argc > 5) testConfig.config.warpNumPerBlock = std::stoi(argv[5]);
-  if (argc > 6) testConfig.config.blockNum = std::stoi(argv[6]);
-  if (argc > 7) testConfig.dataType = DataType(std::stoi(argv[7]));
-  if (argc > 8) testConfig.repeat = std::stoi(argv[8]);
-
+    switch (opt) {
+      case 0:
+        if (strcmp(long_options[option_index].name, "cmd") == 0) {
+          if (strcmp(optarg, "test") == 0) {
+            testConfig.runConfig.testType = TestType::Accuracy;
+          } else if (strcmp(optarg, "bench") == 0) {
+            testConfig.runConfig.testType = TestType::Benchmark;
+          } else {
+            printf("Unknown cmd: %s, must be 'test' or 'bench'\n", optarg);
+            assert(false);
+          }
+        } else if (strcmp(long_options[option_index].name, "data_type") == 0) {
+          if (strcmp(optarg, "fp32") == 0) {
+            testConfig.dataType = DataType::FP32;
+          } else if (strcmp(optarg, "bf16") == 0) {
+            testConfig.dataType = DataType::BF16;
+          } else if (strcmp(optarg, "fp8") == 0) {
+            testConfig.dataType = DataType::FP8_E4M3;
+          } else {
+            printf("Unknown cmd: %s, must be 'test' or 'bench'\n", optarg);
+            assert(false);
+          }
+        }
+        break;
+      case 'd':
+        testConfig.config.hiddenDim = std::stoi(optarg);
+        break;
+      case 'm':
+        testConfig.config.maxNumInpTokenPerRank = std::stoi(optarg);
+        break;
+      case 'r':
+        testConfig.config.numExpertPerRank = std::stoi(optarg);
+        break;
+      case 't':
+        testConfig.config.numExpertPerToken = std::stoi(optarg);
+        break;
+      case 'w':
+        testConfig.config.warpNumPerBlock = std::stoi(optarg);
+        break;
+      case 'b':
+        testConfig.config.blockNum = std::stoi(optarg);
+        break;
+      case 'n':
+        testConfig.runConfig.repeat = std::stoi(optarg);
+        break;
+      case 'h':
+        printf("This is help message\n");
+        break;
+      default:
+        fprintf(stderr, "Unknown error in getopt_long\n");
+        return {};
+    }
+  }
   return testConfig;
 }
 
