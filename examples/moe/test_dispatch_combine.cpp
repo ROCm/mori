@@ -1,3 +1,4 @@
+#include <hip/hip_bfloat16.h>
 #include <mpi.h>
 
 #include <algorithm>
@@ -16,15 +17,21 @@ using namespace mori::core;
 using namespace mori::application;
 using namespace mori::shmem;
 
+struct AccuracyConfig {
+  float atol{1e-2};
+};
+
 struct EpDispatchCombineTestConfig {
   int repeat{10};
+  AccuracyConfig accConfig;
   EpDispatchCombineConfig config;
 };
 
 template <typename T>
 class EpDispatchCombineTestCase {
  public:
-  EpDispatchCombineTestCase(EpDispatchCombineHandle<T>& handle) : handle(handle) {
+  EpDispatchCombineTestCase(EpDispatchCombineHandle<T>& handle, AccuracyConfig accConfig)
+      : handle(handle), accConfig(accConfig) {
     const auto timestamp = std::chrono::system_clock::now();
     gen = mt19937(
         std::chrono::duration_cast<std::chrono::seconds>(timestamp.time_since_epoch()).count() +
@@ -44,22 +51,27 @@ class EpDispatchCombineTestCase {
         config.maxNumInpTokenPerRank * config.numExpertPerToken * sizeof(uint32_t);
     HIP_RUNTIME_CHECK(hipMalloc(&tokenIndicies, tokenIndiciesSize));
     HIP_RUNTIME_CHECK(hipMemset(tokenIndicies, 0, tokenIndiciesSize));
+
+    int weightsBufSize = config.maxNumInpTokenPerRank * config.numExpertPerToken * sizeof(float);
+    HIP_RUNTIME_CHECK(hipMalloc(&weightsBuf, weightsBufSize));
+    HIP_RUNTIME_CHECK(hipMemset(weightsBuf, 0, weightsBufSize));
   }
 
   ~EpDispatchCombineTestCase() {
     HIP_RUNTIME_CHECK(hipFree(inpTokBuf));
     HIP_RUNTIME_CHECK(hipFree(outTokBuf));
     HIP_RUNTIME_CHECK(hipFree(tokenIndicies));
+    HIP_RUNTIME_CHECK(hipFree(weightsBuf));
     free(inpTokBufCpu);
   }
 
   void RandomInitializeHandle() {
     handle.LaunchReset();
     RandomIntializeNumToken();
-    RandomIntializeDispatch();
+    RandomIntializeDispatchAndWeights();
     RandomInitializeToken();
-    handle.PrepareInference(inpTokBuf, outTokBuf, tokenIndicies, numToken);
-    PrintDispatch();
+    handle.PrepareInference(inpTokBuf, outTokBuf, weightsBuf, tokenIndicies, numToken);
+    // PrintDispatch();
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   }
 
@@ -178,12 +190,20 @@ class EpDispatchCombineTestCase {
 
     for (int i = 0; i < handle.curRankNumToken; i++) {
       uint32_t tokenOffset = i * config.hiddenDim;
+
+      // compute weight sum
+      float weightSum = 0.0f;
+      for (int k = 0; k < config.numExpertPerToken; k++)
+        weightSum += weightsBuf[i * config.numExpertPerToken + k];
+
       for (int j = 0; j < config.hiddenDim; j++) {
-        T expected = reinterpret_cast<T*>(inpTokBufCpu)[tokenOffset + j] * config.numExpertPerToken;
+        T expected = reinterpret_cast<T*>(inpTokBufCpu)[tokenOffset + j] * weightSum;
         T got = handle.outTokenBuf[tokenOffset + j];
-        if (got != expected) {
-          printf("Wrong result at pos %d: mype %d tokenId %d expected %d got %d\n", j, config.rank,
-                 i, expected, got);
+        if (abs(got - expected) > accConfig.atol) {
+          std::cout << "Wrong result at pos " << j << ": mype " << config.rank << " tokenId " << i
+                    << " expected " << expected << " got " << got << " weight sum " << weightSum
+                    << " token value " << reinterpret_cast<T*>(inpTokBufCpu)[tokenOffset + j]
+                    << std::endl;
           assert(false);
         }
       }
@@ -197,15 +217,17 @@ class EpDispatchCombineTestCase {
     numToken = dist(gen);
   }
 
-  void RandomIntializeDispatch() {
+  void RandomIntializeDispatchAndWeights() {
     EpDispatchCombineConfig& config = handle.config;
     std::vector<int> epRange;
     for (int i = 0; i < config.worldSize * config.numExpertPerRank; i++) epRange.push_back(i);
 
+    uniform_real_distribution<> tokValDist(1, 2);
     for (int i = 0; i < numToken; i++) {
       std::shuffle(epRange.begin(), epRange.end(), gen);
       for (int j = 0; j < config.numExpertPerToken; j++) {
         tokenIndicies[i * config.numExpertPerRank + j] = epRange[j];
+        weightsBuf[i * config.numExpertPerRank + j] = tokValDist(gen);
       }
     }
   }
@@ -227,7 +249,7 @@ class EpDispatchCombineTestCase {
   void RandomInitializeToken() {
     EpDispatchCombineConfig& config = handle.config;
     int inpTokEleNum = config.maxNumInpTokenPerRank * config.hiddenDim;
-    uniform_int_distribution<> tokValDist(1, config.hiddenDim);
+    uniform_real_distribution<> tokValDist(0, 1);
     for (int i = 0; i < inpTokEleNum; i++) {
       reinterpret_cast<T*>(inpTokBuf)[i] = tokValDist(gen);
     }
@@ -240,9 +262,12 @@ class EpDispatchCombineTestCase {
   T* inpTokBuf{nullptr};
   T* inpTokBufCpu{nullptr};
   T* outTokBuf{nullptr};
+  float* weightsBuf{nullptr};
   uint32_t* tokenIndicies{nullptr};
   int numToken{-1};
   EpDispatchCombineHandle<T>& handle;
+
+  AccuracyConfig accConfig;
 };
 
 // A simple MoE-EP dispatch kernel example, assume dp rank is equal to ep rank
@@ -260,16 +285,17 @@ void EpDispatchWithPutMemAPI(EpDispatchCombineTestConfig testConfig) {
   // Setup config
   testConfig.config.rank = myPe;
   testConfig.config.worldSize = npes;
+  testConfig.accConfig.atol = 1e-3;
 
   if (testConfig.config.rank == 0) std::cout << testConfig.config << std::endl;
   // Intialize EpDispatchCombineHandle
   {
-    using DataType = uint32_t;
+    using DataType = float;
     EpDispatchCombineHandle<DataType> handle(testConfig.config);
 
     // Run tests
     for (int i = 0; i < testConfig.repeat; i++) {
-      EpDispatchCombineTestCase<DataType> testCase(handle);
+      EpDispatchCombineTestCase<DataType> testCase(handle, testConfig.accConfig);
       testCase.RandomInitializeHandle();
       MPI_Barrier(MPI_COMM_WORLD);
       testCase.RunDispatch();

@@ -103,5 +103,32 @@ __device__ void WarpAccum(T* accum, T* src, size_t nelems) {
   }
 }
 
+template <typename T>
+__device__ void WarpAccum(T* accum, T* src, float srcScale, size_t nelems) {
+  constexpr int vecSize = 16 / sizeof(T);
+  int laneId = threadIdx.x & (warpSize - 1);
+  int offset = laneId * vecSize;
+
+  while ((offset + vecSize) < nelems) {
+    float accumValFp32[vecSize];
+    uint4 srcVals = reinterpret_cast<uint4*>(src + offset)[0];
+    uint4 accumVals = reinterpret_cast<uint4*>(accum + offset)[0];
+    for (int i = 0; i < vecSize; i++) accumValFp32[i] = float(reinterpret_cast<T*>(&accumVals)[i]);
+    for (int i = 0; i < vecSize; i++) {
+      float srcVal = float(reinterpret_cast<T*>(&srcVals)[i]);
+      accumValFp32[i] += srcVal * srcScale;
+    }
+    for (int i = 0; i < vecSize; i++) reinterpret_cast<T*>(&accumVals)[i] = T(accumValFp32[i]);
+    reinterpret_cast<uint4*>(accum + offset)[0] = accumVals;
+    offset += warpSize * vecSize;
+  }
+
+  while (offset < nelems) {
+    float accumVal = float(accum[offset]);
+    accum[offset] = T(accumVal + float(src[offset]) * srcScale);
+    offset += 1;
+  }
+}
+
 }  // namespace core
 }  // namespace mori

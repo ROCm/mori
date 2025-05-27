@@ -24,9 +24,11 @@ class EpDispatchCombineHandle {
   EpDispatchCombineHandle(EpDispatchCombineConfig config);
   ~EpDispatchCombineHandle();
 
-  void PrepareInference(T* input, T* output, uint32_t* tokenIndicies, int numToken) {
+  void PrepareInference(T* input, T* output, float* weights, uint32_t* tokenIndicies,
+                        int numToken) {
     this->inpTokenBuf = input;
     this->outTokenBuf = output;
+    this->weightsBuf = weights;
     this->tokenIndicies = tokenIndicies;
     this->curRankNumToken = numToken;
   }
@@ -60,6 +62,7 @@ class EpDispatchCombineHandle {
   // Kernel input/output buffer
   T* inpTokenBuf{nullptr};
   T* outTokenBuf{nullptr};
+  float* weightsBuf{nullptr};
   // Temporary buffers of input/output tokens used for shmem ops
   mori::application::SymmMemObjPtr shmemInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;

@@ -1,5 +1,6 @@
 #include "dispatch_combine_kernels/dispatch_combine.hpp"
 
+#include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
 
@@ -33,6 +34,7 @@ struct EpDispatchCombineArgs {
   uint32_t* tokenIndicies{nullptr};
   T* inpTokenBuf{nullptr};
   T* outTokenBuf{nullptr};
+  float* weightsBuf{nullptr};
   SymmMemObjPtr shmemInpTokMemObj;
   SymmMemObjPtr shmemOutTokMemObj;
   SymmMemObjPtr recvTokenNumMemObj;
@@ -53,6 +55,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<
   args.tokenIndicies = handle.tokenIndicies;
   args.inpTokenBuf = handle.inpTokenBuf;
   args.outTokenBuf = handle.outTokenBuf;
+  args.weightsBuf = handle.weightsBuf;
   args.shmemInpTokMemObj = handle.shmemInpTokMemObj;
   args.shmemOutTokMemObj = handle.shmemOutTokMemObj;
   args.recvTokenNumMemObj = handle.recvTokenNumMemObj;
@@ -317,10 +320,11 @@ __global__ void EpCombineKernel(EpDispatchCombineArgs<T> args) {
 
     uint32_t tokenOffset = i * config.hiddenDim;
     for (int j = 0; j < config.numExpertPerToken; j++) {
-      uint32_t peSortedId = args.tokenIndicesToPeSortedBuf[i * config.numExpertPerToken + j];
+      uint32_t tokExptId = i * config.numExpertPerToken + j;
+      uint32_t peSortedId = args.tokenIndicesToPeSortedBuf[tokExptId];
       uint32_t peSortedOffset = peSortedId * config.hiddenDim;
       WarpAccum(args.outTokenBuf + tokenOffset, shmemOutTokenBuf + peSortedOffset,
-                config.hiddenDim);
+                args.weightsBuf[tokExptId], config.hiddenDim);
     }
   }
 }
@@ -462,8 +466,8 @@ void EpDispatchCombineHandle<T>::LaunchReset() {
   EpDispatchCombineResetKernel<<<1, config.worldSize>>>(GetEpDispatchCombineArgs(*this));
 }
 
-template class EpDispatchCombineHandle<uint16_t>;
-template class EpDispatchCombineHandle<uint32_t>;
+template class EpDispatchCombineHandle<float>;
+template class EpDispatchCombineHandle<hip_bfloat16>;
 
 }  // namespace moe
 }  // namespace mori
