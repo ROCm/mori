@@ -1,6 +1,7 @@
 #include "dispatch_combine_kernels/dispatch_combine.hpp"
 
 #include <hip/hip_bfloat16.h>
+#include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
 
@@ -314,18 +315,22 @@ __global__ void EpCombineKernel(EpDispatchCombineArgs<T> args) {
   }
   SyncIfDebugEnabled("Combine kernel: finish waiting num token signal");
 
+  extern __shared__ char sharedMem[];
+  T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
+
   T* outTokenBuf = args.outTokenBuf;
   for (int i = 0; i < args.curRankNumToken; i++) {
     if ((i % globalWarpNum) != globalWarpId) continue;
 
-    uint32_t tokenOffset = i * config.hiddenDim;
     for (int j = 0; j < config.numExpertPerToken; j++) {
-      uint32_t tokExptId = i * config.numExpertPerToken + j;
-      uint32_t peSortedId = args.tokenIndicesToPeSortedBuf[tokExptId];
+      uint32_t peSortedId = args.tokenIndicesToPeSortedBuf[i * config.numExpertPerToken + j];
       uint32_t peSortedOffset = peSortedId * config.hiddenDim;
-      WarpAccum(args.outTokenBuf + tokenOffset, shmemOutTokenBuf + peSortedOffset,
-                args.weightsBuf[tokExptId], config.hiddenDim);
+      srcPtrs[j] = shmemOutTokenBuf + peSortedOffset;
     }
+
+    WarpAccum(args.outTokenBuf + i * config.hiddenDim, srcPtrs,
+              args.weightsBuf + i * config.numExpertPerToken, config.numExpertPerToken,
+              config.hiddenDim);
   }
 }
 
@@ -457,7 +462,7 @@ template <typename T>
 void EpDispatchCombineHandle<T>::LaunchCombine() {
   dim3 grid(config.blockNum);
   dim3 block(warpSize * config.warpNumPerBlock);
-  size_t sharedMemSize = 2 * config.worldSize * config.warpNumPerBlock * sizeof(uint32_t);
+  size_t sharedMemSize = config.warpNumPerBlock * config.numExpertPerToken * sizeof(T**);
   EpCombineKernel<<<grid, block, sharedMemSize>>>(GetEpDispatchCombineArgs(*this));
 }
 
@@ -468,6 +473,7 @@ void EpDispatchCombineHandle<T>::LaunchReset() {
 
 template class EpDispatchCombineHandle<float>;
 template class EpDispatchCombineHandle<hip_bfloat16>;
+template class EpDispatchCombineHandle<__hip_fp8_e4m3_fnuz>;
 
 }  // namespace moe
 }  // namespace mori

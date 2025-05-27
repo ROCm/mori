@@ -8,7 +8,7 @@ __device__ void ThreadCopy(T* dst, T* src, size_t nelems) {
   constexpr int vecSize = 16 / sizeof(T);
   int offset = 0;
 
-  while ((offset + vecSize) < nelems) {
+  while ((offset + vecSize) <= nelems) {
     reinterpret_cast<uint4*>(dst + offset)[0] = reinterpret_cast<uint4*>(src + offset)[0];
     offset += vecSize;
   }
@@ -36,7 +36,7 @@ __device__ void WarpCopy(T* dst, T* src, size_t nelems) {
   int laneId = threadIdx.x & (warpSize - 1);
   int offset = laneId * vecSize;
 
-  while ((offset + vecSize) < nelems) {
+  while ((offset + vecSize) <= nelems) {
     reinterpret_cast<uint4*>(dst + offset)[0] = reinterpret_cast<uint4*>(src + offset)[0];
     offset += warpSize * vecSize;
   }
@@ -87,7 +87,7 @@ __device__ void WarpAccum(T* accum, T* src, size_t nelems) {
   int laneId = threadIdx.x & (warpSize - 1);
   int offset = laneId * vecSize;
 
-  while ((offset + vecSize) < nelems) {
+  while ((offset + vecSize) <= nelems) {
     uint4 srcVal = reinterpret_cast<uint4*>(src + offset)[0];
     uint4 accumVal = reinterpret_cast<uint4*>(accum + offset)[0];
     for (int i = 0; i < vecSize; i++) {
@@ -103,29 +103,40 @@ __device__ void WarpAccum(T* accum, T* src, size_t nelems) {
   }
 }
 
+// Accumulate multiple buffers
 template <typename T>
-__device__ void WarpAccum(T* accum, T* src, float srcScale, size_t nelems) {
+__device__ void WarpAccum(T* dest, T** srcs, float* srcScales, size_t accumNum, size_t nelems) {
   constexpr int vecSize = 16 / sizeof(T);
   int laneId = threadIdx.x & (warpSize - 1);
   int offset = laneId * vecSize;
 
-  while ((offset + vecSize) < nelems) {
-    float accumValFp32[vecSize];
-    uint4 srcVals = reinterpret_cast<uint4*>(src + offset)[0];
-    uint4 accumVals = reinterpret_cast<uint4*>(accum + offset)[0];
-    for (int i = 0; i < vecSize; i++) accumValFp32[i] = float(reinterpret_cast<T*>(&accumVals)[i]);
-    for (int i = 0; i < vecSize; i++) {
-      float srcVal = float(reinterpret_cast<T*>(&srcVals)[i]);
-      accumValFp32[i] += srcVal * srcScale;
+  while ((offset + vecSize) <= nelems) {
+    float accumValFp32[vecSize] = {0};
+
+    for (int i = 0; i < accumNum; i++) {
+      uint4 srcVals = reinterpret_cast<uint4*>(srcs[i] + offset)[0];
+      float srcScale = srcScales[i];
+      for (int j = 0; j < vecSize; j++) {
+        float srcVal = float(reinterpret_cast<T*>(&srcVals)[j]);
+        accumValFp32[j] += srcVal * srcScale;
+      }
     }
-    for (int i = 0; i < vecSize; i++) reinterpret_cast<T*>(&accumVals)[i] = T(accumValFp32[i]);
-    reinterpret_cast<uint4*>(accum + offset)[0] = accumVals;
-    offset += warpSize * vecSize;
+
+    uint4 accumVals;
+    for (int i = 0; i < vecSize; i++) {
+      float accumVal = accumValFp32[i];
+      reinterpret_cast<T*>(&accumVals)[i] = T(accumVal);
+    }
+    reinterpret_cast<uint4*>(dest + offset)[0] = accumVals;
+
+    offset += vecSize;
   }
 
   while (offset < nelems) {
-    float accumVal = float(accum[offset]);
-    accum[offset] = T(accumVal + float(src[offset]) * srcScale);
+    float accumValFp32 = 0;
+    for (int i = 0; i < accumNum; i++) {
+      dest[offset] = T(float(srcs[i][offset]) * srcScales[i]);
+    }
     offset += 1;
   }
 }

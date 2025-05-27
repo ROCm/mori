@@ -1,4 +1,5 @@
 #include <hip/hip_bfloat16.h>
+#include <hip/hip_fp8.h>
 #include <mpi.h>
 
 #include <algorithm>
@@ -17,11 +18,33 @@ using namespace mori::core;
 using namespace mori::application;
 using namespace mori::shmem;
 
+enum DataType {
+  FP32 = 0,
+  BF16 = 1,
+  FP8_E4M3 = 2,
+};
+
+namespace std {
+static std::ostream& operator<<(std::ostream& s, DataType dataType) {
+  if (dataType == DataType::FP32) {
+    s << "float32";
+  } else if (dataType == DataType::BF16) {
+    s << "bfloat16";
+  } else if (dataType == DataType::FP8_E4M3) {
+    s << "fp8_e4m3";
+  } else {
+    assert(false);
+  }
+  return s;
+};
+}  // namespace std
+
 struct AccuracyConfig {
   float atol{1e-2};
 };
 
 struct EpDispatchCombineTestConfig {
+  DataType dataType{DataType::BF16};
   int repeat{10};
   AccuracyConfig accConfig;
   EpDispatchCombineConfig config;
@@ -152,8 +175,8 @@ class EpDispatchCombineTestCase {
       msg << "mype " << config.rank << " localTokId " << localTokId << " srcpe " << srcPe
           << " srcTokId " << srcTokId;
       for (int k = 0; k < config.hiddenDim; k++) {
-        T expectedVal = srcTokBuf[k];
-        T gotVal = localTokBuf[k];
+        float expectedVal = float(srcTokBuf[k]);
+        float gotVal = float(localTokBuf[k]);
         bool equal = (expectedVal == gotVal);
         if (!equal) {
           std::cout << "Wrong result at pos " << k << ": " << msg.str() << " expected "
@@ -197,12 +220,11 @@ class EpDispatchCombineTestCase {
         weightSum += weightsBuf[i * config.numExpertPerToken + k];
 
       for (int j = 0; j < config.hiddenDim; j++) {
-        T expected = reinterpret_cast<T*>(inpTokBufCpu)[tokenOffset + j] * weightSum;
-        T got = handle.outTokenBuf[tokenOffset + j];
+        float expected = float(reinterpret_cast<T*>(inpTokBufCpu)[tokenOffset + j]) * weightSum;
+        float got = float(handle.outTokenBuf[tokenOffset + j]);
         if (abs(got - expected) > accConfig.atol) {
           std::cout << "Wrong result at pos " << j << ": mype " << config.rank << " tokenId " << i
                     << " expected " << expected << " got " << got << " weight sum " << weightSum
-                    << " token value " << reinterpret_cast<T*>(inpTokBufCpu)[tokenOffset + j]
                     << std::endl;
           assert(false);
         }
@@ -283,19 +305,36 @@ void EpDispatchWithPutMemAPI(EpDispatchCombineTestConfig testConfig) {
   int npes = ShmemNPes();
 
   // Setup config
+  using DType = float;
+  if (testConfig.dataType == DataType::FP32) {
+    using DType = float;
+    testConfig.accConfig.atol = 1e-3;
+  } else if (testConfig.dataType == DataType::BF16) {
+    using DType = hip_bfloat16;
+    testConfig.accConfig.atol = 1e-1;
+  } else if (testConfig.dataType == DataType::FP8_E4M3) {
+    using DType = __hip_fp8_e4m3_fnuz;
+    testConfig.accConfig.atol = 3e-1;
+  } else {
+    std::cout << "Unknown datatype: " << testConfig.dataType << std::endl;
+    assert(false);
+  }
+
   testConfig.config.rank = myPe;
   testConfig.config.worldSize = npes;
-  testConfig.accConfig.atol = 1e-3;
+  if (testConfig.config.rank == 0) {
+    std::cout << "DataType: " << testConfig.dataType << std::endl;
+    std::cout << "Atol: " << testConfig.accConfig.atol << std::endl;
+    std::cout << testConfig.config << std::endl;
+  }
 
-  if (testConfig.config.rank == 0) std::cout << testConfig.config << std::endl;
   // Intialize EpDispatchCombineHandle
   {
-    using DataType = float;
-    EpDispatchCombineHandle<DataType> handle(testConfig.config);
+    EpDispatchCombineHandle<DType> handle(testConfig.config);
 
     // Run tests
     for (int i = 0; i < testConfig.repeat; i++) {
-      EpDispatchCombineTestCase<DataType> testCase(handle, testConfig.accConfig);
+      EpDispatchCombineTestCase<DType> testCase(handle, testConfig.accConfig);
       testCase.RandomInitializeHandle();
       MPI_Barrier(MPI_COMM_WORLD);
       testCase.RunDispatch();
@@ -328,7 +367,8 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
   if (argc > 4) testConfig.config.numExpertPerToken = std::stoi(argv[4]);
   if (argc > 5) testConfig.config.warpNumPerBlock = std::stoi(argv[5]);
   if (argc > 6) testConfig.config.blockNum = std::stoi(argv[6]);
-  if (argc > 7) testConfig.repeat = std::stoi(argv[7]);
+  if (argc > 7) testConfig.dataType = DataType(std::stoi(argv[7]));
+  if (argc > 8) testConfig.repeat = std::stoi(argv[8]);
 
   return testConfig;
 }
