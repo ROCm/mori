@@ -4,7 +4,7 @@
 #include <string>
 
 #include "infiniband/mlx5dv.h"
-
+#include "mori/core/transport/rdma/device_primitives.hpp"
 namespace mori {
 namespace core {
 
@@ -85,6 +85,26 @@ static __device__ __host__ void DumpWqe(void* wqeBaseAddr, uint32_t idx) {
   uint32_t bytes = BE32TOH(wqeDataSeg->byte_count);
   printf("Wqe: post idx %d opcode %d bytes %d\n", opmodIdxOpCode >> 24, opmodIdxOpCode & 0xff,
          bytes);
+}
+
+static __device__ __host__ uint32_t get_num_wqes_in_atomic(atomicType amo_op, uint32_t bytes) {
+  if (bytes == 8) {
+    // RC
+    switch (amo_op) {
+      case AMO_SIGNAL:
+      case AMO_SIGNAL_SET:
+      case AMO_SWAP:
+      case AMO_SET:
+      case AMO_FETCH_AND:
+      case AMO_AND:
+      case AMO_FETCH_OR:
+      case AMO_OR:
+        return 2;
+      default:
+        break;
+    }
+  }
+  return 1;
 }
 
 }  // namespace core
