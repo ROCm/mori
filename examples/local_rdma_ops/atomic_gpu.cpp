@@ -13,14 +13,13 @@ using namespace mori::core;
       IBV_ACCESS_REMOTE_ATOMIC
 
 __device__ void SendThreadKernel(RdmaEndpoint& epSend, MemoryRegion sendMr, MemoryRegion recvMr) {
-  uint32_t postIdx = 0;
-  atomicType amoOp = AMO_SIGNAL_SET;
-  uint32_t value = 1;
+  atomicType amoOp = AMO_SET;
+  uint32_t value = 2;
 
   uint64_t dbr_val = PostAtomic<ProviderType::MLX5, uint32_t>(
-      epSend.wqHandle.sqAddr, epSend.wqHandle.sqWqeNum, &postIdx, epSend.handle.qpn, sendMr.addr,
-      sendMr.lkey, recvMr.addr, recvMr.lkey, value, value, amoOp);
-  UpdateSendDbrRecord<ProviderType::MLX5>(epSend.wqHandle.dbrRecAddr, postIdx);
+      epSend.wqHandle.sqAddr, epSend.wqHandle.sqWqeNum, &epSend.wqHandle.postIdx, epSend.handle.qpn, sendMr.addr,
+      sendMr.lkey, recvMr.addr, recvMr.rkey, value, value, amoOp);
+  UpdateSendDbrRecord<ProviderType::MLX5>(epSend.wqHandle.dbrRecAddr, epSend.wqHandle.postIdx);
   __threadfence_system();
   RingDoorbell<ProviderType::MLX5>(epSend.wqHandle.dbrAddr, dbr_val);
   __threadfence_system();
@@ -28,7 +27,7 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, MemoryRegion sendMr, Memo
   int opcode = PollCq<ProviderType::MLX5>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeSize,
                                           epSend.cqHandle.cqeNum, &epSend.cqHandle.consIdx);
   UpdateCqDbrRecord<ProviderType::MLX5>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx);
-  printf("send block is done, opcode is %d\n", opcode);
+  // printf("send block is done, opcode is %d postIdx %u consIdx %u\n", opcode, epSend.wqHandle.postIdx, epSend.cqHandle.consIdx);
 }
 
 __device__ void RecvThreadKernel(RdmaEndpoint& epRecv, MemoryRegion mr) {
@@ -74,7 +73,7 @@ void LocalRdmaOps() {
   // 2 Create an endpoint
   RdmaEndpointConfig config;
   config.portId = devicePort.second;
-  config.gidIdx = 1;
+  config.gidIdx = 3;
   config.maxMsgsNum = 1024;
   config.maxCqeNum = 1024;
   config.alignment = 4096;
@@ -91,9 +90,9 @@ void LocalRdmaOps() {
   void* recvBuf;
   HIP_RUNTIME_CHECK(hipMalloc(&recvBuf, msgSize));
   HIP_RUNTIME_CHECK(hipMemset(recvBuf, 0, msgSize));
-    void* sendBuf;
+  void* sendBuf;
   HIP_RUNTIME_CHECK(hipMalloc(&sendBuf, msgSize));
-  HIP_RUNTIME_CHECK(hipMemset(sendBuf, 0, msgSize));
+  HIP_RUNTIME_CHECK(hipMemset(sendBuf, 1, msgSize));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MemoryRegion mrSend = deviceContextSend->RegisterMemoryRegion(sendBuf, msgSize, MR_ACCESS_FLAG);
   MemoryRegion mrRecv = deviceContextRecv->RegisterMemoryRegion(recvBuf, msgSize, MR_ACCESS_FLAG);
@@ -102,9 +101,10 @@ void LocalRdmaOps() {
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   uint32_t value; 
   HIP_RUNTIME_CHECK(hipMemcpy(&value, recvBuf, sizeof(uint32_t), hipMemcpyDeviceToHost));
-  std::cout << "Value = " << value << std::endl;  
+  std::cout << "After atomic op value = " << value << std::endl;  
 
   // 8 Finalize
+  deviceContextSend->DeRegisterMemoryRegion(sendBuf);
   deviceContextRecv->DeRegisterMemoryRegion(recvBuf);
 }
 
