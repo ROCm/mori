@@ -7,7 +7,9 @@
 add_executable(
     dist_read
     dist_rdma_ops/read.cpp
+    utils/args_parser.cpp
 )
+target_include_directories(dist_read PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
 target_link_libraries(dist_read mori_application hip::host hip::device)
 
 add_executable(
