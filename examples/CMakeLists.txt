@@ -30,11 +30,11 @@ add_executable(
 )
 target_link_libraries(atomic_gpu mori_application hip::host hip::device)
 
-add_executable(
-    moe_all2all_dispatch
-    moe_all2all/pplx-kernel-hip/internode_dispatch.cpp
-)
-target_link_libraries(moe_all2all_dispatch hip::host hip::device)
+# add_executable(
+#     moe_all2all_dispatch
+#     moe_all2all/pplx-kernel-hip/internode_dispatch.cpp
+# )
+# target_link_libraries(moe_all2all_dispatch hip::host hip::device)
 
 add_executable(
     put_thread_allgather
