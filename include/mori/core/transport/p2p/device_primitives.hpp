@@ -82,6 +82,7 @@ __device__ T WarpPrefixSum(T val, size_t laneNum) {
   return prefixSum;
 }
 
+// TODO: fix bugs
 template <typename T>
 __device__ T BlockPrefixSum(T val, size_t thdNum) {
   int blockSize = FlatBlockSize();

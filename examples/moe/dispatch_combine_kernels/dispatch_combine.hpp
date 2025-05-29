@@ -80,6 +80,8 @@ class EpDispatchCombineHandle {
   // Recover from pe sorted order to original order, filled at dispatch send phase and used at
   // combine recv phase
   uint32_t* tokenIndicesToPeSortedBuf{nullptr};
+  uint32_t* peTokenOffset{nullptr};
+  uint32_t* exptTokenOffset{nullptr};
 };
 
 }  // namespace moe
