@@ -31,7 +31,7 @@ __device__ void ThreadCopyAtomic(T* dst, T* src, size_t nelems) {
 }
 
 template <typename T>
-__device__ void WarpCopy(T* dst, T* src, size_t nelems) {
+inline __device__ void WarpCopy(T* dst, T* src, size_t nelems) {
   constexpr int vecSize = 16 / sizeof(T);
   int laneId = threadIdx.x & (warpSize - 1);
   int offset = laneId * vecSize;
@@ -70,7 +70,8 @@ __device__ T WarpReduceSum(T val) {
 
 template <typename T>
 __device__ T WarpPrefixSum(T val, size_t laneNum) {
-  int laneId = threadIdx.x & (warpSize - 1);
+  assert(laneNum <= warpSize);
+  int laneId = WarpLaneId();
   uint32_t prefixSum = 0;
   if (laneId < laneNum) {
     for (int i = 0; i <= laneId; i++) {
@@ -78,6 +79,31 @@ __device__ T WarpPrefixSum(T val, size_t laneNum) {
       if (laneId > i) prefixSum += targetLaneVal;
     }
   }
+  return prefixSum;
+}
+
+template <typename T>
+__device__ T BlockPrefixSum(T val, size_t thdNum) {
+  int blockSize = FlatBlockSize();
+  assert(thdNum <= blockSize);
+
+  int warpId = FlatBlockWarpId();
+
+  int firstThd = warpId * DeviceWarpSize();
+  int lastThd = std::min(firstThd + DeviceWarpSize(), blockSize);
+  int thisWarpSize = lastThd - firstThd;
+
+  T prefixSum = WarpPrefixSum(val, thisWarpSize);
+
+  __shared__ T warpPrefixSum[32];  // max warp num is 32
+
+  if (WarpLaneId() == (DeviceWarpSize() - 1)) warpPrefixSum[warpId] = prefixSum + val;
+  __syncthreads();
+
+  for (int i = 0; i < warpId; i++) {
+    prefixSum += warpPrefixSum[i];
+  }
+
   return prefixSum;
 }
 

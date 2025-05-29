@@ -47,3 +47,9 @@ add_executable(
 )
 target_link_libraries(test_dispatch_combine mori_application mori_shmem hip::host hip::device)
 target_include_directories(test_dispatch_combine PUBLIC ${CMAKE_SOURCE_DIR}/examples/moe)
+
+add_executable(
+    p2p_bandwidth
+    benchmarks/p2p_bandwidth.cpp
+)
+target_link_libraries(p2p_bandwidth mori_application mori_shmem hip::host hip::device)

@@ -107,15 +107,10 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
   }
 
   for (int i = 0; i < args.curRankNumToken * config.numExpertPerToken; i++) {
-    // located on the same pe
     uint32_t destExpert = args.tokenIndicies[i];
     uint32_t destPe = destExpert / config.numExpertPerRank;
     uint32_t peTokenIdx = peTokenOffset[destPe];
-    if (laneId == 0) {
-      atomicAdd(peTokenOffset + destPe, 1);
-      assert(destPe < npes);  // for debug purpose
-      inpTokToExptBuf[destPe * maxNumOutTokenPerRank + peTokenIdx] = destExpert;
-    }
+    peTokenOffset[destPe] = peTokenIdx + 1;
 
     if ((i % globalWarpNum) != globalWarpId) continue;  // skip token not assigned for this warp
 
@@ -131,10 +126,10 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
                            tokenOffset, config.hiddenDim, destPe);
     if (laneId == 0) {
       args.tokenIndicesToPeSortedBuf[i] = destPe * maxNumOutTokenPerRank + peTokenIdx;
-      uint32_t destPeCopyCnt = atomicAdd(args.gridCopyTokenBarrier + destPe, 1);
+      inpTokToExptBuf[destPe * maxNumOutTokenPerRank + peTokenIdx] = destExpert;
+      atomicAdd(args.gridCopyTokenBarrier + destPe, 1);
     }
   }
-
   SyncIfDebugEnabled("Dispatch kernel: finished send token");
   // Make sure WarCopy is visible to other blocks
   __threadfence_system();
@@ -142,7 +137,7 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
   // Send token num & token to expert mapping to other ranks
   for (int destPe = globalWarpId; destPe < npes; destPe += globalWarpNum) {
     // Add 1 so that when token number == 0, receiver side still know the signal is sent
-    uint32_t recvTokenNum = peTokenOffset[destPe];
+    uint32_t recvTokenNum = AtomicLoadRelaxed(peTokenOffset + destPe);
 
     // Wait until all tokens are sent
     ShmemUint32WaitUntilEquals(args.gridCopyTokenBarrier + destPe, recvTokenNum);
@@ -152,7 +147,6 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
     ShmemPutUint32NbiWarp(args.outTokToExptMapMemObj, myPe * maxNumOutTokenPerRank,
                           args.inpTokToExptMapMemObj, destPe * maxNumOutTokenPerRank, recvTokenNum,
                           destPe);
-
     uint32_t numTokenSignal = recvTokenNum + 1;
     ShmemPutUint32ImmNbiWarp(args.recvTokenNumMemObj, myPe * sizeof(uint32_t), numTokenSignal,
                              destPe);
@@ -178,24 +172,21 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
   }
   SyncIfDebugEnabled("Dispatch kernel: finish waiting num token signal");
 
+  // Compute token number for each expert
   for (int srcPe = warpId; srcPe < npes; srcPe += warpNum) {
     for (int tokId = laneId; tokId < recvTokenNum[srcPe]; tokId += warpSize) {
-      uint32_t expertId = outTokToExptBuf[srcPe * maxNumOutTokenPerRank + tokId];
+      uint32_t expertId =
+          AtomicLoadRelaxed(outTokToExptBuf + srcPe * maxNumOutTokenPerRank + tokId);
       uint32_t localExpertId = expertId % config.numExpertPerRank;
-      if ((expertId / config.numExpertPerRank) != myPe) {
-        printf("mype %d srcpe %d expertId %d\n", myPe, srcPe, expertId);
-        assert(false);
-      }
       atomicAdd(accumExpertTokOffsets + localExpertId, 1);
     }
   }
   __syncthreads();
 
   // Calculate prefix sum of expert token offset
-  assert(config.numExpertPerRank < warpSize);
+  assert(config.numExpertPerRank <= FlatBlockSize());
+  uint32_t accumOffset = BlockPrefixSum(accumExpertTokOffsets[thdId], config.numExpertPerRank);
   if (thdId < config.numExpertPerRank) {
-    uint32_t expertTokNum = accumExpertTokOffsets[thdId];
-    uint32_t accumOffset = WarpPrefixSum(expertTokNum, config.numExpertPerRank);
     accumExpertTokOffsets[thdId] = accumOffset;
   }
   __syncthreads();
@@ -206,7 +197,6 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
 
   T* outTokenBuf = args.outTokenBuf;
   T* shmemOutTokenBuf = args.shmemOutTokMemObj->template GetAs<T*>();
-
   for (int i = 0, srcTokId = 0, srcPe = 0; srcPe < npes; srcTokId++, i++) {
     if (srcTokId == recvTokenNum[srcPe]) {
       srcPe++;
@@ -217,7 +207,7 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
     uint32_t localExpertId =
         outTokToExptBuf[srcPe * maxNumOutTokenPerRank + srcTokId] % config.numExpertPerRank;
     if (laneId == 0) {
-      expertTokOff[localExpertId] += 1;
+      atomicAdd(expertTokOff + localExpertId, 1);
     }
     if ((i % globalWarpNum) != globalWarpId) continue;  // skip token not assigned for this warp
 
@@ -435,7 +425,7 @@ void EpDispatchCombineHandle<T>::FinalizeTokToExptBuf() {
 
 template <typename T>
 void EpDispatchCombineHandle<T>::IntializeOrderMapBuf() {
-  int maxNumOutToken = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken;
+  int maxNumOutToken = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerRank;
   HIP_RUNTIME_CHECK(hipMalloc(&exptSortedToPeSortedBuf, maxNumOutToken * sizeof(uint32_t)));
   HIP_RUNTIME_CHECK(hipMemset(exptSortedToPeSortedBuf, 0, maxNumOutToken * sizeof(uint32_t)));
 
@@ -450,27 +440,27 @@ void EpDispatchCombineHandle<T>::FinalizeOrderMapBuf() {
 }
 
 template <typename T>
-void EpDispatchCombineHandle<T>::LaunchDispatch() {
+void EpDispatchCombineHandle<T>::LaunchDispatch(hipStream_t stream) {
   dim3 grid(config.blockNum);
   dim3 block(warpSize * config.warpNumPerBlock);
   size_t sharedMemSize =
       (config.worldSize * config.warpNumPerBlock +
        config.numExpertPerRank * config.warpNumPerBlock + config.numExpertPerRank) *
       sizeof(uint32_t);
-  EpDispatchKernel<<<grid, block, sharedMemSize>>>(GetEpDispatchCombineArgs(*this));
+  EpDispatchKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
 }
 
 template <typename T>
-void EpDispatchCombineHandle<T>::LaunchCombine() {
+void EpDispatchCombineHandle<T>::LaunchCombine(hipStream_t stream) {
   dim3 grid(config.blockNum);
   dim3 block(warpSize * config.warpNumPerBlock);
   size_t sharedMemSize = config.warpNumPerBlock * config.numExpertPerToken * sizeof(T**);
-  EpCombineKernel<<<grid, block, sharedMemSize>>>(GetEpDispatchCombineArgs(*this));
+  EpCombineKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
 }
 
 template <typename T>
-void EpDispatchCombineHandle<T>::LaunchReset() {
-  EpDispatchCombineResetKernel<<<1, config.worldSize>>>(GetEpDispatchCombineArgs(*this));
+void EpDispatchCombineHandle<T>::LaunchReset(hipStream_t stream) {
+  EpDispatchCombineResetKernel<<<1, config.worldSize, 0, stream>>>(GetEpDispatchCombineArgs(*this));
 }
 
 template class EpDispatchCombineHandle<float>;

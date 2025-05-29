@@ -58,7 +58,7 @@ static std::ostream& operator<<(std::ostream& s, TestType testType) {
 
 struct RunConfig {
   TestType testType{Accuracy};
-  int warmup{3};
+  int warmup{5};
   int repeat{5};
   float atol{1e-2};
 };
@@ -108,9 +108,9 @@ class EpDispatchCombineTestCase {
   }
 
   void InitializeHandle() {
-    handle.LaunchReset();
     if (runConfig.testType == TestType::Accuracy) {
-      RandomInitializeNumToken();
+      // RandomInitializeNumToken();
+      InitializeNumToken();
       RandomInitializeDispatch();
     } else if (runConfig.testType == TestType::Benchmark) {
       InitializeNumToken();
@@ -123,12 +123,6 @@ class EpDispatchCombineTestCase {
     handle.PrepareInference(inpTokBuf, outTokBuf, weightsBuf, tokenIndicies, numToken);
     // PrintDispatch();
     // PrintDispatchStats();
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-  }
-
-  void RunDispatch() {
-    handle.LaunchDispatch();
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   }
 
   void CheckDispatchResult() {
@@ -218,23 +212,6 @@ class EpDispatchCombineTestCase {
     free(tokenIndicesCpu);
   }
 
-  void RunCombine() {
-    EpDispatchCombineConfig& config = handle.config;
-
-    int maxNumOutTokenPerRank =
-        config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken;
-    // Use the output of dispatch as the input of combine
-    HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, outTokBuf,
-                                maxNumOutTokenPerRank * config.hiddenDim * sizeof(T),
-                                hipMemcpyDeviceToDevice));
-    HIP_RUNTIME_CHECK(
-        hipMemset(outTokBuf, 0, maxNumOutTokenPerRank * config.hiddenDim * sizeof(T)));
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-
-    handle.LaunchCombine();
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-  }
-
   void CheckCombineResult() {
     EpDispatchCombineConfig& config = handle.config;
 
@@ -259,7 +236,111 @@ class EpDispatchCombineTestCase {
     }
   }
 
+  void Run() {
+    if (runConfig.testType == TestType::Accuracy) {
+      RunAccuracyTest();
+    } else if (runConfig.testType == TestType::Benchmark) {
+      RunBenchmark();
+    } else {
+      assert(false);
+    }
+  }
+
+  void RunAccuracyTest() {
+    for (int i = 0; i < runConfig.repeat; i++) {
+      InitializeHandle();
+
+      handle.LaunchDispatch();
+      SystemBarrier();
+
+      CheckDispatchResult();
+      SystemBarrier();
+
+      CopyDispatchOutAsCombineInp();
+      handle.LaunchCombine();
+      SystemBarrier();
+
+      CheckCombineResult();
+      SystemBarrier();
+
+      handle.LaunchReset();
+      SystemBarrier();
+
+      if (handle.config.rank == 0) std::cout << "Test round " << i << " PASS" << std::endl;
+    }
+  }
+
+  void RunBenchmark() {
+    hipStream_t stream;
+    HIP_RUNTIME_CHECK(hipStreamCreate(&stream));
+
+    for (int i = 0; i < runConfig.warmup; i++) {
+      InitializeHandle();
+      handle.LaunchDispatch(stream);
+      CopyDispatchOutAsCombineInp();
+      // handle.LaunchCombine(stream);
+      handle.LaunchReset(stream);
+      SystemBarrier();
+      if (handle.config.rank == 0) std::cout << "Warmup Done" << std::endl;
+    }
+
+    hipEvent_t events[4];
+    for (int i = 0; i < 4; i++) HIP_RUNTIME_CHECK(hipEventCreate(&events[i]));
+
+    float dispatchTotal = 0, combineTotal = 0;
+    for (int i = 0; i < runConfig.repeat; i++) {
+      handle.LaunchReset(stream);
+      InitializeHandle();
+      SystemBarrier();
+
+      HIP_RUNTIME_CHECK(hipEventRecord(events[0]));
+      handle.LaunchDispatch(stream);
+      HIP_RUNTIME_CHECK(hipEventRecord(events[1]));
+
+      // CopyDispatchOutAsCombineInp();
+
+      // HIP_RUNTIME_CHECK(hipEventRecord(events[2]));
+      // handle.LaunchCombine(stream);
+      // HIP_RUNTIME_CHECK(hipEventRecord(events[3]));
+
+      float dispatch, combine;
+      HIP_RUNTIME_CHECK(hipEventSynchronize(events[1]));
+      HIP_RUNTIME_CHECK(hipEventElapsedTime(&dispatch, events[0], events[1]));
+      // HIP_RUNTIME_CHECK(hipEventElapsedTime(&combine, events[2], events[3]));
+
+      // std::cout << "Rank " << handle.config.rank << " dispatch " << dispatch << std::endl;
+
+      dispatchTotal += dispatch;
+      combineTotal += combine;
+
+      if (handle.config.rank == 0) std::cout << "Benchmark round " << i << " Done" << std::endl;
+    }
+
+    std::cout << "Rank " << handle.config.rank
+              << " Dispatch average: " << dispatchTotal / runConfig.repeat << std::endl;
+    std::cout << "Rank " << handle.config.rank
+              << " Combine average: " << combineTotal / runConfig.repeat << std::endl;
+
+    HIP_RUNTIME_CHECK(hipStreamDestroy(stream));
+  }
+
  private:
+  void SystemBarrier() {
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+    MPI_Barrier(MPI_COMM_WORLD);
+  }
+
+  void CopyDispatchOutAsCombineInp() {
+    EpDispatchCombineConfig& config = handle.config;
+    int maxNumOutTokenPerRank =
+        config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken;
+    HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, outTokBuf,
+                                maxNumOutTokenPerRank * config.hiddenDim * sizeof(T),
+                                hipMemcpyDeviceToDevice));
+    HIP_RUNTIME_CHECK(
+        hipMemset(outTokBuf, 0, maxNumOutTokenPerRank * config.hiddenDim * sizeof(T)));
+  }
+
   void RandomInitializeNumToken() {
     EpDispatchCombineConfig& config = handle.config;
     uniform_int_distribution<> dist(1, config.maxNumInpTokenPerRank);
@@ -279,17 +360,20 @@ class EpDispatchCombineTestCase {
     std::vector<int> rankCount(config.worldSize, 0);
 
     for (int i = 0; i < numToken; i++) {
-      std::shuffle(epRange.begin(), epRange.end(), gen);
+      std::vector<int> epRangeShuffled(epRange);
+      std::shuffle(epRangeShuffled.begin(), epRangeShuffled.end(), gen);
+
       for (int j = 0; j < config.numExpertPerToken; j++) {
-        assert(epRange[j] < config.numExpertPerRank * config.worldSize);
-        tokenIndicies[i * config.numExpertPerRank + j] = epRange[j];
-        int rank = epRange[j] / config.numExpertPerRank;
+        assert(epRangeShuffled[j] < config.numExpertPerRank * config.worldSize);
+        tokenIndicies[i * config.numExpertPerToken + j] = epRangeShuffled[j];
+        int rank = epRangeShuffled[j] / config.numExpertPerRank;
         rankCount[rank]++;
       }
     }
 
     for (int i = 0; i < config.worldSize; i++) {
-      std::cout << " Dispatch " << rankCount[i] << " tokens to rank " << i << std::endl;
+      std::cout << "Rank " << config.rank << " dispatches " << rankCount[i] << " tokens to rank "
+                << i << std::endl;
     }
   }
 
@@ -318,7 +402,7 @@ class EpDispatchCombineTestCase {
     for (int i = 0; i < handle.curRankNumToken; i++) {
       ss << "  Token " << i << " dispatch to ";
       for (int j = 0; j < config.numExpertPerToken; j++) {
-        ss << tokenIndicies[i * config.numExpertPerRank + j] << " ";
+        ss << tokenIndicies[i * config.numExpertPerToken + j] << " ";
       }
       ss << std::endl;
     }
@@ -382,19 +466,11 @@ void EpDispatchWithPutMemAPI(EpDispatchCombineTestConfig testConfig) {
     EpDispatchCombineHandle<DType> handle(testConfig.config);
 
     // Run tests
-    for (int i = 0; i < testConfig.runConfig.repeat; i++) {
-      EpDispatchCombineTestCase<DType> testCase(handle, testConfig.runConfig);
-      testCase.InitializeHandle();
-      MPI_Barrier(MPI_COMM_WORLD);
-      testCase.RunDispatch();
-      MPI_Barrier(MPI_COMM_WORLD);
-      testCase.CheckDispatchResult();
-      MPI_Barrier(MPI_COMM_WORLD);
-      testCase.RunCombine();
-      MPI_Barrier(MPI_COMM_WORLD);
-      testCase.CheckCombineResult();
-      if (testConfig.config.rank == 0) std::cout << "Round " << i << " PASS" << std::endl;
-    }
+    // for (int i = 0; i < testConfig.runConfig.repeat; i++) {
+    EpDispatchCombineTestCase<DType> testCase(handle, testConfig.runConfig);
+    testCase.Run();
+    //   if (testConfig.config.rank == 0) std::cout << "Round " << i << " PASS" << std::endl;
+    // }
   }
 
   ShmemMpiFinalize();

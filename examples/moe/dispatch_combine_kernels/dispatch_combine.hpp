@@ -33,9 +33,9 @@ class EpDispatchCombineHandle {
     this->curRankNumToken = numToken;
   }
 
-  void LaunchDispatch();
-  void LaunchCombine();
-  void LaunchReset();
+  void LaunchDispatch(hipStream_t = 0);
+  void LaunchCombine(hipStream_t = 0);
+  void LaunchReset(hipStream_t = 0);
 
  private:
   void IntializeShmemInpOutTokBuf();

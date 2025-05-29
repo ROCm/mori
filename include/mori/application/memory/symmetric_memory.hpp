@@ -34,15 +34,17 @@ struct SymmMemObj {
   }
 
   // Get pointers
-  __device__ __host__ void* Get() const { return localPtr; }
-  __device__ __host__ void* Get(int pe) const { return reinterpret_cast<void*>(peerPtrs[pe]); }
+  inline __device__ __host__ void* Get() const { return localPtr; }
+  inline __device__ __host__ void* Get(int pe) const {
+    return reinterpret_cast<void*>(peerPtrs[pe]);
+  }
 
   template <typename T>
-  __device__ __host__ T GetAs() const {
+  inline __device__ __host__ T GetAs() const {
     return reinterpret_cast<T>(localPtr);
   }
   template <typename T>
-  __device__ __host__ T GetAs(int pe) const {
+  inline __device__ __host__ T GetAs(int pe) const {
     return reinterpret_cast<T>(peerPtrs[pe]);
   }
 };
