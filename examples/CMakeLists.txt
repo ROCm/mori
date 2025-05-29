@@ -7,7 +7,9 @@
 add_executable(
     dist_read
     dist_rdma_ops/read.cpp
+    utils/args_parser.cpp
 )
+target_include_directories(dist_read PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
 target_link_libraries(dist_read mori_application hip::host hip::device)
 
 add_executable(
@@ -21,6 +23,18 @@ add_executable(
     local_rdma_ops/write_inline_gpu.cpp
 )
 target_link_libraries(write_inline_gpu mori_application hip::host hip::device)
+
+add_executable(
+    atomic_gpu
+    local_rdma_ops/atomic_gpu.cpp
+)
+target_link_libraries(atomic_gpu mori_application hip::host hip::device)
+
+# add_executable(
+#     moe_all2all_dispatch
+#     moe_all2all/pplx-kernel-hip/internode_dispatch.cpp
+# )
+# target_link_libraries(moe_all2all_dispatch hip::host hip::device)
 
 add_executable(
     put_thread_allgather

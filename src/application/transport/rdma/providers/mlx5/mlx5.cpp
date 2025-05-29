@@ -271,6 +271,8 @@ void Mlx5QpContainer::ModifyRst2Init() {
   void* qpc = DEVX_ADDR_OF(rst2init_qp_in, rst2init_cmd_in, qpc);
   DEVX_SET(qpc, qpc, rwe, 1); /* remote write access */
   DEVX_SET(qpc, qpc, rre, 1); /* remote read access */
+  DEVX_SET(qpc, qpc, rae, 1); 
+  DEVX_SET(qpc, qpc, atomic_mode, 0x3);
   DEVX_SET(qpc, qpc, primary_address_path.vhca_port_num, config.portId);
   int status = mlx5dv_devx_obj_modify(qp, rst2init_cmd_in, sizeof(rst2init_cmd_in),
                                       rst2init_cmd_out, sizeof(rst2init_cmd_out));

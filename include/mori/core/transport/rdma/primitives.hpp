@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <limits.h>
 
 namespace mori {
 namespace core {
@@ -10,6 +11,31 @@ enum ProviderType {
   MLX5 = 1,
   BNXTRE = 2,
 };
+typedef enum {
+  AMO_ACK = 1,
+  AMO_INC,
+  AMO_SET,
+  AMO_ADD,
+  AMO_AND,
+  AMO_OR,
+  AMO_XOR,
+  AMO_SIGNAL,
+  SIGNAL_SET,
+  SIGNAL_ADD,
+  AMO_SIGNAL_SET = SIGNAL_SET,
+  AMO_SIGNAL_ADD = SIGNAL_ADD,
+  AMO_END_OF_NONFETCH,
+  AMO_FETCH,
+  AMO_FETCH_INC,
+  AMO_FETCH_ADD,
+  AMO_FETCH_AND,
+  AMO_FETCH_OR,
+  AMO_FETCH_XOR,
+  AMO_SWAP,
+  AMO_COMPARE_SWAP,
+  AMO_OP_SENTINEL = INT_MAX,
+} atomicType;
+
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Utility Functions                                       */
