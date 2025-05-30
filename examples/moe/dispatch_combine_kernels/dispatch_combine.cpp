@@ -46,6 +46,7 @@ struct EpDispatchCombineArgs {
   SymmMemObjPtr outTokToExptMapMemObj;
   uint32_t* peTokenOffset{nullptr};
   uint32_t* exptTokenOffset{nullptr};
+  uint32_t* dispatchDestTokId{nullptr};
   uint32_t* exptSortedToPeSortedBuf{nullptr};
   uint32_t* tokenIndicesToPeSortedBuf{nullptr};
 };
@@ -62,6 +63,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<
   args.weightsBuf = handle.weightsBuf;
   args.peTokenOffset = handle.peTokenOffset;
   args.exptTokenOffset = handle.exptTokenOffset;
+  args.dispatchDestTokId = handle.dispatchDestTokId;
   args.shmemInpTokMemObj = handle.shmemInpTokMemObj;
   args.shmemOutTokMemObj = handle.shmemOutTokMemObj;
   args.recvTokenNumMemObj = handle.recvTokenNumMemObj;
@@ -97,7 +99,6 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
   int npes = config.worldSize;
 
   T* inpTokenBuf = args.shmemInpTokMemObj->template GetAs<T*>();
-  uint32_t* inpTokToExptBuf = args.inpTokToExptMapMemObj->template GetAs<uint32_t*>();
   uint32_t* outTokToExptBuf = args.outTokToExptMapMemObj->template GetAs<uint32_t*>();
 
   size_t maxNumOutTokenPerRank = config.maxNumInpTokenPerRank * config.numExpertPerToken;
@@ -117,7 +118,8 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
     if (laneId == 0) {
       peTokenIdx = atomicAdd(args.peTokenOffset + destPe, 1);
       args.tokenIndicesToPeSortedBuf[i] = destPe * maxNumOutTokenPerRank + peTokenIdx;
-      inpTokToExptBuf[destPe * maxNumOutTokenPerRank + peTokenIdx] = destExpert;
+      args.outTokToExptMapMemObj->template GetAs<uint32_t*>(
+          destPe)[myPe * maxNumOutTokenPerRank + peTokenIdx] = destExpert;
     }
     peTokenIdx = __shfl(peTokenIdx, 0);
     uint32_t tokenId = i / config.numExpertPerToken;
@@ -131,25 +133,22 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
   }
   if (laneId == 0) atomicAdd(args.dispatchGridCopyTokenBarrier, 1);
   SyncIfDebugEnabled("Dispatch kernel: finished send token");
-  // 100 us
+  // 95 us
 
   // Send token num & token to expert mapping to other ranks
-  for (int destPe = globalWarpId; destPe < npes; destPe += globalWarpNum) {
-    // Wait until all tokens are sent
-    ShmemUint32WaitUntilEquals(args.dispatchGridCopyTokenBarrier, globalWarpNum);
+  if (globalWarpId == 0) {
+    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+      // Wait until all tokens are sent
+      ShmemUint32WaitUntilEquals(args.dispatchGridCopyTokenBarrier, globalWarpNum);
 
-    // Add 1 so that when token number == 0, receiver side still know the signal is sent
-    uint32_t recvTokenNum = AtomicLoadRelaxed(args.peTokenOffset + destPe);
-    ShmemPutUint32NbiWarp(args.outTokToExptMapMemObj, myPe * maxNumOutTokenPerRank,
-                          args.inpTokToExptMapMemObj, destPe * maxNumOutTokenPerRank, recvTokenNum,
-                          destPe);
-
-    uint32_t numTokenSignal = recvTokenNum + 1;
-    ShmemPutUint32ImmNbiWarp(args.recvTokenNumMemObj, myPe * sizeof(uint32_t), numTokenSignal,
-                             destPe);
+      // Add 1 so that when token number == 0, receiver side still know the signal is sent
+      uint32_t numTokenSignal = AtomicLoadRelaxed(args.peTokenOffset + destPe) + 1;
+      ShmemPutUint32ImmNbiThread(args.recvTokenNumMemObj, myPe * sizeof(uint32_t), numTokenSignal,
+                                 destPe);
+    }
   }
   SyncIfDebugEnabled("Dispatch kernel: finish sending tok2expt mapping & num token signal");
-  // 180 us
+  // 125 us
 
   // Phase 2: recv token
   // Each warp wait until sender finished by waiting token number signal
@@ -168,6 +167,7 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
     recvTokenNum[destPe] = AtomicLoadRelaxedSystem(signal) - 1;
   }
   SyncIfDebugEnabled("Dispatch kernel: finish waiting num token signal");
+  // 144us
 
   // Compute token number for each expert
   for (int srcPe = warpId; srcPe < npes; srcPe += warpNum) {
@@ -179,21 +179,19 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
     }
   }
   __syncthreads();
-  // 223 us
+  // 164 us
 
   // Calculate prefix sum of expert token offset
+  assert(config.numExpertPerRank <= warpSize);
   uint32_t accumOffset = 0;
   if (config.numExpertPerRank <= warpSize) {
     accumOffset = WarpPrefixSum(accumExpertTokOffsets[thdId], config.numExpertPerRank);
-  } else {
-    assert(config.numExpertPerRank <= FlatBlockSize());
-    accumOffset = BlockPrefixSum(accumExpertTokOffsets[thdId], config.numExpertPerRank);
   }
   if (thdId < config.numExpertPerRank) {
     accumExpertTokOffsets[thdId] = accumOffset;
   }
   __syncthreads();
-  // 354 us
+  // 299 us
 
   T* outTokenBuf = args.outTokenBuf;
   T* shmemOutTokenBuf = args.shmemOutTokMemObj->template GetAs<T*>();
@@ -230,6 +228,115 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
       args.exptSortedToPeSortedBuf[exptSortedId] = peSortedId;
     }
   }
+  SyncIfDebugEnabled("Dispatch kernel: kernel end");
+}
+
+// TODO: in dispatch kernel, also output topk id array
+template <typename T>
+__global__ void EpDispatchKernelPeSorted(EpDispatchCombineArgs<T> args) {
+  const EpDispatchCombineConfig& config = args.config;
+
+  int thdId = threadIdx.x;
+  int thdNum = blockDim.x;
+
+  int laneId = threadIdx.x & (warpSize - 1);
+  int warpId = thdId / warpSize;
+  int warpNum = blockDim.x / warpSize;
+
+  int globalWarpId = blockIdx.x * warpNum + warpId;
+  int globalWarpNum = gridDim.x * warpNum;
+
+  int myPe = config.rank;
+  int npes = config.worldSize;
+
+  size_t maxNumOutTokenPerRank = config.maxNumInpTokenPerRank * config.numExpertPerToken;
+
+  // Send out tokens
+  extern __shared__ char sharedMem[];
+
+  // Phase1: send token
+  // Each warp compute token offset on destinition PE
+  int i = globalWarpId;
+  for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
+       i += globalWarpNum) {
+    uint32_t destExpert = args.tokenIndicies[i];
+    uint32_t destPe = destExpert / config.numExpertPerRank;
+
+    uint32_t peTokenIdx = 0;
+    if (laneId == 0) {
+      peTokenIdx = atomicAdd(args.peTokenOffset + destPe, 1);
+      args.tokenIndicesToPeSortedBuf[i] = destPe * maxNumOutTokenPerRank + peTokenIdx;
+      args.outTokToExptMapMemObj->template GetAs<uint32_t*>(
+          destPe)[myPe * maxNumOutTokenPerRank + peTokenIdx] = destExpert;
+    }
+    peTokenIdx = __shfl(peTokenIdx, 0);
+    uint32_t tokenId = i / config.numExpertPerToken;
+    uint32_t tokenOffset = tokenId * config.hiddenDim;
+
+    uint32_t peSortedId = myPe * maxNumOutTokenPerRank + peTokenIdx;
+    uint32_t peSortedOffset = peSortedId * config.hiddenDim;
+
+    WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>(destPe) + peSortedOffset,
+             args.inpTokenBuf + tokenOffset, config.hiddenDim);
+  }
+  if (laneId == 0) atomicAdd(args.dispatchGridCopyTokenBarrier, 1);
+  SyncIfDebugEnabled("Dispatch kernel: finished send token");
+  // 95 us
+
+  // Send token num & token to expert mapping to other ranks
+  if (globalWarpId == 0) {
+    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+      // Wait until all tokens are sent
+      ShmemUint32WaitUntilEquals(args.dispatchGridCopyTokenBarrier, globalWarpNum);
+
+      // Add 1 so that when token number == 0, receiver side still know the signal is sent
+      uint32_t numTokenSignal = AtomicLoadRelaxed(args.peTokenOffset + destPe) + 1;
+      ShmemPutUint32ImmNbiThread(args.recvTokenNumMemObj, myPe * sizeof(uint32_t), numTokenSignal,
+                                 destPe);
+    }
+  }
+  SyncIfDebugEnabled("Dispatch kernel: finish sending tok2expt mapping & num token signal");
+  // 125 us
+
+  // Phase 2: recv token
+  // Each warp wait until sender finished by waiting token number signal
+  uint32_t* recvTokenNum = reinterpret_cast<uint32_t*>(sharedMem);
+  for (int destPe = thdId; destPe < npes; destPe += thdNum) {
+    uint32_t* signal = args.recvTokenNumMemObj->template GetAs<uint32_t*>() + destPe;
+    ShmemUint32WaitUntilGreaterThan(signal, 0);
+    recvTokenNum[destPe] = AtomicLoadRelaxedSystem(signal) - 1;
+  }
+  __syncthreads();
+  SyncIfDebugEnabled("Dispatch kernel: finish waiting num token signal");
+  // 132 us
+
+  for (int i = globalWarpId;; i += globalWarpNum) {
+    // find src pe and tok id
+    uint32_t srcPe = 0;
+    uint32_t accumPeTokOffset = 0;
+    for (; srcPe < npes; srcPe++) {
+      if ((i >= accumPeTokOffset) && (i < (accumPeTokOffset + recvTokenNum[srcPe]))) break;
+      accumPeTokOffset += recvTokenNum[srcPe];
+    }
+    if (srcPe >= npes) break;
+    uint32_t srcTokId = i - accumPeTokOffset;
+
+    // Copy token
+    uint32_t peSortedId = srcPe * maxNumOutTokenPerRank + srcTokId;
+    uint32_t srcTokenOff = peSortedId * config.hiddenDim;
+
+    uint32_t destTokId = 0;
+    if (laneId == 0) {
+      destTokId = atomicAdd(args.exptTokenOffset, 1);
+      args.exptSortedToPeSortedBuf[destTokId] = peSortedId;
+    }
+    destTokId = __shfl(destTokId, 0);
+
+    uint32_t destTokenOff = destTokId * config.hiddenDim;
+    WarpCopy(args.outTokenBuf + destTokenOff,
+             args.shmemOutTokMemObj->template GetAs<T*>() + srcTokenOff, config.hiddenDim);
+  }
+  // 191 us
   SyncIfDebugEnabled("Dispatch kernel: kernel end");
 }
 
@@ -346,6 +453,7 @@ __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
   for (int exptId = thdId; exptId < args.config.numExpertPerRank; exptId += blockDim.x) {
     args.exptTokenOffset[exptId] = 0;
   }
+  if (thdId == 0) args.dispatchDestTokId[0] = 0;
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -453,6 +561,9 @@ void EpDispatchCombineHandle<T>::IntializeOrderMapBuf() {
 
   HIP_RUNTIME_CHECK(hipMalloc(&exptTokenOffset, config.numExpertPerRank * sizeof(uint32_t)));
   HIP_RUNTIME_CHECK(hipMemset(exptTokenOffset, 0, config.numExpertPerRank * sizeof(uint32_t)));
+
+  HIP_RUNTIME_CHECK(hipMalloc(&dispatchDestTokId, sizeof(uint32_t)));
+  HIP_RUNTIME_CHECK(hipMemset(dispatchDestTokId, 0, sizeof(uint32_t)));
 }
 
 template <typename T>
@@ -461,6 +572,7 @@ void EpDispatchCombineHandle<T>::FinalizeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipFree(tokenIndicesToPeSortedBuf));
   HIP_RUNTIME_CHECK(hipFree(peTokenOffset));
   HIP_RUNTIME_CHECK(hipFree(exptTokenOffset));
+  HIP_RUNTIME_CHECK(hipFree(dispatchDestTokId));
 }
 
 template <typename T>
@@ -471,7 +583,8 @@ void EpDispatchCombineHandle<T>::LaunchDispatch(hipStream_t stream) {
       (config.worldSize * config.warpNumPerBlock +
        config.numExpertPerRank * config.warpNumPerBlock + config.numExpertPerRank) *
       sizeof(uint32_t);
-  EpDispatchKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
+  // EpDispatchKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
+  EpDispatchKernelPeSorted<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
 }
 
 template <typename T>

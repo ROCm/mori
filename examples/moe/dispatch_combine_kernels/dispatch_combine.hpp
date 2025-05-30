@@ -84,6 +84,7 @@ class EpDispatchCombineHandle {
   uint32_t* tokenIndicesToPeSortedBuf{nullptr};
   uint32_t* peTokenOffset{nullptr};
   uint32_t* exptTokenOffset{nullptr};
+  uint32_t* dispatchDestTokId{nullptr};
 };
 
 }  // namespace moe
