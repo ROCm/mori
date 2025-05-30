@@ -44,7 +44,7 @@ void P2PBandwidthTest() {
   int chunkSize = 7168;
   int chunkNum = 128;
   int warpNum = 8;
-  int blockNum = 256;
+  int blockNum = 128;
 
   for (int i = 0; i < 10; i++) {
     void* buff = ShmemExtMallocWithFlags(chunkSize * chunkNum, hipDeviceMallocUncached);

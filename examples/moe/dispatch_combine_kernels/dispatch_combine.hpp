@@ -69,7 +69,9 @@ class EpDispatchCombineHandle {
   // Record number of tokens that will be received from other PE
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
   mori::application::SymmMemObjPtr sendTokenNumMemObj;
-  uint32_t* gridCopyTokenBarrier{nullptr};
+  uint32_t* dispatchGridCopyTokenBarrier{nullptr};
+  uint32_t* combineGridCopyTokenBarrier{nullptr};
+
   // Buffers for token to expert mapping, only used for shmem ops at dispatch phase
   mori::application::SymmMemObjPtr inpTokToExptMapMemObj;
   mori::application::SymmMemObjPtr outTokToExptMapMemObj;

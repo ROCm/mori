@@ -40,7 +40,8 @@ struct EpDispatchCombineArgs {
   SymmMemObjPtr shmemOutTokMemObj;
   SymmMemObjPtr recvTokenNumMemObj;
   SymmMemObjPtr sendTokenNumMemObj;
-  uint32_t* gridCopyTokenBarrier{nullptr};
+  uint32_t* dispatchGridCopyTokenBarrier{nullptr};
+  uint32_t* combineGridCopyTokenBarrier{nullptr};
   SymmMemObjPtr inpTokToExptMapMemObj;
   SymmMemObjPtr outTokToExptMapMemObj;
   uint32_t* peTokenOffset{nullptr};
@@ -65,7 +66,8 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<
   args.shmemOutTokMemObj = handle.shmemOutTokMemObj;
   args.recvTokenNumMemObj = handle.recvTokenNumMemObj;
   args.sendTokenNumMemObj = handle.sendTokenNumMemObj;
-  args.gridCopyTokenBarrier = handle.gridCopyTokenBarrier;
+  args.dispatchGridCopyTokenBarrier = handle.dispatchGridCopyTokenBarrier;
+  args.combineGridCopyTokenBarrier = handle.combineGridCopyTokenBarrier;
   args.inpTokToExptMapMemObj = handle.inpTokToExptMapMemObj;
   args.outTokToExptMapMemObj = handle.outTokToExptMapMemObj;
   args.exptSortedToPeSortedBuf = handle.exptSortedToPeSortedBuf;
@@ -105,7 +107,7 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
 
   // Phase1: send token
   // Each warp compute token offset on destinition PE
-
+  int i = globalWarpId;
   for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
        i += globalWarpNum) {
     uint32_t destExpert = args.tokenIndicies[i];
@@ -118,27 +120,27 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
       inpTokToExptBuf[destPe * maxNumOutTokenPerRank + peTokenIdx] = destExpert;
     }
     peTokenIdx = __shfl(peTokenIdx, 0);
-
     uint32_t tokenId = i / config.numExpertPerToken;
     uint32_t tokenOffset = tokenId * config.hiddenDim;
 
     uint32_t peSortedId = myPe * maxNumOutTokenPerRank + peTokenIdx;
     uint32_t peSortedOffset = peSortedId * config.hiddenDim;
 
-    // WarpCopy(args.shmemInpTokMemObj->template GetAs<T*>() + tokenOffset,
-    //          args.inpTokenBuf + tokenOffset, config.hiddenDim);
-    // ShmemPutTypeNbiWarp<T>(args.shmemOutTokMemObj, peSortedOffset, args.shmemInpTokMemObj,
-    //                        tokenOffset, config.hiddenDim, destPe);
+    WarpCopy(args.shmemInpTokMemObj->template GetAs<T*>() + tokenOffset,
+             args.inpTokenBuf + tokenOffset, config.hiddenDim);
+    ShmemPutTypeNbiWarp<T>(args.shmemOutTokMemObj, peSortedOffset, args.shmemInpTokMemObj,
+                           tokenOffset, config.hiddenDim, destPe);
     WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>(destPe) + peSortedOffset,
              args.inpTokenBuf + tokenOffset, config.hiddenDim);
   }
-  if (laneId == 0) atomicAdd(args.gridCopyTokenBarrier, 1);
+  if (laneId == 0) atomicAdd(args.dispatchGridCopyTokenBarrier, 1);
   SyncIfDebugEnabled("Dispatch kernel: finished send token");
+  // 100 us
 
   // Send token num & token to expert mapping to other ranks
   for (int destPe = globalWarpId; destPe < npes; destPe += globalWarpNum) {
     // Wait until all tokens are sent
-    ShmemUint32WaitUntilEquals(args.gridCopyTokenBarrier, globalWarpNum);
+    ShmemUint32WaitUntilEquals(args.dispatchGridCopyTokenBarrier, globalWarpNum);
 
     // Add 1 so that when token number == 0, receiver side still know the signal is sent
     uint32_t recvTokenNum = AtomicLoadRelaxed(args.peTokenOffset + destPe);
@@ -151,6 +153,7 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
                              destPe);
   }
   SyncIfDebugEnabled("Dispatch kernel: finish sending tok2expt mapping & num token signal");
+  // 180 us
 
   // Phase 2: recv token
   // Each warp wait until sender finished by waiting token number signal
@@ -180,6 +183,7 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
     }
   }
   __syncthreads();
+  // 223 us
 
   // Calculate prefix sum of expert token offset
   uint32_t accumOffset = 0;
@@ -193,6 +197,7 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
     accumExpertTokOffsets[thdId] = accumOffset;
   }
   __syncthreads();
+  // 354 us
 
   T* outTokenBuf = args.outTokenBuf;
   T* shmemOutTokenBuf = args.shmemOutTokMemObj->template GetAs<T*>();
@@ -286,7 +291,7 @@ __global__ void EpCombineKernel(EpDispatchCombineArgs<T> args) {
     ShmemPutTypeNbiWarp<T>(args.shmemOutTokMemObj, peerPeSortedOffset, args.shmemInpTokMemObj,
                            peSortedOffset, config.hiddenDim, destPe);
     if (laneId == 0) {
-      uint32_t destPeCopyCnt = atomicAdd(args.gridCopyTokenBarrier + destPe, 1);
+      uint32_t destPeCopyCnt = atomicAdd(args.combineGridCopyTokenBarrier + destPe, 1);
     }
   }
   SyncIfDebugEnabled("Combine kernel: finish recovering from expert sorted to pe sorted");
@@ -298,8 +303,8 @@ __global__ void EpCombineKernel(EpDispatchCombineArgs<T> args) {
     uint32_t numTokenSignal = recvTokenNumBuf[destPe];
     uint32_t recvTokenNum = numTokenSignal - 1;
 
-    ShmemUint32WaitUntilEquals(args.gridCopyTokenBarrier + destPe, recvTokenNum);
-    AtomicStoreRelaxed(args.gridCopyTokenBarrier + destPe, uint32_t{0});
+    ShmemUint32WaitUntilEquals(args.combineGridCopyTokenBarrier + destPe, recvTokenNum);
+    AtomicStoreRelaxed(args.combineGridCopyTokenBarrier + destPe, uint32_t{0});
     ShmemPutUint32ImmNbiWarp(args.sendTokenNumMemObj, myPe * sizeof(uint32_t), numTokenSignal,
                              destPe);
   }
@@ -339,7 +344,8 @@ __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
     args.recvTokenNumMemObj->template GetAs<uint32_t*>()[destPe] = 0;
     args.sendTokenNumMemObj->template GetAs<uint32_t*>()[destPe] = 0;
     args.peTokenOffset[destPe] = 0;
-    args.gridCopyTokenBarrier[destPe] = 0;
+    args.dispatchGridCopyTokenBarrier[destPe] = 0;
+    args.combineGridCopyTokenBarrier[destPe] = 0;
   }
   for (int exptId = thdId; exptId < args.config.numExpertPerRank; exptId += blockDim.x) {
     args.exptTokenOffset[exptId] = 0;
@@ -402,15 +408,18 @@ void EpDispatchCombineHandle<T>::IntializeTokenNumSignalBuf() {
   sendTokenNumMemObj = ShmemQueryMemObjPtr(sendTokenNumBuf);
   assert(sendTokenNumMemObj.IsValid());
 
-  HIP_RUNTIME_CHECK(hipMalloc(&gridCopyTokenBarrier, tokenNumSignalSize));
-  HIP_RUNTIME_CHECK(hipMemset(gridCopyTokenBarrier, 0, tokenNumSignalSize));
+  HIP_RUNTIME_CHECK(hipMalloc(&dispatchGridCopyTokenBarrier, tokenNumSignalSize));
+  HIP_RUNTIME_CHECK(hipMemset(dispatchGridCopyTokenBarrier, 0, tokenNumSignalSize));
+  HIP_RUNTIME_CHECK(hipMalloc(&combineGridCopyTokenBarrier, tokenNumSignalSize));
+  HIP_RUNTIME_CHECK(hipMemset(combineGridCopyTokenBarrier, 0, tokenNumSignalSize));
 }
 
 template <typename T>
 void EpDispatchCombineHandle<T>::FinalizeTokenNumSignalBuf() {
   ShmemFree(recvTokenNumMemObj->localPtr);
   ShmemFree(sendTokenNumMemObj->localPtr);
-  HIP_RUNTIME_CHECK(hipFree(gridCopyTokenBarrier));
+  HIP_RUNTIME_CHECK(hipFree(dispatchGridCopyTokenBarrier));
+  HIP_RUNTIME_CHECK(hipFree(combineGridCopyTokenBarrier));
 }
 
 template <typename T>
