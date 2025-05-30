@@ -140,12 +140,8 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
     // Wait until all tokens are sent
     ShmemUint32WaitUntilEquals(args.gridCopyTokenBarrier, globalWarpNum);
 
-    // TODO: reset grid copy token barrier!
-    // AtomicStoreRelaxed(args.gridCopyTokenBarrier, uint32_t{0});  // reset for next inference
-
     // Add 1 so that when token number == 0, receiver side still know the signal is sent
     uint32_t recvTokenNum = AtomicLoadRelaxed(args.peTokenOffset + destPe);
-
     ShmemPutUint32NbiWarp(args.outTokToExptMapMemObj, myPe * maxNumOutTokenPerRank,
                           args.inpTokToExptMapMemObj, destPe * maxNumOutTokenPerRank, recvTokenNum,
                           destPe);
@@ -483,6 +479,7 @@ void EpDispatchCombineHandle<T>::LaunchCombine(hipStream_t stream) {
 
 template <typename T>
 void EpDispatchCombineHandle<T>::LaunchReset(hipStream_t stream) {
+  dim3 block(std::max(config.numExpertPerRank, config.worldSize));
   EpDispatchCombineResetKernel<<<1, config.numExpertPerRank, 0, stream>>>(
       GetEpDispatchCombineArgs(*this));
 }

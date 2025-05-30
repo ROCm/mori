@@ -46,9 +46,13 @@ void Context::IntializePossibleTransports() {
   const RdmaDeviceList& devices = rdmaContext->GetRdmaDeviceList();
   ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(devices);
 
-  RdmaDevice* device = activeDevicePortList[rankInNode % activeDevicePortList.size()].first;
-  int portId = activeDevicePortList[rankInNode % activeDevicePortList.size()].second;
-  rdmaDeviceContext.reset(device->CreateRdmaDeviceContext());
+  int portId;
+  RdmaDevice* device = nullptr;
+  if (!activeDevicePortList.empty()) {
+    RdmaDevice* device = activeDevicePortList[rankInNode % activeDevicePortList.size()].first;
+    portId = activeDevicePortList[rankInNode % activeDevicePortList.size()].second;
+    rdmaDeviceContext.reset(device->CreateRdmaDeviceContext());
+  }
 
   // Intialize transport
   int peerRankInNode = -1;
@@ -70,6 +74,8 @@ void Context::IntializePossibleTransports() {
         continue;
       }
     }
+
+    if (rdmaDeviceContext.get() == nullptr) assert(false && "no rdma device found");
 
     application::RdmaEndpointConfig config;
     config.portId = portId;

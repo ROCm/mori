@@ -55,11 +55,13 @@ void GpuStateInit() {
                 sizeof(application::TransportType) * worldSize, hipMemcpyHostToDevice));
 
   // Copy endpoints to GPU
-  HIP_RUNTIME_CHECK(
-      hipMalloc(&gpuStates.rdmaEndpoints, sizeof(application::RdmaEndpoint) * worldSize));
-  HIP_RUNTIME_CHECK(
-      hipMemcpy(gpuStates.rdmaEndpoints, rdmaStates->commContext->GetRdmaEndpoints().data(),
-                sizeof(application::RdmaEndpoint) * worldSize, hipMemcpyHostToDevice));
+  if (rdmaStates->commContext->RdmaTransportEnabled()) {
+    HIP_RUNTIME_CHECK(
+        hipMalloc(&gpuStates.rdmaEndpoints, sizeof(application::RdmaEndpoint) * worldSize));
+    HIP_RUNTIME_CHECK(
+        hipMemcpy(gpuStates.rdmaEndpoints, rdmaStates->commContext->GetRdmaEndpoints().data(),
+                  sizeof(application::RdmaEndpoint) * worldSize, hipMemcpyHostToDevice));
+  }
 
   // Copy gpu states to constant memory
   HIP_RUNTIME_CHECK(

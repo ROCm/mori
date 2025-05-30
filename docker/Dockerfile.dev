@@ -1,0 +1,4 @@
+FROM rocm/dev-ubuntu-22.04:latest
+
+RUN apt-get update && \
+    apt-get install -y cython3 ibverbs-utils openmpi-bin libopenmpi-dev cmake
