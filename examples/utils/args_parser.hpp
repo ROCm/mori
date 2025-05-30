@@ -11,6 +11,9 @@
 #include <string>
 
 #include "common_utils.hpp"
+#include "mori/core/transport/rdma/primitives.hpp"
+
+using namespace mori::core;
 
 // Enums and types would typically be defined in a header file
 enum MORIDataType {
@@ -35,23 +38,6 @@ enum MORIReduceOp { MORI_MIN, MORI_MAX, MORI_SUM, MORI_PROD, MORI_AND, MORI_OR, 
 
 enum MORIScope { MORI_THREAD, MORI_WARP, MORI_BLOCK, MORI_ALL_SCOPES };
 
-enum AMOType {
-  AMO_INC,
-  AMO_FETCH_INC,
-  AMO_SET,
-  AMO_ADD,
-  AMO_FETCH_ADD,
-  AMO_AND,
-  AMO_FETCH_AND,
-  AMO_OR,
-  AMO_FETCH_OR,
-  AMO_XOR,
-  AMO_FETCH_XOR,
-  AMO_SWAP,
-  AMO_COMPARE_SWAP,
-  AMO_ACK
-};
-
 enum Direction { READ, WRITE };
 
 enum PutGetIssue { ON_STREAM, HOST };
@@ -73,7 +59,7 @@ struct ThreadgroupScope {
 };
 
 struct AMO {
-  AMOType type;
+  atomicType type;
   std::string name;
 };
 
@@ -127,7 +113,7 @@ class BenchmarkConfig {
   bool bidirectional = false;
   bool report_msgrate = false;
 
-  Datatype datatype = {MORI_INT, sizeof(int), "int"};
+  Datatype datatype = {MORI_UINT64, sizeof(uint64_t), "uint64_t"};
   ReduceOp reduce_op = {MORI_SUM, "sum"};
   ThreadgroupScope threadgroup_scope = {MORI_ALL_SCOPES, "all_scopes"};
   AMO test_amo = {AMO_INC, "inc"};

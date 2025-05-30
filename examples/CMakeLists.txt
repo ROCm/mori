@@ -67,3 +67,11 @@ add_executable(
     benchmarks/p2p_bandwidth.cpp
 )
 target_link_libraries(p2p_bandwidth mori_application mori_shmem hip::host hip::device)
+
+add_executable(
+    atomic_perf
+    benchmarks/atomic_perf.cpp
+    utils/args_parser.cpp
+)
+target_include_directories(atomic_perf PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
+target_link_libraries(atomic_perf mori_application hip::host hip::device)
