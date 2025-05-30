@@ -126,10 +126,6 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
     uint32_t peSortedId = myPe * maxNumOutTokenPerRank + peTokenIdx;
     uint32_t peSortedOffset = peSortedId * config.hiddenDim;
 
-    WarpCopy(args.shmemInpTokMemObj->template GetAs<T*>() + tokenOffset,
-             args.inpTokenBuf + tokenOffset, config.hiddenDim);
-    ShmemPutTypeNbiWarp<T>(args.shmemOutTokMemObj, peSortedOffset, args.shmemInpTokMemObj,
-                           tokenOffset, config.hiddenDim, destPe);
     WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>(destPe) + peSortedOffset,
              args.inpTokenBuf + tokenOffset, config.hiddenDim);
   }

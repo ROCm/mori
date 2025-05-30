@@ -88,6 +88,7 @@ class EpDispatchCombineTestCase {
     HIP_RUNTIME_CHECK(hipMemset(inpTokBuf, 0, maxTokenSize));
     HIP_RUNTIME_CHECK(hipMalloc(&outTokBuf, maxTokenSize));
     HIP_RUNTIME_CHECK(hipMemset(outTokBuf, 0, maxTokenSize));
+    inpTokBufCpu = reinterpret_cast<T*>(malloc(maxTokenSize));
 
     int tokenIndiciesSize =
         config.maxNumInpTokenPerRank * config.numExpertPerToken * sizeof(uint32_t);
@@ -158,7 +159,6 @@ class EpDispatchCombineTestCase {
     // Collect tokens from all ranks
     int inpTokEleNum = config.maxNumInpTokenPerRank * config.hiddenDim;
     int inpTokSize = inpTokEleNum * sizeof(T);
-    inpTokBufCpu = reinterpret_cast<T*>(malloc(inpTokSize));
     HIP_RUNTIME_CHECK(
         hipMemcpy(inpTokBufCpu, handle.inpTokenBuf, inpTokSize, hipMemcpyDeviceToHost));
 
@@ -275,24 +275,26 @@ class EpDispatchCombineTestCase {
 
   void CheckCombineResult() {
     EpDispatchCombineConfig& config = handle.config;
-
     for (int i = 0; i < handle.curRankNumToken; i++) {
       uint32_t tokenOffset = i * config.hiddenDim;
 
       // compute weight sum
       float weightSum = 0.0f;
-      for (int k = 0; k < config.numExpertPerToken; k++)
+      for (int k = 0; k < config.numExpertPerToken; k++) {
         weightSum += weightsBuf[i * config.numExpertPerToken + k];
+      }
 
       for (int j = 0; j < config.hiddenDim; j++) {
-        float expected = float(reinterpret_cast<T*>(inpTokBufCpu)[tokenOffset + j]) * weightSum;
+        float expected =
+            float(T(float(reinterpret_cast<T*>(inpTokBufCpu)[tokenOffset + j]) * weightSum));
         float got = float(handle.outTokenBuf[tokenOffset + j]);
-        // if (abs(got - expected) > runConfig.atol) {
-        std::cout << "Wrong result at pos " << j << ": mype " << config.rank << " tokenId " << i
-                  << " expected " << expected << " got " << got << " weight sum " << weightSum
-                  << std::endl;
-        // assert(false);
-        // }
+        assert(weightSum != 0);
+        if (abs(got - expected) > runConfig.atol) {
+          std::cout << "Wrong result at pos " << j << ": mype " << config.rank << " tokenId " << i
+                    << " expected " << expected << " got " << got << " weight sum " << weightSum
+                    << std::endl;
+          assert(false);
+        }
       }
     }
   }
@@ -443,8 +445,7 @@ class EpDispatchCombineTestCase {
     uniform_real_distribution<> tokValDist(1, 2);
     for (int i = 0; i < numToken; i++) {
       for (int j = 0; j < config.numExpertPerToken; j++) {
-        // weightsBuf[i * config.numExpertPerRank + j] = tokValDist(gen);
-        weightsBuf[i * config.numExpertPerRank + j] = 1.0f;
+        weightsBuf[i * config.numExpertPerToken + j] = tokValDist(gen);
       }
     }
   }
