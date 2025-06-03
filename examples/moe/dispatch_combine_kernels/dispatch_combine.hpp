@@ -85,7 +85,63 @@ class EpDispatchCombineHandle {
   uint32_t* peTokenOffset{nullptr};
   uint32_t* exptTokenOffset{nullptr};
   uint32_t* dispatchDestTokId{nullptr};
+
+  mori::application::SymmMemObjPtr dispTokOffsetMemObj;
+  mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
 };
+
+template <typename T>
+struct EpDispatchCombineArgs {
+  EpDispatchCombineConfig config;
+  int curRankNumToken{-1};
+  uint32_t* tokenIndicies{nullptr};
+  T* inpTokenBuf{nullptr};
+  T* outTokenBuf{nullptr};
+  float* weightsBuf{nullptr};
+  mori::application::SymmMemObjPtr shmemInpTokMemObj;
+  mori::application::SymmMemObjPtr shmemOutTokMemObj;
+  mori::application::SymmMemObjPtr recvTokenNumMemObj;
+  mori::application::SymmMemObjPtr sendTokenNumMemObj;
+  uint32_t* dispatchGridCopyTokenBarrier{nullptr};
+  uint32_t* combineGridCopyTokenBarrier{nullptr};
+  mori::application::SymmMemObjPtr inpTokToExptMapMemObj;
+  mori::application::SymmMemObjPtr outTokToExptMapMemObj;
+  uint32_t* peTokenOffset{nullptr};
+  uint32_t* exptTokenOffset{nullptr};
+  uint32_t* dispatchDestTokId{nullptr};
+  uint32_t* exptSortedToPeSortedBuf{nullptr};
+  uint32_t* tokenIndicesToPeSortedBuf{nullptr};
+
+  mori::application::SymmMemObjPtr dispTokOffsetMemObj;
+  mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
+};
+
+template <typename T>
+EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<T>& handle) {
+  EpDispatchCombineArgs<T> args;
+  args.config = handle.config;
+  args.curRankNumToken = handle.curRankNumToken;
+  args.tokenIndicies = handle.tokenIndicies;
+  args.inpTokenBuf = handle.inpTokenBuf;
+  args.outTokenBuf = handle.outTokenBuf;
+  args.weightsBuf = handle.weightsBuf;
+  args.peTokenOffset = handle.peTokenOffset;
+  args.exptTokenOffset = handle.exptTokenOffset;
+  args.dispatchDestTokId = handle.dispatchDestTokId;
+  args.shmemInpTokMemObj = handle.shmemInpTokMemObj;
+  args.shmemOutTokMemObj = handle.shmemOutTokMemObj;
+  args.recvTokenNumMemObj = handle.recvTokenNumMemObj;
+  args.sendTokenNumMemObj = handle.sendTokenNumMemObj;
+  args.dispatchGridCopyTokenBarrier = handle.dispatchGridCopyTokenBarrier;
+  args.combineGridCopyTokenBarrier = handle.combineGridCopyTokenBarrier;
+  args.inpTokToExptMapMemObj = handle.inpTokToExptMapMemObj;
+  args.outTokToExptMapMemObj = handle.outTokToExptMapMemObj;
+  args.exptSortedToPeSortedBuf = handle.exptSortedToPeSortedBuf;
+  args.tokenIndicesToPeSortedBuf = handle.tokenIndicesToPeSortedBuf;
+  args.dispTokOffsetMemObj = handle.dispTokOffsetMemObj;
+  args.dispTokIdToSrcTokIdMemObj = handle.dispTokIdToSrcTokIdMemObj;
+  return args;
+}
 
 }  // namespace moe
 }  // namespace mori

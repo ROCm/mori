@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
 
+#include "dispatch_combine_kernels/intranode.hpp"
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem.hpp"
 
@@ -26,55 +27,6 @@ __device__ void SyncIfDebugEnabled(const char* msg) {
   }
   __syncthreads();
 #endif
-}
-
-template <typename T>
-struct EpDispatchCombineArgs {
-  EpDispatchCombineConfig config;
-  int curRankNumToken{-1};
-  uint32_t* tokenIndicies{nullptr};
-  T* inpTokenBuf{nullptr};
-  T* outTokenBuf{nullptr};
-  float* weightsBuf{nullptr};
-  SymmMemObjPtr shmemInpTokMemObj;
-  SymmMemObjPtr shmemOutTokMemObj;
-  SymmMemObjPtr recvTokenNumMemObj;
-  SymmMemObjPtr sendTokenNumMemObj;
-  uint32_t* dispatchGridCopyTokenBarrier{nullptr};
-  uint32_t* combineGridCopyTokenBarrier{nullptr};
-  SymmMemObjPtr inpTokToExptMapMemObj;
-  SymmMemObjPtr outTokToExptMapMemObj;
-  uint32_t* peTokenOffset{nullptr};
-  uint32_t* exptTokenOffset{nullptr};
-  uint32_t* dispatchDestTokId{nullptr};
-  uint32_t* exptSortedToPeSortedBuf{nullptr};
-  uint32_t* tokenIndicesToPeSortedBuf{nullptr};
-};
-
-template <typename T>
-
-EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<T>& handle) {
-  EpDispatchCombineArgs<T> args;
-  args.config = handle.config;
-  args.curRankNumToken = handle.curRankNumToken;
-  args.tokenIndicies = handle.tokenIndicies;
-  args.inpTokenBuf = handle.inpTokenBuf;
-  args.outTokenBuf = handle.outTokenBuf;
-  args.weightsBuf = handle.weightsBuf;
-  args.peTokenOffset = handle.peTokenOffset;
-  args.exptTokenOffset = handle.exptTokenOffset;
-  args.dispatchDestTokId = handle.dispatchDestTokId;
-  args.shmemInpTokMemObj = handle.shmemInpTokMemObj;
-  args.shmemOutTokMemObj = handle.shmemOutTokMemObj;
-  args.recvTokenNumMemObj = handle.recvTokenNumMemObj;
-  args.sendTokenNumMemObj = handle.sendTokenNumMemObj;
-  args.dispatchGridCopyTokenBarrier = handle.dispatchGridCopyTokenBarrier;
-  args.combineGridCopyTokenBarrier = handle.combineGridCopyTokenBarrier;
-  args.inpTokToExptMapMemObj = handle.inpTokToExptMapMemObj;
-  args.outTokToExptMapMemObj = handle.outTokToExptMapMemObj;
-  args.exptSortedToPeSortedBuf = handle.exptSortedToPeSortedBuf;
-  args.tokenIndicesToPeSortedBuf = handle.tokenIndicesToPeSortedBuf;
-  return args;
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -453,7 +405,10 @@ __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
   for (int exptId = thdId; exptId < args.config.numExpertPerRank; exptId += blockDim.x) {
     args.exptTokenOffset[exptId] = 0;
   }
-  if (thdId == 0) args.dispatchDestTokId[0] = 0;
+  if (thdId == 0) {
+    args.dispatchDestTokId[0] = 0;
+    args.dispTokOffsetMemObj->template GetAs<uint32_t*>()[0] = 0;
+  }
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -529,7 +484,7 @@ void EpDispatchCombineHandle<T>::FinalizeTokenNumSignalBuf() {
 template <typename T>
 void EpDispatchCombineHandle<T>::IntializeTokToExptBuf() {
   int tokToExptMapSize =
-      config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken * sizeof(uint32_t);
+      config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerRank * sizeof(uint32_t);
   void* inpTokToExptMapBuf = ShmemExtMallocWithFlags(tokToExptMapSize, hipDeviceMallocUncached);
   HIP_RUNTIME_CHECK(hipMemset(inpTokToExptMapBuf, 0, tokToExptMapSize));
   inpTokToExptMapMemObj = ShmemQueryMemObjPtr(inpTokToExptMapBuf);
@@ -564,6 +519,17 @@ void EpDispatchCombineHandle<T>::IntializeOrderMapBuf() {
 
   HIP_RUNTIME_CHECK(hipMalloc(&dispatchDestTokId, sizeof(uint32_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispatchDestTokId, 0, sizeof(uint32_t)));
+
+  void* dispTokOffsetBuf = ShmemExtMallocWithFlags(sizeof(uint32_t), hipDeviceMallocUncached);
+  HIP_RUNTIME_CHECK(hipMemset(dispTokOffsetBuf, 0, sizeof(uint32_t)));
+  dispTokOffsetMemObj = ShmemQueryMemObjPtr(dispTokOffsetBuf);
+  assert(dispTokOffsetMemObj.IsValid());
+
+  void* dispTokIdToSrcTokIdBuf =
+      ShmemExtMallocWithFlags(maxNumOutToken * sizeof(uint32_t), hipDeviceMallocUncached);
+  HIP_RUNTIME_CHECK(hipMemset(dispTokIdToSrcTokIdBuf, 0, maxNumOutToken * sizeof(uint32_t)));
+  dispTokIdToSrcTokIdMemObj = ShmemQueryMemObjPtr(dispTokIdToSrcTokIdBuf);
+  assert(dispTokIdToSrcTokIdMemObj.IsValid());
 }
 
 template <typename T>
@@ -573,6 +539,8 @@ void EpDispatchCombineHandle<T>::FinalizeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipFree(peTokenOffset));
   HIP_RUNTIME_CHECK(hipFree(exptTokenOffset));
   HIP_RUNTIME_CHECK(hipFree(dispatchDestTokId));
+  ShmemFree(dispTokOffsetMemObj->localPtr);
+  ShmemFree(dispTokIdToSrcTokIdMemObj->localPtr);
 }
 
 template <typename T>
@@ -584,7 +552,10 @@ void EpDispatchCombineHandle<T>::LaunchDispatch(hipStream_t stream) {
        config.numExpertPerRank * config.warpNumPerBlock + config.numExpertPerRank) *
       sizeof(uint32_t);
   // EpDispatchKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
-  EpDispatchKernelPeSorted<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
+  // EpDispatchKernelPeSorted<<<grid, block, sharedMemSize,
+  // stream>>>(GetEpDispatchCombineArgs(*this));
+  EpDispatchIntraNodeKernel<<<grid, block, sharedMemSize, stream>>>(
+      GetEpDispatchCombineArgs(*this));
 }
 
 template <typename T>
