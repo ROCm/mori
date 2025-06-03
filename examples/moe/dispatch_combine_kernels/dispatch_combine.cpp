@@ -530,6 +530,9 @@ void EpDispatchCombineHandle<T>::IntializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipMemset(dispTokIdToSrcTokIdBuf, 0, maxNumOutToken * sizeof(uint32_t)));
   dispTokIdToSrcTokIdMemObj = ShmemQueryMemObjPtr(dispTokIdToSrcTokIdBuf);
   assert(dispTokIdToSrcTokIdMemObj.IsValid());
+
+  HIP_RUNTIME_CHECK(hipMalloc(&dispDestTokIdMap, maxNumOutToken * sizeof(uint32_t)));
+  HIP_RUNTIME_CHECK(hipMemset(dispDestTokIdMap, 0, maxNumOutToken * sizeof(uint32_t)));
 }
 
 template <typename T>
@@ -541,6 +544,7 @@ void EpDispatchCombineHandle<T>::FinalizeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipFree(dispatchDestTokId));
   ShmemFree(dispTokOffsetMemObj->localPtr);
   ShmemFree(dispTokIdToSrcTokIdMemObj->localPtr);
+  HIP_RUNTIME_CHECK(hipFree(dispDestTokIdMap));
 }
 
 template <typename T>
@@ -563,7 +567,8 @@ void EpDispatchCombineHandle<T>::LaunchCombine(hipStream_t stream) {
   dim3 grid(config.blockNum);
   dim3 block(warpSize * config.warpNumPerBlock);
   size_t sharedMemSize = config.warpNumPerBlock * config.numExpertPerToken * sizeof(T**);
-  EpCombineKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
+  // EpCombineKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
+  EpCombineIntraNodeKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
 }
 
 template <typename T>

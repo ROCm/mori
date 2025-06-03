@@ -140,27 +140,31 @@ __device__ void WarpAccum(T* dest, T** srcs, float* srcScales, size_t accumNum, 
   while ((offset + vecSize) <= nelems) {
     float accumValFp32[vecSize] = {0};
 
+#pragma unroll
     for (int i = 0; i < accumNum; i++) {
       uint4 srcVals = reinterpret_cast<uint4*>(srcs[i] + offset)[0];
       float srcScale = srcScales[i];
+
+#pragma unroll
       for (int j = 0; j < vecSize; j++) {
         float srcVal = float(reinterpret_cast<T*>(&srcVals)[j]);
         accumValFp32[j] += srcVal * srcScale;
       }
     }
-
     uint4 accumVals;
+#pragma unroll
     for (int i = 0; i < vecSize; i++) {
       float accumVal = accumValFp32[i];
       reinterpret_cast<T*>(&accumVals)[i] = T(accumVal);
     }
     reinterpret_cast<uint4*>(dest + offset)[0] = accumVals;
 
-    offset += vecSize;
+    offset += warpSize * vecSize;
   }
 
   while (offset < nelems) {
     float accumValFp32 = 0;
+#pragma unroll
     for (int i = 0; i < accumNum; i++) {
       dest[offset] = T(float(srcs[i][offset]) * srcScales[i]);
     }

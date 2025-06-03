@@ -88,6 +88,8 @@ class EpDispatchCombineHandle {
 
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
+
+  uint32_t* dispDestTokIdMap{nullptr};
 };
 
 template <typename T>
@@ -114,6 +116,8 @@ struct EpDispatchCombineArgs {
 
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
+
+  uint32_t* dispDestTokIdMap{nullptr};
 };
 
 template <typename T>
@@ -140,6 +144,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<
   args.tokenIndicesToPeSortedBuf = handle.tokenIndicesToPeSortedBuf;
   args.dispTokOffsetMemObj = handle.dispTokOffsetMemObj;
   args.dispTokIdToSrcTokIdMemObj = handle.dispTokIdToSrcTokIdMemObj;
+  args.dispDestTokIdMap = handle.dispDestTokIdMap;
   return args;
 }
 
