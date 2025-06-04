@@ -56,13 +56,13 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
                    args.inpTokenBuf + srcTokOffset, config.hiddenDim);
   }
-  if (laneId == 0) atomicAdd(args.dispatchGridCopyTokenBarrier, 1);
+  if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
   // Send token num & token to expert mapping to other ranks
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       // Wait until all tokens are sent
-      shmem::ShmemUint32WaitUntilEquals(args.dispatchGridCopyTokenBarrier, globalWarpNum);
+      shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
 
       // Add 1 so that when token number == 0, receiver side still know the signal is sent
       uint32_t numTokenSignal = core::AtomicLoadRelaxed(args.peTokenOffset + destPe) + 1;

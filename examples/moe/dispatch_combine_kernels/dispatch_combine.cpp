@@ -83,7 +83,7 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
     WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>(destPe) + peSortedOffset,
              args.inpTokenBuf + tokenOffset, config.hiddenDim);
   }
-  if (laneId == 0) atomicAdd(args.dispatchGridCopyTokenBarrier, 1);
+  if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
   SyncIfDebugEnabled("Dispatch kernel: finished send token");
   // 95 us
 
@@ -91,7 +91,7 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       // Wait until all tokens are sent
-      ShmemUint32WaitUntilEquals(args.dispatchGridCopyTokenBarrier, globalWarpNum);
+      ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
 
       // Add 1 so that when token number == 0, receiver side still know the signal is sent
       uint32_t numTokenSignal = AtomicLoadRelaxed(args.peTokenOffset + destPe) + 1;
@@ -231,7 +231,7 @@ __global__ void EpDispatchKernelPeSorted(EpDispatchCombineArgs<T> args) {
     WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>(destPe) + peSortedOffset,
              args.inpTokenBuf + tokenOffset, config.hiddenDim);
   }
-  if (laneId == 0) atomicAdd(args.dispatchGridCopyTokenBarrier, 1);
+  if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
   SyncIfDebugEnabled("Dispatch kernel: finished send token");
   // 95 us
 
@@ -239,7 +239,7 @@ __global__ void EpDispatchKernelPeSorted(EpDispatchCombineArgs<T> args) {
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       // Wait until all tokens are sent
-      ShmemUint32WaitUntilEquals(args.dispatchGridCopyTokenBarrier, globalWarpNum);
+      ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
 
       // Add 1 so that when token number == 0, receiver side still know the signal is sent
       uint32_t numTokenSignal = AtomicLoadRelaxed(args.peTokenOffset + destPe) + 1;
@@ -346,7 +346,7 @@ __global__ void EpCombineKernel(EpDispatchCombineArgs<T> args) {
     ShmemPutTypeNbiWarp<T>(args.shmemOutTokMemObj, peerPeSortedOffset, args.shmemInpTokMemObj,
                            peSortedOffset, config.hiddenDim, destPe);
     if (laneId == 0) {
-      uint32_t destPeCopyCnt = atomicAdd(args.combineGridCopyTokenBarrier + destPe, 1);
+      uint32_t destPeCopyCnt = atomicAdd(args.combineGridBarrier + destPe, 1);
     }
   }
   SyncIfDebugEnabled("Combine kernel: finish recovering from expert sorted to pe sorted");
@@ -358,8 +358,8 @@ __global__ void EpCombineKernel(EpDispatchCombineArgs<T> args) {
     uint32_t numTokenSignal = recvTokenNumBuf[destPe];
     uint32_t recvTokenNum = numTokenSignal - 1;
 
-    ShmemUint32WaitUntilEquals(args.combineGridCopyTokenBarrier + destPe, recvTokenNum);
-    AtomicStoreRelaxed(args.combineGridCopyTokenBarrier + destPe, uint32_t{0});
+    ShmemUint32WaitUntilEquals(args.combineGridBarrier + destPe, recvTokenNum);
+    AtomicStoreRelaxed(args.combineGridBarrier + destPe, uint32_t{0});
     ShmemPutUint32ImmNbiWarp(args.sendTokenNumMemObj, myPe * sizeof(uint32_t), numTokenSignal,
                              destPe);
   }
@@ -399,14 +399,13 @@ __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
     args.recvTokenNumMemObj->template GetAs<uint32_t*>()[destPe] = 0;
     args.sendTokenNumMemObj->template GetAs<uint32_t*>()[destPe] = 0;
     args.peTokenOffset[destPe] = 0;
-    args.dispatchGridCopyTokenBarrier[destPe] = 0;
-    args.combineGridCopyTokenBarrier[destPe] = 0;
+    args.dispatchGridBarrier[destPe] = 0;
+    args.combineGridBarrier[destPe] = 0;
   }
   for (int exptId = thdId; exptId < args.config.numExpertPerRank; exptId += blockDim.x) {
     args.exptTokenOffset[exptId] = 0;
   }
   if (thdId == 0) {
-    args.dispatchDestTokId[0] = 0;
     args.dispTokOffsetMemObj->template GetAs<uint32_t*>()[0] = 0;
   }
 }
@@ -467,18 +466,18 @@ void EpDispatchCombineHandle<T>::IntializeTokenNumSignalBuf() {
   sendTokenNumMemObj = ShmemQueryMemObjPtr(sendTokenNumBuf);
   assert(sendTokenNumMemObj.IsValid());
 
-  HIP_RUNTIME_CHECK(hipMalloc(&dispatchGridCopyTokenBarrier, tokenNumSignalSize));
-  HIP_RUNTIME_CHECK(hipMemset(dispatchGridCopyTokenBarrier, 0, tokenNumSignalSize));
-  HIP_RUNTIME_CHECK(hipMalloc(&combineGridCopyTokenBarrier, tokenNumSignalSize));
-  HIP_RUNTIME_CHECK(hipMemset(combineGridCopyTokenBarrier, 0, tokenNumSignalSize));
+  HIP_RUNTIME_CHECK(hipMalloc(&dispatchGridBarrier, tokenNumSignalSize));
+  HIP_RUNTIME_CHECK(hipMemset(dispatchGridBarrier, 0, tokenNumSignalSize));
+  HIP_RUNTIME_CHECK(hipMalloc(&combineGridBarrier, tokenNumSignalSize));
+  HIP_RUNTIME_CHECK(hipMemset(combineGridBarrier, 0, tokenNumSignalSize));
 }
 
 template <typename T>
 void EpDispatchCombineHandle<T>::FinalizeTokenNumSignalBuf() {
   ShmemFree(recvTokenNumMemObj->localPtr);
   ShmemFree(sendTokenNumMemObj->localPtr);
-  HIP_RUNTIME_CHECK(hipFree(dispatchGridCopyTokenBarrier));
-  HIP_RUNTIME_CHECK(hipFree(combineGridCopyTokenBarrier));
+  HIP_RUNTIME_CHECK(hipFree(dispatchGridBarrier));
+  HIP_RUNTIME_CHECK(hipFree(combineGridBarrier));
 }
 
 template <typename T>
@@ -517,9 +516,6 @@ void EpDispatchCombineHandle<T>::IntializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipMalloc(&exptTokenOffset, config.numExpertPerRank * sizeof(uint32_t)));
   HIP_RUNTIME_CHECK(hipMemset(exptTokenOffset, 0, config.numExpertPerRank * sizeof(uint32_t)));
 
-  HIP_RUNTIME_CHECK(hipMalloc(&dispatchDestTokId, sizeof(uint32_t)));
-  HIP_RUNTIME_CHECK(hipMemset(dispatchDestTokId, 0, sizeof(uint32_t)));
-
   void* dispTokOffsetBuf = ShmemExtMallocWithFlags(sizeof(uint32_t), hipDeviceMallocUncached);
   HIP_RUNTIME_CHECK(hipMemset(dispTokOffsetBuf, 0, sizeof(uint32_t)));
   dispTokOffsetMemObj = ShmemQueryMemObjPtr(dispTokOffsetBuf);
@@ -541,7 +537,6 @@ void EpDispatchCombineHandle<T>::FinalizeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipFree(tokenIndicesToPeSortedBuf));
   HIP_RUNTIME_CHECK(hipFree(peTokenOffset));
   HIP_RUNTIME_CHECK(hipFree(exptTokenOffset));
-  HIP_RUNTIME_CHECK(hipFree(dispatchDestTokId));
   ShmemFree(dispTokOffsetMemObj->localPtr);
   ShmemFree(dispTokIdToSrcTokIdMemObj->localPtr);
   HIP_RUNTIME_CHECK(hipFree(dispDestTokIdMap));
