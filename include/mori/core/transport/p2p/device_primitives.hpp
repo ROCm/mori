@@ -1,5 +1,8 @@
 #pragma once
 
+#include <hip/hip_bfloat16.h>
+#include <hip/hip_fp8.h>
+
 namespace mori {
 namespace core {
 
@@ -158,18 +161,19 @@ __device__ void WarpAccum(T* dest, T** srcs, float* srcScales, size_t accumNum, 
       float accumVal = accumValFp32[i];
       reinterpret_cast<T*>(&accumVals)[i] = T(accumVal);
     }
+
     reinterpret_cast<uint4*>(dest + offset)[0] = accumVals;
 
     offset += warpSize * vecSize;
   }
 
   while (offset < nelems) {
-    assert(false);
     float accumValFp32 = 0;
 #pragma unroll
     for (int i = 0; i < accumNum; i++) {
-      dest[offset] = T(float(srcs[i][offset]) * srcScales[i]);
+      accumValFp32 += float(srcs[i][offset]) * srcScales[i];
     }
+    dest[offset] = T(accumValFp32);
     offset += 1;
   }
 }

@@ -70,7 +70,6 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
                                         numTokenSignal, destPe);
     }
   }
-
   // Phase 2: recv token
   // Each warp wait until sender finished by waiting token number signal
   for (int destPe = thdId; destPe < npes; destPe += thdNum) {
@@ -110,16 +109,13 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
   int warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
   int hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
-  // int inTokenWarpId = globalWarpId % warpsPerToken;
-  // int hiddenDimOffset = inTokenWarpId * hiddenDimPerWarp;
-  // int hiddenDimSize = std::min(config.hiddenDim, hiddenDimOffset + hiddenDimPerWarp);
 
   T* outTokenBuf = args.outTokenBuf;
   for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
     int tokenId = i / warpsPerToken;
     int inTokenPartId = i % warpsPerToken;
     int hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
-    int hiddenDimSize = std::min(config.hiddenDim, hiddenDimOffset + hiddenDimPerWarp);
+    int hiddenDimSize = std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp);
 
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
       uint32_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];

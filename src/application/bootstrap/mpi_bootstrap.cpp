@@ -7,7 +7,7 @@
 namespace mori {
 namespace application {
 
-MpiBootstrapNetwork::MpiBootstrapNetwork(MPI_Comm mpi_comm) : mpi_comm(mpi_comm) {}
+MpiBootstrapNetwork::MpiBootstrapNetwork(MPI_Comm mpi_comm) : mpi_comm(mpi_comm) { Initialize(); }
 
 MpiBootstrapNetwork::~MpiBootstrapNetwork() { Finalize(); }
 

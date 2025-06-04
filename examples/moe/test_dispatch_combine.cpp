@@ -110,8 +110,8 @@ class EpDispatchCombineTestCase {
 
   void InitializeHandle() {
     if (runConfig.testType == TestType::Accuracy) {
-      // RandomInitializeNumToken();
-      InitializeNumToken();
+      RandomInitializeNumToken();
+      // InitializeNumToken();
       RandomInitializeDispatch();
     } else if (runConfig.testType == TestType::Benchmark) {
       InitializeNumToken();
