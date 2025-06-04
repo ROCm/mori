@@ -7,6 +7,11 @@
 namespace mori {
 namespace moe {
 
+enum KernelType {
+  IntraNode = 0,
+  InterNode = 1,
+};
+
 struct EpDispatchCombineConfig {
   int rank{0};
   int worldSize{0};
@@ -16,6 +21,7 @@ struct EpDispatchCombineConfig {
   int numExpertPerToken{2};
   int warpNumPerBlock{1};
   int blockNum{1};
+  KernelType kernelType{IntraNode};
 };
 
 template <typename T>
@@ -59,16 +65,21 @@ class EpDispatchCombineHandle {
   EpDispatchCombineConfig config;
   // Routed expert indices for tokens
   uint32_t* tokenIndicies{nullptr};
+
   // Kernel input/output buffer
   T* inpTokenBuf{nullptr};
   T* outTokenBuf{nullptr};
   float* weightsBuf{nullptr};
+
   // Temporary buffers of input/output tokens used for shmem ops
   mori::application::SymmMemObjPtr shmemInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
+
   // Record number of tokens that will be received from other PE
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
   mori::application::SymmMemObjPtr sendTokenNumMemObj;
+
+  // Barrier for intra-grid synchronization
   uint32_t* dispatchGridBarrier{nullptr};
   uint32_t* combineGridBarrier{nullptr};
 
@@ -82,12 +93,15 @@ class EpDispatchCombineHandle {
   // Recover from pe sorted order to original order, filled at dispatch send phase and used at
   // combine recv phase
   uint32_t* tokenIndicesToPeSortedBuf{nullptr};
+
+  // Counter used for sorting by PE order
   uint32_t* peTokenOffset{nullptr};
+  // Counter used for sorting by expert order
   uint32_t* exptTokenOffset{nullptr};
 
+  // Intra-node kernel parameters
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
-
   uint32_t* dispDestTokIdMap{nullptr};
 };
 
@@ -111,10 +125,8 @@ struct EpDispatchCombineArgs {
   uint32_t* exptTokenOffset{nullptr};
   uint32_t* exptSortedToPeSortedBuf{nullptr};
   uint32_t* tokenIndicesToPeSortedBuf{nullptr};
-
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
-
   uint32_t* dispDestTokIdMap{nullptr};
 };
 

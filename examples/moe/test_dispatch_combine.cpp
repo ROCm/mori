@@ -166,132 +166,83 @@ class EpDispatchCombineTestCase {
     MPI_Allgather(inpTokBufCpu, inpTokSize, MPI_CHAR, globalInpTokBufCpu, inpTokSize, MPI_CHAR,
                   MPI_COMM_WORLD);
 
-    // Build pe sorted to token index map
-    std::vector<std::unordered_map<uint32_t, uint32_t>> peSortToTokenIdxMapsVec;
-    for (int i = 0; i < config.worldSize; i++) {
-      peSortToTokenIdxMapsVec.push_back({});
-      uint32_t peTokenNum = globalTokenNum[i];
-      for (int j = 0; j < peTokenNum * config.numExpertPerToken; j++) {
-        uint32_t peSortedId = globalTokenIndicesToPeSortedBufCpu[i * maxNumOutTokenPerRank + j];
-        assert(peSortToTokenIdxMapsVec[i].find(peSortedId) == peSortToTokenIdxMapsVec[i].end());
-        peSortToTokenIdxMapsVec[i].insert({peSortedId, j});
-      }
-    }
-
-    std::vector<uint32_t> srcPeCheckTokenNum(config.worldSize, 0);
-
     uint32_t totalRecvNumToken = 0;
     for (int i = 0; i < config.worldSize; i++) {
       totalRecvNumToken += handle.recvTokenNumMemObj->template GetAs<uint32_t*>()[i] - 1;
     }
     std::cout << "Rank " << config.rank << " recv " << totalRecvNumToken << " tokens" << std::endl;
 
-    for (int i = 0; i < totalRecvNumToken; i++) {
-      uint32_t peSortedId = handle.exptSortedToPeSortedBuf[i];
-      uint32_t srcPe = peSortedId / maxNumOutTokenPerRank;
-      peSortedId = peSortedId - srcPe * maxNumOutTokenPerRank + config.rank * maxNumOutTokenPerRank;
-      uint32_t srcTokDispatchId = peSortToTokenIdxMapsVec[srcPe][peSortedId];
-      uint32_t srcTokId = srcTokDispatchId / config.numExpertPerToken;
+    if (config.kernelType == IntraNode) {
+      for (int i = 0; i < totalRecvNumToken; i++) {
+        uint32_t srcTokId = handle.dispTokIdToSrcTokIdMemObj->template GetAs<uint32_t*>()[i];
 
-      T* localTokBuf = handle.outTokenBuf + i * config.hiddenDim;
-      T* srcTokBuf = reinterpret_cast<T*>(globalInpTokBufCpu) + srcPe * inpTokEleNum +
-                     srcTokId * config.hiddenDim;
-      srcPeCheckTokenNum[srcPe]++;
+        uint32_t srcPe = srcTokId / config.maxNumInpTokenPerRank;
+        uint32_t localSrcTokId = srcTokId - srcPe * config.maxNumInpTokenPerRank;
 
-      std::stringstream msg;
-      msg << "mype " << config.rank << " localTokId " << i << " srcpe " << srcPe << " srcTokId "
-          << srcTokId;
-      for (int k = 0; k < config.hiddenDim; k++) {
-        float expectedVal = float(srcTokBuf[k]);
-        float gotVal = float(localTokBuf[k]);
-        bool equal = (expectedVal == gotVal);
-        if (!equal) {
-          std::cout << "Wrong result at pos " << k << ": " << msg.str() << " expected "
-                    << expectedVal << " got " << gotVal << std::endl;
-          assert(false);
+        T* localTokBuf = handle.shmemOutTokMemObj->template GetAs<T*>() + i * config.hiddenDim;
+        T* srcTokBuf = reinterpret_cast<T*>(globalInpTokBufCpu) + srcPe * inpTokEleNum +
+                       localSrcTokId * config.hiddenDim;
+
+        std::stringstream msg;
+        msg << "mype " << config.rank << " localTokId " << i << " srcpe " << srcPe << " srcTokId "
+            << srcTokId;
+        for (int k = 0; k < config.hiddenDim; k++) {
+          float expectedVal = float(srcTokBuf[k]);
+          float gotVal = float(localTokBuf[k]);
+          bool equal = (expectedVal == gotVal);
+          assert(expectedVal != 0);
+          if (!equal) {
+            std::cout << "Wrong result at pos " << k << ": " << msg.str() << " expected "
+                      << expectedVal << " got " << gotVal << std::endl;
+            assert(false);
+          }
         }
       }
-    }
-
-    for (int i = 0; i < config.worldSize; i++) {
-      assert(srcPeCheckTokenNum[i] ==
-             (handle.recvTokenNumMemObj->template GetAs<uint32_t*>()[i] - 1));
-    }
-
-    free(globalInpTokBufCpu);
-    free(globalTokIndiciesCpu);
-    free(tokenIndicesCpu);
-  }
-
-  void CheckIntraNodeDispatchResult() {
-    EpDispatchCombineConfig& config = handle.config;
-
-    // Copy token indices to CPU
-    int maxNumOutTokenPerRank = config.maxNumInpTokenPerRank * config.numExpertPerToken;
-    int tokenIndiciesSize = maxNumOutTokenPerRank * sizeof(uint32_t);
-
-    // Collect token indices from all ranks
-    void* tokenIndicesCpu = malloc(tokenIndiciesSize);
-    HIP_RUNTIME_CHECK(
-        hipMemcpy(tokenIndicesCpu, handle.tokenIndicies, tokenIndiciesSize, hipMemcpyDeviceToHost));
-
-    void* globalTokIndiciesCpu = malloc(config.worldSize * tokenIndiciesSize);
-    MPI_Allgather(tokenIndicesCpu, tokenIndiciesSize, MPI_CHAR, globalTokIndiciesCpu,
-                  tokenIndiciesSize, MPI_CHAR, MPI_COMM_WORLD);
-
-    void* tokenIndicesToPeSortedBufCpu = malloc(tokenIndiciesSize);
-    HIP_RUNTIME_CHECK(hipMemcpy(tokenIndicesToPeSortedBufCpu, handle.tokenIndicesToPeSortedBuf,
-                                tokenIndiciesSize, hipMemcpyDeviceToHost));
-
-    uint32_t* globalTokenIndicesToPeSortedBufCpu =
-        reinterpret_cast<uint32_t*>(malloc(config.worldSize * tokenIndiciesSize));
-    MPI_Allgather(tokenIndicesToPeSortedBufCpu, tokenIndiciesSize, MPI_CHAR,
-                  globalTokenIndicesToPeSortedBufCpu, tokenIndiciesSize, MPI_CHAR, MPI_COMM_WORLD);
-
-    // Collect token num from all ranks
-    uint32_t globalTokenNum[config.worldSize];
-    MPI_Allgather(&handle.curRankNumToken, 1, MPI_UINT32_T, globalTokenNum, 1, MPI_UINT32_T,
-                  MPI_COMM_WORLD);
-
-    // Collect tokens from all ranks
-    int inpTokEleNum = config.maxNumInpTokenPerRank * config.hiddenDim;
-    int inpTokSize = inpTokEleNum * sizeof(T);
-    HIP_RUNTIME_CHECK(
-        hipMemcpy(inpTokBufCpu, handle.inpTokenBuf, inpTokSize, hipMemcpyDeviceToHost));
-
-    void* globalInpTokBufCpu = malloc(config.worldSize * inpTokSize);
-    MPI_Allgather(inpTokBufCpu, inpTokSize, MPI_CHAR, globalInpTokBufCpu, inpTokSize, MPI_CHAR,
-                  MPI_COMM_WORLD);
-
-    uint32_t totalRecvNumToken = 0;
-    for (int i = 0; i < config.worldSize; i++) {
-      totalRecvNumToken += handle.recvTokenNumMemObj->template GetAs<uint32_t*>()[i] - 1;
-    }
-    std::cout << "Rank " << config.rank << " recv " << totalRecvNumToken << " tokens" << std::endl;
-
-    for (int i = 0; i < totalRecvNumToken; i++) {
-      uint32_t srcTokId = handle.dispTokIdToSrcTokIdMemObj->template GetAs<uint32_t*>()[i];
-
-      uint32_t srcPe = srcTokId / config.maxNumInpTokenPerRank;
-      uint32_t localSrcTokId = srcTokId - srcPe * config.maxNumInpTokenPerRank;
-
-      T* localTokBuf = handle.shmemOutTokMemObj->template GetAs<T*>() + i * config.hiddenDim;
-      T* srcTokBuf = reinterpret_cast<T*>(globalInpTokBufCpu) + srcPe * inpTokEleNum +
-                     localSrcTokId * config.hiddenDim;
-
-      std::stringstream msg;
-      msg << "mype " << config.rank << " localTokId " << i << " srcpe " << srcPe << " srcTokId "
-          << srcTokId;
-      for (int k = 0; k < config.hiddenDim; k++) {
-        float expectedVal = float(srcTokBuf[k]);
-        float gotVal = float(localTokBuf[k]);
-        bool equal = (expectedVal == gotVal);
-        assert(expectedVal != 0);
-        if (!equal) {
-          std::cout << "Wrong result at pos " << k << ": " << msg.str() << " expected "
-                    << expectedVal << " got " << gotVal << std::endl;
-          assert(false);
+    } else if (config.kernelType == InterNode) {
+      // Build pe sorted to token index map
+      std::vector<std::unordered_map<uint32_t, uint32_t>> peSortToTokenIdxMapsVec;
+      for (int i = 0; i < config.worldSize; i++) {
+        peSortToTokenIdxMapsVec.push_back({});
+        uint32_t peTokenNum = globalTokenNum[i];
+        for (int j = 0; j < peTokenNum * config.numExpertPerToken; j++) {
+          uint32_t peSortedId = globalTokenIndicesToPeSortedBufCpu[i * maxNumOutTokenPerRank + j];
+          assert(peSortToTokenIdxMapsVec[i].find(peSortedId) == peSortToTokenIdxMapsVec[i].end());
+          peSortToTokenIdxMapsVec[i].insert({peSortedId, j});
         }
+      }
+
+      std::vector<uint32_t> srcPeCheckTokenNum(config.worldSize, 0);
+      for (int i = 0; i < totalRecvNumToken; i++) {
+        uint32_t peSortedId = handle.exptSortedToPeSortedBuf[i];
+        uint32_t srcPe = peSortedId / maxNumOutTokenPerRank;
+        peSortedId =
+            peSortedId - srcPe * maxNumOutTokenPerRank + config.rank * maxNumOutTokenPerRank;
+        uint32_t srcTokDispatchId = peSortToTokenIdxMapsVec[srcPe][peSortedId];
+        uint32_t srcTokId = srcTokDispatchId / config.numExpertPerToken;
+
+        T* localTokBuf = handle.outTokenBuf + i * config.hiddenDim;
+        T* srcTokBuf = reinterpret_cast<T*>(globalInpTokBufCpu) + srcPe * inpTokEleNum +
+                       srcTokId * config.hiddenDim;
+        srcPeCheckTokenNum[srcPe]++;
+
+        std::stringstream msg;
+        msg << "mype " << config.rank << " localTokId " << i << " srcpe " << srcPe << " srcTokId "
+            << srcTokId;
+        for (int k = 0; k < config.hiddenDim; k++) {
+          float expectedVal = float(srcTokBuf[k]);
+          float gotVal = float(localTokBuf[k]);
+          bool equal = (expectedVal == gotVal);
+          if (!equal) {
+            std::cout << "Wrong result at pos " << k << ": " << msg.str() << " expected "
+                      << expectedVal << " got " << gotVal << std::endl;
+            assert(false);
+          }
+        }
+      }
+
+      for (int i = 0; i < config.worldSize; i++) {
+        assert(srcPeCheckTokenNum[i] ==
+               (handle.recvTokenNumMemObj->template GetAs<uint32_t*>()[i] - 1));
       }
     }
 
@@ -345,12 +296,13 @@ class EpDispatchCombineTestCase {
       handle.LaunchDispatch();
       SystemBarrier();
 
-      // CheckDispatchResult();
-      CheckIntraNodeDispatchResult();
+      CheckDispatchResult();
       SystemBarrier();
       if (handle.config.rank == 0) std::cout << "Test round " << i << " dispatch PASS" << std::endl;
 
       CopyDispatchOutAsCombineInp();
+      SystemBarrier();
+
       handle.LaunchCombine();
       SystemBarrier();
 
@@ -371,6 +323,7 @@ class EpDispatchCombineTestCase {
 
       handle.LaunchDispatch(stream);
       CopyDispatchOutAsCombineInp();
+      SystemBarrier();
       handle.LaunchCombine(stream);
       if (handle.config.rank == 0) std::cout << "Warmup Done" << std::endl;
     }
@@ -389,6 +342,7 @@ class EpDispatchCombineTestCase {
       HIP_RUNTIME_CHECK(hipEventRecord(events[1]));
 
       CopyDispatchOutAsCombineInp();
+      SystemBarrier();
 
       HIP_RUNTIME_CHECK(hipEventRecord(events[2]));
       handle.LaunchCombine(stream);
@@ -426,8 +380,13 @@ class EpDispatchCombineTestCase {
     HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, outTokBuf,
                                 maxNumOutTokenPerRank * config.hiddenDim * sizeof(T),
                                 hipMemcpyDeviceToDevice));
+    HIP_RUNTIME_CHECK(hipMemcpy(handle.shmemInpTokMemObj->template GetAs<T*>(),
+                                handle.shmemOutTokMemObj->template GetAs<T*>(),
+                                maxNumOutTokenPerRank * config.hiddenDim * sizeof(T),
+                                hipMemcpyDeviceToDevice));
     HIP_RUNTIME_CHECK(
         hipMemset(outTokBuf, 0, maxNumOutTokenPerRank * config.hiddenDim * sizeof(T)));
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   }
 
   void RandomInitializeNumToken() {
@@ -580,6 +539,7 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
                                          {"warp_per_blk", optional_argument, NULL, 'w'},
                                          {"block_num", optional_argument, NULL, 'b'},
                                          {"num", optional_argument, NULL, 'n'},
+                                         {"kernel_type", optional_argument, NULL, 'k'},
                                          {0, 0, 0, 0}};
   int option_index = 0;
   int opt;
@@ -632,6 +592,15 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
       case 'n':
         testConfig.runConfig.repeat = std::stoi(optarg);
         break;
+      case 'k':
+        if (strcmp(long_options[option_index].name, "intra") == 0) {
+          testConfig.config.kernelType = KernelType::IntraNode;
+        } else if (strcmp(long_options[option_index].name, "inter") == 0) {
+          testConfig.config.kernelType = KernelType::InterNode;
+        } else {
+          printf("Unknown cmd: %s, must be 'inter' or 'intra'\n", optarg);
+          assert(false);
+        }
       case 'h':
         printf("This is help message\n");
         break;

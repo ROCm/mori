@@ -183,115 +183,6 @@ __global__ void EpDispatchKernel(EpDispatchCombineArgs<T> args) {
   SyncIfDebugEnabled("Dispatch kernel: kernel end");
 }
 
-// TODO: in dispatch kernel, also output topk id array
-template <typename T>
-__global__ void EpDispatchKernelPeSorted(EpDispatchCombineArgs<T> args) {
-  const EpDispatchCombineConfig& config = args.config;
-
-  int thdId = threadIdx.x;
-  int thdNum = blockDim.x;
-
-  int laneId = threadIdx.x & (warpSize - 1);
-  int warpId = thdId / warpSize;
-  int warpNum = blockDim.x / warpSize;
-
-  int globalWarpId = blockIdx.x * warpNum + warpId;
-  int globalWarpNum = gridDim.x * warpNum;
-
-  int myPe = config.rank;
-  int npes = config.worldSize;
-
-  size_t maxNumOutTokenPerRank = config.maxNumInpTokenPerRank * config.numExpertPerToken;
-
-  // Send out tokens
-  extern __shared__ char sharedMem[];
-
-  // Phase1: send token
-  // Each warp compute token offset on destinition PE
-  int i = globalWarpId;
-  for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
-       i += globalWarpNum) {
-    uint32_t destExpert = args.tokenIndicies[i];
-    uint32_t destPe = destExpert / config.numExpertPerRank;
-
-    uint32_t peTokenIdx = 0;
-    if (laneId == 0) {
-      peTokenIdx = atomicAdd(args.peTokenOffset + destPe, 1);
-      args.tokenIndicesToPeSortedBuf[i] = destPe * maxNumOutTokenPerRank + peTokenIdx;
-      args.outTokToExptMapMemObj->template GetAs<uint32_t*>(
-          destPe)[myPe * maxNumOutTokenPerRank + peTokenIdx] = destExpert;
-    }
-    peTokenIdx = __shfl(peTokenIdx, 0);
-    uint32_t tokenId = i / config.numExpertPerToken;
-    uint32_t tokenOffset = tokenId * config.hiddenDim;
-
-    uint32_t peSortedId = myPe * maxNumOutTokenPerRank + peTokenIdx;
-    uint32_t peSortedOffset = peSortedId * config.hiddenDim;
-
-    WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>(destPe) + peSortedOffset,
-             args.inpTokenBuf + tokenOffset, config.hiddenDim);
-  }
-  if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
-  SyncIfDebugEnabled("Dispatch kernel: finished send token");
-  // 95 us
-
-  // Send token num & token to expert mapping to other ranks
-  if (globalWarpId == 0) {
-    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      // Wait until all tokens are sent
-      ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
-
-      // Add 1 so that when token number == 0, receiver side still know the signal is sent
-      uint32_t numTokenSignal = AtomicLoadRelaxed(args.peTokenOffset + destPe) + 1;
-      ShmemPutUint32ImmNbiThread(args.recvTokenNumMemObj, myPe * sizeof(uint32_t), numTokenSignal,
-                                 destPe);
-    }
-  }
-  SyncIfDebugEnabled("Dispatch kernel: finish sending tok2expt mapping & num token signal");
-  // 125 us
-
-  // Phase 2: recv token
-  // Each warp wait until sender finished by waiting token number signal
-  uint32_t* recvTokenNum = reinterpret_cast<uint32_t*>(sharedMem);
-  for (int destPe = thdId; destPe < npes; destPe += thdNum) {
-    uint32_t* signal = args.recvTokenNumMemObj->template GetAs<uint32_t*>() + destPe;
-    ShmemUint32WaitUntilGreaterThan(signal, 0);
-    recvTokenNum[destPe] = AtomicLoadRelaxedSystem(signal) - 1;
-  }
-  __syncthreads();
-  SyncIfDebugEnabled("Dispatch kernel: finish waiting num token signal");
-  // 132 us
-
-  for (int i = globalWarpId;; i += globalWarpNum) {
-    // find src pe and tok id
-    uint32_t srcPe = 0;
-    uint32_t accumPeTokOffset = 0;
-    for (; srcPe < npes; srcPe++) {
-      if ((i >= accumPeTokOffset) && (i < (accumPeTokOffset + recvTokenNum[srcPe]))) break;
-      accumPeTokOffset += recvTokenNum[srcPe];
-    }
-    if (srcPe >= npes) break;
-    uint32_t srcTokId = i - accumPeTokOffset;
-
-    // Copy token
-    uint32_t peSortedId = srcPe * maxNumOutTokenPerRank + srcTokId;
-    uint32_t srcTokenOff = peSortedId * config.hiddenDim;
-
-    uint32_t destTokId = 0;
-    if (laneId == 0) {
-      destTokId = atomicAdd(args.exptTokenOffset, 1);
-      args.exptSortedToPeSortedBuf[destTokId] = peSortedId;
-    }
-    destTokId = __shfl(destTokId, 0);
-
-    uint32_t destTokenOff = destTokId * config.hiddenDim;
-    WarpCopy(args.outTokenBuf + destTokenOff,
-             args.shmemOutTokMemObj->template GetAs<T*>() + srcTokenOff, config.hiddenDim);
-  }
-  // 191 us
-  SyncIfDebugEnabled("Dispatch kernel: kernel end");
-}
-
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         EpCombineKernel                                        */
 /* ---------------------------------------------------------------------------------------------- */
@@ -550,11 +441,13 @@ void EpDispatchCombineHandle<T>::LaunchDispatch(hipStream_t stream) {
       (config.worldSize * config.warpNumPerBlock +
        config.numExpertPerRank * config.warpNumPerBlock + config.numExpertPerRank) *
       sizeof(uint32_t);
-  // EpDispatchKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
-  // EpDispatchKernelPeSorted<<<grid, block, sharedMemSize,
-  // stream>>>(GetEpDispatchCombineArgs(*this));
-  EpDispatchIntraNodeKernel<<<grid, block, sharedMemSize, stream>>>(
-      GetEpDispatchCombineArgs(*this));
+  if (config.kernelType == KernelType::InterNode)
+    EpDispatchKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
+  else if (config.kernelType == KernelType::IntraNode)
+    EpDispatchIntraNodeKernel<<<grid, block, sharedMemSize, stream>>>(
+        GetEpDispatchCombineArgs(*this));
+  else
+    assert(false);
 }
 
 template <typename T>
@@ -562,8 +455,14 @@ void EpDispatchCombineHandle<T>::LaunchCombine(hipStream_t stream) {
   dim3 grid(config.blockNum);
   dim3 block(warpSize * config.warpNumPerBlock);
   size_t sharedMemSize = config.warpNumPerBlock * config.numExpertPerToken * sizeof(T**);
-  // EpCombineKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
-  EpCombineIntraNodeKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
+
+  if (config.kernelType == KernelType::InterNode)
+    EpCombineKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
+  else if (config.kernelType == KernelType::IntraNode)
+    EpCombineIntraNodeKernel<<<grid, block, sharedMemSize, stream>>>(
+        GetEpDispatchCombineArgs(*this));
+  else
+    assert(false);
 }
 
 template <typename T>

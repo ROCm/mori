@@ -108,31 +108,31 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   extern __shared__ char sharedMem[];
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
 
-  T* baseSrcPtrs[8];
-  for (int i = 0; i < config.worldSize; i++) {
-    baseSrcPtrs[i] = args.shmemOutTokMemObj->template GetAs<T*>(i);
-  }
-
   int warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
   int hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
-  int inTokenWarpId = globalWarpId % warpsPerToken;
-  int hiddenDimOffset = inTokenWarpId * hiddenDimPerWarp;
+  // int inTokenWarpId = globalWarpId % warpsPerToken;
+  // int hiddenDimOffset = inTokenWarpId * hiddenDimPerWarp;
+  // int hiddenDimSize = std::min(config.hiddenDim, hiddenDimOffset + hiddenDimPerWarp);
 
   T* outTokenBuf = args.outTokenBuf;
-  for (int i = (globalWarpId / warpsPerToken); i < args.curRankNumToken;
-       i += (globalWarpNum / warpsPerToken)) {
+  for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
+    int tokenId = i / warpsPerToken;
+    int inTokenPartId = i % warpsPerToken;
+    int hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
+    int hiddenDimSize = std::min(config.hiddenDim, hiddenDimOffset + hiddenDimPerWarp);
+
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
-      uint32_t destTokId = args.dispDestTokIdMap[i * config.numExpertPerToken + j];
+      uint32_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
 
       uint32_t destPe = destTokId / maxNumOutTokenPerRank;
       uint32_t destLocalTokId = destTokId - destPe * maxNumOutTokenPerRank;
 
-      srcPtrs[j] = baseSrcPtrs[destPe] + destLocalTokId * config.hiddenDim + hiddenDimOffset;
+      srcPtrs[j] = args.shmemInpTokMemObj->template GetAs<T*>(destPe) +
+                   destLocalTokId * config.hiddenDim + hiddenDimOffset;
     }
-
-    core::WarpAccum(args.outTokenBuf + i * config.hiddenDim + hiddenDimOffset, srcPtrs,
-                    args.weightsBuf + i * config.numExpertPerToken, config.numExpertPerToken,
-                    hiddenDimPerWarp);
+    core::WarpAccum(args.outTokenBuf + tokenId * config.hiddenDim + hiddenDimOffset, srcPtrs,
+                    args.weightsBuf + tokenId * config.numExpertPerToken, config.numExpertPerToken,
+                    hiddenDimSize);
   }
 }
 

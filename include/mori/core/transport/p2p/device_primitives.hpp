@@ -151,6 +151,7 @@ __device__ void WarpAccum(T* dest, T** srcs, float* srcScales, size_t accumNum, 
         accumValFp32[j] += srcVal * srcScale;
       }
     }
+
     uint4 accumVals;
 #pragma unroll
     for (int i = 0; i < vecSize; i++) {
@@ -163,6 +164,7 @@ __device__ void WarpAccum(T* dest, T** srcs, float* srcScales, size_t accumNum, 
   }
 
   while (offset < nelems) {
+    assert(false);
     float accumValFp32 = 0;
 #pragma unroll
     for (int i = 0; i < accumNum; i++) {
