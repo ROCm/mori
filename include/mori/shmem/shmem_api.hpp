@@ -11,8 +11,11 @@ namespace shmem {
 /*                                         Initialization                                         */
 /* ---------------------------------------------------------------------------------------------- */
 
+// TODO: provide unified initialize / finalize APIs
+int ShmemInit(application::BootstrapNetwork* bootNet);
 int ShmemMpiInit(MPI_Comm);
-int ShmemMpiFinalize();
+int ShmemTorchProcessGroupInit(const std::string& groupName);
+int ShmemFinalize();
 
 int ShmemMyPe();
 int ShmemNPes();

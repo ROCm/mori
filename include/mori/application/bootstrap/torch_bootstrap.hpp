@@ -9,7 +9,7 @@ namespace application {
 
 class TorchBootstrapNetwork : public BootstrapNetwork {
  public:
-  TorchBootstrapNetwork(const c10::intrusive_ptr<c10d::ProcessGroup>& group);
+  TorchBootstrapNetwork(const std::string& groupName);
   ~TorchBootstrapNetwork();
 
   void Initialize();

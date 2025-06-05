@@ -68,13 +68,13 @@ void GpuStateInit() {
       hipMemcpyToSymbol(globalGpuStates, &gpuStates, sizeof(GpuStates), 0, hipMemcpyHostToDevice));
 }
 
-int ShmemMpiInit(MPI_Comm mpi_comm) {
+int ShmemInit(application::BootstrapNetwork* bootNet) {
   int status;
 
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
 
   states->bootStates = new BootStates();
-  states->bootStates->bootNet = new application::MpiBootstrapNetwork(mpi_comm);
+  states->bootStates->bootNet = bootNet;
   states->bootStates->bootNet->Initialize();
   states->bootStates->rank = states->bootStates->bootNet->GetLocalRank();
   states->bootStates->worldSize = states->bootStates->bootNet->GetWorldSize();
@@ -89,7 +89,7 @@ int ShmemMpiInit(MPI_Comm mpi_comm) {
   return 0;
 }
 
-int ShmemMpiFinalize() {
+int ShmemFinalize() {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
 
   HIP_RUNTIME_CHECK(hipFree(globalGpuStates.transportTypes));
@@ -107,6 +107,14 @@ int ShmemMpiFinalize() {
 
   states->status = ShmemStatesStatus::Finalized;
   return 0;
+}
+
+int ShmemMpiInit(MPI_Comm mpiComm) {
+  return ShmemInit(new application::MpiBootstrapNetwork(mpiComm));
+}
+
+int ShmemTorchProcessGroupInit(const std::string& groupName) {
+  return ShmemInit(new application::TorchBootstrapNetwork(groupName));
 }
 
 int ShmemMyPe() {

@@ -524,7 +524,7 @@ void EpDispatchWithPutMemAPI(EpDispatchCombineTestConfig testConfig) {
     assert(false);
   }
 
-  ShmemMpiFinalize();
+  ShmemFinalize();
 }
 
 EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {

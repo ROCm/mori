@@ -18,8 +18,8 @@ void MpiBootstrapNetwork::Initialize() {
   if (!initialized) {
     MPI_Init(NULL, NULL);
   }
-  MPI_Comm_size(mpi_comm, &world_size);
-  MPI_Comm_rank(mpi_comm, &local_rank);
+  MPI_Comm_size(mpi_comm, &worldSize);
+  MPI_Comm_rank(mpi_comm, &localRank);
 }
 
 void MpiBootstrapNetwork::Finalize() {

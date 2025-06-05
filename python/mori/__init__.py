@@ -1,1 +1,2 @@
-from . import ops
+from .torch_ops import torch_mori_ops
+from .torch_ops import torch_mori_shmem

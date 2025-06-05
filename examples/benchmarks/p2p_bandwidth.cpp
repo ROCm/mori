@@ -72,7 +72,7 @@ void P2PBandwidthTest() {
   }
 
   // Finalize
-  ShmemMpiFinalize();
+  ShmemFinalize();
 }
 
 int main(int argc, char* argv[]) {

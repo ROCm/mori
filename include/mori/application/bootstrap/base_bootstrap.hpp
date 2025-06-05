@@ -13,8 +13,8 @@ class BootstrapNetwork {
   virtual void Initialize() = 0;
   virtual void Finalize() = 0;
 
-  int GetLocalRank() const { return local_rank; }
-  int GetWorldSize() const { return world_size; }
+  int GetLocalRank() const { return localRank; }
+  int GetWorldSize() const { return worldSize; }
 
   virtual void Allgather(void* sendbuf, void* recvbuf, size_t sendcount) = 0;
   virtual void AllToAll(void* sendbuf, void* recvbuf, size_t sendcount) = 0;
@@ -22,8 +22,8 @@ class BootstrapNetwork {
   virtual void Barrier() = 0;
 
  protected:
-  int local_rank{0};
-  int world_size{0};
+  int localRank{0};
+  int worldSize{0};
 };
 
 }  // namespace application
