@@ -13,7 +13,7 @@ message(STATUS "Found LibTorch CMake Path: ${CMAKE_PREFIX_PATH}")
 find_package(Torch REQUIRED)
 
 add_library(
-    mori_application
+    mori_application SHARED
     bootstrap/mpi_bootstrap.cpp
     bootstrap/torch_bootstrap.cpp
     transport/rdma/rdma.cpp

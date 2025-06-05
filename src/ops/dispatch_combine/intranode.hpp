@@ -1,6 +1,7 @@
+#pragma once
 
-#include "dispatch_combine_kernels/dispatch_combine.hpp"
 #include "mori/core/core.hpp"
+#include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 #include "mori/shmem/shmem.hpp"
 
 namespace mori {

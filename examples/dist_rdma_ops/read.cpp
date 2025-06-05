@@ -79,8 +79,8 @@ void distRdmaOps(int argc, char* argv[]) {
   RdmaEndpoint endpoint = device_context->CreateRdmaEndpoint(config);
 
   // 3 Allgather global endpoint and connect
-  RdmaEndpointHandle global_rdma_ep_handles[world_size];
-  bootNet.Allgather(&endpoint.handle, global_rdma_ep_handles, sizeof(RdmaEndpointHandle));
+  std::vector<RdmaEndpointHandle> global_rdma_ep_handles(world_size);
+  bootNet.Allgather(&endpoint.handle, global_rdma_ep_handles.data(), sizeof(RdmaEndpointHandle));
 
   std::cout << "Local rank " << local_rank << " " << endpoint.handle << std::endl;
 
@@ -98,8 +98,8 @@ void distRdmaOps(int argc, char* argv[]) {
   // assert(!posix_memalign(&buffer_1, 4096, allreduce_size));
   // memset(buffer_1, 1, allreduce_size);
   MemoryRegion mr_handle = device_context->RegisterMemoryRegion(buffer, maxSize, MR_ACCESS_FLAG);
-  MemoryRegion global_mr_handles[world_size];
-  bootNet.Allgather(&mr_handle, global_mr_handles, sizeof(mr_handle));
+  std::vector<MemoryRegion> global_mr_handles(world_size);
+  bootNet.Allgather(&mr_handle, global_mr_handles.data(), sizeof(mr_handle));
   global_mr_handles[local_rank] = mr_handle;
   //   printf("Before Buffer 2 0th %d 512th %d\n", ((char*)buffer_2)[0], ((char*)buffer_2)[512]);
 

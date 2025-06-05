@@ -1,13 +1,13 @@
-#include "dispatch_combine_kernels/dispatch_combine.hpp"
+#include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
 
-#include "dispatch_combine_kernels/intranode.hpp"
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem.hpp"
+#include "src/ops/dispatch_combine/intranode.hpp"
 
 namespace mori {
 namespace moe {

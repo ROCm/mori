@@ -11,6 +11,9 @@ option(USE_ROCM "Whether to use rocm" ON)
 option(BUILD_EXAMPLES "Whether to build examples" ON)
 option(BUILD_APPLICATION "Whether to build application library" ON)
 option(BUILD_SHMEM "Whether to build shmem library" ON)
+option(BUILD_OPS "Whether to build mori operation kernels" ON)
+option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
+
 
 if (USE_ROCM)
     list(APPEND CMAKE_PREFIX_PATH "/opt/rocm")
@@ -46,4 +49,12 @@ endif()
 
 if (BUILD_SHMEM)
     add_subdirectory(src/shmem)
+endif()
+
+if (BUILD_OPS)
+    add_subdirectory(src/ops)
+endif()
+
+if (BUILD_PYBINDS)
+    add_subdirectory(src/pybind)
 endif()

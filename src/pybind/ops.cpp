@@ -11,7 +11,5 @@ void TestTorchBootstrap(std::string groupName) {
 }  // namespace
 
 namespace mori {
-void register_dispatch_combine_ops(torch::Library& m) {
-  m.def("test_torch_bootstrap", &TestTorchBootstrap);
-}
+void register_mori_ops(torch::Library& m) { m.def("test_torch_bootstrap", &TestTorchBootstrap); }
 }  // namespace mori

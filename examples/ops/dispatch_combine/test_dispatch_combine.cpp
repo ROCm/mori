@@ -9,7 +9,7 @@
 #include <random>
 #include <sstream>
 
-#include "dispatch_combine_kernels/dispatch_combine.hpp"
+#include "mori/ops/ops.hpp"
 #include "mori/shmem/shmem.hpp"
 
 using namespace std;
@@ -152,8 +152,9 @@ class EpDispatchCombineTestCase {
                   globalTokenIndicesToPeSortedBufCpu, tokenIndiciesSize, MPI_CHAR, MPI_COMM_WORLD);
 
     // Collect token num from all ranks
-    uint32_t globalTokenNum[config.worldSize];
-    MPI_Allgather(&handle.curRankNumToken, 1, MPI_UINT32_T, globalTokenNum, 1, MPI_UINT32_T,
+    // uint32_t globalTokenNum[config.worldSize];
+    std::vector<uint32_t> globalTokenNum(config.worldSize);
+    MPI_Allgather(&handle.curRankNumToken, 1, MPI_UINT32_T, globalTokenNum.data(), 1, MPI_UINT32_T,
                   MPI_COMM_WORLD);
 
     // Collect tokens from all ranks
