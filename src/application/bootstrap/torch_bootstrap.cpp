@@ -7,7 +7,7 @@
 namespace mori {
 namespace application {
 
-TorchBootstrapNetwork::TorchBootstrapNetwork(const c10::intrusive_ptr<c10d::ProcessGroup> group;)
+TorchBootstrapNetwork::TorchBootstrapNetwork(const c10::intrusive_ptr<c10d::ProcessGroup>& group)
     : group(group) {
   Initialize();
 }
@@ -15,8 +15,8 @@ TorchBootstrapNetwork::TorchBootstrapNetwork(const c10::intrusive_ptr<c10d::Proc
 TorchBootstrapNetwork::~TorchBootstrapNetwork() { Finalize(); }
 
 void TorchBootstrapNetwork::Initialize() {
-  unsigned n = group->getSize();
-  TORCH_CHECK(n == count, "Group size must be equal to count");
+  uint32_t n = group->getSize();
+  assert(n == GetWorldSize());
 }
 
 void TorchBootstrapNetwork::Finalize() {}

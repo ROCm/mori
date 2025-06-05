@@ -13,7 +13,7 @@ option(BUILD_APPLICATION "Whether to build application library" ON)
 option(BUILD_SHMEM "Whether to build shmem library" ON)
 
 if (USE_ROCM)
-    set(CMAKE_PREFIX_PATH /opt/rocm)
+    list(APPEND CMAKE_PREFIX_PATH "/opt/rocm")
     project(
         mori
         LANGUAGES HIP CXX C

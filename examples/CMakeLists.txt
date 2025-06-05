@@ -56,11 +56,20 @@ target_link_libraries(context mori_application hip::host hip::device)
 
 add_executable(
     test_dispatch_combine
-    moe/test_dispatch_combine.cpp
     moe/dispatch_combine_kernels/dispatch_combine.cpp
+    moe/test_dispatch_combine.cpp
 )
 target_link_libraries(test_dispatch_combine mori_application mori_shmem hip::host hip::device)
 target_include_directories(test_dispatch_combine PUBLIC ${CMAKE_SOURCE_DIR}/examples/moe)
+
+add_library(
+    mori_dispatch_combine SHARED
+    moe/pybinds/dispatch_combine.cpp
+    moe/pybinds/bindings.cpp
+    moe/dispatch_combine_kernels/dispatch_combine.cpp
+)
+target_link_libraries(mori_dispatch_combine mori_application mori_shmem hip::host hip::device)
+target_include_directories(mori_dispatch_combine PUBLIC ${CMAKE_SOURCE_DIR}/examples/moe)
 
 add_executable(
     p2p_bandwidth

@@ -23,11 +23,12 @@ void Context::CollectHostNames() {
   char hostname[HOST_NAME_MAX];
   gethostname(hostname, HOST_NAME_MAX);
 
-  char globalHostNames[HOST_NAME_MAX * WorldSize()];
-  bootNet.Allgather(hostname, globalHostNames, HOST_NAME_MAX);
+  // char globalHostNames[HOST_NAME_MAX * WorldSize()];
+  std::vector<char> globalHostNames(HOST_NAME_MAX * WorldSize());
+  bootNet.Allgather(hostname, globalHostNames.data(), HOST_NAME_MAX);
 
   for (int i = 0; i < WorldSize(); i++) {
-    hostnames.push_back(&globalHostNames[i * HOST_NAME_MAX]);
+    hostnames.push_back(&globalHostNames.data()[i * HOST_NAME_MAX]);
   }
 }
 
