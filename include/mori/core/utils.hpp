@@ -64,6 +64,23 @@ inline __device__ void AtomicStoreSeqCstSystem(T* ptr, T val) {
   return __hip_atomic_store(ptr, val, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
+// TODO: optimize to __hip_atomic_compare_exchange
+template <typename T>
+__device__ T AtomicCompareExchangeSeqCstSystem(T* ptr, T* expected, T desired) {
+  while (true) {
+    T oldVal = __hip_atomic_load(ptr, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_SYSTEM);
+
+    if (oldVal != *expected) {
+      *expected = oldVal;
+      return oldVal;
+    }
+
+    __hip_atomic_store(ptr, desired, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_SYSTEM);
+
+    return oldVal;
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                    Match                                   */
 /* -------------------------------------------------------------------------- */
