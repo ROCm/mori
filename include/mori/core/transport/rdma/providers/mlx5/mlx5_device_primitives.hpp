@@ -418,6 +418,16 @@ inline __device__ uint64_t mlx5PrepareAtomicWqe(void* queue_buff_addr, uint32_t 
   return reinterpret_cast<uint64_t*>(wqeCtrlSeg)[0];
 }
 
+template <>
+inline __device__ uint64_t PostAtomic<ProviderType::MLX5>(void* queue_buff_addr, uint32_t wqe_num,
+                                                          uint32_t* postIdx, uint32_t qpn,
+                                                          uintptr_t laddr, uint64_t lkey,
+                                                          uintptr_t raddr, uint64_t rkey,
+                                                          void* val_1, void* val_2, uint32_t typeBytes,
+                                                          atomicType amo_op) {
+  return mlx5PrepareAtomicWqe(queue_buff_addr, wqe_num, postIdx, qpn, laddr, lkey, raddr, rkey,
+                              val_1, val_2, typeBytes, amo_op);
+}
 
 #define DEFINE_POST_ATOMIC_SPEC(TYPE)                             \
 template <>                                                                 \

@@ -30,6 +30,33 @@ inline __device__ void ShmemPutSizeImmNbiWarpKernel(const application::SymmMemOb
                                                     size_t destOffset, void* val, size_t bytes,
                                                     int pe);
 
+template <application::TransportType TsptType>
+inline __device__ void ShmemAtomicSizeNonFetchThreadKernel(const application::SymmMemObjPtr dest,
+                                                           size_t destOffset, void* val,
+                                                           size_t bytes, int pe,
+                                                           core::atomicType amoType);
+
+template <application::TransportType TsptType>
+inline __device__ void ShmemAtomicSizeNonFetchWarpKernel(const application::SymmMemObjPtr dest,
+                                                         size_t destOffset, void* val, size_t bytes,
+                                                         int pe, core::atomicType amoType);
+
+template <application::TransportType TsptType>
+inline __device__ void ShmemAtomicSizeFetchThreadKernel(const application::SymmMemObjPtr dest,
+                                                        size_t destOffset,
+                                                        const application::MemoryRegion& source,
+                                                        size_t sourceOffset, void* val,
+                                                        void* compare, size_t bytes, int pe,
+                                                        core::atomicType amoType);
+
+template <application::TransportType TsptType>
+inline __device__ void ShmemAtomicSizeFetchWarpKernel(const application::SymmMemObjPtr dest,
+                                                      size_t destOffset,
+                                                      const application::MemoryRegion& source,
+                                                      size_t sourceOffset, void* val, void* compare,
+                                                      size_t bytes, int pe,
+                                                      core::atomicType amoType);
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Synchronization                                        */
 /* ---------------------------------------------------------------------------------------------- */

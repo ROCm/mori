@@ -48,6 +48,40 @@ inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::
   core::WarpCopyAtomic<uint8_t>(destPtr, srcPtr, bytes);
 }
 
+template <>
+inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::P2P>(
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe,
+    core::atomicType amoType){
+      //TODO
+      ;
+    }
+
+template <>
+inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportType::P2P>(
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe,
+    core::atomicType amoType){
+      //TODO
+      ;
+    }
+
+template <>
+inline __device__ void ShmemAtomicSizeFetchThreadKernel<application::TransportType::P2P>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::MemoryRegion& source, size_t sourceOffset, void* val, void* compare,
+    size_t bytes, int pe, core::atomicType amoType){
+      //TODO
+      ;
+    }
+
+template <>
+inline __device__ void ShmemAtomicSizeFetchWarpKernel<application::TransportType::P2P>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::MemoryRegion& source, size_t sourceOffset, void* val, void* compare,
+    size_t bytes, int pe, core::atomicType amoType){
+      //TODO
+      ;
+    }
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Synchronization                                        */
 /* ---------------------------------------------------------------------------------------------- */

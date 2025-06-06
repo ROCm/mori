@@ -117,7 +117,7 @@ SHMEM_PUT_TYPE_IMM_NBI_API_TEMPLATE(Warp)
 #define DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(TypeName, T, Scope)                           \
   inline __device__ void ShmemPut##TypeName##ImmNbi##Scope(                             \
       const application::SymmMemObjPtr dest, size_t destOffset, uint32_t val, int pe) { \
-    ShmemPutTypeImmNbi##Scope<uint32_t>(dest, destOffset, val, pe);                     \
+    ShmemPutTypeImmNbi##Scope<T>(dest, destOffset, val, pe);                     \
   }
 
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint8, uint8_t, Thread)
@@ -129,6 +129,91 @@ DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint8, uint8_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint16, uint16_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint32, uint32_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint64, uint64_t, Warp)
+
+#define SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Scope)                                           \
+  inline __device__ void ShmemAtomicSizeNonFetch##Scope(                                         \
+      const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe, \
+      core::atomicType amoType) {                                                                \
+    DISPATCH_TRANSPORT_TYPE(ShmemAtomicSizeNonFetch##Scope##Kernel, pe, dest, destOffset, val,   \
+                            bytes, pe, amoType);                                                 \
+  }
+
+SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Thread)
+SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Warp)
+
+#define SHMEM_ATOMIC_TYPE_NONFETCH_API_TEMPLATE(Scope)                                        \
+  template <typename T>                                                                        \
+  inline __device__ void ShmemAtomicTypeNonFetch##Scope(const application::SymmMemObjPtr dest, \
+                                                        size_t destOffset, T val, int pe,      \
+                                                        core::atomicType amoType) {            \
+    ShmemAtomicSizeNonFetch##Scope(dest, destOffset, &val, sizeof(T), pe, amoType);            \
+  }
+
+SHMEM_ATOMIC_TYPE_NONFETCH_API_TEMPLATE(Thread)
+SHMEM_ATOMIC_TYPE_NONFETCH_API_TEMPLATE(Warp)
+
+#define DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(TypeName, T, Scope)              \
+  inline __device__ void ShmemAtomic##TypeName##NonFetch##Scope(               \
+      const application::SymmMemObjPtr dest, size_t destOffset, T val, int pe, \
+      core::atomicType amoType) {                                              \
+    ShmemAtomicTypeNonFetch##Scope<T>(dest, destOffset, val, pe, amoType);     \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int64, int64_t, Thread)
+
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int64, int64_t, Warp)
+
+#define SHMEM_ATOMIC_SIZE_FETCH_API_TEMPLATE(Scope)                                            \
+  inline __device__ void ShmemAtomicSizeFetch##Scope(                                          \
+      const application::SymmMemObjPtr dest, size_t destOffset,                                \
+      const application::MemoryRegion& source, size_t sourceOffset, void* val, void* compare,  \
+      size_t bytes, int pe, core::atomicType amoType) {                                        \
+    DISPATCH_TRANSPORT_TYPE(ShmemAtomicSizeFetch##Scope##Kernel, pe, dest, destOffset, source, \
+                            sourceOffset, val, compare, bytes, pe, amoType);                   \
+  }
+
+SHMEM_ATOMIC_SIZE_FETCH_API_TEMPLATE(Thread)
+SHMEM_ATOMIC_SIZE_FETCH_API_TEMPLATE(Warp)
+
+#define SHMEM_ATOMIC_TYPE_FETCH_API_TEMPLATE(Scope)                                                \
+  template <typename T>                                                                            \
+  inline __device__ T ShmemAtomicTypeFetch##Scope(                                                 \
+      const application::SymmMemObjPtr dest, size_t destOffset,                                    \
+      const application::MemoryRegion& source, size_t sourceOffset, T val, T compare, int pe,      \
+      core::atomicType amoType) {                                                                  \
+    ShmemAtomicSizeFetch##Scope(dest, destOffset, source, sourceOffset, &val, &compare, sizeof(T), \
+                                pe, amoType);                                                      \
+    uintptr_t fetchResultPtr = source.addr + sourceOffset;                                         \
+    return core::AtomicLoadRelaxedSystem<T>(reinterpret_cast<T*>(fetchResultPtr));                 \
+  }
+
+SHMEM_ATOMIC_TYPE_FETCH_API_TEMPLATE(Thread)
+SHMEM_ATOMIC_TYPE_FETCH_API_TEMPLATE(Warp)
+
+#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(TypeName, T, Scope)                                  \
+  inline __device__ T ShmemAtomic##TypeName##Fetch##Scope(                                      \
+      const application::SymmMemObjPtr dest, size_t destOffset,                                 \
+      const application::MemoryRegion& source, size_t sourceOffset, T val, T compare, int pe,   \
+      core::atomicType amoType) {                                                               \
+    return ShmemAtomicTypeFetch##Scope<T>(dest, destOffset, source, sourceOffset, val, compare, \
+                                          pe, amoType);                                         \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int64, int64_t, Thread)
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int64, int64_t, Warp)
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Synchronization                                        */

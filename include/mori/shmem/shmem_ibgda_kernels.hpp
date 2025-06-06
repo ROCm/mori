@@ -118,6 +118,119 @@ inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::
   DISPATCH_PROVIDER_TYPE(ShmemPutSizeImmNbiWarpKernelImpl, dest, destOffset, val, bytes, pe);
 }
 
+
+inline __device__ void ShmemQuietThreadKernelImpl();
+
+template <core::ProviderType PrvdType>
+inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe,
+    core::atomicType amoType) {
+  uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
+  uintptr_t rkey = dest->peerRkeys[pe];
+
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  application::WorkQueueHandle& wq = ep[pe].wqHandle;
+
+  int rank = globalGpuStates->rank;
+  uint64_t dbrVal = core::PostAtomic<PrvdType>(wq.sqAddr, wq.sqWqeNum, &wq.postIdx, ep[pe].handle.qpn,
+                                               0, 0, raddr, rkey, val, 0, bytes, amoType);
+
+  core::UpdateSendDbrRecord<PrvdType>(wq.dbrRecAddr, wq.postIdx);
+  __threadfence_system();
+  core::RingDoorbell<PrvdType>(wq.dbrAddr, dbrVal);
+  __threadfence_system();
+}
+
+template <>
+inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::RDMA>(
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe,
+    core::atomicType amoType) {
+  DISPATCH_PROVIDER_TYPE(ShmemAtomicSizeNonFetchThreadKernelImpl, dest, destOffset, val, bytes, pe,
+                         amoType);
+}
+
+template <core::ProviderType PrvdType>
+inline __device__ void ShmemAtomicSizeNonFetchWarpKernelImpl(const application::SymmMemObjPtr dest,
+                                                             size_t destOffset, void* val,
+                                                             size_t bytes, int pe,
+                                                             core::atomicType amoType) {
+  int laneId = threadIdx.x & (warpSize - 1);
+  if (laneId == 0) {
+    ShmemAtomicSizeNonFetchThreadKernelImpl<PrvdType>(dest, destOffset, val, bytes, pe, amoType);
+  }
+}
+
+template <>
+inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportType::RDMA>(
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe,
+    core::atomicType amoType) {
+  DISPATCH_PROVIDER_TYPE(ShmemAtomicSizeNonFetchWarpKernelImpl, dest, destOffset, val, bytes, pe,
+                         amoType);
+}
+
+template <core::ProviderType PrvdType>
+inline __device__ void ShmemAtomicSizeFetchThreadKernelImpl(const application::SymmMemObjPtr dest,
+                                                            size_t destOffset,
+                                                            const application::MemoryRegion& source,
+                                                            size_t sourceOffset, void* val,
+                                                            void* compare, size_t bytes, int pe,
+                                                            core::atomicType amoType) {
+  uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
+  uintptr_t rkey = dest->peerRkeys[pe];
+  uintptr_t laddr = source.addr + sourceOffset;
+  uintptr_t lkey = source.lkey;
+
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  application::WorkQueueHandle& wq = ep[pe].wqHandle;
+
+  int rank = globalGpuStates->rank;
+  uint64_t dbrVal =
+      core::PostAtomic<PrvdType>(wq.sqAddr, wq.sqWqeNum, &wq.postIdx, ep[pe].handle.qpn, laddr,
+                                 lkey, raddr, rkey, val, compare, bytes, amoType);
+
+  core::UpdateSendDbrRecord<PrvdType>(wq.dbrRecAddr, wq.postIdx);
+  __threadfence_system();
+  core::RingDoorbell<PrvdType>(wq.dbrAddr, dbrVal);
+  __threadfence_system();
+
+  // queit to poll CQ
+  ShmemQuietThreadKernelImpl();
+}
+
+template <>
+inline __device__ void ShmemAtomicSizeFetchThreadKernel<application::TransportType::RDMA>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::MemoryRegion& source, size_t sourceOffset, void* val, void* compare,
+    size_t bytes, int pe, core::atomicType amoType) {
+  DISPATCH_PROVIDER_TYPE(ShmemAtomicSizeFetchThreadKernelImpl, dest, destOffset, source,
+                         sourceOffset, val, compare, bytes, pe, amoType);
+}
+
+template <core::ProviderType PrvdType>
+inline __device__ void ShmemAtomicSizeFetchWarpKernelImpl(const application::SymmMemObjPtr dest,
+                                                          size_t destOffset,
+                                                          const application::MemoryRegion& source,
+                                                          size_t sourceOffset, void* val,
+                                                          void* compare, size_t bytes, int pe,
+                                                          core::atomicType amoType) {
+  int laneId = threadIdx.x & (warpSize - 1);
+  if (laneId == 0) {
+    ShmemAtomicSizeFetchThreadKernelImpl<PrvdType>(dest, destOffset, source, sourceOffset, val,
+                                                   compare, bytes, pe, amoType);
+  }
+}
+
+template <>
+inline __device__ void ShmemAtomicSizeFetchWarpKernel<application::TransportType::RDMA>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::MemoryRegion& source, size_t sourceOffset, void* val, void* compare,
+    size_t bytes, int pe, core::atomicType amoType) {
+  DISPATCH_PROVIDER_TYPE(ShmemAtomicSizeFetchWarpKernelImpl, dest, destOffset, source, sourceOffset,
+                         val, compare, bytes, pe, amoType);
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Synchronization                                        */
 /* ---------------------------------------------------------------------------------------------- */

@@ -84,6 +84,12 @@ inline __device__ uint64_t mlx5PrepareAtomicWqe(void* queue_buff_addr, uint32_t 
                                      uint64_t rkey, void* val_1, void* val_2, uint32_t bytes,
                                      atomicType amo_op);
 
+template <ProviderType PrvdType>
+inline __device__ uint64_t PostAtomic(void* queue_buff_addr, uint32_t wqe_num, uint32_t* postIdx,
+                                      uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
+                                      uint64_t rkey, void* val_1, void* val_2, uint32_t typeBytes,
+                                      atomicType amo_op);
+
 template <ProviderType PrvdType, typename T>
 inline __device__ uint64_t PostAtomic(void* queue_buff_addr, uint32_t wqe_num, uint32_t* postIdx,
                                       uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
