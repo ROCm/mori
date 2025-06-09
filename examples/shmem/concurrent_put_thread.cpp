@@ -64,7 +64,6 @@ void ConcurrentPutThread() {
   // Finalize
   ShmemFree(buff);
   ShmemMpiFinalize();
-  MPI_Finalize();
 }
 
 int main(int argc, char* argv[]) {

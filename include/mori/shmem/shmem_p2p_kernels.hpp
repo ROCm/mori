@@ -191,9 +191,8 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernel<application::TransportTy
       int* remoteIntPtr = reinterpret_cast<int*>(destPtr);
       auto casLoop = [=] __device__(int* addr, core::atomicType op, int operand, int cmpVal,
                                     int* oldResult) {
+        int oldVal = core::AtomicLoadSeqCstSystem(addr);
         while (true) {
-          int oldVal = core::AtomicLoadSeqCstSystem(addr);
-
           int newVal = oldVal;
           switch (op) {
             case core::AMO_FETCH_INC:
@@ -232,8 +231,10 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernel<application::TransportTy
             break;
           }
         }
+        return oldVal;
       };
-      int operandInt = *reinterpret_cast<int*>(source.addr + sourceOffset);
+      int *operandIntPtr = reinterpret_cast<int*>(source.addr + sourceOffset);
+      int operandInt = *operandIntPtr;
       switch (amoType) {
         case core::AMO_FETCH_INC:
         case core::AMO_FETCH_ADD:
@@ -242,7 +243,7 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernel<application::TransportTy
         case core::AMO_FETCH_XOR:
         case core::AMO_SWAP:
         case core::AMO_COMPARE_SWAP: {
-          casLoop(remoteIntPtr, amoType, operandInt, cmpVal, fetchResPtr);
+          *operandIntPtr = casLoop(remoteIntPtr, amoType, operandInt, cmpVal, fetchResPtr);
         } break;
 
         default:
@@ -257,8 +258,8 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernel<application::TransportTy
       long long* remoteLLPtr = reinterpret_cast<long long*>(destPtr);
       auto casLoop64 = [=] __device__(long long* addr, core::atomicType op, long long operand,
                                       long long cmpValLL, long long* oldResult) {
+        long long oldVal = core::AtomicLoadSeqCstSystem(addr);
         while (true) {
-          long long oldVal = core::AtomicLoadSeqCstSystem(addr);
           long long newVal = oldVal;
           switch (op) {
             case core::AMO_FETCH_INC:
@@ -297,8 +298,10 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernel<application::TransportTy
             break;
           }
         }
+        return oldVal;
       };
-      long long operandLL = *reinterpret_cast<long long*>(source.addr + sourceOffset);
+      long long *operandLLPtr = reinterpret_cast<long long*>(source.addr + sourceOffset);
+      long long operandLL = *operandLLPtr;
       switch (amoType) {
         case core::AMO_FETCH_INC:
         case core::AMO_FETCH_ADD:
@@ -307,13 +310,14 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernel<application::TransportTy
         case core::AMO_FETCH_XOR:
         case core::AMO_SWAP:
         case core::AMO_COMPARE_SWAP: {
-          casLoop64(remoteLLPtr, amoType, operandLL, cmpValLL, fetchResPtr);
+          *operandLLPtr = casLoop64(remoteLLPtr, amoType, operandLL, cmpValLL, fetchResPtr);
         } break;
 
         default:
           printf("Error: Unsupported 8-byte atomicType (%d) in FetchThreadKernel.\n", amoType);
           break;
       }
+      break;
     }
     default:
       printf("Error: Unsupported data size (%zu bytes) in FetchThreadKernel.\n", bytes);
