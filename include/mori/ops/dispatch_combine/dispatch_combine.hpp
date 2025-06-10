@@ -21,7 +21,6 @@ struct EpDispatchCombineConfig {
   int numExpertPerToken{2};
   int warpNumPerBlock{1};
   int blockNum{1};
-  KernelType kernelType{IntraNode};
 };
 
 template <typename T>
@@ -39,8 +38,13 @@ class EpDispatchCombineHandle {
     this->curRankNumToken = numToken;
   }
 
-  void LaunchDispatch(hipStream_t = 0);
-  void LaunchCombine(hipStream_t = 0);
+  void LaunchIntraNodeDispatch(hipStream_t = 0);
+  void LaunchInterNodeDispatch(hipStream_t = 0);
+  void LaunchIntraNodeCombine(hipStream_t = 0);
+  void LaunchInterNodeCombine(hipStream_t = 0);
+
+  void LaunchDispatch(KernelType, hipStream_t = 0);
+  void LaunchCombine(KernelType, hipStream_t = 0);
   void LaunchReset(hipStream_t = 0);
 
  private:
@@ -55,6 +59,9 @@ class EpDispatchCombineHandle {
 
   void IntializeOrderMapBuf();
   void FinalizeOrderMapBuf();
+
+  void IntializeBarrier();
+  void FinalizeBarrier();
 
  public:
   // Number of tokens on this rank, updated at each round of inference
@@ -103,6 +110,9 @@ class EpDispatchCombineHandle {
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
   uint32_t* dispDestTokIdMap{nullptr};
+  uint32_t* totalRecvTokenNum{nullptr};
+  mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
+  uint32_t crossDeviceBarrierFlag{1};
 };
 
 template <typename T>
@@ -128,6 +138,9 @@ struct EpDispatchCombineArgs {
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
   uint32_t* dispDestTokIdMap{nullptr};
+  uint32_t* totalRecvTokenNum{nullptr};
+  mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
+  uint32_t crossDeviceBarrierFlag{1};
 };
 
 template <typename T>
@@ -154,6 +167,9 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<
   args.dispTokOffsetMemObj = handle.dispTokOffsetMemObj;
   args.dispTokIdToSrcTokIdMemObj = handle.dispTokIdToSrcTokIdMemObj;
   args.dispDestTokIdMap = handle.dispDestTokIdMap;
+  args.totalRecvTokenNum = handle.totalRecvTokenNum;
+  args.crossDeviceBarrierMemObj = handle.crossDeviceBarrierMemObj;
+  args.crossDeviceBarrierFlag = handle.crossDeviceBarrierFlag;
   return args;
 }
 

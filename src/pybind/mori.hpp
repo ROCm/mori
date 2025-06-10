@@ -1,8 +1,8 @@
 #pragma once
 
-#include <torch/library.h>
+#include <pybind11/pybind11.h>
 
 namespace mori {
-void RegisterMoriOps(torch::Library& m);
-void RegisterMoriShmem(torch::Library& m);
+void RegisterMoriOps(pybind11::module_& m);
+void RegisterMoriShmem(pybind11::module_& m);
 }  // namespace mori

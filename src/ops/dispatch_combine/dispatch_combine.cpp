@@ -283,6 +283,9 @@ __global__ void EpCombineKernel(EpDispatchCombineArgs<T> args) {
   }
 }
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                           ResetKernel                                          */
+/* ---------------------------------------------------------------------------------------------- */
 template <typename T>
 __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
   int thdId = threadIdx.x;
@@ -302,6 +305,28 @@ __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
 }
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                                          BarrierKernel                                         */
+/* ---------------------------------------------------------------------------------------------- */
+template <typename T>
+inline __device__ void CrossDeviceBarrierKernel(EpDispatchCombineArgs<T> args) {
+  int thdId = threadIdx.x;
+  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (globalThdId < args.config.worldSize) {
+    AtomicStoreRelaxedSystem(
+        args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(globalThdId) + args.config.rank,
+        args.crossDeviceBarrierFlag);
+  }
+
+  uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
+  if (thdId < args.config.worldSize) {
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != args.crossDeviceBarrierFlag) {
+    }
+  }
+  __syncthreads();
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                     EpDispatchCombineHandle                                    */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>
@@ -311,6 +336,7 @@ EpDispatchCombineHandle<T>::EpDispatchCombineHandle(EpDispatchCombineConfig conf
   IntializeTokenNumSignalBuf();
   IntializeTokToExptBuf();
   IntializeOrderMapBuf();
+  IntializeBarrier();
 }
 
 template <typename T>
@@ -319,6 +345,7 @@ EpDispatchCombineHandle<T>::~EpDispatchCombineHandle() {
   FinalizeTokenNumSignalBuf();
   FinalizeTokToExptBuf();
   FinalizeOrderMapBuf();
+  FinalizeBarrier();
 }
 
 template <typename T>
@@ -357,18 +384,15 @@ void EpDispatchCombineHandle<T>::IntializeTokenNumSignalBuf() {
   sendTokenNumMemObj = ShmemQueryMemObjPtr(sendTokenNumBuf);
   assert(sendTokenNumMemObj.IsValid());
 
-  HIP_RUNTIME_CHECK(hipMalloc(&dispatchGridBarrier, tokenNumSignalSize));
-  HIP_RUNTIME_CHECK(hipMemset(dispatchGridBarrier, 0, tokenNumSignalSize));
-  HIP_RUNTIME_CHECK(hipMalloc(&combineGridBarrier, tokenNumSignalSize));
-  HIP_RUNTIME_CHECK(hipMemset(combineGridBarrier, 0, tokenNumSignalSize));
+  HIP_RUNTIME_CHECK(hipMalloc(&totalRecvTokenNum, sizeof(uint32_t)));
+  HIP_RUNTIME_CHECK(hipMemset(totalRecvTokenNum, 0, sizeof(uint32_t)));
 }
 
 template <typename T>
 void EpDispatchCombineHandle<T>::FinalizeTokenNumSignalBuf() {
   ShmemFree(recvTokenNumMemObj->localPtr);
   ShmemFree(sendTokenNumMemObj->localPtr);
-  HIP_RUNTIME_CHECK(hipFree(dispatchGridBarrier));
-  HIP_RUNTIME_CHECK(hipFree(combineGridBarrier));
+  HIP_RUNTIME_CHECK(hipFree(totalRecvTokenNum));
 }
 
 template <typename T>
@@ -434,16 +458,58 @@ void EpDispatchCombineHandle<T>::FinalizeOrderMapBuf() {
 }
 
 template <typename T>
-void EpDispatchCombineHandle<T>::LaunchDispatch(hipStream_t stream) {
+void EpDispatchCombineHandle<T>::IntializeBarrier() {
+  int barrierSize = config.worldSize * sizeof(uint32_t);
+
+  HIP_RUNTIME_CHECK(hipMalloc(&dispatchGridBarrier, barrierSize));
+  HIP_RUNTIME_CHECK(hipMemset(dispatchGridBarrier, 0, barrierSize));
+  HIP_RUNTIME_CHECK(hipMalloc(&combineGridBarrier, barrierSize));
+  HIP_RUNTIME_CHECK(hipMemset(combineGridBarrier, 0, barrierSize));
+
+  void* crossDeviceBarrierBuf = ShmemExtMallocWithFlags(barrierSize, hipDeviceMallocUncached);
+  HIP_RUNTIME_CHECK(hipMemset(crossDeviceBarrierBuf, 0, barrierSize));
+  crossDeviceBarrierMemObj = ShmemQueryMemObjPtr(crossDeviceBarrierBuf);
+  assert(crossDeviceBarrierMemObj.IsValid());
+}
+
+template <typename T>
+void EpDispatchCombineHandle<T>::FinalizeBarrier() {
+  HIP_RUNTIME_CHECK(hipFree(dispatchGridBarrier));
+  HIP_RUNTIME_CHECK(hipFree(combineGridBarrier));
+  ShmemFree(crossDeviceBarrierMemObj->localPtr);
+}
+
+template <typename T>
+void EpDispatchCombineHandle<T>::LaunchIntraNodeDispatch(hipStream_t stream) {
+  LaunchDispatch(KernelType::IntraNode, stream);
+}
+
+template <typename T>
+void EpDispatchCombineHandle<T>::LaunchInterNodeDispatch(hipStream_t stream) {
+  LaunchDispatch(KernelType::InterNode, stream);
+}
+
+template <typename T>
+void EpDispatchCombineHandle<T>::LaunchIntraNodeCombine(hipStream_t stream) {
+  LaunchCombine(KernelType::IntraNode, stream);
+}
+
+template <typename T>
+void EpDispatchCombineHandle<T>::LaunchInterNodeCombine(hipStream_t stream) {
+  LaunchCombine(KernelType::InterNode, stream);
+}
+
+template <typename T>
+void EpDispatchCombineHandle<T>::LaunchDispatch(KernelType kernelType, hipStream_t stream) {
   dim3 grid(config.blockNum);
   dim3 block(warpSize * config.warpNumPerBlock);
   size_t sharedMemSize =
       (config.worldSize * config.warpNumPerBlock +
        config.numExpertPerRank * config.warpNumPerBlock + config.numExpertPerRank) *
       sizeof(uint32_t);
-  if (config.kernelType == KernelType::InterNode)
+  if (kernelType == KernelType::InterNode)
     EpDispatchKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
-  else if (config.kernelType == KernelType::IntraNode)
+  else if (kernelType == KernelType::IntraNode)
     EpDispatchIntraNodeKernel<<<grid, block, sharedMemSize, stream>>>(
         GetEpDispatchCombineArgs(*this));
   else
@@ -451,14 +517,14 @@ void EpDispatchCombineHandle<T>::LaunchDispatch(hipStream_t stream) {
 }
 
 template <typename T>
-void EpDispatchCombineHandle<T>::LaunchCombine(hipStream_t stream) {
+void EpDispatchCombineHandle<T>::LaunchCombine(KernelType kernelType, hipStream_t stream) {
   dim3 grid(config.blockNum);
   dim3 block(warpSize * config.warpNumPerBlock);
   size_t sharedMemSize = config.warpNumPerBlock * config.numExpertPerToken * sizeof(T**);
 
-  if (config.kernelType == KernelType::InterNode)
+  if (kernelType == KernelType::InterNode)
     EpCombineKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
-  else if (config.kernelType == KernelType::IntraNode)
+  else if (kernelType == KernelType::IntraNode)
     EpCombineIntraNodeKernel<<<grid, block, sharedMemSize, stream>>>(
         GetEpDispatchCombineArgs(*this));
   else
@@ -470,6 +536,7 @@ void EpDispatchCombineHandle<T>::LaunchReset(hipStream_t stream) {
   dim3 block(std::max(config.numExpertPerRank, config.worldSize));
   EpDispatchCombineResetKernel<<<1, config.numExpertPerRank, 0, stream>>>(
       GetEpDispatchCombineArgs(*this));
+  crossDeviceBarrierFlag++;
 }
 
 template class EpDispatchCombineHandle<float>;

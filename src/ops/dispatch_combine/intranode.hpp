@@ -41,6 +41,15 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     uint32_t destPe = destExpert / config.numExpertPerRank;
     uint32_t destTokId = 0;
 
+    // Deduplicate
+    assert(config.numExpertPerToken < warpSize);
+    int condition = 0;
+    if (laneId < (i % config.numExpertPerToken)) {
+      condition = destPe == (args.tokenIndicies[srcTokId * config.numExpertPerToken + laneId] /
+                             config.numExpertPerRank);
+    }
+    if (__any(condition)) continue;
+
     if (laneId == 0) {
       // decide token id in dest pe
       destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<uint32_t*>(destPe), 1);
@@ -73,11 +82,28 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   }
   // Phase 2: recv token
   // Each warp wait until sender finished by waiting token number signal
+  uint32_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint32_t*>();
   for (int destPe = thdId; destPe < npes; destPe += thdNum) {
-    uint32_t* signal = args.recvTokenNumMemObj->template GetAs<uint32_t*>() + destPe;
+    uint32_t* signal = recvTokenNums + destPe;
     shmem::ShmemUint32WaitUntilGreaterThan(signal, 0);
   }
   __syncthreads();
+
+  // Compute total number of received tokens
+  uint32_t totalRecvTokenNum = 0;
+  for (int i = laneId; i < config.worldSize; i += warpSize) {
+    totalRecvTokenNum += recvTokenNums[i] - 1;
+  }
+  totalRecvTokenNum = core::WarpReduceSum<uint32_t>(totalRecvTokenNum);
+  totalRecvTokenNum = __shfl(totalRecvTokenNum, 0);
+
+  for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
+    core::WarpCopy(args.outTokenBuf + i * config.hiddenDim,
+                   args.shmemOutTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
+                   config.hiddenDim);
+  }
+
+  if ((globalWarpId == 0) && (laneId == 0)) *args.totalRecvTokenNum = totalRecvTokenNum;
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -103,7 +129,11 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   size_t maxNumOutTokenPerRank =
       config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken;
 
-  // TODO: sync accors devices
+  for (int i = globalWarpId; i < *args.totalRecvTokenNum; i += globalWarpNum) {
+    core::WarpCopy(args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
+                   args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
+  }
+  CrossDeviceBarrierKernel(args);
 
   extern __shared__ char sharedMem[];
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;

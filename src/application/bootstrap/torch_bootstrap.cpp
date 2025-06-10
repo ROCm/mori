@@ -18,7 +18,6 @@ TorchBootstrapNetwork::~TorchBootstrapNetwork() { Finalize(); }
 void TorchBootstrapNetwork::Initialize() {
   this->worldSize = group->getSize();
   this->localRank = group->getRank();
-  printf("rank %d size %d\n", GetLocalRank(), worldSize);
 }
 
 void TorchBootstrapNetwork::Finalize() {}

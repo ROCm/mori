@@ -58,6 +58,7 @@ static std::ostream& operator<<(std::ostream& s, TestType testType) {
 
 struct RunConfig {
   TestType testType{Accuracy};
+  KernelType kernelType{KernelType::IntraNode};
   int warmup{5};
   int repeat{5};
   float atol{1e-2};
@@ -173,14 +174,15 @@ class EpDispatchCombineTestCase {
     }
     std::cout << "Rank " << config.rank << " recv " << totalRecvNumToken << " tokens" << std::endl;
 
-    if (config.kernelType == IntraNode) {
+    if (runConfig.kernelType == IntraNode) {
       for (int i = 0; i < totalRecvNumToken; i++) {
         uint32_t srcTokId = handle.dispTokIdToSrcTokIdMemObj->template GetAs<uint32_t*>()[i];
 
         uint32_t srcPe = srcTokId / config.maxNumInpTokenPerRank;
         uint32_t localSrcTokId = srcTokId - srcPe * config.maxNumInpTokenPerRank;
 
-        T* localTokBuf = handle.shmemOutTokMemObj->template GetAs<T*>() + i * config.hiddenDim;
+        // T* localTokBuf = handle.shmemOutTokMemObj->template GetAs<T*>() + i * config.hiddenDim;
+        T* localTokBuf = outTokBuf + i * config.hiddenDim;
         T* srcTokBuf = reinterpret_cast<T*>(globalInpTokBufCpu) + srcPe * inpTokEleNum +
                        localSrcTokId * config.hiddenDim;
 
@@ -199,7 +201,7 @@ class EpDispatchCombineTestCase {
           }
         }
       }
-    } else if (config.kernelType == InterNode) {
+    } else if (runConfig.kernelType == InterNode) {
       // Build pe sorted to token index map
       std::vector<std::unordered_map<uint32_t, uint32_t>> peSortToTokenIdxMapsVec;
       for (int i = 0; i < config.worldSize; i++) {
@@ -294,7 +296,7 @@ class EpDispatchCombineTestCase {
       InitializeHandle();
       SystemBarrier();
 
-      handle.LaunchDispatch();
+      handle.LaunchDispatch(runConfig.kernelType);
       SystemBarrier();
 
       CheckDispatchResult();
@@ -304,7 +306,7 @@ class EpDispatchCombineTestCase {
       CopyDispatchOutAsCombineInp();
       SystemBarrier();
 
-      handle.LaunchCombine();
+      handle.LaunchCombine(runConfig.kernelType);
       SystemBarrier();
 
       CheckCombineResult();
@@ -322,10 +324,10 @@ class EpDispatchCombineTestCase {
       InitializeHandle();
       SystemBarrier();
 
-      handle.LaunchDispatch(stream);
+      handle.LaunchDispatch(runConfig.kernelType, stream);
       CopyDispatchOutAsCombineInp();
       SystemBarrier();
-      handle.LaunchCombine(stream);
+      handle.LaunchCombine(runConfig.kernelType, stream);
       if (handle.config.rank == 0) std::cout << "Warmup Done" << std::endl;
     }
 
@@ -339,14 +341,14 @@ class EpDispatchCombineTestCase {
       SystemBarrier();
 
       HIP_RUNTIME_CHECK(hipEventRecord(events[0]));
-      handle.LaunchDispatch(stream);
+      handle.LaunchDispatch(runConfig.kernelType, stream);
       HIP_RUNTIME_CHECK(hipEventRecord(events[1]));
 
       CopyDispatchOutAsCombineInp();
       SystemBarrier();
 
       HIP_RUNTIME_CHECK(hipEventRecord(events[2]));
-      handle.LaunchCombine(stream);
+      handle.LaunchCombine(runConfig.kernelType, stream);
       HIP_RUNTIME_CHECK(hipEventRecord(events[3]));
 
       float dispatch, combine;
@@ -381,10 +383,10 @@ class EpDispatchCombineTestCase {
     HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, outTokBuf,
                                 maxNumOutTokenPerRank * config.hiddenDim * sizeof(T),
                                 hipMemcpyDeviceToDevice));
-    HIP_RUNTIME_CHECK(hipMemcpy(handle.shmemInpTokMemObj->template GetAs<T*>(),
-                                handle.shmemOutTokMemObj->template GetAs<T*>(),
-                                maxNumOutTokenPerRank * config.hiddenDim * sizeof(T),
-                                hipMemcpyDeviceToDevice));
+    // HIP_RUNTIME_CHECK(hipMemcpy(handle.shmemInpTokMemObj->template GetAs<T*>(),
+    //                             handle.shmemOutTokMemObj->template GetAs<T*>(),
+    //                             maxNumOutTokenPerRank * config.hiddenDim * sizeof(T),
+    //                             hipMemcpyDeviceToDevice));
     HIP_RUNTIME_CHECK(
         hipMemset(outTokBuf, 0, maxNumOutTokenPerRank * config.hiddenDim * sizeof(T)));
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
@@ -595,9 +597,9 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
         break;
       case 'k':
         if (strcmp(long_options[option_index].name, "intra") == 0) {
-          testConfig.config.kernelType = KernelType::IntraNode;
+          testConfig.runConfig.kernelType = KernelType::IntraNode;
         } else if (strcmp(long_options[option_index].name, "inter") == 0) {
-          testConfig.config.kernelType = KernelType::InterNode;
+          testConfig.runConfig.kernelType = KernelType::InterNode;
         } else {
           printf("Unknown cmd: %s, must be 'inter' or 'intra'\n", optarg);
           assert(false);

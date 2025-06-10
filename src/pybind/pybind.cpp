@@ -1,6 +1,6 @@
-#include <torch/library.h>
-
 #include "src/pybind/mori.hpp"
 
-TORCH_LIBRARY(mori_ops, m) { mori::RegisterMoriOps(m); }
-TORCH_LIBRARY(mori_shmem, m) { mori::RegisterMoriShmem(m); }
+PYBIND11_MODULE(libmori_pybinds, m) {
+  mori::RegisterMoriOps(m);
+  mori::RegisterMoriShmem(m);
+}

@@ -1,2 +1,1 @@
-from .torch_ops import torch_mori_ops
-from .torch_ops import torch_mori_shmem
+from libmori_pybinds import *
