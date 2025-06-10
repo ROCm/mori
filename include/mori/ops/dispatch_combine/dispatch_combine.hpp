@@ -21,6 +21,8 @@ struct EpDispatchCombineConfig {
   int numExpertPerToken{2};
   int warpNumPerBlock{1};
   int blockNum{1};
+
+  uint32_t MaxNumOutputTokens() { return worldSize * maxNumInpTokenPerRank * numExpertPerRank; }
 };
 
 template <typename T>

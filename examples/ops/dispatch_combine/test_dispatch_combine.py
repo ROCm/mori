@@ -41,8 +41,7 @@ class EpDispatchCombineTestCase:
         mori.shmem_torch_process_group_init("default")
 
         self.rng = torch.Generator(device=self.device)
-        # self.rng.manual_seed(int(time.time()) + self.rank)
-        self.rng.manual_seed(122)
+        self.rng.manual_seed(int(time.time()) + self.rank)
 
     def cleanup(self):
         mori.shmem_finalize()
@@ -115,29 +114,16 @@ class EpDispatchCombineTestCase:
         )
         dist.all_gather(input_list, padded_input)
 
-        max_num_tokens = (
-            self.config.world_size
-            * self.config.max_num_inp_token_per_rank
-            * self.config.num_experts_per_token
-        )
-        output = torch.empty(
-            max_num_tokens,
-            self.config.hidden_dim,
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
-
-        return (num_tokens, indicies, weights, input, output, input_list)
+        return (num_tokens, indicies, weights, input, input_list)
 
     def test_dispatch_combine(self):
         self.setup()
 
         handle = mori.EpDispatchCombineHandleBf16(self.config)
-        num_tokens, indicies, weights, input, output, input_list = self.gen_test_data()
-        mori.launch_intra_node_dispatch_Bf16(
+        num_tokens, indicies, weights, input, input_list = self.gen_test_data()
+        dispatch_output = mori.launch_intra_node_dispatch_Bf16(
             handle,
             input,
-            output,
             weights,
             indicies,
         )
@@ -151,14 +137,37 @@ class EpDispatchCombineTestCase:
         for i, pos in enumerate(src_token_pos):
             src_rank = int(pos) // self.config.max_num_inp_token_per_rank
             src_id = int(pos) % self.config.max_num_inp_token_per_rank
-            is_equal = torch.equal(input_list[src_rank][src_id], output[i])
+            is_equal = torch.equal(input_list[src_rank][src_id], dispatch_output[i])
             if not is_equal:
                 print(
-                    f"rank {self.rank} i {i} pos {pos} src_rank {src_rank} src_id {src_id}"
+                    f"dispatch rank {self.rank} i {i} pos {pos} src_rank {src_rank} src_id {src_id}"
                 )
             assert is_equal
 
         assert len(torch.unique(src_token_pos)) == len(src_token_pos)
+
+        # combine_output = torch.empty(
+        #     num_tokens,
+        #     self.config.hidden_dim,
+        #     dtype=torch.bfloat16,
+        #     device=self.device,
+        # )
+        # mori.launch_intra_node_combine_Bf16(
+        #     handle,
+        #     dispatch_output,
+        #     combine_output,
+        #     weights,
+        #     indicies,
+        # )
+        # torch.cuda.synchronize()
+
+        # for i in range(num_tokens):
+        #     is_equal = torch.equal(combine_output[i], input[i] * torch.sum(weights[i]))
+        #     if not is_equal:
+        #         print(
+        #             f"combine rank {self.rank} i {i} pos {pos} src_rank {src_rank} src_id {src_id}"
+        #         )
+        #     assert is_equal
 
         del handle
         self.cleanup()
@@ -170,7 +179,7 @@ def test_dispatch_combine(rank, world_size):
 
 
 if __name__ == "__main__":
-    world_size = 8
+    world_size = 2
     torch.multiprocessing.spawn(
         test_dispatch_combine, args=(world_size,), nprocs=world_size, join=True
     )

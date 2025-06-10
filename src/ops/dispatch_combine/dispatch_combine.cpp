@@ -301,6 +301,7 @@ __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
   }
   if (thdId == 0) {
     args.dispTokOffsetMemObj->template GetAs<uint32_t*>()[0] = 0;
+    *args.totalRecvTokenNum = 0;
   }
 }
 

@@ -80,30 +80,18 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
                                         numTokenSignal, destPe);
     }
   }
+
   // Phase 2: recv token
   // Each warp wait until sender finished by waiting token number signal
   uint32_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint32_t*>();
-  for (int destPe = thdId; destPe < npes; destPe += thdNum) {
-    uint32_t* signal = recvTokenNums + destPe;
-    shmem::ShmemUint32WaitUntilGreaterThan(signal, 0);
+  if (globalWarpId == 0) {
+    uint32_t totalRecvTokenNum = 0;
+    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+      uint32_t* signal = recvTokenNums + destPe;
+      totalRecvTokenNum = shmem::ShmemUint32WaitUntilGreaterThan(signal, 0) - 1;
+      atomicAdd(args.totalRecvTokenNum, totalRecvTokenNum);
+    }
   }
-  __syncthreads();
-
-  // Compute total number of received tokens
-  uint32_t totalRecvTokenNum = 0;
-  for (int i = laneId; i < config.worldSize; i += warpSize) {
-    totalRecvTokenNum += recvTokenNums[i] - 1;
-  }
-  totalRecvTokenNum = core::WarpReduceSum<uint32_t>(totalRecvTokenNum);
-  totalRecvTokenNum = __shfl(totalRecvTokenNum, 0);
-
-  for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
-    core::WarpCopy(args.outTokenBuf + i * config.hiddenDim,
-                   args.shmemOutTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
-                   config.hiddenDim);
-  }
-
-  if ((globalWarpId == 0) && (laneId == 0)) *args.totalRecvTokenNum = totalRecvTokenNum;
 }
 
 /* ---------------------------------------------------------------------------------------------- */

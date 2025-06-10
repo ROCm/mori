@@ -1,5 +1,6 @@
 #include "src/pybind/mori.hpp"
 
+#include <ATen/hip/HIPContext.h>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
 #include <pybind11/pybind11.h>
@@ -18,15 +19,20 @@
 namespace {
 
 template <typename T>
-void LaunchIntraNodeDispatch(mori::moe::EpDispatchCombineHandle<T>& handle,
-                             const torch::Tensor& input, const torch::Tensor& output,
-                             const torch::Tensor& weights, const torch::Tensor& topkIds) {
-  assert(input.is_contiguous() && output.is_contiguous() && weights.is_contiguous() &&
-         topkIds.is_contiguous());
-  handle.PrepareInference(reinterpret_cast<T*>(input.data_ptr()),
-                          reinterpret_cast<T*>(output.data_ptr()), weights.data_ptr<float>(),
-                          topkIds.data_ptr<uint32_t>(), input.size(0));
-  handle.LaunchIntraNodeDispatch(0);
+torch::Tensor LaunchIntraNodeDispatch(mori::moe::EpDispatchCombineHandle<T>& handle,
+                                      const torch::Tensor& input, const torch::Tensor& weights,
+                                      const torch::Tensor& topkIds) {
+  assert(input.is_contiguous() && weights.is_contiguous() && topkIds.is_contiguous());
+
+  handle.PrepareInference(reinterpret_cast<T*>(input.data_ptr()), nullptr,
+                          weights.data_ptr<float>(), topkIds.data_ptr<uint32_t>(), input.size(0));
+  handle.LaunchIntraNodeDispatch(at::cuda::getCurrentHIPStream());
+
+  auto options = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+  torch::Tensor out =
+      torch::from_blob(handle.shmemOutTokMemObj->Get(),
+                       {handle.config.MaxNumOutputTokens(), handle.config.hiddenDim}, options);
+  return out;
 }
 
 template <typename T>
@@ -38,12 +44,12 @@ void LaunchIntraNodeCombine(mori::moe::EpDispatchCombineHandle<T>& handle,
   handle.PrepareInference(reinterpret_cast<T*>(input.data_ptr()),
                           reinterpret_cast<T*>(output.data_ptr()), weights.data_ptr<float>(),
                           topkIds.data_ptr<uint32_t>(), input.size(0));
-  handle.LaunchIntraNodeCombine(0);
+  handle.LaunchIntraNodeCombine(at::cuda::getCurrentHIPStream());
 }
 
 template <typename T>
 void LaunchReset(mori::moe::EpDispatchCombineHandle<T>& handle) {
-  handle.LaunchReset(0);
+  handle.LaunchReset(at::cuda::getCurrentHIPStream());
 }
 
 template <typename T>
