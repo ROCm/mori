@@ -7,19 +7,17 @@ import torch.distributed as dist
 
 
 class EpDispatchCombineTestCase:
-    def __init__(self, rank, world_size):
+    def __init__(self, rank, world_size, dtype=torch.bfloat16):
         self.rank = rank
         self.world_size = world_size
-
-        self.config = mori.EpDispatchCombineConfig(
+        self.config = mori.ops.EpDispatchCombineConfig(
+            data_type=dtype,
             rank=self.rank,
             world_size=self.world_size,
             hidden_dim=7168,
             max_num_inp_token_per_rank=128,
-            num_expert_per_rank=32,
-            num_expert_per_token=8,
-            warp_num_per_block=4,
-            block_num=256,
+            num_experts_per_rank=32,
+            num_experts_per_token=8,
         )
 
     def setup(self):
@@ -38,13 +36,13 @@ class EpDispatchCombineTestCase:
         world_group = torch.distributed.group.WORLD
         assert world_group is not None
         torch._C._distributed_c10d._register_process_group("default", world_group)
-        mori.shmem_torch_process_group_init("default")
+        mori.shmem.shmem_torch_process_group_init("default")
 
         self.rng = torch.Generator(device=self.device)
         self.rng.manual_seed(int(time.time()) + self.rank)
 
     def cleanup(self):
-        mori.shmem_finalize()
+        mori.shmem.shmem_finalize()
         dist.destroy_process_group()
 
     def gen_test_data(self):
@@ -84,10 +82,11 @@ class EpDispatchCombineTestCase:
         )
 
         # gen input & output
-        input = torch.randn(
+        # some functions such as randn and cat are not implemented for fp8
+        input_fp32 = torch.randn(
             num_tokens,
             self.config.hidden_dim,
-            dtype=torch.bfloat16,
+            dtype=torch.float32,
             generator=self.rng,
             device=self.device,
         )
@@ -95,38 +94,39 @@ class EpDispatchCombineTestCase:
         input_list = [
             torch.zeros(
                 (self.config.max_num_inp_token_per_rank, self.config.hidden_dim),
-                dtype=torch.bfloat16,
+                dtype=self.config.data_type,
                 device=self.device,
             )
             for _ in range(self.world_size)
         ]
         padded_input = torch.cat(
             [
-                input,
+                input_fp32,
                 torch.zeros(
                     self.config.max_num_inp_token_per_rank - num_tokens,
                     self.config.hidden_dim,
-                    dtype=torch.bfloat16,
+                    dtype=torch.float32,
                     device=self.device,
                 ),
             ],
             0,
-        )
+        ).to(self.config.data_type)
         dist.all_gather(input_list, padded_input)
 
-        return (num_tokens, indicies, weights, input, input_list)
-
-    def run_test_once(self, handle, test_data):
-        num_tokens, indicies, weights, input, input_list = test_data
-        dispatch_output = mori.launch_intra_node_dispatch_Bf16(
-            handle,
-            input,
-            weights,
+        return (
+            num_tokens,
             indicies,
+            weights,
+            input_fp32.to(self.config.data_type),
+            input_list,
         )
+
+    def run_test_once(self, op, test_data):
+        num_tokens, indicies, weights, input, input_list = test_data
+        dispatch_output = op.dispatch(input, weights, indicies)
         torch.cuda.synchronize()
 
-        src_token_pos = mori.get_dispatch_src_token_pos_Bf16(handle)
+        src_token_pos = op.get_dispatch_src_token_pos()
         print(
             f"rank {self.rank} got {num_tokens} tokens received {src_token_pos.size(0)} tokens"
         )
@@ -137,18 +137,16 @@ class EpDispatchCombineTestCase:
             is_equal = torch.equal(input_list[src_rank][src_id], dispatch_output[i])
             if not is_equal:
                 print(
-                    f"dispatch rank {self.rank} i {i} pos {pos} src_rank {src_rank} src_id {src_id}"
+                    f"dispatch rank {self.rank} i {i} pos {pos} src_rank {src_rank} src_id {src_id} {input_list[src_rank][src_id]}, {dispatch_output[i]}"
                 )
             assert is_equal
 
         assert len(torch.unique(src_token_pos)) == len(src_token_pos)
 
-        combine_output = mori.launch_intra_node_combine_Bf16(
-            handle,
-            dispatch_output,
-            weights,
-            indicies,
-        )
+        if self.config.rank == 0:
+            print("Dispatch Pass")
+
+        combine_output = op.combine(dispatch_output, weights, indicies)
         torch.cuda.synchronize()
 
         for i in range(num_tokens):
@@ -157,28 +155,32 @@ class EpDispatchCombineTestCase:
                 for idx in indicies[i].cpu().tolist()
             ]
             unique_pes = len(set(pes))
+
+            got, expected = combine_output[i], (
+                input[i].to(torch.float32) * unique_pes
+            ).to(self.config.data_type)
+
             is_equal = torch.allclose(
-                combine_output[i], input[i] * unique_pes, atol=1e-2, rtol=1e-2
+                got.float(), expected.float(), atol=1e-2, rtol=1e-2
             )
             if not is_equal:
                 print(
-                    f"combine rank {self.rank} i {i} src_rank {src_rank} src_id {src_id} unique_pes {unique_pes} {indicies[i]} {pes} {combine_output[i]} {input[i] * unique_pes}"
+                    f"combine rank {self.rank} i {i} src_rank {src_rank} src_id {src_id} unique_pes {unique_pes} {indicies[i]} {pes} {got} {expected}"
                 )
             assert is_equal
-
-        mori.launch_reset_Bf16(handle)
-        torch.cuda.synchronize()
+        if self.config.rank == 0:
+            print("Combine Pass")
 
     def test_dispatch_combine(self):
-        handle = mori.EpDispatchCombineHandleBf16(self.config)
-        for _ in range(1000):
+        op = mori.ops.EpDispatchCombineOp(self.config)
+        for i in range(10000):
             test_data = self.gen_test_data()
-            self.run_test_once(handle, test_data)
-        del handle
+            self.run_test_once(op, test_data)
+        del op
 
 
 def test_dispatch_combine(rank, world_size):
-    test_case = EpDispatchCombineTestCase(rank, world_size)
+    test_case = EpDispatchCombineTestCase(rank, world_size, torch.float8_e4m3fnuz)
     test_case.setup()
     test_case.test_dispatch_combine()
     test_case.cleanup()

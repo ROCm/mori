@@ -12,6 +12,7 @@
 #include "mori/application/application.hpp"
 #include "mori/ops/ops.hpp"
 #include "mori/shmem/shmem.hpp"
+#include "src/pybind/torch_utils.hpp"
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Ops APIs                                            */
@@ -28,7 +29,7 @@ torch::Tensor LaunchIntraNodeDispatch(mori::moe::EpDispatchCombineHandle<T>& han
                           weights.data_ptr<float>(), topkIds.data_ptr<uint32_t>(), input.size(0));
   handle.LaunchIntraNodeDispatch(at::cuda::getCurrentHIPStream());
 
-  auto options = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+  auto options = torch::TensorOptions().dtype(mori::GetTorchDataType<T>()).device(torch::kCUDA);
   torch::Tensor out =
       torch::from_blob(handle.shmemOutTokMemObj->Get(),
                        {handle.config.MaxNumOutputTokens(), handle.config.hiddenDim}, options);
@@ -46,7 +47,7 @@ torch::Tensor LaunchIntraNodeCombine(mori::moe::EpDispatchCombineHandle<T>& hand
                           handle.curRankNumToken);
   handle.LaunchIntraNodeCombine(at::cuda::getCurrentHIPStream());
 
-  auto options = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+  auto options = torch::TensorOptions().dtype(mori::GetTorchDataType<T>()).device(torch::kCUDA);
   torch::Tensor out =
       torch::from_blob(handle.shmemOutTokMemObj->Get(),
                        {handle.config.MaxNumOutputTokens(), handle.config.hiddenDim}, options);
@@ -110,8 +111,8 @@ void RegisterMoriOps(py::module_& m) {
   pybind11::class_<mori::moe::EpDispatchCombineConfig>(m, "EpDispatchCombineConfig")
       .def(pybind11::init<int, int, int, int, int, int, int, int>(), py::arg("rank") = 0,
            py::arg("world_size") = 0, py::arg("hidden_dim") = 0,
-           py::arg("max_num_inp_token_per_rank") = 0, py::arg("num_expert_per_rank") = 0,
-           py::arg("num_expert_per_token") = 0, py::arg("warp_num_per_block") = 0,
+           py::arg("max_num_inp_token_per_rank") = 0, py::arg("num_experts_per_rank") = 0,
+           py::arg("num_experts_per_token") = 0, py::arg("warp_num_per_block") = 0,
            py::arg("block_num") = 0)
       .def_readonly("rank", &mori::moe::EpDispatchCombineConfig::rank)
       .def_readonly("world_size", &mori::moe::EpDispatchCombineConfig::worldSize)
@@ -125,7 +126,7 @@ void RegisterMoriOps(py::module_& m) {
 
   DeclareEpDispatchCombineHandle<float>(m, "Fp32");
   DeclareEpDispatchCombineHandle<hip_bfloat16>(m, "Bf16");
-  DeclareEpDispatchCombineHandle<__hip_fp8_e4m3_fnuz>(m, "Fp8E4m3");
+  DeclareEpDispatchCombineHandle<__hip_fp8_e4m3_fnuz>(m, "Fp8E4m3Fnuz");
 }
 
 void RegisterMoriShmem(py::module_& m) {
