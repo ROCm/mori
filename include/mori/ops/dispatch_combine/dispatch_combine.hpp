@@ -50,8 +50,8 @@ class EpDispatchCombineHandle {
   void LaunchReset(hipStream_t = 0);
 
  private:
-  void IntializeShmemInpOutTokBuf();
-  void FinalizeShmemInpOutTokBuf();
+  void IntializeShmemBuf();
+  void FinalizeShmemBuf();
 
   void IntializeTokenNumSignalBuf();
   void FinalizeTokenNumSignalBuf();
@@ -80,9 +80,13 @@ class EpDispatchCombineHandle {
   T* outTokenBuf{nullptr};
   float* weightsBuf{nullptr};
 
-  // Temporary buffers of input/output tokens used for shmem ops
+  // Registered buffers used for shmem ops, could also be returned to user
   mori::application::SymmMemObjPtr shmemInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
+
+  // Registered buffer used for weights and indicies
+  mori::application::SymmMemObjPtr shmemWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemIndiciesMemObj;
 
   // Record number of tokens that will be received from other PE
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
@@ -127,6 +131,8 @@ struct EpDispatchCombineArgs {
   float* weightsBuf{nullptr};
   mori::application::SymmMemObjPtr shmemInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
+  mori::application::SymmMemObjPtr shmemWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemIndiciesMemObj;
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
   mori::application::SymmMemObjPtr sendTokenNumMemObj;
   uint32_t* dispatchGridBarrier{nullptr};
@@ -158,6 +164,8 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<
   args.exptTokenOffset = handle.exptTokenOffset;
   args.shmemInpTokMemObj = handle.shmemInpTokMemObj;
   args.shmemOutTokMemObj = handle.shmemOutTokMemObj;
+  args.shmemWeightsMemObj = handle.shmemWeightsMemObj;
+  args.shmemIndiciesMemObj = handle.shmemIndiciesMemObj;
   args.recvTokenNumMemObj = handle.recvTokenNumMemObj;
   args.sendTokenNumMemObj = handle.sendTokenNumMemObj;
   args.dispatchGridBarrier = handle.dispatchGridBarrier;

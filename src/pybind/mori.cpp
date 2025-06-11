@@ -20,20 +20,30 @@
 namespace {
 
 template <typename T>
-torch::Tensor LaunchIntraNodeDispatch(mori::moe::EpDispatchCombineHandle<T>& handle,
-                                      const torch::Tensor& input, const torch::Tensor& weights,
-                                      const torch::Tensor& topkIds) {
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> LaunchIntraNodeDispatch(
+    mori::moe::EpDispatchCombineHandle<T>& handle, const torch::Tensor& input,
+    const torch::Tensor& weights, const torch::Tensor& topkIds) {
   assert(input.is_contiguous() && weights.is_contiguous() && topkIds.is_contiguous());
 
   handle.PrepareInference(reinterpret_cast<T*>(input.data_ptr()), nullptr,
                           weights.data_ptr<float>(), topkIds.data_ptr<uint32_t>(), input.size(0));
   handle.LaunchIntraNodeDispatch(at::cuda::getCurrentHIPStream());
 
-  auto options = torch::TensorOptions().dtype(mori::GetTorchDataType<T>()).device(torch::kCUDA);
-  torch::Tensor out =
-      torch::from_blob(handle.shmemOutTokMemObj->Get(),
-                       {handle.config.MaxNumOutputTokens(), handle.config.hiddenDim}, options);
-  return out;
+  torch::Tensor out = torch::from_blob(
+      handle.shmemOutTokMemObj->Get(),
+      {handle.config.MaxNumOutputTokens(), handle.config.hiddenDim},
+      torch::TensorOptions().dtype(mori::GetTorchDataType<T>()).device(torch::kCUDA));
+
+  torch::Tensor outWeights = torch::from_blob(
+      handle.shmemWeightsMemObj->Get(),
+      {handle.config.MaxNumOutputTokens(), handle.config.numExpertPerToken},
+      torch::TensorOptions().dtype(mori::GetTorchDataType<float>()).device(torch::kCUDA));
+
+  torch::Tensor outIndicies = torch::from_blob(
+      handle.shmemIndiciesMemObj->Get(),
+      {handle.config.MaxNumOutputTokens(), handle.config.numExpertPerToken},
+      torch::TensorOptions().dtype(mori::GetTorchDataType<uint32_t>()).device(torch::kCUDA));
+  return {out, outWeights, outIndicies};
 }
 
 // TODO: translate data type

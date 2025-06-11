@@ -57,13 +57,24 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     if (laneId == 0) {
       // decide token id in dest pe
       destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<uint32_t*>(destPe), 1);
-      args.dispTokIdToSrcTokIdMemObj->template GetAs<uint32_t*>(destPe)[destTokId] =
-          myPe * config.maxNumInpTokenPerRank + srcTokId;
-      args.outTokToExptMapMemObj->template GetAs<uint32_t*>(destPe)[destTokId] = destExpert;
       atomicAdd(args.peTokenOffset + destPe, 1);
       args.dispDestTokIdMap[i] = destPe * maxNumOutTokenPerRank + destTokId;
+
+      // For test only
+      args.dispTokIdToSrcTokIdMemObj->template GetAs<uint32_t*>(destPe)[destTokId] =
+          myPe * config.maxNumInpTokenPerRank + srcTokId;
     }
     destTokId = __shfl(destTokId, 0);
+
+    // Write weights and indicies
+    if (laneId < config.numExpertPerToken) {
+      args.shmemWeightsMemObj->template GetAs<float*>(
+          destPe)[destTokId * config.numExpertPerToken + laneId] =
+          args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
+      args.shmemIndiciesMemObj->template GetAs<uint32_t*>(
+          destPe)[destTokId * config.numExpertPerToken + laneId] =
+          args.tokenIndicies[srcTokId * config.numExpertPerToken + laneId];
+    }
 
     uint32_t srcTokOffset = srcTokId * config.hiddenDim;
     uint32_t destTokOffset = destTokId * config.hiddenDim;

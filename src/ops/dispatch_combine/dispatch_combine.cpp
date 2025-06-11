@@ -333,7 +333,7 @@ inline __device__ void CrossDeviceBarrierKernel(EpDispatchCombineArgs<T> args) {
 template <typename T>
 EpDispatchCombineHandle<T>::EpDispatchCombineHandle(EpDispatchCombineConfig config)
     : config(config) {
-  IntializeShmemInpOutTokBuf();
+  IntializeShmemBuf();
   IntializeTokenNumSignalBuf();
   IntializeTokToExptBuf();
   IntializeOrderMapBuf();
@@ -342,7 +342,7 @@ EpDispatchCombineHandle<T>::EpDispatchCombineHandle(EpDispatchCombineConfig conf
 
 template <typename T>
 EpDispatchCombineHandle<T>::~EpDispatchCombineHandle() {
-  FinalizeShmemInpOutTokBuf();
+  FinalizeShmemBuf();
   FinalizeTokenNumSignalBuf();
   FinalizeTokToExptBuf();
   FinalizeOrderMapBuf();
@@ -350,9 +350,8 @@ EpDispatchCombineHandle<T>::~EpDispatchCombineHandle() {
 }
 
 template <typename T>
-void EpDispatchCombineHandle<T>::IntializeShmemInpOutTokBuf() {
-  int maxTokenSize = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken *
-                     config.hiddenDim * sizeof(T);
+void EpDispatchCombineHandle<T>::IntializeShmemBuf() {
+  int maxTokenSize = config.MaxNumOutputTokens() * config.hiddenDim * sizeof(T);
 
   void* shmemInpTokBuf = ShmemExtMallocWithFlags(maxTokenSize, hipDeviceMallocUncached);
   HIP_RUNTIME_CHECK(hipMemset(shmemInpTokBuf, 0, maxTokenSize));
@@ -363,12 +362,26 @@ void EpDispatchCombineHandle<T>::IntializeShmemInpOutTokBuf() {
   HIP_RUNTIME_CHECK(hipMemset(shmemOutTokBuf, 0, maxTokenSize));
   shmemOutTokMemObj = ShmemQueryMemObjPtr(shmemOutTokBuf);
   assert(shmemOutTokMemObj.IsValid());
+
+  int maxWeightSize = config.MaxNumOutputTokens() * config.numExpertPerToken * sizeof(float);
+  void* shmemWeightsBuf = ShmemExtMallocWithFlags(maxWeightSize, hipDeviceMallocUncached);
+  HIP_RUNTIME_CHECK(hipMemset(shmemWeightsBuf, 0, maxWeightSize));
+  shmemWeightsMemObj = ShmemQueryMemObjPtr(shmemWeightsBuf);
+  assert(shmemWeightsMemObj.IsValid());
+
+  int maxIndiciesSize = config.MaxNumOutputTokens() * config.numExpertPerToken * sizeof(uint32_t);
+  void* shmemIndiciesBuf = ShmemExtMallocWithFlags(maxIndiciesSize, hipDeviceMallocUncached);
+  HIP_RUNTIME_CHECK(hipMemset(shmemIndiciesBuf, 0, maxIndiciesSize));
+  shmemIndiciesMemObj = ShmemQueryMemObjPtr(shmemIndiciesBuf);
+  assert(shmemWeightsMemObj.IsValid());
 }
 
 template <typename T>
-void EpDispatchCombineHandle<T>::FinalizeShmemInpOutTokBuf() {
+void EpDispatchCombineHandle<T>::FinalizeShmemBuf() {
   ShmemFree(shmemInpTokMemObj->localPtr);
   ShmemFree(shmemOutTokMemObj->localPtr);
+  ShmemFree(shmemWeightsMemObj->localPtr);
+  ShmemFree(shmemIndiciesMemObj->localPtr);
 }
 
 template <typename T>

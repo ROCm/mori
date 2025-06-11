@@ -45,6 +45,37 @@ class EpDispatchCombineTestCase:
         mori.shmem.shmem_finalize()
         dist.destroy_process_group()
 
+    def _allgather_with_token_num_padding(self, input, max_token_num):
+        shape = list(input.shape)
+
+        pad_shape = shape.copy()
+        pad_shape[0] = max_token_num - shape[0]
+
+        target_shape = shape.copy()
+        target_shape[0] = max_token_num
+
+        output = [
+            torch.zeros(
+                target_shape,
+                dtype=input.dtype,
+                device=input.device,
+            )
+            for _ in range(self.world_size)
+        ]
+        padded_input = torch.cat(
+            [
+                input,
+                torch.zeros(
+                    pad_shape,
+                    dtype=input.dtype,
+                    device=input.device,
+                ),
+            ],
+            0,
+        )
+        dist.all_gather(output, padded_input)
+        return output
+
     def gen_test_data(self):
         # gen num_tokens
         num_tokens = int(
@@ -61,8 +92,8 @@ class EpDispatchCombineTestCase:
         indicies = torch.empty(
             num_tokens,
             self.config.num_experts_per_token,
-            dtype=torch.uint32,
-            device=self.device,
+            dtype=torch.int64,
+            # device=self.device,
         )
         for i in range(num_tokens):
             perm = torch.randperm(
@@ -71,6 +102,13 @@ class EpDispatchCombineTestCase:
                 device=self.device,
             )
             indicies[i] = perm[: self.config.num_experts_per_token]
+        indicies_list = self._allgather_with_token_num_padding(
+            indicies.cpu(), self.config.max_num_inp_token_per_rank
+        )
+        indicies_list = [
+            tensor.to(self.device).to(torch.uint32) for tensor in indicies_list
+        ]
+        indicies = indicies.to(self.device).to(torch.uint32)
 
         # gen weights
         weights = torch.rand(
@@ -79,6 +117,9 @@ class EpDispatchCombineTestCase:
             dtype=torch.float32,
             generator=self.rng,
             device=self.device,
+        )
+        weights_list = self._allgather_with_token_num_padding(
+            weights, self.config.max_num_inp_token_per_rank
         )
 
         # gen input & output
@@ -90,40 +131,56 @@ class EpDispatchCombineTestCase:
             generator=self.rng,
             device=self.device,
         )
+        input_list = self._allgather_with_token_num_padding(
+            input_fp32, self.config.max_num_inp_token_per_rank
+        )
+        input_list = [tensor.to(self.config.data_type) for tensor in input_list]
 
-        input_list = [
-            torch.zeros(
-                (self.config.max_num_inp_token_per_rank, self.config.hidden_dim),
-                dtype=self.config.data_type,
-                device=self.device,
-            )
-            for _ in range(self.world_size)
-        ]
-        padded_input = torch.cat(
-            [
-                input_fp32,
-                torch.zeros(
-                    self.config.max_num_inp_token_per_rank - num_tokens,
-                    self.config.hidden_dim,
-                    dtype=torch.float32,
-                    device=self.device,
-                ),
-            ],
-            0,
-        ).to(self.config.data_type)
-        dist.all_gather(input_list, padded_input)
+        # input_list = [
+        #     torch.zeros(
+        #         (self.config.max_num_inp_token_per_rank, self.config.hidden_dim),
+        #         dtype=self.config.data_type,
+        #         device=self.device,
+        #     )
+        #     for _ in range(self.world_size)
+        # ]
+        # padded_input = torch.cat(
+        #     [
+        #         input_fp32,
+        #         torch.zeros(
+        #             self.config.max_num_inp_token_per_rank - num_tokens,
+        #             self.config.hidden_dim,
+        #             dtype=torch.float32,
+        #             device=self.device,
+        #         ),
+        #     ],
+        #     0,
+        # ).to(self.config.data_type)
+        # dist.all_gather(input_list, padded_input)
 
         return (
             num_tokens,
             indicies,
             weights,
             input_fp32.to(self.config.data_type),
+            indicies_list,
+            weights_list,
             input_list,
         )
 
     def run_test_once(self, op, test_data):
-        num_tokens, indicies, weights, input, input_list = test_data
-        dispatch_output = op.dispatch(input, weights, indicies)
+        (
+            num_tokens,
+            indicies,
+            weights,
+            input,
+            indicies_list,
+            weights_list,
+            input_list,
+        ) = test_data
+        dispatch_output, dispatch_weights, dispatch_indicies = op.dispatch(
+            input, weights, indicies
+        )
         torch.cuda.synchronize()
 
         src_token_pos = op.get_dispatch_src_token_pos()
@@ -138,6 +195,22 @@ class EpDispatchCombineTestCase:
             if not is_equal:
                 print(
                     f"dispatch rank {self.rank} i {i} pos {pos} src_rank {src_rank} src_id {src_id} {input_list[src_rank][src_id]}, {dispatch_output[i]}"
+                )
+            assert is_equal
+
+            is_equal = torch.equal(weights_list[src_rank][src_id], dispatch_weights[i])
+            if not is_equal:
+                print(
+                    f"dispatch rank {self.rank} i {i} pos {pos} src_rank {src_rank} src_id {src_id} {weights_list[src_rank][src_id]}, {dispatch_weights[i]}"
+                )
+            assert is_equal
+
+            is_equal = torch.equal(
+                indicies_list[src_rank][src_id], dispatch_indicies[i]
+            )
+            if not is_equal:
+                print(
+                    f"dispatch rank {self.rank} i {i} pos {pos} src_rank {src_rank} src_id {src_id} {indicies_list[src_rank][src_id]}, {dispatch_indicies[i]}"
                 )
             assert is_equal
 
