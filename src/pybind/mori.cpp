@@ -35,16 +35,22 @@ torch::Tensor LaunchIntraNodeDispatch(mori::moe::EpDispatchCombineHandle<T>& han
   return out;
 }
 
+// TODO: translate data type
 template <typename T>
-void LaunchIntraNodeCombine(mori::moe::EpDispatchCombineHandle<T>& handle,
-                            const torch::Tensor& input, const torch::Tensor& output,
-                            const torch::Tensor& weights, const torch::Tensor& topkIds) {
-  assert(input.is_contiguous() && output.is_contiguous() && weights.is_contiguous() &&
-         topkIds.is_contiguous());
-  handle.PrepareInference(reinterpret_cast<T*>(input.data_ptr()),
-                          reinterpret_cast<T*>(output.data_ptr()), weights.data_ptr<float>(),
-                          topkIds.data_ptr<uint32_t>(), input.size(0));
+torch::Tensor LaunchIntraNodeCombine(mori::moe::EpDispatchCombineHandle<T>& handle,
+                                     const torch::Tensor& input, const torch::Tensor& weights,
+                                     const torch::Tensor& topkIds) {
+  assert(input.is_contiguous() && weights.is_contiguous() && topkIds.is_contiguous());
+  handle.PrepareInference(reinterpret_cast<T*>(input.data_ptr()), nullptr,
+                          weights.data_ptr<float>(), topkIds.data_ptr<uint32_t>(),
+                          handle.curRankNumToken);
   handle.LaunchIntraNodeCombine(at::cuda::getCurrentHIPStream());
+
+  auto options = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+  torch::Tensor out =
+      torch::from_blob(handle.shmemOutTokMemObj->Get(),
+                       {handle.config.MaxNumOutputTokens(), handle.config.hiddenDim}, options);
+  return out;
 }
 
 template <typename T>

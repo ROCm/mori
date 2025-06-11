@@ -48,7 +48,11 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       condition = destPe == (args.tokenIndicies[srcTokId * config.numExpertPerToken + laneId] /
                              config.numExpertPerRank);
     }
-    if (__any(condition)) continue;
+    if (__any(condition)) {
+      // Indicate that this token is already sent to the destination PE
+      if (laneId == 0) args.dispDestTokIdMap[i] = config.worldSize * maxNumOutTokenPerRank;
+      continue;
+    }
 
     if (laneId == 0) {
       // decide token id in dest pe
@@ -122,6 +126,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
                    args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
   }
   CrossDeviceBarrierKernel(args);
+  __threadfence_system();
 
   extern __shared__ char sharedMem[];
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
@@ -129,7 +134,6 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   int warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
   int hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
 
-  T* outTokenBuf = args.outTokenBuf;
   for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
     int tokenId = i / warpsPerToken;
     int inTokenPartId = i % warpsPerToken;
@@ -138,16 +142,20 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
       uint32_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
-
       uint32_t destPe = destTokId / maxNumOutTokenPerRank;
-      uint32_t destLocalTokId = destTokId - destPe * maxNumOutTokenPerRank;
 
-      srcPtrs[j] = args.shmemInpTokMemObj->template GetAs<T*>(destPe) +
-                   destLocalTokId * config.hiddenDim + hiddenDimOffset;
+      if (destPe < config.worldSize) {
+        uint32_t destLocalTokId = destTokId - destPe * maxNumOutTokenPerRank;
+        srcPtrs[j] = args.shmemInpTokMemObj->template GetAs<T*>(destPe) +
+                     destLocalTokId * config.hiddenDim + hiddenDimOffset;
+      } else {
+        srcPtrs[j] = nullptr;
+      }
     }
-    core::WarpAccum(args.outTokenBuf + tokenId * config.hiddenDim + hiddenDimOffset, srcPtrs,
-                    args.weightsBuf + tokenId * config.numExpertPerToken, config.numExpertPerToken,
-                    hiddenDimSize);
+
+    core::WarpAccum(
+        args.shmemOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim + hiddenDimOffset,
+        srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
   }
 }
 

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <random>
 #include <sstream>
+#include <unordered_set>
 
 #include "mori/ops/ops.hpp"
 #include "mori/shmem/shmem.hpp"
@@ -62,6 +63,7 @@ struct RunConfig {
   int warmup{5};
   int repeat{5};
   float atol{1e-2};
+  bool isAiterMoE{true};
 };
 
 struct EpDispatchCombineTestConfig {
@@ -181,8 +183,7 @@ class EpDispatchCombineTestCase {
         uint32_t srcPe = srcTokId / config.maxNumInpTokenPerRank;
         uint32_t localSrcTokId = srcTokId - srcPe * config.maxNumInpTokenPerRank;
 
-        // T* localTokBuf = handle.shmemOutTokMemObj->template GetAs<T*>() + i * config.hiddenDim;
-        T* localTokBuf = outTokBuf + i * config.hiddenDim;
+        T* localTokBuf = handle.shmemOutTokMemObj->template GetAs<T*>() + i * config.hiddenDim;
         T* srcTokBuf = reinterpret_cast<T*>(globalInpTokBufCpu) + srcPe * inpTokEleNum +
                        localSrcTokId * config.hiddenDim;
 
@@ -261,14 +262,25 @@ class EpDispatchCombineTestCase {
 
       // compute weight sum
       float weightSum = 0.0f;
-      for (int k = 0; k < config.numExpertPerToken; k++) {
-        weightSum += weightsBuf[i * config.numExpertPerToken + k];
+      if (runConfig.isAiterMoE) {
+        std::unordered_set<uint32_t> pes;
+        for (int j = 0; j < config.numExpertPerToken; j++) {
+          uint32_t exptId = handle.tokenIndicies[i * config.numExpertPerToken + j];
+          uint32_t destPe = exptId / config.numExpertPerRank;
+          pes.insert(destPe);
+        }
+        weightSum = 1.0f * pes.size();
+      } else {
+        for (int j = 0; j < config.numExpertPerToken; j++) {
+          weightSum += weightsBuf[i * config.numExpertPerToken + j];
+        }
       }
 
       for (int j = 0; j < config.hiddenDim; j++) {
         float expected =
             float(T(float(reinterpret_cast<T*>(inpTokBufCpu)[tokenOffset + j]) * weightSum));
-        float got = float(handle.outTokenBuf[tokenOffset + j]);
+        // float got = float(handle.outTokenBuf[tokenOffset + j]);
+        float got = float(handle.shmemOutTokMemObj->template GetAs<T*>()[tokenOffset + j]);
         assert(weightSum != 0);
         if (abs(got - expected) > runConfig.atol) {
           std::cout << "Wrong result at pos " << j << ": mype " << config.rank << " tokenId " << i
@@ -383,10 +395,9 @@ class EpDispatchCombineTestCase {
     HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, outTokBuf,
                                 maxNumOutTokenPerRank * config.hiddenDim * sizeof(T),
                                 hipMemcpyDeviceToDevice));
-    // HIP_RUNTIME_CHECK(hipMemcpy(handle.shmemInpTokMemObj->template GetAs<T*>(),
-    //                             handle.shmemOutTokMemObj->template GetAs<T*>(),
-    //                             maxNumOutTokenPerRank * config.hiddenDim * sizeof(T),
-    //                             hipMemcpyDeviceToDevice));
+    HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, handle.shmemOutTokMemObj->template GetAs<T*>(),
+                                maxNumOutTokenPerRank * config.hiddenDim * sizeof(T),
+                                hipMemcpyDeviceToDevice));
     HIP_RUNTIME_CHECK(
         hipMemset(outTokBuf, 0, maxNumOutTokenPerRank * config.hiddenDim * sizeof(T)));
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());

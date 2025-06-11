@@ -116,11 +116,8 @@ class EpDispatchCombineTestCase:
 
         return (num_tokens, indicies, weights, input, input_list)
 
-    def test_dispatch_combine(self):
-        self.setup()
-
-        handle = mori.EpDispatchCombineHandleBf16(self.config)
-        num_tokens, indicies, weights, input, input_list = self.gen_test_data()
+    def run_test_once(self, handle, test_data):
+        num_tokens, indicies, weights, input, input_list = test_data
         dispatch_output = mori.launch_intra_node_dispatch_Bf16(
             handle,
             input,
@@ -146,40 +143,49 @@ class EpDispatchCombineTestCase:
 
         assert len(torch.unique(src_token_pos)) == len(src_token_pos)
 
-        # combine_output = torch.empty(
-        #     num_tokens,
-        #     self.config.hidden_dim,
-        #     dtype=torch.bfloat16,
-        #     device=self.device,
-        # )
-        # mori.launch_intra_node_combine_Bf16(
-        #     handle,
-        #     dispatch_output,
-        #     combine_output,
-        #     weights,
-        #     indicies,
-        # )
-        # torch.cuda.synchronize()
+        combine_output = mori.launch_intra_node_combine_Bf16(
+            handle,
+            dispatch_output,
+            weights,
+            indicies,
+        )
+        torch.cuda.synchronize()
 
-        # for i in range(num_tokens):
-        #     is_equal = torch.equal(combine_output[i], input[i] * torch.sum(weights[i]))
-        #     if not is_equal:
-        #         print(
-        #             f"combine rank {self.rank} i {i} pos {pos} src_rank {src_rank} src_id {src_id}"
-        #         )
-        #     assert is_equal
+        for i in range(num_tokens):
+            pes = [
+                (idx // self.config.num_experts_per_rank)
+                for idx in indicies[i].cpu().tolist()
+            ]
+            unique_pes = len(set(pes))
+            is_equal = torch.allclose(
+                combine_output[i], input[i] * unique_pes, atol=1e-2, rtol=1e-2
+            )
+            if not is_equal:
+                print(
+                    f"combine rank {self.rank} i {i} src_rank {src_rank} src_id {src_id} unique_pes {unique_pes} {indicies[i]} {pes} {combine_output[i]} {input[i] * unique_pes}"
+                )
+            assert is_equal
 
+        mori.launch_reset_Bf16(handle)
+        torch.cuda.synchronize()
+
+    def test_dispatch_combine(self):
+        handle = mori.EpDispatchCombineHandleBf16(self.config)
+        for _ in range(1000):
+            test_data = self.gen_test_data()
+            self.run_test_once(handle, test_data)
         del handle
-        self.cleanup()
 
 
 def test_dispatch_combine(rank, world_size):
     test_case = EpDispatchCombineTestCase(rank, world_size)
+    test_case.setup()
     test_case.test_dispatch_combine()
+    test_case.cleanup()
 
 
 if __name__ == "__main__":
-    world_size = 2
+    world_size = 8
     torch.multiprocessing.spawn(
         test_dispatch_combine, args=(world_size,), nprocs=world_size, join=True
     )
