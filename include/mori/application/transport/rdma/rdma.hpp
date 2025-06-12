@@ -64,6 +64,7 @@ struct WorkQueueHandle {
   void* dbrAddr{nullptr};
   uint32_t sqWqeNum{0};
   uint32_t rqWqeNum{0};
+  uint32_t postSendLock{0};
 };
 
 struct CompletionQueueHandle {
@@ -72,6 +73,7 @@ struct CompletionQueueHandle {
   uint32_t consIdx{0};
   uint32_t cqeNum{0};
   uint32_t cqeSize{0};
+  uint32_t pollCqLock{0};
 };
 
 struct RdmaEndpoint {

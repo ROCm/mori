@@ -16,8 +16,7 @@ using namespace mori::core;
 
 __global__ void Write(RdmaEndpoint endpoint, MemoryRegion localMr, MemoryRegion remoteMr,
                       size_t msg_size, int iters) {
-  // uint32_t postIdx = 0;
-  // uint32_t consIdx = 0;
+  // TODO: check Whether pass by value not by pointer
   printf("in kernel iter:%d msg_size:%zu localMr.addr: %lu remoteMr.addr:%lu\n", iters, msg_size,
          localMr.addr, remoteMr.addr);
   for (int i = 0; i < iters; i++) {
@@ -25,15 +24,14 @@ __global__ void Write(RdmaEndpoint endpoint, MemoryRegion localMr, MemoryRegion 
         endpoint.wqHandle.sqAddr, endpoint.wqHandle.sqWqeNum, &endpoint.wqHandle.postIdx,
         endpoint.handle.qpn, localMr.addr, localMr.lkey, remoteMr.addr, remoteMr.rkey, msg_size);
     __threadfence_system();
-    UpdateSendDbrRecord<ProviderType::MLX5>(endpoint.wqHandle.dbrRecAddr,
-                                            endpoint.wqHandle.postIdx);
+    UpdateDbrAndRingDbSend<ProviderType::MLX5>(endpoint.wqHandle.dbrRecAddr,
+                                               endpoint.wqHandle.postIdx, endpoint.wqHandle.dbrAddr,
+                                               dbr_val, &endpoint.wqHandle.postSendLock);
     __threadfence_system();
-    RingDoorbell<ProviderType::MLX5>(endpoint.wqHandle.dbrAddr, dbr_val);
-    __threadfence_system();
-    int snd_opcode =
-        PollCq<ProviderType::MLX5>(endpoint.cqHandle.cqAddr, endpoint.cqHandle.cqeSize,
-                                   endpoint.cqHandle.cqeNum, &endpoint.cqHandle.consIdx);
-    __threadfence_system();
+    PollCqAndUpdateDbr<ProviderType::MLX5>(
+        endpoint.cqHandle.cqAddr, endpoint.cqHandle.cqeSize, endpoint.cqHandle.cqeNum,
+        &endpoint.cqHandle.consIdx, endpoint.cqHandle.dbrRecAddr, &endpoint.cqHandle.pollCqLock);
+
     printf("postIdx: %d, consIdx: %d\n", endpoint.wqHandle.postIdx, endpoint.cqHandle.consIdx);
   }
 }

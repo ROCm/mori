@@ -163,10 +163,12 @@ inline __device__ uint64_t mlx5PrepareAtomicWqe(void* queue_buff_addr, uint32_t 
                                      uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
                                      uint64_t rkey, void* val_1, void* val_2, uint32_t bytes,
                                      atomicType amo_op) {
-  uint32_t wqeIdx = *postIdx & (wqe_num - 1);
+  uint32_t numWqesPerCmd = get_num_wqes_in_atomic(amo_op, bytes);
+  uint32_t curPostIdx = atomicAdd(postIdx, numWqesPerCmd);
+  printf("thread:%d postIdx:%u\n",threadIdx.x, curPostIdx);
+  uint32_t wqeIdx = curPostIdx & (wqe_num - 1);
   void* wqeAddr = reinterpret_cast<char*>(queue_buff_addr) + (wqeIdx << MLX5_SEND_WQE_SHIFT);
 
-  uint32_t numWqesPerCmd = get_num_wqes_in_atomic(amo_op, bytes);
   void* addition_wqe_addr = reinterpret_cast<char*>(queue_buff_addr) + ((wqeIdx + 1) << MLX5_SEND_WQE_SHIFT);
 
   int atomicWqeSize = sizeof(mlx5_wqe_ctrl_seg) + sizeof(mlx5_wqe_raddr_seg) + 2 * sizeof(mlx5_wqe_atomic_seg);
@@ -408,13 +410,11 @@ inline __device__ uint64_t mlx5PrepareAtomicWqe(void* queue_buff_addr, uint32_t 
   wqeCtrlSeg->qpn_ds = HTOBE32((qpn << 8) | numOctoWords);
   wqeCtrlSeg->fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
 
-  if (numWqesPerCmd > 1){
-    wqeDataSeg->byte_count = HTOBE32(bytes);
-    wqeDataSeg->addr = HTOBE64(laddr);
-    wqeDataSeg->lkey = HTOBE32(lkey);
-  }
 
-  atomicAdd(postIdx, numWqeBb);
+  wqeDataSeg->byte_count = HTOBE32(bytes);
+  wqeDataSeg->addr = HTOBE64(laddr);
+  wqeDataSeg->lkey = HTOBE32(lkey);
+
   return reinterpret_cast<uint64_t*>(wqeCtrlSeg)[0];
 }
 
@@ -463,6 +463,32 @@ inline __device__ void UpdateRecvDbrRecord<ProviderType::MLX5>(void* dbrRecAddr,
 template <>
 inline __device__ void RingDoorbell<ProviderType::MLX5>(void* dbrAddr, uint64_t dbrVal) {
   reinterpret_cast<uint64_t*>(dbrAddr)[0] = dbrVal;
+}
+
+template <>
+inline __device__ void UpdateDbrAndRingDbSend<ProviderType::MLX5>(void* dbrRecAddr, uint32_t wqeIdx,
+                                                                  void* dbrAddr, uint64_t dbrVal,
+                                                                  uint32_t* lockVar) {
+  AcquireLock(lockVar);
+
+  UpdateSendDbrRecord<ProviderType::MLX5>(dbrRecAddr, wqeIdx);
+  __threadfence_system();
+  RingDoorbell<ProviderType::MLX5>(dbrAddr, dbrVal);
+
+  ReleaseLock(lockVar);
+}
+
+template <>
+inline __device__ void UpdateDbrAndRingDbRecv<ProviderType::MLX5>(void* dbrRecAddr, uint32_t wqeIdx,
+                                                                  void* dbrAddr, uint64_t dbrVal,
+                                                                  uint32_t* lockVar) {
+  AcquireLock(lockVar);
+
+  UpdateRecvDbrRecord<ProviderType::MLX5>(dbrRecAddr, wqeIdx);
+  __threadfence_system();
+  RingDoorbell<ProviderType::MLX5>(dbrAddr, dbrVal);
+
+  ReleaseLock(lockVar);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -517,6 +543,21 @@ inline __device__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeSize,
 template <>
 inline __device__ void UpdateCqDbrRecord<ProviderType::MLX5>(void* dbrRecAddr, uint32_t cons_idx) {
   reinterpret_cast<uint32_t*>(dbrRecAddr)[MLX5_CQ_SET_CI] = HTOBE32(cons_idx & 0xffffff);
+}
+
+template <>
+inline __device__ int PollCqAndUpdateDbr<ProviderType::MLX5>(void* cqAddr, uint32_t cqeSize,
+                                                      uint32_t cqeNum, uint32_t* consIdx,
+                                                      void* dbrRecAddr, uint32_t* lockVar) {
+  AcquireLock(lockVar);
+
+  int opcode = PollCq<ProviderType::MLX5>(cqAddr, cqeSize, cqeNum, consIdx);
+  if (opcode >= 0) {
+    UpdateCqDbrRecord<ProviderType::MLX5>(dbrRecAddr, *consIdx);
+  }
+
+  ReleaseLock(lockVar);
+  return opcode;
 }
 
 }  // namespace core

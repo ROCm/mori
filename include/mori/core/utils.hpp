@@ -64,21 +64,18 @@ inline __device__ void AtomicStoreSeqCstSystem(T* ptr, T val) {
   return __hip_atomic_store(ptr, val, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-// TODO: optimize to __hip_atomic_compare_exchange
 template <typename T>
-__device__ T AtomicCompareExchangeSeqCstSystem(T* ptr, T* expected, T desired) {
-  while (true) {
-    T oldVal = __hip_atomic_load(ptr, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_SYSTEM);
+__device__ T AtomicCompareExchange(T* address, T* compare, T val) {
+  __hip_atomic_compare_exchange_strong(address, compare, val, __ATOMIC_RELAXED, __ATOMIC_RELAXED,
+                                       __HIP_MEMORY_SCOPE_AGENT);
+  return *compare;
+}
 
-    if (oldVal != *expected) {
-      *expected = oldVal;
-      return oldVal;
-    }
-
-    __hip_atomic_store(ptr, desired, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_SYSTEM);
-
-    return oldVal;
-  }
+template <typename T>
+__device__ T AtomicCompareExchangeSystem(T* address, T* compare, T val) {
+  __hip_atomic_compare_exchange_strong(address, compare, val, __ATOMIC_RELAXED, __ATOMIC_RELAXED,
+                                       __HIP_MEMORY_SCOPE_SYSTEM);
+  return *compare;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -88,6 +85,19 @@ template <typename T>
 constexpr inline __device__ T CeilDiv(T a, T b) {
   return (a + b - 1) / b;
 }
+
+/* -------------------------------------------------------------------------- */
+/*                                    Lock                                    */
+/* -------------------------------------------------------------------------- */
+// TODO: Whether to use GPU lock in lock.hpp
+__device__ inline void AcquireLock(uint32_t* lockVar) {  
+    while (atomicCAS(lockVar, 0, 1) != 0) {  
+    }  
+}  
+
+__device__ inline void ReleaseLock(uint32_t* lockVar) {  
+    atomicExch(lockVar, 0);  
+}  
 
 }  // namespace core
 }  // namespace mori

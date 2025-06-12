@@ -82,7 +82,7 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::Transpor
               break;
           }
           int expected = oldVal;
-          int prev = core::AtomicCompareExchangeSeqCstSystem(ptr4, &expected, newVal);  
+          int prev = core::AtomicCompareExchangeSystem(ptr4, &expected, newVal);  
           if (prev == oldVal) break;
         }
       };
@@ -136,7 +136,7 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::Transpor
               break;
           }
           long long expected = oldVal;
-          long long prev = core::AtomicCompareExchangeSeqCstSystem(ptr8, &expected, newVal);
+          long long prev = core::AtomicCompareExchangeSystem(ptr8, &expected, newVal);
           if (prev == oldVal) break;
         }
       };
@@ -225,7 +225,7 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernel<application::TransportTy
           }
 
           int expected = oldVal;
-          int prev = core::AtomicCompareExchangeSeqCstSystem(addr, &expected, newVal);
+          int prev = core::AtomicCompareExchangeSystem(addr, &expected, newVal);
           if (prev == oldVal) {
             *oldResult = oldVal;
             break;
@@ -292,7 +292,7 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernel<application::TransportTy
           }
 
           long long expected = oldVal;
-          long long prev = core::AtomicCompareExchangeSeqCstSystem(addr, &expected, newVal);
+          long long prev = core::AtomicCompareExchangeSystem(addr, &expected, newVal);
           if (prev == oldVal) {
             *oldResult = oldVal;
             break;

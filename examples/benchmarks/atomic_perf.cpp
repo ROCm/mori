@@ -19,17 +19,19 @@ __global__ void Atomic(RdmaEndpoint endpoint, MemoryRegion localMr, MemoryRegion
                        atomicType amoOp, int iters) {
   T value = 1;
   for (int i = 0; i < iters; i++) {
-    uint64_t dbr_val = PostAtomic<PrvdType, T>(
-        endpoint.wqHandle.sqAddr, endpoint.wqHandle.sqWqeNum, &endpoint.wqHandle.postIdx,
-        endpoint.handle.qpn, localMr.addr, localMr.lkey, remoteMr.addr, remoteMr.rkey, value, value, amoOp);
+    uint64_t dbr_val =
+        PostAtomic<PrvdType, T>(endpoint.wqHandle.sqAddr, endpoint.wqHandle.sqWqeNum,
+                                &endpoint.wqHandle.postIdx, endpoint.handle.qpn, localMr.addr,
+                                localMr.lkey, remoteMr.addr, remoteMr.rkey, value, value, amoOp);
     __threadfence_system();
-    UpdateSendDbrRecord<PrvdType>(endpoint.wqHandle.dbrRecAddr, endpoint.wqHandle.postIdx);
+    UpdateDbrAndRingDbSend<PrvdType>(endpoint.wqHandle.dbrRecAddr, endpoint.wqHandle.postIdx,
+                                     endpoint.wqHandle.dbrAddr, dbr_val,
+                                     &endpoint.wqHandle.postSendLock);
     __threadfence_system();
-    RingDoorbell<PrvdType>(endpoint.wqHandle.dbrAddr, dbr_val);
-    __threadfence_system();
-    int snd_opcode = PollCq<PrvdType>(endpoint.cqHandle.cqAddr, endpoint.cqHandle.cqeSize,
-                                      endpoint.cqHandle.cqeNum, &endpoint.cqHandle.consIdx);
-    __threadfence_system();
+    int snd_opcode = PollCqAndUpdateDbr<ProviderType::MLX5>(
+        endpoint.cqHandle.cqAddr, endpoint.cqHandle.cqeSize, endpoint.cqHandle.cqeNum,
+        &endpoint.cqHandle.consIdx, endpoint.cqHandle.dbrRecAddr, &endpoint.cqHandle.pollCqLock);
+
     printf("postIdx: %d, consIdx: %d\n", endpoint.wqHandle.postIdx, endpoint.cqHandle.consIdx);
   }
 }
@@ -165,8 +167,8 @@ void distRdmaOps(int argc, char* argv[]) {
     time = milliseconds / iters;
     bw = dt.size / (milliseconds * (B_TO_GB / (iters * MS_TO_S)));
   }
-  printf("After: Local rank %d val %lu\n", local_rank, ((uint64_t*)buffer)[0]);
   bootNet.Barrier();
+  printf("After: Local rank %d val %lu\n", local_rank, ((uint64_t*)buffer)[0]);
 
   if (local_rank == 0) {
     printf("\nIters\tsize\t\tbw\ttimes\n");
