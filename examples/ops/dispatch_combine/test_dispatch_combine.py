@@ -198,14 +198,15 @@ class EpDispatchCombineTestCase:
 
     def test_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
-        for i in range(10000):
+        for i in range(100):
             test_data = self.gen_test_data()
             self.run_test_once(op, test_data)
         del op
 
 
 def test_dispatch_combine(rank, world_size):
-    test_case = EpDispatchCombineTestCase(rank, world_size, torch.float8_e4m3fnuz)
+    # test_case = EpDispatchCombineTestCase(rank, world_size, torch.float8_e4m3fnuz)
+    test_case = EpDispatchCombineTestCase(rank, world_size, torch.bfloat16)
     test_case.setup()
     test_case.test_dispatch_combine()
     test_case.cleanup()

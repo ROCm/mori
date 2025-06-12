@@ -7,6 +7,8 @@
 namespace mori {
 namespace moe {
 
+#define MAX_GPUS_PER_NODE 8
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpDispatchIntraNodeKernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
@@ -133,10 +135,12 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   size_t maxNumOutTokenPerRank =
       config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken;
 
+  // Copy input to shmem registered buffer so that other GPUs can access directly
   for (int i = globalWarpId; i < *args.totalRecvTokenNum; i += globalWarpNum) {
     core::WarpCopy(args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
                    args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
   }
+  // Make sure copy on all GPUs are finished
   CrossDeviceBarrierKernel(args);
 
   extern __shared__ char sharedMem[];
@@ -151,6 +155,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     int hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
     int hiddenDimSize = std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp);
 
+    // Prepare data pointers on different GPUs
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
       uint32_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
       uint32_t destPe = destTokId / maxNumOutTokenPerRank;
