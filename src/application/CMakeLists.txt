@@ -1,7 +1,7 @@
 find_package(MPI REQUIRED)
 
 execute_process(
-  COMMAND python3 -c "import torch;print(torch.utils.cmake_prefix_path)"
+  COMMAND python -c "import torch; print(torch.utils.cmake_prefix_path)"
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   OUTPUT_VARIABLE TORCH_DIR
   OUTPUT_STRIP_TRAILING_WHITESPACE
