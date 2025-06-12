@@ -135,7 +135,8 @@ __device__ void WarpAccum(T* accum, T* src, size_t nelems) {
 
 // Accumulate multiple buffers
 template <typename T>
-__device__ void WarpAccum(T* dest, T** srcs, float* srcScales, size_t accumNum, size_t nelems) {
+inline __device__ void WarpAccum(T* dest, T** srcs, float* srcScales, size_t accumNum,
+                                 size_t nelems) {
   constexpr int vecSize = 16 / sizeof(T);
   int laneId = threadIdx.x & (warpSize - 1);
   int offset = laneId * vecSize;

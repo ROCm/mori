@@ -136,28 +136,6 @@ class EpDispatchCombineTestCase:
         )
         input_list = [tensor.to(self.config.data_type) for tensor in input_list]
 
-        # input_list = [
-        #     torch.zeros(
-        #         (self.config.max_num_inp_token_per_rank, self.config.hidden_dim),
-        #         dtype=self.config.data_type,
-        #         device=self.device,
-        #     )
-        #     for _ in range(self.world_size)
-        # ]
-        # padded_input = torch.cat(
-        #     [
-        #         input_fp32,
-        #         torch.zeros(
-        #             self.config.max_num_inp_token_per_rank - num_tokens,
-        #             self.config.hidden_dim,
-        #             dtype=torch.float32,
-        #             device=self.device,
-        #         ),
-        #     ],
-        #     0,
-        # ).to(self.config.data_type)
-        # dist.all_gather(input_list, padded_input)
-
         return (
             num_tokens,
             indicies,

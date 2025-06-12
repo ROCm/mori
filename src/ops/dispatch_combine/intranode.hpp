@@ -49,7 +49,8 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
                              config.numExpertPerRank);
     }
     if (__any(condition)) {
-      // Indicate that this token is already sent to the destination PE
+      // Indicate that this token is already sent to the destination PE by setting an overflow token
+      // index
       if (laneId == 0) args.dispDestTokIdMap[i] = config.worldSize * maxNumOutTokenPerRank;
       continue;
     }
@@ -137,7 +138,6 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
                    args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
   }
   CrossDeviceBarrierKernel(args);
-  __threadfence_system();
 
   extern __shared__ char sharedMem[];
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
