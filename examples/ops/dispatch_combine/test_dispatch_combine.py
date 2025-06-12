@@ -169,29 +169,9 @@ class EpDispatchCombineTestCase:
         for i, pos in enumerate(src_token_pos):
             src_rank = int(pos) // self.config.max_num_inp_token_per_rank
             src_id = int(pos) % self.config.max_num_inp_token_per_rank
-            is_equal = torch.equal(input_list[src_rank][src_id], dispatch_output[i])
-            if not is_equal:
-                print(
-                    f"dispatch rank {self.rank} i {i} pos {pos} src_rank {src_rank} src_id {src_id} {input_list[src_rank][src_id]}, {dispatch_output[i]}"
-                )
-            assert is_equal
-
-            is_equal = torch.equal(weights_list[src_rank][src_id], dispatch_weights[i])
-            if not is_equal:
-                print(
-                    f"dispatch rank {self.rank} i {i} pos {pos} src_rank {src_rank} src_id {src_id} {weights_list[src_rank][src_id]}, {dispatch_weights[i]}"
-                )
-            assert is_equal
-
-            is_equal = torch.equal(
-                indicies_list[src_rank][src_id], dispatch_indicies[i]
-            )
-            if not is_equal:
-                print(
-                    f"dispatch rank {self.rank} i {i} pos {pos} src_rank {src_rank} src_id {src_id} {indicies_list[src_rank][src_id]}, {dispatch_indicies[i]}"
-                )
-            assert is_equal
-
+            assert torch.equal(input_list[src_rank][src_id], dispatch_output[i])
+            assert torch.equal(weights_list[src_rank][src_id], dispatch_weights[i])
+            assert torch.equal(indicies_list[src_rank][src_id], dispatch_indicies[i])
         assert len(torch.unique(src_token_pos)) == len(src_token_pos)
 
         if self.config.rank == 0:
@@ -211,14 +191,8 @@ class EpDispatchCombineTestCase:
                 input[i].to(torch.float32) * unique_pes
             ).to(self.config.data_type)
 
-            is_equal = torch.allclose(
-                got.float(), expected.float(), atol=1e-2, rtol=1e-2
-            )
-            if not is_equal:
-                print(
-                    f"combine rank {self.rank} i {i} src_rank {src_rank} src_id {src_id} unique_pes {unique_pes} {indicies[i]} {pes} {got} {expected}"
-                )
-            assert is_equal
+            assert torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
+
         if self.config.rank == 0:
             print("Combine Pass")
 
