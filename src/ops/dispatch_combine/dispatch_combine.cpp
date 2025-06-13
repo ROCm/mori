@@ -325,6 +325,7 @@ inline __device__ void CrossDeviceBarrierKernel(EpDispatchCombineArgs<T> args) {
     while (core::AtomicLoadRelaxedSystem(localBarrierPtr + laneId) != args.crossDeviceBarrierFlag) {
     }
   }
+  __syncthreads();
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -524,10 +525,13 @@ void EpDispatchCombineHandle<T>::LaunchDispatch(KernelType kernelType, hipStream
       sizeof(uint32_t);
   if (kernelType == KernelType::InterNode)
     EpDispatchKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
-  else if (kernelType == KernelType::IntraNode)
-    EpDispatchIntraNodeKernel<<<grid, block, sharedMemSize, stream>>>(
-        GetEpDispatchCombineArgs(*this));
-  else
+  else if (kernelType == KernelType::IntraNode) {
+    if (config.hiddenDim == 7168)
+      EpDispatchIntraNodeKernel<T, 7168>
+          <<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
+    else
+      assert(false);
+  } else
     assert(false);
 }
 
@@ -539,10 +543,13 @@ void EpDispatchCombineHandle<T>::LaunchCombine(KernelType kernelType, hipStream_
 
   if (kernelType == KernelType::InterNode)
     EpCombineKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
-  else if (kernelType == KernelType::IntraNode)
-    EpCombineIntraNodeKernel<<<grid, block, sharedMemSize, stream>>>(
-        GetEpDispatchCombineArgs(*this));
-  else
+  else if (kernelType == KernelType::IntraNode) {
+    if (config.hiddenDim == 7168)
+      EpCombineIntraNodeKernel<T, 7168>
+          <<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
+    else
+      assert(false);
+  } else
     assert(false);
 }
 

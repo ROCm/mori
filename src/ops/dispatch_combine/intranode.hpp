@@ -13,7 +13,7 @@ namespace moe {
 /*                                    EpDispatchIntraNodeKernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
 // This is a intra-node dispatch kernel that only incurs buffer copy once.
-template <typename T>
+template <typename T, int HiddenDim>
 __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
 
@@ -50,8 +50,8 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
                              config.numExpertPerRank);
     }
     if (__any(condition)) {
-      // Indicate that this token is already sent to the destination PE by setting an overflow token
-      // index
+      // Indicate that this token is already sent to the destination PE by setting an overflow
+      // token index
       if (laneId == 0) args.dispDestTokIdMap[i] = config.worldSize * maxNumOutTokenPerRank;
       continue;
     }
@@ -80,8 +80,8 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
     uint32_t srcTokOffset = srcTokId * config.hiddenDim;
     uint32_t destTokOffset = destTokId * config.hiddenDim;
-    core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
-                   args.inpTokenBuf + srcTokOffset, config.hiddenDim);
+    core::WarpCopy<T, HiddenDim>(args.shmemOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
+                                 args.inpTokenBuf + srcTokOffset);  //, config.hiddenDim);
   }
   if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
@@ -114,7 +114,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpCombineIntraNodeKernel                                    */
 /* ---------------------------------------------------------------------------------------------- */
-template <typename T>
+template <typename T, int HiddenDim>
 __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
   int thdId = threadIdx.x;
@@ -127,6 +127,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
   int globalWarpId = blockIdx.x * warpNum + warpId;
   int globalWarpNum = gridDim.x * warpNum;
+  int globalThdNum = gridDim.x * warpNum * warpSize;
 
   int myPe = config.rank;
   int npes = config.worldSize;
@@ -136,8 +137,11 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   // Copy input to shmem registered buffer so that other GPUs can access directly
   for (int i = globalWarpId; i < core::AtomicLoadRelaxedSystem(args.totalRecvTokenNum);
        i += globalWarpNum) {
-    core::WarpCopy(args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
-                   args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
+    // core::WarpCopy(args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
+    //  args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
+    core::WarpCopy<T, HiddenDim>(
+        args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
+        args.inpTokenBuf + i * config.hiddenDim);
   }
   // Sync in grid
   if (laneId == 0) {

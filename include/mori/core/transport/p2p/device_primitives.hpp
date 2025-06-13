@@ -50,6 +50,28 @@ inline __device__ void WarpCopy(T* dst, T* src, size_t nelems) {
   }
 }
 
+template <typename T, int N>
+inline __device__ void WarpCopy(T* dst, T* src) {
+  constexpr int vecSize = 16 / sizeof(T);
+  int laneId = threadIdx.x & (warpSize - 1);
+  int offset = laneId * vecSize;
+
+  // #pragma unroll
+  //   for (int i = laneId * vecSize; i < N; i += warpSize * vecSize) {
+  //     reinterpret_cast<uint4*>(dst + i)[0] = reinterpret_cast<uint4*>(src + i)[0];
+  //   }
+
+  while ((offset + vecSize) <= N) {
+    reinterpret_cast<uint4*>(dst + offset)[0] = reinterpret_cast<uint4*>(src + offset)[0];
+    offset += warpSize * vecSize;
+  }
+
+  while (offset < N) {
+    dst[offset] = src[offset];
+    offset += 1;
+  }
+}
+
 template <typename T>
 inline __device__ void WarpCopyAtomic(T* dst, T* src, size_t nelems) {
   int laneId = threadIdx.x & (warpSize - 1);

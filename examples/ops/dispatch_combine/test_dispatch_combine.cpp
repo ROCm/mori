@@ -111,12 +111,15 @@ class EpDispatchCombineTestCase {
 
   void InitializeHandle() {
     if (runConfig.testType == TestType::Accuracy) {
-      RandomInitializeNumToken();
-      // InitializeNumToken();
-      RandomInitializeDispatch();
+      InitializeNumToken();
+      // RandomInitializeNumToken();
+
+      // RandomInitializeDispatch();
+      RoundRobinInitializeDispatch();
     } else if (runConfig.testType == TestType::Benchmark) {
       InitializeNumToken();
-      RandomInitializeDispatch();
+      // RandomInitializeDispatch();
+      RoundRobinInitializeDispatch();
     } else {
       assert(false);
     }
@@ -431,10 +434,36 @@ class EpDispatchCombineTestCase {
       }
     }
 
-    // for (int i = 0; i < config.worldSize; i++) {
-    //   std::cout << "Rank " << config.rank << " dispatches " << rankCount[i] << " tokens to rank "
-    //             << i << std::endl;
-    // }
+    for (int i = 0; i < config.worldSize; i++) {
+      std::cout << "Rank " << config.rank << " dispatches " << rankCount[i] << " tokens to rank "
+                << i << std::endl;
+    }
+  }
+
+  void RoundRobinInitializeDispatch() {
+    EpDispatchCombineConfig& config = handle.config;
+    std::vector<int> epRange;
+    for (int i = 0; i < config.worldSize * config.numExpertPerRank; i++) epRange.push_back(i);
+
+    std::vector<int> rankCount(config.worldSize, 0);
+
+    for (int i = 0; i < numToken; i++) {
+      for (int j = 0; j < config.numExpertPerToken; j++) {
+        uint32_t dispIdx = i * config.numExpertPerToken + j;
+        uint32_t destPe = dispIdx % config.worldSize;
+
+        uint32_t localExpertId = dispIdx / config.worldSize % config.numExpertPerRank;
+
+        tokenIndicies[dispIdx] = destPe * config.numExpertPerRank + localExpertId;
+
+        rankCount[destPe]++;
+      }
+    }
+
+    for (int i = 0; i < config.worldSize; i++) {
+      std::cout << "Rank " << config.rank << " dispatches " << rankCount[i] << " tokens to rank "
+                << i << std::endl;
+    }
   }
 
   void RandomInitializeWeights() {
