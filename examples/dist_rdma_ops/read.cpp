@@ -14,6 +14,30 @@ using namespace mori::core;
   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | \
       IBV_ACCESS_REMOTE_ATOMIC
 
+__global__ void CheckBufferKernel(const uint32_t* buffer, size_t numElems, uint32_t expected) {  
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;  
+    if (idx < numElems) {  
+        uint32_t val = buffer[idx];  
+        if (val != expected) {  
+            printf("Mismatch at index %zu: expected=%u, got=%u\n", idx, expected, val);  
+        }  
+    }  
+}  
+   
+void VerifyBuffer(void* buffer, size_t maxSize, uint32_t expected) {  
+    size_t numElems = maxSize / sizeof(uint32_t);  
+  
+    int threadsPerBlock = 256;  
+    int blocks = (static_cast<int>(numElems) + threadsPerBlock - 1) / threadsPerBlock;  
+  
+    CheckBufferKernel<<<blocks, threadsPerBlock>>>(  
+        reinterpret_cast<uint32_t*>(buffer),  
+        numElems,  
+        expected  
+    );  
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());  
+} 
+
 __global__ void Write(RdmaEndpoint endpoint, MemoryRegion localMr, MemoryRegion remoteMr,
                       size_t msg_size, int iters) {
   // TODO: check Whether pass by value not by pointer
@@ -32,7 +56,7 @@ __global__ void Write(RdmaEndpoint endpoint, MemoryRegion localMr, MemoryRegion 
         endpoint.cqHandle.cqAddr, endpoint.cqHandle.cqeSize, endpoint.cqHandle.cqeNum,
         &endpoint.cqHandle.consIdx, endpoint.cqHandle.dbrRecAddr, &endpoint.cqHandle.pollCqLock);
 
-    printf("postIdx: %d, consIdx: %d\n", endpoint.wqHandle.postIdx, endpoint.cqHandle.consIdx);
+    // printf("postIdx: %d, consIdx: %d\n", endpoint.wqHandle.postIdx, endpoint.cqHandle.consIdx);
   }
 }
 
@@ -92,7 +116,8 @@ void distRdmaOps(int argc, char* argv[]) {
   // 4 Register buffer
   void* buffer;
   HIP_RUNTIME_CHECK(hipMalloc(&buffer, maxSize));
-  HIP_RUNTIME_CHECK(hipMemset(buffer, local_rank, maxSize));
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buffer), local_rank, maxSize/sizeof(uint32_t)));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   // assert(!posix_memalign(&buffer_1, 4096, allreduce_size));
   // memset(buffer_1, 1, allreduce_size);
   MemoryRegion mr_handle = device_context->RegisterMemoryRegion(buffer, maxSize, MR_ACCESS_FLAG);
@@ -113,6 +138,20 @@ void distRdmaOps(int argc, char* argv[]) {
   // 5 Prepare kernel argument
   printf("Before: Local rank %d val %d\n", local_rank, ((char*)buffer)[0]);
 
+  for (size_t size = minSize; size <= maxSize; size *= stepFactor) {
+    if (local_rank == 0)
+    {
+      Write<<<1, 1>>>(endpoint, global_mr_handles[0], global_mr_handles[1], size, 1);
+      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+    }
+    bootNet.Barrier();
+    if (local_rank == 1)
+    {
+      VerifyBuffer(reinterpret_cast<uint32_t*>(buffer), size, 0);
+    }
+    bootNet.Barrier();
+  }
+
   if (local_rank == 0) {
     printf("out kernel %p\n", endpoint.wqHandle.sqAddr);
     for (size_t size = minSize; size <= maxSize; size *= stepFactor) {
@@ -123,9 +162,9 @@ void distRdmaOps(int argc, char* argv[]) {
       // test and record
       HIP_RUNTIME_CHECK(hipEventRecord(start));
       Write<<<1, 1>>>(endpoint, global_mr_handles[0], global_mr_handles[1], size, iters);
-      // HIP_RUNTIME_CHECK(hipEventSynchronize(end));
       HIP_RUNTIME_CHECK(hipEventRecord(end));
-      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+      HIP_RUNTIME_CHECK(hipEventSynchronize(end));
+      // HIP_RUNTIME_CHECK(hipDeviceSynchronize());
       HIP_RUNTIME_CHECK(hipEventElapsedTime(&milliseconds, start, end));
       times[validSizeLog] = milliseconds;
       sizeTable[validSizeLog] = size;
@@ -136,7 +175,7 @@ void distRdmaOps(int argc, char* argv[]) {
   }
   bootNet.Barrier();
 
-  printf("After: Local rank %d val %d\n", local_rank, ((char*)buffer)[0]);
+  printf("After: Local rank %d val %d %d\n", local_rank, ((uint32_t*)buffer)[0],((uint32_t*)buffer)[maxSize/sizeof(uint32_t)-1]);
   if (local_rank == 0) {
     printf("Index\tsize\t\tbw\ttimes\n");
     for (size_t i = 0; i < validSizeLog; ++i) {
