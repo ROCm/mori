@@ -314,15 +314,22 @@ inline __device__ void CrossDeviceBarrierKernel(EpDispatchCombineArgs<T> args) {
   int laneId = threadIdx.x & (warpSize - 1);
   int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
 
-  if (laneId < args.config.worldSize) {
+  int warpNum = blockDim.x / warpSize;
+  int globalWarpNum = gridDim.x * warpNum;
+
+  if (laneId == 0) atomicAdd(args.combineGridBarrier, 1);
+
+  if (globalThdId < args.config.worldSize) {
+    // Set remote flag after all copies are done
+    shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
     AtomicStoreRelaxedSystem(
-        args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(laneId) + args.config.rank,
+        args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(globalThdId) + args.config.rank,
         args.crossDeviceBarrierFlag);
   }
 
   uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
-  if (laneId < args.config.worldSize) {
-    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + laneId) != args.crossDeviceBarrierFlag) {
+  if (thdId < args.config.worldSize) {
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != args.crossDeviceBarrierFlag) {
     }
   }
   __syncthreads();

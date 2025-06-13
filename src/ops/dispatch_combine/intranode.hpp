@@ -62,8 +62,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       atomicAdd(args.peTokenOffset + destPe, 1);
       args.dispDestTokIdMap[i] = destPe * maxNumOutTokenPerRank + destTokId;
 
-      // TODO: use a switch to control the writing of this buffer
-      // For test only
+      // TODO: use a switch to control the writing of this buffer, should only turn on for testing
       args.dispTokIdToSrcTokIdMemObj->template GetAs<uint32_t*>(destPe)[destTokId] =
           myPe * config.maxNumInpTokenPerRank + srcTokId;
     }
@@ -141,11 +140,6 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
         args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
         args.inpTokenBuf + i * config.hiddenDim);
   }
-  // Sync in grid
-  if (laneId == 0) {
-    atomicAdd(args.combineGridBarrier, 1);
-    shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
-  }
   // Make sure copy on all GPUs are finished
   CrossDeviceBarrierKernel(args);
 
@@ -176,7 +170,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     }
     core::WarpAccum(
         args.shmemOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim + hiddenDimOffset,
-        srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
+        srcPtrs, config.numExpertPerToken, hiddenDimSize);
   }
 }
 

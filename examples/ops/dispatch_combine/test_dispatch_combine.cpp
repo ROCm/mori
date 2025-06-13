@@ -460,10 +460,10 @@ class EpDispatchCombineTestCase {
       }
     }
 
-    for (int i = 0; i < config.worldSize; i++) {
-      std::cout << "Rank " << config.rank << " dispatches " << rankCount[i] << " tokens to rank "
-                << i << std::endl;
-    }
+    // for (int i = 0; i < config.worldSize; i++) {
+    //   std::cout << "Rank " << config.rank << " dispatches " << rankCount[i] << " tokens to rank "
+    //             << i << std::endl;
+    // }
   }
 
   void RandomInitializeWeights() {
