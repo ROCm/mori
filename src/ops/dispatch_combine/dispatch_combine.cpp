@@ -301,7 +301,7 @@ __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
   }
   if (thdId == 0) {
     args.dispTokOffsetMemObj->template GetAs<uint32_t*>()[0] = 0;
-    *args.totalRecvTokenNum = 0;
+    core::AtomicStoreRelaxedSystem(args.totalRecvTokenNum, uint32_t{0});
   }
 }
 
@@ -311,20 +311,20 @@ __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
 template <typename T>
 inline __device__ void CrossDeviceBarrierKernel(EpDispatchCombineArgs<T> args) {
   int thdId = threadIdx.x;
+  int laneId = threadIdx.x & (warpSize - 1);
   int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
 
-  if (globalThdId < args.config.worldSize) {
+  if (laneId < args.config.worldSize) {
     AtomicStoreRelaxedSystem(
-        args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(globalThdId) + args.config.rank,
+        args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(laneId) + args.config.rank,
         args.crossDeviceBarrierFlag);
   }
 
   uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
-  if (thdId < args.config.worldSize) {
-    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != args.crossDeviceBarrierFlag) {
+  if (laneId < args.config.worldSize) {
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + laneId) != args.crossDeviceBarrierFlag) {
     }
   }
-  __syncthreads();
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -351,7 +351,7 @@ EpDispatchCombineHandle<T>::~EpDispatchCombineHandle() {
 
 template <typename T>
 void EpDispatchCombineHandle<T>::IntializeShmemBuf() {
-  int maxTokenSize = config.MaxNumOutputTokens() * config.hiddenDim * sizeof(T);
+  int maxTokenSize = config.MaxNumTokensToRecvPerRank() * config.hiddenDim * sizeof(T);
 
   void* shmemInpTokBuf = ShmemExtMallocWithFlags(maxTokenSize, hipDeviceMallocUncached);
   HIP_RUNTIME_CHECK(hipMemset(shmemInpTokBuf, 0, maxTokenSize));
@@ -363,13 +363,14 @@ void EpDispatchCombineHandle<T>::IntializeShmemBuf() {
   shmemOutTokMemObj = ShmemQueryMemObjPtr(shmemOutTokBuf);
   assert(shmemOutTokMemObj.IsValid());
 
-  int maxWeightSize = config.MaxNumOutputTokens() * config.numExpertPerToken * sizeof(float);
+  int maxWeightSize = config.MaxNumTokensToRecvPerRank() * config.numExpertPerToken * sizeof(float);
   void* shmemWeightsBuf = ShmemExtMallocWithFlags(maxWeightSize, hipDeviceMallocUncached);
   HIP_RUNTIME_CHECK(hipMemset(shmemWeightsBuf, 0, maxWeightSize));
   shmemWeightsMemObj = ShmemQueryMemObjPtr(shmemWeightsBuf);
   assert(shmemWeightsMemObj.IsValid());
 
-  int maxIndiciesSize = config.MaxNumOutputTokens() * config.numExpertPerToken * sizeof(uint32_t);
+  int maxIndiciesSize =
+      config.MaxNumTokensToRecvPerRank() * config.numExpertPerToken * sizeof(uint32_t);
   void* shmemIndiciesBuf = ShmemExtMallocWithFlags(maxIndiciesSize, hipDeviceMallocUncached);
   HIP_RUNTIME_CHECK(hipMemset(shmemIndiciesBuf, 0, maxIndiciesSize));
   shmemIndiciesMemObj = ShmemQueryMemObjPtr(shmemIndiciesBuf);

@@ -32,6 +32,7 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::P2P>
   core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
 }
 
+// TODO: use uint8_t may cause incompleted data, use other data size
 template <>
 inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::P2P>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe) {

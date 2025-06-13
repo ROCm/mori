@@ -30,8 +30,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   int myPe = config.rank;
   int npes = config.worldSize;
 
-  size_t maxNumOutTokenPerRank =
-      config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken;
+  size_t maxNumOutTokenPerRank = config.MaxNumTokensToSend();
 
   // Phase1: send token
   // Each warp compute token offset on destinition PE
@@ -94,8 +93,8 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
       // Add 1 so that when token number == 0, receiver side still know the signal is sent
       uint32_t numTokenSignal = core::AtomicLoadRelaxed(args.peTokenOffset + destPe) + 1;
-      shmem::ShmemPutUint32ImmNbiThread(args.recvTokenNumMemObj, myPe * sizeof(uint32_t),
-                                        numTokenSignal, destPe);
+      core::AtomicStoreRelaxedSystem(
+          args.recvTokenNumMemObj->template GetAs<uint32_t*>(destPe) + myPe, numTokenSignal);
     }
   }
 
@@ -132,13 +131,18 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   int myPe = config.rank;
   int npes = config.worldSize;
 
-  size_t maxNumOutTokenPerRank =
-      config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken;
+  size_t maxNumOutTokenPerRank = config.MaxNumTokensToSend();
 
   // Copy input to shmem registered buffer so that other GPUs can access directly
-  for (int i = globalWarpId; i < *args.totalRecvTokenNum; i += globalWarpNum) {
+  for (int i = globalWarpId; i < core::AtomicLoadRelaxedSystem(args.totalRecvTokenNum);
+       i += globalWarpNum) {
     core::WarpCopy(args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
                    args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
+  }
+  // Sync in grid
+  if (laneId == 0) {
+    atomicAdd(args.combineGridBarrier, 1);
+    shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
   }
   // Make sure copy on all GPUs are finished
   CrossDeviceBarrierKernel(args);
@@ -168,7 +172,6 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
         srcPtrs[j] = nullptr;
       }
     }
-
     core::WarpAccum(
         args.shmemOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim + hiddenDimOffset,
         srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);

@@ -85,20 +85,18 @@ class EpDispatchCombineTestCase {
     EpDispatchCombineConfig& config = handle.config;
 
     // Set kernel input/output token buffer
-    int maxTokenSize = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken *
-                       config.hiddenDim * sizeof(T);
+    int maxTokenSize = config.MaxNumTokensToRecvPerRank() * config.hiddenDim * sizeof(T);
     HIP_RUNTIME_CHECK(hipMalloc(&inpTokBuf, maxTokenSize));
     HIP_RUNTIME_CHECK(hipMemset(inpTokBuf, 0, maxTokenSize));
     HIP_RUNTIME_CHECK(hipMalloc(&outTokBuf, maxTokenSize));
     HIP_RUNTIME_CHECK(hipMemset(outTokBuf, 0, maxTokenSize));
     inpTokBufCpu = reinterpret_cast<T*>(malloc(maxTokenSize));
 
-    int tokenIndiciesSize =
-        config.maxNumInpTokenPerRank * config.numExpertPerToken * sizeof(uint32_t);
+    int tokenIndiciesSize = config.MaxNumTokensToSendPerRank() * sizeof(uint32_t);
     HIP_RUNTIME_CHECK(hipMalloc(&tokenIndicies, tokenIndiciesSize));
     HIP_RUNTIME_CHECK(hipMemset(tokenIndicies, 0, tokenIndiciesSize));
 
-    int weightsBufSize = config.maxNumInpTokenPerRank * config.numExpertPerToken * sizeof(float);
+    int weightsBufSize = config.MaxNumTokensToSendPerRank() * sizeof(float);
     HIP_RUNTIME_CHECK(hipMalloc(&weightsBuf, weightsBufSize));
     HIP_RUNTIME_CHECK(hipMemset(weightsBuf, 0, weightsBufSize));
   }
@@ -133,8 +131,8 @@ class EpDispatchCombineTestCase {
     EpDispatchCombineConfig& config = handle.config;
 
     // Copy token indices to CPU
-    int maxNumOutTokenPerRank = config.maxNumInpTokenPerRank * config.numExpertPerToken;
-    int tokenIndiciesSize = maxNumOutTokenPerRank * sizeof(uint32_t);
+    int MaxNumTokensToSendPerRank = config.MaxNumTokensToSendPerRank();
+    int tokenIndiciesSize = config.MaxNumTokensToSendPerRank() * sizeof(uint32_t);
 
     // Collect token indices from all ranks
     void* tokenIndicesCpu = malloc(tokenIndiciesSize);
@@ -209,7 +207,8 @@ class EpDispatchCombineTestCase {
         peSortToTokenIdxMapsVec.push_back({});
         uint32_t peTokenNum = globalTokenNum[i];
         for (int j = 0; j < peTokenNum * config.numExpertPerToken; j++) {
-          uint32_t peSortedId = globalTokenIndicesToPeSortedBufCpu[i * maxNumOutTokenPerRank + j];
+          uint32_t peSortedId =
+              globalTokenIndicesToPeSortedBufCpu[i * config.MaxNumTokensToSendPerRank() + j];
           assert(peSortToTokenIdxMapsVec[i].find(peSortedId) == peSortToTokenIdxMapsVec[i].end());
           peSortToTokenIdxMapsVec[i].insert({peSortedId, j});
         }
@@ -218,9 +217,9 @@ class EpDispatchCombineTestCase {
       std::vector<uint32_t> srcPeCheckTokenNum(config.worldSize, 0);
       for (int i = 0; i < totalRecvNumToken; i++) {
         uint32_t peSortedId = handle.exptSortedToPeSortedBuf[i];
-        uint32_t srcPe = peSortedId / maxNumOutTokenPerRank;
-        peSortedId =
-            peSortedId - srcPe * maxNumOutTokenPerRank + config.rank * maxNumOutTokenPerRank;
+        uint32_t srcPe = peSortedId / config.MaxNumTokensToSendPerRank();
+        peSortedId = peSortedId - srcPe * config.MaxNumTokensToSendPerRank() +
+                     config.rank * config.MaxNumTokensToSendPerRank();
         uint32_t srcTokDispatchId = peSortToTokenIdxMapsVec[srcPe][peSortedId];
         uint32_t srcTokId = srcTokDispatchId / config.numExpertPerToken;
 
@@ -285,6 +284,7 @@ class EpDispatchCombineTestCase {
         if (abs(got - expected) > runConfig.atol) {
           std::cout << "Wrong result at pos " << j << ": mype " << config.rank << " tokenId " << i
                     << " expected " << expected << " got " << got << " weight sum " << weightSum
+                    << " src " << float(reinterpret_cast<T*>(inpTokBufCpu)[tokenOffset + j])
                     << std::endl;
           assert(false);
         }
@@ -390,16 +390,14 @@ class EpDispatchCombineTestCase {
 
   void CopyDispatchOutAsCombineInp() {
     EpDispatchCombineConfig& config = handle.config;
-    int maxNumOutTokenPerRank =
-        config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken;
-    HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, outTokBuf,
-                                maxNumOutTokenPerRank * config.hiddenDim * sizeof(T),
-                                hipMemcpyDeviceToDevice));
+    // HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, outTokBuf,
+    //                             config.MaxNumTokensToRecvPerRank() * config.hiddenDim *
+    //                             sizeof(T), hipMemcpyDeviceToDevice));
     HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, handle.shmemOutTokMemObj->template GetAs<T*>(),
-                                maxNumOutTokenPerRank * config.hiddenDim * sizeof(T),
+                                config.MaxNumTokensToRecvPerRank() * config.hiddenDim * sizeof(T),
                                 hipMemcpyDeviceToDevice));
     HIP_RUNTIME_CHECK(
-        hipMemset(outTokBuf, 0, maxNumOutTokenPerRank * config.hiddenDim * sizeof(T)));
+        hipMemset(outTokBuf, 0, config.MaxNumTokensToRecvPerRank() * config.hiddenDim * sizeof(T)));
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   }
 

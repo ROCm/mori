@@ -31,17 +31,17 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> LaunchIntraNodeDispatch(
 
   torch::Tensor out = torch::from_blob(
       handle.shmemOutTokMemObj->Get(),
-      {handle.config.MaxNumOutputTokens(), handle.config.hiddenDim},
+      {handle.config.MaxNumTokensToRecvPerRank(), handle.config.hiddenDim},
       torch::TensorOptions().dtype(mori::GetTorchDataType<T>()).device(torch::kCUDA));
 
   torch::Tensor outWeights = torch::from_blob(
       handle.shmemWeightsMemObj->Get(),
-      {handle.config.MaxNumOutputTokens(), handle.config.numExpertPerToken},
+      {handle.config.MaxNumTokensToRecvPerRank(), handle.config.numExpertPerToken},
       torch::TensorOptions().dtype(mori::GetTorchDataType<float>()).device(torch::kCUDA));
 
   torch::Tensor outIndicies = torch::from_blob(
       handle.shmemIndiciesMemObj->Get(),
-      {handle.config.MaxNumOutputTokens(), handle.config.numExpertPerToken},
+      {handle.config.MaxNumTokensToRecvPerRank(), handle.config.numExpertPerToken},
       torch::TensorOptions().dtype(mori::GetTorchDataType<uint32_t>()).device(torch::kCUDA));
   return {out, outWeights, outIndicies};
 }
@@ -60,7 +60,7 @@ torch::Tensor LaunchIntraNodeCombine(mori::moe::EpDispatchCombineHandle<T>& hand
   auto options = torch::TensorOptions().dtype(mori::GetTorchDataType<T>()).device(torch::kCUDA);
   torch::Tensor out =
       torch::from_blob(handle.shmemOutTokMemObj->Get(),
-                       {handle.config.MaxNumOutputTokens(), handle.config.hiddenDim}, options);
+                       {handle.config.maxNumInpTokenPerRank, handle.config.hiddenDim}, options);
   return out;
 }
 
