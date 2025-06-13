@@ -529,6 +529,9 @@ void EpDispatchCombineHandle<T>::LaunchDispatch(KernelType kernelType, hipStream
     if (config.hiddenDim == 7168)
       EpDispatchIntraNodeKernel<T, 7168>
           <<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
+    else if (config.hiddenDim == 4096)
+      EpDispatchIntraNodeKernel<T, 4096>
+          <<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
     else
       assert(false);
   } else
@@ -546,6 +549,9 @@ void EpDispatchCombineHandle<T>::LaunchCombine(KernelType kernelType, hipStream_
   else if (kernelType == KernelType::IntraNode) {
     if (config.hiddenDim == 7168)
       EpCombineIntraNodeKernel<T, 7168>
+          <<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
+    else if (config.hiddenDim == 4096)
+      EpCombineIntraNodeKernel<T, 4096>
           <<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
     else
       assert(false);

@@ -62,6 +62,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       atomicAdd(args.peTokenOffset + destPe, 1);
       args.dispDestTokIdMap[i] = destPe * maxNumOutTokenPerRank + destTokId;
 
+      // TODO: use a switch to control the writing of this buffer
       // For test only
       args.dispTokIdToSrcTokIdMemObj->template GetAs<uint32_t*>(destPe)[destTokId] =
           myPe * config.maxNumInpTokenPerRank + srcTokId;
@@ -81,7 +82,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     uint32_t srcTokOffset = srcTokId * config.hiddenDim;
     uint32_t destTokOffset = destTokId * config.hiddenDim;
     core::WarpCopy<T, HiddenDim>(args.shmemOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
-                                 args.inpTokenBuf + srcTokOffset);  //, config.hiddenDim);
+                                 args.inpTokenBuf + srcTokOffset);
   }
   if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
@@ -133,12 +134,9 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   int npes = config.worldSize;
 
   size_t maxNumOutTokenPerRank = config.MaxNumTokensToSend();
-
   // Copy input to shmem registered buffer so that other GPUs can access directly
   for (int i = globalWarpId; i < core::AtomicLoadRelaxedSystem(args.totalRecvTokenNum);
        i += globalWarpNum) {
-    // core::WarpCopy(args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
-    //  args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
     core::WarpCopy<T, HiddenDim>(
         args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
         args.inpTokenBuf + i * config.hiddenDim);

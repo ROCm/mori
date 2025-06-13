@@ -53,3 +53,9 @@ add_executable(
     ops/dispatch_combine/test_dispatch_combine.cpp
 )
 target_link_libraries(test_dispatch_combine_ops mori_application mori_shmem mori_ops hip::host hip::device)
+
+add_executable(
+    warp_accum_bench
+    benchmarks/warp_accum.cpp
+)
+target_link_libraries(warp_accum_bench mori_application mori_shmem mori_ops hip::host hip::device)
