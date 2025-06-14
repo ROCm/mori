@@ -1,10 +1,10 @@
 cmake_minimum_required(VERSION 3.19)
 
-set(CMAKE_CXX_FLAGS_DEBUG "-O1")
 set(CMAKE_CXX_FLAGS_DEBUG "-g")
-set(CMAKE_CXX_FLAGS_RELEASE "-O1")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 
-set(CMAKE_BUILD_TYPE Debug)
+# set(CMAKE_BUILD_TYPE Debug)
+set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(USE_ROCM "Whether to use rocm" ON)
@@ -21,6 +21,7 @@ if (USE_ROCM)
         mori
         LANGUAGES HIP CXX C
     )
+    # set(CMAKE_CXX_COMPILER /opt/rocm/bin/hipcc)
     find_package(hip REQUIRED)
 else()
     set(CUDA_HOME /usr/local/cuda)

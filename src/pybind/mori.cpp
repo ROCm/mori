@@ -20,7 +20,7 @@
 namespace {
 
 template <typename T>
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> LaunchIntraNodeDispatch(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> LaunchIntraNodeDispatch(
     mori::moe::EpDispatchCombineHandle<T>& handle, const torch::Tensor& input,
     const torch::Tensor& weights, const torch::Tensor& topkIds) {
   assert(input.is_contiguous() && weights.is_contiguous() && topkIds.is_contiguous());
@@ -43,7 +43,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> LaunchIntraNodeDispatch(
       handle.shmemIndiciesMemObj->Get(),
       {handle.config.MaxNumTokensToRecvPerRank(), handle.config.numExpertPerToken},
       torch::TensorOptions().dtype(mori::GetTorchDataType<uint32_t>()).device(torch::kCUDA));
-  return {out, outWeights, outIndicies};
+
+  torch::Tensor totalRecvTokenNum = torch::from_blob(
+      handle.totalRecvTokenNum, {1},
+      torch::TensorOptions().dtype(mori::GetTorchDataType<size_t>()).device(torch::kCUDA));
+  return {out, outWeights, outIndicies, totalRecvTokenNum};
 }
 
 // TODO: translate data type
@@ -73,7 +77,7 @@ template <typename T>
 torch::Tensor GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle<T>& handle) {
   torch::Tensor tensor =
       torch::from_blob(handle.dispTokIdToSrcTokIdMemObj->template GetAs<uint32_t*>(),
-                       {*handle.totalRecvTokenNum}, nullptr, torch::kUInt32);
+                       {int(*handle.totalRecvTokenNum)}, nullptr, torch::kUInt32);
   return tensor;
 }
 

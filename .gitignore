@@ -1,5 +1,6 @@
 # Build 
 build/
+lib*
 
 # Python
 *.egg-info

@@ -12,6 +12,10 @@ inline torch::Dtype GetTorchDataType() {
     return torch::kFloat32;
   } else if constexpr (std::is_same_v<T, uint32_t>) {
     return torch::kUInt32;
+  } else if constexpr (std::is_same_v<T, size_t>) {
+    return torch::kUInt64;
+  } else if constexpr (std::is_same_v<T, uint64_t>) {
+    return torch::kUInt64;
   } else if constexpr (std::is_same_v<T, hip_bfloat16>) {
     return torch::kBFloat16;
   } else if constexpr (std::is_same_v<T, __hip_fp8_e4m3_fnuz>) {

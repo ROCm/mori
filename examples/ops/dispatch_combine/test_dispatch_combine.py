@@ -15,7 +15,7 @@ class EpDispatchCombineTestCase:
             rank=self.rank,
             world_size=self.world_size,
             hidden_dim=7168,
-            max_num_inp_token_per_rank=128,
+            max_num_inp_token_per_rank=512,
             num_experts_per_rank=32,
             num_experts_per_token=8,
         )
@@ -156,7 +156,7 @@ class EpDispatchCombineTestCase:
             weights_list,
             input_list,
         ) = test_data
-        dispatch_output, dispatch_weights, dispatch_indicies = op.dispatch(
+        dispatch_output, dispatch_weights, dispatch_indicies, dispatch_recv_num_token = op.dispatch(
             input, weights, indicies
         )
         torch.cuda.synchronize()
@@ -173,6 +173,7 @@ class EpDispatchCombineTestCase:
             assert torch.equal(weights_list[src_rank][src_id], dispatch_weights[i])
             assert torch.equal(indicies_list[src_rank][src_id], dispatch_indicies[i])
         assert len(torch.unique(src_token_pos)) == len(src_token_pos)
+        assert len(src_token_pos) == dispatch_recv_num_token[0]
 
         if self.config.rank == 0:
             print("Dispatch Pass")
@@ -198,15 +199,15 @@ class EpDispatchCombineTestCase:
 
     def test_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
-        for i in range(100):
+        for i in range(20):
             test_data = self.gen_test_data()
             self.run_test_once(op, test_data)
         del op
 
 
 def test_dispatch_combine(rank, world_size):
-    # test_case = EpDispatchCombineTestCase(rank, world_size, torch.float8_e4m3fnuz)
-    test_case = EpDispatchCombineTestCase(rank, world_size, torch.bfloat16)
+    test_case = EpDispatchCombineTestCase(rank, world_size, torch.float8_e4m3fnuz)
+    # test_case = EpDispatchCombineTestCase(rank, world_size, torch.bfloat16)
     test_case.setup()
     test_case.test_dispatch_combine()
     test_case.cleanup()

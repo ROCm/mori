@@ -301,7 +301,7 @@ __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
   }
   if (thdId == 0) {
     args.dispTokOffsetMemObj->template GetAs<uint32_t*>()[0] = 0;
-    core::AtomicStoreRelaxedSystem(args.totalRecvTokenNum, uint32_t{0});
+    core::AtomicStoreRelaxedSystem(args.totalRecvTokenNum, size_t{0});
   }
 }
 
@@ -359,7 +359,7 @@ EpDispatchCombineHandle<T>::~EpDispatchCombineHandle() {
 
 template <typename T>
 void EpDispatchCombineHandle<T>::IntializeShmemBuf() {
-  int maxTokenSize = config.MaxNumTokensToRecvPerRank() * config.hiddenDim * sizeof(T);
+  size_t maxTokenSize = config.MaxNumTokensToRecvPerRank() * config.hiddenDim * sizeof(T);
 
   void* shmemInpTokBuf = ShmemExtMallocWithFlags(maxTokenSize, hipDeviceMallocUncached);
   HIP_RUNTIME_CHECK(hipMemset(shmemInpTokBuf, 0, maxTokenSize));
@@ -371,13 +371,14 @@ void EpDispatchCombineHandle<T>::IntializeShmemBuf() {
   shmemOutTokMemObj = ShmemQueryMemObjPtr(shmemOutTokBuf);
   assert(shmemOutTokMemObj.IsValid());
 
-  int maxWeightSize = config.MaxNumTokensToRecvPerRank() * config.numExpertPerToken * sizeof(float);
+  size_t maxWeightSize =
+      config.MaxNumTokensToRecvPerRank() * config.numExpertPerToken * sizeof(float);
   void* shmemWeightsBuf = ShmemExtMallocWithFlags(maxWeightSize, hipDeviceMallocUncached);
   HIP_RUNTIME_CHECK(hipMemset(shmemWeightsBuf, 0, maxWeightSize));
   shmemWeightsMemObj = ShmemQueryMemObjPtr(shmemWeightsBuf);
   assert(shmemWeightsMemObj.IsValid());
 
-  int maxIndiciesSize =
+  size_t maxIndiciesSize =
       config.MaxNumTokensToRecvPerRank() * config.numExpertPerToken * sizeof(uint32_t);
   void* shmemIndiciesBuf = ShmemExtMallocWithFlags(maxIndiciesSize, hipDeviceMallocUncached);
   HIP_RUNTIME_CHECK(hipMemset(shmemIndiciesBuf, 0, maxIndiciesSize));
@@ -395,7 +396,7 @@ void EpDispatchCombineHandle<T>::FinalizeShmemBuf() {
 
 template <typename T>
 void EpDispatchCombineHandle<T>::IntializeTokenNumSignalBuf() {
-  int tokenNumSignalSize = config.worldSize * sizeof(uint32_t);
+  size_t tokenNumSignalSize = config.worldSize * sizeof(uint32_t);
 
   void* recvTokenNumBuf = ShmemExtMallocWithFlags(tokenNumSignalSize, hipDeviceMallocUncached);
   HIP_RUNTIME_CHECK(hipMemset(recvTokenNumBuf, 0, tokenNumSignalSize));
@@ -420,7 +421,7 @@ void EpDispatchCombineHandle<T>::FinalizeTokenNumSignalBuf() {
 
 template <typename T>
 void EpDispatchCombineHandle<T>::IntializeTokToExptBuf() {
-  int tokToExptMapSize =
+  size_t tokToExptMapSize =
       config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerRank * sizeof(uint32_t);
   void* inpTokToExptMapBuf = ShmemExtMallocWithFlags(tokToExptMapSize, hipDeviceMallocUncached);
   HIP_RUNTIME_CHECK(hipMemset(inpTokToExptMapBuf, 0, tokToExptMapSize));
@@ -441,7 +442,7 @@ void EpDispatchCombineHandle<T>::FinalizeTokToExptBuf() {
 
 template <typename T>
 void EpDispatchCombineHandle<T>::IntializeOrderMapBuf() {
-  int maxNumOutToken = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerRank;
+  size_t maxNumOutToken = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerRank;
   HIP_RUNTIME_CHECK(hipMalloc(&exptSortedToPeSortedBuf, maxNumOutToken * sizeof(uint32_t)));
   HIP_RUNTIME_CHECK(hipMemset(exptSortedToPeSortedBuf, 0, maxNumOutToken * sizeof(uint32_t)));
 
@@ -482,7 +483,7 @@ void EpDispatchCombineHandle<T>::FinalizeOrderMapBuf() {
 
 template <typename T>
 void EpDispatchCombineHandle<T>::IntializeBarrier() {
-  int barrierSize = config.worldSize * sizeof(uint32_t);
+  size_t barrierSize = config.worldSize * sizeof(uint32_t);
 
   HIP_RUNTIME_CHECK(hipMalloc(&dispatchGridBarrier, barrierSize));
   HIP_RUNTIME_CHECK(hipMemset(dispatchGridBarrier, 0, barrierSize));

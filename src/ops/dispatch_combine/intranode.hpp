@@ -102,11 +102,10 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   // Each warp wait until sender finished by waiting token number signal
   uint32_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint32_t*>();
   if (globalWarpId == 0) {
-    uint32_t totalRecvTokenNum = 0;
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       uint32_t* signal = recvTokenNums + destPe;
-      totalRecvTokenNum = shmem::ShmemUint32WaitUntilGreaterThan(signal, 0) - 1;
-      atomicAdd(args.totalRecvTokenNum, totalRecvTokenNum);
+      uint32_t recvTokenNum = shmem::ShmemUint32WaitUntilGreaterThan(signal, 0) - 1;
+      atomicAdd(args.totalRecvTokenNum, recvTokenNum);
     }
   }
 }
@@ -134,8 +133,8 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
   size_t maxNumOutTokenPerRank = config.MaxNumTokensToSend();
   // Copy input to shmem registered buffer so that other GPUs can access directly
-  for (int i = globalWarpId; i < core::AtomicLoadRelaxedSystem(args.totalRecvTokenNum);
-       i += globalWarpNum) {
+  size_t totalRecvTokenNum = args.totalRecvTokenNum[0];
+  for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
     core::WarpCopy<T, HiddenDim>(
         args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
         args.inpTokenBuf + i * config.hiddenDim);
@@ -147,13 +146,13 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
 
   int warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
-  int hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
+  size_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
 
   for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
     int tokenId = i / warpsPerToken;
     int inTokenPartId = i % warpsPerToken;
-    int hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
-    int hiddenDimSize = std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp);
+    size_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
+    size_t hiddenDimSize = std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp);
 
     // Prepare data pointers on different GPUs
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
@@ -170,7 +169,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     }
     core::WarpAccum(
         args.shmemOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim + hiddenDimOffset,
-        srcPtrs, config.numExpertPerToken, hiddenDimSize);
+        srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
   }
 }
 

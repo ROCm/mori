@@ -31,7 +31,7 @@ struct EpDispatchCombineConfig {
   }
 
   inline __host__ __device__ int MaxNumTokensToRecvPerRank() const {
-    return worldSize * maxNumInpTokenPerRank * numExpertPerRank;
+    return worldSize * maxNumInpTokenPerRank * std::min(numExpertPerRank, numExpertPerToken);
   }
 };
 
@@ -42,7 +42,7 @@ class EpDispatchCombineHandle {
   ~EpDispatchCombineHandle();
 
   void PrepareInference(T* input, T* output, float* weights, uint32_t* tokenIndicies,
-                        int numToken) {
+                        size_t numToken) {
     this->inpTokenBuf = input;
     this->outTokenBuf = output;
     this->weightsBuf = weights;
@@ -77,7 +77,7 @@ class EpDispatchCombineHandle {
 
  public:
   // Number of tokens on this rank, updated at each round of inference
-  int curRankNumToken{-1};
+  size_t curRankNumToken{0};
 
  public:
   // Config
@@ -126,7 +126,7 @@ class EpDispatchCombineHandle {
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
   uint32_t* dispDestTokIdMap{nullptr};
-  uint32_t* totalRecvTokenNum{nullptr};
+  size_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint32_t crossDeviceBarrierFlag{1};
 };
@@ -134,7 +134,7 @@ class EpDispatchCombineHandle {
 template <typename T>
 struct EpDispatchCombineArgs {
   EpDispatchCombineConfig config;
-  int curRankNumToken{-1};
+  size_t curRankNumToken{0};
   uint32_t* tokenIndicies{nullptr};
   T* inpTokenBuf{nullptr};
   T* outTokenBuf{nullptr};
@@ -156,7 +156,7 @@ struct EpDispatchCombineArgs {
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
   uint32_t* dispDestTokIdMap{nullptr};
-  uint32_t* totalRecvTokenNum{nullptr};
+  size_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint32_t crossDeviceBarrierFlag{1};
 };

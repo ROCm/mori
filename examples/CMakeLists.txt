@@ -43,19 +43,7 @@ add_executable(
 target_link_libraries(context mori_application hip::host hip::device)
 
 add_executable(
-    p2p_bandwidth
-    benchmarks/p2p_bandwidth.cpp
-)
-target_link_libraries(p2p_bandwidth mori_application mori_shmem hip::host hip::device)
-
-add_executable(
     test_dispatch_combine_ops
     ops/dispatch_combine/test_dispatch_combine.cpp
 )
 target_link_libraries(test_dispatch_combine_ops mori_application mori_shmem mori_ops hip::host hip::device)
-
-add_executable(
-    warp_accum_bench
-    benchmarks/warp_accum.cpp
-)
-target_link_libraries(warp_accum_bench mori_application mori_shmem mori_ops hip::host hip::device)
