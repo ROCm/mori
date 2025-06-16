@@ -13,7 +13,7 @@ namespace moe {
 /*                                    EpDispatchIntraNodeKernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
 // This is a intra-node dispatch kernel that only incurs buffer copy once.
-template <typename T, int HiddenDim>
+template <typename T>
 __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
 
@@ -80,8 +80,8 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
     uint32_t srcTokOffset = srcTokId * config.hiddenDim;
     uint32_t destTokOffset = destTokId * config.hiddenDim;
-    core::WarpCopy<T, HiddenDim>(args.shmemOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
-                                 args.inpTokenBuf + srcTokOffset);
+    core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
+                   args.inpTokenBuf + srcTokOffset, config.hiddenDim);
   }
   if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
@@ -113,7 +113,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpCombineIntraNodeKernel                                    */
 /* ---------------------------------------------------------------------------------------------- */
-template <typename T, int HiddenDim>
+template <typename T>
 __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
   int thdId = threadIdx.x;
@@ -135,9 +135,8 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   // Copy input to shmem registered buffer so that other GPUs can access directly
   size_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
-    core::WarpCopy<T, HiddenDim>(
-        args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
-        args.inpTokenBuf + i * config.hiddenDim);
+    core::WarpCopy(args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
+                   args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
   }
   // Make sure copy on all GPUs are finished
   CrossDeviceBarrierKernel(args);

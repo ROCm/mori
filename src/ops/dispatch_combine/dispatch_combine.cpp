@@ -534,14 +534,8 @@ void EpDispatchCombineHandle<T>::LaunchDispatch(KernelType kernelType, hipStream
   if (kernelType == KernelType::InterNode)
     EpDispatchKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
   else if (kernelType == KernelType::IntraNode) {
-    if (config.hiddenDim == 7168)
-      EpDispatchIntraNodeKernel<T, 7168>
-          <<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
-    else if (config.hiddenDim == 4096)
-      EpDispatchIntraNodeKernel<T, 4096>
-          <<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
-    else
-      assert(false);
+    EpDispatchIntraNodeKernel<T>
+        <<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
   } else
     assert(false);
 }
@@ -555,14 +549,8 @@ void EpDispatchCombineHandle<T>::LaunchCombine(KernelType kernelType, hipStream_
   if (kernelType == KernelType::InterNode)
     EpCombineKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
   else if (kernelType == KernelType::IntraNode) {
-    if (config.hiddenDim == 7168)
-      EpCombineIntraNodeKernel<T, 7168>
-          <<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
-    else if (config.hiddenDim == 4096)
-      EpCombineIntraNodeKernel<T, 4096>
-          <<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
-    else
-      assert(false);
+    EpCombineIntraNodeKernel<T>
+        <<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
   } else
     assert(false);
 }

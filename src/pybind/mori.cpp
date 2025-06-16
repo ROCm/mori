@@ -75,9 +75,11 @@ void LaunchReset(mori::moe::EpDispatchCombineHandle<T>& handle) {
 
 template <typename T>
 torch::Tensor GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle<T>& handle) {
+  auto options =
+      torch::TensorOptions().dtype(mori::GetTorchDataType<uint32_t>()).device(torch::kCUDA);
   torch::Tensor tensor =
       torch::from_blob(handle.dispTokIdToSrcTokIdMemObj->template GetAs<uint32_t*>(),
-                       {int(*handle.totalRecvTokenNum)}, nullptr, torch::kUInt32);
+                       {int(*handle.totalRecvTokenNum)}, options);
   return tensor;
 }
 
