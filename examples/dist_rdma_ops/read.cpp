@@ -14,49 +14,48 @@ using namespace mori::core;
   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | \
       IBV_ACCESS_REMOTE_ATOMIC
 
-__global__ void CheckBufferKernel(const uint32_t* buffer, size_t numElems, uint32_t expected) {  
+__global__ void CheckBufferKernel(const char* buffer, size_t numElems, char expected) {  
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;  
     if (idx < numElems) {  
-        uint32_t val = buffer[idx];  
+        char val = buffer[idx];  
         if (val != expected) {  
-            printf("Mismatch at index %zu: expected=%u, got=%u\n", idx, expected, val);  
+            // printf("Mismatch at index %zu: expected=%d, got=%d\n", idx, expected, val);  
+            assert(false && "Buffer mismatch detected!");
         }  
     }  
 }  
    
-void VerifyBuffer(void* buffer, size_t maxSize, uint32_t expected) {  
-    size_t numElems = maxSize / sizeof(uint32_t);  
+void VerifyBuffer(void* buffer, size_t maxSize, char expected) {  
+    size_t numElems = maxSize / sizeof(char);  
   
     int threadsPerBlock = 256;  
     int blocks = (static_cast<int>(numElems) + threadsPerBlock - 1) / threadsPerBlock;  
   
     CheckBufferKernel<<<blocks, threadsPerBlock>>>(  
-        reinterpret_cast<uint32_t*>(buffer),  
+        reinterpret_cast<char*>(buffer),  
         numElems,  
         expected  
     );  
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());  
 } 
 
-__global__ void Write(RdmaEndpoint endpoint, MemoryRegion localMr, MemoryRegion remoteMr,
+__global__ void Write(RdmaEndpoint* endpoint, MemoryRegion localMr, MemoryRegion remoteMr,
                       size_t msg_size, int iters) {
-  // TODO: check Whether pass by value not by pointer
-  printf("in kernel iter:%d msg_size:%zu localMr.addr: %lu remoteMr.addr:%lu\n", iters, msg_size,
-         localMr.addr, remoteMr.addr);
   for (int i = 0; i < iters; i++) {
     uint64_t dbr_val = PostWrite<ProviderType::MLX5>(
-        endpoint.wqHandle.sqAddr, endpoint.wqHandle.sqWqeNum, &endpoint.wqHandle.postIdx,
-        endpoint.handle.qpn, localMr.addr, localMr.lkey, remoteMr.addr, remoteMr.rkey, msg_size);
+        endpoint->wqHandle.sqAddr, endpoint->wqHandle.sqWqeNum, &endpoint->wqHandle.postIdx,
+        endpoint->handle.qpn, localMr.addr, localMr.lkey, remoteMr.addr, remoteMr.rkey, msg_size);
     __threadfence_system();
-    UpdateDbrAndRingDbSend<ProviderType::MLX5>(endpoint.wqHandle.dbrRecAddr,
-                                               endpoint.wqHandle.postIdx, endpoint.wqHandle.dbrAddr,
-                                               dbr_val, &endpoint.wqHandle.postSendLock);
+    UpdateSendDbrRecord<ProviderType::MLX5>(endpoint->wqHandle.dbrRecAddr,
+                                            endpoint->wqHandle.postIdx);
     __threadfence_system();
-    PollCqAndUpdateDbr<ProviderType::MLX5>(
-        endpoint.cqHandle.cqAddr, endpoint.cqHandle.cqeSize, endpoint.cqHandle.cqeNum,
-        &endpoint.cqHandle.consIdx, endpoint.cqHandle.dbrRecAddr, &endpoint.cqHandle.pollCqLock);
-
-    // printf("postIdx: %d, consIdx: %d\n", endpoint.wqHandle.postIdx, endpoint.cqHandle.consIdx);
+    RingDoorbell<ProviderType::MLX5>(endpoint->wqHandle.dbrAddr, dbr_val);
+    __threadfence_system();
+    int snd_opcode =
+        PollCq<ProviderType::MLX5>(endpoint->cqHandle.cqAddr, endpoint->cqHandle.cqeSize,
+                                   endpoint->cqHandle.cqeNum, &endpoint->cqHandle.consIdx);
+    __threadfence_system();   
+    // printf("postIdx: %d, consIdx: %d\n", endpoint->wqHandle.postIdx, endpoint->cqHandle.consIdx);
   }
 }
 
@@ -87,15 +86,17 @@ void distRdmaOps(int argc, char* argv[]) {
   // 1 Create device
   RdmaContext rdma_context;
   RdmaDeviceList rdma_devices = rdma_context.GetRdmaDeviceList();
-  RdmaDevice* device = rdma_devices[1];
+  ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(rdma_devices);
+  RdmaDevice* device = activeDevicePortList[0].first;
+
   RdmaDeviceContext* device_context = device->CreateRdmaDeviceContext();
 
   // 2 Create an endpoint
   RdmaEndpointConfig config;
-  config.portId = 1;
+  config.portId = activeDevicePortList[0].second;
   config.gidIdx = 1;
-  config.maxMsgsNum = 10;
-  config.maxCqeNum = 256;
+  config.maxMsgsNum = 200;
+  config.maxCqeNum = 1024;
   config.alignment = 4096;
   config.onGpu = on_gpu;
   RdmaEndpoint endpoint = device_context->CreateRdmaEndpoint(config);
@@ -116,15 +117,17 @@ void distRdmaOps(int argc, char* argv[]) {
   // 4 Register buffer
   void* buffer;
   HIP_RUNTIME_CHECK(hipMalloc(&buffer, maxSize));
-  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buffer), local_rank, maxSize/sizeof(uint32_t)));
-  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  HIP_RUNTIME_CHECK(hipMemset(buffer, local_rank, maxSize));
+
   // assert(!posix_memalign(&buffer_1, 4096, allreduce_size));
   // memset(buffer_1, 1, allreduce_size);
   MemoryRegion mr_handle = device_context->RegisterMemoryRegion(buffer, maxSize, MR_ACCESS_FLAG);
   MemoryRegion global_mr_handles[world_size];
   bootNet.Allgather(&mr_handle, global_mr_handles, sizeof(mr_handle));
   global_mr_handles[local_rank] = mr_handle;
-  //   printf("Before Buffer 2 0th %d 512th %d\n", ((char*)buffer_2)[0], ((char*)buffer_2)[512]);
+  RdmaEndpoint* devEndpoint;
+  HIP_RUNTIME_CHECK(hipMalloc(&devEndpoint, sizeof(RdmaEndpoint)));
+  HIP_RUNTIME_CHECK(hipMemcpy(devEndpoint, &endpoint, sizeof(RdmaEndpoint), hipMemcpyHostToDevice));
 
   double* bwTable;
   uint64_t* sizeTable;
@@ -136,35 +139,35 @@ void distRdmaOps(int argc, char* argv[]) {
   HIP_RUNTIME_CHECK(hipHostAlloc(&times, maxSizeLog * sizeof(float), hipHostAllocMapped));
   memset(times, 0, maxSizeLog * sizeof(float));
   // 5 Prepare kernel argument
-  printf("Before: Local rank %d val %d\n", local_rank, ((char*)buffer)[0]);
+  // printf("Before: Local rank %d val %d\n", local_rank, ((char*)buffer)[0]);
 
   for (size_t size = minSize; size <= maxSize; size *= stepFactor) {
     if (local_rank == 0)
     {
-      Write<<<1, 1>>>(endpoint, global_mr_handles[0], global_mr_handles[1], size, 1);
+      Write<<<1, 1>>>(devEndpoint, global_mr_handles[0], global_mr_handles[1], size, 1);
       HIP_RUNTIME_CHECK(hipDeviceSynchronize());
     }
     bootNet.Barrier();
     if (local_rank == 1)
     {
-      VerifyBuffer(reinterpret_cast<uint32_t*>(buffer), size, 0);
+      VerifyBuffer(reinterpret_cast<char*>(buffer), size, 0);
+      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
     }
     bootNet.Barrier();
   }
+  printf("rank %d data verify is done\n", local_rank);
 
   if (local_rank == 0) {
-    printf("out kernel %p\n", endpoint.wqHandle.sqAddr);
     for (size_t size = minSize; size <= maxSize; size *= stepFactor) {
       // warmup
-      Write<<<1, 1>>>(endpoint, global_mr_handles[0], global_mr_handles[1], size, warmupIters);
+      Write<<<1, 1>>>(devEndpoint, global_mr_handles[0], global_mr_handles[1], size, warmupIters);
       HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
       // test and record
       HIP_RUNTIME_CHECK(hipEventRecord(start));
-      Write<<<1, 1>>>(endpoint, global_mr_handles[0], global_mr_handles[1], size, iters);
+      Write<<<1, 1>>>(devEndpoint, global_mr_handles[0], global_mr_handles[1], size, iters);
       HIP_RUNTIME_CHECK(hipEventRecord(end));
       HIP_RUNTIME_CHECK(hipEventSynchronize(end));
-      // HIP_RUNTIME_CHECK(hipDeviceSynchronize());
       HIP_RUNTIME_CHECK(hipEventElapsedTime(&milliseconds, start, end));
       times[validSizeLog] = milliseconds;
       sizeTable[validSizeLog] = size;
@@ -174,17 +177,20 @@ void distRdmaOps(int argc, char* argv[]) {
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   }
   bootNet.Barrier();
+  // printf("After: Local rank %d val %d %d\n", local_rank, ((char*)buffer)[0],((char*)buffer)[maxSize/sizeof(char)-1]);
 
-  printf("After: Local rank %d val %d %d\n", local_rank, ((uint32_t*)buffer)[0],((uint32_t*)buffer)[maxSize/sizeof(uint32_t)-1]);
   if (local_rank == 0) {
-    printf("Index\tsize\t\tbw\ttimes\n");
+    printf("\nIBGDA Wite benchmark:\n");
+    printf("%-8s %-12s %-12s %-12s\n", "Index", "Size(B)", "bw(GB)", "Time(ms)");
+
     for (size_t i = 0; i < validSizeLog; ++i) {
-      printf("%zu\t%lu\t%f\t%f\n", i, sizeTable[i], bwTable[i], times[i]);
+      printf("%-8zu %-12lu %-12.4f %-12.4f\n", i + 1, sizeTable[i], bwTable[i], times[i]);
     }
   }
 
   bootNet.Finalize();
   HIP_RUNTIME_CHECK(hipFree(buffer));
+  HIP_RUNTIME_CHECK(hipFree(devEndpoint));
   HIP_RUNTIME_CHECK(hipHostFree(bwTable));
   HIP_RUNTIME_CHECK(hipHostFree(sizeTable));
   HIP_RUNTIME_CHECK(hipHostFree(times));
