@@ -20,14 +20,14 @@
 namespace {
 
 template <typename T>
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> LaunchIntraNodeDispatch(
-    mori::moe::EpDispatchCombineHandle<T>& handle, const torch::Tensor& input,
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> LaunchDispatch(
+    mori::moe::EpDispatchCombineHandle<T>& handle, int kernelType, const torch::Tensor& input,
     const torch::Tensor& weights, const torch::Tensor& topkIds) {
   assert(input.is_contiguous() && weights.is_contiguous() && topkIds.is_contiguous());
 
   handle.PrepareInference(reinterpret_cast<T*>(input.data_ptr()), nullptr,
                           weights.data_ptr<float>(), topkIds.data_ptr<uint32_t>(), input.size(0));
-  handle.LaunchIntraNodeDispatch(at::cuda::getCurrentHIPStream());
+  handle.LaunchDispatch((mori::moe::KernelType)kernelType, at::cuda::getCurrentHIPStream());
 
   torch::Tensor out = torch::from_blob(
       handle.shmemOutTokMemObj->Get(),
@@ -52,14 +52,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> LaunchInt
 
 // TODO: translate data type
 template <typename T>
-torch::Tensor LaunchIntraNodeCombine(mori::moe::EpDispatchCombineHandle<T>& handle,
-                                     const torch::Tensor& input, const torch::Tensor& weights,
-                                     const torch::Tensor& topkIds) {
+torch::Tensor LaunchCombine(mori::moe::EpDispatchCombineHandle<T>& handle, int kernelType,
+                            const torch::Tensor& input, const torch::Tensor& weights,
+                            const torch::Tensor& topkIds) {
   assert(input.is_contiguous() && weights.is_contiguous() && topkIds.is_contiguous());
   handle.PrepareInference(reinterpret_cast<T*>(input.data_ptr()), nullptr,
                           weights.data_ptr<float>(), topkIds.data_ptr<uint32_t>(),
                           handle.curRankNumToken);
-  handle.LaunchIntraNodeCombine(at::cuda::getCurrentHIPStream());
+  handle.LaunchCombine((mori::moe::KernelType)kernelType, at::cuda::getCurrentHIPStream());
 
   auto options = torch::TensorOptions().dtype(mori::GetTorchDataType<T>()).device(torch::kCUDA);
   torch::Tensor out =
@@ -90,11 +90,11 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m, const std::string& type
       .def(pybind11::init<mori::moe::EpDispatchCombineConfig>(),
            py::arg("config") = mori::moe::EpDispatchCombineConfig{});
 
-  std::string funcName = std::string("launch_intra_node_dispatch_") + typeStr;
-  m.def(funcName.c_str(), &LaunchIntraNodeDispatch<T>);
+  std::string funcName = std::string("launch_dispatch_") + typeStr;
+  m.def(funcName.c_str(), &LaunchDispatch<T>);
 
-  funcName = std::string("launch_intra_node_combine_") + typeStr;
-  m.def(funcName.c_str(), &LaunchIntraNodeCombine<T>);
+  funcName = std::string("launch_combine_") + typeStr;
+  m.def(funcName.c_str(), &LaunchCombine<T>);
 
   funcName = std::string("launch_reset_") + typeStr;
   m.def(funcName.c_str(), &LaunchReset<T>);

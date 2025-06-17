@@ -36,6 +36,23 @@ def setup(local_rank, num_node, gpu_per_node):
 
     print(f"I'm pe {mori.shmem.shmem_mype()} in {mori.shmem.shmem_npes()} pes")
 
+    config = mori.ops.EpDispatchCombineConfig(
+        data_type=torch.bfloat16,
+        rank=global_rank,
+        world_size=world_size,
+        hidden_dim=7168,
+        max_num_inp_token_per_rank=512,
+        num_experts_per_rank=32,
+        num_experts_per_token=8,
+    )
+    op = mori.ops.EpDispatchCombineOp(config)
+    op.dispatch_internode(
+        torch.ones(4, 7168).to(torch.bfloat16).to(device), 
+        torch.ones(4, 1).to(torch.float).to(device), 
+        torch.ones(4, 8).to(torch.uint32).to(device)
+    )
+    torch.cuda.synchronize()
+
 
 def cleanup():
     mori.shmem.shmem_finalize()

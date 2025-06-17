@@ -229,8 +229,6 @@ inline __device__ T ShmemTypeWaitUntilGreaterThan(T* addr, T val) {
     got = core::AtomicLoadRelaxedSystem(addr);
   } while (got <= val);
   return got;
-  // while (core::AtomicLoadRelaxedSystem(addr) <= val) {
-  // }
 }
 
 #define DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(TypeName, T)                \

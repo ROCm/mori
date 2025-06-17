@@ -17,19 +17,6 @@ using namespace mori::application;
 using namespace mori::core;
 using namespace mori::shmem;
 
-#define DEBUG 0
-
-__device__ void SyncIfDebugEnabled(const char* msg) {
-#if DEBUG == 1
-  __syncthreads();
-  if ((threadIdx.x == 0) && (blockIdx.x == 0)) {
-    ShmemQuietThread();
-    printf("%s\n", msg);
-  }
-  __syncthreads();
-#endif
-}
-
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        EpDispatchKernel                                        */
 /* ---------------------------------------------------------------------------------------------- */
@@ -549,8 +536,7 @@ void EpDispatchCombineHandle<T>::LaunchCombine(KernelType kernelType, hipStream_
   size_t sharedMemSize = config.warpNumPerBlock * config.numExpertPerToken * sizeof(T**);
 
   if (kernelType == KernelType::InterNode)
-    EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(
-        GetEpDispatchCombineArgs(*this));
+    EpCombineKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
   else if (kernelType == KernelType::IntraNode) {
     EpCombineIntraNodeKernel<T>
         <<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));

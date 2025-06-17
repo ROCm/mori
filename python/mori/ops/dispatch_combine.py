@@ -45,11 +45,11 @@ class EpDispatchCombineOp:
             )
         )
 
-        self._intra_node_dispatch_func = _cpp_dispatch_combine_factory(
-            config.data_type, "launch_intra_node_dispatch_"
+        self._dispatch_func = _cpp_dispatch_combine_factory(
+            config.data_type, "launch_dispatch_"
         )
-        self._intra_node_combine_func = _cpp_dispatch_combine_factory(
-            config.data_type, "launch_intra_node_combine_"
+        self._combine_func = _cpp_dispatch_combine_factory(
+            config.data_type, "launch_combine_"
         )
         self._reset_func = _cpp_dispatch_combine_factory(
             config.data_type, "launch_reset_"
@@ -61,8 +61,9 @@ class EpDispatchCombineOp:
     def dispatch(
         self, input: torch.Tensor, weights: torch.Tensor, indicies: torch.Tensor
     ):
-        return self._intra_node_dispatch_func(
+        return self._dispatch_func(
             self._handle,
+            0,
             input,
             weights,
             indicies,
@@ -71,8 +72,33 @@ class EpDispatchCombineOp:
     def combine(
         self, input: torch.Tensor, weights: torch.Tensor, indicies: torch.Tensor
     ):
-        output = self._intra_node_combine_func(
+        output = self._combine_func(
             self._handle,
+            0,
+            input,
+            weights,
+            indicies,
+        )
+        self._reset_func(self._handle)
+        return output
+    
+    def dispatch_internode(
+        self, input: torch.Tensor, weights: torch.Tensor, indicies: torch.Tensor
+    ):
+        return self._dispatch_func(
+            self._handle,
+            1,
+            input,
+            weights,
+            indicies,
+        )
+
+    def combine_internode(
+        self, input: torch.Tensor, weights: torch.Tensor, indicies: torch.Tensor
+    ):
+        output = self._combine_func(
+            self._handle,
+            1,
             input,
             weights,
             indicies,
