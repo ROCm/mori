@@ -23,11 +23,12 @@ void Context::CollectHostNames() {
   char hostname[HOST_NAME_MAX];
   gethostname(hostname, HOST_NAME_MAX);
 
-  char globalHostNames[HOST_NAME_MAX * WorldSize()];
-  bootNet.Allgather(hostname, globalHostNames, HOST_NAME_MAX);
+  // char globalHostNames[HOST_NAME_MAX * WorldSize()];
+  std::vector<char> globalHostNames(HOST_NAME_MAX * WorldSize());
+  bootNet.Allgather(hostname, globalHostNames.data(), HOST_NAME_MAX);
 
   for (int i = 0; i < WorldSize(); i++) {
-    hostnames.push_back(&globalHostNames[i * HOST_NAME_MAX]);
+    hostnames.push_back(&globalHostNames.data()[i * HOST_NAME_MAX]);
   }
 }
 
@@ -46,9 +47,13 @@ void Context::IntializePossibleTransports() {
   const RdmaDeviceList& devices = rdmaContext->GetRdmaDeviceList();
   ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(devices);
 
-  RdmaDevice* device = activeDevicePortList[rankInNode % activeDevicePortList.size()].first;
-  int portId = activeDevicePortList[rankInNode % activeDevicePortList.size()].second;
-  rdmaDeviceContext.reset(device->CreateRdmaDeviceContext());
+  int portId;
+  RdmaDevice* device = nullptr;
+  if (!activeDevicePortList.empty()) {
+    RdmaDevice* device = activeDevicePortList[rankInNode % activeDevicePortList.size()].first;
+    portId = activeDevicePortList[rankInNode % activeDevicePortList.size()].second;
+    rdmaDeviceContext.reset(device->CreateRdmaDeviceContext());
+  }
 
   // Intialize transport
   int peerRankInNode = -1;
@@ -70,6 +75,8 @@ void Context::IntializePossibleTransports() {
         continue;
       }
     }
+
+    if (rdmaDeviceContext.get() == nullptr) assert(false && "no rdma device found");
 
     application::RdmaEndpointConfig config;
     config.portId = portId;

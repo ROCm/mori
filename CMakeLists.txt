@@ -1,23 +1,27 @@
 cmake_minimum_required(VERSION 3.19)
 
-set(CMAKE_CXX_FLAGS_DEBUG "-O1")
 set(CMAKE_CXX_FLAGS_DEBUG "-g")
-set(CMAKE_CXX_FLAGS_RELEASE "-O1")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 
-set(CMAKE_BUILD_TYPE Debug)
+# set(CMAKE_BUILD_TYPE Debug)
+set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(USE_ROCM "Whether to use rocm" ON)
 option(BUILD_EXAMPLES "Whether to build examples" ON)
 option(BUILD_APPLICATION "Whether to build application library" ON)
 option(BUILD_SHMEM "Whether to build shmem library" ON)
+option(BUILD_OPS "Whether to build mori operation kernels" ON)
+option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
+
 
 if (USE_ROCM)
-    set(CMAKE_PREFIX_PATH /opt/rocm)
+    list(APPEND CMAKE_PREFIX_PATH "/opt/rocm")
     project(
         mori
         LANGUAGES HIP CXX C
     )
+    # set(CMAKE_CXX_COMPILER /opt/rocm/bin/hipcc)
     find_package(hip REQUIRED)
 else()
     set(CUDA_HOME /usr/local/cuda)
@@ -46,4 +50,12 @@ endif()
 
 if (BUILD_SHMEM)
     add_subdirectory(src/shmem)
+endif()
+
+if (BUILD_OPS)
+    add_subdirectory(src/ops)
+endif()
+
+if (BUILD_PYBINDS)
+    add_subdirectory(src/pybind)
 endif()

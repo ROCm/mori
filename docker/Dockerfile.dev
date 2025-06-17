@@ -1,0 +1,5 @@
+# FROM rocm/dev-ubuntu-22.04:latest
+FROM rocm/pytorch:rocm6.4.1_ubuntu24.04_py3.12_pytorch_release_2.5.1
+
+RUN apt-get update && \
+    apt-get install -y git cython3 ibverbs-utils openmpi-bin libopenmpi-dev cmake libdw1 locales

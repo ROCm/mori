@@ -223,14 +223,19 @@ inline __device__ void ShmemQuietThread() {
 }
 
 template <typename T>
-inline __device__ void ShmemTypeWaitUntilGreaterThan(T* addr, T val) {
-  while (core::AtomicLoadRelaxedSystem(addr) <= val) {
-  }
+inline __device__ T ShmemTypeWaitUntilGreaterThan(T* addr, T val) {
+  T got;
+  do {
+    got = core::AtomicLoadRelaxedSystem(addr);
+  } while (got <= val);
+  return got;
+  // while (core::AtomicLoadRelaxedSystem(addr) <= val) {
+  // }
 }
 
-#define DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(TypeName, T)                   \
-  inline __device__ void Shmem##TypeName##WaitUntilGreaterThan(T* addr, T val) { \
-    ShmemTypeWaitUntilGreaterThan<T>(addr, val);                                 \
+#define DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(TypeName, T)                \
+  inline __device__ T Shmem##TypeName##WaitUntilGreaterThan(T* addr, T val) { \
+    return ShmemTypeWaitUntilGreaterThan<T>(addr, val);                       \
   }
 
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Uint8, uint8_t)

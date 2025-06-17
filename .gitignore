@@ -1,2 +1,9 @@
 # Build 
 build/
+lib*
+
+# Python
+*.egg-info
+*.pyc
+.pytest_cache
+__pycache__

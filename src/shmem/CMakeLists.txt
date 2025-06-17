@@ -1,8 +1,7 @@
 find_package(MPI REQUIRED)
 
-
 add_library(
-    mori_shmem
+    mori_shmem 
     init.cpp
     memory.cpp
 )

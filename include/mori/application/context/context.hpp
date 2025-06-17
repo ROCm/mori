@@ -24,6 +24,7 @@ class Context {
 
   RdmaContext* GetRdmaContext() const { return rdmaContext.get(); }
   RdmaDeviceContext* GetRdmaDeviceContext() const { return rdmaDeviceContext.get(); }
+  bool RdmaTransportEnabled() const { return GetRdmaDeviceContext() != nullptr; }
 
   const std::vector<RdmaEndpoint>& GetRdmaEndpoints() const { return rdmaEps; }
 

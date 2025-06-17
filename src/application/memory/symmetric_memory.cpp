@@ -53,20 +53,16 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
   int worldSize = bootNet.GetWorldSize();
   int rank = bootNet.GetLocalRank();
 
-  application::MemoryRegion mr =
-      context.GetRdmaDeviceContext()->RegisterMemoryRegion(localPtr, size);
-
   SymmMemObj* cpuMemObj = new SymmMemObj();
   cpuMemObj->localPtr = localPtr;
   cpuMemObj->size = size;
-  cpuMemObj->lkey = mr.lkey;
 
   // Exchange pointers
   cpuMemObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
   bootNet.Allgather(&localPtr, cpuMemObj->peerPtrs, sizeof(uintptr_t));
-  cpuMemObj->peerPtrs[rank] = reinterpret_cast<uintptr_t>(cpuMemObj->localPtr);
+  // cpuMemObj->peerPtrs[rank] = reinterpret_cast<uintptr_t>(cpuMemObj->localPtr);
 
-  // Exchange ipc pointers
+  // PEP context: exchange ipc mem handles
   hipIpcMemHandle_t handle;
   HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&handle, localPtr));
   cpuMemObj->ipcMemHandles =
@@ -81,10 +77,16 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
                                           hipIpcMemLazyEnablePeerAccess));
   }
 
-  // Exchange rkeys
+  // Rdma context: set lkey and exchange rkeys
   cpuMemObj->peerRkeys = static_cast<uint32_t*>(calloc(worldSize, sizeof(uint32_t)));
-  bootNet.Allgather(&mr.rkey, cpuMemObj->peerRkeys, sizeof(uint32_t));
-  cpuMemObj->peerRkeys[rank] = mr.rkey;
+  cpuMemObj->peerRkeys[rank] = 0;
+  RdmaDeviceContext* rdmaDeviceContext = context.GetRdmaDeviceContext();
+  if (rdmaDeviceContext) {
+    application::MemoryRegion mr = rdmaDeviceContext->RegisterMemoryRegion(localPtr, size);
+    cpuMemObj->lkey = mr.lkey;
+    cpuMemObj->peerRkeys[rank] = mr.rkey;
+  }
+  bootNet.Allgather(&cpuMemObj->peerRkeys[rank], cpuMemObj->peerRkeys, sizeof(uint32_t));
 
   // Copy memory object to GPU memory, we need to access it from GPU directly
   SymmMemObj* gpuMemObj;
@@ -106,7 +108,8 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
 void SymmMemManager::DeRegisterSymmMemObj(void* localPtr) {
   if (memObjPool.find(localPtr) == memObjPool.end()) return;
 
-  context.GetRdmaDeviceContext()->DeRegisterMemoryRegion(localPtr);
+  RdmaDeviceContext* rdmaDeviceContext = context.GetRdmaDeviceContext();
+  if (rdmaDeviceContext) rdmaDeviceContext->DeRegisterMemoryRegion(localPtr);
 
   SymmMemObjPtr memObjPtr = memObjPool.at(localPtr);
   free(memObjPtr.cpu->peerPtrs);

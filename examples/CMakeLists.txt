@@ -1,9 +1,3 @@
-# add_executable(
-#     send_recv
-#     local_rdma_ops/send_recv.cpp
-# )
-# target_link_libraries(send_recv mori_application hip::host hip::device)
-
 add_executable(
     dist_read
     dist_rdma_ops/read.cpp
@@ -29,12 +23,6 @@ add_executable(
     local_rdma_ops/atomic_gpu.cpp
 )
 target_link_libraries(atomic_gpu mori_application hip::host hip::device)
-
-# add_executable(
-#     moe_all2all_dispatch
-#     moe_all2all/pplx-kernel-hip/internode_dispatch.cpp
-# )
-# target_link_libraries(moe_all2all_dispatch hip::host hip::device)
 
 add_executable(
     put_thread_allgather
@@ -67,18 +55,10 @@ add_executable(
 target_link_libraries(context mori_application hip::host hip::device)
 
 add_executable(
-    test_dispatch_combine
-    moe/test_dispatch_combine.cpp
-    moe/dispatch_combine_kernels/dispatch_combine.cpp
+    test_dispatch_combine_ops
+    ops/dispatch_combine/test_dispatch_combine.cpp
 )
-target_link_libraries(test_dispatch_combine mori_application mori_shmem hip::host hip::device)
-target_include_directories(test_dispatch_combine PUBLIC ${CMAKE_SOURCE_DIR}/examples/moe)
-
-add_executable(
-    p2p_bandwidth
-    benchmarks/p2p_bandwidth.cpp
-)
-target_link_libraries(p2p_bandwidth mori_application mori_shmem hip::host hip::device)
+target_link_libraries(test_dispatch_combine_ops mori_application mori_shmem mori_ops hip::host hip::device)
 
 add_executable(
     atomic_perf

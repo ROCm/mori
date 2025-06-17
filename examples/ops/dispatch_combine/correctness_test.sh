@@ -1,5 +1,5 @@
 thisScriptPath=$(dirname $0)
-execPath=$thisScriptPath/../../build/examples/test_dispatch_combine
+execPath=$thisScriptPath/../../../build/examples/test_dispatch_combine_ops
 echo $execPath
 # ------------------------------------------------------------------------------------------------ #
 #                                          Inra-Node Test                                          #

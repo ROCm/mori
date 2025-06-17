@@ -96,7 +96,7 @@ void testAtomicNonFetchThread() {
 
   // Finalize
   ShmemFree(buff);
-  ShmemMpiFinalize();
+  ShmemFinalize();
 }
 
 int main(int argc, char* argv[]) {
