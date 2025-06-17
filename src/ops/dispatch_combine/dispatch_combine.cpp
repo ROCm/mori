@@ -7,6 +7,7 @@
 
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem.hpp"
+#include "src/ops/dispatch_combine/internode.hpp"
 #include "src/ops/dispatch_combine/intranode.hpp"
 
 namespace mori {
@@ -532,7 +533,8 @@ void EpDispatchCombineHandle<T>::LaunchDispatch(KernelType kernelType, hipStream
        config.numExpertPerRank * config.warpNumPerBlock + config.numExpertPerRank) *
       sizeof(uint32_t);
   if (kernelType == KernelType::InterNode)
-    EpDispatchKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
+    EpDispatchInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(
+        GetEpDispatchCombineArgs(*this));
   else if (kernelType == KernelType::IntraNode) {
     EpDispatchIntraNodeKernel<T>
         <<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
@@ -547,7 +549,8 @@ void EpDispatchCombineHandle<T>::LaunchCombine(KernelType kernelType, hipStream_
   size_t sharedMemSize = config.warpNumPerBlock * config.numExpertPerToken * sizeof(T**);
 
   if (kernelType == KernelType::InterNode)
-    EpCombineKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
+    EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(
+        GetEpDispatchCombineArgs(*this));
   else if (kernelType == KernelType::IntraNode) {
     EpCombineIntraNodeKernel<T>
         <<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));

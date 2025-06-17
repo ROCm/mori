@@ -584,8 +584,8 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
                                          {0, 0, 0, 0}};
   int option_index = 0;
   int opt;
-  while ((opt = getopt_long(argc, argv, "d::m::r::t::w::b::n::h", long_options, &option_index)) !=
-         -1) {
+  while ((opt = getopt_long(argc, argv, "d::m::r::t::w::b::n::k::h", long_options,
+                            &option_index)) != -1) {
     if (opt == -1) break;
 
     switch (opt) {
@@ -634,14 +634,15 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
         testConfig.runConfig.repeat = std::stoi(optarg);
         break;
       case 'k':
-        if (strcmp(long_options[option_index].name, "intra") == 0) {
+        if (strcmp(optarg, "intra") == 0) {
           testConfig.runConfig.kernelType = KernelType::IntraNode;
-        } else if (strcmp(long_options[option_index].name, "inter") == 0) {
+        } else if (strcmp(optarg, "inter") == 0) {
           testConfig.runConfig.kernelType = KernelType::InterNode;
         } else {
-          printf("Unknown cmd: %s, must be 'inter' or 'intra'\n", optarg);
+          printf("Unknown kernel type: %s, must be 'inter' or 'intra'\n", optarg);
           assert(false);
         }
+        break;
       case 'h':
         printf("This is help message\n");
         break;
