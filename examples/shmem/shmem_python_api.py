@@ -48,8 +48,10 @@ def test_shmem(rank, num_node, gpu_per_node):
 
 
 if __name__ == "__main__":
-    num_node = 2
-    gpu_per_node = 4
+    gpu_per_node = os.environ.get('GPU_PER_NODE', None)
+    gpu_per_node = int(gpu_per_node) if gpu_per_node is not None else 8
+    num_node = int(os.environ['WORLD_SIZE'])
+
     world_size = num_node * gpu_per_node
     torch.multiprocessing.spawn(
         test_shmem,
@@ -60,5 +62,3 @@ if __name__ == "__main__":
         nprocs=gpu_per_node,
         join=True,
     )
-    # print(os.environ['RANK'] )
-    # test_shmem(num_node, gpu_per_node)

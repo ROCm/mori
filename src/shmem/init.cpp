@@ -79,9 +79,6 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
   states->bootStates->rank = states->bootStates->bootNet->GetLocalRank();
   states->bootStates->worldSize = states->bootStates->bootNet->GetWorldSize();
 
-  // TODO: use in-node rank
-  HIP_RUNTIME_CHECK(hipSetDevice(states->bootStates->rank));
-
   RdmaStatesInit();
   MemoryStatesInit();
   GpuStateInit();
