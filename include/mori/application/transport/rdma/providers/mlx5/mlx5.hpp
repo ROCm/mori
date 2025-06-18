@@ -70,7 +70,7 @@ class Mlx5QpContainer {
   ~Mlx5QpContainer();
 
   void ModifyRst2Init();
-  void ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle);
+  void ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr);
   void ModifyRtr2Rts(const RdmaEndpointHandle& local_handle);
 
   void* GetSqAddress();

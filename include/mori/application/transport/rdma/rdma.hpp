@@ -52,6 +52,7 @@ struct EthernetEndpointHandle {
 struct RdmaEndpointHandle {
   uint32_t psn{0};
   uint32_t qpn{0};
+  uint32_t portId{0};
   InfiniBandEndpointHandle ib;
   EthernetEndpointHandle eth;
 };
@@ -145,7 +146,9 @@ class RdmaDevice {
   virtual ~RdmaDevice();
 
   int GetDevicePortNum() const;
-  std::vector<int> GetActivePortIds() const;
+  std::vector<uint32_t> GetActivePortIds() const;
+  const ibv_device_attr_ex* GetDeviceAttr() const;
+  const std::unordered_map<uint32_t, std::unique_ptr<ibv_port_attr>>* GetPortAttrMap() const;
 
   std::string Name() const;
 
@@ -158,10 +161,11 @@ class RdmaDevice {
   ibv_context* defaultContext;
 
   std::unique_ptr<ibv_device_attr_ex> deviceAttr;
+  std::unordered_map<uint32_t, std::unique_ptr<ibv_port_attr>> portAttrMap;
 };
 
 using RdmaDeviceList = std::vector<RdmaDevice*>;
-using ActiveDevicePort = std::pair<RdmaDevice*, int>;
+using ActiveDevicePort = std::pair<RdmaDevice*, uint32_t>;
 using ActiveDevicePortList = std::vector<ActiveDevicePort>;
 
 ActiveDevicePortList GetActiveDevicePortList(const RdmaDeviceList&);
