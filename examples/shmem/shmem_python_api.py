@@ -14,13 +14,16 @@ def setup(local_rank, num_node, gpu_per_node):
 
     node_rank = int(os.environ["RANK"])
     global_rank = node_rank * gpu_per_node + local_rank
-    print(
-        f"before init process group, rank{local_rank}, env rank {os.environ["RANK"]}, world_size{world_size}, env worldsize {os.environ['WORLD_SIZE']}"
-        f" global_rank {global_rank}"
-    )
+    # print(
+    #     f"before init process group, rank{local_rank}",
+    #     f"env rank {os.environ["RANK"]}",
+    #     f"world_size{world_size},",
+    #     f"env worldsize {os.environ['WORLD_SIZE']}",
+    #     f" global_rank {global_rank}"
+    # )
 
     dist.init_process_group(
-        backend="cpu:gloo",#,cuda:nccl",
+        backend="cpu:gloo",  # ,cuda:nccl",
         rank=global_rank,
         world_size=world_size,
         # device_id=device,
@@ -47,9 +50,9 @@ def setup(local_rank, num_node, gpu_per_node):
     )
     op = mori.ops.EpDispatchCombineOp(config)
     op.dispatch_internode(
-        torch.ones(4, 7168).to(torch.bfloat16).to(device), 
-        torch.ones(4, 1).to(torch.float).to(device), 
-        torch.ones(4, 8).to(torch.uint32).to(device)
+        torch.ones(4, 7168).to(torch.bfloat16).to(device),
+        torch.ones(4, 1).to(torch.float).to(device),
+        torch.ones(4, 8).to(torch.uint32).to(device),
     )
     torch.cuda.synchronize()
 
@@ -65,9 +68,9 @@ def test_shmem(rank, num_node, gpu_per_node):
 
 
 if __name__ == "__main__":
-    gpu_per_node = os.environ.get('GPU_PER_NODE', None)
+    gpu_per_node = os.environ.get("GPU_PER_NODE", None)
     gpu_per_node = int(gpu_per_node) if gpu_per_node is not None else 8
-    num_node = int(os.environ['WORLD_SIZE'])
+    num_node = int(os.environ["WORLD_SIZE"])
 
     world_size = num_node * gpu_per_node
     torch.multiprocessing.spawn(

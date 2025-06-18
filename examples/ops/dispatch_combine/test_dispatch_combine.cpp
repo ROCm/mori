@@ -225,7 +225,9 @@ class EpDispatchCombineTestCase {
         uint32_t srcTokDispatchId = peSortToTokenIdxMapsVec[srcPe][peSortedId];
         uint32_t srcTokId = srcTokDispatchId / config.numExpertPerToken;
 
-        T* localTokBuf = handle.outTokenBuf + i * config.hiddenDim;
+        T* localTokBuf = handle.shmemOutTokMemObj->template GetAs<T*>() + i * config.hiddenDim;
+        // T* localTokBuf = handle.outTokenBuf + i * config.hiddenDim;
+
         T* srcTokBuf = reinterpret_cast<T*>(globalInpTokBufCpu) + srcPe * inpTokEleNum +
                        srcTokId * config.hiddenDim;
         srcPeCheckTokenNum[srcPe]++;
@@ -313,8 +315,8 @@ class EpDispatchCombineTestCase {
       handle.LaunchDispatch(runConfig.kernelType);
       SystemBarrier();
 
-      // CheckDispatchResult();
-      // SystemBarrier();
+      CheckDispatchResult();
+      SystemBarrier();
       if (handle.config.rank == 0) std::cout << "Test round " << i << " dispatch PASS" << std::endl;
 
       // CopyDispatchOutAsCombineInp();
