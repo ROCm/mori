@@ -292,7 +292,7 @@ void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle) {
 
   void* qpc = DEVX_ADDR_OF(init2rtr_qp_in, init2rtr_cmd_in, qpc);
   DEVX_SET(qpc, qpc, mtu, IBV_MTU_1024);
-  DEVX_SET(qpc, qpc, log_msg_max, 20);
+  DEVX_SET(qpc, qpc, log_msg_max, 30);
   DEVX_SET(qpc, qpc, remote_qpn, remote_handle.qpn);
   DEVX_SET(qpc, qpc, next_rcv_psn, remote_handle.psn);
   DEVX_SET(qpc, qpc, min_rnr_nak, 12);

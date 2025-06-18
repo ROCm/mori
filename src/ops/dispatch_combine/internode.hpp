@@ -25,6 +25,9 @@ __device__ void SyncIfDebugEnabled(const char* msg) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpDispatchInterNodeKernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
+// TODO: this mode only works correctly with MORI_DISABLE_P2P=1 set, figure out why
+#define ENABLE_RDMA_AGGREGATE_WRITE 0
+
 template <typename T>
 __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
@@ -68,31 +71,22 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
     uint32_t tokenId = i / config.numExpertPerToken;
     uint32_t tokenOffset = tokenId * config.hiddenDim;
 
-    // uint32_t peSortedId = myPe * MaxNumTokensToSendPerRank + peTokenIdx;
-    // uint32_t peSortedOffset = peSortedId * config.hiddenDim;
-
-    // core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + tokenOffset,
-    //  args.inpTokenBuf + tokenOffset, config.hiddenDim);
-    // if (laneId == 0) core::AcquireLock(args.lock);
-    // shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, peSortedOffset, args.shmemOutTokMemObj,
-    //                               tokenOffset, config.hiddenDim, destPe);
-    // if (laneId == 0) core::ReleaseLock(args.lock);
-
-    // uint32_t localPeSortedOffset = (destPe * MaxNumTokensToSendPerRank + peTokenIdx) *
-    // config.hiddenDim; uint32_t remotePeSortedOffset = (myPe * MaxNumTokensToSendPerRank +
-    // peTokenIdx) * config.hiddenDim; core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() +
-    // localPeSortedOffset,
-    //                args.inpTokenBuf + tokenOffset, config.hiddenDim);
-    // if (laneId == 0) core::AcquireLock(args.lock);
-    // shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, remotePeSortedOffset,
-    // args.shmemOutTokMemObj,
-    //                               localPeSortedOffset, config.hiddenDim, destPe);
-    // if (laneId == 0) core::ReleaseLock(args.lock);
-
+#if ENABLE_RDMA_AGGREGATE_WRITE == 1
     uint32_t peSortedId = destPe * MaxNumTokensToSendPerRank + peTokenIdx;
     uint32_t peSortedOffset = peSortedId * config.hiddenDim;
     core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + peSortedOffset,
                    args.inpTokenBuf + tokenOffset, config.hiddenDim);
+#else
+    uint32_t peSortedId = myPe * MaxNumTokensToSendPerRank + peTokenIdx;
+    uint32_t peSortedOffset = peSortedId * config.hiddenDim;
+
+    core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + tokenOffset,
+                   args.inpTokenBuf + tokenOffset, config.hiddenDim);
+    if (laneId == 0) core::AcquireLock(args.lock);
+    shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, peSortedOffset, args.shmemOutTokMemObj,
+                                  tokenOffset, config.hiddenDim, destPe);
+    if (laneId == 0) core::ReleaseLock(args.lock);
+#endif
   }
   if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
   SyncIfDebugEnabled("Dispatch kernel: finished send token");
@@ -107,11 +101,13 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
       // Add 1 so that when token number == 0, receiver side still know the signal is sent
       uint32_t numToken = core::AtomicLoadRelaxed(args.peTokenOffset + destPe);
+#if ENABLE_RDMA_AGGREGATE_WRITE == 1
       uint32_t localPeSortedOffset = destPe * MaxNumTokensToSendPerRank * config.hiddenDim;
       uint32_t remotePeSortedOffset = myPe * MaxNumTokensToSendPerRank * config.hiddenDim;
       shmem::ShmemPutTypeNbiThread<T>(args.shmemInpTokMemObj, remotePeSortedOffset,
                                       args.shmemOutTokMemObj, localPeSortedOffset,
                                       config.hiddenDim * numToken, destPe);
+#endif
       shmem::ShmemPutUint32ImmNbiThread(args.recvTokenNumMemObj, myPe * sizeof(uint32_t),
                                         numToken + 1, destPe);
       printf("myPe %d send %d tokens to %d\n", myPe, numToken, destPe);
