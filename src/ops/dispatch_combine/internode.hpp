@@ -9,7 +9,7 @@ namespace moe {
 
 #define MAX_GPUS_PER_NODE 8
 
-#define DEBUG 1
+#define DEBUG 0
 
 __device__ void SyncIfDebugEnabled(const char* msg) {
 #if DEBUG == 1
@@ -73,8 +73,10 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
     core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + tokenOffset,
                    args.inpTokenBuf + tokenOffset, config.hiddenDim);
+    if (laneId == 0) core::AcquireLock(args.lock);
     shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, peSortedOffset, args.shmemOutTokMemObj,
                                   tokenOffset, config.hiddenDim, destPe);
+    if (laneId == 0) core::ReleaseLock(args.lock);
   }
   if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
   SyncIfDebugEnabled("Dispatch kernel: finished send token");

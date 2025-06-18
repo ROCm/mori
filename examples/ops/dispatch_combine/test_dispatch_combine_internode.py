@@ -16,11 +16,11 @@ class EpDispatchCombineTestCase:
             rank=self.rank,
             world_size=self.world_size,
             hidden_dim=7168,
-            max_num_inp_token_per_rank=128,
+            max_num_inp_token_per_rank=32,
             num_experts_per_rank=16,
             num_experts_per_token=8,
-            warp_num_per_block=4,
-            block_num=64,
+            warp_num_per_block=8,
+            block_num=4,
         )
 
     def setup(self):

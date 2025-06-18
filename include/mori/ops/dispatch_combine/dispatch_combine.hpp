@@ -122,6 +122,8 @@ class EpDispatchCombineHandle {
   // Counter used for sorting by expert order
   uint32_t* exptTokenOffset{nullptr};
 
+  uint32_t* lock{nullptr};
+
   // Intra-node kernel parameters
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
@@ -151,6 +153,7 @@ struct EpDispatchCombineArgs {
   mori::application::SymmMemObjPtr outTokToExptMapMemObj;
   uint32_t* peTokenOffset{nullptr};
   uint32_t* exptTokenOffset{nullptr};
+  uint32_t* lock{nullptr};
   uint32_t* exptSortedToPeSortedBuf{nullptr};
   uint32_t* tokenIndicesToPeSortedBuf{nullptr};
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
@@ -172,6 +175,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<
   args.weightsBuf = handle.weightsBuf;
   args.peTokenOffset = handle.peTokenOffset;
   args.exptTokenOffset = handle.exptTokenOffset;
+  args.lock = handle.lock;
   args.shmemInpTokMemObj = handle.shmemInpTokMemObj;
   args.shmemOutTokMemObj = handle.shmemOutTokMemObj;
   args.shmemWeightsMemObj = handle.shmemWeightsMemObj;

@@ -398,6 +398,10 @@ void EpDispatchCombineHandle<T>::IntializeTokenNumSignalBuf() {
 
   HIP_RUNTIME_CHECK(hipMalloc(&totalRecvTokenNum, sizeof(uint32_t)));
   HIP_RUNTIME_CHECK(hipMemset(totalRecvTokenNum, 0, sizeof(uint32_t)));
+
+  HIP_RUNTIME_CHECK(
+      hipExtMallocWithFlags((void**)&lock, sizeof(uint32_t), hipDeviceMallocUncached));
+  HIP_RUNTIME_CHECK(hipMemset(lock, 0, sizeof(uint32_t)));
 }
 
 template <typename T>
@@ -405,6 +409,7 @@ void EpDispatchCombineHandle<T>::FinalizeTokenNumSignalBuf() {
   ShmemFree(recvTokenNumMemObj->localPtr);
   ShmemFree(sendTokenNumMemObj->localPtr);
   HIP_RUNTIME_CHECK(hipFree(totalRecvTokenNum));
+  HIP_RUNTIME_CHECK(hipFree(lock));
 }
 
 template <typename T>
