@@ -9,7 +9,7 @@ namespace moe {
 
 #define MAX_GPUS_PER_NODE 8
 
-#define DEBUG 0
+#define DEBUG 1
 
 __device__ void SyncIfDebugEnabled(const char* msg) {
 #if DEBUG == 1
@@ -68,15 +68,31 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
     uint32_t tokenId = i / config.numExpertPerToken;
     uint32_t tokenOffset = tokenId * config.hiddenDim;
 
-    uint32_t peSortedId = myPe * MaxNumTokensToSendPerRank + peTokenIdx;
-    uint32_t peSortedOffset = peSortedId * config.hiddenDim;
+    // uint32_t peSortedId = myPe * MaxNumTokensToSendPerRank + peTokenIdx;
+    // uint32_t peSortedOffset = peSortedId * config.hiddenDim;
 
-    core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + tokenOffset,
+    // core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + tokenOffset,
+    //  args.inpTokenBuf + tokenOffset, config.hiddenDim);
+    // if (laneId == 0) core::AcquireLock(args.lock);
+    // shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, peSortedOffset, args.shmemOutTokMemObj,
+    //                               tokenOffset, config.hiddenDim, destPe);
+    // if (laneId == 0) core::ReleaseLock(args.lock);
+
+    // uint32_t localPeSortedOffset = (destPe * MaxNumTokensToSendPerRank + peTokenIdx) *
+    // config.hiddenDim; uint32_t remotePeSortedOffset = (myPe * MaxNumTokensToSendPerRank +
+    // peTokenIdx) * config.hiddenDim; core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() +
+    // localPeSortedOffset,
+    //                args.inpTokenBuf + tokenOffset, config.hiddenDim);
+    // if (laneId == 0) core::AcquireLock(args.lock);
+    // shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, remotePeSortedOffset,
+    // args.shmemOutTokMemObj,
+    //                               localPeSortedOffset, config.hiddenDim, destPe);
+    // if (laneId == 0) core::ReleaseLock(args.lock);
+
+    uint32_t peSortedId = destPe * MaxNumTokensToSendPerRank + peTokenIdx;
+    uint32_t peSortedOffset = peSortedId * config.hiddenDim;
+    core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + peSortedOffset,
                    args.inpTokenBuf + tokenOffset, config.hiddenDim);
-    if (laneId == 0) core::AcquireLock(args.lock);
-    shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, peSortedOffset, args.shmemOutTokMemObj,
-                                  tokenOffset, config.hiddenDim, destPe);
-    if (laneId == 0) core::ReleaseLock(args.lock);
   }
   if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
   SyncIfDebugEnabled("Dispatch kernel: finished send token");
@@ -90,10 +106,15 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
       shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
 
       // Add 1 so that when token number == 0, receiver side still know the signal is sent
-      uint32_t numTokenSignal = core::AtomicLoadRelaxed(args.peTokenOffset + destPe) + 1;
+      uint32_t numToken = core::AtomicLoadRelaxed(args.peTokenOffset + destPe);
+      uint32_t localPeSortedOffset = destPe * MaxNumTokensToSendPerRank * config.hiddenDim;
+      uint32_t remotePeSortedOffset = myPe * MaxNumTokensToSendPerRank * config.hiddenDim;
+      shmem::ShmemPutTypeNbiThread<T>(args.shmemInpTokMemObj, remotePeSortedOffset,
+                                      args.shmemOutTokMemObj, localPeSortedOffset,
+                                      config.hiddenDim * numToken, destPe);
       shmem::ShmemPutUint32ImmNbiThread(args.recvTokenNumMemObj, myPe * sizeof(uint32_t),
-                                        numTokenSignal, destPe);
-      printf("myPe %d send %d tokens to %d\n", myPe, numTokenSignal - 1, destPe);
+                                        numToken + 1, destPe);
+      printf("myPe %d send %d tokens to %d\n", myPe, numToken, destPe);
     }
   }
   SyncIfDebugEnabled("Dispatch kernel: finish sending tok2expt mapping & num token signal");

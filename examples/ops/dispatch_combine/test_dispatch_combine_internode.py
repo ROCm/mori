@@ -20,7 +20,7 @@ class EpDispatchCombineTestCase:
             num_experts_per_rank=16,
             num_experts_per_token=8,
             warp_num_per_block=8,
-            block_num=4,
+            block_num=32,
         )
 
     def setup(self):
