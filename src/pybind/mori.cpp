@@ -84,6 +84,25 @@ torch::Tensor GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle<T>& handl
 }
 
 template <typename T>
+torch::Tensor GetDispatchSenderTokenIdMap(mori::moe::EpDispatchCombineHandle<T>& handle) {
+  auto options =
+      torch::TensorOptions().dtype(mori::GetTorchDataType<uint32_t>()).device(torch::kCUDA);
+  torch::Tensor tensor =
+      torch::from_blob(handle.tokenIndicesToPeSortedBuf,
+                       {int(handle.curRankNumToken * handle.config.numExpertPerToken)}, options);
+  return tensor;
+}
+
+template <typename T>
+torch::Tensor GetDispatchReceiverTokenIdMap(mori::moe::EpDispatchCombineHandle<T>& handle) {
+  auto options =
+      torch::TensorOptions().dtype(mori::GetTorchDataType<uint32_t>()).device(torch::kCUDA);
+  torch::Tensor tensor =
+      torch::from_blob(handle.exptSortedToPeSortedBuf, {int(*handle.exptTokenOffset)}, options);
+  return tensor;
+}
+
+template <typename T>
 void DeclareEpDispatchCombineHandle(pybind11::module& m, const std::string& typeStr) {
   std::string className = std::string("EpDispatchCombineHandle") + typeStr;
   pybind11::class_<mori::moe::EpDispatchCombineHandle<T>>(m, className.c_str())
@@ -101,6 +120,12 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m, const std::string& type
 
   funcName = std::string("get_dispatch_src_token_pos_") + typeStr;
   m.def(funcName.c_str(), &GetDispatchSrcTokenId<T>);
+
+  funcName = std::string("get_dispatch_sender_token_id_map_") + typeStr;
+  m.def(funcName.c_str(), &GetDispatchSenderTokenIdMap<T>);
+
+  funcName = std::string("get_dispatch_receiver_token_id_map_") + typeStr;
+  m.def(funcName.c_str(), &GetDispatchReceiverTokenIdMap<T>);
 }
 
 }  // namespace

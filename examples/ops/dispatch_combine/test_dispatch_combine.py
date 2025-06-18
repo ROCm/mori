@@ -156,9 +156,12 @@ class EpDispatchCombineTestCase:
             weights_list,
             input_list,
         ) = test_data
-        dispatch_output, dispatch_weights, dispatch_indicies, dispatch_recv_num_token = op.dispatch(
-            input, weights, indicies
-        )
+        (
+            dispatch_output,
+            dispatch_weights,
+            dispatch_indicies,
+            dispatch_recv_num_token,
+        ) = op.dispatch(input, weights, indicies)
         torch.cuda.synchronize()
 
         src_token_pos = op.get_dispatch_src_token_pos()

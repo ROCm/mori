@@ -14,6 +14,8 @@ class EpDispatchCombineConfig:
     max_num_inp_token_per_rank: int
     num_experts_per_rank: int
     num_experts_per_token: int
+    warp_num_per_block: int = 4
+    block_num: int = 256
 
 
 def _cpp_dispatch_combine_factory(data_type: torch.dtype, entity_name):
@@ -40,8 +42,8 @@ class EpDispatchCombineOp:
                 max_num_inp_token_per_rank=config.max_num_inp_token_per_rank,
                 num_experts_per_rank=config.num_experts_per_rank,
                 num_experts_per_token=config.num_experts_per_token,
-                warp_num_per_block=4,  # config.warp_num_per_block,
-                block_num=256,  # config.block_num,
+                warp_num_per_block=config.warp_num_per_block,
+                block_num=config.block_num,
             )
         )
 
@@ -56,6 +58,13 @@ class EpDispatchCombineOp:
         )
         self._get_dispatch_src_token_pos_func = _cpp_dispatch_combine_factory(
             config.data_type, "get_dispatch_src_token_pos_"
+        )
+
+        self._get_dispatch_sender_token_id_map_func = _cpp_dispatch_combine_factory(
+            config.data_type, "get_dispatch_sender_token_id_map_"
+        )
+        self._get_dispatch_receiver_token_id_map_func = _cpp_dispatch_combine_factory(
+            config.data_type, "get_dispatch_receiver_token_id_map_"
         )
 
     def dispatch(
@@ -81,7 +90,7 @@ class EpDispatchCombineOp:
         )
         self._reset_func(self._handle)
         return output
-    
+
     def dispatch_internode(
         self, input: torch.Tensor, weights: torch.Tensor, indicies: torch.Tensor
     ):
@@ -106,5 +115,14 @@ class EpDispatchCombineOp:
         self._reset_func(self._handle)
         return output
 
+    def reset(self):
+        self._reset_func(self._handle)
+
     def get_dispatch_src_token_pos(self):
         return self._get_dispatch_src_token_pos_func(self._handle)
+
+    def get_dispatch_sender_token_id_map(self):
+        return self._get_dispatch_sender_token_id_map_func(self._handle)
+
+    def get_dispatch_receiver_token_id_map(self):
+        return self._get_dispatch_receiver_token_id_map_func(self._handle)
