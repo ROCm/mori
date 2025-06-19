@@ -78,6 +78,14 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
           args.tokenIndicies[srcTokId * config.numExpertPerToken + laneId];
     }
 
+    // Write scales
+    assert(config.numScales <= warpSize);
+    if (laneId < config.numScales) {
+      args.shmemScalesMemObj->template GetAs<uint8_t*>(
+          destPe)[destTokId * config.numScales + laneId] =
+          args.scalesBuf[srcTokId * config.numScales + laneId];
+    }
+
     uint32_t srcTokOffset = srcTokId * config.hiddenDim;
     uint32_t destTokOffset = destTokId * config.hiddenDim;
     core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,

@@ -99,6 +99,10 @@ class EpDispatchCombineTestCase {
     int weightsBufSize = config.MaxNumTokensToSendPerRank() * sizeof(float);
     HIP_RUNTIME_CHECK(hipMalloc(&weightsBuf, weightsBufSize));
     HIP_RUNTIME_CHECK(hipMemset(weightsBuf, 0, weightsBufSize));
+
+    int scalesBufSize = config.MaxNumTokensToSendPerRank() * config.numScales * sizeof(uint8_t);
+    HIP_RUNTIME_CHECK(hipMalloc(&scalesBuf, scalesBufSize));
+    HIP_RUNTIME_CHECK(hipMemset(scalesBuf, 0, scalesBufSize));
   }
 
   ~EpDispatchCombineTestCase() {
@@ -106,6 +110,7 @@ class EpDispatchCombineTestCase {
     HIP_RUNTIME_CHECK(hipFree(outTokBuf));
     HIP_RUNTIME_CHECK(hipFree(tokenIndicies));
     HIP_RUNTIME_CHECK(hipFree(weightsBuf));
+    HIP_RUNTIME_CHECK(hipFree(scalesBuf));
     free(inpTokBufCpu);
   }
 
@@ -125,7 +130,7 @@ class EpDispatchCombineTestCase {
     }
     RandomInitializeWeights();
     RandomInitializeToken();
-    handle.PrepareInference(inpTokBuf, outTokBuf, weightsBuf, tokenIndicies, numToken);
+    handle.PrepareInference(inpTokBuf, outTokBuf, weightsBuf, scalesBuf, tokenIndicies, numToken);
     // PrintDispatch();
     // PrintDispatchStats();
   }
@@ -507,6 +512,7 @@ class EpDispatchCombineTestCase {
   T* inpTokBufCpu{nullptr};
   T* outTokBuf{nullptr};
   float* weightsBuf{nullptr};
+  uint8_t* scalesBuf{nullptr};
   uint32_t* tokenIndicies{nullptr};
   int numToken{-1};
   EpDispatchCombineHandle<T>& handle;
@@ -574,6 +580,7 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
                                          {"cmd", required_argument, NULL, 0},
                                          {"data_type", required_argument, NULL, 0},
                                          {"hdim", optional_argument, NULL, 'd'},
+                                         {"num_scales", optional_argument, NULL, 's'},
                                          {"max_tokens", optional_argument, NULL, 'm'},
                                          {"expert_per_rank", optional_argument, NULL, 'r'},
                                          {"expert_per_token", optional_argument, NULL, 't'},
@@ -584,7 +591,7 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
                                          {0, 0, 0, 0}};
   int option_index = 0;
   int opt;
-  while ((opt = getopt_long(argc, argv, "d::m::r::t::w::b::n::h", long_options, &option_index)) !=
+  while ((opt = getopt_long(argc, argv, "d::m::r::t::w::b::n::s::h", long_options, &option_index)) !=
          -1) {
     if (opt == -1) break;
 
@@ -629,6 +636,9 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
         break;
       case 'b':
         testConfig.config.blockNum = std::stoi(optarg);
+        break;
+      case 's':
+        testConfig.config.numScales = std::stoi(optarg);
         break;
       case 'n':
         testConfig.runConfig.repeat = std::stoi(optarg);

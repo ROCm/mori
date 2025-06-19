@@ -1,5 +1,7 @@
 #pragma once
 
+#include <hip/hip_fp8.h>
+
 #include <sstream>
 
 #include "mori/application/application.hpp"
@@ -16,6 +18,7 @@ struct EpDispatchCombineConfig {
   int rank{0};
   int worldSize{0};
   int hiddenDim{4096};
+  int numScales{32};
   int maxNumInpTokenPerRank{128};
   int numExpertPerRank{1};
   int numExpertPerToken{2};
@@ -46,6 +49,16 @@ class EpDispatchCombineHandle {
     this->inpTokenBuf = input;
     this->outTokenBuf = output;
     this->weightsBuf = weights;
+    this->tokenIndicies = tokenIndicies;
+    this->curRankNumToken = numToken;
+  }
+
+  void PrepareInference(T* input, T* output, float* weights, void* scales, uint32_t* tokenIndicies,
+                        size_t numToken) {
+    this->inpTokenBuf = input;
+    this->outTokenBuf = output;
+    this->weightsBuf = weights;
+    this->scalesBuf = static_cast<uint8_t*>(scales);
     this->tokenIndicies = tokenIndicies;
     this->curRankNumToken = numToken;
   }
@@ -89,6 +102,7 @@ class EpDispatchCombineHandle {
   T* inpTokenBuf{nullptr};
   T* outTokenBuf{nullptr};
   float* weightsBuf{nullptr};
+  uint8_t* scalesBuf{nullptr};
 
   // Registered buffers used for shmem ops, could also be returned to user
   mori::application::SymmMemObjPtr shmemInpTokMemObj;
@@ -96,6 +110,7 @@ class EpDispatchCombineHandle {
 
   // Registered buffer used for weights and indicies
   mori::application::SymmMemObjPtr shmemWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemScalesMemObj;
   mori::application::SymmMemObjPtr shmemIndiciesMemObj;
 
   // Record number of tokens that will be received from other PE
@@ -139,9 +154,11 @@ struct EpDispatchCombineArgs {
   T* inpTokenBuf{nullptr};
   T* outTokenBuf{nullptr};
   float* weightsBuf{nullptr};
+  uint8_t* scalesBuf{nullptr};
   mori::application::SymmMemObjPtr shmemInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
   mori::application::SymmMemObjPtr shmemWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemScalesMemObj;
   mori::application::SymmMemObjPtr shmemIndiciesMemObj;
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
   mori::application::SymmMemObjPtr sendTokenNumMemObj;
@@ -170,11 +187,13 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<
   args.inpTokenBuf = handle.inpTokenBuf;
   args.outTokenBuf = handle.outTokenBuf;
   args.weightsBuf = handle.weightsBuf;
+  args.scalesBuf = handle.scalesBuf;
   args.peTokenOffset = handle.peTokenOffset;
   args.exptTokenOffset = handle.exptTokenOffset;
   args.shmemInpTokMemObj = handle.shmemInpTokMemObj;
   args.shmemOutTokMemObj = handle.shmemOutTokMemObj;
   args.shmemWeightsMemObj = handle.shmemWeightsMemObj;
+  args.shmemScalesMemObj = handle.shmemScalesMemObj;
   args.shmemIndiciesMemObj = handle.shmemIndiciesMemObj;
   args.recvTokenNumMemObj = handle.recvTokenNumMemObj;
   args.sendTokenNumMemObj = handle.sendTokenNumMemObj;
