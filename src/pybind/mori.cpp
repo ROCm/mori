@@ -35,12 +35,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> LaunchDis
       torch::TensorOptions().dtype(mori::GetTorchDataType<T>()).device(torch::kCUDA));
 
   torch::Tensor outWeights = torch::from_blob(
-      handle.shmemWeightsMemObj->Get(),
+      handle.shmemOutWeightsMemObj->Get(),
       {handle.config.MaxNumTokensToRecvPerRank(), handle.config.numExpertPerToken},
       torch::TensorOptions().dtype(mori::GetTorchDataType<float>()).device(torch::kCUDA));
 
   torch::Tensor outIndicies = torch::from_blob(
-      handle.shmemIndiciesMemObj->Get(),
+      handle.shmemOutIndiciesMemObj->Get(),
       {handle.config.MaxNumTokensToRecvPerRank(), handle.config.numExpertPerToken},
       torch::TensorOptions().dtype(mori::GetTorchDataType<uint32_t>()).device(torch::kCUDA));
 
@@ -84,21 +84,21 @@ torch::Tensor GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle<T>& handl
 }
 
 template <typename T>
-torch::Tensor GetDispatchSenderTokenIdMap(mori::moe::EpDispatchCombineHandle<T>& handle) {
+torch::Tensor GetDispatchSenderTokenIdxMap(mori::moe::EpDispatchCombineHandle<T>& handle) {
   auto options =
       torch::TensorOptions().dtype(mori::GetTorchDataType<uint32_t>()).device(torch::kCUDA);
   torch::Tensor tensor =
-      torch::from_blob(handle.tokenIndicesToPeSortedBuf,
+      torch::from_blob(handle.dispSenderIdxMap,
                        {int(handle.curRankNumToken * handle.config.numExpertPerToken)}, options);
   return tensor;
 }
 
 template <typename T>
-torch::Tensor GetDispatchReceiverTokenIdMap(mori::moe::EpDispatchCombineHandle<T>& handle) {
+torch::Tensor GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle<T>& handle) {
   auto options =
       torch::TensorOptions().dtype(mori::GetTorchDataType<uint32_t>()).device(torch::kCUDA);
   torch::Tensor tensor =
-      torch::from_blob(handle.exptSortedToPeSortedBuf, {int(*handle.exptTokenOffset)}, options);
+      torch::from_blob(handle.dispReceiverIdxMap, {int(*handle.localPeTokenCounter)}, options);
   return tensor;
 }
 
@@ -125,11 +125,11 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m, const std::string& type
   funcName = std::string("get_dispatch_src_token_pos_") + typeStr;
   m.def(funcName.c_str(), &GetDispatchSrcTokenId<T>);
 
-  funcName = std::string("get_dispatch_sender_token_id_map_") + typeStr;
-  m.def(funcName.c_str(), &GetDispatchSenderTokenIdMap<T>);
+  funcName = std::string("get_dispatch_sender_token_idx_map_") + typeStr;
+  m.def(funcName.c_str(), &GetDispatchSenderTokenIdxMap<T>);
 
-  funcName = std::string("get_dispatch_receiver_token_id_map_") + typeStr;
-  m.def(funcName.c_str(), &GetDispatchReceiverTokenIdMap<T>);
+  funcName = std::string("get_dispatch_receiver_token_idx_map_") + typeStr;
+  m.def(funcName.c_str(), &GetDispatchReceiverTokenIdxMap<T>);
 }
 
 }  // namespace

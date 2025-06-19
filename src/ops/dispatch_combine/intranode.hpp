@@ -58,7 +58,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     if (laneId == 0) {
       // decide token id in dest pe
       destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<uint32_t*>(destPe), 1);
-      atomicAdd(args.peTokenOffset + destPe, 1);
+      atomicAdd(args.destPeTokenCounter + destPe, 1);
       args.dispDestTokIdMap[i] = destPe * maxNumOutTokenPerRank + destTokId;
 
       // TODO: use a switch to control the writing of this buffer, should only turn on for testing
@@ -69,10 +69,10 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
     // Write weights and indicies
     if (laneId < config.numExpertPerToken) {
-      args.shmemWeightsMemObj->template GetAs<float*>(
+      args.shmemOutWeightsMemObj->template GetAs<float*>(
           destPe)[destTokId * config.numExpertPerToken + laneId] =
           args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
-      args.shmemIndiciesMemObj->template GetAs<uint32_t*>(
+      args.shmemOutIndiciesMemObj->template GetAs<uint32_t*>(
           destPe)[destTokId * config.numExpertPerToken + laneId] =
           args.tokenIndicies[srcTokId * config.numExpertPerToken + laneId];
     }
@@ -91,7 +91,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
 
       // Add 1 so that when token number == 0, receiver side still know the signal is sent
-      uint32_t numTokenSignal = core::AtomicLoadRelaxed(args.peTokenOffset + destPe) + 1;
+      uint32_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       core::AtomicStoreRelaxedSystem(
           args.recvTokenNumMemObj->template GetAs<uint32_t*>(destPe) + myPe, numTokenSignal);
     }

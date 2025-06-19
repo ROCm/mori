@@ -69,11 +69,11 @@ class EpDispatchCombineOp:
         self._get_cur_rank_num_token = _cpp_dispatch_combine_factory(
             config.data_type, "get_cur_rank_num_token_"
         )
-        self._get_dispatch_sender_token_id_map_func = _cpp_dispatch_combine_factory(
-            config.data_type, "get_dispatch_sender_token_id_map_"
+        self._get_dispatch_sender_token_idx_map_func = _cpp_dispatch_combine_factory(
+            config.data_type, "get_dispatch_sender_token_idx_map_"
         )
-        self._get_dispatch_receiver_token_id_map_func = _cpp_dispatch_combine_factory(
-            config.data_type, "get_dispatch_receiver_token_id_map_"
+        self._get_dispatch_receiver_token_idx_map_func = _cpp_dispatch_combine_factory(
+            config.data_type, "get_dispatch_receiver_token_idx_map_"
         )
 
     def dispatch(
@@ -140,10 +140,10 @@ class EpDispatchCombineOp:
         if self.config.kernel_type.value == EpDispatchCombineKernelType.IntraNode.value:
             return self._get_dispatch_src_token_pos_func(self._handle)
 
-        dispatch_sender_token_id_map = self._get_dispatch_sender_token_id_map_func(
+        dispatch_sender_token_id_map = self._get_dispatch_sender_token_idx_map_func(
             self._handle
         )
-        dispatch_receiver_token_id_map = self._get_dispatch_receiver_token_id_map_func(
+        dispatch_receiver_token_id_map = self._get_dispatch_receiver_token_idx_map_func(
             self._handle
         )
 

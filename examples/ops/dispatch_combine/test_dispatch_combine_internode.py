@@ -168,6 +168,12 @@ class EpDispatchCombineTestCase:
             src_pe = src_token_id // max_num_token_to_send_per_rank
             src_tok_id = src_token_id % max_num_token_to_send_per_rank
             assert torch.equal(dispatch_output[i], all_rank_input[src_pe][src_tok_id])
+            assert torch.equal(
+                dispatch_weights[i], all_rank_weights[src_pe][src_tok_id]
+            )
+            assert torch.equal(
+                dispatch_indicies[i], all_rank_indicies[src_pe][src_tok_id]
+            )
 
         if self.config.rank == 0:
             print("Dispatch Pass")
@@ -186,7 +192,7 @@ def test_dispatch_combine(local_rank, num_node, gpu_per_node):
     global_rank = node_rank * gpu_per_node + local_rank
 
     test_case = EpDispatchCombineTestCase(
-        global_rank, gpu_per_node, world_size, torch.bfloat16
+        global_rank, gpu_per_node, world_size, torch.float8_e4m3fnuz  # torch.bfloat16
     )
     test_case.setup()
     test_case.test_dispatch_combine()

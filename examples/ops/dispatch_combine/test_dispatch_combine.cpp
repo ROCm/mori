@@ -146,14 +146,14 @@ class EpDispatchCombineTestCase {
     MPI_Allgather(tokenIndicesCpu, tokenIndiciesSize, MPI_CHAR, globalTokIndiciesCpu,
                   tokenIndiciesSize, MPI_CHAR, MPI_COMM_WORLD);
 
-    void* tokenIndicesToPeSortedBufCpu = malloc(tokenIndiciesSize);
-    HIP_RUNTIME_CHECK(hipMemcpy(tokenIndicesToPeSortedBufCpu, handle.tokenIndicesToPeSortedBuf,
-                                tokenIndiciesSize, hipMemcpyDeviceToHost));
+    void* dispSenderIdxMapCpu = malloc(tokenIndiciesSize);
+    HIP_RUNTIME_CHECK(hipMemcpy(dispSenderIdxMapCpu, handle.dispSenderIdxMap, tokenIndiciesSize,
+                                hipMemcpyDeviceToHost));
 
-    uint32_t* globalTokenIndicesToPeSortedBufCpu =
+    uint32_t* globaldispSenderIdxMapCpu =
         reinterpret_cast<uint32_t*>(malloc(config.worldSize * tokenIndiciesSize));
-    MPI_Allgather(tokenIndicesToPeSortedBufCpu, tokenIndiciesSize, MPI_CHAR,
-                  globalTokenIndicesToPeSortedBufCpu, tokenIndiciesSize, MPI_CHAR, MPI_COMM_WORLD);
+    MPI_Allgather(dispSenderIdxMapCpu, tokenIndiciesSize, MPI_CHAR, globaldispSenderIdxMapCpu,
+                  tokenIndiciesSize, MPI_CHAR, MPI_COMM_WORLD);
 
     // Collect token num from all ranks
     std::vector<uint32_t> globalTokenNum(config.worldSize);
@@ -210,7 +210,7 @@ class EpDispatchCombineTestCase {
         uint32_t peTokenNum = globalTokenNum[i];
         for (int j = 0; j < peTokenNum * config.numExpertPerToken; j++) {
           uint32_t peSortedId =
-              globalTokenIndicesToPeSortedBufCpu[i * config.MaxNumTokensToSendPerRank() + j];
+              globaldispSenderIdxMapCpu[i * config.MaxNumTokensToSendPerRank() + j];
           assert(peSortToTokenIdxMapsVec[i].find(peSortedId) == peSortToTokenIdxMapsVec[i].end());
           peSortToTokenIdxMapsVec[i].insert({peSortedId, j});
         }
@@ -218,7 +218,7 @@ class EpDispatchCombineTestCase {
 
       std::vector<uint32_t> srcPeCheckTokenNum(config.worldSize, 0);
       for (int i = 0; i < totalRecvNumToken; i++) {
-        uint32_t peSortedId = handle.exptSortedToPeSortedBuf[i];
+        uint32_t peSortedId = handle.dispReceiverIdxMap[i];
         uint32_t srcPe = peSortedId / config.MaxNumTokensToSendPerRank();
         peSortedId = peSortedId - srcPe * config.MaxNumTokensToSendPerRank() +
                      config.rank * config.MaxNumTokensToSendPerRank();

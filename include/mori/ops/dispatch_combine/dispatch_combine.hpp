@@ -68,9 +68,6 @@ class EpDispatchCombineHandle {
   void IntializeTokenNumSignalBuf();
   void FinalizeTokenNumSignalBuf();
 
-  void IntializeTokToExptBuf();
-  void FinalizeTokToExptBuf();
-
   void IntializeOrderMapBuf();
   void FinalizeOrderMapBuf();
 
@@ -92,13 +89,15 @@ class EpDispatchCombineHandle {
   T* outTokenBuf{nullptr};
   float* weightsBuf{nullptr};
 
-  // Registered buffers used for shmem ops, could also be returned to user
+  // Registered buffers for tokens, shmemOutTokMemObj will be returned to user as output
   mori::application::SymmMemObjPtr shmemInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
 
   // Registered buffer used for weights and indicies
-  mori::application::SymmMemObjPtr shmemWeightsMemObj;
-  mori::application::SymmMemObjPtr shmemIndiciesMemObj;
+  mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemOutWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemInpIndiciesMemObj;
+  mori::application::SymmMemObjPtr shmemOutIndiciesMemObj;
 
   // Record number of tokens that will be received from other PE
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
@@ -108,22 +107,19 @@ class EpDispatchCombineHandle {
   uint32_t* dispatchGridBarrier{nullptr};
   uint32_t* combineGridBarrier{nullptr};
 
-  // Buffers for token to expert mapping, only used for shmem ops at dispatch phase
-  mori::application::SymmMemObjPtr inpTokToExptMapMemObj;
-  mori::application::SymmMemObjPtr outTokToExptMapMemObj;
+  // Map dispatch input token index to staging buffer index, saved at dispatch send phase and used
+  // at combine recv phase
+  uint32_t* dispSenderIdxMap{nullptr};
+  // Map dispatch staging buffer index to output buffer index, saved at dispatch recv phase and used
+  // at combine send phase
+  uint32_t* dispReceiverIdxMap{nullptr};
 
-  // Recover from expert sorted order to pe sorted order, filled at dispatch recv phase and used at
-  // combine send phase
-  uint32_t* exptSortedToPeSortedBuf{nullptr};
-  // Recover from pe sorted order to original order, filled at dispatch send phase and used at
-  // combine recv phase
-  uint32_t* tokenIndicesToPeSortedBuf{nullptr};
+  // Count the number of tokens sent to destination pe
+  uint32_t* destPeTokenCounter{nullptr};
+  // Count the number of tokens sent to local pe
+  uint32_t* localPeTokenCounter{nullptr};
 
-  // Counter used for sorting by PE order
-  uint32_t* peTokenOffset{nullptr};
-  // Counter used for sorting by expert order
-  uint32_t* exptTokenOffset{nullptr};
-
+  // Lock for guarding shmem ops
   uint32_t* lock{nullptr};
 
   // Intra-node kernel parameters
@@ -145,19 +141,19 @@ struct EpDispatchCombineArgs {
   float* weightsBuf{nullptr};
   mori::application::SymmMemObjPtr shmemInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
-  mori::application::SymmMemObjPtr shmemWeightsMemObj;
-  mori::application::SymmMemObjPtr shmemIndiciesMemObj;
+  mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemOutWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemInpIndiciesMemObj;
+  mori::application::SymmMemObjPtr shmemOutIndiciesMemObj;
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
   mori::application::SymmMemObjPtr sendTokenNumMemObj;
   uint32_t* dispatchGridBarrier{nullptr};
   uint32_t* combineGridBarrier{nullptr};
-  mori::application::SymmMemObjPtr inpTokToExptMapMemObj;
-  mori::application::SymmMemObjPtr outTokToExptMapMemObj;
-  uint32_t* peTokenOffset{nullptr};
-  uint32_t* exptTokenOffset{nullptr};
+  uint32_t* destPeTokenCounter{nullptr};
+  uint32_t* localPeTokenCounter{nullptr};
   uint32_t* lock{nullptr};
-  uint32_t* exptSortedToPeSortedBuf{nullptr};
-  uint32_t* tokenIndicesToPeSortedBuf{nullptr};
+  uint32_t* dispReceiverIdxMap{nullptr};
+  uint32_t* dispSenderIdxMap{nullptr};
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
   uint32_t* dispDestTokIdMap{nullptr};
@@ -175,21 +171,21 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<
   args.inpTokenBuf = handle.inpTokenBuf;
   args.outTokenBuf = handle.outTokenBuf;
   args.weightsBuf = handle.weightsBuf;
-  args.peTokenOffset = handle.peTokenOffset;
-  args.exptTokenOffset = handle.exptTokenOffset;
+  args.destPeTokenCounter = handle.destPeTokenCounter;
+  args.localPeTokenCounter = handle.localPeTokenCounter;
   args.lock = handle.lock;
   args.shmemInpTokMemObj = handle.shmemInpTokMemObj;
   args.shmemOutTokMemObj = handle.shmemOutTokMemObj;
-  args.shmemWeightsMemObj = handle.shmemWeightsMemObj;
-  args.shmemIndiciesMemObj = handle.shmemIndiciesMemObj;
+  args.shmemInpWeightsMemObj = handle.shmemInpWeightsMemObj;
+  args.shmemOutWeightsMemObj = handle.shmemOutWeightsMemObj;
+  args.shmemInpIndiciesMemObj = handle.shmemInpIndiciesMemObj;
+  args.shmemOutIndiciesMemObj = handle.shmemOutIndiciesMemObj;
   args.recvTokenNumMemObj = handle.recvTokenNumMemObj;
   args.sendTokenNumMemObj = handle.sendTokenNumMemObj;
   args.dispatchGridBarrier = handle.dispatchGridBarrier;
   args.combineGridBarrier = handle.combineGridBarrier;
-  args.inpTokToExptMapMemObj = handle.inpTokToExptMapMemObj;
-  args.outTokToExptMapMemObj = handle.outTokToExptMapMemObj;
-  args.exptSortedToPeSortedBuf = handle.exptSortedToPeSortedBuf;
-  args.tokenIndicesToPeSortedBuf = handle.tokenIndicesToPeSortedBuf;
+  args.dispReceiverIdxMap = handle.dispReceiverIdxMap;
+  args.dispSenderIdxMap = handle.dispSenderIdxMap;
   args.dispTokOffsetMemObj = handle.dispTokOffsetMemObj;
   args.dispTokIdToSrcTokIdMemObj = handle.dispTokIdToSrcTokIdMemObj;
   args.dispDestTokIdMap = handle.dispDestTokIdMap;
