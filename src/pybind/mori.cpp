@@ -102,6 +102,7 @@ torch::Tensor GetDispatchReceiverTokenIdMap(mori::moe::EpDispatchCombineHandle<T
   return tensor;
 }
 
+// Defines handle for different template arguments, we use typeStr to avoid function name shadow
 template <typename T>
 void DeclareEpDispatchCombineHandle(pybind11::module& m, const std::string& typeStr) {
   std::string className = std::string("EpDispatchCombineHandle") + typeStr;
@@ -117,6 +118,9 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m, const std::string& type
 
   funcName = std::string("launch_reset_") + typeStr;
   m.def(funcName.c_str(), &LaunchReset<T>);
+
+  funcName = std::string("get_cur_rank_num_token_") + typeStr;
+  m.def(funcName.c_str(), &mori::moe::EpDispatchCombineHandle<T>::GetCurRankNumToken);
 
   funcName = std::string("get_dispatch_src_token_pos_") + typeStr;
   m.def(funcName.c_str(), &GetDispatchSrcTokenId<T>);
@@ -149,6 +153,11 @@ int64_t ShmemNPes() { return mori::shmem::ShmemNPes(); }
 namespace mori {
 
 void RegisterMoriOps(py::module_& m) {
+  pybind11::enum_<mori::moe::KernelType>(m, "EpDispatchCombineKernelType")
+      .value("IntraNode", mori::moe::KernelType::IntraNode)
+      .value("InterNode", mori::moe::KernelType::InterNode)
+      .export_values();
+
   pybind11::class_<mori::moe::EpDispatchCombineConfig>(m, "EpDispatchCombineConfig")
       .def(pybind11::init<int, int, int, int, int, int, int, int>(), py::arg("rank") = 0,
            py::arg("world_size") = 0, py::arg("hidden_dim") = 0,

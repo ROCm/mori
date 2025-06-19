@@ -59,6 +59,8 @@ class EpDispatchCombineHandle {
   void LaunchCombine(KernelType, hipStream_t = 0);
   void LaunchReset(hipStream_t = 0);
 
+  size_t GetCurRankNumToken() const { return curRankNumToken; }
+
  private:
   void IntializeShmemBuf();
   void FinalizeShmemBuf();

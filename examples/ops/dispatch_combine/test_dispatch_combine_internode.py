@@ -16,11 +16,12 @@ class EpDispatchCombineTestCase:
             rank=self.rank,
             world_size=self.world_size,
             hidden_dim=7168,
-            max_num_inp_token_per_rank=32,
+            max_num_inp_token_per_rank=128,
             num_experts_per_rank=16,
             num_experts_per_token=8,
             warp_num_per_block=8,
-            block_num=4,
+            block_num=16,
+            kernel_type=mori.ops.EpDispatchCombineKernelType.InterNode,
         )
 
     def setup(self):
@@ -152,58 +153,24 @@ class EpDispatchCombineTestCase:
             dispatch_weights,
             dispatch_indicies,
             dispatch_recv_num_token,
-        ) = op.dispatch_internode(
+        ) = op.dispatch(
             all_rank_input[self.rank],
             all_rank_weights[self.rank],
             all_rank_indicies[self.rank],
         )
         torch.cuda.synchronize()
 
-        dispatch_sender_token_id_map = op.get_dispatch_sender_token_id_map()
-        dispatch_receiver_token_id_map = op.get_dispatch_receiver_token_id_map()
-
+        src_token_pos = op.get_dispatch_src_token_pos().tolist()
         max_num_token_to_send_per_rank = (
             self.config.max_num_inp_token_per_rank * self.config.num_experts_per_token
         )
-        all_rank_sender_map = self._allgather_with_token_num_padding(
-            dispatch_sender_token_id_map.cpu().to(torch.int64),
-            self.config.max_num_inp_token_per_rank * self.config.num_experts_per_token,
-        )
-
-        reverse_sender_token_id_map = {}
-        for r in range(self.world_size):
-            for i, mapped_id in enumerate(
-                all_rank_sender_map[r].tolist()[
-                    : all_rank_num_token.tolist()[r] * self.config.num_experts_per_token
-                ]
-            ):
-                dest_pe = mapped_id // max_num_token_to_send_per_rank
-                if dest_pe != self.rank:
-                    continue
-                mapped_id = (
-                    mapped_id
-                    - dest_pe * max_num_token_to_send_per_rank
-                    + r * max_num_token_to_send_per_rank
-                )
-                reverse_sender_token_id_map[mapped_id] = (
-                    i // self.config.num_experts_per_token
-                )
-
-        for i, recv_mapped_id in enumerate(dispatch_receiver_token_id_map.tolist()):
-            assert recv_mapped_id in reverse_sender_token_id_map
-            src_pe = recv_mapped_id // max_num_token_to_send_per_rank
-            src_tok_id = reverse_sender_token_id_map[recv_mapped_id]
+        for i, src_token_id in enumerate(src_token_pos):
+            src_pe = src_token_id // max_num_token_to_send_per_rank
+            src_tok_id = src_token_id % max_num_token_to_send_per_rank
             assert torch.equal(dispatch_output[i], all_rank_input[src_pe][src_tok_id])
-            # print(dispatch_output[i], all_rank_input[src_pe][src_tok_id])
-        assert len(dispatch_receiver_token_id_map.tolist()) == len(
-            reverse_sender_token_id_map
-        )
 
         if self.config.rank == 0:
             print("Dispatch Pass")
-
-        op.reset()
-        torch.cuda.synchronize()
 
     def test_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
