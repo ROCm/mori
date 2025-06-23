@@ -79,18 +79,6 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     }
 
     // Write scales
-    // assert(config.scaleDim <= warpSize);
-    // if (laneId < config.scaleDim) {
-    //   if (args.curScaleTypeSize == sizeof(float)) {
-    //     args.shmemScalesMemObj->template GetAs<float*>(
-    //         destPe)[destTokId * config.scaleDim + laneId] =
-    //         ((float*)args.scalesBuf)[srcTokId * config.scaleDim + laneId];
-    //   } else {
-    //     args.shmemScalesMemObj->template GetAs<uint8_t*>(
-    //         destPe)[destTokId * config.scaleDim + laneId] =
-    //         ((uint8_t*)args.scalesBuf)[srcTokId * config.scaleDim + laneId];
-    //   }
-    // }
     uint32_t destScaleOffset = destTokId * config.scaleDim * args.curScaleTypeSize;
     uint32_t srcScaleOffset = srcTokId * config.scaleDim * args.curScaleTypeSize;
     core::WarpCopy(args.shmemScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
