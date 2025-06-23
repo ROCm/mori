@@ -10,6 +10,36 @@ namespace moe {
 #define MAX_GPUS_PER_NODE 8
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                                          BarrierKernel                                         */
+/* ---------------------------------------------------------------------------------------------- */
+template <typename T>
+inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T> args) {
+  int thdId = threadIdx.x;
+  int laneId = threadIdx.x & (warpSize - 1);
+  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
+
+  int warpNum = blockDim.x / warpSize;
+  int globalWarpNum = gridDim.x * warpNum;
+
+  if (laneId == 0) atomicAdd(args.combineGridBarrier, 1);
+
+  if (globalThdId < args.config.worldSize) {
+    // Set remote flag after all copies are done
+    shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
+    core::AtomicStoreRelaxedSystem(
+        args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(globalThdId) + args.config.rank,
+        args.crossDeviceBarrierFlag);
+  }
+
+  uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
+  if (thdId < args.config.worldSize) {
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != args.crossDeviceBarrierFlag) {
+    }
+  }
+  __syncthreads();
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                    EpDispatchIntraNodeKernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>
@@ -138,7 +168,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
                    args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
   }
   // Make sure copy on all GPUs are finished
-  CrossDeviceBarrierKernel(args);
+  CrossDeviceBarrierIntraNodeKernel(args);
 
   extern __shared__ char sharedMem[];
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;

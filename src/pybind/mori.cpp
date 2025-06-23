@@ -31,17 +31,17 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> LaunchDis
 
   torch::Tensor out = torch::from_blob(
       handle.shmemOutTokMemObj->Get(),
-      {handle.config.MaxNumTokensToRecvPerRank(), handle.config.hiddenDim},
+      {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
       torch::TensorOptions().dtype(mori::GetTorchDataType<T>()).device(torch::kCUDA));
 
   torch::Tensor outWeights = torch::from_blob(
       handle.shmemOutWeightsMemObj->Get(),
-      {handle.config.MaxNumTokensToRecvPerRank(), handle.config.numExpertPerToken},
+      {handle.config.MaxNumTokensToRecv(), handle.config.numExpertPerToken},
       torch::TensorOptions().dtype(mori::GetTorchDataType<float>()).device(torch::kCUDA));
 
   torch::Tensor outIndicies = torch::from_blob(
       handle.shmemOutIndiciesMemObj->Get(),
-      {handle.config.MaxNumTokensToRecvPerRank(), handle.config.numExpertPerToken},
+      {handle.config.MaxNumTokensToRecv(), handle.config.numExpertPerToken},
       torch::TensorOptions().dtype(mori::GetTorchDataType<uint32_t>()).device(torch::kCUDA));
 
   torch::Tensor totalRecvTokenNum = torch::from_blob(

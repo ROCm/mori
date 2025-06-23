@@ -85,8 +85,10 @@ struct RdmaEndpoint {
   __device__ __host__ core::ProviderType GetProviderType() {
     if (vendorId == Mellanox) {
       return core::ProviderType::MLX5;
+    } else {
+      printf("unknown vendorId %d", vendorId);
+      assert(false);
     }
-    assert(false);
     return core::ProviderType::Unknown;
   }
 };

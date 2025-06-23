@@ -140,36 +140,6 @@ __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
 }
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                          BarrierKernel                                         */
-/* ---------------------------------------------------------------------------------------------- */
-template <typename T>
-inline __device__ void CrossDeviceBarrierKernel(EpDispatchCombineArgs<T> args) {
-  int thdId = threadIdx.x;
-  int laneId = threadIdx.x & (warpSize - 1);
-  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
-
-  int warpNum = blockDim.x / warpSize;
-  int globalWarpNum = gridDim.x * warpNum;
-
-  if (laneId == 0) atomicAdd(args.combineGridBarrier, 1);
-
-  if (globalThdId < args.config.worldSize) {
-    // Set remote flag after all copies are done
-    shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
-    AtomicStoreRelaxedSystem(
-        args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(globalThdId) + args.config.rank,
-        args.crossDeviceBarrierFlag);
-  }
-
-  uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
-  if (thdId < args.config.worldSize) {
-    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != args.crossDeviceBarrierFlag) {
-    }
-  }
-  __syncthreads();
-}
-
-/* ---------------------------------------------------------------------------------------------- */
 /*                                     EpDispatchCombineHandle                                    */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>
@@ -199,17 +169,16 @@ mori::application::SymmMemObjPtr ShmemMallocAndReturnMemObjPtr(size_t size, unsi
 
 template <typename T>
 void EpDispatchCombineHandle<T>::IntializeShmemBuf() {
-  size_t maxTokenSize = config.MaxNumTokensToRecvPerRank() * config.hiddenDim * sizeof(T);
+  size_t maxTokenSize = config.MaxNumTokensToRecv() * config.hiddenDim * sizeof(T);
   shmemInpTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
   shmemOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
 
-  size_t maxWeightSize =
-      config.MaxNumTokensToRecvPerRank() * config.numExpertPerToken * sizeof(float);
+  size_t maxWeightSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(float);
   shmemInpWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
   shmemOutWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
 
   size_t maxIndiciesSize =
-      config.MaxNumTokensToRecvPerRank() * config.numExpertPerToken * sizeof(uint32_t);
+      config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(uint32_t);
   shmemInpIndiciesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndiciesSize, hipDeviceMallocUncached);
   shmemOutIndiciesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndiciesSize, hipDeviceMallocUncached);
 }
@@ -342,7 +311,8 @@ void EpDispatchCombineHandle<T>::LaunchCombine(KernelType kernelType, hipStream_
   size_t sharedMemSize = config.warpNumPerBlock * config.numExpertPerToken * sizeof(T**);
 
   if (kernelType == KernelType::InterNode)
-    EpCombineKernel<<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
+    EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(
+        GetEpDispatchCombineArgs(*this));
   else if (kernelType == KernelType::IntraNode) {
     EpCombineIntraNodeKernel<T>
         <<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));

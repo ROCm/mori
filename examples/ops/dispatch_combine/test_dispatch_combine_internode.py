@@ -19,8 +19,8 @@ class EpDispatchCombineTestCase:
             max_num_inp_token_per_rank=128,
             num_experts_per_rank=16,
             num_experts_per_token=8,
-            warp_num_per_block=8,
-            block_num=16,
+            warp_num_per_block=4,
+            block_num=32,
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNode,
         )
 
@@ -94,7 +94,6 @@ class EpDispatchCombineTestCase:
             generator=self.rng,
             device=self.device,
         )
-        print(num_token, num_token.sum())
 
         # gen indicies
         all_rank_indicies = []
@@ -164,6 +163,7 @@ class EpDispatchCombineTestCase:
         max_num_token_to_send_per_rank = (
             self.config.max_num_inp_token_per_rank * self.config.num_experts_per_token
         )
+        print(f"rank {self.rank} recv {len(src_token_pos)} tokens")
         for i, src_token_id in enumerate(src_token_pos):
             src_pe = src_token_id // max_num_token_to_send_per_rank
             src_tok_id = src_token_id % max_num_token_to_send_per_rank
@@ -177,6 +177,33 @@ class EpDispatchCombineTestCase:
 
         if self.config.rank == 0:
             print("Dispatch Pass")
+
+        combine_output = op.combine(
+            dispatch_output,
+            all_rank_weights[self.rank],
+            all_rank_indicies[self.rank],
+        )
+        torch.cuda.synchronize()
+
+        for i in range(all_rank_num_token[self.rank]):
+            pes = [
+                (idx // self.config.num_experts_per_rank)
+                for idx in all_rank_indicies[self.rank][i].cpu().tolist()
+            ]
+            unique_pes = len(set(pes))
+
+            got, expected = combine_output[i], (
+                all_rank_input[self.rank][i].to(torch.float32) * unique_pes
+            ).to(self.config.data_type)
+
+            ok = torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
+            if not ok:
+                print(self.rank, "got: ", got)
+                print(self.rank, "expected: ", expected)
+                assert False
+
+        if self.config.rank == 0:
+            print("Combine Pass")
 
     def test_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
@@ -192,7 +219,7 @@ def test_dispatch_combine(local_rank, num_node, gpu_per_node):
     global_rank = node_rank * gpu_per_node + local_rank
 
     test_case = EpDispatchCombineTestCase(
-        global_rank, gpu_per_node, world_size, torch.float8_e4m3fnuz  # torch.bfloat16
+        global_rank, gpu_per_node, world_size, torch.bfloat16  # torch.float8_e4m3fnuz
     )
     test_case.setup()
     test_case.test_dispatch_combine()
