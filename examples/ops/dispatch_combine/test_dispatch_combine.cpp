@@ -100,7 +100,7 @@ class EpDispatchCombineTestCase {
     HIP_RUNTIME_CHECK(hipMalloc(&weightsBuf, weightsBufSize));
     HIP_RUNTIME_CHECK(hipMemset(weightsBuf, 0, weightsBufSize));
 
-    int scalesBufSize = config.MaxNumTokensToSendPerRank() * config.numScales * sizeof(uint8_t);
+    int scalesBufSize = config.MaxNumTokensToSendPerRank() * config.numScales * scaleTypeSize;
     HIP_RUNTIME_CHECK(hipMalloc(&scalesBuf, scalesBufSize));
     HIP_RUNTIME_CHECK(hipMemset(scalesBuf, 0, scalesBufSize));
   }
@@ -130,7 +130,8 @@ class EpDispatchCombineTestCase {
     }
     RandomInitializeWeights();
     RandomInitializeToken();
-    handle.PrepareInference(inpTokBuf, outTokBuf, weightsBuf, scalesBuf, tokenIndicies, numToken);
+    handle.PrepareInference(inpTokBuf, outTokBuf, weightsBuf, scalesBuf, tokenIndicies, numToken,
+                            scaleTypeSize);
     // PrintDispatch();
     // PrintDispatchStats();
   }
@@ -512,9 +513,10 @@ class EpDispatchCombineTestCase {
   T* inpTokBufCpu{nullptr};
   T* outTokBuf{nullptr};
   float* weightsBuf{nullptr};
-  uint8_t* scalesBuf{nullptr};
+  void* scalesBuf{nullptr};
   uint32_t* tokenIndicies{nullptr};
   int numToken{-1};
+  int scaleTypeSize{-1};
   EpDispatchCombineHandle<T>& handle;
   RunConfig runConfig;
 };
@@ -581,6 +583,7 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
                                          {"data_type", required_argument, NULL, 0},
                                          {"hdim", optional_argument, NULL, 'd'},
                                          {"num_scales", optional_argument, NULL, 's'},
+                                         {"scale_type", optional_argument, NULL, 0},
                                          {"max_tokens", optional_argument, NULL, 'm'},
                                          {"expert_per_rank", optional_argument, NULL, 'r'},
                                          {"expert_per_token", optional_argument, NULL, 't'},
@@ -614,7 +617,16 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
           } else if (strcmp(optarg, "fp8") == 0) {
             testConfig.dataType = DataType::FP8_E4M3;
           } else {
-            printf("Unknown cmd: %s, must be 'test' or 'bench'\n", optarg);
+            printf("Unknown data type: %s, must be 'fp32', 'bf16' or 'fp8'\n", optarg);
+            assert(false);
+          }
+        } else if (strcmp(long_options[option_index].name, "scale_type") == 0) {
+          if (strcmp(optarg, "fp32") == 0) {
+            testConfig.config.scaleTypeSize = 4;
+          } else if (strcmp(optarg, "fp8") == 0) {
+            testConfig.config.scaleTypeSize = 1;
+          } else {
+            printf("Unknown scale type: %s, must be 'fp8' or 'fp32'\n", optarg);
             assert(false);
           }
         }

@@ -19,6 +19,7 @@ struct EpDispatchCombineConfig {
   int worldSize{0};
   int hiddenDim{4096};
   int numScales{32};
+  int scaleTypeSize{1};
   int maxNumInpTokenPerRank{128};
   int numExpertPerRank{1};
   int numExpertPerToken{2};
@@ -54,13 +55,15 @@ class EpDispatchCombineHandle {
   }
 
   void PrepareInference(T* input, T* output, float* weights, void* scales, uint32_t* tokenIndicies,
-                        size_t numToken) {
+                        size_t numToken, size_t scaleTypeSize) {
     this->inpTokenBuf = input;
     this->outTokenBuf = output;
     this->weightsBuf = weights;
-    this->scalesBuf = static_cast<uint8_t*>(scales);
+    this->scalesBuf = scales;
     this->tokenIndicies = tokenIndicies;
     this->curRankNumToken = numToken;
+    this->curScaleTypeSize = scaleTypeSize;
+    // std::cout << "curScaleTypeSize " << this->curScaleTypeSize << std::endl;
   }
 
   void LaunchIntraNodeDispatch(hipStream_t = 0);
@@ -89,8 +92,9 @@ class EpDispatchCombineHandle {
   void FinalizeBarrier();
 
  public:
-  // Number of tokens on this rank, updated at each round of inference
+  // Number of tokens on this rank and size of scale data type, updated at each round of inference
   size_t curRankNumToken{0};
+  size_t curScaleTypeSize{0};
 
  public:
   // Config
@@ -102,7 +106,7 @@ class EpDispatchCombineHandle {
   T* inpTokenBuf{nullptr};
   T* outTokenBuf{nullptr};
   float* weightsBuf{nullptr};
-  uint8_t* scalesBuf{nullptr};
+  void* scalesBuf{nullptr};
 
   // Registered buffers used for shmem ops, could also be returned to user
   mori::application::SymmMemObjPtr shmemInpTokMemObj;
@@ -150,11 +154,12 @@ template <typename T>
 struct EpDispatchCombineArgs {
   EpDispatchCombineConfig config;
   size_t curRankNumToken{0};
+  size_t curScaleTypeSize{0};
   uint32_t* tokenIndicies{nullptr};
   T* inpTokenBuf{nullptr};
   T* outTokenBuf{nullptr};
   float* weightsBuf{nullptr};
-  uint8_t* scalesBuf{nullptr};
+  void* scalesBuf{nullptr};
   mori::application::SymmMemObjPtr shmemInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
   mori::application::SymmMemObjPtr shmemWeightsMemObj;
@@ -183,6 +188,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<
   EpDispatchCombineArgs<T> args;
   args.config = handle.config;
   args.curRankNumToken = handle.curRankNumToken;
+  args.curScaleTypeSize = handle.curScaleTypeSize;
   args.tokenIndicies = handle.tokenIndicies;
   args.inpTokenBuf = handle.inpTokenBuf;
   args.outTokenBuf = handle.outTokenBuf;

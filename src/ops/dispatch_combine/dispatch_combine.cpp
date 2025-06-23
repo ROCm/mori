@@ -379,7 +379,7 @@ void EpDispatchCombineHandle<T>::IntializeShmemBuf() {
   assert(shmemWeightsMemObj.IsValid());
 
   size_t maxScaleSize =
-      config.MaxNumTokensToRecvPerRank() * config.numScales * sizeof(float);
+      config.MaxNumTokensToRecvPerRank() * config.numScales * config.scaleTypeSize;
   void* shmemScalesBuf = ShmemExtMallocWithFlags(maxScaleSize, hipDeviceMallocUncached);
   HIP_RUNTIME_CHECK(hipMemset(shmemScalesBuf, 0, maxScaleSize));
   shmemScalesMemObj = ShmemQueryMemObjPtr(shmemScalesBuf);

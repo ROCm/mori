@@ -81,9 +81,15 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     // Write scales
     assert(config.numScales <= warpSize);
     if (laneId < config.numScales) {
-      args.shmemScalesMemObj->template GetAs<uint8_t*>(
-          destPe)[destTokId * config.numScales + laneId] =
-          args.scalesBuf[srcTokId * config.numScales + laneId];
+      if (args.curScaleTypeSize == sizeof(float)) {
+        args.shmemScalesMemObj->template GetAs<float*>(
+            destPe)[destTokId * config.numScales + laneId] =
+            ((float*)args.scalesBuf)[srcTokId * config.numScales + laneId];
+      } else {
+        args.shmemScalesMemObj->template GetAs<uint8_t*>(
+            destPe)[destTokId * config.numScales + laneId] =
+            ((uint8_t*)args.scalesBuf)[srcTokId * config.numScales + laneId];
+      }
     }
 
     uint32_t srcTokOffset = srcTokId * config.hiddenDim;

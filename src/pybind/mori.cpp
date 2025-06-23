@@ -28,7 +28,7 @@ LaunchIntraNodeDispatch(mori::moe::EpDispatchCombineHandle<T>& handle, const tor
 
   handle.PrepareInference(reinterpret_cast<T*>(input.data_ptr()), nullptr,
                           weights.data_ptr<float>(), scales.data_ptr(),
-                          topkIds.data_ptr<uint32_t>(), input.size(0));
+                          topkIds.data_ptr<uint32_t>(), input.size(0), scales.element_size());
   handle.LaunchIntraNodeDispatch(at::cuda::getCurrentHIPStream());
 
   torch::Tensor out = torch::from_blob(
@@ -132,15 +132,16 @@ namespace mori {
 
 void RegisterMoriOps(py::module_& m) {
   pybind11::class_<mori::moe::EpDispatchCombineConfig>(m, "EpDispatchCombineConfig")
-      .def(pybind11::init<int, int, int, int, int, int, int, int, int>(), py::arg("rank") = 0,
+      .def(pybind11::init<int, int, int, int, int, int, int, int, int, int>(), py::arg("rank") = 0,
            py::arg("world_size") = 0, py::arg("hidden_dim") = 0, py::arg("num_scales") = 0,
-           py::arg("max_num_inp_token_per_rank") = 0, py::arg("num_experts_per_rank") = 0,
-           py::arg("num_experts_per_token") = 0, py::arg("warp_num_per_block") = 0,
-           py::arg("block_num") = 0)
+           py::arg("scale_type_size") = 0, py::arg("max_num_inp_token_per_rank") = 0,
+           py::arg("num_experts_per_rank") = 0, py::arg("num_experts_per_token") = 0,
+           py::arg("warp_num_per_block") = 0, py::arg("block_num") = 0)
       .def_readonly("rank", &mori::moe::EpDispatchCombineConfig::rank)
       .def_readonly("world_size", &mori::moe::EpDispatchCombineConfig::worldSize)
       .def_readonly("hidden_dim", &mori::moe::EpDispatchCombineConfig::hiddenDim)
       .def_readonly("num_scales", &mori::moe::EpDispatchCombineConfig::numScales)
+      .def_readonly("scale_type_size", &mori::moe::EpDispatchCombineConfig::scaleTypeSize)
       .def_readonly("max_num_inp_token_per_rank",
                     &mori::moe::EpDispatchCombineConfig::maxNumInpTokenPerRank)
       .def_readonly("num_experts_per_rank", &mori::moe::EpDispatchCombineConfig::numExpertPerRank)
