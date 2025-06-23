@@ -15,7 +15,7 @@ class EpDispatchCombineTestCase:
             rank=self.rank,
             world_size=self.world_size,
             hidden_dim=7168,
-            num_scales=32,
+            scale_dim=32,
             scale_type_size=4,
             max_num_inp_token_per_rank=512,
             num_experts_per_rank=32,
@@ -127,7 +127,7 @@ class EpDispatchCombineTestCase:
         # gen scales
         scales_fp32 = torch.rand(
             num_tokens,
-            self.config.num_scales,
+            self.config.scale_dim,
             dtype=torch.float32,
             generator=self.rng,
             device=self.device,

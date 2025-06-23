@@ -100,7 +100,7 @@ class EpDispatchCombineTestCase {
     HIP_RUNTIME_CHECK(hipMalloc(&weightsBuf, weightsBufSize));
     HIP_RUNTIME_CHECK(hipMemset(weightsBuf, 0, weightsBufSize));
 
-    int scalesBufSize = config.MaxNumTokensToSendPerRank() * config.numScales * scaleTypeSize;
+    int scalesBufSize = config.MaxNumTokensToSendPerRank() * config.scaleDim * scaleTypeSize;
     HIP_RUNTIME_CHECK(hipMalloc(&scalesBuf, scalesBufSize));
     HIP_RUNTIME_CHECK(hipMemset(scalesBuf, 0, scalesBufSize));
   }
@@ -513,7 +513,7 @@ class EpDispatchCombineTestCase {
   T* inpTokBufCpu{nullptr};
   T* outTokBuf{nullptr};
   float* weightsBuf{nullptr};
-  void* scalesBuf{nullptr};
+  uint8_t* scalesBuf{nullptr};
   uint32_t* tokenIndicies{nullptr};
   int numToken{-1};
   int scaleTypeSize{-1};
@@ -582,7 +582,7 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
                                          {"cmd", required_argument, NULL, 0},
                                          {"data_type", required_argument, NULL, 0},
                                          {"hdim", optional_argument, NULL, 'd'},
-                                         {"num_scales", optional_argument, NULL, 's'},
+                                         {"scale_dim", optional_argument, NULL, 's'},
                                          {"scale_type", optional_argument, NULL, 0},
                                          {"max_tokens", optional_argument, NULL, 'm'},
                                          {"expert_per_rank", optional_argument, NULL, 'r'},
@@ -650,7 +650,7 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
         testConfig.config.blockNum = std::stoi(optarg);
         break;
       case 's':
-        testConfig.config.numScales = std::stoi(optarg);
+        testConfig.config.scaleDim = std::stoi(optarg);
         break;
       case 'n':
         testConfig.runConfig.repeat = std::stoi(optarg);

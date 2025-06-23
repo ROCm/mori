@@ -16,7 +16,7 @@ struct EpDispatchCombineConfig {
   int rank{0};
   int worldSize{0};
   int hiddenDim{4096};
-  int numScales{32};
+  int scaleDim{32};
   int scaleTypeSize{1};
   int maxNumInpTokenPerRank{128};
   int numExpertPerRank{1};
@@ -52,8 +52,8 @@ class EpDispatchCombineHandle {
     this->curRankNumToken = numToken;
   }
 
-  void PrepareInference(T* input, T* output, float* weights, void* scales, uint32_t* tokenIndicies,
-                        size_t numToken, size_t scaleTypeSize) {
+  void PrepareInference(T* input, T* output, float* weights, uint8_t* scales,
+                        uint32_t* tokenIndicies, size_t numToken, size_t scaleTypeSize) {
     this->inpTokenBuf = input;
     this->outTokenBuf = output;
     this->weightsBuf = weights;
@@ -104,7 +104,7 @@ class EpDispatchCombineHandle {
   T* inpTokenBuf{nullptr};
   T* outTokenBuf{nullptr};
   float* weightsBuf{nullptr};
-  void* scalesBuf{nullptr};
+  uint8_t* scalesBuf{nullptr};
 
   // Registered buffers used for shmem ops, could also be returned to user
   mori::application::SymmMemObjPtr shmemInpTokMemObj;
@@ -157,7 +157,7 @@ struct EpDispatchCombineArgs {
   T* inpTokenBuf{nullptr};
   T* outTokenBuf{nullptr};
   float* weightsBuf{nullptr};
-  void* scalesBuf{nullptr};
+  uint8_t* scalesBuf{nullptr};
   mori::application::SymmMemObjPtr shmemInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
   mori::application::SymmMemObjPtr shmemWeightsMemObj;
