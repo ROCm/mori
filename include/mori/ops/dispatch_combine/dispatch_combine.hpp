@@ -1,7 +1,5 @@
 #pragma once
 
-#include <hip/hip_fp8.h>
-
 #include <sstream>
 
 #include "mori/application/application.hpp"
