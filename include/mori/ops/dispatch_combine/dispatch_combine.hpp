@@ -12,10 +12,14 @@ enum KernelType {
   InterNode = 1,
 };
 
+using index_t = int32_t;
+
 struct EpDispatchCombineConfig {
   int rank{0};
   int worldSize{0};
   int hiddenDim{4096};
+  int scaleDim{32};
+  int scaleTypeSize{1};
   int maxNumInpTokenPerRank{128};
   int numExpertPerRank{1};
   int numExpertPerToken{2};
@@ -45,11 +49,21 @@ class EpDispatchCombineHandle {
   EpDispatchCombineHandle(EpDispatchCombineConfig config);
   ~EpDispatchCombineHandle();
 
-  void PrepareInference(T* input, T* output, float* weights, uint32_t* tokenIndicies,
+  void PrepareInference(T* input, T* output, float* weights, index_t* tokenIndicies,
                         size_t numToken) {
     this->inpTokenBuf = input;
     this->outTokenBuf = output;
     this->weightsBuf = weights;
+    this->tokenIndicies = tokenIndicies;
+    this->curRankNumToken = numToken;
+  }
+
+  void PrepareInference(T* input, T* output, float* weights, uint8_t* scales,
+                        index_t* tokenIndicies, size_t numToken) {
+    this->inpTokenBuf = input;
+    this->outTokenBuf = output;
+    this->weightsBuf = weights;
+    this->scalesBuf = scales;
     this->tokenIndicies = tokenIndicies;
     this->curRankNumToken = numToken;
   }
@@ -79,27 +93,29 @@ class EpDispatchCombineHandle {
   void FinalizeBarrier();
 
  public:
-  // Number of tokens on this rank, updated at each round of inference
+  // Number of tokens on this rank and size of scale data type, updated at each round of inference
   size_t curRankNumToken{0};
 
  public:
   // Config
   EpDispatchCombineConfig config;
   // Routed expert indices for tokens
-  uint32_t* tokenIndicies{nullptr};
+  index_t* tokenIndicies{nullptr};
 
   // Kernel input/output buffer
   T* inpTokenBuf{nullptr};
   T* outTokenBuf{nullptr};
   float* weightsBuf{nullptr};
+  uint8_t* scalesBuf{nullptr};
 
   // Registered buffers for tokens, shmemOutTokMemObj will be returned to user as output
   mori::application::SymmMemObjPtr shmemInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
 
-  // Registered buffer used for weights and indicies
+  // Registered buffer used for weights, indicies and scales
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
   mori::application::SymmMemObjPtr shmemOutWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemScalesMemObj;
   mori::application::SymmMemObjPtr shmemInpIndiciesMemObj;
   mori::application::SymmMemObjPtr shmemOutIndiciesMemObj;
 
@@ -113,15 +129,15 @@ class EpDispatchCombineHandle {
 
   // Map dispatch input token index to staging buffer index, saved at dispatch send phase and used
   // at combine recv phase
-  uint32_t* dispSenderIdxMap{nullptr};
+  index_t* dispSenderIdxMap{nullptr};
   // Map dispatch staging buffer index to output buffer index, saved at dispatch recv phase and used
   // at combine send phase
-  uint32_t* dispReceiverIdxMap{nullptr};
+  index_t* dispReceiverIdxMap{nullptr};
 
   // Count the number of tokens sent to destination pe
-  uint32_t* destPeTokenCounter{nullptr};
+  index_t* destPeTokenCounter{nullptr};
   // Count the number of tokens sent to local pe
-  uint32_t* localPeTokenCounter{nullptr};
+  index_t* localPeTokenCounter{nullptr};
 
   // Lock for guarding shmem ops
   uint32_t* lock{nullptr};
@@ -129,8 +145,8 @@ class EpDispatchCombineHandle {
   // Intra-node kernel parameters
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
-  uint32_t* dispDestTokIdMap{nullptr};
-  size_t* totalRecvTokenNum{nullptr};
+  index_t* dispDestTokIdMap{nullptr};
+  index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint32_t crossDeviceBarrierFlag{1};
 };
@@ -139,29 +155,31 @@ template <typename T>
 struct EpDispatchCombineArgs {
   EpDispatchCombineConfig config;
   size_t curRankNumToken{0};
-  uint32_t* tokenIndicies{nullptr};
+  index_t* tokenIndicies{nullptr};
   T* inpTokenBuf{nullptr};
   T* outTokenBuf{nullptr};
   float* weightsBuf{nullptr};
+  uint8_t* scalesBuf{nullptr};
   mori::application::SymmMemObjPtr shmemInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
   mori::application::SymmMemObjPtr shmemOutWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemScalesMemObj;
   mori::application::SymmMemObjPtr shmemInpIndiciesMemObj;
   mori::application::SymmMemObjPtr shmemOutIndiciesMemObj;
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
   mori::application::SymmMemObjPtr sendTokenNumMemObj;
   uint32_t* dispatchGridBarrier{nullptr};
   uint32_t* combineGridBarrier{nullptr};
-  uint32_t* destPeTokenCounter{nullptr};
-  uint32_t* localPeTokenCounter{nullptr};
+  index_t* destPeTokenCounter{nullptr};
+  index_t* localPeTokenCounter{nullptr};
   uint32_t* lock{nullptr};
-  uint32_t* dispReceiverIdxMap{nullptr};
-  uint32_t* dispSenderIdxMap{nullptr};
+  index_t* dispReceiverIdxMap{nullptr};
+  index_t* dispSenderIdxMap{nullptr};
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
-  uint32_t* dispDestTokIdMap{nullptr};
-  size_t* totalRecvTokenNum{nullptr};
+  index_t* dispDestTokIdMap{nullptr};
+  index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint32_t crossDeviceBarrierFlag{1};
 };
@@ -175,6 +193,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<
   args.inpTokenBuf = handle.inpTokenBuf;
   args.outTokenBuf = handle.outTokenBuf;
   args.weightsBuf = handle.weightsBuf;
+  args.scalesBuf = handle.scalesBuf;
   args.destPeTokenCounter = handle.destPeTokenCounter;
   args.localPeTokenCounter = handle.localPeTokenCounter;
   args.lock = handle.lock;
@@ -182,6 +201,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<
   args.shmemOutTokMemObj = handle.shmemOutTokMemObj;
   args.shmemInpWeightsMemObj = handle.shmemInpWeightsMemObj;
   args.shmemOutWeightsMemObj = handle.shmemOutWeightsMemObj;
+  args.shmemScalesMemObj = handle.shmemScalesMemObj;
   args.shmemInpIndiciesMemObj = handle.shmemInpIndiciesMemObj;
   args.shmemOutIndiciesMemObj = handle.shmemOutIndiciesMemObj;
   args.recvTokenNumMemObj = handle.recvTokenNumMemObj;
@@ -209,6 +229,8 @@ static std::ostream& operator<<(std::ostream& s, mori::moe::EpDispatchCombineCon
   ss << "EpDispatchCombineConfig: " << std::endl
      << "  WorlSize: " << config.worldSize << std::endl
      << "  hiddenDim: " << config.hiddenDim << std::endl
+     << "  scaleDim: " << config.scaleDim << std::endl
+     << "  scaleTypeSize: " << config.scaleTypeSize << std::endl
      << "  maxNumInpTokenPerRank: " << config.maxNumInpTokenPerRank << std::endl
      << "  numExpertPerRank: " << config.numExpertPerRank << std::endl
      << "  numExpertPerToken: " << config.numExpertPerToken << std::endl

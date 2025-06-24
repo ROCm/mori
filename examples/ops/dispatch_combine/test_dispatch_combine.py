@@ -15,6 +15,8 @@ class EpDispatchCombineTestCase:
             rank=self.rank,
             world_size=self.world_size,
             hidden_dim=7168,
+            scale_dim=32,
+            scale_type_size=1,
             max_num_inp_token_per_rank=512,
             num_experts_per_rank=32,
             num_experts_per_token=8,
@@ -106,9 +108,9 @@ class EpDispatchCombineTestCase:
             indicies.cpu(), self.config.max_num_inp_token_per_rank
         )
         indicies_list = [
-            tensor.to(self.device).to(torch.uint32) for tensor in indicies_list
+            tensor.to(self.device).to(torch.int32) for tensor in indicies_list
         ]
-        indicies = indicies.to(self.device).to(torch.uint32)
+        indicies = indicies.to(self.device).to(torch.int32)
 
         # gen weights
         weights = torch.rand(
@@ -121,6 +123,19 @@ class EpDispatchCombineTestCase:
         weights_list = self._allgather_with_token_num_padding(
             weights, self.config.max_num_inp_token_per_rank
         )
+
+        # gen scales
+        scales_fp32 = torch.rand(
+            num_tokens,
+            self.config.scale_dim,
+            dtype=torch.float32,
+            generator=self.rng,
+            device=self.device,
+        )
+        scales_list = self._allgather_with_token_num_padding(
+            scales_fp32, self.config.max_num_inp_token_per_rank
+        )
+        scales_list = [tensor.to(torch.float8_e4m3fnuz) for tensor in scales_list]
 
         # gen input & output
         # some functions such as randn and cat are not implemented for fp8
@@ -140,9 +155,12 @@ class EpDispatchCombineTestCase:
             num_tokens,
             indicies,
             weights,
+            # scales_fp32,
+            scales_fp32.to(torch.float8_e4m3fnuz),
             input_fp32.to(self.config.data_type),
             indicies_list,
             weights_list,
+            scales_list,
             input_list,
         )
 
@@ -151,17 +169,20 @@ class EpDispatchCombineTestCase:
             num_tokens,
             indicies,
             weights,
+            scales,
             input,
             indicies_list,
             weights_list,
+            scales_list,
             input_list,
         ) = test_data
         (
             dispatch_output,
             dispatch_weights,
+            dispatch_scales,
             dispatch_indicies,
             dispatch_recv_num_token,
-        ) = op.dispatch(input, weights, indicies)
+        ) = op.dispatch(input, weights, scales, indicies)
         torch.cuda.synchronize()
 
         src_token_pos = op.get_dispatch_src_token_pos()
@@ -174,6 +195,7 @@ class EpDispatchCombineTestCase:
             src_id = int(pos) % self.config.max_num_inp_token_per_rank
             assert torch.equal(input_list[src_rank][src_id], dispatch_output[i])
             assert torch.equal(weights_list[src_rank][src_id], dispatch_weights[i])
+            assert torch.equal(scales_list[src_rank][src_id], dispatch_scales[i])
             assert torch.equal(indicies_list[src_rank][src_id], dispatch_indicies[i])
         assert len(torch.unique(src_token_pos)) == len(src_token_pos)
         assert len(src_token_pos) == dispatch_recv_num_token[0]

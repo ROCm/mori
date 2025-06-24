@@ -26,8 +26,8 @@ __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
   int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
 
   for (int destPe = thdId; destPe < args.config.worldSize; destPe += blockDim.x) {
-    args.recvTokenNumMemObj->template GetAs<uint32_t*>()[destPe] = 0;
-    args.sendTokenNumMemObj->template GetAs<uint32_t*>()[destPe] = 0;
+    args.recvTokenNumMemObj->template GetAs<index_t*>()[destPe] = 0;
+    args.sendTokenNumMemObj->template GetAs<index_t*>()[destPe] = 0;
     args.destPeTokenCounter[destPe] = 0;
     args.dispatchGridBarrier[destPe] = 0;
     args.combineGridBarrier[destPe] = 0;
@@ -36,8 +36,8 @@ __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
     args.localPeTokenCounter[exptId] = 0;
   }
   if (thdId == 0) {
-    args.dispTokOffsetMemObj->template GetAs<uint32_t*>()[0] = 0;
-    core::AtomicStoreRelaxedSystem(args.totalRecvTokenNum, size_t{0});
+    args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
+    core::AtomicStoreRelaxedSystem(args.totalRecvTokenNum, index_t{0});
   }
   // TODO: this should be one in wqe post API
   if (globalThdId == 0) {
@@ -83,8 +83,10 @@ void EpDispatchCombineHandle<T>::IntializeShmemBuf() {
   shmemInpWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
   shmemOutWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
 
-  size_t maxIndiciesSize =
-      config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(uint32_t);
+  size_t maxScaleSize = config.MaxNumTokensToRecvPerRank() * config.scaleDim * config.scaleTypeSize;
+  shmemScalesMemObj = ShmemMallocAndReturnMemObjPtr(maxScaleSize, hipDeviceMallocUncached);
+
+  size_t maxIndiciesSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(index_t);
   shmemInpIndiciesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndiciesSize, hipDeviceMallocUncached);
   shmemOutIndiciesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndiciesSize, hipDeviceMallocUncached);
 }
@@ -95,18 +97,19 @@ void EpDispatchCombineHandle<T>::FinalizeShmemBuf() {
   ShmemFree(shmemOutTokMemObj->localPtr);
   ShmemFree(shmemInpWeightsMemObj->localPtr);
   ShmemFree(shmemOutWeightsMemObj->localPtr);
+  ShmemFree(shmemScalesMemObj->localPtr);
   ShmemFree(shmemInpIndiciesMemObj->localPtr);
   ShmemFree(shmemOutIndiciesMemObj->localPtr);
 }
 
 template <typename T>
 void EpDispatchCombineHandle<T>::IntializeTokenNumSignalBuf() {
-  size_t tokenNumSignalSize = config.worldSize * sizeof(uint32_t);
+  size_t tokenNumSignalSize = config.worldSize * sizeof(index_t);
   recvTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
   sendTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
 
-  HIP_RUNTIME_CHECK(hipMalloc(&totalRecvTokenNum, sizeof(uint32_t)));
-  HIP_RUNTIME_CHECK(hipMemset(totalRecvTokenNum, 0, sizeof(uint32_t)));
+  HIP_RUNTIME_CHECK(hipMalloc(&totalRecvTokenNum, sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMemset(totalRecvTokenNum, 0, sizeof(index_t)));
 
   HIP_RUNTIME_CHECK(
       hipExtMallocWithFlags((void**)&lock, sizeof(uint32_t), hipDeviceMallocUncached));
@@ -124,24 +127,24 @@ void EpDispatchCombineHandle<T>::FinalizeTokenNumSignalBuf() {
 template <typename T>
 void EpDispatchCombineHandle<T>::IntializeOrderMapBuf() {
   size_t maxNumOutToken = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerRank;
-  HIP_RUNTIME_CHECK(hipMalloc(&dispReceiverIdxMap, maxNumOutToken * sizeof(uint32_t)));
-  HIP_RUNTIME_CHECK(hipMemset(dispReceiverIdxMap, 0, maxNumOutToken * sizeof(uint32_t)));
+  HIP_RUNTIME_CHECK(hipMalloc(&dispReceiverIdxMap, maxNumOutToken * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMemset(dispReceiverIdxMap, 0, maxNumOutToken * sizeof(index_t)));
 
-  HIP_RUNTIME_CHECK(hipMalloc(&dispSenderIdxMap, maxNumOutToken * sizeof(uint32_t)));
-  HIP_RUNTIME_CHECK(hipMemset(dispSenderIdxMap, 0, maxNumOutToken * sizeof(uint32_t)));
+  HIP_RUNTIME_CHECK(hipMalloc(&dispSenderIdxMap, maxNumOutToken * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMemset(dispSenderIdxMap, 0, maxNumOutToken * sizeof(index_t)));
 
-  HIP_RUNTIME_CHECK(hipMalloc(&destPeTokenCounter, config.worldSize * sizeof(uint32_t)));
-  HIP_RUNTIME_CHECK(hipMemset(destPeTokenCounter, 0, config.worldSize * sizeof(uint32_t)));
+  HIP_RUNTIME_CHECK(hipMalloc(&destPeTokenCounter, config.worldSize * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMemset(destPeTokenCounter, 0, config.worldSize * sizeof(index_t)));
 
-  HIP_RUNTIME_CHECK(hipMalloc(&localPeTokenCounter, config.numExpertPerRank * sizeof(uint32_t)));
-  HIP_RUNTIME_CHECK(hipMemset(localPeTokenCounter, 0, config.numExpertPerRank * sizeof(uint32_t)));
+  HIP_RUNTIME_CHECK(hipMalloc(&localPeTokenCounter, config.numExpertPerRank * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMemset(localPeTokenCounter, 0, config.numExpertPerRank * sizeof(index_t)));
 
-  dispTokOffsetMemObj = ShmemMallocAndReturnMemObjPtr(sizeof(uint32_t), hipDeviceMallocUncached);
+  dispTokOffsetMemObj = ShmemMallocAndReturnMemObjPtr(sizeof(index_t), hipDeviceMallocUncached);
   dispTokIdToSrcTokIdMemObj =
-      ShmemMallocAndReturnMemObjPtr(maxNumOutToken * sizeof(uint32_t), hipDeviceMallocUncached);
+      ShmemMallocAndReturnMemObjPtr(maxNumOutToken * sizeof(index_t), hipDeviceMallocUncached);
 
-  HIP_RUNTIME_CHECK(hipMalloc(&dispDestTokIdMap, maxNumOutToken * sizeof(uint32_t)));
-  HIP_RUNTIME_CHECK(hipMemset(dispDestTokIdMap, 0, maxNumOutToken * sizeof(uint32_t)));
+  HIP_RUNTIME_CHECK(hipMalloc(&dispDestTokIdMap, maxNumOutToken * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMemset(dispDestTokIdMap, 0, maxNumOutToken * sizeof(index_t)));
 }
 
 template <typename T>
@@ -199,7 +202,7 @@ void EpDispatchCombineHandle<T>::LaunchDispatch(KernelType kernelType, hipStream
   size_t sharedMemSize =
       (config.worldSize * config.warpNumPerBlock +
        config.numExpertPerRank * config.warpNumPerBlock + config.numExpertPerRank) *
-      sizeof(uint32_t);
+      sizeof(index_t);
   if (kernelType == KernelType::InterNode)
     EpDispatchInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(
         GetEpDispatchCombineArgs(*this));

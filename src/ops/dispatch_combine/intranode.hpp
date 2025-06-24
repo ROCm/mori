@@ -63,13 +63,12 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
   // Phase1: send token
   // Each warp compute token offset on destinition PE
-  int i = globalWarpId;
   for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
        i += globalWarpNum) {
-    uint32_t srcTokId = i / config.numExpertPerToken;
-    uint32_t destExpert = args.tokenIndicies[i];
-    uint32_t destPe = destExpert / config.numExpertPerRank;
-    uint32_t destTokId = 0;
+    index_t srcTokId = i / config.numExpertPerToken;
+    index_t destExpert = args.tokenIndicies[i];
+    index_t destPe = destExpert / config.numExpertPerRank;
+    index_t destTokId = 0;
 
     // Deduplicate
     assert(config.numExpertPerToken < warpSize);
@@ -87,12 +86,12 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
     if (laneId == 0) {
       // decide token id in dest pe
-      destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<uint32_t*>(destPe), 1);
+      destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
       atomicAdd(args.destPeTokenCounter + destPe, 1);
       args.dispDestTokIdMap[i] = destPe * maxNumOutTokenPerRank + destTokId;
 
       // TODO: use a switch to control the writing of this buffer, should only turn on for testing
-      args.dispTokIdToSrcTokIdMemObj->template GetAs<uint32_t*>(destPe)[destTokId] =
+      args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
           myPe * config.maxNumInpTokenPerRank + srcTokId;
     }
     destTokId = __shfl(destTokId, 0);
@@ -102,13 +101,19 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       args.shmemOutWeightsMemObj->template GetAs<float*>(
           destPe)[destTokId * config.numExpertPerToken + laneId] =
           args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
-      args.shmemOutIndiciesMemObj->template GetAs<uint32_t*>(
+      args.shmemOutIndiciesMemObj->template GetAs<index_t*>(
           destPe)[destTokId * config.numExpertPerToken + laneId] =
           args.tokenIndicies[srcTokId * config.numExpertPerToken + laneId];
     }
 
-    uint32_t srcTokOffset = srcTokId * config.hiddenDim;
-    uint32_t destTokOffset = destTokId * config.hiddenDim;
+    // Write scales
+    index_t destScaleOffset = destTokId * config.scaleDim * config.scaleTypeSize;
+    index_t srcScaleOffset = srcTokId * config.scaleDim * config.scaleTypeSize;
+    core::WarpCopy(args.shmemScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
+                   args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
+
+    index_t srcTokOffset = srcTokId * config.hiddenDim;
+    index_t destTokOffset = destTokId * config.hiddenDim;
     core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
                    args.inpTokenBuf + srcTokOffset, config.hiddenDim);
   }
@@ -121,19 +126,19 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
 
       // Add 1 so that when token number == 0, receiver side still know the signal is sent
-      uint32_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
+      index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       core::AtomicStoreRelaxedSystem(
-          args.recvTokenNumMemObj->template GetAs<uint32_t*>(destPe) + myPe, numTokenSignal);
+          args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe, numTokenSignal);
     }
   }
 
   // Phase 2: recv token
   // Each warp wait until sender finished by waiting token number signal
-  uint32_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint32_t*>();
+  index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      uint32_t* signal = recvTokenNums + destPe;
-      uint32_t recvTokenNum = shmem::ShmemUint32WaitUntilGreaterThan(signal, 0) - 1;
+      index_t* signal = recvTokenNums + destPe;
+      index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
     }
   }
@@ -162,7 +167,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
   size_t maxNumOutTokenPerRank = config.MaxNumTokensToSend();
   // Copy input to shmem registered buffer so that other GPUs can access directly
-  size_t totalRecvTokenNum = args.totalRecvTokenNum[0];
+  index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
     core::WarpCopy(args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
                    args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
@@ -173,22 +178,22 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   extern __shared__ char sharedMem[];
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
 
-  int warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
-  size_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
+  index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
+  index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
 
   for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
-    int tokenId = i / warpsPerToken;
-    int inTokenPartId = i % warpsPerToken;
-    size_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
-    size_t hiddenDimSize = std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp);
+    index_t tokenId = i / warpsPerToken;
+    index_t inTokenPartId = i % warpsPerToken;
+    index_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
+    index_t hiddenDimSize = std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp);
 
     // Prepare data pointers on different GPUs
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
-      uint32_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
-      uint32_t destPe = destTokId / maxNumOutTokenPerRank;
+      index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
+      index_t destPe = destTokId / maxNumOutTokenPerRank;
 
       if (destPe < config.worldSize) {
-        uint32_t destLocalTokId = destTokId - destPe * maxNumOutTokenPerRank;
+        index_t destLocalTokId = destTokId - destPe * maxNumOutTokenPerRank;
         srcPtrs[j] = args.shmemInpTokMemObj->template GetAs<T*>(destPe) +
                      destLocalTokId * config.hiddenDim + hiddenDimOffset;
       } else {

@@ -51,27 +51,40 @@ RdmaDevice::RdmaDevice(ibv_device* device) : device(device) {
   deviceAttr.reset(new ibv_device_attr_ex{});
   int status = ibv_query_device_ex(defaultContext, NULL, deviceAttr.get());
   assert(!status);
+
+  for (uint32_t port = 1; port <= deviceAttr->orig_attr.phys_port_cnt; ++port) {
+    std::unique_ptr<ibv_port_attr> portAttr(new ibv_port_attr{});
+    int ret = ibv_query_port(defaultContext, port, portAttr.get());
+    assert(!ret);
+    portAttrMap.emplace(port, std::move(portAttr));
+  }
 }
 
 RdmaDevice::~RdmaDevice() { ibv_close_device(defaultContext); }
 
 int RdmaDevice::GetDevicePortNum() const { return deviceAttr->orig_attr.phys_port_cnt; }
 
-std::vector<int> RdmaDevice::GetActivePortIds() const {
-  std::vector<int> activePorts;
-  for (int port = 1; port <= deviceAttr->orig_attr.phys_port_cnt; ++port) {
-    ibv_port_attr portAttr;
-    int status = ibv_query_port(defaultContext, port, &portAttr);
-    assert(!status);
-
-    if (portAttr.state == IBV_PORT_ACTIVE) {
-      activePorts.push_back(port);
+std::vector<uint32_t> RdmaDevice::GetActivePortIds() const {
+  std::vector<uint32_t> activePorts;
+  for (uint32_t port = 1; port <= deviceAttr->orig_attr.phys_port_cnt; ++port) {
+    auto it = portAttrMap.find(port);
+    if (it != portAttrMap.end() && it->second) {
+      if (it->second->state == IBV_PORT_ACTIVE) {
+        activePorts.push_back(port);
+      }
     }
   }
   return activePorts;
 }
 
 std::string RdmaDevice::Name() const { return device->name; }
+
+const ibv_device_attr_ex* RdmaDevice::GetDeviceAttr() const { return deviceAttr.get(); }
+
+const std::unordered_map<uint32_t, std::unique_ptr<ibv_port_attr>>* RdmaDevice::GetPortAttrMap()
+    const {
+  return &portAttrMap;
+}
 
 RdmaDeviceContext* RdmaDevice::CreateRdmaDeviceContext() {
   ibv_pd* pd = ibv_alloc_pd(defaultContext);
@@ -81,8 +94,8 @@ RdmaDeviceContext* RdmaDevice::CreateRdmaDeviceContext() {
 ActiveDevicePortList GetActiveDevicePortList(const RdmaDeviceList& devices) {
   ActiveDevicePortList activeDevPortList;
   for (RdmaDevice* device : devices) {
-    std::vector<int> activePorts = device->GetActivePortIds();
-    for (int port : activePorts) {
+    std::vector<uint32_t> activePorts = device->GetActivePortIds();
+    for (uint32_t port : activePorts) {
       activeDevPortList.push_back({device, port});
     }
   }

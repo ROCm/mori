@@ -92,13 +92,17 @@ class EpDispatchCombineTestCase {
     HIP_RUNTIME_CHECK(hipMemset(outTokBuf, 0, maxTokenSize));
     inpTokBufCpu = reinterpret_cast<T*>(malloc(maxTokenSize));
 
-    int tokenIndiciesSize = config.MaxNumTokensToSendPerRank() * sizeof(uint32_t);
+    int tokenIndiciesSize = config.MaxNumTokensToSendPerRank() * sizeof(index_t);
     HIP_RUNTIME_CHECK(hipMalloc(&tokenIndicies, tokenIndiciesSize));
     HIP_RUNTIME_CHECK(hipMemset(tokenIndicies, 0, tokenIndiciesSize));
 
     int weightsBufSize = config.MaxNumTokensToSendPerRank() * sizeof(float);
     HIP_RUNTIME_CHECK(hipMalloc(&weightsBuf, weightsBufSize));
     HIP_RUNTIME_CHECK(hipMemset(weightsBuf, 0, weightsBufSize));
+
+    int scalesBufSize = config.MaxNumTokensToSendPerRank() * config.scaleDim * config.scaleTypeSize;
+    HIP_RUNTIME_CHECK(hipMalloc(&scalesBuf, scalesBufSize));
+    HIP_RUNTIME_CHECK(hipMemset(scalesBuf, 0, scalesBufSize));
   }
 
   ~EpDispatchCombineTestCase() {
@@ -106,6 +110,7 @@ class EpDispatchCombineTestCase {
     HIP_RUNTIME_CHECK(hipFree(outTokBuf));
     HIP_RUNTIME_CHECK(hipFree(tokenIndicies));
     HIP_RUNTIME_CHECK(hipFree(weightsBuf));
+    HIP_RUNTIME_CHECK(hipFree(scalesBuf));
     free(inpTokBufCpu);
   }
 
@@ -125,7 +130,7 @@ class EpDispatchCombineTestCase {
     }
     RandomInitializeWeights();
     RandomInitializeToken();
-    handle.PrepareInference(inpTokBuf, outTokBuf, weightsBuf, tokenIndicies, numToken);
+    handle.PrepareInference(inpTokBuf, outTokBuf, weightsBuf, scalesBuf, tokenIndicies, numToken);
     // PrintDispatch();
     // PrintDispatchStats();
   }
@@ -135,7 +140,7 @@ class EpDispatchCombineTestCase {
 
     // Copy token indices to CPU
     int MaxNumTokensToSendPerRank = config.MaxNumTokensToSendPerRank();
-    int tokenIndiciesSize = config.MaxNumTokensToSendPerRank() * sizeof(uint32_t);
+    int tokenIndiciesSize = config.MaxNumTokensToSendPerRank() * sizeof(index_t);
 
     // Collect token indices from all ranks
     void* tokenIndicesCpu = malloc(tokenIndiciesSize);
@@ -150,14 +155,14 @@ class EpDispatchCombineTestCase {
     HIP_RUNTIME_CHECK(hipMemcpy(dispSenderIdxMapCpu, handle.dispSenderIdxMap, tokenIndiciesSize,
                                 hipMemcpyDeviceToHost));
 
-    uint32_t* globaldispSenderIdxMapCpu =
-        reinterpret_cast<uint32_t*>(malloc(config.worldSize * tokenIndiciesSize));
+    index_t* globaldispSenderIdxMapCpu =
+        reinterpret_cast<index_t*>(malloc(config.worldSize * tokenIndiciesSize));
     MPI_Allgather(dispSenderIdxMapCpu, tokenIndiciesSize, MPI_CHAR, globaldispSenderIdxMapCpu,
                   tokenIndiciesSize, MPI_CHAR, MPI_COMM_WORLD);
 
     // Collect token num from all ranks
-    std::vector<uint32_t> globalTokenNum(config.worldSize);
-    MPI_Allgather(&handle.curRankNumToken, 1, MPI_UINT32_T, globalTokenNum.data(), 1, MPI_UINT32_T,
+    std::vector<index_t> globalTokenNum(config.worldSize);
+    MPI_Allgather(&handle.curRankNumToken, 1, MPI_INT32_T, globalTokenNum.data(), 1, MPI_INT32_T,
                   MPI_COMM_WORLD);
 
     // Collect tokens from all ranks
@@ -170,18 +175,18 @@ class EpDispatchCombineTestCase {
     MPI_Allgather(inpTokBufCpu, inpTokSize, MPI_CHAR, globalInpTokBufCpu, inpTokSize, MPI_CHAR,
                   MPI_COMM_WORLD);
 
-    uint32_t totalRecvNumToken = 0;
+    index_t totalRecvNumToken = 0;
     for (int i = 0; i < config.worldSize; i++) {
-      totalRecvNumToken += handle.recvTokenNumMemObj->template GetAs<uint32_t*>()[i] - 1;
+      totalRecvNumToken += handle.recvTokenNumMemObj->template GetAs<index_t*>()[i] - 1;
     }
     std::cout << "Rank " << config.rank << " recv " << totalRecvNumToken << " tokens" << std::endl;
 
     if (runConfig.kernelType == IntraNode) {
       for (int i = 0; i < totalRecvNumToken; i++) {
-        uint32_t srcTokId = handle.dispTokIdToSrcTokIdMemObj->template GetAs<uint32_t*>()[i];
+        index_t srcTokId = handle.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[i];
 
-        uint32_t srcPe = srcTokId / config.maxNumInpTokenPerRank;
-        uint32_t localSrcTokId = srcTokId - srcPe * config.maxNumInpTokenPerRank;
+        index_t srcPe = srcTokId / config.maxNumInpTokenPerRank;
+        index_t localSrcTokId = srcTokId - srcPe * config.maxNumInpTokenPerRank;
 
         T* localTokBuf = handle.shmemOutTokMemObj->template GetAs<T*>() + i * config.hiddenDim;
         T* srcTokBuf = reinterpret_cast<T*>(globalInpTokBufCpu) + srcPe * inpTokEleNum +
@@ -204,29 +209,28 @@ class EpDispatchCombineTestCase {
       }
     } else if (runConfig.kernelType == InterNode) {
       // Build pe sorted to token index map
-      std::vector<std::unordered_map<uint32_t, uint32_t>> peSortToTokenIdxMapsVec;
+      std::vector<std::unordered_map<index_t, index_t>> peSortToTokenIdxMapsVec;
       for (int i = 0; i < config.worldSize; i++) {
         peSortToTokenIdxMapsVec.push_back({});
-        uint32_t peTokenNum = globalTokenNum[i];
+        index_t peTokenNum = globalTokenNum[i];
         for (int j = 0; j < peTokenNum * config.numExpertPerToken; j++) {
-          uint32_t peSortedId =
+          index_t peSortedId =
               globaldispSenderIdxMapCpu[i * config.MaxNumTokensToSendPerRank() + j];
           assert(peSortToTokenIdxMapsVec[i].find(peSortedId) == peSortToTokenIdxMapsVec[i].end());
           peSortToTokenIdxMapsVec[i].insert({peSortedId, j});
         }
       }
 
-      std::vector<uint32_t> srcPeCheckTokenNum(config.worldSize, 0);
+      std::vector<index_t> srcPeCheckTokenNum(config.worldSize, 0);
       for (int i = 0; i < totalRecvNumToken; i++) {
-        uint32_t peSortedId = handle.dispReceiverIdxMap[i];
-        uint32_t srcPe = peSortedId / config.MaxNumTokensToSendPerRank();
+        index_t peSortedId = handle.dispReceiverIdxMap[i];
+        index_t srcPe = peSortedId / config.MaxNumTokensToSendPerRank();
         peSortedId = peSortedId - srcPe * config.MaxNumTokensToSendPerRank() +
                      config.rank * config.MaxNumTokensToSendPerRank();
-        uint32_t srcTokDispatchId = peSortToTokenIdxMapsVec[srcPe][peSortedId];
-        uint32_t srcTokId = srcTokDispatchId / config.numExpertPerToken;
+        index_t srcTokDispatchId = peSortToTokenIdxMapsVec[srcPe][peSortedId];
+        index_t srcTokId = srcTokDispatchId / config.numExpertPerToken;
 
         T* localTokBuf = handle.shmemOutTokMemObj->template GetAs<T*>() + i * config.hiddenDim;
-        // T* localTokBuf = handle.outTokenBuf + i * config.hiddenDim;
 
         T* srcTokBuf = reinterpret_cast<T*>(globalInpTokBufCpu) + srcPe * inpTokEleNum +
                        srcTokId * config.hiddenDim;
@@ -249,7 +253,7 @@ class EpDispatchCombineTestCase {
 
       for (int i = 0; i < config.worldSize; i++) {
         assert(srcPeCheckTokenNum[i] ==
-               (handle.recvTokenNumMemObj->template GetAs<uint32_t*>()[i] - 1));
+               (handle.recvTokenNumMemObj->template GetAs<index_t*>()[i] - 1));
       }
     }
 
@@ -261,15 +265,15 @@ class EpDispatchCombineTestCase {
   void CheckCombineResult() {
     EpDispatchCombineConfig& config = handle.config;
     for (int i = 0; i < handle.curRankNumToken; i++) {
-      uint32_t tokenOffset = i * config.hiddenDim;
+      index_t tokenOffset = i * config.hiddenDim;
 
       // compute weight sum
       float weightSum = 0.0f;
       if (runConfig.isAiterMoE) {
-        std::unordered_set<uint32_t> pes;
+        std::unordered_set<index_t> pes;
         for (int j = 0; j < config.numExpertPerToken; j++) {
-          uint32_t exptId = handle.tokenIndicies[i * config.numExpertPerToken + j];
-          uint32_t destPe = exptId / config.numExpertPerRank;
+          index_t exptId = handle.tokenIndicies[i * config.numExpertPerToken + j];
+          index_t destPe = exptId / config.numExpertPerRank;
           pes.insert(destPe);
         }
         weightSum = 1.0f * pes.size();
@@ -451,10 +455,10 @@ class EpDispatchCombineTestCase {
 
     for (int i = 0; i < numToken; i++) {
       for (int j = 0; j < config.numExpertPerToken; j++) {
-        uint32_t dispIdx = i * config.numExpertPerToken + j;
-        uint32_t destPe = dispIdx % config.worldSize;
+        index_t dispIdx = i * config.numExpertPerToken + j;
+        index_t destPe = dispIdx % config.worldSize;
 
-        uint32_t localExpertId = dispIdx / config.worldSize % config.numExpertPerRank;
+        index_t localExpertId = dispIdx / config.worldSize % config.numExpertPerRank;
 
         tokenIndicies[dispIdx] = destPe * config.numExpertPerRank + localExpertId;
 
@@ -511,7 +515,8 @@ class EpDispatchCombineTestCase {
   T* inpTokBufCpu{nullptr};
   T* outTokBuf{nullptr};
   float* weightsBuf{nullptr};
-  uint32_t* tokenIndicies{nullptr};
+  uint8_t* scalesBuf{nullptr};
+  index_t* tokenIndicies{nullptr};
   int numToken{-1};
   EpDispatchCombineHandle<T>& handle;
   RunConfig runConfig;
@@ -578,6 +583,8 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
                                          {"cmd", required_argument, NULL, 0},
                                          {"data_type", required_argument, NULL, 0},
                                          {"hdim", optional_argument, NULL, 'd'},
+                                         {"scale_dim", optional_argument, NULL, 's'},
+                                         {"scale_type", optional_argument, NULL, 0},
                                          {"max_tokens", optional_argument, NULL, 'm'},
                                          {"expert_per_rank", optional_argument, NULL, 'r'},
                                          {"expert_per_token", optional_argument, NULL, 't'},
@@ -588,7 +595,7 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
                                          {0, 0, 0, 0}};
   int option_index = 0;
   int opt;
-  while ((opt = getopt_long(argc, argv, "d::m::r::t::w::b::n::k::h", long_options,
+  while ((opt = getopt_long(argc, argv, "d::m::r::t::w::b::n::s::k::h", long_options,
                             &option_index)) != -1) {
     if (opt == -1) break;
 
@@ -611,7 +618,16 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
           } else if (strcmp(optarg, "fp8") == 0) {
             testConfig.dataType = DataType::FP8_E4M3;
           } else {
-            printf("Unknown cmd: %s, must be 'test' or 'bench'\n", optarg);
+            printf("Unknown data type: %s, must be 'fp32', 'bf16' or 'fp8'\n", optarg);
+            assert(false);
+          }
+        } else if (strcmp(long_options[option_index].name, "scale_type") == 0) {
+          if (strcmp(optarg, "fp32") == 0) {
+            testConfig.config.scaleTypeSize = 4;
+          } else if (strcmp(optarg, "fp8") == 0) {
+            testConfig.config.scaleTypeSize = 1;
+          } else {
+            printf("Unknown scale type: %s, must be 'fp8' or 'fp32'\n", optarg);
             assert(false);
           }
         }
@@ -633,6 +649,9 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
         break;
       case 'b':
         testConfig.config.blockNum = std::stoi(optarg);
+        break;
+      case 's':
+        testConfig.config.scaleDim = std::stoi(optarg);
         break;
       case 'n':
         testConfig.runConfig.repeat = std::stoi(optarg);

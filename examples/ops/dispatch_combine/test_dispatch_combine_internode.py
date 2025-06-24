@@ -16,6 +16,8 @@ class EpDispatchCombineTestCase:
             rank=self.rank,
             world_size=self.world_size,
             hidden_dim=7168,
+            scale_dim=32,
+            scale_type_size=4,
             max_num_inp_token_per_rank=512,
             num_experts_per_rank=16,
             num_experts_per_token=8,
@@ -111,8 +113,7 @@ class EpDispatchCombineTestCase:
                     device=self.device,
                 )
                 indicies[i] = perm[: self.config.num_experts_per_token]
-            all_rank_indicies.append(indicies.to(torch.uint32).to(self.device))
-        # print(all_rank_indicies)
+            all_rank_indicies.append(indicies.to(torch.int32).to(self.device))
 
         # gen weights
         all_rank_weights = [
@@ -125,7 +126,18 @@ class EpDispatchCombineTestCase:
             )
             for r in range(self.world_size)
         ]
-        # print(all_rank_weights)
+
+        # gen weights
+        all_rank_scales = [
+            torch.rand(
+                num_token[r],
+                self.config.scale_dim,
+                dtype=torch.float32,
+                generator=self.rng,
+                device=self.device,
+            )
+            for r in range(self.world_size)
+        ]
 
         # gen input & output
         # some functions such as randn and cat are not implemented for fp8
@@ -141,20 +153,32 @@ class EpDispatchCombineTestCase:
                 ).to(self.config.data_type)
             )
 
-        return (num_token, all_rank_indicies, all_rank_input, all_rank_weights)
+        return (
+            num_token,
+            all_rank_indicies,
+            all_rank_input,
+            all_rank_weights,
+            all_rank_scales,
+        )
 
     def run_test_once(self, op, test_data):
-        (all_rank_num_token, all_rank_indicies, all_rank_input, all_rank_weights) = (
-            test_data
-        )
+        (
+            all_rank_num_token,
+            all_rank_indicies,
+            all_rank_input,
+            all_rank_weights,
+            all_rank_scales,
+        ) = test_data
         (
             dispatch_output,
             dispatch_weights,
+            dispatch_scales,
             dispatch_indicies,
             dispatch_recv_num_token,
         ) = op.dispatch(
             all_rank_input[self.rank],
             all_rank_weights[self.rank],
+            all_rank_scales[self.rank],
             all_rank_indicies[self.rank],
         )
         torch.cuda.synchronize()
@@ -174,6 +198,7 @@ class EpDispatchCombineTestCase:
             assert torch.equal(
                 dispatch_indicies[i], all_rank_indicies[src_pe][src_tok_id]
             )
+            # TODO: test output scales
 
         if self.config.rank == 0:
             print("Dispatch Pass")

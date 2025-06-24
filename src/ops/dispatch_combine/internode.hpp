@@ -56,9 +56,9 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
   int i = globalWarpId;
   for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
        i += globalWarpNum) {
-    uint32_t destExpert = args.tokenIndicies[i];
-    uint32_t destPe = destExpert / config.numExpertPerRank;
-    uint32_t tokenId = i / config.numExpertPerToken;
+    index_t destExpert = args.tokenIndicies[i];
+    index_t destPe = destExpert / config.numExpertPerRank;
+    index_t tokenId = i / config.numExpertPerToken;
 
     // Deduplicate
     assert(config.numExpertPerToken < warpSize);
@@ -75,7 +75,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
     }
 
     // Allocate a remote token slot
-    uint32_t destPeTokenIdx = 0, peSortedIdx = 0;
+    index_t destPeTokenIdx = 0, peSortedIdx = 0;
     if (laneId == 0) {
       destPeTokenIdx = atomicAdd(args.destPeTokenCounter + destPe, 1);
       peSortedIdx = destPe * MaxNumTokensToRecvPerRank + destPeTokenIdx;
@@ -84,7 +84,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
     destPeTokenIdx = __shfl(destPeTokenIdx, 0);
     peSortedIdx = __shfl(peSortedIdx, 0);
 
-    uint32_t tokenOffset = tokenId * config.hiddenDim;
+    index_t tokenOffset = tokenId * config.hiddenDim;
 
 #if ENABLE_RDMA_AGGREGATE_WRITE == 1
     // For aggregated write, first copy data into a contiguous buffer
@@ -93,14 +93,14 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
     core::WarpCopy(args.shmemOutWeightsMemObj->template GetAs<float*>() +
                        peSortedIdx * config.numExpertPerToken,
                    args.weightsBuf + tokenId * config.numExpertPerToken, config.numExpertPerToken);
-    core::WarpCopy(args.shmemOutIndiciesMemObj->template GetAs<uint32_t*>() +
+    core::WarpCopy(args.shmemOutIndiciesMemObj->template GetAs<index_t*>() +
                        peSortedIdx * config.numExpertPerToken,
                    args.tokenIndicies + tokenId * config.numExpertPerToken,
                    config.numExpertPerToken);
 #else
     // For disaggregated write, write data to remote directly
-    uint32_t peSortedId = myPe * MaxNumTokensToRecvPerRank + destPeTokenIdx;
-    uint32_t peSortedOffset = peSortedId * config.hiddenDim;
+    index_t peSortedId = myPe * MaxNumTokensToRecvPerRank + destPeTokenIdx;
+    index_t peSortedOffset = peSortedId * config.hiddenDim;
 
     core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + tokenOffset,
                    args.inpTokenBuf + tokenOffset, config.hiddenDim);
@@ -122,10 +122,10 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
       shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
 
       // Add 1 so that when token number == 0, receiver side still know the signal is sent
-      uint32_t numToken = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
+      index_t numToken = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
 #if ENABLE_RDMA_AGGREGATE_WRITE == 1
-      uint32_t localPeSortedOffset = destPe * MaxNumTokensToRecvPerRank;
-      uint32_t remotePeSortedOffset = myPe * MaxNumTokensToRecvPerRank;
+      index_t localPeSortedOffset = destPe * MaxNumTokensToRecvPerRank;
+      index_t remotePeSortedOffset = myPe * MaxNumTokensToRecvPerRank;
       shmem::ShmemPutTypeNbiThread<T>(
           args.shmemInpTokMemObj, remotePeSortedOffset * config.hiddenDim, args.shmemOutTokMemObj,
           localPeSortedOffset * config.hiddenDim, config.hiddenDim * numToken, destPe);
@@ -133,27 +133,25 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
           args.shmemInpWeightsMemObj, remotePeSortedOffset * config.numExpertPerToken,
           args.shmemOutWeightsMemObj, localPeSortedOffset * config.numExpertPerToken,
           config.numExpertPerToken * numToken, destPe);
-      shmem::ShmemPutTypeNbiThread<uint32_t>(
+      shmem::ShmemPutTypeNbiThread<index_t>(
           args.shmemInpIndiciesMemObj, remotePeSortedOffset * config.numExpertPerToken,
           args.shmemOutIndiciesMemObj, localPeSortedOffset * config.numExpertPerToken,
           config.numExpertPerToken * numToken, destPe);
 #endif
-      shmem::ShmemPutUint32ImmNbiThread(args.recvTokenNumMemObj, myPe * sizeof(uint32_t),
-                                        numToken + 1, destPe);
-      // shmem::ShmemAtomicUint32NonFetchThread(args.recvTokenNumMemObj, myPe * sizeof(uint32_t),
-      //                                        numToken + 1, destPe, core::atomicType::AMO_SET);
+      shmem::ShmemPutInt32ImmNbiThread(args.recvTokenNumMemObj, myPe * sizeof(index_t),
+                                       numToken + 1, destPe);
     }
   }
   SyncIfDebugEnabled("Dispatch kernel: finish sending tok2expt mapping & num token signal");
 
   // Phase 2: recv token
   // Each warp wait until sender finished by waiting token number signal
-  uint32_t* recvTokenNumArr = reinterpret_cast<uint32_t*>(sharedMem) + warpId * npes;
+  index_t* recvTokenNumArr = reinterpret_cast<index_t*>(sharedMem) + warpId * npes;
   // TODO: kernel hangs here when launch too many blocks
   for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-    uint32_t* signal = args.recvTokenNumMemObj->template GetAs<uint32_t*>() + destPe;
-    shmem::ShmemUint32WaitUntilGreaterThan(signal, 0);
-    uint32_t recvTokenNum = core::AtomicLoadRelaxedSystem(signal) - 1;
+    index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>() + destPe;
+    shmem::ShmemInt32WaitUntilGreaterThan(signal, 0);
+    index_t recvTokenNum = core::AtomicLoadRelaxedSystem(signal) - 1;
     recvTokenNumArr[destPe] = recvTokenNum;
     if (globalWarpId == 0) atomicAdd(args.totalRecvTokenNum, recvTokenNum);
   }
@@ -161,22 +159,22 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
   for (int i = globalWarpId;; i += globalWarpNum) {
     // find src pe and tok id
-    uint32_t srcPe = 0;
-    uint32_t accumPeTokOffset = 0;
+    index_t srcPe = 0;
+    index_t accumPeTokOffset = 0;
     for (; srcPe < npes; srcPe++) {
       if ((i >= accumPeTokOffset) && (i < (accumPeTokOffset + recvTokenNumArr[srcPe]))) break;
       accumPeTokOffset += recvTokenNumArr[srcPe];
     }
     if (srcPe >= npes) break;
 
-    uint32_t localTokenIdx = 0;
+    index_t localTokenIdx = 0;
     if (laneId == 0) {
       localTokenIdx = atomicAdd(args.localPeTokenCounter, 1);
     }
     localTokenIdx = __shfl(localTokenIdx, 0);
 
     // Copy token
-    uint32_t peSortedId = srcPe * MaxNumTokensToRecvPerRank + i - accumPeTokOffset;
+    index_t peSortedId = srcPe * MaxNumTokensToRecvPerRank + i - accumPeTokOffset;
 
     core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + localTokenIdx * config.hiddenDim,
                    args.shmemInpTokMemObj->template GetAs<T*>() + peSortedId * config.hiddenDim,
@@ -186,9 +184,9 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
                    args.shmemInpWeightsMemObj->template GetAs<float*>() +
                        peSortedId * config.numExpertPerToken,
                    config.numExpertPerToken);
-    core::WarpCopy(args.shmemOutIndiciesMemObj->template GetAs<uint32_t*>() +
+    core::WarpCopy(args.shmemOutIndiciesMemObj->template GetAs<index_t*>() +
                        localTokenIdx * config.numExpertPerToken,
-                   args.shmemInpIndiciesMemObj->template GetAs<uint32_t*>() +
+                   args.shmemInpIndiciesMemObj->template GetAs<index_t*>() +
                        peSortedId * config.numExpertPerToken,
                    config.numExpertPerToken);
     if (laneId == 0) {
@@ -255,19 +253,19 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
   size_t MaxNumTokensToSendPerRank = config.MaxNumTokensToSendPerRank();
   size_t MaxNumTokensToRecvPerRank = config.MaxNumTokensToRecvPerRank();
 
-  uint32_t totalRecvTokenNum = args.totalRecvTokenNum[0];
+  index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
 
   // Phase 1: send token
   // This phase is symmetric with dispatch recv phase, where tokens are first sent back to its
   // source pe in pe sorted order
   for (int localTokenIdx = globalWarpId; localTokenIdx < totalRecvTokenNum;
        localTokenIdx += globalWarpNum) {
-    uint32_t peSortedId = args.dispReceiverIdxMap[localTokenIdx];
-    uint32_t srcPe = peSortedId / MaxNumTokensToRecvPerRank;
+    index_t peSortedId = args.dispReceiverIdxMap[localTokenIdx];
+    index_t srcPe = peSortedId / MaxNumTokensToRecvPerRank;
     peSortedId = peSortedId - srcPe * MaxNumTokensToRecvPerRank + myPe * MaxNumTokensToRecvPerRank;
 
-    uint32_t peSortedOffset = peSortedId * config.hiddenDim;
-    uint32_t tokenOffset = localTokenIdx * config.hiddenDim;
+    index_t peSortedOffset = peSortedId * config.hiddenDim;
+    index_t tokenOffset = localTokenIdx * config.hiddenDim;
 
     core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + tokenOffset,
                    args.inpTokenBuf + tokenOffset, config.hiddenDim);
@@ -295,8 +293,8 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
     // Prepare data pointers on different GPUs
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
-      uint32_t peSortedId = args.dispSenderIdxMap[tokenId * config.numExpertPerToken + j];
-      uint32_t destPe = peSortedId / MaxNumTokensToRecvPerRank;
+      index_t peSortedId = args.dispSenderIdxMap[tokenId * config.numExpertPerToken + j];
+      index_t destPe = peSortedId / MaxNumTokensToRecvPerRank;
       if (destPe < config.worldSize) {
         srcPtrs[j] = args.shmemInpTokMemObj->template GetAs<T*>() + peSortedId * config.hiddenDim +
                      hiddenDimOffset;
