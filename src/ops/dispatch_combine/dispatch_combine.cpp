@@ -18,111 +18,13 @@ using namespace mori::core;
 using namespace mori::shmem;
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                         EpCombineKernel                                        */
-/* ---------------------------------------------------------------------------------------------- */
-template <typename T>
-__global__ void EpCombineKernel(EpDispatchCombineArgs<T> args) {
-  const EpDispatchCombineConfig& config = args.config;
-  int thdId = threadIdx.x;
-  int thdNum = blockDim.x;
-
-  int laneId = threadIdx.x & (warpSize - 1);
-  int warpId = thdId / warpSize;
-  int warpNum = blockDim.x / warpSize;
-
-  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
-  int globalWarpId = blockIdx.x * warpNum + warpId;
-  int globalWarpNum = gridDim.x * warpNum;
-
-  int myPe = config.rank;
-  int npes = config.worldSize;
-
-  T* inpTokenBuf = args.inpTokenBuf;
-  T* shmemInpTokenBuf = args.shmemInpTokMemObj->template GetAs<T*>();
-  T* shmemOutTokenBuf = args.shmemOutTokMemObj->template GetAs<T*>();
-
-  size_t maxNumOutTokenPerRank = config.maxNumInpTokenPerRank * config.numExpertPerToken;
-
-  // Phase 1: recover tokens from expert sorted order to pe sorted order and send token back
-  // Each warp compute total number of recveid tokens
-  uint32_t* recvTokenNumBuf = args.recvTokenNumMemObj->template GetAs<uint32_t*>();
-  uint32_t totalNumRecvToken = 0;
-  for (int i = laneId; i < npes; i += warpSize) {
-    totalNumRecvToken += recvTokenNumBuf[i] - 1;
-  }
-  totalNumRecvToken = WarpReduceSum(totalNumRecvToken);
-  totalNumRecvToken = __shfl(totalNumRecvToken, 0);
-
-  // Recover pe sorted order and send back
-  for (int exptSortedId = 0; exptSortedId < totalNumRecvToken; exptSortedId++) {
-    if ((exptSortedId % globalWarpNum) != globalWarpId) continue;
-
-    uint32_t peSortedId = args.dispReceiverIdxMap[exptSortedId];
-    uint32_t peSortedOffset = peSortedId * config.hiddenDim;
-
-    uint32_t destPe = peSortedId / maxNumOutTokenPerRank;
-    uint32_t peerPeSortedOffset =
-        (peSortedId - destPe * maxNumOutTokenPerRank + myPe * maxNumOutTokenPerRank) *
-        config.hiddenDim;
-
-    uint32_t exptSortedOffset = exptSortedId * config.hiddenDim;
-
-    WarpCopy(shmemInpTokenBuf + peSortedOffset, inpTokenBuf + exptSortedOffset, config.hiddenDim);
-    ShmemPutTypeNbiWarp<T>(args.shmemOutTokMemObj, peerPeSortedOffset, args.shmemInpTokMemObj,
-                           peSortedOffset, config.hiddenDim, destPe);
-    if (laneId == 0) {
-      uint32_t destPeCopyCnt = atomicAdd(args.combineGridBarrier + destPe, 1);
-    }
-  }
-  SyncIfDebugEnabled("Combine kernel: finish recovering from expert sorted to pe sorted");
-
-  // TODO: since we don't have atomic yet, we have to wait untill all tokens are sent, then set
-  // the remote flag; once we have atomic operation, we can send an atomic rdma op after each
-  // token and the remote peer polling the flag to know if the token is finished sent
-  for (int destPe = globalWarpId; destPe < npes; destPe += globalWarpNum) {
-    uint32_t numTokenSignal = recvTokenNumBuf[destPe];
-    uint32_t recvTokenNum = numTokenSignal - 1;
-
-    ShmemUint32WaitUntilEquals(args.combineGridBarrier + destPe, recvTokenNum);
-    AtomicStoreRelaxed(args.combineGridBarrier + destPe, uint32_t{0});
-    ShmemPutUint32ImmNbiWarp(args.sendTokenNumMemObj, myPe * sizeof(uint32_t), numTokenSignal,
-                             destPe);
-  }
-  SyncIfDebugEnabled("Combine kernel: finish sending tokens");
-  __threadfence_system();
-
-  // Phase 2: recv pe sorted token, reduce accross expert and recover original order
-  for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-    uint32_t* signal = args.sendTokenNumMemObj->template GetAs<uint32_t*>() + destPe;
-    ShmemUint32WaitUntilGreaterThan(signal, 0);
-  }
-  SyncIfDebugEnabled("Combine kernel: finish waiting num token signal");
-
-  extern __shared__ char sharedMem[];
-  T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
-
-  T* outTokenBuf = args.outTokenBuf;
-  for (int i = 0; i < args.curRankNumToken; i++) {
-    if ((i % globalWarpNum) != globalWarpId) continue;
-
-    for (int j = 0; j < config.numExpertPerToken; j++) {
-      uint32_t peSortedId = args.dispSenderIdxMap[i * config.numExpertPerToken + j];
-      uint32_t peSortedOffset = peSortedId * config.hiddenDim;
-      srcPtrs[j] = shmemOutTokenBuf + peSortedOffset;
-    }
-
-    WarpAccum(args.outTokenBuf + i * config.hiddenDim, srcPtrs,
-              args.weightsBuf + i * config.numExpertPerToken, config.numExpertPerToken,
-              config.hiddenDim);
-  }
-}
-
-/* ---------------------------------------------------------------------------------------------- */
 /*                                           ResetKernel                                          */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>
 __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
   int thdId = threadIdx.x;
+  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
+
   for (int destPe = thdId; destPe < args.config.worldSize; destPe += blockDim.x) {
     args.recvTokenNumMemObj->template GetAs<uint32_t*>()[destPe] = 0;
     args.sendTokenNumMemObj->template GetAs<uint32_t*>()[destPe] = 0;
@@ -136,6 +38,10 @@ __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
   if (thdId == 0) {
     args.dispTokOffsetMemObj->template GetAs<uint32_t*>()[0] = 0;
     core::AtomicStoreRelaxedSystem(args.totalRecvTokenNum, size_t{0});
+  }
+  // TODO: this should be one in wqe post API
+  if (globalThdId == 0) {
+    shmem::ShmemQuietThread();
   }
 }
 

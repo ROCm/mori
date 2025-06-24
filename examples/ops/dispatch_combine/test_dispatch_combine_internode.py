@@ -16,11 +16,11 @@ class EpDispatchCombineTestCase:
             rank=self.rank,
             world_size=self.world_size,
             hidden_dim=7168,
-            max_num_inp_token_per_rank=128,
+            max_num_inp_token_per_rank=512,
             num_experts_per_rank=16,
             num_experts_per_token=8,
             warp_num_per_block=4,
-            block_num=32,
+            block_num=64,
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNode,
         )
 
@@ -207,9 +207,12 @@ class EpDispatchCombineTestCase:
 
     def test_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
-        for i in range(1):
+        for i in range(1000):
+            if self.rank == 0:
+                print(f"Round {i} begin")
             test_data = self.gen_test_data()
             self.run_test_once(op, test_data)
+
         del op
 
 

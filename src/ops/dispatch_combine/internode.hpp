@@ -23,39 +23,6 @@ __device__ void SyncIfDebugEnabled(const char* msg) {
 }
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                          BarrierKernel                                         */
-/* ---------------------------------------------------------------------------------------------- */
-template <typename T>
-inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T> args) {
-  int thdId = threadIdx.x;
-  int laneId = threadIdx.x & (warpSize - 1);
-  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
-  int globalWarpId = globalThdId / warpSize;
-
-  int warpNum = blockDim.x / warpSize;
-  int globalWarpNum = gridDim.x * warpNum;
-
-  if (laneId == 0) atomicAdd(args.combineGridBarrier, 1);
-
-  // TODO: still figure out why use multiple threads lost RDMA writes
-  for (int destPe = globalWarpId; destPe < args.config.worldSize; destPe += globalWarpNum) {
-    if (laneId == 0) {
-      shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
-      shmem::ShmemPutUint32ImmNbiThread(args.crossDeviceBarrierMemObj,
-                                        args.config.rank * sizeof(uint32_t),
-                                        args.crossDeviceBarrierFlag, destPe);
-    }
-  }
-
-  uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
-  if (thdId < args.config.worldSize) {
-    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != args.crossDeviceBarrierFlag) {
-    }
-  }
-  __syncthreads();
-}
-
-/* ---------------------------------------------------------------------------------------------- */
 /*                                    EpDispatchInterNodeKernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
 // TODO: this mode only works correctly with MORI_DISABLE_P2P=1 set, figure out why
@@ -232,6 +199,39 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
 }
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                                          BarrierKernel                                         */
+/* ---------------------------------------------------------------------------------------------- */
+template <typename T>
+inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T> args) {
+  int thdId = threadIdx.x;
+  int laneId = threadIdx.x & (warpSize - 1);
+  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
+  int globalWarpId = globalThdId / warpSize;
+
+  int warpNum = blockDim.x / warpSize;
+  int globalWarpNum = gridDim.x * warpNum;
+
+  if (laneId == 0) atomicAdd(args.combineGridBarrier, 1);
+
+  // TODO: still figure out why use multiple threads lost RDMA writes
+  for (int destPe = globalWarpId; destPe < args.config.worldSize; destPe += globalWarpNum) {
+    if (laneId == 0) {
+      shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
+      shmem::ShmemPutUint32ImmNbiThread(args.crossDeviceBarrierMemObj,
+                                        args.config.rank * sizeof(uint32_t),
+                                        args.crossDeviceBarrierFlag, destPe);
+    }
+  }
+
+  uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
+  if (thdId < args.config.worldSize) {
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != args.crossDeviceBarrierFlag) {
+    }
+  }
+  __syncthreads();
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                    EpCombineInterNodeKernel                                    */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>
@@ -256,7 +256,6 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
   size_t MaxNumTokensToRecvPerRank = config.MaxNumTokensToRecvPerRank();
 
   uint32_t totalRecvTokenNum = args.totalRecvTokenNum[0];
-  if (globalThdId == 0) printf("mype %d total recv token num %d\n", myPe, totalRecvTokenNum);
 
   // Phase 1: send token
   // This phase is symmetric with dispatch recv phase, where tokens are first sent back to its
@@ -272,10 +271,12 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
     core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + tokenOffset,
                    args.inpTokenBuf + tokenOffset, config.hiddenDim);
-    if (laneId == 0) core::AcquireLock(args.lock);
-    shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, peSortedOffset, args.shmemOutTokMemObj,
-                                  tokenOffset, config.hiddenDim, srcPe);
-    if (laneId == 0) core::ReleaseLock(args.lock);
+    if (laneId == 0) {
+      core::AcquireLock(args.lock);
+      shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, peSortedOffset, args.shmemOutTokMemObj,
+                                    tokenOffset, config.hiddenDim, srcPe);
+      core::ReleaseLock(args.lock);
+    }
   }
   // Make sure copy on all GPUs are finished
   CrossDeviceBarrierInterNodeKernel(args);

@@ -32,21 +32,46 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::P2P>
   core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
 }
 
-// TODO: use uint8_t may cause incompleted data, use other data size
 template <>
 inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::P2P>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe) {
   uint8_t* srcPtr = reinterpret_cast<uint8_t*>(val);
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
-  core::ThreadCopyAtomic<uint8_t>(destPtr, srcPtr, bytes);
+  switch (bytes) {
+    case 1:
+      core::AtomicStoreRelaxedSystem(destPtr, reinterpret_cast<uint8_t*>(val)[0]);
+      break;
+    case 2:
+      core::AtomicStoreRelaxedSystem(reinterpret_cast<uint16_t*>(destPtr),
+                                     reinterpret_cast<uint16_t*>(val)[0]);
+      break;
+    case 4:
+      core::AtomicStoreRelaxedSystem(reinterpret_cast<uint32_t*>(destPtr),
+                                     reinterpret_cast<uint32_t*>(val)[0]);
+      break;
+    case 8:
+      core::AtomicStoreRelaxedSystem(reinterpret_cast<uint64_t*>(destPtr),
+                                     reinterpret_cast<uint64_t*>(val)[0]);
+      break;
+    case 16:
+      reinterpret_cast<uint4*>(destPtr)[0] = reinterpret_cast<uint4*>(val)[0];
+      break;
+    default:
+      printf(
+          "Size must be one of [1,2,4,8,16] bytes, got %lu, for arbitrary size, use ShmemPutMemNbi "
+          "APIs",
+          bytes);
+      assert(false);
+  }
 }
 
 template <>
 inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::P2P>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe) {
-  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(val);
-  uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
-  core::WarpCopyAtomic<uint8_t>(destPtr, srcPtr, bytes);
+  int laneId = threadIdx.x & (warpSize - 1);
+  if (laneId == 0)
+    ShmemPutSizeImmNbiThreadKernel<application::TransportType::P2P>(dest, destOffset, val, bytes,
+                                                                    pe);
 }
 
 template <>
