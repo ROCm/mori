@@ -57,7 +57,7 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle<T>& handle, int kernelType,
 
   torch::Tensor totalRecvTokenNum = torch::from_blob(
       handle.totalRecvTokenNum, {1},
-      torch::TensorOptions().dtype(mori::GetTorchDataType<size_t>()).device(torch::kCUDA));
+      torch::TensorOptions().dtype(mori::GetTorchDataType<mori::moe::index_t>()).device(torch::kCUDA));
   return {out, outWeights, outScales, outIndicies, totalRecvTokenNum};
 }
 
@@ -102,7 +102,7 @@ torch::Tensor GetDispatchSenderTokenIdxMap(mori::moe::EpDispatchCombineHandle<T>
                      .device(torch::kCUDA);
   torch::Tensor tensor =
       torch::from_blob(handle.dispSenderIdxMap,
-                       {int(handle.curRankNumToken * handle.config.numExpertPerToken)}, options);
+                       {handle.curRankNumToken * handle.config.numExpertPerToken}, options);
   return tensor;
 }
 
@@ -112,7 +112,7 @@ torch::Tensor GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle<
                      .dtype(mori::GetTorchDataType<mori::moe::index_t>())
                      .device(torch::kCUDA);
   torch::Tensor tensor =
-      torch::from_blob(handle.dispReceiverIdxMap, {int(*handle.localPeTokenCounter)}, options);
+      torch::from_blob(handle.dispReceiverIdxMap, {*handle.localPeTokenCounter}, options);
   return tensor;
 }
 

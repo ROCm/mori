@@ -50,7 +50,7 @@ class EpDispatchCombineHandle {
   ~EpDispatchCombineHandle();
 
   void PrepareInference(T* input, T* output, float* weights, index_t* tokenIndicies,
-                        size_t numToken) {
+                        index_t numToken) {
     this->inpTokenBuf = input;
     this->outTokenBuf = output;
     this->weightsBuf = weights;
@@ -59,7 +59,7 @@ class EpDispatchCombineHandle {
   }
 
   void PrepareInference(T* input, T* output, float* weights, uint8_t* scales,
-                        index_t* tokenIndicies, size_t numToken) {
+                        index_t* tokenIndicies, index_t numToken) {
     this->inpTokenBuf = input;
     this->outTokenBuf = output;
     this->weightsBuf = weights;
@@ -77,7 +77,7 @@ class EpDispatchCombineHandle {
   void LaunchCombine(KernelType, hipStream_t = 0);
   void LaunchReset(hipStream_t = 0);
 
-  size_t GetCurRankNumToken() const { return curRankNumToken; }
+  index_t GetCurRankNumToken() const { return curRankNumToken; }
 
  private:
   void IntializeShmemBuf();
@@ -94,7 +94,7 @@ class EpDispatchCombineHandle {
 
  public:
   // Number of tokens on this rank and size of scale data type, updated at each round of inference
-  size_t curRankNumToken{0};
+  index_t curRankNumToken{0};
 
  public:
   // Config
@@ -154,7 +154,7 @@ class EpDispatchCombineHandle {
 template <typename T>
 struct EpDispatchCombineArgs {
   EpDispatchCombineConfig config;
-  size_t curRankNumToken{0};
+  index_t curRankNumToken{0};
   index_t* tokenIndicies{nullptr};
   T* inpTokenBuf{nullptr};
   T* outTokenBuf{nullptr};
