@@ -11,6 +11,8 @@ class EpDispatchCombineConfig:
     rank: int
     world_size: int
     hidden_dim: int
+    scale_dim: int
+    scale_type_size: int
     max_num_inp_token_per_rank: int
     num_experts_per_rank: int
     num_experts_per_token: int
@@ -37,6 +39,8 @@ class EpDispatchCombineOp:
                 rank=config.rank,
                 world_size=config.world_size,
                 hidden_dim=config.hidden_dim,
+                scale_dim=config.scale_dim,
+                scale_type_size=config.scale_type_size,
                 max_num_inp_token_per_rank=config.max_num_inp_token_per_rank,
                 num_experts_per_rank=config.num_experts_per_rank,
                 num_experts_per_token=config.num_experts_per_token,
@@ -59,12 +63,13 @@ class EpDispatchCombineOp:
         )
 
     def dispatch(
-        self, input: torch.Tensor, weights: torch.Tensor, indicies: torch.Tensor
+        self, input: torch.Tensor, weights: torch.Tensor, scales: torch.Tensor, indicies: torch.Tensor
     ):
         return self._intra_node_dispatch_func(
             self._handle,
             input,
             weights,
+            scales,
             indicies,
         )
 

@@ -378,12 +378,19 @@ void EpDispatchCombineHandle<T>::IntializeShmemBuf() {
   shmemWeightsMemObj = ShmemQueryMemObjPtr(shmemWeightsBuf);
   assert(shmemWeightsMemObj.IsValid());
 
+  size_t maxScaleSize =
+      config.MaxNumTokensToRecvPerRank() * config.scaleDim * config.scaleTypeSize;
+  void* shmemScalesBuf = ShmemExtMallocWithFlags(maxScaleSize, hipDeviceMallocUncached);
+  HIP_RUNTIME_CHECK(hipMemset(shmemScalesBuf, 0, maxScaleSize));
+  shmemScalesMemObj = ShmemQueryMemObjPtr(shmemScalesBuf);
+  assert(shmemScalesMemObj.IsValid());
+
   size_t maxIndiciesSize =
       config.MaxNumTokensToRecvPerRank() * config.numExpertPerToken * sizeof(uint32_t);
   void* shmemIndiciesBuf = ShmemExtMallocWithFlags(maxIndiciesSize, hipDeviceMallocUncached);
   HIP_RUNTIME_CHECK(hipMemset(shmemIndiciesBuf, 0, maxIndiciesSize));
   shmemIndiciesMemObj = ShmemQueryMemObjPtr(shmemIndiciesBuf);
-  assert(shmemWeightsMemObj.IsValid());
+  assert(shmemIndiciesMemObj.IsValid());
 }
 
 template <typename T>
@@ -391,6 +398,7 @@ void EpDispatchCombineHandle<T>::FinalizeShmemBuf() {
   ShmemFree(shmemInpTokMemObj->localPtr);
   ShmemFree(shmemOutTokMemObj->localPtr);
   ShmemFree(shmemWeightsMemObj->localPtr);
+  ShmemFree(shmemScalesMemObj->localPtr);
   ShmemFree(shmemIndiciesMemObj->localPtr);
 }
 
