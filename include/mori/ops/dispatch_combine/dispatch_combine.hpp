@@ -53,15 +53,13 @@ class EpDispatchCombineHandle {
   }
 
   void PrepareInference(T* input, T* output, float* weights, uint8_t* scales,
-                        uint32_t* tokenIndicies, size_t numToken, size_t scaleTypeSize) {
+                        uint32_t* tokenIndicies, size_t numToken) {
     this->inpTokenBuf = input;
     this->outTokenBuf = output;
     this->weightsBuf = weights;
     this->scalesBuf = scales;
     this->tokenIndicies = tokenIndicies;
     this->curRankNumToken = numToken;
-    this->curScaleTypeSize = scaleTypeSize;
-    // std::cout << "curScaleTypeSize " << this->curScaleTypeSize << std::endl;
   }
 
   void LaunchIntraNodeDispatch(hipStream_t = 0);
@@ -92,7 +90,6 @@ class EpDispatchCombineHandle {
  public:
   // Number of tokens on this rank and size of scale data type, updated at each round of inference
   size_t curRankNumToken{0};
-  size_t curScaleTypeSize{0};
 
  public:
   // Config
@@ -152,7 +149,6 @@ template <typename T>
 struct EpDispatchCombineArgs {
   EpDispatchCombineConfig config;
   size_t curRankNumToken{0};
-  size_t curScaleTypeSize{0};
   uint32_t* tokenIndicies{nullptr};
   T* inpTokenBuf{nullptr};
   T* outTokenBuf{nullptr};
@@ -186,7 +182,6 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<
   EpDispatchCombineArgs<T> args;
   args.config = handle.config;
   args.curRankNumToken = handle.curRankNumToken;
-  args.curScaleTypeSize = handle.curScaleTypeSize;
   args.tokenIndicies = handle.tokenIndicies;
   args.inpTokenBuf = handle.inpTokenBuf;
   args.outTokenBuf = handle.outTokenBuf;
@@ -226,6 +221,8 @@ static std::ostream& operator<<(std::ostream& s, mori::moe::EpDispatchCombineCon
   ss << "EpDispatchCombineConfig: " << std::endl
      << "  WorlSize: " << config.worldSize << std::endl
      << "  hiddenDim: " << config.hiddenDim << std::endl
+     << "  scaleDim: " << config.scaleDim << std::endl
+     << "  scaleTypeSize: " << config.scaleTypeSize << std::endl
      << "  maxNumInpTokenPerRank: " << config.maxNumInpTokenPerRank << std::endl
      << "  numExpertPerRank: " << config.numExpertPerRank << std::endl
      << "  numExpertPerToken: " << config.numExpertPerToken << std::endl

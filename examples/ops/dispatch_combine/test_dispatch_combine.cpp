@@ -100,7 +100,7 @@ class EpDispatchCombineTestCase {
     HIP_RUNTIME_CHECK(hipMalloc(&weightsBuf, weightsBufSize));
     HIP_RUNTIME_CHECK(hipMemset(weightsBuf, 0, weightsBufSize));
 
-    int scalesBufSize = config.MaxNumTokensToSendPerRank() * config.scaleDim * scaleTypeSize;
+    int scalesBufSize = config.MaxNumTokensToSendPerRank() * config.scaleDim * config.scaleTypeSize;
     HIP_RUNTIME_CHECK(hipMalloc(&scalesBuf, scalesBufSize));
     HIP_RUNTIME_CHECK(hipMemset(scalesBuf, 0, scalesBufSize));
   }
@@ -130,8 +130,7 @@ class EpDispatchCombineTestCase {
     }
     RandomInitializeWeights();
     RandomInitializeToken();
-    handle.PrepareInference(inpTokBuf, outTokBuf, weightsBuf, scalesBuf, tokenIndicies, numToken,
-                            scaleTypeSize);
+    handle.PrepareInference(inpTokBuf, outTokBuf, weightsBuf, scalesBuf, tokenIndicies, numToken);
     // PrintDispatch();
     // PrintDispatchStats();
   }
@@ -516,7 +515,6 @@ class EpDispatchCombineTestCase {
   uint8_t* scalesBuf{nullptr};
   uint32_t* tokenIndicies{nullptr};
   int numToken{-1};
-  int scaleTypeSize{-1};
   EpDispatchCombineHandle<T>& handle;
   RunConfig runConfig;
 };

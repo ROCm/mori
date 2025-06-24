@@ -79,10 +79,10 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     }
 
     // Write scales
-    uint32_t destScaleOffset = destTokId * config.scaleDim * args.curScaleTypeSize;
-    uint32_t srcScaleOffset = srcTokId * config.scaleDim * args.curScaleTypeSize;
+    uint32_t destScaleOffset = destTokId * config.scaleDim * config.scaleTypeSize;
+    uint32_t srcScaleOffset = srcTokId * config.scaleDim * config.scaleTypeSize;
     core::WarpCopy(args.shmemScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
-                   args.scalesBuf + srcScaleOffset, config.scaleDim * args.curScaleTypeSize);
+                   args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
 
     uint32_t srcTokOffset = srcTokId * config.hiddenDim;
     uint32_t destTokOffset = destTokId * config.hiddenDim;

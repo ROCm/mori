@@ -26,9 +26,15 @@ for blockNum in "${blockNumList[@]}"; do
 for dataType in "${dataTypeList[@]}"; do
 for scaleType in "${scaleTypeList[@]}"; do
 
-mpirun -np $worldSize --allow-run-as-root $execPath --cmd test --data_type $dataType --hdim=$hiddenStateSize \
-        --scale_dim=$scaleDim --max_tokens=$tokenNum --expert_per_rank=$expertPerRank --expert_per_token=$expertPerToken \
-        --warp_per_blk=$warpPerBlock --block_num=$blockNum --scale_type=$scaleType --num=3
+cmd="mpirun -np $worldSize --allow-run-as-root $execPath --cmd test --data_type $dataType --hdim=$hiddenStateSize \
+--scale_dim=$scaleDim --max_tokens=$tokenNum --expert_per_rank=$expertPerRank --expert_per_token=$expertPerToken \
+--warp_per_blk=$warpPerBlock --block_num=$blockNum --scale_type=$scaleType --num=3"
+echo "$cmd"
+eval "$cmd"
+if [ $? -ne 0 ]; then
+    echo "Command failed: $cmd"
+    exit 1
+fi
 
 done # scaleType
 done # dataType

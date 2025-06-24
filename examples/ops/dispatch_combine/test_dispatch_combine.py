@@ -16,7 +16,7 @@ class EpDispatchCombineTestCase:
             world_size=self.world_size,
             hidden_dim=7168,
             scale_dim=32,
-            scale_type_size=4,
+            scale_type_size=1,
             max_num_inp_token_per_rank=512,
             num_experts_per_rank=32,
             num_experts_per_token=8,

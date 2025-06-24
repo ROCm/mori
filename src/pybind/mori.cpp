@@ -26,10 +26,11 @@ LaunchIntraNodeDispatch(mori::moe::EpDispatchCombineHandle<T>& handle, const tor
                         const torch::Tensor& topkIds) {
   assert(input.is_contiguous() && weights.is_contiguous() && scales.is_contiguous() &&
          topkIds.is_contiguous());
+  assert(scales.element_size() == handle.config.scaleTypeSize);
 
   handle.PrepareInference(reinterpret_cast<T*>(input.data_ptr()), nullptr,
                           weights.data_ptr<float>(), reinterpret_cast<uint8_t*>(scales.data_ptr()),
-                          topkIds.data_ptr<uint32_t>(), input.size(0), scales.element_size());
+                          topkIds.data_ptr<uint32_t>(), input.size(0));
   handle.LaunchIntraNodeDispatch(at::cuda::getCurrentHIPStream());
 
   torch::Tensor out = torch::from_blob(
