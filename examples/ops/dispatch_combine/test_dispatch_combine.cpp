@@ -100,9 +100,12 @@ class EpDispatchCombineTestCase {
     HIP_RUNTIME_CHECK(hipMalloc(&weightsBuf, weightsBufSize));
     HIP_RUNTIME_CHECK(hipMemset(weightsBuf, 0, weightsBufSize));
 
-    int scalesBufSize = config.MaxNumTokensToSendPerRank() * config.scaleDim * config.scaleTypeSize;
-    HIP_RUNTIME_CHECK(hipMalloc(&scalesBuf, scalesBufSize));
-    HIP_RUNTIME_CHECK(hipMemset(scalesBuf, 0, scalesBufSize));
+    if (config.scaleDim > 0) {
+      int scalesBufSize =
+          config.MaxNumTokensToSendPerRank() * config.scaleDim * config.scaleTypeSize;
+      HIP_RUNTIME_CHECK(hipMalloc(&scalesBuf, scalesBufSize));
+      HIP_RUNTIME_CHECK(hipMemset(scalesBuf, 0, scalesBufSize));
+    }
   }
 
   ~EpDispatchCombineTestCase() {
@@ -129,6 +132,7 @@ class EpDispatchCombineTestCase {
       assert(false);
     }
     RandomInitializeWeights();
+    RandomInitializeScales();
     RandomInitializeToken();
     handle.PrepareInference(inpTokBuf, outTokBuf, weightsBuf, scalesBuf, tokenIndicies, numToken);
     // PrintDispatch();
@@ -477,6 +481,22 @@ class EpDispatchCombineTestCase {
     for (int i = 0; i < numToken; i++) {
       for (int j = 0; j < config.numExpertPerToken; j++) {
         weightsBuf[i * config.numExpertPerToken + j] = tokValDist(gen);
+      }
+    }
+  }
+
+  void RandomInitializeScales() {
+    if (!scalesBuf) return;
+    EpDispatchCombineConfig& config = handle.config;
+    uniform_real_distribution<> tokValDist(0, 1);
+    for (int i = 0; i < numToken; i++) {
+      for (int j = 0; j < config.scaleDim; j++) {
+        if (config.scaleTypeSize == sizeof(float)) {
+          reinterpret_cast<float*>(scalesBuf)[i * config.scaleDim + j] = tokValDist(gen);
+        } else {
+          reinterpret_cast<__hip_fp8_e4m3_fnuz*>(scalesBuf)[i * config.scaleDim + j] =
+              tokValDist(gen);
+        }
       }
     }
   }
