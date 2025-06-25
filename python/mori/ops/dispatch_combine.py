@@ -1,8 +1,14 @@
 from mori import cpp as mori_cpp
 
 from dataclasses import dataclass
-
+from enum import Enum
 import torch
+import torch.distributed as dist
+
+
+class EpDispatchCombineKernelType(mori_cpp.EpDispatchCombineKernelType):
+    def __str__(self):
+        return self.name
 
 
 @dataclass
@@ -16,6 +22,9 @@ class EpDispatchCombineConfig:
     max_num_inp_token_per_rank: int
     num_experts_per_rank: int
     num_experts_per_token: int
+    warp_num_per_block: int = 4
+    block_num: int = 256
+    kernel_type: EpDispatchCombineKernelType = EpDispatchCombineKernelType.IntraNode
 
 
 def _cpp_dispatch_combine_factory(data_type: torch.dtype, entity_name):
@@ -44,16 +53,16 @@ class EpDispatchCombineOp:
                 max_num_inp_token_per_rank=config.max_num_inp_token_per_rank,
                 num_experts_per_rank=config.num_experts_per_rank,
                 num_experts_per_token=config.num_experts_per_token,
-                warp_num_per_block=4,  # config.warp_num_per_block,
-                block_num=256,  # config.block_num,
+                warp_num_per_block=config.warp_num_per_block,
+                block_num=config.block_num,
             )
         )
 
-        self._intra_node_dispatch_func = _cpp_dispatch_combine_factory(
-            config.data_type, "launch_intra_node_dispatch_"
+        self._dispatch_func = _cpp_dispatch_combine_factory(
+            config.data_type, "launch_dispatch_"
         )
-        self._intra_node_combine_func = _cpp_dispatch_combine_factory(
-            config.data_type, "launch_intra_node_combine_"
+        self._combine_func = _cpp_dispatch_combine_factory(
+            config.data_type, "launch_combine_"
         )
         self._reset_func = _cpp_dispatch_combine_factory(
             config.data_type, "launch_reset_"
@@ -61,12 +70,22 @@ class EpDispatchCombineOp:
         self._get_dispatch_src_token_pos_func = _cpp_dispatch_combine_factory(
             config.data_type, "get_dispatch_src_token_pos_"
         )
+        self._get_cur_rank_num_token = _cpp_dispatch_combine_factory(
+            config.data_type, "get_cur_rank_num_token_"
+        )
+        self._get_dispatch_sender_token_idx_map_func = _cpp_dispatch_combine_factory(
+            config.data_type, "get_dispatch_sender_token_idx_map_"
+        )
+        self._get_dispatch_receiver_token_idx_map_func = _cpp_dispatch_combine_factory(
+            config.data_type, "get_dispatch_receiver_token_idx_map_"
+        )
 
     def dispatch(
         self, input: torch.Tensor, weights: torch.Tensor, scales: torch.Tensor, indicies: torch.Tensor
     ):
-        return self._intra_node_dispatch_func(
+        return self._dispatch_func(
             self._handle,
+            self.config.kernel_type.value,
             input,
             weights,
             scales,
@@ -76,8 +95,9 @@ class EpDispatchCombineOp:
     def combine(
         self, input: torch.Tensor, weights: torch.Tensor, indicies: torch.Tensor
     ):
-        output = self._intra_node_combine_func(
+        output = self._combine_func(
             self._handle,
+            self.config.kernel_type.value,
             input,
             weights,
             indicies,
@@ -85,5 +105,88 @@ class EpDispatchCombineOp:
         self._reset_func(self._handle)
         return output
 
+    def reset(self):
+        self._reset_func(self._handle)
+
+    def _allgather_with_token_num_padding(self, input, max_token_num):
+        shape = list(input.shape)
+
+        pad_shape = shape.copy()
+        pad_shape[0] = max_token_num - shape[0]
+
+        target_shape = shape.copy()
+        target_shape[0] = max_token_num
+
+        output = [
+            torch.zeros(
+                target_shape,
+                dtype=input.dtype,
+                device=input.device,
+            )
+            for _ in range(self.config.world_size)
+        ]
+        padded_input = torch.cat(
+            [
+                input,
+                torch.zeros(
+                    pad_shape,
+                    dtype=input.dtype,
+                    device=input.device,
+                ),
+            ],
+            0,
+        )
+        dist.all_gather(output, padded_input)
+        return output
+
     def get_dispatch_src_token_pos(self):
-        return self._get_dispatch_src_token_pos_func(self._handle)
+        torch.cuda.synchronize()
+
+        if self.config.kernel_type.value == EpDispatchCombineKernelType.IntraNode.value:
+            return self._get_dispatch_src_token_pos_func(self._handle)
+
+        dispatch_sender_token_id_map = self._get_dispatch_sender_token_idx_map_func(
+            self._handle
+        )
+        dispatch_receiver_token_id_map = self._get_dispatch_receiver_token_idx_map_func(
+            self._handle
+        )
+
+        max_num_token_to_send_per_rank = (
+            self.config.max_num_inp_token_per_rank * self.config.num_experts_per_token
+        )
+        all_rank_sender_map = self._allgather_with_token_num_padding(
+            dispatch_sender_token_id_map.cpu().to(torch.int64),
+            self.config.max_num_inp_token_per_rank * self.config.num_experts_per_token,
+        )
+
+        cur_rank_num_token = self._get_cur_rank_num_token(self._handle)
+        all_rank_num_token = [torch.empty(1) for i in range(self.config.world_size)]
+        dist.all_gather(all_rank_num_token, torch.Tensor([cur_rank_num_token]))
+
+        reverse_sender_token_id_map = {}
+        for r in range(self.config.world_size):
+            for i, mapped_id in enumerate(
+                all_rank_sender_map[r].tolist()[
+                    : int(all_rank_num_token[r][0].item())
+                    * self.config.num_experts_per_token
+                ]
+            ):
+                dest_pe = mapped_id // max_num_token_to_send_per_rank
+                if dest_pe != self.config.rank:
+                    continue
+                mapped_id = (
+                    mapped_id
+                    - dest_pe * max_num_token_to_send_per_rank
+                    + r * max_num_token_to_send_per_rank
+                )
+                reverse_sender_token_id_map[mapped_id] = (
+                    i // self.config.num_experts_per_token
+                )
+        src_token_pos = []
+        for i, recv_mapped_id in enumerate(dispatch_receiver_token_id_map.tolist()):
+            src_pe = recv_mapped_id // max_num_token_to_send_per_rank
+            src_tok_id = reverse_sender_token_id_map[recv_mapped_id]
+            src_token_pos.append(src_pe * max_num_token_to_send_per_rank + src_tok_id)
+
+        return torch.tensor(src_token_pos, dtype=torch.int)

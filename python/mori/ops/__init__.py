@@ -1,1 +1,5 @@
-from .dispatch_combine import EpDispatchCombineConfig, EpDispatchCombineOp
+from .dispatch_combine import (
+    EpDispatchCombineKernelType,
+    EpDispatchCombineConfig,
+    EpDispatchCombineOp,
+)

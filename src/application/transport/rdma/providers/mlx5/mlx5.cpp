@@ -283,7 +283,8 @@ void Mlx5QpContainer::ModifyRst2Init() {
   assert(!status);
 }
 
-void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr) {
+void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
+                                     const ibv_port_attr& portAttr) {
   uint8_t init2rtr_cmd_in[DEVX_ST_SZ_BYTES(init2rtr_qp_in)] = {
       0,
   };
@@ -400,13 +401,13 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
            DEVX_ADDR_OF(query_roce_address_out, out, roce_address.source_mac_47_32),
            sizeof(endpoint.handle.eth.mac));
   } else if (hca_cap.IsInfiniBand()) {
-    auto mapPtr = GetRdmaDevice()->GetPortAttrMap();  
-    auto it = mapPtr->find(config.portId);  
-    if (it != mapPtr->end() && it->second) {  
-        ibv_port_attr* port_attr = it->second.get();  
-        endpoint.handle.ib.lid = port_attr->lid;  
-    } else {  
-        assert(false && "Port attribute not found for given port ID");  
+    auto mapPtr = GetRdmaDevice()->GetPortAttrMap();
+    auto it = mapPtr->find(config.portId);
+    if (it != mapPtr->end() && it->second) {
+      ibv_port_attr* port_attr = it->second.get();
+      endpoint.handle.ib.lid = port_attr->lid;
+    } else {
+      assert(false && "Port attribute not found for given port ID");
     }
   } else {
     assert(false);
@@ -443,7 +444,7 @@ void Mlx5DeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   Mlx5QpContainer* qp = qpPool.at(local_qpn);
   RdmaDevice* rdmaDevice = GetRdmaDevice();
   const ibv_device_attr_ex* deviceAttr = rdmaDevice->GetDeviceAttr();
-  const ibv_port_attr &portAttr = *(rdmaDevice->GetPortAttrMap()->find(local.portId)->second);
+  const ibv_port_attr& portAttr = *(rdmaDevice->GetPortAttrMap()->find(local.portId)->second);
   qp->ModifyRst2Init();
   qp->ModifyInit2Rtr(remote, portAttr);
   qp->ModifyRtr2Rts(local);

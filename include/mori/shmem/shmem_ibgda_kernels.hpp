@@ -76,6 +76,7 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::RDMA
 }
 
 // TODO: deal with bytes count limit
+// TODO: put size api only support 1,2,4,8,16 in nvshmem, should we do that?
 template <core::ProviderType PrvdType>
 inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::SymmMemObjPtr dest,
                                                           size_t destOffset, void* val,

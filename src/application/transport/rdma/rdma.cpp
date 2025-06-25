@@ -52,12 +52,12 @@ RdmaDevice::RdmaDevice(ibv_device* device) : device(device) {
   int status = ibv_query_device_ex(defaultContext, NULL, deviceAttr.get());
   assert(!status);
 
-  for (uint32_t port = 1; port <=  deviceAttr->orig_attr.phys_port_cnt; ++port) {  
-    std::unique_ptr<ibv_port_attr> portAttr(new ibv_port_attr{});  
-    int ret = ibv_query_port(defaultContext, port, portAttr.get());  
-    assert(!ret);  
-    portAttrMap.emplace(port, std::move(portAttr));  
-  }  
+  for (uint32_t port = 1; port <= deviceAttr->orig_attr.phys_port_cnt; ++port) {
+    std::unique_ptr<ibv_port_attr> portAttr(new ibv_port_attr{});
+    int ret = ibv_query_port(defaultContext, port, portAttr.get());
+    assert(!ret);
+    portAttrMap.emplace(port, std::move(portAttr));
+  }
 }
 
 RdmaDevice::~RdmaDevice() { ibv_close_device(defaultContext); }
@@ -81,7 +81,8 @@ std::string RdmaDevice::Name() const { return device->name; }
 
 const ibv_device_attr_ex* RdmaDevice::GetDeviceAttr() const { return deviceAttr.get(); }
 
-const std::unordered_map<uint32_t, std::unique_ptr<ibv_port_attr>>* RdmaDevice::GetPortAttrMap() const {
+const std::unordered_map<uint32_t, std::unique_ptr<ibv_port_attr>>* RdmaDevice::GetPortAttrMap()
+    const {
   return &portAttrMap;
 }
 

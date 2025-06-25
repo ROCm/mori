@@ -32,6 +32,11 @@ void Context::CollectHostNames() {
   }
 }
 
+bool IsP2PDisabled() {
+  const char* varName = "MORI_DISABLE_P2P";
+  return getenv(varName) != nullptr;
+}
+
 void Context::IntializePossibleTransports() {
   // Find my rank in node
   for (int i = 0; i <= LocalRank(); i++) {
@@ -50,8 +55,9 @@ void Context::IntializePossibleTransports() {
   int portId;
   RdmaDevice* device = nullptr;
   if (!activeDevicePortList.empty()) {
-    RdmaDevice* device = activeDevicePortList[rankInNode % activeDevicePortList.size()].first;
-    portId = activeDevicePortList[rankInNode % activeDevicePortList.size()].second;
+    int devicePortId = (rankInNode % activeDevicePortList.size());
+    RdmaDevice* device = activeDevicePortList[devicePortId].first;
+    portId = activeDevicePortList[devicePortId].second;
     rdmaDeviceContext.reset(device->CreateRdmaDeviceContext());
   }
 
@@ -59,17 +65,25 @@ void Context::IntializePossibleTransports() {
   int peerRankInNode = -1;
   for (int i = 0; i < WorldSize(); i++) {
     // Check P2P availability
-    if (HostName() == hostnames[i]) {
-      peerRankInNode++;
+    if (!IsP2PDisabled()) {
+      if (HostName() == hostnames[i]) {
+        peerRankInNode++;
 
-      int canAccessPeer;
-      HIP_RUNTIME_CHECK(hipDeviceCanAccessPeer(&canAccessPeer, rankInNode, peerRankInNode));
+        int canAccessPeer;
+        HIP_RUNTIME_CHECK(hipDeviceCanAccessPeer(&canAccessPeer, rankInNode, peerRankInNode));
 
-      if (canAccessPeer) {
-        HIP_RUNTIME_CHECK(hipDeviceEnablePeerAccess(peerRankInNode, 0));
+        if (canAccessPeer) {
+          HIP_RUNTIME_CHECK(hipDeviceEnablePeerAccess(peerRankInNode, 0));
+        }
+
+        if ((i == LocalRank()) || canAccessPeer) {
+          transportTypes.push_back(TransportType::P2P);
+          rdmaEps.push_back({});
+          continue;
+        }
       }
-
-      if ((i == LocalRank()) || canAccessPeer) {
+    } else {
+      if (i == LocalRank()) {
         transportTypes.push_back(TransportType::P2P);
         rdmaEps.push_back({});
         continue;

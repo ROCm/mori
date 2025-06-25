@@ -23,17 +23,6 @@ inline __device__ void ThreadCopy(T* dst, T* src, size_t nelems) {
 }
 
 template <typename T>
-inline __device__ void ThreadCopyAtomic(T* dst, T* src, size_t nelems) {
-  int offset = 0;
-
-  while (offset < nelems) {
-    T val = AtomicLoadRelaxedSystem(src + offset);
-    AtomicStoreRelaxedSystem(dst + offset, val);
-    offset += 1;
-  }
-}
-
-template <typename T>
 inline __device__ void WarpCopy(T* dst, T* src, size_t nelems) {
   constexpr int vecSize = 16 / sizeof(T);
   int laneId = threadIdx.x & (warpSize - 1);
@@ -62,18 +51,6 @@ inline __device__ void WarpCopy(T* dst, T* src) {
   if constexpr ((N % vecSize) != 0) {
     int offset = N / vecSize * vecSize;
     for (int i = offset + laneId; i < N; i += warpSize) dst[i] = src[i];
-  }
-}
-
-template <typename T>
-inline __device__ void WarpCopyAtomic(T* dst, T* src, size_t nelems) {
-  int laneId = threadIdx.x & (warpSize - 1);
-  int offset = laneId;
-
-  while (offset < nelems) {
-    T val = AtomicLoadRelaxedSystem(src + offset);
-    AtomicStoreRelaxedSystem(dst + offset, val);
-    offset += warpSize;
   }
 }
 

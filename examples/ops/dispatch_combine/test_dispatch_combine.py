@@ -108,9 +108,9 @@ class EpDispatchCombineTestCase:
             indicies.cpu(), self.config.max_num_inp_token_per_rank
         )
         indicies_list = [
-            tensor.to(self.device).to(torch.uint32) for tensor in indicies_list
+            tensor.to(self.device).to(torch.int32) for tensor in indicies_list
         ]
-        indicies = indicies.to(self.device).to(torch.uint32)
+        indicies = indicies.to(self.device).to(torch.int32)
 
         # gen weights
         weights = torch.rand(
@@ -176,9 +176,13 @@ class EpDispatchCombineTestCase:
             scales_list,
             input_list,
         ) = test_data
-        dispatch_output, dispatch_weights, dispatch_scales, dispatch_indicies, dispatch_recv_num_token = op.dispatch(
-            input, weights, scales, indicies
-        )
+        (
+            dispatch_output,
+            dispatch_weights,
+            dispatch_scales,
+            dispatch_indicies,
+            dispatch_recv_num_token,
+        ) = op.dispatch(input, weights, scales, indicies)
         torch.cuda.synchronize()
 
         src_token_pos = op.get_dispatch_src_token_pos()
