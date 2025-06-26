@@ -78,6 +78,7 @@ void EpDispatchCombineHandle<T>::IntializeShmemBuf() {
   size_t maxTokenSize = config.MaxNumTokensToRecv() * config.hiddenDim * sizeof(T);
   shmemInpTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
   shmemOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
+  shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
 
   size_t maxWeightSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(float);
   shmemInpWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
@@ -95,6 +96,7 @@ template <typename T>
 void EpDispatchCombineHandle<T>::FinalizeShmemBuf() {
   ShmemFree(shmemInpTokMemObj->localPtr);
   ShmemFree(shmemOutTokMemObj->localPtr);
+  ShmemFree(shmemStagingTokMemObj->localPtr);
   ShmemFree(shmemInpWeightsMemObj->localPtr);
   ShmemFree(shmemOutWeightsMemObj->localPtr);
   ShmemFree(shmemScalesMemObj->localPtr);
@@ -111,9 +113,9 @@ void EpDispatchCombineHandle<T>::IntializeTokenNumSignalBuf() {
   HIP_RUNTIME_CHECK(hipMalloc(&totalRecvTokenNum, sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(totalRecvTokenNum, 0, sizeof(index_t)));
 
-  HIP_RUNTIME_CHECK(
-      hipExtMallocWithFlags((void**)&lock, sizeof(uint32_t), hipDeviceMallocUncached));
-  HIP_RUNTIME_CHECK(hipMemset(lock, 0, sizeof(uint32_t)));
+  size_t lockSize = config.worldSize * sizeof(uint32_t);
+  HIP_RUNTIME_CHECK(hipExtMallocWithFlags((void**)&lock, lockSize, hipDeviceMallocUncached));
+  HIP_RUNTIME_CHECK(hipMemset(lock, 0, lockSize));
 }
 
 template <typename T>

@@ -27,15 +27,18 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   application::WorkQueueHandle& wq = ep[pe].wqHandle;
+  uint32_t* lock = globalGpuStates->endpointLock;
 
   int rank = globalGpuStates->rank;
-  uint64_t dbrVal =
-      core::PostWrite<PrvdType>(wq.sqAddr, wq.sqWqeNum, &wq.postIdx, ep[pe].handle.qpn, laddr,
-                                source.lkey, raddr, rkey, bytes);
-  core::UpdateSendDbrRecord<PrvdType>(wq.dbrRecAddr, wq.postIdx);
-  __threadfence_system();
+  uint32_t curPostIdx = atomicAdd(&wq.postIdx, 1);
+  uint64_t dbrVal = core::PostWrite<PrvdType>(wq.sqAddr, wq.sqWqeNum, curPostIdx, ep[pe].handle.qpn,
+                                              laddr, source.lkey, raddr, rkey, bytes);
+  while (core::AtomicLoadRelaxed(&wq.readyIdx) != curPostIdx) {
+  }
+  core::UpdateSendDbrRecord<PrvdType>(wq.dbrRecAddr, curPostIdx);
+  // __threadfence_system();
   core::RingDoorbell<PrvdType>(wq.dbrAddr, dbrVal);
-  __threadfence_system();
+  atomicAdd(&wq.readyIdx, 1);
 }
 
 #define DISPATCH_PROVIDER_TYPE(func, ...)                         \
@@ -87,14 +90,18 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   application::WorkQueueHandle& wq = ep[pe].wqHandle;
+  uint32_t* lock = globalGpuStates->endpointLock;
 
   int rank = globalGpuStates->rank;
-  uint64_t dbrVal = core::PostWriteInline<PrvdType>(wq.sqAddr, wq.sqWqeNum, &wq.postIdx,
+  uint32_t curPostIdx = atomicAdd(&wq.postIdx, 1);
+  uint64_t dbrVal = core::PostWriteInline<PrvdType>(wq.sqAddr, wq.sqWqeNum, curPostIdx,
                                                     ep[pe].handle.qpn, val, raddr, rkey, bytes);
-  core::UpdateSendDbrRecord<PrvdType>(wq.dbrRecAddr, wq.postIdx);
-  __threadfence_system();
+  while (core::AtomicLoadRelaxed(&wq.readyIdx) != curPostIdx) {
+  }
+  core::UpdateSendDbrRecord<PrvdType>(wq.dbrRecAddr, curPostIdx);
+  // __threadfence_system();
   core::RingDoorbell<PrvdType>(wq.dbrAddr, dbrVal);
-  __threadfence_system();
+  atomicAdd(&wq.readyIdx, 1);
 }
 
 template <>
@@ -132,15 +139,15 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   application::WorkQueueHandle& wq = ep[pe].wqHandle;
+  uint32_t* lock = globalGpuStates->endpointLock;
 
   int rank = globalGpuStates->rank;
   uint64_t dbrVal = core::PostAtomic<PrvdType>(wq.sqAddr, wq.sqWqeNum, &wq.postIdx, ep[pe].handle.qpn,
                                                0, 0, raddr, rkey, val, 0, bytes, amoType);
-
-  core::UpdateSendDbrRecord<PrvdType>(wq.dbrRecAddr, wq.postIdx);
-  __threadfence_system();
-  core::RingDoorbell<PrvdType>(wq.dbrAddr, dbrVal);
-  __threadfence_system();
+  core::UpdateDbrAndRingDbSend<PrvdType>(wq.dbrRecAddr, wq.postIdx, wq.dbrAddr, dbrVal, lock + pe);
+  // core::UpdateSendDbrRecord<PrvdType>(wq.dbrRecAddr, wq.postIdx);
+  // __threadfence_system();
+  // core::RingDoorbell<PrvdType>(wq.dbrAddr, dbrVal);
 }
 
 template <>
@@ -185,16 +192,17 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernelImpl(const application::S
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   application::WorkQueueHandle& wq = ep[pe].wqHandle;
+  uint32_t* lock = globalGpuStates->endpointLock;
 
   int rank = globalGpuStates->rank;
   uint64_t dbrVal =
       core::PostAtomic<PrvdType>(wq.sqAddr, wq.sqWqeNum, &wq.postIdx, ep[pe].handle.qpn, laddr,
                                  lkey, raddr, rkey, val, compare, bytes, amoType);
+  core::UpdateDbrAndRingDbSend<PrvdType>(wq.dbrRecAddr, wq.postIdx, wq.dbrAddr, dbrVal, lock + pe);
 
-  core::UpdateSendDbrRecord<PrvdType>(wq.dbrRecAddr, wq.postIdx);
-  __threadfence_system();
-  core::RingDoorbell<PrvdType>(wq.dbrAddr, dbrVal);
-  __threadfence_system();
+  // core::UpdateSendDbrRecord<PrvdType>(wq.dbrRecAddr, wq.postIdx);
+  // __threadfence_system();
+  // core::RingDoorbell<PrvdType>(wq.dbrAddr, dbrVal);
 
   // queit to poll CQ
   ShmemQuietThreadKernelImpl();

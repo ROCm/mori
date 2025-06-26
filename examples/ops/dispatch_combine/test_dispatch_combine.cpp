@@ -323,16 +323,15 @@ class EpDispatchCombineTestCase {
       SystemBarrier();
       if (handle.config.rank == 0) std::cout << "Test round " << i << " dispatch PASS" << std::endl;
 
-      // CopyDispatchOutAsCombineInp();
-      // SystemBarrier();
+      CopyDispatchOutAsCombineInp();
+      SystemBarrier();
 
-      // handle.LaunchCombine(runConfig.kernelType);
-      // SystemBarrier();
+      handle.LaunchCombine(runConfig.kernelType);
+      SystemBarrier();
 
-      // CheckCombineResult();
-      // SystemBarrier();
-      // if (handle.config.rank == 0) std::cout << "Test round " << i << " combine PASS" <<
-      // std::endl;
+      CheckCombineResult();
+      SystemBarrier();
+      if (handle.config.rank == 0) std::cout << "Test round " << i << " combine PASS" << std::endl;
     }
   }
 

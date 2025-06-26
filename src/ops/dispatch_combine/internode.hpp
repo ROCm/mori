@@ -26,7 +26,7 @@ __device__ void SyncIfDebugEnabled(const char* msg) {
 /*                                    EpDispatchInterNodeKernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
 // TODO: this mode only works correctly with MORI_DISABLE_P2P=1 set, figure out why
-#define ENABLE_RDMA_AGGREGATE_WRITE 1
+#define ENABLE_RDMA_AGGREGATE_WRITE 0
 
 template <typename T>
 __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
@@ -99,15 +99,15 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
                    config.numExpertPerToken);
 #else
     // For disaggregated write, write data to remote directly
+    // TODO: copy weight and indicies
     index_t peSortedId = myPe * MaxNumTokensToRecvPerRank + destPeTokenIdx;
     index_t peSortedOffset = peSortedId * config.hiddenDim;
 
-    core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + tokenOffset,
+    core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<T*>() + tokenOffset,
                    args.inpTokenBuf + tokenOffset, config.hiddenDim);
-    if (laneId == 0) core::AcquireLock(args.lock);
-    shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, peSortedOffset, args.shmemOutTokMemObj,
-                                  tokenOffset, config.hiddenDim, destPe);
-    if (laneId == 0) core::ReleaseLock(args.lock);
+    shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, peSortedOffset,
+                                  args.shmemStagingTokMemObj, tokenOffset, config.hiddenDim,
+                                  destPe);
 #endif
   }
   if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
@@ -269,12 +269,10 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
     core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + tokenOffset,
                    args.inpTokenBuf + tokenOffset, config.hiddenDim);
-    if (laneId == 0) {
-      core::AcquireLock(args.lock);
-      shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, peSortedOffset, args.shmemOutTokMemObj,
-                                    tokenOffset, config.hiddenDim, srcPe);
-      core::ReleaseLock(args.lock);
-    }
+    // if (laneId == 0) core::AcquireLock(args.lock + srcPe);
+    shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, peSortedOffset, args.shmemOutTokMemObj,
+                                  tokenOffset, config.hiddenDim, srcPe);
+    //  if (laneId == 0) core::ReleaseLock(args.lock + srcPe);
   }
   // Make sure copy on all GPUs are finished
   CrossDeviceBarrierInterNodeKernel(args);

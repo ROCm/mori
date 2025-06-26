@@ -59,6 +59,7 @@ struct RdmaEndpointHandle {
 
 struct WorkQueueHandle {
   uint32_t postIdx{0};
+  uint32_t readyIdx{0};
   void* sqAddr{nullptr};
   void* rqAddr{nullptr};
   void* dbrRecAddr{nullptr};

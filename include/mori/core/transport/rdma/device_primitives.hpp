@@ -65,6 +65,16 @@ inline __device__ void PostRecv(void* queue_buff_addr, uint32_t wqe_num, uint32_
                                 uintptr_t laddr, uint64_t lkey, size_t bytes_count);
 
 template <ProviderType PrvdType>
+inline __device__ uint64_t PostWrite(void* queue_buff_addr, uint32_t wqe_num, uint32_t curPostIdx,
+                                     uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
+                                     uint64_t rkey, size_t bytes_count);
+
+template <ProviderType PrvdType>
+inline __device__ uint64_t PostRead(void* queue_buff_addr, uint32_t wqe_num, uint32_t curPostIdx,
+                                    uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
+                                    uint64_t rkey, size_t bytes_count);
+
+template <ProviderType PrvdType>
 inline __device__ uint64_t PostWrite(void* queue_buff_addr, uint32_t wqe_num, uint32_t* postIdx,
                                      uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
                                      uint64_t rkey, size_t bytes_count);
@@ -77,6 +87,11 @@ inline __device__ uint64_t PostRead(void* queue_buff_addr, uint32_t wqe_num, uin
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostWriteInline(void* queue_buff_addr, uint32_t wqe_num,
                                            uint32_t* postIdx, uint32_t qpn, void* val,
+                                           uintptr_t raddr, uint64_t rkey, size_t bytes_count);
+
+template <ProviderType PrvdType>
+inline __device__ uint64_t PostWriteInline(void* queue_buff_addr, uint32_t wqe_num,
+                                           uint32_t curPostIdx, uint32_t qpn, void* val,
                                            uintptr_t raddr, uint64_t rkey, size_t bytes_count);
 
 inline __device__ uint64_t mlx5PrepareAtomicWqe(void* queue_buff_addr, uint32_t wqe_num, uint32_t* postIdx,
