@@ -109,7 +109,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     // Write scales
     index_t destScaleOffset = destTokId * config.scaleDim * config.scaleTypeSize;
     index_t srcScaleOffset = srcTokId * config.scaleDim * config.scaleTypeSize;
-    core::WarpCopy(args.shmemScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
+    core::WarpCopy(args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
                    args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
 
     index_t srcTokOffset = srcTokId * config.hiddenDim;

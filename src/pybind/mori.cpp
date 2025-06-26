@@ -44,8 +44,8 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle<T>& handle, int kernelType,
       torch::TensorOptions().dtype(mori::GetTorchDataType<float>()).device(torch::kCUDA));
 
   torch::Tensor outScales =
-      torch::from_blob(handle.shmemScalesMemObj->Get(),
-                       {handle.config.MaxNumTokensToRecvPerRank(), handle.config.scaleDim},
+      torch::from_blob(handle.shmemOutScalesMemObj->Get(),
+                       {handle.config.MaxNumTokensToRecv(), handle.config.scaleDim},
                        torch::TensorOptions().dtype(scales.scalar_type()).device(torch::kCUDA));
 
   torch::Tensor outIndicies =
