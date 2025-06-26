@@ -199,12 +199,12 @@ class EpDispatchCombineTestCase {
           float expectedVal = float(srcTokBuf[k]);
           float gotVal = float(localTokBuf[k]);
           bool equal = (expectedVal == gotVal);
-          assert(expectedVal != 0);
           if (!equal) {
             std::cout << "Wrong result at pos " << k << ": " << msg.str() << " expected "
                       << expectedVal << " got " << gotVal << std::endl;
             assert(false);
           }
+          assert(expectedVal != 0);
         }
       }
     } else if (runConfig.kernelType == InterNode) {
@@ -323,16 +323,15 @@ class EpDispatchCombineTestCase {
       SystemBarrier();
       if (handle.config.rank == 0) std::cout << "Test round " << i << " dispatch PASS" << std::endl;
 
-      // CopyDispatchOutAsCombineInp();
-      // SystemBarrier();
+      CopyDispatchOutAsCombineInp();
+      SystemBarrier();
 
-      // handle.LaunchCombine(runConfig.kernelType);
-      // SystemBarrier();
+      handle.LaunchCombine(runConfig.kernelType);
+      SystemBarrier();
 
-      // CheckCombineResult();
-      // SystemBarrier();
-      // if (handle.config.rank == 0) std::cout << "Test round " << i << " combine PASS" <<
-      // std::endl;
+      CheckCombineResult();
+      SystemBarrier();
+      if (handle.config.rank == 0) std::cout << "Test round " << i << " combine PASS" << std::endl;
     }
   }
 
@@ -486,11 +485,16 @@ class EpDispatchCombineTestCase {
     EpDispatchCombineConfig& config = handle.config;
     int maxTokenSize = config.MaxNumTokensToRecvPerRank() * config.hiddenDim * sizeof(T);
     HIP_RUNTIME_CHECK(hipMemset(inpTokBuf, 0, maxTokenSize));
+
     int inpTokEleNum = config.maxNumInpTokenPerRank * config.hiddenDim;
+    T* inpTokBufHost = nullptr;
+    size_t inpTokSize = inpTokEleNum * sizeof(T);
+    HIP_RUNTIME_CHECK(hipHostMalloc((void**)&inpTokBufHost, inpTokSize));
     uniform_real_distribution<> tokValDist(0.01, 1);
     for (int i = 0; i < inpTokEleNum; i++) {
-      reinterpret_cast<T*>(inpTokBuf)[i] = tokValDist(gen);
+      reinterpret_cast<T*>(inpTokBufHost)[i] = tokValDist(gen);
     }
+    HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, inpTokBufHost, inpTokSize, hipMemcpyHostToDevice));
   }
 
   void PrintDispatch() {
