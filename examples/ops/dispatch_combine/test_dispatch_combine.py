@@ -15,8 +15,8 @@ class EpDispatchCombineTestCase:
             rank=self.rank,
             world_size=self.world_size,
             hidden_dim=7168,
-            # scale_dim=32,
-            scale_dim=0,
+            scale_dim=32,
+            # scale_dim=0,
             scale_type_size=1,
             max_num_inp_token_per_rank=512,
             num_experts_per_rank=32,
@@ -156,11 +156,13 @@ class EpDispatchCombineTestCase:
             num_tokens,
             indicies,
             weights,
+            # None,
             # scales_fp32,
             scales_fp32.to(torch.float8_e4m3fnuz),
             input_fp32.to(self.config.data_type),
             indicies_list,
             weights_list,
+            # None,
             scales_list,
             input_list,
         )
@@ -196,7 +198,8 @@ class EpDispatchCombineTestCase:
             src_id = int(pos) % self.config.max_num_inp_token_per_rank
             assert torch.equal(input_list[src_rank][src_id], dispatch_output[i])
             assert torch.equal(weights_list[src_rank][src_id], dispatch_weights[i])
-            assert torch.equal(scales_list[src_rank][src_id], dispatch_scales[i])
+            if scales_list is not None and self.config.scale_dim != 0:
+                assert torch.equal(scales_list[src_rank][src_id], dispatch_scales[i])
             assert torch.equal(indicies_list[src_rank][src_id], dispatch_indicies[i])
         assert len(torch.unique(src_token_pos)) == len(src_token_pos)
         assert len(src_token_pos) == dispatch_recv_num_token[0]

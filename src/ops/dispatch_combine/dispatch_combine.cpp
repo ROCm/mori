@@ -83,9 +83,11 @@ void EpDispatchCombineHandle<T>::IntializeShmemBuf() {
   shmemInpWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
   shmemOutWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
 
-  size_t maxScaleSize = config.MaxNumTokensToRecv() * config.scaleDim * config.scaleTypeSize;
-  shmemInpScalesMemObj = ShmemMallocAndReturnMemObjPtr(maxScaleSize, hipDeviceMallocUncached);
-  shmemOutScalesMemObj = ShmemMallocAndReturnMemObjPtr(maxScaleSize, hipDeviceMallocUncached);
+  if (config.scaleDim > 0 && config.scaleTypeSize > 0) {
+    size_t maxScaleSize = config.MaxNumTokensToRecv() * config.scaleDim * config.scaleTypeSize;
+    shmemInpScalesMemObj = ShmemMallocAndReturnMemObjPtr(maxScaleSize, hipDeviceMallocUncached);
+    shmemOutScalesMemObj = ShmemMallocAndReturnMemObjPtr(maxScaleSize, hipDeviceMallocUncached);
+  }
 
   size_t maxIndiciesSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(index_t);
   shmemInpIndiciesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndiciesSize, hipDeviceMallocUncached);
@@ -98,8 +100,8 @@ void EpDispatchCombineHandle<T>::FinalizeShmemBuf() {
   ShmemFree(shmemOutTokMemObj->localPtr);
   ShmemFree(shmemInpWeightsMemObj->localPtr);
   ShmemFree(shmemOutWeightsMemObj->localPtr);
-  ShmemFree(shmemInpScalesMemObj->localPtr);
-  ShmemFree(shmemOutScalesMemObj->localPtr);
+  if (shmemInpScalesMemObj.IsValid()) ShmemFree(shmemInpScalesMemObj->localPtr);
+  if (shmemOutScalesMemObj.IsValid()) ShmemFree(shmemOutScalesMemObj->localPtr);
   ShmemFree(shmemInpIndiciesMemObj->localPtr);
   ShmemFree(shmemOutIndiciesMemObj->localPtr);
 }
