@@ -90,7 +90,8 @@ class EpDispatchCombineTestCase {
     HIP_RUNTIME_CHECK(hipMemset(inpTokBuf, 0, maxTokenSize));
     HIP_RUNTIME_CHECK(hipMalloc(&outTokBuf, maxTokenSize));
     HIP_RUNTIME_CHECK(hipMemset(outTokBuf, 0, maxTokenSize));
-    inpTokBufCpu = reinterpret_cast<T*>(malloc(maxTokenSize));
+    HIP_RUNTIME_CHECK(hipHostMalloc(&inpTokBufCpu, maxTokenSize));
+    HIP_RUNTIME_CHECK(hipMemset(inpTokBufCpu, 0, maxTokenSize));
 
     int tokenIndiciesSize = config.MaxNumTokensToSendPerRank() * sizeof(index_t);
     HIP_RUNTIME_CHECK(hipMalloc(&tokenIndicies, tokenIndiciesSize));
@@ -114,7 +115,7 @@ class EpDispatchCombineTestCase {
     HIP_RUNTIME_CHECK(hipFree(tokenIndicies));
     HIP_RUNTIME_CHECK(hipFree(weightsBuf));
     HIP_RUNTIME_CHECK(hipFree(scalesBuf));
-    free(inpTokBufCpu);
+    HIP_RUNTIME_CHECK(hipFree(inpTokBufCpu));
   }
 
   void InitializeHandle() {
@@ -505,16 +506,16 @@ class EpDispatchCombineTestCase {
     EpDispatchCombineConfig& config = handle.config;
     int maxTokenSize = config.MaxNumTokensToRecvPerRank() * config.hiddenDim * sizeof(T);
     HIP_RUNTIME_CHECK(hipMemset(inpTokBuf, 0, maxTokenSize));
+    HIP_RUNTIME_CHECK(hipMemset(inpTokBufCpu, 0, maxTokenSize));
 
     int inpTokEleNum = config.maxNumInpTokenPerRank * config.hiddenDim;
-    T* inpTokBufHost = nullptr;
     size_t inpTokSize = inpTokEleNum * sizeof(T);
-    HIP_RUNTIME_CHECK(hipHostMalloc((void**)&inpTokBufHost, inpTokSize));
     uniform_real_distribution<> tokValDist(0.01, 1);
     for (int i = 0; i < inpTokEleNum; i++) {
-      reinterpret_cast<T*>(inpTokBufHost)[i] = tokValDist(gen);
+      reinterpret_cast<T*>(inpTokBufCpu)[i] = tokValDist(gen);
     }
-    HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, inpTokBufHost, inpTokSize, hipMemcpyHostToDevice));
+    HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, inpTokBufCpu, inpTokSize, hipMemcpyHostToDevice));
+    HIP_RUNTIME_CHECK(hipMemset(inpTokBufCpu, 0, maxTokenSize));
   }
 
   void PrintDispatch() {
