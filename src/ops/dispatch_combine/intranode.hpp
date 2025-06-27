@@ -66,7 +66,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
        i += globalWarpNum) {
     index_t srcTokId = i / config.numExpertPerToken;
-    index_t destExpert = args.tokenIndicies[i];
+    index_t destExpert = args.tokenIndices[i];
     index_t destPe = destExpert / config.numExpertPerRank;
     index_t destTokId = 0;
 
@@ -74,7 +74,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     assert(config.numExpertPerToken < warpSize);
     int condition = 0;
     if (laneId < (i % config.numExpertPerToken)) {
-      condition = destPe == (args.tokenIndicies[srcTokId * config.numExpertPerToken + laneId] /
+      condition = destPe == (args.tokenIndices[srcTokId * config.numExpertPerToken + laneId] /
                              config.numExpertPerRank);
     }
     if (__any(condition)) {
@@ -96,14 +96,14 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     }
     destTokId = __shfl(destTokId, 0);
 
-    // Write weights and indicies
+    // Write weights and indices
     if (laneId < config.numExpertPerToken) {
       args.shmemOutWeightsMemObj->template GetAs<float*>(
           destPe)[destTokId * config.numExpertPerToken + laneId] =
           args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
-      args.shmemOutIndiciesMemObj->template GetAs<index_t*>(
+      args.shmemOutIndicesMemObj->template GetAs<index_t*>(
           destPe)[destTokId * config.numExpertPerToken + laneId] =
-          args.tokenIndicies[srcTokId * config.numExpertPerToken + laneId];
+          args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
     }
 
     // Write scales

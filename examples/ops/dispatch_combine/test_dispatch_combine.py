@@ -91,8 +91,8 @@ class EpDispatchCombineTestCase:
             ).item()
         )
 
-        # gen indicies
-        indicies = torch.empty(
+        # gen indices
+        indices = torch.empty(
             num_tokens,
             self.config.num_experts_per_token,
             dtype=torch.int64,
@@ -104,14 +104,14 @@ class EpDispatchCombineTestCase:
                 generator=self.rng,
                 device=self.device,
             )
-            indicies[i] = perm[: self.config.num_experts_per_token]
-        indicies_list = self._allgather_with_token_num_padding(
-            indicies.cpu(), self.config.max_num_inp_token_per_rank
+            indices[i] = perm[: self.config.num_experts_per_token]
+        indices_list = self._allgather_with_token_num_padding(
+            indices.cpu(), self.config.max_num_inp_token_per_rank
         )
-        indicies_list = [
-            tensor.to(self.device).to(torch.int32) for tensor in indicies_list
+        indices_list = [
+            tensor.to(self.device).to(torch.int32) for tensor in indices_list
         ]
-        indicies = indicies.to(self.device).to(torch.int32)
+        indices = indices.to(self.device).to(torch.int32)
 
         # gen weights
         weights = torch.rand(
@@ -154,13 +154,13 @@ class EpDispatchCombineTestCase:
 
         return (
             num_tokens,
-            indicies,
+            indices,
             weights,
             # None,
             # scales_fp32,
             scales_fp32.to(torch.float8_e4m3fnuz),
             input_fp32.to(self.config.data_type),
-            indicies_list,
+            indices_list,
             weights_list,
             # None,
             scales_list,
@@ -170,11 +170,11 @@ class EpDispatchCombineTestCase:
     def run_test_once(self, op, test_data):
         (
             num_tokens,
-            indicies,
+            indices,
             weights,
             scales,
             input,
-            indicies_list,
+            indices_list,
             weights_list,
             scales_list,
             input_list,
@@ -183,9 +183,9 @@ class EpDispatchCombineTestCase:
             dispatch_output,
             dispatch_weights,
             dispatch_scales,
-            dispatch_indicies,
+            dispatch_indices,
             dispatch_recv_num_token,
-        ) = op.dispatch(input, weights, scales, indicies)
+        ) = op.dispatch(input, weights, scales, indices)
         torch.cuda.synchronize()
 
         src_token_pos = op.get_dispatch_src_token_pos()
@@ -200,20 +200,20 @@ class EpDispatchCombineTestCase:
             assert torch.equal(weights_list[src_rank][src_id], dispatch_weights[i])
             if scales_list is not None and self.config.scale_dim != 0:
                 assert torch.equal(scales_list[src_rank][src_id], dispatch_scales[i])
-            assert torch.equal(indicies_list[src_rank][src_id], dispatch_indicies[i])
+            assert torch.equal(indices_list[src_rank][src_id], dispatch_indices[i])
         assert len(torch.unique(src_token_pos)) == len(src_token_pos)
         assert len(src_token_pos) == dispatch_recv_num_token[0]
 
         if self.config.rank == 0:
             print("Dispatch Pass")
 
-        combine_output = op.combine(dispatch_output, weights, indicies)
+        combine_output = op.combine(dispatch_output, weights, indices)
         torch.cuda.synchronize()
 
         for i in range(num_tokens):
             pes = [
                 (idx // self.config.num_experts_per_rank)
-                for idx in indicies[i].cpu().tolist()
+                for idx in indices[i].cpu().tolist()
             ]
             unique_pes = len(set(pes))
 

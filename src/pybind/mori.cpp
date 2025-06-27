@@ -54,8 +54,8 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle<T>& handle, int kernelType,
                          torch::TensorOptions().dtype(scales->scalar_type()).device(torch::kCUDA));
   }
 
-  torch::Tensor outIndicies =
-      torch::from_blob(handle.shmemOutIndiciesMemObj->Get(),
+  torch::Tensor outIndices =
+      torch::from_blob(handle.shmemOutIndicesMemObj->Get(),
                        {handle.config.MaxNumTokensToRecv(), handle.config.numExpertPerToken},
                        torch::TensorOptions()
                            .dtype(mori::GetTorchDataType<mori::moe::index_t>())
@@ -64,7 +64,7 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle<T>& handle, int kernelType,
   torch::Tensor totalRecvTokenNum = torch::from_blob(
       handle.totalRecvTokenNum, {1},
       torch::TensorOptions().dtype(mori::GetTorchDataType<mori::moe::index_t>()).device(torch::kCUDA));
-  return {out, outWeights, outScales, outIndicies, totalRecvTokenNum};
+  return {out, outWeights, outScales, outIndices, totalRecvTokenNum};
 }
 
 // TODO: translate data type
