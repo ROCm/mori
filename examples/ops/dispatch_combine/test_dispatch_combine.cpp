@@ -90,28 +90,32 @@ class EpDispatchCombineTestCase {
     HIP_RUNTIME_CHECK(hipMemset(inpTokBuf, 0, maxTokenSize));
     HIP_RUNTIME_CHECK(hipMalloc(&outTokBuf, maxTokenSize));
     HIP_RUNTIME_CHECK(hipMemset(outTokBuf, 0, maxTokenSize));
-    inpTokBufCpu = reinterpret_cast<T*>(malloc(maxTokenSize));
+    HIP_RUNTIME_CHECK(hipHostMalloc(&inpTokBufCpu, maxTokenSize));
+    HIP_RUNTIME_CHECK(hipMemset(inpTokBufCpu, 0, maxTokenSize));
 
-    int tokenIndiciesSize = config.MaxNumTokensToSendPerRank() * sizeof(index_t);
-    HIP_RUNTIME_CHECK(hipMalloc(&tokenIndicies, tokenIndiciesSize));
-    HIP_RUNTIME_CHECK(hipMemset(tokenIndicies, 0, tokenIndiciesSize));
+    int tokenIndicesSize = config.MaxNumTokensToSendPerRank() * sizeof(index_t);
+    HIP_RUNTIME_CHECK(hipMalloc(&tokenIndices, tokenIndicesSize));
+    HIP_RUNTIME_CHECK(hipMemset(tokenIndices, 0, tokenIndicesSize));
 
     int weightsBufSize = config.MaxNumTokensToSendPerRank() * sizeof(float);
     HIP_RUNTIME_CHECK(hipMalloc(&weightsBuf, weightsBufSize));
     HIP_RUNTIME_CHECK(hipMemset(weightsBuf, 0, weightsBufSize));
 
-    int scalesBufSize = config.MaxNumTokensToSendPerRank() * config.scaleDim * config.scaleTypeSize;
-    HIP_RUNTIME_CHECK(hipMalloc(&scalesBuf, scalesBufSize));
-    HIP_RUNTIME_CHECK(hipMemset(scalesBuf, 0, scalesBufSize));
+    if (config.scaleDim > 0) {
+      int scalesBufSize =
+          config.MaxNumTokensToSendPerRank() * config.scaleDim * config.scaleTypeSize;
+      HIP_RUNTIME_CHECK(hipMalloc(&scalesBuf, scalesBufSize));
+      HIP_RUNTIME_CHECK(hipMemset(scalesBuf, 0, scalesBufSize));
+    }
   }
 
   ~EpDispatchCombineTestCase() {
     HIP_RUNTIME_CHECK(hipFree(inpTokBuf));
     HIP_RUNTIME_CHECK(hipFree(outTokBuf));
-    HIP_RUNTIME_CHECK(hipFree(tokenIndicies));
+    HIP_RUNTIME_CHECK(hipFree(tokenIndices));
     HIP_RUNTIME_CHECK(hipFree(weightsBuf));
     HIP_RUNTIME_CHECK(hipFree(scalesBuf));
-    free(inpTokBufCpu);
+    HIP_RUNTIME_CHECK(hipFree(inpTokBufCpu));
   }
 
   void InitializeHandle() {
@@ -129,8 +133,9 @@ class EpDispatchCombineTestCase {
       assert(false);
     }
     RandomInitializeWeights();
+    RandomInitializeScales();
     RandomInitializeToken();
-    handle.PrepareInference(inpTokBuf, outTokBuf, weightsBuf, scalesBuf, tokenIndicies, numToken);
+    handle.PrepareInference(inpTokBuf, outTokBuf, weightsBuf, scalesBuf, tokenIndices, numToken);
     // PrintDispatch();
     // PrintDispatchStats();
   }
@@ -140,25 +145,25 @@ class EpDispatchCombineTestCase {
 
     // Copy token indices to CPU
     int MaxNumTokensToSendPerRank = config.MaxNumTokensToSendPerRank();
-    int tokenIndiciesSize = config.MaxNumTokensToSendPerRank() * sizeof(index_t);
+    int tokenIndicesSize = config.MaxNumTokensToSendPerRank() * sizeof(index_t);
 
     // Collect token indices from all ranks
-    void* tokenIndicesCpu = malloc(tokenIndiciesSize);
+    void* tokenIndicesCpu = malloc(tokenIndicesSize);
     HIP_RUNTIME_CHECK(
-        hipMemcpy(tokenIndicesCpu, handle.tokenIndicies, tokenIndiciesSize, hipMemcpyDeviceToHost));
+        hipMemcpy(tokenIndicesCpu, handle.tokenIndices, tokenIndicesSize, hipMemcpyDeviceToHost));
 
-    void* globalTokIndiciesCpu = malloc(config.worldSize * tokenIndiciesSize);
-    MPI_Allgather(tokenIndicesCpu, tokenIndiciesSize, MPI_CHAR, globalTokIndiciesCpu,
-                  tokenIndiciesSize, MPI_CHAR, MPI_COMM_WORLD);
+    void* globalTokIndicesCpu = malloc(config.worldSize * tokenIndicesSize);
+    MPI_Allgather(tokenIndicesCpu, tokenIndicesSize, MPI_CHAR, globalTokIndicesCpu,
+                  tokenIndicesSize, MPI_CHAR, MPI_COMM_WORLD);
 
-    void* dispSenderIdxMapCpu = malloc(tokenIndiciesSize);
-    HIP_RUNTIME_CHECK(hipMemcpy(dispSenderIdxMapCpu, handle.dispSenderIdxMap, tokenIndiciesSize,
+    void* dispSenderIdxMapCpu = malloc(tokenIndicesSize);
+    HIP_RUNTIME_CHECK(hipMemcpy(dispSenderIdxMapCpu, handle.dispSenderIdxMap, tokenIndicesSize,
                                 hipMemcpyDeviceToHost));
 
     index_t* globaldispSenderIdxMapCpu =
-        reinterpret_cast<index_t*>(malloc(config.worldSize * tokenIndiciesSize));
-    MPI_Allgather(dispSenderIdxMapCpu, tokenIndiciesSize, MPI_CHAR, globaldispSenderIdxMapCpu,
-                  tokenIndiciesSize, MPI_CHAR, MPI_COMM_WORLD);
+        reinterpret_cast<index_t*>(malloc(config.worldSize * tokenIndicesSize));
+    MPI_Allgather(dispSenderIdxMapCpu, tokenIndicesSize, MPI_CHAR, globaldispSenderIdxMapCpu,
+                  tokenIndicesSize, MPI_CHAR, MPI_COMM_WORLD);
 
     // Collect token num from all ranks
     std::vector<index_t> globalTokenNum(config.worldSize);
@@ -258,7 +263,7 @@ class EpDispatchCombineTestCase {
     }
 
     free(globalInpTokBufCpu);
-    free(globalTokIndiciesCpu);
+    free(globalTokIndicesCpu);
     free(tokenIndicesCpu);
   }
 
@@ -272,7 +277,7 @@ class EpDispatchCombineTestCase {
       if (runConfig.isAiterMoE) {
         std::unordered_set<index_t> pes;
         for (int j = 0; j < config.numExpertPerToken; j++) {
-          index_t exptId = handle.tokenIndicies[i * config.numExpertPerToken + j];
+          index_t exptId = handle.tokenIndices[i * config.numExpertPerToken + j];
           index_t destPe = exptId / config.numExpertPerRank;
           pes.insert(destPe);
         }
@@ -433,7 +438,7 @@ class EpDispatchCombineTestCase {
 
       for (int j = 0; j < config.numExpertPerToken; j++) {
         assert(epRangeShuffled[j] < config.numExpertPerRank * config.worldSize);
-        tokenIndicies[i * config.numExpertPerToken + j] = epRangeShuffled[j];
+        tokenIndices[i * config.numExpertPerToken + j] = epRangeShuffled[j];
         int rank = epRangeShuffled[j] / config.numExpertPerRank;
         rankCount[rank]++;
       }
@@ -459,7 +464,7 @@ class EpDispatchCombineTestCase {
 
         index_t localExpertId = dispIdx / config.worldSize % config.numExpertPerRank;
 
-        tokenIndicies[dispIdx] = destPe * config.numExpertPerRank + localExpertId;
+        tokenIndices[dispIdx] = destPe * config.numExpertPerRank + localExpertId;
 
         rankCount[destPe]++;
       }
@@ -481,20 +486,36 @@ class EpDispatchCombineTestCase {
     }
   }
 
+  void RandomInitializeScales() {
+    if (!scalesBuf) return;
+    EpDispatchCombineConfig& config = handle.config;
+    uniform_real_distribution<> tokValDist(0, 1);
+    for (int i = 0; i < numToken; i++) {
+      for (int j = 0; j < config.scaleDim; j++) {
+        if (config.scaleTypeSize == sizeof(float)) {
+          reinterpret_cast<float*>(scalesBuf)[i * config.scaleDim + j] = tokValDist(gen);
+        } else {
+          reinterpret_cast<__hip_fp8_e4m3_fnuz*>(scalesBuf)[i * config.scaleDim + j] =
+              tokValDist(gen);
+        }
+      }
+    }
+  }
+
   void RandomInitializeToken() {
     EpDispatchCombineConfig& config = handle.config;
     int maxTokenSize = config.MaxNumTokensToRecvPerRank() * config.hiddenDim * sizeof(T);
     HIP_RUNTIME_CHECK(hipMemset(inpTokBuf, 0, maxTokenSize));
+    HIP_RUNTIME_CHECK(hipMemset(inpTokBufCpu, 0, maxTokenSize));
 
     int inpTokEleNum = config.maxNumInpTokenPerRank * config.hiddenDim;
-    T* inpTokBufHost = nullptr;
     size_t inpTokSize = inpTokEleNum * sizeof(T);
-    HIP_RUNTIME_CHECK(hipHostMalloc((void**)&inpTokBufHost, inpTokSize));
     uniform_real_distribution<> tokValDist(0.01, 1);
     for (int i = 0; i < inpTokEleNum; i++) {
-      reinterpret_cast<T*>(inpTokBufHost)[i] = tokValDist(gen);
+      reinterpret_cast<T*>(inpTokBufCpu)[i] = tokValDist(gen);
     }
-    HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, inpTokBufHost, inpTokSize, hipMemcpyHostToDevice));
+    HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, inpTokBufCpu, inpTokSize, hipMemcpyHostToDevice));
+    HIP_RUNTIME_CHECK(hipMemset(inpTokBufCpu, 0, maxTokenSize));
   }
 
   void PrintDispatch() {
@@ -503,7 +524,7 @@ class EpDispatchCombineTestCase {
     for (int i = 0; i < handle.curRankNumToken; i++) {
       ss << "  Token " << i << " dispatch to ";
       for (int j = 0; j < config.numExpertPerToken; j++) {
-        ss << tokenIndicies[i * config.numExpertPerToken + j] << " ";
+        ss << tokenIndices[i * config.numExpertPerToken + j] << " ";
       }
       ss << std::endl;
     }
@@ -520,7 +541,7 @@ class EpDispatchCombineTestCase {
   T* outTokBuf{nullptr};
   float* weightsBuf{nullptr};
   uint8_t* scalesBuf{nullptr};
-  index_t* tokenIndicies{nullptr};
+  index_t* tokenIndices{nullptr};
   int numToken{-1};
   EpDispatchCombineHandle<T>& handle;
   RunConfig runConfig;

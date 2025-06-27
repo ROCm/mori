@@ -20,16 +20,19 @@
 namespace {
 
 template <typename T>
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor>
 LaunchDispatch(mori::moe::EpDispatchCombineHandle<T>& handle, int kernelType,
                const torch::Tensor& input, const torch::Tensor& weights,
-               const torch::Tensor& scales, const torch::Tensor& topkIds) {
-  assert(input.is_contiguous() && weights.is_contiguous() && scales.is_contiguous() &&
-         topkIds.is_contiguous());
-  assert(scales.element_size() == handle.config.scaleTypeSize);
+               const std::optional<torch::Tensor>& scales, const torch::Tensor& topkIds) {
+  assert(input.is_contiguous() && weights.is_contiguous() && topkIds.is_contiguous());
+  uint8_t* scalePtr = nullptr;
+  if (scales.has_value() && handle.config.scaleDim > 0) {
+    assert(scales->is_contiguous() && scales->element_size() == handle.config.scaleTypeSize);
+    scalePtr = reinterpret_cast<uint8_t*>(scales->data_ptr());
+  }
 
   handle.PrepareInference(reinterpret_cast<T*>(input.data_ptr()), nullptr,
-                          weights.data_ptr<float>(), reinterpret_cast<uint8_t*>(scales.data_ptr()),
+                          weights.data_ptr<float>(), scalePtr,
                           topkIds.data_ptr<mori::moe::index_t>(), input.size(0));
   handle.LaunchDispatch((mori::moe::KernelType)kernelType, at::cuda::getCurrentHIPStream());
 
@@ -43,13 +46,16 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle<T>& handle, int kernelType,
       {handle.config.MaxNumTokensToRecv(), handle.config.numExpertPerToken},
       torch::TensorOptions().dtype(mori::GetTorchDataType<float>()).device(torch::kCUDA));
 
-  torch::Tensor outScales =
-      torch::from_blob(handle.shmemOutScalesMemObj->Get(),
-                       {handle.config.MaxNumTokensToRecv(), handle.config.scaleDim},
-                       torch::TensorOptions().dtype(scales.scalar_type()).device(torch::kCUDA));
+  std::optional<torch::Tensor> outScales{std::nullopt};
+  if (scales.has_value() && handle.config.scaleDim > 0) {
+    outScales =
+        torch::from_blob(handle.shmemOutScalesMemObj->Get(),
+                         {handle.config.MaxNumTokensToRecv(), handle.config.scaleDim},
+                         torch::TensorOptions().dtype(scales->scalar_type()).device(torch::kCUDA));
+  }
 
-  torch::Tensor outIndicies =
-      torch::from_blob(handle.shmemOutIndiciesMemObj->Get(),
+  torch::Tensor outIndices =
+      torch::from_blob(handle.shmemOutIndicesMemObj->Get(),
                        {handle.config.MaxNumTokensToRecv(), handle.config.numExpertPerToken},
                        torch::TensorOptions()
                            .dtype(mori::GetTorchDataType<mori::moe::index_t>())
@@ -58,7 +64,7 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle<T>& handle, int kernelType,
   torch::Tensor totalRecvTokenNum = torch::from_blob(
       handle.totalRecvTokenNum, {1},
       torch::TensorOptions().dtype(mori::GetTorchDataType<mori::moe::index_t>()).device(torch::kCUDA));
-  return {out, outWeights, outScales, outIndicies, totalRecvTokenNum};
+  return {out, outWeights, outScales, outIndices, totalRecvTokenNum};
 }
 
 // TODO: translate data type

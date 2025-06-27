@@ -49,22 +49,22 @@ class EpDispatchCombineHandle {
   EpDispatchCombineHandle(EpDispatchCombineConfig config);
   ~EpDispatchCombineHandle();
 
-  void PrepareInference(T* input, T* output, float* weights, index_t* tokenIndicies,
+  void PrepareInference(T* input, T* output, float* weights, index_t* tokenIndices,
                         index_t numToken) {
     this->inpTokenBuf = input;
     this->outTokenBuf = output;
     this->weightsBuf = weights;
-    this->tokenIndicies = tokenIndicies;
+    this->tokenIndices = tokenIndices;
     this->curRankNumToken = numToken;
   }
 
   void PrepareInference(T* input, T* output, float* weights, uint8_t* scales,
-                        index_t* tokenIndicies, index_t numToken) {
+                        index_t* tokenIndices, index_t numToken) {
     this->inpTokenBuf = input;
     this->outTokenBuf = output;
     this->weightsBuf = weights;
     this->scalesBuf = scales;
-    this->tokenIndicies = tokenIndicies;
+    this->tokenIndices = tokenIndices;
     this->curRankNumToken = numToken;
   }
 
@@ -100,7 +100,7 @@ class EpDispatchCombineHandle {
   // Config
   EpDispatchCombineConfig config;
   // Routed expert indices for tokens
-  index_t* tokenIndicies{nullptr};
+  index_t* tokenIndices{nullptr};
 
   // Kernel input/output buffer
   T* inpTokenBuf{nullptr};
@@ -112,13 +112,13 @@ class EpDispatchCombineHandle {
   mori::application::SymmMemObjPtr shmemInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
 
-  // Registered buffer used for weights, indicies and scales
+  // Registered buffer used for weights, indices and scales
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
   mori::application::SymmMemObjPtr shmemOutWeightsMemObj;
   mori::application::SymmMemObjPtr shmemInpScalesMemObj;
   mori::application::SymmMemObjPtr shmemOutScalesMemObj;
-  mori::application::SymmMemObjPtr shmemInpIndiciesMemObj;
-  mori::application::SymmMemObjPtr shmemOutIndiciesMemObj;
+  mori::application::SymmMemObjPtr shmemInpIndicesMemObj;
+  mori::application::SymmMemObjPtr shmemOutIndicesMemObj;
 
   // Record number of tokens that will be received from other PE
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
@@ -156,7 +156,7 @@ template <typename T>
 struct EpDispatchCombineArgs {
   EpDispatchCombineConfig config;
   index_t curRankNumToken{0};
-  index_t* tokenIndicies{nullptr};
+  index_t* tokenIndices{nullptr};
   T* inpTokenBuf{nullptr};
   T* outTokenBuf{nullptr};
   float* weightsBuf{nullptr};
@@ -167,8 +167,8 @@ struct EpDispatchCombineArgs {
   mori::application::SymmMemObjPtr shmemOutWeightsMemObj;
   mori::application::SymmMemObjPtr shmemInpScalesMemObj;
   mori::application::SymmMemObjPtr shmemOutScalesMemObj;
-  mori::application::SymmMemObjPtr shmemInpIndiciesMemObj;
-  mori::application::SymmMemObjPtr shmemOutIndiciesMemObj;
+  mori::application::SymmMemObjPtr shmemInpIndicesMemObj;
+  mori::application::SymmMemObjPtr shmemOutIndicesMemObj;
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
   mori::application::SymmMemObjPtr sendTokenNumMemObj;
   uint32_t* dispatchGridBarrier{nullptr};
@@ -191,7 +191,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<
   EpDispatchCombineArgs<T> args;
   args.config = handle.config;
   args.curRankNumToken = handle.curRankNumToken;
-  args.tokenIndicies = handle.tokenIndicies;
+  args.tokenIndices = handle.tokenIndices;
   args.inpTokenBuf = handle.inpTokenBuf;
   args.outTokenBuf = handle.outTokenBuf;
   args.weightsBuf = handle.weightsBuf;
@@ -205,8 +205,8 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<
   args.shmemOutWeightsMemObj = handle.shmemOutWeightsMemObj;
   args.shmemInpScalesMemObj = handle.shmemInpScalesMemObj;
   args.shmemOutScalesMemObj = handle.shmemOutScalesMemObj;
-  args.shmemInpIndiciesMemObj = handle.shmemInpIndiciesMemObj;
-  args.shmemOutIndiciesMemObj = handle.shmemOutIndiciesMemObj;
+  args.shmemInpIndicesMemObj = handle.shmemInpIndicesMemObj;
+  args.shmemOutIndicesMemObj = handle.shmemOutIndicesMemObj;
   args.recvTokenNumMemObj = handle.recvTokenNumMemObj;
   args.sendTokenNumMemObj = handle.sendTokenNumMemObj;
   args.dispatchGridBarrier = handle.dispatchGridBarrier;
