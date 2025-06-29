@@ -267,12 +267,10 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
     index_t peSortedOffset = peSortedId * config.hiddenDim;
     index_t tokenOffset = localTokenIdx * config.hiddenDim;
 
-    core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + tokenOffset,
+    core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<T*>() + tokenOffset,
                    args.inpTokenBuf + tokenOffset, config.hiddenDim);
-    // if (laneId == 0) core::AcquireLock(args.lock + srcPe);
-    shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, peSortedOffset, args.shmemOutTokMemObj,
+    shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, peSortedOffset, args.shmemStagingTokMemObj,
                                   tokenOffset, config.hiddenDim, srcPe);
-    //  if (laneId == 0) core::ReleaseLock(args.lock + srcPe);
   }
   // Make sure copy on all GPUs are finished
   CrossDeviceBarrierInterNodeKernel(args);

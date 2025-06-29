@@ -36,7 +36,6 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
   while (core::AtomicLoadRelaxed(&wq.readyIdx) != curPostIdx) {
   }
   core::UpdateSendDbrRecord<PrvdType>(wq.dbrRecAddr, curPostIdx);
-  // __threadfence_system();
   core::RingDoorbell<PrvdType>(wq.dbrAddr, dbrVal);
   atomicAdd(&wq.readyIdx, 1);
 }
@@ -99,7 +98,6 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
   while (core::AtomicLoadRelaxed(&wq.readyIdx) != curPostIdx) {
   }
   core::UpdateSendDbrRecord<PrvdType>(wq.dbrRecAddr, curPostIdx);
-  // __threadfence_system();
   core::RingDoorbell<PrvdType>(wq.dbrAddr, dbrVal);
   atomicAdd(&wq.readyIdx, 1);
 }

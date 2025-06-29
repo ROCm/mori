@@ -485,21 +485,18 @@ DEFINE_POST_ATOMIC_SPEC(int64_t)
 /* ---------------------------------------------------------------------------------------------- */
 template <>
 inline __device__ void UpdateSendDbrRecord<ProviderType::MLX5>(void* dbrRecAddr, uint32_t wqeIdx) {
-  // reinterpret_cast<uint32_t*>(dbrRecAddr)[MLX5_SND_DBR] = HTOBE32(wqeIdx & 0xffff);
   core::AtomicStoreSeqCstSystem(reinterpret_cast<uint32_t*>(dbrRecAddr) + MLX5_SND_DBR,
                                 HTOBE32(wqeIdx & 0xffff));
 }
 
 template <>
 inline __device__ void UpdateRecvDbrRecord<ProviderType::MLX5>(void* dbrRecAddr, uint32_t wqeIdx) {
-  // reinterpret_cast<uint32_t*>(dbrRecAddr)[MLX5_RCV_DBR] = HTOBE32(wqeIdx & 0xffff);
   core::AtomicStoreSeqCstSystem(reinterpret_cast<uint32_t*>(dbrRecAddr) + MLX5_RCV_DBR,
                                 HTOBE32(wqeIdx & 0xffff));
 }
 
 template <>
 inline __device__ void RingDoorbell<ProviderType::MLX5>(void* dbrAddr, uint64_t dbrVal) {
-  // reinterpret_cast<uint64_t*>(dbrAddr)[0] = dbrVal;
   core::AtomicStoreSeqCstSystem(reinterpret_cast<uint64_t*>(dbrAddr), dbrVal);
 }
 

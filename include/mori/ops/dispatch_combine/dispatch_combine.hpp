@@ -141,9 +141,6 @@ class EpDispatchCombineHandle {
   // Count the number of tokens sent to local pe
   index_t* localPeTokenCounter{nullptr};
 
-  // Lock for guarding shmem ops
-  uint32_t* lock{nullptr};
-
   // Intra-node kernel parameters
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
@@ -177,7 +174,6 @@ struct EpDispatchCombineArgs {
   uint32_t* combineGridBarrier{nullptr};
   index_t* destPeTokenCounter{nullptr};
   index_t* localPeTokenCounter{nullptr};
-  uint32_t* lock{nullptr};
   index_t* dispReceiverIdxMap{nullptr};
   index_t* dispSenderIdxMap{nullptr};
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
@@ -200,7 +196,6 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<
   args.scalesBuf = handle.scalesBuf;
   args.destPeTokenCounter = handle.destPeTokenCounter;
   args.localPeTokenCounter = handle.localPeTokenCounter;
-  args.lock = handle.lock;
   args.shmemInpTokMemObj = handle.shmemInpTokMemObj;
   args.shmemOutTokMemObj = handle.shmemOutTokMemObj;
   args.shmemStagingTokMemObj = handle.shmemStagingTokMemObj;

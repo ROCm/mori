@@ -18,11 +18,11 @@ class EpDispatchCombineTestCase:
             hidden_dim=7168,
             scale_dim=32,
             scale_type_size=4,
-            max_num_inp_token_per_rank=512,
+            max_num_inp_token_per_rank=128,
             num_experts_per_rank=32,
             num_experts_per_token=8,
             warp_num_per_block=4,
-            block_num=128,
+            block_num=32,
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNode,
         )
 
@@ -226,22 +226,22 @@ class EpDispatchCombineTestCase:
         )
         torch.cuda.synchronize()
 
-        # for i in range(all_rank_num_token[self.rank]):
-        #     pes = [
-        #         (idx // self.config.num_experts_per_rank)
-        #         for idx in all_rank_indicies[self.rank][i].cpu().tolist()
-        #     ]
-        #     unique_pes = len(set(pes))
+        for i in range(all_rank_num_token[self.rank]):
+            pes = [
+                (idx // self.config.num_experts_per_rank)
+                for idx in all_rank_indicies[self.rank][i].cpu().tolist()
+            ]
+            unique_pes = len(set(pes))
 
-        #     got, expected = combine_output[i], (
-        #         all_rank_input[self.rank][i].to(torch.float32) * unique_pes
-        #     ).to(self.config.data_type)
+            got, expected = combine_output[i], (
+                all_rank_input[self.rank][i].to(torch.float32) * unique_pes
+            ).to(self.config.data_type)
 
-        #     ok = torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
-        #     if not ok:
-        #         print(self.rank, "got: ", got)
-        #         print(self.rank, "expected: ", expected)
-        #         assert False
+            ok = torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
+            if not ok:
+                print(self.rank, "got: ", got)
+                print(self.rank, "expected: ", expected)
+                assert False
 
         if self.config.rank == 0:
             print("Combine Pass")
@@ -265,6 +265,10 @@ class EpDispatchCombineTestCase:
             all_rank_scales,
         ) = test_data
         dist.barrier()
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
         (
             dispatch_output,
             dispatch_weights,
@@ -277,10 +281,17 @@ class EpDispatchCombineTestCase:
             all_rank_scales[self.rank],
             all_rank_indicies[self.rank],
         )
+        end_event.record()
         torch.cuda.synchronize()
-        dist.barrier()
+        duration = start_event.elapsed_time(end_event)
 
-        print(f"rank {self.rank} recv {dispatch_recv_num_token[0].item()} tokens")
+        dist.barrier()
+        total_recv_num_token = dispatch_recv_num_token[0].item()
+        print(f"rank {self.rank} recv {total_recv_num_token} tokens")
+
+        element_size = all_rank_input[self.rank].element_size()
+        total_bytes = total_recv_num_token * self.config.hidden_dim * element_size
+        bandwidth = total_bytes / (1024**3) / (duration / (10**3))
 
         # combine_output = op.combine(
         #     dispatch_output,
@@ -291,14 +302,34 @@ class EpDispatchCombineTestCase:
 
         op.reset()
         torch.cuda.synchronize()
+        return duration, bandwidth
 
     def bench_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
-        for i in range(50):
+        test_data = self.gen_test_data(use_max_token_num=True)
+
+        duration_us_list = []
+        bandwidth_GB_list = []
+
+        for i in range(10):
             if self.rank == 0:
                 print(f"Round {i} begin")
-            test_data = self.gen_test_data(use_max_token_num=True)
-            self.run_bench_once(op, test_data)
+            duration, bandwidth = self.run_bench_once(op, test_data)
+
+            duration_output = [torch.zeros(1) for _ in range(self.world_size)]
+            bandwidth_output = [torch.zeros(1) for _ in range(self.world_size)]
+
+            dist.all_gather(duration_output, torch.tensor([duration * 1000]))
+            dist.all_gather(bandwidth_output, torch.tensor([bandwidth]))
+
+            duration_us_list.append([int(t.item()) for t in duration_output])
+            bandwidth_GB_list.append([int(t.item()) for t in bandwidth_output])
+
+        if self.rank == 0:
+            for i, duration_us in enumerate(duration_us_list):
+                print(
+                    f"Round {i} duration {duration_us} bandwidth {bandwidth_GB_list[i]}"
+                )
         del op
 
 
