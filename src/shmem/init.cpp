@@ -61,6 +61,10 @@ void GpuStateInit() {
     HIP_RUNTIME_CHECK(
         hipMemcpy(gpuStates.rdmaEndpoints, rdmaStates->commContext->GetRdmaEndpoints().data(),
                   sizeof(application::RdmaEndpoint) * worldSize, hipMemcpyHostToDevice));
+
+    size_t lockSize = worldSize * sizeof(uint32_t);
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuStates.endpointLock, lockSize));
+    HIP_RUNTIME_CHECK(hipMemset(gpuStates.endpointLock, 0, lockSize));
   }
 
   // Copy gpu states to constant memory

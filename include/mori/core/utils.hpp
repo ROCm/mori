@@ -82,7 +82,7 @@ __device__ T AtomicCompareExchangeSystem(T* address, T* compare, T val) {
 /*                                    Match                                   */
 /* -------------------------------------------------------------------------- */
 template <typename T>
-constexpr inline __device__ T CeilDiv(T a, T b) {
+constexpr inline __device__ __host__ T CeilDiv(T a, T b) {
   return (a + b - 1) / b;
 }
 
