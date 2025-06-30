@@ -22,7 +22,7 @@ class EpDispatchCombineTestCase:
             num_experts_per_rank=32,
             num_experts_per_token=8,
             warp_num_per_block=4,
-            block_num=32,
+            block_num=80,
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNode,
         )
 
@@ -287,7 +287,19 @@ class EpDispatchCombineTestCase:
 
         dist.barrier()
         total_recv_num_token = dispatch_recv_num_token[0].item()
-        print(f"rank {self.rank} recv {total_recv_num_token} tokens")
+        max_num_token_to_send_per_rank = (
+            self.config.max_num_inp_token_per_rank * self.config.num_experts_per_token
+        )
+
+        my_node = self.rank // self.gpu_per_node
+        total_rdma_recv_num_token = 0
+        src_token_pos = op.get_dispatch_src_token_pos().cpu().tolist()
+        for i, src_token_id in enumerate(src_token_pos):
+            src_pe = src_token_id // max_num_token_to_send_per_rank
+            src_node = src_pe // self.gpu_per_node
+            if src_node != my_node:
+                total_rdma_recv_num_token += 1
+        print(f"rank {self.rank} recv {total_recv_num_token} tokens {total_rdma_recv_num_token} rdma tokens")
 
         element_size = all_rank_input[self.rank].element_size()
         total_bytes = total_recv_num_token * self.config.hidden_dim * element_size
@@ -319,7 +331,7 @@ class EpDispatchCombineTestCase:
         comb_duration_us_list = []
         comb_bandwidth_GB_list = []
 
-        for i in range(10):
+        for i in range(50):
             if self.rank == 0:
                 print(f"Round {i} begin")
             disp_duration, disp_bandwidth, comb_duration, comb_bandwidth = (
@@ -348,12 +360,23 @@ class EpDispatchCombineTestCase:
         if self.rank == 0:
             for i, duration_us in enumerate(disp_duration_us_list):
                 print(
-                    f"Round {i} dispatch duration {duration_us} bandwidth {disp_bandwidth_GB_list[i]}"
+                    f"Round {i} dispatch duration {duration_us} bandwidth {disp_bandwidth_GB_list[i]} avg {sum(disp_bandwidth_GB_list[i]) / self.config.world_size}"
                 )
             for i, duration_us in enumerate(comb_duration_us_list):
                 print(
-                    f"Round {i} combine duration {duration_us} bandwidth {comb_bandwidth_GB_list[i]}"
+                    f"Round {i} combine duration {duration_us} bandwidth {comb_bandwidth_GB_list[i]} avg {sum(comb_bandwidth_GB_list[i]) / self.config.world_size}"
                 )
+
+        disp_bandwidth_GB_list = disp_bandwidth_GB_list[10:]
+        avg_disp_bw_per_round = [(sum(round_bw) / len(round_bw)) for round_bw in disp_bandwidth_GB_list]
+        avg_disp_bw = sum(avg_disp_bw_per_round) / len(avg_disp_bw_per_round)
+
+        comb_bandwidth_GB_list = comb_bandwidth_GB_list[10:]
+        avg_comb_bw_per_round = [(sum(round_bw) / len(round_bw)) for round_bw in comb_bandwidth_GB_list]
+        avg_comb_bw = sum(avg_comb_bw_per_round) / len(avg_comb_bw_per_round)
+
+        if self.rank == 0:
+            print(f"dispatch avg bandwidth {avg_disp_bw} combine avg bandwidth {avg_comb_bw}")
         del op
 
 
@@ -363,7 +386,7 @@ def test_dispatch_combine(local_rank, num_node, gpu_per_node, is_bench=False):
     global_rank = node_rank * gpu_per_node + local_rank
 
     test_case = EpDispatchCombineTestCase(
-        global_rank, gpu_per_node, world_size, torch.float8_e4m3fnuz
+        global_rank, gpu_per_node, world_size, torch.bfloat16, #torch.float8_e4m3fnuz
     )
     test_case.setup()
     if is_bench:
