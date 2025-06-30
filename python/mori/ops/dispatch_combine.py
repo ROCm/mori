@@ -33,7 +33,8 @@ def _cpp_dispatch_combine_factory(data_type: torch.dtype, entity_name):
         torch.bfloat16: "Bf16",
         torch.float8_e4m3fnuz: "Fp8E4m3Fnuz",
     }
-    return getattr(mori_cpp, entity_name + _mori_ops_dtype_map[data_type])
+    return getattr(mori_cpp, entity_name)
+    # return getattr(mori_cpp, entity_name + _mori_ops_dtype_map[data_type])
 
 
 class EpDispatchCombineOp:
