@@ -63,6 +63,8 @@ class TorchDistProcessManager:
                 while True:
                     task = self.task_queue.get()
                     if task == "STOP":
+                        if self.init_mori_shmem:
+                            mori.shmem.shmem_finalize()
                         break
                     func, args = task
                     try:

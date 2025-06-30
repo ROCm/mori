@@ -78,7 +78,7 @@ setup(
         "build_ext": CMakeBuild,
         "build": CustomBuild,
     },
-    install_requires=["torch"],
+    install_requires=["torch", "pytest-assume"],
     python_requires=">=3.10",
     ext_modules=extensions,
     include_package_data=True,
