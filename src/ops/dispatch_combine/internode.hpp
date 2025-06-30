@@ -56,7 +56,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
   int i = globalWarpId;
   for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
        i += globalWarpNum) {
-    index_t destExpert = args.tokenIndicies[i];
+    index_t destExpert = args.tokenIndices[i];
     index_t destPe = destExpert / config.numExpertPerRank;
     index_t tokenId = i / config.numExpertPerToken;
 
@@ -64,7 +64,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
     assert(config.numExpertPerToken < warpSize);
     int condition = 0;
     if (laneId < (i % config.numExpertPerToken)) {
-      condition = destPe == (args.tokenIndicies[tokenId * config.numExpertPerToken + laneId] /
+      condition = destPe == (args.tokenIndices[tokenId * config.numExpertPerToken + laneId] /
                              config.numExpertPerRank);
     }
     if (__any(condition)) {
@@ -93,9 +93,9 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
     core::WarpCopy(args.shmemOutWeightsMemObj->template GetAs<float*>() +
                        peSortedIdx * config.numExpertPerToken,
                    args.weightsBuf + tokenId * config.numExpertPerToken, config.numExpertPerToken);
-    core::WarpCopy(args.shmemOutIndiciesMemObj->template GetAs<index_t*>() +
+    core::WarpCopy(args.shmemOutIndicesMemObj->template GetAs<index_t*>() +
                        peSortedIdx * config.numExpertPerToken,
-                   args.tokenIndicies + tokenId * config.numExpertPerToken,
+                   args.tokenIndices + tokenId * config.numExpertPerToken,
                    config.numExpertPerToken);
 #else
     // For disaggregated write, write data to remote directly
@@ -134,8 +134,8 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
           args.shmemOutWeightsMemObj, localPeSortedOffset * config.numExpertPerToken,
           config.numExpertPerToken * numToken, destPe);
       shmem::ShmemPutTypeNbiThread<index_t>(
-          args.shmemInpIndiciesMemObj, remotePeSortedOffset * config.numExpertPerToken,
-          args.shmemOutIndiciesMemObj, localPeSortedOffset * config.numExpertPerToken,
+          args.shmemInpIndicesMemObj, remotePeSortedOffset * config.numExpertPerToken,
+          args.shmemOutIndicesMemObj, localPeSortedOffset * config.numExpertPerToken,
           config.numExpertPerToken * numToken, destPe);
 #endif
       shmem::ShmemPutInt32ImmNbiThread(args.recvTokenNumMemObj, myPe * sizeof(index_t),
@@ -184,9 +184,9 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
                    args.shmemInpWeightsMemObj->template GetAs<float*>() +
                        peSortedId * config.numExpertPerToken,
                    config.numExpertPerToken);
-    core::WarpCopy(args.shmemOutIndiciesMemObj->template GetAs<index_t*>() +
+    core::WarpCopy(args.shmemOutIndicesMemObj->template GetAs<index_t*>() +
                        localTokenIdx * config.numExpertPerToken,
-                   args.shmemInpIndiciesMemObj->template GetAs<index_t*>() +
+                   args.shmemInpIndicesMemObj->template GetAs<index_t*>() +
                        peSortedId * config.numExpertPerToken,
                    config.numExpertPerToken);
     if (laneId == 0) {

@@ -102,10 +102,10 @@ class EpDispatchCombineTestCase:
                 device=self.device,
             )
 
-        # gen indicies
-        all_rank_indicies = []
+        # gen indices
+        all_rank_indices = []
         for r in range(self.world_size):
-            indicies = torch.empty(
+            indices = torch.empty(
                 num_token[r],
                 self.config.num_experts_per_token,
                 dtype=torch.int64,
@@ -117,8 +117,8 @@ class EpDispatchCombineTestCase:
                     generator=self.rng,
                     device=self.device,
                 )
-                indicies[i] = perm[: self.config.num_experts_per_token]
-            all_rank_indicies.append(indicies.to(torch.int32).to(self.device))
+                indices[i] = perm[: self.config.num_experts_per_token]
+            all_rank_indices.append(indices.to(torch.int32).to(self.device))
 
         # gen weights
         all_rank_weights = [
@@ -160,7 +160,7 @@ class EpDispatchCombineTestCase:
 
         return (
             num_token,
-            all_rank_indicies,
+            all_rank_indices,
             all_rank_input,
             all_rank_weights,
             all_rank_scales,
@@ -169,7 +169,7 @@ class EpDispatchCombineTestCase:
     def run_test_once(self, op, test_data):
         (
             all_rank_num_token,
-            all_rank_indicies,
+            all_rank_indices,
             all_rank_input,
             all_rank_weights,
             all_rank_scales,
@@ -179,13 +179,13 @@ class EpDispatchCombineTestCase:
             dispatch_output,
             dispatch_weights,
             dispatch_scales,
-            dispatch_indicies,
+            dispatch_indices,
             dispatch_recv_num_token,
         ) = op.dispatch(
             all_rank_input[self.rank],
             all_rank_weights[self.rank],
             all_rank_scales[self.rank],
-            all_rank_indicies[self.rank],
+            all_rank_indices[self.rank],
         )
         torch.cuda.synchronize()
         dist.barrier()
@@ -222,14 +222,14 @@ class EpDispatchCombineTestCase:
         combine_output = op.combine(
             dispatch_output,
             all_rank_weights[self.rank],
-            all_rank_indicies[self.rank],
+            all_rank_indices[self.rank],
         )
         torch.cuda.synchronize()
 
         for i in range(all_rank_num_token[self.rank]):
             pes = [
                 (idx // self.config.num_experts_per_rank)
-                for idx in all_rank_indicies[self.rank][i].cpu().tolist()
+                for idx in all_rank_indices[self.rank][i].cpu().tolist()
             ]
             unique_pes = len(set(pes))
 
@@ -299,7 +299,9 @@ class EpDispatchCombineTestCase:
             src_node = src_pe // self.gpu_per_node
             if src_node != my_node:
                 total_rdma_recv_num_token += 1
-        print(f"rank {self.rank} recv {total_recv_num_token} tokens {total_rdma_recv_num_token} rdma tokens")
+        print(
+            f"rank {self.rank} recv {total_recv_num_token} tokens {total_rdma_recv_num_token} rdma tokens"
+        )
 
         element_size = all_rank_input[self.rank].element_size()
         total_bytes = total_recv_num_token * self.config.hidden_dim * element_size
@@ -368,15 +370,21 @@ class EpDispatchCombineTestCase:
                 )
 
         disp_bandwidth_GB_list = disp_bandwidth_GB_list[10:]
-        avg_disp_bw_per_round = [(sum(round_bw) / len(round_bw)) for round_bw in disp_bandwidth_GB_list]
+        avg_disp_bw_per_round = [
+            (sum(round_bw) / len(round_bw)) for round_bw in disp_bandwidth_GB_list
+        ]
         avg_disp_bw = sum(avg_disp_bw_per_round) / len(avg_disp_bw_per_round)
 
         comb_bandwidth_GB_list = comb_bandwidth_GB_list[10:]
-        avg_comb_bw_per_round = [(sum(round_bw) / len(round_bw)) for round_bw in comb_bandwidth_GB_list]
+        avg_comb_bw_per_round = [
+            (sum(round_bw) / len(round_bw)) for round_bw in comb_bandwidth_GB_list
+        ]
         avg_comb_bw = sum(avg_comb_bw_per_round) / len(avg_comb_bw_per_round)
 
         if self.rank == 0:
-            print(f"dispatch avg bandwidth {avg_disp_bw} combine avg bandwidth {avg_comb_bw}")
+            print(
+                f"dispatch avg bandwidth {avg_disp_bw} combine avg bandwidth {avg_comb_bw}"
+            )
         del op
 
 
@@ -386,7 +394,10 @@ def test_dispatch_combine(local_rank, num_node, gpu_per_node, is_bench=False):
     global_rank = node_rank * gpu_per_node + local_rank
 
     test_case = EpDispatchCombineTestCase(
-        global_rank, gpu_per_node, world_size, torch.bfloat16, #torch.float8_e4m3fnuz
+        global_rank,
+        gpu_per_node,
+        world_size,
+        torch.float8_e4m3fnuz,  # torch.float8_e4m3fnuz
     )
     test_case.setup()
     if is_bench:
