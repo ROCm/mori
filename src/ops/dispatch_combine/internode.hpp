@@ -215,9 +215,9 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   for (int destPe = globalWarpId; destPe < args.config.worldSize; destPe += globalWarpNum) {
     if (laneId == 0) {
       shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
-      shmem::ShmemPutUint32ImmNbiThread(args.crossDeviceBarrierMemObj,
-                                        args.config.rank * sizeof(uint32_t),
-                                        args.crossDeviceBarrierFlag, destPe);
+      shmem::ShmemPutUint32ImmNbiWarp(args.crossDeviceBarrierMemObj,
+                                      args.config.rank * sizeof(uint32_t),
+                                      args.crossDeviceBarrierFlag, destPe);
     }
   }
 

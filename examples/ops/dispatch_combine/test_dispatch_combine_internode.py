@@ -283,7 +283,7 @@ class EpDispatchCombineTestCase:
         )
         end_event.record()
         torch.cuda.synchronize()
-        duration = start_event.elapsed_time(end_event)
+        disp_duration = start_event.elapsed_time(end_event)
 
         dist.barrier()
         total_recv_num_token = dispatch_recv_num_token[0].item()
@@ -291,44 +291,68 @@ class EpDispatchCombineTestCase:
 
         element_size = all_rank_input[self.rank].element_size()
         total_bytes = total_recv_num_token * self.config.hidden_dim * element_size
-        bandwidth = total_bytes / (1024**3) / (duration / (10**3))
+        disp_bandwidth = total_bytes / (1024**3) / (disp_duration / (10**3))
 
-        # combine_output = op.combine(
-        #     dispatch_output,
-        #     all_rank_weights[self.rank],
-        #     all_rank_indicies[self.rank],
-        # )
-        # torch.cuda.synchronize()
+        dist.barrier()
+        start_event.record()
+        combine_output = op.combine(
+            dispatch_output,
+            all_rank_weights[self.rank],
+            all_rank_indicies[self.rank],
+            call_reset=False,
+        )
+        end_event.record()
+        torch.cuda.synchronize()
+        comb_duration = start_event.elapsed_time(end_event)
+        comb_bandwidth = total_bytes / (1024**3) / (comb_duration / (10**3))
 
         op.reset()
         torch.cuda.synchronize()
-        return duration, bandwidth
+        return disp_duration, disp_bandwidth, comb_duration, comb_bandwidth
 
     def bench_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
         test_data = self.gen_test_data(use_max_token_num=True)
 
-        duration_us_list = []
-        bandwidth_GB_list = []
+        disp_duration_us_list = []
+        disp_bandwidth_GB_list = []
+        comb_duration_us_list = []
+        comb_bandwidth_GB_list = []
 
         for i in range(10):
             if self.rank == 0:
                 print(f"Round {i} begin")
-            duration, bandwidth = self.run_bench_once(op, test_data)
+            disp_duration, disp_bandwidth, comb_duration, comb_bandwidth = (
+                self.run_bench_once(op, test_data)
+            )
 
-            duration_output = [torch.zeros(1) for _ in range(self.world_size)]
-            bandwidth_output = [torch.zeros(1) for _ in range(self.world_size)]
+            disp_duration_output = [torch.zeros(1) for _ in range(self.world_size)]
+            disp_bandwidth_output = [torch.zeros(1) for _ in range(self.world_size)]
+            comb_duration_output = [torch.zeros(1) for _ in range(self.world_size)]
+            comb_bandwidth_output = [torch.zeros(1) for _ in range(self.world_size)]
 
-            dist.all_gather(duration_output, torch.tensor([duration * 1000]))
-            dist.all_gather(bandwidth_output, torch.tensor([bandwidth]))
+            dist.all_gather(disp_duration_output, torch.tensor([disp_duration * 1000]))
+            dist.all_gather(disp_bandwidth_output, torch.tensor([disp_bandwidth]))
+            dist.all_gather(comb_duration_output, torch.tensor([comb_duration * 1000]))
+            dist.all_gather(comb_bandwidth_output, torch.tensor([comb_bandwidth]))
 
-            duration_us_list.append([int(t.item()) for t in duration_output])
-            bandwidth_GB_list.append([int(t.item()) for t in bandwidth_output])
+            disp_duration_us_list.append([int(t.item()) for t in disp_duration_output])
+            disp_bandwidth_GB_list.append(
+                [int(t.item()) for t in disp_bandwidth_output]
+            )
+            comb_duration_us_list.append([int(t.item()) for t in comb_duration_output])
+            comb_bandwidth_GB_list.append(
+                [int(t.item()) for t in comb_bandwidth_output]
+            )
 
         if self.rank == 0:
-            for i, duration_us in enumerate(duration_us_list):
+            for i, duration_us in enumerate(disp_duration_us_list):
                 print(
-                    f"Round {i} duration {duration_us} bandwidth {bandwidth_GB_list[i]}"
+                    f"Round {i} dispatch duration {duration_us} bandwidth {disp_bandwidth_GB_list[i]}"
+                )
+            for i, duration_us in enumerate(comb_duration_us_list):
+                print(
+                    f"Round {i} combine duration {duration_us} bandwidth {comb_bandwidth_GB_list[i]}"
                 )
         del op
 
@@ -339,7 +363,7 @@ def test_dispatch_combine(local_rank, num_node, gpu_per_node, is_bench=False):
     global_rank = node_rank * gpu_per_node + local_rank
 
     test_case = EpDispatchCombineTestCase(
-        global_rank, gpu_per_node, world_size, torch.bfloat16  # torch.float8_e4m3fnuz
+        global_rank, gpu_per_node, world_size, torch.float8_e4m3fnuz
     )
     test_case.setup()
     if is_bench:
@@ -360,7 +384,7 @@ if __name__ == "__main__":
         args=(
             num_node,
             gpu_per_node,
-            False,
+            True,
         ),
         nprocs=gpu_per_node,
         join=True,

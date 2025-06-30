@@ -97,7 +97,11 @@ class EpDispatchCombineOp:
         )
 
     def combine(
-        self, input: torch.Tensor, weights: torch.Tensor, indicies: torch.Tensor
+        self,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        indicies: torch.Tensor,
+        call_reset=True,
     ):
         output = self._combine_func(
             self._handle,
@@ -106,7 +110,8 @@ class EpDispatchCombineOp:
             weights,
             indicies,
         )
-        self._reset_func(self._handle)
+        if call_reset:
+            self._reset_func(self._handle)
         return output
 
     def reset(self):
