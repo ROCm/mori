@@ -118,32 +118,31 @@ torch::Tensor GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle&
   return tensor;
 }
 
-// Defines handle for different template arguments, we use typeStr to avoid function name shadow
-void DeclareEpDispatchCombineHandle(pybind11::module& m, const std::string& typeStr) {
-  std::string className = std::string("EpDispatchCombineHandle") + typeStr;
+void DeclareEpDispatchCombineHandle(pybind11::module& m) {
+  std::string className = std::string("EpDispatchCombineHandle");
   pybind11::class_<mori::moe::EpDispatchCombineHandle>(m, className.c_str())
       .def(pybind11::init<mori::moe::EpDispatchCombineConfig>(),
            py::arg("config") = mori::moe::EpDispatchCombineConfig{});
 
-  std::string funcName = std::string("launch_dispatch_") + typeStr;
+  std::string funcName = std::string("launch_dispatch");
   m.def(funcName.c_str(), &LaunchDispatch);
 
-  funcName = std::string("launch_combine_") + typeStr;
+  funcName = std::string("launch_combine");
   m.def(funcName.c_str(), &LaunchCombine);
 
-  funcName = std::string("launch_reset_") + typeStr;
+  funcName = std::string("launch_reset");
   m.def(funcName.c_str(), &LaunchReset);
 
-  funcName = std::string("get_cur_rank_num_token_") + typeStr;
+  funcName = std::string("get_cur_rank_num_token");
   m.def(funcName.c_str(), &mori::moe::EpDispatchCombineHandle::GetCurRankNumToken);
 
-  funcName = std::string("get_dispatch_src_token_pos_") + typeStr;
+  funcName = std::string("get_dispatch_src_token_pos");
   m.def(funcName.c_str(), &GetDispatchSrcTokenId);
 
-  funcName = std::string("get_dispatch_sender_token_idx_map_") + typeStr;
+  funcName = std::string("get_dispatch_sender_token_idx_map");
   m.def(funcName.c_str(), &GetDispatchSenderTokenIdxMap);
 
-  funcName = std::string("get_dispatch_receiver_token_idx_map_") + typeStr;
+  funcName = std::string("get_dispatch_receiver_token_idx_map");
   m.def(funcName.c_str(), &GetDispatchReceiverTokenIdxMap);
 }
 
@@ -191,7 +190,7 @@ void RegisterMoriOps(py::module_& m) {
       .def_readonly("warp_num_per_block", &mori::moe::EpDispatchCombineConfig::warpNumPerBlock)
       .def_readonly("block_num", &mori::moe::EpDispatchCombineConfig::blockNum);
 
-  DeclareEpDispatchCombineHandle(m, "");
+  DeclareEpDispatchCombineHandle(m);
 }
 
 void RegisterMoriShmem(py::module_& m) {
