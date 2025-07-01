@@ -192,9 +192,6 @@ void RegisterMoriOps(py::module_& m) {
       .def_readonly("block_num", &mori::moe::EpDispatchCombineConfig::blockNum);
 
   DeclareEpDispatchCombineHandle(m, "");
-  // DeclareEpDispatchCombineHandle<float>(m, "Fp32");
-  // DeclareEpDispatchCombineHandle<hip_bfloat16>(m, "Bf16");
-  // DeclareEpDispatchCombineHandle<__hip_fp8_e4m3_fnuz>(m, "Fp8E4m3Fnuz");
 }
 
 void RegisterMoriShmem(py::module_& m) {

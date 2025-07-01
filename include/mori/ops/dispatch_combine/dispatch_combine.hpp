@@ -276,8 +276,6 @@ inline EpDispatchCombineArgsVariant GetEpDispatchCombineArgsByInputType(
       oss << "Unsupported inputType " << HipDataTypeToString(handle.inputType)
           << " in GetEpDispatchCombineArgsByInputType";
       throw std::runtime_error(oss.str());
-      // throw std::runtime_error("Unsupported inputType %s in GetEpDispatchCombineArgsByInputType",
-      //                          HipDataTypeToString(handle.inputType));
   }
 }
 
