@@ -630,6 +630,7 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
                                          {"scale_dim", optional_argument, NULL, 's'},
                                          {"scale_type", optional_argument, NULL, 0},
                                          {"max_tokens", optional_argument, NULL, 'm'},
+                                         {"max_token_type_size", optional_argument, NULL, 0},
                                          {"expert_per_rank", optional_argument, NULL, 'r'},
                                          {"expert_per_token", optional_argument, NULL, 't'},
                                          {"warp_per_blk", optional_argument, NULL, 'w'},
@@ -674,6 +675,8 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
             printf("Unknown scale type: %s, must be 'fp8' or 'fp32'\n", optarg);
             assert(false);
           }
+        } else if (strcmp(long_options[option_index].name, "max_token_type_size") == 0) {
+          testConfig.config.maxTokenTypeSize = std::stoi(optarg);
         }
         break;
       case 'd':
@@ -713,6 +716,9 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
       case 'h':
         printf("This is help message\n");
         break;
+      case '?':
+        fprintf(stderr, "Unknown option or missing argument\n");
+        return {};
       default:
         fprintf(stderr, "Unknown error in getopt_long\n");
         return {};

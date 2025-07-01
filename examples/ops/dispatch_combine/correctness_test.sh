@@ -28,7 +28,7 @@ for scaleType in "${scaleTypeList[@]}"; do
 
 cmd="mpirun -np $worldSize --allow-run-as-root $execPath --cmd test --data_type $dataType --hdim=$hiddenStateSize \
 --scale_dim=$scaleDim --max_tokens=$tokenNum --expert_per_rank=$expertPerRank --expert_per_token=$expertPerToken \
---warp_per_blk=$warpPerBlock --block_num=$blockNum --scale_type=$scaleType --num=3"
+--warp_per_blk=$warpPerBlock --block_num=$blockNum --scale_type=$scaleType --max_token_type_size=4 --num=3"
 echo "$cmd"
 eval "$cmd"
 if [ $? -ne 0 ]; then

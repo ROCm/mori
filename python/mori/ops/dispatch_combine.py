@@ -19,6 +19,7 @@ class EpDispatchCombineConfig:
     hidden_dim: int
     scale_dim: int
     scale_type_size: int
+    max_token_type_size: int
     max_num_inp_token_per_rank: int
     num_experts_per_rank: int
     num_experts_per_token: int
@@ -45,6 +46,7 @@ class EpDispatchCombineOp:
                 hidden_dim=config.hidden_dim,
                 scale_dim=config.scale_dim,
                 scale_type_size=config.scale_type_size,
+                max_token_type_size=config.max_token_type_size,
                 max_num_inp_token_per_rank=config.max_num_inp_token_per_rank,
                 num_experts_per_rank=config.num_experts_per_rank,
                 num_experts_per_token=config.num_experts_per_token,

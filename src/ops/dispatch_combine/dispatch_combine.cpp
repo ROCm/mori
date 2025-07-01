@@ -72,9 +72,7 @@ mori::application::SymmMemObjPtr ShmemMallocAndReturnMemObjPtr(size_t size, unsi
 }
 
 void EpDispatchCombineHandle::InitializeShmemBuf() {
-  // TODO input actual inputType instead of sizeof float
-  size_t maxTokenSize =
-      config.MaxNumTokensToRecv() * config.hiddenDim * sizeof(float);
+  size_t maxTokenSize = config.MaxNumTokensToRecv() * config.hiddenDim * config.maxTokenTypeSize;
   shmemInpTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
   shmemOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
   shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);

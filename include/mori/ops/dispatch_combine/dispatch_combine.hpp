@@ -53,6 +53,7 @@ struct EpDispatchCombineConfig {
   int hiddenDim{4096};
   int scaleDim{32};
   int scaleTypeSize{1};
+  int maxTokenTypeSize{4};
   int maxNumInpTokenPerRank{128};
   int numExpertPerRank{1};
   int numExpertPerToken{2};
@@ -291,6 +292,7 @@ static std::ostream& operator<<(std::ostream& s, mori::moe::EpDispatchCombineCon
      << "  hiddenDim: " << config.hiddenDim << std::endl
      << "  scaleDim: " << config.scaleDim << std::endl
      << "  scaleTypeSize: " << config.scaleTypeSize << std::endl
+     << "  maxTokenTypeSize: " << config.maxTokenTypeSize << std::endl
      << "  maxNumInpTokenPerRank: " << config.maxNumInpTokenPerRank << std::endl
      << "  numExpertPerRank: " << config.numExpertPerRank << std::endl
      << "  numExpertPerToken: " << config.numExpertPerToken << std::endl
