@@ -50,7 +50,7 @@ __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
 /* ---------------------------------------------------------------------------------------------- */
 EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config)
     : config(config) {
-  IntializeShmemBuf();
+  InitializeShmemBuf();
   IntializeTokenNumSignalBuf();
   IntializeOrderMapBuf();
   IntializeBarrier();
@@ -71,7 +71,7 @@ mori::application::SymmMemObjPtr ShmemMallocAndReturnMemObjPtr(size_t size, unsi
   return obj;
 }
 
-void EpDispatchCombineHandle::IntializeShmemBuf() {
+void EpDispatchCombineHandle::InitializeShmemBuf() {
   // TODO input actual inputType instead of sizeof float
   size_t maxTokenSize =
       config.MaxNumTokensToRecv() * config.hiddenDim * sizeof(float);

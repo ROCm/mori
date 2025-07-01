@@ -116,7 +116,7 @@ class EpDispatchCombineHandle {
   index_t GetCurRankNumToken() const { return curRankNumToken; }
 
  private:
-  void IntializeShmemBuf();
+  void InitializeShmemBuf();
   void FinalizeShmemBuf();
 
   void IntializeTokenNumSignalBuf();
