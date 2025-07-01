@@ -19,6 +19,7 @@ class EpDispatchCombineConfig:
     hidden_dim: int
     scale_dim: int
     scale_type_size: int
+    max_token_type_size: int
     max_num_inp_token_per_rank: int
     num_experts_per_rank: int
     num_experts_per_token: int
@@ -27,13 +28,8 @@ class EpDispatchCombineConfig:
     kernel_type: EpDispatchCombineKernelType = EpDispatchCombineKernelType.IntraNode
 
 
-def _cpp_dispatch_combine_factory(data_type: torch.dtype, entity_name):
-    _mori_ops_dtype_map = {
-        torch.float32: "Fp32",
-        torch.bfloat16: "Bf16",
-        torch.float8_e4m3fnuz: "Fp8E4m3Fnuz",
-    }
-    return getattr(mori_cpp, entity_name + _mori_ops_dtype_map[data_type])
+def _cpp_dispatch_combine_factory(entity_name):
+    return getattr(mori_cpp, entity_name)
 
 
 class EpDispatchCombineOp:
@@ -41,7 +37,7 @@ class EpDispatchCombineOp:
         self.config = config
 
         handle_class = _cpp_dispatch_combine_factory(
-            config.data_type, "EpDispatchCombineHandle"
+            "EpDispatchCombineHandle"
         )
         self._handle = handle_class(
             mori_cpp.EpDispatchCombineConfig(
@@ -50,6 +46,7 @@ class EpDispatchCombineOp:
                 hidden_dim=config.hidden_dim,
                 scale_dim=config.scale_dim,
                 scale_type_size=config.scale_type_size,
+                max_token_type_size=config.max_token_type_size,
                 max_num_inp_token_per_rank=config.max_num_inp_token_per_rank,
                 num_experts_per_rank=config.num_experts_per_rank,
                 num_experts_per_token=config.num_experts_per_token,
@@ -59,25 +56,25 @@ class EpDispatchCombineOp:
         )
 
         self._dispatch_func = _cpp_dispatch_combine_factory(
-            config.data_type, "launch_dispatch_"
+            "launch_dispatch"
         )
         self._combine_func = _cpp_dispatch_combine_factory(
-            config.data_type, "launch_combine_"
+            "launch_combine"
         )
         self._reset_func = _cpp_dispatch_combine_factory(
-            config.data_type, "launch_reset_"
+            "launch_reset"
         )
         self._get_dispatch_src_token_pos_func = _cpp_dispatch_combine_factory(
-            config.data_type, "get_dispatch_src_token_pos_"
+            "get_dispatch_src_token_pos"
         )
         self._get_cur_rank_num_token = _cpp_dispatch_combine_factory(
-            config.data_type, "get_cur_rank_num_token_"
+            "get_cur_rank_num_token"
         )
         self._get_dispatch_sender_token_idx_map_func = _cpp_dispatch_combine_factory(
-            config.data_type, "get_dispatch_sender_token_idx_map_"
+            "get_dispatch_sender_token_idx_map"
         )
         self._get_dispatch_receiver_token_idx_map_func = _cpp_dispatch_combine_factory(
-            config.data_type, "get_dispatch_receiver_token_idx_map_"
+            "get_dispatch_receiver_token_idx_map"
         )
 
     def dispatch(

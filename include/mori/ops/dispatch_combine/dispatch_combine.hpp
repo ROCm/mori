@@ -1,6 +1,11 @@
 #pragma once
 
+#include <hip/hip_bfloat16.h>
+#include <hip/hip_fp8.h>
+#include <hip/library_types.h>
+
 #include <sstream>
+#include <variant>
 
 #include "mori/application/application.hpp"
 
@@ -12,6 +17,34 @@ enum KernelType {
   InterNode = 1,
 };
 
+inline const char* HipDataTypeToString(hipDataType dtype) {
+  switch (dtype) {
+    case HIP_R_16F:
+      return "HIP_R_16F";
+    case HIP_R_32F:
+      return "HIP_R_32F";
+    case HIP_R_16BF:
+      return "HIP_R_16BF";
+    case HIP_R_8F_E4M3_FNUZ:
+      return "HIP_R_8F_E4M3_FNUZ";
+    default:
+      return "Unknown";
+  }
+}
+
+inline size_t GetHipDataTypeSize(hipDataType dtype) {
+  switch (dtype) {
+    case HIP_R_32F:
+      return sizeof(float);
+    case HIP_R_16BF:
+      return sizeof(__hip_bfloat16);
+    case HIP_R_8F_E4M3_FNUZ:
+      return sizeof(__hip_fp8_e4m3_fnuz);
+    default:
+      throw std::runtime_error("Unknown hipDataType");
+  }
+}
+
 using index_t = int32_t;
 
 struct EpDispatchCombineConfig {
@@ -20,6 +53,7 @@ struct EpDispatchCombineConfig {
   int hiddenDim{4096};
   int scaleDim{32};
   int scaleTypeSize{1};
+  int maxTokenTypeSize{4};
   int maxNumInpTokenPerRank{128};
   int numExpertPerRank{1};
   int numExpertPerToken{2};
@@ -43,29 +77,32 @@ struct EpDispatchCombineConfig {
   }
 };
 
-template <typename T>
 class EpDispatchCombineHandle {
  public:
   EpDispatchCombineHandle(EpDispatchCombineConfig config);
   ~EpDispatchCombineHandle();
 
-  void PrepareInference(T* input, T* output, float* weights, index_t* tokenIndices,
-                        index_t numToken) {
+  void PrepareInference(hipDataType inputType, void* input, void* output, float* weights,
+                        index_t* tokenIndices, index_t numToken) {
+    this->inputType = inputType;
     this->inpTokenBuf = input;
     this->outTokenBuf = output;
     this->weightsBuf = weights;
     this->tokenIndices = tokenIndices;
     this->curRankNumToken = numToken;
+    // printf("handle inputType %s\n", HipDataTypeToString(inputType));
   }
 
-  void PrepareInference(T* input, T* output, float* weights, uint8_t* scales, index_t* tokenIndices,
-                        index_t numToken) {
+  void PrepareInference(hipDataType inputType, void* input, void* output, float* weights,
+                        uint8_t* scales, index_t* tokenIndices, index_t numToken) {
+    this->inputType = inputType;
     this->inpTokenBuf = input;
     this->outTokenBuf = output;
     this->weightsBuf = weights;
     this->scalesBuf = scales;
     this->tokenIndices = tokenIndices;
     this->curRankNumToken = numToken;
+    // printf("handle inputType %s\n", HipDataTypeToString(inputType));
   }
 
   void LaunchIntraNodeDispatch(hipStream_t = 0);
@@ -80,7 +117,7 @@ class EpDispatchCombineHandle {
   index_t GetCurRankNumToken() const { return curRankNumToken; }
 
  private:
-  void IntializeShmemBuf();
+  void InitializeShmemBuf();
   void FinalizeShmemBuf();
 
   void IntializeTokenNumSignalBuf();
@@ -103,8 +140,9 @@ class EpDispatchCombineHandle {
   index_t* tokenIndices{nullptr};
 
   // Kernel input/output buffer
-  T* inpTokenBuf{nullptr};
-  T* outTokenBuf{nullptr};
+  void* inpTokenBuf{nullptr};
+  void* outTokenBuf{nullptr};
+  hipDataType inputType;
   float* weightsBuf{nullptr};
   uint8_t* scalesBuf{nullptr};
 
@@ -152,6 +190,7 @@ class EpDispatchCombineHandle {
 
 template <typename T>
 struct EpDispatchCombineArgs {
+  using data_type = T;
   EpDispatchCombineConfig config;
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
@@ -184,14 +223,18 @@ struct EpDispatchCombineArgs {
   uint32_t crossDeviceBarrierFlag{1};
 };
 
+using EpDispatchCombineArgsVariant =
+    std::variant<EpDispatchCombineArgs<float>, EpDispatchCombineArgs<__hip_bfloat16>,
+                 EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> >;
+
 template <typename T>
-EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<T>& handle) {
+EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle& handle) {
   EpDispatchCombineArgs<T> args;
   args.config = handle.config;
   args.curRankNumToken = handle.curRankNumToken;
   args.tokenIndices = handle.tokenIndices;
-  args.inpTokenBuf = handle.inpTokenBuf;
-  args.outTokenBuf = handle.outTokenBuf;
+  args.inpTokenBuf = reinterpret_cast<T*>(handle.inpTokenBuf);
+  args.outTokenBuf = reinterpret_cast<T*>(handle.outTokenBuf);
   args.weightsBuf = handle.weightsBuf;
   args.scalesBuf = handle.scalesBuf;
   args.destPeTokenCounter = handle.destPeTokenCounter;
@@ -220,6 +263,23 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle<
   return args;
 }
 
+inline EpDispatchCombineArgsVariant GetEpDispatchCombineArgsByInputType(
+    const EpDispatchCombineHandle& handle) {
+  switch (handle.inputType) {
+    case HIP_R_32F:
+      return GetEpDispatchCombineArgs<float>(handle);
+    case HIP_R_16BF:
+      return GetEpDispatchCombineArgs<__hip_bfloat16>(handle);
+    case HIP_R_8F_E4M3_FNUZ:
+      return GetEpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>(handle);
+    default:
+      std::ostringstream oss;
+      oss << "Unsupported inputType " << HipDataTypeToString(handle.inputType)
+          << " in GetEpDispatchCombineArgsByInputType";
+      throw std::runtime_error(oss.str());
+  }
+}
+
 }  // namespace moe
 }  // namespace mori
 
@@ -232,6 +292,7 @@ static std::ostream& operator<<(std::ostream& s, mori::moe::EpDispatchCombineCon
      << "  hiddenDim: " << config.hiddenDim << std::endl
      << "  scaleDim: " << config.scaleDim << std::endl
      << "  scaleTypeSize: " << config.scaleTypeSize << std::endl
+     << "  maxTokenTypeSize: " << config.maxTokenTypeSize << std::endl
      << "  maxNumInpTokenPerRank: " << config.maxNumInpTokenPerRank << std::endl
      << "  numExpertPerRank: " << config.numExpertPerRank << std::endl
      << "  numExpertPerToken: " << config.numExpertPerToken << std::endl

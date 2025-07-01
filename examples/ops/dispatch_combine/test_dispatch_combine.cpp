@@ -73,9 +73,27 @@ struct EpDispatchCombineTestConfig {
 };
 
 template <typename T>
+hipDataType GetHipDataType();
+
+template <>
+hipDataType GetHipDataType<float>() {
+  return HIP_R_32F;
+}
+
+template <>
+hipDataType GetHipDataType<hip_bfloat16>() {
+  return HIP_R_16BF;
+}
+
+template <>
+hipDataType GetHipDataType<__hip_fp8_e4m3_fnuz>() {
+  return HIP_R_8F_E4M3_FNUZ;
+}
+
+template <typename T>
 class EpDispatchCombineTestCase {
  public:
-  EpDispatchCombineTestCase(EpDispatchCombineHandle<T>& handle, RunConfig runConfig)
+  EpDispatchCombineTestCase(EpDispatchCombineHandle& handle, RunConfig runConfig)
       : handle(handle), runConfig(runConfig) {
     const auto timestamp = std::chrono::system_clock::now();
     gen = mt19937(
@@ -135,7 +153,8 @@ class EpDispatchCombineTestCase {
     RandomInitializeWeights();
     RandomInitializeScales();
     RandomInitializeToken();
-    handle.PrepareInference(inpTokBuf, outTokBuf, weightsBuf, scalesBuf, tokenIndices, numToken);
+    handle.PrepareInference(GetHipDataType<T>(), inpTokBuf, outTokBuf, weightsBuf, scalesBuf,
+                            tokenIndices, numToken);
     // PrintDispatch();
     // PrintDispatchStats();
   }
@@ -317,8 +336,8 @@ class EpDispatchCombineTestCase {
 
   void RunAccuracyTest() {
     for (int i = 0; i < runConfig.repeat; i++) {
-      handle.LaunchReset();
       InitializeHandle();
+      handle.LaunchReset();
       SystemBarrier();
 
       handle.LaunchDispatch(runConfig.kernelType);
@@ -345,8 +364,8 @@ class EpDispatchCombineTestCase {
     HIP_RUNTIME_CHECK(hipStreamCreate(&stream));
 
     for (int i = 0; i < runConfig.warmup; i++) {
-      handle.LaunchReset(stream);
       InitializeHandle();
+      handle.LaunchReset(stream);
       SystemBarrier();
 
       handle.LaunchDispatch(runConfig.kernelType, stream);
@@ -361,8 +380,8 @@ class EpDispatchCombineTestCase {
 
     float dispatchTotal = 0, combineTotal = 0;
     for (int i = 0; i < runConfig.repeat; i++) {
-      handle.LaunchReset(stream);
       InitializeHandle();
+      handle.LaunchReset(stream);
       SystemBarrier();
 
       HIP_RUNTIME_CHECK(hipEventRecord(events[0]));
@@ -543,13 +562,13 @@ class EpDispatchCombineTestCase {
   uint8_t* scalesBuf{nullptr};
   index_t* tokenIndices{nullptr};
   int numToken{-1};
-  EpDispatchCombineHandle<T>& handle;
+  EpDispatchCombineHandle& handle;
   RunConfig runConfig;
 };
 
 template <typename T>
 void RunDispatchCombineTest(EpDispatchCombineTestConfig testConfig) {
-  EpDispatchCombineHandle<T> handle(testConfig.config);
+  EpDispatchCombineHandle handle(testConfig.config);
   EpDispatchCombineTestCase<T> testCase(handle, testConfig.runConfig);
   testCase.Run();
 }
@@ -611,6 +630,7 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
                                          {"scale_dim", optional_argument, NULL, 's'},
                                          {"scale_type", optional_argument, NULL, 0},
                                          {"max_tokens", optional_argument, NULL, 'm'},
+                                         {"max_token_type_size", optional_argument, NULL, 0},
                                          {"expert_per_rank", optional_argument, NULL, 'r'},
                                          {"expert_per_token", optional_argument, NULL, 't'},
                                          {"warp_per_blk", optional_argument, NULL, 'w'},
@@ -655,6 +675,8 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
             printf("Unknown scale type: %s, must be 'fp8' or 'fp32'\n", optarg);
             assert(false);
           }
+        } else if (strcmp(long_options[option_index].name, "max_token_type_size") == 0) {
+          testConfig.config.maxTokenTypeSize = std::stoi(optarg);
         }
         break;
       case 'd':
@@ -694,6 +716,9 @@ EpDispatchCombineTestConfig ParseArguments(int argc, char* argv[]) {
       case 'h':
         printf("This is help message\n");
         break;
+      case '?':
+        fprintf(stderr, "Unknown option or missing argument\n");
+        return {};
       default:
         fprintf(stderr, "Unknown error in getopt_long\n");
         return {};

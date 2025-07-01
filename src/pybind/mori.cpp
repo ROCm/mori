@@ -19,9 +19,8 @@
 /* ---------------------------------------------------------------------------------------------- */
 namespace {
 
-template <typename T>
 std::tuple<torch::Tensor, torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor>
-LaunchDispatch(mori::moe::EpDispatchCombineHandle<T>& handle, int kernelType,
+LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
                const torch::Tensor& input, const torch::Tensor& weights,
                const std::optional<torch::Tensor>& scales, const torch::Tensor& topkIds) {
   assert(input.is_contiguous() && weights.is_contiguous() && topkIds.is_contiguous());
@@ -31,15 +30,15 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle<T>& handle, int kernelType,
     scalePtr = reinterpret_cast<uint8_t*>(scales->data_ptr());
   }
 
-  handle.PrepareInference(reinterpret_cast<T*>(input.data_ptr()), nullptr,
-                          weights.data_ptr<float>(), scalePtr,
+  handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
+                          nullptr, weights.data_ptr<float>(), scalePtr,
                           topkIds.data_ptr<mori::moe::index_t>(), input.size(0));
   handle.LaunchDispatch((mori::moe::KernelType)kernelType, at::cuda::getCurrentHIPStream());
 
-  torch::Tensor out = torch::from_blob(
-      handle.shmemOutTokMemObj->Get(),
-      {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
-      torch::TensorOptions().dtype(mori::GetTorchDataType<T>()).device(torch::kCUDA));
+  torch::Tensor out =
+      torch::from_blob(handle.shmemOutTokMemObj->Get(),
+                       {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
+                       torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA));
 
   torch::Tensor outWeights = torch::from_blob(
       handle.shmemOutWeightsMemObj->Get(),
@@ -70,30 +69,28 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle<T>& handle, int kernelType,
 }
 
 // TODO: translate data type
-template <typename T>
-torch::Tensor LaunchCombine(mori::moe::EpDispatchCombineHandle<T>& handle, int kernelType,
+// template <typename T>
+torch::Tensor LaunchCombine(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
                             const torch::Tensor& input, const torch::Tensor& weights,
                             const torch::Tensor& topkIds) {
   assert(input.is_contiguous() && weights.is_contiguous() && topkIds.is_contiguous());
-  handle.PrepareInference(reinterpret_cast<T*>(input.data_ptr()), nullptr,
-                          weights.data_ptr<float>(), topkIds.data_ptr<mori::moe::index_t>(),
-                          handle.curRankNumToken);
+  handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
+                          nullptr, weights.data_ptr<float>(),
+                          topkIds.data_ptr<mori::moe::index_t>(), handle.curRankNumToken);
   handle.LaunchCombine((mori::moe::KernelType)kernelType, at::cuda::getCurrentHIPStream());
 
-  auto options = torch::TensorOptions().dtype(mori::GetTorchDataType<T>()).device(torch::kCUDA);
+  auto options = torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA);
   torch::Tensor out =
       torch::from_blob(handle.shmemOutTokMemObj->Get(),
                        {handle.config.maxNumInpTokenPerRank, handle.config.hiddenDim}, options);
   return out;
 }
 
-template <typename T>
-void LaunchReset(mori::moe::EpDispatchCombineHandle<T>& handle) {
+void LaunchReset(mori::moe::EpDispatchCombineHandle& handle) {
   handle.LaunchReset(at::cuda::getCurrentHIPStream());
 }
 
-template <typename T>
-torch::Tensor GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle<T>& handle) {
+torch::Tensor GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle& handle) {
   auto options = torch::TensorOptions()
                      .dtype(mori::GetTorchDataType<mori::moe::index_t>())
                      .device(torch::kCUDA);
@@ -103,8 +100,7 @@ torch::Tensor GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle<T>& handl
   return tensor;
 }
 
-template <typename T>
-torch::Tensor GetDispatchSenderTokenIdxMap(mori::moe::EpDispatchCombineHandle<T>& handle) {
+torch::Tensor GetDispatchSenderTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
   auto options = torch::TensorOptions()
                      .dtype(mori::GetTorchDataType<mori::moe::index_t>())
                      .device(torch::kCUDA);
@@ -113,8 +109,7 @@ torch::Tensor GetDispatchSenderTokenIdxMap(mori::moe::EpDispatchCombineHandle<T>
   return tensor;
 }
 
-template <typename T>
-torch::Tensor GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle<T>& handle) {
+torch::Tensor GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
   auto options = torch::TensorOptions()
                      .dtype(mori::GetTorchDataType<mori::moe::index_t>())
                      .device(torch::kCUDA);
@@ -123,34 +118,32 @@ torch::Tensor GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle<
   return tensor;
 }
 
-// Defines handle for different template arguments, we use typeStr to avoid function name shadow
-template <typename T>
-void DeclareEpDispatchCombineHandle(pybind11::module& m, const std::string& typeStr) {
-  std::string className = std::string("EpDispatchCombineHandle") + typeStr;
-  pybind11::class_<mori::moe::EpDispatchCombineHandle<T>>(m, className.c_str())
+void DeclareEpDispatchCombineHandle(pybind11::module& m) {
+  std::string className = std::string("EpDispatchCombineHandle");
+  pybind11::class_<mori::moe::EpDispatchCombineHandle>(m, className.c_str())
       .def(pybind11::init<mori::moe::EpDispatchCombineConfig>(),
            py::arg("config") = mori::moe::EpDispatchCombineConfig{});
 
-  std::string funcName = std::string("launch_dispatch_") + typeStr;
-  m.def(funcName.c_str(), &LaunchDispatch<T>);
+  std::string funcName = std::string("launch_dispatch");
+  m.def(funcName.c_str(), &LaunchDispatch);
 
-  funcName = std::string("launch_combine_") + typeStr;
-  m.def(funcName.c_str(), &LaunchCombine<T>);
+  funcName = std::string("launch_combine");
+  m.def(funcName.c_str(), &LaunchCombine);
 
-  funcName = std::string("launch_reset_") + typeStr;
-  m.def(funcName.c_str(), &LaunchReset<T>);
+  funcName = std::string("launch_reset");
+  m.def(funcName.c_str(), &LaunchReset);
 
-  funcName = std::string("get_cur_rank_num_token_") + typeStr;
-  m.def(funcName.c_str(), &mori::moe::EpDispatchCombineHandle<T>::GetCurRankNumToken);
+  funcName = std::string("get_cur_rank_num_token");
+  m.def(funcName.c_str(), &mori::moe::EpDispatchCombineHandle::GetCurRankNumToken);
 
-  funcName = std::string("get_dispatch_src_token_pos_") + typeStr;
-  m.def(funcName.c_str(), &GetDispatchSrcTokenId<T>);
+  funcName = std::string("get_dispatch_src_token_pos");
+  m.def(funcName.c_str(), &GetDispatchSrcTokenId);
 
-  funcName = std::string("get_dispatch_sender_token_idx_map_") + typeStr;
-  m.def(funcName.c_str(), &GetDispatchSenderTokenIdxMap<T>);
+  funcName = std::string("get_dispatch_sender_token_idx_map");
+  m.def(funcName.c_str(), &GetDispatchSenderTokenIdxMap);
 
-  funcName = std::string("get_dispatch_receiver_token_idx_map_") + typeStr;
-  m.def(funcName.c_str(), &GetDispatchReceiverTokenIdxMap<T>);
+  funcName = std::string("get_dispatch_receiver_token_idx_map");
+  m.def(funcName.c_str(), &GetDispatchReceiverTokenIdxMap);
 }
 
 }  // namespace
@@ -180,9 +173,10 @@ void RegisterMoriOps(py::module_& m) {
       .export_values();
 
   pybind11::class_<mori::moe::EpDispatchCombineConfig>(m, "EpDispatchCombineConfig")
-      .def(pybind11::init<int, int, int, int, int, int, int, int, int, int>(), py::arg("rank") = 0,
-           py::arg("world_size") = 0, py::arg("hidden_dim") = 0, py::arg("scale_dim") = 0,
-           py::arg("scale_type_size") = 0, py::arg("max_num_inp_token_per_rank") = 0,
+      .def(pybind11::init<int, int, int, int, int, int, int, int, int, int, int>(),
+           py::arg("rank") = 0, py::arg("world_size") = 0, py::arg("hidden_dim") = 0,
+           py::arg("scale_dim") = 0, py::arg("scale_type_size") = 0,
+           py::arg("max_token_type_size") = 0, py::arg("max_num_inp_token_per_rank") = 0,
            py::arg("num_experts_per_rank") = 0, py::arg("num_experts_per_token") = 0,
            py::arg("warp_num_per_block") = 0, py::arg("block_num") = 0)
       .def_readonly("rank", &mori::moe::EpDispatchCombineConfig::rank)
@@ -190,6 +184,7 @@ void RegisterMoriOps(py::module_& m) {
       .def_readonly("hidden_dim", &mori::moe::EpDispatchCombineConfig::hiddenDim)
       .def_readonly("scale_dim", &mori::moe::EpDispatchCombineConfig::scaleDim)
       .def_readonly("scale_type_size", &mori::moe::EpDispatchCombineConfig::scaleTypeSize)
+      .def_readonly("max_token_type_size", &mori::moe::EpDispatchCombineConfig::maxTokenTypeSize)
       .def_readonly("max_num_inp_token_per_rank",
                     &mori::moe::EpDispatchCombineConfig::maxNumInpTokenPerRank)
       .def_readonly("num_experts_per_rank", &mori::moe::EpDispatchCombineConfig::numExpertPerRank)
@@ -197,9 +192,7 @@ void RegisterMoriOps(py::module_& m) {
       .def_readonly("warp_num_per_block", &mori::moe::EpDispatchCombineConfig::warpNumPerBlock)
       .def_readonly("block_num", &mori::moe::EpDispatchCombineConfig::blockNum);
 
-  DeclareEpDispatchCombineHandle<float>(m, "Fp32");
-  DeclareEpDispatchCombineHandle<hip_bfloat16>(m, "Bf16");
-  DeclareEpDispatchCombineHandle<__hip_fp8_e4m3_fnuz>(m, "Fp8E4m3Fnuz");
+  DeclareEpDispatchCombineHandle(m);
 }
 
 void RegisterMoriShmem(py::module_& m) {

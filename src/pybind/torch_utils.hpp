@@ -2,6 +2,7 @@
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
+#include <hip/library_types.h>
 #include <torch/torch.h>
 
 namespace mori {
@@ -24,6 +25,19 @@ inline torch::Dtype GetTorchDataType() {
     return torch::kFloat8_e4m3fnuz;
   } else {
     static_assert(false, "Unsupported data type");
+  }
+}
+
+inline hipDataType ScalarTypeToHipDataType(at::ScalarType scalarType) {
+  switch (scalarType) {
+    case at::kFloat:
+      return HIP_R_32F;
+    case at::kBFloat16:
+      return HIP_R_16BF;
+    case at::kFloat8_e4m3fnuz:
+      return HIP_R_8F_E4M3_FNUZ;
+    default:
+      throw std::runtime_error("Unsupported scalar type");
   }
 }
 

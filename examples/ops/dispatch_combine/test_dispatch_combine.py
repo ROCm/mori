@@ -18,6 +18,7 @@ class EpDispatchCombineTestCase:
             scale_dim=32,
             # scale_dim=0,
             scale_type_size=1,
+            max_token_type_size=4,
             max_num_inp_token_per_rank=512,
             num_experts_per_rank=32,
             num_experts_per_token=8,
@@ -207,7 +208,9 @@ class EpDispatchCombineTestCase:
         if self.config.rank == 0:
             print("Dispatch Pass")
 
-        combine_output = op.combine(dispatch_output, weights, indices)
+        # combine_output = op.combine(dispatch_output, weights, indices)
+        combine_output = op.combine(dispatch_output.to(
+            torch.bfloat16), weights, indices)
         torch.cuda.synchronize()
 
         for i in range(num_tokens):
@@ -217,9 +220,11 @@ class EpDispatchCombineTestCase:
             ]
             unique_pes = len(set(pes))
 
-            got, expected = combine_output[i], (
-                input[i].to(torch.float32) * unique_pes
-            ).to(self.config.data_type)
+            # got, expected = combine_output[i], (
+            #     input[i].to(torch.float32) * unique_pes
+            # ).to(self.config.data_type)
+            got, expected = combine_output[i], input[i].to(
+                torch.bfloat16) * unique_pes
 
             assert torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
 

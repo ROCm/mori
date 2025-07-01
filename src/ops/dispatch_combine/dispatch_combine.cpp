@@ -48,17 +48,15 @@ __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                     EpDispatchCombineHandle                                    */
 /* ---------------------------------------------------------------------------------------------- */
-template <typename T>
-EpDispatchCombineHandle<T>::EpDispatchCombineHandle(EpDispatchCombineConfig config)
+EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config)
     : config(config) {
-  IntializeShmemBuf();
+  InitializeShmemBuf();
   IntializeTokenNumSignalBuf();
   IntializeOrderMapBuf();
   IntializeBarrier();
 }
 
-template <typename T>
-EpDispatchCombineHandle<T>::~EpDispatchCombineHandle() {
+EpDispatchCombineHandle::~EpDispatchCombineHandle() {
   FinalizeShmemBuf();
   FinalizeTokenNumSignalBuf();
   FinalizeOrderMapBuf();
@@ -73,9 +71,8 @@ mori::application::SymmMemObjPtr ShmemMallocAndReturnMemObjPtr(size_t size, unsi
   return obj;
 }
 
-template <typename T>
-void EpDispatchCombineHandle<T>::IntializeShmemBuf() {
-  size_t maxTokenSize = config.MaxNumTokensToRecv() * config.hiddenDim * sizeof(T);
+void EpDispatchCombineHandle::InitializeShmemBuf() {
+  size_t maxTokenSize = config.MaxNumTokensToRecv() * config.hiddenDim * config.maxTokenTypeSize;
   shmemInpTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
   shmemOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
   shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
@@ -95,8 +92,7 @@ void EpDispatchCombineHandle<T>::IntializeShmemBuf() {
   shmemOutIndicesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndicesSize, hipDeviceMallocUncached);
 }
 
-template <typename T>
-void EpDispatchCombineHandle<T>::FinalizeShmemBuf() {
+void EpDispatchCombineHandle::FinalizeShmemBuf() {
   ShmemFree(shmemInpTokMemObj->localPtr);
   ShmemFree(shmemOutTokMemObj->localPtr);
   ShmemFree(shmemStagingTokMemObj->localPtr);
@@ -108,8 +104,7 @@ void EpDispatchCombineHandle<T>::FinalizeShmemBuf() {
   ShmemFree(shmemOutIndicesMemObj->localPtr);
 }
 
-template <typename T>
-void EpDispatchCombineHandle<T>::IntializeTokenNumSignalBuf() {
+void EpDispatchCombineHandle::IntializeTokenNumSignalBuf() {
   size_t tokenNumSignalSize = config.worldSize * sizeof(index_t);
   recvTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
   sendTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
@@ -118,15 +113,13 @@ void EpDispatchCombineHandle<T>::IntializeTokenNumSignalBuf() {
   HIP_RUNTIME_CHECK(hipMemset(totalRecvTokenNum, 0, sizeof(index_t)));
 }
 
-template <typename T>
-void EpDispatchCombineHandle<T>::FinalizeTokenNumSignalBuf() {
+void EpDispatchCombineHandle::FinalizeTokenNumSignalBuf() {
   ShmemFree(recvTokenNumMemObj->localPtr);
   ShmemFree(sendTokenNumMemObj->localPtr);
   HIP_RUNTIME_CHECK(hipFree(totalRecvTokenNum));
 }
 
-template <typename T>
-void EpDispatchCombineHandle<T>::IntializeOrderMapBuf() {
+void EpDispatchCombineHandle::IntializeOrderMapBuf() {
   size_t maxNumOutToken = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerRank;
   HIP_RUNTIME_CHECK(hipMalloc(&dispReceiverIdxMap, maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispReceiverIdxMap, 0, maxNumOutToken * sizeof(index_t)));
@@ -148,8 +141,7 @@ void EpDispatchCombineHandle<T>::IntializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipMemset(dispDestTokIdMap, 0, maxNumOutToken * sizeof(index_t)));
 }
 
-template <typename T>
-void EpDispatchCombineHandle<T>::FinalizeOrderMapBuf() {
+void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipFree(dispReceiverIdxMap));
   HIP_RUNTIME_CHECK(hipFree(dispSenderIdxMap));
   HIP_RUNTIME_CHECK(hipFree(destPeTokenCounter));
@@ -159,8 +151,7 @@ void EpDispatchCombineHandle<T>::FinalizeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipFree(dispDestTokIdMap));
 }
 
-template <typename T>
-void EpDispatchCombineHandle<T>::IntializeBarrier() {
+void EpDispatchCombineHandle::IntializeBarrier() {
   size_t barrierSize = config.worldSize * sizeof(uint32_t);
   HIP_RUNTIME_CHECK(hipMalloc(&dispatchGridBarrier, barrierSize));
   HIP_RUNTIME_CHECK(hipMemset(dispatchGridBarrier, 0, barrierSize));
@@ -169,78 +160,85 @@ void EpDispatchCombineHandle<T>::IntializeBarrier() {
   crossDeviceBarrierMemObj = ShmemMallocAndReturnMemObjPtr(barrierSize, hipDeviceMallocUncached);
 }
 
-template <typename T>
-void EpDispatchCombineHandle<T>::FinalizeBarrier() {
+void EpDispatchCombineHandle::FinalizeBarrier() {
   HIP_RUNTIME_CHECK(hipFree(dispatchGridBarrier));
   HIP_RUNTIME_CHECK(hipFree(combineGridBarrier));
   ShmemFree(crossDeviceBarrierMemObj->localPtr);
 }
 
-template <typename T>
-void EpDispatchCombineHandle<T>::LaunchIntraNodeDispatch(hipStream_t stream) {
+void EpDispatchCombineHandle::LaunchIntraNodeDispatch(hipStream_t stream) {
   LaunchDispatch(KernelType::IntraNode, stream);
 }
 
-template <typename T>
-void EpDispatchCombineHandle<T>::LaunchInterNodeDispatch(hipStream_t stream) {
+void EpDispatchCombineHandle::LaunchInterNodeDispatch(hipStream_t stream) {
   LaunchDispatch(KernelType::InterNode, stream);
 }
 
-template <typename T>
-void EpDispatchCombineHandle<T>::LaunchIntraNodeCombine(hipStream_t stream) {
+void EpDispatchCombineHandle::LaunchIntraNodeCombine(hipStream_t stream) {
   LaunchCombine(KernelType::IntraNode, stream);
 }
 
-template <typename T>
-void EpDispatchCombineHandle<T>::LaunchInterNodeCombine(hipStream_t stream) {
+void EpDispatchCombineHandle::LaunchInterNodeCombine(hipStream_t stream) {
   LaunchCombine(KernelType::InterNode, stream);
 }
 
-template <typename T>
-void EpDispatchCombineHandle<T>::LaunchDispatch(KernelType kernelType, hipStream_t stream) {
+void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, hipStream_t stream) {
   dim3 grid(config.blockNum);
   dim3 block(warpSize * config.warpNumPerBlock);
   size_t sharedMemSize =
       (config.worldSize * config.warpNumPerBlock +
        config.numExpertPerRank * config.warpNumPerBlock + config.numExpertPerRank) *
       sizeof(index_t);
-  if (kernelType == KernelType::InterNode)
-    EpDispatchInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(
-        GetEpDispatchCombineArgs(*this));
-  else if (kernelType == KernelType::IntraNode) {
-    EpDispatchIntraNodeKernel<T>
-        <<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
-  } else
-    assert(false);
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
+  std::visit(
+      [&](auto&& args) {
+        using ArgsT = std::decay_t<decltype(args)>;
+        using DataT = typename ArgsT::data_type;
+
+        if (kernelType == KernelType::InterNode) {
+          EpDispatchInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
+        } else if (kernelType == KernelType::IntraNode) {
+          EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
+        } else {
+          assert(false);
+        }
+      },
+      argsVariant);
 }
 
-template <typename T>
-void EpDispatchCombineHandle<T>::LaunchCombine(KernelType kernelType, hipStream_t stream) {
+void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, hipStream_t stream) {
   dim3 grid(config.blockNum);
   dim3 block(warpSize * config.warpNumPerBlock);
-  size_t sharedMemSize = config.warpNumPerBlock * config.numExpertPerToken * sizeof(T**);
 
-  if (kernelType == KernelType::InterNode)
-    EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(
-        GetEpDispatchCombineArgs(*this));
-  else if (kernelType == KernelType::IntraNode) {
-    EpCombineIntraNodeKernel<T>
-        <<<grid, block, sharedMemSize, stream>>>(GetEpDispatchCombineArgs(*this));
-  } else
-    assert(false);
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
+  std::visit(
+      [&](auto&& args) {
+        using ArgsT = std::decay_t<decltype(args)>;
+        using DataT = typename ArgsT::data_type;
+
+        size_t sharedMemSize = config.warpNumPerBlock * config.numExpertPerToken * sizeof(DataT**);
+        if (kernelType == KernelType::InterNode) {
+          EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
+        } else if (kernelType == KernelType::IntraNode) {
+          EpCombineIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
+        } else {
+          assert(false);
+        }
+      },
+      argsVariant);
 }
 
-template <typename T>
-void EpDispatchCombineHandle<T>::LaunchReset(hipStream_t stream) {
+void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) {
   dim3 block(std::max(config.numExpertPerRank, config.worldSize));
-  EpDispatchCombineResetKernel<<<1, config.numExpertPerRank, 0, stream>>>(
-      GetEpDispatchCombineArgs(*this));
+
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
+  std::visit(
+      [&](auto&& args) {
+        EpDispatchCombineResetKernel<<<1, config.numExpertPerRank, 0, stream>>>(args);
+      },
+      argsVariant);
   crossDeviceBarrierFlag++;
 }
-
-template class EpDispatchCombineHandle<float>;
-template class EpDispatchCombineHandle<hip_bfloat16>;
-template class EpDispatchCombineHandle<__hip_fp8_e4m3_fnuz>;
 
 }  // namespace moe
 }  // namespace mori
