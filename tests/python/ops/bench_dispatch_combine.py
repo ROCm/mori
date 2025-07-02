@@ -107,13 +107,17 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         comb_duration_us_list = []
         comb_bandwidth_GB_list = []
 
-        for _ in range(iters):
-            # gen test data at each round to eliminate the effect of caching
-            if always_new_data:
-                test_data = self.gen_test_data()
+        # gen test data at each round to eliminate the effect of caching
+        if always_new_data:
+            test_data_list = [self.gen_test_data() for i in range(iters)]
+            print("Is new data !!!!")
+        else:
+            test_data_list = [test_data for i in range(iters)]
+
+        for i in range(iters):
             self.sync()
             disp_dur, comb_dur, disp_bw, comb_bw, total_bytes = self.run_once(
-                op, test_data
+                op, test_data_list[i]
             )
 
             disp_dur_list = [torch.zeros(1) for _ in range(self.config.world_size)]
@@ -180,7 +184,7 @@ def _bench_dispatch_combine(
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port) as ctx:
         mori.shmem.shmem_torch_process_group_init("default")
         op = mori.ops.EpDispatchCombineOp(config)
-        benchmark.run(op, always_new_data=False)
+        benchmark.run(op, always_new_data=True)
         # benchmark.output()
         # mori.shmem.shmem_finalize()
 
