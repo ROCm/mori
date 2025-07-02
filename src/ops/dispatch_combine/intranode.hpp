@@ -170,9 +170,6 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   size_t maxNumOutTokenPerRank = config.MaxNumTokensToSend();
   // Copy input to shmem registered buffer so that other GPUs can access directly
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
-  // TODO: this copy can be eliminated if the input buffer can be registered in advance, we should
-  // support this option, under DeepSeek config with 4096 tokens, bandwidth can be uplifted from
-  // 160GB/s to 190GB/s
   if (args.config.useExternalInpBuffer) {
     for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
       core::WarpCopy(args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,

@@ -43,6 +43,7 @@ __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
   if (globalThdId == 0) {
     shmem::ShmemQuietThread();
   }
+  __threadfence_system();
 }
 
 /* ---------------------------------------------------------------------------------------------- */
