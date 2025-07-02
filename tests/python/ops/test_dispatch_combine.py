@@ -13,14 +13,22 @@ class EpDispatchCombineTestCase:
         self.rng = torch.Generator(device=self.device)
         self.rng.manual_seed(123)
 
-    def gen_test_data(self):
-        num_token = torch.randint(
-            1,
-            self.config.max_num_inp_token_per_rank + 1,
-            [self.config.world_size],
-            generator=self.rng,
-            device=self.device,
-        )
+    def gen_test_data(self, use_max_token_num=False):
+        if use_max_token_num:
+            num_token = torch.tensor(
+                [
+                    self.config.max_num_inp_token_per_rank
+                    for i in range(self.config.world_size)
+                ]
+            ).to(self.device)
+        else:
+            num_token = torch.randint(
+                1,
+                self.config.max_num_inp_token_per_rank + 1,
+                [self.config.world_size],
+                generator=self.rng,
+                device=self.device,
+            )
 
         # gen indicies
         all_rank_indicies = []
@@ -117,7 +125,10 @@ class EpDispatchCombineTestCase:
             src_id = int(pos) % self.config.max_num_inp_token_per_rank
             assert torch.equal(all_rank_input[src_rank][src_id], dispatch_output[i])
             assert torch.equal(all_rank_weights[src_rank][src_id], dispatch_weights[i])
-            assert torch.equal(all_rank_scales[src_rank][src_id], dispatch_scales[i])
+            if dispatch_scales is not None:
+                assert torch.equal(
+                    all_rank_scales[src_rank][src_id], dispatch_scales[i]
+                )
             assert torch.equal(
                 all_rank_indicies[src_rank][src_id], dispatch_indicies[i]
             )
@@ -125,7 +136,7 @@ class EpDispatchCombineTestCase:
         assert len(src_token_pos) == dispatch_recv_num_token[0]
 
         combine_output = op.combine(
-            dispatch_output, dispatch_weights, dispatch_indicies
+            dispatch_output, dispatch_weights, dispatch_indicies, call_reset=False
         )
         torch.cuda.synchronize()
 
@@ -172,6 +183,9 @@ def _test_dispatch_combine(
         max_num_inp_token_per_rank=max_num_inp_token_per_rank,
         num_experts_per_rank=num_experts_per_rank,
         num_experts_per_token=num_experts_per_token,
+        max_token_type_size=4,
+        block_num=40,
+        warp_num_per_block=8,
     )
     op = mori.ops.EpDispatchCombineOp(config)
     test_case = EpDispatchCombineTestCase(config)
@@ -181,13 +195,13 @@ def _test_dispatch_combine(
 
 # TODO: create a sub process group so that we can test worlds size < 8
 @pytest.mark.parametrize("world_size", (8,))
-@pytest.mark.parametrize("data_type", (torch.bfloat16, torch.float8_e4m3fnuz))
-@pytest.mark.parametrize("hidden_dim", (4096, 7168))
-@pytest.mark.parametrize("scale_dim", (32,))
+@pytest.mark.parametrize("data_type", (torch.float8_e4m3fnuz, torch.bfloat16))
+@pytest.mark.parametrize("hidden_dim", (7168, 4096))
+@pytest.mark.parametrize("scale_dim", (0, 32))
 @pytest.mark.parametrize("scale_type_size", (1, 4))
 @pytest.mark.parametrize("max_num_inp_token_per_rank", (1, 128))
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
-@pytest.mark.parametrize("num_experts_per_token", (4,))
+@pytest.mark.parametrize("num_experts_per_token", (8,))
 def test_dispatch_combine(
     torch_dist_process_manager,
     world_size,

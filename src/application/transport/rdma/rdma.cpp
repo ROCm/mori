@@ -130,7 +130,7 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
       return new Mlx5Device(inDevice);
       break;
     default:
-      assert(false);
+      return nullptr;
   }
 
   ibv_close_device(context);
@@ -139,7 +139,9 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
 void RdmaContext::Intialize() {
   rdmaDeviceList.clear();
   for (int i = 0; deviceList[i] != nullptr; i++) {
-    rdmaDeviceList.push_back(RdmaDeviceFactory(deviceList[i]));
+    RdmaDevice* device = RdmaDeviceFactory(deviceList[i]);
+    if (device == nullptr) continue;
+    rdmaDeviceList.push_back(device);
   }
 }
 

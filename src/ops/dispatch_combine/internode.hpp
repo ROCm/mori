@@ -108,6 +108,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
     shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, peSortedOffset,
                                   args.shmemStagingTokMemObj, tokenOffset, config.hiddenDim,
                                   destPe);
+
 #endif
   }
   if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
@@ -298,7 +299,7 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
         srcPtrs[j] = nullptr;
       }
     }
-    core::WarpAccum(
+    core::WarpAccum<T, 8>(
         args.shmemOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim + hiddenDimOffset,
         srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
   }

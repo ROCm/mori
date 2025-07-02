@@ -21,7 +21,7 @@ if (USE_ROCM)
         mori
         LANGUAGES HIP CXX C
     )
-    # set(CMAKE_CXX_COMPILER /opt/rocm/bin/hipcc)
+    set(CMAKE_CXX_COMPILER /opt/rocm/bin/hipcc)
     find_package(hip REQUIRED)
 else()
     set(CUDA_HOME /usr/local/cuda)

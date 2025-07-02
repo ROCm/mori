@@ -67,3 +67,9 @@ add_executable(
 )
 target_include_directories(atomic_perf PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
 target_link_libraries(atomic_perf mori_application hip::host hip::device)
+
+add_executable(
+    accum_perf
+    benchmarks/accum_perf.cpp
+)
+target_link_libraries(accum_perf mori_application mori_shmem hip::host hip::device)

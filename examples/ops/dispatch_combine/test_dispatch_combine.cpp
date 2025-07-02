@@ -368,10 +368,10 @@ class EpDispatchCombineTestCase {
       handle.LaunchReset(stream);
       SystemBarrier();
 
-      handle.LaunchDispatch(runConfig.kernelType, stream);
+      handle.LaunchDispatch(runConfig.kernelType, -1, -1, stream);
       CopyDispatchOutAsCombineInp();
       SystemBarrier();
-      handle.LaunchCombine(runConfig.kernelType, stream);
+      handle.LaunchCombine(runConfig.kernelType, -1, -1, stream);
       if (handle.config.rank == 0) std::cout << "Warmup Done" << std::endl;
     }
 
@@ -385,14 +385,14 @@ class EpDispatchCombineTestCase {
       SystemBarrier();
 
       HIP_RUNTIME_CHECK(hipEventRecord(events[0]));
-      handle.LaunchDispatch(runConfig.kernelType, stream);
+      handle.LaunchDispatch(runConfig.kernelType, -1, -1, stream);
       HIP_RUNTIME_CHECK(hipEventRecord(events[1]));
 
       CopyDispatchOutAsCombineInp();
       SystemBarrier();
 
       HIP_RUNTIME_CHECK(hipEventRecord(events[2]));
-      handle.LaunchCombine(runConfig.kernelType, stream);
+      handle.LaunchCombine(runConfig.kernelType, -1, -1, stream);
       HIP_RUNTIME_CHECK(hipEventRecord(events[3]));
 
       float dispatch, combine;

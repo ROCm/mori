@@ -166,25 +166,31 @@ void EpDispatchCombineHandle::FinalizeBarrier() {
   ShmemFree(crossDeviceBarrierMemObj->localPtr);
 }
 
-void EpDispatchCombineHandle::LaunchIntraNodeDispatch(hipStream_t stream) {
-  LaunchDispatch(KernelType::IntraNode, stream);
+void EpDispatchCombineHandle::LaunchIntraNodeDispatch(int blockNum, int warpPerBlock,
+                                                      hipStream_t stream) {
+  LaunchDispatch(KernelType::IntraNode, blockNum, warpPerBlock, stream);
 }
 
-void EpDispatchCombineHandle::LaunchInterNodeDispatch(hipStream_t stream) {
-  LaunchDispatch(KernelType::InterNode, stream);
+void EpDispatchCombineHandle::LaunchInterNodeDispatch(int blockNum, int warpPerBlock,
+                                                      hipStream_t stream) {
+  LaunchDispatch(KernelType::InterNode, blockNum, warpPerBlock, stream);
 }
 
-void EpDispatchCombineHandle::LaunchIntraNodeCombine(hipStream_t stream) {
-  LaunchCombine(KernelType::IntraNode, stream);
+void EpDispatchCombineHandle::LaunchIntraNodeCombine(int blockNum, int warpPerBlock,
+                                                     hipStream_t stream) {
+  LaunchCombine(KernelType::IntraNode, blockNum, warpPerBlock, stream);
 }
 
-void EpDispatchCombineHandle::LaunchInterNodeCombine(hipStream_t stream) {
-  LaunchCombine(KernelType::InterNode, stream);
+void EpDispatchCombineHandle::LaunchInterNodeCombine(int blockNum, int warpPerBlock,
+                                                     hipStream_t stream) {
+  LaunchCombine(KernelType::InterNode, blockNum, warpPerBlock, stream);
 }
 
-void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, hipStream_t stream) {
-  dim3 grid(config.blockNum);
-  dim3 block(warpSize * config.warpNumPerBlock);
+void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum, int warpPerBlock,
+                                             hipStream_t stream) {
+  dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
+  dim3 block(warpSize * ((warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock));
+
   size_t sharedMemSize =
       (config.worldSize * config.warpNumPerBlock +
        config.numExpertPerRank * config.warpNumPerBlock + config.numExpertPerRank) *
@@ -196,6 +202,7 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, hipStream_t 
         using DataT = typename ArgsT::data_type;
 
         if (kernelType == KernelType::InterNode) {
+          assert(!config.useExternalInpBuffer);
           EpDispatchInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
@@ -206,9 +213,10 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, hipStream_t 
       argsVariant);
 }
 
-void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, hipStream_t stream) {
-  dim3 grid(config.blockNum);
-  dim3 block(warpSize * config.warpNumPerBlock);
+void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum, int warpPerBlock,
+                                            hipStream_t stream) {
+  dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
+  dim3 block(warpSize * ((warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock));
 
   auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
   std::visit(
@@ -218,6 +226,7 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, hipStream_t s
 
         size_t sharedMemSize = config.warpNumPerBlock * config.numExpertPerToken * sizeof(DataT**);
         if (kernelType == KernelType::InterNode) {
+          assert(!config.useExternalInpBuffer);
           EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpCombineIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);

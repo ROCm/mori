@@ -59,6 +59,9 @@ struct EpDispatchCombineConfig {
   int numExpertPerToken{2};
   int warpNumPerBlock{1};
   int blockNum{1};
+  // If true, use external buffer which incurs extra copy overhead; otherwise, the kernel assumes
+  // the provided buffer is shmemInpTokMemObj
+  bool useExternalInpBuffer{true};
 
   inline __host__ __device__ int MaxNumTokensToSendPerRank() const {
     return maxNumInpTokenPerRank * numExpertPerToken;
@@ -105,13 +108,14 @@ class EpDispatchCombineHandle {
     // printf("handle inputType %s\n", HipDataTypeToString(inputType));
   }
 
-  void LaunchIntraNodeDispatch(hipStream_t = 0);
-  void LaunchInterNodeDispatch(hipStream_t = 0);
-  void LaunchIntraNodeCombine(hipStream_t = 0);
-  void LaunchInterNodeCombine(hipStream_t = 0);
+  // When blockNum and warpPerBlock <= 0, kernel will use default values in config
+  void LaunchIntraNodeDispatch(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
+  void LaunchInterNodeDispatch(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
+  void LaunchIntraNodeCombine(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
+  void LaunchInterNodeCombine(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
 
-  void LaunchDispatch(KernelType, hipStream_t = 0);
-  void LaunchCombine(KernelType, hipStream_t = 0);
+  void LaunchDispatch(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
+  void LaunchCombine(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
   void LaunchReset(hipStream_t = 0);
 
   index_t GetCurRankNumToken() const { return curRankNumToken; }
