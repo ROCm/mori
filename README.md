@@ -23,5 +23,12 @@ cd mori && pip3 install .
 
 ### Test dispatch / combine
 ```
-python mori/examples/ops/dispatch_combine/test_dispatch_combine.py 
+cd /path/to/mori
+export PYTHONPATH=$PYTHONPATH:/path/to/mori
+
+# Test correctness
+pytest tests/python/ops/
+
+# Benchmark performance
+python3 tests/python/ops/bench_dispatch_combine.py 
 ```

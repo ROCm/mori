@@ -13,6 +13,10 @@ class EpDispatchCombineTestCase:
         self.rng = torch.Generator(device=self.device)
         self.rng.manual_seed(123)
 
+    def sync(self):
+        torch.cuda.synchronize()
+        dist.barrier()
+
     def gen_test_data(self, use_max_token_num=False):
         if use_max_token_num:
             num_token = torch.tensor(
@@ -96,6 +100,60 @@ class EpDispatchCombineTestCase:
             all_rank_scales,
         )
 
+    def check_dispatch_result(
+        self,
+        op,
+        test_data,
+        dispatch_output,
+        dispatch_weights,
+        dispatch_scales,
+        dispatch_indicies,
+        dispatch_recv_num_token,
+    ):
+        self.sync()
+        (
+            all_rank_num_token,
+            all_rank_indicies,
+            all_rank_input,
+            all_rank_weights,
+            all_rank_scales,
+        ) = test_data
+        src_token_pos = op.get_dispatch_src_token_pos()
+
+        for i, pos in enumerate(src_token_pos):
+            src_rank = int(pos) // self.config.max_num_inp_token_per_rank
+            src_id = int(pos) % self.config.max_num_inp_token_per_rank
+            assert torch.equal(all_rank_input[src_rank][src_id], dispatch_output[i])
+            assert torch.equal(all_rank_weights[src_rank][src_id], dispatch_weights[i])
+            if dispatch_scales is not None:
+                assert torch.equal(
+                    all_rank_scales[src_rank][src_id], dispatch_scales[i]
+                )
+            assert torch.equal(
+                all_rank_indicies[src_rank][src_id], dispatch_indicies[i]
+            )
+        assert len(torch.unique(src_token_pos)) == len(src_token_pos)
+        assert len(src_token_pos) == dispatch_recv_num_token[0]
+
+    def check_combine_result(self, op, test_data, combine_output):
+        self.sync()
+        all_rank_num_token = test_data[0]
+        all_rank_indicies = test_data[1]
+        all_rank_input = test_data[2]
+
+        for i in range(all_rank_num_token[self.config.rank]):
+            pes = [
+                (idx // self.config.num_experts_per_rank)
+                for idx in all_rank_indicies[self.config.rank][i].cpu().tolist()
+            ]
+            unique_pes = len(set(pes))
+
+            got, expected = combine_output[i], (
+                all_rank_input[self.config.rank][i].to(torch.float32) * unique_pes
+            ).to(self.config.data_type)
+
+            assert torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
+
     def run_test_once(self, op, test_data):
         (
             all_rank_num_token,
@@ -116,42 +174,22 @@ class EpDispatchCombineTestCase:
             all_rank_scales[self.config.rank],
             all_rank_indicies[self.config.rank],
         )
-        torch.cuda.synchronize()
-
-        src_token_pos = op.get_dispatch_src_token_pos()
-
-        for i, pos in enumerate(src_token_pos):
-            src_rank = int(pos) // self.config.max_num_inp_token_per_rank
-            src_id = int(pos) % self.config.max_num_inp_token_per_rank
-            assert torch.equal(all_rank_input[src_rank][src_id], dispatch_output[i])
-            assert torch.equal(all_rank_weights[src_rank][src_id], dispatch_weights[i])
-            if dispatch_scales is not None:
-                assert torch.equal(
-                    all_rank_scales[src_rank][src_id], dispatch_scales[i]
-                )
-            assert torch.equal(
-                all_rank_indicies[src_rank][src_id], dispatch_indicies[i]
-            )
-        assert len(torch.unique(src_token_pos)) == len(src_token_pos)
-        assert len(src_token_pos) == dispatch_recv_num_token[0]
+        self.sync()
+        self.check_dispatch_result(
+            op,
+            test_data,
+            dispatch_output,
+            dispatch_weights,
+            dispatch_scales,
+            dispatch_indicies,
+            dispatch_recv_num_token,
+        )
 
         combine_output = op.combine(
             dispatch_output, dispatch_weights, dispatch_indicies, call_reset=False
         )
-        torch.cuda.synchronize()
-
-        for i in range(all_rank_num_token[self.config.rank]):
-            pes = [
-                (idx // self.config.num_experts_per_rank)
-                for idx in all_rank_indicies[self.config.rank][i].cpu().tolist()
-            ]
-            unique_pes = len(set(pes))
-
-            got, expected = combine_output[i], (
-                all_rank_input[self.config.rank][i].to(torch.float32) * unique_pes
-            ).to(self.config.data_type)
-
-            assert torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
+        self.sync()
+        self.check_combine_result(op, test_data, combine_output)
 
 
 @pytest.fixture(scope="session")

@@ -14,11 +14,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
     def gen_test_data(self):
         return super().gen_test_data(use_max_token_num=True)
 
-    def sync(self):
-        torch.cuda.synchronize()
-        dist.barrier()
-
-    def run_once(self, op, test_data):
+    def run_once(self, op, test_data, check_result=False):
         (
             all_rank_num_token,
             all_rank_indicies,
@@ -50,11 +46,16 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         self.sync()
         disp_duration = start_event.elapsed_time(end_event)
 
-        src_token_pos = op.get_dispatch_src_token_pos()
-        # for i, pos in enumerate(src_token_pos):
-        #     src_rank = int(pos) // self.config.max_num_inp_token_per_rank
-        #     src_id = int(pos) % self.config.max_num_inp_token_per_rank
-        #     assert torch.equal(all_rank_input[src_rank][src_id], dispatch_output[i])
+        if check_result:
+            self.check_dispatch_result(
+                op,
+                test_data,
+                dispatch_output,
+                dispatch_weights,
+                dispatch_scales,
+                dispatch_indicies,
+                dispatch_recv_num_token,
+            )
 
         total_recv_num_token = dispatch_recv_num_token[0].item()
 
@@ -77,16 +78,8 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         self.sync()
         comb_duration = start_event.elapsed_time(end_event)
 
-        # for i in range(int(all_rank_num_token[self.config.rank].item())):
-        #     pes = [
-        #         (idx // self.config.num_experts_per_rank)
-        #         for idx in all_rank_indicies[self.config.rank][i].cpu().tolist()
-        #     ]
-        #     unique_pes = len(set(pes))
-        #     got, expected = combine_output[i], all_rank_input[self.config.rank][i] * unique_pes
-        #     assert torch.allclose(
-        #         got.float(), expected.float(), atol=1e-2, rtol=1e-2
-        #     )
+        if check_result:
+            self.check_combine_result(op, test_data, combine_output)
         op.reset()
         self.sync()
 
@@ -97,7 +90,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
 
         return disp_duration, comb_duration, disp_bandwidth, comb_bandwidth, total_bytes
 
-    def run(self, op, warmup=1, iters=10, always_new_data=True):
+    def run(self, op, warmup=1, iters=10):
         test_data = self.gen_test_data()
         for _ in range(warmup):
             self.run_once(op, test_data)
@@ -106,13 +99,9 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         disp_bandwidth_GB_list = []
         comb_duration_us_list = []
         comb_bandwidth_GB_list = []
+        avg_total_bytes_MB_list = []
 
-        # gen test data at each round to eliminate the effect of caching
-        if always_new_data:
-            test_data_list = [self.gen_test_data() for i in range(iters)]
-            print("Is new data !!!!")
-        else:
-            test_data_list = [test_data for i in range(iters)]
+        test_data_list = [self.gen_test_data() for i in range(iters)]
 
         for i in range(iters):
             self.sync()
@@ -124,32 +113,48 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             disp_bw_list = [torch.zeros(1) for _ in range(self.config.world_size)]
             comb_dur_list = [torch.zeros(1) for _ in range(self.config.world_size)]
             comb_bw_list = [torch.zeros(1) for _ in range(self.config.world_size)]
+            total_bytes_list = [torch.zeros(1) for _ in range(self.config.world_size)]
 
             dist.all_gather(disp_dur_list, torch.tensor([disp_dur * 1000]))
             dist.all_gather(disp_bw_list, torch.tensor([disp_bw]))
             dist.all_gather(comb_dur_list, torch.tensor([comb_dur * 1000]))
             dist.all_gather(comb_bw_list, torch.tensor([comb_bw]))
+            dist.all_gather(total_bytes_list, torch.tensor([total_bytes / (1024**2)]))
 
             disp_duration_us_list.append([int(t.item()) for t in disp_dur_list])
             disp_bandwidth_GB_list.append([int(t.item()) for t in disp_bw_list])
             comb_duration_us_list.append([int(t.item()) for t in comb_dur_list])
             comb_bandwidth_GB_list.append([int(t.item()) for t in comb_bw_list])
+            avg_total_bytes_MB_list.append(
+                int(torch.tensor(total_bytes_list).mean().item())
+            )
 
-        total_bytes_list = [torch.zeros(1) for _ in range(self.config.world_size)]
-        dist.all_gather(total_bytes_list, torch.tensor([total_bytes / (1024**2)]))
-        total_bytes_list = [t.item() for t in total_bytes_list]
-
+        theoretical_peak_bw = 50 * self.config.world_size
         if self.config.rank == 0:
+            print("Dispatch result:")
             for i, duration_us in enumerate(disp_duration_us_list):
-                print(
-                    f"Round {i} dispatch duration {duration_us} bandwidth {disp_bandwidth_GB_list[i]} avg {sum(disp_bandwidth_GB_list[i]) / self.config.world_size}"
+                algo_bw = sum(disp_bandwidth_GB_list[i]) / self.config.world_size
+                bus_bw = int(
+                    algo_bw * (self.config.world_size - 1) / self.config.world_size
                 )
-            for i, duration_us in enumerate(comb_duration_us_list):
                 print(
-                    f"Round {i} combine duration {duration_us} bandwidth {comb_bandwidth_GB_list[i]} avg {sum(comb_bandwidth_GB_list[i]) / self.config.world_size}"
+                    f"Round {i} duration(us) {duration_us} "
+                    f"bandwidth(GB/s) {disp_bandwidth_GB_list[i]} "
+                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw}({theoretical_peak_bw})"
                 )
 
-            print(f"Total bytes is {total_bytes_list} MB")
+            print()
+            print("Combine result:")
+            for i, duration_us in enumerate(comb_duration_us_list):
+                algo_bw = sum(comb_bandwidth_GB_list[i]) / self.config.world_size
+                bus_bw = int(
+                    algo_bw * (self.config.world_size - 1) / self.config.world_size
+                )
+                print(
+                    f"Round {i} duration(us) {duration_us} "
+                    f"bandwidth(GB/s) {comb_bandwidth_GB_list[i]} "
+                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw}({theoretical_peak_bw})"
+                )
 
 
 def _bench_dispatch_combine(
@@ -161,7 +166,7 @@ def _bench_dispatch_combine(
     scale_dim=0,
     scale_type_size=0,
     max_num_inp_token_per_rank=4096,
-    num_experts_per_rank=32,
+    num_experts_per_rank=16,
     num_experts_per_token=8,
 ):
     config = mori.ops.EpDispatchCombineConfig(
@@ -184,7 +189,7 @@ def _bench_dispatch_combine(
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port) as ctx:
         mori.shmem.shmem_torch_process_group_init("default")
         op = mori.ops.EpDispatchCombineOp(config)
-        benchmark.run(op, always_new_data=True)
+        benchmark.run(op)
         # benchmark.output()
         # mori.shmem.shmem_finalize()
 
