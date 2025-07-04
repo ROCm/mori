@@ -18,11 +18,12 @@ class EpDispatchCombineTestCase:
             hidden_dim=7168,
             scale_dim=32,
             scale_type_size=4,
-            max_num_inp_token_per_rank=128,
+            max_num_inp_token_per_rank=4096,
             num_experts_per_rank=32,
             num_experts_per_token=8,
-            warp_num_per_block=4,
+            warp_num_per_block=8,
             block_num=80,
+            max_token_type_size=2,
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNode,
         )
 

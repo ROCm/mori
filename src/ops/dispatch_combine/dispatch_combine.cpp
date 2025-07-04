@@ -203,7 +203,7 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
         using DataT = typename ArgsT::data_type;
 
         if (kernelType == KernelType::InterNode) {
-          assert(!config.useExternalInpBuffer);
+          assert(config.useExternalInpBuffer);
           EpDispatchInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
