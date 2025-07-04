@@ -265,10 +265,12 @@ class EpDispatchCombineTestCase:
             all_rank_weights,
             all_rank_scales,
         ) = test_data
-        dist.barrier()
 
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
+
+        torch.cuda.synchronize()
+        dist.barrier()
         start_event.record()
         (
             dispatch_output,
@@ -308,6 +310,7 @@ class EpDispatchCombineTestCase:
         total_bytes = total_recv_num_token * self.config.hidden_dim * element_size
         disp_bandwidth = total_bytes / (1024**3) / (disp_duration / (10**3))
 
+        torch.cuda.synchronize()
         dist.barrier()
         start_event.record()
         combine_output = op.combine(
@@ -398,7 +401,7 @@ def test_dispatch_combine(local_rank, num_node, gpu_per_node, is_bench=False):
         global_rank,
         gpu_per_node,
         world_size,
-        torch.float8_e4m3fnuz,  # torch.float8_e4m3fnuz
+        torch.bfloat16,  # torch.float8_e4m3fnuz
     )
     test_case.setup()
     if is_bench:
