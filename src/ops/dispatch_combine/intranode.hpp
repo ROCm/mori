@@ -107,7 +107,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     }
 
     // Write scales
-    if (args.scalesBuf) {
+    if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
       index_t destScaleOffset = destTokId * config.scaleDim * config.scaleTypeSize;
       index_t srcScaleOffset = srcTokId * config.scaleDim * config.scaleTypeSize;
       core::WarpCopy(args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
@@ -170,12 +170,15 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   size_t maxNumOutTokenPerRank = config.MaxNumTokensToSend();
   // Copy input to shmem registered buffer so that other GPUs can access directly
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
-  for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
-    core::WarpCopy(args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
-                   args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
+  if (args.config.useExternalInpBuffer) {
+    for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
+      core::WarpCopy(args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
+                     args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
+    }
   }
   // Make sure copy on all GPUs are finished
   CrossDeviceBarrierIntraNodeKernel(args);
+  if (args.curRankNumToken == 0) return;
 
   extern __shared__ char sharedMem[];
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
@@ -187,7 +190,8 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     index_t tokenId = i / warpsPerToken;
     index_t inTokenPartId = i % warpsPerToken;
     index_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
-    index_t hiddenDimSize = std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp);
+    index_t hiddenDimSize =
+        std::max(0, std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp));
 
     // Prepare data pointers on different GPUs
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
@@ -202,7 +206,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
         srcPtrs[j] = nullptr;
       }
     }
-    core::WarpAccum(
+    core::WarpAccum<T, 8>(
         args.shmemOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim + hiddenDimOffset,
         srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
   }

@@ -86,6 +86,11 @@ constexpr inline __device__ __host__ T CeilDiv(T a, T b) {
   return (a + b - 1) / b;
 }
 
+template <typename T>
+constexpr inline __device__ __host__ T IsPowerOf2(T x) {
+  return (x > 0) && ((x & (x - 1)) == 0);
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                    Lock                                    */
 /* -------------------------------------------------------------------------- */

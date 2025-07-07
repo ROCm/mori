@@ -15,15 +15,16 @@ class EpDispatchCombineTestCase:
             rank=self.rank,
             world_size=self.world_size,
             hidden_dim=7168,
-            scale_dim=32,
-            # scale_dim=0,
+            # scale_dim=32,
+            scale_dim=0,
             scale_type_size=torch.tensor(
-                [], dtype=torch.float8_e4m3fnuz).element_size(),
-            max_token_type_size=torch.tensor(
-                [], dtype=torch.float32).element_size(),
-            max_num_inp_token_per_rank=512,
+                [], dtype=torch.float8_e4m3fnuz
+            ).element_size(),
+            max_token_type_size=torch.tensor([], dtype=torch.float32).element_size(),
+            max_num_inp_token_per_rank=4096,
             num_experts_per_rank=32,
             num_experts_per_token=8,
+            use_external_inp_buf=False,
         )
 
     def setup(self):
@@ -188,7 +189,14 @@ class EpDispatchCombineTestCase:
             dispatch_scales,
             dispatch_indices,
             dispatch_recv_num_token,
-        ) = op.dispatch(input, weights, scales, indices)
+        ) = op.dispatch(
+            input,
+            weights,
+            scales,
+            indices,
+            block_num=80,
+            warp_per_block=16,
+        )
         torch.cuda.synchronize()
 
         src_token_pos = op.get_dispatch_src_token_pos()
@@ -210,9 +218,21 @@ class EpDispatchCombineTestCase:
         if self.config.rank == 0:
             print("Dispatch Pass")
 
-        # combine_output = op.combine(dispatch_output, weights, indices)
-        combine_output = op.combine(dispatch_output.to(
-            torch.bfloat16), weights, indices)
+        total_recv_num_token = dispatch_recv_num_token[0].item()
+        combine_input = op.get_registered_input_buffer(self.config.data_type)
+        combine_input[:total_recv_num_token, :].copy_(
+            dispatch_output[:total_recv_num_token, :]
+        )
+
+        combine_input = dispatch_output
+
+        combine_output = op.combine(
+            combine_input.to(torch.bfloat16),
+            weights,
+            indices,
+            block_num=80,
+            warp_per_block=8,
+        )
         torch.cuda.synchronize()
 
         for i in range(num_tokens):
@@ -225,8 +245,7 @@ class EpDispatchCombineTestCase:
             # got, expected = combine_output[i], (
             #     input[i].to(torch.float32) * unique_pes
             # ).to(self.config.data_type)
-            got, expected = combine_output[i], input[i].to(
-                torch.bfloat16) * unique_pes
+            got, expected = combine_output[i], input[i].to(torch.bfloat16) * unique_pes
 
             assert torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
@@ -242,8 +261,8 @@ class EpDispatchCombineTestCase:
 
 
 def test_dispatch_combine(rank, world_size):
-    test_case = EpDispatchCombineTestCase(rank, world_size, torch.float8_e4m3fnuz)
-    # test_case = EpDispatchCombineTestCase(rank, world_size, torch.bfloat16)
+    # test_case = EpDispatchCombineTestCase(rank, world_size, torch.float8_e4m3fnuz)
+    test_case = EpDispatchCombineTestCase(rank, world_size, torch.bfloat16)
     test_case.setup()
     test_case.test_dispatch_combine()
     test_case.cleanup()

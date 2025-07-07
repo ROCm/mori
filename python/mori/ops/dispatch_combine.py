@@ -23,8 +23,9 @@ class EpDispatchCombineConfig:
     max_num_inp_token_per_rank: int
     num_experts_per_rank: int
     num_experts_per_token: int
-    warp_num_per_block: int = 4
-    block_num: int = 256
+    warp_num_per_block: int = 8
+    block_num: int = 80
+    use_external_inp_buf: bool = True
     kernel_type: EpDispatchCombineKernelType = EpDispatchCombineKernelType.IntraNode
 
 
@@ -36,9 +37,7 @@ class EpDispatchCombineOp:
     def __init__(self, config):
         self.config = config
 
-        handle_class = _cpp_dispatch_combine_factory(
-            "EpDispatchCombineHandle"
-        )
+        handle_class = _cpp_dispatch_combine_factory("EpDispatchCombineHandle")
         self._handle = handle_class(
             mori_cpp.EpDispatchCombineConfig(
                 rank=config.rank,
@@ -52,18 +51,13 @@ class EpDispatchCombineOp:
                 num_experts_per_token=config.num_experts_per_token,
                 warp_num_per_block=config.warp_num_per_block,
                 block_num=config.block_num,
+                use_external_inp_buf=config.use_external_inp_buf,
             )
         )
 
-        self._dispatch_func = _cpp_dispatch_combine_factory(
-            "launch_dispatch"
-        )
-        self._combine_func = _cpp_dispatch_combine_factory(
-            "launch_combine"
-        )
-        self._reset_func = _cpp_dispatch_combine_factory(
-            "launch_reset"
-        )
+        self._dispatch_func = _cpp_dispatch_combine_factory("launch_dispatch")
+        self._combine_func = _cpp_dispatch_combine_factory("launch_combine")
+        self._reset_func = _cpp_dispatch_combine_factory("launch_reset")
         self._get_dispatch_src_token_pos_func = _cpp_dispatch_combine_factory(
             "get_dispatch_src_token_pos"
         )
@@ -76,6 +70,12 @@ class EpDispatchCombineOp:
         self._get_dispatch_receiver_token_idx_map_func = _cpp_dispatch_combine_factory(
             "get_dispatch_receiver_token_idx_map"
         )
+        self._get_registered_input_buffer = _cpp_dispatch_combine_factory(
+            "get_registered_input_buffer"
+        )
+
+    def get_registered_input_buffer(self, dtype: torch.dtype):
+        return self._get_registered_input_buffer(self._handle, dtype)
 
     def dispatch(
         self,
@@ -83,6 +83,8 @@ class EpDispatchCombineOp:
         weights: torch.Tensor,
         scales: torch.Tensor,
         indices: torch.Tensor,
+        block_num: int = -1,
+        warp_per_block: int = -1,
     ):
         return self._dispatch_func(
             self._handle,
@@ -91,6 +93,8 @@ class EpDispatchCombineOp:
             weights,
             scales,
             indices,
+            block_num,
+            warp_per_block,
         )
 
     def combine(
@@ -98,7 +102,9 @@ class EpDispatchCombineOp:
         input: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
-        call_reset=True,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+        call_reset: bool = True,
     ):
         output = self._combine_func(
             self._handle,
@@ -106,6 +112,8 @@ class EpDispatchCombineOp:
             input,
             weights,
             indices,
+            block_num,
+            warp_per_block,
         )
         if call_reset:
             self._reset_func(self._handle)
