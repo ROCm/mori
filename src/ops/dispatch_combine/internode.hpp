@@ -9,7 +9,7 @@ namespace moe {
 
 #define MAX_GPUS_PER_NODE 8
 
-#define DEBUG 1
+#define DEBUG 0
 
 __device__ void SyncIfDebugEnabled(const char* msg) {
 #if DEBUG == 1
@@ -158,7 +158,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
   }
   SyncIfDebugEnabled("Dispatch kernel: finish waiting num token signal");
 
-#pragma unroll
+  // #pragma unroll
   for (int srcPe = 0; srcPe < npes; srcPe += 1) {
     index_t recvTokenNum = recvTokenNumArr[srcPe];
 
@@ -170,8 +170,8 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
       localTokenIdx = __shfl(localTokenIdx, 0);
       index_t peSortedId = srcPe * MaxNumTokensToRecvPerRank + i;
 
-      size_t localTokenOffset = localTokenIdx * config.hiddenDim;
-      size_t peSortedTokenOffset = peSortedId * config.hiddenDim;
+      size_t localTokenOffset = size_t(localTokenIdx) * size_t(config.hiddenDim);
+      size_t peSortedTokenOffset = size_t(peSortedId) * size_t(config.hiddenDim);
 
       core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + localTokenOffset,
                      args.shmemInpTokMemObj->template GetAs<T*>() + peSortedTokenOffset,
@@ -330,16 +330,18 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
       index_t peSortedId = args.dispSenderIdxMap[tokenId * config.numExpertPerToken + j];
       index_t destPe = peSortedId / MaxNumTokensToRecvPerRank;
+      size_t offset = size_t(peSortedId) * size_t(config.hiddenDim) + hiddenDimOffset;
+
       if (destPe < config.worldSize) {
-        srcPtrs[j] = args.shmemInpTokMemObj->template GetAs<T*>() + peSortedId * config.hiddenDim +
-                     hiddenDimOffset;
+        srcPtrs[j] = args.shmemInpTokMemObj->template GetAs<T*>() + offset;
       } else {
         srcPtrs[j] = nullptr;
       }
     }
-    core::WarpAccum<T, 8>(
-        args.shmemOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim + hiddenDimOffset,
-        srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
+
+    size_t offset = size_t(tokenId) * size_t(config.hiddenDim) + hiddenDimOffset;
+    core::WarpAccum<T, 8>(args.shmemOutTokMemObj->template GetAs<T*>() + offset, srcPtrs, nullptr,
+                          config.numExpertPerToken, hiddenDimSize);
   }
 }
 
