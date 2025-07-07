@@ -170,10 +170,12 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
       localTokenIdx = __shfl(localTokenIdx, 0);
       index_t peSortedId = srcPe * MaxNumTokensToRecvPerRank + i;
 
-      core::WarpCopy(
-          args.shmemOutTokMemObj->template GetAs<T*>() + localTokenIdx * config.hiddenDim,
-          args.shmemInpTokMemObj->template GetAs<T*>() + peSortedId * config.hiddenDim,
-          config.hiddenDim);
+      size_t localTokenOffset = localTokenIdx * config.hiddenDim;
+      size_t peSortedTokenOffset = peSortedId * config.hiddenDim;
+
+      core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + localTokenOffset,
+                     args.shmemInpTokMemObj->template GetAs<T*>() + peSortedTokenOffset,
+                     config.hiddenDim);
       core::WarpCopy(args.shmemOutWeightsMemObj->template GetAs<float*>() +
                          localTokenIdx * config.numExpertPerToken,
                      args.shmemInpWeightsMemObj->template GetAs<float*>() +
@@ -298,8 +300,8 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
     index_t srcPe = peSortedId / MaxNumTokensToRecvPerRank;
     peSortedId = peSortedId - srcPe * MaxNumTokensToRecvPerRank + myPe * MaxNumTokensToRecvPerRank;
 
-    index_t peSortedOffset = peSortedId * config.hiddenDim;
-    index_t tokenOffset = localTokenIdx * config.hiddenDim;
+    size_t peSortedOffset = peSortedId * config.hiddenDim;
+    size_t tokenOffset = localTokenIdx * config.hiddenDim;
 
     core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<T*>() + tokenOffset,
                    args.inpTokenBuf + tokenOffset, config.hiddenDim);
