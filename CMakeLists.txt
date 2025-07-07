@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.19)
 
-set(CMAKE_CXX_FLAGS_DEBUG "-g")
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 
 # set(CMAKE_BUILD_TYPE Debug)

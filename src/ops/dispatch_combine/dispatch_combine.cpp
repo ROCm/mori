@@ -72,7 +72,8 @@ mori::application::SymmMemObjPtr ShmemMallocAndReturnMemObjPtr(size_t size, unsi
 }
 
 void EpDispatchCombineHandle::InitializeShmemBuf() {
-  size_t maxTokenSize = config.MaxNumTokensToRecv() * config.hiddenDim * config.maxTokenTypeSize;
+  size_t maxTokenSize = static_cast<ssize_t>(config.MaxNumTokensToRecv()) * config.hiddenDim *
+                        config.maxTokenTypeSize;
   shmemInpTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
   shmemOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
   shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);

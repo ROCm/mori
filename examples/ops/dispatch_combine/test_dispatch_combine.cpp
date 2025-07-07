@@ -90,6 +90,9 @@ hipDataType GetHipDataType<__hip_fp8_e4m3_fnuz>() {
   return HIP_R_8F_E4M3_FNUZ;
 }
 
+// inline bool IsNoDataRank(const EpDispatchCombineConfig& config) { return config.rank < 4; }
+inline bool IsNoDataRank(const EpDispatchCombineConfig& config) { return false; }
+
 template <typename T>
 class EpDispatchCombineTestCase {
  public:
@@ -153,8 +156,13 @@ class EpDispatchCombineTestCase {
     RandomInitializeWeights();
     RandomInitializeScales();
     RandomInitializeToken();
-    handle.PrepareInference(GetHipDataType<T>(), inpTokBuf, outTokBuf, weightsBuf, scalesBuf,
-                            tokenIndices, numToken);
+    if (IsNoDataRank(handle.config)) {
+      handle.PrepareInference(GetHipDataType<T>(), nullptr, outTokBuf, weightsBuf, scalesBuf,
+                              nullptr, 0);
+    } else {
+      handle.PrepareInference(GetHipDataType<T>(), inpTokBuf, outTokBuf, weightsBuf, scalesBuf,
+                              tokenIndices, numToken);
+    }
     // PrintDispatch();
     // PrintDispatchStats();
   }
@@ -168,8 +176,11 @@ class EpDispatchCombineTestCase {
 
     // Collect token indices from all ranks
     void* tokenIndicesCpu = malloc(tokenIndicesSize);
-    HIP_RUNTIME_CHECK(
-        hipMemcpy(tokenIndicesCpu, handle.tokenIndices, tokenIndicesSize, hipMemcpyDeviceToHost));
+    memset(tokenIndicesCpu, 0, tokenIndicesSize);
+    if (handle.tokenIndices) {
+      HIP_RUNTIME_CHECK(
+          hipMemcpy(tokenIndicesCpu, handle.tokenIndices, tokenIndicesSize, hipMemcpyDeviceToHost));
+    }
 
     void* globalTokIndicesCpu = malloc(config.worldSize * tokenIndicesSize);
     MPI_Allgather(tokenIndicesCpu, tokenIndicesSize, MPI_CHAR, globalTokIndicesCpu,
@@ -192,8 +203,11 @@ class EpDispatchCombineTestCase {
     // Collect tokens from all ranks
     int inpTokEleNum = config.maxNumInpTokenPerRank * config.hiddenDim;
     int inpTokSize = inpTokEleNum * sizeof(T);
-    HIP_RUNTIME_CHECK(
-        hipMemcpy(inpTokBufCpu, handle.inpTokenBuf, inpTokSize, hipMemcpyDeviceToHost));
+    HIP_RUNTIME_CHECK(hipMemset(inpTokBufCpu, 0, inpTokSize));
+    if (handle.inpTokenBuf) {
+      HIP_RUNTIME_CHECK(
+          hipMemcpy(inpTokBufCpu, handle.inpTokenBuf, inpTokSize, hipMemcpyDeviceToHost));
+    }
 
     void* globalInpTokBufCpu = malloc(config.worldSize * inpTokSize);
     MPI_Allgather(inpTokBufCpu, inpTokSize, MPI_CHAR, globalInpTokBufCpu, inpTokSize, MPI_CHAR,
@@ -422,6 +436,10 @@ class EpDispatchCombineTestCase {
 
   void CopyDispatchOutAsCombineInp() {
     EpDispatchCombineConfig& config = handle.config;
+    if (IsNoDataRank(handle.config)) {
+      handle.PrepareInference(GetHipDataType<T>(), inpTokBuf, outTokBuf, weightsBuf, scalesBuf,
+                              nullptr, 0);
+    }
     // HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, outTokBuf,
     //                             config.MaxNumTokensToRecvPerRank() * config.hiddenDim *
     //                             sizeof(T), hipMemcpyDeviceToDevice));
@@ -525,6 +543,11 @@ class EpDispatchCombineTestCase {
     EpDispatchCombineConfig& config = handle.config;
     int maxTokenSize = config.MaxNumTokensToRecvPerRank() * config.hiddenDim * sizeof(T);
     HIP_RUNTIME_CHECK(hipMemset(inpTokBuf, 0, maxTokenSize));
+
+    if (IsNoDataRank(config)) {
+      return;
+    }
+
     HIP_RUNTIME_CHECK(hipMemset(inpTokBufCpu, 0, maxTokenSize));
 
     int inpTokEleNum = config.maxNumInpTokenPerRank * config.hiddenDim;

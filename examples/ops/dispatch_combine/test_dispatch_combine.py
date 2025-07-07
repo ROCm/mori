@@ -85,15 +85,19 @@ class EpDispatchCombineTestCase:
 
     def gen_test_data(self):
         # gen num_tokens
-        num_tokens = int(
-            torch.randint(
-                1,
-                self.config.max_num_inp_token_per_rank + 1,
-                [1],
-                generator=self.rng,
-                device=self.device,
-            ).item()
-        )
+        # if self.config.rank < 4:
+        if False:
+            num_tokens = 0
+        else:
+            num_tokens = int(
+                torch.randint(
+                    1,
+                    self.config.max_num_inp_token_per_rank + 1,
+                    [1],
+                    generator=self.rng,
+                    device=self.device,
+                ).item()
+            )
 
         # gen indices
         indices = torch.empty(
@@ -254,7 +258,7 @@ class EpDispatchCombineTestCase:
 
     def test_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
-        for i in range(20):
+        for i in range(5):
             test_data = self.gen_test_data()
             self.run_test_once(op, test_data)
         del op

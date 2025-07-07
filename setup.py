@@ -64,6 +64,8 @@ extensions = [
     Extension(
         "mori",
         sources=[],
+        # extra_compile_args=['-g', '-O0'],
+        # extra_link_args=['-g'],
     ),
 ]
 

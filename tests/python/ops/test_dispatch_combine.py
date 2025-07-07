@@ -27,7 +27,7 @@ class EpDispatchCombineTestCase:
             ).to(self.device)
         else:
             num_token = torch.randint(
-                1,
+                0,
                 self.config.max_num_inp_token_per_rank + 1,
                 [self.config.world_size],
                 generator=self.rng,
