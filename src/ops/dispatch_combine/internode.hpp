@@ -100,8 +100,8 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
 #else
     // For disaggregated write, write data to remote directly
     // TODO: copy weight and indicies
-    index_t peSortedId = myPe * MaxNumTokensToRecvPerRank + destPeTokenIdx;
-    index_t peSortedOffset = peSortedId * config.hiddenDim;
+    size_t peSortedId = myPe * MaxNumTokensToRecvPerRank + destPeTokenIdx;
+    size_t peSortedOffset = peSortedId * config.hiddenDim;
 
     core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<T*>() + tokenOffset,
                    args.inpTokenBuf + tokenOffset, config.hiddenDim);
@@ -125,11 +125,11 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
       // Add 1 so that when token number == 0, receiver side still know the signal is sent
       index_t numToken = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
 #if ENABLE_RDMA_AGGREGATE_WRITE == 1
-      index_t localPeSortedOffset = destPe * MaxNumTokensToRecvPerRank;
-      index_t remotePeSortedOffset = myPe * MaxNumTokensToRecvPerRank;
-      shmem::ShmemPutTypeNbiThread<T>(
-          args.shmemInpTokMemObj, remotePeSortedOffset * config.hiddenDim, args.shmemOutTokMemObj,
-          localPeSortedOffset * config.hiddenDim, config.hiddenDim * numToken, destPe);
+      size_t localPeSortedOffset = destPe * MaxNumTokensToRecvPerRank * size_t(config.hiddenDim);
+      size_t remotePeSortedOffset = myPe * MaxNumTokensToRecvPerRank * size_t(config.hiddenDim);
+      shmem::ShmemPutTypeNbiThread<T>(args.shmemInpTokMemObj, remotePeSortedOffset,
+                                      args.shmemOutTokMemObj, localPeSortedOffset,
+                                      config.hiddenDim * numToken, destPe);
       shmem::ShmemPutTypeNbiThread<float>(
           args.shmemInpWeightsMemObj, remotePeSortedOffset * config.numExpertPerToken,
           args.shmemOutWeightsMemObj, localPeSortedOffset * config.numExpertPerToken,
@@ -147,7 +147,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
   // Phase 2: recv token
   // Each warp wait until sender finished by waiting token number signal
-  index_t* recvTokenNumArr = reinterpret_cast<index_t*>(sharedMem) + warpId * npes;
+  index_t* recvTokenNumArr = reinterpret_cast<index_t*>(sharedMem) + warpId * (npes + 1);
   // TODO: kernel hangs here when launch too many blocks
   for (int destPe = laneId; destPe < npes; destPe += warpSize) {
     index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>() + destPe;
@@ -158,42 +158,77 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
   }
   SyncIfDebugEnabled("Dispatch kernel: finish waiting num token signal");
 
-  for (int i = globalWarpId;; i += globalWarpNum) {
-    // find src pe and tok id
-    index_t srcPe = 0;
-    index_t accumPeTokOffset = 0;
-    for (; srcPe < npes; srcPe++) {
-      if ((i >= accumPeTokOffset) && (i < (accumPeTokOffset + recvTokenNumArr[srcPe]))) break;
-      accumPeTokOffset += recvTokenNumArr[srcPe];
-    }
-    if (srcPe >= npes) break;
+  // #pragma unroll
+  for (int srcPe = 0; srcPe < npes; srcPe += 1) {
+    index_t recvTokenNum = recvTokenNumArr[srcPe];
 
-    index_t localTokenIdx = 0;
-    if (laneId == 0) {
-      localTokenIdx = atomicAdd(args.localPeTokenCounter, 1);
-    }
-    localTokenIdx = __shfl(localTokenIdx, 0);
+    for (int i = globalWarpId; i < recvTokenNum; i += globalWarpNum) {
+      index_t localTokenIdx = 0;
+      if (laneId == 0) {
+        localTokenIdx = atomicAdd(args.localPeTokenCounter, 1);
+      }
+      localTokenIdx = __shfl(localTokenIdx, 0);
+      index_t peSortedId = srcPe * MaxNumTokensToRecvPerRank + i;
 
-    // Copy token
-    index_t peSortedId = srcPe * MaxNumTokensToRecvPerRank + i - accumPeTokOffset;
+      size_t localTokenOffset = size_t(localTokenIdx) * size_t(config.hiddenDim);
+      size_t peSortedTokenOffset = size_t(peSortedId) * size_t(config.hiddenDim);
 
-    core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + localTokenIdx * config.hiddenDim,
-                   args.shmemInpTokMemObj->template GetAs<T*>() + peSortedId * config.hiddenDim,
-                   config.hiddenDim);
-    core::WarpCopy(args.shmemOutWeightsMemObj->template GetAs<float*>() +
-                       localTokenIdx * config.numExpertPerToken,
-                   args.shmemInpWeightsMemObj->template GetAs<float*>() +
-                       peSortedId * config.numExpertPerToken,
-                   config.numExpertPerToken);
-    core::WarpCopy(args.shmemOutIndicesMemObj->template GetAs<index_t*>() +
-                       localTokenIdx * config.numExpertPerToken,
-                   args.shmemInpIndicesMemObj->template GetAs<index_t*>() +
-                       peSortedId * config.numExpertPerToken,
-                   config.numExpertPerToken);
-    if (laneId == 0) {
-      args.dispReceiverIdxMap[localTokenIdx] = peSortedId;
+      core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + localTokenOffset,
+                     args.shmemInpTokMemObj->template GetAs<T*>() + peSortedTokenOffset,
+                     config.hiddenDim);
+      core::WarpCopy(args.shmemOutWeightsMemObj->template GetAs<float*>() +
+                         localTokenIdx * config.numExpertPerToken,
+                     args.shmemInpWeightsMemObj->template GetAs<float*>() +
+                         peSortedId * config.numExpertPerToken,
+                     config.numExpertPerToken);
+      core::WarpCopy(args.shmemOutIndicesMemObj->template GetAs<index_t*>() +
+                         localTokenIdx * config.numExpertPerToken,
+                     args.shmemInpIndicesMemObj->template GetAs<index_t*>() +
+                         peSortedId * config.numExpertPerToken,
+                     config.numExpertPerToken);
+      if (laneId == 0) {
+        args.dispReceiverIdxMap[localTokenIdx] = peSortedId;
+      }
     }
   }
+
+  // for (int i = globalWarpId;; i += globalWarpNum) {
+  //   // find src pe and tok id
+  //   index_t srcPe = 0;
+  //   index_t accumPeTokOffset = 0;
+  //   for (; srcPe < npes; srcPe++) {
+  //     if ((i >= accumPeTokOffset) && (i < (accumPeTokOffset + recvTokenNumArr[srcPe]))) break;
+  //     accumPeTokOffset += recvTokenNumArr[srcPe];
+  //   }
+  //   if (srcPe >= npes) break;
+
+  //   index_t localTokenIdx = 0;
+  //   if (laneId == 0) {
+  //     localTokenIdx = atomicAdd(args.localPeTokenCounter, 1);
+  //   }
+  //   localTokenIdx = __shfl(localTokenIdx, 0);
+
+  //   // Copy token
+  //   index_t peSortedId = srcPe * MaxNumTokensToRecvPerRank + i - accumPeTokOffset;
+
+  //   core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + localTokenIdx *
+  //   config.hiddenDim,
+  //                  args.shmemInpTokMemObj->template GetAs<T*>() + peSortedId * config.hiddenDim,
+  //                  config.hiddenDim);
+  //   core::WarpCopy(args.shmemOutWeightsMemObj->template GetAs<float*>() +
+  //                      localTokenIdx * config.numExpertPerToken,
+  //                  args.shmemInpWeightsMemObj->template GetAs<float*>() +
+  //                      peSortedId * config.numExpertPerToken,
+  //                  config.numExpertPerToken);
+  //   core::WarpCopy(args.shmemOutIndicesMemObj->template GetAs<index_t*>() +
+  //                      localTokenIdx * config.numExpertPerToken,
+  //                  args.shmemInpIndicesMemObj->template GetAs<index_t*>() +
+  //                      peSortedId * config.numExpertPerToken,
+  //                  config.numExpertPerToken);
+  //   if (laneId == 0) {
+  //     args.dispReceiverIdxMap[localTokenIdx] = peSortedId;
+  //   }
+  // }
   SyncIfDebugEnabled("Dispatch kernel: kernel end");
 }
 
@@ -265,16 +300,19 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
     index_t srcPe = peSortedId / MaxNumTokensToRecvPerRank;
     peSortedId = peSortedId - srcPe * MaxNumTokensToRecvPerRank + myPe * MaxNumTokensToRecvPerRank;
 
-    index_t peSortedOffset = peSortedId * config.hiddenDim;
-    index_t tokenOffset = localTokenIdx * config.hiddenDim;
+    size_t peSortedOffset = size_t(peSortedId) * size_t(config.hiddenDim);
+    size_t tokenOffset = size_t(localTokenIdx) * size_t(config.hiddenDim);
 
     core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<T*>() + tokenOffset,
                    args.inpTokenBuf + tokenOffset, config.hiddenDim);
     shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, peSortedOffset, args.shmemStagingTokMemObj,
                                   tokenOffset, config.hiddenDim, srcPe);
   }
+  SyncIfDebugEnabled("Combine kernel: send token end");
+
   // Make sure copy on all GPUs are finished
   CrossDeviceBarrierInterNodeKernel(args);
+  SyncIfDebugEnabled("Dispatch kernel: sync across device end");
 
   extern __shared__ char sharedMem[];
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
@@ -292,16 +330,18 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
       index_t peSortedId = args.dispSenderIdxMap[tokenId * config.numExpertPerToken + j];
       index_t destPe = peSortedId / MaxNumTokensToRecvPerRank;
+      size_t offset = size_t(peSortedId) * size_t(config.hiddenDim) + hiddenDimOffset;
+
       if (destPe < config.worldSize) {
-        srcPtrs[j] = args.shmemInpTokMemObj->template GetAs<T*>() + peSortedId * config.hiddenDim +
-                     hiddenDimOffset;
+        srcPtrs[j] = args.shmemInpTokMemObj->template GetAs<T*>() + offset;
       } else {
         srcPtrs[j] = nullptr;
       }
     }
-    core::WarpAccum<T, 8>(
-        args.shmemOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim + hiddenDimOffset,
-        srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
+
+    size_t offset = size_t(tokenId) * size_t(config.hiddenDim) + hiddenDimOffset;
+    core::WarpAccum<T, 8>(args.shmemOutTokMemObj->template GetAs<T*>() + offset, srcPtrs, nullptr,
+                          config.numExpertPerToken, hiddenDimSize);
   }
 }
 

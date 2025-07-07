@@ -18,10 +18,10 @@ class EpDispatchCombineTestCase:
             hidden_dim=7168,
             scale_dim=32,
             scale_type_size=4,
-            max_num_inp_token_per_rank=2048,
+            max_num_inp_token_per_rank=4096,
             num_experts_per_rank=32,
             num_experts_per_token=8,
-            warp_num_per_block=8,
+            warp_num_per_block=16,
             block_num=80,
             max_token_type_size=2,
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNode,
@@ -419,11 +419,7 @@ if __name__ == "__main__":
     world_size = num_node * gpu_per_node
     torch.multiprocessing.spawn(
         test_dispatch_combine,
-        args=(
-            num_node,
-            gpu_per_node,
-            True,
-        ),
+        args=(num_node, gpu_per_node, False),
         nprocs=gpu_per_node,
         join=True,
     )
