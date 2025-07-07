@@ -147,7 +147,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
   // Phase 2: recv token
   // Each warp wait until sender finished by waiting token number signal
-  index_t* recvTokenNumArr = reinterpret_cast<index_t*>(sharedMem) + warpId * npes;
+  index_t* recvTokenNumArr = reinterpret_cast<index_t*>(sharedMem) + warpId * (npes + 1);
   // TODO: kernel hangs here when launch too many blocks
   for (int destPe = laneId; destPe < npes; destPe += warpSize) {
     index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>() + destPe;
@@ -158,42 +158,75 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
   }
   SyncIfDebugEnabled("Dispatch kernel: finish waiting num token signal");
 
-  for (int i = globalWarpId;; i += globalWarpNum) {
-    // find src pe and tok id
-    index_t srcPe = 0;
-    index_t accumPeTokOffset = 0;
-    for (; srcPe < npes; srcPe++) {
-      if ((i >= accumPeTokOffset) && (i < (accumPeTokOffset + recvTokenNumArr[srcPe]))) break;
-      accumPeTokOffset += recvTokenNumArr[srcPe];
-    }
-    if (srcPe >= npes) break;
+#pragma onroll
+  for (int srcPe = 0; srcPe < npes; srcPe += 1) {
+    index_t recvTokenNum = recvTokenNumArr[srcPe];
 
-    index_t localTokenIdx = 0;
-    if (laneId == 0) {
-      localTokenIdx = atomicAdd(args.localPeTokenCounter, 1);
-    }
-    localTokenIdx = __shfl(localTokenIdx, 0);
+    for (int i = globalWarpId; i < recvTokenNum; i += globalWarpNum) {
+      index_t localTokenIdx = 0;
+      if (laneId == 0) {
+        localTokenIdx = atomicAdd(args.localPeTokenCounter, 1);
+      }
+      localTokenIdx = __shfl(localTokenIdx, 0);
+      index_t peSortedId = srcPe * MaxNumTokensToRecvPerRank + i;
 
-    // Copy token
-    index_t peSortedId = srcPe * MaxNumTokensToRecvPerRank + i - accumPeTokOffset;
-
-    core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + localTokenIdx * config.hiddenDim,
-                   args.shmemInpTokMemObj->template GetAs<T*>() + peSortedId * config.hiddenDim,
-                   config.hiddenDim);
-    core::WarpCopy(args.shmemOutWeightsMemObj->template GetAs<float*>() +
-                       localTokenIdx * config.numExpertPerToken,
-                   args.shmemInpWeightsMemObj->template GetAs<float*>() +
-                       peSortedId * config.numExpertPerToken,
-                   config.numExpertPerToken);
-    core::WarpCopy(args.shmemOutIndicesMemObj->template GetAs<index_t*>() +
-                       localTokenIdx * config.numExpertPerToken,
-                   args.shmemInpIndicesMemObj->template GetAs<index_t*>() +
-                       peSortedId * config.numExpertPerToken,
-                   config.numExpertPerToken);
-    if (laneId == 0) {
-      args.dispReceiverIdxMap[localTokenIdx] = peSortedId;
+      core::WarpCopy(
+          args.shmemOutTokMemObj->template GetAs<T*>() + localTokenIdx * config.hiddenDim,
+          args.shmemInpTokMemObj->template GetAs<T*>() + peSortedId * config.hiddenDim,
+          config.hiddenDim);
+      core::WarpCopy(args.shmemOutWeightsMemObj->template GetAs<float*>() +
+                         localTokenIdx * config.numExpertPerToken,
+                     args.shmemInpWeightsMemObj->template GetAs<float*>() +
+                         peSortedId * config.numExpertPerToken,
+                     config.numExpertPerToken);
+      core::WarpCopy(args.shmemOutIndicesMemObj->template GetAs<index_t*>() +
+                         localTokenIdx * config.numExpertPerToken,
+                     args.shmemInpIndicesMemObj->template GetAs<index_t*>() +
+                         peSortedId * config.numExpertPerToken,
+                     config.numExpertPerToken);
+      if (laneId == 0) {
+        args.dispReceiverIdxMap[localTokenIdx] = peSortedId;
+      }
     }
   }
+
+  // for (int i = globalWarpId;; i += globalWarpNum) {
+  //   // find src pe and tok id
+  //   // index_t srcPe = 0;
+  //   // index_t accumPeTokOffset = 0;
+  //   // for (; srcPe < npes; srcPe++) {
+  //   //   if ((i >= accumPeTokOffset) && (i < (accumPeTokOffset + recvTokenNumArr[srcPe]))) break;
+  //   //   accumPeTokOffset += recvTokenNumArr[srcPe];
+  //   // }
+  //   // if (srcPe >= npes) break;
+
+  //   index_t localTokenIdx = 0;
+  //   if (laneId == 0) {
+  //     localTokenIdx = atomicAdd(args.localPeTokenCounter, 1);
+  //   }
+  //   localTokenIdx = __shfl(localTokenIdx, 0);
+
+  //   // Copy token
+  //   index_t peSortedId = srcPe * MaxNumTokensToRecvPerRank + i - accumPeTokOffset;
+
+  //   core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + localTokenIdx *
+  //   config.hiddenDim,
+  //                  args.shmemInpTokMemObj->template GetAs<T*>() + peSortedId * config.hiddenDim,
+  //                  config.hiddenDim);
+  //   core::WarpCopy(args.shmemOutWeightsMemObj->template GetAs<float*>() +
+  //                      localTokenIdx * config.numExpertPerToken,
+  //                  args.shmemInpWeightsMemObj->template GetAs<float*>() +
+  //                      peSortedId * config.numExpertPerToken,
+  //                  config.numExpertPerToken);
+  //   core::WarpCopy(args.shmemOutIndicesMemObj->template GetAs<index_t*>() +
+  //                      localTokenIdx * config.numExpertPerToken,
+  //                  args.shmemInpIndicesMemObj->template GetAs<index_t*>() +
+  //                      peSortedId * config.numExpertPerToken,
+  //                  config.numExpertPerToken);
+  //   if (laneId == 0) {
+  //     args.dispReceiverIdxMap[localTokenIdx] = peSortedId;
+  //   }
+  // }
   SyncIfDebugEnabled("Dispatch kernel: kernel end");
 }
 
