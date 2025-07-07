@@ -9,7 +9,7 @@ namespace moe {
 
 #define MAX_GPUS_PER_NODE 8
 
-#define DEBUG 0
+#define DEBUG 1
 
 __device__ void SyncIfDebugEnabled(const char* msg) {
 #if DEBUG == 1
@@ -125,11 +125,11 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
       // Add 1 so that when token number == 0, receiver side still know the signal is sent
       index_t numToken = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
 #if ENABLE_RDMA_AGGREGATE_WRITE == 1
-      size_t localPeSortedOffset = destPe * MaxNumTokensToRecvPerRank;
-      size_t remotePeSortedOffset = myPe * MaxNumTokensToRecvPerRank;
-      shmem::ShmemPutTypeNbiThread<T>(
-          args.shmemInpTokMemObj, remotePeSortedOffset * config.hiddenDim, args.shmemOutTokMemObj,
-          localPeSortedOffset * config.hiddenDim, config.hiddenDim * numToken, destPe);
+      size_t localPeSortedOffset = destPe * MaxNumTokensToRecvPerRank * size_t(config.hiddenDim);
+      size_t remotePeSortedOffset = myPe * MaxNumTokensToRecvPerRank * size_t(config.hiddenDim);
+      shmem::ShmemPutTypeNbiThread<T>(args.shmemInpTokMemObj, remotePeSortedOffset,
+                                      args.shmemOutTokMemObj, localPeSortedOffset,
+                                      config.hiddenDim * numToken, destPe);
       shmem::ShmemPutTypeNbiThread<float>(
           args.shmemInpWeightsMemObj, remotePeSortedOffset * config.numExpertPerToken,
           args.shmemOutWeightsMemObj, localPeSortedOffset * config.numExpertPerToken,
@@ -158,7 +158,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
   }
   SyncIfDebugEnabled("Dispatch kernel: finish waiting num token signal");
 
-#pragma onroll
+#pragma unroll
   for (int srcPe = 0; srcPe < npes; srcPe += 1) {
     index_t recvTokenNum = recvTokenNumArr[srcPe];
 
@@ -194,13 +194,13 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
   // for (int i = globalWarpId;; i += globalWarpNum) {
   //   // find src pe and tok id
-  //   // index_t srcPe = 0;
-  //   // index_t accumPeTokOffset = 0;
-  //   // for (; srcPe < npes; srcPe++) {
-  //   //   if ((i >= accumPeTokOffset) && (i < (accumPeTokOffset + recvTokenNumArr[srcPe]))) break;
-  //   //   accumPeTokOffset += recvTokenNumArr[srcPe];
-  //   // }
-  //   // if (srcPe >= npes) break;
+  //   index_t srcPe = 0;
+  //   index_t accumPeTokOffset = 0;
+  //   for (; srcPe < npes; srcPe++) {
+  //     if ((i >= accumPeTokOffset) && (i < (accumPeTokOffset + recvTokenNumArr[srcPe]))) break;
+  //     accumPeTokOffset += recvTokenNumArr[srcPe];
+  //   }
+  //   if (srcPe >= npes) break;
 
   //   index_t localTokenIdx = 0;
   //   if (laneId == 0) {
@@ -300,16 +300,19 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
     index_t srcPe = peSortedId / MaxNumTokensToRecvPerRank;
     peSortedId = peSortedId - srcPe * MaxNumTokensToRecvPerRank + myPe * MaxNumTokensToRecvPerRank;
 
-    size_t peSortedOffset = peSortedId * config.hiddenDim;
-    size_t tokenOffset = localTokenIdx * config.hiddenDim;
+    size_t peSortedOffset = size_t(peSortedId) * size_t(config.hiddenDim);
+    size_t tokenOffset = size_t(localTokenIdx) * size_t(config.hiddenDim);
 
     core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<T*>() + tokenOffset,
                    args.inpTokenBuf + tokenOffset, config.hiddenDim);
     shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, peSortedOffset, args.shmemStagingTokMemObj,
                                   tokenOffset, config.hiddenDim, srcPe);
   }
+  SyncIfDebugEnabled("Combine kernel: send token end");
+
   // Make sure copy on all GPUs are finished
   CrossDeviceBarrierInterNodeKernel(args);
+  SyncIfDebugEnabled("Dispatch kernel: sync across device end");
 
   extern __shared__ char sharedMem[];
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
