@@ -100,8 +100,8 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
 #else
     // For disaggregated write, write data to remote directly
     // TODO: copy weight and indicies
-    index_t peSortedId = myPe * MaxNumTokensToRecvPerRank + destPeTokenIdx;
-    index_t peSortedOffset = peSortedId * config.hiddenDim;
+    size_t peSortedId = myPe * MaxNumTokensToRecvPerRank + destPeTokenIdx;
+    size_t peSortedOffset = peSortedId * config.hiddenDim;
 
     core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<T*>() + tokenOffset,
                    args.inpTokenBuf + tokenOffset, config.hiddenDim);
@@ -125,8 +125,8 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
       // Add 1 so that when token number == 0, receiver side still know the signal is sent
       index_t numToken = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
 #if ENABLE_RDMA_AGGREGATE_WRITE == 1
-      index_t localPeSortedOffset = destPe * MaxNumTokensToRecvPerRank;
-      index_t remotePeSortedOffset = myPe * MaxNumTokensToRecvPerRank;
+      size_t localPeSortedOffset = destPe * MaxNumTokensToRecvPerRank;
+      size_t remotePeSortedOffset = myPe * MaxNumTokensToRecvPerRank;
       shmem::ShmemPutTypeNbiThread<T>(
           args.shmemInpTokMemObj, remotePeSortedOffset * config.hiddenDim, args.shmemOutTokMemObj,
           localPeSortedOffset * config.hiddenDim, config.hiddenDim * numToken, destPe);
