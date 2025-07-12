@@ -84,7 +84,7 @@ void distRdmaOps(int argc, char* argv[]) {
 
   // RDMA initialization
   // 1 Create device
-  RdmaContext rdma_context;
+  RdmaContext rdma_context(RdmaBackendType::DirectVerbs);
   RdmaDeviceList rdma_devices = rdma_context.GetRdmaDeviceList();
   ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(rdma_devices);
   RdmaDevice* device = activeDevicePortList[0].first;

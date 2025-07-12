@@ -51,7 +51,7 @@ void LocalRdmaOps() {
 
   // RDMA initialization
   // 1 Create device
-  RdmaContext rdma_context;
+  RdmaContext rdma_context(RdmaBackendType::DirectVerbs);
   RdmaDeviceList rdma_devices = rdma_context.GetRdmaDeviceList();
   RdmaDevice* device = rdma_devices[0];
   RdmaDeviceContext* device_context_1 = device->CreateRdmaDeviceContext();

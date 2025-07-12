@@ -48,7 +48,7 @@ void Context::IntializePossibleTransports() {
   HIP_RUNTIME_CHECK(hipSetDevice(rankInNode));
 
   // Init rdma context
-  rdmaContext.reset(new RdmaContext());
+  rdmaContext.reset(new RdmaContext(RdmaBackendType::DirectVerbs));
   const RdmaDeviceList& devices = rdmaContext->GetRdmaDeviceList();
   ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(devices);
 

@@ -4,6 +4,7 @@
 #include <iostream>
 
 #include "infiniband/verbs.h"
+#include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
 
 namespace mori {
@@ -105,7 +106,7 @@ ActiveDevicePortList GetActiveDevicePortList(const RdmaDeviceList& devices) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           RdmaContext                                          */
 /* ---------------------------------------------------------------------------------------------- */
-RdmaContext::RdmaContext() {
+RdmaContext::RdmaContext(RdmaBackendType backendType) : backendType(backendType) {
   deviceList = ibv_get_device_list(nullptr);
   Intialize();
 }
@@ -125,15 +126,19 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
   int status = ibv_query_device_ex(context, NULL, &device_attr_ex);
   assert(!status);
 
-  switch (device_attr_ex.orig_attr.vendor_id) {
-    case (RdmaDeviceVendorId::Mellanox):
-      return new Mlx5Device(inDevice);
-      break;
-    default:
-      return nullptr;
+  if (backendType == RdmaBackendType::IBVerbs) {
+    return new IBVerbsDevice(inDevice);
+  } else if (backendType == RdmaBackendType::DirectVerbs) {
+    switch (device_attr_ex.orig_attr.vendor_id) {
+      case (static_cast<uint32_t>(RdmaDeviceVendorId::Mellanox)):
+        return new Mlx5Device(inDevice);
+        break;
+      default:
+        return nullptr;
+    }
+  } else {
+    assert(false && "unsupported backend type");
   }
-
-  ibv_close_device(context);
 }
 
 void RdmaContext::Intialize() {

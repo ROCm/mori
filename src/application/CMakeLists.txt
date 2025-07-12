@@ -18,6 +18,7 @@ add_library(
     bootstrap/torch_bootstrap.cpp
     transport/rdma/rdma.cpp
     transport/rdma/providers/mlx5/mlx5.cpp
+    transport/rdma/providers/ibverbs/ibverbs.cpp
     memory/symmetric_memory.cpp
     memory/memory_region.cpp
     context/context.cpp

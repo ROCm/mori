@@ -59,7 +59,7 @@ void LocalRdmaOps() {
   int msgSize = 78;
   // RDMA initialization
   // 1 Create device
-  RdmaContext rdmaContext;
+  RdmaContext rdmaContext(RdmaBackendType::DirectVerbs);
   RdmaDeviceList rdmaDevices = rdmaContext.GetRdmaDeviceList();
   ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(rdmaDevices);
   assert(!activeDevicePortList.empty());

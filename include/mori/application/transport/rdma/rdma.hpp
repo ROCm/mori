@@ -19,7 +19,13 @@ namespace application {
   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | \
       IBV_ACCESS_REMOTE_ATOMIC
 
-enum RdmaDeviceVendorId {
+enum class RdmaBackendType {
+  Unknown = 0,
+  DirectVerbs = 1,
+  IBVerbs = 2,
+};
+
+enum class RdmaDeviceVendorId {
   Unknown = 0,
   Mellanox = 0x02c9,
   // Broadcom =
@@ -78,14 +84,20 @@ struct CompletionQueueHandle {
   uint32_t pollCqLock{0};
 };
 
+struct IBVerbsHandle {};
+
 struct RdmaEndpoint {
   RdmaDeviceVendorId vendorId{RdmaDeviceVendorId::Unknown};
   RdmaEndpointHandle handle;
+  // TODO(@ditian12): we should use an opaque handle to reference the actual transport context
+  // handles, for direct verbs it should be WorkQueueHandle/CompletionQueueHandle, for ib verbs, it
+  // should be ibv structures
   WorkQueueHandle wqHandle;
   CompletionQueueHandle cqHandle;
+  IBVerbsHandle ibvHandle;
 
   __device__ __host__ core::ProviderType GetProviderType() {
-    if (vendorId == Mellanox) {
+    if (vendorId == RdmaDeviceVendorId::Mellanox) {
       return core::ProviderType::MLX5;
     } else {
       printf("unknown vendorId %d", vendorId);
@@ -178,7 +190,7 @@ ActiveDevicePortList GetActiveDevicePortList(const RdmaDeviceList&);
 /* -------------------------------------------------------------------------- */
 class RdmaContext {
  public:
-  RdmaContext();
+  RdmaContext(RdmaBackendType);
   ~RdmaContext();
 
   const RdmaDeviceList& GetRdmaDeviceList() const;
@@ -186,6 +198,9 @@ class RdmaContext {
  private:
   RdmaDevice* RdmaDeviceFactory(ibv_device* inDevice);
   void Intialize();
+
+ public:
+  RdmaBackendType backendType;
 
  private:
   ibv_device** deviceList{nullptr};
