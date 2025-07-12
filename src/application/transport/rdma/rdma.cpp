@@ -87,6 +87,13 @@ const std::unordered_map<uint32_t, std::unique_ptr<ibv_port_attr>>* RdmaDevice::
   return &portAttrMap;
 }
 
+const ibv_port_attr* RdmaDevice::GetPortAttr(uint32_t portId) const {
+  auto mapPtr = GetPortAttrMap();
+  auto it = mapPtr->find(portId);
+  if (it != mapPtr->end() && it->second) return it->second.get();
+  return nullptr;
+}
+
 RdmaDeviceContext* RdmaDevice::CreateRdmaDeviceContext() {
   ibv_pd* pd = ibv_alloc_pd(defaultContext);
   return new RdmaDeviceContext(this, pd);

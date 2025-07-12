@@ -31,6 +31,17 @@ enum class RdmaDeviceVendorId {
   // Broadcom =
 };
 
+template <typename T>
+RdmaDeviceVendorId ToRdmaDeviceVendorId(T v) {
+  switch (v) {
+    case static_cast<T>(RdmaDeviceVendorId::Mellanox):
+      return RdmaDeviceVendorId::Mellanox;
+    default:
+      return RdmaDeviceVendorId::Unknown;
+  }
+  return RdmaDeviceVendorId::Unknown;
+}
+
 #define PAGESIZE uint32_t(sysconf(_SC_PAGE_SIZE))
 
 /* -------------------------------------------------------------------------- */
@@ -84,7 +95,10 @@ struct CompletionQueueHandle {
   uint32_t pollCqLock{0};
 };
 
-struct IBVerbsHandle {};
+struct IBVerbsHandle {
+  ibv_qp* qp;
+  ibv_cq* cq;
+};
 
 struct RdmaEndpoint {
   RdmaDeviceVendorId vendorId{RdmaDeviceVendorId::Unknown};
@@ -122,7 +136,7 @@ struct MemoryRegion {
 class RdmaDeviceContext {
  public:
   RdmaDeviceContext(RdmaDevice* rdma_device, ibv_pd* in_pd);
-  ~RdmaDeviceContext();
+  virtual ~RdmaDeviceContext();
 
   virtual MemoryRegion RegisterMemoryRegion(void* ptr, size_t size,
                                             int accessFlag = MR_DEFAULT_ACCESS_FLAG);
@@ -164,6 +178,7 @@ class RdmaDevice {
   std::vector<uint32_t> GetActivePortIds() const;
   const ibv_device_attr_ex* GetDeviceAttr() const;
   const std::unordered_map<uint32_t, std::unique_ptr<ibv_port_attr>>* GetPortAttrMap() const;
+  const ibv_port_attr* GetPortAttr(uint32_t portId) const;
 
   std::string Name() const;
 
