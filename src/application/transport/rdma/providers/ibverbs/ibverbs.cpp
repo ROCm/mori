@@ -98,8 +98,6 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   flags = IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
           IBV_QP_MAX_QP_RD_ATOMIC;
   ibv_modify_qp(qp, &attr, flags);
-
-  printf("connect endpoint ok!\n");
 }
 
 /* ---------------------------------------------------------------------------------------------- */

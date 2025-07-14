@@ -21,25 +21,22 @@ __global__ void CheckBufferKernel(const char* buffer, size_t numElems, char expe
         if (val != expected) {  
             // printf("Mismatch at index %zu: expected=%d, got=%d\n", idx, expected, val);  
             assert(false && "Buffer mismatch detected!");
-        }  
-    }  
-}  
-   
-void VerifyBuffer(void* buffer, size_t maxSize, char expected) {  
-    size_t numElems = maxSize / sizeof(char);  
-  
-    int threadsPerBlock = 256;  
-    int blocks = (static_cast<int>(numElems) + threadsPerBlock - 1) / threadsPerBlock;  
-  
-    CheckBufferKernel<<<blocks, threadsPerBlock>>>(  
-        reinterpret_cast<char*>(buffer),  
-        numElems,  
-        expected  
-    );  
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());  
-} 
+        }
+    }
+}
 
-__global__ void Write(RdmaEndpoint* endpoint, MemoryRegion localMr, MemoryRegion remoteMr,
+void VerifyBuffer(void* buffer, size_t maxSize, char expected) {
+  size_t numElems = maxSize / sizeof(char);
+
+  int threadsPerBlock = 256;
+  int blocks = (static_cast<int>(numElems) + threadsPerBlock - 1) / threadsPerBlock;
+
+  CheckBufferKernel<<<blocks, threadsPerBlock>>>(reinterpret_cast<char*>(buffer), numElems,
+                                                 expected);
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+}
+
+__global__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemoryRegion remoteMr,
                       size_t msg_size, int iters) {
   for (int i = 0; i < iters; i++) {
     uint64_t dbr_val = PostWrite<ProviderType::MLX5>(
@@ -121,8 +118,9 @@ void distRdmaOps(int argc, char* argv[]) {
 
   // assert(!posix_memalign(&buffer_1, 4096, allreduce_size));
   // memset(buffer_1, 1, allreduce_size);
-  MemoryRegion mr_handle = device_context->RegisterMemoryRegion(buffer, maxSize, MR_ACCESS_FLAG);
-  std::vector<MemoryRegion> global_mr_handles(world_size);
+  RdmaMemoryRegion mr_handle =
+      device_context->RegisterRdmaMemoryRegion(buffer, maxSize, MR_ACCESS_FLAG);
+  std::vector<RdmaMemoryRegion> global_mr_handles(world_size);
   bootNet.Allgather(&mr_handle, global_mr_handles.data(), sizeof(mr_handle));
   global_mr_handles[local_rank] = mr_handle;
   RdmaEndpoint* devEndpoint;

@@ -15,7 +15,7 @@ using namespace mori::core;
       IBV_ACCESS_REMOTE_ATOMIC
 
 template <ProviderType PrvdType, typename T>
-__global__ void Atomic(RdmaEndpoint endpoint, MemoryRegion localMr, MemoryRegion remoteMr,
+__global__ void Atomic(RdmaEndpoint endpoint, RdmaMemoryRegion localMr, RdmaMemoryRegion remoteMr,
                        atomicType amoOp, int iters) {
   T value = 1;
   for (int i = 0; i < iters; i++) {
@@ -37,42 +37,38 @@ __global__ void Atomic(RdmaEndpoint endpoint, MemoryRegion localMr, MemoryRegion
 }
 
 void launchAtomicKernel(const Datatype& dt, ProviderType pType, hipStream_t stream,
-                        RdmaEndpoint endpoint, MemoryRegion localMr, MemoryRegion remoteMr,
+                        RdmaEndpoint endpoint, RdmaMemoryRegion localMr, RdmaMemoryRegion remoteMr,
                         atomicType amoOp, int iters) {
   dim3 block(1);
   dim3 thread(1);
-  switch (pType) {  
-    case ProviderType::MLX5:  
-      switch (dt.type) {  
-        case MORIDataType::MORI_INT32:  
-          hipLaunchKernelGGL((Atomic<ProviderType::MLX5, int32_t>),  
-                             block, thread, 0, stream,  
-                             endpoint, localMr, remoteMr, amoOp, iters);  
-          break;  
-        case MORIDataType::MORI_INT64:  
-          hipLaunchKernelGGL((Atomic<ProviderType::MLX5, int64_t>),  
-                             block, thread, 0, stream,  
-                             endpoint, localMr, remoteMr, amoOp, iters);  
-          break;  
-        case MORIDataType::MORI_UINT32:  
-          hipLaunchKernelGGL((Atomic<ProviderType::MLX5, uint32_t>),  
-                             block, thread, 0, stream,  
-                             endpoint, localMr, remoteMr, amoOp, iters);  
-          break;  
-        case MORIDataType::MORI_UINT64:  
-          hipLaunchKernelGGL((Atomic<ProviderType::MLX5, uint64_t>),  
-                             block, thread, 0, stream,  
-                             endpoint, localMr, remoteMr, amoOp, iters);  
-          break;  
-        default:  
-          std::cerr << "Unknown MORIDataType, cannot launch Atomic kernel!\n";  
-          return;  
-      }  
-      break;  
-    default:  
-      std::cerr << "Unsupported ProviderType in launchAtomicKernel\n";  
-      return;  
-  }  
+  switch (pType) {
+    case ProviderType::MLX5:
+      switch (dt.type) {
+        case MORIDataType::MORI_INT32:
+          hipLaunchKernelGGL((Atomic<ProviderType::MLX5, int32_t>), block, thread, 0, stream,
+                             endpoint, localMr, remoteMr, amoOp, iters);
+          break;
+        case MORIDataType::MORI_INT64:
+          hipLaunchKernelGGL((Atomic<ProviderType::MLX5, int64_t>), block, thread, 0, stream,
+                             endpoint, localMr, remoteMr, amoOp, iters);
+          break;
+        case MORIDataType::MORI_UINT32:
+          hipLaunchKernelGGL((Atomic<ProviderType::MLX5, uint32_t>), block, thread, 0, stream,
+                             endpoint, localMr, remoteMr, amoOp, iters);
+          break;
+        case MORIDataType::MORI_UINT64:
+          hipLaunchKernelGGL((Atomic<ProviderType::MLX5, uint64_t>), block, thread, 0, stream,
+                             endpoint, localMr, remoteMr, amoOp, iters);
+          break;
+        default:
+          std::cerr << "Unknown MORIDataType, cannot launch Atomic kernel!\n";
+          return;
+      }
+      break;
+    default:
+      std::cerr << "Unsupported ProviderType in launchAtomicKernel\n";
+      return;
+  }
 }
 
 void distRdmaOps(int argc, char* argv[]) {
@@ -140,8 +136,8 @@ void distRdmaOps(int argc, char* argv[]) {
   HIP_RUNTIME_CHECK(hipMalloc(&buffer, 8));
   HIP_RUNTIME_CHECK(hipMemset(buffer, 0, 8));
 
-  MemoryRegion mr_handle = device_context->RegisterMemoryRegion(buffer, 8, MR_ACCESS_FLAG);
-  std::vector<MemoryRegion> global_mr_handles(world_size);
+  RdmaMemoryRegion mr_handle = device_context->RegisterRdmaMemoryRegion(buffer, 8, MR_ACCESS_FLAG);
+  std::vector<RdmaMemoryRegion> global_mr_handles(world_size);
   bootNet.Allgather(&mr_handle, global_mr_handles.data(), sizeof(mr_handle));
   global_mr_handles[local_rank] = mr_handle;
 

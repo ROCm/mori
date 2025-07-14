@@ -12,7 +12,8 @@ using namespace mori::core;
   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | \
       IBV_ACCESS_REMOTE_ATOMIC
 
-__device__ void SendThreadKernel(RdmaEndpoint& epSend, MemoryRegion sendMr, MemoryRegion recvMr) {
+__device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion sendMr,
+                                 RdmaMemoryRegion recvMr) {
   atomicType amoOp = AMO_SET;
   uint32_t value = 2;
 
@@ -30,7 +31,7 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, MemoryRegion sendMr, Memo
   // printf("send block is done, opcode is %d postIdx %u consIdx %u\n", opcode, epSend.wqHandle.postIdx, epSend.cqHandle.consIdx);
 }
 
-__device__ void RecvThreadKernel(RdmaEndpoint& epRecv, MemoryRegion mr) {
+__device__ void RecvThreadKernel(RdmaEndpoint& epRecv, RdmaMemoryRegion mr) {
   uint32_t postIdx = 0;
   uint32_t* addr = reinterpret_cast<uint32_t*>(mr.addr);
   uint32_t val = core::AtomicLoadSeqCst(addr);
@@ -41,7 +42,8 @@ __device__ void RecvThreadKernel(RdmaEndpoint& epRecv, MemoryRegion mr) {
   // }
 }
 
-__global__ void SendRecvOnGpu(RdmaEndpoint epSend, RdmaEndpoint epRecv, MemoryRegion mrSend, MemoryRegion mrRecv) {
+__global__ void SendRecvOnGpu(RdmaEndpoint epSend, RdmaEndpoint epRecv, RdmaMemoryRegion mrSend,
+                              RdmaMemoryRegion mrRecv) {
   assert(gridDim.x == 2);
   int tid = blockIdx.x;
   printf("tid %d start \n", tid);
@@ -94,8 +96,10 @@ void LocalRdmaOps() {
   HIP_RUNTIME_CHECK(hipMalloc(&sendBuf, msgSize));
   HIP_RUNTIME_CHECK(hipMemset(sendBuf, 1, msgSize));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-  MemoryRegion mrSend = deviceContextSend->RegisterMemoryRegion(sendBuf, msgSize, MR_ACCESS_FLAG);
-  MemoryRegion mrRecv = deviceContextRecv->RegisterMemoryRegion(recvBuf, msgSize, MR_ACCESS_FLAG);
+  RdmaMemoryRegion mrSend =
+      deviceContextSend->RegisterRdmaMemoryRegion(sendBuf, msgSize, MR_ACCESS_FLAG);
+  RdmaMemoryRegion mrRecv =
+      deviceContextRecv->RegisterRdmaMemoryRegion(recvBuf, msgSize, MR_ACCESS_FLAG);
 
   SendRecvOnGpu<<<2, 1>>>(epSend, epRecv, mrSend, mrRecv);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
@@ -104,8 +108,8 @@ void LocalRdmaOps() {
   std::cout << "After atomic op value = " << value << std::endl;  
 
   // 8 Finalize
-  deviceContextSend->DeRegisterMemoryRegion(sendBuf);
-  deviceContextRecv->DeRegisterMemoryRegion(recvBuf);
+  deviceContextSend->DeRegisterRdmaMemoryRegion(sendBuf);
+  deviceContextRecv->DeRegisterRdmaMemoryRegion(recvBuf);
 }
 
 int main() { LocalRdmaOps(); }

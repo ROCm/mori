@@ -32,7 +32,7 @@ void MemoryStatesInit() {
   states->memoryStates->symmMemMgr =
       new application::SymmMemManager(*states->bootStates->bootNet, *context);
   states->memoryStates->mrMgr =
-      new application::MemoryRegionManager(*context->GetRdmaDeviceContext());
+      new application::RdmaMemoryRegionManager(*context->GetRdmaDeviceContext());
 }
 
 void GpuStateInit() {

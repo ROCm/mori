@@ -24,8 +24,8 @@ struct SymmMemObj {
   // For IPC
   hipIpcMemHandle_t* ipcMemHandles{nullptr};  // should only placed on cpu
 
-  __device__ __host__ MemoryRegion GetMemoryRegion(int pe) const {
-    MemoryRegion mr;
+  __device__ __host__ RdmaMemoryRegion GetRdmaMemoryRegion(int pe) const {
+    RdmaMemoryRegion mr;
     mr.addr = peerPtrs[pe];
     mr.lkey = lkey;
     mr.rkey = peerRkeys[pe];

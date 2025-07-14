@@ -2,7 +2,7 @@
 
 #include "hip/hip_runtime.h"
 #include "mori/application/transport/rdma/rdma.hpp"
-#include "mori/application/utils/hip_check.hpp"
+#include "mori/application/utils/check.hpp"
 #include "mori/core/core.hpp"
 
 namespace mori {
@@ -62,7 +62,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
   bootNet.Allgather(&localPtr, cpuMemObj->peerPtrs, sizeof(uintptr_t));
   // cpuMemObj->peerPtrs[rank] = reinterpret_cast<uintptr_t>(cpuMemObj->localPtr);
 
-  // PEP context: exchange ipc mem handles
+  // P2P context: exchange ipc mem handles
   hipIpcMemHandle_t handle;
   HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&handle, localPtr));
   cpuMemObj->ipcMemHandles =
@@ -82,7 +82,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
   cpuMemObj->peerRkeys[rank] = 0;
   RdmaDeviceContext* rdmaDeviceContext = context.GetRdmaDeviceContext();
   if (rdmaDeviceContext) {
-    application::MemoryRegion mr = rdmaDeviceContext->RegisterMemoryRegion(localPtr, size);
+    application::RdmaMemoryRegion mr = rdmaDeviceContext->RegisterRdmaMemoryRegion(localPtr, size);
     cpuMemObj->lkey = mr.lkey;
     cpuMemObj->peerRkeys[rank] = mr.rkey;
   }
@@ -109,7 +109,7 @@ void SymmMemManager::DeRegisterSymmMemObj(void* localPtr) {
   if (memObjPool.find(localPtr) == memObjPool.end()) return;
 
   RdmaDeviceContext* rdmaDeviceContext = context.GetRdmaDeviceContext();
-  if (rdmaDeviceContext) rdmaDeviceContext->DeRegisterMemoryRegion(localPtr);
+  if (rdmaDeviceContext) rdmaDeviceContext->DeRegisterRdmaMemoryRegion(localPtr);
 
   SymmMemObjPtr memObjPtr = memObjPool.at(localPtr);
   free(memObjPtr.cpu->peerPtrs);

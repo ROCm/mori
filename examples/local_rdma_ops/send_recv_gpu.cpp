@@ -12,7 +12,8 @@ using namespace mori::core;
   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | \
       IBV_ACCESS_REMOTE_ATOMIC
 
-__device__ void SendThreadKernel(RdmaEndpoint& epSend, MemoryRegion mr, int msgSize, int msgNum) {
+__device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion mr, int msgSize,
+                                 int msgNum) {
   uint32_t postIdx = 0;
 
   for (int i = 0; i < msgNum; i++) {
@@ -38,7 +39,8 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, MemoryRegion mr, int msgS
   }
 }
 
-__device__ void RecvThreadKernel(RdmaEndpoint& epRecv, MemoryRegion mr, int msgSize, int msgNum) {
+__device__ void RecvThreadKernel(RdmaEndpoint& epRecv, RdmaMemoryRegion mr, int msgSize,
+                                 int msgNum) {
   uint32_t postIdx = 0;
 
   for (int i = 0; i < msgNum; i++) {
@@ -67,8 +69,8 @@ __device__ void RecvThreadKernel(RdmaEndpoint& epRecv, MemoryRegion mr, int msgS
   }
 }
 
-__global__ void SendRecvOnGpu(RdmaEndpoint epSend, RdmaEndpoint epRecv, MemoryRegion mrSend,
-                              MemoryRegion mrRecv, int msgSize, int msgNum) {
+__global__ void SendRecvOnGpu(RdmaEndpoint epSend, RdmaEndpoint epRecv, RdmaMemoryRegion mrSend,
+                              RdmaMemoryRegion mrRecv, int msgSize, int msgNum) {
   assert(gridDim.x == 2);
   int tid = blockIdx.x;
   printf("tid %d start \n", tid);
@@ -117,18 +119,20 @@ void LocalRdmaOps() {
   // 4 Register buffer
   void* sendBuf;
   HIP_RUNTIME_CHECK(hipMalloc(&sendBuf, msgSize));
-  MemoryRegion mrSend = deviceContextSend->RegisterMemoryRegion(sendBuf, msgSize, MR_ACCESS_FLAG);
+  RdmaMemoryRegion mrSend =
+      deviceContextSend->RegisterRdmaMemoryRegion(sendBuf, msgSize, MR_ACCESS_FLAG);
 
   void* recvBuf;
   HIP_RUNTIME_CHECK(hipMalloc(&recvBuf, msgSize));
-  MemoryRegion mrRecv = deviceContextRecv->RegisterMemoryRegion(recvBuf, msgSize, MR_ACCESS_FLAG);
+  RdmaMemoryRegion mrRecv =
+      deviceContextRecv->RegisterRdmaMemoryRegion(recvBuf, msgSize, MR_ACCESS_FLAG);
 
   SendRecvOnGpu<<<2, 1>>>(epSend, epRecv, mrSend, mrRecv, msgSize, msgNum);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
   // 8 Finalize
-  deviceContextSend->DeRegisterMemoryRegion(sendBuf);
-  deviceContextRecv->DeRegisterMemoryRegion(recvBuf);
+  deviceContextSend->DeRegisterRdmaMemoryRegion(sendBuf);
+  deviceContextRecv->DeRegisterRdmaMemoryRegion(recvBuf);
 }
 
 int main() { LocalRdmaOps(); }

@@ -17,7 +17,7 @@ namespace shmem {
 template <core::ProviderType PrvdType>
 inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMemObjPtr dest,
                                                       size_t destOffset,
-                                                      const application::MemoryRegion& source,
+                                                      const application::RdmaMemoryRegion& source,
                                                       size_t sourceOffset, size_t bytes, int pe) {
   if (bytes == 0) return;
   uintptr_t laddr = source.addr + sourceOffset;
@@ -53,7 +53,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
 template <>
 inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::MemoryRegion& source, size_t sourceOffset, size_t bytes, int pe) {
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe) {
   DISPATCH_PROVIDER_TYPE(ShmemPutMemNbiThreadKernelImpl, dest, destOffset, source, sourceOffset,
                          bytes, pe);
 }
@@ -61,7 +61,7 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::RD
 template <core::ProviderType PrvdType>
 inline __device__ void ShmemPutMemNbiWarpKernelImpl(const application::SymmMemObjPtr dest,
                                                     size_t destOffset,
-                                                    const application::MemoryRegion& source,
+                                                    const application::RdmaMemoryRegion& source,
                                                     size_t sourceOffset, size_t bytes, int pe) {
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {
@@ -72,7 +72,7 @@ inline __device__ void ShmemPutMemNbiWarpKernelImpl(const application::SymmMemOb
 template <>
 inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::MemoryRegion& source, size_t sourceOffset, size_t bytes, int pe) {
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe) {
   DISPATCH_PROVIDER_TYPE(ShmemPutMemNbiWarpKernelImpl, dest, destOffset, source, sourceOffset,
                          bytes, pe);
 }
@@ -176,12 +176,10 @@ inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportT
 }
 
 template <core::ProviderType PrvdType>
-inline __device__ void ShmemAtomicSizeFetchThreadKernelImpl(const application::SymmMemObjPtr dest,
-                                                            size_t destOffset,
-                                                            const application::MemoryRegion& source,
-                                                            size_t sourceOffset, void* val,
-                                                            void* compare, size_t bytes, int pe,
-                                                            core::atomicType amoType) {
+inline __device__ void ShmemAtomicSizeFetchThreadKernelImpl(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare,
+    size_t bytes, int pe, core::atomicType amoType) {
   uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
   uintptr_t rkey = dest->peerRkeys[pe];
   uintptr_t laddr = source.addr + sourceOffset;
@@ -209,19 +207,17 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernelImpl(const application::S
 template <>
 inline __device__ void ShmemAtomicSizeFetchThreadKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::MemoryRegion& source, size_t sourceOffset, void* val, void* compare,
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare,
     size_t bytes, int pe, core::atomicType amoType) {
   DISPATCH_PROVIDER_TYPE(ShmemAtomicSizeFetchThreadKernelImpl, dest, destOffset, source,
                          sourceOffset, val, compare, bytes, pe, amoType);
 }
 
 template <core::ProviderType PrvdType>
-inline __device__ void ShmemAtomicSizeFetchWarpKernelImpl(const application::SymmMemObjPtr dest,
-                                                          size_t destOffset,
-                                                          const application::MemoryRegion& source,
-                                                          size_t sourceOffset, void* val,
-                                                          void* compare, size_t bytes, int pe,
-                                                          core::atomicType amoType) {
+inline __device__ void ShmemAtomicSizeFetchWarpKernelImpl(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare,
+    size_t bytes, int pe, core::atomicType amoType) {
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {
     ShmemAtomicSizeFetchThreadKernelImpl<PrvdType>(dest, destOffset, source, sourceOffset, val,
@@ -232,7 +228,7 @@ inline __device__ void ShmemAtomicSizeFetchWarpKernelImpl(const application::Sym
 template <>
 inline __device__ void ShmemAtomicSizeFetchWarpKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::MemoryRegion& source, size_t sourceOffset, void* val, void* compare,
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare,
     size_t bytes, int pe, core::atomicType amoType) {
   DISPATCH_PROVIDER_TYPE(ShmemAtomicSizeFetchWarpKernelImpl, dest, destOffset, source, sourceOffset,
                          val, compare, bytes, pe, amoType);

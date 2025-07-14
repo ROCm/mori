@@ -17,7 +17,7 @@ namespace shmem {
 template <>
 inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::P2P>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::MemoryRegion& source, size_t sourceOffset, size_t bytes, int pe) {
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe) {
   uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source.addr + sourceOffset);
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   core::ThreadCopy<uint8_t>(destPtr, srcPtr, bytes);
@@ -26,7 +26,7 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::P2
 template <>
 inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::P2P>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::MemoryRegion& source, size_t sourceOffset, size_t bytes, int pe) {
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe) {
   uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source.addr + sourceOffset);
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
@@ -207,7 +207,7 @@ inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportT
 template <>
 inline __device__ void ShmemAtomicSizeFetchThreadKernel<application::TransportType::P2P>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::MemoryRegion& source, size_t sourceOffset, void* val, void* compare,
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare,
     size_t bytes, int pe, core::atomicType amoType) {
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   switch (bytes) {
@@ -354,7 +354,7 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernel<application::TransportTy
 template <>
 inline __device__ void ShmemAtomicSizeFetchWarpKernel<application::TransportType::P2P>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::MemoryRegion& source, size_t sourceOffset, void* val, void* compare,
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare,
     size_t bytes, int pe, core::atomicType amoType) {
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {

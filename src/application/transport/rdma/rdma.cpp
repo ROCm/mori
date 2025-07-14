@@ -21,11 +21,11 @@ RdmaDevice* RdmaDeviceContext::GetRdmaDevice() { return device; }
 
 ibv_context* RdmaDeviceContext::GetIbvContext() { return GetRdmaDevice()->defaultContext; }
 
-application::MemoryRegion RdmaDeviceContext::RegisterMemoryRegion(void* ptr, size_t size,
-                                                                  int accessFlag) {
+application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegion(void* ptr, size_t size,
+                                                                          int accessFlag) {
   ibv_mr* mr = ibv_reg_mr(pd, ptr, size, accessFlag);
   mrPool.insert({ptr, mr});
-  application::MemoryRegion handle;
+  application::RdmaMemoryRegion handle;
   handle.addr = reinterpret_cast<uintptr_t>(ptr);
   handle.lkey = mr->lkey;
   handle.rkey = mr->rkey;
@@ -33,7 +33,7 @@ application::MemoryRegion RdmaDeviceContext::RegisterMemoryRegion(void* ptr, siz
   return handle;
 }
 
-void RdmaDeviceContext::DeRegisterMemoryRegion(void* ptr) {
+void RdmaDeviceContext::DeRegisterRdmaMemoryRegion(void* ptr) {
   if (mrPool.find(ptr) == mrPool.end()) return;
   ibv_mr* mr = mrPool[ptr];
   ibv_dereg_mr(mr);

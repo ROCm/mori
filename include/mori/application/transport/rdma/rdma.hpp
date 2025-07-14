@@ -19,13 +19,13 @@ namespace application {
   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | \
       IBV_ACCESS_REMOTE_ATOMIC
 
-enum class RdmaBackendType {
+enum class RdmaBackendType : uint32_t {
   Unknown = 0,
   DirectVerbs = 1,
   IBVerbs = 2,
 };
 
-enum class RdmaDeviceVendorId {
+enum class RdmaDeviceVendorId : uint32_t {
   Unknown = 0,
   Mellanox = 0x02c9,
   // Broadcom =
@@ -123,7 +123,7 @@ struct RdmaEndpoint {
 
 class RdmaDevice;
 
-struct MemoryRegion {
+struct RdmaMemoryRegion {
   uintptr_t addr;
   uint32_t lkey;
   uint32_t rkey;
@@ -138,9 +138,9 @@ class RdmaDeviceContext {
   RdmaDeviceContext(RdmaDevice* rdma_device, ibv_pd* in_pd);
   virtual ~RdmaDeviceContext();
 
-  virtual MemoryRegion RegisterMemoryRegion(void* ptr, size_t size,
-                                            int accessFlag = MR_DEFAULT_ACCESS_FLAG);
-  virtual void DeRegisterMemoryRegion(void* ptr);
+  virtual RdmaMemoryRegion RegisterRdmaMemoryRegion(void* ptr, size_t size,
+                                                    int accessFlag = MR_DEFAULT_ACCESS_FLAG);
+  virtual void DeRegisterRdmaMemoryRegion(void* ptr);
 
   // TODO: query gid entry by ibv_query_gid_table
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) {

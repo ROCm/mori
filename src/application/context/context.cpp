@@ -5,7 +5,7 @@
 
 #include <vector>
 
-#include "mori/application/utils/hip_check.hpp"
+#include "mori/application/utils/check.hpp"
 
 namespace mori {
 namespace application {

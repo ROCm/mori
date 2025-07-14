@@ -9,19 +9,19 @@
 namespace mori {
 namespace application {
 
-class MemoryRegionManager {
+class RdmaMemoryRegionManager {
  public:
-  MemoryRegionManager(RdmaDeviceContext& context);
-  ~MemoryRegionManager();
+  RdmaMemoryRegionManager(RdmaDeviceContext& context);
+  ~RdmaMemoryRegionManager();
 
-  MemoryRegion RegisterBuffer(void* ptr, size_t size);
+  RdmaMemoryRegion RegisterBuffer(void* ptr, size_t size);
   void DeRegisterBuffer(void* ptr);
 
-  MemoryRegion Get(void* ptr) const;
+  RdmaMemoryRegion Get(void* ptr) const;
 
  private:
   RdmaDeviceContext& context;
-  std::unordered_map<void*, MemoryRegion> mrPool;
+  std::unordered_map<void*, RdmaMemoryRegion> mrPool;
 };
 
 }  // namespace application

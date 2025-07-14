@@ -2,7 +2,7 @@
 
 #include <cassert>
 
-#include "mori/application/utils/hip_check.hpp"
+#include "mori/application/utils/check.hpp"
 #include "mori/shmem/shmem.hpp"
 
 using namespace mori::core;
@@ -31,8 +31,8 @@ __global__ void AtomicFetchThreadKernel(int myPe, const SymmMemObjPtr memObj) {
   int threadOffset = globalTid * sizeof(T);
 
   if (myPe == sendPe) {
-    MemoryRegion source = memObj->GetMemoryRegion(sendPe);
-    
+    RdmaMemoryRegion source = memObj->GetRdmaMemoryRegion(sendPe);
+
     ShmemAtomicTypeFetchThread<T>(memObj, threadOffset, source, threadOffset, sendPe, recvPe, recvPe, AMO_COMPARE_SWAP);
     __threadfence_system();
 

@@ -32,5 +32,14 @@ namespace application {
     assert(hipSuccess == result);                                          \
   } while (0)
 
+#define SYSCALL_RETURN_ZERO(stmt)                                                               \
+  do {                                                                                          \
+    auto _ret = (stmt);                                                                         \
+    if (_ret != 0) {                                                                            \
+      fprintf(stderr, "[%s:%d] syscall failed with %s\n", __FILE__, __LINE__, strerror(errno)); \
+      exit(-1);                                                                                 \
+    }                                                                                           \
+  } while (0)
+
 }  // namespace application
 }  // namespace mori

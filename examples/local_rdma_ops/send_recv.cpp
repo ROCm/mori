@@ -76,13 +76,13 @@ void LocalRdmaOps() {
   // 4 Register buffer
   void* send_buff;
   HIP_RUNTIME_CHECK(hipMalloc(&send_buff, msg_size));
-  MemoryRegion mr_handle_1 =
-      device_context_1->RegisterMemoryRegion(send_buff, msg_size, MR_ACCESS_FLAG);
+  RdmaMemoryRegion mr_handle_1 =
+      device_context_1->RegisterRdmaMemoryRegion(send_buff, msg_size, MR_ACCESS_FLAG);
 
   void* recv_buff;
   HIP_RUNTIME_CHECK(hipMalloc(&recv_buff, msg_size));
-  MemoryRegion mr_handle_2 =
-      device_context_2->RegisterMemoryRegion(recv_buff, msg_size, MR_ACCESS_FLAG);
+  RdmaMemoryRegion mr_handle_2 =
+      device_context_2->RegisterRdmaMemoryRegion(recv_buff, msg_size, MR_ACCESS_FLAG);
 
   IbgdaReadWriteReq send_req;
   send_req.qp_handle.qpn = endpoint_1.handle.qpn;
@@ -130,8 +130,8 @@ void LocalRdmaOps() {
   }
 
   // 8 Finalize
-  device_context_1->DeRegisterMemoryRegion(send_buff);
-  device_context_2->DeRegisterMemoryRegion(recv_buff);
+  device_context_1->DeRegisterRdmaMemoryRegion(send_buff);
+  device_context_2->DeRegisterRdmaMemoryRegion(recv_buff);
 }
 
 int main() { LocalRdmaOps(); }

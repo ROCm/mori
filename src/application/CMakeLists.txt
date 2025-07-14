@@ -19,6 +19,7 @@ add_library(
     transport/rdma/rdma.cpp
     transport/rdma/providers/mlx5/mlx5.cpp
     transport/rdma/providers/ibverbs/ibverbs.cpp
+    transport/tcp/tcp.cpp
     memory/symmetric_memory.cpp
     memory/memory_region.cpp
     context/context.cpp

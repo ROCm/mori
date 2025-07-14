@@ -3,7 +3,7 @@
 
 #include <cassert>
 
-#include "mori/application/utils/hip_check.hpp"
+#include "mori/application/utils/check.hpp"
 #include "mori/shmem/shmem.hpp"
 
 using namespace mori::core;

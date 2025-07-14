@@ -6,7 +6,7 @@
 
 #include <iostream>
 
-#include "mori/application/utils/hip_check.hpp"
+#include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
 #include "src/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
 #include "src/application/transport/rdma/providers/mlx5/mlx5_prm.hpp"
