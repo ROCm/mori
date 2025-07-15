@@ -1,5 +1,3 @@
-#include <fcntl.h>
-
 #include <cassert>
 #include <vector>
 
@@ -15,7 +13,7 @@ void TestTcpContext() {
 
   context1.Listen();
   context2.Listen();
-
+  printf("port 1 %d port 2 %d\n", context1.GetPort(), context2.GetPort());
   assert((context1.GetPort() > 0) && (context2.GetPort() > 0));
   assert((context1.GetListenFd() >= 0) && (context2.GetListenFd() >= 0));
 

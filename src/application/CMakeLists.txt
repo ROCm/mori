@@ -23,6 +23,7 @@ add_library(
     memory/symmetric_memory.cpp
     memory/memory_region.cpp
     context/context.cpp
+    utils/serdes.cpp
 )
 
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR}/include)

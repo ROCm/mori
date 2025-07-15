@@ -41,5 +41,17 @@ namespace application {
     }                                                                                           \
   } while (0)
 
+#define SYSCALL_RETURN_ZERO_IGNORE_ERROR(stmt, ignored)                                           \
+  do {                                                                                            \
+    auto _ret = (stmt);                                                                           \
+    if (_ret != 0) {                                                                              \
+      int err = errno;                                                                            \
+      if (err != ignored) {                                                                       \
+        fprintf(stderr, "[%s:%d] syscall failed with %s\n", __FILE__, __LINE__, strerror(errno)); \
+        exit(-1);                                                                                 \
+      }                                                                                           \
+    }                                                                                             \
+  } while (0)
+
 }  // namespace application
 }  // namespace mori

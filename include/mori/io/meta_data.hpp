@@ -4,7 +4,7 @@
 #include "mori/application/transport/rdma/rdma.hpp"
 
 namespace mori {
-namespace ioengine {
+namespace io {
 
 enum class BackendType : uint32_t {
   Unknown = 0,
@@ -39,17 +39,20 @@ using EngineKey = std::string;
 
 struct EngineDesc {
   EngineKey key;
+  int gpuId;
   std::string hostname;
   BackendBitmap backends;
+  application::TCPContextHandle tcpHandle;
 };
 
 struct MemoryDesc {
   EngineKey engineKey;
   MemoryLocation loc;
+  int gpuId;
   application::P2PMemoryRegion p2p;
   application::RdmaMemoryRegion rdma;
   BackendBitmap backends;
 };
 
-}  // namespace ioengine
+}  // namespace io
 }  // namespace mori

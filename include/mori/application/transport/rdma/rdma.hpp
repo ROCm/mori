@@ -74,6 +74,8 @@ struct RdmaEndpointHandle {
   EthernetEndpointHandle eth;
 };
 
+using RdmaEndpointHandleVec = std::vector<RdmaEndpointHandle>;
+
 struct WorkQueueHandle {
   uint32_t postIdx{0};
   uint32_t readyIdx{0};

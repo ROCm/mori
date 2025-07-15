@@ -20,7 +20,7 @@ int TCPEndpoint::Send(const void* buf, size_t len) {
   const char* p = static_cast<const char*>(buf);
   while (len > 0) {
     size_t n = send(handle.fd, p, len, 0);
-    if (n < 0) return errno;
+    if (n < 0) return n;
     p += n;
     len -= n;
   }
@@ -31,9 +31,7 @@ int TCPEndpoint::Recv(void* buf, size_t len) {
   char* p = static_cast<char*>(buf);
   while (len > 0) {
     size_t n = ::recv(handle.fd, p, len, 0);
-    if (n < 0) return errno;
-    // TODO: handle  n == 0
-    if (n == 0) return 0;
+    if (n <= 0) return n;
     p += n;
     len -= n;
   }
@@ -45,7 +43,7 @@ int TCPEndpoint::Recv(void* buf, size_t len) {
 /* ---------------------------------------------------------------------------------------------- */
 TCPContext::TCPContext(std::string host, uint16_t port) {
   handle.host = host;
-  handle.port = (port >= 0) ? port : 0;
+  handle.port = port;
 }
 
 TCPContext::~TCPContext() { Close(); }
@@ -121,7 +119,7 @@ TCPEndpointHandleVec TCPContext::Accept() {
 
 void TCPContext::CloseEndpoint(TCPEndpointHandle ep) {
   if (endpoints.find(ep.fd) == endpoints.end()) return;
-  SYSCALL_RETURN_ZERO(shutdown(ep.fd, SHUT_WR));
+  SYSCALL_RETURN_ZERO_IGNORE_ERROR(shutdown(ep.fd, SHUT_WR), ENOTCONN);
   SYSCALL_RETURN_ZERO(close(ep.fd));
   endpoints.erase(ep.fd);
 }

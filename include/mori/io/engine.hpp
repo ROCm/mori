@@ -7,13 +7,16 @@
 #include "mori/io/meta_data.hpp"
 
 namespace mori {
-namespace ioengine {
+namespace io {
 
 struct IOEngineConfig {
   std::string host;
-  int port;
+  uint16_t port;
+  int gpuId;
   BackendTypeVec backends;
 };
+
+using RdmaEpPair = std::pair<application::RdmaEndpointHandle, application::RdmaEndpointHandle>;
 
 class IOEngine {
  public:
@@ -34,18 +37,34 @@ class IOEngine {
   void StartControlPlane();
   void ShutdownControlPlane();
 
+  void BuildRdmaConnection(const application::TCPEndpointHandle&, bool isInitiator);
+
+  void InitDataPlane();
+
  public:
+  // Config and descriptors
   IOEngineConfig config;
   EngineDesc desc;
 
  private:
-  std::unique_ptr<application::TCPContext> tcpContext;
+  // Meta data store
+  std::unordered_map<EngineKey, EngineDesc> engineKV;
+  std::unordered_map<EngineKey, RdmaEpPair> rdmaEpKV;
+  // std::unordered_map<MemoryDescId, MemoryDesc> memKV;
 
+ private:
   // Control plane related members
-  int epfd{-1};
+  std::unique_ptr<application::TCPContext> tcpContext;
+  std::unordered_map<int, application::TCPEndpointHandle> tcpEpKV;
+  int epollFd{-1};
   std::thread ctrlPlaneThd;
   std::atomic<bool> running{false};
+
+  // Data plane related members
+  std::unique_ptr<application::RdmaContext> rdmaContext;
+  int rdmaPortId{-1};
+  application::RdmaDeviceContext* rdmaDeviceContext;
 };
 
-}  // namespace ioengine
+}  // namespace io
 }  // namespace mori
