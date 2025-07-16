@@ -15,6 +15,8 @@ class IBVerbsDeviceContext : public RdmaDeviceContext {
   virtual void ConnectEndpoint(const RdmaEndpointHandle& local,
                                const RdmaEndpointHandle& remote) override;
 
+  ibv_qp* GetQp() const;
+
  private:
   std::unordered_map<void*, std::unique_ptr<ibv_cq>> cqPool;
   std::unordered_map<uint32_t, std::unique_ptr<ibv_qp>> qpPool;

@@ -1,5 +1,6 @@
 #include "mori/io/engine.hpp"
 
+#include <infiniband/verbs.h>
 #include <sys/epoll.h>
 
 #include "mori/application/utils/check.hpp"
@@ -36,7 +37,7 @@ EngineDesc IOEngine::GetEngineDesc() {
   return desc;
 }
 
-application::RdmaEndpointHandle IOEngine::CreateRdmaEndpoint() {
+application::RdmaEndpoint IOEngine::CreateRdmaEndpoint() {
   application::RdmaEndpointConfig config;
   config.portId = devicePort.second;
   config.gidIdx = 1;
@@ -44,70 +45,97 @@ application::RdmaEndpointHandle IOEngine::CreateRdmaEndpoint() {
   config.maxCqeNum = 1024;
   config.alignment = 4096;
   application::RdmaEndpoint rdmaEp = rdmaDeviceContext->CreateRdmaEndpoint(config);
-  return rdmaEp.handle;
+  return rdmaEp;
 }
-
-// RdmaEpPair IOEngine::BuildRdmaConnection(const application::TCPEndpointHandle& tcpEph,
-//                                          bool isInitiator) {
-//   // exchange meta data
-//   application::RdmaEndpointConfig config;
-//   config.portId = rdmaPortId;
-//   config.gidIdx = 1;
-//   config.maxMsgsNum = 1024;
-//   config.maxCqeNum = 1024;
-//   config.alignment = 4096;
-//   application::RdmaEndpoint rdmaEp = rdmaDeviceContext->CreateRdmaEndpoint(config);
-
-//   // Exchange rdma endpoint
-//   application::TCPEndpoint tcpEp(tcpEph);
-//   application::RdmaEndpointHandle localRdmaEph = rdmaEp.handle;
-//   application::RdmaEndpointHandle remoteRdmaEph;
-//   application::RdmaEndpointHandlePacker packer;
-
-//   size_t packedSize = packer.PackedSizeCompact();
-//   std::vector<char> packed(packedSize);
-
-//   // send rdma endpoint
-//   if (isInitiator) {
-//     packer.PackCompact(localRdmaEph, packed.data());
-//     SYSCALL_RETURN_ZERO(tcpEp.Send(packed.data(), packedSize));
-//     SYSCALL_RETURN_ZERO(tcpEp.Recv(packed.data(), packedSize));
-//     packer.UnpackCompact(remoteRdmaEph, packed.data());
-//   } else {
-//     SYSCALL_RETURN_ZERO(tcpEp.Recv(packed.data(), packedSize));
-//     packer.UnpackCompact(remoteRdmaEph, packed.data());
-//     packer.PackCompact(localRdmaEph, packed.data());
-//     SYSCALL_RETURN_ZERO(tcpEp.Send(packed.data(), packedSize));
-//   }
-
-//   // Connect
-//   rdmaDeviceContext->ConnectEndpoint(localRdmaEph, remoteRdmaEph);
-//   return RdmaEpPair{localRdmaEph, remoteRdmaEph};
-// }
 
 void IOEngine::RegisterRemoteEngine(EngineDesc remote) {
   if (engineKV.find(remote.key) != engineKV.end()) return;
   application::TCPEndpointHandle tcpEph =
       tcpContext->Connect(remote.tcpHandle.host, remote.tcpHandle.port);
 
-  Protocol protocol(tcpEph);
-  application::RdmaEndpointHandle localRdmaEph = CreateRdmaEndpoint();
-  protocol.WriteMessageRegEngine(MessageRegEngine{GetEngineDesc(), localRdmaEph});
-  MessageHeader hdr = protocol.ReadMessageHeader();
-  assert(hdr.type == MessageType::RegEngine);
-  MessageRegEngine msg = protocol.ReadMessageRegEngine(hdr.len);
-  rdmaDeviceContext->ConnectEndpoint(localRdmaEph, msg.rdmaEph);
+  BackendBitmap commonBes = desc.backends.FindCommonBackends(remote.backends);
+  if (commonBes.IsAvailableBackend(BackendType::RDMA)) {
+    Protocol protocol(tcpEph);
+    application::RdmaEndpoint localRdmaEp = CreateRdmaEndpoint();
+    protocol.WriteMessageRegEngine(MessageRegEngine{GetEngineDesc(), localRdmaEp.handle});
+    MessageHeader hdr = protocol.ReadMessageHeader();
+    assert(hdr.type == MessageType::RegEngine);
+    MessageRegEngine msg = protocol.ReadMessageRegEngine(hdr.len);
+    rdmaDeviceContext->ConnectEndpoint(localRdmaEp.handle, msg.rdmaEph);
 
-  engineKV.insert({remote.key, remote});
-  rdmaEpKV.insert({remote.key, {}});
-  rdmaEpKV[remote.key].push_back({localRdmaEph, msg.rdmaEph});
+    engineKV.insert({remote.key, remote});
+    rdmaEpKV.insert({remote.key, {}});
+    rdmaEpKV[remote.key].push_back({localRdmaEp, msg.rdmaEph});
+  }
+
   tcpContext->CloseEndpoint(tcpEph);
 }
 
 void IOEngine::DeRegisterRemoteEngine(EngineDesc remote) {
-  // TODO: cleanup other resources such as qp pool and tcp conn
   engineKV.erase(remote.key);
   rdmaEpKV.erase(remote.key);
+}
+
+MemoryDesc IOEngine::RegisterMemory(void* data, size_t length, int deviceId,
+                                    MemoryLocationType loc) {
+  MemoryDesc memDesc;
+  memDesc.engineKey = desc.key;
+  memDesc.id = nextMemUid.fetch_add(1, std::memory_order_relaxed);
+  memDesc.deviceId = deviceId;
+  memDesc.data = data;
+  memDesc.length = length;
+  memDesc.loc = loc;
+  memPool.insert({memDesc.id, memDesc});
+
+  if (desc.backends.IsAvailableBackend(BackendType::RDMA)) {
+    application::RdmaMemoryRegion rdmaMr =
+        rdmaDeviceContext->RegisterRdmaMemoryRegion(data, length);
+    memDesc.backendDesc.rdmaMr = rdmaMr;
+  }
+  return memDesc;
+}
+
+void IOEngine::DeRegisterMemory(const MemoryDesc& desc) {
+  memPool.erase(desc.id);
+  rdmaDeviceContext->DeRegisterRdmaMemoryRegion(desc.data);
+}
+
+void IOEngine::Read(MemoryDesc local, size_t localOffset, MemoryDesc remote, size_t remoteOffset,
+                    size_t size) {
+  assert((engineKV.find(remote.engineKey) != engineKV.end()) && "register remote engine first");
+  assert((memPool.find(local.id) != memPool.end()) && "register local memory first");
+
+  if (rdmaEpKV.find(remote.engineKey) == rdmaEpKV.end()) {
+    // TODO make connection
+    assert(false && "lazy connection built up has not yet implemented");
+  }
+
+  // TODO: add selection logics when qp pool feature is ready
+  application::RdmaEndpoint ep = rdmaEpKV[remote.engineKey][0].first;
+
+  ibv_sge sge{};
+  sge.addr = reinterpret_cast<uint64_t>(local.data) + localOffset;
+  sge.length = size;
+  sge.lkey = local.backendDesc.rdmaMr.lkey;
+
+  ibv_send_wr wr{};
+  ibv_send_wr* bad_wr = nullptr;
+  wr.wr_id = 1;
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+  wr.opcode = IBV_WR_RDMA_READ;
+  wr.send_flags = IBV_SEND_SIGNALED;
+  wr.wr.rdma.remote_addr = reinterpret_cast<uint64_t>(remote.data) + remoteOffset;
+  wr.wr.rdma.rkey = remote.backendDesc.rdmaMr.lkey;
+
+  assert(!ibv_post_send(ep.ibvHandle.qp, &wr, &bad_wr) && "ibv_post_send RDMA READ");
+  ibv_wc wc{};
+  while (ibv_poll_cq(ep.ibvHandle.cq, 1, &wc) == 0) {
+    usleep(1000);
+  }
+  std::string errStr = ibv_wc_status_str(wc.status);
+  printf("%s\n", errStr.c_str());
+  assert(wc.status == IBV_WC_SUCCESS);
 }
 
 void IOEngine::StartControlPlane() {
@@ -156,16 +184,20 @@ void IOEngine::HandleControlPlaneProtocol(int fd) {
   switch (hdr.type) {
     case MessageType::RegEngine: {
       MessageRegEngine msg = protocol.ReadMessageRegEngine(hdr.len);
-      application::RdmaEndpointHandle localRdmaEph = CreateRdmaEndpoint();
-      protocol.WriteMessageRegEngine(MessageRegEngine{GetEngineDesc(), localRdmaEph});
-      rdmaDeviceContext->ConnectEndpoint(localRdmaEph, msg.rdmaEph);
 
-      engineKV.insert({msg.engineDesc.key, msg.engineDesc});
-      if (rdmaEpKV.find(msg.engineDesc.key) == rdmaEpKV.end())
-        rdmaEpKV.insert({msg.engineDesc.key, {}});
-      rdmaEpKV[msg.engineDesc.key].push_back({localRdmaEph, msg.rdmaEph});
+      BackendBitmap commonBes = desc.backends.FindCommonBackends(msg.engineDesc.backends);
+      if (commonBes.IsAvailableBackend(BackendType::RDMA)) {
+        application::RdmaEndpoint localRdmaEp = CreateRdmaEndpoint();
+        protocol.WriteMessageRegEngine(MessageRegEngine{GetEngineDesc(), localRdmaEp.handle});
+        rdmaDeviceContext->ConnectEndpoint(localRdmaEp.handle, msg.rdmaEph);
 
-      SYSCALL_RETURN_ZERO(epoll_ctl(epollFd, EPOLL_CTL_DEL, fd, NULL));
+        engineKV.insert({msg.engineDesc.key, msg.engineDesc});
+        if (rdmaEpKV.find(msg.engineDesc.key) == rdmaEpKV.end())
+          rdmaEpKV.insert({msg.engineDesc.key, {}});
+        rdmaEpKV[msg.engineDesc.key].push_back({localRdmaEp, msg.rdmaEph});
+
+        SYSCALL_RETURN_ZERO(epoll_ctl(epollFd, EPOLL_CTL_DEL, fd, NULL));
+      }
       tcpContext->CloseEndpoint(eph);
       tcpEpKV.erase(fd);
       break;
@@ -204,6 +236,7 @@ void IOEngine::InitDataPlane() {
     assert(activeDevicePortList.size() > 0);
     devicePort = activeDevicePortList[desc.gpuId % activeDevicePortList.size()];
     application::RdmaDevice* device = devicePort.first;
+    printf("%d nic id\n", desc.gpuId % activeDevicePortList.size());
     rdmaDeviceContext = device->CreateRdmaDeviceContext();
   }
 

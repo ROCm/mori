@@ -14,6 +14,7 @@ struct BackendBitmap {
   uint64_t bits{0};
 
   BackendBitmap() = default;
+  BackendBitmap(uint64_t backendBits) : bits(backendBits) {}
   BackendBitmap(BackendTypeVec availableBackends) {
     for (auto& be : availableBackends) SetBackend(be);
   }
@@ -23,12 +24,17 @@ struct BackendBitmap {
   inline void SetBackend(BackendType type) { bits |= GetBackendMask(type); }
   inline bool IsAvailableBackend(BackendType type) { return GetBackendMask(type) & bits; }
 
+  BackendBitmap FindCommonBackends(const BackendBitmap& rhs) {
+    return BackendBitmap(bits & rhs.bits);
+  }
+
   constexpr bool operator==(const BackendBitmap& rhs) const noexcept { return bits == rhs.bits; }
 
   MSGPACK_DEFINE(bits);
 };
 
 using EngineKey = std::string;
+using MemoryUniqueId = uint32_t;
 
 struct EngineDesc {
   EngineKey key;
@@ -40,15 +46,21 @@ struct EngineDesc {
   MSGPACK_DEFINE(key, gpuId, hostname, backends, tcpHandle);
 };
 
+struct MemoryBackendDescs {
+  application::RdmaMemoryRegion rdmaMr;
+  MSGPACK_DEFINE(rdmaMr);
+};
+
 struct MemoryDesc {
   EngineKey engineKey;
-  MemoryLocation loc;
-  int gpuId;
-  application::RdmaMemoryRegion rdma;
-  // application::P2PMemoryRegion p2p;
-  BackendBitmap backends;
+  MemoryUniqueId id;
+  int deviceId;
+  void* data;
+  size_t length;
+  MemoryLocationType loc;
+  MemoryBackendDescs backendDesc;
 
-  MSGPACK_DEFINE(engineKey, loc, gpuId, rdma, backends);
+  MSGPACK_DEFINE(engineKey, id, deviceId, length, loc, backendDesc);
 };
 
 }  // namespace io

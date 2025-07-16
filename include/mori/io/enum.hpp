@@ -12,7 +12,7 @@ enum class BackendType : uint32_t {
 
 using BackendTypeVec = std::vector<BackendType>;
 
-enum class MemoryLocation : uint32_t {
+enum class MemoryLocationType : uint32_t {
   Unknown = 0,
   CPU = 1,
   GPU = 2,

@@ -73,7 +73,7 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   attr.rq_psn = 0;
   attr.max_dest_rd_atomic = 1;
   attr.min_rnr_timer = 12;
-  attr.ah_attr.dlid = local.ib.lid;
+  attr.ah_attr.dlid = remote.ib.lid;
   attr.ah_attr.sl = 0;
   attr.ah_attr.src_path_bits = 0;
   attr.ah_attr.port_num = local.portId;
@@ -99,6 +99,8 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
           IBV_QP_MAX_QP_RD_ATOMIC;
   ibv_modify_qp(qp, &attr, flags);
 }
+
+ibv_qp* IBVerbsDeviceContext::GetQp() const {}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          IBVerbsDevice                                         */

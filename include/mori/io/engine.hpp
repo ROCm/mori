@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <thread>
 #include <vector>
 
@@ -16,8 +17,9 @@ struct IOEngineConfig {
   BackendTypeVec backends;
 };
 
-using RdmaEpPair = std::pair<application::RdmaEndpointHandle, application::RdmaEndpointHandle>;
+using RdmaEpPair = std::pair<application::RdmaEndpoint, application::RdmaEndpointHandle>;
 using RdmaEpPairVec = std::vector<RdmaEpPair>;
+using MemoryBackendDescsPool = std::unordered_map<MemoryUniqueId, MemoryBackendDescs>;
 
 class IOEngine {
  public:
@@ -28,19 +30,18 @@ class IOEngine {
   void RegisterRemoteEngine(EngineDesc);
   void DeRegisterRemoteEngine(EngineDesc);
 
-  //   MemoryDesc RegisterMemory(void* data, size_t length, MemLoc loc);
-  //   void DeRegisterMemory(MemoryDesc);
+  MemoryDesc RegisterMemory(void* data, size_t length, int device, MemoryLocationType loc);
+  void DeRegisterMemory(const MemoryDesc& desc);
 
-  //   Status Write(MemoryDesc local, MemoryDesc remote, EngineDesc agent);
+  void Read(MemoryDesc local, size_t localOffset, MemoryDesc remote, size_t remoteOffset,
+            size_t size);
 
-  // Data plane methods
  private:
-  application::RdmaEndpointHandle CreateRdmaEndpoint();
+  // Data plane methods
+  application::RdmaEndpoint CreateRdmaEndpoint();
 
  private:
   // Control plane methods
-  RdmaEpPair BuildRdmaConnection(const application::TCPEndpointHandle&, bool isInitiator);
-
   void AcceptRemoteEngineConn();
   void HandleControlPlaneProtocol(int fd);
   void ControlPlaneLoop();
@@ -58,7 +59,10 @@ class IOEngine {
   // Meta data store
   std::unordered_map<EngineKey, EngineDesc> engineKV;
   std::unordered_map<EngineKey, RdmaEpPairVec> rdmaEpKV;
-  // std::unordered_map<MemoryDescId, MemoryDesc> memKV;
+
+  // memory meta data
+  std::atomic<uint32_t> nextMemUid;
+  std::unordered_map<MemoryUniqueId, MemoryDesc> memPool;
 
  private:
   // Control plane related members
@@ -70,8 +74,8 @@ class IOEngine {
 
   // Data plane related members
   application::ActiveDevicePort devicePort;
-  std::unique_ptr<application::RdmaContext> rdmaContext;
   application::RdmaDeviceContext* rdmaDeviceContext;
+  std::unique_ptr<application::RdmaContext> rdmaContext;
 };
 
 }  // namespace io

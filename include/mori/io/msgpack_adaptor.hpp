@@ -11,20 +11,20 @@ MSGPACK_API_VERSION_NAMESPACE(MSGPACK_DEFAULT_API_NS) {
   namespace adaptor {
 
   template <>
-  struct pack<mori::io::MemoryLocation> {
+  struct pack<mori::io::MemoryLocationType> {
     template <typename Stream>
     msgpack::packer<Stream>& operator()(msgpack::packer<Stream>& o,
-                                        mori::io::MemoryLocation loc) const {
+                                        mori::io::MemoryLocationType loc) const {
       o.pack(static_cast<uint32_t>(loc));
       return o;
     }
   };
 
   template <>
-  struct convert<mori::io::MemoryLocation> {
+  struct convert<mori::io::MemoryLocationType> {
     const msgpack::object& operator()(const msgpack::object& o,
-                                      mori::io::MemoryLocation& loc) const {
-      loc = static_cast<mori::io::MemoryLocation>(o.as<uint32_t>());
+                                      mori::io::MemoryLocationType& loc) const {
+      loc = static_cast<mori::io::MemoryLocationType>(o.as<uint32_t>());
       return o;
     }
   };
