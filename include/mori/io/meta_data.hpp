@@ -1,25 +1,14 @@
 #pragma once
 
+#include <msgpack.hpp>
+
 #include "mori/application/transport/p2p/p2p.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
+#include "mori/io/enum.hpp"
+#include "mori/io/msgpack_adaptor.hpp"
 
 namespace mori {
 namespace io {
-
-enum class BackendType : uint32_t {
-  Unknown = 0,
-  XGMI = 1,
-  RDMA = 2,
-  TCP = 3,
-};
-
-using BackendTypeVec = std::vector<BackendType>;
-
-enum class MemoryLocation : uint32_t {
-  Unknown = 0,
-  CPU = 1,
-  GPU = 2,
-};
 
 struct BackendBitmap {
   uint64_t bits{0};
@@ -33,6 +22,10 @@ struct BackendBitmap {
 
   inline void SetBackend(BackendType type) { bits |= GetBackendMask(type); }
   inline bool IsAvailableBackend(BackendType type) { return GetBackendMask(type) & bits; }
+
+  constexpr bool operator==(const BackendBitmap& rhs) const noexcept { return bits == rhs.bits; }
+
+  MSGPACK_DEFINE(bits);
 };
 
 using EngineKey = std::string;
@@ -43,15 +36,19 @@ struct EngineDesc {
   std::string hostname;
   BackendBitmap backends;
   application::TCPContextHandle tcpHandle;
+
+  MSGPACK_DEFINE(key, gpuId, hostname, backends, tcpHandle);
 };
 
 struct MemoryDesc {
   EngineKey engineKey;
   MemoryLocation loc;
   int gpuId;
-  application::P2PMemoryRegion p2p;
   application::RdmaMemoryRegion rdma;
+  // application::P2PMemoryRegion p2p;
   BackendBitmap backends;
+
+  MSGPACK_DEFINE(engineKey, loc, gpuId, rdma, backends);
 };
 
 }  // namespace io

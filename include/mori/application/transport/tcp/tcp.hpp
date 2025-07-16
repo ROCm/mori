@@ -39,10 +39,15 @@ struct TCPContextHandle {
   std::string host{};
   uint16_t port{0};
   int listenFd{-1};
+
+  constexpr bool operator==(const TCPContextHandle& rhs) const noexcept {
+    return (host == rhs.host) && (port == rhs.port) && (listenFd == rhs.listenFd);
+  }
 };
 
 class TCPContext {
  public:
+  // TODO: delete copy ctor
   TCPContext(std::string ip, uint16_t port = 0);
   ~TCPContext();
 

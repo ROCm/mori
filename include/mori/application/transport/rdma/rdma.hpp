@@ -58,11 +58,19 @@ struct RdmaEndpointConfig {
 
 struct InfiniBandEndpointHandle {
   uint32_t lid{0};
+  constexpr bool operator==(const InfiniBandEndpointHandle& rhs) const noexcept {
+    return lid == rhs.lid;
+  }
 };
 
 struct EthernetEndpointHandle {
   uint8_t gid[16];
   uint8_t mac[ETHERNET_LL_SIZE];
+
+  constexpr bool operator==(const EthernetEndpointHandle& rhs) const noexcept {
+    return std::equal(std::begin(gid), std::end(gid), std::begin(rhs.gid)) &&
+           std::equal(std::begin(mac), std::end(mac), std::begin(rhs.mac));
+  }
 };
 
 // TODO: add gid type
@@ -72,6 +80,11 @@ struct RdmaEndpointHandle {
   uint32_t portId{0};
   InfiniBandEndpointHandle ib;
   EthernetEndpointHandle eth;
+
+  constexpr bool operator==(const RdmaEndpointHandle& rhs) const noexcept {
+    return psn == rhs.psn && qpn == rhs.qpn && portId == rhs.portId && ib == rhs.ib &&
+           eth == rhs.eth;
+  }
 };
 
 using RdmaEndpointHandleVec = std::vector<RdmaEndpointHandle>;

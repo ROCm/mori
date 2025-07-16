@@ -15,3 +15,12 @@ add_executable(
 target_include_directories(test_engine PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(test_engine PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_engine mori_application mori_io)
+
+add_executable(
+    test_protocol
+    io/test_protocol.cpp
+)
+
+target_include_directories(test_protocol PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(test_protocol PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_protocol mori_application mori_io)

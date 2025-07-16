@@ -17,6 +17,7 @@ struct IOEngineConfig {
 };
 
 using RdmaEpPair = std::pair<application::RdmaEndpointHandle, application::RdmaEndpointHandle>;
+using RdmaEpPairVec = std::vector<RdmaEpPair>;
 
 class IOEngine {
  public:
@@ -32,12 +33,19 @@ class IOEngine {
 
   //   Status Write(MemoryDesc local, MemoryDesc remote, EngineDesc agent);
 
+  // Data plane methods
  private:
+  application::RdmaEndpointHandle CreateRdmaEndpoint();
+
+ private:
+  // Control plane methods
+  RdmaEpPair BuildRdmaConnection(const application::TCPEndpointHandle&, bool isInitiator);
+
+  void AcceptRemoteEngineConn();
+  void HandleControlPlaneProtocol(int fd);
   void ControlPlaneLoop();
   void StartControlPlane();
   void ShutdownControlPlane();
-
-  void BuildRdmaConnection(const application::TCPEndpointHandle&, bool isInitiator);
 
   void InitDataPlane();
 
@@ -49,7 +57,7 @@ class IOEngine {
  private:
   // Meta data store
   std::unordered_map<EngineKey, EngineDesc> engineKV;
-  std::unordered_map<EngineKey, RdmaEpPair> rdmaEpKV;
+  std::unordered_map<EngineKey, RdmaEpPairVec> rdmaEpKV;
   // std::unordered_map<MemoryDescId, MemoryDesc> memKV;
 
  private:
@@ -61,8 +69,8 @@ class IOEngine {
   std::atomic<bool> running{false};
 
   // Data plane related members
+  application::ActiveDevicePort devicePort;
   std::unique_ptr<application::RdmaContext> rdmaContext;
-  int rdmaPortId{-1};
   application::RdmaDeviceContext* rdmaDeviceContext;
 };
 
