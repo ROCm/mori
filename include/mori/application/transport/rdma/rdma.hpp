@@ -169,8 +169,6 @@ class RdmaDeviceContext {
   }
 
   RdmaDevice* GetRdmaDevice();
-
- protected:
   ibv_context* GetIbvContext();
 
  protected:
@@ -198,6 +196,7 @@ class RdmaDevice {
   std::string Name() const;
 
   virtual RdmaDeviceContext* CreateRdmaDeviceContext();
+  ibv_context* GetIbvContext() const { return defaultContext; }
 
  protected:
   friend class RdmaDeviceContext;

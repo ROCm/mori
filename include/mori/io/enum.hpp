@@ -18,5 +18,10 @@ enum class MemoryLocationType : uint32_t {
   GPU = 2,
 };
 
+enum class StatusCode : uint32_t {
+  SUCCESS = 0,
+  ERROR = 1,
+};
+
 }  // namespace io
 }  // namespace mori

@@ -63,5 +63,9 @@ struct MemoryDesc {
   MSGPACK_DEFINE(engineKey, id, deviceId, length, loc, backendDesc);
 };
 
+struct TransferStatus {
+  StatusCode code;
+};
+
 }  // namespace io
 }  // namespace mori

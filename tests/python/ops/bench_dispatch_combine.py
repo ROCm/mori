@@ -162,10 +162,10 @@ def _bench_dispatch_combine(
     world_size,
     port,
     data_type=torch.bfloat16,
-    hidden_dim=7168,
+    hidden_dim=4096,
     scale_dim=0,
     scale_type_size=0,
-    max_num_inp_token_per_rank=128,
+    max_num_inp_token_per_rank=64,
     num_experts_per_rank=32,
     num_experts_per_token=8,
 ):

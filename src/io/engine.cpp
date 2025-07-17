@@ -97,11 +97,13 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t length, int deviceId,
 
 void IOEngine::DeRegisterMemory(const MemoryDesc& desc) {
   memPool.erase(desc.id);
-  rdmaDeviceContext->DeRegisterRdmaMemoryRegion(desc.data);
+  if (GetEngineDesc().backends.IsAvailableBackend(BackendType::RDMA)) {
+    rdmaDeviceContext->DeRegisterRdmaMemoryRegion(desc.data);
+  }
 }
 
 void IOEngine::Read(MemoryDesc local, size_t localOffset, MemoryDesc remote, size_t remoteOffset,
-                    size_t size) {
+                    size_t size, TransferStatus& status) {
   assert((engineKV.find(remote.engineKey) != engineKV.end()) && "register remote engine first");
   assert((memPool.find(local.id) != memPool.end()) && "register local memory first");
 
@@ -120,7 +122,7 @@ void IOEngine::Read(MemoryDesc local, size_t localOffset, MemoryDesc remote, siz
 
   ibv_send_wr wr{};
   ibv_send_wr* bad_wr = nullptr;
-  wr.wr_id = 1;
+  wr.wr_id = reinterpret_cast<uint64_t>(&status);
   wr.sg_list = &sge;
   wr.num_sge = 1;
   wr.opcode = IBV_WR_RDMA_READ;
@@ -129,13 +131,6 @@ void IOEngine::Read(MemoryDesc local, size_t localOffset, MemoryDesc remote, siz
   wr.wr.rdma.rkey = remote.backendDesc.rdmaMr.lkey;
 
   assert(!ibv_post_send(ep.ibvHandle.qp, &wr, &bad_wr) && "ibv_post_send RDMA READ");
-  ibv_wc wc{};
-  while (ibv_poll_cq(ep.ibvHandle.cq, 1, &wc) == 0) {
-    usleep(1000);
-  }
-  std::string errStr = ibv_wc_status_str(wc.status);
-  printf("%s\n", errStr.c_str());
-  assert(wc.status == IBV_WC_SUCCESS);
 }
 
 void IOEngine::StartControlPlane() {

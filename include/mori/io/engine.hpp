@@ -34,7 +34,7 @@ class IOEngine {
   void DeRegisterMemory(const MemoryDesc& desc);
 
   void Read(MemoryDesc local, size_t localOffset, MemoryDesc remote, size_t remoteOffset,
-            size_t size);
+            size_t size, TransferStatus& status);
 
  private:
   // Data plane methods
@@ -76,6 +76,8 @@ class IOEngine {
   application::ActiveDevicePort devicePort;
   application::RdmaDeviceContext* rdmaDeviceContext;
   std::unique_ptr<application::RdmaContext> rdmaContext;
+
+  std::thread rdmaPollThd;
 };
 
 }  // namespace io
