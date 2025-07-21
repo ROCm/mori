@@ -26,6 +26,7 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
   if (globalThdId < args.config.worldSize) {
     // Set remote flag after all copies are done
     shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
+    args.combineGridBarrier[0] = 0;
     core::AtomicStoreRelaxedSystem(
         args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(globalThdId) + args.config.rank,
         args.crossDeviceBarrierFlag);
@@ -129,11 +130,13 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       // Wait until all tokens are sent
       shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
+      args.dispatchGridBarrier[0] = 0;
 
       // Add 1 so that when token number == 0, receiver side still know the signal is sent
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
-      core::AtomicStoreRelaxedSystem(
-          args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe, numTokenSignal);
+      index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
+      shmem::ShmemInt32WaitUntilEquals(signal, 0);
+      core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
     }
   }
 
@@ -144,7 +147,17 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       index_t* signal = recvTokenNums + destPe;
       index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
+      core::AtomicStoreRelaxedSystem(signal, 0);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
+
+      // reset local counter
+      args.destPeTokenCounter[destPe] = 0;
+      // args.dispatchGridBarrier[destPe] = 0;
+    }
+
+    // reset counter
+    if (laneId == 0) {
+      args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
     }
   }
 }
@@ -181,6 +194,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   }
   // Make sure copy on all GPUs are finished
   CrossDeviceBarrierIntraNodeKernel(args);
+  *args.totalRecvTokenNum = 0;
   if (args.curRankNumToken == 0) return;
 
   extern __shared__ char sharedMem[];

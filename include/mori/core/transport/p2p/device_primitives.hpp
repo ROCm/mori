@@ -225,6 +225,7 @@ inline __device__ void WarpAccum(T* dest, T** srcs, float* srcScales, size_t acc
     offset += warpSize * vecSize;
   }
 
+  offset = offset - (laneId * vecSize) + laneId;
   while (offset < nelems) {
     float accumValFp32 = 0;
 
@@ -238,7 +239,7 @@ inline __device__ void WarpAccum(T* dest, T** srcs, float* srcScales, size_t acc
       accumValFp32 += float(srcPtr[offset]) * srcScale;
     }
     dest[offset] = T(accumValFp32);
-    offset += 1;
+    offset += warpSize;
   }
 }
 
