@@ -32,14 +32,19 @@ inline __device__ void ShmemPutSizeImmNbiWarpKernel(const application::SymmMemOb
 
 template <application::TransportType TsptType>
 inline __device__ void ShmemAtomicSizeNonFetchThreadKernel(const application::SymmMemObjPtr dest,
-                                                           size_t destOffset, void* val,
+                                                           size_t destOffset,
+                                                           const application::MemoryRegion& source,
+                                                           size_t sourceOffset, void* val,
                                                            size_t bytes, int pe,
                                                            core::atomicType amoType);
 
 template <application::TransportType TsptType>
 inline __device__ void ShmemAtomicSizeNonFetchWarpKernel(const application::SymmMemObjPtr dest,
-                                                         size_t destOffset, void* val, size_t bytes,
-                                                         int pe, core::atomicType amoType);
+                                                         size_t destOffset,
+                                                         const application::MemoryRegion& source,
+                                                         size_t sourceOffset, void* val,
+                                                         size_t bytes, int pe,
+                                                         core::atomicType amoType);
 
 template <application::TransportType TsptType>
 inline __device__ void ShmemAtomicSizeFetchThreadKernel(const application::SymmMemObjPtr dest,
@@ -62,6 +67,9 @@ inline __device__ void ShmemAtomicSizeFetchWarpKernel(const application::SymmMem
 /* ---------------------------------------------------------------------------------------------- */
 template <application::TransportType>
 inline __device__ void ShmemQuietThreadKernel();
+
+template <application::TransportType>
+inline __device__ void ShmemQuietThreadKernel(int pe);
 
 }  // namespace shmem
 }  // namespace mori

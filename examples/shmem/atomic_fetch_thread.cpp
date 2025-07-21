@@ -33,10 +33,10 @@ __global__ void AtomicFetchThreadKernel(int myPe, const SymmMemObjPtr memObj) {
   if (myPe == sendPe) {
     MemoryRegion source = memObj->GetMemoryRegion(sendPe);
     
-    ShmemAtomicTypeFetchThread<T>(memObj, threadOffset, source, threadOffset, sendPe, recvPe, recvPe, AMO_COMPARE_SWAP);
+    ShmemAtomicTypeFetchThread<T>(memObj, threadOffset, source, threadOffset, sendPe, recvPe, recvPe, AMO_FETCH_AND);
     __threadfence_system();
 
-    if (globalTid == 0) ShmemQuietThread();
+    ShmemQuietThread();
     // __syncthreads();
   } else {
     while (atomicAdd(reinterpret_cast<T*>(memObj->localPtr) + globalTid, 0) != sendPe) {

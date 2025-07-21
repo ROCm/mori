@@ -15,14 +15,14 @@ using namespace mori::core;
       IBV_ACCESS_REMOTE_ATOMIC
 
 template <ProviderType PrvdType, typename T>
-__global__ void Atomic(RdmaEndpoint endpoint, MemoryRegion localMr, MemoryRegion remoteMr,
+__global__ void Atomic(RdmaEndpoint& endpoint, MemoryRegion localMr, MemoryRegion remoteMr,
                        atomicType amoOp, int iters) {
   T value = 1;
   for (int i = 0; i < iters; i++) {
-    uint64_t dbr_val =
-        PostAtomic<PrvdType, T>(endpoint.wqHandle.sqAddr, endpoint.wqHandle.sqWqeNum,
-                                &endpoint.wqHandle.postIdx, endpoint.handle.qpn, localMr.addr,
-                                localMr.lkey, remoteMr.addr, remoteMr.rkey, value, value, amoOp);
+    uint64_t dbr_val = PostAtomic<PrvdType, T>(
+        endpoint.wqHandle.sqAddr, endpoint.wqHandle.sqWqeNum, &endpoint.wqHandle.postIdx,
+        endpoint.wqHandle.postIdx, endpoint.handle.qpn, localMr.addr, localMr.lkey, remoteMr.addr,
+        remoteMr.rkey, value, value, amoOp);
     __threadfence_system();
     UpdateDbrAndRingDbSend<PrvdType>(endpoint.wqHandle.dbrRecAddr, endpoint.wqHandle.postIdx,
                                      endpoint.wqHandle.dbrAddr, dbr_val,
@@ -37,7 +37,7 @@ __global__ void Atomic(RdmaEndpoint endpoint, MemoryRegion localMr, MemoryRegion
 }
 
 void launchAtomicKernel(const Datatype& dt, ProviderType pType, hipStream_t stream,
-                        RdmaEndpoint endpoint, MemoryRegion localMr, MemoryRegion remoteMr,
+                        RdmaEndpoint& endpoint, MemoryRegion localMr, MemoryRegion remoteMr,
                         atomicType amoOp, int iters) {
   dim3 block(1);
   dim3 thread(1);
@@ -145,6 +145,10 @@ void distRdmaOps(int argc, char* argv[]) {
   bootNet.Allgather(&mr_handle, global_mr_handles.data(), sizeof(mr_handle));
   global_mr_handles[local_rank] = mr_handle;
 
+  RdmaEndpoint* devEndpoint;
+  HIP_RUNTIME_CHECK(hipMalloc(&devEndpoint, sizeof(RdmaEndpoint)));
+  HIP_RUNTIME_CHECK(hipMemcpy(devEndpoint, &endpoint, sizeof(RdmaEndpoint), hipMemcpyHostToDevice));
+
   // 5 Prepare kernel argument
   printf("Before: Local rank %d val %lu\n", local_rank, ((uint64_t*)buffer)[0]);
   hipStream_t myStream;
@@ -152,13 +156,13 @@ void distRdmaOps(int argc, char* argv[]) {
 
   if (local_rank == 0) {
     // warmup
-    launchAtomicKernel(dt, ProviderType::MLX5, myStream, endpoint, global_mr_handles[0],
+    launchAtomicKernel(dt, ProviderType::MLX5, myStream, *devEndpoint, global_mr_handles[0],
                        global_mr_handles[1], amo.type, warmupIters);
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
     // test and record
     HIP_RUNTIME_CHECK(hipEventRecord(start, myStream));
-    launchAtomicKernel(dt, ProviderType::MLX5, myStream, endpoint, global_mr_handles[0],
+    launchAtomicKernel(dt, ProviderType::MLX5, myStream, *devEndpoint, global_mr_handles[0],
                        global_mr_handles[1], amo.type, iters);
     HIP_RUNTIME_CHECK(hipEventRecord(end, myStream));
     HIP_RUNTIME_CHECK(hipStreamSynchronize(myStream));
@@ -177,6 +181,7 @@ void distRdmaOps(int argc, char* argv[]) {
 
   bootNet.Finalize();
   HIP_RUNTIME_CHECK(hipFree(buffer));
+  HIP_RUNTIME_CHECK(hipFree(devEndpoint));
 }
 
 int main(int argc, char* argv[]) { distRdmaOps(argc, argv); }

@@ -22,8 +22,10 @@ using namespace mori::shmem;
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>
 __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
+  EpDispatchCombineConfig& config = args.config;
   int thdId = threadIdx.x;
   int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
+  int globalThdNum =  gridDim.x * blockDim.x;
 
   for (int destPe = thdId; destPe < args.config.worldSize; destPe += blockDim.x) {
     args.recvTokenNumMemObj->template GetAs<index_t*>()[destPe] = 0;
@@ -39,10 +41,14 @@ __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
     args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
     core::AtomicStoreRelaxedSystem(args.totalRecvTokenNum, index_t{0});
   }
-  // TODO: this should be one in wqe post API
-  if (globalThdId == 0) {
-    shmem::ShmemQuietThread();
+  for (int i = globalThdId; i < config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerRank; i += globalThdNum)
+  {
+    args.destPeTokenIdxMap[i] = -1;
+    args.srcPeTokenIdxMap[i] = -1;
   }
+  // TODO: this should be one in wqe post API
+  shmem::ShmemQuietThread();
+
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -74,9 +80,13 @@ mori::application::SymmMemObjPtr ShmemMallocAndReturnMemObjPtr(size_t size, unsi
 void EpDispatchCombineHandle::InitializeShmemBuf() {
   size_t maxTokenSize = static_cast<ssize_t>(config.MaxNumTokensToRecv()) * config.hiddenDim *
                         config.maxTokenTypeSize;
-  shmemInpTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
+  size_t maxStagingTokSize = static_cast<ssize_t>(config.MaxNumTokensToRecv()) *
+                             (config.hiddenDim * config.maxTokenTypeSize +
+                              (sizeof(float) + sizeof(index_t)) * config.numExpertPerToken +
+                              config.scaleDim * config.scaleTypeSize);
+  shmemInpTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
   shmemOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
-  shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
+  shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
 
   size_t maxWeightSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(float);
   shmemInpWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
@@ -128,6 +138,12 @@ void EpDispatchCombineHandle::IntializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipMalloc(&dispSenderIdxMap, maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispSenderIdxMap, 0, maxNumOutToken * sizeof(index_t)));
 
+  HIP_RUNTIME_CHECK(hipMalloc(&destPeTokenIdxMap, maxNumOutToken * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMemset(destPeTokenIdxMap, -1, maxNumOutToken * sizeof(index_t)));
+
+  HIP_RUNTIME_CHECK(hipMalloc(&srcPeTokenIdxMap, maxNumOutToken * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMemset(srcPeTokenIdxMap, -1, maxNumOutToken * sizeof(index_t)));
+
   HIP_RUNTIME_CHECK(hipMalloc(&destPeTokenCounter, config.worldSize * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(destPeTokenCounter, 0, config.worldSize * sizeof(index_t)));
 
@@ -145,6 +161,8 @@ void EpDispatchCombineHandle::IntializeOrderMapBuf() {
 void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipFree(dispReceiverIdxMap));
   HIP_RUNTIME_CHECK(hipFree(dispSenderIdxMap));
+  HIP_RUNTIME_CHECK(hipFree(destPeTokenIdxMap));
+  HIP_RUNTIME_CHECK(hipFree(srcPeTokenIdxMap));
   HIP_RUNTIME_CHECK(hipFree(destPeTokenCounter));
   HIP_RUNTIME_CHECK(hipFree(localPeTokenCounter));
   ShmemFree(dispTokOffsetMemObj->localPtr);
@@ -239,12 +257,13 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
 }
 
 void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) {
-  dim3 block(std::max(config.numExpertPerRank, config.worldSize));
+  dim3 grid(config.blockNum);
+  dim3 block(warpSize * config.warpNumPerBlock);
 
   auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
   std::visit(
       [&](auto&& args) {
-        EpDispatchCombineResetKernel<<<1, config.numExpertPerRank, 0, stream>>>(args);
+        EpDispatchCombineResetKernel<<<grid, block, 0, stream>>>(args);
       },
       argsVariant);
   crossDeviceBarrierFlag++;

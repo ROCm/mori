@@ -17,15 +17,16 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, MemoryRegion sendMr, Memo
   uint32_t value = 2;
 
   uint64_t dbr_val = PostAtomic<ProviderType::MLX5, uint32_t>(
-      epSend.wqHandle.sqAddr, epSend.wqHandle.sqWqeNum, &epSend.wqHandle.postIdx, epSend.handle.qpn, sendMr.addr,
+      epSend.wqHandle.sqAddr, epSend.wqHandle.sqWqeNum, &epSend.wqHandle.postIdx, epSend.wqHandle.postIdx, epSend.handle.qpn, sendMr.addr,
       sendMr.lkey, recvMr.addr, recvMr.rkey, value, value, amoOp);
   UpdateSendDbrRecord<ProviderType::MLX5>(epSend.wqHandle.dbrRecAddr, epSend.wqHandle.postIdx);
   __threadfence_system();
   RingDoorbell<ProviderType::MLX5>(epSend.wqHandle.dbrAddr, dbr_val);
   __threadfence_system();
 
-  int opcode = PollCq<ProviderType::MLX5>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeSize,
-                                          epSend.cqHandle.cqeNum, &epSend.cqHandle.consIdx);
+  uint16_t wqeCounter;
+  int opcode = PollCq<ProviderType::MLX5>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum,
+                                          &epSend.cqHandle.consIdx, &wqeCounter);
   UpdateCqDbrRecord<ProviderType::MLX5>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx);
   // printf("send block is done, opcode is %d postIdx %u consIdx %u\n", opcode, epSend.wqHandle.postIdx, epSend.cqHandle.consIdx);
 }
@@ -41,7 +42,7 @@ __device__ void RecvThreadKernel(RdmaEndpoint& epRecv, MemoryRegion mr) {
   // }
 }
 
-__global__ void SendRecvOnGpu(RdmaEndpoint epSend, RdmaEndpoint epRecv, MemoryRegion mrSend, MemoryRegion mrRecv) {
+__global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, MemoryRegion mrSend, MemoryRegion mrRecv) {
   assert(gridDim.x == 2);
   int tid = blockIdx.x;
   printf("tid %d start \n", tid);
@@ -87,6 +88,13 @@ void LocalRdmaOps() {
   printf("ep1 qpn %d ep2 qpn %d\n", epSend.handle.qpn, epRecv.handle.qpn);
 
   // 4 Register buffer
+  RdmaEndpoint* devEpSend;
+  HIP_RUNTIME_CHECK(hipMalloc(&devEpSend, sizeof(RdmaEndpoint)));
+  HIP_RUNTIME_CHECK(hipMemcpy(devEpSend, &epSend, sizeof(RdmaEndpoint), hipMemcpyHostToDevice));
+  RdmaEndpoint* devEpRecv;
+  HIP_RUNTIME_CHECK(hipMalloc(&devEpRecv, sizeof(RdmaEndpoint)));
+  HIP_RUNTIME_CHECK(hipMemcpy(devEpRecv, &epRecv, sizeof(RdmaEndpoint), hipMemcpyHostToDevice));
+
   void* recvBuf;
   HIP_RUNTIME_CHECK(hipMalloc(&recvBuf, msgSize));
   HIP_RUNTIME_CHECK(hipMemset(recvBuf, 0, msgSize));
@@ -97,7 +105,7 @@ void LocalRdmaOps() {
   MemoryRegion mrSend = deviceContextSend->RegisterMemoryRegion(sendBuf, msgSize, MR_ACCESS_FLAG);
   MemoryRegion mrRecv = deviceContextRecv->RegisterMemoryRegion(recvBuf, msgSize, MR_ACCESS_FLAG);
 
-  SendRecvOnGpu<<<2, 1>>>(epSend, epRecv, mrSend, mrRecv);
+  SendRecvOnGpu<<<2, 1>>>(*devEpSend, *devEpRecv, mrSend, mrRecv);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   uint32_t value; 
   HIP_RUNTIME_CHECK(hipMemcpy(&value, recvBuf, sizeof(uint32_t), hipMemcpyDeviceToHost));
@@ -106,6 +114,10 @@ void LocalRdmaOps() {
   // 8 Finalize
   deviceContextSend->DeRegisterMemoryRegion(sendBuf);
   deviceContextRecv->DeRegisterMemoryRegion(recvBuf);
+  HIP_RUNTIME_CHECK(hipFree(devEpSend));
+  HIP_RUNTIME_CHECK(hipFree(devEpRecv));
+  HIP_RUNTIME_CHECK(hipFree(sendBuf));
+  HIP_RUNTIME_CHECK(hipFree(recvBuf));
 }
 
 int main() { LocalRdmaOps(); }

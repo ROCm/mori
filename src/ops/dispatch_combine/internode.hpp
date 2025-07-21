@@ -25,9 +25,6 @@ __device__ void SyncIfDebugEnabled(const char* msg) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpDispatchInterNodeKernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
-// TODO: this mode only works correctly with MORI_DISABLE_P2P=1 set, figure out why
-#define ENABLE_RDMA_AGGREGATE_WRITE 0
-
 template <typename T>
 __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
@@ -46,189 +43,258 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
   int myPe = config.rank;
   int npes = config.worldSize;
+  int myNode = myPe / MAX_GPUS_PER_NODE;
 
   size_t MaxNumTokensToSendPerRank = config.MaxNumTokensToSendPerRank();
   size_t MaxNumTokensToRecvPerRank = config.MaxNumTokensToRecvPerRank();
+  size_t MaxNumTokensToRecv = config.MaxNumTokensToRecv();
 
+  int numExpertPerToken = config.numExpertPerToken;
+  assert(numExpertPerToken < warpSize);
+
+  size_t weightOffset = config.hiddenDim * sizeof(T);
+  size_t indicesOffset = weightOffset + sizeof(float) * numExpertPerToken;
+  size_t scalesOffset = indicesOffset + sizeof(index_t) * numExpertPerToken;
+  size_t stagingOffset = scalesOffset + config.scaleTypeSize * config.scaleDim;
+  
   extern __shared__ char sharedMem[];
 
-  // Phase1: send token
-  int i = globalWarpId;
-  for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
-       i += globalWarpNum) {
-    index_t destExpert = args.tokenIndices[i];
-    index_t destPe = destExpert / config.numExpertPerRank;
-    index_t tokenId = i / config.numExpertPerToken;
+  int subWarpNumPerWarp = warpSize / numExpertPerToken;
+  int laneInSubWarp = laneId % numExpertPerToken;
+  int subWarpId = laneId / numExpertPerToken;
+  int globalSubWarpId = globalWarpId * subWarpNumPerWarp + subWarpId;
+  int globalSubWarpNum = globalWarpNum * subWarpNumPerWarp;
+  if (laneId < subWarpNumPerWarp * numExpertPerToken) {
+    for (int tokenId = globalSubWarpId; tokenId < args.curRankNumToken;
+         tokenId += globalSubWarpNum) {
+      const int expertOffset = tokenId * numExpertPerToken + laneInSubWarp;
+      index_t destExpert = args.tokenIndices[expertOffset];
+      index_t destPe = destExpert / config.numExpertPerRank;
 
-    // Deduplicate
-    assert(config.numExpertPerToken < warpSize);
-    int condition = 0;
-    if (laneId < (i % config.numExpertPerToken)) {
-      condition = destPe == (args.tokenIndices[tokenId * config.numExpertPerToken + laneId] /
-                             config.numExpertPerRank);
+      unsigned long long subWarpMask = ((1ULL << numExpertPerToken) - 1ULL)
+                                       << (subWarpId * numExpertPerToken);
+      unsigned long long dupMask = __match_any_sync(subWarpMask, destPe);
+      bool dup = false;
+      if (laneInSubWarp) {
+        unsigned long long lowerMask = dupMask & (((1ULL << laneInSubWarp) - 1ULL) << (subWarpId * numExpertPerToken));
+        dup = (lowerMask != 0ULL);
+      }
+      if (dup) {
+        args.dispSenderIdxMap[expertOffset] = MaxNumTokensToRecv;
+        continue;
+      } else {
+        index_t destPeTokenIdx = 0, peSortedIdx = 0;
+        destPeTokenIdx = atomicAdd(args.destPeTokenCounter + destPe, 1);
+        peSortedIdx = destPe * MaxNumTokensToRecvPerRank + destPeTokenIdx;
+        args.dispSenderIdxMap[expertOffset] = peSortedIdx;
+        args.destPeTokenIdxMap[peSortedIdx] = tokenId;
+        __threadfence();
+      }
     }
-    if (__any(condition)) {
-      // Indicate that this token is already sent to the destination PE by setting an overflowed
-      // token index
-      if (laneId == 0) args.dispSenderIdxMap[i] = config.worldSize * MaxNumTokensToRecvPerRank;
-      continue;
-    }
-
-    // Allocate a remote token slot
-    index_t destPeTokenIdx = 0, peSortedIdx = 0;
-    if (laneId == 0) {
-      destPeTokenIdx = atomicAdd(args.destPeTokenCounter + destPe, 1);
-      peSortedIdx = destPe * MaxNumTokensToRecvPerRank + destPeTokenIdx;
-      args.dispSenderIdxMap[i] = peSortedIdx;
-    }
-    destPeTokenIdx = __shfl(destPeTokenIdx, 0);
-    peSortedIdx = __shfl(peSortedIdx, 0);
-
-    index_t tokenOffset = tokenId * config.hiddenDim;
-
-#if ENABLE_RDMA_AGGREGATE_WRITE == 1
-    // For aggregated write, first copy data into a contiguous buffer
-    core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + peSortedIdx * config.hiddenDim,
-                   args.inpTokenBuf + tokenOffset, config.hiddenDim);
-    core::WarpCopy(args.shmemOutWeightsMemObj->template GetAs<float*>() +
-                       peSortedIdx * config.numExpertPerToken,
-                   args.weightsBuf + tokenId * config.numExpertPerToken, config.numExpertPerToken);
-    core::WarpCopy(args.shmemOutIndicesMemObj->template GetAs<index_t*>() +
-                       peSortedIdx * config.numExpertPerToken,
-                   args.tokenIndices + tokenId * config.numExpertPerToken,
-                   config.numExpertPerToken);
-#else
-    // For disaggregated write, write data to remote directly
-    // TODO: copy weight and indicies
-    size_t peSortedId = myPe * MaxNumTokensToRecvPerRank + destPeTokenIdx;
-    size_t peSortedOffset = peSortedId * config.hiddenDim;
-
-    core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<T*>() + tokenOffset,
-                   args.inpTokenBuf + tokenOffset, config.hiddenDim);
-    shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, peSortedOffset,
-                                  args.shmemStagingTokMemObj, tokenOffset, config.hiddenDim,
-                                  destPe);
-
-#endif
   }
-  if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
-  SyncIfDebugEnabled("Dispatch kernel: finished send token");
 
-  // Send token num & token to expert mapping to other ranks
-  // TODO: we use multiple warps here because using multiple threads in warp 0 lost RDMA writes,
-  // don't know why yet
-  for (int destPe = globalWarpId; destPe < npes; destPe += globalWarpNum) {
-    if (laneId == 0) {
-      // Wait until all tokens are sent
-      shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
+  if (laneId == 0) {
+    int old_val = atomicAdd(args.dispatchGridBarrier, 1);
+    if (old_val == globalWarpNum - 1) {
+      __hip_atomic_store(args.dispatchGridBarrier, 0, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_AGENT);
+    }
+  }
 
-      // Add 1 so that when token number == 0, receiver side still know the signal is sent
-      index_t numToken = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
-#if ENABLE_RDMA_AGGREGATE_WRITE == 1
-      size_t localPeSortedOffset = destPe * MaxNumTokensToRecvPerRank * size_t(config.hiddenDim);
-      size_t remotePeSortedOffset = myPe * MaxNumTokensToRecvPerRank * size_t(config.hiddenDim);
-      shmem::ShmemPutTypeNbiThread<T>(args.shmemInpTokMemObj, remotePeSortedOffset,
-                                      args.shmemOutTokMemObj, localPeSortedOffset,
-                                      config.hiddenDim * numToken, destPe);
-      shmem::ShmemPutTypeNbiThread<float>(
-          args.shmemInpWeightsMemObj, remotePeSortedOffset * config.numExpertPerToken,
-          args.shmemOutWeightsMemObj, localPeSortedOffset * config.numExpertPerToken,
-          config.numExpertPerToken * numToken, destPe);
-      shmem::ShmemPutTypeNbiThread<index_t>(
-          args.shmemInpIndicesMemObj, remotePeSortedOffset * config.numExpertPerToken,
-          args.shmemOutIndicesMemObj, localPeSortedOffset * config.numExpertPerToken,
-          config.numExpertPerToken * numToken, destPe);
-#endif
+  if (laneId == 0) {
+    shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, 0);
+  }
+
+  // TODO: block num should be multiple of npes
+  const int numsBlockPerDestPe = gridDim.x / npes;
+  const int destPe = blockIdx.x / numsBlockPerDestPe;
+  const int destNode = destPe / MAX_GPUS_PER_NODE;
+  const int localBlockId = blockIdx.x - destPe * numsBlockPerDestPe;
+  const int totalTokens = args.destPeTokenCounter[destPe];
+  const int baseChunk = totalTokens / numsBlockPerDestPe;
+  const int remainder = totalTokens % numsBlockPerDestPe;
+
+  const int myChunkSize = baseChunk + (localBlockId < remainder);
+
+  const int startIdx = localBlockId * baseChunk + min(localBlockId, remainder);
+  const int endIdx = startIdx + myChunkSize;
+
+  if (destNode == myNode) { 
+    // intra node use xgmi for transfer
+    for (int idx = warpId; idx < endIdx - startIdx; idx += warpNum) {
+      const index_t mapIdx = destPe * MaxNumTokensToRecvPerRank + startIdx + idx;
+      size_t mapIdxOffset = mapIdx * stagingOffset;
+      const index_t tokenId = args.destPeTokenIdxMap[mapIdx];
+      size_t tokenOffset = tokenId * size_t(config.hiddenDim) * sizeof(T);
+      const index_t peSortedId = myPe * MaxNumTokensToRecvPerRank + startIdx + idx;
+      size_t peSortedOffset = peSortedId * stagingOffset;
+      core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset,
+                     reinterpret_cast<char*>(args.inpTokenBuf) + tokenOffset,
+                     config.hiddenDim * sizeof(T));
+      core::WarpCopy(
+          args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + weightOffset,
+          reinterpret_cast<char*>(args.weightsBuf) +
+              tokenId * config.numExpertPerToken * sizeof(float),
+          config.numExpertPerToken * sizeof(float));
+      core::WarpCopy(
+          args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + indicesOffset,
+          reinterpret_cast<char*>(args.tokenIndices) +
+              tokenId * config.numExpertPerToken * sizeof(index_t),
+          config.numExpertPerToken * sizeof(index_t));
+      if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
+        core::WarpCopy(
+            args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + scalesOffset,
+            reinterpret_cast<char*>(args.scalesBuf) +
+                tokenId * config.scaleDim * config.scaleTypeSize,
+            config.scaleDim * config.scaleTypeSize);
+      }
+      shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemInpTokMemObj, peSortedOffset,
+                                          args.shmemStagingTokMemObj, mapIdxOffset, stagingOffset,
+                                          destPe);
+    }
+  } else {
+    // inter node use ibgda for transfer
+    // last warp for coordinate, other warp for gather token
+    __shared__ int gatherTokenNum[1024];
+    for (int idx = thdId; idx < 1024; idx += thdNum) {
+      gatherTokenNum[idx] = 0;
+    }
+    __syncthreads();
+    const int chunkTokenSize = (warpNum - 1);
+    if (warpId == warpNum - 1) {
+      const int totalTokenInBlock = endIdx - startIdx;
+      const int totalChunk = totalTokenInBlock / chunkTokenSize;
+      const int remainTokenNum = totalTokenInBlock % chunkTokenSize;
+      for (int chunkIdx = 0; chunkIdx < totalChunk; chunkIdx++) {
+        if (laneId == 0) {
+          while (atomicAdd(&gatherTokenNum[chunkIdx], 0) < chunkTokenSize) {
+            ;
+          }
+        }
+        // rdma_send
+        const index_t srcIdx =
+            destPe * MaxNumTokensToRecvPerRank + startIdx + chunkIdx * chunkTokenSize;
+        size_t srcOffset = srcIdx * stagingOffset;
+        const index_t dstIdx =
+            myPe * MaxNumTokensToRecvPerRank + startIdx + chunkIdx * chunkTokenSize;
+        size_t dstOffset = dstIdx * stagingOffset;
+        if (laneId == 0) {
+          shmem::ShmemPutTypeNbiThread<uint8_t>(args.shmemInpTokMemObj, dstOffset,
+                                                args.shmemStagingTokMemObj, srcOffset,
+                                                chunkTokenSize * stagingOffset, destPe);
+        }
+      }
+      // last chunk
+      if (remainTokenNum != 0) {
+        if (laneId == 0) {
+          while (atomicAdd(&gatherTokenNum[totalChunk], 0) < remainTokenNum) {
+            ;
+          }
+        }
+        // rdma_send
+        const index_t srcIdx =
+            destPe * MaxNumTokensToRecvPerRank + startIdx + totalChunk * chunkTokenSize;
+        size_t srcOffset = srcIdx * stagingOffset;
+        const index_t dstIdx =
+            myPe * MaxNumTokensToRecvPerRank + startIdx + totalChunk * chunkTokenSize;
+        size_t dstOffset = dstIdx * stagingOffset;
+        shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemInpTokMemObj, dstOffset,
+                                            args.shmemStagingTokMemObj, srcOffset,
+                                            remainTokenNum * stagingOffset, destPe);
+      }
+    } else {
+      // int warpTokens = 0;
+      int chunkIdx = 0;
+      for (int idx = warpId; idx < endIdx - startIdx; idx += chunkTokenSize) {
+        const index_t mapIdx = destPe * MaxNumTokensToRecvPerRank + startIdx + idx;
+        size_t mapIdxOffset = mapIdx * stagingOffset;
+        const index_t tokenId = args.destPeTokenIdxMap[mapIdx];
+        size_t tokenOffset = tokenId * size_t(config.hiddenDim) * sizeof(T);
+        // const index_t peSortedId = myPe * MaxNumTokensToRecvPerRank + startIdx + idx;
+        // size_t peSortedOffset = peSortedId * size_t(config.hiddenDim);
+        core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset,
+                       reinterpret_cast<char*>(args.inpTokenBuf) + tokenOffset, config.hiddenDim * sizeof(T));
+        core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + weightOffset,
+                       reinterpret_cast<char*>(args.weightsBuf) + tokenId * config.numExpertPerToken * sizeof(float),
+                       config.numExpertPerToken * sizeof(float));
+        core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + indicesOffset,
+                       reinterpret_cast<char*>(args.tokenIndices) + tokenId * config.numExpertPerToken * sizeof(index_t),
+                       config.numExpertPerToken * sizeof(index_t));
+        if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
+          core::WarpCopy(
+              args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + scalesOffset,
+              reinterpret_cast<char*>(args.scalesBuf) + tokenId * config.scaleDim * config.scaleTypeSize,
+              config.scaleDim * config.scaleTypeSize);
+        }
+        if (laneId == 0) atomicAdd(&gatherTokenNum[chunkIdx++], 1);
+      }
+      // if (laneId == 0 && warpTokens) atomicAdd(&gatherTokenNum, warpTokens);
+      __threadfence_block();
+    }
+  }
+
+  __shared__  index_t recvTokenNum;
+  __syncthreads();
+  if (thdId == 0) {
+    // shmem::ShmemAtomicTypeNonFetchWarp<int32_t>(args.recvTokenNumMemObj, myPe * sizeof(index_t),
+    //                                         args.shmemStagingTokMemObj->GetMemoryRegion(myPe), myPe * sizeof(index_t),
+    //                                         (int32_t)(totalTokens+1), destPe, core::AMO_SET);
+    int doneBlockNum = atomicAdd(&args.dispatchGridBarrier[destPe], 1);
+    if (doneBlockNum == numsBlockPerDestPe -1) 
+    {
       shmem::ShmemPutInt32ImmNbiThread(args.recvTokenNumMemObj, myPe * sizeof(index_t),
-                                       numToken + 1, destPe);
+                                    totalTokens + 1, destPe);
     }
   }
-  SyncIfDebugEnabled("Dispatch kernel: finish sending tok2expt mapping & num token signal");
-
-  // Phase 2: recv token
-  // Each warp wait until sender finished by waiting token number signal
-  index_t* recvTokenNumArr = reinterpret_cast<index_t*>(sharedMem) + warpId * (npes + 1);
-  // TODO: kernel hangs here when launch too many blocks
-  for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+  if (thdId == 0)
+  {
     index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>() + destPe;
-    shmem::ShmemInt32WaitUntilGreaterThan(signal, 0);
-    index_t recvTokenNum = core::AtomicLoadRelaxedSystem(signal) - 1;
-    recvTokenNumArr[destPe] = recvTokenNum;
-    if (globalWarpId == 0) atomicAdd(args.totalRecvTokenNum, recvTokenNum);
+    recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
+    if (localBlockId == 0) atomicAdd(args.totalRecvTokenNum, recvTokenNum);
+    // if (localBlockId == 0) printf("rank[%d] destPe[%d] recvTokenNum: %d\n", myPe, destPe, recvTokenNum);
   }
-  SyncIfDebugEnabled("Dispatch kernel: finish waiting num token signal");
+  __syncthreads();
 
-  // #pragma unroll
-  for (int srcPe = 0; srcPe < npes; srcPe += 1) {
-    index_t recvTokenNum = recvTokenNumArr[srcPe];
+  const int baseRecvChunk = recvTokenNum / numsBlockPerDestPe;
+  const int recvRemainder = recvTokenNum % numsBlockPerDestPe;
+  const int myRecvChunkSize = baseRecvChunk + (localBlockId < recvRemainder);
+  // if (localBlockId == 0 && thdId == 0) printf("rank[%d] destPe[%d] myRecvChunkSize: %d\n", myPe, destPe, myRecvChunkSize);
+  const int startRecvIdx = localBlockId * baseRecvChunk + min(localBlockId, recvRemainder);
+  const int endRecvIdx = startRecvIdx + myRecvChunkSize;
+  for (int idx = warpId; idx < myRecvChunkSize; idx += warpNum) {
+    index_t localTokenIdx = 0;
+    if (laneId == 0) {
+      localTokenIdx = atomicAdd(args.localPeTokenCounter, 1);
+    }
+    localTokenIdx = __shfl(localTokenIdx, 0);
+    index_t peSortedId = destPe * MaxNumTokensToRecvPerRank + startRecvIdx + idx;
 
-    for (int i = globalWarpId; i < recvTokenNum; i += globalWarpNum) {
-      index_t localTokenIdx = 0;
-      if (laneId == 0) {
-        localTokenIdx = atomicAdd(args.localPeTokenCounter, 1);
-      }
-      localTokenIdx = __shfl(localTokenIdx, 0);
-      index_t peSortedId = srcPe * MaxNumTokensToRecvPerRank + i;
+    size_t localTokenOffset = size_t(localTokenIdx) * size_t(config.hiddenDim) * sizeof(T);
+    size_t peSortedTokenOffset = size_t(peSortedId) * stagingOffset;
 
-      size_t localTokenOffset = size_t(localTokenIdx) * size_t(config.hiddenDim);
-      size_t peSortedTokenOffset = size_t(peSortedId) * size_t(config.hiddenDim);
-
-      core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + localTokenOffset,
-                     args.shmemInpTokMemObj->template GetAs<T*>() + peSortedTokenOffset,
-                     config.hiddenDim);
-      core::WarpCopy(args.shmemOutWeightsMemObj->template GetAs<float*>() +
-                         localTokenIdx * config.numExpertPerToken,
-                     args.shmemInpWeightsMemObj->template GetAs<float*>() +
-                         peSortedId * config.numExpertPerToken,
-                     config.numExpertPerToken);
-      core::WarpCopy(args.shmemOutIndicesMemObj->template GetAs<index_t*>() +
-                         localTokenIdx * config.numExpertPerToken,
-                     args.shmemInpIndicesMemObj->template GetAs<index_t*>() +
-                         peSortedId * config.numExpertPerToken,
-                     config.numExpertPerToken);
-      if (laneId == 0) {
-        args.dispReceiverIdxMap[localTokenIdx] = peSortedId;
-      }
+    core::WarpCopy(args.shmemOutTokMemObj->template GetAs<char*>() + localTokenOffset,
+                   args.shmemInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset,
+                   config.hiddenDim * sizeof(T));
+    core::WarpCopy(args.shmemOutWeightsMemObj->template GetAs<char*>() +
+                       localTokenIdx * config.numExpertPerToken * sizeof(float),
+                   args.shmemInpTokMemObj->template GetAs<char*>() +
+                       peSortedTokenOffset + weightOffset,
+                   config.numExpertPerToken * sizeof(float));
+    core::WarpCopy(args.shmemOutIndicesMemObj->template GetAs<char*>() +
+                       localTokenIdx * config.numExpertPerToken * sizeof(index_t),
+                   args.shmemInpTokMemObj->template GetAs<char*>() +
+                       peSortedTokenOffset + indicesOffset,
+                   config.numExpertPerToken * sizeof(index_t));
+    if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
+      core::WarpCopy(args.shmemOutScalesMemObj->template GetAs<char*>() +
+                         localTokenIdx * config.scaleDim * config.scaleTypeSize,
+                     args.shmemInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset + scalesOffset,
+                     config.scaleDim * config.scaleTypeSize);
+    }
+    if (laneId == 0) {
+      args.dispReceiverIdxMap[localTokenIdx] = peSortedId;
+      args.srcPeTokenIdxMap[peSortedId] = localTokenIdx;
     }
   }
-
-  // for (int i = globalWarpId;; i += globalWarpNum) {
-  //   // find src pe and tok id
-  //   index_t srcPe = 0;
-  //   index_t accumPeTokOffset = 0;
-  //   for (; srcPe < npes; srcPe++) {
-  //     if ((i >= accumPeTokOffset) && (i < (accumPeTokOffset + recvTokenNumArr[srcPe]))) break;
-  //     accumPeTokOffset += recvTokenNumArr[srcPe];
-  //   }
-  //   if (srcPe >= npes) break;
-
-  //   index_t localTokenIdx = 0;
-  //   if (laneId == 0) {
-  //     localTokenIdx = atomicAdd(args.localPeTokenCounter, 1);
-  //   }
-  //   localTokenIdx = __shfl(localTokenIdx, 0);
-
-  //   // Copy token
-  //   index_t peSortedId = srcPe * MaxNumTokensToRecvPerRank + i - accumPeTokOffset;
-
-  //   core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>() + localTokenIdx *
-  //   config.hiddenDim,
-  //                  args.shmemInpTokMemObj->template GetAs<T*>() + peSortedId * config.hiddenDim,
-  //                  config.hiddenDim);
-  //   core::WarpCopy(args.shmemOutWeightsMemObj->template GetAs<float*>() +
-  //                      localTokenIdx * config.numExpertPerToken,
-  //                  args.shmemInpWeightsMemObj->template GetAs<float*>() +
-  //                      peSortedId * config.numExpertPerToken,
-  //                  config.numExpertPerToken);
-  //   core::WarpCopy(args.shmemOutIndicesMemObj->template GetAs<index_t*>() +
-  //                      localTokenIdx * config.numExpertPerToken,
-  //                  args.shmemInpIndicesMemObj->template GetAs<index_t*>() +
-  //                      peSortedId * config.numExpertPerToken,
-  //                  config.numExpertPerToken);
-  //   if (laneId == 0) {
-  //     args.dispReceiverIdxMap[localTokenIdx] = peSortedId;
-  //   }
-  // }
   SyncIfDebugEnabled("Dispatch kernel: kernel end");
 }
 
@@ -285,28 +351,110 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
   int myPe = config.rank;
   int npes = config.worldSize;
+  int myNode = myPe / MAX_GPUS_PER_NODE;
 
   size_t MaxNumTokensToSendPerRank = config.MaxNumTokensToSendPerRank();
   size_t MaxNumTokensToRecvPerRank = config.MaxNumTokensToRecvPerRank();
 
-  index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
+  // index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
 
   // Phase 1: send token
   // This phase is symmetric with dispatch recv phase, where tokens are first sent back to its
   // source pe in pe sorted order
-  for (int localTokenIdx = globalWarpId; localTokenIdx < totalRecvTokenNum;
-       localTokenIdx += globalWarpNum) {
-    index_t peSortedId = args.dispReceiverIdxMap[localTokenIdx];
-    index_t srcPe = peSortedId / MaxNumTokensToRecvPerRank;
-    peSortedId = peSortedId - srcPe * MaxNumTokensToRecvPerRank + myPe * MaxNumTokensToRecvPerRank;
+  const int numsBlockPerSrcPe = gridDim.x / npes;
+  const int srcPe = blockIdx.x / numsBlockPerSrcPe;
+  const int srcNode = srcPe / MAX_GPUS_PER_NODE;
+  const int localBlockId = blockIdx.x - srcPe * numsBlockPerSrcPe;
+  const int srcPeTokenNum = *(args.recvTokenNumMemObj->template GetAs<index_t*>() + srcPe) - 1;
+  const int baseChunk = srcPeTokenNum / numsBlockPerSrcPe;
+  const int remainder = srcPeTokenNum % numsBlockPerSrcPe;
 
-    size_t peSortedOffset = size_t(peSortedId) * size_t(config.hiddenDim);
-    size_t tokenOffset = size_t(localTokenIdx) * size_t(config.hiddenDim);
+  const int myChunkSize = baseChunk + (localBlockId < remainder);
 
-    core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<T*>() + tokenOffset,
-                   args.inpTokenBuf + tokenOffset, config.hiddenDim);
-    shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, peSortedOffset, args.shmemStagingTokMemObj,
-                                  tokenOffset, config.hiddenDim, srcPe);
+  const int startIdx = localBlockId * baseChunk + min(localBlockId, remainder);
+  const int endIdx = startIdx + myChunkSize;
+
+  if (srcNode == myNode) {
+    // intra node use xgmi for transfer
+    for (int idx = warpId; idx < endIdx - startIdx; idx += warpNum) {
+      const index_t mapIdx = srcPe * MaxNumTokensToRecvPerRank + startIdx + idx;
+      size_t mapIdxOffset = mapIdx * size_t(config.hiddenDim);
+      const index_t tokenId = args.srcPeTokenIdxMap[mapIdx];
+      size_t tokenOffset = tokenId * size_t(config.hiddenDim);
+      const index_t peSortedId = myPe * MaxNumTokensToRecvPerRank + startIdx + idx;
+      size_t peSortedOffset = peSortedId * size_t(config.hiddenDim);
+      core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<T*>() + mapIdxOffset,
+                     args.inpTokenBuf + tokenOffset, config.hiddenDim);
+      shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, peSortedOffset,
+                                    args.shmemStagingTokMemObj, mapIdxOffset, config.hiddenDim,
+                                    srcPe);
+    }
+  } else {
+    // inter node use ibgda for transfer
+    // last warp for coordinate, other warp for gather token
+    __shared__ int gatherTokenNum[1024];
+    for (int idx = thdId; idx < 1024; idx += thdNum) {
+      gatherTokenNum[idx] = 0;
+    }
+    __syncthreads();
+    const int chunkTokenSize = (warpNum - 1);
+    if (warpId == warpNum - 1) {
+      const int totalTokenInBlock = endIdx - startIdx;
+      const int totalChunk = totalTokenInBlock / chunkTokenSize;
+      const int remainTokenNum = totalTokenInBlock % chunkTokenSize;
+      for (int chunkIdx = 0; chunkIdx < totalChunk; chunkIdx++) {
+        if (laneId == 0) {
+          while (atomicAdd(&gatherTokenNum[chunkIdx], 0) < chunkTokenSize) {
+            ;
+          }
+        }
+        // rdma_send
+        const index_t srcIdx =
+            srcPe * MaxNumTokensToRecvPerRank + startIdx + chunkIdx * chunkTokenSize;
+        size_t srcOffset = srcIdx * size_t(config.hiddenDim);
+        const index_t dstIdx =
+            myPe * MaxNumTokensToRecvPerRank + startIdx + chunkIdx * chunkTokenSize;
+        size_t dstOffset = dstIdx * size_t(config.hiddenDim);
+        if (laneId == 0) {
+          shmem::ShmemPutTypeNbiThread<T>(args.shmemInpTokMemObj, dstOffset,
+                                          args.shmemStagingTokMemObj, srcOffset,
+                                          chunkTokenSize * size_t(config.hiddenDim), srcPe);
+        }
+      }
+      // last chunk
+      if (remainTokenNum != 0) {
+        if (laneId == 0) {
+          while (atomicAdd(&gatherTokenNum[totalChunk], 0) < remainTokenNum) {
+            ;
+          }
+        }
+        // rdma_send
+        const index_t srcIdx =
+            srcPe * MaxNumTokensToRecvPerRank + startIdx + totalChunk * chunkTokenSize;
+        size_t srcOffset = srcIdx * size_t(config.hiddenDim);
+        const index_t dstIdx =
+            myPe * MaxNumTokensToRecvPerRank + startIdx + totalChunk * chunkTokenSize;
+        size_t dstOffset = dstIdx * size_t(config.hiddenDim);
+        shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, dstOffset, args.shmemStagingTokMemObj,
+                                      srcOffset, remainTokenNum * size_t(config.hiddenDim), srcPe);
+      }
+    } else {
+      // int warpTokens = 0;
+      int chunkIdx = 0;
+      for (int idx = warpId; idx < endIdx - startIdx; idx += chunkTokenSize) {
+        const index_t mapIdx = srcPe * MaxNumTokensToRecvPerRank + startIdx + idx;
+        size_t mapIdxOffset = mapIdx * size_t(config.hiddenDim);
+        const index_t tokenId = args.srcPeTokenIdxMap[mapIdx];
+        size_t tokenOffset = tokenId * size_t(config.hiddenDim);
+        // const index_t peSortedId = myPe * MaxNumTokensToRecvPerRank + startIdx + idx;
+        // size_t peSortedOffset = peSortedId * size_t(config.hiddenDim);
+        core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<T*>() + mapIdxOffset,
+                       args.inpTokenBuf + tokenOffset, config.hiddenDim);
+        if (laneId == 0) atomicAdd(&gatherTokenNum[chunkIdx++], 1);
+      }
+      // if (laneId == 0 && warpTokens) atomicAdd(&gatherTokenNum, warpTokens);
+      __threadfence_block();
+    }
   }
   SyncIfDebugEnabled("Combine kernel: send token end");
 

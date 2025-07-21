@@ -42,10 +42,10 @@ static __host__ void RingDoorbell(void* dbr_addr, uint64_t dbr_val);
 /*                                         Completion Queu                                        */
 /* ---------------------------------------------------------------------------------------------- */
 template <ProviderType PrvdType>
-static __host__ int PollCqOnce(void* cqAddr, uint32_t cqeSize, uint32_t cqeNum, uint32_t& consIdx);
+static __host__ int PollCqOnce(void* cqAddr, uint32_t cqeNum, uint32_t& consIdx);
 
 template <ProviderType PrvdType>
-static __host__ int PollCq(void* cqAddr, uint32_t cqeSize, uint32_t cqeNum, uint32_t& consIdx);
+static __host__ int PollCq(void* cqAddr, uint32_t cqeNum, uint32_t& consIdx);
 
 template <ProviderType PrvdType>
 static __host__ void UpdateCqDbrRecord(void* dbrRecAddr, uint32_t cons_idx);
