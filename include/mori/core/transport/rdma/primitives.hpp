@@ -57,14 +57,18 @@ typedef enum {
 #define HTOBE16(x) BSWAP16(x)
 
 #if BYTE_ORDER == LITTLE_ENDIAN
+#define BE16TOH(x) BSWAP16(x)
 #define BE32TOH(x) BSWAP32(x)
-#define LE32TOH(x) (x)
 #define BE64TOH(x) BSWAP64(x)
+#define LE16TOH(x) (x)
+#define LE32TOH(x) (x)
 #define LE64TOH(x) (x)
 #elif BYTE_ORDER == BIG_ENDIAN
+#define BE16TOH(x) (x)
 #define BE32TOH(x) (x)
-#define LE32TOH(x) BSWAP32(x)
 #define BE64TOH(x) (x)
+#define LE16TOH(x) BSWAP16(x)
+#define LE32TOH(x) BSWAP32(x)
 #define LE64TOH(x) BSWAP64(x)
 #endif
 

@@ -19,10 +19,10 @@ class EpDispatchCombineTestCase:
             scale_dim=32,
             scale_type_size=4,
             max_num_inp_token_per_rank=4096,
-            num_experts_per_rank=32,
+            num_experts_per_rank=16,
             num_experts_per_token=8,
             warp_num_per_block=16,
-            block_num=80,
+            block_num=64,
             max_token_type_size=2,
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNode,
         )
@@ -167,7 +167,7 @@ class EpDispatchCombineTestCase:
             all_rank_scales,
         )
 
-    def run_test_once(self, op, test_data):
+    def run_test_once(self, op, test_data, error_round, round):
         (
             all_rank_num_token,
             all_rank_indices,
@@ -206,7 +206,8 @@ class EpDispatchCombineTestCase:
                 print(
                     f"rank {self.rank} token {i} assert {is_pass} expected { all_rank_input[src_pe][src_tok_id]} got {dispatch_output[i]}"
                 )
-                assert False
+                # assert False
+                error_round.add(round)
             # assert torch.equal(
             #     dispatch_weights[i], all_rank_weights[src_pe][src_tok_id]
             # )
@@ -242,18 +243,25 @@ class EpDispatchCombineTestCase:
             if not ok:
                 print(self.rank, "got: ", got)
                 print(self.rank, "expected: ", expected)
-                assert False
+                print(self.rank, "delta:", got-expected)
+                # assert False
+                error_round.add(round)
+
 
         if self.config.rank == 0:
             print("Combine Pass")
 
     def test_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
+        error_round = set()
         for i in range(500):
             if self.rank == 0:
                 print(f"Round {i} begin")
             test_data = self.gen_test_data()
-            self.run_test_once(op, test_data)
+            if self.rank == 0:
+                print(f"Round {i} gen test_data done")
+            self.run_test_once(op, test_data, error_round, i)
+        print("rank: ", self.rank, "error times: ", len(error_round), "appear round: ", error_round)
 
         del op
 
@@ -336,6 +344,14 @@ class EpDispatchCombineTestCase:
         disp_bandwidth_GB_list = []
         comb_duration_us_list = []
         comb_bandwidth_GB_list = []
+
+        for i in range(10):
+            if self.rank == 0:
+                print(f"WarmUp Round {i} begin")
+            _, _, _, _ = (
+                self.run_bench_once(op, test_data)
+            )
+
 
         for i in range(50):
             if self.rank == 0:

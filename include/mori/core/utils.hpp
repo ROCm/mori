@@ -15,11 +15,65 @@ inline __device__ int FlatBlockThreadId() {
   return (threadIdx.z * blockDim.y * blockDim.x) + (threadIdx.y * blockDim.x) + threadIdx.x;
 }
 
+inline __device__ int FlatThreadId() {
+  return FlatBlockThreadId() +
+         (blockIdx.x + blockIdx.y * gridDim.x + blockIdx.z * gridDim.x * gridDim.y) *
+             FlatBlockSize();
+}
+
 inline __device__ int FlatBlockWarpNum() { return FlatBlockSize() / DeviceWarpSize(); }
 
 inline __device__ int FlatBlockWarpId() { return FlatBlockThreadId() / DeviceWarpSize(); }
 
 inline __device__ int WarpLaneId() { return FlatBlockThreadId() & (DeviceWarpSize() - 1); }
+
+inline __device__ bool IsThreadZeroInBlock() {  
+    return (FlatBlockThreadId() % DeviceWarpSize()) == 0;  
+}  
+  
+inline __device__ uint64_t GetActiveLaneMask() {  
+    return __ballot(true);  
+}  
+  
+inline __device__ unsigned int GetActiveLaneCount(uint64_t activeLaneMask) {  
+    return __popcll(activeLaneMask);  
+}  
+  
+inline __device__ unsigned int GetActiveLaneCount() {  
+    return GetActiveLaneCount(GetActiveLaneMask());  
+}  
+  
+inline __device__ unsigned int GetActiveLaneNum(uint64_t activeLaneMask) {  
+    return __popcll(activeLaneMask & __lanemask_lt());  
+}  
+  
+inline __device__ unsigned int GetActiveLaneNum() {  
+    return GetActiveLaneNum(GetActiveLaneMask());  
+}  
+  
+inline __device__ int GetFirstActiveLaneID(uint64_t activeLaneMask) {  
+    return __ffsll((unsigned long long int)activeLaneMask) - 1;  
+}  
+  
+inline __device__ int GetFirstActiveLaneID() {  
+    return GetFirstActiveLaneID(GetActiveLaneMask());  
+}  
+  
+inline __device__ bool IsFirstActiveLane(uint64_t activeLaneMask) {  
+    return GetActiveLaneNum(activeLaneMask) == 0;  
+}  
+  
+inline __device__ bool IsFirstActiveLane() {  
+    return IsFirstActiveLane(GetActiveLaneMask());  
+}  
+  
+inline __device__ bool IsLastActiveLane(uint64_t activeLaneMask) {  
+    return GetActiveLaneNum(activeLaneMask) == GetActiveLaneCount(activeLaneMask) - 1;  
+}  
+  
+inline __device__ bool IsLastActiveLane() {  
+    return IsLastActiveLane(GetActiveLaneMask());  
+}  
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Atomic Operations                                       */
