@@ -32,7 +32,17 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
 
   // TODO: we need to add more options in config, include min cqe num for ib_create_cq and max sge
   // for qp
-  endpoint.ibvHandle.cq = ibv_create_cq(context, config.maxCqeNum, NULL, NULL, 0);
+  endpoint.ibvHandle.compCh = config.withCompChannel ? ibv_create_comp_channel(context) : nullptr;
+  endpoint.ibvHandle.cq =
+      ibv_create_cq(context, config.maxCqeNum, NULL, endpoint.ibvHandle.compCh, 0);
+  assert(endpoint.ibvHandle.cq);
+
+  // TODO: should also manage the lifecycle of completion channel
+  if (config.withCompChannel)
+    assert(endpoint.ibvHandle.compCh &&
+           (endpoint.ibvHandle.cq->channel == endpoint.ibvHandle.compCh));
+  printf("create %p %p\n", endpoint.ibvHandle.cq, endpoint.ibvHandle.compCh);
+
   ibv_qp_init_attr qpAttr = {.send_cq = endpoint.ibvHandle.cq,
                              .recv_cq = endpoint.ibvHandle.cq,
                              .cap = {.max_send_wr = config.maxMsgsNum,
@@ -46,7 +56,6 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
   cqPool.insert({endpoint.ibvHandle.cq, std::move(std::unique_ptr<ibv_cq>(endpoint.ibvHandle.cq))});
   qpPool.insert(
       {endpoint.ibvHandle.qp->qp_num, std::move(std::unique_ptr<ibv_qp>(endpoint.ibvHandle.qp))});
-
   return endpoint;
 }
 
@@ -99,8 +108,6 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
           IBV_QP_MAX_QP_RD_ATOMIC;
   ibv_modify_qp(qp, &attr, flags);
 }
-
-ibv_qp* IBVerbsDeviceContext::GetQp() const {}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          IBVerbsDevice                                         */

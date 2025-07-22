@@ -1,5 +1,6 @@
 #include "mori/io/engine.hpp"
 
+#include <fcntl.h>
 #include <infiniband/verbs.h>
 #include <sys/epoll.h>
 
@@ -26,10 +27,13 @@ IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
   desc.tcpHandle = tcpContext->handle;
 
   // Initialize data plane
-  InitDataPlane();
+  StartDataPlane();
 }
 
-IOEngine::~IOEngine() { ShutdownControlPlane(); }
+IOEngine::~IOEngine() {
+  ShutdownControlPlane();
+  ShutdownDataPlane();
+}
 
 EngineDesc IOEngine::GetEngineDesc() {
   printf("before return host %s key %s %d\n", desc.tcpHandle.host.c_str(), desc.key.c_str(),
@@ -44,7 +48,19 @@ application::RdmaEndpoint IOEngine::CreateRdmaEndpoint() {
   config.maxMsgsNum = 1024;
   config.maxCqeNum = 1024;
   config.alignment = 4096;
+  config.withCompChannel = true;
   application::RdmaEndpoint rdmaEp = rdmaDeviceContext->CreateRdmaEndpoint(config);
+  // Register notification
+  SYSCALL_RETURN_ZERO(ibv_req_notify_cq(rdmaEp.ibvHandle.cq, 0));
+  // Add to epoll list
+  epoll_event ev;
+  ev.events = EPOLLIN;
+  ev.data.ptr = rdmaEp.ibvHandle.cq;
+  printf("%s %p %p\n", GetEngineDesc().key.c_str(), ev.data.ptr,
+         static_cast<ibv_cq*>(ev.data.ptr)->channel);
+  assert(rdmaEp.ibvHandle.compCh);
+  SYSCALL_RETURN_ZERO(
+      epoll_ctl(rdmaCompChEpollFd, EPOLL_CTL_ADD, rdmaEp.ibvHandle.compCh->fd, &ev));
   return rdmaEp;
 }
 
@@ -56,6 +72,7 @@ void IOEngine::RegisterRemoteEngine(EngineDesc remote) {
   BackendBitmap commonBes = desc.backends.FindCommonBackends(remote.backends);
   if (commonBes.IsAvailableBackend(BackendType::RDMA)) {
     Protocol protocol(tcpEph);
+    printf("%s reg remote\n", GetEngineDesc().key.c_str());
     application::RdmaEndpoint localRdmaEp = CreateRdmaEndpoint();
     protocol.WriteMessageRegEngine(MessageRegEngine{GetEngineDesc(), localRdmaEp.handle});
     MessageHeader hdr = protocol.ReadMessageHeader();
@@ -114,6 +131,7 @@ void IOEngine::Read(MemoryDesc local, size_t localOffset, MemoryDesc remote, siz
 
   // TODO: add selection logics when qp pool feature is ready
   application::RdmaEndpoint ep = rdmaEpKV[remote.engineKey][0].first;
+  SYSCALL_RETURN_ZERO(ibv_req_notify_cq(ep.ibvHandle.cq, 0));
 
   ibv_sge sge{};
   sge.addr = reinterpret_cast<uint64_t>(local.data) + localOffset;
@@ -128,7 +146,7 @@ void IOEngine::Read(MemoryDesc local, size_t localOffset, MemoryDesc remote, siz
   wr.opcode = IBV_WR_RDMA_READ;
   wr.send_flags = IBV_SEND_SIGNALED;
   wr.wr.rdma.remote_addr = reinterpret_cast<uint64_t>(remote.data) + remoteOffset;
-  wr.wr.rdma.rkey = remote.backendDesc.rdmaMr.lkey;
+  wr.wr.rdma.rkey = remote.backendDesc.rdmaMr.rkey;
 
   assert(!ibv_post_send(ep.ibvHandle.qp, &wr, &bad_wr) && "ibv_post_send RDMA READ");
 }
@@ -222,7 +240,33 @@ void IOEngine::ControlPlaneLoop() {
   }
 }
 
-void IOEngine::InitDataPlane() {
+void IOEngine::RdmaPollLoop() {
+  int maxEvents = 128;
+  epoll_event events[maxEvents];
+  while (running.load()) {
+    int nfds = epoll_wait(rdmaCompChEpollFd, events, maxEvents, 5 /*ms*/);
+    for (int i = 0; i < nfds; ++i) {
+      ibv_cq* cq = static_cast<ibv_cq*>(events[i].data.ptr);
+      printf("%s %p %p\n", GetEngineDesc().key.c_str(), cq, cq->channel);
+      ibv_cq* ev_cq;
+      void* ev_ctx;
+      if (ibv_get_cq_event(cq->channel, &ev_cq, &ev_ctx)) continue;
+      ibv_ack_cq_events(ev_cq, 1);
+      ibv_req_notify_cq(ev_cq, 0);
+
+      // TODO: maybe take multiple cqes?
+      ibv_wc wc;
+      while (ibv_poll_cq(cq, 1, &wc) > 0) {
+        TransferStatus* status = reinterpret_cast<TransferStatus*>(wc.wr_id);
+        // TODO: process cqe correctly
+        printf("poll cq success!\n");
+        status->code = StatusCode::SUCCESS;
+      }
+    }
+  }
+}
+
+void IOEngine::StartDataPlane() {
   if (desc.backends.IsAvailableBackend(BackendType::RDMA)) {
     // TODO: add topology detection
     rdmaContext.reset(new application::RdmaContext(application::RdmaBackendType::IBVerbs));
@@ -233,6 +277,13 @@ void IOEngine::InitDataPlane() {
     application::RdmaDevice* device = devicePort.first;
     printf("%d nic id\n", desc.gpuId % activeDevicePortList.size());
     rdmaDeviceContext = device->CreateRdmaDeviceContext();
+
+    // Start RDMA poll thread
+    // Create epoll fd
+    rdmaCompChEpollFd = epoll_create1(EPOLL_CLOEXEC);
+    assert(rdmaCompChEpollFd >= 0);
+
+    rdmaPollThd = std::thread([this] { RdmaPollLoop(); });
   }
 
   if (desc.backends.IsAvailableBackend(BackendType::XGMI)) {
@@ -242,6 +293,11 @@ void IOEngine::InitDataPlane() {
   if (desc.backends.IsAvailableBackend(BackendType::TCP)) {
     assert(false && "not implemented");
   }
+}
+
+void IOEngine::ShutdownDataPlane() {
+  running.store(false);
+  if (rdmaPollThd.joinable()) rdmaPollThd.join();
 }
 
 }  // namespace io

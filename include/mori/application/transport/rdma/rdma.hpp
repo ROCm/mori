@@ -54,6 +54,7 @@ struct RdmaEndpointConfig {
   uint32_t maxCqeNum{128};
   uint32_t alignment{PAGESIZE};
   bool onGpu{false};
+  bool withCompChannel{false};
 };
 
 struct InfiniBandEndpointHandle {
@@ -111,8 +112,9 @@ struct CompletionQueueHandle {
 };
 
 struct IBVerbsHandle {
-  ibv_qp* qp;
-  ibv_cq* cq;
+  ibv_qp* qp{nullptr};
+  ibv_cq* cq{nullptr};
+  ibv_comp_channel* compCh{nullptr};
 };
 
 struct RdmaEndpoint {

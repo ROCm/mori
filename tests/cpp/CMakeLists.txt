@@ -8,6 +8,15 @@ target_include_directories(test_transport_tcp PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_transport_tcp mori_application)
 
 add_executable(
+    test_transport_ibverbs
+    application/test_transport_ibverbs.cpp
+)
+
+target_include_directories(test_transport_ibverbs PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(test_transport_ibverbs PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_transport_ibverbs mori_application)
+
+add_executable(
     test_engine
     io/test_engine.cpp
 )

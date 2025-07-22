@@ -1,5 +1,7 @@
 #pragma once
 
+#include <infiniband/verbs.h>
+
 #include <atomic>
 #include <thread>
 #include <vector>
@@ -37,10 +39,6 @@ class IOEngine {
             size_t size, TransferStatus& status);
 
  private:
-  // Data plane methods
-  application::RdmaEndpoint CreateRdmaEndpoint();
-
- private:
   // Control plane methods
   void AcceptRemoteEngineConn();
   void HandleControlPlaneProtocol(int fd);
@@ -48,7 +46,11 @@ class IOEngine {
   void StartControlPlane();
   void ShutdownControlPlane();
 
-  void InitDataPlane();
+  // Data plane methods
+  application::RdmaEndpoint CreateRdmaEndpoint();
+  void RdmaPollLoop();
+  void StartDataPlane();
+  void ShutdownDataPlane();
 
  public:
   // Config and descriptors
@@ -76,7 +78,7 @@ class IOEngine {
   application::ActiveDevicePort devicePort;
   application::RdmaDeviceContext* rdmaDeviceContext;
   std::unique_ptr<application::RdmaContext> rdmaContext;
-
+  int rdmaCompChEpollFd{-1};
   std::thread rdmaPollThd;
 };
 

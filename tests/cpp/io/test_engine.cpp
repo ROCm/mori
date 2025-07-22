@@ -37,6 +37,8 @@ void TestMoriIOEngine() {
   TransferStatus status;
   initiator.Read(initatorMem, 0, targetMem, 0, bufSize, status);
   printf("%d\n", reinterpret_cast<uint8_t*>(initiatorBuf)[511]);
+
+  // initiator.RdmaPollLoop();
   initiator.DeRegisterMemory(initatorMem);
   target.DeRegisterMemory(targetMem);
 }

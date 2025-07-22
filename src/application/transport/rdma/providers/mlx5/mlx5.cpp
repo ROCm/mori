@@ -367,6 +367,7 @@ Mlx5DeviceContext::Mlx5DeviceContext(RdmaDevice* rdma_device, ibv_pd* in_pd)
 Mlx5DeviceContext::~Mlx5DeviceContext() {}
 
 RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& config) {
+  assert(!config.withCompChannel && "not implemented");
   ibv_context* context = GetIbvContext();
 
   Mlx5CqContainer* cq = new Mlx5CqContainer(context, config);
