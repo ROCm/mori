@@ -3,6 +3,7 @@
 #include <infiniband/verbs.h>
 
 #include <atomic>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -40,7 +41,10 @@ class IOEngine {
             size_t size, TransferStatus* status, TransferUniqueId id);
   void Write(MemoryDesc localSrc, size_t localOffset, MemoryDesc remoteDest, size_t remoteOffset,
              size_t size, TransferStatus* status, TransferUniqueId id);
-  TransferStatus* QueryTransferStatusRemoteToLocal(EngineKey remote, TransferUniqueId id);
+
+  // Take the transfer status of an inbound op
+  void QueryAndAckInboundTransferStatus(EngineKey remote, TransferUniqueId id,
+                                        TransferStatus* status);
 
  private:
   // Control plane methods
@@ -57,7 +61,8 @@ class IOEngine {
   void ShutdownDataPlane();
   application::RdmaEndpointConfig GetRdmaEndpointConfig();
 
-  void Notify(const application::RdmaEndpoint& ep, TransferStatus* status, TransferUniqueId id);
+  void RdmaNotifyTransfer(const application::RdmaEndpoint& ep, TransferStatus* status,
+                          TransferUniqueId id);
 
  public:
   // Config and descriptors
@@ -65,9 +70,12 @@ class IOEngine {
   EngineDesc desc;
 
  private:
+  // TODO: add a read-write for per-engine / per device members
+
   // Meta data store
   std::unordered_map<EngineKey, EngineDesc> engineKV;
   std::unordered_map<EngineKey, RdmaEpPairVec> rdmaEpKV;
+  std::unordered_map<uint32_t, std::pair<EngineKey, RdmaEpPair>> qpn2EngineKV;
 
   // memory meta data
   std::atomic<uint32_t> nextMemUid{0};
@@ -78,6 +86,12 @@ class IOEngine {
   uint32_t rdmaTrsfUidNum{1024};
   TransferUniqueId* rdmaTrsfUidBuf{nullptr};
   application::RdmaMemoryRegion rdmaTrsfUidMr;
+
+  struct TransferUidNotifMap {
+    mutable std::mutex mu;  // TODO：use read-write lock
+    std::unordered_set<TransferUniqueId> map;
+  };
+  std::unordered_map<EngineKey, std::unique_ptr<TransferUidNotifMap>> trsfUidNotifMaps;
 
  private:
   // Control plane related members

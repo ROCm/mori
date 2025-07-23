@@ -35,25 +35,36 @@ void TestMoriIOEngine() {
   MemoryDesc targetMem = target.RegisterMemory(targetBuf, bufSize, 0, MemoryLocationType::GPU);
 
   for (int i = 0; i < 64; i++) {
-    TransferStatus status;
+    TransferStatus initiatorStatus, targetStatus;
     TransferUniqueId id = initiator.AllocateTransferUniqueId();
-    initiator.Read(initatorMem, 0, targetMem, 0, bufSize, &status, id);
-    while (status.Code() == StatusCode::INIT) {
+    initiator.Read(initatorMem, 0, targetMem, 0, bufSize, &initiatorStatus, id);
+    while (initiatorStatus.Code() == StatusCode::INIT) {
     }
-    printf("Status message %s read value %d\n", status.Message().c_str(),
+    while (targetStatus.Code() == StatusCode::INIT) {
+      target.QueryAndAckInboundTransferStatus(initiator.GetEngineDesc().key, id, &targetStatus);
+    }
+    printf("Status message initiator %s target %s read value %d\n", initiatorStatus.Message().c_str(),targetStatus.Message().c_str(),
            reinterpret_cast<uint8_t*>(initiatorBuf)[511]);
   }
 
-  std::vector<TransferStatus> statusVec(64);
+  std::vector<TransferStatus> initiatorStatusVec(64);
+  std::vector<TransferStatus> targetStatusVec(64);
+  std::vector<TransferUniqueId> trsfIds(64);
+
   for (int i = 0; i < 64; i++) {
     TransferUniqueId id = initiator.AllocateTransferUniqueId();
-    initiator.Read(initatorMem, 0, targetMem, 0, bufSize, &statusVec[i], id);
+    trsfIds[i] = id;
+    initiator.Read(initatorMem, 0, targetMem, 0, bufSize, &initiatorStatusVec[i], id);
   }
 
   for (int i = 0; i < 64; i++) {
-    while (statusVec[i].Code() == StatusCode::INIT) {
+    while (initiatorStatusVec[i].Code() == StatusCode::INIT) {
     }
-    printf("Status message %s read value %d\n", statusVec[i].Message().c_str(),
+    while (targetStatusVec[i].Code() == StatusCode::INIT) {
+      target.QueryAndAckInboundTransferStatus(initiator.GetEngineDesc().key, trsfIds[i],
+                                              &targetStatusVec[i]);
+    }
+    printf("Status message %s read value %d\n", initiatorStatusVec[i].Message().c_str(),
            reinterpret_cast<uint8_t*>(initiatorBuf)[511]);
   }
 

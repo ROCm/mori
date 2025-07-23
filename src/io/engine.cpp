@@ -57,7 +57,7 @@ application::RdmaEndpoint IOEngine::CreateRdmaEndpoint() {
   // Add to epoll list
   epoll_event ev;
   ev.events = EPOLLIN;
-  ev.data.ptr = rdmaEp.ibvHandle.cq;
+  ev.data.u32 = rdmaEp.handle.qpn;
   assert(rdmaEp.ibvHandle.compCh);
   SYSCALL_RETURN_ZERO(
       epoll_ctl(rdmaCompChEpollFd, EPOLL_CTL_ADD, rdmaEp.ibvHandle.compCh->fd, &ev));
@@ -82,6 +82,8 @@ void IOEngine::RegisterRemoteEngine(EngineDesc remote) {
     engineKV.insert({remote.key, remote});
     rdmaEpKV.insert({remote.key, {}});
     rdmaEpKV[remote.key].push_back({localRdmaEp, msg.rdmaEph});
+    qpn2EngineKV.insert({localRdmaEp.handle.qpn, {remote.key, {localRdmaEp, msg.rdmaEph}}});
+    trsfUidNotifMaps.insert({remote.key, std::make_unique<TransferUidNotifMap>()});
   }
 
   tcpContext->CloseEndpoint(tcpEph);
@@ -90,6 +92,7 @@ void IOEngine::RegisterRemoteEngine(EngineDesc remote) {
 void IOEngine::DeRegisterRemoteEngine(EngineDesc remote) {
   engineKV.erase(remote.key);
   rdmaEpKV.erase(remote.key);
+  trsfUidNotifMaps.erase(remote.key);
 }
 
 MemoryDesc IOEngine::RegisterMemory(void* data, size_t length, int deviceId,
@@ -124,6 +127,8 @@ TransferUniqueId IOEngine::AllocateTransferUniqueId() {
 
 void IOEngine::Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remoteSrc,
                     size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id) {
+  assert(GetEngineDesc().backends.IsAvailableBackend(BackendType::RDMA) && "not implemented yet");
+
   assert((engineKV.find(remoteSrc.engineKey) != engineKV.end()) && "register remote engine first");
   assert((memPool.find(localDest.id) != memPool.end()) && "register local memory first");
 
@@ -156,20 +161,36 @@ void IOEngine::Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remoteS
     status->SetMessage(strerror(errno));
   }
 
-  Notify(ep, status, id);
+  RdmaNotifyTransfer(ep, status, id);
 }
 
 void IOEngine::Write(MemoryDesc localSrc, size_t localOffset, MemoryDesc remoteDest,
                      size_t remoteOffset, size_t size, TransferStatus* status,
-                     TransferUniqueId id) {}
+                     TransferUniqueId id) {
+  assert(GetEngineDesc().backends.IsAvailableBackend(BackendType::RDMA) && "not implemented yet");
+}
 
-void IOEngine::Notify(const application::RdmaEndpoint& ep, TransferStatus* status,
-                      TransferUniqueId id) {
+void IOEngine::QueryAndAckInboundTransferStatus(EngineKey remote, TransferUniqueId id,
+                                                TransferStatus* status) {
+  assert(GetEngineDesc().backends.IsAvailableBackend(BackendType::RDMA) && "not implemented yet");
+
+  assert(trsfUidNotifMaps.find(remote) != trsfUidNotifMaps.end());
+  TransferUidNotifMap* notifMap = trsfUidNotifMaps[remote].get();
+  {
+    std::lock_guard<std::mutex> lock(notifMap->mu);
+    if (notifMap->map.find(id) == notifMap->map.end()) return;
+    notifMap->map.erase(id);
+    status->SetCode(StatusCode::SUCCESS);
+  }
+}
+
+void IOEngine::RdmaNotifyTransfer(const application::RdmaEndpoint& ep, TransferStatus* status,
+                                  TransferUniqueId id) {
   ibv_sge sg = {
       .addr = reinterpret_cast<uintptr_t>(&id), .length = sizeof(TransferUniqueId), .lkey = 0};
   struct ibv_send_wr wr = {.wr_id = id,
                            .opcode = IBV_WR_SEND,
-                           .send_flags = IBV_SEND_INLINE,
+                           .send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED,
                            .sg_list = &sg,
                            .num_sge = 1};
   struct ibv_send_wr* bad_wr;
@@ -236,6 +257,9 @@ void IOEngine::HandleControlPlaneProtocol(int fd) {
         if (rdmaEpKV.find(msg.engineDesc.key) == rdmaEpKV.end())
           rdmaEpKV.insert({msg.engineDesc.key, {}});
         rdmaEpKV[msg.engineDesc.key].push_back({localRdmaEp, msg.rdmaEph});
+        qpn2EngineKV.insert(
+            {localRdmaEp.handle.qpn, {msg.engineDesc.key, {localRdmaEp, msg.rdmaEph}}});
+        trsfUidNotifMaps.insert({msg.engineDesc.key, std::make_unique<TransferUidNotifMap>()});
 
         SYSCALL_RETURN_ZERO(epoll_ctl(epollFd, EPOLL_CTL_DEL, fd, NULL));
       }
@@ -274,22 +298,34 @@ void IOEngine::RdmaPollLoop() {
   while (running.load()) {
     int nfds = epoll_wait(rdmaCompChEpollFd, events, maxEvents, 5 /*ms*/);
     for (int i = 0; i < nfds; ++i) {
-      ibv_cq* cq = static_cast<ibv_cq*>(events[i].data.ptr);
+      uint32_t qpn = events[i].data.u32;
 
-      ibv_cq* ev_cq;
-      void* ev_ctx;
-      if (ibv_get_cq_event(cq->channel, &ev_cq, &ev_ctx)) continue;
-      ibv_ack_cq_events(ev_cq, 1);
-      ibv_req_notify_cq(ev_cq, 0);
+      assert(qpn2EngineKV.find(qpn) != qpn2EngineKV.end());
+      std::pair<EngineKey, RdmaEpPair> engineEpPair = qpn2EngineKV[qpn];
+      EngineKey engineKey = engineEpPair.first;
+      ibv_comp_channel* ch = engineEpPair.second.first.ibvHandle.compCh;
+
+      ibv_cq* cq;
+      void* evCtx;
+      if (ibv_get_cq_event(ch, &cq, &evCtx)) continue;
+      ibv_ack_cq_events(cq, 1);
+      ibv_req_notify_cq(cq, 0);
 
       // TODO: maybe take multiple cqes?
       ibv_wc wc;
       while (ibv_poll_cq(cq, 1, &wc) > 0) {
-        // Recv with imm is only used for notification of single-sided op (READ/WRITE)
+        // Recv is only used for notification of single-sided op (READ/WRITE)
         if (wc.opcode == IBV_WC_RECV) {
           uint64_t uidBufIdx = wc.wr_id;
-          TransferUniqueId remoteId = rdmaTrsfUidBuf[uidBufIdx];
-          printf("recv notif for transfer %d\n", remoteId);
+          TransferUniqueId remoteTrsfId = rdmaTrsfUidBuf[uidBufIdx];
+          printf("recv notif for transfer %d\n", remoteTrsfId);
+
+          assert(trsfUidNotifMaps.find(engineKey) != trsfUidNotifMaps.end());
+          TransferUidNotifMap* notifMap = trsfUidNotifMaps[engineKey].get();
+          {
+            std::lock_guard<std::mutex> lock(notifMap->mu);
+            notifMap->map.insert(remoteTrsfId);
+          }
 
           // replenish recv wr
           ibv_sge sge = {.addr = reinterpret_cast<uintptr_t>(rdmaTrsfUidBuf + uidBufIdx),
