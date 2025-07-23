@@ -20,7 +20,8 @@ enum class MemoryLocationType : uint32_t {
 
 enum class StatusCode : uint32_t {
   SUCCESS = 0,
-  ERROR = 1,
+  INIT = 1,
+  ERROR = 2,
 };
 
 }  // namespace io

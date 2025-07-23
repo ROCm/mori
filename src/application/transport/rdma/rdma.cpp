@@ -15,7 +15,10 @@ namespace application {
 /* ---------------------------------------------------------------------------------------------- */
 RdmaDeviceContext::RdmaDeviceContext(RdmaDevice* device, ibv_pd* inPd) : device(device), pd(inPd) {}
 
-RdmaDeviceContext::~RdmaDeviceContext() { ibv_dealloc_pd(pd); }
+RdmaDeviceContext::~RdmaDeviceContext() {
+  ibv_dealloc_pd(pd);
+  if (srq != nullptr) ibv_destroy_srq(srq);
+}
 
 RdmaDevice* RdmaDeviceContext::GetRdmaDevice() { return device; }
 
@@ -39,6 +42,16 @@ void RdmaDeviceContext::DeRegisterRdmaMemoryRegion(void* ptr) {
   ibv_mr* mr = mrPool[ptr];
   ibv_dereg_mr(mr);
   mrPool.erase(ptr);
+}
+
+ibv_srq* RdmaDeviceContext::CreateRdmaSrqIfNx(const RdmaEndpointConfig& config) {
+  assert(config.maxMsgSge <= GetRdmaDevice()->GetDeviceAttr()->orig_attr.max_sge);
+  if (srq == nullptr) {
+    ibv_srq_init_attr srqAttr = {
+        .attr = {.max_wr = config.maxMsgsNum, .max_sge = config.maxMsgSge, .srq_limit = 0}};
+    srq = ibv_create_srq(pd, &srqAttr);
+  }
+  return srq;
 }
 
 /* ---------------------------------------------------------------------------------------------- */

@@ -34,7 +34,6 @@ struct BackendBitmap {
 };
 
 using EngineKey = std::string;
-using MemoryUniqueId = uint32_t;
 
 struct EngineDesc {
   EngineKey key;
@@ -51,20 +50,36 @@ struct MemoryBackendDescs {
   MSGPACK_DEFINE(rdmaMr);
 };
 
+using MemoryUniqueId = uint32_t;
+
 struct MemoryDesc {
   EngineKey engineKey;
-  MemoryUniqueId id;
-  int deviceId;
-  void* data;
-  size_t length;
+  MemoryUniqueId id{0};
+  int deviceId{-1};
+  void* data{nullptr};
+  size_t length{0};
   MemoryLocationType loc;
   MemoryBackendDescs backendDesc;
 
   MSGPACK_DEFINE(engineKey, id, deviceId, length, loc, backendDesc);
 };
 
+using TransferUniqueId = uint64_t;
+
 struct TransferStatus {
-  StatusCode code;
+ public:
+  TransferStatus() = default;
+  ~TransferStatus() = default;
+
+  StatusCode Code() { return code.load(std::memory_order_relaxed); }
+  std::string Message() { return msg; }
+
+  void SetCode(enum StatusCode val) { code.store(val, std::memory_order_relaxed); }
+  void SetMessage(const std::string& val) { msg = val; }
+
+ private:
+  std::atomic<StatusCode> code{StatusCode::INIT};
+  std::string msg;
 };
 
 }  // namespace io

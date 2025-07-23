@@ -52,9 +52,11 @@ struct RdmaEndpointConfig {
   uint32_t gidIdx{1};  // TODO: auto detect?
   uint32_t maxMsgsNum{128};
   uint32_t maxCqeNum{128};
+  uint32_t maxMsgSge{1};
   uint32_t alignment{PAGESIZE};
   bool onGpu{false};
   bool withCompChannel{false};
+  bool enableSrq{false};
 };
 
 struct InfiniBandEndpointHandle {
@@ -114,6 +116,7 @@ struct CompletionQueueHandle {
 struct IBVerbsHandle {
   ibv_qp* qp{nullptr};
   ibv_cq* cq{nullptr};
+  ibv_srq* srq{nullptr};
   ibv_comp_channel* compCh{nullptr};
 };
 
@@ -170,11 +173,15 @@ class RdmaDeviceContext {
     assert(false && "not implementd");
   }
 
+  ibv_srq* CreateRdmaSrqIfNx(const RdmaEndpointConfig&);
+
   RdmaDevice* GetRdmaDevice();
   ibv_context* GetIbvContext();
+  ibv_srq* GetIbvSrq() { return srq; }
 
  protected:
-  ibv_pd* pd;
+  ibv_pd* pd{nullptr};
+  ibv_srq* srq{nullptr};
 
  private:
   RdmaDevice* device;

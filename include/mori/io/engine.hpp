@@ -35,8 +35,12 @@ class IOEngine {
   MemoryDesc RegisterMemory(void* data, size_t length, int device, MemoryLocationType loc);
   void DeRegisterMemory(const MemoryDesc& desc);
 
-  void Read(MemoryDesc local, size_t localOffset, MemoryDesc remote, size_t remoteOffset,
-            size_t size, TransferStatus& status);
+  TransferUniqueId AllocateTransferUniqueId();
+  void Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remoteSrc, size_t remoteOffset,
+            size_t size, TransferStatus* status, TransferUniqueId id);
+  void Write(MemoryDesc localSrc, size_t localOffset, MemoryDesc remoteDest, size_t remoteOffset,
+             size_t size, TransferStatus* status, TransferUniqueId id);
+  TransferStatus* QueryTransferStatusRemoteToLocal(EngineKey remote, TransferUniqueId id);
 
  private:
   // Control plane methods
@@ -51,6 +55,9 @@ class IOEngine {
   void RdmaPollLoop();
   void StartDataPlane();
   void ShutdownDataPlane();
+  application::RdmaEndpointConfig GetRdmaEndpointConfig();
+
+  void Notify(const application::RdmaEndpoint& ep, TransferStatus* status, TransferUniqueId id);
 
  public:
   // Config and descriptors
@@ -63,8 +70,14 @@ class IOEngine {
   std::unordered_map<EngineKey, RdmaEpPairVec> rdmaEpKV;
 
   // memory meta data
-  std::atomic<uint32_t> nextMemUid;
+  std::atomic<uint32_t> nextMemUid{0};
   std::unordered_map<MemoryUniqueId, MemoryDesc> memPool;
+
+  // transfer meta data
+  std::atomic<uint32_t> nextTransferUid{0};
+  uint32_t rdmaTrsfUidNum{1024};
+  TransferUniqueId* rdmaTrsfUidBuf{nullptr};
+  application::RdmaMemoryRegion rdmaTrsfUidMr;
 
  private:
   // Control plane related members

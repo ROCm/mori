@@ -9,7 +9,10 @@ namespace application {
 IBVerbsDeviceContext::IBVerbsDeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd)
     : RdmaDeviceContext(rdma_device, inPd) {}
 
-IBVerbsDeviceContext::~IBVerbsDeviceContext() {}
+IBVerbsDeviceContext::~IBVerbsDeviceContext() {
+  for (auto& it : qpPool) ibv_destroy_qp(it.second.get());
+  for (auto& it : cqPool) ibv_destroy_cq(it.second.get());
+}
 
 RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& config) {
   ibv_context* context = GetIbvContext();
@@ -30,28 +33,37 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
     assert(false && "unsupported link layer");
   }
 
-  // TODO: we need to add more options in config, include min cqe num for ib_create_cq and max sge
-  // for qp
+  // TODO: we need to add more options in config, include min cqe num for ib_create_cq
   endpoint.ibvHandle.compCh = config.withCompChannel ? ibv_create_comp_channel(context) : nullptr;
   endpoint.ibvHandle.cq =
       ibv_create_cq(context, config.maxCqeNum, NULL, endpoint.ibvHandle.compCh, 0);
   assert(endpoint.ibvHandle.cq);
 
-  // TODO: should also manage the lifecycle of completion channel
+  // TODO: should also manage the lifecycle of completion channel && srq
   if (config.withCompChannel)
     assert(endpoint.ibvHandle.compCh &&
            (endpoint.ibvHandle.cq->channel == endpoint.ibvHandle.compCh));
-  printf("create %p %p\n", endpoint.ibvHandle.cq, endpoint.ibvHandle.compCh);
+
+  assert(config.maxMsgSge <= GetRdmaDevice()->GetDeviceAttr()->orig_attr.max_sge);
+  endpoint.ibvHandle.srq = config.enableSrq ? CreateRdmaSrqIfNx(config) : nullptr;
 
   ibv_qp_init_attr qpAttr = {.send_cq = endpoint.ibvHandle.cq,
                              .recv_cq = endpoint.ibvHandle.cq,
-                             .cap = {.max_send_wr = config.maxMsgsNum,
+                             .srq = endpoint.ibvHandle.srq,
+                             .cap =
+                                 {
+                                     .max_send_wr = config.maxMsgsNum,
                                      .max_recv_wr = config.maxMsgsNum,
-                                     .max_send_sge = 1,
-                                     .max_recv_sge = 1},
+                                     .max_send_sge = config.maxMsgSge,
+                                     .max_recv_sge = config.maxMsgSge,
+                                 },
                              .qp_type = IBV_QPT_RC};
   endpoint.ibvHandle.qp = ibv_create_qp(pd, &qpAttr);
+  assert(endpoint.ibvHandle.qp);
   endpoint.handle.qpn = endpoint.ibvHandle.qp->qp_num;
+
+  if (config.enableSrq)
+    assert(endpoint.ibvHandle.srq && (endpoint.ibvHandle.qp->srq == endpoint.ibvHandle.srq));
 
   cqPool.insert({endpoint.ibvHandle.cq, std::move(std::unique_ptr<ibv_cq>(endpoint.ibvHandle.cq))});
   qpPool.insert(

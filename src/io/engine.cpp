@@ -35,29 +35,29 @@ IOEngine::~IOEngine() {
   ShutdownDataPlane();
 }
 
-EngineDesc IOEngine::GetEngineDesc() {
-  printf("before return host %s key %s %d\n", desc.tcpHandle.host.c_str(), desc.key.c_str(),
-         desc.backends.bits);
-  return desc;
-}
+EngineDesc IOEngine::GetEngineDesc() { return desc; }
 
-application::RdmaEndpoint IOEngine::CreateRdmaEndpoint() {
+application::RdmaEndpointConfig IOEngine::GetRdmaEndpointConfig() {
   application::RdmaEndpointConfig config;
   config.portId = devicePort.second;
   config.gidIdx = 1;
   config.maxMsgsNum = 1024;
+  config.maxMsgSge = 1;
   config.maxCqeNum = 1024;
   config.alignment = 4096;
   config.withCompChannel = true;
-  application::RdmaEndpoint rdmaEp = rdmaDeviceContext->CreateRdmaEndpoint(config);
+  config.enableSrq = true;
+  return config;
+}
+
+application::RdmaEndpoint IOEngine::CreateRdmaEndpoint() {
+  application::RdmaEndpoint rdmaEp = rdmaDeviceContext->CreateRdmaEndpoint(GetRdmaEndpointConfig());
   // Register notification
   SYSCALL_RETURN_ZERO(ibv_req_notify_cq(rdmaEp.ibvHandle.cq, 0));
   // Add to epoll list
   epoll_event ev;
   ev.events = EPOLLIN;
   ev.data.ptr = rdmaEp.ibvHandle.cq;
-  printf("%s %p %p\n", GetEngineDesc().key.c_str(), ev.data.ptr,
-         static_cast<ibv_cq*>(ev.data.ptr)->channel);
   assert(rdmaEp.ibvHandle.compCh);
   SYSCALL_RETURN_ZERO(
       epoll_ctl(rdmaCompChEpollFd, EPOLL_CTL_ADD, rdmaEp.ibvHandle.compCh->fd, &ev));
@@ -72,7 +72,6 @@ void IOEngine::RegisterRemoteEngine(EngineDesc remote) {
   BackendBitmap commonBes = desc.backends.FindCommonBackends(remote.backends);
   if (commonBes.IsAvailableBackend(BackendType::RDMA)) {
     Protocol protocol(tcpEph);
-    printf("%s reg remote\n", GetEngineDesc().key.c_str());
     application::RdmaEndpoint localRdmaEp = CreateRdmaEndpoint();
     protocol.WriteMessageRegEngine(MessageRegEngine{GetEngineDesc(), localRdmaEp.handle});
     MessageHeader hdr = protocol.ReadMessageHeader();
@@ -119,44 +118,73 @@ void IOEngine::DeRegisterMemory(const MemoryDesc& desc) {
   }
 }
 
-void IOEngine::Read(MemoryDesc local, size_t localOffset, MemoryDesc remote, size_t remoteOffset,
-                    size_t size, TransferStatus& status) {
-  assert((engineKV.find(remote.engineKey) != engineKV.end()) && "register remote engine first");
-  assert((memPool.find(local.id) != memPool.end()) && "register local memory first");
+TransferUniqueId IOEngine::AllocateTransferUniqueId() {
+  return nextTransferUid.fetch_add(1, std::memory_order_relaxed);
+}
 
-  if (rdmaEpKV.find(remote.engineKey) == rdmaEpKV.end()) {
+void IOEngine::Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remoteSrc,
+                    size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id) {
+  assert((engineKV.find(remoteSrc.engineKey) != engineKV.end()) && "register remote engine first");
+  assert((memPool.find(localDest.id) != memPool.end()) && "register local memory first");
+
+  if (rdmaEpKV.find(remoteSrc.engineKey) == rdmaEpKV.end()) {
     // TODO make connection
     assert(false && "lazy connection built up has not yet implemented");
   }
 
   // TODO: add selection logics when qp pool feature is ready
-  application::RdmaEndpoint ep = rdmaEpKV[remote.engineKey][0].first;
-  SYSCALL_RETURN_ZERO(ibv_req_notify_cq(ep.ibvHandle.cq, 0));
+  application::RdmaEndpoint ep = rdmaEpKV[remoteSrc.engineKey][0].first;
 
   ibv_sge sge{};
-  sge.addr = reinterpret_cast<uint64_t>(local.data) + localOffset;
+  sge.addr = reinterpret_cast<uint64_t>(localDest.data) + localOffset;
   sge.length = size;
-  sge.lkey = local.backendDesc.rdmaMr.lkey;
+  sge.lkey = localDest.backendDesc.rdmaMr.lkey;
 
   ibv_send_wr wr{};
   ibv_send_wr* bad_wr = nullptr;
-  wr.wr_id = reinterpret_cast<uint64_t>(&status);
+  wr.wr_id = reinterpret_cast<uint64_t>(status);
   wr.sg_list = &sge;
   wr.num_sge = 1;
   wr.opcode = IBV_WR_RDMA_READ;
   wr.send_flags = IBV_SEND_SIGNALED;
-  wr.wr.rdma.remote_addr = reinterpret_cast<uint64_t>(remote.data) + remoteOffset;
-  wr.wr.rdma.rkey = remote.backendDesc.rdmaMr.rkey;
+  wr.wr.rdma.remote_addr = reinterpret_cast<uint64_t>(remoteSrc.data) + remoteOffset;
+  wr.wr.rdma.rkey = remoteSrc.backendDesc.rdmaMr.rkey;
 
-  assert(!ibv_post_send(ep.ibvHandle.qp, &wr, &bad_wr) && "ibv_post_send RDMA READ");
+  int ret = ibv_post_send(ep.ibvHandle.qp, &wr, &bad_wr);
+  if (ret != 0) {
+    status->SetCode(StatusCode::ERROR);
+    status->SetMessage(strerror(errno));
+  }
+
+  Notify(ep, status, id);
+}
+
+void IOEngine::Write(MemoryDesc localSrc, size_t localOffset, MemoryDesc remoteDest,
+                     size_t remoteOffset, size_t size, TransferStatus* status,
+                     TransferUniqueId id) {}
+
+void IOEngine::Notify(const application::RdmaEndpoint& ep, TransferStatus* status,
+                      TransferUniqueId id) {
+  ibv_sge sg = {
+      .addr = reinterpret_cast<uintptr_t>(&id), .length = sizeof(TransferUniqueId), .lkey = 0};
+  struct ibv_send_wr wr = {.wr_id = id,
+                           .opcode = IBV_WR_SEND,
+                           .send_flags = IBV_SEND_INLINE,
+                           .sg_list = &sg,
+                           .num_sge = 1};
+  struct ibv_send_wr* bad_wr;
+  int ret = ibv_post_send(ep.ibvHandle.qp, &wr, &bad_wr);
+  if (ret != 0) {
+    status->SetCode(StatusCode::ERROR);
+    status->SetMessage(strerror(errno));
+  }
+  return;
 }
 
 void IOEngine::StartControlPlane() {
   if (running.load()) return;
 
   tcpContext->Listen();
-  printf("host %s port %u fd %d\n", tcpContext->GetHost().c_str(), tcpContext->GetPort(),
-         tcpContext->GetListenFd());
   // Create epoll fd
   epollFd = epoll_create1(EPOLL_CLOEXEC);
   assert(epollFd >= 0);
@@ -247,7 +275,7 @@ void IOEngine::RdmaPollLoop() {
     int nfds = epoll_wait(rdmaCompChEpollFd, events, maxEvents, 5 /*ms*/);
     for (int i = 0; i < nfds; ++i) {
       ibv_cq* cq = static_cast<ibv_cq*>(events[i].data.ptr);
-      printf("%s %p %p\n", GetEngineDesc().key.c_str(), cq, cq->channel);
+
       ibv_cq* ev_cq;
       void* ev_ctx;
       if (ibv_get_cq_event(cq->channel, &ev_cq, &ev_ctx)) continue;
@@ -257,10 +285,32 @@ void IOEngine::RdmaPollLoop() {
       // TODO: maybe take multiple cqes?
       ibv_wc wc;
       while (ibv_poll_cq(cq, 1, &wc) > 0) {
-        TransferStatus* status = reinterpret_cast<TransferStatus*>(wc.wr_id);
-        // TODO: process cqe correctly
-        printf("poll cq success!\n");
-        status->code = StatusCode::SUCCESS;
+        // Recv with imm is only used for notification of single-sided op (READ/WRITE)
+        if (wc.opcode == IBV_WC_RECV) {
+          uint64_t uidBufIdx = wc.wr_id;
+          TransferUniqueId remoteId = rdmaTrsfUidBuf[uidBufIdx];
+          printf("recv notif for transfer %d\n", remoteId);
+
+          // replenish recv wr
+          ibv_sge sge = {.addr = reinterpret_cast<uintptr_t>(rdmaTrsfUidBuf + uidBufIdx),
+                         .length = sizeof(TransferUniqueId),
+                         .lkey = rdmaTrsfUidMr.lkey};
+          ibv_recv_wr wr = {.wr_id = uidBufIdx, .sg_list = &sge, .num_sge = 1};
+          ibv_recv_wr* bad;
+          SYSCALL_RETURN_ZERO(ibv_post_srq_recv(rdmaDeviceContext->GetIbvSrq(), &wr, &bad));
+        } else if (wc.opcode == IBV_WC_SEND) {
+          uint64_t id = wc.wr_id;
+          printf("send notif for transfer %d\n", id);
+        } else {
+          printf("data mov for transfer %d %d\n", wc.wr_id, wc.opcode);
+          TransferStatus* status = reinterpret_cast<TransferStatus*>(wc.wr_id);
+          if (wc.status == IBV_WC_SUCCESS) {
+            status->SetCode(StatusCode::SUCCESS);
+          } else {
+            status->SetCode(StatusCode::ERROR);
+          }
+          status->SetMessage(ibv_wc_status_str(wc.status));
+        }
       }
     }
   }
@@ -275,15 +325,29 @@ void IOEngine::StartDataPlane() {
     assert(activeDevicePortList.size() > 0);
     devicePort = activeDevicePortList[desc.gpuId % activeDevicePortList.size()];
     application::RdmaDevice* device = devicePort.first;
-    printf("%d nic id\n", desc.gpuId % activeDevicePortList.size());
     rdmaDeviceContext = device->CreateRdmaDeviceContext();
+    ibv_srq* srq = rdmaDeviceContext->CreateRdmaSrqIfNx(GetRdmaEndpointConfig());
 
     // Start RDMA poll thread
     // Create epoll fd
     rdmaCompChEpollFd = epoll_create1(EPOLL_CLOEXEC);
     assert(rdmaCompChEpollFd >= 0);
-
     rdmaPollThd = std::thread([this] { RdmaPollLoop(); });
+
+    // Allocate notification buffer
+    SYSCALL_RETURN_ZERO(posix_memalign(reinterpret_cast<void**>(&rdmaTrsfUidBuf), PAGESIZE,
+                                       rdmaTrsfUidNum * sizeof(TransferUniqueId)));
+    rdmaTrsfUidMr = rdmaDeviceContext->RegisterRdmaMemoryRegion(
+        rdmaTrsfUidBuf, rdmaTrsfUidNum * sizeof(TransferUniqueId));
+    // Pre post notification receive wr
+    for (uint64_t i = 0; i < rdmaTrsfUidNum; i++) {
+      ibv_sge sge = {.addr = reinterpret_cast<uintptr_t>(rdmaTrsfUidBuf + i),
+                     .length = sizeof(TransferUniqueId),
+                     .lkey = rdmaTrsfUidMr.lkey};
+      ibv_recv_wr wr = {.wr_id = i, .sg_list = &sge, .num_sge = 1};
+      ibv_recv_wr* bad;
+      SYSCALL_RETURN_ZERO(ibv_post_srq_recv(srq, &wr, &bad));
+    }
   }
 
   if (desc.backends.IsAvailableBackend(BackendType::XGMI)) {
@@ -298,6 +362,7 @@ void IOEngine::StartDataPlane() {
 void IOEngine::ShutdownDataPlane() {
   running.store(false);
   if (rdmaPollThd.joinable()) rdmaPollThd.join();
+  free(rdmaTrsfUidBuf);
 }
 
 }  // namespace io

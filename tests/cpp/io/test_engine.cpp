@@ -34,11 +34,29 @@ void TestMoriIOEngine() {
       initiator.RegisterMemory(initiatorBuf, bufSize, 0, MemoryLocationType::GPU);
   MemoryDesc targetMem = target.RegisterMemory(targetBuf, bufSize, 0, MemoryLocationType::GPU);
 
-  TransferStatus status;
-  initiator.Read(initatorMem, 0, targetMem, 0, bufSize, status);
-  printf("%d\n", reinterpret_cast<uint8_t*>(initiatorBuf)[511]);
+  for (int i = 0; i < 64; i++) {
+    TransferStatus status;
+    TransferUniqueId id = initiator.AllocateTransferUniqueId();
+    initiator.Read(initatorMem, 0, targetMem, 0, bufSize, &status, id);
+    while (status.Code() == StatusCode::INIT) {
+    }
+    printf("Status message %s read value %d\n", status.Message().c_str(),
+           reinterpret_cast<uint8_t*>(initiatorBuf)[511]);
+  }
 
-  // initiator.RdmaPollLoop();
+  std::vector<TransferStatus> statusVec(64);
+  for (int i = 0; i < 64; i++) {
+    TransferUniqueId id = initiator.AllocateTransferUniqueId();
+    initiator.Read(initatorMem, 0, targetMem, 0, bufSize, &statusVec[i], id);
+  }
+
+  for (int i = 0; i < 64; i++) {
+    while (statusVec[i].Code() == StatusCode::INIT) {
+    }
+    printf("Status message %s read value %d\n", statusVec[i].Message().c_str(),
+           reinterpret_cast<uint8_t*>(initiatorBuf)[511]);
+  }
+
   initiator.DeRegisterMemory(initatorMem);
   target.DeRegisterMemory(targetMem);
 }
