@@ -43,7 +43,8 @@ void TestMoriIOEngine() {
     while (targetStatus.Code() == StatusCode::INIT) {
       target.QueryAndAckInboundTransferStatus(initiator.GetEngineDesc().key, id, &targetStatus);
     }
-    printf("Status message initiator %s target %s read value %d\n", initiatorStatus.Message().c_str(),targetStatus.Message().c_str(),
+    printf("Status message initiator %s target %s read value %d\n",
+           initiatorStatus.Message().c_str(), targetStatus.Message().c_str(),
            reinterpret_cast<uint8_t*>(initiatorBuf)[511]);
   }
 
@@ -64,7 +65,8 @@ void TestMoriIOEngine() {
       target.QueryAndAckInboundTransferStatus(initiator.GetEngineDesc().key, trsfIds[i],
                                               &targetStatusVec[i]);
     }
-    printf("Status message %s read value %d\n", initiatorStatusVec[i].Message().c_str(),
+    printf("Status message initiator %s target %s read value %d\n",
+           initiatorStatusVec[i].Message().c_str(), targetStatusVec[i].Message().c_str(),
            reinterpret_cast<uint8_t*>(initiatorBuf)[511]);
   }
 

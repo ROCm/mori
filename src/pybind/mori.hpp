@@ -5,4 +5,5 @@
 namespace mori {
 void RegisterMoriOps(pybind11::module_& m);
 void RegisterMoriShmem(pybind11::module_& m);
+void RegisterMoriIo(pybind11::module_& m);
 }  // namespace mori
