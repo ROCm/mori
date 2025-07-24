@@ -3,6 +3,5 @@
 PYBIND11_MODULE(libmori_pybinds, m) {
   mori::RegisterMoriOps(m);
   mori::RegisterMoriShmem(m);
-
   mori::RegisterMoriIo(m);
 }

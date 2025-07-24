@@ -1,50 +1,68 @@
-# import pytest
-# import mori
+import pytest
+from tests.python.utils import get_free_port
+import torch
+import mori
+from mori.io import IOEngineConfig, BackendType, IOEngine, EngineDesc, MemoryDesc
 
 
-# def test_io_api():
-#     # Step1: Initialize io engines
-#     backends = [
-#         mori.io.BackendType.XGMI,
-#         mori.io.BackendType.RDMA,
-#         mori.io.BackendType.TCP,
-#     ]
-#     engine1 = mori.io.IOEngine(
-#         backends=backends,
-#         config=mori.io.IOEngineConfig(ip="localhost", port=get_free_port()),
-#     )
-#     engine2 = mori.io.IOEngine(
-#         backends=backends,
-#         config=mori.io.IOEngineConfig(ip="localhost", port=get_free_port()),
-#     )
+def test_engine_desc():
+    config = IOEngineConfig(
+        host="127.0.0.1",
+        port=get_free_port(),
+        gpuId=0,
+        backends=[BackendType.RDMA],
+    )
+    engine = IOEngine(key="engine", config=config)
+    desc = engine.get_engine_desc()
 
-#     # Step2: register remote io engines
-#     engine_1_desc = engine1.get_engine_desc()
-#     engine_2_desc = engine2.get_engine_desc()
+    packed_desc = desc.pack()
+    unpacked_desc = EngineDesc.unpack(packed_desc)
 
-#     engine_1_desc.register_remote_engine(engine_2_desc)
-#     engine_2_desc.register_remote_engine(engine_1_desc)
+    # TODO：add comparison operator and check equality
 
-#     # Step3: register memory buffer
-#     device1 = torch.device("cuda", 0)
-#     device2 = torch.device("cuda", 1)
-#     tensor1 = torch.ones([128, 8192]).to(device1)
-#     tensor2 = torch.ones([128, 8192]).to(device2)
 
-#     tensor_1_desc = engine_1_desc.register_memory(tensor1)
-#     tensor_2_desc = engine_2_desc.register_memory(tensor2)
+def test_io_api():
+    # Step1: Initialize io engines
+    config = IOEngineConfig(
+        host="127.0.0.1",
+        port=get_free_port(),
+        gpuId=0,
+        backends=[BackendType.RDMA],
+    )
+    initiator = IOEngine(key="initiator", config=config)
+    config.port = get_free_port()
+    target = IOEngine(key="target", config=config)
 
-#     # Step4: initiate tensfer
-#     future = engine1.write(tensor_1_desc, tensor_2_desc)
-#     status = future.result()
-#     if status != mori.io.StatusCode.SUCC:
-#         print("transfer failed")
-#         exit(1)
+    # Step2: register remote io engines
+    initiator_desc = initiator.get_engine_desc()
+    target_desc = target.get_engine_desc()
 
-#     # Step5: teardown
-#     engine1.deregister_memory(tensor_1_desc)
-#     engine2.deregister_memory(tensor_2_desc)
-#     engine1.deregister_remote_engine(engine_2_desc)
-#     engine2.deregister_remote_engine(engine_1_desc)
-#     del engine1
-#     del engine2
+    initiator.register_remote_engine(target_desc)
+    target.register_remote_engine(initiator_desc)
+
+    # Step3: register memory buffer
+    device1 = torch.device("cuda", 0)
+    device2 = torch.device("cuda", 1)
+    tensor1 = torch.ones([128, 8192]).to(device1)
+    tensor2 = torch.ones([128, 8192]).to(device2)
+
+    initiator_mem = initiator.register_torch_tensor(tensor1)
+    target_mem = target.register_torch_tensor(tensor2)
+
+    # Step4: initiate tensfer
+    transfer_uid = initiator.allocate_transfer_uid()
+    #     future = engine1.write(tensor_1_desc, tensor_2_desc)
+    #     status = future.result()
+    #     if status != mori.io.StatusCode.SUCC:
+    #         print("transfer failed")
+    #         exit(1)
+
+    # Step5: teardown
+    initiator.deregister_memory(initiator_mem)
+    target.deregister_memory(target_mem)
+
+    initiator.deregister_remote_engine(target_desc)
+    target.deregister_remote_engine(initiator_desc)
+
+    del initiator
+    del target

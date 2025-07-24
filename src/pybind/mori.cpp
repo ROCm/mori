@@ -266,7 +266,38 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readonly("gpuId", &mori::io::EngineDesc::gpuId)
       .def_readonly("hostname", &mori::io::EngineDesc::hostname)
       .def_property_readonly(
-          "backends", [](const mori::io::EngineDesc& d) { return d.backends.ToBackendTypeVec(); });
+          "backends", [](const mori::io::EngineDesc& d) { return d.backends.ToBackendTypeVec(); })
+      .def("pack",
+           [](const mori::io::EngineDesc& d) {
+             msgpack::sbuffer buf;
+             msgpack::pack(buf, d);
+             return py::bytes(buf.data(), buf.size());
+           })
+      .def_static("unpack", [](const py::bytes& b) {
+        Py_ssize_t len = PyBytes_Size(b.ptr());
+        const char* data = PyBytes_AsString(b.ptr());
+        auto out = msgpack::unpack(data, len);
+        return out.get().as<mori::io::EngineDesc>();
+      });
+
+  py::class_<mori::io::MemoryDesc>(m, "MemoryDesc")
+      .def(py::init<>())
+      .def_readonly("engineKey", &mori::io::MemoryDesc::engineKey)
+      .def_readonly("id", &mori::io::MemoryDesc::id)
+      .def_readonly("deviceId", &mori::io::MemoryDesc::deviceId)
+      .def_readonly("data", &mori::io::MemoryDesc::data)
+      .def_readonly("length", &mori::io::MemoryDesc::length)
+      .def_readonly("loc", &mori::io::MemoryDesc::loc);
+
+  py::class_<mori::io::IOEngine>(m, "IOEngine")
+      .def(py::init<const mori::io::EngineKey&, const mori::io::IOEngineConfig&>())
+      .def("GetEngineDesc", &mori::io ::IOEngine::GetEngineDesc)
+      .def("RegisterRemoteEngine", &mori::io ::IOEngine::RegisterRemoteEngine)
+      .def("DeRegisterRemoteEngine", &mori::io ::IOEngine::DeRegisterRemoteEngine)
+      .def("RegisterMemory", &mori::io ::IOEngine::RegisterMemory)
+      .def("DeRegisterMemory", &mori::io ::IOEngine::DeRegisterMemory)
+      .def("AllocateTransferUniqueId", &mori::io ::IOEngine::AllocateTransferUniqueId)
+      .def("Read", &mori::io ::IOEngine::Read);
 }
 
 }  // namespace mori
