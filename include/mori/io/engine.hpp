@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -33,7 +34,7 @@ class IOEngine {
   void RegisterRemoteEngine(EngineDesc);
   void DeRegisterRemoteEngine(EngineDesc);
 
-  MemoryDesc RegisterMemory(void* data, size_t length, int device, MemoryLocationType loc);
+  MemoryDesc RegisterMemory(void* data, size_t size, int device, MemoryLocationType loc);
   void DeRegisterMemory(const MemoryDesc& desc);
 
   TransferUniqueId AllocateTransferUniqueId();
@@ -43,8 +44,7 @@ class IOEngine {
              size_t size, TransferStatus* status, TransferUniqueId id);
 
   // Take the transfer status of an inbound op
-  void QueryAndAckInboundTransferStatus(EngineKey remote, TransferUniqueId id,
-                                        TransferStatus* status);
+  bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
 
  private:
   // Control plane methods

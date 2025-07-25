@@ -2,7 +2,14 @@ import pytest
 from tests.python.utils import get_free_port
 import torch
 import mori
-from mori.io import IOEngineConfig, BackendType, IOEngine, EngineDesc, MemoryDesc
+from mori.io import (
+    IOEngineConfig,
+    BackendType,
+    IOEngine,
+    EngineDesc,
+    MemoryDesc,
+    StatusCode,
+)
 
 
 def test_engine_desc():
@@ -41,21 +48,35 @@ def test_io_api():
     target.register_remote_engine(initiator_desc)
 
     # Step3: register memory buffer
+    shape = [128, 8192]
     device1 = torch.device("cuda", 0)
     device2 = torch.device("cuda", 1)
-    tensor1 = torch.ones([128, 8192]).to(device1)
-    tensor2 = torch.ones([128, 8192]).to(device2)
+    tensor1 = torch.ones(shape).to(device1)
+    tensor2 = torch.ones(shape).to(device2)
 
     initiator_mem = initiator.register_torch_tensor(tensor1)
     target_mem = target.register_torch_tensor(tensor2)
 
     # Step4: initiate tensfer
     transfer_uid = initiator.allocate_transfer_uid()
-    #     future = engine1.write(tensor_1_desc, tensor_2_desc)
-    #     status = future.result()
-    #     if status != mori.io.StatusCode.SUCC:
-    #         print("transfer failed")
-    #         exit(1)
+    transfer_status = initiator.read(
+        initiator_mem, 0, target_mem, 0, initiator_mem.size, transfer_uid
+    )
+    while transfer_status.Code() == StatusCode.INIT:
+        pass
+    print(
+        f"read finished at initiator {transfer_status.Code()} {transfer_status.Message()}"
+    )
+
+    while True:
+        target_side_status = target.pop_inbound_transfer_status(
+            initiator_desc.key, transfer_uid
+        )
+        if not target_side_status:
+            continue
+    print(
+        f"read finished at target {target_side_status.Code()} {target_side_status.Message()}"
+    )
 
     # Step5: teardown
     initiator.deregister_memory(initiator_mem)

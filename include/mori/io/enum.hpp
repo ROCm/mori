@@ -22,6 +22,7 @@ enum class StatusCode : uint32_t {
   SUCCESS = 0,
   INIT = 1,
   ERROR = 2,
+  NOT_FOUND = 3,
 };
 
 }  // namespace io

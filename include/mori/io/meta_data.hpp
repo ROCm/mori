@@ -65,11 +65,11 @@ struct MemoryDesc {
   MemoryUniqueId id{0};
   int deviceId{-1};
   void* data{nullptr};
-  size_t length{0};
+  size_t size{0};
   MemoryLocationType loc;
   MemoryBackendDescs backendDesc;
 
-  MSGPACK_DEFINE(engineKey, id, deviceId, length, loc, backendDesc);
+  MSGPACK_DEFINE(engineKey, id, deviceId, size, loc, backendDesc);
 };
 
 using TransferUniqueId = uint64_t;

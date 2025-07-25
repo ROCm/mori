@@ -95,20 +95,18 @@ void IOEngine::DeRegisterRemoteEngine(EngineDesc remote) {
   trsfUidNotifMaps.erase(remote.key);
 }
 
-MemoryDesc IOEngine::RegisterMemory(void* data, size_t length, int deviceId,
-                                    MemoryLocationType loc) {
+MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int deviceId, MemoryLocationType loc) {
   MemoryDesc memDesc;
   memDesc.engineKey = desc.key;
   memDesc.id = nextMemUid.fetch_add(1, std::memory_order_relaxed);
   memDesc.deviceId = deviceId;
   memDesc.data = data;
-  memDesc.length = length;
+  memDesc.size = size;
   memDesc.loc = loc;
   memPool.insert({memDesc.id, memDesc});
 
   if (desc.backends.IsAvailableBackend(BackendType::RDMA)) {
-    application::RdmaMemoryRegion rdmaMr =
-        rdmaDeviceContext->RegisterRdmaMemoryRegion(data, length);
+    application::RdmaMemoryRegion rdmaMr = rdmaDeviceContext->RegisterRdmaMemoryRegion(data, size);
     memDesc.backendDesc.rdmaMr = rdmaMr;
   }
   return memDesc;
@@ -170,17 +168,18 @@ void IOEngine::Write(MemoryDesc localSrc, size_t localOffset, MemoryDesc remoteD
   assert(GetEngineDesc().backends.IsAvailableBackend(BackendType::RDMA) && "not implemented yet");
 }
 
-void IOEngine::QueryAndAckInboundTransferStatus(EngineKey remote, TransferUniqueId id,
-                                                TransferStatus* status) {
+bool IOEngine::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
+                                        TransferStatus* status) {
   assert(GetEngineDesc().backends.IsAvailableBackend(BackendType::RDMA) && "not implemented yet");
 
   assert(trsfUidNotifMaps.find(remote) != trsfUidNotifMaps.end());
   TransferUidNotifMap* notifMap = trsfUidNotifMaps[remote].get();
   {
     std::lock_guard<std::mutex> lock(notifMap->mu);
-    if (notifMap->map.find(id) == notifMap->map.end()) return;
+    if (notifMap->map.find(id) == notifMap->map.end()) return false;
     notifMap->map.erase(id);
     status->SetCode(StatusCode::SUCCESS);
+    return true;
   }
 }
 

@@ -38,3 +38,33 @@ class IOEngine:
 
     def allocate_transfer_uid(self):
         return self._engine.AllocateTransferUniqueId()
+
+    def read(
+        self,
+        local_dest_mem_desc,
+        local_offset,
+        remote_src_mem_desc,
+        remote_offset,
+        size,
+        transfer_uid,
+    ):
+        transfer_status = mori_cpp.TransferStatus()
+        self._engine.Read(
+            local_dest_mem_desc,
+            local_offset,
+            remote_src_mem_desc,
+            remote_offset,
+            size,
+            transfer_status,
+            transfer_uid,
+        )
+        return transfer_status
+
+    def pop_inbound_transfer_status(self, remote_key, transfer_uid):
+        transfer_status = mori_cpp.TransferStatus()
+        found = self._engine.PopInboundTransferStatus(
+            remote_key, transfer_uid, transfer_status
+        )
+        if found:
+            return transfer_status
+        return None

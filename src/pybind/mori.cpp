@@ -243,6 +243,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .value("SUCCESS", mori::io::StatusCode::SUCCESS)
       .value("INIT", mori::io::StatusCode::INIT)
       .value("ERROR", mori::io::StatusCode::ERROR)
+      .value("NOT_FOUND", mori::io::StatusCode::NOT_FOUND)
       .export_values();
 
   py::class_<mori::io::IOEngineConfig>(m, "IOEngineConfig")
@@ -286,7 +287,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readonly("id", &mori::io::MemoryDesc::id)
       .def_readonly("deviceId", &mori::io::MemoryDesc::deviceId)
       .def_readonly("data", &mori::io::MemoryDesc::data)
-      .def_readonly("length", &mori::io::MemoryDesc::length)
+      .def_readonly("size", &mori::io::MemoryDesc::size)
       .def_readonly("loc", &mori::io::MemoryDesc::loc);
 
   py::class_<mori::io::IOEngine>(m, "IOEngine")
@@ -297,7 +298,8 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("RegisterMemory", &mori::io ::IOEngine::RegisterMemory)
       .def("DeRegisterMemory", &mori::io ::IOEngine::DeRegisterMemory)
       .def("AllocateTransferUniqueId", &mori::io ::IOEngine::AllocateTransferUniqueId)
-      .def("Read", &mori::io ::IOEngine::Read);
+      .def("Read", &mori::io ::IOEngine::Read)
+      .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus);
 }
 
 }  // namespace mori
