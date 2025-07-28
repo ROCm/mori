@@ -11,6 +11,24 @@ MSGPACK_API_VERSION_NAMESPACE(MSGPACK_DEFAULT_API_NS) {
   namespace adaptor {
 
   template <>
+  struct pack<mori::io::BackendType> {
+    template <typename Stream>
+    msgpack::packer<Stream>& operator()(msgpack::packer<Stream>& o,
+                                        mori::io::BackendType loc) const {
+      o.pack(static_cast<uint32_t>(loc));
+      return o;
+    }
+  };
+
+  template <>
+  struct convert<mori::io::BackendType> {
+    const msgpack::object& operator()(const msgpack::object& o, mori::io::BackendType& loc) const {
+      loc = static_cast<mori::io::BackendType>(o.as<uint32_t>());
+      return o;
+    }
+  };
+
+  template <>
   struct pack<mori::io::MemoryLocationType> {
     template <typename Stream>
     msgpack::packer<Stream>& operator()(msgpack::packer<Stream>& o,
@@ -34,10 +52,9 @@ MSGPACK_API_VERSION_NAMESPACE(MSGPACK_DEFAULT_API_NS) {
     template <typename Stream>
     msgpack::packer<Stream>& operator()(msgpack::packer<Stream>& o,
                                         const mori::application::TCPContextHandle& ctx) const {
-      o.pack_array(3);
+      o.pack_array(2);
       o.pack(ctx.host);
       o.pack(ctx.port);
-      o.pack(ctx.listenFd);
       return o;
     }
   };
@@ -46,10 +63,9 @@ MSGPACK_API_VERSION_NAMESPACE(MSGPACK_DEFAULT_API_NS) {
   struct convert<mori::application::TCPContextHandle> {
     const msgpack::object& operator()(const msgpack::object& o,
                                       mori::application::TCPContextHandle& ctx) const {
-      if (o.type != msgpack::type::ARRAY || o.via.array.size != 3) throw msgpack::type_error();
+      if (o.type != msgpack::type::ARRAY || o.via.array.size != 2) throw msgpack::type_error();
       ctx.host = o.via.array.ptr[0].as<std::string>();
       ctx.port = o.via.array.ptr[1].as<uint16_t>();
-      ctx.listenFd = o.via.array.ptr[2].as<int>();
       return o;
     }
   };

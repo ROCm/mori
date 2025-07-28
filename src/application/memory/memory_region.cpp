@@ -13,9 +13,9 @@ application::RdmaMemoryRegion RdmaMemoryRegionManager::RegisterBuffer(void* ptr,
   return mr;
 }
 
-void RdmaMemoryRegionManager::DeRegisterBuffer(void* ptr) {
+void RdmaMemoryRegionManager::DeregisterBuffer(void* ptr) {
   if (mrPool.find(ptr) == mrPool.end()) return;
-  context.DeRegisterRdmaMemoryRegion(ptr);
+  context.DeregisterRdmaMemoryRegion(ptr);
   mrPool.erase(ptr);
 }
 

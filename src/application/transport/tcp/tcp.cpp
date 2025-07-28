@@ -49,30 +49,30 @@ TCPContext::TCPContext(std::string host, uint16_t port) {
 TCPContext::~TCPContext() { Close(); }
 
 void TCPContext::Listen() {
-  handle.listenFd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-  assert(handle.listenFd >= 0);
+  listenFd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  assert(listenFd >= 0);
 
   int opt = 1;
-  setsockopt(handle.listenFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(handle.port);
   addr.sin_addr.s_addr = inet_addr(handle.host.c_str());
 
-  SYSCALL_RETURN_ZERO(bind(handle.listenFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)));
+  SYSCALL_RETURN_ZERO(bind(listenFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)));
 
   socklen_t len = sizeof(addr);
-  getsockname(handle.listenFd, reinterpret_cast<sockaddr*>(&addr), &len);
+  getsockname(listenFd, reinterpret_cast<sockaddr*>(&addr), &len);
   handle.port = ntohs(addr.sin_port);
 
-  SYSCALL_RETURN_ZERO(listen(handle.listenFd, DEFAULT_LISTEN_BACKLOG));
+  SYSCALL_RETURN_ZERO(listen(listenFd, DEFAULT_LISTEN_BACKLOG));
 }
 
 void TCPContext::Close() {
-  if (handle.listenFd >= 0) {
-    SYSCALL_RETURN_ZERO(close(handle.listenFd));
-    handle.listenFd = -1;
+  if (listenFd >= 0) {
+    SYSCALL_RETURN_ZERO(close(listenFd));
+    listenFd = -1;
   }
   while (!endpoints.empty()) {
     auto it = endpoints.begin();
@@ -89,6 +89,7 @@ TCPEndpointHandle TCPContext::Connect(std::string remote, uint16_t port) {
   peer.sin_port = htons(port);
   peer.sin_addr.s_addr = inet_addr(remote.c_str());
 
+  printf("remote %s port %d\n", remote.c_str(), port);
   SYSCALL_RETURN_ZERO(connect(sock, reinterpret_cast<sockaddr*>(&peer), sizeof(peer)));
 
   TCPEndpointHandle ep{sock, peer};
@@ -103,7 +104,7 @@ TCPEndpointHandleVec TCPContext::Accept() {
   TCPEndpointHandleVec newEps;
 
   while (true) {
-    int sock = accept(handle.listenFd, reinterpret_cast<sockaddr*>(&peer), &len);
+    int sock = accept(listenFd, reinterpret_cast<sockaddr*>(&peer), &len);
     if (sock >= 0) {
       TCPEndpointHandle ep{sock, peer};
       newEps.push_back(ep);

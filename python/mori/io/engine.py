@@ -15,11 +15,17 @@ class IOEngine:
     def get_engine_desc(self):
         return self._engine.GetEngineDesc()
 
+    def create_backend(self, type: mori_cpp.BackendType):
+        return self._engine.CreateBackend(type, None)
+
+    def remove_backend(self, type: mori_cpp.BackendType):
+        return self._engine.RemoveBackend(type)
+
     def register_remote_engine(self, engine_desc: mori_cpp.EngineDesc):
         return self._engine.RegisterRemoteEngine(engine_desc)
 
     def deregister_remote_engine(self, engine_desc: mori_cpp.EngineDesc):
-        return self._engine.DeRegisterRemoteEngine(engine_desc)
+        return self._engine.DeregisterRemoteEngine(engine_desc)
 
     def register_torch_tensor(self, tensor: torch.Tensor):
         if not tensor.is_contiguous():
@@ -30,11 +36,13 @@ class IOEngine:
         )
         total_bytes = tensor.nelement() * tensor.element_size()
         device_id = tensor.device.index
+        if device_id is None:
+            device_id = -1
         mem_loc = TORCH_DEVICE_TYPE_MAP[tensor.device.type]
         return self._engine.RegisterMemory(data, total_bytes, device_id, mem_loc)
 
     def deregister_memory(self, mem_desc: mori_cpp.MemoryDesc):
-        return self._engine.DeRegisterMemory(mem_desc)
+        return self._engine.DeregisterMemory(mem_desc)
 
     def allocate_transfer_uid(self):
         return self._engine.AllocateTransferUniqueId()

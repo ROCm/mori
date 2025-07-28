@@ -21,6 +21,9 @@ struct MessageHeader {
 
 struct MessageRegEngine {
   EngineDesc engineDesc;
+
+  // TODO: protocol for generic backend info, we can use a msgpack vector with each backend info be
+  // a triple of (backend_type, bytes)
   application::RdmaEndpointHandle rdmaEph;
 
   MSGPACK_DEFINE(engineDesc, rdmaEph);

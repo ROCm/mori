@@ -130,8 +130,8 @@ void LocalRdmaOps() {
   }
 
   // 8 Finalize
-  device_context_1->DeRegisterRdmaMemoryRegion(send_buff);
-  device_context_2->DeRegisterRdmaMemoryRegion(recv_buff);
+  device_context_1->DeregisterRdmaMemoryRegion(send_buff);
+  device_context_2->DeregisterRdmaMemoryRegion(recv_buff);
 }
 
 int main() { LocalRdmaOps(); }

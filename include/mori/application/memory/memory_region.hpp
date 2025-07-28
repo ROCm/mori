@@ -15,7 +15,7 @@ class RdmaMemoryRegionManager {
   ~RdmaMemoryRegionManager();
 
   RdmaMemoryRegion RegisterBuffer(void* ptr, size_t size);
-  void DeRegisterBuffer(void* ptr);
+  void DeregisterBuffer(void* ptr);
 
   RdmaMemoryRegion Get(void* ptr) const;
 

@@ -2,7 +2,7 @@
 #include <vector>
 
 #include "mori/application/transport/tcp/tcp.hpp"
-#include "mori/io/protocol.hpp"
+#include "src/io/rdma/protocol.hpp"
 
 using namespace mori::application;
 using namespace mori::io;
@@ -34,10 +34,7 @@ void TestProtocol() {
 
   MessageRegEngine msg;
   msg.engineDesc.key = "initiator";
-  msg.engineDesc.gpuId = 1;
   msg.engineDesc.hostname = "test";
-  msg.engineDesc.backends = BackendBitmap({BackendType::RDMA, BackendType::TCP});
-  msg.engineDesc.tcpHandle = tcpInfoPair.first.first->handle;
   msg.rdmaEph.psn = 22;
   msg.rdmaEph.qpn = 35;
   msg.rdmaEph.portId = 9999;
@@ -52,10 +49,7 @@ void TestProtocol() {
   MessageRegEngine recv = target.ReadMessageRegEngine(hdr.len);
 
   assert(recv.engineDesc.key == msg.engineDesc.key);
-  assert(recv.engineDesc.gpuId == msg.engineDesc.gpuId);
   assert(recv.engineDesc.hostname == msg.engineDesc.hostname);
-  assert(recv.engineDesc.backends == msg.engineDesc.backends);
-  assert(recv.engineDesc.tcpHandle == msg.engineDesc.tcpHandle);
   assert(recv.rdmaEph == msg.rdmaEph);
 
   for (int i = 0; i < sizeof(msg.rdmaEph.eth.gid); i++) assert(recv.rdmaEph.eth.gid[i] == i);

@@ -12,10 +12,7 @@ void TestMoriIOEngine() {
   IOEngineConfig config;
   config.host = "127.0.0.1";
   config.port = 0;
-  config.backends = {BackendType::RDMA};
-  config.gpuId = 0;
   IOEngine initiator("initiator", config);
-  config.gpuId = 1;
   IOEngine target("target", config);
 
   EngineDesc initiatorEngineDesc = initiator.GetEngineDesc();
@@ -70,8 +67,8 @@ void TestMoriIOEngine() {
            reinterpret_cast<uint8_t*>(initiatorBuf)[511]);
   }
 
-  initiator.DeRegisterMemory(initatorMem);
-  target.DeRegisterMemory(targetMem);
+  initiator.DeregisterMemory(initatorMem);
+  target.DeregisterMemory(targetMem);
 }
 
 int main() { TestMoriIOEngine(); }

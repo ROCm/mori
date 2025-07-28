@@ -108,8 +108,8 @@ void LocalRdmaOps() {
   std::cout << "After atomic op value = " << value << std::endl;  
 
   // 8 Finalize
-  deviceContextSend->DeRegisterRdmaMemoryRegion(sendBuf);
-  deviceContextRecv->DeRegisterRdmaMemoryRegion(recvBuf);
+  deviceContextSend->DeregisterRdmaMemoryRegion(sendBuf);
+  deviceContextRecv->DeregisterRdmaMemoryRegion(recvBuf);
 }
 
 int main() { LocalRdmaOps(); }

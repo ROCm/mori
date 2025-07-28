@@ -1,7 +1,8 @@
 add_library(
     mori_io SHARED
     engine.cpp
-    protocol.cpp
+    rdma/protocol.cpp
+    rdma/backend_impl.cpp
 )
 
 target_include_directories(mori_io PUBLIC ${CMAKE_SOURCE_DIR}/include)

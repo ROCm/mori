@@ -3,6 +3,7 @@
 #include <ATen/hip/HIPContext.h>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
+#include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <torch/python.h>
 
@@ -247,13 +248,9 @@ void RegisterMoriIo(pybind11::module_& m) {
       .export_values();
 
   py::class_<mori::io::IOEngineConfig>(m, "IOEngineConfig")
-      .def(py::init<std::string, uint16_t, int, mori::io::BackendTypeVec>(), py::arg("host") = "",
-           py::arg("port") = 0, py::arg("gpuId") = -1,
-           py::arg("backends") = mori::io::BackendTypeVec{})
+      .def(py::init<std::string, uint16_t>(), py::arg("host") = "", py::arg("port") = 0)
       .def_readwrite("host", &mori::io::IOEngineConfig::host)
-      .def_readwrite("port", &mori::io::IOEngineConfig::port)
-      .def_readwrite("gpuId", &mori::io::IOEngineConfig::gpuId)
-      .def_readwrite("backends", &mori::io::IOEngineConfig::backends);
+      .def_readwrite("port", &mori::io::IOEngineConfig::port);
 
   py::class_<mori::io::TransferStatus>(m, "TransferStatus")
       .def(py::init<>())
@@ -264,10 +261,10 @@ void RegisterMoriIo(pybind11::module_& m) {
 
   py::class_<mori::io::EngineDesc>(m, "EngineDesc")
       .def_readonly("key", &mori::io::EngineDesc::key)
-      .def_readonly("gpuId", &mori::io::EngineDesc::gpuId)
       .def_readonly("hostname", &mori::io::EngineDesc::hostname)
-      .def_property_readonly(
-          "backends", [](const mori::io::EngineDesc& d) { return d.backends.ToBackendTypeVec(); })
+      .def_readonly("host", &mori::io::EngineDesc::host)
+      .def_readonly("port", &mori::io::EngineDesc::port)
+      .def(pybind11::self == pybind11::self)
       .def("pack",
            [](const mori::io::EngineDesc& d) {
              msgpack::sbuffer buf;
@@ -283,20 +280,25 @@ void RegisterMoriIo(pybind11::module_& m) {
 
   py::class_<mori::io::MemoryDesc>(m, "MemoryDesc")
       .def(py::init<>())
-      .def_readonly("engineKey", &mori::io::MemoryDesc::engineKey)
+      .def_readonly("engine_key", &mori::io::MemoryDesc::engineKey)
       .def_readonly("id", &mori::io::MemoryDesc::id)
-      .def_readonly("deviceId", &mori::io::MemoryDesc::deviceId)
-      .def_readonly("data", &mori::io::MemoryDesc::data)
+      .def_readonly("device_id", &mori::io::MemoryDesc::deviceId)
+      .def_property_readonly("data",
+                             [](const mori::io::MemoryDesc& desc) -> uintptr_t {
+                               return reinterpret_cast<uintptr_t>(desc.data);
+                             })
       .def_readonly("size", &mori::io::MemoryDesc::size)
       .def_readonly("loc", &mori::io::MemoryDesc::loc);
 
   py::class_<mori::io::IOEngine>(m, "IOEngine")
       .def(py::init<const mori::io::EngineKey&, const mori::io::IOEngineConfig&>())
       .def("GetEngineDesc", &mori::io ::IOEngine::GetEngineDesc)
+      .def("CreateBackend", &mori::io ::IOEngine::CreateBackend)
+      .def("RemoveBackend", &mori::io ::IOEngine::RemoveBackend)
       .def("RegisterRemoteEngine", &mori::io ::IOEngine::RegisterRemoteEngine)
-      .def("DeRegisterRemoteEngine", &mori::io ::IOEngine::DeRegisterRemoteEngine)
+      .def("DeregisterRemoteEngine", &mori::io ::IOEngine::DeregisterRemoteEngine)
       .def("RegisterMemory", &mori::io ::IOEngine::RegisterMemory)
-      .def("DeRegisterMemory", &mori::io ::IOEngine::DeRegisterMemory)
+      .def("DeregisterMemory", &mori::io ::IOEngine::DeregisterMemory)
       .def("AllocateTransferUniqueId", &mori::io ::IOEngine::AllocateTransferUniqueId)
       .def("Read", &mori::io ::IOEngine::Read)
       .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus);

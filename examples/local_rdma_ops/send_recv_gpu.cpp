@@ -131,8 +131,8 @@ void LocalRdmaOps() {
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
   // 8 Finalize
-  deviceContextSend->DeRegisterRdmaMemoryRegion(sendBuf);
-  deviceContextRecv->DeRegisterRdmaMemoryRegion(recvBuf);
+  deviceContextSend->DeregisterRdmaMemoryRegion(sendBuf);
+  deviceContextRecv->DeregisterRdmaMemoryRegion(recvBuf);
 }
 
 int main() { LocalRdmaOps(); }

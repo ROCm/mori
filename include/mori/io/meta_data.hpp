@@ -42,20 +42,22 @@ struct BackendBitmap {
 };
 
 using EngineKey = std::string;
+using DescBlob = std::vector<std::byte>;
+using BackendDescBlobMap = std::unordered_map<BackendType, DescBlob>;
 
 struct EngineDesc {
   EngineKey key;
-  int gpuId;
   std::string hostname;
-  BackendBitmap backends;
-  application::TCPContextHandle tcpHandle;
+  std::string host;
+  int port;
+  BackendDescBlobMap backendDescs;
 
-  MSGPACK_DEFINE(key, gpuId, hostname, backends, tcpHandle);
-};
+  constexpr bool operator==(const EngineDesc& rhs) const noexcept {
+    return (key == rhs.key) && (hostname == rhs.hostname) && (host == rhs.host) &&
+           (port == rhs.port) && (backendDescs == rhs.backendDescs);
+  }
 
-struct MemoryBackendDescs {
-  application::RdmaMemoryRegion rdmaMr;
-  MSGPACK_DEFINE(rdmaMr);
+  MSGPACK_DEFINE(key, hostname, host, port, backendDescs);
 };
 
 using MemoryUniqueId = uint32_t;
@@ -67,9 +69,9 @@ struct MemoryDesc {
   void* data{nullptr};
   size_t size{0};
   MemoryLocationType loc;
-  MemoryBackendDescs backendDesc;
+  BackendDescBlobMap backendDescs;
 
-  MSGPACK_DEFINE(engineKey, id, deviceId, size, loc, backendDesc);
+  MSGPACK_DEFINE(engineKey, id, deviceId, size, loc, backendDescs);
 };
 
 using TransferUniqueId = uint64_t;

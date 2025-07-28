@@ -37,7 +37,7 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegion(void* 
   return handle;
 }
 
-void RdmaDeviceContext::DeRegisterRdmaMemoryRegion(void* ptr) {
+void RdmaDeviceContext::DeregisterRdmaMemoryRegion(void* ptr) {
   if (mrPool.find(ptr) == mrPool.end()) return;
   ibv_mr* mr = mrPool[ptr];
   ibv_dereg_mr(mr);
