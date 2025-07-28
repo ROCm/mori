@@ -4,7 +4,7 @@ import time
 
 import torch
 import torch.distributed as dist
-
+import argparse
 
 class EpDispatchCombineTestCase:
     def __init__(self, rank, gpu_per_node, world_size, dtype=torch.bfloat16):
@@ -316,7 +316,7 @@ class EpDispatchCombineTestCase:
 
         element_size = all_rank_input[self.rank].element_size()
         total_bytes = total_recv_num_token * self.config.hidden_dim * element_size
-        disp_bandwidth = total_bytes / (1024**3) / (disp_duration / (10**3))
+        disp_bandwidth = total_bytes / (1000**3) / (disp_duration / (10**3))
 
         torch.cuda.synchronize()
         dist.barrier()
@@ -330,7 +330,7 @@ class EpDispatchCombineTestCase:
         end_event.record()
         torch.cuda.synchronize()
         comb_duration = start_event.elapsed_time(end_event)
-        comb_bandwidth = total_bytes / (1024**3) / (comb_duration / (10**3))
+        comb_bandwidth = total_bytes / (1000**3) / (comb_duration / (10**3))
 
         op.reset()
         torch.cuda.synchronize()
@@ -380,30 +380,58 @@ class EpDispatchCombineTestCase:
             )
 
         if self.rank == 0:
-            for i, duration_us in enumerate(disp_duration_us_list):
+            for i in range(len(disp_duration_us_list)):
                 print(
-                    f"Round {i} dispatch duration {duration_us} bandwidth {disp_bandwidth_GB_list[i]} avg {sum(disp_bandwidth_GB_list[i]) / self.config.world_size}"
-                )
-            for i, duration_us in enumerate(comb_duration_us_list):
-                print(
-                    f"Round {i} combine duration {duration_us} bandwidth {comb_bandwidth_GB_list[i]} avg {sum(comb_bandwidth_GB_list[i]) / self.config.world_size}"
+                    f"Round {i} dispatch duration {disp_duration_us_list[i]} "
+                    f"bandwidth {disp_bandwidth_GB_list[i]} "
+                    f"avg {sum(disp_duration_us_list[i]) / self.config.world_size:.2f} µs "
+                    f"avg {sum(disp_bandwidth_GB_list[i]) / self.config.world_size:.2f} GB/s"
                 )
 
-        disp_bandwidth_GB_list = disp_bandwidth_GB_list[10:]
+            for i in range(len(comb_duration_us_list)):
+                print(
+                    f"Round {i} combine  duration {comb_duration_us_list[i]} "
+                    f"bandwidth {comb_bandwidth_GB_list[i]} "
+                    f"avg {sum(comb_duration_us_list[i]) / self.config.world_size:.2f} µs "
+                    f"avg {sum(comb_bandwidth_GB_list[i]) / self.config.world_size:.2f} GB/s"
+                )
+
+        disp_bandwidth_GB_list = disp_bandwidth_GB_list[0:]
         avg_disp_bw_per_round = [
             (sum(round_bw) / len(round_bw)) for round_bw in disp_bandwidth_GB_list
         ]
         avg_disp_bw = sum(avg_disp_bw_per_round) / len(avg_disp_bw_per_round)
 
-        comb_bandwidth_GB_list = comb_bandwidth_GB_list[10:]
+        comb_bandwidth_GB_list = comb_bandwidth_GB_list[0:]
         avg_comb_bw_per_round = [
             (sum(round_bw) / len(round_bw)) for round_bw in comb_bandwidth_GB_list
         ]
         avg_comb_bw = sum(avg_comb_bw_per_round) / len(avg_comb_bw_per_round)
 
+        disp_duration_us_list = disp_duration_us_list[0:]
+        avg_disp_lat_per_round = [sum(round_duration) / len(round_duration) for round_duration in disp_duration_us_list]
+        avg_disp_lat = sum(avg_disp_lat_per_round) / len(avg_disp_lat_per_round)
+
+        comb_duration_us_list = comb_duration_us_list[0:]
+        avg_comb_lat_per_round = [sum(round_duration) / len(round_duration) for round_duration in comb_duration_us_list]
+        avg_comb_lat = sum(avg_comb_lat_per_round) / len(avg_comb_lat_per_round)
+
+        best_disp_bw  = max(avg_disp_bw_per_round)
+        best_comb_bw  = max(avg_comb_bw_per_round)
+
+        best_disp_lat = min(avg_disp_lat_per_round)
+        best_comb_lat = min(avg_comb_lat_per_round)
+
         if self.rank == 0:
             print(
-                f"dispatch avg bandwidth {avg_disp_bw} combine avg bandwidth {avg_comb_bw}"
+                f"dispatch: avg bandwidth {avg_disp_bw:.2f} GB/s, "
+                f"best {best_disp_bw:.2f} GB/s | "
+                f"avg latency {avg_disp_lat:.2f} µs, "
+                f"best {best_disp_lat:.2f} µs\n"
+                f"combine : avg bandwidth {avg_comb_bw:.2f} GB/s, "
+                f"best {best_comb_bw:.2f} GB/s | "
+                f"avg latency {avg_comb_lat:.2f} µs, "
+                f"best {best_comb_lat:.2f} µs"
             )
         del op
 
@@ -427,6 +455,11 @@ def test_dispatch_combine(local_rank, num_node, gpu_per_node, is_bench=False):
     test_case.cleanup()
 
 
+parser = argparse.ArgumentParser(description="dispatch/combine internode test")
+parser.add_argument("--bench", action="store_true",
+                    help="Set this flag True to run benchmark into test_dispatch_combine")
+args_cli = parser.parse_args()
+
 if __name__ == "__main__":
     gpu_per_node = os.environ.get("GPU_PER_NODE", None)
     gpu_per_node = int(gpu_per_node) if gpu_per_node is not None else 8
@@ -435,7 +468,7 @@ if __name__ == "__main__":
     world_size = num_node * gpu_per_node
     torch.multiprocessing.spawn(
         test_dispatch_combine,
-        args=(num_node, gpu_per_node, False),
+        args=(num_node, gpu_per_node, args_cli.bench),
         nprocs=gpu_per_node,
         join=True,
     )
