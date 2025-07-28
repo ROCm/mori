@@ -22,30 +22,30 @@ using namespace mori::shmem;
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>
 __global__ void EpDispatchCombineResetKernel(EpDispatchCombineArgs<T> args) {
-  EpDispatchCombineConfig& config = args.config;
-  int thdId = threadIdx.x;
-  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
-  int globalThdNum =  gridDim.x * blockDim.x;
+  // EpDispatchCombineConfig& config = args.config;
+  // int thdId = threadIdx.x;
+  // int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
+  // int globalThdNum =  gridDim.x * blockDim.x;
 
-  for (int destPe = thdId; destPe < args.config.worldSize; destPe += blockDim.x) {
-    args.recvTokenNumMemObj->template GetAs<index_t*>()[destPe] = 0;
-    args.sendTokenNumMemObj->template GetAs<index_t*>()[destPe] = 0;
-    args.destPeTokenCounter[destPe] = 0;
-    args.dispatchGridBarrier[destPe] = 0;
-    args.combineGridBarrier[destPe] = 0;
-  }
-  for (int exptId = thdId; exptId < args.config.numExpertPerRank; exptId += blockDim.x) {
-    args.localPeTokenCounter[exptId] = 0;
-  }
-  if (thdId == 0) {
-    args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
-    core::AtomicStoreRelaxedSystem(args.totalRecvTokenNum, index_t{0});
-  }
-  for (int i = globalThdId; i < config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerRank; i += globalThdNum)
-  {
-    args.destPeTokenIdxMap[i] = -1;
-    args.srcPeTokenIdxMap[i] = -1;
-  }
+  // for (int destPe = thdId; destPe < args.config.worldSize; destPe += blockDim.x) {
+    // args.recvTokenNumMemObj->template GetAs<index_t*>()[destPe] = 0;
+    // args.sendTokenNumMemObj->template GetAs<index_t*>()[destPe] = 0;
+    // args.destPeTokenCounter[destPe] = 0;
+    // args.dispatchGridBarrier[destPe] = 0;
+    // args.combineGridBarrier[destPe] = 0;
+  // }
+  // for (int exptId = thdId; exptId < args.config.numExpertPerRank; exptId += blockDim.x) {
+  //   args.localPeTokenCounter[exptId] = 0;
+  // }
+  // if (thdId == 0) {
+  //   args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
+  //   core::AtomicStoreRelaxedSystem(args.totalRecvTokenNum, index_t{0});
+  // }
+  // for (int i = globalThdId; i < config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerRank; i += globalThdNum)
+  // {
+  //   args.destPeTokenIdxMap[i] = -1;
+  //   args.srcPeTokenIdxMap[i] = -1;
+  // }
   // TODO: this should be one in wqe post API
   shmem::ShmemQuietThread();
 

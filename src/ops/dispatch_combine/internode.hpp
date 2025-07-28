@@ -96,7 +96,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
   if (laneId == 0) {
     int old_val = atomicAdd(args.dispatchGridBarrier, 1);
     if (old_val == globalWarpNum - 1) {
-      __hip_atomic_store(args.dispatchGridBarrier, 0, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_store(args.dispatchGridBarrier, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
   }
 
@@ -239,17 +239,21 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
     //                                         args.shmemStagingTokMemObj->GetMemoryRegion(myPe), myPe * sizeof(index_t),
     //                                         (int32_t)(totalTokens+1), destPe, core::AMO_SET);
     int doneBlockNum = atomicAdd(&args.dispatchGridBarrier[destPe], 1);
-    if (doneBlockNum == numsBlockPerDestPe -1) 
+    if (doneBlockNum == numsBlockPerDestPe - 1) 
     {
       shmem::ShmemPutInt32ImmNbiThread(args.recvTokenNumMemObj, myPe * sizeof(index_t),
                                     totalTokens + 1, destPe);
+      __hip_atomic_store(&args.dispatchGridBarrier[destPe], 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
   }
   if (thdId == 0)
   {
     index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>() + destPe;
     recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
-    if (localBlockId == 0) atomicAdd(args.totalRecvTokenNum, recvTokenNum);
+    if (localBlockId == 0){
+      atomicAdd(args.totalRecvTokenNum, recvTokenNum);
+      args.destPeTokenCounter[destPe] = 0;
+    } 
     // if (localBlockId == 0) printf("rank[%d] destPe[%d] recvTokenNum: %d\n", myPe, destPe, recvTokenNum);
   }
   __syncthreads();
@@ -356,8 +360,6 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
   size_t MaxNumTokensToSendPerRank = config.MaxNumTokensToSendPerRank();
   size_t MaxNumTokensToRecvPerRank = config.MaxNumTokensToRecvPerRank();
 
-  // index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
-
   // Phase 1: send token
   // This phase is symmetric with dispatch recv phase, where tokens are first sent back to its
   // source pe in pe sorted order
@@ -460,6 +462,17 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
   // Make sure copy on all GPUs are finished
   CrossDeviceBarrierInterNodeKernel(args);
+  
+  if (globalThdId < npes) {
+    args.recvTokenNumMemObj->template GetAs<index_t*>()[globalThdId] = 0;
+  }
+
+  if (globalThdId == 0) {
+    __hip_atomic_store(args.combineGridBarrier, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    args.localPeTokenCounter[0] = 0;
+    args.totalRecvTokenNum[0] = 0;
+  }
+  
   SyncIfDebugEnabled("Dispatch kernel: sync across device end");
 
   extern __shared__ char sharedMem[];
