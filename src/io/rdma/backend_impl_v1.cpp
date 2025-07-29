@@ -114,7 +114,7 @@ void RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId, application::R
   std::lock_guard<std::mutex> lock(mu);
   deviceCtxs[devId]->ConnectEndpoint(local.handle, remote);
   RemoteEngineMeta& meta = remotes[remoteKey];
-  EpPair ep{weight, devId, rdevId, local, remote};
+  EpPair ep{weight, devId, rdevId, remoteKey, local, remote};
   meta.rTable[topoKey].push_back(ep);
   epsMap.insert({ep.local.handle.qpn, ep});
 }
@@ -125,12 +125,18 @@ std::optional<EpPair> RdmaManager::GetEpPairByQpn(uint32_t qpn) {
   return epsMap[qpn];
 }
 
+application::RdmaDeviceContext* RdmaManager::GetRdmaDeviceContext(int devId) {
+  std::lock_guard<std::mutex> lock(mu);
+  return deviceCtxs[devId];
+}
+
 application::RdmaDeviceContext* RdmaManager::GetOrCreateDeviceContext(int devId) {
   assert(devId < deviceCtxs.size());
   application::RdmaDeviceContext* devCtx = deviceCtxs[devId];
   if (devCtx == nullptr) {
     devCtx = availDevices[devId].first->CreateRdmaDeviceContext();
     deviceCtxs[devId] = devCtx;
+    // devCtx->CreateRdmaSrqIfNx(GetRdmaEndpointConfig(availDevices[devId].second));
   }
   return devCtx;
 }
@@ -149,6 +155,39 @@ void NotifManager::RegisterEndpointByQpn(uint32_t qpn) {
   std::optional<EpPair> ep = rdma->GetEpPairByQpn(qpn);
   assert(ep.has_value() && ep->local.ibvHandle.compCh);
   SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_ADD, ep->local.ibvHandle.compCh->fd, &ev));
+}
+
+void NotifManager::RegisterDevice(int devId) {
+  std::lock_guard<std::mutex> lock(mu);
+  if (notifCtx.find(devId) != notifCtx.end()) return;
+
+  application::RdmaDeviceContext* devCtx = rdma->GetRdmaDeviceContext(devId);
+  assert(devCtx);
+
+  void* buf;
+  SYSCALL_RETURN_ZERO(posix_memalign(reinterpret_cast<void**>(&buf), PAGESIZE,
+                                     maxNotifNum * sizeof(TransferUniqueId)));
+  application::RdmaMemoryRegion mr =
+      devCtx->RegisterRdmaMemoryRegion(buf, maxNotifNum * sizeof(TransferUniqueId));
+  ibv_srq* srq = devCtx->GetIbvSrq();
+  assert(srq);
+  notifCtx.insert({devId, {srq, mr}});
+
+  // Pre post notification receive wr
+  for (uint64_t i = 0; i < maxNotifNum; i++) {
+    ibv_sge sge{};
+    sge.addr = mr.addr + i * sizeof(TransferUniqueId);
+    sge.length = sizeof(TransferUniqueId);
+    sge.lkey = mr.lkey;
+
+    ibv_recv_wr wr{};
+    wr.wr_id = i;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+
+    ibv_recv_wr* bad = nullptr;
+    SYSCALL_RETURN_ZERO(ibv_post_srq_recv(srq, &wr, &bad));
+  };
 }
 
 void NotifManager::MainLoop() {
@@ -172,9 +211,36 @@ void NotifManager::MainLoop() {
       ibv_wc wc;
       while (ibv_poll_cq(cq, 1, &wc) > 0) {
         if (wc.opcode == IBV_WC_RECV) {
+          std::lock_guard<std::mutex> lock(mu);
+          int devId = ep->ldevId;
+
+          assert(notifCtx.find(devId) != notifCtx.end());
+          DeviceNotifContext& ctx = notifCtx[devId];
+
+          uint64_t idx = wc.wr_id;
+          TransferUniqueId tid = reinterpret_cast<TransferUniqueId*>(ctx.mr.addr)[idx];
+          printf("recv notif for transfer %d\n", tid);
+
+          EngineKey ekey = ep->remoteEngineKey;
+          notifPool[ekey].insert(tid);
+
+          // replenish recv wr
+          ibv_sge sge;
+          sge.addr = ctx.mr.addr + idx * sizeof(TransferUniqueId);
+          sge.length = sizeof(TransferUniqueId);
+          sge.lkey = ctx.mr.lkey;
+
+          ibv_recv_wr wr;
+          wr.wr_id = idx;
+          wr.sg_list = &sge;
+          wr.num_sge = 1;
+          ibv_recv_wr* bad;
+          SYSCALL_RETURN_ZERO(ibv_post_srq_recv(ctx.srq, &wr, &bad));
         } else if (wc.opcode == IBV_WC_SEND) {
+          uint64_t id = wc.wr_id;
+          printf("send notif for transfer %d\n", id);
         } else {
-          printf("data mov for transfer %d %d\n", wc.wr_id, wc.opcode);
+          printf("data mov for transfer %lu %d\n", wc.wr_id, wc.opcode);
           TransferStatus* status = reinterpret_cast<TransferStatus*>(wc.wr_id);
           if (wc.status == IBV_WC_SUCCESS) {
             status->SetCode(StatusCode::SUCCESS);
@@ -245,6 +311,7 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo) {
 
   rdma->ConnectEndpoint(ekey, devId, lep, msg.devId, msg.eph, topo, weight);
   notif->RegisterEndpointByQpn(lep.handle.qpn);
+  notif->RegisterDevice(devId);
   ctx->CloseEndpoint(tcph);
 }
 
@@ -306,6 +373,7 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
       p.WriteMessageRegEndpoint(MessageRegEndpoint{msg.ekey, msg.topo, devId, lep.handle});
       rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
       notif->RegisterEndpointByQpn(lep.handle.qpn);
+      notif->RegisterDevice(devId);
       SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL));
       break;
     }
@@ -460,20 +528,7 @@ void RdmaBackend::Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remo
     status->SetMessage(strerror(errno));
   }
 
-  //   struct ibv_wc wc;
-  //   int ne;
-  //   do {
-  //     ne = ibv_poll_cq(ep.local.ibvHandle.cq, 1, &wc);
-  //   } while (ne == 0);
-
-  //   assert(ne >= 0);
-
-  //   if (wc.status != IBV_WC_SUCCESS) {
-  //     printf("WC error %s\n", ibv_wc_status_str(wc.status));
-  //   } else {
-  //     printf("poll cq %d \n status %d\n", ne, wc.status);
-  //   }
-  //   printf("read on qpn %d\n", ep.local.handle.qpn);
+  RdmaNotifyTransfer(ep.local, status, id);
 }
 
 void RdmaBackend::Write(MemoryDesc localSrc, size_t localOffset, MemoryDesc remoteDest,
@@ -486,6 +541,28 @@ bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id
                                            TransferStatus* status) {
   status->SetCode(StatusCode::SUCCESS);
   return true;
+}
+
+void RdmaBackend::RdmaNotifyTransfer(const application::RdmaEndpoint& ep, TransferStatus* status,
+                                     TransferUniqueId id) {
+  ibv_sge sge{};
+  sge.addr = reinterpret_cast<uintptr_t>(&id);
+  sge.length = sizeof(TransferUniqueId);
+  sge.lkey = 0;
+
+  ibv_send_wr wr{};
+  wr.wr_id = id;
+  wr.opcode = IBV_WR_SEND;
+  wr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+
+  ibv_send_wr* bad_wr = nullptr;
+  int ret = ibv_post_send(ep.ibvHandle.qp, &wr, &bad_wr);
+  if (ret != 0) {
+    status->SetCode(StatusCode::ERROR);
+    status->SetMessage(strerror(errno));
+  }
 }
 
 }  // namespace io

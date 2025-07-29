@@ -73,7 +73,7 @@ void TestMoriIOEngine() {
     TransferStatus initiatorStatus, targetStatus;
     TransferUniqueId id = initiator.AllocateTransferUniqueId();
     initiator.Read(initatorMem, 0, targetMem, 0, bufSize, &initiatorStatus, id);
-    printf("read %d\n", i);
+    printf("read %d id %d\n", i, id);
     while (initiatorStatus.Code() == StatusCode::INIT) {
     }
     // while (targetStatus.Code() == StatusCode::INIT) {

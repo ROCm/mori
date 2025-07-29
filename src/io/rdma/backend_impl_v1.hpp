@@ -55,6 +55,7 @@ struct EpPair {
   int weight;
   int ldevId;
   int rdevId;
+  EngineKey remoteEngineKey;
   application::RdmaEndpoint local;
   application::RdmaEndpointHandle remote;
 };
@@ -137,6 +138,9 @@ class RdmaManager {
                        application::RdmaEndpointHandle remote, TopoKeyPair key, int weight);
   std::optional<EpPair> GetEpPairByQpn(uint32_t qpn);
 
+  //
+  application::RdmaDeviceContext* GetRdmaDeviceContext(int devId);
+
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
 
@@ -163,15 +167,29 @@ class NotifManager {
   void RegisterEndpointByQpn(uint32_t qpn);
   // void DeregisterEndpoint(EpPair*);
 
+  void RegisterDevice(int devId);
+
   void MainLoop();
   void Start();
   void Shutdown();
 
  private:
+  mutable std::mutex mu;
+
   int epfd{-1};
   std::atomic<bool> running{false};
   std::thread thd;
   RdmaManager* rdma;
+
+ private:
+  struct DeviceNotifContext {
+    ibv_srq* srq;
+    application::RdmaMemoryRegion mr;
+  };
+
+  uint32_t maxNotifNum{1024};
+  std::unordered_map<int, DeviceNotifContext> notifCtx;
+  std::unordered_map<EngineKey, std::unordered_set<TransferUniqueId>> notifPool;
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -236,6 +254,10 @@ class RdmaBackend : public Backend {
   void Write(MemoryDesc localSrc, size_t localOffset, MemoryDesc remoteDest, size_t remoteOffset,
              size_t size, TransferStatus* status, TransferUniqueId id);
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
+
+ private:
+  void RdmaNotifyTransfer(const application::RdmaEndpoint& ep, TransferStatus* status,
+                          TransferUniqueId id);
 
  private:
   std::unique_ptr<RdmaManager> rdma;
