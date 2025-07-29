@@ -553,6 +553,7 @@ class EpDispatchCombineTestCase {
     uniform_real_distribution<> tokValDist(0.01, 1);
     for (int i = 0; i < inpTokEleNum; i++) {
       reinterpret_cast<T*>(inpTokBufCpu)[i] = tokValDist(gen);
+      // reinterpret_cast<T*>(inpTokBufCpu)[i] = config.rank + 1;
     }
     HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, inpTokBufCpu, inpTokSize, hipMemcpyHostToDevice));
     HIP_RUNTIME_CHECK(hipMemset(inpTokBufCpu, 0, maxTokenSize));

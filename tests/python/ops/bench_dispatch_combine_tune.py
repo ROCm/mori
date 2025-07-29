@@ -85,6 +85,8 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
 
         element_size = all_rank_input[self.config.rank].element_size()
         total_bytes = total_recv_num_token * self.config.hidden_dim * element_size
+        # disp_bandwidth = total_bytes / (1024**3) / (disp_duration / (10**3))
+        # comb_bandwidth = total_bytes / (1024**3) / (comb_duration / (10**3))
         disp_bandwidth = total_bytes / (1000**3) / (disp_duration / (10**3))
         comb_bandwidth = total_bytes / (1000**3) / (comb_duration / (10**3))
 
@@ -100,6 +102,8 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         comb_duration_us_list = []
         comb_bandwidth_GB_list = []
         avg_total_bytes_MB_list = []
+        disp_bw_values = []
+        comb_bw_values = []
 
         test_data_list = [self.gen_test_data() for i in range(iters)]
 
@@ -108,6 +112,9 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             disp_dur, comb_dur, disp_bw, comb_bw, total_bytes = self.run_once(
                 op, test_data_list[i], False
             )
+
+            disp_bw_values.append(disp_bw)
+            comb_bw_values.append(comb_bw)
 
             disp_dur_list = [torch.zeros(1) for _ in range(self.config.world_size)]
             disp_bw_list = [torch.zeros(1) for _ in range(self.config.world_size)]
@@ -121,10 +128,14 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             dist.all_gather(comb_bw_list, torch.tensor([comb_bw]))
             dist.all_gather(total_bytes_list, torch.tensor([total_bytes / (1024**2)]))
 
-            disp_duration_us_list.append([int(t.item()) for t in disp_dur_list])
-            disp_bandwidth_GB_list.append([int(t.item()) for t in disp_bw_list])
-            comb_duration_us_list.append([int(t.item()) for t in comb_dur_list])
-            comb_bandwidth_GB_list.append([int(t.item()) for t in comb_bw_list])
+            disp_duration_us_list.append(
+                [round(t.item(), 3) for t in disp_dur_list])
+            disp_bandwidth_GB_list.append(
+                [round(t.item(), 3) for t in disp_bw_list])
+            comb_duration_us_list.append(
+                [round(t.item(), 3) for t in comb_dur_list])
+            comb_bandwidth_GB_list.append(
+                [round(t.item(), 3) for t in comb_bw_list])
             avg_total_bytes_MB_list.append(
                 int(torch.tensor(total_bytes_list).mean().item())
             )
@@ -133,28 +144,44 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         if self.config.rank == 0:
             print("Dispatch result:")
             for i, duration_us in enumerate(disp_duration_us_list):
-                algo_bw = sum(disp_bandwidth_GB_list[i]) / self.config.world_size
+                algo_bw = sum(
+                    disp_bandwidth_GB_list[i]) / self.config.world_size
                 bus_bw = int(
-                    algo_bw * (self.config.world_size - 1) / self.config.world_size
+                    algo_bw * (self.config.world_size - 1) /
+                    self.config.world_size
                 )
                 print(
                     f"Round {i} duration(us) {duration_us} "
                     f"bandwidth(GB/s) {disp_bandwidth_GB_list[i]} "
-                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw}({theoretical_peak_bw})"
+                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw:.2f}({theoretical_peak_bw})"
                 )
 
             print()
             print("Combine result:")
             for i, duration_us in enumerate(comb_duration_us_list):
-                algo_bw = sum(comb_bandwidth_GB_list[i]) / self.config.world_size
+                algo_bw = sum(
+                    comb_bandwidth_GB_list[i]) / self.config.world_size
                 bus_bw = int(
-                    algo_bw * (self.config.world_size - 1) / self.config.world_size
+                    algo_bw * (self.config.world_size - 1) /
+                    self.config.world_size
                 )
                 print(
                     f"Round {i} duration(us) {duration_us} "
                     f"bandwidth(GB/s) {comb_bandwidth_GB_list[i]} "
-                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw}({theoretical_peak_bw})"
+                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw:.2f}({theoretical_peak_bw})"
                 )
+
+            ratio = (1000**3)/(1024**3)
+            print(
+                f"token:{self.config.max_num_inp_token_per_rank} Rank 0 "
+                f"Dispatch Avg: {sum(disp_bw_values)/len(disp_bw_values):.2f} GB/s ({(sum(disp_bw_values)/len(disp_bw_values))*ratio:.2f} GiB/s) "
+                f"Max: {max(disp_bw_values):.2f} GB/s ({max(disp_bw_values)*ratio:.2f} GiB/s)"
+            )
+            print(
+                f"token:{self.config.max_num_inp_token_per_rank} Rank 0 "
+                f"Combine Avg: {sum(comb_bw_values)/len(comb_bw_values):.2f} GB/s ({(sum(comb_bw_values)/len(comb_bw_values))*ratio:.2f} GiB/s) "
+                f"Max: {max(comb_bw_values):.2f} GB/s ({max(comb_bw_values)*ratio:.2f} GiB/s)"
+            )
 
 
 def _bench_dispatch_combine(

@@ -33,10 +33,12 @@ class CMakeBuild(build_ext):
         build_dir = root_dir / "build"
         build_dir.mkdir(parents=True, exist_ok=True)
 
+        unroll_value = os.environ.get("WARP_ACCUM_UNROLL", "1")
         subprocess.check_call(
             [
                 "cmake",
                 "-DUSE_ROCM=ON",
+                "-DWARP_ACCUM_UNROLL=" + unroll_value,
                 "-B",
                 str(build_dir),
                 "-S",

@@ -207,12 +207,13 @@ void EpDispatchCombineHandle::LaunchInterNodeCombine(int blockNum, int warpPerBl
 
 void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum, int warpPerBlock,
                                              hipStream_t stream) {
+  size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
   dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
-  dim3 block(warpSize * ((warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock));
+  dim3 block(warpSize * actualWarpNumPerBlock);
 
   size_t sharedMemSize =
-      (config.worldSize * config.warpNumPerBlock +
-       config.numExpertPerRank * config.warpNumPerBlock + config.numExpertPerRank) *
+      (config.worldSize * actualWarpNumPerBlock + config.numExpertPerRank * actualWarpNumPerBlock +
+       config.numExpertPerRank) *
       sizeof(index_t);
   auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
   std::visit(
@@ -234,8 +235,9 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
 
 void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum, int warpPerBlock,
                                             hipStream_t stream) {
+  size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
   dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
-  dim3 block(warpSize * ((warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock));
+  dim3 block(warpSize * actualWarpNumPerBlock);
 
   auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
   std::visit(
@@ -243,7 +245,7 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
         using ArgsT = std::decay_t<decltype(args)>;
         using DataT = typename ArgsT::data_type;
 
-        size_t sharedMemSize = config.warpNumPerBlock * config.numExpertPerToken * sizeof(DataT**);
+        size_t sharedMemSize = actualWarpNumPerBlock * config.numExpertPerToken * sizeof(DataT**);
         if (kernelType == KernelType::InterNode) {
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);

@@ -14,6 +14,11 @@ option(BUILD_SHMEM "Whether to build shmem library" ON)
 option(BUILD_OPS "Whether to build mori operation kernels" ON)
 option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
 
+if(NOT DEFINED WARP_ACCUM_UNROLL)
+    set(WARP_ACCUM_UNROLL 1)
+endif()
+message(STATUS "WARP_ACCUM_UNROLL is set to: ${WARP_ACCUM_UNROLL}")
+add_definitions(-DWARP_ACCUM_UNROLL=${WARP_ACCUM_UNROLL})
 
 if (USE_ROCM)
     list(APPEND CMAKE_PREFIX_PATH "/opt/rocm")

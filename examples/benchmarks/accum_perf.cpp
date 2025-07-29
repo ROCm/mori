@@ -27,7 +27,7 @@ __global__ void AccumPerfKernel(int myPe, int npes, const SymmMemObjPtr src,
     srcPtrs[laneId] = src->template GetAs<T*>(laneId) + globalWarpId * elementPerWarp;
   }
 
-  mori::core::WarpAccum<T, 16>(
+  mori::core::WarpAccum<T, 8>(
       dest->template GetAs<T*>() + globalWarpId * elementPerWarp, srcPtrs, nullptr, npes,
       std::min(elementPerWarp, elementNum - globalWarpId * elementPerWarp));
 }
@@ -42,7 +42,8 @@ void AccumPerf() {
   int npes = ShmemNPes();
 
   size_t elementSize = sizeof(T);
-  size_t elementNum = 16 * 1000 * 1024;
+  // size_t elementNum = 16 * 1000 * 1024;
+  size_t elementNum = 4096 * 7168;
   size_t bufferSize = elementNum * elementSize;
 
   //   void* srcBuff = ShmemExtMallocWithFlags(bufferSize, hipDeviceMallocUncached);
@@ -65,10 +66,27 @@ void AccumPerf() {
 
   printf("elementPerWarp %zu\n", elementPerWarp);
 
-  for (int i = 0; i < 100; i++)
+  for (int i = 0; i < 3; i++)
     AccumPerfKernel<<<blockNum, threadNum>>>(myPe, npes, srcBuffObj, destBuffObj, elementNum,
                                              elementPerWarp);
+
+  const int iters = 5;
+  hipEvent_t start, stop;
+  HIP_RUNTIME_CHECK(hipEventCreate(&start));
+  HIP_RUNTIME_CHECK(hipEventCreate(&stop));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+  HIP_RUNTIME_CHECK(hipEventRecord(start, 0));
+  for (int i = 0; i < iters; i++) {
+    AccumPerfKernel<<<blockNum, threadNum>>>(myPe, npes, srcBuffObj, destBuffObj, elementNum,
+                                             elementPerWarp);
+  }
+  HIP_RUNTIME_CHECK(hipEventRecord(stop, 0));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  float elapsedTime;
+  HIP_RUNTIME_CHECK(hipEventElapsedTime(&elapsedTime, start, stop));
+  printf("rank %d time %f avgtime %f bw %f\n", myPe, elapsedTime, elapsedTime / iters,
+         (bufferSize / 1.0E9) * npes / (elapsedTime / 1000.0f) / iters);
   MPI_Barrier(MPI_COMM_WORLD);
 
   ShmemFinalize();
