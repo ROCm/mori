@@ -12,6 +12,7 @@
 #include "mori/io/backend.hpp"
 #include "mori/io/engine.hpp"
 #include "mori/io/meta_data.hpp"
+#include "src/io/rdma/ep_manager.hpp"
 
 namespace mori {
 namespace io {

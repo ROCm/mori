@@ -10,146 +10,6 @@
 #include "mori/io/meta_data.hpp"
 #include "src/io/rdma/protocol.hpp"
 
-/* ---------------------------------------------------------------------------------------------- */
-/*                                     RdmaBackend Data Plane                                     */
-/* ---------------------------------------------------------------------------------------------- */
-using namespace mori;
-using namespace mori::io;
-
-struct TopoKey {
-  int deviceId;
-  MemoryLocationType loc;
-
-  bool operator==(const TopoKey& rhs) const noexcept {
-    return (deviceId == rhs.deviceId) && (loc == rhs.loc);
-  }
-};
-
-namespace std {
-template <>
-struct hash<TopoKey> {
-  std::size_t operator()(const TopoKey& k) const noexcept {
-    std::size_t h1 = std::hash<uint32_t>{}(k.deviceId);
-    std::size_t h2 = std::hash<uint32_t>{}(static_cast<uint32_t>(k.loc));
-    return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
-  }
-};
-}  // namespace std
-
-struct TopoKeyPair {
-  TopoKey local;
-  TopoKey remote;
-
-  bool operator==(const TopoKeyPair& rhs) const noexcept {
-    return (local == rhs.local) && (remote == rhs.remote);
-  }
-};
-
-namespace std {
-template <>
-struct hash<TopoKeyPair> {
-  std::size_t operator()(const TopoKeyPair& kp) const noexcept {
-    std::size_t h1 = std::hash<TopoKey>{}(kp.local);
-    std::size_t h2 = std::hash<TopoKey>{}(kp.remote);
-    return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
-  }
-};
-}  // namespace std
-
-struct EpPair {
-  int weight;
-  application::RdmaEndpoint local;
-  application::RdmaEndpointHandle remote;
-};
-
-using EpPairVec = std::vector<EpPair>;
-using RouteTable = std::unordered_map<TopoKeyPair, EpPairVec>;
-
-struct RemoteEngineMeta {
-  EngineKey key;
-  RouteTable rTable;
-};
-
-class EndpointManager {
- public:
-  EndpointManager(application::RdmaContext* ctx);
-  ~EndpointManager();
-
-  application::RdmaEndpointConfig GetRdmaEndpointConfig(int portId);
-
-  std::vector<std::pair<int, int>> Search(TopoKey);
-
-  int CountEndpoint(EngineKey, TopoKeyPair);
-  EpPairVec GetAllEndpoint(EngineKey, TopoKeyPair);
-
-  application::RdmaEndpoint CreateEndpoint(int devIdx);
-  application::RdmaEndpoint ConnectEndpoint(int devIdx, application::RdmaEndpoint local,
-                                            application::RdmaEndpoint remote, TopoKeyPair key);
-
- private:
-  mutable std::mutex mu;
-
-  application::RdmaContext* ctx;
-  application::ActiveDevicePortList availDevices;
-  std::vector<application::RdmaDeviceContext*> deviceCtxs;
-
-  std::unordered_map<EngineKey, RemoteEngineMeta> remotes;
-};
-
-EndpointManager::EndpointManager(application::RdmaContext* ctx) : ctx(ctx) {
-  application::RdmaDeviceList devices = ctx->GetRdmaDeviceList();
-  availDevices = GetActiveDevicePortList(devices);
-  assert(availDevices.size() > 0);
-
-  deviceCtxs.resize(availDevices.size(), nullptr);
-}
-
-std::vector<std::pair<int, int>> EndpointManager::Search(TopoKey key) { return {0, 999}; }
-
-int EndpointManager::CountEndpoint(EngineKey engine, TopoKeyPair key) {}
-
-application::RdmaEndpointConfig EndpointManager::GetRdmaEndpointConfig(int portId) {
-  application::RdmaEndpointConfig config;
-  config.portId = portId;
-  config.gidIdx = 1;
-  config.maxMsgsNum = 1024;
-  config.maxMsgSge = 1;
-  config.maxCqeNum = 1024;
-  config.alignment = 4096;
-  config.withCompChannel = true;
-  config.enableSrq = true;
-  return config;
-}
-
-application::RdmaEndpoint EndpointManager::CreateEndpoint(int devIdx, TopoKey key) {
-  std::lock_guard<std::mutex> lock(mu);
-
-  application::RdmaDeviceContext* devCtx = deviceCtxs[devIdx];
-  if (devCtx == nullptr) {
-    deviceCtxs[devIdx] = availDevices[devIdx].first->CreateRdmaDeviceContext();
-    devCtx = deviceCtxs[devIdx];
-  }
-
-  application::RdmaEndpoint rdmaEp =
-      devCtx->CreateRdmaEndpoint(GetRdmaEndpointConfig(availDevices[devIdx].second));
-  SYSCALL_RETURN_ZERO(ibv_req_notify_cq(rdmaEp.ibvHandle.cq, 0));
-  return rdmaEp;
-}
-
-void EndpointManager::ConnectEndpoint(EngineKey remoteKey, int devIdx,
-                                                           application::RdmaEndpoint local,
-                                                           application::RdmaEndpointHandle remote,
-                                                           TopoKeyPair topoKey, int weight) {
-  std::lock_guard<std::mutex> lock(mu);
-  deviceCtxs[devIdx]->ConnectEndpoint(local.handle, remote);
-
-  if (remotes.find(remoteKey) == remotes.end()) remotes[remoteKey] = {};
-  RemoteEngineMeta meta = remotes[remoteKey];
-
-  if (meta.rTable.find(topoKey) == meta.rTable.end()) meta.raTable[topoKey] = {};
-  meta.rTable[topoKey].push_back(EpPair{local, remote, weight});
-}
-
 namespace mori {
 namespace io {
 
@@ -170,12 +30,12 @@ RdmaBackend::RdmaBackend(EngineKey key, IOEngineConfig config) : config(config) 
   StartControlPlane();
 
   // Initialize data plane
-  StartEndpointManager();
+  StartDataPlane();
 }
 
 RdmaBackend::~RdmaBackend() {
   ShutdownControlPlane();
-  ShutdownEndpointManager();
+  ShutdownDataPlane();
 }
 
 EngineDesc RdmaBackend::GetEngineDesc() { return desc; }
@@ -213,10 +73,10 @@ void RdmaBackend::RegisterRemoteEngine(EngineDesc remote) {
 
   Protocol protocol(tcpEph);
   application::RdmaEndpoint localRdmaEp = CreateRdmaEndpoint();
-  protocol.WriteMessageRegEngine(MessageRegEngine{GetEngineDesc(), localRdmaEp.handle});
+  protocol.WriteMessageRegEndpoint(MessageRegEndpoint{GetEngineDesc(), localRdmaEp.handle});
   MessageHeader hdr = protocol.ReadMessageHeader();
-  assert(hdr.type == MessageType::RegEngine);
-  MessageRegEngine msg = protocol.ReadMessageRegEngine(hdr.len);
+  assert(hdr.type == MessageType::RegEndpoint);
+  MessageRegEndpoint msg = protocol.ReadMessageRegEndpoint(hdr.len);
   rdmaDeviceContext->ConnectEndpoint(localRdmaEp.handle, msg.rdmaEph);
 
   engineKV.insert({remote.key, remote});
@@ -381,11 +241,11 @@ void RdmaBackend::HandleControlPlaneProtocol(int fd) {
   MessageHeader hdr = protocol.ReadMessageHeader();
 
   switch (hdr.type) {
-    case MessageType::RegEngine: {
-      MessageRegEngine msg = protocol.ReadMessageRegEngine(hdr.len);
+    case MessageType::RegEndpoint: {
+      MessageRegEndpoint msg = protocol.ReadMessageRegEndpoint(hdr.len);
 
       application::RdmaEndpoint localRdmaEp = CreateRdmaEndpoint();
-      protocol.WriteMessageRegEngine(MessageRegEngine{GetEngineDesc(), localRdmaEp.handle});
+      protocol.WriteMessageRegEndpoint(MessageRegEndpoint{GetEngineDesc(), localRdmaEp.handle});
       rdmaDeviceContext->ConnectEndpoint(localRdmaEp.handle, msg.rdmaEph);
 
       engineKV.insert({msg.engineDesc.key, msg.engineDesc});
@@ -487,7 +347,7 @@ void RdmaBackend::RdmaPollLoop() {
   }
 }
 
-void RdmaBackend::StartEndpointManager() {
+void RdmaBackend::StartDataPlane() {
   rdmaContext.reset(new application::RdmaContext(application::RdmaBackendType::IBVerbs));
   application::RdmaDeviceList devices = rdmaContext->GetRdmaDeviceList();
   application::ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(devices);
@@ -521,7 +381,7 @@ void RdmaBackend::StartEndpointManager() {
   }
 }
 
-void RdmaBackend::ShutdownEndpointManager() {
+void RdmaBackend::ShutdownDataPlane() {
   running.store(false);
   if (rdmaPollThd.joinable()) rdmaPollThd.join();
   free(rdmaTrsfUidBuf);

@@ -25,18 +25,33 @@ void Protocol::WriteMessageHeader(const MessageHeader& hdr) {
   SYSCALL_RETURN_ZERO(ep.Send(&len, sizeof(len)));
 }
 
-MessageRegEngine Protocol::ReadMessageRegEngine(size_t len) {
+MessageRegEndpoint Protocol::ReadMessageRegEndpoint(size_t len) {
   std::vector<char> buf(len);
   SYSCALL_RETURN_ZERO(ep.Recv(buf.data(), len));
   auto out = msgpack::unpack(buf.data(), len);
-  return out.get().as<MessageRegEngine>();
+  return out.get().as<MessageRegEndpoint>();
 }
 
-void Protocol::WriteMessageRegEngine(const MessageRegEngine& msg) {
+void Protocol::WriteMessageRegEndpoint(const MessageRegEndpoint& msg) {
   msgpack::sbuffer buf;
   msgpack::pack(buf, msg);
   uint32_t len = static_cast<uint32_t>(buf.size());
-  WriteMessageHeader({MessageType::RegEngine, len});
+  WriteMessageHeader({MessageType::RegEndpoint, len});
+  SYSCALL_RETURN_ZERO(ep.Send(buf.data(), buf.size()));
+}
+
+MessageAskMemoryRegion Protocol::ReadMessageAskMemoryRegion(size_t len) {
+  std::vector<char> buf(len);
+  SYSCALL_RETURN_ZERO(ep.Recv(buf.data(), len));
+  auto out = msgpack::unpack(buf.data(), len);
+  return out.get().as<MessageAskMemoryRegion>();
+}
+
+void Protocol::WriteMessageAskMemoryRegion(const MessageAskMemoryRegion& msg) {
+  msgpack::sbuffer buf;
+  msgpack::pack(buf, msg);
+  uint32_t len = static_cast<uint32_t>(buf.size());
+  WriteMessageHeader({MessageType::AskMemoryRegion, len});
   SYSCALL_RETURN_ZERO(ep.Send(buf.data(), buf.size()));
 }
 

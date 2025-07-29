@@ -14,8 +14,8 @@ class Backend {
 
   //   virtual BackendDesc GetBackendDesc() = 0;
 
-  virtual void RegisterRemoteEngine(EngineDesc) = 0;
-  virtual void DeregisterRemoteEngine(EngineDesc) = 0;
+  virtual void RegisterRemoteEngine(const EngineDesc&) = 0;
+  virtual void DeregisterRemoteEngine(const EngineDesc&) = 0;
 
   virtual void RegisterMemory(MemoryDesc& desc) = 0;
   virtual void DeregisterMemory(MemoryDesc& desc) = 0;

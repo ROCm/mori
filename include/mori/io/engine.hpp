@@ -31,8 +31,8 @@ class IOEngine {
 
   EngineDesc GetEngineDesc() const { return desc; }
 
-  void RegisterRemoteEngine(EngineDesc);
-  void DeregisterRemoteEngine(EngineDesc);
+  void RegisterRemoteEngine(const EngineDesc&);
+  void DeregisterRemoteEngine(const EngineDesc&);
 
   MemoryDesc RegisterMemory(void* data, size_t size, int device, MemoryLocationType loc);
   void DeregisterMemory(MemoryDesc& desc);

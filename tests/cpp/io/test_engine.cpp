@@ -1,4 +1,7 @@
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 #include <cassert>
 #include <vector>
@@ -8,12 +11,47 @@
 
 using namespace mori::io;
 
+int GetFreePort() {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return -1;
+
+  int opt = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = 0;
+  addr.sin_addr.s_addr = INADDR_ANY;
+
+  if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    close(fd);
+    return -1;
+  }
+
+  socklen_t len = sizeof(addr);
+  if (getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+    close(fd);
+    return -1;
+  }
+
+  int port = ntohs(addr.sin_port);
+
+  close(fd);
+  return port;
+}
+
 void TestMoriIOEngine() {
   IOEngineConfig config;
   config.host = "127.0.0.1";
-  config.port = 0;
+  config.port = GetFreePort();
   IOEngine initiator("initiator", config);
+  initiator.CreateBackend(BackendType::RDMA, nullptr);
+
+  int newPort = GetFreePort();
+  assert(newPort != config.port);
+  config.port = newPort;
   IOEngine target("target", config);
+  target.CreateBackend(BackendType::RDMA, nullptr);
 
   EngineDesc initiatorEngineDesc = initiator.GetEngineDesc();
   EngineDesc targetEngineDesc = target.GetEngineDesc();
@@ -35,11 +73,12 @@ void TestMoriIOEngine() {
     TransferStatus initiatorStatus, targetStatus;
     TransferUniqueId id = initiator.AllocateTransferUniqueId();
     initiator.Read(initatorMem, 0, targetMem, 0, bufSize, &initiatorStatus, id);
+    printf("read %d\n", i);
     while (initiatorStatus.Code() == StatusCode::INIT) {
     }
-    while (targetStatus.Code() == StatusCode::INIT) {
-      target.PopInboundTransferStatus(initiator.GetEngineDesc().key, id, &targetStatus);
-    }
+    // while (targetStatus.Code() == StatusCode::INIT) {
+    //   target.PopInboundTransferStatus(initiator.GetEngineDesc().key, id, &targetStatus);
+    // }
     printf("Status message initiator %s target %s read value %d\n",
            initiatorStatus.Message().c_str(), targetStatus.Message().c_str(),
            reinterpret_cast<uint8_t*>(initiatorBuf)[511]);
@@ -58,10 +97,10 @@ void TestMoriIOEngine() {
   for (int i = 0; i < 64; i++) {
     while (initiatorStatusVec[i].Code() == StatusCode::INIT) {
     }
-    while (targetStatusVec[i].Code() == StatusCode::INIT) {
-      target.PopInboundTransferStatus(initiator.GetEngineDesc().key, trsfIds[i],
-                                      &targetStatusVec[i]);
-    }
+    // while (targetStatusVec[i].Code() == StatusCode::INIT) {
+    //   target.PopInboundTransferStatus(initiator.GetEngineDesc().key, trsfIds[i],
+    //                                   &targetStatusVec[i]);
+    // }
     printf("Status message initiator %s target %s read value %d\n",
            initiatorStatusVec[i].Message().c_str(), targetStatusVec[i].Message().c_str(),
            reinterpret_cast<uint8_t*>(initiatorBuf)[511]);

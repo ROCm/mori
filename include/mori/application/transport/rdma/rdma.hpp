@@ -144,10 +144,10 @@ struct RdmaEndpoint {
 class RdmaDevice;
 
 struct RdmaMemoryRegion {
-  uintptr_t addr;
-  uint32_t lkey;
-  uint32_t rkey;
-  size_t length;
+  uintptr_t addr{0};
+  uint32_t lkey{0};
+  uint32_t rkey{0};
+  size_t length{0};
 };
 
 /* -------------------------------------------------------------------------- */

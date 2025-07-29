@@ -1,6 +1,6 @@
 #include "mori/io/engine.hpp"
 
-#include "src/io/rdma/backend_impl.hpp"
+#include "src/io/rdma/backend_impl_v1.hpp"
 
 namespace mori {
 namespace io {
@@ -27,13 +27,13 @@ void IOEngine::CreateBackend(BackendType type, void* params) {
 
 void IOEngine::RemoveBackend(BackendType type) { backends.erase(type); }
 
-void IOEngine::RegisterRemoteEngine(EngineDesc remote) {
+void IOEngine::RegisterRemoteEngine(const EngineDesc& remote) {
   for (auto& it : backends) {
     it.second->RegisterRemoteEngine(remote);
   }
 }
 
-void IOEngine::DeregisterRemoteEngine(EngineDesc remote) {
+void IOEngine::DeregisterRemoteEngine(const EngineDesc& remote) {
   for (auto& it : backends) {
     it.second->DeregisterRemoteEngine(remote);
   }

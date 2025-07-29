@@ -4,6 +4,7 @@
 
 #include "mori/io/meta_data.hpp"
 #include "mori/io/msgpack_adaptor.hpp"
+#include "src/io/rdma/backend_impl_v1.hpp"
 
 namespace mori {
 namespace io {
@@ -11,7 +12,8 @@ namespace io {
 /*                                             Message                                            */
 /* ---------------------------------------------------------------------------------------------- */
 enum class MessageType : uint8_t {
-  RegEngine = 0,
+  RegEndpoint = 0,
+  AskMemoryRegion = 1,
 };
 
 struct MessageHeader {
@@ -19,14 +21,20 @@ struct MessageHeader {
   uint32_t len;
 };
 
-struct MessageRegEngine {
-  EngineDesc engineDesc;
+struct MessageRegEndpoint {
+  EngineKey ekey;
+  TopoKeyPair topo;
+  int devId;
+  application::RdmaEndpointHandle eph;
+  MSGPACK_DEFINE(ekey, topo, devId, eph);
+};
 
-  // TODO: protocol for generic backend info, we can use a msgpack vector with each backend info be
-  // a triple of (backend_type, bytes)
-  application::RdmaEndpointHandle rdmaEph;
-
-  MSGPACK_DEFINE(engineDesc, rdmaEph);
+struct MessageAskMemoryRegion {
+  EngineKey ekey;
+  int devId;
+  MemoryUniqueId id;
+  application::RdmaMemoryRegion mr;
+  MSGPACK_DEFINE(ekey, devId, id, mr);
 };
 
 struct MessageBuildConn {
@@ -45,8 +53,11 @@ class Protocol {
   MessageHeader ReadMessageHeader();
   void WriteMessageHeader(const MessageHeader&);
 
-  MessageRegEngine ReadMessageRegEngine(size_t len);
-  void WriteMessageRegEngine(const MessageRegEngine&);
+  MessageRegEndpoint ReadMessageRegEndpoint(size_t len);
+  void WriteMessageRegEndpoint(const MessageRegEndpoint&);
+
+  MessageAskMemoryRegion ReadMessageAskMemoryRegion(size_t len);
+  void WriteMessageAskMemoryRegion(const MessageAskMemoryRegion&);
 
  private:
   application::TCPEndpoint ep;

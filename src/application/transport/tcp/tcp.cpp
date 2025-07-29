@@ -89,7 +89,6 @@ TCPEndpointHandle TCPContext::Connect(std::string remote, uint16_t port) {
   peer.sin_port = htons(port);
   peer.sin_addr.s_addr = inet_addr(remote.c_str());
 
-  printf("remote %s port %d\n", remote.c_str(), port);
   SYSCALL_RETURN_ZERO(connect(sock, reinterpret_cast<sockaddr*>(&peer), sizeof(peer)));
 
   TCPEndpointHandle ep{sock, peer};
