@@ -64,7 +64,7 @@ class EpDispatchCombineTestCase:
             for r in range(self.config.world_size)
         ]
 
-        # gen weights
+        # gen scales
         all_rank_scales = [
             torch.rand(
                 num_token[r],

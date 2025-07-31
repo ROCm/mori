@@ -208,38 +208,39 @@ inline __device__ void WarpCopyImpl(T* dst, const T* src, size_t& offset, size_t
   }
 }
 
-template <typename T, int Unroll = 1>
-inline __device__ void WarpCopy(T* dst, const T* src, size_t nelems) {
-  int laneId = threadIdx.x & (warpSize - 1);
-
-  size_t offset = 0;
-  WarpCopyImpl<T, Unroll>(dst, src, offset, nelems);
-  if constexpr (Unroll > 1) {
-    WarpCopyImpl<T, 1>(dst, src, offset, nelems);
-  }
-
-  while (offset + laneId < nelems) {
-    dst[offset] = src[offset];
-    offset += warpSize;
-  }
-}
-
-// template <typename T>
-// inline __device__ void WarpCopy(T* dst, T* src, size_t nelems) {
-//   constexpr int vecSize = 16 / sizeof(T);
+// template <typename T, int Unroll = 1>
+// inline __device__ void WarpCopy(T* dst, const T* src, size_t nelems) {
 //   int laneId = threadIdx.x & (warpSize - 1);
-//   int offset = laneId * vecSize;
 
-//   while ((offset + vecSize) <= nelems) {
-//     reinterpret_cast<uint4*>(dst + offset)[0] = reinterpret_cast<uint4*>(src + offset)[0];
-//     offset += warpSize * vecSize;
+//   size_t offset = 0;
+//   WarpCopyImpl<T, Unroll>(dst, src, offset, nelems);
+//   if constexpr (Unroll > 1) {
+//     WarpCopyImpl<T, 1>(dst, src, offset, nelems);
 //   }
 
-//   while (offset < nelems) {
+//   while (offset + laneId < nelems) {
 //     dst[offset] = src[offset];
 //     offset += warpSize;
 //   }
 // }
+
+template <typename T>
+inline __device__ void WarpCopy(T* dst, T* src, size_t nelems) {
+  constexpr int vecSize = 16 / sizeof(T);
+  int laneId = threadIdx.x & (warpSize - 1);
+  int offset = laneId * vecSize;
+
+  while ((offset + vecSize) <= nelems) {
+    reinterpret_cast<uint4*>(dst + offset)[0] = reinterpret_cast<uint4*>(src + offset)[0];
+    offset += warpSize * vecSize;
+  }
+
+  offset = offset - laneId * vecSize + laneId;
+  while (offset < nelems) {
+    dst[offset] = src[offset];
+    offset += warpSize;
+  }
+}
 
 template <typename T, int N>
 inline __device__ void WarpCopy(T* dst, T* src) {
