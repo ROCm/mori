@@ -17,6 +17,7 @@ add_library(
   bootstrap/torch_bootstrap.cpp
   transport/rdma/rdma.cpp
   transport/rdma/providers/mlx5/mlx5.cpp
+  transport/rdma/providers/bnxt/bnxt.cpp
   transport/rdma/providers/ibverbs/ibverbs.cpp
   transport/tcp/tcp.cpp
   memory/symmetric_memory.cpp
@@ -37,6 +38,7 @@ target_link_libraries(
   hip::host
   hip::device
   mlx5
+  bnxt_re
   rocm_smi64
   pci)
 

@@ -49,7 +49,7 @@ enum class RdmaBackendType : uint32_t {
 enum class RdmaDeviceVendorId : uint32_t {
   Unknown = 0,
   Mellanox = 0x02c9,
-  // Broadcom =
+  Broadcom = 0x14E4,
 };
 
 template <typename T>
@@ -114,6 +114,16 @@ struct RdmaEndpointHandle {
 
 using RdmaEndpointHandleVec = std::vector<RdmaEndpointHandle>;
 
+struct WorkQueueAttrs {
+  uint32_t wqeNum{0};
+  uint32_t wqeSize{0};
+  uint64_t wqSize{0};
+  uint32_t head{0};
+  uint32_t postIdx{0};
+  uint32_t wqeShift{0};
+  uint32_t offset{0};
+};
+
 struct WorkQueueHandle {
   uint32_t postIdx{0};     // numbers of wqe that post to work queue
   uint32_t dbTouchIdx{0};  // numbers of wqe that touched doorbell
@@ -132,9 +142,10 @@ struct WorkQueueHandle {
 struct CompletionQueueHandle {
   void* cqAddr{nullptr};
   void* dbrRecAddr{nullptr};
-  uint32_t consIdx{0};      // numbers of cqe that have been completed
-  uint32_t needConsIdx{0};  // numbers of cqe that should be consumed
-  uint32_t activeIdx{0};    // numbers of cqe that under processing but not completed
+  void* dbrAddr{nullptr};
+  uint32_t consIdx{0}; // numbers of cqe that have been completed
+  uint32_t needConsIdx{0}; // numbers of cqe that should be consumed
+  uint32_t activeIdx{0}; // numbers of cqe that under processing but not completed
   uint32_t cq_consumer{0};
   uint32_t cqeNum{0};
   uint32_t cqeSize{0};
@@ -161,6 +172,8 @@ struct RdmaEndpoint {
   __device__ __host__ core::ProviderType GetProviderType() {
     if (vendorId == RdmaDeviceVendorId::Mellanox) {
       return core::ProviderType::MLX5;
+    } if (vendorId == Broadcom) {
+      return core::ProviderType::BNXT;
     } else {
       printf("unknown vendorId %d", vendorId);
       assert(false);

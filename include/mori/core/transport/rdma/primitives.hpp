@@ -32,7 +32,7 @@ enum ProviderType {
   // Mellanox direct verbs
   MLX5 = 1,
   // Broadcom direct verbs
-  BNXTRE = 2,
+  BNXT = 2,
   // Ib verbs
   IBVERBS = 3,
 };

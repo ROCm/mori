@@ -74,16 +74,6 @@ class Mlx5CqContainer {
   mlx5dv_devx_obj* cq{nullptr};
 };
 
-struct WorkQueueAttrs {
-  uint32_t wqeNum{0};
-  uint32_t wqeSize{0};
-  uint64_t wqSize{0};
-  uint32_t head{0};
-  uint32_t postIdx{0};
-  uint32_t wqeShift{0};
-  uint32_t offset{0};
-};
-
 class Mlx5QpContainer {
  public:
   Mlx5QpContainer(ibv_context* context, const RdmaEndpointConfig& config, uint32_t cqn,
