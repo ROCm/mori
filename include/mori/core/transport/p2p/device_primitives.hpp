@@ -565,8 +565,14 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
     case 4:
       WarpAccum<T, VecBytes, 4, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, nelems);
       break;
+    case 6:
+      WarpAccum<T, VecBytes, 6, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, nelems);
+      break;
     case 8:
       WarpAccum<T, VecBytes, 8, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, nelems);
+      break;
+    case 10:
+      WarpAccum<T, VecBytes, 10, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, nelems);
       break;
     default:
       assert(false && "Unsupported accumNum");
