@@ -9,7 +9,7 @@ namespace core {
 enum ProviderType {
   Unknown = 0,
   MLX5 = 1,
-  BNXTRE = 2,
+  BNXT = 2,
 };
 typedef enum {
   AMO_ACK = 1,

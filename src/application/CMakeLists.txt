@@ -18,6 +18,7 @@ add_library(
     bootstrap/torch_bootstrap.cpp
     transport/rdma/rdma.cpp
     transport/rdma/providers/mlx5/mlx5.cpp
+    transport/rdma/providers/bnxt/bnxt.cpp
     memory/symmetric_memory.cpp
     memory/memory_region.cpp
     context/context.cpp
@@ -25,7 +26,7 @@ add_library(
 
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(mori_application MPI::MPI_CXX ibverbs hip::host hip::device mlx5)
+target_link_libraries(mori_application MPI::MPI_CXX ibverbs hip::host hip::device mlx5 bnxt_re)
 
 target_include_directories(mori_application PUBLIC ${TORCH_INCLUDE_DIRS})
 target_link_libraries(mori_application c10 torch torch_cpu c10_hip torch_hip)
