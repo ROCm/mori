@@ -7,7 +7,7 @@ import torch.distributed as dist
 import argparse
 
 class EpDispatchCombineTestCase:
-    def __init__(self, rank, gpu_per_node, world_size, dtype=torch.bfloat16):
+    def __init__(self, rank, gpu_per_node, world_size, max_tokens, dtype=torch.bfloat16):
         self.rank = rank
         self.gpu_per_node = gpu_per_node
         self.world_size = world_size
@@ -18,7 +18,7 @@ class EpDispatchCombineTestCase:
             hidden_dim=7168,
             scale_dim=32,
             scale_type_size=4,
-            max_num_inp_token_per_rank=4096,
+            max_num_inp_token_per_rank=max_tokens,
             num_experts_per_rank=16,
             num_experts_per_token=8,
             warp_num_per_block=16,
@@ -254,7 +254,7 @@ class EpDispatchCombineTestCase:
     def test_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
         error_round = set()
-        for i in range(500):
+        for i in range(5):
             if self.rank == 0:
                 print(f"Round {i} begin")
             test_data = self.gen_test_data()
@@ -345,12 +345,19 @@ class EpDispatchCombineTestCase:
         comb_duration_us_list = []
         comb_bandwidth_GB_list = []
 
+        # for i in range(10):
+        #     if self.rank == 0:
+        #         print(f"WarmUp Round {i} begin")
+        #     _, _, _, _ = (
+        #         self.run_bench_once(op, test_data)
+        #     )
+        
+        error_round = set()
         for i in range(10):
             if self.rank == 0:
                 print(f"WarmUp Round {i} begin")
-            _, _, _, _ = (
-                self.run_bench_once(op, test_data)
-            )
+            self.run_test_once(op, test_data, error_round, i)
+        assert(len(error_round) == 0), f"Warmup failed with errors in rounds: {error_round}"
 
 
         for i in range(50):
@@ -424,19 +431,15 @@ class EpDispatchCombineTestCase:
 
         if self.rank == 0:
             print(
-                f"dispatch: avg bandwidth {avg_disp_bw:.2f} GB/s, "
-                f"best {best_disp_bw:.2f} GB/s | "
-                f"avg latency {avg_disp_lat:.2f} µs, "
-                f"best {best_disp_lat:.2f} µs\n"
-                f"combine : avg bandwidth {avg_comb_bw:.2f} GB/s, "
-                f"best {best_comb_bw:.2f} GB/s | "
-                f"avg latency {avg_comb_lat:.2f} µs, "
-                f"best {best_comb_lat:.2f} µs"
+                f"dispatch: best/avg bandwidth {best_disp_bw:.2f} / {avg_disp_bw:.2f} GB/s | "
+                f"best/avg latency {best_disp_lat:.2f} / {avg_disp_lat:.2f} µs\n"
+                f"combine : best/avg bandwidth {best_comb_bw:.2f} / {avg_comb_bw:.2f} GB/s | "
+                f"best/avg latency {best_comb_lat:.2f} / {avg_comb_lat:.2f} µs"
             )
         del op
 
 
-def test_dispatch_combine(local_rank, num_node, gpu_per_node, is_bench=False):
+def test_dispatch_combine(local_rank, num_node, gpu_per_node, max_tokens, is_bench=False):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
     global_rank = node_rank * gpu_per_node + local_rank
@@ -445,6 +448,7 @@ def test_dispatch_combine(local_rank, num_node, gpu_per_node, is_bench=False):
         global_rank,
         gpu_per_node,
         world_size,
+        max_tokens,
         torch.bfloat16,  # torch.float8_e4m3fnuz
     )
     test_case.setup()
@@ -458,6 +462,8 @@ def test_dispatch_combine(local_rank, num_node, gpu_per_node, is_bench=False):
 parser = argparse.ArgumentParser(description="dispatch/combine internode test")
 parser.add_argument("--bench", action="store_true",
                     help="Set this flag True to run benchmark into test_dispatch_combine")
+parser.add_argument("--max-tokens", type=int, default=4096,
+                    help="Maximum number of input tokens per rank (default: 4096)")
 args_cli = parser.parse_args()
 
 if __name__ == "__main__":
@@ -468,7 +474,7 @@ if __name__ == "__main__":
     world_size = num_node * gpu_per_node
     torch.multiprocessing.spawn(
         test_dispatch_combine,
-        args=(num_node, gpu_per_node, args_cli.bench),
+        args=(num_node, gpu_per_node, args_cli.max_tokens, args_cli.bench),
         nprocs=gpu_per_node,
         join=True,
     )

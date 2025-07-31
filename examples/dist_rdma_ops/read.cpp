@@ -14,29 +14,26 @@ using namespace mori::core;
   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | \
       IBV_ACCESS_REMOTE_ATOMIC
 
-__global__ void CheckBufferKernel(const char* buffer, size_t numElems, char expected) {  
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;  
-    if (idx < numElems) {  
-        char val = buffer[idx];  
-        if (val != expected) {  
-            // printf("Mismatch at index %zu: expected=%d, got=%d\n", idx, expected, val);  
-            assert(false && "Buffer mismatch detected!");
-        }  
-    }  
-}  
-   
-void VerifyBuffer(void* buffer, size_t maxSize, char expected) {  
-    size_t numElems = maxSize / sizeof(char);  
-  
-    int threadsPerBlock = 256;  
-    int blocks = (static_cast<int>(numElems) + threadsPerBlock - 1) / threadsPerBlock;  
-  
-    CheckBufferKernel<<<blocks, threadsPerBlock>>>(  
-        reinterpret_cast<char*>(buffer),  
-        numElems,  
-        expected  
-    );  
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());  
+__global__ void CheckBufferKernel(const char* buffer, size_t numElems, char expected) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < numElems) {
+    char val = buffer[idx];
+    if (val != expected) {
+      // printf("Mismatch at index %zu: expected=%d, got=%d\n", idx, expected, val);
+      assert(false && "Buffer mismatch detected!");
+    }
+  }
+}
+
+void VerifyBuffer(void* buffer, size_t maxSize, char expected) {
+  size_t numElems = maxSize / sizeof(char);
+
+  int threadsPerBlock = 256;
+  int blocks = (static_cast<int>(numElems) + threadsPerBlock - 1) / threadsPerBlock;
+
+  CheckBufferKernel<<<blocks, threadsPerBlock>>>(reinterpret_cast<char*>(buffer), numElems,
+                                                 expected);
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 }
 
 __device__ void Quite(RdmaEndpoint* endpoint) {
@@ -210,14 +207,15 @@ void distRdmaOps(int argc, char* argv[]) {
   RdmaContext rdma_context;
   RdmaDeviceList rdma_devices = rdma_context.GetRdmaDeviceList();
   ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(rdma_devices);
-  RdmaDevice* device = activeDevicePortList[local_rank].first;
+  RdmaDevice* device = activeDevicePortList[local_rank % activeDevicePortList.size()].first;
+  std::cout << "localRank " << local_rank << " select device " << device->Name() << std::endl;
 
   RdmaDeviceContext* device_context = device->CreateRdmaDeviceContext();
 
   // 2 Create an endpoint
   RdmaEndpointConfig config;
-  config.portId = activeDevicePortList[local_rank].second;
-  config.gidIdx = 1;
+  config.portId = activeDevicePortList[local_rank % activeDevicePortList.size()].second;
+  config.gidIdx = 3;
   config.maxMsgsNum = 1024;
   config.maxCqeNum = 4096;
   config.alignment = 4096;
@@ -267,14 +265,12 @@ void distRdmaOps(int argc, char* argv[]) {
   // printf("Before: Local rank %d val %d\n", local_rank, ((char*)buffer)[0]);
 
   for (size_t size = minSize; size <= maxSize; size *= stepFactor) {
-    if (local_rank == 0)
-    {
+    if (local_rank == 0) {
       Write<<<blocks, threads>>>(devEndpoint, global_mr_handles[0], global_mr_handles[1], size, 1);
       HIP_RUNTIME_CHECK(hipDeviceSynchronize());
     }
     bootNet.Barrier();
-    if (local_rank == 1)
-    {
+    if (local_rank == 1) {
       VerifyBuffer(reinterpret_cast<char*>(buffer), size, 0);
       HIP_RUNTIME_CHECK(hipDeviceSynchronize());
     }
@@ -285,24 +281,28 @@ void distRdmaOps(int argc, char* argv[]) {
   if (local_rank == 0) {
     for (size_t size = minSize; size <= maxSize; size *= stepFactor) {
       // warmup
-      Write<<<blocks, threads>>>(devEndpoint, global_mr_handles[0], global_mr_handles[1], size, warmupIters);
+      Write<<<blocks, threads>>>(devEndpoint, global_mr_handles[0], global_mr_handles[1], size,
+                                 warmupIters);
       HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
       // test and record
       HIP_RUNTIME_CHECK(hipEventRecord(start));
-      Write<<<blocks, threads>>>(devEndpoint, global_mr_handles[0], global_mr_handles[1], size, iters);
+      Write<<<blocks, threads>>>(devEndpoint, global_mr_handles[0], global_mr_handles[1], size,
+                                 iters);
       HIP_RUNTIME_CHECK(hipEventRecord(end));
       HIP_RUNTIME_CHECK(hipEventSynchronize(end));
       HIP_RUNTIME_CHECK(hipEventElapsedTime(&milliseconds, start, end));
       times[validSizeLog] = milliseconds;
       sizeTable[validSizeLog] = size;
-      bwTable[validSizeLog] = size * blocks * threads / (milliseconds * (B_TO_GB / (iters * MS_TO_S)));
+      bwTable[validSizeLog] =
+          size * blocks * threads / (milliseconds * (B_TO_GB / (iters * MS_TO_S)));
       validSizeLog++;
     }
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   }
   bootNet.Barrier();
-  // printf("After: Local rank %d val %d %d\n", local_rank, ((char*)buffer)[0],((char*)buffer)[maxSize/sizeof(char)-1]);
+  // printf("After: Local rank %d val %d %d\n", local_rank,
+  // ((char*)buffer)[0],((char*)buffer)[maxSize/sizeof(char)-1]);
 
   if (local_rank == 0) {
     printf("\nIBGDA Wite benchmark:\n");

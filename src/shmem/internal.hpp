@@ -56,8 +56,6 @@ struct ShmemStates {
   }
 };
 
-constexpr int MaxRdmaEndpointNum = 1024;
-
 struct GpuStates {
   int rank{-1};
   int worldSize{-1};

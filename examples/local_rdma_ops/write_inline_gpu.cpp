@@ -91,7 +91,7 @@ void LocalRdmaOps() {
   // 2 Create an endpoint
   RdmaEndpointConfig config;
   config.portId = devicePort.second;
-  config.gidIdx = 1;
+  config.gidIdx = 3;
   config.maxMsgsNum = 1024;
   config.maxCqeNum = 1024;
   config.alignment = 4096;

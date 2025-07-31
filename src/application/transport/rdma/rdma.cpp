@@ -1,7 +1,10 @@
 #include "mori/application/transport/rdma/rdma.hpp"
 
 #include <cassert>
+#include <cstdlib>
 #include <iostream>
+#include <sstream>
+#include <unordered_set>
 
 #include "infiniband/verbs.h"
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
@@ -138,11 +141,55 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
 
 void RdmaContext::Intialize() {
   rdmaDeviceList.clear();
-  for (int i = 0; deviceList[i] != nullptr; i++) {
-    RdmaDevice* device = RdmaDeviceFactory(deviceList[i]);
-    if (device == nullptr) continue;
-    rdmaDeviceList.push_back(device);
+
+  const char* envDevices = std::getenv("MORI_RDMA_DEVICES");
+  std::unordered_set<std::string> envDeviceSet;
+  std::vector<std::string> envDeviceInOrder;
+  bool isExcludeMode = false;
+  if (envDevices) {
+    std::string envDevicesStr(envDevices);
+    if (!envDevicesStr.empty() && envDevicesStr[0] == '^') {
+      isExcludeMode = true;
+      envDevicesStr = envDevicesStr.substr(1);
+    }
+
+    std::stringstream ss(envDevicesStr);
+    std::string device;
+    while (std::getline(ss, device, ',')) {
+      device.erase(0, device.find_first_not_of(" \t"));
+      device.erase(device.find_last_not_of(" \t") + 1);
+      if (!device.empty()) {
+        envDeviceSet.insert(device);
+        envDeviceInOrder.push_back(device);
+      }
+    }
   }
+
+  if (isExcludeMode || envDeviceSet.empty()) {
+    for (int i = 0; deviceList[i] != nullptr; i++) {
+      if (!envDeviceSet.empty() &&
+          (isExcludeMode ^ (envDeviceSet.find(deviceList[i]->name) == envDeviceSet.end()))) {
+        continue;
+      }
+      RdmaDevice* device = RdmaDeviceFactory(deviceList[i]);
+      if (device != nullptr) {
+        rdmaDeviceList.push_back(device);
+      }
+    }
+  } else {
+    for (const std::string& envDevice : envDeviceInOrder) {
+      for (int i = 0; deviceList[i] != nullptr; i++) {
+        if (deviceList[i]->name == envDevice) {
+          RdmaDevice* device = RdmaDeviceFactory(deviceList[i]);
+          if (device != nullptr) {
+            rdmaDeviceList.push_back(device);
+          }
+          break;
+        }
+      }
+    }
+  }
+
 }
 
 }  // namespace application

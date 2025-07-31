@@ -33,7 +33,7 @@ enum RdmaDeviceVendorId {
 /* -------------------------------------------------------------------------- */
 struct RdmaEndpointConfig {
   uint32_t portId{1};
-  uint32_t gidIdx{1};  // TODO: auto detect?
+  uint32_t gidIdx{3};  // TODO: auto detect?
   uint32_t maxMsgsNum{128};
   uint32_t maxCqeNum{128};
   uint32_t alignment{PAGESIZE};

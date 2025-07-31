@@ -52,11 +52,26 @@ void Context::IntializePossibleTransports() {
   const RdmaDeviceList& devices = rdmaContext->GetRdmaDeviceList();
   ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(devices);
 
+  if (rankInNode == 0) {
+    std::cout << "rank " << LocalRank() << " RDMA devices: ";
+    if (activeDevicePortList.empty()) {
+      std::cout << "None" << std::endl;
+    } else {
+      for (size_t i = 0; i < activeDevicePortList.size(); ++i) {
+        if (i > 0) std::cout << ", ";
+        std::cout << activeDevicePortList[i].first->Name();
+      }
+      std::cout << std::endl;
+    }
+  }
+
   int portId;
   RdmaDevice* device = nullptr;
   if (!activeDevicePortList.empty()) {
     int devicePortId = (rankInNode % activeDevicePortList.size());
     RdmaDevice* device = activeDevicePortList[devicePortId].first;
+    std::cout << "rank " << LocalRank() << " rankInNode " << rankInNode << " select device "
+              << "[" << devicePortId << "] " << device->Name() << std::endl;
     portId = activeDevicePortList[devicePortId].second;
     rdmaDeviceContext.reset(device->CreateRdmaDeviceContext());
   }
@@ -94,7 +109,7 @@ void Context::IntializePossibleTransports() {
 
     application::RdmaEndpointConfig config;
     config.portId = portId;
-    config.gidIdx = 1;
+    config.gidIdx = 3;
     config.maxMsgsNum = 4096;
     config.maxCqeNum = 4096;
     config.alignment = 4096;
