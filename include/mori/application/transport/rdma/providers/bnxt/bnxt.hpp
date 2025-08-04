@@ -96,7 +96,6 @@ class BnxtDeviceContext : public RdmaDeviceContext {
 
  private:
   uint32_t pdn;
-  ibv_pd* pd;
 
   std::unordered_map<uint32_t, BnxtCqContainer*> cqPool;
   std::unordered_map<uint32_t, BnxtQpContainer*> qpPool;

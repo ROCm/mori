@@ -8,6 +8,7 @@
 
 #include "infiniband/verbs.h"
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
+#include "mori/application/transport/rdma/providers/bnxt/bnxt.hpp"
 
 namespace mori {
 namespace application {
@@ -109,7 +110,7 @@ ActiveDevicePortList GetActiveDevicePortList(const RdmaDeviceList& devices) {
 /*                                           RdmaContext                                          */
 /* ---------------------------------------------------------------------------------------------- */
 RdmaContext::RdmaContext() {
-  deviceList = ibv_get_device_list(nullptr);
+  deviceList = ibv_get_device_list(&nums_device);
   Intialize();
 }
 
@@ -131,6 +132,9 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
   switch (device_attr_ex.orig_attr.vendor_id) {
     case (RdmaDeviceVendorId::Mellanox):
       return new Mlx5Device(inDevice);
+      break;
+    case (RdmaDeviceVendorId::Broadcom):
+      return new BnxtDevice(inDevice);
       break;
     default:
       return nullptr;
