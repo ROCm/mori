@@ -69,38 +69,40 @@ void TestMoriIOEngine() {
       initiator.RegisterMemory(initiatorBuf, bufSize, 0, MemoryLocationType::GPU);
   MemoryDesc targetMem = target.RegisterMemory(targetBuf, bufSize, 0, MemoryLocationType::GPU);
 
-  for (int i = 0; i < 64; i++) {
+  int transferCnt = 64;
+
+  for (int i = 0; i < transferCnt; i++) {
     TransferStatus initiatorStatus, targetStatus;
     TransferUniqueId id = initiator.AllocateTransferUniqueId();
     initiator.Read(initatorMem, 0, targetMem, 0, bufSize, &initiatorStatus, id);
     printf("read %d id %d\n", i, id);
     while (initiatorStatus.Code() == StatusCode::INIT) {
     }
-    // while (targetStatus.Code() == StatusCode::INIT) {
-    //   target.PopInboundTransferStatus(initiator.GetEngineDesc().key, id, &targetStatus);
-    // }
+    while (targetStatus.Code() == StatusCode::INIT) {
+      target.PopInboundTransferStatus(initiator.GetEngineDesc().key, id, &targetStatus);
+    }
     printf("Status message initiator %s target %s read value %d\n",
            initiatorStatus.Message().c_str(), targetStatus.Message().c_str(),
            reinterpret_cast<uint8_t*>(initiatorBuf)[511]);
   }
 
-  std::vector<TransferStatus> initiatorStatusVec(64);
-  std::vector<TransferStatus> targetStatusVec(64);
-  std::vector<TransferUniqueId> trsfIds(64);
+  std::vector<TransferStatus> initiatorStatusVec(transferCnt);
+  std::vector<TransferStatus> targetStatusVec(transferCnt);
+  std::vector<TransferUniqueId> trsfIds(transferCnt);
 
-  for (int i = 0; i < 64; i++) {
+  for (int i = 0; i < transferCnt; i++) {
     TransferUniqueId id = initiator.AllocateTransferUniqueId();
     trsfIds[i] = id;
     initiator.Read(initatorMem, 0, targetMem, 0, bufSize, &initiatorStatusVec[i], id);
   }
 
-  for (int i = 0; i < 64; i++) {
+  for (int i = 0; i < transferCnt; i++) {
     while (initiatorStatusVec[i].Code() == StatusCode::INIT) {
     }
-    // while (targetStatusVec[i].Code() == StatusCode::INIT) {
-    //   target.PopInboundTransferStatus(initiator.GetEngineDesc().key, trsfIds[i],
-    //                                   &targetStatusVec[i]);
-    // }
+    while (targetStatusVec[i].Code() == StatusCode::INIT) {
+      target.PopInboundTransferStatus(initiator.GetEngineDesc().key, trsfIds[i],
+                                      &targetStatusVec[i]);
+    }
     printf("Status message initiator %s target %s read value %d\n",
            initiatorStatusVec[i].Message().c_str(), targetStatusVec[i].Message().c_str(),
            reinterpret_cast<uint8_t*>(initiatorBuf)[511]);

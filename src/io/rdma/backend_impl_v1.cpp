@@ -87,7 +87,7 @@ EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
 application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int portId) {
   application::RdmaEndpointConfig config;
   config.portId = portId;
-  config.gidIdx = 1;
+  config.gidIdx = 3;
   config.maxMsgsNum = 1024;
   config.maxMsgSge = 1;
   config.maxCqeNum = 1024;

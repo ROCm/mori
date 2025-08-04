@@ -1,5 +1,8 @@
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 
+#include <iostream>
+
+#include "mori/application/utils/check.hpp"
 namespace mori {
 namespace application {
 
@@ -27,8 +30,9 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
   if (portAttr->link_layer == IBV_LINK_LAYER_INFINIBAND) {
     endpoint.handle.ib.lid = portAttr->lid;
   } else if (portAttr->link_layer == IBV_LINK_LAYER_ETHERNET) {
-    // TODO: implement ethernet
-    assert(false && "not implemented");
+    union ibv_gid gid;
+    SYSCALL_RETURN_ZERO(ibv_query_gid(context, config.portId, config.gidIdx, &gid));
+    memcpy(endpoint.handle.eth.gid, gid.raw, 16);
   } else {
     assert(false && "unsupported link layer");
   }
@@ -94,17 +98,21 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   attr.rq_psn = 0;
   attr.max_dest_rd_atomic = 1;
   attr.min_rnr_timer = 12;
-  attr.ah_attr.dlid = remote.ib.lid;
   attr.ah_attr.sl = 0;
   attr.ah_attr.src_path_bits = 0;
   attr.ah_attr.port_num = local.portId;
-  // TODO: complete ethernet logics
-  //   if (dgid) {
-  //     attr.ah_attr.is_global = 1;
-  //     attr.ah_attr.grh.dgid = *dgid;
-  //     attr.ah_attr.grh.sgid_index = 0;
-  //     attr.ah_attr.grh.hop_limit = 1;
-  //   }
+
+  const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(local.portId);
+  if (portAttr->link_layer == IBV_LINK_LAYER_INFINIBAND) {
+    attr.ah_attr.dlid = remote.ib.lid;
+  } else if (portAttr->link_layer == IBV_LINK_LAYER_ETHERNET) {
+    attr.ah_attr.is_global = 1;
+    union ibv_gid dgid;
+    memcpy(dgid.raw, remote.eth.gid, 16);
+    attr.ah_attr.grh.dgid = dgid;
+    attr.ah_attr.grh.sgid_index = 3;
+    attr.ah_attr.grh.hop_limit = 1;
+  }
   flags = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
           IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER | IBV_QP_AV;
   ibv_modify_qp(qp, &attr, flags);
