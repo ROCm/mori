@@ -11,6 +11,14 @@ message(STATUS "Found LibTorch CMake Path: ${CMAKE_PREFIX_PATH}")
 
 find_package(Torch REQUIRED)
 
+set(CMAKE_LIBRARY_PATH "/usr/local/lib;${CMAKE_LIBRARY_PATH}")
+find_library(BNXT_RE_LIB NAMES bnxt_re)
+if (BNXT_RE_LIB)
+  message(STATUS "Found bnxt_re library at: ${BNXT_RE_LIB}")
+else()
+  message(FATAL_ERROR "Could NOT find bnxt_re library.")
+endif()
+
 add_library(
   mori_application SHARED
   bootstrap/mpi_bootstrap.cpp
@@ -38,7 +46,7 @@ target_link_libraries(
   hip::host
   hip::device
   mlx5
-  bnxt_re
+  ${BNXT_RE_LIB}
   rocm_smi64
   pci)
 
