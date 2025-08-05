@@ -32,4 +32,4 @@ add_executable(
 
 target_include_directories(test_protocol PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(test_protocol PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(test_protocol mori_application mori_io)
+target_link_libraries(test_protocol mori_application mori_io glog::glog)

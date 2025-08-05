@@ -40,6 +40,8 @@ else()
     find_package(CUDAToolkit REQUIRED)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -expt-relaxed-constexpr")
 endif()
+find_package(glog REQUIRED)
+
 
 if (BUILD_EXAMPLES)
     SET(BUILD_APPLICATION ON)

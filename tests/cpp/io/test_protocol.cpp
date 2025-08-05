@@ -3,6 +3,7 @@
 
 #include "mori/application/transport/tcp/tcp.hpp"
 #include "mori/io/protocol.hpp"
+#include <glog/logging.h>
 
 using namespace mori::application;
 using namespace mori::io;
@@ -12,6 +13,7 @@ using TCPInfoPair = std::pair<TCPInfo, TCPInfo>;
 
 TCPInfoPair PrepareTCPEndpoints() {
   std::string host = "127.0.0.1";
+  VLOG(10) << "host = " << host;
 
   TCPContext* context1 = new TCPContext(host, 0);
   TCPContext* context2 = new TCPContext(host, 0);
@@ -28,6 +30,7 @@ TCPInfoPair PrepareTCPEndpoints() {
 }
 
 void TestProtocol() {
+
   auto tcpInfoPair = PrepareTCPEndpoints();
   Protocol initiator(tcpInfoPair.first.second);
   Protocol target(tcpInfoPair.second.second);
@@ -62,4 +65,8 @@ void TestProtocol() {
   for (int i = 0; i < sizeof(msg.rdmaEph.eth.mac); i++) assert(recv.rdmaEph.eth.mac[i] == i);
 }
 
-int main() { TestProtocol(); }
+int main(int argc, char* argv[]) {
+	google::InitGoogleLogging(argv[0]);
+       	TestProtocol();
+	return 0;
+}
