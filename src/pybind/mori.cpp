@@ -12,6 +12,7 @@
 
 #include "mori/application/application.hpp"
 #include "mori/io/io.hpp"
+#include "mori/io/meta_data.hpp"
 #include "mori/ops/ops.hpp"
 #include "mori/shmem/shmem.hpp"
 #include "src/pybind/torch_utils.hpp"
@@ -288,7 +289,35 @@ void RegisterMoriIo(pybind11::module_& m) {
                                return reinterpret_cast<uintptr_t>(desc.data);
                              })
       .def_readonly("size", &mori::io::MemoryDesc::size)
-      .def_readonly("loc", &mori::io::MemoryDesc::loc);
+      .def_readonly("loc", &mori::io::MemoryDesc::loc)
+      .def("pack",[](const mori::io::MemoryDesc& memdesc){
+        mori::io::PackableMemoryDesc tmp;
+        msgpack::sbuffer buf;
+        tmp.engineKey = memdesc.engineKey;
+        tmp.id = memdesc.id;
+        tmp.deviceId = memdesc.deviceId;
+        tmp.size = memdesc.size;
+        tmp.loc = memdesc.loc;
+        tmp.backendDescs = memdesc.backendDescs;
+        tmp.data = reinterpret_cast<uintptr_t>(memdesc.data);
+        msgpack::pack(buf, tmp);
+        return py::bytes(buf.data(), buf.size());
+      })
+      .def_static("unpack",[](const py::bytes& b){
+        Py_ssize_t len = PyBytes_Size(b.ptr());
+        const char* data = PyBytes_AsString(b.ptr());
+        auto out = msgpack::unpack(data, len);
+        auto memdesc = out.get().as<mori::io::PackableMemoryDesc>();
+        mori::io::MemoryDesc tmp;
+        tmp.engineKey = memdesc.engineKey;
+        tmp.id = memdesc.id;
+        tmp.deviceId = memdesc.deviceId;
+        tmp.size = memdesc.size;
+        tmp.loc = memdesc.loc;
+        tmp.backendDescs = memdesc.backendDescs;
+        tmp.data = reinterpret_cast<void*>(memdesc.data);
+        return tmp;
+      });
 
   py::class_<mori::io::IOEngine>(m, "IOEngine")
       .def(py::init<const mori::io::EngineKey&, const mori::io::IOEngineConfig&>())

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <msgpack.hpp>
 
 #include "mori/application/transport/p2p/p2p.hpp"
@@ -70,9 +71,27 @@ struct MemoryDesc {
   size_t size{0};
   MemoryLocationType loc;
   BackendDescBlobMap backendDescs;
+  void set_data_ptr(uintptr_t intptr){
+    this->data = reinterpret_cast<void*>(intptr);
+  }
 
-  MSGPACK_DEFINE(engineKey, id, deviceId, size, loc, backendDescs);
+  // see PackableMemoryDesc
+  // MSGPACK_DEFINE(engineKey, id, deviceId, size, loc, backendDescs);
 };
+
+// only for msg pack/unpack,not for user
+struct PackableMemoryDesc{
+  EngineKey engineKey;
+  MemoryUniqueId id{0};
+  int deviceId{-1};
+  uintptr_t data{0};
+  size_t size{0};
+  MemoryLocationType loc;
+  BackendDescBlobMap backendDescs;
+
+  MSGPACK_DEFINE(engineKey, id, deviceId, data, size, loc, backendDescs);
+};
+
 
 using TransferUniqueId = uint64_t;
 
