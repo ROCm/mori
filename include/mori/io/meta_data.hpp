@@ -76,20 +76,15 @@ struct MemoryDesc {
   }
 
   // see PackableMemoryDesc
-  // MSGPACK_DEFINE(engineKey, id, deviceId, size, loc, backendDescs);
+  MSGPACK_DEFINE(engineKey, id, deviceId, size, loc, backendDescs);
 };
 
 // only for msg pack/unpack,not for user
 struct PackableMemoryDesc{
-  EngineKey engineKey;
-  MemoryUniqueId id{0};
-  int deviceId{-1};
+  MemoryDesc mem_desc;
   uintptr_t data{0};
-  size_t size{0};
-  MemoryLocationType loc;
-  BackendDescBlobMap backendDescs;
 
-  MSGPACK_DEFINE(engineKey, id, deviceId, data, size, loc, backendDescs);
+  MSGPACK_DEFINE(mem_desc,data);
 };
 
 

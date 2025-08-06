@@ -293,12 +293,12 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("pack",[](const mori::io::MemoryDesc& memdesc){
         mori::io::PackableMemoryDesc tmp;
         msgpack::sbuffer buf;
-        tmp.engineKey = memdesc.engineKey;
-        tmp.id = memdesc.id;
-        tmp.deviceId = memdesc.deviceId;
-        tmp.size = memdesc.size;
-        tmp.loc = memdesc.loc;
-        tmp.backendDescs = memdesc.backendDescs;
+        tmp.mem_desc.engineKey = memdesc.engineKey;
+        tmp.mem_desc.id = memdesc.id;
+        tmp.mem_desc.deviceId = memdesc.deviceId;
+        tmp.mem_desc.size = memdesc.size;
+        tmp.mem_desc.loc = memdesc.loc;
+        tmp.mem_desc.backendDescs = memdesc.backendDescs;
         tmp.data = reinterpret_cast<uintptr_t>(memdesc.data);
         msgpack::pack(buf, tmp);
         return py::bytes(buf.data(), buf.size());
@@ -309,12 +309,12 @@ void RegisterMoriIo(pybind11::module_& m) {
         auto out = msgpack::unpack(data, len);
         auto memdesc = out.get().as<mori::io::PackableMemoryDesc>();
         mori::io::MemoryDesc tmp;
-        tmp.engineKey = memdesc.engineKey;
-        tmp.id = memdesc.id;
-        tmp.deviceId = memdesc.deviceId;
-        tmp.size = memdesc.size;
-        tmp.loc = memdesc.loc;
-        tmp.backendDescs = memdesc.backendDescs;
+        tmp.engineKey = memdesc.mem_desc.engineKey;
+        tmp.id = memdesc.mem_desc.id;
+        tmp.deviceId = memdesc.mem_desc.deviceId;
+        tmp.size = memdesc.mem_desc.size;
+        tmp.loc = memdesc.mem_desc.loc;
+        tmp.backendDescs = memdesc.mem_desc.backendDescs;
         tmp.data = reinterpret_cast<void*>(memdesc.data);
         return tmp;
       });
