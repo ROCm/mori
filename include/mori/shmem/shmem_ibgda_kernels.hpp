@@ -115,7 +115,7 @@ inline __device__ void ShmemQuietThreadKernelImpl(int pe) {
       } while (completed != warp_cq_consumer);
       if (prvdType == core::ProviderType::MLX5) {
         core::UpdateCqDbrRecord<core::ProviderType::MLX5>(
-            cq.dbrRecAddr, (uint32_t)(warp_cq_consumer + quiet_amount));
+            cq.dbrRecAddr, (uint32_t)(warp_cq_consumer + quiet_amount), cq.cqeNum);
       } else {
         assert(false);
       }
@@ -197,7 +197,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
   }
   wq.outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
   uint64_t dbr_val =
-      core::PostWrite<PrvdType>(wq.sqAddr, wq.sqWqeNum, nullptr, my_sq_counter, ep[pe].handle.qpn,
+      core::PostWrite<PrvdType>(wq, my_sq_counter, my_sq_counter, my_sq_counter, ep[pe].handle.qpn,
                                 laddr, source.lkey, raddr, rkey, bytes);
 
   if (is_leader) {
@@ -305,7 +305,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
 
   wq.outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
 
-  uint64_t dbr_val = core::PostWriteInline<PrvdType>(wq.sqAddr, wq.sqWqeNum, nullptr, my_sq_counter,
+  uint64_t dbr_val = core::PostWriteInline<PrvdType>(wq, my_sq_counter, my_sq_counter, my_sq_counter,
                                                      ep[pe].handle.qpn, val, raddr, rkey, bytes);
 
   if (is_leader) {
@@ -405,7 +405,7 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
   ;
 
   uint64_t dbr_val =
-      core::PostAtomic<PrvdType>(wq.sqAddr, wq.sqWqeNum, nullptr, my_sq_counter, ep[pe].handle.qpn,
+      core::PostAtomic<PrvdType>(wq, my_sq_counter, my_sq_counter, my_sq_counter, ep[pe].handle.qpn,
                                  laddr, lkey, raddr, rkey, val, 0, bytes, amoType);
   __threadfence_system();
   if (is_leader) {
@@ -513,7 +513,7 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernelImpl(
   wq.outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter + numWqesPerCmd - 1;
 
   uint64_t dbr_val =
-      core::PostAtomic<PrvdType>(wq.sqAddr, wq.sqWqeNum, nullptr, my_sq_counter, ep[pe].handle.qpn,
+      core::PostAtomic<PrvdType>(wq, my_sq_counter, my_sq_counter, my_sq_counter, ep[pe].handle.qpn,
                                  laddr, lkey, raddr, rkey, val, compare, bytes, amoType);
   __threadfence_system();
   if (is_leader) {

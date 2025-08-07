@@ -31,7 +31,7 @@
 #include <vector>
 
 #include "infiniband/verbs.h"
-#include "mori/core/transport/rdma/rdma.hpp"
+#include "mori/core/transport/rdma/primitives.hpp"
 
 namespace mori {
 namespace application {
@@ -129,11 +129,16 @@ struct WorkQueueHandle {
   uint32_t dbTouchIdx{0};  // numbers of wqe that touched doorbell
   uint32_t doneIdx{0};     // numbers of wqe that have been consumed by nic
   uint32_t readyIdx{0};
+  uint32_t msntblSlotIdx{0};
   void* sqAddr{nullptr};
+  void* msntblAddr{nullptr}; // for bnxt
   void* rqAddr{nullptr};
   void* dbrRecAddr{nullptr};
   void* dbrAddr{nullptr};
+  uint32_t psnIdx{0}; // for bnxt msn psn index calculate
+  uint32_t mtuSize{4096};
   uint32_t sqWqeNum{0};
+  uint32_t msntblNum{0};
   uint32_t rqWqeNum{0};
   uint32_t postSendLock{0};
   uint64_t outstandingWqe[OUTSTANDING_TABLE_SIZE]{0};

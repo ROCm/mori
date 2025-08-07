@@ -93,6 +93,8 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   memset(&qpMemInfo, 0, sizeof(struct bnxt_re_dv_qp_mem_info));
   err = bnxt_re_dv_qp_mem_alloc(pd, &ib_qp_attr, &qpMemInfo);
   assert(!err);
+  printf("bnxt_re_dv_qp_mem_alloc is done\n");
+  fflush(stdout); 
 
   // sqUmemAddr
   if (config.onGpu) {
@@ -150,6 +152,8 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   umem_attr.access_flags = IBV_ACCESS_LOCAL_WRITE;
   sqUmem = dv_qp_attr.sq_umem_handle = bnxt_re_dv_umem_reg(context, &umem_attr);
   assert(sqUmem);
+  printf("bnxt_re_dv_umem_reg 1 is done\n");
+  fflush(stdout); 
 
   memset(&umem_attr, 0, sizeof(struct bnxt_re_dv_umem_reg_attr));
   umem_attr.addr = rqUmemAddr;
@@ -157,10 +161,15 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   umem_attr.access_flags = IBV_ACCESS_LOCAL_WRITE;
   rqUmem = dv_qp_attr.rq_umem_handle = bnxt_re_dv_umem_reg(context, &umem_attr);
   assert(rqUmem);
+  printf("bnxt_re_dv_umem_reg 2 is done\n");
+  fflush(stdout); 
 
   qp = bnxt_re_dv_create_qp(pd, &dv_qp_attr);
+  printf("bnxt_re_dv_create_qp is done\n");
+  fflush(stdout); 
   assert(qp);
   qpn = qp->qp_num;
+  std::cout << qpMemInfo << std::endl;
 }
 
 BnxtQpContainer::~BnxtQpContainer() { DestroyQueuePair(); }
@@ -178,6 +187,8 @@ void BnxtQpContainer::DestroyQueuePair() {
 }
 
 void* BnxtQpContainer::GetSqAddress() { return static_cast<char*>(sqUmemAddr); }
+
+void* BnxtQpContainer::GetMsntblAddress() { return static_cast<char*>(msntblUmemAddr); }
 
 void* BnxtQpContainer::GetRqAddress() { return static_cast<char*>(rqUmemAddr); }
 
@@ -267,7 +278,10 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   ibv_context* context = GetIbvContext();
 
   BnxtCqContainer* cq = new BnxtCqContainer(context, config);
+  printf("create cq is done\n");
+  
   BnxtQpContainer* qp = new BnxtQpContainer(context, config, cq->cq, pd);
+  printf("create qp is done\n");
   int ret;
 
   RdmaEndpoint endpoint;
@@ -301,11 +315,16 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
 
   endpoint.vendorId = RdmaDeviceVendorId::Broadcom;
 
+  RdmaDevice* rdmaDevice = GetRdmaDevice();
+  const ibv_port_attr& portAttr = *(rdmaDevice->GetPortAttrMap()->find(config.portId)->second);
+  endpoint.wqHandle.mtuSize = 256U << (portAttr.active_mtu - 1);
   endpoint.wqHandle.sqAddr = qp->GetSqAddress();
+  endpoint.wqHandle.msntblAddr = qp->GetMsntblAddress();
   endpoint.wqHandle.rqAddr = qp->GetRqAddress();
   endpoint.wqHandle.dbrAddr = qp->qpUarPtr;
   endpoint.wqHandle.sqWqeNum = qp->qpMemInfo.sq_slots;
   endpoint.wqHandle.rqWqeNum = qp->qpMemInfo.rq_slots;
+  endpoint.wqHandle.msntblNum = qp->qpMemInfo.sq_npsn;
 
   endpoint.cqHandle.cqAddr = cq->cqUmemAddr;
   endpoint.cqHandle.dbrAddr = cq->cqUarPtr;

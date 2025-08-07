@@ -123,7 +123,7 @@ __device__ void Quite(RdmaEndpoint* endpoint) {
             __hip_atomic_load(&cqHandle->consIdx, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_AGENT);
       } while (completed != warp_cq_consumer);
       UpdateCqDbrRecord<core::ProviderType::MLX5>(cqHandle->dbrRecAddr,
-                                                  (uint32_t)(warp_cq_consumer + quiet_amount));
+                                                  (uint32_t)(warp_cq_consumer + quiet_amount), cqHandle->cqeNum);
       __atomic_signal_fence(__ATOMIC_SEQ_CST);
 
       uint64_t doneIdx = wqe_broadcast[warp_id];
@@ -172,7 +172,7 @@ __global__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
     uintptr_t srcAddr = localMr.addr + FlatThreadId() * msg_size;
     uintptr_t dstAddr = remoteMr.addr + FlatThreadId() * msg_size;
     uint64_t dbr_val = PostWrite<ProviderType::MLX5>(
-        wqHandle->sqAddr, wqHandle->sqWqeNum, nullptr, my_sq_counter, endpoint->handle.qpn, srcAddr,
+        *wqHandle, my_sq_counter, my_sq_counter, my_sq_counter, endpoint->handle.qpn, srcAddr,
         localMr.lkey, dstAddr, remoteMr.rkey, msg_size);
 
     if (is_leader) {

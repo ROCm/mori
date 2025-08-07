@@ -44,39 +44,36 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion mr, int 
     }
 
     __threadfence_system();
-    uint64_t dbr_val =
-        PostSend<ProviderType::MLX5>(epSend.wqHandle.sqAddr, &postIdx, epSend.wqHandle.sqWqeNum,
-                                     epSend.handle.qpn, mr.addr, mr.lkey, msgSize);
+    uint64_t dbr_val = PostSend<ProviderType::MLX5>(epSend.wqHandle, epSend.handle.qpn, mr.addr,
+                                                    mr.lkey, msgSize);
     __threadfence_system();
-    UpdateSendDbrRecord<ProviderType::MLX5>(epSend.wqHandle.dbrRecAddr, postIdx);
+    UpdateSendDbrRecord<ProviderType::MLX5>(epSend.wqHandle.dbrRecAddr, epSend.wqHandle.postIdx);
     __threadfence_system();
     RingDoorbell<ProviderType::MLX5>(epSend.wqHandle.dbrAddr, dbr_val);
     __threadfence_system();
 
     int snd_opcode = PollCq<ProviderType::MLX5>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum,
                                                 &epSend.cqHandle.consIdx);
-    UpdateCqDbrRecord<ProviderType::MLX5>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx);
+    UpdateCqDbrRecord<ProviderType::MLX5>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx, epSend.cqHandle.cqeNum);
     // printf("snd_opcode %d val %d\n", snd_opcode, reinterpret_cast<char*>(mrSend.addr)[0]);
   }
 }
 
 __device__ void RecvThreadKernel(RdmaEndpoint& epRecv, RdmaMemoryRegion mr, int msgSize,
                                  int msgNum) {
-  uint32_t postIdx = 0;
 
   for (int i = 0; i < msgNum; i++) {
     uint8_t sendVal = i;
 
     __threadfence_system();
-    PostRecv<ProviderType::MLX5>(epRecv.wqHandle.rqAddr, epRecv.wqHandle.rqWqeNum, &postIdx,
-                                 mr.addr, mr.lkey, msgSize);
+    PostRecv<ProviderType::MLX5>(epRecv.wqHandle, mr.addr, mr.lkey, msgSize);
     __threadfence_system();
-    UpdateRecvDbrRecord<ProviderType::MLX5>(epRecv.wqHandle.dbrRecAddr, postIdx);
+    UpdateRecvDbrRecord<ProviderType::MLX5>(epRecv.wqHandle.dbrRecAddr, epRecv.wqHandle.postIdx);
     __threadfence_system();
 
     int rcv_opcode = PollCq<ProviderType::MLX5>(epRecv.cqHandle.cqAddr, epRecv.cqHandle.cqeNum,
                                                 &epRecv.cqHandle.consIdx);
-    UpdateCqDbrRecord<ProviderType::MLX5>(epRecv.cqHandle.dbrRecAddr, epRecv.cqHandle.consIdx);
+    UpdateCqDbrRecord<ProviderType::MLX5>(epRecv.cqHandle.dbrRecAddr, epRecv.cqHandle.consIdx, epRecv.cqHandle.cqeNum);
 
     for (int j = 0; j < msgSize; j++) {
       uint8_t recvVal = reinterpret_cast<char*>(mr.addr)[j];
@@ -111,26 +108,30 @@ void LocalRdmaOps() {
   // RDMA initialization
   // 1 Create device
   RdmaContext rdmaContext(RdmaBackendType::DirectVerbs);
+  printf("nums_device: %d\n", rdmaContext.nums_device);
   RdmaDeviceList rdmaDevices = rdmaContext.GetRdmaDeviceList();
+  assert(!rdmaDevices.empty());
   ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(rdmaDevices);
   assert(!activeDevicePortList.empty());
-
+  printf("GetActiveDevicePortList done: %zu\n", activeDevicePortList.size());
   ActiveDevicePort devicePort = activeDevicePortList[0];
 
   RdmaDevice* device = devicePort.first;
   RdmaDeviceContext* deviceContextSend = device->CreateRdmaDeviceContext();
   RdmaDeviceContext* deviceContextRecv = device->CreateRdmaDeviceContext();
+  printf("CreateRdmaDeviceContext done\n");
 
   // 2 Create an endpoint
   RdmaEndpointConfig config;
   config.portId = devicePort.second;
   config.gidIdx = 3;
-  config.maxMsgsNum = 1000;
+  config.maxMsgsNum = 256;
   config.maxCqeNum = 256;
   config.alignment = 4096;
   config.onGpu = true;
   RdmaEndpoint epSend = deviceContextSend->CreateRdmaEndpoint(config);
   RdmaEndpoint epRecv = deviceContextRecv->CreateRdmaEndpoint(config);
+  printf("CreateRdmaEndpoint done\n");
 
   // 3 Allgather global endpoint and connect
   deviceContextSend->ConnectEndpoint(epSend.handle, epRecv.handle);
@@ -154,8 +155,8 @@ void LocalRdmaOps() {
   RdmaMemoryRegion mrRecv =
       deviceContextRecv->RegisterRdmaMemoryRegion(recvBuf, msgSize, MR_ACCESS_FLAG);
 
-  SendRecvOnGpu<<<2, 1>>>(*devEpSend, *devEpRecv, mrSend, mrRecv, msgSize, msgNum);
-  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  // SendRecvOnGpu<<<2, 1>>>(*devEpSend, *devEpRecv, mrSend, mrRecv, msgSize, msgNum);
+  // HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
   // 8 Finalize
   deviceContextSend->DeregisterRdmaMemoryRegion(sendBuf);
