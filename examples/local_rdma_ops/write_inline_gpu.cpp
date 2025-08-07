@@ -15,7 +15,6 @@ using namespace mori::core;
 #define MAX_INLINE_DATA_SIZE 12
 
 __device__ void SendThreadKernel(RdmaEndpoint& epSend, MemoryRegion mr) {
-  uint32_t postIdx = 0;
   uint8_t vals[MAX_INLINE_DATA_SIZE];
   uintptr_t raddr = mr.addr;
 
@@ -26,16 +25,15 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, MemoryRegion mr) {
     }
 
     uint64_t dbr_val =
-        PostWriteInline<ProviderType::MLX5>(epSend.wqHandle.sqAddr, epSend.wqHandle.sqWqeNum,
-                                            &postIdx, postIdx, epSend.handle.qpn, vals, raddr, mr.rkey, i);
-    UpdateSendDbrRecord<ProviderType::MLX5>(epSend.wqHandle.dbrRecAddr, postIdx);
+        PostWriteInline<ProviderType::MLX5>(epSend.wqHandle, epSend.handle.qpn, vals, raddr, mr.rkey, i);
+    UpdateSendDbrRecord<ProviderType::MLX5>(epSend.wqHandle.dbrRecAddr, epSend.wqHandle.postIdx);
     __threadfence_system();
     RingDoorbell<ProviderType::MLX5>(epSend.wqHandle.dbrAddr, dbr_val);
     __threadfence_system();
 
     int opcode = PollCq<ProviderType::MLX5>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum,
                                             &epSend.cqHandle.consIdx);
-    UpdateCqDbrRecord<ProviderType::MLX5>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx);
+    UpdateCqDbrRecord<ProviderType::MLX5>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx, epSend.cqHandle.cqeNum);
     // printf("round %d snd_opcode %d\n", i, opcode);
 
     raddr += i;

@@ -1,8 +1,10 @@
 #pragma once
 
 // #include <infiniband/bnxt_re_dv.h>
-#include "bnxt_re_dv.h"
-#include "bnxt_re-abi.h"
+extern "C" {
+#include <infiniband/bnxt_re_dv.h>
+#include <infiniband/bnxt_re_hsi.h>
+}
 #include "mori/application/transport/rdma/rdma.hpp"
 
 namespace mori {
@@ -10,7 +12,6 @@ namespace application {
 
 #define BNXT_RE_SLOT_SIZE 16
 #define BNXT_RE_CQE_SIZE     (2 * BNXT_RE_SLOT_SIZE)
-#define BNXT_RE_STATIC_WQE_SIZE_SLOTS 16
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Device Attributes                                       */
@@ -56,6 +57,7 @@ class BnxtQpContainer {
   void ModifyRtr2Rts(const RdmaEndpointHandle& local_handle, const RdmaEndpointHandle& remote_handle);
 
   void* GetSqAddress();
+  void* GetMsntblAddress();
   void* GetRqAddress();
 
  private:

@@ -17,7 +17,7 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, MemoryRegion sendMr, Memo
   uint32_t value = 2;
 
   uint64_t dbr_val = PostAtomic<ProviderType::MLX5, uint32_t>(
-      epSend.wqHandle.sqAddr, epSend.wqHandle.sqWqeNum, &epSend.wqHandle.postIdx, epSend.wqHandle.postIdx, epSend.handle.qpn, sendMr.addr,
+      epSend.wqHandle, epSend.handle.qpn, sendMr.addr,
       sendMr.lkey, recvMr.addr, recvMr.rkey, value, value, amoOp);
   UpdateSendDbrRecord<ProviderType::MLX5>(epSend.wqHandle.dbrRecAddr, epSend.wqHandle.postIdx);
   __threadfence_system();
@@ -27,7 +27,7 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, MemoryRegion sendMr, Memo
   uint16_t wqeCounter;
   int opcode = PollCq<ProviderType::MLX5>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum,
                                           &epSend.cqHandle.consIdx, &wqeCounter);
-  UpdateCqDbrRecord<ProviderType::MLX5>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx);
+  UpdateCqDbrRecord<ProviderType::MLX5>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx, epSend.cqHandle.cqeNum);
   // printf("send block is done, opcode is %d postIdx %u consIdx %u\n", opcode, epSend.wqHandle.postIdx, epSend.cqHandle.consIdx);
 }
 
