@@ -6,7 +6,7 @@ MORI stands for Modular RDMA Interface
 
 ### Prerequsites
 
-- pytorch:rocm >= 6.3.0
+- pytorch:rocm >= 6.4.0
 - Linux packages
     
     ```apt-get install -y git cython3 ibverbs-utils openmpi-bin libopenmpi-dev cmake libdw1```

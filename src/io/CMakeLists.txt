@@ -2,7 +2,6 @@ add_library(
     mori_io SHARED
     engine.cpp
     rdma/protocol.cpp
-    # rdma/backend_impl.cpp
     rdma/backend_impl_v1.cpp
 )
 

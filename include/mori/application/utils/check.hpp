@@ -4,6 +4,8 @@
 #include <hip/hip_runtime.h>
 #include <unistd.h>
 
+#include "rocm_smi/rocm_smi.h"
+
 namespace mori {
 namespace application {
 
@@ -51,6 +53,18 @@ namespace application {
         exit(-1);                                                                                 \
       }                                                                                           \
     }                                                                                             \
+  } while (0)
+
+#define ROCM_SMI_CHECK(stmt)                                                          \
+  do {                                                                                \
+    rsmi_status_t result = (stmt);                                                    \
+    if (RSMI_STATUS_SUCCESS != result) {                                              \
+      const char* msg;                                                                \
+      rsmi_status_string(result, &msg);                                               \
+      fprintf(stderr, "[%s:%d] rocm smi failed with %s \n", __FILE__, __LINE__, msg); \
+      exit(-1);                                                                       \
+    }                                                                                 \
+    assert(RSMI_STATUS_SUCCESS == result);                                            \
   } while (0)
 
 }  // namespace application

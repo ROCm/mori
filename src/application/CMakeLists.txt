@@ -23,12 +23,13 @@ add_library(
     memory/symmetric_memory.cpp
     memory/memory_region.cpp
     context/context.cpp
+    topology/system.cpp
     utils/serdes.cpp
 )
 
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(mori_application MPI::MPI_CXX ibverbs hip::host hip::device mlx5)
+target_link_libraries(mori_application MPI::MPI_CXX ibverbs hip::host hip::device mlx5 rocm_smi64 pci)
 
 target_include_directories(mori_application PUBLIC ${TORCH_INCLUDE_DIRS})
 target_link_libraries(mori_application c10 torch torch_cpu c10_hip torch_hip)
