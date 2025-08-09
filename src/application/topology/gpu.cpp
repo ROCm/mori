@@ -12,9 +12,16 @@ TopoSystemGpu::TopoSystemGpu() { Load(); }
 
 TopoSystemGpu::~TopoSystemGpu() {}
 
+PciBusId RsmiBusId2PciBusId(uint64_t rsmiBusId) {
+  uint16_t domain = (rsmiBusId >> 32);
+  uint8_t bus = (rsmiBusId >> 8);
+  uint8_t dev = (rsmiBusId >> 3) & 0x1f;
+  uint8_t func = rsmiBusId & 0x7;
+  return PciBusId(domain, bus, dev, func);
+}
+
 void TopoSystemGpu::Load() {
   uint32_t numGpus;
-  PciBusId busId;
 
   ROCM_SMI_CHECK(rsmi_init(0));
   ROCM_SMI_CHECK(rsmi_num_monitor_devices(&numGpus));
@@ -22,7 +29,9 @@ void TopoSystemGpu::Load() {
   for (uint32_t i = 0; i < numGpus; ++i) {
     TopoNodeGpu* gpu = new TopoNodeGpu();
     gpus.emplace_back(gpu);
-    ROCM_SMI_CHECK(rsmi_dev_pci_id_get(i, &gpu->busId));
+    uint64_t rsmiBusId = 0;
+    ROCM_SMI_CHECK(rsmi_dev_pci_id_get(i, &rsmiBusId));
+    gpu->busId = RsmiBusId2PciBusId(rsmiBusId);
     // ROCM_SMI_CHECK(rsmi_topo_numa_affinity_get(reinterpret_cast<uint32_t>(i), &gpu->numaNode));
   }
 

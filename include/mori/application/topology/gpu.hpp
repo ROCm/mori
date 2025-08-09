@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "mori/application/topology/node.hpp"
+#include "mori/application/topology/pci.hpp"
 #include "rocm_smi/rocm_smi.h"
 
 namespace mori {

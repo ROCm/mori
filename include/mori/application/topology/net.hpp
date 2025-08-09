@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "mori/application/topology/node.hpp"
+#include "mori/application/topology/pci.hpp"
 
 namespace mori {
 namespace application {

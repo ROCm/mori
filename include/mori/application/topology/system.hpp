@@ -19,10 +19,14 @@ class TopoSystem {
   TopoSystem();
   ~TopoSystem();
 
+  TopoSystemGpu* GetTopoSystemGpu() { return gpu.get(); }
+  TopoSystemPci* GetTopoSystemPci() { return pci.get(); }
+  TopoSystemNet* GetTopoSystemNet() { return net.get(); }
+
  private:
   void Load();
 
- public:
+ private:
   std::unique_ptr<TopoSystemGpu> gpu;
   std::unique_ptr<TopoSystemPci> pci;
   std::unique_ptr<TopoSystemNet> net;
