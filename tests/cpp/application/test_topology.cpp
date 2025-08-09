@@ -5,8 +5,7 @@
 #include "mori/application/topology/topology.hpp"
 
 int TestTopoNodeGpu() {
-  mori::io::TopoSystem sys{};
-  sys.Load();
+  mori::application::TopoSystem sys{};
   return 0;
 }
 

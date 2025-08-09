@@ -108,6 +108,58 @@ const ibv_port_attr* RdmaDevice::GetPortAttr(uint32_t portId) const {
   return nullptr;
 }
 
+double RdmaDevice::ActiveGbps(uint32_t portId) const {
+  static constexpr std::array<double, 10> SpeedTable = {
+      0,         // 0 unused
+      2.5,       // 1 SDR
+      5.0,       // 2 DDR
+      10.0,      // 4 QDR
+      10.3125,   // 8 FDR10
+      14.0625,   // 16 FDR
+      25.78125,  // 32 EDR
+      50.0,      // 64 HDR
+      100.0,     // 128 NDR
+      250.0      // 256 XDR
+  };
+
+  static constexpr std::array<double, 6> WidthTable = {
+      0,  // 0 unused
+      1,  // 1 IBV_WIDTH_1X
+      4,  // 2 IBV_WIDTH_4X
+      0,  // 3 unused
+      8,  // 4 IBV_WIDTH_8X
+      12  // 5 IBV_WIDTH_12X
+  };
+
+  // static const int WidthTable[] = {
+  //     [1] = 1, /* IBV_WIDTH_1X  */
+  //     [2] = 4, /* IBV_WIDTH_4X  */
+  //     [4] = 8, /* IBV_WIDTH_8X  */
+  //     [5] = 12 /* IBV_WIDTH_12X */
+  // };
+
+  const ibv_port_attr* attr = GetPortAttr(portId);
+  if (!attr) return 0;
+
+  int speedIdx = 1;
+  for (; speedIdx < 9; speedIdx++) {
+    if ((attr->active_speed >> (speedIdx - 1)) & 0x1) break;
+  }
+
+  double laneSpeed = SpeedTable[speedIdx];
+  double lanes = WidthTable[attr->active_width];
+  printf("port %d lane spd %f lanes %f \n", portId, laneSpeed, lanes);
+  return laneSpeed * lanes;
+}
+
+double RdmaDevice::TotalActiveGbps() const {
+  uint32_t gbps = 0;
+  for (auto port : GetActivePortIds()) {
+    gbps += ActiveGbps(port);
+  }
+  return gbps;
+}
+
 RdmaDeviceContext* RdmaDevice::CreateRdmaDeviceContext() {
   ibv_pd* pd = ibv_alloc_pd(defaultContext);
   return new RdmaDeviceContext(this, pd);

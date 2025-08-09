@@ -202,10 +202,14 @@ class RdmaDevice {
   const std::unordered_map<uint32_t, std::unique_ptr<ibv_port_attr>>* GetPortAttrMap() const;
   const ibv_port_attr* GetPortAttr(uint32_t portId) const;
 
+  double ActiveGbps(uint32_t portId) const;
+  double TotalActiveGbps() const;
+
   std::string Name() const;
 
   virtual RdmaDeviceContext* CreateRdmaDeviceContext();
   ibv_context* GetIbvContext() const { return defaultContext; }
+  ibv_device* GetIbvDevice() const { return device; }
 
  protected:
   friend class RdmaDeviceContext;

@@ -23,7 +23,13 @@ add_library(
     memory/symmetric_memory.cpp
     memory/memory_region.cpp
     context/context.cpp
+
+    topology/gpu.cpp
+    topology/net.cpp
+    topology/node.cpp
+    topology/pci.cpp
     topology/system.cpp
+
     utils/serdes.cpp
 )
 
