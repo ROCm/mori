@@ -190,6 +190,9 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
       core::WarpCopy(args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
                      args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
+      core::WarpCopy(
+          args.shmemInpWeightsMemObj->template GetAs<float*>() + i * config.numExpertPerToken,
+          args.weightsBuf + i * config.numExpertPerToken, config.numExpertPerToken);
     }
   }
   // Make sure copy on all GPUs are finished
@@ -211,6 +214,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
         std::max(0, std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp));
 
     // Prepare data pointers on different GPUs
+    float* srcWeightsPtr[warpSize];
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
       index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
       index_t destPe = destTokId / maxNumOutTokenPerRank;
@@ -219,13 +223,22 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
         index_t destLocalTokId = destTokId - destPe * maxNumOutTokenPerRank;
         srcPtrs[j] = args.shmemInpTokMemObj->template GetAs<T*>(destPe) +
                      destLocalTokId * config.hiddenDim + hiddenDimOffset;
+        srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
+                           destLocalTokId * config.numExpertPerToken;
       } else {
         srcPtrs[j] = nullptr;
+        srcWeightsPtr[j] = nullptr;
       }
     }
     core::WarpAccum<T, 8>(
         args.shmemOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim + hiddenDimOffset,
         srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
+        
+    if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
+      core::WarpAccum<float, 1>(
+          args.shmemOutWeightsMemObj->template GetAs<float*>() + tokenId * config.numExpertPerToken,
+          srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
+    }
   }
 }
 
