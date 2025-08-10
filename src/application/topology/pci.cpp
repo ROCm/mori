@@ -6,7 +6,10 @@
 #include <unistd.h>
 
 #include <cassert>
+#include <iomanip>
 #include <queue>
+#include <regex>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -31,6 +34,36 @@ bool IsUnderRootComplex(struct pci_dev* dev) {
   const char* last = basename(parent);
   return strncmp(last, "pci", 3) == 0;
 }
+
+bool IsBdfString(const std::string& s) {
+  static const std::regex bdfRegex(R"(^[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$)");
+  return std::regex_match(s, bdfRegex);
+}
+std::vector<uint64_t> ParseBdfFromString(const std::string& str) {
+  if (!IsBdfString(str)) return {};
+
+  uint64_t domain = 0, bus = 0, dev = 0, func = 0;
+  char dot;
+
+  std::stringstream ss(str);
+  ss >> std::hex >> domain;
+  ss.ignore(1, ':');
+  ss >> std::hex >> bus;
+  ss.ignore(1, ':');
+  ss >> std::hex >> dev;
+  ss >> dot;
+  ss >> std::hex >> func;
+
+  return {domain, bus, dev, func};
+}
+
+std::string BdfToString(uint64_t domain, uint64_t bus, uint64_t dev, uint64_t func) {
+  std::stringstream ss;
+  ss << std::hex << std::setfill('0') << std::setw(4) << domain << ":" << std::setw(2) << bus << ":"
+     << std::setw(2) << dev << "." << std::dec << func;
+  return ss.str();
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           TopoNodePci                                          */
 /* ---------------------------------------------------------------------------------------------- */
@@ -110,9 +143,75 @@ void TopoNodePci::RemoveDownstreamPort(PciBusId bus) {
 }
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                                           TopoPathPci                                          */
+/* ---------------------------------------------------------------------------------------------- */
+TopoPathPci::TopoPathPci(TopoNodePci* h, TopoNodePci* t) : head(h), tail(t) {
+  assert(head && tail);
+  BuildPath();
+  Validate();
+}
+
+void TopoPathPci::BuildPath() {
+  std::vector<TopoNodePci*> hAnces;
+  std::vector<TopoNodePci*> tAnces;
+  std::unordered_map<TopoNodePci*, int> tAnces2Idx;
+
+  for (TopoNodePci* n = head; n != nullptr; n = n->UpstreamPort()) hAnces.push_back(n);
+
+  int i = 0;
+  for (TopoNodePci* n = tail; n != nullptr; n = n->UpstreamPort(), i++) {
+    tAnces.push_back(n);
+    tAnces2Idx.insert({n, i});
+  }
+
+  for (auto* n : hAnces) {
+    if (tAnces2Idx.find(n) == tAnces2Idx.end()) {
+      nodes.push_back(n);
+    } else {
+      int idx = tAnces2Idx[n];
+      for (int i = idx; i >= 0; i--) nodes.push_back(tAnces[i]);
+      break;
+    }
+  }
+}
+
+void TopoPathPci::Validate() {
+  assert(!nodes.empty());
+  assert(nodes[0] == head);
+  assert(nodes[nodes.size() - 1] == tail);
+}
+
+int TopoPathPci::Hops() const { return 0; }
+
+bool TopoPathPci::CrossRootComplex() const {
+  for (auto* n : nodes) {
+    if (n->Type() == TopoNodePciType::RootComplex) return true;
+  }
+  return false;
+}
+
+bool TopoPathPci::CrossMultipleNuma() const {
+  // No root complex, check numa directly
+  if ((head->Type() != TopoNodePciType::RootComplex) &&
+      (tail->Type() != TopoNodePciType::RootComplex)) {
+    return (head->NumaNode() != tail->NumaNode());
+  }
+  // If one is root complex, check
+  bool crossMultiRc = false;
+  for (auto* n : nodes) {
+    if (n->Type() == TopoNodePciType::VirtualRoot) {
+      crossMultiRc = true;
+      break;
+    }
+  }
+  return crossMultiRc;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                          TopoSystemPci                                         */
 /* ---------------------------------------------------------------------------------------------- */
-TopoSystemPci::TopoSystemPci() {
+
+TopoSystemPci::TopoSystemPci() : pathCache() {
   Load();
   Validate();
 }
@@ -124,6 +223,8 @@ TopoNodePci* CreateTopoNodePciFrom(pci_dev* dev) {
   PciBusId bus = PciBusId(dev->domain, dev->bus, dev->dev, dev->func);
   NumaNodeId numa = dev->numa_node;
   if ((cls == PCI_CLASS_BRIDGE_HOST) || (cls == PCI_CLASS_BRIDGE_PCI)) {
+    if (cls == PCI_CLASS_BRIDGE_HOST)
+      printf("host bridge numa %d dom %2x bus %2x\n", dev->numa_node, dev->domain, dev->bus);
     return TopoNodePci::CreateBridge(bus, numa);
   } else if ((cls == PCI_CLASS_NETWORK_ETHERNET) || (cls == PCI_CLASS_SERIAL_INFINIBAND)) {
     return TopoNodePci::CreateNet(bus, numa);
@@ -228,6 +329,18 @@ void TopoSystemPci::Validate() {
 
   assert(seen.size() == pcis.size());
   printf("total nodes %d\n", seen.size());
+}
+
+TopoPathPci* TopoSystemPci::Path(PciBusId head, PciBusId tail) {
+  if (pcis.find(head.packed) == pcis.end()) return nullptr;
+  if (pcis.find(tail.packed) == pcis.end()) return nullptr;
+
+  PathKey key{head.packed, tail.packed};
+  if (pathCache.find(key) == pathCache.end()) {
+    TopoPathPci* p = new TopoPathPci(pcis[head.packed].get(), pcis[tail.packed].get());
+    pathCache.emplace(key, p);
+  }
+  return pathCache[key].get();
 }
 
 }  // namespace application

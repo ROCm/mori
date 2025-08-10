@@ -29,8 +29,6 @@ add_library(
     topology/node.cpp
     topology/pci.cpp
     topology/system.cpp
-
-    utils/serdes.cpp
 )
 
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR}/include)
