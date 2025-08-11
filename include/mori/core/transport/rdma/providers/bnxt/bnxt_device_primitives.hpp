@@ -644,13 +644,17 @@ template <>
 inline __device__ int PollCqOnce<ProviderType::BNXT>(void* cqeAddr, uint32_t cqeNum,
                                                      uint32_t consIdx, uint32_t* wqeIdx) {
   uint32_t cqeIdx = consIdx % cqeNum;
-  void* cqe = reinterpret_cast<char*>(cqeAddr) + 2 * BNXT_RE_SLOT_SIZE * cqeIdx;
-  struct bnxt_re_bcqe* hdr = (struct bnxt_re_bcqe*)((char*)cqe + sizeof(struct bnxt_re_rc_cqe));
-  uint32_t flg_val = hdr->flg_st_typ_ph;
+
+  volatile char* cqe = static_cast<volatile char*>(cqeAddr);
+  volatile char* src = cqe + 2 * BNXT_RE_SLOT_SIZE * cqeIdx + sizeof(struct bnxt_re_rc_cqe);
+  struct bnxt_re_bcqe bcqe;
+  bcqe.flg_st_typ_ph = *reinterpret_cast<volatile uint32_t*>(src);
+  bcqe.qphi_rwrid = *reinterpret_cast<volatile uint32_t*>(src + 4);
   uint32_t phase = BNXT_RE_QUEUE_START_PHASE ^ ((consIdx / cqeNum) & 0x1);
+  uint32_t flg_val = bcqe.flg_st_typ_ph;
   // printf("GPU  flg_val = 0x%08X (%u), phase = 0x%08X (%u)\n", flg_val & BNXT_RE_BCQE_PH_MASK,
   //        flg_val & BNXT_RE_BCQE_PH_MASK, phase, phase);
-  if (((flg_val)&BNXT_RE_BCQE_PH_MASK) == (phase)) {
+  if (((flg_val) & BNXT_RE_BCQE_PH_MASK) == (phase)) {
     uint8_t status = (flg_val >> BNXT_RE_BCQE_STATUS_SHIFT) & BNXT_RE_BCQE_STATUS_MASK;
 
     if (status != BNXT_RE_REQ_ST_OK) {
@@ -658,7 +662,7 @@ inline __device__ int PollCqOnce<ProviderType::BNXT>(void* cqeAddr, uint32_t cqe
       return status;
     }
     if (wqeIdx) {
-      *wqeIdx = BE32TOH(hdr->qphi_rwrid) & BNXT_RE_BCQE_RWRID_MASK;
+      *wqeIdx = bcqe.qphi_rwrid & BNXT_RE_BCQE_RWRID_MASK;
     }
     return 0;
   }
