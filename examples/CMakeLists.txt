@@ -5,6 +5,9 @@ target_link_libraries(dist_read mori_application hip::host hip::device)
 add_executable(send_recv_gpu local_rdma_ops/send_recv_gpu.cpp)
 target_link_libraries(send_recv_gpu mori_application hip::host hip::device)
 
+add_executable(write_gpu local_rdma_ops/write_gpu.cpp)
+target_link_libraries(write_gpu mori_application hip::host hip::device)
+
 add_executable(write_inline_gpu local_rdma_ops/write_inline_gpu.cpp)
 target_link_libraries(write_inline_gpu mori_application hip::host hip::device)
 
