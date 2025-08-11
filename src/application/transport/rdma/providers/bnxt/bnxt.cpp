@@ -328,6 +328,7 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
 
   endpoint.cqHandle.cqAddr = cq->cqUmemAddr;
   endpoint.cqHandle.dbrAddr = cq->cqUarPtr;
+  endpoint.cqHandle.dbrRecAddr = cq->cqUarPtr;
   endpoint.cqHandle.cqeNum = cq->cqeNum;
   endpoint.cqHandle.cqeSize = GetBnxtCqeSize();
 

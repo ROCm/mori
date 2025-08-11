@@ -91,9 +91,9 @@ inline __device__ uint64_t BnxtPostSend(WorkQueueHandle& wq, uint32_t curPostIdx
   send.avid = 0;
   send.rsvd = 0;
 
-  sge.pa = HTOBE64(laddr);
-  sge.lkey = HTOBE32(lkey);
-  sge.length = HTOBE32(bytes);
+  sge.pa = (uint64_t) laddr;
+  sge.lkey = lkey & 0xffffffff;
+  sge.length = bytes;
 
   char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
   memcpy(base + 0 * BNXT_RE_SLOT_SIZE, &hdr, sizeof(hdr));
@@ -110,7 +110,7 @@ inline __device__ uint64_t BnxtPostSend(WorkQueueHandle& wq, uint32_t curPostIdx
   uint8_t flags = (curPostIdx / wqeNum) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
 
-  return bnxt_re_init_db_hdr((slotIdx | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
+  return bnxt_re_init_db_hdr(((slotIdx + slotsNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
 }
 
 template <>
@@ -167,9 +167,9 @@ inline __device__ void PostRecv<ProviderType::BNXT>(WorkQueueHandle& wq, uint32_
       (wqe_size << BNXT_RE_HDR_WS_SHIFT) | (hdr_flags << BNXT_RE_HDR_FLAGS_SHIFT) | wqe_type;
   hdr.wrid = slotIdx / slotsNum;
 
-  sge.pa = HTOBE64(laddr);
-  sge.lkey = HTOBE32(lkey);
-  sge.length = HTOBE32(bytes);
+  sge.pa = (uint64_t) laddr;
+  sge.lkey = lkey & 0xffffffff;
+  sge.length = bytes;
 
   char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
   memcpy(base + 0 * BNXT_RE_SLOT_SIZE, &hdr, sizeof(hdr));
@@ -203,9 +203,9 @@ inline __device__ void PostRecv<ProviderType::BNXT>(WorkQueueHandle& wq, uintptr
       (wqe_size << BNXT_RE_HDR_WS_SHIFT) | (hdr_flags << BNXT_RE_HDR_FLAGS_SHIFT) | wqe_type;
   hdr.wrid = slotIdx / slotsNum;
 
-  sge.pa = HTOBE64(laddr);
-  sge.lkey = HTOBE32(lkey);
-  sge.length = HTOBE32(bytes);
+  sge.pa = (uint64_t) laddr;
+  sge.lkey = lkey & 0xffffffff;
+  sge.length = bytes;
 
   char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
   memcpy(base + 0 * BNXT_RE_SLOT_SIZE, &hdr, sizeof(hdr));
@@ -255,12 +255,12 @@ inline __device__ uint64_t BnxtPostReadWrite(WorkQueueHandle& wq, uint32_t curPo
   hdr.key_immd = 0;
   hdr.lhdr.qkey_len = bytes;
 
-  rdma.rva = HTOBE64(raddr);
-  rdma.rkey = HTOBE32(rkey);
+  rdma.rva = (uint64_t) raddr;
+  rdma.rkey = rkey & 0xffffffff;
 
-  sge.pa = HTOBE64(laddr);
-  sge.lkey = HTOBE32(lkey);
-  sge.length = HTOBE32(bytes);
+  sge.pa = (uint64_t) laddr;
+  sge.lkey = lkey & 0xffffffff;
+  sge.length = bytes;
 
   char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
   memcpy(base + 0 * BNXT_RE_SLOT_SIZE, &hdr, sizeof(hdr));
@@ -276,7 +276,7 @@ inline __device__ uint64_t BnxtPostReadWrite(WorkQueueHandle& wq, uint32_t curPo
   uint8_t flags = (curPostIdx / wqeNum) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
 
-  return bnxt_re_init_db_hdr((slotIdx | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
+  return bnxt_re_init_db_hdr(((slotIdx + slotsNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
 }
 
 template <>
@@ -381,8 +381,8 @@ inline __device__ uint64_t BnxtPostWriteInline(WorkQueueHandle& wq, uint32_t cur
   hdr.key_immd = 0;
   hdr.lhdr.qkey_len = bytes;
 
-  rdma.rva = HTOBE64(raddr);
-  rdma.rkey = HTOBE32(rkey);
+  rdma.rva = (uint64_t) raddr;
+  rdma.rkey = rkey & 0xffffffff;
 
   char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
   memcpy(base + 0 * BNXT_RE_SLOT_SIZE, &hdr, sizeof(hdr));
@@ -407,7 +407,7 @@ inline __device__ uint64_t BnxtPostWriteInline(WorkQueueHandle& wq, uint32_t cur
   uint8_t flags = (curPostIdx / wqeNum) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
 
-  return bnxt_re_init_db_hdr((slotIdx | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
+  return bnxt_re_init_db_hdr(((slotIdx + slotsNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
 }
 
 template <>
@@ -508,15 +508,15 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
   uint32_t wqe_type = BNXT_RE_HDR_WT_MASK & opcode;
   hdr.rsv_ws_fl_wt =
       (wqe_size << BNXT_RE_HDR_WS_SHIFT) | (hdr_flags << BNXT_RE_HDR_FLAGS_SHIFT) | wqe_type;
-  hdr.key_immd = HTOBE32(rkey);
-  hdr.lhdr.rva = HTOBE64(raddr);
+  hdr.key_immd = rkey & 0xffffffff;
+  hdr.lhdr.rva = (uint64_t) raddr;
 
-  amo.swp_dt = HTOBE64(data);
-  amo.cmp_dt = HTOBE64(cmp);
+  amo.swp_dt = (uint64_t) data;
+  amo.cmp_dt = (uint64_t) cmp;
 
-  sge.pa = HTOBE64(laddr);
-  sge.lkey = HTOBE32(lkey);
-  sge.length = HTOBE32(bytes);
+  sge.pa = (uint64_t) laddr;
+  sge.lkey = lkey & 0xffffffff;
+  sge.length = bytes;
 
   char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
   memcpy(base + 0 * BNXT_RE_SLOT_SIZE, &hdr, sizeof(hdr));
@@ -532,7 +532,7 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
   uint8_t flags = (curPostIdx / wqeNum) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
 
-  return bnxt_re_init_db_hdr((slotIdx | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
+  return bnxt_re_init_db_hdr(((slotIdx + slotsNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
 }
 
 template <>
@@ -648,7 +648,8 @@ inline __device__ int PollCqOnce<ProviderType::BNXT>(void* cqeAddr, uint32_t cqe
   struct bnxt_re_bcqe* hdr = (struct bnxt_re_bcqe*)((char*)cqe + sizeof(struct bnxt_re_rc_cqe));
   uint32_t flg_val = hdr->flg_st_typ_ph;
   uint32_t phase = BNXT_RE_QUEUE_START_PHASE ^ ((consIdx / cqeNum) & 0x1);
-
+  // printf("GPU  flg_val = 0x%08X (%u), phase = 0x%08X (%u)\n", flg_val & BNXT_RE_BCQE_PH_MASK,
+  //        flg_val & BNXT_RE_BCQE_PH_MASK, phase, phase);
   if (((flg_val)&BNXT_RE_BCQE_PH_MASK) == (phase)) {
     uint8_t status = (flg_val >> BNXT_RE_BCQE_STATUS_SHIFT) & BNXT_RE_BCQE_STATUS_MASK;
 
