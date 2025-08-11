@@ -27,6 +27,8 @@ class TopoSystemNet {
   TopoSystemNet();
   ~TopoSystemNet();
 
+  std::vector<TopoNodeNic*> GetNICs() const;
+
  private:
   void Load();
 

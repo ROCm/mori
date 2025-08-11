@@ -43,6 +43,8 @@ class TopoSystemGpu {
   TopoSystemGpu();
   ~TopoSystemGpu();
 
+  std::vector<TopoNodeGpu*> GetGpus() const;
+
  private:
   void Load();
 

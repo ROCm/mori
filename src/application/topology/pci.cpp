@@ -107,6 +107,14 @@ TopoNodePci* TopoNodePci::CreateNet(PciBusId bus, NumaNodeId numa) {
   return n;
 }
 
+TopoNodePci* TopoNodePci::CreateOthers(PciBusId bus, NumaNodeId numa) {
+  TopoNodePci* n = new TopoNodePci();
+  n->type = TopoNodePciType::Others;
+  n->busId = bus;
+  n->numaNode = numa;
+  return n;
+}
+
 void TopoNodePci::SetUpstreamPort(TopoNodePci* n) {
   if (type == TopoNodePciType::VirtualRoot) {
     assert(false && "virtual root cannot have usp");
@@ -181,7 +189,13 @@ void TopoPathPci::Validate() {
   assert(nodes[nodes.size() - 1] == tail);
 }
 
-int TopoPathPci::Hops() const { return 0; }
+size_t TopoPathPci::Hops() const {
+  if ((head == nullptr) || (tail == nullptr)) return 0;
+
+  size_t distance = nodes.size();
+  if (distance <= 2) return 0;
+  return distance - 2;
+}
 
 bool TopoPathPci::CrossRootComplex() const {
   for (auto* n : nodes) {
@@ -220,17 +234,20 @@ TopoSystemPci::~TopoSystemPci() {}
 
 TopoNodePci* CreateTopoNodePciFrom(pci_dev* dev) {
   uint16_t cls = dev->device_class;
+  uint16_t baseCls = (cls >> 8);
   PciBusId bus = PciBusId(dev->domain, dev->bus, dev->dev, dev->func);
   NumaNodeId numa = dev->numa_node;
   if ((cls == PCI_CLASS_BRIDGE_HOST) || (cls == PCI_CLASS_BRIDGE_PCI)) {
-    if (cls == PCI_CLASS_BRIDGE_HOST)
-      printf("host bridge numa %d dom %2x bus %2x\n", dev->numa_node, dev->domain, dev->bus);
     return TopoNodePci::CreateBridge(bus, numa);
-  } else if ((cls == PCI_CLASS_NETWORK_ETHERNET) || (cls == PCI_CLASS_SERIAL_INFINIBAND)) {
+  } else if (baseCls == PCI_BASE_CLASS_NETWORK) {
     return TopoNodePci::CreateNet(bus, numa);
-  } else if (cls == PCI_CLASS_DISPLAY_3D) {
+  } else if (cls == 0x1200) {
     return TopoNodePci::CreateGpu(bus, numa);
   }
+  //  else {
+  //   return TopoNodePci::CreateOthers(bus, numa);
+  // }
+
   return nullptr;
 }
 
@@ -271,7 +288,6 @@ void TopoSystemPci::Load() {
 
   // Create root port
   for (auto& dom : domains) {
-    printf("domain %d\n", dom);
     TopoNodePci* n = TopoNodePci::CreateRootComplex(PciBusId(dom, 0, 0, 0), -1, root);
     pcis.emplace(n->BusId().packed, n);
   }
@@ -341,6 +357,11 @@ TopoPathPci* TopoSystemPci::Path(PciBusId head, PciBusId tail) {
     pathCache.emplace(key, p);
   }
   return pathCache[key].get();
+}
+
+TopoNodePci* TopoSystemPci::Node(PciBusId busId) {
+  if (pcis.find(busId.packed) == pcis.end()) return nullptr;
+  return pcis[busId.packed].get();
 }
 
 }  // namespace application

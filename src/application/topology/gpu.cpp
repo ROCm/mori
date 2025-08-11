@@ -17,6 +17,7 @@ PciBusId RsmiBusId2PciBusId(uint64_t rsmiBusId) {
   uint8_t bus = (rsmiBusId >> 8);
   uint8_t dev = (rsmiBusId >> 3) & 0x1f;
   uint8_t func = rsmiBusId & 0x7;
+  printf("bus %16x\n", rsmiBusId);
   return PciBusId(domain, bus, dev, func);
 }
 
@@ -55,6 +56,12 @@ void TopoSystemGpu::Load() {
   }
 
   ROCM_SMI_CHECK(rsmi_shut_down());
+}
+
+std::vector<TopoNodeGpu*> TopoSystemGpu::GetGpus() const {
+  std::vector<TopoNodeGpu*> v(gpus.size());
+  for (int i = 0; i < gpus.size(); i++) v[i] = gpus[i].get();
+  return v;
 }
 
 }  // namespace application

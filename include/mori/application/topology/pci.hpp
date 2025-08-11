@@ -67,6 +67,7 @@ enum class TopoNodePciType {
   Bridge = 2,
   Gpu = 3,
   Net = 4,
+  Others = 8,
   Unknown = 9,
 };
 
@@ -80,6 +81,7 @@ class TopoNodePci : public TopoNode {
   static TopoNodePci* CreateBridge(PciBusId, NumaNodeId);
   static TopoNodePci* CreateGpu(PciBusId, NumaNodeId);
   static TopoNodePci* CreateNet(PciBusId, NumaNodeId);
+  static TopoNodePci* CreateOthers(PciBusId, NumaNodeId);
 
   TopoNodePciType Type() const { return type; }
   PciBusId BusId() const { return busId; }
@@ -92,7 +94,7 @@ class TopoNodePci : public TopoNode {
   void RemoveDownstreamPort(PciBusId);
 
  private:
-  TopoNodePciType type{TopoNodePciType::Unknown};
+  TopoNodePciType type{TopoNodePciType::Others};
   PciBusId busId{0};
   NumaNodeId numaNode{-1};
   TopoNodePci* usp{nullptr};
@@ -105,7 +107,7 @@ class TopoPathPci {
   ~TopoPathPci() = default;
 
   // Returns how many pci hops the path go through
-  int Hops() const;
+  size_t Hops() const;
   // Whether the path crosses root complex
   bool CrossRootComplex() const;
   // Whether the path crosses multiple numa nodes
@@ -128,6 +130,7 @@ class TopoSystemPci {
   ~TopoSystemPci();
 
   TopoPathPci* Path(PciBusId, PciBusId);
+  TopoNodePci* Node(PciBusId);
 
  private:
   void Load();
