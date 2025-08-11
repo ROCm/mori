@@ -407,7 +407,7 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
   }
 
   for (size_t iter = 0; iter < numIters; ++iter) {
-    float accumValFp32[vecSize] = {0};
+    float accumValFp32[vecSize] = {0.0f};
 
     DataType srcVals[AccumNum];
 #pragma unroll AccumNum

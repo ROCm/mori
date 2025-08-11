@@ -527,7 +527,7 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
                           config.numExpertPerToken, hiddenDimSize);
 
     if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
-      core::WarpAccum<float, 1>(
+      core::WarpAccum<float, 8>(
           args.shmemOutWeightsMemObj->template GetAs<float*>() + tokenId * config.numExpertPerToken,
           srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
     }
