@@ -169,23 +169,23 @@ void NotifManager::RegisterDevice(int devId) {
                                      maxNotifNum * sizeof(TransferUniqueId)));
   application::RdmaMemoryRegion mr =
       devCtx->RegisterRdmaMemoryRegion(buf, maxNotifNum * sizeof(TransferUniqueId));
-  ibv_srq* srq = devCtx->GetIbvSrq();
+  struct ibv_srq* srq = devCtx->GetIbvSrq();
   assert(srq);
   notifCtx.insert({devId, {srq, mr}});
 
   // Pre post notification receive wr
   for (uint64_t i = 0; i < maxNotifNum; i++) {
-    ibv_sge sge{};
+    struct ibv_sge sge {};
     sge.addr = mr.addr + i * sizeof(TransferUniqueId);
     sge.length = sizeof(TransferUniqueId);
     sge.lkey = mr.lkey;
 
-    ibv_recv_wr wr{};
+    struct ibv_recv_wr wr {};
     wr.wr_id = i;
     wr.sg_list = &sge;
     wr.num_sge = 1;
 
-    ibv_recv_wr* bad = nullptr;
+    struct ibv_recv_wr* bad = nullptr;
     SYSCALL_RETURN_ZERO(ibv_post_srq_recv(srq, &wr, &bad));
   };
 }
@@ -199,16 +199,16 @@ void NotifManager::MainLoop() {
       uint32_t qpn = events[i].data.u32;
 
       std::optional<EpPair> ep = rdma->GetEpPairByQpn(qpn);
-      ibv_comp_channel* ch = ep->local.ibvHandle.compCh;
+      struct ibv_comp_channel* ch = ep->local.ibvHandle.compCh;
 
-      ibv_cq* cq;
-      void* evCtx;
+      struct ibv_cq* cq = nullptr;
+      void* evCtx = nullptr;
       if (ibv_get_cq_event(ch, &cq, &evCtx)) continue;
       ibv_ack_cq_events(cq, 1);
       ibv_req_notify_cq(cq, 0);
 
       // TODO: maybe take multiple cqes?
-      ibv_wc wc;
+      struct ibv_wc wc {};
       while (ibv_poll_cq(cq, 1, &wc) > 0) {
         if (wc.opcode == IBV_WC_RECV) {
           std::lock_guard<std::mutex> lock(mu);
@@ -225,16 +225,16 @@ void NotifManager::MainLoop() {
           notifPool[ekey].insert(tid);
 
           // replenish recv wr
-          ibv_sge sge;
+          struct ibv_sge sge {};
           sge.addr = ctx.mr.addr + idx * sizeof(TransferUniqueId);
           sge.length = sizeof(TransferUniqueId);
           sge.lkey = ctx.mr.lkey;
 
-          ibv_recv_wr wr;
+          struct ibv_recv_wr wr {};
           wr.wr_id = idx;
           wr.sg_list = &sge;
           wr.num_sge = 1;
-          ibv_recv_wr* bad;
+          struct ibv_recv_wr* bad = nullptr;
           SYSCALL_RETURN_ZERO(ibv_post_srq_recv(ctx.srq, &wr, &bad));
         } else if (wc.opcode == IBV_WC_SEND) {
           uint64_t id = wc.wr_id;
@@ -506,13 +506,13 @@ void RdmaBackend::Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remo
     assert(remoteMr->length == remoteSrc.size);
   }
 
-  ibv_sge sge{};
+  struct ibv_sge sge {};
   sge.addr = reinterpret_cast<uint64_t>(localDest.data) + localOffset;
   sge.length = size;
   sge.lkey = localMr->lkey;
 
-  ibv_send_wr wr{};
-  ibv_send_wr* bad_wr = nullptr;
+  struct ibv_send_wr wr {};
+  struct ibv_send_wr* bad_wr = nullptr;
   wr.wr_id = reinterpret_cast<uint64_t>(status);
   wr.sg_list = &sge;
   wr.num_sge = 1;
@@ -544,19 +544,19 @@ bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id
 
 void RdmaBackend::RdmaNotifyTransfer(const application::RdmaEndpoint& ep, TransferStatus* status,
                                      TransferUniqueId id) {
-  ibv_sge sge{};
+  struct ibv_sge sge {};
   sge.addr = reinterpret_cast<uintptr_t>(&id);
   sge.length = sizeof(TransferUniqueId);
   sge.lkey = 0;
 
-  ibv_send_wr wr{};
+  struct ibv_send_wr wr {};
   wr.wr_id = id;
   wr.opcode = IBV_WR_SEND;
   wr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
   wr.sg_list = &sge;
   wr.num_sge = 1;
 
-  ibv_send_wr* bad_wr = nullptr;
+  struct ibv_send_wr* bad_wr = nullptr;
   int ret = ibv_post_send(ep.ibvHandle.qp, &wr, &bad_wr);
   if (ret != 0) {
     status->SetCode(StatusCode::ERROR);

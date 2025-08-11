@@ -13,8 +13,8 @@ IBVerbsDeviceContext::IBVerbsDeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd
     : RdmaDeviceContext(rdma_device, inPd) {}
 
 IBVerbsDeviceContext::~IBVerbsDeviceContext() {
-  for (auto& it : qpPool) ibv_destroy_qp(it.second.get());
-  for (auto& it : cqPool) ibv_destroy_cq(it.second.get());
+  for (auto& it : qpPool) ibv_destroy_qp(it.second);
+  for (auto& it : cqPool) ibv_destroy_cq(it.second);
 }
 
 RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& config) {
@@ -79,7 +79,7 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   ibv_qp_attr attr;
   int flags;
 
-  ibv_qp* qp = qpPool.find(local.qpn)->second.get();
+  ibv_qp* qp = qpPool.find(local.qpn)->second;
 
   // INIT
   memset(&attr, 0, sizeof(attr));
