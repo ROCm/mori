@@ -450,8 +450,9 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
         const index_t dstIdx =
             myPe * MaxNumTokensToRecvPerRank + startIdx + totalChunk * chunkTokenSize;
         size_t dstOffset = dstIdx * tokenPackSize;
-        shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, dstOffset, args.shmemStagingTokMemObj,
-                                      srcOffset, remainTokenNum * tokenPackSize, srcPe);
+        shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemInpTokMemObj, dstOffset,
+                                            args.shmemStagingTokMemObj, srcOffset,
+                                            remainTokenNum * tokenPackSize, srcPe);
       }
     } else {
       // int warpTokens = 0;
@@ -460,7 +461,7 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
         const index_t mapIdx = srcPe * MaxNumTokensToRecvPerRank + startIdx + idx;
         size_t mapIdxOffset = mapIdx * tokenPackSize;
         const index_t tokenId = args.srcPeTokenIdxMap[mapIdx];
-        size_t tokenOffset = tokenId * size_t(config.hiddenDim) * sizeof(T);
+        size_t tokenOffset = tokenId * tokenSize;
         // const index_t peSortedId = myPe * MaxNumTokensToRecvPerRank + startIdx + idx;
         // size_t peSortedOffset = peSortedId * size_t(config.hiddenDim);
         core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset,

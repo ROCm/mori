@@ -208,9 +208,9 @@ class EpDispatchCombineTestCase:
                 )
                 # assert False
                 error_round.add(round)
-            # assert torch.equal(
-            #     dispatch_weights[i], all_rank_weights[src_pe][src_tok_id]
-            # )
+            assert torch.equal(
+                dispatch_weights[i], all_rank_weights[src_pe][src_tok_id]
+            )
             # assert torch.equal(
             #     dispatch_indicies[i], all_rank_indicies[src_pe][src_tok_id]
             # )
@@ -224,7 +224,6 @@ class EpDispatchCombineTestCase:
         combine_output, combine_output_weight = op.combine(
             dispatch_output,
             dispatch_weights,
-            all_rank_weights[self.rank],
             all_rank_indices[self.rank],
         )
         torch.cuda.synchronize()
@@ -245,7 +244,7 @@ class EpDispatchCombineTestCase:
                 print(self.rank, "got: ", got)
                 print(self.rank, "expected: ", expected)
                 print(self.rank, "delta:", got-expected)
-                # assert False
+                assert False
                 error_round.add(round)
 
             got_weight, expected_weight = combine_output_weight[
@@ -343,7 +342,6 @@ class EpDispatchCombineTestCase:
         start_event.record()
         combine_output, _ = op.combine(
             dispatch_output,
-            # all_rank_weights[self.rank],
             None,
             all_rank_indicies[self.rank],
             call_reset=False,
