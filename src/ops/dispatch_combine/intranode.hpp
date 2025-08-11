@@ -208,8 +208,8 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
   extern __shared__ char sharedMem[];
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
-  float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) + warpNum * config.numExpertPerToken +
-                          warpId * config.numExpertPerToken;
+  float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
+                          warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
 
   index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
   index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
@@ -241,7 +241,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     core::WarpAccum<T, 8>(
         args.shmemOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim + hiddenDimOffset,
         srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
-        
+
     if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
       core::WarpAccum<float, 4>(
           args.shmemOutWeightsMemObj->template GetAs<float*>() + tokenId * config.numExpertPerToken,
