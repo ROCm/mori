@@ -193,10 +193,12 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     }
   }
 
-  for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
-    core::WarpCopy(
-        args.shmemInpWeightsMemObj->template GetAs<float*>() + i * config.numExpertPerToken,
-        args.weightsBuf + i * config.numExpertPerToken, config.numExpertPerToken);
+  if (args.weightsBuf) {
+    for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
+      core::WarpCopy(
+          args.shmemInpWeightsMemObj->template GetAs<float*>() + i * config.numExpertPerToken,
+          args.weightsBuf + i * config.numExpertPerToken, config.numExpertPerToken);
+    }
   }
 
   // Make sure copy on all GPUs are finished
@@ -221,7 +223,6 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
         std::max(0, std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp));
 
     // Prepare data pointers on different GPUs
-    // float* srcWeightsPtr[warpSize];
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
       index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
       index_t destPe = destTokId / maxNumOutTokenPerRank;
@@ -246,19 +247,6 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
           args.shmemOutWeightsMemObj->template GetAs<float*>() + tokenId * config.numExpertPerToken,
           srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
     }
-
-    // if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
-    //   float* destWeightPtr =
-    //       args.shmemOutWeightsMemObj->template GetAs<float*>() + tokenId * config.numExpertPerToken;
-    //   for (int i = 0; i < config.numExpertPerToken; ++i) {
-    //     float weight = 0.0f;
-    //     if (laneId < config.numExpertPerToken) {
-    //       if (srcWeightsPtr[laneId]) weight = *(srcWeightsPtr[laneId] + i);
-    //     }
-    //     float weightSum = core::WarpReduceSum(weight);
-    //     if (laneId == 0) destWeightPtr[i] = weightSum;
-    //   }
-    // }
   }
 }
 
