@@ -34,10 +34,11 @@ __global__ void AtomicNonFetchThreadKernel(int myPe, const SymmMemObjPtr memObj)
     RdmaMemoryRegion source = memObj->GetRdmaMemoryRegion(sendPe);
 
     // ShmemAtomicUint64NonFetchThread(memObj, threadOffset, sendPe, recvPe, AMO_SET);
-    ShmemAtomicTypeNonFetchThread<T>(memObj, threadOffset, sendPe, recvPe, AMO_SET);
+    ShmemAtomicTypeNonFetchThread<T>(memObj, threadOffset, source, threadOffset, sendPe, recvPe,
+                                     AMO_SET);
     __threadfence_system();
 
-    if (globalTid == 0) ShmemQuietThread();
+    ShmemQuietThread();
     // __syncthreads();
   } else {
     while (atomicAdd(reinterpret_cast<T*>(memObj->localPtr) + globalTid, 0) != sendPe) {

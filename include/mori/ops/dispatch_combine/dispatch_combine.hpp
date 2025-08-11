@@ -47,6 +47,7 @@ inline size_t GetHipDataTypeSize(hipDataType dtype) {
 
 using index_t = int32_t;
 
+#define MAX_EXPERTS_PER_TOKEN (8)
 struct EpDispatchCombineConfig {
   int rank{0};
   int worldSize{0};
@@ -178,6 +179,13 @@ class EpDispatchCombineHandle {
   // at combine send phase
   index_t* dispReceiverIdxMap{nullptr};
 
+  // Map staging buffer index to dispatch input token index, saved at dispatch init phase and used
+  // at dispatch send phase
+  index_t* destPeTokenIdxMap{nullptr};
+  // Map output buffer index to combine input token index, saved at dispatch recv phase and used at
+  // combine send phase
+  index_t* srcPeTokenIdxMap{nullptr};
+
   // Count the number of tokens sent to destination pe
   index_t* destPeTokenCounter{nullptr};
   // Count the number of tokens sent to local pe
@@ -219,6 +227,8 @@ struct EpDispatchCombineArgs {
   index_t* localPeTokenCounter{nullptr};
   index_t* dispReceiverIdxMap{nullptr};
   index_t* dispSenderIdxMap{nullptr};
+  index_t* destPeTokenIdxMap{nullptr};
+  index_t* srcPeTokenIdxMap{nullptr};
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
   index_t* dispDestTokIdMap{nullptr};
@@ -258,6 +268,8 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.combineGridBarrier = handle.combineGridBarrier;
   args.dispReceiverIdxMap = handle.dispReceiverIdxMap;
   args.dispSenderIdxMap = handle.dispSenderIdxMap;
+  args.destPeTokenIdxMap = handle.destPeTokenIdxMap;
+  args.srcPeTokenIdxMap = handle.srcPeTokenIdxMap;
   args.dispTokOffsetMemObj = handle.dispTokOffsetMemObj;
   args.dispTokIdToSrcTokIdMemObj = handle.dispTokIdToSrcTokIdMemObj;
   args.dispDestTokIdMap = handle.dispDestTokIdMap;

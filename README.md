@@ -24,7 +24,7 @@ cd mori && pip3 install .
 ### Test dispatch / combine
 ```
 cd /path/to/mori
-export PYTHONPATH=$PYTHONPATH:/path/to/mori
+export PYTHONPATH=/path/to/mori:$PYTHONPATH
 
 # Test correctness
 pytest tests/python/ops/

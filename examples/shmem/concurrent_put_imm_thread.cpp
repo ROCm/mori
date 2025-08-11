@@ -9,28 +9,28 @@ using namespace mori::core;
 using namespace mori::shmem;
 using namespace mori::application;
 
-__global__ void ConcurrentPutThreadKernel(int myPe, const SymmMemObjPtr memObj) {
+__global__ void ConcurrentPutImmThreadKernel(int myPe, const SymmMemObjPtr memObj) {
   constexpr int sendPe = 0;
   constexpr int recvPe = 1;
-
+  uint32_t val = 42;
   int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
   int threadOffset = globalTid * sizeof(uint32_t);
 
   if (myPe == sendPe) {
     RdmaMemoryRegion source = memObj->GetRdmaMemoryRegion(myPe);
 
-    ShmemPutMemNbiThread(memObj, threadOffset, source, threadOffset, sizeof(uint32_t), recvPe);
+    ShmemPutSizeImmNbiThread(memObj, threadOffset, &val, sizeof(uint32_t), recvPe);
     __threadfence_system();
 
     ShmemQuietThread();
     // __syncthreads();
   } else {
-    while (atomicAdd(reinterpret_cast<uint32_t*>(memObj->localPtr) + globalTid, 0) != sendPe) {
+    while (atomicAdd(reinterpret_cast<uint32_t*>(memObj->localPtr) + globalTid, 0) != val) {
     }
   }
 }
 
-void ConcurrentPutThread() {
+void ConcurrentPutImmThread() {
   int status;
   MPI_Init(NULL, NULL);
 
@@ -57,7 +57,7 @@ void ConcurrentPutThread() {
   assert(buffObj.IsValid());
 
   // Run put
-  ConcurrentPutThreadKernel<<<blockNum, threadNum>>>(myPe, buffObj);
+  ConcurrentPutImmThreadKernel<<<blockNum, threadNum>>>(myPe, buffObj);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
 
@@ -67,6 +67,6 @@ void ConcurrentPutThread() {
 }
 
 int main(int argc, char* argv[]) {
-  ConcurrentPutThread();
+  ConcurrentPutImmThread();
   return 0;
 }

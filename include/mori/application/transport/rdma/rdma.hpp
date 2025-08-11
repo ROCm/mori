@@ -43,13 +43,14 @@ RdmaDeviceVendorId ToRdmaDeviceVendorId(T v) {
 }
 
 #define PAGESIZE uint32_t(sysconf(_SC_PAGE_SIZE))
+#define OUTSTANDING_TABLE_SIZE (65536)
 
 /* -------------------------------------------------------------------------- */
 /*                             Rdma Data Structure                            */
 /* -------------------------------------------------------------------------- */
 struct RdmaEndpointConfig {
   uint32_t portId{1};
-  uint32_t gidIdx{1};  // TODO: auto detect?
+  uint32_t gidIdx{3};  // TODO: auto detect?
   uint32_t maxMsgsNum{128};
   uint32_t maxCqeNum{128};
   uint32_t maxMsgSge{1};
@@ -93,7 +94,9 @@ struct RdmaEndpointHandle {
 using RdmaEndpointHandleVec = std::vector<RdmaEndpointHandle>;
 
 struct WorkQueueHandle {
-  uint32_t postIdx{0};
+  uint32_t postIdx{0};     // numbers of wqe that post to work queue
+  uint32_t dbTouchIdx{0};  // numbers of wqe that touched doorbell
+  uint32_t doneIdx{0};     // numbers of wqe that have been consumed by nic
   uint32_t readyIdx{0};
   void* sqAddr{nullptr};
   void* rqAddr{nullptr};
@@ -102,12 +105,16 @@ struct WorkQueueHandle {
   uint32_t sqWqeNum{0};
   uint32_t rqWqeNum{0};
   uint32_t postSendLock{0};
+  uint64_t outstandingWqe[OUTSTANDING_TABLE_SIZE]{0};
 };
 
 struct CompletionQueueHandle {
   void* cqAddr{nullptr};
   void* dbrRecAddr{nullptr};
-  uint32_t consIdx{0};
+  uint32_t consIdx{0};      // numbers of cqe that have been completed
+  uint32_t needConsIdx{0};  // numbers of cqe that should be consumed
+  uint32_t activeIdx{0};    // numbers of cqe that under processing but not completed
+  uint32_t cq_consumer{0};
   uint32_t cqeNum{0};
   uint32_t cqeSize{0};
   uint32_t pollCqLock{0};

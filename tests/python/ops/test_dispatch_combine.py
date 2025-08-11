@@ -64,7 +64,7 @@ class EpDispatchCombineTestCase:
             for r in range(self.config.world_size)
         ]
 
-        # gen weights
+        # gen scales
         all_rank_scales = [
             torch.rand(
                 num_token[r],
@@ -194,6 +194,11 @@ class EpDispatchCombineTestCase:
 
 @pytest.fixture(scope="session")
 def torch_dist_process_manager():
+    try:
+        torch.multiprocessing.set_start_method("spawn", force=True)
+        print("Multiprocessing start method set to spawn")
+    except RuntimeError:
+        pass
     manager = TorchDistProcessManager()
     manager.start_workers(world_size=8)
     yield manager

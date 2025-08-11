@@ -16,6 +16,11 @@ option(BUILD_IO "Whether to build mori io library" ON)
 option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
 option(BUILD_TESTS "Whether to build mori CPP tests" ON)
 
+if(NOT DEFINED WARP_ACCUM_UNROLL)
+    set(WARP_ACCUM_UNROLL 1)
+endif()
+message(STATUS "WARP_ACCUM_UNROLL is set to: ${WARP_ACCUM_UNROLL}")
+add_definitions(-DWARP_ACCUM_UNROLL=${WARP_ACCUM_UNROLL})
 
 if (USE_ROCM)
     list(APPEND CMAKE_PREFIX_PATH "/opt/rocm")

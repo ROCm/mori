@@ -352,25 +352,23 @@ class EpDispatchCombineTestCase {
     for (int i = 0; i < runConfig.repeat; i++) {
       InitializeHandle();
       handle.LaunchReset();
-      SystemBarrier();
 
       handle.LaunchDispatch(runConfig.kernelType);
-      SystemBarrier();
 
+      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
       CheckDispatchResult();
-      SystemBarrier();
       if (handle.config.rank == 0) std::cout << "Test round " << i << " dispatch PASS" << std::endl;
 
       CopyDispatchOutAsCombineInp();
-      SystemBarrier();
 
       handle.LaunchCombine(runConfig.kernelType);
-      SystemBarrier();
 
+      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
       CheckCombineResult();
-      SystemBarrier();
       if (handle.config.rank == 0) std::cout << "Test round " << i << " combine PASS" << std::endl;
     }
+    SystemBarrier();
+    std::cout << "rank " << handle.config.rank << " done" << std::endl;
   }
 
   void RunBenchmark() {
@@ -448,7 +446,7 @@ class EpDispatchCombineTestCase {
                                 hipMemcpyDeviceToDevice));
     HIP_RUNTIME_CHECK(
         hipMemset(outTokBuf, 0, config.MaxNumTokensToRecvPerRank() * config.hiddenDim * sizeof(T)));
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+    // HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   }
 
   void RandomInitializeNumToken() {
@@ -555,6 +553,7 @@ class EpDispatchCombineTestCase {
     uniform_real_distribution<> tokValDist(0.01, 1);
     for (int i = 0; i < inpTokEleNum; i++) {
       reinterpret_cast<T*>(inpTokBufCpu)[i] = tokValDist(gen);
+      // reinterpret_cast<T*>(inpTokBufCpu)[i] = config.rank + 1;
     }
     HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, inpTokBufCpu, inpTokSize, hipMemcpyHostToDevice));
     HIP_RUNTIME_CHECK(hipMemset(inpTokBufCpu, 0, maxTokenSize));

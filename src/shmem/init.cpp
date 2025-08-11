@@ -19,7 +19,6 @@ void RdmaStatesInit() {
 
   int rank = states->bootStates->rank;
   int worldSize = states->bootStates->worldSize;
-  assert(worldSize * worldSize <= MaxRdmaEndpointNum);
 
   rdmaStates->commContext = new application::Context(*states->bootStates->bootNet);
 }

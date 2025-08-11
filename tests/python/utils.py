@@ -53,29 +53,40 @@ class TorchDistProcessManager:
         self.processes = []
         self.init_mori_shmem = init_mori_shmem
 
-    def start_workers(self, world_size):
-        def worker(rank, world_size, port):
-            with TorchDistContext(
-                rank=rank, world_size=world_size, master_port=port
-            ) as ctx:
-                if self.init_mori_shmem:
-                    mori.shmem.shmem_torch_process_group_init("default")
-                while True:
-                    task = self.task_queue.get()
-                    if task == "STOP":
-                        if self.init_mori_shmem:
-                            mori.shmem.shmem_finalize()
-                        break
-                    func, args = task
-                    try:
-                        result = func(rank, *args)
-                        self.result_queue.put((rank, result))
-                    except Exception as e:
-                        self.result_queue.put((rank, traceback.format_exc()))
+    @staticmethod
+    def _worker(rank, world_size, port, init_shmem, task_queue, result_queue):
+        with TorchDistContext(
+            rank=rank, world_size=world_size, master_port=port
+        ) as ctx:
+            if init_shmem:
+                mori.shmem.shmem_torch_process_group_init("default")
+            while True:
+                task = task_queue.get()
+                if task == "STOP":
+                    if init_shmem:
+                        mori.shmem.shmem_finalize()
+                    break
+                func, args = task
+                try:
+                    result = func(rank, *args)
+                    result_queue.put((rank, result))
+                except Exception as e:
+                    result_queue.put((rank, traceback.format_exc()))
 
+    def start_workers(self, world_size):
         port = get_free_port()
         self.processes = [
-            torch.multiprocessing.Process(target=worker, args=(rank, world_size, port))
+            torch.multiprocessing.Process(
+                target=self._worker,
+                args=(
+                    rank,
+                    world_size,
+                    port,
+                    self.init_mori_shmem,
+                    self.task_queue,
+                    self.result_queue,
+                ),
+            )
             for rank in range(world_size)
         ]
         for p in self.processes:

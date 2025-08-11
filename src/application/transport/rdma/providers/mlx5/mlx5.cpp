@@ -301,6 +301,7 @@ void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
   DEVX_SET(qpc, qpc, remote_qpn, remote_handle.qpn);
   DEVX_SET(qpc, qpc, next_rcv_psn, remote_handle.psn);
   DEVX_SET(qpc, qpc, min_rnr_nak, 12);
+  DEVX_SET(qpc, qpc, log_rra_max, 20);
 
   qpc = DEVX_ADDR_OF(init2rtr_qp_in, init2rtr_cmd_in, qpc);
   DEVX_SET(qpc, qpc, primary_address_path.vhca_port_num, config.portId);
@@ -342,7 +343,7 @@ void Mlx5QpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle) {
   DEVX_SET(qpc, qpc, next_send_psn, local_handle.psn);
   DEVX_SET(qpc, qpc, retry_count, 7);
   DEVX_SET(qpc, qpc, rnr_retry, 7);
-  DEVX_SET(qpc, qpc, primary_address_path.ack_timeout, 14);
+  DEVX_SET(qpc, qpc, primary_address_path.ack_timeout, 20);
   DEVX_SET(qpc, qpc, primary_address_path.vhca_port_num, config.portId);
 
   int status = mlx5dv_devx_obj_modify(qp, rtr2rts_cmd_in, sizeof(rtr2rts_cmd_in), rtr2rts_cmd_out,

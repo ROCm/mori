@@ -25,6 +25,17 @@ namespace shmem {
   }
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                                         Synchronization                                        */
+/* ---------------------------------------------------------------------------------------------- */
+inline __device__ void ShmemQuietThread() {
+  ShmemQuietThreadKernel<application::TransportType::RDMA>();
+}
+
+inline __device__ void ShmemQuietThread(int pe) {
+  DISPATCH_TRANSPORT_TYPE(ShmemQuietThreadKernel, pe, pe);
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                         Point-to-Point                                         */
 /* ---------------------------------------------------------------------------------------------- */
 #define DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Scope)                                            \
@@ -146,33 +157,37 @@ DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int32, int32_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int64, int64_t, Warp)
 
-#define SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Scope)                                           \
-  inline __device__ void ShmemAtomicSizeNonFetch##Scope(                                         \
-      const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe, \
-      core::atomicType amoType) {                                                                \
-    DISPATCH_TRANSPORT_TYPE(ShmemAtomicSizeNonFetch##Scope##Kernel, pe, dest, destOffset, val,   \
-                            bytes, pe, amoType);                                                 \
+#define SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Scope)                                            \
+  inline __device__ void ShmemAtomicSizeNonFetch##Scope(                                          \
+      const application::SymmMemObjPtr dest, size_t destOffset,                                   \
+      const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, size_t bytes,  \
+      int pe, core::atomicType amoType) {                                                         \
+    DISPATCH_TRANSPORT_TYPE(ShmemAtomicSizeNonFetch##Scope##Kernel, pe, dest, destOffset, source, \
+                            sourceOffset, val, bytes, pe, amoType);                               \
   }
 
 SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Thread)
 SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Warp)
 
-#define SHMEM_ATOMIC_TYPE_NONFETCH_API_TEMPLATE(Scope)                                        \
-  template <typename T>                                                                        \
-  inline __device__ void ShmemAtomicTypeNonFetch##Scope(const application::SymmMemObjPtr dest, \
-                                                        size_t destOffset, T val, int pe,      \
-                                                        core::atomicType amoType) {            \
-    ShmemAtomicSizeNonFetch##Scope(dest, destOffset, &val, sizeof(T), pe, amoType);            \
+#define SHMEM_ATOMIC_TYPE_NONFETCH_API_TEMPLATE(Scope)                                          \
+  template <typename T>                                                                         \
+  inline __device__ void ShmemAtomicTypeNonFetch##Scope(                                        \
+      const application::SymmMemObjPtr dest, size_t destOffset,                                 \
+      const application::RdmaMemoryRegion& source, size_t sourceOffset, T val, int pe,          \
+      core::atomicType amoType) {                                                               \
+    ShmemAtomicSizeNonFetch##Scope(dest, destOffset, source, sourceOffset, &val, sizeof(T), pe, \
+                                   amoType);                                                    \
   }
 
 SHMEM_ATOMIC_TYPE_NONFETCH_API_TEMPLATE(Thread)
 SHMEM_ATOMIC_TYPE_NONFETCH_API_TEMPLATE(Warp)
 
-#define DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(TypeName, T, Scope)              \
-  inline __device__ void ShmemAtomic##TypeName##NonFetch##Scope(               \
-      const application::SymmMemObjPtr dest, size_t destOffset, T val, int pe, \
-      core::atomicType amoType) {                                              \
-    ShmemAtomicTypeNonFetch##Scope<T>(dest, destOffset, val, pe, amoType);     \
+#define DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(TypeName, T, Scope)                                \
+  inline __device__ void ShmemAtomic##TypeName##NonFetch##Scope(                                 \
+      const application::SymmMemObjPtr dest, size_t destOffset,                                  \
+      const application::RdmaMemoryRegion& source, size_t sourceOffset, T val, int pe,           \
+      core::atomicType amoType) {                                                                \
+    ShmemAtomicTypeNonFetch##Scope<T>(dest, destOffset, source, sourceOffset, val, pe, amoType); \
   }
 
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint32, uint32_t, Thread)
@@ -230,13 +245,6 @@ DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint32, uint32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int32, int32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int64, int64_t, Warp)
-
-/* ---------------------------------------------------------------------------------------------- */
-/*                                         Synchronization                                        */
-/* ---------------------------------------------------------------------------------------------- */
-inline __device__ void ShmemQuietThread() {
-  ShmemQuietThreadKernel<application::TransportType::RDMA>();
-}
 
 template <typename T>
 inline __device__ T ShmemTypeWaitUntilGreaterThan(T* addr, T val) {
