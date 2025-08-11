@@ -513,8 +513,8 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
       if (destPe < config.worldSize) {
         srcPtrs[j] =
-            reinterpret_cast<char*>(args.shmemInpTokMemObj->template GetAs<char*>() + byteOffset);
-        srcWeightsPtr[j] = reinterpret_cast<char*>(args.shmemInpTokMemObj->template GetAs<char*>() +
+            reinterpret_cast<T*>(args.shmemInpTokMemObj->template GetAs<char*>() + byteOffset);
+        srcWeightsPtr[j] = reinterpret_cast<float*>(args.shmemInpTokMemObj->template GetAs<char*>() +
                                                    weightByteOffset);
       } else {
         srcPtrs[j] = nullptr;

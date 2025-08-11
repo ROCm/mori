@@ -81,7 +81,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
   float* weightsPtr = nullptr;
   if (weights.has_value() && weights->size(0) != 0) {
     assert(weights->is_contiguous());
-    weightsPtr = reinterpret_cast<hip_bfloat16*>(weights->data_ptr());
+    weightsPtr = weights->data_ptr<float>();
   }
 
   handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
@@ -99,7 +99,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
   if (weightsPtr) {
     outWeights =
         torch::from_blob(handle.shmemOutWeightsMemObj->Get(),
-                         {handle.config.MaxNumTokensToRecv(), handle.config.numExpertPerToken},
+                         {handle.config.maxNumInpTokenPerRank, handle.config.numExpertPerToken},
                          torch::TensorOptions().dtype(weights->scalar_type()).device(torch::kCUDA));
   }
 

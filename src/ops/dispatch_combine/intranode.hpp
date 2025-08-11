@@ -202,10 +202,13 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
   extern __shared__ char sharedMem[];
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
+  float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) + warpNum * config.numExpertPerToken +
+                          warpId * config.numExpertPerToken;
 
   index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
   index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
 
+  assert(config.numExpertPerToken < warpSize);
   for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
     index_t tokenId = i / warpsPerToken;
     index_t inTokenPartId = i % warpsPerToken;
@@ -214,7 +217,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
         std::max(0, std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp));
 
     // Prepare data pointers on different GPUs
-    float* srcWeightsPtr[warpSize];
+    // float* srcWeightsPtr[warpSize];
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
       index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
       index_t destPe = destTokId / maxNumOutTokenPerRank;
@@ -225,6 +228,21 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
                      destLocalTokId * config.hiddenDim + hiddenDimOffset;
         srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                            destLocalTokId * config.numExpertPerToken;
+
+        if (tokenId < 3 && laneId == 0 && inTokenPartId == warpsPerToken - 1) {  // 只打印前3个token避免输出过多
+            printf("Token %d Expert %d: destTokId=%d, destPe=%d, destLocalTokId=%d\n", 
+                   tokenId, j, destTokId, destPe, destLocalTokId);
+            printf("  srcWeightsPtr[%d] = %p\n", j, srcWeightsPtr[j]);
+            
+            if (srcWeightsPtr[j]) {
+                printf("  rank=%d destPe=%d, destLocalTokId=%d weights data: [", args.config.rank, destPe, destLocalTokId);
+                for (int k = 0; k < config.numExpertPerToken; ++k) {
+                    printf("%.6f", srcWeightsPtr[j][k]);
+                    if (k < config.numExpertPerToken - 1) printf(", ");
+                }
+                printf("]\n");
+            }
+        }
       } else {
         srcPtrs[j] = nullptr;
         srcWeightsPtr[j] = nullptr;
@@ -235,10 +253,23 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
         srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
         
     if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
-      core::WarpAccum<float, 8>(
+      core::WarpAccum<float, 4>(
           args.shmemOutWeightsMemObj->template GetAs<float*>() + tokenId * config.numExpertPerToken,
           srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
     }
+
+    // if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
+    //   float* destWeightPtr =
+    //       args.shmemOutWeightsMemObj->template GetAs<float*>() + tokenId * config.numExpertPerToken;
+    //   for (int i = 0; i < config.numExpertPerToken; ++i) {
+    //     float weight = 0.0f;
+    //     if (laneId < config.numExpertPerToken) {
+    //       if (srcWeightsPtr[laneId]) weight = *(srcWeightsPtr[laneId] + i);
+    //     }
+    //     float weightSum = core::WarpReduceSum(weight);
+    //     if (laneId == 0) destWeightPtr[i] = weightSum;
+    //   }
+    // }
   }
 }
 

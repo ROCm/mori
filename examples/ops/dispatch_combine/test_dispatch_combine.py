@@ -229,10 +229,11 @@ class EpDispatchCombineTestCase:
         )
 
         combine_input = dispatch_output
+        combine_input_weight = dispatch_weights
 
-        combine_output, combine_weight = op.combine(
+        combine_output, combine_output_weight = op.combine(
             combine_input.to(torch.bfloat16),
-            weights,
+            combine_input_weight,
             indices,
             block_num=80,
             warp_per_block=8,
@@ -250,7 +251,7 @@ class EpDispatchCombineTestCase:
             #     input[i].to(torch.float32) * unique_pes
             # ).to(self.config.data_type)
             got, expected = combine_output[i], input[i].to(torch.bfloat16) * unique_pes
-            got_weight, expected_weight = combine_weight[i], weights[i] * unique_pes
+            got_weight, expected_weight = combine_output_weight[i], weights[i] * unique_pes
 
             assert torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
             assert torch.allclose(got_weight, expected_weight, atol=1e-2, rtol=1e-2)
