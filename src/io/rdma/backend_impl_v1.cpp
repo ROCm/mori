@@ -492,7 +492,6 @@ void RdmaBackend::Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remo
   EpPairVec eps = rdma->GetAllEndpoint(ekey, kp);
   assert(!eps.empty());
 
-  //
   EpPair ep = eps[0];
   auto localMr = rdma->GetLocalMemory(ep.ldevId, localDest.id);
   if (!localMr.has_value()) {

@@ -69,9 +69,8 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
   if (config.enableSrq)
     assert(endpoint.ibvHandle.srq && (endpoint.ibvHandle.qp->srq == endpoint.ibvHandle.srq));
 
-  cqPool.insert({endpoint.ibvHandle.cq, std::move(std::unique_ptr<ibv_cq>(endpoint.ibvHandle.cq))});
-  qpPool.insert(
-      {endpoint.ibvHandle.qp->qp_num, std::move(std::unique_ptr<ibv_qp>(endpoint.ibvHandle.qp))});
+  cqPool.insert({endpoint.ibvHandle.cq, endpoint.ibvHandle.cq});
+  qpPool.insert({endpoint.ibvHandle.qp->qp_num, endpoint.ibvHandle.qp});
   return endpoint;
 }
 
