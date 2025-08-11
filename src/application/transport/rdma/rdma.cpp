@@ -131,13 +131,6 @@ double RdmaDevice::ActiveGbps(uint32_t portId) const {
       12  // 5 IBV_WIDTH_12X
   };
 
-  // static const int WidthTable[] = {
-  //     [1] = 1, /* IBV_WIDTH_1X  */
-  //     [2] = 4, /* IBV_WIDTH_4X  */
-  //     [4] = 8, /* IBV_WIDTH_8X  */
-  //     [5] = 12 /* IBV_WIDTH_12X */
-  // };
-
   const ibv_port_attr* attr = GetPortAttr(portId);
   if (!attr) return 0;
 
@@ -148,7 +141,6 @@ double RdmaDevice::ActiveGbps(uint32_t portId) const {
 
   double laneSpeed = SpeedTable[speedIdx];
   double lanes = WidthTable[attr->active_width];
-  printf("port %d lane spd %f lanes %f \n", portId, laneSpeed, lanes);
   return laneSpeed * lanes;
 }
 

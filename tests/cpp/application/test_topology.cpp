@@ -11,7 +11,7 @@ int TestTopoNodeGpu() {
   auto* pciSys = sys.GetTopoSystemPci();
 
   auto gpus = gpuSys->GetGpus();
-  auto nics = netSys->GetNICs();
+  auto nics = netSys->GetNics();
 
   for (auto* gpu : gpus) {
     assert(pciSys->Node(gpu->busId));
@@ -22,15 +22,16 @@ int TestTopoNodeGpu() {
         printf("gpu %s nic %s no direct link\n", gpu->busId.String().c_str(),
                nic->busId.String().c_str());
       } else {
-        printf("gpu %s nic %s hops %d\n", gpu->busId.String().c_str(), nic->busId.String().c_str(),
-               path->Hops());
+        printf("gpu %s nic %s %s hops %d\n", gpu->busId.String().c_str(),
+               nic->busId.String().c_str(), nic->name.c_str(), path->Hops());
       }
     }
   }
 
-  // for (auto* nic : net->GetNICs()) {
-  //   printf("bdf %s rate %f\n", nic->busId.String().c_str(), nic->totalGbps);
-  // }
+  std::vector<std::string> matches = sys.MatchVisibleGpusAndNics();
+  for (int i = 0; i < matches.size(); i++) {
+    printf("gpu %d matches %s\n", i, matches[i].c_str());
+  }
 
   return 0;
 }

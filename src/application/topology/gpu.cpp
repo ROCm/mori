@@ -17,7 +17,6 @@ PciBusId RsmiBusId2PciBusId(uint64_t rsmiBusId) {
   uint8_t bus = (rsmiBusId >> 8);
   uint8_t dev = (rsmiBusId >> 3) & 0x1f;
   uint8_t func = rsmiBusId & 0x7;
-  printf("bus %16x\n", rsmiBusId);
   return PciBusId(domain, bus, dev, func);
 }
 
@@ -62,6 +61,18 @@ std::vector<TopoNodeGpu*> TopoSystemGpu::GetGpus() const {
   std::vector<TopoNodeGpu*> v(gpus.size());
   for (int i = 0; i < gpus.size(); i++) v[i] = gpus[i].get();
   return v;
+}
+
+TopoNodeGpu* TopoSystemGpu::GetGpuByLogicalId(int id) const {
+  std::string str;
+  str.resize(13);
+  HIP_RUNTIME_CHECK(hipDeviceGetPCIBusId(str.data(), str.size(), id));
+  PciBusId target{str};
+  for (auto& gpuPtr : gpus) {
+    TopoNodeGpu* gpu = gpuPtr.get();
+    if (gpu->busId == target) return gpu;
+  }
+  return nullptr;
 }
 
 }  // namespace application

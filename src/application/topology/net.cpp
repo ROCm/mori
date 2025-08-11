@@ -32,16 +32,15 @@ void TopoSystemNet::Load() {
     // TODO: finish nic plane
     TopoNodeNic* nic = new TopoNodeNic();
     auto rPath = std::filesystem::canonical(dev->GetIbvDevice()->ibdev_path);
+    nic->name = dev->Name();
     nic->busId = ParseBusIdFromSysfs(rPath);
     nic->totalGbps = dev->TotalActiveGbps();
 
     nics.emplace_back(nic);
-    printf("nic %s gbps %f path %s bdf %s\n", dev->Name().c_str(), nic->totalGbps, rPath.c_str(),
-           nic->busId.String().c_str());
   }
 }
 
-std::vector<TopoNodeNic*> TopoSystemNet::GetNICs() const {
+std::vector<TopoNodeNic*> TopoSystemNet::GetNics() const {
   std::vector<TopoNodeNic*> v(nics.size());
   for (int i = 0; i < nics.size(); i++) v[i] = nics[i].get();
   return v;

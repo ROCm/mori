@@ -18,6 +18,7 @@ class TopoNodeNic : public TopoNode {
   ~TopoNodeNic() = default;
 
  public:
+  std::string name{};
   PciBusId busId{0};
   double totalGbps{0};
 };
@@ -27,7 +28,7 @@ class TopoSystemNet {
   TopoSystemNet();
   ~TopoSystemNet();
 
-  std::vector<TopoNodeNic*> GetNICs() const;
+  std::vector<TopoNodeNic*> GetNics() const;
 
  private:
   void Load();

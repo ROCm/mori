@@ -37,7 +37,7 @@ bool IsUnderRootComplex(struct pci_dev* dev) {
 
 bool IsBdfString(const std::string& s) {
   static const std::regex bdfRegex(R"(^[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$)");
-  return std::regex_match(s, bdfRegex);
+  return std::regex_match(s.c_str(), bdfRegex);
 }
 std::vector<uint64_t> ParseBdfFromString(const std::string& str) {
   if (!IsBdfString(str)) return {};
@@ -344,7 +344,6 @@ void TopoSystemPci::Validate() {
   }
 
   assert(seen.size() == pcis.size());
-  printf("total nodes %d\n", seen.size());
 }
 
 TopoPathPci* TopoSystemPci::Path(PciBusId head, PciBusId tail) {
