@@ -161,45 +161,37 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
     __syncthreads();
     const int chunkTokenSize = (warpNum - 1);
     if (warpId == warpNum - 1) {
-      const int totalTokenInBlock = endIdx - startIdx;
-      const int totalChunk = totalTokenInBlock / chunkTokenSize;
-      const int remainTokenNum = totalTokenInBlock % chunkTokenSize;
-      for (int chunkIdx = 0; chunkIdx < totalChunk; chunkIdx++) {
+      int  remaining   = endIdx - startIdx;
+      int  chunkIdx    = 0;
+      int  movedTokens = 0;
+
+      while (remaining > 0) {
+        const int thisChunk = remaining >= chunkTokenSize
+                                ? chunkTokenSize
+                                : remaining;
         if (laneId == 0) {
-          while (atomicAdd(&gatherTokenNum[chunkIdx], 0) < chunkTokenSize) {
+          while (atomicAdd(&gatherTokenNum[chunkIdx], 0) < thisChunk) {
+            // __nanosleep(100);
             ;
           }
         }
-        // rdma_send
-        const index_t srcIdx =
-            destPe * MaxNumTokensToRecvPerRank + startIdx + chunkIdx * chunkTokenSize;
-        size_t srcOffset = srcIdx * stagingOffset;
-        const index_t dstIdx =
-            myPe * MaxNumTokensToRecvPerRank + startIdx + chunkIdx * chunkTokenSize;
-        size_t dstOffset = dstIdx * stagingOffset;
-        if (laneId == 0) {
-          shmem::ShmemPutTypeNbiThread<uint8_t>(args.shmemInpTokMemObj, dstOffset,
-                                                args.shmemStagingTokMemObj, srcOffset,
-                                                chunkTokenSize * stagingOffset, destPe);
-        }
-      }
-      // last chunk
-      if (remainTokenNum != 0) {
-        if (laneId == 0) {
-          while (atomicAdd(&gatherTokenNum[totalChunk], 0) < remainTokenNum) {
-            ;
-          }
-        }
-        // rdma_send
-        const index_t srcIdx =
-            destPe * MaxNumTokensToRecvPerRank + startIdx + totalChunk * chunkTokenSize;
-        size_t srcOffset = srcIdx * stagingOffset;
-        const index_t dstIdx =
-            myPe * MaxNumTokensToRecvPerRank + startIdx + totalChunk * chunkTokenSize;
-        size_t dstOffset = dstIdx * stagingOffset;
+
+        const index_t srcIdx = destPe * MaxNumTokensToRecvPerRank
+                            + startIdx + movedTokens;
+        const index_t dstIdx = myPe   * MaxNumTokensToRecvPerRank
+                            + startIdx + movedTokens;
+
+        size_t srcOffset = static_cast<size_t>(srcIdx) * stagingOffset;
+        size_t dstOffset = static_cast<size_t>(dstIdx) * stagingOffset;
+        size_t byteCount = static_cast<size_t>(thisChunk) * stagingOffset;
+
         shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemInpTokMemObj, dstOffset,
                                             args.shmemStagingTokMemObj, srcOffset,
-                                            remainTokenNum * stagingOffset, destPe);
+                                            byteCount, destPe);
+
+        remaining   -= thisChunk;
+        movedTokens += thisChunk;
+        ++chunkIdx;
       }
     } else {
       // int warpTokens = 0;
