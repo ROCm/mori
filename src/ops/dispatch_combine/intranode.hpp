@@ -190,11 +190,15 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
       core::WarpCopy(args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
                      args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
-      core::WarpCopy(
-          args.shmemInpWeightsMemObj->template GetAs<float*>() + i * config.numExpertPerToken,
-          args.weightsBuf + i * config.numExpertPerToken, config.numExpertPerToken);
     }
   }
+
+  for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
+    core::WarpCopy(
+        args.shmemInpWeightsMemObj->template GetAs<float*>() + i * config.numExpertPerToken,
+        args.weightsBuf + i * config.numExpertPerToken, config.numExpertPerToken);
+  }
+
   // Make sure copy on all GPUs are finished
   CrossDeviceBarrierIntraNodeKernel(args);
   *args.totalRecvTokenNum = 0;
@@ -228,21 +232,6 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
                      destLocalTokId * config.hiddenDim + hiddenDimOffset;
         srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                            destLocalTokId * config.numExpertPerToken;
-
-        if (tokenId < 3 && laneId == 0 && inTokenPartId == warpsPerToken - 1) {  // 只打印前3个token避免输出过多
-            printf("Token %d Expert %d: destTokId=%d, destPe=%d, destLocalTokId=%d\n", 
-                   tokenId, j, destTokId, destPe, destLocalTokId);
-            printf("  srcWeightsPtr[%d] = %p\n", j, srcWeightsPtr[j]);
-            
-            if (srcWeightsPtr[j]) {
-                printf("  rank=%d destPe=%d, destLocalTokId=%d weights data: [", args.config.rank, destPe, destLocalTokId);
-                for (int k = 0; k < config.numExpertPerToken; ++k) {
-                    printf("%.6f", srcWeightsPtr[j][k]);
-                    if (k < config.numExpertPerToken - 1) printf(", ");
-                }
-                printf("]\n");
-            }
-        }
       } else {
         srcPtrs[j] = nullptr;
         srcWeightsPtr[j] = nullptr;
