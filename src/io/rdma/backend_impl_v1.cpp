@@ -60,13 +60,13 @@ void RdmaManager::RegisterRemoteMemory(EngineKey ekey, int devId, MemoryUniqueId
                                        application::RdmaMemoryRegion mr) {
   std::lock_guard<std::mutex> lock(mu);
   MemoryKey key{devId, id};
-  RemoteEngineMeta remote = remotes[ekey];
+  RemoteEngineMeta& remote = remotes[ekey];
   remote.mTable[key] = mr;
 }
 
 void RdmaManager::DeregisterRemoteMemory(EngineKey ekey, int devId, MemoryUniqueId id) {
   std::lock_guard<std::mutex> lock(mu);
-  RemoteEngineMeta remote = remotes[ekey];
+  RemoteEngineMeta& remote = remotes[ekey];
   MemoryKey key{devId, id};
   if (remote.mTable.find(key) != remote.mTable.end()) {
     remote.mTable.erase(key);

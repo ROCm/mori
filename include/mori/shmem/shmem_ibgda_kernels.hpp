@@ -60,7 +60,6 @@ inline __device__ void ShmemQuietThreadKernelImpl(int pe) {
         if (done) {
           warp_cq_consumer = __hip_atomic_fetch_add(&cq.cq_consumer, quiet_amount, __ATOMIC_RELAXED,
                                                     __HIP_MEMORY_SCOPE_AGENT);
-          ;
         }
       }
       done = __shfl(done, leader_phys_lane_id);

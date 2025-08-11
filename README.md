@@ -18,7 +18,7 @@ cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
 
 ### Install with Python
 ```
-cd mori && pip3 install .
+cd mori && git submodule update --init --recursive && pip3 install .
 ```
 
 ### Test dispatch / combine
