@@ -146,8 +146,9 @@ inline __device__ uint64_t PostSend<ProviderType::BNXT>(WorkQueueHandle& wq, uin
 }
 
 template <>
-inline __device__ void PostRecv<ProviderType::BNXT>(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                                    uintptr_t laddr, uint64_t lkey, size_t bytes) {
+inline __device__ uint64_t PostRecv<ProviderType::BNXT>(WorkQueueHandle& wq, uint32_t curPostIdx,
+                                                        uint32_t qpn, uintptr_t laddr,
+                                                        uint64_t lkey, size_t bytes) {
   void* queueBuffAddr = wq.rqAddr;
   uint32_t wqeNum = wq.rqWqeNum;
   struct bnxt_re_brqe hdr;
@@ -167,7 +168,7 @@ inline __device__ void PostRecv<ProviderType::BNXT>(WorkQueueHandle& wq, uint32_
       (wqe_size << BNXT_RE_HDR_WS_SHIFT) | (hdr_flags << BNXT_RE_HDR_FLAGS_SHIFT) | wqe_type;
   hdr.wrid = slotIdx / slotsNum;
 
-  sge.pa = (uint64_t) laddr;
+  sge.pa = (uint64_t)laddr;
   sge.lkey = lkey & 0xffffffff;
   sge.length = bytes;
 
@@ -178,11 +179,15 @@ inline __device__ void PostRecv<ProviderType::BNXT>(WorkQueueHandle& wq, uint32_
   memcpy(base + 2 * BNXT_RE_SLOT_SIZE, &sge, sizeof(sge));
 
   // recv wqe needn't to fill msntbl
+  uint8_t flags = (curPostIdx / wqeNum) & 0x1;
+  uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
+  return bnxt_re_init_db_hdr(((slotIdx + slotsNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_RQ);
 }
 
 template <>
-inline __device__ void PostRecv<ProviderType::BNXT>(WorkQueueHandle& wq, uintptr_t laddr,
-                                                    uint64_t lkey, size_t bytes) {
+inline __device__ uint64_t PostRecv<ProviderType::BNXT>(WorkQueueHandle& wq, uint32_t qpn,
+                                                        uintptr_t laddr, uint64_t lkey,
+                                                        size_t bytes) {
   void* queueBuffAddr = wq.rqAddr;
   uint32_t wqeNum = wq.rqWqeNum;
   struct bnxt_re_brqe hdr;
@@ -203,7 +208,7 @@ inline __device__ void PostRecv<ProviderType::BNXT>(WorkQueueHandle& wq, uintptr
       (wqe_size << BNXT_RE_HDR_WS_SHIFT) | (hdr_flags << BNXT_RE_HDR_FLAGS_SHIFT) | wqe_type;
   hdr.wrid = slotIdx / slotsNum;
 
-  sge.pa = (uint64_t) laddr;
+  sge.pa = (uint64_t)laddr;
   sge.lkey = lkey & 0xffffffff;
   sge.length = bytes;
 
@@ -214,6 +219,9 @@ inline __device__ void PostRecv<ProviderType::BNXT>(WorkQueueHandle& wq, uintptr
   memcpy(base + 2 * BNXT_RE_SLOT_SIZE, &sge, sizeof(sge));
 
   // recv wqe needn't to fill msntbl
+  uint8_t flags = (curPostIdx / wqeNum) & 0x1;
+  uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
+  return bnxt_re_init_db_hdr(((slotIdx + slotsNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_RQ);
 }
 
 /* ---------------------------------------------------------------------------------------------- */

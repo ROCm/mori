@@ -57,8 +57,9 @@ inline __device__ uint64_t PostSend<ProviderType::MLX5>(WorkQueueHandle& wq, uin
 }
 
 template <>
-inline __device__ void PostRecv<ProviderType::MLX5>(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                                    uintptr_t laddr, uint64_t lkey, size_t bytes) {
+inline __device__ uint64_t PostRecv<ProviderType::MLX5>(WorkQueueHandle& wq, uint32_t curPostIdx,
+                                                        uint32_t qpn, uintptr_t laddr,
+                                                        uint64_t lkey, size_t bytes) {
   void* queueBuffAddr = wq.rqAddr;
   uint32_t wqeNum = wq.rqWqeNum;
 
@@ -69,11 +70,13 @@ inline __device__ void PostRecv<ProviderType::MLX5>(WorkQueueHandle& wq, uint32_
   wqe_data_seg->byte_count = HTOBE32(bytes);
   wqe_data_seg->lkey = HTOBE32(lkey);
   wqe_data_seg->addr = HTOBE64(laddr);
+  return reinterpret_cast<uint64_t*>(wqe_data_seg)[0];
 }
 
 template <>
-inline __device__ void PostRecv<ProviderType::MLX5>(WorkQueueHandle& wq, uintptr_t laddr,
-                                                    uint64_t lkey, size_t bytes) {
+inline __device__ uint64_t PostRecv<ProviderType::MLX5>(WorkQueueHandle& wq, uint32_t qpn,
+                                                        uintptr_t laddr, uint64_t lkey,
+                                                        size_t bytes) {
   void* queueBuffAddr = wq.rqAddr;
   uint32_t wqeNum = wq.rqWqeNum;
   uint32_t curPostIdx = atomicAdd(&wq.postIdx, 1);
@@ -84,6 +87,7 @@ inline __device__ void PostRecv<ProviderType::MLX5>(WorkQueueHandle& wq, uintptr
   wqe_data_seg->byte_count = HTOBE32(bytes);
   wqe_data_seg->lkey = HTOBE32(lkey);
   wqe_data_seg->addr = HTOBE64(laddr);
+  return reinterpret_cast<uint64_t*>(wqe_data_seg)[0];
 }
 
 /* ---------------------------------------------------------------------------------------------- */
