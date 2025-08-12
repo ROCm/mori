@@ -163,7 +163,7 @@ def _bench_dispatch_combine(
     port,
     max_num_inp_token_per_rank=4096,
     data_type=torch.bfloat16,
-    hidden_dim=7168,
+    hidden_dim=4096,
     scale_dim=0,
     scale_type_size=0,
     num_experts_per_rank=16,
@@ -180,7 +180,7 @@ def _bench_dispatch_combine(
         max_num_inp_token_per_rank=max_num_inp_token_per_rank,
         num_experts_per_rank=num_experts_per_rank,
         num_experts_per_token=num_experts_per_token,
-        warp_num_per_block=4,
+        warp_num_per_block=16,
         block_num=80,
         use_external_inp_buf=False,
     )
@@ -198,18 +198,23 @@ def bench_dispatch_combine(max_num_inp_token_per_rank=4096):
     world_size = 8
     port = get_free_port()
     torch.multiprocessing.spawn(
-        _bench_dispatch_combine, args=(
-            world_size, port, max_num_inp_token_per_rank), nprocs=world_size, join=True
+        _bench_dispatch_combine,
+        args=(world_size, port, max_num_inp_token_per_rank),
+        nprocs=world_size,
+        join=True,
     )
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description='Benchmark EP Dispatch Combine')
-    parser.add_argument('--max-tokens', type=int, default=4096,
-                        help='Maximum number of input tokens per rank (default: 4096)')
+    parser = argparse.ArgumentParser(description="Benchmark EP Dispatch Combine")
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=4096,
+        help="Maximum number of input tokens per rank (default: 4096)",
+    )
 
     args = parser.parse_args()
 

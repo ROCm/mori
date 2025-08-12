@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "mori/application/bootstrap/bootstrap.hpp"
+#include "mori/application/topology/topology.hpp"
 #include "mori/application/transport/transport.hpp"
 
 namespace mori {
@@ -42,6 +43,8 @@ class Context {
   std::unique_ptr<RdmaDeviceContext> rdmaDeviceContext{nullptr};
 
   std::vector<RdmaEndpoint> rdmaEps;
+
+  std::unique_ptr<TopoSystem> topo{nullptr};
 };
 
 }  // namespace application

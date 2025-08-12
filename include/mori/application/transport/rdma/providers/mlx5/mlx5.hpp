@@ -107,7 +107,7 @@ class Mlx5QpContainer {
 class Mlx5DeviceContext : public RdmaDeviceContext {
  public:
   Mlx5DeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd);
-  ~Mlx5DeviceContext();
+  ~Mlx5DeviceContext() override;
 
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) override;
   virtual void ConnectEndpoint(const RdmaEndpointHandle& local,
@@ -116,17 +116,14 @@ class Mlx5DeviceContext : public RdmaDeviceContext {
  private:
   uint32_t pdn;
 
-  // std::unordered_map<uint32_t, std::unique_ptr<Mlx5CqContainer>> cq_pool;
-  // std::unordered_map<uint32_t, std::unique_ptr<Mlx5QpContainer>> qp_pool;
-
-  std::unordered_map<uint32_t, Mlx5CqContainer*> cqPool;
-  std::unordered_map<uint32_t, Mlx5QpContainer*> qpPool;
+  std::unordered_map<uint32_t, std::unique_ptr<Mlx5CqContainer>> cqPool;
+  std::unordered_map<uint32_t, std::unique_ptr<Mlx5QpContainer>> qpPool;
 };
 
 class Mlx5Device : public RdmaDevice {
  public:
   Mlx5Device(ibv_device* device);
-  ~Mlx5Device();
+  ~Mlx5Device() override;
 
   RdmaDeviceContext* CreateRdmaDeviceContext() override;
 };

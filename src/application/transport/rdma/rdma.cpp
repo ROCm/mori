@@ -7,6 +7,7 @@
 #include <unordered_set>
 
 #include "infiniband/verbs.h"
+#include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
 
 namespace mori {
@@ -17,17 +18,21 @@ namespace application {
 /* ---------------------------------------------------------------------------------------------- */
 RdmaDeviceContext::RdmaDeviceContext(RdmaDevice* device, ibv_pd* inPd) : device(device), pd(inPd) {}
 
-RdmaDeviceContext::~RdmaDeviceContext() { ibv_dealloc_pd(pd); }
+RdmaDeviceContext::~RdmaDeviceContext() {
+  ibv_dealloc_pd(pd);
+  if (srq != nullptr) ibv_destroy_srq(srq);
+}
 
 RdmaDevice* RdmaDeviceContext::GetRdmaDevice() { return device; }
 
 ibv_context* RdmaDeviceContext::GetIbvContext() { return GetRdmaDevice()->defaultContext; }
 
-application::MemoryRegion RdmaDeviceContext::RegisterMemoryRegion(void* ptr, size_t size,
-                                                                  int accessFlag) {
+application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegion(void* ptr, size_t size,
+                                                                          int accessFlag) {
   ibv_mr* mr = ibv_reg_mr(pd, ptr, size, accessFlag);
+  assert(mr);
   mrPool.insert({ptr, mr});
-  application::MemoryRegion handle;
+  application::RdmaMemoryRegion handle;
   handle.addr = reinterpret_cast<uintptr_t>(ptr);
   handle.lkey = mr->lkey;
   handle.rkey = mr->rkey;
@@ -35,11 +40,21 @@ application::MemoryRegion RdmaDeviceContext::RegisterMemoryRegion(void* ptr, siz
   return handle;
 }
 
-void RdmaDeviceContext::DeRegisterMemoryRegion(void* ptr) {
+void RdmaDeviceContext::DeregisterRdmaMemoryRegion(void* ptr) {
   if (mrPool.find(ptr) == mrPool.end()) return;
   ibv_mr* mr = mrPool[ptr];
   ibv_dereg_mr(mr);
   mrPool.erase(ptr);
+}
+
+ibv_srq* RdmaDeviceContext::CreateRdmaSrqIfNx(const RdmaEndpointConfig& config) {
+  assert(config.maxMsgSge <= GetRdmaDevice()->GetDeviceAttr()->orig_attr.max_sge);
+  if (srq == nullptr) {
+    ibv_srq_init_attr srqAttr = {
+        .attr = {.max_wr = config.maxMsgsNum, .max_sge = config.maxMsgSge, .srq_limit = 0}};
+    srq = ibv_create_srq(pd, &srqAttr);
+  }
+  return srq;
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -89,6 +104,57 @@ const std::unordered_map<uint32_t, std::unique_ptr<ibv_port_attr>>* RdmaDevice::
   return &portAttrMap;
 }
 
+const ibv_port_attr* RdmaDevice::GetPortAttr(uint32_t portId) const {
+  auto mapPtr = GetPortAttrMap();
+  auto it = mapPtr->find(portId);
+  if (it != mapPtr->end() && it->second) return it->second.get();
+  return nullptr;
+}
+
+double RdmaDevice::ActiveGbps(uint32_t portId) const {
+  static constexpr std::array<double, 10> SpeedTable = {
+      0,         // 0 unused
+      2.5,       // 1 SDR
+      5.0,       // 2 DDR
+      10.0,      // 4 QDR
+      10.3125,   // 8 FDR10
+      14.0625,   // 16 FDR
+      25.78125,  // 32 EDR
+      50.0,      // 64 HDR
+      100.0,     // 128 NDR
+      250.0      // 256 XDR
+  };
+
+  static constexpr std::array<double, 6> WidthTable = {
+      0,  // 0 unused
+      1,  // 1 IBV_WIDTH_1X
+      4,  // 2 IBV_WIDTH_4X
+      0,  // 3 unused
+      8,  // 4 IBV_WIDTH_8X
+      12  // 5 IBV_WIDTH_12X
+  };
+
+  const ibv_port_attr* attr = GetPortAttr(portId);
+  if (!attr) return 0;
+
+  int speedIdx = 1;
+  for (; speedIdx < 9; speedIdx++) {
+    if ((attr->active_speed >> (speedIdx - 1)) & 0x1) break;
+  }
+
+  double laneSpeed = SpeedTable[speedIdx];
+  double lanes = WidthTable[attr->active_width];
+  return laneSpeed * lanes;
+}
+
+double RdmaDevice::TotalActiveGbps() const {
+  uint32_t gbps = 0;
+  for (auto port : GetActivePortIds()) {
+    gbps += ActiveGbps(port);
+  }
+  return gbps;
+}
+
 RdmaDeviceContext* RdmaDevice::CreateRdmaDeviceContext() {
   ibv_pd* pd = ibv_alloc_pd(defaultContext);
   return new RdmaDeviceContext(this, pd);
@@ -108,7 +174,7 @@ ActiveDevicePortList GetActiveDevicePortList(const RdmaDeviceList& devices) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           RdmaContext                                          */
 /* ---------------------------------------------------------------------------------------------- */
-RdmaContext::RdmaContext() {
+RdmaContext::RdmaContext(RdmaBackendType backendType) : backendType(backendType) {
   deviceList = ibv_get_device_list(nullptr);
   Intialize();
 }
@@ -128,15 +194,19 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
   int status = ibv_query_device_ex(context, NULL, &device_attr_ex);
   assert(!status);
 
-  switch (device_attr_ex.orig_attr.vendor_id) {
-    case (RdmaDeviceVendorId::Mellanox):
-      return new Mlx5Device(inDevice);
-      break;
-    default:
-      return nullptr;
+  if (backendType == RdmaBackendType::IBVerbs) {
+    return new IBVerbsDevice(inDevice);
+  } else if (backendType == RdmaBackendType::DirectVerbs) {
+    switch (device_attr_ex.orig_attr.vendor_id) {
+      case (static_cast<uint32_t>(RdmaDeviceVendorId::Mellanox)):
+        return new Mlx5Device(inDevice);
+        break;
+      default:
+        return nullptr;
+    }
+  } else {
+    assert(false && "unsupported backend type");
   }
-
-  ibv_close_device(context);
 }
 
 void RdmaContext::Intialize() {
@@ -189,7 +259,6 @@ void RdmaContext::Intialize() {
       }
     }
   }
-
 }
 
 }  // namespace application

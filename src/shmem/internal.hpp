@@ -26,7 +26,7 @@ struct RdmaStates {
 
 struct MemoryStates {
   application::SymmMemManager* symmMemMgr{nullptr};
-  application::MemoryRegionManager* mrMgr{nullptr};
+  application::RdmaMemoryRegionManager* mrMgr{nullptr};
 };
 
 enum ShmemStatesStatus {

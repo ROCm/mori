@@ -79,9 +79,9 @@ static __device__ __host__ void DumpWqe(void* wqeBaseAddr, uint32_t idx) {
   uintptr_t wqeAddr = reinterpret_cast<uintptr_t>(wqeBaseAddr) + (idx << MLX5_SEND_WQE_SHIFT);
   mlx5_wqe_ctrl_seg* wqeCtrlSeg = reinterpret_cast<mlx5_wqe_ctrl_seg*>(wqeAddr);
   uint32_t opmodIdxOpCode = BE32TOH(wqeCtrlSeg->opmod_idx_opcode);
-  uint32_t opcode = opmodIdxOpCode & 0xFF;           
-  uint32_t wqeIdx = (opmodIdxOpCode >> 8) & 0xFFFF; 
-  uint32_t opmod  = (opmodIdxOpCode >> 24) & 0xFF; 
+  uint32_t opcode = opmodIdxOpCode & 0xFF;
+  uint32_t wqeIdx = (opmodIdxOpCode >> 8) & 0xFFFF;
+  uint32_t opmod = (opmodIdxOpCode >> 24) & 0xFF;
 
   mlx5_wqe_data_seg* wqeDataSeg = reinterpret_cast<mlx5_wqe_data_seg*>(
       wqeAddr + sizeof(mlx5_wqe_ctrl_seg) + sizeof(mlx5_wqe_raddr_seg));

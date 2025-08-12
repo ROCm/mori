@@ -6,8 +6,11 @@ import torch
 import torch.distributed as dist
 import argparse
 
+
 class EpDispatchCombineTestCase:
-    def __init__(self, rank, gpu_per_node, world_size, max_tokens, dtype=torch.bfloat16):
+    def __init__(
+        self, rank, gpu_per_node, world_size, max_tokens, dtype=torch.bfloat16
+    ):
         self.rank = rank
         self.gpu_per_node = gpu_per_node
         self.world_size = world_size
@@ -243,10 +246,9 @@ class EpDispatchCombineTestCase:
             if not ok:
                 print(self.rank, "got: ", got)
                 print(self.rank, "expected: ", expected)
-                print(self.rank, "delta:", got-expected)
+                print(self.rank, "delta:", got - expected)
                 # assert False
                 error_round.add(round)
-
 
         if self.config.rank == 0:
             print("Combine Pass")
@@ -261,7 +263,14 @@ class EpDispatchCombineTestCase:
             if self.rank == 0:
                 print(f"Round {i} gen test_data done")
             self.run_test_once(op, test_data, error_round, i)
-        print("rank: ", self.rank, "error times: ", len(error_round), "appear round: ", error_round)
+        print(
+            "rank: ",
+            self.rank,
+            "error times: ",
+            len(error_round),
+            "appear round: ",
+            error_round,
+        )
 
         del op
 
@@ -351,14 +360,15 @@ class EpDispatchCombineTestCase:
         #     _, _, _, _ = (
         #         self.run_bench_once(op, test_data)
         #     )
-        
+
         error_round = set()
         for i in range(10):
             if self.rank == 0:
                 print(f"WarmUp Round {i} begin")
             self.run_test_once(op, test_data, error_round, i)
-        assert(len(error_round) == 0), f"Warmup failed with errors in rounds: {error_round}"
-
+        assert (
+            len(error_round) == 0
+        ), f"Warmup failed with errors in rounds: {error_round}"
 
         for i in range(50):
             if self.rank == 0:
@@ -416,15 +426,21 @@ class EpDispatchCombineTestCase:
         avg_comb_bw = sum(avg_comb_bw_per_round) / len(avg_comb_bw_per_round)
 
         disp_duration_us_list = disp_duration_us_list[0:]
-        avg_disp_lat_per_round = [sum(round_duration) / len(round_duration) for round_duration in disp_duration_us_list]
+        avg_disp_lat_per_round = [
+            sum(round_duration) / len(round_duration)
+            for round_duration in disp_duration_us_list
+        ]
         avg_disp_lat = sum(avg_disp_lat_per_round) / len(avg_disp_lat_per_round)
 
         comb_duration_us_list = comb_duration_us_list[0:]
-        avg_comb_lat_per_round = [sum(round_duration) / len(round_duration) for round_duration in comb_duration_us_list]
+        avg_comb_lat_per_round = [
+            sum(round_duration) / len(round_duration)
+            for round_duration in comb_duration_us_list
+        ]
         avg_comb_lat = sum(avg_comb_lat_per_round) / len(avg_comb_lat_per_round)
 
-        best_disp_bw  = max(avg_disp_bw_per_round)
-        best_comb_bw  = max(avg_comb_bw_per_round)
+        best_disp_bw = max(avg_disp_bw_per_round)
+        best_comb_bw = max(avg_comb_bw_per_round)
 
         best_disp_lat = min(avg_disp_lat_per_round)
         best_comb_lat = min(avg_comb_lat_per_round)
@@ -439,7 +455,9 @@ class EpDispatchCombineTestCase:
         del op
 
 
-def test_dispatch_combine(local_rank, num_node, gpu_per_node, max_tokens, is_bench=False):
+def test_dispatch_combine(
+    local_rank, num_node, gpu_per_node, max_tokens, is_bench=False
+):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
     global_rank = node_rank * gpu_per_node + local_rank
@@ -460,10 +478,17 @@ def test_dispatch_combine(local_rank, num_node, gpu_per_node, max_tokens, is_ben
 
 
 parser = argparse.ArgumentParser(description="dispatch/combine internode test")
-parser.add_argument("--bench", action="store_true",
-                    help="Set this flag True to run benchmark into test_dispatch_combine")
-parser.add_argument("--max-tokens", type=int, default=4096,
-                    help="Maximum number of input tokens per rank (default: 4096)")
+parser.add_argument(
+    "--bench",
+    action="store_true",
+    help="Set this flag True to run benchmark into test_dispatch_combine",
+)
+parser.add_argument(
+    "--max-tokens",
+    type=int,
+    default=4096,
+    help="Maximum number of input tokens per rank (default: 4096)",
+)
 args_cli = parser.parse_args()
 
 if __name__ == "__main__":

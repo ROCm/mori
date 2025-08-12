@@ -114,7 +114,7 @@ __device__ void Quite(RdmaEndpoint* endpoint) {
   }
 }
 
-__global__ void Write(RdmaEndpoint* endpoint, MemoryRegion localMr, MemoryRegion remoteMr,
+__global__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemoryRegion remoteMr,
                       size_t msg_size, int iters) {
   for (int i = 0; i < iters; i++) {
     uint64_t activemask = GetActiveLaneMask();
@@ -204,7 +204,7 @@ void distRdmaOps(int argc, char* argv[]) {
 
   // RDMA initialization
   // 1 Create device
-  RdmaContext rdma_context;
+  RdmaContext rdma_context(RdmaBackendType::DirectVerbs);
   RdmaDeviceList rdma_devices = rdma_context.GetRdmaDeviceList();
   ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(rdma_devices);
   RdmaDevice* device = activeDevicePortList[local_rank % activeDevicePortList.size()].first;
@@ -244,8 +244,9 @@ void distRdmaOps(int argc, char* argv[]) {
 
   // assert(!posix_memalign(&buffer_1, 4096, allreduce_size));
   // memset(buffer_1, 1, allreduce_size);
-  MemoryRegion mr_handle = device_context->RegisterMemoryRegion(buffer, totalSize, MR_ACCESS_FLAG);
-  std::vector<MemoryRegion> global_mr_handles(world_size);
+  RdmaMemoryRegion mr_handle =
+      device_context->RegisterRdmaMemoryRegion(buffer, totalSize, MR_ACCESS_FLAG);
+  std::vector<RdmaMemoryRegion> global_mr_handles(world_size);
   bootNet.Allgather(&mr_handle, global_mr_handles.data(), sizeof(mr_handle));
   global_mr_handles[local_rank] = mr_handle;
   RdmaEndpoint* devEndpoint;

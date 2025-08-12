@@ -2,7 +2,7 @@
 
 #include "hip/hip_runtime.h"
 #include "mori/application/transport/rdma/rdma.hpp"
-#include "mori/application/utils/hip_check.hpp"
+#include "mori/application/utils/check.hpp"
 #include "mori/core/core.hpp"
 
 namespace mori {
@@ -13,7 +13,7 @@ SymmMemManager::SymmMemManager(BootstrapNetwork& bootNet, Context& context)
 
 SymmMemManager::~SymmMemManager() {
   while (!memObjPool.empty()) {
-    DeRegisterSymmMemObj(memObjPool.begin()->first);
+    DeregisterSymmMemObj(memObjPool.begin()->first);
   }
 }
 
@@ -27,7 +27,7 @@ SymmMemObjPtr SymmMemManager::HostMalloc(size_t size, size_t alignment) {
 
 void SymmMemManager::HostFree(void* localPtr) {
   free(localPtr);
-  DeRegisterSymmMemObj(localPtr);
+  DeregisterSymmMemObj(localPtr);
 }
 
 SymmMemObjPtr SymmMemManager::Malloc(size_t size) {
@@ -46,7 +46,7 @@ SymmMemObjPtr SymmMemManager::ExtMallocWihFlags(size_t size, unsigned int flags)
 
 void SymmMemManager::Free(void* localPtr) {
   HIP_RUNTIME_CHECK(hipFree(localPtr));
-  DeRegisterSymmMemObj(localPtr);
+  DeregisterSymmMemObj(localPtr);
 }
 
 SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
@@ -62,7 +62,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
   bootNet.Allgather(&localPtr, cpuMemObj->peerPtrs, sizeof(uintptr_t));
   // cpuMemObj->peerPtrs[rank] = reinterpret_cast<uintptr_t>(cpuMemObj->localPtr);
 
-  // PEP context: exchange ipc mem handles
+  // P2P context: exchange ipc mem handles
   hipIpcMemHandle_t handle;
   HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&handle, localPtr));
   cpuMemObj->ipcMemHandles =
@@ -82,7 +82,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
   cpuMemObj->peerRkeys[rank] = 0;
   RdmaDeviceContext* rdmaDeviceContext = context.GetRdmaDeviceContext();
   if (rdmaDeviceContext) {
-    application::MemoryRegion mr = rdmaDeviceContext->RegisterMemoryRegion(localPtr, size);
+    application::RdmaMemoryRegion mr = rdmaDeviceContext->RegisterRdmaMemoryRegion(localPtr, size);
     cpuMemObj->lkey = mr.lkey;
     cpuMemObj->peerRkeys[rank] = mr.rkey;
   }
@@ -105,11 +105,11 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
   return memObjPool.at(localPtr);
 }
 
-void SymmMemManager::DeRegisterSymmMemObj(void* localPtr) {
+void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
   if (memObjPool.find(localPtr) == memObjPool.end()) return;
 
   RdmaDeviceContext* rdmaDeviceContext = context.GetRdmaDeviceContext();
-  if (rdmaDeviceContext) rdmaDeviceContext->DeRegisterMemoryRegion(localPtr);
+  if (rdmaDeviceContext) rdmaDeviceContext->DeregisterRdmaMemoryRegion(localPtr);
 
   SymmMemObjPtr memObjPtr = memObjPool.at(localPtr);
   free(memObjPtr.cpu->peerPtrs);

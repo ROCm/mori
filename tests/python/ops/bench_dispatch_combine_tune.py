@@ -128,14 +128,10 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             dist.all_gather(comb_bw_list, torch.tensor([comb_bw]))
             dist.all_gather(total_bytes_list, torch.tensor([total_bytes / (1024**2)]))
 
-            disp_duration_us_list.append(
-                [round(t.item(), 3) for t in disp_dur_list])
-            disp_bandwidth_GB_list.append(
-                [round(t.item(), 3) for t in disp_bw_list])
-            comb_duration_us_list.append(
-                [round(t.item(), 3) for t in comb_dur_list])
-            comb_bandwidth_GB_list.append(
-                [round(t.item(), 3) for t in comb_bw_list])
+            disp_duration_us_list.append([round(t.item(), 3) for t in disp_dur_list])
+            disp_bandwidth_GB_list.append([round(t.item(), 3) for t in disp_bw_list])
+            comb_duration_us_list.append([round(t.item(), 3) for t in comb_dur_list])
+            comb_bandwidth_GB_list.append([round(t.item(), 3) for t in comb_bw_list])
             avg_total_bytes_MB_list.append(
                 int(torch.tensor(total_bytes_list).mean().item())
             )
@@ -144,11 +140,9 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         if self.config.rank == 0:
             print("Dispatch result:")
             for i, duration_us in enumerate(disp_duration_us_list):
-                algo_bw = sum(
-                    disp_bandwidth_GB_list[i]) / self.config.world_size
+                algo_bw = sum(disp_bandwidth_GB_list[i]) / self.config.world_size
                 bus_bw = int(
-                    algo_bw * (self.config.world_size - 1) /
-                    self.config.world_size
+                    algo_bw * (self.config.world_size - 1) / self.config.world_size
                 )
                 print(
                     f"Round {i} duration(us) {duration_us} "
@@ -159,11 +153,9 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             print()
             print("Combine result:")
             for i, duration_us in enumerate(comb_duration_us_list):
-                algo_bw = sum(
-                    comb_bandwidth_GB_list[i]) / self.config.world_size
+                algo_bw = sum(comb_bandwidth_GB_list[i]) / self.config.world_size
                 bus_bw = int(
-                    algo_bw * (self.config.world_size - 1) /
-                    self.config.world_size
+                    algo_bw * (self.config.world_size - 1) / self.config.world_size
                 )
                 print(
                     f"Round {i} duration(us) {duration_us} "
@@ -171,7 +163,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                     f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw:.2f}({theoretical_peak_bw})"
                 )
 
-            ratio = (1000**3)/(1024**3)
+            ratio = (1000**3) / (1024**3)
             print(
                 f"token:{self.config.max_num_inp_token_per_rank} Rank 0 "
                 f"Dispatch Avg: {sum(disp_bw_values)/len(disp_bw_values):.2f} GB/s ({(sum(disp_bw_values)/len(disp_bw_values))*ratio:.2f} GiB/s) "
@@ -225,18 +217,23 @@ def bench_dispatch_combine(max_num_inp_token_per_rank=4096):
     world_size = 8
     port = get_free_port()
     torch.multiprocessing.spawn(
-        _bench_dispatch_combine, args=(
-            world_size, port, max_num_inp_token_per_rank), nprocs=world_size, join=True
+        _bench_dispatch_combine,
+        args=(world_size, port, max_num_inp_token_per_rank),
+        nprocs=world_size,
+        join=True,
     )
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description='Benchmark EP Dispatch Combine')
-    parser.add_argument('--max-tokens', type=int, default=4096,
-                        help='Maximum number of input tokens per rank (default: 4096)')
+    parser = argparse.ArgumentParser(description="Benchmark EP Dispatch Combine")
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=4096,
+        help="Maximum number of input tokens per rank (default: 4096)",
+    )
 
     args = parser.parse_args()
 

@@ -8,9 +8,14 @@ namespace core {
 
 enum ProviderType {
   Unknown = 0,
+  // Mellanox direct verbs
   MLX5 = 1,
+  // Broadcom direct verbs
   BNXTRE = 2,
+  // Ib verbs
+  IBVERBS = 3,
 };
+
 typedef enum {
   AMO_ACK = 1,
   AMO_INC,

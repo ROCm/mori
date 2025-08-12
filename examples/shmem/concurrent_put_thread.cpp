@@ -2,7 +2,7 @@
 
 #include <cassert>
 
-#include "mori/application/utils/hip_check.hpp"
+#include "mori/application/utils/check.hpp"
 #include "mori/shmem/shmem.hpp"
 
 using namespace mori::core;
@@ -17,7 +17,7 @@ __global__ void ConcurrentPutThreadKernel(int myPe, const SymmMemObjPtr memObj) 
   int threadOffset = globalTid * sizeof(uint32_t);
 
   if (myPe == sendPe) {
-    MemoryRegion source = memObj->GetMemoryRegion(myPe);
+    RdmaMemoryRegion source = memObj->GetRdmaMemoryRegion(myPe);
 
     ShmemPutMemNbiThread(memObj, threadOffset, source, threadOffset, sizeof(uint32_t), recvPe);
     __threadfence_system();
