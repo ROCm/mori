@@ -65,7 +65,7 @@ void TestMoriIOEngine() {
   HIP_RUNTIME_CHECK(hipMalloc(&targetBuf, bufSize));
   HIP_RUNTIME_CHECK(hipMemset(targetBuf, 1, bufSize));
 
-  MemoryDesc initatorMem =
+  MemoryDesc initiatorMem =
       initiator.RegisterMemory(initiatorBuf, bufSize, 0, MemoryLocationType::GPU);
   MemoryDesc targetMem = target.RegisterMemory(targetBuf, bufSize, 0, MemoryLocationType::GPU);
 
@@ -74,7 +74,7 @@ void TestMoriIOEngine() {
   for (int i = 0; i < transferCnt; i++) {
     TransferStatus initiatorStatus, targetStatus;
     TransferUniqueId id = initiator.AllocateTransferUniqueId();
-    initiator.Read(initatorMem, 0, targetMem, 0, bufSize, &initiatorStatus, id);
+    initiator.Read(initiatorMem, 0, targetMem, 0, bufSize, &initiatorStatus, id);
     printf("read %d id %d\n", i, id);
     while (initiatorStatus.Code() == StatusCode::INIT) {
     }
@@ -93,7 +93,7 @@ void TestMoriIOEngine() {
   for (int i = 0; i < transferCnt; i++) {
     TransferUniqueId id = initiator.AllocateTransferUniqueId();
     trsfIds[i] = id;
-    initiator.Read(initatorMem, 0, targetMem, 0, bufSize, &initiatorStatusVec[i], id);
+    initiator.Read(initiatorMem, 0, targetMem, 0, bufSize, &initiatorStatusVec[i], id);
   }
 
   for (int i = 0; i < transferCnt; i++) {
@@ -108,7 +108,7 @@ void TestMoriIOEngine() {
            reinterpret_cast<uint8_t*>(initiatorBuf)[511]);
   }
 
-  initiator.DeregisterMemory(initatorMem);
+  initiator.DeregisterMemory(initiatorMem);
   target.DeregisterMemory(targetMem);
 }
 
