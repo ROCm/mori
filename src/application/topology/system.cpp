@@ -30,19 +30,24 @@ void TopoSystem::Load() {
 std::string TopoSystem::MatchGpuAndNic(int id) const {
   auto nics = net->GetNics();
   TopoNodeGpu* d = gpu->GetGpuByLogicalId(id);
-  int minHops = std::numeric_limits<int>::max();
-  std::string best;
 
+  using CandType = std::pair<TopoPathPci*, TopoNodeNic*>;
+  std::vector<CandType> candidates;
   for (auto* nic : nics) {
     TopoPathPci* path = pci->Path(d->busId, nic->busId);
     if (!path) continue;
-    if (path->Hops() < minHops) {
-      minHops = path->Hops();
-      best = nic->name;
-    }
+    candidates.push_back({path, nic});
   }
 
-  return best;
+  std::sort(candidates.begin(), candidates.end(), [](CandType a, CandType b) {
+    if (a.second->totalGbps == b.second->totalGbps) {
+      return a.first->Hops() <= b.first->Hops();
+    }
+    return a.second->totalGbps > b.second->totalGbps;
+  });
+
+  if (candidates.empty()) return "";
+  return candidates[0].second->name;
 }
 
 std::vector<std::string> TopoSystem::MatchAllGpusAndNics() const {
