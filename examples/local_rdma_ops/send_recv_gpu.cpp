@@ -71,12 +71,17 @@ __device__ void RecvThreadKernel(RdmaEndpoint& epRecv, RdmaMemoryRegion mr, int 
     uint8_t sendVal = i;
 
     __threadfence_system();
-    PostRecv<P>(epRecv.wqHandle, mr.addr, mr.lkey, msgSize);
+    uint64_t dbr_val =  PostRecv<P>(epRecv.wqHandle, epRecv.handle.qpn, mr.addr, mr.lkey, msgSize);
     printf("PostRecv is done\n");
     __threadfence_system();
     UpdateRecvDbrRecord<P>(epRecv.wqHandle.dbrRecAddr, epRecv.wqHandle.postIdx);
     printf("UpdateRecvDbrRecord is done\n");
     __threadfence_system();
+    if constexpr (P == ProviderType::BNXT) {
+      RingDoorbell<P>(epRecv.wqHandle.dbrAddr, dbr_val);
+      printf("recv RingDoorbell is done\n");
+    }
+
 
     int rcv_opcode =
         PollCq<P>(epRecv.cqHandle.cqAddr, epRecv.cqHandle.cqeNum, &epRecv.cqHandle.consIdx);

@@ -88,11 +88,12 @@ inline __device__ uint64_t PostSend(WorkQueueHandle& wq, uint32_t qpn, uintptr_t
                                     uint64_t lkey, size_t bytes);
 
 template <ProviderType PrvdType>
-inline __device__ void PostRecv(WorkQueueHandle& wq, uint32_t curPostIdx, uintptr_t laddr,
-                                uint64_t lkey, size_t bytes);
+inline __device__ uint64_t PostRecv(WorkQueueHandle& wq, uint32_t curPostIdx, uint32_t qpn,
+                                    uintptr_t laddr, uint64_t lkey, size_t bytes);
 
 template <ProviderType PrvdType>
-inline __device__ void PostRecv(WorkQueueHandle& wq, uintptr_t laddr, uint64_t lkey, size_t bytes);
+inline __device__ uint64_t PostRecv(WorkQueueHandle& wq, uint32_t qpn, uintptr_t laddr,
+                                    uint64_t lkey, size_t bytes);
 
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostWrite(WorkQueueHandle& wq, uint32_t curPostIdx,
