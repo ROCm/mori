@@ -247,8 +247,13 @@ void Mlx5QpContainer::DestroyQueuePair() {
   if (qpDbrUmemAddr) HIP_RUNTIME_CHECK(hipFree(qpDbrUmemAddr));
   if (qpDbrUmem) mlx5dv_devx_umem_dereg(qpDbrUmem);
   if (qpUar) {
+    hipPointerAttribute_t attr;
+    HIP_RUNTIME_CHECK(hipPointerGetAttributes(&attr, qpUar->reg_addr));
+    // Multiple qp may share the same uar address, only unregister once
+    if ((attr.type == hipMemoryTypeHost) && (attr.hostPointer != nullptr)) {
+      HIP_RUNTIME_CHECK(hipHostUnregister(qpUar->reg_addr));
+    }
     mlx5dv_devx_free_uar(qpUar);
-    HIP_RUNTIME_CHECK(hipHostUnregister(qpUar->reg_addr));
   }
   if (qp) mlx5dv_devx_obj_destroy(qp);
 }
