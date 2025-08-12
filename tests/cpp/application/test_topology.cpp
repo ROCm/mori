@@ -28,7 +28,7 @@ int TestTopoNodeGpu() {
     }
   }
 
-  std::vector<std::string> matches = sys.MatchVisibleGpusAndNics();
+  std::vector<std::string> matches = sys.MatchAllGpusAndNics();
   for (int i = 0; i < matches.size(); i++) {
     printf("gpu %d matches %s\n", i, matches[i].c_str());
   }

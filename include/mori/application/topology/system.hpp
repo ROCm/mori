@@ -23,7 +23,8 @@ class TopoSystem {
   TopoSystemPci* GetTopoSystemPci() { return pci.get(); }
   TopoSystemNet* GetTopoSystemNet() { return net.get(); }
 
-  std::vector<std::string> MatchVisibleGpusAndNics() const;
+  std::string MatchGpuAndNic(int id) const;
+  std::vector<std::string> MatchAllGpusAndNics() const;
 
  private:
   void Load();

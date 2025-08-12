@@ -72,7 +72,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             dispatch_indicies,
             call_reset=False,
             block_num=80,
-            warp_per_block=16,
+            warp_per_block=8,
         )
         end_event.record()
         self.sync()

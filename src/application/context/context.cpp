@@ -42,10 +42,7 @@ void Context::IntializePossibleTransports() {
   for (int i = 0; i <= LocalRank(); i++) {
     if (HostName() == hostnames[i]) rankInNode++;
   }
-  int gpuCount;
-  HIP_RUNTIME_CHECK(hipGetDeviceCount(&gpuCount));
-  assert(rankInNode < gpuCount);
-  HIP_RUNTIME_CHECK(hipSetDevice(rankInNode));
+  assert(rankInNode < 8);
 
   // Init rdma context
   rdmaContext.reset(new RdmaContext(RdmaBackendType::DirectVerbs));
@@ -65,15 +62,29 @@ void Context::IntializePossibleTransports() {
     }
   }
 
+  // Match gpu and nic
+  int deviceId = -1;
+  HIP_RUNTIME_CHECK(hipGetDevice(&deviceId));
+  topo.reset(new TopoSystem());
+  std::string nicName = topo->MatchGpuAndNic(deviceId);
+
   int portId;
   RdmaDevice* device = nullptr;
-  if (!activeDevicePortList.empty()) {
-    int devicePortId = (rankInNode % activeDevicePortList.size());
-    RdmaDevice* device = activeDevicePortList[devicePortId].first;
-    std::cout << "rank " << LocalRank() << " rankInNode " << rankInNode << " select device "
-              << "[" << devicePortId << "] " << device->Name() << std::endl;
-    portId = activeDevicePortList[devicePortId].second;
+  for (int i = 0; i < activeDevicePortList.size(); i++) {
+    auto& dp = activeDevicePortList[i];
+    if (dp.first->Name() != nicName) continue;
+    device = dp.first;
+    portId = activeDevicePortList[i].second;
     rdmaDeviceContext.reset(device->CreateRdmaDeviceContext());
+
+    std::cout << "rank " << LocalRank() << " rankInNode " << rankInNode << " select device "
+              << "[" << i << "] " << device->Name() << std::endl;
+    break;
+  }
+
+  if (device == nullptr) {
+    std::cout << "rank " << LocalRank() << " rankInNode " << rankInNode << " select no device"
+              << std::endl;
   }
 
   // Intialize transport

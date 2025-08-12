@@ -601,6 +601,10 @@ void EpDispatchWithPutMemAPI(EpDispatchCombineTestConfig testConfig) {
 
   // Initialize shmem
   MPI_Init(NULL, NULL);
+  int localRank = -1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &localRank);
+  HIP_RUNTIME_CHECK(hipSetDevice(localRank % 8));
+
   status = ShmemMpiInit(MPI_COMM_WORLD);
   assert(!status);
 
