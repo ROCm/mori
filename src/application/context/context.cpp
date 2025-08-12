@@ -95,12 +95,9 @@ void Context::IntializePossibleTransports() {
       if (HostName() == hostnames[i]) {
         peerRankInNode++;
 
-        int canAccessPeer;
-        HIP_RUNTIME_CHECK(hipDeviceCanAccessPeer(&canAccessPeer, rankInNode, peerRankInNode));
-
-        if (canAccessPeer) {
-          HIP_RUNTIME_CHECK(hipDeviceEnablePeerAccess(peerRankInNode, 0));
-        }
+        // TODO: should use TopoSystemGpu to determine if peer access is enabled, but that requires
+        // exchanging gpu bdf id, hence for simplicity we assume peer access is enabled
+        bool canAccessPeer = true;
 
         if ((i == LocalRank()) || canAccessPeer) {
           transportTypes.push_back(TransportType::P2P);
