@@ -288,7 +288,20 @@ void RegisterMoriIo(pybind11::module_& m) {
                                return reinterpret_cast<uintptr_t>(desc.data);
                              })
       .def_readonly("size", &mori::io::MemoryDesc::size)
-      .def_readonly("loc", &mori::io::MemoryDesc::loc);
+      .def_readonly("loc", &mori::io::MemoryDesc::loc)
+      .def(pybind11::self == pybind11::self)
+      .def("pack",
+           [](const mori::io::MemoryDesc& d) {
+             msgpack::sbuffer buf;
+             msgpack::pack(buf, d);
+             return py::bytes(buf.data(), buf.size());
+           })
+      .def_static("unpack", [](const py::bytes& b) {
+        Py_ssize_t len = PyBytes_Size(b.ptr());
+        const char* data = PyBytes_AsString(b.ptr());
+        auto out = msgpack::unpack(data, len);
+        return out.get().as<mori::io::MemoryDesc>();
+      });
 
   py::class_<mori::io::IOEngine>(m, "IOEngine")
       .def(py::init<const mori::io::EngineKey&, const mori::io::IOEngineConfig&>())

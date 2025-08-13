@@ -47,7 +47,7 @@ application::RdmaMemoryRegion RdmaManager::RegisterLocalMemory(int devId, Memory
   std::lock_guard<std::mutex> lock(mu);
   MemoryKey key{devId, desc.id};
   application::RdmaDeviceContext* devCtx = GetOrCreateDeviceContext(devId);
-  mTable[key] = devCtx->RegisterRdmaMemoryRegion(desc.data, desc.size);
+  mTable[key] = devCtx->RegisterRdmaMemoryRegion(reinterpret_cast<void*>(desc.data), desc.size);
   return mTable[key];
 }
 
@@ -55,7 +55,7 @@ void RdmaManager::DeregisterLocalMemory(int devId, MemoryDesc& desc) {
   std::lock_guard<std::mutex> lock(mu);
   MemoryKey key{devId, desc.id};
   if (mTable.find(key) != mTable.end()) {
-    deviceCtxs[devId]->DeregisterRdmaMemoryRegion(desc.data);
+    deviceCtxs[devId]->DeregisterRdmaMemoryRegion(reinterpret_cast<void*>(desc.data));
     mTable.erase(key);
   }
 }
@@ -208,7 +208,7 @@ void NotifManager::MainLoop() {
   int maxEvents = 128;
   epoll_event events[maxEvents];
   while (running.load()) {
-    int nfds = epoll_wait(epfd, events, maxEvents, 5 /*ms*/);
+    int nfds = epoll_wait(epfd, events, maxEvents, 1 /*ms*/);
     for (int i = 0; i < nfds; ++i) {
       uint32_t qpn = events[i].data.u32;
 
@@ -233,7 +233,7 @@ void NotifManager::MainLoop() {
 
           uint64_t idx = wc.wr_id;
           TransferUniqueId tid = reinterpret_cast<TransferUniqueId*>(ctx.mr.addr)[idx];
-          printf("recv notif for transfer %d\n", tid);
+          // printf("recv notif for transfer %d\n", tid);
 
           EngineKey ekey = ep->remoteEngineKey;
           notifPool[ekey].insert(tid);
@@ -252,9 +252,9 @@ void NotifManager::MainLoop() {
           SYSCALL_RETURN_ZERO(ibv_post_srq_recv(ctx.srq, &wr, &bad));
         } else if (wc.opcode == IBV_WC_SEND) {
           uint64_t id = wc.wr_id;
-          printf("send notif for transfer %d\n", id);
+          // printf("send notif for transfer %d\n", id);
         } else {
-          printf("data mov for transfer %lu %d\n", wc.wr_id, wc.opcode);
+          // printf("data mov for transfer %lu %d\n", wc.wr_id, wc.opcode);
           TransferStatus* status = reinterpret_cast<TransferStatus*>(wc.wr_id);
           if (wc.status == IBV_WC_SUCCESS) {
             status->SetCode(StatusCode::SUCCESS);
@@ -262,6 +262,7 @@ void NotifManager::MainLoop() {
             status->SetCode(StatusCode::ERROR);
           }
           status->SetMessage(ibv_wc_status_str(wc.status));
+          // printf("set transfer status\n");
         }
       }
     }

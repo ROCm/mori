@@ -58,6 +58,9 @@ def test_mem_desc():
     assert mem_desc.loc == MemoryLocationType.GPU
 
     # TODO: test mem_desc pack / unpack
+    packed_desc = mem_desc.pack()
+    unpacked_desc = MemoryDesc.unpack(packed_desc)
+    assert mem_desc == unpacked_desc
 
 
 def test_io_api():

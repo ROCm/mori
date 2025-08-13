@@ -16,11 +16,19 @@ def get_free_port():
 
 
 class TorchDistContext:
-    def __init__(self, rank, world_size, master_addr="localhost", master_port="12335"):
+    def __init__(
+        self,
+        rank,
+        world_size,
+        master_addr="localhost",
+        master_port="12335",
+        device_id=None,
+    ):
         self.rank = rank
         self.world_size = world_size
         self.master_addr = master_addr
         self.master_port = master_port
+        self.device_id = device_id if device_id is not None else self.rank
 
     def __enter__(self):
         if self.master_addr is not None:
@@ -28,8 +36,8 @@ class TorchDistContext:
         if self.master_port is not None:
             os.environ["MASTER_PORT"] = str(self.master_port)
 
-        torch.cuda.set_device(self.rank)
-        device = torch.device("cuda", self.rank)
+        torch.cuda.set_device(self.device_id)
+        device = torch.device("cuda", self.device_id)
 
         dist.init_process_group(
             backend="cpu:gloo,cuda:nccl",

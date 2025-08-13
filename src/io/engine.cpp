@@ -44,7 +44,7 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryL
   memDesc.engineKey = desc.key;
   memDesc.id = nextMemUid.fetch_add(1, std::memory_order_relaxed);
   memDesc.deviceId = device;
-  memDesc.data = data;
+  memDesc.data = reinterpret_cast<uintptr_t>(data);
   memDesc.size = size;
   memDesc.loc = loc;
 
