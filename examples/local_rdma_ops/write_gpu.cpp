@@ -30,10 +30,11 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, MemoryRegion sendMr, Rdma
     RingDoorbell<P>(epSend.wqHandle.dbrAddr, dbr_val);
     printf("RingDoorbell is done\n");
     __threadfence_system();
-
-    int snd_opcode =
-        PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum, &epSend.cqHandle.consIdx);
-    printf("send PollCq is done\n");
+    uint16_t wqeIdx;
+    int snd_opcode = PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum,
+                               &epSend.cqHandle.consIdx, &wqeIdx);
+    epSend.cqHandle.consIdx += 1;
+    printf("send PollCq is done, wqeIdx: %hu\n", wqeIdx);
     UpdateCqDbrRecord<P>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx,
                          epSend.cqHandle.cqeNum);
     printf("send UpdateCqDbrRecord is done\n");
@@ -93,7 +94,7 @@ __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, Memory
 
 void LocalRdmaOps() {
   int msgSize = 1024;
-  int msgNum = 1024;
+  int msgNum = 128;
 
   // RDMA initialization
   // 1 Create device

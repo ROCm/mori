@@ -653,13 +653,11 @@ inline __device__ int PollCqOnce<ProviderType::BNXT>(void* cqeAddr, uint32_t cqe
                                                      uint32_t consIdx, uint32_t* wqeIdx) {
   uint32_t cqeIdx = consIdx % cqeNum;
 
-  volatile char* cqe = static_cast<volatile char*>(cqeAddr);
-  volatile char* src = cqe + 2 * BNXT_RE_SLOT_SIZE * cqeIdx + sizeof(struct bnxt_re_rc_cqe);
-  struct bnxt_re_bcqe bcqe;
-  bcqe.flg_st_typ_ph = *reinterpret_cast<volatile uint32_t*>(src);
-  bcqe.qphi_rwrid = *reinterpret_cast<volatile uint32_t*>(src + 4);
+  volatile char* cqe = static_cast<volatile char*>(cqeAddr) + 2 * BNXT_RE_SLOT_SIZE * cqeIdx;
+  volatile char* flgSrc = cqe + sizeof(struct bnxt_re_req_cqe);
   uint32_t phase = BNXT_RE_QUEUE_START_PHASE ^ ((consIdx / cqeNum) & 0x1);
-  uint32_t flg_val = bcqe.flg_st_typ_ph;
+  uint32_t flg_val = *reinterpret_cast<volatile uint32_t*>(flgSrc);
+  uint32_t con_indx = *reinterpret_cast<volatile uint32_t*>(cqe + offsetof(bnxt_re_req_cqe, con_indx));
   // printf("GPU  flg_val = 0x%08X (%u), phase = 0x%08X (%u)\n", flg_val & BNXT_RE_BCQE_PH_MASK,
   //        flg_val & BNXT_RE_BCQE_PH_MASK, phase, phase);
   if (((flg_val) & BNXT_RE_BCQE_PH_MASK) == (phase)) {
@@ -670,7 +668,7 @@ inline __device__ int PollCqOnce<ProviderType::BNXT>(void* cqeAddr, uint32_t cqe
       return status;
     }
     if (wqeIdx) {
-      *wqeIdx = bcqe.qphi_rwrid & BNXT_RE_BCQE_RWRID_MASK;
+      *wqeIdx = con_indx & 0xFFFF;
     }
     return 0;
   }
