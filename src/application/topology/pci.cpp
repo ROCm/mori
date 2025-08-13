@@ -70,6 +70,7 @@ std::string BdfToString(uint64_t domain, uint64_t bus, uint64_t dev, uint64_t fu
 TopoNodePci* TopoNodePci::CreateVirtualRoot() {
   TopoNodePci* n = new TopoNodePci();
   n->type = TopoNodePciType::VirtualRoot;
+  n->busId = PciBusId(std::numeric_limits<uint64_t>::max());
   return n;
 }
 
@@ -290,13 +291,14 @@ void TopoSystemPci::Load() {
   for (auto& dom : domains) {
     TopoNodePci* n = TopoNodePci::CreateRootComplex(PciBusId(dom, 0, 0, 0), -1, root);
     pcis.emplace(n->BusId().packed, n);
+    root->AddDownstreamPort(n);
   }
 
   // Connect upstream port and downstream port
   for (auto& it : pcis) {
     PciBusId busId = it.first;
     TopoNodePci* node = it.second.get();
-    if (busId.packed == 0) continue;
+    if ((node->Type() == TopoNodePciType::RootComplex) || node->Type()==TopoNodePciType::VirtualRoot) continue;
 
     uint64_t parentDsp = PciBusId(busId.Domain(), busId.Bus(), 0, 0).packed;
     uint64_t parentBus = 0;
