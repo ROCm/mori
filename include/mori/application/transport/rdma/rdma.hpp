@@ -129,13 +129,18 @@ struct WorkQueueHandle {
   uint32_t dbTouchIdx{0};  // numbers of wqe that touched doorbell
   uint32_t doneIdx{0};     // numbers of wqe that have been consumed by nic
   uint32_t readyIdx{0};
-  uint32_t msntblSlotIdx{0};
+  union {
+    struct {
+      uint32_t msntblSlotIdx;
+      uint32_t psnIdx; // for bnxt msn psn index calculate
+    };
+    uint64_t msnPack{0};
+  };
   void* sqAddr{nullptr};
   void* msntblAddr{nullptr}; // for bnxt
   void* rqAddr{nullptr};
   void* dbrRecAddr{nullptr};
   void* dbrAddr{nullptr};
-  uint32_t psnIdx{0}; // for bnxt msn psn index calculate
   uint32_t mtuSize{4096};
   uint32_t sqWqeNum{0};
   uint32_t msntblNum{0};
