@@ -70,6 +70,7 @@ std::string BdfToString(uint64_t domain, uint64_t bus, uint64_t dev, uint64_t fu
 TopoNodePci* TopoNodePci::CreateVirtualRoot() {
   TopoNodePci* n = new TopoNodePci();
   n->type = TopoNodePciType::VirtualRoot;
+  n->busId = PciBusId(std::numeric_limits<uint64_t>::max());
   return n;
 }
 
@@ -237,16 +238,13 @@ TopoNodePci* CreateTopoNodePciFrom(pci_dev* dev) {
   uint16_t baseCls = (cls >> 8);
   PciBusId bus = PciBusId(dev->domain, dev->bus, dev->dev, dev->func);
   NumaNodeId numa = dev->numa_node;
-  if ((cls == PCI_CLASS_BRIDGE_HOST) || (cls == PCI_CLASS_BRIDGE_PCI)) {
+  if (cls == PCI_CLASS_BRIDGE_PCI) {
     return TopoNodePci::CreateBridge(bus, numa);
   } else if (baseCls == PCI_BASE_CLASS_NETWORK) {
     return TopoNodePci::CreateNet(bus, numa);
   } else if (cls == 0x1200) {
     return TopoNodePci::CreateGpu(bus, numa);
   }
-  //  else {
-  //   return TopoNodePci::CreateOthers(bus, numa);
-  // }
 
   return nullptr;
 }
@@ -291,13 +289,14 @@ void TopoSystemPci::Load() {
     TopoNodePci* n = TopoNodePci::CreateRootComplex(PciBusId(dom, 0, 0, 0), -1, root);
     printf("domain bus %s\n", n->BusId().String().c_str());
     pcis.emplace(n->BusId().packed, n);
+    root->AddDownstreamPort(n);
   }
 
   // Connect upstream port and downstream port
   for (auto& it : pcis) {
     PciBusId busId = it.first;
     TopoNodePci* node = it.second.get();
-    if (busId.packed == 0) continue;
+    if ((node->Type() == TopoNodePciType::RootComplex) || node->Type()==TopoNodePciType::VirtualRoot) continue;
 
     uint64_t parentDsp = PciBusId(busId.Domain(), busId.Bus(), 0, 0).packed;
     uint64_t parentBus = 0;
