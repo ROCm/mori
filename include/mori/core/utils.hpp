@@ -49,16 +49,20 @@ inline __device__ unsigned int GetActiveLaneNum(uint64_t activeLaneMask) {
   
 inline __device__ unsigned int GetActiveLaneNum() {  
     return GetActiveLaneNum(GetActiveLaneMask());  
-}  
-  
-inline __device__ int GetFirstActiveLaneID(uint64_t activeLaneMask) {  
-    return __ffsll((unsigned long long int)activeLaneMask) - 1;  
-}  
-  
-inline __device__ int GetFirstActiveLaneID() {  
-    return GetFirstActiveLaneID(GetActiveLaneMask());  
-}  
-  
+}
+
+inline __device__ int GetFirstActiveLaneID(uint64_t activeLaneMask) {
+  return activeLaneMask ? __ffsll((unsigned long long int)activeLaneMask) - 1 : -1;
+}
+
+inline __device__ int GetFirstActiveLaneID() { return GetFirstActiveLaneID(GetActiveLaneMask()); }
+
+inline __device__ int GetLastActiveLaneID(uint64_t activeLaneMask) {
+  return activeLaneMask ? 63 - __clzll(activeLaneMask) : -1;
+}
+
+inline __device__ int GetLastActiveLaneID() { return GetLastActiveLaneID(GetActiveLaneMask()); }
+
 inline __device__ bool IsFirstActiveLane(uint64_t activeLaneMask) {  
     return GetActiveLaneNum(activeLaneMask) == 0;  
 }  
