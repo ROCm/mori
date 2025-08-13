@@ -238,16 +238,13 @@ TopoNodePci* CreateTopoNodePciFrom(pci_dev* dev) {
   uint16_t baseCls = (cls >> 8);
   PciBusId bus = PciBusId(dev->domain, dev->bus, dev->dev, dev->func);
   NumaNodeId numa = dev->numa_node;
-  if ((cls == PCI_CLASS_BRIDGE_HOST) || (cls == PCI_CLASS_BRIDGE_PCI)) {
+  if (cls == PCI_CLASS_BRIDGE_PCI) {
     return TopoNodePci::CreateBridge(bus, numa);
   } else if (baseCls == PCI_BASE_CLASS_NETWORK) {
     return TopoNodePci::CreateNet(bus, numa);
   } else if (cls == 0x1200) {
     return TopoNodePci::CreateGpu(bus, numa);
   }
-  //  else {
-  //   return TopoNodePci::CreateOthers(bus, numa);
-  // }
 
   return nullptr;
 }
