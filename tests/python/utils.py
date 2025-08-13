@@ -23,8 +23,10 @@ class TorchDistContext:
         self.master_port = master_port
 
     def __enter__(self):
-        os.environ["MASTER_ADDR"] = self.master_addr
-        os.environ["MASTER_PORT"] = str(self.master_port)
+        if self.master_addr is not None:
+            os.environ["MASTER_ADDR"] = self.master_addr
+        if self.master_port is not None:
+            os.environ["MASTER_PORT"] = str(self.master_port)
 
         torch.cuda.set_device(self.rank)
         device = torch.device("cuda", self.rank)

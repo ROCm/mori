@@ -8,6 +8,7 @@
 #include <thread>
 #include <vector>
 
+#include "mori/application/topology/topology.hpp"
 #include "mori/application/transport/tcp/tcp.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/io/backend.hpp"
@@ -138,7 +139,6 @@ class RdmaManager {
                        application::RdmaEndpointHandle remote, TopoKeyPair key, int weight);
   std::optional<EpPair> GetEpPairByQpn(uint32_t qpn);
 
-  //
   application::RdmaDeviceContext* GetRdmaDeviceContext(int devId);
 
  private:
@@ -154,6 +154,8 @@ class RdmaManager {
   MemoryTable mTable;
   std::unordered_map<EngineKey, RemoteEngineMeta> remotes;
   std::unordered_map<uint32_t, EpPair> epsMap;
+
+  std::unique_ptr<application::TopoSystem> topo{nullptr};
 };
 
 /* ---------------------------------------------------------------------------------------------- */

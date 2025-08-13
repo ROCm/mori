@@ -289,6 +289,7 @@ void TopoSystemPci::Load() {
   // Create root port
   for (auto& dom : domains) {
     TopoNodePci* n = TopoNodePci::CreateRootComplex(PciBusId(dom, 0, 0, 0), -1, root);
+    printf("domain bus %s\n", n->BusId().String().c_str());
     pcis.emplace(n->BusId().packed, n);
   }
 
@@ -301,9 +302,15 @@ void TopoSystemPci::Load() {
     uint64_t parentDsp = PciBusId(busId.Domain(), busId.Bus(), 0, 0).packed;
     uint64_t parentBus = 0;
     if (dsp2dev.find(parentDsp) == dsp2dev.end()) {
+      if (busId.Bus() == 0) {
+        printf("bus %s \n", busId.String().c_str());
+      }
       assert(IsUnderRootComplex(bus2dev[busId.packed]));
       parentBus = PciBusId(busId.Domain(), 0, 0, 0).packed;
     } else {
+      if (busId.packed == 0) {
+        printf("root port\n");
+      }
       pci_dev* dev = dsp2dev[parentDsp];
       parentBus = PciBusId(dev->domain, dev->bus, dev->dev, dev->func).packed;
     }

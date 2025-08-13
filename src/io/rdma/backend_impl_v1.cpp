@@ -16,9 +16,22 @@ RdmaManager::RdmaManager(application::RdmaContext* ctx) : ctx(ctx) {
   assert(availDevices.size() > 0);
 
   deviceCtxs.resize(availDevices.size(), nullptr);
+  topo.reset(new application::TopoSystem());
 }
 
-std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) { return {{0, 999}}; }
+std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
+  if (key.loc == MemoryLocationType::GPU) {
+    std::string nicName = topo->MatchGpuAndNic(key.deviceId);
+    assert(!nicName.empty());
+    for (int i = 0; i < availDevices.size(); i++) {
+      if (availDevices[i].first->Name() == nicName) {
+        return {{i, 1}};
+      }
+    }
+  } else {
+    assert("topo searching for device other than GPU is not implemented yet");
+  }
+}
 
 /* ----------------------------------- Local Memory Management ---------------------------------- */
 std::optional<application::RdmaMemoryRegion> RdmaManager::GetLocalMemory(int devId,
