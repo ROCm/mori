@@ -46,10 +46,10 @@ int ShmemBufferRegister(void* ptr, size_t size) {
   return 0;
 }
 
-int ShmemBufferDeRegister(void* ptr, size_t size) {
+int ShmemBufferDeregister(void* ptr, size_t size) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
   states->CheckStatusValid();
-  states->memoryStates->mrMgr->DeRegisterBuffer(ptr);
+  states->memoryStates->mrMgr->DeregisterBuffer(ptr);
   return 0;
 }
 

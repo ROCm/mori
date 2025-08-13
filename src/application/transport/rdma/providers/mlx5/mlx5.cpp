@@ -6,7 +6,7 @@
 
 #include <iostream>
 
-#include "mori/application/utils/hip_check.hpp"
+#include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
 #include "src/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
 #include "src/application/transport/rdma/providers/mlx5/mlx5_prm.hpp"
@@ -249,8 +249,13 @@ void Mlx5QpContainer::DestroyQueuePair() {
   if (qpDbrUmemAddr) HIP_RUNTIME_CHECK(hipFree(qpDbrUmemAddr));
   if (qpDbrUmem) mlx5dv_devx_umem_dereg(qpDbrUmem);
   if (qpUar) {
+    hipPointerAttribute_t attr;
+    HIP_RUNTIME_CHECK(hipPointerGetAttributes(&attr, qpUar->reg_addr));
+    // Multiple qp may share the same uar address, only unregister once
+    if ((attr.type == hipMemoryTypeHost) && (attr.hostPointer != nullptr)) {
+      HIP_RUNTIME_CHECK(hipHostUnregister(qpUar->reg_addr));
+    }
     mlx5dv_devx_free_uar(qpUar);
-    HIP_RUNTIME_CHECK(hipHostUnregister(qpUar->reg_addr));
   }
   if (qp) mlx5dv_devx_obj_destroy(qp);
 }
@@ -360,9 +365,6 @@ Mlx5DeviceContext::Mlx5DeviceContext(RdmaDevice* rdma_device, ibv_pd* in_pd)
     : RdmaDeviceContext(rdma_device, in_pd) {
   mlx5dv_obj dv_obj{};
   mlx5dv_pd dvpd{};
-  // TODO: should we zero init?
-  // memset(dvpd, 0, sizeof(mlx5dv_pd));
-  // memset(dv_obj, 0, sizeof(mlx5dv_obj));
   dv_obj.pd.in = pd;
   dv_obj.pd.out = &dvpd;
   int status = mlx5dv_init_obj(&dv_obj, MLX5DV_OBJ_PD);
@@ -373,6 +375,7 @@ Mlx5DeviceContext::Mlx5DeviceContext(RdmaDevice* rdma_device, ibv_pd* in_pd)
 Mlx5DeviceContext::~Mlx5DeviceContext() {}
 
 RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& config) {
+  assert(!config.withCompChannel && !config.enableSrq && "not implemented");
   ibv_context* context = GetIbvContext();
 
   Mlx5CqContainer* cq = new Mlx5CqContainer(context, config);
@@ -431,11 +434,8 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   endpoint.cqHandle.cqeSize = GetMlx5CqeSize();
   endpoint.cqHandle.dbrRecAddr = cq->cqDbrUmemAddr;
 
-  // cq_pool.insert({cq->cqn, std::move(std::unique_ptr<Mlx5CqContainer>(cq))});
-  // qpPool.insert({qp->qpn, std::move(std::unique_ptr<Mlx5QpContainer>(qp))});
-
-  cqPool.insert({cq->cqn, cq});
-  qpPool.insert({qp->qpn, qp});
+  cqPool.insert({cq->cqn, std::move(std::unique_ptr<Mlx5CqContainer>(cq))});
+  qpPool.insert({qp->qpn, std::move(std::unique_ptr<Mlx5QpContainer>(qp))});
 
   return endpoint;
 }
@@ -444,7 +444,7 @@ void Mlx5DeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
                                         const RdmaEndpointHandle& remote) {
   uint32_t local_qpn = local.qpn;
   assert(qpPool.find(local_qpn) != qpPool.end());
-  Mlx5QpContainer* qp = qpPool.at(local_qpn);
+  Mlx5QpContainer* qp = qpPool.at(local_qpn).get();
   RdmaDevice* rdmaDevice = GetRdmaDevice();
   const ibv_device_attr_ex* deviceAttr = rdmaDevice->GetDeviceAttr();
   const ibv_port_attr& portAttr = *(rdmaDevice->GetPortAttrMap()->find(local.portId)->second);

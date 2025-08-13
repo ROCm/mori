@@ -157,8 +157,7 @@ inline __host__ int PollCqOnce<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum
 }
 
 template <>
-inline __host__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum,
-                                               uint32_t& consIdx) {
+inline __host__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum, uint32_t& consIdx) {
   int opcode = -1;
   do {
     opcode = PollCqOnce<ProviderType::MLX5>(cqAddr, cqeNum, consIdx);

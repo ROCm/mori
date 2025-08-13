@@ -14,7 +14,7 @@ using namespace mori::core;
 
 #define MAX_INLINE_DATA_SIZE 12
 
-__device__ void SendThreadKernel(RdmaEndpoint& epSend, MemoryRegion mr) {
+__device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion mr) {
   uint32_t postIdx = 0;
   uint8_t vals[MAX_INLINE_DATA_SIZE];
   uintptr_t raddr = mr.addr;
@@ -25,9 +25,9 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, MemoryRegion mr) {
       vals[j] = sendVal;
     }
 
-    uint64_t dbr_val =
-        PostWriteInline<ProviderType::MLX5>(epSend.wqHandle.sqAddr, epSend.wqHandle.sqWqeNum,
-                                            &postIdx, postIdx, epSend.handle.qpn, vals, raddr, mr.rkey, i);
+    uint64_t dbr_val = PostWriteInline<ProviderType::MLX5>(
+        epSend.wqHandle.sqAddr, epSend.wqHandle.sqWqeNum, &postIdx, postIdx, epSend.handle.qpn,
+        vals, raddr, mr.rkey, i);
     UpdateSendDbrRecord<ProviderType::MLX5>(epSend.wqHandle.dbrRecAddr, postIdx);
     __threadfence_system();
     RingDoorbell<ProviderType::MLX5>(epSend.wqHandle.dbrAddr, dbr_val);
@@ -42,7 +42,7 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, MemoryRegion mr) {
   }
 }
 
-__device__ void RecvThreadKernel(RdmaEndpoint& epRecv, MemoryRegion mr) {
+__device__ void RecvThreadKernel(RdmaEndpoint& epRecv, RdmaMemoryRegion mr) {
   uint32_t postIdx = 0;
   uint8_t* addr = reinterpret_cast<uint8_t*>(mr.addr);
 
@@ -58,7 +58,7 @@ __device__ void RecvThreadKernel(RdmaEndpoint& epRecv, MemoryRegion mr) {
   }
 }
 
-__global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, MemoryRegion mrRecv) {
+__global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMemoryRegion mrRecv) {
   assert(gridDim.x == 2);
   int tid = blockIdx.x;
   printf("tid %d start \n", tid);
@@ -77,7 +77,7 @@ void LocalRdmaOps() {
 
   // RDMA initialization
   // 1 Create device
-  RdmaContext rdmaContext;
+  RdmaContext rdmaContext(RdmaBackendType::DirectVerbs);
   RdmaDeviceList rdmaDevices = rdmaContext.GetRdmaDeviceList();
   ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(rdmaDevices);
   assert(!activeDevicePortList.empty());
@@ -115,13 +115,14 @@ void LocalRdmaOps() {
   HIP_RUNTIME_CHECK(hipMalloc(&recvBuf, msgSize));
   HIP_RUNTIME_CHECK(hipMemset(recvBuf, 99, msgSize));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-  MemoryRegion mrRecv = deviceContextRecv->RegisterMemoryRegion(recvBuf, msgSize, MR_ACCESS_FLAG);
+  RdmaMemoryRegion mrRecv =
+      deviceContextRecv->RegisterRdmaMemoryRegion(recvBuf, msgSize, MR_ACCESS_FLAG);
 
   SendRecvOnGpu<<<2, 1>>>(*devEpSend, *devEpRecv, mrRecv);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
   // 8 Finalize
-  deviceContextRecv->DeRegisterMemoryRegion(recvBuf);
+  deviceContextRecv->DeregisterRdmaMemoryRegion(recvBuf);
   HIP_RUNTIME_CHECK(hipFree(devEpSend));
   HIP_RUNTIME_CHECK(hipFree(devEpRecv));
   HIP_RUNTIME_CHECK(hipFree(recvBuf));

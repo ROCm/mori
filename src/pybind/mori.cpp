@@ -3,6 +3,7 @@
 #include <ATen/hip/HIPContext.h>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
+#include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <torch/python.h>
 
@@ -10,6 +11,7 @@
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
 #include "mori/application/application.hpp"
+#include "mori/io/io.hpp"
 #include "mori/ops/ops.hpp"
 #include "mori/shmem/shmem.hpp"
 #include "src/pybind/torch_utils.hpp"
@@ -196,6 +198,11 @@ int64_t ShmemNPes() { return mori::shmem::ShmemNPes(); }
 
 }  // namespace
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                             IO APIs                                            */
+/* ---------------------------------------------------------------------------------------------- */
+namespace {}
+
 namespace mori {
 
 void RegisterMoriOps(py::module_& m) {
@@ -212,18 +219,19 @@ void RegisterMoriOps(py::module_& m) {
            py::arg("num_experts_per_rank") = 0, py::arg("num_experts_per_token") = 0,
            py::arg("warp_num_per_block") = 0, py::arg("block_num") = 0,
            py::arg("use_external_inp_buf") = true)
-      .def_readonly("rank", &mori::moe::EpDispatchCombineConfig::rank)
-      .def_readonly("world_size", &mori::moe::EpDispatchCombineConfig::worldSize)
-      .def_readonly("hidden_dim", &mori::moe::EpDispatchCombineConfig::hiddenDim)
-      .def_readonly("scale_dim", &mori::moe::EpDispatchCombineConfig::scaleDim)
-      .def_readonly("scale_type_size", &mori::moe::EpDispatchCombineConfig::scaleTypeSize)
-      .def_readonly("max_token_type_size", &mori::moe::EpDispatchCombineConfig::maxTokenTypeSize)
-      .def_readonly("max_num_inp_token_per_rank",
-                    &mori::moe::EpDispatchCombineConfig::maxNumInpTokenPerRank)
-      .def_readonly("num_experts_per_rank", &mori::moe::EpDispatchCombineConfig::numExpertPerRank)
-      .def_readonly("num_experts_per_token", &mori::moe::EpDispatchCombineConfig::numExpertPerToken)
-      .def_readonly("warp_num_per_block", &mori::moe::EpDispatchCombineConfig::warpNumPerBlock)
-      .def_readonly("block_num", &mori::moe::EpDispatchCombineConfig::blockNum);
+      .def_readwrite("rank", &mori::moe::EpDispatchCombineConfig::rank)
+      .def_readwrite("world_size", &mori::moe::EpDispatchCombineConfig::worldSize)
+      .def_readwrite("hidden_dim", &mori::moe::EpDispatchCombineConfig::hiddenDim)
+      .def_readwrite("scale_dim", &mori::moe::EpDispatchCombineConfig::scaleDim)
+      .def_readwrite("scale_type_size", &mori::moe::EpDispatchCombineConfig::scaleTypeSize)
+      .def_readwrite("max_token_type_size", &mori::moe::EpDispatchCombineConfig::maxTokenTypeSize)
+      .def_readwrite("max_num_inp_token_per_rank",
+                     &mori::moe::EpDispatchCombineConfig::maxNumInpTokenPerRank)
+      .def_readwrite("num_experts_per_rank", &mori::moe::EpDispatchCombineConfig::numExpertPerRank)
+      .def_readwrite("num_experts_per_token",
+                     &mori::moe::EpDispatchCombineConfig::numExpertPerToken)
+      .def_readwrite("warp_num_per_block", &mori::moe::EpDispatchCombineConfig::warpNumPerBlock)
+      .def_readwrite("block_num", &mori::moe::EpDispatchCombineConfig::blockNum);
 
   DeclareEpDispatchCombineHandle(m);
 }
@@ -234,4 +242,83 @@ void RegisterMoriShmem(py::module_& m) {
   m.def("shmem_mype", &ShmemMyPe);
   m.def("shmem_npes", &ShmemNPes);
 }
+
+void RegisterMoriIo(pybind11::module_& m) {
+  py::enum_<mori::io::BackendType>(m, "BackendType")
+      .value("Unknown", mori::io::BackendType::Unknown)
+      .value("XGMI", mori::io::BackendType::XGMI)
+      .value("RDMA", mori::io::BackendType::RDMA)
+      .value("TCP", mori::io::BackendType::TCP)
+      .export_values();
+
+  py::enum_<mori::io::MemoryLocationType>(m, "MemoryLocationType")
+      .value("Unknown", mori::io::MemoryLocationType::Unknown)
+      .value("CPU", mori::io::MemoryLocationType::CPU)
+      .value("GPU", mori::io::MemoryLocationType::GPU)
+      .export_values();
+
+  py::enum_<mori::io::StatusCode>(m, "StatusCode")
+      .value("SUCCESS", mori::io::StatusCode::SUCCESS)
+      .value("INIT", mori::io::StatusCode::INIT)
+      .value("ERROR", mori::io::StatusCode::ERROR)
+      .value("NOT_FOUND", mori::io::StatusCode::NOT_FOUND)
+      .export_values();
+
+  py::class_<mori::io::IOEngineConfig>(m, "IOEngineConfig")
+      .def(py::init<std::string, uint16_t>(), py::arg("host") = "", py::arg("port") = 0)
+      .def_readwrite("host", &mori::io::IOEngineConfig::host)
+      .def_readwrite("port", &mori::io::IOEngineConfig::port);
+
+  py::class_<mori::io::TransferStatus>(m, "TransferStatus")
+      .def(py::init<>())
+      .def("Code", &mori::io::TransferStatus::Code)
+      .def("Message", &mori::io::TransferStatus::Message)
+      .def("SetCode", &mori::io::TransferStatus::SetCode)
+      .def("SetMessage", &mori::io::TransferStatus::SetMessage);
+
+  py::class_<mori::io::EngineDesc>(m, "EngineDesc")
+      .def_readonly("key", &mori::io::EngineDesc::key)
+      .def_readonly("hostname", &mori::io::EngineDesc::hostname)
+      .def_readonly("host", &mori::io::EngineDesc::host)
+      .def_readonly("port", &mori::io::EngineDesc::port)
+      .def(pybind11::self == pybind11::self)
+      .def("pack",
+           [](const mori::io::EngineDesc& d) {
+             msgpack::sbuffer buf;
+             msgpack::pack(buf, d);
+             return py::bytes(buf.data(), buf.size());
+           })
+      .def_static("unpack", [](const py::bytes& b) {
+        Py_ssize_t len = PyBytes_Size(b.ptr());
+        const char* data = PyBytes_AsString(b.ptr());
+        auto out = msgpack::unpack(data, len);
+        return out.get().as<mori::io::EngineDesc>();
+      });
+
+  py::class_<mori::io::MemoryDesc>(m, "MemoryDesc")
+      .def(py::init<>())
+      .def_readonly("engine_key", &mori::io::MemoryDesc::engineKey)
+      .def_readonly("id", &mori::io::MemoryDesc::id)
+      .def_readonly("device_id", &mori::io::MemoryDesc::deviceId)
+      .def_property_readonly("data",
+                             [](const mori::io::MemoryDesc& desc) -> uintptr_t {
+                               return reinterpret_cast<uintptr_t>(desc.data);
+                             })
+      .def_readonly("size", &mori::io::MemoryDesc::size)
+      .def_readonly("loc", &mori::io::MemoryDesc::loc);
+
+  py::class_<mori::io::IOEngine>(m, "IOEngine")
+      .def(py::init<const mori::io::EngineKey&, const mori::io::IOEngineConfig&>())
+      .def("GetEngineDesc", &mori::io ::IOEngine::GetEngineDesc)
+      .def("CreateBackend", &mori::io ::IOEngine::CreateBackend)
+      .def("RemoveBackend", &mori::io ::IOEngine::RemoveBackend)
+      .def("RegisterRemoteEngine", &mori::io ::IOEngine::RegisterRemoteEngine)
+      .def("DeregisterRemoteEngine", &mori::io ::IOEngine::DeregisterRemoteEngine)
+      .def("RegisterMemory", &mori::io ::IOEngine::RegisterMemory)
+      .def("DeregisterMemory", &mori::io ::IOEngine::DeregisterMemory)
+      .def("AllocateTransferUniqueId", &mori::io ::IOEngine::AllocateTransferUniqueId)
+      .def("Read", &mori::io ::IOEngine::Read)
+      .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus);
+}
+
 }  // namespace mori

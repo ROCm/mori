@@ -2,7 +2,7 @@
 
 #include <cassert>
 
-#include "mori/application/utils/hip_check.hpp"
+#include "mori/application/utils/check.hpp"
 #include "mori/shmem/shmem.hpp"
 
 using namespace mori::core;
@@ -15,7 +15,7 @@ __global__ void RingAllGatherWithPutMemAPIKernel(int myPe, int npes, const SymmM
   int nextPeer = (myPe + 1) % npes;
   int peChunkSize = memObj->size / npes;
 
-  MemoryRegion source;
+  RdmaMemoryRegion source;
   source.addr = reinterpret_cast<uintptr_t>(memObj->localPtr);
   source.lkey = memObj->lkey;
 

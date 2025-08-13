@@ -440,9 +440,10 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
 }
 
 template <typename T, int VecBytes, int AccumNum>
-__forceinline__ __device__ void WarpAccumPipelineImpl(T* __restrict__ dest, T* const* __restrict__ srcs,
-                                              const float* __restrict__ srcScales, size_t& offset,
-                                              size_t nelems) {
+__forceinline__ __device__ void WarpAccumPipelineImpl(T* __restrict__ dest,
+                                                      T* const* __restrict__ srcs,
+                                                      const float* __restrict__ srcScales,
+                                                      size_t& offset, size_t nelems) {
   constexpr int vecSize = VecBytes / sizeof(T);
   using DataType = typename VecTypeSelector<VecBytes>::dataType;
 
@@ -471,12 +472,12 @@ __forceinline__ __device__ void WarpAccumPipelineImpl(T* __restrict__ dest, T* c
     if (srcs[1] != nullptr) tmp1 = load<VecBytes>(srcs[1] + offset + laneOffset);
     bool tail = true;
 
-// #pragma unroll AccumNum
+    // #pragma unroll AccumNum
     for (int i = 2; i < AccumNum; i += 2) {
       if (srcs[i] != nullptr) tmp2 = load<VecBytes>(srcs[i] + offset + laneOffset);
 
       if (srcs[i - 1] != nullptr) {
-// #pragma unroll vecSize
+        // #pragma unroll vecSize
         for (int j = 0; j < vecSize; ++j) {
           accumValFp32[j] += float(reinterpret_cast<const T*>(tmp1)[j]) * scales[i - 1];
         }
@@ -489,7 +490,7 @@ __forceinline__ __device__ void WarpAccumPipelineImpl(T* __restrict__ dest, T* c
       }
 
       if (srcs[i] != nullptr) {
-// #pragma unroll vecSize
+        // #pragma unroll vecSize
         for (int j = 0; j < vecSize; ++j) {
           accumValFp32[j] += float(reinterpret_cast<const T*>(tmp2)[j]) * scales[i];
         }
@@ -498,7 +499,7 @@ __forceinline__ __device__ void WarpAccumPipelineImpl(T* __restrict__ dest, T* c
 
     if (tail) {
       if (srcs[AccumNum - 1] != nullptr) {
-// #pragma unroll vecSize
+        // #pragma unroll vecSize
         for (int j = 0; j < vecSize; ++j) {
           accumValFp32[j] += float(reinterpret_cast<const T*>(tmp1)[j]) * scales[AccumNum - 1];
         }

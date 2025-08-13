@@ -224,9 +224,7 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
       argsVariant);
 }
 
-void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) {
-  crossDeviceBarrierFlag++;
-}
+void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) { crossDeviceBarrierFlag++; }
 
 }  // namespace moe
 }  // namespace mori
