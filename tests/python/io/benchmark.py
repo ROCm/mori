@@ -14,6 +14,7 @@ from mori.io import (
 import argparse
 from enum import Enum
 import os
+import time
 
 
 def parse_args():
@@ -59,6 +60,9 @@ class MoriIoBenchmark:
         self.role_rank = rank_in_node
         self.num_initiator_dev = num_initiator_dev
         self.num_target_dev = num_target_dev
+        assert self.num_initiator_dev == self.num_target_dev
+        self.single_transfer_size = 32768
+        self.num_transfer = 64
 
         self.world_size = self.num_initiator_dev + self.num_target_dev
         if self.node_rank == 0:
@@ -91,9 +95,9 @@ class MoriIoBenchmark:
         self.engine = IOEngine(key=f"{self.role.name}-{self.role_rank}", config=config)
         self.engine.create_backend(BackendType.RDMA)
 
-        engine_desc = self.engine.get_engine_desc()
-        engine_desc_bytes = engine_desc.pack()
-        print(engine_desc, engine_desc.key, engine_desc.pack())
+        self.engine_desc = self.engine.get_engine_desc()
+        engine_desc_bytes = self.engine_desc.pack()
+        print(self.engine_desc, self.engine_desc.key, self.engine_desc.pack())
 
         if self.role is EngineRole.INITIATOR:
             for i in range(self.num_target_dev):
@@ -112,8 +116,48 @@ class MoriIoBenchmark:
             for i in range(self.num_initiator_dev):
                 self.send_bytes(engine_desc_bytes, i)
 
-    def run_once(self):
-        pass
+        device = torch.device("cuda", self.role_rank)
+        tensor = torch.randn(self.single_transfer_size * self.num_transfer).to(
+            device, dtype=torch.int8
+        )
+        self.mem = self.engine.register_torch_tensor(tensor)
+
+        if self.role is EngineRole.TARGET:
+            mem_desc = self.mem.pack()
+            print(f"{self.engine_desc.key} send mem obj to rank {self.role_rank}")
+            self.send_bytes(mem_desc, self.role_rank)
+        else:
+            print(
+                f"{self.engine_desc.key} recv mem obj from rank {self.num_initiator_dev + self.role_rank}"
+            )
+            target_mem_desc = self.recv_bytes(self.num_initiator_dev + self.role_rank)
+            self.target_mem = MemoryDesc.unpack(target_mem_desc)
+
+    def run_once(self, batch_size):
+        if self.role is EngineRole.INITIATOR:
+            status = []
+            transfer_uids = []
+
+            st = time.time()
+            for i in range(batch_size):
+                transfer_uids.append(self.engine.allocate_transfer_uid())
+            print(f"alloc uid duration {time.time()-st}")
+
+            read_st = time.time()
+            for i in range(batch_size):
+                transfer_status = self.engine.read(
+                    self.mem,
+                    self.single_transfer_size * (i % self.num_transfer),
+                    self.target_mem,
+                    self.single_transfer_size * (i % self.num_transfer),
+                    self.single_transfer_size,
+                    transfer_uids[i],
+                )
+                status.append(transfer_status)
+            print(f"submit duration {time.time()-read_st}")
+
+            while status[-1].Code() == StatusCode.INIT:
+                pass
 
     def run(self):
         with TorchDistContext(
@@ -121,8 +165,24 @@ class MoriIoBenchmark:
             world_size=self.world_size,
             master_addr=None,
             master_port=None,
+            device_id=self.role_rank,
         ) as ctx:
             self.initialize()
+            for _ in range(3):
+                self.run_once(1)
+            round = 1
+            dist.barrier()
+            st = time.time()
+            self.run_once(self.num_transfer * round)
+            end = time.time()
+            duration = end - st
+            total_mem_gb = (
+                self.single_transfer_size * self.num_transfer * round / (10**9)
+            )
+            bw = total_mem_gb / (end - st)
+            print(
+                f"total duration {duration*1000} ms, bytes {total_mem_gb} GB, bandwidth: {bw} GB/s"
+            )
 
 
 def benchmark_engine(local_rank, node_rank, args):
