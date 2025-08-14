@@ -122,8 +122,8 @@ class RdmaManager {
 
   // Local memory management APIs
   std::optional<application::RdmaMemoryRegion> GetLocalMemory(int ldevId, MemoryUniqueId);
-  application::RdmaMemoryRegion RegisterLocalMemory(int ldevId, MemoryDesc& desc);
-  void DeregisterLocalMemory(int ldevId, MemoryDesc& desc);
+  application::RdmaMemoryRegion RegisterLocalMemory(int ldevId, const MemoryDesc& desc);
+  void DeregisterLocalMemory(int ldevId, const MemoryDesc& desc);
 
   // Remote memory management APIs
   std::optional<application::RdmaMemoryRegion> GetRemoteMemory(EngineKey, int remRdmaDevId,
@@ -250,13 +250,18 @@ class RdmaBackend : public Backend {
 
   void RegisterRemoteEngine(const EngineDesc&);
   void DeregisterRemoteEngine(const EngineDesc&);
-  void RegisterMemory(MemoryDesc& desc);
-  void DeregisterMemory(MemoryDesc& desc);
-  void Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remoteSrc, size_t remoteOffset,
-            size_t size, TransferStatus* status, TransferUniqueId id);
-  void Write(MemoryDesc localSrc, size_t localOffset, MemoryDesc remoteDest, size_t remoteOffset,
-             size_t size, TransferStatus* status, TransferUniqueId id);
+  void RegisterMemory(const MemoryDesc& desc);
+  void DeregisterMemory(const MemoryDesc& desc);
+  void Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
+            size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id);
+  void Write(const MemoryDesc& localSrc, size_t localOffset, const MemoryDesc& remoteDest,
+             size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id);
+  void BatchRead(const MemoryDesc& localDest, const SizeVec& localOffsets,
+                 const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets, const SizeVec& sizes,
+                 TransferStatus* status, TransferUniqueId id);
+
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
+  void Shutdown();
 
  private:
   void RdmaNotifyTransfer(const application::RdmaEndpoint& ep, TransferStatus* status,

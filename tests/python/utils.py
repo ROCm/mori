@@ -9,6 +9,33 @@ import mori
 import traceback
 
 
+str_to_dtype = {
+    "float32": torch.float32,
+    "float": torch.float32,
+    "float64": torch.float64,
+    "double": torch.float64,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "half": torch.float16,
+    "int8": torch.int8,
+    "int16": torch.int16,
+    "short": torch.int16,
+    "int32": torch.int32,
+    "int": torch.int32,
+    "int64": torch.int64,
+    "long": torch.int64,
+    "uint8": torch.uint8,
+    "bool": torch.bool,
+}
+
+
+def string_to_dtype(s):
+    s = s.lower()
+    if s not in str_to_dtype:
+        raise ValueError(f"Unknown dtype string: {s}")
+    return str_to_dtype[s]
+
+
 def get_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))

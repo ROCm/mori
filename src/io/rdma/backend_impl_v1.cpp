@@ -45,7 +45,7 @@ std::optional<application::RdmaMemoryRegion> RdmaManager::GetLocalMemory(int dev
   return mTable[key];
 }
 
-application::RdmaMemoryRegion RdmaManager::RegisterLocalMemory(int devId, MemoryDesc& desc) {
+application::RdmaMemoryRegion RdmaManager::RegisterLocalMemory(int devId, const MemoryDesc& desc) {
   std::lock_guard<std::mutex> lock(mu);
   MemoryKey key{devId, desc.id};
   application::RdmaDeviceContext* devCtx = GetOrCreateDeviceContext(devId);
@@ -53,7 +53,7 @@ application::RdmaMemoryRegion RdmaManager::RegisterLocalMemory(int devId, Memory
   return mTable[key];
 }
 
-void RdmaManager::DeregisterLocalMemory(int devId, MemoryDesc& desc) {
+void RdmaManager::DeregisterLocalMemory(int devId, const MemoryDesc& desc) {
   std::lock_guard<std::mutex> lock(mu);
   MemoryKey key{devId, desc.id};
   if (mTable.find(key) != mTable.end()) {
@@ -70,7 +70,6 @@ std::optional<application::RdmaMemoryRegion> RdmaManager::GetRemoteMemory(Engine
   MemoryKey key{remRdmaDevId, id};
   RemoteEngineMeta& remote = remotes[ekey];
   if (remote.mTable.find(key) == remote.mTable.end()) {
-    printf("memory key %s %d %d\n", ekey.c_str(), remRdmaDevId, id);
     return std::nullopt;
   }
   return remote.mTable[key];
@@ -80,7 +79,6 @@ void RdmaManager::RegisterRemoteMemory(EngineKey ekey, int remRdmaDevId, MemoryU
                                        application::RdmaMemoryRegion mr) {
   std::lock_guard<std::mutex> lock(mu);
   MemoryKey key{remRdmaDevId, id};
-  printf("register memory key %s %d %d\n", ekey.c_str(), remRdmaDevId, id);
   RemoteEngineMeta& remote = remotes[ekey];
   remote.mTable[key] = mr;
 }
@@ -268,7 +266,7 @@ void NotifManager::MainLoop() {
           } else {
             status->SetCode(StatusCode::ERROR);
           }
-          status->SetMessage(ibv_wc_status_str(wc.status));
+          // status->SetMessage(ibv_wc_status_str(wc.status));
           // printf("set transfer status\n");
         }
       }
@@ -483,7 +481,9 @@ RdmaBackend::RdmaBackend(EngineKey key, IOEngineConfig config) {
   server->Start();
 }
 
-RdmaBackend::~RdmaBackend() {
+RdmaBackend::~RdmaBackend() { Shutdown(); }
+
+void RdmaBackend::Shutdown() {
   notif->Shutdown();
   server->Shutdown();
 }
@@ -496,16 +496,13 @@ void RdmaBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   server->DeregisterRemoteEngine(rdesc);
 }
 
-void RdmaBackend::RegisterMemory(MemoryDesc& desc) { server->RegisterMemory(desc); }
+void RdmaBackend::RegisterMemory(const MemoryDesc& desc) { server->RegisterMemory(desc); }
 
-void RdmaBackend::DeregisterMemory(MemoryDesc& desc) { server->DeregisterMemory(desc); }
+void RdmaBackend::DeregisterMemory(const MemoryDesc& desc) { server->DeregisterMemory(desc); }
 
-void RdmaBackend::Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remoteSrc,
+void RdmaBackend::Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
                        size_t remoteOffset, size_t size, TransferStatus* status,
                        TransferUniqueId id) {
-  using clock = std::chrono::steady_clock;
-  using ns = std::chrono::microseconds;
-  auto t0 = clock::now();
   TopoKey local{localDest.deviceId, localDest.loc};
   TopoKey remote{remoteSrc.deviceId, remoteSrc.loc};
   TopoKeyPair kp{local, remote};
@@ -514,7 +511,6 @@ void RdmaBackend::Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remo
 
   // Create a pair of endpoint if none
   if (rdma->CountEndpoint(ekey, kp) == 0) {
-    printf("build connection\n");
     server->BuildRdmaConn(ekey, kp);
   }
   EpPairVec eps = rdma->GetAllEndpoint(ekey, kp);
@@ -523,22 +519,17 @@ void RdmaBackend::Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remo
   EpPair ep = eps[0];
   auto localMr = rdma->GetLocalMemory(ep.ldevId, localDest.id);
   if (!localMr.has_value()) {
-    printf("register local mem\n");
     localMr = rdma->RegisterLocalMemory(ep.ldevId, localDest);
   }
 
   auto remoteMr = rdma->GetRemoteMemory(ekey, ep.rdevId, remoteSrc.id);
   if (!remoteMr.has_value()) {
-    printf("ask remote mem\n");
     remoteMr = server->AskRemoteMemoryRegion(ekey, ep.rdevId, remoteSrc.id);
     // TODO: protocol should return status code
     // Currently we check member equality to ensure correct memory region
     assert(remoteMr->length == remoteSrc.size);
     rdma->RegisterRemoteMemory(ekey, ep.rdevId, remoteSrc.id, remoteMr.value());
   }
-  auto t1 = clock::now();
-  auto elapsed = std::chrono::duration_cast<ns>(t1 - t0);
-  std::cout << "Query meta data latency: " << elapsed.count() << " us\n";
 
   struct ibv_sge sge {};
   sge.addr = reinterpret_cast<uint64_t>(localDest.data) + localOffset;
@@ -562,15 +553,79 @@ void RdmaBackend::Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remo
   }
 
   RdmaNotifyTransfer(ep.local, status, id);
-  auto t2 = clock::now();
-  elapsed = std::chrono::duration_cast<ns>(t2 - t1);
-  std::cout << "Submit wr latency: " << elapsed.count() << " us\n";
 }
 
-void RdmaBackend::Write(MemoryDesc localSrc, size_t localOffset, MemoryDesc remoteDest,
-                        size_t remoteOffset, size_t size, TransferStatus* status,
-                        TransferUniqueId id) {
+void RdmaBackend::Write(const MemoryDesc& localSrc, size_t localOffset,
+                        const MemoryDesc& remoteDest, size_t remoteOffset, size_t size,
+                        TransferStatus* status, TransferUniqueId id) {
   status->SetCode(StatusCode::SUCCESS);
+}
+
+void RdmaBackend::BatchRead(const MemoryDesc& localDest, const SizeVec& localOffsets,
+                            const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
+                            const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
+  assert(localOffsets.size() == remoteOffsets.size());
+  assert(sizes.size() == remoteOffsets.size());
+  size_t batchSize = sizes.size();
+  if (batchSize == 0) {
+    status->SetCode(StatusCode::SUCCESS);
+    return;
+  }
+
+  TopoKey local{localDest.deviceId, localDest.loc};
+  TopoKey remote{remoteSrc.deviceId, remoteSrc.loc};
+  TopoKeyPair kp{local, remote};
+
+  EngineKey ekey = remoteSrc.engineKey;
+
+  // Create a pair of endpoint if none
+  if (rdma->CountEndpoint(ekey, kp) == 0) {
+    server->BuildRdmaConn(ekey, kp);
+  }
+  EpPairVec eps = rdma->GetAllEndpoint(ekey, kp);
+  assert(!eps.empty());
+
+  EpPair ep = eps[0];
+  auto localMr = rdma->GetLocalMemory(ep.ldevId, localDest.id);
+  if (!localMr.has_value()) {
+    localMr = rdma->RegisterLocalMemory(ep.ldevId, localDest);
+  }
+
+  auto remoteMr = rdma->GetRemoteMemory(ekey, ep.rdevId, remoteSrc.id);
+  if (!remoteMr.has_value()) {
+    remoteMr = server->AskRemoteMemoryRegion(ekey, ep.rdevId, remoteSrc.id);
+    // TODO: protocol should return status code
+    // Currently we check member equality to ensure correct memory region
+    assert(remoteMr->length == remoteSrc.size);
+    rdma->RegisterRemoteMemory(ekey, ep.rdevId, remoteSrc.id, remoteMr.value());
+  }
+
+  std::vector<struct ibv_sge> sges(batchSize, ibv_sge{});
+  std::vector<struct ibv_send_wr> wrs(batchSize, ibv_send_wr{});
+  for (int i = 0; i < batchSize; i++) {
+    struct ibv_sge& sge = sges[i];
+    sge.addr = reinterpret_cast<uint64_t>(localDest.data) + localOffsets[i];
+    sge.length = sizes[i];
+    sge.lkey = localMr->lkey;
+
+    struct ibv_send_wr& wr = wrs[i];
+    wr.wr_id = (i < (batchSize - 1)) ? 0 : reinterpret_cast<uint64_t>(status);
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_READ;
+    wr.send_flags = (i < (batchSize - 1)) ? 0 : IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = reinterpret_cast<uint64_t>(remoteSrc.data) + remoteOffsets[i];
+    wr.wr.rdma.rkey = remoteMr->rkey;
+    wr.next = (i < (batchSize - 1)) ? wrs.data() + i + 1 : nullptr;
+  }
+
+  int ret = ibv_post_send(ep.local.ibvHandle.qp, wrs.data(), nullptr);
+  if (ret != 0) {
+    status->SetCode(StatusCode::ERROR);
+    status->SetMessage(strerror(errno));
+  }
+
+  RdmaNotifyTransfer(ep.local, status, id);
 }
 
 bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,

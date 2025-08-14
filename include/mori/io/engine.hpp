@@ -35,16 +35,21 @@ class IOEngine {
   void DeregisterRemoteEngine(const EngineDesc&);
 
   MemoryDesc RegisterMemory(void* data, size_t size, int device, MemoryLocationType loc);
-  void DeregisterMemory(MemoryDesc& desc);
+  void DeregisterMemory(const MemoryDesc& desc);
 
   TransferUniqueId AllocateTransferUniqueId();
-  void Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remoteSrc, size_t remoteOffset,
-            size_t size, TransferStatus* status, TransferUniqueId id);
-  void Write(MemoryDesc localSrc, size_t localOffset, MemoryDesc remoteDest, size_t remoteOffset,
-             size_t size, TransferStatus* status, TransferUniqueId id);
+  void Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
+            size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id);
+  void Write(const MemoryDesc& localSrc, size_t localOffset, const MemoryDesc& remoteDest,
+             size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id);
+
+  void BatchRead(const MemoryDesc& localDest, const SizeVec& localOffsets,
+                 const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets, const SizeVec& sizes,
+                 TransferStatus* status, TransferUniqueId id);
 
   // Take the transfer status of an inbound op
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
+  void Shutdown();
 
  public:
   // Config and descriptors

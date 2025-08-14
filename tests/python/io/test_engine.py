@@ -13,6 +13,31 @@ from mori.io import (
 )
 
 
+@pytest.fixture(scope="module")
+def pre_connected_engine_pair():
+    config = IOEngineConfig(
+        host="127.0.0.1",
+        port=get_free_port(),
+    )
+    initiator = IOEngine(key="initiator", config=config)
+    config.port = get_free_port()
+    target = IOEngine(key="target", config=config)
+
+    initiator.create_backend(BackendType.RDMA)
+    target.create_backend(BackendType.RDMA)
+
+    initiator_desc = initiator.get_engine_desc()
+    target_desc = target.get_engine_desc()
+
+    initiator.register_remote_engine(target_desc)
+    target.register_remote_engine(initiator_desc)
+
+    yield (initiator, target)
+
+    del initiator
+    del target
+
+
 def test_engine_desc():
     config = IOEngineConfig(
         host="127.0.0.1",
@@ -63,27 +88,24 @@ def test_mem_desc():
     assert mem_desc == unpacked_desc
 
 
-def test_io_api():
-    # Step1: Initialize io engines
-    config = IOEngineConfig(
-        host="127.0.0.1",
-        port=get_free_port(),
-    )
-    initiator = IOEngine(key="initiator", config=config)
-    config.port = get_free_port()
-    target = IOEngine(key="target", config=config)
+def wait_status(status):
+    while status.Code() == StatusCode.INIT:
+        pass
 
-    initiator.create_backend(BackendType.RDMA)
-    target.create_backend(BackendType.RDMA)
 
-    # Step2: register remote io engines
-    initiator_desc = initiator.get_engine_desc()
-    target_desc = target.get_engine_desc()
+def wait_inbound_status(engine, remote_engine_key, remote_transfer_uid):
+    while True:
+        target_side_status = engine.pop_inbound_transfer_status(
+            remote_engine_key, remote_transfer_uid
+        )
+        if target_side_status:
+            return target_side_status
 
-    initiator.register_remote_engine(target_desc)
-    target.register_remote_engine(initiator_desc)
 
-    # Step3: register memory buffer
+def test_read(pre_connected_engine_pair):
+    initiator, target = pre_connected_engine_pair
+
+    # register memory buffer
     shape = [128, 8192]
     device1 = torch.device("cuda", 0)
     device2 = torch.device("cuda", 1)
@@ -93,35 +115,48 @@ def test_io_api():
     initiator_mem = initiator.register_torch_tensor(tensor1)
     target_mem = target.register_torch_tensor(tensor2)
 
-    # Step4: initiate tensfer
+    # initiate tensfer
     transfer_uid = initiator.allocate_transfer_uid()
     transfer_status = initiator.read(
         initiator_mem, 0, target_mem, 0, initiator_mem.size, transfer_uid
     )
-    while transfer_status.Code() == StatusCode.INIT:
-        pass
-    print(
-        f"read finished at initiator {transfer_status.Code()} {transfer_status.Message()}"
-    )
 
-    while True:
-        target_side_status = target.pop_inbound_transfer_status(
-            initiator_desc.key, transfer_uid
-        )
-        if target_side_status:
-            break
-    print(
-        f"read finished at target {target_side_status.Code()} {target_side_status.Message()}"
+    wait_status(transfer_status)
+    target_status = wait_inbound_status(
+        target, initiator.get_engine_desc().key, transfer_uid
     )
-
+    assert transfer_status.Code() == StatusCode.SUCCESS
+    assert target_status.Code() == StatusCode.SUCCESS
     assert torch.equal(tensor1.cpu(), tensor2.cpu())
 
-    # Step5: teardown
-    initiator.deregister_memory(initiator_mem)
-    target.deregister_memory(target_mem)
 
-    initiator.deregister_remote_engine(target_desc)
-    target.deregister_remote_engine(initiator_desc)
+def test_batch_read(pre_connected_engine_pair):
+    initiator, target = pre_connected_engine_pair
 
-    del initiator
-    del target
+    batch_size = 128
+    buffer_size = 8192
+    # register memory buffer
+    shape = [batch_size, buffer_size]
+    device1 = torch.device("cuda", 0)
+    device2 = torch.device("cuda", 1)
+    tensor1 = torch.randn(shape).to(device1, dtype=torch.uint8)
+    tensor2 = torch.randn(shape).to(device2, dtype=torch.uint8)
+
+    initiator_mem = initiator.register_torch_tensor(tensor1)
+    target_mem = target.register_torch_tensor(tensor2)
+
+    # initiate tensfer
+    transfer_uid = initiator.allocate_transfer_uid()
+    offsets = [i * buffer_size for i in range(batch_size)]
+    sizes = [buffer_size for _ in range(batch_size)]
+    transfer_status = initiator.batch_read(
+        initiator_mem, offsets, target_mem, offsets, sizes, transfer_uid
+    )
+
+    wait_status(transfer_status)
+    target_status = wait_inbound_status(
+        target, initiator.get_engine_desc().key, transfer_uid
+    )
+    assert transfer_status.Code() == StatusCode.SUCCESS
+    assert target_status.Code() == StatusCode.SUCCESS
+    assert torch.equal(tensor1.cpu(), tensor2.cpu())

@@ -5,6 +5,7 @@
 #include <hip/hip_fp8.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <torch/python.h>
 
 #include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
@@ -314,7 +315,9 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("DeregisterMemory", &mori::io ::IOEngine::DeregisterMemory)
       .def("AllocateTransferUniqueId", &mori::io ::IOEngine::AllocateTransferUniqueId)
       .def("Read", &mori::io ::IOEngine::Read)
-      .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus);
+      .def("BatchRead", &mori::io ::IOEngine::BatchRead)
+      .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus)
+      .def("Shutdown", &mori::io::IOEngine::Shutdown);
 }
 
 }  // namespace mori

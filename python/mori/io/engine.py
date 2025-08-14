@@ -68,6 +68,27 @@ class IOEngine:
         )
         return transfer_status
 
+    def batch_read(
+        self,
+        local_dest_mem_desc,
+        local_offsets,
+        remote_src_mem_desc,
+        remote_offsets,
+        sizes,
+        transfer_uid,
+    ):
+        transfer_status = mori_cpp.TransferStatus()
+        self._engine.BatchRead(
+            local_dest_mem_desc,
+            local_offsets,
+            remote_src_mem_desc,
+            remote_offsets,
+            sizes,
+            transfer_status,
+            transfer_uid,
+        )
+        return transfer_status
+
     def pop_inbound_transfer_status(self, remote_key, transfer_uid):
         transfer_status = mori_cpp.TransferStatus()
         found = self._engine.PopInboundTransferStatus(
@@ -76,3 +97,6 @@ class IOEngine:
         if found:
             return transfer_status
         return None
+
+    def shutdown(self):
+        self._engine.Shutdown()

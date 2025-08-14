@@ -95,5 +95,7 @@ struct TransferStatus {
   std::string msg;
 };
 
+using SizeVec = std::vector<size_t>;
+
 }  // namespace io
 }  // namespace mori

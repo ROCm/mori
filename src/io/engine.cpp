@@ -56,7 +56,7 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryL
   return memDesc;
 }
 
-void IOEngine::DeregisterMemory(MemoryDesc& desc) {
+void IOEngine::DeregisterMemory(const MemoryDesc& desc) {
   for (auto& it : backends) {
     it.second->DeregisterMemory(desc);
   }
@@ -67,14 +67,14 @@ TransferUniqueId IOEngine::AllocateTransferUniqueId() {
   return nextTransferUid.fetch_add(1, std::memory_order_relaxed);
 }
 
-void IOEngine::Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remoteSrc,
+void IOEngine::Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
                     size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id) {
   for (auto& it : backends) {
     return it.second->Read(localDest, localOffset, remoteSrc, remoteOffset, size, status, id);
   }
 }
 
-void IOEngine::Write(MemoryDesc localSrc, size_t localOffset, MemoryDesc remoteDest,
+void IOEngine::Write(const MemoryDesc& localSrc, size_t localOffset, const MemoryDesc& remoteDest,
                      size_t remoteOffset, size_t size, TransferStatus* status,
                      TransferUniqueId id) {
   for (auto& it : backends) {
@@ -82,10 +82,25 @@ void IOEngine::Write(MemoryDesc localSrc, size_t localOffset, MemoryDesc remoteD
   }
 }
 
+void IOEngine::BatchRead(const MemoryDesc& localDest, const SizeVec& localOffsets,
+                         const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
+                         const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
+  for (auto& it : backends) {
+    return it.second->BatchRead(localDest, localOffsets, remoteSrc, remoteOffsets, sizes, status,
+                                id);
+  }
+}
+
 bool IOEngine::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                         TransferStatus* status) {
   status->SetCode(StatusCode::SUCCESS);
   return true;
+}
+
+void IOEngine::Shutdown() {
+  for (auto& it : backends) {
+    it.second->Shutdown();
+  }
 }
 
 }  // namespace io
