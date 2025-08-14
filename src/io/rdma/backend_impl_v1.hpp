@@ -126,10 +126,11 @@ class RdmaManager {
   void DeregisterLocalMemory(int ldevId, MemoryDesc& desc);
 
   // Remote memory management APIs
-  std::optional<application::RdmaMemoryRegion> GetRemoteMemory(EngineKey, int rdevId,
+  std::optional<application::RdmaMemoryRegion> GetRemoteMemory(EngineKey, int remRdmaDevId,
                                                                MemoryUniqueId);
-  void RegisterRemoteMemory(EngineKey, int rdevId, MemoryUniqueId, application::RdmaMemoryRegion);
-  void DeregisterRemoteMemory(EngineKey, int rdevId, MemoryUniqueId);
+  void RegisterRemoteMemory(EngineKey, int remRdmaDevId, MemoryUniqueId,
+                            application::RdmaMemoryRegion);
+  void DeregisterRemoteMemory(EngineKey, int remRdmaDevId, MemoryUniqueId);
 
   // Endpoint management APIs
   int CountEndpoint(EngineKey, TopoKeyPair);

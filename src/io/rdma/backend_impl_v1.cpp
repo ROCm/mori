@@ -2,6 +2,8 @@
 
 #include <sys/epoll.h>
 
+#include <chrono>
+
 #include "src/io/rdma/protocol.hpp"
 namespace mori {
 namespace io {
@@ -61,27 +63,32 @@ void RdmaManager::DeregisterLocalMemory(int devId, MemoryDesc& desc) {
 }
 
 /* ---------------------------------- Remote Memory Management ---------------------------------- */
-std::optional<application::RdmaMemoryRegion> RdmaManager::GetRemoteMemory(EngineKey ekey, int devId,
+std::optional<application::RdmaMemoryRegion> RdmaManager::GetRemoteMemory(EngineKey ekey,
+                                                                          int remRdmaDevId,
                                                                           MemoryUniqueId id) {
   std::lock_guard<std::mutex> lock(mu);
-  MemoryKey key{devId, id};
-  RemoteEngineMeta remote = remotes[ekey];
-  if (remote.mTable.find(key) == remote.mTable.end()) return std::nullopt;
+  MemoryKey key{remRdmaDevId, id};
+  RemoteEngineMeta& remote = remotes[ekey];
+  if (remote.mTable.find(key) == remote.mTable.end()) {
+    printf("memory key %s %d %d\n", ekey.c_str(), remRdmaDevId, id);
+    return std::nullopt;
+  }
   return remote.mTable[key];
 }
 
-void RdmaManager::RegisterRemoteMemory(EngineKey ekey, int devId, MemoryUniqueId id,
+void RdmaManager::RegisterRemoteMemory(EngineKey ekey, int remRdmaDevId, MemoryUniqueId id,
                                        application::RdmaMemoryRegion mr) {
   std::lock_guard<std::mutex> lock(mu);
-  MemoryKey key{devId, id};
+  MemoryKey key{remRdmaDevId, id};
+  printf("register memory key %s %d %d\n", ekey.c_str(), remRdmaDevId, id);
   RemoteEngineMeta& remote = remotes[ekey];
   remote.mTable[key] = mr;
 }
 
-void RdmaManager::DeregisterRemoteMemory(EngineKey ekey, int devId, MemoryUniqueId id) {
+void RdmaManager::DeregisterRemoteMemory(EngineKey ekey, int remRdmaDevId, MemoryUniqueId id) {
   std::lock_guard<std::mutex> lock(mu);
   RemoteEngineMeta& remote = remotes[ekey];
-  MemoryKey key{devId, id};
+  MemoryKey key{remRdmaDevId, id};
   if (remote.mTable.find(key) != remote.mTable.end()) {
     remote.mTable.erase(key);
   }
@@ -208,7 +215,7 @@ void NotifManager::MainLoop() {
   int maxEvents = 128;
   epoll_event events[maxEvents];
   while (running.load()) {
-    int nfds = epoll_wait(epfd, events, maxEvents, 1 /*ms*/);
+    int nfds = epoll_wait(epfd, events, maxEvents, 0 /*ms*/);
     for (int i = 0; i < nfds; ++i) {
       uint32_t qpn = events[i].data.u32;
 
@@ -496,6 +503,9 @@ void RdmaBackend::DeregisterMemory(MemoryDesc& desc) { server->DeregisterMemory(
 void RdmaBackend::Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remoteSrc,
                        size_t remoteOffset, size_t size, TransferStatus* status,
                        TransferUniqueId id) {
+  using clock = std::chrono::steady_clock;
+  using ns = std::chrono::microseconds;
+  auto t0 = clock::now();
   TopoKey local{localDest.deviceId, localDest.loc};
   TopoKey remote{remoteSrc.deviceId, remoteSrc.loc};
   TopoKeyPair kp{local, remote};
@@ -503,23 +513,32 @@ void RdmaBackend::Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remo
   EngineKey ekey = remoteSrc.engineKey;
 
   // Create a pair of endpoint if none
-  if (rdma->CountEndpoint(ekey, kp) == 0) server->BuildRdmaConn(ekey, kp);
+  if (rdma->CountEndpoint(ekey, kp) == 0) {
+    printf("build connection\n");
+    server->BuildRdmaConn(ekey, kp);
+  }
   EpPairVec eps = rdma->GetAllEndpoint(ekey, kp);
   assert(!eps.empty());
 
   EpPair ep = eps[0];
   auto localMr = rdma->GetLocalMemory(ep.ldevId, localDest.id);
   if (!localMr.has_value()) {
+    printf("register local mem\n");
     localMr = rdma->RegisterLocalMemory(ep.ldevId, localDest);
   }
 
   auto remoteMr = rdma->GetRemoteMemory(ekey, ep.rdevId, remoteSrc.id);
   if (!remoteMr.has_value()) {
+    printf("ask remote mem\n");
     remoteMr = server->AskRemoteMemoryRegion(ekey, ep.rdevId, remoteSrc.id);
     // TODO: protocol should return status code
     // Currently we check member equality to ensure correct memory region
     assert(remoteMr->length == remoteSrc.size);
+    rdma->RegisterRemoteMemory(ekey, ep.rdevId, remoteSrc.id, remoteMr.value());
   }
+  auto t1 = clock::now();
+  auto elapsed = std::chrono::duration_cast<ns>(t1 - t0);
+  std::cout << "Query meta data latency: " << elapsed.count() << " us\n";
 
   struct ibv_sge sge {};
   sge.addr = reinterpret_cast<uint64_t>(localDest.data) + localOffset;
@@ -543,6 +562,9 @@ void RdmaBackend::Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remo
   }
 
   RdmaNotifyTransfer(ep.local, status, id);
+  auto t2 = clock::now();
+  elapsed = std::chrono::duration_cast<ns>(t2 - t1);
+  std::cout << "Submit wr latency: " << elapsed.count() << " us\n";
 }
 
 void RdmaBackend::Write(MemoryDesc localSrc, size_t localOffset, MemoryDesc remoteDest,

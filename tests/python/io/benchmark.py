@@ -121,6 +121,7 @@ class MoriIoBenchmark:
             device, dtype=torch.int8
         )
         self.mem = self.engine.register_torch_tensor(tensor)
+        print(f"engine key {self.engine_desc.key} device id {self.mem.device_id}")
 
         if self.role is EngineRole.TARGET:
             mem_desc = self.mem.pack()
@@ -132,6 +133,7 @@ class MoriIoBenchmark:
             )
             target_mem_desc = self.recv_bytes(self.num_initiator_dev + self.role_rank)
             self.target_mem = MemoryDesc.unpack(target_mem_desc)
+            # print(f"remote device id {}")
 
     def run_once(self, batch_size):
         if self.role is EngineRole.INITIATOR:
@@ -145,16 +147,20 @@ class MoriIoBenchmark:
 
             read_st = time.time()
             for i in range(batch_size):
+                slot = i % self.num_transfer
+                offset = self.single_transfer_size * slot
+                st = time.time()
                 transfer_status = self.engine.read(
                     self.mem,
-                    self.single_transfer_size * (i % self.num_transfer),
+                    offset,
                     self.target_mem,
-                    self.single_transfer_size * (i % self.num_transfer),
+                    offset,
                     self.single_transfer_size,
                     transfer_uids[i],
                 )
+                print(f"python submit read latency: {(time.time()-st)*1000000} us")
                 status.append(transfer_status)
-            print(f"submit duration {time.time()-read_st}")
+            print(f"submit duration {(time.time()-read_st)*1000} ms")
 
             while status[-1].Code() == StatusCode.INIT:
                 pass
