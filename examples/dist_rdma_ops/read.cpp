@@ -143,7 +143,7 @@ __device__ void Quite(RdmaEndpoint* endpoint) {
       uint64_t doneIdx = wqe_broadcast[warp_id];
       __hip_atomic_fetch_max(&endpoint->wqHandle.doneIdx, doneIdx, __ATOMIC_RELAXED,
                          __HIP_MEMORY_SCOPE_AGENT);
-      __hip_atomic_fetch_max(&cqHandle->consIdx, wqe_id / num_slot_per_wqe, __ATOMIC_RELAXED,
+      __hip_atomic_fetch_add(&cqHandle->consIdx, quiet_amount, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_AGENT);
     }
   }
@@ -234,7 +234,7 @@ __global__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
     uintptr_t dstAddr = remoteMr.addr + FlatThreadId() * msg_size;
     uint64_t dbr_val = PostWrite<P>(
         *wqHandle, my_sq_counter, my_msntbl_counter, my_psn_counter, endpoint->handle.qpn, srcAddr,
-        localMr.lkey, dstAddr, remoteMr.rkey, msg_size);
+        localMr.lkey, dstAddr, remoteMr.rkey, msg_size, is_leader);
 
     if (is_leader) {
       uint64_t db_touched{0};
@@ -252,16 +252,13 @@ __global__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
       // __threadfence_system();
       RingDoorbell<P>(wqHandle->dbrAddr, dbr_val);
 
-      __hip_atomic_fetch_add(&cqHandle->needConsIdx, num_wqes, __ATOMIC_RELAXED,
+      __hip_atomic_fetch_add(&cqHandle->needConsIdx, 1, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_AGENT);
       __hip_atomic_store(&wqHandle->dbTouchIdx, warp_sq_counter + num_wqes * num_slot_per_wqe,
                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       printf("block %d post write done\n", blockIdx.x);
     }
-    if (FlatThreadId() == 0)
-    {
-      Quite<P>(endpoint);
-    }
+    Quite<P>(endpoint);
     
   }
 }

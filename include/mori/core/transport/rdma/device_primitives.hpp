@@ -99,7 +99,7 @@ template <ProviderType PrvdType>
 inline __device__ uint64_t PostWrite(WorkQueueHandle& wq, uint32_t curPostIdx,
                                      uint32_t curMsntblSlotIdx, uint32_t curPsnIdx, uint32_t qpn,
                                      uintptr_t laddr, uint64_t lkey, uintptr_t raddr, uint64_t rkey,
-                                     size_t bytes);
+                                     size_t bytes, bool signal);
 
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostRead(WorkQueueHandle& wq, uint32_t curPostIdx,

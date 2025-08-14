@@ -152,9 +152,12 @@ inline __device__ uint64_t Mlx5PostReadWrite(WorkQueueHandle& wq, uint32_t curPo
 }
 
 template <>
-inline __device__ uint64_t PostWrite<ProviderType::MLX5>(
-    WorkQueueHandle& wq, uint32_t curPostIdx, uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
-    uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr, uint64_t rkey, size_t bytes) {
+inline __device__ uint64_t PostWrite<ProviderType::MLX5>(WorkQueueHandle& wq, uint32_t curPostIdx,
+                                                         uint32_t curMsntblSlotIdx,
+                                                         uint32_t curPsnIdx, uint32_t qpn,
+                                                         uintptr_t laddr, uint64_t lkey,
+                                                         uintptr_t raddr, uint64_t rkey,
+                                                         size_t bytes, bool signal) {
   return Mlx5PostReadWrite(wq, curPostIdx, qpn, laddr, lkey, raddr, rkey, bytes, false);
 }
 
