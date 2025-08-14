@@ -74,13 +74,21 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
 
 // TODO: translate data type
 // template <typename T>
-torch::Tensor LaunchCombine(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
-                            const torch::Tensor& input, const torch::Tensor& weights,
-                            const torch::Tensor& topkIds, int blockNum, int warpPerBlock) {
-  assert(input.is_contiguous() && weights.is_contiguous() && topkIds.is_contiguous());
+std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
+    mori::moe::EpDispatchCombineHandle& handle, int kernelType, const torch::Tensor& input,
+    const std::optional<torch::Tensor>& weights, const torch::Tensor& topkIds, int blockNum,
+    int warpPerBlock) {
+  assert(input.is_contiguous() && topkIds.is_contiguous());
+
+  float* weightsPtr = nullptr;
+  if (weights.has_value() && weights->size(0) != 0) {
+    assert(weights->is_contiguous());
+    weightsPtr = weights->data_ptr<float>();
+  }
+
   handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
-                          nullptr, weights.data_ptr<float>(),
-                          topkIds.data_ptr<mori::moe::index_t>(), handle.curRankNumToken);
+                          nullptr, weightsPtr, topkIds.data_ptr<mori::moe::index_t>(),
+                          handle.curRankNumToken);
   handle.LaunchCombine((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
                        at::cuda::getCurrentHIPStream());
 
@@ -88,7 +96,16 @@ torch::Tensor LaunchCombine(mori::moe::EpDispatchCombineHandle& handle, int kern
   torch::Tensor out =
       torch::from_blob(handle.shmemOutTokMemObj->Get(),
                        {handle.config.maxNumInpTokenPerRank, handle.config.hiddenDim}, options);
-  return out;
+
+  std::optional<torch::Tensor> outWeights{std::nullopt};
+  if (weightsPtr) {
+    outWeights =
+        torch::from_blob(handle.shmemOutWeightsMemObj->Get(),
+                         {handle.config.maxNumInpTokenPerRank, handle.config.numExpertPerToken},
+                         torch::TensorOptions().dtype(weights->scalar_type()).device(torch::kCUDA));
+  }
+
+  return {out, outWeights};
 }
 
 void LaunchReset(mori::moe::EpDispatchCombineHandle& handle) {

@@ -213,6 +213,8 @@ class EpDispatchCombineTestCase {
     MPI_Allgather(inpTokBufCpu, inpTokSize, MPI_CHAR, globalInpTokBufCpu, inpTokSize, MPI_CHAR,
                   MPI_COMM_WORLD);
 
+    // TODO: Collect scales from all ranks
+
     index_t totalRecvNumToken = 0;
     for (int i = 0; i < config.worldSize; i++) {
       totalRecvNumToken += handle.recvTokenNumMemObj->template GetAs<index_t*>()[i] - 1;
@@ -391,6 +393,7 @@ class EpDispatchCombineTestCase {
     for (int i = 0; i < 4; i++) HIP_RUNTIME_CHECK(hipEventCreate(&events[i]));
 
     float dispatchTotal = 0, combineTotal = 0;
+    int dispatchTotalRecvTokenNum = 0;
     for (int i = 0; i < runConfig.repeat; i++) {
       InitializeHandle();
       handle.LaunchReset(stream);
@@ -400,6 +403,8 @@ class EpDispatchCombineTestCase {
       handle.LaunchDispatch(runConfig.kernelType, -1, -1, stream);
       HIP_RUNTIME_CHECK(hipEventRecord(events[1]));
 
+      HIP_RUNTIME_CHECK(hipMemcpy(&dispatchTotalRecvTokenNum, handle.totalRecvTokenNum, sizeof(int),
+                                  hipMemcpyDeviceToHost));
       CopyDispatchOutAsCombineInp();
       SystemBarrier();
 
@@ -418,11 +423,16 @@ class EpDispatchCombineTestCase {
       if (handle.config.rank == 0) std::cout << "Benchmark round " << i << " Done" << std::endl;
     }
 
-    std::cout << "Rank " << handle.config.rank
-              << " Dispatch average: " << dispatchTotal / runConfig.repeat << std::endl;
-    std::cout << "Rank " << handle.config.rank
-              << " Combine average: " << combineTotal / runConfig.repeat << std::endl;
-
+    size_t total_bytes = dispatchTotalRecvTokenNum * handle.config.hiddenDim * sizeof(T);
+    float dispatchBw =
+        (total_bytes / 1e9f) / (dispatchTotal / runConfig.repeat / 1000.0f);
+    float combineBw = (total_bytes / 1e9f) / (combineTotal / runConfig.repeat / 1000.0f);
+    std::cout << "Rank " << handle.config.rank << " recvTokenNum " << dispatchTotalRecvTokenNum
+              << " Dispatch average time: " << dispatchTotal / runConfig.repeat
+              << " bw: " << dispatchBw << std::endl;
+    std::cout << "Rank " << handle.config.rank << " recvTokenNum " << dispatchTotalRecvTokenNum
+              << " Combine average time: " << combineTotal / runConfig.repeat
+              << " bw: " << combineBw << std::endl;
     HIP_RUNTIME_CHECK(hipStreamDestroy(stream));
   }
 

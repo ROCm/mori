@@ -192,6 +192,15 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
                      args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
     }
   }
+
+  if (args.weightsBuf) {
+    for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
+      core::WarpCopy(
+          args.shmemInpWeightsMemObj->template GetAs<float*>() + i * config.numExpertPerToken,
+          args.weightsBuf + i * config.numExpertPerToken, config.numExpertPerToken);
+    }
+  }
+
   // Make sure copy on all GPUs are finished
   CrossDeviceBarrierIntraNodeKernel(args);
   *args.totalRecvTokenNum = 0;
@@ -199,10 +208,13 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
   extern __shared__ char sharedMem[];
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
+  float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
+                          warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
 
   index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
   index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
 
+  assert(config.numExpertPerToken < warpSize);
   for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
     index_t tokenId = i / warpsPerToken;
     index_t inTokenPartId = i % warpsPerToken;
@@ -219,13 +231,22 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
         index_t destLocalTokId = destTokId - destPe * maxNumOutTokenPerRank;
         srcPtrs[j] = args.shmemInpTokMemObj->template GetAs<T*>(destPe) +
                      destLocalTokId * config.hiddenDim + hiddenDimOffset;
+        srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
+                           destLocalTokId * config.numExpertPerToken;
       } else {
         srcPtrs[j] = nullptr;
+        srcWeightsPtr[j] = nullptr;
       }
     }
     core::WarpAccum<T, 8>(
         args.shmemOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim + hiddenDimOffset,
         srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
+
+    if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
+      core::WarpAccum<float, 4>(
+          args.shmemOutWeightsMemObj->template GetAs<float*>() + tokenId * config.numExpertPerToken,
+          srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
+    }
   }
 }
 
