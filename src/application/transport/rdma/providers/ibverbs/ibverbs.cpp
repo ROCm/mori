@@ -79,6 +79,7 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   ibv_qp_attr attr;
   int flags;
 
+  const ibv_device_attr_ex* devAttr = GetRdmaDevice()->GetDeviceAttr();
   ibv_qp* qp = qpPool.find(local.qpn)->second;
 
   // INIT
@@ -95,7 +96,7 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   attr.path_mtu = IBV_MTU_4096;
   attr.dest_qp_num = remote.qpn;
   attr.rq_psn = 0;
-  attr.max_dest_rd_atomic = 1;
+  attr.max_dest_rd_atomic = devAttr->orig_attr.max_qp_rd_atom;
   attr.min_rnr_timer = 12;
   attr.ah_attr.sl = 0;
   attr.ah_attr.src_path_bits = 0;
@@ -122,7 +123,7 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   attr.timeout = 14;
   attr.retry_cnt = 7;
   attr.rnr_retry = 7;
-  attr.max_rd_atomic = 1;
+  attr.max_rd_atomic = devAttr->orig_attr.max_qp_init_rd_atom;
   flags = IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
           IBV_QP_MAX_QP_RD_ATOMIC;
   ibv_modify_qp(qp, &attr, flags);

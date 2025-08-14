@@ -190,7 +190,7 @@ class NotifManager {
     application::RdmaMemoryRegion mr;
   };
 
-  uint32_t maxNotifNum{1024};
+  uint32_t maxNotifNum{8192};
   std::unordered_map<int, DeviceNotifContext> notifCtx;
   std::unordered_map<EngineKey, std::unordered_set<TransferUniqueId>> notifPool;
 };

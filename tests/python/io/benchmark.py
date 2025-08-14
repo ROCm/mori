@@ -178,15 +178,14 @@ class MoriIoBenchmark:
 
     def run_single_once(self):
         if self.role is EngineRole.INITIATOR:
-            status = []
+            status_list = []
             transfer_uids = []
 
             for i in range(self.transfer_batch_size):
                 transfer_uids.append(self.engine.allocate_transfer_uid())
 
             for i in range(self.transfer_batch_size):
-                slot = i % self.transfer_batch_size
-                offset = self.buffer_size * slot
+                offset = self.buffer_size * i
                 transfer_status = self.engine.read(
                     self.mem,
                     offset,
@@ -195,10 +194,12 @@ class MoriIoBenchmark:
                     self.buffer_size,
                     transfer_uids[i],
                 )
-                status.append(transfer_status)
+                status_list.append(transfer_status)
 
-            while status[-1].Code() == StatusCode.INIT:
-                pass
+            for i, status in enumerate(status_list):
+                while status.Code() == StatusCode.INIT:
+                    pass
+                assert status.Code() == StatusCode.SUCCESS
 
     def run_batch_once(self):
         if self.role is EngineRole.INITIATOR:
@@ -213,9 +214,9 @@ class MoriIoBenchmark:
                 sizes,
                 transfer_uid,
             )
-
-            while transfer_status == StatusCode.INIT:
+            while transfer_status.Code() == StatusCode.INIT:
                 pass
+            assert transfer_status.Code() == StatusCode.SUCCESS
 
     def run_once(self):
         if self.enable_batch_transfer:
@@ -233,13 +234,13 @@ class MoriIoBenchmark:
         ):
             self.initialize()
             self.run_once()
-            # self.validate()
+            self.validate()
             self.run_once()
             dist.barrier()
 
-            round = 5
+            round = 100
             st = time.time()
-            for _ in range(round):
+            for i in range(round):
                 self.run_once()
             end = time.time()
 
@@ -249,9 +250,9 @@ class MoriIoBenchmark:
 
             if self.role is EngineRole.INITIATOR:
                 print(
-                    f"total duration {duration*1000} ms, bytes {total_mem_gb} GB, bandwidth: {bw} GB/s"
+                    f"average duration {duration*1000000} us, bytes {total_mem_gb} GB, bandwidth: {bw} GB/s"
                 )
-            # self.engine.shutdown()
+            self.engine.shutdown()
 
 
 def benchmark_engine(local_rank, node_rank, args):

@@ -107,9 +107,9 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int portId) {
   application::RdmaEndpointConfig config;
   config.portId = portId;
   config.gidIdx = 3;
-  config.maxMsgsNum = 1024;
+  config.maxMsgsNum = 8192;
   config.maxMsgSge = 1;
-  config.maxCqeNum = 1024;
+  config.maxCqeNum = 8192;
   config.alignment = 4096;
   config.withCompChannel = true;
   config.enableSrq = true;
@@ -155,7 +155,6 @@ application::RdmaDeviceContext* RdmaManager::GetOrCreateDeviceContext(int devId)
   if (devCtx == nullptr) {
     devCtx = availDevices[devId].first->CreateRdmaDeviceContext();
     deviceCtxs[devId] = devCtx;
-    // devCtx->CreateRdmaSrqIfNx(GetRdmaEndpointConfig(availDevices[devId].second));
   }
   return devCtx;
 }
@@ -193,6 +192,7 @@ void NotifManager::RegisterDevice(int devId) {
   notifCtx.insert({devId, {srq, mr}});
 
   // Pre post notification receive wr
+  // TODO: should use min(maxNotifNum, maxSrqWrNum)
   for (uint64_t i = 0; i < maxNotifNum; i++) {
     struct ibv_sge sge {};
     sge.addr = mr.addr + i * sizeof(TransferUniqueId);
@@ -236,6 +236,7 @@ void NotifManager::MainLoop() {
           assert(notifCtx.find(devId) != notifCtx.end());
           DeviceNotifContext& ctx = notifCtx[devId];
 
+          // FIXME: this notif mechenism has bug when notif index is wrapped around
           uint64_t idx = wc.wr_id;
           TransferUniqueId tid = reinterpret_cast<TransferUniqueId*>(ctx.mr.addr)[idx];
           // printf("recv notif for transfer %d\n", tid);
@@ -244,6 +245,10 @@ void NotifManager::MainLoop() {
           notifPool[ekey].insert(tid);
 
           // replenish recv wr
+          // TODO(ditian12): we should replenish recv wr faster, insufficient recv wr is met
+          // frequently when transfer is very fast. Two way to solve this, 1. use srq_limit to
+          // replenish in advance
+          // 2. independant srq entry config (now reuse maxMsgNum)
           struct ibv_sge sge {};
           sge.addr = ctx.mr.addr + idx * sizeof(TransferUniqueId);
           sge.length = sizeof(TransferUniqueId);
@@ -266,7 +271,7 @@ void NotifManager::MainLoop() {
           } else {
             status->SetCode(StatusCode::ERROR);
           }
-          // status->SetMessage(ibv_wc_status_str(wc.status));
+          status->SetMessage(ibv_wc_status_str(wc.status));
           // printf("set transfer status\n");
         }
       }
