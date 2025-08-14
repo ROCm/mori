@@ -34,6 +34,34 @@ def parse_args():
         help="Number of devices on target side",
     )
 
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Number of batch size",
+    )
+
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=1,
+        help="Number of block size for each transfer",
+    )
+
+    parser.add_argument(
+        "--unit",
+        type=str,
+        default="GiB",
+        help="GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb",
+    )
+
+    parser.add_argument(
+        "--role",
+        type=str,
+        default="target",
+        help="target|initiator",
+    )
+
     args = parser.parse_args()
     return args
 
