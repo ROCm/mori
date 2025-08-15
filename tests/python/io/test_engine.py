@@ -152,6 +152,25 @@ def test_read(pre_connected_engine_pair):
     )
 
 
+def test_sess_read(pre_connected_engine_pair):
+    initiator, target = pre_connected_engine_pair
+    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
+        pre_connected_engine_pair, [128, 8192]
+    )
+
+    sess = initiator.create_session(initiator_mem, target_mem)
+    transfer_uid = sess.allocate_transfer_uid()
+    transfer_status = sess.read(0, 0, initiator_mem.size, transfer_uid)
+
+    check_transfer_result(
+        pre_connected_engine_pair,
+        transfer_status,
+        initiator_tensor,
+        target_tensor,
+        transfer_uid,
+    )
+
+
 def test_batch_read(pre_connected_engine_pair):
     initiator, target = pre_connected_engine_pair
     batch_size, buffer_size = 128, 8192

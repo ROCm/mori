@@ -20,7 +20,6 @@ class IOEngineSession:
         local_offset,
         remote_offset,
         size,
-        transfer_status,
         transfer_uid,
     ):
         transfer_status = mori_cpp.TransferStatus()
