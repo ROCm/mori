@@ -252,7 +252,6 @@ class MoriIoBenchmark:
                 print(
                     f"average duration {duration*1000000} us, bytes {total_mem_gb} GB, bandwidth: {bw} GB/s"
                 )
-            self.engine.shutdown()
 
 
 def benchmark_engine(local_rank, node_rank, args):

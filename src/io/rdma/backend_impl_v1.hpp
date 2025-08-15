@@ -240,6 +240,32 @@ class ControlPlaneServer {
 };
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                                       RdmaBackendSession                                       */
+/* ---------------------------------------------------------------------------------------------- */
+class RdmaBackendSession : public BackendSession {
+ public:
+  RdmaBackendSession() = default;
+  RdmaBackendSession(const application::RdmaMemoryRegion& local,
+                     const application::RdmaMemoryRegion& remote, const EpPair& eps);
+  ~RdmaBackendSession() = default;
+
+  void Read(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
+            TransferUniqueId id);
+  void Write(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
+             TransferUniqueId id);
+
+  void BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets, const SizeVec& sizes,
+                 TransferStatus* status, TransferUniqueId id);
+
+  bool Alive() const;
+
+ private:
+  application::RdmaMemoryRegion local{};
+  application::RdmaMemoryRegion remote{};
+  EpPair eps{};
+};
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                           RdmaBackend                                          */
 /* ---------------------------------------------------------------------------------------------- */
 
@@ -260,17 +286,17 @@ class RdmaBackend : public Backend {
                  const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets, const SizeVec& sizes,
                  TransferStatus* status, TransferUniqueId id);
 
+  BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
-  void Shutdown();
 
  private:
-  void RdmaNotifyTransfer(const application::RdmaEndpoint& ep, TransferStatus* status,
-                          TransferUniqueId id);
+  void CreateSession(const MemoryDesc& local, const MemoryDesc& remote, RdmaBackendSession& sess);
 
  private:
   std::unique_ptr<RdmaManager> rdma;
   std::unique_ptr<NotifManager> notif;
   std::unique_ptr<ControlPlaneServer> server;
+  std::vector<std::unique_ptr<RdmaBackendSession>> sessions;
 };
 
 }  // namespace io

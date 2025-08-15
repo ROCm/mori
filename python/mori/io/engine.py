@@ -8,6 +8,52 @@ TORCH_DEVICE_TYPE_MAP = {
 }
 
 
+class IOEngineSession:
+    def __init__(self, mori_sess):
+        self._sess = mori_sess
+
+    def allocate_transfer_uid(self):
+        return self._sess.AllocateTransferUniqueId()
+
+    def read(
+        self,
+        local_offset,
+        remote_offset,
+        size,
+        transfer_status,
+        transfer_uid,
+    ):
+        transfer_status = mori_cpp.TransferStatus()
+        self._sess.Read(
+            local_offset,
+            remote_offset,
+            size,
+            transfer_status,
+            transfer_uid,
+        )
+        return transfer_status
+
+    def batch_read(
+        self,
+        local_offsets,
+        remote_offsets,
+        sizes,
+        transfer_uid,
+    ):
+        transfer_status = mori_cpp.TransferStatus()
+        self._sess.BatchRead(
+            local_offsets,
+            remote_offsets,
+            sizes,
+            transfer_status,
+            transfer_uid,
+        )
+        return transfer_status
+
+    def alive(self):
+        return self._sess.Alive()
+
+
 class IOEngine:
     def __init__(self, key, config: mori_cpp.IOEngineConfig):
         self._engine = mori_cpp.IOEngine(key, config)
@@ -89,6 +135,9 @@ class IOEngine:
         )
         return transfer_status
 
+    def create_session(self, local_mem, remote_mem):
+        return IOEngineSession(self._engine.CreateSession(local_mem, remote_mem))
+
     def pop_inbound_transfer_status(self, remote_key, transfer_uid):
         transfer_status = mori_cpp.TransferStatus()
         found = self._engine.PopInboundTransferStatus(
@@ -97,6 +146,3 @@ class IOEngine:
         if found:
             return transfer_status
         return None
-
-    def shutdown(self):
-        self._engine.Shutdown()

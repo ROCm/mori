@@ -304,6 +304,12 @@ void RegisterMoriIo(pybind11::module_& m) {
         return out.get().as<mori::io::MemoryDesc>();
       });
 
+  py::class_<mori::io::IOEngineSession>(m, "IOEngineSession")
+      .def("AllocateTransferUniqueId", &mori::io ::IOEngineSession::AllocateTransferUniqueId)
+      .def("Read", &mori::io ::IOEngineSession::Read)
+      .def("BatchRead", &mori::io ::IOEngineSession::BatchRead)
+      .def("Alive", &mori::io ::IOEngineSession::Alive);
+
   py::class_<mori::io::IOEngine>(m, "IOEngine")
       .def(py::init<const mori::io::EngineKey&, const mori::io::IOEngineConfig&>())
       .def("GetEngineDesc", &mori::io ::IOEngine::GetEngineDesc)
@@ -316,8 +322,8 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("AllocateTransferUniqueId", &mori::io ::IOEngine::AllocateTransferUniqueId)
       .def("Read", &mori::io ::IOEngine::Read)
       .def("BatchRead", &mori::io ::IOEngine::BatchRead)
-      .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus)
-      .def("Shutdown", &mori::io::IOEngine::Shutdown);
+      .def("CreateSession", &mori::io::IOEngine::CreateSession, py::return_value_policy::reference)
+      .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus);
 }
 
 }  // namespace mori

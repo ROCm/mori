@@ -5,6 +5,45 @@
 namespace mori {
 namespace io {
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                         IOEngineSession                                        */
+/* ---------------------------------------------------------------------------------------------- */
+TransferUniqueId IOEngineSession::AllocateTransferUniqueId() {
+  return engine->AllocateTransferUniqueId();
+}
+
+void IOEngineSession::Read(size_t localOffset, size_t remoteOffset, size_t size,
+                           TransferStatus* status, TransferUniqueId id) {
+  for (auto& it : backendSess) {
+    return it.second->Read(localOffset, remoteOffset, size, status, id);
+  }
+}
+
+void IOEngineSession::Write(size_t localOffset, size_t remoteOffset, size_t size,
+                            TransferStatus* status, TransferUniqueId id) {
+  for (auto& it : backendSess) {
+    return it.second->Write(localOffset, remoteOffset, size, status, id);
+  }
+}
+
+void IOEngineSession::BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                                const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
+  for (auto& it : backendSess) {
+    return it.second->BatchRead(localOffsets, remoteOffsets, sizes, status, id);
+  }
+}
+
+bool IOEngineSession::Alive() {
+  for (auto& it : backendSess) {
+    if (it.second->Alive()) return true;
+  }
+  return false;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                            IOEngine                                            */
+/* ---------------------------------------------------------------------------------------------- */
+
 IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
   // Initialize descriptor
   desc.key = key;
@@ -91,16 +130,21 @@ void IOEngine::BatchRead(const MemoryDesc& localDest, const SizeVec& localOffset
   }
 }
 
+IOEngineSession* IOEngine::CreateSession(const MemoryDesc& local, const MemoryDesc& remote) {
+  IOEngineSession* sess = new IOEngineSession{};
+  sess->engine = this;
+  for (auto& it : backends) {
+    BackendSession* bsess = it.second->CreateSession(local, remote);
+    sess->backendSess.insert({it.first, bsess});
+  }
+  sessions.emplace_back(sess);
+  return sess;
+}
+
 bool IOEngine::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                         TransferStatus* status) {
   status->SetCode(StatusCode::SUCCESS);
   return true;
-}
-
-void IOEngine::Shutdown() {
-  for (auto& it : backends) {
-    it.second->Shutdown();
-  }
 }
 
 }  // namespace io

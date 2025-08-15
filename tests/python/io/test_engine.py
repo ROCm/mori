@@ -102,41 +102,10 @@ def wait_inbound_status(engine, remote_engine_key, remote_transfer_uid):
             return target_side_status
 
 
-def test_read(pre_connected_engine_pair):
+def alloc_and_register_mem(pre_connected_engine_pair, shape):
     initiator, target = pre_connected_engine_pair
 
     # register memory buffer
-    shape = [128, 8192]
-    device1 = torch.device("cuda", 0)
-    device2 = torch.device("cuda", 1)
-    tensor1 = torch.randn(shape).to(device1)
-    tensor2 = torch.randn(shape).to(device2)
-
-    initiator_mem = initiator.register_torch_tensor(tensor1)
-    target_mem = target.register_torch_tensor(tensor2)
-
-    # initiate tensfer
-    transfer_uid = initiator.allocate_transfer_uid()
-    transfer_status = initiator.read(
-        initiator_mem, 0, target_mem, 0, initiator_mem.size, transfer_uid
-    )
-
-    wait_status(transfer_status)
-    target_status = wait_inbound_status(
-        target, initiator.get_engine_desc().key, transfer_uid
-    )
-    assert transfer_status.Code() == StatusCode.SUCCESS
-    assert target_status.Code() == StatusCode.SUCCESS
-    assert torch.equal(tensor1.cpu(), tensor2.cpu())
-
-
-def test_batch_read(pre_connected_engine_pair):
-    initiator, target = pre_connected_engine_pair
-
-    batch_size = 128
-    buffer_size = 8192
-    # register memory buffer
-    shape = [batch_size, buffer_size]
     device1 = torch.device("cuda", 0)
     device2 = torch.device("cuda", 1)
     tensor1 = torch.randn(shape).to(device1, dtype=torch.uint8)
@@ -144,8 +113,53 @@ def test_batch_read(pre_connected_engine_pair):
 
     initiator_mem = initiator.register_torch_tensor(tensor1)
     target_mem = target.register_torch_tensor(tensor2)
+    return tensor1, tensor2, initiator_mem, target_mem
 
-    # initiate tensfer
+
+def check_transfer_result(
+    pre_connected_engine_pair,
+    initiator_status,
+    initiator_tensor,
+    target_tensor,
+    transfer_uid,
+):
+    initiator, target = pre_connected_engine_pair
+    wait_status(initiator_status)
+    target_status = wait_inbound_status(
+        target, initiator.get_engine_desc().key, transfer_uid
+    )
+    assert initiator_status.Code() == StatusCode.SUCCESS
+    assert target_status.Code() == StatusCode.SUCCESS
+    assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+
+
+def test_read(pre_connected_engine_pair):
+    initiator, target = pre_connected_engine_pair
+    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
+        pre_connected_engine_pair, [128, 8192]
+    )
+
+    transfer_uid = initiator.allocate_transfer_uid()
+    transfer_status = initiator.read(
+        initiator_mem, 0, target_mem, 0, initiator_mem.size, transfer_uid
+    )
+    check_transfer_result(
+        pre_connected_engine_pair,
+        transfer_status,
+        initiator_tensor,
+        target_tensor,
+        transfer_uid,
+    )
+
+
+def test_batch_read(pre_connected_engine_pair):
+    initiator, target = pre_connected_engine_pair
+    batch_size, buffer_size = 128, 8192
+
+    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
+        pre_connected_engine_pair, [batch_size, buffer_size]
+    )
+
     transfer_uid = initiator.allocate_transfer_uid()
     offsets = [i * buffer_size for i in range(batch_size)]
     sizes = [buffer_size for _ in range(batch_size)]
@@ -153,10 +167,33 @@ def test_batch_read(pre_connected_engine_pair):
         initiator_mem, offsets, target_mem, offsets, sizes, transfer_uid
     )
 
-    wait_status(transfer_status)
-    target_status = wait_inbound_status(
-        target, initiator.get_engine_desc().key, transfer_uid
+    check_transfer_result(
+        pre_connected_engine_pair,
+        transfer_status,
+        initiator_tensor,
+        target_tensor,
+        transfer_uid,
     )
-    assert transfer_status.Code() == StatusCode.SUCCESS
-    assert target_status.Code() == StatusCode.SUCCESS
-    assert torch.equal(tensor1.cpu(), tensor2.cpu())
+
+
+def test_sess_batch_read(pre_connected_engine_pair):
+    initiator, target = pre_connected_engine_pair
+    batch_size, buffer_size = 128, 8192
+
+    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
+        pre_connected_engine_pair, [batch_size, buffer_size]
+    )
+
+    sess = initiator.create_session(initiator_mem, target_mem)
+    transfer_uid = sess.allocate_transfer_uid()
+    offsets = [i * buffer_size for i in range(batch_size)]
+    sizes = [buffer_size for _ in range(batch_size)]
+    transfer_status = sess.batch_read(offsets, offsets, sizes, transfer_uid)
+
+    check_transfer_result(
+        pre_connected_engine_pair,
+        transfer_status,
+        initiator_tensor,
+        target_tensor,
+        transfer_uid,
+    )
