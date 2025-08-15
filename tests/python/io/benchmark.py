@@ -40,6 +40,11 @@ def parse_args():
         help="Whether to enable batch APIs, default: False",
     )
     parser.add_argument(
+        "--enable-sess",
+        action="store_true",
+        help="Whether to use session, default: False",
+    )
+    parser.add_argument(
         "--num-initiator-dev",
         type=int,
         default=1,
@@ -70,7 +75,8 @@ class MoriIoBenchmark:
         rank_in_node: int,
         buffer_size: int,
         transfer_batch_size: int,
-        enable_batch_transfer: bool = True,
+        enable_batch_transfer: bool = False,
+        enable_sess: bool = False,
         num_initiator_dev: int = 1,
         num_target_dev: int = 1,
     ):
@@ -84,6 +90,7 @@ class MoriIoBenchmark:
         self.buffer_size = buffer_size
         self.transfer_batch_size = transfer_batch_size
         self.enable_batch_transfer = enable_batch_transfer
+        self.enable_sess = enable_sess
 
         self.world_size = self.num_initiator_dev + self.num_target_dev
         if self.node_rank == 0:
@@ -110,6 +117,7 @@ class MoriIoBenchmark:
         print(f"  buffer_size: {self.buffer_size} B")
         print(f"  transfer_batch_size: {self.transfer_batch_size}")
         print(f"  enable_batch_transfer: {self.enable_batch_transfer}")
+        print(f"  enable_sess: {self.enable_sess}")
         print()
 
     def send_bytes(self, b: bytes, dst: int):
@@ -175,6 +183,7 @@ class MoriIoBenchmark:
         else:
             target_mem_desc = self.recv_bytes(self.num_initiator_dev + self.role_rank)
             self.target_mem = MemoryDesc.unpack(target_mem_desc)
+            self.sess = self.engine.create_session(self.mem, self.target_mem)
 
     def run_single_once(self):
         if self.role is EngineRole.INITIATOR:
@@ -186,14 +195,22 @@ class MoriIoBenchmark:
 
             for i in range(self.transfer_batch_size):
                 offset = self.buffer_size * i
-                transfer_status = self.engine.read(
-                    self.mem,
-                    offset,
-                    self.target_mem,
-                    offset,
-                    self.buffer_size,
-                    transfer_uids[i],
-                )
+                if self.enable_sess:
+                    transfer_status = self.sess.read(
+                        offset,
+                        offset,
+                        self.buffer_size,
+                        transfer_uids[i],
+                    )
+                else:
+                    transfer_status = self.engine.read(
+                        self.mem,
+                        offset,
+                        self.target_mem,
+                        offset,
+                        self.buffer_size,
+                        transfer_uids[i],
+                    )
                 status_list.append(transfer_status)
 
             for i, status in enumerate(status_list):
@@ -206,14 +223,22 @@ class MoriIoBenchmark:
             offsets = [(i * self.buffer_size) for i in range(self.transfer_batch_size)]
             sizes = [self.buffer_size for _ in range(self.transfer_batch_size)]
             transfer_uid = self.engine.allocate_transfer_uid()
-            transfer_status = self.engine.batch_read(
-                self.mem,
-                offsets,
-                self.target_mem,
-                offsets,
-                sizes,
-                transfer_uid,
-            )
+            if self.enable_sess:
+                transfer_status = self.sess.batch_read(
+                    offsets,
+                    offsets,
+                    sizes,
+                    transfer_uid,
+                )
+            else:
+                transfer_status = self.engine.batch_read(
+                    self.mem,
+                    offsets,
+                    self.target_mem,
+                    offsets,
+                    sizes,
+                    transfer_uid,
+                )
             while transfer_status.Code() == StatusCode.INIT:
                 pass
             assert transfer_status.Code() == StatusCode.SUCCESS
@@ -263,6 +288,7 @@ def benchmark_engine(local_rank, node_rank, args):
         buffer_size=args.buffer_size,
         transfer_batch_size=args.transfer_batch_size,
         enable_batch_transfer=args.enable_batch_transfer,
+        enable_sess=args.enable_sess,
         num_initiator_dev=args.num_initiator_dev,
         num_target_dev=args.num_target_dev,
     )
