@@ -9,7 +9,7 @@ MORI stands for Modular RDMA Interface
 - pytorch:rocm >= 6.4.0
 - Linux packages
     
-    ```apt-get install -y git cython3 ibverbs-utils openmpi-bin libopenmpi-dev cmake libdw1```
+    ```apt-get install -y git cython3 ibverbs-utils openmpi-bin libopenmpi-dev libpci-dev cmake libdw1```
 
 Or build docker image with:
 ```
@@ -32,3 +32,4 @@ pytest tests/python/ops/
 # Benchmark performance
 python3 tests/python/ops/bench_dispatch_combine.py 
 ```
+
