@@ -254,19 +254,26 @@ class EpDispatchCombineTestCase:
 
             assert torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
-            got_weight, expected_weight = combine_output_weight[i], weights[i] * unique_pes 
-            weight_match = torch.allclose(got_weight, expected_weight, atol=1e-5, rtol=1e-5)
+            got_weight, expected_weight = (
+                combine_output_weight[i],
+                weights[i] * unique_pes,
+            )
+            weight_match = torch.allclose(
+                got_weight, expected_weight, atol=1e-5, rtol=1e-5
+            )
             if not weight_match and self.config.rank == 0:
                 print(f"Weight mismatch for token {i}:")
                 print(f"  indices[{i}]: {indices[i].cpu().tolist()}")
                 print(f"  pes: {pes}")
                 print(f"  unique_pes: {unique_pes}")
                 print(f"  got_weight: {got_weight}")
-                print(f"  expected_weight (weights[{i}] * {unique_pes}): {expected_weight}")
+                print(
+                    f"  expected_weight (weights[{i}] * {unique_pes}): {expected_weight}"
+                )
                 print(f"  original weights[{i}]: {weights[i]}")
                 print(f"  diff: {torch.abs(got_weight - expected_weight)}")
                 print(f"  max_diff: {torch.abs(got_weight - expected_weight).max()}")
-            
+
             assert weight_match, f"Weight assertion failed for token {i}"
 
         if self.config.rank == 0:
