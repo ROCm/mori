@@ -78,7 +78,7 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   struct bnxt_re_dv_qp_init_attr dv_qp_attr;
   int err;
 
-  uint32_t maxMsgsNum = RoundUpPowOfTwo(config.maxMsgsNum);
+  uint32_t maxMsgsNum = AlignUpTo3x256Minus1(config.maxMsgsNum);
   memset(&ib_qp_attr, 0, sizeof(struct ibv_qp_init_attr));
   ib_qp_attr.send_cq = cq;
   ib_qp_attr.recv_cq = cq;
@@ -86,7 +86,7 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   ib_qp_attr.cap.max_recv_wr = maxMsgsNum;
   ib_qp_attr.cap.max_send_sge = 1;
   ib_qp_attr.cap.max_recv_sge = 1;
-  ib_qp_attr.cap.max_inline_data = 0;
+  ib_qp_attr.cap.max_inline_data = 16;
   ib_qp_attr.qp_type = IBV_QPT_RC;
   ib_qp_attr.sq_sig_all = 0;
 

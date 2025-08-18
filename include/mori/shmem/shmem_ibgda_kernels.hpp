@@ -198,7 +198,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
   wq.outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
   uint64_t dbr_val =
       core::PostWrite<PrvdType>(wq, my_sq_counter, my_sq_counter, my_sq_counter, ep[pe].handle.qpn,
-                                laddr, source.lkey, raddr, rkey, bytes);
+                                laddr, source.lkey, raddr, rkey, bytes, true);
 
   if (is_leader) {
     uint64_t db_touched{0};

@@ -16,14 +16,15 @@ namespace core {
 // struct bnxt_re_db_hdr {
 // 	__u64 typ_qid_indx; /* typ: 4, qid:20, indx:24 */
 // };
-inline __device__ uint64_t bnxt_re_init_db_hdr(int32_t indx, uint32_t toggle, uint32_t qid, uint32_t typ) {
+inline __device__ uint64_t bnxt_re_init_db_hdr(int32_t indx, uint32_t toggle, uint32_t qid,
+                                               uint32_t typ) {
   uint64_t key_lo = indx | toggle;
 
-    uint64_t key_hi = (static_cast<uint64_t>(qid) & BNXT_RE_DB_QID_MASK);
-    key_hi |= (static_cast<uint64_t>(typ) & BNXT_RE_DB_TYP_MASK) << BNXT_RE_DB_TYP_SHIFT;
-    key_hi |= 0x1UL << BNXT_RE_DB_VALID_SHIFT;
-    
-    return key_lo | (key_hi << 32);
+  uint64_t key_hi = (static_cast<uint64_t>(qid) & BNXT_RE_DB_QID_MASK);
+  key_hi |= (static_cast<uint64_t>(typ) & BNXT_RE_DB_TYP_MASK) << BNXT_RE_DB_TYP_SHIFT;
+  key_hi |= 0x1UL << BNXT_RE_DB_VALID_SHIFT;
+
+  return key_lo | (key_hi << 32);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -46,7 +47,7 @@ inline __device__ void bnxt_re_fill_psns_for_msntbl(void* msnBuffAddr, uint32_t 
 
   uint64_t* msns_ptr;
   // Get the MSN table address
-  msns_ptr = (uint64_t*)(((char*)msnBuffAddr) + ((msntblIdx) << 4));
+  msns_ptr = (uint64_t*)(((char*)msnBuffAddr) + ((msntblIdx) << 3));
 
   msns.start_idx_next_psn_start_psn |= bnxt_re_update_msn_tbl(postIdx, nextPsn, curPsnIdx);
 
@@ -254,8 +255,12 @@ inline __device__ uint64_t BnxtPostReadWrite(WorkQueueHandle& wq, uint32_t curPo
 
   uint32_t slotIdx = curPostIdx % wqeNum;
   // TODO： wqeNum should be multiple of slotsNum, BRCM say using a specific conf currently.
-  assert((slotIdx + slotsNum) <= wqeNum);
-
+  if ((slotIdx + slotsNum) > wqeNum) {
+      printf("[Error] (slotIdx + slotsNum) <= wqeNum failed!\n"
+            "  slotIdx=%u, slotsNum=%d, wqeNum=%u\n",
+            slotIdx, slotsNum, wqeNum);
+      assert(false);
+  }
   uint32_t wqe_size = BNXT_RE_HDR_WS_MASK & slotsNum;
   uint32_t hdr_flags = BNXT_RE_HDR_FLAGS_MASK & signalFlag;
   uint32_t wqe_type = BNXT_RE_HDR_WT_MASK & opcode;
@@ -282,10 +287,10 @@ inline __device__ uint64_t BnxtPostReadWrite(WorkQueueHandle& wq, uint32_t curPo
 
   // get doorbell header
   // struct bnxt_re_db_hdr hdr;
-  uint8_t flags = (curPostIdx / wqeNum) & 0x1;
+  uint8_t flags = ((curPostIdx + slotsNum) / wqeNum) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
 
-  return bnxt_re_init_db_hdr(((slotIdx + slotsNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
+  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
 }
 
 template <>
@@ -621,6 +626,7 @@ inline __device__ void UpdateRecvDbrRecord<ProviderType::BNXT>(void* dbrRecAddr,
 template <>
 inline __device__ void RingDoorbell<ProviderType::BNXT>(void* dbrAddr, uint64_t dbrVal) {
   core::AtomicStoreSeqCstSystem(reinterpret_cast<uint64_t*>(dbrAddr), dbrVal);
+  // __builtin_nontemporal_store(dbrVal , reinterpret_cast<uint64_t*>(dbrAddr));
 }
 
 template <>
@@ -662,8 +668,9 @@ inline __device__ int PollCqOnce<ProviderType::BNXT>(void* cqeAddr, uint32_t cqe
   uint32_t phase = BNXT_RE_QUEUE_START_PHASE ^ ((consIdx / cqeNum) & 0x1);
   uint32_t flg_val = *reinterpret_cast<volatile uint32_t*>(flgSrc);
   uint32_t con_indx = *reinterpret_cast<volatile uint32_t*>(cqe + offsetof(bnxt_re_req_cqe, con_indx));
-  // printf("GPU  flg_val = 0x%08X (%u), phase = 0x%08X (%u)\n", flg_val & BNXT_RE_BCQE_PH_MASK,
-  //        flg_val & BNXT_RE_BCQE_PH_MASK, phase, phase);
+  // printf("GPU  flg_val = 0x%08X (%u), phase = 0x%08X (%u) consIdx %u, cqeNum %u\n",
+  //        flg_val & BNXT_RE_BCQE_PH_MASK, flg_val & BNXT_RE_BCQE_PH_MASK, phase, phase, consIdx,
+  //        cqeNum);
   if (((flg_val) & BNXT_RE_BCQE_PH_MASK) == (phase)) {
     uint8_t status = (flg_val >> BNXT_RE_BCQE_STATUS_SHIFT) & BNXT_RE_BCQE_STATUS_MASK;
 
@@ -719,9 +726,9 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
 
 template <>
 inline __device__ void UpdateCqDbrRecord<ProviderType::BNXT>(void* dbrRecAddr, uint32_t cons_idx, uint32_t cqeNum) {
-  uint8_t flags = (cons_idx / cqeNum) & 0x1;
+  uint8_t flags = ((cons_idx + 1)  / cqeNum) & (1UL << BNXT_RE_FLAG_EPOCH_HEAD_SHIFT);
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
-  uint64_t dbrVal = bnxt_re_init_db_hdr((cons_idx | epoch), 0, flags, BNXT_RE_QUE_TYPE_CQ);
+  uint64_t dbrVal = bnxt_re_init_db_hdr(((cons_idx + 1) | epoch), 0, flags, BNXT_RE_QUE_TYPE_CQ);
   core::AtomicStoreSeqCstSystem(reinterpret_cast<uint64_t*>(dbrRecAddr), dbrVal);
 }
 
