@@ -228,9 +228,9 @@ __global__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
     }
     uintptr_t srcAddr = localMr.addr + FlatThreadId() * msg_size;
     uintptr_t dstAddr = remoteMr.addr + FlatThreadId() * msg_size;
-    uint64_t dbr_val = PostWrite<P>(*wqHandle, my_sq_counter, my_msntbl_counter, my_psn_counter,
-                                    endpoint->handle.qpn, srcAddr, localMr.lkey, dstAddr,
-                                    remoteMr.rkey, msg_size, is_leader);
+    uint64_t dbr_val =
+        PostWrite<P>(*wqHandle, my_sq_counter, my_msntbl_counter, my_psn_counter, is_leader,
+                     endpoint->handle.qpn, srcAddr, localMr.lkey, dstAddr, remoteMr.rkey, msg_size);
 
     if (is_leader) {
       uint64_t db_touched{0};
