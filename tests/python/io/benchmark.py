@@ -264,18 +264,27 @@ class MoriIoBenchmark:
             dist.barrier()
 
             round = 100
-            st = time.time()
+            latency = []
             for i in range(round):
+                st = time.time()
                 self.run_once()
-            end = time.time()
+                latency.append(time.time() - st)
 
-            duration = (end - st) / round
-            total_mem_gb = self.buffer_size * self.transfer_batch_size / (10**9)
-            bw = total_mem_gb / duration
+            total_mem_gb = self.buffer_size * self.transfer_batch_size / (10**6)
+
+            avg_duration = sum(latency) / len(latency)
+            min_duration = min(latency)
+            avg_duration_us, min_duration_us = avg_duration * (
+                10**6
+            ), min_duration * (10**6)
+
+            avg_bw = total_mem_gb / (10**3) / avg_duration
+            max_bw = total_mem_gb / (10**3) / min_duration
 
             if self.role is EngineRole.INITIATOR:
                 print(
-                    f"average duration {duration*1000000} us, bytes {total_mem_gb} GB, bandwidth: {bw} GB/s"
+                    f"Duration {min_duration_us:.2f}({avg_duration_us:.2f}) us, "
+                    f"bytes {total_mem_gb} MB, bandwidth: {max_bw:.2f}({avg_bw:.2f}) GB/s"
                 )
 
 

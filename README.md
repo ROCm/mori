@@ -32,3 +32,16 @@ pytest tests/python/ops/
 # Benchmark performance
 python3 tests/python/ops/bench_dispatch_combine.py 
 ```
+
+### Test MORI-IO
+```
+cd /path/to/mori
+export PYTHONPATH=/path/to/mori:$PYTHONPATH
+
+# Test correctness
+pytest tests/python/io/
+
+# Benchmark performance
+export GLOO_SOCKET_IFNAME=ens14np0
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.194.129.65" --master_port=1234 tests/python/io/benchmark.py --host="10.194.129.65" --enable-batch-transfer --enable-sess --buffer-size 32768 --transfer-batch-size 128
+```
