@@ -181,8 +181,8 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
   }
   wq.outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
   uint64_t dbr_val =
-      core::PostWrite<PrvdType>(wq, my_sq_counter, my_sq_counter, my_sq_counter, ep[pe].handle.qpn,
-                                laddr, source.lkey, raddr, rkey, bytes, true);
+      core::PostWrite<PrvdType>(wq, my_sq_counter, my_sq_counter, my_sq_counter, true,
+                                ep[pe].handle.qpn, laddr, source.lkey, raddr, rkey, bytes);
 
   if (is_leader) {
     uint64_t db_touched{0};
@@ -291,8 +291,9 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
 
   wq.outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
 
-  uint64_t dbr_val = core::PostWriteInline<PrvdType>(wq, my_sq_counter, my_sq_counter, my_sq_counter,
-                                                     ep[pe].handle.qpn, val, raddr, rkey, bytes);
+  uint64_t dbr_val =
+      core::PostWriteInline<PrvdType>(wq, my_sq_counter, my_sq_counter, my_sq_counter, true,
+                                      ep[pe].handle.qpn, val, raddr, rkey, bytes);
 
   if (is_leader) {
     uint64_t db_touched{0};
@@ -389,9 +390,9 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
 
   wq.outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter + numWqesPerCmd - 1;;
 
-  uint64_t dbr_val =
-      core::PostAtomic<PrvdType>(wq, my_sq_counter, my_sq_counter, my_sq_counter, ep[pe].handle.qpn,
-                                 laddr, lkey, raddr, rkey, val, 0, bytes, amoType);
+  uint64_t dbr_val = core::PostAtomic<PrvdType>(wq, my_sq_counter, my_sq_counter, my_sq_counter,
+                                                true, ep[pe].handle.qpn, laddr, lkey, raddr, rkey,
+                                                val, 0, bytes, amoType);
   __threadfence_system();
   if (is_leader) {
     uint64_t db_touched = 0;
@@ -498,9 +499,9 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernelImpl(const application::S
 
   wq.outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter + numWqesPerCmd - 1;
 
-  uint64_t dbr_val =
-      core::PostAtomic<PrvdType>(wq, my_sq_counter, my_sq_counter, my_sq_counter, ep[pe].handle.qpn,
-                                 laddr, lkey, raddr, rkey, val, compare, bytes, amoType);
+  uint64_t dbr_val = core::PostAtomic<PrvdType>(wq, my_sq_counter, my_sq_counter, my_sq_counter,
+                                                true, ep[pe].handle.qpn, laddr, lkey, raddr, rkey,
+                                                val, compare, bytes, amoType);
   __threadfence_system();
   if (is_leader) {
     uint64_t db_touched = 0;

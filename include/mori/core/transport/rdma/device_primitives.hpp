@@ -1,7 +1,7 @@
 #pragma once
 
-#include "primitives.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
+#include "primitives.hpp"
 
 using namespace mori::application;
 
@@ -59,16 +59,16 @@ static_assert(sizeof(ibgda_atomic_64_masked_cs_seg_t) == 16,
 
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostSend(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                    uint32_t curMsntblSlotIdx, uint32_t curPsnIdx, uint32_t qpn,
-                                    uintptr_t laddr, uint64_t lkey, size_t bytes);
+                                    uint32_t curMsntblSlotIdx, uint32_t curPsnIdx, bool cqeSignal,
+                                    uint32_t qpn, uintptr_t laddr, uint64_t lkey, size_t bytes);
 
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostSend(WorkQueueHandle& wq, uint32_t qpn, uintptr_t laddr,
                                     uint64_t lkey, size_t bytes);
 
 template <ProviderType PrvdType>
-inline __device__ uint64_t PostRecv(WorkQueueHandle& wq, uint32_t curPostIdx, uint32_t qpn,
-                                    uintptr_t laddr, uint64_t lkey, size_t bytes);
+inline __device__ uint64_t PostRecv(WorkQueueHandle& wq, uint32_t curPostIdx, bool cqeSignal,
+                                    uint32_t qpn, uintptr_t laddr, uint64_t lkey, size_t bytes);
 
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostRecv(WorkQueueHandle& wq, uint32_t qpn, uintptr_t laddr,
@@ -76,15 +76,15 @@ inline __device__ uint64_t PostRecv(WorkQueueHandle& wq, uint32_t qpn, uintptr_t
 
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostWrite(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                     uint32_t curMsntblSlotIdx, uint32_t curPsnIdx, uint32_t qpn,
-                                     uintptr_t laddr, uint64_t lkey, uintptr_t raddr, uint64_t rkey,
-                                     size_t bytes, bool signal);
+                                     uint32_t curMsntblSlotIdx, uint32_t curPsnIdx, bool cqeSignal,
+                                     uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
+                                     uint64_t rkey, size_t bytes);
 
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostRead(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                    uint32_t curMsntblSlotIdx, uint32_t curPsnIdx, uint32_t qpn,
-                                    uintptr_t laddr, uint64_t lkey, uintptr_t raddr, uint64_t rkey,
-                                    size_t bytes);
+                                    uint32_t curMsntblSlotIdx, uint32_t curPsnIdx, bool cqeSignal,
+                                    uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
+                                    uint64_t rkey, size_t bytes);
 
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostWrite(WorkQueueHandle& wq, uint32_t qpn, uintptr_t laddr,
@@ -97,8 +97,8 @@ inline __device__ uint64_t PostRead(WorkQueueHandle& wq, uint32_t qpn, uintptr_t
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostWriteInline(WorkQueueHandle& wq, uint32_t curPostIdx,
                                            uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
-                                           uint32_t qpn, void* val, uintptr_t raddr, uint64_t rkey,
-                                           size_t bytes);
+                                           bool cqeSignal, uint32_t qpn, void* val, uintptr_t raddr,
+                                           uint64_t rkey, size_t bytes);
 
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostWriteInline(WorkQueueHandle& wq, uint32_t qpn, void* val,
@@ -106,8 +106,8 @@ inline __device__ uint64_t PostWriteInline(WorkQueueHandle& wq, uint32_t qpn, vo
 
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostAtomic(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                      uint32_t curMsntblSlotIdx, uint32_t curPsnIdx, uint32_t qpn,
-                                      uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
+                                      uint32_t curMsntblSlotIdx, uint32_t curPsnIdx, bool cqeSignal,
+                                      uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
                                       uint64_t rkey, void* val_1, void* val_2, uint32_t typeBytes,
                                       atomicType amo_op);
 
@@ -118,8 +118,8 @@ inline __device__ uint64_t PostAtomic(WorkQueueHandle& wq, uint32_t qpn, uintptr
 
 template <ProviderType PrvdType, typename T>
 inline __device__ uint64_t PostAtomic(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                      uint32_t curMsntblSlotIdx, uint32_t curPsnIdx, uint32_t qpn,
-                                      uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
+                                      uint32_t curMsntblSlotIdx, uint32_t curPsnIdx, bool cqeSignal,
+                                      uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
                                       uint64_t rkey, const T val_1, const T val_2,
                                       atomicType amo_op);
 

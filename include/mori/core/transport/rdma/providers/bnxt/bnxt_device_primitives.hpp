@@ -57,10 +57,15 @@ inline __device__ void bnxt_re_fill_psns_for_msntbl(void* msnBuffAddr, uint32_t 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           Post Tasks                                           */
 /* ---------------------------------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------------------------------- */
+/*                                        Send / Recv APIs                                        */
+/* ---------------------------------------------------------------------------------------------- */
 inline __device__ uint64_t BnxtPostSend(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                        uint32_t curMsntblSlotIdx, uint32_t curPsnIdx, uint32_t qpn,
-                                        uintptr_t laddr, uint64_t lkey, size_t bytes) {
+                                        uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
+                                        bool cqeSignal, uint32_t qpn, uintptr_t laddr,
+                                        uint64_t lkey, size_t bytes) {
   // In bnxt, wqeNum mean total sq slot num
+  uint8_t signalFlag = cqeSignal ? BNXT_RE_WR_FLAGS_SIGNALED : 0x00;
   void* queueBuffAddr = wq.sqAddr;
   void* msntblAddr = wq.msntblAddr;
   uint32_t wqeNum = wq.sqWqeNum;
@@ -80,7 +85,7 @@ inline __device__ uint64_t BnxtPostSend(WorkQueueHandle& wq, uint32_t curPostIdx
   assert((slotIdx + slotsNum) <= wqeNum);
 
   uint32_t wqe_size = BNXT_RE_HDR_WS_MASK & slotsNum;
-  uint32_t hdr_flags = BNXT_RE_HDR_FLAGS_MASK & BNXT_RE_WR_FLAGS_SIGNALED;
+  uint32_t hdr_flags = BNXT_RE_HDR_FLAGS_MASK & signalFlag;
   uint32_t wqe_type = BNXT_RE_HDR_WT_MASK & BNXT_RE_WR_OPCD_SEND;
   hdr.rsv_ws_fl_wt =
       (wqe_size << BNXT_RE_HDR_WS_SHIFT) | (hdr_flags << BNXT_RE_HDR_FLAGS_SHIFT) | wqe_type;
@@ -92,7 +97,7 @@ inline __device__ uint64_t BnxtPostSend(WorkQueueHandle& wq, uint32_t curPostIdx
   send.avid = 0;
   send.rsvd = 0;
 
-  sge.pa = (uint64_t) laddr;
+  sge.pa = (uint64_t)laddr;
   sge.lkey = lkey & 0xffffffff;
   sge.length = bytes;
 
@@ -117,10 +122,11 @@ inline __device__ uint64_t BnxtPostSend(WorkQueueHandle& wq, uint32_t curPostIdx
 template <>
 inline __device__ uint64_t PostSend<ProviderType::BNXT>(WorkQueueHandle& wq, uint32_t curPostIdx,
                                                         uint32_t curMsntblSlotIdx,
-                                                        uint32_t curPsnIdx, uint32_t qpn,
-                                                        uintptr_t laddr, uint64_t lkey,
-                                                        size_t bytes) {
-  return BnxtPostSend(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, qpn, laddr, lkey, bytes);
+                                                        uint32_t curPsnIdx, bool cqeSignal,
+                                                        uint32_t qpn, uintptr_t laddr,
+                                                        uint64_t lkey, size_t bytes) {
+  return BnxtPostSend(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, cqeSignal, qpn, laddr, lkey,
+                      bytes);
 }
 
 template <>
@@ -143,13 +149,13 @@ inline __device__ uint64_t PostSend<ProviderType::BNXT>(WorkQueueHandle& wq, uin
   uint32_t curPsnIdx = wq.psnIdx;
   wq.psnIdx += psnCnt;
   ReleaseLock(&wq.postSendLock);
-  return BnxtPostSend(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, qpn, laddr, lkey, bytes);
+  return BnxtPostSend(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, true, qpn, laddr, lkey, bytes);
 }
 
-template <>
-inline __device__ uint64_t PostRecv<ProviderType::BNXT>(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                                        uint32_t qpn, uintptr_t laddr,
-                                                        uint64_t lkey, size_t bytes) {
+inline __device__ uint64_t BnxtPostRecv(WorkQueueHandle& wq, uint32_t curPostIdx, bool cqeSignal,
+                                        uint32_t qpn, uintptr_t laddr, uint64_t lkey,
+                                        size_t bytes) {
+  uint8_t signalFlag = cqeSignal ? BNXT_RE_WR_FLAGS_SIGNALED : 0x00;
   void* queueBuffAddr = wq.rqAddr;
   uint32_t wqeNum = wq.rqWqeNum;
   struct bnxt_re_brqe hdr;
@@ -163,7 +169,7 @@ inline __device__ uint64_t PostRecv<ProviderType::BNXT>(WorkQueueHandle& wq, uin
   uint32_t slotIdx = curPostIdx % wqeNum;
 
   uint32_t wqe_size = BNXT_RE_HDR_WS_MASK & slotsNum;
-  uint32_t hdr_flags = BNXT_RE_HDR_FLAGS_MASK & BNXT_RE_WR_FLAGS_SIGNALED;
+  uint32_t hdr_flags = BNXT_RE_HDR_FLAGS_MASK & signalFlag;
   uint32_t wqe_type = BNXT_RE_HDR_WT_MASK & BNXT_RE_WR_OPCD_RECV;
   hdr.rsv_ws_fl_wt =
       (wqe_size << BNXT_RE_HDR_WS_SHIFT) | (hdr_flags << BNXT_RE_HDR_FLAGS_SHIFT) | wqe_type;
@@ -183,46 +189,25 @@ inline __device__ uint64_t PostRecv<ProviderType::BNXT>(WorkQueueHandle& wq, uin
   uint8_t flags = (curPostIdx / wqeNum) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
   return bnxt_re_init_db_hdr(((slotIdx + slotsNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_RQ);
+}
+
+template <>
+inline __device__ uint64_t PostRecv<ProviderType::BNXT>(WorkQueueHandle& wq, uint32_t curPostIdx,
+                                                        bool cqeSignal, uint32_t qpn,
+                                                        uintptr_t laddr, uint64_t lkey,
+                                                        size_t bytes) {
+  return BnxtPostRecv(wq, curPostIdx, cqeSignal, qpn, laddr, lkey, bytes);
 }
 
 template <>
 inline __device__ uint64_t PostRecv<ProviderType::BNXT>(WorkQueueHandle& wq, uint32_t qpn,
                                                         uintptr_t laddr, uint64_t lkey,
                                                         size_t bytes) {
-  void* queueBuffAddr = wq.rqAddr;
-  uint32_t wqeNum = wq.rqWqeNum;
-  struct bnxt_re_brqe hdr;
-  struct bnxt_re_rqe recv;
-  struct bnxt_re_sge sge;
-
   constexpr int recvWqeSize =
       sizeof(struct bnxt_re_brqe) + sizeof(struct bnxt_re_rqe) + sizeof(struct bnxt_re_sge);
   constexpr int slotsNum = CeilDiv(recvWqeSize, BNXT_RE_SLOT_SIZE);
-
   uint32_t curPostIdx = atomicAdd(&wq.postIdx, slotsNum);
-  uint32_t slotIdx = curPostIdx % wqeNum;
-
-  uint32_t wqe_size = BNXT_RE_HDR_WS_MASK & slotsNum;
-  uint32_t hdr_flags = BNXT_RE_HDR_FLAGS_MASK & BNXT_RE_WR_FLAGS_SIGNALED;
-  uint32_t wqe_type = BNXT_RE_HDR_WT_MASK & BNXT_RE_WR_OPCD_RECV;
-  hdr.rsv_ws_fl_wt =
-      (wqe_size << BNXT_RE_HDR_WS_SHIFT) | (hdr_flags << BNXT_RE_HDR_FLAGS_SHIFT) | wqe_type;
-  hdr.wrid = slotIdx / slotsNum;
-
-  sge.pa = (uint64_t)laddr;
-  sge.lkey = lkey & 0xffffffff;
-  sge.length = bytes;
-
-  char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
-  memcpy(base + 0 * BNXT_RE_SLOT_SIZE, &hdr, sizeof(hdr));
-  *reinterpret_cast<uint64_t*>(base + BNXT_RE_SLOT_SIZE) = 0ULL;
-  *reinterpret_cast<uint64_t*>(base + BNXT_RE_SLOT_SIZE + 8) = 0ULL;  // memcpy -> set 0
-  memcpy(base + 2 * BNXT_RE_SLOT_SIZE, &sge, sizeof(sge));
-
-  // recv wqe needn't to fill msntbl
-  uint8_t flags = (curPostIdx / wqeNum) & 0x1;
-  uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
-  return bnxt_re_init_db_hdr(((slotIdx + slotsNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_RQ);
+  return BnxtPostRecv(wq, curPostIdx, true, qpn, laddr, lkey, bytes);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -231,11 +216,11 @@ inline __device__ uint64_t PostRecv<ProviderType::BNXT>(WorkQueueHandle& wq, uin
 // TODO: convert raddr/rkey laddr/lkey to big endien in advance to save cycles
 inline __device__ uint64_t BnxtPostReadWrite(WorkQueueHandle& wq, uint32_t curPostIdx,
                                              uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
-                                             uint32_t qpn, uintptr_t laddr, uint64_t lkey,
-                                             uintptr_t raddr, uint64_t rkey, size_t bytes,
-                                             bool signal, bool isRead) {
+                                             bool cqeSignal, uint32_t qpn, uintptr_t laddr,
+                                             uint64_t lkey, uintptr_t raddr, uint64_t rkey,
+                                             size_t bytes, bool isRead) {
   uint32_t opcode = isRead ? BNXT_RE_WR_OPCD_RDMA_READ : BNXT_RE_WR_OPCD_RDMA_WRITE;
-  uint8_t signalFlag = signal ? BNXT_RE_WR_FLAGS_SIGNALED : 0x00;
+  uint8_t signalFlag = cqeSignal ? BNXT_RE_WR_FLAGS_SIGNALED : 0x00;
   // In bnxt, wqeNum mean total sq slot num
   void* queueBuffAddr = wq.sqAddr;
   void* msntblAddr = wq.msntblAddr;
@@ -296,20 +281,23 @@ inline __device__ uint64_t BnxtPostReadWrite(WorkQueueHandle& wq, uint32_t curPo
 template <>
 inline __device__ uint64_t PostWrite<ProviderType::BNXT>(WorkQueueHandle& wq, uint32_t curPostIdx,
                                                          uint32_t curMsntblSlotIdx,
-                                                         uint32_t curPsnIdx, uint32_t qpn,
-                                                         uintptr_t laddr, uint64_t lkey,
-                                                         uintptr_t raddr, uint64_t rkey,
-                                                         size_t bytes, bool signal) {
-  return BnxtPostReadWrite(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, qpn, laddr, lkey, raddr,
-                           rkey, bytes, signal, false);
+                                                         uint32_t curPsnIdx, bool cqeSignal,
+                                                         uint32_t qpn, uintptr_t laddr,
+                                                         uint64_t lkey, uintptr_t raddr,
+                                                         uint64_t rkey, size_t bytes) {
+  return BnxtPostReadWrite(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, cqeSignal, qpn, laddr, lkey,
+                           raddr, rkey, bytes, false);
 }
 
 template <>
-inline __device__ uint64_t PostRead<ProviderType::BNXT>(
-    WorkQueueHandle& wq, uint32_t curPostIdx, uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
-    uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr, uint64_t rkey, size_t bytes) {
-  return BnxtPostReadWrite(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, qpn, laddr, lkey, raddr,
-                           rkey, bytes, true, true);
+inline __device__ uint64_t PostRead<ProviderType::BNXT>(WorkQueueHandle& wq, uint32_t curPostIdx,
+                                                        uint32_t curMsntblSlotIdx,
+                                                        uint32_t curPsnIdx, bool cqeSignal,
+                                                        uint32_t qpn, uintptr_t laddr,
+                                                        uint64_t lkey, uintptr_t raddr,
+                                                        uint64_t rkey, size_t bytes) {
+  return BnxtPostReadWrite(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, cqeSignal, qpn, laddr, lkey,
+                           raddr, rkey, bytes, true);
 }
 
 template <>
@@ -332,8 +320,8 @@ inline __device__ uint64_t PostWrite<ProviderType::BNXT>(WorkQueueHandle& wq, ui
   uint32_t curPsnIdx = wq.psnIdx;
   wq.psnIdx += psnCnt;
   ReleaseLock(&wq.postSendLock);
-  return BnxtPostReadWrite(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, qpn, laddr, lkey, raddr,
-                           rkey, bytes, true, false);
+  return BnxtPostReadWrite(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, true, qpn, laddr, lkey,
+                           raddr, rkey, bytes, false);
 }
 
 template <>
@@ -356,8 +344,8 @@ inline __device__ uint64_t PostRead<ProviderType::BNXT>(WorkQueueHandle& wq, uin
   uint32_t curPsnIdx = wq.psnIdx;
   wq.psnIdx += psnCnt;
   ReleaseLock(&wq.postSendLock);
-  return BnxtPostReadWrite(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, qpn, laddr, lkey, raddr,
-                           rkey, bytes, true, true);
+  return BnxtPostReadWrite(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, true, qpn, laddr, lkey,
+                           raddr, rkey, bytes, true);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -365,10 +353,11 @@ inline __device__ uint64_t PostRead<ProviderType::BNXT>(WorkQueueHandle& wq, uin
 /* ---------------------------------------------------------------------------------------------- */
 inline __device__ uint64_t BnxtPostWriteInline(WorkQueueHandle& wq, uint32_t curPostIdx,
                                                uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
-                                               uint32_t qpn, void* val, uintptr_t raddr,
-                                               uint64_t rkey, size_t bytes) {
+                                               bool cqeSignal, uint32_t qpn, void* val,
+                                               uintptr_t raddr, uint64_t rkey, size_t bytes) {
   // max is 16 * 13slot, use 1 slot now to align write/read
   assert(bytes <= BNXT_RE_SLOT_SIZE);
+  uint8_t signalFlag = cqeSignal ? BNXT_RE_WR_FLAGS_SIGNALED : 0x00;
   // In bnxt, wqeNum mean total sq slot num
   void* queueBuffAddr = wq.sqAddr;
   void* msntblAddr = wq.msntblAddr;
@@ -390,8 +379,7 @@ inline __device__ uint64_t BnxtPostWriteInline(WorkQueueHandle& wq, uint32_t cur
   assert((slotIdx + slotsNum) <= wqeNum);
 
   uint32_t wqe_size = BNXT_RE_HDR_WS_MASK & slotsNum;
-  uint32_t hdr_flags =
-      BNXT_RE_HDR_FLAGS_MASK & (BNXT_RE_WR_FLAGS_INLINE | BNXT_RE_WR_FLAGS_SIGNALED);
+  uint32_t hdr_flags = BNXT_RE_HDR_FLAGS_MASK & (BNXT_RE_WR_FLAGS_INLINE | signalFlag);
   uint32_t wqe_type = BNXT_RE_HDR_WT_MASK & BNXT_RE_WR_OPCD_RDMA_WRITE;
   hdr.rsv_ws_fl_wt =
       (wqe_size << BNXT_RE_HDR_WS_SHIFT) | (hdr_flags << BNXT_RE_HDR_FLAGS_SHIFT) | wqe_type;
@@ -430,9 +418,9 @@ inline __device__ uint64_t BnxtPostWriteInline(WorkQueueHandle& wq, uint32_t cur
 template <>
 inline __device__ uint64_t PostWriteInline<ProviderType::BNXT>(
     WorkQueueHandle& wq, uint32_t curPostIdx, uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
-    uint32_t qpn, void* val, uintptr_t raddr, uint64_t rkey, size_t bytes) {
-  return BnxtPostWriteInline(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, qpn, val, raddr, rkey,
-                             bytes);
+    bool cqeSignal, uint32_t qpn, void* val, uintptr_t raddr, uint64_t rkey, size_t bytes) {
+  return BnxtPostWriteInline(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, cqeSignal, qpn, val,
+                             raddr, rkey, bytes);
 }
 
 template <>
@@ -448,8 +436,8 @@ inline __device__ uint64_t PostWriteInline<ProviderType::BNXT>(WorkQueueHandle& 
   uint32_t curPsnIdx = wq.psnIdx;
   wq.psnIdx += 1;
   ReleaseLock(&wq.postSendLock);
-  return BnxtPostWriteInline(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, qpn, val, raddr, rkey,
-                             bytes);
+  return BnxtPostWriteInline(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, true, qpn, val, raddr,
+                             rkey, bytes);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -457,10 +445,12 @@ inline __device__ uint64_t PostWriteInline<ProviderType::BNXT>(WorkQueueHandle& 
 /* ---------------------------------------------------------------------------------------------- */
 inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t curPostIdx,
                                                 uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
-                                                uint32_t qpn, uintptr_t laddr, uint64_t lkey,
-                                                uintptr_t raddr, uint64_t rkey, void* val_1,
-                                                void* val_2, uint32_t bytes, atomicType amo_op) {
+                                                bool cqeSignal, uint32_t qpn, uintptr_t laddr,
+                                                uint64_t lkey, uintptr_t raddr, uint64_t rkey,
+                                                void* val_1, void* val_2, uint32_t bytes,
+                                                atomicType amo_op) {
   // In bnxt, wqeNum mean total sq slot num
+  uint8_t signalFlag = cqeSignal ? BNXT_RE_WR_FLAGS_SIGNALED : 0x00;
   void* queueBuffAddr = wq.sqAddr;
   void* msntblAddr = wq.msntblAddr;
   uint32_t wqeNum = wq.sqWqeNum;
@@ -521,7 +511,7 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
   }
 
   uint32_t wqe_size = BNXT_RE_HDR_WS_MASK & slotsNum;
-  uint32_t hdr_flags = BNXT_RE_HDR_FLAGS_MASK & BNXT_RE_WR_FLAGS_SIGNALED;
+  uint32_t hdr_flags = BNXT_RE_HDR_FLAGS_MASK & signalFlag;
   uint32_t wqe_type = BNXT_RE_HDR_WT_MASK & opcode;
   hdr.rsv_ws_fl_wt =
       (wqe_size << BNXT_RE_HDR_WS_SHIFT) | (hdr_flags << BNXT_RE_HDR_FLAGS_SHIFT) | wqe_type;
@@ -555,10 +545,10 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
 template <>
 inline __device__ uint64_t PostAtomic<ProviderType::BNXT>(
     WorkQueueHandle& wq, uint32_t curPostIdx, uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
-    uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr, uint64_t rkey, void* val_1,
-    void* val_2, uint32_t typeBytes, atomicType amo_op) {
-  return BnxtPrepareAtomicWqe(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, qpn, laddr, lkey, raddr,
-                              rkey, val_1, val_2, typeBytes, amo_op);
+    bool cqeSignal, uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr, uint64_t rkey,
+    void* val_1, void* val_2, uint32_t typeBytes, atomicType amo_op) {
+  return BnxtPrepareAtomicWqe(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, cqeSignal, qpn, laddr,
+                              lkey, raddr, rkey, val_1, val_2, typeBytes, amo_op);
 }
 
 template <>
@@ -576,33 +566,35 @@ inline __device__ uint64_t PostAtomic<ProviderType::BNXT>(WorkQueueHandle& wq, u
   uint32_t curPsnIdx = wq.psnIdx;
   wq.psnIdx += 1;
   ReleaseLock(&wq.postSendLock);
-  return BnxtPrepareAtomicWqe(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, qpn, laddr, lkey, raddr,
-                              rkey, val_1, val_2, typeBytes, amo_op);
+  return BnxtPrepareAtomicWqe(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, true, qpn, laddr, lkey,
+                              raddr, rkey, val_1, val_2, typeBytes, amo_op);
 }
 
-#define DEFINE_BNXT_POST_ATOMIC_SPEC(TYPE)                                                        \
-  template <>                                                                                     \
-  inline __device__ uint64_t PostAtomic<ProviderType::BNXT, TYPE>(                                \
-      WorkQueueHandle & wq, uint32_t curPostIdx, uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,   \
-      uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr, uint64_t rkey,               \
-      const TYPE val_1, const TYPE val_2, atomicType amo_op) {                                    \
-    return BnxtPrepareAtomicWqe(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, qpn, laddr, lkey,    \
-                                raddr, rkey, (void*)&val_1, (void*)&val_2, sizeof(TYPE), amo_op); \
-  }                                                                                               \
-  template <>                                                                                     \
-  inline __device__ uint64_t PostAtomic<ProviderType::BNXT, TYPE>(                                \
-      WorkQueueHandle & wq, uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,        \
-      uint64_t rkey, const TYPE val_1, const TYPE val_2, atomicType amo_op) {                     \
-    AcquireLock(&wq.postSendLock);                                                                \
-    uint32_t curPostIdx = wq.postIdx;                                                             \
-    wq.postIdx += 3;                                                                              \
-    uint32_t curMsntblSlotIdx = wq.msntblSlotIdx;                                                 \
-    wq.msntblSlotIdx += 1;                                                                        \
-    uint32_t curPsnIdx = wq.psnIdx;                                                               \
-    wq.psnIdx += 1;                                                                               \
-    ReleaseLock(&wq.postSendLock);                                                                \
-    return BnxtPrepareAtomicWqe(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, qpn, laddr, lkey,    \
-                                raddr, rkey, (void*)&val_1, (void*)&val_2, sizeof(TYPE), amo_op); \
+#define DEFINE_BNXT_POST_ATOMIC_SPEC(TYPE)                                                      \
+  template <>                                                                                   \
+  inline __device__ uint64_t PostAtomic<ProviderType::BNXT, TYPE>(                              \
+      WorkQueueHandle & wq, uint32_t curPostIdx, uint32_t curMsntblSlotIdx, uint32_t curPsnIdx, \
+      bool cqeSignal, uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,            \
+      uint64_t rkey, const TYPE val_1, const TYPE val_2, atomicType amo_op) {                   \
+    return BnxtPrepareAtomicWqe(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, cqeSignal, qpn,    \
+                                laddr, lkey, raddr, rkey, (void*)&val_1, (void*)&val_2,         \
+                                sizeof(TYPE), amo_op);                                          \
+  }                                                                                             \
+  template <>                                                                                   \
+  inline __device__ uint64_t PostAtomic<ProviderType::BNXT, TYPE>(                              \
+      WorkQueueHandle & wq, uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,      \
+      uint64_t rkey, const TYPE val_1, const TYPE val_2, atomicType amo_op) {                   \
+    AcquireLock(&wq.postSendLock);                                                              \
+    uint32_t curPostIdx = wq.postIdx;                                                           \
+    wq.postIdx += 3;                                                                            \
+    uint32_t curMsntblSlotIdx = wq.msntblSlotIdx;                                               \
+    wq.msntblSlotIdx += 1;                                                                      \
+    uint32_t curPsnIdx = wq.psnIdx;                                                             \
+    wq.psnIdx += 1;                                                                             \
+    ReleaseLock(&wq.postSendLock);                                                              \
+    return BnxtPrepareAtomicWqe(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, true, qpn, laddr,  \
+                                lkey, raddr, rkey, (void*)&val_1, (void*)&val_2, sizeof(TYPE),  \
+                                amo_op);                                                        \
   }
 
 DEFINE_BNXT_POST_ATOMIC_SPEC(uint32_t)
