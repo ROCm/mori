@@ -129,8 +129,8 @@ static __device__ __host__ const char* IbvWcStatusString(enum ibv_wc_status stat
   return wc_status_str[status];
 }
 
-// TODO: write a better version
-static __device__ __host__ void DumpWqe(void* wqeBaseAddr, uint32_t idx) {
+// TODO: write a better verison
+static __device__ __host__ void DumpMlx5Wqe(void* wqeBaseAddr, uint32_t idx) {
   uintptr_t wqeAddr = reinterpret_cast<uintptr_t>(wqeBaseAddr) + (idx << MLX5_SEND_WQE_SHIFT);
   mlx5_wqe_ctrl_seg* wqeCtrlSeg = reinterpret_cast<mlx5_wqe_ctrl_seg*>(wqeAddr);
   uint32_t opmodIdxOpCode = BE32TOH(wqeCtrlSeg->opmod_idx_opcode);
