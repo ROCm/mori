@@ -1,0 +1,44 @@
+#pragma once
+
+#include <hip/hip_bfloat16.h>
+#include <hip/hip_fp8.h>
+#include <hip/library_types.h>
+#include <torch/torch.h>
+
+namespace mori {
+
+template <typename T>
+inline torch::Dtype GetTorchDataType() {
+  if constexpr (std::is_same_v<T, float>) {
+    return torch::kFloat32;
+  } else if constexpr (std::is_same_v<T, uint32_t>) {
+    return torch::kUInt32;
+  } else if constexpr (std::is_same_v<T, int32_t>) {
+    return torch::kInt32;
+  } else if constexpr (std::is_same_v<T, size_t>) {
+    return torch::kUInt64;
+  } else if constexpr (std::is_same_v<T, uint64_t>) {
+    return torch::kUInt64;
+  } else if constexpr (std::is_same_v<T, hip_bfloat16>) {
+    return torch::kBFloat16;
+  } else if constexpr (std::is_same_v<T, __hip_fp8_e4m3_fnuz>) {
+    return torch::kFloat8_e4m3fnuz;
+  } else {
+    static_assert(false, "Unsupported data type");
+  }
+}
+
+inline hipDataType ScalarTypeToHipDataType(at::ScalarType scalarType) {
+  switch (scalarType) {
+    case at::kFloat:
+      return HIP_R_32F;
+    case at::kBFloat16:
+      return HIP_R_16BF;
+    case at::kFloat8_e4m3fnuz:
+      return HIP_R_8F_E4M3_FNUZ;
+    default:
+      throw std::runtime_error("Unsupported scalar type");
+  }
+}
+
+}  // namespace mori

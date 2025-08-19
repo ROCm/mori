@@ -1,0 +1,49 @@
+#pragma once
+
+#include <mpi.h>
+
+#include "mori/application/application.hpp"
+
+namespace mori {
+namespace shmem {
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                         Initialization                                         */
+/* ---------------------------------------------------------------------------------------------- */
+
+// TODO: provide unified initialize / finalize APIs
+int ShmemInit(application::BootstrapNetwork* bootNet);
+int ShmemMpiInit(MPI_Comm);
+int ShmemTorchProcessGroupInit(const std::string& groupName);
+int ShmemFinalize();
+
+int ShmemMyPe();
+int ShmemNPes();
+
+enum ShmemTeamType {
+  INVALID = -1,
+  WORLD = 0,
+  SHARED = 1,
+  TEAM_NODE = 2,
+};
+
+// TODO: finish team pe api
+// int ShmemTeamMyPe(ShmemTeamType);
+// int ShmemTeamNPes(ShmemTeamType);
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                        Symmetric Memory                                        */
+/* ---------------------------------------------------------------------------------------------- */
+
+void* ShmemMalloc(size_t size);
+void* ShmemExtMallocWithFlags(size_t size, unsigned int flags);
+void ShmemFree(void*);
+
+// Note: temporary API for testing
+application::SymmMemObjPtr ShmemQueryMemObjPtr(void*);
+
+int ShmemBufferRegister(void* ptr, size_t size);
+int ShmemBufferDeregister(void* ptr, size_t size);
+
+}  // namespace shmem
+}  // namespace mori
