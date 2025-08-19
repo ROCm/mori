@@ -8,6 +8,7 @@ RUN apt-get update && \
     openmpi-bin \
     libopenmpi-dev \
     libpci-dev \
+    libmsgpack-dev \
     cmake \
     libdw1 \
     locales

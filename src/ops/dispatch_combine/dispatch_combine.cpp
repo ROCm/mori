@@ -137,7 +137,7 @@ void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
 }
 
 void EpDispatchCombineHandle::IntializeBarrier() {
-  size_t barrierSize = config.worldSize * sizeof(uint32_t);
+  size_t barrierSize = (config.worldSize + 1) * sizeof(uint32_t);
   HIP_RUNTIME_CHECK(hipMalloc(&dispatchGridBarrier, barrierSize));
   HIP_RUNTIME_CHECK(hipMemset(dispatchGridBarrier, 0, barrierSize));
   HIP_RUNTIME_CHECK(hipMalloc(&combineGridBarrier, barrierSize));
