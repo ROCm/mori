@@ -8,6 +8,7 @@
 #include <thread>
 #include <vector>
 
+#include "mori/application/topology/topology.hpp"
 #include "mori/application/transport/tcp/tcp.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/io/backend.hpp"
@@ -121,14 +122,15 @@ class RdmaManager {
 
   // Local memory management APIs
   std::optional<application::RdmaMemoryRegion> GetLocalMemory(int ldevId, MemoryUniqueId);
-  application::RdmaMemoryRegion RegisterLocalMemory(int ldevId, MemoryDesc& desc);
-  void DeregisterLocalMemory(int ldevId, MemoryDesc& desc);
+  application::RdmaMemoryRegion RegisterLocalMemory(int ldevId, const MemoryDesc& desc);
+  void DeregisterLocalMemory(int ldevId, const MemoryDesc& desc);
 
   // Remote memory management APIs
-  std::optional<application::RdmaMemoryRegion> GetRemoteMemory(EngineKey, int rdevId,
+  std::optional<application::RdmaMemoryRegion> GetRemoteMemory(EngineKey, int remRdmaDevId,
                                                                MemoryUniqueId);
-  void RegisterRemoteMemory(EngineKey, int rdevId, MemoryUniqueId, application::RdmaMemoryRegion);
-  void DeregisterRemoteMemory(EngineKey, int rdevId, MemoryUniqueId);
+  void RegisterRemoteMemory(EngineKey, int remRdmaDevId, MemoryUniqueId,
+                            application::RdmaMemoryRegion);
+  void DeregisterRemoteMemory(EngineKey, int remRdmaDevId, MemoryUniqueId);
 
   // Endpoint management APIs
   int CountEndpoint(EngineKey, TopoKeyPair);
@@ -138,7 +140,6 @@ class RdmaManager {
                        application::RdmaEndpointHandle remote, TopoKeyPair key, int weight);
   std::optional<EpPair> GetEpPairByQpn(uint32_t qpn);
 
-  //
   application::RdmaDeviceContext* GetRdmaDeviceContext(int devId);
 
  private:
@@ -154,6 +155,8 @@ class RdmaManager {
   MemoryTable mTable;
   std::unordered_map<EngineKey, RemoteEngineMeta> remotes;
   std::unordered_map<uint32_t, EpPair> epsMap;
+
+  std::unique_ptr<application::TopoSystem> topo{nullptr};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -187,7 +190,7 @@ class NotifManager {
     application::RdmaMemoryRegion mr;
   };
 
-  uint32_t maxNotifNum{1024};
+  uint32_t maxNotifNum{8192};
   std::unordered_map<int, DeviceNotifContext> notifCtx;
   std::unordered_map<EngineKey, std::unordered_set<TransferUniqueId>> notifPool;
 };
@@ -237,6 +240,32 @@ class ControlPlaneServer {
 };
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                                       RdmaBackendSession                                       */
+/* ---------------------------------------------------------------------------------------------- */
+class RdmaBackendSession : public BackendSession {
+ public:
+  RdmaBackendSession() = default;
+  RdmaBackendSession(const application::RdmaMemoryRegion& local,
+                     const application::RdmaMemoryRegion& remote, const EpPair& eps);
+  ~RdmaBackendSession() = default;
+
+  void Read(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
+            TransferUniqueId id);
+  void Write(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
+             TransferUniqueId id);
+
+  void BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets, const SizeVec& sizes,
+                 TransferStatus* status, TransferUniqueId id);
+
+  bool Alive() const;
+
+ private:
+  application::RdmaMemoryRegion local{};
+  application::RdmaMemoryRegion remote{};
+  EpPair eps{};
+};
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                           RdmaBackend                                          */
 /* ---------------------------------------------------------------------------------------------- */
 
@@ -247,22 +276,27 @@ class RdmaBackend : public Backend {
 
   void RegisterRemoteEngine(const EngineDesc&);
   void DeregisterRemoteEngine(const EngineDesc&);
-  void RegisterMemory(MemoryDesc& desc);
-  void DeregisterMemory(MemoryDesc& desc);
-  void Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remoteSrc, size_t remoteOffset,
-            size_t size, TransferStatus* status, TransferUniqueId id);
-  void Write(MemoryDesc localSrc, size_t localOffset, MemoryDesc remoteDest, size_t remoteOffset,
-             size_t size, TransferStatus* status, TransferUniqueId id);
+  void RegisterMemory(const MemoryDesc& desc);
+  void DeregisterMemory(const MemoryDesc& desc);
+  void Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
+            size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id);
+  void Write(const MemoryDesc& localSrc, size_t localOffset, const MemoryDesc& remoteDest,
+             size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id);
+  void BatchRead(const MemoryDesc& localDest, const SizeVec& localOffsets,
+                 const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets, const SizeVec& sizes,
+                 TransferStatus* status, TransferUniqueId id);
+
+  BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
 
  private:
-  void RdmaNotifyTransfer(const application::RdmaEndpoint& ep, TransferStatus* status,
-                          TransferUniqueId id);
+  void CreateSession(const MemoryDesc& local, const MemoryDesc& remote, RdmaBackendSession& sess);
 
  private:
   std::unique_ptr<RdmaManager> rdma;
   std::unique_ptr<NotifManager> notif;
   std::unique_ptr<ControlPlaneServer> server;
+  std::vector<std::unique_ptr<RdmaBackendSession>> sessions;
 };
 
 }  // namespace io

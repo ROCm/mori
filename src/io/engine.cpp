@@ -5,6 +5,45 @@
 namespace mori {
 namespace io {
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                         IOEngineSession                                        */
+/* ---------------------------------------------------------------------------------------------- */
+TransferUniqueId IOEngineSession::AllocateTransferUniqueId() {
+  return engine->AllocateTransferUniqueId();
+}
+
+void IOEngineSession::Read(size_t localOffset, size_t remoteOffset, size_t size,
+                           TransferStatus* status, TransferUniqueId id) {
+  for (auto& it : backendSess) {
+    return it.second->Read(localOffset, remoteOffset, size, status, id);
+  }
+}
+
+void IOEngineSession::Write(size_t localOffset, size_t remoteOffset, size_t size,
+                            TransferStatus* status, TransferUniqueId id) {
+  for (auto& it : backendSess) {
+    return it.second->Write(localOffset, remoteOffset, size, status, id);
+  }
+}
+
+void IOEngineSession::BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                                const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
+  for (auto& it : backendSess) {
+    return it.second->BatchRead(localOffsets, remoteOffsets, sizes, status, id);
+  }
+}
+
+bool IOEngineSession::Alive() {
+  for (auto& it : backendSess) {
+    if (it.second->Alive()) return true;
+  }
+  return false;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                            IOEngine                                            */
+/* ---------------------------------------------------------------------------------------------- */
+
 IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
   // Initialize descriptor
   desc.key = key;
@@ -44,7 +83,7 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryL
   memDesc.engineKey = desc.key;
   memDesc.id = nextMemUid.fetch_add(1, std::memory_order_relaxed);
   memDesc.deviceId = device;
-  memDesc.data = data;
+  memDesc.data = reinterpret_cast<uintptr_t>(data);
   memDesc.size = size;
   memDesc.loc = loc;
 
@@ -56,7 +95,7 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryL
   return memDesc;
 }
 
-void IOEngine::DeregisterMemory(MemoryDesc& desc) {
+void IOEngine::DeregisterMemory(const MemoryDesc& desc) {
   for (auto& it : backends) {
     it.second->DeregisterMemory(desc);
   }
@@ -67,19 +106,39 @@ TransferUniqueId IOEngine::AllocateTransferUniqueId() {
   return nextTransferUid.fetch_add(1, std::memory_order_relaxed);
 }
 
-void IOEngine::Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remoteSrc,
+void IOEngine::Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
                     size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id) {
   for (auto& it : backends) {
     return it.second->Read(localDest, localOffset, remoteSrc, remoteOffset, size, status, id);
   }
 }
 
-void IOEngine::Write(MemoryDesc localSrc, size_t localOffset, MemoryDesc remoteDest,
+void IOEngine::Write(const MemoryDesc& localSrc, size_t localOffset, const MemoryDesc& remoteDest,
                      size_t remoteOffset, size_t size, TransferStatus* status,
                      TransferUniqueId id) {
   for (auto& it : backends) {
     return it.second->Write(localSrc, localOffset, remoteDest, remoteOffset, size, status, id);
   }
+}
+
+void IOEngine::BatchRead(const MemoryDesc& localDest, const SizeVec& localOffsets,
+                         const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
+                         const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
+  for (auto& it : backends) {
+    return it.second->BatchRead(localDest, localOffsets, remoteSrc, remoteOffsets, sizes, status,
+                                id);
+  }
+}
+
+IOEngineSession* IOEngine::CreateSession(const MemoryDesc& local, const MemoryDesc& remote) {
+  IOEngineSession* sess = new IOEngineSession{};
+  sess->engine = this;
+  for (auto& it : backends) {
+    BackendSession* bsess = it.second->CreateSession(local, remote);
+    sess->backendSess.insert({it.first, bsess});
+  }
+  sessions.emplace_back(sess);
+  return sess;
 }
 
 bool IOEngine::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,

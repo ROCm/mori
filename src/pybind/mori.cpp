@@ -5,6 +5,7 @@
 #include <hip/hip_fp8.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <torch/python.h>
 
 #include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
@@ -305,7 +306,26 @@ void RegisterMoriIo(pybind11::module_& m) {
                                return reinterpret_cast<uintptr_t>(desc.data);
                              })
       .def_readonly("size", &mori::io::MemoryDesc::size)
-      .def_readonly("loc", &mori::io::MemoryDesc::loc);
+      .def_readonly("loc", &mori::io::MemoryDesc::loc)
+      .def(pybind11::self == pybind11::self)
+      .def("pack",
+           [](const mori::io::MemoryDesc& d) {
+             msgpack::sbuffer buf;
+             msgpack::pack(buf, d);
+             return py::bytes(buf.data(), buf.size());
+           })
+      .def_static("unpack", [](const py::bytes& b) {
+        Py_ssize_t len = PyBytes_Size(b.ptr());
+        const char* data = PyBytes_AsString(b.ptr());
+        auto out = msgpack::unpack(data, len);
+        return out.get().as<mori::io::MemoryDesc>();
+      });
+
+  py::class_<mori::io::IOEngineSession>(m, "IOEngineSession")
+      .def("AllocateTransferUniqueId", &mori::io ::IOEngineSession::AllocateTransferUniqueId)
+      .def("Read", &mori::io ::IOEngineSession::Read)
+      .def("BatchRead", &mori::io ::IOEngineSession::BatchRead)
+      .def("Alive", &mori::io ::IOEngineSession::Alive);
 
   py::class_<mori::io::IOEngine>(m, "IOEngine")
       .def(py::init<const mori::io::EngineKey&, const mori::io::IOEngineConfig&>())
@@ -318,6 +338,8 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("DeregisterMemory", &mori::io ::IOEngine::DeregisterMemory)
       .def("AllocateTransferUniqueId", &mori::io ::IOEngine::AllocateTransferUniqueId)
       .def("Read", &mori::io ::IOEngine::Read)
+      .def("BatchRead", &mori::io ::IOEngine::BatchRead)
+      .def("CreateSession", &mori::io::IOEngine::CreateSession, py::return_value_policy::reference)
       .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus);
 }
 

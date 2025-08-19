@@ -9,6 +9,33 @@ import mori
 import traceback
 
 
+str_to_dtype = {
+    "float32": torch.float32,
+    "float": torch.float32,
+    "float64": torch.float64,
+    "double": torch.float64,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "half": torch.float16,
+    "int8": torch.int8,
+    "int16": torch.int16,
+    "short": torch.int16,
+    "int32": torch.int32,
+    "int": torch.int32,
+    "int64": torch.int64,
+    "long": torch.int64,
+    "uint8": torch.uint8,
+    "bool": torch.bool,
+}
+
+
+def string_to_dtype(s):
+    s = s.lower()
+    if s not in str_to_dtype:
+        raise ValueError(f"Unknown dtype string: {s}")
+    return str_to_dtype[s]
+
+
 def get_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
@@ -16,18 +43,28 @@ def get_free_port():
 
 
 class TorchDistContext:
-    def __init__(self, rank, world_size, master_addr="localhost", master_port="12335"):
+    def __init__(
+        self,
+        rank,
+        world_size,
+        master_addr="localhost",
+        master_port="12335",
+        device_id=None,
+    ):
         self.rank = rank
         self.world_size = world_size
         self.master_addr = master_addr
         self.master_port = master_port
+        self.device_id = device_id if device_id is not None else self.rank
 
     def __enter__(self):
-        os.environ["MASTER_ADDR"] = self.master_addr
-        os.environ["MASTER_PORT"] = str(self.master_port)
+        if self.master_addr is not None:
+            os.environ["MASTER_ADDR"] = self.master_addr
+        if self.master_port is not None:
+            os.environ["MASTER_PORT"] = str(self.master_port)
 
-        torch.cuda.set_device(self.rank)
-        device = torch.device("cuda", self.rank)
+        torch.cuda.set_device(self.device_id)
+        device = torch.device("cuda", self.device_id)
 
         dist.init_process_group(
             backend="cpu:gloo,cuda:nccl",

@@ -50,14 +50,13 @@ struct EngineDesc {
   std::string hostname;
   std::string host;
   int port;
-  BackendDescBlobMap backendDescs;
 
   constexpr bool operator==(const EngineDesc& rhs) const noexcept {
     return (key == rhs.key) && (hostname == rhs.hostname) && (host == rhs.host) &&
-           (port == rhs.port) && (backendDescs == rhs.backendDescs);
+           (port == rhs.port);
   }
 
-  MSGPACK_DEFINE(key, hostname, host, port, backendDescs);
+  MSGPACK_DEFINE(key, hostname, host, port);
 };
 
 using MemoryUniqueId = uint32_t;
@@ -66,12 +65,16 @@ struct MemoryDesc {
   EngineKey engineKey;
   MemoryUniqueId id{0};
   int deviceId{-1};
-  void* data{nullptr};
+  uintptr_t data{0};
   size_t size{0};
   MemoryLocationType loc;
-  BackendDescBlobMap backendDescs;
 
-  MSGPACK_DEFINE(engineKey, id, deviceId, size, loc, backendDescs);
+  constexpr bool operator==(const MemoryDesc& rhs) const noexcept {
+    return (engineKey == rhs.engineKey) && (id == rhs.id) && (deviceId == rhs.deviceId) &&
+           (data == rhs.data) && (size == rhs.size) && (loc == rhs.loc);
+  }
+
+  MSGPACK_DEFINE(engineKey, id, deviceId, data, size, loc);
 };
 
 using TransferUniqueId = uint64_t;
@@ -91,6 +94,8 @@ struct TransferStatus {
   std::atomic<StatusCode> code{StatusCode::INIT};
   std::string msg;
 };
+
+using SizeVec = std::vector<size_t>;
 
 }  // namespace io
 }  // namespace mori

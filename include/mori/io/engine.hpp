@@ -21,6 +21,33 @@ struct IOEngineConfig {
   uint16_t port;
 };
 
+class IOEngine;
+
+// This is a low latency session between a pair of memory descriptor, it caches
+// necessary meta data to avoid the overhead of
+class IOEngineSession {
+ public:
+  ~IOEngineSession() = default;
+
+  TransferUniqueId AllocateTransferUniqueId();
+  void Read(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
+            TransferUniqueId id);
+  void Write(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
+             TransferUniqueId id);
+
+  void BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets, const SizeVec& sizes,
+                 TransferStatus* status, TransferUniqueId id);
+  bool Alive();
+
+  friend class IOEngine;
+
+ protected:
+  IOEngineSession() = default;
+
+  IOEngine* engine{nullptr};
+  std::unordered_map<BackendType, BackendSession*> backendSess;
+};
+
 class IOEngine {
  public:
   IOEngine(EngineKey, IOEngineConfig);
@@ -35,16 +62,23 @@ class IOEngine {
   void DeregisterRemoteEngine(const EngineDesc&);
 
   MemoryDesc RegisterMemory(void* data, size_t size, int device, MemoryLocationType loc);
-  void DeregisterMemory(MemoryDesc& desc);
+  void DeregisterMemory(const MemoryDesc& desc);
 
   TransferUniqueId AllocateTransferUniqueId();
-  void Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remoteSrc, size_t remoteOffset,
-            size_t size, TransferStatus* status, TransferUniqueId id);
-  void Write(MemoryDesc localSrc, size_t localOffset, MemoryDesc remoteDest, size_t remoteOffset,
-             size_t size, TransferStatus* status, TransferUniqueId id);
+  void Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
+            size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id);
+  void Write(const MemoryDesc& localSrc, size_t localOffset, const MemoryDesc& remoteDest,
+             size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id);
+
+  void BatchRead(const MemoryDesc& localDest, const SizeVec& localOffsets,
+                 const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets, const SizeVec& sizes,
+                 TransferStatus* status, TransferUniqueId id);
 
   // Take the transfer status of an inbound op
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
+
+  IOEngineSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
+  void DestroySession(IOEngineSession*);
 
  public:
   // Config and descriptors
@@ -56,6 +90,7 @@ class IOEngine {
   std::atomic<uint32_t> nextMemUid{0};
   std::unordered_map<MemoryUniqueId, MemoryDesc> memPool;
   std::unordered_map<BackendType, std::unique_ptr<Backend>> backends;
+  std::vector<std::unique_ptr<IOEngineSession>> sessions;
 };
 
 }  // namespace io
