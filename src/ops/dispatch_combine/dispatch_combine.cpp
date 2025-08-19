@@ -53,6 +53,10 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   shmemInpTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
   shmemOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
   shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
+  const size_t prefixSize = config.worldSize * sizeof(index_t);
+  const size_t syncSize = config.worldSize * sizeof(index_t);
+  shmemMetaDataMemObj =
+      ShmemMallocAndReturnMemObjPtr(prefixSize + syncSize, hipDeviceMallocUncached);
 
   size_t maxWeightSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(float);
   shmemInpWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
@@ -73,6 +77,7 @@ void EpDispatchCombineHandle::FinalizeShmemBuf() {
   ShmemFree(shmemInpTokMemObj->localPtr);
   ShmemFree(shmemOutTokMemObj->localPtr);
   ShmemFree(shmemStagingTokMemObj->localPtr);
+  ShmemFree(shmemMetaDataMemObj->localPtr);
   ShmemFree(shmemInpWeightsMemObj->localPtr);
   ShmemFree(shmemOutWeightsMemObj->localPtr);
   if (shmemInpScalesMemObj.IsValid()) ShmemFree(shmemInpScalesMemObj->localPtr);
@@ -107,8 +112,8 @@ void EpDispatchCombineHandle::IntializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipMalloc(&destPeTokenIdxMap, maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(destPeTokenIdxMap, -1, maxNumOutToken * sizeof(index_t)));
 
-  HIP_RUNTIME_CHECK(hipMalloc(&srcPeTokenIdxMap, maxNumOutToken * sizeof(index_t)));
-  HIP_RUNTIME_CHECK(hipMemset(srcPeTokenIdxMap, -1, maxNumOutToken * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMalloc(&recvTokenOffset, config.worldSize * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMemset(recvTokenOffset, 0, config.worldSize * sizeof(index_t)));
 
   HIP_RUNTIME_CHECK(hipMalloc(&destPeTokenCounter, config.worldSize * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(destPeTokenCounter, 0, config.worldSize * sizeof(index_t)));
@@ -128,7 +133,7 @@ void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipFree(dispReceiverIdxMap));
   HIP_RUNTIME_CHECK(hipFree(dispSenderIdxMap));
   HIP_RUNTIME_CHECK(hipFree(destPeTokenIdxMap));
-  HIP_RUNTIME_CHECK(hipFree(srcPeTokenIdxMap));
+  HIP_RUNTIME_CHECK(hipFree(recvTokenOffset));
   HIP_RUNTIME_CHECK(hipFree(destPeTokenCounter));
   HIP_RUNTIME_CHECK(hipFree(localPeTokenCounter));
   ShmemFree(dispTokOffsetMemObj->localPtr);

@@ -155,6 +155,7 @@ class EpDispatchCombineHandle {
   mori::application::SymmMemObjPtr shmemInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
   mori::application::SymmMemObjPtr shmemStagingTokMemObj;
+  mori::application::SymmMemObjPtr shmemMetaDataMemObj;
 
   // Registered buffer used for weights, indices and scales
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
@@ -184,7 +185,7 @@ class EpDispatchCombineHandle {
   index_t* destPeTokenIdxMap{nullptr};
   // Map output buffer index to combine input token index, saved at dispatch recv phase and used at
   // combine send phase
-  index_t* srcPeTokenIdxMap{nullptr};
+  index_t* recvTokenOffset{nullptr};
 
   // Count the number of tokens sent to destination pe
   index_t* destPeTokenCounter{nullptr};
@@ -213,6 +214,7 @@ struct EpDispatchCombineArgs {
   mori::application::SymmMemObjPtr shmemInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
   mori::application::SymmMemObjPtr shmemStagingTokMemObj;
+  mori::application::SymmMemObjPtr shmemMetaDataMemObj;
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
   mori::application::SymmMemObjPtr shmemOutWeightsMemObj;
   mori::application::SymmMemObjPtr shmemInpScalesMemObj;
@@ -228,7 +230,7 @@ struct EpDispatchCombineArgs {
   index_t* dispReceiverIdxMap{nullptr};
   index_t* dispSenderIdxMap{nullptr};
   index_t* destPeTokenIdxMap{nullptr};
-  index_t* srcPeTokenIdxMap{nullptr};
+  index_t* recvTokenOffset{nullptr};
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
   index_t* dispDestTokIdMap{nullptr};
@@ -256,6 +258,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.shmemInpTokMemObj = handle.shmemInpTokMemObj;
   args.shmemOutTokMemObj = handle.shmemOutTokMemObj;
   args.shmemStagingTokMemObj = handle.shmemStagingTokMemObj;
+  args.shmemMetaDataMemObj = handle.shmemMetaDataMemObj;
   args.shmemInpWeightsMemObj = handle.shmemInpWeightsMemObj;
   args.shmemOutWeightsMemObj = handle.shmemOutWeightsMemObj;
   args.shmemInpScalesMemObj = handle.shmemInpScalesMemObj;
@@ -269,7 +272,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.dispReceiverIdxMap = handle.dispReceiverIdxMap;
   args.dispSenderIdxMap = handle.dispSenderIdxMap;
   args.destPeTokenIdxMap = handle.destPeTokenIdxMap;
-  args.srcPeTokenIdxMap = handle.srcPeTokenIdxMap;
+  args.recvTokenOffset = handle.recvTokenOffset;
   args.dispTokOffsetMemObj = handle.dispTokOffsetMemObj;
   args.dispTokIdToSrcTokIdMemObj = handle.dispTokIdToSrcTokIdMemObj;
   args.dispDestTokIdMap = handle.dispDestTokIdMap;
