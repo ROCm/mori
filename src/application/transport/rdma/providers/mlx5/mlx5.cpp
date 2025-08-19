@@ -154,7 +154,9 @@ void Mlx5QpContainer::ComputeQueueAttrs(const RdmaEndpointConfig& config) {
   qpTotalSize = RoundUpPowOfTwo(rqAttrs.wqSize + sqAttrs.wqSize);
   qpTotalSize = (qpTotalSize + config.alignment - 1) / config.alignment * config.alignment;
 
+#if DEBUG == 1
   std::cout << "rq[ " << rqAttrs << "] sq[ " << sqAttrs << "]" << std::endl;
+#endif
 }
 
 void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {

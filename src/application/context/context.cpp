@@ -63,28 +63,42 @@ void Context::IntializePossibleTransports() {
   }
 
   // Match gpu and nic
-  int deviceId = -1;
-  HIP_RUNTIME_CHECK(hipGetDevice(&deviceId));
-  topo.reset(new TopoSystem());
-  std::string nicName = topo->MatchGpuAndNic(deviceId);
-
-  int portId;
+  const char* disableTopo = std::getenv("MORI_DISABLE_TOPO");
+  int portId = -1;
+  int devicePortId = -1;
   RdmaDevice* device = nullptr;
-  for (int i = 0; i < activeDevicePortList.size(); i++) {
-    auto& dp = activeDevicePortList[i];
-    if (dp.first->Name() != nicName) continue;
-    device = dp.first;
-    portId = activeDevicePortList[i].second;
-    rdmaDeviceContext.reset(device->CreateRdmaDeviceContext());
 
-    std::cout << "rank " << LocalRank() << " rankInNode " << rankInNode << " select device "
-              << "[" << i << "] " << device->Name() << std::endl;
-    break;
+  if (disableTopo) {
+    std::cout << "MORI Topology detection is disabled, use static matching" << std::endl;
+    if (!activeDevicePortList.empty()) {
+      devicePortId = (rankInNode % activeDevicePortList.size());
+      device = activeDevicePortList[devicePortId].first;
+      portId = activeDevicePortList[devicePortId].second;
+      rdmaDeviceContext.reset(device->CreateRdmaDeviceContext());
+    }
+  } else {
+    int deviceId = -1;
+    HIP_RUNTIME_CHECK(hipGetDevice(&deviceId));
+    topo.reset(new TopoSystem());
+    std::string nicName = topo->MatchGpuAndNic(deviceId);
+
+    for (int i = 0; i < activeDevicePortList.size(); i++) {
+      auto& dp = activeDevicePortList[i];
+      if (dp.first->Name() != nicName) continue;
+      device = dp.first;
+      portId = activeDevicePortList[i].second;
+      rdmaDeviceContext.reset(device->CreateRdmaDeviceContext());
+      devicePortId = i;
+      break;
+    }
   }
 
   if (device == nullptr) {
     std::cout << "rank " << LocalRank() << " rankInNode " << rankInNode << " select no device"
               << std::endl;
+  } else {
+    std::cout << "rank " << LocalRank() << " rankInNode " << rankInNode << " select device "
+              << "[" << devicePortId << "] " << device->Name() << std::endl;
   }
 
   // Intialize transport

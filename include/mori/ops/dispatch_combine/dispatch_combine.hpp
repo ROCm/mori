@@ -37,7 +37,7 @@ inline size_t GetHipDataTypeSize(hipDataType dtype) {
     case HIP_R_32F:
       return sizeof(float);
     case HIP_R_16BF:
-      return sizeof(__hip_bfloat16);
+      return sizeof(hip_bfloat16);
     case HIP_R_8F_E4M3_FNUZ:
       return sizeof(__hip_fp8_e4m3_fnuz);
     default:
@@ -238,7 +238,7 @@ struct EpDispatchCombineArgs {
 };
 
 using EpDispatchCombineArgsVariant =
-    std::variant<EpDispatchCombineArgs<float>, EpDispatchCombineArgs<__hip_bfloat16>,
+    std::variant<EpDispatchCombineArgs<float>, EpDispatchCombineArgs<hip_bfloat16>,
                  EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> >;
 
 template <typename T>
@@ -285,7 +285,7 @@ inline EpDispatchCombineArgsVariant GetEpDispatchCombineArgsByInputType(
     case HIP_R_32F:
       return GetEpDispatchCombineArgs<float>(handle);
     case HIP_R_16BF:
-      return GetEpDispatchCombineArgs<__hip_bfloat16>(handle);
+      return GetEpDispatchCombineArgs<hip_bfloat16>(handle);
     case HIP_R_8F_E4M3_FNUZ:
       return GetEpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>(handle);
     default:

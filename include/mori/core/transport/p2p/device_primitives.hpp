@@ -208,39 +208,40 @@ inline __device__ void WarpCopyImpl(T* dst, const T* src, size_t& offset, size_t
   }
 }
 
-// template <typename T, int Unroll = 1>
-// inline __device__ void WarpCopy(T* dst, const T* src, size_t nelems) {
-//   int laneId = threadIdx.x & (warpSize - 1);
-
-//   size_t offset = 0;
-//   WarpCopyImpl<T, Unroll>(dst, src, offset, nelems);
-//   if constexpr (Unroll > 1) {
-//     WarpCopyImpl<T, 1>(dst, src, offset, nelems);
-//   }
-
-//   while (offset + laneId < nelems) {
-//     dst[offset] = src[offset];
-//     offset += warpSize;
-//   }
-// }
-
-template <typename T>
-inline __device__ void WarpCopy(T* dst, T* src, size_t nelems) {
-  constexpr int vecSize = 16 / sizeof(T);
+template <typename T, int Unroll = 1>
+inline __device__ void WarpCopy(T* dst, const T* src, size_t nelems) {
   int laneId = threadIdx.x & (warpSize - 1);
-  int offset = laneId * vecSize;
 
-  while ((offset + vecSize) <= nelems) {
-    reinterpret_cast<uint4*>(dst + offset)[0] = reinterpret_cast<uint4*>(src + offset)[0];
-    offset += warpSize * vecSize;
+  size_t offset = 0;
+  WarpCopyImpl<T, Unroll>(dst, src, offset, nelems);
+  if constexpr (Unroll > 1) {
+    WarpCopyImpl<T, 1>(dst, src, offset, nelems);
   }
 
-  offset = offset - laneId * vecSize + laneId;
+  offset += laneId;
   while (offset < nelems) {
     dst[offset] = src[offset];
     offset += warpSize;
   }
 }
+
+// template <typename T>
+// inline __device__ void WarpCopy(T* dst, T* src, size_t nelems) {
+//   constexpr int vecSize = 16 / sizeof(T);
+//   int laneId = threadIdx.x & (warpSize - 1);
+//   int offset = laneId * vecSize;
+
+//   while ((offset + vecSize) <= nelems) {
+//     reinterpret_cast<uint4*>(dst + offset)[0] = reinterpret_cast<uint4*>(src + offset)[0];
+//     offset += warpSize * vecSize;
+//   }
+
+//   offset = offset - laneId * vecSize + laneId;
+//   while (offset < nelems) {
+//     dst[offset] = src[offset];
+//     offset += warpSize;
+//   }
+// }
 
 template <typename T, int N>
 inline __device__ void WarpCopy(T* dst, T* src) {
@@ -533,7 +534,8 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
   WarpAccumImpl<T, VecBytes, AccumNum>(dest, srcs, srcScales, offset, nelems);
 
   // remaining size
-  while (offset + laneId < nelems) {
+  offset += laneId;
+  while (offset < nelems) {
     float accumValFp32 = 0;
 #pragma unroll AccumNum
     for (int i = 0; i < AccumNum; ++i) {
@@ -541,9 +543,9 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
       if (srcPtr == nullptr) continue;
 
       float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
-      accumValFp32 += float(srcPtr[offset + laneId]) * srcScale;
+      accumValFp32 += float(srcPtr[offset]) * srcScale;
     }
-    dest[offset + laneId] = T(accumValFp32);
+    dest[offset] = T(accumValFp32);
     offset += warpSize;
   }
 }
