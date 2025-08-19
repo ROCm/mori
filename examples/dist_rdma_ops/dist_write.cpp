@@ -245,12 +245,6 @@ __global__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
       UpdateSendDbrRecord<P>(wqHandle->dbrRecAddr, warp_sq_counter + num_wqes);
       // __threadfence_system();
       RingDoorbell<P>(wqHandle->dbrAddr, dbr_val);
-      // TODO: BNXT seems need some latency to process dbr hdr
-      //       use workaround which using read-back and sleep now.
-      if constexpr (P == ProviderType::BNXT) {
-        uint64_t currentVal = *reinterpret_cast<volatile uint64_t*>(wqHandle->dbrAddr);
-        __builtin_amdgcn_s_sleep(125);
-      }
 
       __hip_atomic_fetch_add(&cqHandle->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       __hip_atomic_store(&wqHandle->dbTouchIdx, warp_sq_counter + num_wqes * num_slot_per_wqe,
