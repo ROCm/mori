@@ -196,7 +196,7 @@ def _bench_dispatch_combine(
 
 
 def bench_dispatch_combine(max_num_inp_token_per_rank=4096):
-    world_size = 2
+    world_size = 8
     port = get_free_port()
     torch.multiprocessing.spawn(
         _bench_dispatch_combine,
