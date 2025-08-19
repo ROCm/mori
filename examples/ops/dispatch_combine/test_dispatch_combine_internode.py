@@ -24,7 +24,7 @@ class EpDispatchCombineTestCase:
             max_num_inp_token_per_rank=max_tokens,
             num_experts_per_rank=16,
             num_experts_per_token=8,
-            warp_num_per_block=2,
+            warp_num_per_block=16,
             block_num=16,
             max_token_type_size=2,
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNode,
@@ -150,27 +150,27 @@ class EpDispatchCombineTestCase:
 
         # gen input & output
         # some functions such as randn and cat are not implemented for fp8
-        # all_rank_input = []
-        # for r in range(self.world_size):
-        #     all_rank_input.append(
-        #         torch.randn(
-        #             num_token[r],
-        #             self.config.hidden_dim,
-        #             dtype=torch.float32,
-        #             generator=self.rng,
-        #             device=self.device,
-        #         ).to(self.config.data_type)
-        #     )
         all_rank_input = []
         for r in range(self.world_size):
             all_rank_input.append(
-                torch.full(
-                    (num_token[r], self.config.hidden_dim),
-                    fill_value=float(r + 1),
+                torch.randn(
+                    num_token[r],
+                    self.config.hidden_dim,
                     dtype=torch.float32,
+                    generator=self.rng,
                     device=self.device,
                 ).to(self.config.data_type)
             )
+        # all_rank_input = []
+        # for r in range(self.world_size):
+        #     all_rank_input.append(
+        #         torch.full(
+        #             (num_token[r], self.config.hidden_dim),
+        #             fill_value=float(r + 1),
+        #             dtype=torch.float32,
+        #             device=self.device,
+        #         ).to(self.config.data_type)
+        #     )
 
         return (
             num_token,
@@ -221,9 +221,9 @@ class EpDispatchCombineTestCase:
                 )
                 assert False
                 error_round.add(round)
-            # assert torch.equal(
-            #     dispatch_weights[i], all_rank_weights[src_pe][src_tok_id]
-            # )
+            assert torch.equal(
+                dispatch_weights[i], all_rank_weights[src_pe][src_tok_id]
+            )
             # assert torch.equal(
             #     dispatch_indicies[i], all_rank_indicies[src_pe][src_tok_id]
             # )
@@ -254,29 +254,43 @@ class EpDispatchCombineTestCase:
 
         ok = torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
         if not ok:
-            print(self.rank, "got: ", got)
-            print(self.rank, "expected: ", expected)
-            print(self.rank, "delta:", got - expected)
+            print(f"rank {self.config.rank} result mismatch for token {i}:")
+            print(
+                f"  rank {self.config.rank} indices[{i}]: {all_rank_indices[self.config.rank][i].cpu().tolist()}"
+            )
+            print(f"  rank {self.config.rank} pes: {pes}")
+            print(f"  rank {self.config.rank} unique_pes: {unique_pes}")
+            print(f"  rank {self.config.rank} got: {got}")
+            print(f"  rank {self.config.rank} expected : {expected}")
+            print(
+                f"  rank {self.config.rank} dispatch input : {all_rank_input[self.rank][i].to(torch.float32)}"
+            )
             assert False
-            error_round.add(round)
 
-        # got_weight, expected_weight = (
-        #     combine_output_weight[i],
-        #     all_rank_weights[self.rank][i] * unique_pes,
-        # )
-        # weight_match = torch.allclose(got_weight, expected_weight, atol=1e-5, rtol=1e-5)
-        # if not weight_match and self.config.rank == 0:
-        #     print(f"Weight mismatch for token {i}:")
-        #     print(f"  indices[{i}]: {all_rank_indices[self.rank][i].cpu().tolist()}")
-        #     print(f"  pes: {pes}")
-        #     print(f"  unique_pes: {unique_pes}")
-        #     print(f"  got_weight: {got_weight}")
-        #     print(f"  expected_weight (weights[{i}] * {unique_pes}): {expected_weight}")
-        #     print(f"  original weights[{i}]: {all_rank_weights[self.rank][i]}")
-        #     print(f"  diff: {torch.abs(got_weight - expected_weight)}")
-        #     print(f"  max_diff: {torch.abs(got_weight - expected_weight).max()}")
+        # if not ok:
+        #     print(self.rank, "got: ", got)
+        #     print(self.rank, "expected: ", expected)
+        #     print(self.rank, "delta:", got - expected)
+        #     assert False
+        #     error_round.add(round)
 
-        # assert weight_match, f"Weight assertion failed for token {i}"
+        got_weight, expected_weight = (
+            combine_output_weight[i],
+            all_rank_weights[self.rank][i] * unique_pes,
+        )
+        weight_match = torch.allclose(got_weight, expected_weight, atol=1e-5, rtol=1e-5)
+        if not weight_match and self.config.rank == 0:
+            print(f"Weight mismatch for token {i}:")
+            print(f"  indices[{i}]: {all_rank_indices[self.rank][i].cpu().tolist()}")
+            print(f"  pes: {pes}")
+            print(f"  unique_pes: {unique_pes}")
+            print(f"  got_weight: {got_weight}")
+            print(f"  expected_weight (weights[{i}] * {unique_pes}): {expected_weight}")
+            print(f"  original weights[{i}]: {all_rank_weights[self.rank][i]}")
+            print(f"  diff: {torch.abs(got_weight - expected_weight)}")
+            print(f"  max_diff: {torch.abs(got_weight - expected_weight).max()}")
+
+        assert weight_match, f"Weight assertion failed for token {i}"
 
         if self.config.rank == 0:
             print("Combine Pass")
