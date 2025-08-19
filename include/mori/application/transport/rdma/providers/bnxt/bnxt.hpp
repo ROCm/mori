@@ -12,6 +12,7 @@ namespace application {
 
 #define BNXT_RE_SLOT_SIZE 16
 #define BNXT_RE_CQE_SIZE     (2 * BNXT_RE_SLOT_SIZE)
+#define BNXT_RE_NUM_SLOT_PER_WQE 3
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Device Attributes                                       */
