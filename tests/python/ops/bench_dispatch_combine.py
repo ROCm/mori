@@ -36,7 +36,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
     def run_once(self, op, test_data, check_result):
         (
             all_rank_num_token,
-            all_rank_indicies,
+            all_rank_indices,
             all_rank_input,
             all_rank_weights,
             all_rank_scales,
@@ -51,13 +51,13 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             dispatch_output,
             dispatch_weights,
             dispatch_scales,
-            dispatch_indicies,
+            dispatch_indices,
             dispatch_recv_num_token,
         ) = op.dispatch(
             all_rank_input[self.config.rank],
             all_rank_weights[self.config.rank],
             all_rank_scales[self.config.rank],
-            all_rank_indicies[self.config.rank],
+            all_rank_indices[self.config.rank],
             block_num=80,
             warp_per_block=16,
         )
@@ -72,7 +72,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 dispatch_output,
                 dispatch_weights,
                 dispatch_scales,
-                dispatch_indicies,
+                dispatch_indices,
                 dispatch_recv_num_token,
             )
 
@@ -89,7 +89,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             combine_input,
             # dispatch_weights,
             None,
-            dispatch_indicies,
+            dispatch_indices,
             call_reset=False,
             block_num=80,
             warp_per_block=8,
@@ -154,7 +154,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             print("Dispatch result:")
             for i, duration_us in enumerate(disp_duration_us_list):
                 algo_bw = sum(disp_bandwidth_GB_list[i]) / self.config.world_size
-                bus_bw = int(
+                bus_bw = int(  # noqa: F841
                     algo_bw * (self.config.world_size - 1) / self.config.world_size
                 )
                 print(
@@ -167,7 +167,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             print("Combine result:")
             for i, duration_us in enumerate(comb_duration_us_list):
                 algo_bw = sum(comb_bandwidth_GB_list[i]) / self.config.world_size
-                bus_bw = int(
+                bus_bw = int(  # noqa: F841
                     algo_bw * (self.config.world_size - 1) / self.config.world_size
                 )
                 print(
@@ -206,7 +206,7 @@ def _bench_dispatch_combine(
     )
     benchmark = EpDispatchCombineBenchmark(config)
 
-    with TorchDistContext(rank=rank, world_size=world_size, master_port=port) as ctx:
+    with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         mori.shmem.shmem_torch_process_group_init("default")
         op = mori.ops.EpDispatchCombineOp(config)
         benchmark.run(op)

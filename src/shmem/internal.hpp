@@ -66,7 +66,7 @@ struct ShmemStates {
   void CheckStatusValid() {
     if (status == ShmemStatesStatus::New) {
       std::cout
-          << "Shmem state is not initialized, initialize it by calling ShmemMpiIntialize first."
+          << "Shmem state is not initialized, initialize it by calling ShmemMpiInitialize first."
           << std::endl;
       assert(false);
     }

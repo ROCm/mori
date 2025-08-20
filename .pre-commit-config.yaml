@@ -73,18 +73,6 @@ repos:
         files: \.(c|cc|cxx|cpp|cu|h|cuh|hpp|hxx|xpu|kps)$
   - repo: local
     hooks:
-      - id: cpplint-cpp-source
-        name: cpplint
-        description: Check C++ code style using cpplint.py.
-        entry: bash ./tools/codestyle/cpplint.sh
-        language: system
-        files: \.(cc|cxx|cpp|cu|h|hpp|hxx)$
-        args:
-          - --extensions=cc,cxx,cpp,cu,cuh,h,hpp,hxx,kps
-          - --filter=-readability/fn_size,-build/include_what_you_use,-build/c++11,-whitespace/parens,-whitespace/indent_namespace
-          - --quiet
-  - repo: local
-    hooks:
       - id: clang-tidy
         name: clang-tidy
         description: Parallel clang-tidy runner.

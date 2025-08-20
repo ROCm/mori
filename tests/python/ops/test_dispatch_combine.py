@@ -54,10 +54,10 @@ class EpDispatchCombineTestCase:
                 device=self.device,
             )
 
-        # gen indicies
-        all_rank_indicies = []
+        # gen indices
+        all_rank_indices = []
         for r in range(self.config.world_size):
-            indicies = torch.empty(
+            indices = torch.empty(
                 num_token[r],
                 self.config.num_experts_per_token,
                 dtype=torch.int64,
@@ -69,8 +69,8 @@ class EpDispatchCombineTestCase:
                     generator=self.rng,
                     device=self.device,
                 )
-                indicies[i] = perm[: self.config.num_experts_per_token]
-            all_rank_indicies.append(indicies.to(torch.int32).to(self.device))
+                indices[i] = perm[: self.config.num_experts_per_token]
+            all_rank_indices.append(indices.to(torch.int32).to(self.device))
 
         # gen weights
         all_rank_weights = [
@@ -114,7 +114,7 @@ class EpDispatchCombineTestCase:
 
         return (
             num_token,
-            all_rank_indicies,
+            all_rank_indices,
             all_rank_input,
             all_rank_weights,
             all_rank_scales,
@@ -127,13 +127,13 @@ class EpDispatchCombineTestCase:
         dispatch_output,
         dispatch_weights,
         dispatch_scales,
-        dispatch_indicies,
+        dispatch_indices,
         dispatch_recv_num_token,
     ):
         self.sync()
         (
             all_rank_num_token,
-            all_rank_indicies,
+            all_rank_indices,
             all_rank_input,
             all_rank_weights,
             all_rank_scales,
@@ -149,9 +149,7 @@ class EpDispatchCombineTestCase:
                 assert torch.equal(
                     all_rank_scales[src_rank][src_id], dispatch_scales[i]
                 )
-            assert torch.equal(
-                all_rank_indicies[src_rank][src_id], dispatch_indicies[i]
-            )
+            assert torch.equal(all_rank_indices[src_rank][src_id], dispatch_indices[i])
         assert len(torch.unique(src_token_pos)) == len(src_token_pos)
         assert len(src_token_pos) == dispatch_recv_num_token[0]
 
@@ -160,14 +158,14 @@ class EpDispatchCombineTestCase:
     ):
         self.sync()
         all_rank_num_token = test_data[0]
-        all_rank_indicies = test_data[1]
+        all_rank_indices = test_data[1]
         all_rank_input = test_data[2]
         all_rank_weights = test_data[3]
 
         for i in range(all_rank_num_token[self.config.rank]):
             pes = [
                 (idx // self.config.num_experts_per_rank)
-                for idx in all_rank_indicies[self.config.rank][i].cpu().tolist()
+                for idx in all_rank_indices[self.config.rank][i].cpu().tolist()
             ]
             unique_pes = len(set(pes))
 
@@ -181,7 +179,7 @@ class EpDispatchCombineTestCase:
             if not result_match and self.config.rank == 0:
                 print(f"Result mismatch for token {i}:")
                 print(
-                    f"  indices[{i}]: {all_rank_indicies[self.config.rank][i].cpu().tolist()}"
+                    f"  indices[{i}]: {all_rank_indices[self.config.rank][i].cpu().tolist()}"
                 )
                 print(f"  pes: {pes}")
                 print(f"  unique_pes: {unique_pes}")
@@ -199,7 +197,7 @@ class EpDispatchCombineTestCase:
                 if not weight_match and self.config.rank == 0:
                     print(f"Weight mismatch for token {i}:")
                     print(
-                        f"  indices[{i}]: {all_rank_indicies[self.config.rank][i].cpu().tolist()}"
+                        f"  indices[{i}]: {all_rank_indices[self.config.rank][i].cpu().tolist()}"
                     )
                     print(f"  pes: {pes}")
                     print(f"  unique_pes: {unique_pes}")
@@ -211,7 +209,7 @@ class EpDispatchCombineTestCase:
     def run_test_once(self, op, test_data):
         (
             all_rank_num_token,
-            all_rank_indicies,
+            all_rank_indices,
             all_rank_input,
             all_rank_weights,
             all_rank_scales,
@@ -220,13 +218,13 @@ class EpDispatchCombineTestCase:
             dispatch_output,
             dispatch_weights,
             dispatch_scales,
-            dispatch_indicies,
+            dispatch_indices,
             dispatch_recv_num_token,
         ) = op.dispatch(
             all_rank_input[self.config.rank],
             all_rank_weights[self.config.rank],
             all_rank_scales[self.config.rank],
-            all_rank_indicies[self.config.rank],
+            all_rank_indices[self.config.rank],
         )
         self.sync()
         self.check_dispatch_result(
@@ -235,12 +233,12 @@ class EpDispatchCombineTestCase:
             dispatch_output,
             dispatch_weights,
             dispatch_scales,
-            dispatch_indicies,
+            dispatch_indices,
             dispatch_recv_num_token,
         )
 
         combine_output, combine_output_weight = op.combine(
-            dispatch_output, dispatch_weights, dispatch_indicies, call_reset=False
+            dispatch_output, dispatch_weights, dispatch_indices, call_reset=False
         )
         self.sync()
         self.check_combine_result(op, test_data, combine_output, combine_output_weight)

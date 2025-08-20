@@ -269,7 +269,7 @@ void NotifManager::MainLoop() {
           // TODO(ditian12): we should replenish recv wr faster, insufficient recv wr is met
           // frequently when transfer is very fast. Two way to solve this, 1. use srq_limit to
           // replenish in advance
-          // 2. independant srq entry config (now reuse maxMsgNum)
+          // 2. independent srq entry config (now reuse maxMsgNum)
           struct ibv_sge sge{};
           sge.addr = ctx.mr.addr + idx * sizeof(TransferUniqueId);
           sge.length = sizeof(TransferUniqueId);

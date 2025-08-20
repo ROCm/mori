@@ -41,7 +41,8 @@ void* ShmemMalloc(size_t size) {
 void* ShmemExtMallocWithFlags(size_t size, unsigned int flags) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
   states->CheckStatusValid();
-  application::SymmMemObjPtr obj = states->memoryStates->symmMemMgr->ExtMallocWihFlags(size, flags);
+  application::SymmMemObjPtr obj =
+      states->memoryStates->symmMemMgr->ExtMallocWithFlags(size, flags);
   if (obj.IsValid()) {
     return obj.cpu->localPtr;
   }

@@ -327,7 +327,7 @@ void distRdmaOps(int argc, char* argv[]) {
   // ((char*)buffer)[0],((char*)buffer)[maxSize/sizeof(char)-1]);
 
   if (local_rank == 0) {
-    printf("\nIBGDA Wite benchmark:\n");
+    printf("\nIBGDA White benchmark:\n");
     printf("%-8s %-12s %-12s %-12s\n", "Index", "Size(B)", "bw(GB)", "Time(ms)");
 
     for (size_t i = 0; i < validSizeLog; ++i) {

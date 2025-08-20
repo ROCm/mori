@@ -43,9 +43,9 @@ using namespace mori::shmem;
 /* ---------------------------------------------------------------------------------------------- */
 EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config) : config(config) {
   InitializeShmemBuf();
-  IntializeTokenNumSignalBuf();
-  IntializeOrderMapBuf();
-  IntializeBarrier();
+  InitializeTokenNumSignalBuf();
+  InitializeOrderMapBuf();
+  InitializeBarrier();
 }
 
 EpDispatchCombineHandle::~EpDispatchCombineHandle() {
@@ -101,7 +101,7 @@ void EpDispatchCombineHandle::FinalizeShmemBuf() {
   ShmemFree(shmemOutIndicesMemObj->localPtr);
 }
 
-void EpDispatchCombineHandle::IntializeTokenNumSignalBuf() {
+void EpDispatchCombineHandle::InitializeTokenNumSignalBuf() {
   size_t tokenNumSignalSize = config.worldSize * sizeof(index_t);
   recvTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
   sendTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
@@ -116,7 +116,7 @@ void EpDispatchCombineHandle::FinalizeTokenNumSignalBuf() {
   HIP_RUNTIME_CHECK(hipFree(totalRecvTokenNum));
 }
 
-void EpDispatchCombineHandle::IntializeOrderMapBuf() {
+void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   size_t maxNumOutToken = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerRank;
   HIP_RUNTIME_CHECK(hipMalloc(&dispReceiverIdxMap, maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispReceiverIdxMap, 0, maxNumOutToken * sizeof(index_t)));
@@ -156,7 +156,7 @@ void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipFree(dispDestTokIdMap));
 }
 
-void EpDispatchCombineHandle::IntializeBarrier() {
+void EpDispatchCombineHandle::InitializeBarrier() {
   size_t barrierSize = config.worldSize * sizeof(uint32_t);
   HIP_RUNTIME_CHECK(hipMalloc(&dispatchGridBarrier, barrierSize));
   HIP_RUNTIME_CHECK(hipMemset(dispatchGridBarrier, 0, barrierSize));

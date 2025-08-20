@@ -33,7 +33,7 @@ namespace application {
 
 Context::Context(BootstrapNetwork& bootNet) : bootNet(bootNet) {
   CollectHostNames();
-  IntializePossibleTransports();
+  InitializePossibleTransports();
 }
 
 Context::~Context() {}
@@ -58,7 +58,7 @@ bool IsP2PDisabled() {
   return getenv(varName) != nullptr;
 }
 
-void Context::IntializePossibleTransports() {
+void Context::InitializePossibleTransports() {
   // Find my rank in node
   for (int i = 0; i <= LocalRank(); i++) {
     if (HostName() == hostnames[i]) rankInNode++;
@@ -122,7 +122,7 @@ void Context::IntializePossibleTransports() {
               << "[" << devicePortId << "] " << device->Name() << std::endl;
   }
 
-  // Intialize transport
+  // Initialize transport
   int peerRankInNode = -1;
   for (int i = 0; i < WorldSize(); i++) {
     // Check P2P availability

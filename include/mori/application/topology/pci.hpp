@@ -83,7 +83,7 @@ struct PciBusId {
 PciBusId PackPciBusId(uint16_t domain, uint8_t bus, uint8_t);
 
 enum class TopoNodePciType {
-  VirtualRoot = 0,  // A vritual root to traverse pci tree
+  VirtualRoot = 0,  // A virtual root to traverse pci tree
   RootComplex = 1,
   Bridge = 2,
   Gpu = 3,

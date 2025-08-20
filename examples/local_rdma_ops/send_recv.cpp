@@ -137,7 +137,7 @@ void LocalRdmaOps() {
 
     SendRecvOnCpu(send_req, recv_req, endpoint_1, endpoint_2);
 
-    // Chekc results
+    // Check results
     for (int j = 0; j < msg_size; j++) {
       uint8_t val = reinterpret_cast<uint8_t*>(recv_buff)[j];
       if (val != send_val) {

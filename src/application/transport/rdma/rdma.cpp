@@ -197,7 +197,7 @@ ActiveDevicePortList GetActiveDevicePortList(const RdmaDeviceList& devices) {
 /* ---------------------------------------------------------------------------------------------- */
 RdmaContext::RdmaContext(RdmaBackendType backendType) : backendType(backendType) {
   deviceList = ibv_get_device_list(nullptr);
-  Intialize();
+  Initialize();
 }
 
 RdmaContext::~RdmaContext() {
@@ -230,7 +230,7 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
   }
 }
 
-void RdmaContext::Intialize() {
+void RdmaContext::Initialize() {
   rdmaDeviceList.clear();
 
   const char* envDevices = std::getenv("MORI_RDMA_DEVICES");

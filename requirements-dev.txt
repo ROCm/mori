@@ -1,3 +1,2 @@
 clang-format==20.1.8
-cpplint==2.0.2
 pre_commit==4.3.0

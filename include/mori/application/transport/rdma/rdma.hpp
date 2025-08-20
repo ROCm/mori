@@ -192,13 +192,13 @@ class RdmaDeviceContext {
 
   // TODO: query gid entry by ibv_query_gid_table
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) {
-    assert(false && "not implementd");
+    assert(false && "not implemented");
   }
   void ConnectEndpoint(const RdmaEndpoint& local, const RdmaEndpoint& remote) {
     ConnectEndpoint(local.handle, remote.handle);
   }
   virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote) {
-    assert(false && "not implementd");
+    assert(false && "not implemented");
   }
 
   ibv_srq* CreateRdmaSrqIfNx(const RdmaEndpointConfig&);
@@ -267,7 +267,7 @@ class RdmaContext {
 
  private:
   RdmaDevice* RdmaDeviceFactory(ibv_device* inDevice);
-  void Intialize();
+  void Initialize();
 
  public:
   RdmaBackendType backendType;

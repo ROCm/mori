@@ -52,7 +52,7 @@ class Context {
 
  private:
   void CollectHostNames();
-  void IntializePossibleTransports();
+  void InitializePossibleTransports();
 
  private:
   BootstrapNetwork& bootNet;

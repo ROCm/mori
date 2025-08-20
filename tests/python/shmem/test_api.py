@@ -26,7 +26,7 @@ import torch
 
 
 def _test_torch_init(rank, world_size, port):
-    with TorchDistContext(rank=rank, world_size=world_size, master_port=port) as ctx:
+    with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         mori.shmem.shmem_torch_process_group_init("default")
         assert rank == mori.shmem.shmem_mype()
         assert world_size == mori.shmem.shmem_npes()

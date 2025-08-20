@@ -60,7 +60,7 @@ template <ProviderType PrvdType>
 static __host__ void RingDoorbell(void* dbr_addr, uint64_t dbr_val);
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                         Completion Queu                                        */
+/*                                         Completion Queue */
 /* ---------------------------------------------------------------------------------------------- */
 template <ProviderType PrvdType>
 static __host__ int PollCqOnce(void* cqAddr, uint32_t cqeNum, uint32_t& consIdx);

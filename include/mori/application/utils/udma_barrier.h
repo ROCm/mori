@@ -60,7 +60,7 @@
 
    These barriers are expliclty only for use with user DMA operations. If you
    are looking for barriers to use with cache-coherent multi-threaded
-   consitency then look in stdatomic.h. If you need both kinds of synchronicity
+   consistency then look in stdatomic.h. If you need both kinds of synchronicity
    for the same address then use an atomic operation followed by one
    of these barriers.
 
@@ -271,7 +271,7 @@
 
    Any access to a multi-value WC region must ensure that multiple cpus do not
    write to the same values concurrently, these macros make that
-   straightforward and efficient if the choosen exclusion is a spinlock.
+   straightforward and efficient if the chosen exclusion is a spinlock.
 
    The spinlock guarantees that the WC writes issued within the critical
    section are made visible as TLP to the device. The TLP must be seen by the

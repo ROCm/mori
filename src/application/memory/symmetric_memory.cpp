@@ -58,7 +58,7 @@ SymmMemObjPtr SymmMemManager::Malloc(size_t size) {
   return RegisterSymmMemObj(ptr, size);
 }
 
-SymmMemObjPtr SymmMemManager::ExtMallocWihFlags(size_t size, unsigned int flags) {
+SymmMemObjPtr SymmMemManager::ExtMallocWithFlags(size_t size, unsigned int flags) {
   void* ptr = nullptr;
   HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&ptr, size, flags));
   HIP_RUNTIME_CHECK(hipMemset(ptr, 0, size));

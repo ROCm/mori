@@ -111,9 +111,7 @@ class TorchDistProcessManager:
 
     @staticmethod
     def _worker(rank, world_size, port, init_shmem, task_queue, result_queue):
-        with TorchDistContext(
-            rank=rank, world_size=world_size, master_port=port
-        ) as ctx:
+        with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
             if init_shmem:
                 mori.shmem.shmem_torch_process_group_init("default")
             while True:

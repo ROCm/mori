@@ -10,7 +10,7 @@ Feature summary:
 - Applications
     - MORI-EP: intra and inter-node dispatch/combine kernels with SOTA performance
     - MORI-IO: point-to-point communication library with ultra-low overhead
-    - MORI-CCL: lightweight and felxible collective communication library designed for highly customized use cases such as latency-sensitive or resource-constrained envrionment
+    - MORI-CCL: lightweight and flexible collective communication library designed for highly customized use cases such as latency-sensitive or resource-constrained environment
 - Framework
     - High-performance building blocks for IBGDA / P2P and more​
     - Modular & composable components for developing communication applications, such as transport management, topology detection and etc.
@@ -54,11 +54,11 @@ Benchmark result on the following configurations:
 128 KB | 8 MB | 1.59 | 37.55 | 27.95 | 38.66 |
 512 KB | 32 MB | 6.24 | 43.08 | 35.91 | 43.03 |
 
-- Session is a specific techinique used in MORI-IO to reduce overhead
+- Session is a specific technique used in MORI-IO to reduce overhead
 
 ## Installation
 
-### Prerequsites
+### Prerequisites
 
 - pytorch:rocm >= 6.4.0
 - Linux packages: see packages in dockerfile

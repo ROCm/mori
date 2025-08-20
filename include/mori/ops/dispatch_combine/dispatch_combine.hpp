@@ -146,13 +146,13 @@ class EpDispatchCombineHandle {
   void InitializeShmemBuf();
   void FinalizeShmemBuf();
 
-  void IntializeTokenNumSignalBuf();
+  void InitializeTokenNumSignalBuf();
   void FinalizeTokenNumSignalBuf();
 
-  void IntializeOrderMapBuf();
+  void InitializeOrderMapBuf();
   void FinalizeOrderMapBuf();
 
-  void IntializeBarrier();
+  void InitializeBarrier();
   void FinalizeBarrier();
 
  public:
@@ -325,7 +325,7 @@ namespace std {
 static std::ostream& operator<<(std::ostream& s, mori::moe::EpDispatchCombineConfig config) {
   std::stringstream ss;
   ss << "EpDispatchCombineConfig: " << std::endl
-     << "  WorlSize: " << config.worldSize << std::endl
+     << "  WorldSize: " << config.worldSize << std::endl
      << "  hiddenDim: " << config.hiddenDim << std::endl
      << "  scaleDim: " << config.scaleDim << std::endl
      << "  scaleTypeSize: " << config.scaleTypeSize << std::endl

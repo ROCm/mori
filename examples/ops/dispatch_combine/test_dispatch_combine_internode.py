@@ -235,7 +235,7 @@ class EpDispatchCombineTestCase:
                 dispatch_weights[i], all_rank_weights[src_pe][src_tok_id]
             )
             # assert torch.equal(
-            #     dispatch_indicies[i], all_rank_indicies[src_pe][src_tok_id]
+            #     dispatch_indices[i], all_rank_indices[src_pe][src_tok_id]
             # )
             # TODO: test output scales
 
@@ -321,7 +321,7 @@ class EpDispatchCombineTestCase:
     def run_bench_once(self, op, test_data):
         (
             all_rank_num_token,
-            all_rank_indicies,
+            all_rank_indices,
             all_rank_input,
             all_rank_weights,
             all_rank_scales,
@@ -337,13 +337,13 @@ class EpDispatchCombineTestCase:
             dispatch_output,
             dispatch_weights,
             dispatch_scales,
-            dispatch_indicies,
+            dispatch_indices,
             dispatch_recv_num_token,
         ) = op.dispatch(
             all_rank_input[self.rank],
             all_rank_weights[self.rank],
             all_rank_scales[self.rank],
-            all_rank_indicies[self.rank],
+            all_rank_indices[self.rank],
         )
         end_event.record()
         torch.cuda.synchronize()
@@ -377,7 +377,7 @@ class EpDispatchCombineTestCase:
         combine_output, _ = op.combine(
             dispatch_output,
             None,
-            all_rank_indicies[self.rank],
+            all_rank_indices[self.rank],
             call_reset=False,
         )
         end_event.record()
