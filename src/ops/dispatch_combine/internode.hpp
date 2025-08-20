@@ -161,7 +161,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
           args.recvTokenOffset[pe] = sum;
 
           // send prefix back
-          if (pe / MAX_GPUS_PER_NODE == myNode) {  // TODO这里要不要优先填本机的，让机内拷贝先开始
+          if (pe / MAX_GPUS_PER_NODE == myNode) {
             index_t* peerPrefixPtr = args.shmemMetaDataMemObj->template GetAs<index_t*>(pe) + myPe;
             shmem::ShmemInt32WaitUntilEquals(peerPrefixPtr, 0);
             core::AtomicStoreRelaxedSystem(peerPrefixPtr, sum + 1);
@@ -210,18 +210,6 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
             reinterpret_cast<char*>(args.scalesBuf) + tokenId * scaleSize, scaleSize);
       }
     }
-
-    // // Same dest PE block barrier
-    // __syncthreads();
-    // LocalBarrier(&args.dispatchGridBarrier[destPe], numsBlockPerDestPe, thdId);
-    // if (localBlockId == 0 && thdId == 0) {
-    //   index_t* sync = args.shmemSyncDataMemObj->template GetAs<index_t*>(destPe) + myPe;
-    //   shmem::ShmemInt32WaitUntilEquals(sync, 0);
-    //   core::AtomicStoreRelaxedSystem(sync, SIGNAL_PUT_FINISHED);
-    //   // clear meta data
-    //   core::AtomicStoreRelaxedSystem(args.shmemMetaDataMemObj->template GetAs<index_t*>() + destPe,
-    //                                  0);
-    // }
   } else {
     // last warp for coordinate, other warp for gather token
     const size_t stagingBaseOffset = destPe * MaxNumTokensToRecvPerRank * tokenPackSize;
@@ -307,17 +295,6 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
       }
       __threadfence_block();
     }
-
-    // // Same dest PE block barrier
-    // __syncthreads();
-    // LocalBarrier(&args.dispatchGridBarrier[destPe], numsBlockPerDestPe, thdId);
-    // if (localBlockId == 0 && thdId == 0) {  // TODO 连续跑会hang?
-    //   shmem::ShmemPutInt32ImmNbiThread(args.shmemSyncDataMemObj, myPe * sizeof(index_t),
-    //                                    SIGNAL_PUT_FINISHED, destPe);
-    //   // clear meta data
-    //   core::AtomicStoreRelaxedSystem(args.shmemMetaDataMemObj->template GetAs<index_t*>() + destPe,
-    //                                  0);
-    // }
   }
 
   // Same dest PE block barrier
@@ -456,15 +433,6 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
       shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemInpTokMemObj, peSortedOffset,
                                           args.shmemStagingTokMemObj, mapIdxOffset, tokenPackSize,
                                           srcPe);
-      // TODO remove
-#if DEBUG==1
-      if (fabs(*(float*)(args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset) -
-               float(srcPe + 1)) > 0.1) {
-        int tmp = myPe;
-        while (tmp < npes) {
-        };
-      }
-#endif
     }
   } else {
     // inter node use ibgda for transfer
@@ -496,15 +464,6 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
         shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemInpTokMemObj, dstOffset,
                                             args.shmemStagingTokMemObj, srcOffset,
                                             actualTokenNum * tokenPackSize, srcPe);
-#if DEBUG == 1
-        if (fabs(*(float*)(args.shmemStagingTokMemObj->template GetAs<char*>() + srcOffset) -
-                 float(srcPe + 1)) > 0.1) {
-          int tmp = myPe;
-          while (tmp < npes) {
-          };
-        }
-#endif
-
         ++chunkIdx;
         chunkOffset += chunkTokenSize;
       }
@@ -521,14 +480,6 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
         // size_t peSortedOffset = peSortedId * size_t(config.hiddenDim);
         core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset,
                        reinterpret_cast<char*>(args.inpTokenBuf) + tokenOffset, tokenSize);
-#if DEBUG == 1
-        if (fabs(*(float*)(args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset) -
-                 float(srcPe + 1)) > 0.1) {
-          int tmp = myPe;
-          while (tmp < npes) {
-          };
-        }
-#endif
 
         if (args.weightsBuf) {
           core::WarpCopy(
@@ -587,13 +538,6 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
             reinterpret_cast<T*>(args.shmemInpTokMemObj->template GetAs<char*>() + byteOffset);
         srcWeightsPtr[j] = reinterpret_cast<float*>(
             args.shmemInpTokMemObj->template GetAs<char*>() + weightByteOffset);
-#if DEBUG == 1
-        if (fabs(*(float*)(srcPtrs[j]) - float(myPe + 1)) > 0.1) {
-          int tmp = myPe;
-          while (tmp < npes) {
-          };
-        }
-#endif
       } else {
         srcPtrs[j] = nullptr;
         srcWeightsPtr[j] = nullptr;
