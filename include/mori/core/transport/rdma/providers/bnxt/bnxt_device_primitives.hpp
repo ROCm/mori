@@ -470,8 +470,8 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
   assert((slotIdx + slotsNum) <= wqeNum);
 
   uint32_t opcode = BNXT_RE_WR_OPCD_ATOMIC_FA;
-  uint64_t data = *static_cast<uint64_t*>(val_1);
-  uint64_t cmp = *static_cast<uint64_t*>(val_2);
+  uint64_t data = val_1 ? *static_cast<uint64_t*>(val_1) : 0;
+  uint64_t cmp = val_2 ? *static_cast<uint64_t*>(val_2) : 0;
 
   switch (amo_op) {
     case AMO_FETCH_INC:
@@ -532,7 +532,7 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
 
   // fill psns in msn Table for retransmissions
   uint32_t msntblIdx = curMsntblSlotIdx % wq.msntblNum;
-  bnxt_re_fill_psns_for_msntbl(msntblAddr, slotIdx, curPsnIdx, psnCnt, msntblIdx);
+  bnxt_re_fill_psns_for_msntbl(msntblAddr, slotIdx, curPsnIdx, 1, msntblIdx);
 
   // get doorbell header
   // struct bnxt_re_db_hdr hdr;
