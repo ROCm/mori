@@ -29,7 +29,6 @@ repos:
       - id: insert-license  # Insert a short license disclaimer as a header comment in Python files
         name: License inserter (Python)
         files: \.py$
-        exclude: ^tools/codestyle/clang-tidy\.py$
         args:
           - --license-filepath
           - LICENSE
