@@ -162,6 +162,12 @@ class RdmaManager {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      Notification Manager                                      */
 /* ---------------------------------------------------------------------------------------------- */
+struct NotifMessage {
+  TransferUniqueId id{0};
+  int qpIndex{-1};
+  int totalNum{-1};
+};
+
 class NotifManager {
  public:
   NotifManager(RdmaManager*);
@@ -171,6 +177,8 @@ class NotifManager {
   // void DeregisterEndpoint(EpPair*);
 
   void RegisterDevice(int devId);
+
+  bool PopInboundTransferStatus(const EngineKey&, TransferUniqueId, TransferStatus*);
 
   void MainLoop();
   void Start();
@@ -192,7 +200,7 @@ class NotifManager {
 
   uint32_t maxNotifNum{8192};
   std::unordered_map<int, DeviceNotifContext> notifCtx;
-  std::unordered_map<EngineKey, std::unordered_set<TransferUniqueId>> notifPool;
+  std::unordered_map<EngineKey, std::unordered_map<TransferUniqueId, int>> notifPool;
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -246,7 +254,7 @@ class RdmaBackendSession : public BackendSession {
  public:
   RdmaBackendSession() = default;
   RdmaBackendSession(const application::RdmaMemoryRegion& local,
-                     const application::RdmaMemoryRegion& remote, const EpPair& eps);
+                     const application::RdmaMemoryRegion& remote, const EpPairVec& eps);
   ~RdmaBackendSession() = default;
 
   void Read(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
@@ -262,7 +270,7 @@ class RdmaBackendSession : public BackendSession {
  private:
   application::RdmaMemoryRegion local{};
   application::RdmaMemoryRegion remote{};
-  EpPair eps{};
+  EpPairVec eps{};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
