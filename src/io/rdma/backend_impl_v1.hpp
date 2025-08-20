@@ -170,7 +170,7 @@ struct NotifMessage {
 
 class NotifManager {
  public:
-  NotifManager(RdmaManager*);
+  NotifManager(RdmaManager*, const RdmaBackendConfig&);
   ~NotifManager();
 
   void RegisterEndpointByQpn(uint32_t qpn);
@@ -185,6 +185,7 @@ class NotifManager {
   void Shutdown();
 
  private:
+  RdmaBackendConfig config;
   mutable std::mutex mu;
 
   int epfd{-1};
@@ -201,6 +202,8 @@ class NotifManager {
   uint32_t maxNotifNum{8192};
   std::unordered_map<int, DeviceNotifContext> notifCtx;
   std::unordered_map<EngineKey, std::unordered_map<TransferUniqueId, int>> notifPool;
+
+  std::unordered_map<TransferStatus*, int> localNotif;
 };
 
 /* ---------------------------------------------------------------------------------------------- */

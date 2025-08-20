@@ -163,7 +163,8 @@ application::RdmaDeviceContext* RdmaManager::GetOrCreateDeviceContext(int devId)
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      Notification Manager                                      */
 /* ---------------------------------------------------------------------------------------------- */
-NotifManager::NotifManager(RdmaManager* rdmaMgr) : rdma(rdmaMgr) {}
+NotifManager::NotifManager(RdmaManager* rdmaMgr, const RdmaBackendConfig& cfg)
+    : rdma(rdmaMgr), config(cfg) {}
 
 NotifManager::~NotifManager() { Shutdown(); }
 
@@ -269,14 +270,25 @@ void NotifManager::MainLoop() {
           uint64_t id = wc.wr_id;
           // printf("send notif for transfer %d\n", id);
         } else {
+          std::lock_guard<std::mutex> lock(mu);
           // printf("data mov for transfer %lu %d\n", wc.wr_id, wc.opcode);
           TransferStatus* status = reinterpret_cast<TransferStatus*>(wc.wr_id);
+          if (localNotif.find(status) == localNotif.end()) {
+            localNotif[status] = 0;
+          }
           if (wc.status == IBV_WC_SUCCESS) {
-            status->SetCode(StatusCode::SUCCESS);
+            localNotif[status] += 1;
+            if (localNotif[status] == config.qpPerTransfer) {
+              status->SetCode(StatusCode::SUCCESS);
+              status->SetMessage(ibv_wc_status_str(wc.status));
+              localNotif.erase(status);
+            }
+            // printf("set status %p\n", status);
           } else {
             status->SetCode(StatusCode::ERROR);
+            status->SetMessage(ibv_wc_status_str(wc.status));
+            localNotif.erase(status);
           }
-          status->SetMessage(ibv_wc_status_str(wc.status));
           // printf("set transfer status\n");
         }
       }
@@ -626,21 +638,22 @@ void RdmaBackendSession::BatchRead(const SizeVec& localOffsets, const SizeVec& r
 }
 
 bool RdmaBackendSession::Alive() const { return true; }
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           RdmaBackend                                          */
 /* ---------------------------------------------------------------------------------------------- */
 
-RdmaBackend::RdmaBackend(EngineKey key, const IOEngineConfig& config,
+RdmaBackend::RdmaBackend(EngineKey key, const IOEngineConfig& engConfig,
                          const RdmaBackendConfig& beConfig)
     : config(beConfig) {
   application::RdmaContext* ctx =
       new application::RdmaContext(application::RdmaBackendType::IBVerbs);
   rdma.reset(new mori::io::RdmaManager(ctx));
 
-  notif.reset(new NotifManager(rdma.get()));
+  notif.reset(new NotifManager(rdma.get(), beConfig));
   notif->Start();
 
-  server.reset(new ControlPlaneServer(config.host, config.port, rdma.get(), notif.get()));
+  server.reset(new ControlPlaneServer(engConfig.host, engConfig.port, rdma.get(), notif.get()));
   server->Start();
 }
 
