@@ -1,2 +1,0 @@
-clang-format==20.1.8
-pre_commit==4.3.0
