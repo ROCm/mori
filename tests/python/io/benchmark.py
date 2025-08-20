@@ -10,6 +10,7 @@ from mori.io import (
     MemoryDesc,
     StatusCode,
     MemoryLocationType,
+    RdmaBackendConfig,
 )
 import argparse
 from enum import Enum
@@ -56,6 +57,12 @@ def parse_args():
         default=1,
         help="Number of devices on target side",
     )
+    parser.add_argument(
+        "--num-qp-per-transfer",
+        type=int,
+        default=1,
+        help="Number of QPused for single transfer",
+    )
 
     args = parser.parse_args()
     return args
@@ -79,6 +86,7 @@ class MoriIoBenchmark:
         enable_sess: bool = False,
         num_initiator_dev: int = 1,
         num_target_dev: int = 1,
+        num_qp_per_transfer: int = 1,
     ):
         self.host = host
         self.port = port
@@ -91,6 +99,7 @@ class MoriIoBenchmark:
         self.transfer_batch_size = transfer_batch_size
         self.enable_batch_transfer = enable_batch_transfer
         self.enable_sess = enable_sess
+        self.num_qp_per_transfer = num_qp_per_transfer
 
         self.world_size = self.num_initiator_dev + self.num_target_dev
         if self.node_rank == 0:
@@ -155,7 +164,8 @@ class MoriIoBenchmark:
             port=self.port,
         )
         self.engine = IOEngine(key=f"{self.role.name}-{self.role_rank}", config=config)
-        self.engine.create_backend(BackendType.RDMA)
+        config = RdmaBackendConfig(qp_per_transfer=self.num_qp_per_transfer)
+        self.engine.create_backend(BackendType.RDMA, config)
 
         self.engine_desc = self.engine.get_engine_desc()
         engine_desc_bytes = self.engine_desc.pack()
@@ -270,18 +280,18 @@ class MoriIoBenchmark:
                 self.run_once()
                 latency.append(time.time() - st)
 
-            total_mem_gb = self.buffer_size * self.transfer_batch_size / (10**6)
-
-            avg_duration = sum(latency) / len(latency)
-            min_duration = min(latency)
-            avg_duration_us, min_duration_us = avg_duration * (
-                10**6
-            ), min_duration * (10**6)
-
-            avg_bw = total_mem_gb / (10**3) / avg_duration
-            max_bw = total_mem_gb / (10**3) / min_duration
-
             if self.role is EngineRole.INITIATOR:
+                total_mem_gb = self.buffer_size * self.transfer_batch_size / (10**6)
+
+                avg_duration = sum(latency) / len(latency)
+                min_duration = min(latency)
+                avg_duration_us, min_duration_us = avg_duration * (
+                    10**6
+                ), min_duration * (10**6)
+
+                avg_bw = total_mem_gb / (10**3) / avg_duration
+                max_bw = total_mem_gb / (10**3) / min_duration
+
                 print(
                     f"Duration {min_duration_us:.2f}({avg_duration_us:.2f}) us, "
                     f"bytes {total_mem_gb} MB, bandwidth: {max_bw:.2f}({avg_bw:.2f}) GB/s"
@@ -300,6 +310,7 @@ def benchmark_engine(local_rank, node_rank, args):
         enable_sess=args.enable_sess,
         num_initiator_dev=args.num_initiator_dev,
         num_target_dev=args.num_target_dev,
+        num_qp_per_transfer=args.num_qp_per_transfer,
     )
     bench.print_config()
     bench.run()
