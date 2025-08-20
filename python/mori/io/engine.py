@@ -60,8 +60,13 @@ class IOEngine:
     def get_engine_desc(self):
         return self._engine.GetEngineDesc()
 
-    def create_backend(self, type: mori_cpp.BackendType):
-        return self._engine.CreateBackend(type, None)
+    def create_backend(self, type: mori_cpp.BackendType, config=None):
+        if config is None:
+            if type is mori_cpp.BackendType.RDMA:
+                config = mori_cpp.RdmaBackendConfig()
+            else:
+                raise NotImplemented("backend not implemented yet")
+        return self._engine.CreateBackend(type, config)
 
     def remove_backend(self, type: mori_cpp.BackendType):
         return self._engine.RemoveBackend(type)

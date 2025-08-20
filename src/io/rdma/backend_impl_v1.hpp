@@ -271,7 +271,7 @@ class RdmaBackendSession : public BackendSession {
 
 class RdmaBackend : public Backend {
  public:
-  RdmaBackend(EngineKey, IOEngineConfig);
+  RdmaBackend(EngineKey, const IOEngineConfig&, const RdmaBackendConfig&);
   ~RdmaBackend();
 
   void RegisterRemoteEngine(const EngineDesc&);
@@ -293,6 +293,7 @@ class RdmaBackend : public Backend {
   void CreateSession(const MemoryDesc& local, const MemoryDesc& remote, RdmaBackendSession& sess);
 
  private:
+  RdmaBackendConfig config;
   std::unique_ptr<RdmaManager> rdma;
   std::unique_ptr<NotifManager> notif;
   std::unique_ptr<ControlPlaneServer> server;

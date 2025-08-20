@@ -597,7 +597,9 @@ bool RdmaBackendSession::Alive() const { return true; }
 /*                                           RdmaBackend                                          */
 /* ---------------------------------------------------------------------------------------------- */
 
-RdmaBackend::RdmaBackend(EngineKey key, IOEngineConfig config) {
+RdmaBackend::RdmaBackend(EngineKey key, const IOEngineConfig& config,
+                         const RdmaBackendConfig& beConfig)
+    : config(beConfig) {
   application::RdmaContext* ctx =
       new application::RdmaContext(application::RdmaBackendType::IBVerbs);
   rdma.reset(new mori::io::RdmaManager(ctx));

@@ -45,13 +45,15 @@ void TestMoriIOEngine() {
   config.host = "127.0.0.1";
   config.port = GetFreePort();
   IOEngine initiator("initiator", config);
-  initiator.CreateBackend(BackendType::RDMA, nullptr);
+
+  RdmaBackendConfig rdmaConfig{};
+  initiator.CreateBackend(BackendType::RDMA, rdmaConfig);
 
   int newPort = GetFreePort();
   assert(newPort != config.port);
   config.port = newPort;
   IOEngine target("target", config);
-  target.CreateBackend(BackendType::RDMA, nullptr);
+  target.CreateBackend(BackendType::RDMA, rdmaConfig);
 
   EngineDesc initiatorEngineDesc = initiator.GetEngineDesc();
   EngineDesc targetEngineDesc = target.GetEngineDesc();

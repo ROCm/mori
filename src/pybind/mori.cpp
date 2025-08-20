@@ -265,6 +265,12 @@ void RegisterMoriIo(pybind11::module_& m) {
       .value("NOT_FOUND", mori::io::StatusCode::NOT_FOUND)
       .export_values();
 
+  py::class_<mori::io::BackendConfig>(m, "BackendConfig");
+
+  py::class_<mori::io::RdmaBackendConfig, mori::io::BackendConfig>(m, "RdmaBackendConfig")
+      .def(py::init<uint32_t>(), py::arg("qp_per_transfer") = 1)
+      .def_readwrite("qp_per_transfer", &mori::io::RdmaBackendConfig::qpPerTransfer);
+
   py::class_<mori::io::IOEngineConfig>(m, "IOEngineConfig")
       .def(py::init<std::string, uint16_t>(), py::arg("host") = "", py::arg("port") = 0)
       .def_readwrite("host", &mori::io::IOEngineConfig::host)
@@ -330,7 +336,7 @@ void RegisterMoriIo(pybind11::module_& m) {
   py::class_<mori::io::IOEngine>(m, "IOEngine")
       .def(py::init<const mori::io::EngineKey&, const mori::io::IOEngineConfig&>())
       .def("GetEngineDesc", &mori::io ::IOEngine::GetEngineDesc)
-      .def("CreateBackend", &mori::io ::IOEngine::CreateBackend)
+      .def("CreateBackend", &mori::io::IOEngine::CreateBackend)
       .def("RemoveBackend", &mori::io ::IOEngine::RemoveBackend)
       .def("RegisterRemoteEngine", &mori::io ::IOEngine::RegisterRemoteEngine)
       .def("DeregisterRemoteEngine", &mori::io ::IOEngine::DeregisterRemoteEngine)

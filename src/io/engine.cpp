@@ -56,10 +56,11 @@ IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
 
 IOEngine::~IOEngine() {}
 
-void IOEngine::CreateBackend(BackendType type, void* params) {
+void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
   if (type == BackendType::RDMA) {
     assert(backends.find(type) == backends.end());
-    backends.insert({type, std::make_unique<RdmaBackend>(desc.key, config)});
+    backends.insert({type, std::make_unique<RdmaBackend>(
+                               desc.key, config, static_cast<const RdmaBackendConfig&>(beConfig))});
   } else
     assert(false && "not implemented");
 }
