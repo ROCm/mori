@@ -156,6 +156,7 @@ class EpDispatchCombineHandle {
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
   mori::application::SymmMemObjPtr shmemStagingTokMemObj;
   mori::application::SymmMemObjPtr shmemMetaDataMemObj;
+  mori::application::SymmMemObjPtr shmemSyncDataMemObj;
 
   // Registered buffer used for weights, indices and scales
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
@@ -215,6 +216,7 @@ struct EpDispatchCombineArgs {
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
   mori::application::SymmMemObjPtr shmemStagingTokMemObj;
   mori::application::SymmMemObjPtr shmemMetaDataMemObj;
+  mori::application::SymmMemObjPtr shmemSyncDataMemObj;
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
   mori::application::SymmMemObjPtr shmemOutWeightsMemObj;
   mori::application::SymmMemObjPtr shmemInpScalesMemObj;
@@ -259,6 +261,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.shmemOutTokMemObj = handle.shmemOutTokMemObj;
   args.shmemStagingTokMemObj = handle.shmemStagingTokMemObj;
   args.shmemMetaDataMemObj = handle.shmemMetaDataMemObj;
+  args.shmemSyncDataMemObj = handle.shmemSyncDataMemObj;
   args.shmemInpWeightsMemObj = handle.shmemInpWeightsMemObj;
   args.shmemOutWeightsMemObj = handle.shmemOutWeightsMemObj;
   args.shmemInpScalesMemObj = handle.shmemInpScalesMemObj;

@@ -54,9 +54,11 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   shmemOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
   shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
   const size_t prefixSize = config.worldSize * sizeof(index_t);
-  const size_t syncSize = config.worldSize * sizeof(index_t);
   shmemMetaDataMemObj =
-      ShmemMallocAndReturnMemObjPtr(prefixSize + syncSize, hipDeviceMallocUncached);
+      ShmemMallocAndReturnMemObjPtr(prefixSize, hipDeviceMallocUncached);
+  const size_t syncSize = config.worldSize * sizeof(index_t);
+  shmemSyncDataMemObj =
+      ShmemMallocAndReturnMemObjPtr(syncSize, hipDeviceMallocUncached);
 
   size_t maxWeightSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(float);
   shmemInpWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
