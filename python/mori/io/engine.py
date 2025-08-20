@@ -30,12 +30,13 @@ class IOEngine:
     def register_torch_tensor(self, tensor: torch.Tensor):
         if not tensor.is_contiguous():
             raise RuntimeError("input tensor must be contiguous")
-
+        
         data = ctypes.pythonapi.PyCapsule_New(
             ctypes.c_void_p(tensor.data_ptr()), None, None
         )
         total_bytes = tensor.nelement() * tensor.element_size()
         device_id = tensor.device.index
+        print(f"zovlog: mori engine py register_torch_tensor, tensor.shape = {tensor.shape},{total_bytes = },{device_id = }")
         if device_id is None:
             device_id = -1
         mem_loc = TORCH_DEVICE_TYPE_MAP[tensor.device.type]

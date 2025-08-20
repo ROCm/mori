@@ -487,7 +487,7 @@ void RdmaBackend::Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remo
   TopoKey remote{remoteSrc.deviceId, remoteSrc.loc};
   TopoKeyPair kp{local, remote};
   std::cout<<"\n\n\nzovlog:moio engine:RdmaBackend::Read localDest.data = "<<reinterpret_cast<uintptr_t>(localDest.data)
-          << ",localOffset = "<<localOffset<<",remoteSrc.data = "<<reinterpret_cast<uintptr_t>(remoteSrc.data)<<",remoteOffset = "<<remoteOffset<<"\n\n\n";
+          << ",localOffset = "<<localOffset<<",remoteSrc.data = "<<reinterpret_cast<uintptr_t>(remoteSrc.data)<<",remoteOffset = "<<remoteOffset<<",size = "<<size<<"\n\n\n";
   EngineKey ekey = remoteSrc.engineKey;
 
   // Create a pair of endpoint if none
