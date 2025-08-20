@@ -98,3 +98,23 @@ pytest tests/python/io/
 export GLOO_SOCKET_IFNAME=ens14np0
 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.194.129.65" --master_port=1234 tests/python/io/benchmark.py --host="10.194.129.65" --enable-batch-transfer --enable-sess --buffer-size 32768 --transfer-batch-size 128
 ```
+
+## Contribution Guide
+
+Welcome to MORI! We appreciate your interest in contributing. Whether you're fixing bugs, adding features, improving documentation, or sharing feedback, your contributions help make MORI better for everyone.
+
+### Code Quality
+
+MORI uses pre-commit hooks to maintain code quality. After cloning the repository:
+
+```bash
+# Install and setup pre-commit
+pip install pre-commit
+cd /path/to/mori
+pre-commit install
+
+# Run on all files (first time)
+pre-commit run --all-files
+```
+
+Pre-commit automatically checks code formatting, linting, license headers, and other quality checks on commit. To skip checks when necessary: `git commit --no-verify`
