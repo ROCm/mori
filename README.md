@@ -12,9 +12,9 @@ Feature summary:
     - MORI-IO: point-to-point communication library with ultra-low overhead
     - MORI-CCL: lightweight and felxible collective communication library designed for highly customized use cases such as latency-sensitive or resource-constrained envrionment
 - Framework
-    - High-performance building blocks for IBGDA / P2P and more​ 
+    - High-performance building blocks for IBGDA / P2P and more​
     - Modular & composable components for developing communication applications, such as transport management, topology detection and etc.
-    - Shmem-style APIs  
+    - Shmem-style APIs
     - C++ level APIs
     - Python level APIs
 
@@ -24,7 +24,7 @@ Configurations:
 - Hardware: 8 x MI300X per node, with 8 single-port CX7 400Gb/s RDMA NICs
 - Software: ROCm 6.4.0
 
-### MORI-EP 
+### MORI-EP
 
 Benchmark result on DeepSeek V3 model configurations:
 
@@ -82,7 +82,7 @@ export PYTHONPATH=/path/to/mori:$PYTHONPATH
 pytest tests/python/ops/
 
 # Benchmark performance
-python3 tests/python/ops/bench_dispatch_combine.py 
+python3 tests/python/ops/bench_dispatch_combine.py
 ```
 
 ### Test MORI-IO

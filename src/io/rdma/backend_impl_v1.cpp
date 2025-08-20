@@ -1,3 +1,24 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 #include "src/io/rdma/backend_impl_v1.hpp"
 
 #include <sys/epoll.h>
@@ -194,12 +215,12 @@ void NotifManager::RegisterDevice(int devId) {
   // Pre post notification receive wr
   // TODO: should use min(maxNotifNum, maxSrqWrNum)
   for (uint64_t i = 0; i < maxNotifNum; i++) {
-    struct ibv_sge sge {};
+    struct ibv_sge sge{};
     sge.addr = mr.addr + i * sizeof(TransferUniqueId);
     sge.length = sizeof(TransferUniqueId);
     sge.lkey = mr.lkey;
 
-    struct ibv_recv_wr wr {};
+    struct ibv_recv_wr wr{};
     wr.wr_id = i;
     wr.sg_list = &sge;
     wr.num_sge = 1;
@@ -227,7 +248,7 @@ void NotifManager::MainLoop() {
       ibv_req_notify_cq(cq, 0);
 
       // TODO: maybe take multiple cqes?
-      struct ibv_wc wc {};
+      struct ibv_wc wc{};
       while (ibv_poll_cq(cq, 1, &wc) > 0) {
         if (wc.opcode == IBV_WC_RECV) {
           std::lock_guard<std::mutex> lock(mu);
@@ -249,12 +270,12 @@ void NotifManager::MainLoop() {
           // frequently when transfer is very fast. Two way to solve this, 1. use srq_limit to
           // replenish in advance
           // 2. independant srq entry config (now reuse maxMsgNum)
-          struct ibv_sge sge {};
+          struct ibv_sge sge{};
           sge.addr = ctx.mr.addr + idx * sizeof(TransferUniqueId);
           sge.length = sizeof(TransferUniqueId);
           sge.lkey = ctx.mr.lkey;
 
-          struct ibv_recv_wr wr {};
+          struct ibv_recv_wr wr{};
           wr.wr_id = idx;
           wr.sg_list = &sge;
           wr.num_sge = 1;
@@ -477,12 +498,12 @@ namespace {
 
 void RdmaNotifyTransfer(const application::RdmaEndpoint& ep, TransferStatus* status,
                         TransferUniqueId id) {
-  struct ibv_sge sge {};
+  struct ibv_sge sge{};
   sge.addr = reinterpret_cast<uintptr_t>(&id);
   sge.length = sizeof(TransferUniqueId);
   sge.lkey = 0;
 
-  struct ibv_send_wr wr {};
+  struct ibv_send_wr wr{};
   wr.wr_id = id;
   wr.opcode = IBV_WR_SEND;
   wr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;

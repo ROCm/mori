@@ -1,9 +1,29 @@
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 import pytest
 import mori
-from tests.python.utils import TorchDistContext, get_free_port, TorchDistProcessManager
+from tests.python.utils import TorchDistProcessManager
 import torch
 import torch.distributed as dist
-import time
 
 
 class EpDispatchCombineTestCase:
@@ -135,7 +155,9 @@ class EpDispatchCombineTestCase:
         assert len(torch.unique(src_token_pos)) == len(src_token_pos)
         assert len(src_token_pos) == dispatch_recv_num_token[0]
 
-    def check_combine_result(self, op, test_data, combine_output, combine_output_weight = None):
+    def check_combine_result(
+        self, op, test_data, combine_output, combine_output_weight=None
+    ):
         self.sync()
         all_rank_num_token = test_data[0]
         all_rank_indicies = test_data[1]
@@ -153,16 +175,19 @@ class EpDispatchCombineTestCase:
                 all_rank_input[self.config.rank][i].to(torch.float32) * unique_pes
             ).to(self.config.data_type)
 
-            result_match = torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
+            result_match = torch.allclose(
+                got.float(), expected.float(), atol=1e-2, rtol=1e-2
+            )
             if not result_match and self.config.rank == 0:
                 print(f"Result mismatch for token {i}:")
                 print(
-                    f"  indices[{i}]: {all_rank_indicies[self.config.rank][i].cpu().tolist()}")
+                    f"  indices[{i}]: {all_rank_indicies[self.config.rank][i].cpu().tolist()}"
+                )
                 print(f"  pes: {pes}")
                 print(f"  unique_pes: {unique_pes}")
                 print(f"  got: {got}")
                 print(f"  expected : {expected}")
-            
+
             if combine_output_weight is not None:
                 got_weight, expected_weight = (
                     combine_output_weight[i],
@@ -174,7 +199,8 @@ class EpDispatchCombineTestCase:
                 if not weight_match and self.config.rank == 0:
                     print(f"Weight mismatch for token {i}:")
                     print(
-                        f"  indices[{i}]: {all_rank_indicies[self.config.rank][i].cpu().tolist()}")
+                        f"  indices[{i}]: {all_rank_indicies[self.config.rank][i].cpu().tolist()}"
+                    )
                     print(f"  pes: {pes}")
                     print(f"  unique_pes: {unique_pes}")
                     print(f"  got_weight: {got_weight}")
@@ -217,8 +243,7 @@ class EpDispatchCombineTestCase:
             dispatch_output, dispatch_weights, dispatch_indicies, call_reset=False
         )
         self.sync()
-        self.check_combine_result(
-            op, test_data, combine_output, combine_output_weight)
+        self.check_combine_result(op, test_data, combine_output, combine_output_weight)
 
 
 @pytest.fixture(scope="session")
