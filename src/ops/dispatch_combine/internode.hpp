@@ -23,10 +23,6 @@ __device__ void SyncIfDebugEnabled(const char* msg) {
 #endif
 }
 
-inline __device__ index_t EncodeValue(index_t val) { return val + 1; }
-
-inline __device__ index_t DecodeValue(index_t val) { return val - 1; }
-
 inline __device__ void LocalBarrier(uint32_t* barrier, int syncNum, int id) {
   if (id == 0) {
     int old_val = atomicAdd(barrier, 1);
@@ -128,8 +124,19 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
   const int endIdx = startIdx + myChunkSize;
 
   if (destNode == myNode) {
+    // calculate prefix to determine output offset
     if (destPe == myPe && localBlockId == 0 && warpId == 0) {
-      // calculate prefix to determine output offset
+      // // write number of token to send
+      // for (int pe = laneId; pe < npes; pe += warpSize) {
+      //   if (pe / MAX_GPUS_PER_NODE == myNode) {
+      //     index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(pe) + myPe;
+      //     shmem::ShmemInt32WaitUntilEquals(signal, 0);
+      //     core::AtomicStoreRelaxedSystem(signal, args.destPeTokenCounter[pe] + 1);
+      //   } else {
+      //     shmem::ShmemPutInt32ImmNbiThread(args.recvTokenNumMemObj, myPe * sizeof(index_t),
+      //                                      args.destPeTokenCounter[pe] + 1, pe);
+      //   }
+      // }
       if (laneId == 0) {
         // write number of token to send
         for (int peerPe = 0; peerPe < npes; ++peerPe) {
@@ -204,13 +211,17 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
       }
     }
 
-    // Same dest PE block barrier
-    LocalBarrier(&args.dispatchGridBarrier[destPe], numsBlockPerDestPe, thdId);
-    if (localBlockId == 0 && thdId == 0) {
-      index_t* sync = args.shmemMetaDataMemObj->template GetAs<index_t*>(destPe) + npes + myPe;
-      shmem::ShmemInt32WaitUntilEquals(sync, 0);
-      core::AtomicStoreRelaxedSystem(sync, SIGNAL_PUT_FINISHED);
-    }
+    // // Same dest PE block barrier
+    // __syncthreads();
+    // LocalBarrier(&args.dispatchGridBarrier[destPe], numsBlockPerDestPe, thdId);
+    // if (localBlockId == 0 && thdId == 0) {
+    //   index_t* sync = args.shmemSyncDataMemObj->template GetAs<index_t*>(destPe) + myPe;
+    //   shmem::ShmemInt32WaitUntilEquals(sync, 0);
+    //   core::AtomicStoreRelaxedSystem(sync, SIGNAL_PUT_FINISHED);
+    //   // clear meta data
+    //   core::AtomicStoreRelaxedSystem(args.shmemMetaDataMemObj->template GetAs<index_t*>() + destPe,
+    //                                  0);
+    // }
   } else {
     // last warp for coordinate, other warp for gather token
     const size_t stagingBaseOffset = destPe * MaxNumTokensToRecvPerRank * tokenPackSize;
@@ -253,29 +264,22 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
           shmem::ShmemPutTypeNbiThread<uint8_t>(args.shmemOutTokMemObj, dstOffset,
                                                 args.shmemStagingTokMemObj, srcOffset,
                                                 actualTokenNum * tokenSize, destPe);
-          // TODO check perf
-          shmem::ShmemPutTypeNbiThread<uint8_t>(
-              args.shmemOutWeightsMemObj, outputIdx * weightSize, args.shmemStagingTokMemObj,
-              stagingWeightBaseOffset + srcIdx * weightSize, actualTokenNum * weightSize, destPe);
-          shmem::ShmemPutTypeNbiThread<uint8_t>(
-              args.shmemOutIndicesMemObj, outputIdx * indiceSize, args.shmemStagingTokMemObj,
-              stagingIndiceBaseOffset + srcIdx * indiceSize, actualTokenNum * indiceSize, destPe);
-          if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
-            shmem::ShmemPutTypeNbiThread<uint8_t>(
-                args.shmemOutScalesMemObj, outputIdx * scaleSize, args.shmemStagingTokMemObj,
-                stagingScaleBaseOffset + srcIdx * scaleSize, actualTokenNum * scaleSize, destPe);
-          }
+          // // TODO check perf
+          // shmem::ShmemPutTypeNbiThread<uint8_t>(
+          //     args.shmemOutWeightsMemObj, outputIdx * weightSize, args.shmemStagingTokMemObj,
+          //     stagingWeightBaseOffset + srcIdx * weightSize, actualTokenNum * weightSize, destPe);
+          // shmem::ShmemPutTypeNbiThread<uint8_t>(
+          //     args.shmemOutIndicesMemObj, outputIdx * indiceSize, args.shmemStagingTokMemObj,
+          //     stagingIndiceBaseOffset + srcIdx * indiceSize, actualTokenNum * indiceSize, destPe);
+          // if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
+          //   shmem::ShmemPutTypeNbiThread<uint8_t>(
+          //       args.shmemOutScalesMemObj, outputIdx * scaleSize, args.shmemStagingTokMemObj,
+          //       stagingScaleBaseOffset + srcIdx * scaleSize, actualTokenNum * scaleSize, destPe);
+          // }
         }
 
         ++chunkIdx;
         chunkOffset += chunkTokenSize;
-      }
-
-      // Same dest PE block barrier
-      LocalBarrier(&args.dispatchGridBarrier[destPe], numsBlockPerDestPe, thdId);
-      if (localBlockId == 0 && laneId == 0) {  // TODO 连续跑会hang?
-        shmem::ShmemPutInt32ImmNbiThread(args.shmemMetaDataMemObj, (npes + myPe) * sizeof(index_t),
-                                         SIGNAL_PUT_FINISHED, destPe);
       }
     } else {
       int chunkIdx = 0;
@@ -303,24 +307,50 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
       }
       __threadfence_block();
     }
+
+    // // Same dest PE block barrier
+    // __syncthreads();
+    // LocalBarrier(&args.dispatchGridBarrier[destPe], numsBlockPerDestPe, thdId);
+    // if (localBlockId == 0 && thdId == 0) {  // TODO 连续跑会hang?
+    //   shmem::ShmemPutInt32ImmNbiThread(args.shmemSyncDataMemObj, myPe * sizeof(index_t),
+    //                                    SIGNAL_PUT_FINISHED, destPe);
+    //   // clear meta data
+    //   core::AtomicStoreRelaxedSystem(args.shmemMetaDataMemObj->template GetAs<index_t*>() + destPe,
+    //                                  0);
+    // }
   }
 
+  // Same dest PE block barrier
   __syncthreads();
+  LocalBarrier(&args.dispatchGridBarrier[destPe], numsBlockPerDestPe, thdId);
   if (localBlockId == 0 && thdId == 0) {
-    index_t* sync = args.shmemMetaDataMemObj->template GetAs<index_t*>() + (npes + destPe);
+    if (destNode == myNode) {
+      index_t* sync = args.shmemSyncDataMemObj->template GetAs<index_t*>(destPe) + myPe;
+      shmem::ShmemInt32WaitUntilEquals(sync, 0);
+      core::AtomicStoreRelaxedSystem(sync, SIGNAL_PUT_FINISHED);
+    } else {
+      shmem::ShmemPutInt32ImmNbiThread(args.shmemSyncDataMemObj, myPe * sizeof(index_t),
+                                       SIGNAL_PUT_FINISHED, destPe);
+    }
+    // clear meta data
+    core::AtomicStoreRelaxedSystem(args.shmemMetaDataMemObj->template GetAs<index_t*>() + destPe,
+                                   0);
+  }
+
+  if (localBlockId == 0 && thdId == 0) {
+    index_t* sync = args.shmemSyncDataMemObj->template GetAs<index_t*>() + destPe;
     shmem::ShmemInt32WaitUntilEquals(sync, SIGNAL_PUT_FINISHED);
     core::AtomicStoreRelaxedSystem(sync, 0);
   }
+
   // global warp barrier
-  LocalBarrier(&args.dispatchGridBarrier[npes], globalWarpNum, laneId);
-  // clear meta data
-  for (int i = globalThdId; i < npes * 2; ++i) {
-    core::AtomicStoreRelaxedSystem(args.shmemMetaDataMemObj->template GetAs<index_t*>() + i, 0);
-  }
+  // LocalBarrier(&args.dispatchGridBarrier[npes], globalWarpNum, laneId);
+
   for (int i = globalThdId; i < npes; ++i) {
     args.destPeTokenCounter[i] = 0;
   }
-  __syncthreads();
+
+  shmem::ShmemQuietThread();
 
   SyncIfDebugEnabled("Dispatch kernel: kernel end");
 }
