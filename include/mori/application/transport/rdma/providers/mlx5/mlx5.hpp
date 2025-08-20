@@ -2,7 +2,6 @@
 
 #include "infiniband/mlx5dv.h"
 #include "mori/application/transport/rdma/rdma.hpp"
-#include "src/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
 
 namespace mori {
 namespace application {
@@ -24,8 +23,8 @@ struct HcaCapability {
   uint32_t portType{0};
   uint32_t dbrRegSize{0};
 
-  bool IsEthernet() const { return portType == MLX5_CAP_PORT_TYPE_ETH; }
-  bool IsInfiniBand() const { return portType == MLX5_CAP_PORT_TYPE_IB; }
+  bool IsInfiniBand() const { return portType == 0x0; }
+  bool IsEthernet() const { return portType == 0x1; }
 };
 
 HcaCapability QueryHcaCap(ibv_context* context);

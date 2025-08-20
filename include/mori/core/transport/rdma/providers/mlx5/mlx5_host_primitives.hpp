@@ -5,7 +5,6 @@
 #include <atomic>
 
 #include "infiniband/mlx5dv.h"
-#include "mori/application/utils/udma_barrier.h"
 #include "mori/core/transport/rdma/device_primitives.hpp"
 #include "mori/core/transport/rdma/providers/mlx5/mlx5_defs.hpp"
 #include "mori/core/transport/rdma/providers/mlx5/utils.h"
@@ -163,7 +162,8 @@ inline __host__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum, ui
     opcode = PollCqOnce<ProviderType::MLX5>(cqAddr, cqeNum, consIdx);
     // printf("op code %d\n", opcode);
   } while (opcode < 0);
-  udma_from_device_barrier();
+  // TODO: for license reasone we delete dma barrier, when we want to use host primitives, add the
+  // barrier here udma_from_device_barrier();
 
   if (opcode == MLX5_CQE_RESP_ERR || opcode == MLX5_CQE_REQ_ERR) {
     int idx = consIdx % cqeNum;

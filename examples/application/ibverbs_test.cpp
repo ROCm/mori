@@ -2,7 +2,6 @@
 #include <mpi.h>
 
 #include "mori/application/application.hpp"
-#include "mori/application/utils/udma_barrier.h"
 #include "mori/core/core.hpp"
 
 using namespace mori;
