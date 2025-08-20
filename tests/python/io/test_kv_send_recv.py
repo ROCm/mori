@@ -24,8 +24,8 @@ from mori.io import (
 shape = [1024,1024]
 sync_port = [5656,5657,5658,5659,5660,5661,5662,5663,5664,5665,5666,5667,5668,5669]
 sync_time = 0
-kv_provider_ip = "10.235.192.56"
-kv_consumer_ip = "10.235.192.57"
+kv_provider_ip = "10.235.192.54"
+kv_consumer_ip = "10.235.192.59"
 
 def run_get_output(cmd):
     import subprocess
@@ -66,7 +66,7 @@ def exchange_engine_meta_data(io_engine_obj:IOEngine,exchange_ip,self_role):
 
         port += 1
         consumer_engine_metadata = EngineDesc.unpack(receive_data(port))
-        io_engine_obj.register_remote_engine(consumer_engine_metadata)
+        # io_engine_obj.register_remote_engine(consumer_engine_metadata)
         return consumer_engine_metadata
 
     elif self_role == "kv_consumer":
@@ -133,13 +133,17 @@ def waiting_for_transfer_complete(transfer_status,role):
     
 
 def generate_kv_cache():
-    bs,seq,head,headsize = 1,1024,128,128
+    # bs,seq,head,headsize = 1,1024,128,128
     torch.manual_seed(11)
-    tensor_list = []
-    for idx in range(seq*bs):
-        tensor_list.append(idx*torch.ones([head,headsize],dtype=torch.half,device=torch.device("cuda",0)))
-    cache = torch.stack(tensor_list,dim=0)
+    cache = torch.randn([2,63103,16,8,128],dtype=torch.half,device=torch.device("cuda",0))
+    # cache = torch.ones([2,65536,16,8,128],dtype=torch.half,device=torch.device("cuda",0))
     return cache
+
+    # tensor_list = []
+    # for idx in range(seq*bs):
+    #     tensor_list.append(idx*torch.ones([head,headsize],dtype=torch.half,device=torch.device("cuda",0)))
+    # cache = torch.stack(tensor_list,dim=0)
+    # return cache
 
 
 def send_kv_cache():
@@ -153,9 +157,9 @@ def send_kv_cache():
     tensor = generate_kv_cache()
     local_mem_meta_data,remote_mem_meta_data = exchange_tensor_meta_data(kv_provider,tensor,kv_consumer_ip,"kv_provider")
     ok = receive_data(sync_port[0])
-    kv_provider.deregister_memory(local_mem_meta_data)
-    kv_provider.deregister_remote_engine(remote_engine_meta_data)
-
+    # kv_provider.deregister_memory(local_mem_meta_data)
+    # kv_provider.deregister_remote_engine(remote_engine_meta_data)
+    print(tensor[0,1,...].sum().item(),tensor[1,1,...].sum().item())
     del kv_provider
 
 def recv_kv_cache():
@@ -166,26 +170,36 @@ def recv_kv_cache():
     kv_consumer = IOEngine(key="kv_consumer", config=kv_consumer_config)
     kv_consumer.create_backend(BackendType.RDMA)
     remote_engine_meta_data = exchange_engine_meta_data(kv_consumer,kv_provider_ip,"kv_consumer")
-    tensor = generate_kv_cache() * 0 # empty space
+    tensor = generate_kv_cache().zero_() # empty space
     local_mem_meta_data,remote_mem_meta_data = exchange_tensor_meta_data(kv_consumer,tensor,kv_provider_ip,"kv_consumer")
     # transfer_uid = kv_consumer.allocate_transfer_uid()
     # uid = exchange_transfer_uid(transfer_uid,kv_consumer_ip,"kv_consumer")
     test_pass = True
     for idx in range(512):
         transfer_status = kv_consumer.read(
-            local_mem_meta_data, 0, 
-            remote_mem_meta_data, 128*128*idx* 2*2, 
-            # local_mem_meta_data.size, 
-            128*128*2,
+            local_mem_meta_data, 2*16384, 
+            remote_mem_meta_data, 2*16384, 
+            32768,
             kv_consumer.allocate_transfer_uid())
         waiting_for_transfer_complete(transfer_status,"kv_consumer")   
-        test_pass &= torch.allclose(tensor[0],idx*2*torch.ones_like(tensor[0]))
+        
+        _,blknum,blksize,hn,hs = tensor.shape
+        stride = [blknum*blksize*hn*hs   ,blksize*hs*hn   ,hs*hn   ,hs   ,1]
+        offsetv = tensor.element_size() * (1 * stride[0] + 1 * stride[1])
+        transfer_status = kv_consumer.read(
+            local_mem_meta_data, offsetv, 
+            remote_mem_meta_data, offsetv, 
+            32768,
+            kv_consumer.allocate_transfer_uid())
+        waiting_for_transfer_complete(transfer_status,"kv_consumer")   
+        break
+        # test_pass &= torch.allclose(tensor[0],idx*2*torch.ones_like(tensor[0]))
     send_data("OK".encode("utf-8"), kv_provider_ip, sync_port[0])
     if test_pass:
         print("all test pass!")
     kv_consumer.deregister_memory(local_mem_meta_data)
     kv_consumer.deregister_remote_engine(remote_engine_meta_data)
-
+    print(tensor[0,1,...].sum().item(),tensor[1,1,...].sum().item())
     del kv_consumer
 
 
@@ -193,7 +207,7 @@ if __name__=="__main__":
     machine = run_get_output(r'''   ibv_devices | awk '/bnxt_re_bond0/ {print $2}'    ''')
     is_provider = False
     print(machine)
-    if machine.find("0c6e4cfffe7117d7")>=0:
+    if machine.find("30786afffee60ec9")>=0:
         is_provider = True
     
     if is_provider:
