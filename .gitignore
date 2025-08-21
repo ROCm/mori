@@ -9,3 +9,5 @@ lib*
 __pycache__
 
 .vscode
+
+3rdparty/msgpack-c/
