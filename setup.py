@@ -6,6 +6,7 @@ import shutil
 from setuptools import Command, Extension, find_packages, setup
 from setuptools.command.build import build as _build
 from setuptools.command.build_ext import build_ext
+from setuptools_scm import get_version
 
 
 def _get_torch_cmake_prefix_path() -> str:
@@ -73,7 +74,7 @@ extensions = [
 
 setup(
     name="mori",
-    version="0.0.0",
+    use_scm_version=True,
     description="Modular RDMA Interface",
     packages=find_packages(where="python"),
     package_dir={"": "python"},
@@ -82,6 +83,7 @@ setup(
         "build_ext": CMakeBuild,
         "build": CustomBuild,
     },
+    setup_requires=["setuptools_scm"],
     install_requires=["torch", "pytest-assume"],
     python_requires=">=3.10",
     ext_modules=extensions,
