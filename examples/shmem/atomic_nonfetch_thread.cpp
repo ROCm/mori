@@ -1,3 +1,24 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 #include <mpi.h>
 
 #include <cassert>
@@ -9,20 +30,21 @@ using namespace mori::core;
 using namespace mori::shmem;
 using namespace mori::application;
 
-__global__ void memsetD64Kernel(unsigned long long* dst, unsigned long long value, size_t count) {  
-    size_t idx = threadIdx.x + blockIdx.x * blockDim.x;  
-    if (idx < count) {  
-        dst[idx] = value;  
-    }  
-}  
-  
-void myHipMemsetD64(void* dst, unsigned long long value, size_t count) {  
-    const int blockSize = 256;  
-    const int gridSize = (count + blockSize - 1) / blockSize;  
-    memsetD64Kernel<<<gridSize, blockSize>>>(reinterpret_cast<unsigned long long*>(dst), value, count);  
+__global__ void memsetD64Kernel(unsigned long long* dst, unsigned long long value, size_t count) {
+  size_t idx = threadIdx.x + blockIdx.x * blockDim.x;
+  if (idx < count) {
+    dst[idx] = value;
+  }
 }
 
-template<typename T>
+void myHipMemsetD64(void* dst, unsigned long long value, size_t count) {
+  const int blockSize = 256;
+  const int gridSize = (count + blockSize - 1) / blockSize;
+  memsetD64Kernel<<<gridSize, blockSize>>>(reinterpret_cast<unsigned long long*>(dst), value,
+                                           count);
+}
+
+template <typename T>
 __global__ void AtomicNonFetchThreadKernel(int myPe, const SymmMemObjPtr memObj) {
   constexpr int sendPe = 0;
   constexpr int recvPe = 1;
@@ -43,8 +65,8 @@ __global__ void AtomicNonFetchThreadKernel(int myPe, const SymmMemObjPtr memObj)
   } else {
     while (atomicAdd(reinterpret_cast<T*>(memObj->localPtr) + globalTid, 0) != sendPe) {
     }
-    if (globalTid == 0){
-        printf("atomic nonfetch is ok!~\n");
+    if (globalTid == 0) {
+      printf("atomic nonfetch is ok!~\n");
     }
   }
 }

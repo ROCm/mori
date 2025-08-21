@@ -1,3 +1,24 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 #pragma once
 
 #include <assert.h>
@@ -62,8 +83,8 @@ DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Warp)
       const application::SymmMemObjPtr dest, size_t destElmOffset,                               \
       const application::RdmaMemoryRegion& source, size_t srcElmOffset, size_t nelems, int pe) { \
     constexpr size_t typeSize = sizeof(T);                                                       \
-    ShmemPutMemNbi##Scope(dest, destElmOffset* typeSize, source, srcElmOffset* typeSize,         \
-                          nelems* typeSize, pe);                                                 \
+    ShmemPutMemNbi##Scope(dest, destElmOffset * typeSize, source, srcElmOffset * typeSize,       \
+                          nelems * typeSize, pe);                                                \
   }                                                                                              \
   template <typename T>                                                                          \
   inline __device__ void ShmemPutTypeNbi##Scope(                                                 \
@@ -136,7 +157,7 @@ SHMEM_PUT_TYPE_IMM_NBI_API_TEMPLATE(Warp)
 #define DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(TypeName, T, Scope)                           \
   inline __device__ void ShmemPut##TypeName##ImmNbi##Scope(                             \
       const application::SymmMemObjPtr dest, size_t destOffset, uint32_t val, int pe) { \
-    ShmemPutTypeImmNbi##Scope<T>(dest, destOffset, val, pe);                     \
+    ShmemPutTypeImmNbi##Scope<T>(dest, destOffset, val, pe);                            \
   }
 
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint8, uint8_t, Thread)

@@ -1,3 +1,24 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 /*
  * Copyright (c) 2005 Topspin Communications.  All rights reserved.
  *
@@ -39,7 +60,7 @@
 
    These barriers are expliclty only for use with user DMA operations. If you
    are looking for barriers to use with cache-coherent multi-threaded
-   consitency then look in stdatomic.h. If you need both kinds of synchronicity
+   consistency then look in stdatomic.h. If you need both kinds of synchronicity
    for the same address then use an atomic operation followed by one
    of these barriers.
 
@@ -250,7 +271,7 @@
 
    Any access to a multi-value WC region must ensure that multiple cpus do not
    write to the same values concurrently, these macros make that
-   straightforward and efficient if the choosen exclusion is a spinlock.
+   straightforward and efficient if the chosen exclusion is a spinlock.
 
    The spinlock guarantees that the WC writes issued within the critical
    section are made visible as TLP to the device. The TLP must be seen by the

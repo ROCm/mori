@@ -1,6 +1,26 @@
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 import mori
 import os
-import time
 
 import torch
 import torch.distributed as dist
@@ -215,7 +235,7 @@ class EpDispatchCombineTestCase:
                 dispatch_weights[i], all_rank_weights[src_pe][src_tok_id]
             )
             # assert torch.equal(
-            #     dispatch_indicies[i], all_rank_indicies[src_pe][src_tok_id]
+            #     dispatch_indices[i], all_rank_indices[src_pe][src_tok_id]
             # )
             # TODO: test output scales
 
@@ -301,7 +321,7 @@ class EpDispatchCombineTestCase:
     def run_bench_once(self, op, test_data):
         (
             all_rank_num_token,
-            all_rank_indicies,
+            all_rank_indices,
             all_rank_input,
             all_rank_weights,
             all_rank_scales,
@@ -317,13 +337,13 @@ class EpDispatchCombineTestCase:
             dispatch_output,
             dispatch_weights,
             dispatch_scales,
-            dispatch_indicies,
+            dispatch_indices,
             dispatch_recv_num_token,
         ) = op.dispatch(
             all_rank_input[self.rank],
             all_rank_weights[self.rank],
             all_rank_scales[self.rank],
-            all_rank_indicies[self.rank],
+            all_rank_indices[self.rank],
         )
         end_event.record()
         torch.cuda.synchronize()
@@ -357,7 +377,7 @@ class EpDispatchCombineTestCase:
         combine_output, _ = op.combine(
             dispatch_output,
             None,
-            all_rank_indicies[self.rank],
+            all_rank_indices[self.rank],
             call_reset=False,
         )
         end_event.record()
