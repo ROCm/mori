@@ -10,6 +10,127 @@ namespace mori {
 namespace io {
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                                         Rdma Utilities                                         */
+/* ---------------------------------------------------------------------------------------------- */
+namespace {
+
+struct RdmaOpStatusHandle {
+  TransferStatus* status{nullptr};
+  int expctedNumCqe{0};
+  std::atomic<uint32_t> curNumCqe{0};
+};
+
+void RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id) {
+  for (int i = 0; i < eps.size(); i++) {
+    const application::RdmaEndpoint& ep = eps[i].local;
+    NotifMessage msg{id, i, static_cast<int>(eps.size())};
+
+    struct ibv_sge sge {};
+    sge.addr = reinterpret_cast<uintptr_t>(&msg);
+    sge.length = sizeof(NotifMessage);
+    sge.lkey = 0;
+
+    struct ibv_send_wr wr {};
+    wr.wr_id = id;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+
+    struct ibv_send_wr* bad_wr = nullptr;
+    int ret = ibv_post_send(ep.ibvHandle.qp, &wr, &bad_wr);
+    if (ret != 0) {
+      status->SetCode(StatusCode::ERROR);
+      status->SetMessage(strerror(errno));
+      return;
+    }
+  }
+}
+
+void RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
+                        const SizeVec& localOffsets, const application::RdmaMemoryRegion& remote,
+                        const SizeVec& remoteOffsets, const SizeVec& sizes, TransferStatus* status,
+                        TransferUniqueId id, bool isRead) {
+  assert(localOffsets.size() == remoteOffsets.size());
+  assert(sizes.size() == remoteOffsets.size());
+  size_t batchSize = sizes.size();
+  if (batchSize == 0) {
+    status->SetCode(StatusCode::SUCCESS);
+    return;
+  }
+
+  size_t epNum = eps.size();
+  size_t epBatchSize = (batchSize + epNum - 1) / epNum;
+
+  RdmaOpStatusHandle* internalStatus = new RdmaOpStatusHandle();
+  internalStatus->status = status;
+  internalStatus->expctedNumCqe = std::min(batchSize, epNum);
+
+  std::vector<struct ibv_sge> sges(batchSize, ibv_sge{});
+  std::vector<struct ibv_send_wr> wrs(batchSize, ibv_send_wr{});
+  for (int i = 0; i < epNum; i++) {
+    int st = epBatchSize * i;
+    int end = std::min(static_cast<size_t>(st) + epBatchSize, batchSize);
+    int mBatchSize = end - st;
+    if (mBatchSize == 0) break;
+
+    for (int j = st; j < end; j++) {
+      struct ibv_sge& sge = sges[j];
+      sge.addr = reinterpret_cast<uint64_t>(local.addr) + localOffsets[j];
+      sge.length = sizes[j];
+      sge.lkey = local.lkey;
+
+      struct ibv_send_wr& wr = wrs[j];
+      wr.wr_id = (j < (end - 1)) ? 0 : reinterpret_cast<uint64_t>(internalStatus);
+      wr.sg_list = &sge;
+      wr.num_sge = 1;
+      wr.opcode = isRead ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
+      wr.send_flags = (j < (end - 1)) ? 0 : IBV_SEND_SIGNALED;
+      wr.wr.rdma.remote_addr = reinterpret_cast<uint64_t>(remote.addr) + remoteOffsets[j];
+      wr.wr.rdma.rkey = remote.rkey;
+      wr.next = (j < (end - 1)) ? wrs.data() + j + 1 : nullptr;
+    }
+
+    int ret = ibv_post_send(eps[i].local.ibvHandle.qp, wrs.data() + st, nullptr);
+    if (ret != 0) {
+      status->SetCode(StatusCode::ERROR);
+      status->SetMessage(strerror(errno));
+      return;
+    }
+  }
+}
+
+void RdmaBatchRead(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
+                   const SizeVec& localOffsets, const application::RdmaMemoryRegion& remote,
+                   const SizeVec& remoteOffsets, const SizeVec& sizes, TransferStatus* status,
+                   TransferUniqueId id) {
+  RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, status, id,
+                     true /*isRead */);
+}
+
+void RdmaBatchWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
+                    const SizeVec& localOffsets, const application::RdmaMemoryRegion& remote,
+                    const SizeVec& remoteOffsets, const SizeVec& sizes, TransferStatus* status,
+                    TransferUniqueId id) {
+  RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, status, id,
+                     false /*isRead */);
+}
+
+void RdmaRead(const EpPairVec& eps, const application::RdmaMemoryRegion& local, size_t localOffset,
+              const application::RdmaMemoryRegion& remote, size_t remoteOffset, size_t size,
+              TransferStatus* status, TransferUniqueId id) {
+  RdmaBatchRead(eps, local, {localOffset}, remote, {remoteOffset}, {size}, status, id);
+}
+
+void RdmaWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local, size_t localOffset,
+               const application::RdmaMemoryRegion& remote, size_t remoteOffset, size_t size,
+               TransferStatus* status, TransferUniqueId id) {
+  RdmaBatchWrite(eps, local, {localOffset}, remote, {remoteOffset}, {size}, status, id);
+}
+
+};  // namespace
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                           RdmaManager                                          */
 /* ---------------------------------------------------------------------------------------------- */
 
@@ -268,28 +389,25 @@ void NotifManager::MainLoop() {
           SYSCALL_RETURN_ZERO(ibv_post_srq_recv(ctx.srq, &wr, &bad));
         } else if (wc.opcode == IBV_WC_SEND) {
           uint64_t id = wc.wr_id;
-          // printf("send notif for transfer %d\n", id);
         } else {
-          std::lock_guard<std::mutex> lock(mu);
-          // printf("data mov for transfer %lu %d\n", wc.wr_id, wc.opcode);
-          TransferStatus* status = reinterpret_cast<TransferStatus*>(wc.wr_id);
-          if (localNotif.find(status) == localNotif.end()) {
-            localNotif[status] = 0;
-          }
-          if (wc.status == IBV_WC_SUCCESS) {
-            localNotif[status] += 1;
-            if (localNotif[status] == config.qpPerTransfer) {
-              status->SetCode(StatusCode::SUCCESS);
-              status->SetMessage(ibv_wc_status_str(wc.status));
-              localNotif.erase(status);
+          RdmaOpStatusHandle* handle = reinterpret_cast<RdmaOpStatusHandle*>(wc.wr_id);
+          uint32_t lastNumCqe = handle->curNumCqe.fetch_add(1);
+          if (handle->status != nullptr) {
+            if (wc.status == IBV_WC_SUCCESS) {
+              if ((lastNumCqe + 1) == handle->expctedNumCqe) {
+                handle->status->SetCode(StatusCode::SUCCESS);
+                handle->status->SetMessage(ibv_wc_status_str(wc.status));
+              }
+            } else {
+              handle->status->SetCode(StatusCode::ERROR);
+              handle->status->SetMessage(ibv_wc_status_str(wc.status));
+              // set satus to nullptr indicate that transfer failed
+              handle->status = nullptr;
             }
-            // printf("set status %p\n", status);
-          } else {
-            status->SetCode(StatusCode::ERROR);
-            status->SetMessage(ibv_wc_status_str(wc.status));
-            localNotif.erase(status);
           }
-          // printf("set transfer status\n");
+          if ((lastNumCqe + 1) == handle->expctedNumCqe) {
+            free(handle);
+          }
         }
       }
     }
@@ -499,117 +617,6 @@ void ControlPlaneServer::Shutdown() {
   running.store(false);
   if (thd.joinable()) thd.join();
 }
-
-/* ---------------------------------------------------------------------------------------------- */
-/*                                         Rdma Utilities                                         */
-/* ---------------------------------------------------------------------------------------------- */
-namespace {
-
-void RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id) {
-  for (int i = 0; i < eps.size(); i++) {
-    const application::RdmaEndpoint& ep = eps[i].local;
-    NotifMessage msg{id, i, static_cast<int>(eps.size())};
-
-    struct ibv_sge sge {};
-    sge.addr = reinterpret_cast<uintptr_t>(&msg);
-    sge.length = sizeof(NotifMessage);
-    sge.lkey = 0;
-
-    struct ibv_send_wr wr {};
-    wr.wr_id = id;
-    wr.opcode = IBV_WR_SEND;
-    wr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
-
-    struct ibv_send_wr* bad_wr = nullptr;
-    int ret = ibv_post_send(ep.ibvHandle.qp, &wr, &bad_wr);
-    if (ret != 0) {
-      status->SetCode(StatusCode::ERROR);
-      status->SetMessage(strerror(errno));
-      return;
-    }
-  }
-}
-
-void RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
-                        const SizeVec& localOffsets, const application::RdmaMemoryRegion& remote,
-                        const SizeVec& remoteOffsets, const SizeVec& sizes, TransferStatus* status,
-                        TransferUniqueId id, bool isRead) {
-  assert(localOffsets.size() == remoteOffsets.size());
-  assert(sizes.size() == remoteOffsets.size());
-  size_t batchSize = sizes.size();
-  if (batchSize == 0) {
-    status->SetCode(StatusCode::SUCCESS);
-    return;
-  }
-
-  int epNum = eps.size();
-  int epBatchSize = (batchSize + epNum - 1) / epNum;
-
-  std::vector<struct ibv_sge> sges(batchSize, ibv_sge{});
-  std::vector<struct ibv_send_wr> wrs(batchSize, ibv_send_wr{});
-  for (int i = 0; i < epNum; i++) {
-    int st = epBatchSize * i;
-    int end = std::min(static_cast<size_t>(st + epBatchSize), batchSize);
-    int mBatchSize = end - st;
-    if (mBatchSize == 0) break;
-
-    for (int j = st; j < end; j++) {
-      struct ibv_sge& sge = sges[j];
-      sge.addr = reinterpret_cast<uint64_t>(local.addr) + localOffsets[j];
-      sge.length = sizes[j];
-      sge.lkey = local.lkey;
-
-      struct ibv_send_wr& wr = wrs[j];
-      wr.wr_id = (j < (end - 1)) ? 0 : reinterpret_cast<uint64_t>(status);
-      wr.sg_list = &sge;
-      wr.num_sge = 1;
-      wr.opcode = isRead ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
-      wr.send_flags = (j < (end - 1)) ? 0 : IBV_SEND_SIGNALED;
-      wr.wr.rdma.remote_addr = reinterpret_cast<uint64_t>(remote.addr) + remoteOffsets[j];
-      wr.wr.rdma.rkey = remote.rkey;
-      wr.next = (j < (end - 1)) ? wrs.data() + j + 1 : nullptr;
-    }
-
-    int ret = ibv_post_send(eps[i].local.ibvHandle.qp, wrs.data() + st, nullptr);
-    if (ret != 0) {
-      status->SetCode(StatusCode::ERROR);
-      status->SetMessage(strerror(errno));
-      return;
-    }
-  }
-}
-
-void RdmaBatchRead(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
-                   const SizeVec& localOffsets, const application::RdmaMemoryRegion& remote,
-                   const SizeVec& remoteOffsets, const SizeVec& sizes, TransferStatus* status,
-                   TransferUniqueId id) {
-  RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, status, id,
-                     true /*isRead */);
-}
-
-void RdmaBatchWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
-                    const SizeVec& localOffsets, const application::RdmaMemoryRegion& remote,
-                    const SizeVec& remoteOffsets, const SizeVec& sizes, TransferStatus* status,
-                    TransferUniqueId id) {
-  RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, status, id,
-                     false /*isRead */);
-}
-
-void RdmaRead(const EpPairVec& eps, const application::RdmaMemoryRegion& local, size_t localOffset,
-              const application::RdmaMemoryRegion& remote, size_t remoteOffset, size_t size,
-              TransferStatus* status, TransferUniqueId id) {
-  RdmaBatchRead(eps, local, {localOffset}, remote, {remoteOffset}, {size}, status, id);
-}
-
-void RdmaWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local, size_t localOffset,
-               const application::RdmaMemoryRegion& remote, size_t remoteOffset, size_t size,
-               TransferStatus* status, TransferUniqueId id) {
-  RdmaBatchWrite(eps, local, {localOffset}, remote, {remoteOffset}, {size}, status, id);
-}
-
-};  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                       RdmaBackendSession                                       */

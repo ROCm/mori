@@ -30,7 +30,7 @@ class CMakeBuild(build_ext):
         build_lib.mkdir(parents=True, exist_ok=True)
 
         root_dir = Path(__file__).parent
-        build_dir = root_dir / "build"
+        build_dir = root_dir / os.environ.get("MORI_PYBUILD_DIR", "build")
         build_dir.mkdir(parents=True, exist_ok=True)
 
         unroll_value = os.environ.get("WARP_ACCUM_UNROLL", "1")
