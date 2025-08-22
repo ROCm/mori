@@ -326,7 +326,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
     if (num_free_entries > num_entries_until_warp_last_entry) {
       break;
     }
-    ShmemQuietThreadKernelImpl<PrvdType>(pe);
+    ShmemQuietThreadKernelSerialImpl<PrvdType>(pe);
   }
   uint64_t dbr_val;
   if constexpr (PrvdType == core::ProviderType::MLX5) {
@@ -463,7 +463,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
     if (num_free_entries > num_entries_until_warp_last_entry) {
       break;
     }
-    ShmemQuietThreadKernelImpl<PrvdType>(pe);
+    ShmemQuietThreadKernelSerialImpl<PrvdType>(pe);
   }
 
   uint64_t dbr_val;
