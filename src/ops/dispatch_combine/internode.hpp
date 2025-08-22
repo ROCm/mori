@@ -420,11 +420,8 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
         const index_t dstIdx =
             myPe * MaxNumTokensToRecvPerRank + startIdx + chunkIdx * chunkTokenSize;
         size_t dstOffset = dstIdx * size_t(config.hiddenDim);
-        if (laneId == 0) {
-          shmem::ShmemPutTypeNbiThread<T>(args.shmemInpTokMemObj, dstOffset,
-                                          args.shmemStagingTokMemObj, srcOffset,
-                                          chunkTokenSize * size_t(config.hiddenDim), srcPe);
-        }
+        shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, dstOffset, args.shmemStagingTokMemObj,
+                                      srcOffset, chunkTokenSize * size_t(config.hiddenDim), srcPe);
       }
       // last chunk
       if (remainTokenNum != 0) {
