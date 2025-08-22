@@ -61,6 +61,60 @@ namespace shmem {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Synchronization                                        */
 /* ---------------------------------------------------------------------------------------------- */
+
+template <core::ProviderType PrvdType>
+inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe) {
+  if (threadIdx.x != 0) return;
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  application::CompletionQueueHandle& cq = ep[pe].cqHandle;
+  application::WorkQueueHandle& wq = ep[pe].wqHandle;
+  while (true) {
+    bool done{false};
+    uint32_t quiet_amount{0};
+    uint32_t my_cq_consumer{0};
+
+    uint32_t dbTouchIdx =
+        __hip_atomic_load(&wq.dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint32_t doneIdx = __hip_atomic_load(&wq.doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    // printf("dbTouchIdx: %u, doneIdx: %u\n", dbTouchIdx, doneIdx);
+    if (dbTouchIdx == doneIdx) {
+      return;
+    }
+
+    my_cq_consumer =
+        __hip_atomic_fetch_add(&cq.cq_consumer, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+
+    uint16_t wqe_counter;
+    uint64_t wqe_id;
+    int opcode = core::PollCq<PrvdType>(cq.cqAddr, cq.cqeNum, &my_cq_consumer, &wqe_counter);
+    if constexpr (PrvdType == core::ProviderType::MLX5) {
+      if (opcode == MLX5_CQE_RESP_ERR || opcode == MLX5_CQE_REQ_ERR) {
+        int rank = globalGpuStates->rank;
+        uint32_t my_cq_index = my_cq_consumer % cq.cqeNum;
+        printf("rank %d dest pe %d consIdx %d opcode %d\n", rank, pe, my_cq_index, opcode);
+        core::DumpMlx5Wqe(wq.sqAddr, my_cq_index);
+        assert(false);
+      }
+      wqe_id = wq.outstandingWqe[wqe_counter];
+    } else if constexpr (PrvdType == core::ProviderType::BNXT) {
+      if (opcode != BNXT_RE_REQ_ST_OK) {
+        int rank = globalGpuStates->rank;
+        uint32_t my_cq_index = my_cq_consumer % cq.cqeNum;
+        printf("rank %d dest pe %d consIdx %d opcode %d\n", rank, pe, my_cq_index, opcode);
+        assert(false);
+      }
+      wqe_counter = (BNXT_RE_NUM_SLOT_PER_WQE * (wqe_counter + wq.sqWqeNum -1 ) % wq.sqWqeNum);
+      wqe_id = wq.outstandingWqe[wqe_counter] + BNXT_RE_NUM_SLOT_PER_WQE;
+    }
+
+    core::UpdateCqDbrRecord<PrvdType>(cq.dbrRecAddr, (uint32_t)(my_cq_consumer + 1), cq.cqeNum);
+
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    __hip_atomic_fetch_max(&wq.doneIdx, wqe_id, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  }
+}
+
 template <core::ProviderType PrvdType>
 inline __device__ void ShmemQuietThreadKernelImpl(int pe) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
@@ -159,10 +213,10 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int rank = globalGpuStates->rank;
   int worldSize = globalGpuStates->worldSize;
-  for (int pe = 0; pe < worldSize; pe++) {
-    if (pe == rank) continue;
-    if (globalGpuStates->transportTypes[pe] != application::TransportType::RDMA) continue;
-    DISPATCH_PROVIDER_TYPE_EP(ep, ShmemQuietThreadKernelImpl, pe);
+  for (int pe = blockIdx.x; pe < worldSize; pe += gridDim.x) {
+    if (pe != rank && globalGpuStates->transportTypes[pe] == application::TransportType::RDMA) {
+      DISPATCH_PROVIDER_TYPE_EP(ep, ShmemQuietThreadKernelSerialImpl, pe);
+    }
   }
 }
 
@@ -173,7 +227,7 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(
   int rank = globalGpuStates->rank;
   if (pe == rank) return;
   if (globalGpuStates->transportTypes[pe] != application::TransportType::RDMA) return;
-  DISPATCH_PROVIDER_TYPE_EP(ep, ShmemQuietThreadKernelImpl, pe);
+  DISPATCH_PROVIDER_TYPE_EP(ep, ShmemQuietThreadKernelSerialImpl, pe);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -297,6 +351,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_wqes);
     // __threadfence_system();
     core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
+    __threadfence_system();
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     if constexpr (PrvdType == core::ProviderType::MLX5) {
@@ -307,7 +362,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
   }
-  __threadfence_system();
+  // __threadfence_system();
 }
 
 template <>
@@ -435,6 +490,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_wqes);
     // __threadfence_system();
     core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
+    __threadfence_system();
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     if constexpr (PrvdType == core::ProviderType::MLX5) {
@@ -445,7 +501,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
   }
-  __threadfence_system();
+  // __threadfence_system();
 }
 
 template <>

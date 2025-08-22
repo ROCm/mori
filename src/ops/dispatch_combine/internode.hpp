@@ -315,6 +315,9 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
     }
   }
   SyncIfDebugEnabled("Dispatch kernel: kernel end");
+  if (localBlockId == 0 && warpId == 0) {
+    shmem::ShmemQuietThread(destPe);
+  }
 }
 
 /* ---------------------------------------------------------------------------------------------- */
