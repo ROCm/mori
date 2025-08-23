@@ -96,5 +96,5 @@ pytest tests/python/io/
 # Benchmark performance
 # Run the following command on two nodes
 export GLOO_SOCKET_IFNAME=ens14np0
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.194.129.65" --master_port=1234 tests/python/io/benchmark.py --host="10.194.129.65" --enable-batch-transfer --enable-sess --buffer-size 32768 --transfer-batch-size 128
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.194.129.65" --master_port=1234 tests/python/io/benchmark.py --host="10.194.129.65" --enable-batch-transfer --enable-sess --buffer-size 32768 --transfer-batch-size 128 --num-initiator-dev 1 --num-target-dev 1 --num-qp-per-transfer 1
 ```

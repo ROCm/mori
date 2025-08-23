@@ -266,6 +266,7 @@ class MoriIoBenchmark:
             master_addr=None,
             master_port=None,
             device_id=self.role_rank,
+            backend="gloo",
         ):
             self.initialize()
             self.run_once()
