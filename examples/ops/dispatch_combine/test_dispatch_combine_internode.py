@@ -25,7 +25,7 @@ class EpDispatchCombineTestCase:
             num_experts_per_rank=16,
             num_experts_per_token=8,
             warp_num_per_block=16,
-            block_num=16,
+            block_num=64,
             max_token_type_size=2,
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNode,
         )

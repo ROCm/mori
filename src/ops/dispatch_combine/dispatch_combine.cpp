@@ -35,11 +35,20 @@ EpDispatchCombineHandle::~EpDispatchCombineHandle() {
   FinalizeBarrier();
 }
 
-mori::application::SymmMemObjPtr ShmemMallocAndReturnMemObjPtr(size_t size, unsigned int flags) {
+mori::application::SymmMemObjPtr ShmemMallocAndReturnMemObjPtr(size_t size, unsigned int flags,
+                                                               const char* file = __FILE__,
+                                                               int line = __LINE__) {
   void* buf = ShmemExtMallocWithFlags(size, flags);
   HIP_RUNTIME_CHECK(hipMemset(buf, 0, size));
   mori::application::SymmMemObjPtr obj = ShmemQueryMemObjPtr(buf);
   assert(obj.IsValid());
+#if 0
+  int dev = 0;
+  HIP_RUNTIME_CHECK(hipGetDevice(&dev));
+  if (dev == 0) {
+    printf("[ShmemMalloc] %s:%d device=%d size=%zu bytes\n", file, line, dev, size);
+  }
+#endif
   return obj;
 }
 
@@ -50,6 +59,7 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
                              (config.hiddenDim * config.maxTokenTypeSize +
                               (sizeof(float) + sizeof(index_t)) * config.numExpertPerToken +
                               config.scaleDim * config.scaleTypeSize);
+  // printf("MaxNumTokensToRecv=%d\n", config.MaxNumTokensToRecv());
   shmemInpTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
   shmemOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
   shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
@@ -106,9 +116,12 @@ void EpDispatchCombineHandle::FinalizeTokenNumSignalBuf() {
 
 void EpDispatchCombineHandle::IntializeOrderMapBuf() {
   size_t maxNumOutToken = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerRank;
+  // HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&dispReceiverIdxMap),
+  //                                    maxNumOutToken * sizeof(index_t)));
+  // HIP_RUNTIME_CHECK(hipMemset(dispReceiverIdxMap, 0, maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&dispReceiverIdxMap),
-                                     maxNumOutToken * sizeof(index_t)));
-  HIP_RUNTIME_CHECK(hipMemset(dispReceiverIdxMap, 0, maxNumOutToken * sizeof(index_t)));
+                                        config.worldSize * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMemset(dispReceiverIdxMap, 0, config.worldSize * sizeof(index_t)));
 
   HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&dispSenderIdxMap),
                                      maxNumOutToken * sizeof(index_t)));

@@ -106,7 +106,7 @@ class EpDispatchCombineTestCase {
     EpDispatchCombineConfig& config = handle.config;
 
     // Set kernel input/output token buffer
-    int maxTokenSize = config.MaxNumTokensToRecvPerRank() * config.hiddenDim * sizeof(T);
+    int maxTokenSize = config.MaxNumTokensToRecv() * config.hiddenDim * sizeof(T);
     HIP_RUNTIME_CHECK(hipMalloc(&inpTokBuf, maxTokenSize));
     HIP_RUNTIME_CHECK(hipMemset(inpTokBuf, 0, maxTokenSize));
     HIP_RUNTIME_CHECK(hipMalloc(&outTokBuf, maxTokenSize));
@@ -455,10 +455,10 @@ class EpDispatchCombineTestCase {
     //                             config.MaxNumTokensToRecvPerRank() * config.hiddenDim *
     //                             sizeof(T), hipMemcpyDeviceToDevice));
     HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, handle.shmemOutTokMemObj->template GetAs<T*>(),
-                                config.MaxNumTokensToRecvPerRank() * config.hiddenDim * sizeof(T),
+                                config.MaxNumTokensToRecv() * config.hiddenDim * sizeof(T),
                                 hipMemcpyDeviceToDevice));
     HIP_RUNTIME_CHECK(
-        hipMemset(outTokBuf, 0, config.MaxNumTokensToRecvPerRank() * config.hiddenDim * sizeof(T)));
+        hipMemset(outTokBuf, 0, config.MaxNumTokensToRecv() * config.hiddenDim * sizeof(T)));
     // HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   }
 

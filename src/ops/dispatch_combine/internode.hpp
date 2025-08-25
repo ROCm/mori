@@ -155,7 +155,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
         for (int pe = 0; pe < npes; ++pe) {
           index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>() + pe;
           recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
-          args.dispReceiverIdxMap[pe] = recvTokenNum;  // TODO 按照实际大小开
+          args.dispReceiverIdxMap[pe] = recvTokenNum;  // TODO modify dispReceiverIdxMap size
           sum += prevRecvTokenNum;
           prevRecvTokenNum = recvTokenNum;
           args.recvTokenOffset[pe] = sum;
@@ -172,7 +172,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
         }
         // args.dispReceiverIdxMap[npes] = sum;
 
-        *args.localPeTokenCounter = npes;  // TODO 和dispReceiverIdxMap一起改一下
+        *args.localPeTokenCounter = npes;  // TODO modify size
         *args.totalRecvTokenNum = sum;     // TODO
       }
     }
@@ -252,18 +252,18 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
           shmem::ShmemPutTypeNbiThread<uint8_t>(args.shmemOutTokMemObj, dstOffset,
                                                 args.shmemStagingTokMemObj, srcOffset,
                                                 actualTokenNum * tokenSize, destPe);
-          // // TODO check perf
-          // shmem::ShmemPutTypeNbiThread<uint8_t>(
-          //     args.shmemOutWeightsMemObj, outputIdx * weightSize, args.shmemStagingTokMemObj,
-          //     stagingWeightBaseOffset + srcIdx * weightSize, actualTokenNum * weightSize, destPe);
-          // shmem::ShmemPutTypeNbiThread<uint8_t>(
-          //     args.shmemOutIndicesMemObj, outputIdx * indiceSize, args.shmemStagingTokMemObj,
-          //     stagingIndiceBaseOffset + srcIdx * indiceSize, actualTokenNum * indiceSize, destPe);
-          // if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
-          //   shmem::ShmemPutTypeNbiThread<uint8_t>(
-          //       args.shmemOutScalesMemObj, outputIdx * scaleSize, args.shmemStagingTokMemObj,
-          //       stagingScaleBaseOffset + srcIdx * scaleSize, actualTokenNum * scaleSize, destPe);
-          // }
+          // TODO check perf
+          shmem::ShmemPutTypeNbiThread<uint8_t>(
+              args.shmemOutWeightsMemObj, outputIdx * weightSize, args.shmemStagingTokMemObj,
+              stagingWeightBaseOffset + srcIdx * weightSize, actualTokenNum * weightSize, destPe);
+          shmem::ShmemPutTypeNbiThread<uint8_t>(
+              args.shmemOutIndicesMemObj, outputIdx * indiceSize, args.shmemStagingTokMemObj,
+              stagingIndiceBaseOffset + srcIdx * indiceSize, actualTokenNum * indiceSize, destPe);
+          if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
+            shmem::ShmemPutTypeNbiThread<uint8_t>(
+                args.shmemOutScalesMemObj, outputIdx * scaleSize, args.shmemStagingTokMemObj,
+                stagingScaleBaseOffset + srcIdx * scaleSize, actualTokenNum * scaleSize, destPe);
+          }
         }
 
         ++chunkIdx;
@@ -468,7 +468,7 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
         chunkOffset += chunkTokenSize;
       }
     } else {
-      // TODO 多机也可以支持不用external buffer input staging可以改成max recv大小
+      // TODO support no external buffer
       // int warpTokens = 0;
       int chunkIdx = 0;
       for (int idx = warpId; idx < endIdx - startIdx; idx += chunkTokenSize) {
