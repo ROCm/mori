@@ -486,8 +486,6 @@ void RdmaBackend::Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remo
   TopoKey local{localDest.deviceId, localDest.loc};
   TopoKey remote{remoteSrc.deviceId, remoteSrc.loc};
   TopoKeyPair kp{local, remote};
-  std::cout<<"\n\n\nzovlog:moio engine:RdmaBackend::Read localDest.data = "<<reinterpret_cast<uintptr_t>(localDest.data)
-          << ",localOffset = "<<localOffset<<",remoteSrc.data = "<<reinterpret_cast<uintptr_t>(remoteSrc.data)<<",remoteOffset = "<<remoteOffset<<",size = "<<size<<"\n\n\n";
   EngineKey ekey = remoteSrc.engineKey;
 
   // Create a pair of endpoint if none
@@ -526,13 +524,8 @@ void RdmaBackend::Read(MemoryDesc localDest, size_t localOffset, MemoryDesc remo
   wr.wr.rdma.rkey = remoteMr->rkey;
 
   int ret = ibv_post_send(ep.local.ibvHandle.qp, &wr, &bad_wr);
-  if (ret != 0) {
-    std::cout<<"zovlog:moriio engine ibv_post_send FAILED!!!!!!!!!!-----> ret = "<<ret<<"\n\n\n";
-    status->SetCode(StatusCode::ERROR);
-    status->SetMessage(strerror(errno));
-  }else{
-    std::cout<<"zovlog:moriio engine ibv_post_send SUCCESS!!!!!!!!!-----> ret = "<<ret<<"\n\n\n";
-  }
+  status->SetCode(StatusCode::ERROR);
+  status->SetMessage(strerror(errno));
 
   RdmaNotifyTransfer(ep.local, status, id);
 }

@@ -50,7 +50,6 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryL
   memDesc.data = data;
   memDesc.size = size;
   memDesc.loc = loc;
-  std::cout<<"\n\n\nzovlog:moriio engine:IOEngine::RegisterMemory----> data = "<<reinterpret_cast<uintptr_t>(data)<<",size = "<<size<<"\n\n\n";
   for (auto& it : backends) {
     it.second->RegisterMemory(memDesc);
   }

@@ -135,8 +135,8 @@ def waiting_for_transfer_complete(transfer_status,role):
 def generate_kv_cache():
     # bs,seq,head,headsize = 1,1024,128,128
     torch.manual_seed(11)
-    cache = torch.randn([2,63103,16,8,128],dtype=torch.half,device=torch.device("cuda",0))
-    # cache = torch.ones([2,65536,16,8,128],dtype=torch.half,device=torch.device("cuda",0))
+    # cache = torch.randn([2,63103,16,8,128],dtype=torch.half,device=torch.device("cuda",0))
+    cache = torch.ones([2,65536,16,8,128],dtype=torch.half,device=torch.device("cuda",0))
     return cache
 
     # tensor_list = []
@@ -174,15 +174,20 @@ def recv_kv_cache():
     local_mem_meta_data,remote_mem_meta_data = exchange_tensor_meta_data(kv_consumer,tensor,kv_provider_ip,"kv_consumer")
     # transfer_uid = kv_consumer.allocate_transfer_uid()
     # uid = exchange_transfer_uid(transfer_uid,kv_consumer_ip,"kv_consumer")
+    all_transfer_status = []
     test_pass = True
-    for idx in range(512):
-        transfer_status = kv_consumer.read(
-            local_mem_meta_data, 2*16384, 
-            remote_mem_meta_data, 2*16384, 
-            32768,
-            kv_consumer.allocate_transfer_uid())
-        waiting_for_transfer_complete(transfer_status,"kv_consumer")   
-        
+    for size in range(1,65):
+        for idx in range(1024):
+            transfer_status = kv_consumer.read(
+                local_mem_meta_data, 0, 
+                remote_mem_meta_data, 0, 
+                1024*size,
+                kv_consumer.allocate_transfer_uid())
+            all_transfer_status.append(transfer_status)
+    while all_transfer_status:
+        status = all_transfer_status.pop(0)
+        waiting_for_transfer_complete(status,"kv_consumer")   
+        '''
         _,blknum,blksize,hn,hs = tensor.shape
         stride = [blknum*blksize*hn*hs   ,blksize*hs*hn   ,hs*hn   ,hs   ,1]
         offsetv = tensor.element_size() * (1 * stride[0] + 1 * stride[1])
@@ -193,6 +198,7 @@ def recv_kv_cache():
             kv_consumer.allocate_transfer_uid())
         waiting_for_transfer_complete(transfer_status,"kv_consumer")   
         break
+        '''
         # test_pass &= torch.allclose(tensor[0],idx*2*torch.ones_like(tensor[0]))
     send_data("OK".encode("utf-8"), kv_provider_ip, sync_port[0])
     if test_pass:
