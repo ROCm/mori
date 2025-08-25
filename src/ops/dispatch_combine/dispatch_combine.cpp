@@ -93,7 +93,8 @@ void EpDispatchCombineHandle::IntializeTokenNumSignalBuf() {
   recvTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
   sendTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
 
-  HIP_RUNTIME_CHECK(hipMalloc(&totalRecvTokenNum, sizeof(index_t)));
+  HIP_RUNTIME_CHECK(
+      HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&totalRecvTokenNum), sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(totalRecvTokenNum, 0, sizeof(index_t)));
 }
 
@@ -105,29 +106,36 @@ void EpDispatchCombineHandle::FinalizeTokenNumSignalBuf() {
 
 void EpDispatchCombineHandle::IntializeOrderMapBuf() {
   size_t maxNumOutToken = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerRank;
-  HIP_RUNTIME_CHECK(hipMalloc(&dispReceiverIdxMap, maxNumOutToken * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&dispReceiverIdxMap),
+                                     maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispReceiverIdxMap, 0, maxNumOutToken * sizeof(index_t)));
 
-  HIP_RUNTIME_CHECK(hipMalloc(&dispSenderIdxMap, maxNumOutToken * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&dispSenderIdxMap),
+                                     maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispSenderIdxMap, 0, maxNumOutToken * sizeof(index_t)));
 
-  HIP_RUNTIME_CHECK(hipMalloc(&destPeTokenIdxMap, maxNumOutToken * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&destPeTokenIdxMap),
+                                     maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(destPeTokenIdxMap, -1, maxNumOutToken * sizeof(index_t)));
 
-  HIP_RUNTIME_CHECK(hipMalloc(&recvTokenOffset, config.worldSize * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&recvTokenOffset),
+                                     config.worldSize * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(recvTokenOffset, 0, config.worldSize * sizeof(index_t)));
 
-  HIP_RUNTIME_CHECK(hipMalloc(&destPeTokenCounter, config.worldSize * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&destPeTokenCounter),
+                                     config.worldSize * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(destPeTokenCounter, 0, config.worldSize * sizeof(index_t)));
 
-  HIP_RUNTIME_CHECK(hipMalloc(&localPeTokenCounter, config.numExpertPerRank * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&localPeTokenCounter),
+                                     config.numExpertPerRank * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(localPeTokenCounter, 0, config.numExpertPerRank * sizeof(index_t)));
 
   dispTokOffsetMemObj = ShmemMallocAndReturnMemObjPtr(sizeof(index_t), hipDeviceMallocUncached);
   dispTokIdToSrcTokIdMemObj =
       ShmemMallocAndReturnMemObjPtr(maxNumOutToken * sizeof(index_t), hipDeviceMallocUncached);
 
-  HIP_RUNTIME_CHECK(hipMalloc(&dispDestTokIdMap, maxNumOutToken * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&dispDestTokIdMap),
+                                     maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispDestTokIdMap, 0, maxNumOutToken * sizeof(index_t)));
 }
 
@@ -145,9 +153,9 @@ void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
 
 void EpDispatchCombineHandle::IntializeBarrier() {
   size_t barrierSize = (config.worldSize + 1) * sizeof(uint32_t);
-  HIP_RUNTIME_CHECK(hipMalloc(&dispatchGridBarrier, barrierSize));
+  HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&dispatchGridBarrier), barrierSize));
   HIP_RUNTIME_CHECK(hipMemset(dispatchGridBarrier, 0, barrierSize));
-  HIP_RUNTIME_CHECK(hipMalloc(&combineGridBarrier, barrierSize));
+  HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&combineGridBarrier), barrierSize));
   HIP_RUNTIME_CHECK(hipMemset(combineGridBarrier, 0, barrierSize));
   crossDeviceBarrierMemObj = ShmemMallocAndReturnMemObjPtr(barrierSize, hipDeviceMallocUncached);
 }

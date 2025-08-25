@@ -32,7 +32,7 @@ void SymmMemManager::HostFree(void* localPtr) {
 
 SymmMemObjPtr SymmMemManager::Malloc(size_t size) {
   void* ptr = nullptr;
-  HIP_RUNTIME_CHECK(hipMalloc(&ptr, size));
+  HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(&ptr, size));
   HIP_RUNTIME_CHECK(hipMemset(ptr, 0, size));
   return RegisterSymmMemObj(ptr, size);
 }
@@ -90,14 +90,16 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
 
   // Copy memory object to GPU memory, we need to access it from GPU directly
   SymmMemObj* gpuMemObj;
-  HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj, sizeof(SymmMemObj)));
+  HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&gpuMemObj), sizeof(SymmMemObj)));
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj, cpuMemObj, sizeof(SymmMemObj), hipMemcpyHostToDevice));
 
-  HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->peerPtrs, sizeof(uintptr_t) * worldSize));
+  HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&gpuMemObj->peerPtrs),
+                                     sizeof(uintptr_t) * worldSize));
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerPtrs, cpuMemObj->peerPtrs,
                               sizeof(uintptr_t) * worldSize, hipMemcpyHostToDevice));
 
-  HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->peerRkeys, sizeof(uint32_t) * worldSize));
+  HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&gpuMemObj->peerRkeys),
+                                     sizeof(uint32_t) * worldSize));
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerRkeys, cpuMemObj->peerRkeys,
                               sizeof(uint32_t) * worldSize, hipMemcpyHostToDevice));
 

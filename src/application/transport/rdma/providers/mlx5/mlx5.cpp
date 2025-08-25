@@ -65,7 +65,7 @@ Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig&
   cqSize = (cqSize + config.alignment - 1) / config.alignment * config.alignment;
 
   if (config.onGpu) {
-    HIP_RUNTIME_CHECK(hipMalloc(&cqUmemAddr, cqSize));
+    HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(&cqUmemAddr, cqSize));
     HIP_RUNTIME_CHECK(hipMemset(cqUmemAddr, 0, cqSize));
   } else {
     int status = posix_memalign(&cqUmemAddr, config.alignment, cqSize);
@@ -78,7 +78,7 @@ Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig&
 
   // Allocate user memory for CQ DBR (doorbell?)
   if (config.onGpu) {
-    HIP_RUNTIME_CHECK(hipMalloc(&cqDbrUmemAddr, 8));
+    HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(&cqDbrUmemAddr, 8));
     HIP_RUNTIME_CHECK(hipMemset(cqDbrUmemAddr, 0, 8));
   } else {
     int status = posix_memalign(&cqDbrUmemAddr, 8, 8);
@@ -171,7 +171,7 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   // Allocate user memory for QP
 
   if (config.onGpu) {
-    HIP_RUNTIME_CHECK(hipMalloc(&qpUmemAddr, qpTotalSize));
+    HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(&qpUmemAddr, qpTotalSize));
     HIP_RUNTIME_CHECK(hipMemset(qpUmemAddr, 0, qpTotalSize));
   } else {
     status = posix_memalign(&qpUmemAddr, config.alignment, qpTotalSize);
@@ -184,7 +184,7 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
 
   // Allocate user memory for DBR (doorbell?)
   if (config.onGpu) {
-    HIP_RUNTIME_CHECK(hipMalloc(&qpDbrUmemAddr, 8));
+    HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(&qpDbrUmemAddr, 8));
     HIP_RUNTIME_CHECK(hipMemset(qpDbrUmemAddr, 0, 8));
   } else {
     status = posix_memalign(&qpDbrUmemAddr, 8, 8);

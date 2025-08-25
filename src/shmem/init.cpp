@@ -47,22 +47,23 @@ void GpuStateInit() {
   gpuStates.worldSize = worldSize;
 
   // Copy transport types to GPU
-  HIP_RUNTIME_CHECK(
-      hipMalloc(&gpuStates.transportTypes, sizeof(application::TransportType) * worldSize));
+  HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&gpuStates.transportTypes),
+                                     sizeof(application::TransportType) * worldSize));
   HIP_RUNTIME_CHECK(
       hipMemcpy(gpuStates.transportTypes, rdmaStates->commContext->GetTransportTypes().data(),
                 sizeof(application::TransportType) * worldSize, hipMemcpyHostToDevice));
 
   // Copy endpoints to GPU
   if (rdmaStates->commContext->RdmaTransportEnabled()) {
-    HIP_RUNTIME_CHECK(
-        hipMalloc(&gpuStates.rdmaEndpoints, sizeof(application::RdmaEndpoint) * worldSize));
+    HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&gpuStates.rdmaEndpoints),
+                                       sizeof(application::RdmaEndpoint) * worldSize));
     HIP_RUNTIME_CHECK(
         hipMemcpy(gpuStates.rdmaEndpoints, rdmaStates->commContext->GetRdmaEndpoints().data(),
                   sizeof(application::RdmaEndpoint) * worldSize, hipMemcpyHostToDevice));
 
     size_t lockSize = worldSize * sizeof(uint32_t);
-    HIP_RUNTIME_CHECK(hipMalloc(&gpuStates.endpointLock, lockSize));
+    HIP_RUNTIME_CHECK(
+        HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&gpuStates.endpointLock), lockSize));
     HIP_RUNTIME_CHECK(hipMemset(gpuStates.endpointLock, 0, lockSize));
   }
 
