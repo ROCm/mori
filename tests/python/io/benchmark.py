@@ -330,6 +330,7 @@ class MoriIoBenchmark:
                 cur_size = 2**3
                 max_size = 2**20
                 while cur_size <= max_size:
+                    dist.barrier()
                     total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
                         self._run_and_compute(cur_size, iters)
                     )
