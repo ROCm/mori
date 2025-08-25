@@ -10,11 +10,11 @@ Feature summary:
 - Applications
     - MORI-EP: intra and inter-node dispatch/combine kernels with SOTA performance
     - MORI-IO: point-to-point communication library with ultra-low overhead
-    - MORI-CCL: lightweight and felxible collective communication library designed for highly customized use cases such as latency-sensitive or resource-constrained envrionment
+    - MORI-CCL: lightweight and flexible collective communication library designed for highly customized use cases such as latency-sensitive or resource-constrained environment
 - Framework
-    - High-performance building blocks for IBGDA / P2P and more​ 
+    - High-performance building blocks for IBGDA / P2P and more​
     - Modular & composable components for developing communication applications, such as transport management, topology detection and etc.
-    - Shmem-style APIs  
+    - Shmem-style APIs
     - C++ level APIs
     - Python level APIs
 
@@ -24,7 +24,7 @@ Configurations:
 - Hardware: 8 x MI300X per node, with 8 single-port CX7 400Gb/s RDMA NICs
 - Software: ROCm 6.4.0
 
-### MORI-EP 
+### MORI-EP
 
 Benchmark result on DeepSeek V3 model configurations:
 
@@ -54,11 +54,11 @@ Benchmark result on the following configurations:
 128 KB | 8 MB | 1.59 | 37.55 | 27.95 | 38.66 |
 512 KB | 32 MB | 6.24 | 43.08 | 35.91 | 43.03 |
 
-- Session is a specific techinique used in MORI-IO to reduce overhead
+- Session is a specific technique used in MORI-IO to reduce overhead
 
 ## Installation
 
-### Prerequsites
+### Prerequisites
 
 - pytorch:rocm >= 6.4.0
 - Linux packages: see packages in dockerfile
@@ -70,7 +70,7 @@ cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
 
 ### Install with Python
 ```
-cd mori && git submodule update --init --recursive && pip3 install .
+cd mori && pip install -r requirements-build.txt && git submodule update --init --recursive && pip3 install .
 ```
 
 ### Test dispatch / combine
@@ -82,7 +82,7 @@ export PYTHONPATH=/path/to/mori:$PYTHONPATH
 pytest tests/python/ops/
 
 # Benchmark performance
-python3 tests/python/ops/bench_dispatch_combine.py 
+python3 tests/python/ops/bench_dispatch_combine.py
 ```
 
 ### Test MORI-IO
@@ -96,5 +96,25 @@ pytest tests/python/io/
 # Benchmark performance
 # Run the following command on two nodes
 export GLOO_SOCKET_IFNAME=ens14np0
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.194.129.65" --master_port=1234 tests/python/io/benchmark.py --host="10.194.129.65" --enable-batch-transfer --enable-sess --buffer-size 32768 --transfer-batch-size 128 --num-initiator-dev 1 --num-target-dev 1 --num-qp-per-transfer 1
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.194.129.65" --master_port=1234 tests/python/io/benchmark.py --host="10.194.129.65" --enable-batch-transfer --enable-sess --buffer-size 32768 --transfer-batch-size 128
 ```
+
+## Contribution Guide
+
+Welcome to MORI! We appreciate your interest in contributing. Whether you're fixing bugs, adding features, improving documentation, or sharing feedback, your contributions help make MORI better for everyone.
+
+### Code Quality
+
+MORI uses pre-commit hooks to maintain code quality. After cloning the repository:
+
+```bash
+# Install and setup pre-commit
+pip install pre-commit
+cd /path/to/mori
+pre-commit install
+
+# Run on all files (first time)
+pre-commit run --all-files
+```
+
+Pre-commit automatically checks code formatting, linting, license headers, and other quality checks on commit. To skip checks when necessary: `git commit --no-verify`

@@ -1,0 +1,4 @@
+cmake>=3.26
+setuptools>=77.0.3
+setuptools-scm>=8
+prettytable

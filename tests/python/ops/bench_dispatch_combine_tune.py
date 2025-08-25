@@ -1,10 +1,29 @@
-import pytest
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 import mori
 from tests.python.ops.test_dispatch_combine import EpDispatchCombineTestCase
-from tests.python.utils import TorchDistContext, get_free_port, TorchDistProcessManager
+from tests.python.utils import TorchDistContext, get_free_port
 import torch
 import torch.distributed as dist
-import time
 
 
 class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
@@ -17,7 +36,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
     def run_once(self, op, test_data, check_result):
         (
             all_rank_num_token,
-            all_rank_indicies,
+            all_rank_indices,
             all_rank_input,
             all_rank_weights,
             all_rank_scales,
@@ -32,13 +51,13 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             dispatch_output,
             dispatch_weights,
             dispatch_scales,
-            dispatch_indicies,
+            dispatch_indices,
             dispatch_recv_num_token,
         ) = op.dispatch(
             all_rank_input[self.config.rank],
             all_rank_weights[self.config.rank],
             all_rank_scales[self.config.rank],
-            all_rank_indicies[self.config.rank],
+            all_rank_indices[self.config.rank],
             block_num=80,
             warp_per_block=16,
         )
@@ -53,7 +72,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 dispatch_output,
                 dispatch_weights,
                 dispatch_scales,
-                dispatch_indicies,
+                dispatch_indices,
                 dispatch_recv_num_token,
             )
 
@@ -69,7 +88,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         combine_output = op.combine(
             combine_input,
             dispatch_weights,
-            dispatch_indicies,
+            dispatch_indices,
             call_reset=False,
             block_num=80,
             warp_per_block=8,
@@ -154,7 +173,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             print("Combine result:")
             for i, duration_us in enumerate(comb_duration_us_list):
                 algo_bw = sum(comb_bandwidth_GB_list[i]) / self.config.world_size
-                bus_bw = int(
+                bus_bw = int(  # noqa: F841
                     algo_bw * (self.config.world_size - 1) / self.config.world_size
                 )
                 print(
@@ -205,7 +224,7 @@ def _bench_dispatch_combine(
     )
     benchmark = EpDispatchCombineBenchmark(config)
 
-    with TorchDistContext(rank=rank, world_size=world_size, master_port=port) as ctx:
+    with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         mori.shmem.shmem_torch_process_group_init("default")
         op = mori.ops.EpDispatchCombineOp(config)
         benchmark.run(op)

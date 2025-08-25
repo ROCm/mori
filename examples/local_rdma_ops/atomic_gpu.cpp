@@ -1,3 +1,24 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 #include <hip/hip_runtime.h>
 
 #include "mori/application/application.hpp"
@@ -30,14 +51,15 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion sendMr,
   int opcode = PollCq<ProviderType::MLX5>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum,
                                           &epSend.cqHandle.consIdx, &wqeCounter);
   UpdateCqDbrRecord<ProviderType::MLX5>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx);
-  // printf("send block is done, opcode is %d postIdx %u consIdx %u\n", opcode, epSend.wqHandle.postIdx, epSend.cqHandle.consIdx);
+  // printf("send block is done, opcode is %d postIdx %u consIdx %u\n", opcode,
+  // epSend.wqHandle.postIdx, epSend.cqHandle.consIdx);
 }
 
 __device__ void RecvThreadKernel(RdmaEndpoint& epRecv, RdmaMemoryRegion mr) {
   uint32_t postIdx = 0;
   uint32_t* addr = reinterpret_cast<uint32_t*>(mr.addr);
   uint32_t val = core::AtomicLoadSeqCst(addr);
-  printf("val = %u\n",val);
+  printf("val = %u\n", val);
   // while (val != 1) {
   //   val = core::AtomicLoadSeqCst(addr);
   //   printf("val = %u\n",val);
@@ -112,9 +134,9 @@ void LocalRdmaOps() {
 
   SendRecvOnGpu<<<2, 1>>>(*devEpSend, *devEpRecv, mrSend, mrRecv);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-  uint32_t value; 
+  uint32_t value;
   HIP_RUNTIME_CHECK(hipMemcpy(&value, recvBuf, sizeof(uint32_t), hipMemcpyDeviceToHost));
-  std::cout << "After atomic op value = " << value << std::endl;  
+  std::cout << "After atomic op value = " << value << std::endl;
 
   // 8 Finalize
   deviceContextSend->DeregisterRdmaMemoryRegion(sendBuf);

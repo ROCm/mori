@@ -1,4 +1,4 @@
-# Build 
+# Build
 build/
 lib*
 
@@ -7,3 +7,5 @@ lib*
 *.pyc
 .pytest_cache
 __pycache__
+
+.vscode
