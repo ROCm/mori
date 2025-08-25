@@ -22,6 +22,16 @@ endif()
 message(STATUS "WARP_ACCUM_UNROLL is set to: ${WARP_ACCUM_UNROLL}")
 add_definitions(-DWARP_ACCUM_UNROLL=${WARP_ACCUM_UNROLL})
 
+include("cmake/msgpack-c.cmake")
+
+# Create an interface library to represent msgpack-c dependency
+add_library(msgpack-c-interface INTERFACE)
+target_include_directories(
+  msgpack-c-interface INTERFACE ${CMAKE_SOURCE_DIR}/3rdparty/msgpack-c/include)
+target_compile_definitions(msgpack-c-interface INTERFACE MSGPACK_NO_BOOST)
+# Make sure msgpack-c is downloaded before using the interface
+add_dependencies(msgpack-c-interface msgpack-c)
+
 if(USE_ROCM)
   list(APPEND CMAKE_PREFIX_PATH "/opt/rocm")
   project(mori LANGUAGES HIP CXX C)
