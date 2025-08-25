@@ -27,4 +27,5 @@ from mori.cpp import (
     EngineDesc,
     MemoryDesc,
     MemoryLocationType,
+    RdmaBackendConfig,
 )

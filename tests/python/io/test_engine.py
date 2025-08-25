@@ -30,6 +30,7 @@ from mori.io import (
     MemoryDesc,
     StatusCode,
     MemoryLocationType,
+    RdmaBackendConfig,
 )
 
 
@@ -43,8 +44,9 @@ def pre_connected_engine_pair():
     config.port = get_free_port()
     target = IOEngine(key="target", config=config)
 
-    initiator.create_backend(BackendType.RDMA)
-    target.create_backend(BackendType.RDMA)
+    config = RdmaBackendConfig(qp_per_transfer=2)
+    initiator.create_backend(BackendType.RDMA, config)
+    target.create_backend(BackendType.RDMA, config)
 
     initiator_desc = initiator.get_engine_desc()
     target_desc = target.get_engine_desc()

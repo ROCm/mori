@@ -74,7 +74,7 @@ class IOEngine {
   IOEngine(EngineKey, IOEngineConfig);
   ~IOEngine();
 
-  void CreateBackend(BackendType, void* params);
+  void CreateBackend(BackendType, const BackendConfig&);
   void RemoveBackend(BackendType);
 
   EngineDesc GetEngineDesc() const { return desc; }

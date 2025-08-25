@@ -69,12 +69,14 @@ class TorchDistContext:
         master_addr="localhost",
         master_port="12335",
         device_id=None,
+        backend="cpu:gloo,cuda:nccl",
     ):
         self.rank = rank
         self.world_size = world_size
         self.master_addr = master_addr
         self.master_port = master_port
         self.device_id = device_id if device_id is not None else self.rank
+        self.backend = backend
 
     def __enter__(self):
         if self.master_addr is not None:
@@ -86,7 +88,7 @@ class TorchDistContext:
         device = torch.device("cuda", self.device_id)
 
         dist.init_process_group(
-            backend="cpu:gloo,cuda:nccl",
+            backend=self.backend,
             rank=self.rank,
             world_size=self.world_size,
             device_id=device,

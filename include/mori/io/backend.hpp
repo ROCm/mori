@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include "mori/io/enum.hpp"
 #include "mori/io/meta_data.hpp"
 
 namespace mori {
@@ -28,6 +29,30 @@ namespace io {
 
 class IOEngineConfig;
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                          BackendConfig                                         */
+/* ---------------------------------------------------------------------------------------------- */
+struct BackendConfig {
+  BackendConfig(BackendType t) : type(t) {}
+  ~BackendConfig() = default;
+
+  BackendType Type() const { return type; }
+
+ private:
+  const BackendType type;
+};
+
+struct RdmaBackendConfig : public BackendConfig {
+  RdmaBackendConfig() : BackendConfig(BackendType::RDMA) {}
+  RdmaBackendConfig(int qpPerTransfer_)
+      : BackendConfig(BackendType::RDMA), qpPerTransfer(qpPerTransfer_) {}
+
+  int qpPerTransfer{1};
+};
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                         BackendSession                                         */
+/* ---------------------------------------------------------------------------------------------- */
 class BackendSession {
  public:
   BackendSession() = default;
@@ -44,6 +69,9 @@ class BackendSession {
   virtual bool Alive() const = 0;
 };
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                             Backend                                            */
+/* ---------------------------------------------------------------------------------------------- */
 class Backend {
  public:
   Backend() = default;

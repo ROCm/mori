@@ -183,9 +183,15 @@ class RdmaManager {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      Notification Manager                                      */
 /* ---------------------------------------------------------------------------------------------- */
+struct NotifMessage {
+  TransferUniqueId id{0};
+  int qpIndex{-1};
+  int totalNum{-1};
+};
+
 class NotifManager {
  public:
-  NotifManager(RdmaManager*);
+  NotifManager(RdmaManager*, const RdmaBackendConfig&);
   ~NotifManager();
 
   void RegisterEndpointByQpn(uint32_t qpn);
@@ -193,11 +199,14 @@ class NotifManager {
 
   void RegisterDevice(int devId);
 
+  bool PopInboundTransferStatus(const EngineKey&, TransferUniqueId, TransferStatus*);
+
   void MainLoop();
   void Start();
   void Shutdown();
 
  private:
+  RdmaBackendConfig config;
   mutable std::mutex mu;
 
   int epfd{-1};
@@ -213,7 +222,9 @@ class NotifManager {
 
   uint32_t maxNotifNum{8192};
   std::unordered_map<int, DeviceNotifContext> notifCtx;
-  std::unordered_map<EngineKey, std::unordered_set<TransferUniqueId>> notifPool;
+  std::unordered_map<EngineKey, std::unordered_map<TransferUniqueId, int>> notifPool;
+
+  std::unordered_map<TransferStatus*, int> localNotif;
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -267,7 +278,7 @@ class RdmaBackendSession : public BackendSession {
  public:
   RdmaBackendSession() = default;
   RdmaBackendSession(const application::RdmaMemoryRegion& local,
-                     const application::RdmaMemoryRegion& remote, const EpPair& eps);
+                     const application::RdmaMemoryRegion& remote, const EpPairVec& eps);
   ~RdmaBackendSession() = default;
 
   void Read(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
@@ -283,7 +294,7 @@ class RdmaBackendSession : public BackendSession {
  private:
   application::RdmaMemoryRegion local{};
   application::RdmaMemoryRegion remote{};
-  EpPair eps{};
+  EpPairVec eps{};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -292,7 +303,7 @@ class RdmaBackendSession : public BackendSession {
 
 class RdmaBackend : public Backend {
  public:
-  RdmaBackend(EngineKey, IOEngineConfig);
+  RdmaBackend(EngineKey, const IOEngineConfig&, const RdmaBackendConfig&);
   ~RdmaBackend();
 
   void RegisterRemoteEngine(const EngineDesc&);
@@ -314,6 +325,7 @@ class RdmaBackend : public Backend {
   void CreateSession(const MemoryDesc& local, const MemoryDesc& remote, RdmaBackendSession& sess);
 
  private:
+  RdmaBackendConfig config;
   std::unique_ptr<RdmaManager> rdma;
   std::unique_ptr<NotifManager> notif;
   std::unique_ptr<ControlPlaneServer> server;
