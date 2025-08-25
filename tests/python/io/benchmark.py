@@ -337,8 +337,8 @@ class MoriIoBenchmark:
                 field_names=[
                     "MsgSize (B)",
                     "TotalSize (MB)",
-                    "Max BW (MB/s)",
-                    "Avg Bw (MB/s)",
+                    "Max BW (GB/s)",
+                    "Avg Bw (GB/s)",
                     "Min Lat (us)",
                     "Avg Lat (us)",
                 ],
