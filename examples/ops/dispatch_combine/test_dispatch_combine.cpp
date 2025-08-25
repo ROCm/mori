@@ -445,8 +445,11 @@ class EpDispatchCombineTestCase {
   void CopyDispatchOutAsCombineInp() {
     EpDispatchCombineConfig& config = handle.config;
     if (IsNoDataRank(handle.config)) {
-      handle.PrepareInference(GetHipDataType<T>(), inpTokBuf, outTokBuf, weightsBuf, scalesBuf,
+      handle.PrepareInference(GetHipDataType<T>(), inpTokBuf, outTokBuf, nullptr, scalesBuf,
                               nullptr, 0);
+    } else {
+      handle.PrepareInference(GetHipDataType<T>(), inpTokBuf, outTokBuf, nullptr, scalesBuf,
+                              tokenIndices, numToken);
     }
     // HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, outTokBuf,
     //                             config.MaxNumTokensToRecvPerRank() * config.hiddenDim *
