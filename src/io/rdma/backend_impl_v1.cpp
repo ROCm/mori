@@ -149,7 +149,6 @@ std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
     assert(!nicName.empty());
     for (int i = 0; i < availDevices.size(); i++) {
       if (availDevices[i].first->Name() == nicName) {
-        printf("gpu %d match nic %s\n", key.deviceId, nicName.c_str());
         return {{i, 1}};
       }
     }

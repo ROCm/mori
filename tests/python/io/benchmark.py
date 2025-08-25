@@ -16,6 +16,7 @@ import argparse
 from enum import Enum
 import os
 import time
+from prettytable import PrettyTable
 
 
 def parse_args():
@@ -30,10 +31,15 @@ def parse_args():
         help="Number of element in a single transfer, default: 16384",
     )
     parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Run sizes from 8 till 2^20",
+    )
+    parser.add_argument(
         "--transfer-batch-size",
         type=int,
-        default=64,
-        help="Number of transfer per round, default: 64",
+        default=256,
+        help="Number of transfer per iteration, default: 64",
     )
     parser.add_argument(
         "--enable-batch-transfer",
@@ -87,6 +93,7 @@ class MoriIoBenchmark:
         num_initiator_dev: int = 1,
         num_target_dev: int = 1,
         num_qp_per_transfer: int = 1,
+        sweep: bool = False,
     ):
         self.host = host
         self.port = port
@@ -100,6 +107,7 @@ class MoriIoBenchmark:
         self.enable_batch_transfer = enable_batch_transfer
         self.enable_sess = enable_sess
         self.num_qp_per_transfer = num_qp_per_transfer
+        self.sweep = sweep
 
         self.world_size = self.num_initiator_dev + self.num_target_dev
         if self.node_rank == 0:
@@ -127,6 +135,7 @@ class MoriIoBenchmark:
         print(f"  transfer_batch_size: {self.transfer_batch_size}")
         print(f"  enable_batch_transfer: {self.enable_batch_transfer}")
         print(f"  enable_sess: {self.enable_sess}")
+        print(f"  num_qp_per_transfer: {self.num_qp_per_transfer}")
         print()
 
     def send_bytes(self, b: bytes, dst: int):
@@ -153,7 +162,6 @@ class MoriIoBenchmark:
             dist.recv(int8_tensor, src=self.num_initiator_dev + self.role_rank)
             tensor = int8_tensor.view(torch.float8_e4m3fnuz)
             assert torch.equal(self.tensor, tensor)
-            print("Validation Pass")
         else:
             int8_view = self.tensor.view(torch.uint8)
             dist.send(int8_view, dst=self.role_rank)
@@ -195,7 +203,8 @@ class MoriIoBenchmark:
             self.target_mem = MemoryDesc.unpack(target_mem_desc)
             self.sess = self.engine.create_session(self.mem, self.target_mem)
 
-    def run_single_once(self):
+    def run_single_once(self, buffer_size=None):
+        assert buffer_size <= self.buffer_size
         if self.role is EngineRole.INITIATOR:
             status_list = []
             transfer_uids = []
@@ -204,12 +213,12 @@ class MoriIoBenchmark:
                 transfer_uids.append(self.engine.allocate_transfer_uid())
 
             for i in range(self.transfer_batch_size):
-                offset = self.buffer_size * i
+                offset = buffer_size * i
                 if self.enable_sess:
                     transfer_status = self.sess.read(
                         offset,
                         offset,
-                        self.buffer_size,
+                        buffer_size,
                         transfer_uids[i],
                     )
                 else:
@@ -218,7 +227,7 @@ class MoriIoBenchmark:
                         offset,
                         self.target_mem,
                         offset,
-                        self.buffer_size,
+                        buffer_size,
                         transfer_uids[i],
                     )
                 status_list.append(transfer_status)
@@ -228,10 +237,11 @@ class MoriIoBenchmark:
                     pass
                 assert status.Code() == StatusCode.SUCCESS
 
-    def run_batch_once(self):
+    def run_batch_once(self, buffer_size):
+        assert buffer_size <= self.buffer_size
         if self.role is EngineRole.INITIATOR:
-            offsets = [(i * self.buffer_size) for i in range(self.transfer_batch_size)]
-            sizes = [self.buffer_size for _ in range(self.transfer_batch_size)]
+            offsets = [(i * buffer_size) for i in range(self.transfer_batch_size)]
+            sizes = [buffer_size for _ in range(self.transfer_batch_size)]
             transfer_uid = self.engine.allocate_transfer_uid()
             if self.enable_sess:
                 transfer_status = self.sess.batch_read(
@@ -253,11 +263,40 @@ class MoriIoBenchmark:
                 pass
             assert transfer_status.Code() == StatusCode.SUCCESS
 
-    def run_once(self):
+    def run_once(self, buffer_size):
         if self.enable_batch_transfer:
-            self.run_batch_once()
+            self.run_batch_once(buffer_size)
         else:
-            self.run_single_once()
+            self.run_single_once(buffer_size)
+
+    def _run_and_compute(self, buffer_size, iters):
+        latency = []
+        for i in range(iters):
+            st = time.time()
+            self.run_once(buffer_size)
+            latency.append(time.time() - st)
+
+        if self.role is EngineRole.TARGET:
+            return 0, 0, 0, 0, 0
+
+        total_mem_mb = buffer_size * self.transfer_batch_size / (10**6)
+
+        avg_duration = sum(latency) / len(latency)
+        min_duration = min(latency)
+        avg_duration_us, min_duration_us = avg_duration * (10**6), min_duration * (
+            10**6
+        )
+
+        avg_bw = total_mem_mb / (10**3) / avg_duration
+        max_bw = total_mem_mb / (10**3) / min_duration
+
+        return (
+            total_mem_mb,
+            avg_duration_us,
+            min_duration_us,
+            avg_bw,
+            max_bw,
+        )
 
     def run(self):
         with TorchDistContext(
@@ -269,49 +308,78 @@ class MoriIoBenchmark:
             backend="gloo",
         ):
             self.initialize()
-            self.run_once()
+            self.run_once(self.buffer_size)
             self.validate()
-            self.run_once()
+            self.run_once(self.buffer_size)
             dist.barrier()
 
-            round = 100
-            latency = []
-            for i in range(round):
-                st = time.time()
-                self.run_once()
-                latency.append(time.time() - st)
+            iters = 128
+            table = PrettyTable(
+                field_names=[
+                    "MsgSize (B)",
+                    "TotalSize (MB)",
+                    "Max BW (MB/s)",
+                    "Avg Bw (MB/s)",
+                    "Min Lat (us)",
+                    "Avg Lat (us)",
+                ],
+                title=f"Initiator Rank {self.role_rank}",
+            )
+
+            if self.sweep:
+                cur_size = 2**3
+                max_size = 2**20
+                while cur_size <= max_size:
+                    total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
+                        self._run_and_compute(cur_size, iters)
+                    )
+                    table.add_row(
+                        [
+                            cur_size,
+                            f"{total_mem_mb:.2f}",
+                            f"{max_bw:.2f}",
+                            f"{avg_bw:.2f}",
+                            f"{min_duration:.2f}",
+                            f"{avg_duration:.2f}",
+                        ]
+                    )
+                    cur_size *= 2
+            else:
+                total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
+                    self._run_and_compute(self.buffer_size, iters)
+                )
+                table.add_row(
+                    [
+                        self.buffer_size,
+                        f"{total_mem_mb:.2f}",
+                        f"{max_bw:.2f}",
+                        f"{avg_bw:.2f}",
+                        f"{min_duration:.2f}",
+                        f"{avg_duration:.2f}",
+                    ]
+                )
 
             if self.role is EngineRole.INITIATOR:
-                total_mem_gb = self.buffer_size * self.transfer_batch_size / (10**6)
-
-                avg_duration = sum(latency) / len(latency)
-                min_duration = min(latency)
-                avg_duration_us, min_duration_us = avg_duration * (
-                    10**6
-                ), min_duration * (10**6)
-
-                avg_bw = total_mem_gb / (10**3) / avg_duration
-                max_bw = total_mem_gb / (10**3) / min_duration
-
-                print(
-                    f"Duration {min_duration_us:.2f}({avg_duration_us:.2f}) us, "
-                    f"bytes {total_mem_gb} MB, bandwidth: {max_bw:.2f}({avg_bw:.2f}) GB/s"
-                )
+                print(table)
 
 
 def benchmark_engine(local_rank, node_rank, args):
+    max_buffer_size = args.buffer_size
+    if args.all:
+        max_buffer_size = max(max_buffer_size, 2**20)
     bench = MoriIoBenchmark(
         host=args.host,
         port=get_free_port(),
         node_rank=node_rank,
         rank_in_node=local_rank,
-        buffer_size=args.buffer_size,
+        buffer_size=max_buffer_size,
         transfer_batch_size=args.transfer_batch_size,
         enable_batch_transfer=args.enable_batch_transfer,
         enable_sess=args.enable_sess,
         num_initiator_dev=args.num_initiator_dev,
         num_target_dev=args.num_target_dev,
         num_qp_per_transfer=args.num_qp_per_transfer,
+        sweep=args.all,
     )
     bench.print_config()
     bench.run()
