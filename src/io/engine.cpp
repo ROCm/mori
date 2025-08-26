@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "mori/io/engine.hpp"
 
+#include "mori/io/logging.hpp"
 #include "src/io/rdma/backend_impl_v1.hpp"
 
 namespace mori {
@@ -73,6 +74,8 @@ IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
   desc.hostname = std::string(hostname);
   desc.host = config.host;
   desc.port = config.port;
+  MORI_IO_INFO("Create engine key {} hostname {} host {}, port {}", key, hostname, config.host,
+               config.port);
 }
 
 IOEngine::~IOEngine() {}
@@ -84,6 +87,7 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
                                desc.key, config, static_cast<const RdmaBackendConfig&>(beConfig))});
   } else
     assert(false && "not implemented");
+  MORI_IO_INFO("Create backend type {}", static_cast<uint32_t>(type));
 }
 
 void IOEngine::RemoveBackend(BackendType type) { backends.erase(type); }
@@ -92,12 +96,14 @@ void IOEngine::RegisterRemoteEngine(const EngineDesc& remote) {
   for (auto& it : backends) {
     it.second->RegisterRemoteEngine(remote);
   }
+  MORI_IO_INFO("Register remote engine {}", remote.key.c_str());
 }
 
 void IOEngine::DeregisterRemoteEngine(const EngineDesc& remote) {
   for (auto& it : backends) {
     it.second->DeregisterRemoteEngine(remote);
   }
+  MORI_IO_INFO("Deregister remote engine {}", remote.key.c_str());
 }
 
 MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryLocationType loc) {
@@ -114,6 +120,8 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryL
   }
 
   memPool.insert({memDesc.id, memDesc});
+  MORI_IO_DEBUG("Register memory address {} size {} device {} loc {} with id {}", data, size,
+                device, loc, memDesc.id);
   return memDesc;
 }
 
@@ -122,10 +130,13 @@ void IOEngine::DeregisterMemory(const MemoryDesc& desc) {
     it.second->DeregisterMemory(desc);
   }
   memPool.erase(desc.id);
+  MORI_IO_DEBUG("Deregister memory {} at address {}", desc.id, desc.data);
 }
 
 TransferUniqueId IOEngine::AllocateTransferUniqueId() {
-  return nextTransferUid.fetch_add(1, std::memory_order_relaxed);
+  TransferUniqueId id = nextTransferUid.fetch_add(1, std::memory_order_relaxed);
+  MORI_IO_DEBUG("Allocate transfer uid {}", id);
+  return id;
 }
 
 void IOEngine::Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,

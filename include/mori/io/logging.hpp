@@ -21,7 +21,26 @@
 // SOFTWARE.
 #pragma once
 
-#include "mori/io/engine.hpp"
-#include "mori/io/enum.hpp"
-#include "mori/io/logging.hpp"
-#include "mori/io/meta_data.hpp"
+#include <string>
+
+#include "spdlog/spdlog.h"
+
+namespace mori {
+namespace io {
+
+#define MORI_IO_TRACE SPDLOG_TRACE
+#define MORI_IO_DEBUG SPDLOG_DEBUG
+#define MORI_IO_INFO SPDLOG_INFO
+#define MORI_IO_WARN SPDLOG_WARN
+#define MORI_IO_ERROR SPDLOG_ERROR
+#define MORI_IO_CRITICAL SPDLOG_CRITICAL
+
+// trace / debug / info / warning / error / critical
+void SetLogLevel(const std::string& strLevel) {
+  spdlog::level::level_enum level = spdlog::level::from_str(strLevel);
+  spdlog::set_level(level);
+  spdlog::info("Set MORI-IO log level to {}", spdlog::level::to_string_view(level));
+}
+
+}  // namespace io
+}  // namespace mori

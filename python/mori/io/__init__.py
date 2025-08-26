@@ -28,4 +28,5 @@ from mori.cpp import (
     MemoryDesc,
     MemoryLocationType,
     RdmaBackendConfig,
+    set_log_level,
 )

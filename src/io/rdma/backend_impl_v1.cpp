@@ -252,7 +252,7 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int portId) {
   config.maxMsgsNum = 8192;
   config.maxMsgSge = 1;
   config.maxCqeNum = 8192;
-  config.alignment = 4096;
+  config.alignment = PAGESIZE;
   config.withCompChannel = true;
   config.enableSrq = true;
   return config;

@@ -2,3 +2,6 @@
 	path = 3rdparty/msgpack-c
 	url = https://github.com/msgpack/msgpack-c.git
 	branch = cpp_master
+[submodule "3rdparty/spdlog"]
+	path = 3rdparty/spdlog
+	url = https://github.com/gabime/spdlog.git

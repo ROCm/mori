@@ -266,6 +266,8 @@ void RegisterMoriShmem(py::module_& m) {
 }
 
 void RegisterMoriIo(pybind11::module_& m) {
+  m.def("set_log_level", &mori::io::SetLogLevel);
+
   py::enum_<mori::io::BackendType>(m, "BackendType")
       .value("Unknown", mori::io::BackendType::Unknown)
       .value("XGMI", mori::io::BackendType::XGMI)
