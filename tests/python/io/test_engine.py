@@ -212,7 +212,7 @@ def test_rdma_backend_ops(
     for status in status_list:
         check_transfer_result(
             pre_connected_engine_pair,
-            transfer_status,
+            status,
             initiator_tensor,
             target_tensor,
             transfer_uid,

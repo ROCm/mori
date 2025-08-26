@@ -36,10 +36,10 @@ namespace io {
 #define MORI_IO_CRITICAL SPDLOG_CRITICAL
 
 // trace / debug / info / warning / error / critical
-void SetLogLevel(const std::string& strLevel) {
+inline void SetLogLevel(const std::string& strLevel) {
   spdlog::level::level_enum level = spdlog::level::from_str(strLevel);
   spdlog::set_level(level);
-  spdlog::info("Set MORI-IO log level to {}", spdlog::level::to_string_view(level));
+  MORI_IO_INFO("Set MORI-IO log level to {}", spdlog::level::to_string_view(level));
 }
 
 }  // namespace io
