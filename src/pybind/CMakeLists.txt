@@ -10,8 +10,14 @@ target_link_libraries(
   mori_pybinds
   mori_ops
   mori_io
-  ${PYTHON_LIBRARIES}
   ${TORCH_LIBRARIES}
   torch_python
   hip::host
   hip::device)
+
+# For python packages to find dependent libraries
+set_target_properties(
+  mori_pybinds
+  PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/../torch/lib"
+             INSTALL_RPATH "$ORIGIN;$ORIGIN/../torch/lib"
+             BUILD_WITH_INSTALL_RPATH TRUE)

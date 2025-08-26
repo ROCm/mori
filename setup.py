@@ -71,10 +71,22 @@ class CMakeBuild(build_ext):
             ["cmake", "--build", ".", "-j", f"{os.cpu_count()}"], cwd=str(build_dir)
         )
 
-        shutil.copyfile(
-            build_dir / "src/pybind/libmori_pybinds.so",
-            root_dir / "python/mori/libmori_pybinds.so",
-        )
+        files_to_copy = [
+            (
+                build_dir / "src/pybind/libmori_pybinds.so",
+                root_dir / "python/mori/libmori_pybinds.so",
+            ),
+            (
+                build_dir / "src/application/libmori_application.so",
+                root_dir / "python/mori/libmori_application.so",
+            ),
+            (
+                build_dir / "src/io/libmori_io.so",
+                root_dir / "python/mori/libmori_io.so",
+            ),
+        ]
+        for src_path, dst_path in files_to_copy:
+            shutil.copyfile(src_path, dst_path)
 
 
 class CustomBuild(_build):
@@ -87,8 +99,6 @@ extensions = [
     Extension(
         "mori",
         sources=[],
-        # extra_compile_args=['-g', '-O0'],
-        # extra_link_args=['-g'],
     ),
 ]
 
@@ -98,13 +108,14 @@ setup(
     description="Modular RDMA Interface",
     packages=find_packages(where="python"),
     package_dir={"": "python"},
-    package_data={"mori": ["libmori_pybinds.so"]},
+    package_data={
+        "mori": ["libmori_pybinds.so", "libmori_io.so", "libmori_application.so"]
+    },
     cmdclass={
         "build_ext": CMakeBuild,
         "build": CustomBuild,
     },
     setup_requires=["setuptools_scm"],
-    install_requires=["torch", "pytest-assume"],
     python_requires=">=3.10",
     ext_modules=extensions,
     include_package_data=True,
