@@ -215,8 +215,8 @@ class EpDispatchCombineTestCase:
         dist.barrier()
 
         src_token_pos = op.get_dispatch_src_token_pos().tolist()
-        max_num_token_to_send_per_rank = (
-            self.config.max_num_inp_token_per_rank * self.config.num_experts_per_token
+        max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank * min(
+            self.config.num_experts_per_rank, self.config.num_experts_per_token
         )
         print(f"rank {self.rank} recv {len(src_token_pos)} tokens")
         for i, src_token_id in enumerate(src_token_pos):

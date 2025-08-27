@@ -76,7 +76,7 @@ class EpDispatchCombineOp:
         )
 
         self._dispatch_func = _cpp_dispatch_combine_factory("launch_dispatch")
-        self._combine_func = _cpp_dispatch_combine_factory("get_dispatch_src_token_pos")
+        self._combine_func = _cpp_dispatch_combine_factory("launch_combine")
         self._reset_func = _cpp_dispatch_combine_factory("launch_reset")
         self._get_dispatch_src_token_pos_func = _cpp_dispatch_combine_factory(
             "get_dispatch_src_token_pos"
@@ -186,9 +186,8 @@ class EpDispatchCombineOp:
             self._handle
         )
 
-        max_num_token_to_send_per_rank = (
-            self.config.max_num_inp_token_per_rank * 
-            min(self.config.num_experts_per_token, self.config.num_experts_per_rank)
+        max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank * min(
+            self.config.num_experts_per_token, self.config.num_experts_per_rank
         )
         all_rank_sender_map = self._allgather_with_token_num_padding(
             dispatch_sender_token_id_map.cpu().to(torch.int64),
@@ -221,6 +220,11 @@ class EpDispatchCombineOp:
         src_token_pos = []
         for i, recv_mapped_id in enumerate(dispatch_receiver_token_id_map.tolist()):
             src_pe = recv_mapped_id // max_num_token_to_send_per_rank
+            if recv_mapped_id not in reverse_sender_token_id_map:
+                print(
+                    f"Warning: rank {self.config.rank} src_pe {src_pe} max_num_token_to_send_per_rank {max_num_token_to_send_per_rank} recv_mapped_id {recv_mapped_id} not in reverse_sender_token_id_map"
+                )
+                raise
             src_tok_id = reverse_sender_token_id_map[recv_mapped_id]
             src_token_pos.append(src_pe * max_num_token_to_send_per_rank + src_tok_id)
 
