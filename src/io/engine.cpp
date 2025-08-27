@@ -37,21 +37,34 @@ TransferUniqueId IOEngineSession::AllocateTransferUniqueId() {
 void IOEngineSession::Read(size_t localOffset, size_t remoteOffset, size_t size,
                            TransferStatus* status, TransferUniqueId id) {
   for (auto& it : backendSess) {
-    return it.second->Read(localOffset, remoteOffset, size, status, id);
+    it.second->Read(localOffset, remoteOffset, size, status, id);
+    if (status->Failed()) {
+      MORI_IO_ERROR("Session read error {} message {}", status->CodeUint32(), status->Message());
+    }
+    return;
   }
 }
 
 void IOEngineSession::Write(size_t localOffset, size_t remoteOffset, size_t size,
                             TransferStatus* status, TransferUniqueId id) {
   for (auto& it : backendSess) {
-    return it.second->Write(localOffset, remoteOffset, size, status, id);
+    it.second->Write(localOffset, remoteOffset, size, status, id);
+    if (status->Failed()) {
+      MORI_IO_ERROR("Session write error {} message {}", status->CodeUint32(), status->Message());
+    }
+    return;
   }
 }
 
 void IOEngineSession::BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                 const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
   for (auto& it : backendSess) {
-    return it.second->BatchRead(localOffsets, remoteOffsets, sizes, status, id);
+    it.second->BatchRead(localOffsets, remoteOffsets, sizes, status, id);
+    if (status->Failed()) {
+      MORI_IO_ERROR("Session batch read error {} message {}", status->CodeUint32(),
+                    status->Message());
+    }
+    return;
   }
 }
 
@@ -142,7 +155,11 @@ TransferUniqueId IOEngine::AllocateTransferUniqueId() {
 void IOEngine::Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
                     size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id) {
   for (auto& it : backends) {
-    return it.second->Read(localDest, localOffset, remoteSrc, remoteOffset, size, status, id);
+    it.second->Read(localDest, localOffset, remoteSrc, remoteOffset, size, status, id);
+    if (status->Failed()) {
+      MORI_IO_ERROR("Engine read error {} message {}", status->CodeUint32(), status->Message());
+    }
+    return;
   }
 }
 
@@ -150,7 +167,10 @@ void IOEngine::Write(const MemoryDesc& localSrc, size_t localOffset, const Memor
                      size_t remoteOffset, size_t size, TransferStatus* status,
                      TransferUniqueId id) {
   for (auto& it : backends) {
-    return it.second->Write(localSrc, localOffset, remoteDest, remoteOffset, size, status, id);
+    it.second->Write(localSrc, localOffset, remoteDest, remoteOffset, size, status, id);
+    if (status->Failed()) {
+      MORI_IO_ERROR("Engine write error {} message {}", status->CodeUint32(), status->Message());
+    }
   }
 }
 
@@ -158,8 +178,11 @@ void IOEngine::BatchRead(const MemoryDesc& localDest, const SizeVec& localOffset
                          const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
                          const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
   for (auto& it : backends) {
-    return it.second->BatchRead(localDest, localOffsets, remoteSrc, remoteOffsets, sizes, status,
-                                id);
+    it.second->BatchRead(localDest, localOffsets, remoteSrc, remoteOffsets, sizes, status, id);
+    if (status->Failed()) {
+      MORI_IO_ERROR("Engine batch read error {} message {}", status->CodeUint32(),
+                    status->Message());
+    }
   }
 }
 

@@ -39,15 +39,18 @@ struct BackendConfig {
   BackendType Type() const { return type; }
 
  private:
-  const BackendType type;
+  BackendType type;
 };
 
 struct RdmaBackendConfig : public BackendConfig {
   RdmaBackendConfig() : BackendConfig(BackendType::RDMA) {}
-  RdmaBackendConfig(int qpPerTransfer_)
-      : BackendConfig(BackendType::RDMA), qpPerTransfer(qpPerTransfer_) {}
+  RdmaBackendConfig(int qpPerTransfer_, int postBatchSize_)
+      : BackendConfig(BackendType::RDMA),
+        qpPerTransfer(qpPerTransfer_),
+        postBatchSize(postBatchSize_) {}
 
   int qpPerTransfer{1};
+  int postBatchSize{-1};
 };
 
 /* ---------------------------------------------------------------------------------------------- */

@@ -42,8 +42,12 @@ enum class MemoryLocationType : uint32_t {
 enum class StatusCode : uint32_t {
   SUCCESS = 0,
   INIT = 1,
-  ERROR = 2,
-  NOT_FOUND = 3,
+  IN_PROGRESS = 2,
+
+  ERR_BEGIN = 10,
+  ERR_INVALID_ARGS = 11,
+  ERR_NOT_FOUND = 12,
+  ERR_RDMA_OP = 13
 };
 
 }  // namespace io

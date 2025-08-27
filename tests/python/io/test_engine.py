@@ -37,7 +37,7 @@ from mori.io import (
 
 @pytest.fixture(scope="module")
 def pre_connected_engine_pair():
-    set_log_level("info")
+    set_log_level("debug")
     config = IOEngineConfig(
         host="127.0.0.1",
         port=get_free_port(),
@@ -46,7 +46,7 @@ def pre_connected_engine_pair():
     config.port = get_free_port()
     target = IOEngine(key="target", config=config)
 
-    config = RdmaBackendConfig(qp_per_transfer=2)
+    config = RdmaBackendConfig(qp_per_transfer=2, post_batch_size=16)
     initiator.create_backend(BackendType.RDMA, config)
     target.create_backend(BackendType.RDMA, config)
 
@@ -113,7 +113,7 @@ def test_mem_desc():
 
 
 def wait_status(status):
-    while status.Code() == StatusCode.INIT:
+    while status.InProgress():
         pass
 
 
@@ -152,8 +152,8 @@ def check_transfer_result(
     target_status = wait_inbound_status(
         target, initiator.get_engine_desc().key, transfer_uid
     )
-    assert initiator_status.Code() == StatusCode.SUCCESS
-    assert target_status.Code() == StatusCode.SUCCESS
+    assert initiator_status.Succeeded()
+    assert target_status.Succeeded()
     assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
 
 
@@ -217,3 +217,24 @@ def test_rdma_backend_ops(
             target_tensor,
             transfer_uid,
         )
+
+
+def test_err_out_of_range(pre_connected_engine_pair):
+    initiator, target = pre_connected_engine_pair
+    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
+        pre_connected_engine_pair,
+        (
+            2,
+            32,
+        ),
+    )
+
+    sess = initiator.create_session(initiator_mem, target_mem)
+    offsets = (0, 32)
+    sizes = (32, 34)
+
+    transfer_uid = sess.allocate_transfer_uid()
+    transfer_status = sess.batch_read(offsets, offsets, sizes, transfer_uid)
+
+    assert transfer_status.Failed()
+    assert transfer_status.Code() == StatusCode.ERR_INVALID_ARGS

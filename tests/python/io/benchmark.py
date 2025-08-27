@@ -28,7 +28,6 @@ from mori.io import (
     IOEngine,
     EngineDesc,
     MemoryDesc,
-    StatusCode,
     RdmaBackendConfig,
 )
 import argparse
@@ -191,7 +190,9 @@ class MoriIoBenchmark:
             port=self.port,
         )
         self.engine = IOEngine(key=f"{self.role.name}-{self.role_rank}", config=config)
-        config = RdmaBackendConfig(qp_per_transfer=self.num_qp_per_transfer)
+        config = RdmaBackendConfig(
+            qp_per_transfer=self.num_qp_per_transfer, post_batch_size=-1
+        )
         self.engine.create_backend(BackendType.RDMA, config)
 
         self.engine_desc = self.engine.get_engine_desc()
@@ -252,9 +253,9 @@ class MoriIoBenchmark:
                 status_list.append(transfer_status)
 
             for i, status in enumerate(status_list):
-                while status.Code() == StatusCode.INIT:
+                while status.InProgress():
                     pass
-                assert status.Code() == StatusCode.SUCCESS
+                assert status.Succeeded()
 
     def run_batch_once(self, buffer_size):
         assert buffer_size <= self.buffer_size
@@ -278,9 +279,9 @@ class MoriIoBenchmark:
                     sizes,
                     transfer_uid,
                 )
-            while transfer_status.Code() == StatusCode.INIT:
+            while transfer_status.InProgress():
                 pass
-            assert transfer_status.Code() == StatusCode.SUCCESS
+            assert transfer_status.Succeeded()
 
     def run_once(self, buffer_size):
         if self.enable_batch_transfer:
