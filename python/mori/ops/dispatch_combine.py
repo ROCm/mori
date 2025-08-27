@@ -76,7 +76,7 @@ class EpDispatchCombineOp:
         )
 
         self._dispatch_func = _cpp_dispatch_combine_factory("launch_dispatch")
-        self._combine_func = _cpp_dispatch_combine_factory("launch_combine")
+        self._combine_func = _cpp_dispatch_combine_factory("get_dispatch_src_token_pos")
         self._reset_func = _cpp_dispatch_combine_factory("launch_reset")
         self._get_dispatch_src_token_pos_func = _cpp_dispatch_combine_factory(
             "get_dispatch_src_token_pos"
@@ -187,7 +187,8 @@ class EpDispatchCombineOp:
         )
 
         max_num_token_to_send_per_rank = (
-            self.config.max_num_inp_token_per_rank * self.config.num_experts_per_token
+            self.config.max_num_inp_token_per_rank * 
+            min(self.config.num_experts_per_token, self.config.num_experts_per_rank)
         )
         all_rank_sender_map = self._allgather_with_token_num_padding(
             dispatch_sender_token_id_map.cpu().to(torch.int64),

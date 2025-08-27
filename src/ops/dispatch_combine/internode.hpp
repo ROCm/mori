@@ -483,7 +483,7 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
   // Make sure copy on all GPUs are finished
   CrossDeviceBarrierInterNodeKernel(args);
-
+  shmem::ShmemQuietThread();
   if (globalThdId < npes) {
     args.recvTokenNumMemObj->template GetAs<index_t*>()[globalThdId] = 0;
   }
