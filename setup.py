@@ -54,17 +54,19 @@ class CMakeBuild(build_ext):
         build_dir = root_dir / os.environ.get("MORI_PYBUILD_DIR", "build")
         build_dir.mkdir(parents=True, exist_ok=True)
 
+        build_type = os.environ.get("CMAKE_BUILD_TYPE", "Release")
         unroll_value = os.environ.get("WARP_ACCUM_UNROLL", "1")
         subprocess.check_call(
             [
                 "cmake",
                 "-DUSE_ROCM=ON",
-                "-DWARP_ACCUM_UNROLL=" + unroll_value,
+                f"-DCMAKE_BUILD_TYPE={build_type}",
+                f"-DWARP_ACCUM_UNROLL={unroll_value}",
                 "-B",
                 str(build_dir),
                 "-S",
                 str(root_dir),
-                "-DCMAKE_PREFIX_PATH=" + _get_torch_cmake_prefix_path(),
+                f"-DCMAKE_PREFIX_PATH={_get_torch_cmake_prefix_path()}",
             ]
         )
         subprocess.check_call(
