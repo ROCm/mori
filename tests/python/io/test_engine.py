@@ -37,7 +37,7 @@ from mori.io import (
 
 @pytest.fixture(scope="module")
 def pre_connected_engine_pair():
-    set_log_level("debug")
+    set_log_level("info")
     config = IOEngineConfig(
         host="127.0.0.1",
         port=get_free_port(),
@@ -178,7 +178,7 @@ def test_rdma_backend_ops(
     sess = initiator.create_session(initiator_mem, target_mem)
     offsets = [i * buffer_size for i in range(batch_size)]
     sizes = [buffer_size for _ in range(batch_size)]
-    status_list = []
+    uid_status_list = []
 
     if enable_batch:
         if enable_sess:
@@ -189,7 +189,7 @@ def test_rdma_backend_ops(
             transfer_status = initiator.batch_read(
                 initiator_mem, offsets, target_mem, offsets, sizes, transfer_uid
             )
-        status_list.append(transfer_status)
+        uid_status_list.append((transfer_uid, transfer_status))
     else:
         for i in range(batch_size):
             if enable_sess:
@@ -207,15 +207,15 @@ def test_rdma_backend_ops(
                     sizes[i],
                     transfer_uid,
                 )
-            status_list.append(transfer_status)
+            uid_status_list.append((transfer_uid, transfer_status))
 
-    for status in status_list:
+    for uid, status in uid_status_list:
         check_transfer_result(
             pre_connected_engine_pair,
             status,
             initiator_tensor,
             target_tensor,
-            transfer_uid,
+            uid,
         )
 
 
