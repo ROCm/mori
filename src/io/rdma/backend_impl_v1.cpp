@@ -43,6 +43,8 @@ struct RdmaOpStatusHandle {
 };
 
 void RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id) {
+  MORI_IO_FUNCTION_TIMER;
+
   for (int i = 0; i < eps.size(); i++) {
     const application::RdmaEndpoint& ep = eps[i].local;
     NotifMessage msg{id, i, static_cast<int>(eps.size())};
@@ -73,6 +75,8 @@ void RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegio
                         const SizeVec& localOffsets, const application::RdmaMemoryRegion& remote,
                         const SizeVec& remoteOffsets, const SizeVec& sizes, TransferStatus* status,
                         TransferUniqueId id, int postBatchSize, bool isRead) {
+  MORI_IO_FUNCTION_TIMER;
+
   // Check sizes
   if ((localOffsets.size() != remoteOffsets.size()) || (sizes.size() != remoteOffsets.size())) {
     status->SetCode(StatusCode::ERR_INVALID_ARGS);
@@ -135,7 +139,7 @@ void RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegio
           status->SetMessage(strerror(errno));
           return;
         }
-        MORI_IO_DEBUG("ibv_post_send ep index {} batch index {}", i, j);
+        MORI_IO_TRACE("ibv_post_send ep index {} batch index {}", i, j);
       }
     }
   }

@@ -28,7 +28,7 @@
 #include <vector>
 
 #include "mori/application/utils/check.hpp"
-#include "mori/io/engine.hpp"
+#include "mori/io/io.hpp"
 
 using namespace mori::io;
 
@@ -62,6 +62,8 @@ int GetFreePort() {
 }
 
 void TestMoriIOEngine() {
+  SetLogLevel("trace");
+
   IOEngineConfig config;
   config.host = "127.0.0.1";
   config.port = GetFreePort();

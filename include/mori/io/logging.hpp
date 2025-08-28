@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <chrono>
 #include <string>
 
 #include "spdlog/spdlog.h"
@@ -28,12 +29,12 @@
 namespace mori {
 namespace io {
 
-#define MORI_IO_TRACE SPDLOG_TRACE
-#define MORI_IO_DEBUG SPDLOG_DEBUG
-#define MORI_IO_INFO SPDLOG_INFO
-#define MORI_IO_WARN SPDLOG_WARN
-#define MORI_IO_ERROR SPDLOG_ERROR
-#define MORI_IO_CRITICAL SPDLOG_CRITICAL
+#define MORI_IO_TRACE spdlog::trace
+#define MORI_IO_DEBUG spdlog::debug
+#define MORI_IO_INFO spdlog::info
+#define MORI_IO_WARN spdlog::warn
+#define MORI_IO_ERROR spdlog::error
+#define MORI_IO_CRITICAL spdlog::critical
 
 // trace / debug / info / warning / error / critical
 inline void SetLogLevel(const std::string& strLevel) {
@@ -41,6 +42,28 @@ inline void SetLogLevel(const std::string& strLevel) {
   spdlog::set_level(level);
   MORI_IO_INFO("Set MORI-IO log level to {}", spdlog::level::to_string_view(level));
 }
+
+class ScopedTimer {
+ public:
+  using Clock = std::chrono::steady_clock;
+
+  explicit ScopedTimer(std::string name) : name_(std::move(name)), start_(Clock::now()) {}
+
+  ~ScopedTimer() {
+    auto end = Clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start_).count();
+    MORI_IO_DEBUG("ScopedTimer [{}] took {} ns", name_, duration);
+  }
+
+  ScopedTimer(const ScopedTimer&) = delete;
+  ScopedTimer& operator=(const ScopedTimer&) = delete;
+
+ private:
+  std::string name_;
+  Clock::time_point start_;
+};
+
+#define MORI_IO_FUNCTION_TIMER ScopedTimer instance(__func__)
 
 }  // namespace io
 }  // namespace mori

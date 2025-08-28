@@ -29,6 +29,7 @@ from mori.io import (
     EngineDesc,
     MemoryDesc,
     RdmaBackendConfig,
+    set_log_level,
 )
 import argparse
 from enum import Enum
@@ -86,6 +87,12 @@ def parse_args():
         type=int,
         default=1,
         help="Number of QPused for single transfer",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="info",
+        help="Log level options: 'trace', 'debug', 'info', 'warning', 'error', 'critical'",
     )
 
     args = parser.parse_args()
@@ -385,6 +392,7 @@ class MoriIoBenchmark:
 
 
 def benchmark_engine(local_rank, node_rank, args):
+    set_log_level(args.log_level)
     max_buffer_size = args.buffer_size
     if args.all:
         max_buffer_size = max(max_buffer_size, 2**20)

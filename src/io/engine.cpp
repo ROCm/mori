@@ -36,6 +36,7 @@ TransferUniqueId IOEngineSession::AllocateTransferUniqueId() {
 
 void IOEngineSession::Read(size_t localOffset, size_t remoteOffset, size_t size,
                            TransferStatus* status, TransferUniqueId id) {
+  MORI_IO_FUNCTION_TIMER;
   for (auto& it : backendSess) {
     it.second->Read(localOffset, remoteOffset, size, status, id);
     if (status->Failed()) {
@@ -47,6 +48,7 @@ void IOEngineSession::Read(size_t localOffset, size_t remoteOffset, size_t size,
 
 void IOEngineSession::Write(size_t localOffset, size_t remoteOffset, size_t size,
                             TransferStatus* status, TransferUniqueId id) {
+  MORI_IO_FUNCTION_TIMER;
   for (auto& it : backendSess) {
     it.second->Write(localOffset, remoteOffset, size, status, id);
     if (status->Failed()) {
@@ -58,6 +60,7 @@ void IOEngineSession::Write(size_t localOffset, size_t remoteOffset, size_t size
 
 void IOEngineSession::BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                 const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
+  MORI_IO_FUNCTION_TIMER;
   for (auto& it : backendSess) {
     it.second->BatchRead(localOffsets, remoteOffsets, sizes, status, id);
     if (status->Failed()) {
@@ -133,8 +136,8 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryL
   }
 
   memPool.insert({memDesc.id, memDesc});
-  MORI_IO_DEBUG("Register memory address {} size {} device {} loc {} with id {}", data, size,
-                device, loc, memDesc.id);
+  MORI_IO_TRACE("Register memory address {} size {} device {} loc {} with id {}", data, size,
+                device, static_cast<uint32_t>(loc), memDesc.id);
   return memDesc;
 }
 
@@ -143,17 +146,18 @@ void IOEngine::DeregisterMemory(const MemoryDesc& desc) {
     it.second->DeregisterMemory(desc);
   }
   memPool.erase(desc.id);
-  MORI_IO_DEBUG("Deregister memory {} at address {}", desc.id, desc.data);
+  MORI_IO_TRACE("Deregister memory {} at address {}", desc.id, desc.data);
 }
 
 TransferUniqueId IOEngine::AllocateTransferUniqueId() {
   TransferUniqueId id = nextTransferUid.fetch_add(1, std::memory_order_relaxed);
-  MORI_IO_DEBUG("Allocate transfer uid {}", id);
+  MORI_IO_TRACE("Allocate transfer uid {}", id);
   return id;
 }
 
 void IOEngine::Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
                     size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id) {
+  MORI_IO_FUNCTION_TIMER;
   for (auto& it : backends) {
     it.second->Read(localDest, localOffset, remoteSrc, remoteOffset, size, status, id);
     if (status->Failed()) {
@@ -166,6 +170,7 @@ void IOEngine::Read(const MemoryDesc& localDest, size_t localOffset, const Memor
 void IOEngine::Write(const MemoryDesc& localSrc, size_t localOffset, const MemoryDesc& remoteDest,
                      size_t remoteOffset, size_t size, TransferStatus* status,
                      TransferUniqueId id) {
+  MORI_IO_FUNCTION_TIMER;
   for (auto& it : backends) {
     it.second->Write(localSrc, localOffset, remoteDest, remoteOffset, size, status, id);
     if (status->Failed()) {
@@ -177,6 +182,7 @@ void IOEngine::Write(const MemoryDesc& localSrc, size_t localOffset, const Memor
 void IOEngine::BatchRead(const MemoryDesc& localDest, const SizeVec& localOffsets,
                          const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
                          const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
+  MORI_IO_FUNCTION_TIMER;
   for (auto& it : backends) {
     it.second->BatchRead(localDest, localOffsets, remoteSrc, remoteOffsets, sizes, status, id);
     if (status->Failed()) {
