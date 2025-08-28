@@ -106,7 +106,14 @@ struct TransferStatus {
   ~TransferStatus() = default;
 
   StatusCode Code() { return code.load(std::memory_order_relaxed); }
+  uint32_t CodeUint32() { return static_cast<uint32_t>(code.load(std::memory_order_relaxed)); }
+
   std::string Message() { return msg; }
+
+  bool Init() { return Code() == StatusCode::INIT; }
+  bool InProgress() { return Code() == StatusCode::IN_PROGRESS; }
+  bool Succeeded() { return Code() == StatusCode::SUCCESS; }
+  bool Failed() { return Code() > StatusCode::ERR_BEGIN; }
 
   void SetCode(enum StatusCode val) { code.store(val, std::memory_order_relaxed); }
   void SetMessage(const std::string& val) { msg = val; }

@@ -266,6 +266,8 @@ void RegisterMoriShmem(py::module_& m) {
 }
 
 void RegisterMoriIo(pybind11::module_& m) {
+  m.def("set_log_level", &mori::io::SetLogLevel);
+
   py::enum_<mori::io::BackendType>(m, "BackendType")
       .value("Unknown", mori::io::BackendType::Unknown)
       .value("XGMI", mori::io::BackendType::XGMI)
@@ -282,14 +284,16 @@ void RegisterMoriIo(pybind11::module_& m) {
   py::enum_<mori::io::StatusCode>(m, "StatusCode")
       .value("SUCCESS", mori::io::StatusCode::SUCCESS)
       .value("INIT", mori::io::StatusCode::INIT)
-      .value("ERROR", mori::io::StatusCode::ERROR)
-      .value("NOT_FOUND", mori::io::StatusCode::NOT_FOUND)
+      .value("IN_PROGRESS", mori::io::StatusCode::IN_PROGRESS)
+      .value("ERR_INVALID_ARGS", mori::io::StatusCode::ERR_INVALID_ARGS)
+      .value("ERR_NOT_FOUND", mori::io::StatusCode::ERR_NOT_FOUND)
+      .value("ERR_RDMA_OP", mori::io::StatusCode::ERR_RDMA_OP)
       .export_values();
 
   py::class_<mori::io::BackendConfig>(m, "BackendConfig");
 
   py::class_<mori::io::RdmaBackendConfig, mori::io::BackendConfig>(m, "RdmaBackendConfig")
-      .def(py::init<uint32_t>(), py::arg("qp_per_transfer") = 1)
+      .def(py::init<int, int>(), py::arg("qp_per_transfer") = 1, py::arg("post_batch_size") = -1)
       .def_readwrite("qp_per_transfer", &mori::io::RdmaBackendConfig::qpPerTransfer);
 
   py::class_<mori::io::IOEngineConfig>(m, "IOEngineConfig")
@@ -301,6 +305,10 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def(py::init<>())
       .def("Code", &mori::io::TransferStatus::Code)
       .def("Message", &mori::io::TransferStatus::Message)
+      .def("Init", &mori::io::TransferStatus::Init)
+      .def("InProgress", &mori::io::TransferStatus::InProgress)
+      .def("Succeeded", &mori::io::TransferStatus::Succeeded)
+      .def("Failed", &mori::io::TransferStatus::Failed)
       .def("SetCode", &mori::io::TransferStatus::SetCode)
       .def("SetMessage", &mori::io::TransferStatus::SetMessage);
 

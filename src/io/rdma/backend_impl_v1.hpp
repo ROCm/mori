@@ -277,7 +277,7 @@ class ControlPlaneServer {
 class RdmaBackendSession : public BackendSession {
  public:
   RdmaBackendSession() = default;
-  RdmaBackendSession(const application::RdmaMemoryRegion& local,
+  RdmaBackendSession(const RdmaBackendConfig& config, const application::RdmaMemoryRegion& local,
                      const application::RdmaMemoryRegion& remote, const EpPairVec& eps);
   ~RdmaBackendSession() = default;
 
@@ -292,6 +292,7 @@ class RdmaBackendSession : public BackendSession {
   bool Alive() const;
 
  private:
+  RdmaBackendConfig config{};
   application::RdmaMemoryRegion local{};
   application::RdmaMemoryRegion remote{};
   EpPairVec eps{};

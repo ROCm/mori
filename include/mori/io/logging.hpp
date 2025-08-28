@@ -21,34 +21,49 @@
 // SOFTWARE.
 #pragma once
 
+#include <chrono>
+#include <string>
+
+#include "spdlog/spdlog.h"
+
 namespace mori {
 namespace io {
 
-enum class BackendType : uint32_t {
-  Unknown = 0,
-  XGMI = 1,
-  RDMA = 2,
-  TCP = 3,
+#define MORI_IO_TRACE spdlog::trace
+#define MORI_IO_DEBUG spdlog::debug
+#define MORI_IO_INFO spdlog::info
+#define MORI_IO_WARN spdlog::warn
+#define MORI_IO_ERROR spdlog::error
+#define MORI_IO_CRITICAL spdlog::critical
+
+// trace / debug / info / warning / error / critical
+inline void SetLogLevel(const std::string& strLevel) {
+  spdlog::level::level_enum level = spdlog::level::from_str(strLevel);
+  spdlog::set_level(level);
+  MORI_IO_INFO("Set MORI-IO log level to {}", spdlog::level::to_string_view(level));
+}
+
+class ScopedTimer {
+ public:
+  using Clock = std::chrono::steady_clock;
+
+  explicit ScopedTimer(std::string name) : name_(std::move(name)), start_(Clock::now()) {}
+
+  ~ScopedTimer() {
+    auto end = Clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start_).count();
+    MORI_IO_DEBUG("ScopedTimer [{}] took {} ns", name_, duration);
+  }
+
+  ScopedTimer(const ScopedTimer&) = delete;
+  ScopedTimer& operator=(const ScopedTimer&) = delete;
+
+ private:
+  std::string name_;
+  Clock::time_point start_;
 };
 
-using BackendTypeVec = std::vector<BackendType>;
-
-enum class MemoryLocationType : uint32_t {
-  Unknown = 0,
-  CPU = 1,
-  GPU = 2,
-};
-
-enum class StatusCode : uint32_t {
-  SUCCESS = 0,
-  INIT = 1,
-  IN_PROGRESS = 2,
-
-  ERR_BEGIN = 10,
-  ERR_INVALID_ARGS = 11,
-  ERR_NOT_FOUND = 12,
-  ERR_RDMA_OP = 13
-};
+#define MORI_IO_FUNCTION_TIMER ScopedTimer instance(__func__)
 
 }  // namespace io
 }  // namespace mori

@@ -31,11 +31,13 @@ from mori.io import (
     StatusCode,
     MemoryLocationType,
     RdmaBackendConfig,
+    set_log_level,
 )
 
 
 @pytest.fixture(scope="module")
 def pre_connected_engine_pair():
+    set_log_level("info")
     config = IOEngineConfig(
         host="127.0.0.1",
         port=get_free_port(),
@@ -44,7 +46,7 @@ def pre_connected_engine_pair():
     config.port = get_free_port()
     target = IOEngine(key="target", config=config)
 
-    config = RdmaBackendConfig(qp_per_transfer=2)
+    config = RdmaBackendConfig(qp_per_transfer=2, post_batch_size=16)
     initiator.create_backend(BackendType.RDMA, config)
     target.create_backend(BackendType.RDMA, config)
 
@@ -111,7 +113,7 @@ def test_mem_desc():
 
 
 def wait_status(status):
-    while status.Code() == StatusCode.INIT:
+    while status.InProgress():
         pass
 
 
@@ -150,91 +152,89 @@ def check_transfer_result(
     target_status = wait_inbound_status(
         target, initiator.get_engine_desc().key, transfer_uid
     )
-    assert initiator_status.Code() == StatusCode.SUCCESS
-    assert target_status.Code() == StatusCode.SUCCESS
+    assert initiator_status.Succeeded()
+    assert target_status.Succeeded()
     assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
 
 
-def test_read(pre_connected_engine_pair):
+@pytest.mark.parametrize("enable_sess", (True, False))
+@pytest.mark.parametrize("enable_batch", (True, False))
+@pytest.mark.parametrize("op_type", ("read",))
+@pytest.mark.parametrize("batch_size", (1, 64))
+@pytest.mark.parametrize("buffer_size", (8, 8192))
+def test_rdma_backend_ops(
+    pre_connected_engine_pair,
+    enable_sess,
+    enable_batch,
+    op_type,
+    batch_size,
+    buffer_size,
+):
     initiator, target = pre_connected_engine_pair
-    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
-        pre_connected_engine_pair, [128, 8192]
-    )
-
-    transfer_uid = initiator.allocate_transfer_uid()
-    transfer_status = initiator.read(
-        initiator_mem, 0, target_mem, 0, initiator_mem.size, transfer_uid
-    )
-    check_transfer_result(
-        pre_connected_engine_pair,
-        transfer_status,
-        initiator_tensor,
-        target_tensor,
-        transfer_uid,
-    )
-
-
-def test_sess_read(pre_connected_engine_pair):
-    initiator, target = pre_connected_engine_pair
-    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
-        pre_connected_engine_pair, [128, 8192]
-    )
-
-    sess = initiator.create_session(initiator_mem, target_mem)
-    transfer_uid = sess.allocate_transfer_uid()
-    transfer_status = sess.read(0, 0, initiator_mem.size, transfer_uid)
-
-    check_transfer_result(
-        pre_connected_engine_pair,
-        transfer_status,
-        initiator_tensor,
-        target_tensor,
-        transfer_uid,
-    )
-
-
-def test_batch_read(pre_connected_engine_pair):
-    initiator, target = pre_connected_engine_pair
-    batch_size, buffer_size = 128, 8192
-
-    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
-        pre_connected_engine_pair, [batch_size, buffer_size]
-    )
-
-    transfer_uid = initiator.allocate_transfer_uid()
-    offsets = [i * buffer_size for i in range(batch_size)]
-    sizes = [buffer_size for _ in range(batch_size)]
-    transfer_status = initiator.batch_read(
-        initiator_mem, offsets, target_mem, offsets, sizes, transfer_uid
-    )
-
-    check_transfer_result(
-        pre_connected_engine_pair,
-        transfer_status,
-        initiator_tensor,
-        target_tensor,
-        transfer_uid,
-    )
-
-
-def test_sess_batch_read(pre_connected_engine_pair):
-    initiator, target = pre_connected_engine_pair
-    batch_size, buffer_size = 128, 8192
-
     initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
         pre_connected_engine_pair, [batch_size, buffer_size]
     )
 
     sess = initiator.create_session(initiator_mem, target_mem)
-    transfer_uid = sess.allocate_transfer_uid()
     offsets = [i * buffer_size for i in range(batch_size)]
     sizes = [buffer_size for _ in range(batch_size)]
+    uid_status_list = []
+
+    if enable_batch:
+        if enable_sess:
+            transfer_uid = sess.allocate_transfer_uid()
+            transfer_status = sess.batch_read(offsets, offsets, sizes, transfer_uid)
+        else:
+            transfer_uid = initiator.allocate_transfer_uid()
+            transfer_status = initiator.batch_read(
+                initiator_mem, offsets, target_mem, offsets, sizes, transfer_uid
+            )
+        uid_status_list.append((transfer_uid, transfer_status))
+    else:
+        for i in range(batch_size):
+            if enable_sess:
+                transfer_uid = sess.allocate_transfer_uid()
+                transfer_status = sess.read(
+                    offsets[i], offsets[i], sizes[i], transfer_uid
+                )
+            else:
+                transfer_uid = initiator.allocate_transfer_uid()
+                transfer_status = initiator.read(
+                    initiator_mem,
+                    offsets[i],
+                    target_mem,
+                    offsets[i],
+                    sizes[i],
+                    transfer_uid,
+                )
+            uid_status_list.append((transfer_uid, transfer_status))
+
+    for uid, status in uid_status_list:
+        check_transfer_result(
+            pre_connected_engine_pair,
+            status,
+            initiator_tensor,
+            target_tensor,
+            uid,
+        )
+
+
+def test_err_out_of_range(pre_connected_engine_pair):
+    initiator, target = pre_connected_engine_pair
+    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
+        pre_connected_engine_pair,
+        (
+            2,
+            32,
+        ),
+    )
+
+    sess = initiator.create_session(initiator_mem, target_mem)
+    offsets = (0, 32)
+    sizes = (32, 34)
+
+    transfer_uid = sess.allocate_transfer_uid()
     transfer_status = sess.batch_read(offsets, offsets, sizes, transfer_uid)
 
-    check_transfer_result(
-        pre_connected_engine_pair,
-        transfer_status,
-        initiator_tensor,
-        target_tensor,
-        transfer_uid,
-    )
+    assert transfer_status.Failed()
+    assert transfer_status.Code() == StatusCode.ERR_INVALID_ARGS
