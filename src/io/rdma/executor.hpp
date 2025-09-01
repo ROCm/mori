@@ -43,7 +43,7 @@ struct ExecutorReq {
   const application::RdmaMemoryRegion& remote;
   const SizeVec& remoteOffsets;
   const SizeVec& sizes;
-  TransferStatus* status;
+  CqCallbackHandle* callbackStatus;
   TransferUniqueId id;
   int postBatchSize;
   bool isRead;
@@ -59,7 +59,7 @@ class Executor {
 
   virtual void Start() = 0;
   virtual void Shutdown() = 0;
-  virtual void RdmaBatchReadWrite(const ExecutorReq& req) = 0;
+  virtual RdmaOpRet RdmaBatchReadWrite(const ExecutorReq& req) = 0;
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -70,14 +70,14 @@ class MultithreadExecutor : public Executor {
   MultithreadExecutor(int numWorker);
   ~MultithreadExecutor();
 
-  void RdmaBatchReadWrite(const ExecutorReq& req);
+  RdmaOpRet RdmaBatchReadWrite(const ExecutorReq& req);
   void Start();
   void Shutdown();
 
  private:
   struct Task {
     const ExecutorReq& req;
-    TransferStatus& status;
+    RdmaOpRet& ret;
     int epId{-1};
     int begin{-1};
     int end{-1};

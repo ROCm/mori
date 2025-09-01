@@ -50,8 +50,8 @@ void MultithreadExecutor::Worker::Shutdown() {
 }
 
 void MultithreadExecutor::Worker::MainLoop() {
+  MORI_IO_INFO("worker {} enter main loop", workerId);
   while (true) {
-    MORI_IO_INFO("worker {} enter main loop", workerId);
     {
       std::unique_lock<std::mutex> lock(mu);
       cond.wait(lock, [this]() { return !q.empty() || !running.load(); });
@@ -70,12 +70,12 @@ void MultithreadExecutor::Worker::MainLoop() {
         SizeVec tRemoteOffsets(task.req.remoteOffsets.begin() + task.begin,
                                task.req.remoteOffsets.begin() + task.end);
         SizeVec tSizes(task.req.sizes.begin() + task.begin, task.req.sizes.begin() + task.end);
-        mori::io::RdmaBatchReadWrite({task.req.eps[task.epId]}, task.req.local, tLoclOffsets,
-                                     task.req.remote, tRemoteOffsets, tSizes, task.req.status,
-                                     task.req.id, task.req.isRead, task.expectedNumCqe,
-                                     task.req.postBatchSize);
-        MORI_IO_TRACE("worker {} execute task {} begin {} end {}", workerId, task.req.id,
-                      task.begin, task.end);
+        task.ret = mori::io::RdmaBatchReadWrite(
+            {task.req.eps[task.epId]}, task.req.local, tLoclOffsets, task.req.remote,
+            tRemoteOffsets, tSizes, task.req.status, task.req.id, task.req.isRead,
+            task.expectedNumCqe, task.req.postBatchSize);
+        MORI_IO_TRACE("Worker {} execute task {} begin {} end {} ret code {}", workerId,
+                      task.req.id, task.begin, task.end, static_cast<uint32_t>(task.ret.code));
       }
     }
   }
@@ -85,13 +85,15 @@ void MultithreadExecutor::Worker::Submit(Task task) {
   {
     std::lock_guard<std::mutex> lock(mu);
     if (!running.load()) {
-      task.status.SetCode(StatusCode::ERR_BAD_STATE);
-      task.status.SetMessage("worker not started yet");
+      task.ret.code = StatusCode::ERR_BAD_STATE;
+      task.ret.message = "worker not started yet";
       return;
     }
     q.push(task);
     cond.notify_all();
   }
+  MORI_IO_TRACE("Submit to worker {} task {} begin {} end {}", workerId, task.req.id, task.begin,
+                task.end);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -126,37 +128,36 @@ std::vector<std::pair<int, int>> MultithreadExecutor::SplitWork(const ExecutorRe
   return splits;
 }
 
-void MultithreadExecutor::RdmaBatchReadWrite(const ExecutorReq& req) {
-  std::vector<std::unique_ptr<TransferStatus>> resps;
-  for (int i = 0; i < numWorker; i++) resps.emplace_back(new TransferStatus());
-
+RdmaOpRet MultithreadExecutor::RdmaBatchReadWrite(const ExecutorReq& req) {
   auto splits = SplitWork(req);
-  int expectedNumCqe = splits.size();
-  for (int i = 0; i < splits.size(); i++) {
-    pool[i]->Submit({req, *resps[i], i, splits[i].first, splits[i].second, expectedNumCqe});
+  int numSplits = splits.size();
+  std::vector<RdmaOpRet> rets(numSplits);
+
+  for (int i = 0; i < numSplits; i++) {
+    pool[i]->Submit({req, rets[i], i, splits[i].first, splits[i].second, numSplits});
   }
 
   bool hasFail = false;
   int numSucc = 0;
-  for (auto& status : resps) {
-    while (status->Init()) {
+  RdmaOpRet failedRet;
+  for (auto& ret : rets) {
+    while (ret.Init()) {
     }
-    if (status->Failed()) {
+    if (ret.Failed()) {
       hasFail = true;
-      req.status->SetCode(status->Code());
-      req.status->SetMessage(status->Message());
-    } else if (status->Succeeded()) {
+      failedRet = ret;
+    } else if (ret.Succeeded()) {
       numSucc++;
     }
   }
-  if (hasFail) return;
+  if (hasFail) return failedRet;
 
-  if (numSucc == numWorker) {
-    req.status->SetCode(StatusCode::SUCCESS);
-    return;
+  if (numSucc == numSplits) {
+    return {StatusCode::SUCCESS, ""};
   }
 
-  req.status->SetCode(StatusCode::IN_PROGRESS);
+  MORI_IO_TRACE("MultithreadExecutor submit request for RdmaBatchReadWrite done");
+  return {StatusCode::IN_PROGRESS, ""};
 }
 
 void MultithreadExecutor::Start() {

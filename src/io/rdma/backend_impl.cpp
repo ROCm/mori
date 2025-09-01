@@ -290,11 +290,12 @@ void NotifManager::MainLoop() {
         } else if (wc.opcode == IBV_WC_SEND) {
           uint64_t id = wc.wr_id;
         } else {
-          RdmaOpStatusHandle* handle = reinterpret_cast<RdmaOpStatusHandle*>(wc.wr_id);
+          CqCallbackHandle* handle = reinterpret_cast<CqCallbackHandle*>(wc.wr_id);
           uint32_t lastNumCqe = handle->curNumCqe.fetch_add(1);
           if (handle->status != nullptr) {
             if (wc.status == IBV_WC_SUCCESS) {
               if ((lastNumCqe + 1) == handle->expectedNumCqe) {
+                // TODO: should use atomic cas to avoid overwriting faied status
                 handle->status->SetCode(StatusCode::SUCCESS);
                 handle->status->SetMessage(ibv_wc_status_str(wc.status));
               }
@@ -305,6 +306,9 @@ void NotifManager::MainLoop() {
               handle->status = nullptr;
             }
           }
+          MORI_IO_TRACE(
+              "NotifManager receive cqe for task {} code {} expected num cqe {} last num cqe {}",
+              handle->id, handle->status->CodeUint32(), handle->expectedNumCqe, lastNumCqe);
           if ((lastNumCqe + 1) == handle->expectedNumCqe) {
             free(handle);
           }
@@ -529,16 +533,33 @@ RdmaBackendSession::RdmaBackendSession(const RdmaBackendConfig& config,
 
 void RdmaBackendSession::Read(size_t localOffset, size_t remoteOffset, size_t size,
                               TransferStatus* status, TransferUniqueId id) {
-  RdmaRead(eps, local, localOffset, remote, remoteOffset, size, status, id);
-  if (!status->Failed()) {
+  status->SetCode(StatusCode::IN_PROGRESS);
+  CqCallbackHandle callbackStatus = new CqCallbackHandle(status, id, 1, );
+
+  RdmaOpRet ret = RdmaRead(eps, local, localOffset, remote, remoteOffset, size, callbackStatus, id);
+  assert(!ret.Init());
+  if (ret.Failed() || ret.Succeeded()) {
+    status->SetCode(ret.code);
+    status->SetMessage(ret.message);
+  }
+  if (!ret.Failed()) {
     RdmaNotifyTransfer(eps, status, id);
   }
 }
 
 void RdmaBackendSession::Write(size_t localOffset, size_t remoteOffset, size_t size,
                                TransferStatus* status, TransferUniqueId id) {
-  RdmaWrite(eps, local, localOffset, remote, remoteOffset, size, status, id);
-  if (!status->Failed()) {
+  status->SetCode(StatusCode::IN_PROGRESS);
+  CqCallbackHandle callbackStatus = new CqCallbackHandle(status, id, 1, );
+
+  RdmaOpRet ret =
+      RdmaWrite(eps, local, localOffset, remote, remoteOffset, size, callbackStatus, id);
+  assert(!ret.Init());
+  if (ret.Failed() || ret.Succeeded()) {
+    status->SetCode(ret.code);
+    status->SetMessage(ret.message);
+  }
+  if (!ret.Failed()) {
     RdmaNotifyTransfer(eps, status, id);
   }
 }
@@ -546,18 +567,34 @@ void RdmaBackendSession::Write(size_t localOffset, size_t remoteOffset, size_t s
 void RdmaBackendSession::BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                    const SizeVec& sizes, TransferStatus* status,
                                    TransferUniqueId id) {
+  status->SetCode(StatusCode::IN_PROGRESS);
+  CqCallbackHandle callbackStatus = new CqCallbackHandle(status, id, 1, );
+  RdmaOpRet ret;
   if (executor) {
     ExecutorReq req{
-        eps,    local, localOffsets,         remote, remoteOffsets, sizes,
-        status, id,    config.postBatchSize, true /*isRead */
+        eps,
+        local,
+        localOffsets,
+        remote,
+        remoteOffsets,
+        sizes,
+        callbackStatus,
+        id,
+        config.postBatchSize,
+        true /*isRead */
     };
-    executor->RdmaBatchReadWrite(req);
+    ret = executor->RdmaBatchReadWrite(req);
   } else {
-    RdmaBatchRead(eps, local, localOffsets, remote, remoteOffsets, sizes, status, id,
-                  config.postBatchSize);
+    ret = RdmaBatchRead(eps, local, localOffsets, remote, remoteOffsets, sizes, status, id,
+                        config.postBatchSize);
   }
 
-  if (!status->Failed()) {
+  assert(!ret.Init());
+  if (ret.Failed() || ret.Succeeded()) {
+    status->SetCode(ret.code);
+    status->SetMessage(ret.message);
+  }
+  if (!ret.Failed()) {
     RdmaNotifyTransfer(eps, status, id);
   }
 }
@@ -595,7 +632,9 @@ RdmaBackend::RdmaBackend(EngineKey key, const IOEngineConfig& engConfig,
 RdmaBackend::~RdmaBackend() {
   notif->Shutdown();
   server->Shutdown();
-  executor->Shutdown();
+  if (executor.get() != nullptr) {
+    executor->Shutdown();
+  }
 }
 
 void RdmaBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {

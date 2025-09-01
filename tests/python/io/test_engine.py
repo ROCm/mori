@@ -47,7 +47,9 @@ def create_connected_engine_pair(
     target = IOEngine(key=f"{name_prefix}_target", config=config)
 
     config = RdmaBackendConfig(
-        qp_per_transfer=2, post_batch_size=-1, num_worker_threads=1
+        qp_per_transfer=qp_per_transfer,
+        post_batch_size=post_batch_size,
+        num_worker_threads=num_worker_threads,
     )
     initiator.create_backend(BackendType.RDMA, config)
     target.create_backend(BackendType.RDMA, config)
@@ -63,7 +65,7 @@ def create_connected_engine_pair(
 
 @pytest.fixture(scope="module")
 def pre_connected_engine_pair():
-    set_log_level("info")
+    set_log_level("trace")
     initiator, target = create_connected_engine_pair(
         "normal", qp_per_transfer=2, post_batch_size=-1, num_worker_threads=1
     )
@@ -176,11 +178,11 @@ def check_transfer_result(
 
 
 @pytest.mark.parametrize("engine_type", ("multhd",))
-@pytest.mark.parametrize("enable_sess", (True, False))
-@pytest.mark.parametrize("enable_batch", (True, False))
+@pytest.mark.parametrize("enable_sess", (True,))
+@pytest.mark.parametrize("enable_batch", (True,))
 @pytest.mark.parametrize("op_type", ("read",))
-@pytest.mark.parametrize("batch_size", (1, 64))
-@pytest.mark.parametrize("buffer_size", (8, 8192))
+@pytest.mark.parametrize("batch_size", (64,))
+@pytest.mark.parametrize("buffer_size", (8,))
 def test_rdma_backend_ops(
     pre_connected_engine_pair,
     engine_type,

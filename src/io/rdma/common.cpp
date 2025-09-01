@@ -29,7 +29,7 @@ namespace io {
 /*                                         Rdma Utilities                                         */
 /* ---------------------------------------------------------------------------------------------- */
 
-void RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id) {
+RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
 
   for (int i = 0; i < eps.size(); i++) {
@@ -51,50 +51,43 @@ void RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUn
     struct ibv_send_wr* bad_wr = nullptr;
     int ret = ibv_post_send(ep.ibvHandle.qp, &wr, &bad_wr);
     if (ret != 0) {
-      status->SetCode(StatusCode::ERR_RDMA_OP);
-      status->SetMessage(strerror(errno));
-      return;
+      // TODO: set callback status here?
+      return {StatusCode::ERR_RDMA_OP, strerror(errno)};
     }
   }
+
+  return {StatusCode::IN_PROGRESS, ""};
 }
 
-void RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
-                        const SizeVec& localOffsets, const application::RdmaMemoryRegion& remote,
-                        const SizeVec& remoteOffsets, const SizeVec& sizes, TransferStatus* status,
-                        TransferUniqueId id, bool isRead, int expectedNumCqe, int postBatchSize) {
+RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
+                             const SizeVec& localOffsets,
+                             const application::RdmaMemoryRegion& remote,
+                             const SizeVec& remoteOffsets, const SizeVec& sizes,
+                             TransferStatus* callbackStatus, TransferUniqueId id, bool isRead,
+                             int expectedNumCqe, int postBatchSize) {
   MORI_IO_FUNCTION_TIMER;
 
   // Check sizes
   if ((localOffsets.size() != remoteOffsets.size()) || (sizes.size() != remoteOffsets.size())) {
-    status->SetCode(StatusCode::ERR_INVALID_ARGS);
-    status->SetMessage("lengths of local offsets, remote offsets or sizes mismatch");
-    return;
+    return {StatusCode::ERR_INVALID_ARGS,
+            "lengths of local offsets, remote offsets or sizes mismatch"};
   }
 
   size_t batchSize = sizes.size();
   if (batchSize == 0) {
-    status->SetCode(StatusCode::SUCCESS);
-    return;
+    return {StatusCode::SUCCESS, ""};
   }
 
   // Check offset and size is in range
   for (int i = 0; i < batchSize; i++) {
     if (((localOffsets[i] + sizes[i]) > local.length) ||
         ((remoteOffsets[i] + sizes[i]) > remote.length)) {
-      status->SetCode(StatusCode::ERR_INVALID_ARGS);
-      status->SetMessage("length out of range");
-      return;
+      return {StatusCode::ERR_INVALID_ARGS, "length out of range"};
     }
   }
-  status->SetCode(StatusCode::IN_PROGRESS);
 
   size_t epNum = eps.size();
   size_t epBatchSize = (batchSize + epNum - 1) / epNum;
-
-  RdmaOpStatusHandle* internalStatus = new RdmaOpStatusHandle();
-  internalStatus->status = status;
-  internalStatus->expectedNumCqe =
-      (expectedNumCqe <= 0) ? std::min(batchSize, epNum) : expectedNumCqe;
 
   std::vector<struct ibv_sge> sges(batchSize, ibv_sge{});
   std::vector<struct ibv_send_wr> wrs(batchSize, ibv_send_wr{});
@@ -111,7 +104,7 @@ void RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegio
       sge.lkey = local.lkey;
 
       struct ibv_send_wr& wr = wrs[j];
-      wr.wr_id = (j < (end - 1)) ? 0 : reinterpret_cast<uint64_t>(internalStatus);
+      wr.wr_id = (j < (end - 1)) ? 0 : reinterpret_cast<uint64_t>(callbackStatus);
       wr.sg_list = &sge;
       wr.num_sge = 1;
       wr.opcode = isRead ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
@@ -123,14 +116,14 @@ void RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegio
       if ((j > st) && ((j - st) % postBatchSize == 0) || (j == (end - 1))) {
         int ret = ibv_post_send(eps[i].local.ibvHandle.qp, wrs.data() + st, nullptr);
         if (ret != 0) {
-          status->SetCode(StatusCode::ERR_RDMA_OP);
-          status->SetMessage(strerror(errno));
-          return;
+          return {StatusCode::ERR_RDMA_OP, strerror(errno)};
         }
         MORI_IO_TRACE("ibv_post_send ep index {} batch index {}", i, j);
       }
     }
   }
+
+  return {StatusCode::IN_PROGRESS, ""};
 }
 
 };  // namespace io

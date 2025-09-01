@@ -125,50 +125,69 @@ struct NotifMessage {
   int totalNum{-1};
 };
 
-struct RdmaOpStatusHandle {
+struct CqCallbackHandle {
+  CqCallbackHandle(TransferStatus* s, TransferUniqueId id_, int n)
+      : status(s), id(id), totalNumWr(n) {}
+
   TransferStatus* status{nullptr};
-  int expectedNumCqe{0};
-  std::atomic<uint32_t> curNumCqe{0};
+  TransferUniqueId id{0};
+  int totalNumWr{0};
+  std::atomic<uint32_t> curNumWr{0};
 };
 
-void RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id);
+struct RdmaOpRet {
+  StatusCode code{StatusCode::INIT};
+  std::string message;
 
-void RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
-                        const SizeVec& localOffsets, const application::RdmaMemoryRegion& remote,
-                        const SizeVec& remoteOffsets, const SizeVec& sizes, TransferStatus* status,
-                        TransferUniqueId id, bool isRead, int expectedNumCqe = -1,
-                        int postBatchSize = -1);
+  bool Init() { return code == StatusCode::INIT; }
+  bool InProgress() { return code == StatusCode::IN_PROGRESS; }
+  bool Succeeded() { return code == StatusCode::SUCCESS; }
+  bool Failed() { return code > StatusCode::ERR_BEGIN; }
+};
 
-inline void RdmaBatchRead(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
-                          const SizeVec& localOffsets, const application::RdmaMemoryRegion& remote,
-                          const SizeVec& remoteOffsets, const SizeVec& sizes,
-                          TransferStatus* status, TransferUniqueId id, int expectedNumCqe = -1,
-                          int postBatchSize = -1) {
-  RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, status, id,
-                     true /*isRead */, expectedNumCqe, postBatchSize);
+RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id);
+
+RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
+                             const SizeVec& localOffsets,
+                             const application::RdmaMemoryRegion& remote,
+                             const SizeVec& remoteOffsets, const SizeVec& sizes,
+                             CqCallbackHandle* callbackStatus, TransferUniqueId id, bool isRead,
+                             int expectedNumCqe = -1, int postBatchSize = -1);
+
+inline RdmaOpRet RdmaBatchRead(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
+                               const SizeVec& localOffsets,
+                               const application::RdmaMemoryRegion& remote,
+                               const SizeVec& remoteOffsets, const SizeVec& sizes,
+                               CqCallbackHandle* callbackStatus, TransferUniqueId id,
+                               int expectedNumCqe = -1, int postBatchSize = -1) {
+  return RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, callbackStatus,
+                            id, true /*isRead */, expectedNumCqe, postBatchSize);
 }
 
-inline void RdmaBatchWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
-                           const SizeVec& localOffsets, const application::RdmaMemoryRegion& remote,
-                           const SizeVec& remoteOffsets, const SizeVec& sizes,
-                           TransferStatus* status, TransferUniqueId id, int expectedNumCqe = -1,
-                           int postBatchSize = -1) {
-  RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, status, id,
-                     false /*isRead */, expectedNumCqe, postBatchSize);
+inline RdmaOpRet RdmaBatchWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
+                                const SizeVec& localOffsets,
+                                const application::RdmaMemoryRegion& remote,
+                                const SizeVec& remoteOffsets, const SizeVec& sizes,
+                                CqCallbackHandle* callbackStatus, TransferUniqueId id,
+                                int expectedNumCqe = -1, int postBatchSize = -1) {
+  return RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, callbackStatus,
+                            id, false /*isRead */, expectedNumCqe, postBatchSize);
 }
 
-inline void RdmaRead(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
-                     size_t localOffset, const application::RdmaMemoryRegion& remote,
-                     size_t remoteOffset, size_t size, TransferStatus* status,
-                     TransferUniqueId id) {
-  RdmaBatchRead(eps, local, {localOffset}, remote, {remoteOffset}, {size}, status, id, 1, 1);
+inline RdmaOpRet RdmaRead(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
+                          size_t localOffset, const application::RdmaMemoryRegion& remote,
+                          size_t remoteOffset, size_t size, CqCallbackHandle* callbackStatus,
+                          TransferUniqueId id) {
+  return RdmaBatchRead(eps, local, {localOffset}, remote, {remoteOffset}, {size}, callbackStatus,
+                       id, 1, 1);
 }
 
-inline void RdmaWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
-                      size_t localOffset, const application::RdmaMemoryRegion& remote,
-                      size_t remoteOffset, size_t size, TransferStatus* status,
-                      TransferUniqueId id) {
-  RdmaBatchWrite(eps, local, {localOffset}, remote, {remoteOffset}, {size}, status, id, 1, 1);
+inline RdmaOpRet RdmaWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
+                           size_t localOffset, const application::RdmaMemoryRegion& remote,
+                           size_t remoteOffset, size_t size, CqCallbackHandle* callbackStatus,
+                           TransferUniqueId id) {
+  return RdmaBatchWrite(eps, local, {localOffset}, remote, {remoteOffset}, {size}, callbackStatus,
+                        id, 1, 1);
 }
 }  // namespace io
 }  // namespace mori
