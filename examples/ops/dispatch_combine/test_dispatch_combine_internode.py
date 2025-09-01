@@ -300,7 +300,7 @@ class EpDispatchCombineTestCase:
     def test_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
         error_round = set()
-        for i in range(5):
+        for i in range(500):
             if self.rank == 0:
                 print(f"Round {i} begin")
             test_data = self.gen_test_data()
