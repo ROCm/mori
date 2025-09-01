@@ -320,7 +320,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
   } else {
     assert(false);
   }
-
+  // __threadfence_system();
   if (is_leader) {
     uint64_t db_touched{0};
     do {
@@ -459,7 +459,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
   } else {
     assert(false);
   }
-
+  // __threadfence_system();
   if (is_leader) {
     uint64_t db_touched = 0;
     do {

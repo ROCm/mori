@@ -113,10 +113,10 @@ inline __device__ uint64_t BnxtPostSend(WorkQueueHandle& wq, uint32_t curPostIdx
 
   // get doorbell header
   // struct bnxt_re_db_hdr hdr;
-  uint8_t flags = (curPostIdx / wqeNum) & 0x1;
+  uint8_t flags = ((curPostIdx + slotsNum) / wqeNum) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
 
-  return bnxt_re_init_db_hdr(((slotIdx + slotsNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
+  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
 }
 
 template <>
@@ -186,9 +186,9 @@ inline __device__ uint64_t BnxtPostRecv(WorkQueueHandle& wq, uint32_t curPostIdx
   ThreadCopy<char>(base + 2 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&sge), sizeof(sge));
 
   // recv wqe needn't to fill msntbl
-  uint8_t flags = (curPostIdx / wqeNum) & 0x1;
+  uint8_t flags = ((curPostIdx + slotsNum) / wqeNum) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
-  return bnxt_re_init_db_hdr(((slotIdx + slotsNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_RQ);
+  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum)| epoch), 0, qpn, BNXT_RE_QUE_TYPE_RQ);
 }
 
 template <>
@@ -409,10 +409,9 @@ inline __device__ uint64_t BnxtPostWriteInline(WorkQueueHandle& wq, uint32_t cur
 
   // get doorbell header
   // struct bnxt_re_db_hdr hdr;
-  uint8_t flags = (curPostIdx / wqeNum) & 0x1;
+  uint8_t flags = ((curPostIdx + slotsNum) / wqeNum) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
-
-  return bnxt_re_init_db_hdr(((slotIdx + slotsNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
+  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
 }
 
 template <>
@@ -536,10 +535,10 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
 
   // get doorbell header
   // struct bnxt_re_db_hdr hdr;
-  uint8_t flags = (curPostIdx / wqeNum) & 0x1;
+  uint8_t flags = ((curPostIdx + slotsNum) / wqeNum) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
 
-  return bnxt_re_init_db_hdr(((slotIdx + slotsNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
+  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
 }
 
 template <>
@@ -720,7 +719,8 @@ template <>
 inline __device__ void UpdateCqDbrRecord<ProviderType::BNXT>(void* dbrRecAddr, uint32_t cons_idx, uint32_t cqeNum) {
   uint8_t flags = ((cons_idx + 1)  / cqeNum) & (1UL << BNXT_RE_FLAG_EPOCH_HEAD_SHIFT);
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
-  uint64_t dbrVal = bnxt_re_init_db_hdr(((cons_idx + 1) | epoch), 0, flags, BNXT_RE_QUE_TYPE_CQ);
+  // uint64_t dbrVal = bnxt_re_init_db_hdr(((cons_idx + 1) | epoch), 0, flags, BNXT_RE_QUE_TYPE_CQ);
+  uint64_t dbrVal = bnxt_re_init_db_hdr((((cons_idx + 1) % cqeNum) | epoch), 0, flags, BNXT_RE_QUE_TYPE_CQ);
   core::AtomicStoreSeqCstSystem(reinterpret_cast<uint64_t*>(dbrRecAddr), dbrVal);
 }
 

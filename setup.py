@@ -2,6 +2,7 @@ import os
 import subprocess
 from pathlib import Path
 import shutil
+import socket
 
 from setuptools import Command, Extension, find_packages, setup
 from setuptools.command.build import build as _build
@@ -30,7 +31,8 @@ class CMakeBuild(build_ext):
         build_lib.mkdir(parents=True, exist_ok=True)
 
         root_dir = Path(__file__).parent
-        build_dir = root_dir / "build"
+        hostname = socket.gethostname()
+        build_dir = root_dir / f"build_{hostname}"
         build_dir.mkdir(parents=True, exist_ok=True)
 
         unroll_value = os.environ.get("WARP_ACCUM_UNROLL", "1")
