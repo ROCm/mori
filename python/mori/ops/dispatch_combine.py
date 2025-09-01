@@ -186,9 +186,7 @@ class EpDispatchCombineOp:
             self._handle
         )
 
-        max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank * min(
-            self.config.num_experts_per_token, self.config.num_experts_per_rank
-        )
+        max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank
         all_rank_sender_map = self._allgather_with_token_num_padding(
             dispatch_sender_token_id_map.cpu().to(torch.int64),
             self.config.max_num_inp_token_per_rank * self.config.num_experts_per_token,
@@ -229,3 +227,4 @@ class EpDispatchCombineOp:
             src_token_pos.append(src_pe * max_num_token_to_send_per_rank + src_tok_id)
 
         return torch.tensor(src_token_pos, dtype=torch.int)
+
