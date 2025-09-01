@@ -293,7 +293,8 @@ void RegisterMoriIo(pybind11::module_& m) {
   py::class_<mori::io::BackendConfig>(m, "BackendConfig");
 
   py::class_<mori::io::RdmaBackendConfig, mori::io::BackendConfig>(m, "RdmaBackendConfig")
-      .def(py::init<int, int>(), py::arg("qp_per_transfer") = 1, py::arg("post_batch_size") = -1)
+      .def(py::init<int, int, int>(), py::arg("qp_per_transfer") = 1,
+           py::arg("post_batch_size") = -1, py::arg("num_worker_threads") = -1)
       .def_readwrite("qp_per_transfer", &mori::io::RdmaBackendConfig::qpPerTransfer);
 
   py::class_<mori::io::IOEngineConfig>(m, "IOEngineConfig")

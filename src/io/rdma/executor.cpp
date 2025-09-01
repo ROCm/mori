@@ -55,11 +55,19 @@ void MultithreadExecutor::Worker::MainLoop() {
 
       if (!running.load()) break;
 
-      // TODO: execute task
       while (!q.empty()) {
         Task task = q.front();
         q.pop();
-        task.status.SetCode(StatusCode::SUCCESS);
+
+        SizeVec tLoclOffsets(task.req.localOffsets.begin() + task.begin,
+                             task.req.localOffsets.begin() + task.end);
+        SizeVec tRemoteOffsets(task.req.remoteOffsets.begin() + task.begin,
+                               task.req.remoteOffsets.begin() + task.end);
+        SizeVec tSizes(task.req.sizes.begin() + task.begin, task.req.sizes.begin() + task.end);
+        mori::io::RdmaBatchReadWrite({task.req.eps[task.epId]}, task.req.local, tLoclOffsets,
+                                     task.req.remote, tRemoteOffsets, tSizes, task.req.status,
+                                     task.req.id, task.req.isRead, task.expectedNumCqe,
+                                     task.req.postBatchSize);
       }
     }
   }
@@ -81,20 +89,38 @@ void MultithreadExecutor::Worker::Submit(Task task) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                       MultithreadExecutor                                      */
 /* ---------------------------------------------------------------------------------------------- */
-MultithreadExecutor::MultithreadExecutor(int n) : numWorker(n), pool(5) {}
+MultithreadExecutor::MultithreadExecutor(int n) : numWorker(n), pool(5) { assert(n > 0); }
 
 MultithreadExecutor::~MultithreadExecutor() { Shutdown(); }
 
-std::vector<std::pair<int, int>> MultithreadExecutor::SplitWork() { return {}; }
+std::vector<std::pair<int, int>> MultithreadExecutor::SplitWork(const ExecutorReq& req) {
+  int numEps = req.eps.size();
+  int totalBatchSize = req.sizes.size();
+
+  assert(numEps > 0);
+
+  int numActiveWorkers = std::min(numEps, numWorker);
+  int perWorkerBatchSize = (totalBatchSize + numActiveWorkers - 1) / numActiveWorkers;
+
+  std::vector<std::pair<int, int>> splits;
+  for (int i = 0; i < numActiveWorkers; i++) {
+    int begin = i * perWorkerBatchSize;
+    int end = std::min(begin + perWorkerBatchSize, totalBatchSize);
+    splits.push_back({begin, end});
+    if (end >= totalBatchSize) break;
+  }
+
+  return splits;
+}
 
 void MultithreadExecutor::RdmaBatchReadWrite(const ExecutorReq& req) {
   std::vector<std::unique_ptr<TransferStatus>> resps;
   for (int i = 0; i < numWorker; i++) resps.emplace_back(new TransferStatus());
 
-  auto split = SplitWork();
-
-  for (int i = 0; i < numWorker; i++) {
-    pool[i].Submit({req, *resps[i], split[i].first, split[i].second});
+  auto splits = SplitWork(req);
+  int expectedNumCqe = splits.size();
+  for (int i = 0; i < splits.size(); i++) {
+    pool[i].Submit({req, *resps[i], i, splits[i].first, splits[i].second, expectedNumCqe});
   }
 
   bool hasFail = false;

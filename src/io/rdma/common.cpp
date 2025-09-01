@@ -61,7 +61,7 @@ void RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUn
 void RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                         const SizeVec& localOffsets, const application::RdmaMemoryRegion& remote,
                         const SizeVec& remoteOffsets, const SizeVec& sizes, TransferStatus* status,
-                        TransferUniqueId id, int postBatchSize, bool isRead) {
+                        TransferUniqueId id, bool isRead, int expectedNumCqe, int postBatchSize) {
   MORI_IO_FUNCTION_TIMER;
 
   // Check sizes
@@ -93,7 +93,8 @@ void RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegio
 
   RdmaOpStatusHandle* internalStatus = new RdmaOpStatusHandle();
   internalStatus->status = status;
-  internalStatus->expectedNumCqe = std::min(batchSize, epNum);
+  internalStatus->expectedNumCqe =
+      (expectedNumCqe <= 0) ? std::min(batchSize, epNum) : expectedNumCqe;
 
   std::vector<struct ibv_sge> sges(batchSize, ibv_sge{});
   std::vector<struct ibv_send_wr> wrs(batchSize, ibv_send_wr{});

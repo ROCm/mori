@@ -132,38 +132,43 @@ struct RdmaOpStatusHandle {
 };
 
 void RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id);
+
 void RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                         const SizeVec& localOffsets, const application::RdmaMemoryRegion& remote,
                         const SizeVec& remoteOffsets, const SizeVec& sizes, TransferStatus* status,
-                        TransferUniqueId id, int postBatchSize, bool isRead);
+                        TransferUniqueId id, bool isRead, int expectedNumCqe = -1,
+                        int postBatchSize = -1);
+
 inline void RdmaBatchRead(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                           const SizeVec& localOffsets, const application::RdmaMemoryRegion& remote,
                           const SizeVec& remoteOffsets, const SizeVec& sizes,
-                          TransferStatus* status, TransferUniqueId id, int postBatchSize) {
+                          TransferStatus* status, TransferUniqueId id, int expectedNumCqe = -1,
+                          int postBatchSize = -1) {
   RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, status, id,
-                     postBatchSize, true /*isRead */);
+                     true /*isRead */, expectedNumCqe, postBatchSize);
 }
 
 inline void RdmaBatchWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                            const SizeVec& localOffsets, const application::RdmaMemoryRegion& remote,
                            const SizeVec& remoteOffsets, const SizeVec& sizes,
-                           TransferStatus* status, TransferUniqueId id, int postBatchSize) {
+                           TransferStatus* status, TransferUniqueId id, int expectedNumCqe = -1,
+                           int postBatchSize = -1) {
   RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, status, id,
-                     postBatchSize, false /*isRead */);
+                     false /*isRead */, expectedNumCqe, postBatchSize);
 }
 
 inline void RdmaRead(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                      size_t localOffset, const application::RdmaMemoryRegion& remote,
                      size_t remoteOffset, size_t size, TransferStatus* status,
                      TransferUniqueId id) {
-  RdmaBatchRead(eps, local, {localOffset}, remote, {remoteOffset}, {size}, status, id, 1);
+  RdmaBatchRead(eps, local, {localOffset}, remote, {remoteOffset}, {size}, status, id, 1, 1);
 }
 
 inline void RdmaWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                       size_t localOffset, const application::RdmaMemoryRegion& remote,
                       size_t remoteOffset, size_t size, TransferStatus* status,
                       TransferUniqueId id) {
-  RdmaBatchWrite(eps, local, {localOffset}, remote, {remoteOffset}, {size}, status, id, 1);
+  RdmaBatchWrite(eps, local, {localOffset}, remote, {remoteOffset}, {size}, status, id, 1, 1);
 }
 }  // namespace io
 }  // namespace mori

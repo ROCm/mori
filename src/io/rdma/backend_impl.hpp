@@ -36,6 +36,7 @@
 #include "mori/io/common.hpp"
 #include "mori/io/engine.hpp"
 #include "src/io/rdma/common.hpp"
+#include "src/io/rdma/executor.hpp"
 
 namespace mori {
 namespace io {
@@ -183,7 +184,8 @@ class RdmaBackendSession : public BackendSession {
  public:
   RdmaBackendSession() = default;
   RdmaBackendSession(const RdmaBackendConfig& config, const application::RdmaMemoryRegion& local,
-                     const application::RdmaMemoryRegion& remote, const EpPairVec& eps);
+                     const application::RdmaMemoryRegion& remote, const EpPairVec& eps,
+                     Executor* executor);
   ~RdmaBackendSession() = default;
 
   void Read(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
@@ -201,6 +203,7 @@ class RdmaBackendSession : public BackendSession {
   application::RdmaMemoryRegion local{};
   application::RdmaMemoryRegion remote{};
   EpPairVec eps{};
+  Executor* executor{nullptr};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -223,8 +226,10 @@ class RdmaBackend : public Backend {
   void BatchRead(const MemoryDesc& localDest, const SizeVec& localOffsets,
                  const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets, const SizeVec& sizes,
                  TransferStatus* status, TransferUniqueId id);
-
+  // TODO: batch write
+  // TODO: send / recv
   BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
+  // TODO: destroy session
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
 
  private:
@@ -232,10 +237,11 @@ class RdmaBackend : public Backend {
 
  private:
   RdmaBackendConfig config;
-  std::unique_ptr<RdmaManager> rdma;
-  std::unique_ptr<NotifManager> notif;
-  std::unique_ptr<ControlPlaneServer> server;
+  std::unique_ptr<RdmaManager> rdma{nullptr};
+  std::unique_ptr<NotifManager> notif{nullptr};
+  std::unique_ptr<ControlPlaneServer> server{nullptr};
   std::vector<std::unique_ptr<RdmaBackendSession>> sessions;
+  std::unique_ptr<Executor> executor{nullptr};
 };
 
 }  // namespace io

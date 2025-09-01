@@ -78,11 +78,13 @@ class MultithreadExecutor : public Executor {
   struct Task {
     const ExecutorReq& req;
     TransferStatus& status;
+    int epId{-1};
     int begin{-1};
     int end{-1};
+    int expectedNumCqe{-1};
   };
 
-  std::vector<std::pair<int, int>> SplitWork();
+  std::vector<std::pair<int, int>> SplitWork(const ExecutorReq& req);
 
   class Worker {
    public:

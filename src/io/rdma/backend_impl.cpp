@@ -523,8 +523,9 @@ void ControlPlaneServer::Shutdown() {
 /* ---------------------------------------------------------------------------------------------- */
 RdmaBackendSession::RdmaBackendSession(const RdmaBackendConfig& config,
                                        const application::RdmaMemoryRegion& l,
-                                       const application::RdmaMemoryRegion& r, const EpPairVec& e)
-    : config(config), local(l), remote(r), eps(e) {}
+                                       const application::RdmaMemoryRegion& r, const EpPairVec& e,
+                                       Executor* exec)
+    : config(config), local(l), remote(r), eps(e), executor(exec) {}
 
 void RdmaBackendSession::Read(size_t localOffset, size_t remoteOffset, size_t size,
                               TransferStatus* status, TransferUniqueId id) {
@@ -545,8 +546,17 @@ void RdmaBackendSession::Write(size_t localOffset, size_t remoteOffset, size_t s
 void RdmaBackendSession::BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                    const SizeVec& sizes, TransferStatus* status,
                                    TransferUniqueId id) {
-  RdmaBatchRead(eps, local, localOffsets, remote, remoteOffsets, sizes, status, id,
-                config.postBatchSize);
+  if (executor) {
+    ExecutorReq req{
+        eps,    local, localOffsets,         remote, remoteOffsets, sizes,
+        status, id,    config.postBatchSize, true /*isRead */
+    };
+    executor->RdmaBatchReadWrite(req);
+  } else {
+    RdmaBatchRead(eps, local, localOffsets, remote, remoteOffsets, sizes, status, id,
+                  config.postBatchSize);
+  }
+
   if (!status->Failed()) {
     RdmaNotifyTransfer(eps, status, id);
   }
@@ -570,6 +580,11 @@ RdmaBackend::RdmaBackend(EngineKey key, const IOEngineConfig& engConfig,
 
   server.reset(new ControlPlaneServer(engConfig.host, engConfig.port, rdma.get(), notif.get()));
   server->Start();
+
+  if (config.numWorkerThreads > 1) {
+    executor.reset(
+        new MultithreadExecutor(std::min(config.qpPerTransfer, config.numWorkerThreads)));
+  }
 }
 
 RdmaBackend::~RdmaBackend() {
@@ -662,7 +677,7 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
     rdma->RegisterRemoteMemory(ekey, ep.rdevId, remote.id, remoteMr.value());
   }
 
-  sess = RdmaBackendSession(config, localMr.value(), remoteMr.value(), epSet);
+  sess = RdmaBackendSession(config, localMr.value(), remoteMr.value(), epSet, executor.get());
 }
 
 bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,

@@ -44,13 +44,15 @@ struct BackendConfig {
 
 struct RdmaBackendConfig : public BackendConfig {
   RdmaBackendConfig() : BackendConfig(BackendType::RDMA) {}
-  RdmaBackendConfig(int qpPerTransfer_, int postBatchSize_)
+  RdmaBackendConfig(int qpPerTransfer_, int postBatchSize_, int numWorkerThreads_)
       : BackendConfig(BackendType::RDMA),
         qpPerTransfer(qpPerTransfer_),
-        postBatchSize(postBatchSize_) {}
+        postBatchSize(postBatchSize_),
+        numWorkerThreads(numWorkerThreads_) {}
 
   int qpPerTransfer{1};
   int postBatchSize{-1};
+  int numWorkerThreads{1};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
