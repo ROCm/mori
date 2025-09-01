@@ -31,7 +31,7 @@
 
 #include "mori/application/transport/tcp/tcp.hpp"
 #include "mori/io/backend.hpp"
-#include "mori/io/meta_data.hpp"
+#include "mori/io/common.hpp"
 
 namespace mori {
 namespace io {

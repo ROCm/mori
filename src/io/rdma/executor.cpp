@@ -25,56 +25,112 @@ namespace mori {
 namespace io {
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                                   MultithreadExecutor::Worker                                  */
+/* ---------------------------------------------------------------------------------------------- */
+MultithreadExecutor::Worker::Worker() {}
+
+MultithreadExecutor::Worker::~Worker() { Shutdown(); }
+
+void MultithreadExecutor::Worker::Start() {
+  if (running.load()) return;
+  running.store(true);
+  thd = std::thread([this] { MainLoop(); });
+}
+
+void MultithreadExecutor::Worker::Shutdown() {
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    if (!running.load()) return;
+    running.store(false);
+    cond.notify_all();
+  }
+  if (thd.joinable()) thd.join();
+}
+
+void MultithreadExecutor::Worker::MainLoop() {
+  while (true) {
+    {
+      std::unique_lock<std::mutex> lock(mu);
+      cond.wait(lock, [this]() { return !q.empty() || !running.load(); });
+
+      if (!running.load()) break;
+
+      // TODO: execute task
+      while (!q.empty()) {
+        Task task = q.front();
+        q.pop();
+        task.status.SetCode(StatusCode::SUCCESS);
+      }
+    }
+  }
+}
+
+void MultithreadExecutor::Worker::Submit(Task task) {
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    if (!running.load()) {
+      task.status.SetCode(StatusCode::ERR_BAD_STATE);
+      task.status.SetMessage("worker not started yet");
+      return;
+    }
+    q.push(task);
+    cond.notify_all();
+  }
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                       MultithreadExecutor                                      */
 /* ---------------------------------------------------------------------------------------------- */
-MultithreadExecutor::MultithreadExecutor(int n) : numThd(n) {}
+MultithreadExecutor::MultithreadExecutor(int n) : numWorker(n), pool(5) {}
 
 MultithreadExecutor::~MultithreadExecutor() { Shutdown(); }
 
+std::vector<std::pair<int, int>> MultithreadExecutor::SplitWork() { return {}; }
+
 void MultithreadExecutor::RdmaBatchReadWrite(const ExecutorReq& req) {
-  assert(running.load());
-  std::lock_guard<std::mutex> lock(mu);
-  std::vector<TransferStatus> statusVec(numThd, TransferStatus{});
-  q.push({req, statusVec});
+  std::vector<std::unique_ptr<TransferStatus>> resps;
+  for (int i = 0; i < numWorker; i++) resps.emplace_back(new TransferStatus());
+
+  auto split = SplitWork();
+
+  for (int i = 0; i < numWorker; i++) {
+    pool[i].Submit({req, *resps[i], split[i].first, split[i].second});
+  }
 
   bool hasFail = false;
   int numSucc = 0;
-  for (auto& status : statusVec) {
-    while (status.Init()) {
+  for (auto& status : resps) {
+    while (status->Init()) {
     }
-    if (status.Failed()) {
+    if (status->Failed()) {
       hasFail = true;
-      req.status->Code(status.Code());
-      req.status->Message(status.Message());
-    } else if (status.Succeeded()) {
+      req.status->SetCode(status->Code());
+      req.status->SetMessage(status->Message());
+    } else if (status->Succeeded()) {
       numSucc++;
     }
   }
   if (hasFail) return;
 
-  if (numSucc == numThd) {
-    req.status->Code(StatusCode::SUCCESS);
+  if (numSucc == numWorker) {
+    req.status->SetCode(StatusCode::SUCCESS);
     return;
   }
 
-  req.status->Code(StatusCode::IN_PROGRESS);
+  req.status->SetCode(StatusCode::IN_PROGRESS);
 }
 
 void MultithreadExecutor::Start() {
-  if (running.load()) return;
-  running.store(true);
-  for (int i = 0; i < numThd; i++) {
-    std::thread worker(MainLoop);
-    pool.push_back(std::move(worker));
+  for (auto& worker : pool) {
+    worker.Start();
   }
 }
 
 void MultithreadExecutor::Shutdown() {
-  running.store(false);
-  if (thd.joinable()) thd.join();
+  for (auto& worker : pool) {
+    worker.Shutdown();
+  }
 }
-
-void MultithreadExecutor::MainLoop() {}
 
 }  // namespace io
 }  // namespace mori

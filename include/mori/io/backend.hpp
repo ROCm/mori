@@ -21,8 +21,8 @@
 // SOFTWARE.
 #pragma once
 
+#include "mori/io/common.hpp"
 #include "mori/io/enum.hpp"
-#include "mori/io/meta_data.hpp"
 
 namespace mori {
 namespace io {

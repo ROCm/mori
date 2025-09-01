@@ -21,10 +21,14 @@
 // SOFTWARE.
 #pragma once
 
+#include <condition_variable>
+#include <memory>
 #include <mutex>
+#include <queue>
 
-#include "mori/application/rdma.hpp"
-#include "mori/io/meta_data.hpp"
+#include "mori/application/transport/rdma/rdma.hpp"
+#include "mori/io/common.hpp"
+#include "src/io/rdma/common.hpp"
 
 namespace mori {
 namespace io {
@@ -51,7 +55,7 @@ struct ExecutorReq {
 class Executor {
  public:
   Executor() = default;
-  virtual ~Executor() = 0;
+  virtual ~Executor() = default;
 
   virtual void Start() = 0;
   virtual void Shutdown() = 0;
@@ -63,7 +67,7 @@ class Executor {
 /* ---------------------------------------------------------------------------------------------- */
 class MultithreadExecutor : public Executor {
  public:
-  MultithreadExecutor(int numThd);
+  MultithreadExecutor(int numWorker);
   ~MultithreadExecutor();
 
   void RdmaBatchReadWrite(const ExecutorReq& req);
@@ -71,20 +75,39 @@ class MultithreadExecutor : public Executor {
   void Shutdown();
 
  private:
-  using Task = std::pair<ExecutorReq&, std::vector<TransferStatus>&>;
-  void MainLoop();
+  struct Task {
+    const ExecutorReq& req;
+    TransferStatus& status;
+    int begin{-1};
+    int end{-1};
+  };
+
+  std::vector<std::pair<int, int>> SplitWork();
+
+  class Worker {
+   public:
+    Worker();
+    ~Worker();
+    void MainLoop();
+    void Start();
+    void Shutdown();
+
+    void Submit(Task);
+
+   private:
+    std::atomic<bool> running{false};
+    mutable std::mutex mu;
+    std::condition_variable cond;
+    std::queue<Task> q;
+    std::thread thd;
+  };
 
  public:
-  int numThd{1};
+  int numWorker{1};
 
  private:
   std::atomic<bool> running{false};
-
-  mutable std::mutex mu;
-  std::condition_variable condTask;
-  std::queue<Task> q;
-
-  std::vector<std::thread> pool;
+  std::vector<Worker> pool;
 };
 
 }  // namespace io

@@ -33,101 +33,12 @@
 #include "mori/application/transport/tcp/tcp.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/io/backend.hpp"
+#include "mori/io/common.hpp"
 #include "mori/io/engine.hpp"
-#include "mori/io/meta_data.hpp"
+#include "src/io/rdma/common.hpp"
 
 namespace mori {
 namespace io {
-
-/* ---------------------------------------------------------------------------------------------- */
-/*                                     Common Data Structures                                     */
-/* ---------------------------------------------------------------------------------------------- */
-struct TopoKey {
-  int deviceId;
-  MemoryLocationType loc;
-
-  bool operator==(const TopoKey& rhs) const noexcept {
-    return (deviceId == rhs.deviceId) && (loc == rhs.loc);
-  }
-
-  MSGPACK_DEFINE(deviceId, loc);
-};
-
-struct TopoKeyPair {
-  TopoKey local;
-  TopoKey remote;
-
-  bool operator==(const TopoKeyPair& rhs) const noexcept {
-    return (local == rhs.local) && (remote == rhs.remote);
-  }
-
-  MSGPACK_DEFINE(local, remote);
-};
-
-struct MemoryKey {
-  int devId;
-  MemoryUniqueId id;
-
-  bool operator==(const MemoryKey& rhs) const noexcept {
-    return (id == rhs.id) && (devId == rhs.devId);
-  }
-};
-
-struct EpPair {
-  int weight;
-  int ldevId;
-  int rdevId;
-  EngineKey remoteEngineKey;
-  application::RdmaEndpoint local;
-  application::RdmaEndpointHandle remote;
-};
-
-}  // namespace io
-}  // namespace mori
-
-namespace std {
-template <>
-struct hash<mori::io::TopoKey> {
-  std::size_t operator()(const mori::io::TopoKey& k) const noexcept {
-    std::size_t h1 = std::hash<uint32_t>{}(k.deviceId);
-    std::size_t h2 = std::hash<uint32_t>{}(static_cast<uint32_t>(k.loc));
-    return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
-  }
-};
-
-template <>
-struct hash<mori::io::TopoKeyPair> {
-  std::size_t operator()(const mori::io::TopoKeyPair& kp) const noexcept {
-    std::size_t h1 = std::hash<mori::io::TopoKey>{}(kp.local);
-    std::size_t h2 = std::hash<mori::io::TopoKey>{}(kp.remote);
-    return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
-  }
-};
-
-template <>
-struct hash<mori::io::MemoryKey> {
-  std::size_t operator()(const mori::io::MemoryKey& k) const noexcept {
-    std::size_t h1 = std::hash<mori::io::MemoryUniqueId>{}(k.id);
-    std::size_t h2 = std::hash<int>{}(k.devId);
-    return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
-  }
-};
-
-}  // namespace std
-
-namespace mori {
-namespace io {
-
-using EpPairVec = std::vector<EpPair>;
-using RouteTable = std::unordered_map<TopoKeyPair, EpPairVec>;
-using MemoryTable = std::unordered_map<MemoryKey, application::RdmaMemoryRegion>;
-
-struct RemoteEngineMeta {
-  EngineKey key;
-  RouteTable rTable;
-  MemoryTable mTable;
-};
-
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           RdmaManager                                          */
 /* ---------------------------------------------------------------------------------------------- */
@@ -183,12 +94,6 @@ class RdmaManager {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      Notification Manager                                      */
 /* ---------------------------------------------------------------------------------------------- */
-struct NotifMessage {
-  TransferUniqueId id{0};
-  int qpIndex{-1};
-  int totalNum{-1};
-};
-
 class NotifManager {
  public:
   NotifManager(RdmaManager*, const RdmaBackendConfig&);

@@ -22,7 +22,7 @@
 #include "mori/io/engine.hpp"
 
 #include "mori/io/logging.hpp"
-#include "src/io/rdma/backend_impl_v1.hpp"
+#include "src/io/rdma/backend_impl.hpp"
 
 namespace mori {
 namespace io {
