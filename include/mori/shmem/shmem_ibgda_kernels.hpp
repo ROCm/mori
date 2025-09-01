@@ -143,6 +143,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
   uintptr_t rkey = dest->peerRkeys[pe];
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  int rank = globalGpuStates->rank;
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   application::WorkQueueHandle& wq = ep[pe].wqHandle;
   application::CompletionQueueHandle& cq = ep[pe].cqHandle;
@@ -197,6 +198,13 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
                        __HIP_MEMORY_SCOPE_AGENT);
   }
   __threadfence_system();
+#if DEBUG == 1
+  if (rank == 0)
+    printf("rank=%d, blockIdx.x=%d, threadIdx.x=%d, needConsIdx=%u, bytes=%lu, pe=%d\n", rank,
+           blockIdx.x, threadIdx.x,
+           __hip_atomic_load(&cq.needConsIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT), bytes,
+           pe);
+#endif
 }
 
 #define DISPATCH_PROVIDER_TYPE(func, ...)                         \
@@ -248,6 +256,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
   uintptr_t rkey = dest->peerRkeys[pe];
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  int rank = globalGpuStates->rank;
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   application::WorkQueueHandle& wq = ep[pe].wqHandle;
   application::CompletionQueueHandle& cq = ep[pe].cqHandle;
@@ -306,6 +315,13 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
                        __HIP_MEMORY_SCOPE_AGENT);
   }
   __threadfence_system();
+#if DEBUG==1
+  if (rank == 0)
+    printf("IMM rank=%d, blockIdx.x=%d, threadIdx.x=%d, needConsIdx=%u, bytes=%lu, pe=%d\n", rank,
+           blockIdx.x, threadIdx.x,
+           __hip_atomic_load(&cq.needConsIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT), bytes,
+           pe);
+#endif
 }
 
 template <>

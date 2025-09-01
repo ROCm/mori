@@ -8,6 +8,7 @@
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem.hpp"
 #include "src/ops/dispatch_combine/internode.hpp"
+#include "src/ops/dispatch_combine/internode_normal.hpp"
 #include "src/ops/dispatch_combine/intranode.hpp"
 
 namespace mori {
@@ -53,16 +54,16 @@ mori::application::SymmMemObjPtr ShmemMallocAndReturnMemObjPtr(size_t size, unsi
 }
 
 void EpDispatchCombineHandle::InitializeShmemBuf() {
-  size_t maxTokenSize = static_cast<ssize_t>(config.MaxNumTokensToRecv()) * config.hiddenDim *
-                        config.maxTokenTypeSize;
-  size_t maxStagingTokSize = static_cast<ssize_t>(config.MaxNumTokensToRecv()) *
-                             (config.hiddenDim * config.maxTokenTypeSize +
-                              (sizeof(float) + sizeof(index_t)) * config.numExpertPerToken +
-                              config.scaleDim * config.scaleTypeSize);
+  const size_t maxNumTokensToRecv = config.MaxNumTokensToRecv();
+  size_t maxTokenSize = maxNumTokensToRecv * config.hiddenDim * config.maxTokenTypeSize;
+  size_t maxStagingSize =
+      maxNumTokensToRecv * (config.hiddenDim * config.maxTokenTypeSize +
+                            (sizeof(float) + sizeof(index_t)) * config.numExpertPerToken +
+                            config.scaleDim * config.scaleTypeSize);
   // printf("MaxNumTokensToRecv=%d\n", config.MaxNumTokensToRecv());
-  shmemInpTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
+  shmemInpTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
   shmemOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
-  shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
+  shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
   const size_t prefixSize = config.worldSize * sizeof(index_t);
   shmemMetaDataMemObj =
       ShmemMallocAndReturnMemObjPtr(prefixSize, hipDeviceMallocUncached);
@@ -75,12 +76,12 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   shmemOutWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
 
   if (config.scaleDim > 0 && config.scaleTypeSize > 0) {
-    size_t maxScaleSize = config.MaxNumTokensToRecv() * config.scaleDim * config.scaleTypeSize;
+    size_t maxScaleSize = maxNumTokensToRecv * config.scaleDim * config.scaleTypeSize;
     shmemInpScalesMemObj = ShmemMallocAndReturnMemObjPtr(maxScaleSize, hipDeviceMallocUncached);
     shmemOutScalesMemObj = ShmemMallocAndReturnMemObjPtr(maxScaleSize, hipDeviceMallocUncached);
   }
 
-  size_t maxIndicesSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(index_t);
+  size_t maxIndicesSize = maxNumTokensToRecv * config.numExpertPerToken * sizeof(index_t);
   shmemInpIndicesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndicesSize, hipDeviceMallocUncached);
   shmemOutIndicesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndicesSize, hipDeviceMallocUncached);
 }
@@ -89,7 +90,8 @@ void EpDispatchCombineHandle::FinalizeShmemBuf() {
   ShmemFree(shmemInpTokMemObj->localPtr);
   ShmemFree(shmemOutTokMemObj->localPtr);
   ShmemFree(shmemStagingTokMemObj->localPtr);
-  ShmemFree(shmemMetaDataMemObj->localPtr);
+  if (shmemMetaDataMemObj.IsValid()) ShmemFree(shmemMetaDataMemObj->localPtr);
+  if (shmemSyncDataMemObj.IsValid()) ShmemFree(shmemSyncDataMemObj->localPtr);
   ShmemFree(shmemInpWeightsMemObj->localPtr);
   ShmemFree(shmemOutWeightsMemObj->localPtr);
   if (shmemInpScalesMemObj.IsValid()) ShmemFree(shmemInpScalesMemObj->localPtr);
@@ -131,9 +133,15 @@ void EpDispatchCombineHandle::IntializeOrderMapBuf() {
                                      maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(destPeTokenIdxMap, -1, maxNumOutToken * sizeof(index_t)));
 
-  HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&recvTokenOffset),
-                                     config.worldSize * sizeof(index_t)));
-  HIP_RUNTIME_CHECK(hipMemset(recvTokenOffset, 0, config.worldSize * sizeof(index_t)));
+  if (config.kernelType == KernelType::InterNodeNormal) {
+    HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&recvTokenOffset),
+                                          config.worldSize * sizeof(index_t)));
+    HIP_RUNTIME_CHECK(hipMemset(recvTokenOffset, 0, config.worldSize * sizeof(index_t)));
+  } else {
+    HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&srcPeTokenIdxMap),
+                                          maxNumOutToken * sizeof(index_t)));
+    HIP_RUNTIME_CHECK(hipMemset(srcPeTokenIdxMap, 0, maxNumOutToken * sizeof(index_t)));
+  }
 
   HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&destPeTokenCounter),
                                      config.worldSize * sizeof(index_t)));
@@ -156,6 +164,7 @@ void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipFree(dispReceiverIdxMap));
   HIP_RUNTIME_CHECK(hipFree(dispSenderIdxMap));
   HIP_RUNTIME_CHECK(hipFree(destPeTokenIdxMap));
+  HIP_RUNTIME_CHECK(hipFree(srcPeTokenIdxMap));
   HIP_RUNTIME_CHECK(hipFree(recvTokenOffset));
   HIP_RUNTIME_CHECK(hipFree(destPeTokenCounter));
   HIP_RUNTIME_CHECK(hipFree(localPeTokenCounter));
@@ -218,6 +227,8 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
         if (kernelType == KernelType::InterNode) {
           assert(config.useExternalInpBuffer);
           EpDispatchInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
+        } else if (kernelType == KernelType::InterNodeNormal) {
+          EpDispatchInterNodeNormalKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else {
@@ -243,6 +254,8 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
         if (kernelType == KernelType::InterNode) {
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
+        } else if (kernelType == KernelType::InterNodeNormal) {
+          EpCombineIntraNodeNormalKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpCombineIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else {
