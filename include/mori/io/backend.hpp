@@ -55,6 +55,11 @@ struct RdmaBackendConfig : public BackendConfig {
   int numWorkerThreads{1};
 };
 
+inline std::ostream& operator<<(std::ostream& os, const RdmaBackendConfig& c) {
+  return os << "qpPerTransfer[" << c.qpPerTransfer << "] postBatchSize[" << c.postBatchSize
+            << "] numWorkerThreads[" << c.numWorkerThreads << "]";
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         BackendSession                                         */
 /* ---------------------------------------------------------------------------------------------- */

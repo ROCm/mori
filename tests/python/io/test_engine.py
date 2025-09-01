@@ -35,18 +35,20 @@ from mori.io import (
 )
 
 
-@pytest.fixture(scope="module")
-def pre_connected_engine_pair():
-    set_log_level("info")
+def create_connected_engine_pair(
+    name_prefix, qp_per_transfer, post_batch_size, num_worker_threads
+):
     config = IOEngineConfig(
         host="127.0.0.1",
         port=get_free_port(),
     )
-    initiator = IOEngine(key="initiator", config=config)
+    initiator = IOEngine(key=f"{name_prefix}_initiator", config=config)
     config.port = get_free_port()
-    target = IOEngine(key="target", config=config)
+    target = IOEngine(key=f"{name_prefix}_target", config=config)
 
-    config = RdmaBackendConfig(qp_per_transfer=2, post_batch_size=16)
+    config = RdmaBackendConfig(
+        qp_per_transfer=2, post_batch_size=-1, num_worker_threads=1
+    )
     initiator.create_backend(BackendType.RDMA, config)
     target.create_backend(BackendType.RDMA, config)
 
@@ -56,10 +58,26 @@ def pre_connected_engine_pair():
     initiator.register_remote_engine(target_desc)
     target.register_remote_engine(initiator_desc)
 
-    yield (initiator, target)
+    return initiator, target
 
-    del initiator
-    del target
+
+@pytest.fixture(scope="module")
+def pre_connected_engine_pair():
+    set_log_level("info")
+    initiator, target = create_connected_engine_pair(
+        "normal", qp_per_transfer=2, post_batch_size=-1, num_worker_threads=1
+    )
+    multhd_initiator, multhd_target = create_connected_engine_pair(
+        "multhd", qp_per_transfer=2, post_batch_size=-1, num_worker_threads=2
+    )
+
+    engines = {
+        "normal": (initiator, target),
+        "multhd": (multhd_initiator, multhd_target),
+    }
+    yield engines
+
+    del initiator, target
 
 
 def test_engine_desc():
@@ -126,8 +144,8 @@ def wait_inbound_status(engine, remote_engine_key, remote_transfer_uid):
             return target_side_status
 
 
-def alloc_and_register_mem(pre_connected_engine_pair, shape):
-    initiator, target = pre_connected_engine_pair
+def alloc_and_register_mem(engine_pair, shape):
+    initiator, target = engine_pair
 
     # register memory buffer
     device1 = torch.device("cuda", 0)
@@ -141,13 +159,13 @@ def alloc_and_register_mem(pre_connected_engine_pair, shape):
 
 
 def check_transfer_result(
-    pre_connected_engine_pair,
+    engine_pair,
     initiator_status,
     initiator_tensor,
     target_tensor,
     transfer_uid,
 ):
-    initiator, target = pre_connected_engine_pair
+    initiator, target = engine_pair
     wait_status(initiator_status)
     target_status = wait_inbound_status(
         target, initiator.get_engine_desc().key, transfer_uid
@@ -157,6 +175,7 @@ def check_transfer_result(
     assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
 
 
+@pytest.mark.parametrize("engine_type", ("multhd",))
 @pytest.mark.parametrize("enable_sess", (True, False))
 @pytest.mark.parametrize("enable_batch", (True, False))
 @pytest.mark.parametrize("op_type", ("read",))
@@ -164,15 +183,17 @@ def check_transfer_result(
 @pytest.mark.parametrize("buffer_size", (8, 8192))
 def test_rdma_backend_ops(
     pre_connected_engine_pair,
+    engine_type,
     enable_sess,
     enable_batch,
     op_type,
     batch_size,
     buffer_size,
 ):
-    initiator, target = pre_connected_engine_pair
+    engine_pair = pre_connected_engine_pair[engine_type]
+    initiator, target = engine_pair
     initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
-        pre_connected_engine_pair, [batch_size, buffer_size]
+        engine_pair, [batch_size, buffer_size]
     )
 
     sess = initiator.create_session(initiator_mem, target_mem)
@@ -211,7 +232,7 @@ def test_rdma_backend_ops(
 
     for uid, status in uid_status_list:
         check_transfer_result(
-            pre_connected_engine_pair,
+            engine_pair,
             status,
             initiator_tensor,
             target_tensor,
@@ -220,9 +241,10 @@ def test_rdma_backend_ops(
 
 
 def test_err_out_of_range(pre_connected_engine_pair):
-    initiator, target = pre_connected_engine_pair
+    engine_pair = pre_connected_engine_pair["normal"]
+    initiator, target = engine_pair
     initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
-        pre_connected_engine_pair,
+        engine_pair,
         (
             2,
             32,

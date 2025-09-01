@@ -21,13 +21,15 @@
 // SOFTWARE.
 #include "src/io/rdma/executor.hpp"
 
+#include "mori/io/logging.hpp"
+
 namespace mori {
 namespace io {
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                   MultithreadExecutor::Worker                                  */
 /* ---------------------------------------------------------------------------------------------- */
-MultithreadExecutor::Worker::Worker() {}
+MultithreadExecutor::Worker::Worker(int wid) : workerId(wid) {}
 
 MultithreadExecutor::Worker::~Worker() { Shutdown(); }
 
@@ -49,11 +51,15 @@ void MultithreadExecutor::Worker::Shutdown() {
 
 void MultithreadExecutor::Worker::MainLoop() {
   while (true) {
+    MORI_IO_INFO("worker {} enter main loop", workerId);
     {
       std::unique_lock<std::mutex> lock(mu);
       cond.wait(lock, [this]() { return !q.empty() || !running.load(); });
 
-      if (!running.load()) break;
+      if (!running.load()) {
+        MORI_IO_INFO("worker {} shutdown", workerId);
+        break;
+      }
 
       while (!q.empty()) {
         Task task = q.front();
@@ -68,6 +74,8 @@ void MultithreadExecutor::Worker::MainLoop() {
                                      task.req.remote, tRemoteOffsets, tSizes, task.req.status,
                                      task.req.id, task.req.isRead, task.expectedNumCqe,
                                      task.req.postBatchSize);
+        MORI_IO_TRACE("worker {} execute task {} begin {} end {}", workerId, task.req.id,
+                      task.begin, task.end);
       }
     }
   }
@@ -89,7 +97,12 @@ void MultithreadExecutor::Worker::Submit(Task task) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                       MultithreadExecutor                                      */
 /* ---------------------------------------------------------------------------------------------- */
-MultithreadExecutor::MultithreadExecutor(int n) : numWorker(n), pool(5) { assert(n > 0); }
+MultithreadExecutor::MultithreadExecutor(int n) : numWorker(n) {
+  assert(n > 0);
+  for (int i = 0; i < numWorker; i++) {
+    pool.emplace_back(new Worker(i));
+  }
+}
 
 MultithreadExecutor::~MultithreadExecutor() { Shutdown(); }
 
@@ -120,7 +133,7 @@ void MultithreadExecutor::RdmaBatchReadWrite(const ExecutorReq& req) {
   auto splits = SplitWork(req);
   int expectedNumCqe = splits.size();
   for (int i = 0; i < splits.size(); i++) {
-    pool[i].Submit({req, *resps[i], i, splits[i].first, splits[i].second, expectedNumCqe});
+    pool[i]->Submit({req, *resps[i], i, splits[i].first, splits[i].second, expectedNumCqe});
   }
 
   bool hasFail = false;
@@ -148,13 +161,13 @@ void MultithreadExecutor::RdmaBatchReadWrite(const ExecutorReq& req) {
 
 void MultithreadExecutor::Start() {
   for (auto& worker : pool) {
-    worker.Start();
+    worker->Start();
   }
 }
 
 void MultithreadExecutor::Shutdown() {
   for (auto& worker : pool) {
-    worker.Shutdown();
+    worker->Shutdown();
   }
 }
 

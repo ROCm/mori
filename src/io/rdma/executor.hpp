@@ -88,7 +88,7 @@ class MultithreadExecutor : public Executor {
 
   class Worker {
    public:
-    Worker();
+    Worker(int wid);
     ~Worker();
     void MainLoop();
     void Start();
@@ -97,6 +97,7 @@ class MultithreadExecutor : public Executor {
     void Submit(Task);
 
    private:
+    int workerId{-1};
     std::atomic<bool> running{false};
     mutable std::mutex mu;
     std::condition_variable cond;
@@ -109,7 +110,7 @@ class MultithreadExecutor : public Executor {
 
  private:
   std::atomic<bool> running{false};
-  std::vector<Worker> pool;
+  std::vector<std::unique_ptr<Worker>> pool;
 };
 
 }  // namespace io

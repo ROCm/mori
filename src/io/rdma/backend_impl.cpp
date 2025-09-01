@@ -584,12 +584,18 @@ RdmaBackend::RdmaBackend(EngineKey key, const IOEngineConfig& engConfig,
   if (config.numWorkerThreads > 1) {
     executor.reset(
         new MultithreadExecutor(std::min(config.qpPerTransfer, config.numWorkerThreads)));
+    executor->Start();
   }
+
+  std::stringstream ss;
+  ss << config;
+  MORI_IO_INFO("RdmaBackend created with config: {}", ss.str().c_str());
 }
 
 RdmaBackend::~RdmaBackend() {
   notif->Shutdown();
   server->Shutdown();
+  executor->Shutdown();
 }
 
 void RdmaBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
