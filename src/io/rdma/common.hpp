@@ -125,14 +125,20 @@ struct NotifMessage {
   int totalNum{-1};
 };
 
-struct CqCallbackHandle {
-  CqCallbackHandle(TransferStatus* s, TransferUniqueId id_, int n)
-      : status(s), id(id), totalNumWr(n) {}
+struct CqCallbackMeta {
+  CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n)
+      : status(s), id(id_), totalBatchSize(n) {}
 
   TransferStatus* status{nullptr};
   TransferUniqueId id{0};
-  int totalNumWr{0};
-  std::atomic<uint32_t> curNumWr{0};
+  int totalBatchSize{0};
+  std::atomic<uint32_t> finishedBatchSize{0};
+};
+
+struct CqCallbackMessage {
+  CqCallbackMessage(CqCallbackMeta* m, int n) : meta(m), batchSize(n) {}
+  CqCallbackMeta* meta{nullptr};
+  int batchSize{0};
 };
 
 struct RdmaOpRet {
@@ -151,16 +157,16 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
                              const SizeVec& localOffsets,
                              const application::RdmaMemoryRegion& remote,
                              const SizeVec& remoteOffsets, const SizeVec& sizes,
-                             CqCallbackHandle* callbackStatus, TransferUniqueId id, bool isRead,
+                             CqCallbackMeta* callbackMeta, TransferUniqueId id, bool isRead,
                              int expectedNumCqe = -1, int postBatchSize = -1);
 
 inline RdmaOpRet RdmaBatchRead(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                                const SizeVec& localOffsets,
                                const application::RdmaMemoryRegion& remote,
                                const SizeVec& remoteOffsets, const SizeVec& sizes,
-                               CqCallbackHandle* callbackStatus, TransferUniqueId id,
+                               CqCallbackMeta* callbackMeta, TransferUniqueId id,
                                int expectedNumCqe = -1, int postBatchSize = -1) {
-  return RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, callbackStatus,
+  return RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, callbackMeta,
                             id, true /*isRead */, expectedNumCqe, postBatchSize);
 }
 
@@ -168,26 +174,26 @@ inline RdmaOpRet RdmaBatchWrite(const EpPairVec& eps, const application::RdmaMem
                                 const SizeVec& localOffsets,
                                 const application::RdmaMemoryRegion& remote,
                                 const SizeVec& remoteOffsets, const SizeVec& sizes,
-                                CqCallbackHandle* callbackStatus, TransferUniqueId id,
+                                CqCallbackMeta* callbackMeta, TransferUniqueId id,
                                 int expectedNumCqe = -1, int postBatchSize = -1) {
-  return RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, callbackStatus,
+  return RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, callbackMeta,
                             id, false /*isRead */, expectedNumCqe, postBatchSize);
 }
 
 inline RdmaOpRet RdmaRead(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                           size_t localOffset, const application::RdmaMemoryRegion& remote,
-                          size_t remoteOffset, size_t size, CqCallbackHandle* callbackStatus,
+                          size_t remoteOffset, size_t size, CqCallbackMeta* callbackMeta,
                           TransferUniqueId id) {
-  return RdmaBatchRead(eps, local, {localOffset}, remote, {remoteOffset}, {size}, callbackStatus,
-                       id, 1, 1);
+  return RdmaBatchRead(eps, local, {localOffset}, remote, {remoteOffset}, {size}, callbackMeta, id,
+                       1, 1);
 }
 
 inline RdmaOpRet RdmaWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                            size_t localOffset, const application::RdmaMemoryRegion& remote,
-                           size_t remoteOffset, size_t size, CqCallbackHandle* callbackStatus,
+                           size_t remoteOffset, size_t size, CqCallbackMeta* callbackMeta,
                            TransferUniqueId id) {
-  return RdmaBatchWrite(eps, local, {localOffset}, remote, {remoteOffset}, {size}, callbackStatus,
-                        id, 1, 1);
+  return RdmaBatchWrite(eps, local, {localOffset}, remote, {remoteOffset}, {size}, callbackMeta, id,
+                        1, 1);
 }
 }  // namespace io
 }  // namespace mori

@@ -177,12 +177,12 @@ def check_transfer_result(
     assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
 
 
-@pytest.mark.parametrize("engine_type", ("multhd",))
-@pytest.mark.parametrize("enable_sess", (True,))
-@pytest.mark.parametrize("enable_batch", (True,))
+@pytest.mark.parametrize("engine_type", ("multhd", "normal"))
+@pytest.mark.parametrize("enable_sess", (True, False))
+@pytest.mark.parametrize("enable_batch", (True, False))
 @pytest.mark.parametrize("op_type", ("read",))
 @pytest.mark.parametrize("batch_size", (64,))
-@pytest.mark.parametrize("buffer_size", (8,))
+@pytest.mark.parametrize("buffer_size", (8, 8192))
 def test_rdma_backend_ops(
     pre_connected_engine_pair,
     engine_type,

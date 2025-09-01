@@ -63,7 +63,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
                              const SizeVec& localOffsets,
                              const application::RdmaMemoryRegion& remote,
                              const SizeVec& remoteOffsets, const SizeVec& sizes,
-                             TransferStatus* callbackStatus, TransferUniqueId id, bool isRead,
+                             CqCallbackMeta* callbackMeta, TransferUniqueId id, bool isRead,
                              int expectedNumCqe, int postBatchSize) {
   MORI_IO_FUNCTION_TIMER;
 
@@ -104,7 +104,10 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
       sge.lkey = local.lkey;
 
       struct ibv_send_wr& wr = wrs[j];
-      wr.wr_id = (j < (end - 1)) ? 0 : reinterpret_cast<uint64_t>(callbackStatus);
+      wr.wr_id = 0;
+      if (j == (end - 1)) {
+        wr.wr_id = reinterpret_cast<uint64_t>(new CqCallbackMessage(callbackMeta, end - st));
+      }
       wr.sg_list = &sge;
       wr.num_sge = 1;
       wr.opcode = isRead ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;

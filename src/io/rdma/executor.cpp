@@ -72,7 +72,7 @@ void MultithreadExecutor::Worker::MainLoop() {
         SizeVec tSizes(task.req.sizes.begin() + task.begin, task.req.sizes.begin() + task.end);
         task.ret = mori::io::RdmaBatchReadWrite(
             {task.req.eps[task.epId]}, task.req.local, tLoclOffsets, task.req.remote,
-            tRemoteOffsets, tSizes, task.req.status, task.req.id, task.req.isRead,
+            tRemoteOffsets, tSizes, task.req.callbackMeta, task.req.id, task.req.isRead,
             task.expectedNumCqe, task.req.postBatchSize);
         MORI_IO_TRACE("Worker {} execute task {} begin {} end {} ret code {}", workerId,
                       task.req.id, task.begin, task.end, static_cast<uint32_t>(task.ret.code));
