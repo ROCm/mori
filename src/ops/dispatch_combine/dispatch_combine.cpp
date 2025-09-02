@@ -141,6 +141,7 @@ mori::application::SymmMemObjPtr ShmemMallocAndReturnMemObjPtr(size_t size, unsi
 void EpDispatchCombineHandle::InitializeShmemBuf() {
   size_t maxTokenSize = static_cast<ssize_t>(config.MaxNumTokensToRecv()) * config.hiddenDim *
                         config.maxTokenTypeSize;
+
   size_t maxStagingTokSize = static_cast<ssize_t>(config.MaxNumTokensToRecv()) *
                              (config.hiddenDim * config.maxTokenTypeSize +
                               (sizeof(float) + sizeof(index_t)) * config.numExpertPerToken +
