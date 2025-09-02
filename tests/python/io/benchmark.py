@@ -86,7 +86,19 @@ def parse_args():
         "--num-qp-per-transfer",
         type=int,
         default=1,
-        help="Number of QPused for single transfer",
+        help="Number of QPs for single transfer",
+    )
+    parser.add_argument(
+        "--num-worker-threads",
+        type=int,
+        default=1,
+        help="Number of threads used for transfer",
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=128,
+        help="Number of iterations running test",
     )
     parser.add_argument(
         "--log-level",
@@ -118,6 +130,8 @@ class MoriIoBenchmark:
         num_initiator_dev: int = 1,
         num_target_dev: int = 1,
         num_qp_per_transfer: int = 1,
+        num_worker_threads: int = 1,
+        iters: int = 128,
         sweep: bool = False,
     ):
         self.host = host
@@ -132,6 +146,8 @@ class MoriIoBenchmark:
         self.enable_batch_transfer = enable_batch_transfer
         self.enable_sess = enable_sess
         self.num_qp_per_transfer = num_qp_per_transfer
+        self.num_worker_threads = num_worker_threads
+        self.iters = iters
         self.sweep = sweep
 
         self.world_size = self.num_initiator_dev + self.num_target_dev
@@ -161,6 +177,8 @@ class MoriIoBenchmark:
         print(f"  enable_batch_transfer: {self.enable_batch_transfer}")
         print(f"  enable_sess: {self.enable_sess}")
         print(f"  num_qp_per_transfer: {self.num_qp_per_transfer}")
+        print(f"  num_worker_threads: {self.num_worker_threads}")
+        print(f"  iters: {self.iters}")
         print()
 
     def send_bytes(self, b: bytes, dst: int):
@@ -198,7 +216,9 @@ class MoriIoBenchmark:
         )
         self.engine = IOEngine(key=f"{self.role.name}-{self.role_rank}", config=config)
         config = RdmaBackendConfig(
-            qp_per_transfer=self.num_qp_per_transfer, post_batch_size=-1
+            qp_per_transfer=self.num_qp_per_transfer,
+            post_batch_size=-1,
+            num_worker_threads=self.num_worker_threads,
         )
         self.engine.create_backend(BackendType.RDMA, config)
 
@@ -340,7 +360,7 @@ class MoriIoBenchmark:
             self.run_once(self.buffer_size)
             dist.barrier()
 
-            iters = 128
+            iters = self.iters
             table = PrettyTable(
                 field_names=[
                     "MsgSize (B)",
@@ -408,6 +428,8 @@ def benchmark_engine(local_rank, node_rank, args):
         num_initiator_dev=args.num_initiator_dev,
         num_target_dev=args.num_target_dev,
         num_qp_per_transfer=args.num_qp_per_transfer,
+        num_worker_threads=args.num_worker_threads,
+        iters=args.iters,
         sweep=args.all,
     )
     bench.print_config()

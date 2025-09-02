@@ -181,7 +181,13 @@ def check_transfer_result(
 @pytest.mark.parametrize("enable_sess", (True, False))
 @pytest.mark.parametrize("enable_batch", (True, False))
 @pytest.mark.parametrize("op_type", ("read",))
-@pytest.mark.parametrize("batch_size", (64,))
+@pytest.mark.parametrize(
+    "batch_size",
+    (
+        1,
+        64,
+    ),
+)
 @pytest.mark.parametrize("buffer_size", (8, 8192))
 def test_rdma_backend_ops(
     pre_connected_engine_pair,
