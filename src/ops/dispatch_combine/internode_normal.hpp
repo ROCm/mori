@@ -1,24 +1,3 @@
-// Copyright © Advanced Micro Devices, Inc. All rights reserved.
-//
-// MIT License
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
 #pragma once
 
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
@@ -27,13 +6,24 @@
 namespace mori {
 namespace moe {
 
+#define SIGNAL_PUT_FINISHED 1
 #define DEBUG 0
 
+inline __device__ void LocalBarrier(uint32_t* barrier, int syncNum, int id) {
+  if (id == 0) {
+    int old_val = atomicAdd(barrier, 1);
+    if (old_val == syncNum - 1) {
+      __hip_atomic_store(barrier, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    shmem::ShmemUint32WaitUntilEquals(barrier, 0);
+  }
+}
+
 /* ---------------------------------------------------------------------------------------------- */
-/*                                    EpDispatchInterNodeKernel                                   */
+/*                                    EpDispatchInterNodeNormalKernel                             */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>
-__global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
+__global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
 
   int thdId = threadIdx.x;
@@ -48,9 +38,9 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
   int globalWarpId = blockIdx.x * warpNum + warpId;
   int globalWarpNum = gridDim.x * warpNum;
 
-  int myPe = config.rank;
-  int npes = config.worldSize;
-  int myNode = myPe / MAX_GPUS_PER_NODE;
+  const int myPe = config.rank;
+  const int npes = config.worldSize;
+  const int myNode = myPe / MAX_GPUS_PER_NODE;
 
   size_t MaxNumTokensToSendPerRank = config.MaxNumTokensToSendPerRank();
   size_t MaxNumTokensToRecvPerRank = config.MaxNumTokensToRecvPerRank();
@@ -59,10 +49,11 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
   int numExpertPerToken = config.numExpertPerToken;
   assert(numExpertPerToken < warpSize);
 
-  size_t weightOffset = config.hiddenDim * sizeof(T);
-  size_t indicesOffset = weightOffset + sizeof(float) * numExpertPerToken;
-  size_t scalesOffset = indicesOffset + sizeof(index_t) * numExpertPerToken;
-  size_t stagingOffset = scalesOffset + config.scaleTypeSize * config.scaleDim;
+  const size_t tokenSize = config.hiddenDim * sizeof(T);
+  const size_t weightSize = sizeof(float) * numExpertPerToken;
+  const size_t indiceSize = sizeof(index_t) * numExpertPerToken;
+  const size_t scaleSize = config.scaleTypeSize * config.scaleDim;
+  const size_t tokenPackSize = tokenSize + weightSize + indiceSize + scaleSize;
 
   extern __shared__ char sharedMem[];
 
@@ -101,16 +92,8 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
     }
   }
 
-  if (laneId == 0) {
-    int old_val = atomicAdd(args.dispatchGridBarrier, 1);
-    if (old_val == globalWarpNum - 1) {
-      __hip_atomic_store(args.dispatchGridBarrier, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    }
-  }
-
-  if (laneId == 0) {
-    shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, 0);
-  }
+  // global warp barrier
+  LocalBarrier(&args.dispatchGridBarrier[npes], globalWarpNum, laneId);
 
   // TODO: block num should be multiple of npes
   const int numsBlockPerDestPe = gridDim.x / npes;
@@ -119,7 +102,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
   const int localBlockId = blockIdx.x - destPe * numsBlockPerDestPe;
   const int totalTokens = args.destPeTokenCounter[destPe];
   const int baseChunk = totalTokens / numsBlockPerDestPe;
-  const int remainder = totalTokens % numsBlockPerDestPe;
+  const int remainder = totalTokens - baseChunk * numsBlockPerDestPe;
 
   const int myChunkSize = baseChunk + (localBlockId < remainder);
 
@@ -127,41 +110,99 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
   const int endIdx = startIdx + myChunkSize;
 
   if (destNode == myNode) {
+    // calculate prefix to determine output offset
+    if (destPe == myPe && localBlockId == 0 && warpId == 0) {
+      // // write number of token to send
+      // for (int pe = laneId; pe < npes; pe += warpSize) {
+      //   if (pe / MAX_GPUS_PER_NODE == myNode) {
+      //     index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(pe) + myPe;
+      //     shmem::ShmemInt32WaitUntilEquals(signal, 0);
+      //     core::AtomicStoreRelaxedSystem(signal, args.destPeTokenCounter[pe] + 1);
+      //   } else {
+      //     shmem::ShmemPutInt32ImmNbiThread(args.recvTokenNumMemObj, myPe * sizeof(index_t),
+      //                                      args.destPeTokenCounter[pe] + 1, pe);
+      //   }
+      // }
+      if (laneId == 0) {
+        // write number of token to send
+        for (int peerPe = 0; peerPe < npes; ++peerPe) {
+          if (peerPe / MAX_GPUS_PER_NODE == myNode) {
+            index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(peerPe) + myPe;
+            shmem::ShmemInt32WaitUntilEquals(signal, 0);
+            core::AtomicStoreRelaxedSystem(signal, args.destPeTokenCounter[peerPe] + 1);
+          } else {
+            shmem::ShmemPutInt32ImmNbiThread(args.recvTokenNumMemObj, myPe * sizeof(index_t),
+                                             args.destPeTokenCounter[peerPe] + 1, peerPe);
+          }
+        }
+        // obtain number of token to recv
+        index_t recvTokenNum = 0, prevRecvTokenNum = 0;
+        index_t sum = 0;
+        for (int pe = 0; pe < npes; ++pe) {
+          index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>() + pe;
+          recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
+          args.dispReceiverIdxMap[pe] = recvTokenNum;  // TODO modify dispReceiverIdxMap size
+          sum += prevRecvTokenNum;
+          prevRecvTokenNum = recvTokenNum;
+          args.recvTokenOffset[pe] = sum;
+
+          // send prefix back
+          if (pe / MAX_GPUS_PER_NODE == myNode) {
+            index_t* peerPrefixPtr = args.shmemMetaDataMemObj->template GetAs<index_t*>(pe) + myPe;
+            shmem::ShmemInt32WaitUntilEquals(peerPrefixPtr, 0);
+            core::AtomicStoreRelaxedSystem(peerPrefixPtr, sum + 1);
+          } else {
+            shmem::ShmemPutInt32ImmNbiThread(args.shmemMetaDataMemObj, myPe * sizeof(index_t),
+                                             sum + 1, pe);
+          }
+        }
+        // args.dispReceiverIdxMap[npes] = sum;
+
+        *args.localPeTokenCounter = npes;  // TODO modify size
+        *args.totalRecvTokenNum = sum;     // TODO
+      }
+    }
+
+    index_t outputBaseIdx;
+    if (laneId == 0) {
+      index_t* prefix = args.shmemMetaDataMemObj->template GetAs<index_t*>() + destPe;
+      outputBaseIdx = shmem::ShmemInt32WaitUntilGreaterThan(prefix, 0) - 1;
+      outputBaseIdx += startIdx;
+    }
+    outputBaseIdx = __shfl(outputBaseIdx, 0);
+    // if (myPe != 0 && thdId == 0) {
+    //   index_t* prefix = args.shmemMetaDataMemObj->template GetAs<index_t*>(destPe) + (myPe - 1);
+    //   outputBaseIdx = shmem::ShmemInt32WaitUntilGreaterThan(prefix, 0) - 1;
+    //   outputBaseIdx += startIdx;
+    // }
     // intra node use xgmi for transfer
     for (int idx = warpId; idx < endIdx - startIdx; idx += warpNum) {
       const index_t mapIdx = destPe * MaxNumTokensToRecvPerRank + startIdx + idx;
-      size_t mapIdxOffset = mapIdx * stagingOffset;
       const index_t tokenId = args.destPeTokenIdxMap[mapIdx];
-      size_t tokenOffset = tokenId * size_t(config.hiddenDim) * sizeof(T);
-      const index_t peSortedId = myPe * MaxNumTokensToRecvPerRank + startIdx + idx;
-      size_t peSortedOffset = peSortedId * stagingOffset;
-      core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset,
-                     reinterpret_cast<char*>(args.inpTokenBuf) + tokenOffset,
-                     config.hiddenDim * sizeof(T));
+      size_t tokenOffset = tokenId * tokenSize;
+      const index_t outputIdx = outputBaseIdx + idx;
+
+      core::WarpCopy(args.shmemOutTokMemObj->template GetAs<char*>(destPe) + outputIdx * tokenSize,
+                     reinterpret_cast<char*>(args.inpTokenBuf) + tokenOffset, tokenSize);
       core::WarpCopy(
-          args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + weightOffset,
-          reinterpret_cast<char*>(args.weightsBuf) +
-              tokenId * config.numExpertPerToken * sizeof(float),
-          config.numExpertPerToken * sizeof(float));
+          args.shmemOutWeightsMemObj->template GetAs<char*>(destPe) + outputIdx * weightSize,
+          reinterpret_cast<char*>(args.weightsBuf) + tokenId * weightSize, weightSize);
       core::WarpCopy(
-          args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + indicesOffset,
-          reinterpret_cast<char*>(args.tokenIndices) +
-              tokenId * config.numExpertPerToken * sizeof(index_t),
-          config.numExpertPerToken * sizeof(index_t));
+          args.shmemOutIndicesMemObj->template GetAs<char*>(destPe) + outputIdx * indiceSize,
+          reinterpret_cast<char*>(args.tokenIndices) + tokenId * indiceSize, indiceSize);
       if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
         core::WarpCopy(
-            args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + scalesOffset,
-            reinterpret_cast<char*>(args.scalesBuf) +
-                tokenId * config.scaleDim * config.scaleTypeSize,
-            config.scaleDim * config.scaleTypeSize);
+            args.shmemOutScalesMemObj->template GetAs<char*>(destPe) + outputIdx * scaleSize,
+            reinterpret_cast<char*>(args.scalesBuf) + tokenId * scaleSize, scaleSize);
       }
-      shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemInpTokMemObj, peSortedOffset,
-                                          args.shmemStagingTokMemObj, mapIdxOffset, stagingOffset,
-                                          destPe);
     }
   } else {
-    // inter node use ibgda for transfer
     // last warp for coordinate, other warp for gather token
+    const size_t stagingBaseOffset = destPe * MaxNumTokensToRecvPerRank * tokenPackSize;
+    const size_t stagingWeightBaseOffset = stagingBaseOffset + totalTokens * tokenSize;
+    const size_t stagingIndiceBaseOffset = stagingWeightBaseOffset + totalTokens * indiceSize;
+    const size_t stagingScaleBaseOffset = stagingIndiceBaseOffset + totalTokens * scaleSize;
+
     __shared__ int gatherTokenNum[1024];
     for (int idx = thdId; idx < 1024; idx += thdNum) {
       gatherTokenNum[idx] = 0;
@@ -169,6 +210,13 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
     __syncthreads();
     const int chunkTokenSize = (warpNum - 1);
     if (warpId == warpNum - 1) {
+      index_t outputBaseIdx = 0;
+      if (laneId == 0) {
+        index_t* prefix = args.shmemMetaDataMemObj->template GetAs<index_t*>() + destPe;
+        outputBaseIdx = shmem::ShmemInt32WaitUntilGreaterThan(prefix, 0) - 1;
+      }
+
+      // inter node use ibgda to transfer data
       const int totalTokenInBlock = endIdx - startIdx;
       int chunkOffset = 0;
       int chunkIdx = 0;
@@ -181,133 +229,102 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
             ;
           }
         }
-        // rdma_send
-        const index_t srcIdx = destPe * MaxNumTokensToRecvPerRank + startIdx + chunkOffset;
-        size_t srcOffset = srcIdx * stagingOffset;
-        const index_t dstIdx = myPe * MaxNumTokensToRecvPerRank + startIdx + chunkOffset;
-        size_t dstOffset = dstIdx * stagingOffset;
-        shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemInpTokMemObj, dstOffset,
-                                            args.shmemStagingTokMemObj, srcOffset,
-                                            actualTokenNum * stagingOffset, destPe);
+        // rdma write to output buffer
+        if (laneId == 0) {
+          const index_t srcIdx = startIdx + chunkOffset;
+          size_t srcOffset = stagingBaseOffset + (startIdx + chunkOffset) * tokenSize;
+          const index_t outputIdx = outputBaseIdx + startIdx + chunkOffset;
+          size_t dstOffset = outputIdx * tokenSize;
+          shmem::ShmemPutTypeNbiThread<uint8_t>(args.shmemOutTokMemObj, dstOffset,
+                                                args.shmemStagingTokMemObj, srcOffset,
+                                                actualTokenNum * tokenSize, destPe);
+          // TODO check perf
+          shmem::ShmemPutTypeNbiThread<uint8_t>(
+              args.shmemOutWeightsMemObj, outputIdx * weightSize, args.shmemStagingTokMemObj,
+              stagingWeightBaseOffset + srcIdx * weightSize, actualTokenNum * weightSize, destPe);
+          shmem::ShmemPutTypeNbiThread<uint8_t>(
+              args.shmemOutIndicesMemObj, outputIdx * indiceSize, args.shmemStagingTokMemObj,
+              stagingIndiceBaseOffset + srcIdx * indiceSize, actualTokenNum * indiceSize, destPe);
+          if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
+            shmem::ShmemPutTypeNbiThread<uint8_t>(
+                args.shmemOutScalesMemObj, outputIdx * scaleSize, args.shmemStagingTokMemObj,
+                stagingScaleBaseOffset + srcIdx * scaleSize, actualTokenNum * scaleSize, destPe);
+          }
+        }
 
         ++chunkIdx;
         chunkOffset += chunkTokenSize;
       }
     } else {
-      // int warpTokens = 0;
       int chunkIdx = 0;
       for (int idx = warpId; idx < endIdx - startIdx; idx += chunkTokenSize) {
         const index_t mapIdx = destPe * MaxNumTokensToRecvPerRank + startIdx + idx;
-        size_t mapIdxOffset = mapIdx * stagingOffset;
         const index_t tokenId = args.destPeTokenIdxMap[mapIdx];
-        size_t tokenOffset = tokenId * size_t(config.hiddenDim) * sizeof(T);
-        // const index_t peSortedId = myPe * MaxNumTokensToRecvPerRank + startIdx + idx;
-        // size_t peSortedOffset = peSortedId * size_t(config.hiddenDim);
-        core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset,
-                       reinterpret_cast<char*>(args.inpTokenBuf) + tokenOffset,
-                       config.hiddenDim * sizeof(T));
-        core::WarpCopy(
-            args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + weightOffset,
-            reinterpret_cast<char*>(args.weightsBuf) +
-                tokenId * config.numExpertPerToken * sizeof(float),
-            config.numExpertPerToken * sizeof(float));
-        core::WarpCopy(
-            args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + indicesOffset,
-            reinterpret_cast<char*>(args.tokenIndices) +
-                tokenId * config.numExpertPerToken * sizeof(index_t),
-            config.numExpertPerToken * sizeof(index_t));
+        const index_t stagingIdx = startIdx + idx;
+
+        core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + stagingBaseOffset +
+                           stagingIdx * tokenSize,
+                       reinterpret_cast<char*>(args.inpTokenBuf) + tokenId * tokenSize, tokenSize);
+        core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() +
+                           stagingWeightBaseOffset + stagingIdx * weightSize,
+                       reinterpret_cast<char*>(args.weightsBuf) + tokenId * weightSize, weightSize);
+        core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() +
+                           stagingIndiceBaseOffset + stagingIdx * indiceSize,
+                       reinterpret_cast<char*>(args.tokenIndices) + tokenId * indiceSize,
+                       indiceSize);
         if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
-          core::WarpCopy(
-              args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + scalesOffset,
-              reinterpret_cast<char*>(args.scalesBuf) +
-                  tokenId * config.scaleDim * config.scaleTypeSize,
-              config.scaleDim * config.scaleTypeSize);
+          core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() +
+                             stagingScaleBaseOffset + stagingIdx * scaleSize,
+                         reinterpret_cast<char*>(args.scalesBuf) + tokenId * scaleSize, scaleSize);
         }
         if (laneId == 0) atomicAdd(&gatherTokenNum[chunkIdx++], 1);
       }
-      // if (laneId == 0 && warpTokens) atomicAdd(&gatherTokenNum, warpTokens);
       __threadfence_block();
     }
   }
 
-  __shared__ index_t recvTokenNum;
+  // Same dest PE block barrier
   __syncthreads();
-  if (thdId == 0) {
-    // shmem::ShmemAtomicTypeNonFetchWarp<int32_t>(args.recvTokenNumMemObj, myPe * sizeof(index_t),
-    //                                         args.shmemStagingTokMemObj->GetMemoryRegion(myPe),
-    //                                         myPe * sizeof(index_t), (int32_t)(totalTokens+1),
-    //                                         destPe, core::AMO_SET);
-    int doneBlockNum = atomicAdd(&args.dispatchGridBarrier[destPe], 1);
-    if (doneBlockNum == numsBlockPerDestPe - 1) {
-      shmem::ShmemPutInt32ImmNbiThread(args.recvTokenNumMemObj, myPe * sizeof(index_t),
-                                       totalTokens + 1, destPe);
-      __hip_atomic_store(&args.dispatchGridBarrier[destPe], 0, __ATOMIC_RELAXED,
-                         __HIP_MEMORY_SCOPE_AGENT);
+  LocalBarrier(&args.dispatchGridBarrier[destPe], numsBlockPerDestPe, thdId);
+  if (localBlockId == 0 && thdId == 0) {
+    if (destNode == myNode) {
+      index_t* sync = args.shmemSyncDataMemObj->template GetAs<index_t*>(destPe) + myPe;
+      shmem::ShmemInt32WaitUntilEquals(sync, 0);
+      core::AtomicStoreRelaxedSystem(sync, SIGNAL_PUT_FINISHED);
+    } else {
+      shmem::ShmemPutInt32ImmNbiThread(args.shmemSyncDataMemObj, myPe * sizeof(index_t),
+                                       SIGNAL_PUT_FINISHED, destPe);
     }
+    // clear meta data
+    core::AtomicStoreRelaxedSystem(args.shmemMetaDataMemObj->template GetAs<index_t*>() + destPe,
+                                   0);
   }
-  if (thdId == 0) {
-    index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>() + destPe;
-    recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
-    if (localBlockId == 0) {
-      atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-      args.destPeTokenCounter[destPe] = 0;
-    }
-    // if (localBlockId == 0) printf("rank[%d] destPe[%d] recvTokenNum: %d\n", myPe, destPe,
-    // recvTokenNum);
+
+  if (localBlockId == 0 && thdId == 0) {
+    index_t* sync = args.shmemSyncDataMemObj->template GetAs<index_t*>() + destPe;
+    shmem::ShmemInt32WaitUntilEquals(sync, SIGNAL_PUT_FINISHED);
+    core::AtomicStoreRelaxedSystem(sync, 0);
   }
+
+  // global warp barrier
+  // LocalBarrier(&args.dispatchGridBarrier[npes], globalWarpNum, laneId);
+
+  for (int i = globalThdId; i < npes; ++i) {
+    args.destPeTokenCounter[i] = 0;
+  }
+
+  __syncthreads();
+  shmem::ShmemQuietThread();
   __syncthreads();
 
-  const int baseRecvChunk = recvTokenNum / numsBlockPerDestPe;
-  const int recvRemainder = recvTokenNum % numsBlockPerDestPe;
-  const int myRecvChunkSize = baseRecvChunk + (localBlockId < recvRemainder);
-  // if (localBlockId == 0 && thdId == 0) printf("rank[%d] destPe[%d] myRecvChunkSize: %d\n", myPe,
-  // destPe, myRecvChunkSize);
-  const int startRecvIdx = localBlockId * baseRecvChunk + min(localBlockId, recvRemainder);
-  const int endRecvIdx = startRecvIdx + myRecvChunkSize;
-  for (int idx = warpId; idx < myRecvChunkSize; idx += warpNum) {
-    index_t localTokenIdx = 0;
-    if (laneId == 0) {
-      localTokenIdx = atomicAdd(args.localPeTokenCounter, 1);
-    }
-    localTokenIdx = __shfl(localTokenIdx, 0);
-    index_t peSortedId = destPe * MaxNumTokensToRecvPerRank + startRecvIdx + idx;
-
-    size_t localTokenOffset = size_t(localTokenIdx) * size_t(config.hiddenDim) * sizeof(T);
-    size_t peSortedTokenOffset = size_t(peSortedId) * stagingOffset;
-
-    core::WarpCopy(args.shmemOutTokMemObj->template GetAs<char*>() + localTokenOffset,
-                   args.shmemInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset,
-                   config.hiddenDim * sizeof(T));
-    core::WarpCopy(
-        args.shmemOutWeightsMemObj->template GetAs<char*>() +
-            localTokenIdx * config.numExpertPerToken * sizeof(float),
-        args.shmemInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset + weightOffset,
-        config.numExpertPerToken * sizeof(float));
-    core::WarpCopy(
-        args.shmemOutIndicesMemObj->template GetAs<char*>() +
-            localTokenIdx * config.numExpertPerToken * sizeof(index_t),
-        args.shmemInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset + indicesOffset,
-        config.numExpertPerToken * sizeof(index_t));
-    if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
-      core::WarpCopy(
-          args.shmemOutScalesMemObj->template GetAs<char*>() +
-              localTokenIdx * config.scaleDim * config.scaleTypeSize,
-          args.shmemInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset + scalesOffset,
-          config.scaleDim * config.scaleTypeSize);
-    }
-    if (laneId == 0) {
-      args.dispReceiverIdxMap[localTokenIdx] = peSortedId;
-      args.srcPeTokenIdxMap[peSortedId] = localTokenIdx;
-    }
-  }
-  SyncIfDebugEnabled("Dispatch kernel: kernel end");
+  // SyncIfDebugEnabled("Dispatch kernel: kernel end");
 }
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                    EpCombineInterNodeKernel                                    */
+/*                                    EpCombineIntraNodeNormalKernel                              */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>
-__global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
+__global__ void EpCombineIntraNodeNormalKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
   int thdId = threadIdx.x;
   int thdNum = blockDim.x;
@@ -353,7 +370,7 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
     for (int idx = warpId; idx < endIdx - startIdx; idx += warpNum) {
       const index_t mapIdx = srcPe * MaxNumTokensToRecvPerRank + startIdx + idx;
       size_t mapIdxOffset = mapIdx * tokenPackSize;
-      const index_t tokenId = args.srcPeTokenIdxMap[mapIdx];
+      const index_t tokenId = args.recvTokenOffset[srcPe] + startIdx + idx;
       size_t tokenOffset = tokenId * tokenSize;
       const index_t peSortedId = myPe * MaxNumTokensToRecvPerRank + startIdx + idx;
       size_t peSortedOffset = peSortedId * tokenPackSize;
@@ -402,17 +419,17 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
         shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemInpTokMemObj, dstOffset,
                                             args.shmemStagingTokMemObj, srcOffset,
                                             actualTokenNum * tokenPackSize, srcPe);
-
         ++chunkIdx;
         chunkOffset += chunkTokenSize;
       }
     } else {
+      // TODO support no external buffer
       // int warpTokens = 0;
       int chunkIdx = 0;
       for (int idx = warpId; idx < endIdx - startIdx; idx += chunkTokenSize) {
         const index_t mapIdx = srcPe * MaxNumTokensToRecvPerRank + startIdx + idx;
         size_t mapIdxOffset = mapIdx * tokenPackSize;
-        const index_t tokenId = args.srcPeTokenIdxMap[mapIdx];
+        const index_t tokenId = args.recvTokenOffset[srcPe] + startIdx + idx;
         size_t tokenOffset = tokenId * tokenSize;
         // const index_t peSortedId = myPe * MaxNumTokensToRecvPerRank + startIdx + idx;
         // size_t peSortedOffset = peSortedId * size_t(config.hiddenDim);
@@ -439,6 +456,7 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
   if (globalThdId < npes) {
     args.recvTokenNumMemObj->template GetAs<index_t*>()[globalThdId] = 0;
+    args.recvTokenOffset[globalThdId] = 0;
   }
 
   if (globalThdId == 0) {

@@ -36,6 +36,7 @@ namespace moe {
 enum KernelType {
   IntraNode = 0,
   InterNode = 1,
+  InterNodeNormal = 2,
 };
 
 inline const char* HipDataTypeToString(hipDataType dtype) {
@@ -81,20 +82,21 @@ struct EpDispatchCombineConfig {
   int numExpertPerToken{2};
   int warpNumPerBlock{1};
   int blockNum{1};
+  int kernelType{KernelType::IntraNode};
   // If true, use external buffer which incurs extra copy overhead; otherwise, the kernel assumes
   // the provided buffer is shmemInpTokMemObj
   bool useExternalInpBuffer{true};
 
   inline __host__ __device__ int MaxNumTokensToSendPerRank() const {
-    return maxNumInpTokenPerRank * numExpertPerToken;
+    return maxNumInpTokenPerRank;
   }
 
   inline __host__ __device__ int MaxNumTokensToSend() const {
-    return worldSize * maxNumInpTokenPerRank * numExpertPerToken;
+    return worldSize * MaxNumTokensToSendPerRank();
   }
 
   inline __host__ __device__ int MaxNumTokensToRecvPerRank() const {
-    return maxNumInpTokenPerRank * std::min(numExpertPerRank, numExpertPerToken);
+    return maxNumInpTokenPerRank;
   }
 
   inline __host__ __device__ int MaxNumTokensToRecv() const {
@@ -176,6 +178,8 @@ class EpDispatchCombineHandle {
   mori::application::SymmMemObjPtr shmemInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
   mori::application::SymmMemObjPtr shmemStagingTokMemObj;
+  mori::application::SymmMemObjPtr shmemMetaDataMemObj;
+  mori::application::SymmMemObjPtr shmemSyncDataMemObj;
 
   // Registered buffer used for weights, indices and scales
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
@@ -206,6 +210,8 @@ class EpDispatchCombineHandle {
   // Map output buffer index to combine input token index, saved at dispatch recv phase and used at
   // combine send phase
   index_t* srcPeTokenIdxMap{nullptr};
+  // internode normal kernel record recv token offset from different PEs
+  index_t* recvTokenOffset{nullptr};
 
   // Count the number of tokens sent to destination pe
   index_t* destPeTokenCounter{nullptr};
@@ -234,6 +240,8 @@ struct EpDispatchCombineArgs {
   mori::application::SymmMemObjPtr shmemInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
   mori::application::SymmMemObjPtr shmemStagingTokMemObj;
+  mori::application::SymmMemObjPtr shmemMetaDataMemObj;
+  mori::application::SymmMemObjPtr shmemSyncDataMemObj;
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
   mori::application::SymmMemObjPtr shmemOutWeightsMemObj;
   mori::application::SymmMemObjPtr shmemInpScalesMemObj;
@@ -250,6 +258,7 @@ struct EpDispatchCombineArgs {
   index_t* dispSenderIdxMap{nullptr};
   index_t* destPeTokenIdxMap{nullptr};
   index_t* srcPeTokenIdxMap{nullptr};
+  index_t* recvTokenOffset{nullptr};
   mori::application::SymmMemObjPtr dispTokOffsetMemObj;
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
   index_t* dispDestTokIdMap{nullptr};
@@ -277,6 +286,8 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.shmemInpTokMemObj = handle.shmemInpTokMemObj;
   args.shmemOutTokMemObj = handle.shmemOutTokMemObj;
   args.shmemStagingTokMemObj = handle.shmemStagingTokMemObj;
+  args.shmemMetaDataMemObj = handle.shmemMetaDataMemObj;
+  args.shmemSyncDataMemObj = handle.shmemSyncDataMemObj;
   args.shmemInpWeightsMemObj = handle.shmemInpWeightsMemObj;
   args.shmemOutWeightsMemObj = handle.shmemOutWeightsMemObj;
   args.shmemInpScalesMemObj = handle.shmemInpScalesMemObj;
@@ -291,6 +302,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.dispSenderIdxMap = handle.dispSenderIdxMap;
   args.destPeTokenIdxMap = handle.destPeTokenIdxMap;
   args.srcPeTokenIdxMap = handle.srcPeTokenIdxMap;
+  args.recvTokenOffset = handle.recvTokenOffset;
   args.dispTokOffsetMemObj = handle.dispTokOffsetMemObj;
   args.dispTokIdToSrcTokIdMemObj = handle.dispTokIdToSrcTokIdMemObj;
   args.dispDestTokIdMap = handle.dispDestTokIdMap;
@@ -329,6 +341,7 @@ static std::ostream& operator<<(std::ostream& s, mori::moe::EpDispatchCombineCon
      << "  hiddenDim: " << config.hiddenDim << std::endl
      << "  scaleDim: " << config.scaleDim << std::endl
      << "  scaleTypeSize: " << config.scaleTypeSize << std::endl
+     << "  kernelType: " << config.kernelType << std::endl
      << "  maxTokenTypeSize: " << config.maxTokenTypeSize << std::endl
      << "  maxNumInpTokenPerRank: " << config.maxNumInpTokenPerRank << std::endl
      << "  numExpertPerRank: " << config.numExpertPerRank << std::endl

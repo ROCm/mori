@@ -89,4 +89,18 @@ namespace application {
   } while (0)
 
 }  // namespace application
+
+#define HIP_MALLOC_WITH_LOG(ptr, size) HipMallocWithLog(ptr, size, __FILE__, __LINE__)
+
+inline hipError_t HipMallocWithLog(void** ptr, size_t size, const char* file, int line) {
+#if 0
+  int dev = 0;
+  HIP_RUNTIME_CHECK(hipGetDevice(&dev));
+  if (dev == 0) {
+    printf("[hipMalloc] %s:%d device=%d size=%zu bytes\n", file, line, dev, size);
+  }
+#endif
+  return hipMalloc(ptr, size);
+}
+
 }  // namespace mori

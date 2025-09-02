@@ -71,6 +71,7 @@ class EpDispatchCombineOp:
                 num_experts_per_token=config.num_experts_per_token,
                 warp_num_per_block=config.warp_num_per_block,
                 block_num=config.block_num,
+                kernel_type=config.kernel_type,
                 use_external_inp_buf=config.use_external_inp_buf,
             )
         )
@@ -187,7 +188,7 @@ class EpDispatchCombineOp:
         )
 
         max_num_token_to_send_per_rank = (
-            self.config.max_num_inp_token_per_rank * self.config.num_experts_per_token
+            self.config.max_num_inp_token_per_rank
         )
         all_rank_sender_map = self._allgather_with_token_num_padding(
             dispatch_sender_token_id_map.cpu().to(torch.int64),
@@ -217,10 +218,39 @@ class EpDispatchCombineOp:
                 reverse_sender_token_id_map[mapped_id] = (
                     i // self.config.num_experts_per_token
                 )
-        src_token_pos = []
-        for i, recv_mapped_id in enumerate(dispatch_receiver_token_id_map.tolist()):
-            src_pe = recv_mapped_id // max_num_token_to_send_per_rank
-            src_tok_id = reverse_sender_token_id_map[recv_mapped_id]
-            src_token_pos.append(src_pe * max_num_token_to_send_per_rank + src_tok_id)
+
+        if self.config.kernel_type.value == EpDispatchCombineKernelType.InterNode.value:
+            src_token_pos = []
+            for i, recv_mapped_id in enumerate(dispatch_receiver_token_id_map.tolist()):
+                src_pe = recv_mapped_id // max_num_token_to_send_per_rank
+                src_tok_id = reverse_sender_token_id_map[recv_mapped_id]
+                src_token_pos.append(
+                    src_pe * max_num_token_to_send_per_rank + src_tok_id
+                )
+        elif (
+            self.config.kernel_type.value
+            == EpDispatchCombineKernelType.InterNodeNormal.value
+        ):
+            # print(
+            #     f"rank={self.config.rank}, dispatch_receiver_token_id_map={dispatch_receiver_token_id_map.tolist()}"
+            # )
+            src_pe_token_map = {}
+            for srcPe, num_recv_tokens in enumerate(
+                dispatch_receiver_token_id_map.tolist()
+            ):
+                src_pe_token_map[srcPe] = list(range(num_recv_tokens))
+
+            src_token_pos = []
+            for src_pe, local_recv_token_indice in src_pe_token_map.items():
+                for local_recv_token_idx in local_recv_token_indice:
+                    recv_mapped_id = (
+                        src_pe * max_num_token_to_send_per_rank + local_recv_token_idx
+                    )
+                    src_tok_id = reverse_sender_token_id_map[recv_mapped_id]
+                    src_token_pos.append(
+                        src_pe * max_num_token_to_send_per_rank + src_tok_id
+                    )
+
+            # print(f"rank={self.config.rank}, src_token_pos={src_token_pos}")
 
         return torch.tensor(src_token_pos, dtype=torch.int)
