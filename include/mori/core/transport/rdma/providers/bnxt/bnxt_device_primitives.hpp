@@ -4,8 +4,10 @@
 #include "mori/core/utils.hpp"
 
 #include "mori/core/transport/rdma/device_primitives.hpp"
+#include "mori/core/transport/rdma/providers/bnxt/bnxt_defs.hpp"
+#include "mori/core/transport/p2p/device_primitives.hpp"
 // #include <infiniband/bnxt_re_dv.h>
-#include "mori/application/transport/rdma/providers/bnxt/bnxt.hpp"
+// #include "mori/application/transport/rdma/providers/bnxt/bnxt.hpp"
 
 namespace mori {
 namespace core {

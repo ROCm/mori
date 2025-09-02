@@ -67,8 +67,8 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe) {
   if (threadIdx.x != 0) return;
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
-  application::CompletionQueueHandle& cq = ep[pe].cqHandle;
-  application::WorkQueueHandle& wq = ep[pe].wqHandle;
+  core::CompletionQueueHandle& cq = ep[pe].cqHandle;
+  core::WorkQueueHandle& wq = ep[pe].wqHandle;
   while (true) {
     bool done{false};
     uint32_t quiet_amount{0};
@@ -119,8 +119,8 @@ template <core::ProviderType PrvdType>
 inline __device__ void ShmemQuietThreadKernelImpl(int pe) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
-  application::CompletionQueueHandle& cq = ep[pe].cqHandle;
-  application::WorkQueueHandle& wq = ep[pe].wqHandle;
+  core::CompletionQueueHandle& cq = ep[pe].cqHandle;
+  core::WorkQueueHandle& wq = ep[pe].wqHandle;
 
   constexpr size_t BROADCAST_SIZE = 1024 / warpSize;
   __shared__ uint64_t wqe_broadcast[BROADCAST_SIZE];
@@ -267,8 +267,8 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
-  application::WorkQueueHandle* wq = &ep[pe].wqHandle;
-  application::CompletionQueueHandle* cq = &ep[pe].cqHandle;
+  core::WorkQueueHandle* wq = &ep[pe].wqHandle;
+  core::CompletionQueueHandle* cq = &ep[pe].cqHandle;
 
   uint64_t activemask = core::GetActiveLaneMask();
   uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
@@ -405,8 +405,8 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
-  application::WorkQueueHandle* wq = &ep[pe].wqHandle;
-  application::CompletionQueueHandle* cq = &ep[pe].cqHandle;
+  core::WorkQueueHandle* wq = &ep[pe].wqHandle;
+  core::CompletionQueueHandle* cq = &ep[pe].cqHandle;
 
   uint64_t activemask = core::GetActiveLaneMask();
   uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
@@ -539,8 +539,8 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
-  application::WorkQueueHandle* wq = &ep[pe].wqHandle;
-  application::CompletionQueueHandle* cq = &ep[pe].cqHandle;
+  core::WorkQueueHandle* wq = &ep[pe].wqHandle;
+  core::CompletionQueueHandle* cq = &ep[pe].cqHandle;
 
   uint64_t activemask = core::GetActiveLaneMask();
   uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
@@ -687,8 +687,8 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernelImpl(
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
-  application::WorkQueueHandle* wq = &ep[pe].wqHandle;
-  application::CompletionQueueHandle* cq = &ep[pe].cqHandle;
+  core::WorkQueueHandle* wq = &ep[pe].wqHandle;
+  core::CompletionQueueHandle* cq = &ep[pe].cqHandle;
 
   uint64_t activemask = core::GetActiveLaneMask();
   uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);

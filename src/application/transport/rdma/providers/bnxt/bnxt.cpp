@@ -6,7 +6,7 @@
 
 #include <iostream>
 
-#include "mori/application/utils/hip_check.hpp"
+#include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
 
 namespace mori {
@@ -93,7 +93,6 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   memset(&qpMemInfo, 0, sizeof(struct bnxt_re_dv_qp_mem_info));
   err = bnxt_re_dv_qp_mem_alloc(pd, &ib_qp_attr, &qpMemInfo);
   assert(!err);
-  printf("bnxt_re_dv_qp_mem_alloc is done\n");
   fflush(stdout); 
 
   // sqUmemAddr
@@ -152,7 +151,6 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   umem_attr.access_flags = IBV_ACCESS_LOCAL_WRITE;
   sqUmem = dv_qp_attr.sq_umem_handle = bnxt_re_dv_umem_reg(context, &umem_attr);
   assert(sqUmem);
-  printf("bnxt_re_dv_umem_reg 1 is done\n");
   fflush(stdout); 
 
   memset(&umem_attr, 0, sizeof(struct bnxt_re_dv_umem_reg_attr));
@@ -161,11 +159,9 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   umem_attr.access_flags = IBV_ACCESS_LOCAL_WRITE;
   rqUmem = dv_qp_attr.rq_umem_handle = bnxt_re_dv_umem_reg(context, &umem_attr);
   assert(rqUmem);
-  printf("bnxt_re_dv_umem_reg 2 is done\n");
   fflush(stdout); 
 
   qp = bnxt_re_dv_create_qp(pd, &dv_qp_attr);
-  printf("bnxt_re_dv_create_qp is done\n");
   fflush(stdout); 
   assert(qp);
   qpn = qp->qp_num;
@@ -278,10 +274,8 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   ibv_context* context = GetIbvContext();
 
   BnxtCqContainer* cq = new BnxtCqContainer(context, config);
-  printf("create cq is done\n");
   
   BnxtQpContainer* qp = new BnxtQpContainer(context, config, cq->cq, pd);
-  printf("create qp is done\n");
   int ret;
 
   RdmaEndpoint endpoint;

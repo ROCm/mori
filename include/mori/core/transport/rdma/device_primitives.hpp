@@ -21,10 +21,10 @@
 // SOFTWARE.
 #pragma once
 
-#include "mori/application/transport/rdma/rdma.hpp"
+// #include "mori/application/transport/rdma/rdma.hpp"
 #include "primitives.hpp"
 
-using namespace mori::application;
+// using namespace mori::application;
 
 namespace mori {
 namespace core {
