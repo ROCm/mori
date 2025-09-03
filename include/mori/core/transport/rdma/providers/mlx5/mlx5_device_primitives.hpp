@@ -202,8 +202,8 @@ inline __device__ uint64_t Mlx5PostWriteInline(WorkQueueHandle& wq, uint32_t cur
                                                uintptr_t raddr, uint64_t rkey, size_t bytes) {
   assert(bytes <= MaxInlineDataSizePerWqe);
   uint8_t signalFlag = cqeSignal ? MLX5_WQE_CTRL_CQ_UPDATE : 0x00;
-  void* queueBuffAddr = wq.rqAddr;
-  uint32_t wqeNum = wq.rqWqeNum;
+  void* queueBuffAddr = wq.sqAddr;
+  uint32_t wqeNum = wq.sqWqeNum;
 
   uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
   uintptr_t wqeAddr = reinterpret_cast<uintptr_t>(queueBuffAddr) + (wqeIdx << MLX5_SEND_WQE_SHIFT);
