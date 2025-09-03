@@ -228,10 +228,7 @@ class RdmaBackend : public Backend {
                       const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
                       const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
                       bool isRead);
-  // TODO: batch write
-  // TODO: send / recv
   BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
-  // TODO: destroy session
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
 
  private:
