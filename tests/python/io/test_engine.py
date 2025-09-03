@@ -326,7 +326,7 @@ def test_no_backend():
 
     initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
         (initiator, target),
-        (32),
+        (32,),
     )
 
     offsets = (0, 16)
