@@ -164,8 +164,11 @@ def check_transfer_result(
     engine_pair,
     initiator_status,
     initiator_tensor,
+    initiator_tensor_copy,
     target_tensor,
+    target_tensor_copy,
     transfer_uid,
+    op_type,
 ):
     initiator, target = engine_pair
     wait_status(initiator_status)
@@ -176,11 +179,34 @@ def check_transfer_result(
     assert target_status.Succeeded()
     assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
 
+    if op_type == "read":
+        assert not torch.equal(initiator_tensor.cpu(), initiator_tensor_copy.cpu())
+    else:
+        assert not torch.equal(target_tensor.cpu(), target_tensor_copy.cpu())
 
-@pytest.mark.parametrize("engine_type", ("multhd", "normal"))
-@pytest.mark.parametrize("enable_sess", (True, False))
-@pytest.mark.parametrize("enable_batch", (True, False))
-@pytest.mark.parametrize("op_type", ("read",))
+
+@pytest.mark.parametrize("engine_type", ("normal", "multhd"))
+@pytest.mark.parametrize(
+    "enable_sess",
+    (
+        True,
+        False,
+    ),
+)
+@pytest.mark.parametrize(
+    "enable_batch",
+    (
+        True,
+        False,
+    ),
+)
+@pytest.mark.parametrize(
+    "op_type",
+    (
+        "write",
+        "read",
+    ),
+)
 @pytest.mark.parametrize(
     "batch_size",
     (
@@ -188,7 +214,13 @@ def check_transfer_result(
         64,
     ),
 )
-@pytest.mark.parametrize("buffer_size", (8, 8192))
+@pytest.mark.parametrize(
+    "buffer_size",
+    (
+        8,
+        8192,
+    ),
+)
 def test_rdma_backend_ops(
     pre_connected_engine_pair,
     engine_type,
@@ -203,6 +235,8 @@ def test_rdma_backend_ops(
     initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
         engine_pair, [batch_size, buffer_size]
     )
+    initiator_tensor_copy = initiator_tensor.clone()
+    target_tensor_copy = target_tensor.clone()
 
     sess = initiator.create_session(initiator_mem, target_mem)
     offsets = [i * buffer_size for i in range(batch_size)]
@@ -212,10 +246,12 @@ def test_rdma_backend_ops(
     if enable_batch:
         if enable_sess:
             transfer_uid = sess.allocate_transfer_uid()
-            transfer_status = sess.batch_read(offsets, offsets, sizes, transfer_uid)
+            func = sess.batch_read if op_type == "read" else sess.batch_write
+            transfer_status = func(offsets, offsets, sizes, transfer_uid)
         else:
             transfer_uid = initiator.allocate_transfer_uid()
-            transfer_status = initiator.batch_read(
+            func = initiator.batch_read if op_type == "read" else initiator.batch_write
+            transfer_status = func(
                 initiator_mem, offsets, target_mem, offsets, sizes, transfer_uid
             )
         uid_status_list.append((transfer_uid, transfer_status))
@@ -223,12 +259,12 @@ def test_rdma_backend_ops(
         for i in range(batch_size):
             if enable_sess:
                 transfer_uid = sess.allocate_transfer_uid()
-                transfer_status = sess.read(
-                    offsets[i], offsets[i], sizes[i], transfer_uid
-                )
+                func = sess.read if op_type == "read" else sess.write
+                transfer_status = func(offsets[i], offsets[i], sizes[i], transfer_uid)
             else:
                 transfer_uid = initiator.allocate_transfer_uid()
-                transfer_status = initiator.read(
+                func = initiator.read if op_type == "read" else initiator.write
+                transfer_status = func(
                     initiator_mem,
                     offsets[i],
                     target_mem,
@@ -243,8 +279,11 @@ def test_rdma_backend_ops(
             engine_pair,
             status,
             initiator_tensor,
+            initiator_tensor_copy,
             target_tensor,
+            target_tensor_copy,
             uid,
+            op_type,
         )
 
 

@@ -36,15 +36,11 @@ class IOEngineSession:
     def allocate_transfer_uid(self):
         return self._sess.AllocateTransferUniqueId()
 
-    def read(
-        self,
-        local_offset,
-        remote_offset,
-        size,
-        transfer_uid,
+    def _single_side_transfer(
+        self, func, local_offset, remote_offset, size, transfer_uid
     ):
         transfer_status = mori_cpp.TransferStatus()
-        self._sess.Read(
+        func(
             local_offset,
             remote_offset,
             size,
@@ -53,15 +49,17 @@ class IOEngineSession:
         )
         return transfer_status
 
-    def batch_read(
-        self,
-        local_offsets,
-        remote_offsets,
-        sizes,
-        transfer_uid,
+    def read(self, *args):
+        return self._single_side_transfer(self._sess.Read, *args)
+
+    def write(self, *args):
+        return self._single_side_transfer(self._sess.Write, *args)
+
+    def _batch_single_side_transfer(
+        self, func, local_offsets, remote_offsets, sizes, transfer_uid
     ):
         transfer_status = mori_cpp.TransferStatus()
-        self._sess.BatchRead(
+        func(
             local_offsets,
             remote_offsets,
             sizes,
@@ -69,6 +67,12 @@ class IOEngineSession:
             transfer_uid,
         )
         return transfer_status
+
+    def batch_read(self, *args):
+        return self._batch_single_side_transfer(self._sess.BatchRead, *args)
+
+    def batch_write(self, *args):
+        return self._batch_single_side_transfer(self._sess.BatchWrite, *args)
 
     def alive(self):
         return self._sess.Alive()
@@ -118,8 +122,9 @@ class IOEngine:
     def allocate_transfer_uid(self):
         return self._engine.AllocateTransferUniqueId()
 
-    def read(
+    def _single_side_transfer(
         self,
+        func,
         local_dest_mem_desc,
         local_offset,
         remote_src_mem_desc,
@@ -128,7 +133,7 @@ class IOEngine:
         transfer_uid,
     ):
         transfer_status = mori_cpp.TransferStatus()
-        self._engine.Read(
+        func(
             local_dest_mem_desc,
             local_offset,
             remote_src_mem_desc,
@@ -139,8 +144,15 @@ class IOEngine:
         )
         return transfer_status
 
-    def batch_read(
+    def read(self, *args):
+        return self._single_side_transfer(self._engine.Read, *args)
+
+    def write(self, *args):
+        return self._single_side_transfer(self._engine.Write, *args)
+
+    def _batch_single_side_transfer(
         self,
+        func,
         local_dest_mem_desc,
         local_offsets,
         remote_src_mem_desc,
@@ -149,7 +161,7 @@ class IOEngine:
         transfer_uid,
     ):
         transfer_status = mori_cpp.TransferStatus()
-        self._engine.BatchRead(
+        func(
             local_dest_mem_desc,
             local_offsets,
             remote_src_mem_desc,
@@ -159,6 +171,12 @@ class IOEngine:
             transfer_uid,
         )
         return transfer_status
+
+    def batch_read(self, *args):
+        return self._batch_single_side_transfer(self._engine.BatchRead, *args)
+
+    def batch_write(self, *args):
+        return self._batch_single_side_transfer(self._engine.BatchWrite, *args)
 
     def create_session(self, local_mem, remote_mem):
         mori_sess = self._engine.CreateSession(local_mem, remote_mem)

@@ -68,14 +68,28 @@ class BackendSession {
   BackendSession() = default;
   virtual ~BackendSession() = default;
 
-  virtual void Read(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
-                    TransferUniqueId id) = 0;
-  virtual void Write(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
-                     TransferUniqueId id) = 0;
+  virtual void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
+                         TransferStatus* status, TransferUniqueId id, bool isRead) = 0;
+  inline void Write(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
+                    TransferUniqueId id) {
+    ReadWrite(localOffset, remoteOffset, size, status, id, false);
+  }
+  inline void Read(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
+                   TransferUniqueId id) {
+    ReadWrite(localOffset, remoteOffset, size, status, id, true);
+  }
 
-  virtual void BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
-                         const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) = 0;
-
+  virtual void BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                              const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
+                              bool isRead) = 0;
+  inline void BatchWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                         const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
+    BatchReadWrite(localOffsets, remoteOffsets, sizes, status, id, false);
+  }
+  inline void BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                        const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
+    BatchReadWrite(localOffsets, remoteOffsets, sizes, status, id, true);
+  }
   virtual bool Alive() const = 0;
 };
 
@@ -93,16 +107,32 @@ class Backend {
   virtual void RegisterMemory(const MemoryDesc& desc) = 0;
   virtual void DeregisterMemory(const MemoryDesc& desc) = 0;
 
-  virtual void Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
-                    size_t remoteOffset, size_t size, TransferStatus* status,
-                    TransferUniqueId id) = 0;
-  virtual void Write(const MemoryDesc& localSrc, size_t localOffset, const MemoryDesc& remoteDest,
-                     size_t remoteOffset, size_t size, TransferStatus* status,
-                     TransferUniqueId id) = 0;
+  virtual void ReadWrite(const MemoryDesc& localDest, size_t localOffset,
+                         const MemoryDesc& remoteSrc, size_t remoteOffset, size_t size,
+                         TransferStatus* status, TransferUniqueId id, bool isRead) = 0;
+  inline void Write(const MemoryDesc& localSrc, size_t localOffset, const MemoryDesc& remoteDest,
+                    size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id) {
+    ReadWrite(localSrc, localOffset, remoteDest, remoteOffset, size, status, id, false);
+  }
+  inline void Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
+                   size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id) {
+    ReadWrite(localDest, localOffset, remoteSrc, remoteOffset, size, status, id, true);
+  }
 
-  virtual void BatchRead(const MemoryDesc& localDest, const SizeVec& localOffsets,
-                         const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
-                         const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) = 0;
+  virtual void BatchReadWrite(const MemoryDesc& localDest, const SizeVec& localOffsets,
+                              const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
+                              const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
+                              bool isRead) = 0;
+  inline void BatchWrite(const MemoryDesc& localSrc, const SizeVec& localOffsets,
+                         const MemoryDesc& remoteDest, const SizeVec& remoteOffsets,
+                         const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
+    BatchReadWrite(localSrc, localOffsets, remoteDest, remoteOffsets, sizes, status, id, false);
+  }
+  inline void BatchRead(const MemoryDesc& localDest, const SizeVec& localOffsets,
+                        const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
+                        const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
+    BatchReadWrite(localDest, localOffsets, remoteSrc, remoteOffsets, sizes, status, id, true);
+  }
 
   virtual BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote) = 0;
 

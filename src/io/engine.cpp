@@ -63,6 +63,17 @@ void IOEngineSession::BatchRead(const SizeVec& localOffsets, const SizeVec& remo
   }
 }
 
+void IOEngineSession::BatchWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                                 const SizeVec& sizes, TransferStatus* status,
+                                 TransferUniqueId id) {
+  MORI_IO_FUNCTION_TIMER;
+  backendSess->BatchWrite(localOffsets, remoteOffsets, sizes, status, id);
+  if (status->Failed()) {
+    MORI_IO_ERROR("Session batch read error {} message {}", status->CodeUint32(),
+                  status->Message());
+  }
+}
+
 bool IOEngineSession::Alive() { return backendSess->Alive(); }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -190,6 +201,18 @@ void IOEngine::BatchRead(const MemoryDesc& localDest, const SizeVec& localOffset
   Backend* backend = nullptr;
   SELECT_BACKEND_AND_RETURN_IF_NONE(localDest, remoteSrc, status, backend);
   backend->BatchRead(localDest, localOffsets, remoteSrc, remoteOffsets, sizes, status, id);
+  if (status->Failed()) {
+    MORI_IO_ERROR("Engine batch read error {} message {}", status->CodeUint32(), status->Message());
+  }
+}
+
+void IOEngine::BatchWrite(const MemoryDesc& localSrc, const SizeVec& localOffsets,
+                          const MemoryDesc& remoteDest, const SizeVec& remoteOffsets,
+                          const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
+  MORI_IO_FUNCTION_TIMER;
+  Backend* backend = nullptr;
+  SELECT_BACKEND_AND_RETURN_IF_NONE(localSrc, remoteDest, status, backend);
+  backend->BatchWrite(localSrc, localOffsets, remoteDest, remoteOffsets, sizes, status, id);
   if (status->Failed()) {
     MORI_IO_ERROR("Engine batch read error {} message {}", status->CodeUint32(), status->Message());
   }

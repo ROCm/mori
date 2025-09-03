@@ -364,6 +364,8 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("AllocateTransferUniqueId", &mori::io ::IOEngineSession::AllocateTransferUniqueId)
       .def("Read", &mori::io ::IOEngineSession::Read)
       .def("BatchRead", &mori::io ::IOEngineSession::BatchRead)
+      .def("Write", &mori::io ::IOEngineSession::Write)
+      .def("BatchWrite", &mori::io ::IOEngineSession::BatchWrite)
       .def("Alive", &mori::io ::IOEngineSession::Alive);
 
   py::class_<mori::io::IOEngine>(m, "IOEngine")
@@ -378,6 +380,8 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("AllocateTransferUniqueId", &mori::io ::IOEngine::AllocateTransferUniqueId)
       .def("Read", &mori::io ::IOEngine::Read)
       .def("BatchRead", &mori::io ::IOEngine::BatchRead)
+      .def("Write", &mori::io ::IOEngine::Write)
+      .def("BatchWrite", &mori::io ::IOEngine::BatchWrite)
       .def("CreateSession", &mori::io::IOEngine::CreateSession)
       .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus);
 }

@@ -539,12 +539,14 @@ RdmaBackendSession::RdmaBackendSession(const RdmaBackendConfig& config,
                                        Executor* exec)
     : config(config), local(l), remote(r), eps(e), executor(exec) {}
 
-void RdmaBackendSession::Read(size_t localOffset, size_t remoteOffset, size_t size,
-                              TransferStatus* status, TransferUniqueId id) {
+void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
+                                   TransferStatus* status, TransferUniqueId id, bool isRead) {
   status->SetCode(StatusCode::IN_PROGRESS);
   CqCallbackMeta* callbackMeta = new CqCallbackMeta(status, id, 1);
 
-  RdmaOpRet ret = RdmaRead(eps, local, localOffset, remote, remoteOffset, size, callbackMeta, id);
+  RdmaOpRet ret =
+      RdmaReadWrite(eps, local, localOffset, remote, remoteOffset, size, callbackMeta, id, isRead);
+
   assert(!ret.Init());
   if (ret.Failed() || ret.Succeeded()) {
     status->SetCode(ret.code);
@@ -555,37 +557,19 @@ void RdmaBackendSession::Read(size_t localOffset, size_t remoteOffset, size_t si
   }
 }
 
-void RdmaBackendSession::Write(size_t localOffset, size_t remoteOffset, size_t size,
-                               TransferStatus* status, TransferUniqueId id) {
-  status->SetCode(StatusCode::IN_PROGRESS);
-  CqCallbackMeta* callbackMeta = new CqCallbackMeta(status, id, 1);
-
-  RdmaOpRet ret = RdmaWrite(eps, local, localOffset, remote, remoteOffset, size, callbackMeta, id);
-  assert(!ret.Init());
-  if (ret.Failed() || ret.Succeeded()) {
-    status->SetCode(ret.code);
-    status->SetMessage(ret.message);
-  }
-  if (!ret.Failed()) {
-    RdmaNotifyTransfer(eps, status, id);
-  }
-}
-
-void RdmaBackendSession::BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
-                                   const SizeVec& sizes, TransferStatus* status,
-                                   TransferUniqueId id) {
+void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                                        const SizeVec& sizes, TransferStatus* status,
+                                        TransferUniqueId id, bool isRead) {
   status->SetCode(StatusCode::IN_PROGRESS);
   CqCallbackMeta* callbackMeta = new CqCallbackMeta(status, id, sizes.size());
   RdmaOpRet ret;
   if (executor) {
-    ExecutorReq req{
-        eps,          local, localOffsets,         remote, remoteOffsets, sizes,
-        callbackMeta, id,    config.postBatchSize, true /*isRead */
-    };
+    ExecutorReq req{eps,          local, localOffsets,         remote, remoteOffsets, sizes,
+                    callbackMeta, id,    config.postBatchSize, isRead};
     ret = executor->RdmaBatchReadWrite(req);
   } else {
-    ret = RdmaBatchRead(eps, local, localOffsets, remote, remoteOffsets, sizes, callbackMeta, id,
-                        config.postBatchSize);
+    ret = RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, callbackMeta,
+                             id, isRead, config.postBatchSize);
   }
 
   assert(!ret.Init());
@@ -649,25 +633,18 @@ void RdmaBackend::RegisterMemory(const MemoryDesc& desc) { server->RegisterMemor
 
 void RdmaBackend::DeregisterMemory(const MemoryDesc& desc) { server->DeregisterMemory(desc); }
 
-void RdmaBackend::Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
-                       size_t remoteOffset, size_t size, TransferStatus* status,
-                       TransferUniqueId id) {
+void RdmaBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
+                            const MemoryDesc& remoteSrc, size_t remoteOffset, size_t size,
+                            TransferStatus* status, TransferUniqueId id, bool isRead) {
   RdmaBackendSession sess;
   CreateSession(localDest, remoteSrc, sess);
-  return sess.Read(localOffset, remoteOffset, size, status, id);
+  return sess.ReadWrite(localOffset, remoteOffset, size, status, id, isRead);
 }
 
-void RdmaBackend::Write(const MemoryDesc& localSrc, size_t localOffset,
-                        const MemoryDesc& remoteDest, size_t remoteOffset, size_t size,
-                        TransferStatus* status, TransferUniqueId id) {
-  RdmaBackendSession sess;
-  CreateSession(localSrc, remoteDest, sess);
-  return sess.Write(localOffset, remoteOffset, size, status, id);
-}
-
-void RdmaBackend::BatchRead(const MemoryDesc& localDest, const SizeVec& localOffsets,
-                            const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
-                            const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
+void RdmaBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& localOffsets,
+                                 const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
+                                 const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
+                                 bool isRead) {
   assert(localOffsets.size() == remoteOffsets.size());
   assert(sizes.size() == remoteOffsets.size());
   size_t batchSize = sizes.size();
@@ -678,7 +655,7 @@ void RdmaBackend::BatchRead(const MemoryDesc& localDest, const SizeVec& localOff
 
   RdmaBackendSession sess;
   CreateSession(localDest, remoteSrc, sess);
-  return sess.BatchRead(localOffsets, remoteOffsets, sizes, status, id);
+  return sess.BatchReadWrite(localOffsets, remoteOffsets, sizes, status, id, isRead);
 }
 
 BackendSession* RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote) {

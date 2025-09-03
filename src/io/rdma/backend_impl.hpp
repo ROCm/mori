@@ -191,13 +191,12 @@ class RdmaBackendSession : public BackendSession {
                      Executor* executor);
   ~RdmaBackendSession() = default;
 
-  void Read(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
-            TransferUniqueId id);
-  void Write(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
-             TransferUniqueId id);
+  void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
+                 TransferUniqueId id, bool isRead);
 
-  void BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets, const SizeVec& sizes,
-                 TransferStatus* status, TransferUniqueId id);
+  void BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                      const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
+                      bool isRead);
 
   bool Alive() const;
 
@@ -222,13 +221,13 @@ class RdmaBackend : public Backend {
   void DeregisterRemoteEngine(const EngineDesc&);
   void RegisterMemory(const MemoryDesc& desc);
   void DeregisterMemory(const MemoryDesc& desc);
-  void Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
-            size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id);
-  void Write(const MemoryDesc& localSrc, size_t localOffset, const MemoryDesc& remoteDest,
-             size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id);
-  void BatchRead(const MemoryDesc& localDest, const SizeVec& localOffsets,
-                 const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets, const SizeVec& sizes,
-                 TransferStatus* status, TransferUniqueId id);
+  void ReadWrite(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
+                 size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id,
+                 bool isRead);
+  void BatchReadWrite(const MemoryDesc& localDest, const SizeVec& localOffsets,
+                      const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
+                      const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
+                      bool isRead);
   // TODO: batch write
   // TODO: send / recv
   BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote);

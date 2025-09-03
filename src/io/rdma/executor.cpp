@@ -70,10 +70,10 @@ void MultithreadExecutor::Worker::MainLoop() {
         SizeVec tRemoteOffsets(task.req.remoteOffsets.begin() + task.begin,
                                task.req.remoteOffsets.begin() + task.end);
         SizeVec tSizes(task.req.sizes.begin() + task.begin, task.req.sizes.begin() + task.end);
-        task.ret = mori::io::RdmaBatchReadWrite(
-            {task.req.eps[task.epId]}, task.req.local, tLoclOffsets, task.req.remote,
-            tRemoteOffsets, tSizes, task.req.callbackMeta, task.req.id, task.req.isRead,
-            task.expectedNumCqe, task.req.postBatchSize);
+        task.ret = mori::io::RdmaBatchReadWrite({task.req.eps[task.epId]}, task.req.local,
+                                                tLoclOffsets, task.req.remote, tRemoteOffsets,
+                                                tSizes, task.req.callbackMeta, task.req.id,
+                                                task.req.isRead, task.req.postBatchSize);
         MORI_IO_TRACE("Worker {} execute task {} begin {} end {} ret code {}", workerId,
                       task.req.id, task.begin, task.end, static_cast<uint32_t>(task.ret.code));
       }
@@ -134,7 +134,7 @@ RdmaOpRet MultithreadExecutor::RdmaBatchReadWrite(const ExecutorReq& req) {
   std::vector<RdmaOpRet> rets(numSplits);
 
   for (int i = 0; i < numSplits; i++) {
-    pool[i]->Submit({req, rets[i], i, splits[i].first, splits[i].second, numSplits});
+    pool[i]->Submit({req, rets[i], i, splits[i].first, splits[i].second});
   }
 
   bool hasFail = false;

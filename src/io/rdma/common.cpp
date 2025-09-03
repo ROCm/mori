@@ -64,7 +64,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
                              const application::RdmaMemoryRegion& remote,
                              const SizeVec& remoteOffsets, const SizeVec& sizes,
                              CqCallbackMeta* callbackMeta, TransferUniqueId id, bool isRead,
-                             int expectedNumCqe, int postBatchSize) {
+                             int postBatchSize) {
   MORI_IO_FUNCTION_TIMER;
 
   // Check sizes

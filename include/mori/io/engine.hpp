@@ -58,6 +58,8 @@ class IOEngineSession {
 
   void BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets, const SizeVec& sizes,
                  TransferStatus* status, TransferUniqueId id);
+  void BatchWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets, const SizeVec& sizes,
+                  TransferStatus* status, TransferUniqueId id);
   bool Alive();
 
   friend class IOEngine;
@@ -94,7 +96,9 @@ class IOEngine {
   void BatchRead(const MemoryDesc& localDest, const SizeVec& localOffsets,
                  const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets, const SizeVec& sizes,
                  TransferStatus* status, TransferUniqueId id);
-
+  void BatchWrite(const MemoryDesc& localSrc, const SizeVec& localOffsets,
+                  const MemoryDesc& remoteDest, const SizeVec& remoteOffsets, const SizeVec& sizes,
+                  TransferStatus* status, TransferUniqueId id);
   // Take the transfer status of an inbound op
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
 

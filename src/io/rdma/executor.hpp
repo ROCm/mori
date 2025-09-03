@@ -81,7 +81,6 @@ class MultithreadExecutor : public Executor {
     int epId{-1};
     int begin{-1};
     int end{-1};
-    int expectedNumCqe{-1};
   };
 
   std::vector<std::pair<int, int>> SplitWork(const ExecutorReq& req);
