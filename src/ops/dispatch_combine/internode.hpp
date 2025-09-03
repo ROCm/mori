@@ -314,7 +314,9 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
       args.srcPeTokenIdxMap[peSortedId] = localTokenIdx;
     }
   }
-  SyncIfDebugEnabled("Dispatch kernel: kernel end");
+  shmem::ShmemQuietThread();
+  __syncthreads();
+  // SyncIfDebugEnabled("Dispatch kernel: kernel end");
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -483,10 +485,7 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
   // Make sure copy on all GPUs are finished
   CrossDeviceBarrierInterNodeKernel(args);
-  if (localBlockId == 0 && warpId == 0) {
-    shmem::ShmemQuietThread(srcPe);
-  }
-  
+  shmem::ShmemQuietThread();
   if (globalThdId < npes) {
     args.recvTokenNumMemObj->template GetAs<index_t*>()[globalThdId] = 0;
   }
