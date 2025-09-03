@@ -86,15 +86,15 @@ struct EpDispatchCombineConfig {
   bool useExternalInpBuffer{true};
 
   inline __host__ __device__ int MaxNumTokensToSendPerRank() const {
-    return maxNumInpTokenPerRank * numExpertPerToken;
+    return maxNumInpTokenPerRank;
   }
 
   inline __host__ __device__ int MaxNumTokensToSend() const {
-    return worldSize * maxNumInpTokenPerRank * numExpertPerToken;
+    return worldSize * MaxNumTokensToSendPerRank();
   }
 
   inline __host__ __device__ int MaxNumTokensToRecvPerRank() const {
-    return maxNumInpTokenPerRank * std::min(numExpertPerRank, numExpertPerToken);
+    return maxNumInpTokenPerRank;
   }
 
   inline __host__ __device__ int MaxNumTokensToRecv() const {
