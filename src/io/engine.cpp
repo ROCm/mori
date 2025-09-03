@@ -69,7 +69,7 @@ void IOEngineSession::BatchWrite(const SizeVec& localOffsets, const SizeVec& rem
   MORI_IO_FUNCTION_TIMER;
   backendSess->BatchWrite(localOffsets, remoteOffsets, sizes, status, id);
   if (status->Failed()) {
-    MORI_IO_ERROR("Session batch read error {} message {}", status->CodeUint32(),
+    MORI_IO_ERROR("Session batch write error {} message {}", status->CodeUint32(),
                   status->Message());
   }
 }
