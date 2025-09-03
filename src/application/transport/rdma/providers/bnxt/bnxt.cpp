@@ -11,7 +11,7 @@
 
 namespace mori {
 namespace application {
-
+#ifdef ENABLE_BNXT
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          BnxtCqContainer */
 /* ---------------------------------------------------------------------------------------------- */
@@ -93,7 +93,6 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   memset(&qpMemInfo, 0, sizeof(struct bnxt_re_dv_qp_mem_info));
   err = bnxt_re_dv_qp_mem_alloc(pd, &ib_qp_attr, &qpMemInfo);
   assert(!err);
-  fflush(stdout); 
 
   // sqUmemAddr
   if (config.onGpu) {
@@ -151,7 +150,6 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   umem_attr.access_flags = IBV_ACCESS_LOCAL_WRITE;
   sqUmem = dv_qp_attr.sq_umem_handle = bnxt_re_dv_umem_reg(context, &umem_attr);
   assert(sqUmem);
-  fflush(stdout); 
 
   memset(&umem_attr, 0, sizeof(struct bnxt_re_dv_umem_reg_attr));
   umem_attr.addr = rqUmemAddr;
@@ -159,10 +157,8 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   umem_attr.access_flags = IBV_ACCESS_LOCAL_WRITE;
   rqUmem = dv_qp_attr.rq_umem_handle = bnxt_re_dv_umem_reg(context, &umem_attr);
   assert(rqUmem);
-  fflush(stdout); 
 
   qp = bnxt_re_dv_create_qp(pd, &dv_qp_attr);
-  fflush(stdout); 
   assert(qp);
   qpn = qp->qp_num;
   std::cout << qpMemInfo << std::endl;
@@ -274,7 +270,7 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   ibv_context* context = GetIbvContext();
 
   BnxtCqContainer* cq = new BnxtCqContainer(context, config);
-  
+
   BnxtQpContainer* qp = new BnxtQpContainer(context, config, cq->cq, pd);
   int ret;
 
@@ -355,6 +351,7 @@ RdmaDeviceContext* BnxtDevice::CreateRdmaDeviceContext() {
   ibv_pd* pd = ibv_alloc_pd(defaultContext);
   return new BnxtDeviceContext(this, pd);
 }
+#endif
 
 }  // namespace application
 }  // namespace mori

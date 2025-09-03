@@ -113,9 +113,11 @@ __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMe
       case ProviderType::MLX5:
         SendThreadKernel<ProviderType::MLX5>(epSend, mrSend, msgSize, msgNum);
         break;
+#ifdef ENABLE_BNXT        
       case ProviderType::BNXT:
         SendThreadKernel<ProviderType::BNXT>(epSend, mrSend, msgSize, msgNum);
         break;
+#endif        
       default:
         // unsupported provider
         break;
@@ -126,9 +128,11 @@ __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMe
       case ProviderType::MLX5:
         RecvThreadKernel<ProviderType::MLX5>(epRecv, mrRecv, msgSize, msgNum);
         break;
+#ifdef ENABLE_BNXT        
       case ProviderType::BNXT:
         RecvThreadKernel<ProviderType::BNXT>(epRecv, mrRecv, msgSize, msgNum);
         break;
+#endif        
       default:
         // unsupported provider
         break;

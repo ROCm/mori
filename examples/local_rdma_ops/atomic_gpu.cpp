@@ -39,17 +39,17 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion sendMr,
   atomicType amoOp = AMO_COMPARE_SWAP;
   uint32_t value = 2;
 
-  uint64_t dbr_val = PostAtomic<P, uint32_t>(
-      epSend.wqHandle, epSend.handle.qpn, sendMr.addr,
-      sendMr.lkey, recvMr.addr, recvMr.rkey, value, 0, amoOp);
+  uint64_t dbr_val =
+      PostAtomic<P, uint32_t>(epSend.wqHandle, epSend.handle.qpn, sendMr.addr, sendMr.lkey,
+                              recvMr.addr, recvMr.rkey, value, 0, amoOp);
   UpdateSendDbrRecord<P>(epSend.wqHandle.dbrRecAddr, epSend.wqHandle.postIdx);
   __threadfence_system();
   RingDoorbell<P>(epSend.wqHandle.dbrAddr, dbr_val);
   __threadfence_system();
 
   uint16_t wqeCounter;
-  int opcode = PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum,
-                                          &epSend.cqHandle.consIdx, &wqeCounter);
+  int opcode = PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum, &epSend.cqHandle.consIdx,
+                         &wqeCounter);
   UpdateCqDbrRecord<P>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx, epSend.cqHandle.cqeNum);
   printf("wqeCounter = %hu\n", wqeCounter);
   // printf("send block is done, opcode is %d postIdx %u consIdx %u\n", opcode,
@@ -63,24 +63,25 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion sendMr,
   __threadfence_system();
   epSend.cqHandle.consIdx += 1;
   opcode = PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum, &epSend.cqHandle.consIdx,
-                         &wqeCounter);
+                     &wqeCounter);
   UpdateCqDbrRecord<P>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx, epSend.cqHandle.cqeNum);
   printf("wqeCounter = %hu\n", wqeCounter);
-  printf("send block is done, opcode is %d postIdx %u consIdx %u\n", opcode, epSend.wqHandle.postIdx, epSend.cqHandle.consIdx);
+  printf("send block is done, opcode is %d postIdx %u consIdx %u\n", opcode,
+         epSend.wqHandle.postIdx, epSend.cqHandle.consIdx);
 }
 
 __device__ void RecvThreadKernel(RdmaEndpoint& epRecv, RdmaMemoryRegion mr) {
   uint32_t postIdx = 0;
   uint32_t* addr = reinterpret_cast<uint32_t*>(mr.addr);
   uint32_t val = core::AtomicLoadSeqCst(addr);
-  printf("val = %u\n",val);
+  printf("val = %u\n", val);
   while (val != 2) {
     val = core::AtomicLoadSeqCst(addr);
-    printf("after compare and swap val = %u\n",val);
+    printf("after compare and swap val = %u\n", val);
   }
   while (val != 4) {
     val = core::AtomicLoadSeqCst(addr);
-    printf("after fetch add val = %u\n",val);
+    printf("after fetch add val = %u\n", val);
   }
 }
 
@@ -95,9 +96,11 @@ __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMe
       case ProviderType::MLX5:
         SendThreadKernel<ProviderType::MLX5>(epSend, mrSend, mrRecv);
         break;
+#ifdef ENABLE_BNXT
       case ProviderType::BNXT:
         SendThreadKernel<ProviderType::BNXT>(epSend, mrSend, mrRecv);
         break;
+#endif  // ENABLE_BNXT
       default:
         // unsupported provider
         break;
@@ -162,11 +165,11 @@ void LocalRdmaOps() {
 
   SendRecvOnGpu<<<2, 1>>>(*devEpSend, *devEpRecv, mrSend, mrRecv);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-  uint32_t valueSend, valueRecv; 
+  uint32_t valueSend, valueRecv;
   HIP_RUNTIME_CHECK(hipMemcpy(&valueRecv, recvBuf, sizeof(uint32_t), hipMemcpyDeviceToHost));
-  std::cout << "After atomic op recv value = " << valueRecv << std::endl;  
+  std::cout << "After atomic op recv value = " << valueRecv << std::endl;
   HIP_RUNTIME_CHECK(hipMemcpy(&valueSend, sendBuf, sizeof(uint32_t), hipMemcpyDeviceToHost));
-  std::cout << "After atomic op send value = " << valueSend << std::endl;  
+  std::cout << "After atomic op send value = " << valueSend << std::endl;
 
   // 8 Finalize
   deviceContextSend->DeregisterRdmaMemoryRegion(sendBuf);

@@ -56,12 +56,14 @@ class CMakeBuild(build_ext):
 
         build_type = os.environ.get("CMAKE_BUILD_TYPE", "Release")
         unroll_value = os.environ.get("WARP_ACCUM_UNROLL", "1")
+        use_bnxt = os.environ.get("USE_BNXT", "OFF")
         subprocess.check_call(
             [
                 "cmake",
                 "-DUSE_ROCM=ON",
                 f"-DCMAKE_BUILD_TYPE={build_type}",
                 f"-DWARP_ACCUM_UNROLL={unroll_value}",
+                f"-DUSE_BNXT={use_bnxt}",
                 "-B",
                 str(build_dir),
                 "-S",

@@ -28,9 +28,9 @@
 #include <unordered_set>
 
 #include "infiniband/verbs.h"
+#include "mori/application/transport/rdma/providers/bnxt/bnxt.hpp"
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
-#include "mori/application/transport/rdma/providers/bnxt/bnxt.hpp"
 
 namespace mori {
 namespace application {
@@ -223,9 +223,11 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
       case (static_cast<uint32_t>(RdmaDeviceVendorId::Mellanox)):
         return new Mlx5Device(inDevice);
         break;
+#ifdef ENABLE_BNXT
       case (static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)):
         return new BnxtDevice(inDevice);
         break;
+#endif
       default:
         return nullptr;
     }

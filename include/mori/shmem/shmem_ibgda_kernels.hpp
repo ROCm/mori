@@ -32,30 +32,34 @@
 namespace mori {
 namespace shmem {
 
-// TODO: Temporary compilation solution
-#define ENABLE_MLX5 0
-#define ENABLE_BNXT 1
+#ifdef ENABLE_BNXT
+#define DISPATCH_MLX5 0
+#define DISPATCH_BNXT 1
+#else
+#define DISPATCH_MLX5 1
+#define DISPATCH_BNXT 0
+#endif
 
-#define DISPATCH_PROVIDER_TYPE(func, ...)                           \
-  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();             \
-  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;   \
-  core::ProviderType prvdType = ep[pe].GetProviderType();           \
-  if (ENABLE_MLX5 && prvdType == core::ProviderType::MLX5) {        \
-    func<core::ProviderType::MLX5>(__VA_ARGS__);                    \
-  } else if (ENABLE_BNXT && prvdType == core::ProviderType::BNXT) { \
-    func<core::ProviderType::BNXT>(__VA_ARGS__);                    \
-  } else {                                                          \
-    assert(false && "Unsupported or disabled provider type");       \
+#define DISPATCH_PROVIDER_TYPE(func, ...)                             \
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();               \
+  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;     \
+  core::ProviderType prvdType = ep[pe].GetProviderType();             \
+  if (DISPATCH_MLX5 && prvdType == core::ProviderType::MLX5) {        \
+    func<core::ProviderType::MLX5>(__VA_ARGS__);                      \
+  } else if (DISPATCH_BNXT && prvdType == core::ProviderType::BNXT) { \
+    func<core::ProviderType::BNXT>(__VA_ARGS__);                      \
+  } else {                                                            \
+    assert(false && "Unsupported or disabled provider type");         \
   }
 
-#define DISPATCH_PROVIDER_TYPE_EP(ep, func, ...)                    \
-  core::ProviderType prvdType = ep[pe].GetProviderType();           \
-  if (ENABLE_MLX5 && prvdType == core::ProviderType::MLX5) {        \
-    func<core::ProviderType::MLX5>(__VA_ARGS__);                    \
-  } else if (ENABLE_BNXT && prvdType == core::ProviderType::BNXT) { \
-    func<core::ProviderType::BNXT>(__VA_ARGS__);                    \
-  } else {                                                          \
-    assert(false && "Unsupported or disabled provider type");       \
+#define DISPATCH_PROVIDER_TYPE_EP(ep, func, ...)                      \
+  core::ProviderType prvdType = ep[pe].GetProviderType();             \
+  if (DISPATCH_MLX5 && prvdType == core::ProviderType::MLX5) {        \
+    func<core::ProviderType::MLX5>(__VA_ARGS__);                      \
+  } else if (DISPATCH_BNXT && prvdType == core::ProviderType::BNXT) { \
+    func<core::ProviderType::BNXT>(__VA_ARGS__);                      \
+  } else {                                                            \
+    assert(false && "Unsupported or disabled provider type");         \
   }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -104,7 +108,7 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe) {
         printf("rank %d dest pe %d consIdx %d opcode %d\n", rank, pe, my_cq_index, opcode);
         assert(false);
       }
-      wqe_counter = (BNXT_RE_NUM_SLOT_PER_WQE * (wqe_counter + wq.sqWqeNum -1 ) % wq.sqWqeNum);
+      wqe_counter = (BNXT_RE_NUM_SLOT_PER_WQE * (wqe_counter + wq.sqWqeNum - 1) % wq.sqWqeNum);
       wqe_id = wq.outstandingWqe[wqe_counter] + BNXT_RE_NUM_SLOT_PER_WQE;
     }
 

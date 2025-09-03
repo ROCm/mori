@@ -1,16 +1,18 @@
 #pragma once
-
+#ifdef ENABLE_BNXT
 // #include <infiniband/bnxt_re_dv.h>
 extern "C" {
 #include <infiniband/bnxt_re_dv.h>
 #include <infiniband/bnxt_re_hsi.h>
 }
+#endif  // ENABLE_BNXT
+
 #include "mori/application/transport/rdma/rdma.hpp"
 
 namespace mori {
 namespace application {
 
-
+#ifdef ENABLE_BNXT
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Device Attributes                                       */
 /* ---------------------------------------------------------------------------------------------- */
@@ -52,7 +54,8 @@ class BnxtQpContainer {
 
   void ModifyRst2Init();
   void ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr);
-  void ModifyRtr2Rts(const RdmaEndpointHandle& local_handle, const RdmaEndpointHandle& remote_handle);
+  void ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
+                     const RdmaEndpointHandle& remote_handle);
 
   void* GetSqAddress();
   void* GetMsntblAddress();
@@ -108,11 +111,12 @@ class BnxtDevice : public RdmaDevice {
 
   RdmaDeviceContext* CreateRdmaDeviceContext() override;
 };
-
+#endif  // ENABLE_BNXT
 }  // namespace application
 }  // namespace mori
 
 namespace std {
+#ifdef ENABLE_BNXT
 static std::ostream& operator<<(std::ostream& s, const bnxt_re_dv_qp_mem_info& m) {
   std::stringstream ss;
   ss << "qp_handle: 0x" << std::hex << m.qp_handle << std::dec << "  sq_va: 0x" << std::hex
@@ -124,4 +128,5 @@ static std::ostream& operator<<(std::ostream& s, const bnxt_re_dv_qp_mem_info& m
   s << ss.str();
   return s;
 }
+#endif  // ENABLE_BNXT
 }  // namespace std

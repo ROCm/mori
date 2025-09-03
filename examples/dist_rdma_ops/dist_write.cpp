@@ -349,10 +349,12 @@ void distRdmaOps(int argc, char* argv[]) {
           Write<ProviderType::MLX5><<<blocks, threads>>>(devEndpoint, global_mr_handles[0],
                                                          global_mr_handles[1], size, 1);
           break;
+#ifdef ENABLE_BNXT
         case ProviderType::BNXT:
           Write<ProviderType::BNXT><<<blocks, threads>>>(devEndpoint, global_mr_handles[0],
                                                          global_mr_handles[1], size, 1);
           break;
+#endif
         default:
           break;
       }
@@ -375,10 +377,12 @@ void distRdmaOps(int argc, char* argv[]) {
           Write<ProviderType::MLX5><<<blocks, threads>>>(devEndpoint, global_mr_handles[0],
                                                          global_mr_handles[1], size, warmupIters);
           break;
+#ifdef ENABLE_BNXT
         case ProviderType::BNXT:
           Write<ProviderType::BNXT><<<blocks, threads>>>(devEndpoint, global_mr_handles[0],
                                                          global_mr_handles[1], size, warmupIters);
           break;
+#endif
         default:
           break;
       }
@@ -391,10 +395,12 @@ void distRdmaOps(int argc, char* argv[]) {
           Write<ProviderType::MLX5><<<blocks, threads>>>(devEndpoint, global_mr_handles[0],
                                                          global_mr_handles[1], size, iters);
           break;
+#ifdef ENABLE_BNXT
         case ProviderType::BNXT:
           Write<ProviderType::BNXT><<<blocks, threads>>>(devEndpoint, global_mr_handles[0],
                                                          global_mr_handles[1], size, iters);
           break;
+#endif
         default:
           break;
       }

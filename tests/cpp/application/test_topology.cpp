@@ -43,7 +43,7 @@ int TestTopoNodeGpu() {
         printf("gpu %s nic %s no direct link\n", gpu->busId.String().c_str(),
                nic->busId.String().c_str());
       } else {
-        printf("gpu %s nic %s %s hops %d\n", gpu->busId.String().c_str(),
+        printf("gpu %s nic %s %s hops %zu\n", gpu->busId.String().c_str(),
                nic->busId.String().c_str(), nic->name.c_str(), path->Hops());
       }
     }
