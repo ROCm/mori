@@ -314,7 +314,9 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
       args.srcPeTokenIdxMap[peSortedId] = localTokenIdx;
     }
   }
-  SyncIfDebugEnabled("Dispatch kernel: kernel end");
+  shmem::ShmemQuietThread();
+  __syncthreads();
+  // SyncIfDebugEnabled("Dispatch kernel: kernel end");
 }
 
 /* ---------------------------------------------------------------------------------------------- */
