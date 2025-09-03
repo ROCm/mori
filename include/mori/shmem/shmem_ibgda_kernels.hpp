@@ -121,6 +121,10 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe) {
 
 template <core::ProviderType PrvdType>
 inline __device__ void ShmemQuietThreadKernelImpl(int pe) {
+  if constexpr (PrvdType == core::ProviderType::BNXT) {
+    ShmemQuietThreadKernelSerialImpl<PrvdType>(pe);
+    return;
+  }
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   core::CompletionQueueHandle& cq = ep[pe].cqHandle;
@@ -219,7 +223,7 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(
   int worldSize = globalGpuStates->worldSize;
   for (int pe = blockIdx.x; pe < worldSize; pe += gridDim.x) {
     if (pe != rank && globalGpuStates->transportTypes[pe] == application::TransportType::RDMA) {
-      DISPATCH_PROVIDER_TYPE_EP(ep, ShmemQuietThreadKernelSerialImpl, pe);
+      DISPATCH_PROVIDER_TYPE_EP(ep, ShmemQuietThreadKernelImpl, pe);
     }
   }
 }
@@ -231,7 +235,7 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(
   int rank = globalGpuStates->rank;
   if (pe == rank) return;
   if (globalGpuStates->transportTypes[pe] != application::TransportType::RDMA) return;
-  DISPATCH_PROVIDER_TYPE_EP(ep, ShmemQuietThreadKernelSerialImpl, pe);
+  DISPATCH_PROVIDER_TYPE_EP(ep, ShmemQuietThreadKernelImpl, pe);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -330,7 +334,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
     if (num_free_entries > num_entries_until_warp_last_entry) {
       break;
     }
-    ShmemQuietThreadKernelSerialImpl<PrvdType>(pe);
+    ShmemQuietThreadKernelImpl<PrvdType>(pe);
   }
   uint64_t dbr_val;
   if constexpr (PrvdType == core::ProviderType::MLX5) {
@@ -467,7 +471,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
     if (num_free_entries > num_entries_until_warp_last_entry) {
       break;
     }
-    ShmemQuietThreadKernelSerialImpl<PrvdType>(pe);
+    ShmemQuietThreadKernelImpl<PrvdType>(pe);
   }
 
   uint64_t dbr_val;
