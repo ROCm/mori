@@ -47,7 +47,8 @@ enum class StatusCode : uint32_t {
   ERR_BEGIN = 10,
   ERR_INVALID_ARGS = 11,
   ERR_NOT_FOUND = 12,
-  ERR_RDMA_OP = 13
+  ERR_RDMA_OP = 13,
+  ERR_BAD_STATE = 14
 };
 
 }  // namespace io

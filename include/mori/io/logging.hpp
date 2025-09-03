@@ -47,20 +47,20 @@ class ScopedTimer {
  public:
   using Clock = std::chrono::steady_clock;
 
-  explicit ScopedTimer(std::string name) : name_(std::move(name)), start_(Clock::now()) {}
+  explicit ScopedTimer(const std::string& n) : name(n), start(Clock::now()) {}
 
   ~ScopedTimer() {
     auto end = Clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start_).count();
-    MORI_IO_DEBUG("ScopedTimer [{}] took {} ns", name_, duration);
+    auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+    MORI_IO_DEBUG("ScopedTimer [{}] took {} ns", name, duration);
   }
 
   ScopedTimer(const ScopedTimer&) = delete;
   ScopedTimer& operator=(const ScopedTimer&) = delete;
 
  private:
-  std::string name_;
-  Clock::time_point start_;
+  std::string name;
+  Clock::time_point start;
 };
 
 #define MORI_IO_FUNCTION_TIMER ScopedTimer instance(__func__)

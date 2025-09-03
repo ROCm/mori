@@ -35,18 +35,22 @@ from mori.io import (
 )
 
 
-@pytest.fixture(scope="module")
-def pre_connected_engine_pair():
-    set_log_level("info")
+def create_connected_engine_pair(
+    name_prefix, qp_per_transfer, post_batch_size, num_worker_threads
+):
     config = IOEngineConfig(
         host="127.0.0.1",
         port=get_free_port(),
     )
-    initiator = IOEngine(key="initiator", config=config)
+    initiator = IOEngine(key=f"{name_prefix}_initiator", config=config)
     config.port = get_free_port()
-    target = IOEngine(key="target", config=config)
+    target = IOEngine(key=f"{name_prefix}_target", config=config)
 
-    config = RdmaBackendConfig(qp_per_transfer=2, post_batch_size=16)
+    config = RdmaBackendConfig(
+        qp_per_transfer=qp_per_transfer,
+        post_batch_size=post_batch_size,
+        num_worker_threads=num_worker_threads,
+    )
     initiator.create_backend(BackendType.RDMA, config)
     target.create_backend(BackendType.RDMA, config)
 
@@ -56,10 +60,26 @@ def pre_connected_engine_pair():
     initiator.register_remote_engine(target_desc)
     target.register_remote_engine(initiator_desc)
 
-    yield (initiator, target)
+    return initiator, target
 
-    del initiator
-    del target
+
+@pytest.fixture(scope="module")
+def pre_connected_engine_pair():
+    set_log_level("info")
+    initiator, target = create_connected_engine_pair(
+        "normal", qp_per_transfer=2, post_batch_size=-1, num_worker_threads=1
+    )
+    multhd_initiator, multhd_target = create_connected_engine_pair(
+        "multhd", qp_per_transfer=2, post_batch_size=-1, num_worker_threads=2
+    )
+
+    engines = {
+        "normal": (initiator, target),
+        "multhd": (multhd_initiator, multhd_target),
+    }
+    yield engines
+
+    del initiator, target
 
 
 def test_engine_desc():
@@ -126,8 +146,8 @@ def wait_inbound_status(engine, remote_engine_key, remote_transfer_uid):
             return target_side_status
 
 
-def alloc_and_register_mem(pre_connected_engine_pair, shape):
-    initiator, target = pre_connected_engine_pair
+def alloc_and_register_mem(engine_pair, shape):
+    initiator, target = engine_pair
 
     # register memory buffer
     device1 = torch.device("cuda", 0)
@@ -141,13 +161,16 @@ def alloc_and_register_mem(pre_connected_engine_pair, shape):
 
 
 def check_transfer_result(
-    pre_connected_engine_pair,
+    engine_pair,
     initiator_status,
     initiator_tensor,
+    initiator_tensor_copy,
     target_tensor,
+    target_tensor_copy,
     transfer_uid,
+    op_type,
 ):
-    initiator, target = pre_connected_engine_pair
+    initiator, target = engine_pair
     wait_status(initiator_status)
     target_status = wait_inbound_status(
         target, initiator.get_engine_desc().key, transfer_uid
@@ -156,24 +179,64 @@ def check_transfer_result(
     assert target_status.Succeeded()
     assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
 
+    if op_type == "read":
+        assert not torch.equal(initiator_tensor.cpu(), initiator_tensor_copy.cpu())
+    else:
+        assert not torch.equal(target_tensor.cpu(), target_tensor_copy.cpu())
 
-@pytest.mark.parametrize("enable_sess", (True, False))
-@pytest.mark.parametrize("enable_batch", (True, False))
-@pytest.mark.parametrize("op_type", ("read",))
-@pytest.mark.parametrize("batch_size", (1, 64))
-@pytest.mark.parametrize("buffer_size", (8, 8192))
+
+@pytest.mark.parametrize("engine_type", ("normal", "multhd"))
+@pytest.mark.parametrize(
+    "enable_sess",
+    (
+        True,
+        False,
+    ),
+)
+@pytest.mark.parametrize(
+    "enable_batch",
+    (
+        True,
+        False,
+    ),
+)
+@pytest.mark.parametrize(
+    "op_type",
+    (
+        "write",
+        "read",
+    ),
+)
+@pytest.mark.parametrize(
+    "batch_size",
+    (
+        1,
+        64,
+    ),
+)
+@pytest.mark.parametrize(
+    "buffer_size",
+    (
+        8,
+        8192,
+    ),
+)
 def test_rdma_backend_ops(
     pre_connected_engine_pair,
+    engine_type,
     enable_sess,
     enable_batch,
     op_type,
     batch_size,
     buffer_size,
 ):
-    initiator, target = pre_connected_engine_pair
+    engine_pair = pre_connected_engine_pair[engine_type]
+    initiator, target = engine_pair
     initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
-        pre_connected_engine_pair, [batch_size, buffer_size]
+        engine_pair, [batch_size, buffer_size]
     )
+    initiator_tensor_copy = initiator_tensor.clone()
+    target_tensor_copy = target_tensor.clone()
 
     sess = initiator.create_session(initiator_mem, target_mem)
     offsets = [i * buffer_size for i in range(batch_size)]
@@ -183,10 +246,12 @@ def test_rdma_backend_ops(
     if enable_batch:
         if enable_sess:
             transfer_uid = sess.allocate_transfer_uid()
-            transfer_status = sess.batch_read(offsets, offsets, sizes, transfer_uid)
+            func = sess.batch_read if op_type == "read" else sess.batch_write
+            transfer_status = func(offsets, offsets, sizes, transfer_uid)
         else:
             transfer_uid = initiator.allocate_transfer_uid()
-            transfer_status = initiator.batch_read(
+            func = initiator.batch_read if op_type == "read" else initiator.batch_write
+            transfer_status = func(
                 initiator_mem, offsets, target_mem, offsets, sizes, transfer_uid
             )
         uid_status_list.append((transfer_uid, transfer_status))
@@ -194,12 +259,12 @@ def test_rdma_backend_ops(
         for i in range(batch_size):
             if enable_sess:
                 transfer_uid = sess.allocate_transfer_uid()
-                transfer_status = sess.read(
-                    offsets[i], offsets[i], sizes[i], transfer_uid
-                )
+                func = sess.read if op_type == "read" else sess.write
+                transfer_status = func(offsets[i], offsets[i], sizes[i], transfer_uid)
             else:
                 transfer_uid = initiator.allocate_transfer_uid()
-                transfer_status = initiator.read(
+                func = initiator.read if op_type == "read" else initiator.write
+                transfer_status = func(
                     initiator_mem,
                     offsets[i],
                     target_mem,
@@ -211,18 +276,22 @@ def test_rdma_backend_ops(
 
     for uid, status in uid_status_list:
         check_transfer_result(
-            pre_connected_engine_pair,
+            engine_pair,
             status,
             initiator_tensor,
+            initiator_tensor_copy,
             target_tensor,
+            target_tensor_copy,
             uid,
+            op_type,
         )
 
 
 def test_err_out_of_range(pre_connected_engine_pair):
-    initiator, target = pre_connected_engine_pair
+    engine_pair = pre_connected_engine_pair["normal"]
+    initiator, target = engine_pair
     initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
-        pre_connected_engine_pair,
+        engine_pair,
         (
             2,
             32,
@@ -238,3 +307,38 @@ def test_err_out_of_range(pre_connected_engine_pair):
 
     assert transfer_status.Failed()
     assert transfer_status.Code() == StatusCode.ERR_INVALID_ARGS
+
+
+def test_no_backend():
+    config = IOEngineConfig(
+        host="127.0.0.1",
+        port=get_free_port(),
+    )
+    initiator = IOEngine(key=f"no_be_initiator", config=config)
+    config.port = get_free_port()
+    target = IOEngine(key=f"no_be_target", config=config)
+
+    initiator_desc = initiator.get_engine_desc()
+    target_desc = target.get_engine_desc()
+
+    initiator.register_remote_engine(target_desc)
+    target.register_remote_engine(initiator_desc)
+
+    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target),
+        (32,),
+    )
+
+    offsets = (0, 16)
+    sizes = (16, 16)
+
+    transfer_uid = initiator.allocate_transfer_uid()
+    transfer_status = initiator.batch_read(
+        initiator_mem, offsets, target_mem, offsets, sizes, transfer_uid
+    )
+
+    assert transfer_status.Failed()
+    assert transfer_status.Code() == StatusCode.ERR_BAD_STATE
+
+    sess = initiator.create_session(initiator_mem, target_mem)
+    assert sess is None
