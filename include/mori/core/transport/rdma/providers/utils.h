@@ -26,9 +26,17 @@
 
 #include "infiniband/mlx5dv.h"
 #include "mori/core/transport/rdma/device_primitives.hpp"
+
+#ifdef ENABLE_BNXT
 extern "C" {
 #include <infiniband/bnxt_re_hsi.h>
+}  // ENABLE_BNXT
+#else
+extern "C" {
+#include "mori/core/transport/rdma/providers/bnxt/bnxt_re_hsi.h"
 }
+#endif
+
 namespace mori {
 namespace core {
 

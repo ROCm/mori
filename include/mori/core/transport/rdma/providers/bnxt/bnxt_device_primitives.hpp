@@ -1,13 +1,44 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 #pragma once
 
 #include <hip/hip_runtime.h>
-#include "mori/core/utils.hpp"
 
+#include "mori/core/transport/p2p/device_primitives.hpp"
 #include "mori/core/transport/rdma/device_primitives.hpp"
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_defs.hpp"
-#include "mori/core/transport/p2p/device_primitives.hpp"
-// #include <infiniband/bnxt_re_dv.h>
-// #include "mori/application/transport/rdma/providers/bnxt/bnxt.hpp"
+#include "mori/core/transport/rdma/providers/utils.h"
+#include "mori/core/utils.hpp"
+#ifdef ENABLE_BNXT
+extern "C" {
+#include <infiniband/bnxt_re_dv.h>
+#include <infiniband/bnxt_re_hsi.h>
+}  // ENABLE_BNXT
+#else
+extern "C" {
+#include "mori/core/transport/rdma/providers/bnxt/bnxt_re_dv.h"
+#include "mori/core/transport/rdma/providers/bnxt/bnxt_re_hsi.h"
+}
+#endif
 
 namespace mori {
 namespace core {
@@ -32,7 +63,8 @@ inline __device__ uint64_t bnxt_re_init_db_hdr(int32_t indx, uint32_t toggle, ui
 /* ---------------------------------------------------------------------------------------------- */
 /*                                       Fill MSN Table                                           */
 /* ---------------------------------------------------------------------------------------------- */
-inline __device__ uint64_t bnxt_re_update_msn_tbl(uint32_t st_idx, uint32_t npsn, uint32_t start_psn) {
+inline __device__ uint64_t bnxt_re_update_msn_tbl(uint32_t st_idx, uint32_t npsn,
+                                                  uint32_t start_psn) {
   return ((((uint64_t)(st_idx) << BNXT_RE_SQ_MSN_SEARCH_START_IDX_SHIFT) &
            BNXT_RE_SQ_MSN_SEARCH_START_IDX_MASK) |
           (((uint64_t)(npsn) << BNXT_RE_SQ_MSN_SEARCH_NEXT_PSN_SHIFT) &
@@ -41,8 +73,9 @@ inline __device__ uint64_t bnxt_re_update_msn_tbl(uint32_t st_idx, uint32_t npsn
            BNXT_RE_SQ_MSN_SEARCH_START_PSN_MASK));
 }
 
-inline __device__ void bnxt_re_fill_psns_for_msntbl(void* msnBuffAddr, uint32_t postIdx, uint32_t curPsnIdx, uint32_t psnCnt,
-                                             uint32_t msntblIdx) {
+inline __device__ void bnxt_re_fill_psns_for_msntbl(void* msnBuffAddr, uint32_t postIdx,
+                                                    uint32_t curPsnIdx, uint32_t psnCnt,
+                                                    uint32_t msntblIdx) {
   uint32_t nextPsn = curPsnIdx + psnCnt;
   struct bnxt_re_msns msns;
   msns.start_idx_next_psn_start_psn = 0;
@@ -118,7 +151,8 @@ inline __device__ uint64_t BnxtPostSend(WorkQueueHandle& wq, uint32_t curPostIdx
   uint8_t flags = ((curPostIdx + slotsNum) / wqeNum) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
 
-  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
+  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum) | epoch), 0, qpn,
+                             BNXT_RE_QUE_TYPE_SQ);
 }
 
 template <>
@@ -190,7 +224,8 @@ inline __device__ uint64_t BnxtPostRecv(WorkQueueHandle& wq, uint32_t curPostIdx
   // recv wqe needn't to fill msntbl
   uint8_t flags = ((curPostIdx + slotsNum) / wqeNum) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
-  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum)| epoch), 0, qpn, BNXT_RE_QUE_TYPE_RQ);
+  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum) | epoch), 0, qpn,
+                             BNXT_RE_QUE_TYPE_RQ);
 }
 
 template <>
@@ -243,10 +278,11 @@ inline __device__ uint64_t BnxtPostReadWrite(WorkQueueHandle& wq, uint32_t curPo
   uint32_t slotIdx = curPostIdx % wqeNum;
   // TODO： wqeNum should be multiple of slotsNum, BRCM say using a specific conf currently.
   if ((slotIdx + slotsNum) > wqeNum) {
-      printf("[Error] (slotIdx + slotsNum) <= wqeNum failed!\n"
-            "  slotIdx=%u, slotsNum=%d, wqeNum=%u\n",
-            slotIdx, slotsNum, wqeNum);
-      assert(false);
+    printf(
+        "[Error] (slotIdx + slotsNum) <= wqeNum failed!\n"
+        "  slotIdx=%u, slotsNum=%d, wqeNum=%u\n",
+        slotIdx, slotsNum, wqeNum);
+    assert(false);
   }
   uint32_t wqe_size = BNXT_RE_HDR_WS_MASK & slotsNum;
   uint32_t hdr_flags = BNXT_RE_HDR_FLAGS_MASK & signalFlag;
@@ -277,7 +313,8 @@ inline __device__ uint64_t BnxtPostReadWrite(WorkQueueHandle& wq, uint32_t curPo
   uint8_t flags = ((curPostIdx + slotsNum) / wqeNum) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
 
-  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
+  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum) | epoch), 0, qpn,
+                             BNXT_RE_QUE_TYPE_SQ);
 }
 
 template <>
@@ -388,7 +425,7 @@ inline __device__ uint64_t BnxtPostWriteInline(WorkQueueHandle& wq, uint32_t cur
   hdr.key_immd = 0;
   hdr.lhdr.qkey_len = bytes;
 
-  rdma.rva = (uint64_t) raddr;
+  rdma.rva = (uint64_t)raddr;
   rdma.rkey = rkey & 0xffffffff;
 
   char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
@@ -413,7 +450,8 @@ inline __device__ uint64_t BnxtPostWriteInline(WorkQueueHandle& wq, uint32_t cur
   // struct bnxt_re_db_hdr hdr;
   uint8_t flags = ((curPostIdx + slotsNum) / wqeNum) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
-  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
+  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum) | epoch), 0, qpn,
+                             BNXT_RE_QUE_TYPE_SQ);
 }
 
 template <>
@@ -517,12 +555,12 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
   hdr.rsv_ws_fl_wt =
       (wqe_size << BNXT_RE_HDR_WS_SHIFT) | (hdr_flags << BNXT_RE_HDR_FLAGS_SHIFT) | wqe_type;
   hdr.key_immd = rkey & 0xffffffff;
-  hdr.lhdr.rva = (uint64_t) raddr;
+  hdr.lhdr.rva = (uint64_t)raddr;
 
-  amo.swp_dt = (uint64_t) data;
-  amo.cmp_dt = (uint64_t) cmp;
+  amo.swp_dt = (uint64_t)data;
+  amo.cmp_dt = (uint64_t)cmp;
 
-  sge.pa = (uint64_t) laddr;
+  sge.pa = (uint64_t)laddr;
   sge.lkey = lkey & 0xffffffff;
   sge.length = bytes;
 
@@ -540,7 +578,8 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
   uint8_t flags = ((curPostIdx + slotsNum) / wqeNum) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
 
-  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum) | epoch), 0, qpn, BNXT_RE_QUE_TYPE_SQ);
+  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum) | epoch), 0, qpn,
+                             BNXT_RE_QUE_TYPE_SQ);
 }
 
 template <>
@@ -660,11 +699,12 @@ inline __device__ int PollCqOnce<ProviderType::BNXT>(void* cqeAddr, uint32_t cqe
   volatile char* flgSrc = cqe + sizeof(struct bnxt_re_req_cqe);
   uint32_t phase = BNXT_RE_QUEUE_START_PHASE ^ ((consIdx / cqeNum) & 0x1);
   uint32_t flg_val = *reinterpret_cast<volatile uint32_t*>(flgSrc);
-  uint32_t con_indx = *reinterpret_cast<volatile uint32_t*>(cqe + offsetof(bnxt_re_req_cqe, con_indx));
+  uint32_t con_indx =
+      *reinterpret_cast<volatile uint32_t*>(cqe + offsetof(bnxt_re_req_cqe, con_indx));
   // printf("GPU  flg_val = 0x%08X (%u), phase = 0x%08X (%u) consIdx %u, cqeNum %u\n",
   //        flg_val & BNXT_RE_BCQE_PH_MASK, flg_val & BNXT_RE_BCQE_PH_MASK, phase, phase, consIdx,
   //        cqeNum);
-  if (((flg_val) & BNXT_RE_BCQE_PH_MASK) == (phase)) {
+  if (((flg_val)&BNXT_RE_BCQE_PH_MASK) == (phase)) {
     uint8_t status = (flg_val >> BNXT_RE_BCQE_STATUS_SHIFT) & BNXT_RE_BCQE_STATUS_MASK;
 
     if (status != BNXT_RE_REQ_ST_OK) {
@@ -718,11 +758,13 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
 }
 
 template <>
-inline __device__ void UpdateCqDbrRecord<ProviderType::BNXT>(void* dbrRecAddr, uint32_t cons_idx, uint32_t cqeNum) {
-  uint8_t flags = ((cons_idx + 1)  / cqeNum) & (1UL << BNXT_RE_FLAG_EPOCH_HEAD_SHIFT);
+inline __device__ void UpdateCqDbrRecord<ProviderType::BNXT>(void* dbrRecAddr, uint32_t cons_idx,
+                                                             uint32_t cqeNum) {
+  uint8_t flags = ((cons_idx + 1) / cqeNum) & (1UL << BNXT_RE_FLAG_EPOCH_HEAD_SHIFT);
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
   // uint64_t dbrVal = bnxt_re_init_db_hdr(((cons_idx + 1) | epoch), 0, flags, BNXT_RE_QUE_TYPE_CQ);
-  uint64_t dbrVal = bnxt_re_init_db_hdr((((cons_idx + 1) % cqeNum) | epoch), 0, flags, BNXT_RE_QUE_TYPE_CQ);
+  uint64_t dbrVal =
+      bnxt_re_init_db_hdr((((cons_idx + 1) % cqeNum) | epoch), 0, flags, BNXT_RE_QUE_TYPE_CQ);
   core::AtomicStoreSeqCstSystem(reinterpret_cast<uint64_t*>(dbrRecAddr), dbrVal);
 }
 

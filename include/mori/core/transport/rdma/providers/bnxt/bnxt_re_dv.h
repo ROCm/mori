@@ -211,6 +211,8 @@ int bnxt_re_dv_qp_get_mem_info(struct ibv_pd *ibvpd,
 			       struct bnxt_re_dv_qp_mem_info *qp_mem);
 int bnxt_re_dv_get_cq_attr(struct ibv_context *ibvctx, uint32_t ncqe,
 			   struct bnxt_re_dv_cq_attr *cq_attr);
+void *bnxt_re_dv_cq_mem_alloc(struct ibv_context *ibvctx, int num_cqe,
+			      struct bnxt_re_dv_cq_attr *cq_attr);
 #ifdef __cplusplus
 }
 #endif
