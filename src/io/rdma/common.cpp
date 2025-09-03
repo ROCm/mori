@@ -116,7 +116,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
       wr.wr.rdma.rkey = remote.rkey;
       wr.next = (j < (end - 1)) ? wrs.data() + j + 1 : nullptr;
 
-      if ((j > st) && ((j - st) % postBatchSize == 0) || (j == (end - 1))) {
+      if (((j > st) && ((j - st) % postBatchSize == 0)) || (j == (end - 1))) {
         int ret = ibv_post_send(eps[i].local.ibvHandle.qp, wrs.data() + st, nullptr);
         if (ret != 0) {
           return {StatusCode::ERR_RDMA_OP, strerror(errno)};

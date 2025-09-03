@@ -161,7 +161,10 @@ class IOEngine:
         return transfer_status
 
     def create_session(self, local_mem, remote_mem):
-        return IOEngineSession(self._engine.CreateSession(local_mem, remote_mem))
+        mori_sess = self._engine.CreateSession(local_mem, remote_mem)
+        if mori_sess is None:
+            return None
+        return IOEngineSession(mori_sess)
 
     def pop_inbound_transfer_status(self, remote_key, transfer_uid):
         transfer_status = mori_cpp.TransferStatus()

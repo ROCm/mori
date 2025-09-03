@@ -65,7 +65,7 @@ def create_connected_engine_pair(
 
 @pytest.fixture(scope="module")
 def pre_connected_engine_pair():
-    set_log_level("trace")
+    set_log_level("info")
     initiator, target = create_connected_engine_pair(
         "normal", qp_per_transfer=2, post_batch_size=-1, num_worker_threads=1
     )
@@ -268,3 +268,38 @@ def test_err_out_of_range(pre_connected_engine_pair):
 
     assert transfer_status.Failed()
     assert transfer_status.Code() == StatusCode.ERR_INVALID_ARGS
+
+
+def test_no_backend():
+    config = IOEngineConfig(
+        host="127.0.0.1",
+        port=get_free_port(),
+    )
+    initiator = IOEngine(key=f"no_be_initiator", config=config)
+    config.port = get_free_port()
+    target = IOEngine(key=f"no_be_target", config=config)
+
+    initiator_desc = initiator.get_engine_desc()
+    target_desc = target.get_engine_desc()
+
+    initiator.register_remote_engine(target_desc)
+    target.register_remote_engine(initiator_desc)
+
+    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target),
+        (32),
+    )
+
+    offsets = (0, 16)
+    sizes = (16, 16)
+
+    transfer_uid = initiator.allocate_transfer_uid()
+    transfer_status = initiator.batch_read(
+        initiator_mem, offsets, target_mem, offsets, sizes, transfer_uid
+    )
+
+    assert transfer_status.Failed()
+    assert transfer_status.Code() == StatusCode.ERR_BAD_STATE
+
+    sess = initiator.create_session(initiator_mem, target_mem)
+    assert sess is None

@@ -55,6 +55,7 @@ std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
     }
   } else {
     assert("topo searching for device other than GPU is not implemented yet");
+    return {};
   }
 }
 
@@ -270,7 +271,10 @@ void NotifManager::MainLoop() {
             notifPool[ekey][msg.id] = msg.totalNum;
           }
           notifPool[ekey][msg.id] -= 1;
-
+          MORI_IO_TRACE(
+              "NotifManager receive notif message from engine {} id {} qp {} total num {} cur num "
+              "{}",
+              ekey.c_str(), msg.id, msg.qpIndex, msg.totalNum, notifPool[ekey][msg.id]);
           // replenish recv wr
           // TODO(ditian12): we should replenish recv wr faster, insufficient recv wr is met
           // frequently when transfer is very fast. Two way to solve this, 1. use srq_limit to
@@ -349,8 +353,9 @@ void NotifManager::Shutdown() {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      Control Plane Server                                      */
 /* ---------------------------------------------------------------------------------------------- */
-ControlPlaneServer::ControlPlaneServer(std::string host, int port, RdmaManager* rdmaMgr,
-                                       NotifManager* notifMgr) {
+ControlPlaneServer::ControlPlaneServer(const std::string& k, const std::string& host, int port,
+                                       RdmaManager* rdmaMgr, NotifManager* notifMgr)
+    : myEngKey(k) {
   ctx.reset(new application::TCPContext(host, port));
   rdma = rdmaMgr;
   notif = notifMgr;
@@ -384,7 +389,7 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo) {
   application::RdmaEndpoint lep = rdma->CreateEndpoint(devId);
 
   Protocol p(tcph);
-  p.WriteMessageRegEndpoint({ekey, topo, devId, lep.handle});
+  p.WriteMessageRegEndpoint({myEngKey, topo, devId, lep.handle});
   MessageHeader hdr = p.ReadMessageHeader();
   assert(hdr.type == MessageType::RegEndpoint);
   MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
@@ -450,7 +455,7 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
       int rdevId = msg.devId;
       auto [devId, weight] = candidates[0];
       application::RdmaEndpoint lep = rdma->CreateEndpoint(devId);
-      p.WriteMessageRegEndpoint(MessageRegEndpoint{msg.ekey, msg.topo, devId, lep.handle});
+      p.WriteMessageRegEndpoint(MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle});
       rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
       notif->RegisterEndpointByQpn(lep.handle.qpn);
       notif->RegisterDevice(devId);
@@ -599,9 +604,9 @@ bool RdmaBackendSession::Alive() const { return true; }
 /*                                           RdmaBackend                                          */
 /* ---------------------------------------------------------------------------------------------- */
 
-RdmaBackend::RdmaBackend(EngineKey key, const IOEngineConfig& engConfig,
+RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
                          const RdmaBackendConfig& beConfig)
-    : config(beConfig) {
+    : myEngKey(k), config(beConfig) {
   application::RdmaContext* ctx =
       new application::RdmaContext(application::RdmaBackendType::IBVerbs);
   rdma.reset(new mori::io::RdmaManager(ctx));
@@ -609,7 +614,8 @@ RdmaBackend::RdmaBackend(EngineKey key, const IOEngineConfig& engConfig,
   notif.reset(new NotifManager(rdma.get(), beConfig));
   notif->Start();
 
-  server.reset(new ControlPlaneServer(engConfig.host, engConfig.port, rdma.get(), notif.get()));
+  server.reset(
+      new ControlPlaneServer(myEngKey, engConfig.host, engConfig.port, rdma.get(), notif.get()));
   server->Start();
 
   if (config.numWorkerThreads > 1) {
@@ -678,7 +684,6 @@ void RdmaBackend::BatchRead(const MemoryDesc& localDest, const SizeVec& localOff
 BackendSession* RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote) {
   RdmaBackendSession* sess = new RdmaBackendSession();
   CreateSession(local, remote, *sess);
-  sessions.emplace_back(sess);
   return sess;
 }
 

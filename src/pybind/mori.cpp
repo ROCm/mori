@@ -288,6 +288,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .value("ERR_INVALID_ARGS", mori::io::StatusCode::ERR_INVALID_ARGS)
       .value("ERR_NOT_FOUND", mori::io::StatusCode::ERR_NOT_FOUND)
       .value("ERR_RDMA_OP", mori::io::StatusCode::ERR_RDMA_OP)
+      .value("ERR_BAD_STATE", mori::io::StatusCode::ERR_BAD_STATE)
       .export_values();
 
   py::class_<mori::io::BackendConfig>(m, "BackendConfig");
@@ -377,7 +378,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("AllocateTransferUniqueId", &mori::io ::IOEngine::AllocateTransferUniqueId)
       .def("Read", &mori::io ::IOEngine::Read)
       .def("BatchRead", &mori::io ::IOEngine::BatchRead)
-      .def("CreateSession", &mori::io::IOEngine::CreateSession, py::return_value_policy::reference)
+      .def("CreateSession", &mori::io::IOEngine::CreateSession)
       .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus);
 }
 

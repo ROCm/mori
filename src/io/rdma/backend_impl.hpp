@@ -138,7 +138,8 @@ class NotifManager {
 /* ---------------------------------------------------------------------------------------------- */
 class ControlPlaneServer {
  public:
-  ControlPlaneServer(std::string host, int port, RdmaManager*, NotifManager*);
+  ControlPlaneServer(const std::string& key, const std::string& host, int port, RdmaManager*,
+                     NotifManager*);
   ~ControlPlaneServer();
 
   // Remote engine meta management
@@ -163,6 +164,8 @@ class ControlPlaneServer {
   void HandleControlPlaneProtocol(int fd);
 
  private:
+  EngineKey myEngKey;
+
   mutable std::mutex mu;
 
   int epfd{-1};
@@ -236,11 +239,11 @@ class RdmaBackend : public Backend {
   void CreateSession(const MemoryDesc& local, const MemoryDesc& remote, RdmaBackendSession& sess);
 
  private:
+  EngineKey myEngKey;
   RdmaBackendConfig config;
   std::unique_ptr<RdmaManager> rdma{nullptr};
   std::unique_ptr<NotifManager> notif{nullptr};
   std::unique_ptr<ControlPlaneServer> server{nullptr};
-  std::vector<std::unique_ptr<RdmaBackendSession>> sessions;
   std::unique_ptr<Executor> executor{nullptr};
 };
 

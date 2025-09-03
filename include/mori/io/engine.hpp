@@ -66,7 +66,7 @@ class IOEngineSession {
   IOEngineSession() = default;
 
   IOEngine* engine{nullptr};
-  std::unordered_map<BackendType, BackendSession*> backendSess;
+  std::shared_ptr<BackendSession> backendSess{nullptr};
 };
 
 class IOEngine {
@@ -98,8 +98,10 @@ class IOEngine {
   // Take the transfer status of an inbound op
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
 
-  IOEngineSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
-  void DestroySession(IOEngineSession*);
+  std::optional<IOEngineSession> CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
+
+ private:
+  Backend* SelectBackend(const MemoryDesc& local, const MemoryDesc& remote);
 
  public:
   // Config and descriptors
@@ -111,7 +113,6 @@ class IOEngine {
   std::atomic<uint32_t> nextMemUid{0};
   std::unordered_map<MemoryUniqueId, MemoryDesc> memPool;
   std::unordered_map<BackendType, std::unique_ptr<Backend>> backends;
-  std::vector<std::unique_ptr<IOEngineSession>> sessions;
 };
 
 }  // namespace io

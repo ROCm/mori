@@ -37,46 +37,33 @@ TransferUniqueId IOEngineSession::AllocateTransferUniqueId() {
 void IOEngineSession::Read(size_t localOffset, size_t remoteOffset, size_t size,
                            TransferStatus* status, TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
-  for (auto& it : backendSess) {
-    it.second->Read(localOffset, remoteOffset, size, status, id);
-    if (status->Failed()) {
-      MORI_IO_ERROR("Session read error {} message {}", status->CodeUint32(), status->Message());
-    }
-    return;
+  backendSess->Read(localOffset, remoteOffset, size, status, id);
+  if (status->Failed()) {
+    MORI_IO_ERROR("Session read error {} message {}", status->CodeUint32(), status->Message());
   }
 }
 
 void IOEngineSession::Write(size_t localOffset, size_t remoteOffset, size_t size,
                             TransferStatus* status, TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
-  for (auto& it : backendSess) {
-    it.second->Write(localOffset, remoteOffset, size, status, id);
-    if (status->Failed()) {
-      MORI_IO_ERROR("Session write error {} message {}", status->CodeUint32(), status->Message());
-    }
-    return;
+  backendSess->Write(localOffset, remoteOffset, size, status, id);
+  if (status->Failed()) {
+    MORI_IO_ERROR("Session write error {} message {}", status->CodeUint32(), status->Message());
   }
+  return;
 }
 
 void IOEngineSession::BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                 const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
-  for (auto& it : backendSess) {
-    it.second->BatchRead(localOffsets, remoteOffsets, sizes, status, id);
-    if (status->Failed()) {
-      MORI_IO_ERROR("Session batch read error {} message {}", status->CodeUint32(),
-                    status->Message());
-    }
-    return;
+  backendSess->BatchRead(localOffsets, remoteOffsets, sizes, status, id);
+  if (status->Failed()) {
+    MORI_IO_ERROR("Session batch read error {} message {}", status->CodeUint32(),
+                  status->Message());
   }
 }
 
-bool IOEngineSession::Alive() {
-  for (auto& it : backendSess) {
-    if (it.second->Alive()) return true;
-  }
-  return false;
-}
+bool IOEngineSession::Alive() { return backendSess->Alive(); }
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            IOEngine                                            */
@@ -155,15 +142,32 @@ TransferUniqueId IOEngine::AllocateTransferUniqueId() {
   return id;
 }
 
+Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remote) {
+  if (backends.empty()) {
+    return nullptr;
+  }
+  return backends.begin()->second.get();
+}
+
+#define SELECT_BACKEND_AND_RETURN_IF_NONE(local, remote, status, backend)     \
+  backend = SelectBackend(local, remote);                                     \
+  if (backend == nullptr) {                                                   \
+    if (status != nullptr) {                                                  \
+      status->SetCode(StatusCode::ERR_BAD_STATE);                             \
+      status->SetMessage("No available backend found, create backend first"); \
+    }                                                                         \
+    MORI_IO_ERROR("No available backend found, please create backend first"); \
+    return;                                                                   \
+  }
+
 void IOEngine::Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
                     size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
-  for (auto& it : backends) {
-    it.second->Read(localDest, localOffset, remoteSrc, remoteOffset, size, status, id);
-    if (status->Failed()) {
-      MORI_IO_ERROR("Engine read error {} message {}", status->CodeUint32(), status->Message());
-    }
-    return;
+  Backend* backend = nullptr;
+  SELECT_BACKEND_AND_RETURN_IF_NONE(localDest, remoteSrc, status, backend);
+  backend->Read(localDest, localOffset, remoteSrc, remoteOffset, size, status, id);
+  if (status->Failed()) {
+    MORI_IO_ERROR("Engine read error {} message {}", status->CodeUint32(), status->Message());
   }
 }
 
@@ -171,11 +175,11 @@ void IOEngine::Write(const MemoryDesc& localSrc, size_t localOffset, const Memor
                      size_t remoteOffset, size_t size, TransferStatus* status,
                      TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
-  for (auto& it : backends) {
-    it.second->Write(localSrc, localOffset, remoteDest, remoteOffset, size, status, id);
-    if (status->Failed()) {
-      MORI_IO_ERROR("Engine write error {} message {}", status->CodeUint32(), status->Message());
-    }
+  Backend* backend = nullptr;
+  SELECT_BACKEND_AND_RETURN_IF_NONE(localSrc, remoteDest, status, backend);
+  backend->Write(localSrc, localOffset, remoteDest, remoteOffset, size, status, id);
+  if (status->Failed()) {
+    MORI_IO_ERROR("Engine write error {} message {}", status->CodeUint32(), status->Message());
   }
 }
 
@@ -183,30 +187,36 @@ void IOEngine::BatchRead(const MemoryDesc& localDest, const SizeVec& localOffset
                          const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
                          const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
-  for (auto& it : backends) {
-    it.second->BatchRead(localDest, localOffsets, remoteSrc, remoteOffsets, sizes, status, id);
-    if (status->Failed()) {
-      MORI_IO_ERROR("Engine batch read error {} message {}", status->CodeUint32(),
-                    status->Message());
-    }
+  Backend* backend = nullptr;
+  SELECT_BACKEND_AND_RETURN_IF_NONE(localDest, remoteSrc, status, backend);
+  backend->BatchRead(localDest, localOffsets, remoteSrc, remoteOffsets, sizes, status, id);
+  if (status->Failed()) {
+    MORI_IO_ERROR("Engine batch read error {} message {}", status->CodeUint32(), status->Message());
   }
 }
 
-IOEngineSession* IOEngine::CreateSession(const MemoryDesc& local, const MemoryDesc& remote) {
-  IOEngineSession* sess = new IOEngineSession{};
-  sess->engine = this;
-  for (auto& it : backends) {
-    BackendSession* bsess = it.second->CreateSession(local, remote);
-    sess->backendSess.insert({it.first, bsess});
+std::optional<IOEngineSession> IOEngine::CreateSession(const MemoryDesc& local,
+                                                       const MemoryDesc& remote) {
+  IOEngineSession sess{};
+  sess.engine = this;
+
+  Backend* backend = SelectBackend(local, remote);
+  if (backend == nullptr) {
+    return std::nullopt;
   }
-  sessions.emplace_back(sess);
+  sess.backendSess.reset(backend->CreateSession(local, remote));
+
   return sess;
 }
 
 bool IOEngine::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                         TransferStatus* status) {
-  status->SetCode(StatusCode::SUCCESS);
-  return true;
+  // status->SetCode(StatusCode::SUCCESS);
+  for (auto& it : backends) {
+    bool popped = it.second->PopInboundTransferStatus(remote, id, status);
+    if (popped) return true;
+  }
+  return false;
 }
 
 }  // namespace io
