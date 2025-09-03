@@ -93,7 +93,7 @@ def parse_args():
         "--num-qp-per-transfer",
         type=int,
         default=1,
-        help="Number of QPs for single transfer",
+        help="Number of QPs for a single transfer",
     )
     parser.add_argument(
         "--num-worker-threads",
