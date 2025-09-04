@@ -107,6 +107,9 @@ std::vector<std::string> TopoSystem::MatchAllGpusAndNics() {
 
   for (int i = 0; i < count; i++) {
     std::vector<Candidate> candidates = CollectAndSortCandidates(this, i);
+    if (candidates.empty()) {
+      matches.push_back("");
+    }
 
     bool found = false;
     for (auto& cand : candidates) {

@@ -338,6 +338,9 @@ void TopoSystemPci::Load() {
       pci_dev* dev = dsp2dev[parentDsp];
       parentBus = PciBusId(dev->domain, dev->bus, dev->dev, dev->func).packed;
     }
+
+    // Prevent loopback to self, this could happen in SR-IOV mode where all devices directly connect
+    // to root complex
     if (parentBus == node->BusId().packed) continue;
 
     assert(pcis.find(parentBus) != pcis.end());
