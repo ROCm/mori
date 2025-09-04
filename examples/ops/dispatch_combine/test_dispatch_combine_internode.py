@@ -545,4 +545,3 @@ if __name__ == "__main__":
         nprocs=gpu_per_node,
         join=True,
     )
-

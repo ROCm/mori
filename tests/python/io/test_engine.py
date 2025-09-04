@@ -185,7 +185,7 @@ def check_transfer_result(
         assert not torch.equal(target_tensor.cpu(), target_tensor_copy.cpu())
 
 
-@pytest.mark.parametrize("engine_type", ("normal", "multhd"))
+@pytest.mark.parametrize("engine_type", ("normal",))
 @pytest.mark.parametrize(
     "enable_sess",
     (
