@@ -138,7 +138,7 @@ struct RdmaEndpoint {
   __device__ __host__ core::ProviderType GetProviderType() {
     if (vendorId == RdmaDeviceVendorId::Mellanox) {
       return core::ProviderType::MLX5;
-    } if (vendorId == RdmaDeviceVendorId::Broadcom) {
+    } else if (vendorId == RdmaDeviceVendorId::Broadcom) {
       return core::ProviderType::BNXT;
     } else {
       printf("unknown vendorId %d", vendorId);

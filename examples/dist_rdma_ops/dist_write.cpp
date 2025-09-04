@@ -58,6 +58,57 @@ void VerifyBuffer(void* buffer, size_t maxSize, char expected) {
 }
 
 template <ProviderType P>
+inline __device__ void QuiteSerial(RdmaEndpoint* endpoint) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+  CompletionQueueHandle& cq = endpoint->cqHandle;
+  WorkQueueHandle& wq = endpoint->wqHandle;
+  // AcquireLock(&cq.pollCqLock);
+  while (true) {
+    bool done{false};
+    uint32_t quiet_amount{0};
+    uint32_t my_cq_consumer{0};
+
+    uint32_t dbTouchIdx =
+        __hip_atomic_load(&wq.dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint32_t doneIdx = __hip_atomic_load(&wq.doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    // printf("dbTouchIdx: %u, doneIdx: %u\n", dbTouchIdx, doneIdx);
+    if (dbTouchIdx == doneIdx) {
+      return;
+    }
+
+    my_cq_consumer =
+        __hip_atomic_fetch_add(&cq.cq_consumer, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+
+    uint16_t wqe_counter;
+    uint64_t wqe_id;
+    int opcode = core::PollCq<P>(cq.cqAddr, cq.cqeNum, &my_cq_consumer, &wqe_counter);
+    // printf("wqe_counter: %u\n",wqe_counter);
+    if constexpr (P == core::ProviderType::MLX5) {
+      if (opcode == MLX5_CQE_RESP_ERR || opcode == MLX5_CQE_REQ_ERR) {
+        uint32_t my_cq_index = my_cq_consumer % cq.cqeNum;
+        core::DumpMlx5Wqe(wq.sqAddr, my_cq_index);
+        assert(false);
+      }
+      wqe_id = wq.outstandingWqe[wqe_counter];
+    } else if constexpr (P == core::ProviderType::BNXT) {
+      if (opcode != BNXT_RE_REQ_ST_OK) {
+        uint32_t my_cq_index = my_cq_consumer % cq.cqeNum;
+        assert(false);
+      }
+      wqe_counter = (BNXT_RE_NUM_SLOT_PER_WQE * (wqe_counter + wq.sqWqeNum - 1) % wq.sqWqeNum);
+      wqe_id = wq.outstandingWqe[wqe_counter] + BNXT_RE_NUM_SLOT_PER_WQE;
+    }
+
+    // core::UpdateCqDbrRecord<P>(cq.dbrRecAddr, (uint32_t)(my_cq_consumer + 1), cq.cqeNum);
+
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    __hip_atomic_fetch_max(&wq.doneIdx, wqe_id, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  }
+  // ReleaseLock(&cq.pollCqLock);
+}
+
+template <ProviderType P>
 __device__ void Quite(RdmaEndpoint* endpoint) {
   constexpr size_t BROADCAST_SIZE = 1024 / warpSize;
   __shared__ uint64_t wqe_broadcast[BROADCAST_SIZE];
@@ -219,7 +270,11 @@ __global__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
       if (num_free_entries > num_entries_until_warp_last_entry) {
         break;
       }
-      Quite<P>(endpoint);
+      if constexpr (P == ProviderType::MLX5) {
+        Quite<P>(endpoint);
+      } else if constexpr (P == ProviderType::BNXT) {
+        QuiteSerial<P>(endpoint);
+      }
     }
     if constexpr (P == ProviderType::MLX5) {
       wqHandle->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
@@ -250,7 +305,11 @@ __global__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
       __hip_atomic_store(&wqHandle->dbTouchIdx, warp_sq_counter + num_wqes * num_slot_per_wqe,
                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
-    Quite<P>(endpoint);
+    if constexpr (P == ProviderType::MLX5) {
+      Quite<P>(endpoint);
+    } else if constexpr (P == ProviderType::BNXT) {
+      QuiteSerial<P>(endpoint);
+    }
   }
 }
 
@@ -421,10 +480,12 @@ void distRdmaOps(int argc, char* argv[]) {
 
   if (local_rank == 0) {
     printf("\nIBGDA White benchmark:\n");
-    printf("%-8s %-12s %-12s %-12s\n", "Index", "Size(B)", "bw(GB)", "Time(ms)");
+    printf("Blocks: %zu, Threads: %zu, Iterations: %zu\n", blocks, threads, iters);
+    printf("%-8s %-12s %-12s %-12s %-12s\n", "Index", "Size(B)", "bw(GB)", "Time(ms)", "Rate(pps)");
 
     for (size_t i = 0; i < validSizeLog; ++i) {
-      printf("%-8zu %-12lu %-12.4f %-12.4f\n", i + 1, sizeTable[i], bwTable[i], times[i]);
+      double rate_pps = (blocks * threads * iters) / (times[i] * MS_TO_S);
+      printf("%-8zu %-12lu %-12.4f %-12.4f %-12.4f\n", i + 1, sizeTable[i], bwTable[i], times[i], rate_pps);
     }
   }
 

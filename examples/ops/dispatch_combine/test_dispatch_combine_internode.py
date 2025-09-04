@@ -349,9 +349,7 @@ class EpDispatchCombineTestCase:
 
         dist.barrier()
         total_recv_num_token = dispatch_recv_num_token[0].item()
-        max_num_token_to_send_per_rank = (
-            self.config.max_num_inp_token_per_rank * self.config.num_experts_per_token
-        )
+        max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank
 
         my_node = self.rank // self.gpu_per_node
         total_rdma_recv_num_token = 0
