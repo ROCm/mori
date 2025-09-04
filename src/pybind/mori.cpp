@@ -234,13 +234,13 @@ void RegisterMoriOps(py::module_& m) {
       .export_values();
 
   pybind11::class_<mori::moe::EpDispatchCombineConfig>(m, "EpDispatchCombineConfig")
-      .def(pybind11::init<int, int, int, int, int, int, int, int, int, int, int, bool>(),
+      .def(pybind11::init<int, int, int, int, int, int, int, int, int, int, int, int, bool>(),
            py::arg("rank") = 0, py::arg("world_size") = 0, py::arg("hidden_dim") = 0,
            py::arg("scale_dim") = 0, py::arg("scale_type_size") = 0,
            py::arg("max_token_type_size") = 0, py::arg("max_num_inp_token_per_rank") = 0,
            py::arg("num_experts_per_rank") = 0, py::arg("num_experts_per_token") = 0,
-           py::arg("warp_num_per_block") = 0, py::arg("block_num") = 0,
-           py::arg("use_external_inp_buf") = true)
+           py::arg("num_worst_token") = 0, py::arg("warp_num_per_block") = 0,
+           py::arg("block_num") = 0, py::arg("use_external_inp_buf") = true)
       .def_readwrite("rank", &mori::moe::EpDispatchCombineConfig::rank)
       .def_readwrite("world_size", &mori::moe::EpDispatchCombineConfig::worldSize)
       .def_readwrite("hidden_dim", &mori::moe::EpDispatchCombineConfig::hiddenDim)
@@ -252,6 +252,7 @@ void RegisterMoriOps(py::module_& m) {
       .def_readwrite("num_experts_per_rank", &mori::moe::EpDispatchCombineConfig::numExpertPerRank)
       .def_readwrite("num_experts_per_token",
                      &mori::moe::EpDispatchCombineConfig::numExpertPerToken)
+      .def_readwrite("num_worst_token", &mori::moe::EpDispatchCombineConfig::numWorstToken)
       .def_readwrite("warp_num_per_block", &mori::moe::EpDispatchCombineConfig::warpNumPerBlock)
       .def_readwrite("block_num", &mori::moe::EpDispatchCombineConfig::blockNum);
 
