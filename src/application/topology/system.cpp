@@ -48,38 +48,84 @@ void TopoSystem::Load() {
   net.reset(new TopoSystemNet());
 }
 
-std::string TopoSystem::MatchGpuAndNic(int id) const {
-  auto nics = net->GetNics();
-  TopoNodeGpu* d = gpu->GetGpuByLogicalId(id);
+struct Candidate {
+  TopoPathPci* path{nullptr};
+  TopoNodePci* node{nullptr};
+  TopoNodeNic* nic{nullptr};
+};
 
-  using CandType = std::pair<TopoPathPci*, TopoNodeNic*>;
-  std::vector<CandType> candidates;
+std::vector<Candidate> CollectAndSortCandidates(TopoSystem* sys, int id) {
+  assert(sys != nullptr);
+
+  TopoSystemGpu* gpu = sys->GetTopoSystemGpu();
+  TopoSystemPci* pci = sys->GetTopoSystemPci();
+  TopoSystemNet* net = sys->GetTopoSystemNet();
+
+  TopoNodeGpu* dev = gpu->GetGpuByLogicalId(id);
+  NumaNodeId gpuNumaNodeId = pci->Node(dev->busId)->NumaNode();
+
+  // Collect nic candidates
+  auto nics = net->GetNics();
+  std::vector<Candidate> candidates;
   for (auto* nic : nics) {
-    TopoPathPci* path = pci->Path(d->busId, nic->busId);
+    TopoPathPci* path = pci->Path(dev->busId, nic->busId);
+    TopoNodePci* nicPci = pci->Node(nic->busId);
     if (!path) continue;
-    candidates.push_back({path, nic});
+    candidates.push_back({path, nicPci, nic});
   }
 
-  std::sort(candidates.begin(), candidates.end(), [](CandType a, CandType b) {
-    if (a.second->totalGbps == b.second->totalGbps) {
-      return a.first->Hops() <= b.first->Hops();
+  std::sort(candidates.begin(), candidates.end(), [](Candidate a, Candidate b) {
+    if (a.nic->totalGbps == b.nic->totalGbps) {
+      return a.path->Hops() <= b.path->Hops();
     }
-    return a.second->totalGbps > b.second->totalGbps;
+    return a.nic->totalGbps > b.nic->totalGbps;
   });
 
-  if (candidates.empty()) return "";
-  return candidates[0].second->name;
+  return candidates;
 }
 
-std::vector<std::string> TopoSystem::MatchAllGpusAndNics() const {
+std::string TopoSystem::MatchGpuAndNic(int id) {
+  std::vector<std::string> matches = MatchAllGpusAndNics();
+  assert(id < matches.size());
+  return matches[id];
+}
+
+// std::vector<std::string> TopoSystem::MatchAllGpusAndNics() {
+//   int count;
+//   HIP_RUNTIME_CHECK(hipGetDeviceCount(&count));
+
+//   auto nics = net->GetNics();
+
+//   std::vector<std::string> matches(count);
+//   for (int i = 0; i < count; i++) {
+//     matches[i] = MatchGpuAndNic(i);
+//   }
+
+//   return matches;
+// }
+
+std::vector<std::string> TopoSystem::MatchAllGpusAndNics() {
   int count;
   HIP_RUNTIME_CHECK(hipGetDeviceCount(&count));
 
-  auto nics = net->GetNics();
+  std::vector<std::string> matches;
+  std::unordered_set<std::string> matched;
 
-  std::vector<std::string> matches(count);
   for (int i = 0; i < count; i++) {
-    matches[i] = MatchGpuAndNic(i);
+    std::vector<Candidate> candidates = CollectAndSortCandidates(this, i);
+
+    bool found = false;
+    for (auto& cand : candidates) {
+      std::string name = cand.nic->name;
+      if (matched.find(name) == matched.end()) {
+        matches.push_back(name);
+        matched.insert(name);
+        found = true;
+        break;
+      }
+    }
+
+    if (!found) matches.push_back(candidates[i % candidates.size()].nic->name);
   }
 
   return matches;

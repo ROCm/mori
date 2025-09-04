@@ -64,6 +64,7 @@ class TopoSystemGpu {
   TopoSystemGpu();
   ~TopoSystemGpu();
 
+  int NumGpus() const { return gpus.size(); }
   std::vector<TopoNodeGpu*> GetGpus() const;
   TopoNodeGpu* GetGpuByLogicalId(int) const;
 
