@@ -74,11 +74,19 @@ std::vector<Candidate> CollectAndSortCandidates(TopoSystem* sys, int id) {
     candidates.push_back({path, nicPci, nic});
   }
 
-  std::sort(candidates.begin(), candidates.end(), [](Candidate a, Candidate b) {
-    if (a.nic->totalGbps == b.nic->totalGbps) {
-      return a.path->Hops() <= b.path->Hops();
-    }
-    return a.nic->totalGbps > b.nic->totalGbps;
+  // Sort by 1) speed 2) numa 3) hops 4) name
+  std::sort(candidates.begin(), candidates.end(), [&gpuNumaNodeId](Candidate a, Candidate b) {
+    bool tie = (a.nic->totalGbps == b.nic->totalGbps);
+    if (!tie) return a.nic->totalGbps > b.nic->totalGbps;
+
+    if ((a.node->NumaNode() == gpuNumaNodeId) && (b.node->NumaNode() != gpuNumaNodeId)) return true;
+    if ((a.node->NumaNode() != gpuNumaNodeId) && (b.node->NumaNode() == gpuNumaNodeId))
+      return false;
+
+    tie = (a.path->Hops() == b.path->Hops());
+    if (!tie) return a.path->Hops() <= b.path->Hops();
+
+    return a.nic->name <= b.nic->name;
   });
 
   return candidates;
@@ -89,20 +97,6 @@ std::string TopoSystem::MatchGpuAndNic(int id) {
   assert(id < matches.size());
   return matches[id];
 }
-
-// std::vector<std::string> TopoSystem::MatchAllGpusAndNics() {
-//   int count;
-//   HIP_RUNTIME_CHECK(hipGetDeviceCount(&count));
-
-//   auto nics = net->GetNics();
-
-//   std::vector<std::string> matches(count);
-//   for (int i = 0; i < count; i++) {
-//     matches[i] = MatchGpuAndNic(i);
-//   }
-
-//   return matches;
-// }
 
 std::vector<std::string> TopoSystem::MatchAllGpusAndNics() {
   int count;
