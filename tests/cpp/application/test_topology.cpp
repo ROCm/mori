@@ -39,12 +39,14 @@ int TestTopoNodeGpu() {
     for (auto* nic : nics) {
       assert(pciSys->Node(nic->busId));
       auto* path = pciSys->Path(gpu->busId, nic->busId);
+      auto* nicPci = pciSys->Node(nic->busId);
       if (!path) {
         printf("gpu %s nic %s no direct link\n", gpu->busId.String().c_str(),
                nic->busId.String().c_str());
       } else {
-        printf("gpu %s nic %s %s hops %d\n", gpu->busId.String().c_str(),
-               nic->busId.String().c_str(), nic->name.c_str(), path->Hops());
+        printf("gpu %s nic %s %s hops %d speed %f numa %d\n", gpu->busId.String().c_str(),
+               nic->busId.String().c_str(), nic->name.c_str(), path->Hops(), nic->totalGbps,
+               nicPci->NumaNode());
       }
     }
   }
