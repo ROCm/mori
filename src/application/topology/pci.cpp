@@ -338,7 +338,7 @@ void TopoSystemPci::Load() {
       pci_dev* dev = dsp2dev[parentDsp];
       parentBus = PciBusId(dev->domain, dev->bus, dev->dev, dev->func).packed;
     }
-    if (parentBus == node->BusId().packed) break;
+    if (parentBus == node->BusId().packed) continue;
 
     assert(pcis.find(parentBus) != pcis.end());
     TopoNodePci* parent = pcis[parentBus].get();
