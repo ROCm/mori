@@ -11,12 +11,14 @@ message(STATUS "Found LibTorch CMake Path: ${CMAKE_PREFIX_PATH}")
 
 find_package(Torch REQUIRED)
 
+
 add_library(
   mori_application SHARED
   bootstrap/mpi_bootstrap.cpp
   bootstrap/torch_bootstrap.cpp
   transport/rdma/rdma.cpp
   transport/rdma/providers/mlx5/mlx5.cpp
+  transport/rdma/providers/bnxt/bnxt.cpp
   transport/rdma/providers/ibverbs/ibverbs.cpp
   transport/tcp/tcp.cpp
   memory/symmetric_memory.cpp
@@ -38,7 +40,12 @@ target_link_libraries(
   hip::device
   mlx5
   rocm_smi64
-  pci)
+  pci
+)
+
+if(USE_BNXT)
+  target_link_libraries(mori_application ${BNXT_RE_LIB})
+endif()
 
 target_include_directories(mori_application PUBLIC ${TORCH_INCLUDE_DIRS})
 target_link_libraries(mori_application c10 torch torch_cpu c10_hip torch_hip)

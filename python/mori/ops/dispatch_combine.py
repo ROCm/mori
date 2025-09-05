@@ -227,3 +227,4 @@ class EpDispatchCombineOp:
             src_token_pos.append(src_pe * max_num_token_to_send_per_rank + src_tok_id)
 
         return torch.tensor(src_token_pos, dtype=torch.int)
+

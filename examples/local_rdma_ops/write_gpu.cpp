@@ -34,17 +34,16 @@ using namespace mori::core;
       IBV_ACCESS_REMOTE_ATOMIC
 
 template <ProviderType P>
-__device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion mr, int msgSize,
-                                 int msgNum) {
-  for (int i = 0; i < msgNum; i++) {
-    uint8_t sendVal = i;
+__device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion sendMr, RdmaEndpoint& epRecv,
+                                 RdmaMemoryRegion recvMr, int msgSize, int msgNum) {
+    uint8_t sendVal = msgNum;
     for (int j = 0; j < msgSize; j++) {
-      reinterpret_cast<char*>(mr.addr)[j] = sendVal;
+      reinterpret_cast<char*>(sendMr.addr)[j] = sendVal;
     }
 
     __threadfence_system();
-    uint64_t dbr_val = PostSend<P>(epSend.wqHandle, epSend.handle.qpn, mr.addr, mr.lkey, msgSize);
-    printf("PostSend is done\n");
+    uint64_t dbr_val = PostWrite<P>(epSend.wqHandle, epSend.handle.qpn, sendMr.addr, sendMr.lkey, recvMr.addr, recvMr.rkey, msgSize);
+    printf("PostWrite is done\n");
     __threadfence_system();
     UpdateSendDbrRecord<P>(epSend.wqHandle.dbrRecAddr, epSend.wqHandle.postIdx);
     printf("UpdateSendDbrRecord is done\n");
@@ -52,87 +51,65 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion mr, int 
     RingDoorbell<P>(epSend.wqHandle.dbrAddr, dbr_val);
     printf("RingDoorbell is done\n");
     __threadfence_system();
-
-    int snd_opcode =
-        PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum, &epSend.cqHandle.consIdx);
-    printf("send PollCq is done\n");
+    uint16_t wqeIdx;
+    int snd_opcode = PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum,
+                               &epSend.cqHandle.consIdx, &wqeIdx);
+    epSend.cqHandle.consIdx += 1;
+    printf("send PollCq is done, wqeIdx: %hu\n", wqeIdx);
     UpdateCqDbrRecord<P>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx,
                          epSend.cqHandle.cqeNum);
     printf("send UpdateCqDbrRecord is done\n");
     // printf("snd_opcode %d val %d\n", snd_opcode, reinterpret_cast<char*>(mrSend.addr)[0]);
-  }
+
 }
 
 template <ProviderType P>
-__device__ void RecvThreadKernel(RdmaEndpoint& epRecv, RdmaMemoryRegion mr, int msgSize,
-                                 int msgNum) {
-
-  for (int i = 0; i < msgNum; i++) {
-    uint8_t sendVal = i;
-
-    __threadfence_system();
-    uint64_t dbr_val =  PostRecv<P>(epRecv.wqHandle, epRecv.handle.qpn, mr.addr, mr.lkey, msgSize);
-    printf("PostRecv is done\n");
-    __threadfence_system();
-    UpdateRecvDbrRecord<P>(epRecv.wqHandle.dbrRecAddr, epRecv.wqHandle.postIdx);
-    printf("UpdateRecvDbrRecord is done\n");
-    __threadfence_system();
-    if constexpr (P == ProviderType::BNXT) {
-      RingDoorbell<P>(epRecv.wqHandle.dbrAddr, dbr_val);
-      printf("recv RingDoorbell is done\n");
-    }
-
-
-    int rcv_opcode =
-        PollCq<P>(epRecv.cqHandle.cqAddr, epRecv.cqHandle.cqeNum, &epRecv.cqHandle.consIdx);
-    printf("recv PollCq is done\n");
-    UpdateCqDbrRecord<P>(epRecv.cqHandle.dbrRecAddr, epRecv.cqHandle.consIdx,
-                         epRecv.cqHandle.cqeNum);
-    printf("recv UpdateCqDbrRecord is done\n");
+__device__ void RecvThreadKernel(RdmaEndpoint& epRecv, RdmaMemoryRegion mr, int msgSize, int msgNum) {
+    printf("round %d recv verify for result\n", msgNum);
+    uint8_t sendVal = msgNum;
 
     for (int j = 0; j < msgSize; j++) {
       uint8_t recvVal = reinterpret_cast<char*>(mr.addr)[j];
       if (recvVal != sendVal) {
-        printf("round %d expected %d got %d\n", i, sendVal, recvVal);
+        printf("round %d expected %d got %d\n", msgNum, sendVal, recvVal);
         assert(false);
       }
     }
-    printf("round %d expected %d got %d pass\n", i, sendVal,
+    printf("round %d expected %d got %d pass\n", msgNum, sendVal,
            reinterpret_cast<uint8_t*>(mr.addr)[768]);
-  }
 }
 
 __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMemoryRegion mrSend,
                               RdmaMemoryRegion mrRecv, int msgSize, int msgNum) {
-  assert(gridDim.x == 2);
+  assert(gridDim.x == 1);
   int bid = blockIdx.x;
-  printf("bid %d start \n", bid);
-  if (bid == 0) {
+  for (int i = 0; i < msgNum; i++) {
+    printf("bid %d start \n", bid);
     printf("bid %d send\n", bid);
     switch (epSend.GetProviderType()) {
       case ProviderType::MLX5:
-        SendThreadKernel<ProviderType::MLX5>(epSend, mrSend, msgSize, msgNum);
+        SendThreadKernel<ProviderType::MLX5>(epSend, mrSend, epRecv, mrRecv, msgSize, i);
         break;
 #ifdef ENABLE_BNXT        
       case ProviderType::BNXT:
-        SendThreadKernel<ProviderType::BNXT>(epSend, mrSend, msgSize, msgNum);
+        SendThreadKernel<ProviderType::BNXT>(epSend, mrSend, epRecv, mrRecv, msgSize, i);
         break;
-#endif        
+#endif // ENABLE_BNXT        
       default:
         // unsupported provider
         break;
     }
-  } else if (bid == 1) {
+
     printf("bid %d recv\n", bid);
     switch (epRecv.GetProviderType()) {
       case ProviderType::MLX5:
-        RecvThreadKernel<ProviderType::MLX5>(epRecv, mrRecv, msgSize, msgNum);
+        RecvThreadKernel<ProviderType::MLX5>(epRecv, mrRecv, msgSize, i);
         break;
-#ifdef ENABLE_BNXT        
+#ifdef ENABLE_BNXT
       case ProviderType::BNXT:
-        RecvThreadKernel<ProviderType::BNXT>(epRecv, mrRecv, msgSize, msgNum);
+        RecvThreadKernel<ProviderType::BNXT>(epRecv, mrRecv, msgSize, i);
         break;
-#endif        
+#endif // ENABLE_BNXT
       default:
         // unsupported provider
         break;
@@ -142,7 +119,7 @@ __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMe
 
 void LocalRdmaOps() {
   int msgSize = 1024;
-  int msgNum = 1;
+  int msgNum = 128;
 
   // RDMA initialization
   // 1 Create device
@@ -186,15 +163,13 @@ void LocalRdmaOps() {
   HIP_RUNTIME_CHECK(hipMemcpy(devEpRecv, &epRecv, sizeof(RdmaEndpoint), hipMemcpyHostToDevice));
   void* sendBuf;
   HIP_RUNTIME_CHECK(hipMalloc(&sendBuf, msgSize));
-  RdmaMemoryRegion mrSend =
-      deviceContextSend->RegisterRdmaMemoryRegion(sendBuf, msgSize, MR_ACCESS_FLAG);
+  RdmaMemoryRegion mrSend = deviceContextSend->RegisterRdmaMemoryRegion(sendBuf, msgSize, MR_ACCESS_FLAG);
 
   void* recvBuf;
   HIP_RUNTIME_CHECK(hipMalloc(&recvBuf, msgSize));
-  RdmaMemoryRegion mrRecv =
-      deviceContextRecv->RegisterRdmaMemoryRegion(recvBuf, msgSize, MR_ACCESS_FLAG);
+  RdmaMemoryRegion mrRecv = deviceContextRecv->RegisterRdmaMemoryRegion(recvBuf, msgSize, MR_ACCESS_FLAG);
 
-  SendRecvOnGpu<<<2, 1>>>(*devEpSend, *devEpRecv, mrSend, mrRecv, msgSize, msgNum);
+  SendRecvOnGpu<<<1, 1>>>(*devEpSend, *devEpRecv, mrSend, mrRecv, msgSize, msgNum);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
   // 8 Finalize

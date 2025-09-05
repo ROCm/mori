@@ -26,6 +26,17 @@
 
 #include "infiniband/mlx5dv.h"
 #include "mori/core/transport/rdma/device_primitives.hpp"
+
+#ifdef ENABLE_BNXT
+extern "C" {
+#include <infiniband/bnxt_re_hsi.h>
+}  // ENABLE_BNXT
+#else
+extern "C" {
+#include "mori/core/transport/rdma/providers/bnxt/bnxt_re_hsi.h"
+}
+#endif
+
 namespace mori {
 namespace core {
 
@@ -57,6 +68,37 @@ static __device__ __host__ enum ibv_wc_status Mlx5HandleErrorCqe(struct mlx5_err
       return IBV_WC_RNR_RETRY_EXC_ERR;
     case MLX5_CQE_SYNDROME_REMOTE_ABORTED_ERR:
       return IBV_WC_REM_ABORT_ERR;
+    default:
+      return IBV_WC_GENERAL_ERR;
+  }
+}
+
+static __device__ __host__ enum ibv_wc_status BnxtHandleErrorCqe(int status) {
+  switch (status) {
+    case BNXT_RE_REQ_ST_OK:
+      return IBV_WC_SUCCESS;
+    case BNXT_RE_REQ_ST_BAD_RESP:
+      return IBV_WC_BAD_RESP_ERR;
+    case BNXT_RE_REQ_ST_LOC_LEN:
+      return IBV_WC_LOC_LEN_ERR;
+    case BNXT_RE_REQ_ST_LOC_QP_OP:
+      return IBV_WC_LOC_QP_OP_ERR;
+    case BNXT_RE_REQ_ST_PROT:
+      return IBV_WC_LOC_PROT_ERR;
+    case BNXT_RE_REQ_ST_MEM_OP:
+      return IBV_WC_LOC_ACCESS_ERR;
+    case BNXT_RE_REQ_ST_REM_INVAL:
+      return IBV_WC_REM_INV_REQ_ERR;
+    case BNXT_RE_REQ_ST_REM_ACC:
+      return IBV_WC_REM_ACCESS_ERR;
+    case BNXT_RE_REQ_ST_REM_OP:
+      return IBV_WC_REM_OP_ERR;
+    case BNXT_RE_REQ_ST_RNR_NAK_XCED:
+      return IBV_WC_RNR_RETRY_EXC_ERR;
+    case BNXT_RE_REQ_ST_TRNSP_XCED:
+      return IBV_WC_RETRY_EXC_ERR;
+    case BNXT_RE_REQ_ST_WR_FLUSH:
+      return IBV_WC_WR_FLUSH_ERR;
     default:
       return IBV_WC_GENERAL_ERR;
   }
@@ -95,8 +137,8 @@ static __device__ __host__ const char* IbvWcStatusString(enum ibv_wc_status stat
   return wc_status_str[status];
 }
 
-// TODO: write a better version
-static __device__ __host__ void DumpWqe(void* wqeBaseAddr, uint32_t idx) {
+// TODO: write a better verison
+static __device__ __host__ void DumpMlx5Wqe(void* wqeBaseAddr, uint32_t idx) {
   uintptr_t wqeAddr = reinterpret_cast<uintptr_t>(wqeBaseAddr) + (idx << MLX5_SEND_WQE_SHIFT);
   mlx5_wqe_ctrl_seg* wqeCtrlSeg = reinterpret_cast<mlx5_wqe_ctrl_seg*>(wqeAddr);
   uint32_t opmodIdxOpCode = BE32TOH(wqeCtrlSeg->opmod_idx_opcode);

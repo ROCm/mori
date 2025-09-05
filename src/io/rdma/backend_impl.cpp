@@ -57,6 +57,7 @@ std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
     assert("topo searching for device other than GPU is not implemented yet");
     return {};
   }
+  return {};
 }
 
 /* ----------------------------------- Local Memory Management ---------------------------------- */
@@ -234,7 +235,7 @@ void NotifManager::RegisterDevice(int devId) {
 }
 
 void NotifManager::MainLoop() {
-  int maxEvents = 128;
+  constexpr int maxEvents = 128;
   epoll_event events[maxEvents];
   while (running.load()) {
     int nfds = epoll_wait(epfd, events, maxEvents, 0 /*ms*/);
@@ -487,7 +488,7 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
 }
 
 void ControlPlaneServer::MainLoop() {
-  int maxEvents = 128;
+  constexpr int maxEvents = 128;
   epoll_event events[maxEvents];
 
   while (running.load()) {

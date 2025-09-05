@@ -43,7 +43,12 @@ __global__ void ConcurrentPutThreadKernel(int myPe, const SymmMemObjPtr memObj) 
     ShmemPutMemNbiThread(memObj, threadOffset, source, threadOffset, sizeof(uint32_t), recvPe);
     __threadfence_system();
 
-    ShmemQuietThread();
+    if (blockIdx.x == 0)
+    {
+      ShmemQuietThread();
+    }
+    
+
     // __syncthreads();
   } else {
     while (atomicAdd(reinterpret_cast<uint32_t*>(memObj->localPtr) + globalTid, 0) != sendPe) {
