@@ -288,13 +288,17 @@ void RegisterMoriIo(pybind11::module_& m) {
       .value("ERR_INVALID_ARGS", mori::io::StatusCode::ERR_INVALID_ARGS)
       .value("ERR_NOT_FOUND", mori::io::StatusCode::ERR_NOT_FOUND)
       .value("ERR_RDMA_OP", mori::io::StatusCode::ERR_RDMA_OP)
+      .value("ERR_BAD_STATE", mori::io::StatusCode::ERR_BAD_STATE)
       .export_values();
 
   py::class_<mori::io::BackendConfig>(m, "BackendConfig");
 
   py::class_<mori::io::RdmaBackendConfig, mori::io::BackendConfig>(m, "RdmaBackendConfig")
-      .def(py::init<int, int>(), py::arg("qp_per_transfer") = 1, py::arg("post_batch_size") = -1)
-      .def_readwrite("qp_per_transfer", &mori::io::RdmaBackendConfig::qpPerTransfer);
+      .def(py::init<int, int, int>(), py::arg("qp_per_transfer") = 1,
+           py::arg("post_batch_size") = -1, py::arg("num_worker_threads") = -1)
+      .def_readwrite("qp_per_transfer", &mori::io::RdmaBackendConfig::qpPerTransfer)
+      .def_readwrite("post_batch_size", &mori::io::RdmaBackendConfig::postBatchSize)
+      .def_readwrite("num_worker_threads", &mori::io::RdmaBackendConfig::numWorkerThreads);
 
   py::class_<mori::io::IOEngineConfig>(m, "IOEngineConfig")
       .def(py::init<std::string, uint16_t>(), py::arg("host") = "", py::arg("port") = 0)
@@ -360,6 +364,8 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("AllocateTransferUniqueId", &mori::io ::IOEngineSession::AllocateTransferUniqueId)
       .def("Read", &mori::io ::IOEngineSession::Read)
       .def("BatchRead", &mori::io ::IOEngineSession::BatchRead)
+      .def("Write", &mori::io ::IOEngineSession::Write)
+      .def("BatchWrite", &mori::io ::IOEngineSession::BatchWrite)
       .def("Alive", &mori::io ::IOEngineSession::Alive);
 
   py::class_<mori::io::IOEngine>(m, "IOEngine")
@@ -374,7 +380,9 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("AllocateTransferUniqueId", &mori::io ::IOEngine::AllocateTransferUniqueId)
       .def("Read", &mori::io ::IOEngine::Read)
       .def("BatchRead", &mori::io ::IOEngine::BatchRead)
-      .def("CreateSession", &mori::io::IOEngine::CreateSession, py::return_value_policy::reference)
+      .def("Write", &mori::io ::IOEngine::Write)
+      .def("BatchWrite", &mori::io ::IOEngine::BatchWrite)
+      .def("CreateSession", &mori::io::IOEngine::CreateSession)
       .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus);
 }
 

@@ -44,6 +44,13 @@ def parse_args():
         "--host", type=str, help="Host IP for mori io engine OOB communication"
     )
     parser.add_argument(
+        "--op-type",
+        type=str,
+        choices=["read", "write"],
+        default="read",
+        help="Type of ops, choices [read, write], default to 'read'",
+    )
+    parser.add_argument(
         "--buffer-size",
         type=int,
         default=32768,
@@ -86,7 +93,19 @@ def parse_args():
         "--num-qp-per-transfer",
         type=int,
         default=1,
-        help="Number of QPused for single transfer",
+        help="Number of QPs for a single transfer",
+    )
+    parser.add_argument(
+        "--num-worker-threads",
+        type=int,
+        default=1,
+        help="Number of threads used for transfer",
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=128,
+        help="Number of iterations running test",
     )
     parser.add_argument(
         "--log-level",
@@ -107,6 +126,7 @@ class EngineRole(Enum):
 class MoriIoBenchmark:
     def __init__(
         self,
+        op_type: str,
         host: str,
         port: int,
         node_rank: int,
@@ -118,8 +138,11 @@ class MoriIoBenchmark:
         num_initiator_dev: int = 1,
         num_target_dev: int = 1,
         num_qp_per_transfer: int = 1,
+        num_worker_threads: int = 1,
+        iters: int = 128,
         sweep: bool = False,
     ):
+        self.op_type = op_type
         self.host = host
         self.port = port
         self.node_rank = node_rank
@@ -132,6 +155,8 @@ class MoriIoBenchmark:
         self.enable_batch_transfer = enable_batch_transfer
         self.enable_sess = enable_sess
         self.num_qp_per_transfer = num_qp_per_transfer
+        self.num_worker_threads = num_worker_threads
+        self.iters = iters
         self.sweep = sweep
 
         self.world_size = self.num_initiator_dev + self.num_target_dev
@@ -149,6 +174,7 @@ class MoriIoBenchmark:
 
     def print_config(self):
         print("MORI-IO Benchmark Configurations:")
+        print(f"  op_type: {self.op_type}")
         print(f"  host: {self.host}")
         print(f"  port: {self.port}")
         print(f"  node_rank: {self.node_rank}")
@@ -161,6 +187,8 @@ class MoriIoBenchmark:
         print(f"  enable_batch_transfer: {self.enable_batch_transfer}")
         print(f"  enable_sess: {self.enable_sess}")
         print(f"  num_qp_per_transfer: {self.num_qp_per_transfer}")
+        print(f"  num_worker_threads: {self.num_worker_threads}")
+        print(f"  iters: {self.iters}")
         print()
 
     def send_bytes(self, b: bytes, dst: int):
@@ -198,7 +226,9 @@ class MoriIoBenchmark:
         )
         self.engine = IOEngine(key=f"{self.role.name}-{self.role_rank}", config=config)
         config = RdmaBackendConfig(
-            qp_per_transfer=self.num_qp_per_transfer, post_batch_size=-1
+            qp_per_transfer=self.num_qp_per_transfer,
+            post_batch_size=-1,
+            num_worker_threads=self.num_worker_threads,
         )
         self.engine.create_backend(BackendType.RDMA, config)
 
@@ -242,14 +272,20 @@ class MoriIoBenchmark:
             for i in range(self.transfer_batch_size):
                 offset = buffer_size * i
                 if self.enable_sess:
-                    transfer_status = self.sess.read(
+                    func = self.sess.read if self.op_type == "read" else self.sess.write
+                    transfer_status = func(
                         offset,
                         offset,
                         buffer_size,
                         transfer_uids[i],
                     )
                 else:
-                    transfer_status = self.engine.read(
+                    func = (
+                        self.engine.read
+                        if self.op_type == "read"
+                        else self.engine.write
+                    )
+                    transfer_status = func(
                         self.mem,
                         offset,
                         self.target_mem,
@@ -271,14 +307,24 @@ class MoriIoBenchmark:
             sizes = [buffer_size for _ in range(self.transfer_batch_size)]
             transfer_uid = self.engine.allocate_transfer_uid()
             if self.enable_sess:
-                transfer_status = self.sess.batch_read(
+                func = (
+                    self.sess.batch_read
+                    if self.op_type == "read"
+                    else self.sess.batch_write
+                )
+                transfer_status = func(
                     offsets,
                     offsets,
                     sizes,
                     transfer_uid,
                 )
             else:
-                transfer_status = self.engine.batch_read(
+                func = (
+                    self.engine.batch_read
+                    if self.op_type == "read"
+                    else self.engine.batch_write
+                )
+                transfer_status = func(
                     self.mem,
                     offsets,
                     self.target_mem,
@@ -340,7 +386,7 @@ class MoriIoBenchmark:
             self.run_once(self.buffer_size)
             dist.barrier()
 
-            iters = 128
+            iters = self.iters
             table = PrettyTable(
                 field_names=[
                     "MsgSize (B)",
@@ -397,6 +443,7 @@ def benchmark_engine(local_rank, node_rank, args):
     if args.all:
         max_buffer_size = max(max_buffer_size, 2**20)
     bench = MoriIoBenchmark(
+        op_type=args.op_type,
         host=args.host,
         port=get_free_port(),
         node_rank=node_rank,
@@ -408,6 +455,8 @@ def benchmark_engine(local_rank, node_rank, args):
         num_initiator_dev=args.num_initiator_dev,
         num_target_dev=args.num_target_dev,
         num_qp_per_transfer=args.num_qp_per_transfer,
+        num_worker_threads=args.num_worker_threads,
+        iters=args.iters,
         sweep=args.all,
     )
     bench.print_config()

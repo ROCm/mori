@@ -5,6 +5,7 @@ lib*
 
 # Python
 *.egg-info
+.eggs
 *.pyc
 .pytest_cache
 __pycache__

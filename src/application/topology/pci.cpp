@@ -307,15 +307,24 @@ void TopoSystemPci::Load() {
 
   // Create root port
   for (auto& dom : domains) {
-    TopoNodePci* n = TopoNodePci::CreateRootComplex(PciBusId(dom, 0, 0, 0), -1, root);
-    pcis.emplace(n->BusId().packed, n);
+    TopoNodePci* n = nullptr;
+    PciBusId busId(dom, 0, 0, 0);
+    // No root port or device found, create a virtual one
+    if (pcis.find(busId.packed) == pcis.end()) {
+      n = TopoNodePci::CreateRootComplex(busId, -1, root);
+      pcis.emplace(n->BusId().packed, n);
+    }
+    n = pcis[busId.packed].get();
     root->AddDownstreamPort(n);
+    n->SetUpstreamPort(root);
   }
 
   // Connect upstream port and downstream port
   for (auto& it : pcis) {
     PciBusId busId = it.first;
     TopoNodePci* node = it.second.get();
+
+    // These nodes should already be connected
     if ((node->Type() == TopoNodePciType::RootComplex) ||
         node->Type() == TopoNodePciType::VirtualRoot)
       continue;
@@ -329,6 +338,10 @@ void TopoSystemPci::Load() {
       pci_dev* dev = dsp2dev[parentDsp];
       parentBus = PciBusId(dev->domain, dev->bus, dev->dev, dev->func).packed;
     }
+
+    // Prevent loopback to self, this could happen in SR-IOV mode where all devices directly connect
+    // to root complex
+    if (parentBus == node->BusId().packed) continue;
 
     assert(pcis.find(parentBus) != pcis.end());
     TopoNodePci* parent = pcis[parentBus].get();

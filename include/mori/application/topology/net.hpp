@@ -49,6 +49,7 @@ class TopoSystemNet {
   TopoSystemNet();
   ~TopoSystemNet();
 
+  int NumNics() const { return nics.size(); }
   std::vector<TopoNodeNic*> GetNics() const;
 
  private:

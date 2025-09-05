@@ -33,101 +33,13 @@
 #include "mori/application/transport/tcp/tcp.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/io/backend.hpp"
+#include "mori/io/common.hpp"
 #include "mori/io/engine.hpp"
-#include "mori/io/meta_data.hpp"
+#include "src/io/rdma/common.hpp"
+#include "src/io/rdma/executor.hpp"
 
 namespace mori {
 namespace io {
-
-/* ---------------------------------------------------------------------------------------------- */
-/*                                     Common Data Structures                                     */
-/* ---------------------------------------------------------------------------------------------- */
-struct TopoKey {
-  int deviceId;
-  MemoryLocationType loc;
-
-  bool operator==(const TopoKey& rhs) const noexcept {
-    return (deviceId == rhs.deviceId) && (loc == rhs.loc);
-  }
-
-  MSGPACK_DEFINE(deviceId, loc);
-};
-
-struct TopoKeyPair {
-  TopoKey local;
-  TopoKey remote;
-
-  bool operator==(const TopoKeyPair& rhs) const noexcept {
-    return (local == rhs.local) && (remote == rhs.remote);
-  }
-
-  MSGPACK_DEFINE(local, remote);
-};
-
-struct MemoryKey {
-  int devId;
-  MemoryUniqueId id;
-
-  bool operator==(const MemoryKey& rhs) const noexcept {
-    return (id == rhs.id) && (devId == rhs.devId);
-  }
-};
-
-struct EpPair {
-  int weight;
-  int ldevId;
-  int rdevId;
-  EngineKey remoteEngineKey;
-  application::RdmaEndpoint local;
-  application::RdmaEndpointHandle remote;
-};
-
-}  // namespace io
-}  // namespace mori
-
-namespace std {
-template <>
-struct hash<mori::io::TopoKey> {
-  std::size_t operator()(const mori::io::TopoKey& k) const noexcept {
-    std::size_t h1 = std::hash<uint32_t>{}(k.deviceId);
-    std::size_t h2 = std::hash<uint32_t>{}(static_cast<uint32_t>(k.loc));
-    return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
-  }
-};
-
-template <>
-struct hash<mori::io::TopoKeyPair> {
-  std::size_t operator()(const mori::io::TopoKeyPair& kp) const noexcept {
-    std::size_t h1 = std::hash<mori::io::TopoKey>{}(kp.local);
-    std::size_t h2 = std::hash<mori::io::TopoKey>{}(kp.remote);
-    return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
-  }
-};
-
-template <>
-struct hash<mori::io::MemoryKey> {
-  std::size_t operator()(const mori::io::MemoryKey& k) const noexcept {
-    std::size_t h1 = std::hash<mori::io::MemoryUniqueId>{}(k.id);
-    std::size_t h2 = std::hash<int>{}(k.devId);
-    return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
-  }
-};
-
-}  // namespace std
-
-namespace mori {
-namespace io {
-
-using EpPairVec = std::vector<EpPair>;
-using RouteTable = std::unordered_map<TopoKeyPair, EpPairVec>;
-using MemoryTable = std::unordered_map<MemoryKey, application::RdmaMemoryRegion>;
-
-struct RemoteEngineMeta {
-  EngineKey key;
-  RouteTable rTable;
-  MemoryTable mTable;
-};
-
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           RdmaManager                                          */
 /* ---------------------------------------------------------------------------------------------- */
@@ -183,12 +95,6 @@ class RdmaManager {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      Notification Manager                                      */
 /* ---------------------------------------------------------------------------------------------- */
-struct NotifMessage {
-  TransferUniqueId id{0};
-  int qpIndex{-1};
-  int totalNum{-1};
-};
-
 class NotifManager {
  public:
   NotifManager(RdmaManager*, const RdmaBackendConfig&);
@@ -232,7 +138,8 @@ class NotifManager {
 /* ---------------------------------------------------------------------------------------------- */
 class ControlPlaneServer {
  public:
-  ControlPlaneServer(std::string host, int port, RdmaManager*, NotifManager*);
+  ControlPlaneServer(const std::string& key, const std::string& host, int port, RdmaManager*,
+                     NotifManager*);
   ~ControlPlaneServer();
 
   // Remote engine meta management
@@ -257,6 +164,8 @@ class ControlPlaneServer {
   void HandleControlPlaneProtocol(int fd);
 
  private:
+  EngineKey myEngKey;
+
   mutable std::mutex mu;
 
   int epfd{-1};
@@ -278,16 +187,16 @@ class RdmaBackendSession : public BackendSession {
  public:
   RdmaBackendSession() = default;
   RdmaBackendSession(const RdmaBackendConfig& config, const application::RdmaMemoryRegion& local,
-                     const application::RdmaMemoryRegion& remote, const EpPairVec& eps);
+                     const application::RdmaMemoryRegion& remote, const EpPairVec& eps,
+                     Executor* executor);
   ~RdmaBackendSession() = default;
 
-  void Read(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
-            TransferUniqueId id);
-  void Write(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
-             TransferUniqueId id);
+  void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
+                 TransferUniqueId id, bool isRead);
 
-  void BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets, const SizeVec& sizes,
-                 TransferStatus* status, TransferUniqueId id);
+  void BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                      const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
+                      bool isRead);
 
   bool Alive() const;
 
@@ -296,6 +205,7 @@ class RdmaBackendSession : public BackendSession {
   application::RdmaMemoryRegion local{};
   application::RdmaMemoryRegion remote{};
   EpPairVec eps{};
+  Executor* executor{nullptr};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -311,14 +221,13 @@ class RdmaBackend : public Backend {
   void DeregisterRemoteEngine(const EngineDesc&);
   void RegisterMemory(const MemoryDesc& desc);
   void DeregisterMemory(const MemoryDesc& desc);
-  void Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
-            size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id);
-  void Write(const MemoryDesc& localSrc, size_t localOffset, const MemoryDesc& remoteDest,
-             size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id);
-  void BatchRead(const MemoryDesc& localDest, const SizeVec& localOffsets,
-                 const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets, const SizeVec& sizes,
-                 TransferStatus* status, TransferUniqueId id);
-
+  void ReadWrite(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
+                 size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id,
+                 bool isRead);
+  void BatchReadWrite(const MemoryDesc& localDest, const SizeVec& localOffsets,
+                      const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
+                      const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
+                      bool isRead);
   BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
 
@@ -326,11 +235,12 @@ class RdmaBackend : public Backend {
   void CreateSession(const MemoryDesc& local, const MemoryDesc& remote, RdmaBackendSession& sess);
 
  private:
+  EngineKey myEngKey;
   RdmaBackendConfig config;
-  std::unique_ptr<RdmaManager> rdma;
-  std::unique_ptr<NotifManager> notif;
-  std::unique_ptr<ControlPlaneServer> server;
-  std::vector<std::unique_ptr<RdmaBackendSession>> sessions;
+  std::unique_ptr<RdmaManager> rdma{nullptr};
+  std::unique_ptr<NotifManager> notif{nullptr};
+  std::unique_ptr<ControlPlaneServer> server{nullptr};
+  std::unique_ptr<Executor> executor{nullptr};
 };
 
 }  // namespace io
