@@ -48,9 +48,9 @@ __global__ void AccumPerfKernel(int myPe, int npes, const SymmMemObjPtr src,
     srcPtrs[laneId] = src->template GetAs<T*>(laneId) + globalWarpId * elementPerWarp;
   }
 
-  mori::core::WarpAccum<T, 8>(dest->template GetAs<T*>() + globalWarpId * elementPerWarp, srcPtrs,
-                              nullptr, npes,
-                              std::min(elementPerWarp, elementNum - globalWarpId * elementPerWarp));
+  mori::core::WarpAccum<T, 16>(
+      dest->template GetAs<T*>() + globalWarpId * elementPerWarp, srcPtrs, nullptr, npes,
+      std::min(elementPerWarp, elementNum - globalWarpId * elementPerWarp));
 }
 
 void AccumPerf() {

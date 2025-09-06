@@ -92,7 +92,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             dispatch_indices,
             call_reset=False,
             block_num=80,
-            warp_per_block=8,
+            warp_per_block=4,
         )
         end_event.record()
         self.sync()
@@ -183,7 +183,7 @@ def _bench_dispatch_combine(
     port,
     max_num_inp_token_per_rank=4096,
     data_type=torch.bfloat16,
-    hidden_dim=4096,
+    hidden_dim=7168,
     scale_dim=0,
     scale_type_size=0,
     num_experts_per_rank=16,

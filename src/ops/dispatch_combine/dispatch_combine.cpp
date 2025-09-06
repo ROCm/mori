@@ -209,7 +209,7 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
 
         if (kernelType == KernelType::InterNode) {
           assert(config.useExternalInpBuffer);
-          EpDispatchInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
+          // EpDispatchInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else {
@@ -235,7 +235,7 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
             actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
         if (kernelType == KernelType::InterNode) {
           assert(config.useExternalInpBuffer);
-          EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
+          // EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpCombineIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else {

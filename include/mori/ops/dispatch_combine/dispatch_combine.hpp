@@ -85,17 +85,13 @@ struct EpDispatchCombineConfig {
   // the provided buffer is shmemInpTokMemObj
   bool useExternalInpBuffer{true};
 
-  inline __host__ __device__ int MaxNumTokensToSendPerRank() const {
-    return maxNumInpTokenPerRank;
-  }
+  inline __host__ __device__ int MaxNumTokensToSendPerRank() const { return maxNumInpTokenPerRank; }
 
   inline __host__ __device__ int MaxNumTokensToSend() const {
     return worldSize * MaxNumTokensToSendPerRank();
   }
 
-  inline __host__ __device__ int MaxNumTokensToRecvPerRank() const {
-    return maxNumInpTokenPerRank;
-  }
+  inline __host__ __device__ int MaxNumTokensToRecvPerRank() const { return maxNumInpTokenPerRank; }
 
   inline __host__ __device__ int MaxNumTokensToRecv() const {
     return worldSize * MaxNumTokensToRecvPerRank();
@@ -258,9 +254,9 @@ struct EpDispatchCombineArgs {
   uint32_t crossDeviceBarrierFlag{1};
 };
 
-using EpDispatchCombineArgsVariant =
-    std::variant<EpDispatchCombineArgs<float>, EpDispatchCombineArgs<hip_bfloat16>,
-                 EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> >;
+using EpDispatchCombineArgsVariant = std::variant<EpDispatchCombineArgs<hip_bfloat16>>;
+// std::variant<EpDispatchCombineArgs<float>, EpDispatchCombineArgs<hip_bfloat16>,
+//              EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> >;
 
 template <typename T>
 EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle& handle) {
@@ -303,12 +299,12 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
 inline EpDispatchCombineArgsVariant GetEpDispatchCombineArgsByInputType(
     const EpDispatchCombineHandle& handle) {
   switch (handle.inputType) {
-    case HIP_R_32F:
-      return GetEpDispatchCombineArgs<float>(handle);
+    // case HIP_R_32F:
+    // return GetEpDispatchCombineArgs<float>(handle);
     case HIP_R_16BF:
       return GetEpDispatchCombineArgs<hip_bfloat16>(handle);
-    case HIP_R_8F_E4M3_FNUZ:
-      return GetEpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>(handle);
+    // case HIP_R_8F_E4M3_FNUZ:
+    //   return GetEpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>(handle);
     default:
       std::ostringstream oss;
       oss << "Unsupported inputType " << HipDataTypeToString(handle.inputType)

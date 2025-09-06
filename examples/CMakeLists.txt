@@ -1,5 +1,6 @@
 add_executable(dist_write dist_rdma_ops/dist_write.cpp utils/args_parser.cpp)
-target_include_directories(dist_write PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
+target_include_directories(dist_write
+                           PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
 target_link_libraries(dist_write mori_application hip::host hip::device)
 
 add_executable(send_recv_gpu local_rdma_ops/send_recv_gpu.cpp)
@@ -46,6 +47,11 @@ target_link_libraries(atomic_perf mori_application hip::host hip::device)
 add_executable(accum_perf benchmarks/accum_perf.cpp)
 target_link_libraries(accum_perf mori_application mori_shmem hip::host
                       hip::device)
+target_compile_options(accum_perf PUBLIC --save-temps)
+
+add_executable(accum_test benchmarks/accum_test.cpp)
+target_link_libraries(accum_test mori_application hip::host hip::device)
+target_compile_options(accum_test PUBLIC --save-temps)
 
 add_executable(ibverbs_test application/ibverbs_test.cpp)
 target_link_libraries(ibverbs_test mori_application mori_shmem hip::host

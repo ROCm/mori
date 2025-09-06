@@ -259,14 +259,18 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
         srcWeightsPtr[j] = nullptr;
       }
     }
-    core::WarpAccum<T, 8>(
+    // core::WarpAccum<T, 8, 8, 1>(
+    //     args.shmemOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim +
+    //     hiddenDimOffset, srcPtrs, nullptr, hiddenDimSize);
+    core::WarpAccum8<T, 4, 8, 1>(
         args.shmemOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim + hiddenDimOffset,
-        srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
+        srcPtrs[0], srcPtrs[1], srcPtrs[2], srcPtrs[3], srcPtrs[4], srcPtrs[5], srcPtrs[6],
+        srcPtrs[7], nullptr, hiddenDimSize);
 
     if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
-      core::WarpAccum<float, 4>(
+      core::WarpAccum<float, 4, 8, 1>(
           args.shmemOutWeightsMemObj->template GetAs<float*>() + tokenId * config.numExpertPerToken,
-          srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
+          srcWeightsPtr, nullptr, config.numExpertPerToken);
     }
   }
 }

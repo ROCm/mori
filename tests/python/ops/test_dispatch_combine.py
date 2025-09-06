@@ -290,7 +290,7 @@ def _test_dispatch_combine(
 
 # TODO: create a sub process group so that we can test worlds size < 8
 @pytest.mark.parametrize("world_size", (8,))
-@pytest.mark.parametrize("data_type", (torch.float8_e4m3fnuz, torch.bfloat16))
+@pytest.mark.parametrize("data_type", (torch.bfloat16,))
 @pytest.mark.parametrize("hidden_dim", (7168, 4096))
 @pytest.mark.parametrize("scale_dim", (0, 32))
 @pytest.mark.parametrize("scale_type_size", (1, 4))

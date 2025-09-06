@@ -23,6 +23,7 @@
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
+
 #include "mori/core/utils.hpp"
 namespace mori {
 namespace core {
@@ -409,7 +410,8 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
 }
 
 template <typename T, int VecBytes, int AccumNum>
-__forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __restrict__ srcs,
+__forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest,
+                                              T* __restrict__ const* __restrict__ srcs,
                                               const float* __restrict__ srcScales, size_t& offset,
                                               size_t nelems) {
   constexpr int vecSize = VecBytes / sizeof(T);
@@ -566,6 +568,118 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
       float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
       accumValFp32 += float(srcPtr[offset]) * srcScale;
     }
+    dest[offset] = T(accumValFp32);
+    offset += warpSize;
+  }
+}
+
+template <typename T, int VecBytes, int AccumNum, int Unroll>
+__forceinline__ __device__ void WarpAccum8(T* __restrict__ dest, T* __restrict__ src0,
+                                           T* __restrict__ src1, T* __restrict__ src2,
+                                           T* __restrict__ src3, T* __restrict__ src4,
+                                           T* __restrict__ src5, T* __restrict__ src6,
+                                           T* __restrict__ src7,
+                                           const float* __restrict__ srcScales, size_t nelems) {
+  static_assert((VecBytes <= 16) && (VecBytes >= 4) && IsPowerOf2(VecBytes));
+
+  constexpr int vecSize = VecBytes / sizeof(T);
+  const int laneId = threadIdx.x & (warpSize - 1);
+  size_t offset = 0;
+
+  // WarpAccumImpl<T, VecBytes, AccumNum, Unroll>(dest, srcs, srcScales, offset, nelems);
+  // WarpAccumImpl<T, VecBytes, AccumNum, 1>(dest, srcs, srcScales, offset, nelems);
+  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+
+  const int elemsPerWarp = warpSize * vecSize;
+  const size_t numIters = (nelems - offset) / elemsPerWarp;
+
+  const size_t laneOffset = laneId * vecSize;
+
+  float scales[AccumNum];
+#pragma unroll AccumNum
+  for (int i = 0; i < AccumNum; ++i) {
+    scales[i] = (srcScales == nullptr) ? 1.0f : srcScales[i];
+  }
+
+  for (size_t iter = 0; iter < numIters; ++iter) {
+    float accumValFp32[vecSize] = {0};
+
+    DataType srcVals[AccumNum];
+
+    srcVals[0] = (src0 != nullptr) ? load<VecBytes>(src0 + offset + laneOffset) : DataType{};
+    srcVals[1] = (src1 != nullptr) ? load<VecBytes>(src1 + offset + laneOffset) : DataType{};
+    srcVals[2] = (src2 != nullptr) ? load<VecBytes>(src2 + offset + laneOffset) : DataType{};
+    srcVals[3] = (src3 != nullptr) ? load<VecBytes>(src3 + offset + laneOffset) : DataType{};
+    srcVals[4] = (src4 != nullptr) ? load<VecBytes>(src4 + offset + laneOffset) : DataType{};
+    srcVals[5] = (src5 != nullptr) ? load<VecBytes>(src5 + offset + laneOffset) : DataType{};
+    srcVals[6] = (src6 != nullptr) ? load<VecBytes>(src6 + offset + laneOffset) : DataType{};
+    srcVals[7] = (src7 != nullptr) ? load<VecBytes>(src7 + offset + laneOffset) : DataType{};
+
+#pragma unroll AccumNum
+    for (int i = 0; i < AccumNum; ++i) {
+      for (int j = 0; j < vecSize; ++j) {
+        accumValFp32[j] += float(reinterpret_cast<const T*>(srcVals + i)[j]) * scales[i];
+      }
+    }
+
+    union {
+      DataType accumVec;
+      T accumVal[vecSize];
+    };
+#pragma unroll vecSize
+    for (int j = 0; j < vecSize; ++j) {
+      accumVal[j] = T(accumValFp32[j]);
+    }
+    store<VecBytes>(dest + offset + laneOffset, accumVec);
+
+    offset += elemsPerWarp;
+  }
+
+  offset += laneId;
+  while (offset < nelems) {
+    float accumValFp32 = 0;
+
+    if (src0 != nullptr) {
+      float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[0];
+      accumValFp32 += float(src0[offset]) * srcScale;
+    }
+    if (src1 != nullptr) {
+      float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[1];
+      accumValFp32 += float(src1[offset]) * srcScale;
+    }
+    if (src2 != nullptr) {
+      float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[2];
+      accumValFp32 += float(src2[offset]) * srcScale;
+    }
+    if (src3 != nullptr) {
+      float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[3];
+      accumValFp32 += float(src3[offset]) * srcScale;
+    }
+    if (src4 != nullptr) {
+      float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[4];
+      accumValFp32 += float(src4[offset]) * srcScale;
+    }
+    if (src5 != nullptr) {
+      float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[5];
+      accumValFp32 += float(src5[offset]) * srcScale;
+    }
+    if (src6 != nullptr) {
+      float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[6];
+      accumValFp32 += float(src6[offset]) * srcScale;
+    }
+    if (src7 != nullptr) {
+      float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[7];
+      accumValFp32 += float(src7[offset]) * srcScale;
+    }
+
+    // #pragma unroll AccumNum
+    //     for (int i = 0; i < AccumNum; ++i) {
+    //       const T* srcPtr = srcs[i];
+    //       if (srcPtr == nullptr) continue;
+
+    //       float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
+    //       accumValFp32 += float(srcPtr[offset]) * srcScale;
+    //     }
     dest[offset] = T(accumValFp32);
     offset += warpSize;
   }
