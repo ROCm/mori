@@ -102,7 +102,7 @@ void EpDispatchCombineHandle::FinalizeShmemBuf() {
 }
 
 void EpDispatchCombineHandle::InitializeTokenNumSignalBuf() {
-  size_t tokenNumSignalSize = config.worldSize * sizeof(index_t);
+  size_t tokenNumSignalSize = config.worldSize * sizeof(index_t) * 2;
   recvTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
   sendTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
 
