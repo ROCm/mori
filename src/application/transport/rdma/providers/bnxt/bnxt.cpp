@@ -182,7 +182,6 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   qp = bnxt_re_dv_create_qp(pd, &dv_qp_attr);
   assert(qp);
   qpn = qp->qp_num;
-  std::cout << qpMemInfo << std::endl;
 }
 
 BnxtQpContainer::~BnxtQpContainer() { DestroyQueuePair(); }
