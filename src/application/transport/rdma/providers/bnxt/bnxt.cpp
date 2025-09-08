@@ -221,7 +221,8 @@ void BnxtQpContainer::ModifyRst2Init() {
 }
 
 void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
-                                     const ibv_port_attr& portAttr) {
+                                     const ibv_port_attr& portAttr,
+                                     const ibv_device_attr_ex& deviceAttr) {
   struct ibv_qp_attr attr;
   int attr_mask;
 
@@ -239,7 +240,7 @@ void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
   attr.ah_attr.port_num = config.portId;
 
   // TODO: max_dest_rd_atomic whether affect nums of amo/rd
-  attr.max_dest_rd_atomic = 1;
+  attr.max_dest_rd_atomic = deviceAttr.orig_attr.max_qp_rd_atom;
   attr.min_rnr_timer = 12;
 
   attr_mask = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_RQ_PSN | IBV_QP_DEST_QPN | IBV_QP_AV |
@@ -354,10 +355,10 @@ void BnxtDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   assert(qpPool.find(local_qpn) != qpPool.end());
   BnxtQpContainer* qp = qpPool.at(local_qpn);
   RdmaDevice* rdmaDevice = GetRdmaDevice();
-  const ibv_device_attr_ex* deviceAttr = rdmaDevice->GetDeviceAttr();
+  const ibv_device_attr_ex& deviceAttr = *(rdmaDevice->GetDeviceAttr());
   const ibv_port_attr& portAttr = *(rdmaDevice->GetPortAttrMap()->find(local.portId)->second);
   qp->ModifyRst2Init();
-  qp->ModifyInit2Rtr(remote, portAttr);
+  qp->ModifyInit2Rtr(remote, portAttr, deviceAttr);
   qp->ModifyRtr2Rts(local, remote);
 }
 

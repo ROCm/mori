@@ -79,7 +79,8 @@ class BnxtQpContainer {
   ~BnxtQpContainer();
 
   void ModifyRst2Init();
-  void ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr);
+  void ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr,
+                      const ibv_device_attr_ex& deviceAttr);
   void ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
                      const RdmaEndpointHandle& remote_handle);
 
