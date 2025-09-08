@@ -56,6 +56,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         ) = op.dispatch(
             all_rank_input[self.config.rank],
             all_rank_weights[self.config.rank],
+            # None,
             all_rank_scales[self.config.rank],
             all_rank_indices[self.config.rank],
             block_num=80,
@@ -92,7 +93,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             dispatch_indices,
             call_reset=False,
             block_num=80,
-            warp_per_block=8,
+            warp_per_block=4,
         )
         end_event.record()
         self.sync()

@@ -152,11 +152,13 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
       core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset,
                      reinterpret_cast<char*>(args.inpTokenBuf) + tokenOffset,
                      config.hiddenDim * sizeof(T));
-      core::WarpCopy(
-          args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + weightOffset,
-          reinterpret_cast<char*>(args.weightsBuf) +
-              tokenId * config.numExpertPerToken * sizeof(float),
-          config.numExpertPerToken * sizeof(float));
+      if (args.weightsBuf) {
+        core::WarpCopy(
+            args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + weightOffset,
+            reinterpret_cast<char*>(args.weightsBuf) +
+                tokenId * config.numExpertPerToken * sizeof(float),
+            config.numExpertPerToken * sizeof(float));
+      }
       core::WarpCopy(
           args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + indicesOffset,
           reinterpret_cast<char*>(args.tokenIndices) +
@@ -220,11 +222,13 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
         core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset,
                        reinterpret_cast<char*>(args.inpTokenBuf) + tokenOffset,
                        config.hiddenDim * sizeof(T));
-        core::WarpCopy(
-            args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + weightOffset,
-            reinterpret_cast<char*>(args.weightsBuf) +
-                tokenId * config.numExpertPerToken * sizeof(float),
-            config.numExpertPerToken * sizeof(float));
+        if (args.weightsBuf) {
+          core::WarpCopy(
+              args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + weightOffset,
+              reinterpret_cast<char*>(args.weightsBuf) +
+                  tokenId * config.numExpertPerToken * sizeof(float),
+              config.numExpertPerToken * sizeof(float));
+        }
         core::WarpCopy(
             args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + indicesOffset,
             reinterpret_cast<char*>(args.tokenIndices) +

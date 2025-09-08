@@ -144,7 +144,8 @@ class EpDispatchCombineTestCase:
             src_rank = int(pos) // self.config.max_num_inp_token_per_rank
             src_id = int(pos) % self.config.max_num_inp_token_per_rank
             assert torch.equal(all_rank_input[src_rank][src_id], dispatch_output[i])
-            assert torch.equal(all_rank_weights[src_rank][src_id], dispatch_weights[i])
+            if dispatch_weights is not None:
+                assert torch.equal(all_rank_weights[src_rank][src_id], dispatch_weights[i])
             if dispatch_scales is not None:
                 assert torch.equal(
                     all_rank_scales[src_rank][src_id], dispatch_scales[i]
