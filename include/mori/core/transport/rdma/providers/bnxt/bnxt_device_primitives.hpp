@@ -116,7 +116,7 @@ inline __device__ uint64_t BnxtPostSend(WorkQueueHandle& wq, uint32_t curPostIdx
   int psnCnt = (bytes == 0) ? 1 : (bytes + mtuSize - 1) / mtuSize;
 
   uint32_t slotIdx = curPostIdx % wqeNum;
-  // TODO： wqeNum should be multiple of slotsNum, BRCM say using a specific conf currently.
+  // TODO: wqeNum should be multiple of slotsNum, BRCM say using a specific conf currently.
   assert((slotIdx + slotsNum) <= wqeNum);
 
   uint32_t wqe_size = BNXT_RE_HDR_WS_MASK & slotsNum;
