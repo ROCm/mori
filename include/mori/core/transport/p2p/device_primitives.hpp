@@ -23,7 +23,7 @@
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
-
+#include "mori/core/utils.hpp"
 namespace mori {
 namespace core {
 

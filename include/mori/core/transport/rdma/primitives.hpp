@@ -23,6 +23,7 @@
 
 #include <limits.h>
 #include <stdint.h>
+#include "infiniband/verbs.h"
 
 namespace mori {
 namespace core {
@@ -32,7 +33,7 @@ enum ProviderType {
   // Mellanox direct verbs
   MLX5 = 1,
   // Broadcom direct verbs
-  BNXTRE = 2,
+  BNXT = 2,
   // Ib verbs
   IBVERBS = 3,
 };
@@ -61,6 +62,52 @@ typedef enum {
   AMO_COMPARE_SWAP,
   AMO_OP_SENTINEL = INT_MAX,
 } atomicType;
+
+#define OUTSTANDING_TABLE_SIZE (65536)
+struct WorkQueueHandle {
+  uint32_t postIdx{0};     // numbers of wqe that post to work queue
+  uint32_t dbTouchIdx{0};  // numbers of wqe that touched doorbell
+  uint32_t doneIdx{0};     // numbers of wqe that have been consumed by nic
+  uint32_t readyIdx{0};
+  union {
+    struct {
+      uint32_t msntblSlotIdx;
+      uint32_t psnIdx; // for bnxt msn psn index calculate
+    };
+    uint64_t msnPack{0};
+  };
+  void* sqAddr{nullptr};
+  void* msntblAddr{nullptr}; // for bnxt
+  void* rqAddr{nullptr};
+  void* dbrRecAddr{nullptr};
+  void* dbrAddr{nullptr};
+  uint32_t mtuSize{4096};
+  uint32_t sqWqeNum{0};
+  uint32_t msntblNum{0};
+  uint32_t rqWqeNum{0};
+  uint32_t postSendLock{0};
+  uint64_t outstandingWqe[OUTSTANDING_TABLE_SIZE]{0};
+};
+
+struct CompletionQueueHandle {
+  void* cqAddr{nullptr};
+  void* dbrRecAddr{nullptr};
+  void* dbrAddr{nullptr};
+  uint32_t consIdx{0}; // numbers of cqe that have been completed
+  uint32_t needConsIdx{0}; // numbers of cqe that should be consumed
+  uint32_t activeIdx{0}; // numbers of cqe that under processing but not completed
+  uint32_t cq_consumer{0};
+  uint32_t cqeNum{0};
+  uint32_t cqeSize{0};
+  uint32_t pollCqLock{0};
+};
+
+struct IBVerbsHandle {
+  ibv_qp* qp{nullptr};
+  ibv_cq* cq{nullptr};
+  ibv_srq* srq{nullptr};
+  ibv_comp_channel* compCh{nullptr};
+};
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Utility Functions                                       */

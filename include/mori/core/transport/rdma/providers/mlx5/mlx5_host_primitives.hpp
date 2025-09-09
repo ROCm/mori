@@ -29,7 +29,7 @@
 #include "mori/application/utils/udma_barrier.h"
 #include "mori/core/transport/rdma/device_primitives.hpp"
 #include "mori/core/transport/rdma/providers/mlx5/mlx5_defs.hpp"
-#include "mori/core/transport/rdma/providers/mlx5/utils.h"
+#include "mori/core/transport/rdma/providers/utils.h"
 
 namespace mori {
 namespace core {

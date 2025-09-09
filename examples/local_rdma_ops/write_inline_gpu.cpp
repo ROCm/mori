@@ -35,8 +35,8 @@ using namespace mori::core;
 
 #define MAX_INLINE_DATA_SIZE 12
 
+template <ProviderType P>
 __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion mr) {
-  uint32_t postIdx = 0;
   uint8_t vals[MAX_INLINE_DATA_SIZE];
   uintptr_t raddr = mr.addr;
 
@@ -46,17 +46,18 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion mr) {
       vals[j] = sendVal;
     }
 
-    uint64_t dbr_val = PostWriteInline<ProviderType::MLX5>(
-        epSend.wqHandle.sqAddr, epSend.wqHandle.sqWqeNum, &postIdx, postIdx, epSend.handle.qpn,
-        vals, raddr, mr.rkey, i);
-    UpdateSendDbrRecord<ProviderType::MLX5>(epSend.wqHandle.dbrRecAddr, postIdx);
+    uint64_t dbr_val =
+        PostWriteInline<P>(epSend.wqHandle, epSend.handle.qpn, vals, raddr, mr.rkey, i);
+    UpdateSendDbrRecord<P>(epSend.wqHandle.dbrRecAddr, epSend.wqHandle.postIdx);
     __threadfence_system();
-    RingDoorbell<ProviderType::MLX5>(epSend.wqHandle.dbrAddr, dbr_val);
+    RingDoorbell<P>(epSend.wqHandle.dbrAddr, dbr_val);
     __threadfence_system();
 
-    int opcode = PollCq<ProviderType::MLX5>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum,
-                                            &epSend.cqHandle.consIdx);
-    UpdateCqDbrRecord<ProviderType::MLX5>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx);
+    int opcode =
+        PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum, &epSend.cqHandle.consIdx);
+    __threadfence_system();
+    UpdateCqDbrRecord<P>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx,
+                         epSend.cqHandle.cqeNum);
     // printf("round %d snd_opcode %d\n", i, opcode);
 
     raddr += i;
@@ -81,13 +82,25 @@ __device__ void RecvThreadKernel(RdmaEndpoint& epRecv, RdmaMemoryRegion mr) {
 
 __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMemoryRegion mrRecv) {
   assert(gridDim.x == 2);
-  int tid = blockIdx.x;
-  printf("tid %d start \n", tid);
-  if (tid == 0) {
-    printf("tid %d send\n", tid);
-    SendThreadKernel(epSend, mrRecv);
-  } else if (tid == 1) {
-    printf("tid %d recv\n", tid);
+  int bid = blockIdx.x;
+  printf("bid %d start \n", bid);
+  if (bid == 0) {
+    printf("bid %d send\n", bid);
+    switch (epSend.GetProviderType()) {
+      case ProviderType::MLX5:
+        SendThreadKernel<ProviderType::MLX5>(epSend, mrRecv);
+        break;
+#ifdef ENABLE_BNXT
+      case ProviderType::BNXT:
+        SendThreadKernel<ProviderType::BNXT>(epSend, mrRecv);
+        break;
+#endif
+      default:
+        // unsupported provider
+        break;
+    }
+  } else if (bid == 1) {
+    printf("bid %d recv\n", bid);
     RecvThreadKernel(epRecv, mrRecv);
   }
   __syncthreads();

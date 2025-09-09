@@ -298,7 +298,7 @@ class EpDispatchCombineTestCase:
     def test_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
         error_round = set()
-        for i in range(5):
+        for i in range(500):
             if self.rank == 0:
                 print(f"Round {i} begin")
             test_data = self.gen_test_data()
@@ -349,9 +349,7 @@ class EpDispatchCombineTestCase:
 
         dist.barrier()
         total_recv_num_token = dispatch_recv_num_token[0].item()
-        max_num_token_to_send_per_rank = (
-            self.config.max_num_inp_token_per_rank * self.config.num_experts_per_token
-        )
+        max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank
 
         my_node = self.rank // self.gpu_per_node
         total_rdma_recv_num_token = 0
@@ -545,3 +543,4 @@ if __name__ == "__main__":
         nprocs=gpu_per_node,
         join=True,
     )
+

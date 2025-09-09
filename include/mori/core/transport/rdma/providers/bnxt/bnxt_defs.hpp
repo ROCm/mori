@@ -21,9 +21,12 @@
 // SOFTWARE.
 #pragma once
 
-#include "mori/core/transport/rdma/device_primitives.hpp"
-#include "mori/core/transport/rdma/host_primitives.hpp"
-#include "mori/core/transport/rdma/primitives.hpp"
-#include "mori/core/transport/rdma/providers/mlx5/mlx5_device_primitives.hpp"
-#include "mori/core/transport/rdma/providers/mlx5/mlx5_host_primitives.hpp"
-#include "mori/core/transport/rdma/providers/bnxt/bnxt_device_primitives.hpp"
+namespace mori {
+namespace core {
+
+#define BNXT_RE_SLOT_SIZE 16
+#define BNXT_RE_CQE_SIZE (2 * BNXT_RE_SLOT_SIZE)
+#define BNXT_RE_NUM_SLOT_PER_WQE 3
+
+}  // namespace core
+}  // namespace mori

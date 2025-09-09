@@ -75,7 +75,7 @@ std::vector<Candidate> CollectAndSortCandidates(TopoSystem* sys, int id) {
   }
 
   // Sort by 1) speed 2) numa 3) hops 4) name
-  std::sort(candidates.begin(), candidates.end(), [&gpuNumaNodeId](Candidate a, Candidate b) {
+  std::sort(candidates.begin(), candidates.end(), [&gpuNumaNodeId](Candidate a, Candidate b) -> bool {
     bool tie = (a.nic->totalGbps == b.nic->totalGbps);
     if (!tie) return a.nic->totalGbps > b.nic->totalGbps;
 

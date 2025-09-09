@@ -21,44 +21,42 @@
 // SOFTWARE.
 #pragma once
 
-#include "infiniband/mlx5dv.h"
+#ifdef ENABLE_BNXT
+extern "C" {
+#include <infiniband/bnxt_re_dv.h>
+#include <infiniband/bnxt_re_hsi.h>
+}  // ENABLE_BNXT
+#else
+extern "C" {
+#include "mori/core/transport/rdma/providers/bnxt/bnxt_re_dv.h"
+#include "mori/core/transport/rdma/providers/bnxt/bnxt_re_hsi.h"
+}
+#endif
+
 #include "mori/application/transport/rdma/rdma.hpp"
-#include "src/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
 
 namespace mori {
 namespace application {
 
+#ifdef ENABLE_BNXT
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Device Attributes                                       */
 /* ---------------------------------------------------------------------------------------------- */
-static size_t GetMlx5CqeSize() { return sizeof(mlx5_cqe64); }
+static size_t GetBnxtCqeSize() { return BNXT_RE_CQE_SIZE; }
 
-// TODO: figure out how does 192 computed?
-static size_t GetMlx5SqWqeSize() {
-  return (192 + sizeof(mlx5_wqe_data_seg) + MLX5_SEND_WQE_BB - 1) / MLX5_SEND_WQE_BB *
-         MLX5_SEND_WQE_BB;
-}
-
-static size_t GetMlx5RqWqeSize() { return sizeof(mlx5_wqe_data_seg); }
-
-struct HcaCapability {
-  uint32_t portType{0};
-  uint32_t dbrRegSize{0};
-
-  bool IsEthernet() const { return portType == MLX5_CAP_PORT_TYPE_ETH; }
-  bool IsInfiniBand() const { return portType == MLX5_CAP_PORT_TYPE_IB; }
-};
-
-HcaCapability QueryHcaCap(ibv_context* context);
+// static size_t GetBnxtSqWqeSize() {
+//   return (192 + sizeof(mlx5_wqe_data_seg) + MLX5_SEND_WQE_BB - 1) / MLX5_SEND_WQE_BB *
+//          MLX5_SEND_WQE_BB;
+// }
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                 Device Data Structure Container                                */
 /* ---------------------------------------------------------------------------------------------- */
-// TODO: refactor Mlx5CqContainer so its structure is similar to Mlx5QpContainer
-class Mlx5CqContainer {
+// TODO: refactor BnxtCqContainer so its structure is similar to BnxtQpContainer
+class BnxtCqContainer {
  public:
-  Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig& config);
-  ~Mlx5CqContainer();
+  BnxtCqContainer(ibv_context* context, const RdmaEndpointConfig& config);
+  ~BnxtCqContainer();
 
  public:
   RdmaEndpointConfig config;
@@ -68,28 +66,29 @@ class Mlx5CqContainer {
   uint32_t cqn{0};
   void* cqUmemAddr{nullptr};
   void* cqDbrUmemAddr{nullptr};
-  mlx5dv_devx_umem* cqUmem{nullptr};
-  mlx5dv_devx_umem* cqDbrUmem{nullptr};
-  mlx5dv_devx_uar* uar{nullptr};
-  mlx5dv_devx_obj* cq{nullptr};
+  void* cqUmem{nullptr};
+  void* cqDbrUmem{nullptr};
+  void* cqUar{nullptr};
+  void* cqUarPtr{nullptr};
+  ibv_cq* cq{nullptr};
 };
 
-class Mlx5QpContainer {
+class BnxtQpContainer {
  public:
-  Mlx5QpContainer(ibv_context* context, const RdmaEndpointConfig& config, uint32_t cqn,
-                  uint32_t pdn);
-  ~Mlx5QpContainer();
+  BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig& config, ibv_cq* cq, ibv_pd* pd);
+  ~BnxtQpContainer();
 
   void ModifyRst2Init();
-  void ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr);
-  void ModifyRtr2Rts(const RdmaEndpointHandle& local_handle);
+  void ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr,
+                      const ibv_device_attr_ex& deviceAttr);
+  void ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
+                     const RdmaEndpointHandle& remote_handle);
 
   void* GetSqAddress();
+  void* GetMsntblAddress();
   void* GetRqAddress();
 
  private:
-  void ComputeQueueAttrs(const RdmaEndpointConfig& config);
-  void CreateQueuePair(uint32_t cqn, uint32_t pdn);
   void DestroyQueuePair();
 
  public:
@@ -97,28 +96,29 @@ class Mlx5QpContainer {
 
  public:
   RdmaEndpointConfig config;
-  WorkQueueAttrs rqAttrs;
-  WorkQueueAttrs sqAttrs;
-  size_t qpTotalSize{0};
+  struct bnxt_re_dv_qp_mem_info qpMemInfo;
 
  public:
   size_t qpn{0};
-  void* qpUmemAddr{nullptr};
+  void* sqUmemAddr{nullptr};
+  void* rqUmemAddr{nullptr};
+  void* msntblUmemAddr{nullptr};
   void* qpDbrUmemAddr{nullptr};
-  mlx5dv_devx_umem* qpUmem{nullptr};
-  mlx5dv_devx_umem* qpDbrUmem{nullptr};
-  mlx5dv_devx_uar* qpUar{nullptr};
+  void* sqUmem{nullptr};
+  void* rqUmem{nullptr};
+  void* qpDbrUmem{nullptr};
+  void* qpUar{nullptr};
   void* qpUarPtr{nullptr};
-  mlx5dv_devx_obj* qp{nullptr};
+  ibv_qp* qp{nullptr};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                        Mlx5DeviceContext                                       */
+/*                                        BnxtDeviceContext                                       */
 /* ---------------------------------------------------------------------------------------------- */
-class Mlx5DeviceContext : public RdmaDeviceContext {
+class BnxtDeviceContext : public RdmaDeviceContext {
  public:
-  Mlx5DeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd);
-  ~Mlx5DeviceContext() override;
+  BnxtDeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd);
+  ~BnxtDeviceContext();
 
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) override;
   virtual void ConnectEndpoint(const RdmaEndpointHandle& local,
@@ -127,30 +127,33 @@ class Mlx5DeviceContext : public RdmaDeviceContext {
  private:
   uint32_t pdn;
 
-  std::unordered_map<uint32_t, std::unique_ptr<Mlx5CqContainer>> cqPool;
-  std::unordered_map<uint32_t, std::unique_ptr<Mlx5QpContainer>> qpPool;
+  std::unordered_map<uint32_t, BnxtCqContainer*> cqPool;
+  std::unordered_map<uint32_t, BnxtQpContainer*> qpPool;
 };
 
-class Mlx5Device : public RdmaDevice {
+class BnxtDevice : public RdmaDevice {
  public:
-  Mlx5Device(ibv_device* device);
-  ~Mlx5Device() override;
+  BnxtDevice(ibv_device* device);
+  ~BnxtDevice();
 
   RdmaDeviceContext* CreateRdmaDeviceContext() override;
 };
-
+#endif  // ENABLE_BNXT
 }  // namespace application
 }  // namespace mori
 
 namespace std {
-
-static std::ostream& operator<<(std::ostream& s, const mori::application::WorkQueueAttrs wq_attrs) {
+#ifdef ENABLE_BNXT
+static std::ostream& operator<<(std::ostream& s, const bnxt_re_dv_qp_mem_info& m) {
   std::stringstream ss;
-  ss << "wqeNum: " << wq_attrs.wqeNum << " wqeSize: " << wq_attrs.wqeSize
-     << " wqSize: " << wq_attrs.wqSize << " postIdx: " << wq_attrs.postIdx
-     << " wqeShift: " << wq_attrs.wqeShift << " offset: " << wq_attrs.offset;
+  ss << "qp_handle: 0x" << std::hex << m.qp_handle << std::dec << "  sq_va: 0x" << std::hex
+     << m.sq_va << std::dec << "  sq_len: " << m.sq_len << "  sq_slots: " << m.sq_slots
+     << "  sq_wqe_sz: " << m.sq_wqe_sz << "  sq_psn_sz: " << m.sq_psn_sz
+     << "  sq_npsn: " << m.sq_npsn << "  rq_va: 0x" << std::hex << m.rq_va << std::dec
+     << "  rq_len: " << m.rq_len << "  rq_slots: " << m.rq_slots << "  rq_wqe_sz: " << m.rq_wqe_sz
+     << "  comp_mask: 0x" << std::hex << m.comp_mask << std::dec;
   s << ss.str();
   return s;
 }
-
+#endif  // ENABLE_BNXT
 }  // namespace std
