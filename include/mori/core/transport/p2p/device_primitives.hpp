@@ -353,6 +353,61 @@ inline __device__ void WarpAccum(T* accum, T* src, size_t nelems) {
   }
 }
 
+template <typename T, int VecBytes, int Unroll>
+__forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const* __restrict__ srcs,
+                                                 const float* __restrict__ srcScales,
+                                                 size_t accumNum, size_t nelems) {
+  static_assert((VecBytes <= 16) && (VecBytes >= 4) && IsPowerOf2(VecBytes));
+
+  constexpr int vecSize = VecBytes / sizeof(T);
+  const int laneId = threadIdx.x & (warpSize - 1);
+  size_t offset = 0;
+
+  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+  const int elemsPerWarp = warpSize * vecSize;
+  const size_t numIters = (nelems - offset) / elemsPerWarp;
+  const size_t laneOffset = laneId * vecSize;
+  for (size_t iter = 0; iter < numIters; ++iter) {
+    float accumValFp32[vecSize] = {0};
+    for (int i = 0; i < accumNum; ++i) {
+      if (srcs[i] == nullptr) continue;
+      DataType srcVal = load<VecBytes>(srcs[i] + offset + laneOffset);
+      float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
+#pragma unroll vecSize
+      for (int j = 0; j < vecSize; ++j) {
+        accumValFp32[j] += float(reinterpret_cast<const T*>(&srcVal)[j]) * srcScale;
+      }
+    }
+
+    union {
+      DataType accumVec;
+      T accumVal[vecSize];
+    };
+#pragma unroll vecSize
+    for (int j = 0; j < vecSize; ++j) {
+      accumVal[j] = T(accumValFp32[j]);
+    }
+    store<VecBytes>(dest + offset + laneOffset, accumVec);
+
+    offset += elemsPerWarp;
+  }
+
+  // remaining size
+  offset += laneId;
+  while (offset < nelems) {
+    float accumValFp32 = 0;
+    for (int i = 0; i < accumNum; ++i) {
+      const T* srcPtr = srcs[i];
+      if (srcPtr == nullptr) continue;
+
+      float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
+      accumValFp32 += float(srcPtr[offset]) * srcScale;
+    }
+    dest[offset] = T(accumValFp32);
+    offset += warpSize;
+  }
+}
+
 template <typename T, int VecBytes, int AccumNum, int Unroll>
 __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __restrict__ srcs,
                                               const float* __restrict__ srcScales, size_t& offset,
@@ -371,7 +426,6 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
   const int laneId = threadIdx.x & (warpSize - 1);
   const size_t laneOffset = laneId * vecSize;
 
-  // while ((offset + (Unroll - 1) * vecSize * warpSize + vecSize) <= nelems) {
   for (size_t iter = 0; iter < numIters; iter++) {
     float accumValFp32[Unroll][vecSize] = {0};
 
@@ -460,6 +514,7 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
   }
 }
 
+#if 0
 template <typename T, int VecBytes, int AccumNum>
 __forceinline__ __device__ void WarpAccumPipelineImpl(T* __restrict__ dest,
                                                       T* const* __restrict__ srcs,
@@ -539,6 +594,7 @@ __forceinline__ __device__ void WarpAccumPipelineImpl(T* __restrict__ dest,
     offset += elemsPerWarp;
   }
 }
+#endif
 
 template <typename T, int VecBytes, int AccumNum, int Unroll>
 __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __restrict__ srcs,
@@ -579,29 +635,28 @@ template <typename T, int VecBytes>
 __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __restrict__ srcs,
                                           const float* __restrict__ srcScales, size_t accumNum,
                                           size_t nelems) {
+#define WARP_ACCUM_CASE(AccumNum)                                                       \
+  case AccumNum:                                                                        \
+    WarpAccum<T, VecBytes, AccumNum, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, nelems); \
+    break;
+
   switch (accumNum) {
-    case 1:
-      WarpAccum<T, VecBytes, 1, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, nelems);
-      break;
-    case 2:
-      WarpAccum<T, VecBytes, 2, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, nelems);
-      break;
-    case 4:
-      WarpAccum<T, VecBytes, 4, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, nelems);
-      break;
-    case 6:
-      WarpAccum<T, VecBytes, 6, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, nelems);
-      break;
-    case 8:
-      WarpAccum<T, VecBytes, 8, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, nelems);
-      break;
-    case 10:
-      WarpAccum<T, VecBytes, 10, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, nelems);
-      break;
+    WARP_ACCUM_CASE(1)
+    WARP_ACCUM_CASE(2)
+    WARP_ACCUM_CASE(4)
+    WARP_ACCUM_CASE(6)
+    WARP_ACCUM_CASE(8)
+    WARP_ACCUM_CASE(10)
+    WARP_ACCUM_CASE(12)
+    WARP_ACCUM_CASE(14)
+    WARP_ACCUM_CASE(16)
     default:
+      // WarpAccumDynamic<T, VecBytes, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, accumNum, nelems);
       assert(false && "Unsupported accumNum");
       break;
   }
+
+#undef WARP_ACCUM_CASE
 }
 
 }  // namespace core

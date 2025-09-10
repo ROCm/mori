@@ -152,11 +152,13 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
       core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset,
                      reinterpret_cast<char*>(args.inpTokenBuf) + tokenOffset,
                      config.hiddenDim * sizeof(T));
-      core::WarpCopy(
-          args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + weightOffset,
-          reinterpret_cast<char*>(args.weightsBuf) +
-              tokenId * config.numExpertPerToken * sizeof(float),
-          config.numExpertPerToken * sizeof(float));
+      if (args.weightsBuf) {
+        core::WarpCopy(
+            args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + weightOffset,
+            reinterpret_cast<char*>(args.weightsBuf) +
+                tokenId * config.numExpertPerToken * sizeof(float),
+            config.numExpertPerToken * sizeof(float));
+      }
       core::WarpCopy(
           args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + indicesOffset,
           reinterpret_cast<char*>(args.tokenIndices) +
@@ -220,11 +222,13 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
         core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset,
                        reinterpret_cast<char*>(args.inpTokenBuf) + tokenOffset,
                        config.hiddenDim * sizeof(T));
-        core::WarpCopy(
-            args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + weightOffset,
-            reinterpret_cast<char*>(args.weightsBuf) +
-                tokenId * config.numExpertPerToken * sizeof(float),
-            config.numExpertPerToken * sizeof(float));
+        if (args.weightsBuf) {
+          core::WarpCopy(
+              args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + weightOffset,
+              reinterpret_cast<char*>(args.weightsBuf) +
+                  tokenId * config.numExpertPerToken * sizeof(float),
+              config.numExpertPerToken * sizeof(float));
+        }
         core::WarpCopy(
             args.shmemStagingTokMemObj->template GetAs<char*>() + mapIdxOffset + indicesOffset,
             reinterpret_cast<char*>(args.tokenIndices) +
@@ -253,14 +257,17 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
     //                                         destPe, core::AMO_SET);
     int doneBlockNum = atomicAdd(&args.dispatchGridBarrier[destPe], 1);
     if (doneBlockNum == numsBlockPerDestPe - 1) {
-      shmem::ShmemPutInt32ImmNbiThread(args.recvTokenNumMemObj, myPe * sizeof(index_t),
-                                       totalTokens + 1, destPe);
+      shmem::ShmemPutInt32ImmNbiThread(
+          args.recvTokenNumMemObj,
+          (myPe + (args.crossDeviceBarrierFlag & 1) * npes) * sizeof(index_t), totalTokens + 1,
+          destPe);
       __hip_atomic_store(&args.dispatchGridBarrier[destPe], 0, __ATOMIC_RELAXED,
                          __HIP_MEMORY_SCOPE_AGENT);
     }
   }
   if (thdId == 0) {
-    index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>() + destPe;
+    index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>() + destPe +
+                      (args.crossDeviceBarrierFlag & 1) * npes;
     recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
     if (localBlockId == 0) {
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
@@ -384,7 +391,9 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
   const int srcPe = blockIdx.x / numsBlockPerSrcPe;
   const int srcNode = srcPe / MAX_GPUS_PER_NODE;
   const int localBlockId = blockIdx.x - srcPe * numsBlockPerSrcPe;
-  const int srcPeTokenNum = *(args.recvTokenNumMemObj->template GetAs<index_t*>() + srcPe) - 1;
+  const int srcPeTokenNum = *(args.recvTokenNumMemObj->template GetAs<index_t*>() + srcPe +
+                              (args.crossDeviceBarrierFlag & 1) * npes) -
+                            1;
   const int baseChunk = srcPeTokenNum / numsBlockPerSrcPe;
   const int remainder = srcPeTokenNum % numsBlockPerSrcPe;
 
@@ -487,7 +496,8 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
   CrossDeviceBarrierInterNodeKernel(args);
   shmem::ShmemQuietThread();
   if (globalThdId < npes) {
-    args.recvTokenNumMemObj->template GetAs<index_t*>()[globalThdId] = 0;
+    args.recvTokenNumMemObj
+        ->template GetAs<index_t*>()[globalThdId + (args.crossDeviceBarrierFlag & 1) * npes] = 0;
   }
 
   if (globalThdId == 0) {

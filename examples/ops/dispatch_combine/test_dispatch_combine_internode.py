@@ -43,6 +43,7 @@ class EpDispatchCombineTestCase:
             scale_type_size=4,
             max_num_inp_token_per_rank=max_tokens,
             num_experts_per_rank=16,
+            # num_experts_per_rank=256 // world_size,
             num_experts_per_token=8,
             warp_num_per_block=16,
             block_num=64,
@@ -144,6 +145,20 @@ class EpDispatchCombineTestCase:
                 indices[i] = perm[: self.config.num_experts_per_token]
             all_rank_indices.append(indices.to(torch.int32).to(self.device))
 
+        # even_indices = (
+        #     torch.arange(
+        #         self.config.max_num_inp_token_per_rank
+        #         * self.config.num_experts_per_token,
+        #         device="cuda",
+        #     ).view(
+        #         self.config.max_num_inp_token_per_rank,
+        #         self.config.num_experts_per_token,
+        #     )
+        #     % 256
+        # )
+        # even_indices = even_indices.to(torch.int32)
+        # all_rank_indices = [even_indices for _ in range(self.world_size)]
+
         # gen weights
         all_rank_weights = [
             torch.rand(
@@ -208,6 +223,7 @@ class EpDispatchCombineTestCase:
         ) = op.dispatch(
             all_rank_input[self.rank],
             all_rank_weights[self.rank],
+            # None,
             all_rank_scales[self.rank],
             all_rank_indices[self.rank],
         )
@@ -229,12 +245,13 @@ class EpDispatchCombineTestCase:
                 )
                 # assert False
                 error_round.add(round)
+            if dispatch_weights is not None:
+                assert torch.equal(
+                    dispatch_weights[i], all_rank_weights[src_pe][src_tok_id]
+                )
             assert torch.equal(
-                dispatch_weights[i], all_rank_weights[src_pe][src_tok_id]
+                dispatch_indices[i], all_rank_indices[src_pe][src_tok_id]
             )
-            # assert torch.equal(
-            #     dispatch_indices[i], all_rank_indices[src_pe][src_tok_id]
-            # )
             # TODO: test output scales
 
         if self.config.rank == 0:
@@ -268,29 +285,29 @@ class EpDispatchCombineTestCase:
                 assert False
                 error_round.add(round)
 
-            got_weight, expected_weight = (
-                combine_output_weight[i],
-                all_rank_weights[self.rank][i] * unique_pes,
-            )
-            weight_match = torch.allclose(
-                got_weight, expected_weight, atol=1e-5, rtol=1e-5
-            )
-            if not weight_match and self.config.rank == 0:
-                print(f"Weight mismatch for token {i}:")
-                print(
-                    f"  indices[{i}]: {all_rank_indices[self.rank][i].cpu().tolist()}"
+            if dispatch_weights is not None:
+                got_weight, expected_weight = (
+                    combine_output_weight[i],
+                    all_rank_weights[self.rank][i] * unique_pes,
                 )
-                print(f"  pes: {pes}")
-                print(f"  unique_pes: {unique_pes}")
-                print(f"  got_weight: {got_weight}")
-                print(
-                    f"  expected_weight (weights[{i}] * {unique_pes}): {expected_weight}"
+                weight_match = torch.allclose(
+                    got_weight, expected_weight, atol=1e-5, rtol=1e-5
                 )
-                print(f"  original weights[{i}]: {all_rank_weights[self.rank][i]}")
-                print(f"  diff: {torch.abs(got_weight - expected_weight)}")
-                print(f"  max_diff: {torch.abs(got_weight - expected_weight).max()}")
-
-            assert weight_match, f"Weight assertion failed for token {i}"
+                if not weight_match and self.config.rank == 0:
+                    print(f"Weight mismatch for token {i}:")
+                    print(
+                        f"  indices[{i}]: {all_rank_indices[self.rank][i].cpu().tolist()}"
+                    )
+                    print(f"  pes: {pes}")
+                    print(f"  unique_pes: {unique_pes}")
+                    print(f"  got_weight: {got_weight}")
+                    print(
+                        f"  expected_weight (weights[{i}] * {unique_pes}): {expected_weight}"
+                    )
+                    print(f"  original weights[{i}]: {all_rank_weights[self.rank][i]}")
+                    print(f"  diff: {torch.abs(got_weight - expected_weight)}")
+                    print(f"  max_diff: {torch.abs(got_weight - expected_weight).max()}")
+                assert weight_match, f"Weight assertion failed for token {i}"
 
         if self.config.rank == 0:
             print("Combine Pass")

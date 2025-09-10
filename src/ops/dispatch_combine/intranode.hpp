@@ -121,9 +121,11 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
       // Write weights and indices
       if (laneId < config.numExpertPerToken) {
-        args.shmemOutWeightsMemObj->template GetAs<float*>(
-            destPe)[destTokId * config.numExpertPerToken + laneId] =
-            args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
+        if (args.weightsBuf) {
+          args.shmemOutWeightsMemObj->template GetAs<float*>(
+              destPe)[destTokId * config.numExpertPerToken + laneId] =
+              args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
+        }
         args.shmemOutIndicesMemObj->template GetAs<index_t*>(
             destPe)[destTokId * config.numExpertPerToken + laneId] =
             args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
@@ -259,7 +261,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
         srcWeightsPtr[j] = nullptr;
       }
     }
-    core::WarpAccum<T, 8>(
+    core::WarpAccum<T, 4>(
         args.shmemOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim + hiddenDimOffset,
         srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
 
