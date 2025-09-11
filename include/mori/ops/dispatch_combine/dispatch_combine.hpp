@@ -85,17 +85,13 @@ struct EpDispatchCombineConfig {
   // the provided buffer is shmemInpTokMemObj
   bool useExternalInpBuffer{true};
 
-  inline __host__ __device__ int MaxNumTokensToSendPerRank() const {
-    return maxNumInpTokenPerRank;
-  }
+  inline __host__ __device__ int MaxNumTokensToSendPerRank() const { return maxNumInpTokenPerRank; }
 
   inline __host__ __device__ int MaxNumTokensToSend() const {
     return worldSize * MaxNumTokensToSendPerRank();
   }
 
-  inline __host__ __device__ int MaxNumTokensToRecvPerRank() const {
-    return maxNumInpTokenPerRank;
-  }
+  inline __host__ __device__ int MaxNumTokensToRecvPerRank() const { return maxNumInpTokenPerRank; }
 
   inline __host__ __device__ int MaxNumTokensToRecv() const {
     return worldSize * MaxNumTokensToRecvPerRank();

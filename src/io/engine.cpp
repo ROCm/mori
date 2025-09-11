@@ -214,7 +214,8 @@ void IOEngine::BatchWrite(const MemoryDesc& localSrc, const SizeVec& localOffset
   SELECT_BACKEND_AND_RETURN_IF_NONE(localSrc, remoteDest, status, backend);
   backend->BatchWrite(localSrc, localOffsets, remoteDest, remoteOffsets, sizes, status, id);
   if (status->Failed()) {
-    MORI_IO_ERROR("Engine batch write error {} message {}", status->CodeUint32(), status->Message());
+    MORI_IO_ERROR("Engine batch write error {} message {}", status->CodeUint32(),
+                  status->Message());
   }
 }
 

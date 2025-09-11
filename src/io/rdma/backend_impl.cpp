@@ -300,7 +300,7 @@ void NotifManager::MainLoop() {
           if (msg->meta->status != nullptr) {
             if (wc.status == IBV_WC_SUCCESS) {
               if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
-                // TODO: should use atomic cas to avoid overwriting faied status
+                // TODO: should use atomic cas to avoid overwriting failed status
                 msg->meta->status->SetCode(StatusCode::SUCCESS);
                 msg->meta->status->SetMessage(ibv_wc_status_str(wc.status));
               }
@@ -542,6 +542,7 @@ RdmaBackendSession::RdmaBackendSession(const RdmaBackendConfig& config,
 
 void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
+  MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
   CqCallbackMeta* callbackMeta = new CqCallbackMeta(status, id, 1);
 
@@ -561,6 +562,7 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
 void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                         const SizeVec& sizes, TransferStatus* status,
                                         TransferUniqueId id, bool isRead) {
+  MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
   CqCallbackMeta* callbackMeta = new CqCallbackMeta(status, id, sizes.size());
   RdmaOpRet ret;
@@ -572,7 +574,6 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
     ret = RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, callbackMeta,
                              id, isRead, config.postBatchSize);
   }
-
   assert(!ret.Init());
   if (ret.Failed() || ret.Succeeded()) {
     status->SetCode(ret.code);
@@ -637,6 +638,7 @@ void RdmaBackend::DeregisterMemory(const MemoryDesc& desc) { server->DeregisterM
 void RdmaBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
                             const MemoryDesc& remoteSrc, size_t remoteOffset, size_t size,
                             TransferStatus* status, TransferUniqueId id, bool isRead) {
+  MORI_IO_FUNCTION_TIMER;
   RdmaBackendSession sess;
   CreateSession(localDest, remoteSrc, sess);
   return sess.ReadWrite(localOffset, remoteOffset, size, status, id, isRead);
@@ -646,6 +648,7 @@ void RdmaBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loc
                                  const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
                                  const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
                                  bool isRead) {
+  MORI_IO_FUNCTION_TIMER;
   assert(localOffsets.size() == remoteOffsets.size());
   assert(sizes.size() == remoteOffsets.size());
   size_t batchSize = sizes.size();

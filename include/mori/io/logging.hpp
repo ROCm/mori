@@ -63,7 +63,7 @@ class ScopedTimer {
   Clock::time_point start;
 };
 
-#define MORI_IO_FUNCTION_TIMER ScopedTimer instance(__func__)
-
+#define MORI_IO_TIMER(message) ScopedTimer instance(message)
+#define MORI_IO_FUNCTION_TIMER ScopedTimer instance(__PRETTY_FUNCTION__)
 }  // namespace io
 }  // namespace mori

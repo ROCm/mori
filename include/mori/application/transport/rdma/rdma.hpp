@@ -244,6 +244,7 @@ class RdmaContext {
 
   const RdmaDeviceList& GetRdmaDeviceList() const;
   int nums_device;
+
  private:
   RdmaDevice* RdmaDeviceFactory(ibv_device* inDevice);
   void Initialize();

@@ -325,7 +325,8 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("Succeeded", &mori::io::TransferStatus::Succeeded)
       .def("Failed", &mori::io::TransferStatus::Failed)
       .def("SetCode", &mori::io::TransferStatus::SetCode)
-      .def("SetMessage", &mori::io::TransferStatus::SetMessage);
+      .def("SetMessage", &mori::io::TransferStatus::SetMessage)
+      .def("Wait", &mori::io ::TransferStatus::Wait);
 
   py::class_<mori::io::EngineDesc>(m, "EngineDesc")
       .def_readonly("key", &mori::io::EngineDesc::key)

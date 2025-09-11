@@ -269,15 +269,18 @@ class MoriIoBenchmark:
             for i in range(self.transfer_batch_size):
                 transfer_uids.append(self.engine.allocate_transfer_uid())
 
+            func, arg_list = None, []
             for i in range(self.transfer_batch_size):
                 offset = buffer_size * i
                 if self.enable_sess:
                     func = self.sess.read if self.op_type == "read" else self.sess.write
-                    transfer_status = func(
-                        offset,
-                        offset,
-                        buffer_size,
-                        transfer_uids[i],
+                    arg_list.append(
+                        (
+                            offset,
+                            offset,
+                            buffer_size,
+                            transfer_uids[i],
+                        )
                     )
                 else:
                     func = (
@@ -285,20 +288,29 @@ class MoriIoBenchmark:
                         if self.op_type == "read"
                         else self.engine.write
                     )
-                    transfer_status = func(
-                        self.mem,
-                        offset,
-                        self.target_mem,
-                        offset,
-                        buffer_size,
-                        transfer_uids[i],
+                    arg_list.append(
+                        (
+                            self.mem,
+                            offset,
+                            self.target_mem,
+                            offset,
+                            buffer_size,
+                            transfer_uids[i],
+                        )
                     )
-                status_list.append(transfer_status)
 
+            st = time.time()
+            for i in range(self.transfer_batch_size):
+                status = func(*arg_list[i])
+                status_list.append(status)
             for i, status in enumerate(status_list):
-                while status.InProgress():
-                    pass
+                status.Wait()
+            duration = time.time() - st
+            for status in status_list:
                 assert status.Succeeded()
+            return duration
+        else:
+            return 0
 
     def run_batch_once(self, buffer_size):
         assert buffer_size <= self.buffer_size
@@ -306,25 +318,27 @@ class MoriIoBenchmark:
             offsets = [(i * buffer_size) for i in range(self.transfer_batch_size)]
             sizes = [buffer_size for _ in range(self.transfer_batch_size)]
             transfer_uid = self.engine.allocate_transfer_uid()
+            func, args = None, None
             if self.enable_sess:
                 func = (
                     self.sess.batch_read
                     if self.op_type == "read"
                     else self.sess.batch_write
                 )
-                transfer_status = func(
+                args = (
                     offsets,
                     offsets,
                     sizes,
                     transfer_uid,
                 )
+
             else:
                 func = (
                     self.engine.batch_read
                     if self.op_type == "read"
                     else self.engine.batch_write
                 )
-                transfer_status = func(
+                args = (
                     self.mem,
                     offsets,
                     self.target_mem,
@@ -332,22 +346,26 @@ class MoriIoBenchmark:
                     sizes,
                     transfer_uid,
                 )
-            while transfer_status.InProgress():
-                pass
+            st = time.time()
+            transfer_status = func(*args)
+            transfer_status.Wait()
+            duration = time.time() - st
             assert transfer_status.Succeeded()
+            return duration
+        else:
+            return 0
 
     def run_once(self, buffer_size):
         if self.enable_batch_transfer:
-            self.run_batch_once(buffer_size)
+            return self.run_batch_once(buffer_size)
         else:
-            self.run_single_once(buffer_size)
+            return self.run_single_once(buffer_size)
 
     def _run_and_compute(self, buffer_size, iters):
         latency = []
         for i in range(iters):
-            st = time.time()
-            self.run_once(buffer_size)
-            latency.append(time.time() - st)
+            duration = self.run_once(buffer_size)
+            latency.append(duration)
 
         if self.role is EngineRole.TARGET:
             return 0, 0, 0, 0, 0

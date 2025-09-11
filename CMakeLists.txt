@@ -26,11 +26,14 @@ option(BUILD_TESTS "Whether to build mori CPP tests" ON)
 
 set(CMAKE_LIBRARY_PATH "/usr/local/lib;${CMAKE_LIBRARY_PATH}")
 find_library(BNXT_RE_LIB NAMES bnxt_re)
-if (BNXT_RE_LIB)
+if(BNXT_RE_LIB)
   message(STATUS "Found bnxt_re library at: ${BNXT_RE_LIB}")
 else()
-  message(STATUS "Could NOT find bnxt_re library. BNXT features will be disabled.")
-  set(USE_BNXT OFF CACHE BOOL "Enable BNXT features if bnxt_re library is found" FORCE)
+  message(
+    STATUS "Could NOT find bnxt_re library. BNXT features will be disabled.")
+  set(USE_BNXT
+      OFF
+      CACHE BOOL "Enable BNXT features if bnxt_re library is found" FORCE)
 endif()
 message(STATUS "USE_BNXT = ${USE_BNXT}")
 if(USE_BNXT)
