@@ -353,7 +353,7 @@ inline __device__ void WarpAccum(T* accum, T* src, size_t nelems) {
   }
 }
 
-template <typename T, int VecBytes, int Unroll>
+template <typename T, int VecBytes>
 __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const* __restrict__ srcs,
                                                  const float* __restrict__ srcScales,
                                                  size_t accumNum, size_t nelems) {
@@ -369,11 +369,12 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
   const size_t laneOffset = laneId * vecSize;
   for (size_t iter = 0; iter < numIters; ++iter) {
     float accumValFp32[vecSize] = {0};
+#pragma unroll
     for (int i = 0; i < accumNum; ++i) {
       if (srcs[i] == nullptr) continue;
       DataType srcVal = load<VecBytes>(srcs[i] + offset + laneOffset);
       float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
-#pragma unroll vecSize
+#pragma unroll
       for (int j = 0; j < vecSize; ++j) {
         accumValFp32[j] += float(reinterpret_cast<const T*>(&srcVal)[j]) * srcScale;
       }
@@ -383,7 +384,7 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
       DataType accumVec;
       T accumVal[vecSize];
     };
-#pragma unroll vecSize
+#pragma unroll
     for (int j = 0; j < vecSize; ++j) {
       accumVal[j] = T(accumValFp32[j]);
     }
@@ -647,12 +648,8 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
     WARP_ACCUM_CASE(6)
     WARP_ACCUM_CASE(8)
     WARP_ACCUM_CASE(10)
-    WARP_ACCUM_CASE(12)
-    WARP_ACCUM_CASE(14)
-    WARP_ACCUM_CASE(16)
     default:
-      // WarpAccumDynamic<T, VecBytes, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, accumNum, nelems);
-      assert(false && "Unsupported accumNum");
+      WarpAccumDynamic<T, VecBytes>(dest, srcs, srcScales, accumNum, nelems);
       break;
   }
 
