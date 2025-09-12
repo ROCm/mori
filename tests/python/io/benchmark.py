@@ -63,6 +63,11 @@ def parse_args():
         help="Run sizes from 8 till 2^20",
     )
     parser.add_argument(
+        "--all-batch",
+        action="store_true",
+        help="Run batch sizes from 8 to 32768",
+    )
+    parser.add_argument(
         "--transfer-batch-size",
         type=int,
         default=256,
@@ -151,6 +156,7 @@ class MoriIoBenchmark:
         poll_cq_mode: str = "polling",
         iters: int = 128,
         sweep: bool = False,
+        sweep_batch: bool = False,
     ):
         self.op_type = op_type
         self.host = host
@@ -171,6 +177,7 @@ class MoriIoBenchmark:
         )
         self.iters = iters
         self.sweep = sweep
+        self.sweep_batch = sweep_batch
 
         self.world_size = self.num_initiator_dev + self.num_target_dev
         if self.node_rank == 0:
@@ -275,17 +282,17 @@ class MoriIoBenchmark:
             self.target_mem = MemoryDesc.unpack(target_mem_desc)
             self.sess = self.engine.create_session(self.mem, self.target_mem)
 
-    def run_single_once(self, buffer_size=None):
+    def run_single_once(self, buffer_size, transfer_batch_size):
         assert buffer_size <= self.buffer_size
         if self.role is EngineRole.INITIATOR:
             status_list = []
             transfer_uids = []
 
-            for i in range(self.transfer_batch_size):
+            for i in range(transfer_batch_size):
                 transfer_uids.append(self.engine.allocate_transfer_uid())
 
             func, arg_list = None, []
-            for i in range(self.transfer_batch_size):
+            for i in range(transfer_batch_size):
                 offset = buffer_size * i
                 if self.enable_sess:
                     func = self.sess.read if self.op_type == "read" else self.sess.write
@@ -315,7 +322,7 @@ class MoriIoBenchmark:
                     )
 
             st = time.time()
-            for i in range(self.transfer_batch_size):
+            for i in range(transfer_batch_size):
                 status = func(*arg_list[i])
                 status_list.append(status)
             for i, status in enumerate(status_list):
@@ -327,11 +334,11 @@ class MoriIoBenchmark:
         else:
             return 0
 
-    def run_batch_once(self, buffer_size):
+    def run_batch_once(self, buffer_size, transfer_batch_size):
         assert buffer_size <= self.buffer_size
         if self.role is EngineRole.INITIATOR:
-            offsets = [(i * buffer_size) for i in range(self.transfer_batch_size)]
-            sizes = [buffer_size for _ in range(self.transfer_batch_size)]
+            offsets = [(i * buffer_size) for i in range(transfer_batch_size)]
+            sizes = [buffer_size for _ in range(transfer_batch_size)]
             transfer_uid = self.engine.allocate_transfer_uid()
             func, args = None, None
             if self.enable_sess:
@@ -370,22 +377,22 @@ class MoriIoBenchmark:
         else:
             return 0
 
-    def run_once(self, buffer_size):
+    def run_once(self, buffer_size, transfer_batch_size):
         if self.enable_batch_transfer:
-            return self.run_batch_once(buffer_size)
+            return self.run_batch_once(buffer_size, transfer_batch_size)
         else:
-            return self.run_single_once(buffer_size)
+            return self.run_single_once(buffer_size, transfer_batch_size)
 
-    def _run_and_compute(self, buffer_size, iters):
+    def _run_and_compute(self, buffer_size, transfer_batch_size, iters):
         latency = []
         for i in range(iters):
-            duration = self.run_once(buffer_size)
+            duration = self.run_once(buffer_size, transfer_batch_size)
             latency.append(duration)
 
         if self.role is EngineRole.TARGET:
             return 0, 0, 0, 0, 0
 
-        total_mem_mb = buffer_size * self.transfer_batch_size / (10**6)
+        total_mem_mb = buffer_size * transfer_batch_size / (10**6)
 
         avg_duration = sum(latency) / len(latency)
         min_duration = min(latency)
@@ -414,15 +421,16 @@ class MoriIoBenchmark:
             backend="gloo",
         ):
             self.initialize()
-            self.run_once(self.buffer_size)
+            self.run_once(self.buffer_size, self.transfer_batch_size)
             self.validate()
-            self.run_once(self.buffer_size)
+            self.run_once(self.buffer_size, self.transfer_batch_size)
             dist.barrier()
 
             iters = self.iters
             table = PrettyTable(
                 field_names=[
                     "MsgSize (B)",
+                    "BatchSize",
                     "TotalSize (MB)",
                     "Max BW (GB/s)",
                     "Avg Bw (GB/s)",
@@ -438,11 +446,12 @@ class MoriIoBenchmark:
                 while cur_size <= max_size:
                     dist.barrier()
                     total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
-                        self._run_and_compute(cur_size, iters)
+                        self._run_and_compute(cur_size, self.transfer_batch_size, iters)
                     )
                     table.add_row(
                         [
                             cur_size,
+                            self.transfer_batch_size,
                             f"{total_mem_mb:.2f}",
                             f"{max_bw:.2f}",
                             f"{avg_bw:.2f}",
@@ -451,13 +460,38 @@ class MoriIoBenchmark:
                         ]
                     )
                     cur_size *= 2
+            elif self.sweep_batch:
+                cur_transfer_batch_size = 1
+                max_transfer_batch_size = 32768
+                while cur_transfer_batch_size <= max_transfer_batch_size:
+                    dist.barrier()
+                    total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
+                        self._run_and_compute(
+                            self.buffer_size, cur_transfer_batch_size, iters
+                        )
+                    )
+                    table.add_row(
+                        [
+                            self.buffer_size,
+                            cur_transfer_batch_size,
+                            f"{total_mem_mb:.2f}",
+                            f"{max_bw:.2f}",
+                            f"{avg_bw:.2f}",
+                            f"{min_duration:.2f}",
+                            f"{avg_duration:.2f}",
+                        ]
+                    )
+                    cur_transfer_batch_size *= 2
             else:
                 total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
-                    self._run_and_compute(self.buffer_size, iters)
+                    self._run_and_compute(
+                        self.buffer_size, self.transfer_batch_size, iters
+                    )
                 )
                 table.add_row(
                     [
                         self.buffer_size,
+                        self.transfer_batch_size,
                         f"{total_mem_mb:.2f}",
                         f"{max_bw:.2f}",
                         f"{avg_bw:.2f}",
@@ -475,6 +509,9 @@ def benchmark_engine(local_rank, node_rank, args):
     max_buffer_size = args.buffer_size
     if args.all:
         max_buffer_size = max(max_buffer_size, 2**20)
+    max_transfer_batch_size = args.transfer_batch_size
+    if args.all_batch:
+        max_transfer_batch_size = max(max_transfer_batch_size, 2**15)
     bench = MoriIoBenchmark(
         op_type=args.op_type,
         host=args.host,
@@ -482,7 +519,7 @@ def benchmark_engine(local_rank, node_rank, args):
         node_rank=node_rank,
         rank_in_node=local_rank,
         buffer_size=max_buffer_size,
-        transfer_batch_size=args.transfer_batch_size,
+        transfer_batch_size=max_transfer_batch_size,
         enable_batch_transfer=args.enable_batch_transfer,
         enable_sess=args.enable_sess,
         num_initiator_dev=args.num_initiator_dev,
@@ -492,6 +529,7 @@ def benchmark_engine(local_rank, node_rank, args):
         poll_cq_mode=args.poll_cq_mode,
         iters=args.iters,
         sweep=args.all,
+        sweep_batch=args.all_batch,
     )
     bench.print_config()
     bench.run()
