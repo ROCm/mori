@@ -28,6 +28,7 @@ from mori.io import (
     IOEngine,
     EngineDesc,
     MemoryDesc,
+    PollCqMode,
     RdmaBackendConfig,
     set_log_level,
 )
@@ -108,9 +109,17 @@ def parse_args():
         help="Number of iterations running test",
     )
     parser.add_argument(
+        "--poll_cq_mode",
+        type=str,
+        default="polling",
+        choices=["polling", "event"],
+        help="Determines how to process CQE, choices ['polling', event]",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="info",
+        choices=["trace", "debug", "info", "warning", "error", "critical"],
         help="Log level options: 'trace', 'debug', 'info', 'warning', 'error', 'critical'",
     )
 
@@ -139,6 +148,7 @@ class MoriIoBenchmark:
         num_target_dev: int = 1,
         num_qp_per_transfer: int = 1,
         num_worker_threads: int = 1,
+        poll_cq_mode: str = "polling",
         iters: int = 128,
         sweep: bool = False,
     ):
@@ -156,6 +166,9 @@ class MoriIoBenchmark:
         self.enable_sess = enable_sess
         self.num_qp_per_transfer = num_qp_per_transfer
         self.num_worker_threads = num_worker_threads
+        self.poll_cq_mode = (
+            PollCqMode.POLLING if poll_cq_mode == "polling" else PollCqMode.EVENT
+        )
         self.iters = iters
         self.sweep = sweep
 
@@ -188,6 +201,7 @@ class MoriIoBenchmark:
         print(f"  enable_sess: {self.enable_sess}")
         print(f"  num_qp_per_transfer: {self.num_qp_per_transfer}")
         print(f"  num_worker_threads: {self.num_worker_threads}")
+        print(f"  poll_cq_mode: {self.poll_cq_mode}")
         print(f"  iters: {self.iters}")
         print()
 
@@ -229,6 +243,7 @@ class MoriIoBenchmark:
             qp_per_transfer=self.num_qp_per_transfer,
             post_batch_size=-1,
             num_worker_threads=self.num_worker_threads,
+            poll_cq_mode=self.poll_cq_mode,
         )
         self.engine.create_backend(BackendType.RDMA, config)
 
@@ -474,6 +489,7 @@ def benchmark_engine(local_rank, node_rank, args):
         num_target_dev=args.num_target_dev,
         num_qp_per_transfer=args.num_qp_per_transfer,
         num_worker_threads=args.num_worker_threads,
+        poll_cq_mode=args.poll_cq_mode,
         iters=args.iters,
         sweep=args.all,
     )

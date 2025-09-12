@@ -91,12 +91,16 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
 
   std::vector<struct ibv_sge> sges(batchSize, ibv_sge{});
   std::vector<struct ibv_send_wr> wrs(batchSize, ibv_send_wr{});
-  for (int i = 0; i < epNum; i++) {
-    int st = epBatchSize * i;
-    int end = std::min(static_cast<size_t>(st) + epBatchSize, batchSize);
+
+  if (postBatchSize == -1) postBatchSize = epBatchSize;
+  int numPostBatch = (batchSize + postBatchSize - 1) / postBatchSize;
+
+  // Post batch in round-robin fashion
+  for (int i = 0; i < numPostBatch; i++) {
+    int st = i * postBatchSize;
+    int end = std::min(static_cast<size_t>(st) + postBatchSize, batchSize);
     if ((end - st) == 0) break;
 
-    if (postBatchSize == -1) postBatchSize = end - st;
     for (int j = st; j < end; j++) {
       struct ibv_sge& sge = sges[j];
       sge.addr = reinterpret_cast<uint64_t>(local.addr) + localOffsets[j];
@@ -105,27 +109,31 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
 
       struct ibv_send_wr& wr = wrs[j];
       wr.wr_id = 0;
-      if (j == (end - 1)) {
-        wr.wr_id = reinterpret_cast<uint64_t>(new CqCallbackMessage(callbackMeta, end - st));
-      }
       wr.sg_list = &sge;
       wr.num_sge = 1;
       wr.opcode = isRead ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
-      wr.send_flags = (j < (end - 1)) ? 0 : IBV_SEND_SIGNALED;
+      wr.send_flags = 0;
       wr.wr.rdma.remote_addr = reinterpret_cast<uint64_t>(remote.addr) + remoteOffsets[j];
       wr.wr.rdma.rkey = remote.rkey;
-      wr.next = (j < (end - 1)) ? wrs.data() + j + 1 : nullptr;
-
-      if (((j > st) && ((j - st) % postBatchSize == 0)) || (j == (end - 1))) {
-        int ret = ibv_post_send(eps[i].local.ibvHandle.qp, wrs.data() + st, nullptr);
-        if (ret != 0) {
-          return {StatusCode::ERR_RDMA_OP, strerror(errno)};
-        }
-        MORI_IO_TRACE("ibv_post_send ep index {} batch index {}", i, j);
-      }
+      wr.next = wrs.data() + j + 1;
     }
-  }
 
+    struct ibv_send_wr& last = wrs[end - 1];
+    last.next = nullptr;
+    int epId = i % epNum;
+    // If is last wr for this endpoint, signal for cqe
+    if ((i + epNum) >= numPostBatch) {
+      int epTotalBatchSize = i / epNum * postBatchSize + end - st;
+      last.wr_id =
+          reinterpret_cast<uint64_t>(new CqCallbackMessage(callbackMeta, epTotalBatchSize));
+      last.send_flags = IBV_SEND_SIGNALED;
+    }
+    int ret = ibv_post_send(eps[epId].local.ibvHandle.qp, wrs.data() + st, nullptr);
+    if (ret != 0) {
+      return {StatusCode::ERR_RDMA_OP, strerror(errno)};
+    }
+    MORI_IO_TRACE("ibv_post_send ep index {} batch index range [{}, {})", epId, st, end);
+  }
   return {StatusCode::IN_PROGRESS, ""};
 }
 

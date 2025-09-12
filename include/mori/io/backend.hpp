@@ -44,15 +44,18 @@ struct BackendConfig {
 
 struct RdmaBackendConfig : public BackendConfig {
   RdmaBackendConfig() : BackendConfig(BackendType::RDMA) {}
-  RdmaBackendConfig(int qpPerTransfer_, int postBatchSize_, int numWorkerThreads_)
+  RdmaBackendConfig(int qpPerTransfer_, int postBatchSize_, int numWorkerThreads_,
+                    PollCqMode pollCqMode_)
       : BackendConfig(BackendType::RDMA),
         qpPerTransfer(qpPerTransfer_),
         postBatchSize(postBatchSize_),
-        numWorkerThreads(numWorkerThreads_) {}
+        numWorkerThreads(numWorkerThreads_),
+        pollCqMode(pollCqMode_) {}
 
   int qpPerTransfer{1};
   int postBatchSize{-1};
   int numWorkerThreads{1};
+  PollCqMode pollCqMode{PollCqMode::POLLING};
 };
 
 inline std::ostream& operator<<(std::ostream& os, const RdmaBackendConfig& c) {
