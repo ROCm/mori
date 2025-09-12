@@ -185,7 +185,7 @@ def check_transfer_result(
         assert not torch.equal(target_tensor.cpu(), target_tensor_copy.cpu())
 
 
-@pytest.mark.parametrize("engine_type", ("normal",))
+@pytest.mark.parametrize("engine_type", ("normal", "multhd"))
 @pytest.mark.parametrize(
     "enable_sess",
     (
@@ -314,9 +314,9 @@ def test_no_backend():
         host="127.0.0.1",
         port=get_free_port(),
     )
-    initiator = IOEngine(key=f"no_be_initiator", config=config)
+    initiator = IOEngine(key="no_be_initiator", config=config)
     config.port = get_free_port()
-    target = IOEngine(key=f"no_be_target", config=config)
+    target = IOEngine(key="no_be_target", config=config)
 
     initiator_desc = initiator.get_engine_desc()
     target_desc = target.get_engine_desc()

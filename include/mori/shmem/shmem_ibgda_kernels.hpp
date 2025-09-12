@@ -296,7 +296,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
       uint32_t psnCnt = (bytes + wq->mtuSize - 1) / wq->mtuSize;
       atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, psnCnt * num_wqes, &warp_msntbl_counter,
                                     &warp_psn_counter);
-      // TODO: if warp_msntbl_counter overflow 32bit, sq_slot's caculation will be wrong
+      // TODO: if warp_msntbl_counter overflow 32bit, sq_slot's calculation will be wrong
       warp_sq_counter = warp_msntbl_counter * BNXT_RE_NUM_SLOT_PER_WQE;
       __hip_atomic_fetch_max(&wq->postIdx,
                              (warp_msntbl_counter + num_wqes) * BNXT_RE_NUM_SLOT_PER_WQE,

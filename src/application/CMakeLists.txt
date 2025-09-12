@@ -11,7 +11,6 @@ message(STATUS "Found LibTorch CMake Path: ${CMAKE_PREFIX_PATH}")
 
 find_package(Torch REQUIRED)
 
-
 add_library(
   mori_application SHARED
   bootstrap/mpi_bootstrap.cpp
@@ -40,8 +39,7 @@ target_link_libraries(
   hip::device
   mlx5
   rocm_smi64
-  pci
-)
+  pci)
 
 if(USE_BNXT)
   target_link_libraries(mori_application ${BNXT_RE_LIB})

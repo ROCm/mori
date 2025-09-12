@@ -26,6 +26,7 @@
 #include <atomic>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <thread>
 #include <vector>
 
@@ -45,7 +46,7 @@ namespace io {
 /* ---------------------------------------------------------------------------------------------- */
 class RdmaManager {
  public:
-  RdmaManager(application::RdmaContext* ctx);
+  RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* ctx);
   ~RdmaManager() = default;
 
   application::RdmaEndpointConfig GetRdmaEndpointConfig(int portId);
@@ -75,11 +76,16 @@ class RdmaManager {
 
   application::RdmaDeviceContext* GetRdmaDeviceContext(int devId);
 
+  // Endpoint enumeration
+  using EnumerateEpCallbackFunc = std::function<void(int qpn, const EpPair& ep)>;
+  void EnumerateEndpoints(const EnumerateEpCallbackFunc&);
+
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
 
  private:
-  mutable std::mutex mu;
+  RdmaBackendConfig config;
+  mutable std::shared_mutex mu;
 
   application::RdmaContext* ctx;
   application::ActiveDevicePortList availDevices;
@@ -112,6 +118,9 @@ class NotifManager {
   void Shutdown();
 
  private:
+  void ProcessOneCqe(int qpn, const EpPair& ep);
+
+ private:
   RdmaBackendConfig config;
   mutable std::mutex mu;
 
@@ -120,6 +129,7 @@ class NotifManager {
   std::thread thd;
   RdmaManager* rdma;
 
+  // Notification context
  private:
   struct DeviceNotifContext {
     ibv_srq* srq;

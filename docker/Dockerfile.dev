@@ -1,4 +1,5 @@
-FROM rocm/pytorch:rocm6.4.1_ubuntu24.04_py3.12_pytorch_release_2.5.1
+# FROM rocm/pytorch:rocm6.4.1_ubuntu22.04_py3.12_pytorch_release_2.5.1
+FROM rocm/pytorch:rocm6.4.3_ubuntu22.04_py3.10_pytorch_release_2.5.1
 
 RUN apt-get update && \
     apt-get install -y \

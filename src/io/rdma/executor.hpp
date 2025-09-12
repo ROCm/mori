@@ -22,6 +22,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -76,11 +77,14 @@ class MultithreadExecutor : public Executor {
 
  private:
   struct Task {
-    const ExecutorReq& req;
-    RdmaOpRet& ret;
+    const ExecutorReq* req;
     int epId{-1};
     int begin{-1};
     int end{-1};
+    std::promise<RdmaOpRet> ret;
+
+    Task(const ExecutorReq* req_, int epId_, int begin_, int end_)
+        : req(req_), epId(epId_), begin(begin_), end(end_) {}
   };
 
   std::vector<std::pair<int, int>> SplitWork(const ExecutorReq& req);
@@ -93,7 +97,7 @@ class MultithreadExecutor : public Executor {
     void Start();
     void Shutdown();
 
-    void Submit(Task);
+    void Submit(Task&&);
 
    private:
     int workerId{-1};

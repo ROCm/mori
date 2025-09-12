@@ -118,6 +118,11 @@ struct TransferStatus {
   void SetCode(enum StatusCode val) { code.store(val, std::memory_order_relaxed); }
   void SetMessage(const std::string& val) { msg = val; }
 
+  void Wait() {
+    while (InProgress()) {
+    }
+  }
+
  private:
   std::atomic<StatusCode> code{StatusCode::INIT};
   std::string msg;

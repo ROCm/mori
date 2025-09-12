@@ -51,5 +51,7 @@ enum class StatusCode : uint32_t {
   ERR_BAD_STATE = 14
 };
 
+enum class PollCqMode : uint32_t { POLLING = 0, EVENT = 1 };
+
 }  // namespace io
 }  // namespace mori

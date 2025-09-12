@@ -3,6 +3,10 @@ cmake_minimum_required(VERSION 3.19)
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
 if(NOT DEFINED CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "")
   message(STATUS "Build type not set - defaulting to Release")
   set(CMAKE_BUILD_TYPE
@@ -26,11 +30,14 @@ option(BUILD_TESTS "Whether to build mori CPP tests" ON)
 
 set(CMAKE_LIBRARY_PATH "/usr/local/lib;${CMAKE_LIBRARY_PATH}")
 find_library(BNXT_RE_LIB NAMES bnxt_re)
-if (BNXT_RE_LIB)
+if(BNXT_RE_LIB)
   message(STATUS "Found bnxt_re library at: ${BNXT_RE_LIB}")
 else()
-  message(STATUS "Could NOT find bnxt_re library. BNXT features will be disabled.")
-  set(USE_BNXT OFF CACHE BOOL "Enable BNXT features if bnxt_re library is found" FORCE)
+  message(
+    STATUS "Could NOT find bnxt_re library. BNXT features will be disabled.")
+  set(USE_BNXT
+      OFF
+      CACHE BOOL "Enable BNXT features if bnxt_re library is found" FORCE)
 endif()
 message(STATUS "USE_BNXT = ${USE_BNXT}")
 if(USE_BNXT)

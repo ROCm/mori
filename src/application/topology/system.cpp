@@ -75,19 +75,21 @@ std::vector<Candidate> CollectAndSortCandidates(TopoSystem* sys, int id) {
   }
 
   // Sort by 1) speed 2) numa 3) hops 4) name
-  std::sort(candidates.begin(), candidates.end(), [&gpuNumaNodeId](Candidate a, Candidate b) -> bool {
-    bool tie = (a.nic->totalGbps == b.nic->totalGbps);
-    if (!tie) return a.nic->totalGbps > b.nic->totalGbps;
+  std::sort(candidates.begin(), candidates.end(),
+            [&gpuNumaNodeId](Candidate a, Candidate b) -> bool {
+              bool tie = (a.nic->totalGbps == b.nic->totalGbps);
+              if (!tie) return a.nic->totalGbps > b.nic->totalGbps;
 
-    if ((a.node->NumaNode() == gpuNumaNodeId) && (b.node->NumaNode() != gpuNumaNodeId)) return true;
-    if ((a.node->NumaNode() != gpuNumaNodeId) && (b.node->NumaNode() == gpuNumaNodeId))
-      return false;
+              if ((a.node->NumaNode() == gpuNumaNodeId) && (b.node->NumaNode() != gpuNumaNodeId))
+                return true;
+              if ((a.node->NumaNode() != gpuNumaNodeId) && (b.node->NumaNode() == gpuNumaNodeId))
+                return false;
 
-    tie = (a.path->Hops() == b.path->Hops());
-    if (!tie) return a.path->Hops() <= b.path->Hops();
+              tie = (a.path->Hops() == b.path->Hops());
+              if (!tie) return a.path->Hops() <= b.path->Hops();
 
-    return a.nic->name <= b.nic->name;
-  });
+              return a.nic->name <= b.nic->name;
+            });
 
   return candidates;
 }

@@ -306,7 +306,9 @@ class EpDispatchCombineTestCase:
                     )
                     print(f"  original weights[{i}]: {all_rank_weights[self.rank][i]}")
                     print(f"  diff: {torch.abs(got_weight - expected_weight)}")
-                    print(f"  max_diff: {torch.abs(got_weight - expected_weight).max()}")
+                    print(
+                        f"  max_diff: {torch.abs(got_weight - expected_weight).max()}"
+                    )
                 assert weight_match, f"Weight assertion failed for token {i}"
 
         if self.config.rank == 0:
@@ -560,4 +562,3 @@ if __name__ == "__main__":
         nprocs=gpu_per_node,
         join=True,
     )
-
