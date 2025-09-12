@@ -71,6 +71,7 @@ class EpDispatchCombineOp:
                 num_experts_per_token=config.num_experts_per_token,
                 warp_num_per_block=config.warp_num_per_block,
                 block_num=config.block_num,
+                kernel_type=config.kernel_type,
                 use_external_inp_buf=config.use_external_inp_buf,
             )
         )
@@ -178,6 +179,11 @@ class EpDispatchCombineOp:
 
         if self.config.kernel_type.value == EpDispatchCombineKernelType.IntraNode.value:
             return self._get_dispatch_src_token_pos_func(self._handle)
+        # elif (
+        #     self.config.kernel_type.value
+        #     == EpDispatchCombineKernelType.InterNodeNormal.value
+        # ):
+        #     return
 
         dispatch_sender_token_id_map = self._get_dispatch_sender_token_idx_map_func(
             self._handle

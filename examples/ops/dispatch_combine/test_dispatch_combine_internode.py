@@ -49,6 +49,7 @@ class EpDispatchCombineTestCase:
             block_num=64,
             max_token_type_size=2,
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNode,
+            kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeNormal,
         )
 
     def setup(self):
@@ -196,6 +197,16 @@ class EpDispatchCombineTestCase:
                     device=self.device,
                 ).to(self.config.data_type)
             )
+        # all_rank_input = []
+        # for r in range(self.world_size):
+        #     all_rank_input.append(
+        #         torch.full(
+        #             (num_token[r], self.config.hidden_dim),
+        #             fill_value=float(r + 1),
+        #             dtype=torch.float32,
+        #             device=self.device,
+        #         ).to(self.config.data_type)
+        #     )
 
         return (
             num_token,

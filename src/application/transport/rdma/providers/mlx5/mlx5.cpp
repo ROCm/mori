@@ -128,6 +128,8 @@ Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig&
   DEVX_SET(cqc, cq_context, dbr_umem_id, cqDbrUmem->umem_id);
   DEVX_SET(cqc, cq_context, log_cq_size, LogCeil2(cqeNum));
   DEVX_SET(cqc, cq_context, uar_page, uar->page_id);
+  // DEVX_SET(cqc, cq_context, cc, 0x1);  // Use collapsed CQ
+  // DEVX_SET(cqc, cq_context, oi, 0x1);  // Allow overrun
 
   uint32_t eqn;
   status = mlx5dv_devx_query_eqn(context, 0, &eqn);

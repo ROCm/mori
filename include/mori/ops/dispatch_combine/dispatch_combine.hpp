@@ -36,6 +36,7 @@ namespace moe {
 enum KernelType {
   IntraNode = 0,
   InterNode = 1,
+  InterNodeNormal = 2,
 };
 
 inline const char* HipDataTypeToString(hipDataType dtype) {
@@ -81,6 +82,7 @@ struct EpDispatchCombineConfig {
   int numExpertPerToken{2};
   int warpNumPerBlock{1};
   int blockNum{1};
+  int kernelType{KernelType::IntraNode};
   // If true, use external buffer which incurs extra copy overhead; otherwise, the kernel assumes
   // the provided buffer is shmemInpTokMemObj
   bool useExternalInpBuffer{true};
@@ -103,15 +105,15 @@ class EpDispatchCombineHandle {
   EpDispatchCombineHandle(EpDispatchCombineConfig config);
   ~EpDispatchCombineHandle();
 
-  void PrepareInference(hipDataType inputType, void* input, void* output, float* weights,
-                        index_t* tokenIndices, index_t numToken) {
+  void PrepareTraining(hipDataType inputType, void* input, void* output, float* weights,
+                       uint8_t* scales, index_t* tokenIndices, index_t numToken) {
     this->inputType = inputType;
     this->inpTokenBuf = input;
     this->outTokenBuf = output;
     this->weightsBuf = weights;
+    this->scalesBuf = scales;
     this->tokenIndices = tokenIndices;
     this->curRankNumToken = numToken;
-    // printf("handle inputType %s\n", HipDataTypeToString(inputType));
   }
 
   void PrepareInference(hipDataType inputType, void* input, void* output, float* weights,
@@ -328,6 +330,7 @@ static std::ostream& operator<<(std::ostream& s, mori::moe::EpDispatchCombineCon
      << "  hiddenDim: " << config.hiddenDim << std::endl
      << "  scaleDim: " << config.scaleDim << std::endl
      << "  scaleTypeSize: " << config.scaleTypeSize << std::endl
+     << "  kernelType: " << config.kernelType << std::endl
      << "  maxTokenTypeSize: " << config.maxTokenTypeSize << std::endl
      << "  maxNumInpTokenPerRank: " << config.maxNumInpTokenPerRank << std::endl
      << "  numExpertPerRank: " << config.numExpertPerRank << std::endl
