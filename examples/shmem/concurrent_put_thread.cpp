@@ -86,6 +86,9 @@ void ConcurrentPutThread() {
   ConcurrentPutThreadKernel<<<blockNum, threadNum>>>(myPe, buffObj);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
+  if (myPe == 0) {
+    printf("test done!\n");
+  }
 
   // Finalize
   ShmemFree(buff);
