@@ -127,6 +127,12 @@ def parse_args():
         choices=["trace", "debug", "info", "warning", "error", "critical"],
         help="Log level options: 'trace', 'debug', 'info', 'warning', 'error', 'critical'",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Directory to write benchmark results",
+    )
 
     args = parser.parse_args()
     return args
@@ -157,6 +163,7 @@ class MoriIoBenchmark:
         iters: int = 128,
         sweep: bool = False,
         sweep_batch: bool = False,
+        output_dir: str = None,
     ):
         self.op_type = op_type
         self.host = host
@@ -178,6 +185,7 @@ class MoriIoBenchmark:
         self.iters = iters
         self.sweep = sweep
         self.sweep_batch = sweep_batch
+        self.output_dir = output_dir
 
         self.world_size = self.num_initiator_dev + self.num_target_dev
         if self.node_rank == 0:
@@ -502,6 +510,15 @@ class MoriIoBenchmark:
 
             if self.role is EngineRole.INITIATOR:
                 print(table)
+                if self.output_dir:
+                    with open(
+                        os.path.join(
+                            self.output_dir, f"benchmark_{self.role_rank}.csv"
+                        ),
+                        "w",
+                        newline="",
+                    ) as f:
+                        f.write(table.get_csv_string())
 
 
 def benchmark_engine(local_rank, node_rank, args):
@@ -530,6 +547,7 @@ def benchmark_engine(local_rank, node_rank, args):
         iters=args.iters,
         sweep=args.all,
         sweep_batch=args.all_batch,
+        output_dir=args.output_dir,
     )
     bench.print_config()
     bench.run()
