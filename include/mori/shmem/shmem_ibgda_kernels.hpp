@@ -241,28 +241,6 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Point-to-Point                                         */
 /* ---------------------------------------------------------------------------------------------- */
-inline __device__ void atomic_add_packed_msn_and_psn(uint64_t* msnPack, uint32_t incSlot,
-                                                     uint32_t incPsn, uint32_t* oldSlot,
-                                                     uint32_t* oldPsn) {
-  uint64_t expected = __hip_atomic_load(msnPack, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  while (true) {
-    uint32_t curSlot = static_cast<uint32_t>(expected & 0xFFFFFFFF);
-    uint32_t curPsn = static_cast<uint32_t>((expected >> 32) & 0xFFFFFFFF);
-
-    uint32_t newSlot = curSlot + incSlot;
-    uint32_t newPsn = curPsn + incPsn;
-
-    uint64_t desired = (static_cast<uint64_t>(newPsn) << 32) | static_cast<uint64_t>(newSlot);
-
-    if (__hip_atomic_compare_exchange_strong(msnPack, &expected, desired, __ATOMIC_RELAXED,
-                                             __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) {
-      if (oldSlot) *oldSlot = curSlot;
-      if (oldPsn) *oldPsn = curPsn;
-      break;
-    }
-  }
-}
-
 template <core::ProviderType PrvdType>
 inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMemObjPtr dest,
                                                       size_t destOffset,
@@ -294,7 +272,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
                                                __HIP_MEMORY_SCOPE_AGENT);
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
       uint32_t psnCnt = (bytes + wq->mtuSize - 1) / wq->mtuSize;
-      atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, psnCnt * num_wqes, &warp_msntbl_counter,
+      core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, psnCnt * num_wqes, &warp_msntbl_counter,
                                     &warp_psn_counter);
       // TODO: if warp_msntbl_counter overflow 32bit, sq_slot's calculation will be wrong
       warp_sq_counter = warp_msntbl_counter * BNXT_RE_NUM_SLOT_PER_WQE;
@@ -436,7 +414,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
     my_sq_counter = warp_sq_counter + my_logical_lane_id;
   } else if constexpr (PrvdType == core::ProviderType::BNXT) {
     if (is_leader) {
-      atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, num_wqes, &warp_msntbl_counter,
+      core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, num_wqes, &warp_msntbl_counter,
                                     &warp_psn_counter);
       warp_sq_counter = warp_msntbl_counter * BNXT_RE_NUM_SLOT_PER_WQE;
       __hip_atomic_fetch_max(&wq->postIdx,
@@ -573,7 +551,7 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
   } else if constexpr (PrvdType == core::ProviderType::BNXT) {
     num_wqes = num_active_lanes;
     if (is_leader) {
-      atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, num_wqes, &warp_msntbl_counter,
+      core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, num_wqes, &warp_msntbl_counter,
                                     &warp_psn_counter);
       warp_sq_counter = warp_msntbl_counter * BNXT_RE_NUM_SLOT_PER_WQE;
       __hip_atomic_fetch_max(&wq->postIdx,
@@ -721,7 +699,7 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernelImpl(
   } else if constexpr (PrvdType == core::ProviderType::BNXT) {
     num_wqes = num_active_lanes;
     if (is_leader) {
-      atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, num_wqes, &warp_msntbl_counter,
+      core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, num_wqes, &warp_msntbl_counter,
                                     &warp_psn_counter);
       warp_sq_counter = warp_msntbl_counter * BNXT_RE_NUM_SLOT_PER_WQE;
       __hip_atomic_fetch_max(&wq->postIdx,

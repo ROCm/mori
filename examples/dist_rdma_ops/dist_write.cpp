@@ -70,8 +70,8 @@ inline __device__ void QuiteSerial(RdmaEndpoint* endpoint) {
     uint32_t my_cq_consumer{0};
 
     uint32_t dbTouchIdx =
-        __hip_atomic_load(&wq.dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint32_t doneIdx = __hip_atomic_load(&wq.doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __hip_atomic_load(&wq.dbTouchIdx, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_AGENT);
+    uint32_t doneIdx = __hip_atomic_load(&wq.doneIdx, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_AGENT);
     // printf("dbTouchIdx: %u, doneIdx: %u\n", dbTouchIdx, doneIdx);
     if (dbTouchIdx == doneIdx) {
       return;
@@ -96,8 +96,8 @@ inline __device__ void QuiteSerial(RdmaEndpoint* endpoint) {
         uint32_t my_cq_index = my_cq_consumer % cq.cqeNum;
         assert(false);
       }
-      wqe_counter = (BNXT_RE_NUM_SLOT_PER_WQE * (wqe_counter + wq.sqWqeNum - 1) % wq.sqWqeNum);
-      wqe_id = wq.outstandingWqe[wqe_counter] + BNXT_RE_NUM_SLOT_PER_WQE;
+      wqe_counter = (wqe_counter + wq.sqWqeNum - 1) % wq.sqWqeNum;
+      wqe_id = wq.outstandingWqe[wqe_counter] + 1;
     }
 
     // core::UpdateCqDbrRecord<P>(cq.dbrRecAddr, (uint32_t)(my_cq_consumer + 1), cq.cqeNum);
@@ -175,7 +175,6 @@ __device__ void Quite(RdmaEndpoint* endpoint) {
       wqe_id = endpoint->wqHandle.outstandingWqe[wqe_counter];
       __hip_atomic_fetch_max(&wqe_broadcast[warp_id], wqe_id, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_WORKGROUP);
-      __atomic_signal_fence(__ATOMIC_RELAXED);
     }
     if (is_leader) {
       uint64_t completed{0};
@@ -185,7 +184,6 @@ __device__ void Quite(RdmaEndpoint* endpoint) {
       } while (completed != warp_cq_consumer);
       UpdateCqDbrRecord<P>(cqHandle->dbrRecAddr, (uint32_t)(warp_cq_consumer + quiet_amount),
                            cqHandle->cqeNum);
-      __atomic_signal_fence(__ATOMIC_RELAXED);
 
       uint64_t doneIdx = wqe_broadcast[warp_id];
       __hip_atomic_fetch_max(&endpoint->wqHandle.doneIdx, doneIdx, __ATOMIC_RELAXED,
@@ -220,53 +218,44 @@ inline __device__ void atomic_add_packed_msn_and_psn(uint64_t* msnPack, uint32_t
 
 template <ProviderType P>
 __global__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemoryRegion remoteMr,
-                      size_t msg_size, int iters) {
+                      size_t msg_size, int iters, uint32_t* blockSync) {
   for (int i = 0; i < iters; i++) {
+
     uint64_t activemask = GetActiveLaneMask();
     uint8_t num_active_lanes = GetActiveLaneCount(activemask);
     uint8_t my_logical_lane_id = GetActiveLaneNum(activemask);
     bool is_leader{my_logical_lane_id == num_active_lanes - 1};
     const uint64_t leader_phys_lane_id = GetLastActiveLaneID(activemask);
 
-    uint8_t num_slot_per_wqe;
-    if constexpr (P == ProviderType::MLX5) {
-      num_slot_per_wqe = 1;
-    } else if constexpr (P == ProviderType::BNXT) {
-      num_slot_per_wqe = 3;
-    }
     uint8_t num_wqes = num_active_lanes;
 
     uint64_t warp_sq_counter{0};
     uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
     WorkQueueHandle* wqHandle = &endpoint->wqHandle;
     CompletionQueueHandle* cqHandle = &endpoint->cqHandle;
-
+    uint32_t psnCnt = (msg_size + wqHandle->mtuSize - 1) / wqHandle->mtuSize;
     if (is_leader) {
-      uint32_t psnCnt = (msg_size + wqHandle->mtuSize - 1) / wqHandle->mtuSize;
-      atomic_add_packed_msn_and_psn(&wqHandle->msnPack, num_wqes, psnCnt * num_wqes,
-                                    &warp_msntbl_counter, &warp_psn_counter);
+      core::atomic_add_packed_msn_and_psn(&wqHandle->msnPack, num_wqes, psnCnt * num_wqes,
+                                          &warp_msntbl_counter, &warp_psn_counter);
       // TODO: if warp_msntbl_counter overflow 32bit, sq_slot's caculation will be wrong
-      warp_sq_counter = warp_msntbl_counter * num_slot_per_wqe;
-      __hip_atomic_fetch_max(&wqHandle->postIdx,
-                             (warp_msntbl_counter + num_wqes) * num_slot_per_wqe, __ATOMIC_RELAXED,
+      warp_sq_counter = warp_msntbl_counter;
+      __hip_atomic_fetch_max(&wqHandle->postIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_AGENT);
     }
     warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
     warp_msntbl_counter = __shfl(warp_msntbl_counter, leader_phys_lane_id);
     warp_psn_counter = __shfl(warp_psn_counter, leader_phys_lane_id);
-    uint64_t my_sq_counter = warp_sq_counter + my_logical_lane_id * num_slot_per_wqe;
+    uint64_t my_sq_counter = warp_sq_counter + my_logical_lane_id;
     uint64_t my_msntbl_counter = warp_msntbl_counter + my_logical_lane_id;
-    uint64_t my_psn_counter = warp_psn_counter + my_logical_lane_id;
+    uint64_t my_psn_counter = warp_psn_counter + my_logical_lane_id * psnCnt;
     while (true) {
       uint64_t db_touched =
           __hip_atomic_load(&wqHandle->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       uint64_t db_done =
           __hip_atomic_load(&wqHandle->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       uint64_t num_active_sq_entries = db_touched - db_done;
-      uint64_t num_free_entries =
-          min(wqHandle->sqWqeNum, cqHandle->cqeNum * num_slot_per_wqe) - num_active_sq_entries;
-      uint64_t num_entries_until_warp_last_entry =
-          warp_sq_counter + num_active_lanes * num_slot_per_wqe - db_touched;
+      uint64_t num_free_entries = wqHandle->sqWqeNum - num_active_sq_entries;
+      uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
       if (num_free_entries > num_entries_until_warp_last_entry) {
         break;
       }
@@ -302,14 +291,21 @@ __global__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
       RingDoorbell<P>(wqHandle->dbrAddr, dbr_val);
 
       __hip_atomic_fetch_add(&cqHandle->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      __hip_atomic_store(&wqHandle->dbTouchIdx, warp_sq_counter + num_wqes * num_slot_per_wqe,
-                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_store(&wqHandle->dbTouchIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
     }
     if constexpr (P == ProviderType::MLX5) {
       Quite<P>(endpoint);
     } else if constexpr (P == ProviderType::BNXT) {
       QuiteSerial<P>(endpoint);
     }
+    if (threadIdx.x == 0) {
+      atomicAdd(blockSync + i, 1);
+    }
+    while (atomicAdd(blockSync + i, 0) < gridDim.x) {
+      ;
+    }
+    __syncthreads();
   }
 }
 
@@ -371,12 +367,15 @@ void distRdmaOps(int argc, char* argv[]) {
               << std::endl;
   }
 
-  // 4 Register buffer
+  // 4 Register buffer and block sync memory
   void* buffer;
   size_t totalSize = maxSize * blocks * threads;
   assert(totalSize <= 0x800000000ULL && "Error: totalSize cannot exceed 32GB!");
   HIP_RUNTIME_CHECK(hipMalloc(&buffer, totalSize));
   HIP_RUNTIME_CHECK(hipMemset(buffer, local_rank, totalSize));
+  uint32_t* blockSync;
+  HIP_RUNTIME_CHECK(hipMalloc(&blockSync, (warmupIters + iters + 1) * sizeof(uint32_t)));
+  HIP_RUNTIME_CHECK(hipMemset(blockSync, 0, (warmupIters + iters + 1) * sizeof(uint32_t)));
 
   // assert(!posix_memalign(&buffer_1, 4096, allreduce_size));
   // memset(buffer_1, 1, allreduce_size);
@@ -406,12 +405,12 @@ void distRdmaOps(int argc, char* argv[]) {
       switch (endpoint.GetProviderType()) {
         case ProviderType::MLX5:
           Write<ProviderType::MLX5><<<blocks, threads>>>(devEndpoint, global_mr_handles[0],
-                                                         global_mr_handles[1], size, 1);
+                                                         global_mr_handles[1], size, 1, blockSync);
           break;
 #ifdef ENABLE_BNXT
         case ProviderType::BNXT:
           Write<ProviderType::BNXT><<<blocks, threads>>>(devEndpoint, global_mr_handles[0],
-                                                         global_mr_handles[1], size, 1);
+                                                         global_mr_handles[1], size, 1, blockSync);
           break;
 #endif
         default:
@@ -434,12 +433,14 @@ void distRdmaOps(int argc, char* argv[]) {
       switch (endpoint.GetProviderType()) {
         case ProviderType::MLX5:
           Write<ProviderType::MLX5><<<blocks, threads>>>(devEndpoint, global_mr_handles[0],
-                                                         global_mr_handles[1], size, warmupIters);
+                                                         global_mr_handles[1], size, warmupIters,
+                                                         blockSync + 1);
           break;
 #ifdef ENABLE_BNXT
         case ProviderType::BNXT:
           Write<ProviderType::BNXT><<<blocks, threads>>>(devEndpoint, global_mr_handles[0],
-                                                         global_mr_handles[1], size, warmupIters);
+                                                         global_mr_handles[1], size, warmupIters,
+                                                         blockSync + 1);
           break;
 #endif
         default:
@@ -452,12 +453,14 @@ void distRdmaOps(int argc, char* argv[]) {
       switch (endpoint.GetProviderType()) {
         case ProviderType::MLX5:
           Write<ProviderType::MLX5><<<blocks, threads>>>(devEndpoint, global_mr_handles[0],
-                                                         global_mr_handles[1], size, iters);
+                                                         global_mr_handles[1], size, iters,
+                                                         blockSync + 1 + warmupIters);
           break;
 #ifdef ENABLE_BNXT
         case ProviderType::BNXT:
           Write<ProviderType::BNXT><<<blocks, threads>>>(devEndpoint, global_mr_handles[0],
-                                                         global_mr_handles[1], size, iters);
+                                                         global_mr_handles[1], size, iters,
+                                                         blockSync + 1 + warmupIters);
           break;
 #endif
         default:
@@ -485,7 +488,8 @@ void distRdmaOps(int argc, char* argv[]) {
 
     for (size_t i = 0; i < validSizeLog; ++i) {
       double rate_pps = (blocks * threads * iters) / (times[i] * MS_TO_S);
-      printf("%-8zu %-12lu %-12.4f %-12.4f %-12.4f\n", i + 1, sizeTable[i], bwTable[i], times[i], rate_pps);
+      printf("%-8zu %-12lu %-12.4f %-12.4f %-12.4f\n", i + 1, sizeTable[i], bwTable[i], times[i],
+             rate_pps);
     }
   }
 
