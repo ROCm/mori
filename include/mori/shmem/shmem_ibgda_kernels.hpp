@@ -265,10 +265,10 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
   uint32_t warp_sq_counter{0};
   uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
   uint32_t my_sq_counter{0}, my_msntbl_counter{0}, my_psn_counter{0};
-  uint32_t psnCnt;
+  uint32_t psnCnt = 0;
 
   if constexpr (PrvdType == core::ProviderType::BNXT) {
-    uint32_t psnCnt = (bytes + wq->mtuSize - 1) / wq->mtuSize;
+    psnCnt = (bytes + wq->mtuSize - 1) / wq->mtuSize;
   }
   if (is_leader) {
     if constexpr (PrvdType == core::ProviderType::MLX5) {
