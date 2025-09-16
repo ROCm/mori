@@ -63,6 +63,28 @@ inline __device__ uint64_t bnxt_re_init_db_hdr(int32_t indx, uint32_t toggle, ui
 /* ---------------------------------------------------------------------------------------------- */
 /*                                       Fill MSN Table                                           */
 /* ---------------------------------------------------------------------------------------------- */
+inline __device__ void atomic_add_packed_msn_and_psn(uint64_t* msnPack, uint32_t incSlot,
+                                                     uint32_t incPsn, uint32_t* oldSlot,
+                                                     uint32_t* oldPsn) {
+  uint64_t expected = __hip_atomic_load(msnPack, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  while (true) {
+    uint32_t curSlot = static_cast<uint32_t>(expected & 0xFFFFFFFF);
+    uint32_t curPsn = static_cast<uint32_t>((expected >> 32) & 0xFFFFFFFF);
+
+    uint32_t newSlot = curSlot + incSlot;
+    uint32_t newPsn = curPsn + incPsn;
+
+    uint64_t desired = (static_cast<uint64_t>(newPsn) << 32) | static_cast<uint64_t>(newSlot);
+
+    if (__hip_atomic_compare_exchange_strong(msnPack, &expected, desired, __ATOMIC_RELAXED,
+                                             __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) {
+      if (oldSlot) *oldSlot = curSlot;
+      if (oldPsn) *oldPsn = curPsn;
+      break;
+    }
+  }
+}
+
 inline __device__ uint64_t bnxt_re_update_msn_tbl(uint32_t st_idx, uint32_t npsn,
                                                   uint32_t start_psn) {
   return ((((uint64_t)(st_idx) << BNXT_RE_SQ_MSN_SEARCH_START_IDX_SHIFT) &
@@ -109,17 +131,16 @@ inline __device__ uint64_t BnxtPostSend(WorkQueueHandle& wq, uint32_t curPostIdx
   struct bnxt_re_bsqe hdr;
   struct bnxt_re_send send;
   struct bnxt_re_sge sge;
-  constexpr int sendWqeSize =
-      sizeof(struct bnxt_re_bsqe) + sizeof(struct bnxt_re_send) + sizeof(struct bnxt_re_sge);
-  constexpr int slotsNum = CeilDiv(sendWqeSize, BNXT_RE_SLOT_SIZE);
+  // constexpr int sendWqeSize =
+  //     sizeof(struct bnxt_re_bsqe) + sizeof(struct bnxt_re_send) + sizeof(struct bnxt_re_sge);
+  // constexpr int slotsNum = CeilDiv(sendWqeSize, BNXT_RE_SLOT_SIZE);
 
   int psnCnt = (bytes == 0) ? 1 : (bytes + mtuSize - 1) / mtuSize;
 
-  uint32_t slotIdx = curPostIdx % wqeNum;
-  // TODO: wqeNum should be multiple of slotsNum, BRCM say using a specific conf currently.
-  assert((slotIdx + slotsNum) <= wqeNum);
+  uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
+  uint32_t slotIdx = wqeIdx * BNXT_RE_NUM_SLOT_PER_WQE;
 
-  uint32_t wqe_size = BNXT_RE_HDR_WS_MASK & slotsNum;
+  uint32_t wqe_size = BNXT_RE_HDR_WS_MASK & BNXT_RE_NUM_SLOT_PER_WQE;
   uint32_t hdr_flags = BNXT_RE_HDR_FLAGS_MASK & signalFlag;
   uint32_t wqe_type = BNXT_RE_HDR_WT_MASK & BNXT_RE_WR_OPCD_SEND;
   hdr.rsv_ws_fl_wt =
@@ -148,11 +169,11 @@ inline __device__ uint64_t BnxtPostSend(WorkQueueHandle& wq, uint32_t curPostIdx
 
   // get doorbell header
   // struct bnxt_re_db_hdr hdr;
-  uint8_t flags = ((curPostIdx + slotsNum) / wqeNum) & 0x1;
+  uint8_t flags = ((curPostIdx + 1) >> (__ffs(wqeNum) - 1)) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
 
-  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum) | epoch), 0, qpn,
-                             BNXT_RE_QUE_TYPE_SQ);
+  return bnxt_re_init_db_hdr(((((wqeIdx + 1) & (wqeNum - 1)) * BNXT_RE_NUM_SLOT_PER_WQE) | epoch),
+                             0, qpn, BNXT_RE_QUE_TYPE_SQ);
 }
 
 template <>
@@ -171,20 +192,11 @@ inline __device__ uint64_t PostSend<ProviderType::BNXT>(WorkQueueHandle& wq, uin
                                                         size_t bytes) {
   uint32_t mtuSize = wq.mtuSize;
 
-  constexpr int sendWqeSize =
-      sizeof(struct bnxt_re_bsqe) + sizeof(struct bnxt_re_send) + sizeof(struct bnxt_re_sge);
-  constexpr int slotsNum = CeilDiv(sendWqeSize, BNXT_RE_SLOT_SIZE);
-
   int psnCnt = (bytes == 0) ? 1 : (bytes + mtuSize - 1) / mtuSize;
+  uint32_t curMsntblSlotIdx, curPsnIdx, curPostIdx;
   // psn index needs to be strictly ordered
-  AcquireLock(&wq.postSendLock);
-  uint32_t curPostIdx = wq.postIdx;
-  wq.postIdx += slotsNum;
-  uint32_t curMsntblSlotIdx = wq.msntblSlotIdx;
-  wq.msntblSlotIdx += 1;
-  uint32_t curPsnIdx = wq.psnIdx;
-  wq.psnIdx += psnCnt;
-  ReleaseLock(&wq.postSendLock);
+  atomic_add_packed_msn_and_psn(&wq.msnPack, 1, psnCnt, &curMsntblSlotIdx, &curPsnIdx);
+  curPostIdx = curMsntblSlotIdx;
   return BnxtPostSend(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, true, qpn, laddr, lkey, bytes);
 }
 
@@ -202,7 +214,8 @@ inline __device__ uint64_t BnxtPostRecv(WorkQueueHandle& wq, uint32_t curPostIdx
       sizeof(struct bnxt_re_brqe) + sizeof(struct bnxt_re_rqe) + sizeof(struct bnxt_re_sge);
   constexpr int slotsNum = CeilDiv(recvWqeSize, BNXT_RE_SLOT_SIZE);
 
-  uint32_t slotIdx = curPostIdx % wqeNum;
+  uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
+  uint32_t slotIdx = wqeIdx * BNXT_RE_NUM_SLOT_PER_WQE;
 
   uint32_t wqe_size = BNXT_RE_HDR_WS_MASK & slotsNum;
   uint32_t hdr_flags = BNXT_RE_HDR_FLAGS_MASK & signalFlag;
@@ -222,10 +235,11 @@ inline __device__ uint64_t BnxtPostRecv(WorkQueueHandle& wq, uint32_t curPostIdx
   ThreadCopy<char>(base + 2 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&sge), sizeof(sge));
 
   // recv wqe needn't to fill msntbl
-  uint8_t flags = ((curPostIdx + slotsNum) / wqeNum) & 0x1;
+  uint8_t flags = ((curPostIdx + 1) >> (__ffs(wqeNum) - 1)) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
-  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum) | epoch), 0, qpn,
-                             BNXT_RE_QUE_TYPE_RQ);
+
+  return bnxt_re_init_db_hdr(((((wqeIdx + 1) & (wqeNum - 1)) * BNXT_RE_NUM_SLOT_PER_WQE) | epoch),
+                             0, qpn, BNXT_RE_QUE_TYPE_RQ);
 }
 
 template <>
@@ -240,10 +254,7 @@ template <>
 inline __device__ uint64_t PostRecv<ProviderType::BNXT>(WorkQueueHandle& wq, uint32_t qpn,
                                                         uintptr_t laddr, uint64_t lkey,
                                                         size_t bytes) {
-  constexpr int recvWqeSize =
-      sizeof(struct bnxt_re_brqe) + sizeof(struct bnxt_re_rqe) + sizeof(struct bnxt_re_sge);
-  constexpr int slotsNum = CeilDiv(recvWqeSize, BNXT_RE_SLOT_SIZE);
-  uint32_t curPostIdx = atomicAdd(&wq.postIdx, slotsNum);
+  uint32_t curPostIdx = atomicAdd(&wq.postIdx, 1);
   return BnxtPostRecv(wq, curPostIdx, true, qpn, laddr, lkey, bytes);
 }
 
@@ -268,23 +279,17 @@ inline __device__ uint64_t BnxtPostReadWrite(WorkQueueHandle& wq, uint32_t curPo
   struct bnxt_re_rdma rdma;
   struct bnxt_re_sge sge;
 
-  constexpr int sendWqeSize =
-      sizeof(struct bnxt_re_bsqe) + sizeof(struct bnxt_re_rdma) + sizeof(struct bnxt_re_sge);
-  constexpr int slotsNum = CeilDiv(sendWqeSize, BNXT_RE_SLOT_SIZE);
+  // constexpr int sendWqeSize =
+  //     sizeof(struct bnxt_re_bsqe) + sizeof(struct bnxt_re_rdma) + sizeof(struct bnxt_re_sge);
+  // constexpr int slotsNum = CeilDiv(sendWqeSize, BNXT_RE_SLOT_SIZE);
 
   int psnCnt = (bytes == 0) ? 1 : (bytes + mtuSize - 1) / mtuSize;
   // psn index needs to be strictly ordered
 
-  uint32_t slotIdx = curPostIdx % wqeNum;
-  // TODO： wqeNum should be multiple of slotsNum, BRCM say using a specific conf currently.
-  if ((slotIdx + slotsNum) > wqeNum) {
-    printf(
-        "[Error] (slotIdx + slotsNum) <= wqeNum failed!\n"
-        "  slotIdx=%u, slotsNum=%d, wqeNum=%u\n",
-        slotIdx, slotsNum, wqeNum);
-    assert(false);
-  }
-  uint32_t wqe_size = BNXT_RE_HDR_WS_MASK & slotsNum;
+  uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
+  uint32_t slotIdx = wqeIdx * BNXT_RE_NUM_SLOT_PER_WQE;
+
+  uint32_t wqe_size = BNXT_RE_HDR_WS_MASK & BNXT_RE_NUM_SLOT_PER_WQE;
   uint32_t hdr_flags = BNXT_RE_HDR_FLAGS_MASK & signalFlag;
   uint32_t wqe_type = BNXT_RE_HDR_WT_MASK & opcode;
   hdr.rsv_ws_fl_wt =
@@ -310,11 +315,12 @@ inline __device__ uint64_t BnxtPostReadWrite(WorkQueueHandle& wq, uint32_t curPo
 
   // get doorbell header
   // struct bnxt_re_db_hdr hdr;
-  uint8_t flags = ((curPostIdx + slotsNum) / wqeNum) & 0x1;
+  // uint8_t flags = ((curPostIdx + 1) / wqeNum) & 0x1;
+  uint8_t flags = ((curPostIdx + 1) >> (__ffs(wqeNum) - 1)) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
 
-  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum) | epoch), 0, qpn,
-                             BNXT_RE_QUE_TYPE_SQ);
+  return bnxt_re_init_db_hdr(((((wqeIdx + 1) & (wqeNum - 1)) * BNXT_RE_NUM_SLOT_PER_WQE) | epoch),
+                             0, qpn, BNXT_RE_QUE_TYPE_SQ);
 }
 
 template <>
@@ -345,20 +351,13 @@ inline __device__ uint64_t PostWrite<ProviderType::BNXT>(WorkQueueHandle& wq, ui
                                                          uintptr_t raddr, uint64_t rkey,
                                                          size_t bytes) {
   uint32_t mtuSize = wq.mtuSize;
-  constexpr int sendWqeSize =
-      sizeof(struct bnxt_re_bsqe) + sizeof(struct bnxt_re_send) + sizeof(struct bnxt_re_sge);
-  constexpr int slotsNum = CeilDiv(sendWqeSize, BNXT_RE_SLOT_SIZE);
 
   int psnCnt = (bytes == 0) ? 1 : (bytes + mtuSize - 1) / mtuSize;
   // psn index needs to be strictly ordered
-  AcquireLock(&wq.postSendLock);
-  uint32_t curPostIdx = wq.postIdx;
-  wq.postIdx += slotsNum;
-  uint32_t curMsntblSlotIdx = wq.msntblSlotIdx;
-  wq.msntblSlotIdx += 1;
-  uint32_t curPsnIdx = wq.psnIdx;
-  wq.psnIdx += psnCnt;
-  ReleaseLock(&wq.postSendLock);
+  uint32_t curMsntblSlotIdx, curPsnIdx, curPostIdx;
+  // psn index needs to be strictly ordered
+  atomic_add_packed_msn_and_psn(&wq.msnPack, 1, psnCnt, &curMsntblSlotIdx, &curPsnIdx);
+  curPostIdx = curMsntblSlotIdx;
   return BnxtPostReadWrite(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, true, qpn, laddr, lkey,
                            raddr, rkey, bytes, false);
 }
@@ -369,20 +368,13 @@ inline __device__ uint64_t PostRead<ProviderType::BNXT>(WorkQueueHandle& wq, uin
                                                         uintptr_t raddr, uint64_t rkey,
                                                         size_t bytes) {
   uint32_t mtuSize = wq.mtuSize;
-  constexpr int sendWqeSize =
-      sizeof(struct bnxt_re_bsqe) + sizeof(struct bnxt_re_send) + sizeof(struct bnxt_re_sge);
-  constexpr int slotsNum = CeilDiv(sendWqeSize, BNXT_RE_SLOT_SIZE);
 
   int psnCnt = (bytes == 0) ? 1 : (bytes + mtuSize - 1) / mtuSize;
   // psn index needs to be strictly ordered
-  AcquireLock(&wq.postSendLock);
-  uint32_t curPostIdx = wq.postIdx;
-  wq.postIdx += slotsNum;
-  uint32_t curMsntblSlotIdx = wq.msntblSlotIdx;
-  wq.msntblSlotIdx += 1;
-  uint32_t curPsnIdx = wq.psnIdx;
-  wq.psnIdx += psnCnt;
-  ReleaseLock(&wq.postSendLock);
+  uint32_t curMsntblSlotIdx, curPsnIdx, curPostIdx;
+  // psn index needs to be strictly ordered
+  atomic_add_packed_msn_and_psn(&wq.msnPack, 1, psnCnt, &curMsntblSlotIdx, &curPsnIdx);
+  curPostIdx = curMsntblSlotIdx;
   return BnxtPostReadWrite(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, true, qpn, laddr, lkey,
                            raddr, rkey, bytes, true);
 }
@@ -406,18 +398,18 @@ inline __device__ uint64_t BnxtPostWriteInline(WorkQueueHandle& wq, uint32_t cur
   struct bnxt_re_bsqe hdr;
   struct bnxt_re_rdma rdma;
 
-  constexpr int sendWqeSize =
-      sizeof(struct bnxt_re_bsqe) + sizeof(struct bnxt_re_rdma) + sizeof(struct bnxt_re_sge);
-  constexpr int slotsNum = CeilDiv(sendWqeSize, BNXT_RE_SLOT_SIZE);
+  // constexpr int sendWqeSize =
+  //     sizeof(struct bnxt_re_bsqe) + sizeof(struct bnxt_re_rdma) + sizeof(struct bnxt_re_sge);
+  // constexpr int slotsNum = CeilDiv(sendWqeSize, BNXT_RE_SLOT_SIZE);
 
   // int psnCnt = 1;
   // psn index needs to be strictly ordered
 
-  uint32_t slotIdx = curPostIdx % wqeNum;
+  uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
+  uint32_t slotIdx = wqeIdx * BNXT_RE_NUM_SLOT_PER_WQE;
   // TODO： wqeNum should be multiple of slotsNum, BRCM say using a specific conf currently.
-  assert((slotIdx + slotsNum) <= wqeNum);
 
-  uint32_t wqe_size = BNXT_RE_HDR_WS_MASK & slotsNum;
+  uint32_t wqe_size = BNXT_RE_HDR_WS_MASK & BNXT_RE_NUM_SLOT_PER_WQE;
   uint32_t hdr_flags = BNXT_RE_HDR_FLAGS_MASK & (BNXT_RE_WR_FLAGS_INLINE | signalFlag);
   uint32_t wqe_type = BNXT_RE_HDR_WT_MASK & BNXT_RE_WR_OPCD_RDMA_WRITE;
   hdr.rsv_ws_fl_wt =
@@ -448,10 +440,11 @@ inline __device__ uint64_t BnxtPostWriteInline(WorkQueueHandle& wq, uint32_t cur
 
   // get doorbell header
   // struct bnxt_re_db_hdr hdr;
-  uint8_t flags = ((curPostIdx + slotsNum) / wqeNum) & 0x1;
+  uint8_t flags = ((curPostIdx + 1) >> (__ffs(wqeNum) - 1)) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
-  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum) | epoch), 0, qpn,
-                             BNXT_RE_QUE_TYPE_SQ);
+
+  return bnxt_re_init_db_hdr(((((wqeIdx + 1) & (wqeNum - 1)) * BNXT_RE_NUM_SLOT_PER_WQE) | epoch),
+                             0, qpn, BNXT_RE_QUE_TYPE_SQ);
 }
 
 template <>
@@ -467,14 +460,9 @@ inline __device__ uint64_t PostWriteInline<ProviderType::BNXT>(WorkQueueHandle& 
                                                                void* val, uintptr_t raddr,
                                                                uint64_t rkey, size_t bytes) {
   // psn index needs to be strictly ordered
-  AcquireLock(&wq.postSendLock);
-  uint32_t curPostIdx = wq.postIdx;
-  wq.postIdx += 3;
-  uint32_t curMsntblSlotIdx = wq.msntblSlotIdx;
-  wq.msntblSlotIdx += 1;
-  uint32_t curPsnIdx = wq.psnIdx;
-  wq.psnIdx += 1;
-  ReleaseLock(&wq.postSendLock);
+  uint32_t curMsntblSlotIdx, curPsnIdx, curPostIdx;
+  atomic_add_packed_msn_and_psn(&wq.msnPack, 1, 1, &curMsntblSlotIdx, &curPsnIdx);
+  curPostIdx = curMsntblSlotIdx;
   return BnxtPostWriteInline(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, true, qpn, val, raddr,
                              rkey, bytes);
 }
@@ -499,14 +487,8 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
   struct bnxt_re_atomic amo;
   struct bnxt_re_sge sge;
 
-  // bnxt atomic slot is 3
-  constexpr int slotsNum = 3;
-  int psnCnt = 1;
-  // psn index needs to be strictly ordered
-
-  uint32_t slotIdx = curPostIdx % wqeNum;
-  // TODO： wqeNum should be multiple of slotsNum, BRCM say using a specific conf currently.
-  assert((slotIdx + slotsNum) <= wqeNum);
+  uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
+  uint32_t slotIdx = wqeIdx * BNXT_RE_NUM_SLOT_PER_WQE;
 
   uint32_t opcode = BNXT_RE_WR_OPCD_ATOMIC_FA;
   uint64_t data = val_1 ? *static_cast<uint64_t*>(val_1) : 0;
@@ -549,7 +531,7 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
     }
   }
 
-  uint32_t wqe_size = BNXT_RE_HDR_WS_MASK & slotsNum;
+  uint32_t wqe_size = BNXT_RE_HDR_WS_MASK & BNXT_RE_NUM_SLOT_PER_WQE;
   uint32_t hdr_flags = BNXT_RE_HDR_FLAGS_MASK & signalFlag;
   uint32_t wqe_type = BNXT_RE_HDR_WT_MASK & opcode;
   hdr.rsv_ws_fl_wt =
@@ -575,11 +557,11 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
 
   // get doorbell header
   // struct bnxt_re_db_hdr hdr;
-  uint8_t flags = ((curPostIdx + slotsNum) / wqeNum) & 0x1;
+  uint8_t flags = ((curPostIdx + 1) >> (__ffs(wqeNum) - 1)) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
 
-  return bnxt_re_init_db_hdr((((slotIdx + slotsNum) % wqeNum) | epoch), 0, qpn,
-                             BNXT_RE_QUE_TYPE_SQ);
+  return bnxt_re_init_db_hdr(((((wqeIdx + 1) & (wqeNum - 1)) * BNXT_RE_NUM_SLOT_PER_WQE) | epoch),
+                             0, qpn, BNXT_RE_QUE_TYPE_SQ);
 }
 
 template <>
@@ -598,14 +580,9 @@ inline __device__ uint64_t PostAtomic<ProviderType::BNXT>(WorkQueueHandle& wq, u
                                                           void* val_1, void* val_2,
                                                           uint32_t typeBytes, atomicType amo_op) {
   // psn index needs to be strictly ordered
-  AcquireLock(&wq.postSendLock);
-  uint32_t curPostIdx = wq.postIdx;
-  wq.postIdx += 3;
-  uint32_t curMsntblSlotIdx = wq.msntblSlotIdx;
-  wq.msntblSlotIdx += 1;
-  uint32_t curPsnIdx = wq.psnIdx;
-  wq.psnIdx += 1;
-  ReleaseLock(&wq.postSendLock);
+  uint32_t curMsntblSlotIdx, curPsnIdx, curPostIdx;
+  atomic_add_packed_msn_and_psn(&wq.msnPack, 1, 1, &curMsntblSlotIdx, &curPsnIdx);
+  curPostIdx = curMsntblSlotIdx;
   return BnxtPrepareAtomicWqe(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, true, qpn, laddr, lkey,
                               raddr, rkey, val_1, val_2, typeBytes, amo_op);
 }
@@ -624,14 +601,9 @@ inline __device__ uint64_t PostAtomic<ProviderType::BNXT>(WorkQueueHandle& wq, u
   inline __device__ uint64_t PostAtomic<ProviderType::BNXT, TYPE>(                              \
       WorkQueueHandle & wq, uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,      \
       uint64_t rkey, const TYPE val_1, const TYPE val_2, atomicType amo_op) {                   \
-    AcquireLock(&wq.postSendLock);                                                              \
-    uint32_t curPostIdx = wq.postIdx;                                                           \
-    wq.postIdx += 3;                                                                            \
-    uint32_t curMsntblSlotIdx = wq.msntblSlotIdx;                                               \
-    wq.msntblSlotIdx += 1;                                                                      \
-    uint32_t curPsnIdx = wq.psnIdx;                                                             \
-    wq.psnIdx += 1;                                                                             \
-    ReleaseLock(&wq.postSendLock);                                                              \
+    uint32_t curMsntblSlotIdx, curPsnIdx, curPostIdx;                                           \
+    atomic_add_packed_msn_and_psn(&wq.msnPack, 1, 1, &curMsntblSlotIdx, &curPsnIdx);            \
+    curPostIdx = curMsntblSlotIdx;                                                              \
     return BnxtPrepareAtomicWqe(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, true, qpn, laddr,  \
                                 lkey, raddr, rkey, (void*)&val_1, (void*)&val_2, sizeof(TYPE),  \
                                 amo_op);                                                        \

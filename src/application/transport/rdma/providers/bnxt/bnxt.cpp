@@ -91,6 +91,46 @@ BnxtCqContainer::~BnxtCqContainer() {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         BnxtQpContainer                                        */
 /* ---------------------------------------------------------------------------------------------- */
+int bnxt_re_calc_dv_qp_mem_info(struct ibv_pd* ibvpd, struct ibv_qp_init_attr* attr,
+                          struct bnxt_re_dv_qp_mem_info* dv_qp_mem) {
+  struct ibv_qp_init_attr_ex attr_ex;
+  constexpr int fixed_num_slot_per_wqe = BNXT_RE_NUM_SLOT_PER_WQE;
+
+  uint32_t nwqe;
+  uint32_t max_wqesz;
+  uint32_t wqe_size;
+  uint32_t slots;
+  uint32_t psn_sz;
+  uint32_t npsn;
+  size_t sq_bytes = 0;
+  size_t rq_bytes = 0;
+
+  wqe_size = fixed_num_slot_per_wqe * BNXT_RE_SLOT_SIZE;
+  nwqe = attr->cap.max_send_wr;
+  slots = fixed_num_slot_per_wqe * nwqe;
+
+  // msn mem calc
+  npsn = RoundUpPowOfTwo(slots) / 2;
+  psn_sz = 8;
+
+  /*sq mem calc*/
+  sq_bytes = slots * BNXT_RE_SLOT_SIZE;
+  sq_bytes += npsn * psn_sz;
+  dv_qp_mem->sq_len = AlignUp(sq_bytes, 4096);
+  dv_qp_mem->sq_slots = slots;
+  dv_qp_mem->sq_wqe_sz = wqe_size;
+  dv_qp_mem->sq_npsn = npsn;
+  dv_qp_mem->sq_psn_sz = 8;
+
+  /*rq mem calc*/
+  rq_bytes = slots * BNXT_RE_SLOT_SIZE;
+  dv_qp_mem->rq_len = AlignUp(rq_bytes, 4096);
+  dv_qp_mem->rq_slots = slots;
+  dv_qp_mem->rq_wqe_sz = wqe_size;
+
+  return 0;
+}
+
 BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig& config, ibv_cq* cq,
                                  ibv_pd* pd)
     : context(context), config(config) {
@@ -99,7 +139,7 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   struct bnxt_re_dv_qp_init_attr dv_qp_attr;
   int err;
 
-  uint32_t maxMsgsNum = AlignUpTo3x256Minus1(config.maxMsgsNum);
+  uint32_t maxMsgsNum = RoundUpPowOfTwoAlignUpTo256(config.maxMsgsNum);
   memset(&ib_qp_attr, 0, sizeof(struct ibv_qp_init_attr));
   ib_qp_attr.send_cq = cq;
   ib_qp_attr.recv_cq = cq;
@@ -112,7 +152,7 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   ib_qp_attr.sq_sig_all = 0;
 
   memset(&qpMemInfo, 0, sizeof(struct bnxt_re_dv_qp_mem_info));
-  err = bnxt_re_dv_qp_mem_alloc(pd, &ib_qp_attr, &qpMemInfo);
+  err = bnxt_re_calc_dv_qp_mem_info(pd, &ib_qp_attr, &qpMemInfo);
   assert(!err);
 
   // sqUmemAddr
@@ -154,7 +194,7 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   dv_qp_attr.max_inline_data = ib_qp_attr.cap.max_inline_data;
   dv_qp_attr.qp_type = ib_qp_attr.qp_type;
 
-  dv_qp_attr.qp_handle = qpMemInfo.qp_handle;
+  // dv_qp_attr.qp_handle = qpMemInfo.qp_handle;
   dv_qp_attr.sq_len = qpMemInfo.sq_len;
   dv_qp_attr.sq_slots = qpMemInfo.sq_slots;
   dv_qp_attr.sq_wqe_sz = qpMemInfo.sq_wqe_sz;
@@ -182,6 +222,7 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   qp = bnxt_re_dv_create_qp(pd, &dv_qp_attr);
   assert(qp);
   qpn = qp->qp_num;
+  // std::cout << qpMemInfo << std::endl;
 }
 
 BnxtQpContainer::~BnxtQpContainer() { DestroyQueuePair(); }
@@ -258,8 +299,8 @@ void BnxtQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
   memset(&attr, 0, sizeof(struct ibv_qp_attr));
   attr.qp_state = IBV_QPS_RTS;
   attr.sq_psn = remote_handle.psn;
-  attr.max_rd_atomic = 1;
-  attr.timeout = 14;
+  attr.max_rd_atomic = 7;
+  attr.timeout = 20;
   attr.retry_cnt = 7;
   attr.rnr_retry = 7;
 
@@ -333,8 +374,10 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   endpoint.wqHandle.msntblAddr = qp->GetMsntblAddress();
   endpoint.wqHandle.rqAddr = qp->GetRqAddress();
   endpoint.wqHandle.dbrAddr = qp->qpUarPtr;
-  endpoint.wqHandle.sqWqeNum = qp->qpMemInfo.sq_slots;
-  endpoint.wqHandle.rqWqeNum = qp->qpMemInfo.rq_slots;
+  assert(qp->qpMemInfo.sq_slots % BNXT_RE_NUM_SLOT_PER_WQE == 0);
+  assert(qp->qpMemInfo.rq_slots % BNXT_RE_NUM_SLOT_PER_WQE == 0);
+  endpoint.wqHandle.sqWqeNum = qp->qpMemInfo.sq_slots / BNXT_RE_NUM_SLOT_PER_WQE;
+  endpoint.wqHandle.rqWqeNum = qp->qpMemInfo.rq_slots / BNXT_RE_NUM_SLOT_PER_WQE;
   endpoint.wqHandle.msntblNum = qp->qpMemInfo.sq_npsn;
 
   endpoint.cqHandle.cqAddr = cq->cqUmemAddr;
