@@ -29,6 +29,7 @@
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem.hpp"
 #include "src/ops/dispatch_combine/internode.hpp"
+#include "src/ops/dispatch_combine/internode_dedup.hpp"
 #include "src/ops/dispatch_combine/intranode.hpp"
 
 namespace mori {
@@ -210,6 +211,8 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
         if (kernelType == KernelType::InterNode) {
           assert(config.useExternalInpBuffer);
           EpDispatchInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
+        } else if (kernelType == KernelType::InterNodeDedup) {
+          EpDispatchInterNodeDedupKernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else {
@@ -236,6 +239,9 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
         if (kernelType == KernelType::InterNode) {
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
+        } else if (kernelType == KernelType::InterNodeDedup) {
+          assert(config.useExternalInpBuffer);
+          EpCombineInterNodeDedupKernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpCombineIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else {

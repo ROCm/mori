@@ -36,6 +36,7 @@ namespace moe {
 enum KernelType {
   IntraNode = 0,
   InterNode = 1,
+  InterNodeDedup = 2,
 };
 
 inline const char* HipDataTypeToString(hipDataType dtype) {

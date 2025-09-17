@@ -242,6 +242,7 @@ void RegisterMoriOps(py::module_& m) {
   pybind11::enum_<mori::moe::KernelType>(m, "EpDispatchCombineKernelType")
       .value("IntraNode", mori::moe::KernelType::IntraNode)
       .value("InterNode", mori::moe::KernelType::InterNode)
+      .value("InterNodeDedup", mori::moe::KernelType::InterNodeDedup)
       .export_values();
 
   pybind11::class_<mori::moe::EpDispatchCombineConfig>(m, "EpDispatchCombineConfig")
