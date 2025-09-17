@@ -668,15 +668,17 @@ void RdmaBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
 
 void RdmaBackend::RegisterMemory(const MemoryDesc& desc) { server->RegisterMemory(desc); }
 
-void RdmaBackend::DeregisterMemory(const MemoryDesc& desc) { server->DeregisterMemory(desc); }
+void RdmaBackend::DeregisterMemory(const MemoryDesc& desc) {
+  server->DeregisterMemory(desc);
+  InvalidateSessionsForMemory(desc.id);
+}
 
 void RdmaBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
                             const MemoryDesc& remoteSrc, size_t remoteOffset, size_t size,
                             TransferStatus* status, TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
-  RdmaBackendSession sess;
-  CreateSession(localDest, remoteSrc, sess);
-  return sess.ReadWrite(localOffset, remoteOffset, size, status, id, isRead);
+  RdmaBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
+  sess->ReadWrite(localOffset, remoteOffset, size, status, id, isRead);
 }
 
 void RdmaBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& localOffsets,
@@ -692,9 +694,8 @@ void RdmaBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loc
     return;
   }
 
-  RdmaBackendSession sess;
-  CreateSession(localDest, remoteSrc, sess);
-  return sess.BatchReadWrite(localOffsets, remoteOffsets, sizes, status, id, isRead);
+  RdmaBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
+  sess->BatchReadWrite(localOffsets, remoteOffsets, sizes, status, id, isRead);
 }
 
 BackendSession* RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote) {
@@ -743,6 +744,38 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
 bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                            TransferStatus* status) {
   return notif->PopInboundTransferStatus(remote, id, status);
+}
+
+RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& local,
+                                                          const MemoryDesc& remote) {
+  SessionCacheKey key{remote.engineKey, local.id, remote.id};
+  {
+    std::lock_guard<std::mutex> lock(sessionCacheMu);
+    auto it = sessionCache.find(key);
+    if (it != sessionCache.end()) {
+      return it->second.get();
+    }
+  }
+  // create outside lock (CreateSession may allocate / block); then insert
+  auto newSess = std::make_unique<RdmaBackendSession>();
+  CreateSession(local, remote, *newSess);
+  std::lock_guard<std::mutex> lock(sessionCacheMu);
+  auto& ref = sessionCache[key];
+  if (!ref) {
+    ref = std::move(newSess);
+  }
+  return ref.get();
+}
+
+void RdmaBackend::InvalidateSessionsForMemory(MemoryUniqueId id) {
+  std::lock_guard<std::mutex> lock(sessionCacheMu);
+  for (auto it = sessionCache.begin(); it != sessionCache.end();) {
+    if (it->first.localMemId == id || it->first.remoteMemId == id) {
+      it = sessionCache.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 }  // namespace io
