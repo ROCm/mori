@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <memory>
 
 namespace mori {
 namespace io {
@@ -89,19 +90,38 @@ void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
   hdr.size = size;
 
   application::TCPEndpoint ep(conn.handle);
+  // host staging buffers when GPU memory involved
+  bool localIsGpu = (localDest.loc == MemoryLocationType::GPU);
+  // For remote side we don't know its loc explicitly; protocol does not carry it yet.
+  // We will always send/recv host buffers over TCP.
+  std::unique_ptr<char[]> hostBuf(new char[size]);
+  char* hostPtr = hostBuf.get();
+
+  // If write (sending data), and source is GPU, copy device->host first.
+  if (!isRead) {
+    if (localIsGpu) {
+      const void* devPtr = reinterpret_cast<const void*>(localDest.data + localOffset);
+      hipError_t e = hipMemcpy(hostPtr, devPtr, size, hipMemcpyDeviceToHost);
+      if (e != hipSuccess) {
+        status->SetCode(StatusCode::ERR_BAD_STATE);
+        status->SetMessage(std::string("hipMemcpy D2H failed: ") + hipGetErrorString(e));
+        return;
+      }
+    } else {
+      const char* src = reinterpret_cast<const char*>(localDest.data + localOffset);
+      std::memcpy(hostPtr, src, size);
+    }
+  }
+
   // send header
   ep.Send(&hdr, sizeof(hdr));
   if (!isRead) {
-    // write request includes data payload from local memory at localOffset
-    const char* src = reinterpret_cast<const char*>(localDest.data + localOffset);
-    ep.Send(src, size);
-    // Wait for write response
+    ep.Send(hostPtr, size);
     TcpMessageHeader resp{};
     ep.Recv(&resp, sizeof(resp));
     status->SetCode(StatusCode::SUCCESS);
     return;
   } else {
-    // read request, expect read response header + payload
     TcpMessageHeader resp{};
     ep.Recv(&resp, sizeof(resp));
     if (resp.opcode != 2 || resp.size != size) {
@@ -109,8 +129,19 @@ void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
       status->SetMessage("unexpected read response");
       return;
     }
-    char* dst = reinterpret_cast<char*>(localDest.data + localOffset);
-    ep.Recv(dst, size);
+    ep.Recv(hostPtr, size);
+    if (localIsGpu) {
+      void* devPtr = reinterpret_cast<void*>(localDest.data + localOffset);
+      hipError_t e = hipMemcpy(devPtr, hostPtr, size, hipMemcpyHostToDevice);
+      if (e != hipSuccess) {
+        status->SetCode(StatusCode::ERR_BAD_STATE);
+        status->SetMessage(std::string("hipMemcpy H2D failed: ") + hipGetErrorString(e));
+        return;
+      }
+    } else {
+      char* dst = reinterpret_cast<char*>(localDest.data + localOffset);
+      std::memcpy(dst, hostPtr, size);
+    }
     status->SetCode(StatusCode::SUCCESS);
     return;
   }
@@ -175,31 +206,41 @@ void TcpBackend::ServiceLoop() {
       TcpMessageHeader hdr{};
       ssize_t r = ::recv(fd, &hdr, sizeof(hdr), MSG_WAITALL);
       if (r != sizeof(hdr)) { ::close(fd); continue; }
-      if (hdr.opcode == 0) { // read request: send data back
-        // find memory (assume only one memory id for now)
-        // For now we ignore memory id (not transmitted). Use first memory.
+      if (hdr.opcode == 0 || hdr.opcode == 1) { // read or write
         MemoryDesc target{};
         {
           std::lock_guard<std::mutex> lock(mu);
           if (localMems.empty()) { ::close(fd); continue; }
           target = localMems.begin()->second;
         }
-        const char* src = reinterpret_cast<const char*>(target.data + hdr.offset);
-        TcpMessageHeader resp{2, hdr.id, hdr.offset, hdr.size};
-        ::send(fd, &resp, sizeof(resp), 0);
-        ::send(fd, src, hdr.size, 0);
-      } else if (hdr.opcode == 1) { // write request: receive payload and respond
-        MemoryDesc target{};
-        {
-          std::lock_guard<std::mutex> lock(mu);
-          if (localMems.empty()) { ::close(fd); continue; }
-          target = localMems.begin()->second;
+        bool targetIsGpu = (target.loc == MemoryLocationType::GPU);
+        std::unique_ptr<char[]> hostBuf(new char[hdr.size]);
+        if (hdr.opcode == 0) { // read request: copy from target to host and send
+          if (targetIsGpu) {
+            const void* devPtr = reinterpret_cast<const void*>(target.data + hdr.offset);
+            if (hipMemcpy(hostBuf.get(), devPtr, hdr.size, hipMemcpyDeviceToHost) != hipSuccess) {
+              ::close(fd); continue; }
+          } else {
+            const char* src = reinterpret_cast<const char*>(target.data + hdr.offset);
+            std::memcpy(hostBuf.get(), src, hdr.size);
+          }
+          TcpMessageHeader resp{2, hdr.id, hdr.offset, hdr.size};
+            ::send(fd, &resp, sizeof(resp), 0);
+            ::send(fd, hostBuf.get(), hdr.size, 0);
+        } else { // write request: recv payload into host then copy to device if needed
+          ssize_t r2 = ::recv(fd, hostBuf.get(), hdr.size, MSG_WAITALL);
+          if (r2 != (ssize_t)hdr.size) { ::close(fd); continue; }
+          if (targetIsGpu) {
+            void* devPtr = reinterpret_cast<void*>(target.data + hdr.offset);
+            if (hipMemcpy(devPtr, hostBuf.get(), hdr.size, hipMemcpyHostToDevice) != hipSuccess) {
+              ::close(fd); continue; }
+          } else {
+            char* dst = reinterpret_cast<char*>(target.data + hdr.offset);
+            std::memcpy(dst, hostBuf.get(), hdr.size);
+          }
+          TcpMessageHeader resp{3, hdr.id, hdr.offset, hdr.size};
+          ::send(fd, &resp, sizeof(resp), 0);
         }
-        char* dst = reinterpret_cast<char*>(target.data + hdr.offset);
-        ssize_t r2 = ::recv(fd, dst, hdr.size, MSG_WAITALL);
-        if (r2 != (ssize_t)hdr.size) { ::close(fd); continue; }
-        TcpMessageHeader resp{3, hdr.id, hdr.offset, hdr.size};
-        ::send(fd, &resp, sizeof(resp), 0);
       } else {
         ::close(fd);
       }

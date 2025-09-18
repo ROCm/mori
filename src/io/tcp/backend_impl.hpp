@@ -9,6 +9,7 @@
 #include "mori/io/engine.hpp"
 #include "mori/io/logging.hpp"
 #include "mori/application/transport/tcp/tcp.hpp"
+#include "mori/application/utils/check.hpp"
 
 namespace mori {
 namespace io {
