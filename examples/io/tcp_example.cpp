@@ -5,6 +5,7 @@
 #include <thread>
 #include <vector>
 #include <cstring>
+#include <hip/hip_runtime.h>
 
 using namespace mori::io;
 
@@ -25,22 +26,35 @@ int main() {
   engineA.RegisterRemoteEngine(descB);
   engineB.RegisterRemoteEngine(descA);
 
-  std::vector<char> bufA(1024, 0);
-  std::vector<char> bufB(1024, 0);
-  strcpy(bufA.data(), "Hello TCP Backend");
+  const size_t bufSize = 1024;
+  std::vector<char> hostA(bufSize, 0), hostB(bufSize, 0);
+  const char* msg = "Hello TCP Backend";
+  std::memcpy(hostA.data(), msg, std::strlen(msg)+1);
 
-  auto memA = engineA.RegisterMemory(bufA.data(), bufA.size(), 0, MemoryLocationType::CPU);
-  auto memB = engineB.RegisterMemory(bufB.data(), bufB.size(), 0, MemoryLocationType::CPU);
+  void* devA = nullptr; void* devB = nullptr;
+  hipMalloc(&devA, bufSize);
+  hipMalloc(&devB, bufSize);
+  hipMemset(devB, 0, bufSize);
+  hipMemcpy(devA, hostA.data(), bufSize, hipMemcpyHostToDevice);
+
+  auto memA = engineA.RegisterMemory(devA, bufSize, 0, MemoryLocationType::GPU);
+  auto memB = engineB.RegisterMemory(devB, bufSize, 0, MemoryLocationType::GPU);
 
   TransferStatus st;
   auto tid = engineA.AllocateTransferUniqueId();
-  engineA.Write(memA, 0, memB, 0, strlen(bufA.data())+1, &st, tid);
+  engineA.Write(memA, 0, memB, 0, std::strlen(msg)+1, &st, tid);
   if (st.Code() != StatusCode::SUCCESS) {
     printf("Write failed code %u message %s\n", (unsigned)st.Code(), st.Message().c_str());
   }
 
-  // For simplicity, only demonstrate write path; read path in current TCP backend
-  // mirrors write but synchronous; a complete round-trip would require memory id propagation.
-  printf("Buffer on engineB after write: %s\n", bufB.data());
+  // Copy device B buffer back to host to verify
+  hipMemcpy(hostB.data(), devB, bufSize, hipMemcpyDeviceToHost);
+  printf("Buffer on engineB after write: %s\n", hostB.data());
+
+  // Cleanup
+  engineA.DeregisterMemory(memA);
+  engineB.DeregisterMemory(memB);
+  hipFree(devA);
+  hipFree(devB);
   return 0;
 }
