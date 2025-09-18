@@ -28,8 +28,7 @@
 namespace mori {
 namespace moe {
 
-#define MAX_GPUS_PER_NODE 8
-
+/* ---------------------------------------------------------------------------------------------- */
 /*                                 EpDispatchInterNodeDedupKernel                                 */
 /* ---------------------------------------------------------------------------------------------- */
 #define IMPORT_COMMON_VARIABLES                                          \
@@ -47,8 +46,8 @@ namespace moe {
   int globalWarpNum = gridDim.x * warpNum;                               \
   int myPe = config.rank;                                                \
   int npes = config.worldSize;                                           \
-  int myNode = myPe / MAX_GPUS_PER_NODE;                                 \
-  int nNodes = npes / MAX_GPUS_PER_NODE;                                 \
+  int myNode = myPe / config.gpuPerNode;                                 \
+  int nNodes = npes / config.gpuPerNode;                                 \
   size_t MaxNumTokensToSendPerRank = config.MaxNumTokensToSendPerRank(); \
   size_t MaxNumTokensToRecvPerRank = config.MaxNumTokensToRecvPerRank(); \
   size_t MaxNumTokensToRecv = config.MaxNumTokensToRecv();               \
@@ -60,7 +59,7 @@ template <typename T>
 inline __device__ void DispatchSendIntraNode(EpDispatchCombineArgs<T>& args, int tokenId,
                                              int destPe, int lanePe, int expId) {
   const EpDispatchCombineConfig& config = args.config;
-  index_t tokenExpertId = tokenId * args.config.numExpertPerToken + destPe;
+  index_t tokenExpertId = tokenId * args.config.numExpertPerToken + expId;
   int condition = 0;
   if ((core::WarpLaneId1D() < expId) && (destPe == lanePe)) {
     condition = 1;
@@ -84,8 +83,8 @@ inline __device__ void DispatchSendIntraNode(EpDispatchCombineArgs<T>& args, int
   }
   destTokId = __shfl(destTokId, 0);
 
-  index_t srcTokOffset = tokenId * config.hiddenDim;
-  index_t destTokOffset = destTokId * config.hiddenDim;
+  size_t srcTokOffset = tokenId * config.hiddenDim;
+  size_t destTokOffset = destTokId * config.hiddenDim;
   core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
                  args.inpTokenBuf + srcTokOffset, config.hiddenDim);
 }
@@ -94,8 +93,9 @@ template <typename T>
 inline __device__ void DispatchSendInterNode(EpDispatchCombineArgs<T>& args, int tokenId,
                                              int destNode, int laneNode, int expId) {
   IMPORT_COMMON_VARIABLES;
+  index_t proxyPe = (config.rank % config.gpuPerNode) + destNode * config.gpuPerNode;
 
-  index_t tokenExpertId = tokenId * args.config.numExpertPerToken + destPe;
+  index_t tokenExpertId = tokenId * args.config.numExpertPerToken + expId;
   int condition = 0;
   if ((core::WarpLaneId1D() < expId) && (destNode == laneNode)) {
     condition = 1;
@@ -107,25 +107,29 @@ inline __device__ void DispatchSendInterNode(EpDispatchCombineArgs<T>& args, int
   }
 
   index_t destTokId = 0;
-  index_t destNodeIdx = destNode + MAX_GPUS_PER_NODE;
   if (core::WarpLaneId1D() == 0) {
     // decide token id in dest pe
-    destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destNodeIdx), 1);
-    atomicAdd(args.destPeTokenCounter + destNodeIdx, 1);
-    args.dispDestTokIdMap[tokenExpertId] = destPe * config.MaxNumTokensToSendPerRank() + destTokId;
+    destTokId = atomicAdd(args.destNodeTokenCounter + destNode, 1);
+    args.dispDestTokIdMap[tokenExpertId] = proxyPe * config.MaxNumTokensToSendPerRank() + destTokId;
   }
   destTokId = __shfl(destTokId, 0);
 
-  index_t srcTokOffset = tokenId * config.hiddenDim;
-  index_t stagingTokOffset =
-      (destNodeIdx * config.MaxNumTokensToSendPerRank() + destTokId) * config.hiddenDim;
-  core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<T*>(destNodeIdx) + stagingTokOffset,
+  // Copy to local staging buffer
+  size_t srcTokOffset = tokenId * config.hiddenDim;
+  size_t stagingTokOffset =
+      (destNode * config.MaxNumTokensToSendPerRank() + destTokId) * config.hiddenDim;
+  core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<T*>() + stagingTokOffset,
                  args.inpTokenBuf + srcTokOffset, config.hiddenDim);
-  index_t remoteOffset = stagingTokOffset + (MAX_GPUS_PER_NODE + myNode) *
-                                                config.MaxNumTokensToRecvPerRank() *
-                                                config.hiddenDim;
+
+  // Copy to remote proxy's staging buffer
+  size_t remoteIdx = myNode * config.MaxNumTokensToRecvPerRank() + destTokId;
+  size_t remoteOffset = remoteIdx * config.hiddenDim;
   shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, remoteOffset, args.shmemStagingTokMemObj,
-                                stagingTokOffset, config.hiddenDim, destPe);
+                                stagingTokOffset, config.hiddenDim, proxyPe);
+  if (core::WarpLaneId1D() == 0) {
+    shmem::ShmemPutInt32ImmNbiWarp(args.recvTokenFlagMemObj, remoteIdx * sizeof(index_t), 1,
+                                   proxyPe);
+  }
 }
 
 template <typename T>
@@ -141,50 +145,142 @@ inline __device__ void DispatchSendPhase(EpDispatchCombineArgs<T>& args) {
     int lanePe = -1, laneNode = -1;
     if (laneId < numExpertPerToken) {
       lanePe = (args.tokenIndices[tokenId * numExpertPerToken + laneId] / config.numExpertPerRank);
-      laneNode = lanePe / MAX_GPUS_PER_NODE;
+      laneNode = lanePe / config.gpuPerNode;
     };
 
     // Send to other pes in myNode
     for (int e = 0; e < config.numExpertPerToken; e++) {
       int destExpert = args.tokenIndices[tokenId * numExpertPerToken + e];
       int destPe = destExpert / config.numExpertPerRank;
-      int destNode = destPe / MAX_GPUS_PER_NODE;
+      int destNode = destPe / config.gpuPerNode;
       if (destNode == myNode)
         dedup::DispatchSendIntraNode(args, tokenId, destPe, lanePe, e);
       else
         dedup::DispatchSendInterNode(args, tokenId, destNode, laneNode, e);
     }
   }
-}
 
-template <typename T>
-inline __device__ void DispatchRecvPhase(EpDispatchCombineArgs<T>& args) {}
-
-template <typename T>
-inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
-  IMPORT_COMMON_VARIABLES;
-
-  if (core::WarpLaneId1D() == 0) atomicAdd(args.dispatchGridBarrier, 1);
-
-  // Send token num & token to expert mapping to other ranks
-  if (globalWarpId == 0) {
-    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      // Wait until all tokens are sent
-      shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
-      args.dispatchGridBarrier[0] = 0;
-
-      // Add 1 so that when token number == 0, receiver side still know the signal is sent
+  int finishedBlock;
+  if (thdId == 0) finishedBlock = atomicAdd(args.dispatchGridBarrier, 1);
+  finishedBlock = __shfl(finishedBlock, 0);
+  if ((finishedBlock + 1) == config.blockNum) {
+    if (thdId < nNodes) {
+      index_t proxyPe = thdId * config.gpuPerNode + (config.rank % config.gpuPerNode);
+      shmem::ShmemPutInt32ImmNbiThread(args.nodeRecvTokenNumMemObj, myNode * sizeof(index_t),
+                                       core::AtomicLoadRelaxed(args.destNodeTokenCounter + thdId),
+                                       proxyPe);
+    }
+    if (thdId < config.gpuPerNode) {
+      int destPe = myNode * config.gpuPerNode + thdId;
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
       shmem::ShmemInt32WaitUntilEquals(signal, 0);
       core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
     }
+    args.dispatchGridBarrier[0] = 0;
   }
+}
+
+template <typename T>
+inline __device__ void DispatchRecvPhase(EpDispatchCombineArgs<T>& args) {
+  IMPORT_COMMON_VARIABLES;
+  constexpr int flagNum = 512;
+  __shared__ uint32_t tokenIndex[flagNum];
+  __shared__ uint32_t slotIdx;
+  __shared__ uint32_t producer;
+  __shared__ uint32_t consumer;
+  __shared__ uint32_t blockFinished;
+  for (int i = thdId * 4; i < flagNum; i += thdNum * 4) {
+    reinterpret_cast<uint4*>(tokenIndex + i)[0] = {-1, -1, -1, -1};
+  }
+  if (thdId == 0) {
+    slotIdx = 0;
+    producer = 0;
+    consumer = 0;
+    blockFinished = 0;
+  }
+  __syncthreads();
+
+  // Warp-0 polling on recv token flags and producer tasks
+  if (warpId == 0) {
+    int totalFlags = nNodes * config.MaxNumTokensToRecvPerRank();
+    index_t* recvTokenFlags = args.recvTokenFlagMemObj->template GetAs<index_t*>();
+    for (int i = blockId * warpSize + laneId; i < totalFlags; i += config.blockNum * warpSize) {
+      int node = i / config.MaxNumTokensToRecvPerRank();
+      int tokenIdx = i % config.MaxNumTokensToRecvPerRank();
+      bool finished = (node == myNode);
+      while (true) {
+        index_t nodeRecvTokenNum =
+            core::AtomicLoadRelaxed(args.nodeRecvTokenNumMemObj->template GetAs<index_t*>() + node);
+        // finished |= (nodeRecvTokenNum > 0);
+        finished |= (nodeRecvTokenNum > 0) && (tokenIdx > (nodeRecvTokenNum - 2));
+        if (core::AtomicLoadRelaxed(recvTokenFlags + i)) {
+          finished = true;
+          uint32_t mySlot = atomicAdd(&slotIdx, 1);
+          tokenIndex[mySlot] = i;
+          atomicAdd(&producer, 1);
+          printf("mype %d recv token from node %d tokenIdx %d\n", myPe, node, tokenIdx);
+        }
+        // else {
+        //   index_t nodeRecvTokenNum = core::AtomicLoadRelaxed(
+        //       args.nodeRecvTokenNumMemObj->template GetAs<index_t*>() + node);
+        //   finished |= (nodeRecvTokenNum > 0) && (tokenIdx > (nodeRecvTokenNum - 2));
+        // }
+        if (__all(finished)) break;
+      }
+    }
+    core::AtomicStoreRelaxed(&blockFinished, uint32_t{1});
+    if (laneId < nNodes) {
+      printf("rank %d recv %d tokens from node %d\n", myPe,
+             args.nodeRecvTokenNumMemObj->template GetAs<index_t*>()[laneId], laneId);
+    }
+  }
+
+  // Other warps consume tasks
+  // while (true) {
+  //   int taskId = -1;
+  //   // Try fetch task with lane-0
+  //   if (laneId == 0) {
+  //     if (core::AtomicLoadRelaxed(&blockFinished)) break;
+  //     int curConsumer = core::AtomicLoadRelaxed(&consumer);
+  //     int curProducer = core::AtomicLoadRelaxed(&producer);
+  //     taskId = curConsumer + 1;
+  //     if ((curConsumer < curProducer) && (curProducer >= 0)) {
+  //       if (atomicCAS(&consumer, curConsumer, taskId) != curConsumer) continue;  // fetch failed
+  //     }
+  //   }
+  //   taskId = __shfl(taskId, 0);
+  //   // Execute task
+  // }
+}
+
+template <typename T>
+inline __device__ void DispatchSyncIntraNode(EpDispatchCombineArgs<T>& args) {
+  IMPORT_COMMON_VARIABLES;
+
+  // if (core::WarpLaneId1D() == 0) atomicAdd(args.dispatchGridBarrier, 1);
+  int nodePeOffset = myNode * config.gpuPerNode;
+  // // Send token num & token to expert mapping to other ranks
+  // if (globalWarpId == 0) {
+  //   for (int destPe = nodePeOffset + laneId; destPe < (nodePeOffset + config.gpuPerNode);
+  //        destPe += warpSize) {
+  //     // Wait until all tokens are sent
+  //     shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
+  //     args.dispatchGridBarrier[0] = 0;
+
+  //     // Add 1 so that when token number == 0, receiver side still know the signal is sent
+  //     index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
+  //     index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
+  //     shmem::ShmemInt32WaitUntilEquals(signal, 0);
+  //     core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
+  //   }
+  // }
 
   // Each warp wait until sender finished by waiting token number signal
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   if (globalWarpId == 0) {
-    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+    for (int destPe = nodePeOffset + laneId; destPe < (nodePeOffset + config.gpuPerNode);
+         destPe += warpSize) {
       index_t* signal = recvTokenNums + destPe;
       index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
       core::AtomicStoreRelaxedSystem(signal, 0);
@@ -206,7 +302,7 @@ template <typename T>
 __global__ void EpDispatchInterNodeDedupKernel(EpDispatchCombineArgs<T> args) {
   dedup::DispatchSendPhase(args);
   dedup::DispatchRecvPhase(args);
-  dedup::DispatchSync(args);
+  dedup::DispatchSyncIntraNode(args);
 }
 
 /* ---------------------------------------------------------------------------------------------- */

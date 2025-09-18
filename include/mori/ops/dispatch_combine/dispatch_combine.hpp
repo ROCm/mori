@@ -85,6 +85,7 @@ struct EpDispatchCombineConfig {
   // If true, use external buffer which incurs extra copy overhead; otherwise, the kernel assumes
   // the provided buffer is shmemInpTokMemObj
   bool useExternalInpBuffer{true};
+  int gpuPerNode{8};
 
   inline __host__ __device__ int MaxNumTokensToSendPerRank() const { return maxNumInpTokenPerRank; }
 
@@ -216,6 +217,11 @@ class EpDispatchCombineHandle {
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint32_t crossDeviceBarrierFlag{1};
+
+  // Inter-node dedup kernel
+  mori::application::SymmMemObjPtr recvTokenFlagMemObj;
+  index_t* destNodeTokenCounter{nullptr};
+  mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;
 };
 
 template <typename T>
@@ -253,6 +259,9 @@ struct EpDispatchCombineArgs {
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint32_t crossDeviceBarrierFlag{1};
+  mori::application::SymmMemObjPtr recvTokenFlagMemObj;
+  index_t* destNodeTokenCounter{nullptr};
+  mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;
 };
 
 using EpDispatchCombineArgsVariant =
@@ -294,6 +303,9 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.totalRecvTokenNum = handle.totalRecvTokenNum;
   args.crossDeviceBarrierMemObj = handle.crossDeviceBarrierMemObj;
   args.crossDeviceBarrierFlag = handle.crossDeviceBarrierFlag;
+  args.recvTokenFlagMemObj = handle.recvTokenFlagMemObj;
+  args.destNodeTokenCounter = handle.destNodeTokenCounter;
+  args.nodeRecvTokenNumMemObj = handle.nodeRecvTokenNumMemObj;
   return args;
 }
 

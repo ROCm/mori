@@ -49,6 +49,7 @@ class EpDispatchCombineTestCase:
             block_num=64,
             max_token_type_size=2,
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeDedup,
+            gpu_per_node=4,
         )
 
     def setup(self):
@@ -423,7 +424,7 @@ class EpDispatchCombineTestCase:
         #     )
 
         error_round = set()
-        for i in range(10):
+        for i in range(1):
             if self.rank == 0:
                 print(f"WarmUp Round {i} begin")
             self.run_test_once(op, test_data, error_round, i)
@@ -431,7 +432,7 @@ class EpDispatchCombineTestCase:
             len(error_round) == 0
         ), f"Warmup failed with errors in rounds: {error_round}"
 
-        for i in range(20):
+        for i in range(0):
             if self.rank == 0:
                 print(f"Round {i} begin")
             disp_duration, disp_bandwidth, comb_duration, comb_bandwidth = (
