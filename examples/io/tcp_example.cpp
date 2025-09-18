@@ -9,7 +9,7 @@
 using namespace mori::io;
 
 int main() {
-  SetLogLevel(spdlog::level::info);
+  SetLogLevel("info");
   IOEngineConfig cfgA{"127.0.0.1", 34567};
   IOEngineConfig cfgB{"127.0.0.1", 34568};
   IOEngine engineA("engineA", cfgA);

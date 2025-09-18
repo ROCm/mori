@@ -129,7 +129,8 @@ void TcpBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loca
     TransferStatus s;
     ReadWrite(localDest, localOffsets[i], remoteSrc, remoteOffsets[i], sizes[i], &s, id, isRead);
     if (s.Failed()) {
-      *status = s;
+      status->SetCode(s.Code());
+      status->SetMessage(s.Message());
       return;
     }
   }
