@@ -29,5 +29,6 @@ from mori.cpp import (
     MemoryLocationType,
     PollCqMode,
     RdmaBackendConfig,
+    TcpBackendConfig,
     set_log_level,
 )

@@ -30,6 +30,7 @@ from mori.io import (
     MemoryDesc,
     PollCqMode,
     RdmaBackendConfig,
+    TcpBackendConfig,
     set_log_level,
 )
 import argparse
@@ -127,6 +128,13 @@ def parse_args():
         choices=["trace", "debug", "info", "warning", "error", "critical"],
         help="Log level options: 'trace', 'debug', 'info', 'warning', 'error', 'critical'",
     )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="rdma",
+        choices=["rdma", "tcp"],
+        help="Choose backend type, options: 'rdma', 'tcp'",
+    )
 
     args = parser.parse_args()
     return args
@@ -157,6 +165,7 @@ class MoriIoBenchmark:
         iters: int = 128,
         sweep: bool = False,
         sweep_batch: bool = False,
+        backend: str = "rdma",
     ):
         self.op_type = op_type
         self.host = host
@@ -178,6 +187,7 @@ class MoriIoBenchmark:
         self.iters = iters
         self.sweep = sweep
         self.sweep_batch = sweep_batch
+        self.backend = backend
 
         self.world_size = self.num_initiator_dev + self.num_target_dev
         if self.node_rank == 0:
@@ -210,6 +220,7 @@ class MoriIoBenchmark:
         print(f"  num_worker_threads: {self.num_worker_threads}")
         print(f"  poll_cq_mode: {self.poll_cq_mode}")
         print(f"  iters: {self.iters}")
+        print(f"  backend: {self.backend}")
         print()
 
     def send_bytes(self, b: bytes, dst: int):
@@ -246,13 +257,19 @@ class MoriIoBenchmark:
             port=self.port,
         )
         self.engine = IOEngine(key=f"{self.role.name}-{self.role_rank}", config=config)
-        config = RdmaBackendConfig(
-            qp_per_transfer=self.num_qp_per_transfer,
-            post_batch_size=-1,
-            num_worker_threads=self.num_worker_threads,
-            poll_cq_mode=self.poll_cq_mode,
-        )
-        self.engine.create_backend(BackendType.RDMA, config)
+
+        if self.backend == "rdma":
+            config = RdmaBackendConfig(
+                qp_per_transfer=self.num_qp_per_transfer,
+                post_batch_size=-1,
+                num_worker_threads=self.num_worker_threads,
+                poll_cq_mode=self.poll_cq_mode,
+            )
+            self.engine.create_backend(BackendType.RDMA, config)
+        elif self.backend == "tcp":
+            config = TcpBackendConfig()
+            self.engine.create_backend(BackendType.TCP, config)
+        
 
         self.engine_desc = self.engine.get_engine_desc()
         engine_desc_bytes = self.engine_desc.pack()
