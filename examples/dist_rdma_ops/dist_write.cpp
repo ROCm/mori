@@ -62,7 +62,7 @@ inline __device__ void QuiteSerial(RdmaEndpoint* endpoint) {
   if (GetActiveLaneNum() != 0) return;
   CompletionQueueHandle& cq = endpoint->cqHandle;
   WorkQueueHandle& wq = endpoint->wqHandle;
-  if(!AcquireLockOnce(&cq.pollCqLock)) return;
+  if (!AcquireLockOnce(&cq.pollCqLock)) return;
   while (true) {
     bool done{false};
     uint32_t quiet_amount{0};
@@ -194,28 +194,6 @@ __device__ void Quite(RdmaEndpoint* endpoint) {
   }
 }
 
-inline __device__ void atomic_add_packed_msn_and_psn(uint64_t* msnPack, uint32_t incSlot,
-                                                     uint32_t incPsn, uint32_t* oldSlot,
-                                                     uint32_t* oldPsn) {
-  uint64_t expected = __hip_atomic_load(msnPack, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  while (true) {
-    uint32_t curSlot = static_cast<uint32_t>(expected & 0xFFFFFFFF);
-    uint32_t curPsn = static_cast<uint32_t>((expected >> 32) & 0xFFFFFFFF);
-
-    uint32_t newSlot = curSlot + incSlot;
-    uint32_t newPsn = curPsn + incPsn;
-
-    uint64_t desired = (static_cast<uint64_t>(newPsn) << 32) | static_cast<uint64_t>(newSlot);
-
-    if (__hip_atomic_compare_exchange_strong(msnPack, &expected, desired, __ATOMIC_RELAXED,
-                                             __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) {
-      if (oldSlot) *oldSlot = curSlot;
-      if (oldPsn) *oldPsn = curPsn;
-      break;
-    }
-  }
-}
-
 template <ProviderType P>
 __device__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemoryRegion remoteMr,
                       size_t msg_size) {
@@ -248,9 +226,9 @@ __device__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
   uint64_t my_psn_counter = warp_psn_counter + my_logical_lane_id * psnCnt;
   while (true) {
     uint64_t db_touched =
-        __hip_atomic_load(&wqHandle->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __hip_atomic_load(&wqHandle->dbTouchIdx, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
     uint64_t db_done =
-        __hip_atomic_load(&wqHandle->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __hip_atomic_load(&wqHandle->doneIdx, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
     uint64_t num_active_sq_entries = db_touched - db_done;
     uint64_t num_free_entries = wqHandle->sqWqeNum - num_active_sq_entries;
     uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
@@ -303,7 +281,7 @@ __global__ void MultiQpWrite(RdmaEndpoint* endpoints, RdmaMemoryRegion localMr,
 
   int laneId = threadIdx.x & (warpSize - 1);
   int warpId = thdId / warpSize;
-  int warpNum = blockDim.x / warpSize;
+  int warpNum = (blockDim.x + warpSize - 1) / warpSize;
 
   int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
   int globalThdNum = gridDim.x * blockDim.x;
@@ -322,7 +300,7 @@ __global__ void MultiQpWrite(RdmaEndpoint* endpoints, RdmaMemoryRegion localMr,
         QuiteSerial<P>(endpoints + t);
       }
     }
-     __syncthreads();
+    __syncthreads();
     if (threadIdx.x == 0) {
       atomicAdd(blockSync + i, 1);
     }
@@ -356,7 +334,7 @@ void distRdmaOps(int argc, char* argv[]) {
   hipEvent_t start, end;
   HIP_RUNTIME_CHECK(hipEventCreate(&start));
   HIP_RUNTIME_CHECK(hipEventCreate(&end));
-  int num_qp = 2;
+  int num_qp = args.getNumQp();
 
   // RDMA initialization
   // 1 Create device
@@ -517,13 +495,13 @@ void distRdmaOps(int argc, char* argv[]) {
 
   if (local_rank == 0) {
     printf("\nIBGDA White benchmark:\n");
-    printf("Blocks: %zu, Threads: %zu, Iterations: %zu\n", blocks, threads, iters);
-    printf("%-8s %-12s %-12s %-12s %-12s\n", "Index", "Size(B)", "bw(GB)", "Time(ms)", "Rate(pps)");
+    printf("Blocks: %zu, Threads: %zu, Iterations: %zu, QPs:%d \n", blocks, threads, iters, num_qp);
+    printf("%-8s %-12s %-12s %-12s %-12s\n", "Index", "Size(B)", "bw(GB)", "Time(ms)", "Rate(Mpps)");
 
     for (size_t i = 0; i < validSizeLog; ++i) {
-      double rate_pps = (blocks * threads * iters) / (times[i] * MS_TO_S);
+      double rate_mpps = (blocks * threads * iters) / (times[i] / MS_TO_S) / 1000000.0;
       printf("%-8zu %-12lu %-12.4f %-12.4f %-12.4f\n", i + 1, sizeTable[i], bwTable[i], times[i],
-             rate_pps);
+             rate_mpps);
     }
   }
 

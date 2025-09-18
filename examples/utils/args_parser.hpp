@@ -109,6 +109,7 @@ class BenchmarkConfig {
   size_t getStepFactor() const { return step_factor; }
   size_t getMaxSizeLog() const { return max_size_log; }
   size_t getStride() const { return stride; }
+  size_t getNumQp() const { return num_qp; }
 
   bool isBidirectional() const { return bidirectional; }
   bool isReportMsgrate() const { return report_msgrate; }
@@ -130,6 +131,7 @@ class BenchmarkConfig {
   size_t step_factor = 2;
   size_t max_size_log = 1;
   size_t stride = 1;
+  size_t num_qp = 1;
 
   bool bidirectional = false;
   bool report_msgrate = false;
