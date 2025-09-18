@@ -50,3 +50,6 @@ target_link_libraries(accum_perf mori_application mori_shmem hip::host
 add_executable(ibverbs_test application/ibverbs_test.cpp)
 target_link_libraries(ibverbs_test mori_application mori_shmem hip::host
                       hip::device)
+
+add_executable(tcp_example io/tcp_example.cpp)
+target_link_libraries(tcp_example mori_io mori_application hip::host hip::device)

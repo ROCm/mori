@@ -23,6 +23,7 @@
 
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/backend_impl.hpp"
+#include "src/io/tcp/backend_impl.hpp"
 
 namespace mori {
 namespace io {
@@ -99,6 +100,10 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
     assert(backends.find(type) == backends.end());
     backends.insert({type, std::make_unique<RdmaBackend>(
                                desc.key, config, static_cast<const RdmaBackendConfig&>(beConfig))});
+  } else if (type == BackendType::TCP) {
+    assert(backends.find(type) == backends.end());
+    backends.insert({type, std::make_unique<TcpBackend>(
+                               desc.key, config, static_cast<const TcpBackendConfig&>(beConfig))});
   } else
     assert(false && "not implemented");
   MORI_IO_INFO("Create backend type {}", static_cast<uint32_t>(type));

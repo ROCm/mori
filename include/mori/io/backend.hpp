@@ -63,6 +63,12 @@ inline std::ostream& operator<<(std::ostream& os, const RdmaBackendConfig& c) {
             << "] numWorkerThreads[" << c.numWorkerThreads << "]";
 }
 
+struct TcpBackendConfig : public BackendConfig {
+  TcpBackendConfig() : BackendConfig(BackendType::TCP) {}
+  // For future extension (e.g., parallelism, buffer sizing)
+  int numWorkerThreads{1};
+};
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         BackendSession                                         */
 /* ---------------------------------------------------------------------------------------------- */

@@ -317,6 +317,10 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readwrite("num_worker_threads", &mori::io::RdmaBackendConfig::numWorkerThreads)
       .def_readwrite("poll_cq_mode", &mori::io::RdmaBackendConfig::pollCqMode);
 
+  py::class_<mori::io::TcpBackendConfig, mori::io::BackendConfig>(m, "TcpBackendConfig")
+    .def(py::init<>())
+    .def_readwrite("num_worker_threads", &mori::io::TcpBackendConfig::numWorkerThreads);
+
   py::class_<mori::io::IOEngineConfig>(m, "IOEngineConfig")
       .def(py::init<std::string, uint16_t>(), py::arg("host") = "", py::arg("port") = 0)
       .def_readwrite("host", &mori::io::IOEngineConfig::host)
