@@ -760,11 +760,12 @@ RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& loca
   auto newSess = std::make_unique<RdmaBackendSession>();
   CreateSession(local, remote, *newSess);
   std::lock_guard<std::mutex> lock(sessionCacheMu);
-  auto& ref = sessionCache[key];
-  if (!ref) {
-    ref = std::move(newSess);
+  auto it = sessionCache.find(key);
+  if (it != sessionCache.end()) {
+    return it->second.get();
   }
-  return ref.get();
+  auto [emplacedIt, inserted] = sessionCache.emplace(key, std::move(newSess));
+  return emplacedIt->second.get();
 }
 
 void RdmaBackend::InvalidateSessionsForMemory(MemoryUniqueId id) {
