@@ -76,7 +76,7 @@ namespace shmem {
 /* ---------------------------------------------------------------------------------------------- */
 
 template <core::ProviderType PrvdType>
-inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId = 0) {
+inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId) {
   if (core::GetActiveLaneNum() != 0) return;
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
@@ -132,7 +132,7 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId = 0) {
 }
 
 template <core::ProviderType PrvdType>
-inline __device__ void ShmemQuietThreadKernelImpl(int pe, int qpId = 0) {
+inline __device__ void ShmemQuietThreadKernelImpl(int pe, int qpId) {
   if constexpr (PrvdType == core::ProviderType::BNXT) {
     ShmemQuietThreadKernelSerialImpl<PrvdType>(pe, qpId);
     return;
@@ -236,8 +236,7 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(
 }
 
 template <>
-inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(int pe,
-                                                                                int qpId = 0) {
+inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(int pe, int qpId) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int rank = globalGpuStates->rank;
@@ -254,7 +253,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
                                                       size_t destOffset,
                                                       const application::RdmaMemoryRegion& source,
                                                       size_t sourceOffset, size_t bytes, int pe,
-                                                      int qpId = 0) {
+                                                      int qpId) {
   if (bytes == 0) return;
   uintptr_t laddr = source.addr + sourceOffset;
   uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
@@ -318,7 +317,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
     if (num_free_entries > num_entries_until_warp_last_entry) {
       break;
     }
-    ShmemQuietThreadKernelImpl<PrvdType>(pe);
+    ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
   }
   uint64_t dbr_val;
   if constexpr (PrvdType == core::ProviderType::MLX5) {
@@ -355,7 +354,7 @@ template <>
 inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe,
-    int qpId = 0) {
+    int qpId) {
   bool need_turn{true};
   uint64_t turns = __ballot(need_turn);
   while (turns) {
@@ -375,7 +374,7 @@ inline __device__ void ShmemPutMemNbiWarpKernelImpl(const application::SymmMemOb
                                                     size_t destOffset,
                                                     const application::RdmaMemoryRegion& source,
                                                     size_t sourceOffset, size_t bytes, int pe,
-                                                    int qpId = 0) {
+                                                    int qpId) {
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {
     ShmemPutMemNbiThreadKernelImpl<PrvdType>(dest, destOffset, source, sourceOffset, bytes, pe,
@@ -387,7 +386,7 @@ template <>
 inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe,
-    int qpId = 0) {
+    int qpId) {
   DISPATCH_PROVIDER_TYPE_COMPILE_TIME(ShmemPutMemNbiWarpKernelImpl, dest, destOffset, source,
                                       sourceOffset, bytes, pe, qpId);
 }
@@ -397,7 +396,7 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::RDMA
 template <core::ProviderType PrvdType>
 inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::SymmMemObjPtr dest,
                                                           size_t destOffset, void* val,
-                                                          size_t bytes, int pe, int qpId = 0) {
+                                                          size_t bytes, int pe, int qpId) {
   if (bytes == 0) return;
 
   uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
@@ -455,7 +454,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
     if (num_free_entries > num_entries_until_warp_last_entry) {
       break;
     }
-    ShmemQuietThreadKernelImpl<PrvdType>(pe);
+    ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
   }
 
   uint64_t dbr_val;
@@ -491,7 +490,8 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
 
 template <>
 inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::RDMA>(
-    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe) {
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe,
+    int qpId) {
   bool need_turn{true};
   uint64_t turns = __ballot(need_turn);
   while (turns) {
@@ -509,7 +509,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType
 template <core::ProviderType PrvdType>
 inline __device__ void ShmemPutSizeImmNbiWarpKernelImpl(const application::SymmMemObjPtr dest,
                                                         size_t destOffset, void* val, size_t bytes,
-                                                        int pe, int qpId = 0) {
+                                                        int pe, int qpId) {
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {
     ShmemPutSizeImmNbiThreadKernelImpl<PrvdType>(dest, destOffset, val, bytes, pe, qpId);
@@ -519,7 +519,7 @@ inline __device__ void ShmemPutSizeImmNbiWarpKernelImpl(const application::SymmM
 template <>
 inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe,
-    int qpId = 0) {
+    int qpId) {
   DISPATCH_PROVIDER_TYPE_COMPILE_TIME(ShmemPutSizeImmNbiWarpKernelImpl, dest, destOffset, val,
                                       bytes, pe, qpId);
 }
@@ -528,7 +528,7 @@ template <core::ProviderType PrvdType>
 inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, size_t bytes,
-    core::atomicType amoType, int pe, int qpId = 0) {
+    core::atomicType amoType, int pe, int qpId) {
   if (bytes == 0) return;
   uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
   uintptr_t rkey = dest->peerRkeys[pe];
@@ -589,7 +589,7 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
     uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
     uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_wqes - db_touched;
     if (num_free_entries > num_entries_until_warp_last_entry) break;
-    ShmemQuietThreadKernelImpl<PrvdType>(pe);
+    ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
   }
 
   if constexpr (PrvdType == core::ProviderType::MLX5) {
@@ -633,7 +633,7 @@ template <>
 inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, size_t bytes,
-    core::atomicType amoType, int pe, int qpId = 0) {
+    core::atomicType amoType, int pe, int qpId) {
   bool need_turn{true};
   uint64_t turns = __ballot(need_turn);
   while (turns) {
@@ -652,20 +652,20 @@ template <core::ProviderType PrvdType>
 inline __device__ void ShmemAtomicSizeNonFetchWarpKernelImpl(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, size_t bytes,
-    core::atomicType amoType, int pe, int qpId = 0) {
+    core::atomicType amoType, int pe, int qpId) {
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {
     ShmemAtomicSizeNonFetchThreadKernelImpl<PrvdType>(dest, destOffset, source, sourceOffset, val,
                                                       bytes, amoType, pe, qpId);
   }
-  // ShmemQuietThreadKernelImpl<PrvdType>(pe);
+  // ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
 }
 
 template <>
 inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, size_t bytes,
-    core::atomicType amoType, int pe, int qpId = 0) {
+    core::atomicType amoType, int pe, int qpId) {
   DISPATCH_PROVIDER_TYPE_COMPILE_TIME(ShmemAtomicSizeNonFetchWarpKernelImpl, dest, destOffset,
                                       source, sourceOffset, val, bytes, amoType, pe, qpId);
 }
@@ -674,7 +674,7 @@ template <core::ProviderType PrvdType>
 inline __device__ void ShmemAtomicSizeFetchThreadKernelImpl(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare,
-    size_t bytes, core::atomicType amoType, int pe, int qpId = 0) {
+    size_t bytes, core::atomicType amoType, int pe, int qpId) {
   if (bytes == 0) return;
   uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
   uintptr_t rkey = dest->peerRkeys[pe];
@@ -735,7 +735,7 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernelImpl(
     uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
     uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_wqes - db_touched;
     if (num_free_entries > num_entries_until_warp_last_entry) break;
-    ShmemQuietThreadKernelImpl<PrvdType>(pe);
+    ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
   }
 
   if constexpr (PrvdType == core::ProviderType::MLX5) {
@@ -773,14 +773,14 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernelImpl(
   }
 
   // __threadfence_system();
-  // ShmemQuietThreadKernelImpl<PrvdType>(pe);
+  // ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
 }
 
 template <>
 inline __device__ void ShmemAtomicSizeFetchThreadKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare,
-    size_t bytes, core::atomicType amoType, int pe, int qpId = 0) {
+    size_t bytes, core::atomicType amoType, int pe, int qpId) {
   bool need_turn{true};
   uint64_t turns = __ballot(need_turn);
   while (turns) {
@@ -800,7 +800,7 @@ template <core::ProviderType PrvdType>
 inline __device__ void ShmemAtomicSizeFetchWarpKernelImpl(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare,
-    size_t bytes, core::atomicType amoType, int pe, int qpId = 0) {
+    size_t bytes, core::atomicType amoType, int pe, int qpId) {
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {
     ShmemAtomicSizeFetchThreadKernelImpl<PrvdType>(dest, destOffset, source, sourceOffset, val,
@@ -812,9 +812,9 @@ template <>
 inline __device__ void ShmemAtomicSizeFetchWarpKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare,
-    size_t bytes, core::atomicType amoType, int pe, int qpId = 0) {
+    size_t bytes, core::atomicType amoType, int pe, int qpId) {
   DISPATCH_PROVIDER_TYPE_COMPILE_TIME(ShmemAtomicSizeFetchWarpKernelImpl, dest, destOffset, source,
-                                      sourceOffset, val, compare, bytes, pe, amoType, qpId);
+                                      sourceOffset, val, compare, bytes, amoType, pe, qpId);
 }
 
 }  // namespace shmem

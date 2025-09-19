@@ -40,7 +40,7 @@ __global__ void ConcurrentPutThreadKernel(int myPe, const SymmMemObjPtr memObj) 
   if (myPe == sendPe) {
     RdmaMemoryRegion source = memObj->GetRdmaMemoryRegion(myPe);
 
-    ShmemPutMemNbiThread(memObj, threadOffset, source, threadOffset, sizeof(uint32_t), recvPe);
+    ShmemPutMemNbiThread(memObj, threadOffset, source, threadOffset, sizeof(uint32_t), recvPe, 1);
     __threadfence_system();
 
     if (blockIdx.x == 0)
