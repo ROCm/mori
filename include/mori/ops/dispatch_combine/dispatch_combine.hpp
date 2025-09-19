@@ -33,6 +33,9 @@
 namespace mori {
 namespace moe {
 
+#define MAX_GPUS_PER_NODE 8
+#define MAX_NODES 32
+
 enum KernelType {
   IntraNode = 0,
   InterNode = 1,
@@ -153,6 +156,9 @@ class EpDispatchCombineHandle {
   void InitializeBarrier();
   void FinalizeBarrier();
 
+  void InitializeNormalKernelBuf();
+  void FinalizeNormalKernelBuf();
+
  public:
   // Number of tokens on this rank and size of scale data type, updated at each round of inference
   index_t curRankNumToken{0};
@@ -188,6 +194,14 @@ class EpDispatchCombineHandle {
   mori::application::SymmMemObjPtr sendTokenNumMemObj;
   mori::application::SymmMemObjPtr sendAtomicSignalMemObj;
 
+  // productor tail and consumer head for internode normal kernel
+  mori::application::SymmMemObjPtr headMemObj;
+  mori::application::SymmMemObjPtr tailMemObj;
+  // mori::application::SymmMemObjPtr rdmaHeadMemObj;
+  // mori::application::SymmMemObjPtr rdmaTailMemObj;
+  // mori::application::SymmMemObjPtr p2pHeadMemObj;
+  // mori::application::SymmMemObjPtr p2pTailMemObj;
+
   // Barrier for intra-grid synchronization
   uint32_t* dispatchGridBarrier{nullptr};
   uint32_t* combineGridBarrier{nullptr};
@@ -218,6 +232,12 @@ class EpDispatchCombineHandle {
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint32_t crossDeviceBarrierFlag{1};
+
+  // Inter-node normal kernel parameters
+  mori::application::SymmMemObjPtr intraNodeBarrierMemObj;
+  void* localPeBuf{nullptr};
+  uint64_t* localHead{nullptr};
+  uint64_t* localTail{nullptr};
 };
 
 template <typename T>
@@ -242,6 +262,12 @@ struct EpDispatchCombineArgs {
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
   mori::application::SymmMemObjPtr sendTokenNumMemObj;
   mori::application::SymmMemObjPtr sendAtomicSignalMemObj;
+  mori::application::SymmMemObjPtr headMemObj;
+  mori::application::SymmMemObjPtr tailMemObj;
+  // mori::application::SymmMemObjPtr rdmaHeadMemObj;
+  // mori::application::SymmMemObjPtr rdmaTailMemObj;
+  // mori::application::SymmMemObjPtr p2pHeadMemObj;
+  // mori::application::SymmMemObjPtr p2pTailMemObj;
   uint32_t* dispatchGridBarrier{nullptr};
   uint32_t* combineGridBarrier{nullptr};
   index_t* destPeTokenCounter{nullptr};
@@ -256,6 +282,11 @@ struct EpDispatchCombineArgs {
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint32_t crossDeviceBarrierFlag{1};
+  // Inter-node normal kernel parameters
+  mori::application::SymmMemObjPtr intraNodeBarrierMemObj;
+  void* localPeBuf{nullptr};
+  uint64_t* localHead{nullptr};
+  uint64_t* localTail{nullptr};
 };
 
 using EpDispatchCombineArgsVariant =
@@ -284,6 +315,12 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.shmemInpIndicesMemObj = handle.shmemInpIndicesMemObj;
   args.shmemOutIndicesMemObj = handle.shmemOutIndicesMemObj;
   args.recvTokenNumMemObj = handle.recvTokenNumMemObj;
+  args.headMemObj = handle.headMemObj;
+  args.tailMemObj = handle.tailMemObj;
+  // args.rdmaHeadMemObj = handle.rdmaHeadMemObj;
+  // args.rdmaTailMemObj = handle.rdmaTailMemObj;
+  // args.p2pHeadMemObj = handle.p2pHeadMemObj;
+  // args.p2pTailMemObj = handle.p2pTailMemObj;
   args.sendTokenNumMemObj = handle.sendTokenNumMemObj;
   args.sendAtomicSignalMemObj = handle.sendAtomicSignalMemObj;
   args.dispatchGridBarrier = handle.dispatchGridBarrier;
@@ -298,6 +335,10 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.totalRecvTokenNum = handle.totalRecvTokenNum;
   args.crossDeviceBarrierMemObj = handle.crossDeviceBarrierMemObj;
   args.crossDeviceBarrierFlag = handle.crossDeviceBarrierFlag;
+  args.intraNodeBarrierMemObj = handle.intraNodeBarrierMemObj;
+  args.localPeBuf = handle.localPeBuf;
+  args.localHead = handle.localHead;
+  args.localTail = handle.localTail;
   return args;
 }
 

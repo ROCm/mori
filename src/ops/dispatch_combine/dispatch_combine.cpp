@@ -44,6 +44,9 @@ using namespace mori::shmem;
 /* ---------------------------------------------------------------------------------------------- */
 EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config) : config(config) {
   InitializeShmemBuf();
+  if (config.kernelType == KernelType::InterNodeNormal) {
+    InitializeNormalKernelBuf();
+  }
   InitializeTokenNumSignalBuf();
   InitializeOrderMapBuf();
   InitializeBarrier();
@@ -51,6 +54,9 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config)
 
 EpDispatchCombineHandle::~EpDispatchCombineHandle() {
   FinalizeShmemBuf();
+  if (config.kernelType == KernelType::InterNodeNormal) {
+    FinalizeNormalKernelBuf();
+  }
   FinalizeTokenNumSignalBuf();
   FinalizeOrderMapBuf();
   FinalizeBarrier();
@@ -103,7 +109,9 @@ void EpDispatchCombineHandle::FinalizeShmemBuf() {
 }
 
 void EpDispatchCombineHandle::InitializeTokenNumSignalBuf() {
-  size_t tokenNumSignalSize = config.worldSize * sizeof(index_t) * 2;
+  size_t tokenNumSignalSize = config.kernelType == KernelType::InterNodeNormal
+                                  ? config.blockNum * config.worldSize * sizeof(index_t)
+                                  : config.worldSize * sizeof(index_t) * 2;
   recvTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
   sendTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
   // The extra *2 is for the laddr.
@@ -121,6 +129,45 @@ void EpDispatchCombineHandle::FinalizeTokenNumSignalBuf() {
   HIP_RUNTIME_CHECK(hipFree(totalRecvTokenNum));
 }
 
+void EpDispatchCombineHandle::InitializeNormalKernelBuf() {
+  const int channelNum = config.blockNum / 2;
+  const int nNodes = config.worldSize / MAX_GPUS_PER_NODE;
+  const int maxTokens = ((config.maxNumInpTokenPerRank + channelNum - 1) / channelNum) * channelNum;
+  const size_t localPeBufSize =
+      config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerRank * sizeof(index_t) +
+      maxTokens * nNodes * sizeof(index_t) + channelNum * nNodes * sizeof(index_t);
+  HIP_RUNTIME_CHECK(hipMalloc(&localPeBuf, localPeBufSize));
+  HIP_RUNTIME_CHECK(hipMemset(localPeBuf, 0, localPeBufSize));
+
+  const size_t syncCounterSize = config.blockNum * config.worldSize * sizeof(uint64_t);
+  // rdmaHeadMemObj = ShmemMallocAndReturnMemObjPtr(syncCounterSize, hipDeviceMallocUncached);
+  // rdmaTailMemObj = ShmemMallocAndReturnMemObjPtr(syncCounterSize, hipDeviceMallocUncached);
+  // p2pHeadMemObj = ShmemMallocAndReturnMemObjPtr(syncCounterSize, hipDeviceMallocUncached);
+  // p2pTailMemObj = ShmemMallocAndReturnMemObjPtr(syncCounterSize, hipDeviceMallocUncached);
+  headMemObj = ShmemMallocAndReturnMemObjPtr(syncCounterSize, hipDeviceMallocUncached);
+  tailMemObj = ShmemMallocAndReturnMemObjPtr(syncCounterSize, hipDeviceMallocUncached);
+  HIP_RUNTIME_CHECK(hipMalloc(&localHead, syncCounterSize));
+  HIP_RUNTIME_CHECK(hipMemset(localHead, 0, syncCounterSize));
+  HIP_RUNTIME_CHECK(hipMalloc(&localTail, syncCounterSize));
+  HIP_RUNTIME_CHECK(hipMemset(localTail, 0, syncCounterSize));
+
+  intraNodeBarrierMemObj =
+      ShmemMallocAndReturnMemObjPtr(config.worldSize * sizeof(int), hipDeviceMallocUncached);
+}
+
+void EpDispatchCombineHandle::FinalizeNormalKernelBuf() {
+  HIP_RUNTIME_CHECK(hipFree(localPeBuf));
+  ShmemFree(headMemObj->localPtr);
+  ShmemFree(tailMemObj->localPtr);
+  // ShmemFree(rdmaHeadMemObj->localPtr);
+  // ShmemFree(rdmaTailMemObj->localPtr);
+  // ShmemFree(p2pHeadMemObj->localPtr);
+  // ShmemFree(p2pTailMemObj->localPtr);
+  HIP_RUNTIME_CHECK(hipFree(localHead));
+  HIP_RUNTIME_CHECK(hipFree(localTail));
+  ShmemFree(intraNodeBarrierMemObj->localPtr);
+}
+
 void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   size_t maxNumOutToken = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerRank;
   HIP_RUNTIME_CHECK(hipMalloc(&dispReceiverIdxMap, maxNumOutToken * sizeof(index_t)));
@@ -135,8 +182,11 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipMalloc(&srcPeTokenIdxMap, maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(srcPeTokenIdxMap, -1, maxNumOutToken * sizeof(index_t)));
 
-  HIP_RUNTIME_CHECK(hipMalloc(&destPeTokenCounter, config.worldSize * sizeof(index_t)));
-  HIP_RUNTIME_CHECK(hipMemset(destPeTokenCounter, 0, config.worldSize * sizeof(index_t)));
+  size_t counterSize =
+      (config.kernelType == KernelType::InterNodeNormal ? (config.blockNum / 2) : 1) *
+      config.worldSize * sizeof(index_t);
+  HIP_RUNTIME_CHECK(hipMalloc(&destPeTokenCounter, counterSize));
+  HIP_RUNTIME_CHECK(hipMemset(destPeTokenCounter, 0, counterSize));
 
   HIP_RUNTIME_CHECK(hipMalloc(&localPeTokenCounter, config.numExpertPerRank * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(localPeTokenCounter, 0, config.numExpertPerRank * sizeof(index_t)));

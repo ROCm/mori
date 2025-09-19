@@ -28,8 +28,6 @@
 namespace mori {
 namespace moe {
 
-#define MAX_GPUS_PER_NODE 8
-
 #define DEBUG 0
 
 __device__ void SyncIfDebugEnabled(const char* msg) {
