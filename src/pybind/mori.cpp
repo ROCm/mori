@@ -319,7 +319,11 @@ void RegisterMoriIo(pybind11::module_& m) {
 
   py::class_<mori::io::TcpBackendConfig, mori::io::BackendConfig>(m, "TcpBackendConfig")
     .def(py::init<>())
-    .def_readwrite("num_worker_threads", &mori::io::TcpBackendConfig::numWorkerThreads);
+    .def_readwrite("num_worker_threads", &mori::io::TcpBackendConfig::numWorkerThreads)
+    .def_readwrite("preconnect", &mori::io::TcpBackendConfig::preconnect)
+    .def_readwrite("buffer_pool_max_buffers", &mori::io::TcpBackendConfig::buffer_pool_max_buffers)
+    .def_readwrite("buffer_pool_max_bytes", &mori::io::TcpBackendConfig::buffer_pool_max_bytes)
+    .def_readwrite("buffer_pool_pinned", &mori::io::TcpBackendConfig::buffer_pool_pinned);
 
   py::class_<mori::io::IOEngineConfig>(m, "IOEngineConfig")
       .def(py::init<std::string, uint16_t>(), py::arg("host") = "", py::arg("port") = 0)

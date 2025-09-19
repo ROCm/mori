@@ -547,6 +547,7 @@ def benchmark_engine(local_rank, node_rank, args):
         iters=args.iters,
         sweep=args.all,
         sweep_batch=args.all_batch,
+        backend=args.backend,
     )
     bench.print_config()
     bench.run()

@@ -3,6 +3,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <deque>
 
 #include "mori/io/backend.hpp"
 #include "mori/io/common.hpp"
@@ -70,6 +71,66 @@ class TcpBackend : public Backend {
   std::unique_ptr<application::TCPContext> ctx{nullptr};
   std::thread serviceThread;
   std::atomic<bool> running{false};
+
+  struct BufferBlock {
+    char* data{nullptr};
+    size_t capacity{0};
+    bool pinned{false};
+  };
+
+  class BufferPool {
+   public:
+    BufferPool() = default;
+    void Configure(size_t maxBuffers, size_t maxBytes, bool pinned) {
+      max_buffers = maxBuffers; max_bytes = maxBytes; use_pinned = pinned;
+    }
+    BufferBlock Acquire(size_t size) {
+      std::lock_guard<std::mutex> lk(mu);
+      // try find first-fit large enough
+      for (auto it = pool.begin(); it != pool.end(); ++it) {
+        if (it->capacity >= size) {
+          BufferBlock b = *it;
+          current_bytes -= b.capacity;
+          pool.erase(it);
+          return b;
+        }
+      }
+      // allocate new
+      BufferBlock b; b.capacity = size; b.pinned = use_pinned;
+      if (use_pinned) {
+        if (hipHostMalloc(&b.data, size) != hipSuccess) { b.data = (char*)::malloc(size); b.pinned=false; }
+      } else {
+        b.data = (char*)::malloc(size);
+      }
+      return b;
+    }
+    void Release(BufferBlock&& b) {
+      if (!b.data) return;
+      std::lock_guard<std::mutex> lk(mu);
+      if (pool.size() >= max_buffers || (current_bytes + b.capacity) > max_bytes) {
+        Free(b);
+        return;
+      }
+      current_bytes += b.capacity;
+      pool.push_back(b);
+    }
+    void Free(BufferBlock& b) {
+      if (!b.data) return;
+      if (b.pinned) hipHostFree(b.data); else ::free(b.data);
+      b.data=nullptr; b.capacity=0; b.pinned=false;
+    }
+    ~BufferPool(){
+      for (auto& b : pool) Free(b);
+    }
+   private:
+    std::mutex mu;
+    std::deque<BufferBlock> pool;
+    size_t current_bytes{0};
+    size_t max_buffers{0};
+    size_t max_bytes{0};
+    bool use_pinned{true};
+  };
+  BufferPool bufferPool;
 
   // memory registered locally
   std::unordered_map<MemoryUniqueId, MemoryDesc> localMems;

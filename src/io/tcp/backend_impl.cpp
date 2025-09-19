@@ -14,6 +14,8 @@ namespace io {
 TcpBackend::TcpBackend(EngineKey key, const IOEngineConfig& engCfg, const TcpBackendConfig& cfg)
     : myEngKey(key), config(cfg), engConfig(engCfg) {
   ctx.reset(new application::TCPContext(engConfig.host, engConfig.port));
+  bufferPool.Configure(config.buffer_pool_max_buffers, config.buffer_pool_max_bytes,
+                       config.buffer_pool_pinned);
   ctx->Listen();
   StartService();
   MORI_IO_INFO("TcpBackend created host {} port {}", engConfig.host.c_str(), engConfig.port);
@@ -123,8 +125,8 @@ void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
   bool localIsGpu = (localDest.loc == MemoryLocationType::GPU);
   // For remote side we don't know its loc explicitly; protocol does not carry it yet.
   // We will always send/recv host buffers over TCP.
-  std::unique_ptr<char[]> hostBuf(new char[size]);
-  char* hostPtr = hostBuf.get();
+  auto bufBlock = bufferPool.Acquire(size);
+  char* hostPtr = bufBlock.data;
 
   // If write (sending data), and source is GPU, copy device->host first.
   if (!isRead) {
@@ -149,6 +151,7 @@ void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
     TcpMessageHeader resp{};
     ep.Recv(&resp, sizeof(resp));
     status->SetCode(StatusCode::SUCCESS);
+    bufferPool.Release(std::move(bufBlock));
     return;
   } else {
     TcpMessageHeader resp{};
@@ -156,6 +159,7 @@ void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
     if (resp.opcode != 2 || resp.size != size) {
       status->SetCode(StatusCode::ERR_BAD_STATE);
       status->SetMessage("unexpected read response");
+      bufferPool.Release(std::move(bufBlock));
       return;
     }
     ep.Recv(hostPtr, size);
@@ -165,6 +169,7 @@ void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
       if (e != hipSuccess) {
         status->SetCode(StatusCode::ERR_BAD_STATE);
         status->SetMessage(std::string("hipMemcpy H2D failed: ") + hipGetErrorString(e));
+        bufferPool.Release(std::move(bufBlock));
         return;
       }
     } else {
@@ -172,6 +177,7 @@ void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
       std::memcpy(dst, hostPtr, size);
     }
     status->SetCode(StatusCode::SUCCESS);
+    bufferPool.Release(std::move(bufBlock));
     return;
   }
 }
@@ -243,32 +249,37 @@ void TcpBackend::ServiceLoop() {
           target = localMems.begin()->second;
         }
         bool targetIsGpu = (target.loc == MemoryLocationType::GPU);
-        std::unique_ptr<char[]> hostBuf(new char[hdr.size]);
+        auto bufBlock = bufferPool.Acquire(hdr.size);
+        char* hostBuf = bufBlock.data;
         if (hdr.opcode == 0) { // read request: copy from target to host and send
           if (targetIsGpu) {
             const void* devPtr = reinterpret_cast<const void*>(target.data + hdr.offset);
-            if (hipMemcpy(hostBuf.get(), devPtr, hdr.size, hipMemcpyDeviceToHost) != hipSuccess) {
+            if (hipMemcpy(hostBuf, devPtr, hdr.size, hipMemcpyDeviceToHost) != hipSuccess) {
+              bufferPool.Release(std::move(bufBlock));
               ::close(fd); continue; }
           } else {
             const char* src = reinterpret_cast<const char*>(target.data + hdr.offset);
-            std::memcpy(hostBuf.get(), src, hdr.size);
+            std::memcpy(hostBuf, src, hdr.size);
           }
           TcpMessageHeader resp{2, hdr.id, hdr.offset, hdr.size};
             ::send(fd, &resp, sizeof(resp), 0);
-            ::send(fd, hostBuf.get(), hdr.size, 0);
+            ::send(fd, hostBuf, hdr.size, 0);
+            bufferPool.Release(std::move(bufBlock));
         } else { // write request: recv payload into host then copy to device if needed
-          ssize_t r2 = ::recv(fd, hostBuf.get(), hdr.size, MSG_WAITALL);
-          if (r2 != (ssize_t)hdr.size) { ::close(fd); continue; }
+          ssize_t r2 = ::recv(fd, hostBuf, hdr.size, MSG_WAITALL);
+          if (r2 != (ssize_t)hdr.size) { bufferPool.Release(std::move(bufBlock)); ::close(fd); continue; }
           if (targetIsGpu) {
             void* devPtr = reinterpret_cast<void*>(target.data + hdr.offset);
-            if (hipMemcpy(devPtr, hostBuf.get(), hdr.size, hipMemcpyHostToDevice) != hipSuccess) {
+            if (hipMemcpy(devPtr, hostBuf, hdr.size, hipMemcpyHostToDevice) != hipSuccess) {
+              bufferPool.Release(std::move(bufBlock));
               ::close(fd); continue; }
           } else {
             char* dst = reinterpret_cast<char*>(target.data + hdr.offset);
-            std::memcpy(dst, hostBuf.get(), hdr.size);
+            std::memcpy(dst, hostBuf, hdr.size);
           }
           TcpMessageHeader resp{3, hdr.id, hdr.offset, hdr.size};
           ::send(fd, &resp, sizeof(resp), 0);
+          bufferPool.Release(std::move(bufBlock));
         }
       } else {
         ::close(fd);
