@@ -1,12 +1,34 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 #include "src/io/tcp/backend_impl.hpp"
 
+#include <netinet/tcp.h>
 #include <sys/epoll.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cstring>
 #include <memory>
-#include <netinet/tcp.h>
 
 namespace mori {
 namespace io {
@@ -14,6 +36,16 @@ namespace io {
 TcpBackend::TcpBackend(EngineKey key, const IOEngineConfig& engCfg, const TcpBackendConfig& cfg)
     : myEngKey(key), config(cfg), engConfig(engCfg) {
   ctx.reset(new application::TCPContext(engConfig.host, engConfig.port));
+  // Set basic socket options on listening socket
+  int lfd = ctx->GetListenFd();
+  if (lfd >= 0) {
+    int one = 1;
+    ::setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    // Optional: enlarge listen socket buffers (kernel will clone defaults to accepted sockets)
+    int bufSz = 4 * 1024 * 1024;  // 4MB
+    ::setsockopt(lfd, SOL_SOCKET, SO_RCVBUF, &bufSz, sizeof(bufSz));
+    ::setsockopt(lfd, SOL_SOCKET, SO_SNDBUF, &bufSz, sizeof(bufSz));
+  }
   bufferPool.Configure(config.buffer_pool_max_buffers, config.buffer_pool_max_bytes,
                        config.buffer_pool_pinned);
   ctx->Listen();
@@ -37,7 +69,7 @@ void TcpBackend::StopService() {
 
 void TcpBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
   {
-    std::lock_guard<std::mutex> lock(mu);
+    std::lock_guard<std::mutex> lock(remotesMu);
     remotes[rdesc.key] = rdesc;
   }
   if (config.preconnect) {
@@ -47,8 +79,9 @@ void TcpBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
 }
 
 void TcpBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
-  std::lock_guard<std::mutex> lock(mu);
+  std::lock_guard<std::mutex> lock(remotesMu);
   remotes.erase(rdesc.key);
+  std::lock_guard<std::mutex> lock2(connsMu);
   auto it = conns.find(rdesc.key);
   if (it != conns.end()) {
     if (it->second.handle.fd >= 0) {
@@ -59,18 +92,18 @@ void TcpBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
 }
 
 void TcpBackend::RegisterMemory(const MemoryDesc& desc) {
-  std::lock_guard<std::mutex> lock(mu);
+  std::lock_guard<std::mutex> lock(memMu);
   localMems[desc.id] = desc;
 }
 
 void TcpBackend::DeregisterMemory(const MemoryDesc& desc) {
-  std::lock_guard<std::mutex> lock(mu);
+  std::lock_guard<std::mutex> lock(memMu);
   localMems.erase(desc.id);
 }
 
 TcpConnection TcpBackend::GetOrCreateConnection(const EngineDesc& rdesc) {
   {
-    std::lock_guard<std::mutex> lock(mu);
+    std::lock_guard<std::mutex> lock(connsMu);
     auto it = conns.find(rdesc.key);
     if (it != conns.end() && it->second.Valid()) return it->second;
   }
@@ -81,9 +114,15 @@ TcpConnection TcpBackend::GetOrCreateConnection(const EngineDesc& rdesc) {
     int flag = 1;
     setsockopt(handle.fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));  // for small msg
     setsockopt(handle.fd, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
+    int bufSz = 4 * 1024 * 1024;  // 4MB send/recv buffers
+    setsockopt(handle.fd, SOL_SOCKET, SO_RCVBUF, &bufSz, sizeof(bufSz));
+    setsockopt(handle.fd, SOL_SOCKET, SO_SNDBUF, &bufSz, sizeof(bufSz));
+
+    int qack = 1;
+    setsockopt(handle.fd, IPPROTO_TCP, TCP_QUICKACK, &qack, sizeof(qack));
   }
   {
-    std::lock_guard<std::mutex> lock(mu);
+    std::lock_guard<std::mutex> lock(connsMu);
     TcpConnection c(handle);
     conns[rdesc.key] = c;
     MORI_IO_INFO("TCP persistent connection established to {}:{} (fd={})", rdesc.host.c_str(),
@@ -99,7 +138,7 @@ void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
   EngineKey remoteKey = remoteSrc.engineKey;
   EngineDesc rdesc;
   {
-    std::lock_guard<std::mutex> lock(mu);
+    std::lock_guard<std::mutex> lock(remotesMu);
     if (remotes.find(remoteKey) == remotes.end()) {
       status->SetCode(StatusCode::ERR_NOT_FOUND);
       status->SetMessage("remote engine not registered");
@@ -115,8 +154,9 @@ void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
   }
 
   TcpMessageHeader hdr{};
-  hdr.opcode = isRead ? 0 : 1; // read_req or write_req
+  hdr.opcode = isRead ? 0 : 1;  // read_req or write_req
   hdr.id = id;
+  hdr.mem_id = remoteSrc.id;  // specify remote memory id explicitly
   hdr.offset = remoteOffset;
   hdr.size = size;
 
@@ -144,16 +184,34 @@ void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
     }
   }
 
-  // send header
-  ep.Send(&hdr, sizeof(hdr));
+  // send header (+payload for write) using writev to reduce syscalls
   if (!isRead) {
-    ep.Send(hostPtr, size);
+    struct iovec iov[2];
+    iov[0].iov_base = &hdr;
+    iov[0].iov_len = sizeof(hdr);
+    iov[1].iov_base = hostPtr;
+    iov[1].iov_len = size;
+    ssize_t wr = ::writev(conn.handle.fd, iov, 2);
+    if (wr < (ssize_t)(sizeof(hdr) + size)) {
+      status->SetCode(StatusCode::ERR_BAD_STATE);
+      status->SetMessage("partial writev");
+      bufferPool.Release(std::move(bufBlock));
+      return;
+    }
     TcpMessageHeader resp{};
     ep.Recv(&resp, sizeof(resp));
     status->SetCode(StatusCode::SUCCESS);
     bufferPool.Release(std::move(bufBlock));
     return;
   } else {
+    // read request: only header out
+    ssize_t wr = ::send(conn.handle.fd, &hdr, sizeof(hdr), 0);
+    if (wr != (ssize_t)sizeof(hdr)) {
+      status->SetCode(StatusCode::ERR_BAD_STATE);
+      status->SetMessage("header send failed");
+      bufferPool.Release(std::move(bufBlock));
+      return;
+    }
     TcpMessageHeader resp{};
     ep.Recv(&resp, sizeof(resp));
     if (resp.opcode != 2 || resp.size != size) {
@@ -209,7 +267,7 @@ BackendSession* TcpBackend::CreateSession(const MemoryDesc& local, const MemoryD
 
 bool TcpBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                           TransferStatus* status) {
-  return false; // simplistic synchronous model
+  return false;  // simplistic synchronous model
 }
 
 void TcpBackend::ServiceLoop() {
@@ -230,57 +288,94 @@ void TcpBackend::ServiceLoop() {
       if (fd == ctx->GetListenFd()) {
         auto newEps = ctx->Accept();
         for (auto& h : newEps) {
+          if (h.fd >= 0) {
+            int flag = 1;
+            setsockopt(h.fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+            setsockopt(h.fd, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
+            int bufSz = 4 * 1024 * 1024;
+            setsockopt(h.fd, SOL_SOCKET, SO_RCVBUF, &bufSz, sizeof(bufSz));
+            setsockopt(h.fd, SOL_SOCKET, SO_SNDBUF, &bufSz, sizeof(bufSz));
+
+            int qack = 1;
+            setsockopt(h.fd, IPPROTO_TCP, TCP_QUICKACK, &qack, sizeof(qack));
+          }
           epoll_event nev{};
-            nev.events = EPOLLIN | EPOLLET;
-            nev.data.fd = h.fd;
-            epoll_ctl(epfd, EPOLL_CTL_ADD, h.fd, &nev);
+          nev.events = EPOLLIN | EPOLLET;
+          nev.data.fd = h.fd;
+          epoll_ctl(epfd, EPOLL_CTL_ADD, h.fd, &nev);
         }
         continue;
       }
       // handle request
       TcpMessageHeader hdr{};
       ssize_t r = ::recv(fd, &hdr, sizeof(hdr), MSG_WAITALL);
-      if (r != sizeof(hdr)) { ::close(fd); continue; }
-      if (hdr.opcode == 0 || hdr.opcode == 1) { // read or write
+      if (r != sizeof(hdr)) {
+        ::close(fd);
+        continue;
+      }
+      if (hdr.opcode == 0 || hdr.opcode == 1) {  // read or write
         MemoryDesc target{};
         {
-          std::lock_guard<std::mutex> lock(mu);
-          if (localMems.empty()) { ::close(fd); continue; }
-          target = localMems.begin()->second;
+          std::lock_guard<std::mutex> lock(memMu);
+          auto it = localMems.find(hdr.mem_id);
+          if (it == localMems.end()) {
+            ::close(fd);
+            continue;
+          }
+          target = it->second;
         }
         bool targetIsGpu = (target.loc == MemoryLocationType::GPU);
         auto bufBlock = bufferPool.Acquire(hdr.size);
         char* hostBuf = bufBlock.data;
-        if (hdr.opcode == 0) { // read request: copy from target to host and send
+        if (hdr.opcode == 0) {  // read request: copy from target to host and send
           if (targetIsGpu) {
             const void* devPtr = reinterpret_cast<const void*>(target.data + hdr.offset);
             if (hipMemcpy(hostBuf, devPtr, hdr.size, hipMemcpyDeviceToHost) != hipSuccess) {
               bufferPool.Release(std::move(bufBlock));
-              ::close(fd); continue; }
+              ::close(fd);
+              continue;
+            }
           } else {
             const char* src = reinterpret_cast<const char*>(target.data + hdr.offset);
             std::memcpy(hostBuf, src, hdr.size);
           }
-          TcpMessageHeader resp{2, hdr.id, hdr.offset, hdr.size};
-            ::send(fd, &resp, sizeof(resp), 0);
-            ::send(fd, hostBuf, hdr.size, 0);
-            bufferPool.Release(std::move(bufBlock));
-        } else { // write request: recv payload into host then copy to device if needed
+          TcpMessageHeader resp{};
+          resp.opcode = 2;
+          resp.id = hdr.id;
+          resp.mem_id = hdr.mem_id;
+          resp.offset = hdr.offset;
+          resp.size = hdr.size;
+          ::send(fd, &resp, sizeof(resp), 0);
+          ::send(fd, hostBuf, hdr.size, 0);
+          bufferPool.Release(std::move(bufBlock));
+        } else {  // write request: recv payload into host then copy to device if needed
           ssize_t r2 = ::recv(fd, hostBuf, hdr.size, MSG_WAITALL);
-          if (r2 != (ssize_t)hdr.size) { bufferPool.Release(std::move(bufBlock)); ::close(fd); continue; }
+          if (r2 != (ssize_t)hdr.size) {
+            bufferPool.Release(std::move(bufBlock));
+            ::close(fd);
+            continue;
+          }
           if (targetIsGpu) {
             void* devPtr = reinterpret_cast<void*>(target.data + hdr.offset);
             if (hipMemcpy(devPtr, hostBuf, hdr.size, hipMemcpyHostToDevice) != hipSuccess) {
               bufferPool.Release(std::move(bufBlock));
-              ::close(fd); continue; }
+              ::close(fd);
+              continue;
+            }
           } else {
             char* dst = reinterpret_cast<char*>(target.data + hdr.offset);
             std::memcpy(dst, hostBuf, hdr.size);
           }
-          TcpMessageHeader resp{3, hdr.id, hdr.offset, hdr.size};
+          TcpMessageHeader resp{};
+          resp.opcode = 3;
+          resp.id = hdr.id;
+          resp.mem_id = hdr.mem_id;
+          resp.offset = hdr.offset;
+          resp.size = hdr.size;
           ::send(fd, &resp, sizeof(resp), 0);
           bufferPool.Release(std::move(bufBlock));
         }
+        break;
       } else {
         ::close(fd);
       }
@@ -300,5 +395,5 @@ void TcpBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeVe
   backend->BatchReadWrite(local, localOffsets, remote, remoteOffsets, sizes, status, id, isRead);
 }
 
-} // namespace io
-} // namespace mori
+}  // namespace io
+}  // namespace mori
