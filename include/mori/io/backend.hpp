@@ -67,6 +67,7 @@ struct TcpBackendConfig : public BackendConfig {
   TcpBackendConfig() : BackendConfig(BackendType::TCP) {}
   // For future extension (e.g., parallelism, buffer sizing)
   int numWorkerThreads{1};
+  bool preconnect{true};
 };
 
 /* ---------------------------------------------------------------------------------------------- */

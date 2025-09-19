@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <netinet/tcp.h>
 
 namespace mori {
 namespace io {
@@ -33,14 +34,26 @@ void TcpBackend::StopService() {
 }
 
 void TcpBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
-  std::lock_guard<std::mutex> lock(mu);
-  remotes[rdesc.key] = rdesc;
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    remotes[rdesc.key] = rdesc;
+  }
+  if (config.preconnect) {
+    // Establish persistent data connection immediately
+    (void)GetOrCreateConnection(rdesc);
+  }
 }
 
 void TcpBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   std::lock_guard<std::mutex> lock(mu);
   remotes.erase(rdesc.key);
-  conns.erase(rdesc.key);
+  auto it = conns.find(rdesc.key);
+  if (it != conns.end()) {
+    if (it->second.handle.fd >= 0) {
+      ::close(it->second.handle.fd);
+    }
+    conns.erase(it);
+  }
 }
 
 void TcpBackend::RegisterMemory(const MemoryDesc& desc) {
@@ -54,11 +67,27 @@ void TcpBackend::DeregisterMemory(const MemoryDesc& desc) {
 }
 
 TcpConnection TcpBackend::GetOrCreateConnection(const EngineDesc& rdesc) {
-  if (conns.find(rdesc.key) != conns.end() && conns[rdesc.key].Valid()) return conns[rdesc.key];
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = conns.find(rdesc.key);
+    if (it != conns.end() && it->second.Valid()) return it->second;
+  }
+
+  // Connect outside lock to avoid blocking other operations
   auto handle = ctx->Connect(rdesc.host, rdesc.port);
-  TcpConnection c(handle);
-  conns[rdesc.key] = c;
-  return c;
+  if (handle.fd >= 0) {
+    int flag = 1;
+    setsockopt(handle.fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));  // for small msg
+    setsockopt(handle.fd, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
+  }
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    TcpConnection c(handle);
+    conns[rdesc.key] = c;
+    MORI_IO_INFO("TCP persistent connection established to {}:{} (fd={})", rdesc.host.c_str(),
+                 rdesc.port, handle.fd);
+    return conns[rdesc.key];
+  }
 }
 
 void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
