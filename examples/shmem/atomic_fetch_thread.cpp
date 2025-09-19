@@ -56,7 +56,7 @@ __global__ void AtomicFetchThreadKernel(int myPe, const SymmMemObjPtr memObj) {
     RdmaMemoryRegion source = memObj->GetRdmaMemoryRegion(sendPe);
 
     ShmemAtomicTypeFetchThread<T>(memObj, threadOffset, source, threadOffset, sendPe, recvPe,
-                                  recvPe, AMO_FETCH_AND);
+                                  AMO_FETCH_AND, recvPe);
     __threadfence_system();
 
     ShmemQuietThread();

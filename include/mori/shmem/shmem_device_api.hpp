@@ -59,55 +59,61 @@ inline __device__ void ShmemQuietThread(int pe) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Point-to-Point                                         */
 /* ---------------------------------------------------------------------------------------------- */
-#define DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Scope)                                            \
-  inline __device__ void ShmemPutMemNbi##Scope(                                                 \
-      const application::SymmMemObjPtr dest, size_t destOffset,                                 \
-      const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe) { \
-    DISPATCH_TRANSPORT_TYPE(ShmemPutMemNbi##Scope##Kernel, pe, dest, destOffset, source,        \
-                            sourceOffset, bytes, pe);                                           \
-  }                                                                                             \
-  inline __device__ void ShmemPutMemNbi##Scope(                                                 \
-      const application::SymmMemObjPtr dest, size_t destOffset,                                 \
-      const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe) {     \
-    int rank = GetGlobalGpuStatesPtr()->rank;                                                   \
-    ShmemPutMemNbi##Scope(dest, destOffset, source->GetRdmaMemoryRegion(rank), sourceOffset,    \
-                          bytes, pe);                                                           \
+#define DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Scope)                                          \
+  inline __device__ void ShmemPutMemNbi##Scope(                                               \
+      const application::SymmMemObjPtr dest, size_t destOffset,                               \
+      const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe, \
+      int qpId = 0) {                                                                         \
+    DISPATCH_TRANSPORT_TYPE(ShmemPutMemNbi##Scope##Kernel, pe, dest, destOffset, source,      \
+                            sourceOffset, bytes, pe, qpId);                                   \
+  }                                                                                           \
+  inline __device__ void ShmemPutMemNbi##Scope(                                               \
+      const application::SymmMemObjPtr dest, size_t destOffset,                               \
+      const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe,     \
+      int qpId = 0) {                                                                         \
+    int rank = GetGlobalGpuStatesPtr()->rank;                                                 \
+    ShmemPutMemNbi##Scope(dest, destOffset, source->GetRdmaMemoryRegion(rank), sourceOffset,  \
+                          bytes, pe, qpId);                                                   \
   }
 
 DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Warp)
 
-#define DEFINE_SHMEM_PUT_TYPE_NBI_API_TEMPLATE(Scope)                                            \
-  template <typename T>                                                                          \
-  inline __device__ void ShmemPutTypeNbi##Scope(                                                 \
-      const application::SymmMemObjPtr dest, size_t destElmOffset,                               \
-      const application::RdmaMemoryRegion& source, size_t srcElmOffset, size_t nelems, int pe) { \
-    constexpr size_t typeSize = sizeof(T);                                                       \
-    ShmemPutMemNbi##Scope(dest, destElmOffset * typeSize, source, srcElmOffset * typeSize,       \
-                          nelems * typeSize, pe);                                                \
-  }                                                                                              \
-  template <typename T>                                                                          \
-  inline __device__ void ShmemPutTypeNbi##Scope(                                                 \
-      const application::SymmMemObjPtr dest, size_t destElmOffset,                               \
-      const application::SymmMemObjPtr source, size_t srcElmOffset, size_t nelems, int pe) {     \
-    int rank = GetGlobalGpuStatesPtr()->rank;                                                    \
-    ShmemPutTypeNbi##Scope<T>(dest, destElmOffset, source->GetRdmaMemoryRegion(rank),            \
-                              srcElmOffset, nelems, pe);                                         \
+#define DEFINE_SHMEM_PUT_TYPE_NBI_API_TEMPLATE(Scope)                                          \
+  template <typename T>                                                                        \
+  inline __device__ void ShmemPutTypeNbi##Scope(                                               \
+      const application::SymmMemObjPtr dest, size_t destElmOffset,                             \
+      const application::RdmaMemoryRegion& source, size_t srcElmOffset, size_t nelems, int pe, \
+      int qpId = 0) {                                                                          \
+    constexpr size_t typeSize = sizeof(T);                                                     \
+    ShmemPutMemNbi##Scope(dest, destElmOffset * typeSize, source, srcElmOffset * typeSize,     \
+                          nelems * typeSize, pe, qpId);                                        \
+  }                                                                                            \
+  template <typename T>                                                                        \
+  inline __device__ void ShmemPutTypeNbi##Scope(                                               \
+      const application::SymmMemObjPtr dest, size_t destElmOffset,                             \
+      const application::SymmMemObjPtr source, size_t srcElmOffset, size_t nelems, int pe,     \
+      int qpId = 0) {                                                                          \
+    int rank = GetGlobalGpuStatesPtr()->rank;                                                  \
+    ShmemPutTypeNbi##Scope<T>(dest, destElmOffset, source->GetRdmaMemoryRegion(rank),          \
+                              srcElmOffset, nelems, pe, qpId);                                 \
   }
 
 DEFINE_SHMEM_PUT_TYPE_NBI_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_API_TEMPLATE(Warp)
 
-#define DEFINE_SHMEM_PUT_TYPE_NBI_API(TypeName, T, Scope)                                        \
-  inline __device__ void ShmemPut##TypeName##Nbi##Scope(                                         \
-      const application::SymmMemObjPtr dest, size_t destElmOffset,                               \
-      const application::RdmaMemoryRegion& source, size_t srcElmOffset, size_t nelems, int pe) { \
-    ShmemPutTypeNbi##Scope<T>(dest, destElmOffset, source, srcElmOffset, nelems, pe);            \
-  }                                                                                              \
-  inline __device__ void ShmemPut##TypeName##Nbi##Scope(                                         \
-      const application::SymmMemObjPtr dest, size_t destElmOffset,                               \
-      const application::SymmMemObjPtr source, size_t srcElmOffset, size_t nelems, int pe) {     \
-    ShmemPutTypeNbi##Scope<T>(dest, destElmOffset, source, srcElmOffset, nelems, pe);            \
+#define DEFINE_SHMEM_PUT_TYPE_NBI_API(TypeName, T, Scope)                                      \
+  inline __device__ void ShmemPut##TypeName##Nbi##Scope(                                       \
+      const application::SymmMemObjPtr dest, size_t destElmOffset,                             \
+      const application::RdmaMemoryRegion& source, size_t srcElmOffset, size_t nelems, int pe, \
+      int qpId = 0) {                                                                          \
+    ShmemPutTypeNbi##Scope<T>(dest, destElmOffset, source, srcElmOffset, nelems, pe, qpId);    \
+  }                                                                                            \
+  inline __device__ void ShmemPut##TypeName##Nbi##Scope(                                       \
+      const application::SymmMemObjPtr dest, size_t destElmOffset,                             \
+      const application::SymmMemObjPtr source, size_t srcElmOffset, size_t nelems, int pe,     \
+      int qpId = 0) {                                                                          \
+    ShmemPutTypeNbi##Scope<T>(dest, destElmOffset, source, srcElmOffset, nelems, pe, qpId);    \
   }
 
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint8, uint8_t, Thread)
@@ -133,31 +139,33 @@ DEFINE_SHMEM_PUT_TYPE_NBI_API(Float, float, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Double, double, Warp)
 
 // TODO: deal with bytes count limit
-#define SHMEM_PUT_SIZE_IMM_NBI_API(Scope)                                                          \
-  inline __device__ void ShmemPutSizeImmNbi##Scope(                                                \
-      const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe) { \
-    DISPATCH_TRANSPORT_TYPE(ShmemPutSizeImmNbi##Scope##Kernel, pe, dest, destOffset, val, bytes,   \
-                            pe);                                                                   \
+#define SHMEM_PUT_SIZE_IMM_NBI_API(Scope)                                                        \
+  inline __device__ void ShmemPutSizeImmNbi##Scope(const application::SymmMemObjPtr dest,        \
+                                                   size_t destOffset, void* val, size_t bytes,   \
+                                                   int pe, int qpId = 0) {                       \
+    DISPATCH_TRANSPORT_TYPE(ShmemPutSizeImmNbi##Scope##Kernel, pe, dest, destOffset, val, bytes, \
+                            pe, qpId);                                                           \
   }
 
 SHMEM_PUT_SIZE_IMM_NBI_API(Thread)
 SHMEM_PUT_SIZE_IMM_NBI_API(Warp)
 
-#define SHMEM_PUT_TYPE_IMM_NBI_API_TEMPLATE(Scope)                                        \
-  template <typename T>                                                                   \
-  inline __device__ void ShmemPutTypeImmNbi##Scope(const application::SymmMemObjPtr dest, \
-                                                   size_t destOffset, T val, int pe) {    \
-    static_assert(sizeof(T) <= core::MaxInlineDataSizePerWqe);                            \
-    ShmemPutSizeImmNbi##Scope(dest, destOffset, &val, sizeof(T), pe);                     \
+#define SHMEM_PUT_TYPE_IMM_NBI_API_TEMPLATE(Scope)                                             \
+  template <typename T>                                                                        \
+  inline __device__ void ShmemPutTypeImmNbi##Scope(                                            \
+      const application::SymmMemObjPtr dest, size_t destOffset, T val, int pe, int qpId = 0) { \
+    static_assert(sizeof(T) <= core::MaxInlineDataSizePerWqe);                                 \
+    ShmemPutSizeImmNbi##Scope(dest, destOffset, &val, sizeof(T), pe, qpId);                    \
   }
 
 SHMEM_PUT_TYPE_IMM_NBI_API_TEMPLATE(Thread)
 SHMEM_PUT_TYPE_IMM_NBI_API_TEMPLATE(Warp)
 
-#define DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(TypeName, T, Scope)                           \
-  inline __device__ void ShmemPut##TypeName##ImmNbi##Scope(                             \
-      const application::SymmMemObjPtr dest, size_t destOffset, uint32_t val, int pe) { \
-    ShmemPutTypeImmNbi##Scope<T>(dest, destOffset, val, pe);                            \
+#define DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(TypeName, T, Scope)                                     \
+  inline __device__ void ShmemPut##TypeName##ImmNbi##Scope(const application::SymmMemObjPtr dest, \
+                                                           size_t destOffset, uint32_t val,       \
+                                                           int pe, int qpId = 0) {                \
+    ShmemPutTypeImmNbi##Scope<T>(dest, destOffset, val, pe, qpId);                                \
   }
 
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint8, uint8_t, Thread)
@@ -182,33 +190,34 @@ DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int64, int64_t, Warp)
   inline __device__ void ShmemAtomicSizeNonFetch##Scope(                                          \
       const application::SymmMemObjPtr dest, size_t destOffset,                                   \
       const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, size_t bytes,  \
-      int pe, core::atomicType amoType) {                                                         \
+      core::atomicType amoType, int pe, int qpId = 0) {                                           \
     DISPATCH_TRANSPORT_TYPE(ShmemAtomicSizeNonFetch##Scope##Kernel, pe, dest, destOffset, source, \
-                            sourceOffset, val, bytes, pe, amoType);                               \
+                            sourceOffset, val, bytes, amoType, qpId);                             \
   }
 
 SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Thread)
 SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Warp)
 
-#define SHMEM_ATOMIC_TYPE_NONFETCH_API_TEMPLATE(Scope)                                          \
-  template <typename T>                                                                         \
-  inline __device__ void ShmemAtomicTypeNonFetch##Scope(                                        \
-      const application::SymmMemObjPtr dest, size_t destOffset,                                 \
-      const application::RdmaMemoryRegion& source, size_t sourceOffset, T val, int pe,          \
-      core::atomicType amoType) {                                                               \
-    ShmemAtomicSizeNonFetch##Scope(dest, destOffset, source, sourceOffset, &val, sizeof(T), pe, \
-                                   amoType);                                                    \
+#define SHMEM_ATOMIC_TYPE_NONFETCH_API_TEMPLATE(Scope)                                      \
+  template <typename T>                                                                     \
+  inline __device__ void ShmemAtomicTypeNonFetch##Scope(                                    \
+      const application::SymmMemObjPtr dest, size_t destOffset,                             \
+      const application::RdmaMemoryRegion& source, size_t sourceOffset, T val,              \
+      core::atomicType amoType, int pe, int qpId = 0) {                                     \
+    ShmemAtomicSizeNonFetch##Scope(dest, destOffset, source, sourceOffset, &val, sizeof(T), \
+                                   amoType, pe, qpId);                                      \
   }
 
 SHMEM_ATOMIC_TYPE_NONFETCH_API_TEMPLATE(Thread)
 SHMEM_ATOMIC_TYPE_NONFETCH_API_TEMPLATE(Warp)
 
-#define DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(TypeName, T, Scope)                                \
-  inline __device__ void ShmemAtomic##TypeName##NonFetch##Scope(                                 \
-      const application::SymmMemObjPtr dest, size_t destOffset,                                  \
-      const application::RdmaMemoryRegion& source, size_t sourceOffset, T val, int pe,           \
-      core::atomicType amoType) {                                                                \
-    ShmemAtomicTypeNonFetch##Scope<T>(dest, destOffset, source, sourceOffset, val, pe, amoType); \
+#define DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(TypeName, T, Scope)                               \
+  inline __device__ void ShmemAtomic##TypeName##NonFetch##Scope(                                \
+      const application::SymmMemObjPtr dest, size_t destOffset,                                 \
+      const application::RdmaMemoryRegion& source, size_t sourceOffset, T val,                  \
+      core::atomicType amoType, int pe, int qpId = 0) {                                         \
+    ShmemAtomicTypeNonFetch##Scope<T>(dest, destOffset, source, sourceOffset, val, amoType, pe, \
+                                      qpId);                                                    \
   }
 
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint32, uint32_t, Thread)
@@ -225,9 +234,9 @@ DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int64, int64_t, Warp)
   inline __device__ void ShmemAtomicSizeFetch##Scope(                                             \
       const application::SymmMemObjPtr dest, size_t destOffset,                                   \
       const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare, \
-      size_t bytes, int pe, core::atomicType amoType) {                                           \
+      size_t bytes, core::atomicType amoType, int pe, int qpId = 0) {                             \
     DISPATCH_TRANSPORT_TYPE(ShmemAtomicSizeFetch##Scope##Kernel, pe, dest, destOffset, source,    \
-                            sourceOffset, val, compare, bytes, pe, amoType);                      \
+                            sourceOffset, val, compare, bytes, amoType, pe, qpId);                \
   }
 
 SHMEM_ATOMIC_SIZE_FETCH_API_TEMPLATE(Thread)
@@ -237,10 +246,10 @@ SHMEM_ATOMIC_SIZE_FETCH_API_TEMPLATE(Warp)
   template <typename T>                                                                            \
   inline __device__ T ShmemAtomicTypeFetch##Scope(                                                 \
       const application::SymmMemObjPtr dest, size_t destOffset,                                    \
-      const application::RdmaMemoryRegion& source, size_t sourceOffset, T val, T compare, int pe,  \
-      core::atomicType amoType) {                                                                  \
+      const application::RdmaMemoryRegion& source, size_t sourceOffset, T val, T compare,          \
+      core::atomicType amoType, int pe, int qpId = 0) {                                            \
     ShmemAtomicSizeFetch##Scope(dest, destOffset, source, sourceOffset, &val, &compare, sizeof(T), \
-                                pe, amoType);                                                      \
+                                amoType, pe, qpId);                                                \
     uintptr_t fetchResultPtr = source.addr + sourceOffset;                                         \
     return core::AtomicLoadRelaxedSystem<T>(reinterpret_cast<T*>(fetchResultPtr));                 \
   }
@@ -248,13 +257,13 @@ SHMEM_ATOMIC_SIZE_FETCH_API_TEMPLATE(Warp)
 SHMEM_ATOMIC_TYPE_FETCH_API_TEMPLATE(Thread)
 SHMEM_ATOMIC_TYPE_FETCH_API_TEMPLATE(Warp)
 
-#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(TypeName, T, Scope)                                    \
-  inline __device__ T ShmemAtomic##TypeName##Fetch##Scope(                                        \
-      const application::SymmMemObjPtr dest, size_t destOffset,                                   \
-      const application::RdmaMemoryRegion& source, size_t sourceOffset, T val, T compare, int pe, \
-      core::atomicType amoType) {                                                                 \
-    return ShmemAtomicTypeFetch##Scope<T>(dest, destOffset, source, sourceOffset, val, compare,   \
-                                          pe, amoType);                                           \
+#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(TypeName, T, Scope)                                  \
+  inline __device__ T ShmemAtomic##TypeName##Fetch##Scope(                                      \
+      const application::SymmMemObjPtr dest, size_t destOffset,                                 \
+      const application::RdmaMemoryRegion& source, size_t sourceOffset, T val, T compare,       \
+      core::atomicType amoType, int pe, int qpId = 0) {                                         \
+    return ShmemAtomicTypeFetch##Scope<T>(dest, destOffset, source, sourceOffset, val, compare, \
+                                          amoType, pe, qpId);                                   \
   }
 
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint32, uint32_t, Thread)

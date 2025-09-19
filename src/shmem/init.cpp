@@ -66,6 +66,7 @@ void GpuStateInit() {
   GpuStates gpuStates;
   gpuStates.rank = rank;
   gpuStates.worldSize = worldSize;
+  gpuStates.numQpPerPe = rdmaStates->commContext->GetNumQpPerPe();
 
   // Copy transport types to GPU
   HIP_RUNTIME_CHECK(
@@ -76,13 +77,14 @@ void GpuStateInit() {
 
   // Copy endpoints to GPU
   if (rdmaStates->commContext->RdmaTransportEnabled()) {
+    size_t numEndpoints = gpuStates.worldSize * gpuStates.numQpPerPe;
     HIP_RUNTIME_CHECK(
-        hipMalloc(&gpuStates.rdmaEndpoints, sizeof(application::RdmaEndpoint) * worldSize));
+        hipMalloc(&gpuStates.rdmaEndpoints, sizeof(application::RdmaEndpoint) * numEndpoints));
     HIP_RUNTIME_CHECK(
         hipMemcpy(gpuStates.rdmaEndpoints, rdmaStates->commContext->GetRdmaEndpoints().data(),
-                  sizeof(application::RdmaEndpoint) * worldSize, hipMemcpyHostToDevice));
+                  sizeof(application::RdmaEndpoint) * numEndpoints, hipMemcpyHostToDevice));
 
-    size_t lockSize = worldSize * sizeof(uint32_t);
+    size_t lockSize = numEndpoints * sizeof(uint32_t);
     HIP_RUNTIME_CHECK(hipMalloc(&gpuStates.endpointLock, lockSize));
     HIP_RUNTIME_CHECK(hipMemset(gpuStates.endpointLock, 0, lockSize));
   }
