@@ -38,7 +38,8 @@ namespace shmem {
 template <>
 inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::P2P>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe) {
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe,
+    int qpId) {
   uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source.addr + sourceOffset);
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   core::ThreadCopy<uint8_t>(destPtr, srcPtr, bytes);
@@ -47,7 +48,8 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::P2
 template <>
 inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::P2P>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe) {
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe,
+    int qpId) {
   uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source.addr + sourceOffset);
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
@@ -55,7 +57,8 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::P2P>
 
 template <>
 inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::P2P>(
-    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe) {
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe,
+    int qpId) {
   uint8_t* srcPtr = reinterpret_cast<uint8_t*>(val);
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   switch (bytes) {
@@ -88,7 +91,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType
 
 template <>
 inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::P2P>(
-    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe) {
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe, int qpId) {
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0)
     ShmemPutSizeImmNbiThreadKernel<application::TransportType::P2P>(dest, destOffset, val, bytes,
@@ -99,7 +102,7 @@ template <>
 inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::P2P>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, size_t bytes,
-    core::atomicType amoType, int pe) {
+    core::atomicType amoType, int pe, int qpId) {
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   switch (bytes) {
     case 4: {
@@ -219,7 +222,7 @@ template <>
 inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportType::P2P>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, size_t bytes,
-    core::atomicType amoType, int pe) {
+    core::atomicType amoType, int pe, int qpId) {
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {
     ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::P2P>(
@@ -231,7 +234,7 @@ template <>
 inline __device__ void ShmemAtomicSizeFetchThreadKernel<application::TransportType::P2P>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare,
-    size_t bytes, core::atomicType amoType, int pe) {
+    size_t bytes, core::atomicType amoType, int pe, int qpId) {
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   switch (bytes) {
     case 4: {
@@ -379,7 +382,7 @@ template <>
 inline __device__ void ShmemAtomicSizeFetchWarpKernel<application::TransportType::P2P>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare,
-    size_t bytes, core::atomicType amoType, int pe) {
+    size_t bytes, core::atomicType amoType, int pe, int qpId) {
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {
     ShmemAtomicSizeFetchThreadKernel<application::TransportType::P2P>(
@@ -394,7 +397,7 @@ template <>
 inline __device__ void ShmemQuietThreadKernel<application::TransportType::P2P>() {}
 
 template <>
-inline __device__ void ShmemQuietThreadKernel<application::TransportType::P2P>(int pe) {}
+inline __device__ void ShmemQuietThreadKernel<application::TransportType::P2P>(int pe, int qpId) {}
 
 }  // namespace shmem
 }  // namespace mori
