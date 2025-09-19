@@ -52,7 +52,9 @@ namespace moe {
   size_t MaxNumTokensToRecvPerRank = config.MaxNumTokensToRecvPerRank(); \
   size_t MaxNumTokensToRecv = config.MaxNumTokensToRecv();               \
   int numExpertPerToken = config.numExpertPerToken;                      \
-  assert(numExpertPerToken < warpSize);
+  assert(numExpertPerToken < warpSize);                                  \
+  size_t hiddenBytes = config.hiddenDim * sizeof(T);                     \
+  size_t indexBytes = config.numExpertPerToken * sizeof(index_t);
 
 namespace dedup {
 template <typename T>
@@ -115,18 +117,20 @@ inline __device__ void DispatchSendInterNode(EpDispatchCombineArgs<T>& args, int
   destTokId = __shfl(destTokId, 0);
 
   // Copy to local staging buffer
-  size_t srcTokOffset = tokenId * config.hiddenDim;
-  size_t stagingTokOffset =
-      (destNode * config.MaxNumTokensToSendPerRank() + destTokId) * config.hiddenDim;
-  core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<T*>() + stagingTokOffset,
-                 args.inpTokenBuf + srcTokOffset, config.hiddenDim);
+  uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
+  size_t xferSize = hiddenBytes + indexBytes;
+  size_t stagingTokOffset = (destNode * config.MaxNumTokensToSendPerRank() + destTokId) * xferSize;
+  core::WarpCopy(stagingPtr + stagingTokOffset,
+                 reinterpret_cast<uint8_t*>(args.inpTokenBuf) + tokenId * hiddenBytes, hiddenBytes);
+  core::WarpCopy(stagingPtr + stagingTokOffset + hiddenBytes,
+                 reinterpret_cast<uint8_t*>(args.tokenIndices) + tokenId * indexBytes, indexBytes);
 
   // Copy to remote proxy's staging buffer
-  size_t remoteIdx = myNode * config.MaxNumTokensToRecvPerRank() + destTokId;
-  size_t remoteOffset = remoteIdx * config.hiddenDim;
-  shmem::ShmemPutTypeNbiWarp<T>(args.shmemInpTokMemObj, remoteOffset, args.shmemStagingTokMemObj,
-                                stagingTokOffset, config.hiddenDim, proxyPe);
+  // TODO: use ShmemPutTypeNbiWarp causes INVALID_ISA core, need to figure out why
   if (core::WarpLaneId1D() == 0) {
+    size_t remoteIdx = myNode * config.MaxNumTokensToRecvPerRank() + destTokId;
+    shmem::ShmemPutMemNbiThread(args.shmemInpTokMemObj, remoteIdx * xferSize,
+                                args.shmemStagingTokMemObj, stagingTokOffset, xferSize, proxyPe);
     shmem::ShmemPutInt32ImmNbiWarp(args.recvTokenFlagMemObj, remoteIdx * sizeof(index_t), 1,
                                    proxyPe);
   }
