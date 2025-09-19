@@ -80,6 +80,7 @@ struct ShmemStates {
 struct GpuStates {
   int rank{-1};
   int worldSize{-1};
+  int numQpPerPe{1};
   application::TransportType* transportTypes{nullptr};
   application::RdmaEndpoint* rdmaEndpoints{nullptr};
   uint32_t* endpointLock{nullptr};

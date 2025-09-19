@@ -24,6 +24,7 @@
 #include <hip/hip_runtime.h>
 #include <unistd.h>
 
+#include <cstdlib>
 #include <vector>
 
 #include "mori/application/utils/check.hpp"
@@ -130,6 +131,12 @@ void Context::InitializePossibleTransports() {
               << "[" << devicePortId << "] " << device->Name() << std::endl;
   }
 
+  int numQpPerPe = 1;
+  const char* envNumQp = std::getenv("MORI_NUM_QP_PER_PE");
+  if (envNumQp != nullptr) {
+    numQpPerPe = std::max(1, std::atoi(envNumQp));  // ensure at least 1 QP
+  }
+  this->numQpPerPe = numQpPerPe;
   // Initialize transport
   int peerRankInNode = -1;
   for (int i = 0; i < WorldSize(); i++) {
@@ -144,20 +151,24 @@ void Context::InitializePossibleTransports() {
 
         if ((i == LocalRank()) || canAccessPeer) {
           transportTypes.push_back(TransportType::P2P);
-          rdmaEps.push_back({});
+          for (int qp = 0; qp < numQpPerPe; qp++) {
+            rdmaEps.push_back({});
+          }
           continue;
         }
       }
     } else {
       if (i == LocalRank()) {
         transportTypes.push_back(TransportType::P2P);
-        rdmaEps.push_back({});
+        for (int qp = 0; qp < numQpPerPe; qp++) {
+          rdmaEps.push_back({});
+        }
         continue;
       }
     }
 
     if (rdmaDeviceContext.get() == nullptr) assert(false && "no rdma device found");
-
+    // Create multiple QPs for this peer
     application::RdmaEndpointConfig config;
     config.portId = portId;
     config.gidIdx = 3;
@@ -165,23 +176,37 @@ void Context::InitializePossibleTransports() {
     config.maxCqeNum = 4096;
     config.alignment = 4096;
     config.onGpu = true;
-    RdmaEndpoint ep = rdmaDeviceContext->CreateRdmaEndpoint(config);
-    rdmaEps.push_back(ep);
+    for (int qp = 0; qp < numQpPerPe; qp++) {
+      RdmaEndpoint ep = rdmaDeviceContext->CreateRdmaEndpoint(config);
+      rdmaEps.push_back(ep);
+    }
     transportTypes.push_back(TransportType::RDMA);
   }
 
   // All2All rdma eps
-  // Exchange endpoint handles
-  std::vector<RdmaEndpointHandle> localToPeerEpHandles(WorldSize());
-  std::vector<RdmaEndpointHandle> peerToLocalEpHandles(WorldSize());
-  for (int i = 0; i < WorldSize(); i++) localToPeerEpHandles[i] = rdmaEps[i].handle;
+  // Exchange endpoint handles (now with multiple QPs per peer)
+  int totalEps = WorldSize() * numQpPerPe;
+  std::vector<RdmaEndpointHandle> localToPeerEpHandles(totalEps);
+  std::vector<RdmaEndpointHandle> peerToLocalEpHandles(totalEps);
+
+  // Fill local endpoint handles
+  for (int i = 0; i < rdmaEps.size(); i++) {
+    localToPeerEpHandles[i] = rdmaEps[i].handle;
+  }
+
   bootNet.AllToAll(localToPeerEpHandles.data(), peerToLocalEpHandles.data(),
-                   sizeof(RdmaEndpointHandle));
+                   sizeof(RdmaEndpointHandle) * numQpPerPe);
 
   // Connect RDMA endpoints
-  for (int i = 0; i < WorldSize(); i++) {
-    if (transportTypes[i] != TransportType::RDMA) continue;
-    rdmaDeviceContext->ConnectEndpoint(localToPeerEpHandles[i], peerToLocalEpHandles[i]);
+  for (int peer = 0; peer < WorldSize(); peer++) {
+    if (transportTypes[peer] != TransportType::RDMA) {
+      continue;
+    }
+    for (int qp = 0; qp < numQpPerPe; qp++) {
+      int epIndex = peer * numQpPerPe + qp;
+      rdmaDeviceContext->ConnectEndpoint(localToPeerEpHandles[epIndex],
+                                         peerToLocalEpHandles[epIndex]);
+    }
   }
 }
 
