@@ -54,21 +54,19 @@ namespace moe {
   int numExpertPerToken = config.numExpertPerToken;                      \
   assert(numExpertPerToken < warpSize);                                  \
   size_t hiddenBytes = config.hiddenDim * sizeof(T);                     \
-  size_t indexBytes = config.numExpertPerToken * sizeof(index_t);
+  size_t indexBytes = config.numExpertPerToken * sizeof(index_t);        \
+  size_t xferBytes = hiddenBytes + indexBytes;
 
 namespace dedup {
 template <typename T>
 inline __device__ void DispatchSendIntraNode(EpDispatchCombineArgs<T>& args, int tokenId,
                                              int destPe, int lanePe, int expId) {
-  const EpDispatchCombineConfig& config = args.config;
+  IMPORT_COMMON_VARIABLES;
+
   index_t tokenExpertId = tokenId * args.config.numExpertPerToken + expId;
-  int condition = 0;
-  if ((core::WarpLaneId1D() < expId) && (destPe == lanePe)) {
-    condition = 1;
-  }
+  int condition = ((core::WarpLaneId1D() < expId) && (destPe == lanePe)) ? 1 : 0;
   if (__any(condition)) {  // Duplicated, skip sending
-    if (core::WarpLaneId1D() == 0)
-      args.dispDestTokIdMap[tokenExpertId] = config.MaxNumTokensToRecv();
+    if (core::WarpLaneId1D() == 0) args.dispDestTokIdMap[tokenExpertId] = MaxNumTokensToRecv;
     return;
   }
 
@@ -77,7 +75,7 @@ inline __device__ void DispatchSendIntraNode(EpDispatchCombineArgs<T>& args, int
     // decide token id in dest pe
     destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
     atomicAdd(args.destPeTokenCounter + destPe, 1);
-    args.dispDestTokIdMap[tokenExpertId] = destPe * config.MaxNumTokensToSendPerRank() + destTokId;
+    args.dispDestTokIdMap[tokenExpertId] = destPe * MaxNumTokensToSendPerRank + destTokId;
 
     // TODO: use a switch to control the writing of this buffer, should only turn on for testing
     args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
@@ -98,10 +96,7 @@ inline __device__ void DispatchSendInterNode(EpDispatchCombineArgs<T>& args, int
   index_t proxyPe = (config.rank % config.gpuPerNode) + destNode * config.gpuPerNode;
 
   index_t tokenExpertId = tokenId * args.config.numExpertPerToken + expId;
-  int condition = 0;
-  if ((core::WarpLaneId1D() < expId) && (destNode == laneNode)) {
-    condition = 1;
-  }
+  int condition = ((core::WarpLaneId1D() < expId) && (destNode == laneNode)) ? 1 : 0;
   if (__any(condition)) {  // Duplicated, skip sending
     if (core::WarpLaneId1D() == 0)
       args.dispDestTokIdMap[tokenExpertId] = config.MaxNumTokensToRecv();
@@ -118,22 +113,17 @@ inline __device__ void DispatchSendInterNode(EpDispatchCombineArgs<T>& args, int
 
   // Copy to local staging buffer
   uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
-  size_t xferSize = hiddenBytes + indexBytes;
-  size_t stagingTokOffset = (destNode * config.MaxNumTokensToSendPerRank() + destTokId) * xferSize;
+  size_t stagingTokOffset = (destNode * config.MaxNumTokensToSendPerRank() + destTokId) * xferBytes;
   core::WarpCopy(stagingPtr + stagingTokOffset,
                  reinterpret_cast<uint8_t*>(args.inpTokenBuf) + tokenId * hiddenBytes, hiddenBytes);
   core::WarpCopy(stagingPtr + stagingTokOffset + hiddenBytes,
                  reinterpret_cast<uint8_t*>(args.tokenIndices) + tokenId * indexBytes, indexBytes);
 
   // Copy to remote proxy's staging buffer
-  // TODO: use ShmemPutTypeNbiWarp causes INVALID_ISA core, need to figure out why
-  if (core::WarpLaneId1D() == 0) {
-    size_t remoteIdx = myNode * config.MaxNumTokensToRecvPerRank() + destTokId;
-    shmem::ShmemPutMemNbiThread(args.shmemInpTokMemObj, remoteIdx * xferSize,
-                                args.shmemStagingTokMemObj, stagingTokOffset, xferSize, proxyPe);
-    shmem::ShmemPutInt32ImmNbiWarp(args.recvTokenFlagMemObj, remoteIdx * sizeof(index_t), 1,
-                                   proxyPe);
-  }
+  size_t remoteIdx = (myNode * config.MaxNumTokensToRecvPerRank() + size_t(destTokId));
+  // shmem::ShmemPutMemNbiWarp(args.shmemInpTokMemObj, stagingTokOffset, args.shmemStagingTokMemObj,
+  //                           remoteIdx * xferBytes, xferBytes, proxyPe);
+  shmem::ShmemPutInt32ImmNbiWarp(args.recvTokenFlagMemObj, remoteIdx * sizeof(index_t), 1, proxyPe);
 }
 
 template <typename T>
@@ -207,29 +197,22 @@ inline __device__ void DispatchRecvPhase(EpDispatchCombineArgs<T>& args) {
 
   // Warp-0 polling on recv token flags and producer tasks
   if (warpId == 0) {
-    int totalFlags = nNodes * config.MaxNumTokensToRecvPerRank();
+    int totalFlags = nNodes * MaxNumTokensToRecvPerRank;
     index_t* recvTokenFlags = args.recvTokenFlagMemObj->template GetAs<index_t*>();
     for (int i = blockId * warpSize + laneId; i < totalFlags; i += config.blockNum * warpSize) {
-      int node = i / config.MaxNumTokensToRecvPerRank();
-      int tokenIdx = i % config.MaxNumTokensToRecvPerRank();
+      int node = i / MaxNumTokensToRecvPerRank;
+      int tokenIdx = i % MaxNumTokensToRecvPerRank;
       bool finished = (node == myNode);
       while (true) {
         index_t nodeRecvTokenNum =
             core::AtomicLoadRelaxed(args.nodeRecvTokenNumMemObj->template GetAs<index_t*>() + node);
-        // finished |= (nodeRecvTokenNum > 0);
         finished |= (nodeRecvTokenNum > 0) && (tokenIdx > (nodeRecvTokenNum - 2));
         if (core::AtomicLoadRelaxed(recvTokenFlags + i)) {
           finished = true;
           uint32_t mySlot = atomicAdd(&slotIdx, 1);
           tokenIndex[mySlot] = i;
           atomicAdd(&producer, 1);
-          printf("mype %d recv token from node %d tokenIdx %d\n", myPe, node, tokenIdx);
         }
-        // else {
-        //   index_t nodeRecvTokenNum = core::AtomicLoadRelaxed(
-        //       args.nodeRecvTokenNumMemObj->template GetAs<index_t*>() + node);
-        //   finished |= (nodeRecvTokenNum > 0) && (tokenIdx > (nodeRecvTokenNum - 2));
-        // }
         if (__all(finished)) break;
       }
     }
@@ -262,23 +245,7 @@ template <typename T>
 inline __device__ void DispatchSyncIntraNode(EpDispatchCombineArgs<T>& args) {
   IMPORT_COMMON_VARIABLES;
 
-  // if (core::WarpLaneId1D() == 0) atomicAdd(args.dispatchGridBarrier, 1);
   int nodePeOffset = myNode * config.gpuPerNode;
-  // // Send token num & token to expert mapping to other ranks
-  // if (globalWarpId == 0) {
-  //   for (int destPe = nodePeOffset + laneId; destPe < (nodePeOffset + config.gpuPerNode);
-  //        destPe += warpSize) {
-  //     // Wait until all tokens are sent
-  //     shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
-  //     args.dispatchGridBarrier[0] = 0;
-
-  //     // Add 1 so that when token number == 0, receiver side still know the signal is sent
-  //     index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
-  //     index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
-  //     shmem::ShmemInt32WaitUntilEquals(signal, 0);
-  //     core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
-  //   }
-  // }
 
   // Each warp wait until sender finished by waiting token number signal
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
