@@ -146,6 +146,11 @@ class EpDispatchCombineTestCase:
                 indices[i] = perm[: self.config.num_experts_per_token]
             all_rank_indices.append(indices.to(torch.int32).to(self.device))
 
+        # num_total_experts = self.config.num_experts_per_rank * self.config.world_size
+        # all_indices = torch.cat(all_rank_indices, dim=0).reshape(-1)
+        # expert_counts = torch.bincount(all_indices, minlength=num_total_experts)
+        # print("Expert counts:", expert_counts)
+
         # even_indices = (
         #     torch.arange(
         #         self.config.max_num_inp_token_per_rank
@@ -228,7 +233,7 @@ class EpDispatchCombineTestCase:
             all_rank_scales[self.rank],
             all_rank_indices[self.rank],
             block_num=80,
-            warp_per_block=16,
+            warp_per_block=4,
         )
         torch.cuda.synchronize()
         dist.barrier()
@@ -364,6 +369,8 @@ class EpDispatchCombineTestCase:
             all_rank_weights[self.rank],
             all_rank_scales[self.rank],
             all_rank_indices[self.rank],
+            block_num=80,
+            warp_per_block=4,
         )
         end_event.record()
         torch.cuda.synchronize()
