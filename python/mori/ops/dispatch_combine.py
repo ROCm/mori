@@ -47,6 +47,7 @@ class EpDispatchCombineConfig:
     block_num: int = 80
     use_external_inp_buf: bool = True
     kernel_type: EpDispatchCombineKernelType = EpDispatchCombineKernelType.IntraNode
+    gpu_per_node: int = 8
 
 
 def _cpp_dispatch_combine_factory(entity_name):
@@ -72,6 +73,7 @@ class EpDispatchCombineOp:
                 warp_num_per_block=config.warp_num_per_block,
                 block_num=config.block_num,
                 use_external_inp_buf=config.use_external_inp_buf,
+                gpu_per_node=config.gpu_per_node,
             )
         )
 
@@ -176,7 +178,10 @@ class EpDispatchCombineOp:
     def get_dispatch_src_token_pos(self):
         torch.cuda.synchronize()
 
-        if self.config.kernel_type.value == EpDispatchCombineKernelType.IntraNode.value:
+        if self.config.kernel_type.value in (
+            EpDispatchCombineKernelType.IntraNode.value,
+            EpDispatchCombineKernelType.InterNodeDedup.value,
+        ):
             return self._get_dispatch_src_token_pos_func(self._handle)
 
         dispatch_sender_token_id_map = self._get_dispatch_sender_token_idx_map_func(
