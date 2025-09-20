@@ -49,7 +49,7 @@ class EpDispatchCombineTestCase:
             block_num=64,
             max_token_type_size=2,
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeDedup,
-            gpu_per_node=4,
+            gpu_per_node=8,
         )
 
     def setup(self):
