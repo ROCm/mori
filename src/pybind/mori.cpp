@@ -68,11 +68,11 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
                           input.size(0));
   handle.LaunchDispatch((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
                         at::cuda::getCurrentHIPStream());
-
-  torch::Tensor out =
-      torch::from_blob(handle.shmemOutTokMemObj->Get(),
-                       {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
-                       torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA));
+  torch::Tensor out = torch::from_blob(
+      kernelType == mori::moe::KernelType::InterNodeNormal ? handle.outTokenBuf
+                                                           : handle.shmemOutTokMemObj->Get(),
+      {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
+      torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA));
 
   std::optional<torch::Tensor> outWeights{std::nullopt};
   if (weightPtr) {

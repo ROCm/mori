@@ -123,7 +123,7 @@ class EpDispatchCombineHandle {
                         uint8_t* scales, index_t* tokenIndices, index_t numToken) {
     this->inputType = inputType;
     this->inpTokenBuf = input;
-    this->outTokenBuf = output;
+    // this->outTokenBuf = output;
     this->weightsBuf = weights;
     this->scalesBuf = scales;
     this->tokenIndices = tokenIndices;
