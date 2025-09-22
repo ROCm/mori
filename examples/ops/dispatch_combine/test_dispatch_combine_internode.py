@@ -49,7 +49,7 @@ class EpDispatchCombineTestCase:
             block_num=64,
             max_token_type_size=2,
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeDedup,
-            gpu_per_node=8,
+            gpu_per_node=self.gpu_per_node,
         )
 
     def setup(self):
@@ -370,7 +370,7 @@ class EpDispatchCombineTestCase:
             all_rank_scales[self.rank],
             all_rank_indices[self.rank],
             block_num=80,
-            warp_per_block=4,
+            warp_per_block=8,
         )
         end_event.record()
         torch.cuda.synchronize()
@@ -396,23 +396,24 @@ class EpDispatchCombineTestCase:
         total_bytes = total_recv_num_token * self.config.hidden_dim * element_size
         disp_bandwidth = total_bytes / (1000**3) / (disp_duration / (10**3))
 
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         dist.barrier()
-        start_event.record()
+        # start_event.record()
         combine_output, _ = op.combine(
             dispatch_output,
             None,
             all_rank_indices[self.rank],
             call_reset=False,
         )
-        end_event.record()
+        # end_event.record()
         torch.cuda.synchronize()
-        comb_duration = start_event.elapsed_time(end_event)
-        comb_bandwidth = total_bytes / (1000**3) / (comb_duration / (10**3))
+        # comb_duration = start_event.elapsed_time(end_event)
+        # comb_bandwidth = total_bytes / (1000**3) / (comb_duration / (10**3))
 
-        op.reset()
-        torch.cuda.synchronize()
-        return disp_duration, disp_bandwidth, comb_duration, comb_bandwidth
+        # op.reset()
+        # torch.cuda.synchronize()
+        # return disp_duration, disp_bandwidth, comb_duration, comb_bandwidth
+        return disp_duration, disp_bandwidth, float(0), float(0)
 
     def bench_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
@@ -439,7 +440,7 @@ class EpDispatchCombineTestCase:
             len(error_round) == 0
         ), f"Warmup failed with errors in rounds: {error_round}"
 
-        for i in range(0):
+        for i in range(10):
             if self.rank == 0:
                 print(f"Round {i} begin")
             disp_duration, disp_bandwidth, comb_duration, comb_bandwidth = (
