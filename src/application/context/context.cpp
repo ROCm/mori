@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "mori/application/utils/check.hpp"
+#include "mori/utils/mori_log.hpp"
 
 namespace mori {
 namespace application {
@@ -50,6 +51,13 @@ void Context::CollectHostNames() {
 
   for (int i = 0; i < WorldSize(); i++) {
     hostnames.push_back(&globalHostNames.data()[i * HOST_NAME_MAX]);
+  }
+
+  if (LocalRank() == 0) {
+    MORI_APP_INFO("Collected hostnames:");
+    for (int i = 0; i < hostnames.size(); i++) {
+      MORI_APP_INFO("  rank {}: {}", i, hostnames[i]);
+    }
   }
 }
 

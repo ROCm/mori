@@ -6,6 +6,7 @@ target_include_directories(mori_shmem PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(
   mori_shmem
   mori_application
+  mori_logging
   MPI::MPI_CXX
   ibverbs
   hip::host
