@@ -21,6 +21,8 @@
 // SOFTWARE.
 #pragma once
 
+#include <mutex>
+
 // Include the new centralized logging system
 #include "mori/utils/mori_log.hpp"
 
@@ -29,9 +31,21 @@ namespace io {
 
 // Legacy SetLogLevel function for backward compatibility
 inline void SetLogLevel(const std::string& strLevel) {
-  SetModuleLogLevel(modules::IO, strLevel);
-  MORI_IO_INFO("Set MORI-IO log level to {}", strLevel);
+  try {
+    InitializeLoggingFromEnv();
+  } catch (...) {
+  }
+  
+  ForceSetModuleLogLevel(modules::IO, strLevel);
+  
+  auto logger = mori::ModuleLogger::GetInstance().GetLogger(modules::IO);
+  if (logger) {
+    logger->info("Set MORI-IO log level to {}", strLevel);
+  }
 }
+
+// Legacy ScopedTimer - redirect to new implementation
+using ScopedTimer = mori::ScopedTimer;
 
 // Legacy ScopedTimer - redirect to new implementation
 using ScopedTimer = mori::ScopedTimer;

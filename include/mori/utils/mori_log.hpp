@@ -69,15 +69,32 @@ class ModuleLogger {
  public:
 
   // Initialize a module-specific logger
-  void InitModule(const std::string& moduleName, Level level = Level::INFO) {
-    auto logger = spdlog::stdout_color_mt(moduleName);
+  void InitModule(const std::string& moduleName, Level level = Level::ERROR) {
+    // Check if logger already exists
+    auto existing_logger = spdlog::get(moduleName);
+    std::shared_ptr<spdlog::logger> logger;
+    
+    if (existing_logger) {
+      // Use existing logger
+      logger = existing_logger;
+    } else {
+      // Create new logger
+      logger = spdlog::stdout_color_mt(moduleName);
+      logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%n] [%^%l%$] %v");
+    }
     
     // Determine the log level priority: env var > global setting > provided level
     Level finalLevel = level;
     
     // Check environment variable first
-    std::string envVar = "MORI_" + moduleName + "_LOG_LEVEL";
-    std::transform(envVar.begin(), envVar.end(), envVar.begin(), ::toupper);
+    std::string envVar;
+    if (moduleName == "application") {
+      // Use abbreviated form for APPLICATION module
+      envVar = "MORI_APP_LOG_LEVEL";
+    } else {
+      envVar = "MORI_" + moduleName + "_LOG_LEVEL";
+      std::transform(envVar.begin(), envVar.end(), envVar.begin(), ::toupper);
+    }
     const char* envLevel = std::getenv(envVar.c_str());
     
     if (envLevel) {
@@ -89,7 +106,6 @@ class ModuleLogger {
     }
     
     logger->set_level(ConvertLevel(finalLevel));
-    logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%n] [%^%l%$] %v");
     loggers_[moduleName] = logger;
   }
 
@@ -174,13 +190,16 @@ class ModuleLogger {
 
   // Convert string to level
   Level LevelFromString(const std::string& strLevel) {
-    if (strLevel == "trace") return Level::TRACE;
-    if (strLevel == "debug") return Level::DEBUG;
-    if (strLevel == "info") return Level::INFO;
-    if (strLevel == "warn") return Level::WARN;
-    if (strLevel == "error") return Level::ERROR;
-    if (strLevel == "critical") return Level::CRITICAL;
-    return Level::INFO;
+    std::string lower_level = strLevel;
+    std::transform(lower_level.begin(), lower_level.end(), lower_level.begin(), ::tolower);
+    
+    if (lower_level == "trace") return Level::TRACE;
+    if (lower_level == "debug") return Level::DEBUG;
+    if (lower_level == "info") return Level::INFO;
+    if (lower_level == "warn") return Level::WARN;
+    if (lower_level == "error") return Level::ERROR;
+    if (lower_level == "critical") return Level::CRITICAL;
+    return Level::ERROR;
   }
 
   // Allow access to loggers for advanced configuration
@@ -191,7 +210,7 @@ class ModuleLogger {
  private:
   std::unordered_map<std::string, std::shared_ptr<spdlog::logger>> loggers_;
   std::unordered_map<std::string, Level> envOverrides_;  // Track env variable overrides
-  Level globalLevel_ = Level::INFO;
+  Level globalLevel_ = Level::ERROR;
   bool globalLevelSet_ = false;
 
   spdlog::level::level_enum ConvertLevel(Level level) {
@@ -203,7 +222,7 @@ class ModuleLogger {
       case Level::ERROR: return spdlog::level::err;
       case Level::CRITICAL: return spdlog::level::critical;
     }
-    return spdlog::level::info;
+    return spdlog::level::err;
   }
 };
 
@@ -295,7 +314,7 @@ class ScopedTimer {
 inline void InitializeLogging() {
   auto& logger = ModuleLogger::GetInstance();
   
-  // Initialize all modules with default INFO level
+  // Initialize all modules with default ERROR level
   logger.InitModule(modules::APPLICATION);
   logger.InitModule(modules::IO);
   logger.InitModule(modules::SHMEM);
