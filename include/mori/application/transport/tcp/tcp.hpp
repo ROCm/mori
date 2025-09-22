@@ -81,6 +81,16 @@ class TCPContext {
   TCPEndpointHandle Connect(std::string remote, uint16_t port);
   TCPEndpointHandleVec Accept();
   void CloseEndpoint(TCPEndpointHandle);
+  void CloseFd(int fd) {
+    if (fd < 0) return;
+    auto it = endpoints.find(fd);
+    if (it != endpoints.end()) {
+      CloseEndpoint(it->second);
+    } else {
+      // best effort close of unknown fd
+      ::close(fd);
+    }
+  }
 
  public:
   TCPContextHandle handle;

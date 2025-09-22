@@ -310,7 +310,7 @@ void TcpBackend::ServiceLoop() {
       TcpMessageHeader hdr{};
       ssize_t r = ::recv(fd, &hdr, sizeof(hdr), MSG_WAITALL);
       if (r != sizeof(hdr)) {
-        ::close(fd);
+        ctx->CloseFd(fd);
         continue;
       }
       if (hdr.opcode == 0 || hdr.opcode == 1) {  // read or write
@@ -319,7 +319,7 @@ void TcpBackend::ServiceLoop() {
           std::lock_guard<std::mutex> lock(memMu);
           auto it = localMems.find(hdr.mem_id);
           if (it == localMems.end()) {
-            ::close(fd);
+            ctx->CloseFd(fd);
             continue;
           }
           target = it->second;
@@ -332,7 +332,7 @@ void TcpBackend::ServiceLoop() {
             const void* devPtr = reinterpret_cast<const void*>(target.data + hdr.offset);
             if (hipMemcpy(hostBuf, devPtr, hdr.size, hipMemcpyDeviceToHost) != hipSuccess) {
               bufferPool.Release(std::move(bufBlock));
-              ::close(fd);
+              ctx->CloseFd(fd);
               continue;
             }
           } else {
@@ -352,14 +352,14 @@ void TcpBackend::ServiceLoop() {
           ssize_t r2 = ::recv(fd, hostBuf, hdr.size, MSG_WAITALL);
           if (r2 != (ssize_t)hdr.size) {
             bufferPool.Release(std::move(bufBlock));
-            ::close(fd);
+            ctx->CloseFd(fd);
             continue;
           }
           if (targetIsGpu) {
             void* devPtr = reinterpret_cast<void*>(target.data + hdr.offset);
             if (hipMemcpy(devPtr, hostBuf, hdr.size, hipMemcpyHostToDevice) != hipSuccess) {
               bufferPool.Release(std::move(bufBlock));
-              ::close(fd);
+              ctx->CloseFd(fd);
               continue;
             }
           } else {
@@ -377,7 +377,7 @@ void TcpBackend::ServiceLoop() {
         }
         break;
       } else {
-        ::close(fd);
+        ctx->CloseFd(fd);
       }
     }
   }
