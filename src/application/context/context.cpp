@@ -21,10 +21,16 @@
 // SOFTWARE.
 #include "mori/application/context/context.hpp"
 
+#include <arpa/inet.h>
 #include <hip/hip_runtime.h>
+#include <ifaddrs.h>
+#include <netdb.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <cstdlib>
+#include <iostream>
+#include <string>
 #include <vector>
 
 #include "mori/application/utils/check.hpp"
@@ -40,18 +46,60 @@ Context::Context(BootstrapNetwork& bootNet) : bootNet(bootNet) {
 
 Context::~Context() {}
 
+std::string GetLocalIP() {
+  struct ifaddrs *ifaddr, *ifa;
+  char host[NI_MAXHOST];
+  std::string localIP = "127.0.0.1";
+
+  if (getifaddrs(&ifaddr) == -1) {
+    perror("getifaddrs");
+    return localIP;
+  }
+
+  for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+    if (ifa->ifa_addr == NULL) continue;
+
+    if (ifa->ifa_addr->sa_family == AF_INET) {
+      int s = getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in), host, NI_MAXHOST, NULL, 0,
+                          NI_NUMERICHOST);
+      if (s != 0) {
+        continue;
+      }
+
+      if (strcmp(host, "127.0.0.1") == 0) {
+        continue;
+      }
+
+      localIP = host;
+      break;
+    }
+  }
+
+  freeifaddrs(ifaddr);
+  return localIP;
+}
+
 std::string Context::HostName() const { return hostnames[LocalRank()]; }
 
 void Context::CollectHostNames() {
   char hostname[HOST_NAME_MAX];
   gethostname(hostname, HOST_NAME_MAX);
 
-  // char globalHostNames[HOST_NAME_MAX * WorldSize()];
-  std::vector<char> globalHostNames(HOST_NAME_MAX * WorldSize());
-  bootNet.Allgather(hostname, globalHostNames.data(), HOST_NAME_MAX);
+  std::string localIP = GetLocalIP();
+  std::string hostIdentifier = std::string(hostname) + ":" + localIP;
+
+  constexpr int IDENTIFIER_MAX = HOST_NAME_MAX + INET_ADDRSTRLEN;
+  std::vector<char> globalIdentifiers(IDENTIFIER_MAX * WorldSize());
+  
+  // Create a non-const buffer for Allgather
+  char localBuffer[IDENTIFIER_MAX];
+  strncpy(localBuffer, hostIdentifier.c_str(), IDENTIFIER_MAX - 1);
+  localBuffer[IDENTIFIER_MAX - 1] = '\0';
+  
+  bootNet.Allgather(localBuffer, globalIdentifiers.data(), IDENTIFIER_MAX);
 
   for (int i = 0; i < WorldSize(); i++) {
-    hostnames.push_back(&globalHostNames.data()[i * HOST_NAME_MAX]);
+    hostnames.push_back(&globalIdentifiers.data()[i * IDENTIFIER_MAX]);
   }
 
   if (LocalRank() == 0) {
