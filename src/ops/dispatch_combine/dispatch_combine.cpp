@@ -143,7 +143,7 @@ void EpDispatchCombineHandle::InitializeNormalKernelBuf() {
   HIP_RUNTIME_CHECK(hipMalloc(&localPeBuf, localPeBufSize));
   HIP_RUNTIME_CHECK(hipMemset(localPeBuf, 0, localPeBufSize));
 
-  const size_t syncCounterSize = config.blockNum * config.worldSize * sizeof(uint64_t);
+  const size_t syncCounterSize = channelNum * config.worldSize * sizeof(uint64_t);
   // rdmaHeadMemObj = ShmemMallocAndReturnMemObjPtr(syncCounterSize, hipDeviceMallocUncached);
   // rdmaTailMemObj = ShmemMallocAndReturnMemObjPtr(syncCounterSize, hipDeviceMallocUncached);
   // p2pHeadMemObj = ShmemMallocAndReturnMemObjPtr(syncCounterSize, hipDeviceMallocUncached);
@@ -155,8 +155,8 @@ void EpDispatchCombineHandle::InitializeNormalKernelBuf() {
   HIP_RUNTIME_CHECK(hipMalloc(&localTail, syncCounterSize));
   HIP_RUNTIME_CHECK(hipMemset(localTail, 0, syncCounterSize));
 
-  intraNodeBarrierMemObj =
-      ShmemMallocAndReturnMemObjPtr(config.worldSize * sizeof(int), hipDeviceMallocUncached);
+  intraNodeBarrierMemObj = ShmemMallocAndReturnMemObjPtr(
+      channelNum * config.worldSize * sizeof(int), hipDeviceMallocUncached);
 }
 
 void EpDispatchCombineHandle::FinalizeNormalKernelBuf() {
@@ -315,3 +315,4 @@ void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) { crossDeviceBarri
 
 }  // namespace moe
 }  // namespace mori
+

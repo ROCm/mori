@@ -177,13 +177,12 @@ class EpDispatchCombineOp:
     def get_dispatch_src_token_pos(self):
         torch.cuda.synchronize()
 
-        if self.config.kernel_type.value == EpDispatchCombineKernelType.IntraNode.value:
+        if (
+            self.config.kernel_type.value == EpDispatchCombineKernelType.IntraNode.value
+            or self.config.kernel_type.value
+            == EpDispatchCombineKernelType.InterNodeNormal.value
+        ):
             return self._get_dispatch_src_token_pos_func(self._handle)
-        # elif (
-        #     self.config.kernel_type.value
-        #     == EpDispatchCombineKernelType.InterNodeNormal.value
-        # ):
-        #     return
 
         dispatch_sender_token_id_map = self._get_dispatch_sender_token_idx_map_func(
             self._handle
@@ -233,3 +232,4 @@ class EpDispatchCombineOp:
             src_token_pos.append(src_pe * max_num_token_to_send_per_rank + src_tok_id)
 
         return torch.tensor(src_token_pos, dtype=torch.int)
+
