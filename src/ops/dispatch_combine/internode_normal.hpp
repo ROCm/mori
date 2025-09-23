@@ -27,7 +27,7 @@
 
 namespace mori {
 namespace moe {
-#define DEBUG 1
+#define DEBUG 0
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpDispatchInterNodeNormalKernel                             */
@@ -185,10 +185,10 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           srcStagingOffset = __shfl(srcStagingOffset, destNode);
           dstStagingOffset = __shfl(dstStagingOffset, destNode);
 #if DEBUG == 1
-          // if (laneId == 0) {
-          //   assert(float(*((T*)(args.shmemStagingTokMemObj->template GetAs<char*>() +
-          //                      srcStagingOffset) + 1)) == float(myPe + 1));
-          // }
+          if (laneId == 0) {
+            assert(float(*((T*)(args.shmemStagingTokMemObj->template GetAs<char*>() +
+                               srcStagingOffset) + 1)) == float(myPe + 1));
+          }
 #endif
           if (destNode == myNode) {
             core::WarpCopy(args.shmemInpTokMemObj->template GetAs<char*>(destPe) + dstStagingOffset,
@@ -215,15 +215,19 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
               __hip_atomic_store(
                   args.tailMemObj->template GetAs<uint64_t*>(destPe) + myPe + channelId * npes,
                   tailCache, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-              // printf(
-              //     "rank=%d warpId=%d destPe=%d tail=%lu offset=%d\n", myPe, warpId, destPe,
-              //     *(args.tailMemObj->template GetAs<uint64_t*>(destPe) + myPe + channelId * npes),
-              //     myPe + channelId * npes);
+#if DEBUG == 1
+              printf(
+                  "rank=%d warpId=%d destPe=%d tail=%lu offset=%d\n", myPe, warpId, destPe,
+                  *(args.tailMemObj->template GetAs<uint64_t*>(destPe) + myPe + channelId * npes),
+                  myPe + channelId * npes);
+#endif
             } else {
               shmem::ShmemPutUint64ImmNbiThread(
                   args.tailMemObj, (myPe + channelId * npes) * sizeof(uint64_t), tailCache, destPe);
-              // printf("rank=%d warpId=%d destPe=%d tail=%lu offset=%d\n", myPe, warpId, destPe,
-              //        tailCache, myPe + channelId * npes);
+#if DEBUG == 1
+              printf("rank=%d warpId=%d destPe=%d tail=%lu offset=%d\n", myPe, warpId, destPe,
+                     tailCache, myPe + channelId * npes);
+#endif
             }
           }
         }
@@ -293,11 +297,11 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             *(reinterpret_cast<size_t*>(args.shmemStagingTokMemObj->template GetAs<char*>() +
                                         stagingOffset)) = myPe * maxNumInpTokenPerRank + tokenIdx;
 #if DEBUG == 1
-            // assert(float(*((T*)(args.shmemStagingTokMemObj->template GetAs<char*>() +
-            //                     ((channelId * nNodes + node) * maxRDMAStagingTokens +
-            //                      tail % maxRDMAStagingTokens) *
-            //                         tokenPackBytes) +
-            //                1)) == (float)(myPe + 1));
+            assert(float(*((T*)(args.shmemStagingTokMemObj->template GetAs<char*>() +
+                                ((channelId * nNodes + node) * maxRDMAStagingTokens +
+                                 tail % maxRDMAStagingTokens) *
+                                    tokenPackBytes) +
+                           1)) == (float)(myPe + 1));
 #endif
           }
         }
@@ -405,13 +409,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             localTokenIdx = __shfl(localTokenIdx, 0);
             // TODO abstrct into a function
             char* dstPtr = reinterpret_cast<char*>(args.outTokenBuf) + localTokenIdx * tokenBytes;
-            if (laneId == 0 && myPe == 1)
-              printf("BEFORE rank=%d laneId=%d fwd localTokenIdx=%d dst=%p val1=%f\n", myPe, laneId,
-                     localTokenIdx, dstPtr, float(args.outTokenBuf[1]));
             core::WarpCopy(dstPtr, srcPtr, tokenBytes);
-            if (laneId == 0 && myPe == 1)
-              printf("AFTER rank=%d laneId=%d fwd localTokenIdx=%d dst=%p val1=%f\n", myPe, laneId,
-                     localTokenIdx, dstPtr, float(args.outTokenBuf[1]));
             srcPtr += tokenBytes;
             if (weightBytes) {
               core::WarpCopy(
@@ -434,31 +432,10 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
               args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[localTokenIdx] =
                   *(reinterpret_cast<index_t*>(srcPtr));
 #if DEBUG == 1
-              int offset = 1;
-              // if (myPe == 0) {
-                printf(
-                    "rank %d localTokenIdx=%d srcPe=%d meta=%d maxNumInpTokenPerRank=%zu expect=%f "
-                    "output_first=%f output_last=%f ptr=%p\n",
-                    myPe, localTokenIdx, srcPe, *(reinterpret_cast<index_t*>(srcPtr)),
-                    maxNumInpTokenPerRank,
-                    (float)(*(reinterpret_cast<size_t*>(srcPtr)) / maxNumInpTokenPerRank + 1),
-                    float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
-                                 localTokenIdx * tokenBytes))),
-                    float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
-                                 localTokenIdx * tokenBytes) +
-                            offset)),
-                    (T*)(reinterpret_cast<char*>(args.outTokenBuf) + localTokenIdx * tokenBytes));
-              // }
-              // assert(float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
-              //                     localTokenIdx * tokenBytes) +
-              //                offset)) ==
-              //        (float)(*(reinterpret_cast<size_t*>(srcPtr)) / maxNumInpTokenPerRank + 1));
-              // if (myPe == 1) {
-              //   int tmp=myPe;
-              //   while(tmp < npes) {
-              //     //
-              //   }
-              // }
+              assert(float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
+                                  localTokenIdx * tokenBytes) +
+                             offset)) ==
+                     (float)(*(reinterpret_cast<size_t*>(srcPtr)) / maxNumInpTokenPerRank + 1));
 #endif
             }
           } else {
@@ -471,14 +448,17 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           ++p2pTailCache, ++fwdCounter;
         }
         __threadfence_system();
+        // TODO add content in comment
         if (laneId == 0 && fwdPe != myPe /*&&
             (numTokensToRecv == 0 || p2pTailCache - lastP2pTail >= maxNumP2pSendTokens)*/) {
           __hip_atomic_store(
               args.tailMemObj->template GetAs<uint64_t*>(fwdPe) + channelId * npes + myPe,
               p2pTailCache, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
           lastP2pTail = p2pTailCache;
-          // printf("rank=%d warpId=%d fwdPe=%d p2p tail=%lu\n", myPe, warpId, fwdPe,
-          //        *(args.tailMemObj->template GetAs<uint64_t*>(fwdPe) + channelId * npes + myPe));
+#if DEBUG == 1
+          printf("rank=%d warpId=%d fwdPe=%d p2p tail=%lu\n", myPe, warpId, fwdPe,
+                 *(args.tailMemObj->template GetAs<uint64_t*>(fwdPe) + channelId * npes + myPe));
+#endif
         }
         if (laneId == srcNode) {
           headCache = tailCache;
@@ -557,6 +537,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         }
 
         // check data ready
+        // TODO 可能改成所有thr进入while loop？
         if (laneId == 0) {
           while (true) {
             p2pTailCache = __hip_atomic_load(
@@ -587,35 +568,8 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           localTokenIdx = __shfl(localTokenIdx, 0);
 
           // TODO use args.outTokenBuf
-          if (myPe == 1 && laneId == 1) {
-            printf(
-                "BEFORE rank=%d laneId=%d srcLocalPe=%d warpId=%d i=%d copyToOutput "
-                "localTokenIdx=%d "
-                "addr=%p done=%d p2pHeadCache=%d p2pTailCache=%d\n",
-                myPe, laneId, srcLocalPe, warpId, i, localTokenIdx, args.outTokenBuf, done,
-                p2pHeadCache, p2pTailCache);
-          }
-          // if (laneId == 0 && myPe == 1)
-          //   printf(
-          //       "BEFORE rank=%d laneId=%d copyToOutput localTokenIdx=%d dst=%p tokenBytes=%zu "
-          //       "val=%f\n",
-          //       myPe, laneId, localTokenIdx,
-          //       reinterpret_cast<char*>(args.outTokenBuf) + localTokenIdx * tokenBytes, tokenBytes,
-          //       float(args.outTokenBuf[1]));
           core::WarpCopy(reinterpret_cast<char*>(args.outTokenBuf) + localTokenIdx * tokenBytes,
                          srcPtr, tokenBytes);
-          // if (laneId == 0 && myPe == 1) {
-          //   printf(
-          //       "AFTER rank=%d laneId=%d copyToOutput localTokenIdx=%d dst=%p tokenBytes=%zu "
-          //       "val=%f\n",
-          //       myPe, laneId, localTokenIdx,
-          //       reinterpret_cast<char*>(args.outTokenBuf) + localTokenIdx * tokenBytes, tokenBytes,
-          //       (float)(args.outTokenBuf[1]));
-          //   int tmp = myPe;
-          //   while (tmp < npes) {
-          //     //
-          //   }
-          // }
           srcPtr += tokenBytes;
           if (weightBytes) {
             core::WarpCopy(
@@ -638,41 +592,18 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[localTokenIdx] =
                 *(reinterpret_cast<index_t*>(srcPtr));
 #if DEBUG == 1
-            // if (myPe == 0) {
-              int offset = 1;
-              printf(
-                  "rank %d localTokenIdx=%d srcPe=%d meta=%d maxNumInpTokenPerRank=%zu expect=%f "
-                  "got=%f output=%f output_offset=%f ptr=%p ptr_offset=%p\n",
-                  myPe, localTokenIdx, srcPe, *(reinterpret_cast<index_t*>(srcPtr)),
-                  maxNumInpTokenPerRank,
-                  (float)(*(reinterpret_cast<size_t*>(srcPtr)) / maxNumInpTokenPerRank + 1),
-                  float(*(T*)(args.shmemOutTokMemObj->template GetAs<char*>(srcPe) +
-                              ((channelId * nlocalPes + myLocalPe) * maxP2PStagingTokens + slot) *
-                                  tokenPackBytes)),
-                  float(*(T*)(reinterpret_cast<char*>(args.outTokenBuf) +
-                              localTokenIdx * tokenBytes)),
-                  float(*(
-                      (T*)(reinterpret_cast<char*>(args.outTokenBuf) + localTokenIdx * tokenBytes) +
-                      offset)),
-                  (T*)(reinterpret_cast<char*>(args.outTokenBuf) + localTokenIdx * tokenBytes),
-                  (T*)(reinterpret_cast<char*>(args.outTokenBuf) + localTokenIdx * tokenBytes) +
-                      offset);
-              // assert(
-              //     float(*((T*)(args.shmemOutTokMemObj->template GetAs<char*>(srcPe) +
-              //                  ((channelId * nlocalPes + myLocalPe) * maxP2PStagingTokens + slot) *
-              //                      tokenPackBytes) +
-              //             offset)) ==
-              //     (float)(*(reinterpret_cast<size_t*>(srcPtr)) / maxNumInpTokenPerRank + 1));
-            // }
+            assert(float(*((T*)(args.shmemOutTokMemObj->template GetAs<char*>(srcPe) +
+                                ((channelId * nlocalPes + myLocalPe) * maxP2PStagingTokens + slot) *
+                                    tokenPackBytes) +
+                           offset)) ==
+                   (float)(*(reinterpret_cast<size_t*>(srcPtr)) / maxNumInpTokenPerRank + 1));
 #endif
           }
         }
-        if (p2pTailCache > p2pHeadCache) {
-          p2pHeadCache = p2pTailCache;
-          if (laneId == 0) {
-            *(args.headMemObj->template GetAs<uint64_t*>(srcPe) + channelId * npes + myPe) =
-                p2pHeadCache;
-          }
+        p2pHeadCache = p2pTailCache;
+        if (laneId == 0) {
+          *(args.headMemObj->template GetAs<uint64_t*>(srcPe) + channelId * npes + myPe) =
+              p2pHeadCache;
         }
       }
       __threadfence_system();
@@ -681,17 +612,11 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
     if (thdId == 0) {
       // totalRecvTokenNum will be used in GetDispatchSrcTokenId
       *(args.totalRecvTokenNum) = *(args.localPeTokenCounter);
-      // printf("rank=%d srcPe=%d totalRecvTokenNum=%d\n", myPe, srcPe, *args.totalRecvTokenNum);
+#if DEBUG == 1
+      printf("rank=%d srcPe=%d totalRecvTokenNum=%d\n", myPe, srcPe, *args.totalRecvTokenNum);
+#endif
       // clear localPeTokenCounter
       args.localPeTokenCounter = 0;
-#if DEBUG == 1
-      if (myPe == 1) {
-        T* buf = reinterpret_cast<T*>(args.outTokenBuf);
-        for (int i = 0; i < 8 * *(args.totalRecvTokenNum); ++i)
-          printf("rank=%d i=%d output=%f output1=%f ptr=%p\n", myPe, i, float(*(buf + i)),
-                 float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf)) + i)), buf + i);
-      }
-#endif
     }
   }  // Receiver end
 }
