@@ -50,6 +50,7 @@ class EpDispatchCombineTestCase:
             max_token_type_size=2,
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeDedup,
             gpu_per_node=self.gpu_per_node,
+            rdma_block_num=16,
         )
 
     def setup(self):
@@ -233,7 +234,7 @@ class EpDispatchCombineTestCase:
             all_rank_scales[self.rank],
             all_rank_indices[self.rank],
             block_num=80,
-            warp_per_block=4,
+            warp_per_block=8,
         )
         torch.cuda.synchronize()
         dist.barrier()

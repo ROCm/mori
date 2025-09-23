@@ -238,14 +238,53 @@ inline __device__ void DispatchSendInterNode(EpDispatchCombineArgs<T>& args) {
 
   // Then send to other nodes
   for (int i = warpId; i < nNodes; i += warpNum) {
+    if (i == myNode) continue;
     for (int tokenId = startTokenIdx + laneId; tokenId < endTokenIdx; tokenId += warpSize) {
+      bool shouldSend = false;
+      for (int e = 0; e < config.numExpertPerToken; e++) {
+        shouldSend |= args.tokenIndices[tokenId * numExpertPerToken + e] / config.numExpertPerRank /
+                      config.gpuPerNode;
+      }
+      uint64_t mask = __ballot(shouldSend) & __activemask();
+      uint64_t num = __popcll(mask);
+      index_t destTokIdOffset = 0;
+      if (laneId == 0) {
+        destTokIdOffset = atomicAdd(args.destNodeTokenCounter + i, num);
+      }
+      destTokIdOffset = __shfl(destTokIdOffset, 0);
+
+      uint64_t warpOffset = 0;
+      if (laneId > 0) warpOffset = __popcll(mask << (warpSize - laneId));
+      index_t destTokId = destTokIdOffset + warpOffset;
+      // printf("myPe %d my block %d my warp %d laneId %d num %lu destTokIdOff %d warpOff %lu mask
+      // %08x shouldSend %d\n", myPe, blockId, warpId, laneId, num, destTokIdOffset, warpOffset,
+      // mask, shouldSend);
+
+      if (shouldSend) {
+        // Copy to remote proxy's staging buffer
+        size_t remoteIdx = (myNode * config.MaxNumTokensToRecvPerRank() + destTokId);
+
+        size_t stagingTokOffset = tokenId * xferBytes;
+        int proxyPe = i * config.gpuPerNode + (config.rank % config.gpuPerNode);
+        shmem::ShmemPutMemNbiThread(args.shmemInpTokMemObj, remoteIdx * xferBytes,
+                                    args.shmemStagingTokMemObj, stagingTokOffset, xferBytes,
+                                    proxyPe);
+        shmem::ShmemPutInt32ImmNbiThread(args.recvTokenFlagMemObj, remoteIdx * sizeof(index_t),
+                                         index_t{1}, proxyPe);
+      }
     }
   }
 
   int finishedWarp = 0;
-  if (laneId == 0) finishedWarp = atomicAdd(args.dispatchGridBarrier, 1);
+  if (laneId == 0) {
+    finishedWarp = atomicAdd(args.dispatchGridBarrier, 1);
+  //   if(myPe == 0)
+  //   printf("blockId %d warpId %d finished %d expected %d\n", blockId, warpId, finishedWarp,
+  // config.rdmaBlockNum*config.warpNumPerBlock);
+  }
   finishedWarp = __shfl(finishedWarp, 0);
-  if ((finishedWarp + 1) == config.rdmaBlockNum) {
+  if ((finishedWarp + 1) == (config.rdmaBlockNum*warpNum)) {
+    // if(laneId==0) printf("blockId %d warpId %d done\n", blockId, warpId);
     if (laneId < nNodes) {
       index_t proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
       shmem::ShmemPutInt32ImmNbiThread(
@@ -286,6 +325,10 @@ inline __device__ void DispatchRecvPhase(EpDispatchCombineArgs<T>& args) {
       // printf("myPe %d warp %d start wait recv token from node %d\n", myPe, warpId, node);
       while (true) {
         index_t nodeRecvTokenNum = core::AtomicLoadRelaxedSystem(nodeRecvTokenNums + node);
+        // if (nodeRecvTokenNum > 0) {
+        //   printf("myPe %d i %d node %d node recv token %d\n", myPe, i, node, nodeRecvTokenNum);
+        //   break;
+        // }
         if ((nodeRecvTokenNum > 0) && (tokIdx >= (nodeRecvTokenNum - 1))) {
           break;
         }
@@ -295,10 +338,7 @@ inline __device__ void DispatchRecvPhase(EpDispatchCombineArgs<T>& args) {
           break;
         }
 
-        // if (nodeRecvTokenNum > 0) {
-        //   printf("myPe %d i %d node %d node recv token %d\n", myPe, i, node, nodeRecvTokenNum);
-        //   break;
-        // }
+
       }
     }
     shouldRecv = __shfl(shouldRecv, 0);

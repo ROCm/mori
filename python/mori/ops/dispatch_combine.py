@@ -48,7 +48,7 @@ class EpDispatchCombineConfig:
     use_external_inp_buf: bool = True
     kernel_type: EpDispatchCombineKernelType = EpDispatchCombineKernelType.IntraNode
     gpu_per_node: int = 8
-
+    rdma_block_num: int = 0
 
 def _cpp_dispatch_combine_factory(entity_name):
     return getattr(mori_cpp, entity_name)
@@ -74,6 +74,7 @@ class EpDispatchCombineOp:
                 block_num=config.block_num,
                 use_external_inp_buf=config.use_external_inp_buf,
                 gpu_per_node=config.gpu_per_node,
+                rdma_block_num=config.rdma_block_num,
             )
         )
 
