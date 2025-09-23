@@ -88,7 +88,6 @@ class TcpBackend : public Backend {
   void StartService();
   void StopService();
 
- private:
   EngineKey myEngKey;
   TcpBackendConfig config;
   IOEngineConfig engConfig;

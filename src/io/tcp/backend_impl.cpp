@@ -23,12 +23,54 @@
 
 #include <netinet/tcp.h>
 #include <sys/epoll.h>
-#include <sys/uio.h>
-#include <unistd.h>
 
-#include <algorithm>
-#include <cstring>
-#include <memory>
+int FullSend(int fd, const void* buf, size_t len) {
+  const char* p = static_cast<const char*>(buf);
+  size_t remaining = len;
+  while (remaining > 0) {
+    ssize_t n = ::send(fd, p, remaining, 0);
+    if (n == 0) {
+      errno = ECONNRESET;
+      return -1;
+    }
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) continue;  // spin; could epoll later
+      return -1;
+    }
+    p += n;
+    remaining -= static_cast<size_t>(n);
+  }
+  return 0;
+}
+
+int FullWritev(int fd, struct iovec* iov, int iovcnt) {
+  int idx = 0;
+  while (idx < iovcnt) {
+    ssize_t n = ::writev(fd, &iov[idx], iovcnt - idx);
+    if (n == 0) {
+      errno = ECONNRESET;
+      return -1;
+    }
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+      return -1;
+    }
+    ssize_t consumed = n;
+    while (consumed > 0 && idx < iovcnt) {
+      if (consumed >= static_cast<ssize_t>(iov[idx].iov_len)) {
+        consumed -= static_cast<ssize_t>(iov[idx].iov_len);
+        ++idx;
+      } else {
+        iov[idx].iov_base = static_cast<char*>(iov[idx].iov_base) + consumed;
+        iov[idx].iov_len -= consumed;
+        consumed = 0;
+      }
+    }
+  }
+  return 0;
+}
 
 namespace mori {
 namespace io {
@@ -161,82 +203,96 @@ void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
   hdr.size = size;
 
   application::TCPEndpoint ep(conn.handle);
-  // host staging buffers when GPU memory involved
   bool localIsGpu = (localDest.loc == MemoryLocationType::GPU);
-  // For remote side we don't know its loc explicitly; protocol does not carry it yet.
-  // We will always send/recv host buffers over TCP.
-  auto bufBlock = bufferPool.Acquire(size);
-  char* hostPtr = bufBlock.data;
+  BufferBlock bufBlock;  // only allocate if GPU staging needed
+  char* stagingPtr = nullptr;
 
-  // If write (sending data), and source is GPU, copy device->host first.
   if (!isRead) {
+    const char* sendPtr = nullptr;
     if (localIsGpu) {
+      bufBlock = bufferPool.Acquire(size);
+      stagingPtr = bufBlock.data;
       const void* devPtr = reinterpret_cast<const void*>(localDest.data + localOffset);
-      hipError_t e = hipMemcpy(hostPtr, devPtr, size, hipMemcpyDeviceToHost);
+      hipError_t e = hipMemcpy(stagingPtr, devPtr, size, hipMemcpyDeviceToHost);
       if (e != hipSuccess) {
         status->SetCode(StatusCode::ERR_BAD_STATE);
         status->SetMessage(std::string("hipMemcpy D2H failed: ") + hipGetErrorString(e));
+        if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
         return;
       }
+      sendPtr = stagingPtr;
     } else {
-      const char* src = reinterpret_cast<const char*>(localDest.data + localOffset);
-      std::memcpy(hostPtr, src, size);
+      // zero-copy host path
+      sendPtr = reinterpret_cast<const char*>(localDest.data + localOffset);
     }
-  }
-
-  // send header (+payload for write) using writev to reduce syscalls
-  if (!isRead) {
     struct iovec iov[2];
     iov[0].iov_base = &hdr;
     iov[0].iov_len = sizeof(hdr);
-    iov[1].iov_base = hostPtr;
+    iov[1].iov_base = const_cast<char*>(sendPtr);
     iov[1].iov_len = size;
-    ssize_t wr = ::writev(conn.handle.fd, iov, 2);
-    if (wr < (ssize_t)(sizeof(hdr) + size)) {
+    if (FullWritev(conn.handle.fd, iov, 2) != 0) {
       status->SetCode(StatusCode::ERR_BAD_STATE);
-      status->SetMessage("partial writev");
-      bufferPool.Release(std::move(bufBlock));
+      status->SetMessage("writev failed");
+      if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
       return;
     }
     TcpMessageHeader resp{};
-    ep.Recv(&resp, sizeof(resp));
+    if (ep.Recv(&resp, sizeof(resp)) != 0) {
+      status->SetCode(StatusCode::ERR_BAD_STATE);
+      status->SetMessage("write ack recv failed");
+      if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
+      return;
+    }
     status->SetCode(StatusCode::SUCCESS);
-    bufferPool.Release(std::move(bufBlock));
+    if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
     return;
   } else {
-    // read request: only header out
-    ssize_t wr = ::send(conn.handle.fd, &hdr, sizeof(hdr), 0);
-    if (wr != (ssize_t)sizeof(hdr)) {
+    if (FullSend(conn.handle.fd, &hdr, sizeof(hdr)) != 0) {
       status->SetCode(StatusCode::ERR_BAD_STATE);
-      status->SetMessage("header send failed");
-      bufferPool.Release(std::move(bufBlock));
+      status->SetMessage("read header send failed");
       return;
     }
     TcpMessageHeader resp{};
-    ep.Recv(&resp, sizeof(resp));
+    if (ep.Recv(&resp, sizeof(resp)) != 0) {
+      status->SetCode(StatusCode::ERR_BAD_STATE);
+      status->SetMessage("read resp header recv failed");
+      return;
+    }
     if (resp.opcode != 2 || resp.size != size) {
       status->SetCode(StatusCode::ERR_BAD_STATE);
       status->SetMessage("unexpected read response");
-      bufferPool.Release(std::move(bufBlock));
       return;
     }
-    ep.Recv(hostPtr, size);
     if (localIsGpu) {
+      bufBlock = bufferPool.Acquire(size);
+      stagingPtr = bufBlock.data;
+      if (ep.Recv(stagingPtr, size) != 0) {
+        status->SetCode(StatusCode::ERR_BAD_STATE);
+        status->SetMessage("read payload recv failed");
+        if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
+        return;
+      }
       void* devPtr = reinterpret_cast<void*>(localDest.data + localOffset);
-      hipError_t e = hipMemcpy(devPtr, hostPtr, size, hipMemcpyHostToDevice);
+      hipError_t e = hipMemcpy(devPtr, stagingPtr, size, hipMemcpyHostToDevice);
       if (e != hipSuccess) {
         status->SetCode(StatusCode::ERR_BAD_STATE);
         status->SetMessage(std::string("hipMemcpy H2D failed: ") + hipGetErrorString(e));
-        bufferPool.Release(std::move(bufBlock));
+        if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
         return;
       }
+      status->SetCode(StatusCode::SUCCESS);
+      if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
+      return;
     } else {
       char* dst = reinterpret_cast<char*>(localDest.data + localOffset);
-      std::memcpy(dst, hostPtr, size);
+      if (ep.Recv(dst, size) != 0) {
+        status->SetCode(StatusCode::ERR_BAD_STATE);
+        status->SetMessage("read payload recv failed");
+        return;
+      }
+      status->SetCode(StatusCode::SUCCESS);
+      return;
     }
-    status->SetCode(StatusCode::SUCCESS);
-    bufferPool.Release(std::move(bufBlock));
-    return;
   }
 }
 
