@@ -105,44 +105,44 @@ class TcpBackend : public Backend {
    public:
     BufferPool() = default;
     void Configure(size_t maxBuffers, size_t maxBytes, bool pinned) {
+      std::lock_guard<std::mutex> lk(mu);
       max_buffers = maxBuffers;
       max_bytes = maxBytes;
       use_pinned = pinned;
+      current_bytes = 0;
+      total_buffers = 0;
+      // pre-warm a few common sizes (4K, 64K, 1M) if budget allows
+      const size_t commonSizes[] = {4 * 1024ULL, 64 * 1024ULL, 1 * 1024 * 1024ULL};
+      for (size_t sz : commonSizes) {
+        if (total_buffers >= max_buffers || (current_bytes + sz) > max_bytes) break;
+        BufferBlock b = Allocate(sz);
+        AddToBucket(std::move(b));
+      }
     }
     BufferBlock Acquire(size_t size) {
+      size_t bucketSize = NextPow2(std::max<size_t>(size, kMinBucket));
       std::lock_guard<std::mutex> lk(mu);
-      // try find first-fit large enough
-      for (auto it = pool.begin(); it != pool.end(); ++it) {
-        if (it->capacity >= size) {
-          BufferBlock b = *it;
-          current_bytes -= b.capacity;
-          pool.erase(it);
-          return b;
-        }
+      size_t idx = BucketIndex(bucketSize);
+      if (idx < buckets.size() && !buckets[idx].empty()) {
+        BufferBlock b = std::move(buckets[idx].back());
+        buckets[idx].pop_back();
+        in_pool_buffers--;
+        in_pool_bytes -= b.capacity;
+        return b;
       }
-      // allocate new
-      BufferBlock b;
-      b.capacity = size;
-      b.pinned = use_pinned;
-      if (use_pinned) {
-        if (hipHostMalloc(&b.data, size) != hipSuccess) {
-          b.data = (char*)::malloc(size);
-          b.pinned = false;
-        }
-      } else {
-        b.data = (char*)::malloc(size);
-      }
+      // allocate fresh (exact bucket size to reduce fragmentation)
+      BufferBlock b = Allocate(bucketSize);
       return b;
     }
     void Release(BufferBlock&& b) {
       if (!b.data) return;
+      size_t cap = b.capacity;
       std::lock_guard<std::mutex> lk(mu);
-      if (pool.size() >= max_buffers || (current_bytes + b.capacity) > max_bytes) {
+      if (total_buffers >= max_buffers || (current_bytes + cap) > max_bytes) {
         Free(b);
         return;
       }
-      current_bytes += b.capacity;
-      pool.push_back(b);
+      AddToBucket(std::move(b));
     }
     void Free(BufferBlock& b) {
       if (!b.data) return;
@@ -155,16 +155,84 @@ class TcpBackend : public Backend {
       b.pinned = false;
     }
     ~BufferPool() {
-      for (auto& b : pool) Free(b);
+      for (auto& vec : buckets) {
+        for (auto& b : vec) Free(b);
+      }
     }
 
    private:
+    static constexpr size_t kMinBucket = 256;  // smallest granularity
+    static constexpr size_t kMaxBuckets = 32;  // up to 2^(31) bytes (>2GB) guard
     std::mutex mu;
-    std::deque<BufferBlock> pool;
-    size_t current_bytes{0};
+    std::vector<std::vector<BufferBlock>> buckets;  // power-of-two sized bins
+    size_t current_bytes{0};                        // total allocated bytes ever (live + pooled)
+    size_t in_pool_bytes{0};                        // bytes currently inside pool
+    size_t total_buffers{0};                        // total allocated buffers
+    size_t in_pool_buffers{0};                      // buffers currently pooled
     size_t max_buffers{0};
     size_t max_bytes{0};
     bool use_pinned{true};
+
+    inline size_t NextPow2(size_t v) {
+      if (v <= 1) return 1;
+      constexpr size_t kMaxPow = size_t(1) << (sizeof(size_t) * 8 - 1);
+      if (v > kMaxPow) return kMaxPow;
+#if defined(__GNUC__) || defined(__clang__)
+      unsigned leading = __builtin_clzl(v - 1);
+      unsigned bits = sizeof(size_t) * 8;
+      return size_t(1) << (bits - leading);
+#else
+      size_t x = v - 1;
+      x |= x >> 1;
+      x |= x >> 2;
+      x |= x >> 4;
+      x |= x >> 8;
+      x |= x >> 16;
+      if constexpr (sizeof(size_t) == 8) x |= x >> 32;
+      return x + 1;
+#endif
+    }
+
+    inline size_t BucketIndex(size_t size) {
+      if (size <= 1) return 0;
+#if defined(__GNUC__) || defined(__clang__)
+      unsigned leading = __builtin_clzl(size);
+      unsigned bits = sizeof(size_t) * 8;
+      size_t idx = bits - leading - 1;
+#else
+      size_t s = size, idx = 0;
+      while (s > 1) {
+        s >>= 1;
+        ++idx;
+      }
+#endif
+      if (idx >= kMaxBuckets) idx = kMaxBuckets - 1;
+      return idx;
+    }
+
+    BufferBlock Allocate(size_t size) {
+      BufferBlock b;
+      b.capacity = size;
+      b.pinned = use_pinned;
+      if (use_pinned) {
+        if (hipHostMalloc(&b.data, size) != hipSuccess) {
+          b.data = (char*)::malloc(size);
+          b.pinned = false;
+        }
+      } else {
+        b.data = (char*)::malloc(size);
+      }
+      current_bytes += size;
+      total_buffers++;
+      return b;
+    }
+    void AddToBucket(BufferBlock&& b) {
+      size_t idx = BucketIndex(b.capacity);
+      if (buckets.empty()) buckets.resize(kMaxBuckets);
+      buckets[idx].push_back(std::move(b));
+      in_pool_buffers++;
+      in_pool_bytes += buckets[idx].back().capacity;
+    }
   };
   BufferPool bufferPool;
 
