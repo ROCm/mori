@@ -24,6 +24,7 @@
 #include "mori/application/memory/symmetric_memory.hpp"
 #include "mori/shmem/shmem_api.hpp"
 #include "src/shmem/internal.hpp"
+#include "mori/utils/mori_log.hpp"
 
 namespace mori {
 namespace shmem {
@@ -32,6 +33,7 @@ void* ShmemMalloc(size_t size) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
   states->CheckStatusValid();
   application::SymmMemObjPtr obj = states->memoryStates->symmMemMgr->Malloc(size);
+  MORI_SHMEM_INFO("Allocated shared memory of size {}", size);
   if (obj.IsValid()) {
     return obj.cpu->localPtr;
   }

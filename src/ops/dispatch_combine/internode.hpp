@@ -55,7 +55,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
   int laneId = threadIdx.x & (warpSize - 1);
   int warpId = thdId / warpSize;
-  int warpNum = blockDim.x / warpSize;
+  int warpNum = (blockDim.x + warpSize - 1) / warpSize;
 
   int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
   int globalThdNum = gridDim.x * blockDim.x;
@@ -139,6 +139,12 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
   const int startIdx = localBlockId * baseChunk + min(localBlockId, remainder);
   const int endIdx = startIdx + myChunkSize;
+  if (localBlockId == 0 && warpId == warpNum - 1) {
+    shmem::ShmemPutInt32ImmNbiWarp(
+        args.recvTokenNumMemObj,
+        (myPe + (args.crossDeviceBarrierFlag & 1) * npes) * sizeof(index_t), totalTokens, destPe,
+        localBlockId);
+  }
 
   if (destNode == myNode) {
     // intra node use xgmi for transfer
@@ -251,24 +257,18 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
   __shared__ index_t recvTokenNum;
   __syncthreads();
   if (thdId == 0) {
-    // shmem::ShmemAtomicTypeNonFetchWarp<int32_t>(args.recvTokenNumMemObj, myPe * sizeof(index_t),
-    //                                         args.shmemStagingTokMemObj->GetMemoryRegion(myPe),
-    //                                         myPe * sizeof(index_t), (int32_t)(totalTokens+1),
-    //                                         destPe, core::AMO_SET);
-    int doneBlockNum = atomicAdd(&args.dispatchGridBarrier[destPe], 1);
-    if (doneBlockNum == numsBlockPerDestPe - 1) {
-      shmem::ShmemPutInt32ImmNbiThread(
-          args.recvTokenNumMemObj,
-          (myPe + (args.crossDeviceBarrierFlag & 1) * npes) * sizeof(index_t), totalTokens + 1,
-          destPe);
-      __hip_atomic_store(&args.dispatchGridBarrier[destPe], 0, __ATOMIC_RELAXED,
-                         __HIP_MEMORY_SCOPE_AGENT);
-    }
+    shmem::ShmemAtomicTypeNonFetchThread<int32_t>(
+        args.sendTokenNumMemObj,
+        (myPe + (args.crossDeviceBarrierFlag & 1) * npes) * sizeof(index_t),
+        args.sendTokenNumMemObj->GetRdmaMemoryRegion(myPe), myPe * sizeof(index_t), 1, core::AMO_ADD,
+        destPe, localBlockId);
   }
   if (thdId == 0) {
-    index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>() + destPe +
+    index_t* signal = args.sendTokenNumMemObj->template GetAs<index_t*>() + destPe +
                       (args.crossDeviceBarrierFlag & 1) * npes;
-    recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
+    shmem::ShmemInt32WaitUntilGreaterThan(signal, numsBlockPerDestPe - 1);
+    recvTokenNum = atomicAdd(&args.recvTokenNumMemObj->template GetAs<index_t*>()[destPe +
+                                         (args.crossDeviceBarrierFlag & 1) * npes], 0);
     if (localBlockId == 0) {
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
       args.destPeTokenCounter[destPe] = 0;

@@ -192,7 +192,7 @@ DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int64, int64_t, Warp)
       const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, size_t bytes,  \
       core::atomicType amoType, int pe, int qpId = 0) {                                           \
     DISPATCH_TRANSPORT_TYPE(ShmemAtomicSizeNonFetch##Scope##Kernel, pe, dest, destOffset, source, \
-                            sourceOffset, val, bytes, amoType, qpId);                             \
+                            sourceOffset, val, bytes, amoType, pe, qpId);                         \
   }
 
 SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Thread)

@@ -56,14 +56,14 @@ __global__ void AtomicNonFetchThreadKernel(int myPe, const SymmMemObjPtr memObj)
     RdmaMemoryRegion source = memObj->GetRdmaMemoryRegion(sendPe);
 
     // ShmemAtomicUint64NonFetchThread(memObj, threadOffset, sendPe, AMO_SET, recvPe);
-    ShmemAtomicTypeNonFetchThread<T>(memObj, threadOffset, source, threadOffset, sendPe, AMO_SET,
+    ShmemAtomicTypeNonFetchThread<T>(memObj, 0, source, threadOffset, 1, AMO_ADD,
                                      recvPe);
     __threadfence_system();
 
     ShmemQuietThread();
     // __syncthreads();
   } else {
-    while (atomicAdd(reinterpret_cast<T*>(memObj->localPtr) + globalTid, 0) != sendPe) {
+    while (atomicAdd(reinterpret_cast<T*>(memObj->localPtr), 0) != gridDim.x * blockDim.x + 1) {
     }
     if (globalTid == 0) {
       printf("atomic nonfetch is ok!~\n");
@@ -94,7 +94,7 @@ void testAtomicNonFetchThread() {
   myHipMemsetD64(buff, myPe, numEle);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   printf("before rank[%d] %lu %lu\n", myPe, *(reinterpret_cast<uint64_t*>(buff)),
-         *(reinterpret_cast<uint64_t*>(buff) + numEle - 1));
+         *(reinterpret_cast<uint64_t*>(buff)));
   SymmMemObjPtr buffObj = ShmemQueryMemObjPtr(buff);
   assert(buffObj.IsValid());
 
@@ -103,19 +103,19 @@ void testAtomicNonFetchThread() {
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
   printf("after rank[%d] %lu %lu\n", myPe, *(reinterpret_cast<uint64_t*>(buff)),
-         *(reinterpret_cast<uint64_t*>(buff) + numEle - 1));
+         *(reinterpret_cast<uint64_t*>(buff)));
 
   buffSize = numEle * sizeof(uint32_t);
   HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff), myPe, numEle));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   printf("before rank[%d] %u %u\n", myPe, *(reinterpret_cast<uint32_t*>(buff)),
-         *(reinterpret_cast<uint32_t*>(buff) + numEle - 1));
+         *(reinterpret_cast<uint32_t*>(buff)));
   // Run uint32 atomic nonfetch
   AtomicNonFetchThreadKernel<uint32_t><<<blockNum, threadNum>>>(myPe, buffObj);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
   printf("after rank[%d] %u %u\n", myPe, *(reinterpret_cast<uint32_t*>(buff)),
-         *(reinterpret_cast<uint32_t*>(buff) + numEle - 1));
+         *(reinterpret_cast<uint32_t*>(buff)));
 
   // Finalize
   ShmemFree(buff);

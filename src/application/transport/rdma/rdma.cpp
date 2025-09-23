@@ -31,6 +31,7 @@
 #include "mori/application/transport/rdma/providers/bnxt/bnxt.hpp"
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
+#include "mori/utils/mori_log.hpp"
 
 namespace mori {
 namespace application {
@@ -198,6 +199,7 @@ ActiveDevicePortList GetActiveDevicePortList(const RdmaDeviceList& devices) {
 /* ---------------------------------------------------------------------------------------------- */
 RdmaContext::RdmaContext(RdmaBackendType backendType) : backendType(backendType) {
   deviceList = ibv_get_device_list(&nums_device);
+  MORI_APP_INFO("ibv_get_device_list nums_device: {}", nums_device);
   Initialize();
 }
 
