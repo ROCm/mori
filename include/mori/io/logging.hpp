@@ -21,49 +21,37 @@
 // SOFTWARE.
 #pragma once
 
-#include <chrono>
-#include <string>
+#include <mutex>
 
-#include "spdlog/spdlog.h"
+// Include the new centralized logging system
+#include "mori/utils/mori_log.hpp"
 
 namespace mori {
 namespace io {
 
-#define MORI_IO_TRACE spdlog::trace
-#define MORI_IO_DEBUG spdlog::debug
-#define MORI_IO_INFO spdlog::info
-#define MORI_IO_WARN spdlog::warn
-#define MORI_IO_ERROR spdlog::error
-#define MORI_IO_CRITICAL spdlog::critical
-
-// trace / debug / info / warning / error / critical
+// Legacy SetLogLevel function for backward compatibility
 inline void SetLogLevel(const std::string& strLevel) {
-  spdlog::level::level_enum level = spdlog::level::from_str(strLevel);
-  spdlog::set_level(level);
-  MORI_IO_INFO("Set MORI-IO log level to {}", spdlog::level::to_string_view(level));
+  try {
+    InitializeLoggingFromEnv();
+  } catch (...) {
+  }
+  
+  ForceSetModuleLogLevel(modules::IO, strLevel);
+  
+  auto logger = mori::ModuleLogger::GetInstance().GetLogger(modules::IO);
+  if (logger) {
+    logger->info("Set MORI-IO log level to {}", strLevel);
+  }
 }
 
-class ScopedTimer {
- public:
-  using Clock = std::chrono::steady_clock;
+// Legacy ScopedTimer - redirect to new implementation
+using ScopedTimer = mori::ScopedTimer;
 
-  explicit ScopedTimer(const std::string& n) : name(n), start(Clock::now()) {}
+// Legacy ScopedTimer - redirect to new implementation
+using ScopedTimer = mori::ScopedTimer;
 
-  ~ScopedTimer() {
-    auto end = Clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-    MORI_IO_DEBUG("ScopedTimer [{}] took {} ns", name, duration);
-  }
+#define MORI_IO_TIMER(message) MORI_TIMER(message, mori::modules::IO)
+#define MORI_IO_FUNCTION_TIMER MORI_FUNCTION_TIMER(mori::modules::IO)
 
-  ScopedTimer(const ScopedTimer&) = delete;
-  ScopedTimer& operator=(const ScopedTimer&) = delete;
-
- private:
-  std::string name;
-  Clock::time_point start;
-};
-
-#define MORI_IO_TIMER(message) ScopedTimer instance(message)
-#define MORI_IO_FUNCTION_TIMER ScopedTimer instance(__PRETTY_FUNCTION__)
 }  // namespace io
 }  // namespace mori

@@ -74,6 +74,12 @@ else()
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -expt-relaxed-constexpr")
 endif()
 
+add_library(mori_logging INTERFACE)
+target_include_directories(mori_logging INTERFACE 
+    include 
+    3rdparty/spdlog/include)
+
+
 if(BUILD_EXAMPLES)
   set(BUILD_APPLICATION ON)
   add_subdirectory(examples)

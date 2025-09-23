@@ -29,6 +29,41 @@
 
 #include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
+#include "mori/utils/mori_log.hpp"
+
+#ifdef ENABLE_BNXT
+namespace std {
+static std::ostream& operator<<(std::ostream& s, const bnxt_re_dv_qp_mem_info& m) {
+  std::stringstream ss;
+  ss << "qp_handle: 0x" << std::hex << m.qp_handle << std::dec << "  sq_va: 0x" << std::hex
+     << m.sq_va << std::dec << "  sq_len: " << m.sq_len << "  sq_slots: " << m.sq_slots
+     << "  sq_wqe_sz: " << m.sq_wqe_sz << "  sq_psn_sz: " << m.sq_psn_sz
+     << "  sq_npsn: " << m.sq_npsn << "  rq_va: 0x" << std::hex << m.rq_va << std::dec
+     << "  rq_len: " << m.rq_len << "  rq_slots: " << m.rq_slots << "  rq_wqe_sz: " << m.rq_wqe_sz
+     << "  comp_mask: 0x" << std::hex << m.comp_mask << std::dec;
+  s << ss.str();
+  return s;
+}
+}  // namespace std
+
+template <>
+struct fmt::formatter<bnxt_re_dv_qp_mem_info> {
+  constexpr auto parse(format_parse_context& ctx) -> decltype(ctx.begin()) {
+    return ctx.end();
+  }
+
+  template <typename FormatContext>
+  auto format(const bnxt_re_dv_qp_mem_info& m, FormatContext& ctx) -> decltype(ctx.out()) {
+    return fmt::format_to(ctx.out(),
+      "qp_handle: 0x{:x}  sq_va: 0x{:x}  sq_len: {}  sq_slots: {}  "
+      "sq_wqe_sz: {}  sq_psn_sz: {}  sq_npsn: {}  rq_va: 0x{:x}  "
+      "rq_len: {}  rq_slots: {}  rq_wqe_sz: {}  comp_mask: 0x{:x}",
+      m.qp_handle, m.sq_va, m.sq_len, m.sq_slots, m.sq_wqe_sz, 
+      m.sq_psn_sz, m.sq_npsn, m.rq_va, m.rq_len, m.rq_slots, 
+      m.rq_wqe_sz, m.comp_mask);
+  }
+};
+#endif  // ENABLE_BNXT
 
 namespace mori {
 namespace application {
@@ -92,7 +127,7 @@ BnxtCqContainer::~BnxtCqContainer() {
 /*                                         BnxtQpContainer                                        */
 /* ---------------------------------------------------------------------------------------------- */
 int bnxt_re_calc_dv_qp_mem_info(struct ibv_pd* ibvpd, struct ibv_qp_init_attr* attr,
-                          struct bnxt_re_dv_qp_mem_info* dv_qp_mem) {
+                                struct bnxt_re_dv_qp_mem_info* dv_qp_mem) {
   struct ibv_qp_init_attr_ex attr_ex;
   constexpr int fixed_num_slot_per_wqe = BNXT_RE_NUM_SLOT_PER_WQE;
 
@@ -222,7 +257,7 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   qp = bnxt_re_dv_create_qp(pd, &dv_qp_attr);
   assert(qp);
   qpn = qp->qp_num;
-  // std::cout << qpMemInfo << std::endl;
+  MORI_APP_INFO(qpMemInfo);
 }
 
 BnxtQpContainer::~BnxtQpContainer() { DestroyQueuePair(); }
