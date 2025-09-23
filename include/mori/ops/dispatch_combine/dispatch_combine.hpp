@@ -33,8 +33,8 @@
 namespace mori {
 namespace moe {
 
-#define MAX_GPUS_PER_NODE 8
-#define MAX_NODES 32
+#define MAX_GPUS_PER_NODE (8)
+#define MAX_NODES (32)
 
 enum KernelType {
   IntraNode = 0,
