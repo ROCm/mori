@@ -73,8 +73,9 @@ inline __device__ void DispatchSendIntraNodeBlock(EpDispatchCombineArgs<T>& args
     args.dispDestTokIdMap[tokenExpertId] = destPe * MaxNumTokensToSendPerRank + destTokId;
 
     // TODO: use a switch to control the writing of this buffer, should only turn on for testing
-    args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
-        config.rank * config.maxNumInpTokenPerRank + tokenId;
+    core::AtomicStoreRelaxedSystem(
+        args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe) + destTokId,
+        config.rank * config.maxNumInpTokenPerRank + tokenId);
   }
   destTokId = __shfl(destTokId, 0);
 
@@ -82,99 +83,6 @@ inline __device__ void DispatchSendIntraNodeBlock(EpDispatchCombineArgs<T>& args
   size_t destTokOffset = destTokId * config.hiddenDim;
   core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
                  args.inpTokenBuf + srcTokOffset, config.hiddenDim);
-}
-
-template <typename T>
-inline __device__ void DispatchSendInterNodeBlock(EpDispatchCombineArgs<T>& args, int tokenId,
-                                                  int destNode, int laneNode, int expId) {
-  DEF_COMMON_VARS;
-  index_t proxyPe = (config.rank % config.gpuPerNode) + destNode * config.gpuPerNode;
-
-  index_t tokenExpertId = tokenId * args.config.numExpertPerToken + expId;
-  index_t destTokId = 0;
-  if (core::WarpLaneId1D() == 0) {
-    // decide token id in dest pe
-    destTokId = atomicAdd(args.destNodeTokenCounter + destNode, 1);
-    args.dispDestTokIdMap[tokenExpertId] = proxyPe * config.MaxNumTokensToSendPerRank() + destTokId;
-  }
-  destTokId = __shfl(destTokId, 0);
-
-  // Copy to local staging buffer
-  uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
-  size_t stagingTokOffset = (destNode * config.MaxNumTokensToSendPerRank() + destTokId) * xferBytes;
-  core::WarpCopy(stagingPtr + stagingTokOffset,
-                 reinterpret_cast<uint8_t*>(args.inpTokenBuf) + tokenId * hiddenBytes, hiddenBytes);
-  core::WarpCopy(stagingPtr + stagingTokOffset + hiddenBytes,
-                 reinterpret_cast<uint8_t*>(args.tokenIndices) + tokenId * indexBytes, indexBytes);
-  if (laneId == 0)
-    reinterpret_cast<index_t*>(stagingPtr + stagingTokOffset + hiddenBytes + indexBytes)[0] =
-        tokenId + config.rank * config.maxNumInpTokenPerRank;
-
-  // Copy to remote proxy's staging buffer
-  size_t remoteIdx = (myNode * config.MaxNumTokensToRecvPerRank() + destTokId);
-  size_t remoteOff = remoteIdx * xferBytes;
-
-  shmem::ShmemPutMemNbiWarp(args.shmemInpTokMemObj, remoteIdx * xferBytes,
-                            args.shmemStagingTokMemObj, stagingTokOffset, xferBytes, proxyPe);
-  shmem::ShmemPutInt32ImmNbiWarp(args.recvTokenFlagMemObj, remoteIdx * sizeof(index_t), index_t{1},
-                                 proxyPe);
-  // if (laneId == 0)
-  // printf("mype %d set remote recv token flag idx %lu proxy pe %d\n", myPe, remoteIdx, proxyPe);
-}
-
-template <typename T>
-inline __device__ void DispatchSendPhase(EpDispatchCombineArgs<T>& args) {
-  DEF_COMMON_VARS;
-
-  // Distribute tokens evenly to all blocks
-  int tokenPerBlock = (args.curRankNumToken + blockNum - 1) / blockNum;
-  int startTokenIdx = blockId * tokenPerBlock;
-  int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, args.curRankNumToken);
-
-  for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
-    int lanePe = -1, laneNode = -1;
-    if (laneId < numExpertPerToken) {
-      lanePe = (args.tokenIndices[tokenId * numExpertPerToken + laneId] / config.numExpertPerRank);
-      laneNode = lanePe / config.gpuPerNode;
-    };
-
-    // Send to other pes in myNode
-    for (int e = 0; e < config.numExpertPerToken; e++) {
-      int tokenExpertId = tokenId * config.numExpertPerToken + e;
-      // int destExpert = args.tokenIndices[tokenExpertId];
-      // int destPe = destExpert / config.numExpertPerRank;
-      int destPe = __shfl(lanePe, e);
-      int destNode = destPe / config.gpuPerNode;
-      if (destNode == myNode) {
-        if (__any((laneId < e) && (destPe == lanePe))) {
-          if (laneId == 0) args.dispDestTokIdMap[tokenExpertId] = config.MaxNumTokensToRecv();
-          continue;
-        }
-        DispatchSendIntraNodeBlock(args, tokenId, destPe, lanePe, e);
-      } else {
-        if (__any((laneId < e) && (destNode == laneNode))) {
-          if (laneId == 0) args.dispDestTokIdMap[tokenExpertId] = config.MaxNumTokensToRecv();
-          continue;
-        }
-        DispatchSendInterNodeBlock(args, tokenId, destNode, laneNode, e);
-      }
-    }
-  }
-
-  int finishedWarp = 0;
-  if (laneId == 0) finishedWarp = atomicAdd(args.dispatchGridBarrier, 1);
-  finishedWarp = __shfl(finishedWarp, 0);
-  if ((finishedWarp + 1) == globalWarpNum) {
-    if (laneId < nNodes) {
-      index_t proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      shmem::ShmemPutInt32ImmNbiThread(
-          args.nodeRecvTokenNumMemObj, myNode * sizeof(index_t),
-          core::AtomicLoadRelaxed(args.destNodeTokenCounter + laneId) + 1, proxyPe);
-      // printf("myPe %d send token num %d to peoxyPe %d myNode %d\n", myPe,
-      //        core::AtomicLoadRelaxed(args.destNodeTokenCounter + laneId) + 1, proxyPe, myNode);
-    }
-    if (laneId == 0) args.dispatchGridBarrier[0] = 0;
-  }
 }
 
 template <typename T>
@@ -242,8 +150,9 @@ inline __device__ void DispatchSendInterNode(EpDispatchCombineArgs<T>& args) {
     for (int tokenId = startTokenIdx + laneId; tokenId < endTokenIdx; tokenId += warpSize) {
       bool shouldSend = false;
       for (int e = 0; e < config.numExpertPerToken; e++) {
-        shouldSend |= args.tokenIndices[tokenId * numExpertPerToken + e] / config.numExpertPerRank /
-                      config.gpuPerNode;
+        int destNode = args.tokenIndices[tokenId * numExpertPerToken + e] /
+                       config.numExpertPerRank / config.gpuPerNode;
+        shouldSend |= (destNode == i);
       }
       uint64_t mask = __ballot(shouldSend) & __activemask();
       uint64_t num = __popcll(mask);
@@ -327,7 +236,7 @@ inline __device__ void DispatchRecvPhase(EpDispatchCombineArgs<T>& args) {
         index_t nodeRecvTokenNum = core::AtomicLoadRelaxedSystem(nodeRecvTokenNums + node);
         // if (nodeRecvTokenNum > 0) {
         //   printf("myPe %d i %d node %d node recv token %d\n", myPe, i, node, nodeRecvTokenNum);
-        //   break;
+        // break;
         // }
         if ((nodeRecvTokenNum > 0) && (tokIdx >= (nodeRecvTokenNum - 1))) {
           break;
@@ -337,8 +246,6 @@ inline __device__ void DispatchRecvPhase(EpDispatchCombineArgs<T>& args) {
           core::AtomicStoreRelaxedSystem(recvTokenFlags + i, 0);
           break;
         }
-
-
       }
     }
     shouldRecv = __shfl(shouldRecv, 0);
@@ -360,8 +267,7 @@ inline __device__ void DispatchRecvPhase(EpDispatchCombineArgs<T>& args) {
     //          indicies[7]);
     // }
     for (int e = 0; e < config.numExpertPerToken; e++) {
-      int destExpt = indicies[e];
-      int destPe = destExpt / config.numExpertPerRank;
+      int destPe = __shfl(lanePe, e);
       int destNode = destPe / config.gpuPerNode;
       if (destNode != myNode) continue;
       if (__any((laneId < e) && (destPe == lanePe))) {
@@ -371,7 +277,8 @@ inline __device__ void DispatchRecvPhase(EpDispatchCombineArgs<T>& args) {
       if (laneId == 0) {
         destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
         atomicAdd(args.destPeTokenCounter + destPe, 1);
-        args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] = srcTokId;
+        core::AtomicStoreRelaxedSystem(
+            args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe) + destTokId, srcTokId);
       }
       destTokId = __shfl(destTokId, 0);
       core::WarpCopy(
@@ -431,7 +338,6 @@ inline __device__ void DispatchSyncIntraNode(EpDispatchCombineArgs<T>& args) {
 
 template <typename T>
 __global__ void EpDispatchInterNodeDedupKernel(EpDispatchCombineArgs<T> args) {
-  // dedup::DispatchSendPhase(args);
   dedup::DispatchSendPhaseSpecialize(args);
   dedup::DispatchRecvPhase(args);
   dedup::DispatchSyncIntraNode(args);

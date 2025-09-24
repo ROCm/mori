@@ -50,7 +50,7 @@ class EpDispatchCombineTestCase:
             max_token_type_size=2,
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeDedup,
             gpu_per_node=self.gpu_per_node,
-            rdma_block_num=16,
+            rdma_block_num=32,
         )
 
     def setup(self):
@@ -147,10 +147,45 @@ class EpDispatchCombineTestCase:
                 indices[i] = perm[: self.config.num_experts_per_token]
             all_rank_indices.append(indices.to(torch.int32).to(self.device))
 
-        # num_total_experts = self.config.num_experts_per_rank * self.config.world_size
-        # all_indices = torch.cat(all_rank_indices, dim=0).reshape(-1)
-        # expert_counts = torch.bincount(all_indices, minlength=num_total_experts)
-        # print("Expert counts:", expert_counts)
+        num_total_experts = self.config.num_experts_per_rank * self.config.world_size
+        num_nodes = self.config.world_size // self.config.gpu_per_node
+
+        # Per-rank counts
+        rank_counts = torch.zeros(self.config.world_size, dtype=torch.int32, device=self.device)
+        rank_counts_remote_recv = torch.zeros(self.config.world_size, dtype=torch.int32, device=self.device)
+        rank_counts_remote_send = torch.zeros(self.config.world_size, dtype=torch.int32, device=self.device)
+
+        for src_rank, indices in enumerate(all_rank_indices):
+            src_node = src_rank // self.config.gpu_per_node
+
+            # Map expert IDs to rank IDs
+            token_ranks = indices // self.config.num_experts_per_rank   # [num_tokens, num_experts_per_token]
+
+            # Deduplicate rank IDs per token
+            unique_ranks_per_token = [torch.unique(row) for row in token_ranks]
+
+            # For each token, update counts
+            for ur in unique_ranks_per_token:
+                rank_counts[ur] += 1  # All ranks that receive this token
+
+                dst_nodes = {dst_rank // self.config.gpu_per_node for dst_rank in ur.tolist()}
+
+                for dst_rank in ur.tolist():
+                    dst_node = dst_rank // self.config.gpu_per_node
+                    if dst_node != src_node:
+                        # Receiving side
+                        rank_counts_remote_recv[dst_rank] += 1
+
+                # Sending side (dedup by node: count once if token goes to a remote node)
+                for dst_node in dst_nodes:
+                    if dst_node != src_node:
+                        rank_counts_remote_send[src_rank] += 1
+
+        if self.config.rank == 0:
+            print("Rank counts (deduplicated):", rank_counts)
+            # print("Rank counts local nodes:", rank_counts - rank_counts_remote_recv)
+            # print("Rank counts from other nodes:", rank_counts_remote_recv)
+            # print("Rank counts to other nodes:", rank_counts_remote_send)
 
         # even_indices = (
         #     torch.arange(
@@ -424,13 +459,6 @@ class EpDispatchCombineTestCase:
         disp_bandwidth_GB_list = []
         comb_duration_us_list = []
         comb_bandwidth_GB_list = []
-
-        # for i in range(10):
-        #     if self.rank == 0:
-        #         print(f"WarmUp Round {i} begin")
-        #     _, _, _, _ = (
-        #         self.run_bench_once(op, test_data)
-        #     )
 
         error_round = set()
         for i in range(1):
