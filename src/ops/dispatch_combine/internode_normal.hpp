@@ -84,7 +84,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
   constexpr int stepRDMATokens = 30;
   
   // TODO modify maxTokensPerChannel 目前是channel所需的最大size，可以根据实际改小
-  const size_t maxTokensPerChannel = max(baseTokensPerChannel + 1, stepRDMATokens);
+  const size_t maxTokensPerChannel = max(baseTokensPerChannel + (remTokens ? 1 : 0), stepRDMATokens);
   const size_t maxNumToken = maxTokensPerChannel * nChannels;
 
   const size_t maxRDMAStagingTokens =
