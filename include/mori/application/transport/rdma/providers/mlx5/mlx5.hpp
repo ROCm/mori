@@ -122,7 +122,7 @@ class Mlx5DeviceContext : public RdmaDeviceContext {
 
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) override;
   virtual void ConnectEndpoint(const RdmaEndpointHandle& local,
-                               const RdmaEndpointHandle& remote) override;
+                               const RdmaEndpointHandle& remote, uint32_t qpId = 0) override;
 
  private:
   uint32_t pdn;

@@ -26,6 +26,10 @@
 #include <unistd.h>
 
 #include <iostream>
+#include <sstream>
+#include <string>
+#include <cstdlib>
+#include <cstring>
 
 #include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
@@ -68,6 +72,93 @@ struct fmt::formatter<bnxt_re_dv_qp_mem_info> {
 namespace mori {
 namespace application {
 #ifdef ENABLE_BNXT
+
+// Global UDP sport configuration - initialize once
+static uint32_t g_bnxt_udp_sport[BNXT_UDP_SPORT_ARRAY_SIZE] = {0};
+static bool g_udp_sport_initialized = false;
+
+static void InitializeBnxtUdpSport() {
+  if (g_udp_sport_initialized) {
+    return;
+  }
+  
+  // Default values
+  // Default UDP sport values array for round-robin selection
+  uint32_t default_udp_sports[] = {52768, 52769, 52770, 52771};
+  
+  for (int i = 0; i < BNXT_UDP_SPORT_ARRAY_SIZE; i++) {
+    g_bnxt_udp_sport[i] = default_udp_sports[i % (sizeof(default_udp_sports) / sizeof(default_udp_sports[0]))];
+  }
+  
+  // Try to read from environment variable MORI_GOR_PORT
+  const char* env_udp_sport = std::getenv("MORI_GOR_PORT");
+  if (env_udp_sport != nullptr) {
+    std::string sport_str(env_udp_sport);
+    std::stringstream ss(sport_str);
+    std::string token;
+    int index = 0;
+    
+    // Parse comma-separated values
+    while (std::getline(ss, token, ',') && index < BNXT_UDP_SPORT_ARRAY_SIZE) {
+      try {
+        g_bnxt_udp_sport[index] = static_cast<uint32_t>(std::stoul(token));
+        index++;
+      } catch (const std::exception& e) {
+        MORI_APP_WARN("Invalid UDP sport value '{}' in MORI_GOR_PORT, using default", token);
+        break;
+      }
+    }
+    
+    if (index > 0) {
+      std::string env_values = "[";
+      for (int i = 0; i < BNXT_UDP_SPORT_ARRAY_SIZE; i++) {
+        if (i > 0) env_values += ", ";
+        env_values += std::to_string(g_bnxt_udp_sport[i]);
+      }
+      env_values += "]";
+      MORI_APP_INFO("Using UDP sport values from environment MORI_GOR_PORT: {}", env_values);
+    }
+  }
+  
+  // Try to read individual environment variables MORI_GOR_PORT1, MORI_GOR_PORT2, etc.
+  bool has_individual_settings = false;
+  
+  for (int i = 0; i < BNXT_UDP_SPORT_ARRAY_SIZE; i++) {
+    // Generate environment variable name dynamically
+    std::string env_name = "MORI_GOR_PORT" + std::to_string(i + 1);
+    const char* env_value = std::getenv(env_name.c_str());
+    if (env_value != nullptr) {
+      try {
+        g_bnxt_udp_sport[i] = static_cast<uint32_t>(std::stoul(env_value));
+        has_individual_settings = true;
+        MORI_APP_INFO("Set UDP sport[{}] from {}: {}", i, env_name, g_bnxt_udp_sport[i]);
+      } catch (const std::exception& e) {
+        MORI_APP_WARN("Invalid UDP sport value '{}' in {}, keeping current value", env_value, env_name);
+      }
+    }
+  }
+  
+  if (!env_udp_sport && !has_individual_settings) {
+    std::string default_values = "[";
+    for (int i = 0; i < BNXT_UDP_SPORT_ARRAY_SIZE; i++) {
+      if (i > 0) default_values += ", ";
+      default_values += std::to_string(g_bnxt_udp_sport[i]);
+    }
+    default_values += "]";
+    MORI_APP_INFO("No UDP sport environment variables set, using default values: {}", default_values);
+  } else if (has_individual_settings) {
+    std::string final_values = "[";
+    for (int i = 0; i < BNXT_UDP_SPORT_ARRAY_SIZE; i++) {
+      if (i > 0) final_values += ", ";
+      final_values += std::to_string(g_bnxt_udp_sport[i]);
+    }
+    final_values += "]";
+    MORI_APP_INFO("Final UDP sport values: {}", final_values);
+  }
+  
+  g_udp_sport_initialized = true;
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          BnxtCqContainer */
 /* ---------------------------------------------------------------------------------------------- */
@@ -257,7 +348,13 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   qp = bnxt_re_dv_create_qp(pd, &dv_qp_attr);
   assert(qp);
   qpn = qp->qp_num;
-  MORI_APP_INFO(qpMemInfo);
+  MORI_APP_TRACE(qpMemInfo);
+  
+  // Initialize global UDP sport configuration on first use
+  InitializeBnxtUdpSport();
+  
+  // Copy global UDP sport values to instance
+  std::memcpy(udp_sport_setting, g_bnxt_udp_sport, sizeof(udp_sport_setting));
 }
 
 BnxtQpContainer::~BnxtQpContainer() { DestroyQueuePair(); }
@@ -298,7 +395,7 @@ void BnxtQpContainer::ModifyRst2Init() {
 
 void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
                                      const ibv_port_attr& portAttr,
-                                     const ibv_device_attr_ex& deviceAttr) {
+                                     const ibv_device_attr_ex& deviceAttr, uint32_t qpId) {
   struct ibv_qp_attr attr;
   int attr_mask;
 
@@ -318,11 +415,21 @@ void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
   // TODO: max_dest_rd_atomic whether affect nums of amo/rd
   attr.max_dest_rd_atomic = deviceAttr.orig_attr.max_qp_rd_atom;
   attr.min_rnr_timer = 12;
+  
+  // Use qpId to select UDP sport value from the array (round-robin)
+  uint32_t selected_udp_sport = udp_sport_setting[qpId % BNXT_UDP_SPORT_ARRAY_SIZE];
+  MORI_APP_TRACE("QP {} using UDP sport {} (qpId={}, index={})", qpn, selected_udp_sport, qpId, qpId % BNXT_UDP_SPORT_ARRAY_SIZE);
+  int status = bnxt_re_dv_modify_qp_udp_sport(qp, selected_udp_sport & 0xffff);
+  if (status) {
+    MORI_APP_ERROR("Failed to set UDP sport {} for QP {}: error code {}", selected_udp_sport, qpn, status);
+  }
+  assert(!status);
+  MORI_APP_TRACE("bnxt_re_dv_modify_qp_udp_sport is done, return {}", status);
 
   attr_mask = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_RQ_PSN | IBV_QP_DEST_QPN | IBV_QP_AV |
               IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
 
-  int status = bnxt_re_dv_modify_qp(qp, &attr, attr_mask, 0, 0);
+  status = bnxt_re_dv_modify_qp(qp, &attr, attr_mask, 0, 0);
   assert(!status);
 }
 
@@ -428,7 +535,7 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
 }
 
 void BnxtDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
-                                        const RdmaEndpointHandle& remote) {
+                                        const RdmaEndpointHandle& remote, uint32_t qpId) {
   uint32_t local_qpn = local.qpn;
   assert(qpPool.find(local_qpn) != qpPool.end());
   BnxtQpContainer* qp = qpPool.at(local_qpn);
@@ -436,7 +543,7 @@ void BnxtDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   const ibv_device_attr_ex& deviceAttr = *(rdmaDevice->GetDeviceAttr());
   const ibv_port_attr& portAttr = *(rdmaDevice->GetPortAttrMap()->find(local.portId)->second);
   qp->ModifyRst2Init();
-  qp->ModifyInit2Rtr(remote, portAttr, deviceAttr);
+  qp->ModifyInit2Rtr(remote, portAttr, deviceAttr, qpId);
   qp->ModifyRtr2Rts(local, remote);
 }
 

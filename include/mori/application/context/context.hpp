@@ -58,7 +58,7 @@ class Context {
  private:
   BootstrapNetwork& bootNet;
   int rankInNode{-1};
-  int numQpPerPe{1};
+  int numQpPerPe{4};
   std::vector<std::string> hostnames;
   std::vector<TransportType> transportTypes;
 

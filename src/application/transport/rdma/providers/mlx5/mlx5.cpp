@@ -462,7 +462,7 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
 }
 
 void Mlx5DeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
-                                        const RdmaEndpointHandle& remote) {
+                                        const RdmaEndpointHandle& remote, uint32_t qpId) {
   uint32_t local_qpn = local.qpn;
   assert(qpPool.find(local_qpn) != qpPool.end());
   Mlx5QpContainer* qp = qpPool.at(local_qpn).get();

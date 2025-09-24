@@ -39,6 +39,9 @@ namespace mori {
 namespace application {
 
 #ifdef ENABLE_BNXT
+// BNXT UDP sport configuration constants
+static constexpr uint32_t BNXT_UDP_SPORT_ARRAY_SIZE = 4;
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Device Attributes                                       */
 /* ---------------------------------------------------------------------------------------------- */
@@ -80,7 +83,7 @@ class BnxtQpContainer {
 
   void ModifyRst2Init();
   void ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr,
-                      const ibv_device_attr_ex& deviceAttr);
+                      const ibv_device_attr_ex& deviceAttr, uint32_t qpId = 0);
   void ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
                      const RdmaEndpointHandle& remote_handle);
 
@@ -110,6 +113,7 @@ class BnxtQpContainer {
   void* qpUar{nullptr};
   void* qpUarPtr{nullptr};
   ibv_qp* qp{nullptr};
+  uint32_t udp_sport_setting[BNXT_UDP_SPORT_ARRAY_SIZE]{0};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -122,7 +126,7 @@ class BnxtDeviceContext : public RdmaDeviceContext {
 
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) override;
   virtual void ConnectEndpoint(const RdmaEndpointHandle& local,
-                               const RdmaEndpointHandle& remote) override;
+                               const RdmaEndpointHandle& remote, uint32_t qpId = 0) override;
 
  private:
   uint32_t pdn;

@@ -173,10 +173,10 @@ class RdmaDeviceContext {
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) {
     assert(false && "not implemented");
   }
-  void ConnectEndpoint(const RdmaEndpoint& local, const RdmaEndpoint& remote) {
-    ConnectEndpoint(local.handle, remote.handle);
+  void ConnectEndpoint(const RdmaEndpoint& local, const RdmaEndpoint& remote, uint32_t qpId = 0) {
+    ConnectEndpoint(local.handle, remote.handle, qpId);
   }
-  virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote) {
+  virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote, uint32_t qpId = 0) {
     assert(false && "not implemented");
   }
 

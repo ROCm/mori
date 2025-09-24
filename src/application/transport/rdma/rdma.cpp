@@ -199,7 +199,7 @@ ActiveDevicePortList GetActiveDevicePortList(const RdmaDeviceList& devices) {
 /* ---------------------------------------------------------------------------------------------- */
 RdmaContext::RdmaContext(RdmaBackendType backendType) : backendType(backendType) {
   deviceList = ibv_get_device_list(&nums_device);
-  MORI_APP_INFO("ibv_get_device_list nums_device: {}", nums_device);
+  MORI_APP_TRACE("ibv_get_device_list nums_device: {}", nums_device);
   Initialize();
 }
 

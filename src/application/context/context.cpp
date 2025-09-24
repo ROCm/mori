@@ -90,12 +90,12 @@ void Context::CollectHostNames() {
 
   constexpr int IDENTIFIER_MAX = HOST_NAME_MAX + INET_ADDRSTRLEN;
   std::vector<char> globalIdentifiers(IDENTIFIER_MAX * WorldSize());
-  
+
   // Create a non-const buffer for Allgather
   char localBuffer[IDENTIFIER_MAX];
   strncpy(localBuffer, hostIdentifier.c_str(), IDENTIFIER_MAX - 1);
   localBuffer[IDENTIFIER_MAX - 1] = '\0';
-  
+
   bootNet.Allgather(localBuffer, globalIdentifiers.data(), IDENTIFIER_MAX);
 
   for (int i = 0; i < WorldSize(); i++) {
@@ -103,9 +103,9 @@ void Context::CollectHostNames() {
   }
 
   if (LocalRank() == 0) {
-    MORI_APP_INFO("Collected hostnames:");
+    MORI_APP_TRACE("Collected hostnames:");
     for (int i = 0; i < hostnames.size(); i++) {
-      MORI_APP_INFO("  rank {}: {}", i, hostnames[i]);
+      MORI_APP_TRACE("  rank {}: {}", i, hostnames[i]);
     }
   }
 }
@@ -253,7 +253,7 @@ void Context::InitializePossibleTransports() {
     for (int qp = 0; qp < numQpPerPe; qp++) {
       int epIndex = peer * numQpPerPe + qp;
       rdmaDeviceContext->ConnectEndpoint(localToPeerEpHandles[epIndex],
-                                         peerToLocalEpHandles[epIndex]);
+                                         peerToLocalEpHandles[epIndex], qp);
     }
   }
 }
