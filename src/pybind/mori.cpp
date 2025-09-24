@@ -63,16 +63,31 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
     scalePtr = reinterpret_cast<uint8_t*>(scales->data_ptr());
   }
 
-  handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
-                          nullptr, weightPtr, scalePtr, topkIds.data_ptr<mori::moe::index_t>(),
-                          input.size(0));
+  torch::Tensor out;
+  if (kernelType == mori::moe::KernelType::InterNodeNormal) {
+    out = torch::empty({handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
+                       torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA));
+    // TODO remove this
+    HIP_RUNTIME_CHECK(hipMemset(out.data_ptr(), 0, out.nbytes()));
+    handle.PrepareTraining(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
+                           out.data_ptr(), weightPtr, scalePtr,
+                           topkIds.data_ptr<mori::moe::index_t>(), input.size(0));
+  } else {
+    handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
+                            nullptr, weightPtr, scalePtr, topkIds.data_ptr<mori::moe::index_t>(),
+                            input.size(0));
+  }
+
   handle.LaunchDispatch((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
                         at::cuda::getCurrentHIPStream());
-  torch::Tensor out = torch::from_blob(
-      kernelType == mori::moe::KernelType::InterNodeNormal ? handle.outTokenBuf
-                                                           : handle.shmemOutTokMemObj->Get(),
-      {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
-      torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA));
+
+  if (kernelType != mori::moe::KernelType::InterNodeNormal) {
+    out = torch::from_blob(kernelType == mori::moe::KernelType::InterNodeNormal
+                               ? handle.outTokenBuf
+                               : handle.shmemOutTokMemObj->Get(),
+                           {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
+                           torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA));
+  }
 
   std::optional<torch::Tensor> outWeights{std::nullopt};
   if (weightPtr) {

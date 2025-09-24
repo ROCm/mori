@@ -100,8 +100,8 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   shmemOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
   shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
 
-  HIP_RUNTIME_CHECK(hipMalloc(&outTokenBuf, maxTokenSize));
-  HIP_RUNTIME_CHECK(hipMemset(outTokenBuf, 0, maxTokenSize));
+  // HIP_RUNTIME_CHECK(hipMalloc(&outTokenBuf, maxTokenSize));
+  // HIP_RUNTIME_CHECK(hipMemset(outTokenBuf, 0, maxTokenSize));
 
   size_t maxWeightSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(float);
   shmemInpWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
