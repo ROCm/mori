@@ -489,6 +489,8 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
 
   uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
   uint32_t slotIdx = wqeIdx * BNXT_RE_NUM_SLOT_PER_WQE;
+  // printf("atomic wqeIdx = %u, slotIdx = %u\n", wqeIdx, slotIdx);
+  
 
   uint32_t opcode = BNXT_RE_WR_OPCD_ATOMIC_FA;
   uint64_t data = val_1 ? *static_cast<uint64_t*>(val_1) : 0;
@@ -719,13 +721,12 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
     opcode = PollCqOnce<ProviderType::BNXT>(cqAddr, cqeNum, curConsIdx, &wqeIdx);
     asm volatile("" ::: "memory");
   } while (opcode < 0);
-
+  *wqeCounter = (uint16_t)(wqeIdx & 0xFFFF);
   if (opcode != BNXT_RE_REQ_ST_OK) {
     auto error = BnxtHandleErrorCqe(opcode);
-    printf("(%s:%d) CQE error: %s\n", __FILE__, __LINE__, IbvWcStatusString(error));
+    printf("(%s:%d) CQE error: %s, wqeCounter: %u\n", __FILE__, __LINE__, IbvWcStatusString(error), *wqeCounter);
     return opcode;
   }
-  *wqeCounter = (uint16_t)(wqeIdx & 0xFFFF);
   return opcode;
 }
 

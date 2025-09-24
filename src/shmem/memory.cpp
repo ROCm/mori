@@ -45,6 +45,7 @@ void* ShmemExtMallocWithFlags(size_t size, unsigned int flags) {
   states->CheckStatusValid();
   application::SymmMemObjPtr obj =
       states->memoryStates->symmMemMgr->ExtMallocWithFlags(size, flags);
+  MORI_SHMEM_INFO("Allocated shared memory of size {} with flags {}", size, flags);
   if (obj.IsValid()) {
     return obj.cpu->localPtr;
   }

@@ -105,6 +105,9 @@ void EpDispatchCombineHandle::InitializeTokenNumSignalBuf() {
   size_t tokenNumSignalSize = config.worldSize * sizeof(index_t) * 2;
   recvTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
   sendTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
+  // The extra 1 is for the laddr.
+  sendAtomicSignalMemObj = ShmemMallocAndReturnMemObjPtr(
+      (config.worldSize + 1) * sizeof(int64_t) * 2, hipDeviceMallocUncached);
 
   HIP_RUNTIME_CHECK(hipMalloc(&totalRecvTokenNum, sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(totalRecvTokenNum, 0, sizeof(index_t)));
@@ -113,6 +116,7 @@ void EpDispatchCombineHandle::InitializeTokenNumSignalBuf() {
 void EpDispatchCombineHandle::FinalizeTokenNumSignalBuf() {
   ShmemFree(recvTokenNumMemObj->localPtr);
   ShmemFree(sendTokenNumMemObj->localPtr);
+  ShmemFree(sendAtomicSignalMemObj->localPtr);
   HIP_RUNTIME_CHECK(hipFree(totalRecvTokenNum));
 }
 

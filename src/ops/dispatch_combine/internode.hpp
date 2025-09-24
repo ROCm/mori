@@ -179,7 +179,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
       }
       shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemInpTokMemObj, peSortedOffset,
                                           args.shmemStagingTokMemObj, mapIdxOffset, stagingOffset,
-                                          destPe);
+                                          destPe, localBlockId);
     }
   } else {
     // inter node use ibgda for transfer
@@ -210,7 +210,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
         size_t dstOffset = dstIdx * stagingOffset;
         shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemInpTokMemObj, dstOffset,
                                             args.shmemStagingTokMemObj, srcOffset,
-                                            actualTokenNum * stagingOffset, destPe);
+                                            actualTokenNum * stagingOffset, destPe, localBlockId);
 
         ++chunkIdx;
         chunkOffset += chunkTokenSize;
@@ -256,19 +256,21 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
   __shared__ index_t recvTokenNum;
   __syncthreads();
-  if (thdId == 0) {
-    shmem::ShmemAtomicTypeNonFetchThread<int32_t>(
-        args.sendTokenNumMemObj,
-        (myPe + (args.crossDeviceBarrierFlag & 1) * npes) * sizeof(index_t),
-        args.sendTokenNumMemObj->GetRdmaMemoryRegion(myPe), myPe * sizeof(index_t), 1, core::AMO_ADD,
-        destPe, localBlockId);
+  if (warpId == 0) {
+    shmem::ShmemAtomicTypeNonFetchWarp<int64_t>(
+        args.sendAtomicSignalMemObj,
+        (myPe + (args.crossDeviceBarrierFlag & 1) * npes) * sizeof(int64_t),
+        args.sendAtomicSignalMemObj->GetRdmaMemoryRegion(myPe), (2 * npes) * sizeof(int64_t), 1,
+        core::AMO_ADD, destPe, localBlockId);
   }
   if (thdId == 0) {
-    index_t* signal = args.sendTokenNumMemObj->template GetAs<index_t*>() + destPe +
-                      (args.crossDeviceBarrierFlag & 1) * npes;
-    shmem::ShmemInt32WaitUntilGreaterThan(signal, numsBlockPerDestPe - 1);
-    recvTokenNum = atomicAdd(&args.recvTokenNumMemObj->template GetAs<index_t*>()[destPe +
-                                         (args.crossDeviceBarrierFlag & 1) * npes], 0);
+    int64_t* signal = args.sendAtomicSignalMemObj->template GetAs<int64_t*>() + destPe +
+                       (args.crossDeviceBarrierFlag & 1) * npes;
+    shmem::ShmemInt64WaitUntilGreaterThan(signal, numsBlockPerDestPe - 1);
+    recvTokenNum = atomicAdd(
+        &args.recvTokenNumMemObj
+             ->template GetAs<index_t*>()[destPe + (args.crossDeviceBarrierFlag & 1) * npes],
+        0);
     if (localBlockId == 0) {
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
       args.destPeTokenCounter[destPe] = 0;
@@ -497,6 +499,8 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
   shmem::ShmemQuietThread();
   if (globalThdId < npes) {
     args.recvTokenNumMemObj
+        ->template GetAs<index_t*>()[globalThdId + (args.crossDeviceBarrierFlag & 1) * npes] = 0;
+    args.sendAtomicSignalMemObj
         ->template GetAs<index_t*>()[globalThdId + (args.crossDeviceBarrierFlag & 1) * npes] = 0;
   }
 

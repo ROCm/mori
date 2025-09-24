@@ -117,7 +117,8 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId) {
       if (opcode != BNXT_RE_REQ_ST_OK) {
         int rank = globalGpuStates->rank;
         uint32_t my_cq_index = my_cq_consumer % cq.cqeNum;
-        printf("rank %d dest pe %d consIdx %d opcode %d\n", rank, pe, my_cq_index, opcode);
+        printf("rank %d dest pe %d qpId %d consIdx %d opcode %d wqe_counter %d\n", rank, pe, qpId, my_cq_index,
+               opcode, wqe_counter);
         assert(false);
       }
       wqe_counter = (wqe_counter + wq.sqWqeNum - 1) % wq.sqWqeNum;
@@ -547,6 +548,11 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
   uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
   bool is_leader{my_logical_lane_id == num_active_lanes - 1};
   const uint64_t leader_phys_lane_id = core::GetLastActiveLaneID(activemask);
+  if (is_leader) {
+    printf(
+        "raddr: %lx, laddr: %lx, rank:%d, pe: %d, qpId: %d, destOffset: %zu, sourceOffset: %zu\n",
+        raddr, laddr, globalGpuStates->rank, pe, qpId, destOffset, sourceOffset);
+  }
 
   uint32_t warp_sq_counter = 0;
   uint32_t warp_msntbl_counter = 0, warp_psn_counter = 0;
