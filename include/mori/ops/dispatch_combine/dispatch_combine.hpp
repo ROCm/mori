@@ -76,6 +76,7 @@ using index_t = int32_t;
 struct EpDispatchCombineConfig {
   int rank{0};
   int worldSize{0};
+  int numGPUsPerNode{8};
   int hiddenDim{4096};
   int scaleDim{32};
   int scaleTypeSize{1};
@@ -85,6 +86,7 @@ struct EpDispatchCombineConfig {
   int numExpertPerToken{2};
   int warpNumPerBlock{1};
   int blockNum{1};
+  int maxRDMAStepTokens{30};
   int kernelType{KernelType::IntraNode};
   // If true, use external buffer which incurs extra copy overhead; otherwise, the kernel assumes
   // the provided buffer is shmemInpTokMemObj
@@ -368,6 +370,7 @@ static std::ostream& operator<<(std::ostream& s, mori::moe::EpDispatchCombineCon
   std::stringstream ss;
   ss << "EpDispatchCombineConfig: " << std::endl
      << "  WorldSize: " << config.worldSize << std::endl
+     << "  numGPUsPerNode: " << config.numGPUsPerNode << std::endl
      << "  hiddenDim: " << config.hiddenDim << std::endl
      << "  scaleDim: " << config.scaleDim << std::endl
      << "  scaleTypeSize: " << config.scaleTypeSize << std::endl
@@ -377,7 +380,9 @@ static std::ostream& operator<<(std::ostream& s, mori::moe::EpDispatchCombineCon
      << "  numExpertPerRank: " << config.numExpertPerRank << std::endl
      << "  numExpertPerToken: " << config.numExpertPerToken << std::endl
      << "  warpNumPerBlock: " << config.warpNumPerBlock << std::endl
-     << "  blockNum: " << config.blockNum;
+     << "  blockNum: " << config.blockNum << std::endl
+     << "  maxRDMAStepTokens: " << config.maxRDMAStepTokens << std::endl
+     << "  kernelType: " << config.kernelType;
   s << ss.str();
   return s;
 }

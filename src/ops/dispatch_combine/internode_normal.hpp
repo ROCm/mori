@@ -52,7 +52,8 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
 
   const int myPe = config.rank;
   const int npes = config.worldSize;
-  constexpr int nlocalPes = MAX_GPUS_PER_NODE;
+  // constexpr int nlocalPes = MAX_GPUS_PER_NODE;
+  const int nlocalPes = config.numGPUsPerNode;
   const int myLocalPe = config.rank % nlocalPes;
   const int myNode = myPe / nlocalPes;
   const int nNodes = npes / nlocalPes;
@@ -81,8 +82,11 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
 
   // TODO maxRDMAStagingTokens 是RDMA从某一个node收发数据的最大值；maxP2PStagingTokens是转发数据上限
   // TODO staging buffer每个channel不能小于maxNumRDMASendTokens？
-  constexpr int stepRDMATokens = 30;
-  
+  const int stepRDMATokens = config.maxRDMAStepTokens;
+  if (blockId==0 && thdId == 0) {
+    printf("nlocalPes=%d stepRDMATokens=%d\n", nlocalPes, stepRDMATokens);
+  }
+
   // TODO modify maxTokensPerChannel 目前是channel所需的最大size，可以根据实际改小
   const size_t maxTokensPerChannel = max(baseTokensPerChannel + (remTokens ? 1 : 0), stepRDMATokens);
   const size_t maxNumToken = maxTokensPerChannel * nChannels;
@@ -94,9 +98,6 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
   const int maxNumP2pSendTokens = 32;
   const size_t maxP2PStagingTokens = maxTokensPerChannel * nNodes;
 
-  // for (int tokenIdx = channelStartOffset + warpId; tokenIdx < channelEndOffset;
-  //      tokenIdx += warpNum) {
-  // }
   // TODO uodate localPeBuf size
   // For sender
   index_t* tokenIdxToSlotMap = reinterpret_cast<index_t*>(args.localPeBuf);
@@ -392,7 +393,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
       if (warpId == 0) fwdHead[laneId / MAX_NODES][laneId % MAX_NODES] = 0;
       if (laneId == 0) fwdFinish = 0;
       const int fwdLocalPe = warpId;
-      const int fwdPe = myNode * MAX_GPUS_PER_NODE + fwdLocalPe;
+      const int fwdPe = myNode * nlocalPes + fwdLocalPe;
       index_t numTokensToRecv = 0;
       if (laneId < nNodes) {
         index_t* signal =
@@ -401,7 +402,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         rdmaRecvTokensNum[laneId] = numTokensToRecv;
       }
       __syncthreads();
-      if (fwdLocalPe >= MAX_GPUS_PER_NODE) {
+      if (fwdLocalPe >= nlocalPes) {
         __syncthreads();
         return;
       }
@@ -637,7 +638,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         for (int node = 0; node < nNodes; ++node) {
           if (laneId == node) {
             minHead = fwdHead[0][laneId];
-            for (int i = 1; i < MAX_GPUS_PER_NODE; ++i) {
+            for (int i = 1; i < nlocalPes; ++i) {
               minHead = min(minHead, fwdHead[i][laneId]);
             }
           }
@@ -679,11 +680,11 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
       int srcLocalPe = warpId - (kfwdWarpCount + 1);
       // skip self PE
       if (srcLocalPe >= myLocalPe) ++srcLocalPe;
-      if (srcLocalPe >= MAX_GPUS_PER_NODE) {
+      if (srcLocalPe >= nlocalPes) {
         __syncthreads();
         return;
       }
-      int srcPe = myNode * MAX_GPUS_PER_NODE + srcLocalPe;
+      int srcPe = myNode * nlocalPes + srcLocalPe;
 
       uint64_t p2pHeadCache = __hip_atomic_load(
           args.headMemObj->template GetAs<uint64_t*>(srcPe) + channelId * npes + myPe,
