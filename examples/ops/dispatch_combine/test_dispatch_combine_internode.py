@@ -46,11 +46,11 @@ class EpDispatchCombineTestCase:
             # num_experts_per_rank=256 // world_size,
             num_experts_per_token=8,
             warp_num_per_block=16,
-            block_num=64,
+            block_num=80,
             max_token_type_size=2,
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeDedup,
             gpu_per_node=self.gpu_per_node,
-            rdma_block_num=32,
+            rdma_block_num=8,
         )
 
     def setup(self):
@@ -567,6 +567,7 @@ def test_dispatch_combine(
         world_size,
         max_tokens,
         torch.bfloat16,  # torch.float8_e4m3fnuz
+        # torch.float8_e4m3fnuz
     )
     test_case.setup()
     if is_bench:
