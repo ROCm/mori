@@ -21,28 +21,36 @@
 // SOFTWARE.
 #include "src/pybind/mori.hpp"
 
-#include <ATen/hip/HIPContext.h>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+
+#ifdef MORI_WITH_TORCH
+#include <ATen/hip/HIPContext.h>
 #include <torch/python.h>
 
 #include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
+#endif
 
 #include "mori/application/application.hpp"
 #include "mori/io/io.hpp"
 #include "mori/ops/ops.hpp"
 #include "mori/shmem/shmem.hpp"
+#ifdef MORI_WITH_TORCH
 #include "src/pybind/torch_utils.hpp"
+#endif
+#include "src/pybind/dlpack_min.hpp"
+#include "src/pybind/dtype_utils.hpp"
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Ops APIs                                            */
 /* ---------------------------------------------------------------------------------------------- */
 namespace {
 
+#ifdef MORI_WITH_TORCH
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, torch::Tensor,
            torch::Tensor>
 LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
@@ -181,6 +189,175 @@ torch::Tensor GetRegisteredInputBuffer(mori::moe::EpDispatchCombineHandle& handl
                        torch::TensorOptions().dtype(scalarType).device(torch::kCUDA));
   return out;
 }
+#endif  // MORI_WITH_TORCH
+
+// Torch-free raw pointer APIs for dispatch/combine; Python will wrap with torch tensors
+struct MoriTensorDesc {
+  uintptr_t data;
+  int64_t dim0;
+  int64_t dim1;
+  mori::MoriScalarType dtype;
+};
+
+std::tuple<MoriTensorDesc, std::optional<MoriTensorDesc>, std::optional<MoriTensorDesc>,
+           MoriTensorDesc, int64_t>
+LaunchDispatchRaw(mori::moe::EpDispatchCombineHandle& handle, int kernelType, uintptr_t input_ptr,
+                  mori::MoriScalarType input_dtype, std::optional<uintptr_t> weights_ptr,
+                  std::optional<int> scale_type_size, std::optional<uintptr_t> scales_ptr,
+                  uintptr_t topk_ids_ptr, int64_t input_tokens, int blockNum, int warpPerBlock) {
+  float* weightPtr = nullptr;
+  if (weights_ptr.has_value()) {
+    weightPtr = reinterpret_cast<float*>(*weights_ptr);
+  }
+  uint8_t* scalePtr = nullptr;
+  if (scales_ptr.has_value() && handle.config.scaleDim > 0) {
+    scalePtr = reinterpret_cast<uint8_t*>(*scales_ptr);
+  }
+
+  handle.PrepareInference(mori::MoriScalarToHipDataType(input_dtype),
+                          reinterpret_cast<void*>(input_ptr), nullptr, weightPtr, scalePtr,
+                          reinterpret_cast<mori::moe::index_t*>(topk_ids_ptr), input_tokens);
+  handle.LaunchDispatch((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
+#ifdef MORI_WITH_TORCH
+                        at::cuda::getCurrentHIPStream()
+#else
+                        nullptr
+#endif
+  );
+
+  MoriTensorDesc out{reinterpret_cast<uintptr_t>(handle.shmemOutTokMemObj->Get()),
+                     handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim, input_dtype};
+
+  std::optional<MoriTensorDesc> outWeights{std::nullopt};
+  if (weightPtr) {
+    outWeights = MoriTensorDesc{reinterpret_cast<uintptr_t>(handle.shmemOutWeightsMemObj->Get()),
+                                handle.config.MaxNumTokensToRecv(), handle.config.numExpertPerToken,
+                                mori::MoriScalarType::Float32};
+  }
+  std::optional<MoriTensorDesc> outScales{std::nullopt};
+  if (scales_ptr.has_value() && handle.config.scaleDim > 0) {
+    // dtype unknown beyond size; choose based on scale_type_size if provided
+    mori::MoriScalarType st = (handle.config.scaleTypeSize == 2)
+                                  ? mori::MoriScalarType::BFloat16
+                                  : mori::MoriScalarType::Float8_e4m3fnuz;
+    outScales = MoriTensorDesc{reinterpret_cast<uintptr_t>(handle.shmemOutScalesMemObj->Get()),
+                               handle.config.MaxNumTokensToRecv(), handle.config.scaleDim, st};
+  }
+  MoriTensorDesc outIndices{reinterpret_cast<uintptr_t>(handle.shmemOutIndicesMemObj->Get()),
+                            handle.config.MaxNumTokensToRecv(), handle.config.numExpertPerToken,
+                            mori::MoriScalarType::Int32};
+  int64_t totalRecvTokenNum = static_cast<int64_t>(*handle.totalRecvTokenNum);
+  return {out, outWeights, outScales, outIndices, totalRecvTokenNum};
+}
+
+std::tuple<MoriTensorDesc, std::optional<MoriTensorDesc>> LaunchCombineRaw(
+    mori::moe::EpDispatchCombineHandle& handle, int kernelType, uintptr_t input_ptr,
+    mori::MoriScalarType input_dtype, std::optional<uintptr_t> weights_ptr, uintptr_t topk_ids_ptr,
+    int blockNum, int warpPerBlock) {
+  float* weightsPtr = nullptr;
+  if (weights_ptr.has_value()) {
+    weightsPtr = reinterpret_cast<float*>(*weights_ptr);
+  }
+  handle.PrepareInference(
+      mori::MoriScalarToHipDataType(input_dtype), reinterpret_cast<void*>(input_ptr), nullptr,
+      weightsPtr, reinterpret_cast<mori::moe::index_t*>(topk_ids_ptr), handle.curRankNumToken);
+  handle.LaunchCombine((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
+#ifdef MORI_WITH_TORCH
+                       at::cuda::getCurrentHIPStream()
+#else
+                       nullptr
+#endif
+  );
+  MoriTensorDesc out{reinterpret_cast<uintptr_t>(handle.shmemOutTokMemObj->Get()),
+                     handle.config.maxNumInpTokenPerRank, handle.config.hiddenDim, input_dtype};
+  std::optional<MoriTensorDesc> outWeights{std::nullopt};
+  if (weightsPtr) {
+    outWeights = MoriTensorDesc{reinterpret_cast<uintptr_t>(handle.shmemOutWeightsMemObj->Get()),
+                                handle.config.maxNumInpTokenPerRank,
+                                handle.config.numExpertPerToken, mori::MoriScalarType::Float32};
+  }
+  return {out, outWeights};
+}
+
+void LaunchResetRaw(mori::moe::EpDispatchCombineHandle& handle) {
+#ifdef MORI_WITH_TORCH
+  handle.LaunchReset(at::cuda::getCurrentHIPStream());
+#else
+  handle.LaunchReset(nullptr);
+#endif
+}
+
+uintptr_t GetRegisteredInputBufferRaw(mori::moe::EpDispatchCombineHandle& handle) {
+  return reinterpret_cast<uintptr_t>(handle.shmemInpTokMemObj->Get());
+}
+
+py::capsule ExportToDlpack(const MoriTensorDesc& desc, int device_id) {
+  auto* managed = new DLManagedTensor();
+  managed->manager_ctx = nullptr;
+  managed->deleter = [](DLManagedTensor* self) {
+    // We don't own underlying data; only delete the wrapper
+    if (self->dl_tensor.shape) delete[] self->dl_tensor.shape;
+    delete self;
+  };
+  managed->dl_tensor.data = reinterpret_cast<void*>(desc.data);
+  managed->dl_tensor.device = {kDLROCM, device_id};
+  if (desc.dim1 <= 1) {
+    managed->dl_tensor.ndim = 1;
+    managed->dl_tensor.shape = new dlp_shape_t[1]{desc.dim0};
+  } else {
+    managed->dl_tensor.ndim = 2;
+    managed->dl_tensor.shape = new dlp_shape_t[2]{desc.dim0, desc.dim1};
+  }
+  managed->dl_tensor.strides = nullptr;
+  managed->dl_tensor.byte_offset = 0;
+  switch (desc.dtype) {
+    case mori::MoriScalarType::Float32:
+      managed->dl_tensor.dtype = {kDLFloat, 32, 1};
+      break;
+    case mori::MoriScalarType::BFloat16:
+      managed->dl_tensor.dtype = {kDLBfloat, 16, 1};
+      break;
+    case mori::MoriScalarType::Float8_e4m3fnuz:
+      managed->dl_tensor.dtype = {kDLFloat, 8, 1};
+      break;
+    case mori::MoriScalarType::Int32:
+      managed->dl_tensor.dtype = {kDLInt, 32, 1};
+      break;
+    case mori::MoriScalarType::UInt32:
+      managed->dl_tensor.dtype = {kDLUInt, 32, 1};
+      break;
+    case mori::MoriScalarType::UInt64:
+      managed->dl_tensor.dtype = {kDLUInt, 64, 1};
+      break;
+  }
+  return py::capsule(managed, "dltensor", [](PyObject* cap) {
+    auto* m = reinterpret_cast<DLManagedTensor*>(PyCapsule_GetPointer(cap, "dltensor"));
+    if (m && m->deleter) m->deleter(m);
+  });
+}
+
+std::pair<int64_t, int64_t> GetRegisteredInputBufferShape(
+    mori::moe::EpDispatchCombineHandle& handle) {
+  return {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim};
+}
+
+MoriTensorDesc GetDispatchSenderTokenIdxMapRaw(mori::moe::EpDispatchCombineHandle& handle) {
+  int64_t n = static_cast<int64_t>(handle.curRankNumToken) * handle.config.numExpertPerToken;
+  return {reinterpret_cast<uintptr_t>(handle.dispSenderIdxMap), n, 1, mori::MoriScalarType::Int32};
+}
+
+MoriTensorDesc GetDispatchReceiverTokenIdxMapRaw(mori::moe::EpDispatchCombineHandle& handle) {
+  int64_t n = static_cast<int64_t>(*handle.localPeTokenCounter);
+  return {reinterpret_cast<uintptr_t>(handle.dispReceiverIdxMap), n, 1,
+          mori::MoriScalarType::Int32};
+}
+
+MoriTensorDesc GetDispatchSrcTokenIdRaw(mori::moe::EpDispatchCombineHandle& handle) {
+  int64_t n = static_cast<int64_t>(*handle.totalRecvTokenNum);
+  return {reinterpret_cast<uintptr_t>(
+              handle.dispTokIdToSrcTokIdMemObj->template GetAs<mori::moe::index_t*>()),
+          n, 1, mori::MoriScalarType::Int32};
+}
 
 void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   std::string className = std::string("EpDispatchCombineHandle");
@@ -188,29 +365,64 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
       .def(pybind11::init<mori::moe::EpDispatchCombineConfig>(),
            py::arg("config") = mori::moe::EpDispatchCombineConfig{});
 
-  std::string funcName = std::string("launch_dispatch");
+  std::string funcName;
+#ifdef MORI_WITH_TORCH
+  funcName = std::string("launch_dispatch");
   m.def(funcName.c_str(), &LaunchDispatch);
-
   funcName = std::string("launch_combine");
   m.def(funcName.c_str(), &LaunchCombine);
-
   funcName = std::string("launch_reset");
   m.def(funcName.c_str(), &LaunchReset);
+#endif
+
+  // Torch-free raw interfaces
+  py::class_<MoriTensorDesc>(m, "MoriTensorDesc")
+      .def(py::init<>())
+      .def(py::init<uintptr_t, int64_t, int64_t, mori::MoriScalarType>())
+      .def_readwrite("data", &MoriTensorDesc::data)
+      .def_readwrite("dim0", &MoriTensorDesc::dim0)
+      .def_readwrite("dim1", &MoriTensorDesc::dim1)
+      .def_readwrite("dtype", &MoriTensorDesc::dtype);
+
+  py::enum_<mori::MoriScalarType>(m, "MoriScalarType")
+      .value("Float32", mori::MoriScalarType::Float32)
+      .value("BFloat16", mori::MoriScalarType::BFloat16)
+      .value("Float8_e4m3fnuz", mori::MoriScalarType::Float8_e4m3fnuz)
+      .export_values();
+
+  m.def("launch_dispatch_raw", &LaunchDispatchRaw, py::arg("handle"), py::arg("kernel_type"),
+        py::arg("input_ptr"), py::arg("input_dtype"), py::arg("weights_ptr") = std::nullopt,
+        py::arg("scale_type_size") = std::nullopt, py::arg("scales_ptr") = std::nullopt,
+        py::arg("topk_ids_ptr"), py::arg("input_tokens"), py::arg("block_num") = -1,
+        py::arg("warp_per_block") = -1);
+
+  m.def("launch_combine_raw", &LaunchCombineRaw, py::arg("handle"), py::arg("kernel_type"),
+        py::arg("input_ptr"), py::arg("input_dtype"), py::arg("weights_ptr") = std::nullopt,
+        py::arg("topk_ids_ptr"), py::arg("block_num") = -1, py::arg("warp_per_block") = -1);
+
+  m.def("launch_reset_raw", &LaunchResetRaw, py::arg("handle"));
+  m.def("get_registered_input_buffer_raw", &GetRegisteredInputBufferRaw, py::arg("handle"));
+  m.def("export_to_dlpack", &ExportToDlpack, py::arg("desc"), py::arg("device_id") = 0);
+  m.def("get_registered_input_buffer_shape", &GetRegisteredInputBufferShape, py::arg("handle"));
+  m.def("get_dispatch_sender_token_idx_map_raw", &GetDispatchSenderTokenIdxMapRaw,
+        py::arg("handle"));
+  m.def("get_dispatch_receiver_token_idx_map_raw", &GetDispatchReceiverTokenIdxMapRaw,
+        py::arg("handle"));
+  m.def("get_dispatch_src_token_pos_raw", &GetDispatchSrcTokenIdRaw, py::arg("handle"));
 
   funcName = std::string("get_cur_rank_num_token");
   m.def(funcName.c_str(), &mori::moe::EpDispatchCombineHandle::GetCurRankNumToken);
 
+#ifdef MORI_WITH_TORCH
   funcName = std::string("get_dispatch_src_token_pos");
   m.def(funcName.c_str(), &GetDispatchSrcTokenId);
-
   funcName = std::string("get_dispatch_sender_token_idx_map");
   m.def(funcName.c_str(), &GetDispatchSenderTokenIdxMap);
-
   funcName = std::string("get_dispatch_receiver_token_idx_map");
   m.def(funcName.c_str(), &GetDispatchReceiverTokenIdxMap);
-
   funcName = std::string("get_registered_input_buffer");
   m.def(funcName.c_str(), &GetRegisteredInputBuffer);
+#endif
 }
 
 }  // namespace
@@ -239,6 +451,13 @@ namespace {}
 namespace mori {
 
 void RegisterMoriOps(py::module_& m) {
+  m.def("with_torch", []() {
+#ifdef MORI_WITH_TORCH
+    return true;
+#else
+    return false;
+#endif
+  });
   pybind11::enum_<mori::moe::KernelType>(m, "EpDispatchCombineKernelType")
       .value("IntraNode", mori::moe::KernelType::IntraNode)
       .value("InterNode", mori::moe::KernelType::InterNode)

@@ -56,6 +56,7 @@ def _cpp_dispatch_combine_factory(entity_name):
 class EpDispatchCombineOp:
     def __init__(self, config):
         self.config = config
+        self._with_torch = getattr(mori_cpp, "with_torch", lambda: True)()
 
         handle_class = _cpp_dispatch_combine_factory("EpDispatchCombineHandle")
         self._handle = handle_class(
@@ -75,27 +76,77 @@ class EpDispatchCombineOp:
             )
         )
 
-        self._dispatch_func = _cpp_dispatch_combine_factory("launch_dispatch")
-        self._combine_func = _cpp_dispatch_combine_factory("launch_combine")
-        self._reset_func = _cpp_dispatch_combine_factory("launch_reset")
-        self._get_dispatch_src_token_pos_func = _cpp_dispatch_combine_factory(
-            "get_dispatch_src_token_pos"
-        )
+        if self._with_torch:
+            self._dispatch_func = _cpp_dispatch_combine_factory("launch_dispatch")
+            self._combine_func = _cpp_dispatch_combine_factory("launch_combine")
+            self._reset_func = _cpp_dispatch_combine_factory("launch_reset")
+            self._get_dispatch_src_token_pos_func = _cpp_dispatch_combine_factory(
+                "get_dispatch_src_token_pos"
+            )
+            self._get_registered_input_buffer = _cpp_dispatch_combine_factory(
+                "get_registered_input_buffer"
+            )
+            self._get_dispatch_sender_token_idx_map_func = (
+                _cpp_dispatch_combine_factory("get_dispatch_sender_token_idx_map")
+            )
+            self._get_dispatch_receiver_token_idx_map_func = (
+                _cpp_dispatch_combine_factory("get_dispatch_receiver_token_idx_map")
+            )
+        else:
+            # raw APIs
+            self._dispatch_func_raw = _cpp_dispatch_combine_factory(
+                "launch_dispatch_raw"
+            )
+            self._combine_func_raw = _cpp_dispatch_combine_factory("launch_combine_raw")
+            self._reset_func = _cpp_dispatch_combine_factory("launch_reset_raw")
+            self._get_registered_input_buffer_raw = _cpp_dispatch_combine_factory(
+                "get_registered_input_buffer_raw"
+            )
+            self._get_registered_input_buffer_shape = _cpp_dispatch_combine_factory(
+                "get_registered_input_buffer_shape"
+            )
+            self._export_to_dlpack = _cpp_dispatch_combine_factory("export_to_dlpack")
+            self._get_dispatch_sender_token_idx_map_raw = _cpp_dispatch_combine_factory(
+                "get_dispatch_sender_token_idx_map_raw"
+            )
+            self._get_dispatch_receiver_token_idx_map_raw = (
+                _cpp_dispatch_combine_factory("get_dispatch_receiver_token_idx_map_raw")
+            )
+            self._get_dispatch_src_token_pos_raw = _cpp_dispatch_combine_factory(
+                "get_dispatch_src_token_pos_raw"
+            )
         self._get_cur_rank_num_token = _cpp_dispatch_combine_factory(
             "get_cur_rank_num_token"
         )
-        self._get_dispatch_sender_token_idx_map_func = _cpp_dispatch_combine_factory(
-            "get_dispatch_sender_token_idx_map"
+
+    def _torch_dtype_to_mori(self, dtype: torch.dtype):
+        mt = mori_cpp.MoriScalarType
+        if dtype == torch.float32:
+            return mt.Float32
+        if dtype == torch.bfloat16:
+            return mt.BFloat16
+        # float8 may be unavailable on some builds; assume e4m3
+        if hasattr(torch, "float8_e4m3fnuz") and dtype == torch.float8_e4m3fnuz:
+            return mt.Float8_e4m3fnuz
+        raise ValueError(f"Unsupported dtype for MORI: {dtype}")
+
+    def _from_desc(self, desc, device=None):
+        if device is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        cap = self._export_to_dlpack(
+            desc, device.index if device.index is not None else 0
         )
-        self._get_dispatch_receiver_token_idx_map_func = _cpp_dispatch_combine_factory(
-            "get_dispatch_receiver_token_idx_map"
-        )
-        self._get_registered_input_buffer = _cpp_dispatch_combine_factory(
-            "get_registered_input_buffer"
-        )
+        return torch.utils.dlpack.from_dlpack(cap)
 
     def get_registered_input_buffer(self, dtype: torch.dtype):
-        return self._get_registered_input_buffer(self._handle, dtype)
+        if self._with_torch:
+            return self._get_registered_input_buffer(self._handle, dtype)
+        ptr = self._get_registered_input_buffer_raw(self._handle)
+        dim0, dim1 = self._get_registered_input_buffer_shape(self._handle)
+        desc = mori_cpp.MoriTensorDesc(
+            ptr, dim0, dim1, self._torch_dtype_to_mori(dtype)
+        )
+        return self._from_desc(desc)
 
     def dispatch(
         self,
@@ -106,16 +157,42 @@ class EpDispatchCombineOp:
         block_num: int = -1,
         warp_per_block: int = -1,
     ):
-        return self._dispatch_func(
+        if self._with_torch:
+            return self._dispatch_func(
+                self._handle,
+                self.config.kernel_type.value,
+                input,
+                weights,
+                scales,
+                indices,
+                block_num,
+                warp_per_block,
+            )
+        desc_out, desc_w, desc_s, desc_idx, total_recv = self._dispatch_func_raw(
             self._handle,
             self.config.kernel_type.value,
-            input,
-            weights,
-            scales,
-            indices,
+            input.data_ptr(),
+            self._torch_dtype_to_mori(input.dtype),
+            weights.data_ptr() if weights is not None and weights.numel() > 0 else None,
+            self.config.scale_type_size if scales is not None else None,
+            (
+                scales.data_ptr()
+                if scales is not None and self.config.scale_dim > 0
+                else None
+            ),
+            indices.data_ptr(),
+            input.shape[0],
             block_num,
             warp_per_block,
         )
+        out = self._from_desc(desc_out, input.device)
+        out_w = self._from_desc(desc_w, input.device) if desc_w is not None else None
+        out_s = self._from_desc(desc_s, input.device) if desc_s is not None else None
+        out_idx = self._from_desc(desc_idx, input.device)
+        total_recv_tensor = torch.tensor(
+            [total_recv], device=input.device, dtype=torch.int64
+        )
+        return out, out_w, out_s, out_idx, total_recv_tensor
 
     def combine(
         self,
@@ -126,15 +203,36 @@ class EpDispatchCombineOp:
         warp_per_block: int = -1,
         call_reset: bool = True,
     ):
-        output = self._combine_func(
-            self._handle,
-            self.config.kernel_type.value,
-            input,
-            weights,
-            indices,
-            block_num,
-            warp_per_block,
-        )
+        if self._with_torch:
+            output = self._combine_func(
+                self._handle,
+                self.config.kernel_type.value,
+                input,
+                weights,
+                indices,
+                block_num,
+                warp_per_block,
+            )
+        else:
+            desc_out, desc_w = self._combine_func_raw(
+                self._handle,
+                self.config.kernel_type.value,
+                input.data_ptr(),
+                self._torch_dtype_to_mori(input.dtype),
+                (
+                    weights.data_ptr()
+                    if weights is not None and weights.numel() > 0
+                    else None
+                ),
+                indices.data_ptr(),
+                block_num,
+                warp_per_block,
+            )
+            out = self._from_desc(desc_out, input.device)
+            out_w = (
+                self._from_desc(desc_w, input.device) if desc_w is not None else None
+            )
+            output = (out, out_w)
         if call_reset:
             self._reset_func(self._handle)
         return output
@@ -177,14 +275,26 @@ class EpDispatchCombineOp:
         torch.cuda.synchronize()
 
         if self.config.kernel_type.value == EpDispatchCombineKernelType.IntraNode.value:
-            return self._get_dispatch_src_token_pos_func(self._handle)
+            if self._with_torch:
+                return self._get_dispatch_src_token_pos_func(self._handle)
+            else:
+                desc = self._get_dispatch_src_token_pos_raw(self._handle)
+                return self._from_desc(desc).to(torch.int64)
 
-        dispatch_sender_token_id_map = self._get_dispatch_sender_token_idx_map_func(
-            self._handle
-        )
-        dispatch_receiver_token_id_map = self._get_dispatch_receiver_token_idx_map_func(
-            self._handle
-        )
+        if self._with_torch:
+            dispatch_sender_token_id_map = self._get_dispatch_sender_token_idx_map_func(
+                self._handle
+            )
+            dispatch_receiver_token_id_map = (
+                self._get_dispatch_receiver_token_idx_map_func(self._handle)
+            )
+        else:
+            dispatch_sender_token_id_map = self._from_desc(
+                self._get_dispatch_sender_token_idx_map_raw(self._handle)
+            ).to(torch.int32)
+            dispatch_receiver_token_id_map = self._from_desc(
+                self._get_dispatch_receiver_token_idx_map_raw(self._handle)
+            ).to(torch.int32)
 
         max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank
         all_rank_sender_map = self._allgather_with_token_num_padding(
