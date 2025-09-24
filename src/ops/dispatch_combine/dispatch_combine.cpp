@@ -81,7 +81,7 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
 
   assert(config.blockNum % 2 == 0);
   const int channelNum = config.blockNum / 2;
-  const int nNodes = config.worldSize / MAX_GPUS_PER_NODE;
+  const int nNodes = config.worldSize / config.numGPUsPerNode;
   // TODO maxNumInpTokenPerRank could be smaller
   const size_t maxNumInpTokenPerRank =
       ((config.maxNumInpTokenPerRank + channelNum - 1) / channelNum) * channelNum;
@@ -100,7 +100,7 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
 
   shmemOutTokMemObj = ShmemMallocAndReturnMemObjPtr(config.kernelType == KernelType::InterNodeNormal
-                                                        ? maxStagingTokSize * MAX_GPUS_PER_NODE
+                                                        ? maxStagingTokSize * config.numGPUsPerNode
                                                         : maxTokenSize,
                                                     hipDeviceMallocUncached);
 
@@ -157,7 +157,7 @@ void EpDispatchCombineHandle::FinalizeTokenNumSignalBuf() {
 
 void EpDispatchCombineHandle::InitializeNormalKernelBuf() {
   const int channelNum = config.blockNum / 2;
-  const int nNodes = config.worldSize / MAX_GPUS_PER_NODE;
+  const int nNodes = config.worldSize / config.numGPUsPerNode;
   const int maxNumInpTokenPerRank =
       ((config.maxNumInpTokenPerRank + channelNum - 1) / channelNum) * channelNum;
   const size_t localPeBufSize =

@@ -52,7 +52,6 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
 
   const int myPe = config.rank;
   const int npes = config.worldSize;
-  // constexpr int nlocalPes = MAX_GPUS_PER_NODE;
   const int nlocalPes = config.numGPUsPerNode;
   const int myLocalPe = config.rank % nlocalPes;
   const int myNode = myPe / nlocalPes;

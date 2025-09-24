@@ -45,6 +45,8 @@ class EpDispatchCombineConfig:
     num_experts_per_token: int
     warp_num_per_block: int = 8
     block_num: int = 80
+    num_gpus_per_node: int = 8
+    max_rdma_step_tokens: int = 30
     use_external_inp_buf: bool = True
     kernel_type: EpDispatchCombineKernelType = EpDispatchCombineKernelType.IntraNode
 
@@ -62,6 +64,7 @@ class EpDispatchCombineOp:
             mori_cpp.EpDispatchCombineConfig(
                 rank=config.rank,
                 world_size=config.world_size,
+                num_gpus_per_node=config.num_gpus_per_node,
                 hidden_dim=config.hidden_dim,
                 scale_dim=config.scale_dim,
                 scale_type_size=config.scale_type_size,
@@ -71,6 +74,7 @@ class EpDispatchCombineOp:
                 num_experts_per_token=config.num_experts_per_token,
                 warp_num_per_block=config.warp_num_per_block,
                 block_num=config.block_num,
+                max_rdma_step_tokens=config.max_rdma_step_tokens,
                 kernel_type=config.kernel_type,
                 use_external_inp_buf=config.use_external_inp_buf,
             )
@@ -232,4 +236,3 @@ class EpDispatchCombineOp:
             src_token_pos.append(src_pe * max_num_token_to_send_per_rank + src_tok_id)
 
         return torch.tensor(src_token_pos, dtype=torch.int)
-
