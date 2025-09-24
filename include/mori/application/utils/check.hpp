@@ -38,7 +38,6 @@ namespace application {
               hipGetErrorString(result));                                  \
       exit(-1);                                                            \
     }                                                                      \
-    assert(hipSuccess == result);                                          \
   } while (0)
 
 #define HIP_RUNTIME_CHECK_WITH_BACKTRACE(stmt)                             \
@@ -52,7 +51,6 @@ namespace application {
       backtrace_symbols_fd(array, size, STDERR_FILENO);                    \
       exit(-1);                                                            \
     }                                                                      \
-    assert(hipSuccess == result);                                          \
   } while (0)
 
 #define SYSCALL_RETURN_ZERO(stmt)                                                               \
@@ -85,7 +83,6 @@ namespace application {
       fprintf(stderr, "[%s:%d] rocm smi failed with %s \n", __FILE__, __LINE__, msg); \
       exit(-1);                                                                       \
     }                                                                                 \
-    assert(RSMI_STATUS_SUCCESS == result);                                            \
   } while (0)
 
 }  // namespace application

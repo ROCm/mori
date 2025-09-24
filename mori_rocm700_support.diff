@@ -1,0 +1,47 @@
+diff --git a/include/mori/application/utils/check.hpp b/include/mori/application/utils/check.hpp
+index 08d75ea..6ddc107 100644
+--- a/include/mori/application/utils/check.hpp
++++ b/include/mori/application/utils/check.hpp
+@@ -38,7 +38,6 @@ namespace application {
+               hipGetErrorString(result));                                  \
+       exit(-1);                                                            \
+     }                                                                      \
+-    assert(hipSuccess == result);                                          \
+   } while (0)
+ 
+ #define HIP_RUNTIME_CHECK_WITH_BACKTRACE(stmt)                             \
+@@ -52,7 +51,6 @@ namespace application {
+       backtrace_symbols_fd(array, size, STDERR_FILENO);                    \
+       exit(-1);                                                            \
+     }                                                                      \
+-    assert(hipSuccess == result);                                          \
+   } while (0)
+ 
+ #define SYSCALL_RETURN_ZERO(stmt)                                                               \
+@@ -85,7 +83,6 @@ namespace application {
+       fprintf(stderr, "[%s:%d] rocm smi failed with %s \n", __FILE__, __LINE__, msg); \
+       exit(-1);                                                                       \
+     }                                                                                 \
+-    assert(RSMI_STATUS_SUCCESS == result);                                            \
+   } while (0)
+ 
+ }  // namespace application
+diff --git a/include/mori/core/utils.hpp b/include/mori/core/utils.hpp
+index 419abf4..f8b59e8 100644
+--- a/include/mori/core/utils.hpp
++++ b/include/mori/core/utils.hpp
+@@ -21,6 +21,14 @@
+ // SOFTWARE.
+ #pragma once
+ 
++#ifndef warpSize
++#if defined(__GFX8__) || defined(__GFX9__)
++  #define warpSize 64
++#else
++  #define warpSize 32
++#endif
++#endif
++
+ namespace mori {
+ namespace core {
+ 
