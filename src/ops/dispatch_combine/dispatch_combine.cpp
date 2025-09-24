@@ -85,7 +85,7 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   // TODO maxNumInpTokenPerRank could be smaller
   const size_t maxNumInpTokenPerRank =
       ((config.maxNumInpTokenPerRank + channelNum - 1) / channelNum) * channelNum;
-  constexpr int stepRDMATokens = 30;
+  const int stepRDMATokens = config.maxRDMAStepTokens;
 
   const size_t stagingTokens =
       max(maxNumInpTokenPerRank * nNodes, stepRDMATokens * nNodes * channelNum);
