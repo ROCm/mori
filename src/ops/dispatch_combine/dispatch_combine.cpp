@@ -97,8 +97,12 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
                              (tokenBytes + weightBytes + indiceBytes +
                               sizeof(index_t) * config.numExpertPerToken + scaleBytes + metaBytes);
   shmemInpTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
-  shmemOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
   shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
+
+  shmemOutTokMemObj = ShmemMallocAndReturnMemObjPtr(config.kernelType == KernelType::InterNodeNormal
+                                                        ? maxStagingTokSize * MAX_GPUS_PER_NODE
+                                                        : maxTokenSize,
+                                                    hipDeviceMallocUncached);
 
   // HIP_RUNTIME_CHECK(hipMalloc(&outTokenBuf, maxTokenSize));
   // HIP_RUNTIME_CHECK(hipMemset(outTokenBuf, 0, maxTokenSize));

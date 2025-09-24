@@ -27,8 +27,9 @@
 
 namespace mori {
 namespace moe {
-#define DEBUG 1
+#define DEBUG 0
 #define DEBUG_DATA 0
+#define SPINS_CNT 100000
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpDispatchInterNodeNormalKernel                             */
@@ -236,24 +237,24 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
                   args.tailMemObj->template GetAs<uint64_t*>(destPe) + myPe + channelId * npes,
                   tailCache, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 #if DEBUG == 1
-              printf(
-                  "send RDMA put rank=%d call=%d warpId=%d destPe=%d numTokensToSend=%d "
-                  "sendSlotStart=%d offset=%d "
-                  "tail=%lu\n",
-                  myPe, args.crossDeviceBarrierFlag, warpId, destPe, numTokensToSend, sendSlotStart,
-                  myPe + channelId * npes,
-                  *(args.tailMemObj->template GetAs<uint64_t*>(destPe) + myPe + channelId * npes));
+              // printf(
+              //     "send RDMA put rank=%d call=%d warpId=%d destPe=%d numTokensToSend=%d "
+              //     "sendSlotStart=%d offset=%d "
+              //     "tail=%lu\n",
+              //     myPe, args.crossDeviceBarrierFlag, warpId, destPe, numTokensToSend, sendSlotStart,
+              //     myPe + channelId * npes,
+              //     *(args.tailMemObj->template GetAs<uint64_t*>(destPe) + myPe + channelId * npes));
 #endif
             } else {
               shmem::ShmemPutUint64ImmNbiThread(
                   args.tailMemObj, (myPe + channelId * npes) * sizeof(uint64_t), tailCache, destPe);
 #if DEBUG == 1
-              printf(
-                  "send RDMA put rank=%d call=%d warpId=%d destPe=%d numTokensToSend=%d "
-                  "sendSlotStart=%d offset=%d "
-                  "tailCache=%lu\n",
-                  myPe, args.crossDeviceBarrierFlag, warpId, destPe, numTokensToSend, sendSlotStart,
-                  myPe + channelId * npes, tailCache);
+              // printf(
+              //     "send RDMA put rank=%d call=%d warpId=%d destPe=%d numTokensToSend=%d "
+              //     "sendSlotStart=%d offset=%d "
+              //     "tailCache=%lu\n",
+              //     myPe, args.crossDeviceBarrierFlag, warpId, destPe, numTokensToSend, sendSlotStart,
+              //     myPe + channelId * npes, tailCache);
 #endif
             }
           }
@@ -272,11 +273,13 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
 
         }
       }
+#if DEBUG == 1
       if (laneId < nNodes) {
         args.localTail[(laneId * nlocalPes + myLocalPe) + channelId * npes] = tailCache;
         printf("send RDMA after rank=%d warpId=%d peerRank=%d args.localTail=%lu\n", myPe, warpId,
                laneId * nlocalPes + myLocalPe, tailCache);
       }
+#endif
       // clear data
       for (int i = laneId; i < nNodes * maxTokensPerChannel; i += warpSize) {
         slotToTokenIdxMap[i] = 0;
@@ -307,11 +310,23 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           //                                   __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
           //   }
           // }
+          int spins = 0;
           while (tailCache - headCache >= maxRDMASteps) {
-            if (laneId == node)
+            if (laneId == node) {
               headCache = __hip_atomic_load(args.headMemObj->template GetAs<uint64_t*>() +
                                                 channelId * npes + (node * nlocalPes + myLocalPe),
                                             __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+              ++spins;
+              // if (spins == SPINS_CNT) {
+              //   printf(
+              //       "send to RDMA staging TIMEOUT rank=%d wait peer=%d call=%d warpId=%d "
+              //       "node=%d "
+              //       "channelId=%d tailCache=%lu "
+              //       "headCache=%lu\n",
+              //       myPe, node * nlocalPes + myLocalPe, args.crossDeviceBarrierFlag, warpId, node,
+              //       channelId, tailCache, headCache);
+              // }
+            }
             headCache = __shfl(headCache, node);
           }
 
@@ -403,10 +418,12 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
       uint64_t headCache = headBase;
       uint64_t tailCache = headCache;
 
+#if DEBUG == 1
       if (laneId < nNodes) {
         printf("recv fwd before rank=%d call=%d warpId=%d node=%d localHead=%lu\n", myPe,
                args.crossDeviceBarrierFlag, warpId, laneId, headCache);
       }
+#endif
 
       uint64_t p2pHeadCache =
           __hip_atomic_load(args.headMemObj->template GetAs<uint64_t*>() + channelId * npes + fwdPe,
@@ -432,25 +449,34 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             tailCache = __hip_atomic_load(
                 args.tailMemObj->template GetAs<uint64_t*>() + srcPe + channelId * npes,
                 __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-            if (spins == 10000) {
-              printf(
-                  "recv fwd TO rank=%d wait srcPe=%d call=%d warpId=%d srcNode=%d "
-                  "syncNumTokensToRecv=%d tailCache=%lu "
-                  "headCache=%lu\n",
-                  myPe, srcPe, args.crossDeviceBarrierFlag, warpId, srcNode,
-                  syncNumTokensToRecv, tailCache, headCache);
-            }
+            // if (spins == SPINS_CNT) {
+            //   printf(
+            //       "recv fwd wait data TIMEOUT rank=%d srcPe=%d call=%d warpId=%d srcNode=%d "
+            //       "syncNumTokensToRecv=%d tailCache=%lu "
+            //       "headCache=%lu\n",
+            //       myPe, srcPe, args.crossDeviceBarrierFlag, warpId, srcNode, syncNumTokensToRecv,
+            //       tailCache, headCache);
+            // }
             ++spins;
           }
         }
 
         // check buffer ready (shmemOutTokMemObj)
         if (laneId == 0 && srcNode != myNode) {
+          int spins = 0;
           while (true) {
             if (p2pTailCache - p2pHeadCache < maxP2PStagingTokens) break;
             p2pHeadCache = __hip_atomic_load(
                 args.headMemObj->template GetAs<uint64_t*>() + channelId * npes + fwdPe,
                 __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            // if (spins == SPINS_CNT) {
+            //   printf(
+            //       "recv fwd wait buffer TIMEOUT rank=%d fwdPe=%d call=%d warpId=%d srcNode=%d "
+            //       "channelId=%d p2pTailCache=%lu "
+            //       "p2pHeadCache=%lu\n",
+            //       myPe, fwdPe, args.crossDeviceBarrierFlag, warpId, srcNode, channelId,
+            //       p2pTailCache, p2pHeadCache);
+            // }
           }
         }
 
@@ -464,7 +490,6 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           if (srcNode == laneId) {
             --numTokensToRecv;
 #if DEBUG == 1
-            // printf("WYT DEBUG laneId=%d numTokensToRecv=%d\n", laneId, numTokensToRecv);
             assert(numTokensToRecv >= 0);
 #endif
           }
@@ -573,9 +598,11 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             args.intraNodeBarrierMemObj->template GetAs<int*>(fwdPe) + myPe + channelId * npes;
         shmem::ShmemInt32WaitUntilEquals(statusPtr, 0);
         core::AtomicStoreRelaxedSystem(statusPtr, fwdCounter + 1);
+#if DEBUG==1
         if (laneId == 0)
           printf("recv fwd rank=%d warpId=%d fwdPe=%d fwdCounter=%d\n", myPe, warpId, fwdPe,
                  fwdCounter);
+#endif
       }
     } else if (warpId == kfwdWarpCount) {
       __syncthreads();
@@ -664,6 +691,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         // check data ready (shmemOutTokMemObj)
         // TODO 可能改成所有thr进入while loop？
         if (laneId == 0) {
+          int spins = 0;
           while (true) {
             if (p2pTailCache >= p2pHeadCache + 1 || done) break;
             p2pTailCache = __hip_atomic_load(
@@ -671,6 +699,14 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
                 __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
             done = core::AtomicLoadRelaxedSystem(statusPtr);
           }
+          // if (spins == SPINS_CNT) {
+          //   printf(
+          //       "recv copy wait data TIMEOUT rank=%d srcPe=%d call=%d warpId=%d "
+          //       "channelId=%d p2pTailCache=%lu "
+          //       "p2pHeadCache=%lu\n",
+          //       myPe, srcPe, args.crossDeviceBarrierFlag, warpId, channelId, p2pTailCache,
+          //       p2pHeadCache);
+          // }
         }
         p2pTailCache = __shfl(p2pTailCache, 0);
 
