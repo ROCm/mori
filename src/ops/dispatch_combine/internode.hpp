@@ -260,12 +260,12 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
     shmem::ShmemAtomicTypeNonFetchWarp<int64_t>(
         args.sendAtomicSignalMemObj,
         (myPe + (args.crossDeviceBarrierFlag & 1) * npes) * sizeof(int64_t),
-        args.sendAtomicSignalMemObj->GetRdmaMemoryRegion(myPe), (2 * npes) * sizeof(int64_t), 1,
-        core::AMO_ADD, destPe, localBlockId);
+        args.sendAtomicSignalMemObj->GetRdmaMemoryRegion(myPe), (2 * npes + myPe) * sizeof(int64_t),
+        1, core::AMO_ADD, destPe, localBlockId);
   }
   if (thdId == 0) {
     int64_t* signal = args.sendAtomicSignalMemObj->template GetAs<int64_t*>() + destPe +
-                       (args.crossDeviceBarrierFlag & 1) * npes;
+                      (args.crossDeviceBarrierFlag & 1) * npes;
     shmem::ShmemInt64WaitUntilGreaterThan(signal, numsBlockPerDestPe - 1);
     recvTokenNum = atomicAdd(
         &args.recvTokenNumMemObj
@@ -332,7 +332,8 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
 /*                                          BarrierKernel                                         */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>
-inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T> args) {
+inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T> args,
+                                                         int numQps) {
   int thdId = threadIdx.x;
   int laneId = threadIdx.x & (warpSize - 1);
   int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
@@ -344,18 +345,14 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   if (laneId == 0) atomicAdd(args.combineGridBarrier, 1);
 
   // TODO: still figure out why use multiple threads lost RDMA writes
-  for (int destPe = globalWarpId; destPe < args.config.worldSize; destPe += globalWarpNum) {
-    if (laneId == 0) {
-      shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
-      shmem::ShmemPutUint32ImmNbiWarp(args.crossDeviceBarrierMemObj,
-                                      args.config.rank * sizeof(uint32_t),
-                                      args.crossDeviceBarrierFlag, destPe);
-    }
+  if (laneId == 0) {
+    shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
   }
 
-  uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
+  uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
   if (thdId < args.config.worldSize) {
-    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != args.crossDeviceBarrierFlag) {
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) !=
+           args.crossDeviceBarrierFlag * numQps) {
     }
   }
   __syncthreads();
@@ -394,8 +391,7 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
   const int srcNode = srcPe / MAX_GPUS_PER_NODE;
   const int localBlockId = blockIdx.x - srcPe * numsBlockPerSrcPe;
   const int srcPeTokenNum = *(args.recvTokenNumMemObj->template GetAs<index_t*>() + srcPe +
-                              (args.crossDeviceBarrierFlag & 1) * npes) -
-                            1;
+                              (args.crossDeviceBarrierFlag & 1) * npes);
   const int baseChunk = srcPeTokenNum / numsBlockPerSrcPe;
   const int remainder = srcPeTokenNum % numsBlockPerSrcPe;
 
@@ -461,7 +457,7 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
         size_t dstOffset = dstIdx * tokenPackSize;
         shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemInpTokMemObj, dstOffset,
                                             args.shmemStagingTokMemObj, srcOffset,
-                                            actualTokenNum * tokenPackSize, srcPe);
+                                            actualTokenNum * tokenPackSize, srcPe, localBlockId);
 
         ++chunkIdx;
         chunkOffset += chunkTokenSize;
@@ -492,16 +488,23 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
       __threadfence_block();
     }
   }
+  if (warpId == 0) {
+    shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
+        args.crossDeviceBarrierMemObj, args.config.rank * sizeof(uint64_t),
+        args.crossDeviceBarrierMemObj->GetRdmaMemoryRegion(args.config.rank),
+        (args.config.rank + args.config.worldSize) * sizeof(uint64_t), 1, core::AMO_ADD, srcPe,
+        localBlockId);
+  }
   SyncIfDebugEnabled("Combine kernel: send token end");
 
   // Make sure copy on all GPUs are finished
-  CrossDeviceBarrierInterNodeKernel(args);
+  CrossDeviceBarrierInterNodeKernel(args, numsBlockPerSrcPe);
   shmem::ShmemQuietThread();
   if (globalThdId < npes) {
     args.recvTokenNumMemObj
         ->template GetAs<index_t*>()[globalThdId + (args.crossDeviceBarrierFlag & 1) * npes] = 0;
     args.sendAtomicSignalMemObj
-        ->template GetAs<index_t*>()[globalThdId + (args.crossDeviceBarrierFlag & 1) * npes] = 0;
+        ->template GetAs<int64_t*>()[globalThdId + (args.crossDeviceBarrierFlag & 1) * npes] = 0;
   }
 
   if (globalThdId == 0) {

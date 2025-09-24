@@ -548,11 +548,11 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
   uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
   bool is_leader{my_logical_lane_id == num_active_lanes - 1};
   const uint64_t leader_phys_lane_id = core::GetLastActiveLaneID(activemask);
-  if (is_leader) {
-    printf(
-        "raddr: %lx, laddr: %lx, rank:%d, pe: %d, qpId: %d, destOffset: %zu, sourceOffset: %zu\n",
-        raddr, laddr, globalGpuStates->rank, pe, qpId, destOffset, sourceOffset);
-  }
+  // if (is_leader) {
+  //   printf(
+  //       "raddr: %lx, laddr: %lx, rank:%d, pe: %d, qpId: %d, destOffset: %zu, sourceOffset: %zu\n",
+  //       raddr, laddr, globalGpuStates->rank, pe, qpId, destOffset, sourceOffset);
+  // }
 
   uint32_t warp_sq_counter = 0;
   uint32_t warp_msntbl_counter = 0, warp_psn_counter = 0;
