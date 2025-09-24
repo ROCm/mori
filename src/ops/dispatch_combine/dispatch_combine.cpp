@@ -73,11 +73,29 @@ mori::application::SymmMemObjPtr ShmemMallocAndReturnMemObjPtr(size_t size, unsi
 void EpDispatchCombineHandle::InitializeShmemBuf() {
   size_t maxTokenSize = static_cast<ssize_t>(config.MaxNumTokensToRecv()) * config.hiddenDim *
                         config.maxTokenTypeSize;
-  size_t maxStagingTokSize =
-      static_cast<ssize_t>(config.MaxNumTokensToRecv()) *
-      (config.hiddenDim * config.maxTokenTypeSize +
-       (sizeof(float) + sizeof(index_t)) * config.numExpertPerToken +
-       sizeof(index_t) * config.numExpertPerToken + config.scaleDim * config.scaleTypeSize);
+  const size_t tokenBytes = config.hiddenDim * config.maxTokenTypeSize;
+  const size_t weightBytes = sizeof(float) * config.numExpertPerToken;
+  const size_t indiceBytes = sizeof(index_t) * config.numExpertPerToken;
+  const size_t scaleBytes = config.scaleTypeSize * config.scaleDim;
+  const size_t metaBytes = sizeof(size_t);
+
+  assert(config.blockNum % 2 == 0);
+  const int channelNum = config.blockNum / 2;
+  const int nNodes = config.worldSize / MAX_GPUS_PER_NODE;
+  // TODO maxNumInpTokenPerRank could be smaller
+  const size_t maxNumInpTokenPerRank =
+      ((config.maxNumInpTokenPerRank + channelNum - 1) / channelNum) * channelNum;
+  constexpr int stepRDMATokens = 30;
+
+  const size_t stagingTokens =
+      max(maxNumInpTokenPerRank * nNodes, stepRDMATokens * nNodes * channelNum);
+  printf("rank %d stagingTokens %zu max(%zu, %d)\n", config.rank, stagingTokens,
+         maxNumInpTokenPerRank * nNodes, stepRDMATokens * nNodes * channelNum);
+  size_t maxStagingTokSize = (config.kernelType == KernelType::InterNodeNormal
+                                  ? stagingTokens
+                                  : static_cast<ssize_t>(config.MaxNumTokensToRecv())) *
+                             (tokenBytes + weightBytes + indiceBytes +
+                              sizeof(index_t) * config.numExpertPerToken + scaleBytes + metaBytes);
   shmemInpTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
   shmemOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
   shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
@@ -136,10 +154,11 @@ void EpDispatchCombineHandle::FinalizeTokenNumSignalBuf() {
 void EpDispatchCombineHandle::InitializeNormalKernelBuf() {
   const int channelNum = config.blockNum / 2;
   const int nNodes = config.worldSize / MAX_GPUS_PER_NODE;
-  const int maxTokens = ((config.maxNumInpTokenPerRank + channelNum - 1) / channelNum) * channelNum;
+  const int maxNumInpTokenPerRank =
+      ((config.maxNumInpTokenPerRank + channelNum - 1) / channelNum) * channelNum;
   const size_t localPeBufSize =
       config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerRank * sizeof(index_t) +
-      maxTokens * nNodes * sizeof(index_t) + channelNum * nNodes * sizeof(index_t);
+      maxNumInpTokenPerRank * nNodes * sizeof(index_t) + channelNum * nNodes * sizeof(index_t);
   HIP_RUNTIME_CHECK(hipMalloc(&localPeBuf, localPeBufSize));
   HIP_RUNTIME_CHECK(hipMemset(localPeBuf, 0, localPeBufSize));
 

@@ -76,15 +76,21 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
   const index_t channelStartOffset = channelId * baseTokensPerChannel + min(channelId, remTokens);
   const index_t tokensPerChannel = baseTokensPerChannel + (channelId < remTokens ? 1 : 0);
   const index_t channelEndOffset = min(channelStartOffset + tokensPerChannel, tokenNum);
+
+  // TODO maxRDMAStagingTokens 是RDMA从某一个node收发数据的最大值；maxP2PStagingTokens是转发数据上限
+  // TODO staging buffer每个channel不能小于maxNumRDMASendTokens？
+  constexpr int stepRDMATokens = 30;
+  
   // TODO modify maxTokensPerChannel 目前是channel所需的最大size，可以根据实际改小
-  const size_t maxTokensPerChannel = baseTokensPerChannel + 1;
+  const size_t maxTokensPerChannel = max(baseTokensPerChannel + 1, stepRDMATokens);
   const size_t maxNumToken = maxTokensPerChannel * nChannels;
-  // constexpr int maxNumRDMASendTokens = 30;
-  // TODO maxRDMAStagingTokens是RDMA从某一个node收发数据的最大值；maxP2PStagingTokens是转发数据上限
-  const size_t maxRDMAStagingTokens = maxTokensPerChannel;
-  const size_t maxP2PStagingTokens = maxTokensPerChannel * nNodes;
-  const int maxNumRDMASendTokens = maxNumInpTokenPerRank;
+
+  const size_t maxRDMAStagingTokens =
+      maxTokensPerChannel / stepRDMATokens * stepRDMATokens;
+  const size_t maxRDMASteps = maxRDMAStagingTokens / stepRDMATokens;
+
   const int maxNumP2pSendTokens = 32;
+  const size_t maxP2PStagingTokens = maxTokensPerChannel * nNodes;
 
   // for (int tokenIdx = channelStartOffset + warpId; tokenIdx < channelEndOffset;
   //      tokenIdx += warpNum) {
@@ -168,9 +174,9 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           if (destNodeNumTokensToSend == 0) continue;
 
           index_t destNodeSendSlotStart = __shfl(sendSlotStart, destNode);
-          // TODO modify maxNumRDMASendTokens
+          // TODO modify stepRDMATokens
           index_t sendTokenNum =
-              min(maxNumRDMASendTokens, destNodeNumTokensToSend - destNodeSendSlotStart);
+              min(stepRDMATokens, destNodeNumTokensToSend - destNodeSendSlotStart);
           index_t lastTokenIdx = slotToTokenIdxMap[destNode * maxTokensPerChannel +
                                                    destNodeSendSlotStart + sendTokenNum - 1];
           while (true) {
@@ -180,11 +186,12 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
 
           size_t srcStagingOffset = 0, dstStagingOffset = 0;
           if (laneId == destNode) {
+            // for RDMA, tailCache save send step
             srcStagingOffset = ((channelId * nNodes + destNode) * maxRDMAStagingTokens +
-                                tailCache % maxRDMAStagingTokens) *
+                                (tailCache % maxRDMASteps) * stepRDMATokens) *
                                tokenPackBytes;
             dstStagingOffset = ((channelId * nNodes + myNode) * maxRDMAStagingTokens +
-                                tailCache % maxRDMAStagingTokens) *
+                                (tailCache % maxRDMASteps) * stepRDMATokens) *
                                tokenPackBytes;
           }
           srcStagingOffset = __shfl(srcStagingOffset, destNode);
@@ -203,13 +210,18 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemInpTokMemObj, dstStagingOffset,
                                                 args.shmemStagingTokMemObj, srcStagingOffset,
                                                 sendTokenNum * tokenPackBytes, destPe);
+            shmem::ShmemQuietThread();
           }
           if (laneId == destNode) {
             numTokensToSend -= sendTokenNum;
             sendSlotStart += sendTokenNum;
-            tailCache += sendTokenNum;
+            // tailCache += sendTokenNum;
+            tailCache += 1;
+#if DEBUG == 1
             assert(numTokensToSend >= 0);
+#endif
 
+            // Update rdma tail
             // TODO use amo (amo hang)
             if (destNode == myNode) {
               // *(args.tailMemObj->template GetAs<uint64_t*>(destPe) + myPe + channelId * npes) =
@@ -219,33 +231,32 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
                   tailCache, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 #if DEBUG == 1
               printf(
-                  "send RDMA put rank=%d call=%d warpId=%d destPe=%d tail=%lu offset=%d\n", myPe,
-                  args.crossDeviceBarrierFlag, warpId, destPe,
-                  *(args.tailMemObj->template GetAs<uint64_t*>(destPe) + myPe + channelId * npes),
-                  myPe + channelId * npes);
+                  "send RDMA put rank=%d call=%d warpId=%d destPe=%d offset=%d tail=%lu\n", myPe,
+                  args.crossDeviceBarrierFlag, warpId, destPe, myPe + channelId * npes,
+                  *(args.tailMemObj->template GetAs<uint64_t*>(destPe) + myPe + channelId * npes));
 #endif
             } else {
-//               shmem::ShmemPutUint64ImmNbiThread(
-//                   args.tailMemObj, (myPe + channelId * npes) * sizeof(uint64_t), tailCache, destPe);
-// #if DEBUG == 1
-//               printf("send RDMA put rank=%d call=%d warpId=%d destPe=%d tail=%lu offset=%d\n",
-//                      myPe, args.crossDeviceBarrierFlag, warpId, destPe, tailCache,
-//                      myPe + channelId * npes);
-// #endif
+              shmem::ShmemPutUint64ImmNbiThread(
+                  args.tailMemObj, (myPe + channelId * npes) * sizeof(uint64_t), tailCache, destPe);
+#if DEBUG == 1
+              printf("send RDMA put rank=%d call=%d warpId=%d destPe=%d offset=%d tailCache=%lu\n",
+                     myPe, args.crossDeviceBarrierFlag, warpId, destPe, myPe + channelId * npes,
+                     tailCache);
+#endif
             }
           }
 
-          if (destNode != myNode) {
-            uint64_t syncTailCache = __shfl(tailCache, destNode);
-            shmem::ShmemPutUint64ImmNbiWarp(args.tailMemObj,
-                                            (myPe + channelId * npes) * sizeof(uint64_t),
-                                            syncTailCache, destPe);
-            if (laneId == warpSize - 1) {
-              printf("send RDMA put rank=%d call=%d warpId=%d destPe=%d tail=%lu offset=%d\n", myPe,
-                     args.crossDeviceBarrierFlag, warpId, destPe, syncTailCache,
-                     myPe + channelId * npes);
-            }
-          }
+          // if (destNode != myNode) {
+          //   uint64_t syncTailCache = __shfl(tailCache, destNode);
+          //   shmem::ShmemPutUint64ImmNbiWarp(args.tailMemObj,
+          //                                   (myPe + channelId * npes) * sizeof(uint64_t),
+          //                                   syncTailCache, destPe);
+          //   if (laneId == warpSize - 1) {
+          //     printf("send RDMA put rank=%d call=%d warpId=%d destPe=%d tail=%lu offset=%d\n", myPe,
+          //            args.crossDeviceBarrierFlag, warpId, destPe, syncTailCache,
+          //            myPe + channelId * npes);
+          //   }
+          // }
 
         }
       }
@@ -276,15 +287,15 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           if (slot == -1) continue;
 
           // TODO check shmemInpTokMemObj buffer ready
-          size_t tailCache = nodetailCache[node] + slot;
+          uint64_t tailCache = nodetailCache[node] + slot / stepRDMATokens;
           // if (laneId == node) {
-          //   while (tailCache - headCache >= maxRDMAStagingTokens) {
+          //   while (tailCache - headCache >= maxRDMASteps) {
           //     headCache = __hip_atomic_load(args.headMemObj->template GetAs<uint64_t*>() +
           //                                       channelId * npes + (node * nlocalPes + myLocalPe),
           //                                   __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
           //   }
           // }
-          while (tailCache - headCache >= maxRDMAStagingTokens) {
+          while (tailCache - headCache >= maxRDMASteps) {
             if (laneId == node)
               headCache = __hip_atomic_load(args.headMemObj->template GetAs<uint64_t*>() +
                                                 channelId * npes + (node * nlocalPes + myLocalPe),
@@ -293,9 +304,10 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           }
 
           // TODO modify shmemStagingTokMemObj size
-          size_t stagingOffset = ((channelId * nNodes + node) * maxRDMAStagingTokens +
-                                  tailCache % maxRDMAStagingTokens) *
-                                 tokenPackBytes;
+          size_t stagingOffset =
+              ((channelId * nNodes + node) * maxRDMAStagingTokens +
+               (tailCache % maxRDMASteps) * stepRDMATokens + slot % stepRDMATokens) *
+              tokenPackBytes;
           core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + stagingOffset,
                          reinterpret_cast<char*>(args.inpTokenBuf) + tokenIdx * tokenBytes,
                          tokenBytes);
@@ -389,10 +401,10 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
       while (__any(numTokensToRecv > 0)) {
         srcNode = (srcNode - 1 + nNodes) % nNodes;
         int srcPe = srcNode * nlocalPes + myLocalPe;
-        index_t destNodeNumTokensToRecv = __shfl(numTokensToRecv, srcNode);
-        if (destNodeNumTokensToRecv == 0) continue;
+        index_t syncNumTokensToRecv = __shfl(numTokensToRecv, srcNode);
+        if (syncNumTokensToRecv == 0) continue;
 
-        // check shmemInpTokMemObj data ready, wait data from same-id GPU
+        // check RDMA data ready (shmemInpTokMemObj), wait data from same-id GPU
         if (laneId == srcNode) {
           int spins = 0;
           while (true) {
@@ -403,10 +415,10 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             if (spins == 10000) {
               printf(
                   "recv fwd TO rank=%d wait srcPe=%d call=%d warpId=%d srcNode=%d "
-                  "destNodeNumTokensToRecv=%d tailCache=%lu "
+                  "syncNumTokensToRecv=%d tailCache=%lu "
                   "headCache=%lu\n",
                   myPe, srcPe, args.crossDeviceBarrierFlag, warpId, srcNode,
-                  destNodeNumTokensToRecv, tailCache, headCache);
+                  syncNumTokensToRecv, tailCache, headCache);
             }
             ++spins;
           }
@@ -422,11 +434,19 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           }
         }
 
-        uint64_t tokenStart = __shfl(headCache, srcNode);
-        uint64_t tokenEnd = __shfl(tailCache, srcNode);
+        uint64_t stepHead = __shfl(headCache, srcNode);
+        uint64_t stepEnd = __shfl(tailCache, srcNode);
+        for (uint64_t step = stepHead; step < stepEnd; ++step) {
+        uint64_t tokenStart = (stepHead % maxRDMASteps) * stepRDMATokens;
+        uint64_t tokenEnd = tokenStart + min(syncNumTokensToRecv, stepRDMATokens);
         for (uint64_t i = tokenStart; i < tokenEnd; ++i) {
-          if (srcNode == laneId) --numTokensToRecv;
-          index_t slot = i % maxRDMAStagingTokens;
+          if (srcNode == laneId) {
+            --numTokensToRecv;
+#if DEBUG == 1
+            assert(numTokensToRecv >= 0);
+#endif
+          }
+          index_t slot = i;
           char* srcPtr =
               args.shmemInpTokMemObj->template GetAs<char*>() +
               ((channelId * nNodes + srcNode) * maxRDMAStagingTokens + slot) * tokenPackBytes;
@@ -487,10 +507,12 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           }
           ++p2pTailCache, ++fwdCounter;
         }
+        }
         __threadfence_system();
         // TODO add content in comment
         if (laneId == 0 && fwdPe != myPe /*&&
             (numTokensToRecv == 0 || p2pTailCache - lastP2pTail >= maxNumP2pSendTokens)*/) {
+          // Update p2p tail
           __hip_atomic_store(
               args.tailMemObj->template GetAs<uint64_t*>(fwdPe) + channelId * npes + myPe,
               p2pTailCache, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -521,7 +543,13 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           laneId < nNodes ? rdmaRecvTokensNum[laneId] : 0;
       uint64_t headBase =
           laneId < nNodes ? args.localHead[(laneId * nlocalPes + myLocalPe) + channelId * npes] : 0;
-
+#if DEBUG == 1
+      if (laneId < nNodes) {
+        printf(
+            "recv Ctl before rank=%d call=%d warpId=%d node=%d numTokensToRecv=%d localHead=%lu\n",
+            myPe, args.crossDeviceBarrierFlag, warpId, laneId, numTokensToRecv, headBase);
+      }
+#endif
       index_t curMinHead = 0;
       index_t minHead = 0;
       while (__any(numTokensToRecv > 0)) {
@@ -538,27 +566,29 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           // TODO use amo (amo hang)
           if (syncMinHead > syncCurMinHead) {
             uint64_t syncHeadBase = __shfl(headBase, node);
+            // Update rdma head
             // ShmemPutUint64ImmNbiThread may lead to hang
             shmem::ShmemPutUint64ImmNbiWarp(
                 args.headMemObj, (myPe + channelId * npes) * sizeof(uint64_t),
                 syncHeadBase + syncMinHead, node * nlocalPes + myLocalPe);
             if (laneId == node) {
-              numTokensToRecv -= (minHead - curMinHead);
+              numTokensToRecv -= (minHead - curMinHead) * stepRDMATokens;
               curMinHead = minHead;
-              assert(numTokensToRecv >= 0);
+#if DEBUG == 1
+              assert(numTokensToRecv > -stepRDMATokens);
+#endif
             }
           }
         }
       }
 
       if (laneId < nNodes) {
-        assert(rdmaRecvTokensNum[laneId] == curMinHead);
         args.localHead[(laneId * nlocalPes + myLocalPe) + channelId * npes] = headBase + curMinHead;
-        if (laneId < nNodes) {
-          printf("recv Ctl rank=%d call=%d warpId=%d node=%d localHead=%lu\n", myPe,
-                 args.crossDeviceBarrierFlag, warpId, laneId,
-                 args.localHead[(laneId * nlocalPes + myLocalPe) + channelId * npes]);
-        }
+#if DEBUG == 1
+        printf("recv Ctl rank=%d call=%d warpId=%d node=%d numRecvTokens=%d localHead=%lu\n", myPe,
+               args.crossDeviceBarrierFlag, warpId, laneId, rdmaRecvTokensNum[laneId],
+               args.localHead[(laneId * nlocalPes + myLocalPe) + channelId * npes]);
+#endif
         // clear rdmaRecvTokensNum
         rdmaRecvTokensNum[laneId] = 0;
       }
@@ -655,6 +685,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           }
         }
         p2pHeadCache = p2pTailCache;
+        // Update p2p head
         if (laneId == 0) {
           *(args.headMemObj->template GetAs<uint64_t*>(srcPe) + channelId * npes + myPe) =
               p2pHeadCache;
