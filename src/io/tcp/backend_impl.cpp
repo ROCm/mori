@@ -21,56 +21,7 @@
 // SOFTWARE.
 #include "src/io/tcp/backend_impl.hpp"
 
-#include <netinet/tcp.h>
-#include <sys/epoll.h>
-
-int FullSend(int fd, const void* buf, size_t len) {
-  const char* p = static_cast<const char*>(buf);
-  size_t remaining = len;
-  while (remaining > 0) {
-    ssize_t n = ::send(fd, p, remaining, 0);
-    if (n == 0) {
-      errno = ECONNRESET;
-      return -1;
-    }
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      if (errno == EAGAIN || errno == EWOULDBLOCK) continue;  // spin; could epoll later
-      return -1;
-    }
-    p += n;
-    remaining -= static_cast<size_t>(n);
-  }
-  return 0;
-}
-
-int FullWritev(int fd, struct iovec* iov, int iovcnt) {
-  int idx = 0;
-  while (idx < iovcnt) {
-    ssize_t n = ::writev(fd, &iov[idx], iovcnt - idx);
-    if (n == 0) {
-      errno = ECONNRESET;
-      return -1;
-    }
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-      return -1;
-    }
-    ssize_t consumed = n;
-    while (consumed > 0 && idx < iovcnt) {
-      if (consumed >= static_cast<ssize_t>(iov[idx].iov_len)) {
-        consumed -= static_cast<ssize_t>(iov[idx].iov_len);
-        ++idx;
-      } else {
-        iov[idx].iov_base = static_cast<char*>(iov[idx].iov_base) + consumed;
-        iov[idx].iov_len -= consumed;
-        consumed = 0;
-      }
-    }
-  }
-  return 0;
-}
+#include "src/io/tcp/executor.hpp"
 
 namespace mori {
 namespace io {
@@ -100,200 +51,96 @@ TcpBackend::~TcpBackend() { StopService(); }
 void TcpBackend::StartService() {
   if (running.load()) return;
   running.store(true);
+  executor.reset(new MultithreadExecutor(this, config.numWorkerThreads));
   serviceThread = std::thread([this] { ServiceLoop(); });
 }
 
 void TcpBackend::StopService() {
   running.store(false);
   if (serviceThread.joinable()) serviceThread.join();
+  executor->Shutdown();
   if (ctx) ctx->Close();
 }
 
 void TcpBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
-  {
-    std::lock_guard<std::mutex> lock(remotesMu);
-    remotes[rdesc.key] = rdesc;
-  }
-  if (config.preconnect) {
-    // Establish persistent data connection immediately
-    (void)GetOrCreateConnection(rdesc);
-  }
+  executor->RegisterRemoteEngine(rdesc);
+  // Establish persistent data connection immediately
+  (void)GetOrCreateConnection(rdesc);
 }
 
 void TcpBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
-  std::lock_guard<std::mutex> lock(remotesMu);
-  remotes.erase(rdesc.key);
+  executor->DeregisterRemoteEngine(rdesc);
   std::lock_guard<std::mutex> lock2(connsMu);
   auto it = conns.find(rdesc.key);
   if (it != conns.end()) {
-    if (it->second.handle.fd >= 0) {
-      ::close(it->second.handle.fd);
+    for (auto con : it->second) {
+      if (con.handle.fd >= 0) {
+        ::close(con.handle.fd);
+      }
     }
+
     conns.erase(it);
   }
 }
 
-void TcpBackend::RegisterMemory(const MemoryDesc& desc) {
-  std::lock_guard<std::mutex> lock(memMu);
-  localMems[desc.id] = desc;
-}
+void TcpBackend::RegisterMemory(const MemoryDesc& desc) { executor->RegisterMemory(desc); }
 
-void TcpBackend::DeregisterMemory(const MemoryDesc& desc) {
-  std::lock_guard<std::mutex> lock(memMu);
-  localMems.erase(desc.id);
-}
+void TcpBackend::DeregisterMemory(const MemoryDesc& desc) { executor->DeregisterMemory(desc); }
 
-TcpConnection TcpBackend::GetOrCreateConnection(const EngineDesc& rdesc) {
-  {
-    std::lock_guard<std::mutex> lock(connsMu);
-    auto it = conns.find(rdesc.key);
-    if (it != conns.end() && it->second.Valid()) return it->second;
-  }
+std::vector<TcpConnection>& TcpBackend::GetOrCreateConnection(const EngineDesc& rdesc) {
+  //   {
+  //     std::lock_guard<std::mutex> lock(connsMu);
+  //     auto it = conns.find(rdesc.key);
+  //     if (it != conns.end()) {
+  //       // Check at least first connection validity
+  //       if (!it->second.empty() && it->second.front().Valid()) return it->second;
+  //     }
+  //   }
+  if (executor->Findconn)
+    ...
 
-  // Connect outside lock to avoid blocking other operations
-  auto handle = ctx->Connect(rdesc.host, rdesc.port);
-  if (handle.fd >= 0) {
-    int flag = 1;
-    setsockopt(handle.fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));  // for small msg
-    setsockopt(handle.fd, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
-    int bufSz = 4 * 1024 * 1024;  // 4MB send/recv buffers
-    setsockopt(handle.fd, SOL_SOCKET, SO_RCVBUF, &bufSz, sizeof(bufSz));
-    setsockopt(handle.fd, SOL_SOCKET, SO_SNDBUF, &bufSz, sizeof(bufSz));
-
-    int qack = 1;
-    setsockopt(handle.fd, IPPROTO_TCP, TCP_QUICKACK, &qack, sizeof(qack));
-  }
-  {
-    std::lock_guard<std::mutex> lock(connsMu);
-    TcpConnection c(handle);
-    conns[rdesc.key] = c;
-    MORI_IO_INFO("TCP persistent connection established to {}:{} (fd={})", rdesc.host.c_str(),
-                 rdesc.port, handle.fd);
-    return conns[rdesc.key];
-  }
+        // Connect outside lock to avoid blocking other operations
+        // Create multiple connections for parallelism
+        for (int i = 0; i < static_cast<int>(config.numWorkerThreads); ++i) {
+      auto handle = ctx->Connect(rdesc.host, rdesc.port);
+      if (handle.fd >= 0) {
+        int flag = 1;
+        setsockopt(handle.fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));  // for small msg
+        setsockopt(handle.fd, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
+        int bufSz = 4 * 1024 * 1024;  // 4MB send/recv buffers
+        setsockopt(handle.fd, SOL_SOCKET, SO_RCVBUF, &bufSz, sizeof(bufSz));
+        setsockopt(handle.fd, SOL_SOCKET, SO_SNDBUF, &bufSz, sizeof(bufSz));
+        int qack = 1;
+        setsockopt(handle.fd, IPPROTO_TCP, TCP_QUICKACK, &qack, sizeof(qack));
+      } else {
+        MORI_IO_ERROR("TCP connection to {}:{} failed", rdesc.host.c_str(), rdesc.port);
+        break;  // stop attempting further connections
+      }
+      std::lock_guard<std::mutex> lock(connsMu);
+      // conns[rdesc.key].emplace_back(handle);
+      executor->Addconn(rdesc.key, handle);
+      MORI_IO_INFO("TCP persistent connection established to {}:{} (fd={})", rdesc.host.c_str(),
+                   rdesc.port, handle.fd);
+    }
+  return  // conns[rdesc.key];
 }
 
 void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
                            const MemoryDesc& remoteSrc, size_t remoteOffset, size_t size,
                            TransferStatus* status, TransferUniqueId id, bool isRead) {
   status->SetCode(StatusCode::IN_PROGRESS);
-  EngineKey remoteKey = remoteSrc.engineKey;
-  EngineDesc rdesc;
-  {
-    std::lock_guard<std::mutex> lock(remotesMu);
-    if (remotes.find(remoteKey) == remotes.end()) {
-      status->SetCode(StatusCode::ERR_NOT_FOUND);
-      status->SetMessage("remote engine not registered");
-      return;
-    }
-    rdesc = remotes[remoteKey];
-  }
-  TcpConnection conn = GetOrCreateConnection(rdesc);
-  if (!conn.Valid()) {
+  ReadWriteWork work{localDest, localOffset, remoteSrc, remoteOffset, size, status, id, isRead};
+  if (executor->SubmitReadWriteWork(work) != 0) {
     status->SetCode(StatusCode::ERR_BAD_STATE);
-    status->SetMessage("tcp connection invalid");
+    status->SetMessage("executor shutdown");
     return;
   }
-
-  TcpMessageHeader hdr{};
-  hdr.opcode = isRead ? 0 : 1;  // read_req or write_req
-  hdr.id = id;
-  hdr.mem_id = remoteSrc.id;  // specify remote memory id explicitly
-  hdr.offset = remoteOffset;
-  hdr.size = size;
-
-  application::TCPEndpoint ep(conn.handle);
-  bool localIsGpu = (localDest.loc == MemoryLocationType::GPU);
-  BufferBlock bufBlock;  // only allocate if GPU staging needed
-  char* stagingPtr = nullptr;
-
-  if (!isRead) {
-    const char* sendPtr = nullptr;
-    if (localIsGpu) {
-      bufBlock = bufferPool.Acquire(size);
-      stagingPtr = bufBlock.data;
-      const void* devPtr = reinterpret_cast<const void*>(localDest.data + localOffset);
-      hipError_t e = hipMemcpy(stagingPtr, devPtr, size, hipMemcpyDeviceToHost);
-      if (e != hipSuccess) {
-        status->SetCode(StatusCode::ERR_BAD_STATE);
-        status->SetMessage(std::string("hipMemcpy D2H failed: ") + hipGetErrorString(e));
-        if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
-        return;
-      }
-      sendPtr = stagingPtr;
-    } else {
-      // zero-copy host path
-      sendPtr = reinterpret_cast<const char*>(localDest.data + localOffset);
-    }
-    struct iovec iov[2];
-    iov[0].iov_base = &hdr;
-    iov[0].iov_len = sizeof(hdr);
-    iov[1].iov_base = const_cast<char*>(sendPtr);
-    iov[1].iov_len = size;
-    if (FullWritev(conn.handle.fd, iov, 2) != 0) {
-      status->SetCode(StatusCode::ERR_BAD_STATE);
-      status->SetMessage("writev failed");
-      if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
-      return;
-    }
-    TcpMessageHeader resp{};
-    if (ep.Recv(&resp, sizeof(resp)) != 0) {
-      status->SetCode(StatusCode::ERR_BAD_STATE);
-      status->SetMessage("write ack recv failed");
-      if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
-      return;
-    }
-    status->SetCode(StatusCode::SUCCESS);
-    if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
-    return;
-  } else {
-    if (FullSend(conn.handle.fd, &hdr, sizeof(hdr)) != 0) {
-      status->SetCode(StatusCode::ERR_BAD_STATE);
-      status->SetMessage("read header send failed");
-      return;
-    }
-    TcpMessageHeader resp{};
-    if (ep.Recv(&resp, sizeof(resp)) != 0) {
-      status->SetCode(StatusCode::ERR_BAD_STATE);
-      status->SetMessage("read resp header recv failed");
-      return;
-    }
-    if (resp.opcode != 2 || resp.size != size) {
-      status->SetCode(StatusCode::ERR_BAD_STATE);
-      status->SetMessage("unexpected read response");
-      return;
-    }
-    if (localIsGpu) {
-      bufBlock = bufferPool.Acquire(size);
-      stagingPtr = bufBlock.data;
-      if (ep.Recv(stagingPtr, size) != 0) {
-        status->SetCode(StatusCode::ERR_BAD_STATE);
-        status->SetMessage("read payload recv failed");
-        if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
-        return;
-      }
-      void* devPtr = reinterpret_cast<void*>(localDest.data + localOffset);
-      hipError_t e = hipMemcpy(devPtr, stagingPtr, size, hipMemcpyHostToDevice);
-      if (e != hipSuccess) {
-        status->SetCode(StatusCode::ERR_BAD_STATE);
-        status->SetMessage(std::string("hipMemcpy H2D failed: ") + hipGetErrorString(e));
-        if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
-        return;
-      }
-      status->SetCode(StatusCode::SUCCESS);
-      if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
-      return;
-    } else {
-      char* dst = reinterpret_cast<char*>(localDest.data + localOffset);
-      if (ep.Recv(dst, size) != 0) {
-        status->SetCode(StatusCode::ERR_BAD_STATE);
-        status->SetMessage("read payload recv failed");
-        return;
-      }
-      status->SetCode(StatusCode::SUCCESS);
-      return;
-    }
+  // synchronous wait for completion
+  while (status->Code() == StatusCode::IN_PROGRESS) {
+    std::this_thread::yield();
   }
+
+  return;
 }
 
 void TcpBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& localOffsets,
@@ -304,15 +151,35 @@ void TcpBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loca
     status->SetCode(StatusCode::SUCCESS);
     return;
   }
-  // naive sequential
+  // Submit all work items
+  if (localOffsets.size() != sizes.size() || remoteOffsets.size() != sizes.size()) {
+    status->SetCode(StatusCode::ERR_INVALID_ARG);
+    status->SetMessage("BatchReadWrite: offsets and sizes vector size mismatch");
+    return;
+  }
+  status->SetCode(StatusCode::IN_PROGRESS);
+  std::vector<TransferStatus> itemStatuses(sizes.size());
+
   for (size_t i = 0; i < sizes.size(); ++i) {
-    TransferStatus s;
-    ReadWrite(localDest, localOffsets[i], remoteSrc, remoteOffsets[i], sizes[i], &s, id, isRead);
-    if (s.Failed()) {
-      status->SetCode(s.Code());
-      status->SetMessage(s.Message());
+    ReadWriteWork work{localDest, localOffsets[i],  remoteSrc, remoteOffsets[i],
+                       sizes[i],  &itemStatuses[i], id,        isRead};
+    if (executor->SubmitReadWriteWork(work) != 0) {
+      status->SetCode(StatusCode::ERR_BAD_STATE);
+      status->SetMessage("executor shutdown");
       return;
     }
+  }
+
+  // Busy wait; TODO replace with condition variable once TransferStatus supports signaling
+  bool anyFailed = false;
+  for (auto& s : itemStatuses) {
+    s.Wait();
+    if (s.Failed()) anyFailed = true;
+  }
+  if (anyFailed) {
+    status->SetCode(StatusCode::ERR_UNKNOWN);
+    status->SetMessage("one or more batch items failed");
+    return;
   }
   status->SetCode(StatusCode::SUCCESS);
 }
@@ -362,79 +229,8 @@ void TcpBackend::ServiceLoop() {
         }
         continue;
       }
-      // handle request
-      TcpMessageHeader hdr{};
-      ssize_t r = ::recv(fd, &hdr, sizeof(hdr), MSG_WAITALL);
-      if (r != sizeof(hdr)) {
-        ctx->CloseFd(fd);
-        continue;
-      }
-      if (hdr.opcode == 0 || hdr.opcode == 1) {  // read or write
-        MemoryDesc target{};
-        {
-          std::lock_guard<std::mutex> lock(memMu);
-          auto it = localMems.find(hdr.mem_id);
-          if (it == localMems.end()) {
-            ctx->CloseFd(fd);
-            continue;
-          }
-          target = it->second;
-        }
-        bool targetIsGpu = (target.loc == MemoryLocationType::GPU);
-        auto bufBlock = bufferPool.Acquire(hdr.size);
-        char* hostBuf = bufBlock.data;
-        if (hdr.opcode == 0) {  // read request: copy from target to host and send
-          if (targetIsGpu) {
-            const void* devPtr = reinterpret_cast<const void*>(target.data + hdr.offset);
-            if (hipMemcpy(hostBuf, devPtr, hdr.size, hipMemcpyDeviceToHost) != hipSuccess) {
-              bufferPool.Release(std::move(bufBlock));
-              ctx->CloseFd(fd);
-              continue;
-            }
-          } else {
-            const char* src = reinterpret_cast<const char*>(target.data + hdr.offset);
-            std::memcpy(hostBuf, src, hdr.size);
-          }
-          TcpMessageHeader resp{};
-          resp.opcode = 2;
-          resp.id = hdr.id;
-          resp.mem_id = hdr.mem_id;
-          resp.offset = hdr.offset;
-          resp.size = hdr.size;
-          ::send(fd, &resp, sizeof(resp), 0);
-          ::send(fd, hostBuf, hdr.size, 0);
-          bufferPool.Release(std::move(bufBlock));
-        } else {  // write request: recv payload into host then copy to device if needed
-          ssize_t r2 = ::recv(fd, hostBuf, hdr.size, MSG_WAITALL);
-          if (r2 != (ssize_t)hdr.size) {
-            bufferPool.Release(std::move(bufBlock));
-            ctx->CloseFd(fd);
-            continue;
-          }
-          if (targetIsGpu) {
-            void* devPtr = reinterpret_cast<void*>(target.data + hdr.offset);
-            if (hipMemcpy(devPtr, hostBuf, hdr.size, hipMemcpyHostToDevice) != hipSuccess) {
-              bufferPool.Release(std::move(bufBlock));
-              ctx->CloseFd(fd);
-              continue;
-            }
-          } else {
-            char* dst = reinterpret_cast<char*>(target.data + hdr.offset);
-            std::memcpy(dst, hostBuf, hdr.size);
-          }
-          TcpMessageHeader resp{};
-          resp.opcode = 3;
-          resp.id = hdr.id;
-          resp.mem_id = hdr.mem_id;
-          resp.offset = hdr.offset;
-          resp.size = hdr.size;
-          ::send(fd, &resp, sizeof(resp), 0);
-          bufferPool.Release(std::move(bufBlock));
-        }
-        break;
-      } else {
-        ctx->CloseFd(fd);
-      }
+      // submit processing to service worker
+      executor->SubmitServiceWork(fd);
     }
   }
   ::close(epfd);

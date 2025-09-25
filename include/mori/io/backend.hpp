@@ -68,10 +68,6 @@ struct TcpBackendConfig : public BackendConfig {
   // For future extension (e.g., parallelism, buffer sizing)
   int numWorkerThreads{1};
   bool preconnect{true};
-  // Buffer pool parameters (host staging buffers for GPU + general reuse)
-  size_t buffer_pool_max_buffers{128};      // max number of buffers kept
-  size_t buffer_pool_max_bytes{64 * 1024 * 1024}; // total bytes budget
-  bool buffer_pool_pinned{true};          // allocate pinned host memory when true
 };
 
 /* ---------------------------------------------------------------------------------------------- */
