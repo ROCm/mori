@@ -21,6 +21,14 @@
 // SOFTWARE.
 #pragma once
 
+#ifndef warpSize
+#if defined(__GFX8__) || defined(__GFX9__)
+  #define warpSize 64
+#else
+  #define warpSize 32
+#endif
+#endif
+
 namespace mori {
 namespace core {
 
