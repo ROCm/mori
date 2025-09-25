@@ -372,7 +372,7 @@ void distRdmaOps(int argc, char* argv[]) {
     if (i == local_rank) continue;
     for (int qp = 0; qp < num_qp; ++qp) {
       device_context->ConnectEndpoint(endpoints[qp].handle,
-                                      global_rdma_ep_handles[i + qp * world_size]);
+                                      global_rdma_ep_handles[i + qp * world_size], qp);
       std::cout << "Local rank " << local_rank << " connected to rank " << i << " qp " << qp
                 << " with handle " << global_rdma_ep_handles[i + qp * world_size] << std::endl;
     }

@@ -76,9 +76,11 @@ class BnxtCqContainer {
   ibv_cq* cq{nullptr};
 };
 
+class BnxtDeviceContext;  // Forward declaration
+
 class BnxtQpContainer {
  public:
-  BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig& config, ibv_cq* cq, ibv_pd* pd);
+  BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig& config, ibv_cq* cq, ibv_pd* pd, BnxtDeviceContext* device_context);
   ~BnxtQpContainer();
 
   void ModifyRst2Init();
@@ -90,12 +92,15 @@ class BnxtQpContainer {
   void* GetSqAddress();
   void* GetMsntblAddress();
   void* GetRqAddress();
+  
+  BnxtDeviceContext* GetDeviceContext() { return device_context; }
 
  private:
   void DestroyQueuePair();
 
  public:
   ibv_context* context;
+  BnxtDeviceContext* device_context;
 
  public:
   RdmaEndpointConfig config;
@@ -113,7 +118,6 @@ class BnxtQpContainer {
   void* qpUar{nullptr};
   void* qpUarPtr{nullptr};
   ibv_qp* qp{nullptr};
-  uint32_t udp_sport_setting[BNXT_UDP_SPORT_ARRAY_SIZE]{0};
 };
 
 /* ---------------------------------------------------------------------------------------------- */

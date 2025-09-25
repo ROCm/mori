@@ -147,8 +147,8 @@ Mlx5CqContainer::~Mlx5CqContainer() {
 /*                                         Mlx5QpContainer                                        */
 /* ---------------------------------------------------------------------------------------------- */
 Mlx5QpContainer::Mlx5QpContainer(ibv_context* context, const RdmaEndpointConfig& config,
-                                 uint32_t cqn, uint32_t pdn)
-    : context(context), config(config) {
+                                 uint32_t cqn, uint32_t pdn, Mlx5DeviceContext* device_context)
+    : context(context), config(config), device_context(device_context) {
   ComputeQueueAttrs(config);
   CreateQueuePair(cqn, pdn);
 }
@@ -312,7 +312,7 @@ void Mlx5QpContainer::ModifyRst2Init() {
 }
 
 void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
-                                     const ibv_port_attr& portAttr) {
+                                     const ibv_port_attr& portAttr, uint32_t qpId) {
   uint8_t init2rtr_cmd_in[DEVX_ST_SZ_BYTES(init2rtr_qp_in)] = {
       0,
   };
@@ -343,7 +343,9 @@ void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
            sizeof(remote_handle.eth.mac));
     DEVX_SET(qpc, qpc, primary_address_path.hop_limit, 64);
     DEVX_SET(qpc, qpc, primary_address_path.src_addr_index, config.gidIdx);
-    DEVX_SET(qpc, qpc, primary_address_path.udp_sport, 0xC000);
+    // Use shared UDP sport configuration with qpId-based selection
+    uint16_t selected_udp_sport = device_context->GetUdpSport(qpId);
+    DEVX_SET(qpc, qpc, primary_address_path.udp_sport, selected_udp_sport);
   } else if (portAttr.link_layer == IBV_LINK_LAYER_INFINIBAND) {
     DEVX_SET(qpc, qpc, primary_address_path.rlid, remote_handle.ib.lid);
   } else {
@@ -400,7 +402,7 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   ibv_context* context = GetIbvContext();
 
   Mlx5CqContainer* cq = new Mlx5CqContainer(context, config);
-  Mlx5QpContainer* qp = new Mlx5QpContainer(context, config, cq->cqn, pdn);
+  Mlx5QpContainer* qp = new Mlx5QpContainer(context, config, cq->cqn, pdn, this);
 
   RdmaEndpoint endpoint;
   endpoint.handle.psn = 0;
@@ -470,7 +472,7 @@ void Mlx5DeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   const ibv_device_attr_ex* deviceAttr = rdmaDevice->GetDeviceAttr();
   const ibv_port_attr& portAttr = *(rdmaDevice->GetPortAttrMap()->find(local.portId)->second);
   qp->ModifyRst2Init();
-  qp->ModifyInit2Rtr(remote, portAttr);
+  qp->ModifyInit2Rtr(remote, portAttr, qpId);
   qp->ModifyRtr2Rts(local);
 }
 

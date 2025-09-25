@@ -39,7 +39,9 @@ namespace application {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        RdmaDeviceContext                                       */
 /* ---------------------------------------------------------------------------------------------- */
-RdmaDeviceContext::RdmaDeviceContext(RdmaDevice* device, ibv_pd* inPd) : device(device), pd(inPd) {}
+RdmaDeviceContext::RdmaDeviceContext(RdmaDevice* device, ibv_pd* inPd) : device(device), pd(inPd) {
+  InitializeUdpSportConfiguration();
+}
 
 RdmaDeviceContext::~RdmaDeviceContext() {
   ibv_dealloc_pd(pd);
@@ -288,6 +290,68 @@ void RdmaContext::Initialize() {
       }
     }
   }
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                 UDP Sport Configuration                                        */
+/* ---------------------------------------------------------------------------------------------- */
+void RdmaDeviceContext::InitializeUdpSportConfiguration() {
+  // Default UDP sport configuration
+  static constexpr uint16_t DEFAULT_UDP_SPORTS[RDMA_UDP_SPORT_ARRAY_SIZE] = {
+    0xBE10, 0xBE11, 0xBE12, 0xBE13
+  };
+
+  // Initialize with defaults
+  for (uint32_t i = 0; i < RDMA_UDP_SPORT_ARRAY_SIZE; i++) {
+    udp_sport_setting[i] = DEFAULT_UDP_SPORTS[i];
+  }
+
+  // Check for environment variable configurations
+  const char* gor_port_batch = std::getenv("MORI_GOR_PORT");
+  if (gor_port_batch != nullptr) {
+    // Parse comma-separated values
+    std::string batch_str(gor_port_batch);
+    std::stringstream ss(batch_str);
+    std::string item;
+    uint32_t index = 0;
+
+    while (std::getline(ss, item, ',') && index < RDMA_UDP_SPORT_ARRAY_SIZE) {
+      try {
+        // Support both decimal and hexadecimal (0x prefix) formats
+        uint16_t port_val = static_cast<uint16_t>(std::stoul(item, nullptr, 0));
+        udp_sport_setting[index] = port_val;
+        index++;
+      } catch (const std::exception& e) {
+        MORI_APP_WARN("Invalid UDP sport value in MORI_GOR_PORT: {}, using default value", item);
+      }
+    }
+  } else {
+    // Check individual environment variables
+    const char* env_vars[RDMA_UDP_SPORT_ARRAY_SIZE] = {
+      "MORI_GOR_PORT1", "MORI_GOR_PORT2", "MORI_GOR_PORT3", "MORI_GOR_PORT4"
+    };
+
+    for (uint32_t i = 0; i < RDMA_UDP_SPORT_ARRAY_SIZE; i++) {
+      const char* env_val = std::getenv(env_vars[i]);
+      if (env_val != nullptr) {
+        try {
+          uint16_t port_val = static_cast<uint16_t>(std::stoul(env_val, nullptr, 0));
+          udp_sport_setting[i] = port_val;
+        } catch (const std::exception& e) {
+          MORI_APP_WARN("Invalid UDP sport value in {}: {}, using default value", env_vars[i], env_val);
+        }
+      }
+    }
+  }
+
+  // Log final configuration
+  for (uint32_t i = 0; i < RDMA_UDP_SPORT_ARRAY_SIZE; i++) {
+    MORI_APP_INFO("UDP sport[{}] = 0x{:x}", i, udp_sport_setting[i]);
+  }
+}
+
+uint16_t RdmaDeviceContext::GetUdpSport(uint32_t qpId) const {
+  return udp_sport_setting[qpId % RDMA_UDP_SPORT_ARRAY_SIZE];
 }
 
 }  // namespace application

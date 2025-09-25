@@ -67,6 +67,9 @@ RdmaDeviceVendorId ToRdmaDeviceVendorId(T v) {
 #define PAGESIZE uint32_t(sysconf(_SC_PAGE_SIZE))
 // #define OUTSTANDING_TABLE_SIZE (65536)
 
+// UDP sport configuration constants for multi-provider support
+static constexpr uint32_t RDMA_UDP_SPORT_ARRAY_SIZE = 4;
+
 /* -------------------------------------------------------------------------- */
 /*                             Rdma Data Structure                            */
 /* -------------------------------------------------------------------------- */
@@ -185,11 +188,19 @@ class RdmaDeviceContext {
   RdmaDevice* GetRdmaDevice();
   ibv_context* GetIbvContext();
   ibv_srq* GetIbvSrq() { return srq; }
+  
+  uint16_t GetUdpSport(uint32_t qpId) const;
 
  protected:
   ibv_pd* pd{nullptr};
   ibv_srq* srq{nullptr};
-
+  
+  // Shared UDP sport configuration for all RDMA providers
+  uint16_t udp_sport_setting[RDMA_UDP_SPORT_ARRAY_SIZE];
+  
+  // Initialize UDP sport configuration from environment variables
+  void InitializeUdpSportConfiguration();
+  
  private:
   RdmaDevice* device;
   std::unordered_map<void*, ibv_mr*> mrPool;
