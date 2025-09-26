@@ -66,8 +66,6 @@ class TcpBackend : public Backend {
   void StartService();
   void StopService();
 
-  std::vector<TcpConnection>& GetOrCreateConnection(const EngineDesc& rdesc);
-
   EngineKey myEngKey;
   TcpBackendConfig config;
   IOEngineConfig engConfig;

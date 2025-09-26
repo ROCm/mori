@@ -38,9 +38,10 @@ TcpBackend::TcpBackend(EngineKey key, const IOEngineConfig& engCfg, const TcpBac
     int bufSz = 4 * 1024 * 1024;  // 4MB
     ::setsockopt(lfd, SOL_SOCKET, SO_RCVBUF, &bufSz, sizeof(bufSz));
     ::setsockopt(lfd, SOL_SOCKET, SO_SNDBUF, &bufSz, sizeof(bufSz));
+    // Set listening socket non-blocking for EPOLLET safety
+    int flags = fcntl(lfd, F_GETFL, 0);
+    if (flags >= 0) fcntl(lfd, F_SETFL, flags | O_NONBLOCK);
   }
-  bufferPool.Configure(config.buffer_pool_max_buffers, config.buffer_pool_max_bytes,
-                       config.buffer_pool_pinned);
   ctx->Listen();
   StartService();
   MORI_IO_INFO("TcpBackend created host {} port {}", engConfig.host.c_str(), engConfig.port);
@@ -51,7 +52,7 @@ TcpBackend::~TcpBackend() { StopService(); }
 void TcpBackend::StartService() {
   if (running.load()) return;
   running.store(true);
-  executor.reset(new MultithreadExecutor(this, config.numWorkerThreads));
+  executor.reset(new MultithreadExecutor(ctx.get(), config.numWorkerThreads));
   serviceThread = std::thread([this] { ServiceLoop(); });
 }
 
@@ -64,66 +65,21 @@ void TcpBackend::StopService() {
 
 void TcpBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
   executor->RegisterRemoteEngine(rdesc);
-  // Establish persistent data connection immediately
-  (void)GetOrCreateConnection(rdesc);
+  if (auto* mexec = dynamic_cast<MultithreadExecutor*>(executor.get())) {
+    mexec->EnsureConnections(rdesc, config.numWorkerThreads);
+  }
 }
 
 void TcpBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   executor->DeregisterRemoteEngine(rdesc);
-  std::lock_guard<std::mutex> lock2(connsMu);
-  auto it = conns.find(rdesc.key);
-  if (it != conns.end()) {
-    for (auto con : it->second) {
-      if (con.handle.fd >= 0) {
-        ::close(con.handle.fd);
-      }
-    }
-
-    conns.erase(it);
+  if (auto* mexec = dynamic_cast<MultithreadExecutor*>(executor.get())) {
+    mexec->CloseConnections(rdesc.key);
   }
 }
 
 void TcpBackend::RegisterMemory(const MemoryDesc& desc) { executor->RegisterMemory(desc); }
 
 void TcpBackend::DeregisterMemory(const MemoryDesc& desc) { executor->DeregisterMemory(desc); }
-
-std::vector<TcpConnection>& TcpBackend::GetOrCreateConnection(const EngineDesc& rdesc) {
-  //   {
-  //     std::lock_guard<std::mutex> lock(connsMu);
-  //     auto it = conns.find(rdesc.key);
-  //     if (it != conns.end()) {
-  //       // Check at least first connection validity
-  //       if (!it->second.empty() && it->second.front().Valid()) return it->second;
-  //     }
-  //   }
-  if (executor->Findconn)
-    ...
-
-        // Connect outside lock to avoid blocking other operations
-        // Create multiple connections for parallelism
-        for (int i = 0; i < static_cast<int>(config.numWorkerThreads); ++i) {
-      auto handle = ctx->Connect(rdesc.host, rdesc.port);
-      if (handle.fd >= 0) {
-        int flag = 1;
-        setsockopt(handle.fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));  // for small msg
-        setsockopt(handle.fd, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
-        int bufSz = 4 * 1024 * 1024;  // 4MB send/recv buffers
-        setsockopt(handle.fd, SOL_SOCKET, SO_RCVBUF, &bufSz, sizeof(bufSz));
-        setsockopt(handle.fd, SOL_SOCKET, SO_SNDBUF, &bufSz, sizeof(bufSz));
-        int qack = 1;
-        setsockopt(handle.fd, IPPROTO_TCP, TCP_QUICKACK, &qack, sizeof(qack));
-      } else {
-        MORI_IO_ERROR("TCP connection to {}:{} failed", rdesc.host.c_str(), rdesc.port);
-        break;  // stop attempting further connections
-      }
-      std::lock_guard<std::mutex> lock(connsMu);
-      // conns[rdesc.key].emplace_back(handle);
-      executor->Addconn(rdesc.key, handle);
-      MORI_IO_INFO("TCP persistent connection established to {}:{} (fd={})", rdesc.host.c_str(),
-                   rdesc.port, handle.fd);
-    }
-  return  // conns[rdesc.key];
-}
 
 void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
                            const MemoryDesc& remoteSrc, size_t remoteOffset, size_t size,
@@ -161,6 +117,7 @@ void TcpBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loca
   std::vector<TransferStatus> itemStatuses(sizes.size());
 
   for (size_t i = 0; i < sizes.size(); ++i) {
+    itemStatuses[i].SetCode(StatusCode::IN_PROGRESS);
     ReadWriteWork work{localDest, localOffsets[i],  remoteSrc, remoteOffsets[i],
                        sizes[i],  &itemStatuses[i], id,        isRead};
     if (executor->SubmitReadWriteWork(work) != 0) {
@@ -221,6 +178,9 @@ void TcpBackend::ServiceLoop() {
 
             int qack = 1;
             setsockopt(h.fd, IPPROTO_TCP, TCP_QUICKACK, &qack, sizeof(qack));
+            // Non-blocking for edge-triggered epoll
+            int cflags = fcntl(h.fd, F_GETFL, 0);
+            if (cflags >= 0) fcntl(h.fd, F_SETFL, cflags | O_NONBLOCK);
           }
           epoll_event nev{};
           nev.events = EPOLLIN | EPOLLET;

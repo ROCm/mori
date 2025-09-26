@@ -24,6 +24,21 @@
 namespace mori {
 namespace io {
 
+// Non-blocking server-side connection state for partial I/O handling.
+// Simple state machine: RECV_HDR -> (maybe RECV_PAYLOAD) -> SEND_RESP -> RECV_HDR ...
+// All operations processed by service worker threads; protected by serviceStatesMu.
+
+enum class ConnPhase { RECV_HDR, RECV_PAYLOAD, SEND_RESP };
+
+struct ServiceConnState {
+  TcpMessageHeader hdr{};  // inbound header being accumulated
+  ConnPhase phase{ConnPhase::RECV_HDR};
+  std::vector<char> in_payload;  // staging for WRITE request inbound data
+  std::vector<char> out_buf;     // response bytes (header + optional payload)
+  bool target_is_gpu{false};     // cached after header decode
+  bool closed{false};
+};
+
 class Executor {
  public:
   Executor() = default;
@@ -35,7 +50,9 @@ class Executor {
 
 class MultithreadExecutor : public Executor {
  public:
-  MultithreadExecutor(size_t numThreads) : numThreads(numThreads) {
+  // ctx is owned by TcpBackend; executor only borrows pointer (lifetime > executor)
+  MultithreadExecutor(application::TCPContext* ctx, size_t numThreads)
+      : ctx(ctx), numThreads(numThreads) {
     running.store(true);
     Start();
   }
@@ -49,6 +66,8 @@ class MultithreadExecutor : public Executor {
   }
 
   void Shutdown() override {
+    workQueue.shutdown();
+    serviceQueue.shutdown();
     running.store(false);
     for (auto& t : serviceWorkers) {
       if (t.joinable()) t.join();
@@ -72,6 +91,15 @@ class MultithreadExecutor : public Executor {
 
   void RegisterMemory(const MemoryDesc& desc);
   void DeregisterMemory(const MemoryDesc& desc);
+
+  std::vector<TcpConnection>& FindConnections(const EngineKey& key);
+
+  // Ensure at least minCount persistent outbound connections exist to remote engine.
+  // Returns reference to internal connection vector (guarded by connsMu while mutating).
+  std::vector<TcpConnection>& EnsureConnections(const EngineDesc& rdesc, size_t minCount);
+
+  // Close and erase all persistent connections for engine key.
+  void CloseConnections(const EngineKey& key);
 
  private:
   void ReadWriteWorkerLoop() {
@@ -101,6 +129,7 @@ class MultithreadExecutor : public Executor {
   void DoReadWrite(const ReadWriteWork& work, BufferPool& bufferPool);
   void DoServiceWork(int fd, BufferPool& bufferPool);
 
+  application::TCPContext* ctx{nullptr};
   size_t numThreads{1};
   std::vector<std::thread> serviceWorkers;
   std::vector<std::thread> readWriteWorkers;
@@ -115,6 +144,9 @@ class MultithreadExecutor : public Executor {
   std::mutex memMu;                                                 // protects localMems
   std::mutex remotesMu;  // protects remotes & remoteMems meta
   std::mutex connsMu;    // protects conns map
+  // Server-side accepted connection states (fd -> state) for non-blocking EPOLLET processing.
+  std::unordered_map<int, ServiceConnState> serviceStates;
+  std::mutex serviceStatesMu;
 };
 
 }  // namespace io

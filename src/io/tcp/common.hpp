@@ -19,6 +19,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+
 #include <netinet/tcp.h>
 #include <sys/epoll.h>
 
@@ -193,6 +194,7 @@ class BufferPool {
 };
 
 int FullSend(int fd, const void* buf, size_t len);
+int FullRecv(int fd, void* buf, size_t len);
 int FullWritev(int fd, struct iovec* iov, int iovcnt);
 
 /**

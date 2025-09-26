@@ -37,21 +37,20 @@ void MultithreadExecutor::DoReadWrite(const ReadWriteWork& work, BufferPool& buf
   EngineDesc rdesc;
   {
     std::lock_guard<std::mutex> lock(remotesMu);
-    if (remotes.find(remoteKey) == remotes.end()) {
+    auto it = remotes.find(remoteKey);
+    if (it == remotes.end()) {
       status->SetCode(StatusCode::ERR_NOT_FOUND);
       status->SetMessage("remote engine not registered");
       return;
     }
-    rdesc = remotes[remoteKey];
+    rdesc = it->second;
   }
+  // Ensure at least one connection exists; if creation fails we error out.
   TcpConnection* connPtr = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(connsMu);
-    auto it = conns.find(remoteKey);
-    if (it != conns.end() && !it->second.empty()) {
-      size_t idx = std::hash<std::thread::id>{}(std::this_thread::get_id()) % it->second.size();
-      connPtr = &it->second[idx];
-    }
+  auto& vec = EnsureConnections(rdesc, 1);
+  if (!vec.empty()) {
+    size_t idx = std::hash<std::thread::id>{}(std::this_thread::get_id()) % vec.size();
+    connPtr = &vec[idx];
   }
   if (!connPtr || !connPtr->Valid()) {
     status->SetCode(StatusCode::ERR_BAD_STATE);
@@ -160,78 +159,141 @@ void MultithreadExecutor::DoReadWrite(const ReadWriteWork& work, BufferPool& buf
 }
 
 void MultithreadExecutor::DoServiceWork(int fd, BufferPool& bufferPool) {
-  // handle request
-  TcpMessageHeader hdr{};
-  ssize_t r = ::recv(fd, &hdr, sizeof(hdr), MSG_WAITALL);
-  if (r != sizeof(hdr)) {
-    ::close(fd);
-    return;
-  }
-  if (hdr.opcode == 0 || hdr.opcode == 1) {  // read or write
-    MemoryDesc target{};
+  // Non-blocking incremental processing; loop until EAGAIN or closed.
+  for (;;) {
+    ServiceConnState* stPtr = nullptr;
     {
-      std::lock_guard<std::mutex> lock(memMu);
-      auto it = localMems.find(hdr.mem_id);
-      if (it == localMems.end()) {
-        ::close(fd);
-        return;
-      }
-      target = it->second;
+      std::lock_guard<std::mutex> lk(serviceStatesMu);
+      stPtr = &serviceStates[fd];
     }
-    bool targetIsGpu = (target.loc == MemoryLocationType::GPU);
-    auto bufBlock = bufferPool.Acquire(hdr.size);
-    char* hostBuf = bufBlock.data;
-    if (hdr.opcode == 0) {  // read request: copy from target to host and send
-      if (targetIsGpu) {
-        const void* devPtr = reinterpret_cast<const void*>(target.data + hdr.offset);
-        if (hipMemcpy(hostBuf, devPtr, hdr.size, hipMemcpyDeviceToHost) != hipSuccess) {
-          bufferPool.Release(std::move(bufBlock));
-          ::close(fd);
-          return;
-        }
-      } else {
-        const char* src = reinterpret_cast<const char*>(target.data + hdr.offset);
-        std::memcpy(hostBuf, src, hdr.size);
-      }
-      TcpMessageHeader resp{};
-      resp.opcode = 2;
-      resp.id = hdr.id;
-      resp.mem_id = hdr.mem_id;
-      resp.offset = hdr.offset;
-      resp.size = hdr.size;
-      ::send(fd, &resp, sizeof(resp), 0);
-      ::send(fd, hostBuf, hdr.size, 0);
-      bufferPool.Release(std::move(bufBlock));
-    } else {  // write request: recv payload into host then copy to device if needed
-      ssize_t r2 = ::recv(fd, hostBuf, hdr.size, MSG_WAITALL);
-      if (r2 != (ssize_t)hdr.size) {
-        bufferPool.Release(std::move(bufBlock));
+    ServiceConnState& st = *stPtr;
+    if (st.closed) return;
+    if (st.phase == ConnPhase::RECV_HDR) {
+      // Read remaining header bytes
+      if (FullRecv(fd, reinterpret_cast<char*>(&st.hdr), sizeof(TcpMessageHeader)) != 0) {
+        st.closed = true;
         ::close(fd);
         return;
       }
-      if (targetIsGpu) {
-        void* devPtr = reinterpret_cast<void*>(target.data + hdr.offset);
-        if (hipMemcpy(devPtr, hostBuf, hdr.size, hipMemcpyHostToDevice) != hipSuccess) {
-          bufferPool.Release(std::move(bufBlock));
+
+      // Validate opcode
+      if (st.hdr.opcode != 0 && st.hdr.opcode != 1) {
+        st.closed = true;
+        ::close(fd);
+        return;
+      }
+      // Fetch memory meta
+      MemoryDesc target{};
+      {
+        std::lock_guard<std::mutex> lock(memMu);
+        auto it = localMems.find(st.hdr.mem_id);
+        if (it == localMems.end()) {
+          st.closed = true;
+          ::close(fd);
+          return;
+        }
+        target = it->second;
+      }
+      st.target_is_gpu = (target.loc == MemoryLocationType::GPU);
+      if (st.hdr.opcode == 0) {  // READ_REQ: prepare response buffer now
+        // Stage data into host memory if needed
+        size_t sz = st.hdr.size;
+        BufferBlock block = bufferPool.Acquire(sz);
+        std::vector<char> payload(sz);
+        if (st.target_is_gpu) {
+          const void* devPtr = reinterpret_cast<const void*>(target.data + st.hdr.offset);
+          if (hipMemcpy(payload.data(), devPtr, sz, hipMemcpyDeviceToHost) != hipSuccess) {
+            bufferPool.Release(std::move(block));
+            st.closed = true;
+            ::close(fd);
+            return;
+          }
+        } else {
+          const char* src = reinterpret_cast<const char*>(target.data + st.hdr.offset);
+          std::memcpy(payload.data(), src, sz);
+        }
+        // Build response (header + payload) into out_buf
+        TcpMessageHeader resp{};
+        resp.opcode = 2;
+        resp.id = st.hdr.id;
+        resp.mem_id = st.hdr.mem_id;
+        resp.offset = st.hdr.offset;
+        resp.size = st.hdr.size;
+        st.out_buf.resize(sizeof(resp) + payload.size());
+        std::memcpy(st.out_buf.data(), &resp, sizeof(resp));
+        std::memcpy(st.out_buf.data() + sizeof(resp), payload.data(), payload.size());
+        bufferPool.Release(std::move(block));
+        st.phase = ConnPhase::SEND_RESP;
+      } else {  // WRITE_REQ
+        st.in_payload.resize(st.hdr.size);
+        st.phase = ConnPhase::RECV_PAYLOAD;
+      }
+      // Loop to next phase without returning
+      continue;
+    }
+    if (st.phase == ConnPhase::RECV_PAYLOAD) {
+      if (FullRecv(fd, st.in_payload.data(), st.in_payload.size()) != 0) {
+        st.closed = true;
+        ::close(fd);
+        return;
+      }
+
+      // Complete write: copy to target memory
+      MemoryDesc target{};
+      {
+        std::lock_guard<std::mutex> lock(memMu);
+        auto it = localMems.find(st.hdr.mem_id);
+        if (it == localMems.end()) {
+          st.closed = true;
+          ::close(fd);
+          return;
+        }
+        target = it->second;
+      }
+      if (st.target_is_gpu) {
+        void* devPtr = reinterpret_cast<void*>(target.data + st.hdr.offset);
+        if (hipMemcpy(devPtr, st.in_payload.data(), st.in_payload.size(), hipMemcpyHostToDevice) !=
+            hipSuccess) {
+          st.closed = true;
           ::close(fd);
           return;
         }
       } else {
-        char* dst = reinterpret_cast<char*>(target.data + hdr.offset);
-        std::memcpy(dst, hostBuf, hdr.size);
+        char* dst = reinterpret_cast<char*>(target.data + st.hdr.offset);
+        std::memcpy(dst, st.in_payload.data(), st.in_payload.size());
       }
       TcpMessageHeader resp{};
       resp.opcode = 3;
-      resp.id = hdr.id;
-      resp.mem_id = hdr.mem_id;
-      resp.offset = hdr.offset;
-      resp.size = hdr.size;
-      ::send(fd, &resp, sizeof(resp), 0);
-      bufferPool.Release(std::move(bufBlock));
+      resp.id = st.hdr.id;
+      resp.mem_id = st.hdr.mem_id;
+      resp.offset = st.hdr.offset;
+      resp.size = st.hdr.size;
+      st.out_buf.resize(sizeof(resp));
+      std::memcpy(st.out_buf.data(), &resp, sizeof(resp));
+      st.phase = ConnPhase::SEND_RESP;
+      continue;
     }
-  } else {
-    ::close(fd);
+    if (st.phase == ConnPhase::SEND_RESP) {
+      if (FullSend(fd, st.out_buf.data(), st.out_buf.size()) != 0) {
+        st.closed = true;
+        ::close(fd);
+        return;
+      }
+
+      st = ServiceConnState{};  // resets all fields
+      continue;
+    }
   }
+}
+
+std::vector<TcpConnection>& MultithreadExecutor::FindConnections(const EngineKey& key) {
+  std::lock_guard<std::mutex> lock(connsMu);
+  auto it = conns.find(key);
+  if (it != conns.end()) {
+    // Check at least first connection validity
+    if (!it->second.empty() && it->second.front().Valid()) return it->second;
+  }
+  return conns[key];
 }
 
 void MultithreadExecutor::RegisterRemoteEngine(const EngineDesc& rdesc) {
@@ -242,6 +304,49 @@ void MultithreadExecutor::RegisterRemoteEngine(const EngineDesc& rdesc) {
 void MultithreadExecutor::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   std::lock_guard<std::mutex> lock(remotesMu);
   remotes.erase(rdesc.key);
+}
+
+std::vector<TcpConnection>& MultithreadExecutor::EnsureConnections(const EngineDesc& rdesc,
+                                                                   size_t minCount) {
+  std::lock_guard<std::mutex> lk(connsMu);
+  auto& vec = conns[rdesc.key];
+  // Remove any dead connections first
+  vec.erase(
+      std::remove_if(vec.begin(), vec.end(), [](const TcpConnection& c) { return !c.Valid(); }),
+      vec.end());
+  while (vec.size() < minCount) {
+    if (!ctx) break;
+    auto handle = ctx->Connect(rdesc.host, rdesc.port);
+    if (handle.fd < 0) {
+      break;  // fail silently; caller will detect invalid
+    }
+    int flag = 1;
+    setsockopt(handle.fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    setsockopt(handle.fd, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
+    int bufSz = 4 * 1024 * 1024;
+    setsockopt(handle.fd, SOL_SOCKET, SO_RCVBUF, &bufSz, sizeof(bufSz));
+    setsockopt(handle.fd, SOL_SOCKET, SO_SNDBUF, &bufSz, sizeof(bufSz));
+
+    int qack = 1;
+    setsockopt(handle.fd, IPPROTO_TCP, TCP_QUICKACK, &qack, sizeof(qack));
+
+    vec.emplace_back(handle);
+  }
+  return vec;
+}
+
+void MultithreadExecutor::CloseConnections(const EngineKey& key) {
+  std::lock_guard<std::mutex> lk(connsMu);
+  auto it = conns.find(key);
+  if (it == conns.end()) return;
+  for (auto& c : it->second) {
+    if (c.handle.fd >= 0) {
+      ctx->CloseEndpoint(c.handle);
+      ::close(c.handle.fd);
+      c.handle.fd = -1;
+    }
+  }
+  conns.erase(it);
 }
 
 void MultithreadExecutor::RegisterMemory(const MemoryDesc& desc) {
