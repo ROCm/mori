@@ -566,8 +566,8 @@ def test_dispatch_combine(
         gpu_per_node,
         world_size,
         max_tokens,
-        # torch.bfloat16,  # torch.float8_e4m3fnuz
-        torch.float8_e4m3fnuz
+        torch.bfloat16,  # torch.float8_e4m3fnuz
+        # torch.float8_e4m3fnuz
     )
     test_case.setup()
     if is_bench:
