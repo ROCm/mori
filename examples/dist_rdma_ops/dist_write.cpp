@@ -351,7 +351,7 @@ void distRdmaOps(int argc, char* argv[]) {
   config.portId = activeDevicePortList[local_rank % activeDevicePortList.size()].second;
   config.gidIdx = 3;
   config.maxMsgsNum = 10000;
-  config.maxCqeNum = 4096;
+  config.maxCqeNum = 1;
   config.alignment = 4096;
   config.onGpu = on_gpu;
   std::vector<RdmaEndpoint> endpoints;

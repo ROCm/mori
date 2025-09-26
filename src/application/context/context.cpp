@@ -221,7 +221,7 @@ void Context::InitializePossibleTransports() {
     config.portId = portId;
     config.gidIdx = 3;
     config.maxMsgsNum = 4096;
-    config.maxCqeNum = 4096;
+    config.maxCqeNum = 1;
     config.alignment = 4096;
     config.onGpu = true;
     for (int qp = 0; qp < numQpPerPe; qp++) {

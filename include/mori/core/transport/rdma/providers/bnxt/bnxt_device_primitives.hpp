@@ -490,7 +490,6 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
   uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
   uint32_t slotIdx = wqeIdx * BNXT_RE_NUM_SLOT_PER_WQE;
   // printf("atomic wqeIdx = %u, slotIdx = %u\n", wqeIdx, slotIdx);
-  
 
   uint32_t opcode = BNXT_RE_WR_OPCD_ATOMIC_FA;
   uint64_t data = val_1 ? *static_cast<uint64_t*>(val_1) : 0;
@@ -664,38 +663,66 @@ inline __device__ void UpdateDbrAndRingDbRecv<ProviderType::BNXT>(void* dbrRecAd
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Completion Queue                                        */
 /* ---------------------------------------------------------------------------------------------- */
+inline __device__ int PollSingleCqe(volatile char* cqe, uint32_t consIdx, uint32_t* wqeIdx) {
+  // Extract completion index
+  const uint32_t con_indx = *reinterpret_cast<volatile uint32_t*>(
+      cqe + offsetof(bnxt_re_req_cqe, con_indx));
+  
+  if (wqeIdx) {
+    *wqeIdx = con_indx & 0xFFFF;
+  }
+  
+  // Check completion status
+  volatile char* flgSrc = cqe + sizeof(struct bnxt_re_req_cqe);
+  const uint32_t flg_val = *reinterpret_cast<volatile uint32_t*>(flgSrc);
+  const uint8_t status = (flg_val >> BNXT_RE_BCQE_STATUS_SHIFT) & BNXT_RE_BCQE_STATUS_MASK;
+
+  if (status == BNXT_RE_REQ_ST_OK) {
+    return BNXT_RE_REQ_ST_OK;
+  }
+
+  return status;
+}
+
 template <>
 inline __device__ int PollCqOnce<ProviderType::BNXT>(void* cqeAddr, uint32_t cqeNum,
                                                      uint32_t consIdx, uint32_t* wqeIdx) {
-  uint32_t cqeIdx = consIdx % cqeNum;
-
+  // Fast path for single CQE (most common case) - eliminate all branching
+  if (cqeNum == 1) {
+    return PollSingleCqe(static_cast<volatile char*>(cqeAddr), consIdx, wqeIdx);
+  }
+  
+  // Slower path for multiple CQEs
+  const uint32_t cqeIdx = consIdx % cqeNum;
   volatile char* cqe = static_cast<volatile char*>(cqeAddr) + 2 * BNXT_RE_SLOT_SIZE * cqeIdx;
   volatile char* flgSrc = cqe + sizeof(struct bnxt_re_req_cqe);
-  uint32_t phase = BNXT_RE_QUEUE_START_PHASE ^ ((consIdx / cqeNum) & 0x1);
-  uint32_t flg_val = *reinterpret_cast<volatile uint32_t*>(flgSrc);
-  uint32_t con_indx =
-      *reinterpret_cast<volatile uint32_t*>(cqe + offsetof(bnxt_re_req_cqe, con_indx));
-  // printf("GPU  flg_val = 0x%08X (%u), phase = 0x%08X (%u) consIdx %u, cqeNum %u\n",
-  //        flg_val & BNXT_RE_BCQE_PH_MASK, flg_val & BNXT_RE_BCQE_PH_MASK, phase, phase, consIdx,
-  //        cqeNum);
-  if (((flg_val)&BNXT_RE_BCQE_PH_MASK) == (phase)) {
-    uint8_t status = (flg_val >> BNXT_RE_BCQE_STATUS_SHIFT) & BNXT_RE_BCQE_STATUS_MASK;
-
-    if (status != BNXT_RE_REQ_ST_OK) {
-      printf("CQ Error (%u)\n", status);
-      return status;
-    }
-    if (wqeIdx) {
-      *wqeIdx = con_indx & 0xFFFF;
-    }
-    return 0;
+  const uint32_t flg_val = *reinterpret_cast<volatile uint32_t*>(flgSrc);
+  const uint32_t expected_phase = BNXT_RE_QUEUE_START_PHASE ^ ((consIdx / cqeNum) & 0x1);
+  
+  if ((flg_val & BNXT_RE_BCQE_PH_MASK) != expected_phase) {
+    return -1;  // CQE not ready yet
   }
-  return -1;
+  
+  // Extract completion index and check status
+  const uint32_t con_indx = *reinterpret_cast<volatile uint32_t*>(
+      cqe + offsetof(bnxt_re_req_cqe, con_indx));
+  
+  if (wqeIdx) {
+    *wqeIdx = con_indx & 0xFFFF;
+  }
+  
+  const uint8_t status = (flg_val >> BNXT_RE_BCQE_STATUS_SHIFT) & BNXT_RE_BCQE_STATUS_MASK;
+  
+  if (__builtin_expect(status == BNXT_RE_REQ_ST_OK, 1)) {
+    return BNXT_RE_REQ_ST_OK;
+  }
+  
+  return status;
 }
 
 template <>
 inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx) {
-  uint32_t curConsIdx = atomicAdd(consIdx, 1);
+  const uint32_t curConsIdx = atomicAdd(consIdx, 1);
   int opcode = -1;
   do {
     opcode = PollCqOnce<ProviderType::BNXT>(cqAddr, cqeNum, curConsIdx, nullptr);
@@ -703,18 +730,21 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
     asm volatile("" ::: "memory");
   } while (opcode < 0);
 
+  // Handle error cases
   if (opcode != BNXT_RE_REQ_ST_OK) {
     auto error = BnxtHandleErrorCqe(opcode);
-    printf("(%s:%d) CQE error: %s\n", __FILE__, __LINE__, IbvWcStatusString(error));
+    printf("[BNXT PollCq] CQE error: %s (opcode: %d) at %s:%d\n", 
+           IbvWcStatusString(error), opcode, __FILE__, __LINE__);
     return opcode;
   }
-  return opcode;
+  
+  return BNXT_RE_REQ_ST_OK;
 }
 
 template <>
 inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx,
                                                  uint16_t* wqeCounter) {
-  uint32_t curConsIdx = *consIdx;
+  const uint32_t curConsIdx = *consIdx;
   int opcode = -1;
   uint32_t wqeIdx;
   do {
@@ -724,10 +754,12 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
   *wqeCounter = (uint16_t)(wqeIdx & 0xFFFF);
   if (opcode != BNXT_RE_REQ_ST_OK) {
     auto error = BnxtHandleErrorCqe(opcode);
-    printf("(%s:%d) CQE error: %s, wqeCounter: %u\n", __FILE__, __LINE__, IbvWcStatusString(error), *wqeCounter);
+    printf("[BNXT PollCq] CQE error: %s (opcode: %d), wqeCounter: %u at %s:%d\n",
+           IbvWcStatusString(error), opcode, *wqeCounter, __FILE__, __LINE__);
     return opcode;
   }
-  return opcode;
+  
+  return BNXT_RE_REQ_ST_OK;
 }
 
 template <>

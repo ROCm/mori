@@ -116,6 +116,9 @@ BnxtCqContainer::BnxtCqContainer(ibv_context* context, const RdmaEndpointConfig&
   int status = bnxt_re_dv_init_obj(&dv_obj, BNXT_RE_DV_OBJ_CQ);
   assert(!status);
   cqn = dvcq.cqn;
+  
+  MORI_APP_TRACE("BNXT CQ created: cqn={}, cqeNum={}, cqSize={}, cqUmemAddr=0x{:x}", 
+                 cqn, cqeNum, cqSize, reinterpret_cast<uintptr_t>(cqUmemAddr));
 }
 
 BnxtCqContainer::~BnxtCqContainer() {
