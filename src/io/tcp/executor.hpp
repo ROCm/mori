@@ -39,29 +39,29 @@ struct ServiceConnState {
   bool closed{false};
 };
 
-class Executor {
+class TCPExecutor {
  public:
-  Executor() = default;
-  virtual ~Executor() = default;
+  TCPExecutor() = default;
+  virtual ~TCPExecutor() = default;
 
   virtual void Start() = 0;
   virtual void Shutdown() = 0;
 };
 
-class MultithreadExecutor : public Executor {
+class MultithreadTCPExecutor : public TCPExecutor {
  public:
   // ctx is owned by TcpBackend; executor only borrows pointer (lifetime > executor)
-  MultithreadExecutor(application::TCPContext* ctx, size_t numThreads)
+  MultithreadTCPExecutor(application::TCPContext* ctx, size_t numThreads)
       : ctx(ctx), numThreads(numThreads) {
     running.store(true);
     Start();
   }
-  ~MultithreadExecutor() override = default;
+  ~MultithreadTCPExecutor() override = default;
 
   void Start() override {
     for (size_t i = 0; i < numThreads; ++i) {
-      readWriteWorkers.emplace_back(&MultithreadExecutor::ReadWriteWorkerLoop, this);
-      serviceWorkers.emplace_back(&MultithreadExecutor::ServiceWorkerLoop, this);
+      readWriteWorkers.emplace_back(&MultithreadTCPExecutor::ReadWriteWorkerLoop, this);
+      serviceWorkers.emplace_back(&MultithreadTCPExecutor::ServiceWorkerLoop, this);
     }
   }
 

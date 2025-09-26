@@ -33,7 +33,6 @@
 #include "mori/io/common.hpp"
 #include "mori/io/engine.hpp"
 #include "mori/io/logging.hpp"
-#include "src/io/tcp/common.hpp"
 #include "src/io/tcp/executor.hpp"
 
 namespace mori {
@@ -73,7 +72,7 @@ class TcpBackend : public Backend {
   std::thread serviceThread;
   std::atomic<bool> running{false};
 
-  std::unique_ptr<Executor> executor{nullptr};
+  std::unique_ptr<TCPExecutor> executor{nullptr};
 };
 
 class TcpBackendSession : public BackendSession {

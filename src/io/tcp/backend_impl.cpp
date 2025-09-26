@@ -21,8 +21,6 @@
 // SOFTWARE.
 #include "src/io/tcp/backend_impl.hpp"
 
-#include "src/io/tcp/executor.hpp"
-
 namespace mori {
 namespace io {
 
@@ -52,7 +50,7 @@ TcpBackend::~TcpBackend() { StopService(); }
 void TcpBackend::StartService() {
   if (running.load()) return;
   running.store(true);
-  executor.reset(new MultithreadExecutor(ctx.get(), config.numWorkerThreads));
+  executor.reset(new MultithreadTCPExecutor(ctx.get(), config.numWorkerThreads));
   serviceThread = std::thread([this] { ServiceLoop(); });
 }
 
@@ -65,14 +63,14 @@ void TcpBackend::StopService() {
 
 void TcpBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
   executor->RegisterRemoteEngine(rdesc);
-  if (auto* mexec = dynamic_cast<MultithreadExecutor*>(executor.get())) {
+  if (auto* mexec = dynamic_cast<MultithreadTCPExecutor*>(executor.get())) {
     mexec->EnsureConnections(rdesc, config.numWorkerThreads);
   }
 }
 
 void TcpBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   executor->DeregisterRemoteEngine(rdesc);
-  if (auto* mexec = dynamic_cast<MultithreadExecutor*>(executor.get())) {
+  if (auto* mexec = dynamic_cast<MultithreadTCPExecutor*>(executor.get())) {
     mexec->CloseConnections(rdesc.key);
   }
 }
@@ -109,7 +107,7 @@ void TcpBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loca
   }
   // Submit all work items
   if (localOffsets.size() != sizes.size() || remoteOffsets.size() != sizes.size()) {
-    status->SetCode(StatusCode::ERR_INVALID_ARG);
+    status->SetCode(StatusCode::ERR_INVALID_ARGS);
     status->SetMessage("BatchReadWrite: offsets and sizes vector size mismatch");
     return;
   }

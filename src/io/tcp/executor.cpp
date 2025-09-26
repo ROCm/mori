@@ -24,7 +24,7 @@
 namespace mori {
 namespace io {
 
-void MultithreadExecutor::DoReadWrite(const ReadWriteWork& work, BufferPool& bufferPool) {
+void MultithreadTCPExecutor::DoReadWrite(const ReadWriteWork& work, BufferPool& bufferPool) {
   const MemoryDesc& localDest = work.localDest;
   size_t localOffset = work.localOffset;
   const MemoryDesc& remoteSrc = work.remoteSrc;
@@ -158,7 +158,7 @@ void MultithreadExecutor::DoReadWrite(const ReadWriteWork& work, BufferPool& buf
   }
 }
 
-void MultithreadExecutor::DoServiceWork(int fd, BufferPool& bufferPool) {
+void MultithreadTCPExecutor::DoServiceWork(int fd, BufferPool& bufferPool) {
   // Non-blocking incremental processing; loop until EAGAIN or closed.
   for (;;) {
     ServiceConnState* stPtr = nullptr;
@@ -286,7 +286,7 @@ void MultithreadExecutor::DoServiceWork(int fd, BufferPool& bufferPool) {
   }
 }
 
-std::vector<TcpConnection>& MultithreadExecutor::FindConnections(const EngineKey& key) {
+std::vector<TcpConnection>& MultithreadTCPExecutor::FindConnections(const EngineKey& key) {
   std::lock_guard<std::mutex> lock(connsMu);
   auto it = conns.find(key);
   if (it != conns.end()) {
@@ -296,18 +296,18 @@ std::vector<TcpConnection>& MultithreadExecutor::FindConnections(const EngineKey
   return conns[key];
 }
 
-void MultithreadExecutor::RegisterRemoteEngine(const EngineDesc& rdesc) {
+void MultithreadTCPExecutor::RegisterRemoteEngine(const EngineDesc& rdesc) {
   std::lock_guard<std::mutex> lock(remotesMu);
   remotes[rdesc.key] = rdesc;
 }
 
-void MultithreadExecutor::DeregisterRemoteEngine(const EngineDesc& rdesc) {
+void MultithreadTCPExecutor::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   std::lock_guard<std::mutex> lock(remotesMu);
   remotes.erase(rdesc.key);
 }
 
-std::vector<TcpConnection>& MultithreadExecutor::EnsureConnections(const EngineDesc& rdesc,
-                                                                   size_t minCount) {
+std::vector<TcpConnection>& MultithreadTCPExecutor::EnsureConnections(const EngineDesc& rdesc,
+                                                                      size_t minCount) {
   std::lock_guard<std::mutex> lk(connsMu);
   auto& vec = conns[rdesc.key];
   // Remove any dead connections first
@@ -335,7 +335,7 @@ std::vector<TcpConnection>& MultithreadExecutor::EnsureConnections(const EngineD
   return vec;
 }
 
-void MultithreadExecutor::CloseConnections(const EngineKey& key) {
+void MultithreadTCPExecutor::CloseConnections(const EngineKey& key) {
   std::lock_guard<std::mutex> lk(connsMu);
   auto it = conns.find(key);
   if (it == conns.end()) return;
@@ -349,12 +349,12 @@ void MultithreadExecutor::CloseConnections(const EngineKey& key) {
   conns.erase(it);
 }
 
-void MultithreadExecutor::RegisterMemory(const MemoryDesc& desc) {
+void MultithreadTCPExecutor::RegisterMemory(const MemoryDesc& desc) {
   std::lock_guard<std::mutex> lock(memMu);
   localMems[desc.id] = desc;
 }
 
-void MultithreadExecutor::DeregisterMemory(const MemoryDesc& desc) {
+void MultithreadTCPExecutor::DeregisterMemory(const MemoryDesc& desc) {
   std::lock_guard<std::mutex> lock(memMu);
   localMems.erase(desc.id);
 }
