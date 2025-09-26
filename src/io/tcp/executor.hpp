@@ -46,7 +46,7 @@ class TCPExecutor {
 
   virtual void Start() = 0;
   virtual void Shutdown() = 0;
-  virtual int SubmitReadWriteWork() = 0;
+  virtual int SubmitReadWriteWork(const ReadWriteWork& work) = 0;
 
   virtual int SubmitServiceWork(int fd) = 0;
 
@@ -90,27 +90,27 @@ class MultithreadTCPExecutor : public TCPExecutor {
     }
   }
 
-  int SubmitReadWriteWork(const ReadWriteWork& work) {
+  int SubmitReadWriteWork(const ReadWriteWork& work) override {
     if (!workQueue.push(work)) {
       return -1;  // queue shutdown
     }
     return 0;
   }
 
-  int SubmitServiceWork(int fd) { return serviceQueue.push(fd) ? 0 : -1; }
+  int SubmitServiceWork(int fd) override { return serviceQueue.push(fd) ? 0 : -1; }
 
-  void RegisterRemoteEngine(const EngineDesc&);
-  void DeregisterRemoteEngine(const EngineDesc&);
+  void RegisterRemoteEngine(const EngineDesc&) override;
+  void DeregisterRemoteEngine(const EngineDesc&) override;
 
-  void RegisterMemory(const MemoryDesc& desc);
-  void DeregisterMemory(const MemoryDesc& desc);
+  void RegisterMemory(const MemoryDesc& desc) override;
+  void DeregisterMemory(const MemoryDesc& desc) override;
 
   // Ensure at least minCount persistent outbound connections exist to remote engine.
   // Returns reference to internal connection vector (guarded by connsMu while mutating).
-  std::vector<TcpConnection>& EnsureConnections(const EngineDesc& rdesc, size_t minCount);
+  std::vector<TcpConnection>& EnsureConnections(const EngineDesc& rdesc, size_t minCount) override;
 
   // Close and erase all persistent connections for engine key.
-  void CloseConnections(const EngineKey& key);
+  void CloseConnections(const EngineKey& key) override;
 
  private:
   void ReadWriteWorkerLoop() {

@@ -23,6 +23,9 @@
 #include <netinet/tcp.h>
 #include <sys/epoll.h>
 
+#include <condition_variable>
+#include <mutex>
+
 #include "mori/io/common.hpp"
 
 namespace mori {
