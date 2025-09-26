@@ -86,6 +86,7 @@ void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
   ReadWriteWork work{localDest, localOffset, remoteSrc, remoteOffset, size, status, id, isRead};
   if (executor->SubmitReadWriteWork(work) != 0) {
     status->SetCode(StatusCode::ERR_BAD_STATE);
+    printf("set code bad state at file %s line %d\n", __FILE__, __LINE__);
     status->SetMessage("executor shutdown");
     return;
   }
@@ -120,6 +121,7 @@ void TcpBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loca
                        sizes[i],  &itemStatuses[i], id,        isRead};
     if (executor->SubmitReadWriteWork(work) != 0) {
       status->SetCode(StatusCode::ERR_BAD_STATE);
+      printf("set code bad state at file %s line %d\n", __FILE__, __LINE__);
       status->SetMessage("executor shutdown");
       return;
     }
@@ -133,6 +135,7 @@ void TcpBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loca
   }
   if (anyFailed) {
     status->SetCode(StatusCode::ERR_BAD_STATE);
+    printf("set code bad state at file %s line %d\n", __FILE__, __LINE__);
     status->SetMessage("one or more batch items failed");
     return;
   }

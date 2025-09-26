@@ -66,7 +66,7 @@ inline std::ostream& operator<<(std::ostream& os, const RdmaBackendConfig& c) {
 struct TcpBackendConfig : public BackendConfig {
   TcpBackendConfig() : BackendConfig(BackendType::TCP) {}
   // For future extension (e.g., parallelism, buffer sizing)
-  int numWorkerThreads{1};
+  int numWorkerThreads{4};
   bool preconnect{true};
 };
 

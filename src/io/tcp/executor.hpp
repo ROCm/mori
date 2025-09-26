@@ -24,10 +24,7 @@
 namespace mori {
 namespace io {
 
-// Non-blocking server-side connection state for partial I/O handling.
 // Simple state machine: RECV_HDR -> (maybe RECV_PAYLOAD) -> SEND_RESP -> RECV_HDR ...
-// All operations processed by service worker threads; protected by serviceStatesMu.
-
 enum class ConnPhase { RECV_HDR, RECV_PAYLOAD, SEND_RESP };
 
 struct ServiceConnState {
@@ -155,9 +152,6 @@ class MultithreadTCPExecutor : public TCPExecutor {
   std::mutex memMu;                                                 // protects localMems
   std::mutex remotesMu;  // protects remotes & remoteMems meta
   std::mutex connsMu;    // protects conns map
-  // Server-side accepted connection states (fd -> state) for non-blocking EPOLLET processing.
-  std::unordered_map<int, ServiceConnState> serviceStates;
-  std::mutex serviceStatesMu;
 };
 
 }  // namespace io

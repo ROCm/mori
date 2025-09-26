@@ -27,6 +27,7 @@
 #include <mutex>
 
 #include "mori/io/common.hpp"
+#include "mori/io/logging.hpp"
 
 namespace mori {
 namespace io {
@@ -50,10 +51,24 @@ class TcpBackendSession;  // fwd
 class TcpConnection {
  public:
   TcpConnection() = default;
-  TcpConnection(application::TCPEndpointHandle h) : handle(h) {}
+  explicit TcpConnection(application::TCPEndpointHandle h) : handle(h) {}
   ~TcpConnection() = default;
+  // Non-copyable because of std::mutex
+  TcpConnection(const TcpConnection&) = delete;
+  TcpConnection& operator=(const TcpConnection&) = delete;
+  // Movable: recreate mutex in destination, transfer handle
+  TcpConnection(TcpConnection&& other) noexcept : handle(other.handle) { other.handle.fd = -1; }
+  TcpConnection& operator=(TcpConnection&& other) noexcept {
+    if (this != &other) {
+      handle = other.handle;
+      other.handle.fd = -1;
+      // ioMu left default constructed; any locks on old mutex are not transferred
+    }
+    return *this;
+  }
   bool Valid() const { return handle.fd >= 0; }
   application::TCPEndpointHandle handle{-1, {}};
+  std::mutex ioMu;  // serialize request/response if connection is shared unexpectedly
 };
 
 struct BufferBlock {
