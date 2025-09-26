@@ -94,8 +94,8 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId) {
     uint32_t doneIdx = __hip_atomic_load(&wq.doneIdx, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_AGENT);
     // printf("dbTouchIdx: %u, doneIdx: %u\n", dbTouchIdx, doneIdx);
     if (dbTouchIdx == doneIdx) {
-      core::ReleaseLock(&cq.pollCqLock);
-      return;
+      // core::ReleaseLock(&cq.pollCqLock);
+      break;
     }
 
     my_cq_consumer =
@@ -117,8 +117,6 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId) {
       if (opcode != BNXT_RE_REQ_ST_OK) {
         int rank = globalGpuStates->rank;
         uint32_t my_cq_index = my_cq_consumer % cq.cqeNum;
-        printf("rank %d dest pe %d qpId %d consIdx %d opcode %d wqe_counter %d\n", rank, pe, qpId, my_cq_index,
-               opcode, wqe_counter);
         assert(false);
       }
       wqe_counter = (wqe_counter + wq.sqWqeNum - 1) % wq.sqWqeNum;
@@ -130,6 +128,7 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId) {
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
     __hip_atomic_fetch_max(&wq.doneIdx, wqe_id, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
   }
+  core::ReleaseLock(&cq.pollCqLock);
 }
 
 template <core::ProviderType PrvdType>
@@ -310,8 +309,8 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
 
   while (true) {
     uint64_t db_touched =
-        __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+    uint64_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
     uint64_t num_active_sq_entries = db_touched - db_done;
     uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
     uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
@@ -342,7 +341,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_wqes);
     // __threadfence_system();
     core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
-    __threadfence_system();
+    // __threadfence_system();
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
@@ -480,7 +479,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_wqes);
     // __threadfence_system();
     core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
-    __threadfence_system();
+    // __threadfence_system();
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
@@ -624,7 +623,7 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
     } while (db_touched != warp_sq_counter);
 
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_wqes);
-    __threadfence_system();
+    // __threadfence_system();
     core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -770,7 +769,7 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernelImpl(
     } while (db_touched != warp_sq_counter);
 
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_wqes);
-    __threadfence_system();
+    // __threadfence_system();
     core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);

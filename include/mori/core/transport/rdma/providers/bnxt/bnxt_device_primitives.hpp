@@ -664,17 +664,19 @@ inline __device__ void UpdateDbrAndRingDbRecv<ProviderType::BNXT>(void* dbrRecAd
 /*                                        Completion Queue                                        */
 /* ---------------------------------------------------------------------------------------------- */
 inline __device__ int PollSingleCqe(volatile char* cqe, uint32_t consIdx, uint32_t* wqeIdx) {
-  // Extract completion index
-  const uint32_t con_indx = *reinterpret_cast<volatile uint32_t*>(
-      cqe + offsetof(bnxt_re_req_cqe, con_indx));
-  
+  // Extract completion index using HIP atomic load
+  const uint32_t con_indx = __hip_atomic_load(
+      reinterpret_cast<uint32_t*>(const_cast<char*>(cqe) + offsetof(bnxt_re_req_cqe, con_indx)),
+      __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+
   if (wqeIdx) {
     *wqeIdx = con_indx & 0xFFFF;
   }
-  
-  // Check completion status
+
+  // Check completion status using HIP atomic load
   volatile char* flgSrc = cqe + sizeof(struct bnxt_re_req_cqe);
-  const uint32_t flg_val = *reinterpret_cast<volatile uint32_t*>(flgSrc);
+  const uint32_t flg_val = __hip_atomic_load(reinterpret_cast<uint32_t*>(const_cast<char*>(flgSrc)),
+                                             __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
   const uint8_t status = (flg_val >> BNXT_RE_BCQE_STATUS_SHIFT) & BNXT_RE_BCQE_STATUS_MASK;
 
   if (status == BNXT_RE_REQ_ST_OK) {
@@ -691,32 +693,32 @@ inline __device__ int PollCqOnce<ProviderType::BNXT>(void* cqeAddr, uint32_t cqe
   if (cqeNum == 1) {
     return PollSingleCqe(static_cast<volatile char*>(cqeAddr), consIdx, wqeIdx);
   }
-  
+
   // Slower path for multiple CQEs
   const uint32_t cqeIdx = consIdx % cqeNum;
   volatile char* cqe = static_cast<volatile char*>(cqeAddr) + 2 * BNXT_RE_SLOT_SIZE * cqeIdx;
   volatile char* flgSrc = cqe + sizeof(struct bnxt_re_req_cqe);
   const uint32_t flg_val = *reinterpret_cast<volatile uint32_t*>(flgSrc);
   const uint32_t expected_phase = BNXT_RE_QUEUE_START_PHASE ^ ((consIdx / cqeNum) & 0x1);
-  
+
   if ((flg_val & BNXT_RE_BCQE_PH_MASK) != expected_phase) {
     return -1;  // CQE not ready yet
   }
-  
+
   // Extract completion index and check status
-  const uint32_t con_indx = *reinterpret_cast<volatile uint32_t*>(
-      cqe + offsetof(bnxt_re_req_cqe, con_indx));
-  
+  const uint32_t con_indx =
+      *reinterpret_cast<volatile uint32_t*>(cqe + offsetof(bnxt_re_req_cqe, con_indx));
+
   if (wqeIdx) {
     *wqeIdx = con_indx & 0xFFFF;
   }
-  
+
   const uint8_t status = (flg_val >> BNXT_RE_BCQE_STATUS_SHIFT) & BNXT_RE_BCQE_STATUS_MASK;
-  
+
   if (__builtin_expect(status == BNXT_RE_REQ_ST_OK, 1)) {
     return BNXT_RE_REQ_ST_OK;
   }
-  
+
   return status;
 }
 
@@ -733,11 +735,11 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
   // Handle error cases
   if (opcode != BNXT_RE_REQ_ST_OK) {
     auto error = BnxtHandleErrorCqe(opcode);
-    printf("[BNXT PollCq] CQE error: %s (opcode: %d) at %s:%d\n", 
-           IbvWcStatusString(error), opcode, __FILE__, __LINE__);
+    printf("[BNXT PollCq] CQE error: %s (opcode: %d) at %s:%d\n", IbvWcStatusString(error), opcode,
+           __FILE__, __LINE__);
     return opcode;
   }
-  
+
   return BNXT_RE_REQ_ST_OK;
 }
 
@@ -758,7 +760,7 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
            IbvWcStatusString(error), opcode, *wqeCounter, __FILE__, __LINE__);
     return opcode;
   }
-  
+
   return BNXT_RE_REQ_ST_OK;
 }
 
