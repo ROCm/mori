@@ -29,6 +29,7 @@
 
 #include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
+#include "mori/utils/mori_log.hpp"
 #include "src/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
 #include "src/application/transport/rdma/providers/mlx5/mlx5_prm.hpp"
 
@@ -61,6 +62,9 @@ HcaCapability QueryHcaCap(ibv_context* context) {
   uint32_t logBfRegSize =
       DEVX_GET(query_hca_cap_out, cmd_cap_out, capability.cmd_hca_cap.log_bf_reg_size);
   hca_cap.dbrRegSize = 1LLU << logBfRegSize;
+
+  MORI_APP_TRACE("MLX5 HCA capabilities: portType={}, dbrRegSize={}", hca_cap.portType,
+                 hca_cap.dbrRegSize);
 
   return hca_cap;
 }
@@ -134,6 +138,9 @@ Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig&
   assert(cq);
 
   cqn = DEVX_GET(create_cq_out, cmd_out, cqn);
+
+  MORI_APP_TRACE("MLX5 CQ created: cqn={}, cqeNum={}, cqSize={}, cqUmemAddr=0x{:x}, uar_page_id={}",
+                 cqn, cqeNum, cqSize, reinterpret_cast<uintptr_t>(cqUmemAddr), uar->page_id);
 }
 
 Mlx5CqContainer::~Mlx5CqContainer() {
@@ -263,6 +270,12 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   assert(qp);
 
   qpn = DEVX_GET(create_qp_out, cmd_out, qpn);
+
+  MORI_APP_TRACE(
+      "MLX5 QP created: qpn={}, qpTotalSize={}, sqWqeNum={}, rqWqeNum={}, sqAddr=0x{:x}, "
+      "rqAddr=0x{:x}",
+      qpn, qpTotalSize, sqAttrs.wqeNum, rqAttrs.wqeNum, reinterpret_cast<uintptr_t>(GetSqAddress()),
+      reinterpret_cast<uintptr_t>(GetRqAddress()));
 }
 
 void Mlx5QpContainer::DestroyQueuePair() {
@@ -346,6 +359,8 @@ void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
     // Use shared UDP sport configuration with qpId-based selection
     uint16_t selected_udp_sport = device_context->GetUdpSport(qpId);
     DEVX_SET(qpc, qpc, primary_address_path.udp_sport, selected_udp_sport);
+    MORI_APP_TRACE("MLX5 QP {} using UDP sport {} (qpId={}, index={})", qpn, selected_udp_sport,
+                   qpId, qpId % RDMA_UDP_SPORT_ARRAY_SIZE);
   } else if (portAttr.link_layer == IBV_LINK_LAYER_INFINIBAND) {
     DEVX_SET(qpc, qpc, primary_address_path.rlid, remote_handle.ib.lid);
   } else {
@@ -460,6 +475,9 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   cqPool.insert({cq->cqn, std::move(std::unique_ptr<Mlx5CqContainer>(cq))});
   qpPool.insert({qp->qpn, std::move(std::unique_ptr<Mlx5QpContainer>(qp))});
 
+  MORI_APP_TRACE("MLX5 endpoint created: qpn={}, cqn={}, portId={}, gidIdx={}", qp->qpn, cq->cqn,
+                 config.portId, config.gidIdx);
+
   return endpoint;
 }
 
@@ -468,12 +486,19 @@ void Mlx5DeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   uint32_t local_qpn = local.qpn;
   assert(qpPool.find(local_qpn) != qpPool.end());
   Mlx5QpContainer* qp = qpPool.at(local_qpn).get();
+
+  MORI_APP_TRACE("MLX5 connecting endpoint: local_qpn={}, remote_qpn={}, qpId={}", local_qpn,
+                 remote.qpn, qpId);
+
   RdmaDevice* rdmaDevice = GetRdmaDevice();
   const ibv_device_attr_ex* deviceAttr = rdmaDevice->GetDeviceAttr();
   const ibv_port_attr& portAttr = *(rdmaDevice->GetPortAttrMap()->find(local.portId)->second);
   qp->ModifyRst2Init();
   qp->ModifyInit2Rtr(remote, portAttr, qpId);
   qp->ModifyRtr2Rts(local);
+
+  MORI_APP_TRACE("MLX5 endpoint connected successfully: local_qpn={}, remote_qpn={}", local_qpn,
+                 remote.qpn);
 }
 
 /* ---------------------------------------------------------------------------------------------- */

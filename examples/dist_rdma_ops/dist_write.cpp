@@ -122,12 +122,6 @@ __device__ void Quite(RdmaEndpoint* endpoint) {
   bool is_last{my_logical_lane_id == num_active_lanes - 1};
   const uint64_t leader_phys_lane_id = GetFirstActiveLaneID(activemask);
   CompletionQueueHandle* cqHandle = &endpoint->cqHandle;
-  uint8_t num_slot_per_wqe;
-  if constexpr (P == ProviderType::MLX5) {
-    num_slot_per_wqe = 1;
-  } else if constexpr (P == ProviderType::BNXT) {
-    num_slot_per_wqe = 3;
-  }
 
   while (true) {
     bool done{false};
@@ -144,9 +138,8 @@ __device__ void Quite(RdmaEndpoint* endpoint) {
       if (!(posted - completed)) {
         return;
       }
-      uint32_t quiet_val = posted - active;
-
-      if (!quiet_val) {
+      int32_t quiet_val = posted - active;
+      if (quiet_val <= 0) {
         continue;
       }
       quiet_amount = min(num_active_lanes, quiet_val);
@@ -155,7 +148,8 @@ __device__ void Quite(RdmaEndpoint* endpoint) {
                                                     active + quiet_amount, __ATOMIC_RELAXED,
                                                     __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
         if (done) {
-          warp_cq_consumer = active;
+          warp_cq_consumer = __hip_atomic_fetch_add(&cqHandle->cq_consumer, quiet_amount,
+                                                    __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
         }
       }
       done = __shfl(done, leader_phys_lane_id);
@@ -167,14 +161,11 @@ __device__ void Quite(RdmaEndpoint* endpoint) {
     if (my_logical_lane_id < quiet_amount) {
       uint16_t wqe_counter;
       PollCq<P>(cqHandle->cqAddr, cqHandle->cqeNum, &my_cq_consumer, &wqe_counter);
-      if constexpr (P == ProviderType::BNXT) {
-        wqe_counter = (num_slot_per_wqe * (wqe_counter + endpoint->wqHandle.sqWqeNum - 1) %
-                       endpoint->wqHandle.sqWqeNum);
-      }
       __threadfence_system();
       wqe_id = endpoint->wqHandle.outstandingWqe[wqe_counter];
       __hip_atomic_fetch_max(&wqe_broadcast[warp_id], wqe_id, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_WORKGROUP);
+      __atomic_signal_fence(__ATOMIC_SEQ_CST);
     }
     if (is_leader) {
       uint64_t completed{0};
@@ -197,33 +188,51 @@ __device__ void Quite(RdmaEndpoint* endpoint) {
 template <ProviderType P>
 __device__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemoryRegion remoteMr,
                       size_t msg_size) {
+  if (msg_size == 0) return;
   uint64_t activemask = GetActiveLaneMask();
   uint8_t num_active_lanes = GetActiveLaneCount(activemask);
   uint8_t my_logical_lane_id = GetActiveLaneNum(activemask);
   bool is_leader{my_logical_lane_id == num_active_lanes - 1};
   const uint64_t leader_phys_lane_id = GetLastActiveLaneID(activemask);
 
-  uint8_t num_wqes = num_active_lanes;
-
-  uint64_t warp_sq_counter{0};
+  uint8_t num_wqes{num_active_lanes};
+  uint32_t warp_sq_counter{0};
   uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
+  uint32_t my_sq_counter{0}, my_msntbl_counter{0}, my_psn_counter{0};
+
   WorkQueueHandle* wqHandle = &endpoint->wqHandle;
   CompletionQueueHandle* cqHandle = &endpoint->cqHandle;
-  uint32_t psnCnt = (msg_size + wqHandle->mtuSize - 1) / wqHandle->mtuSize;
+  uint32_t psnCnt;
+  if constexpr (P == core::ProviderType::BNXT) {
+    psnCnt = (msg_size + wqHandle->mtuSize - 1) / wqHandle->mtuSize;
+  }
   if (is_leader) {
-    core::atomic_add_packed_msn_and_psn(&wqHandle->msnPack, num_wqes, psnCnt * num_wqes,
-                                        &warp_msntbl_counter, &warp_psn_counter);
-    // TODO: if warp_msntbl_counter overflow 32bit, sq_slot's caculation will be wrong
-    warp_sq_counter = warp_msntbl_counter;
-    __hip_atomic_fetch_max(&wqHandle->postIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
-                           __HIP_MEMORY_SCOPE_AGENT);
+    if constexpr (P == core::ProviderType::MLX5) {
+      warp_sq_counter = __hip_atomic_fetch_add(&wqHandle->postIdx, num_wqes, __ATOMIC_RELAXED,
+                                               __HIP_MEMORY_SCOPE_AGENT);
+    } else if constexpr (P == core::ProviderType::BNXT) {
+      core::atomic_add_packed_msn_and_psn(&wqHandle->msnPack, num_wqes, psnCnt * num_wqes,
+                                          &warp_msntbl_counter, &warp_psn_counter);
+      warp_sq_counter = warp_msntbl_counter;
+      __hip_atomic_fetch_max(&wqHandle->postIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
+                             __HIP_MEMORY_SCOPE_AGENT);
+    } else {
+      assert(false);
+    }
   }
   warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
-  warp_msntbl_counter = __shfl(warp_msntbl_counter, leader_phys_lane_id);
-  warp_psn_counter = __shfl(warp_psn_counter, leader_phys_lane_id);
-  uint64_t my_sq_counter = warp_sq_counter + my_logical_lane_id;
-  uint64_t my_msntbl_counter = warp_msntbl_counter + my_logical_lane_id;
-  uint64_t my_psn_counter = warp_psn_counter + my_logical_lane_id * psnCnt;
+  if constexpr (P == core::ProviderType::MLX5) {
+    my_sq_counter = warp_sq_counter + my_logical_lane_id;
+  } else if constexpr (P == core::ProviderType::BNXT) {
+    warp_msntbl_counter = __shfl(warp_msntbl_counter, leader_phys_lane_id);
+    warp_psn_counter = __shfl(warp_psn_counter, leader_phys_lane_id);
+    my_sq_counter = warp_sq_counter + my_logical_lane_id;
+    my_msntbl_counter = warp_msntbl_counter + my_logical_lane_id;
+    my_psn_counter = warp_psn_counter + psnCnt * my_logical_lane_id;
+  } else {
+    assert(false);
+  }
+
   while (true) {
     uint64_t db_touched =
         __hip_atomic_load(&wqHandle->dbTouchIdx, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
@@ -241,16 +250,22 @@ __device__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
       QuiteSerial<P>(endpoint);
     }
   }
-  if constexpr (P == ProviderType::MLX5) {
-    wqHandle->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
-  } else if constexpr (P == ProviderType::BNXT) {
-    wqHandle->outstandingWqe[my_sq_counter % wqHandle->sqWqeNum] = my_sq_counter;
-  }
   uintptr_t srcAddr = localMr.addr + FlatThreadId() * msg_size;
   uintptr_t dstAddr = remoteMr.addr + FlatThreadId() * msg_size;
-  uint64_t dbr_val =
-      PostWrite<P>(*wqHandle, my_sq_counter, my_msntbl_counter, my_psn_counter, is_leader,
-                   endpoint->handle.qpn, srcAddr, localMr.lkey, dstAddr, remoteMr.rkey, msg_size);
+  uint64_t dbr_val;
+  if constexpr (P == ProviderType::MLX5) {
+    wqHandle->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
+    dbr_val =
+        PostWrite<P>(*wqHandle, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
+                     endpoint->handle.qpn, srcAddr, localMr.lkey, dstAddr, remoteMr.rkey, msg_size);
+  } else if constexpr (P == ProviderType::BNXT) {
+    wqHandle->outstandingWqe[my_sq_counter % wqHandle->sqWqeNum] = my_sq_counter;
+    dbr_val =
+        PostWrite<P>(*wqHandle, my_sq_counter, my_msntbl_counter, my_psn_counter, is_leader,
+                     endpoint->handle.qpn, srcAddr, localMr.lkey, dstAddr, remoteMr.rkey, msg_size);
+  } else {
+    assert(false);
+  }
 
   if (is_leader) {
     uint64_t db_touched{0};
@@ -259,11 +274,7 @@ __device__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
           __hip_atomic_load(&wqHandle->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     } while (db_touched != warp_sq_counter);
 
-    // uint8_t* base_ptr = reinterpret_cast<uint8_t*>(wqHandle->sqAddr);
-    // uint64_t* ctrl_wqe_8B_for_db = reinterpret_cast<uint64_t*>(
-    //     &base_ptr[64 * ((warp_sq_counter + num_wqes - 1) % wqHandle->sqWqeNum)]);
     UpdateSendDbrRecord<P>(wqHandle->dbrRecAddr, warp_sq_counter + num_wqes);
-    // __threadfence_system();
     RingDoorbell<P>(wqHandle->dbrAddr, dbr_val);
 
     __hip_atomic_fetch_add(&cqHandle->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -350,8 +361,12 @@ void distRdmaOps(int argc, char* argv[]) {
   RdmaEndpointConfig config;
   config.portId = activeDevicePortList[local_rank % activeDevicePortList.size()].second;
   config.gidIdx = 3;
-  config.maxMsgsNum = 10000;
+  config.maxMsgsNum = 8092;
+#ifdef ENABLE_BNXT
   config.maxCqeNum = 1;
+#else
+  config.maxCqeNum = 4096;
+#endif
   config.alignment = 4096;
   config.onGpu = on_gpu;
   std::vector<RdmaEndpoint> endpoints;
@@ -496,7 +511,8 @@ void distRdmaOps(int argc, char* argv[]) {
   if (local_rank == 0) {
     printf("\nIBGDA White benchmark:\n");
     printf("Blocks: %zu, Threads: %zu, Iterations: %zu, QPs:%d \n", blocks, threads, iters, num_qp);
-    printf("%-8s %-12s %-12s %-12s %-12s\n", "Index", "Size(B)", "bw(GB)", "Time(ms)", "Rate(Mpps)");
+    printf("%-8s %-12s %-12s %-12s %-12s\n", "Index", "Size(B)", "bw(GB)", "Time(ms)",
+           "Rate(Mpps)");
 
     for (size_t i = 0; i < validSizeLog; ++i) {
       double rate_mpps = (blocks * threads * iters) / (times[i] / MS_TO_S) / 1000000.0;
