@@ -183,15 +183,11 @@ void TcpBackend::ServiceLoop() {
             int cflags = fcntl(h.fd, F_GETFL, 0);
             if (cflags >= 0) fcntl(h.fd, F_SETFL, cflags | O_NONBLOCK);
           }
-          epoll_event nev{};
-          nev.events = EPOLLIN | EPOLLET;
-          nev.data.fd = h.fd;
-          epoll_ctl(epfd, EPOLL_CTL_ADD, h.fd, &nev);
+          executor->SubmitServiceWork(h.fd);
         }
         continue;
       }
       // submit processing to service worker
-      executor->SubmitServiceWork(fd);
     }
   }
   ::close(epfd);
