@@ -286,16 +286,6 @@ void MultithreadTCPExecutor::DoServiceWork(int fd, BufferPool& bufferPool) {
   }
 }
 
-std::vector<TcpConnection>& MultithreadTCPExecutor::FindConnections(const EngineKey& key) {
-  std::lock_guard<std::mutex> lock(connsMu);
-  auto it = conns.find(key);
-  if (it != conns.end()) {
-    // Check at least first connection validity
-    if (!it->second.empty() && it->second.front().Valid()) return it->second;
-  }
-  return conns[key];
-}
-
 void MultithreadTCPExecutor::RegisterRemoteEngine(const EngineDesc& rdesc) {
   std::lock_guard<std::mutex> lock(remotesMu);
   remotes[rdesc.key] = rdesc;

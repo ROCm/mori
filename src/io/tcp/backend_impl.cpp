@@ -132,7 +132,7 @@ void TcpBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loca
     if (s.Failed()) anyFailed = true;
   }
   if (anyFailed) {
-    status->SetCode(StatusCode::ERR_UNKNOWN);
+    status->SetCode(StatusCode::ERR_BAD_STATE);
     status->SetMessage("one or more batch items failed");
     return;
   }

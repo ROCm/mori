@@ -46,6 +46,19 @@ class TCPExecutor {
 
   virtual void Start() = 0;
   virtual void Shutdown() = 0;
+  virtual int SubmitReadWriteWork() = 0;
+
+  virtual int SubmitServiceWork(int fd) = 0;
+
+  virtual void RegisterRemoteEngine(const EngineDesc&) = 0;
+  virtual void DeregisterRemoteEngine(const EngineDesc&) = 0;
+
+  virtual void RegisterMemory(const MemoryDesc& desc) = 0;
+  virtual void DeregisterMemory(const MemoryDesc& desc) = 0;
+
+  virtual std::vector<TcpConnection>& EnsureConnections(const EngineDesc& rdesc,
+                                                        size_t minCount) = 0;
+  virtual void CloseConnections(const EngineKey& key) = 0;
 };
 
 class MultithreadTCPExecutor : public TCPExecutor {
@@ -91,8 +104,6 @@ class MultithreadTCPExecutor : public TCPExecutor {
 
   void RegisterMemory(const MemoryDesc& desc);
   void DeregisterMemory(const MemoryDesc& desc);
-
-  std::vector<TcpConnection>& FindConnections(const EngineKey& key);
 
   // Ensure at least minCount persistent outbound connections exist to remote engine.
   // Returns reference to internal connection vector (guarded by connsMu while mutating).
