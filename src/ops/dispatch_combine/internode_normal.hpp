@@ -444,6 +444,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         if (syncNumTokensToRecv == 0) continue;
 
         // check RDMA data ready (shmemInpTokMemObj), wait data from same-id GPU
+#if 0
         if (laneId == srcNode) {
           int spins = 0;
           while (true) {
@@ -462,19 +463,21 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             ++spins;
           }
         }
-
-        // uint64_t syncHeadCache = __shfl(headCache, srcNode);
-        // uint64_t syncTailCache = __shfl(tailCache, srcNode);
-        // while (syncTailCache < syncHeadCache + 1) {
-        //   if (laneId == srcNode) {
-        //     tailCache = __hip_atomic_load(
-        //         args.tailMemObj->template GetAs<uint64_t*>() + srcPe + channelId * npes,
-        //         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-        //   }
-        //   syncTailCache = __shfl(syncTailCache, srcNode);
-        // }
+#else
+        uint64_t syncHeadCache = __shfl(headCache, srcNode);
+        uint64_t syncTailCache = __shfl(tailCache, srcNode);
+        while (syncTailCache < syncHeadCache + 1) {
+          if (laneId == srcNode) {
+            tailCache = __hip_atomic_load(
+                args.tailMemObj->template GetAs<uint64_t*>() + srcPe + channelId * npes,
+                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+          }
+          syncTailCache = __shfl(tailCache, srcNode);
+        }
+#endif
 
         // check buffer ready (shmemOutTokMemObj)
+#if 0
         if (laneId == 0 && srcNode != myNode) {
           int spins = 0;
           while (true) {
@@ -492,9 +495,23 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             // }
           }
         }
+#else
+        if (srcNode != myNode) {
+          while (p2pTailCache - p2pHeadCache >= maxP2PStagingTokens) {
+            if(laneId == 0) {
+              p2pHeadCache = __hip_atomic_load(
+                  args.headMemObj->template GetAs<uint64_t*>() + channelId * npes + fwdPe,
+                  __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            }
+            p2pHeadCache = __shfl(p2pHeadCache, 0);
+          }
+        }
+#endif
 
-        uint64_t syncHeadCache = __shfl(headCache, srcNode);
-        uint64_t syncTailCache = __shfl(tailCache, srcNode);
+#if 0
+        // uint64_t syncHeadCache = __shfl(headCache, srcNode);
+        // uint64_t syncTailCache = __shfl(tailCache, srcNode);
+#endif
         for (uint64_t step = syncHeadCache; step < syncTailCache; ++step) {
         uint64_t tokenStart = (syncHeadCache % maxRDMASteps) * stepRDMATokens;
         syncNumTokensToRecv = __shfl(numTokensToRecv, srcNode);
@@ -703,7 +720,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         }
 
         // check data ready (shmemOutTokMemObj)
-        // TODO 可能改成所有thr进入while loop？
+#if 0
         if (laneId == 0) {
           int spins = 0;
           while (true) {
@@ -724,7 +741,18 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           }
         }
         p2pTailCache = __shfl(p2pTailCache, 0);
-
+#else
+        while (p2pTailCache < p2pHeadCache + 1 && !done) {
+          if(laneId == 0){
+            p2pTailCache = __hip_atomic_load(
+                args.tailMemObj->template GetAs<uint64_t*>() + srcPe + channelId * npes,
+                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            done = core::AtomicLoadRelaxedSystem(statusPtr);
+          }
+          p2pTailCache = __shfl(p2pTailCache, 0);
+          done = __shfl(done, 0);
+        }
+#endif
         for (uint64_t i = p2pHeadCache; i < p2pTailCache; ++i) {
           index_t slot = i % maxP2PStagingTokens;
           char* srcPtr =
@@ -786,23 +814,35 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         p2pHeadCache = p2pTailCache;
         // Update p2p head
         if (laneId == 0) {
-          *(args.headMemObj->template GetAs<uint64_t*>(srcPe) + channelId * npes + myPe) =
-              p2pHeadCache;
+          // *(args.headMemObj->template GetAs<uint64_t*>(srcPe) + channelId * npes + myPe) =
+          //     p2pHeadCache;
+          __hip_atomic_store(
+              args.headMemObj->template GetAs<uint64_t*>(srcPe) + channelId * npes + myPe,
+              p2pHeadCache, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
         }
       }
       __threadfence_system();
     }
     __syncthreads();
     shmem::ShmemQuietThread();
+
+    // all recv block barrier
     if (thdId == 0) {
-      // totalRecvTokenNum will be used in GetDispatchSrcTokenId
-      *(args.totalRecvTokenNum) = *(args.localPeTokenCounter);
+      // TODO check hang
+      atomicAdd(args.dispatchGridBarrier, 1);
+      while (atomicCAS(args.dispatchGridBarrier, nChannels, 0) != 0);
+
+      if (channelId == 0) {
+        // totalRecvTokenNum will be used in GetDispatchSrcTokenId
+        *(args.totalRecvTokenNum) = *(args.localPeTokenCounter);
 #if DEBUG == 1
-      // printf("rank=%d totalRecvTokenNum=%d\n", myPe, *args.totalRecvTokenNum);
+        printf("rank=%d totalRecvTokenNum=%d\n", myPe, *args.totalRecvTokenNum);
 #endif
-      // clear localPeTokenCounter
-      *args.localPeTokenCounter = 0;
+        // clear localPeTokenCounter
+        *args.localPeTokenCounter = 0;
+      }
     }
+    __syncthreads();
   }  // Receiver end
 }
 
