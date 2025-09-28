@@ -502,15 +502,6 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
       data = 1;
       break;
     }
-    // TODO: dont have opmod, is set will work?
-    case AMO_SIGNAL:
-    case AMO_SIGNAL_SET:
-    case AMO_SWAP:
-    case AMO_SET: {
-      opcode = BNXT_RE_WR_OPCD_ATOMIC_CS;
-      cmp = 0;
-      break;
-    }
     case AMO_FETCH_ADD:
     case AMO_SIGNAL_ADD:
     case AMO_ADD: {

@@ -105,51 +105,63 @@ void testAtomicNonFetchThread() {
   SymmMemObjPtr buffObj = ShmemQueryMemObjPtr(buff);
   assert(buffObj.IsValid());
 
-  // Run uint64 atomic nonfetch
-  AtomicNonFetchThreadKernel<uint64_t><<<blockNum, threadNum>>>(myPe, buffObj);
-  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-  MPI_Barrier(MPI_COMM_WORLD);
-  printf("after rank[%d] %lu %lu\n", myPe, *(reinterpret_cast<uint64_t*>(buff)),
-         *(reinterpret_cast<uint64_t*>(buff) + 2));
+  // Run atomic operations 10 times
+  for (int iteration = 0; iteration < 10; iteration++) {
+    printf("========== Iteration %d ==========\n", iteration + 1);
+    
+    // Run uint64 atomic nonfetch
+    myHipMemsetD64(buff, myPe, numEle);
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+    printf("before rank[%d] uint64: %lu %lu\n", myPe, *(reinterpret_cast<uint64_t*>(buff)),
+           *(reinterpret_cast<uint64_t*>(buff)));
+    AtomicNonFetchThreadKernel<uint64_t><<<blockNum, threadNum>>>(myPe, buffObj);
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+    MPI_Barrier(MPI_COMM_WORLD);
+    printf("after rank[%d] uint64: %lu %lu\n", myPe, *(reinterpret_cast<uint64_t*>(buff)),
+           *(reinterpret_cast<uint64_t*>(buff) + 2));
 
-  // Test int64_t atomic nonfetch
-  buffSize = numEle * sizeof(int64_t);
-  myHipMemsetD64(buff, myPe, numEle);
-  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-  printf("before rank[%d] %ld %ld\n", myPe, *(reinterpret_cast<int64_t*>(buff)),
-         *(reinterpret_cast<int64_t*>(buff)));
-  // Run int64 atomic nonfetch
-  AtomicNonFetchThreadKernel<int64_t><<<blockNum, threadNum>>>(myPe, buffObj);
-  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-  MPI_Barrier(MPI_COMM_WORLD);
-  printf("after rank[%d] %ld %ld\n", myPe, *(reinterpret_cast<int64_t*>(buff)),
-         *(reinterpret_cast<int64_t*>(buff) + 2));
+    // Test int64_t atomic nonfetch
+    buffSize = numEle * sizeof(int64_t);
+    myHipMemsetD64(buff, myPe, numEle);
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+    printf("before rank[%d] int64: %ld %ld\n", myPe, *(reinterpret_cast<int64_t*>(buff)),
+           *(reinterpret_cast<int64_t*>(buff)));
+    // Run int64 atomic nonfetch
+    AtomicNonFetchThreadKernel<int64_t><<<blockNum, threadNum>>>(myPe, buffObj);
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+    MPI_Barrier(MPI_COMM_WORLD);
+    printf("after rank[%d] int64: %ld %ld\n", myPe, *(reinterpret_cast<int64_t*>(buff)),
+           *(reinterpret_cast<int64_t*>(buff) + 2));
 
-  // Test uint32_t atomic nonfetch
-  buffSize = numEle * sizeof(uint32_t);
-  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff), myPe, numEle));
-  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-  printf("before rank[%d] %u %u\n", myPe, *(reinterpret_cast<uint32_t*>(buff)),
-         *(reinterpret_cast<uint32_t*>(buff)));
-  // Run uint32 atomic nonfetch
-  AtomicNonFetchThreadKernel<uint32_t><<<blockNum, threadNum>>>(myPe, buffObj);
-  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-  MPI_Barrier(MPI_COMM_WORLD);
-  printf("after rank[%d] %u %u\n", myPe, *(reinterpret_cast<uint32_t*>(buff)),
-         *(reinterpret_cast<uint32_t*>(buff) + 2));
+    // Test uint32_t atomic nonfetch
+    buffSize = numEle * sizeof(uint32_t);
+    HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff), myPe, numEle));
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+    printf("before rank[%d] uint32: %u %u\n", myPe, *(reinterpret_cast<uint32_t*>(buff)),
+           *(reinterpret_cast<uint32_t*>(buff)));
+    // Run uint32 atomic nonfetch
+    AtomicNonFetchThreadKernel<uint32_t><<<blockNum, threadNum>>>(myPe, buffObj);
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+    MPI_Barrier(MPI_COMM_WORLD);
+    printf("after rank[%d] uint32: %u %u\n", myPe, *(reinterpret_cast<uint32_t*>(buff)),
+           *(reinterpret_cast<uint32_t*>(buff) + 2));
 
-  // Test int32_t atomic nonfetch
-  buffSize = numEle * sizeof(int32_t);
-  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<int32_t*>(buff), myPe, numEle));
-  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-  printf("before rank[%d] %d %d\n", myPe, *(reinterpret_cast<int32_t*>(buff)),
-         *(reinterpret_cast<int32_t*>(buff)));
-  // Run int32 atomic nonfetch
-  AtomicNonFetchThreadKernel<int32_t><<<blockNum, threadNum>>>(myPe, buffObj);
-  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-  MPI_Barrier(MPI_COMM_WORLD);
-  printf("after rank[%d] %d %d\n", myPe, *(reinterpret_cast<int32_t*>(buff)),
-         *(reinterpret_cast<int32_t*>(buff) + 2));
+    // Test int32_t atomic nonfetch
+    buffSize = numEle * sizeof(int32_t);
+    HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<int32_t*>(buff), myPe, numEle));
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+    printf("before rank[%d] int32: %d %d\n", myPe, *(reinterpret_cast<int32_t*>(buff)),
+           *(reinterpret_cast<int32_t*>(buff)));
+    // Run int32 atomic nonfetch
+    AtomicNonFetchThreadKernel<int32_t><<<blockNum, threadNum>>>(myPe, buffObj);
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+    MPI_Barrier(MPI_COMM_WORLD);
+    printf("after rank[%d] int32: %d %d\n", myPe, *(reinterpret_cast<int32_t*>(buff)),
+           *(reinterpret_cast<int32_t*>(buff) + 2));
+    
+    printf("Iteration %d completed\n", iteration + 1);
+    MPI_Barrier(MPI_COMM_WORLD);  // Ensure all processes complete this iteration before next
+  }
 
   // Finalize
   ShmemFree(buff);

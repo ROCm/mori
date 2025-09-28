@@ -154,22 +154,22 @@ static __device__ __host__ void DumpMlx5Wqe(void* wqeBaseAddr, uint32_t idx) {
 }
 
 static __device__ __host__ uint32_t get_num_wqes_in_atomic(atomicType amo_op, uint32_t bytes) {
-  if (bytes == 8) {
-    // RC
-    switch (amo_op) {
-      case AMO_SIGNAL:
-      case AMO_SIGNAL_SET:
-      case AMO_SWAP:
-      case AMO_SET:
-      case AMO_FETCH_AND:
-      case AMO_AND:
-      case AMO_FETCH_OR:
-      case AMO_OR:
-        return 2;
-      default:
-        break;
-    }
-  }
+  // if (bytes == 8) {
+  //   // RC
+  //   switch (amo_op) {
+  //     case AMO_SIGNAL:
+  //     case AMO_SIGNAL_SET:
+  //     case AMO_SWAP:
+  //     case AMO_SET:
+  //     case AMO_FETCH_AND:
+  //     case AMO_AND:
+  //     case AMO_FETCH_OR:
+  //     case AMO_OR:
+  //       return 2;
+  //     default:
+  //       break;
+  //   }
+  // }
   return 1;
 }
 
