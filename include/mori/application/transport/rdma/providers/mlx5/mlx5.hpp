@@ -115,6 +115,11 @@ class Mlx5QpContainer {
   mlx5dv_devx_uar* qpUar{nullptr};
   void* qpUarPtr{nullptr};
   mlx5dv_devx_obj* qp{nullptr};
+  
+  // Atomic internal buffer fields
+  void* atomicIbufAddr{nullptr};
+  size_t atomicIbufSize{0};
+  ibv_mr* atomicIbufMr{nullptr};
 };
 
 /* ---------------------------------------------------------------------------------------------- */

@@ -174,7 +174,7 @@ void Mlx5QpContainer::ComputeQueueAttrs(const RdmaEndpointConfig& config) {
   // Send queue attributes
   sqAttrs.offset = rqAttrs.wqSize;
   sqAttrs.wqeSize = GetMlx5SqWqeSize();
-  sqAttrs.wqSize = RoundUpPowOfTwo(sqAttrs.wqeSize * config.maxMsgsNum);
+  sqAttrs.wqSize = RoundUpPowOfTwo(sqAttrs.wqeSize * maxMsgsNum);
   sqAttrs.wqeNum = ceil(sqAttrs.wqSize / MLX5_SEND_WQE_BB);
   sqAttrs.wqeShift = MLX5_SEND_WQE_SHIFT;
 
@@ -182,9 +182,11 @@ void Mlx5QpContainer::ComputeQueueAttrs(const RdmaEndpointConfig& config) {
   qpTotalSize = RoundUpPowOfTwo(rqAttrs.wqSize + sqAttrs.wqSize);
   qpTotalSize = (qpTotalSize + config.alignment - 1) / config.alignment * config.alignment;
 
-#if DEBUG == 1
-  std::cout << "rq[ " << rqAttrs << "] sq[ " << sqAttrs << "]" << std::endl;
-#endif
+  MORI_APP_TRACE(
+      "MLX5 Queue attributes computed - RQ: wqeSize={}, wqSize={}, wqeNum={}, offset={} | SQ: "
+      "wqeSize={}, wqSize={}, wqeNum={}, offset={} | Total: {}",
+      rqAttrs.wqeSize, rqAttrs.wqSize, rqAttrs.wqeNum, rqAttrs.offset, sqAttrs.wqeSize,
+      sqAttrs.wqSize, sqAttrs.wqeNum, sqAttrs.offset, qpTotalSize);
 }
 
 void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
@@ -222,6 +224,27 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
 
   qpDbrUmem = mlx5dv_devx_umem_reg(context, qpDbrUmemAddr, 8, IBV_ACCESS_LOCAL_WRITE);
   assert(qpDbrUmem);
+
+  // Allocate and register atomic internal buffer (ibuf)
+  atomicIbufSize = RoundUpPowOfTwo(config.atomicIbufSize);
+  if (config.onGpu) {
+    HIP_RUNTIME_CHECK(hipMalloc(&atomicIbufAddr, atomicIbufSize));
+    HIP_RUNTIME_CHECK(hipMemset(atomicIbufAddr, 0, atomicIbufSize));
+  } else {
+    status = posix_memalign(&atomicIbufAddr, config.alignment, atomicIbufSize);
+    memset(atomicIbufAddr, 0, atomicIbufSize);
+    assert(!status);
+  }
+
+  // Register atomic ibuf as independent memory region
+  atomicIbufMr = ibv_reg_mr(device_context->GetIbvPd(), atomicIbufAddr, atomicIbufSize,
+                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                                IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+  assert(atomicIbufMr);
+
+  MORI_APP_TRACE("MLX5 Atomic ibuf allocated: addr=0x{:x}, size={}, lkey=0x{:x}, rkey=0x{:x}",
+                 reinterpret_cast<uintptr_t>(atomicIbufAddr), atomicIbufSize, atomicIbufMr->lkey,
+                 atomicIbufMr->rkey);
 
   // Allocate user access region
   qpUar = mlx5dv_devx_alloc_uar(context, MLX5DV_UAR_ALLOC_TYPE_NC);
@@ -279,15 +302,43 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
 }
 
 void Mlx5QpContainer::DestroyQueuePair() {
-  if (qpUmemAddr) HIP_RUNTIME_CHECK(hipFree(qpUmemAddr));
-  if (qpDbrUmemAddr) HIP_RUNTIME_CHECK(hipFree(qpDbrUmemAddr));
+  if (atomicIbufMr) {
+    ibv_dereg_mr(atomicIbufMr);
+    atomicIbufMr = nullptr;
+  }
+  if (atomicIbufAddr) {
+    if (config.onGpu) {
+      HIP_RUNTIME_CHECK(hipFree(atomicIbufAddr));
+    } else {
+      free(atomicIbufAddr);
+    }
+    atomicIbufAddr = nullptr;
+  }
+
+  if (qpUmem) mlx5dv_devx_umem_dereg(qpUmem);
+  if (qpUmemAddr) {
+    if (config.onGpu) {
+      HIP_RUNTIME_CHECK(hipFree(qpUmemAddr));
+    } else {
+      free(qpUmemAddr);
+    }
+  }
   if (qpDbrUmem) mlx5dv_devx_umem_dereg(qpDbrUmem);
+  if (qpDbrUmemAddr) {
+    if (config.onGpu) {
+      HIP_RUNTIME_CHECK(hipFree(qpDbrUmemAddr));
+    } else {
+      free(qpDbrUmemAddr);
+    }
+  }
   if (qpUar) {
-    hipPointerAttribute_t attr;
-    HIP_RUNTIME_CHECK(hipPointerGetAttributes(&attr, qpUar->reg_addr));
-    // Multiple qp may share the same uar address, only unregister once
-    if ((attr.type == hipMemoryTypeHost) && (attr.hostPointer != nullptr)) {
-      HIP_RUNTIME_CHECK(hipHostUnregister(qpUar->reg_addr));
+    if (config.onGpu) {
+      hipPointerAttribute_t attr;
+      HIP_RUNTIME_CHECK(hipPointerGetAttributes(&attr, qpUar->reg_addr));
+      // Multiple qp may share the same uar address, only unregister once
+      if ((attr.type == hipMemoryTypeHost) && (attr.hostPointer != nullptr)) {
+        HIP_RUNTIME_CHECK(hipHostUnregister(qpUar->reg_addr));
+      }
     }
     mlx5dv_devx_free_uar(qpUar);
   }
@@ -472,11 +523,20 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   endpoint.cqHandle.cqeSize = GetMlx5CqeSize();
   endpoint.cqHandle.dbrRecAddr = cq->cqDbrUmemAddr;
 
+  // Set atomic internal buffer information
+  endpoint.atomicIbuf.addr = reinterpret_cast<uintptr_t>(qp->atomicIbufAddr);
+  endpoint.atomicIbuf.lkey = qp->atomicIbufMr->lkey;
+  endpoint.atomicIbuf.rkey = qp->atomicIbufMr->rkey;
+  endpoint.atomicIbuf.nslots = qp->atomicIbufSize / 8;  // number of 8-byte slots
+
   cqPool.insert({cq->cqn, std::move(std::unique_ptr<Mlx5CqContainer>(cq))});
   qpPool.insert({qp->qpn, std::move(std::unique_ptr<Mlx5QpContainer>(qp))});
 
-  MORI_APP_TRACE("MLX5 endpoint created: qpn={}, cqn={}, portId={}, gidIdx={}", qp->qpn, cq->cqn,
-                 config.portId, config.gidIdx);
+  MORI_APP_TRACE(
+      "MLX5 endpoint created: qpn={}, cqn={}, portId={}, gidIdx={}, atomicIbuf addr=0x{:x}, "
+      "nslots={}",
+      qp->qpn, cq->cqn, config.portId, config.gidIdx, endpoint.atomicIbuf.addr,
+      endpoint.atomicIbuf.nslots);
 
   return endpoint;
 }

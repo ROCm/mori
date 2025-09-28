@@ -118,6 +118,11 @@ class BnxtQpContainer {
   void* qpUar{nullptr};
   void* qpUarPtr{nullptr};
   ibv_qp* qp{nullptr};
+  
+  // Atomic internal buffer fields
+  void* atomicIbufAddr{nullptr};
+  size_t atomicIbufSize{0};
+  ibv_mr* atomicIbufMr{nullptr};
 };
 
 /* ---------------------------------------------------------------------------------------------- */

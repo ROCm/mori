@@ -25,11 +25,11 @@
 #include <infiniband/verbs.h>
 #include <unistd.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <sstream>
 #include <string>
-#include <cstdlib>
-#include <cstring>
 
 #include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
@@ -52,19 +52,16 @@ static std::ostream& operator<<(std::ostream& s, const bnxt_re_dv_qp_mem_info& m
 
 template <>
 struct fmt::formatter<bnxt_re_dv_qp_mem_info> {
-  constexpr auto parse(format_parse_context& ctx) -> decltype(ctx.begin()) {
-    return ctx.end();
-  }
+  constexpr auto parse(format_parse_context& ctx) -> decltype(ctx.begin()) { return ctx.end(); }
 
   template <typename FormatContext>
   auto format(const bnxt_re_dv_qp_mem_info& m, FormatContext& ctx) -> decltype(ctx.out()) {
     return fmt::format_to(ctx.out(),
-      "qp_handle: 0x{:x}  sq_va: 0x{:x}  sq_len: {}  sq_slots: {}  "
-      "sq_wqe_sz: {}  sq_psn_sz: {}  sq_npsn: {}  rq_va: 0x{:x}  "
-      "rq_len: {}  rq_slots: {}  rq_wqe_sz: {}  comp_mask: 0x{:x}",
-      m.qp_handle, m.sq_va, m.sq_len, m.sq_slots, m.sq_wqe_sz, 
-      m.sq_psn_sz, m.sq_npsn, m.rq_va, m.rq_len, m.rq_slots, 
-      m.rq_wqe_sz, m.comp_mask);
+                          "qp_handle: 0x{:x}  sq_va: 0x{:x}  sq_len: {}  sq_slots: {}  "
+                          "sq_wqe_sz: {}  sq_psn_sz: {}  sq_npsn: {}  rq_va: 0x{:x}  "
+                          "rq_len: {}  rq_slots: {}  rq_wqe_sz: {}  comp_mask: 0x{:x}",
+                          m.qp_handle, m.sq_va, m.sq_len, m.sq_slots, m.sq_wqe_sz, m.sq_psn_sz,
+                          m.sq_npsn, m.rq_va, m.rq_len, m.rq_slots, m.rq_wqe_sz, m.comp_mask);
   }
 };
 #endif  // ENABLE_BNXT
@@ -116,9 +113,9 @@ BnxtCqContainer::BnxtCqContainer(ibv_context* context, const RdmaEndpointConfig&
   int status = bnxt_re_dv_init_obj(&dv_obj, BNXT_RE_DV_OBJ_CQ);
   assert(!status);
   cqn = dvcq.cqn;
-  
-  MORI_APP_TRACE("BNXT CQ created: cqn={}, cqeNum={}, cqSize={}, cqUmemAddr=0x{:x}", 
-                 cqn, cqeNum, cqSize, reinterpret_cast<uintptr_t>(cqUmemAddr));
+
+  MORI_APP_TRACE("BNXT CQ created: cqn={}, cqeNum={}, cqSize={}, cqUmemAddr=0x{:x}", cqn, cqeNum,
+                 cqSize, reinterpret_cast<uintptr_t>(cqUmemAddr));
 }
 
 BnxtCqContainer::~BnxtCqContainer() {
@@ -265,19 +262,75 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   qp = bnxt_re_dv_create_qp(pd, &dv_qp_attr);
   assert(qp);
   qpn = qp->qp_num;
+
+  // Allocate and register atomic internal buffer (ibuf)
+  atomicIbufSize = config.atomicIbufSize;
+  if (config.onGpu) {
+    HIP_RUNTIME_CHECK(
+        hipExtMallocWithFlags(&atomicIbufAddr, atomicIbufSize, hipDeviceMallocUncached));
+    HIP_RUNTIME_CHECK(hipMemset(atomicIbufAddr, 0, atomicIbufSize));
+  } else {
+    err = posix_memalign(&atomicIbufAddr, config.alignment, atomicIbufSize);
+    memset(atomicIbufAddr, 0, atomicIbufSize);
+    assert(!err);
+  }
+
+  // Register atomic ibuf as independent memory region
+  atomicIbufMr = ibv_reg_mr(pd, atomicIbufAddr, atomicIbufSize,
+                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                                IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+  assert(atomicIbufMr);
+
+  MORI_APP_TRACE("BNXT Atomic ibuf allocated: addr=0x{:x}, size={}, lkey=0x{:x}, rkey=0x{:x}",
+                 reinterpret_cast<uintptr_t>(atomicIbufAddr), atomicIbufSize, atomicIbufMr->lkey,
+                 atomicIbufMr->rkey);
   MORI_APP_TRACE(qpMemInfo);
 }
 
 BnxtQpContainer::~BnxtQpContainer() { DestroyQueuePair(); }
 
 void BnxtQpContainer::DestroyQueuePair() {
-  if (sqUmemAddr) HIP_RUNTIME_CHECK(hipFree(sqUmemAddr));
-  if (rqUmemAddr) HIP_RUNTIME_CHECK(hipFree(rqUmemAddr));
-  if (qpDbrUmemAddr) HIP_RUNTIME_CHECK(hipFree(qpDbrUmemAddr));
+  // Clean up atomic internal buffer
+  if (atomicIbufMr) {
+    ibv_dereg_mr(atomicIbufMr);
+    atomicIbufMr = nullptr;
+  }
+  if (atomicIbufAddr) {
+    if (config.onGpu) {
+      HIP_RUNTIME_CHECK(hipFree(atomicIbufAddr));
+    } else {
+      free(atomicIbufAddr);
+    }
+    atomicIbufAddr = nullptr;
+  }
+
   if (sqUmem) bnxt_re_dv_umem_dereg(sqUmem);
   if (rqUmem) bnxt_re_dv_umem_dereg(rqUmem);
+  if (sqUmemAddr) {
+    if (config.onGpu) {
+      HIP_RUNTIME_CHECK(hipFree(sqUmemAddr));
+    } else {
+      free(sqUmemAddr);
+    }
+  }
+  if (rqUmemAddr) {
+    if (config.onGpu) {
+      HIP_RUNTIME_CHECK(hipFree(rqUmemAddr));
+    } else {
+      free(rqUmemAddr);
+    }
+  }
+  if (qpDbrUmemAddr) {
+    if (config.onGpu) {
+      HIP_RUNTIME_CHECK(hipFree(qpDbrUmemAddr));
+    } else {
+      free(qpDbrUmemAddr);
+    }
+  }
   if (qpUar) {
-    HIP_RUNTIME_CHECK(hipHostUnregister(qpUar));
+    if (config.onGpu) {
+      HIP_RUNTIME_CHECK(hipHostUnregister(qpUar));
+    }
   }
   if (qp) bnxt_re_dv_destroy_qp(qp);
 }
@@ -326,13 +379,15 @@ void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
   // TODO: max_dest_rd_atomic whether affect nums of amo/rd
   attr.max_dest_rd_atomic = deviceAttr.orig_attr.max_qp_rd_atom;
   attr.min_rnr_timer = 12;
-  
+
   // Use qpId to select UDP sport value from the shared configuration (round-robin)
   uint16_t selected_udp_sport = GetDeviceContext()->GetUdpSport(qpId);
-  MORI_APP_TRACE("QP {} using UDP sport {} (qpId={}, index={})", qpn, selected_udp_sport, qpId, qpId % RDMA_UDP_SPORT_ARRAY_SIZE);
+  MORI_APP_TRACE("QP {} using UDP sport {} (qpId={}, index={})", qpn, selected_udp_sport, qpId,
+                 qpId % RDMA_UDP_SPORT_ARRAY_SIZE);
   int status = bnxt_re_dv_modify_qp_udp_sport(qp, selected_udp_sport);
   if (status) {
-    MORI_APP_ERROR("Failed to set UDP sport {} for QP {}: error code {}", selected_udp_sport, qpn, status);
+    MORI_APP_ERROR("Failed to set UDP sport {} for QP {}: error code {}", selected_udp_sport, qpn,
+                   status);
   }
   assert(!status);
   MORI_APP_TRACE("bnxt_re_dv_modify_qp_udp_sport is done, return {}", status);
@@ -439,8 +494,20 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   endpoint.cqHandle.cqeNum = cq->cqeNum;
   endpoint.cqHandle.cqeSize = GetBnxtCqeSize();
 
+  // Set atomic internal buffer information
+  endpoint.atomicIbuf.addr = reinterpret_cast<uintptr_t>(qp->atomicIbufAddr);
+  endpoint.atomicIbuf.lkey = qp->atomicIbufMr->lkey;
+  endpoint.atomicIbuf.rkey = qp->atomicIbufMr->rkey;
+  endpoint.atomicIbuf.nslots = qp->atomicIbufSize / 8;  // number of 8-byte slots
+
   cqPool.insert({cq->cqn, cq});
   qpPool.insert({qp->qpn, qp});
+
+  MORI_APP_TRACE(
+      "BNXT endpoint created: qpn={}, cqn={}, portId={}, gidIdx={}, atomicIbuf addr=0x{:x}, "
+      "nslots={}",
+      qp->qpn, cq->cqn, config.portId, config.gidIdx, endpoint.atomicIbuf.addr,
+      endpoint.atomicIbuf.nslots);
 
   return endpoint;
 }

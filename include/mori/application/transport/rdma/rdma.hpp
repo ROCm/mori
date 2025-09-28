@@ -83,6 +83,7 @@ struct RdmaEndpointConfig {
   bool onGpu{false};
   bool withCompChannel{false};
   bool enableSrq{false};
+  size_t atomicIbufSize{4096};  // Size of atomic internal buffer, default 4KB
 };
 
 struct InfiniBandEndpointHandle {
@@ -128,6 +129,13 @@ struct WorkQueueAttrs {
   uint32_t offset{0};
 };
 
+struct RdmaMemoryRegion {
+  uintptr_t addr{0};
+  uint32_t lkey{0};
+  uint32_t rkey{0};
+  size_t length{0};
+};
+
 struct RdmaEndpoint {
   RdmaDeviceVendorId vendorId{RdmaDeviceVendorId::Unknown};
   RdmaEndpointHandle handle;
@@ -137,6 +145,9 @@ struct RdmaEndpoint {
   core::WorkQueueHandle wqHandle;
   core::CompletionQueueHandle cqHandle;
   core::IBVerbsHandle ibvHandle;
+  
+  // Atomic internal buffer (ibuf) - independent MR for atomic operations
+  core::IbufHandle atomicIbuf;
 
   __device__ __host__ core::ProviderType GetProviderType() {
     if (vendorId == RdmaDeviceVendorId::Mellanox) {
@@ -152,13 +163,6 @@ struct RdmaEndpoint {
 };
 
 class RdmaDevice;
-
-struct RdmaMemoryRegion {
-  uintptr_t addr{0};
-  uint32_t lkey{0};
-  uint32_t rkey{0};
-  size_t length{0};
-};
 
 /* -------------------------------------------------------------------------- */
 /*                              RdmaDeviceContext                             */
@@ -187,6 +191,7 @@ class RdmaDeviceContext {
 
   RdmaDevice* GetRdmaDevice();
   ibv_context* GetIbvContext();
+  ibv_pd* GetIbvPd() {return pd;}
   ibv_srq* GetIbvSrq() { return srq; }
   
   uint16_t GetUdpSport(uint32_t qpId) const;
