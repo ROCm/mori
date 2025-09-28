@@ -264,8 +264,8 @@ inline __device__ uint64_t mlx5PrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
                                                 void* val_1, void* val_2, uint32_t bytes,
                                                 atomicType amo_op) {
   uint8_t signalFlag = cqeSignal ? MLX5_WQE_CTRL_CQ_UPDATE : 0x00;
-  void* queueBuffAddr = wq.rqAddr;
-  uint32_t wqeNum = wq.rqWqeNum;
+  void* queueBuffAddr = wq.sqAddr;
+  uint32_t wqeNum = wq.sqWqeNum;
 
   uint32_t numWqesPerCmd = get_num_wqes_in_atomic(amo_op, bytes);
   uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
