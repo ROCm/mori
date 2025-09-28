@@ -50,6 +50,7 @@ class EpDispatchCombineConfig:
     gpu_per_node: int = 8
     rdma_block_num: int = 0
 
+
 def _cpp_dispatch_combine_factory(entity_name):
     return getattr(mori_cpp, entity_name)
 

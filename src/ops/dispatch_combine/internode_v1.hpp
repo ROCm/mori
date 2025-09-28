@@ -82,6 +82,9 @@ inline __device__ void DispatchSendIntraNodeBlock(EpDispatchCombineArgs<T>& args
   size_t destTokOffset = destTokId * config.hiddenDim;
   core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
                  args.inpTokenBuf + srcTokOffset, config.hiddenDim);
+  core::WarpCopy(args.shmemOutIndicesMemObj->template GetAs<index_t*>(destPe) +
+                     destTokId * config.numExpertPerToken,
+                 args.tokenIndices + tokenId * config.numExpertPerToken, config.numExpertPerToken);
 }
 
 template <typename T>
@@ -90,7 +93,7 @@ inline __device__ void DispatchSendIntraNode(EpDispatchCombineArgs<T>& args) {
 
   // Distribute tokens evenly to all blocks
   int blockOffset = config.rdmaBlockNum;
-  int xgmiBlockNum = config.blockNum - config.rdmaBlockNum;
+  int xgmiBlockNum = blockNum - config.rdmaBlockNum;
   int tokenPerBlock = (args.curRankNumToken + xgmiBlockNum - 1) / xgmiBlockNum;
   int startTokenIdx = (blockId - blockOffset) * tokenPerBlock;
   int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, args.curRankNumToken);
@@ -168,7 +171,6 @@ inline __device__ void DispatchSendInterNode(EpDispatchCombineArgs<T>& args) {
     if (i == myNode) continue;
     int proxyPe = i * config.gpuPerNode + (config.rank % config.gpuPerNode);
     for (int tokenId = startTokenIdx + laneId; tokenId < endTokenIdx; tokenId += warpSize) {
-      uint64_t st = clock64();
       bool shouldSend = false;
       for (int e = 0; e < config.numExpertPerToken; e++) {
         int destNode = args.tokenIndices[tokenId * numExpertPerToken + e] /
@@ -202,14 +204,10 @@ inline __device__ void DispatchSendInterNode(EpDispatchCombineArgs<T>& args) {
         }
         size_t remoteIdx = (myNode * config.MaxNumTokensToRecvPerRank() + destTokId);
         if (count > 0) {
-          // printf("myPe %d warp %d send tokens %d\n", myPe, globalWarpId, count);
           size_t stagingTokOffset = tokenId * xferBytes;
           shmem::ShmemPutMemNbiThread(args.shmemInpTokMemObj, remoteIdx * xferBytes,
                                       args.shmemStagingTokMemObj, stagingTokOffset,
                                       count * xferBytes, proxyPe);
-          uint64_t end = clock64();
-          // printf("myPe %d block %d warp %d lane %d cycles %lu\n", myPe, blockId, warpId, laneId,
-          // end-st);
         }
       }
     }
@@ -293,7 +291,6 @@ inline __device__ void DispatchInterNodeChannel(EpDispatchCombineArgs<T>& args) 
                                    index_t{curSlotIdx - startSlotIdx + 1}, proxyPe);
   }
 
-  // v1::DispatchSendInterNodeFinalize(args);
   uint8_t* stagingPtr = args.shmemInpTokMemObj->template GetAs<uint8_t*>();
   for (int i = 0; i < nNodes; i++) {
     if (i == myNode) continue;
@@ -337,6 +334,9 @@ inline __device__ void DispatchInterNodeChannel(EpDispatchCombineArgs<T>& args) 
         core::WarpCopy(
             args.shmemOutTokMemObj->template GetAs<uint8_t*>(destPe) + destTokId * hiddenBytes,
             stagingPtr + tokIdx * xferBytes, hiddenBytes);
+        core::WarpCopy(
+            args.shmemOutIndicesMemObj->template GetAs<uint8_t*>(destPe) + destTokId * indexBytes,
+            stagingPtr + tokIdx * xferBytes + hiddenBytes, indexBytes);
       }
     }
   }
@@ -454,16 +454,26 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
 }  // namespace v1
 
 template <typename T>
+__global__ void EpDispatchInterNodeKernelV1GlobalSync(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  if (blockId < config.rdmaBlockNum) {
+    v1::DispatchSendInterNode(args);
+    v1::DispatchSendInterNodeFinalize(args);
+  } else {
+    v1::DispatchSendIntraNode(args);
+  }
+  v1::DispatchRecvInterNode(args);
+  v1::DispatchSync(args);
+}
+
+template <typename T>
 __global__ void EpDispatchInterNodeKernelV1(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   if (blockId < config.rdmaBlockNum) {
-    // v1::DispatchSendInterNode(args);
-    // v1::DispatchSendInterNodeFinalize(args);
     v1::DispatchInterNodeChannel(args);
   } else {
     v1::DispatchSendIntraNode(args);
   }
-  // v1::DispatchRecvInterNode(args);
   v1::DispatchSync(args);
 }
 
