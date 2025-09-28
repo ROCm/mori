@@ -213,8 +213,8 @@ void IOEngine::BatchRead(const MemDescVec& localDest, const BatchSizeVec& localO
     backend->BatchRead(localDest[i], localOffsets[i], remoteSrc[i], remoteOffsets[i], sizes[i],
                        status[i], ids[i]);
     if (status[i]->Failed()) {
-      MORI_IO_ERROR("Engine batch read error {} message {}", status->CodeUint32(),
-                    status->Message());
+      MORI_IO_ERROR("Engine batch read error {} message {}", status[i]->CodeUint32(),
+                    status[i]->Message());
     }
   }
 }
@@ -237,9 +237,9 @@ void IOEngine::BatchWrite(const MemDescVec& localSrc, const BatchSizeVec& localO
     SELECT_BACKEND_AND_RETURN_IF_NONE(localSrc[i], remoteDest[i], status[i], backend);
     backend->BatchWrite(localSrc[i], localOffsets[i], remoteDest[i], remoteOffsets[i], sizes[i],
                         status[i], ids[i]);
-    if (status->Failed()) {
-      MORI_IO_ERROR("Engine batch write error {} message {}", status->CodeUint32(),
-                    status->Message());
+    if (status[i]->Failed()) {
+      MORI_IO_ERROR("Engine batch write error {} message {}", status[i]->CodeUint32(),
+                    status[i]->Message());
     }
   }
 }
