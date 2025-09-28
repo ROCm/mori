@@ -587,7 +587,7 @@ inline __device__ uint64_t mlx5PrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
   wqeAtomicSeg->swap_add = HTOBE64(data);
   wqeAtomicSeg->compare = HTOBE64(cmp);
 
-  wqeDataSeg->byte_count = HTOBE32(bytes);
+  wqeDataSeg->byte_count = HTOBE32(8);
   wqeDataSeg->addr = HTOBE64(laddr);
   wqeDataSeg->lkey = HTOBE32(lkey);
   return reinterpret_cast<uint64_t*>(wqeCtrlSeg)[0];
