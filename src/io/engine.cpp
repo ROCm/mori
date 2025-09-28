@@ -194,28 +194,53 @@ void IOEngine::Write(const MemoryDesc& localSrc, size_t localOffset, const Memor
   }
 }
 
-void IOEngine::BatchRead(const MemoryDesc& localDest, const SizeVec& localOffsets,
-                         const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
-                         const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
+void IOEngine::BatchRead(const MemDescVec& localDest, const BatchSizeVec& localOffsets,
+                         const MemDescVec& remoteSrc, const BatchSizeVec& remoteOffsets,
+                         const BatchSizeVec& sizes, TransferStatusPtrVec& status,
+                         TransferUniqueIdVec& ids) {
   MORI_IO_FUNCTION_TIMER;
-  Backend* backend = nullptr;
-  SELECT_BACKEND_AND_RETURN_IF_NONE(localDest, remoteSrc, status, backend);
-  backend->BatchRead(localDest, localOffsets, remoteSrc, remoteOffsets, sizes, status, id);
-  if (status->Failed()) {
-    MORI_IO_ERROR("Engine batch read error {} message {}", status->CodeUint32(), status->Message());
+  size_t batchSize = localDest.size();
+  assert(batchSize == remoteSrc.size());
+  assert(batchSize == localOffsets.size());
+  assert(batchSize == remoteOffsets.size());
+  assert(batchSize == sizes.size());
+  assert(batchSize == status.size());
+  assert(batchSize == ids.size());
+
+  for (size_t i = 0; i < batchSize; i++) {
+    Backend* backend = nullptr;
+    SELECT_BACKEND_AND_RETURN_IF_NONE(localDest[i], remoteSrc[i], status[i], backend);
+    backend->BatchRead(localDest[i], localOffsets[i], remoteSrc[i], remoteOffsets[i], sizes[i],
+                       status[i], ids[i]);
+    if (status[i]->Failed()) {
+      MORI_IO_ERROR("Engine batch read error {} message {}", status->CodeUint32(),
+                    status->Message());
+    }
   }
 }
 
-void IOEngine::BatchWrite(const MemoryDesc& localSrc, const SizeVec& localOffsets,
-                          const MemoryDesc& remoteDest, const SizeVec& remoteOffsets,
-                          const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
+void IOEngine::BatchWrite(const MemDescVec& localSrc, const BatchSizeVec& localOffsets,
+                          const MemDescVec& remoteDest, const BatchSizeVec& remoteOffsets,
+                          const BatchSizeVec& sizes, TransferStatusPtrVec& status,
+                          TransferUniqueIdVec& ids) {
   MORI_IO_FUNCTION_TIMER;
-  Backend* backend = nullptr;
-  SELECT_BACKEND_AND_RETURN_IF_NONE(localSrc, remoteDest, status, backend);
-  backend->BatchWrite(localSrc, localOffsets, remoteDest, remoteOffsets, sizes, status, id);
-  if (status->Failed()) {
-    MORI_IO_ERROR("Engine batch write error {} message {}", status->CodeUint32(),
-                  status->Message());
+  size_t batchSize = localSrc.size();
+  assert(batchSize == remoteDest.size());
+  assert(batchSize == localOffsets.size());
+  assert(batchSize == remoteOffsets.size());
+  assert(batchSize == sizes.size());
+  assert(batchSize == status.size());
+  assert(batchSize == ids.size());
+
+  for (size_t i = 0; i < batchSize; i++) {
+    Backend* backend = nullptr;
+    SELECT_BACKEND_AND_RETURN_IF_NONE(localSrc[i], remoteDest[i], status[i], backend);
+    backend->BatchWrite(localSrc[i], localOffsets[i], remoteDest[i], remoteOffsets[i], sizes[i],
+                        status[i], ids[i]);
+    if (status->Failed()) {
+      MORI_IO_ERROR("Engine batch write error {} message {}", status->CodeUint32(),
+                    status->Message());
+    }
   }
 }
 

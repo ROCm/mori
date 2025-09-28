@@ -252,8 +252,13 @@ def test_rdma_backend_ops(
             transfer_uid = initiator.allocate_transfer_uid()
             func = initiator.batch_read if op_type == "read" else initiator.batch_write
             transfer_status = func(
-                initiator_mem, offsets, target_mem, offsets, sizes, transfer_uid
-            )
+                [initiator_mem],
+                [offsets],
+                [target_mem],
+                [offsets],
+                [sizes],
+                [transfer_uid],
+            )[0]
         uid_status_list.append((transfer_uid, transfer_status))
     else:
         for i in range(batch_size):
@@ -334,8 +339,8 @@ def test_no_backend():
 
     transfer_uid = initiator.allocate_transfer_uid()
     transfer_status = initiator.batch_read(
-        initiator_mem, offsets, target_mem, offsets, sizes, transfer_uid
-    )
+        [initiator_mem], [offsets], [target_mem], [offsets], [sizes], [transfer_uid]
+    )[0]
 
     assert transfer_status.Failed()
     assert transfer_status.Code() == StatusCode.ERR_BAD_STATE

@@ -361,15 +361,15 @@ class MoriIoBenchmark:
                     else self.engine.batch_write
                 )
                 args = (
-                    self.mem,
-                    offsets,
-                    self.target_mem,
-                    offsets,
-                    sizes,
-                    transfer_uid,
+                    [self.mem],
+                    [offsets],
+                    [self.target_mem],
+                    [offsets],
+                    [sizes],
+                    [transfer_uid],
                 )
             st = time.time()
-            transfer_status = func(*args)
+            transfer_status = func(*args)[0]
             transfer_status.Wait()
             duration = time.time() - st
             assert transfer_status.Succeeded()
