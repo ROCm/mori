@@ -85,10 +85,12 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   // TODO maxNumInpTokenPerRank could be smaller
   const size_t maxNumInpTokenPerRank =
       ((config.maxNumInpTokenPerRank + channelNum - 1) / channelNum) * channelNum;
+  const size_t maxNumInpTokenPerChannel = maxNumInpTokenPerRank / channelNum;
   const int stepRDMATokens = config.maxRDMAStepTokens;
 
   const size_t stagingTokens =
-      max(maxNumInpTokenPerRank * nNodes, stepRDMATokens * nNodes * channelNum);
+      (((maxNumInpTokenPerChannel + stepRDMATokens - 1) / stepRDMATokens) * stepRDMATokens) *
+      nNodes * channelNum;
   printf("rank %d stagingTokens %zu max(%zu, %d)\n", config.rank, stagingTokens,
          maxNumInpTokenPerRank * nNodes, stepRDMATokens * nNodes * channelNum);
   size_t maxStagingTokSize = (config.kernelType == KernelType::InterNodeNormal
@@ -171,7 +173,17 @@ void EpDispatchCombineHandle::InitializeNormalKernelBuf() {
   // rdmaTailMemObj = ShmemMallocAndReturnMemObjPtr(syncCounterSize, hipDeviceMallocUncached);
   // p2pHeadMemObj = ShmemMallocAndReturnMemObjPtr(syncCounterSize, hipDeviceMallocUncached);
   // p2pTailMemObj = ShmemMallocAndReturnMemObjPtr(syncCounterSize, hipDeviceMallocUncached);
+  printf("enter headMemObj\n");
   headMemObj = ShmemMallocAndReturnMemObjPtr(syncCounterSize, hipDeviceMallocUncached);
+  assert(headMemObj->peerPtrs != nullptr && headMemObj->localPtr != nullptr);
+  printf(
+      "headMemObj.cpu=%p headMemObj->localPtr=%p headMemObj->peerPtrs[0]=%p "
+      "headMemObj->peerPtrs[1]=%p\n",
+      headMemObj.cpu, headMemObj->localPtr, headMemObj->peerPtrs[0], headMemObj->peerPtrs[1]);
+  // int tmp = config.blockNum;
+  // while (config.rank == 0 && tmp > 10) {
+  //   //
+  // }
   tailMemObj = ShmemMallocAndReturnMemObjPtr(syncCounterSize, hipDeviceMallocUncached);
   HIP_RUNTIME_CHECK(hipMalloc(&localHead, syncCounterSize));
   HIP_RUNTIME_CHECK(hipMemset(localHead, 0, syncCounterSize));
@@ -295,7 +307,7 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
           EpDispatchInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeNormal) {
           // EpPreDispatchInterNodeNormalKernel<DataT><<<1, warpSize, 0, stream>>>(args);
-          EpDispatchInterNodeNormalKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
+          EpDispatchInterNodeNormalKernel<DataT><<<grid, block, 0, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else {

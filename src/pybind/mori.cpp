@@ -68,7 +68,7 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
     out = torch::empty({handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
                        torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA));
     // TODO remove this
-    HIP_RUNTIME_CHECK(hipMemset(out.data_ptr(), 0, out.nbytes()));
+    // HIP_RUNTIME_CHECK(hipMemset(out.data_ptr(), 0, out.nbytes()));
     handle.PrepareTraining(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
                            out.data_ptr(), weightPtr, scalePtr,
                            topkIds.data_ptr<mori::moe::index_t>(), input.size(0));
