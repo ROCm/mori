@@ -68,6 +68,11 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
   const size_t metaBytes = sizeof(size_t);
   const size_t tokenPackBytes = tokenBytes + weightBytes + indiceBytes + scaleBytes + metaBytes;
 
+  const size_t weightsOffset = tokenBytes;
+  const size_t indiceOffset = weightsOffset + weightBytes;
+  const size_t scalesOffset = indiceOffset + indiceBytes;
+  const size_t metaOffset = scalesOffset + scaleBytes;
+
   const int nChannels = blockNum / 2;
   const int isSender = blockId < nChannels;
   const int channelId = blockId % nChannels;
@@ -136,6 +141,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             ++nodeTokenCount[destNode];
           }
         }
+        __threadfence();
         tokenProgress[kSendWarpCount] = tokenIdx;
       }
 #if DEBUG == 1
@@ -282,10 +288,6 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
                laneId * nlocalPes + myLocalPe, tailCache);
 #endif
       }
-      // clear data
-      for (int i = laneId; i < nNodes * maxTokensPerChannel; i += warpSize) {
-        slotToTokenIdxMap[i] = 0;
-      }
     } else if (warpId < kSendWarpCount) {
       __syncthreads();
       uint64_t nodetailCache[MAX_NODES] = {};
@@ -299,8 +301,6 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
 
         for (int node = 0; node < nNodes; ++node) {
           index_t slot = tokenIdxToSlotMap[tokenIdx * nNodes + node] - 1;
-          // clear tokenIdxToSlotMap
-          if (laneId) tokenIdxToSlotMap[tokenIdx * nNodes + node] = 0;
           if (slot == -1) continue;
 
           // TODO check RDMA buffer ready (shmemInpTokMemObj)
@@ -333,34 +333,31 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           }
 
           // TODO modify shmemStagingTokMemObj size
-          size_t stagingOffset =
+          char* sendStagingPtr =
+              args.shmemStagingTokMemObj->template GetAs<char*>() +
               ((channelId * nNodes + node) * maxRDMAStagingTokens +
                (tailCache % maxRDMASteps) * stepRDMATokens + slot % stepRDMATokens) *
-              tokenPackBytes;
-          core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + stagingOffset,
+                  tokenPackBytes;
+          core::WarpCopy(sendStagingPtr,
                          reinterpret_cast<char*>(args.inpTokenBuf) + tokenIdx * tokenBytes,
                          tokenBytes);
-          stagingOffset += tokenBytes;
           if (weightBytes) {
-            core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + stagingOffset,
+            core::WarpCopy(sendStagingPtr + weightsOffset,
                            reinterpret_cast<char*>(args.weightsBuf) + tokenIdx * weightBytes,
                            weightBytes);
-            stagingOffset += weightBytes;
           }
-          core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + stagingOffset,
+          core::WarpCopy(sendStagingPtr + indiceOffset,
                          reinterpret_cast<char*>(args.tokenIndices) + tokenIdx * indiceBytes,
                          indiceBytes);
-          stagingOffset += indiceBytes;
           if (scaleBytes) {
-            core::WarpCopy(args.shmemStagingTokMemObj->template GetAs<char*>() + stagingOffset,
+            core::WarpCopy(sendStagingPtr + scalesOffset,
                            reinterpret_cast<char*>(args.scalesBuf) + tokenIdx * scaleBytes,
                            scaleBytes);
-            stagingOffset += scaleBytes;
           }
           if (laneId == 0) {
             // write meta - record source token info
-            *(reinterpret_cast<size_t*>(args.shmemStagingTokMemObj->template GetAs<char*>() +
-                                        stagingOffset)) = myPe * maxNumInpTokenPerRank + tokenIdx;
+            *(reinterpret_cast<size_t*>(sendStagingPtr + metaOffset)) =
+                myPe * maxNumInpTokenPerRank + tokenIdx;
 #if DEBUG_DATA == 1
             printf(
                 "DATA CHECK SEND copy to RDMA staging node=%d slot=%d tailCache=%lu srcData=%f\n",
@@ -382,6 +379,16 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         tokenProgress[warpId] = tokenIdx;
       }
       tokenProgress[warpId] = channelEndOffset - 1;
+    }
+    
+    __syncthreads();
+    // clear slotToTokenIdxMap
+    for (int i = thdId; i < nNodes * maxTokensPerChannel; i += thdNum) {
+      slotToTokenIdxMap[i] = 0;
+    }
+    // clear tokenIdxToSlotMap
+    for (int i = thdId + channelStartOffset * nNodes; i < channelEndOffset * nNodes; i += thdNum) {
+      tokenIdxToSlotMap[i] = 0;
     }
   } else {  // Receiver
     constexpr int kfwdWarpCount = 8;
@@ -514,7 +521,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
 #endif
         for (uint64_t step = syncHeadCache; step < syncTailCache; ++step) {
         uint64_t tokenStart = (syncHeadCache % maxRDMASteps) * stepRDMATokens;
-        syncNumTokensToRecv = __shfl(numTokensToRecv, srcNode);
+        // syncNumTokensToRecv = __shfl(numTokensToRecv, srcNode);
         uint64_t tokenEnd = tokenStart + min(syncNumTokensToRecv, stepRDMATokens);
         for (uint64_t i = tokenStart; i < tokenEnd; ++i) {
           if (srcNode == laneId) {
@@ -523,11 +530,12 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             assert(numTokensToRecv >= 0);
 #endif
           }
+          --syncNumTokensToRecv;
           index_t slot = i;
           char* srcPtr =
               args.shmemInpTokMemObj->template GetAs<char*>() +
               ((channelId * nNodes + srcNode) * maxRDMAStagingTokens + slot) * tokenPackBytes;
-          index_t* srcIndicesPtr = reinterpret_cast<index_t*>(srcPtr + tokenBytes + weightBytes);
+          index_t* srcIndicesPtr = reinterpret_cast<index_t*>(srcPtr + indiceOffset);
           int destPe = -1;
           if (laneId < numExpertPerToken) destPe = srcIndicesPtr[laneId] / config.numExpertPerRank;
           if (!__any(destPe == fwdPe)) {
@@ -546,33 +554,31 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             }
             localTokenIdx = __shfl(localTokenIdx, 0);
             // TODO abstrct into a function
-            char* dstPtr = reinterpret_cast<char*>(args.outTokenBuf) + localTokenIdx * tokenBytes;
-            core::WarpCopy(dstPtr, srcPtr, tokenBytes);
-            srcPtr += tokenBytes;
+            core::WarpCopy(reinterpret_cast<char*>(args.outTokenBuf) + localTokenIdx * tokenBytes,
+                           srcPtr, tokenBytes);
             if (weightBytes) {
               core::WarpCopy(
                   args.shmemOutWeightsMemObj->template GetAs<char*>() + localTokenIdx * weightBytes,
-                  srcPtr, weightBytes);
-              srcPtr += weightBytes;
+                  srcPtr + weightsOffset, weightBytes);
             }
             core::WarpCopy(
                 args.shmemOutIndicesMemObj->template GetAs<char*>() + localTokenIdx * indiceBytes,
-                srcPtr, indiceBytes);
-            srcPtr += indiceBytes;
+                srcPtr + indiceOffset, indiceBytes);
             if (scaleBytes) {
               core::WarpCopy(
                   args.shmemOutScalesMemObj->template GetAs<char*>() + localTokenIdx * scaleBytes,
-                  srcPtr, scaleBytes);
-              srcPtr += scaleBytes;
+                  srcPtr + scalesOffset, scaleBytes);
             }
             if (laneId == 0) {
               // get meta
               args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[localTokenIdx] =
-                  *(reinterpret_cast<index_t*>(srcPtr));
+                  *(reinterpret_cast<index_t*>(srcPtr + metaOffset));
 #if DEBUG_DATA == 1
               // assert(float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
               //                     localTokenIdx * tokenBytes))) ==
-              //        (float)(*(reinterpret_cast<size_t*>(srcPtr)) / maxNumInpTokenPerRank + 1));
+              //        (float)(*(reinterpret_cast<size_t*>(srcPtr + metaOffset)) /
+              //                    maxNumInpTokenPerRank +
+              //                1));
               printf(
                   "DATA CHECK RECV fwd to output srcStep=%lu srcSlot=%d srcData=%f dst(output) "
                   "localTokenIdx=%d\n",
@@ -782,32 +788,30 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
                 slot, (float)(*((T*)srcPtr)), localTokenIdx);
           }
 #endif
-          srcPtr += tokenBytes;
           if (weightBytes) {
             core::WarpCopy(
                 args.shmemOutWeightsMemObj->template GetAs<char*>() + localTokenIdx * weightBytes,
-                srcPtr, weightBytes);
-            srcPtr += weightBytes;
+                srcPtr + weightsOffset, weightBytes);
           }
           core::WarpCopy(
               args.shmemOutIndicesMemObj->template GetAs<char*>() + localTokenIdx * indiceBytes,
-              srcPtr, indiceBytes);
-          srcPtr += indiceBytes;
+              srcPtr + indiceOffset, indiceBytes);
           if (scaleBytes) {
             core::WarpCopy(
                 args.shmemOutScalesMemObj->template GetAs<char*>() + localTokenIdx * scaleBytes,
-                srcPtr, scaleBytes);
-            srcPtr += scaleBytes;
+                srcPtr + scalesOffset, scaleBytes);
           }
           if (laneId == 0) {
             // get meta
             args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[localTokenIdx] =
-                *(reinterpret_cast<index_t*>(srcPtr));
+                *(reinterpret_cast<index_t*>(srcPtr + metaOffset));
 #if DEBUG_DATA == 1
-            assert(float(*((T*)(args.shmemOutTokMemObj->template GetAs<char*>(srcPe) +
-                                ((channelId * nlocalPes + myLocalPe) * maxP2PStagingTokens + slot) *
-                                    tokenPackBytes) )) ==
-                   (float)(*(reinterpret_cast<size_t*>(srcPtr)) / maxNumInpTokenPerRank + 1));
+            assert(
+                float(*((T*)(args.shmemOutTokMemObj->template GetAs<char*>(srcPe) +
+                             ((channelId * nlocalPes + myLocalPe) * maxP2PStagingTokens + slot) *
+                                 tokenPackBytes))) ==
+                (float)(*(reinterpret_cast<size_t*>(srcPtr + metaOffset)) / maxNumInpTokenPerRank +
+                        1));
 #endif
           }
         }
@@ -842,7 +846,6 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         *args.localPeTokenCounter = 0;
       }
     }
-    __syncthreads();
   }  // Receiver end
 }
 
