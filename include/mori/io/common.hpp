@@ -129,6 +129,10 @@ struct TransferStatus {
 };
 
 using SizeVec = std::vector<size_t>;
+using MemDescVec = std::vector<MemoryDesc>;
+using BatchSizeVec = std::vector<SizeVec>;
+using TransferUniqueIdVec = std::vector<TransferUniqueId>;
+using TransferStatusPtrVec = std::vector<TransferStatus*>;
 
 }  // namespace io
 }  // namespace mori
