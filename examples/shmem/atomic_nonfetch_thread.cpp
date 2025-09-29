@@ -58,11 +58,9 @@ __global__ void AtomicNonFetchThreadKernel(int myPe, const SymmMemObjPtr memObj)
 
     // ShmemAtomicUint64NonFetchThread(memObj, threadOffset, sendPe, AMO_SET, recvPe);
     if (globalWarpId % 2 == 0) {
-      ShmemAtomicTypeNonFetchThread<T>(memObj, 2 * sizeof(T), source, sizeof(T), 1, AMO_ADD,
-                                       recvPe);
+      ShmemAtomicTypeNonFetchThread<T>(memObj, 2 * sizeof(T), 1, AMO_ADD, recvPe);
     } else {
-      ShmemAtomicTypeNonFetchThread<T>(memObj, 2 * sizeof(T), source, sizeof(T), 1, AMO_ADD, recvPe,
-                                       1);
+      ShmemAtomicTypeNonFetchThread<T>(memObj, 2 * sizeof(T), 1, AMO_ADD, recvPe, 1);
     }
     __threadfence_system();
 
@@ -108,7 +106,7 @@ void testAtomicNonFetchThread() {
   // Run atomic operations 10 times
   for (int iteration = 0; iteration < 10; iteration++) {
     printf("========== Iteration %d ==========\n", iteration + 1);
-    
+
     // Run uint64 atomic nonfetch
     myHipMemsetD64(buff, myPe, numEle);
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
@@ -158,7 +156,7 @@ void testAtomicNonFetchThread() {
     MPI_Barrier(MPI_COMM_WORLD);
     printf("after rank[%d] int32: %d %d\n", myPe, *(reinterpret_cast<int32_t*>(buff)),
            *(reinterpret_cast<int32_t*>(buff) + 2));
-    
+
     printf("Iteration %d completed\n", iteration + 1);
     MPI_Barrier(MPI_COMM_WORLD);  // Ensure all processes complete this iteration before next
   }

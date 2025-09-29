@@ -256,12 +256,11 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
 
   __shared__ index_t recvTokenNum;
   __syncthreads();
-  if (warpId ==  warpNum - 1) {
+  if (warpId == warpNum - 1) {
     shmem::ShmemAtomicTypeNonFetchWarp<int64_t>(
         args.sendAtomicSignalMemObj,
-        (myPe + (args.crossDeviceBarrierFlag & 1) * npes) * sizeof(int64_t),
-        args.sendAtomicSignalMemObj->GetRdmaMemoryRegion(myPe), (2 * npes + myPe) * sizeof(int64_t),
-        1, core::AMO_ADD, destPe, localBlockId);
+        (myPe + (args.crossDeviceBarrierFlag & 1) * npes) * sizeof(int64_t), 1, core::AMO_ADD,
+        destPe, localBlockId);
   }
   if (thdId == 0) {
     int64_t* signal = args.sendAtomicSignalMemObj->template GetAs<int64_t*>() + destPe +
@@ -353,10 +352,10 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   if (thdId < args.config.worldSize) {
     uint64_t currentVal = core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId);
 #if DEBUG == 1
-    printf("Thread %d: localBarrierPtr[%d] = %lu, expected = %lu\n", 
-           thdId, thdId, currentVal, (uint64_t)(args.crossDeviceBarrierFlag * numQps));
+    printf("Thread %d: localBarrierPtr[%d] = %lu, expected = %lu\n", thdId, thdId, currentVal,
+           (uint64_t)(args.crossDeviceBarrierFlag * numQps));
 #endif
-    
+
     while (currentVal != args.crossDeviceBarrierFlag * numQps) {
       currentVal = core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId);
     }
@@ -495,11 +494,9 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
   }
   __syncthreads();
   if (warpId == warpNum - 1) {
-    shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
-        args.crossDeviceBarrierMemObj, args.config.rank * sizeof(uint64_t),
-        args.crossDeviceBarrierMemObj->GetRdmaMemoryRegion(args.config.rank),
-        (args.config.rank + args.config.worldSize) * sizeof(uint64_t), 1, core::AMO_ADD, srcPe,
-        localBlockId);
+    shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(args.crossDeviceBarrierMemObj,
+                                                 args.config.rank * sizeof(uint64_t), 1,
+                                                 core::AMO_ADD, srcPe, localBlockId);
   }
   SyncIfDebugEnabled("Combine kernel: send token end");
 

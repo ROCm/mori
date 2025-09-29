@@ -489,11 +489,11 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
 
   uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
   uint32_t slotIdx = wqeIdx * BNXT_RE_NUM_SLOT_PER_WQE;
-  // printf("atomic wqeIdx = %u, slotIdx = %u\n", wqeIdx, slotIdx);
 
   uint32_t opcode = BNXT_RE_WR_OPCD_ATOMIC_FA;
   uint64_t data = val_1 ? *static_cast<uint64_t*>(val_1) : 0;
   uint64_t cmp = val_2 ? *static_cast<uint64_t*>(val_2) : 0;
+  // printf("BNXT atomic values: data=0x%lx, cmp=0x%lx\n", data, cmp);
 
   switch (amo_op) {
     case AMO_FETCH_INC:
@@ -536,7 +536,7 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
 
   sge.pa = (uint64_t)laddr;
   sge.lkey = lkey & 0xffffffff;
-  sge.length = bytes;
+  sge.length = 8;
 
   char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
   ThreadCopy<char>(base + 0 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&hdr), sizeof(hdr));

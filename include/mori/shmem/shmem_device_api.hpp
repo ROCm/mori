@@ -186,38 +186,33 @@ DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int32, int32_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int64, int64_t, Warp)
 
-#define SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Scope)                                            \
-  inline __device__ void ShmemAtomicSizeNonFetch##Scope(                                          \
-      const application::SymmMemObjPtr dest, size_t destOffset,                                   \
-      const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, size_t bytes,  \
-      core::atomicType amoType, int pe, int qpId = 0) {                                           \
-    DISPATCH_TRANSPORT_TYPE(ShmemAtomicSizeNonFetch##Scope##Kernel, pe, dest, destOffset, source, \
-                            sourceOffset, val, bytes, amoType, pe, qpId);                         \
+#define SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Scope)                                         \
+  inline __device__ void ShmemAtomicSizeNonFetch##Scope(                                       \
+      const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,       \
+      core::atomicType amoType, int pe, int qpId = 0) {                                        \
+    DISPATCH_TRANSPORT_TYPE(ShmemAtomicSizeNonFetch##Scope##Kernel, pe, dest, destOffset, val, \
+                            bytes, amoType, pe, qpId);                                         \
   }
 
 SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Thread)
 SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Warp)
 
-#define SHMEM_ATOMIC_TYPE_NONFETCH_API_TEMPLATE(Scope)                                      \
-  template <typename T>                                                                     \
-  inline __device__ void ShmemAtomicTypeNonFetch##Scope(                                    \
-      const application::SymmMemObjPtr dest, size_t destOffset,                             \
-      const application::RdmaMemoryRegion& source, size_t sourceOffset, T val,              \
-      core::atomicType amoType, int pe, int qpId = 0) {                                     \
-    ShmemAtomicSizeNonFetch##Scope(dest, destOffset, source, sourceOffset, &val, sizeof(T), \
-                                   amoType, pe, qpId);                                      \
+#define SHMEM_ATOMIC_TYPE_NONFETCH_API_TEMPLATE(Scope)                                           \
+  template <typename T>                                                                          \
+  inline __device__ void ShmemAtomicTypeNonFetch##Scope(                                         \
+      const application::SymmMemObjPtr dest, size_t destOffset, T val, core::atomicType amoType, \
+      int pe, int qpId = 0) {                                                                    \
+    ShmemAtomicSizeNonFetch##Scope(dest, destOffset, &val, sizeof(T), amoType, pe, qpId);        \
   }
 
 SHMEM_ATOMIC_TYPE_NONFETCH_API_TEMPLATE(Thread)
 SHMEM_ATOMIC_TYPE_NONFETCH_API_TEMPLATE(Warp)
 
-#define DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(TypeName, T, Scope)                               \
-  inline __device__ void ShmemAtomic##TypeName##NonFetch##Scope(                                \
-      const application::SymmMemObjPtr dest, size_t destOffset,                                 \
-      const application::RdmaMemoryRegion& source, size_t sourceOffset, T val,                  \
-      core::atomicType amoType, int pe, int qpId = 0) {                                         \
-    ShmemAtomicTypeNonFetch##Scope<T>(dest, destOffset, source, sourceOffset, val, amoType, pe, \
-                                      qpId);                                                    \
+#define DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(TypeName, T, Scope)                                \
+  inline __device__ void ShmemAtomic##TypeName##NonFetch##Scope(                                 \
+      const application::SymmMemObjPtr dest, size_t destOffset, T val, core::atomicType amoType, \
+      int pe, int qpId = 0) {                                                                    \
+    ShmemAtomicTypeNonFetch##Scope<T>(dest, destOffset, val, amoType, pe, qpId);                 \
   }
 
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint32, uint32_t, Thread)

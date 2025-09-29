@@ -91,7 +91,8 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType
 
 template <>
 inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::P2P>(
-    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe, int qpId) {
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe,
+    int qpId) {
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0)
     ShmemPutSizeImmNbiThreadKernel<application::TransportType::P2P>(dest, destOffset, val, bytes,
@@ -100,8 +101,7 @@ inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::
 
 template <>
 inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::P2P>(
-    const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, size_t bytes,
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
     core::atomicType amoType, int pe, int qpId) {
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   switch (bytes) {
@@ -220,13 +220,12 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::Transpor
 
 template <>
 inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportType::P2P>(
-    const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, size_t bytes,
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
     core::atomicType amoType, int pe, int qpId) {
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {
-    ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::P2P>(
-        dest, destOffset, source, sourceOffset, val, bytes, amoType, pe);
+    ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::P2P>(dest, destOffset, val,
+                                                                         bytes, amoType, pe);
   }
 }
 
