@@ -31,6 +31,8 @@ TcpBackend::TcpBackend(EngineKey key, const IOEngineConfig& engCfg, const TcpBac
     MORI_IO_ERROR("TcpBackend: epoll_create1 failed: {}", strerror(errno));
     return;
   }
+
+  bufferPool.Configure(128, 16 * 1024 * 1024, true);  // TODO: make configurable
   for (int i = 0; i < config.numWorkerThreads; ++i) {
     application::TCPContext* listenctx =
         new application::TCPContext(engConfig.host, engConfig.port);
@@ -96,7 +98,7 @@ void TcpBackend::WorkerLoop(application::TCPContext* ctx) {
         HandleWritable(conn);
       }
       if (events.events & (EPOLLHUP | EPOLLERR)) {
-        MORI_IO_ERROR("TcpBackend: connection closed or error on fd {}", conn->fd);
+        MORI_IO_ERROR("TcpBackend: connection closed or error on fd {}", conn->handle.fd);
         conn->Close();
         delete conn;
       }
@@ -131,6 +133,40 @@ void TcpBackend::HandleNewConnection(application::TCPContext* listener_ctx, int 
     std::lock_guard<std::mutex> lock(inConnsMu);
     inboundConnections[ep.fd] = std::move(conn);
   }
+}
+
+void TcpBackend::HandleReadable(ConnectionState* conn) {
+  // This function implements the protocol parsing state machine.
+  if (conn->recvstate == ConnectionState::RecvState::PARSING_HEADER) {
+    application::TCPEndpoint ep(conn->handle);
+    if (ep.Recv(&conn->pendingheader, sizeof(TcpMessageHeader)) != 0) {
+      MORI_IO_ERROR("TcpBackend: recv header failed on fd {}: {}", conn->handle.fd,
+                    strerror(errno));
+      return;
+    }
+    conn->recvstate = ConnectionState::RecvState::PARSING_PAYLOAD;
+  }
+
+  if (conn->recvstate == ConnectionState::RecvState::PARSING_PAYLOAD) {
+    auto& header = conn->pendingheader;
+    switch (header.opcode) {
+      case 0:  // READ_REQ
+      {
+      } break;
+      case 1:  // WRITE_REQ
+      {
+      } break;
+      case 2:  // READ RESP
+      {
+      } break;
+      case 3:  // WRITE RESP
+      {
+      } break;
+    }
+    conn->MarkComplete();
+  }
+
+  conn->Reset();
 }
 
 void TcpBackend::SetNonBlocking(int fd) {
@@ -205,19 +241,14 @@ TcpBackendSession* TcpBackend::GetOrCreateSessionCached(const MemoryDesc& local,
 }
 
 void TcpBackend::EnsureConnections(const EngineDesc& rdesc, size_t minCount) {
-  // First quick size check (short lock).
-  size_t existing = 0;
-  {
-    std::lock_guard<std::mutex> lk(outConnsMu);
-    existing = outboundConnections[rdesc.key].size();
-    if (existing >= minCount) return;
-  }
+  size_t existing = connPools[rdesc.key]->ConnectionCount();
+  if (existing >= minCount) return;
 
   size_t toCreate = minCount - existing;
   if (toCreate == 0) return;
 
   // Create connections without holding the lock.
-  std::vector<std::unique_ptr<ConnectionState>> pending;
+  std::vector<std::shared_ptr<ConnectionState>> pending;
   pending.reserve(toCreate);
 
   for (size_t i = 0; i < toCreate; ++i) {
@@ -238,14 +269,7 @@ void TcpBackend::EnsureConnections(const EngineDesc& rdesc, size_t minCount) {
     pending.push_back(std::move(conn));
   }
 
-  {
-    std::lock_guard<std::mutex> lk(outConnsMu);
-    auto& vec = outboundConnections[rdesc.key];
-    for (auto& c : pending) {
-      if (vec.size() >= minCount) break;
-      vec.push_back(std::move(c));
-    }
-  }
+  connPools[rdesc.key]->SetConnections(pending);
 }
 
 void TcpBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
@@ -265,20 +289,10 @@ void TcpBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
     std::lock_guard<std::mutex> lock(remotesMu);
     remotes.erase(rdesc.key);
   }
-  std::vector<std::unique_ptr<ConnectionState>> toClose;
-  {
-    std::lock_guard<std::mutex> lk(outConnsMu);
-    auto it = outboundConnections.find(rdesc.key);
-    if (it != outboundConnections.end()) {
-      for (auto& c : it->second) {
-        toClose.push_back(std::move(c));
-      }
-      outboundConnections.erase(it);
-    }
-  }
-
-  for (auto& c : toClose) {
-    if (c) c->Close();
+  auto it = connPools.find(rdesc.key);
+  if (it != connPools.end()) {
+    it->second->ClearConnections();
+    connPools.erase(it);
   }
 }
 
@@ -299,23 +313,140 @@ void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
     status->SetCode(StatusCode::SUCCESS);
     return;
   }
-  // Find or create session
-  TcpBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
-  sess->ReadWrite(localOffset, remoteOffset, size, status, id, isRead);
+  EngineKey remoteKey = remoteSrc.engineKey;
+  EngineDesc rdesc;
+  {
+    std::lock_guard<std::mutex> lock(remotesMu);
+    auto it = remotes.find(remoteKey);
+    if (it == remotes.end()) {
+      status->SetCode(StatusCode::ERR_NOT_FOUND);
+      status->SetMessage("remote engine not registered");
+      return;
+    }
+    rdesc = it->second;
+  }
+  // For reference:
+  //
+  // TcpConnection& conn = *connPtr;
+  // // Always lock the connection to fully serialize request-response sequences. This
+  // // prevents header/payload interleaving during connection fan-out warm-up or if any
+  // // future logic accidentally shares a connection.
+  // std::lock_guard<std::mutex> connLock(conn.ioMu);
+  // application::TCPEndpoint ep(conn.handle);
+  // bool localIsGpu = (localDest.loc == MemoryLocationType::GPU);
+  // BufferBlock bufBlock;  // only allocate if GPU staging needed
+  // char* stagingPtr = nullptr;
+  //
+  // TcpMessageHeader hdr{};
+  // hdr.opcode = isRead ? 0 : 1;  // read_req or write_req
+  // hdr.id = id;
+  // hdr.mem_id = remoteSrc.id;  // specify remote memory id explicitly
+  // hdr.offset = remoteOffset;
+  // hdr.size = size;
+  //
+  // if (!isRead) {
+  //   const char* sendPtr = nullptr;
+  //   if (localIsGpu) {
+  //     bufBlock = bufferPool.Acquire(size);
+  //     stagingPtr = bufBlock.data;
+  //     const void* devPtr = reinterpret_cast<const void*>(localDest.data + localOffset);
+  //     hipError_t e = hipMemcpy(stagingPtr, devPtr, size, hipMemcpyDeviceToHost);
+  //     if (e != hipSuccess) {
+  //       status->SetCode(StatusCode::ERR_BAD_STATE);
+  //       printf("set code bad state at file %s line %d\n", __FILE__, __LINE__);
+  //       status->SetMessage(std::string("hipMemcpy D2H failed: ") + hipGetErrorString(e));
+  //       if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
+  //       return;
+  //     }
+  //     sendPtr = stagingPtr;
+  //   } else {
+  //     sendPtr = reinterpret_cast<const char*>(localDest.data + localOffset);
+  //   }
+  //   struct iovec iov[2];
+  //   iov[0].iov_base = &hdr;
+  //   iov[0].iov_len = sizeof(hdr);
+  //   iov[1].iov_base = const_cast<char*>(sendPtr);
+  //   iov[1].iov_len = size;
+  //   if (FullWritev(conn.handle.fd, iov, 2) != 0) {
+  //     int e = errno;
+  //     status->SetCode(StatusCode::ERR_BAD_STATE);
+  //     printf("set code bad state at file %s line %d\n", __FILE__, __LINE__);
+  //     status->SetMessage(std::string("writev failed errno=") + std::to_string(e) + " " +
+  //                        std::strerror(e));
+  //     if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
+  //     return;
+  //   }
+  //   TcpMessageHeader resp{};
+  //   if (ep.Recv(&resp, sizeof(resp)) != 0) {
+  //     status->SetCode(StatusCode::ERR_BAD_STATE);
+  //     printf("set code bad state at file %s line %d\n", __FILE__, __LINE__);
+  //     status->SetMessage("write ack recv failed");
+  //     if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
+  //     return;
+  //   }
+  //   status->SetCode(StatusCode::SUCCESS);
+  //   if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
+  //   return;
+  // } else {
+  //   if (FullSend(conn.handle.fd, &hdr, sizeof(hdr)) != 0) {
+  //     status->SetCode(StatusCode::ERR_BAD_STATE);
+  //     printf("set code bad state at file %s line %d\n", __FILE__, __LINE__);
+  //     status->SetMessage("read header send failed");
+  //     return;
+  //   }
+  //   TcpMessageHeader resp{};
+  //   if (ep.Recv(&resp, sizeof(resp)) != 0) {
+  //     status->SetCode(StatusCode::ERR_BAD_STATE);
+  //     printf("set code bad state at file %s line %d\n", __FILE__, __LINE__);
+  //     status->SetMessage("read resp header recv failed");
+  //     return;
+  //   }
+  //   if (resp.opcode != 2 || resp.size != size) {
+  //     status->SetCode(StatusCode::ERR_BAD_STATE);
+  //     printf("set code bad state at file %s line %d\n", __FILE__, __LINE__);
+  //     status->SetMessage("unexpected read response");
+  //     return;
+  //   }
+  //   if (localIsGpu) {
+  //     bufBlock = bufferPool.Acquire(size);
+  //     stagingPtr = bufBlock.data;
+  //     if (ep.Recv(stagingPtr, size) != 0) {
+  //       status->SetCode(StatusCode::ERR_BAD_STATE);
+  //       printf("set code bad state at file %s line %d\n", __FILE__, __LINE__);
+  //       status->SetMessage("read payload recv failed");
+  //       if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
+  //       return;
+  //     }
+  //     void* devPtr = reinterpret_cast<void*>(localDest.data + localOffset);
+  //     hipError_t e = hipMemcpy(devPtr, stagingPtr, size, hipMemcpyHostToDevice);
+  //     if (e != hipSuccess) {
+  //       status->SetCode(StatusCode::ERR_BAD_STATE);
+  //       printf("set code bad state at file %s line %d\n", __FILE__, __LINE__);
+  //       status->SetMessage(std::string("hipMemcpy H2D failed: ") + hipGetErrorString(e));
+  //       if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
+  //       return;
+  //     }
+  //     status->SetCode(StatusCode::SUCCESS);
+  //     if (bufBlock.data) bufferPool.Release(std::move(bufBlock));
+  //     return;
+  //   } else {
+  //     char* dst = reinterpret_cast<char*>(localDest.data + localOffset);
+  //     if (ep.Recv(dst, size) != 0) {
+  //       status->SetCode(StatusCode::ERR_BAD_STATE);
+  //       printf("set code bad state at file %s line %d\n", __FILE__, __LINE__);
+  //       status->SetMessage("read payload recv failed");
+  //       return;
+  //     }
+  //     status->SetCode(StatusCode::SUCCESS);
+  //     return;
+  //   }
+  // }
 }
 
 void TcpBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& localOffsets,
                                 const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
                                 const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
-                                bool isRead) {
-  if (sizes.size() == 0) {
-    status->SetCode(StatusCode::SUCCESS);
-    return;
-  }
-
-  TcpBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
-  sess->BatchReadWrite(localOffsets, remoteOffsets, sizes, status, id, isRead);
-}
+                                bool isRead) {}
 
 BackendSession* TcpBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote) {
   TcpBackendSession* sess = new TcpBackendSession();

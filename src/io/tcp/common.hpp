@@ -57,7 +57,7 @@ struct BufferBlock {
 struct TransferOp {
   MemoryDesc localDest;
   size_t localOffset;
-  MemoryDesc remoteSrc;
+  MemoryDesc remoteDest;
   size_t remoteOffset;
   size_t size;
   TransferStatus* status;
@@ -119,6 +119,52 @@ class ConnectionState {
       listener = nullptr;
     }
   }
+};
+
+class ConnectionPool {
+ public:
+  ConnectionPool() = default;
+  ~ConnectionPool() = default;
+
+  std::shared_ptr<ConnectionState> GetNextConnection() {
+    size_t idx = nextIdx.fetch_add(1, std::memory_order_relaxed);
+    if (outConns.empty()) return nullptr;
+    return outConns[idx % outConns.size()];
+  }
+
+  void SetConnections(const std::vector<std::shared_ptr<ConnectionState>>& conns) {
+    std::lock_guard<std::mutex> lk(mu);
+    for (const auto& c : conns) {
+      outConns.push_back(c);
+    }
+  }
+
+  size_t ConnectionCount() {
+    std::lock_guard<std::mutex> lk(mu);
+    return outConns.size();
+  }
+
+  void RemoveConnection(std::shared_ptr<ConnectionState> conn) {
+    auto it = std::find(outConns.begin(), outConns.end(), conn);
+    if (it != outConns.end()) {
+      it->get()->Close();
+      std::lock_guard<std::mutex> lk(mu);
+      outConns.erase(it);
+    }
+  }
+
+  void ClearConnections() {
+    std::lock_guard<std::mutex> lk(mu);
+    for (auto& c : outConns) {
+      c->Close();
+    }
+    outConns.clear();
+  }
+
+ private:
+  std::mutex mu;
+  std::deque<std::shared_ptr<ConnectionState>> outConns;
+  std::atomic<size_t> nextIdx{0};
 };
 
 class BufferPool {

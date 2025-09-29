@@ -111,10 +111,11 @@ class TcpBackend : public Backend {
   std::vector<std::thread> workerThreads;
   std::atomic<bool> running{false};
 
+  BufferPool bufferPool;
+
   std::mutex inConnsMu;
-  std::mutex outConnsMu;
   std::unordered_map<int, std::unique_ptr<ConnectionState>> inboundConnections;
-  std::unordered_map<EngineKey, std::vector<std::unique_ptr<ConnectionState>>> outboundConnections;
+  std::unordered_map<EngineKey, std::unique_ptr<ConnectionPool>> connPools;
 
   std::mutex remotesMu;
   std::unordered_map<EngineKey, EngineDesc> remotes;
