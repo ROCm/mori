@@ -62,7 +62,7 @@ struct TransferOp {
   size_t size;
   TransferStatus* status;
   TransferUniqueId id;
-  bool isRead;
+  uint8_t opType;  // 0 = READ_REQ, 1 = WRITE_REQ, 2 = READ_RESP, 3 = WRITE_RESP
   bool isGpuOp{false};
   BufferBlock stagingBuffer;  // used for CPU<->GPU staging if needed
   hipStream_t stream{nullptr};
@@ -85,16 +85,34 @@ class ConnectionState {
 
   EndpointHandle handle{-1, {}};
   application::TCPContext* listener{nullptr};
-
-  mutable std::mutex mu;  // protects mutable state below
   enum class RecvState { PARSING_HEADER, PARSING_PAYLOAD };
   RecvState recvstate{RecvState::PARSING_HEADER};
   TcpMessageHeader pendingheader{};  // zero-init
   std::condition_variable recv_cv;
   bool complete{false};
   std::optional<GpuCommState> gpu_state;
+  std::optional<TransferOp> recv_op;
 
-  std::deque<TransferOp> pending_ops;  // guarded by mu
+  std::deque<TransferOp> sendQueue;                             // guarded by mu
+  std::unordered_map<TransferUniqueId, TransferOp> pendingOps;  // guarded by mu
+
+  void SubmitTransfer(TransferOp& op) {
+    std::scoped_lock lk(mu);
+    sendQueue.emplace_back(op);
+    auto it = pendingOps.find(op.id);
+    if (it == pendingOps.end()) {
+      auto inserted = pendingOps.emplace(op.id, std::move(op));
+    } else {
+      it->second = std::move(op);
+    }
+  }
+
+  TransferOp& PopTransfer() {
+    std::scoped_lock lk(mu);
+    assert(!sendQueue.empty());
+    TransferOp op = std::move(sendQueue.front());
+    sendQueue.pop_front();
+  }
 
   void Reset() noexcept {
     std::scoped_lock lk(mu);
@@ -119,6 +137,9 @@ class ConnectionState {
       listener = nullptr;
     }
   }
+
+ private:
+  std::mutex mu;
 };
 
 class ConnectionPool {

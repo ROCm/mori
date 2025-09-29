@@ -161,12 +161,108 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
       } break;
       case 3:  // WRITE RESP
       {
+        TransferOp& op = conn->pendingOps[header.id];
+        op.status->SetCode(StatusCode::SUCCESS);
+        conn->pendingOps.erase(header.id);
+        conn->recvstate = ConnectionState::RecvState::PARSING_HEADER;
       } break;
     }
-    conn->MarkComplete();
   }
 
   conn->Reset();
+}
+
+void TcpBackend::HandleWritable(ConnectionState* conn) {
+  TransferOp& op = conn->PopTransfer();
+  application::TCPEndpoint ep(conn->handle);
+  switch (op.opType) {
+    case 0:  // READ_REQ
+    {
+      TcpMessageHeader hdr{};
+      hdr.opcode = 0;  // read_req or write_req
+      hdr.id = op.id;
+      hdr.mem_id = op.remoteDest.id;  // specify remote memory id explicitly
+      hdr.offset = op.remoteOffset;
+      hdr.size = op.size;
+      if (ep.Send(&hdr, sizeof(hdr)) != 0) {
+        MORI_IO_ERROR("TcpBackend: send read_req header failed on fd {}: {}", conn->handle.fd,
+                      strerror(errno));
+        op.status->SetCode(StatusCode::ERR_BAD_STATE);
+        op.status->SetMessage("send read_req header failed");
+        return;
+      }
+    } break;
+    case 1:  // WRITE_REQ
+    {
+      bool localIsGpu = (op.localDest.loc == MemoryLocationType::GPU);
+      const char* sendPtr = nullptr;
+      if (localIsGpu) {
+        if (!op.stagingBuffer.data) {
+          op.stagingBuffer = bufferPool.Acquire(op.size);
+          if (!op.stagingBuffer.data) {
+            MORI_IO_ERROR("TcpBackend: staging buffer allocation failed for write_req of size {}",
+                          op.size);
+            op.status->SetCode(StatusCode::ERR_BAD_STATE);
+            op.status->SetMessage("staging buffer allocation failed");
+            return;
+          }
+        }
+        const void* devPtr = reinterpret_cast<const void*>(op.localDest.data + op.localOffset);
+        hipError_t e = hipMemcpy(op.stagingBuffer.data, devPtr, op.size, hipMemcpyDeviceToHost);
+        if (e != hipSuccess) {
+          MORI_IO_ERROR("TcpBackend: hipMemcpy D2H failed for write_req of size {}: {}", op.size,
+                        hipGetErrorString(e));
+          op.status->SetCode(StatusCode::ERR_BAD_STATE);
+          op.status->SetMessage(std::string("hipMemcpy D2H failed: ") + hipGetErrorString(e));
+          if (op.stagingBuffer.data) bufferPool.Release(std::move(op.stagingBuffer));
+          return;
+        }
+        sendPtr = op.stagingBuffer.data;
+      } else
+        sendPtr = reinterpret_cast<const char*>(op.localDest.data + op.localOffset);
+      TcpMessageHeader hdr{};
+      hdr.opcode = 1;
+      hdr.id = op.id;
+      hdr.mem_id = op.remoteDest.id;  // specify remote memory id explicitly
+      hdr.offset = op.remoteOffset;
+      hdr.size = op.size;
+
+      if (ep.Send(&hdr, sizeof(hdr)) != 0) {
+        MORI_IO_ERROR("TcpBackend: send write_req header failed on fd {}: {}", conn->handle.fd,
+                      strerror(errno));
+        op.status->SetCode(StatusCode::ERR_BAD_STATE);
+        op.status->SetMessage("send write_req header failed");
+        return;
+      }
+      if (ep.Send(sendPtr, op.size) != 0) {
+        MORI_IO_ERROR("TcpBackend: send write_req payload failed on fd {}: {}", conn->handle.fd,
+                      strerror(errno));
+        op.status->SetCode(StatusCode::ERR_BAD_STATE);
+        op.status->SetMessage("send write_req payload failed");
+      }
+    } break;
+    case 2:  // READ RESP
+    {
+    } break;
+    case 3:  // WRITE RESP
+    {
+      TcpMessageHeader hdr{};
+      hdr.opcode = 3;  // write_resp
+      hdr.id = op.id;
+      hdr.mem_id = op.remoteDest.id;
+      hdr.offset = op.remoteOffset;
+      hdr.size = op.size;
+
+      if (ep.Send(&hdr, sizeof(hdr)) != 0) {
+        MORI_IO_ERROR("TcpBackend: send write_resp header failed on fd {}: {}", conn->handle.fd,
+                      strerror(errno));
+        op.status->SetCode(StatusCode::ERR_BAD_STATE);
+        op.status->SetMessage("send write_resp header failed");
+        return;
+      }
+
+    } break;
+  }
 }
 
 void TcpBackend::SetNonBlocking(int fd) {
@@ -266,6 +362,15 @@ void TcpBackend::EnsureConnections(const EngineDesc& rdesc, size_t minCount) {
     conn->recvstate = ConnectionState::RecvState::PARSING_HEADER;
     conn->handle = handle;
     conn->listener = nullptr;  // outbound
+
+    struct epoll_event event;
+    event.data.ptr = conn.get();
+    event.events = EPOLLIN | EPOLLET | EPOLLOUT | EPOLLONESHOT;
+    if (epoll_ctl(epollFd, EPOLL_CTL_ADD, handle.fd, &event) == -1) {
+      MORI_IO_ERROR("TcpBackend: epoll_ctl ADD new connection fd failed: {}", strerror(errno));
+      conn->Close();
+      continue;
+    }
     pending.push_back(std::move(conn));
   }
 
@@ -313,6 +418,7 @@ void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
     status->SetCode(StatusCode::SUCCESS);
     return;
   }
+  status->SetCode(StatusCode::IN_PROGRESS);
   EngineKey remoteKey = remoteSrc.engineKey;
   EngineDesc rdesc;
   {
@@ -325,6 +431,13 @@ void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
     }
     rdesc = it->second;
   }
+
+  TransferOp op{localDest, localOffset, remoteSrc, remoteOffset, size, status, id};
+  op.opType = isRead ? 0 : 1;
+
+  auto connection = connPools[rdesc.key]->GetNextConnection();
+  connection->SubmitTransfer(op);
+
   // For reference:
   //
   // TcpConnection& conn = *connPtr;
