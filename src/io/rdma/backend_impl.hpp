@@ -243,29 +243,6 @@ class RdmaBackend : public Backend {
 
  private:
   void CreateSession(const MemoryDesc& local, const MemoryDesc& remote, RdmaBackendSession& sess);
-  // Session cache helpers
-  struct SessionCacheKey {
-    EngineKey remoteEngineKey;  // use remote memory's engine key
-    MemoryUniqueId localMemId;
-    MemoryUniqueId remoteMemId;
-    bool operator==(const SessionCacheKey& o) const {
-      return remoteEngineKey == o.remoteEngineKey && localMemId == o.localMemId &&
-             remoteMemId == o.remoteMemId;
-    }
-  };
-  struct SessionCacheKeyHash {
-    std::size_t operator()(const SessionCacheKey& k) const noexcept {
-      auto hash_combine = [](std::size_t& seed, std::size_t v) {
-        // 64-bit variant of boost::hash_combine / splitmix64 inspired
-        seed ^= v + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
-      };
-      std::size_t seed = 0;
-      hash_combine(seed, std::hash<std::string>()(k.remoteEngineKey));
-      hash_combine(seed, std::hash<uint64_t>()(k.localMemId));
-      hash_combine(seed, std::hash<uint64_t>()(k.remoteMemId));
-      return seed;
-    }
-  };
   RdmaBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
   void InvalidateSessionsForMemory(MemoryUniqueId id);
 

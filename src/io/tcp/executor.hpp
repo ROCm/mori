@@ -150,8 +150,8 @@ class MultithreadTCPExecutor : public TCPExecutor {
   SPMCQueue<int> serviceQueue{1024};
   std::unordered_map<EngineKey, std::vector<TcpConnection>> conns;  // engine -> connections
   std::mutex memMu;                                                 // protects localMems
-  std::mutex remotesMu;  // protects remotes & remoteMems meta
-  std::mutex connsMu;    // protects conns map
+
+  std::mutex connsMu;  // protects conns map
 };
 
 }  // namespace io

@@ -353,16 +353,6 @@ void MultithreadTCPExecutor::DoServiceWork(int fd, BufferPool& bufferPool) {
   }
 }
 
-void MultithreadTCPExecutor::RegisterRemoteEngine(const EngineDesc& rdesc) {
-  std::lock_guard<std::mutex> lock(remotesMu);
-  remotes[rdesc.key] = rdesc;
-}
-
-void MultithreadTCPExecutor::DeregisterRemoteEngine(const EngineDesc& rdesc) {
-  std::lock_guard<std::mutex> lock(remotesMu);
-  remotes.erase(rdesc.key);
-}
-
 std::vector<TcpConnection>& MultithreadTCPExecutor::EnsureConnections(const EngineDesc& rdesc,
                                                                       size_t minCount) {
   std::lock_guard<std::mutex> lk(connsMu);
@@ -405,14 +395,5 @@ void MultithreadTCPExecutor::CloseConnections(const EngineKey& key) {
   conns.erase(it);
 }
 
-void MultithreadTCPExecutor::RegisterMemory(const MemoryDesc& desc) {
-  std::lock_guard<std::mutex> lock(memMu);
-  localMems[desc.id] = desc;
-}
-
-void MultithreadTCPExecutor::DeregisterMemory(const MemoryDesc& desc) {
-  std::lock_guard<std::mutex> lock(memMu);
-  localMems.erase(desc.id);
-}
 }  // namespace io
 }  // namespace mori

@@ -22,7 +22,8 @@
 #pragma once
 
 // Internal TCP backend implementation details.
-#include <deque>
+#include <fcntl.h>
+
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -37,6 +38,25 @@
 
 namespace mori {
 namespace io {
+
+class TcpBackendSession : public BackendSession {
+ public:
+  TcpBackendSession() = default;
+  TcpBackendSession(const MemoryDesc& local, const MemoryDesc& remote)
+      : local(local), remote(remote) {}
+  ~TcpBackendSession() = default;
+
+  void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
+                 TransferUniqueId id, bool isRead);
+  void BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                      const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
+                      bool isRead);
+  bool Alive() const { return true; }
+
+ private:
+  MemoryDesc local{};
+  MemoryDesc remote{};
+};
 
 class TcpBackend : public Backend {
  public:
@@ -61,37 +81,49 @@ class TcpBackend : public Backend {
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
 
  private:
-  void ServiceLoop();
-  void StartService();
-  void StopService();
+  // --- Core Asynchronous Engine ---
+  void StartThreads();
+  void StopThreads();
+  void WorkerLoop(application::TCPContext* ctx);
+
+  // --- Event Handlers ---
+  void HandleNewConnection(application::TCPContext* listener_ctx, int epoll_fd);
+  void HandleReadable(ConnectionState* conn);
+  void HandleWritable(ConnectionState* conn);
+
+  // --- Helper Functions ---
+  void SetSocketOptions(int fd);
+  void SetNonBlocking(int fd);
+  void RearmSocket(int epoll_fd, ConnectionState* conn, uint32_t events);
+
+  // --- GPU Resource Management ---
+  void InitializeGpuResources();
+  void CleanupGpuResources();
+
+  void EnsureConnections(const EngineDesc& rdesc, size_t minCount);
+  TcpBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
 
   EngineKey myEngKey;
   TcpBackendConfig config;
   IOEngineConfig engConfig;
-  std::unique_ptr<application::TCPContext> ctx{nullptr};
-  std::thread serviceThread;
+  int epollFd{-1};
+  std::vector<application::TCPContext*> listeners;
+  std::vector<std::thread> workerThreads;
   std::atomic<bool> running{false};
 
-  std::unique_ptr<TCPExecutor> executor{nullptr};
-};
+  std::mutex inConnsMu;
+  std::mutex outConnsMu;
+  std::unordered_map<int, std::unique_ptr<ConnectionState>> inboundConnections;
+  std::unordered_map<EngineKey, std::vector<std::unique_ptr<ConnectionState>>> outboundConnections;
 
-class TcpBackendSession : public BackendSession {
- public:
-  TcpBackendSession(TcpBackend* backend, const MemoryDesc& local, const MemoryDesc& remote)
-      : backend(backend), local(local), remote(remote) {}
-  ~TcpBackendSession() = default;
+  std::mutex remotesMu;
+  std::unordered_map<EngineKey, EngineDesc> remotes;
+  std::mutex memMu;
+  std::unordered_map<MemoryUniqueId, MemoryDesc> localMems;
 
-  void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
-                 TransferUniqueId id, bool isRead);
-  void BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
-                      const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
-                      bool isRead);
-  bool Alive() const { return true; }
-
- private:
-  TcpBackend* backend{nullptr};
-  MemoryDesc local{};
-  MemoryDesc remote{};
+  std::unordered_map<SessionCacheKey, std::unique_ptr<TcpBackendSession>, SessionCacheKeyHash>
+      sessionCache;
+  std::mutex sessionCacheMu;
 };
 
 }  // namespace io

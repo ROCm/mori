@@ -68,6 +68,7 @@ struct TCPContextHandle {
 class TCPContext {
  public:
   // TODO: delete copy ctor
+  TCPContext() = default;
   TCPContext(std::string ip, uint16_t port = 0);
   ~TCPContext();
 

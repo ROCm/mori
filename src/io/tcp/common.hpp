@@ -24,7 +24,9 @@
 #include <sys/epoll.h>
 
 #include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <optional>
 
 #include "mori/io/common.hpp"
 #include "mori/io/logging.hpp"
@@ -32,8 +34,6 @@
 namespace mori {
 namespace io {
 
-// Simple TCP data plane: emulate RDMA read/write by message framing and memcpy semantics.
-// This backend is NOT optimized and intended as a functional placeholder.
 struct TcpMessageHeader {
   uint8_t opcode;       // 0 = READ_REQ, 1 = WRITE_REQ, 2 = READ_RESP, 3 = WRITE_RESP
   uint8_t reserved{0};  // alignment / future flags
@@ -48,33 +48,77 @@ class TcpBackend;  // fwd
 
 class TcpBackendSession;  // fwd
 
-class TcpConnection {
- public:
-  TcpConnection() = default;
-  explicit TcpConnection(application::TCPEndpointHandle h) : handle(h) {}
-  ~TcpConnection() = default;
-  // Non-copyable because of std::mutex
-  TcpConnection(const TcpConnection&) = delete;
-  TcpConnection& operator=(const TcpConnection&) = delete;
-  // Movable: recreate mutex in destination, transfer handle
-  TcpConnection(TcpConnection&& other) noexcept : handle(other.handle) { other.handle.fd = -1; }
-  TcpConnection& operator=(TcpConnection&& other) noexcept {
-    if (this != &other) {
-      handle = other.handle;
-      other.handle.fd = -1;
-      // ioMu left default constructed; any locks on old mutex are not transferred
-    }
-    return *this;
-  }
-  bool Valid() const { return handle.fd >= 0; }
-  application::TCPEndpointHandle handle{-1, {}};
-  std::mutex ioMu;  // serialize request/response if connection is shared unexpectedly
-};
-
 struct BufferBlock {
   char* data{nullptr};
   size_t capacity{0};
-  bool pinned{false};
+  bool pinned{true};
+};
+
+struct TransferOp {
+  MemoryDesc localDest;
+  size_t localOffset;
+  MemoryDesc remoteSrc;
+  size_t remoteOffset;
+  size_t size;
+  TransferStatus* status;
+  TransferUniqueId id;
+  bool isRead;
+  bool isGpuOp{false};
+  BufferBlock stagingBuffer;  // used for CPU<->GPU staging if needed
+  hipStream_t stream{nullptr};
+  hipEvent_t event{nullptr};
+  enum class GpuCopyState { PENDING, IN_PROGRESS, COMPLETED } gpuCopyState;
+};
+
+struct GpuCommState {
+  hipStream_t stream;
+  hipEvent_t event;
+  // Pointers to pinned staging buffers, etc.
+};
+
+class ConnectionState {
+ public:
+  using EndpointHandle = application::TCPEndpointHandle;
+
+  ConnectionState() = default;
+  ~ConnectionState() { Close(); }
+
+  EndpointHandle handle{-1, {}};
+  application::TCPContext* listener{nullptr};
+
+  mutable std::mutex mu;  // protects mutable state below
+  enum class RecvState { PARSING_HEADER, PARSING_PAYLOAD };
+  RecvState recvstate{RecvState::PARSING_HEADER};
+  TcpMessageHeader pendingheader{};  // zero-init
+  std::condition_variable recv_cv;
+  bool complete{false};
+  std::optional<GpuCommState> gpu_state;
+
+  std::deque<TransferOp> pending_ops;  // guarded by mu
+
+  void Reset() noexcept {
+    std::scoped_lock lk(mu);
+    recvstate = RecvState::PARSING_HEADER;
+    pendingheader = TcpMessageHeader{};
+    complete = false;
+  }
+
+  void MarkComplete() {
+    {
+      std::scoped_lock lk(mu);
+      complete = true;
+    }
+    recv_cv.notify_all();
+  }
+
+  void Close() noexcept {
+    std::scoped_lock lk(mu);
+    if (listener) {
+      listener->CloseEndpoint(handle);
+      handle.fd = -1;
+      listener = nullptr;
+    }
+  }
 };
 
 class BufferPool {
@@ -371,17 +415,6 @@ class SPMCQueue {
   std::condition_variable cv_not_empty_;
   bool done_ = false;
 };
-
-typedef struct {
-  MemoryDesc localDest;
-  size_t localOffset;
-  MemoryDesc remoteSrc;
-  size_t remoteOffset;
-  size_t size;
-  TransferStatus* status;
-  TransferUniqueId id;
-  bool isRead;
-} ReadWriteWork;
 
 }  // namespace io
 }  // namespace mori

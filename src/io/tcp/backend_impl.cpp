@@ -26,183 +26,313 @@ namespace io {
 
 TcpBackend::TcpBackend(EngineKey key, const IOEngineConfig& engCfg, const TcpBackendConfig& cfg)
     : myEngKey(key), config(cfg), engConfig(engCfg) {
-  ctx.reset(new application::TCPContext(engConfig.host, engConfig.port));
-  // Set basic socket options on listening socket
-  int lfd = ctx->GetListenFd();
-  if (lfd >= 0) {
-    int one = 1;
-    ::setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    // Optional: enlarge listen socket buffers (kernel will clone defaults to accepted sockets)
-    int bufSz = 4 * 1024 * 1024;  // 4MB
-    ::setsockopt(lfd, SOL_SOCKET, SO_RCVBUF, &bufSz, sizeof(bufSz));
-    ::setsockopt(lfd, SOL_SOCKET, SO_SNDBUF, &bufSz, sizeof(bufSz));
-    // Set listening socket non-blocking for EPOLLET safety
-    int flags = fcntl(lfd, F_GETFL, 0);
-    if (flags >= 0) fcntl(lfd, F_SETFL, flags | O_NONBLOCK);
+  epollFd = epoll_create1(0);
+  if (epollFd == -1) {
+    MORI_IO_ERROR("TcpBackend: epoll_create1 failed: {}", strerror(errno));
+    return;
   }
-  ctx->Listen();
-  StartService();
-  MORI_IO_INFO("TcpBackend created host {} port {}", engConfig.host.c_str(), engConfig.port);
-}
-
-TcpBackend::~TcpBackend() { StopService(); }
-
-void TcpBackend::StartService() {
-  if (running.load()) return;
+  for (int i = 0; i < config.numWorkerThreads; ++i) {
+    application::TCPContext* listenctx =
+        new application::TCPContext(engConfig.host, engConfig.port);
+    listenctx->Listen();
+    int lfd = listenctx->GetListenFd();
+    if (lfd > 0) {
+      SetNonBlocking(lfd);
+    } else {
+      MORI_IO_ERROR("TcpBackend: failed to get listen fd");
+      delete listenctx;
+      return;
+    }
+    listeners.push_back(listenctx);
+    workerThreads.push_back(std::thread([this, listenctx] { WorkerLoop(listenctx); }));
+  }
   running.store(true);
-  executor.reset(new MultithreadTCPExecutor(ctx.get(), config.numWorkerThreads));
-  serviceThread = std::thread([this] { ServiceLoop(); });
 }
 
-void TcpBackend::StopService() {
+TcpBackend::~TcpBackend() {
   running.store(false);
-  if (serviceThread.joinable()) serviceThread.join();
-  executor->Shutdown();
-  if (ctx) ctx->Close();
+  for (auto& t : workerThreads) {
+    if (t.joinable()) t.join();
+  }
+  workerThreads.clear();
+}
+
+void TcpBackend::WorkerLoop(application::TCPContext* ctx) {
+  struct epoll_event events;
+
+  int workerEpollFd = epoll_create1(0);
+  if (workerEpollFd == -1) {
+    MORI_IO_ERROR("TcpBackend: epoll_create1 failed in worker: {}", strerror(errno));
+    return;
+  }
+  int listenFd = ctx->GetListenFd();
+  // add listen fd to epoll
+  events.data.fd = listenFd;
+  events.events = EPOLLIN | EPOLLET;
+  if (epoll_ctl(workerEpollFd, EPOLL_CTL_ADD, listenFd, &events) == -1) {
+    MORI_IO_ERROR("TcpBackend: epoll_ctl ADD listen fd failed: {}", strerror(errno));
+    close(workerEpollFd);
+    return;
+  }
+
+  while (running.load()) {
+    int n = epoll_wait(workerEpollFd, &events, 10, 1000);  // 1 second timeout
+    if (n == -1) {
+      if (errno == EINTR) continue;
+      MORI_IO_ERROR("TcpBackend: epoll_wait failed: {}", strerror(errno));
+      break;
+    } else if (n == 0) {
+      continue;  // timeout
+    }
+
+    if (events.data.fd == listenFd) {
+      HandleNewConnection(ctx, workerEpollFd);
+    } else {
+      ConnectionState* conn = reinterpret_cast<ConnectionState*>(events.data.ptr);
+      if (events.events & EPOLLIN) {
+        HandleReadable(conn);
+      }
+      if (events.events & EPOLLOUT) {
+        HandleWritable(conn);
+      }
+      if (events.events & (EPOLLHUP | EPOLLERR)) {
+        MORI_IO_ERROR("TcpBackend: connection closed or error on fd {}", conn->fd);
+        conn->Close();
+        delete conn;
+      }
+
+      // Re-arm the socket since we used EPOLLONESHOT
+      RearmSocket(workerEpollFd, conn, EPOLLIN | EPOLLOUT);
+    }
+  }
+  close(workerEpollFd);
+}
+
+void TcpBackend::HandleNewConnection(application::TCPContext* listener_ctx, int epoll_fd) {
+  auto newEps = listener_ctx->Accept();
+  for (const auto& ep : newEps) {
+    std::unique_ptr<ConnectionState> conn = std::make_unique<ConnectionState>();
+    conn->recvstate = ConnectionState::RecvState::PARSING_HEADER;
+    conn->handle = ep;
+    conn->listener = listener_ctx;
+
+    SetNonBlocking(ep.fd);
+    SetSocketOptions(ep.fd);
+
+    struct epoll_event event;
+    event.data.ptr = conn.get();
+    event.events = EPOLLIN | EPOLLET | EPOLLOUT | EPOLLONESHOT;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ep.fd, &event) == -1) {
+      MORI_IO_ERROR("TcpBackend: epoll_ctl ADD new connection fd failed: {}", strerror(errno));
+      listener_ctx->CloseEndpoint(ep);
+      continue;
+    }
+
+    std::lock_guard<std::mutex> lock(inConnsMu);
+    inboundConnections[ep.fd] = std::move(conn);
+  }
+}
+
+void TcpBackend::SetNonBlocking(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags == -1) {
+    MORI_IO_ERROR("TcpBackend: fcntl F_GETFL failed: {}", strerror(errno));
+    return;
+  }
+  if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+    MORI_IO_ERROR("TcpBackend: fcntl F_SETFL failed: {}", strerror(errno));
+    return;
+  }
+}
+
+void TcpBackend::SetSocketOptions(int fd) {
+  int flag = 1;
+  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+  setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
+  int bufSz = 4 * 1024 * 1024;
+  setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufSz, sizeof(bufSz));
+  setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufSz, sizeof(bufSz));
+
+  int qack = 1;
+  setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &qack, sizeof(qack));
+}
+
+void TcpBackend::RearmSocket(int epoll_fd, ConnectionState* conn, uint32_t events) {
+  struct epoll_event event;
+  event.data.ptr = conn;
+  event.events = events | EPOLLET | EPOLLONESHOT;
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->handle.fd, &event) == -1) {
+    MORI_IO_ERROR("TcpBackend: epoll_ctl MOD fd {} failed: {}", conn->handle.fd, strerror(errno));
+    conn->Close();
+  }
+}
+
+TcpBackendSession* TcpBackend::GetOrCreateSessionCached(const MemoryDesc& local,
+                                                        const MemoryDesc& remote) {
+  SessionCacheKey key{remote.engineKey, local.id, remote.id};
+  {
+    std::lock_guard<std::mutex> lock(sessionCacheMu);
+    auto it = sessionCache.find(key);
+    if (it != sessionCache.end()) {
+      return it->second.get();
+    }
+  }
+
+  BackendSession* rawBase = CreateSession(local, remote);
+  if (!rawBase) {
+    MORI_IO_ERROR("TcpBackend: CreateSession failed for local mem {} remote mem {}", local.id,
+                  remote.id);
+    return nullptr;
+  }
+
+  std::unique_ptr<TcpBackendSession> newSess(dynamic_cast<TcpBackendSession*>(rawBase));
+  if (!newSess) {
+    MORI_IO_ERROR(
+        "TcpBackend: CreateSession returned incompatible session type (local {}, remote {})",
+        local.id, remote.id);
+    delete rawBase;
+    return nullptr;
+  }
+
+  std::lock_guard<std::mutex> lock(sessionCacheMu);
+  auto it = sessionCache.find(key);
+  if (it != sessionCache.end()) {
+    return it->second.get();  // Another thread won the race
+  }
+
+  auto [emplacedIt, inserted] = sessionCache.emplace(key, std::move(newSess));
+  return emplacedIt->second.get();
+}
+
+void TcpBackend::EnsureConnections(const EngineDesc& rdesc, size_t minCount) {
+  // First quick size check (short lock).
+  size_t existing = 0;
+  {
+    std::lock_guard<std::mutex> lk(outConnsMu);
+    existing = outboundConnections[rdesc.key].size();
+    if (existing >= minCount) return;
+  }
+
+  size_t toCreate = minCount - existing;
+  if (toCreate == 0) return;
+
+  // Create connections without holding the lock.
+  std::vector<std::unique_ptr<ConnectionState>> pending;
+  pending.reserve(toCreate);
+
+  for (size_t i = 0; i < toCreate; ++i) {
+    auto handle = application::TCPContext().Connect(rdesc.host, rdesc.port);
+    if (handle.fd < 0) {
+      MORI_IO_ERROR("TcpBackend: connect to {}:{} failed (attempt {} of {})", rdesc.host,
+                    rdesc.port, i + 1, toCreate);
+      break;
+    }
+
+    SetNonBlocking(handle.fd);
+    SetSocketOptions(handle.fd);
+
+    auto conn = std::make_unique<ConnectionState>();
+    conn->recvstate = ConnectionState::RecvState::PARSING_HEADER;
+    conn->handle = handle;
+    conn->listener = nullptr;  // outbound
+    pending.push_back(std::move(conn));
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(outConnsMu);
+    auto& vec = outboundConnections[rdesc.key];
+    for (auto& c : pending) {
+      if (vec.size() >= minCount) break;
+      vec.push_back(std::move(c));
+    }
+  }
 }
 
 void TcpBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
-  executor->RegisterRemoteEngine(rdesc);
-  if (auto* mexec = dynamic_cast<MultithreadTCPExecutor*>(executor.get())) {
-    mexec->EnsureConnections(rdesc, config.numWorkerThreads);
+  {
+    std::lock_guard<std::mutex> lock(remotesMu);
+    auto [it, inserted] = remotes.emplace(rdesc.key, rdesc);
+    if (!inserted) return;
+  }
+
+  if (config.preconnect) {
+    EnsureConnections(rdesc, config.numWorkerThreads);
   }
 }
 
 void TcpBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
-  executor->DeregisterRemoteEngine(rdesc);
-  if (auto* mexec = dynamic_cast<MultithreadTCPExecutor*>(executor.get())) {
-    mexec->CloseConnections(rdesc.key);
+  {
+    std::lock_guard<std::mutex> lock(remotesMu);
+    remotes.erase(rdesc.key);
+  }
+  std::vector<std::unique_ptr<ConnectionState>> toClose;
+  {
+    std::lock_guard<std::mutex> lk(outConnsMu);
+    auto it = outboundConnections.find(rdesc.key);
+    if (it != outboundConnections.end()) {
+      for (auto& c : it->second) {
+        toClose.push_back(std::move(c));
+      }
+      outboundConnections.erase(it);
+    }
+  }
+
+  for (auto& c : toClose) {
+    if (c) c->Close();
   }
 }
 
-void TcpBackend::RegisterMemory(const MemoryDesc& desc) { executor->RegisterMemory(desc); }
+void TcpBackend::RegisterMemory(const MemoryDesc& desc) {
+  std::lock_guard<std::mutex> lock(memMu);
+  localMems[desc.id] = desc;
+}
 
-void TcpBackend::DeregisterMemory(const MemoryDesc& desc) { executor->DeregisterMemory(desc); }
+void TcpBackend::DeregisterMemory(const MemoryDesc& desc) {
+  std::lock_guard<std::mutex> lock(memMu);
+  localMems.erase(desc.id);
+}
 
 void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
                            const MemoryDesc& remoteSrc, size_t remoteOffset, size_t size,
                            TransferStatus* status, TransferUniqueId id, bool isRead) {
-  status->SetCode(StatusCode::IN_PROGRESS);
-  ReadWriteWork work{localDest, localOffset, remoteSrc, remoteOffset, size, status, id, isRead};
-  if (executor->SubmitReadWriteWork(work) != 0) {
-    status->SetCode(StatusCode::ERR_BAD_STATE);
-    printf("set code bad state at file %s line %d\n", __FILE__, __LINE__);
-    status->SetMessage("executor shutdown");
+  if (size == 0) {
+    status->SetCode(StatusCode::SUCCESS);
     return;
   }
-  // synchronous wait for completion
-  while (status->Code() == StatusCode::IN_PROGRESS) {
-    std::this_thread::yield();
-  }
-
-  return;
+  // Find or create session
+  TcpBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
+  sess->ReadWrite(localOffset, remoteOffset, size, status, id, isRead);
 }
 
 void TcpBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& localOffsets,
                                 const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
                                 const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
                                 bool isRead) {
-  if (sizes.empty()) {
+  if (sizes.size() == 0) {
     status->SetCode(StatusCode::SUCCESS);
     return;
   }
-  // Submit all work items
-  if (localOffsets.size() != sizes.size() || remoteOffsets.size() != sizes.size()) {
-    status->SetCode(StatusCode::ERR_INVALID_ARGS);
-    status->SetMessage("BatchReadWrite: offsets and sizes vector size mismatch");
-    return;
-  }
-  status->SetCode(StatusCode::IN_PROGRESS);
-  std::vector<TransferStatus> itemStatuses(sizes.size());
 
-  for (size_t i = 0; i < sizes.size(); ++i) {
-    itemStatuses[i].SetCode(StatusCode::IN_PROGRESS);
-    ReadWriteWork work{localDest, localOffsets[i],  remoteSrc, remoteOffsets[i],
-                       sizes[i],  &itemStatuses[i], id,        isRead};
-    if (executor->SubmitReadWriteWork(work) != 0) {
-      status->SetCode(StatusCode::ERR_BAD_STATE);
-      printf("set code bad state at file %s line %d\n", __FILE__, __LINE__);
-      status->SetMessage("executor shutdown");
-      return;
-    }
-  }
-
-  // Busy wait; TODO replace with condition variable once TransferStatus supports signaling
-  bool anyFailed = false;
-  for (auto& s : itemStatuses) {
-    s.Wait();
-    if (s.Failed()) anyFailed = true;
-  }
-  if (anyFailed) {
-    status->SetCode(StatusCode::ERR_BAD_STATE);
-    printf("set code bad state at file %s line %d\n", __FILE__, __LINE__);
-    status->SetMessage("one or more batch items failed");
-    return;
-  }
-  status->SetCode(StatusCode::SUCCESS);
+  TcpBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
+  sess->BatchReadWrite(localOffsets, remoteOffsets, sizes, status, id, isRead);
 }
 
 BackendSession* TcpBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote) {
-  return new TcpBackendSession(this, local, remote);
+  TcpBackendSession* sess = new TcpBackendSession();
+  EngineDesc rdesc = remotes[remote.engineKey];
+  EnsureConnections(rdesc, config.numWorkerThreads);
+  return sess;
 }
 
 bool TcpBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
-                                          TransferStatus* status) {
-  return false;  // simplistic synchronous model
-}
-
-void TcpBackend::ServiceLoop() {
-  int epfd = epoll_create1(EPOLL_CLOEXEC);
-  assert(epfd >= 0);
-  epoll_event ev{};
-  ev.events = EPOLLIN | EPOLLET;
-  ev.data.fd = ctx->GetListenFd();
-  epoll_ctl(epfd, EPOLL_CTL_ADD, ctx->GetListenFd(), &ev);
-
-  constexpr int maxEvents = 128;
-  epoll_event events[maxEvents];
-
-  while (running.load()) {
-    int nfds = epoll_wait(epfd, events, maxEvents, 10);
-    for (int i = 0; i < nfds; ++i) {
-      int fd = events[i].data.fd;
-      if (fd == ctx->GetListenFd()) {
-        auto newEps = ctx->Accept();
-        for (auto& h : newEps) {
-          if (h.fd >= 0) {
-            int flag = 1;
-            setsockopt(h.fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-            setsockopt(h.fd, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
-            int bufSz = 4 * 1024 * 1024;
-            setsockopt(h.fd, SOL_SOCKET, SO_RCVBUF, &bufSz, sizeof(bufSz));
-            setsockopt(h.fd, SOL_SOCKET, SO_SNDBUF, &bufSz, sizeof(bufSz));
-
-            int qack = 1;
-            setsockopt(h.fd, IPPROTO_TCP, TCP_QUICKACK, &qack, sizeof(qack));
-            // Non-blocking for edge-triggered epoll
-            int cflags = fcntl(h.fd, F_GETFL, 0);
-            if (cflags >= 0) fcntl(h.fd, F_SETFL, cflags | O_NONBLOCK);
-          }
-          executor->SubmitServiceWork(h.fd);
-        }
-        continue;
-      }
-      // submit processing to service worker
-    }
-  }
-  ::close(epfd);
-}
+                                          TransferStatus* status) {}
 
 void TcpBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
-                                  TransferStatus* status, TransferUniqueId id, bool isRead) {
-  backend->ReadWrite(local, localOffset, remote, remoteOffset, size, status, id, isRead);
-}
+                                  TransferStatus* status, TransferUniqueId id, bool isRead) {}
 
 void TcpBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                        const SizeVec& sizes, TransferStatus* status,
-                                       TransferUniqueId id, bool isRead) {
-  backend->BatchReadWrite(local, localOffsets, remote, remoteOffsets, sizes, status, id, isRead);
-}
+                                       TransferUniqueId id, bool isRead) {}
 
 }  // namespace io
 }  // namespace mori
