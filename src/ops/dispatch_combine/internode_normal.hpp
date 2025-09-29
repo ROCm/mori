@@ -31,6 +31,7 @@ namespace moe {
 #define DEBUG_DATA 0
 #define ASSERT_ON 1
 #define SPINS_CNT 100000
+#define RECV_DATA 0
 
 __device__ inline float tokenCheckValue(int srcPe, int srcTokenId) {
   return srcPe * 0.1f + 1.0f + srcTokenId;
@@ -344,8 +345,8 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
               //       "node=%d "
               //       "channelId=%d tailCache=%lu "
               //       "headCache=%lu\n",
-              //       myPe, node * nlocalPes + myLocalPe, args.crossDeviceBarrierFlag, warpId, node,
-              //       channelId, tailCache, headCache);
+              //       myPe, node * nlocalPes + myLocalPe, args.crossDeviceBarrierFlag, warpId,
+              //       node, channelId, tailCache, headCache);
               // }
             }
             headCache = __shfl(headCache, node);
@@ -382,8 +383,8 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           for (int i = laneId; i < numExpertPerToken * numNodesToSend; i += warpSize) {
             int node = i / numExpertPerToken;
             int weightIdx = i % numExpertPerToken;
-            auto weightVal = __builtin_nontemporal_load(args.weightsBuf + tokenIdx * numExpertPerToken +
-                                                  weightIdx);
+            auto weightVal = __builtin_nontemporal_load(args.weightsBuf +
+                                                        tokenIdx * numExpertPerToken + weightIdx);
             *(reinterpret_cast<float*>(sendStagingPtr[node] + weightsOffset) + weightIdx) =
                 weightVal;
           }
@@ -406,7 +407,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             }
           }
         }
-        
+
         if (laneId < numNodesToSend) {
           // write meta - record source token info
           *(reinterpret_cast<size_t*>(sendStagingPtr[laneId] + metaOffset)) =
@@ -418,7 +419,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
       }
       tokenProgress[warpId] = channelEndOffset - 1;
     }
-    
+
     __syncthreads();
     // clear slotToTokenIdxMap
     for (int i = thdId; i < nNodes * maxTokensPerChannel; i += thdNum) {
@@ -450,7 +451,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         __syncthreads();
         return;
       }
-      if(warpId == 0) {
+      if (warpId == 0) {
         // clear recvTokenNumMemObj
         // TODO maybe hang
         if (laneId < nNodes) {
@@ -489,26 +490,6 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         if (syncNumTokensToRecv == 0) continue;
 
         // check RDMA data ready (shmemInpTokMemObj), wait data from same-id GPU
-#if 0
-        if (laneId == srcNode) {
-          int spins = 0;
-          while (true) {
-            if (tailCache >= headCache + 1) break;
-            tailCache = __hip_atomic_load(
-                args.tailMemObj->template GetAs<uint64_t*>() + srcPe + channelId * npes,
-                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-            // if (spins == SPINS_CNT) {
-            //   printf(
-            //       "recv fwd wait data TIMEOUT rank=%d srcPe=%d call=%d warpId=%d srcNode=%d "
-            //       "syncNumTokensToRecv=%d tailCache=%lu "
-            //       "headCache=%lu\n",
-            //       myPe, srcPe, args.crossDeviceBarrierFlag, warpId, srcNode, syncNumTokensToRecv,
-            //       tailCache, headCache);
-            // }
-            ++spins;
-          }
-        }
-#else
         uint64_t syncHeadCache = __shfl(headCache, srcNode);
         uint64_t syncTailCache = __shfl(tailCache, srcNode);
         while (syncTailCache < syncHeadCache + 1) {
@@ -519,31 +500,11 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           }
           syncTailCache = __shfl(tailCache, srcNode);
         }
-#endif
 
         // check buffer ready (shmemOutTokMemObj)
-#if 0
-        if (laneId == 0 && srcNode != myNode) {
-          int spins = 0;
-          while (true) {
-            if (p2pTailCache - p2pHeadCache < maxP2PStagingTokens) break;
-            p2pHeadCache = __hip_atomic_load(
-                args.headMemObj->template GetAs<uint64_t*>() + channelId * npes + fwdPe,
-                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-            // if (spins == SPINS_CNT) {
-            //   printf(
-            //       "recv fwd wait buffer TIMEOUT rank=%d fwdPe=%d call=%d warpId=%d srcNode=%d "
-            //       "channelId=%d p2pTailCache=%lu "
-            //       "p2pHeadCache=%lu\n",
-            //       myPe, fwdPe, args.crossDeviceBarrierFlag, warpId, srcNode, channelId,
-            //       p2pTailCache, p2pHeadCache);
-            // }
-          }
-        }
-#else
         if (srcNode != myNode) {
           while (p2pTailCache - p2pHeadCache >= maxP2PStagingTokens) {
-            if(laneId == 0) {
+            if (laneId == 0) {
               p2pHeadCache = __hip_atomic_load(
                   args.headMemObj->template GetAs<uint64_t*>() + channelId * npes + fwdPe,
                   __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -551,113 +512,108 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             p2pHeadCache = __shfl(p2pHeadCache, 0);
           }
         }
-#endif
 
-#if 0
-        // uint64_t syncHeadCache = __shfl(headCache, srcNode);
-        // uint64_t syncTailCache = __shfl(tailCache, srcNode);
-#endif
         for (uint64_t step = syncHeadCache; step < syncTailCache; ++step) {
-        uint64_t tokenStart = (syncHeadCache % maxRDMASteps) * stepRDMATokens;
-        // syncNumTokensToRecv = __shfl(numTokensToRecv, srcNode);
-        uint64_t tokenEnd = tokenStart + min(syncNumTokensToRecv, stepRDMATokens);
-        for (uint64_t i = tokenStart; i < tokenEnd; ++i) {
-          if (srcNode == laneId) {
-            --numTokensToRecv;
+          uint64_t tokenStart = (syncHeadCache % maxRDMASteps) * stepRDMATokens;
+          // syncNumTokensToRecv = __shfl(numTokensToRecv, srcNode);
+          uint64_t tokenEnd = tokenStart + min(syncNumTokensToRecv, stepRDMATokens);
+          for (uint64_t i = tokenStart; i < tokenEnd; ++i) {
+            if (srcNode == laneId) {
+              --numTokensToRecv;
 #if ASSERT_ON == 1
-            assert(numTokensToRecv >= 0);
+              assert(numTokensToRecv >= 0);
 #endif
-          }
-          --syncNumTokensToRecv;
-          index_t slot = i;
-          char* srcPtr =
-              args.shmemInpTokMemObj->template GetAs<char*>() +
-              ((channelId * nNodes + srcNode) * maxRDMAStagingTokens + slot) * tokenPackBytes;
-          index_t* srcIndicesPtr = reinterpret_cast<index_t*>(srcPtr + indiceOffset);
-          int destPe = -1;
-          if (laneId < numExpertPerToken) destPe = srcIndicesPtr[laneId] / config.numExpertPerRank;
-          if (!__any(destPe == fwdPe)) {
-            continue;
-          }
+            }
+            --syncNumTokensToRecv;
+            index_t slot = i;
+            char* srcPtr =
+                args.shmemInpTokMemObj->template GetAs<char*>() +
+                ((channelId * nNodes + srcNode) * maxRDMAStagingTokens + slot) * tokenPackBytes;
+            index_t* srcIndicesPtr = reinterpret_cast<index_t*>(srcPtr + indiceOffset);
+            int destPe = -1;
+            if (laneId < numExpertPerToken)
+              destPe = srcIndicesPtr[laneId] / config.numExpertPerRank;
+            if (!__any(destPe == fwdPe)) {
+              continue;
+            }
 
-#if DEBUG_DATA == 1 && ASSERT_ON == 1 
-          if (laneId == 0) {
-            assert(float(*(T*)srcPtr) != float(0));
-          }
+#if DEBUG_DATA == 1 && ASSERT_ON == 1
+            if (laneId == 0) {
+              assert(float(*(T*)srcPtr) != float(0));
+            }
 #endif
-          if (fwdPe == myPe) {
-            index_t localTokenIdx = 0;
-            if (laneId == 0) {
-              localTokenIdx = atomicAdd(args.localPeTokenCounter, 1);
-            }
-            localTokenIdx = __shfl(localTokenIdx, 0);
-            // TODO abstrct into a function
-            core::WarpCopy(reinterpret_cast<char*>(args.outTokenBuf) + localTokenIdx * tokenBytes,
-                           srcPtr, tokenBytes);
-            if (weightBytes) {
+            if (fwdPe == myPe) {
+              index_t localTokenIdx = 0;
+              if (laneId == 0) {
+                localTokenIdx = atomicAdd(args.localPeTokenCounter, 1);
+              }
+              localTokenIdx = __shfl(localTokenIdx, 0);
+              // TODO abstrct into a function
+              core::WarpCopy(reinterpret_cast<char*>(args.outTokenBuf) + localTokenIdx * tokenBytes,
+                             srcPtr, tokenBytes);
+              if (weightBytes) {
+                core::WarpCopy(args.shmemOutWeightsMemObj->template GetAs<char*>() +
+                                   localTokenIdx * weightBytes,
+                               srcPtr + weightsOffset, weightBytes);
+              }
               core::WarpCopy(
-                  args.shmemOutWeightsMemObj->template GetAs<char*>() + localTokenIdx * weightBytes,
-                  srcPtr + weightsOffset, weightBytes);
-            }
-            core::WarpCopy(
-                args.shmemOutIndicesMemObj->template GetAs<char*>() + localTokenIdx * indiceBytes,
-                srcPtr + indiceOffset, indiceBytes);
-            if (scaleBytes) {
-              core::WarpCopy(
-                  args.shmemOutScalesMemObj->template GetAs<char*>() + localTokenIdx * scaleBytes,
-                  srcPtr + scalesOffset, scaleBytes);
-            }
-            if (laneId == 0) {
-              // get meta
-              args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[localTokenIdx] =
-                  *(reinterpret_cast<index_t*>(srcPtr + metaOffset));
+                  args.shmemOutIndicesMemObj->template GetAs<char*>() + localTokenIdx * indiceBytes,
+                  srcPtr + indiceOffset, indiceBytes);
+              if (scaleBytes) {
+                core::WarpCopy(
+                    args.shmemOutScalesMemObj->template GetAs<char*>() + localTokenIdx * scaleBytes,
+                    srcPtr + scalesOffset, scaleBytes);
+              }
+              if (laneId == 0) {
+                // get meta
+                args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[localTokenIdx] =
+                    *(reinterpret_cast<index_t*>(srcPtr + metaOffset));
 #if DEBUG_DATA == 1
-              index_t meta = *(reinterpret_cast<index_t*>(srcPtr + metaOffset));
-              int srcPe = meta / maxNumInpTokenPerRank;
-              int srcTokenId = meta % maxNumInpTokenPerRank;
+                index_t meta = *(reinterpret_cast<index_t*>(srcPtr + metaOffset));
+                int srcPe = meta / maxNumInpTokenPerRank;
+                int srcTokenId = meta % maxNumInpTokenPerRank;
 #if ASSERT_ON == 1
-              assert(float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
-                                  localTokenIdx * tokenBytes))) != (float)(0));
-              assert(float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
-                                  localTokenIdx * tokenBytes) +
-                             config.hiddenDim - 1)) != (float)(0));
+                assert(float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
+                                    localTokenIdx * tokenBytes))) != (float)(0));
+                assert(float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
+                                    localTokenIdx * tokenBytes) +
+                               config.hiddenDim - 1)) != (float)(0));
 
-              assert(float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
-                                  localTokenIdx * tokenBytes))) ==
-                     tokenCheckValue(srcPe, srcTokenId));
-              assert(float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
-                                  localTokenIdx * tokenBytes) +
-                             config.hiddenDim - 1)) == tokenCheckValue(srcPe, srcTokenId));
+                assert(float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
+                                    localTokenIdx * tokenBytes))) ==
+                       tokenCheckValue(srcPe, srcTokenId));
+                assert(float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
+                                    localTokenIdx * tokenBytes) +
+                               config.hiddenDim - 1)) == tokenCheckValue(srcPe, srcTokenId));
+#endif
+                // printf(
+                //     "DATA CHECK RECV fwd to output srcStep=%lu srcSlot=%d srcData=%f dst(output)
+                //     " "localTokenIdx=%d\n", step, slot,
+                //     float(*((T*)(args.shmemInpTokMemObj->template GetAs<char*>() +
+                //                  ((channelId * nNodes + srcNode) * maxRDMAStagingTokens + slot) *
+                //                      tokenPackBytes))),
+                //     localTokenIdx);
+#endif
+              }
+            } else {
+              char* dstPtr = args.shmemOutTokMemObj->template GetAs<char*>() +
+                             ((channelId * nlocalPes + fwdLocalPe) * maxP2PStagingTokens +
+                              p2pTailCache % maxP2PStagingTokens) *
+                                 tokenPackBytes;
+              core::WarpCopy(dstPtr, srcPtr, tokenPackBytes);
+#if DEBUG_DATA == 1
+#if ASSERT_ON == 1
+              assert((float)(*(T*)dstPtr) != float(0));
 #endif
               // printf(
-              //     "DATA CHECK RECV fwd to output srcStep=%lu srcSlot=%d srcData=%f dst(output) "
-              //     "localTokenIdx=%d\n",
-              //     step, slot,
-              //     float(*((T*)(args.shmemInpTokMemObj->template GetAs<char*>() +
-              //                  ((channelId * nNodes + srcNode) * maxRDMAStagingTokens + slot) *
-              //                      tokenPackBytes))),
-              //     localTokenIdx);
+              //     "DATA CHECK RECV fwd to shmemOutTokMemObj srcStep=%lu srcSlot=%d srcData=%f "
+              //     "dst p2pTailCache=%lu dstSlot=%lu\n",
+              //     step, slot, float(*((T*)(srcPtr))), p2pTailCache,
+              //     p2pTailCache % maxP2PStagingTokens);
 #endif
             }
-          } else {
-            char* dstPtr = args.shmemOutTokMemObj->template GetAs<char*>() +
-                           ((channelId * nlocalPes + fwdLocalPe) * maxP2PStagingTokens +
-                            p2pTailCache % maxP2PStagingTokens) *
-                               tokenPackBytes;
-            core::WarpCopy(dstPtr, srcPtr, tokenPackBytes);
-#if DEBUG_DATA == 1
-#if ASSERT_ON == 1
-            assert((float)(*(T*)dstPtr) != float(0));
-#endif
-            // printf(
-            //     "DATA CHECK RECV fwd to shmemOutTokMemObj srcStep=%lu srcSlot=%d srcData=%f "
-            //     "dst p2pTailCache=%lu dstSlot=%lu\n",
-            //     step, slot, float(*((T*)(srcPtr))), p2pTailCache,
-            //     p2pTailCache % maxP2PStagingTokens);
-#endif
+            ++p2pTailCache, ++fwdCounter;
           }
-          ++p2pTailCache, ++fwdCounter;
-        }
         }
         __threadfence_system();
         // TODO add content in comment
@@ -684,7 +640,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             args.intraNodeBarrierMemObj->template GetAs<int*>(fwdPe) + myPe + channelId * npes;
         shmem::ShmemInt32WaitUntilEquals(statusPtr, 0);
         core::AtomicStoreRelaxedSystem(statusPtr, fwdCounter + 1);
-#if DEBUG==1
+#if DEBUG == 1
         if (laneId == 0) {
           printf("recv fwd rank=%d ch=%d warpId=%d fwdPe=%d fwdCounter=%d\n", myPe, channelId,
                  warpId, fwdPe, fwdCounter);
@@ -693,8 +649,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
       }
     } else if (warpId == kfwdWarpCount) {
       __syncthreads();
-      index_t numTokensToRecv =
-          laneId < nNodes ? rdmaRecvTokensNum[laneId] : 0;
+      index_t numTokensToRecv = laneId < nNodes ? rdmaRecvTokensNum[laneId] : 0;
       uint64_t headBase =
           laneId < nNodes ? args.localHead[(laneId * nlocalPes + myLocalPe) + channelId * npes] : 0;
 #if DEBUG == 1
@@ -775,7 +730,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
       while (true) {
         done = __shfl(done, 0);
         if (done) {
-          if(laneId == 0) core::AtomicStoreRelaxedSystem(statusPtr, 0);
+          if (laneId == 0) core::AtomicStoreRelaxedSystem(statusPtr, 0);
           break;
         }
 
@@ -803,7 +758,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         p2pTailCache = __shfl(p2pTailCache, 0);
 #else
         while (p2pTailCache < p2pHeadCache + 1 && !done) {
-          if(laneId == 0){
+          if (laneId == 0) {
             p2pTailCache = __hip_atomic_load(
                 args.tailMemObj->template GetAs<uint64_t*>() + srcPe + channelId * npes,
                 __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
