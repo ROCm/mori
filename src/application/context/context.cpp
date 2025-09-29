@@ -179,7 +179,7 @@ void Context::InitializePossibleTransports() {
               << "[" << devicePortId << "] " << device->Name() << std::endl;
   }
 
-  int numQpPerPe = 1;
+  int numQpPerPe = 4;
   const char* envNumQp = std::getenv("MORI_NUM_QP_PER_PE");
   if (envNumQp != nullptr) {
     numQpPerPe = std::max(1, std::atoi(envNumQp));  // ensure at least 1 QP
