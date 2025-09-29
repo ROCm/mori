@@ -329,6 +329,49 @@ inline __device__ T BlockPrefixSum(T val, size_t thdNum) {
 }
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                                           WarpBroadcast                                        */
+/* ---------------------------------------------------------------------------------------------- */
+
+template <typename T, int VecBytes, int Unroll = 1>
+__forceinline__ __device__ void WarpBroadcast(T* const* __restrict__ dests, T* __restrict__ src,
+                                              int nDests, size_t nelems) {
+  int laneId = threadIdx.x & (warpSize - 1);
+  size_t offset = 0;
+  constexpr int vecSize = VecBytes / sizeof(T);
+  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+
+  const int elemsPerWarp = Unroll * warpSize * vecSize;
+  const size_t numIters = (nelems - offset) / elemsPerWarp;
+  for (size_t iter = 0; iter < numIters; iter++) {
+    DataType vec[Unroll];
+#pragma unroll
+    for (int u = 0; u < Unroll; u++) {
+      vec[u] = load<VecBytes>(src + offset + (laneId + u * warpSize) * vecSize);
+    }
+
+#pragma unroll
+    for (int u = 0; u < Unroll; u++) {
+#pragma unroll
+      for (int d = 0; d < nDests; ++d) {
+        store<VecBytes>(dests[d] + offset + (laneId + u * warpSize) * vecSize, vec[u]);
+      }
+    }
+
+    offset += elemsPerWarp;
+  }
+
+  // remaining size
+  offset += laneId;
+  while (offset < nelems) {
+#pragma unroll
+    for (int d = 0; d < nDests; ++d) {
+      *(dests[d] + offset) = src[offset];
+    }
+    offset += warpSize;
+  }
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                        WarpAccumulation                                        */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>

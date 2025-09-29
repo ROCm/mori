@@ -323,19 +323,14 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
            tokenIdx += (kSendWarpCount - 1)) {
         while (tokenIdx > tokenProgress[kSendWarpCount]);
 
+        char* sendStagingPtr[MAX_NODES];
+        int numNodesToSend = 0;
         for (int node = 0; node < nNodes; ++node) {
           index_t slot = tokenIdxToSlotMap[tokenIdx * nNodes + node] - 1;
           if (slot == -1) continue;
 
           // TODO check RDMA buffer ready (shmemInpTokMemObj)
           uint64_t tailCache = nodetailCache[node] + slot / stepRDMATokens;
-          // if (laneId == node) {
-          //   while (tailCache - headCache >= maxRDMASteps) {
-          //     headCache = __hip_atomic_load(args.headMemObj->template GetAs<uint64_t*>() +
-          //                                       channelId * npes + (node * nlocalPes + myLocalPe),
-          //                                   __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-          //   }
-          // }
           int spins = 0;
           while (tailCache - headCache >= maxRDMASteps) {
             if (laneId == node) {
@@ -357,44 +352,67 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           }
 
           // TODO modify shmemStagingTokMemObj size
-          char* sendStagingPtr =
+          sendStagingPtr[numNodesToSend++] =
               args.shmemStagingTokMemObj->template GetAs<char*>() +
               ((channelId * nNodes + node) * maxRDMAStagingTokens +
                (tailCache % maxRDMASteps) * stepRDMATokens + slot % stepRDMATokens) *
                   tokenPackBytes;
-          core::WarpCopy(sendStagingPtr,
-                         reinterpret_cast<char*>(args.inpTokenBuf) + tokenIdx * tokenBytes,
-                         tokenBytes);
-          if (weightBytes) {
-            core::WarpCopy(sendStagingPtr + weightsOffset,
-                           reinterpret_cast<char*>(args.weightsBuf) + tokenIdx * weightBytes,
-                           weightBytes);
-          }
-          core::WarpCopy(sendStagingPtr + indiceOffset,
-                         reinterpret_cast<char*>(args.tokenIndices) + tokenIdx * indiceBytes,
-                         indiceBytes);
-          if (scaleBytes) {
-            core::WarpCopy(sendStagingPtr + scalesOffset,
-                           reinterpret_cast<char*>(args.scalesBuf) + tokenIdx * scaleBytes,
-                           scaleBytes);
-          }
-          if (laneId == 0) {
-            // write meta - record source token info
-            *(reinterpret_cast<size_t*>(sendStagingPtr + metaOffset)) =
-                myPe * maxNumInpTokenPerRank + tokenIdx;
+        }
+
+        core::WarpBroadcast<T, 8>(
+            reinterpret_cast<T**>(sendStagingPtr),
+            reinterpret_cast<T*>(args.inpTokenBuf + tokenIdx * config.hiddenDim), numNodesToSend,
+            config.hiddenDim);
+
 #if DEBUG_DATA == 1
-            // printf(
-            //     "DATA CHECK SEND copy to RDMA staging node=%d slot=%d tailCache=%lu srcData=%f\n",
-            //     node, slot, tailCache, float(*((T*)sendStagingPtr + 0)));
+        for (int node = 0; node < numNodesToSend; ++node) {
+          // printf(
+          //     "DATA CHECK SEND copy to RDMA staging node=%d slot=%d tailCache=%lu srcData=%f\n",
+          //     node, slot, tailCache, float(*((T*)sendStagingPtr[node] + 0)));
 #if ASSERT_ON == 1
-            assert((float)(*((T*)sendStagingPtr + 1)) != (float)(0));
-            assert((float)(*((T*)sendStagingPtr + 1)) == tokenCheckValue(myPe, tokenIdx));
-            assert((float)(*((T*)sendStagingPtr + config.hiddenDim - 1)) ==
-                   tokenCheckValue(myPe, tokenIdx));
+          assert((float)(*((T*)sendStagingPtr[node] + 1)) != (float)(0));
+          assert((float)(*((T*)sendStagingPtr[node] + 1)) == tokenCheckValue(myPe, tokenIdx));
+          assert((float)(*((T*)sendStagingPtr[node] + config.hiddenDim - 1)) ==
+                 tokenCheckValue(myPe, tokenIdx));
 #endif
+        }
 #endif
+
+        if (weightBytes) {
+          for (int i = laneId; i < numExpertPerToken * numNodesToSend; i += warpSize) {
+            int node = i / numExpertPerToken;
+            int weightIdx = i % numExpertPerToken;
+            auto weightVal = __builtin_nontemporal_load(args.weightsBuf + tokenIdx * numExpertPerToken +
+                                                  weightIdx);
+            *(reinterpret_cast<float*>(sendStagingPtr[node] + weightsOffset) + weightIdx) =
+                weightVal;
           }
         }
+
+        for (int i = laneId; i < numExpertPerToken * numNodesToSend; i += warpSize) {
+          int node = i / numExpertPerToken;
+          int indexIdx = i % numExpertPerToken;
+          auto indexVal = __builtin_nontemporal_load(args.tokenIndices +
+                                                     tokenIdx * numExpertPerToken + indexIdx);
+          *(reinterpret_cast<index_t*>(sendStagingPtr[node] + indiceOffset) + indexIdx) = indexVal;
+        }
+
+        if (scaleBytes) {
+          for (int i = laneId; i < config.scaleDim * config.scaleTypeSize; i += warpSize) {
+            auto scaleVal = __builtin_nontemporal_load(reinterpret_cast<char*>(args.scalesBuf) +
+                                                       tokenIdx * scaleBytes + i);
+            for (int node = 0; node < numNodesToSend; ++node) {
+              *(sendStagingPtr[node] + scalesOffset + i) = scaleVal;
+            }
+          }
+        }
+        
+        if (laneId < numNodesToSend) {
+          // write meta - record source token info
+          *(reinterpret_cast<size_t*>(sendStagingPtr[laneId] + metaOffset)) =
+              myPe * maxNumInpTokenPerRank + tokenIdx;
+        }
+
         tokenProgress[warpId] = tokenIdx;
         __threadfence_block();
       }
