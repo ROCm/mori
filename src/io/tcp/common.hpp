@@ -20,6 +20,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#pragma once
+
 #include <netinet/tcp.h>
 #include <sys/epoll.h>
 
@@ -94,6 +96,10 @@ class ConnectionState {
   std::optional<GpuCommState> gpuState;
   std::optional<TransferOp> recvOp;
 
+  // Connection lifecycle flags
+  std::atomic<bool> connecting{false};  // true after non-blocking connect issued until SO_ERROR==0
+  std::atomic<bool> ready{false};  // true after epoll registration & (if outbound) connect success
+
   std::deque<TransferOp> sendQueue;                             // guarded by mu
   std::unordered_map<TransferUniqueId, TransferOp> pendingOps;  // guarded by mu (WRITE ops)
 
@@ -118,7 +124,6 @@ class ConnectionState {
     pendingHeader = TcpMessageHeader{};
     complete = false;
   }
-
   void MarkComplete() {
     {
       std::scoped_lock lk(mu);
@@ -126,14 +131,17 @@ class ConnectionState {
     }
     recvCv.notify_all();
   }
-
   void Close() noexcept {
     std::scoped_lock lk(mu);
     if (listener) {
       listener->CloseEndpoint(handle);
       handle.fd = -1;
       listener = nullptr;
+    } else if (handle.fd >= 0) {
+      ::close(handle.fd);
+      handle.fd = -1;
     }
+    ready.store(false, std::memory_order_release);
   }
 
  private:
@@ -273,9 +281,9 @@ class ConnectionPool {
   // Non-blocking acquire (returns nullptr if none available)
   std::shared_ptr<ConnectionState> GetNextConnection() {
     std::lock_guard<std::mutex> lk(mu);
-    if (available.empty()) return nullptr;
-    auto conn = std::move(available.front());
-    available.pop_front();
+    if (ready.empty()) return nullptr;
+    auto conn = ready.front();
+    ready.pop_front();
     return conn;
   }
 
@@ -283,14 +291,14 @@ class ConnectionPool {
   std::shared_ptr<ConnectionState> AcquireConnection(
       std::chrono::milliseconds timeout = std::chrono::milliseconds::max()) {
     std::unique_lock<std::mutex> lk(mu);
-    if (timeout == std::chrono::milliseconds::max()) {
-      cv.wait(lk, [this] { return shuttingDown || !available.empty(); });
-    } else {
-      cv.wait_for(lk, timeout, [this] { return shuttingDown || !available.empty(); });
-    }
-    if (shuttingDown || available.empty()) return nullptr;
-    auto conn = std::move(available.front());
-    available.pop_front();
+    auto pred = [this] { return shuttingDown || !ready.empty(); };
+    if (timeout == std::chrono::milliseconds::max())
+      cv.wait(lk, pred);
+    else
+      cv.wait_for(lk, timeout, pred);
+    if (shuttingDown || ready.empty()) return nullptr;
+    auto conn = ready.front();
+    ready.pop_front();
     return conn;
   }
 
@@ -302,15 +310,22 @@ class ConnectionPool {
       conn->Close();
       return;
     }
-    available.push_back(std::move(conn));
-    cv.notify_one();
+    if (conn->ready.load(std::memory_order_acquire)) {
+      ready.push_back(std::move(conn));
+      cv.notify_one();
+    } else {
+      pending.push_back(std::move(conn));
+    }
   }
 
   void SetConnections(const std::vector<std::shared_ptr<ConnectionState>>& conns) {
     std::lock_guard<std::mutex> lk(mu);
     for (const auto& c : conns) {
       allConns.push_back(c);
-      available.push_back(c);
+      if (c->ready.load(std::memory_order_acquire))
+        ready.push_back(c);
+      else
+        pending.push_back(c);
     }
     cv.notify_all();
   }
@@ -327,7 +342,8 @@ class ConnectionPool {
       auto it = std::find(dq.begin(), dq.end(), conn);
       if (it != dq.end()) dq.erase(it);
     };
-    eraseOne(available);
+    eraseOne(ready);
+    eraseOne(pending);
     auto it = std::find(allConns.begin(), allConns.end(), conn);
     if (it != allConns.end()) {
       (*it)->Close();
@@ -339,7 +355,25 @@ class ConnectionPool {
     std::lock_guard<std::mutex> lk(mu);
     for (auto& c : allConns) c->Close();
     allConns.clear();
-    available.clear();
+    ready.clear();
+    pending.clear();
+  }
+
+  // Promote a pending connection to ready once it becomes usable.
+  void Promote(ConnectionState* raw) {
+    if (!raw) return;
+    std::lock_guard<std::mutex> lk(mu);
+    // Find in pending; move to ready if found & marked ready.
+    for (auto it = pending.begin(); it != pending.end(); ++it) {
+      if (it->get() == raw) {
+        if ((*it)->ready.load(std::memory_order_acquire)) {
+          ready.push_back(*it);
+          pending.erase(it);
+          cv.notify_one();
+        }
+        return;
+      }
+    }
   }
 
   void Shutdown() {
@@ -354,7 +388,8 @@ class ConnectionPool {
   std::mutex mu;
   std::condition_variable cv;
   std::deque<std::shared_ptr<ConnectionState>> allConns;
-  std::deque<std::shared_ptr<ConnectionState>> available;
+  std::deque<std::shared_ptr<ConnectionState>> ready;    // fully usable connections
+  std::deque<std::shared_ptr<ConnectionState>> pending;  // not yet ready (connect pending)
   bool shuttingDown{false};
 };
 

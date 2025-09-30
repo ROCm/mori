@@ -21,6 +21,8 @@
 // SOFTWARE.
 #include "src/io/tcp/backend_impl.hpp"
 
+#include <sys/eventfd.h>
+
 #include <array>
 
 namespace mori {
@@ -29,19 +31,19 @@ namespace io {
 TcpBackend::TcpBackend(EngineKey key, const IOEngineConfig& engCfg, const TcpBackendConfig& cfg)
     : myEngKey(key), config(cfg), engConfig(engCfg) {
   running.store(true);  // set before threads start
-  epollFd = epoll_create1(0);
-  if (epollFd == -1) {
-    MORI_IO_ERROR("TcpBackend: epoll_create1 failed: {}", strerror(errno));
-    running.store(false);
-    return;
-  }
   bufferPool.Configure(128, 16 * 1024 * 1024, true);
   hipStreams.Initialize(config.numWorkerThreads);
   listeners.reserve(config.numWorkerThreads);
   workerThreads.reserve(config.numWorkerThreads);
+  workerCtxs.reserve(config.numWorkerThreads);
+
   for (int i = 0; i < config.numWorkerThreads; ++i) {
     auto* listenctx = new application::TCPContext(engConfig.host, engConfig.port);
-    listenctx->Listen();
+    if (!listenctx->Listen()) {
+      MORI_IO_ERROR("TcpBackend: Listen failed for worker {}", i);
+      delete listenctx;
+      continue;
+    }
     int lfd = listenctx->GetListenFd();
     if (lfd <= 0) {
       MORI_IO_ERROR("TcpBackend: failed to get listen fd worker {}", i);
@@ -50,7 +52,52 @@ TcpBackend::TcpBackend(EngineKey key, const IOEngineConfig& engCfg, const TcpBac
     }
     SetNonBlocking(lfd);
     listeners.push_back(listenctx);
-    workerThreads.emplace_back([this, listenctx] { WorkerLoop(listenctx); });
+
+    // Allocate worker context
+    auto* wctx = new WorkerContext();
+    wctx->listenCtx = listenctx;
+    wctx->id = static_cast<size_t>(i);
+    wctx->epollFd = epoll_create1(0);
+    if (wctx->epollFd == -1) {
+      MORI_IO_ERROR("TcpBackend: epoll_create1 failed for worker {}: {}", i, strerror(errno));
+      delete wctx;
+      continue;
+    }
+    wctx->wakeFd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (wctx->wakeFd == -1) {
+      MORI_IO_ERROR("TcpBackend: eventfd failed for worker {}: {}", i, strerror(errno));
+      close(wctx->epollFd);
+      delete wctx;
+      continue;
+    }
+
+    // Register listen fd
+    struct epoll_event lev{};
+    lev.data.fd = lfd;
+    lev.events = EPOLLIN | EPOLLET;
+    if (epoll_ctl(wctx->epollFd, EPOLL_CTL_ADD, lfd, &lev) == -1) {
+      MORI_IO_ERROR("TcpBackend: epoll_ctl ADD listen fd failed for worker {}: {}", i,
+                    strerror(errno));
+      close(wctx->wakeFd);
+      close(wctx->epollFd);
+      delete wctx;
+      continue;
+    }
+    // Register wake fd
+    struct epoll_event wev{};
+    wev.data.fd = wctx->wakeFd;
+    wev.events = EPOLLIN | EPOLLET;
+    if (epoll_ctl(wctx->epollFd, EPOLL_CTL_ADD, wctx->wakeFd, &wev) == -1) {
+      MORI_IO_ERROR("TcpBackend: epoll_ctl ADD wake fd failed for worker {}: {}", i,
+                    strerror(errno));
+      close(wctx->wakeFd);
+      close(wctx->epollFd);
+      delete wctx;
+      continue;
+    }
+
+    workerCtxs.push_back(wctx);
+    workerThreads.emplace_back([this, wctx] { WorkerLoop(wctx); });
   }
 }
 
@@ -59,35 +106,26 @@ TcpBackend::~TcpBackend() {
   for (auto& t : workerThreads)
     if (t.joinable()) t.join();
   workerThreads.clear();
+  for (auto* w : workerCtxs) {
+    if (w->epollFd >= 0) close(w->epollFd);
+    if (w->wakeFd >= 0) close(w->wakeFd);
+  }
   for (auto* l : listeners) delete l;
+  for (auto* w : workerCtxs) delete w;
+  workerCtxs.clear();
   listeners.clear();
   for (auto& kv : connPools)
     if (kv.second) kv.second->ClearConnections();
   connPools.clear();
-  if (epollFd >= 0) {
-    close(epollFd);
-    epollFd = -1;
-  }
   hipStreams.Destroy();
 }
 
-void TcpBackend::WorkerLoop(application::TCPContext* ctx) {
+void TcpBackend::WorkerLoop(WorkerContext* wctx) {
   constexpr int kMaxEvents = 64;
   std::array<epoll_event, kMaxEvents> events{};
-  int workerEpollFd = epoll_create1(0);
-  if (workerEpollFd == -1) {
-    MORI_IO_ERROR("TcpBackend: epoll_create1 failed in worker: {}", strerror(errno));
-    return;
-  }
-  int listenFd = ctx->GetListenFd();
-  struct epoll_event lev{};  // add listen fd to epoll
-  lev.data.fd = listenFd;
-  lev.events = EPOLLIN | EPOLLET;
-  if (epoll_ctl(workerEpollFd, EPOLL_CTL_ADD, listenFd, &lev) == -1) {
-    MORI_IO_ERROR("TcpBackend: epoll_ctl ADD listen fd failed: {}", strerror(errno));
-    close(workerEpollFd);
-    return;
-  }
+  int workerEpollFd = wctx->epollFd;
+  int listenFd = wctx->listenCtx->GetListenFd();
+  int wakeFd = wctx->wakeFd;
   while (running.load()) {
     int n = epoll_wait(workerEpollFd, events.data(), kMaxEvents, 500);
     if (n == -1) {
@@ -99,7 +137,30 @@ void TcpBackend::WorkerLoop(application::TCPContext* ctx) {
     for (int i = 0; i < n; ++i) {
       auto& ev = events[i];
       if (ev.data.fd == listenFd) {
-        HandleNewConnection(ctx, workerEpollFd);
+        HandleNewConnection(wctx->listenCtx, workerEpollFd);
+        continue;
+      }
+      if (ev.data.fd == wakeFd) {
+        // Drain eventfd (edge triggered)
+        uint64_t tmp;
+        while (read(wakeFd, &tmp, sizeof(tmp)) > 0) {
+        }
+        // Register any pending outbound connections (currently unused placeholder)
+        std::vector<std::shared_ptr<ConnectionState>> toAdd;
+        {
+          std::lock_guard<std::mutex> lk(wctx->pendingAddMu);
+          toAdd.swap(wctx->pendingAdd);
+        }
+        for (auto& c : toAdd) {
+          struct epoll_event cev{};
+          cev.data.ptr = c.get();
+          cev.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLONESHOT;
+          if (epoll_ctl(workerEpollFd, EPOLL_CTL_ADD, c->handle.fd, &cev) == -1) {
+            MORI_IO_ERROR("TcpBackend: epoll_ctl ADD pending outbound fd failed: {}",
+                          strerror(errno));
+            c->Close();
+          }
+        }
         continue;
       }
       auto* conn = reinterpret_cast<ConnectionState*>(ev.data.ptr);
@@ -110,13 +171,31 @@ void TcpBackend::WorkerLoop(application::TCPContext* ctx) {
         conn->Close();
         closed = true;
       } else {
-        if (ev.events & EPOLLIN) HandleReadable(conn);
+        // Complete non-blocking connect if still in progress.
+        if ((ev.events & (EPOLLIN | EPOLLOUT)) &&
+            conn->connecting.load(std::memory_order_acquire)) {
+          int err = 0;
+          socklen_t len = sizeof(err);
+          if (getsockopt(conn->handle.fd, SOL_SOCKET, SO_ERROR, &err, &len) == -1 || err != 0) {
+            MORI_IO_ERROR("TcpBackend: outbound connect failed fd {} so_error={} errno={}",
+                          conn->handle.fd, err, errno);
+            conn->Close();
+            closed = true;
+          } else {
+            conn->connecting.store(false, std::memory_order_release);
+            conn->ready.store(true, std::memory_order_release);
+            // Promote in its owning pool (linear scan across pools acceptable for now)
+            for (auto& kv : connPools) {
+              kv.second->Promote(conn);
+            }
+          }
+        }
+        if (!closed && (ev.events & EPOLLIN)) HandleReadable(conn);
         if (!closed && (ev.events & EPOLLOUT)) HandleWritable(conn);
       }
       if (!closed) RearmSocket(workerEpollFd, conn, EPOLLIN | EPOLLOUT);
     }
   }
-  close(workerEpollFd);
 }
 
 void TcpBackend::HandleNewConnection(application::TCPContext* listener_ctx, int epoll_fd) {
@@ -138,6 +217,9 @@ void TcpBackend::HandleNewConnection(application::TCPContext* listener_ctx, int 
       listener_ctx->CloseEndpoint(ep);
       continue;
     }
+
+    // Accepted sockets are immediately usable for request handling.
+    conn->ready.store(true, std::memory_order_release);
 
     std::lock_guard<std::mutex> lock(inConnsMu);
     inboundConnections[ep.fd] = std::move(conn);
@@ -285,6 +367,7 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
         if (ep.Recv(payload, sz) != 0) {
           MORI_IO_ERROR("tcp service: close fd {} reason=recv_payload_fail mem={} size={} errno={}",
                         conn->handle.fd, header.mem_id, sz, errno);
+          bufferPool.Release(std::move(block));
           conn->Close();
           return;
         }
@@ -309,6 +392,7 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
         }
         op.status->SetCode(StatusCode::SUCCESS);
         conn->recvOp.reset();
+        bufferPool.Release(std::move(block));
       } break;
       case 3:  // WRITE RESP
       {
@@ -316,6 +400,11 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
         op.status->SetCode(StatusCode::SUCCESS);
         conn->pendingOps.erase(header.id);
 
+      } break;
+      default: {
+        MORI_IO_ERROR("TcpBackend: unknown opcode {} fd {} closing", (int)header.opcode,
+                      conn->handle.fd);
+        conn->Close();
       } break;
     }
   }
@@ -396,6 +485,11 @@ void TcpBackend::HandleWritable(ConnectionState* conn) {
       }
       // Track pending write to match WRITE RESP
       conn->pendingOps.emplace(op.id, std::move(op));
+    } break;
+    default: {
+      MORI_IO_ERROR("TcpBackend: unknown opType {} on fd {}", (int)op.opType, conn->handle.fd);
+      op.status->SetCode(StatusCode::ERR_BAD_STATE);
+      op.status->SetMessage("unknown opType");
     } break;
   }
 }
@@ -504,17 +598,26 @@ void TcpBackend::EnsureConnections(const EngineDesc& rdesc, size_t minCount) {
     connPtr->recvState = ConnectionState::RecvState::PARSING_HEADER;
     connPtr->handle = handle;
     connPtr->listener = nullptr;
-    if (epollFd >= 0) {
-      struct epoll_event ev{};
-      ev.data.ptr = connPtr.get();
-      ev.events = EPOLLIN | EPOLLET | EPOLLOUT | EPOLLONESHOT;
-      if (epoll_ctl(epollFd, EPOLL_CTL_ADD, handle.fd, &ev) == -1) {
-        MORI_IO_ERROR("TcpBackend: epoll_ctl ADD outbound fd failed: {}", strerror(errno));
-        connPtr->Close();
-        continue;
+    connPtr->connecting.store(true, std::memory_order_release);
+    // Assign to a worker in round-robin fashion; queue for registration.
+    if (workerCtxs.empty()) {
+      MORI_IO_ERROR("TcpBackend: no worker contexts available for outbound connection");
+      connPtr->Close();
+      continue;
+    }
+    size_t idx = nextWorker.fetch_add(1, std::memory_order_relaxed) % workerCtxs.size();
+    auto* wctx = workerCtxs[idx];
+    {
+      std::lock_guard<std::mutex> lk(wctx->pendingAddMu);
+      wctx->pendingAdd.push_back(connPtr);
+    }
+    uint64_t one = 1;
+    if (write(wctx->wakeFd, &one, sizeof(one)) < 0) {
+      if (errno != EAGAIN) {
+        MORI_IO_ERROR("TcpBackend: write wakeFd failed: {}", strerror(errno));
       }
     }
-    pending.push_back(connPtr);
+    pending.push_back(connPtr);  // still track in pool
   }
   connPools[rdesc.key]->SetConnections(pending);
 }

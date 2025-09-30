@@ -24,9 +24,11 @@
 // Internal TCP backend implementation details.
 #include <fcntl.h>
 
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "mori/application/transport/tcp/tcp.hpp"
 #include "mori/application/utils/check.hpp"
@@ -62,10 +64,13 @@ class TcpBackend : public Backend {
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
 
  private:
+  // Forward declaration of worker context (defined below TcpBackendSession)
+  struct WorkerContext;
+
   // --- Core Asynchronous Engine ---
   void StartThreads();
   void StopThreads();
-  void WorkerLoop(application::TCPContext* ctx);
+  void WorkerLoop(WorkerContext* wctx);
 
   // --- Event Handlers ---
   void HandleNewConnection(application::TCPContext* listener_ctx, int epoll_fd);
@@ -87,10 +92,12 @@ class TcpBackend : public Backend {
   EngineKey myEngKey;
   TcpBackendConfig config;
   IOEngineConfig engConfig;
-  int epollFd{-1};
+  // (Removed global epollFd; per-worker epoll now lives in WorkerContext.)
   std::vector<application::TCPContext*> listeners;
   std::vector<std::thread> workerThreads;
+  std::vector<WorkerContext*> workerCtxs;  // owns WorkerContext pointers (freed in dtor)
   std::atomic<bool> running{false};
+  std::atomic<size_t> nextWorker{0};  // round-robin index for assigning outbound connections
 
   BufferPool bufferPool;
 
@@ -126,6 +133,17 @@ class TcpBackendSession : public BackendSession {
   TcpBackend* backend{nullptr};
   MemoryDesc local{};
   MemoryDesc remote{};
+};
+
+// WorkerContext holds per-worker reactor state.
+// outbound connections will later be enqueued and registered via wakeFd.
+struct TcpBackend::WorkerContext {
+  application::TCPContext* listenCtx{nullptr};
+  int epollFd{-1};
+  int wakeFd{-1};  // eventfd used to wake epoll loop when new outbound conns pending
+  size_t id{0};
+  std::mutex pendingAddMu;                                   // protects pendingAdd
+  std::vector<std::shared_ptr<ConnectionState>> pendingAdd;  // connections to add to epoll
 };
 
 }  // namespace io
