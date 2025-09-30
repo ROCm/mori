@@ -34,7 +34,6 @@
 #include "mori/io/common.hpp"
 #include "mori/io/engine.hpp"
 #include "mori/io/logging.hpp"
-#include "src/io/tcp/executor.hpp"
 
 namespace mori {
 namespace io {
@@ -116,6 +115,7 @@ class TcpBackend : public Backend {
   std::mutex inConnsMu;
   std::unordered_map<int, std::unique_ptr<ConnectionState>> inboundConnections;
   std::unordered_map<EngineKey, std::unique_ptr<ConnectionPool>> connPools;
+  HipStreamPool hipStreams;
 
   std::mutex remotesMu;
   std::unordered_map<EngineKey, EngineDesc> remotes;

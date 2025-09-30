@@ -33,6 +33,7 @@ TcpBackend::TcpBackend(EngineKey key, const IOEngineConfig& engCfg, const TcpBac
   }
 
   bufferPool.Configure(128, 16 * 1024 * 1024, true);  // TODO: make configurable
+  hipStreams.Initialize(config.numWorkerThreads);
   for (int i = 0; i < config.numWorkerThreads; ++i) {
     application::TCPContext* listenctx =
         new application::TCPContext(engConfig.host, engConfig.port);
@@ -114,7 +115,7 @@ void TcpBackend::HandleNewConnection(application::TCPContext* listener_ctx, int 
   auto newEps = listener_ctx->Accept();
   for (const auto& ep : newEps) {
     std::unique_ptr<ConnectionState> conn = std::make_unique<ConnectionState>();
-    conn->recvstate = ConnectionState::RecvState::PARSING_HEADER;
+    conn->recvState = ConnectionState::RecvState::PARSING_HEADER;
     conn->handle = ep;
     conn->listener = listener_ctx;
 
@@ -137,34 +138,174 @@ void TcpBackend::HandleNewConnection(application::TCPContext* listener_ctx, int 
 
 void TcpBackend::HandleReadable(ConnectionState* conn) {
   // This function implements the protocol parsing state machine.
-  if (conn->recvstate == ConnectionState::RecvState::PARSING_HEADER) {
-    application::TCPEndpoint ep(conn->handle);
-    if (ep.Recv(&conn->pendingheader, sizeof(TcpMessageHeader)) != 0) {
+  application::TCPEndpoint ep(conn->handle);
+  if (conn->recvState == ConnectionState::RecvState::PARSING_HEADER) {
+    if (ep.Recv(&conn->pendingHeader, sizeof(TcpMessageHeader)) != 0) {
       MORI_IO_ERROR("TcpBackend: recv header failed on fd {}: {}", conn->handle.fd,
                     strerror(errno));
       return;
     }
-    conn->recvstate = ConnectionState::RecvState::PARSING_PAYLOAD;
+    conn->recvState = ConnectionState::RecvState::PARSING_PAYLOAD;
   }
 
-  if (conn->recvstate == ConnectionState::RecvState::PARSING_PAYLOAD) {
-    auto& header = conn->pendingheader;
+  if (conn->recvState == ConnectionState::RecvState::PARSING_PAYLOAD) {
+    auto& header = conn->pendingHeader;
+    size_t sz = header.size;
     switch (header.opcode) {
       case 0:  // READ_REQ
       {
+        // Fetch memory meta
+        MemoryDesc target{};
+        {
+          std::lock_guard<std::mutex> lock(memMu);
+          auto it = localMems.find(header.mem_id);
+          if (it == localMems.end()) {
+            MORI_IO_ERROR(
+                "tcp service: close fd {} reason=mem_not_found mem_id={} opcode={} size={} ",
+                conn->handle.fd, header.mem_id, (int)header.opcode, header.size);
+            conn->Close();
+            return;
+          }
+          target = it->second;
+        }
+        bool targetIsGpu = (target.loc == MemoryLocationType::GPU);
+
+        BufferBlock block = bufferPool.Acquire(sz);
+        char* payload = block.data;
+        if (targetIsGpu) {
+          const void* devPtr = reinterpret_cast<const void*>(target.data + header.offset);
+          if (hipMemcpy(payload, devPtr, sz, hipMemcpyDeviceToHost) != hipSuccess) {
+            bufferPool.Release(std::move(block));
+            MORI_IO_ERROR(
+                "tcp service: close fd {} reason=hipMemcpy_D2H_fail mem={} size={} errno={}",
+                conn->handle.fd, header.mem_id, sz, errno);
+            conn->Close();
+            return;
+          }
+        } else {
+          const char* src = reinterpret_cast<const char*>(target.data + header.offset);
+          std::memcpy(payload, src, sz);
+        }
+        // Build response (header + payload) into out_buf
+        TcpMessageHeader resp{};
+        resp.opcode = 2;
+        resp.id = header.id;
+        resp.mem_id = header.mem_id;
+        resp.offset = header.offset;
+        resp.size = header.size;
+
+        if (ep.Send(&resp, sizeof(resp)) != 0) {
+          MORI_IO_ERROR("TcpBackend: send write_req header failed on fd {}: {}", conn->handle.fd,
+                        strerror(errno));
+          conn->Close();
+          return;
+        }
+        if (ep.Send(payload, sz) != 0) {
+          MORI_IO_ERROR("TcpBackend: send write_req payload failed on fd {}: {}", conn->handle.fd,
+                        strerror(errno));
+          conn->Close();
+        }
+        bufferPool.Release(std::move(block));
+
       } break;
       case 1:  // WRITE_REQ
       {
+        BufferBlock block = bufferPool.Acquire(sz);
+        char* payload = block.data;
+        if (ep.Recv(payload, sz) != 0) {
+          MORI_IO_ERROR("tcp service: close fd {} reason=recv_payload_fail mem={} size={} errno={}",
+                        conn->handle.fd, header.mem_id, sz, errno);
+          conn->Close();
+          return;
+        }
+
+        // Complete write: copy to target memory
+        MemoryDesc target{};
+        {
+          std::lock_guard<std::mutex> lock(memMu);
+          auto it = localMems.find(header.mem_id);
+          if (it == localMems.end()) {
+            MORI_IO_ERROR("tcp service: close fd {} reason=mem_not_found(write) mem={} size={}",
+                          conn->handle.fd, header.mem_id, sz);
+            conn->Close();
+            return;
+          }
+          target = it->second;
+        }
+        bool targetIsGpu = (target.loc == MemoryLocationType::GPU);
+        if (targetIsGpu) {
+          void* devPtr = reinterpret_cast<void*>(target.data + header.offset);
+          if (hipMemcpy(devPtr, payload, sz, hipMemcpyHostToDevice) != hipSuccess) {
+            MORI_IO_ERROR(
+                "tcp service: close fd {} reason=hipMemcpy_H2D_fail mem={} size={} errno={}",
+                conn->handle.fd, header.mem_id, sz, errno);
+            conn->Close();
+            return;
+          }
+        } else {
+          char* dst = reinterpret_cast<char*>(target.data + header.offset);
+          std::memcpy(dst, payload, sz);
+        }
+        TcpMessageHeader resp{};
+        resp.opcode = 3;
+        resp.id = header.id;
+        resp.mem_id = header.mem_id;
+        resp.offset = header.offset;
+        resp.size = header.size;
+        ep.Send(&resp, sizeof(resp));
+        bufferPool.Release(std::move(block));
       } break;
       case 2:  // READ RESP
       {
+        if (conn->recvOp == std::nullopt) {
+          MORI_IO_ERROR("TcpBackend: unexpected READ RESP on fd {}", conn->handle.fd);
+          conn->Close();
+          return;
+        }
+        TransferOp& op = *(conn->recvOp);
+        if (sz != op.size) {
+          MORI_IO_ERROR("TcpBackend: READ RESP size mismatch on fd {}: expected {}, got {}",
+                        conn->handle.fd, op.size, sz);
+          op.status->SetCode(StatusCode::ERR_BAD_STATE);
+          op.status->SetMessage("READ RESP size mismatch");
+          conn->recvOp.reset();
+          conn->recvState = ConnectionState::RecvState::PARSING_HEADER;
+          return;
+        }
+        BufferBlock block = bufferPool.Acquire(sz);
+        char* payload = block.data;
+        if (ep.Recv(payload, sz) != 0) {
+          MORI_IO_ERROR("tcp service: close fd {} reason=recv_payload_fail mem={} size={} errno={}",
+                        conn->handle.fd, header.mem_id, sz, errno);
+          conn->Close();
+          return;
+        }
+
+        bool localIsGpu = (op.localDest.loc == MemoryLocationType::GPU);
+        if (localIsGpu) {
+          void* devPtr = reinterpret_cast<void*>(op.localDest.data + op.localOffset);
+          if (hipMemcpy(devPtr, payload, sz, hipMemcpyHostToDevice) != hipSuccess) {
+            MORI_IO_ERROR("TcpBackend: hipMemcpy H2D failed for read_resp of size {}: {}", sz,
+                          hipGetErrorString(hipGetLastError()));
+            op.status->SetCode(StatusCode::ERR_BAD_STATE);
+            op.status->SetMessage(std::string("hipMemcpy H2D failed: ") +
+                                  hipGetErrorString(hipGetLastError()));
+            conn->recvOp.reset();
+            conn->recvState = ConnectionState::RecvState::PARSING_HEADER;
+            bufferPool.Release(std::move(block));
+            return;
+          }
+        } else {
+          char* dst = reinterpret_cast<char*>(op.localDest.data + op.localOffset);
+          std::memcpy(dst, payload, sz);
+        }
       } break;
       case 3:  // WRITE RESP
       {
         TransferOp& op = conn->pendingOps[header.id];
         op.status->SetCode(StatusCode::SUCCESS);
         conn->pendingOps.erase(header.id);
-        conn->recvstate = ConnectionState::RecvState::PARSING_HEADER;
+        conn->recvState = ConnectionState::RecvState::PARSING_HEADER;
       } break;
     }
   }
@@ -191,6 +332,8 @@ void TcpBackend::HandleWritable(ConnectionState* conn) {
         op.status->SetMessage("send read_req header failed");
         return;
       }
+      conn->recvOp = std::move(op);
+      conn->recvState = ConnectionState::RecvState::PARSING_HEADER;
     } break;
     case 1:  // WRITE_REQ
     {
@@ -240,27 +383,6 @@ void TcpBackend::HandleWritable(ConnectionState* conn) {
         op.status->SetCode(StatusCode::ERR_BAD_STATE);
         op.status->SetMessage("send write_req payload failed");
       }
-    } break;
-    case 2:  // READ RESP
-    {
-    } break;
-    case 3:  // WRITE RESP
-    {
-      TcpMessageHeader hdr{};
-      hdr.opcode = 3;  // write_resp
-      hdr.id = op.id;
-      hdr.mem_id = op.remoteDest.id;
-      hdr.offset = op.remoteOffset;
-      hdr.size = op.size;
-
-      if (ep.Send(&hdr, sizeof(hdr)) != 0) {
-        MORI_IO_ERROR("TcpBackend: send write_resp header failed on fd {}: {}", conn->handle.fd,
-                      strerror(errno));
-        op.status->SetCode(StatusCode::ERR_BAD_STATE);
-        op.status->SetMessage("send write_resp header failed");
-        return;
-      }
-
     } break;
   }
 }
@@ -359,7 +481,7 @@ void TcpBackend::EnsureConnections(const EngineDesc& rdesc, size_t minCount) {
     SetSocketOptions(handle.fd);
 
     auto conn = std::make_unique<ConnectionState>();
-    conn->recvstate = ConnectionState::RecvState::PARSING_HEADER;
+    conn->recvState = ConnectionState::RecvState::PARSING_HEADER;
     conn->handle = handle;
     conn->listener = nullptr;  // outbound
 
@@ -436,6 +558,11 @@ void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
   op.opType = isRead ? 0 : 1;
 
   auto connection = connPools[rdesc.key]->GetNextConnection();
+  if (!connection) {
+    status->SetCode(StatusCode::ERR_BAD_STATE);
+    status->SetMessage("no valid tcp connection");
+    return;
+  }
   connection->SubmitTransfer(op);
 
   // For reference:

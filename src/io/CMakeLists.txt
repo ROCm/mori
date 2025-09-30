@@ -6,7 +6,6 @@ add_library(
   rdma/executor.cpp
   rdma/common.cpp
   tcp/backend_impl.cpp
-  tcp/executor.cpp
   tcp/common.cpp)
 
 target_include_directories(mori_io PUBLIC ${CMAKE_SOURCE_DIR}/include)

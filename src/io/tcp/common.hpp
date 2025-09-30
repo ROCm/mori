@@ -86,12 +86,12 @@ class ConnectionState {
   EndpointHandle handle{-1, {}};
   application::TCPContext* listener{nullptr};
   enum class RecvState { PARSING_HEADER, PARSING_PAYLOAD };
-  RecvState recvstate{RecvState::PARSING_HEADER};
-  TcpMessageHeader pendingheader{};  // zero-init
-  std::condition_variable recv_cv;
+  RecvState recvState{RecvState::PARSING_HEADER};
+  TcpMessageHeader pendingHeader{};  // zero-init
+  std::condition_variable recvCv;
   bool complete{false};
-  std::optional<GpuCommState> gpu_state;
-  std::optional<TransferOp> recv_op;
+  std::optional<GpuCommState> gpuState;
+  std::optional<TransferOp> recvOp;
 
   std::deque<TransferOp> sendQueue;                             // guarded by mu
   std::unordered_map<TransferUniqueId, TransferOp> pendingOps;  // guarded by mu
@@ -116,8 +116,8 @@ class ConnectionState {
 
   void Reset() noexcept {
     std::scoped_lock lk(mu);
-    recvstate = RecvState::PARSING_HEADER;
-    pendingheader = TcpMessageHeader{};
+    recvState = RecvState::PARSING_HEADER;
+    pendingHeader = TcpMessageHeader{};
     complete = false;
   }
 
@@ -126,7 +126,7 @@ class ConnectionState {
       std::scoped_lock lk(mu);
       complete = true;
     }
-    recv_cv.notify_all();
+    recvCv.notify_all();
   }
 
   void Close() noexcept {
@@ -142,50 +142,222 @@ class ConnectionState {
   std::mutex mu;
 };
 
+class HipStreamPool {
+ public:
+  struct Lease {
+    hipStream_t stream{nullptr};
+    HipStreamPool* pool{nullptr};
+    Lease() = default;
+    Lease(hipStream_t s, HipStreamPool* p) : stream(s), pool(p) {}
+    Lease(const Lease&) = delete;
+    Lease& operator=(const Lease&) = delete;
+    Lease(Lease&& other) noexcept {
+      stream = other.stream;
+      pool = other.pool;
+      other.stream = nullptr;
+      other.pool = nullptr;
+    }
+    Lease& operator=(Lease&& other) noexcept {
+      if (this != &other) {
+        release();
+        stream = other.stream;
+        pool = other.pool;
+        other.stream = nullptr;
+        other.pool = nullptr;
+      }
+      return *this;
+    }
+    ~Lease() { release(); }
+    void release() {
+      if (pool && stream) {
+        pool->Release(stream);
+        stream = nullptr;
+        pool = nullptr;
+      }
+    }
+    hipStream_t get() const { return stream; }
+    operator hipStream_t() const { return stream; }
+    bool valid() const { return stream != nullptr; }
+  };
+
+  HipStreamPool() = default;
+  ~HipStreamPool() { Destroy(); }
+
+  void Initialize(size_t streamCount, unsigned flags = hipStreamDefault) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (initialized_) return;
+    streams_.reserve(streamCount);
+    for (size_t i = 0; i < streamCount; ++i) {
+      hipStream_t s{};
+      hipError_t st = hipStreamCreateWithFlags(&s, flags);
+      if (st != hipSuccess) {
+        if (hipStreamCreate(&s) != hipSuccess) {
+          MORI_IO_ERROR("Failed to create HIP stream {}", i);
+          continue;
+        }
+      }
+      streams_.push_back(s);
+      available_.push_back(s);
+    }
+    initialized_ = true;
+  }
+
+  hipStream_t AcquireRaw(std::chrono::milliseconds timeout = std::chrono::milliseconds::max()) {
+    std::unique_lock<std::mutex> lk(mu_);
+    if (timeout == std::chrono::milliseconds::max()) {
+      cv_.wait(lk, [this] { return shuttingDown_ || !available_.empty(); });
+    } else {
+      cv_.wait_for(lk, timeout, [this] { return shuttingDown_ || !available_.empty(); });
+    }
+    if (shuttingDown_ || available_.empty()) return nullptr;
+    hipStream_t s = available_.front();
+    available_.pop_front();
+    return s;
+  }
+
+  Lease Acquire(std::chrono::milliseconds timeout = std::chrono::milliseconds::max()) {
+    hipStream_t s = AcquireRaw(timeout);
+    return Lease{s, s ? this : nullptr};
+  }
+
+  void Release(hipStream_t s) {
+    if (!s) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (shuttingDown_) return;  // let Destroy() handle
+    available_.push_back(s);
+    cv_.notify_one();
+  }
+
+  size_t TotalStreams() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return streams_.size();
+  }
+
+  void Shutdown() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!shuttingDown_) {
+      shuttingDown_ = true;
+      cv_.notify_all();
+    }
+  }
+
+  void Destroy() {
+    std::deque<hipStream_t> toDestroy;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      shuttingDown_ = true;
+      toDestroy.assign(streams_.begin(), streams_.end());
+      streams_.clear();
+      available_.clear();
+    }
+    for (auto s : toDestroy) {
+      if (s) hipStreamDestroy(s);
+    }
+  }
+
+ private:
+  mutable std::mutex mu_;
+  std::condition_variable cv_;
+  std::vector<hipStream_t> streams_;
+  std::deque<hipStream_t> available_;
+  bool initialized_{false};
+  bool shuttingDown_{false};
+};
+
 class ConnectionPool {
  public:
   ConnectionPool() = default;
-  ~ConnectionPool() = default;
+  ~ConnectionPool() {
+    Shutdown();
+    ClearConnections();
+  }
 
+  // Non-blocking acquire (returns nullptr if none available)
   std::shared_ptr<ConnectionState> GetNextConnection() {
-    size_t idx = nextIdx.fetch_add(1, std::memory_order_relaxed);
-    if (outConns.empty()) return nullptr;
-    return outConns[idx % outConns.size()];
+    std::lock_guard<std::mutex> lk(mu);
+    if (available.empty()) return nullptr;
+    auto conn = std::move(available.front());
+    available.pop_front();
+    return conn;
+  }
+
+  // Blocking acquire with optional timeout (default: wait indefinitely)
+  std::shared_ptr<ConnectionState> AcquireConnection(
+      std::chrono::milliseconds timeout = std::chrono::milliseconds::max()) {
+    std::unique_lock<std::mutex> lk(mu);
+    if (timeout == std::chrono::milliseconds::max()) {
+      cv.wait(lk, [this] { return shuttingDown || !available.empty(); });
+    } else {
+      cv.wait_for(lk, timeout, [this] { return shuttingDown || !available.empty(); });
+    }
+    if (shuttingDown || available.empty()) return nullptr;
+    auto conn = std::move(available.front());
+    available.pop_front();
+    return conn;
+  }
+
+  // Return a leased connection
+  void ReleaseConnection(std::shared_ptr<ConnectionState> conn) {
+    if (!conn) return;
+    std::lock_guard<std::mutex> lk(mu);
+    if (shuttingDown) {
+      conn->Close();
+      return;
+    }
+    available.push_back(std::move(conn));
+    cv.notify_one();
   }
 
   void SetConnections(const std::vector<std::shared_ptr<ConnectionState>>& conns) {
     std::lock_guard<std::mutex> lk(mu);
     for (const auto& c : conns) {
-      outConns.push_back(c);
+      allConns.push_back(c);
+      available.push_back(c);
     }
+    cv.notify_all();
   }
 
   size_t ConnectionCount() {
     std::lock_guard<std::mutex> lk(mu);
-    return outConns.size();
+    return allConns.size();
   }
 
   void RemoveConnection(std::shared_ptr<ConnectionState> conn) {
-    auto it = std::find(outConns.begin(), outConns.end(), conn);
-    if (it != outConns.end()) {
-      it->get()->Close();
-      std::lock_guard<std::mutex> lk(mu);
-      outConns.erase(it);
+    if (!conn) return;
+    std::lock_guard<std::mutex> lk(mu);
+    auto eraseOne = [&](auto& dq) {
+      auto it = std::find(dq.begin(), dq.end(), conn);
+      if (it != dq.end()) dq.erase(it);
+    };
+    eraseOne(available);
+    auto it = std::find(allConns.begin(), allConns.end(), conn);
+    if (it != allConns.end()) {
+      (*it)->Close();
+      allConns.erase(it);
     }
   }
 
   void ClearConnections() {
     std::lock_guard<std::mutex> lk(mu);
-    for (auto& c : outConns) {
-      c->Close();
+    for (auto& c : allConns) c->Close();
+    allConns.clear();
+    available.clear();
+  }
+
+  void Shutdown() {
+    std::lock_guard<std::mutex> lk(mu);
+    if (!shuttingDown) {
+      shuttingDown = true;
+      cv.notify_all();
     }
-    outConns.clear();
   }
 
  private:
   std::mutex mu;
-  std::deque<std::shared_ptr<ConnectionState>> outConns;
-  std::atomic<size_t> nextIdx{0};
+  std::condition_variable cv;
+  std::deque<std::shared_ptr<ConnectionState>> allConns;
+  std::deque<std::shared_ptr<ConnectionState>> available;
+  bool shuttingDown{false};
 };
 
 class BufferPool {
