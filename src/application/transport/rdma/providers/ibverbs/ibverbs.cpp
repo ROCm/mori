@@ -96,7 +96,7 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
 }
 
 void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
-                                           const RdmaEndpointHandle& remote) {
+                                           const RdmaEndpointHandle& remote, uint32_t qpId) {
   ibv_qp_attr attr;
   int flags;
 

@@ -23,6 +23,7 @@
 
 #include <limits.h>
 #include <stdint.h>
+
 #include "infiniband/verbs.h"
 
 namespace mori {
@@ -72,12 +73,12 @@ struct WorkQueueHandle {
   union {
     struct {
       uint32_t msntblSlotIdx;
-      uint32_t psnIdx; // for bnxt msn psn index calculate
+      uint32_t psnIdx;  // for bnxt msn psn index calculate
     };
     uint64_t msnPack{0};
   };
   void* sqAddr{nullptr};
-  void* msntblAddr{nullptr}; // for bnxt
+  void* msntblAddr{nullptr};  // for bnxt
   void* rqAddr{nullptr};
   void* dbrRecAddr{nullptr};
   void* dbrAddr{nullptr};
@@ -93,9 +94,9 @@ struct CompletionQueueHandle {
   void* cqAddr{nullptr};
   void* dbrRecAddr{nullptr};
   void* dbrAddr{nullptr};
-  uint32_t consIdx{0}; // numbers of cqe that have been completed
-  uint32_t needConsIdx{0}; // numbers of cqe that should be consumed
-  uint32_t activeIdx{0}; // numbers of cqe that under processing but not completed
+  uint32_t consIdx{0};      // numbers of cqe that have been completed
+  uint32_t needConsIdx{0};  // numbers of cqe that should be consumed
+  uint32_t activeIdx{0};    // numbers of cqe that under processing but not completed
   uint32_t cq_consumer{0};
   uint32_t cqeNum{0};
   uint32_t cqeSize{0};
@@ -107,6 +108,15 @@ struct IBVerbsHandle {
   ibv_cq* cq{nullptr};
   ibv_srq* srq{nullptr};
   ibv_comp_channel* compCh{nullptr};
+};
+
+struct IbufHandle {
+  uintptr_t addr{0};
+  uint32_t lkey{0};
+  uint32_t rkey{0};
+  uint32_t nslots{0};
+  uint32_t head{0};
+  uint32_t tail{0};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
