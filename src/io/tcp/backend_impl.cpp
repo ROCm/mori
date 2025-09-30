@@ -111,7 +111,8 @@ TcpBackend::~TcpBackend() {
   workerCtxs.clear();
   listeners.clear();
   for (auto& kv : connPools)
-    if (kv.second) kv.second->ClearConnections();
+    if (kv.second) kv.second->Shutdown();
+
   connPools.clear();
   hipStreams.Destroy();
 }
@@ -218,7 +219,6 @@ void TcpBackend::HandleNewConnection(application::TCPContext* listener_ctx, int 
     conn->ready.store(true, std::memory_order_release);
 
     std::lock_guard<std::mutex> lock(inConnsMu);
-    inboundConnections[ep.fd] = std::move(conn);
   }
 }
 
@@ -250,6 +250,7 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
                 "tcp service: close fd {} reason=mem_not_found mem_id={} opcode={} size={} ",
                 conn->handle.fd, header.mem_id, (int)header.opcode, header.size);
             conn->Close();
+            conn->Reset();
             return;
           }
           target = it->second;
@@ -266,6 +267,7 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
                 "tcp service: close fd {} reason=hipMemcpy_D2H_fail mem={} size={} errno={}",
                 conn->handle.fd, header.mem_id, sz, errno);
             conn->Close();
+            conn->Reset();
             return;
           }
         } else {
@@ -284,12 +286,16 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
           MORI_IO_ERROR("TcpBackend: send write_req header failed on fd {}: {}", conn->handle.fd,
                         strerror(errno));
           conn->Close();
+          conn->Reset();
+          bufferPool.Release(std::move(block));
           return;
         }
         if (ep.Send(payload, sz) != 0) {
           MORI_IO_ERROR("TcpBackend: send write_req payload failed on fd {}: {}", conn->handle.fd,
                         strerror(errno));
           conn->Close();
+          conn->Reset();
+          bufferPool.Release(std::move(block));
         }
         bufferPool.Release(std::move(block));
 
@@ -302,6 +308,8 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
           MORI_IO_ERROR("tcp service: close fd {} reason=recv_payload_fail mem={} size={} errno={}",
                         conn->handle.fd, header.mem_id, sz, errno);
           conn->Close();
+          conn->Reset();
+          bufferPool.Release(std::move(block));
           return;
         }
 
@@ -314,6 +322,8 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
             MORI_IO_ERROR("tcp service: close fd {} reason=mem_not_found(write) mem={} size={}",
                           conn->handle.fd, header.mem_id, sz);
             conn->Close();
+            conn->Reset();
+            bufferPool.Release(std::move(block));
             return;
           }
           target = it->second;
@@ -326,6 +336,8 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
                 "tcp service: close fd {} reason=hipMemcpy_H2D_fail mem={} size={} errno={}",
                 conn->handle.fd, header.mem_id, sz, errno);
             conn->Close();
+            conn->Reset();
+            bufferPool.Release(std::move(block));
             return;
           }
         } else {
@@ -346,6 +358,7 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
         if (conn->recvOp == std::nullopt) {
           MORI_IO_ERROR("TcpBackend: unexpected READ RESP on fd {}", conn->handle.fd);
           conn->Close();
+          conn->Reset();
           return;
         }
         TransferOp& op = *(conn->recvOp);
@@ -365,6 +378,7 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
                         conn->handle.fd, header.mem_id, sz, errno);
           bufferPool.Release(std::move(block));
           conn->Close();
+          conn->Reset();
           return;
         }
 
@@ -389,18 +403,29 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
         op.status->SetCode(StatusCode::SUCCESS);
         conn->recvOp.reset();
         bufferPool.Release(std::move(block));
+        connPools[op.remoteDest.engineKey]->ReleaseConnection(
+            std::shared_ptr<ConnectionState>(conn));
       } break;
       case 3:  // WRITE RESP
       {
-        TransferOp& op = conn->pendingOps[header.id];
+        std::lock_guard<std::mutex> lk(conn->mu);
+        auto it = conn->pendingOps.find(header.id);
+        if (it == conn->pendingOps.end()) {
+          MORI_IO_ERROR("WRITE_RESP for unknown id {} on fd {}", header.id, conn->handle.fd);
+          return;
+        }
+        TransferOp& op = it->second;
         op.status->SetCode(StatusCode::SUCCESS);
-        conn->pendingOps.erase(header.id);
+        conn->pendingOps.erase(it);
+        connPools[op.remoteDest.engineKey]->ReleaseConnection(
+            std::shared_ptr<ConnectionState>(conn));
 
       } break;
       default: {
         MORI_IO_ERROR("TcpBackend: unknown opcode {} fd {} closing", (int)header.opcode,
                       conn->handle.fd);
         conn->Close();
+        conn->Reset();
       } break;
     }
   }
@@ -430,6 +455,7 @@ void TcpBackend::HandleWritable(ConnectionState* conn) {
       }
       conn->recvOp = std::move(op);  // wait for incoming READ RESP
       conn->recvState = ConnectionState::RecvState::PARSING_HEADER;
+      // TODO: implement timeout for read response
     } break;
     case 1:  // WRITE_REQ
     {
@@ -480,7 +506,10 @@ void TcpBackend::HandleWritable(ConnectionState* conn) {
         op.status->SetMessage("send write_req payload failed");
       }
       // Track pending write to match WRITE RESP
-      conn->pendingOps.emplace(op.id, std::move(op));
+      {
+        std::lock_guard<std::mutex> lk(conn->mu);
+        conn->pendingOps.emplace(op.id, std::move(op));
+      }
     } break;
     default: {
       MORI_IO_ERROR("TcpBackend: unknown opType {} on fd {}", (int)op.opType, conn->handle.fd);
@@ -637,7 +666,7 @@ void TcpBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   }
   auto it = connPools.find(rdesc.key);
   if (it != connPools.end()) {
-    it->second->ClearConnections();
+    it->second->Shutdown();
     connPools.erase(it);
   }
 }
@@ -676,7 +705,7 @@ void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
   TransferOp op{localDest, localOffset, remoteSrc, remoteOffset, size, status, id};
   op.opType = isRead ? 0 : 1;
 
-  auto connection = connPools[rdesc.key]->GetNextConnection();
+  auto connection = connPools[rdesc.key]->AcquireConnection();
   if (!connection) {
     status->SetCode(StatusCode::ERR_BAD_STATE);
     status->SetMessage("no valid tcp connection");

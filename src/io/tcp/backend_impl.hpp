@@ -96,7 +96,6 @@ class TcpBackend : public Backend {
   BufferPool bufferPool;
 
   std::mutex inConnsMu;
-  std::unordered_map<int, std::unique_ptr<ConnectionState>> inboundConnections;
   std::unordered_map<EngineKey, std::unique_ptr<ConnectionPool>> connPools;
   HipStreamPool hipStreams;
 

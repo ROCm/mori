@@ -37,6 +37,8 @@
 namespace mori {
 namespace io {
 
+enum OpType { READ_REQ = 0, WRITE_REQ = 1, READ_RESP = 2, WRITE_RESP = 3 };
+
 struct TcpMessageHeader {
   uint8_t opcode;       // 0 = READ_REQ, 1 = WRITE_REQ, 2 = READ_RESP, 3 = WRITE_RESP
   uint8_t reserved{0};  // alignment / future flags
@@ -65,7 +67,7 @@ struct TransferOp {
   size_t size;
   TransferStatus* status;
   TransferUniqueId id;
-  uint8_t opType;  // 0 = READ_REQ, 1 = WRITE_REQ, 2 = READ_RESP, 3 = WRITE_RESP
+  OpType opType;  // 0 = READ_REQ, 1 = WRITE_REQ, 2 = READ_RESP, 3 = WRITE_RESP
   bool isGpuOp{false};
   BufferBlock stagingBuffer;  // used for CPU<->GPU staging if needed
   hipStream_t stream{nullptr};
@@ -91,7 +93,6 @@ class ConnectionState {
   enum class RecvState { PARSING_HEADER, PARSING_PAYLOAD };
   RecvState recvState{RecvState::PARSING_HEADER};
   TcpMessageHeader pendingHeader{};  // zero-init
-  std::condition_variable recvCv;
   bool complete{false};
   std::optional<GpuCommState> gpuState;
   std::optional<TransferOp> recvOp;
@@ -124,13 +125,7 @@ class ConnectionState {
     pendingHeader = TcpMessageHeader{};
     complete = false;
   }
-  void MarkComplete() {
-    {
-      std::scoped_lock lk(mu);
-      complete = true;
-    }
-    recvCv.notify_all();
-  }
+
   void Close() noexcept {
     std::scoped_lock lk(mu);
     if (listener) {
@@ -144,7 +139,6 @@ class ConnectionState {
     ready.store(false, std::memory_order_release);
   }
 
- private:
   std::mutex mu;
 };
 
@@ -351,14 +345,6 @@ class ConnectionPool {
     }
   }
 
-  void ClearConnections() {
-    std::lock_guard<std::mutex> lk(mu);
-    for (auto& c : allConns) c->Close();
-    allConns.clear();
-    ready.clear();
-    pending.clear();
-  }
-
   // Promote a pending connection to ready once it becomes usable.
   void Promote(ConnectionState* raw) {
     if (!raw) return;
@@ -382,6 +368,10 @@ class ConnectionPool {
       shuttingDown = true;
       cv.notify_all();
     }
+    for (auto& c : allConns) c->Close();
+    allConns.clear();
+    ready.clear();
+    pending.clear();
   }
 
  private:
