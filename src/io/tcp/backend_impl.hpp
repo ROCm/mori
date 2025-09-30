@@ -34,28 +34,10 @@
 #include "mori/io/common.hpp"
 #include "mori/io/engine.hpp"
 #include "mori/io/logging.hpp"
+#include "src/io/tcp/common.hpp"
 
 namespace mori {
 namespace io {
-
-class TcpBackendSession : public BackendSession {
- public:
-  TcpBackendSession() = default;
-  TcpBackendSession(const MemoryDesc& local, const MemoryDesc& remote)
-      : local(local), remote(remote) {}
-  ~TcpBackendSession() = default;
-
-  void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
-                 TransferUniqueId id, bool isRead);
-  void BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
-                      const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
-                      bool isRead);
-  bool Alive() const { return true; }
-
- private:
-  MemoryDesc local{};
-  MemoryDesc remote{};
-};
 
 class TcpBackend : public Backend {
  public:
@@ -125,6 +107,25 @@ class TcpBackend : public Backend {
   std::unordered_map<SessionCacheKey, std::unique_ptr<TcpBackendSession>, SessionCacheKeyHash>
       sessionCache;
   std::mutex sessionCacheMu;
+};
+
+class TcpBackendSession : public BackendSession {
+ public:
+  TcpBackendSession(TcpBackend* backend, const MemoryDesc& local, const MemoryDesc& remote)
+      : backend(backend), local(local), remote(remote) {}
+  ~TcpBackendSession() = default;
+
+  void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
+                 TransferUniqueId id, bool isRead);
+  void BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                      const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
+                      bool isRead);
+  bool Alive() const { return true; }
+
+ private:
+  TcpBackend* backend{nullptr};
+  MemoryDesc local{};
+  MemoryDesc remote{};
 };
 
 }  // namespace io

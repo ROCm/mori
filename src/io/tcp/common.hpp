@@ -23,6 +23,7 @@
 #include <netinet/tcp.h>
 #include <sys/epoll.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -94,24 +95,21 @@ class ConnectionState {
   std::optional<TransferOp> recvOp;
 
   std::deque<TransferOp> sendQueue;                             // guarded by mu
-  std::unordered_map<TransferUniqueId, TransferOp> pendingOps;  // guarded by mu
+  std::unordered_map<TransferUniqueId, TransferOp> pendingOps;  // guarded by mu (WRITE ops)
 
-  void SubmitTransfer(TransferOp& op) {
+  // Queue a transfer (caller sets status->IN_PROGRESS beforehand).
+  void SubmitTransfer(TransferOp op) {
     std::scoped_lock lk(mu);
-    sendQueue.emplace_back(op);
-    auto it = pendingOps.find(op.id);
-    if (it == pendingOps.end()) {
-      auto inserted = pendingOps.emplace(op.id, std::move(op));
-    } else {
-      it->second = std::move(op);
-    }
+    sendQueue.emplace_back(std::move(op));
   }
 
-  TransferOp& PopTransfer() {
+  // Pop next transfer (by value). Returns empty optional if none.
+  std::optional<TransferOp> PopTransfer() {
     std::scoped_lock lk(mu);
-    assert(!sendQueue.empty());
+    if (sendQueue.empty()) return std::nullopt;
     TransferOp op = std::move(sendQueue.front());
     sendQueue.pop_front();
+    return op;
   }
 
   void Reset() noexcept {
