@@ -222,7 +222,7 @@ void Context::InitializePossibleTransports() {
     config.gidIdx = 3;
     config.maxMsgsNum = 4096;
 #ifdef ENABLE_BNXT
-    config.maxCqeNum = 1;
+    config.maxCqeNum = 4096;
 #else
     config.maxCqeNum = 4096;
 #endif
