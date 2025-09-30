@@ -143,14 +143,14 @@ void TcpBackend::WorkerLoop(WorkerContext* wctx) {
         while (read(wakeFd, &tmp, sizeof(tmp)) > 0) {
         }
         // Register any pending outbound connections (currently unused placeholder)
-        std::vector<std::shared_ptr<ConnectionState>> toAdd;
+        std::vector<ConnectionState*> toAdd;
         {
           std::lock_guard<std::mutex> lk(wctx->pendingAddMu);
           toAdd.swap(wctx->pendingAdd);
         }
-        for (auto& c : toAdd) {
+        for (auto* c : toAdd) {
           struct epoll_event cev{};
-          cev.data.ptr = c.get();
+          cev.data.ptr = c;
           cev.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLONESHOT;
           if (epoll_ctl(workerEpollFd, EPOLL_CTL_ADD, c->handle.fd, &cev) == -1) {
             MORI_IO_ERROR("TcpBackend: epoll_ctl ADD pending outbound fd failed: {}",
@@ -219,6 +219,7 @@ void TcpBackend::HandleNewConnection(application::TCPContext* listener_ctx, int 
     conn->ready.store(true, std::memory_order_release);
 
     std::lock_guard<std::mutex> lock(inConnsMu);
+    inboundConnections[ep.fd] = std::move(conn);
   }
 }
 
@@ -237,9 +238,8 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
   if (conn->recvState == ConnectionState::RecvState::PARSING_PAYLOAD) {
     auto& header = conn->pendingHeader;
     size_t sz = header.size;
-    switch (header.opcode) {
-      case 0:  // READ_REQ
-      {
+    switch (static_cast<OpType>(header.opcode)) {
+      case READ_REQ: {
         // Fetch memory meta
         MemoryDesc target{};
         {
@@ -249,8 +249,11 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
             MORI_IO_ERROR(
                 "tcp service: close fd {} reason=mem_not_found mem_id={} opcode={} size={} ",
                 conn->handle.fd, header.mem_id, (int)header.opcode, header.size);
+            std::lock_guard lk(inConnsMu);
+            inboundConnections.erase(conn->handle.fd);
             conn->Close();
             conn->Reset();
+
             return;
           }
           target = it->second;
@@ -266,6 +269,8 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
             MORI_IO_ERROR(
                 "tcp service: close fd {} reason=hipMemcpy_D2H_fail mem={} size={} errno={}",
                 conn->handle.fd, header.mem_id, sz, errno);
+            std::lock_guard lk(inConnsMu);
+            inboundConnections.erase(conn->handle.fd);
             conn->Close();
             conn->Reset();
             return;
@@ -285,6 +290,8 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
         if (ep.Send(&resp, sizeof(resp)) != 0) {
           MORI_IO_ERROR("TcpBackend: send write_req header failed on fd {}: {}", conn->handle.fd,
                         strerror(errno));
+          std::lock_guard lk(inConnsMu);
+          inboundConnections.erase(conn->handle.fd);
           conn->Close();
           conn->Reset();
           bufferPool.Release(std::move(block));
@@ -293,6 +300,8 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
         if (ep.Send(payload, sz) != 0) {
           MORI_IO_ERROR("TcpBackend: send write_req payload failed on fd {}: {}", conn->handle.fd,
                         strerror(errno));
+          std::lock_guard lk(inConnsMu);
+          inboundConnections.erase(conn->handle.fd);
           conn->Close();
           conn->Reset();
           bufferPool.Release(std::move(block));
@@ -300,13 +309,14 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
         bufferPool.Release(std::move(block));
 
       } break;
-      case 1:  // WRITE_REQ
-      {
+      case WRITE_REQ: {
         BufferBlock block = bufferPool.Acquire(sz);
         char* payload = block.data;
         if (ep.Recv(payload, sz) != 0) {
           MORI_IO_ERROR("tcp service: close fd {} reason=recv_payload_fail mem={} size={} errno={}",
                         conn->handle.fd, header.mem_id, sz, errno);
+          std::lock_guard lk(inConnsMu);
+          inboundConnections.erase(conn->handle.fd);
           conn->Close();
           conn->Reset();
           bufferPool.Release(std::move(block));
@@ -321,6 +331,8 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
           if (it == localMems.end()) {
             MORI_IO_ERROR("tcp service: close fd {} reason=mem_not_found(write) mem={} size={}",
                           conn->handle.fd, header.mem_id, sz);
+            std::lock_guard lk(inConnsMu);
+            inboundConnections.erase(conn->handle.fd);
             conn->Close();
             conn->Reset();
             bufferPool.Release(std::move(block));
@@ -335,6 +347,8 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
             MORI_IO_ERROR(
                 "tcp service: close fd {} reason=hipMemcpy_H2D_fail mem={} size={} errno={}",
                 conn->handle.fd, header.mem_id, sz, errno);
+            std::lock_guard lk(inConnsMu);
+            inboundConnections.erase(conn->handle.fd);
             conn->Close();
             conn->Reset();
             bufferPool.Release(std::move(block));
@@ -353,8 +367,7 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
         ep.Send(&resp, sizeof(resp));
         bufferPool.Release(std::move(block));
       } break;
-      case 2:  // READ RESP
-      {
+      case READ_RESP: {
         if (conn->recvOp == std::nullopt) {
           MORI_IO_ERROR("TcpBackend: unexpected READ RESP on fd {}", conn->handle.fd);
           conn->Close();
@@ -403,11 +416,9 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
         op.status->SetCode(StatusCode::SUCCESS);
         conn->recvOp.reset();
         bufferPool.Release(std::move(block));
-        connPools[op.remoteDest.engineKey]->ReleaseConnection(
-            std::shared_ptr<ConnectionState>(conn));
+        connPools[op.remoteDest.engineKey]->ReleaseConnection(conn);
       } break;
-      case 3:  // WRITE RESP
-      {
+      case WRITE_RESP: {
         std::lock_guard<std::mutex> lk(conn->mu);
         auto it = conn->pendingOps.find(header.id);
         if (it == conn->pendingOps.end()) {
@@ -417,8 +428,7 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
         TransferOp& op = it->second;
         op.status->SetCode(StatusCode::SUCCESS);
         conn->pendingOps.erase(it);
-        connPools[op.remoteDest.engineKey]->ReleaseConnection(
-            std::shared_ptr<ConnectionState>(conn));
+        connPools[op.remoteDest.engineKey]->ReleaseConnection(conn);
 
       } break;
       default: {
@@ -438,8 +448,7 @@ void TcpBackend::HandleWritable(ConnectionState* conn) {
   TransferOp op = std::move(*optOp);
   application::TCPEndpoint ep(conn->handle);
   switch (op.opType) {
-    case 0:  // READ_REQ
-    {
+    case READ_REQ: {
       TcpMessageHeader hdr{};
       hdr.opcode = 0;  // read_req or write_req
       hdr.id = op.id;
@@ -457,8 +466,7 @@ void TcpBackend::HandleWritable(ConnectionState* conn) {
       conn->recvState = ConnectionState::RecvState::PARSING_HEADER;
       // TODO: implement timeout for read response
     } break;
-    case 1:  // WRITE_REQ
-    {
+    case WRITE_REQ: {
       bool localIsGpu = (op.localDest.loc == MemoryLocationType::GPU);
       const char* sendPtr = nullptr;
       if (localIsGpu) {
@@ -597,7 +605,7 @@ void TcpBackend::EnsureConnections(const EngineDesc& rdesc, size_t minCount) {
   size_t existing = connPools[rdesc.key]->ConnectionCount();
   if (existing >= minCount) return;
   size_t toCreate = minCount - existing;
-  std::vector<std::shared_ptr<ConnectionState>> pending;
+  std::vector<ConnectionState*> pending;
   pending.reserve(toCreate);
   for (size_t i = 0; i < toCreate; ++i) {
     int sock = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -619,7 +627,7 @@ void TcpBackend::EnsureConnections(const EngineDesc& rdesc, size_t minCount) {
     }
     application::TCPEndpointHandle handle{sock, peer};
     SetSocketOptions(handle.fd);
-    auto connPtr = std::make_shared<ConnectionState>();
+    ConnectionState* connPtr = new ConnectionState();
     connPtr->recvState = ConnectionState::RecvState::PARSING_HEADER;
     connPtr->handle = handle;
     connPtr->listener = nullptr;
@@ -628,6 +636,7 @@ void TcpBackend::EnsureConnections(const EngineDesc& rdesc, size_t minCount) {
     if (workerCtxs.empty()) {
       MORI_IO_ERROR("TcpBackend: no worker contexts available for outbound connection");
       connPtr->Close();
+      delete connPtr;
       continue;
     }
     size_t idx = nextWorker.fetch_add(1, std::memory_order_relaxed) % workerCtxs.size();
@@ -703,7 +712,7 @@ void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
   }
 
   TransferOp op{localDest, localOffset, remoteSrc, remoteOffset, size, status, id};
-  op.opType = isRead ? 0 : 1;
+  op.opType = isRead ? READ_REQ : WRITE_REQ;
 
   auto connection = connPools[rdesc.key]->AcquireConnection();
   if (!connection) {

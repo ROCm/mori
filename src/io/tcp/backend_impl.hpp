@@ -96,6 +96,7 @@ class TcpBackend : public Backend {
   BufferPool bufferPool;
 
   std::mutex inConnsMu;
+  std::unordered_map<int, std::unique_ptr<ConnectionState>> inboundConnections;
   std::unordered_map<EngineKey, std::unique_ptr<ConnectionPool>> connPools;
   HipStreamPool hipStreams;
 
@@ -135,8 +136,8 @@ struct TcpBackend::WorkerContext {
   int epollFd{-1};
   int wakeFd{-1};  // eventfd used to wake epoll loop when new outbound conns pending
   size_t id{0};
-  std::mutex pendingAddMu;                                   // protects pendingAdd
-  std::vector<std::shared_ptr<ConnectionState>> pendingAdd;  // connections to add to epoll
+  std::mutex pendingAddMu;                   // protects pendingAdd
+  std::vector<ConnectionState*> pendingAdd;  // connections to add to epoll
 };
 
 }  // namespace io

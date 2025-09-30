@@ -267,22 +267,19 @@ class HipStreamPool {
 class ConnectionPool {
  public:
   ConnectionPool() = default;
-  ~ConnectionPool() {
-    Shutdown();
-    ClearConnections();
-  }
+  ~ConnectionPool() { Shutdown(); }
 
   // Non-blocking acquire (returns nullptr if none available)
-  std::shared_ptr<ConnectionState> GetNextConnection() {
+  ConnectionState* GetNextConnection() {
     std::lock_guard<std::mutex> lk(mu);
     if (ready.empty()) return nullptr;
-    auto conn = ready.front();
+    ConnectionState* conn = ready.front();
     ready.pop_front();
     return conn;
   }
 
   // Blocking acquire with optional timeout (default: wait indefinitely)
-  std::shared_ptr<ConnectionState> AcquireConnection(
+  ConnectionState* AcquireConnection(
       std::chrono::milliseconds timeout = std::chrono::milliseconds::max()) {
     std::unique_lock<std::mutex> lk(mu);
     auto pred = [this] { return shuttingDown || !ready.empty(); };
@@ -291,13 +288,13 @@ class ConnectionPool {
     else
       cv.wait_for(lk, timeout, pred);
     if (shuttingDown || ready.empty()) return nullptr;
-    auto conn = ready.front();
+    ConnectionState* conn = ready.front();
     ready.pop_front();
     return conn;
   }
 
   // Return a leased connection
-  void ReleaseConnection(std::shared_ptr<ConnectionState> conn) {
+  void ReleaseConnection(ConnectionState* conn) {
     if (!conn) return;
     std::lock_guard<std::mutex> lk(mu);
     if (shuttingDown) {
@@ -305,16 +302,16 @@ class ConnectionPool {
       return;
     }
     if (conn->ready.load(std::memory_order_acquire)) {
-      ready.push_back(std::move(conn));
+      ready.push_back(conn);
       cv.notify_one();
     } else {
-      pending.push_back(std::move(conn));
+      pending.push_back(conn);
     }
   }
 
-  void SetConnections(const std::vector<std::shared_ptr<ConnectionState>>& conns) {
+  void SetConnections(const std::vector<ConnectionState*>& conns) {
     std::lock_guard<std::mutex> lk(mu);
-    for (const auto& c : conns) {
+    for (auto* c : conns) {
       allConns.push_back(c);
       if (c->ready.load(std::memory_order_acquire))
         ready.push_back(c);
@@ -329,7 +326,7 @@ class ConnectionPool {
     return allConns.size();
   }
 
-  void RemoveConnection(std::shared_ptr<ConnectionState> conn) {
+  void RemoveConnection(ConnectionState* conn) {
     if (!conn) return;
     std::lock_guard<std::mutex> lk(mu);
     auto eraseOne = [&](auto& dq) {
@@ -341,6 +338,7 @@ class ConnectionPool {
     auto it = std::find(allConns.begin(), allConns.end(), conn);
     if (it != allConns.end()) {
       (*it)->Close();
+      delete *it;
       allConns.erase(it);
     }
   }
@@ -351,9 +349,9 @@ class ConnectionPool {
     std::lock_guard<std::mutex> lk(mu);
     // Find in pending; move to ready if found & marked ready.
     for (auto it = pending.begin(); it != pending.end(); ++it) {
-      if (it->get() == raw) {
-        if ((*it)->ready.load(std::memory_order_acquire)) {
-          ready.push_back(*it);
+      if (*it == raw) {
+        if (raw->ready.load(std::memory_order_acquire)) {
+          ready.push_back(raw);
           pending.erase(it);
           cv.notify_one();
         }
@@ -368,7 +366,12 @@ class ConnectionPool {
       shuttingDown = true;
       cv.notify_all();
     }
-    for (auto& c : allConns) c->Close();
+    for (auto* c : allConns) {
+      if (c) {
+        c->Close();
+        delete c;
+      }
+    }
     allConns.clear();
     ready.clear();
     pending.clear();
@@ -377,9 +380,9 @@ class ConnectionPool {
  private:
   std::mutex mu;
   std::condition_variable cv;
-  std::deque<std::shared_ptr<ConnectionState>> allConns;
-  std::deque<std::shared_ptr<ConnectionState>> ready;    // fully usable connections
-  std::deque<std::shared_ptr<ConnectionState>> pending;  // not yet ready (connect pending)
+  std::deque<ConnectionState*> allConns;
+  std::deque<ConnectionState*> ready;    // fully usable connections
+  std::deque<ConnectionState*> pending;  // not yet ready (connect pending)
   bool shuttingDown{false};
 };
 
