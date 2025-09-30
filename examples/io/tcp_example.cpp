@@ -102,6 +102,7 @@ int main(int argc, char** argv) {
 
   // Define cleanup lambda after resources & before any early returns
   auto cleanup = [&]() {
+    std::cout << "Starting cleanup" << std::endl;
     engineA.DeregisterMemory(memA);
     engineA.DeregisterMemory(memRoundtrip);
     engineB.DeregisterMemory(memB);
@@ -141,29 +142,7 @@ int main(int argc, char** argv) {
     std::cout << " (validation FAILED)";
   std::cout << std::endl;
 
-  if (auto sessOpt = engineA.CreateSession(memA, memB)) {
-    auto& sess = *sessOpt;
-    TransferStatus sessWriteStatus;
-    auto sessTid = sess.AllocateTransferUniqueId();
-    sessWriteStatus.SetCode(StatusCode::IN_PROGRESS);
-    const char* msg2 = "SessionWrite";
-    size_t len2 = std::strlen(msg2) + 1;
-    // Overwrite beginning of memA, then write to remote
-    std::memset(hostA.data(), 0, bufSize);
-    std::memcpy(hostA.data(), msg2, len2);
-    CheckHip(hipMemcpy(devA, hostA.data(), bufSize, hipMemcpyHostToDevice), "H2D copy devA msg2");
-    sess.Write(0, 0, len2, &sessWriteStatus, sessTid);
-    if (WaitForCompletion(&sessWriteStatus)) {
-      CheckHip(hipMemcpy(hostB.data(), devB, bufSize, hipMemcpyDeviceToHost), "D2H copy devB2");
-      std::cout << "[Session Write] EngineB buffer now: '" << hostB.data() << "'" << std::endl;
-    } else {
-      std::cout << "[Session Write] Incomplete status code=" << (unsigned)sessWriteStatus.Code()
-                << std::endl;
-    }
-  } else {
-    std::cout << "Session creation not available / failed (continuing)." << std::endl;
-  }
-
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
   cleanup();
   return 0;
 }

@@ -124,6 +124,9 @@ class ConnectionState {
     recvState = RecvState::PARSING_HEADER;
     pendingHeader = TcpMessageHeader{};
     complete = false;
+    headerBytesRead = 0;
+    payloadBytesRead = 0;
+    expectedPayloadSize = 0;
   }
 
   void Close() noexcept {
@@ -140,6 +143,21 @@ class ConnectionState {
   }
 
   std::mutex mu;
+
+  // New incremental parsing state (non-blocking ET)
+  size_t headerBytesRead{0};
+  size_t payloadBytesRead{0};
+  size_t expectedPayloadSize{0};
+  BufferBlock inboundPayload;  // Only used for WRITE_REQ or READ_RESP
+  int lastEpollFd{-1};
+
+  // Outgoing (write side) non-blocking send state
+  std::optional<TransferOp> activeSendOp;  // op currently being sent (header and maybe payload)
+  char outgoingHeader[sizeof(TcpMessageHeader)];
+  size_t headerBytesSent{0};
+  const char* payloadPtr{nullptr};
+  size_t payloadBytesTotal{0};
+  size_t payloadBytesSent{0};
 };
 
 class HipStreamPool {

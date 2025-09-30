@@ -59,6 +59,35 @@ int TCPEndpoint::Recv(void* buf, size_t len) {
   return 0;
 }
 
+// Non-blocking aware receive: tries to read up to len bytes, returns:
+//  >0 : number of bytes read (may be < len)
+//   0 : peer closed (EOF and nothing read this call)
+// -EAGAIN / -EWOULDBLOCK: would block and no bytes read
+// -errno (negative) : other system error
+int TCPEndpoint::RecvSomeExact(void* buf, size_t len) {
+  char* p = static_cast<char*>(buf);
+  size_t total = 0;
+  while (len > 0) {
+    ssize_t n = ::recv(handle.fd, p, len, 0);
+    if (n > 0) {
+      p += n;
+      len -= static_cast<size_t>(n);
+      total += static_cast<size_t>(n);
+      // Continue loop to drain as much as possible (ET semantics)
+      continue;
+    }
+    if (n == 0) {
+      // Peer closed; if we already read some bytes, return them (upper layer keeps state)
+      return total > 0 ? static_cast<int>(total) : 0;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      return total > 0 ? static_cast<int>(total) : -EAGAIN;
+    }
+    return -errno;  // real error
+  }
+  return static_cast<int>(total);
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           TCPContext                                           */
 /* ---------------------------------------------------------------------------------------------- */

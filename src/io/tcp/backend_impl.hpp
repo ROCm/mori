@@ -79,6 +79,7 @@ class TcpBackend : public Backend {
   void SetSocketOptions(int fd);
   void SetNonBlocking(int fd);
   void RearmSocket(int epoll_fd, ConnectionState* conn, uint32_t events);
+  void CloseInbound(ConnectionState* conn);
 
   void EnsureConnections(const EngineDesc& rdesc, size_t minCount);
   TcpBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);

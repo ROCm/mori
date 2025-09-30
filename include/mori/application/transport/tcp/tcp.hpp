@@ -48,6 +48,7 @@ class TCPEndpoint {
 
   int Send(const void* buf, size_t len);
   int Recv(void* buf, size_t len);
+  int RecvSomeExact(void* buf, size_t len);
 
  public:
   TCPEndpointHandle handle;
