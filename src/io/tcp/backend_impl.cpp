@@ -39,11 +39,7 @@ TcpBackend::TcpBackend(EngineKey key, const IOEngineConfig& engCfg, const TcpBac
 
   for (int i = 0; i < config.numWorkerThreads; ++i) {
     auto* listenctx = new application::TCPContext(engConfig.host, engConfig.port);
-    if (!listenctx->Listen()) {
-      MORI_IO_ERROR("TcpBackend: Listen failed for worker {}", i);
-      delete listenctx;
-      continue;
-    }
+    listenctx->Listen();
     int lfd = listenctx->GetListenFd();
     if (lfd <= 0) {
       MORI_IO_ERROR("TcpBackend: failed to get listen fd worker {}", i);
@@ -692,7 +688,23 @@ void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
 void TcpBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& localOffsets,
                                 const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
                                 const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
-                                bool isRead) {}
+                                bool isRead) {
+  if (sizes.empty()) {
+    status->SetCode(StatusCode::SUCCESS);
+    return;
+  }
+  // naive sequential
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    TransferStatus s;
+    ReadWrite(localDest, localOffsets[i], remoteSrc, remoteOffsets[i], sizes[i], &s, id, isRead);
+    if (s.Failed()) {
+      status->SetCode(s.Code());
+      status->SetMessage(s.Message());
+      return;
+    }
+  }
+  status->SetCode(StatusCode::SUCCESS);
+}
 
 BackendSession* TcpBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote) {
   return new TcpBackendSession(this, local, remote);

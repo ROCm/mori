@@ -68,8 +68,6 @@ class TcpBackend : public Backend {
   struct WorkerContext;
 
   // --- Core Asynchronous Engine ---
-  void StartThreads();
-  void StopThreads();
   void WorkerLoop(WorkerContext* wctx);
 
   // --- Event Handlers ---
@@ -81,10 +79,6 @@ class TcpBackend : public Backend {
   void SetSocketOptions(int fd);
   void SetNonBlocking(int fd);
   void RearmSocket(int epoll_fd, ConnectionState* conn, uint32_t events);
-
-  // --- GPU Resource Management ---
-  void InitializeGpuResources();
-  void CleanupGpuResources();
 
   void EnsureConnections(const EngineDesc& rdesc, size_t minCount);
   TcpBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
