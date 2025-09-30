@@ -335,6 +335,7 @@ inline __device__ T BlockPrefixSum(T val, size_t thdNum) {
 template <typename T, int VecBytes, int Unroll = 1>
 __forceinline__ __device__ void WarpBroadcast(T* const* __restrict__ dests, T* __restrict__ src,
                                               int nDests, size_t nelems) {
+  if (nDests == 0) return;
   int laneId = threadIdx.x & (warpSize - 1);
   size_t offset = 0;
   constexpr int vecSize = VecBytes / sizeof(T);
