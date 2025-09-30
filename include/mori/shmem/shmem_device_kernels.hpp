@@ -65,19 +65,17 @@ inline __device__ void ShmemAtomicSizeNonFetchWarpKernel(const application::Symm
                                                          core::atomicType amoType, int pe,
                                                          int qpId = 0);
 
-template <application::TransportType TsptType>
-inline __device__ void ShmemAtomicSizeFetchThreadKernel(
-    const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare,
-    size_t bytes, core::atomicType amoType, int pe, int qpId = 0);
+template <application::TransportType TsptType, typename T>
+inline __device__ T ShmemAtomicTypeFetchThreadKernel(const application::SymmMemObjPtr dest,
+                                                     size_t destOffset, void* val, void* compare,
+                                                     size_t bytes, core::atomicType amoType, int pe,
+                                                     int qpId = 0);
 
-template <application::TransportType TsptType>
-inline __device__ void ShmemAtomicSizeFetchWarpKernel(const application::SymmMemObjPtr dest,
-                                                      size_t destOffset,
-                                                      const application::RdmaMemoryRegion& source,
-                                                      size_t sourceOffset, void* val, void* compare,
-                                                      size_t bytes, core::atomicType amoType,
-                                                      int pe, int qpId = 0);
+template <application::TransportType TsptType, typename T>
+inline __device__ T ShmemAtomicTypeFetchWarpKernel(const application::SymmMemObjPtr dest,
+                                                   size_t destOffset, void* val, void* compare,
+                                                   size_t bytes, core::atomicType amoType, int pe,
+                                                   int qpId = 0);
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Synchronization                                        */

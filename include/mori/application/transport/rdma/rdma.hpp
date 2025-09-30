@@ -70,6 +70,9 @@ RdmaDeviceVendorId ToRdmaDeviceVendorId(T v) {
 // UDP sport configuration constants for multi-provider support
 static constexpr uint32_t RDMA_UDP_SPORT_ARRAY_SIZE = 4;
 
+// Atomic internal buffer configuration
+static constexpr size_t ATOMIC_IBUF_SLOT_SIZE = 8;  // Each atomic ibuf slot is 8 bytes
+
 /* -------------------------------------------------------------------------- */
 /*                             Rdma Data Structure                            */
 /* -------------------------------------------------------------------------- */
@@ -83,7 +86,7 @@ struct RdmaEndpointConfig {
   bool onGpu{false};
   bool withCompChannel{false};
   bool enableSrq{false};
-  size_t atomicIbufSize{4096};  // Size of atomic internal buffer, default 4KB
+  uint32_t atomicIbufSlots{512};  // Number of atomic internal buffer slots, each slot is 8B
 };
 
 struct InfiniBandEndpointHandle {
@@ -145,7 +148,7 @@ struct RdmaEndpoint {
   core::WorkQueueHandle wqHandle;
   core::CompletionQueueHandle cqHandle;
   core::IBVerbsHandle ibvHandle;
-  
+
   // Atomic internal buffer (ibuf) - independent MR for atomic operations
   core::IbufHandle atomicIbuf;
 
@@ -183,7 +186,8 @@ class RdmaDeviceContext {
   void ConnectEndpoint(const RdmaEndpoint& local, const RdmaEndpoint& remote, uint32_t qpId = 0) {
     ConnectEndpoint(local.handle, remote.handle, qpId);
   }
-  virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote, uint32_t qpId = 0) {
+  virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote,
+                               uint32_t qpId = 0) {
     assert(false && "not implemented");
   }
 
@@ -191,21 +195,21 @@ class RdmaDeviceContext {
 
   RdmaDevice* GetRdmaDevice();
   ibv_context* GetIbvContext();
-  ibv_pd* GetIbvPd() {return pd;}
+  ibv_pd* GetIbvPd() { return pd; }
   ibv_srq* GetIbvSrq() { return srq; }
-  
+
   uint16_t GetUdpSport(uint32_t qpId) const;
 
  protected:
   ibv_pd* pd{nullptr};
   ibv_srq* srq{nullptr};
-  
+
   // Shared UDP sport configuration for all RDMA providers
   uint16_t udp_sport_setting[RDMA_UDP_SPORT_ARRAY_SIZE];
-  
+
   // Initialize UDP sport configuration from environment variables
   void InitializeUdpSportConfiguration();
-  
+
  private:
   RdmaDevice* device;
   std::unordered_map<void*, ibv_mr*> mrPool;

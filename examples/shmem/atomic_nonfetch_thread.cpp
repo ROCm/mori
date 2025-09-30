@@ -105,7 +105,9 @@ void testAtomicNonFetchThread() {
 
   // Run atomic operations 10 times
   for (int iteration = 0; iteration < 10; iteration++) {
-    printf("========== Iteration %d ==========\n", iteration + 1);
+    if (myPe == 0) {
+      printf("========== Iteration %d ==========\n", iteration + 1);
+    }
 
     // Run uint64 atomic nonfetch
     myHipMemsetD64(buff, myPe, numEle);
@@ -156,9 +158,11 @@ void testAtomicNonFetchThread() {
     MPI_Barrier(MPI_COMM_WORLD);
     printf("after rank[%d] int32: %d %d\n", myPe, *(reinterpret_cast<int32_t*>(buff)),
            *(reinterpret_cast<int32_t*>(buff) + 2));
-
-    printf("Iteration %d completed\n", iteration + 1);
     MPI_Barrier(MPI_COMM_WORLD);  // Ensure all processes complete this iteration before next
+    if (myPe == 0) {
+      printf("Iteration %d completed\n", iteration + 1);
+    }
+    sleep(1);
   }
 
   // Finalize

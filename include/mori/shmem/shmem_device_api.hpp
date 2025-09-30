@@ -45,6 +45,20 @@ namespace shmem {
     assert(false);                                                                \
   }
 
+#define DISPATCH_TRANSPORT_DATA_TYPE_WITH_RETURN(func, pe, type, ...)               \
+  [&]() {                                                                           \
+    GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();                           \
+    application::TransportType transportType = globalGpuStates->transportTypes[pe]; \
+    if (transportType == application::TransportType::RDMA) {                        \
+      return func<application::TransportType::RDMA, type>(__VA_ARGS__);             \
+    } else if (transportType == application::TransportType::P2P) {                  \
+      return func<application::TransportType::P2P, type>(__VA_ARGS__);              \
+    } else {                                                                        \
+      assert(false);                                                                \
+      return type{};                                                                \
+    }                                                                               \
+  }()
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Synchronization                                        */
 /* ---------------------------------------------------------------------------------------------- */
@@ -225,40 +239,25 @@ DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int32, int32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int64, int64_t, Warp)
 
-#define SHMEM_ATOMIC_SIZE_FETCH_API_TEMPLATE(Scope)                                               \
-  inline __device__ void ShmemAtomicSizeFetch##Scope(                                             \
-      const application::SymmMemObjPtr dest, size_t destOffset,                                   \
-      const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare, \
-      size_t bytes, core::atomicType amoType, int pe, int qpId = 0) {                             \
-    DISPATCH_TRANSPORT_TYPE(ShmemAtomicSizeFetch##Scope##Kernel, pe, dest, destOffset, source,    \
-                            sourceOffset, val, compare, bytes, amoType, pe, qpId);                \
-  }
-
-SHMEM_ATOMIC_SIZE_FETCH_API_TEMPLATE(Thread)
-SHMEM_ATOMIC_SIZE_FETCH_API_TEMPLATE(Warp)
-
-#define SHMEM_ATOMIC_TYPE_FETCH_API_TEMPLATE(Scope)                                                \
-  template <typename T>                                                                            \
-  inline __device__ T ShmemAtomicTypeFetch##Scope(                                                 \
-      const application::SymmMemObjPtr dest, size_t destOffset,                                    \
-      const application::RdmaMemoryRegion& source, size_t sourceOffset, T val, T compare,          \
-      core::atomicType amoType, int pe, int qpId = 0) {                                            \
-    ShmemAtomicSizeFetch##Scope(dest, destOffset, source, sourceOffset, &val, &compare, sizeof(T), \
-                                amoType, pe, qpId);                                                \
-    uintptr_t fetchResultPtr = source.addr + sourceOffset;                                         \
-    return core::AtomicLoadRelaxedSystem<T>(reinterpret_cast<T*>(fetchResultPtr));                 \
+#define SHMEM_ATOMIC_TYPE_FETCH_API_TEMPLATE(Scope)                                              \
+  template <typename T>                                                                          \
+  inline __device__ T ShmemAtomicTypeFetch##Scope(                                               \
+      const application::SymmMemObjPtr dest, size_t destOffset, T val, T compare,                \
+      core::atomicType amoType, int pe, int qpId = 0) {                                          \
+    T result = DISPATCH_TRANSPORT_DATA_TYPE_WITH_RETURN(ShmemAtomicTypeFetch##Scope##Kernel, pe, \
+                                                        T, dest, destOffset, &val, &compare,     \
+                                                        sizeof(T), amoType, pe, qpId);           \
+    return result;                                                                               \
   }
 
 SHMEM_ATOMIC_TYPE_FETCH_API_TEMPLATE(Thread)
 SHMEM_ATOMIC_TYPE_FETCH_API_TEMPLATE(Warp)
 
-#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(TypeName, T, Scope)                                  \
-  inline __device__ T ShmemAtomic##TypeName##Fetch##Scope(                                      \
-      const application::SymmMemObjPtr dest, size_t destOffset,                                 \
-      const application::RdmaMemoryRegion& source, size_t sourceOffset, T val, T compare,       \
-      core::atomicType amoType, int pe, int qpId = 0) {                                         \
-    return ShmemAtomicTypeFetch##Scope<T>(dest, destOffset, source, sourceOffset, val, compare, \
-                                          amoType, pe, qpId);                                   \
+#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(TypeName, T, Scope)                                \
+  inline __device__ T ShmemAtomic##TypeName##Fetch##Scope(                                    \
+      const application::SymmMemObjPtr dest, size_t destOffset, T val, T compare,             \
+      core::atomicType amoType, int pe, int qpId = 0) {                                       \
+    return ShmemAtomicTypeFetch##Scope<T>(dest, destOffset, val, compare, amoType, pe, qpId); \
   }
 
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint32, uint32_t, Thread)

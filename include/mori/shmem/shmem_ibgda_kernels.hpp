@@ -71,6 +71,15 @@ namespace shmem {
     }                                                  \
   } while (0)
 
+#define DISPATCH_PROVIDER_TYPE_COMPILE_TIME_WITH_RETURN(func, type, ...) \
+  [&]() {                                                                \
+    if constexpr (DISPATCH_BNXT == 1) {                                  \
+      return func<core::ProviderType::BNXT, type>(__VA_ARGS__);          \
+    } else {                                                             \
+      return func<core::ProviderType::MLX5, type>(__VA_ARGS__);          \
+    }                                                                    \
+  }()
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Synchronization                                        */
 /* ---------------------------------------------------------------------------------------------- */
@@ -271,7 +280,6 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
   uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
   bool is_leader{my_logical_lane_id == num_active_lanes - 1};
   const uint64_t leader_phys_lane_id = core::GetLastActiveLaneID(activemask);
-  uint8_t num_wqes{num_active_lanes};
   uint32_t warp_sq_counter{0};
   uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
   uint32_t my_sq_counter{0}, my_msntbl_counter{0}, my_psn_counter{0};
@@ -282,13 +290,13 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
   }
   if (is_leader) {
     if constexpr (PrvdType == core::ProviderType::MLX5) {
-      warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_wqes, __ATOMIC_RELAXED,
+      warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
                                                __HIP_MEMORY_SCOPE_AGENT);
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-      core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, psnCnt * num_wqes,
+      core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, psnCnt * num_active_lanes,
                                           &warp_msntbl_counter, &warp_psn_counter);
       warp_sq_counter = warp_msntbl_counter;
-      __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
+      __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_AGENT);
     } else {
       assert(false);
@@ -338,13 +346,13 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
       db_touched = __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     } while (db_touched != warp_sq_counter);
 
-    core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_wqes);
+    core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
     // __threadfence_system();
     core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
     // __threadfence_system();
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
+    __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
                        __HIP_MEMORY_SCOPE_AGENT);
   }
   // __threadfence_system();
@@ -414,24 +422,23 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
   uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
   bool is_leader{my_logical_lane_id == num_active_lanes - 1};
   const uint64_t leader_phys_lane_id = core::GetLastActiveLaneID(activemask);
-  uint8_t num_wqes{num_active_lanes};
   uint32_t warp_sq_counter{0};
   uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
   uint32_t my_sq_counter{0}, my_msntbl_counter{0}, my_psn_counter{0};
 
   if constexpr (PrvdType == core::ProviderType::MLX5) {
     if (is_leader) {
-      warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_wqes, __ATOMIC_RELAXED,
+      warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
                                                __HIP_MEMORY_SCOPE_AGENT);
     }
     warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
     my_sq_counter = warp_sq_counter + my_logical_lane_id;
   } else if constexpr (PrvdType == core::ProviderType::BNXT) {
     if (is_leader) {
-      core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, num_wqes, &warp_msntbl_counter,
-                                          &warp_psn_counter);
+      core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, num_active_lanes,
+                                          &warp_msntbl_counter, &warp_psn_counter);
       warp_sq_counter = warp_msntbl_counter;
-      __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
+      __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_AGENT);
     }
     warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
@@ -476,13 +483,13 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
       db_touched = __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     } while (db_touched != warp_sq_counter);
 
-    core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_wqes);
+    core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
     // __threadfence_system();
     core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
     // __threadfence_system();
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
+    __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
                        __HIP_MEMORY_SCOPE_AGENT);
   }
   // __threadfence_system();
@@ -552,23 +559,20 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
   uint32_t warp_sq_counter = 0;
   uint32_t warp_msntbl_counter = 0, warp_psn_counter = 0;
   uint32_t my_sq_counter = 0, my_msntbl_counter = 0, my_psn_counter = 0;
-  uint8_t num_wqes;
 
   if constexpr (PrvdType == core::ProviderType::MLX5) {
-    num_wqes = num_active_lanes;
     if (is_leader) {
-      warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_wqes, __ATOMIC_RELAXED,
+      warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
                                                __HIP_MEMORY_SCOPE_AGENT);
     }
     warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
     my_sq_counter = warp_sq_counter + my_logical_lane_id;
   } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-    num_wqes = num_active_lanes;
     if (is_leader) {
-      core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, num_wqes, &warp_msntbl_counter,
-                                          &warp_psn_counter);
+      core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, num_active_lanes,
+                                          &warp_msntbl_counter, &warp_psn_counter);
       warp_sq_counter = warp_msntbl_counter;
-      __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
+      __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_AGENT);
     }
     warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
@@ -587,7 +591,7 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
     uint64_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     uint64_t num_active_sq_entries = db_touched - db_done;
     uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
-    uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_wqes - db_touched;
+    uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
     if (num_free_entries > num_entries_until_warp_last_entry) break;
     ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
   }
@@ -616,12 +620,12 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
       db_touched = __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     } while (db_touched != warp_sq_counter);
 
-    core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_wqes);
+    core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
     // __threadfence_system();
     core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
+    __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
                        __HIP_MEMORY_SCOPE_AGENT);
   }
 
@@ -666,23 +670,40 @@ inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportT
                                       bytes, amoType, pe, qpId);
 }
 
-template <core::ProviderType PrvdType>
-inline __device__ void ShmemAtomicSizeFetchThreadKernelImpl(
-    const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare,
-    size_t bytes, core::atomicType amoType, int pe, int qpId) {
-  if (bytes == 0) return;
-  uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
-  uintptr_t rkey = dest->peerRkeys[pe];
-  uintptr_t laddr = source.addr + sourceOffset;
-  uintptr_t lkey = source.lkey;
+inline __device__ uint32_t ShmemGetAtomicIbufSlot(core::IbufHandle* ibuf, uint32_t num_slots = 1) {
+  uint32_t base_slot = atomicAdd(&ibuf->head, num_slots);
+  uint32_t nslots = ibuf->nslots;
+  uint32_t last_slot = base_slot + num_slots;
+  while (last_slot - __hip_atomic_load(&ibuf->tail, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) >
+         nslots) {
+    ;
+  }
+  __threadfence_block();
+  return base_slot;
+}
 
+inline __device__ void ShmemReleaseAtomicIbufSlot(core::IbufHandle* ibuf, uint32_t base_slots,
+                                                  uint32_t num_slots) {
+  uint32_t last_slot = base_slots + num_slots;
+  while (atomicCAS(&ibuf->tail, base_slots, last_slot) != base_slots) {
+    ;
+  }
+  __threadfence_block();
+}
+
+template <core::ProviderType PrvdType, typename T>
+inline __device__ T ShmemAtomicTypeFetchThreadKernelImpl(const application::SymmMemObjPtr dest,
+                                                         size_t destOffset, void* val,
+                                                         void* compare, size_t bytes,
+                                                         core::atomicType amoType, int pe,
+                                                         int qpId) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
   uint32_t qpn = ep[epIndex].handle.qpn;
+  core::IbufHandle* ibuf = &ep[epIndex].atomicIbuf;
 
   uint64_t activemask = core::GetActiveLaneMask();
   uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
@@ -690,26 +711,34 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernelImpl(
   bool is_leader = (my_logical_lane_id == num_active_lanes - 1);
   uint64_t leader_phys_lane_id = core::GetLastActiveLaneID(activemask);
 
+  uint32_t base_slot = 0;
+  if (is_leader) {
+    base_slot = ShmemGetAtomicIbufSlot(ibuf, num_active_lanes);
+  }
+  uint32_t my_slot = __shfl(base_slot, leader_phys_lane_id) + my_logical_lane_id;
+  uint32_t my_slot_index = my_slot & (ibuf->nslots - 1);
+  uintptr_t laddr = ibuf->addr + (my_slot_index + 1) * application::ATOMIC_IBUF_SLOT_SIZE;
+  uintptr_t lkey = ibuf->lkey;
+  uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
+  uintptr_t rkey = dest->peerRkeys[pe];
+
   uint32_t warp_sq_counter = 0;
   uint32_t warp_msntbl_counter = 0, warp_psn_counter = 0;
   uint32_t my_sq_counter = 0, my_msntbl_counter = 0, my_psn_counter = 0;
-  uint8_t num_wqes;
 
   if constexpr (PrvdType == core::ProviderType::MLX5) {
-    num_wqes = num_active_lanes;
     if (is_leader) {
-      warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_wqes, __ATOMIC_RELAXED,
+      warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
                                                __HIP_MEMORY_SCOPE_AGENT);
     }
     warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
     my_sq_counter = warp_sq_counter + my_logical_lane_id;
   } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-    num_wqes = num_active_lanes;
     if (is_leader) {
-      core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, num_wqes, &warp_msntbl_counter,
-                                          &warp_psn_counter);
+      core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, num_active_lanes,
+                                          &warp_msntbl_counter, &warp_psn_counter);
       warp_sq_counter = warp_msntbl_counter;
-      __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
+      __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_AGENT);
     }
     warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
@@ -728,7 +757,7 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernelImpl(
     uint64_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     uint64_t num_active_sq_entries = db_touched - db_done;
     uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
-    uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_wqes - db_touched;
+    uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
     if (num_free_entries > num_entries_until_warp_last_entry) break;
     ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
   }
@@ -757,59 +786,80 @@ inline __device__ void ShmemAtomicSizeFetchThreadKernelImpl(
       db_touched = __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     } while (db_touched != warp_sq_counter);
 
-    core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_wqes);
+    core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
     // __threadfence_system();
     core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
+    __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
                        __HIP_MEMORY_SCOPE_AGENT);
   }
 
-  // __threadfence_system();
-  // ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
-}
+  ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
+  T ret = *reinterpret_cast<volatile T*>(laddr);
+  if (sizeof(T) == 4) ret = BSWAP32((uint32_t)ret);
 
-template <>
-inline __device__ void ShmemAtomicSizeFetchThreadKernel<application::TransportType::RDMA>(
-    const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare,
-    size_t bytes, core::atomicType amoType, int pe, int qpId) {
-  bool need_turn{true};
-  uint64_t turns = __ballot(need_turn);
-  while (turns) {
-    uint8_t lane = __ffsll((unsigned long long)turns) - 1;
-    int pe_turn = __shfl(pe, lane);
-    if (pe_turn == pe) {
-      DISPATCH_PROVIDER_TYPE_COMPILE_TIME(ShmemAtomicSizeFetchThreadKernelImpl, dest, destOffset,
-                                          source, sourceOffset, val, compare, bytes, amoType, pe,
-                                          qpId);
-      need_turn = false;
-    }
-    turns = __ballot(need_turn);
+  if (is_leader) {
+    ShmemReleaseAtomicIbufSlot(ibuf, base_slot, num_active_lanes);
   }
+
+  return ret;
 }
 
-template <core::ProviderType PrvdType>
-inline __device__ void ShmemAtomicSizeFetchWarpKernelImpl(
-    const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare,
-    size_t bytes, core::atomicType amoType, int pe, int qpId) {
+#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_THREAD_KERNEL(TypeName, T)                            \
+  template <>                                                                                \
+  inline __device__ T ShmemAtomicTypeFetchThreadKernel<application::TransportType::RDMA, T>( \
+      const application::SymmMemObjPtr dest, size_t destOffset, void* val, void* compare,    \
+      size_t bytes, core::atomicType amoType, int pe, int qpId) {                            \
+    bool need_turn{true};                                                                    \
+    uint64_t turns = __ballot(need_turn);                                                    \
+    T result{};                                                                              \
+    while (turns) {                                                                          \
+      uint8_t lane = __ffsll((unsigned long long)turns) - 1;                                 \
+      int pe_turn = __shfl(pe, lane);                                                        \
+      if (pe_turn == pe) {                                                                   \
+        result = DISPATCH_PROVIDER_TYPE_COMPILE_TIME_WITH_RETURN(                            \
+            ShmemAtomicTypeFetchThreadKernelImpl, T, dest, destOffset, val, compare, bytes,  \
+            amoType, pe, qpId);                                                              \
+        need_turn = false;                                                                   \
+      }                                                                                      \
+      turns = __ballot(need_turn);                                                           \
+    }                                                                                        \
+    return result;                                                                           \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_THREAD_KERNEL(Uint32, uint32_t)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_THREAD_KERNEL(Uint64, uint64_t)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_THREAD_KERNEL(Int32, int32_t)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_THREAD_KERNEL(Int64, int64_t)
+
+template <core::ProviderType PrvdType, typename T>
+inline __device__ T ShmemAtomicTypeFetchWarpKernelImpl(const application::SymmMemObjPtr dest,
+                                                       size_t destOffset, void* val, void* compare,
+                                                       size_t bytes, core::atomicType amoType,
+                                                       int pe, int qpId) {
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {
-    ShmemAtomicSizeFetchThreadKernelImpl<PrvdType>(dest, destOffset, source, sourceOffset, val,
-                                                   compare, bytes, amoType, pe, qpId);
+    return ShmemAtomicTypeFetchThreadKernelImpl<PrvdType, T>(dest, destOffset, val, compare, bytes,
+                                                             amoType, pe, qpId);
   }
+  return T{};
 }
 
-template <>
-inline __device__ void ShmemAtomicSizeFetchWarpKernel<application::TransportType::RDMA>(
-    const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare,
-    size_t bytes, core::atomicType amoType, int pe, int qpId) {
-  DISPATCH_PROVIDER_TYPE_COMPILE_TIME(ShmemAtomicSizeFetchWarpKernelImpl, dest, destOffset, source,
-                                      sourceOffset, val, compare, bytes, amoType, pe, qpId);
-}
+#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_WARP_KERNEL(TypeName, T)                                   \
+  template <>                                                                                     \
+  inline __device__ T ShmemAtomicTypeFetchWarpKernel<application::TransportType::RDMA, T>(        \
+      const application::SymmMemObjPtr dest, size_t destOffset, void* val, void* compare,         \
+      size_t bytes, core::atomicType amoType, int pe, int qpId) {                                 \
+    return DISPATCH_PROVIDER_TYPE_COMPILE_TIME_WITH_RETURN(ShmemAtomicTypeFetchWarpKernelImpl, T, \
+                                                           dest, destOffset, val, compare, bytes, \
+                                                           amoType, pe, qpId);                    \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_WARP_KERNEL(Uint32, uint32_t)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_WARP_KERNEL(Uint64, uint64_t)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_WARP_KERNEL(Int32, int32_t)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_WARP_KERNEL(Int64, int64_t)
 
 }  // namespace shmem
 }  // namespace mori

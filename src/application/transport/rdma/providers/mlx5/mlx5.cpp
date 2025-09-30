@@ -226,7 +226,7 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   assert(qpDbrUmem);
 
   // Allocate and register atomic internal buffer (ibuf)
-  atomicIbufSize = RoundUpPowOfTwo(config.atomicIbufSize);
+  atomicIbufSize = (RoundUpPowOfTwo(config.atomicIbufSlots) + 1) * ATOMIC_IBUF_SLOT_SIZE;
   if (config.onGpu) {
     HIP_RUNTIME_CHECK(hipMalloc(&atomicIbufAddr, atomicIbufSize));
     HIP_RUNTIME_CHECK(hipMemset(atomicIbufAddr, 0, atomicIbufSize));
@@ -242,9 +242,10 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
                                 IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
   assert(atomicIbufMr);
 
-  MORI_APP_TRACE("MLX5 Atomic ibuf allocated: addr=0x{:x}, size={}, lkey=0x{:x}, rkey=0x{:x}",
-                 reinterpret_cast<uintptr_t>(atomicIbufAddr), atomicIbufSize, atomicIbufMr->lkey,
-                 atomicIbufMr->rkey);
+  MORI_APP_TRACE(
+      "MLX5 Atomic ibuf allocated: addr=0x{:x}, slots={}, size={}, lkey=0x{:x}, rkey=0x{:x}",
+      reinterpret_cast<uintptr_t>(atomicIbufAddr), RoundUpPowOfTwo(config.atomicIbufSlots),
+      atomicIbufSize, atomicIbufMr->lkey, atomicIbufMr->rkey);
 
   // Allocate user access region
   qpUar = mlx5dv_devx_alloc_uar(context, MLX5DV_UAR_ALLOC_TYPE_NC);
@@ -527,7 +528,7 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   endpoint.atomicIbuf.addr = reinterpret_cast<uintptr_t>(qp->atomicIbufAddr);
   endpoint.atomicIbuf.lkey = qp->atomicIbufMr->lkey;
   endpoint.atomicIbuf.rkey = qp->atomicIbufMr->rkey;
-  endpoint.atomicIbuf.nslots = qp->atomicIbufSize / 8;  // number of 8-byte slots
+  endpoint.atomicIbuf.nslots = RoundUpPowOfTwo(config.atomicIbufSlots);
 
   cqPool.insert({cq->cqn, std::move(std::unique_ptr<Mlx5CqContainer>(cq))});
   qpPool.insert({qp->qpn, std::move(std::unique_ptr<Mlx5QpContainer>(qp))});
