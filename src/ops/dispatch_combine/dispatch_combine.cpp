@@ -70,7 +70,8 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
                              (config.hiddenDim * config.maxTokenTypeSize +
                               (sizeof(float) + sizeof(index_t)) * config.numExpertPerToken +
                               config.scaleDim * config.scaleTypeSize);
-  shmemInpTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
+  dispatchShmemInpTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
+  combineShmemInpTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
   shmemOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
   shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
 
@@ -90,7 +91,8 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
 }
 
 void EpDispatchCombineHandle::FinalizeShmemBuf() {
-  ShmemFree(shmemInpTokMemObj->localPtr);
+  ShmemFree(dispatchShmemInpTokMemObj->localPtr);
+  ShmemFree(combineShmemInpTokMemObj->localPtr);
   ShmemFree(shmemOutTokMemObj->localPtr);
   ShmemFree(shmemStagingTokMemObj->localPtr);
   ShmemFree(shmemInpWeightsMemObj->localPtr);
