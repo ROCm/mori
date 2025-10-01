@@ -90,12 +90,12 @@ class EpDispatchCombineOp:
         self._get_dispatch_receiver_token_idx_map_func = _cpp_dispatch_combine_factory(
             "get_dispatch_receiver_token_idx_map"
         )
-        self._get_registered_input_buffer = _cpp_dispatch_combine_factory(
-            "get_registered_input_buffer"
+        self._get_registered_combine_input_buffer = _cpp_dispatch_combine_factory(
+            "get_registered_combine_input_buffer"
         )
 
-    def get_registered_input_buffer(self, dtype: torch.dtype):
-        return self._get_registered_input_buffer(self._handle, dtype)
+    def get_registered_combine_input_buffer(self, dtype: torch.dtype):
+        return self._get_registered_combine_input_buffer(self._handle, dtype)
 
     def dispatch(
         self,

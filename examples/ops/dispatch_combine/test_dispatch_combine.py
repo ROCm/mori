@@ -244,7 +244,7 @@ class EpDispatchCombineTestCase:
             print("Dispatch Pass")
 
         total_recv_num_token = dispatch_recv_num_token[0].item()
-        combine_input = op.get_registered_input_buffer(self.config.data_type)
+        combine_input = op.get_registered_combine_input_buffer(self.config.data_type)
         combine_input[:total_recv_num_token, :].copy_(
             dispatch_output[:total_recv_num_token, :]
         )
