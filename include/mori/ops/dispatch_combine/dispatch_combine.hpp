@@ -169,7 +169,8 @@ class EpDispatchCombineHandle {
   uint8_t* scalesBuf{nullptr};
 
   // Registered buffers for tokens, shmemOutTokMemObj will be returned to user as output
-  mori::application::SymmMemObjPtr shmemInpTokMemObj;
+  mori::application::SymmMemObjPtr dispatchShmemInpTokMemObj;
+  mori::application::SymmMemObjPtr combineShmemInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
   mori::application::SymmMemObjPtr shmemStagingTokMemObj;
 
@@ -227,7 +228,8 @@ struct EpDispatchCombineArgs {
   T* outTokenBuf{nullptr};
   float* weightsBuf{nullptr};
   uint8_t* scalesBuf{nullptr};
-  mori::application::SymmMemObjPtr shmemInpTokMemObj;
+  mori::application::SymmMemObjPtr dispatchShmemInpTokMemObj;
+  mori::application::SymmMemObjPtr combineShmemInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
   mori::application::SymmMemObjPtr shmemStagingTokMemObj;
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
@@ -270,7 +272,8 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.scalesBuf = handle.scalesBuf;
   args.destPeTokenCounter = handle.destPeTokenCounter;
   args.localPeTokenCounter = handle.localPeTokenCounter;
-  args.shmemInpTokMemObj = handle.shmemInpTokMemObj;
+  args.dispatchShmemInpTokMemObj = handle.dispatchShmemInpTokMemObj;
+  args.combineShmemInpTokMemObj = handle.combineShmemInpTokMemObj;
   args.shmemOutTokMemObj = handle.shmemOutTokMemObj;
   args.shmemStagingTokMemObj = handle.shmemStagingTokMemObj;
   args.shmemInpWeightsMemObj = handle.shmemInpWeightsMemObj;
