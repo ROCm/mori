@@ -9,7 +9,7 @@ jobs:
         run: |
           pwd
           hostname
-          rm -rf mytest
+          rm -rf mori
           #git clone https://github.com/zhangfei829/mytest.git
           git clone https://github.com/ROCm/mori.git
           cd mori
