@@ -1,0 +1,37 @@
+name: mori
+on: push
+jobs:
+  build:
+    name: mori build
+    runs-on: label-1
+    steps:
+      - name: clone source code
+        run: |
+          pwd
+          hostname
+          rm -rf mytest
+          #git clone https://github.com/zhangfei829/mytest.git
+          git clone https://github.com/ROCm/mori.git
+          cd mori
+          git submodule update --init --recursive
+          pip3 install .
+          #make
+          ls
+  test:
+    name: mori test
+    runs-on: label-1
+    steps:
+        #- uses: actions/checkout@v4
+        #- name: Set up Python
+        #uses: actions/setup-python@v4
+        #with:
+                #python-version: '3.11'
+      #- run: pip install -r requirements.txt
+      - name: Run tests
+        run: |
+          cd mori
+          ls
+          #python test.py
+          #bash test.sh
+          export PYTHONPATH=/home/yutongwu/mori:$PYTHONPATH
+          python3 tests/python/ops/bench_dispatch_combine.py
