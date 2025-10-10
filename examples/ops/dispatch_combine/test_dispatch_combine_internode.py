@@ -254,8 +254,8 @@ class EpDispatchCombineTestCase:
             )
             # TODO: test output scales
 
-        if self.config.rank == 0:
-            print("Dispatch Pass")
+        if self.rank % self.gpu_per_node == 0:
+            print(f"Node {self.rank // self.gpu_per_node} Dispatch Pass")
 
         dist.barrier()
 
@@ -311,8 +311,8 @@ class EpDispatchCombineTestCase:
                     )
                 assert weight_match, f"Weight assertion failed for token {i}"
 
-        if self.config.rank == 0:
-            print("Combine Pass")
+        if self.rank % self.gpu_per_node == 0:
+            print(f"Node {self.rank // self.gpu_per_node} Combine Pass")
 
     def test_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)

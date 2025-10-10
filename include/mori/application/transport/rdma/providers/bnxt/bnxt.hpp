@@ -39,6 +39,9 @@ namespace mori {
 namespace application {
 
 #ifdef ENABLE_BNXT
+// BNXT UDP sport configuration constants
+static constexpr uint32_t BNXT_UDP_SPORT_ARRAY_SIZE = 4;
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Device Attributes                                       */
 /* ---------------------------------------------------------------------------------------------- */
@@ -73,26 +76,31 @@ class BnxtCqContainer {
   ibv_cq* cq{nullptr};
 };
 
+class BnxtDeviceContext;  // Forward declaration
+
 class BnxtQpContainer {
  public:
-  BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig& config, ibv_cq* cq, ibv_pd* pd);
+  BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig& config, ibv_cq* cq, ibv_pd* pd, BnxtDeviceContext* device_context);
   ~BnxtQpContainer();
 
   void ModifyRst2Init();
   void ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr,
-                      const ibv_device_attr_ex& deviceAttr);
+                      const ibv_device_attr_ex& deviceAttr, uint32_t qpId = 0);
   void ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
                      const RdmaEndpointHandle& remote_handle);
 
   void* GetSqAddress();
   void* GetMsntblAddress();
   void* GetRqAddress();
+  
+  BnxtDeviceContext* GetDeviceContext() { return device_context; }
 
  private:
   void DestroyQueuePair();
 
  public:
   ibv_context* context;
+  BnxtDeviceContext* device_context;
 
  public:
   RdmaEndpointConfig config;
@@ -110,6 +118,11 @@ class BnxtQpContainer {
   void* qpUar{nullptr};
   void* qpUarPtr{nullptr};
   ibv_qp* qp{nullptr};
+  
+  // Atomic internal buffer fields
+  void* atomicIbufAddr{nullptr};
+  size_t atomicIbufSize{0};
+  ibv_mr* atomicIbufMr{nullptr};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -122,7 +135,7 @@ class BnxtDeviceContext : public RdmaDeviceContext {
 
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) override;
   virtual void ConnectEndpoint(const RdmaEndpointHandle& local,
-                               const RdmaEndpointHandle& remote) override;
+                               const RdmaEndpointHandle& remote, uint32_t qpId = 0) override;
 
  private:
   uint32_t pdn;

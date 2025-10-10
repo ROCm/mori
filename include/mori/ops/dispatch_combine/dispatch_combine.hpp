@@ -184,6 +184,7 @@ class EpDispatchCombineHandle {
   // Record number of tokens that will be received from other PE
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
   mori::application::SymmMemObjPtr sendTokenNumMemObj;
+  mori::application::SymmMemObjPtr sendAtomicSignalMemObj;
 
   // Barrier for intra-grid synchronization
   uint32_t* dispatchGridBarrier{nullptr};
@@ -238,6 +239,7 @@ struct EpDispatchCombineArgs {
   mori::application::SymmMemObjPtr shmemOutIndicesMemObj;
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
   mori::application::SymmMemObjPtr sendTokenNumMemObj;
+  mori::application::SymmMemObjPtr sendAtomicSignalMemObj;
   uint32_t* dispatchGridBarrier{nullptr};
   uint32_t* combineGridBarrier{nullptr};
   index_t* destPeTokenCounter{nullptr};
@@ -281,6 +283,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.shmemOutIndicesMemObj = handle.shmemOutIndicesMemObj;
   args.recvTokenNumMemObj = handle.recvTokenNumMemObj;
   args.sendTokenNumMemObj = handle.sendTokenNumMemObj;
+  args.sendAtomicSignalMemObj = handle.sendAtomicSignalMemObj;
   args.dispatchGridBarrier = handle.dispatchGridBarrier;
   args.combineGridBarrier = handle.combineGridBarrier;
   args.dispReceiverIdxMap = handle.dispReceiverIdxMap;

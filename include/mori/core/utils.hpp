@@ -187,6 +187,11 @@ __device__ inline void AcquireLock(uint32_t* lockVar) {
   }
 }
 
+__device__ inline bool AcquireLockOnce(uint32_t* lockVar) {
+  return atomicCAS(lockVar, 0, 1) == 0;
+}
+
+
 __device__ inline void ReleaseLock(uint32_t* lockVar) { atomicExch(lockVar, 0); }
 
 }  // namespace core
