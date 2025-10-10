@@ -230,6 +230,9 @@ inline __device__ uint64_t Mlx5PostWriteInline(WorkQueueHandle& wq, uint32_t cur
   if (bytes == 4) {
     AtomicStoreRelaxed(reinterpret_cast<uint32_t*>(wqeDataPtr),
                        reinterpret_cast<uint32_t*>(val)[0]);
+  } else if (bytes == 8) {
+    AtomicStoreRelaxed(reinterpret_cast<uint64_t*>(wqeDataPtr),
+                       reinterpret_cast<uint64_t*>(val)[0]);
   } else {
     for (int i = 0; i < bytes; i++) {
       AtomicStoreRelaxed(reinterpret_cast<uint8_t*>(wqeDataPtr) + i,

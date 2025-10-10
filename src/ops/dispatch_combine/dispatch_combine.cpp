@@ -154,6 +154,9 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
 
   HIP_RUNTIME_CHECK(hipMalloc(&dispDestTokIdMap, maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispDestTokIdMap, 0, maxNumOutToken * sizeof(index_t)));
+
+  HIP_RUNTIME_CHECK(hipMalloc(&blockFlagCounter, sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMemset(blockFlagCounter, 0, sizeof(index_t)));
 }
 
 void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
@@ -167,6 +170,7 @@ void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
   ShmemFree(dispTokOffsetMemObj->localPtr);
   ShmemFree(dispTokIdToSrcTokIdMemObj->localPtr);
   HIP_RUNTIME_CHECK(hipFree(dispDestTokIdMap));
+  HIP_RUNTIME_CHECK(hipFree(blockFlagCounter));
 }
 
 void EpDispatchCombineHandle::InitializeBarrier() {
@@ -178,7 +182,7 @@ void EpDispatchCombineHandle::InitializeBarrier() {
   crossDeviceBarrierMemObj = ShmemMallocAndReturnMemObjPtr(barrierSize, hipDeviceMallocUncached);
 
   size_t recvTokenFlagSize =
-      config.worldSize / config.gpuPerNode * config.MaxNumTokensToRecvPerRank() * sizeof(index_t);
+      config.worldSize / config.gpuPerNode * config.MaxNumTokensToRecvPerRank() * sizeof(uint32_t);
   recvTokenFlagMemObj = ShmemMallocAndReturnMemObjPtr(recvTokenFlagSize, hipDeviceMallocUncached);
 }
 

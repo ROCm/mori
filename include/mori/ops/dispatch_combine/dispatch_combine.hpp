@@ -223,6 +223,7 @@ class EpDispatchCombineHandle {
   mori::application::SymmMemObjPtr recvTokenFlagMemObj;
   index_t* destNodeTokenCounter{nullptr};
   mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;
+  index_t* blockFlagCounter{nullptr};
 };
 
 template <typename T>
@@ -263,6 +264,7 @@ struct EpDispatchCombineArgs {
   mori::application::SymmMemObjPtr recvTokenFlagMemObj;
   index_t* destNodeTokenCounter{nullptr};
   mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;
+  index_t* blockFlagCounter{nullptr};
 };
 
 using EpDispatchCombineArgsVariant =
@@ -307,6 +309,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.recvTokenFlagMemObj = handle.recvTokenFlagMemObj;
   args.destNodeTokenCounter = handle.destNodeTokenCounter;
   args.nodeRecvTokenNumMemObj = handle.nodeRecvTokenNumMemObj;
+  args.blockFlagCounter = handle.blockFlagCounter;
   return args;
 }
 
