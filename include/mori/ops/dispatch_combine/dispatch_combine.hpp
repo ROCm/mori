@@ -86,7 +86,8 @@ struct EpDispatchCombineConfig {
   int numExpertPerToken{2};
   int warpNumPerBlock{1};
   int blockNum{1};
-  int maxRDMAStepTokens{30};
+  int maxRDMAStepTokens{64};
+  int maxP2PStepTokens{32};
   int kernelType{KernelType::IntraNode};
   // If true, use external buffer which incurs extra copy overhead; otherwise, the kernel assumes
   // the provided buffer is shmemInpTokMemObj
@@ -382,6 +383,7 @@ static std::ostream& operator<<(std::ostream& s, mori::moe::EpDispatchCombineCon
      << "  warpNumPerBlock: " << config.warpNumPerBlock << std::endl
      << "  blockNum: " << config.blockNum << std::endl
      << "  maxRDMAStepTokens: " << config.maxRDMAStepTokens << std::endl
+     << "  maxP2PStepTokens: " << config.maxP2PStepTokens << std::endl
      << "  kernelType: " << config.kernelType;
   s << ss.str();
   return s;

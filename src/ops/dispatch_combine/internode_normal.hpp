@@ -95,6 +95,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
   // TODO maxRDMAStagingTokens 是RDMA从某一个node收发数据的最大值；maxP2PStagingTokens是转发数据上限
   // TODO staging buffer每个channel不能小于maxNumRDMASendTokens？
   const int stepRDMATokens = config.maxRDMAStepTokens;
+  const int stepP2pTokens = stepRDMATokens;
   // if (blockId==0 && thdId == 0) {
   //   printf("nlocalPes=%d stepRDMATokens=%d\n", nlocalPes, stepRDMATokens);
   // }
@@ -107,7 +108,6 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
       ((maxTokensPerChannel + stepRDMATokens - 1) / stepRDMATokens) * stepRDMATokens;
   const size_t maxRDMASteps = maxRDMAStagingTokens / stepRDMATokens;
 
-  const int maxNumP2pSendTokens = 32;
   const size_t maxP2PStagingTokens = maxTokensPerChannel * nNodes;
 
   // TODO uodate localPeBuf size
@@ -201,19 +201,19 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           }
 
           uint64_t syncTailCache = __shfl(tailCache, destNode);
-          // for RDMA, tailCache save send step
-          size_t srcStagingOffset = ((channelId * nNodes + destNode) * maxRDMAStagingTokens +
-                                     (syncTailCache % maxRDMASteps) * stepRDMATokens) *
-                                    tokenPackBytes;
-          size_t dstStagingOffset = ((channelId * nNodes + myNode) * maxRDMAStagingTokens +
-                                     (syncTailCache % maxRDMASteps) * stepRDMATokens) *
-                                    tokenPackBytes;
 #if ASSERT_ON == 1
           assert(sendTokenNum > 0);
 #endif
 
 #if SEND_DATA == 1
           if (destNode != myNode) {
+            // for RDMA, tailCache save send step
+            size_t srcStagingOffset = ((channelId * nNodes + destNode) * maxRDMAStagingTokens +
+                                       (syncTailCache % maxRDMASteps) * stepRDMATokens) *
+                                      tokenPackBytes;
+            size_t dstStagingOffset = ((channelId * nNodes + myNode) * maxRDMAStagingTokens +
+                                       (syncTailCache % maxRDMASteps) * stepRDMATokens) *
+                                      tokenPackBytes;
             // if (laneId == destNode) {
             shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemInpTokMemObj, dstStagingOffset,
                                                 args.shmemStagingTokMemObj, srcStagingOffset,
@@ -229,25 +229,25 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
 #endif
             // }
             shmem::ShmemQuietThread();
+#if DEBUG_DATA == 1
+            if (laneId == 0) {
+#if ASSERT_ON == 1
+              // assert(float(*((T*)(args.shmemStagingTokMemObj->template GetAs<char*>() +
+              //                     srcStagingOffset) +
+              //                1)) == tokenCheckValue(myPe, 0));
+              assert(float(*((T*)(args.shmemStagingTokMemObj->template GetAs<char*>() +
+                                  srcStagingOffset) +
+                             1)) != float(0));
+#endif
+              // printf("DATA CHECK SEND RDMA PUT destNode=%d step=%lu srcData=%f\n", destNode,
+              //        tailCache,
+              //        float(*((T*)(args.shmemStagingTokMemObj->template GetAs<char*>() +
+              //                     srcStagingOffset))));
+            }
+#endif
           }
 #endif
 
-#if DEBUG_DATA == 1
-          if (laneId == 0) {
-#if ASSERT_ON == 1
-            // assert(float(*((T*)(args.shmemStagingTokMemObj->template GetAs<char*>() +
-            //                     srcStagingOffset) +
-            //                1)) == tokenCheckValue(myPe, 0));
-            assert(float(*((T*)(args.shmemStagingTokMemObj->template GetAs<char*>() +
-                                srcStagingOffset) +
-                           1)) != float(0));
-#endif
-            // printf("DATA CHECK SEND RDMA PUT destNode=%d step=%lu srcData=%f\n", destNode,
-            //        tailCache,
-            //        float(*((T*)(args.shmemStagingTokMemObj->template GetAs<char*>() +
-            //                     srcStagingOffset))));
-          }
-#endif
           if (laneId == destNode) {
             numTokensToSend -= sendTokenNum;
             sendSlotStart += sendTokenNum;
@@ -493,7 +493,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         }
 
         // check RDMA data ready (shmemInpTokMemObj), wait data from same-id GPU
-        while(true){
+        while (true) {
           srcNode = (srcNode - 1 + nNodes) % nNodes;
           int srcPe = srcNode * nlocalPes + myLocalPe;
           syncNumTokensToRecv = __shfl(numTokensToRecv, srcNode);
@@ -609,32 +609,37 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
               //     step, slot, float(*((T*)(srcPtr))), p2pTailCache,
               //     p2pTailCache % maxP2PStagingTokens);
 #endif
+              ++p2pTailCache;
+              if (syncNumTokensToRecv == 0 || p2pTailCache - lastP2pTail >= stepP2pTokens) {
+                __threadfence_system();
+                // Update p2p tail
+                if (laneId == 0) {
+                  __hip_atomic_store(
+                      args.tailMemObj->template GetAs<uint64_t*>(fwdPe) + channelId * npes + myPe,
+                      p2pTailCache, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                }
+                lastP2pTail = p2pTailCache;
+#if DEBUG == 1
+                printf(
+                    "recv fwd after rank=%d ch=%d warpId=%d fwdPe=%d p2p tail=%lu\n", myPe,
+                    channelId, warpId, fwdPe,
+                    *(args.tailMemObj->template GetAs<uint64_t*>(fwdPe) + channelId * npes + myPe));
+#endif
+              }
             }
 #endif
 
-            ++p2pTailCache, ++fwdCounter;
+            ++fwdCounter;
+          }
+
+          if (laneId == srcNode) {
+            headCache = tailCache;
+            fwdHead[fwdLocalPe][srcNode] = headCache - headBase;
           }
         }
-        __threadfence_system();
-        // TODO add content in comment
-        if (laneId == 0 && fwdPe != myPe /*&&
-            (numTokensToRecv == 0 || p2pTailCache - lastP2pTail >= maxNumP2pSendTokens)*/) {
-          // Update p2p tail
-          __hip_atomic_store(
-              args.tailMemObj->template GetAs<uint64_t*>(fwdPe) + channelId * npes + myPe,
-              p2pTailCache, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-          lastP2pTail = p2pTailCache;
-#if DEBUG == 1
-          printf("recv fwd after rank=%d ch=%d warpId=%d fwdPe=%d p2p tail=%lu\n", myPe, channelId,
-                 warpId, fwdPe,
-                 *(args.tailMemObj->template GetAs<uint64_t*>(fwdPe) + channelId * npes + myPe));
-#endif
-        }
-        if (laneId == srcNode) {
-          headCache = tailCache;
-          fwdHead[fwdLocalPe][srcNode] = headCache - headBase;
-        }
       }
+
+      // Set intra-node forward finished flag
       if (fwdLocalPe != myLocalPe) {
         int* statusPtr =
             args.intraNodeBarrierMemObj->template GetAs<int*>(fwdPe) + myPe + channelId * npes;
@@ -808,7 +813,6 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
 #endif
           }
 #endif
-
         }
         p2pHeadCache = p2pTailCache;
         // Update p2p head

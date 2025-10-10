@@ -46,7 +46,8 @@ class EpDispatchCombineConfig:
     warp_num_per_block: int = 8
     block_num: int = 80
     num_gpus_per_node: int = 8
-    max_rdma_step_tokens: int = 30
+    max_rdma_step_tokens: int = 64
+    max_p2p_step_tokens: int = 32
     use_external_inp_buf: bool = True
     kernel_type: EpDispatchCombineKernelType = EpDispatchCombineKernelType.IntraNode
 
@@ -75,6 +76,7 @@ class EpDispatchCombineOp:
                 warp_num_per_block=config.warp_num_per_block,
                 block_num=config.block_num,
                 max_rdma_step_tokens=config.max_rdma_step_tokens,
+                max_p2p_step_tokens=config.max_p2p_step_tokens,
                 kernel_type=config.kernel_type,
                 use_external_inp_buf=config.use_external_inp_buf,
             )
