@@ -196,8 +196,9 @@ application::RdmaDeviceContext* RdmaManager::GetOrCreateDeviceContext(int devId)
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      Notification Manager                                      */
 /* ---------------------------------------------------------------------------------------------- */
-NotifManager::NotifManager(RdmaManager* rdmaMgr, const RdmaBackendConfig& cfg)
-    : rdma(rdmaMgr), config(cfg) {}
+NotifManager::NotifManager(RdmaManager* rdmaMgr, const RdmaBackendConfig& cfg,
+                           Backend* ownerBackend)
+    : rdma(rdmaMgr), config(cfg), owner(ownerBackend) {}
 
 NotifManager::~NotifManager() { Shutdown(); }
 
@@ -250,7 +251,8 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
   ibv_cq* cq = ep.local.ibvHandle.cq;
 
   struct ibv_wc wc{};
-  while (ibv_poll_cq(cq, 1, &wc) > 0) {
+  int rc = 0;
+  while ((rc = ibv_poll_cq(cq, 1, &wc)) > 0) {
     if (wc.opcode == IBV_WC_RECV) {
       std::lock_guard<std::mutex> lock(mu);
       int devId = ep.ldevId;
@@ -305,6 +307,41 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
           msg->meta->status->SetMessage(ibv_wc_status_str(wc.status));
           // set status to nullptr indicate that transfer failed
           msg->meta->status = nullptr;
+          // Error reporting hook: map wc.status to Backend::ErrorRecord severity.
+          Backend::ErrorRecord rec{};
+          rec.vendor_err = wc.vendor_err;
+          rec.msg = ibv_wc_status_str(wc.status);
+          switch (wc.status) {
+            case IBV_WC_SUCCESS:
+              rec.code = Backend::ErrorCode::Ok;
+              rec.severity = Backend::Severity::Info;
+              break;
+            case IBV_WC_RNR_RETRY_EXC_ERR:
+              rec.code = Backend::ErrorCode::Transient;
+              rec.severity = Backend::Severity::Recoverable;
+              break;
+            case IBV_WC_RETRY_EXC_ERR:
+              rec.code = Backend::ErrorCode::Transient;
+              rec.severity = Backend::Severity::Recoverable;
+              break;
+            case IBV_WC_RESP_TIMEOUT_ERR:
+              rec.code = Backend::ErrorCode::Timeout;
+              rec.severity = Backend::Severity::Recoverable;
+              break;
+            case IBV_WC_LOC_PROT_ERR:
+              rec.code = Backend::ErrorCode::Protection;
+              rec.severity = Backend::Severity::Fatal;
+              break;
+            case IBV_WC_REM_OP_ERR:
+              rec.code = Backend::ErrorCode::RemoteDisconnect;
+              rec.severity = Backend::Severity::Recoverable;  // may escalate if frequent
+              break;
+            default:
+              rec.code = Backend::ErrorCode::Internal;
+              rec.severity = Backend::Severity::Fatal;
+              break;
+          }
+          if (owner) owner->report_error(rec);
         }
       }
       MORI_IO_TRACE(
@@ -317,6 +354,14 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
       }
       free(msg);
     }
+  }
+  if (rc < 0) {
+    // ibv_poll_cq error path: record as fatal CQPollFailed
+    Backend::ErrorRecord rec{};
+    rec.code = Backend::ErrorCode::CQPollFailed;
+    rec.severity = Backend::Severity::Fatal;
+    rec.msg = "ibv_poll_cq failed";
+    if (owner) owner->report_error(rec);
   }
 }
 
@@ -632,7 +677,7 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
       new application::RdmaContext(application::RdmaBackendType::IBVerbs);
   rdma.reset(new mori::io::RdmaManager(beConfig, ctx));
 
-  notif.reset(new NotifManager(rdma.get(), beConfig));
+  notif.reset(new NotifManager(rdma.get(), beConfig, this));
   notif->Start();
 
   server.reset(

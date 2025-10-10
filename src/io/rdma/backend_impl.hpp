@@ -103,7 +103,7 @@ class RdmaManager {
 /* ---------------------------------------------------------------------------------------------- */
 class NotifManager {
  public:
-  NotifManager(RdmaManager*, const RdmaBackendConfig&);
+  NotifManager(RdmaManager*, const RdmaBackendConfig&, Backend* ownerBackend);
   ~NotifManager();
 
   void RegisterEndpointByQpn(uint32_t qpn);
@@ -128,6 +128,7 @@ class NotifManager {
   std::atomic<bool> running{false};
   std::thread thd;
   RdmaManager* rdma;
+  Backend* owner{nullptr};
 
   // Notification context
  private:

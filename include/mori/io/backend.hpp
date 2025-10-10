@@ -149,6 +149,77 @@ class Backend {
   // Take the transfer status of an inbound op
   virtual bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                         TransferStatus* status) = 0;
+  // Health querying (default: Healthy if backend doesn't override)
+  enum class Health : uint8_t { Healthy = 0, Degraded = 1, Failed = 2 };
+  enum class ErrorCode : uint8_t {
+    Ok = 0,
+    Transient,
+    Timeout,
+    Protection,
+    RemoteDisconnect,
+    CQPollFailed,
+    Internal
+  };
+  enum class Severity : uint8_t { Info = 0, Recoverable = 1, Fatal = 2 };
+  struct ErrorRecord {
+    ErrorCode code{ErrorCode::Ok};
+    Severity severity{Severity::Info};
+    int vendor_err{0};
+    const char* msg{nullptr};
+  };
+  virtual Health health() const noexcept { return health_.load(std::memory_order_acquire); }
+
+ protected:
+  void report_error(const ErrorRecord& rec) noexcept {
+    // if fatal -> Failed; if recoverable and previously healthy -> Degraded.
+    if (rec.severity == Severity::Fatal) {
+      health_.store(Health::Failed, std::memory_order_release);
+    } else if (rec.severity == Severity::Recoverable) {
+      auto now_ms = []() -> int64_t {
+        using namespace std::chrono;
+        return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+      }();
+      const auto& th = thresholds();
+      Health cur = health_.load(std::memory_order_acquire);
+      if (cur == Health::Healthy) {
+        health_.compare_exchange_strong(cur, Health::Degraded, std::memory_order_acq_rel);
+      }
+      int64_t start = recoverable_window_start_ms_.load(std::memory_order_acquire);
+      if (start == 0 || now_ms - start > static_cast<int64_t>(th.recoverable_window_ms)) {
+        recoverable_window_start_ms_.store(now_ms, std::memory_order_release);
+        recoverable_window_count_.store(1, std::memory_order_release);
+      } else {
+        uint32_t cnt = recoverable_window_count_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (cnt >= th.recoverable_fail_threshold) {
+          health_.store(Health::Failed, std::memory_order_release);
+        }
+      }
+    }
+    on_error(rec);
+  }
+
+  // Optional override point (placed after existing virtuals to reduce ABI disturbance risk)
+  virtual void on_error(const ErrorRecord&) {}
+
+ private:
+  std::atomic<Health> health_{Health::Healthy};
+  // Recoverable error escalation window tracking
+  std::atomic<uint32_t> recoverable_window_count_{0};
+  std::atomic<int64_t> recoverable_window_start_ms_{0};
+
+  struct Thresholds {
+    uint32_t recoverable_fail_threshold{50};
+    uint32_t recoverable_window_ms{30000};
+  };
+  static void ConfigureErrorThresholds(uint32_t failThreshold, uint32_t windowMs) {
+    auto& t = thresholds();
+    t.recoverable_fail_threshold = failThreshold;
+    t.recoverable_window_ms = windowMs;
+  }
+  static Thresholds& thresholds() {
+    static Thresholds t{};
+    return t;
+  }
 };
 
 }  // namespace io

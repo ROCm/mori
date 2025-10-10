@@ -40,6 +40,11 @@ struct IOEngineConfig {
   // Out of band TCP network configuration
   std::string host;
   uint16_t port;
+  // Fallback configuration
+  bool enableFallback{false};
+  // Recoverable error escalation thresholds (applied to all backends that honor them)
+  uint32_t recoverableFailThreshold{50};
+  uint32_t recoverableWindowMs{30000};
 };
 
 class IOEngine;

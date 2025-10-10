@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "mori/io/engine.hpp"
 
+#include "mori/io/fallback_backend.hpp"
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/tcp/backend_impl.hpp"
@@ -89,6 +90,7 @@ IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
   desc.hostname = std::string(hostname);
   desc.host = config.host;
   desc.port = config.port;
+  Backend::ConfigureErrorThresholds(config.recoverableFailThreshold, config.recoverableWindowMs);
   MORI_IO_INFO("Create engine key {} hostname {} host {}, port {}", key, hostname, config.host,
                config.port);
 }
@@ -96,16 +98,30 @@ IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
 IOEngine::~IOEngine() {}
 
 void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
+  // If fallback desired we create only once when RDMA requested and TCP config available later
   if (type == BackendType::RDMA) {
     assert(backends.find(type) == backends.end());
-    backends.insert({type, std::make_unique<RdmaBackend>(
-                               desc.key, config, static_cast<const RdmaBackendConfig&>(beConfig))});
+    if (config.enableFallback && backends.find(BackendType::TCP) != backends.end()) {
+      auto tcpPtr = std::move(backends[BackendType::TCP]);
+      backends.erase(BackendType::TCP);
+      auto rdmaPtr = std::make_unique<RdmaBackend>(desc.key, config,
+                                                   static_cast<const RdmaBackendConfig&>(beConfig));
+      auto fallback = std::make_unique<FallbackBackend>(std::move(rdmaPtr), std::move(tcpPtr));
+      backends.insert({BackendType::RDMA, std::move(fallback)});
+      MORI_IO_INFO("IOEngine: created RDMA+TCP fallback backend (config.enableFallback=true)");
+    } else {
+      backends.insert(
+          {type, std::make_unique<RdmaBackend>(desc.key, config,
+                                               static_cast<const RdmaBackendConfig&>(beConfig))});
+    }
   } else if (type == BackendType::TCP) {
+    // If fallback not yet formed, just insert. When RDMA later requested with env var, we'll wrap.
     assert(backends.find(type) == backends.end());
     backends.insert({type, std::make_unique<TcpBackend>(
                                desc.key, config, static_cast<const TcpBackendConfig&>(beConfig))});
-  } else
+  } else {
     assert(false && "not implemented");
+  }
   MORI_IO_INFO("Create backend type {}", static_cast<uint32_t>(type));
 }
 
