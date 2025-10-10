@@ -70,6 +70,10 @@ inline __device__ void ShmemQuietThread(int pe) {
   DISPATCH_TRANSPORT_TYPE(ShmemQuietThreadKernel, pe, pe);
 }
 
+inline __device__ void ShmemQuietThread(int pe, int qpId) {
+  DISPATCH_TRANSPORT_TYPE(ShmemQuietThreadKernel, pe, pe, qpId);
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Point-to-Point                                         */
 /* ---------------------------------------------------------------------------------------------- */

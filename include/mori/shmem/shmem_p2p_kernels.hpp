@@ -366,6 +366,9 @@ template <>
 inline __device__ void ShmemQuietThreadKernel<application::TransportType::P2P>() {}
 
 template <>
+inline __device__ void ShmemQuietThreadKernel<application::TransportType::P2P>(int pe) {}
+
+template <>
 inline __device__ void ShmemQuietThreadKernel<application::TransportType::P2P>(int pe, int qpId) {}
 
 }  // namespace shmem
