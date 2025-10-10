@@ -427,7 +427,14 @@ class MoriIoStress:
             st = func(offsets_src, offsets_dst, sizes, uid)
         else:
             func = self.engine.batch_read if is_read else self.engine.batch_write
-            st = func(self.mem, offsets_src, self.target_mem, offsets_dst, sizes, uid)
+            st = func(
+                [self.mem],
+                [offsets_src],
+                [self.target_mem],
+                [offsets_dst],
+                [sizes],
+                [uid],
+            )[0]
 
         while st.InProgress():
             time.sleep(0.00005)

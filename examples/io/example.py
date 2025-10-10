@@ -77,13 +77,13 @@ def batch_read_write_example(initiator, target, size, batch_size):
     # Perform batch p2p transfer from initiator to target
     transfer_uid = initiator.allocate_transfer_uid()
     transfer_status = initiator.batch_read(
-        initiator_mem,
-        local_offsets,
-        target_mem,
-        remote_offsets,
-        sizes,
-        transfer_uid,
-    )
+        [initiator_mem],
+        [local_offsets],
+        [target_mem],
+        [remote_offsets],
+        [sizes],
+        [transfer_uid],
+    )[0]
 
     while transfer_status.InProgress():
         pass
