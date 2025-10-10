@@ -95,7 +95,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
   // TODO maxRDMAStagingTokens 是RDMA从某一个node收发数据的最大值；maxP2PStagingTokens是转发数据上限
   // TODO staging buffer每个channel不能小于maxNumRDMASendTokens？
   const int stepRDMATokens = config.maxRDMAStepTokens;
-  const int stepP2pTokens = stepRDMATokens;
+  const int stepP2pTokens = config.maxP2PStepTokens;
   // if (blockId==0 && thdId == 0) {
   //   printf("nlocalPes=%d stepRDMATokens=%d\n", nlocalPes, stepRDMATokens);
   // }
