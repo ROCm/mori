@@ -25,7 +25,8 @@ jobs:
           for cmd in $(which -a cmake); do
             echo "   $cmd: $($cmd --version | head -n1)"
           done
-          echo "5. 当前 shell: $SHELL"    
+          echo "5. 当前 shell: $SHELL"
+          sudo -i    
           rm -rf mori
           #git clone https://github.com/zhangfei829/mytest.git
           git clone https://github.com/ROCm/mori.git
