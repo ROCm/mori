@@ -14,6 +14,18 @@ jobs:
           #exit
           source ~/.bashrc
           cmake --version
+          echo "=== CMake 版本诊断 ==="
+          echo "1. PATH: $PATH"
+          echo "2. which cmake: $(which cmake)"
+          echo "3. 所有 cmake 路径:"
+          which -a cmake
+          echo "4. 各路径版本:"
+          for cmd in $(which -a cmake); do
+            echo "   $cmd: $($cmd --version | head -n1)"
+          done
+          echo "5. 当前 shell: $SHELL"
+          echo "6. 环境变量:"
+          env | grep -i cmake          
           rm -rf mori
           #git clone https://github.com/zhangfei829/mytest.git
           git clone https://github.com/ROCm/mori.git
