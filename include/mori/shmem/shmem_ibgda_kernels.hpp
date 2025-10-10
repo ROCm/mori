@@ -245,6 +245,17 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(
 }
 
 template <>
+inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(int pe){
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  int rank = globalGpuStates->rank;
+  if (pe == rank) return;
+  if (globalGpuStates->transportTypes[pe] != application::TransportType::RDMA) return;
+  for (int qpId = 0; qpId < globalGpuStates->numQpPerPe; qpId++) {
+    DISPATCH_PROVIDER_TYPE_COMPILE_TIME(ShmemQuietThreadKernelImpl, pe, qpId);
+  }
+}
+
+template <>
 inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(int pe, int qpId) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
