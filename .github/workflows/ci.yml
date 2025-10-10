@@ -11,7 +11,7 @@ jobs:
           hostname
           id
           cmake --version
-          exit
+          #exit
           cmake --version
           rm -rf mori
           #git clone https://github.com/zhangfei829/mytest.git
