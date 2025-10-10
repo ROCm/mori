@@ -13,6 +13,8 @@ jobs:
           cmake --version
           #exit
           source ~/.bashrc
+          echo "0. PATH: $PATH"
+          export PATH="/home/runner/.local/bin:$PATH"
           cmake --version
           echo "=== CMake 版本诊断 ==="
           echo "1. PATH: $PATH"
@@ -25,7 +27,7 @@ jobs:
           done
           echo "5. 当前 shell: $SHELL"
           echo "6. 环境变量:"
-          env | grep -i cmake          
+          #env | grep -i cmake          
           rm -rf mori
           #git clone https://github.com/zhangfei829/mytest.git
           git clone https://github.com/ROCm/mori.git
