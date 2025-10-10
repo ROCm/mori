@@ -26,8 +26,11 @@ jobs:
             echo "   $cmd: $($cmd --version | head -n1)"
           done
           echo "5. 当前 shell: $SHELL"
-          sudo -i    
+          sudo -i
+          id  
+          ls  
           rm -rf mori
+          ls
           #git clone https://github.com/zhangfei829/mytest.git
           git clone https://github.com/ROCm/mori.git
           cd mori
@@ -37,6 +40,7 @@ jobs:
           ls
   test:
     name: mori test
+    needs: build
     runs-on: label-1
     steps:
         #- uses: actions/checkout@v4
