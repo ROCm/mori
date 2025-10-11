@@ -374,7 +374,7 @@ class EpDispatchCombineTestCase:
         for i in range(500):
             if self.rank == 0:
                 print(f"Round {i} begin")
-            test_data = self.gen_test_data()
+            test_data = self.gen_test_data(use_max_token_num=False)
             if self.rank == 0:
                 print(f"Round {i} gen test_data done")
             self.run_test_once(op, test_data, error_round, i)

@@ -474,10 +474,10 @@ inline __device__ void DispatchInterNodeChannelOptim1(EpDispatchCombineArgs<T>& 
     // }
   }
 
-  constexpr int numRecvBlock = 1;
+  constexpr int numRecvBlock = 4;
   // if (blockId != 48) return;
   uint8_t* stagingPtr = args.shmemInpTokMemObj->template GetAs<uint8_t*>();
-  for (int k = blockId; k < config.rdmaBlockNum; k += (config.rdmaBlockNum)) {
+  for (int k = blockId/numRecvBlock; k < config.rdmaBlockNum; k += (config.rdmaBlockNum/numRecvBlock)) {
     for (int i = 0; i < nNodes; i++) {
       if (i == myNode) continue;
       uint32_t recvFlag = 0;
