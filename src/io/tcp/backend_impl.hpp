@@ -107,6 +107,13 @@ class TcpBackend : public Backend {
   std::unordered_map<SessionCacheKey, std::unique_ptr<TcpBackendSession>, SessionCacheKeyHash>
       sessionCache;
   std::mutex sessionCacheMu;
+
+  // Global monotonically increasing id source for internal sub-operations (batch).
+  std::atomic<uint64_t> nextTransferId{1};  // TODO: Avoid collision
+
+  inline TransferUniqueId NextUniqueTransferId() {
+    return nextTransferId.fetch_add(1, std::memory_order_relaxed);
+  }
 };
 
 class TcpBackendSession : public BackendSession {
@@ -133,7 +140,6 @@ class TcpBackendSession : public BackendSession {
 struct TcpBackend::WorkerContext {
   application::TCPContext* listenCtx{nullptr};
   int epollFd{-1};
-  int wakeFd{-1};  // eventfd used to wake epoll loop when new outbound conns pending
   size_t id{0};
   std::mutex pendingAddMu;                   // protects pendingAdd
   std::vector<ConnectionState*> pendingAdd;  // connections to add to epoll

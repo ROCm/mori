@@ -59,6 +59,19 @@ struct BufferBlock {
   bool pinned{true};
 };
 
+// Holds shared state for a batch submission so that we can drive the user-provided
+// TransferStatus to completion only after all individual ops complete or on first failure.
+struct TcpBatchContext {
+  TransferStatus* userStatus{nullptr};
+  std::atomic<size_t> remaining{0};
+  std::atomic<bool> failed{false};
+  // Protected message for first failure.
+  std::mutex msgMu;
+  std::string failMsg;
+  // Constructor
+  TcpBatchContext(TransferStatus* us, size_t total) : userStatus(us), remaining(total) {}
+};
+
 struct TransferOp {
   MemoryDesc localDest;
   size_t localOffset;
@@ -69,6 +82,9 @@ struct TransferOp {
   TransferUniqueId id;
   OpType opType;              // 0 = READ_REQ, 1 = WRITE_REQ, 2 = READ_RESP, 3 = WRITE_RESP
   BufferBlock stagingBuffer;  // used for CPU<->GPU staging if needed
+  // Optional batch aggregation context. When non-null, per-op completions update the
+  // shared context which owns the original user provided TransferStatus.
+  struct TcpBatchContext* batchCtx{nullptr};
 };
 
 class ConnectionState {
@@ -176,6 +192,11 @@ class ConnectionPool {
     return conn;
   }
 
+  std::deque<ConnectionState*> GetAllConnections() {
+    std::lock_guard<std::mutex> lk(mu);
+    return allConns;
+  }
+
   // Return a leased connection
   void ReleaseConnection(ConnectionState* conn) {
     if (!conn) return;
@@ -184,22 +205,15 @@ class ConnectionPool {
       conn->Close();
       return;
     }
-    if (conn->ready.load(std::memory_order_acquire)) {
-      ready.push_back(conn);
-      cv.notify_one();
-    } else {
-      pending.push_back(conn);
-    }
+    ready.push_back(conn);
+    cv.notify_one();
   }
 
   void SetConnections(const std::vector<ConnectionState*>& conns) {
     std::lock_guard<std::mutex> lk(mu);
     for (auto* c : conns) {
       allConns.push_back(c);
-      if (c->ready.load(std::memory_order_acquire))
-        ready.push_back(c);
-      else
-        pending.push_back(c);
+      if (c->ready.load(std::memory_order_acquire)) ready.push_back(c);
     }
     cv.notify_all();
   }
@@ -217,29 +231,11 @@ class ConnectionPool {
       if (it != dq.end()) dq.erase(it);
     };
     eraseOne(ready);
-    eraseOne(pending);
     auto it = std::find(allConns.begin(), allConns.end(), conn);
     if (it != allConns.end()) {
       (*it)->Close();
       delete *it;
       allConns.erase(it);
-    }
-  }
-
-  // Promote a pending connection to ready once it becomes usable.
-  void Promote(ConnectionState* raw) {
-    if (!raw) return;
-    std::lock_guard<std::mutex> lk(mu);
-    // Find in pending; move to ready if found & marked ready.
-    for (auto it = pending.begin(); it != pending.end(); ++it) {
-      if (*it == raw) {
-        if (raw->ready.load(std::memory_order_acquire)) {
-          ready.push_back(raw);
-          pending.erase(it);
-          cv.notify_one();
-        }
-        return;
-      }
     }
   }
 
@@ -257,15 +253,13 @@ class ConnectionPool {
     }
     allConns.clear();
     ready.clear();
-    pending.clear();
   }
 
  private:
   std::mutex mu;
   std::condition_variable cv;
   std::deque<ConnectionState*> allConns;
-  std::deque<ConnectionState*> ready;    // fully usable connections
-  std::deque<ConnectionState*> pending;  // not yet ready (connect pending)
+  std::deque<ConnectionState*> ready;  // fully usable connections
   bool shuttingDown{false};
 };
 
