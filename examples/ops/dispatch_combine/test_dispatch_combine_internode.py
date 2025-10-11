@@ -487,21 +487,21 @@ class EpDispatchCombineTestCase:
         comb_duration_us_list = []
         comb_bandwidth_GB_list = []
 
-        for i in range(10):
-            if self.rank == 0:
-                print(f"WarmUp Round {i} begin")
-            _, _, _, _ = (
-                self.run_bench_once(op, test_data)
-            )
-
-        # error_round = set()
         # for i in range(10):
         #     if self.rank == 0:
         #         print(f"WarmUp Round {i} begin")
-        #     self.run_test_once(op, test_data, error_round, i)
-        #     assert (
-        #         len(error_round) == 0
-        #     ), f"Warmup failed with errors in rounds: {error_round}"
+        #     _, _, _, _ = (
+        #         self.run_bench_once(op, test_data)
+        #     )
+
+        error_round = set()
+        for i in range(10):
+            if self.rank == 0:
+                print(f"WarmUp Round {i} begin")
+            self.run_test_once(op, test_data, error_round, i)
+            assert (
+                len(error_round) == 0
+            ), f"Warmup failed with errors in rounds: {error_round}"
 
         for i in range(50):
             if self.rank == 0:
