@@ -33,7 +33,6 @@ TcpBackend::TcpBackend(EngineKey key, const IOEngineConfig& engCfg, const TcpBac
     : myEngKey(key), config(cfg), engConfig(engCfg) {
   running.store(true);  // set before threads start
   bufferPool.Configure(128, 16 * 1024 * 1024, true);
-  hipStreams.Initialize(config.numWorkerThreads);
   listeners.reserve(config.numWorkerThreads);
   workerThreads.reserve(config.numWorkerThreads);
   workerCtxs.reserve(config.numWorkerThreads);
@@ -115,7 +114,6 @@ TcpBackend::~TcpBackend() {
     if (kv.second) kv.second->Shutdown();
 
   connPools.clear();
-  hipStreams.Destroy();
 }
 
 void TcpBackend::CloseInbound(ConnectionState* conn) {
