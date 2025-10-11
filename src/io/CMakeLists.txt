@@ -1,14 +1,6 @@
 add_library(
-  mori_io SHARED
-  engine.cpp
-  rdma/protocol.cpp
-  rdma/backend_impl.cpp
-  rdma/executor.cpp
-  rdma/common.cpp
-  fallback_backend.cpp
-  backend_factory.cpp
-  tcp/backend_impl.cpp
-  tcp/common.cpp)
+  mori_io SHARED engine.cpp rdma/protocol.cpp rdma/backend_impl.cpp
+                 rdma/executor.cpp rdma/common.cpp tcp/backend_impl.cpp)
 
 target_include_directories(mori_io PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(mori_io PUBLIC ${CMAKE_SOURCE_DIR})

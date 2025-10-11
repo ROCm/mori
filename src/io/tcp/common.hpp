@@ -67,18 +67,8 @@ struct TransferOp {
   size_t size;
   TransferStatus* status;
   TransferUniqueId id;
-  OpType opType;  // 0 = READ_REQ, 1 = WRITE_REQ, 2 = READ_RESP, 3 = WRITE_RESP
-  bool isGpuOp{false};
+  OpType opType;              // 0 = READ_REQ, 1 = WRITE_REQ, 2 = READ_RESP, 3 = WRITE_RESP
   BufferBlock stagingBuffer;  // used for CPU<->GPU staging if needed
-  hipStream_t stream{nullptr};
-  hipEvent_t event{nullptr};
-  enum class GpuCopyState { PENDING, IN_PROGRESS, COMPLETED } gpuCopyState;
-};
-
-struct GpuCommState {
-  hipStream_t stream;
-  hipEvent_t event;
-  // Pointers to pinned staging buffers, etc.
 };
 
 class ConnectionState {
@@ -93,8 +83,6 @@ class ConnectionState {
   enum class RecvState { PARSING_HEADER, PARSING_PAYLOAD };
   RecvState recvState{RecvState::PARSING_HEADER};
   TcpMessageHeader pendingHeader{};  // zero-init
-  bool complete{false};
-  std::optional<GpuCommState> gpuState;
   std::optional<TransferOp> recvOp;
 
   // Connection lifecycle flags
@@ -123,7 +111,6 @@ class ConnectionState {
     std::scoped_lock lk(mu);
     recvState = RecvState::PARSING_HEADER;
     pendingHeader = TcpMessageHeader{};
-    complete = false;
     headerBytesRead = 0;
     payloadBytesRead = 0;
     expectedPayloadSize = 0;
@@ -158,128 +145,6 @@ class ConnectionState {
   const char* payloadPtr{nullptr};
   size_t payloadBytesTotal{0};
   size_t payloadBytesSent{0};
-};
-
-class HipStreamPool {
- public:
-  struct Lease {
-    hipStream_t stream{nullptr};
-    HipStreamPool* pool{nullptr};
-    Lease() = default;
-    Lease(hipStream_t s, HipStreamPool* p) : stream(s), pool(p) {}
-    Lease(const Lease&) = delete;
-    Lease& operator=(const Lease&) = delete;
-    Lease(Lease&& other) noexcept {
-      stream = other.stream;
-      pool = other.pool;
-      other.stream = nullptr;
-      other.pool = nullptr;
-    }
-    Lease& operator=(Lease&& other) noexcept {
-      if (this != &other) {
-        release();
-        stream = other.stream;
-        pool = other.pool;
-        other.stream = nullptr;
-        other.pool = nullptr;
-      }
-      return *this;
-    }
-    ~Lease() { release(); }
-    void release() {
-      if (pool && stream) {
-        pool->Release(stream);
-        stream = nullptr;
-        pool = nullptr;
-      }
-    }
-    hipStream_t get() const { return stream; }
-    operator hipStream_t() const { return stream; }
-    bool valid() const { return stream != nullptr; }
-  };
-
-  HipStreamPool() = default;
-  ~HipStreamPool() { Destroy(); }
-
-  void Initialize(size_t streamCount, unsigned flags = hipStreamDefault) {
-    std::lock_guard<std::mutex> lk(mu_);
-    if (initialized_) return;
-    streams_.reserve(streamCount);
-    for (size_t i = 0; i < streamCount; ++i) {
-      hipStream_t s{};
-      hipError_t st = hipStreamCreateWithFlags(&s, flags);
-      if (st != hipSuccess) {
-        if (hipStreamCreate(&s) != hipSuccess) {
-          MORI_IO_ERROR("Failed to create HIP stream {}", i);
-          continue;
-        }
-      }
-      streams_.push_back(s);
-      available_.push_back(s);
-    }
-    initialized_ = true;
-  }
-
-  hipStream_t AcquireRaw(std::chrono::milliseconds timeout = std::chrono::milliseconds::max()) {
-    std::unique_lock<std::mutex> lk(mu_);
-    if (timeout == std::chrono::milliseconds::max()) {
-      cv_.wait(lk, [this] { return shuttingDown_ || !available_.empty(); });
-    } else {
-      cv_.wait_for(lk, timeout, [this] { return shuttingDown_ || !available_.empty(); });
-    }
-    if (shuttingDown_ || available_.empty()) return nullptr;
-    hipStream_t s = available_.front();
-    available_.pop_front();
-    return s;
-  }
-
-  Lease Acquire(std::chrono::milliseconds timeout = std::chrono::milliseconds::max()) {
-    hipStream_t s = AcquireRaw(timeout);
-    return Lease{s, s ? this : nullptr};
-  }
-
-  void Release(hipStream_t s) {
-    if (!s) return;
-    std::lock_guard<std::mutex> lk(mu_);
-    if (shuttingDown_) return;  // let Destroy() handle
-    available_.push_back(s);
-    cv_.notify_one();
-  }
-
-  size_t TotalStreams() const {
-    std::lock_guard<std::mutex> lk(mu_);
-    return streams_.size();
-  }
-
-  void Shutdown() {
-    std::lock_guard<std::mutex> lk(mu_);
-    if (!shuttingDown_) {
-      shuttingDown_ = true;
-      cv_.notify_all();
-    }
-  }
-
-  void Destroy() {
-    std::deque<hipStream_t> toDestroy;
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      shuttingDown_ = true;
-      toDestroy.assign(streams_.begin(), streams_.end());
-      streams_.clear();
-      available_.clear();
-    }
-    for (auto s : toDestroy) {
-      if (s) hipStreamDestroy(s);
-    }
-  }
-
- private:
-  mutable std::mutex mu_;
-  std::condition_variable cv_;
-  std::vector<hipStream_t> streams_;
-  std::deque<hipStream_t> available_;
-  bool initialized_{false};
-  bool shuttingDown_{false};
 };
 
 class ConnectionPool {
@@ -536,167 +401,6 @@ class BufferPool {
     in_pool_buffers++;
     in_pool_bytes += buckets[idx].back().capacity;
   }
-};
-
-int FullSend(int fd, const void* buf, size_t len);
-int FullRecv(int fd, void* buf, size_t len);
-int FullWritev(int fd, struct iovec* iov, int iovcnt);
-
-/**
- * Single Producer / Multiple Consumer bounded blocking queue.
- * Thread-safety:
- *  - Exactly one producer thread may call push/emplace/try_push.
- *  - Multiple consumer threads may call pop/try_pop concurrently.
- *  - shutdown() may be called once (typically by the producer / owner).
- */
-template <typename T>
-class SPMCQueue {
- public:
-  explicit SPMCQueue(size_t capacity) : capacity_(capacity), buffer_(capacity) {
-    if (capacity_ == 0) throw std::invalid_argument("capacity must be > 0");
-  }
-
-  SPMCQueue(const SPMCQueue&) = delete;
-  SPMCQueue& operator=(const SPMCQueue&) = delete;
-  SPMCQueue(SPMCQueue&&) = delete;
-  SPMCQueue& operator=(SPMCQueue&&) = delete;
-
-  ~SPMCQueue() {
-    shutdown();  // ensure any waiting threads are released
-  }
-
-  // Blocking push (returns false if queue has been shut down before insertion)
-  bool push(const T& item) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    cv_not_full_.wait(lock, [this] { return size_ < capacity_ || done_; });
-    if (done_) return false;
-    write_unlocked(item);
-    lock.unlock();
-    cv_not_empty_.notify_one();
-    return true;
-  }
-
-  bool push(T&& item) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    cv_not_full_.wait(lock, [this] { return size_ < capacity_ || done_; });
-    if (done_) return false;
-    write_unlocked(std::move(item));
-    lock.unlock();
-    cv_not_empty_.notify_one();
-    return true;
-  }
-
-  // Variadic emplace (construct T from args) - returns false if closed
-  template <class... Args>
-  bool emplace(Args&&... args) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    cv_not_full_.wait(lock, [this] { return size_ < capacity_ || done_; });
-    if (done_) return false;
-    buffer_[tail_] = T(std::forward<Args>(args)...);
-    advance_tail_unlocked();
-    lock.unlock();
-    cv_not_empty_.notify_one();
-    return true;
-  }
-
-  // Non-blocking try_push (returns false if full or closed)
-  bool try_push(const T& item) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (done_ || size_ == capacity_) return false;
-    write_unlocked(item);
-    cv_not_empty_.notify_one();
-    return true;
-  }
-
-  bool try_push(T&& item) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (done_ || size_ == capacity_) return false;
-    write_unlocked(std::move(item));
-    cv_not_empty_.notify_one();
-    return true;
-  }
-
-  // Blocking pop. Returns false when queue is empty AND has been shut down.
-  bool pop(T& out) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    cv_not_empty_.wait(lock, [this] { return size_ > 0 || done_; });
-    if (size_ == 0 && done_) return false;
-    out = std::move(buffer_[head_]);
-    head_ = (head_ + 1) % capacity_;
-    --size_;
-    lock.unlock();
-    cv_not_full_.notify_one();
-    return true;
-  }
-
-  // Non-blocking pop. Returns false if empty (even if not closed yet).
-  bool try_pop(T& out) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (size_ == 0) return false;
-    out = std::move(buffer_[head_]);
-    head_ = (head_ + 1) % capacity_;
-    --size_;
-    cv_not_full_.notify_one();
-    return true;
-  }
-
-  void shutdown() {
-    bool notify = false;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (!done_) {
-        done_ = true;
-        notify = true;
-      }
-    }
-    if (notify) {
-      cv_not_empty_.notify_all();
-      cv_not_full_.notify_all();  // wake producer if waiting
-    }
-  }
-
-  bool closed() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return done_;
-  }
-
-  size_t size() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return size_;
-  }
-
-  bool empty() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return size_ == 0;
-  }
-
-  size_t capacity() const noexcept { return capacity_; }
-
- private:
-  void write_unlocked(const T& v) {
-    buffer_[tail_] = v;
-    advance_tail_unlocked();
-  }
-  void write_unlocked(T&& v) {
-    buffer_[tail_] = std::move(v);
-    advance_tail_unlocked();
-  }
-  void advance_tail_unlocked() {
-    tail_ = (tail_ + 1) % capacity_;
-    ++size_;
-  }
-
-  const size_t capacity_;
-  std::vector<T> buffer_;
-
-  size_t head_ = 0;
-  size_t tail_ = 0;
-  size_t size_ = 0;
-
-  mutable std::mutex mutex_;
-  std::condition_variable cv_not_full_;
-  std::condition_variable cv_not_empty_;
-  bool done_ = false;
 };
 
 }  // namespace io

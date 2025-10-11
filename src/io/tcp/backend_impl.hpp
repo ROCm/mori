@@ -87,7 +87,6 @@ class TcpBackend : public Backend {
   EngineKey myEngKey;
   TcpBackendConfig config;
   IOEngineConfig engConfig;
-  // (Removed global epollFd; per-worker epoll now lives in WorkerContext.)
   std::vector<application::TCPContext*> listeners;
   std::vector<std::thread> workerThreads;
   std::vector<WorkerContext*> workerCtxs;  // owns WorkerContext pointers (freed in dtor)
@@ -99,7 +98,6 @@ class TcpBackend : public Backend {
   std::mutex inConnsMu;
   std::unordered_map<int, std::unique_ptr<ConnectionState>> inboundConnections;
   std::unordered_map<EngineKey, std::unique_ptr<ConnectionPool>> connPools;
-  HipStreamPool hipStreams;
 
   std::mutex remotesMu;
   std::unordered_map<EngineKey, EngineDesc> remotes;
