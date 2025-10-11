@@ -27,6 +27,7 @@ jobs:
           done
           echo "5. 当前 shell: $SHELL"
           sudo -i
+          pwd
           id  
           ls  
           rm -rf mori
