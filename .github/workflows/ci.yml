@@ -56,5 +56,6 @@ jobs:
           ls
           #python test.py
           #bash test.sh
-          export PYTHONPATH=/home/yutongwu/mori:$PYTHONPATH
-          python3 tests/python/ops/bench_dispatch_combine.py
+          export PYTHONPATH=/home/runner/actions-runner/_work/mori/mori/mori:$PYTHONPATH
+          #python3 tests/python/ops/bench_dispatch_combine.py
+          pytest -v tests/python/ops/
