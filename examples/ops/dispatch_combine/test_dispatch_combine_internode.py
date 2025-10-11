@@ -48,7 +48,7 @@ class EpDispatchCombineTestCase:
             warp_num_per_block=16,
             block_num=80,
             max_token_type_size=2,
-            kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeDedup,
+            kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeV1,
             gpu_per_node=self.gpu_per_node,
             rdma_block_num=64,
         )
@@ -299,13 +299,13 @@ class EpDispatchCombineTestCase:
                 )
                 assert False
             # error_round.add(round)
-            # if dispatch_weights is not None:
-            #     assert torch.equal(
-            #         dispatch_weights[i], all_rank_weights[src_pe][src_tok_id]
-            #     )
-            # assert torch.equal(
-            #     dispatch_indices[i], all_rank_indices[src_pe][src_tok_id]
-            # )
+            if dispatch_weights is not None:
+                assert torch.equal(
+                    dispatch_weights[i], all_rank_weights[src_pe][src_tok_id]
+                )
+            assert torch.equal(
+                dispatch_indices[i], all_rank_indices[src_pe][src_tok_id]
+            )
             # TODO: test output scales
 
         if self.config.rank == 0:
@@ -371,7 +371,7 @@ class EpDispatchCombineTestCase:
     def test_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
         error_round = set()
-        for i in range(500):
+        for i in range(5000):
             if self.rank == 0:
                 print(f"Round {i} begin")
             test_data = self.gen_test_data(use_max_token_num=False)
@@ -436,7 +436,7 @@ class EpDispatchCombineTestCase:
                 total_rdma_recv_num_token += 1
         if (
             self.config.kernel_type
-            is mori.ops.EpDispatchCombineKernelType.InterNodeDedup
+            is mori.ops.EpDispatchCombineKernelType.InterNodeV1
         ):
             total_rdma_recv_num_token = (
                 self.config.max_num_inp_token_per_rank * self.config.world_size // 8
@@ -483,7 +483,7 @@ class EpDispatchCombineTestCase:
         comb_bandwidth_GB_list = []
 
         error_round = set()
-        for i in range(1):
+        for i in range(3):
             if self.rank == 0:
                 print(f"WarmUp Round {i} begin")
             self.run_test_once(op, test_data, error_round, i)

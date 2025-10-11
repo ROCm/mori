@@ -36,7 +36,7 @@ namespace moe {
 enum KernelType {
   IntraNode = 0,
   InterNode = 1,
-  InterNodeDedup = 2,
+  InterNodeV1 = 2,
 };
 
 inline const char* HipDataTypeToString(hipDataType dtype) {
@@ -219,11 +219,17 @@ class EpDispatchCombineHandle {
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint32_t crossDeviceBarrierFlag{1};
 
-  // Inter-node dedup kernel
-  mori::application::SymmMemObjPtr recvTokenFlagMemObj;
-  index_t* destNodeTokenCounter{nullptr};
+  // Inter-node v1 kernel parameters
+  // Signal the completion of inter-node token transfer
+  mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
+  // Signal the number of tokens transfered from other nodes
   mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;
+  // Count the number of tokens sent to other nodes
+  index_t* destNodeTokenCounter{nullptr};
+  // Counter that is used to sort the ordering of inter-node token chunk transfer
   index_t* blockFlagCounter{nullptr};
+  //
+  uint32_t* interNodeBlocksBarrier{nullptr};
 };
 
 template <typename T>
@@ -261,10 +267,11 @@ struct EpDispatchCombineArgs {
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint32_t crossDeviceBarrierFlag{1};
-  mori::application::SymmMemObjPtr recvTokenFlagMemObj;
+  mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
   index_t* destNodeTokenCounter{nullptr};
   mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;
   index_t* blockFlagCounter{nullptr};
+  uint32_t* interNodeBlocksBarrier{nullptr};
 };
 
 using EpDispatchCombineArgsVariant =
@@ -306,10 +313,11 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.totalRecvTokenNum = handle.totalRecvTokenNum;
   args.crossDeviceBarrierMemObj = handle.crossDeviceBarrierMemObj;
   args.crossDeviceBarrierFlag = handle.crossDeviceBarrierFlag;
-  args.recvTokenFlagMemObj = handle.recvTokenFlagMemObj;
+  args.interNodeChunkFlagMemObj = handle.interNodeChunkFlagMemObj;
   args.destNodeTokenCounter = handle.destNodeTokenCounter;
   args.nodeRecvTokenNumMemObj = handle.nodeRecvTokenNumMemObj;
   args.blockFlagCounter = handle.blockFlagCounter;
+  args.interNodeBlocksBarrier = handle.interNodeBlocksBarrier;
   return args;
 }
 

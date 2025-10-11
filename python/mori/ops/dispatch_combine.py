@@ -182,7 +182,7 @@ class EpDispatchCombineOp:
 
         if self.config.kernel_type.value in (
             EpDispatchCombineKernelType.IntraNode.value,
-            EpDispatchCombineKernelType.InterNodeDedup.value,
+            EpDispatchCombineKernelType.InterNodeV1.value,
         ):
             return self._get_dispatch_src_token_pos_func(self._handle)
 

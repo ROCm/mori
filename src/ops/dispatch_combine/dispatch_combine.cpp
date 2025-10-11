@@ -181,16 +181,22 @@ void EpDispatchCombineHandle::InitializeBarrier() {
   HIP_RUNTIME_CHECK(hipMemset(combineGridBarrier, 0, barrierSize));
   crossDeviceBarrierMemObj = ShmemMallocAndReturnMemObjPtr(barrierSize, hipDeviceMallocUncached);
 
-  size_t recvTokenFlagSize =
-      config.worldSize / config.gpuPerNode * config.MaxNumTokensToRecvPerRank() * sizeof(uint32_t);
-  recvTokenFlagMemObj = ShmemMallocAndReturnMemObjPtr(recvTokenFlagSize, hipDeviceMallocUncached);
+  // We allocate one flag for each token, this ensure that we can use all chunk size(>=1)
+  size_t interNodeChunkFlagSize =
+      config.worldSize / config.gpuPerNode * config.MaxNumTokensToRecvPerRank() * sizeof(index_t);
+  interNodeChunkFlagMemObj =
+      ShmemMallocAndReturnMemObjPtr(interNodeChunkFlagSize, hipDeviceMallocUncached);
+
+  HIP_RUNTIME_CHECK(hipMalloc(&interNodeBlocksBarrier, sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMemset(interNodeBlocksBarrier, 0, sizeof(index_t)));
 }
 
 void EpDispatchCombineHandle::FinalizeBarrier() {
   HIP_RUNTIME_CHECK(hipFree(dispatchGridBarrier));
   HIP_RUNTIME_CHECK(hipFree(combineGridBarrier));
+  HIP_RUNTIME_CHECK(hipFree(interNodeBlocksBarrier));
   ShmemFree(crossDeviceBarrierMemObj->localPtr);
-  ShmemFree(recvTokenFlagMemObj->localPtr);
+  ShmemFree(interNodeChunkFlagMemObj->localPtr);
 }
 
 void EpDispatchCombineHandle::LaunchIntraNodeDispatch(int blockNum, int warpPerBlock,
@@ -232,8 +238,8 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
         if (kernelType == KernelType::InterNode) {
           assert(config.useExternalInpBuffer);
           EpDispatchInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
-        } else if (kernelType == KernelType::InterNodeDedup) {
-          EpDispatchInterNodeKernelV1<<<grid, block, sharedMemSize, stream>>>(args);
+        } else if (kernelType == KernelType::InterNodeV1) {
+          EpDispatchInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else {
@@ -260,9 +266,9 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
         if (kernelType == KernelType::InterNode) {
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
-        } else if (kernelType == KernelType::InterNodeDedup) {
+        } else if (kernelType == KernelType::InterNodeV1) {
           assert(config.useExternalInpBuffer);
-          EpCombineInterNodeDedupKernel<<<grid, block, sharedMemSize, stream>>>(args);
+          EpCombineInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpCombineIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else {

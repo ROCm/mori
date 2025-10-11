@@ -29,16 +29,10 @@ namespace mori {
 namespace moe {
 
 template <typename T>
-__global__ void EpDispatchInterNodeKernelV1GlobalSync(EpDispatchCombineArgs<T> args);
+__global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args);
 
 template <typename T>
-__global__ void EpDispatchInterNodeKernelV1(EpDispatchCombineArgs<T> args);
-
-/* ---------------------------------------------------------------------------------------------- */
-/*                                    EpCombineInterNodeKernel                                    */
-/* ---------------------------------------------------------------------------------------------- */
-template <typename T>
-__global__ void EpCombineInterNodeDedupKernel(EpDispatchCombineArgs<T> args);
+__global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args);
 
 }  // namespace moe
 }  // namespace mori
