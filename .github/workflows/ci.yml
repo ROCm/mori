@@ -26,7 +26,7 @@ jobs:
             echo "   $cmd: $($cmd --version | head -n1)"
           done
           echo "5. 当前 shell: $SHELL"
-          sudo -i
+          #sudo -i
           pwd
           id  
           ls  
