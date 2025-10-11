@@ -31,7 +31,7 @@ jobs:
           id  
           ls  
           rm -rf mori
-          ls
+
           #git clone https://github.com/zhangfei829/mytest.git
           git clone https://github.com/ROCm/mori.git
           cd mori
