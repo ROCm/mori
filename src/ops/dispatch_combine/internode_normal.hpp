@@ -169,7 +169,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         if (laneId == 0) {
           shmem::ShmemPutInt32ImmNbiThread(args.recvTokenNumMemObj,
                                            (myNode + channelId * nNodes) * sizeof(index_t),
-                                           nodeTokenCount[destNode] + 1, destPe);
+                                           nodeTokenCount[destNode] + 1, destPe, channelId);
         }
       }
 
@@ -217,7 +217,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             // if (laneId == destNode) {
             shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemInpTokMemObj, dstStagingOffset,
                                                 args.shmemStagingTokMemObj, srcStagingOffset,
-                                                sendTokenNum * tokenPackBytes, destPe);
+                                                sendTokenNum * tokenPackBytes, destPe, channelId);
 #if DEBUG == 1
             if (laneId == warpSize - 1)
               printf(
@@ -226,9 +226,9 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
                   "syncSendSlotStart=%d syncTailCache=%lu maxRDMASteps=%zu stepRDMATokens=%d\n",
                   myPe, channelId, laneId, args.crossDeviceBarrierFlag, warpId, destPe,
                   sendTokenNum, syncSendSlotStart, syncTailCache, maxRDMASteps, stepRDMATokens);
+            shmem::ShmemQuietThread(destPe, channelId);
 #endif
             // }
-            shmem::ShmemQuietThread();
 #if DEBUG_DATA == 1
             if (laneId == 0) {
 #if ASSERT_ON == 1
@@ -275,11 +275,12 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
                   *(args.tailMemObj->template GetAs<uint64_t*>(destPe) + myPe + channelId * npes));
 #endif
             } else {
-              shmem::ShmemPutUint64ImmNbiThread(
-                  args.tailMemObj, (myPe + channelId * npes) * sizeof(uint64_t), tailCache, destPe);
-              // will report cqe error
-              // shmem::ShmemQuietThread();
+              shmem::ShmemPutUint64ImmNbiThread(args.tailMemObj,
+                                                (myPe + channelId * npes) * sizeof(uint64_t),
+                                                tailCache, destPe, channelId);
 #if DEBUG == 1
+              // will report cqe error
+              shmem::ShmemQuietThread(destPe, channelId);
               printf(
                   "send RDMA putSignal rank=%d ch=%d laneId=%d call=%d warpId=%d destPe=%d "
                   "numTokensToSend=%d "
@@ -296,7 +297,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           // __threadfence_block();
         }
       }
-      shmem::ShmemQuietThread();
+
       if (laneId < nNodes) {
         args.localTail[(laneId * nlocalPes + myLocalPe) + channelId * npes] = tailCache;
 #if DEBUG == 1
@@ -415,6 +416,12 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
     } else {
       __syncthreads();
     }
+
+    for (int node = 0; node < nNodes; ++node) {
+      int destPe = node * nlocalPes + myLocalPe;
+      shmem::ShmemQuietThread(destPe, channelId);
+    }
+
     __syncthreads();
     // clear slotToTokenIdxMap
     for (int i = thdId; i < nNodes * maxTokensPerChannel; i += thdNum) {
@@ -686,7 +693,10 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             // ShmemPutUint64ImmNbiThread may lead to hang
             shmem::ShmemPutUint64ImmNbiWarp(
                 args.headMemObj, (myPe + channelId * npes) * sizeof(uint64_t),
-                syncHeadBase + syncMinHead, node * nlocalPes + myLocalPe);
+                syncHeadBase + syncMinHead, node * nlocalPes + myLocalPe, channelId);
+#if DEBUG == 1
+            shmem::ShmemQuietThread(node * nlocalPes + myLocalPe, channelId);
+#endif
             if (laneId == node) {
               numTokensToRecv -= (minHead - curMinHead) * stepRDMATokens;
               curMinHead = minHead;
@@ -696,7 +706,6 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             }
           }
         }
-        shmem::ShmemQuietThread();
       }
 
       if (laneId < nNodes) {
@@ -825,8 +834,12 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         }
       }
     }
+
+    for (int node = 0; node < nNodes; ++node) {
+      int destPe = node * nlocalPes + myLocalPe;
+      shmem::ShmemQuietThread(destPe, channelId);
+    }
     __syncthreads();
-    shmem::ShmemQuietThread();
 
     // all recv block barrier
     if (thdId == 0) {
