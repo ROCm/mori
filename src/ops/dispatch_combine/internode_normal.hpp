@@ -153,13 +153,12 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         // __threadfence_block();
       }
 #if DEBUG == 1
-      // if (laneId == 0) {
-      //   for (int i = 0; i < nNodes; ++i) {
-      //     printf("rank=%d warpId=%d nodeTokenCount[%d]=%d tokenProgress[15]=%d\n", myPe, warpId,
-      //     i,
-      //            nodeTokenCount[i], tokenProgress[kSendWarpCount]);
-      //   }
-      // }
+      if (myPe == 0 && laneId == 0 && channelId == 0) {
+        for (int i = 0; i < nNodes; ++i) {
+          printf("send Ctl rank=%d warpId=%d nodeTokenCount[%d]=%d tokenProgress[15]=%d\n", myPe,
+                 warpId, i, nodeTokenCount[i], tokenProgress[kSendWarpCount]);
+        }
+      }
 #endif
 
       for (int i = 0; i < nNodes; ++i) {
@@ -178,7 +177,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
       uint64_t tailCache =
           laneId < nNodes ? args.localTail[(laneId * nlocalPes + myLocalPe) + channelId * npes] : 0;
 #if DEBUG == 1
-      // if (laneId < nNodes) {
+      // if (myPe == 0 && laneId < nNodes && channelId == 0) {
       //   printf("send RDMA before rank=%d ch=%d call=%d warpId=%d node=%d localTail=%lu\n", myPe,
       //          channelId, args.crossDeviceBarrierFlag, warpId, laneId, tailCache);
       // }
@@ -219,13 +218,14 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
                                                 args.shmemStagingTokMemObj, srcStagingOffset,
                                                 sendTokenNum * tokenPackBytes, destPe, channelId);
 #if DEBUG == 1
-            if (laneId == warpSize - 1)
+            if (myPe == 0 && laneId == warpSize - 1 && channelId == 0) {
               printf(
                   "send RDMA putData rank=%d ch=%d laneId=%d call=%d warpId=%d destPe=%d "
                   "sendTokenNum=%d "
                   "syncSendSlotStart=%d syncTailCache=%lu maxRDMASteps=%zu stepRDMATokens=%d\n",
                   myPe, channelId, laneId, args.crossDeviceBarrierFlag, warpId, destPe,
                   sendTokenNum, syncSendSlotStart, syncTailCache, maxRDMASteps, stepRDMATokens);
+            }
             shmem::ShmemQuietThread(destPe, channelId);
 #endif
             // }
@@ -266,28 +266,34 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
                   args.tailMemObj->template GetAs<uint64_t*>(destPe) + myPe + channelId * npes,
                   tailCache, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 #if DEBUG == 1
-              printf(
-                  "send RDMA putSignalLocal rank=%d call=%d warpId=%d destPe=%d numTokensToSend=%d "
-                  "sendSlotStart=%d offset=%d "
-                  "tail=%lu\n",
-                  myPe, args.crossDeviceBarrierFlag, warpId, destPe, numTokensToSend, sendSlotStart,
-                  myPe + channelId * npes,
-                  *(args.tailMemObj->template GetAs<uint64_t*>(destPe) + myPe + channelId * npes));
+              if (myPe == 0 && channelId == 0) {
+                printf(
+                    "send RDMA putSignal(local) rank=%d call=%d warpId=%d destPe=%d "
+                    "numTokensToSend=%d "
+                    "sendSlotStart=%d offset=%d "
+                    "tail=%lu\n",
+                    myPe, args.crossDeviceBarrierFlag, warpId, destPe, numTokensToSend,
+                    sendSlotStart, myPe + channelId * npes,
+                    *(args.tailMemObj->template GetAs<uint64_t*>(destPe) + myPe +
+                      channelId * npes));
+              }
 #endif
             } else {
               shmem::ShmemPutUint64ImmNbiThread(args.tailMemObj,
                                                 (myPe + channelId * npes) * sizeof(uint64_t),
                                                 tailCache, destPe, channelId);
 #if DEBUG == 1
+              if (myPe == 0 && channelId == 0) {
+                printf(
+                    "send RDMA putSignal rank=%d ch=%d laneId=%d call=%d warpId=%d destPe=%d "
+                    "numTokensToSend=%d "
+                    "sendSlotStart=%d offset=%d "
+                    "tailCache=%lu\n",
+                    myPe, channelId, laneId, args.crossDeviceBarrierFlag, warpId, destPe,
+                    numTokensToSend, sendSlotStart, myPe + channelId * npes, tailCache);
+              }
               // will report cqe error
               shmem::ShmemQuietThread(destPe, channelId);
-              printf(
-                  "send RDMA putSignal rank=%d ch=%d laneId=%d call=%d warpId=%d destPe=%d "
-                  "numTokensToSend=%d "
-                  "sendSlotStart=%d offset=%d "
-                  "tailCache=%lu\n",
-                  myPe, channelId, laneId, args.crossDeviceBarrierFlag, warpId, destPe,
-                  numTokensToSend, sendSlotStart, myPe + channelId * npes, tailCache);
 #endif
             }
           }
@@ -301,8 +307,10 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
       if (laneId < nNodes) {
         args.localTail[(laneId * nlocalPes + myLocalPe) + channelId * npes] = tailCache;
 #if DEBUG == 1
-        printf("send RDMA after rank=%d ch=%d warpId=%d peerRank=%d args.localTail=%lu\n", myPe,
-               channelId, warpId, laneId * nlocalPes + myLocalPe, tailCache);
+        if (myPe == 0 && channelId == 0) {
+          printf("send RDMA after rank=%d ch=%d warpId=%d peerRank=%d args.localTail=%lu\n", myPe,
+                 channelId, warpId, laneId * nlocalPes + myLocalPe, tailCache);
+        }
 #endif
       }
     } else if (warpId < kSendWarpCount) {
@@ -437,8 +445,10 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
     __shared__ volatile int fwdFinish;
 
     if (warpId < kfwdWarpCount) {  // copy from shmemInpTokMemObj to shmemOutTokMemObj
-      if (warpId == 0) fwdHead[laneId / MAX_NODES][laneId % MAX_NODES] = 0;
-      if (laneId == 0) fwdFinish = 0;
+      if (warpId == 0) {
+        fwdHead[laneId / MAX_NODES][laneId % MAX_NODES] = 0;
+        if (laneId == 0) fwdFinish = 0;
+      }
       const int fwdLocalPe = warpId;
       const int fwdPe = myNode * nlocalPes + fwdLocalPe;
       index_t numTokensToRecv = 0;
@@ -446,7 +456,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         index_t* signal =
             args.recvTokenNumMemObj->template GetAs<index_t*>() + laneId + channelId * nNodes;
         numTokensToRecv = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
-        rdmaRecvTokensNum[laneId] = numTokensToRecv;
+        if (warpId == 0) rdmaRecvTokensNum[laneId] = numTokensToRecv;
       }
       __syncthreads();
       if (fwdLocalPe >= nlocalPes) {
@@ -469,9 +479,9 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
       uint64_t tailCache = headCache;
 
 #if DEBUG == 1
-      if (laneId < nNodes) {
-        printf("recv fwd before rank=%d ch=%d call=%d warpId=%d node=%d localHead=%lu\n", myPe,
-               channelId, args.crossDeviceBarrierFlag, warpId, laneId, headCache);
+      if (laneId < nNodes && myPe == 0 && channelId == 0) {
+        printf("recv fwd before rank=%d ch=%d fwdPe=%d call=%d warpId=%d node=%d localHead=%lu\n",
+               myPe, channelId, fwdPe, args.crossDeviceBarrierFlag, warpId, laneId, headCache);
       }
 #endif
 
@@ -627,10 +637,14 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
                 }
                 lastP2pTail = p2pTailCache;
 #if DEBUG == 1
-                printf(
-                    "recv fwd after rank=%d ch=%d warpId=%d fwdPe=%d p2p tail=%lu\n", myPe,
-                    channelId, warpId, fwdPe,
-                    *(args.tailMemObj->template GetAs<uint64_t*>(fwdPe) + channelId * npes + myPe));
+                if (myPe == 0 && channelId == 0 && laneId == warpSize - 1) {
+                  printf(
+                      "recv fwd after rank=%d ch=%d warpId=%d laneId=%d srcNode=%d fwdPe=%d p2p "
+                      "tail=%lu\n",
+                      myPe, channelId, warpId, laneId, srcNode, fwdPe,
+                      *(args.tailMemObj->template GetAs<uint64_t*>(fwdPe) + channelId * npes +
+                        myPe));
+                }
 #endif
               }
             }
@@ -653,8 +667,8 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         shmem::ShmemInt32WaitUntilEquals(statusPtr, 0);
         core::AtomicStoreRelaxedSystem(statusPtr, fwdCounter + 1);
 #if DEBUG == 1
-        if (laneId == 0) {
-          printf("recv fwd rank=%d ch=%d warpId=%d fwdPe=%d fwdCounter=%d\n", myPe, channelId,
+        if (laneId == 0 && myPe == 0 && channelId == 0) {
+          printf("recv fwd done rank=%d ch=%d warpId=%d fwdPe=%d fwdCounter=%d\n", myPe, channelId,
                  warpId, fwdPe, fwdCounter);
         }
 #endif
@@ -665,7 +679,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
       uint64_t headBase =
           laneId < nNodes ? args.localHead[(laneId * nlocalPes + myLocalPe) + channelId * npes] : 0;
 #if DEBUG == 1
-      if (laneId < nNodes) {
+      if (laneId < nNodes && myPe == 0 && channelId == 0) {
         printf(
             "recv Ctl before rank=%d ch=%d call=%d warpId=%d node=%d numTokensToRecv=%d "
             "localHead=%lu\n",
@@ -711,10 +725,13 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
       if (laneId < nNodes) {
         args.localHead[(laneId * nlocalPes + myLocalPe) + channelId * npes] = headBase + curMinHead;
 #if DEBUG == 1
-        printf("recv Ctl rank=%d ch=%d call=%d warpId=%d node=%d numRecvTokens=%d localHead=%lu\n",
-               myPe, channelId, args.crossDeviceBarrierFlag, warpId, laneId,
-               rdmaRecvTokensNum[laneId],
-               args.localHead[(laneId * nlocalPes + myLocalPe) + channelId * npes]);
+        if (myPe == 0 && channelId == 0) {
+          printf(
+              "recv Ctl rank=%d ch=%d call=%d warpId=%d node=%d numRecvTokens=%d localHead=%lu\n",
+              myPe, channelId, args.crossDeviceBarrierFlag, warpId, laneId,
+              rdmaRecvTokensNum[laneId],
+              args.localHead[(laneId * nlocalPes + myLocalPe) + channelId * npes]);
+        }
 #endif
         // clear rdmaRecvTokensNum
         rdmaRecvTokensNum[laneId] = 0;
