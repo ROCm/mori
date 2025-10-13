@@ -230,6 +230,10 @@ class EpDispatchCombineHandle {
   index_t* blockFlagCounter{nullptr};
   //
   uint32_t* interNodeBlocksBarrier{nullptr};
+
+  index_t* interNodeDispDestTokIdMap{nullptr};
+  index_t* interNodeChunkFlagCombine{nullptr};
+  index_t* interNodeDispSendMap{nullptr};
 };
 
 template <typename T>
@@ -272,6 +276,9 @@ struct EpDispatchCombineArgs {
   mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;
   index_t* blockFlagCounter{nullptr};
   uint32_t* interNodeBlocksBarrier{nullptr};
+  index_t* interNodeDispDestTokIdMap{nullptr};
+  index_t* interNodeChunkFlagCombine{nullptr};
+  index_t* interNodeDispSendMap{nullptr};
 };
 
 using EpDispatchCombineArgsVariant =
@@ -318,6 +325,9 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.nodeRecvTokenNumMemObj = handle.nodeRecvTokenNumMemObj;
   args.blockFlagCounter = handle.blockFlagCounter;
   args.interNodeBlocksBarrier = handle.interNodeBlocksBarrier;
+  args.interNodeDispDestTokIdMap = handle.interNodeDispDestTokIdMap;
+  args.interNodeChunkFlagCombine = handle.interNodeChunkFlagCombine;
+  args.interNodeDispSendMap = handle.interNodeDispSendMap;
   return args;
 }
 

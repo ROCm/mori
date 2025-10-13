@@ -155,8 +155,19 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipMalloc(&dispDestTokIdMap, maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispDestTokIdMap, 0, maxNumOutToken * sizeof(index_t)));
 
+  size_t maxNumInterNodeToken = config.worldSize / config.gpuPerNode *
+                                config.maxNumInpTokenPerRank * config.numExpertPerToken;
+  HIP_RUNTIME_CHECK(hipMalloc(&interNodeDispDestTokIdMap, maxNumInterNodeToken * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(
+      hipMemset(interNodeDispDestTokIdMap, 0, maxNumInterNodeToken * sizeof(index_t)));
+
   HIP_RUNTIME_CHECK(hipMalloc(&blockFlagCounter, sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(blockFlagCounter, 0, sizeof(index_t)));
+
+  size_t interNodeDispSendMapSize =
+      config.worldSize / config.gpuPerNode * config.maxNumInpTokenPerRank * sizeof(index_t);
+  HIP_RUNTIME_CHECK(hipMalloc(&interNodeDispSendMap, interNodeDispSendMapSize));
+  HIP_RUNTIME_CHECK(hipMemset(interNodeDispSendMap, 0, interNodeDispSendMapSize));
 }
 
 void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
@@ -170,7 +181,9 @@ void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
   ShmemFree(dispTokOffsetMemObj->localPtr);
   ShmemFree(dispTokIdToSrcTokIdMemObj->localPtr);
   HIP_RUNTIME_CHECK(hipFree(dispDestTokIdMap));
+  HIP_RUNTIME_CHECK(hipFree(interNodeDispDestTokIdMap));
   HIP_RUNTIME_CHECK(hipFree(blockFlagCounter));
+  HIP_RUNTIME_CHECK(hipFree(interNodeDispSendMap));
 }
 
 void EpDispatchCombineHandle::InitializeBarrier() {
@@ -187,6 +200,9 @@ void EpDispatchCombineHandle::InitializeBarrier() {
   interNodeChunkFlagMemObj =
       ShmemMallocAndReturnMemObjPtr(interNodeChunkFlagSize, hipDeviceMallocUncached);
 
+  HIP_RUNTIME_CHECK(hipMalloc(&interNodeChunkFlagCombine, interNodeChunkFlagSize));
+  HIP_RUNTIME_CHECK(hipMemset(interNodeChunkFlagCombine, 0, interNodeChunkFlagSize));
+
   HIP_RUNTIME_CHECK(hipMalloc(&interNodeBlocksBarrier, sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(interNodeBlocksBarrier, 0, sizeof(index_t)));
 }
@@ -194,6 +210,7 @@ void EpDispatchCombineHandle::InitializeBarrier() {
 void EpDispatchCombineHandle::FinalizeBarrier() {
   HIP_RUNTIME_CHECK(hipFree(dispatchGridBarrier));
   HIP_RUNTIME_CHECK(hipFree(combineGridBarrier));
+  HIP_RUNTIME_CHECK(hipFree(interNodeChunkFlagCombine));
   HIP_RUNTIME_CHECK(hipFree(interNodeBlocksBarrier));
   ShmemFree(crossDeviceBarrierMemObj->localPtr);
   ShmemFree(interNodeChunkFlagMemObj->localPtr);

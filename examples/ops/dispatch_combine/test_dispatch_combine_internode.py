@@ -317,6 +317,8 @@ class EpDispatchCombineTestCase:
             dispatch_output,
             dispatch_weights,
             all_rank_indices[self.rank],
+            block_num=self.config.block_num,
+            warp_per_block=8,
         )
         torch.cuda.synchronize()
 
@@ -333,7 +335,7 @@ class EpDispatchCombineTestCase:
                     if (pe // self.gpu_per_node == self.rank // self.gpu_per_node)
                 ]
             )
-            final_unique_pes = unique_innode_pes
+            final_unique_pes = unique_pes-unique_innode_pes
             # print(
             #     self.rank,
             #     f"token {i} pes {pes} unique pes {unique_pes} unique innode pes {unique_innode_pes}",
@@ -479,7 +481,8 @@ class EpDispatchCombineTestCase:
             dispatch_output,
             None,
             all_rank_indices[self.rank],
-            call_reset=False,
+            block_num=self.config.block_num,
+            warp_per_block=8,
         )
         # end_event.record()
         torch.cuda.synchronize()
