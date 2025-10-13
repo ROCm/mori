@@ -29,11 +29,24 @@ namespace mori {
 namespace moe {
 #define DEBUG 0
 #define DEBUG_DATA 0
-#define ASSERT_ON 0
+#define ASSERT_ON 1
 #define SPINS_CNT 100000
 #define RECV_DATA 1
 #define SEND_DATA 1
 #define COPY_DATA 1
+
+#if ASSERT_ON == 1
+#define KERNEL_ASSERT(cond)                                                                  \
+  do {                                                                                       \
+    if (!(cond)) {                                                                           \
+      printf("[ASSERT] Block %d Thread %d - %s:%d: %s\n", blockIdx.x, threadIdx.x, __FILE__, \
+             __LINE__, #cond);                                                               \
+      abort();                                                                               \
+    }                                                                                        \
+  } while (0)
+#else
+#define KERNEL_ASSERT(cond) ((void)0)
+#endif
 
 __device__ inline float tokenCheckValue(int srcPe, int srcTokenId) {
   return srcPe * 0.1f + 1.0f + srcTokenId;
@@ -46,10 +59,13 @@ template <typename T>
 __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
 
-  // TODO check if need sync
-  if (!(args.tokenIndices && args.inpTokenBuf)) {
-    return;
+  const index_t tokenNum = args.curRankNumToken;
+#if DEBUG == 1
+  if (tokenNum != 0) {
+    KERNEL_ASSERT(args.tokenIndices && args.inpTokenBuf);
   }
+#endif
+
   const int thdId = threadIdx.x;
   const int thdNum = blockDim.x;
   const int laneId = threadIdx.x & (warpSize - 1);
@@ -65,7 +81,6 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
   const int myNode = myPe / nlocalPes;
   const int nNodes = npes / nlocalPes;
 
-  const index_t tokenNum = args.curRankNumToken;
   const int numExpertPerToken = config.numExpertPerToken;
   const size_t tokenBytes = config.hiddenDim * sizeof(T);
   const size_t weightBytes = args.weightsBuf ? sizeof(float) * numExpertPerToken : 0;
@@ -200,9 +215,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           }
 
           uint64_t syncTailCache = __shfl(tailCache, destNode);
-#if ASSERT_ON == 1
-          assert(sendTokenNum > 0);
-#endif
+          KERNEL_ASSERT(sendTokenNum > 0);
 
 #if SEND_DATA == 1
           if (destNode != myNode) {
@@ -231,14 +244,12 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             // }
 #if DEBUG_DATA == 1
             if (laneId == 0) {
-#if ASSERT_ON == 1
-              // assert(float(*((T*)(args.shmemStagingTokMemObj->template GetAs<char*>() +
+              // KERNEL_ASSERT(float(*((T*)(args.shmemStagingTokMemObj->template GetAs<char*>() +
               //                     srcStagingOffset) +
               //                1)) == tokenCheckValue(myPe, 0));
-              assert(float(*((T*)(args.shmemStagingTokMemObj->template GetAs<char*>() +
-                                  srcStagingOffset) +
-                             1)) != float(0));
-#endif
+              KERNEL_ASSERT(float(*((T*)(args.shmemStagingTokMemObj->template GetAs<char*>() +
+                                         srcStagingOffset) +
+                                    1)) != float(0));
               // printf("DATA CHECK SEND RDMA PUT destNode=%d step=%lu srcData=%f\n", destNode,
               //        tailCache,
               //        float(*((T*)(args.shmemStagingTokMemObj->template GetAs<char*>() +
@@ -253,9 +264,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             sendSlotStart += sendTokenNum;
             // tailCache += sendTokenNum;
             tailCache += 1;
-#if ASSERT_ON == 1
-            assert(numTokensToSend >= 0 && sendSlotStart <= nodeTokenCount[destNode]);
-#endif
+            KERNEL_ASSERT(numTokensToSend >= 0 && sendSlotStart <= nodeTokenCount[destNode]);
 
             // Update rdma tail
             // TODO use amo (amo hang)
@@ -372,12 +381,11 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           // printf(
           //     "DATA CHECK SEND copy to RDMA staging node=%d slot=%d tailCache=%lu srcData=%f\n",
           //     node, slot, tailCache, float(*((T*)sendStagingPtr[node] + 0)));
-#if ASSERT_ON == 1
-          assert((float)(*((T*)sendStagingPtr[node] + 1)) != (float)(0));
-          assert((float)(*((T*)sendStagingPtr[node] + 1)) == tokenCheckValue(myPe, tokenIdx));
-          assert((float)(*((T*)sendStagingPtr[node] + config.hiddenDim - 1)) ==
-                 tokenCheckValue(myPe, tokenIdx));
-#endif
+          KERNEL_ASSERT((float)(*((T*)sendStagingPtr[node] + 1)) != (float)(0));
+          KERNEL_ASSERT((float)(*((T*)sendStagingPtr[node] + 1)) ==
+                        tokenCheckValue(myPe, tokenIdx));
+          KERNEL_ASSERT((float)(*((T*)sendStagingPtr[node] + config.hiddenDim - 1)) ==
+                        tokenCheckValue(myPe, tokenIdx));
         }
 #endif
 
@@ -533,9 +541,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           for (uint64_t i = tokenStart; i < tokenEnd; ++i) {
             if (srcNode == laneId) {
               --numTokensToRecv;
-#if ASSERT_ON == 1
-              assert(numTokensToRecv >= 0);
-#endif
+              KERNEL_ASSERT(numTokensToRecv >= 0);
             }
             --syncNumTokensToRecv;
             index_t slot = i;
@@ -550,9 +556,9 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
               continue;
             }
 
-#if DEBUG_DATA == 1 && ASSERT_ON == 1
+#if DEBUG_DATA == 1
             if (laneId == 0) {
-              assert(float(*(T*)srcPtr) != float(0));
+              KERNEL_ASSERT(float(*(T*)srcPtr) != float(0));
             }
 #endif
 
@@ -587,20 +593,18 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
                 index_t meta = *(reinterpret_cast<index_t*>(srcPtr + metaOffset));
                 int srcPe = meta / maxNumInpTokenPerRank;
                 int srcTokenId = meta % maxNumInpTokenPerRank;
-#if ASSERT_ON == 1
-                assert(float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
-                                    localTokenIdx * tokenBytes))) != (float)(0));
-                assert(float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
-                                    localTokenIdx * tokenBytes) +
-                               config.hiddenDim - 1)) != (float)(0));
+                KERNEL_ASSERT(float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
+                                           localTokenIdx * tokenBytes))) != (float)(0));
+                KERNEL_ASSERT(float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
+                                           localTokenIdx * tokenBytes) +
+                                      config.hiddenDim - 1)) != (float)(0));
 
-                assert(float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
-                                    localTokenIdx * tokenBytes))) ==
-                       tokenCheckValue(srcPe, srcTokenId));
-                assert(float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
-                                    localTokenIdx * tokenBytes) +
-                               config.hiddenDim - 1)) == tokenCheckValue(srcPe, srcTokenId));
-#endif
+                KERNEL_ASSERT(float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
+                                           localTokenIdx * tokenBytes))) ==
+                              tokenCheckValue(srcPe, srcTokenId));
+                KERNEL_ASSERT(float(*((T*)(reinterpret_cast<char*>(args.outTokenBuf) +
+                                           localTokenIdx * tokenBytes) +
+                                      config.hiddenDim - 1)) == tokenCheckValue(srcPe, srcTokenId));
                 // printf(
                 //     "DATA CHECK RECV fwd to output srcStep=%lu srcSlot=%d srcData=%f dst(output)
                 //     " "localTokenIdx=%d\n", step, slot,
@@ -617,9 +621,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
                                  tokenPackBytes;
               core::WarpCopy(dstPtr, srcPtr, tokenPackBytes);
 #if DEBUG_DATA == 1
-#if ASSERT_ON == 1
-              assert((float)(*(T*)dstPtr) != float(0));
-#endif
+              KERNEL_ASSERT((float)(*(T*)dstPtr) != float(0));
               // printf(
               //     "DATA CHECK RECV fwd to shmemOutTokMemObj srcStep=%lu srcSlot=%d srcData=%f "
               //     "dst p2pTailCache=%lu dstSlot=%lu\n",
@@ -714,9 +716,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             if (laneId == node) {
               numTokensToRecv -= (minHead - curMinHead) * stepRDMATokens;
               curMinHead = minHead;
-#if ASSERT_ON == 1
-              assert(numTokensToRecv > -stepRDMATokens);
-#endif
+              KERNEL_ASSERT(numTokensToRecv > -stepRDMATokens);
             }
           }
         }
@@ -783,9 +783,9 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
               args.shmemOutTokMemObj->template GetAs<char*>(srcPe) +
               ((channelId * nlocalPes + myLocalPe) * maxP2PStagingTokens + slot) * tokenPackBytes;
 
-#if DEBUG_DATA == 1 && ASSERT_ON == 1
+#if DEBUG_DATA == 1
           if (laneId == 0) {
-            assert(float(*(T*)srcPtr) != 0);
+            KERNEL_ASSERT(float(*(T*)srcPtr) != 0);
           }
 #endif
 
@@ -806,9 +806,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           //       "dst output localTokenIdx=%d\n",
           //       slot, (float)(*((T*)srcPtr)), localTokenIdx);
           // }
-#if ASSERT_ON == 1
-          assert((float)(*(T*)(srcPtr)) != 0);
-#endif
+          KERNEL_ASSERT((float)(*(T*)(srcPtr)) != 0);
 #endif
           if (weightBytes) {
             core::WarpCopy(
@@ -831,11 +829,9 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             index_t meta = *(reinterpret_cast<index_t*>(srcPtr + metaOffset));
             int srcPe = meta / maxNumInpTokenPerRank;
             int srcTokenId = meta % maxNumInpTokenPerRank;
-#if ASSERT_ON == 1
-            assert(float(*((T*)(srcPtr))) == tokenCheckValue(srcPe, srcTokenId));
-            assert(float(*((T*)(srcPtr) + config.hiddenDim - 1)) ==
-                   tokenCheckValue(srcPe, srcTokenId));
-#endif
+            KERNEL_ASSERT(float(*((T*)(srcPtr))) == tokenCheckValue(srcPe, srcTokenId));
+            KERNEL_ASSERT(float(*((T*)(srcPtr) + config.hiddenDim - 1)) ==
+                          tokenCheckValue(srcPe, srcTokenId));
 #endif
           }
 #endif
