@@ -33,7 +33,7 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, Trans
   MORI_IO_FUNCTION_TIMER;
 
   for (int i = 0; i < eps.size(); i++) {
-    const application::RdmaEndpoint& ep = eps[i].local;
+    const application::RdmaEndpoint& ep = eps[i]->local;
     NotifMessage msg{id, i, static_cast<int>(eps.size())};
 
     struct ibv_sge sge{};
@@ -128,7 +128,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
           reinterpret_cast<uint64_t>(new CqCallbackMessage(callbackMeta, epTotalBatchSize));
       last.send_flags = IBV_SEND_SIGNALED;
     }
-    int ret = ibv_post_send(eps[epId].local.ibvHandle.qp, wrs.data() + st, nullptr);
+    int ret = ibv_post_send(eps[epId]->local.ibvHandle.qp, wrs.data() + st, nullptr);
     if (ret != 0) {
       return {StatusCode::ERR_RDMA_OP, strerror(errno)};
     }

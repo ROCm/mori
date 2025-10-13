@@ -169,7 +169,12 @@ class Backend {
   };
   virtual Health health() const noexcept { return health_.load(std::memory_order_acquire); }
 
- protected:
+  static void ConfigureErrorThresholds(uint32_t failThreshold, uint32_t windowMs) {
+    auto& t = thresholds();
+    t.recoverable_fail_threshold = failThreshold;
+    t.recoverable_window_ms = windowMs;
+  }
+
   void report_error(const ErrorRecord& rec) noexcept {
     // if fatal -> Failed; if recoverable and previously healthy -> Degraded.
     if (rec.severity == Severity::Fatal) {
@@ -211,11 +216,7 @@ class Backend {
     uint32_t recoverable_fail_threshold{50};
     uint32_t recoverable_window_ms{30000};
   };
-  static void ConfigureErrorThresholds(uint32_t failThreshold, uint32_t windowMs) {
-    auto& t = thresholds();
-    t.recoverable_fail_threshold = failThreshold;
-    t.recoverable_window_ms = windowMs;
-  }
+
   static Thresholds& thresholds() {
     static Thresholds t{};
     return t;

@@ -107,10 +107,53 @@ struct EpPair {
   EngineKey remoteEngineKey;
   application::RdmaEndpoint local;
   application::RdmaEndpointHandle remote;
+  // Topology info for possible rebuild
+  TopoKeyPair topoKey;
+  // Rebuild / error tracking (lightweight; thresholds handled elsewhere)
+  std::atomic<uint32_t> retry_exhausted_count{0};
+  std::atomic<uint32_t> timeout_count{0};
+  std::atomic<uint32_t> flush_err_count{0};
+  std::atomic<uint32_t> rebuild_generation{0};
+  std::atomic<bool> scheduled_rebuild{false};
 };
 
-using EpPairVec = std::vector<EpPair>;
-using RouteTable = std::unordered_map<TopoKeyPair, EpPairVec>;
+// EpHandle design note:
+// In the next iteration we may introduce an EpHandle abstraction wrapping a shared_ptr<EpPair>
+// with an atomic swap capability so sessions can hold lightweight handles and automatically
+// observe rebuilt QPs without recreating their EpPairVec. Current code mutates EpPair in place
+// and updates the epsMap key; sessions that cached the pointer see the new QP fields, but any
+// code storing the old QPN as key will need to refresh. EpHandle would provide:
+//   struct EpHandle { std::atomic<EpPair*> cur; EpPairPtr owner; };
+// Allowing transparent reload while keeping ownership semantics explicit.
+
+using EpPairPtr = std::shared_ptr<EpPair>;
+
+// EpHandle wraps an EpPairPtr allowing atomic pointer swap on rebuild without invalidating handles
+struct EpHandle {
+  explicit EpHandle(EpPairPtr ep) : owner(std::move(ep)) { cur.store(owner.get()); }
+  EpHandle(const EpHandle&) = delete;
+  EpHandle& operator=(const EpHandle&) = delete;
+  EpHandle(EpHandle&&) = delete;
+  EpHandle& operator=(EpHandle&&) = delete;
+  ~EpHandle() = default;
+
+  EpPair* get() const { return cur.load(std::memory_order_acquire); }
+  EpPairPtr shared() const { return owner; }
+  uint32_t qpn() const { return get()->local.handle.qpn; }
+  void update(EpPairPtr n) {
+    owner = std::move(n);
+    cur.store(owner.get(), std::memory_order_release);
+  }
+
+ private:
+  std::atomic<EpPair*> cur{nullptr};
+  EpPairPtr owner;
+};
+using EpHandlePtr = std::shared_ptr<EpHandle>;
+using EpHandleVec = std::vector<EpHandlePtr>;
+// For RDMA posting functions we still reuse EpPairVec as a snapshot of current pointers.
+using EpPairVec = std::vector<EpPairPtr>;
+using RouteTable = std::unordered_map<TopoKeyPair, EpHandleVec>;
 using MemoryTable = std::unordered_map<MemoryKey, application::RdmaMemoryRegion>;
 
 struct RemoteEngineMeta {

@@ -126,7 +126,27 @@ int RdmaManager::CountEndpoint(EngineKey engine, TopoKeyPair key) {
 
 EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
   std::shared_lock<std::shared_mutex> lock(mu);
-  return remotes[engine].rTable[key];
+  EpPairVec out;
+  auto engIt = remotes.find(engine);
+  if (engIt == remotes.end()) return out;
+  auto rtIt = engIt->second.rTable.find(key);
+  if (rtIt == engIt->second.rTable.end()) return out;
+  out.reserve(rtIt->second.size());
+  for (auto& handle : rtIt->second) {
+    out.push_back(handle->shared());
+  }
+  return out;
+}
+
+EpHandleVec RdmaManager::GetAllEndpointHandles(EngineKey engine, TopoKeyPair key) {
+  std::shared_lock<std::shared_mutex> lock(mu);
+  EpHandleVec out;
+  auto engIt = remotes.find(engine);
+  if (engIt == remotes.end()) return out;
+  auto rtIt = engIt->second.rTable.find(key);
+  if (rtIt == engIt->second.rTable.end()) return out;
+  out = rtIt->second;  // shallow copy of shared_ptr handles
+  return out;
 }
 
 application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int portId) {
@@ -160,15 +180,63 @@ void RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId, application::R
   std::unique_lock<std::shared_mutex> lock(mu);
   deviceCtxs[devId]->ConnectEndpoint(local.handle, remote);
   RemoteEngineMeta& meta = remotes[remoteKey];
-  EpPair ep{weight, devId, rdevId, remoteKey, local, remote};
-  meta.rTable[topoKey].push_back(ep);
-  epsMap.insert({ep.local.handle.qpn, ep});
+  EpPairPtr epPair = std::make_shared<EpPair>();
+  epPair->weight = weight;
+  epPair->ldevId = devId;
+  epPair->rdevId = rdevId;
+  epPair->remoteEngineKey = remoteKey;
+  epPair->local = local;
+  epPair->remote = remote;
+  epPair->topoKey = topoKey;
+  EpHandlePtr handle = std::make_shared<EpHandle>(epPair);
+  meta.rTable[topoKey].push_back(handle);
+  epsMap.insert({epPair->local.handle.qpn, epPair});
 }
 
-std::optional<EpPair> RdmaManager::GetEpPairByQpn(uint32_t qpn) {
+std::optional<EpPairPtr> RdmaManager::GetEpPairPtrByQpn(uint32_t qpn) {
   std::shared_lock<std::shared_mutex> lock(mu);
-  if (epsMap.find(qpn) == epsMap.end()) return std::nullopt;
-  return epsMap[qpn];
+  auto it = epsMap.find(qpn);
+  if (it == epsMap.end()) return std::nullopt;
+  return it->second;
+}
+
+std::optional<EpPairPtr> RdmaManager::RebuildEndpoint(uint32_t qpn) {
+  std::unique_lock<std::shared_mutex> lock(mu);
+  auto it = epsMap.find(qpn);
+  if (it == epsMap.end()) return std::nullopt;
+  EpPairPtr oldEp = it->second;
+  application::RdmaDeviceContext* devCtx = GetOrCreateDeviceContext(oldEp->ldevId);
+  // 1. Create brand new endpoint
+  application::RdmaEndpoint newLocal =
+      devCtx->CreateRdmaEndpoint(GetRdmaEndpointConfig(availDevices[oldEp->ldevId].second));
+  deviceCtxs[oldEp->ldevId]->ConnectEndpoint(newLocal.handle, oldEp->remote);
+  // 2. Prepare new EpPair
+  EpPairPtr newEp = std::make_shared<EpPair>();
+  newEp->weight = oldEp->weight;
+  newEp->ldevId = oldEp->ldevId;
+  newEp->rdevId = oldEp->rdevId;
+  newEp->remoteEngineKey = oldEp->remoteEngineKey;
+  newEp->remote = oldEp->remote;
+  newEp->topoKey = oldEp->topoKey;
+  newEp->rebuild_generation.store(oldEp->rebuild_generation.load(std::memory_order_relaxed) + 1,
+                                  std::memory_order_relaxed);
+  newEp->scheduled_rebuild.store(false, std::memory_order_release);
+  newEp->local = newLocal;
+  // 3. Find its handle in route table and atomically swap pointer inside handle
+  RemoteEngineMeta& meta = remotes[newEp->remoteEngineKey];
+  auto& vec = meta.rTable[newEp->topoKey];
+  for (auto& h : vec) {
+    if (h->qpn() == qpn) {  // match old
+      h->update(newEp);     // atomic store of new raw pointer
+      break;
+    }
+  }
+  // 4. Update epsMap: remove old qpn entry, insert new qpn->newEp
+  epsMap.erase(it);
+  epsMap.emplace(newEp->local.handle.qpn, newEp);
+  // 5. Mark old as retired (optional flags)
+  oldEp->scheduled_rebuild.store(false, std::memory_order_release);
+  return newEp;
 }
 
 application::RdmaDeviceContext* RdmaManager::GetRdmaDeviceContext(int devId) {
@@ -179,7 +247,7 @@ application::RdmaDeviceContext* RdmaManager::GetRdmaDeviceContext(int devId) {
 void RdmaManager::EnumerateEndpoints(const EnumerateEpCallbackFunc& func) {
   std::shared_lock<std::shared_mutex> lock(mu);
   for (auto& it : epsMap) {
-    func(it.first, it.second);
+    func(it.first, *it.second);
   }
 }
 
@@ -207,9 +275,18 @@ void NotifManager::RegisterEndpointByQpn(uint32_t qpn) {
     epoll_event ev;
     ev.events = EPOLLIN;
     ev.data.u32 = qpn;
-    std::optional<EpPair> ep = rdma->GetEpPairByQpn(qpn);
-    assert(ep.has_value() && ep->local.ibvHandle.compCh);
-    SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_ADD, ep->local.ibvHandle.compCh->fd, &ev));
+    std::optional<EpPairPtr> ep = rdma->GetEpPairPtrByQpn(qpn);
+    assert(ep.has_value() && (*ep)->local.ibvHandle.compCh);
+    SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_ADD, (*ep)->local.ibvHandle.compCh->fd, &ev));
+  }
+}
+
+void NotifManager::UnregisterEndpointByQpn(uint32_t qpn) {
+  if (config.pollCqMode == PollCqMode::EVENT) {
+    std::optional<EpPairPtr> ep = rdma->GetEpPairPtrByQpn(qpn);
+    if (ep.has_value() && (*ep)->local.ibvHandle.compCh) {
+      epoll_ctl(epfd, EPOLL_CTL_DEL, (*ep)->local.ibvHandle.compCh->fd, nullptr);
+    }
   }
 }
 
@@ -336,12 +413,56 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
               rec.code = Backend::ErrorCode::RemoteDisconnect;
               rec.severity = Backend::Severity::Recoverable;  // may escalate if frequent
               break;
+            case IBV_WC_WR_FLUSH_ERR:
+              rec.code = Backend::ErrorCode::Transient;
+              rec.severity = Backend::Severity::Recoverable;
+              break;
             default:
               rec.code = Backend::ErrorCode::Internal;
               rec.severity = Backend::Severity::Fatal;
               break;
           }
           if (owner) owner->report_error(rec);
+          // QP rebuild scheduling logic (lightweight heuristic for now)
+          if (rec.severity != Backend::Severity::Info) {
+            auto epPtrOpt = rdma->GetEpPairPtrByQpn(ep.local.handle.qpn);
+            if (epPtrOpt.has_value()) {
+              EpPairPtr epPtr = *epPtrOpt;
+              bool needRebuild = false;
+              switch (wc.status) {
+                case IBV_WC_WR_FLUSH_ERR:
+                  epPtr->flush_err_count.fetch_add(1, std::memory_order_relaxed);
+                  needRebuild = true;  // flush indicates QP moved to error
+                  break;
+                case IBV_WC_RETRY_EXC_ERR:
+                  if (epPtr->retry_exhausted_count.fetch_add(1, std::memory_order_relaxed) > 5)
+                    needRebuild = true;
+                  break;
+                case IBV_WC_RESP_TIMEOUT_ERR:
+                  if (epPtr->timeout_count.fetch_add(1, std::memory_order_relaxed) > 5)
+                    needRebuild = true;
+                  break;
+                default:
+                  break;
+              }
+              if (needRebuild && !epPtr->scheduled_rebuild.exchange(true)) {
+                // Rebuild inline (could be offloaded to separate thread later)
+                auto rebuilt = rdma->RebuildEndpoint(ep.local.handle.qpn);
+                if (rebuilt.has_value()) {
+                  MORI_IO_INFO("QP rebuild success old_qpn {} new_qpn {} gen {}",
+                               ep.local.handle.qpn, (*rebuilt)->local.handle.qpn,
+                               (*rebuilt)->rebuild_generation.load(std::memory_order_relaxed));
+                  // Re-register new QP for event mode
+                  if (config.pollCqMode == PollCqMode::EVENT) {
+                    RegisterEndpointByQpn((*rebuilt)->local.handle.qpn);
+                    UnregisterEndpointByQpn(ep.local.handle.qpn);
+                  }
+                } else {
+                  MORI_IO_INFO("QP rebuild failed qpn {}", ep.local.handle.qpn);
+                }
+              }
+            }
+          }
         }
       }
       MORI_IO_TRACE(
@@ -374,10 +495,10 @@ void NotifManager::MainLoop() {
       for (int i = 0; i < nfds; ++i) {
         uint32_t qpn = events[i].data.u32;
 
-        std::optional<EpPair> ep = rdma->GetEpPairByQpn(qpn);
+        std::optional<EpPairPtr> ep = rdma->GetEpPairPtrByQpn(qpn);
         if (!ep.has_value()) continue;
 
-        struct ibv_comp_channel* ch = ep->local.ibvHandle.compCh;
+        struct ibv_comp_channel* ch = (*ep)->local.ibvHandle.compCh;
 
         struct ibv_cq* cq = nullptr;
         void* evCtx = nullptr;
@@ -385,7 +506,7 @@ void NotifManager::MainLoop() {
         ibv_ack_cq_events(cq, 1);
         ibv_req_notify_cq(cq, 0);
 
-        ProcessOneCqe(qpn, ep.value());
+        ProcessOneCqe(qpn, *(*ep));
       }
     }
   } else {
@@ -614,9 +735,9 @@ void ControlPlaneServer::Shutdown() {
  */
 RdmaBackendSession::RdmaBackendSession(const RdmaBackendConfig& config,
                                        const application::RdmaMemoryRegion& l,
-                                       const application::RdmaMemoryRegion& r, const EpPairVec& e,
+                                       const application::RdmaMemoryRegion& r, const EpHandleVec& h,
                                        Executor* exec)
-    : config(config), local(l), remote(r), eps(e), executor(exec) {}
+    : config(config), local(l), remote(r), handles(h), executor(exec) {}
 
 void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
@@ -624,8 +745,12 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
   status->SetCode(StatusCode::IN_PROGRESS);
   CqCallbackMeta* callbackMeta = new CqCallbackMeta(status, id, 1);
 
-  RdmaOpRet ret =
-      RdmaReadWrite(eps, local, localOffset, remote, remoteOffset, size, callbackMeta, id, isRead);
+  // snapshot current EpPairs for this op
+  EpPairVec snapshot;
+  snapshot.reserve(handles.size());
+  for (auto& h : handles) snapshot.push_back(h->shared());
+  RdmaOpRet ret = RdmaReadWrite(snapshot, local, localOffset, remote, remoteOffset, size,
+                                callbackMeta, id, isRead);
 
   assert(!ret.Init());
   if (ret.Failed() || ret.Succeeded()) {
@@ -633,7 +758,7 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
     status->SetMessage(ret.message);
   }
   if (!ret.Failed()) {
-    RdmaNotifyTransfer(eps, status, id);
+    RdmaNotifyTransfer(snapshot, status, id);
   }
 }
 
@@ -643,14 +768,17 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
   CqCallbackMeta* callbackMeta = new CqCallbackMeta(status, id, sizes.size());
+  EpPairVec snapshot;
+  snapshot.reserve(handles.size());
+  for (auto& h : handles) snapshot.push_back(h->shared());
   RdmaOpRet ret;
   if (executor) {
-    ExecutorReq req{eps,          local, localOffsets,         remote, remoteOffsets, sizes,
+    ExecutorReq req{snapshot,     local, localOffsets,         remote, remoteOffsets, sizes,
                     callbackMeta, id,    config.postBatchSize, isRead};
     ret = executor->RdmaBatchReadWrite(req);
   } else {
-    ret = RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, callbackMeta,
-                             id, isRead, config.postBatchSize);
+    ret = RdmaBatchReadWrite(snapshot, local, localOffsets, remote, remoteOffsets, sizes,
+                             callbackMeta, id, isRead, config.postBatchSize);
   }
   assert(!ret.Init());
   if (ret.Failed() || ret.Succeeded()) {
@@ -658,7 +786,7 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
     status->SetMessage(ret.message);
   }
   if (!ret.Failed()) {
-    RdmaNotifyTransfer(eps, status, id);
+    RdmaNotifyTransfer(snapshot, status, id);
   }
 }
 
@@ -762,28 +890,28 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
   for (int i = 0; i < (config.qpPerTransfer - epNum); i++) {
     server->BuildRdmaConn(ekey, kp);
   }
-  EpPairVec eps = rdma->GetAllEndpoint(ekey, kp);
-  assert(!eps.empty());
-
-  EpPairVec epSet = {eps.begin(), eps.begin() + config.qpPerTransfer};
-
-  // TODO: we assume all eps is on same device and has same ldevId/rdevId
-  EpPair ep = epSet[0];
-  auto localMr = rdma->GetLocalMemory(ep.ldevId, local.id);
+  EpHandleVec handles = rdma->GetAllEndpointHandles(ekey, kp);
+  assert(!handles.empty());
+  if (handles.size() > static_cast<size_t>(config.qpPerTransfer)) {
+    handles.resize(config.qpPerTransfer);
+  }
+  // TODO: we assume all selected endpoints are on same device
+  EpPairPtr ep = handles[0]->shared();
+  auto localMr = rdma->GetLocalMemory(ep->ldevId, local.id);
   if (!localMr.has_value()) {
-    localMr = rdma->RegisterLocalMemory(ep.ldevId, local);
+    localMr = rdma->RegisterLocalMemory(ep->ldevId, local);
   }
 
-  auto remoteMr = rdma->GetRemoteMemory(ekey, ep.rdevId, remote.id);
+  auto remoteMr = rdma->GetRemoteMemory(ekey, ep->rdevId, remote.id);
   if (!remoteMr.has_value()) {
-    remoteMr = server->AskRemoteMemoryRegion(ekey, ep.rdevId, remote.id);
+    remoteMr = server->AskRemoteMemoryRegion(ekey, ep->rdevId, remote.id);
     // TODO: protocol should return status code
     // Currently we check member equality to ensure correct memory region
     assert(remoteMr->length == remote.size);
-    rdma->RegisterRemoteMemory(ekey, ep.rdevId, remote.id, remoteMr.value());
+    rdma->RegisterRemoteMemory(ekey, ep->rdevId, remote.id, remoteMr.value());
   }
 
-  sess = RdmaBackendSession(config, localMr.value(), remoteMr.value(), epSet, executor.get());
+  sess = RdmaBackendSession(config, localMr.value(), remoteMr.value(), handles, executor.get());
 }
 
 bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,

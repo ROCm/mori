@@ -69,10 +69,13 @@ class RdmaManager {
   // Endpoint management APIs
   int CountEndpoint(EngineKey, TopoKeyPair);
   EpPairVec GetAllEndpoint(EngineKey, TopoKeyPair);
+  EpHandleVec GetAllEndpointHandles(EngineKey, TopoKeyPair);
   application::RdmaEndpoint CreateEndpoint(int devId);
   void ConnectEndpoint(EngineKey remoteKey, int ldevId, application::RdmaEndpoint local, int rdevId,
                        application::RdmaEndpointHandle remote, TopoKeyPair key, int weight);
-  std::optional<EpPair> GetEpPairByQpn(uint32_t qpn);
+  std::optional<EpPairPtr> GetEpPairPtrByQpn(uint32_t qpn);
+  // QP rebuild: create new endpoint to replace an existing ep (identified by qpn)
+  std::optional<EpPairPtr> RebuildEndpoint(uint32_t qpn);
 
   application::RdmaDeviceContext* GetRdmaDeviceContext(int devId);
 
@@ -93,7 +96,7 @@ class RdmaManager {
 
   MemoryTable mTable;
   std::unordered_map<EngineKey, RemoteEngineMeta> remotes;
-  std::unordered_map<uint32_t, EpPair> epsMap;
+  std::unordered_map<uint32_t, EpPairPtr> epsMap;
 
   std::unique_ptr<application::TopoSystem> topo{nullptr};
 };
@@ -107,6 +110,7 @@ class NotifManager {
   ~NotifManager();
 
   void RegisterEndpointByQpn(uint32_t qpn);
+  void UnregisterEndpointByQpn(uint32_t qpn);
   // void DeregisterEndpoint(EpPair*);
 
   void RegisterDevice(int devId);
@@ -198,7 +202,7 @@ class RdmaBackendSession : public BackendSession {
  public:
   RdmaBackendSession() = default;
   RdmaBackendSession(const RdmaBackendConfig& config, const application::RdmaMemoryRegion& local,
-                     const application::RdmaMemoryRegion& remote, const EpPairVec& eps,
+                     const application::RdmaMemoryRegion& remote, const EpHandleVec& handles,
                      Executor* executor);
   ~RdmaBackendSession() = default;
 
@@ -215,7 +219,7 @@ class RdmaBackendSession : public BackendSession {
   RdmaBackendConfig config{};
   application::RdmaMemoryRegion local{};
   application::RdmaMemoryRegion remote{};
-  EpPairVec eps{};
+  EpHandleVec handles{};  // vector of EpHandle shared_ptr
   Executor* executor{nullptr};
 };
 
