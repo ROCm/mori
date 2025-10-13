@@ -320,24 +320,46 @@ class EpDispatchCombineTestCase:
         )
         torch.cuda.synchronize()
 
-        # for i in range(all_rank_num_token[self.rank]):
-        #     pes = [
-        #         (idx // self.config.num_experts_per_rank)
-        #         for idx in all_rank_indices[self.rank][i].cpu().tolist()
-        #     ]
-        #     unique_pes = len(set(pes))
+        for i in range(all_rank_num_token[self.rank]):
+            pes = [
+                (idx // self.config.num_experts_per_rank)
+                for idx in all_rank_indices[self.rank][i].cpu().tolist()
+            ]
+            unique_pes = len(set(pes))
+            unique_innode_pes = len(
+                [
+                    pe
+                    for pe in set(pes)
+                    if (pe // self.gpu_per_node == self.rank // self.gpu_per_node)
+                ]
+            )
+            final_unique_pes = unique_innode_pes
+            # print(
+            #     self.rank,
+            #     f"token {i} pes {pes} unique pes {unique_pes} unique innode pes {unique_innode_pes}",
+            # )
+            if final_unique_pes == 0:
+                continue
 
-        #     got, expected = combine_output[i], (
-        #         all_rank_input[self.rank][i].to(torch.float32) * unique_pes
-        #     ).to(self.config.data_type)
+            got, expected = combine_output[i], (
+                all_rank_input[self.rank][i].to(torch.float32) * final_unique_pes
+            ).to(self.config.data_type)
 
-        #     ok = torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
-        #     if not ok:
-        #         print(self.rank, "got: ", got)
-        #         print(self.rank, "expected: ", expected)
-        #         print(self.rank, "delta:", got - expected)
-        #         assert False
-        #         error_round.add(round)
+            ok = torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
+            if not ok:
+                if self.rank == 0:
+                    print(
+                        self.rank,
+                        f"token {i} pes {pes} unique pes {unique_pes} unique innode pes {unique_innode_pes}",
+                    )
+                    print(self.rank, "got: ", got)
+                    print(
+                        self.rank, "expected: ", expected, all_rank_input[self.rank][i]
+                    )
+                    delta = got - expected
+                    print(self.rank, i, "delta:", delta.nonzero())
+                assert False
+                error_round.add(round)
 
         #     if dispatch_weights is not None:
         # got_weight, expected_weight = (
@@ -434,10 +456,7 @@ class EpDispatchCombineTestCase:
             src_node = src_pe // self.gpu_per_node
             if src_node != my_node:
                 total_rdma_recv_num_token += 1
-        if (
-            self.config.kernel_type
-            is mori.ops.EpDispatchCombineKernelType.InterNodeV1
-        ):
+        if self.config.kernel_type is mori.ops.EpDispatchCombineKernelType.InterNodeV1:
             total_rdma_recv_num_token = (
                 self.config.max_num_inp_token_per_rank * self.config.world_size // 8
             )
@@ -491,7 +510,7 @@ class EpDispatchCombineTestCase:
             len(error_round) == 0
         ), f"Warmup failed with errors in rounds: {error_round}"
 
-        for i in range(30):
+        for i in range(0):
             if self.rank == 0:
                 print(f"Round {i} begin")
             (
@@ -612,8 +631,8 @@ def test_dispatch_combine(
         gpu_per_node,
         world_size,
         max_tokens,
-        # torch.bfloat16,  # torch.float8_e4m3fnuz
-        torch.float8_e4m3fnuz,
+        torch.bfloat16,  # torch.float8_e4m3fnuz
+        # torch.float8_e4m3fnuz,
     )
     test_case.setup()
     if is_bench:

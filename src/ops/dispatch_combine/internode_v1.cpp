@@ -32,38 +32,36 @@ namespace moe {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                   EpDispatchInterNodeV1Kernel                                  */
 /* ---------------------------------------------------------------------------------------------- */
-#define DEF_COMMON_VARS                                                  \
-  const EpDispatchCombineConfig& config = args.config;                   \
-  int thdId = threadIdx.x;                                               \
-  int thdNum = blockDim.x;                                               \
-  int laneId = threadIdx.x & (warpSize - 1);                             \
-  int warpId = thdId / warpSize;                                         \
-  int warpNum = blockDim.x / warpSize;                                   \
-  int blockNum = gridDim.x;                                              \
-  int blockId = blockIdx.x;                                              \
-  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;               \
-  int globalThdNum = gridDim.x * blockDim.x;                             \
-  int globalWarpId = blockIdx.x * warpNum + warpId;                      \
-  int globalWarpNum = gridDim.x * warpNum;                               \
-  int myPe = config.rank;                                                \
-  int npes = config.worldSize;                                           \
-  int myNode = myPe / config.gpuPerNode;                                 \
-  int nNodes = npes / config.gpuPerNode;                                 \
-  size_t MaxNumTokensToSendPerRank = config.MaxNumTokensToSendPerRank(); \
-  size_t MaxNumTokensToRecvPerRank = config.MaxNumTokensToRecvPerRank(); \
-  size_t MaxNumTokensToRecv = config.MaxNumTokensToRecv();               \
-  int numExpertPerToken = config.numExpertPerToken;                      \
-  assert(numExpertPerToken < warpSize);                                  \
-  size_t hiddenBytes = config.hiddenDim * sizeof(T);                     \
-  size_t indexBytes = config.numExpertPerToken * sizeof(index_t);        \
-  size_t weightBytes = config.numExpertPerToken * sizeof(float);         \
-  size_t srcTokenIdBytes = sizeof(index_t);                              \
+#define DEF_COMMON_VARS                                             \
+  const EpDispatchCombineConfig& config = args.config;              \
+  int thdId = threadIdx.x;                                          \
+  int thdNum = blockDim.x;                                          \
+  int laneId = threadIdx.x & (warpSize - 1);                        \
+  int warpId = thdId / warpSize;                                    \
+  int warpNum = blockDim.x / warpSize;                              \
+  int blockNum = gridDim.x;                                         \
+  int blockId = blockIdx.x;                                         \
+  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;          \
+  int globalThdNum = gridDim.x * blockDim.x;                        \
+  int globalWarpId = blockIdx.x * warpNum + warpId;                 \
+  int globalWarpNum = gridDim.x * warpNum;                          \
+  int nullTokenId = config.worldSize * config.MaxNumTokensToRecv(); \
+  int myPe = config.rank;                                           \
+  int npes = config.worldSize;                                      \
+  int myNode = myPe / config.gpuPerNode;                            \
+  int nNodes = npes / config.gpuPerNode;                            \
+  int numExpertPerToken = config.numExpertPerToken;                 \
+  assert(numExpertPerToken < warpSize);                             \
+  size_t hiddenBytes = config.hiddenDim * sizeof(T);                \
+  size_t indexBytes = config.numExpertPerToken * sizeof(index_t);   \
+  size_t weightBytes = config.numExpertPerToken * sizeof(float);    \
+  size_t srcTokenIdBytes = sizeof(index_t);                         \
   size_t xferBytes = hiddenBytes + indexBytes + weightBytes + srcTokenIdBytes;
 
 namespace v1 {
 template <typename T>
-inline __device__ void DispatchSendIntraNodeBlock(EpDispatchCombineArgs<T>& args, int tokenId,
-                                                  int expId, int destPe) {
+inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, int tokenId,
+                                              int expId, int destPe) {
   DEF_COMMON_VARS;
 
   index_t tokenExpertId = tokenId * args.config.numExpertPerToken + expId;
@@ -72,7 +70,9 @@ inline __device__ void DispatchSendIntraNodeBlock(EpDispatchCombineArgs<T>& args
     // decide token id in dest pe
     destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
     atomicAdd(args.destPeTokenCounter + destPe, 1);
-    args.dispDestTokIdMap[tokenExpertId] = destPe * MaxNumTokensToSendPerRank + destTokId;
+    args.dispDestTokIdMap[tokenExpertId] = destPe * config.MaxNumTokensToRecv() + destTokId;
+    // printf("send myPe %d tokenExpertId %lu index %lu destPe %lu destTokId %d\n", myPe,
+    //        tokenExpertId, destPe * config.MaxNumTokensToRecv() + destTokId, destPe, destTokId);
 
     core::AtomicStoreRelaxedSystem(
         args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe) + destTokId,
@@ -99,7 +99,7 @@ inline __device__ void DispatchSendIntraNodeBlock(EpDispatchCombineArgs<T>& args
 }
 
 template <typename T>
-inline __device__ void DispatchSendIntraNode(EpDispatchCombineArgs<T>& args) {
+inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
 
   // Distribute tokens evenly to all blocks
@@ -123,10 +123,10 @@ inline __device__ void DispatchSendIntraNode(EpDispatchCombineArgs<T>& args) {
       int destNode = destPe / config.gpuPerNode;
       if (destNode == myNode) {
         if (__any((laneId < e) && (destPe == lanePe))) {
-          if (laneId == 0) args.dispDestTokIdMap[tokenExpertId] = config.MaxNumTokensToRecv();
+          if (laneId == 0) args.dispDestTokIdMap[tokenExpertId] = nullTokenId;
           continue;
         }
-        DispatchSendIntraNodeBlock(args, tokenId, e, destPe);
+        DispatchIntraNodeBlock(args, tokenId, e, destPe);
       }
     }
   }
@@ -173,7 +173,10 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
       for (int e = 0; e < config.numExpertPerToken; e++) {
         int destNode = args.tokenIndices[tokenId * numExpertPerToken + e] /
                        config.numExpertPerRank / config.gpuPerNode;
-        shouldSend |= (destNode == i);
+        if (destNode == i) {
+          shouldSend |= true;
+          args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = nullTokenId;
+        }
       }
       uint64_t mask = __ballot(shouldSend) & __activemask();
       uint64_t num = __popcll(mask);
@@ -368,23 +371,118 @@ __global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
     v1::DispatchInterNodeSend(args);
     v1::DispatchInterNodeRecv(args);
   } else {
-    v1::DispatchSendIntraNode(args);
+    v1::DispatchIntraNode(args);
   }
   v1::DispatchSync(args);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                    EpCombineInterNodeKernel                                    */
+/*                                   EpCombineInterNodeV1Kernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
+namespace v1 {
+
+template <typename T>
+inline __device__ void CombineIntraNodeSync(EpDispatchCombineArgs<T>& args) {
+  DEF_COMMON_VARS;
+
+  // Distribute tokens evenly to all blocks
+  int blockOffset = config.rdmaBlockNum;
+  int xgmiBlockNum = blockNum - config.rdmaBlockNum;
+
+  // Copy input to shmem registered buffer so that other GPUs can access directly
+  index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
+  int tokenPerBlock = core::CeilDiv(totalRecvTokenNum, xgmiBlockNum);
+  int startTokenIdx = (blockId - blockOffset) * tokenPerBlock;
+  int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, totalRecvTokenNum);
+  for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
+    core::WarpCopy(args.shmemInpTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim,
+                   args.inpTokenBuf + tokenId * config.hiddenDim, config.hiddenDim);
+  }
+
+  // After all warps copy done, set barrier flag
+  int finishedWarp = 0;
+  if (laneId == 0) finishedWarp = atomicAdd(args.combineGridBarrier, 1);
+  finishedWarp = __shfl(finishedWarp, 0);
+  if ((finishedWarp + 1) == (xgmiBlockNum * warpNum)) {
+    if (laneId < config.gpuPerNode) {
+      int destPe = myNode * config.gpuPerNode + laneId;
+      core::AtomicStoreRelaxedSystem(
+          args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(destPe) + args.config.rank,
+          args.crossDeviceBarrierFlag);
+    }
+    if (laneId == 0) args.combineGridBarrier[0] = 0;
+  }
+  // Wait other pes to set flag
+  uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
+  if (laneId < config.gpuPerNode) {
+    int destPe = myNode * config.gpuPerNode + laneId;
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe) != args.crossDeviceBarrierFlag) {
+    }
+  }
+}
+
+template <typename T>
+inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
+  DEF_COMMON_VARS;
+
+  // Distribute tokens evenly to all blocks
+  int blockOffset = config.rdmaBlockNum;
+  int xgmiBlockNum = blockNum - config.rdmaBlockNum;
+
+  extern __shared__ char sharedMem[];
+  T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
+  float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
+                          warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
+
+  int tokenPerBlock = (args.curRankNumToken + xgmiBlockNum - 1) / xgmiBlockNum;
+  int startTokenIdx = (blockId - blockOffset) * tokenPerBlock;
+  int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, args.curRankNumToken);
+
+  for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
+    if (laneId < config.numExpertPerToken) {
+      srcPtrs[laneId] = nullptr;
+      srcWeightsPtr[laneId] = nullptr;
+      index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + laneId];
+      index_t destPe = destTokId / config.MaxNumTokensToRecv();
+      index_t destNode = destPe / config.gpuPerNode;
+      if (destNode == myNode) {
+        index_t destLocalTokId = destTokId - destPe * config.MaxNumTokensToRecv();
+        // printf("recv myPe %d tokenExpertId %lu index %lu destPe %lu destTokId %lu\n", myPe,
+        //        tokenId * config.numExpertPerToken + laneId, destTokId, destPe, destLocalTokId);
+        srcPtrs[laneId] =
+            args.shmemInpTokMemObj->template GetAs<T*>(destPe) + destLocalTokId * config.hiddenDim;
+        srcWeightsPtr[laneId] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
+                                destLocalTokId * config.numExpertPerToken;
+      }
+    }
+    core::WarpAccum<T, 8>(args.shmemOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim,
+                          srcPtrs, nullptr, config.numExpertPerToken, config.hiddenDim);
+  }
+}
+}  // namespace v1
+
 template <typename T>
 __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
-  if (globalThdId == 0) {
-    args.totalRecvTokenNum[0] = 0;
-    args.blockFlagCounter[0] = 0;
-    for (int i = 0; i < config.worldSize; i++) shmem::ShmemQuietThread(i);
+
+  if (blockId < config.rdmaBlockNum) {
+  } else {
+    // First copy into shmem registered buffer and sync
+    v1::CombineIntraNodeSync(args);
+    // Then combine
+    v1::CombineIntraNode(args);
+    if (blockId == config.rdmaBlockNum) {
+      if (laneId == 0) {
+        if (globalThdId == 0) {
+          args.totalRecvTokenNum[0] = 0;
+          args.blockFlagCounter[0] = 0;
+          for (int i = 0; i < config.worldSize; i++) shmem::ShmemQuietThread(i);
+        }
+      }
+    }
   }
 
+  // TODO: refactor following state reset code
   if (globalThdId < nNodes)
     args.nodeRecvTokenNumMemObj->template GetAs<index_t*>()[globalThdId] = 0;
 
@@ -393,6 +491,9 @@ __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
     args.interNodeChunkFlagMemObj->template GetAs<index_t*>()[i] = 0;
 }
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                     Template Specialization                                    */
+/* ---------------------------------------------------------------------------------------------- */
 template __global__ void EpDispatchInterNodeV1Kernel<hip_bfloat16>(
     EpDispatchCombineArgs<hip_bfloat16> args);
 template __global__ void EpDispatchInterNodeV1Kernel<__hip_fp8_e4m3_fnuz>(
