@@ -79,6 +79,7 @@ struct EpDispatchCombineConfig {
   int maxNumInpTokenPerRank{128};
   int numExpertPerRank{1};
   int numExpertPerToken{2};
+  int numWorstToken{0};
   int warpNumPerBlock{1};
   int blockNum{1};
   // If true, use external buffer which incurs extra copy overhead; otherwise, the kernel assumes
@@ -94,6 +95,9 @@ struct EpDispatchCombineConfig {
   inline __host__ __device__ int MaxNumTokensToRecvPerRank() const { return maxNumInpTokenPerRank; }
 
   inline __host__ __device__ int MaxNumTokensToRecv() const {
+    if (numWorstToken != 0) {
+      return numWorstToken;
+    }
     return worldSize * MaxNumTokensToRecvPerRank();
   }
 };

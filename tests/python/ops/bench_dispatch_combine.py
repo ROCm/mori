@@ -190,6 +190,7 @@ def _bench_dispatch_combine(
     num_experts_per_rank=16,
     num_experts_per_token=8,
 ):
+    num_worst_token = max_num_inp_token_per_rank * world_size
     config = mori.ops.EpDispatchCombineConfig(
         data_type=data_type,
         rank=rank,
@@ -201,6 +202,7 @@ def _bench_dispatch_combine(
         max_num_inp_token_per_rank=max_num_inp_token_per_rank,
         num_experts_per_rank=num_experts_per_rank,
         num_experts_per_token=num_experts_per_token,
+        num_worst_token=num_worst_token,
         warp_num_per_block=16,
         block_num=80,
         use_external_inp_buf=False,
