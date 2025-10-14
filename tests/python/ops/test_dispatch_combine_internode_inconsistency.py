@@ -157,7 +157,7 @@ class EpDispatchCombineTestCase:
 
 @pytest.fixture(scope="session")
 def torch_dist_process_manager():
-    os.environ['MORI_DISABLE_P2P'] = '1'
+    os.environ["MORI_DISABLE_P2P"] = "1"
     try:
         torch.multiprocessing.set_start_method("spawn", force=True)
         print("Multiprocessing start method set to spawn")
@@ -192,7 +192,7 @@ def _test_dispatch_combine(
         num_experts_per_token=num_experts_per_token,
         max_token_type_size=2,
         block_num=16,
-        warp_num_per_block=1,
+        warp_num_per_block=16,
         kernel_type=mori.ops.EpDispatchCombineKernelType.InterNode,
     )
     op = mori.ops.EpDispatchCombineOp(config)
@@ -200,9 +200,9 @@ def _test_dispatch_combine(
     test_data = test_case.gen_test_data(True)
     num_reps = 2048
     for idx in range(num_reps):
-      test_case.run_test_once(op, test_data)
-      if rank == 0:
-          print(f"Passed {idx}/{num_reps}")
+        test_case.run_test_once(op, test_data)
+        if rank == 0:
+            print(f"Passed {idx}/{num_reps}")
 
 
 # TODO: create a sub process group so that we can test worlds size < 8
@@ -211,7 +211,7 @@ def _test_dispatch_combine(
 @pytest.mark.parametrize("hidden_dim", (7168,))
 @pytest.mark.parametrize("scale_dim", (56,))
 @pytest.mark.parametrize("scale_type_size", (4,))
-@pytest.mark.parametrize("max_num_inp_token_per_rank", (256,))
+@pytest.mark.parametrize("max_num_inp_token_per_rank", (4096,))
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
 @pytest.mark.parametrize("num_experts_per_token", (8,))
 def test_dispatch_combine(
