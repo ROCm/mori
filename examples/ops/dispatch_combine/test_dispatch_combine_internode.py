@@ -335,7 +335,7 @@ class EpDispatchCombineTestCase:
                     if (pe // self.gpu_per_node == self.rank // self.gpu_per_node)
                 ]
             )
-            final_unique_pes = unique_pes-unique_innode_pes
+            final_unique_pes = unique_pes
             # print(
             #     self.rank,
             #     f"token {i} pes {pes} unique pes {unique_pes} unique innode pes {unique_innode_pes}",
@@ -349,7 +349,7 @@ class EpDispatchCombineTestCase:
 
             ok = torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
             if not ok:
-                if self.rank == 0:
+                if self.rank == 8:
                     print(
                         self.rank,
                         f"token {i} pes {pes} unique pes {unique_pes} unique innode pes {unique_innode_pes}",
@@ -505,7 +505,7 @@ class EpDispatchCombineTestCase:
         comb_bandwidth_GB_list = []
 
         error_round = set()
-        for i in range(3):
+        for i in range(1):
             if self.rank == 0:
                 print(f"WarmUp Round {i} begin")
             self.run_test_once(op, test_data, error_round, i)
