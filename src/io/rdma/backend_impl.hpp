@@ -79,6 +79,17 @@ class RdmaManager {
                                                  const application::RdmaEndpoint& new_local,
                                                  const application::RdmaEndpointHandle& remoteNew);
 
+  // Deferred reclamation support -------------------------------------------------------------
+  struct RetiredEndpoint {
+    application::RdmaEndpoint ep;  // owns ibvHandle objects to destroy later
+    EpPairPtr epPair;              // keep shared_ptr so use_count reflects external refs
+    std::chrono::steady_clock::time_point retire_time;  // for diagnostics / optional timeout
+  };
+
+  // Periodically invoked (e.g. from NotifManager loop) to destroy endpoints whose EpPair
+  // is no longer referenced elsewhere (use_count == 1 meaning only retired list holds it).
+  void ReclaimRetiredEndpoints();
+
   application::RdmaDeviceContext* GetRdmaDeviceContext(int devId);
 
   int GetActiveDevicePort(int devId);
@@ -90,7 +101,6 @@ class RdmaManager {
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
 
- private:
   RdmaBackendConfig config;
   mutable std::shared_mutex mu;
 
@@ -101,6 +111,9 @@ class RdmaManager {
   MemoryTable mTable;
   std::unordered_map<EngineKey, RemoteEngineMeta> remotes;
   std::unordered_map<uint32_t, EpPairPtr> epsMap;
+
+  // Retired endpoints awaiting safe destruction. Guarded by mu.
+  std::vector<RetiredEndpoint> retiredEps;
 
   std::unique_ptr<application::TopoSystem> topo{nullptr};
 };
@@ -176,16 +189,6 @@ class ControlPlaneServer {
   // Placeholder: coordinated rebuild initiation (synchronous minimal version)
   // Returns true if handshake succeeded; false means fallback to local-only.
   bool SendRebuildRequest(uint32_t old_qpn, EpPairPtr epPtr, const RdmaBackendConfig& cfg);
-
-  struct PendingRebuild {
-    uint32_t old_qpn{0};
-    application::RdmaEndpoint new_local{};  // initiator prepared new endpoint
-    EpPairPtr old_ep{};                     // original ep pair
-    bool have_new_local{false};
-  };
-
-  std::mutex rebuildMu;
-  std::unordered_map<uint32_t, PendingRebuild> pendingRebuilds;  // key: old_qpn
 
   // Server management
   void MainLoop();

@@ -36,6 +36,9 @@ class IBVerbsDeviceContext : public RdmaDeviceContext {
   virtual void ConnectEndpoint(const RdmaEndpointHandle& local,
                                const RdmaEndpointHandle& remote) override;
 
+  // Destroy a single endpoint (qp, cq, comp channel). Does not touch shared SRQ.
+  virtual void DestroyRdmaEndpoint(const RdmaEndpoint& endpoint) override;
+
  private:
   std::unordered_map<void*, ibv_cq*> cqPool;
   std::unordered_map<uint32_t, ibv_qp*> qpPool;

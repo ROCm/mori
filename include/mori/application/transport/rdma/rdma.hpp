@@ -173,6 +173,7 @@ class RdmaDeviceContext {
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) {
     assert(false && "not implemented");
   }
+  virtual void DestroyRdmaEndpoint(const RdmaEndpoint& endpoint);
   void ConnectEndpoint(const RdmaEndpoint& local, const RdmaEndpoint& remote) {
     ConnectEndpoint(local.handle, remote.handle);
   }

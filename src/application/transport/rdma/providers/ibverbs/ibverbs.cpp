@@ -38,6 +38,27 @@ IBVerbsDeviceContext::~IBVerbsDeviceContext() {
   for (auto& it : cqPool) ibv_destroy_cq(it.second);
 }
 
+// Destroy a single endpoint's ibverbs resources (qp, cq, comp channel) if present.
+// Safe to call multiple times; missing entries will be ignored.
+void IBVerbsDeviceContext::DestroyRdmaEndpoint(const RdmaEndpoint& endpoint) {
+  // QP
+  if (endpoint.ibvHandle.qp) {
+    auto qpIt = qpPool.find(endpoint.ibvHandle.qp->qp_num);
+    if (qpIt != qpPool.end()) qpPool.erase(qpIt);
+    ibv_destroy_qp(endpoint.ibvHandle.qp);
+  }
+  // CQ
+  if (endpoint.ibvHandle.cq) {
+    auto cqIt = cqPool.find(endpoint.ibvHandle.cq);
+    if (cqIt != cqPool.end()) cqPool.erase(cqIt);
+    ibv_destroy_cq(endpoint.ibvHandle.cq);
+  }
+  // Completion channel (not tracked in pool maps)
+  if (endpoint.ibvHandle.compCh) {
+    ibv_destroy_comp_channel(endpoint.ibvHandle.compCh);
+  }
+}
+
 RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& config) {
   ibv_context* context = GetIbvContext();
   const ibv_device_attr_ex* deviceAttr = GetRdmaDevice()->GetDeviceAttr();
