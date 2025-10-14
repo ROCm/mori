@@ -349,17 +349,14 @@ class EpDispatchCombineTestCase:
 
             ok = torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
             if not ok:
-                if self.rank == 8:
-                    print(
-                        self.rank,
-                        f"token {i} pes {pes} unique pes {unique_pes} unique innode pes {unique_innode_pes}",
-                    )
-                    print(self.rank, "got: ", got)
-                    print(
-                        self.rank, "expected: ", expected, all_rank_input[self.rank][i]
-                    )
-                    delta = got - expected
-                    print(self.rank, i, "delta:", delta.nonzero())
+                print(
+                    self.rank,
+                    f"token {i} pes {pes} unique pes {unique_pes} unique innode pes {unique_innode_pes}",
+                )
+                print(self.rank, "got: ", got)
+                print(self.rank, "expected: ", expected, all_rank_input[self.rank][i])
+                delta = got - expected
+                print(self.rank, i, "delta:", delta.nonzero())
                 assert False
                 error_round.add(round)
 
@@ -425,6 +422,8 @@ class EpDispatchCombineTestCase:
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
 
+        if self.rank == 0:
+            print("dispatch")
         torch.cuda.synchronize()
         dist.barrier()
         start_event.record()
@@ -474,25 +473,34 @@ class EpDispatchCombineTestCase:
         disp_rdma_bandwidth = total_rdma_bytes / (1000**3) / (disp_duration / (10**3))
         disp_bandwidth = total_bytes / (1000**3) / (disp_duration / (10**3))
 
-        # torch.cuda.synchronize()
+        if self.rank == 0:
+            print("combine")
+        torch.cuda.synchronize()
         dist.barrier()
-        # start_event.record()
+        start_event.record()
         combine_output, _ = op.combine(
             dispatch_output,
             None,
             all_rank_indices[self.rank],
             block_num=self.config.block_num,
-            warp_per_block=8,
+            warp_per_block=16,
         )
-        # end_event.record()
+        end_event.record()
         torch.cuda.synchronize()
-        # comb_duration = start_event.elapsed_time(end_event)
-        # comb_bandwidth = total_bytes / (1000**3) / (comb_duration / (10**3))
+        comb_duration = start_event.elapsed_time(end_event)
+        comb_rdma_bandwidth = total_rdma_bytes / (1000**3) / (comb_duration / (10**3))
+        comb_bandwidth = total_bytes / (1000**3) / (comb_duration / (10**3))
 
-        # op.reset()
-        # torch.cuda.synchronize()
-        # return disp_duration, disp_bandwidth, comb_duration, comb_bandwidth
-        return disp_duration, disp_rdma_bandwidth, disp_bandwidth, float(0), float(0)
+        op.reset()
+        torch.cuda.synchronize()
+        return (
+            disp_duration,
+            disp_rdma_bandwidth,
+            disp_bandwidth,
+            comb_duration,
+            comb_rdma_bandwidth,
+            comb_bandwidth,
+        )
 
     def bench_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
@@ -502,6 +510,7 @@ class EpDispatchCombineTestCase:
         disp_rdma_bandwidth_GB_list = []
         disp_bandwidth_GB_list = []
         comb_duration_us_list = []
+        comb_rdma_bandwidth_GB_list = []
         comb_bandwidth_GB_list = []
 
         error_round = set()
@@ -513,7 +522,7 @@ class EpDispatchCombineTestCase:
             len(error_round) == 0
         ), f"Warmup failed with errors in rounds: {error_round}"
 
-        for i in range(0):
+        for i in range(20):
             if self.rank == 0:
                 print(f"Round {i} begin")
             (
@@ -521,6 +530,7 @@ class EpDispatchCombineTestCase:
                 disp_rdma_bandwidth,
                 disp_bandwidth,
                 comb_duration,
+                comb_rdma_bandwidth,
                 comb_bandwidth,
             ) = self.run_bench_once(op, test_data)
 
@@ -530,6 +540,9 @@ class EpDispatchCombineTestCase:
             ]
             disp_bandwidth_output = [torch.zeros(1) for _ in range(self.world_size)]
             comb_duration_output = [torch.zeros(1) for _ in range(self.world_size)]
+            comb_rdma_bandwidth_output = [
+                torch.zeros(1) for _ in range(self.world_size)
+            ]
             comb_bandwidth_output = [torch.zeros(1) for _ in range(self.world_size)]
 
             dist.all_gather(disp_duration_output, torch.tensor([disp_duration * 1000]))
@@ -538,6 +551,9 @@ class EpDispatchCombineTestCase:
             )
             dist.all_gather(disp_bandwidth_output, torch.tensor([disp_bandwidth]))
             dist.all_gather(comb_duration_output, torch.tensor([comb_duration * 1000]))
+            dist.all_gather(
+                comb_rdma_bandwidth_output, torch.tensor([comb_rdma_bandwidth])
+            )
             dist.all_gather(comb_bandwidth_output, torch.tensor([comb_bandwidth]))
 
             disp_duration_us_list.append([int(t.item()) for t in disp_duration_output])
@@ -548,6 +564,9 @@ class EpDispatchCombineTestCase:
                 [int(t.item()) for t in disp_bandwidth_output]
             )
             comb_duration_us_list.append([int(t.item()) for t in comb_duration_output])
+            comb_rdma_bandwidth_GB_list.append(
+                [int(t.item()) for t in comb_rdma_bandwidth_output]
+            )
             comb_bandwidth_GB_list.append(
                 [int(t.item()) for t in comb_bandwidth_output]
             )
@@ -565,13 +584,17 @@ class EpDispatchCombineTestCase:
                     f"  bandwidth {disp_bandwidth_GB_list[i]} avg {sum(disp_bandwidth_GB_list[i]) / self.config.world_size:.2f} GB/s"
                 )
 
-            # for i in range(len(comb_duration_us_list)):
-            #     print(
-            #         f"Round {i} combine  duration {comb_duration_us_list[i]} "
-            #         f"bandwidth {comb_bandwidth_GB_list[i]} "
-            #         f"avg {sum(comb_duration_us_list[i]) / self.config.world_size:.2f} µs "
-            #         f"avg {sum(comb_bandwidth_GB_list[i]) / self.config.world_size:.2f} GB/s"
-            #     )
+            for i in range(len(comb_duration_us_list)):
+                print(f"Round {i}")
+                print(
+                    f"  combine duration {comb_duration_us_list[i]} avg {sum(comb_duration_us_list[i]) / self.config.world_size:.2f} µs"
+                )
+                print(
+                    f"  rdma bandwidth {comb_rdma_bandwidth_GB_list[i]} avg {sum(comb_rdma_bandwidth_GB_list[i]) / self.config.world_size:.2f} GB/s"
+                )
+                print(
+                    f"  bandwidth {comb_bandwidth_GB_list[i]} avg {sum(comb_bandwidth_GB_list[i]) / self.config.world_size:.2f} GB/s"
+                )
 
         disp_bandwidth_GB_list = disp_bandwidth_GB_list[0:]
         avg_disp_bw_per_round = [
@@ -589,7 +612,13 @@ class EpDispatchCombineTestCase:
         avg_comb_bw_per_round = [
             (sum(round_bw) / len(round_bw)) for round_bw in comb_bandwidth_GB_list
         ]
+        avg_comb_rdma_bw_per_round = [
+            (sum(round_bw) / len(round_bw)) for round_bw in comb_rdma_bandwidth_GB_list
+        ]
         avg_comb_bw = sum(avg_comb_bw_per_round) / len(avg_comb_bw_per_round)
+        avg_comb_rdma_bw = sum(avg_comb_rdma_bw_per_round) / len(
+            avg_comb_rdma_bw_per_round
+        )
 
         disp_duration_us_list = disp_duration_us_list[0:]
         avg_disp_lat_per_round = [
@@ -608,6 +637,7 @@ class EpDispatchCombineTestCase:
         best_disp_bw = max(avg_disp_bw_per_round)
         best_disp_rdma_bw = max(avg_disp_rdma_bw_per_round)
         best_comb_bw = max(avg_comb_bw_per_round)
+        best_comb_rdma_bw = max(avg_comb_rdma_bw_per_round)
 
         best_disp_lat = min(avg_disp_lat_per_round)
         best_comb_lat = min(avg_comb_lat_per_round)
@@ -616,7 +646,7 @@ class EpDispatchCombineTestCase:
             print(
                 f"dispatch: best/avg RDMA bandwidth {best_disp_rdma_bw:.2f} / {avg_disp_rdma_bw:.2f} XGMI bandwidth {best_disp_bw:.2f} / {avg_disp_bw:.2f} GB/s | "
                 f"best/avg latency {best_disp_lat:.2f} / {avg_disp_lat:.2f} µs\n"
-                f"combine : best/avg bandwidth {best_comb_bw:.2f} / {avg_comb_bw:.2f} GB/s | "
+                f"combine: best/avg RDMA bandwidth {best_comb_rdma_bw:.2f} / {avg_comb_rdma_bw:.2f} XGMI bandwidth {best_comb_bw:.2f} / {avg_comb_bw:.2f} GB/s | "
                 f"best/avg latency {best_comb_lat:.2f} / {avg_comb_lat:.2f} µs"
             )
         del op
