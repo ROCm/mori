@@ -393,7 +393,6 @@ class EpDispatchCombineTestCase:
             dispatch_output,
             None,
             all_rank_indices[self.rank],
-            call_reset=False,
         )
         end_event.record()
         torch.cuda.synchronize()
