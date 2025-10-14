@@ -149,6 +149,12 @@ EpHandleVec RdmaManager::GetAllEndpointHandles(EngineKey engine, TopoKeyPair key
   return out;
 }
 
+int RdmaManager::GetActiveDevicePort(int devId) {
+  std::shared_lock<std::shared_mutex> lock(mu);
+  assert(devId < availDevices.size());
+  return availDevices[devId].second;
+}
+
 application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int portId) {
   application::RdmaEndpointConfig config;
   config.portId = portId;
@@ -200,41 +206,36 @@ std::optional<EpPairPtr> RdmaManager::GetEpPairPtrByQpn(uint32_t qpn) {
   return it->second;
 }
 
-std::optional<EpPairPtr> RdmaManager::RebuildEndpoint(uint32_t qpn) {
+std::optional<EpPairPtr> RdmaManager::CommitPreparedRebuild(
+    uint32_t old_qpn, const application::RdmaEndpoint& new_local,
+    const application::RdmaEndpointHandle& remoteNew) {
   std::unique_lock<std::shared_mutex> lock(mu);
-  auto it = epsMap.find(qpn);
+  auto it = epsMap.find(old_qpn);
   if (it == epsMap.end()) return std::nullopt;
   EpPairPtr oldEp = it->second;
-  application::RdmaDeviceContext* devCtx = GetOrCreateDeviceContext(oldEp->ldevId);
-  // 1. Create brand new endpoint
-  application::RdmaEndpoint newLocal =
-      devCtx->CreateRdmaEndpoint(GetRdmaEndpointConfig(availDevices[oldEp->ldevId].second));
-  deviceCtxs[oldEp->ldevId]->ConnectEndpoint(newLocal.handle, oldEp->remote);
-  // 2. Prepare new EpPair
+  // Build new EpPair
   EpPairPtr newEp = std::make_shared<EpPair>();
   newEp->weight = oldEp->weight;
   newEp->ldevId = oldEp->ldevId;
   newEp->rdevId = oldEp->rdevId;
   newEp->remoteEngineKey = oldEp->remoteEngineKey;
-  newEp->remote = oldEp->remote;
+  newEp->remote = remoteNew;  // remote updated handle (may have new qpn)
   newEp->topoKey = oldEp->topoKey;
   newEp->rebuild_generation.store(oldEp->rebuild_generation.load(std::memory_order_relaxed) + 1,
                                   std::memory_order_relaxed);
   newEp->scheduled_rebuild.store(false, std::memory_order_release);
-  newEp->local = newLocal;
-  // 3. Find its handle in route table and atomically swap pointer inside handle
+  newEp->local = new_local;
+  // Swap in route table
   RemoteEngineMeta& meta = remotes[newEp->remoteEngineKey];
   auto& vec = meta.rTable[newEp->topoKey];
   for (auto& h : vec) {
-    if (h->qpn() == qpn) {  // match old
-      h->update(newEp);     // atomic store of new raw pointer
+    if (h->qpn() == old_qpn) {
+      h->update(newEp);
       break;
     }
   }
-  // 4. Update epsMap: remove old qpn entry, insert new qpn->newEp
   epsMap.erase(it);
-  epsMap.emplace(newEp->local.handle.qpn, newEp);
-  // 5. Mark old as retired (optional flags)
+  epsMap.emplace(new_local.handle.qpn, newEp);
   oldEp->scheduled_rebuild.store(false, std::memory_order_release);
   return newEp;
 }
@@ -446,19 +447,14 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
                   break;
               }
               if (needRebuild && !epPtr->scheduled_rebuild.exchange(true)) {
-                // Rebuild inline (could be offloaded to separate thread later)
-                auto rebuilt = rdma->RebuildEndpoint(ep.local.handle.qpn);
-                if (rebuilt.has_value()) {
-                  MORI_IO_INFO("QP rebuild success old_qpn {} new_qpn {} gen {}",
-                               ep.local.handle.qpn, (*rebuilt)->local.handle.qpn,
-                               (*rebuilt)->rebuild_generation.load(std::memory_order_relaxed));
-                  // Re-register new QP for event mode
-                  if (config.pollCqMode == PollCqMode::EVENT) {
-                    RegisterEndpointByQpn((*rebuilt)->local.handle.qpn);
-                    UnregisterEndpointByQpn(ep.local.handle.qpn);
+                RdmaBackend* be = dynamic_cast<RdmaBackend*>(owner);
+                if (be && be->server) {
+                  bool coordinatedAccepted =
+                      be->server->SendRebuildRequest(ep.local.handle.qpn, epPtr, config);
+                  if (!coordinatedAccepted) {
+                    MORI_IO_ERROR("NotifManager: Rdma QP rebuild failed for QP {}",
+                                  ep.local.handle.qpn);
                   }
-                } else {
-                  MORI_IO_INFO("QP rebuild failed qpn {}", ep.local.handle.qpn);
                 }
               }
             }
@@ -552,11 +548,13 @@ void NotifManager::Shutdown() {
 /* ----------------------------------------------------------------------------------------------
  */
 ControlPlaneServer::ControlPlaneServer(const std::string& k, const std::string& host, int port,
-                                       RdmaManager* rdmaMgr, NotifManager* notifMgr)
+                                       Backend* ownerBackend, RdmaManager* rdmaMgr,
+                                       NotifManager* notifMgr)
     : myEngKey(k) {
   ctx.reset(new application::TCPContext(host, port));
   rdma = rdmaMgr;
   notif = notifMgr;
+  owner = ownerBackend;
 }
 
 ControlPlaneServer::~ControlPlaneServer() { Shutdown(); }
@@ -627,6 +625,72 @@ application::RdmaMemoryRegion ControlPlaneServer::AskRemoteMemoryRegion(EngineKe
   return msg.mr;
 }
 
+bool ControlPlaneServer::SendRebuildRequest(uint32_t old_qpn, EpPairPtr epPtr,
+                                            const RdmaBackendConfig& cfg) {
+  // Phase 0: prepare new local endpoint BUT do not swap.
+  application::RdmaEndpoint newLocal;
+  {
+    // we reuse RdmaManager create endpoint path outside of locks to minimize contention
+    // Need device id stored in epPtr
+    newLocal = rdma->CreateEndpoint(epPtr->ldevId);
+  }
+  // Record pending structure
+  {
+    std::lock_guard<std::mutex> g(rebuildMu);
+    pendingRebuilds.erase(old_qpn);  // clear previous if any
+    PendingRebuild pr;
+    pr.old_qpn = old_qpn;
+    pr.new_local = newLocal;
+    pr.old_ep = epPtr;
+    pr.have_new_local = true;
+    pendingRebuilds[old_qpn] = pr;
+  }
+  // Acquire remote engine description
+  EngineDesc rdesc;
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = engines.find(epPtr->remoteEngineKey);
+    if (it == engines.end()) return false;
+    rdesc = it->second;
+  }
+  application::TCPEndpointHandle tcph = ctx->Connect(rdesc.host, rdesc.port);
+  Protocol p(tcph);
+  uint32_t expectedGen = epPtr->rebuild_generation.load(std::memory_order_relaxed) + 1;
+  MessageRebuildRequest req{myEngKey, old_qpn, newLocal.handle.qpn, expectedGen};
+  p.WriteMessageRebuildRequest(req);
+  MessageHeader hdr = p.ReadMessageHeader();
+  if (hdr.type != MessageType::RebuildAck) {
+    ctx->CloseEndpoint(tcph);
+    return false;
+  }
+  MessageRebuildAck ack = p.ReadMessageRebuildAck(hdr.len);
+  ctx->CloseEndpoint(tcph);
+  if (ack.status != 0) {
+    return false;  // remote not ready
+  }
+  // Phase 1: now connect local new endpoint to remote NEW responder endpoint
+  // (ack.responder_new_qpn)
+  application::RdmaEndpointHandle remoteNewHandle = epPtr->remote;  // copy old then mutate qpn
+  remoteNewHandle.qpn = ack.responder_new_qpn;
+  // Connect new local endpoint with remote new handle
+  rdma->GetRdmaDeviceContext(epPtr->ldevId)->ConnectEndpoint(newLocal.handle, remoteNewHandle);
+  // Phase 2: commit swap atomically
+  auto committed = rdma->CommitPreparedRebuild(old_qpn, newLocal, remoteNewHandle);
+  if (committed.has_value()) {
+    if (cfg.pollCqMode == PollCqMode::EVENT) {
+      notif->RegisterEndpointByQpn(newLocal.handle.qpn);
+      notif->UnregisterEndpointByQpn(old_qpn);
+    }
+    std::lock_guard<std::mutex> g(rebuildMu);
+    pendingRebuilds.erase(old_qpn);
+    MORI_IO_INFO("Coordinated rebuild success old_qpn {} new_qpn {} peer_new_qpn {} gen {}",
+                 old_qpn, newLocal.handle.qpn, ack.responder_new_qpn,
+                 (*committed)->rebuild_generation.load(std::memory_order_relaxed));
+    return true;
+  }
+  return false;
+}
+
 void ControlPlaneServer::AcceptRemoteEngineConn() {
   application::TCPEndpointHandleVec newEps = ctx->Accept();
   for (auto& ep : newEps) {
@@ -644,6 +708,7 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
 
   Protocol p(tcph);
   MessageHeader hdr = p.ReadMessageHeader();
+  RdmaBackend* be = dynamic_cast<RdmaBackend*>(owner);
 
   switch (hdr.type) {
     case MessageType::RegEndpoint: {
@@ -674,6 +739,58 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
         // TODO: we should add status code for NOT_FOUND
         p.WriteMessageAskMemoryRegion({msg.ekey, msg.devId, msg.id, {}});
       }
+      break;
+    }
+    case MessageType::RebuildRequest: {
+      MessageRebuildRequest req = p.ReadMessageRebuildRequest(hdr.len);
+      uint32_t status = 0;
+      uint32_t responder_new_qpn = 0;
+      // Locate EpPair by old_qpn
+      auto epPairOpt = rdma->GetEpPairPtrByQpn(req.old_qpn);
+      if (!epPairOpt.has_value()) {
+        status = 2;  // not found
+      } else {
+        EpPairPtr oldEp = *epPairOpt;
+        // Validate generation expectation (soft check)
+        uint32_t curGen = oldEp->rebuild_generation.load(std::memory_order_relaxed);
+        if (req.expected_generation != (curGen + 1)) {
+          // Mismatch but we can still proceed; mark different status code 3
+          status = 3;  // generation mismatch
+        }
+        // Responder builds its new local endpoint and connects to requester's NEW endpoint
+        // (requester_new_qpn). We need device context and remote handle clone.
+        application::RdmaDeviceContext* devCtx = rdma->GetRdmaDeviceContext(oldEp->ldevId);
+        application::RdmaEndpoint responderNew = devCtx->CreateRdmaEndpoint(
+            rdma->GetRdmaEndpointConfig(rdma->GetActiveDevicePort(oldEp->ldevId)));
+        // Build remote handle referencing requester's new qpn
+        application::RdmaEndpointHandle remoteNewHandle = oldEp->remote;
+        if (req.requester_new_qpn == 0) {
+          status = (status == 0 ? 4 : status);  // requester did not provide new qp
+        } else {
+          remoteNewHandle.qpn = req.requester_new_qpn;
+          devCtx->ConnectEndpoint(responderNew.handle, remoteNewHandle);
+          responder_new_qpn = responderNew.handle.qpn;
+          // Commit locally (old local qpn swapped to new, remote handle updated to requester's new)
+          auto committed = rdma->CommitPreparedRebuild(req.old_qpn, responderNew, remoteNewHandle);
+          if (!committed.has_value()) {
+            status = (status == 0 ? 4 : status);
+          } else if (notif && be->config.pollCqMode == PollCqMode::EVENT) {
+            notif->RegisterEndpointByQpn(responder_new_qpn);
+            notif->UnregisterEndpointByQpn(req.old_qpn);
+          }
+        }
+      }
+      MessageRebuildAck ack{
+          myEngKey, req.old_qpn, responder_new_qpn, req.requester_new_qpn, req.expected_generation,
+          status};
+      p.WriteMessageRebuildAck(ack);
+      break;
+    }
+    case MessageType::RebuildAck: {
+      MessageRebuildAck ack = p.ReadMessageRebuildAck(hdr.len);
+      // TODO
+      MORI_IO_INFO("Received unexpected RebuildAck old_qpn {} status {} (no handler yet)",
+                   ack.old_qpn, ack.status);
       break;
     }
     default:
@@ -808,8 +925,8 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
   notif.reset(new NotifManager(rdma.get(), beConfig, this));
   notif->Start();
 
-  server.reset(
-      new ControlPlaneServer(myEngKey, engConfig.host, engConfig.port, rdma.get(), notif.get()));
+  server.reset(new ControlPlaneServer(myEngKey, engConfig.host, engConfig.port, this, rdma.get(),
+                                      notif.get()));
   server->Start();
 
   if (config.numWorkerThreads > 1) {

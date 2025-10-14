@@ -56,6 +56,9 @@ struct RdmaBackendConfig : public BackendConfig {
   int postBatchSize{-1};
   int numWorkerThreads{1};
   PollCqMode pollCqMode{PollCqMode::POLLING};
+  // Coordinated QP rebuild feature flags (experimental)
+  uint32_t rebuildAckTimeoutMs{500};  // wait time for Ack before fallback
+  uint32_t rebuildMaxRetries{3};      // max retries before fallback/local-only
 };
 
 inline std::ostream& operator<<(std::ostream& os, const RdmaBackendConfig& c) {

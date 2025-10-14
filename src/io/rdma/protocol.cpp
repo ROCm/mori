@@ -76,5 +76,35 @@ void Protocol::WriteMessageAskMemoryRegion(const MessageAskMemoryRegion& msg) {
   SYSCALL_RETURN_ZERO(ep.Send(buf.data(), buf.size()));
 }
 
+MessageRebuildRequest Protocol::ReadMessageRebuildRequest(size_t len) {
+  std::vector<char> buf(len);
+  SYSCALL_RETURN_ZERO(ep.Recv(buf.data(), len));
+  auto out = msgpack::unpack(buf.data(), len);
+  return out.get().as<MessageRebuildRequest>();
+}
+
+void Protocol::WriteMessageRebuildRequest(const MessageRebuildRequest& msg) {
+  msgpack::sbuffer buf;
+  msgpack::pack(buf, msg);
+  uint32_t len = static_cast<uint32_t>(buf.size());
+  WriteMessageHeader({MessageType::RebuildRequest, len});
+  SYSCALL_RETURN_ZERO(ep.Send(buf.data(), buf.size()));
+}
+
+MessageRebuildAck Protocol::ReadMessageRebuildAck(size_t len) {
+  std::vector<char> buf(len);
+  SYSCALL_RETURN_ZERO(ep.Recv(buf.data(), len));
+  auto out = msgpack::unpack(buf.data(), len);
+  return out.get().as<MessageRebuildAck>();
+}
+
+void Protocol::WriteMessageRebuildAck(const MessageRebuildAck& msg) {
+  msgpack::sbuffer buf;
+  msgpack::pack(buf, msg);
+  uint32_t len = static_cast<uint32_t>(buf.size());
+  WriteMessageHeader({MessageType::RebuildAck, len});
+  SYSCALL_RETURN_ZERO(ep.Send(buf.data(), buf.size()));
+}
+
 }  // namespace io
 }  // namespace mori

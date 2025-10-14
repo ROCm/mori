@@ -35,6 +35,8 @@ namespace io {
 enum class MessageType : uint8_t {
   RegEndpoint = 0,
   AskMemoryRegion = 1,
+  RebuildRequest = 2,
+  RebuildAck = 3,
 };
 
 struct MessageHeader {
@@ -58,6 +60,31 @@ struct MessageAskMemoryRegion {
   MSGPACK_DEFINE(ekey, devId, id, mr);
 };
 
+// QP rebuild handshake messages
+// RebuildRequest: one side proposes rebuilding a specific QP (old_qpn). It may optionally
+// pre-create a new local QP and include its new_qpn so peer can connect to it; in the minimal
+// version we let peer allocate first, so new_qpn can be 0 meaning 'not allocated yet'.
+// generation is the expected next generation (old_generation+1) for validation.
+struct MessageRebuildRequest {
+  EngineKey ekey;                // remote engine key (target of the request)
+  uint32_t old_qpn;              // qpn being replaced (as seen by requester)
+  uint32_t requester_new_qpn;    // optional new local qpn (0 if not created yet)
+  uint32_t expected_generation;  // requester expectation for new generation
+  MSGPACK_DEFINE(ekey, old_qpn, requester_new_qpn, expected_generation);
+};
+
+// RebuildAck: peer responds with its newly created QP number and echoes fields for validation.
+// status: 0 success, non-zero error codes (TBD). If status!=0 new_qpn fields may be 0.
+struct MessageRebuildAck {
+  EngineKey ekey;  // echo
+  uint32_t old_qpn;
+  uint32_t responder_new_qpn;    // peer's new qpn (if success)
+  uint32_t requester_new_qpn;    // echo back to confirm which proposal matched
+  uint32_t expected_generation;  // echo
+  uint32_t status;               // 0 success
+  MSGPACK_DEFINE(ekey, old_qpn, responder_new_qpn, requester_new_qpn, expected_generation, status);
+};
+
 struct MessageBuildConn {
   EngineKey key;
   MSGPACK_DEFINE(key);
@@ -79,6 +106,12 @@ class Protocol {
 
   MessageAskMemoryRegion ReadMessageAskMemoryRegion(size_t len);
   void WriteMessageAskMemoryRegion(const MessageAskMemoryRegion&);
+
+  MessageRebuildRequest ReadMessageRebuildRequest(size_t len);
+  void WriteMessageRebuildRequest(const MessageRebuildRequest&);
+
+  MessageRebuildAck ReadMessageRebuildAck(size_t len);
+  void WriteMessageRebuildAck(const MessageRebuildAck&);
 
  private:
   application::TCPEndpoint ep;

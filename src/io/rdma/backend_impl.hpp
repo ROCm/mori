@@ -74,10 +74,14 @@ class RdmaManager {
   void ConnectEndpoint(EngineKey remoteKey, int ldevId, application::RdmaEndpoint local, int rdevId,
                        application::RdmaEndpointHandle remote, TopoKeyPair key, int weight);
   std::optional<EpPairPtr> GetEpPairPtrByQpn(uint32_t qpn);
-  // QP rebuild: create new endpoint to replace an existing ep (identified by qpn)
-  std::optional<EpPairPtr> RebuildEndpoint(uint32_t qpn);
+
+  std::optional<EpPairPtr> CommitPreparedRebuild(uint32_t old_qpn,
+                                                 const application::RdmaEndpoint& new_local,
+                                                 const application::RdmaEndpointHandle& remoteNew);
 
   application::RdmaDeviceContext* GetRdmaDeviceContext(int devId);
+
+  int GetActiveDevicePort(int devId);
 
   // Endpoint enumeration
   using EnumerateEpCallbackFunc = std::function<void(int qpn, const EpPair& ep)>;
@@ -153,8 +157,8 @@ class NotifManager {
 /* ---------------------------------------------------------------------------------------------- */
 class ControlPlaneServer {
  public:
-  ControlPlaneServer(const std::string& key, const std::string& host, int port, RdmaManager*,
-                     NotifManager*);
+  ControlPlaneServer(const std::string& key, const std::string& host, int port,
+                     Backend* ownerBackend, RdmaManager*, NotifManager*);
   ~ControlPlaneServer();
 
   // Remote engine meta management
@@ -169,6 +173,20 @@ class ControlPlaneServer {
   void DeregisterMemory(const MemoryDesc&);
   application::RdmaMemoryRegion AskRemoteMemoryRegion(EngineKey, int rdevId, MemoryUniqueId);
 
+  // Placeholder: coordinated rebuild initiation (synchronous minimal version)
+  // Returns true if handshake succeeded; false means fallback to local-only.
+  bool SendRebuildRequest(uint32_t old_qpn, EpPairPtr epPtr, const RdmaBackendConfig& cfg);
+
+  struct PendingRebuild {
+    uint32_t old_qpn{0};
+    application::RdmaEndpoint new_local{};  // initiator prepared new endpoint
+    EpPairPtr old_ep{};                     // original ep pair
+    bool have_new_local{false};
+  };
+
+  std::mutex rebuildMu;
+  std::unordered_map<uint32_t, PendingRebuild> pendingRebuilds;  // key: old_qpn
+
   // Server management
   void MainLoop();
   void Start();
@@ -178,7 +196,7 @@ class ControlPlaneServer {
   void AcceptRemoteEngineConn();
   void HandleControlPlaneProtocol(int fd);
 
- private:
+  Backend* owner{nullptr};
   EngineKey myEngKey;
 
   mutable std::mutex mu;
@@ -232,6 +250,9 @@ class RdmaBackend : public Backend {
   RdmaBackend(EngineKey, const IOEngineConfig&, const RdmaBackendConfig&);
   ~RdmaBackend();
 
+  friend class NotifManager;
+  friend class ControlPlaneServer;
+
   void RegisterRemoteEngine(const EngineDesc&);
   void DeregisterRemoteEngine(const EngineDesc&);
   void RegisterMemory(const MemoryDesc& desc);
@@ -251,7 +272,6 @@ class RdmaBackend : public Backend {
   RdmaBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
   void InvalidateSessionsForMemory(MemoryUniqueId id);
 
- private:
   EngineKey myEngKey;
   RdmaBackendConfig config;
   std::unique_ptr<RdmaManager> rdma{nullptr};
