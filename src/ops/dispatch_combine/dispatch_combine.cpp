@@ -170,6 +170,8 @@ void EpDispatchCombineHandle::InitializeBarrier() {
   HIP_RUNTIME_CHECK(hipMemset(dispatchGridBarrier, 0, barrierSize));
   HIP_RUNTIME_CHECK(hipMalloc(&combineGridBarrier, barrierSize));
   HIP_RUNTIME_CHECK(hipMemset(combineGridBarrier, 0, barrierSize));
+  HIP_RUNTIME_CHECK(hipMalloc(&crossDeviceBarrierFlag, sizeof(uint32_t)));
+  HIP_RUNTIME_CHECK(hipMemsetD32(crossDeviceBarrierFlag, 1, 1));
   crossDeviceBarrierMemObj = ShmemMallocAndReturnMemObjPtr(
       barrierSize * 2 * sizeof(uint64_t) / sizeof(uint32_t), hipDeviceMallocUncached);
 }
@@ -177,6 +179,7 @@ void EpDispatchCombineHandle::InitializeBarrier() {
 void EpDispatchCombineHandle::FinalizeBarrier() {
   HIP_RUNTIME_CHECK(hipFree(dispatchGridBarrier));
   HIP_RUNTIME_CHECK(hipFree(combineGridBarrier));
+  HIP_RUNTIME_CHECK(hipFree(crossDeviceBarrierFlag));
   ShmemFree(crossDeviceBarrierMemObj->localPtr);
 }
 
@@ -254,7 +257,8 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
       argsVariant);
 }
 
-void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) { crossDeviceBarrierFlag++; }
+// no need for a separate reset kernel now
+void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) { ; }
 
 }  // namespace moe
 }  // namespace mori

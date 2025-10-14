@@ -124,7 +124,7 @@ class EpDispatchCombineOp:
         indices: torch.Tensor,
         block_num: int = -1,
         warp_per_block: int = -1,
-        call_reset: bool = True,
+        call_reset: bool = False,
     ):
         output = self._combine_func(
             self._handle,

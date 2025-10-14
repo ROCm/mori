@@ -91,7 +91,6 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             # dispatch_weights,
             None,
             dispatch_indices,
-            call_reset=False,
             block_num=80,
             warp_per_block=4,
         )

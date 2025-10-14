@@ -374,7 +374,6 @@ class EpDispatchCombineTestCase {
   void RunAccuracyTest() {
     for (int i = 0; i < runConfig.repeat; i++) {
       InitializeHandle();
-      handle.LaunchReset();
 
       handle.LaunchDispatch(runConfig.kernelType);
 
@@ -400,7 +399,6 @@ class EpDispatchCombineTestCase {
 
     for (int i = 0; i < runConfig.warmup; i++) {
       InitializeHandle();
-      handle.LaunchReset(stream);
       SystemBarrier();
 
       handle.LaunchDispatch(runConfig.kernelType, -1, -1, stream);
@@ -417,7 +415,6 @@ class EpDispatchCombineTestCase {
     int dispatchTotalRecvTokenNum = 0;
     for (int i = 0; i < runConfig.repeat; i++) {
       InitializeHandle();
-      handle.LaunchReset(stream);
       SystemBarrier();
 
       HIP_RUNTIME_CHECK(hipEventRecord(events[0]));

@@ -50,12 +50,12 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
     args.combineGridBarrier[0] = 0;
     core::AtomicStoreRelaxedSystem(
         args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(globalThdId) + args.config.rank,
-        args.crossDeviceBarrierFlag);
+        *args.crossDeviceBarrierFlag);
   }
 
   uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
   if (thdId < args.config.worldSize) {
-    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != args.crossDeviceBarrierFlag) {
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != *args.crossDeviceBarrierFlag) {
     }
   }
   __syncthreads();
