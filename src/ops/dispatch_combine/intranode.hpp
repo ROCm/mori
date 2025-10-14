@@ -211,7 +211,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   if (args.config.useExternalInpBuffer) {
     for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
-      core::WarpCopy(args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
+      core::WarpCopy(args.shmemCombineInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
                      args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
     }
   }
@@ -252,7 +252,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
       if (destPe < config.worldSize) {
         index_t destLocalTokId = destTokId - destPe * maxNumOutTokenPerRank;
-        srcPtrs[j] = args.shmemInpTokMemObj->template GetAs<T*>(destPe) +
+        srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
                      destLocalTokId * config.hiddenDim + hiddenDimOffset;
         srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                            destLocalTokId * config.numExpertPerToken;

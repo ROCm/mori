@@ -177,7 +177,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
                 tokenId * config.scaleDim * config.scaleTypeSize,
             config.scaleDim * config.scaleTypeSize);
       }
-      shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemInpTokMemObj, peSortedOffset,
+      shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemDispatchInpTokMemObj, peSortedOffset,
                                           args.shmemStagingTokMemObj, mapIdxOffset, stagingOffset,
                                           destPe, localBlockId);
     }
@@ -208,7 +208,7 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
         size_t srcOffset = srcIdx * stagingOffset;
         const index_t dstIdx = myPe * MaxNumTokensToRecvPerRank + startIdx + chunkOffset;
         size_t dstOffset = dstIdx * stagingOffset;
-        shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemInpTokMemObj, dstOffset,
+        shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemDispatchInpTokMemObj, dstOffset,
                                             args.shmemStagingTokMemObj, srcOffset,
                                             actualTokenNum * stagingOffset, destPe, localBlockId);
 
@@ -298,24 +298,24 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
     size_t peSortedTokenOffset = size_t(peSortedId) * stagingOffset;
 
     core::WarpCopy(args.shmemOutTokMemObj->template GetAs<char*>() + localTokenOffset,
-                   args.shmemInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset,
+                   args.shmemDispatchInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset,
                    config.hiddenDim * sizeof(T));
-    core::WarpCopy(
-        args.shmemOutWeightsMemObj->template GetAs<char*>() +
-            localTokenIdx * config.numExpertPerToken * sizeof(float),
-        args.shmemInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset + weightOffset,
-        config.numExpertPerToken * sizeof(float));
-    core::WarpCopy(
-        args.shmemOutIndicesMemObj->template GetAs<char*>() +
-            localTokenIdx * config.numExpertPerToken * sizeof(index_t),
-        args.shmemInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset + indicesOffset,
-        config.numExpertPerToken * sizeof(index_t));
+    core::WarpCopy(args.shmemOutWeightsMemObj->template GetAs<char*>() +
+                       localTokenIdx * config.numExpertPerToken * sizeof(float),
+                   args.shmemDispatchInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset +
+                       weightOffset,
+                   config.numExpertPerToken * sizeof(float));
+    core::WarpCopy(args.shmemOutIndicesMemObj->template GetAs<char*>() +
+                       localTokenIdx * config.numExpertPerToken * sizeof(index_t),
+                   args.shmemDispatchInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset +
+                       indicesOffset,
+                   config.numExpertPerToken * sizeof(index_t));
     if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
-      core::WarpCopy(
-          args.shmemOutScalesMemObj->template GetAs<char*>() +
-              localTokenIdx * config.scaleDim * config.scaleTypeSize,
-          args.shmemInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset + scalesOffset,
-          config.scaleDim * config.scaleTypeSize);
+      core::WarpCopy(args.shmemOutScalesMemObj->template GetAs<char*>() +
+                         localTokenIdx * config.scaleDim * config.scaleTypeSize,
+                     args.shmemDispatchInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset +
+                         scalesOffset,
+                     config.scaleDim * config.scaleTypeSize);
     }
     if (laneId == 0) {
       args.dispReceiverIdxMap[localTokenIdx] = peSortedId;
@@ -428,7 +428,7 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
             weightSize);
       }
 
-      shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemInpTokMemObj, peSortedOffset,
+      shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemCombineInpTokMemObj, peSortedOffset,
                                           args.shmemStagingTokMemObj, mapIdxOffset, tokenPackSize,
                                           srcPe);
     }
@@ -459,7 +459,7 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
         size_t srcOffset = srcIdx * tokenPackSize;
         const index_t dstIdx = myPe * MaxNumTokensToRecvPerRank + startIdx + chunkOffset;
         size_t dstOffset = dstIdx * tokenPackSize;
-        shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemInpTokMemObj, dstOffset,
+        shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemCombineInpTokMemObj, dstOffset,
                                             args.shmemStagingTokMemObj, srcOffset,
                                             actualTokenNum * tokenPackSize, srcPe, localBlockId);
 
@@ -540,10 +540,10 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
       size_t weightByteOffset = size_t(peSortedId) * tokenPackSize + tokenSize;
 
       if (destPe < config.worldSize) {
-        srcPtrs[j] =
-            reinterpret_cast<T*>(args.shmemInpTokMemObj->template GetAs<char*>() + byteOffset);
+        srcPtrs[j] = reinterpret_cast<T*>(args.shmemCombineInpTokMemObj->template GetAs<char*>() +
+                                          byteOffset);
         srcWeightsPtr[j] = reinterpret_cast<float*>(
-            args.shmemInpTokMemObj->template GetAs<char*>() + weightByteOffset);
+            args.shmemCombineInpTokMemObj->template GetAs<char*>() + weightByteOffset);
       } else {
         srcPtrs[j] = nullptr;
         srcWeightsPtr[j] = nullptr;
