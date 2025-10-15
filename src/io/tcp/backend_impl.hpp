@@ -31,7 +31,6 @@
 #include <vector>
 
 #include "mori/application/transport/tcp/tcp.hpp"
-#include "mori/application/utils/check.hpp"
 #include "mori/io/backend.hpp"
 #include "mori/io/common.hpp"
 #include "mori/io/engine.hpp"
@@ -41,10 +40,14 @@
 namespace mori {
 namespace io {
 
-class TcpBackend : public Backend {
+class BackendServer {
  public:
-  TcpBackend(EngineKey, const IOEngineConfig&, const TcpBackendConfig&);
-  ~TcpBackend();
+  BackendServer(const IOEngineConfig& engCfg, const TcpBackendConfig& cfg)
+      : config(cfg), engConfig(engCfg) {}
+  ~BackendServer() = default;
+
+  void Start();
+  void Stop();
 
   void RegisterRemoteEngine(const EngineDesc&);
   void DeregisterRemoteEngine(const EngineDesc&);
@@ -52,20 +55,19 @@ class TcpBackend : public Backend {
   void RegisterMemory(const MemoryDesc& desc);
   void DeregisterMemory(const MemoryDesc& desc);
 
-  void ReadWrite(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
-                 size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id,
-                 bool isRead);
   void BatchReadWrite(const MemoryDesc& localDest, const SizeVec& localOffsets,
                       const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
                       const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
                       bool isRead);
 
-  BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
-  bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
-
  private:
-  // Forward declaration of worker context (defined below TcpBackendSession)
-  struct WorkerContext;
+  struct WorkerContext {
+    application::TCPContext* listenCtx{nullptr};
+    int epollFd{-1};
+    size_t id{0};
+    std::mutex pendingAddMu;                   // protects pendingAdd
+    std::vector<ConnectionState*> pendingAdd;  // connections to add to epoll
+  };
 
   // --- Core Asynchronous Engine ---
   void WorkerLoop(WorkerContext* wctx);
@@ -84,7 +86,6 @@ class TcpBackend : public Backend {
   void EnsureConnections(const EngineDesc& rdesc, size_t minCount);
   TcpBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
 
-  EngineKey myEngKey;
   TcpBackendConfig config;
   IOEngineConfig engConfig;
   std::vector<application::TCPContext*> listeners;
@@ -118,7 +119,7 @@ class TcpBackend : public Backend {
 
 class TcpBackendSession : public BackendSession {
  public:
-  TcpBackendSession(TcpBackend* backend, const MemoryDesc& local, const MemoryDesc& remote)
+  TcpBackendSession(BackendServer* backend, const MemoryDesc& local, const MemoryDesc& remote)
       : backend(backend), local(local), remote(remote) {}
   ~TcpBackendSession() = default;
 
@@ -130,19 +131,36 @@ class TcpBackendSession : public BackendSession {
   bool Alive() const { return true; }
 
  private:
-  TcpBackend* backend{nullptr};
+  BackendServer* backend{nullptr};
   MemoryDesc local{};
   MemoryDesc remote{};
 };
 
-// WorkerContext holds per-worker reactor state.
-// outbound connections will later be enqueued and registered via wakeFd.
-struct TcpBackend::WorkerContext {
-  application::TCPContext* listenCtx{nullptr};
-  int epollFd{-1};
-  size_t id{0};
-  std::mutex pendingAddMu;                   // protects pendingAdd
-  std::vector<ConnectionState*> pendingAdd;  // connections to add to epoll
+class TcpBackend : public Backend {
+ public:
+  TcpBackend(EngineKey, const IOEngineConfig&, const TcpBackendConfig&);
+  ~TcpBackend();
+
+  void RegisterRemoteEngine(const EngineDesc&);
+  void DeregisterRemoteEngine(const EngineDesc&);
+
+  void RegisterMemory(const MemoryDesc& desc);
+  void DeregisterMemory(const MemoryDesc& desc);
+
+  void ReadWrite(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
+                 size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id,
+                 bool isRead);
+  void BatchReadWrite(const MemoryDesc& localDest, const SizeVec& localOffsets,
+                      const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
+                      const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
+                      bool isRead);
+
+  BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
+  bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
+
+ private:
+  EngineKey myEngKey;
+  BackendServer* server;
 };
 
 }  // namespace io

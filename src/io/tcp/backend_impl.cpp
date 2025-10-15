@@ -76,8 +76,7 @@ inline void TcpBatchOpFail(TransferOp& op, StatusCode code, const std::string& m
 }
 }  // namespace
 
-TcpBackend::TcpBackend(EngineKey key, const IOEngineConfig& engCfg, const TcpBackendConfig& cfg)
-    : myEngKey(key), config(cfg), engConfig(engCfg) {
+void BackendServer::Start() {
   running.store(true);  // set before threads start
   bufferPool.Configure(128, 16 * 1024 * 1024, true);
   listeners.reserve(config.numWorkerThreads);
@@ -124,7 +123,7 @@ TcpBackend::TcpBackend(EngineKey key, const IOEngineConfig& engCfg, const TcpBac
   }
 }
 
-TcpBackend::~TcpBackend() {
+void BackendServer::Stop() {
   running.store(false);
   for (auto& t : workerThreads)
     if (t.joinable()) t.join();
@@ -142,7 +141,7 @@ TcpBackend::~TcpBackend() {
   connPools.clear();
 }
 
-void TcpBackend::CloseInbound(ConnectionState* conn) {
+void BackendServer::CloseInbound(ConnectionState* conn) {
   std::unique_ptr<ConnectionState> victim;
   {
     std::lock_guard<std::mutex> lk(inConnsMu);
@@ -155,7 +154,7 @@ void TcpBackend::CloseInbound(ConnectionState* conn) {
   if (victim) victim->Close();
 }
 
-void TcpBackend::WorkerLoop(WorkerContext* wctx) {
+void BackendServer::WorkerLoop(WorkerContext* wctx) {
   constexpr int kMaxEvents = 64;
   std::array<epoll_event, kMaxEvents> events{};
   int workerEpollFd = wctx->epollFd;
@@ -194,7 +193,7 @@ void TcpBackend::WorkerLoop(WorkerContext* wctx) {
   }
 }
 
-void TcpBackend::HandleNewConnection(application::TCPContext* listener_ctx, int epoll_fd) {
+void BackendServer::HandleNewConnection(application::TCPContext* listener_ctx, int epoll_fd) {
   auto newEps = listener_ctx->Accept();
   for (const auto& ep : newEps) {
     std::unique_ptr<ConnectionState> conn = std::make_unique<ConnectionState>();
@@ -222,7 +221,7 @@ void TcpBackend::HandleNewConnection(application::TCPContext* listener_ctx, int 
   }
 }
 
-void TcpBackend::HandleReadable(ConnectionState* conn) {
+void BackendServer::HandleReadable(ConnectionState* conn) {
   application::TCPEndpoint ep(conn->handle);
   constexpr size_t kHeaderSize = sizeof(TcpMessageHeader);
   bool needRearm = false;
@@ -486,7 +485,7 @@ void TcpBackend::HandleReadable(ConnectionState* conn) {
   }
 }
 
-void TcpBackend::HandleWritable(ConnectionState* conn) {
+void BackendServer::HandleWritable(ConnectionState* conn) {
   application::TCPEndpoint ep(conn->handle);
   bool needRearm = false;
 
@@ -621,7 +620,7 @@ void TcpBackend::HandleWritable(ConnectionState* conn) {
   }
 }
 
-void TcpBackend::SetNonBlocking(int fd) {
+void BackendServer::SetNonBlocking(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
   if (flags == -1) {
     MORI_IO_ERROR("TcpBackend: fcntl F_GETFL failed: {}", strerror(errno));
@@ -633,7 +632,7 @@ void TcpBackend::SetNonBlocking(int fd) {
   }
 }
 
-void TcpBackend::SetSocketOptions(int fd) {
+void BackendServer::SetSocketOptions(int fd) {
   int flag = 1;
   setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
   setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
@@ -645,7 +644,7 @@ void TcpBackend::SetSocketOptions(int fd) {
   setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &qack, sizeof(qack));
 }
 
-void TcpBackend::RearmSocket(int epoll_fd, ConnectionState* conn, uint32_t events) {
+void BackendServer::RearmSocket(int epoll_fd, ConnectionState* conn, uint32_t events) {
   if (conn->handle.fd < 0) return;
   struct epoll_event event;
   event.data.ptr = conn;
@@ -656,44 +655,7 @@ void TcpBackend::RearmSocket(int epoll_fd, ConnectionState* conn, uint32_t event
   }
 }
 
-TcpBackendSession* TcpBackend::GetOrCreateSessionCached(const MemoryDesc& local,
-                                                        const MemoryDesc& remote) {
-  SessionCacheKey key{remote.engineKey, local.id, remote.id};
-  {
-    std::lock_guard<std::mutex> lock(sessionCacheMu);
-    auto it = sessionCache.find(key);
-    if (it != sessionCache.end()) {
-      return it->second.get();
-    }
-  }
-
-  BackendSession* rawBase = CreateSession(local, remote);
-  if (!rawBase) {
-    MORI_IO_ERROR("TcpBackend: CreateSession failed for local mem {} remote mem {}", local.id,
-                  remote.id);
-    return nullptr;
-  }
-
-  std::unique_ptr<TcpBackendSession> newSess(dynamic_cast<TcpBackendSession*>(rawBase));
-  if (!newSess) {
-    MORI_IO_ERROR(
-        "TcpBackend: CreateSession returned incompatible session type (local {}, remote {})",
-        local.id, remote.id);
-    delete rawBase;
-    return nullptr;
-  }
-
-  std::lock_guard<std::mutex> lock(sessionCacheMu);
-  auto it = sessionCache.find(key);
-  if (it != sessionCache.end()) {
-    return it->second.get();  // Another thread won the race
-  }
-
-  auto [emplacedIt, inserted] = sessionCache.emplace(key, std::move(newSess));
-  return emplacedIt->second.get();
-}
-
-void TcpBackend::EnsureConnections(const EngineDesc& rdesc, size_t minCount) {
+void BackendServer::EnsureConnections(const EngineDesc& rdesc, size_t minCount) {
   if (connPools.find(rdesc.key) == connPools.end()) {
     connPools.emplace(rdesc.key, std::make_unique<ConnectionPool>());
   }
@@ -751,7 +713,7 @@ void TcpBackend::EnsureConnections(const EngineDesc& rdesc, size_t minCount) {
   connPools[rdesc.key]->SetConnections(pending);
 }
 
-void TcpBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
+void BackendServer::RegisterRemoteEngine(const EngineDesc& rdesc) {
   {
     std::lock_guard<std::mutex> lock(remotesMu);
     auto [it, inserted] = remotes.emplace(rdesc.key, rdesc);
@@ -763,7 +725,7 @@ void TcpBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
   }
 }
 
-void TcpBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
+void BackendServer::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   {
     std::lock_guard<std::mutex> lock(remotesMu);
     remotes.erase(rdesc.key);
@@ -775,53 +737,20 @@ void TcpBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   }
 }
 
-void TcpBackend::RegisterMemory(const MemoryDesc& desc) {
+void BackendServer::RegisterMemory(const MemoryDesc& desc) {
   std::lock_guard<std::mutex> lock(memMu);
   localMems[desc.id] = desc;
 }
 
-void TcpBackend::DeregisterMemory(const MemoryDesc& desc) {
+void BackendServer::DeregisterMemory(const MemoryDesc& desc) {
   std::lock_guard<std::mutex> lock(memMu);
   localMems.erase(desc.id);
 }
 
-void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
-                           const MemoryDesc& remoteSrc, size_t remoteOffset, size_t size,
-                           TransferStatus* status, TransferUniqueId id, bool isRead) {
-  if (size == 0) {
-    status->SetCode(StatusCode::SUCCESS);
-    return;
-  }
-  status->SetCode(StatusCode::IN_PROGRESS);
-  EngineKey remoteKey = remoteSrc.engineKey;
-  EngineDesc rdesc;
-  {
-    std::lock_guard<std::mutex> lock(remotesMu);
-    auto it = remotes.find(remoteKey);
-    if (it == remotes.end()) {
-      status->SetCode(StatusCode::ERR_NOT_FOUND);
-      status->SetMessage("remote engine not registered");
-      return;
-    }
-    rdesc = it->second;
-  }
-
-  TransferOp op{localDest, localOffset, remoteSrc, remoteOffset, size, status, id};
-  op.opType = isRead ? READ_REQ : WRITE_REQ;
-
-  auto connection = connPools[rdesc.key]->AcquireConnection();
-  if (!connection) {
-    status->SetCode(StatusCode::ERR_BAD_STATE);
-    status->SetMessage("no valid tcp connection");
-    return;
-  }
-  connection->SubmitTransfer(std::move(op));
-}
-
-void TcpBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& localOffsets,
-                                const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
-                                const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
-                                bool isRead) {
+void BackendServer::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& localOffsets,
+                                   const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
+                                   const SizeVec& sizes, TransferStatus* status,
+                                   TransferUniqueId id, bool isRead) {
   // Basic validation
   if (sizes.empty()) {
     status->SetCode(StatusCode::SUCCESS);
@@ -858,7 +787,7 @@ void TcpBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loca
   std::deque<ConnectionState*> conns = pool->GetAllConnections();
   if (conns.empty()) {
     // Try to create at least one connection lazily
-    EnsureConnections(rdesc, 1);
+    EnsureConnections(rdesc, config.numWorkerThreads);
     conns = pool->GetAllConnections();
   }
   if (conns.empty()) {
@@ -905,8 +834,46 @@ void TcpBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loca
   }
 }
 
-BackendSession* TcpBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote) {
-  return new TcpBackendSession(this, local, remote);
+TcpBackend::TcpBackend(EngineKey k, const IOEngineConfig& engineCfg,
+                       const TcpBackendConfig& tcpCfg) {
+  myEngKey = k;
+  server = new BackendServer(engineCfg, tcpCfg);
+  server->Start();
+}
+
+TcpBackend::~TcpBackend() {
+  server->Stop();
+  delete server;
+}
+
+void TcpBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
+  server->RegisterRemoteEngine(rdesc);
+}
+
+void TcpBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
+  server->DeregisterRemoteEngine(rdesc);
+}
+
+void TcpBackend::RegisterMemory(const MemoryDesc& desc) { server->RegisterMemory(desc); }
+
+void TcpBackend::DeregisterMemory(const MemoryDesc& desc) { server->DeregisterMemory(desc); }
+
+void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
+                           const MemoryDesc& remoteSrc, size_t remoteOffset, size_t size,
+                           TransferStatus* status, TransferUniqueId id, bool isRead) {
+  SizeVec localOffsets{localOffset};
+  SizeVec remoteOffsets{remoteOffset};
+  SizeVec sizes{size};
+  server->BatchReadWrite(localDest, localOffsets, remoteSrc, remoteOffsets, sizes, status, id,
+                         isRead);
+}
+
+void TcpBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& localOffsets,
+                                const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
+                                const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
+                                bool isRead) {
+  server->BatchReadWrite(localDest, localOffsets, remoteSrc, remoteOffsets, sizes, status, id,
+                         isRead);
 }
 
 bool TcpBackend::PopInboundTransferStatus(EngineKey /*remote*/, TransferUniqueId /*id*/,
@@ -914,9 +881,16 @@ bool TcpBackend::PopInboundTransferStatus(EngineKey /*remote*/, TransferUniqueId
   return false;  // Not implemented yet
 }
 
+BackendSession* TcpBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote) {
+  return new TcpBackendSession(server, local, remote);
+}
+
 void TcpBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                   TransferStatus* status, TransferUniqueId id, bool isRead) {
-  backend->ReadWrite(local, localOffset, remote, remoteOffset, size, status, id, isRead);
+  SizeVec localOffsets{localOffset};
+  SizeVec remoteOffsets{remoteOffset};
+  SizeVec sizes{size};
+  backend->BatchReadWrite(local, localOffsets, remote, remoteOffsets, sizes, status, id, isRead);
 }
 
 void TcpBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,

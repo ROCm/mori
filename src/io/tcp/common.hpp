@@ -31,8 +31,8 @@
 #include <mutex>
 #include <optional>
 
+#include "mori/application/utils/check.hpp"
 #include "mori/io/common.hpp"
-#include "mori/io/logging.hpp"
 
 namespace mori {
 namespace io {
@@ -309,7 +309,7 @@ class BufferPool {
   void Free(BufferBlock& b) {
     if (!b.data) return;
     if (b.pinned)
-      hipHostFree(b.data);
+      HIP_RUNTIME_CHECK(hipHostFree(b.data));
     else
       ::free(b.data);
     b.data = nullptr;
