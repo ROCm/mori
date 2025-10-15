@@ -216,7 +216,7 @@ class EpDispatchCombineHandle {
   index_t* dispDestTokIdMap{nullptr};
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
-  uint32_t crossDeviceBarrierFlag{1};
+  uint32_t* crossDeviceBarrierFlag{nullptr};
 };
 
 template <typename T>
@@ -255,7 +255,7 @@ struct EpDispatchCombineArgs {
   index_t* dispDestTokIdMap{nullptr};
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
-  uint32_t crossDeviceBarrierFlag{1};
+  uint32_t* crossDeviceBarrierFlag{nullptr};
 };
 
 using EpDispatchCombineArgsVariant =

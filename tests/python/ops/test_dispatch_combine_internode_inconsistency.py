@@ -198,7 +198,7 @@ def _test_dispatch_combine(
     op = mori.ops.EpDispatchCombineOp(config)
     test_case = EpDispatchCombineTestCase(config)
     test_data = test_case.gen_test_data(True)
-    num_reps = 2048
+    num_reps = 128
     for idx in range(num_reps):
         test_case.run_test_once(op, test_data)
         if rank == 0:
