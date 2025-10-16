@@ -79,7 +79,8 @@ class BackendServer {
   void SetSocketOptions(int fd);
   void SetNonBlocking(int fd);
   void RearmSocket(int epoll_fd, Connection* conn, uint32_t events);
-  void CloseInbound(Connection* conn);
+  // Unified close (inbound or outbound). Propagates failure to any pending ops/batches.
+  void CloseConnection(Connection* conn, StatusCode code, const std::string& msg);
 
   void EnsureConnections(const EngineDesc& rdesc, size_t minCount);
   TcpBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
@@ -97,6 +98,8 @@ class BackendServer {
   std::mutex inConnsMu;
   std::unordered_map<int, std::unique_ptr<Connection>> inboundConnections;
   std::unordered_map<EngineKey, std::unique_ptr<ConnectionPool>> connPools;
+  // Map socket fd to its owning outbound ConnectionPool for O(1) removal on close.
+  std::unordered_map<int, ConnectionPool*> fdToPool;
 
   std::mutex remotesMu;
   std::unordered_map<EngineKey, EngineDesc> remotes;

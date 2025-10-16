@@ -22,7 +22,7 @@
 #include "src/io/tcp/backend_impl.hpp"
 
 #include <errno.h>
-#include <sys/eventfd.h>
+#include <signal.h>
 
 #include <array>
 
@@ -78,6 +78,8 @@ inline void TcpBatchOpFail(TransferOp& op, StatusCode code, const std::string& m
 
 void BackendServer::Start() {
   running.store(true);  // set before threads start
+  // Ensure SIGPIPE does not terminate process when writing to closed sockets.
+  ::signal(SIGPIPE, SIG_IGN);
   bufferPool.Configure(128, 16 * 1024 * 1024, true);
   listeners.reserve(config.numWorkerThreads);
   workerThreads.reserve(config.numWorkerThreads);
@@ -141,17 +143,78 @@ void BackendServer::Stop() {
   connPools.clear();
 }
 
-void BackendServer::CloseInbound(Connection* conn) {
-  std::unique_ptr<Connection> victim;
+// Close connection (inbound or outbound) and fail any pending operations.
+void BackendServer::CloseConnection(Connection* conn, StatusCode code, const std::string& msg) {
+  if (!conn) return;
+
+  // Attempt epoll DEL first (avoid stale events if fd reused quickly)
+  int fd = conn->handle.fd;
+  if (fd >= 0 && conn->lastEpollFd >= 0) {
+    epoll_ctl(conn->lastEpollFd, EPOLL_CTL_DEL, fd, nullptr);  // ignore errors
+  }
+
+  // Collect pending ops under lock
+  std::vector<TransferOp> toFail;
+  size_t pendingWriteCount = 0;
+  bool hadRecvOp = false;
+  bool hadActiveSend = false;
+  {
+    std::lock_guard<std::mutex> lk(conn->mu);
+    if (conn->recvOp) {
+      toFail.push_back(*conn->recvOp);
+      conn->recvOp.reset();
+      hadRecvOp = true;
+    }
+    pendingWriteCount = conn->pendingOps.size();
+    for (auto& kv : conn->pendingOps) {
+      toFail.push_back(kv.second);
+    }
+    conn->pendingOps.clear();
+    if (conn->activeSendOp) {
+      toFail.push_back(*conn->activeSendOp);
+      conn->activeSendOp.reset();
+      hadActiveSend = true;
+    }
+  }
+  if (!toFail.empty()) {
+    MORI_IO_WARN(
+        "TcpBackend: closing fd {} reason='{}' will fail {} ops (recvOp={} activeSend={} "
+        "pendingWrites={})",
+        fd, msg, toFail.size(), hadRecvOp, hadActiveSend, pendingWriteCount);
+  }
+
+  // Determine if inbound map owns it
+  bool ownedInbound = false;
   {
     std::lock_guard<std::mutex> lk(inConnsMu);
-    auto it = inboundConnections.find(conn->handle.fd);
+    auto it = inboundConnections.find(fd);
     if (it != inboundConnections.end()) {
-      victim = std::move(it->second);
+      ownedInbound = true;
+      // unique_ptr will be released after we close
+      it->second->Close();
       inboundConnections.erase(it);
     }
   }
-  if (victim) victim->Close();
+
+  if (!ownedInbound) {
+    ConnectionPool* pool = nullptr;
+    auto itp = fdToPool.find(fd);
+    if (itp != fdToPool.end()) pool = itp->second;
+    if (pool) {
+      pool->RemoveConnection(conn);
+      fdToPool.erase(fd);
+    }
+  }
+
+  // If still open (not owned by pool or inbound), just close.
+  if (fd >= 0 && conn->handle.fd >= 0) {
+    conn->Close();
+  }
+
+  // Fail all collected ops / batches (outside lock)
+  for (auto& op : toFail) {
+    TcpBatchOpFail(op, code, msg);
+  }
 }
 
 void BackendServer::WorkerLoop(WorkerContext* wctx) {
@@ -179,7 +242,7 @@ void BackendServer::WorkerLoop(WorkerContext* wctx) {
       if (ev.events & (EPOLLERR | EPOLLHUP)) {
         MORI_IO_ERROR("TcpBackend: connection err/hup fd {} events=0x{:x}", conn->handle.fd,
                       ev.events);
-        conn->Close();
+        CloseConnection(conn, StatusCode::ERR_BAD_STATE, "connection error/hup");
         closed = true;
       } else {
         if (!closed && (ev.events & EPOLLIN)) HandleReadable(conn);
@@ -242,7 +305,7 @@ void BackendServer::HandleReadable(Connection* conn) {
         auto& header = conn->pendingHeader;
         if (header.opcode == 0 && header.id == 0 && header.mem_id == 0 && header.size == 0) {
           // Treat as peer close / invalid; close
-          CloseInbound(conn);
+          CloseConnection(conn, StatusCode::ERR_BAD_STATE, "invalid zero header");
           return;
         }
         conn->expectedPayloadSize = header.size;
@@ -255,7 +318,7 @@ void BackendServer::HandleReadable(Connection* conn) {
             if (!conn->inboundPayload.data) {
               MORI_IO_ERROR("TcpBackend: buffer allocation failed size {} fd {}",
                             conn->expectedPayloadSize, conn->handle.fd);
-              CloseInbound(conn);
+              CloseConnection(conn, StatusCode::ERR_BAD_STATE, "buffer allocation failed");
               return;
             }
           }
@@ -264,7 +327,7 @@ void BackendServer::HandleReadable(Connection* conn) {
         // Fall through to payload loop same iteration
       } else if (r == 0) {
         // Peer closed during header
-        CloseInbound(conn);
+        CloseConnection(conn, StatusCode::ERR_BAD_STATE, "peer closed during header");
         return;
       } else if (r == -EAGAIN) {
         needRearm = true;
@@ -272,7 +335,7 @@ void BackendServer::HandleReadable(Connection* conn) {
       } else {  // real error
         MORI_IO_ERROR("TcpBackend: header recv error fd {} err={} errno={} ", conn->handle.fd, r,
                       errno);
-        CloseInbound(conn);
+        CloseConnection(conn, StatusCode::ERR_BAD_STATE, "header recv error");
         return;
       }
     }
@@ -295,7 +358,7 @@ void BackendServer::HandleReadable(Connection* conn) {
           } else if (r == 0) {
             // Peer closed mid-payload
             MORI_IO_ERROR("TcpBackend: peer closed mid-payload fd {}", conn->handle.fd);
-            CloseInbound(conn);
+            CloseConnection(conn, StatusCode::ERR_BAD_STATE, "peer closed mid-payload");
             return;
           } else if (r == -EAGAIN) {
             needRearm = true;
@@ -303,7 +366,7 @@ void BackendServer::HandleReadable(Connection* conn) {
           } else {  // real error
             MORI_IO_ERROR("TcpBackend: payload recv error fd {} err={} errno={} ", conn->handle.fd,
                           r, errno);
-            CloseInbound(conn);
+            CloseConnection(conn, StatusCode::ERR_BAD_STATE, "payload recv error");
             return;
           }
         }
@@ -321,7 +384,7 @@ void BackendServer::HandleReadable(Connection* conn) {
               MORI_IO_ERROR(
                   "tcp service: close fd {} reason=mem_not_found mem_id={} opcode={} size={}",
                   conn->handle.fd, header.mem_id, (int)header.opcode, header.size);
-              CloseInbound(conn);
+              CloseConnection(conn, StatusCode::ERR_NOT_FOUND, "read req mem not found");
               return;
             }
             target = it->second;
@@ -331,7 +394,7 @@ void BackendServer::HandleReadable(Connection* conn) {
           if (header.size && !block.data) {
             MORI_IO_ERROR("TcpBackend: buffer alloc fail for read_resp size {} fd {}", header.size,
                           conn->handle.fd);
-            CloseInbound(conn);
+            CloseConnection(conn, StatusCode::ERR_BAD_STATE, "buffer alloc fail read_resp");
             return;
           }
           char* payload = block.data;
@@ -343,7 +406,7 @@ void BackendServer::HandleReadable(Connection* conn) {
                 MORI_IO_ERROR(
                     "tcp service: close fd {} reason=hipMemcpy_D2H_fail mem={} size={} errno={}",
                     conn->handle.fd, header.mem_id, header.size, errno);
-                CloseInbound(conn);
+                CloseConnection(conn, StatusCode::ERR_BAD_STATE, "hipMemcpy D2H failed");
                 return;
               }
             } else {
@@ -361,7 +424,7 @@ void BackendServer::HandleReadable(Connection* conn) {
               (header.size && ep.Send(payload, header.size) != 0)) {
             MORI_IO_ERROR("TcpBackend: send read_resp failed fd {}", conn->handle.fd);
             bufferPool.Release(std::move(block));
-            CloseInbound(conn);
+            CloseConnection(conn, StatusCode::ERR_BAD_STATE, "send read_resp failed");
             return;
           }
           bufferPool.Release(std::move(block));
@@ -376,7 +439,7 @@ void BackendServer::HandleReadable(Connection* conn) {
               MORI_IO_ERROR("tcp service: close fd {} reason=mem_not_found(write) mem={} size={}",
                             conn->handle.fd, header.mem_id, header.size);
               if (conn->inboundPayload.data) bufferPool.Release(std::move(conn->inboundPayload));
-              CloseInbound(conn);
+              CloseConnection(conn, StatusCode::ERR_BAD_STATE, "write req mem not found");
               return;
             }
             target = it->second;
@@ -391,7 +454,7 @@ void BackendServer::HandleReadable(Connection* conn) {
                     "tcp service: close fd {} reason=hipMemcpy_H2D_fail mem={} size={} errno={}",
                     conn->handle.fd, header.mem_id, header.size, errno);
                 if (conn->inboundPayload.data) bufferPool.Release(std::move(conn->inboundPayload));
-                CloseInbound(conn);
+                CloseConnection(conn, StatusCode::ERR_BAD_STATE, "hipMemcpy H2D failed write_req");
                 return;
               }
             } else {
@@ -412,7 +475,7 @@ void BackendServer::HandleReadable(Connection* conn) {
           if (conn->recvOp == std::nullopt) {
             MORI_IO_ERROR("TcpBackend: unexpected READ RESP fd {}", conn->handle.fd);
             if (conn->inboundPayload.data) bufferPool.Release(std::move(conn->inboundPayload));
-            CloseInbound(conn);
+            CloseConnection(conn, StatusCode::ERR_BAD_STATE, "unexpected READ RESP");
             return;
           }
           TransferOp& op = *(conn->recvOp);
@@ -433,7 +496,7 @@ void BackendServer::HandleReadable(Connection* conn) {
                 TcpBatchOpFail(op, StatusCode::ERR_BAD_STATE, "hipMemcpy H2D failed");
                 if (conn->inboundPayload.data) bufferPool.Release(std::move(conn->inboundPayload));
                 conn->recvOp.reset();
-                CloseInbound(conn);
+                CloseConnection(conn, StatusCode::ERR_BAD_STATE, "hipMemcpy H2D failed read_resp");
                 return;
               }
             } else {
@@ -466,7 +529,7 @@ void BackendServer::HandleReadable(Connection* conn) {
         default: {
           MORI_IO_ERROR("TcpBackend: unknown opcode {} fd {} closing", (int)header.opcode,
                         conn->handle.fd);
-          CloseInbound(conn);
+          CloseConnection(conn, StatusCode::ERR_BAD_STATE, "unknown opcode");
           return;
         }
       }
@@ -708,6 +771,8 @@ void BackendServer::EnsureConnections(const EngineDesc& rdesc, size_t minCount) 
       delete connPtr;
       continue;
     }
+    // Track mapping for fast removal
+    fdToPool[handle.fd] = connPools[rdesc.key].get();
     pending.push_back(connPtr);  // still track in pool
   }
   connPools[rdesc.key]->SetConnections(pending);
