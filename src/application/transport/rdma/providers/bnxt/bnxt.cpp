@@ -273,15 +273,6 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
     memset(atomicIbufAddr, 0, atomicIbufSize);
     assert(!status);
   }
-  if (config.onGpu) {
-    HIP_RUNTIME_CHECK(
-        hipExtMallocWithFlags(&atomicIbufAddr, atomicIbufSize, hipDeviceMallocUncached));
-    HIP_RUNTIME_CHECK(hipMemset(atomicIbufAddr, 0, atomicIbufSize));
-  } else {
-    err = posix_memalign(&atomicIbufAddr, config.alignment, atomicIbufSize);
-    memset(atomicIbufAddr, 0, atomicIbufSize);
-    assert(!err);
-  }
 
   // Register atomic ibuf as independent memory region
   atomicIbufMr = ibv_reg_mr(pd, atomicIbufAddr, atomicIbufSize,
