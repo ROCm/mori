@@ -65,8 +65,6 @@ class BackendServer {
     application::TCPContext* listenCtx{nullptr};
     int epollFd{-1};
     size_t id{0};
-    std::mutex pendingAddMu;                   // protects pendingAdd
-    std::vector<ConnectionState*> pendingAdd;  // connections to add to epoll
   };
 
   // --- Core Asynchronous Engine ---
@@ -74,14 +72,14 @@ class BackendServer {
 
   // --- Event Handlers ---
   void HandleNewConnection(application::TCPContext* listener_ctx, int epoll_fd);
-  void HandleReadable(ConnectionState* conn);
-  void HandleWritable(ConnectionState* conn);
+  void HandleReadable(Connection* conn);
+  void HandleWritable(Connection* conn);
 
   // --- Helper Functions ---
   void SetSocketOptions(int fd);
   void SetNonBlocking(int fd);
-  void RearmSocket(int epoll_fd, ConnectionState* conn, uint32_t events);
-  void CloseInbound(ConnectionState* conn);
+  void RearmSocket(int epoll_fd, Connection* conn, uint32_t events);
+  void CloseInbound(Connection* conn);
 
   void EnsureConnections(const EngineDesc& rdesc, size_t minCount);
   TcpBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
@@ -97,7 +95,7 @@ class BackendServer {
   BufferPool bufferPool;
 
   std::mutex inConnsMu;
-  std::unordered_map<int, std::unique_ptr<ConnectionState>> inboundConnections;
+  std::unordered_map<int, std::unique_ptr<Connection>> inboundConnections;
   std::unordered_map<EngineKey, std::unique_ptr<ConnectionPool>> connPools;
 
   std::mutex remotesMu;

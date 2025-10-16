@@ -141,8 +141,8 @@ void BackendServer::Stop() {
   connPools.clear();
 }
 
-void BackendServer::CloseInbound(ConnectionState* conn) {
-  std::unique_ptr<ConnectionState> victim;
+void BackendServer::CloseInbound(Connection* conn) {
+  std::unique_ptr<Connection> victim;
   {
     std::lock_guard<std::mutex> lk(inConnsMu);
     auto it = inboundConnections.find(conn->handle.fd);
@@ -173,7 +173,7 @@ void BackendServer::WorkerLoop(WorkerContext* wctx) {
         HandleNewConnection(wctx->listenCtx, workerEpollFd);
         continue;
       }
-      auto* conn = reinterpret_cast<ConnectionState*>(ev.data.ptr);
+      auto* conn = reinterpret_cast<Connection*>(ev.data.ptr);
       if (conn) conn->lastEpollFd = workerEpollFd;
       bool closed = false;
       if (ev.events & (EPOLLERR | EPOLLHUP)) {
@@ -196,8 +196,8 @@ void BackendServer::WorkerLoop(WorkerContext* wctx) {
 void BackendServer::HandleNewConnection(application::TCPContext* listener_ctx, int epoll_fd) {
   auto newEps = listener_ctx->Accept();
   for (const auto& ep : newEps) {
-    std::unique_ptr<ConnectionState> conn = std::make_unique<ConnectionState>();
-    conn->recvState = ConnectionState::RecvState::PARSING_HEADER;
+    std::unique_ptr<Connection> conn = std::make_unique<Connection>();
+    conn->recvState = Connection::RecvState::PARSING_HEADER;
     conn->handle = ep;
     conn->listener = listener_ctx;
 
@@ -221,13 +221,13 @@ void BackendServer::HandleNewConnection(application::TCPContext* listener_ctx, i
   }
 }
 
-void BackendServer::HandleReadable(ConnectionState* conn) {
+void BackendServer::HandleReadable(Connection* conn) {
   application::TCPEndpoint ep(conn->handle);
   constexpr size_t kHeaderSize = sizeof(TcpMessageHeader);
   bool needRearm = false;
   while (true) {
     // Phase 1: read header incrementally
-    if (conn->recvState == ConnectionState::RecvState::PARSING_HEADER) {
+    if (conn->recvState == Connection::RecvState::PARSING_HEADER) {
       int r =
           ep.RecvSomeExact(reinterpret_cast<char*>(&conn->pendingHeader) + conn->headerBytesRead,
                            kHeaderSize - conn->headerBytesRead);
@@ -260,7 +260,7 @@ void BackendServer::HandleReadable(ConnectionState* conn) {
             }
           }
         }
-        conn->recvState = ConnectionState::RecvState::PARSING_PAYLOAD;
+        conn->recvState = Connection::RecvState::PARSING_PAYLOAD;
         // Fall through to payload loop same iteration
       } else if (r == 0) {
         // Peer closed during header
@@ -278,7 +278,7 @@ void BackendServer::HandleReadable(ConnectionState* conn) {
     }
 
     // Phase 2: payload (if any)
-    if (conn->recvState == ConnectionState::RecvState::PARSING_PAYLOAD) {
+    if (conn->recvState == Connection::RecvState::PARSING_PAYLOAD) {
       auto& header = conn->pendingHeader;
       OpType opt = static_cast<OpType>(header.opcode);
       size_t need = conn->expectedPayloadSize - conn->payloadBytesRead;
@@ -475,7 +475,7 @@ void BackendServer::HandleReadable(ConnectionState* conn) {
       conn->headerBytesRead = 0;
       conn->payloadBytesRead = 0;
       conn->expectedPayloadSize = 0;
-      conn->recvState = ConnectionState::RecvState::PARSING_HEADER;
+      conn->recvState = Connection::RecvState::PARSING_HEADER;
       // Continue loop to drain further messages in same epoll tick
       continue;
     }
@@ -485,7 +485,7 @@ void BackendServer::HandleReadable(ConnectionState* conn) {
   }
 }
 
-void BackendServer::HandleWritable(ConnectionState* conn) {
+void BackendServer::HandleWritable(Connection* conn) {
   application::TCPEndpoint ep(conn->handle);
   bool needRearm = false;
 
@@ -644,7 +644,7 @@ void BackendServer::SetSocketOptions(int fd) {
   setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &qack, sizeof(qack));
 }
 
-void BackendServer::RearmSocket(int epoll_fd, ConnectionState* conn, uint32_t events) {
+void BackendServer::RearmSocket(int epoll_fd, Connection* conn, uint32_t events) {
   if (conn->handle.fd < 0) return;
   struct epoll_event event;
   event.data.ptr = conn;
@@ -662,7 +662,7 @@ void BackendServer::EnsureConnections(const EngineDesc& rdesc, size_t minCount) 
   size_t existing = connPools[rdesc.key]->ConnectionCount();
   if (existing >= minCount) return;
   size_t toCreate = minCount - existing;
-  std::vector<ConnectionState*> pending;
+  std::vector<Connection*> pending;
   pending.reserve(toCreate);
   for (size_t i = 0; i < toCreate; ++i) {
     int sock = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -685,8 +685,8 @@ void BackendServer::EnsureConnections(const EngineDesc& rdesc, size_t minCount) 
     application::TCPEndpointHandle handle{sock, peer};
     SetSocketOptions(handle.fd);
     SetNonBlocking(handle.fd);
-    ConnectionState* connPtr = new ConnectionState();
-    connPtr->recvState = ConnectionState::RecvState::PARSING_HEADER;
+    Connection* connPtr = new Connection();
+    connPtr->recvState = Connection::RecvState::PARSING_HEADER;
     connPtr->handle = handle;
     connPtr->listener = nullptr;
     connPtr->ready.store(true, std::memory_order_release);
@@ -775,21 +775,13 @@ void BackendServer::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& l
     rdesc = it->second;
   }
 
-  // Snapshot connections (both ready & pending). We'll attempt to push ops into their queues;
-  // even pending ones will pick them up after promotion.
   auto poolIt = connPools.find(rdesc.key);
   if (poolIt == connPools.end()) {
-    status->SetCode(StatusCode::ERR_BAD_STATE);
-    status->SetMessage("no connection pool for remote engine");
-    return;
-  }
-  ConnectionPool* pool = poolIt->second.get();
-  std::deque<ConnectionState*> conns = pool->GetAllConnections();
-  if (conns.empty()) {
-    // Try to create at least one connection lazily
     EnsureConnections(rdesc, config.numWorkerThreads);
-    conns = pool->GetAllConnections();
   }
+  ConnectionPool* pool = connPools[rdesc.key].get();
+  std::deque<Connection*> conns = pool->GetAllConnections();
+
   if (conns.empty()) {
     status->SetCode(StatusCode::ERR_BAD_STATE);
     status->SetMessage("no tcp connections available");
@@ -828,7 +820,7 @@ void BackendServer::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& l
                   NextUniqueTransferId(),
                   isRead ? READ_REQ : WRITE_REQ};
     op.batchCtx = batchCtx;
-    ConnectionState* c = conns[connIdx % conns.size()];
+    Connection* c = conns[connIdx % conns.size()];
     connIdx++;
     c->SubmitTransfer(std::move(op));
   }

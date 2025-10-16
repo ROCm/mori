@@ -87,12 +87,12 @@ struct TransferOp {
   struct TcpBatchContext* batchCtx{nullptr};
 };
 
-class ConnectionState {
+class Connection {
  public:
   using EndpointHandle = application::TCPEndpointHandle;
 
-  ConnectionState() = default;
-  ~ConnectionState() { Close(); }
+  Connection() = default;
+  ~Connection() { Close(); }
 
   EndpointHandle handle{-1, {}};
   application::TCPContext* listener{nullptr};
@@ -169,16 +169,16 @@ class ConnectionPool {
   ~ConnectionPool() { Shutdown(); }
 
   // Non-blocking acquire (returns nullptr if none available)
-  ConnectionState* GetNextConnection() {
+  Connection* GetNextConnection() {
     std::lock_guard<std::mutex> lk(mu);
     if (ready.empty()) return nullptr;
-    ConnectionState* conn = ready.front();
+    Connection* conn = ready.front();
     ready.pop_front();
     return conn;
   }
 
   // Blocking acquire with optional timeout (default: wait indefinitely)
-  ConnectionState* AcquireConnection(
+  Connection* AcquireConnection(
       std::chrono::milliseconds timeout = std::chrono::milliseconds::max()) {
     std::unique_lock<std::mutex> lk(mu);
     auto pred = [this] { return shuttingDown || !ready.empty(); };
@@ -187,18 +187,18 @@ class ConnectionPool {
     else
       cv.wait_for(lk, timeout, pred);
     if (shuttingDown || ready.empty()) return nullptr;
-    ConnectionState* conn = ready.front();
+    Connection* conn = ready.front();
     ready.pop_front();
     return conn;
   }
 
-  std::deque<ConnectionState*> GetAllConnections() {
+  std::deque<Connection*> GetAllConnections() {
     std::lock_guard<std::mutex> lk(mu);
     return allConns;
   }
 
   // Return a leased connection
-  void ReleaseConnection(ConnectionState* conn) {
+  void ReleaseConnection(Connection* conn) {
     if (!conn) return;
     std::lock_guard<std::mutex> lk(mu);
     if (shuttingDown) {
@@ -209,7 +209,7 @@ class ConnectionPool {
     cv.notify_one();
   }
 
-  void SetConnections(const std::vector<ConnectionState*>& conns) {
+  void SetConnections(const std::vector<Connection*>& conns) {
     std::lock_guard<std::mutex> lk(mu);
     for (auto* c : conns) {
       allConns.push_back(c);
@@ -223,7 +223,7 @@ class ConnectionPool {
     return allConns.size();
   }
 
-  void RemoveConnection(ConnectionState* conn) {
+  void RemoveConnection(Connection* conn) {
     if (!conn) return;
     std::lock_guard<std::mutex> lk(mu);
     auto eraseOne = [&](auto& dq) {
@@ -258,8 +258,8 @@ class ConnectionPool {
  private:
   std::mutex mu;
   std::condition_variable cv;
-  std::deque<ConnectionState*> allConns;
-  std::deque<ConnectionState*> ready;  // fully usable connections
+  std::deque<Connection*> allConns;
+  std::deque<Connection*> ready;  // fully usable connections
   bool shuttingDown{false};
 };
 
