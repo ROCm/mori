@@ -30,8 +30,8 @@ using namespace mori::core;
 using namespace mori::shmem;
 using namespace mori::application;
 
-__global__ void ConcurrentPutSignalThreadKernel(int myPe, const SymmMemObjPtr dataObj,
-                                                const SymmMemObjPtr signalObj) {
+__global__ void ConcurrentPutSignalThreadKernelAdd(int myPe, const SymmMemObjPtr dataObj,
+                                                   const SymmMemObjPtr signalObj) {
   constexpr int sendPe = 0;
   constexpr int recvPe = 1;
 
@@ -41,7 +41,7 @@ __global__ void ConcurrentPutSignalThreadKernel(int myPe, const SymmMemObjPtr da
   if (myPe == sendPe) {
     RdmaMemoryRegion source = dataObj->GetRdmaMemoryRegion(myPe);
 
-    // Test onlyOneSignal=true: only leader thread signals
+    // Test onlyOneSignal=true with AMO_ADD: only leader thread signals
     ShmemPutMemNbiSignalThread<true>(dataObj, threadOffset, source, threadOffset,
                                      sizeof(uint32_t), signalObj, 0, 1, atomicType::AMO_ADD,
                                      recvPe, 0);
@@ -56,7 +56,46 @@ __global__ void ConcurrentPutSignalThreadKernel(int myPe, const SymmMemObjPtr da
       while (atomicAdd(signalPtr, 0) != expectedSignals) {
         // Busy wait for all signals
       }
-      printf("PE %d block %d: Received all %lu signals!\n", myPe, blockIdx.x, expectedSignals);
+      printf("PE %d: AMO_ADD test - Received all %lu signals!\n", myPe, expectedSignals);
+    }
+    __syncthreads();
+
+    // Verify data
+    uint32_t receivedData = atomicAdd(reinterpret_cast<uint32_t*>(dataObj->localPtr) + globalTid, 0);
+    if (receivedData != sendPe) {
+      printf("PE %d, thread %d: Data mismatch! Expected %d, got %d\n", myPe, globalTid, sendPe,
+             receivedData);
+    }
+  }
+}
+
+__global__ void ConcurrentPutSignalThreadKernelSet(int myPe, const SymmMemObjPtr dataObj,
+                                                   const SymmMemObjPtr signalObj) {
+  constexpr int sendPe = 0;
+  constexpr int recvPe = 1;
+  constexpr uint64_t MAGIC_VALUE = 0xDEADBEEF;
+
+  int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
+  int threadOffset = globalTid * sizeof(uint32_t);
+
+  if (myPe == sendPe) {
+    RdmaMemoryRegion source = dataObj->GetRdmaMemoryRegion(myPe);
+
+    // Test onlyOneSignal=true with AMO_SET: only leader thread signals
+    ShmemPutMemNbiSignalThread<true>(dataObj, threadOffset, source, threadOffset,
+                                     sizeof(uint32_t), signalObj, 0, MAGIC_VALUE,
+                                     atomicType::AMO_SET, recvPe, 0);
+    __threadfence_system();
+
+    ShmemQuietThread();
+  } else {
+    // Receiver: wait for signal to be set to magic value
+    if (threadIdx.x == 0) {
+      uint64_t* signalPtr = reinterpret_cast<uint64_t*>(signalObj->localPtr);
+      while (atomicAdd(signalPtr, 0) != MAGIC_VALUE) {
+        // Busy wait for signal
+      }
+      printf("PE %d: AMO_SET test - Received magic signal value 0x%lx!\n", myPe, MAGIC_VALUE);
     }
     __syncthreads();
 
@@ -105,14 +144,39 @@ void ConcurrentPutSignalThread() {
 
   MPI_Barrier(MPI_COMM_WORLD);
 
-  // Run put with signal
-  ConcurrentPutSignalThreadKernel<<<blockNum, threadNum>>>(myPe, dataBuffObj, signalBuffObj);
-  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-  
-  MPI_Barrier(MPI_COMM_WORLD);
-  
+  // Test 1: AMO_ADD signal operation
   if (myPe == 0) {
-    printf("PutMemNbi with Signal test completed successfully!\n");
+    printf("\n=== Test 1: PutMemNbi with Signal (AMO_ADD) ===\n");
+  }
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  ConcurrentPutSignalThreadKernelAdd<<<blockNum, threadNum>>>(myPe, dataBuffObj, signalBuffObj);
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  if (myPe == 0) {
+    printf("Test 1 completed successfully!\n");
+  }
+
+  // Reset buffers for next test
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(dataBuff), myPe, numEle));
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(signalBuff), 0, 2));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  // Test 2: AMO_SET signal operation
+  if (myPe == 0) {
+    printf("\n=== Test 2: PutMemNbi with Signal (AMO_SET) ===\n");
+  }
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  ConcurrentPutSignalThreadKernelSet<<<blockNum, threadNum>>>(myPe, dataBuffObj, signalBuffObj);
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  if (myPe == 0) {
+    printf("Test 2 completed successfully!\n");
+    printf("\n=== All PutMemNbi with Signal tests passed! ===\n");
   }
 
   // Finalize
