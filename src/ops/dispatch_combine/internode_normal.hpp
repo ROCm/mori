@@ -1,13 +1,14 @@
 #pragma once
 
-#include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 #include "common_kernel.hpp"
+#include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 
 namespace mori {
 namespace moe {
 
 #define SIGNAL_PUT_FINISHED 1
 #define DEBUG 0
+#define COMBINE_KERNEL 1
 
 inline __device__ void LocalBarrier(uint32_t* barrier, int syncNum, int id) {
   if (id == 0) {
@@ -17,6 +18,55 @@ inline __device__ void LocalBarrier(uint32_t* barrier, int syncNum, int id) {
     }
     shmem::ShmemUint32WaitUntilEquals(barrier, 0);
   }
+}
+
+template <typename T>
+__global__ void EpPreDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
+#if COMBINE_KERNEL == 0
+  const EpDispatchCombineConfig& config = args.config;
+  const int thdId = threadIdx.x;
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const int warpId = thdId / warpSize;
+  const int warpNum = blockDim.x / warpSize;
+  const int globalWarpId = blockIdx.x * warpNum + warpId;
+
+  if (globalWarpId == 0 && laneId == 0) {
+    // write number of token to send
+    for (int peerPe = 0; peerPe < npes; ++peerPe) {
+      if (peerPe / MAX_GPUS_PER_NODE == myNode) {
+        index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(peerPe) + myPe;
+        shmem::ShmemInt32WaitUntilEquals(signal, 0);
+        core::AtomicStoreRelaxedSystem(signal, args.destPeTokenCounter[peerPe] + 1);
+      } else {
+        shmem::ShmemPutInt32ImmNbiThread(args.recvTokenNumMemObj, myPe * sizeof(index_t),
+                                         args.destPeTokenCounter[peerPe] + 1, peerPe);
+      }
+    }
+    // obtain number of token to recv
+    index_t recvTokenNum = 0, prevRecvTokenNum = 0;
+    index_t sum = 0;
+    for (int pe = 0; pe < npes; ++pe) {
+      index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>() + pe;
+      recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
+      args.dispReceiverIdxMap[pe] = recvTokenNum;
+      sum += prevRecvTokenNum;
+      prevRecvTokenNum = recvTokenNum;
+      args.recvTokenOffset[pe] = sum;
+
+      // send prefix back
+      if (pe / MAX_GPUS_PER_NODE == myNode) {
+        index_t* peerPrefixPtr = args.shmemMetaDataMemObj->template GetAs<index_t*>(pe) + myPe;
+        shmem::ShmemInt32WaitUntilEquals(peerPrefixPtr, 0);
+        core::AtomicStoreRelaxedSystem(peerPrefixPtr, sum + 1);
+      } else {
+        shmem::ShmemPutInt32ImmNbiThread(args.shmemMetaDataMemObj, myPe * sizeof(index_t), sum + 1,
+                                         pe);
+      }
+    }
+    *args.localPeTokenCounter = npes;
+    *args.totalRecvTokenNum = sum;
+  }
+#endif
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -110,6 +160,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
   const int endIdx = startIdx + myChunkSize;
 
   if (destNode == myNode) {
+#if COMBINE_KERNEL==1
     // calculate prefix to determine output offset
     if (destPe == myPe && localBlockId == 0 && warpId == 0) {
       // // write number of token to send
@@ -162,6 +213,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         *args.totalRecvTokenNum = sum;     // TODO
       }
     }
+#endif
 
     index_t outputBaseIdx;
     if (laneId == 0) {

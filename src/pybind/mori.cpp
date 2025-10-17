@@ -55,6 +55,9 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
     scalePtr = reinterpret_cast<uint8_t*>(scales->data_ptr());
   }
 
+  if (config.kernelType == KernelType::InterNodeNormal) {
+  }
+
   handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
                           nullptr, weights.data_ptr<float>(), scalePtr,
                           topkIds.data_ptr<mori::moe::index_t>(), input.size(0));
@@ -109,7 +112,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
   }
 
   handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
-                          nullptr, weightsPtr, topkIds.data_ptr<mori::moe::index_t>(),
+                          nullptr, weightsPtr, nullptr, topkIds.data_ptr<mori::moe::index_t>(),
                           handle.curRankNumToken);
   handle.LaunchCombine((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
                        at::cuda::getCurrentHIPStream());

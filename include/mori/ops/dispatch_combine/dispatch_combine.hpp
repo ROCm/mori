@@ -109,15 +109,15 @@ class EpDispatchCombineHandle {
   EpDispatchCombineHandle(EpDispatchCombineConfig config);
   ~EpDispatchCombineHandle();
 
-  void PrepareInference(hipDataType inputType, void* input, void* output, float* weights,
-                        index_t* tokenIndices, index_t numToken) {
+  void PrepareTraining(hipDataType inputType, void* input, void* output, float* weights,
+                       uint8_t* scales, index_t* tokenIndices, index_t numToken) {
     this->inputType = inputType;
     this->inpTokenBuf = input;
     this->outTokenBuf = output;
     this->weightsBuf = weights;
+    this->scalesBuf = scales;
     this->tokenIndices = tokenIndices;
     this->curRankNumToken = numToken;
-    // printf("handle inputType %s\n", HipDataTypeToString(inputType));
   }
 
   void PrepareInference(hipDataType inputType, void* input, void* output, float* weights,

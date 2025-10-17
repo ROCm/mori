@@ -84,12 +84,13 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   shmemInpTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
   shmemOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
   shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
-  const size_t prefixSize = config.worldSize * sizeof(index_t);
-  shmemMetaDataMemObj =
-      ShmemMallocAndReturnMemObjPtr(prefixSize, hipDeviceMallocUncached);
-  const size_t syncSize = config.worldSize * sizeof(index_t);
-  shmemSyncDataMemObj =
-      ShmemMallocAndReturnMemObjPtr(syncSize, hipDeviceMallocUncached);
+
+  if (config.kernelType == KernelType::InterNodeNormal) {
+    const size_t prefixSize = config.worldSize * sizeof(index_t);
+    shmemMetaDataMemObj = ShmemMallocAndReturnMemObjPtr(prefixSize, hipDeviceMallocUncached);
+    const size_t syncSize = config.worldSize * sizeof(index_t);
+    shmemSyncDataMemObj = ShmemMallocAndReturnMemObjPtr(syncSize, hipDeviceMallocUncached);
+  }
 
   size_t maxWeightSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(float);
   shmemInpWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
@@ -138,19 +139,22 @@ void EpDispatchCombineHandle::FinalizeTokenNumSignalBuf() {
 
 void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   size_t maxNumOutToken = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerRank;
-  // HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&dispReceiverIdxMap),
-  //                                    maxNumOutToken * sizeof(index_t)));
-  // HIP_RUNTIME_CHECK(hipMemset(dispReceiverIdxMap, 0, maxNumOutToken * sizeof(index_t)));
-  HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&dispReceiverIdxMap),
-                                        config.worldSize * sizeof(index_t)));
-  HIP_RUNTIME_CHECK(hipMemset(dispReceiverIdxMap, 0, config.worldSize * sizeof(index_t)));
+  if (config.kernelType == KernelType::InterNodeNormal) {
+    HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&dispReceiverIdxMap),
+                                          config.worldSize * sizeof(index_t)));
+    HIP_RUNTIME_CHECK(hipMemset(dispReceiverIdxMap, 0, config.worldSize * sizeof(index_t)));
+  } else {
+    HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&dispReceiverIdxMap),
+                                          maxNumOutToken * sizeof(index_t)));
+    HIP_RUNTIME_CHECK(hipMemset(dispReceiverIdxMap, 0, maxNumOutToken * sizeof(index_t)));
+  }
 
   HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&dispSenderIdxMap),
-                                     maxNumOutToken * sizeof(index_t)));
+                                        maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispSenderIdxMap, 0, maxNumOutToken * sizeof(index_t)));
 
   HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&destPeTokenIdxMap),
-                                     maxNumOutToken * sizeof(index_t)));
+                                        maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(destPeTokenIdxMap, -1, maxNumOutToken * sizeof(index_t)));
 
   if (config.kernelType == KernelType::InterNodeNormal) {
@@ -164,19 +168,19 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   }
 
   HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&destPeTokenCounter),
-                                     config.worldSize * sizeof(index_t)));
+                                        config.worldSize * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(destPeTokenCounter, 0, config.worldSize * sizeof(index_t)));
 
-  HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&localPeTokenCounter),
-                                     config.numExpertPerRank * sizeof(index_t)));
-  HIP_RUNTIME_CHECK(hipMemset(localPeTokenCounter, 0, config.numExpertPerRank * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(
+      HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&localPeTokenCounter), sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMemset(localPeTokenCounter, 0, sizeof(index_t)));
 
   dispTokOffsetMemObj = ShmemMallocAndReturnMemObjPtr(sizeof(index_t), hipDeviceMallocUncached);
   dispTokIdToSrcTokIdMemObj =
       ShmemMallocAndReturnMemObjPtr(maxNumOutToken * sizeof(index_t), hipDeviceMallocUncached);
 
   HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&dispDestTokIdMap),
-                                     maxNumOutToken * sizeof(index_t)));
+                                        maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispDestTokIdMap, 0, maxNumOutToken * sizeof(index_t)));
 }
 
@@ -195,9 +199,11 @@ void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
 
 void EpDispatchCombineHandle::InitializeBarrier() {
   size_t barrierSize = (config.worldSize + 1) * sizeof(uint32_t);
-  HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&dispatchGridBarrier), barrierSize));
+  HIP_RUNTIME_CHECK(
+      HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&dispatchGridBarrier), barrierSize));
   HIP_RUNTIME_CHECK(hipMemset(dispatchGridBarrier, 0, barrierSize));
-  HIP_RUNTIME_CHECK(HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&combineGridBarrier), barrierSize));
+  HIP_RUNTIME_CHECK(
+      HIP_MALLOC_WITH_LOG(reinterpret_cast<void**>(&combineGridBarrier), barrierSize));
   HIP_RUNTIME_CHECK(hipMemset(combineGridBarrier, 0, barrierSize));
   crossDeviceBarrierMemObj = ShmemMallocAndReturnMemObjPtr(barrierSize, hipDeviceMallocUncached);
 }
@@ -248,6 +254,7 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
           assert(config.useExternalInpBuffer);
           EpDispatchInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeNormal) {
+          // EpPreDispatchInterNodeNormalKernel<DataT><<<1, warpSize, 0, stream>>>(args);
           EpDispatchInterNodeNormalKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
