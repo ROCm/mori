@@ -318,7 +318,7 @@ class EpDispatchCombineTestCase:
             dispatch_weights,
             all_rank_indices[self.rank],
             block_num=self.config.block_num,
-            warp_per_block=8,
+            warp_per_block=16,
         )
         torch.cuda.synchronize()
 
@@ -360,6 +360,9 @@ class EpDispatchCombineTestCase:
                 assert False
                 error_round.add(round)
 
+        if len(error_round) > 0:
+            assert False
+
         #     if dispatch_weights is not None:
         # got_weight, expected_weight = (
         #     combine_output_weight[i],
@@ -390,8 +393,8 @@ class EpDispatchCombineTestCase:
             print("Combine Pass")
 
     def test_dispatch_combine(self):
-        op = mori.ops.EpDispatchCombineOp(self.config)
         error_round = set()
+        op = mori.ops.EpDispatchCombineOp(self.config)
         for i in range(5000):
             if self.rank == 0:
                 print(f"Round {i} begin")
