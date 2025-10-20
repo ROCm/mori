@@ -368,7 +368,7 @@ void BnxtQpContainer::ModifyRst2Init() {
 
 void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
                                      const ibv_port_attr& portAttr,
-                                     const ibv_device_attr_ex& deviceAttr, uint32_t qpId) {
+                                     const ibv_device_attr_ex& deviceAttr) {
   struct ibv_qp_attr attr;
   int attr_mask;
 
@@ -394,22 +394,10 @@ void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
 
   int status = bnxt_re_dv_modify_qp(qp, &attr, attr_mask, 0, 0);
   assert(!status);
-
-  // Use qpId to select UDP sport value from the shared configuration (round-robin)
-  uint16_t selected_udp_sport = GetDeviceContext()->GetUdpSport(qpId);
-  MORI_APP_TRACE("QP {} using UDP sport {} (qpId={}, index={})", qpn, selected_udp_sport, qpId,
-                 qpId % RDMA_UDP_SPORT_ARRAY_SIZE);
-  status = bnxt_re_dv_modify_qp_udp_sport(qp, selected_udp_sport);
-  if (status) {
-    MORI_APP_ERROR("Failed to set UDP sport {} for QP {}: error code {}", selected_udp_sport, qpn,
-                   status);
-  }
-  assert(!status);
-  MORI_APP_TRACE("bnxt_re_dv_modify_qp_udp_sport is done, return {}", status);
 }
 
 void BnxtQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
-                                    const RdmaEndpointHandle& remote_handle) {
+                                    const RdmaEndpointHandle& remote_handle, uint32_t qpId) {
   struct ibv_qp_attr attr;
   int attr_mask;
 
@@ -426,6 +414,17 @@ void BnxtQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
 
   int status = bnxt_re_dv_modify_qp(qp, &attr, attr_mask, 0, 0);
   assert(!status);
+    // Use qpId to select UDP sport value from the shared configuration (round-robin)
+  uint16_t selected_udp_sport = GetDeviceContext()->GetUdpSport(qpId);
+  MORI_APP_TRACE("QP {} using UDP sport {} (qpId={}, index={})", qpn, selected_udp_sport, qpId,
+                 qpId % RDMA_UDP_SPORT_ARRAY_SIZE);
+  status = bnxt_re_dv_modify_qp_udp_sport(qp, selected_udp_sport);
+  if (status) {
+    MORI_APP_ERROR("Failed to set UDP sport {} for QP {}: error code {}", selected_udp_sport, qpn,
+                   status);
+  }
+  assert(!status);
+  MORI_APP_TRACE("bnxt_re_dv_modify_qp_udp_sport is done, return {}", status);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -530,8 +529,8 @@ void BnxtDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   const ibv_device_attr_ex& deviceAttr = *(rdmaDevice->GetDeviceAttr());
   const ibv_port_attr& portAttr = *(rdmaDevice->GetPortAttrMap()->find(local.portId)->second);
   qp->ModifyRst2Init();
-  qp->ModifyInit2Rtr(remote, portAttr, deviceAttr, qpId);
-  qp->ModifyRtr2Rts(local, remote);
+  qp->ModifyInit2Rtr(remote, portAttr, deviceAttr);
+  qp->ModifyRtr2Rts(local, remote, qpId);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
