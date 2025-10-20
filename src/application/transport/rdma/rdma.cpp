@@ -298,7 +298,7 @@ void RdmaContext::Initialize() {
 void RdmaDeviceContext::InitializeUdpSportConfiguration() {
   // Default UDP sport configuration
   static constexpr uint16_t DEFAULT_UDP_SPORTS[RDMA_UDP_SPORT_ARRAY_SIZE] = {
-    0xBE10, 0xBE11, 0xBE12, 0xBE13
+    49153, 49154, 49155, 49156
   };
 
   // Initialize with defaults
@@ -346,7 +346,7 @@ void RdmaDeviceContext::InitializeUdpSportConfiguration() {
 
   // Log final configuration
   for (uint32_t i = 0; i < RDMA_UDP_SPORT_ARRAY_SIZE; i++) {
-    MORI_APP_INFO("UDP sport[{}] = 0x{:x}", i, udp_sport_setting[i]);
+    MORI_APP_INFO("UDP sport[{}] = {}", i, udp_sport_setting[i]);
   }
 }
 
