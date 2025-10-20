@@ -389,23 +389,23 @@ void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
   attr.max_dest_rd_atomic = deviceAttr.orig_attr.max_qp_rd_atom;
   attr.min_rnr_timer = 12;
 
+  attr_mask = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_RQ_PSN | IBV_QP_DEST_QPN | IBV_QP_AV |
+              IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+
+  int status = bnxt_re_dv_modify_qp(qp, &attr, attr_mask, 0, 0);
+  assert(!status);
+
   // Use qpId to select UDP sport value from the shared configuration (round-robin)
   uint16_t selected_udp_sport = GetDeviceContext()->GetUdpSport(qpId);
   MORI_APP_TRACE("QP {} using UDP sport {} (qpId={}, index={})", qpn, selected_udp_sport, qpId,
                  qpId % RDMA_UDP_SPORT_ARRAY_SIZE);
-  int status = bnxt_re_dv_modify_qp_udp_sport(qp, selected_udp_sport);
+  status = bnxt_re_dv_modify_qp_udp_sport(qp, selected_udp_sport);
   if (status) {
     MORI_APP_ERROR("Failed to set UDP sport {} for QP {}: error code {}", selected_udp_sport, qpn,
                    status);
   }
   assert(!status);
   MORI_APP_TRACE("bnxt_re_dv_modify_qp_udp_sport is done, return {}", status);
-
-  attr_mask = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_RQ_PSN | IBV_QP_DEST_QPN | IBV_QP_AV |
-              IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
-
-  status = bnxt_re_dv_modify_qp(qp, &attr, attr_mask, 0, 0);
-  assert(!status);
 }
 
 void BnxtQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
