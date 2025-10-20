@@ -111,6 +111,7 @@ struct RdmaEndpointHandle {
   uint32_t psn{0};
   uint32_t qpn{0};
   uint32_t portId{0};
+  uint32_t maxSge{1};
   InfiniBandEndpointHandle ib;
   EthernetEndpointHandle eth;
 

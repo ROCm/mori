@@ -102,6 +102,7 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
 
   const ibv_device_attr_ex* devAttr = GetRdmaDevice()->GetDeviceAttr();
   ibv_qp* qp = qpPool.find(local.qpn)->second;
+  remote.maxSge = deviceAttr.tm_caps.max_sge;
 
   // INIT
   memset(&attr, 0, sizeof(attr));
