@@ -82,17 +82,13 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   assert(config.blockNum % 2 == 0);
   const int channelNum = config.blockNum / 2;
   const int nNodes = config.worldSize / config.numGPUsPerNode;
-  // TODO maxNumInpTokenPerRank could be smaller
-  const size_t maxNumInpTokenPerRank =
-      ((config.maxNumInpTokenPerRank + channelNum - 1) / channelNum) * channelNum;
-  const size_t maxNumInpTokenPerChannel = maxNumInpTokenPerRank / channelNum;
+  const size_t maxChannelStagingTokens = config.maxChannelStagingTokens;
   const int stepRDMATokens = config.maxRDMAStepTokens;
+  assert(maxChannelStagingTokens % stepRDMATokens == 0);
 
-  const size_t stagingTokens =
-      (((maxNumInpTokenPerChannel + stepRDMATokens - 1) / stepRDMATokens) * stepRDMATokens) *
-      nNodes * channelNum;
-  printf("rank %d stagingTokens %zu max(%zu, %d)\n", config.rank, stagingTokens,
-         maxNumInpTokenPerRank * nNodes, stepRDMATokens * nNodes * channelNum);
+  const size_t stagingTokens = maxChannelStagingTokens * nNodes * channelNum;
+  printf("rank %d stagingTokens %zu maxChannelStagingTokens %zu\n", config.rank, stagingTokens,
+         maxChannelStagingTokens);
   size_t maxStagingTokSize = (config.kernelType == KernelType::InterNodeNormal
                                   ? stagingTokens
                                   : static_cast<ssize_t>(config.MaxNumTokensToRecv())) *
@@ -160,11 +156,11 @@ void EpDispatchCombineHandle::FinalizeTokenNumSignalBuf() {
 void EpDispatchCombineHandle::InitializeNormalKernelBuf() {
   const int channelNum = config.blockNum / 2;
   const int nNodes = config.worldSize / config.numGPUsPerNode;
-  const int maxNumInpTokenPerRank =
+  const int maxNumInpTokenPerRankAligned =
       ((config.maxNumInpTokenPerRank + channelNum - 1) / channelNum) * channelNum;
   const size_t localPeBufSize =
       config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerRank * sizeof(index_t) +
-      maxNumInpTokenPerRank * nNodes * sizeof(index_t) + channelNum * nNodes * sizeof(index_t);
+      maxNumInpTokenPerRankAligned * nNodes * sizeof(index_t);
   HIP_RUNTIME_CHECK(hipMalloc(&localPeBuf, localPeBufSize));
   HIP_RUNTIME_CHECK(hipMemset(localPeBuf, 0, localPeBufSize));
 
@@ -192,6 +188,20 @@ void EpDispatchCombineHandle::InitializeNormalKernelBuf() {
 
   intraNodeBarrierMemObj = ShmemMallocAndReturnMemObjPtr(
       channelNum * config.worldSize * sizeof(int), hipDeviceMallocUncached);
+
+  // For combine
+  HIP_RUNTIME_CHECK(
+      hipMalloc(&p2pRecvTokenNum, (channelNum * config.numGPUsPerNode + 1) * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(
+      hipMemset(p2pRecvTokenNum, 0, (channelNum * config.numGPUsPerNode + 1) * sizeof(index_t)));
+
+  HIP_RUNTIME_CHECK(hipMalloc(&rdmaRecvTokensNum, (channelNum * nNodes) * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMemset(rdmaRecvTokensNum, 0, (channelNum * nNodes) * sizeof(index_t)));
+
+  HIP_RUNTIME_CHECK(
+      hipMalloc(&fwdTokenMap, maxNumInpTokenPerRankAligned * config.worldSize * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(
+      hipMemset(fwdTokenMap, 0, maxNumInpTokenPerRankAligned * config.worldSize * sizeof(index_t)));
 }
 
 void EpDispatchCombineHandle::FinalizeNormalKernelBuf() {
@@ -205,6 +215,9 @@ void EpDispatchCombineHandle::FinalizeNormalKernelBuf() {
   HIP_RUNTIME_CHECK(hipFree(localHead));
   HIP_RUNTIME_CHECK(hipFree(localTail));
   ShmemFree(intraNodeBarrierMemObj->localPtr);
+  HIP_RUNTIME_CHECK(hipFree(p2pRecvTokenNum));
+  HIP_RUNTIME_CHECK(hipFree(rdmaRecvTokensNum));
+  HIP_RUNTIME_CHECK(hipFree(fwdTokenMap));
 }
 
 void EpDispatchCombineHandle::InitializeOrderMapBuf() {

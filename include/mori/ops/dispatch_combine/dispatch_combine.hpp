@@ -87,7 +87,8 @@ struct EpDispatchCombineConfig {
   int warpNumPerBlock{1};
   int blockNum{1};
   int maxRDMAStepTokens{64};
-  int maxP2PStepTokens{32};
+  int maxP2PStepTokens{8};
+  int maxChannelStagingTokens{128};
   int kernelType{KernelType::IntraNode};
   // If true, use external buffer which incurs extra copy overhead; otherwise, the kernel assumes
   // the provided buffer is shmemInpTokMemObj
@@ -241,6 +242,9 @@ class EpDispatchCombineHandle {
   void* localPeBuf{nullptr};
   uint64_t* localHead{nullptr};
   uint64_t* localTail{nullptr};
+  index_t* p2pRecvTokenNum{nullptr};
+  index_t* rdmaRecvTokensNum{nullptr};
+  index_t* fwdTokenMap{nullptr};
 };
 
 template <typename T>
@@ -290,6 +294,9 @@ struct EpDispatchCombineArgs {
   void* localPeBuf{nullptr};
   uint64_t* localHead{nullptr};
   uint64_t* localTail{nullptr};
+  index_t* p2pRecvTokenNum{nullptr};
+  index_t* rdmaRecvTokensNum{nullptr};
+  index_t* fwdTokenMap{nullptr};
 };
 
 using EpDispatchCombineArgsVariant =
@@ -342,6 +349,9 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.localPeBuf = handle.localPeBuf;
   args.localHead = handle.localHead;
   args.localTail = handle.localTail;
+  args.p2pRecvTokenNum = handle.p2pRecvTokenNum;
+  args.rdmaRecvTokensNum = handle.rdmaRecvTokensNum;
+  args.fwdTokenMap = handle.fwdTokenMap;
   return args;
 }
 
@@ -384,6 +394,7 @@ static std::ostream& operator<<(std::ostream& s, mori::moe::EpDispatchCombineCon
      << "  blockNum: " << config.blockNum << std::endl
      << "  maxRDMAStepTokens: " << config.maxRDMAStepTokens << std::endl
      << "  maxP2PStepTokens: " << config.maxP2PStepTokens << std::endl
+     << "  maxChannelStagingTokens: " << config.maxChannelStagingTokens << std::endl
      << "  kernelType: " << config.kernelType;
   s << ss.str();
   return s;

@@ -35,6 +35,8 @@ namespace moe {
 #define SEND_DATA 1
 #define COPY_DATA 1
 
+#define INTRA_NODE_WRITE 1
+
 #if ASSERT_ON == 1
 #define KERNEL_ASSERT(cond)                                                                  \
   do {                                                                                       \
@@ -101,41 +103,46 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
   const int channelId = blockId % nChannels;
 
   const size_t maxNumInpTokenPerRank = config.maxNumInpTokenPerRank;
-  index_t baseTokensPerChannel = maxNumInpTokenPerRank / nChannels;
-  index_t remTokens = maxNumInpTokenPerRank % nChannels;
+
+  // calculate channel size and offset
+  const index_t baseTokensPerChannel = tokenNum / nChannels;
+  const index_t remTokens = tokenNum % nChannels;
   const index_t channelStartOffset = channelId * baseTokensPerChannel + min(channelId, remTokens);
   const index_t tokensPerChannel = baseTokensPerChannel + (channelId < remTokens ? 1 : 0);
   const index_t channelEndOffset = min(channelStartOffset + tokensPerChannel, tokenNum);
 
-  // TODO maxRDMAStagingTokens 是RDMA从某一个node收发数据的最大值；maxP2PStagingTokens是转发数据上限
-  // TODO staging buffer每个channel不能小于maxNumRDMASendTokens？
-  const int stepRDMATokens = config.maxRDMAStepTokens;
-  const int stepP2pTokens = config.maxP2PStepTokens;
-  // if (blockId==0 && thdId == 0) {
-  //   printf("nlocalPes=%d stepRDMATokens=%d\n", nlocalPes, stepRDMATokens);
-  // }
-
-  // TODO modify maxTokensPerChannel 目前是channel所需的最大size，可以根据实际改小
   const size_t maxTokensPerChannel = baseTokensPerChannel + (remTokens ? 1 : 0);
   const size_t maxNumToken = maxTokensPerChannel * nChannels;
+  const size_t maxChannelRecvTokensPerRank = maxTokensPerChannel * nNodes;
 
-  const size_t maxRDMAStagingTokens =
-      ((maxTokensPerChannel + stepRDMATokens - 1) / stepRDMATokens) * stepRDMATokens;
-  const size_t maxRDMASteps = maxRDMAStagingTokens / stepRDMATokens;
+  // define staging buffer size
+  const int stepRDMATokens = config.maxRDMAStepTokens;
+  const int stepP2pTokens = config.maxP2PStepTokens;
+#if DEBUG == 1
+  if (blockId==0 && thdId == 0) {
+    printf("nlocalPes=%d stepRDMATokens=%d\n", nlocalPes, stepRDMATokens);
+  }
+#endif
+  const size_t maxChannelStagingTokens = config.maxChannelStagingTokens;
 
-  const size_t maxP2PStagingTokens = maxTokensPerChannel * nNodes;
+  const size_t maxRDMAStagingTokens = maxChannelStagingTokens;
+  const size_t maxRDMASteps = maxChannelStagingTokens / stepRDMATokens;
 
-  // TODO uodate localPeBuf size
+  const size_t maxP2PStagingTokens = maxChannelStagingTokens * nNodes;
+
   // For sender
   index_t* tokenIdxToSlotMap = reinterpret_cast<index_t*>(args.localPeBuf);
   index_t* slotToTokenIdxMap =
       reinterpret_cast<index_t*>(reinterpret_cast<char*>(tokenIdxToSlotMap) +
                                  maxNumInpTokenPerRank * nNodes * sizeof(index_t));
-  // For Reveiver
-  index_t* rdmaRecvTokensNum = reinterpret_cast<index_t*>(
-      reinterpret_cast<char*>(slotToTokenIdxMap) + nNodes * maxNumToken * sizeof(index_t));
+  // // For Reveiver
+  // index_t* rdmaRecvTokensNum = reinterpret_cast<index_t*>(
+  //     reinterpret_cast<char*>(slotToTokenIdxMap) + nNodes * maxNumToken * sizeof(index_t));
+
   slotToTokenIdxMap += channelId * nNodes * maxTokensPerChannel;
-  rdmaRecvTokensNum += channelId * nNodes;
+
+  // For Reveiver
+  index_t* rdmaRecvTokensNum = args.rdmaRecvTokensNum + channelId * nNodes;
 
   if (isSender) {
     constexpr int kSendWarpCount = 15;
@@ -269,8 +276,6 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             // Update rdma tail
             // TODO use amo (amo hang)
             if (destNode == myNode) {
-              // *(args.tailMemObj->template GetAs<uint64_t*>(destPe) + myPe + channelId * npes) =
-              //     tailCache;
               __hip_atomic_store(
                   args.tailMemObj->template GetAs<uint64_t*>(destPe) + myPe + channelId * npes,
                   tailCache, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -342,7 +347,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           // TODO check RDMA buffer ready (shmemInpTokMemObj)
           uint64_t tailCache = nodetailCache[node] + slot / stepRDMATokens;
           int spins = 0;
-          while (tailCache - headCache >= maxRDMASteps) {
+          do {
             if (laneId == node) {
               headCache = __hip_atomic_load(args.headMemObj->template GetAs<uint64_t*>() +
                                                 channelId * npes + (node * nlocalPes + myLocalPe),
@@ -359,7 +364,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
               // }
             }
             headCache = __shfl(headCache, node);
-          }
+          } while (tailCache - headCache >= maxRDMASteps);
 
           // TODO modify shmemStagingTokMemObj size
           sendStagingPtr[numNodesToSend++] =
@@ -371,10 +376,9 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         }
 
 #if COPY_DATA == 1
-        core::WarpBroadcast<T, 8>(
-            reinterpret_cast<T**>(sendStagingPtr),
-            reinterpret_cast<T*>(args.inpTokenBuf + tokenIdx * config.hiddenDim), numNodesToSend,
-            config.hiddenDim);
+        core::WarpBroadcast<T, 8>(reinterpret_cast<T**>(sendStagingPtr),
+                                  args.inpTokenBuf + tokenIdx * config.hiddenDim, numNodesToSend,
+                                  config.hiddenDim);
 
 #if DEBUG_DATA == 1
         for (int node = 0; node < numNodesToSend; ++node) {
@@ -504,6 +508,15 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
       index_t fwdCounter = 0;
       int srcNode = (myNode + 1) % nNodes;
       index_t syncNumTokensToRecv = 0;
+      // update map for combine
+      index_t srcNodeTokensCounter = 0;
+      index_t* recvTokenMap = args.srcPeTokenIdxMap +
+                              (channelId * nlocalPes + fwdLocalPe) * maxChannelRecvTokensPerRank;
+      index_t* fwdTokenMap =
+          laneId < nNodes
+              ? args.fwdTokenMap + (channelId * nNodes + laneId) * maxTokensPerChannel * nlocalPes +
+                    fwdLocalPe
+              : nullptr;
       while (__any(numTokensToRecv > 0)) {
         // check buffer ready (shmemOutTokMemObj)
         if (srcNode != myNode) {
@@ -542,6 +555,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             if (srcNode == laneId) {
               --numTokensToRecv;
               KERNEL_ASSERT(numTokensToRecv >= 0);
+              ++srcNodeTokensCounter;
             }
             --syncNumTokensToRecv;
             index_t slot = i;
@@ -589,6 +603,9 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
                 // get meta
                 args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[localTokenIdx] =
                     *(reinterpret_cast<index_t*>(srcPtr + metaOffset));
+                // update map for combine
+                // args.dispReceiverIdxMap[localTokenIdx] = srcNode;
+                recvTokenMap[fwdCounter] = localTokenIdx;
 #if DEBUG_DATA == 1
                 index_t meta = *(reinterpret_cast<index_t*>(srcPtr + metaOffset));
                 int srcPe = meta / maxNumInpTokenPerRank;
@@ -615,10 +632,17 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
 #endif
               }
             } else {
+#if INTRA_NODE_WRITE == 1
+              char* dstPtr = args.shmemOutTokMemObj->template GetAs<char*>(fwdPe) +
+                             ((channelId * nlocalPes + myLocalPe) * maxP2PStagingTokens +
+                              p2pTailCache % maxP2PStagingTokens) *
+                                 tokenPackBytes;
+#else
               char* dstPtr = args.shmemOutTokMemObj->template GetAs<char*>() +
                              ((channelId * nlocalPes + fwdLocalPe) * maxP2PStagingTokens +
                               p2pTailCache % maxP2PStagingTokens) *
                                  tokenPackBytes;
+#endif
               core::WarpCopy(dstPtr, srcPtr, tokenPackBytes);
 #if DEBUG_DATA == 1
               KERNEL_ASSERT((float)(*(T*)dstPtr) != float(0));
@@ -652,6 +676,9 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             }
 #endif
 
+            if (laneId == srcNode) {
+              fwdTokenMap[((srcNodeTokensCounter - 1)) * nlocalPes] = fwdCounter + 1;
+            }
             ++fwdCounter;
           }
 
@@ -667,13 +694,19 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
         int* statusPtr =
             args.intraNodeBarrierMemObj->template GetAs<int*>(fwdPe) + myPe + channelId * npes;
         shmem::ShmemInt32WaitUntilEquals(statusPtr, 0);
-        core::AtomicStoreRelaxedSystem(statusPtr, fwdCounter + 1);
+        if (laneId == 0) {
+          core::AtomicStoreRelaxedSystem(statusPtr, fwdCounter + 1);
+        }
 #if DEBUG == 1
         if (laneId == 0 && myPe == 0 && channelId == 0) {
           printf("recv fwd done rank=%d ch=%d warpId=%d fwdPe=%d fwdCounter=%d\n", myPe, channelId,
                  warpId, fwdPe, fwdCounter);
         }
 #endif
+      } else {
+        if (laneId == 0) {
+          args.p2pRecvTokenNum[channelId * nlocalPes + fwdLocalPe] = fwdCounter;
+        }
       }
     } else if (warpId == kfwdWarpCount) {
       __syncthreads();
@@ -733,8 +766,8 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
               args.localHead[(laneId * nlocalPes + myLocalPe) + channelId * npes]);
         }
 #endif
-        // clear rdmaRecvTokensNum
-        rdmaRecvTokensNum[laneId] = 0;
+        // // clear rdmaRecvTokensNum
+        // rdmaRecvTokensNum[laneId] = 0;
       }
 
     } else {  // copy from shmemOutTokMemObj to output
@@ -758,6 +791,11 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
       int done = 0;
       int* statusPtr =
           args.intraNodeBarrierMemObj->template GetAs<int*>() + srcPe + channelId * npes;
+
+      // update map for combine
+      index_t recvTokensCounter = 0;
+      index_t* recvTokenMap = args.srcPeTokenIdxMap +
+                              (channelId * nlocalPes + srcLocalPe) * maxChannelRecvTokensPerRank;
       while (true) {
         done = __shfl(done, 0);
         if (done) {
@@ -779,9 +817,15 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
 
         for (uint64_t i = p2pHeadCache; i < p2pTailCache; ++i) {
           index_t slot = i % maxP2PStagingTokens;
+#if INTRA_NODE_WRITE == 1
+          char* srcPtr =
+              args.shmemOutTokMemObj->template GetAs<char*>() +
+              ((channelId * nlocalPes + srcLocalPe) * maxP2PStagingTokens + slot) * tokenPackBytes;
+#else
           char* srcPtr =
               args.shmemOutTokMemObj->template GetAs<char*>(srcPe) +
               ((channelId * nlocalPes + myLocalPe) * maxP2PStagingTokens + slot) * tokenPackBytes;
+#endif
 
 #if DEBUG_DATA == 1
           if (laneId == 0) {
@@ -823,8 +867,8 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
           }
           if (laneId == 0) {
             // get meta
-            args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[localTokenIdx] =
-                *(reinterpret_cast<index_t*>(srcPtr + metaOffset));
+            index_t meta = *(reinterpret_cast<index_t*>(srcPtr + metaOffset));
+            args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[localTokenIdx] = meta;
 #if DEBUG_DATA == 1
             index_t meta = *(reinterpret_cast<index_t*>(srcPtr + metaOffset));
             int srcPe = meta / maxNumInpTokenPerRank;
@@ -833,18 +877,26 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
             KERNEL_ASSERT(float(*((T*)(srcPtr) + config.hiddenDim - 1)) ==
                           tokenCheckValue(srcPe, srcTokenId));
 #endif
+            // record source node for combine
+            // args.dispReceiverIdxMap[localTokenIdx] = (meta / maxNumInpTokenPerRank) / nNodes;
+            // record output slot index for combine
+            recvTokenMap[recvTokensCounter++] = localTokenIdx;
           }
 #endif
         }
+
         p2pHeadCache = p2pTailCache;
         // Update p2p head
         if (laneId == 0) {
-          // *(args.headMemObj->template GetAs<uint64_t*>(srcPe) + channelId * npes + myPe) =
-          //     p2pHeadCache;
           __hip_atomic_store(
               args.headMemObj->template GetAs<uint64_t*>(srcPe) + channelId * npes + myPe,
               p2pHeadCache, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
         }
+      }
+
+      // record recvTokensCounter for combine
+      if (laneId == 0){
+        args.p2pRecvTokenNum[channelId * nlocalPes + srcLocalPe] = recvTokensCounter;
       }
     }
 
@@ -868,6 +920,7 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
 #endif
         // clear localPeTokenCounter
         *args.localPeTokenCounter = 0;
+        // args.p2pRecvTokenNum[nChannels * nlocalPes] = maxChannelRecvTokensPerRank;
       }
     }
   }  // Receiver end
@@ -879,6 +932,314 @@ __global__ void EpDispatchInterNodeNormalKernel(EpDispatchCombineArgs<T> args) {
 template <typename T>
 __global__ void EpCombineIntraNodeNormalKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
+
+  const int thdId = threadIdx.x;
+  const int thdNum = blockDim.x;
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const int warpId = thdId / warpSize;
+  const int warpNum = blockDim.x / warpSize;
+  const int blockId = blockIdx.x;
+  const int blockNum = gridDim.x;
+
+  const int myPe = config.rank;
+  const int npes = config.worldSize;
+  const int nlocalPes = config.numGPUsPerNode;
+  const int myLocalPe = config.rank % nlocalPes;
+  const int myNode = myPe / nlocalPes;
+  const int nNodes = npes / nlocalPes;
+
+  const int numExpertPerToken = config.numExpertPerToken;
+  const size_t tokenBytes = config.hiddenDim * sizeof(T);
+  const size_t weightBytes = args.weightsBuf ? sizeof(float) * numExpertPerToken : 0;
+  const size_t indiceBytes = 0;
+  const size_t scaleBytes = 0;
+  const size_t metaBytes = 0;
+  const size_t tokenPackBytes = tokenBytes + weightBytes + indiceBytes + scaleBytes + metaBytes;
+
+  const size_t weightsOffset = tokenBytes;
+  // const size_t indiceOffset = weightsOffset + weightBytes;
+  // const size_t scalesOffset = indiceOffset + indiceBytes;
+  // const size_t metaOffset = scalesOffset + scaleBytes;
+
+  const int nChannels = blockNum / 2;
+  const int isSender = blockId < nChannels;
+  const int channelId = blockId % nChannels;
+
+  // calculate channel size and offset
+  const index_t tokenNum = args.curRankNumToken;
+  index_t baseTokensPerChannel = tokenNum / nChannels;
+  const size_t maxTokensPerChannel = baseTokensPerChannel + (remTokens ? 1 : 0);
+  const size_t maxChannelRecvTokensPerRank = maxTokensPerChannel * nNodes;
+#if DEBUG == 1
+  if (blockId == 0 && thdId == 0) {
+    printf("maxTokensPerChannel=%zu\n", maxTokensPerChannel);
+  }
+#endif
+
+  // define staging buffer size
+  const int stepRDMATokens = config.maxRDMAStepTokens;
+  const int stepP2pTokens = config.maxP2PStepTokens;
+  const size_t maxChannelStagingTokens = config.maxChannelStagingTokens;
+
+  const size_t maxRDMAStagingTokens = maxChannelStagingTokens;
+  const size_t maxRDMASteps = maxChannelStagingTokens / stepRDMATokens;
+
+  // differs from dispatch
+  const size_t maxP2PStagingTokens = maxChannelStagingTokens * nNodes;
+
+  // clear totalRecvTokenNum
+  if (blockId == 0 && thdId == 0) {
+    args.totalRecvTokenNum[0] = 0;
+  }
+
+  if (isSender) {
+    constexpr int kSendWarpCount = 8;
+    if (warpId < kSendWarpCount) {
+      const int dstLocalPe = warpId;
+      const int destPe = myNode * nlocalPes + dstLocalPe;
+      const index_t numChannelTokens = args.p2pRecvTokenNum[channelId * nlocalPes + dstLocalPe];
+
+      uint64_t p2pHeadCache = __hip_atomic_load(
+          args.headMemObj->template GetAs<uint64_t*>(destPe) + channelId * npes + myPe,
+          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      uint64_t p2pTailCache =
+          __hip_atomic_load(args.tailMemObj->template GetAs<uint64_t*>() + destPe + channelId * npes,
+                            __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+
+      index_t* recvTokenMap = args.srcPeTokenIdxMap +
+                              (channelId * nlocalPes + dstLocalPe) * maxChannelRecvTokensPerRank;
+
+      for (int idx = 0; idx < numChannelTokens; ++idx) {
+        index_t localTokenIdx = recvTokenMap[idx];
+        // int destNode = args.dispReceiverIdxMap[localTokenIdx];
+
+        // TODO check p2p buffer ready
+        while (p2pTailCache - p2pHeadCache >= maxP2PStagingTokens) {
+          if (laneId == 0) {
+            p2pHeadCache = __hip_atomic_load(
+                args.headMemObj->template GetAs<uint64_t*>() + channelId * npes + destPe,
+                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+          }
+          p2pHeadCache = __shfl(p2pHeadCache, 0);
+        }
+
+        index_t slot = p2pTailCache % maxP2PStagingTokens;
+        char* dstPtr =
+            args.shmemOutTokMemObj->template GetAs<char*>(destPe) +
+            ((channelId * nlocalPes + myLocalPe) * maxP2PStagingTokens + slot) * tokenPackBytes;
+        core::WarpCopy(dstPtr,
+                       reinterpret_cast<char*>(args.inpTokenBuf) + localTokenIdx * tokenBytes,
+                       tokenBytes);
+        if (args.weightsBuf) {
+          core::WarpCopy(dstPtr + weightsOffset,
+                         reinterpret_cast<char*>(args.weightsBuf) + localTokenIdx * weightBytes,
+                         weightBytes);
+        }
+
+        ++p2pTailCache;
+        if ((idx + 1) % maxRDMAStagingTokens == 0 || idx == numChannelTokens - 1) {
+          if (laneId == 0) {
+            __hip_atomic_store(
+                args.tailMemObj->template GetAs<uint64_t*>(destPe) + channelId * npes + myPe,
+                p2pTailCache, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+          }
+        }
+      }
+    } else {
+      const int destNode = warpId % nNodes;
+      const int destPe = destNode * nlocalPes + myLocalPe;
+      const int subWarpId = warpId / nNodes;
+      const int nSubWarps = (warpNum - kSendWarpCount) / nNodes;
+
+      index_t* rdmaRecvTokensNum = args.rdmaRecvTokensNum + channelId * nNodes + destNode;
+      const index_t numTokensToCombine = *rdmaRecvTokensNum;
+      if (subWarpId == 0 && laneId == 0) {
+        // clear rdmaRecvTokensNum
+        *rdmaRecvTokensNum = 0;
+      }
+
+      index_t* fwdTokenMap =
+          args.fwdTokenMap + (channelId * nNodes + destNode) * maxTokensPerChannel * nlocalPes;
+
+      uint64_t* p2pHeadPtr =
+          laneId < nlocalPes
+              ? args.headMemObj->template GetAs<uint64_t*>(destNode * nlocalPes + laneId) +
+                    channelId * npes + myPe
+              : nullptr;
+      uint64_t* p2pTailPtr = laneId < nlocalPes
+                                 ? args.tailMemObj->template GetAs<uint64_t*>() + channelId * npes +
+                                       (destNode * nlocalPes + laneId)
+                                 : nullptr;
+
+      uint64_t p2pHeadCache = laneId < nlocalPes ? __hip_atomic_load(p2pHeadPtr, __ATOMIC_RELAXED,
+                                                                     __HIP_MEMORY_SCOPE_SYSTEM)
+                                                 : 0;
+      uint64_t p2pTailCache = laneId < nlocalPes ? __hip_atomic_load(p2pTailPtr, __ATOMIC_RELAXED,
+                                                                     __HIP_MEMORY_SCOPE_SYSTEM)
+                                                 : 0;
+      // TODO 这里会有问题，tail由其他rank更新
+      uint64_t p2pTailBase = p2pTailCache;
+
+      uint64_t headCache = __hip_atomic_load(args.headMemObj->template GetAs<uint64_t*>() +
+                                                 channelId * npes + (node * nlocalPes + myLocalPe),
+                                             __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      uint64_t tailCache = args.localTail[channelId * npes + destPe];
+
+      for (int idx = 0; idx < numTokensToCombine; idx += stepRDMATokens) {
+        // TODO check rdma buffer ready
+        while (tailCache - headCache >= maxRDMASteps) {
+          if (laneId == node) {
+            headCache = __hip_atomic_load(args.headMemObj->template GetAs<uint64_t*>() +
+                                              channelId * npes + (node * nlocalPes + myLocalPe),
+                                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+          }
+          headCache = __shfl(headCache, node);
+        }
+
+        for (int i = subWarpId; i < stepRDMATokens && i + idx < numTokensToCombine;
+             i += nSubWarps) {
+          index_t expectTail =
+              laneId < nlocalPes ? fwdTokenMap[(idx + i) * nlocalPes + laneId] - 1 : -1;
+
+          // wait data
+          while(true) {
+            bool dataReady = p2pTailCache > expectTail + p2pTailBase;
+            if (__all(dataReady)) break;
+            if (!dataReady) {
+              p2pTailCache =
+                  __hip_atomic_load(p2pTailPtr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            }
+          }
+
+          char* dstPtr =
+              (destNode == myNode ? args.shmemInpTokMemObj->template GetAs<char*>()
+                                  : args.shmemStagingTokMemObj->template GetAs<char*>()) +
+              ((channelId * nNodes + destNode) * maxRDMAStagingTokens +
+               (tailCache % maxRDMASteps) * stepRDMATokens + i) *
+                  tokenPackBytes;
+
+          T* srcPtrs[MAX_GPUS_PER_NODE];
+          int accumNum = 0;
+          for (int pe = 0; pe < nlocalPes; ++pe) {
+            uint64_t slot = __shfl(expectTail + p2pTailBase, pe);
+            if (slot != -1) {
+              srcPtrs[accumNum++] = args.shmemOutTokMemObj->template GetAs<char*>() +
+                                    ((channelId * nlocalPes + pe) * maxP2PStagingTokens +
+                                     slot % maxP2PStagingTokens) *
+                                        tokenPackBytes;
+            }
+          }
+          // TODO 记录当前slot，维护一个nNodes*nlocalPes的shmem，用来更新p2p buffer的head
+
+          core::WarpAccum<T, 8>(reinterpret_cast<T*>(dstPtr), srcPtrs, nullptr, accumNum,
+                                config.hiddenDim);
+
+          if (args.weightsBuf) {
+            float* srcWeightPtrs[MAX_GPUS_PER_NODE];
+            for (int n = 0 ; n < accumNum ; ++n) {
+              srcWeightPtrs[n] = reinterpret_cast<char*>(srcPtrs[n]) + tokenBytes;
+            }
+            core::WarpAccum<float, 4>(
+                reinterpret_cast<float*>(reinterpret_cast<char*>(dstPtr) + tokenBytes),
+                srcWeightPtrs, nullptr, accumNum, config.numExpertPerToken);
+          }
+        }
+
+        // TODO sub warp barrier
+
+        if (subWarpId == nSubWarps - 1 && destNode != myNode) {
+          size_t dstStagingOffset = ((channelId * nNodes + myNode) * maxRDMAStagingTokens +
+                                     (tailCache % maxRDMASteps) * stepRDMATokens) *
+                                    tokenPackBytes;
+          size_t srcStagingOffset = ((channelId * nNodes + destNode) * maxRDMAStagingTokens +
+                                     (tailCache % maxRDMASteps) * stepRDMATokens) *
+                                    tokenPackBytes;
+          shmem::ShmemPutTypeNbiWarp<uint8_t>(
+              args.shmemInpTokMemObj, dstStagingOffset, args.shmemStagingTokMemObj,
+              srcStagingOffset, min(stepRDMATokens, numTokensToCombine - idx) * tokenPackBytes,
+              destPe, channelId);
+        }
+
+        // Update rmda tail
+        ++tailCache;
+        if (subWarpId == nSubWarps - 1 && laneId == destNode) {
+          // if (destNode == myNode) {
+          //   __hip_atomic_store(
+          //       args.tailMemObj->template GetAs<uint64_t*>(destPe) + myPe + channelId * npes,
+          //       tailCache, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+          // } else {
+            shmem::ShmemPutUint64ImmNbiThread(args.tailMemObj,
+                                              (myPe + channelId * npes) * sizeof(uint64_t),
+                                              tailCache, destPe, channelId);
+#if COMB_DEBUG == 1
+            // will report cqe error
+            shmem::ShmemQuietThread(destPe, channelId);
+#endif
+          // }
+        }
+      }
+    }
+  } else {  // Receiver
+    constexpr int kRecvWarpCount = 8;
+    if (warpId < kRecvWarpCount){
+      const index_t remTokens = tokenNum % nChannels;
+      const index_t channelStartOffset =
+          channelId * baseTokensPerChannel + min(channelId, remTokens);
+      const index_t tokensPerChannel = baseTokensPerChannel + (channelId < remTokens ? 1 : 0);
+      const index_t channelEndOffset = min(channelStartOffset + tokensPerChannel, tokenNum);
+      index_t* tokenIdxToSlotMap = reinterpret_cast<index_t*>(args.localPeBuf);
+
+      uint64_t* tailPtr = laneId < nNodes ? args.tailMemObj->template GetAs<uint64_t*>() +
+                                                channelId * npes + (laneId * nlocalPes + myLocalPe)
+                                          : nullptr;
+      uint64_t headBase =
+          laneId < nNodes ? args.localHead[channelId * npes + (laneId * nlocalPes + myLocalPe)] : 0;
+      uint64_t tailCache =
+          laneId < nNodes ? __hip_atomic_load(tailPtr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM)
+                          : 0;
+      uint64_t tailBase = tailCache;
+
+      index_t* tokenIdxToSlotMap = reinterpret_cast<index_t*>(args.localPeBuf);
+      for (int tokenIdx = channelStartOffset + warpId; tokenIdx < channelEndOffset;
+           tokenIdx += (kRecvWarpCount - 1)) {
+        index_t expectTail =
+            laneId < nNodes ? tokenIdxToSlotMap[tokenIdx * nNodes + laneId] - 1 : -1;
+        // wait data
+        while (true) {
+          bool dataReady = tailCache * stepRDMATokens > expectTail + tailBase * stepRDMATokens;
+          if (__all(dataReady)) break;
+          if (!dataReady) {
+            tailCache = __hip_atomic_load(tailPtr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+          }
+        }
+
+        T* srcPtrs[MAX_NODES];
+        int accumNum = 0;
+        for (int node = 0; node < nNodes; ++node) {
+          uint64_t slot = __shfl(expectTail + tailBase * stepRDMATokens, node);
+          if (slot != -1) {
+            srcPtrs[accumNum++] =
+                args.shmemInpTokMemObj->template GetAs<char*>() +
+                ((channelId * nNodes + node) * maxRDMAStagingTokens + slot % maxRDMAStagingTokens) *
+                    tokenPackBytes;
+          }
+        }
+        core::WarpAccum<T, 8>(args.outTokenBuf + tokenIdx * config.hiddenDim, srcPtrs, nullptr,
+                              accumNum, config.hiddenDim);
+
+        if (args.weightsBuf) {
+          float* srcWeightPtrs[MAX_GPUS_PER_MAX_NODESNODE];
+          for (int n = 0; n < accumNum; ++n) {
+            srcWeightPtrs[n] = reinterpret_cast<char*>(srcPtrs[n]) + tokenBytes;
+          }
+          core::WarpAccum<float, 4>(args.shmemOutWeightsMemObj->template GetAs<float*>() +
+                                        tokenIdx * config.numExpertPerToken,
+                                    srcWeightPtrs, nullptr, accumNum, config.numExpertPerToken);
+        }
+      }
+      // TODO update rdma head
+    }
+  }
 }
 
 }  // namespace moe

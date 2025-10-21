@@ -52,6 +52,7 @@ class EpDispatchCombineTestCase:
             block_num=80,
             max_rdma_step_tokens=64,
             max_p2p_step_tokens=8,
+            max_channel_staging_tokens=128,
             # kernel_type=mori.ops.EpDispatchCombineKernelType.InterNode,
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeNormal,
         )

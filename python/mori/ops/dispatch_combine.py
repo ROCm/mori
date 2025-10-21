@@ -47,7 +47,8 @@ class EpDispatchCombineConfig:
     block_num: int = 80
     num_gpus_per_node: int = 8
     max_rdma_step_tokens: int = 64
-    max_p2p_step_tokens: int = 32
+    max_p2p_step_tokens: int = 8
+    max_channel_staging_tokens: int = 128
     use_external_inp_buf: bool = True
     kernel_type: EpDispatchCombineKernelType = EpDispatchCombineKernelType.IntraNode
 
@@ -77,6 +78,7 @@ class EpDispatchCombineOp:
                 block_num=config.block_num,
                 max_rdma_step_tokens=config.max_rdma_step_tokens,
                 max_p2p_step_tokens=config.max_p2p_step_tokens,
+                max_channel_staging_tokens=config.max_channel_staging_tokens,
                 kernel_type=config.kernel_type,
                 use_external_inp_buf=config.use_external_inp_buf,
             )
