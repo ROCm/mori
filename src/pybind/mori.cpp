@@ -320,7 +320,8 @@ void RegisterMoriIo(pybind11::module_& m) {
   py::class_<mori::io::TcpBackendConfig, mori::io::BackendConfig>(m, "TcpBackendConfig")
       .def(py::init<>())
       .def_readwrite("num_worker_threads", &mori::io::TcpBackendConfig::numWorkerThreads)
-      .def_readwrite("preconnect", &mori::io::TcpBackendConfig::preconnect);
+    .def_readwrite("preconnect", &mori::io::TcpBackendConfig::preconnect)
+    .def_readwrite("enable_metrics", &mori::io::TcpBackendConfig::enableMetrics);
 
   py::class_<mori::io::IOEngineConfig>(m, "IOEngineConfig")
       .def(py::init<std::string, uint16_t>(), py::arg("host") = "", py::arg("port") = 0)
@@ -406,7 +407,8 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("Write", &mori::io ::IOEngine::Write)
       .def("BatchWrite", &mori::io ::IOEngine::BatchWrite)
       .def("CreateSession", &mori::io::IOEngine::CreateSession)
-      .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus);
+  .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus)
+  .def("GetTcpMetricsJson", &mori::io::IOEngine::GetTcpMetricsJson);
 }
 
 }  // namespace mori

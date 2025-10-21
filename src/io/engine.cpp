@@ -248,5 +248,13 @@ bool IOEngine::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
   return false;
 }
 
+std::string IOEngine::GetTcpMetricsJson() {
+  auto it = backends.find(BackendType::TCP);
+  if (it == backends.end()) return std::string();
+  auto* tcp = dynamic_cast<TcpBackend*>(it->second.get());
+  if (!tcp) return std::string();
+  return tcp->GetMetricsJson();
+}
+
 }  // namespace io
 }  // namespace mori

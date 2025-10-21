@@ -60,6 +60,32 @@ class BackendServer {
                       const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
                       bool isRead);
 
+  // Snapshot of current metrics (thread-safe, returns copy). Only populated when
+  // config.enableMetrics == true.
+  struct TcpMetricsSnapshot {
+    uint64_t workerLoops{0};
+    uint64_t epollWaitCalls{0};
+    uint64_t epollWaitTotalNs{0};
+    uint64_t headerRecvCount{0};
+    uint64_t headerRecvNs{0};
+    uint64_t payloadRecvCount{0};
+    uint64_t payloadRecvNs{0};
+    uint64_t opExecCount{0};
+    uint64_t opExecNs{0};
+    uint64_t gpuStagingCopies{0};
+    uint64_t gpuStagingCopyNs{0};
+    uint64_t headerSendCount{0};
+    uint64_t headerSendNs{0};
+    uint64_t payloadSendCount{0};
+    uint64_t payloadSendNs{0};
+    uint64_t batchScheduleCount{0};
+    uint64_t batchScheduleNs{0};
+  };
+
+  TcpMetricsSnapshot GetMetricsSnapshot() const;
+  void ResetMetrics();
+  std::string GetMetricsJson() const;  // JSON serialization of snapshot
+
  private:
   struct WorkerContext {
     application::TCPContext* listenCtx{nullptr};
@@ -116,6 +142,47 @@ class BackendServer {
   inline TransferUniqueId NextUniqueTransferId() {
     return nextTransferId.fetch_add(1, std::memory_order_relaxed);
   }
+
+  // --- Metrics collection (optional) ---
+  struct TcpMetricsInternal {
+    std::atomic<uint64_t> workerLoops{0};
+    std::atomic<uint64_t> epollWaitCalls{0};
+    std::atomic<uint64_t> epollWaitTotalNs{0};
+    std::atomic<uint64_t> headerRecvCount{0};
+    std::atomic<uint64_t> headerRecvNs{0};
+    std::atomic<uint64_t> payloadRecvCount{0};
+    std::atomic<uint64_t> payloadRecvNs{0};
+    std::atomic<uint64_t> opExecCount{0};
+    std::atomic<uint64_t> opExecNs{0};
+    std::atomic<uint64_t> gpuStagingCopies{0};
+    std::atomic<uint64_t> gpuStagingCopyNs{0};
+    std::atomic<uint64_t> headerSendCount{0};
+    std::atomic<uint64_t> headerSendNs{0};
+    std::atomic<uint64_t> payloadSendCount{0};
+    std::atomic<uint64_t> payloadSendNs{0};
+    std::atomic<uint64_t> batchScheduleCount{0};
+    std::atomic<uint64_t> batchScheduleNs{0};
+
+    void Reset() {
+      workerLoops.store(0, std::memory_order_relaxed);
+      epollWaitCalls.store(0, std::memory_order_relaxed);
+      epollWaitTotalNs.store(0, std::memory_order_relaxed);
+      headerRecvCount.store(0, std::memory_order_relaxed);
+      headerRecvNs.store(0, std::memory_order_relaxed);
+      payloadRecvCount.store(0, std::memory_order_relaxed);
+      payloadRecvNs.store(0, std::memory_order_relaxed);
+      opExecCount.store(0, std::memory_order_relaxed);
+      opExecNs.store(0, std::memory_order_relaxed);
+      gpuStagingCopies.store(0, std::memory_order_relaxed);
+      gpuStagingCopyNs.store(0, std::memory_order_relaxed);
+      headerSendCount.store(0, std::memory_order_relaxed);
+      headerSendNs.store(0, std::memory_order_relaxed);
+      payloadSendCount.store(0, std::memory_order_relaxed);
+      payloadSendNs.store(0, std::memory_order_relaxed);
+      batchScheduleCount.store(0, std::memory_order_relaxed);
+      batchScheduleNs.store(0, std::memory_order_relaxed);
+    }
+  } metrics;
 };
 
 class TcpBackendSession : public BackendSession {
@@ -158,6 +225,14 @@ class TcpBackend : public Backend {
 
   BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
+
+  // Convenience forwarding for metrics
+  inline BackendServer* GetServer() { return server; }
+  inline BackendServer::TcpMetricsSnapshot GetMetricsSnapshot() const {
+    return server->GetMetricsSnapshot();
+  }
+  inline std::string GetMetricsJson() const { return server->GetMetricsJson(); }
+  inline void ResetMetrics() { server->ResetMetrics(); }
 
  private:
   EngineKey myEngKey;

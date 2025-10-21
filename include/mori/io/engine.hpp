@@ -104,6 +104,9 @@ class IOEngine {
 
   std::optional<IOEngineSession> CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
 
+  // Return metrics JSON string for TCP backend if present, else empty string.
+  std::string GetTcpMetricsJson();
+
  private:
   Backend* SelectBackend(const MemoryDesc& local, const MemoryDesc& remote);
 

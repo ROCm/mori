@@ -135,6 +135,11 @@ def parse_args():
         choices=["rdma", "tcp"],
         help="Choose backend type, options: 'rdma', 'tcp'",
     )
+    parser.add_argument(
+        "--enable-tcp-metrics",
+        action="store_true",
+        help="Enable internal TCP backend performance metrics collection and output JSON at end",
+    )
 
     args = parser.parse_args()
     return args
@@ -166,6 +171,7 @@ class MoriIoBenchmark:
         sweep: bool = False,
         sweep_batch: bool = False,
         backend: str = "rdma",
+        enable_tcp_metrics: bool = False,
     ):
         self.op_type = op_type
         self.host = host
@@ -188,6 +194,7 @@ class MoriIoBenchmark:
         self.sweep = sweep
         self.sweep_batch = sweep_batch
         self.backend = backend
+        self.enable_tcp_metrics = enable_tcp_metrics
 
         self.world_size = self.num_initiator_dev + self.num_target_dev
         if self.node_rank == 0:
@@ -268,8 +275,9 @@ class MoriIoBenchmark:
             self.engine.create_backend(BackendType.RDMA, config)
         elif self.backend == "tcp":
             config = TcpBackendConfig()
+            if hasattr(config, "enable_metrics") and self.enable_tcp_metrics:
+                config.enable_metrics = True
             self.engine.create_backend(BackendType.TCP, config)
-        
 
         self.engine_desc = self.engine.get_engine_desc()
         engine_desc_bytes = self.engine_desc.pack()
@@ -519,6 +527,13 @@ class MoriIoBenchmark:
 
             if self.role is EngineRole.INITIATOR:
                 print(table)
+                if self.backend == "tcp" and self.enable_tcp_metrics:
+                    try:
+                        metrics_json = self.engine._engine.GetTcpMetricsJson()
+                        print("TCP Metrics JSON:")
+                        print(metrics_json)
+                    except Exception as e:
+                        print(f"Failed to retrieve TCP metrics: {e}")
 
 
 def benchmark_engine(local_rank, node_rank, args):
@@ -548,6 +563,7 @@ def benchmark_engine(local_rank, node_rank, args):
         sweep=args.all,
         sweep_batch=args.all_batch,
         backend=args.backend,
+        enable_tcp_metrics=args.enable_tcp_metrics,
     )
     bench.print_config()
     bench.run()

@@ -68,6 +68,8 @@ struct TcpBackendConfig : public BackendConfig {
   // For future extension (e.g., parallelism, buffer sizing)
   int numWorkerThreads{4};
   bool preconnect{true};
+  // Enable lightweight internal timing metrics collection inside TCP backend.
+  bool enableMetrics{false};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
