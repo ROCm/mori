@@ -33,51 +33,49 @@ template <application::TransportType TsptType>
 inline __device__ void ShmemPutMemNbiThreadKernel(const application::SymmMemObjPtr dest,
                                                   size_t destOffset,
                                                   const application::RdmaMemoryRegion& source,
-                                                  size_t sourceOffset, size_t bytes, int pe);
+                                                  size_t sourceOffset, size_t bytes, int pe,
+                                                  int qpId = 0);
 
 template <application::TransportType TsptType>
 inline __device__ void ShmemPutMemNbiWarpKernel(const application::SymmMemObjPtr dest,
                                                 size_t destOffset,
                                                 const application::RdmaMemoryRegion& source,
-                                                size_t sourceOffset, size_t bytes, int pe);
+                                                size_t sourceOffset, size_t bytes, int pe,
+                                                int qpId = 0);
 
 template <application::TransportType TsptType>
 inline __device__ void ShmemPutSizeImmNbiThreadKernel(const application::SymmMemObjPtr dest,
                                                       size_t destOffset, void* val, size_t bytes,
-                                                      int pe);
+                                                      int pe, int qpId = 0);
 
 template <application::TransportType TsptType>
 inline __device__ void ShmemPutSizeImmNbiWarpKernel(const application::SymmMemObjPtr dest,
                                                     size_t destOffset, void* val, size_t bytes,
-                                                    int pe);
+                                                    int pe, int qpId = 0);
 
 template <application::TransportType TsptType>
-inline __device__ void ShmemAtomicSizeNonFetchThreadKernel(
-    const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, size_t bytes,
-    int pe, core::atomicType amoType);
+inline __device__ void ShmemAtomicSizeNonFetchThreadKernel(const application::SymmMemObjPtr dest,
+                                                           size_t destOffset, void* val,
+                                                           size_t bytes, core::atomicType amoType,
+                                                           int pe, int qpId = 0);
 
 template <application::TransportType TsptType>
-inline __device__ void ShmemAtomicSizeNonFetchWarpKernel(
-    const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, size_t bytes,
-    int pe, core::atomicType amoType);
+inline __device__ void ShmemAtomicSizeNonFetchWarpKernel(const application::SymmMemObjPtr dest,
+                                                         size_t destOffset, void* val, size_t bytes,
+                                                         core::atomicType amoType, int pe,
+                                                         int qpId = 0);
 
-template <application::TransportType TsptType>
-inline __device__ void ShmemAtomicSizeFetchThreadKernel(const application::SymmMemObjPtr dest,
-                                                        size_t destOffset,
-                                                        const application::RdmaMemoryRegion& source,
-                                                        size_t sourceOffset, void* val,
-                                                        void* compare, size_t bytes, int pe,
-                                                        core::atomicType amoType);
+template <application::TransportType TsptType, typename T>
+inline __device__ T ShmemAtomicTypeFetchThreadKernel(const application::SymmMemObjPtr dest,
+                                                     size_t destOffset, void* val, void* compare,
+                                                     size_t bytes, core::atomicType amoType, int pe,
+                                                     int qpId = 0);
 
-template <application::TransportType TsptType>
-inline __device__ void ShmemAtomicSizeFetchWarpKernel(const application::SymmMemObjPtr dest,
-                                                      size_t destOffset,
-                                                      const application::RdmaMemoryRegion& source,
-                                                      size_t sourceOffset, void* val, void* compare,
-                                                      size_t bytes, int pe,
-                                                      core::atomicType amoType);
+template <application::TransportType TsptType, typename T>
+inline __device__ T ShmemAtomicTypeFetchWarpKernel(const application::SymmMemObjPtr dest,
+                                                   size_t destOffset, void* val, void* compare,
+                                                   size_t bytes, core::atomicType amoType, int pe,
+                                                   int qpId = 0);
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Synchronization                                        */
@@ -87,6 +85,9 @@ inline __device__ void ShmemQuietThreadKernel();
 
 template <application::TransportType>
 inline __device__ void ShmemQuietThreadKernel(int pe);
+
+template <application::TransportType>
+inline __device__ void ShmemQuietThreadKernel(int pe, int qpId);
 
 }  // namespace shmem
 }  // namespace mori

@@ -39,7 +39,8 @@ target_link_libraries(
   hip::device
   mlx5
   rocm_smi64
-  pci)
+  pci
+  mori_logging)
 
 if(USE_BNXT)
   target_link_libraries(mori_application ${BNXT_RE_LIB})

@@ -24,6 +24,8 @@
 #include <assert.h>
 #include <mpi.h>
 
+#include <type_traits>
+
 #include "mori/application/application.hpp"
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem_api.hpp"
@@ -38,7 +40,8 @@ namespace shmem {
 template <>
 inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::P2P>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe) {
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe,
+    int qpId) {
   uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source.addr + sourceOffset);
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   core::ThreadCopy<uint8_t>(destPtr, srcPtr, bytes);
@@ -47,7 +50,8 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::P2
 template <>
 inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::P2P>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe) {
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe,
+    int qpId) {
   uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source.addr + sourceOffset);
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
@@ -55,7 +59,8 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::P2P>
 
 template <>
 inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::P2P>(
-    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe) {
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe,
+    int qpId) {
   uint8_t* srcPtr = reinterpret_cast<uint8_t*>(val);
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   switch (bytes) {
@@ -88,7 +93,8 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType
 
 template <>
 inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::P2P>(
-    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe) {
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe,
+    int qpId) {
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0)
     ShmemPutSizeImmNbiThreadKernel<application::TransportType::P2P>(dest, destOffset, val, bytes,
@@ -97,9 +103,8 @@ inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::
 
 template <>
 inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::P2P>(
-    const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, size_t bytes,
-    int pe, core::atomicType amoType) {
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
+    core::atomicType amoType, int pe, int qpId) {
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   switch (bytes) {
     case 4: {
@@ -217,175 +222,142 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::Transpor
 
 template <>
 inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportType::P2P>(
-    const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, size_t bytes,
-    int pe, core::atomicType amoType) {
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
+    core::atomicType amoType, int pe, int qpId) {
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {
-    ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::P2P>(
-        dest, destOffset, source, sourceOffset, val, bytes, pe, amoType);
+    ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::P2P>(dest, destOffset, val,
+                                                                         bytes, amoType, pe);
   }
 }
 
-template <>
-inline __device__ void ShmemAtomicSizeFetchThreadKernel<application::TransportType::P2P>(
-    const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare,
-    size_t bytes, int pe, core::atomicType amoType) {
-  uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
-  switch (bytes) {
-    case 4: {
-      int* fetchResPtr = reinterpret_cast<int*>(val);
-      int cmpVal = (compare != nullptr) ? *reinterpret_cast<int*>(compare) : 0;
-      int* remoteIntPtr = reinterpret_cast<int*>(destPtr);
-      auto casLoop = [=] __device__(int* addr, core::atomicType op, int operand, int cmpVal,
-                                    int* oldResult) {
-        int oldVal = core::AtomicLoadSeqCstSystem(addr);
-        while (true) {
-          int newVal = oldVal;
-          switch (op) {
-            case core::AMO_FETCH_INC:
-              newVal = oldVal + 1;
-              break;
-            case core::AMO_FETCH_ADD:
-              newVal = oldVal + operand;
-              break;
-            case core::AMO_FETCH_AND:
-              newVal = oldVal & operand;
-              break;
-            case core::AMO_FETCH_OR:
-              newVal = oldVal | operand;
-              break;
-            case core::AMO_FETCH_XOR:
-              newVal = oldVal ^ operand;
-              break;
-            case core::AMO_SWAP:
-              newVal = operand;
-              break;
-            case core::AMO_COMPARE_SWAP:
-              if (oldVal == cmpVal) {
-                newVal = operand;
-              } else {
-                newVal = oldVal;
-              }
-              break;
-            default:
-              break;
-          }
+template <typename T>
+inline __device__ T ShmemAtomicTypeFetchThreadKernelImplP2P(const application::SymmMemObjPtr dest,
+                                                            size_t destOffset, void* val,
+                                                            void* compare, size_t bytes,
+                                                            core::atomicType amoType, int pe,
+                                                            int qpId) {
+  T* destPtr = reinterpret_cast<T*>(dest->peerPtrs[pe] + destOffset);
+  T* fetchResPtr = reinterpret_cast<T*>(val);
+  T cmpVal = (compare != nullptr) ? *reinterpret_cast<T*>(compare) : T{};
 
-          int expected = oldVal;
-          int prev = core::AtomicCompareExchangeSystem(addr, &expected, newVal);
-          if (prev == oldVal) {
-            *oldResult = oldVal;
-            break;
-          }
-        }
-        return oldVal;
-      };
-      int* operandIntPtr = reinterpret_cast<int*>(source.addr + sourceOffset);
-      int operandInt = *operandIntPtr;
-      switch (amoType) {
+  auto casLoop = [=] __device__(T * addr, core::atomicType op, T operand, T cmpVal, T * oldResult) {
+    T oldVal = core::AtomicLoadSeqCstSystem(addr);
+    while (true) {
+      T newVal = oldVal;
+      switch (op) {
         case core::AMO_FETCH_INC:
+          newVal = oldVal + T{1};
+          break;
         case core::AMO_FETCH_ADD:
+          newVal = oldVal + operand;
+          break;
         case core::AMO_FETCH_AND:
+          if constexpr (std::is_integral_v<T>) {
+            newVal = oldVal & operand;
+          }
+          break;
         case core::AMO_FETCH_OR:
+          if constexpr (std::is_integral_v<T>) {
+            newVal = oldVal | operand;
+          }
+          break;
         case core::AMO_FETCH_XOR:
+          if constexpr (std::is_integral_v<T>) {
+            newVal = oldVal ^ operand;
+          }
+          break;
         case core::AMO_SWAP:
-        case core::AMO_COMPARE_SWAP: {
-          *operandIntPtr = casLoop(remoteIntPtr, amoType, operandInt, cmpVal, fetchResPtr);
-        } break;
-
+          newVal = operand;
+          break;
+        case core::AMO_COMPARE_SWAP:
+          if (oldVal == cmpVal) {
+            newVal = operand;
+          } else {
+            newVal = oldVal;
+          }
+          break;
         default:
-          printf("Error: Unsupported 4-byte atomicType (%d) in FetchThreadKernel.\n", amoType);
           break;
       }
 
-      break;
-    }
-    case 8: {
-      long long* fetchResPtr = reinterpret_cast<long long*>(val);
-      long long cmpValLL = (compare != nullptr) ? *reinterpret_cast<long long*>(compare) : 0LL;
-      long long* remoteLLPtr = reinterpret_cast<long long*>(destPtr);
-      auto casLoop64 = [=] __device__(long long* addr, core::atomicType op, long long operand,
-                                      long long cmpValLL, long long* oldResult) {
-        long long oldVal = core::AtomicLoadSeqCstSystem(addr);
-        while (true) {
-          long long newVal = oldVal;
-          switch (op) {
-            case core::AMO_FETCH_INC:
-              newVal = oldVal + 1;
-              break;
-            case core::AMO_FETCH_ADD:
-              newVal = oldVal + operand;
-              break;
-            case core::AMO_FETCH_AND:
-              newVal = oldVal & operand;
-              break;
-            case core::AMO_FETCH_OR:
-              newVal = oldVal | operand;
-              break;
-            case core::AMO_FETCH_XOR:
-              newVal = oldVal ^ operand;
-              break;
-            case core::AMO_SWAP:
-              newVal = operand;
-              break;
-            case core::AMO_COMPARE_SWAP:
-              if (oldVal == cmpValLL) {
-                newVal = operand;
-              } else {
-                newVal = oldVal;
-              }
-              break;
-            default:
-              break;
-          }
-
-          long long expected = oldVal;
-          long long prev = core::AtomicCompareExchangeSystem(addr, &expected, newVal);
-          if (prev == oldVal) {
-            *oldResult = oldVal;
-            break;
-          }
-        }
-        return oldVal;
-      };
-      long long* operandLLPtr = reinterpret_cast<long long*>(source.addr + sourceOffset);
-      long long operandLL = *operandLLPtr;
-      switch (amoType) {
-        case core::AMO_FETCH_INC:
-        case core::AMO_FETCH_ADD:
-        case core::AMO_FETCH_AND:
-        case core::AMO_FETCH_OR:
-        case core::AMO_FETCH_XOR:
-        case core::AMO_SWAP:
-        case core::AMO_COMPARE_SWAP: {
-          *operandLLPtr = casLoop64(remoteLLPtr, amoType, operandLL, cmpValLL, fetchResPtr);
-        } break;
-
-        default:
-          printf("Error: Unsupported 8-byte atomicType (%d) in FetchThreadKernel.\n", amoType);
-          break;
+      T expected = oldVal;
+      T prev = core::AtomicCompareExchangeSystem(addr, &expected, newVal);
+      if (prev == oldVal) {
+        *oldResult = oldVal;
+        break;
       }
-      break;
+      oldVal = prev;
     }
+    return oldVal;
+  };
+
+  T* valPtr = reinterpret_cast<T*>(val);
+  T operand = *valPtr;
+
+  switch (amoType) {
+    case core::AMO_FETCH_INC:
+    case core::AMO_FETCH_ADD:
+    case core::AMO_FETCH_AND:
+    case core::AMO_FETCH_OR:
+    case core::AMO_FETCH_XOR:
+    case core::AMO_SWAP:
+    case core::AMO_COMPARE_SWAP: {
+      T result = casLoop(destPtr, amoType, operand, cmpVal, fetchResPtr);
+      return result;
+    } break;
     default:
-      printf("Error: Unsupported data size (%zu bytes) in FetchThreadKernel.\n", bytes);
+      if constexpr (sizeof(T) == 4) {
+        printf("Error: Unsupported 4-byte atomicType (%d) in TypeFetchThreadKernel.\n", amoType);
+      } else if constexpr (sizeof(T) == 8) {
+        printf("Error: Unsupported 8-byte atomicType (%d) in TypeFetchThreadKernel.\n", amoType);
+      }
       break;
   }
+  return T{};
 }
 
-template <>
-inline __device__ void ShmemAtomicSizeFetchWarpKernel<application::TransportType::P2P>(
-    const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, void* val, void* compare,
-    size_t bytes, int pe, core::atomicType amoType) {
+#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_THREAD_KERNEL_P2P(TypeName, T)                        \
+  template <>                                                                                \
+  inline __device__ T ShmemAtomicTypeFetchThreadKernel<application::TransportType::P2P, T>(  \
+      const application::SymmMemObjPtr dest, size_t destOffset, void* val, void* compare,    \
+      size_t bytes, core::atomicType amoType, int pe, int qpId) {                            \
+    return ShmemAtomicTypeFetchThreadKernelImplP2P<T>(dest, destOffset, val, compare, bytes, \
+                                                      amoType, pe, qpId);                    \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_THREAD_KERNEL_P2P(Uint32, uint32_t)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_THREAD_KERNEL_P2P(Uint64, uint64_t)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_THREAD_KERNEL_P2P(Int32, int32_t)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_THREAD_KERNEL_P2P(Int64, int64_t)
+
+template <typename T>
+inline __device__ T ShmemAtomicTypeFetchWarpKernelImpl_P2P(const application::SymmMemObjPtr dest,
+                                                           size_t destOffset, void* val,
+                                                           void* compare, size_t bytes,
+                                                           core::atomicType amoType, int pe,
+                                                           int qpId) {
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {
-    ShmemAtomicSizeFetchThreadKernel<application::TransportType::P2P>(
-        dest, destOffset, source, sourceOffset, val, compare, bytes, pe, amoType);
+    return ShmemAtomicTypeFetchThreadKernelImplP2P<T>(dest, destOffset, val, compare, bytes,
+                                                      amoType, pe, qpId);
   }
+  return T{};
 }
+
+#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_WARP_KERNEL_P2P(TypeName, T)                          \
+  template <>                                                                                \
+  inline __device__ T ShmemAtomicTypeFetchWarpKernel<application::TransportType::P2P, T>(    \
+      const application::SymmMemObjPtr dest, size_t destOffset, void* val, void* compare,    \
+      size_t bytes, core::atomicType amoType, int pe, int qpId) {                            \
+    return ShmemAtomicTypeFetchThreadKernelImplP2P<T>(dest, destOffset, val, compare, bytes, \
+                                                      amoType, pe, qpId);                    \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_WARP_KERNEL_P2P(Uint32, uint32_t)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_WARP_KERNEL_P2P(Uint64, uint64_t)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_WARP_KERNEL_P2P(Int32, int32_t)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_WARP_KERNEL_P2P(Int64, int64_t)
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Synchronization                                        */
@@ -395,6 +367,9 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::P2P>()
 
 template <>
 inline __device__ void ShmemQuietThreadKernel<application::TransportType::P2P>(int pe) {}
+
+template <>
+inline __device__ void ShmemQuietThreadKernel<application::TransportType::P2P>(int pe, int qpId) {}
 
 }  // namespace shmem
 }  // namespace mori

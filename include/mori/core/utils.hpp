@@ -21,6 +21,14 @@
 // SOFTWARE.
 #pragma once
 
+#ifndef warpSize
+#if defined(__GFX8__) || defined(__GFX9__)
+  #define warpSize 64
+#else
+  #define warpSize 32
+#endif
+#endif
+
 namespace mori {
 namespace core {
 
@@ -172,6 +180,11 @@ __device__ inline void AcquireLock(uint32_t* lockVar) {
   while (atomicCAS(lockVar, 0, 1) != 0) {
   }
 }
+
+__device__ inline bool AcquireLockOnce(uint32_t* lockVar) {
+  return atomicCAS(lockVar, 0, 1) == 0;
+}
+
 
 __device__ inline void ReleaseLock(uint32_t* lockVar) { atomicExch(lockVar, 0); }
 

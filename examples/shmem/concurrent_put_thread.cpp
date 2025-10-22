@@ -40,7 +40,7 @@ __global__ void ConcurrentPutThreadKernel(int myPe, const SymmMemObjPtr memObj) 
   if (myPe == sendPe) {
     RdmaMemoryRegion source = memObj->GetRdmaMemoryRegion(myPe);
 
-    ShmemPutMemNbiThread(memObj, threadOffset, source, threadOffset, sizeof(uint32_t), recvPe);
+    ShmemPutMemNbiThread(memObj, threadOffset, source, threadOffset, sizeof(uint32_t), recvPe, 1);
     __threadfence_system();
 
     if (blockIdx.x == 0)
@@ -86,6 +86,9 @@ void ConcurrentPutThread() {
   ConcurrentPutThreadKernel<<<blockNum, threadNum>>>(myPe, buffObj);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
+  if (myPe == 0) {
+    printf("test done!\n");
+  }
 
   // Finalize
   ShmemFree(buff);

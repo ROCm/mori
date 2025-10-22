@@ -93,12 +93,13 @@ class IOEngine {
   void Write(const MemoryDesc& localSrc, size_t localOffset, const MemoryDesc& remoteDest,
              size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id);
 
-  void BatchRead(const MemoryDesc& localDest, const SizeVec& localOffsets,
-                 const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets, const SizeVec& sizes,
-                 TransferStatus* status, TransferUniqueId id);
-  void BatchWrite(const MemoryDesc& localSrc, const SizeVec& localOffsets,
-                  const MemoryDesc& remoteDest, const SizeVec& remoteOffsets, const SizeVec& sizes,
-                  TransferStatus* status, TransferUniqueId id);
+  void BatchRead(const MemDescVec& localDest, const BatchSizeVec& localOffsets,
+                 const MemDescVec& remoteSrc, const BatchSizeVec& remoteOffsets,
+                 const BatchSizeVec& sizes, TransferStatusPtrVec& status, TransferUniqueIdVec& ids);
+  void BatchWrite(const MemDescVec& localSrc, const BatchSizeVec& localOffsets,
+                  const MemDescVec& remoteDest, const BatchSizeVec& remoteOffsets,
+                  const BatchSizeVec& sizes, TransferStatusPtrVec& status,
+                  TransferUniqueIdVec& ids);
   // Take the transfer status of an inbound op
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
 

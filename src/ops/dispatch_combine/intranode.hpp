@@ -50,12 +50,12 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
     args.combineGridBarrier[0] = 0;
     core::AtomicStoreRelaxedSystem(
         args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(globalThdId) + args.config.rank,
-        args.crossDeviceBarrierFlag);
+        *args.crossDeviceBarrierFlag);
   }
 
   uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
   if (thdId < args.config.worldSize) {
-    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != args.crossDeviceBarrierFlag) {
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != *args.crossDeviceBarrierFlag) {
     }
   }
   __syncthreads();
@@ -211,7 +211,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   if (args.config.useExternalInpBuffer) {
     for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
-      core::WarpCopy(args.shmemInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
+      core::WarpCopy(args.shmemCombineInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
                      args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
     }
   }
@@ -251,8 +251,8 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       index_t destPe = destTokId / MaxNumTokensToSend;
 
       if (destPe < config.worldSize) {
-        index_t destLocalTokId = destTokId - destPe * MaxNumTokensToSend;
-        srcPtrs[j] = args.shmemInpTokMemObj->template GetAs<T*>(destPe) +
+        index_t destLocalTokId = destTokId - destPe * maxNumOutTokenPerRank;
+        srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
                      destLocalTokId * config.hiddenDim + hiddenDimOffset;
         srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                            destLocalTokId * config.numExpertPerToken;

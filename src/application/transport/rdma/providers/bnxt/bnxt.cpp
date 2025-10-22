@@ -25,14 +25,51 @@
 #include <infiniband/verbs.h>
 #include <unistd.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
+#include <sstream>
+#include <string>
 
 #include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
+#include "mori/utils/mori_log.hpp"
+
+#ifdef ENABLE_BNXT
+namespace std {
+static std::ostream& operator<<(std::ostream& s, const bnxt_re_dv_qp_mem_info& m) {
+  std::stringstream ss;
+  ss << "qp_handle: 0x" << std::hex << m.qp_handle << std::dec << "  sq_va: 0x" << std::hex
+     << m.sq_va << std::dec << "  sq_len: " << m.sq_len << "  sq_slots: " << m.sq_slots
+     << "  sq_wqe_sz: " << m.sq_wqe_sz << "  sq_psn_sz: " << m.sq_psn_sz
+     << "  sq_npsn: " << m.sq_npsn << "  rq_va: 0x" << std::hex << m.rq_va << std::dec
+     << "  rq_len: " << m.rq_len << "  rq_slots: " << m.rq_slots << "  rq_wqe_sz: " << m.rq_wqe_sz
+     << "  comp_mask: 0x" << std::hex << m.comp_mask << std::dec;
+  s << ss.str();
+  return s;
+}
+}  // namespace std
+
+template <>
+struct fmt::formatter<bnxt_re_dv_qp_mem_info> {
+  constexpr auto parse(format_parse_context& ctx) -> decltype(ctx.begin()) { return ctx.end(); }
+
+  template <typename FormatContext>
+  auto format(const bnxt_re_dv_qp_mem_info& m, FormatContext& ctx) -> decltype(ctx.out()) {
+    return fmt::format_to(ctx.out(),
+                          "qp_handle: 0x{:x}  sq_va: 0x{:x}  sq_len: {}  sq_slots: {}  "
+                          "sq_wqe_sz: {}  sq_psn_sz: {}  sq_npsn: {}  rq_va: 0x{:x}  "
+                          "rq_len: {}  rq_slots: {}  rq_wqe_sz: {}  comp_mask: 0x{:x}",
+                          m.qp_handle, m.sq_va, m.sq_len, m.sq_slots, m.sq_wqe_sz, m.sq_psn_sz,
+                          m.sq_npsn, m.rq_va, m.rq_len, m.rq_slots, m.rq_wqe_sz, m.comp_mask);
+  }
+};
+#endif  // ENABLE_BNXT
 
 namespace mori {
 namespace application {
 #ifdef ENABLE_BNXT
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          BnxtCqContainer */
 /* ---------------------------------------------------------------------------------------------- */
@@ -76,6 +113,9 @@ BnxtCqContainer::BnxtCqContainer(ibv_context* context, const RdmaEndpointConfig&
   int status = bnxt_re_dv_init_obj(&dv_obj, BNXT_RE_DV_OBJ_CQ);
   assert(!status);
   cqn = dvcq.cqn;
+
+  MORI_APP_TRACE("BNXT CQ created: cqn={}, cqeNum={}, cqSize={}, cqUmemAddr=0x{:x}", cqn, cqeNum,
+                 cqSize, reinterpret_cast<uintptr_t>(cqUmemAddr));
 }
 
 BnxtCqContainer::~BnxtCqContainer() {
@@ -91,15 +131,55 @@ BnxtCqContainer::~BnxtCqContainer() {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         BnxtQpContainer                                        */
 /* ---------------------------------------------------------------------------------------------- */
+int bnxt_re_calc_dv_qp_mem_info(struct ibv_pd* ibvpd, struct ibv_qp_init_attr* attr,
+                                struct bnxt_re_dv_qp_mem_info* dv_qp_mem) {
+  struct ibv_qp_init_attr_ex attr_ex;
+  constexpr int fixed_num_slot_per_wqe = BNXT_RE_NUM_SLOT_PER_WQE;
+
+  uint32_t nwqe;
+  uint32_t max_wqesz;
+  uint32_t wqe_size;
+  uint32_t slots;
+  uint32_t psn_sz;
+  uint32_t npsn;
+  size_t sq_bytes = 0;
+  size_t rq_bytes = 0;
+
+  wqe_size = fixed_num_slot_per_wqe * BNXT_RE_SLOT_SIZE;
+  nwqe = attr->cap.max_send_wr;
+  slots = fixed_num_slot_per_wqe * nwqe;
+
+  // msn mem calc
+  npsn = RoundUpPowOfTwo(slots) / 2;
+  psn_sz = 8;
+
+  /*sq mem calc*/
+  sq_bytes = slots * BNXT_RE_SLOT_SIZE;
+  sq_bytes += npsn * psn_sz;
+  dv_qp_mem->sq_len = AlignUp(sq_bytes, 4096);
+  dv_qp_mem->sq_slots = slots;
+  dv_qp_mem->sq_wqe_sz = wqe_size;
+  dv_qp_mem->sq_npsn = npsn;
+  dv_qp_mem->sq_psn_sz = 8;
+
+  /*rq mem calc*/
+  rq_bytes = slots * BNXT_RE_SLOT_SIZE;
+  dv_qp_mem->rq_len = AlignUp(rq_bytes, 4096);
+  dv_qp_mem->rq_slots = slots;
+  dv_qp_mem->rq_wqe_sz = wqe_size;
+
+  return 0;
+}
+
 BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig& config, ibv_cq* cq,
-                                 ibv_pd* pd)
-    : context(context), config(config) {
+                                 ibv_pd* pd, BnxtDeviceContext* device_context)
+    : context(context), config(config), device_context(device_context) {
   struct ibv_qp_init_attr ib_qp_attr;
   struct bnxt_re_dv_umem_reg_attr umem_attr;
   struct bnxt_re_dv_qp_init_attr dv_qp_attr;
   int err;
 
-  uint32_t maxMsgsNum = AlignUpTo3x256Minus1(config.maxMsgsNum);
+  uint32_t maxMsgsNum = RoundUpPowOfTwoAlignUpTo256(config.maxMsgsNum);
   memset(&ib_qp_attr, 0, sizeof(struct ibv_qp_init_attr));
   ib_qp_attr.send_cq = cq;
   ib_qp_attr.recv_cq = cq;
@@ -112,7 +192,7 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   ib_qp_attr.sq_sig_all = 0;
 
   memset(&qpMemInfo, 0, sizeof(struct bnxt_re_dv_qp_mem_info));
-  err = bnxt_re_dv_qp_mem_alloc(pd, &ib_qp_attr, &qpMemInfo);
+  err = bnxt_re_calc_dv_qp_mem_info(pd, &ib_qp_attr, &qpMemInfo);
   assert(!err);
 
   // sqUmemAddr
@@ -154,7 +234,7 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   dv_qp_attr.max_inline_data = ib_qp_attr.cap.max_inline_data;
   dv_qp_attr.qp_type = ib_qp_attr.qp_type;
 
-  dv_qp_attr.qp_handle = qpMemInfo.qp_handle;
+  // dv_qp_attr.qp_handle = qpMemInfo.qp_handle;
   dv_qp_attr.sq_len = qpMemInfo.sq_len;
   dv_qp_attr.sq_slots = qpMemInfo.sq_slots;
   dv_qp_attr.sq_wqe_sz = qpMemInfo.sq_wqe_sz;
@@ -182,18 +262,84 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   qp = bnxt_re_dv_create_qp(pd, &dv_qp_attr);
   assert(qp);
   qpn = qp->qp_num;
+
+  // Allocate and register atomic internal buffer (ibuf)
+  atomicIbufSize = (RoundUpPowOfTwo(config.atomicIbufSlots) + 1) * ATOMIC_IBUF_SLOT_SIZE;
+  if (config.onGpu) {
+    HIP_RUNTIME_CHECK(hipMalloc(&atomicIbufAddr, atomicIbufSize));
+    HIP_RUNTIME_CHECK(hipMemset(atomicIbufAddr, 0, atomicIbufSize));
+  } else {
+    int status = posix_memalign(&atomicIbufAddr, config.alignment, atomicIbufSize);
+    memset(atomicIbufAddr, 0, atomicIbufSize);
+    assert(!status);
+  }
+  if (config.onGpu) {
+    HIP_RUNTIME_CHECK(
+        hipExtMallocWithFlags(&atomicIbufAddr, atomicIbufSize, hipDeviceMallocUncached));
+    HIP_RUNTIME_CHECK(hipMemset(atomicIbufAddr, 0, atomicIbufSize));
+  } else {
+    err = posix_memalign(&atomicIbufAddr, config.alignment, atomicIbufSize);
+    memset(atomicIbufAddr, 0, atomicIbufSize);
+    assert(!err);
+  }
+
+  // Register atomic ibuf as independent memory region
+  atomicIbufMr = ibv_reg_mr(pd, atomicIbufAddr, atomicIbufSize,
+                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                                IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+  assert(atomicIbufMr);
+
+  MORI_APP_TRACE(
+      "BNXT Atomic ibuf allocated: addr=0x{:x}, slots={}, size={}, lkey=0x{:x}, rkey=0x{:x}",
+      reinterpret_cast<uintptr_t>(atomicIbufAddr), RoundUpPowOfTwo(config.atomicIbufSlots),
+      atomicIbufSize, atomicIbufMr->lkey, atomicIbufMr->rkey);
+  MORI_APP_TRACE(qpMemInfo);
 }
 
 BnxtQpContainer::~BnxtQpContainer() { DestroyQueuePair(); }
 
 void BnxtQpContainer::DestroyQueuePair() {
-  if (sqUmemAddr) HIP_RUNTIME_CHECK(hipFree(sqUmemAddr));
-  if (rqUmemAddr) HIP_RUNTIME_CHECK(hipFree(rqUmemAddr));
-  if (qpDbrUmemAddr) HIP_RUNTIME_CHECK(hipFree(qpDbrUmemAddr));
+  // Clean up atomic internal buffer
+  if (atomicIbufMr) {
+    ibv_dereg_mr(atomicIbufMr);
+    atomicIbufMr = nullptr;
+  }
+  if (atomicIbufAddr) {
+    if (config.onGpu) {
+      HIP_RUNTIME_CHECK(hipFree(atomicIbufAddr));
+    } else {
+      free(atomicIbufAddr);
+    }
+    atomicIbufAddr = nullptr;
+  }
+
   if (sqUmem) bnxt_re_dv_umem_dereg(sqUmem);
   if (rqUmem) bnxt_re_dv_umem_dereg(rqUmem);
+  if (sqUmemAddr) {
+    if (config.onGpu) {
+      HIP_RUNTIME_CHECK(hipFree(sqUmemAddr));
+    } else {
+      free(sqUmemAddr);
+    }
+  }
+  if (rqUmemAddr) {
+    if (config.onGpu) {
+      HIP_RUNTIME_CHECK(hipFree(rqUmemAddr));
+    } else {
+      free(rqUmemAddr);
+    }
+  }
+  if (qpDbrUmemAddr) {
+    if (config.onGpu) {
+      HIP_RUNTIME_CHECK(hipFree(qpDbrUmemAddr));
+    } else {
+      free(qpDbrUmemAddr);
+    }
+  }
   if (qpUar) {
-    HIP_RUNTIME_CHECK(hipHostUnregister(qpUar));
+    if (config.onGpu) {
+      HIP_RUNTIME_CHECK(hipHostUnregister(qpUar));
+    }
   }
   if (qp) bnxt_re_dv_destroy_qp(qp);
 }
@@ -251,15 +397,15 @@ void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
 }
 
 void BnxtQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
-                                    const RdmaEndpointHandle& remote_handle) {
+                                    const RdmaEndpointHandle& remote_handle, uint32_t qpId) {
   struct ibv_qp_attr attr;
   int attr_mask;
 
   memset(&attr, 0, sizeof(struct ibv_qp_attr));
   attr.qp_state = IBV_QPS_RTS;
   attr.sq_psn = remote_handle.psn;
-  attr.max_rd_atomic = 1;
-  attr.timeout = 14;
+  attr.max_rd_atomic = 7;
+  attr.timeout = 20;
   attr.retry_cnt = 7;
   attr.rnr_retry = 7;
 
@@ -268,6 +414,17 @@ void BnxtQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
 
   int status = bnxt_re_dv_modify_qp(qp, &attr, attr_mask, 0, 0);
   assert(!status);
+    // Use qpId to select UDP sport value from the shared configuration (round-robin)
+  uint16_t selected_udp_sport = GetDeviceContext()->GetUdpSport(qpId);
+  MORI_APP_TRACE("QP {} using UDP sport {} (qpId={}, index={})", qpn, selected_udp_sport, qpId,
+                 qpId % RDMA_UDP_SPORT_ARRAY_SIZE);
+  status = bnxt_re_dv_modify_qp_udp_sport(qp, selected_udp_sport);
+  if (status) {
+    MORI_APP_ERROR("Failed to set UDP sport {} for QP {}: error code {}", selected_udp_sport, qpn,
+                   status);
+  }
+  assert(!status);
+  MORI_APP_TRACE("bnxt_re_dv_modify_qp_udp_sport is done, return {}", status);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -292,7 +449,7 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
 
   BnxtCqContainer* cq = new BnxtCqContainer(context, config);
 
-  BnxtQpContainer* qp = new BnxtQpContainer(context, config, cq->cq, pd);
+  BnxtQpContainer* qp = new BnxtQpContainer(context, config, cq->cq, pd, this);
   int ret;
 
   RdmaEndpoint endpoint;
@@ -333,8 +490,10 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   endpoint.wqHandle.msntblAddr = qp->GetMsntblAddress();
   endpoint.wqHandle.rqAddr = qp->GetRqAddress();
   endpoint.wqHandle.dbrAddr = qp->qpUarPtr;
-  endpoint.wqHandle.sqWqeNum = qp->qpMemInfo.sq_slots;
-  endpoint.wqHandle.rqWqeNum = qp->qpMemInfo.rq_slots;
+  assert(qp->qpMemInfo.sq_slots % BNXT_RE_NUM_SLOT_PER_WQE == 0);
+  assert(qp->qpMemInfo.rq_slots % BNXT_RE_NUM_SLOT_PER_WQE == 0);
+  endpoint.wqHandle.sqWqeNum = qp->qpMemInfo.sq_slots / BNXT_RE_NUM_SLOT_PER_WQE;
+  endpoint.wqHandle.rqWqeNum = qp->qpMemInfo.rq_slots / BNXT_RE_NUM_SLOT_PER_WQE;
   endpoint.wqHandle.msntblNum = qp->qpMemInfo.sq_npsn;
 
   endpoint.cqHandle.cqAddr = cq->cqUmemAddr;
@@ -343,14 +502,26 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   endpoint.cqHandle.cqeNum = cq->cqeNum;
   endpoint.cqHandle.cqeSize = GetBnxtCqeSize();
 
+  // Set atomic internal buffer information
+  endpoint.atomicIbuf.addr = reinterpret_cast<uintptr_t>(qp->atomicIbufAddr);
+  endpoint.atomicIbuf.lkey = qp->atomicIbufMr->lkey;
+  endpoint.atomicIbuf.rkey = qp->atomicIbufMr->rkey;
+  endpoint.atomicIbuf.nslots = RoundUpPowOfTwo(config.atomicIbufSlots);
+
   cqPool.insert({cq->cqn, cq});
   qpPool.insert({qp->qpn, qp});
+
+  MORI_APP_TRACE(
+      "BNXT endpoint created: qpn={}, cqn={}, portId={}, gidIdx={}, atomicIbuf addr=0x{:x}, "
+      "nslots={}",
+      qp->qpn, cq->cqn, config.portId, config.gidIdx, endpoint.atomicIbuf.addr,
+      endpoint.atomicIbuf.nslots);
 
   return endpoint;
 }
 
 void BnxtDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
-                                        const RdmaEndpointHandle& remote) {
+                                        const RdmaEndpointHandle& remote, uint32_t qpId) {
   uint32_t local_qpn = local.qpn;
   assert(qpPool.find(local_qpn) != qpPool.end());
   BnxtQpContainer* qp = qpPool.at(local_qpn);
@@ -359,7 +530,7 @@ void BnxtDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   const ibv_port_attr& portAttr = *(rdmaDevice->GetPortAttrMap()->find(local.portId)->second);
   qp->ModifyRst2Init();
   qp->ModifyInit2Rtr(remote, portAttr, deviceAttr);
-  qp->ModifyRtr2Rts(local, remote);
+  qp->ModifyRtr2Rts(local, remote, qpId);
 }
 
 /* ---------------------------------------------------------------------------------------------- */

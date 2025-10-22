@@ -261,14 +261,14 @@ inline __device__ uint64_t PostWriteInline<ProviderType::MLX5>(WorkQueueHandle& 
 /*                                        Atomic APIs                                             */
 /* ---------------------------------------------------------------------------------------------- */
 
-inline __device__ uint64_t mlx5PrepareAtomicWqe(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                                bool cqeSignal, uint32_t qpn, uintptr_t laddr,
-                                                uint64_t lkey, uintptr_t raddr, uint64_t rkey,
-                                                void* val_1, void* val_2, uint32_t bytes,
-                                                atomicType amo_op) {
+inline __device__ uint64_t mlx5PrepareAtomicWqe_v1(WorkQueueHandle& wq, uint32_t curPostIdx,
+                                                   bool cqeSignal, uint32_t qpn, uintptr_t laddr,
+                                                   uint64_t lkey, uintptr_t raddr, uint64_t rkey,
+                                                   void* val_1, void* val_2, uint32_t bytes,
+                                                   atomicType amo_op) {
   uint8_t signalFlag = cqeSignal ? MLX5_WQE_CTRL_CQ_UPDATE : 0x00;
-  void* queueBuffAddr = wq.rqAddr;
-  uint32_t wqeNum = wq.rqWqeNum;
+  void* queueBuffAddr = wq.sqAddr;
+  uint32_t wqeNum = wq.sqWqeNum;
 
   uint32_t numWqesPerCmd = get_num_wqes_in_atomic(amo_op, bytes);
   uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
@@ -522,6 +522,80 @@ inline __device__ uint64_t mlx5PrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
   return reinterpret_cast<uint64_t*>(wqeCtrlSeg)[0];
 }
 
+inline __device__ uint64_t mlx5PrepareAtomicWqe(WorkQueueHandle& wq, uint32_t curPostIdx,
+                                                bool cqeSignal, uint32_t qpn, uintptr_t laddr,
+                                                uint64_t lkey, uintptr_t raddr, uint64_t rkey,
+                                                void* val_1, void* val_2, uint32_t bytes,
+                                                atomicType amo_op) {
+  uint8_t signalFlag = cqeSignal ? MLX5_WQE_CTRL_CQ_UPDATE : 0x00;
+  void* queueBuffAddr = wq.sqAddr;
+  uint32_t wqeNum = wq.sqWqeNum;
+
+  uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
+  void* wqeAddr = reinterpret_cast<char*>(queueBuffAddr) + (wqeIdx << MLX5_SEND_WQE_SHIFT);
+
+  constexpr int atomicWqeSize =
+      sizeof(mlx5_wqe_ctrl_seg) + sizeof(mlx5_wqe_raddr_seg) + 2 * sizeof(mlx5_wqe_atomic_seg);
+  constexpr int numOctoWords = CeilDiv(atomicWqeSize, 16);
+  assert(numOctoWords == 4);
+
+  struct mlx5_wqe_ctrl_seg* wqeCtrlSeg = reinterpret_cast<mlx5_wqe_ctrl_seg*>(wqeAddr);
+  struct mlx5_wqe_raddr_seg* wqeRaddrSeg = reinterpret_cast<mlx5_wqe_raddr_seg*>(
+      reinterpret_cast<char*>(wqeAddr) + sizeof(mlx5_wqe_ctrl_seg));
+  struct mlx5_wqe_atomic_seg* wqeAtomicSeg = reinterpret_cast<mlx5_wqe_atomic_seg*>(
+      reinterpret_cast<char*>(wqeAddr) + sizeof(mlx5_wqe_ctrl_seg) + sizeof(mlx5_wqe_raddr_seg));
+  struct mlx5_wqe_data_seg* wqeDataSeg = reinterpret_cast<mlx5_wqe_data_seg*>(
+      reinterpret_cast<char*>(wqeAddr) + sizeof(mlx5_wqe_ctrl_seg) + sizeof(mlx5_wqe_raddr_seg) +
+      sizeof(mlx5_wqe_atomic_seg));
+
+  uint64_t data = val_1 ? *static_cast<uint64_t*>(val_1) : 0;
+  uint64_t cmp = val_2 ? *static_cast<uint64_t*>(val_2) : 0;
+
+  uint32_t opcode = MLX5_OPCODE_ATOMIC_FA;
+  switch (amo_op) {
+    case AMO_FETCH_INC:
+    case AMO_INC: {
+      opcode = MLX5_OPCODE_ATOMIC_FA;
+      data = 1;
+      break;
+    }
+    case AMO_FETCH_ADD:
+    case AMO_SIGNAL_ADD:
+    case AMO_ADD: {
+      opcode = MLX5_OPCODE_ATOMIC_FA;
+      break;
+    }
+    case AMO_FETCH: {
+      opcode = MLX5_OPCODE_ATOMIC_FA;
+      data = 0;
+      break;
+    }
+    case AMO_COMPARE_SWAP: {
+      opcode = MLX5_OPCODE_ATOMIC_CS;
+      break;
+    }
+    default: {
+      printf("Error: unsupported atomic type (%d)\n", amo_op);
+      assert(0);
+    }
+  }
+  wqeCtrlSeg->opmod_idx_opcode = HTOBE32(((curPostIdx & 0xffff) << 8) | opcode);
+  wqeCtrlSeg->qpn_ds = HTOBE32((qpn << 8) | numOctoWords);
+  wqeCtrlSeg->fm_ce_se = signalFlag;
+
+  wqeRaddrSeg->raddr = HTOBE64(raddr);
+  wqeRaddrSeg->rkey = HTOBE32(rkey);
+  wqeRaddrSeg->reserved = 0;
+
+  wqeAtomicSeg->swap_add = HTOBE64(data);
+  wqeAtomicSeg->compare = HTOBE64(cmp);
+
+  wqeDataSeg->byte_count = HTOBE32(8);
+  wqeDataSeg->addr = HTOBE64(laddr);
+  wqeDataSeg->lkey = HTOBE32(lkey);
+  return reinterpret_cast<uint64_t*>(wqeCtrlSeg)[0];
+}
+
 template <>
 inline __device__ uint64_t PostAtomic<ProviderType::MLX5>(
     WorkQueueHandle& wq, uint32_t curPostIdx, uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
@@ -691,7 +765,8 @@ inline __device__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum, 
 }
 
 template <>
-inline __device__ void UpdateCqDbrRecord<ProviderType::MLX5>(void* dbrRecAddr, uint32_t cons_idx, uint32_t cqeNum) {
+inline __device__ void UpdateCqDbrRecord<ProviderType::MLX5>(void* dbrRecAddr, uint32_t cons_idx,
+                                                             uint32_t cqeNum) {
   reinterpret_cast<uint32_t*>(dbrRecAddr)[MLX5_CQ_SET_CI] = HTOBE32(cons_idx & 0xffffff);
 }
 

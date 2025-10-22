@@ -172,7 +172,8 @@ class EpDispatchCombineHandle {
   uint8_t* scalesBuf{nullptr};
 
   // Registered buffers for tokens, shmemOutTokMemObj will be returned to user as output
-  mori::application::SymmMemObjPtr shmemInpTokMemObj;
+  mori::application::SymmMemObjPtr shmemDispatchInpTokMemObj;
+  mori::application::SymmMemObjPtr shmemCombineInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
   mori::application::SymmMemObjPtr shmemStagingTokMemObj;
 
@@ -187,6 +188,7 @@ class EpDispatchCombineHandle {
   // Record number of tokens that will be received from other PE
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
   mori::application::SymmMemObjPtr sendTokenNumMemObj;
+  mori::application::SymmMemObjPtr sendAtomicSignalMemObj;
 
   // Barrier for intra-grid synchronization
   uint32_t* dispatchGridBarrier{nullptr};
@@ -217,7 +219,7 @@ class EpDispatchCombineHandle {
   index_t* dispDestTokIdMap{nullptr};
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
-  uint32_t crossDeviceBarrierFlag{1};
+  uint32_t* crossDeviceBarrierFlag{nullptr};
 
   // Inter-node v1 kernel parameters
   // Signal the completion of inter-node token transfer
@@ -246,7 +248,8 @@ struct EpDispatchCombineArgs {
   T* outTokenBuf{nullptr};
   float* weightsBuf{nullptr};
   uint8_t* scalesBuf{nullptr};
-  mori::application::SymmMemObjPtr shmemInpTokMemObj;
+  mori::application::SymmMemObjPtr shmemDispatchInpTokMemObj;
+  mori::application::SymmMemObjPtr shmemCombineInpTokMemObj;
   mori::application::SymmMemObjPtr shmemOutTokMemObj;
   mori::application::SymmMemObjPtr shmemStagingTokMemObj;
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
@@ -257,6 +260,7 @@ struct EpDispatchCombineArgs {
   mori::application::SymmMemObjPtr shmemOutIndicesMemObj;
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
   mori::application::SymmMemObjPtr sendTokenNumMemObj;
+  mori::application::SymmMemObjPtr sendAtomicSignalMemObj;
   uint32_t* dispatchGridBarrier{nullptr};
   uint32_t* combineGridBarrier{nullptr};
   index_t* destPeTokenCounter{nullptr};
@@ -270,7 +274,7 @@ struct EpDispatchCombineArgs {
   index_t* dispDestTokIdMap{nullptr};
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
-  uint32_t crossDeviceBarrierFlag{1};
+  uint32_t* crossDeviceBarrierFlag{nullptr};
   mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
   index_t* destNodeTokenCounter{nullptr};
   mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;
@@ -297,7 +301,8 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.scalesBuf = handle.scalesBuf;
   args.destPeTokenCounter = handle.destPeTokenCounter;
   args.localPeTokenCounter = handle.localPeTokenCounter;
-  args.shmemInpTokMemObj = handle.shmemInpTokMemObj;
+  args.shmemDispatchInpTokMemObj = handle.shmemDispatchInpTokMemObj;
+  args.shmemCombineInpTokMemObj = handle.shmemCombineInpTokMemObj;
   args.shmemOutTokMemObj = handle.shmemOutTokMemObj;
   args.shmemStagingTokMemObj = handle.shmemStagingTokMemObj;
   args.shmemInpWeightsMemObj = handle.shmemInpWeightsMemObj;
@@ -308,6 +313,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.shmemOutIndicesMemObj = handle.shmemOutIndicesMemObj;
   args.recvTokenNumMemObj = handle.recvTokenNumMemObj;
   args.sendTokenNumMemObj = handle.sendTokenNumMemObj;
+  args.sendAtomicSignalMemObj = handle.sendAtomicSignalMemObj;
   args.dispatchGridBarrier = handle.dispatchGridBarrier;
   args.combineGridBarrier = handle.combineGridBarrier;
   args.dispReceiverIdxMap = handle.dispReceiverIdxMap;

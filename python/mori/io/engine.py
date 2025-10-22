@@ -160,7 +160,7 @@ class IOEngine:
         sizes,
         transfer_uid,
     ):
-        transfer_status = mori_cpp.TransferStatus()
+        transfer_status = [mori_cpp.TransferStatus() for _ in range(len(sizes))]
         func(
             local_dest_mem_desc,
             local_offsets,

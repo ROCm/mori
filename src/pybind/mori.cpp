@@ -173,10 +173,10 @@ torch::Tensor GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle&
   return tensor;
 }
 
-torch::Tensor GetRegisteredInputBuffer(mori::moe::EpDispatchCombineHandle& handle,
-                                       at::ScalarType scalarType) {
+torch::Tensor GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle& handle,
+                                              at::ScalarType scalarType) {
   torch::Tensor out =
-      torch::from_blob(handle.shmemInpTokMemObj->Get(),
+      torch::from_blob(handle.shmemCombineInpTokMemObj->Get(),
                        {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
                        torch::TensorOptions().dtype(scalarType).device(torch::kCUDA));
   return out;
@@ -209,8 +209,8 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   funcName = std::string("get_dispatch_receiver_token_idx_map");
   m.def(funcName.c_str(), &GetDispatchReceiverTokenIdxMap);
 
-  funcName = std::string("get_registered_input_buffer");
-  m.def(funcName.c_str(), &GetRegisteredInputBuffer);
+  funcName = std::string("get_registered_combine_input_buffer");
+  m.def(funcName.c_str(), &GetRegisteredCombineInputBuffer);
 }
 
 }  // namespace

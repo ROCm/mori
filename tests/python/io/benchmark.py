@@ -63,6 +63,18 @@ def parse_args():
         help="Run sizes from 8 till 2^20",
     )
     parser.add_argument(
+        "--sweep-start-size",
+        type=int,
+        default=8,
+        help="Starting message size when using --all sweep (default: 8)",
+    )
+    parser.add_argument(
+        "--sweep-max-size",
+        type=int,
+        default=2**20,
+        help="Maximum message size when using --all sweep (default: 2**20)",
+    )
+    parser.add_argument(
         "--all-batch",
         action="store_true",
         help="Run batch sizes from 8 to 32768",
@@ -157,6 +169,8 @@ class MoriIoBenchmark:
         iters: int = 128,
         sweep: bool = False,
         sweep_batch: bool = False,
+        sweep_start_size: int = 8,
+        sweep_max_size: int = 2**20,
     ):
         self.op_type = op_type
         self.host = host
@@ -178,6 +192,17 @@ class MoriIoBenchmark:
         self.iters = iters
         self.sweep = sweep
         self.sweep_batch = sweep_batch
+        self.sweep_start_size = sweep_start_size
+        self.sweep_max_size = sweep_max_size
+
+        if self.sweep:
+            # basic validation
+            if self.sweep_start_size <= 0 or self.sweep_max_size <= 0:
+                raise ValueError("Sweep sizes must be positive integers")
+            if self.sweep_start_size > self.sweep_max_size:
+                raise ValueError(
+                    f"start-buffer-size ({self.sweep_start_size}) should not exceed max-buffer-size ({self.sweep_max_size})"
+                )
 
         self.world_size = self.num_initiator_dev + self.num_target_dev
         if self.node_rank == 0:
@@ -353,6 +378,8 @@ class MoriIoBenchmark:
                     sizes,
                     transfer_uid,
                 )
+                st = time.time()
+                transfer_status = func(*args)
 
             else:
                 func = (
@@ -361,15 +388,15 @@ class MoriIoBenchmark:
                     else self.engine.batch_write
                 )
                 args = (
-                    self.mem,
-                    offsets,
-                    self.target_mem,
-                    offsets,
-                    sizes,
-                    transfer_uid,
+                    [self.mem],
+                    [offsets],
+                    [self.target_mem],
+                    [offsets],
+                    [sizes],
+                    [transfer_uid],
                 )
-            st = time.time()
-            transfer_status = func(*args)
+                st = time.time()
+                transfer_status = func(*args)[0]
             transfer_status.Wait()
             duration = time.time() - st
             assert transfer_status.Succeeded()
@@ -441,8 +468,8 @@ class MoriIoBenchmark:
             )
 
             if self.sweep:
-                cur_size = 2**3
-                max_size = 2**20
+                cur_size = self.sweep_start_size
+                max_size = self.sweep_max_size
                 while cur_size <= max_size:
                     dist.barrier()
                     total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
@@ -508,7 +535,7 @@ def benchmark_engine(local_rank, node_rank, args):
     set_log_level(args.log_level)
     max_buffer_size = args.buffer_size
     if args.all:
-        max_buffer_size = max(max_buffer_size, 2**20)
+        max_buffer_size = max(max_buffer_size, args.sweep_max_size)
     max_transfer_batch_size = args.transfer_batch_size
     if args.all_batch:
         max_transfer_batch_size = max(max_transfer_batch_size, 2**15)
@@ -530,6 +557,8 @@ def benchmark_engine(local_rank, node_rank, args):
         iters=args.iters,
         sweep=args.all,
         sweep_batch=args.all_batch,
+        sweep_start_size=args.sweep_start_size,
+        sweep_max_size=args.sweep_max_size,
     )
     bench.print_config()
     bench.run()
@@ -537,6 +566,13 @@ def benchmark_engine(local_rank, node_rank, args):
 
 def benchmark():
     args = parse_args()
+    if args.all:
+        if args.sweep_start_size > args.sweep_max_size:
+            raise ValueError(
+                f"--start-buffer-size ({args.sweep_start_size}) must be <= --max-buffer-size ({args.sweep_max_size})"
+            )
+        if args.sweep_start_size <= 0 or args.sweep_max_size <= 0:
+            raise ValueError("Sweep sizes must be positive integers")
     num_node = int(os.environ["WORLD_SIZE"])
     assert num_node == 2
     node_rank = int(os.environ["RANK"])

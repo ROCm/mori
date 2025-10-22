@@ -72,7 +72,10 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
                              (config.hiddenDim * config.maxTokenTypeSize +
                               (sizeof(float) + sizeof(index_t)) * config.numExpertPerToken +
                               config.scaleDim * config.scaleTypeSize);
-  shmemInpTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
+  shmemDispatchInpTokMemObj =
+      ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
+  shmemCombineInpTokMemObj =
+      ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
   shmemOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
   shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
 
@@ -92,7 +95,8 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
 }
 
 void EpDispatchCombineHandle::FinalizeShmemBuf() {
-  ShmemFree(shmemInpTokMemObj->localPtr);
+  ShmemFree(shmemDispatchInpTokMemObj->localPtr);
+  ShmemFree(shmemCombineInpTokMemObj->localPtr);
   ShmemFree(shmemOutTokMemObj->localPtr);
   ShmemFree(shmemStagingTokMemObj->localPtr);
   ShmemFree(shmemInpWeightsMemObj->localPtr);
@@ -107,6 +111,9 @@ void EpDispatchCombineHandle::InitializeTokenNumSignalBuf() {
   size_t tokenNumSignalSize = config.worldSize * sizeof(index_t) * 2;
   recvTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
   sendTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
+  // The extra *2 is for the laddr.
+  sendAtomicSignalMemObj = ShmemMallocAndReturnMemObjPtr(
+      (config.worldSize * 2) * sizeof(int64_t) * 2, hipDeviceMallocUncached);
 
   HIP_RUNTIME_CHECK(
       hipExtMallocWithFlags((void**)&totalRecvTokenNum, sizeof(index_t), hipDeviceMallocUncached));
@@ -120,6 +127,7 @@ void EpDispatchCombineHandle::InitializeTokenNumSignalBuf() {
 void EpDispatchCombineHandle::FinalizeTokenNumSignalBuf() {
   ShmemFree(recvTokenNumMemObj->localPtr);
   ShmemFree(sendTokenNumMemObj->localPtr);
+  ShmemFree(sendAtomicSignalMemObj->localPtr);
   ShmemFree(nodeRecvTokenNumMemObj->localPtr);
   HIP_RUNTIME_CHECK(hipFree(totalRecvTokenNum));
 }
@@ -206,7 +214,10 @@ void EpDispatchCombineHandle::InitializeBarrier() {
   HIP_RUNTIME_CHECK(
       hipExtMallocWithFlags((void**)&combineGridBarrier, barrierSize, hipDeviceMallocUncached));
   HIP_RUNTIME_CHECK(hipMemset(combineGridBarrier, 0, barrierSize));
-  crossDeviceBarrierMemObj = ShmemMallocAndReturnMemObjPtr(barrierSize, hipDeviceMallocUncached);
+  HIP_RUNTIME_CHECK(hipMalloc(&crossDeviceBarrierFlag, sizeof(uint32_t)));
+  HIP_RUNTIME_CHECK(hipMemsetD32(crossDeviceBarrierFlag, 1, 1));
+  crossDeviceBarrierMemObj = ShmemMallocAndReturnMemObjPtr(
+      barrierSize * 2 * sizeof(uint64_t) / sizeof(uint32_t), hipDeviceMallocUncached);
 
   // We allocate one flag for each token, this ensure that we can use all chunk size(>=1)
   size_t interNodeChunkFlagSize =
@@ -226,6 +237,7 @@ void EpDispatchCombineHandle::InitializeBarrier() {
 void EpDispatchCombineHandle::FinalizeBarrier() {
   HIP_RUNTIME_CHECK(hipFree(dispatchGridBarrier));
   HIP_RUNTIME_CHECK(hipFree(combineGridBarrier));
+  HIP_RUNTIME_CHECK(hipFree(crossDeviceBarrierFlag));
   HIP_RUNTIME_CHECK(hipFree(interNodeChunkFlagCombine));
   HIP_RUNTIME_CHECK(hipFree(interNodeBlocksBarrier));
   ShmemFree(crossDeviceBarrierMemObj->localPtr);
@@ -313,7 +325,8 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
       argsVariant);
 }
 
-void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) { crossDeviceBarrierFlag++; }
+// no need for a separate reset kernel now
+void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) { ; }
 
 }  // namespace moe
 }  // namespace mori

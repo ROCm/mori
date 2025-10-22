@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.19)
 
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+set(CMAKE_CXX_FLAGS_O3DEBUG "-ggdb -O3")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -55,7 +56,16 @@ if(USE_ROCM)
   project(mori LANGUAGES HIP CXX C)
   # set(CMAKE_CXX_COMPILER /opt/rocm/bin/hipcc)
   find_package(hip REQUIRED)
-  add_compile_options(--save-temps)
+
+  if(DEFINED GPU_TARGETS)
+    list(GET GPU_TARGETS 0 GPU_ARCH)
+    message(STATUS "GPU ARCH: ${GPU_ARCH}")
+    if(GPU_ARCH MATCHES "^gfx8")
+      add_definitions(-D__GFX8__=1)
+    elseif(GPU_ARCH MATCHES "^gfx9")
+      add_definitions(-D__GFX9__=1)
+    endif()
+  endif()
 else()
   set(CUDA_HOME /usr/local/cuda)
   message(STATUS "CUDA_HOME: ${CUDA_HOME}")
@@ -74,6 +84,12 @@ else()
   find_package(CUDAToolkit REQUIRED)
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -expt-relaxed-constexpr")
 endif()
+
+add_library(mori_logging INTERFACE)
+target_include_directories(mori_logging INTERFACE 
+    include 
+    3rdparty/spdlog/include)
+
 
 if(BUILD_EXAMPLES)
   set(BUILD_APPLICATION ON)
