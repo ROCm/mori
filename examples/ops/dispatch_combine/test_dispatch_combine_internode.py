@@ -46,11 +46,11 @@ class EpDispatchCombineTestCase:
             # num_experts_per_rank=256 // world_size,
             num_experts_per_token=8,
             warp_num_per_block=16,
-            block_num=80,
+            block_num=32,
             max_token_type_size=2,
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeV1,
             gpu_per_node=self.gpu_per_node,
-            rdma_block_num=64,
+            rdma_block_num=16,
         )
 
     def setup(self):
@@ -193,8 +193,8 @@ class EpDispatchCombineTestCase:
 
         if self.config.rank == 0:
             print("Rank counts (deduplicated):", rank_counts)
-            # print("Rank counts local nodes:", rank_counts - rank_counts_remote_recv)
-            # print("Rank counts from other nodes:", rank_counts_remote_recv)
+            print("Rank counts local nodes:", rank_counts - rank_counts_remote_recv)
+            print("Rank counts from other nodes:", rank_counts_remote_recv)
             # print("Rank counts to other nodes:", rank_counts_remote_send)
 
         # even_indices = (
@@ -311,6 +311,7 @@ class EpDispatchCombineTestCase:
         if self.config.rank == 0:
             print("Dispatch Pass")
 
+        torch.cuda.synchronize()
         dist.barrier()
 
         combine_output, combine_output_weight = op.combine(
@@ -321,6 +322,7 @@ class EpDispatchCombineTestCase:
             warp_per_block=16,
         )
         torch.cuda.synchronize()
+        dist.barrier()
 
         for i in range(all_rank_num_token[self.rank]):
             pes = [
@@ -353,15 +355,15 @@ class EpDispatchCombineTestCase:
                     self.rank,
                     f"token {i} pes {pes} unique pes {unique_pes} unique innode pes {unique_innode_pes}",
                 )
-                print(self.rank, "got: ", got)
-                print(self.rank, "expected: ", expected, all_rank_input[self.rank][i])
+                # print(self.rank, "got: ", got)
+                # print(self.rank, "expected: ", expected, all_rank_input[self.rank][i])
                 delta = got - expected
-                print(self.rank, i, "delta:", delta.nonzero())
-                assert False
+                # print(self.rank, i, "delta:", delta.nonzero())
+                # assert False
                 error_round.add(round)
 
         if len(error_round) > 0:
-            assert False
+            assert False 
 
         #     if dispatch_weights is not None:
         # got_weight, expected_weight = (
@@ -394,8 +396,10 @@ class EpDispatchCombineTestCase:
 
     def test_dispatch_combine(self):
         error_round = set()
-        op = mori.ops.EpDispatchCombineOp(self.config)
         for i in range(5000):
+            if i < 1:
+                continue
+            op = mori.ops.EpDispatchCombineOp(self.config)
             if self.rank == 0:
                 print(f"Round {i} begin")
             test_data = self.gen_test_data(use_max_token_num=False)

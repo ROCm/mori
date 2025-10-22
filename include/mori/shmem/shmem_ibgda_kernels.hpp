@@ -374,13 +374,11 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
 }
 
 template <core::ProviderType PrvdType>
-inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMemObjPtr dest,
-                                                      size_t destOffset,
-                                                      const application::RdmaMemoryRegion& source,
-                                                      size_t sourceOffset, size_t bytes,
-                                                      const application::SymmMemObjPtr signal,
-                                                      size_t signalOffset, void* signalVal,
-                                                      size_t signalBytes, int pe) {
+inline __device__ void ShmemPutMemNbiThreadKernelImpl(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signal, size_t signalOffset, void* signalVal,
+    size_t signalBytes, const application::SymmMemObjPtr atomic, int pe) {
   if (bytes == 0) return;
   uintptr_t laddr = source.addr + sourceOffset;
   uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
@@ -438,7 +436,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
     uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
     uint64_t num_entries_until_warp_last_entry;
     if constexpr (PrvdType == core::ProviderType::MLX5) {
-      num_entries_until_warp_last_entry = warp_sq_counter + 1 + num_active_lanes - db_touched;
+      num_entries_until_warp_last_entry = warp_sq_counter + num_wqes - db_touched;
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
       num_entries_until_warp_last_entry =
           warp_sq_counter + num_active_lanes * BNXT_RE_NUM_SLOT_PER_WQE - db_touched;
@@ -456,7 +454,19 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
     dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, false,
                                         ep[pe].handle.qpn, laddr, source.lkey, raddr, rkey, bytes);
     if (is_leader) {
-      uint64_t signal_sq_counter = warp_sq_counter + num_wqes - 1;
+      // int rank = GetGlobalGpuStatesPtr()->rank;
+      // uint64_t atomic_sq_counter = my_sq_counter + 1;
+      // uintptr_t atomic_raddr = atomic->peerPtrs[pe];
+      // uintptr_t atomic_rkey = atomic->peerRkeys[pe];
+      // wq->outstandingWqe[atomic_sq_counter % OUTSTANDING_TABLE_SIZE] = atomic_sq_counter;
+      // uint64_t val = 0;
+      // dbr_val = core::PostAtomic<PrvdType>(*wq, atomic_sq_counter, atomic_sq_counter,
+      //                                      atomic_sq_counter, false, ep[pe].handle.qpn,
+      //                                      atomic->GetRdmaMemoryRegion(rank).addr,
+      //                                      atomic->GetRdmaMemoryRegion(rank).lkey, atomic_raddr,
+      //                                      atomic_rkey, &val, &val, 8, core::AMO_ADD);
+      // uint64_t signal_sq_counter = warp_sq_counter + num_wqes - 1;
+      uint64_t signal_sq_counter = my_sq_counter + 1;
       uintptr_t signal_raddr = signal->peerPtrs[pe] + signalOffset;
       uintptr_t signal_rkey = signal->peerRkeys[pe];
       wq->outstandingWqe[signal_sq_counter % OUTSTANDING_TABLE_SIZE] = signal_sq_counter;
