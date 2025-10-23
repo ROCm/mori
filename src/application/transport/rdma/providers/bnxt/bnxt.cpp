@@ -472,8 +472,7 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   void* uar_host = (void*)dbrAttr.dbr;
   void* uar_dev = uar_host;
   if (config.onGpu) {
-    constexpr uint32_t flag =
-        hipHostRegisterPortable | hipHostRegisterMapped | hipHostRegisterIoMemory;
+    constexpr uint32_t flag = hipHostRegisterPortable | hipHostRegisterMapped;
 
     HIP_RUNTIME_CHECK(hipHostRegister(uar_host, getpagesize(), flag));
     HIP_RUNTIME_CHECK(hipHostGetDevicePointer(&uar_dev, uar_host, 0));
