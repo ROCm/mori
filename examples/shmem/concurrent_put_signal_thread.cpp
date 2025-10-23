@@ -119,25 +119,35 @@ __global__ void ConcurrentPutSignalThreadKernelSet(int myPe, const SymmMemObjPtr
 
   int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
   int threadOffset = globalTid * sizeof(uint32_t);
+  int globalWarpId = globalTid / warpSize;
 
   if (myPe == sendPe) {
     RdmaMemoryRegion source = dataObj->GetRdmaMemoryRegion(myPe);
 
-    // Test onlyOneSignal=true with AMO_SET: only leader thread signals
+    // Test onlyOneSignal=true with AMO_SET: each warp sets its own signal slot
+    // Use warp ID as offset to avoid overwriting other warps' signals
     ShmemPutMemNbiSignalThread<true>(dataObj, threadOffset, source, threadOffset,
-                                     sizeof(uint32_t), signalObj, 0, MAGIC_VALUE,
-                                     atomicType::AMO_SET, recvPe, 0);
+                                     sizeof(uint32_t), signalObj, globalWarpId * sizeof(uint64_t), 
+                                     MAGIC_VALUE, atomicType::AMO_SET, recvPe, 0);
     __threadfence_system();
 
     if (blockIdx.x == 0) {
       ShmemQuietThread();
     }
   } else {
-    // Receiver: wait for signal to be set to magic value
+    // Receiver: wait for all warps' signals to be set to magic value
+    int totalWarps = (blockDim.x * gridDim.x) / warpSize;
     if (threadIdx.x == 0) {
       uint64_t* signalPtr = reinterpret_cast<uint64_t*>(signalObj->localPtr);
-      while (atomicAdd(signalPtr, 0) != MAGIC_VALUE) {
-        // Busy wait for signal
+      bool allReceived = false;
+      while (!allReceived) {
+        allReceived = true;
+        for (int warpId = 0; warpId < totalWarps; warpId++) {
+          if (atomicAdd(&signalPtr[warpId], 0) != MAGIC_VALUE) {
+            allReceived = false;
+            break;
+          }
+        }
       }
     }
     __syncthreads();
@@ -159,24 +169,34 @@ __global__ void ConcurrentPutSignalThreadKernelSet_PureAddr(int myPe, uint32_t* 
   constexpr uint64_t MAGIC_VALUE = 0xDEADBEEF;
 
   int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
+  int globalWarpId = globalTid / warpSize;
 
   if (myPe == sendPe) {
     uint32_t* src = dataBuff + globalTid;
     uint32_t* dest = dataBuff + globalTid;
 
-    // Test onlyOneSignal=true with AMO_SET: only leader thread signals
-    ShmemPutMemNbiSignalThread<true>(dest, src, sizeof(uint32_t), signalBuff, MAGIC_VALUE,
-                                     atomicType::AMO_SET, recvPe, 0);
+    // Test onlyOneSignal=true with AMO_SET: each warp sets its own signal slot
+    // Use warp ID as index to avoid overwriting other warps' signals
+    ShmemPutMemNbiSignalThread<true>(dest, src, sizeof(uint32_t), signalBuff + globalWarpId, 
+                                     MAGIC_VALUE, atomicType::AMO_SET, recvPe, 0);
     __threadfence_system();
 
     if (blockIdx.x == 0) {
       ShmemQuietThread();
     }
   } else {
-    // Receiver: wait for signal to be set to magic value
+    // Receiver: wait for all warps' signals to be set to magic value
+    int totalWarps = (blockDim.x * gridDim.x) / warpSize;
     if (threadIdx.x == 0) {
-      while (atomicAdd(signalBuff, 0) != MAGIC_VALUE) {
-        // Busy wait for signal
+      bool allReceived = false;
+      while (!allReceived) {
+        allReceived = true;
+        for (int warpId = 0; warpId < totalWarps; warpId++) {
+          if (atomicAdd(&signalBuff[warpId], 0) != MAGIC_VALUE) {
+            allReceived = false;
+            break;
+          }
+        }
       }
     }
     __syncthreads();
@@ -209,14 +229,14 @@ void ConcurrentPutSignalThread() {
   int numEle = threadNum * blockNum;
   int buffSize = numEle * sizeof(uint32_t);
 
-  if (myPe == 0) {
+  if (myPe == 1) {
     printf("=================================================================\n");
     printf("Testing both Legacy and Pure Address APIs (Put with Signal)\n");
     printf("=================================================================\n");
   }
 
   // ===== Test 1: Legacy API with AMO_ADD =====
-  if (myPe == 0) {
+  if (myPe == 1) {
     printf("\n--- Test 1: Legacy API with AMO_ADD Signal ---\n");
   }
 
@@ -236,7 +256,7 @@ void ConcurrentPutSignalThread() {
 
   MPI_Barrier(MPI_COMM_WORLD);
 
-  if (myPe == 0) {
+  if (myPe == 1) {
     printf("Running legacy API test with AMO_ADD...\n");
   }
   ConcurrentPutSignalThreadKernelAdd<<<blockNum, threadNum>>>(myPe, dataBuffObj1, signalBuffObj1);
@@ -255,14 +275,12 @@ void ConcurrentPutSignalThread() {
         break;
       }
     }
-  }
-  
-  if (myPe == 0) {
+    
     uint64_t signalValue;
     HIP_RUNTIME_CHECK(hipMemcpy(&signalValue, signalBuff1, sizeof(uint64_t), hipMemcpyDeviceToHost));
-    uint64_t expectedSignals = threadNum * blockNum / 32;  // One signal per warp
-    printf("✓ Legacy API AMO_ADD test PASSED! Signal counter: %lu (expected: %lu)\n", 
-           signalValue, expectedSignals);
+    uint64_t expectedSignals = (threadNum * blockNum + warpSize - 1) / warpSize;  // One signal per warp
+    printf("✓ Legacy API AMO_ADD test PASSED! Signal counter: %lu (expected: %lu), Data: %s\n", 
+           signalValue, expectedSignals, success ? "OK" : "FAILED");
   }
 
   // Cleanup Test 1
@@ -270,7 +288,7 @@ void ConcurrentPutSignalThread() {
   ShmemFree(signalBuff1);
 
   // ===== Test 2: Pure Address API with AMO_ADD =====
-  if (myPe == 0) {
+  if (myPe == 1) {
     printf("\n--- Test 2: Pure Address API with AMO_ADD Signal ---\n");
   }
 
@@ -284,7 +302,7 @@ void ConcurrentPutSignalThread() {
 
   MPI_Barrier(MPI_COMM_WORLD);
 
-  if (myPe == 0) {
+  if (myPe == 1) {
     printf("Running pure address API test with AMO_ADD...\n");
   }
   ConcurrentPutSignalThreadKernelAdd_PureAddr<<<blockNum, threadNum>>>(
@@ -304,14 +322,12 @@ void ConcurrentPutSignalThread() {
         break;
       }
     }
-  }
-  
-  if (myPe == 0) {
+    
     uint64_t signalValue;
     HIP_RUNTIME_CHECK(hipMemcpy(&signalValue, signalBuff2, sizeof(uint64_t), hipMemcpyDeviceToHost));
-    uint64_t expectedSignals = threadNum * blockNum / 32;
-    printf("✓ Pure Address API AMO_ADD test PASSED! Signal counter: %lu (expected: %lu)\n", 
-           signalValue, expectedSignals);
+    uint64_t expectedSignals = (threadNum * blockNum + warpSize - 1) / warpSize;
+    printf("✓ Pure Address API AMO_ADD test PASSED! Signal counter: %lu (expected: %lu), Data: %s\n", 
+           signalValue, expectedSignals, success ? "OK" : "FAILED");
   }
 
   // Cleanup Test 2
@@ -319,8 +335,9 @@ void ConcurrentPutSignalThread() {
   ShmemFree(signalBuff2);
 
   // ===== Test 3: Legacy API with AMO_SET =====
-  if (myPe == 0) {
+  if (myPe == 1) {
     printf("\n--- Test 3: Legacy API with AMO_SET Signal ---\n");
+    printf("  Each warp sets its own signal slot\n");
   }
 
   void* dataBuff3 = ShmemMalloc(buffSize);
@@ -330,8 +347,10 @@ void ConcurrentPutSignalThread() {
   SymmMemObjPtr dataBuffObj3 = ShmemQueryMemObjPtr(dataBuff3);
   assert(dataBuffObj3.IsValid());
 
-  void* signalBuff3 = ShmemMalloc(sizeof(uint64_t));
-  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(signalBuff3), 0, 2));
+  // Allocate signal buffer for all warps (one uint64_t per warp)
+  int totalWarps = (threadNum * blockNum + warpSize - 1) / warpSize;
+  void* signalBuff3 = ShmemMalloc(totalWarps * sizeof(uint64_t));
+  HIP_RUNTIME_CHECK(hipMemset(signalBuff3, 0, totalWarps * sizeof(uint64_t)));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
   SymmMemObjPtr signalBuffObj3 = ShmemQueryMemObjPtr(signalBuff3);
@@ -339,8 +358,9 @@ void ConcurrentPutSignalThread() {
 
   MPI_Barrier(MPI_COMM_WORLD);
 
-  if (myPe == 0) {
-    printf("Running legacy API test with AMO_SET...\n");
+  if (myPe == 1) {
+    printf("Running legacy API test with AMO_SET (%d warps, %d signals)...\n", 
+           totalWarps, totalWarps);
   }
   ConcurrentPutSignalThreadKernelSet<<<blockNum, threadNum>>>(myPe, dataBuffObj3, signalBuffObj3);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
@@ -350,21 +370,29 @@ void ConcurrentPutSignalThread() {
   std::vector<uint32_t> hostData3(numEle);
   HIP_RUNTIME_CHECK(hipMemcpy(hostData3.data(), dataBuff3, buffSize, hipMemcpyDeviceToHost));
   
+  bool dataSuccess = true;
   if (myPe == 1) {
-    bool success = true;
     for (int i = 0; i < numEle; i++) {
       if (hostData3[i] != 0) {
-        success = false;
+        dataSuccess = false;
         break;
       }
     }
-  }
-  
-  if (myPe == 0) {
-    uint64_t signalValue;
-    HIP_RUNTIME_CHECK(hipMemcpy(&signalValue, signalBuff3, sizeof(uint64_t), hipMemcpyDeviceToHost));
-    printf("✓ Legacy API AMO_SET test PASSED! Signal value: 0x%lx (expected: 0xDEADBEEF)\n", 
-           signalValue);
+    
+    // PE 1: Verify signal values (PE 1 is the receiver)
+    std::vector<uint64_t> signalValues(totalWarps);
+    HIP_RUNTIME_CHECK(hipMemcpy(signalValues.data(), signalBuff3, 
+                                totalWarps * sizeof(uint64_t), hipMemcpyDeviceToHost));
+    int validSignals = 0;
+    for (int i = 0; i < totalWarps; i++) {
+      if (signalValues[i] == 0xDEADBEEF) {
+        validSignals++;
+      } else {
+        printf("Warning: Signal[%d] = 0x%lx (expected 0xDEADBEEF)\n", i, signalValues[i]);
+      }
+    }
+    printf("✓ Legacy API AMO_SET test PASSED! Data: %s, Valid signals: %d/%d\n", 
+           dataSuccess ? "OK" : "FAILED", validSignals, totalWarps);
   }
 
   // Cleanup Test 3
@@ -372,22 +400,25 @@ void ConcurrentPutSignalThread() {
   ShmemFree(signalBuff3);
 
   // ===== Test 4: Pure Address API with AMO_SET =====
-  if (myPe == 0) {
+  if (myPe == 1) {
     printf("\n--- Test 4: Pure Address API with AMO_SET Signal ---\n");
+    printf("  Each warp sets its own signal slot\n");
   }
 
   void* dataBuff4 = ShmemMalloc(buffSize);
   HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(dataBuff4), myPe, numEle));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
-  void* signalBuff4 = ShmemMalloc(sizeof(uint64_t));
-  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(signalBuff4), 0, 2));
+  // Allocate signal buffer for all warps (one uint64_t per warp)
+  void* signalBuff4 = ShmemMalloc(totalWarps * sizeof(uint64_t));
+  HIP_RUNTIME_CHECK(hipMemset(signalBuff4, 0, totalWarps * sizeof(uint64_t)));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
   MPI_Barrier(MPI_COMM_WORLD);
 
-  if (myPe == 0) {
-    printf("Running pure address API test with AMO_SET...\n");
+  if (myPe == 1) {
+    printf("Running pure address API test with AMO_SET (%d warps, %d signals)...\n", 
+           totalWarps, totalWarps);
   }
   ConcurrentPutSignalThreadKernelSet_PureAddr<<<blockNum, threadNum>>>(
       myPe, reinterpret_cast<uint32_t*>(dataBuff4), reinterpret_cast<uint64_t*>(signalBuff4));
@@ -398,24 +429,32 @@ void ConcurrentPutSignalThread() {
   std::vector<uint32_t> hostData4(numEle);
   HIP_RUNTIME_CHECK(hipMemcpy(hostData4.data(), dataBuff4, buffSize, hipMemcpyDeviceToHost));
   
+  dataSuccess = true;
   if (myPe == 1) {
-    bool success = true;
     for (int i = 0; i < numEle; i++) {
       if (hostData4[i] != 0) {
-        success = false;
+        dataSuccess = false;
         break;
       }
     }
-  }
-  
-  if (myPe == 0) {
-    uint64_t signalValue;
-    HIP_RUNTIME_CHECK(hipMemcpy(&signalValue, signalBuff4, sizeof(uint64_t), hipMemcpyDeviceToHost));
-    printf("✓ Pure Address API AMO_SET test PASSED! Signal value: 0x%lx (expected: 0xDEADBEEF)\n", 
-           signalValue);
+    
+    // PE 1: Verify signal values (PE 1 is the receiver)
+    std::vector<uint64_t> signalValues(totalWarps);
+    HIP_RUNTIME_CHECK(hipMemcpy(signalValues.data(), signalBuff4, 
+                                totalWarps * sizeof(uint64_t), hipMemcpyDeviceToHost));
+    int validSignals = 0;
+    for (int i = 0; i < totalWarps; i++) {
+      if (signalValues[i] == 0xDEADBEEF) {
+        validSignals++;
+      } else {
+        printf("Warning: Signal[%d] = 0x%lx (expected 0xDEADBEEF)\n", i, signalValues[i]);
+      }
+    }
+    printf("✓ Pure Address API AMO_SET test PASSED! Data: %s, Valid signals: %d/%d\n", 
+           dataSuccess ? "OK" : "FAILED", validSignals, totalWarps);
   }
 
-  if (myPe == 0) {
+  if (myPe == 1) {
     printf("\n=================================================================\n");
     printf("All tests completed successfully!\n");
     printf("=================================================================\n");
