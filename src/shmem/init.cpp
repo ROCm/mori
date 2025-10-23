@@ -75,11 +75,16 @@ void MemoryStatesInit() {
 
   states->memoryStates->staticHeapBasePtr = heapObj.cpu->localPtr;
   states->memoryStates->staticHeapSize = heapSize;
-  states->memoryStates->staticHeapUsed = 0;
+  // IMPORTANT: Start with a small offset to avoid collision between heap base address
+  // and first ShmemMalloc allocation. Without this, when staticHeapUsed == 0,
+  // the first ShmemMalloc would return staticHeapBasePtr, which is the same address
+  // as the heap itself in memObjPool, causing the heap's SymmMemObj to be overwritten.
+  constexpr size_t HEAP_INITIAL_OFFSET = 256;
+  states->memoryStates->staticHeapUsed = HEAP_INITIAL_OFFSET;
   states->memoryStates->staticHeapObj = heapObj;
 
-  MORI_SHMEM_INFO("Static symmetric heap allocated at {} (local), size {} bytes",
-                  states->memoryStates->staticHeapBasePtr, heapSize);
+  MORI_SHMEM_INFO("Static symmetric heap allocated at {} (local), size {} bytes, initial offset {} bytes",
+                  states->memoryStates->staticHeapBasePtr, heapSize, HEAP_INITIAL_OFFSET);
 }
 
 void GpuStateInit() {
