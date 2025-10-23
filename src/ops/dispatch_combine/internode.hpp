@@ -297,10 +297,10 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
     size_t localTokenOffset = size_t(localTokenIdx) * size_t(config.hiddenDim) * sizeof(T);
     size_t peSortedTokenOffset = size_t(peSortedId) * stagingOffset;
 
-    core::WarpCopy(args.shmemOutTokMemObj->template GetAs<char*>() + localTokenOffset,
+    core::WarpCopy(args.shmemDispatchOutTokMemObj->template GetAs<char*>() + localTokenOffset,
                    args.shmemDispatchInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset,
                    config.hiddenDim * sizeof(T));
-    core::WarpCopy(args.shmemOutWeightsMemObj->template GetAs<char*>() +
+    core::WarpCopy(args.shmemDispatchOutWeightsMemObj->template GetAs<char*>() +
                        localTokenIdx * config.numExpertPerToken * sizeof(float),
                    args.shmemDispatchInpTokMemObj->template GetAs<char*>() + peSortedTokenOffset +
                        weightOffset,
@@ -348,7 +348,8 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
     shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
   }
 
-  volatile uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<volatile uint64_t*>();
+  volatile uint64_t* localBarrierPtr =
+      args.crossDeviceBarrierMemObj->template GetAs<volatile uint64_t*>();
   if (thdId < args.config.worldSize) {
     uint64_t currentVal = core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId);
 #if DEBUG == 1
@@ -551,13 +552,14 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
     }
 
     size_t offset = size_t(tokenId) * size_t(config.hiddenDim) + hiddenDimOffset;
-    core::WarpAccum<T, 8>(args.shmemOutTokMemObj->template GetAs<T*>() + offset, srcPtrs, nullptr,
-                          config.numExpertPerToken, hiddenDimSize);
+    core::WarpAccum<T, 8>(args.shmemCombineOutTokMemObj->template GetAs<T*>() + offset, srcPtrs,
+                          nullptr, config.numExpertPerToken, hiddenDimSize);
 
     if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
-      core::WarpAccum<float, 4>(
-          args.shmemOutWeightsMemObj->template GetAs<float*>() + tokenId * config.numExpertPerToken,
-          srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
+      core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
+                                    tokenId * config.numExpertPerToken,
+                                srcWeightsPtr, nullptr, config.numExpertPerToken,
+                                config.numExpertPerToken);
     }
   }
   if (globalThdId == 0) {

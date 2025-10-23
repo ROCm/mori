@@ -122,7 +122,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       // Write weights and indices
       if (laneId < config.numExpertPerToken) {
         if (args.weightsBuf) {
-          args.shmemOutWeightsMemObj->template GetAs<float*>(
+          args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
               destPe)[destTokId * config.numExpertPerToken + laneId] =
               args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
         }
@@ -142,7 +142,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
       index_t srcTokOffset = srcTokId * config.hiddenDim;
       index_t destTokOffset = destTokId * config.hiddenDim;
-      core::WarpCopy(args.shmemOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
+      core::WarpCopy(args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
                      args.inpTokenBuf + srcTokOffset, config.hiddenDim);
     }
   }
@@ -261,14 +261,15 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
         srcWeightsPtr[j] = nullptr;
       }
     }
-    core::WarpAccum<T, 4>(
-        args.shmemOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim + hiddenDimOffset,
-        srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
+    core::WarpAccum<T, 4>(args.shmemCombineOutTokMemObj->template GetAs<T*>() +
+                              tokenId * config.hiddenDim + hiddenDimOffset,
+                          srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
 
     if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
-      core::WarpAccum<float, 4>(
-          args.shmemOutWeightsMemObj->template GetAs<float*>() + tokenId * config.numExpertPerToken,
-          srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
+      core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
+                                    tokenId * config.numExpertPerToken,
+                                srcWeightsPtr, nullptr, config.numExpertPerToken,
+                                config.numExpertPerToken);
     }
   }
 }
