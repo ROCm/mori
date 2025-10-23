@@ -21,8 +21,11 @@
 // SOFTWARE.
 #include <mpi.h>
 
+#include <cstdlib>
+
 #include "mori/application/application.hpp"
 #include "mori/shmem/shmem_api.hpp"
+#include "mori/utils/mori_log.hpp"
 #include "src/shmem/internal.hpp"
 
 namespace mori {
@@ -53,6 +56,30 @@ void MemoryStatesInit() {
       new application::SymmMemManager(*states->bootStates->bootNet, *context);
   states->memoryStates->mrMgr =
       new application::RdmaMemoryRegionManager(*context->GetRdmaDeviceContext());
+
+  // Allocate static symmetric heap
+  // Size can be configured via environment variable
+  const char* heapSizeEnv = std::getenv("MORI_SHMEM_HEAP_SIZE");
+  size_t heapSize = heapSizeEnv ? std::stoull(heapSizeEnv) : DEFAULT_SYMMETRIC_HEAP_SIZE;
+
+  MORI_SHMEM_INFO("Allocating static symmetric heap of size {} bytes ({} MB)", heapSize,
+                  heapSize / (1024 * 1024));
+
+  // Allocate the symmetric heap using the SymmMemManager
+  application::SymmMemObjPtr heapObj =
+      states->memoryStates->symmMemMgr->ExtMallocWithFlags(heapSize, hipDeviceMallocUncached);
+  if (!heapObj.IsValid()) {
+    MORI_SHMEM_ERROR("Failed to allocate static symmetric heap!");
+    throw std::runtime_error("Failed to allocate static symmetric heap");
+  }
+
+  states->memoryStates->staticHeapBasePtr = heapObj.cpu->localPtr;
+  states->memoryStates->staticHeapSize = heapSize;
+  states->memoryStates->staticHeapUsed = 0;
+  states->memoryStates->staticHeapObj = heapObj;
+
+  MORI_SHMEM_INFO("Static symmetric heap allocated at {} (local), size {} bytes",
+                  states->memoryStates->staticHeapBasePtr, heapSize);
 }
 
 void GpuStateInit() {
@@ -89,6 +116,22 @@ void GpuStateInit() {
     HIP_RUNTIME_CHECK(hipMemset(gpuStates.endpointLock, 0, lockSize));
   }
 
+  // Copy static symmetric heap info to GPU
+  uintptr_t heapBase = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
+  gpuStates.heapBaseAddr = heapBase;
+  gpuStates.heapEndAddr = heapBase + states->memoryStates->staticHeapSize;
+
+  // Copy the SymmMemObj to GPU memory so it can be accessed from device
+  application::SymmMemObj* deviceHeapObj;
+  HIP_RUNTIME_CHECK(hipMalloc(&deviceHeapObj, sizeof(application::SymmMemObj)));
+  HIP_RUNTIME_CHECK(hipMemcpy(deviceHeapObj, states->memoryStates->staticHeapObj.cpu,
+                              sizeof(application::SymmMemObj), hipMemcpyHostToDevice));
+  gpuStates.heapObj = deviceHeapObj;
+
+  MORI_SHMEM_INFO("Heap info copied to GPU: base=0x{:x}, end=0x{:x}, size={} bytes",
+                  gpuStates.heapBaseAddr, gpuStates.heapEndAddr,
+                  gpuStates.heapEndAddr - gpuStates.heapBaseAddr);
+
   // Copy gpu states to constant memory
   HIP_RUNTIME_CHECK(
       hipMemcpyToSymbol(globalGpuStates, &gpuStates, sizeof(GpuStates), 0, hipMemcpyHostToDevice));
@@ -117,6 +160,19 @@ int ShmemFinalize() {
 
   HIP_RUNTIME_CHECK(hipFree(globalGpuStates.transportTypes));
   HIP_RUNTIME_CHECK(hipFree(globalGpuStates.rdmaEndpoints));
+
+  // Free the device-side heap object
+  GpuStates hostGpuStates;
+  HIP_RUNTIME_CHECK(hipMemcpyFromSymbol(&hostGpuStates, globalGpuStates, sizeof(GpuStates), 0,
+                                        hipMemcpyDeviceToHost));
+  if (hostGpuStates.heapObj) {
+    HIP_RUNTIME_CHECK(hipFree(hostGpuStates.heapObj));
+  }
+
+  // Free the static symmetric heap through SymmMemManager
+  if (states->memoryStates->staticHeapObj.IsValid()) {
+    states->memoryStates->symmMemMgr->Free(states->memoryStates->staticHeapBasePtr);
+  }
 
   delete states->memoryStates->symmMemMgr;
   delete states->memoryStates->mrMgr;
