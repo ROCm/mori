@@ -104,41 +104,6 @@ extern __constant__ GpuStates globalGpuStates;
 static __device__ GpuStates* GetGlobalGpuStatesPtr() { return &globalGpuStates; }
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                    Address-based Helper Functions                              */
-/* ---------------------------------------------------------------------------------------------- */
-
-// Helper structure to store address lookup result
-struct ShmemPtrInfo {
-  application::SymmMemObj* obj;
-  size_t offset;
-  bool valid;
-
-  __device__ ShmemPtrInfo() : obj(nullptr), offset(0), valid(false) {}
-  __device__ ShmemPtrInfo(application::SymmMemObj* o, size_t off)
-      : obj(o), offset(off), valid(true) {}
-};
-
-inline __device__ ShmemPtrInfo ShmemPtrToSymmMemObj(const void* ptr) {
-  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  uintptr_t targetAddr = reinterpret_cast<uintptr_t>(ptr);
-
-  // Simple range check against the static symmetric heap
-  if (targetAddr >= globalGpuStates->heapBaseAddr && targetAddr < globalGpuStates->heapEndAddr) {
-    size_t offset = targetAddr - globalGpuStates->heapBaseAddr;
-    return ShmemPtrInfo(globalGpuStates->heapObj, offset);
-  }
-
-  return ShmemPtrInfo();
-}
-
-inline __device__ size_t ShmemGetOffset(const application::SymmMemObjPtr obj, const void* addr) {
-  uintptr_t baseAddr = reinterpret_cast<uintptr_t>(obj->localPtr);
-  uintptr_t targetAddr = reinterpret_cast<uintptr_t>(addr);
-  // assert(targetAddr >= baseAddr && (targetAddr - baseAddr) < obj->size);
-  return targetAddr - baseAddr;
-}
-
-/* ---------------------------------------------------------------------------------------------- */
 /*                                Address to Remote Address Translation                           */
 /* ---------------------------------------------------------------------------------------------- */
 struct RemoteAddrInfo {
@@ -147,7 +112,7 @@ struct RemoteAddrInfo {
   bool valid;
 
   __device__ RemoteAddrInfo() : raddr(0), rkey(0), valid(false) {}
-  __device__ RemoteAddrInfo(uintptr_t r, uintptr_t k, uintptr_t l = 0)
+  __device__ RemoteAddrInfo(uintptr_t r, uintptr_t k)
       : raddr(r), rkey(k), valid(true) {}
 };
 

@@ -121,16 +121,14 @@ void GpuStateInit() {
   gpuStates.heapBaseAddr = heapBase;
   gpuStates.heapEndAddr = heapBase + states->memoryStates->staticHeapSize;
 
-  // Copy the SymmMemObj to GPU memory so it can be accessed from device
-  application::SymmMemObj* deviceHeapObj;
-  HIP_RUNTIME_CHECK(hipMalloc(&deviceHeapObj, sizeof(application::SymmMemObj)));
-  HIP_RUNTIME_CHECK(hipMemcpy(deviceHeapObj, states->memoryStates->staticHeapObj.cpu,
-                              sizeof(application::SymmMemObj), hipMemcpyHostToDevice));
-  gpuStates.heapObj = deviceHeapObj;
+  // Use the GPU-side SymmMemObj pointer that was already allocated and initialized
+  // by RegisterSymmMemObj (which properly set up peerPtrs and peerRkeys on GPU)
+  gpuStates.heapObj = states->memoryStates->staticHeapObj.gpu;
 
-  MORI_SHMEM_INFO("Heap info copied to GPU: base=0x{:x}, end=0x{:x}, size={} bytes",
+  MORI_SHMEM_INFO("Heap info copied to GPU: base=0x{:x}, end=0x{:x}, size={} bytes, heapObj=0x{:x}",
                   gpuStates.heapBaseAddr, gpuStates.heapEndAddr,
-                  gpuStates.heapEndAddr - gpuStates.heapBaseAddr);
+                  gpuStates.heapEndAddr - gpuStates.heapBaseAddr,
+                  reinterpret_cast<uintptr_t>(gpuStates.heapObj));
 
   // Copy gpu states to constant memory
   HIP_RUNTIME_CHECK(
@@ -161,13 +159,6 @@ int ShmemFinalize() {
   HIP_RUNTIME_CHECK(hipFree(globalGpuStates.transportTypes));
   HIP_RUNTIME_CHECK(hipFree(globalGpuStates.rdmaEndpoints));
 
-  // Free the device-side heap object
-  GpuStates hostGpuStates;
-  HIP_RUNTIME_CHECK(hipMemcpyFromSymbol(&hostGpuStates, globalGpuStates, sizeof(GpuStates), 0,
-                                        hipMemcpyDeviceToHost));
-  if (hostGpuStates.heapObj) {
-    HIP_RUNTIME_CHECK(hipFree(hostGpuStates.heapObj));
-  }
 
   // Free the static symmetric heap through SymmMemManager
   if (states->memoryStates->staticHeapObj.IsValid()) {

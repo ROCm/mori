@@ -30,6 +30,7 @@ using namespace mori::core;
 using namespace mori::shmem;
 using namespace mori::application;
 
+// Legacy API: Using SymmMemObjPtr + offset
 __global__ void ConcurrentPutThreadKernel(int myPe, const SymmMemObjPtr memObj) {
   constexpr int sendPe = 0;
   constexpr int recvPe = 1;
@@ -56,6 +57,32 @@ __global__ void ConcurrentPutThreadKernel(int myPe, const SymmMemObjPtr memObj) 
   }
 }
 
+// New API: Using pure addresses
+__global__ void ConcurrentPutThreadKernel_PureAddr(int myPe, uint32_t* localBuff) {
+  constexpr int sendPe = 0;
+  constexpr int recvPe = 1;
+
+  int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (myPe == sendPe) {
+    // Calculate source and destination addresses
+    uint32_t* src = localBuff + globalTid;
+    uint32_t* dest = localBuff + globalTid;
+
+    // Use pure address-based API
+    ShmemPutMemNbiThread(dest, src, sizeof(uint32_t), recvPe, 1);
+    __threadfence_system();
+
+    if (blockIdx.x == 0) {
+      ShmemQuietThread();
+    }
+  } else {
+    // Wait for data to arrive
+    while (atomicAdd(localBuff + globalTid, 0) != sendPe) {
+    }
+  }
+}
+
 void ConcurrentPutThread() {
   int status;
   MPI_Init(NULL, NULL);
@@ -70,28 +97,89 @@ void ConcurrentPutThread() {
 
   constexpr int threadNum = 128;
   constexpr int blockNum = 3;
-
-  // Allocate buffer
   int numEle = threadNum * blockNum;
   int buffSize = numEle * sizeof(uint32_t);
 
-  void* buff = ShmemMalloc(buffSize);
-  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff), myPe, numEle));
+  printf("=================================================================\n");
+  printf("PE %d: Testing both Legacy and Pure Address APIs\n", myPe);
+  printf("=================================================================\n");
+
+  // ===== Test 1: Legacy API with SymmMemObjPtr + offset =====
+  printf("\n--- Test 1: Legacy API (SymmMemObjPtr + offset) ---\n");
+  
+  void* buff1 = ShmemMalloc(buffSize);
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff1), myPe, numEle));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
-  SymmMemObjPtr buffObj = ShmemQueryMemObjPtr(buff);
-  assert(buffObj.IsValid());
+  SymmMemObjPtr buffObj1 = ShmemQueryMemObjPtr(buff1);
+  assert(buffObj1.IsValid());
 
-  // Run put
-  ConcurrentPutThreadKernel<<<blockNum, threadNum>>>(myPe, buffObj);
+  printf("PE %d: Running legacy API test...\n", myPe);
+  ConcurrentPutThreadKernel<<<blockNum, threadNum>>>(myPe, buffObj1);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
-  if (myPe == 0) {
-    printf("test done!\n");
+
+  // Verify Test 1
+  std::vector<uint32_t> hostBuff1(numEle);
+  HIP_RUNTIME_CHECK(hipMemcpy(hostBuff1.data(), buff1, buffSize, hipMemcpyDeviceToHost));
+  
+  if (myPe == 1) {
+    bool success = true;
+    for (int i = 0; i < numEle; i++) {
+      if (hostBuff1[i] != 0) {
+        printf("Error at index %d: expected 0, got %u\n", i, hostBuff1[i]);
+        success = false;
+        break;
+      }
+    }
+    if (success) {
+      printf("✓ Legacy API test PASSED! All %d elements verified.\n", numEle);
+    } else {
+      printf("✗ Legacy API test FAILED!\n");
+    }
   }
 
-  // Finalize
-  ShmemFree(buff);
+  // ===== Test 2: Pure Address API =====
+  printf("\n--- Test 2: Pure Address API ---\n");
+  
+  void* buff2 = ShmemMalloc(buffSize);
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff2), myPe, numEle));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  printf("PE %d: Running pure address API test...\n", myPe);
+  ConcurrentPutThreadKernel_PureAddr<<<blockNum, threadNum>>>(myPe, reinterpret_cast<uint32_t*>(buff2));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+  
+  // Verify Test 2
+  std::vector<uint32_t> hostBuff2(numEle);
+  HIP_RUNTIME_CHECK(hipMemcpy(hostBuff2.data(), buff2, buffSize, hipMemcpyDeviceToHost));
+  
+  if (myPe == 1) {
+    bool success = true;
+    for (int i = 0; i < numEle; i++) {
+      if (hostBuff2[i] != 0) {
+        printf("Error at index %d: expected 0, got %u\n", i, hostBuff2[i]);
+        success = false;
+        break;
+      }
+    }
+    if (success) {
+      printf("✓ Pure address API test PASSED! All %d elements verified.\n", numEle);
+    } else {
+      printf("✗ Pure address API test FAILED!\n");
+    }
+  }
+
+  printf("\n=================================================================\n");
+  if (myPe == 0) {
+    printf("All tests completed!\n");
+  }
+  printf("=================================================================\n");
+
+  // Cleanup
+  ShmemFree(buff1);
+  ShmemFree(buff2);
   ShmemFinalize();
 }
 
