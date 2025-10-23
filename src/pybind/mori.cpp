@@ -70,14 +70,14 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
                         at::cuda::getCurrentHIPStream());
 
   torch::Tensor out =
-      torch::from_blob(handle.shmemOutTokMemObj->Get(),
+      torch::from_blob(handle.shmemDispatchOutTokMemObj->Get(),
                        {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
                        torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA));
 
   std::optional<torch::Tensor> outWeights{std::nullopt};
   if (weightPtr) {
     outWeights = torch::from_blob(
-        handle.shmemOutWeightsMemObj->Get(),
+        handle.shmemDispatchOutWeightsMemObj->Get(),
         {handle.config.MaxNumTokensToRecv(), handle.config.numExpertPerToken},
         torch::TensorOptions().dtype(mori::GetTorchDataType<float>()).device(torch::kCUDA));
   }
@@ -127,13 +127,13 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
 
   auto options = torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA);
   torch::Tensor out =
-      torch::from_blob(handle.shmemOutTokMemObj->Get(),
+      torch::from_blob(handle.shmemCombineOutTokMemObj->Get(),
                        {handle.config.maxNumInpTokenPerRank, handle.config.hiddenDim}, options);
 
   std::optional<torch::Tensor> outWeights{std::nullopt};
   if (weightsPtr) {
     outWeights =
-        torch::from_blob(handle.shmemOutWeightsMemObj->Get(),
+        torch::from_blob(handle.shmemCombineOutWeightsMemObj->Get(),
                          {handle.config.maxNumInpTokenPerRank, handle.config.numExpertPerToken},
                          torch::TensorOptions().dtype(weights->scalar_type()).device(torch::kCUDA));
   }

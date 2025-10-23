@@ -171,12 +171,14 @@ class EpDispatchCombineHandle {
   // Registered buffers for tokens, shmemOutTokMemObj will be returned to user as output
   mori::application::SymmMemObjPtr shmemDispatchInpTokMemObj;
   mori::application::SymmMemObjPtr shmemCombineInpTokMemObj;
-  mori::application::SymmMemObjPtr shmemOutTokMemObj;
+  mori::application::SymmMemObjPtr shmemDispatchOutTokMemObj;
+  mori::application::SymmMemObjPtr shmemCombineOutTokMemObj;
   mori::application::SymmMemObjPtr shmemStagingTokMemObj;
 
   // Registered buffer used for weights, indices and scales
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
-  mori::application::SymmMemObjPtr shmemOutWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemDispatchOutWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemCombineOutWeightsMemObj;
   mori::application::SymmMemObjPtr shmemInpScalesMemObj;
   mori::application::SymmMemObjPtr shmemOutScalesMemObj;
   mori::application::SymmMemObjPtr shmemInpIndicesMemObj;
@@ -231,10 +233,12 @@ struct EpDispatchCombineArgs {
   uint8_t* scalesBuf{nullptr};
   mori::application::SymmMemObjPtr shmemDispatchInpTokMemObj;
   mori::application::SymmMemObjPtr shmemCombineInpTokMemObj;
-  mori::application::SymmMemObjPtr shmemOutTokMemObj;
+  mori::application::SymmMemObjPtr shmemDispatchOutTokMemObj;
+  mori::application::SymmMemObjPtr shmemCombineOutTokMemObj;
   mori::application::SymmMemObjPtr shmemStagingTokMemObj;
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
-  mori::application::SymmMemObjPtr shmemOutWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemDispatchOutWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemCombineOutWeightsMemObj;
   mori::application::SymmMemObjPtr shmemInpScalesMemObj;
   mori::application::SymmMemObjPtr shmemOutScalesMemObj;
   mori::application::SymmMemObjPtr shmemInpIndicesMemObj;
@@ -276,10 +280,12 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.localPeTokenCounter = handle.localPeTokenCounter;
   args.shmemDispatchInpTokMemObj = handle.shmemDispatchInpTokMemObj;
   args.shmemCombineInpTokMemObj = handle.shmemCombineInpTokMemObj;
-  args.shmemOutTokMemObj = handle.shmemOutTokMemObj;
+  args.shmemDispatchOutTokMemObj = handle.shmemDispatchOutTokMemObj;
+  args.shmemCombineOutTokMemObj = handle.shmemCombineOutTokMemObj;
   args.shmemStagingTokMemObj = handle.shmemStagingTokMemObj;
   args.shmemInpWeightsMemObj = handle.shmemInpWeightsMemObj;
-  args.shmemOutWeightsMemObj = handle.shmemOutWeightsMemObj;
+  args.shmemDispatchOutWeightsMemObj = handle.shmemDispatchOutWeightsMemObj;
+  args.shmemCombineOutWeightsMemObj = handle.shmemCombineOutWeightsMemObj;
   args.shmemInpScalesMemObj = handle.shmemInpScalesMemObj;
   args.shmemOutScalesMemObj = handle.shmemOutScalesMemObj;
   args.shmemInpIndicesMemObj = handle.shmemInpIndicesMemObj;

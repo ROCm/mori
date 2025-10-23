@@ -74,12 +74,16 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
       ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
   shmemCombineInpTokMemObj =
       ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
-  shmemOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
+  shmemDispatchOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
+  shmemCombineOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
   shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
 
   size_t maxWeightSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(float);
   shmemInpWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
-  shmemOutWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
+  shmemDispatchOutWeightsMemObj =
+      ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
+  shmemCombineOutWeightsMemObj =
+      ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
 
   if (config.scaleDim > 0 && config.scaleTypeSize > 0) {
     size_t maxScaleSize = config.MaxNumTokensToRecv() * config.scaleDim * config.scaleTypeSize;
@@ -95,10 +99,12 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
 void EpDispatchCombineHandle::FinalizeShmemBuf() {
   ShmemFree(shmemDispatchInpTokMemObj->localPtr);
   ShmemFree(shmemCombineInpTokMemObj->localPtr);
-  ShmemFree(shmemOutTokMemObj->localPtr);
+  ShmemFree(shmemDispatchOutTokMemObj->localPtr);
+  ShmemFree(shmemCombineOutTokMemObj->localPtr);
   ShmemFree(shmemStagingTokMemObj->localPtr);
   ShmemFree(shmemInpWeightsMemObj->localPtr);
-  ShmemFree(shmemOutWeightsMemObj->localPtr);
+  ShmemFree(shmemDispatchOutWeightsMemObj->localPtr);
+  ShmemFree(shmemCombineOutWeightsMemObj->localPtr);
   if (shmemInpScalesMemObj.IsValid()) ShmemFree(shmemInpScalesMemObj->localPtr);
   if (shmemOutScalesMemObj.IsValid()) ShmemFree(shmemOutScalesMemObj->localPtr);
   ShmemFree(shmemInpIndicesMemObj->localPtr);
