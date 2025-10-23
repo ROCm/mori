@@ -152,6 +152,26 @@ inline __device__ void AtomicStoreSeqCstSystem(T* ptr, T val) {
 }
 
 template <typename T>
+inline __device__ T AtomicAddSeqCst(T* ptr, T val) {
+  return __hip_atomic_fetch_add(ptr, val, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+template <typename T>
+inline __device__ T AtomicAddSeqCstSystem(T* ptr, T val) {
+  return __hip_atomic_fetch_add(ptr, val, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+template <typename T>
+inline __device__ T AtomicAddRelaxed(T* ptr, T val) {
+  return __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+template <typename T>
+inline __device__ T AtomicAddRelaxedSystem(T* ptr, T val) {
+  return __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+template <typename T>
 __device__ T AtomicCompareExchange(T* address, T* compare, T val) {
   __hip_atomic_compare_exchange_strong(address, compare, val, __ATOMIC_RELAXED, __ATOMIC_RELAXED,
                                        __HIP_MEMORY_SCOPE_AGENT);

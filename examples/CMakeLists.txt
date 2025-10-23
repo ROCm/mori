@@ -24,6 +24,10 @@ add_executable(concurrent_put_imm_thread shmem/concurrent_put_imm_thread.cpp)
 target_link_libraries(concurrent_put_imm_thread mori_shmem hip::host
                       hip::device)
 
+add_executable(concurrent_put_signal_thread shmem/concurrent_put_signal_thread.cpp)
+target_link_libraries(concurrent_put_signal_thread mori_shmem hip::host
+                      hip::device)
+
 add_executable(atomic_nonfetch_thread shmem/atomic_nonfetch_thread.cpp)
 target_link_libraries(atomic_nonfetch_thread mori_shmem hip::host hip::device)
 
