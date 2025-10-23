@@ -46,6 +46,7 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
   endpoint.vendorId = ToRdmaDeviceVendorId(deviceAttr->orig_attr.vendor_id);
   endpoint.handle.psn = 0;
   endpoint.handle.portId = config.portId;
+  endpoint.handle.maxSge = deviceAttr->tm_caps.max_sge;
 
   const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(config.portId);
   if (portAttr->link_layer == IBV_LINK_LAYER_INFINIBAND) {
@@ -102,7 +103,6 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
 
   const ibv_device_attr_ex* devAttr = GetRdmaDevice()->GetDeviceAttr();
   ibv_qp* qp = qpPool.find(local.qpn)->second;
-  remote.maxSge = deviceAttr.tm_caps.max_sge;
 
   // INIT
   memset(&attr, 0, sizeof(attr));

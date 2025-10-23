@@ -470,10 +470,12 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
 
   Mlx5CqContainer* cq = new Mlx5CqContainer(context, config);
   Mlx5QpContainer* qp = new Mlx5QpContainer(context, config, cq->cqn, pdn, this);
+  const ibv_device_attr_ex* deviceAttr = GetRdmaDevice()->GetDeviceAttr();
 
   RdmaEndpoint endpoint;
   endpoint.handle.psn = 0;
   endpoint.handle.portId = config.portId;
+  endpoint.handle.maxSge = deviceAttr->tm_caps.max_sge;
 
   HcaCapability hca_cap = QueryHcaCap(context);
 

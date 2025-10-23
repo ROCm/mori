@@ -451,11 +451,14 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   BnxtCqContainer* cq = new BnxtCqContainer(context, config);
 
   BnxtQpContainer* qp = new BnxtQpContainer(context, config, cq->cq, pd, this);
+
+  const ibv_device_attr_ex* deviceAttr = GetRdmaDevice()->GetDeviceAttr();
   int ret;
 
   RdmaEndpoint endpoint;
   endpoint.handle.psn = 0;
   endpoint.handle.portId = config.portId;
+  endpoint.handle.maxSge = deviceAttr->tm_caps.max_sge;
 
   endpoint.handle.qpn = qp->qpn;
 

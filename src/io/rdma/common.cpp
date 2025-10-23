@@ -91,6 +91,8 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
   struct MergedWorkRequest {
     ibv_send_wr wr{};
     std::vector<ibv_sge> sges;
+    size_t totalRemoteLength = 0;
+    size_t mergedRequests = 1;
   };
 
   std::vector<MergedWorkRequest> mergedWrs;
@@ -98,16 +100,15 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
 
   const uint64_t localBaseAddr = reinterpret_cast<uint64_t>(local.addr);
   const uint64_t remoteBaseAddr = reinterpret_cast<uint64_t>(remote.addr);
-  const uint32_t maxSge = eps[0].remote.maxSge;
+  const uint32_t maxSge = eps[0].local.handle.maxSge;
 
   for (size_t i = 0; i < batchSize; ++i) {
     uint64_t currentLocalAddr = localBaseAddr + localOffsets[i];
     uint64_t currentRemoteAddr = remoteBaseAddr + remoteOffsets[i];
     size_t currentSize = sizes[i];
 
-    bool canMerge =
-        !mergedWrs.empty() && (mergedWrs.back().wr.wr.rdma.remote_addr +
-                               mergedWrs.back().wr.sg_list[0].length) == currentRemoteAddr;
+    bool canMerge = !mergedWrs.empty() && (mergedWrs.back().wr.wr.rdma.remote_addr +
+                                           mergedWrs.back().totalRemoteLength) == currentRemoteAddr;
 
     if (canMerge) {
       MergedWorkRequest& lastWr = mergedWrs.back();
@@ -117,22 +118,29 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
 
       if (localContiguous) {
         lastSge.length += currentSize;
-        lastWr.wr.sg_list[0].length += currentSize;
+        lastWr.mergedRequests += 1;
       } else if (lastWr.sges.size() < maxSge) {
         lastWr.sges.push_back(
             {.addr = currentLocalAddr, .length = (uint32_t)currentSize, .lkey = local.lkey});
         lastWr.wr.num_sge = static_cast<int>(lastWr.sges.size());
-        lastWr.wr.sg_list[0].length += currentSize;
+        lastWr.mergedRequests += 1;
       } else {
         canMerge = false;
+      }
+
+      if (canMerge) {
+        lastWr.totalRemoteLength += currentSize;
       }
     }
 
     if (!canMerge) {
       mergedWrs.emplace_back();
       MergedWorkRequest& newWr = mergedWrs.back();
+      newWr.sges.reserve(maxSge);  // Make sure sges.data() is stable
       newWr.sges.push_back(
           {.addr = currentLocalAddr, .length = (uint32_t)currentSize, .lkey = local.lkey});
+
+      newWr.totalRemoteLength = currentSize;  // Initialize remote length
 
       newWr.wr.sg_list = newWr.sges.data();
       newWr.wr.num_sge = 1;
@@ -144,70 +152,44 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
   }
 
   size_t mergedWrCount = mergedWrs.size();
-  callbackMeta->totalBatchSize = static_cast<int>(mergedWrCount);
   size_t epNum = eps.size();
+  size_t epBatchSize = (mergedWrCount + epNum - 1) / epNum;
+
+  if (postBatchSize == -1) postBatchSize = epBatchSize;
+  int numPostBatch = (mergedWrCount + postBatchSize - 1) / postBatchSize;
 
   std::vector<std::unique_ptr<CqCallbackMessage>> callbackMessages;
-  std::vector<bool> signalFlags(mergedWrCount, false);
-  if (mergedWrCount > 0) {
-    std::vector<int> lastWrIndexPerEp(epNum, -1);
-    for (int i = 0; i < mergedWrCount; ++i) {
-      lastWrIndexPerEp[i % epNum] = i;
+  callbackMessages.reserve(epNum);               // At most one callback per endpoint
+  std::vector<size_t> epPostedCounts(epNum, 0);  // Actual posted requests count per endpoint
+
+  for (int i = 0; i < numPostBatch; i++) {
+    int st = i * postBatchSize;
+    int end = std::min(static_cast<size_t>(st) + postBatchSize, mergedWrCount);
+    if (end - st == 0) break;
+    int epId = i % epNum;
+    size_t mergedReqSize = 0;
+    for (int j = st; j < end; j++) {
+      struct ibv_send_wr& wr = mergedWrs[j].wr;
+      wr.wr_id = 0;
+      wr.next = (j + 1 < end) ? &mergedWrs[j + 1].wr : nullptr;
+      mergedReqSize += mergedWrs[j].mergedRequests;
     }
-    for (int epId = 0; epId < epNum; ++epId) {
-      if (lastWrIndexPerEp[epId] != -1) {
-        signalFlags[lastWrIndexPerEp[epId]] = true;
-      }
+
+    struct ibv_send_wr& last = mergedWrs[end - 1].wr;
+
+    epPostedCounts[epId] += mergedReqSize;
+    if ((i + epNum) >= numPostBatch) {
+      int epTotalBatchSize = static_cast<int>(epPostedCounts[epId]);
+      last.wr_id =
+          reinterpret_cast<uint64_t>(new CqCallbackMessage(callbackMeta, epTotalBatchSize));
+      last.send_flags = IBV_SEND_SIGNALED;
     }
+    int ret = ibv_post_send(eps[epId].local.ibvHandle.qp, &mergedWrs[st].wr, nullptr);
+    if (ret != 0) {
+      return {StatusCode::ERR_RDMA_OP, strerror(errno)};
+    }
+    MORI_IO_TRACE("ibv_post_send ep index {} batch index range [{}, {})", epId, st, end);
   }
-
-  size_t wrIndex = 0;
-  while (wrIndex < mergedWrCount) {
-    size_t epId = (wrIndex / (postBatchSize > 0 ? postBatchSize : 1)) % epNum;
-    ibv_qp* qp = eps[epId].local.ibvHandle.qp;
-
-    ibv_send_wr* firstWr = nullptr;
-    ibv_send_wr* lastWr = nullptr;
-
-    size_t batchEnd =
-        std::min(wrIndex + (postBatchSize > 0 ? postBatchSize : mergedWrCount), mergedWrCount);
-
-    for (size_t i = wrIndex; i < batchEnd; ++i) {
-      MergedWorkRequest& current = mergedWrs[i];
-      current.wr.next = nullptr;
-
-      if (!firstWr) {
-        firstWr = &current.wr;
-      }
-      if (lastWr) {
-        lastWr->next = &current.wr;
-      }
-      lastWr = &current.wr;
-
-      if (signalFlags[i]) {
-        auto cbMsg =
-            std::make_unique<CqCallbackMessage>(callbackMeta, 0);  // TODO: correct callback
-        lastWr->wr_id = reinterpret_cast<uint64_t>(cbMsg.get());
-        lastWr->send_flags |= IBV_SEND_SIGNALED;
-        callbackMessages.push_back(std::move(cbMsg));
-      }
-    }
-
-    if (firstWr) {
-      ibv_send_wr* badWr = nullptr;
-      if (ibv_post_send(qp, firstWr, &badWr) != 0) {
-        return {StatusCode::ERR_RDMA_OP, strerror(errno)};
-      }
-      for (auto& cb : callbackMessages) {
-        cb.release();
-      }
-      callbackMessages.clear();
-      MORI_IO_TRACE("ibv_post_send ep index {} merged batch range [{}, {})", epId, wrIndex,
-                    batchEnd);
-    }
-    wrIndex = batchEnd;
-  }
-
   return {StatusCode::IN_PROGRESS, ""};
 }
 
