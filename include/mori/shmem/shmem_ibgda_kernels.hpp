@@ -34,9 +34,11 @@ namespace shmem {
 
 #ifdef ENABLE_BNXT
 #define DISPATCH_MLX5 0
+#define DISPATCH_PSD  0
 #define DISPATCH_BNXT 1
 #else
 #define DISPATCH_MLX5 1
+#define DISPATCH_PSD  1
 #define DISPATCH_BNXT 0
 #endif
 
@@ -48,6 +50,8 @@ namespace shmem {
     func<core::ProviderType::MLX5>(__VA_ARGS__);                      \
   } else if (DISPATCH_BNXT && prvdType == core::ProviderType::BNXT) { \
     func<core::ProviderType::BNXT>(__VA_ARGS__);                      \
+  } else if (DISPATCH_PSD && prvdType == core::ProviderType::PSD) {   \
+    func<core::ProviderType::PSD>(__VA_ARGS__);                      \
   } else {                                                            \
     assert(false && "Unsupported or disabled provider type");         \
   }
@@ -58,6 +62,8 @@ namespace shmem {
     func<core::ProviderType::MLX5>(__VA_ARGS__);                      \
   } else if (DISPATCH_BNXT && prvdType == core::ProviderType::BNXT) { \
     func<core::ProviderType::BNXT>(__VA_ARGS__);                      \
+  } else if (DISPATCH_PSD && prvdType == core::ProviderType::PSD) {   \
+    func<core::ProviderType::PSD>(__VA_ARGS__);                       \
   } else {                                                            \
     assert(false && "Unsupported or disabled provider type");         \
   }
@@ -66,6 +72,8 @@ namespace shmem {
   do {                                                 \
     if constexpr (DISPATCH_BNXT == 1) {                \
       func<core::ProviderType::BNXT>(__VA_ARGS__);     \
+    } else if constexpr (DISPATCH_PSD == 1) {          \
+      func<core::ProviderType::PSD>(__VA_ARGS__);      \
     } else {                                           \
       func<core::ProviderType::MLX5>(__VA_ARGS__);     \
     }                                                  \
@@ -75,6 +83,8 @@ namespace shmem {
   [&]() {                                                                \
     if constexpr (DISPATCH_BNXT == 1) {                                  \
       return func<core::ProviderType::BNXT, type>(__VA_ARGS__);          \
+    } if constexpr (DISPATCH_PSD == 1) {                                 \
+      return func<core::ProviderType::PSD, type>(__VA_ARGS__);           \
     } else {                                                             \
       return func<core::ProviderType::MLX5, type>(__VA_ARGS__);          \
     }                                                                    \
@@ -130,9 +140,18 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId) {
       }
       wqe_counter = (wqe_counter + wq.sqWqeNum - 1) % wq.sqWqeNum;
       wqe_id = wq.outstandingWqe[wqe_counter] + 1;
+    } else if constexpr (PrvdType == core::ProviderType::PSD) {
+      if (opcode != 0) {
+        int rank = globalGpuStates->rank;
+        uint32_t my_cq_index = my_cq_consumer % cq.cqeNum;
+        printf("rank %d dest pe %d consIdx %d opcode %d\n", rank, pe, my_cq_index, opcode);
+        core::DumpMlx5Wqe(wq.sqAddr, my_cq_index);
+        assert(false);
+      }
+      wqe_id = wq.outstandingWqe[wqe_counter];
     }
 
-    // core::UpdateCqDbrRecord<PrvdType>(cq.dbrRecAddr, (uint32_t)(my_cq_consumer + 1), cq.cqeNum);
+    // core::UpdateCqDbrRecord<PrvdType>(cq, cq.dbrRecAddr, (uint32_t)(my_cq_consumer + 1), cq.cqeNum);
 
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
     __hip_atomic_fetch_max(&wq.doneIdx, wqe_id, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -217,7 +236,7 @@ inline __device__ void ShmemQuietThreadKernelImpl(int pe, int qpId) {
           completed = __hip_atomic_load(&cq.consIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
         } while (completed != warp_cq_consumer);
 
-        core::UpdateCqDbrRecord<PrvdType>(cq.dbrRecAddr,
+        core::UpdateCqDbrRecord<PrvdType>(cq, cq.dbrRecAddr,
                                           (uint32_t)(warp_cq_consumer + quiet_amount), cq.cqeNum);
 
         __atomic_signal_fence(__ATOMIC_SEQ_CST);

@@ -35,6 +35,8 @@ enum ProviderType {
   MLX5 = 1,
   // Broadcom direct verbs
   BNXT = 2,
+  // Pensando direct verbs
+  PSD = 3,
   // Ib verbs
   IBVERBS = 3,
 };
@@ -88,6 +90,9 @@ struct WorkQueueHandle {
   uint32_t rqWqeNum{0};
   uint32_t postSendLock{0};
   uint64_t outstandingWqe[OUTSTANDING_TABLE_SIZE]{0};
+  bool color;
+  uint64_t sq_dbval{0};
+  uint64_t rq_dbval{0};
 };
 
 struct CompletionQueueHandle {
@@ -101,6 +106,7 @@ struct CompletionQueueHandle {
   uint32_t cqeNum{0};
   uint32_t cqeSize{0};
   uint32_t pollCqLock{0};
+  uint64_t cq_dbval{0};
 };
 
 struct IBVerbsHandle {

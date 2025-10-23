@@ -104,6 +104,41 @@ static __device__ __host__ enum ibv_wc_status BnxtHandleErrorCqe(int status) {
   }
 }
 
+static inline int IonicHandleErrorCqe(int status)
+{
+	switch (status) {
+	case IONIC_STS_OK:
+		return IBV_WC_SUCCESS;
+	case IONIC_STS_LOCAL_LEN_ERR:
+		return IBV_WC_LOC_LEN_ERR;
+	case IONIC_STS_LOCAL_QP_OPER_ERR:
+		return IBV_WC_LOC_QP_OP_ERR;
+	case IONIC_STS_LOCAL_PROT_ERR:
+		return IBV_WC_LOC_PROT_ERR;
+	case IONIC_STS_WQE_FLUSHED_ERR:
+		return IBV_WC_WR_FLUSH_ERR;
+	case IONIC_STS_MEM_MGMT_OPER_ERR:
+		return IBV_WC_MW_BIND_ERR;
+	case IONIC_STS_BAD_RESP_ERR:
+		return IBV_WC_BAD_RESP_ERR;
+	case IONIC_STS_LOCAL_ACC_ERR:
+		return IBV_WC_LOC_ACCESS_ERR;
+	case IONIC_STS_REMOTE_INV_REQ_ERR:
+		return IBV_WC_REM_INV_REQ_ERR;
+	case IONIC_STS_REMOTE_ACC_ERR:
+		return IBV_WC_REM_ACCESS_ERR;
+	case IONIC_STS_REMOTE_OPER_ERR:
+		return IBV_WC_REM_OP_ERR;
+	case IONIC_STS_RETRY_EXCEEDED:
+		return IBV_WC_RETRY_EXC_ERR;
+	case IONIC_STS_RNR_RETRY_EXCEEDED:
+		return IBV_WC_RNR_RETRY_EXC_ERR;
+	case IONIC_STS_XRC_VIO_ERR:
+	default:
+		return IBV_WC_GENERAL_ERR;
+	}
+}
+
 static __device__ __host__ const char* IbvWcStatusString(enum ibv_wc_status status) {
   static const char* const wc_status_str[] = {
       /* IBV_WC_SUCCESS*/ "success",

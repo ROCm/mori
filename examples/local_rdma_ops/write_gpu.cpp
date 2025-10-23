@@ -56,7 +56,7 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion sendMr, 
                                &epSend.cqHandle.consIdx, &wqeIdx);
     epSend.cqHandle.consIdx += 1;
     printf("send PollCq is done, wqeIdx: %hu\n", wqeIdx);
-    UpdateCqDbrRecord<P>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx,
+    UpdateCqDbrRecord<P>(epSend.cqHandle, epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx,
                          epSend.cqHandle.cqeNum);
     printf("send UpdateCqDbrRecord is done\n");
     // printf("snd_opcode %d val %d\n", snd_opcode, reinterpret_cast<char*>(mrSend.addr)[0]);
@@ -95,6 +95,9 @@ __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMe
         SendThreadKernel<ProviderType::BNXT>(epSend, mrSend, epRecv, mrRecv, msgSize, i);
         break;
 #endif // ENABLE_BNXT        
+      case ProviderType::PSD:
+        SendThreadKernel<ProviderType::PSD>(epSend, mrSend, epRecv, mrRecv, msgSize, i);
+        break;
       default:
         // unsupported provider
         break;
@@ -110,6 +113,9 @@ __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMe
         RecvThreadKernel<ProviderType::BNXT>(epRecv, mrRecv, msgSize, i);
         break;
 #endif // ENABLE_BNXT
+      case ProviderType::PSD:
+        RecvThreadKernel<ProviderType::PSD>(epRecv, mrRecv, msgSize, i);
+        break;      
       default:
         // unsupported provider
         break;
