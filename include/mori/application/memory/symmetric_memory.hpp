@@ -98,6 +98,9 @@ class SymmMemManager {
   SymmMemObjPtr RegisterSymmMemObj(void* localPtr, size_t size);
   void DeregisterSymmMemObj(void* localPtr);
 
+  SymmMemObjPtr HeapRegisterSymmMemObj(void* localPtr, size_t size, SymmMemObjPtr* heapObj);
+  void HeapDeregisterSymmMemObj(void* localPtr);
+
   SymmMemObjPtr Get(void* localPtr) const;
 
  private:

@@ -32,6 +32,9 @@
 namespace mori {
 namespace shmem {
 
+// Configuration for static symmetric heap
+constexpr size_t DEFAULT_SYMMETRIC_HEAP_SIZE = 2ULL * 1024 * 1024 * 1024;  // 2GB default
+
 struct BootStates {
   int rank{0};
   int worldSize{0};
@@ -48,6 +51,12 @@ struct RdmaStates {
 struct MemoryStates {
   application::SymmMemManager* symmMemMgr{nullptr};
   application::RdmaMemoryRegionManager* mrMgr{nullptr};
+
+  void* staticHeapBasePtr{nullptr};          // Base address of the static symmetric heap
+  size_t staticHeapSize{0};                  // Total size of the static heap
+  size_t staticHeapUsed{0};                  // Currently used bytes
+  application::SymmMemObjPtr staticHeapObj;  // SymmMemObj for the entire heap
+  std::mutex heapLock;                       // Lock for thread-safe allocation
 };
 
 enum ShmemStatesStatus {
@@ -84,11 +93,50 @@ struct GpuStates {
   application::TransportType* transportTypes{nullptr};
   application::RdmaEndpoint* rdmaEndpoints{nullptr};
   uint32_t* endpointLock{nullptr};
+
+  uintptr_t heapBaseAddr{0};                  // Base address of symmetric heap
+  uintptr_t heapEndAddr{0};                   // End address of symmetric heap (base + size)
+  application::SymmMemObj* heapObj{nullptr};  // Pointer to the heap's SymmMemObj on device
 };
 
 extern __constant__ GpuStates globalGpuStates;
 
 static __device__ GpuStates* GetGlobalGpuStatesPtr() { return &globalGpuStates; }
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                Address to Remote Address Translation                           */
+/* ---------------------------------------------------------------------------------------------- */
+struct RemoteAddrInfo {
+  uintptr_t raddr;  // Remote address
+  uintptr_t rkey;   // Remote key for RDMA
+  bool valid;
+
+  __device__ RemoteAddrInfo() : raddr(0), rkey(0), valid(false) {}
+  __device__ RemoteAddrInfo(uintptr_t r, uintptr_t k)
+      : raddr(r), rkey(k), valid(true) {}
+};
+
+inline __device__ RemoteAddrInfo ShmemAddrToRemoteAddr(const void* localAddr, int pe) {
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  uintptr_t localAddrInt = reinterpret_cast<uintptr_t>(localAddr);
+
+  // Check if address is in symmetric heap
+  if (localAddrInt < globalGpuStates->heapBaseAddr ||
+      localAddrInt >= globalGpuStates->heapEndAddr) {
+    assert(false && "dest addr not in symmetric heap");
+    return RemoteAddrInfo();
+  }
+
+  // Calculate offset within the symmetric heap
+  size_t offset = localAddrInt - globalGpuStates->heapBaseAddr;
+
+  // Get remote address using the heap's SymmMemObj
+  application::SymmMemObj* heapObj = globalGpuStates->heapObj;
+  uintptr_t raddr = heapObj->peerPtrs[pe] + offset;
+  uintptr_t rkey = heapObj->peerRkeys[pe];
+
+  return RemoteAddrInfo(raddr, rkey);
+}
 
 class ShmemStatesSingleton {
  public:
