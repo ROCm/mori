@@ -144,6 +144,67 @@ void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
   memObjPool.erase(localPtr);
 }
 
+SymmMemObjPtr SymmMemManager::HeapRegisterSymmMemObj(void* localPtr, size_t size,
+                                                     SymmMemObjPtr* heapObj) {
+  int worldSize = bootNet.GetWorldSize();
+  int rank = bootNet.GetLocalRank();
+
+  SymmMemObj* cpuMemObj = new SymmMemObj();
+  cpuMemObj->localPtr = localPtr;
+  cpuMemObj->size = size;
+
+  // Calculate offset from heap base
+  uintptr_t heapBase = reinterpret_cast<uintptr_t>(heapObj->cpu->localPtr);
+  uintptr_t localAddr = reinterpret_cast<uintptr_t>(localPtr);
+  size_t offset = localAddr - heapBase;
+
+  cpuMemObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
+  for (int i = 0; i < worldSize; i++) {
+    cpuMemObj->peerPtrs[i] = heapObj->cpu->peerPtrs[i] + offset;
+  }
+
+  cpuMemObj->ipcMemHandles =
+      static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
+  memcpy(cpuMemObj->ipcMemHandles, heapObj->cpu->ipcMemHandles,
+         sizeof(hipIpcMemHandle_t) * worldSize);
+
+  cpuMemObj->peerRkeys = static_cast<uint32_t*>(calloc(worldSize, sizeof(uint32_t)));
+  memcpy(cpuMemObj->peerRkeys, heapObj->cpu->peerRkeys, sizeof(uint32_t) * worldSize);
+  cpuMemObj->lkey = heapObj->cpu->lkey;
+
+  SymmMemObj* gpuMemObj;
+  HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj, sizeof(SymmMemObj)));
+  HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj, cpuMemObj, sizeof(SymmMemObj), hipMemcpyHostToDevice));
+
+  HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->peerPtrs, sizeof(uintptr_t) * worldSize));
+  HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerPtrs, cpuMemObj->peerPtrs,
+                              sizeof(uintptr_t) * worldSize, hipMemcpyHostToDevice));
+
+  HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->peerRkeys, sizeof(uint32_t) * worldSize));
+  HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerRkeys, cpuMemObj->peerRkeys,
+                              sizeof(uint32_t) * worldSize, hipMemcpyHostToDevice));
+
+  memObjPool.insert({localPtr, SymmMemObjPtr{cpuMemObj, gpuMemObj}});
+  return memObjPool.at(localPtr);
+}
+
+void SymmMemManager::HeapDeregisterSymmMemObj(void* localPtr) {
+  if (memObjPool.find(localPtr) == memObjPool.end()) return;
+
+  // No need to deregister RDMA memory region - this is a sub-region of the heap
+
+  SymmMemObjPtr memObjPtr = memObjPool.at(localPtr);
+  free(memObjPtr.cpu->peerPtrs);
+  free(memObjPtr.cpu->peerRkeys);
+  free(memObjPtr.cpu->ipcMemHandles);
+  free(memObjPtr.cpu);
+  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerPtrs));
+  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerRkeys));
+  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu));
+
+  memObjPool.erase(localPtr);
+}
+
 SymmMemObjPtr SymmMemManager::Get(void* localPtr) const {
   if (memObjPool.find(localPtr) == memObjPool.end()) return SymmMemObjPtr{};
   return memObjPool.at(localPtr);
