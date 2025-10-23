@@ -60,7 +60,26 @@ void MemoryStatesInit() {
   // Allocate static symmetric heap
   // Size can be configured via environment variable
   const char* heapSizeEnv = std::getenv("MORI_SHMEM_HEAP_SIZE");
-  size_t heapSize = heapSizeEnv ? std::stoull(heapSizeEnv) : DEFAULT_SYMMETRIC_HEAP_SIZE;
+  size_t heapSize = DEFAULT_SYMMETRIC_HEAP_SIZE;
+  
+  if (heapSizeEnv) {
+    std::string heapSizeStr(heapSizeEnv);
+    size_t multiplier = 1;
+    
+    // Check for suffix
+    if (!heapSizeStr.empty()) {
+      char lastChar = heapSizeStr.back();
+      if (lastChar == 'G' || lastChar == 'g') {
+        multiplier = 1024ULL * 1024ULL * 1024ULL;  // GiB
+        heapSizeStr.pop_back();
+      } else if (lastChar == 'M' || lastChar == 'm') {
+        multiplier = 1024ULL * 1024ULL;  // MiB
+        heapSizeStr.pop_back();
+      }
+    }
+    
+    heapSize = std::stoull(heapSizeStr) * multiplier;
+  }
 
   MORI_SHMEM_INFO("Allocating static symmetric heap of size {} bytes ({} MB)", heapSize,
                   heapSize / (1024 * 1024));
