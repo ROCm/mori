@@ -30,13 +30,12 @@
 namespace mori {
 namespace application {
 
-TorchBootstrapNetwork::TorchBootstrapNetwork(const std::string& groupName) {
-  this->group = c10d::resolve_process_group(groupName);
-}
+TorchBootstrapNetwork::TorchBootstrapNetwork(const std::string& name) : groupName(name) {}
 
 TorchBootstrapNetwork::~TorchBootstrapNetwork() { Finalize(); }
 
 void TorchBootstrapNetwork::Initialize() {
+  c10::intrusive_ptr<c10d::ProcessGroup> group = c10d::resolve_process_group(groupName);
   this->worldSize = group->getSize();
   this->localRank = group->getRank();
 }
@@ -44,6 +43,8 @@ void TorchBootstrapNetwork::Initialize() {
 void TorchBootstrapNetwork::Finalize() {}
 
 void TorchBootstrapNetwork::Allgather(void* sendbuf, void* recvbuf, size_t sendcount) {
+  c10::intrusive_ptr<c10d::ProcessGroup> group = c10d::resolve_process_group(groupName);
+
   std::vector<at::Tensor> inputTensors = {
       at::from_blob(sendbuf, {1, (int)sendcount}, at::TensorOptions().dtype(at::kByte))};
 
@@ -56,6 +57,8 @@ void TorchBootstrapNetwork::Allgather(void* sendbuf, void* recvbuf, size_t sendc
 }
 
 void TorchBootstrapNetwork::AllToAll(void* sendbuf, void* recvbuf, size_t sendcount) {
+  c10::intrusive_ptr<c10d::ProcessGroup> group = c10d::resolve_process_group(groupName);
+
   at::Tensor inputTensor =
       at::from_blob(sendbuf, {worldSize, (int)sendcount}, at::TensorOptions().dtype(at::kByte));
 
@@ -70,6 +73,8 @@ void TorchBootstrapNetwork::AllToAll(void* sendbuf, void* recvbuf, size_t sendco
 }
 
 void TorchBootstrapNetwork::Barrier() {
+  c10::intrusive_ptr<c10d::ProcessGroup> group = c10d::resolve_process_group(groupName);
+
   auto work = group->barrier();
   work->wait();
 }
