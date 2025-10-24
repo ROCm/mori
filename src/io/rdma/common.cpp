@@ -21,6 +21,8 @@
 // SOFTWARE.
 #include "src/io/rdma/common.hpp"
 
+#include <numeric>
+
 #include "mori/io/logging.hpp"
 
 namespace mori {
@@ -88,6 +90,13 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     return {StatusCode::ERR_INVALID_ARGS, "no endpoints"};
   }
 
+  std::vector<size_t> indices(batchSize);
+  std::iota(indices.begin(), indices.end(), 0);
+
+  if (std::is_sorted(remoteOffsets.begin(), remoteOffsets.end()) == false)
+    std::sort(indices.begin(), indices.end(),
+              [&](size_t a, size_t b) { return remoteOffsets[a] < remoteOffsets[b]; });
+
   struct MergedWorkRequest {
     ibv_send_wr wr{};
     std::vector<ibv_sge> sges;
@@ -95,59 +104,68 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     size_t mergedRequests = 1;
   };
 
-  std::vector<MergedWorkRequest> mergedWrs;
-  mergedWrs.reserve(batchSize);
-
   const uint64_t localBaseAddr = reinterpret_cast<uint64_t>(local.addr);
   const uint64_t remoteBaseAddr = reinterpret_cast<uint64_t>(remote.addr);
   const uint32_t maxSge = eps[0].local.handle.maxSge;
 
+  std::vector<MergedWorkRequest> mergedWrs;
+  mergedWrs.reserve(batchSize);
+
+  auto start_new_wr = [&](uint64_t remoteAddr, uint64_t localAddr, uint32_t len) {
+    mergedWrs.emplace_back();
+    MergedWorkRequest& newWr = mergedWrs.back();
+    newWr.sges.reserve(maxSge);  // keep sg_list stable
+    newWr.sges.push_back(ibv_sge{.addr = localAddr, .length = len, .lkey = local.lkey});
+    newWr.totalRemoteLength = len;
+
+    newWr.wr.sg_list = newWr.sges.data();
+    newWr.wr.num_sge = 1;
+    newWr.wr.opcode = isRead ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
+    newWr.wr.send_flags = 0;
+    newWr.wr.wr.rdma.remote_addr = remoteAddr;
+    newWr.wr.wr.rdma.rkey = remote.rkey;
+  };
+
   for (size_t i = 0; i < batchSize; ++i) {
-    uint64_t currentLocalAddr = localBaseAddr + localOffsets[i];
-    uint64_t currentRemoteAddr = remoteBaseAddr + remoteOffsets[i];
-    size_t currentSize = sizes[i];
+    const size_t idx = indices[i];
+    const uint64_t currentLocalAddr = localBaseAddr + localOffsets[idx];
+    const uint64_t currentRemoteAddr = remoteBaseAddr + remoteOffsets[idx];
+    const uint32_t currentSize32 = static_cast<uint32_t>(sizes[idx]);
 
-    bool canMerge = !mergedWrs.empty() && (mergedWrs.back().wr.wr.rdma.remote_addr +
-                                           mergedWrs.back().totalRemoteLength) == currentRemoteAddr;
-
-    if (canMerge) {
+    bool merged = false;
+    if (!mergedWrs.empty()) {
       MergedWorkRequest& lastWr = mergedWrs.back();
-      ibv_sge& lastSge = lastWr.sges.back();
+      const uint64_t expectedRemoteAddr = lastWr.wr.wr.rdma.remote_addr + lastWr.totalRemoteLength;
+      if (expectedRemoteAddr == currentRemoteAddr) {
+        // Try to merge into last WR
+        ibv_sge& lastSge = lastWr.sges.back();
+        const bool localContiguous = (lastSge.addr + lastSge.length) == currentLocalAddr;
 
-      bool localContiguous = (lastSge.addr + lastSge.length) == currentLocalAddr;
-
-      if (localContiguous) {
-        lastSge.length += currentSize;
-        lastWr.mergedRequests += 1;
-      } else if (lastWr.sges.size() < maxSge) {
-        lastWr.sges.push_back(
-            {.addr = currentLocalAddr, .length = (uint32_t)currentSize, .lkey = local.lkey});
-        lastWr.wr.num_sge = static_cast<int>(lastWr.sges.size());
-        lastWr.mergedRequests += 1;
-      } else {
-        canMerge = false;
-      }
-
-      if (canMerge) {
-        lastWr.totalRemoteLength += currentSize;
+        if (localContiguous) {
+          // Ensure SGE length doesn't overflow uint32_t
+          const uint64_t newLen = static_cast<uint64_t>(lastSge.length) + currentSize32;
+          if (newLen <= std::numeric_limits<uint32_t>::max()) {
+            lastSge.length = static_cast<uint32_t>(newLen);
+            lastWr.mergedRequests += 1;
+            lastWr.totalRemoteLength += currentSize32;
+            merged = true;
+          }
+        }
+        if (!merged) {
+          if (lastWr.sges.size() < maxSge) {
+            // Append a new SGE into the same WR
+            lastWr.sges.push_back(
+                ibv_sge{.addr = currentLocalAddr, .length = currentSize32, .lkey = local.lkey});
+            lastWr.wr.num_sge = static_cast<int>(lastWr.sges.size());
+            lastWr.mergedRequests += 1;
+            lastWr.totalRemoteLength += currentSize32;
+            merged = true;
+          }
+        }
       }
     }
-
-    if (!canMerge) {
-      mergedWrs.emplace_back();
-      MergedWorkRequest& newWr = mergedWrs.back();
-      newWr.sges.reserve(maxSge);  // Make sure sges.data() is stable
-      newWr.sges.push_back(
-          {.addr = currentLocalAddr, .length = (uint32_t)currentSize, .lkey = local.lkey});
-
-      newWr.totalRemoteLength = currentSize;  // Initialize remote length
-
-      newWr.wr.sg_list = newWr.sges.data();
-      newWr.wr.num_sge = 1;
-      newWr.wr.opcode = isRead ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
-      newWr.wr.send_flags = 0;
-      newWr.wr.wr.rdma.remote_addr = currentRemoteAddr;
-      newWr.wr.wr.rdma.rkey = remote.rkey;
+    if (!merged) {
+      start_new_wr(currentRemoteAddr, currentLocalAddr, currentSize32);
     }
   }
 
@@ -158,8 +176,6 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
   if (postBatchSize == -1) postBatchSize = epBatchSize;
   int numPostBatch = (mergedWrCount + postBatchSize - 1) / postBatchSize;
 
-  std::vector<std::unique_ptr<CqCallbackMessage>> callbackMessages;
-  callbackMessages.reserve(epNum);               // At most one callback per endpoint
   std::vector<size_t> epPostedCounts(epNum, 0);  // Actual posted requests count per endpoint
 
   for (int i = 0; i < numPostBatch; i++) {
