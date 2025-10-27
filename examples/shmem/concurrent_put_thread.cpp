@@ -83,11 +83,70 @@ __global__ void ConcurrentPutThreadKernel_PureAddr(int myPe, uint32_t* localBuff
   }
 }
 
+// Test direct GPU-to-GPU access using peer pointers
+__global__ void DirectAccessTestKernel(int myPe, const SymmMemObjPtr memObj, uint32_t* peerBuffer, bool* accessResult) {
+  constexpr int sendPe = 0;
+  constexpr int recvPe = 1;
+  
+  int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
+  
+  if (globalTid == 0) {
+    // Print address information for debugging
+    printf("PE %d: localPtr = %p\n", myPe, memObj->localPtr);
+    if (memObj->peerPtrs) {
+      printf("PE %d: peerPtrs[0] = %p\n", myPe, (void*)memObj->peerPtrs[0]);
+      printf("PE %d: peerPtrs[1] = %p\n", myPe, (void*)memObj->peerPtrs[1]);
+    }
+  }
+  
+  __syncthreads();
+  
+  if (myPe == sendPe && globalTid < 1) {
+    // Try to write directly to peer's memory using peer pointer
+    if (peerBuffer != nullptr) {
+      // Test 1: Write a pattern to peer memory
+      uint32_t testValue = 0xABCD0000 + globalTid;
+      
+      // Attempt direct write to peer memory
+      __threadfence_system();
+      peerBuffer[globalTid] = testValue;
+      __threadfence_system();
+      
+      if (globalTid == 0) {
+        *accessResult = true;
+        printf("PE %d: Successfully wrote to peer address %p\n", myPe, peerBuffer);
+      }
+    }
+  } else if (myPe == recvPe && globalTid < 1) {
+    // Wait for data and verify
+    uint32_t expected = 0xABCD0000 + globalTid;
+    uint32_t* localBuff = reinterpret_cast<uint32_t*>(memObj->localPtr);
+    
+    // Wait for the write to arrive (with timeout)
+    int timeout = 1000000;
+    while (timeout-- > 0 && localBuff[globalTid] != expected) {
+      __threadfence_system();
+    }
+    
+    if (localBuff[globalTid] == expected) {
+      if (globalTid == 0) {
+        printf("PE %d: Successfully received data from peer\n", myPe);
+      }
+    } else {
+      if (globalTid == 0) {
+        printf("PE %d: Failed to receive expected data. Got 0x%x, expected 0x%x\n", 
+               myPe, localBuff[globalTid], expected);
+        *accessResult = false;
+      }
+    }
+  }
+}
+
 void ConcurrentPutThread() {
   int status;
   MPI_Init(NULL, NULL);
 
-  status = ShmemMpiInit(MPI_COMM_WORLD);
+  status = ShmemInit();
   assert(!status);
 
   // Assume in same node
@@ -105,6 +164,64 @@ void ConcurrentPutThread() {
     printf("Testing both Legacy and Pure Address APIs\n");
     printf("=================================================================\n");
   }
+
+    // ===== Test 0: Direct GPU-to-GPU Access Test =====
+  if (myPe == 0) {
+    printf("\n--- Test 0: Direct GPU-to-GPU Access Test ---\n");
+  }
+  
+  void* buff3 = ShmemMalloc(buffSize);
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff3), 0x12345678, numEle));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  SymmMemObjPtr buffObj3 = ShmemQueryMemObjPtr(buff3);
+  assert(buffObj3.IsValid());
+
+  // Allocate result flags on device
+  bool* d_accessResult;
+  HIP_RUNTIME_CHECK(hipMalloc(&d_accessResult, sizeof(bool)));
+  HIP_RUNTIME_CHECK(hipMemset(d_accessResult, 1, sizeof(bool))); // Initialize as true
+  
+  if (myPe == 0) {
+    printf("Running direct access test...\n");
+    // PE 0 gets PE 1's address for direct access
+    uint32_t* peerAddr = (myPe == 0) ? reinterpret_cast<uint32_t*>(buffObj3.cpu->peerPtrs[1]) : nullptr;
+    DirectAccessTestKernel<<<2, 64>>>(myPe, buffObj3, peerAddr, d_accessResult);
+  } else {
+    // PE 1 waits and verifies
+    DirectAccessTestKernel<<<2, 64>>>(myPe, buffObj3, nullptr, d_accessResult);
+  }
+  
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  // Check results
+  bool h_accessResult;
+  HIP_RUNTIME_CHECK(hipMemcpy(&h_accessResult, d_accessResult, sizeof(bool), hipMemcpyDeviceToHost));
+  
+  if (myPe == 0) {
+    if (h_accessResult) {
+      printf("✓ Direct GPU-to-GPU access test PASSED!\n");
+    } else {
+      printf("✗ Direct GPU-to-GPU access test FAILED!\n");
+    }
+  }
+
+  // Verify data integrity for Test 3
+  std::vector<uint32_t> hostBuff3(64); // Only check first 64 elements
+  HIP_RUNTIME_CHECK(hipMemcpy(hostBuff3.data(), buff3, 64 * sizeof(uint32_t), hipMemcpyDeviceToHost));
+  
+  if (myPe == 1) {
+    printf("PE %d verification: First few values: ", myPe);
+    for (int i = 0; i < 8; i++) {
+      printf("0x%x ", hostBuff3[i]);
+    }
+    printf("\n");
+  }
+
+  HIP_RUNTIME_CHECK(hipFree(d_accessResult));
+
+
 
   // ===== Test 1: Legacy API with SymmMemObjPtr + offset =====
   if (myPe == 0) {
@@ -191,6 +308,7 @@ void ConcurrentPutThread() {
   // Cleanup
   ShmemFree(buff1);
   ShmemFree(buff2);
+  ShmemFree(buff3);
   ShmemFinalize();
 }
 

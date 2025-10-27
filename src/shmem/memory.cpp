@@ -29,8 +29,7 @@
 namespace mori {
 namespace shmem {
 
-// Simple bump allocator for static symmetric heap
-// TODO: Implement a proper free list allocator for better memory reuse
+
 void* ShmemMalloc(size_t size) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
   states->CheckStatusValid();
@@ -39,31 +38,45 @@ void* ShmemMalloc(size_t size) {
     return nullptr;
   }
 
-  // Align to 256 bytes for better performance
-  constexpr size_t ALIGNMENT = 256;
-  size = (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+  // Check if using VMM heap
+  if (states->memoryStates->useVMMHeap && states->memoryStates->vmmHeapInitialized) {
+    // Use VMM-based allocation
+    application::SymmMemObjPtr memObj = states->memoryStates->symmMemMgr->VMMAllocChunk(size);
+    if (!memObj.IsValid()) {
+      MORI_SHMEM_ERROR("VMM allocation failed for size {} bytes", size);
+      return nullptr;
+    }
+    
+    MORI_SHMEM_TRACE("VMM allocated {} bytes at {}", size, memObj.cpu->localPtr);
+    return memObj.cpu->localPtr;
+  } else {
+    // Use traditional static heap bump allocator
+    // Align to 256 bytes for better performance
+    constexpr size_t ALIGNMENT = 256;
+    size = (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
 
-  std::lock_guard<std::mutex> lock(states->memoryStates->heapLock);
+    std::lock_guard<std::mutex> lock(states->memoryStates->heapLock);
 
-  // Check if we have enough space
-  if (states->memoryStates->staticHeapUsed + size > states->memoryStates->staticHeapSize) {
-    MORI_SHMEM_ERROR("Out of symmetric heap memory! Requested: {} bytes, Available: {} bytes", size,
-                     states->memoryStates->staticHeapSize - states->memoryStates->staticHeapUsed);
-    return nullptr;
+    // Check if we have enough space
+    if (states->memoryStates->staticHeapUsed + size > states->memoryStates->staticHeapSize) {
+      MORI_SHMEM_ERROR("Out of symmetric heap memory! Requested: {} bytes, Available: {} bytes", size,
+                       states->memoryStates->staticHeapSize - states->memoryStates->staticHeapUsed);
+      return nullptr;
+    }
+
+    // Allocate from the bump pointer
+    uintptr_t baseAddr = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
+    void* ptr = reinterpret_cast<void*>(baseAddr + states->memoryStates->staticHeapUsed);
+    states->memoryStates->staticHeapUsed += size;
+
+    states->memoryStates->symmMemMgr->HeapRegisterSymmMemObj(ptr, size,
+                                                             &states->memoryStates->staticHeapObj);
+    MORI_SHMEM_TRACE("Static heap allocated {} bytes at offset {} (total used: {} / {})", size,
+                     reinterpret_cast<uintptr_t>(ptr) - baseAddr,
+                     states->memoryStates->staticHeapUsed, states->memoryStates->staticHeapSize);
+
+    return ptr;
   }
-
-  // Allocate from the bump pointer
-  uintptr_t baseAddr = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
-  void* ptr = reinterpret_cast<void*>(baseAddr + states->memoryStates->staticHeapUsed);
-  states->memoryStates->staticHeapUsed += size;
-
-  states->memoryStates->symmMemMgr->HeapRegisterSymmMemObj(ptr, size,
-                                                           &states->memoryStates->staticHeapObj);
-  MORI_SHMEM_TRACE("Allocated {} bytes at offset {} (total used: {} / {})", size,
-                   reinterpret_cast<uintptr_t>(ptr) - baseAddr,
-                   states->memoryStates->staticHeapUsed, states->memoryStates->staticHeapSize);
-
-  return ptr;
 }
 
 void* ShmemExtMallocWithFlags(size_t size, unsigned int flags) {
@@ -81,7 +94,17 @@ void ShmemFree(void* localPtr) {
     return;
   }
 
-  states->memoryStates->symmMemMgr->HeapDeregisterSymmMemObj(localPtr);
+  // Check if using VMM heap
+  if (states->memoryStates->useVMMHeap && states->memoryStates->vmmHeapInitialized) {
+    // Use VMM-based deallocation (true free)
+    states->memoryStates->symmMemMgr->VMMFreeChunk(localPtr);
+    MORI_SHMEM_TRACE("VMM freed memory at {}", localPtr);
+  } else {
+    // For static heap, we can only deregister but not actually free
+    // (bump allocator limitation)
+    states->memoryStates->symmMemMgr->HeapDeregisterSymmMemObj(localPtr);
+    MORI_SHMEM_TRACE("Static heap deregistered memory at {} (memory not reclaimed)", localPtr);
+  }
 }
 
 application::SymmMemObjPtr ShmemQueryMemObjPtr(void* localPtr) {
