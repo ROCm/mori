@@ -211,7 +211,7 @@ class EpDispatchCombineTestCase:
         assert len(src_token_pos) == dispatch_recv_num_token[0]
 
     def check_combine_result(
-        self, test_data, combine_output, combine_output_weight, round
+        self, test_data, combine_output, combine_output_weight=None, round=0
     ):
         (
             input,
@@ -220,7 +220,7 @@ class EpDispatchCombineTestCase:
             scales,
         ) = test_data
 
-        def _get_expected(input, indices, weights, scales, combine_weights):
+        def _get_expected(input, indices, weights, scales):
             if input.dtype == torch.float8_e4m3fnuz:
                 assert scales is not None
                 input = self.dequantize_input(input, scales, dtype=torch.float32)
@@ -237,11 +237,8 @@ class EpDispatchCombineTestCase:
             return expected_output, expected_weight
 
         expected_output, expected_weight = _get_expected(
-            input, indices, weights, scales, combine_output_weight
+            input, indices, weights, scales
         )
-
-        combine_output = combine_output
-        combine_output_weight = combine_output_weight
 
         result_match = torch.allclose(
             combine_output, expected_output, atol=1e-2, rtol=1e-2
@@ -319,37 +316,19 @@ class EpDispatchCombineTestCase:
                     dispatch_scales.clone() if dispatch_scales is not None else None,
                     dispatch_indices.clone(),
                     dispatch_recv_num_token.clone(),
-                    op.src_token_pos.clone(),
+                    op.get_dispatch_src_token_pos().clone(),
                 )
             else:
                 dispatch_result = None
 
-            num_recv_token = dispatch_recv_num_token.item()
-            if num_recv_token == 0:
-                weighted_output = torch.empty_like(dispatch_output)
-            else:
-                dispatch_output = dispatch_output[:num_recv_token]
-                dispatch_weights = dispatch_weights[:num_recv_token]
-                dispatch_indices = dispatch_indices[:num_recv_token]
-                if dispatch_scales is not None:
-                    dispatch_scales = dispatch_scales[:num_recv_token]
-
-                mask = (
-                    self.config.num_experts_per_rank * self.config.rank
-                    <= dispatch_indices
-                ) & (
-                    dispatch_indices
-                    < self.config.num_experts_per_rank * (self.config.rank + 1)
-                )
-                mask = mask.to(self.device)
-                if dispatch_output.dtype == torch.float8_e4m3fnuz:
-                    dispatch_output = self.dequantize_input(
-                        dispatch_output, dispatch_scales, dtype=torch.float32
-                    )
-                masked_weights = (mask * dispatch_weights).sum(dim=-1)
-                weighted_output = dispatch_output * masked_weights.unsqueeze(1)
-
-            weighted_output = weighted_output.to(torch.float32)
+            weighted_output = self.moe_sum(
+                dispatch_recv_num_token,
+                dispatch_output,
+                dispatch_weights,
+                dispatch_indices,
+                dispatch_scales,
+                dtype=torch.float32,
+            )
             combine_output, combine_output_weights = op.combine(
                 weighted_output, dispatch_weights, dispatch_indices
             )
@@ -361,6 +340,45 @@ class EpDispatchCombineTestCase:
             outputs.append((dispatch_result, combine_result))
 
         return outputs
+
+    def moe_sum(
+        self,
+        dispatch_recv_num_token,
+        dispatch_output,
+        dispatch_weights,
+        dispatch_indices,
+        dispatch_scales,
+        output=None,
+        dtype=torch.bfloat16,
+    ):
+        num_recv_token = dispatch_recv_num_token.item()
+        if num_recv_token == 0:
+            weighted_output = torch.empty_like(dispatch_output)
+        else:
+            dispatch_output = dispatch_output[:num_recv_token]
+            dispatch_weights = dispatch_weights[:num_recv_token]
+            dispatch_indices = dispatch_indices[:num_recv_token]
+            if dispatch_scales is not None:
+                dispatch_scales = dispatch_scales[:num_recv_token]
+
+            mask = (
+                self.config.num_experts_per_rank * self.config.rank <= dispatch_indices
+            ) & (
+                dispatch_indices
+                < self.config.num_experts_per_rank * (self.config.rank + 1)
+            )
+            mask = mask.to(self.device)
+            if dispatch_output.dtype == torch.float8_e4m3fnuz:
+                dispatch_output = self.dequantize_input(
+                    dispatch_output, dispatch_scales, dtype=dtype
+                )
+            masked_weights = (mask * dispatch_weights).sum(dim=-1)
+            weighted_output = dispatch_output * masked_weights.unsqueeze(1)
+        weighted_output = weighted_output.to(dtype)
+
+        if output is not None:
+            output.copy_(weighted_output)
+        return weighted_output
 
     def run_test(self, op, test_dataset):
         # Run mori dispathc/combine for all test data
