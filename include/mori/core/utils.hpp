@@ -56,29 +56,27 @@ inline __device__ int FlatBlockWarpId() { return FlatBlockThreadId() / DeviceWar
 
 inline __device__ int WarpLaneId() { return FlatBlockThreadId() & (DeviceWarpSize() - 1); }
 
-inline __device__ bool IsThreadZeroInBlock() {  
-    return (FlatBlockThreadId() % DeviceWarpSize()) == 0;  
-}  
-  
-inline __device__ uint64_t GetActiveLaneMask() {  
-    return __ballot(true);  
-}  
-  
-inline __device__ unsigned int GetActiveLaneCount(uint64_t activeLaneMask) {  
-    return __popcll(activeLaneMask);  
-}  
-  
-inline __device__ unsigned int GetActiveLaneCount() {  
-    return GetActiveLaneCount(GetActiveLaneMask());  
-}  
-  
-inline __device__ unsigned int GetActiveLaneNum(uint64_t activeLaneMask) {  
-    return __popcll(activeLaneMask & __lanemask_lt());  
-}  
-  
-inline __device__ unsigned int GetActiveLaneNum() {  
-    return GetActiveLaneNum(GetActiveLaneMask());  
+inline __device__ int WarpLaneId1D() { return threadIdx.x & (warpSize - 1); }
+
+inline __device__ bool IsThreadZeroInBlock() {
+  return (FlatBlockThreadId() % DeviceWarpSize()) == 0;
 }
+
+inline __device__ uint64_t GetActiveLaneMask() { return __ballot(true); }
+
+inline __device__ unsigned int GetActiveLaneCount(uint64_t activeLaneMask) {
+  return __popcll(activeLaneMask);
+}
+
+inline __device__ unsigned int GetActiveLaneCount() {
+  return GetActiveLaneCount(GetActiveLaneMask());
+}
+
+inline __device__ unsigned int GetActiveLaneNum(uint64_t activeLaneMask) {
+  return __popcll(activeLaneMask & __lanemask_lt());
+}
+
+inline __device__ unsigned int GetActiveLaneNum() { return GetActiveLaneNum(GetActiveLaneMask()); }
 
 inline __device__ int GetFirstActiveLaneID(uint64_t activeLaneMask) {
   return activeLaneMask ? __ffsll((unsigned long long int)activeLaneMask) - 1 : -1;
@@ -92,21 +90,17 @@ inline __device__ int GetLastActiveLaneID(uint64_t activeLaneMask) {
 
 inline __device__ int GetLastActiveLaneID() { return GetLastActiveLaneID(GetActiveLaneMask()); }
 
-inline __device__ bool IsFirstActiveLane(uint64_t activeLaneMask) {  
-    return GetActiveLaneNum(activeLaneMask) == 0;  
-}  
-  
-inline __device__ bool IsFirstActiveLane() {  
-    return IsFirstActiveLane(GetActiveLaneMask());  
-}  
-  
-inline __device__ bool IsLastActiveLane(uint64_t activeLaneMask) {  
-    return GetActiveLaneNum(activeLaneMask) == GetActiveLaneCount(activeLaneMask) - 1;  
-}  
-  
-inline __device__ bool IsLastActiveLane() {  
-    return IsLastActiveLane(GetActiveLaneMask());  
-}  
+inline __device__ bool IsFirstActiveLane(uint64_t activeLaneMask) {
+  return GetActiveLaneNum(activeLaneMask) == 0;
+}
+
+inline __device__ bool IsFirstActiveLane() { return IsFirstActiveLane(GetActiveLaneMask()); }
+
+inline __device__ bool IsLastActiveLane(uint64_t activeLaneMask) {
+  return GetActiveLaneNum(activeLaneMask) == GetActiveLaneCount(activeLaneMask) - 1;
+}
+
+inline __device__ bool IsLastActiveLane() { return IsLastActiveLane(GetActiveLaneMask()); }
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Atomic Operations                                       */
@@ -149,6 +143,26 @@ inline __device__ void AtomicStoreSeqCst(T* ptr, T val) {
 template <typename T>
 inline __device__ void AtomicStoreSeqCstSystem(T* ptr, T val) {
   return __hip_atomic_store(ptr, val, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+template <typename T>
+inline __device__ T AtomicAddSeqCst(T* ptr, T val) {
+  return __hip_atomic_fetch_add(ptr, val, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+template <typename T>
+inline __device__ T AtomicAddSeqCstSystem(T* ptr, T val) {
+  return __hip_atomic_fetch_add(ptr, val, __ATOMIC_SEQ_CST, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+template <typename T>
+inline __device__ T AtomicAddRelaxed(T* ptr, T val) {
+  return __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+template <typename T>
+inline __device__ T AtomicAddRelaxedSystem(T* ptr, T val) {
+  return __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 template <typename T>

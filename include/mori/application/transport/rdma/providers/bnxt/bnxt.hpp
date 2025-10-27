@@ -85,9 +85,9 @@ class BnxtQpContainer {
 
   void ModifyRst2Init();
   void ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr,
-                      const ibv_device_attr_ex& deviceAttr, uint32_t qpId = 0);
+                      const ibv_device_attr_ex& deviceAttr);
   void ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
-                     const RdmaEndpointHandle& remote_handle);
+                     const RdmaEndpointHandle& remote_handle, uint32_t qpId = 0);
 
   void* GetSqAddress();
   void* GetMsntblAddress();

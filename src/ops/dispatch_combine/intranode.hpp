@@ -82,7 +82,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   int myPe = config.rank;
   int npes = config.worldSize;
 
-  size_t maxNumOutTokenPerRank = config.MaxNumTokensToSend();
+  size_t maxNumTokensToSend = config.MaxNumTokensToSend();
 
   if (args.tokenIndices && args.inpTokenBuf) {
     // Phase1: send token
@@ -104,7 +104,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       if (__any(condition)) {
         // Indicate that this token is already sent to the destination PE by setting an overflow
         // token index
-        if (laneId == 0) args.dispDestTokIdMap[i] = config.worldSize * maxNumOutTokenPerRank;
+        if (laneId == 0) args.dispDestTokIdMap[i] = config.worldSize * maxNumTokensToSend;
         continue;
       }
 
@@ -112,7 +112,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
         // decide token id in dest pe
         destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
         atomicAdd(args.destPeTokenCounter + destPe, 1);
-        args.dispDestTokIdMap[i] = destPe * maxNumOutTokenPerRank + destTokId;
+        args.dispDestTokIdMap[i] = destPe * maxNumTokensToSend + destTokId;
 
         // TODO: use a switch to control the writing of this buffer, should only turn on for testing
         args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
@@ -250,10 +250,10 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     // Prepare data pointers on different GPUs
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
       index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
-      index_t destPe = destTokId / maxNumOutTokenPerRank;
+      index_t destPe = destTokId / maxNumTokensToSend;
 
       if (destPe < config.worldSize) {
-        index_t destLocalTokId = destTokId - destPe * maxNumOutTokenPerRank;
+        index_t destLocalTokId = destTokId - destPe * maxNumTokensToSend;
         srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
                      destLocalTokId * config.hiddenDim + hiddenDimOffset;
         srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +

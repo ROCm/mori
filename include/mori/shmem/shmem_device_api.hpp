@@ -45,6 +45,17 @@ namespace shmem {
     assert(false);                                                                \
   }
 
+#define DISPATCH_TRANSPORT_TYPE_WITH_BOOL(func, boolParam, pe, ...)               \
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();                           \
+  application::TransportType transportType = globalGpuStates->transportTypes[pe]; \
+  if (transportType == application::TransportType::RDMA) {                        \
+    func<application::TransportType::RDMA, boolParam>(__VA_ARGS__);               \
+  } else if (transportType == application::TransportType::P2P) {                  \
+    func<application::TransportType::P2P, boolParam>(__VA_ARGS__);                \
+  } else {                                                                        \
+    assert(false);                                                                \
+  }
+
 #define DISPATCH_TRANSPORT_DATA_TYPE_WITH_RETURN(func, pe, type, ...)               \
   [&]() {                                                                           \
     GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();                           \
@@ -76,6 +87,10 @@ inline __device__ void ShmemQuietThread(int pe, int qpId) {
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Point-to-Point                                         */
+/* ---------------------------------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                        PutNbi APIs                                             */
 /* ---------------------------------------------------------------------------------------------- */
 #define DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Scope)                                          \
   inline __device__ void ShmemPutMemNbi##Scope(                                               \
@@ -156,6 +171,9 @@ DEFINE_SHMEM_PUT_TYPE_NBI_API(Int64, int64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Float, float, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Double, double, Warp)
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                       PutNbi Inline APIs                                       */
+/* ---------------------------------------------------------------------------------------------- */
 // TODO: deal with bytes count limit
 #define SHMEM_PUT_SIZE_IMM_NBI_API(Scope)                                                        \
   inline __device__ void ShmemPutSizeImmNbi##Scope(const application::SymmMemObjPtr dest,        \
@@ -204,6 +222,109 @@ DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int32, int32_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int64, int64_t, Warp)
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                      PutNbi with Signal APIs                                   */
+/* ---------------------------------------------------------------------------------------------- */
+// PutNbi with Signal - Memory version
+#define DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Scope)                                        \
+  template <bool onlyOneSignal = true>                                                             \
+  inline __device__ void ShmemPutMemNbiSignal##Scope(                                              \
+      const application::SymmMemObjPtr dest, size_t destOffset,                                    \
+      const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,              \
+      const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,  \
+      core::atomicType signalOp, int pe, int qpId = 0) {                                           \
+    DISPATCH_TRANSPORT_TYPE_WITH_BOOL(ShmemPutMemNbiSignal##Scope##Kernel, onlyOneSignal, pe,      \
+                                     dest, destOffset, source, sourceOffset, bytes, signalDest,    \
+                                     signalDestOffset, signalValue, signalOp, pe, qpId);           \
+  }                                                                                                \
+  template <bool onlyOneSignal = true>                                                             \
+  inline __device__ void ShmemPutMemNbiSignal##Scope(                                              \
+      const application::SymmMemObjPtr dest, size_t destOffset,                                    \
+      const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,                  \
+      const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,  \
+      core::atomicType signalOp, int pe, int qpId = 0) {                                           \
+    int rank = GetGlobalGpuStatesPtr()->rank;                                                      \
+    ShmemPutMemNbiSignal##Scope<onlyOneSignal>(                                                    \
+        dest, destOffset, source->GetRdmaMemoryRegion(rank), sourceOffset, bytes, signalDest,      \
+        signalDestOffset, signalValue, signalOp, pe, qpId);                                        \
+  }
+
+DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Thread)
+DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Warp)
+
+// PutNbi with Signal - Typed version
+#define DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API_TEMPLATE(Scope)                                      \
+  template <typename T, bool onlyOneSignal = true>                                                \
+  inline __device__ void ShmemPutTypeNbiSignal##Scope(                                            \
+      const application::SymmMemObjPtr dest, size_t destElmOffset,                                \
+      const application::RdmaMemoryRegion& source, size_t srcElmOffset, size_t nelems,            \
+      const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue, \
+      core::atomicType signalOp, int pe, int qpId = 0) {                                          \
+    constexpr size_t typeSize = sizeof(T);                                                        \
+    ShmemPutMemNbiSignal##Scope<onlyOneSignal>(                                                   \
+        dest, destElmOffset * typeSize, source, srcElmOffset * typeSize, nelems * typeSize,       \
+        signalDest, signalDestOffset, signalValue, signalOp, pe, qpId);                           \
+  }                                                                                               \
+  template <typename T, bool onlyOneSignal = true>                                                \
+  inline __device__ void ShmemPutTypeNbiSignal##Scope(                                            \
+      const application::SymmMemObjPtr dest, size_t destElmOffset,                                \
+      const application::SymmMemObjPtr source, size_t srcElmOffset, size_t nelems,                \
+      const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue, \
+      core::atomicType signalOp, int pe, int qpId = 0) {                                          \
+    int rank = GetGlobalGpuStatesPtr()->rank;                                                     \
+    ShmemPutTypeNbiSignal##Scope<T, onlyOneSignal>(                                               \
+        dest, destElmOffset, source->GetRdmaMemoryRegion(rank), srcElmOffset, nelems, signalDest, \
+        signalDestOffset, signalValue, signalOp, pe, qpId);                                       \
+  }
+
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API_TEMPLATE(Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API_TEMPLATE(Warp)
+
+// PutNbi with Signal - Concrete typed versions
+#define DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(TypeName, T, Scope)                                   \
+  template <bool onlyOneSignal = true>                                                             \
+  inline __device__ void ShmemPut##TypeName##NbiSignal##Scope(                                     \
+      const application::SymmMemObjPtr dest, size_t destElmOffset,                                 \
+      const application::RdmaMemoryRegion& source, size_t srcElmOffset, size_t nelems,             \
+      const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,  \
+      core::atomicType signalOp, int pe, int qpId = 0) {                                           \
+    ShmemPutTypeNbiSignal##Scope<T, onlyOneSignal>(dest, destElmOffset, source, srcElmOffset,      \
+                                                   nelems, signalDest, signalDestOffset,           \
+                                                   signalValue, signalOp, pe, qpId);               \
+  }                                                                                                \
+  template <bool onlyOneSignal = true>                                                             \
+  inline __device__ void ShmemPut##TypeName##NbiSignal##Scope(                                     \
+      const application::SymmMemObjPtr dest, size_t destElmOffset,                                 \
+      const application::SymmMemObjPtr source, size_t srcElmOffset, size_t nelems,                 \
+      const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,  \
+      core::atomicType signalOp, int pe, int qpId = 0) {                                           \
+    ShmemPutTypeNbiSignal##Scope<T, onlyOneSignal>(dest, destElmOffset, source, srcElmOffset,      \
+                                                   nelems, signalDest, signalDestOffset,           \
+                                                   signalValue, signalOp, pe, qpId);               \
+  }
+
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint8, uint8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int8, int8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint16, uint16_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int16, int16_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Float, float, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Double, double, Thread)
+
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint8, uint8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int8, int8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint16, uint16_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int16, int16_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Float, float, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Double, double, Warp)
+
 #define SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Scope)                                         \
   inline __device__ void ShmemAtomicSizeNonFetch##Scope(                                       \
       const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,       \
@@ -243,6 +364,9 @@ DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int32, int32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int64, int64_t, Warp)
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                       Atomic Fetch APIs                                        */
+/* ---------------------------------------------------------------------------------------------- */
 #define SHMEM_ATOMIC_TYPE_FETCH_API_TEMPLATE(Scope)                                              \
   template <typename T>                                                                          \
   inline __device__ T ShmemAtomicTypeFetch##Scope(                                               \
@@ -274,6 +398,9 @@ DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int32, int32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int64, int64_t, Warp)
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                    Wait Until Greater Than APIs                                */
+/* ---------------------------------------------------------------------------------------------- */
 template <typename T>
 inline __device__ T ShmemTypeWaitUntilGreaterThan(T* addr, T val) {
   T got;
@@ -297,6 +424,9 @@ DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Int32, int32_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Uint64, uint64_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Int64, int64_t)
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                       Wait Until Equal APIs                                    */
+/* ---------------------------------------------------------------------------------------------- */
 template <typename T>
 inline __device__ void ShmemTypeWaitUntilEquals(T* addr, T val) {
   while (core::AtomicLoadRelaxedSystem(addr) != val) {

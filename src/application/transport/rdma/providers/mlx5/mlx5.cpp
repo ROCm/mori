@@ -253,7 +253,7 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   assert(qpUar->page_id != 0);
 
   if (config.onGpu) {
-    uint32_t flag = hipHostRegisterPortable | hipHostRegisterMapped | hipHostRegisterIoMemory;
+    uint32_t flag = hipHostRegisterPortable | hipHostRegisterMapped;
     HIP_RUNTIME_CHECK(hipHostRegister(qpUar->reg_addr, QueryHcaCap(context).dbrRegSize, flag));
     HIP_RUNTIME_CHECK(hipHostGetDevicePointer(&qpUarPtr, qpUar->reg_addr, 0));
   } else {
@@ -410,7 +410,7 @@ void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
     DEVX_SET(qpc, qpc, primary_address_path.src_addr_index, config.gidIdx);
     // Use shared UDP sport configuration with qpId-based selection
     uint16_t selected_udp_sport = device_context->GetUdpSport(qpId);
-    DEVX_SET(qpc, qpc, primary_address_path.udp_sport, selected_udp_sport);
+    DEVX_SET(qpc, qpc, primary_address_path.udp_sport, selected_udp_sport | 0xC000);
     MORI_APP_TRACE("MLX5 QP {} using UDP sport {} (qpId={}, index={})", qpn, selected_udp_sport,
                    qpId, qpId % RDMA_UDP_SPORT_ARRAY_SIZE);
   } else if (portAttr.link_layer == IBV_LINK_LAYER_INFINIBAND) {

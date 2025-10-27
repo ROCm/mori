@@ -36,6 +36,7 @@ namespace moe {
 enum KernelType {
   IntraNode = 0,
   InterNode = 1,
+  InterNodeV1 = 2,
 };
 
 inline const char* HipDataTypeToString(hipDataType dtype) {
@@ -84,6 +85,8 @@ struct EpDispatchCombineConfig {
   // If true, use external buffer which incurs extra copy overhead; otherwise, the kernel assumes
   // the provided buffer is shmemInpTokMemObj
   bool useExternalInpBuffer{true};
+  int gpuPerNode{8};
+  int rdmaBlockNum{1};
 
   inline __host__ __device__ int MaxNumTokensToSendPerRank() const { return maxNumInpTokenPerRank; }
 
@@ -217,6 +220,24 @@ class EpDispatchCombineHandle {
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint32_t* crossDeviceBarrierFlag{nullptr};
+
+  // Inter-node v1 kernel parameters
+  // Signal the completion of inter-node token transfer
+  mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
+  // Signal the number of tokens transfered from other nodes
+  mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;
+  // Count the number of tokens sent to other nodes
+  index_t* destNodeTokenCounter{nullptr};
+  // Counter that is used to sort the ordering of inter-node token chunk transfer
+  index_t* blockFlagCounter{nullptr};
+  // Barrier blocks that do inter node rdma transfer
+  uint32_t* interNodeBlocksBarrier{nullptr};
+  // Map dispatch token idx for inter-node tokens
+  index_t* interNodeDispDestTokIdMap{nullptr};
+  // Barrier rdma block group
+  index_t* interNodeChunkFlagCombine{nullptr};
+  // Map dispatched rdma token chunk index
+  index_t* interNodeDispSendMap{nullptr};
 };
 
 template <typename T>
@@ -256,6 +277,14 @@ struct EpDispatchCombineArgs {
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint32_t* crossDeviceBarrierFlag{nullptr};
+  mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
+  index_t* destNodeTokenCounter{nullptr};
+  mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;
+  index_t* blockFlagCounter{nullptr};
+  uint32_t* interNodeBlocksBarrier{nullptr};
+  index_t* interNodeDispDestTokIdMap{nullptr};
+  index_t* interNodeChunkFlagCombine{nullptr};
+  index_t* interNodeDispSendMap{nullptr};
 };
 
 using EpDispatchCombineArgsVariant =
@@ -299,6 +328,14 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.totalRecvTokenNum = handle.totalRecvTokenNum;
   args.crossDeviceBarrierMemObj = handle.crossDeviceBarrierMemObj;
   args.crossDeviceBarrierFlag = handle.crossDeviceBarrierFlag;
+  args.interNodeChunkFlagMemObj = handle.interNodeChunkFlagMemObj;
+  args.destNodeTokenCounter = handle.destNodeTokenCounter;
+  args.nodeRecvTokenNumMemObj = handle.nodeRecvTokenNumMemObj;
+  args.blockFlagCounter = handle.blockFlagCounter;
+  args.interNodeBlocksBarrier = handle.interNodeBlocksBarrier;
+  args.interNodeDispDestTokIdMap = handle.interNodeDispDestTokIdMap;
+  args.interNodeChunkFlagCombine = handle.interNodeChunkFlagCombine;
+  args.interNodeDispSendMap = handle.interNodeDispSendMap;
   return args;
 }
 

@@ -273,15 +273,6 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
     memset(atomicIbufAddr, 0, atomicIbufSize);
     assert(!status);
   }
-  if (config.onGpu) {
-    HIP_RUNTIME_CHECK(
-        hipExtMallocWithFlags(&atomicIbufAddr, atomicIbufSize, hipDeviceMallocUncached));
-    HIP_RUNTIME_CHECK(hipMemset(atomicIbufAddr, 0, atomicIbufSize));
-  } else {
-    err = posix_memalign(&atomicIbufAddr, config.alignment, atomicIbufSize);
-    memset(atomicIbufAddr, 0, atomicIbufSize);
-    assert(!err);
-  }
 
   // Register atomic ibuf as independent memory region
   atomicIbufMr = ibv_reg_mr(pd, atomicIbufAddr, atomicIbufSize,
@@ -368,7 +359,7 @@ void BnxtQpContainer::ModifyRst2Init() {
 
 void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
                                      const ibv_port_attr& portAttr,
-                                     const ibv_device_attr_ex& deviceAttr, uint32_t qpId) {
+                                     const ibv_device_attr_ex& deviceAttr) {
   struct ibv_qp_attr attr;
   int attr_mask;
 
@@ -389,27 +380,15 @@ void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
   attr.max_dest_rd_atomic = deviceAttr.orig_attr.max_qp_rd_atom;
   attr.min_rnr_timer = 12;
 
-  // Use qpId to select UDP sport value from the shared configuration (round-robin)
-  uint16_t selected_udp_sport = GetDeviceContext()->GetUdpSport(qpId);
-  MORI_APP_TRACE("QP {} using UDP sport {} (qpId={}, index={})", qpn, selected_udp_sport, qpId,
-                 qpId % RDMA_UDP_SPORT_ARRAY_SIZE);
-  int status = bnxt_re_dv_modify_qp_udp_sport(qp, selected_udp_sport);
-  if (status) {
-    MORI_APP_ERROR("Failed to set UDP sport {} for QP {}: error code {}", selected_udp_sport, qpn,
-                   status);
-  }
-  assert(!status);
-  MORI_APP_TRACE("bnxt_re_dv_modify_qp_udp_sport is done, return {}", status);
-
   attr_mask = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_RQ_PSN | IBV_QP_DEST_QPN | IBV_QP_AV |
               IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
 
-  status = bnxt_re_dv_modify_qp(qp, &attr, attr_mask, 0, 0);
+  int status = bnxt_re_dv_modify_qp(qp, &attr, attr_mask, 0, 0);
   assert(!status);
 }
 
 void BnxtQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
-                                    const RdmaEndpointHandle& remote_handle) {
+                                    const RdmaEndpointHandle& remote_handle, uint32_t qpId) {
   struct ibv_qp_attr attr;
   int attr_mask;
 
@@ -426,6 +405,17 @@ void BnxtQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
 
   int status = bnxt_re_dv_modify_qp(qp, &attr, attr_mask, 0, 0);
   assert(!status);
+    // Use qpId to select UDP sport value from the shared configuration (round-robin)
+  uint16_t selected_udp_sport = GetDeviceContext()->GetUdpSport(qpId);
+  MORI_APP_TRACE("QP {} using UDP sport {} (qpId={}, index={})", qpn, selected_udp_sport, qpId,
+                 qpId % RDMA_UDP_SPORT_ARRAY_SIZE);
+  status = bnxt_re_dv_modify_qp_udp_sport(qp, selected_udp_sport);
+  if (status) {
+    MORI_APP_ERROR("Failed to set UDP sport {} for QP {}: error code {}", selected_udp_sport, qpn,
+                   status);
+  }
+  assert(!status);
+  MORI_APP_TRACE("bnxt_re_dv_modify_qp_udp_sport is done, return {}", status);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -473,8 +463,7 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   void* uar_host = (void*)dbrAttr.dbr;
   void* uar_dev = uar_host;
   if (config.onGpu) {
-    constexpr uint32_t flag =
-        hipHostRegisterPortable | hipHostRegisterMapped | hipHostRegisterIoMemory;
+    constexpr uint32_t flag = hipHostRegisterPortable | hipHostRegisterMapped;
 
     HIP_RUNTIME_CHECK(hipHostRegister(uar_host, getpagesize(), flag));
     HIP_RUNTIME_CHECK(hipHostGetDevicePointer(&uar_dev, uar_host, 0));
@@ -530,8 +519,8 @@ void BnxtDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   const ibv_device_attr_ex& deviceAttr = *(rdmaDevice->GetDeviceAttr());
   const ibv_port_attr& portAttr = *(rdmaDevice->GetPortAttrMap()->find(local.portId)->second);
   qp->ModifyRst2Init();
-  qp->ModifyInit2Rtr(remote, portAttr, deviceAttr, qpId);
-  qp->ModifyRtr2Rts(local, remote);
+  qp->ModifyInit2Rtr(remote, portAttr, deviceAttr);
+  qp->ModifyRtr2Rts(local, remote, qpId);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
