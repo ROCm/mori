@@ -34,7 +34,8 @@ namespace moe {
 /*                                          BarrierKernel                                         */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>
-inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T> args) {
+inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T> args,
+                                                         const uint32_t crossDeviceBarrierFlag) {
   int thdId = threadIdx.x;
   int laneId = threadIdx.x & (warpSize - 1);
   int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
@@ -50,12 +51,12 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
     args.combineGridBarrier[0] = 0;
     core::AtomicStoreRelaxedSystem(
         args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(globalThdId) + args.config.rank,
-        *args.crossDeviceBarrierFlag);
+        crossDeviceBarrierFlag);
   }
 
   uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
   if (thdId < args.config.worldSize) {
-    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != *args.crossDeviceBarrierFlag) {
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != crossDeviceBarrierFlag) {
     }
   }
   __syncthreads();
@@ -206,7 +207,8 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   int myPe = config.rank;
   int npes = config.worldSize;
 
-  size_t maxNumTokensToSend = config.MaxNumTokensToSend();
+  const uint32_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
+  size_t maxNumOutTokenPerRank = config.MaxNumTokensToSend();
   // Copy input to shmem registered buffer so that other GPUs can access directly
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   if (args.config.useExternalInpBuffer) {
@@ -225,7 +227,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   }
 
   // Make sure copy on all GPUs are finished
-  CrossDeviceBarrierIntraNodeKernel(args);
+  CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
   *args.totalRecvTokenNum = 0;
   if (args.curRankNumToken == 0) return;
 
@@ -270,6 +272,11 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
           args.shmemOutWeightsMemObj->template GetAs<float*>() + tokenId * config.numExpertPerToken,
           srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
     }
+  }
+
+  if (globalThdId == 0) {
+    __hip_atomic_fetch_add(args.crossDeviceBarrierFlag, 1, __ATOMIC_RELEASE,
+                           __HIP_MEMORY_SCOPE_SYSTEM);
   }
 }
 
