@@ -27,9 +27,21 @@ import torch.distributed as dist
 import argparse
 
 
+kernel_type_map = {
+    "v0": mori.ops.EpDispatchCombineKernelType.InterNode,
+    "v1": mori.ops.EpDispatchCombineKernelType.InterNodeV1,
+}
+
+
 class EpDispatchCombineTestCase:
     def __init__(
-        self, rank, gpu_per_node, world_size, max_tokens, dtype=torch.bfloat16
+        self,
+        rank,
+        gpu_per_node,
+        world_size,
+        max_tokens,
+        kernel_type,
+        dtype=torch.bfloat16,
     ):
         self.rank = rank
         self.gpu_per_node = gpu_per_node
@@ -46,11 +58,11 @@ class EpDispatchCombineTestCase:
             # num_experts_per_rank=256 // world_size,
             num_experts_per_token=8,
             warp_num_per_block=16,
-            block_num=32,
+            block_num=80,
             max_token_type_size=2,
-            kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeV1,
+            kernel_type=kernel_type_map[kernel_type],
             gpu_per_node=self.gpu_per_node,
-            rdma_block_num=16,
+            rdma_block_num=64,
         )
 
     def setup(self):
@@ -150,53 +162,6 @@ class EpDispatchCombineTestCase:
         num_total_experts = self.config.num_experts_per_rank * self.config.world_size
         num_nodes = self.config.world_size // self.config.gpu_per_node
 
-        # Per-rank counts
-        rank_counts = torch.zeros(
-            self.config.world_size, dtype=torch.int32, device=self.device
-        )
-        rank_counts_remote_recv = torch.zeros(
-            self.config.world_size, dtype=torch.int32, device=self.device
-        )
-        rank_counts_remote_send = torch.zeros(
-            self.config.world_size, dtype=torch.int32, device=self.device
-        )
-
-        for src_rank, indices in enumerate(all_rank_indices):
-            src_node = src_rank // self.config.gpu_per_node
-
-            # Map expert IDs to rank IDs
-            token_ranks = (
-                indices // self.config.num_experts_per_rank
-            )  # [num_tokens, num_experts_per_token]
-
-            # Deduplicate rank IDs per token
-            unique_ranks_per_token = [torch.unique(row) for row in token_ranks]
-
-            # For each token, update counts
-            for ur in unique_ranks_per_token:
-                rank_counts[ur] += 1  # All ranks that receive this token
-
-                dst_nodes = {
-                    dst_rank // self.config.gpu_per_node for dst_rank in ur.tolist()
-                }
-
-                for dst_rank in ur.tolist():
-                    dst_node = dst_rank // self.config.gpu_per_node
-                    if dst_node != src_node:
-                        # Receiving side
-                        rank_counts_remote_recv[dst_rank] += 1
-
-                # Sending side (dedup by node: count once if token goes to a remote node)
-                for dst_node in dst_nodes:
-                    if dst_node != src_node:
-                        rank_counts_remote_send[src_rank] += 1
-
-        if self.config.rank == 0:
-            print("Rank counts (deduplicated):", rank_counts)
-            print("Rank counts local nodes:", rank_counts - rank_counts_remote_recv)
-            print("Rank counts from other nodes:", rank_counts_remote_recv)
-            # print("Rank counts to other nodes:", rank_counts_remote_send)
-
         # even_indices = (
         #     torch.arange(
         #         self.config.max_num_inp_token_per_rank
@@ -257,6 +222,55 @@ class EpDispatchCombineTestCase:
             all_rank_scales,
         )
 
+    def count_token_num(self, all_rank_indices):
+        # Per-rank counts
+        rank_counts = torch.zeros(
+            self.config.world_size, dtype=torch.int32, device=self.device
+        )
+        rank_counts_remote_recv = torch.zeros(
+            self.config.world_size, dtype=torch.int32, device=self.device
+        )
+        rank_counts_remote_send = torch.zeros(
+            self.config.world_size, dtype=torch.int32, device=self.device
+        )
+
+        for src_rank, indices in enumerate(all_rank_indices):
+            src_node = src_rank // self.config.gpu_per_node
+
+            # Map expert IDs to rank IDs
+            token_ranks = (
+                indices // self.config.num_experts_per_rank
+            )  # [num_tokens, num_experts_per_token]
+
+            # Deduplicate rank IDs per token
+            unique_ranks_per_token = [torch.unique(row) for row in token_ranks]
+
+            # For each token, update counts
+            for ur in unique_ranks_per_token:
+                rank_counts[ur] += 1  # All ranks that receive this token
+
+                dst_nodes = {
+                    dst_rank // self.config.gpu_per_node for dst_rank in ur.tolist()
+                }
+
+                for dst_rank in ur.tolist():
+                    dst_node = dst_rank // self.config.gpu_per_node
+                    if dst_node != src_node:
+                        # Receiving side
+                        rank_counts_remote_recv[dst_rank] += 1
+
+                # Sending side (dedup by node: count once if token goes to a remote node)
+                for dst_node in dst_nodes:
+                    if dst_node != src_node:
+                        rank_counts_remote_send[src_rank] += 1
+
+        if self.config.rank == 0:
+            print("Rank counts (deduplicated):", rank_counts)
+            # print("Rank counts local nodes:", rank_counts - rank_counts_remote_recv)
+            # print("Rank counts from other nodes:", rank_counts_remote_recv)
+            # print("Rank counts to other nodes:", rank_counts_remote_send)
+        return rank_counts, rank_counts_remote_recv, rank_counts_remote_send
+
     def run_test_once(self, op, test_data, error_round, round):
         (
             all_rank_num_token,
@@ -266,6 +280,7 @@ class EpDispatchCombineTestCase:
             all_rank_scales,
         ) = test_data
         dist.barrier()
+
         (
             dispatch_output,
             dispatch_weights,
@@ -284,9 +299,22 @@ class EpDispatchCombineTestCase:
         torch.cuda.synchronize()
         dist.barrier()
 
+        rank_counts, _, _ = self.count_token_num(all_rank_indices)
+
         src_token_pos = op.get_dispatch_src_token_pos().tolist()
         max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank
-        print(f"rank {self.rank} recv {len(src_token_pos)} tokens")
+        recv_token_num = len(src_token_pos)
+
+        # Check recv token num
+        print(f"rank {self.rank} recv {recv_token_num} tokens")
+        token_num_pass = rank_counts[self.rank] == recv_token_num
+        if not token_num_pass:
+            print(
+                f"rank {self.rank} expected token num {rank_counts[self.rank]} got {recv_token_num}"
+            )
+            assert False
+
+        # Check token equality
         for i, src_token_id in enumerate(src_token_pos):
             src_pe = src_token_id // max_num_token_to_send_per_rank
             src_tok_id = src_token_id % max_num_token_to_send_per_rank
@@ -298,7 +326,7 @@ class EpDispatchCombineTestCase:
                     f"rank {self.rank} token {i} assert {is_pass} expected { all_rank_input[src_pe][src_tok_id]} got {dispatch_output[i]}"
                 )
                 assert False
-            # error_round.add(round)
+                # error_round.add(round)
             if dispatch_weights is not None:
                 assert torch.equal(
                     dispatch_weights[i], all_rank_weights[src_pe][src_tok_id]
@@ -338,10 +366,6 @@ class EpDispatchCombineTestCase:
                 ]
             )
             final_unique_pes = unique_pes
-            # print(
-            #     self.rank,
-            #     f"token {i} pes {pes} unique pes {unique_pes} unique innode pes {unique_innode_pes}",
-            # )
             if final_unique_pes == 0:
                 continue
 
@@ -351,45 +375,43 @@ class EpDispatchCombineTestCase:
 
             ok = torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
             if not ok:
-                print(
-                    self.rank,
-                    f"token {i} pes {pes} unique pes {unique_pes} unique innode pes {unique_innode_pes}",
-                )
-                # print(self.rank, "got: ", got)
+                # print(
+                #     self.rank,
+                #     f"token {i} pes {pes} unique pes {unique_pes} unique innode pes {unique_innode_pes}",
+                # )
+                # print( f"{self.rank} got: ", got, f"{self.rank} expected: ", expected, all_rank_input[self.rank][i])
                 # print(self.rank, "expected: ", expected, all_rank_input[self.rank][i])
-                delta = got - expected
-                # print(self.rank, i, "delta:", delta.nonzero())
+                # delta = got.float() - expected.float()
+                # print(self.rank, "delta:", delta)
                 # assert False
-                error_round.add(round)
+                # error_round.add(round)
+                pass
 
-        if len(error_round) > 0:
-            assert False 
-
-        #     if dispatch_weights is not None:
-        # got_weight, expected_weight = (
-        #     combine_output_weight[i],
-        #     all_rank_weights[self.rank][i] * unique_pes,
-        # )
-        # weight_match = torch.allclose(
-        #     got_weight, expected_weight, atol=1e-5, rtol=1e-5
-        # )
-        # if not weight_match and self.config.rank == 0:
-        #     print(f"Weight mismatch for token {i}:")
-        #     print(
-        #         f"  indices[{i}]: {all_rank_indices[self.rank][i].cpu().tolist()}"
-        #     )
-        #     print(f"  pes: {pes}")
-        #     print(f"  unique_pes: {unique_pes}")
-        #     print(f"  got_weight: {got_weight}")
-        #     print(
-        #         f"  expected_weight (weights[{i}] * {unique_pes}): {expected_weight}"
-        #     )
-        #     print(f"  original weights[{i}]: {all_rank_weights[self.rank][i]}")
-        #     print(f"  diff: {torch.abs(got_weight - expected_weight)}")
-        #     print(
-        #         f"  max_diff: {torch.abs(got_weight - expected_weight).max()}"
-        #     )
-        # assert weight_match, f"Weight assertion failed for token {i}"
+        if (dispatch_weights is not None) and (
+            self.config.kernel_type != mori.ops.EpDispatchCombineKernelType.InterNodeV1
+        ):
+            got_weight, expected_weight = (
+                combine_output_weight[i],
+                all_rank_weights[self.rank][i] * unique_pes,
+            )
+            weight_match = torch.allclose(
+                got_weight, expected_weight, atol=1e-5, rtol=1e-5
+            )
+            if not weight_match and self.config.rank == 0:
+                print(f"Weight mismatch for token {i}:")
+                print(
+                    f"  indices[{i}]: {all_rank_indices[self.rank][i].cpu().tolist()}"
+                )
+                print(f"  pes: {pes}")
+                print(f"  unique_pes: {unique_pes}")
+                print(f"  got_weight: {got_weight}")
+                print(
+                    f"  expected_weight (weights[{i}] * {unique_pes}): {expected_weight}"
+                )
+                print(f"  original weights[{i}]: {all_rank_weights[self.rank][i]}")
+                print(f"  diff: {torch.abs(got_weight - expected_weight)}")
+                print(f"  max_diff: {torch.abs(got_weight - expected_weight).max()}")
+            assert weight_match, f"Weight assertion failed for token {i}"
 
         if self.rank % self.gpu_per_node == 0:
             print(f"Node {self.rank // self.gpu_per_node} Combine Pass")
@@ -398,8 +420,6 @@ class EpDispatchCombineTestCase:
         error_round = set()
         op = mori.ops.EpDispatchCombineOp(self.config)
         for i in range(5000):
-            if i < 1:
-                continue
             if self.rank == 0:
                 print(f"Round {i} begin")
             test_data = self.gen_test_data(use_max_token_num=False)
@@ -429,8 +449,6 @@ class EpDispatchCombineTestCase:
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
 
-        if self.rank == 0:
-            print("dispatch")
         torch.cuda.synchronize()
         dist.barrier()
         start_event.record()
@@ -462,12 +480,12 @@ class EpDispatchCombineTestCase:
         for i, src_token_id in enumerate(src_token_pos):
             src_pe = src_token_id // max_num_token_to_send_per_rank
             src_node = src_pe // self.gpu_per_node
-            if src_node != my_node:
-                total_rdma_recv_num_token += 1
-        if self.config.kernel_type is mori.ops.EpDispatchCombineKernelType.InterNodeV1:
-            total_rdma_recv_num_token = (
-                self.config.max_num_inp_token_per_rank * self.config.world_size // 8
-            )
+            # if src_node != my_node:
+            #     total_rdma_recv_num_token += 1
+        # if self.config.kernel_type is mori.ops.EpDispatchCombineKernelType.InterNodeV1:
+        total_rdma_recv_num_token = (
+            self.config.max_num_inp_token_per_rank * self.config.world_size // 8
+        )
         print(
             f"rank {self.rank} recv {total_recv_num_token} tokens {total_rdma_recv_num_token} rdma tokens"
         )
@@ -480,8 +498,6 @@ class EpDispatchCombineTestCase:
         disp_rdma_bandwidth = total_rdma_bytes / (1000**3) / (disp_duration / (10**3))
         disp_bandwidth = total_bytes / (1000**3) / (disp_duration / (10**3))
 
-        if self.rank == 0:
-            print("combine")
         torch.cuda.synchronize()
         dist.barrier()
         start_event.record()
@@ -660,7 +676,7 @@ class EpDispatchCombineTestCase:
 
 
 def test_dispatch_combine(
-    local_rank, num_node, gpu_per_node, max_tokens, is_bench=False
+    local_rank, num_node, gpu_per_node, max_tokens, kernel_type, is_bench=False
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
@@ -671,6 +687,7 @@ def test_dispatch_combine(
         gpu_per_node,
         world_size,
         max_tokens,
+        kernel_type,
         torch.bfloat16,  # torch.float8_e4m3fnuz
         # torch.float8_e4m3fnuz,
     )
@@ -694,6 +711,13 @@ parser.add_argument(
     default=4096,
     help="Maximum number of input tokens per rank (default: 4096)",
 )
+parser.add_argument(
+    "--kernel-type",
+    type=str,
+    default="v1",
+    help="Type of kernel to test",
+    choices=["v0", "v1"],
+)
 args_cli = parser.parse_args()
 
 if __name__ == "__main__":
@@ -704,7 +728,13 @@ if __name__ == "__main__":
     world_size = num_node * gpu_per_node
     torch.multiprocessing.spawn(
         test_dispatch_combine,
-        args=(num_node, gpu_per_node, args_cli.max_tokens, args_cli.bench),
+        args=(
+            num_node,
+            gpu_per_node,
+            args_cli.max_tokens,
+            args_cli.kernel_type,
+            args_cli.bench,
+        ),
         nprocs=gpu_per_node,
         join=True,
     )

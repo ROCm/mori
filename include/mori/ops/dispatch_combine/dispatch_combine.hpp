@@ -230,11 +230,13 @@ class EpDispatchCombineHandle {
   index_t* destNodeTokenCounter{nullptr};
   // Counter that is used to sort the ordering of inter-node token chunk transfer
   index_t* blockFlagCounter{nullptr};
-  //
+  // Barrier blocks that do inter node rdma transfer
   uint32_t* interNodeBlocksBarrier{nullptr};
-
+  // Map dispatch token idx for inter-node tokens
   index_t* interNodeDispDestTokIdMap{nullptr};
+  // Barrier rdma block group
   index_t* interNodeChunkFlagCombine{nullptr};
+  // Map dispatched rdma token chunk index
   index_t* interNodeDispSendMap{nullptr};
 };
 

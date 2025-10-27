@@ -115,8 +115,7 @@ void EpDispatchCombineHandle::InitializeTokenNumSignalBuf() {
   sendAtomicSignalMemObj = ShmemMallocAndReturnMemObjPtr(
       (config.worldSize * 2) * sizeof(int64_t) * 2, hipDeviceMallocUncached);
 
-  HIP_RUNTIME_CHECK(
-      hipExtMallocWithFlags((void**)&totalRecvTokenNum, sizeof(index_t), hipDeviceMallocUncached));
+  HIP_RUNTIME_CHECK(hipMalloc(&totalRecvTokenNum, sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(totalRecvTokenNum, 0, sizeof(index_t)));
 
   size_t nodeTokenNumSignalSize = config.worldSize / config.gpuPerNode * sizeof(index_t);
@@ -146,26 +145,15 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipMalloc(&srcPeTokenIdxMap, maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(srcPeTokenIdxMap, -1, maxNumOutToken * sizeof(index_t)));
 
-  HIP_RUNTIME_CHECK(hipExtMallocWithFlags((void**)&destPeTokenCounter,
-                                          config.worldSize * sizeof(index_t) * 1024,
-                                          hipDeviceMallocUncached));
-  // HIP_RUNTIME_CHECK(hipMalloc(&destPeTokenCounter, config.worldSize * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMalloc(&destPeTokenCounter, config.worldSize * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(destPeTokenCounter, 0, config.worldSize * sizeof(index_t)));
 
-  HIP_RUNTIME_CHECK(hipExtMallocWithFlags(
-      (void**)&destNodeTokenCounter, config.worldSize * sizeof(index_t), hipDeviceMallocUncached));
-  HIP_RUNTIME_CHECK(hipMemset(destNodeTokenCounter, 0, config.worldSize * sizeof(index_t)));
-
-  // HIP_RUNTIME_CHECK(
-  //     hipMalloc(&destNodeTokenCounter, config.worldSize / config.gpuPerNode *
-  //     sizeof(index_t)));
+  HIP_RUNTIME_CHECK(
+      hipMalloc(&destNodeTokenCounter, config.worldSize / config.gpuPerNode * sizeof(index_t)));
   HIP_RUNTIME_CHECK(
       hipMemset(destNodeTokenCounter, 0, config.worldSize / config.gpuPerNode * sizeof(index_t)));
 
-  HIP_RUNTIME_CHECK(hipExtMallocWithFlags(
-      (void**)&localPeTokenCounter, config.worldSize * sizeof(index_t), hipDeviceMallocUncached));
-
-  // HIP_RUNTIME_CHECK(hipMalloc(&localPeTokenCounter, config.worldSize * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMalloc(&localPeTokenCounter, config.worldSize * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(localPeTokenCounter, 0, config.worldSize * sizeof(index_t)));
 
   dispTokOffsetMemObj = ShmemMallocAndReturnMemObjPtr(sizeof(index_t), hipDeviceMallocUncached);
@@ -208,11 +196,9 @@ void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
 
 void EpDispatchCombineHandle::InitializeBarrier() {
   size_t barrierSize = config.worldSize * sizeof(uint32_t);
-  HIP_RUNTIME_CHECK(
-      hipExtMallocWithFlags((void**)&dispatchGridBarrier, barrierSize, hipDeviceMallocUncached));
+  HIP_RUNTIME_CHECK(hipMalloc(&dispatchGridBarrier, barrierSize));
   HIP_RUNTIME_CHECK(hipMemset(dispatchGridBarrier, 0, barrierSize));
-  HIP_RUNTIME_CHECK(
-      hipExtMallocWithFlags((void**)&combineGridBarrier, barrierSize, hipDeviceMallocUncached));
+  HIP_RUNTIME_CHECK(hipMalloc(&combineGridBarrier, barrierSize));
   HIP_RUNTIME_CHECK(hipMemset(combineGridBarrier, 0, barrierSize));
   HIP_RUNTIME_CHECK(hipMalloc(&crossDeviceBarrierFlag, sizeof(uint32_t)));
   HIP_RUNTIME_CHECK(hipMemsetD32(crossDeviceBarrierFlag, 1, 1));
@@ -221,16 +207,14 @@ void EpDispatchCombineHandle::InitializeBarrier() {
 
   // We allocate one flag for each token, this ensure that we can use all chunk size(>=1)
   size_t interNodeChunkFlagSize =
-      config.worldSize / config.gpuPerNode * config.MaxNumTokensToRecvPerRank() * sizeof(index_t);
+      config.worldSize / config.gpuPerNode * config.MaxNumTokensToRecvPerRank() * sizeof(uint64_t);
   interNodeChunkFlagMemObj =
       ShmemMallocAndReturnMemObjPtr(interNodeChunkFlagSize, hipDeviceMallocUncached);
 
   HIP_RUNTIME_CHECK(hipMalloc(&interNodeChunkFlagCombine, interNodeChunkFlagSize));
   HIP_RUNTIME_CHECK(hipMemset(interNodeChunkFlagCombine, 0, interNodeChunkFlagSize));
 
-  HIP_RUNTIME_CHECK(hipExtMallocWithFlags((void**)&interNodeBlocksBarrier, sizeof(index_t),
-                                          hipDeviceMallocUncached));
-  // HIP_RUNTIME_CHECK(hipMalloc(&interNodeBlocksBarrier, sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMalloc(&interNodeBlocksBarrier, sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(interNodeBlocksBarrier, 0, sizeof(index_t)));
 }
 
@@ -285,8 +269,6 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
           EpDispatchInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeV1) {
           EpDispatchInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
-          // hipDeviceSynchronize();
-          // DispatchSyncKernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else {
@@ -326,10 +308,7 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
 }
 
 // no need for a separate reset kernel now
-void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) {
-  uint32_t flag = crossDeviceBarrierFlag[0];
-  crossDeviceBarrierFlag[0] = flag + 1;
-}
+void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) {}
 
 }  // namespace moe
 }  // namespace mori

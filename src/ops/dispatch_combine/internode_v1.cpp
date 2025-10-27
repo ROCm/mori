@@ -220,12 +220,17 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
         size_t remoteIdx = (myNode * config.MaxNumTokensToRecvPerRank() + destTokId);
         if (count > 0) {
           size_t stagingTokOffset = tokenId * xferBytes;
-          shmem::ShmemPutMemNbiThreadKernelImpl<core::ProviderType::MLX5>(
-              args.shmemDispatchInpTokMemObj, remoteIdx * xferBytes,
-              args.shmemStagingTokMemObj->GetRdmaMemoryRegion(shmem::GetGlobalGpuStatesPtr()->rank),
-              stagingTokOffset, count * xferBytes, args.interNodeChunkFlagMemObj,
-              (myNode * maxChunkNum + flagSlotId) * sizeof(index_t), &flag, sizeof(index_t),
-              args.sendTokenNumMemObj, proxyPe);
+          shmem::ShmemPutMemNbiSignalThread(args.shmemDispatchInpTokMemObj, remoteIdx * xferBytes,
+                                            args.shmemStagingTokMemObj, stagingTokOffset,
+                                            count * xferBytes, args.interNodeChunkFlagMemObj,
+                                            (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
+                                            flag, core::atomicType::AMO_SET, proxyPe);
+          // shmem::ShmemPutMemNbiThreadKernelImpl<core::ProviderType::MLX5>(
+          //     args.shmemDispatchInpTokMemObj, remoteIdx * xferBytes,
+          //     args.shmemStagingTokMemObj->GetRdmaMemoryRegion(shmem::GetGlobalGpuStatesPtr()->rank),
+          //     stagingTokOffset, count * xferBytes, args.interNodeChunkFlagMemObj,
+          //     (myNode * maxChunkNum + flagSlotId) * sizeof(index_t), &flag, sizeof(index_t),
+          //     args.sendTokenNumMemObj, proxyPe);
         }
         args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
       }
@@ -255,7 +260,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
   constexpr int numRecvBlock = 4;
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
 
-  index_t* chunkFlag = args.interNodeChunkFlagMemObj->template GetAs<index_t*>();
+  uint64_t* chunkFlag = args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>();
   index_t* nodeRecvTokenNum = args.nodeRecvTokenNumMemObj->template GetAs<index_t*>();
   uint8_t* stagingPtr = args.shmemDispatchInpTokMemObj->template GetAs<uint8_t*>();
 
@@ -269,7 +274,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
       int startTokenIdx = k * warpSize;
 
       // Poll completion flags
-      index_t thisChunkTokenNum = 0;
+      uint64_t thisChunkTokenNum = 0;
       index_t nodeFlag = 0;
       if (laneId == 0) {
         while (1) {
@@ -393,6 +398,8 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
       //     args.nodeRecvTokenNumMemObj->template GetAs<index_t*>() + laneId, 0);
       core::AtomicStoreRelaxedSystem(args.destNodeTokenCounter + laneId, 0);
     }
+
+    atomicAdd(args.crossDeviceBarrierFlag, 1);
   }
 
   // if ((globalWarpId < config.worldSize) && (laneId == 0)) shmem::ShmemQuietThread(globalWarpId);
@@ -499,7 +506,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   constexpr int numRecvBlock = 4;
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
 
-  index_t* chunkFlag = args.interNodeChunkFlagMemObj->template GetAs<index_t*>();
+  uint64_t* chunkFlag = args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>();
 
   extern __shared__ char sharedMem[];
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
@@ -510,7 +517,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
     for (int i = 0; i < nNodes; i++) {
       if (i == myNode) continue;
 
-      index_t thisChunkTokenNum = chunkFlag[i * maxChunkNum + k];
+      uint64_t thisChunkTokenNum = chunkFlag[i * maxChunkNum + k];
       thisChunkTokenNum -= (thisChunkTokenNum > 0) ? 1 : 0;
       int startTokenIdx = k * warpSize;
       int endTokenIdx = startTokenIdx + thisChunkTokenNum;
@@ -582,8 +589,6 @@ inline __device__ void CombineAll(EpDispatchCombineArgs<T>& args) {
     shmem::ShmemUint32WaitUntilEquals(&args.combineGridBarrier[1], globalWarpNum);
   }
   finishedWarps = __shfl(finishedWarps, 0);
-  // while (core::AtomicLoadRelaxed(&args.combineGridBarrier[1]) != globalWarpNum) {
-  // }
   if (((finishedWarps + 1) == globalWarpNum) && (laneId == 0)) args.combineGridBarrier[1] = 0;
 
   // Wait other pes to set flag
@@ -657,7 +662,7 @@ __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
 
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
   for (int i = globalThdId; i < (config.maxNumInpTokenPerRank * nNodes); i += globalThdNum) {
-    args.interNodeChunkFlagMemObj->template GetAs<index_t*>()[i] = 0;
+    args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>()[i] = 0;
     args.interNodeChunkFlagCombine[i] = 0;
     // args.interNodeDispSendMap[i] = 0;
   }
