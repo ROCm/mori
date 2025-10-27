@@ -36,6 +36,8 @@ extern "C" {
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_re_hsi.h"
 }
 #endif
+#include "mori/core/transport/rdma/providers/ionic/ionic_dv.h"
+#include "mori/core/transport/rdma/providers/ionic/ionic_fw.h"
 
 namespace mori {
 namespace core {
@@ -104,7 +106,7 @@ static __device__ __host__ enum ibv_wc_status BnxtHandleErrorCqe(int status) {
   }
 }
 
-static inline int IonicHandleErrorCqe(int status)
+static __device__ __host__ enum ibv_wc_status IonicHandleErrorCqe(int status)
 {
 	switch (status) {
 	case IONIC_STS_OK:

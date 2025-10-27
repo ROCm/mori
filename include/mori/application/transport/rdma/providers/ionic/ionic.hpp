@@ -21,6 +21,10 @@
 // SOFTWARE.
 #pragma once
 
+#include <hip/hip_runtime.h>
+#include <hsa/hsa.h>
+#include <hsa/hsa_ext_amd.h>
+
 #include "mori/core/transport/rdma/providers/ionic/ionic_dv.h"
 #include "mori/core/transport/rdma/providers/ionic/ionic_fw.h"
 #include "mori/application/transport/rdma/rdma.hpp"
@@ -42,7 +46,7 @@ static size_t GetIonicCqeSize() { return sizeof(struct ionic_v1_cqe); }
 // TODO: refactor IonicCqContainer so its structure is similar to IonicQpContainer
 class IonicCqContainer {
  public:
-  IonicCqContainer(ibv_context* context, const RdmaEndpointConfig& config);
+  IonicCqContainer(ibv_context* context, const RdmaEndpointConfig& config, ibv_pd* pd);
   ~IonicCqContainer();
 
  public:
@@ -62,15 +66,20 @@ class IonicCqContainer {
 
 class IonicDeviceContext;  // Forward declaration
 
+typedef struct device_agent {
+  hsa_agent_t agent;
+  hsa_amd_memory_pool_t pool;
+} device_agent_t;
+
 class IonicQpContainer {
  public:
   IonicQpContainer(ibv_context* context, const RdmaEndpointConfig& config, 
                    ibv_cq* cq, ibv_pd* pd, IonicDeviceContext* device_context);
-  ~IonicQpContainer(struct ibv_qp *qp);
+  ~IonicQpContainer();
 
   void ModifyRst2Init();
   void ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr,
-                      const ibv_device_attr_ex& deviceAttr, uint32_t qpn = 0);
+                      uint32_t qpn = 0);
   void ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
                      const RdmaEndpointHandle& remote_handle);
 

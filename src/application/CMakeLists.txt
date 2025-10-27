@@ -18,6 +18,7 @@ add_library(
   transport/rdma/rdma.cpp
   transport/rdma/providers/mlx5/mlx5.cpp
   transport/rdma/providers/bnxt/bnxt.cpp
+  transport/rdma/providers/ionic/ionic.cpp
   transport/rdma/providers/ibverbs/ibverbs.cpp
   transport/tcp/tcp.cpp
   memory/symmetric_memory.cpp

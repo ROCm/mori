@@ -19,13 +19,14 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
 
 #include <hip/hip_runtime.h>
-#include <infiniband/ionic_dv.h>
-#include <infiniband/ionic_fw.h>
 #include <infiniband/verbs.h>
 #include <iostream>
+
+#include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
+#include "mori/core/transport/rdma/providers/ionic/ionic_dv.h"
+#include "mori/core/transport/rdma/providers/ionic/ionic_fw.h"
 
 #include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
@@ -43,7 +44,7 @@ namespace application {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          IonicCqContainer 				                	  */
 /* ---------------------------------------------------------------------------------------------- */
-IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfig& config)
+IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfig& config, ibv_pd* pd)
     : config(config) {
   int status;
   struct ibv_cq_init_attr_ex cq_attr;
@@ -59,10 +60,9 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
   cq_attr.comp_vector   = 0;
   cq_attr.flags         = 0;
   cq_attr.comp_mask     = IBV_CQ_INIT_ATTR_MASK_PD;
-  cq_attr.parent_domain = pd_uxdma[0];
+  cq_attr.parent_domain = pd;
 
   cq_ex = ibv_create_cq_ex(context, &cq_attr);
-  CHECK_NNULL(cq_ex, "ibv_create_cq_ex");
   assert(cq_ex);
   
   cq = ibv_cq_ex_to_cq(cq_ex);
@@ -80,14 +80,96 @@ IonicCqContainer::~IonicCqContainer() {
 }
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                         IonicQpContainer                                        */
+/*                                         IonicQpContainer                                       */
 /* ---------------------------------------------------------------------------------------------- */
+
+std::vector<device_agent_t> gpu_agents;
+std::vector<device_agent_t> cpu_agents;
+
+hsa_status_t rocm_hsa_amd_memory_pool_callback(hsa_amd_memory_pool_t memory_pool, void* data) {
+	  hsa_amd_memory_pool_global_flag_t pool_flag{};
+
+	    hsa_status_t status{hsa_amd_memory_pool_get_info(
+			          memory_pool, HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, &pool_flag)};
+
+	      if (status != HSA_STATUS_SUCCESS) {
+		          printf("Failure to get pool info: 0x%x", status);
+			      return status;
+			        }
+
+	        if (pool_flag == (HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT |
+					                    HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED)) {
+			    *static_cast<hsa_amd_memory_pool_t*>(data) = memory_pool;
+			      }
+
+		  return HSA_STATUS_SUCCESS;
+}
+
+hsa_status_t rocm_hsa_agent_callback(hsa_agent_t agent, [[maybe_unused]] void* data) {
+	  hsa_device_type_t device_type{};
+
+	    hsa_status_t status{
+		          hsa_agent_get_info(agent, HSA_AGENT_INFO_DEVICE, &device_type)};
+
+	      if (status != HSA_STATUS_SUCCESS) {
+		          printf("Failure to get device type: 0x%x", status);
+			      return status;
+			        }
+
+	        if (device_type == HSA_DEVICE_TYPE_GPU) {
+			    gpu_agents.emplace_back();
+			        gpu_agents.back().agent = agent;
+				    status = hsa_amd_agent_iterate_memory_pools(
+						            agent, rocm_hsa_amd_memory_pool_callback, &(gpu_agents.back().pool));
+				      }
+
+		  if (device_type == HSA_DEVICE_TYPE_CPU) {
+			      cpu_agents.emplace_back();
+			          cpu_agents.back().agent = agent;
+				      status = hsa_amd_agent_iterate_memory_pools(
+						              agent, rocm_hsa_amd_memory_pool_callback, &(cpu_agents.back().pool));
+				        }
+
+		    return status;
+}
+
+int rocm_init() {
+	  hsa_status_t status{hsa_init()};
+
+	    if (status != HSA_STATUS_SUCCESS) {
+		        printf("Failure to open HSA connection: 0x%x", status);
+			    return 1;
+			      }
+
+	      status = hsa_iterate_agents(rocm_hsa_agent_callback, nullptr);
+
+	        if (status != HSA_STATUS_SUCCESS && status != HSA_STATUS_INFO_BREAK) {
+			    printf("Failure to iterate HSA agents: 0x%x", status);
+			        return 1;
+				  }
+
+		  return 0;
+}
+
+void rocm_memory_lock_to_fine_grain(void* ptr, size_t size, void** gpu_ptr,
+		                                    int gpu_id) {
+	  hsa_status_t status{
+		        hsa_amd_memory_lock_to_pool(ptr, size, &(gpu_agents[gpu_id].agent), 1,
+					                                  cpu_agents[0].pool, 0, gpu_ptr)};
+
+	    if (status != HSA_STATUS_SUCCESS) {
+		        printf("Failed to lock memory pool (%p): 0x%x\n", ptr, status);
+			    exit(-1);
+			      }
+}
+
 IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfig& config,
                                    ibv_cq* cq, struct ibv_pd *pd_uxdma, 
                                    IonicDeviceContext* device_context)
     : context(context), config(config), device_context(device_context) {
   struct ibv_qp_init_attr_ex attr;
   int hip_dev_id{-1};
+  int err;
 
   wqeNum = config.maxMsgsNum;
   memset(&attr, 0, sizeof(struct ibv_qp_init_attr_ex));
@@ -108,7 +190,7 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
 
   HIP_RUNTIME_CHECK(hipGetDevice(&hip_dev_id));
   ionic_dv_get_ctx(&dvctx, context);
-
+  rocm_init();
   rocm_memory_lock_to_fine_grain(dvctx.db_page, 0x1000, &gpu_db_page, hip_dev_id);
 
   db_page_u64 = reinterpret_cast<uint64_t*>(dvctx.db_page);
@@ -116,7 +198,7 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
 
   gpu_db_ptr = &gpu_db_page_u64[dvctx.db_ptr - db_page_u64];
 
-  gpu_db_page = gpu_db_page;
+  //gpu_db_page = gpu_db_page;
   gpu_db_cq = &gpu_db_ptr[dvctx.cq_qtype];
   gpu_db_sq = &gpu_db_ptr[dvctx.sq_qtype];
   gpu_db_rq = &gpu_db_ptr[dvctx.rq_qtype];
@@ -177,7 +259,7 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
       atomicIbufSize, atomicIbufMr->lkey, atomicIbufMr->rkey);  
 }
 
-IonicQpContainer::~IonicQpContainer(struct ibv_qp *qp) { 
+IonicQpContainer::~IonicQpContainer() { 
   int err;
 
   // Clean up atomic internal buffer
@@ -199,9 +281,9 @@ IonicQpContainer::~IonicQpContainer(struct ibv_qp *qp) {
   assert(err == 0);
 }
 
-void* IonicQpContainer::GetSqAddress() { return static_cast<char*>(ionic_sq_buf)}
+void* IonicQpContainer::GetSqAddress() { return reinterpret_cast<char*>(ionic_sq_buf);}
 
-void* IonicQpContainer::GetRqAddress() { return static_cast<char*>(ionic_rq_buf) }
+void* IonicQpContainer::GetRqAddress() { return reinterpret_cast<char*>(ionic_rq_buf); }
 
 void IonicQpContainer::ModifyRst2Init() {
   int err;
@@ -236,14 +318,14 @@ void IonicQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
   attr.dest_qp_num = remote_handle.qpn;
 
   //ah_atter
-  memcpy(&attr.ah_attr.grh.dgid, &dest_info[i].gid, 16);
+  memcpy(&attr.ah_attr.grh.dgid, remote_handle.eth.gid, 16);
   attr.ah_attr.grh.sgid_index = config.gidIdx;
   attr.ah_attr.port_num = config.portId;
   attr.ah_attr.is_global = 1;
   attr.ah_attr.grh.hop_limit = 1;
   attr.ah_attr.sl = 1;
 
-  attr_mask = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_RQ_PSN | IBV_QP_DEST_QPN
+  attr_mask = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_RQ_PSN | IBV_QP_DEST_QPN |
               IBV_QP_AV | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
 
   err = ibv_modify_qp(qp, &attr, attr_mask);
@@ -287,7 +369,7 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
 
   assert(!config.withCompChannel && !config.enableSrq && "not implemented");
 
-  IonicCqContainer* cq = new IonicCqContainer(context, config);
+  IonicCqContainer* cq = new IonicCqContainer(context, config, pd_uxdma);
   IonicQpContainer* qp = new IonicQpContainer(context, config, cq->cq, pd_uxdma, this);
 
   RdmaEndpoint endpoint;
@@ -322,9 +404,8 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
   endpoint.atomicIbuf.lkey = qp->atomicIbufMr->lkey;
   endpoint.atomicIbuf.rkey = qp->atomicIbufMr->rkey;
   endpoint.atomicIbuf.nslots = RoundUpPowOfTwo(config.atomicIbufSlots);
-
-  cqPool.insert({cq->cqn, std::move(std::unique_ptr<Mlx5CqContainer>(cq))});
-  qpPool.insert({qp->qpn, std::move(std::unique_ptr<Mlx5QpContainer>(qp))});
+  //cqPool.insert({cq->cqn, cq});
+  qpPool.insert({qp->qpn, qp});
 
   MORI_APP_TRACE(
       "Ionic endpoint created: qpn={}, cqn={}, portId={}, gidIdx={}, atomicIbuf addr=0x{:x}, "
@@ -339,10 +420,10 @@ void IonicDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
                                          const RdmaEndpointHandle& remote, uint32_t qpn) {
   uint32_t local_qpn = local.qpn;
   assert(qpPool.find(local_qpn) != qpPool.end());
-  Mlx5QpContainer* qp = qpPool.at(local_qpn).get();
+  IonicQpContainer* qp = qpPool.at(local_qpn);
 
   MORI_APP_TRACE("Ionic connecting endpoint: local_qpn={}, remote_qpn={}, qpId={}", local_qpn,
-                 remote.qpn, qpId);
+                 remote.qpn, qpn);
 
   RdmaDevice* rdmaDevice = GetRdmaDevice();
   const ibv_device_attr_ex* deviceAttr = rdmaDevice->GetDeviceAttr();
@@ -350,7 +431,7 @@ void IonicDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   qp->ModifyRst2Init();
   //qpn unused for now, other vendor for udp multi-sport
   qp->ModifyInit2Rtr(remote, portAttr, qpn);
-  qp->ModifyRtr2Rts(local);
+  qp->ModifyRtr2Rts(local, remote);
 
   MORI_APP_TRACE("Ionic endpoint connected successfully: local_qpn={}, remote_qpn={}", local_qpn,
                  remote.qpn);
@@ -363,13 +444,13 @@ IonicDevice::IonicDevice(ibv_device* in_device) : RdmaDevice(in_device) {}
 IonicDevice::~IonicDevice() {}
 
 void IonicDevice::pd_release(struct ibv_pd* pd, void* pd_context, void* ptr, uint64_t resource_type) {
-  CHECK_HIP(hipFree(ptr));
+  HIP_RUNTIME_CHECK(hipFree(ptr));
 }
 
 void* IonicDevice::pd_alloc_device_uncached(struct ibv_pd* pd, void* pd_context, size_t size, 
                                             size_t alignment, uint64_t resource_type) {
   void* dev_ptr{nullptr};
-  CHECK_HIP(hipExtMallocWithFlags(reinterpret_cast<void**>(&dev_ptr), size, hipDeviceMallocUncached));
+  HIP_RUNTIME_CHECK(hipExtMallocWithFlags(reinterpret_cast<void**>(&dev_ptr), size, hipDeviceMallocUncached));
   memset(dev_ptr, 0, size);
   return dev_ptr;
 }

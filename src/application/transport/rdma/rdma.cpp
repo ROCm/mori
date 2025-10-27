@@ -29,6 +29,7 @@
 
 #include "infiniband/verbs.h"
 #include "mori/application/transport/rdma/providers/bnxt/bnxt.hpp"
+#include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
 #include "mori/utils/mori_log.hpp"
@@ -219,7 +220,7 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
   ibv_device_attr_ex device_attr_ex;
   int status = ibv_query_device_ex(context, NULL, &device_attr_ex);
   assert(!status);
-
+  //device_attr_ex.orig_attr.vendor_id = 0x14E4;
   if (backendType == RdmaBackendType::IBVerbs) {
     return new IBVerbsDevice(inDevice);
   } else if (backendType == RdmaBackendType::DirectVerbs) {

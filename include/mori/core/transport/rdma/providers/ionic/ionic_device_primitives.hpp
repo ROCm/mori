@@ -46,7 +46,7 @@ inline __device__ uint64_t IonicPostSend(WorkQueueHandle& wq, uint32_t curPostId
   uint32_t wqeNum = wq.sqWqeNum;
   int32_t size = (int32_t)bytes;
   uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
-  char* wqeAddr = reinterpret_cast<char *>(queueBuffAddr) + (wqeIdx * (struct ionic_v1_wqe));
+  char* wqeAddr = reinterpret_cast<char *>(queueBuffAddr) + (wqeIdx * sizeof(struct ionic_v1_wqe));
   struct ionic_v1_wqe* wqe = reinterpret_cast<ionic_v1_wqe*>(wqeAddr);
   uint16_t wqe_flags = 0;
 
@@ -105,7 +105,7 @@ inline __device__ uint64_t IonicPostRecv(WorkQueueHandle& wq, uint32_t curPostId
   uint32_t wqeNum = wq.rqWqeNum;
   int32_t size = (int32_t)bytes;
   uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
-  char* wqeAddr = reinterpret_cast<char *>(queueBuffAddr) + (wqeIdx * (struct ionic_v1_wqe));
+  char* wqeAddr = reinterpret_cast<char *>(queueBuffAddr) + (wqeIdx * sizeof(struct ionic_v1_wqe));
   struct ionic_v1_wqe* wqe = reinterpret_cast<ionic_v1_wqe*>(wqeAddr);
   uint16_t wqe_flags = 0;
 
@@ -155,7 +155,7 @@ inline __device__ uint64_t IonicPostReadWrite(WorkQueueHandle& wq, uint32_t curP
   uint32_t wqeNum = wq.sqWqeNum;
   int32_t size = (int32_t)bytes;
   uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
-  char* wqeAddr = reinterpret_cast<char *>(queueBuffAddr) + (wqeIdx * (struct ionic_v1_wqe));
+  char* wqeAddr = reinterpret_cast<char *>(queueBuffAddr) + (wqeIdx * sizeof(struct ionic_v1_wqe));
   struct ionic_v1_wqe* wqe = reinterpret_cast<ionic_v1_wqe*>(wqeAddr);
   uint16_t wqe_flags = 0;
 
@@ -240,7 +240,7 @@ inline __device__ uint64_t IonicPostWriteInline(WorkQueueHandle& wq, uint32_t cu
   uint32_t wqeNum = wq.sqWqeNum;
   int32_t size = (int32_t)bytes;
   uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
-  char* wqeAddr = reinterpret_cast<char *>(queueBuffAddr) + (wqeIdx * (struct ionic_v1_wqe));
+  char* wqeAddr = reinterpret_cast<char *>(queueBuffAddr) + (wqeIdx * sizeof(struct ionic_v1_wqe));
   struct ionic_v1_wqe* wqe = reinterpret_cast<ionic_v1_wqe*>(wqeAddr);
   uint16_t wqe_flags = 0;
 
@@ -255,7 +255,7 @@ inline __device__ uint64_t IonicPostWriteInline(WorkQueueHandle& wq, uint32_t cu
   }
 
   wqe->base.wqe_idx = wqeIdx;
-  wqe->base.op = isRead ? IONIC_V2_OP_RDMA_READ : IONIC_V2_OP_RDMA_WRITE;
+  wqe->base.op = IONIC_V2_OP_RDMA_WRITE;
   wqe->base.num_sge_key = 0;
   wqe->base.imm_data_key = HTOBE32(0);
   __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
@@ -300,7 +300,7 @@ inline __device__ uint64_t IonicPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t c
   uint32_t wqeNum = wq.sqWqeNum;
   int32_t size = (int32_t)bytes;
   uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
-  char* wqeAddr = reinterpret_cast<char *>(queueBuffAddr) + (wqeIdx * (struct ionic_v1_wqe));
+  char* wqeAddr = reinterpret_cast<char *>(queueBuffAddr) + (wqeIdx * sizeof(struct ionic_v1_wqe));
   struct ionic_v1_wqe* wqe = reinterpret_cast<ionic_v1_wqe*>(wqeAddr);
   uint16_t wqe_flags = 0;
 
@@ -461,7 +461,7 @@ template <>
 inline __device__ int PollCqOnce<ProviderType::PSD>(void* cqeAddr, uint32_t cqeNum,
                                                     uint32_t consIdx, uint32_t* wqeIdx) {
   uint32_t cqeIdx = consIdx & (cqeNum - 1);
-  char* Addr = reinterpret_cast<char *>(cqeAddr) + (cqeIdx * (struct ionic_v1_cqe));
+  char* Addr = reinterpret_cast<char *>(cqeAddr) + (cqeIdx * sizeof(struct ionic_v1_cqe));
   struct ionic_v1_cqe* cqe = reinterpret_cast<ionic_v1_cqe*>(Addr);
                                                     
   printf("consIdx:%u, cqeIdx:%u, cqeAddr:%p", consIdx, cqeIdx, cqeAddr);
@@ -485,7 +485,7 @@ inline __device__ int PollCqOnce<ProviderType::PSD>(void* cqeAddr, uint32_t cqeN
   
   /* Report if the completion indicates an error. */
   if (!!(qtf_be & HTOBE32(IONIC_V1_CQE_ERROR))) {
-    uint32_t qtf = HTOBE32>(qtf_be);
+    uint32_t qtf = HTOBE32(qtf_be);
     uint32_t qid = qtf >> IONIC_V1_CQE_QID_SHIFT;
     uint32_t type = (qtf >> IONIC_V1_CQE_TYPE_SHIFT) & IONIC_V1_CQE_TYPE_MASK;
     uint32_t flag = qtf & 0xf;
