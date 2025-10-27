@@ -106,7 +106,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
 
   const uint64_t localBaseAddr = reinterpret_cast<uint64_t>(local.addr);
   const uint64_t remoteBaseAddr = reinterpret_cast<uint64_t>(remote.addr);
-  const uint32_t maxSge = eps[0].local.handle.maxSge;
+  const uint32_t maxSge = std::max(eps[0].local.handle.maxSge, 1u); // We assume all endpoints have the same maxSge
 
   std::vector<MergedWorkRequest> mergedWrs;
   mergedWrs.reserve(batchSize);
