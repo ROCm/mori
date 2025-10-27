@@ -273,15 +273,6 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
     memset(atomicIbufAddr, 0, atomicIbufSize);
     assert(!status);
   }
-  if (config.onGpu) {
-    HIP_RUNTIME_CHECK(
-        hipExtMallocWithFlags(&atomicIbufAddr, atomicIbufSize, hipDeviceMallocUncached));
-    HIP_RUNTIME_CHECK(hipMemset(atomicIbufAddr, 0, atomicIbufSize));
-  } else {
-    err = posix_memalign(&atomicIbufAddr, config.alignment, atomicIbufSize);
-    memset(atomicIbufAddr, 0, atomicIbufSize);
-    assert(!err);
-  }
 
   // Register atomic ibuf as independent memory region
   atomicIbufMr = ibv_reg_mr(pd, atomicIbufAddr, atomicIbufSize,
@@ -472,8 +463,7 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   void* uar_host = (void*)dbrAttr.dbr;
   void* uar_dev = uar_host;
   if (config.onGpu) {
-    constexpr uint32_t flag =
-        hipHostRegisterPortable | hipHostRegisterMapped | hipHostRegisterIoMemory;
+    constexpr uint32_t flag = hipHostRegisterPortable | hipHostRegisterMapped;
 
     HIP_RUNTIME_CHECK(hipHostRegister(uar_host, getpagesize(), flag));
     HIP_RUNTIME_CHECK(hipHostGetDevicePointer(&uar_dev, uar_host, 0));

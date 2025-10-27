@@ -101,6 +101,127 @@ inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::
                                                                     pe);
 }
 
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                    PutMemNbi with Signal                                       */
+/* ---------------------------------------------------------------------------------------------- */
+template <>
+inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::P2P, true>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  if (bytes == 0) return;
+
+  // Execute put operation
+  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source.addr + sourceOffset);
+  uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
+  core::ThreadCopy<uint8_t>(destPtr, srcPtr, bytes);
+
+  // Execute signal operation (only once for onlyOneSignal=true)
+  uint64_t activemask = core::GetActiveLaneMask();
+  uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
+  uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
+  bool is_leader = (my_logical_lane_id == num_active_lanes - 1);
+
+  if (is_leader) {
+    uint64_t* signalPtr = reinterpret_cast<uint64_t*>(signalDest->peerPtrs[pe] + signalDestOffset);
+    if (signalOp == core::atomicType::AMO_SET || signalOp == core::atomicType::AMO_SIGNAL_SET) {
+      core::AtomicStoreSeqCstSystem(signalPtr, signalValue);
+    } else if (signalOp == core::atomicType::AMO_ADD ||
+               signalOp == core::atomicType::AMO_SIGNAL_ADD) {
+      core::AtomicAddSeqCstSystem(signalPtr, signalValue);
+    } else {
+      assert(false && "Unsupported signal operation");
+    }
+  }
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::P2P, false>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  if (bytes == 0) return;
+
+  // Execute put operation
+  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source.addr + sourceOffset);
+  uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
+  core::ThreadCopy<uint8_t>(destPtr, srcPtr, bytes);
+
+  // Execute signal operation (every thread signals for onlyOneSignal=false)
+  uint64_t* signalPtr = reinterpret_cast<uint64_t*>(signalDest->peerPtrs[pe] + signalDestOffset);
+  if (signalOp == core::atomicType::AMO_SET || signalOp == core::atomicType::AMO_SIGNAL_SET) {
+    core::AtomicStoreSeqCstSystem(signalPtr, signalValue);
+  } else if (signalOp == core::atomicType::AMO_ADD ||
+             signalOp == core::atomicType::AMO_SIGNAL_ADD) {
+    core::AtomicAddSeqCstSystem(signalPtr, signalValue);
+  } else {
+    assert(false && "Unsupported signal operation");
+  }
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::P2P, true>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  if (bytes == 0) return;
+
+  // Execute put operation (all lanes participate)
+  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source.addr + sourceOffset);
+  uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
+  core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
+
+  // Execute signal operation (only lane 0 for onlyOneSignal=true)
+  int laneId = threadIdx.x & (warpSize - 1);
+  if (laneId == 0) {
+    uint64_t* signalPtr = reinterpret_cast<uint64_t*>(signalDest->peerPtrs[pe] + signalDestOffset);
+    if (signalOp == core::atomicType::AMO_SET || signalOp == core::atomicType::AMO_SIGNAL_SET) {
+      core::AtomicStoreSeqCstSystem(signalPtr, signalValue);
+    } else if (signalOp == core::atomicType::AMO_ADD ||
+               signalOp == core::atomicType::AMO_SIGNAL_ADD) {
+      core::AtomicAddSeqCstSystem(signalPtr, signalValue);
+    } else {
+      assert(false && "Unsupported signal operation");
+    }
+  }
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::P2P, false>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  if (bytes == 0) return;
+
+  // Execute put operation (all lanes participate)
+  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source.addr + sourceOffset);
+  uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
+  core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
+
+  // Execute signal operation (lane 0 only, but signals once per active lane)
+  int laneId = threadIdx.x & (warpSize - 1);
+  if (laneId == 0) {
+    uint64_t activemask = core::GetActiveLaneMask();
+    uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
+
+    uint64_t* signalPtr = reinterpret_cast<uint64_t*>(signalDest->peerPtrs[pe] + signalDestOffset);
+    if (signalOp == core::atomicType::AMO_SET || signalOp == core::atomicType::AMO_SIGNAL_SET) {
+      core::AtomicStoreSeqCstSystem(signalPtr, signalValue);
+    } else if (signalOp == core::atomicType::AMO_ADD ||
+               signalOp == core::atomicType::AMO_SIGNAL_ADD) {
+      core::AtomicAddSeqCstSystem(signalPtr, signalValue * num_active_lanes);
+    } else {
+      assert(false && "Unsupported signal operation");
+    }
+  }
+}
+
+
 template <>
 inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::P2P>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,

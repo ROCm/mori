@@ -80,6 +80,15 @@ namespace shmem {
     }                                                                    \
   }()
 
+#define DISPATCH_PROVIDER_TYPE_COMPILE_TIME_WITH_BOOL(func, boolParam, ...) \
+  do {                                                                      \
+    if constexpr (DISPATCH_BNXT == 1) {                                     \
+      func<core::ProviderType::BNXT, boolParam>(__VA_ARGS__);               \
+    } else {                                                                \
+      func<core::ProviderType::MLX5, boolParam>(__VA_ARGS__);               \
+    }                                                                       \
+  } while (0)
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Synchronization                                        */
 /* ---------------------------------------------------------------------------------------------- */
@@ -245,7 +254,7 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(
 }
 
 template <>
-inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(int pe){
+inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(int pe) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   int rank = globalGpuStates->rank;
   if (pe == rank) return;
@@ -678,6 +687,234 @@ inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::
     int qpId) {
   DISPATCH_PROVIDER_TYPE_COMPILE_TIME(ShmemPutSizeImmNbiWarpKernelImpl, dest, destOffset, val,
                                       bytes, pe, qpId);
+}
+
+template <core::ProviderType PrvdType, bool onlyOneSignal = true>
+inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  if (bytes == 0) return;
+  uintptr_t laddr = source.addr + sourceOffset;
+  uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
+  uintptr_t rkey = dest->peerRkeys[pe];
+
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
+  core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
+  core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
+  uint32_t qpn = ep[epIndex].handle.qpn;
+
+  uint64_t activemask = core::GetActiveLaneMask();
+  uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
+  uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
+  bool is_leader{my_logical_lane_id == num_active_lanes - 1};
+  const uint64_t leader_phys_lane_id = core::GetLastActiveLaneID(activemask);
+  uint32_t warp_sq_counter{0};
+  uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
+  uint32_t my_sq_counter{0}, my_msntbl_counter{0}, my_psn_counter{0};
+  uint32_t psnCnt = 0;
+  uint32_t num_wqes = onlyOneSignal ? num_active_lanes + 1 : num_active_lanes * 2;
+
+  if constexpr (PrvdType == core::ProviderType::BNXT) {
+    psnCnt = (bytes + wq->mtuSize - 1) / wq->mtuSize;
+  }
+  if (is_leader) {
+    if constexpr (PrvdType == core::ProviderType::MLX5) {
+      warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_wqes, __ATOMIC_RELAXED,
+                                               __HIP_MEMORY_SCOPE_AGENT);
+    } else if constexpr (PrvdType == core::ProviderType::BNXT) {
+      core::atomic_add_packed_msn_and_psn(
+          &wq->msnPack, num_wqes,
+          psnCnt * num_active_lanes + (onlyOneSignal ? 1 : num_active_lanes), &warp_msntbl_counter,
+          &warp_psn_counter);
+      warp_sq_counter = warp_msntbl_counter;
+      __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
+                             __HIP_MEMORY_SCOPE_AGENT);
+    } else {
+      assert(false);
+    }
+  }
+  warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
+  if constexpr (PrvdType == core::ProviderType::MLX5) {
+    my_sq_counter = warp_sq_counter + (onlyOneSignal ? my_logical_lane_id : my_logical_lane_id * 2);
+  } else if constexpr (PrvdType == core::ProviderType::BNXT) {
+    warp_msntbl_counter = __shfl(warp_msntbl_counter, leader_phys_lane_id);
+    warp_psn_counter = __shfl(warp_psn_counter, leader_phys_lane_id);
+    my_sq_counter = warp_sq_counter + (onlyOneSignal ? my_logical_lane_id : my_logical_lane_id * 2);
+    my_msntbl_counter =
+        warp_msntbl_counter + (onlyOneSignal ? my_logical_lane_id : my_logical_lane_id * 2);
+    my_psn_counter = warp_psn_counter + (onlyOneSignal ? psnCnt * my_logical_lane_id
+                                                       : (psnCnt + 1) * my_logical_lane_id);
+  } else {
+    assert(false);
+  }
+
+  while (true) {
+    uint64_t db_touched =
+        __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+    uint64_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+    uint64_t num_active_sq_entries = db_touched - db_done;
+    uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
+    uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_wqes - db_touched;
+    if (num_free_entries > num_entries_until_warp_last_entry) {
+      break;
+    }
+    ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
+  }
+  // putmem nbi
+  if constexpr (PrvdType == core::ProviderType::MLX5) {
+    wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
+    core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, false, qpn, laddr,
+                              source.lkey, raddr, rkey, bytes);
+  } else if constexpr (PrvdType == core::ProviderType::BNXT) {
+    wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
+    core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter, false, qpn,
+                              laddr, source.lkey, raddr, rkey, bytes);
+  } else {
+    assert(false);
+  }
+
+  // signal
+  uint64_t dbr_val;
+  uintptr_t signalRaddr = signalDest->peerPtrs[pe] + signalDestOffset;
+  uintptr_t signalRkey = signalDest->peerRkeys[pe];
+  if (signalOp == core::atomicType::AMO_SET || signalOp == core::atomicType::AMO_SIGNAL_SET) {
+    // TODO: not support masked atomic yet, use write inline for now
+    bool should_signal = onlyOneSignal ? is_leader : true;
+    if (should_signal) {
+      if constexpr (PrvdType == core::ProviderType::MLX5) {
+        wq->outstandingWqe[(my_sq_counter + 1) % OUTSTANDING_TABLE_SIZE] = my_sq_counter + 1;
+        dbr_val = core::PostWriteInline<PrvdType>(*wq, my_sq_counter + 1, my_sq_counter + 1,
+                                                  my_sq_counter + 1, is_leader, qpn, &signalValue,
+                                                  signalRaddr, signalRkey, sizeof(signalValue));
+      } else if constexpr (PrvdType == core::ProviderType::BNXT) {
+        wq->outstandingWqe[(my_sq_counter + 1) % wq->sqWqeNum] = my_sq_counter + 1;
+        dbr_val = core::PostWriteInline<PrvdType>(*wq, my_sq_counter + 1, my_msntbl_counter + 1,
+                                                  my_psn_counter + 1, is_leader, qpn, &signalValue,
+                                                  signalRaddr, signalRkey, sizeof(signalValue));
+      }
+    }
+
+  } else if (signalOp == core::atomicType::AMO_ADD ||
+             signalOp == core::atomicType::AMO_SIGNAL_ADD) {
+    core::IbufHandle* ibuf = &ep[epIndex].atomicIbuf;
+    bool should_signal = onlyOneSignal ? is_leader : true;
+    if (should_signal) {
+      if constexpr (PrvdType == core::ProviderType::MLX5) {
+        wq->outstandingWqe[(my_sq_counter + 1) % OUTSTANDING_TABLE_SIZE] = my_sq_counter + 1;
+        dbr_val = core::PostAtomic<PrvdType>(
+            *wq, my_sq_counter + 1, my_sq_counter + 1, my_sq_counter + 1, is_leader, qpn,
+            ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
+            sizeof(signalValue), core::atomicType::AMO_ADD);
+      } else if constexpr (PrvdType == core::ProviderType::BNXT) {
+        wq->outstandingWqe[(my_sq_counter + 1) % wq->sqWqeNum] = my_sq_counter + 1;
+        dbr_val = core::PostAtomic<PrvdType>(
+            *wq, my_sq_counter + 1, my_msntbl_counter + 1, my_psn_counter + 1, is_leader, qpn,
+            ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
+            sizeof(signalValue), core::atomicType::AMO_ADD);
+      }
+    }
+  } else {
+    assert(false && "signal unsupported atomic type");
+  }
+
+  // __threadfence_system();
+  if (is_leader) {
+    uint64_t db_touched{0};
+    do {
+      db_touched = __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    } while (db_touched != warp_sq_counter);
+
+    core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_wqes);
+    // __threadfence_system();
+    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
+    // __threadfence_system();
+
+    __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
+                       __HIP_MEMORY_SCOPE_AGENT);
+  }
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::RDMA, true>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  bool need_turn{true};
+  uint64_t turns = __ballot(need_turn);
+  while (turns) {
+    uint8_t lane = __ffsll((unsigned long long)turns) - 1;
+    int pe_turn = __shfl(pe, lane);
+    if (pe_turn == pe) {
+      DISPATCH_PROVIDER_TYPE_COMPILE_TIME_WITH_BOOL(
+          ShmemPutMemNbiSignalThreadKernelImpl, true, dest, destOffset, source, sourceOffset, bytes,
+          signalDest, signalDestOffset, signalValue, signalOp, pe, qpId);
+      need_turn = false;
+    }
+    turns = __ballot(need_turn);
+  }
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::RDMA, false>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  bool need_turn{true};
+  uint64_t turns = __ballot(need_turn);
+  while (turns) {
+    uint8_t lane = __ffsll((unsigned long long)turns) - 1;
+    int pe_turn = __shfl(pe, lane);
+    if (pe_turn == pe) {
+      DISPATCH_PROVIDER_TYPE_COMPILE_TIME_WITH_BOOL(
+          ShmemPutMemNbiSignalThreadKernelImpl, false, dest, destOffset, source, sourceOffset,
+          bytes, signalDest, signalDestOffset, signalValue, signalOp, pe, qpId);
+      need_turn = false;
+    }
+    turns = __ballot(need_turn);
+  }
+}
+
+template <core::ProviderType PrvdType, bool onlyOneSignal = true>
+inline __device__ void ShmemPutMemNbiSignalWarpKernelImpl(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  int laneId = threadIdx.x & (warpSize - 1);
+  if (laneId == 0) {
+    ShmemPutMemNbiSignalThreadKernelImpl<PrvdType, onlyOneSignal>(
+        dest, destOffset, source, sourceOffset, bytes, signalDest, signalDestOffset, signalValue,
+        signalOp, pe, qpId);
+  }
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::RDMA, true>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  DISPATCH_PROVIDER_TYPE_COMPILE_TIME_WITH_BOOL(ShmemPutMemNbiSignalWarpKernelImpl, true, dest,
+                                                destOffset, source, sourceOffset, bytes, signalDest,
+                                                signalDestOffset, signalValue, signalOp, pe, qpId);
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::RDMA, false>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  DISPATCH_PROVIDER_TYPE_COMPILE_TIME_WITH_BOOL(ShmemPutMemNbiSignalWarpKernelImpl, false, dest,
+                                                destOffset, source, sourceOffset, bytes, signalDest,
+                                                signalDestOffset, signalValue, signalOp, pe, qpId);
 }
 
 template <core::ProviderType PrvdType>
