@@ -21,25 +21,18 @@
 // SOFTWARE.
 #pragma once
 
+#include "mori/core/core.hpp"
+#include "mori/ops/dispatch_combine/dispatch_combine.hpp"
+#include "mori/shmem/shmem.hpp"
+
 namespace mori {
-namespace core {
+namespace moe {
 
-class GpuLock {
- public:
-  __device__ GpuLock(uint32_t* lockMem) : lock(lockMem) {}
-  __device__ ~GpuLock() = default;
+template <typename T>
+__global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args);
 
-  __device__ void Lock() {
-    while (!atomicCAS(lock, 0, 1)) {
-    }
-    __threadfence_system();
-  }
+template <typename T>
+__global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args);
 
-  __device__ void Unlock() { atomicCAS(lock, 1, 0); }
-
- private:
-  uint32_t* lock{nullptr};
-};
-
-}  // namespace core
+}  // namespace moe
 }  // namespace mori

@@ -205,7 +205,8 @@ inline __device__ void ThreadCopy(T* dst, T* src, size_t nelems) {
 }
 
 template <typename T, int Unroll>
-inline __device__ void WarpCopyImpl(T* dst, const T* src, size_t& offset, size_t nelems) {
+inline __device__ void WarpCopyImpl(T* __restrict__ dst, const T* __restrict__ src, size_t& offset,
+                                    size_t nelems) {
   constexpr int VecBytes = 16;
   constexpr int vecSize = VecBytes / sizeof(T);
   int laneId = threadIdx.x & (warpSize - 1);
@@ -230,7 +231,7 @@ inline __device__ void WarpCopyImpl(T* dst, const T* src, size_t& offset, size_t
 }
 
 template <typename T, int Unroll = 1>
-inline __device__ void WarpCopy(T* dst, const T* src, size_t nelems) {
+inline __device__ void WarpCopy(T* __restrict__ dst, const T* __restrict__ src, size_t nelems) {
   int laneId = threadIdx.x & (warpSize - 1);
 
   size_t offset = 0;

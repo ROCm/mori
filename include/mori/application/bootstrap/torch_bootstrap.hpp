@@ -21,8 +21,6 @@
 // SOFTWARE.
 #pragma once
 
-#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
-
 #include "mori/application/bootstrap/base_bootstrap.hpp"
 
 namespace mori {
@@ -41,7 +39,7 @@ class TorchBootstrapNetwork : public BootstrapNetwork {
   void Barrier();
 
  private:
-  c10::intrusive_ptr<c10d::ProcessGroup> group;
+  std::string groupName;
 };
 
 }  // namespace application
