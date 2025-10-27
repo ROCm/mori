@@ -251,7 +251,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       index_t destPe = destTokId / MaxNumTokensToSend;
 
       if (destPe < config.worldSize) {
-        index_t destLocalTokId = destTokId - destPe * maxNumOutTokenPerRank;
+        index_t destLocalTokId = destTokId - destPe * MaxNumTokensToSend;
         srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
                      destLocalTokId * config.hiddenDim + hiddenDimOffset;
         srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +

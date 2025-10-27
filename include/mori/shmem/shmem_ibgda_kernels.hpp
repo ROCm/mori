@@ -382,8 +382,15 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
-  core::WorkQueueHandle* wq = &ep[pe].wqHandle;
-  core::CompletionQueueHandle* cq = &ep[pe].cqHandle;
+  int epIndex = pe * globalGpuStates->numQpPerPe + (0 % globalGpuStates->numQpPerPe);
+  core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
+  core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
+  uint32_t qpn = ep[epIndex].handle.qpn;
+
+  // GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  // application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  // core::WorkQueueHandle* wq = &ep[pe].wqHandle;
+  // core::CompletionQueueHandle* cq = &ep[pe].cqHandle;
 
   uint64_t activemask = core::GetActiveLaneMask();
   uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
@@ -402,8 +409,8 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(
                                                __HIP_MEMORY_SCOPE_AGENT);
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
       uint32_t psnCnt = (bytes + wq->mtuSize - 1) / wq->mtuSize;
-      atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, psnCnt * num_wqes, &warp_msntbl_counter,
-                                    &warp_psn_counter);
+      core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, psnCnt * num_wqes,
+                                          &warp_msntbl_counter, &warp_psn_counter);
       // TODO: if warp_msntbl_counter overflow 32bit, sq_slot's calculation will be wrong
       warp_sq_counter = warp_msntbl_counter * BNXT_RE_NUM_SLOT_PER_WQE;
       __hip_atomic_fetch_max(&wq->postIdx,
@@ -442,13 +449,13 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(
     if (num_free_entries > num_entries_until_warp_last_entry) {
       break;
     }
-    ShmemQuietThreadKernelImpl<PrvdType>(pe);
+    ShmemQuietThreadKernelImpl<PrvdType>(pe, 0);
   }
   uint64_t dbr_val;
   if constexpr (PrvdType == core::ProviderType::MLX5) {
     wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
     dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, false,
-                                        ep[pe].handle.qpn, laddr, source.lkey, raddr, rkey, bytes);
+                                        qpn, laddr, source.lkey, raddr, rkey, bytes);
     if (is_leader) {
       // int rank = GetGlobalGpuStatesPtr()->rank;
       // uint64_t atomic_sq_counter = my_sq_counter + 1;
@@ -456,25 +463,23 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(
       // uintptr_t atomic_rkey = atomic->peerRkeys[pe];
       // wq->outstandingWqe[atomic_sq_counter % OUTSTANDING_TABLE_SIZE] = atomic_sq_counter;
       // uint64_t val = 0;
-      // dbr_val = core::PostAtomic<PrvdType>(*wq, atomic_sq_counter, atomic_sq_counter,
-      //                                      atomic_sq_counter, false, ep[pe].handle.qpn,
-      //                                      atomic->GetRdmaMemoryRegion(rank).addr,
-      //                                      atomic->GetRdmaMemoryRegion(rank).lkey, atomic_raddr,
-      //                                      atomic_rkey, &val, &val, 8, core::AMO_ADD);
+      // dbr_val = core::PostAtomic<PrvdType>(
+      //     *wq, atomic_sq_counter, atomic_sq_counter, atomic_sq_counter, false, qpn,
+      //     atomic->GetRdmaMemoryRegion(rank).addr, atomic->GetRdmaMemoryRegion(rank).lkey,
+      //     atomic_raddr, atomic_rkey, &val, &val, 8, core::AMO_ADD);
       // uint64_t signal_sq_counter = warp_sq_counter + num_wqes - 1;
       uint64_t signal_sq_counter = my_sq_counter + 1;
       uintptr_t signal_raddr = signal->peerPtrs[pe] + signalOffset;
       uintptr_t signal_rkey = signal->peerRkeys[pe];
       wq->outstandingWqe[signal_sq_counter % OUTSTANDING_TABLE_SIZE] = signal_sq_counter;
       dbr_val = core::PostWriteInline<PrvdType>(*wq, signal_sq_counter, signal_sq_counter,
-                                                signal_sq_counter, is_leader, ep[pe].handle.qpn,
-                                                signalVal, signal_raddr, signal_rkey, signalBytes);
+                                                signal_sq_counter, is_leader, qpn, signalVal,
+                                                signal_raddr, signal_rkey, signalBytes);
     }
   } else if constexpr (PrvdType == core::ProviderType::BNXT) {
     wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
-    dbr_val =
-        core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter, is_leader,
-                                  ep[pe].handle.qpn, laddr, source.lkey, raddr, rkey, bytes);
+    dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter,
+                                        is_leader, qpn, laddr, source.lkey, raddr, rkey, bytes);
   } else {
     assert(false);
   }

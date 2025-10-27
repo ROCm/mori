@@ -326,7 +326,10 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
 }
 
 // no need for a separate reset kernel now
-void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) { ; }
+void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) {
+  uint32_t flag = crossDeviceBarrierFlag[0];
+  crossDeviceBarrierFlag[0] = flag + 1;
+}
 
 }  // namespace moe
 }  // namespace mori
