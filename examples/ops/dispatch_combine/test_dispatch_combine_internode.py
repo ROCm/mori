@@ -375,17 +375,22 @@ class EpDispatchCombineTestCase:
 
             ok = torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
             if not ok:
-                # print(
-                #     self.rank,
-                #     f"token {i} pes {pes} unique pes {unique_pes} unique innode pes {unique_innode_pes}",
-                # )
-                # print( f"{self.rank} got: ", got, f"{self.rank} expected: ", expected, all_rank_input[self.rank][i])
-                # print(self.rank, "expected: ", expected, all_rank_input[self.rank][i])
+                print(
+                    self.rank,
+                    f"token {i} pes {pes} unique pes {unique_pes} unique innode pes {unique_innode_pes}",
+                )
+                print(
+                    f"{self.rank} got: ",
+                    got,
+                    f"{self.rank} expected: ",
+                    expected,
+                    all_rank_input[self.rank][i],
+                )
                 # delta = got.float() - expected.float()
                 # print(self.rank, "delta:", delta)
-                # assert False
                 # error_round.add(round)
-                pass
+                assert False
+                # pass
 
         if (dispatch_weights is not None) and (
             self.config.kernel_type != mori.ops.EpDispatchCombineKernelType.InterNodeV1
@@ -688,7 +693,7 @@ def test_dispatch_combine(
         world_size,
         max_tokens,
         kernel_type,
-        torch.bfloat16,  # torch.float8_e4m3fnuz
+        torch.bfloat16,
         # torch.float8_e4m3fnuz,
     )
     test_case.setup()

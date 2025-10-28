@@ -81,7 +81,7 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, in
   size_t srcTokOffset = tokenId * config.hiddenDim;
   size_t destTokOffset = destTokId * config.hiddenDim;
 
-  T* remoteTokenPtr = args.shmemOutTokMemObj->template GetAs<T*>(destPe);
+  T* remoteTokenPtr = args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe);
   const T* localTokenPtr = args.inpTokenBuf;
   core::WarpCopy(remoteTokenPtr + destTokOffset, localTokenPtr + srcTokOffset, config.hiddenDim);
 
@@ -90,7 +90,7 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, in
   core::WarpCopy(remoteIndexPtr + destTokId * config.numExpertPerToken,
                  localIndexPtr + tokenId * config.numExpertPerToken, config.numExpertPerToken);
 
-  float* remoteWeightPtr = args.shmemOutWeightsMemObj->template GetAs<float*>(destPe);
+  float* remoteWeightPtr = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe);
   const float* localWeightPtr = args.weightsBuf;
   core::WarpCopy(remoteWeightPtr + destTokId * config.numExpertPerToken,
                  localWeightPtr + tokenId * config.numExpertPerToken, config.numExpertPerToken);
@@ -329,12 +329,13 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
           if ((destPe % config.gpuPerNode) == laneId) localPeTokenCounter++;
           destTokId = __shfl(destTokId, 0);
           core::WarpCopy<uint8_t, 8>(
-              args.shmemOutTokMemObj->template GetAs<uint8_t*>(destPe) + destTokId * hiddenBytes,
+              args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>(destPe) +
+                  destTokId * hiddenBytes,
               stagingPtr + tokIdx * xferBytes, hiddenBytes);
           core::WarpCopy(
               args.shmemOutIndicesMemObj->template GetAs<uint8_t*>(destPe) + destTokId * indexBytes,
               stagingPtr + tokIdx * xferBytes + hiddenBytes, indexBytes);
-          core::WarpCopy(args.shmemOutWeightsMemObj->template GetAs<uint8_t*>(destPe) +
+          core::WarpCopy(args.shmemDispatchOutWeightsMemObj->template GetAs<uint8_t*>(destPe) +
                              destTokId * weightBytes,
                          stagingPtr + tokIdx * xferBytes + hiddenBytes + indexBytes, weightBytes);
         }
@@ -627,8 +628,9 @@ inline __device__ void CombineAll(EpDispatchCombineArgs<T>& args) {
       }
     }
     if (laneId < nNodes) args.interNodeDispSendMap[nNodes * tokenId + laneId] = 0;
-    core::WarpAccum<T, 4>(args.shmemOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim,
-                          srcPtrs, nullptr, nNodes, config.hiddenDim);
+    core::WarpAccum<T, 4>(
+        args.shmemCombineOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim, srcPtrs,
+        nullptr, nNodes, config.hiddenDim);
   }
 }
 }  // namespace v1
