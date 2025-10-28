@@ -1,6 +1,10 @@
 find_package(MPI REQUIRED)
 find_package(hsa-runtime64 REQUIRED)
-find_package(libionic REQUIRED)
+find_library(IONIC_LIBRARY 
+  NAMES ionic 
+  HINTS /lib/x86_64-linux-gnu
+  REQUIRED
+)
 execute_process(
   COMMAND python -c "import torch; print(torch.utils.cmake_prefix_path)"
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -44,7 +48,7 @@ target_link_libraries(
   pci
   mori_logging
   hsa-runtime64
-  libionic)
+  ${IONIC_LIBRARY})
 
 if(USE_BNXT)
   target_link_libraries(mori_application ${BNXT_RE_LIB})
