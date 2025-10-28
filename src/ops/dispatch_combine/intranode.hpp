@@ -208,7 +208,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   int npes = config.worldSize;
 
   const uint32_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
-  size_t maxNumOutTokenPerRank = config.MaxNumTokensToSend();
+  size_t maxNumTokensToSend = config.MaxNumTokensToSend();
   // Copy input to shmem registered buffer so that other GPUs can access directly
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   if (args.config.useExternalInpBuffer) {
