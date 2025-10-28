@@ -114,7 +114,6 @@ class EpDispatchCombineTestCase:
 
         total_num_expert = self.config.num_experts_per_rank * self.config.world_size
         expert_map = torch.randperm(total_num_expert).to(torch.int32).to(self.device)
-        # expert_map = torch.arange(total_num_expert).to(torch.int32).to(self.device)
 
         return (
             num_token,

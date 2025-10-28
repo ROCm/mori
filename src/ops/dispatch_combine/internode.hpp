@@ -24,6 +24,7 @@
 #include "mori/core/core.hpp"
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 #include "mori/shmem/shmem.hpp"
+#include "src/ops/dispatch_combine/intranode.hpp"
 
 namespace mori {
 namespace moe {
@@ -91,7 +92,8 @@ __global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
     for (int tokenId = globalSubWarpId; tokenId < args.curRankNumToken;
          tokenId += globalSubWarpNum) {
       const int expertOffset = tokenId * numExpertPerToken + laneInSubWarp;
-      index_t destExpert = args.tokenIndices[expertOffset];
+      // index_t destExpert = args.tokenIndices[expertOffset];
+      index_t destExpert = GetExpertIndex(args, expertOffset);
       index_t destPe = destExpert / config.numExpertPerRank;
 
       unsigned long long subWarpMask = ((1ULL << numExpertPerToken) - 1ULL)
