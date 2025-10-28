@@ -69,7 +69,6 @@ inline size_t GetHipDataTypeSize(hipDataType dtype) {
 
 using index_t = int32_t;
 
-#define MAX_EXPERTS_PER_TOKEN (8)
 struct EpDispatchCombineConfig {
   int rank{0};
   int worldSize{0};
@@ -107,18 +106,20 @@ class EpDispatchCombineHandle {
   ~EpDispatchCombineHandle();
 
   void PrepareInference(hipDataType inputType, void* input, void* output, float* weights,
-                        index_t* tokenIndices, index_t numToken) {
+                        index_t* tokenIndices, index_t* indexToExpertId, index_t numToken) {
     this->inputType = inputType;
     this->inpTokenBuf = input;
     this->outTokenBuf = output;
     this->weightsBuf = weights;
     this->tokenIndices = tokenIndices;
     this->curRankNumToken = numToken;
+    this->indexToExpertId = indexToExpertId;
     // printf("handle inputType %s\n", HipDataTypeToString(inputType));
   }
 
   void PrepareInference(hipDataType inputType, void* input, void* output, float* weights,
-                        uint8_t* scales, index_t* tokenIndices, index_t numToken) {
+                        uint8_t* scales, index_t* tokenIndices, index_t* indexToExpertId,
+                        index_t numToken) {
     this->inputType = inputType;
     this->inpTokenBuf = input;
     this->outTokenBuf = output;
@@ -126,6 +127,7 @@ class EpDispatchCombineHandle {
     this->scalesBuf = scales;
     this->tokenIndices = tokenIndices;
     this->curRankNumToken = numToken;
+    this->indexToExpertId = indexToExpertId;
     // printf("handle inputType %s\n", HipDataTypeToString(inputType));
   }
 
@@ -163,6 +165,7 @@ class EpDispatchCombineHandle {
   EpDispatchCombineConfig config;
   // Routed expert indices for tokens
   index_t* tokenIndices{nullptr};
+  index_t* indexToExpertId{nullptr};
 
   // Kernel input/output buffer
   void* inpTokenBuf{nullptr};
@@ -248,6 +251,7 @@ struct EpDispatchCombineArgs {
   EpDispatchCombineConfig config;
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
+  index_t* indexToExpertId{nullptr};
   T* inpTokenBuf{nullptr};
   T* outTokenBuf{nullptr};
   float* weightsBuf{nullptr};
@@ -301,6 +305,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.config = handle.config;
   args.curRankNumToken = handle.curRankNumToken;
   args.tokenIndices = handle.tokenIndices;
+  args.indexToExpertId = handle.indexToExpertId;
   args.inpTokenBuf = reinterpret_cast<T*>(handle.inpTokenBuf);
   args.outTokenBuf = reinterpret_cast<T*>(handle.outTokenBuf);
   args.weightsBuf = handle.weightsBuf;

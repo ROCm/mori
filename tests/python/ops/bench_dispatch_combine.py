@@ -31,7 +31,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         super().__init__(config)
 
     def gen_test_data(self):
-        return super().gen_test_data(use_max_token_num=True)
+        return super().gen_test_data(use_max_token_num=True, with_expert_map=False)
 
     def run_once(self, op, test_data, check_result):
         (
@@ -40,6 +40,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             all_rank_input,
             all_rank_weights,
             all_rank_scales,
+            _,
         ) = test_data
 
         start_event = torch.cuda.Event(enable_timing=True)
@@ -92,7 +93,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             None,
             dispatch_indices,
             block_num=80,
-            warp_per_block=16,
+            warp_per_block=4,
         )
         end_event.record()
         self.sync()
@@ -182,7 +183,7 @@ def _bench_dispatch_combine(
     world_size,
     port,
     max_num_inp_token_per_rank=128,
-    data_type=torch.float8_e4m3fnuz,
+    data_type=torch.bfloat16,
     hidden_dim=7168,
     scale_dim=0,
     scale_type_size=0,

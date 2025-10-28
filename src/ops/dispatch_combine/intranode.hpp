@@ -62,6 +62,13 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
   __syncthreads();
 }
 
+template <typename T>
+inline __device__ index_t GetExpertIndex(EpDispatchCombineArgs<T> args, index_t id) {
+  index_t expert = args.tokenIndices[id];
+  if (args.indexToExpertId) expert = args.indexToExpertId[expert];
+  return expert;
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpDispatchIntraNodeKernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
@@ -90,7 +97,8 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
          i += globalWarpNum) {
       index_t srcTokId = i / config.numExpertPerToken;
-      index_t destExpert = args.tokenIndices[i];
+      // index_t destExpert = args.tokenIndices[i];
+      index_t destExpert = GetExpertIndex(args, i);
       index_t destPe = destExpert / config.numExpertPerRank;
       index_t destTokId = 0;
 
@@ -98,7 +106,9 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       assert(config.numExpertPerToken < warpSize);
       int condition = 0;
       if (laneId < (i % config.numExpertPerToken)) {
-        condition = destPe == (args.tokenIndices[srcTokId * config.numExpertPerToken + laneId] /
+        // condition = destPe == (args.tokenIndices[srcTokId * config.numExpertPerToken + laneId] /
+        //                        config.numExpertPerRank);
+        condition = destPe == (GetExpertIndex(args, srcTokId * config.numExpertPerToken + laneId) /
                                config.numExpertPerRank);
       }
       if (__any(condition)) {
@@ -127,6 +137,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
               destPe)[destTokId * config.numExpertPerToken + laneId] =
               args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
         }
+        // Output indicies are used for later computation ops, do not map
         args.shmemOutIndicesMemObj->template GetAs<index_t*>(
             destPe)[destTokId * config.numExpertPerToken + laneId] =
             args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];

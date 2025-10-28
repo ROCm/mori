@@ -48,7 +48,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Ten
 LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
                const torch::Tensor& input, const std::optional<torch::Tensor>& weights,
                const std::optional<torch::Tensor>& scales, const torch::Tensor& topkIds,
-               int blockNum = -1, int warpPerBlock = -1) {
+               const std::optional<torch::Tensor>& idxToExpIds, int blockNum = -1,
+               int warpPerBlock = -1) {
   assert(input.is_contiguous() && topkIds.is_contiguous());
 
   float* weightPtr = nullptr;
@@ -63,9 +64,16 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
     scalePtr = reinterpret_cast<uint8_t*>(scales->data_ptr());
   }
 
+  mori::moe::index_t* idxToExpIdsPtr = nullptr;
+  if (idxToExpIds.has_value()) {
+    assert(idxToExpIds->is_contiguous() &&
+           idxToExpIds->numel() == (handle.config.numExpertPerRank * handle.config.worldSize));
+    idxToExpIdsPtr = reinterpret_cast<mori::moe::index_t*>(idxToExpIds->data_ptr());
+  }
+
   handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
                           nullptr, weightPtr, scalePtr, topkIds.data_ptr<mori::moe::index_t>(),
-                          input.size(0));
+                          idxToExpIdsPtr, input.size(0));
   handle.LaunchDispatch((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
                         at::cuda::getCurrentHIPStream());
 
@@ -120,7 +128,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
   }
 
   handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
-                          nullptr, weightsPtr, topkIds.data_ptr<mori::moe::index_t>(),
+                          nullptr, weightsPtr, topkIds.data_ptr<mori::moe::index_t>(), nullptr,
                           handle.curRankNumToken);
   handle.LaunchCombine((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
                        at::cuda::getCurrentHIPStream());

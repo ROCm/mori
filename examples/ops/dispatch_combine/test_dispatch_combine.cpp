@@ -179,10 +179,10 @@ class EpDispatchCombineTestCase {
     RandomInitializeToken();
     if (IsNoDataRank(handle.config)) {
       handle.PrepareInference(GetHipDataType<T>(), nullptr, outTokBuf, weightsBuf, scalesBuf,
-                              nullptr, 0);
+                              nullptr, nullptr, 0);
     } else {
       handle.PrepareInference(GetHipDataType<T>(), inpTokBuf, outTokBuf, weightsBuf, scalesBuf,
-                              tokenIndices, numToken);
+                              tokenIndices, nullptr, numToken);
     }
     // PrintDispatch();
     // PrintDispatchStats();
@@ -465,7 +465,7 @@ class EpDispatchCombineTestCase {
     EpDispatchCombineConfig& config = handle.config;
     if (IsNoDataRank(handle.config)) {
       handle.PrepareInference(GetHipDataType<T>(), inpTokBuf, outTokBuf, weightsBuf, scalesBuf,
-                              nullptr, 0);
+                              nullptr, nullptr, 0);
     }
     // HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, outTokBuf,
     //                             config.MaxNumTokensToRecvPerRank() * config.hiddenDim *
