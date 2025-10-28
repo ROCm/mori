@@ -8,6 +8,9 @@
 
 #include <stdbool.h>
 #include <infiniband/verbs.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 struct ibv_cq;
 struct ibv_qp;
@@ -241,5 +244,7 @@ int ionic_dv_get_qp(struct ionic_dv_qp *dvqp, struct ibv_qp *ibqp);
  */
 int ionic_dv_qp_set_puec_plane_route(struct ibv_qp *ibqp, uint8_t plane_idx,
 				     struct ionic_dv_puec_route *ipr);
-
+#ifdef __cplusplus
+}
+#endif
 #endif /* IONIC_DV_H */
