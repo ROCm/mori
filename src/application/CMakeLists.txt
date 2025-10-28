@@ -1,6 +1,6 @@
 find_package(MPI REQUIRED)
 find_package(hsa-runtime64 REQUIRED)
-
+find_package(libionic REQUIRED)
 execute_process(
   COMMAND python -c "import torch; print(torch.utils.cmake_prefix_path)"
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -43,7 +43,8 @@ target_link_libraries(
   rocm_smi64
   pci
   mori_logging
-  hsa-runtime64)
+  hsa-runtime64
+  libionic)
 
 if(USE_BNXT)
   target_link_libraries(mori_application ${BNXT_RE_LIB})
