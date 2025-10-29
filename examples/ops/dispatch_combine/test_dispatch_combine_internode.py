@@ -344,7 +344,6 @@ class EpDispatchCombineTestCase:
         combine_output, combine_output_weight = op.combine(
             dispatch_output,
             dispatch_weights,
-            # None,
             all_rank_indices[self.rank],
             block_num=self.config.block_num,
             warp_per_block=16,

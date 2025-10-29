@@ -458,9 +458,6 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
-  // T* stagingPtr = args.shmemStagingTokMemObj->template GetAs<T*>() +
-  //                 (nNodes + myNode) * config.MaxNumTokensToRecvPerRank() * config.hiddenDim;
-
   uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>() +
                         (nNodes + myNode) * config.MaxNumTokensToRecvPerRank() * combXferBytes;
 
@@ -483,14 +480,6 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
                                 destLocalTokId * config.numExpertPerToken;
       }
     }
-    // core::WarpAccum<T, 4>(stagingPtr + tokenId * config.hiddenDim, srcPtrs, nullptr,
-    //                       config.numExpertPerToken, config.hiddenDim);
-    // if (args.weightsBuf) {
-    //   core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
-    //                                 tokenId * config.numExpertPerToken,
-    //                             srcWeightsPtr, nullptr, config.numExpertPerToken,
-    //                             config.numExpertPerToken);
-    // }
     core::WarpAccum<T, 4>(reinterpret_cast<T*>(stagingPtr + tokenId * combXferBytes), srcPtrs,
                           nullptr, config.numExpertPerToken, config.hiddenDim);
     if (args.weightsBuf) {
@@ -544,9 +533,6 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
           }
           args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId] = 0;
         }
-        // core::WarpAccum<T, 4>(
-        //     args.shmemStagingTokMemObj->template GetAs<T*>() + tokIdx * config.hiddenDim,
-        //     srcPtrs, nullptr, config.numExpertPerToken, config.hiddenDim);
         core::WarpAccum<T, 4>(reinterpret_cast<T*>(stagingPtr + tokIdx * combXferBytes), srcPtrs,
                               nullptr, config.numExpertPerToken, config.hiddenDim);
         if (args.weightsBuf) {
@@ -563,13 +549,6 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
       if ((finished + 1) < (numRecvBlock * warpNum)) continue;
 
       int proxyPe = i * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      // shmem::ShmemPutTypeNbiWarp<T>(
-      //     args.shmemStagingTokMemObj,
-      //     ((myNode + nNodes) * config.MaxNumTokensToRecvPerRank() + startTokenIdx) *
-      //         config.hiddenDim,
-      //     args.shmemStagingTokMemObj,
-      //     (i * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * config.hiddenDim,
-      //     thisChunkTokenNum * config.hiddenDim, proxyPe);
       shmem::ShmemPutTypeNbiWarp<uint8_t>(
           args.shmemStagingTokMemObj,
           ((myNode + nNodes) * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * combXferBytes,
@@ -619,8 +598,6 @@ inline __device__ void CombineAll(EpDispatchCombineArgs<T>& args) {
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
   float** srcWeightsPtrs = reinterpret_cast<float**>(sharedMem) +
                            warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
-  // T* stagingPtr = args.shmemStagingTokMemObj->template GetAs<T*>() +
-  //                 nNodes * config.MaxNumTokensToRecvPerRank() * config.hiddenDim;
   uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>() +
                         nNodes * config.MaxNumTokensToRecvPerRank() * combXferBytes;
 
@@ -644,8 +621,6 @@ inline __device__ void CombineAll(EpDispatchCombineArgs<T>& args) {
         int mappedId = (i == myNode) ? tokenId : args.interNodeDispSendMap[nNodes * tokenId + i];
         uint8_t* base =
             stagingPtr + (i * config.MaxNumTokensToRecvPerRank() + mappedId) * combXferBytes;
-        // srcPtrs[i] =
-        //     stagingPtr + (i * config.MaxNumTokensToRecvPerRank() + mappedId) * config.hiddenDim;
         srcPtrs[i] = reinterpret_cast<T*>(base);
         srcWeightsPtrs[i] = reinterpret_cast<float*>(base + hiddenBytes);
       }
