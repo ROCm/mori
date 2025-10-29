@@ -32,7 +32,7 @@ Benchmark result on DeepSeek V3 model configurations:
 
 | **Kernels**| **# CUs**| **Dispatch XGMI** |**Dispatch RDMA** |**Combine XGMI**|**Combine RDMA** |
 |------------|----------|-------------------|------------------|----------------|-----------------|
-|EP8         | 80       | 307 GB/s          | x                | 285 GB/s       | x               |
+|EP8         | 80       | 307 GB/s          | x                | 330 GB/s       | x               |
 |EP16-V0     | 32       | 75 GB/s           | 23 GB/s          | 76 GB/s        | 23GB/s          |
 |EP16-V0     | 80       | 79 GB/s           | 24 GB/s          | 82 GB/s        | 25GB/s          | 
 |EP16-V1     | 32       | 185 GB/s          | 57 GB/s          | 172GB/s        | 52GB/s          |
