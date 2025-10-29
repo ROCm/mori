@@ -42,6 +42,7 @@ class EpDispatchCombineTestCase:
         max_tokens,
         kernel_type,
         dtype=torch.bfloat16,
+        with_expert_map=False,
     ):
         self.rank = rank
         self.gpu_per_node = gpu_per_node
@@ -64,6 +65,7 @@ class EpDispatchCombineTestCase:
             gpu_per_node=self.gpu_per_node,
             rdma_block_num=16,
         )
+        self.with_expert_map = with_expert_map
 
     def setup(self):
         local_rank = self.rank % self.gpu_per_node
@@ -214,15 +216,21 @@ class EpDispatchCombineTestCase:
                 ).to(self.config.data_type)
             )
 
+        total_num_expert = self.config.num_experts_per_rank * self.config.world_size
+        expert_map = torch.randperm(
+            total_num_expert, generator=self.rng, device=self.device
+        ).to(torch.int32)
+
         return (
             num_token,
             all_rank_indices,
             all_rank_input,
             all_rank_weights,
             all_rank_scales,
+            expert_map if self.with_expert_map else None,
         )
 
-    def count_token_num(self, all_rank_indices):
+    def count_token_num(self, all_rank_indices, expert_map):
         # Per-rank counts
         rank_counts = torch.zeros(
             self.config.world_size, dtype=torch.int32, device=self.device
@@ -238,9 +246,11 @@ class EpDispatchCombineTestCase:
             src_node = src_rank // self.config.gpu_per_node
 
             # Map expert IDs to rank IDs
-            token_ranks = (
-                indices // self.config.num_experts_per_rank
-            )  # [num_tokens, num_experts_per_token]
+            if expert_map is not None:
+                indices = [expert_map[ids] for ids in indices]
+            else:
+                indices = [ids for ids in indices]
+            token_ranks = [ids // self.config.num_experts_per_rank for ids in indices]
 
             # Deduplicate rank IDs per token
             unique_ranks_per_token = [torch.unique(row) for row in token_ranks]
@@ -265,10 +275,10 @@ class EpDispatchCombineTestCase:
                         rank_counts_remote_send[src_rank] += 1
 
         if self.config.rank == 0:
-            print("Rank counts (deduplicated):", rank_counts)
-            # print("Rank counts local nodes:", rank_counts - rank_counts_remote_recv)
-            # print("Rank counts from other nodes:", rank_counts_remote_recv)
-            # print("Rank counts to other nodes:", rank_counts_remote_send)
+            print(self.config.rank, "Rank counts (deduplicated):", rank_counts)
+        # print("Rank counts local nodes:", rank_counts - rank_counts_remote_recv)
+        # print("Rank counts from other nodes:", rank_counts_remote_recv)
+        # print("Rank counts to other nodes:", rank_counts_remote_send)
         return rank_counts, rank_counts_remote_recv, rank_counts_remote_send
 
     def run_test_once(self, op, test_data, error_round, round):
@@ -278,6 +288,7 @@ class EpDispatchCombineTestCase:
             all_rank_input,
             all_rank_weights,
             all_rank_scales,
+            expert_map,
         ) = test_data
         dist.barrier()
 
@@ -292,13 +303,14 @@ class EpDispatchCombineTestCase:
             all_rank_weights[self.rank],
             all_rank_scales[self.rank],
             all_rank_indices[self.rank],
+            index_to_exp_id=expert_map,
             block_num=self.config.block_num,
             warp_per_block=16,
         )
         torch.cuda.synchronize()
         dist.barrier()
 
-        rank_counts, _, _ = self.count_token_num(all_rank_indices)
+        rank_counts, _, _ = self.count_token_num(all_rank_indices, expert_map)
 
         src_token_pos = op.get_dispatch_src_token_pos().tolist()
         max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank
@@ -306,10 +318,10 @@ class EpDispatchCombineTestCase:
 
         # Check recv token num
         print(f"rank {self.rank} recv {recv_token_num} tokens")
-        token_num_pass = rank_counts[self.rank] == recv_token_num
+        token_num_pass = rank_counts[self.config.rank] == recv_token_num
         if not token_num_pass:
             print(
-                f"rank {self.rank} expected token num {rank_counts[self.rank]} got {recv_token_num}"
+                f"rank {self.rank} expected token num {rank_counts[self.config.rank]} got {recv_token_num}"
             )
             assert False
 
@@ -352,9 +364,11 @@ class EpDispatchCombineTestCase:
         dist.barrier()
 
         for i in range(all_rank_num_token[self.rank]):
+            indices = all_rank_indices[self.config.rank][i].cpu()
+            if expert_map is not None:
+                indices = expert_map[indices]
             pes = [
-                (idx // self.config.num_experts_per_rank)
-                for idx in all_rank_indices[self.rank][i].cpu().tolist()
+                (idx // self.config.num_experts_per_rank) for idx in indices.tolist()
             ]
             unique_pes = len(set(pes))
             unique_innode_pes = len(
@@ -448,6 +462,7 @@ class EpDispatchCombineTestCase:
             all_rank_input,
             all_rank_weights,
             all_rank_scales,
+            expert_map,
         ) = test_data
 
         start_event = torch.cuda.Event(enable_timing=True)
@@ -467,6 +482,7 @@ class EpDispatchCombineTestCase:
             all_rank_weights[self.rank],
             all_rank_scales[self.rank],
             all_rank_indices[self.rank],
+            index_to_exp_id=expert_map,
             block_num=self.config.block_num,
             warp_per_block=16,
         )
@@ -695,6 +711,7 @@ def test_dispatch_combine(
         kernel_type,
         torch.bfloat16,
         # torch.float8_e4m3fnuz,
+        with_expert_map=False,
     )
     test_case.setup()
     if is_bench:

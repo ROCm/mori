@@ -37,7 +37,7 @@ class EpDispatchCombineTestCase:
         torch.cuda.synchronize()
         dist.barrier()
 
-    def gen_test_data(self, use_max_token_num=False):
+    def gen_test_data(self, use_max_token_num=False, with_expert_map=False):
         if use_max_token_num:
             num_token = torch.tensor(
                 [
@@ -112,12 +112,16 @@ class EpDispatchCombineTestCase:
                 ).to(self.config.data_type)
             )
 
+        total_num_expert = self.config.num_experts_per_rank * self.config.world_size
+        expert_map = torch.randperm(total_num_expert).to(torch.int32).to(self.device)
+
         return (
             num_token,
             all_rank_indices,
             all_rank_input,
             all_rank_weights,
             all_rank_scales,
+            expert_map if with_expert_map else None,
         )
 
     def check_dispatch_result(
@@ -137,6 +141,7 @@ class EpDispatchCombineTestCase:
             all_rank_input,
             all_rank_weights,
             all_rank_scales,
+            expert_map,
         ) = test_data
         src_token_pos = op.get_dispatch_src_token_pos()
 
@@ -160,15 +165,21 @@ class EpDispatchCombineTestCase:
         self, op, test_data, combine_output, combine_output_weight=None
     ):
         self.sync()
-        all_rank_num_token = test_data[0]
-        all_rank_indices = test_data[1]
-        all_rank_input = test_data[2]
-        all_rank_weights = test_data[3]
+        (
+            all_rank_num_token,
+            all_rank_indices,
+            all_rank_input,
+            all_rank_weights,
+            all_rank_scales,
+            expert_map,
+        ) = test_data
 
         for i in range(all_rank_num_token[self.config.rank]):
+            indices = all_rank_indices[self.config.rank][i].cpu()
+            if expert_map is not None:
+                indices = expert_map[indices]
             pes = [
-                (idx // self.config.num_experts_per_rank)
-                for idx in all_rank_indices[self.config.rank][i].cpu().tolist()
+                (idx // self.config.num_experts_per_rank) for idx in indices.tolist()
             ]
             unique_pes = len(set(pes))
 
@@ -181,9 +192,7 @@ class EpDispatchCombineTestCase:
             )
             if not result_match and self.config.rank == 0:
                 print(f"Result mismatch for token {i}:")
-                print(
-                    f"  indices[{i}]: {all_rank_indices[self.config.rank][i].cpu().tolist()}"
-                )
+                print(f"  indices[{i}]: {indices}")
                 print(f"  pes: {pes}")
                 print(f"  unique_pes: {unique_pes}")
                 print(f"  got: {got}")
@@ -199,9 +208,7 @@ class EpDispatchCombineTestCase:
                 )
                 if not weight_match and self.config.rank == 0:
                     print(f"Weight mismatch for token {i}:")
-                    print(
-                        f"  indices[{i}]: {all_rank_indices[self.config.rank][i].cpu().tolist()}"
-                    )
+                    print(f"  indices[{i}]: {indices}")
                     print(f"  pes: {pes}")
                     print(f"  unique_pes: {unique_pes}")
                     print(f"  got_weight: {got_weight}")
@@ -216,6 +223,7 @@ class EpDispatchCombineTestCase:
             all_rank_input,
             all_rank_weights,
             all_rank_scales,
+            expert_map,
         ) = test_data
         (
             dispatch_output,
@@ -228,6 +236,7 @@ class EpDispatchCombineTestCase:
             all_rank_weights[self.config.rank],
             all_rank_scales[self.config.rank],
             all_rank_indices[self.config.rank],
+            index_to_exp_id=expert_map,
         )
         self.sync()
         self.check_dispatch_result(
@@ -270,6 +279,7 @@ def _test_dispatch_combine(
     max_num_inp_token_per_rank,
     num_experts_per_rank,
     num_experts_per_token,
+    with_expert_map,
 ):
     config = mori.ops.EpDispatchCombineConfig(
         data_type=data_type,
@@ -287,7 +297,7 @@ def _test_dispatch_combine(
     )
     op = mori.ops.EpDispatchCombineOp(config)
     test_case = EpDispatchCombineTestCase(config)
-    test_data = test_case.gen_test_data()
+    test_data = test_case.gen_test_data(with_expert_map=with_expert_map)
     test_case.run_test_once(op, test_data)
 
 
@@ -300,6 +310,7 @@ def _test_dispatch_combine(
 @pytest.mark.parametrize("max_num_inp_token_per_rank", (1, 128))
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
 @pytest.mark.parametrize("num_experts_per_token", (8,))
+@pytest.mark.parametrize("with_expert_map", (True, False))
 def test_dispatch_combine(
     torch_dist_process_manager,
     world_size,
@@ -310,6 +321,7 @@ def test_dispatch_combine(
     max_num_inp_token_per_rank,
     num_experts_per_rank,
     num_experts_per_token,
+    with_expert_map,
 ):
     for i in range(world_size):
         torch_dist_process_manager.task_queue.put(
@@ -324,6 +336,7 @@ def test_dispatch_combine(
                     max_num_inp_token_per_rank,
                     num_experts_per_rank,
                     num_experts_per_token,
+                    with_expert_map,
                 ],
             )
         )

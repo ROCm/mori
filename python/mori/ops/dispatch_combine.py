@@ -107,6 +107,7 @@ class EpDispatchCombineOp:
         weights: torch.Tensor,
         scales: torch.Tensor,
         indices: torch.Tensor,
+        index_to_exp_id: torch.Tensor = None,
         block_num: int = -1,
         warp_per_block: int = -1,
     ):
@@ -117,6 +118,7 @@ class EpDispatchCombineOp:
             weights,
             scales,
             indices,
+            index_to_exp_id,
             block_num,
             warp_per_block,
         )
