@@ -28,18 +28,17 @@ import torch.distributed as dist
 
 class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
     def __init__(self, config):
-        super().__init__(config)
+        super().__init__(config, use_max_token_num=True)
 
     def gen_test_data(self):
-        return super().gen_test_data(use_max_token_num=True)
+        return super().gen_test_data()
 
     def run_once(self, op, test_data, check_result):
         (
-            all_rank_num_token,
-            all_rank_indices,
-            all_rank_input,
-            all_rank_weights,
-            all_rank_scales,
+            input,
+            indices,
+            weights,
+            scales,
         ) = test_data
 
         start_event = torch.cuda.Event(enable_timing=True)
@@ -54,10 +53,10 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             dispatch_indices,
             dispatch_recv_num_token,
         ) = op.dispatch(
-            all_rank_input[self.config.rank],
-            all_rank_weights[self.config.rank],
-            all_rank_scales[self.config.rank],
-            all_rank_indices[self.config.rank],
+            input,
+            weights,
+            scales,
+            indices,
             block_num=80,
             warp_per_block=16,
         )
@@ -67,25 +66,30 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
 
         if check_result:
             self.check_dispatch_result(
-                op,
                 test_data,
                 dispatch_output,
                 dispatch_weights,
                 dispatch_scales,
                 dispatch_indices,
                 dispatch_recv_num_token,
+                op.get_dispatch_src_token_pos(),
             )
 
         total_recv_num_token = dispatch_recv_num_token[0].item()
 
-        combine_input = op.get_registered_input_buffer(self.config.data_type)
-        combine_input[:total_recv_num_token, :].copy_(
-            dispatch_output[:total_recv_num_token, :]
+        combine_input = op.get_registered_combine_input_buffer(self.config.data_type)
+        self.moe_sum(
+            dispatch_recv_num_token,
+            dispatch_output,
+            dispatch_weights,
+            dispatch_indices,
+            dispatch_scales,
+            output=combine_input[:total_recv_num_token],
         )
 
         self.sync()
         start_event.record()
-        combine_output = op.combine(
+        combine_output, _ = op.combine(
             combine_input,
             dispatch_weights,
             dispatch_indices,
@@ -97,11 +101,11 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         comb_duration = start_event.elapsed_time(end_event)
 
         if check_result:
-            self.check_combine_result(op, test_data, combine_output)
+            self.check_combine_result(test_data, combine_output)
         op.reset()
         self.sync()
 
-        element_size = all_rank_input[self.config.rank].element_size()
+        element_size = input.element_size()
         total_bytes = total_recv_num_token * self.config.hidden_dim * element_size
         # disp_bandwidth = total_bytes / (1024**3) / (disp_duration / (10**3))
         # comb_bandwidth = total_bytes / (1024**3) / (comb_duration / (10**3))
@@ -221,11 +225,11 @@ def _bench_dispatch_combine(
         block_num=80,
         use_external_inp_buf=False,
     )
-    benchmark = EpDispatchCombineBenchmark(config)
 
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         mori.shmem.shmem_torch_process_group_init("default")
         op = mori.ops.EpDispatchCombineOp(config)
+        benchmark = EpDispatchCombineBenchmark(config)
         benchmark.run(op)
         # benchmark.output()
         # mori.shmem.shmem_finalize()
