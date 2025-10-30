@@ -175,8 +175,10 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(
       hipMemset(interNodeDispDestTokIdMap, 0, maxNumInterNodeToken * sizeof(index_t)));
 
-  HIP_RUNTIME_CHECK(hipMalloc(&blockFlagCounter, sizeof(index_t)));
-  HIP_RUNTIME_CHECK(hipMemset(blockFlagCounter, 0, sizeof(index_t)));
+  HIP_RUNTIME_CHECK(
+      hipMalloc(&blockFlagCounter, config.worldSize / config.gpuPerNode * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(
+      hipMemset(blockFlagCounter, 0, config.worldSize / config.gpuPerNode * sizeof(index_t)));
 
   size_t interNodeDispSendMapSize =
       config.worldSize / config.gpuPerNode * config.maxNumInpTokenPerRank * sizeof(index_t);

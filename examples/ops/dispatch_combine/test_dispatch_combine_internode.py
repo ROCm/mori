@@ -55,7 +55,6 @@ class EpDispatchCombineTestCase:
             scale_type_size=4,
             max_num_inp_token_per_rank=max_tokens,
             num_experts_per_rank=16,
-            # num_experts_per_rank=256 // world_size,
             num_experts_per_token=8,
             warp_num_per_block=16,
             block_num=32,
@@ -279,7 +278,7 @@ class EpDispatchCombineTestCase:
             all_rank_weights,
             all_rank_scales,
         ) = test_data
-        dist.barrier()
+        # dist.barrier()
 
         (
             dispatch_output,
@@ -296,7 +295,6 @@ class EpDispatchCombineTestCase:
             warp_per_block=16,
         )
         torch.cuda.synchronize()
-        dist.barrier()
 
         rank_counts, _, _ = self.count_token_num(all_rank_indices)
 
@@ -338,9 +336,6 @@ class EpDispatchCombineTestCase:
         if self.rank % self.gpu_per_node == 0:
             print(f"Node {self.rank // self.gpu_per_node} Dispatch Pass")
 
-        torch.cuda.synchronize()
-        dist.barrier()
-
         combine_output, combine_output_weight = op.combine(
             dispatch_output,
             dispatch_weights,
@@ -349,7 +344,6 @@ class EpDispatchCombineTestCase:
             warp_per_block=16,
         )
         torch.cuda.synchronize()
-        dist.barrier()
 
         for i in range(all_rank_num_token[self.rank]):
             pes = [
@@ -496,6 +490,7 @@ class EpDispatchCombineTestCase:
 
         element_size = all_rank_input[self.rank].element_size()
         total_bytes = total_recv_num_token * self.config.hidden_dim * element_size
+        ll_mode_scale = self.config.max_num_inp_token_per_rank * self.config.num_experts_per_token / total_recv_num_token
         total_rdma_bytes = (
             total_rdma_recv_num_token * self.config.hidden_dim * element_size
         )
@@ -528,6 +523,7 @@ class EpDispatchCombineTestCase:
             comb_duration,
             comb_rdma_bandwidth,
             comb_bandwidth,
+            ll_mode_scale
         )
 
     def bench_dispatch_combine(self):
@@ -560,6 +556,7 @@ class EpDispatchCombineTestCase:
                 comb_duration,
                 comb_rdma_bandwidth,
                 comb_bandwidth,
+                ll_mode_scale
             ) = self.run_bench_once(op, test_data)
 
             disp_duration_output = [torch.zeros(1) for _ in range(self.world_size)]
@@ -672,10 +669,14 @@ class EpDispatchCombineTestCase:
 
         if self.rank == 0:
             print(
+                f"Normal kernel metrics:\n"
                 f"dispatch: best/avg RDMA bandwidth {best_disp_rdma_bw:.2f} / {avg_disp_rdma_bw:.2f} XGMI bandwidth {best_disp_bw:.2f} / {avg_disp_bw:.2f} GB/s | "
                 f"best/avg latency {best_disp_lat:.2f} / {avg_disp_lat:.2f} µs\n"
                 f"combine: best/avg RDMA bandwidth {best_comb_rdma_bw:.2f} / {avg_comb_rdma_bw:.2f} XGMI bandwidth {best_comb_bw:.2f} / {avg_comb_bw:.2f} GB/s | "
-                f"best/avg latency {best_comb_lat:.2f} / {avg_comb_lat:.2f} µs"
+                f"best/avg latency {best_comb_lat:.2f} / {avg_comb_lat:.2f} µs\n"
+                f"Low latency kernel metrics:\n"
+                f"dispatch: best/avg bandwidth {best_disp_bw*ll_mode_scale:.2f} / {avg_disp_bw*ll_mode_scale:.2f} GB/s\n"
+                f"combine: best/avg bandwidth {best_comb_bw*ll_mode_scale:.2f} / {avg_comb_bw*ll_mode_scale:.2f} GB/s"
             )
         del op
 

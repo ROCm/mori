@@ -105,10 +105,11 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
 
         element_size = all_rank_input[self.config.rank].element_size()
         total_bytes = total_recv_num_token * self.config.hidden_dim * element_size
+        ll_mode_scale = self.config.max_num_inp_token_per_rank * self.config.num_experts_per_token / total_recv_num_token
         disp_bandwidth = total_bytes / (1000**3) / (disp_duration / (10**3))
         comb_bandwidth = total_bytes / (1000**3) / (comb_duration / (10**3))
 
-        return disp_duration, comb_duration, disp_bandwidth, comb_bandwidth, total_bytes
+        return disp_duration, comb_duration, disp_bandwidth, comb_bandwidth, total_bytes, ll_mode_scale
 
     def run(self, op, warmup=1, iters=10):
         test_data = self.gen_test_data()
@@ -125,7 +126,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
 
         for i in range(iters):
             self.sync()
-            disp_dur, comb_dur, disp_bw, comb_bw, total_bytes = self.run_once(
+            disp_dur, comb_dur, disp_bw, comb_bw, total_bytes, ll_mode_scale = self.run_once(
                 op, test_data_list[i], False
             )
 
@@ -159,8 +160,8 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 )
                 print(
                     f"Round {i} duration(us) {duration_us} "
-                    f"bandwidth(GB/s) {disp_bandwidth_GB_list[i]} "
-                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw}({theoretical_peak_bw})"
+                    f"bandwidth(GB/s) {disp_bandwidth_GB_list[i]}"
+                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw} / {algo_bw*ll_mode_scale:.2f}"
                 )
 
             print()
@@ -172,8 +173,8 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 )
                 print(
                     f"Round {i} duration(us) {duration_us} "
-                    f"bandwidth(GB/s) {comb_bandwidth_GB_list[i]} "
-                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw}({theoretical_peak_bw})"
+                    f"bandwidth(GB/s) {comb_bandwidth_GB_list[i]}"
+                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw} / {algo_bw*ll_mode_scale:.2f}"
                 )
 
 
@@ -182,11 +183,11 @@ def _bench_dispatch_combine(
     world_size,
     port,
     max_num_inp_token_per_rank=128,
-    data_type=torch.float8_e4m3fnuz,
+    data_type=torch.bfloat16,
     hidden_dim=7168,
     scale_dim=0,
     scale_type_size=0,
-    num_experts_per_rank=16,
+    num_experts_per_rank=32,
     num_experts_per_token=8,
 ):
     config = mori.ops.EpDispatchCombineConfig(
