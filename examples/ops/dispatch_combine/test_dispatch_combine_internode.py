@@ -414,13 +414,53 @@ class EpDispatchCombineTestCase:
         if self.rank % self.gpu_per_node == 0:
             print(f"Node {self.rank // self.gpu_per_node} Combine Pass")
 
+    def run_stress_once(self, op, test_data, error_round, round):
+        (
+            all_rank_num_token,
+            all_rank_indices,
+            all_rank_input,
+            all_rank_weights,
+            all_rank_scales,
+        ) = test_data
+
+        (
+            dispatch_output,
+            dispatch_weights,
+            dispatch_scales,
+            dispatch_indices,
+            dispatch_recv_num_token,
+        ) = op.dispatch(
+            all_rank_input[self.rank],
+            all_rank_weights[self.rank],
+            all_rank_scales[self.rank],
+            all_rank_indices[self.rank],
+            block_num=self.config.block_num,
+            warp_per_block=16,
+        )
+        torch.cuda.synchronize()
+
+        if self.rank % self.gpu_per_node == 0:
+            print(f"Node {self.rank // self.gpu_per_node} Dispatch Pass")
+
+        combine_output, combine_output_weight = op.combine(
+            dispatch_output,
+            dispatch_weights,
+            all_rank_indices[self.rank],
+            block_num=self.config.block_num,
+            warp_per_block=16,
+        )
+        torch.cuda.synchronize()
+
+        if self.rank % self.gpu_per_node == 0:
+            print(f"Node {self.rank // self.gpu_per_node} Combine Pass")
+
     def test_dispatch_combine(self):
         error_round = set()
         op = mori.ops.EpDispatchCombineOp(self.config)
         for i in range(5000):
             if self.rank == 0:
                 print(f"Round {i} begin")
-            test_data = self.gen_test_data(use_max_token_num=False)
+            test_data = self.gen_test_data(use_max_token_num=True)
             if self.rank == 0:
                 print(f"Round {i} gen test_data done")
             self.run_test_once(op, test_data, error_round, i)
@@ -432,6 +472,24 @@ class EpDispatchCombineTestCase:
             "appear round: ",
             error_round,
         )
+
+        del op
+
+    def stress_dispatch_combine(self):
+        error_round = set()
+        op = mori.ops.EpDispatchCombineOp(self.config)
+        import time
+
+        test_data_list = [
+            self.gen_test_data(use_max_token_num=False) for i in range(10)
+        ]
+        if self.rank == 0:
+            print(f"gen test_data done")
+        for i in range(5000):
+            if self.rank == 0:
+                print(f"Round {i} begin")
+            self.run_stress_once(op, test_data_list[i % 5], error_round, i)
+            time.sleep(0.001)
 
         del op
 
@@ -490,7 +548,11 @@ class EpDispatchCombineTestCase:
 
         element_size = all_rank_input[self.rank].element_size()
         total_bytes = total_recv_num_token * self.config.hidden_dim * element_size
-        ll_mode_scale = self.config.max_num_inp_token_per_rank * self.config.num_experts_per_token / total_recv_num_token
+        ll_mode_scale = (
+            self.config.max_num_inp_token_per_rank
+            * self.config.num_experts_per_token
+            / total_recv_num_token
+        )
         total_rdma_bytes = (
             total_rdma_recv_num_token * self.config.hidden_dim * element_size
         )
@@ -523,7 +585,7 @@ class EpDispatchCombineTestCase:
             comb_duration,
             comb_rdma_bandwidth,
             comb_bandwidth,
-            ll_mode_scale
+            ll_mode_scale,
         )
 
     def bench_dispatch_combine(self):
@@ -556,7 +618,7 @@ class EpDispatchCombineTestCase:
                 comb_duration,
                 comb_rdma_bandwidth,
                 comb_bandwidth,
-                ll_mode_scale
+                ll_mode_scale,
             ) = self.run_bench_once(op, test_data)
 
             disp_duration_output = [torch.zeros(1) for _ in range(self.world_size)]
@@ -701,7 +763,8 @@ def test_dispatch_combine(
     if is_bench:
         test_case.bench_dispatch_combine()
     else:
-        test_case.test_dispatch_combine()
+        # test_case.test_dispatch_combine()
+        test_case.stress_dispatch_combine()
     test_case.cleanup()
 
 

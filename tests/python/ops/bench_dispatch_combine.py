@@ -105,11 +105,22 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
 
         element_size = all_rank_input[self.config.rank].element_size()
         total_bytes = total_recv_num_token * self.config.hidden_dim * element_size
-        ll_mode_scale = self.config.max_num_inp_token_per_rank * self.config.num_experts_per_token / total_recv_num_token
+        ll_mode_scale = (
+            self.config.max_num_inp_token_per_rank
+            * self.config.num_experts_per_token
+            / total_recv_num_token
+        )
         disp_bandwidth = total_bytes / (1000**3) / (disp_duration / (10**3))
         comb_bandwidth = total_bytes / (1000**3) / (comb_duration / (10**3))
 
-        return disp_duration, comb_duration, disp_bandwidth, comb_bandwidth, total_bytes, ll_mode_scale
+        return (
+            disp_duration,
+            comb_duration,
+            disp_bandwidth,
+            comb_bandwidth,
+            total_bytes,
+            ll_mode_scale,
+        )
 
     def run(self, op, warmup=1, iters=10):
         test_data = self.gen_test_data()
@@ -126,8 +137,8 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
 
         for i in range(iters):
             self.sync()
-            disp_dur, comb_dur, disp_bw, comb_bw, total_bytes, ll_mode_scale = self.run_once(
-                op, test_data_list[i], False
+            disp_dur, comb_dur, disp_bw, comb_bw, total_bytes, ll_mode_scale = (
+                self.run_once(op, test_data_list[i], False)
             )
 
             disp_dur_list = [torch.zeros(1) for _ in range(self.config.world_size)]
