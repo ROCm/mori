@@ -226,7 +226,7 @@ class EpDispatchCombineHandle {
   // Inter-node v1 kernel parameters
   // Signal the completion of inter-node token transfer
   mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
-  // Signal the number of tokens transfered from other nodes
+  // Signal the number of tokens transferred from other nodes
   mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;
   // Count the number of tokens sent to other nodes
   index_t* destNodeTokenCounter{nullptr};

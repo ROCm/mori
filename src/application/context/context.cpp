@@ -218,11 +218,11 @@ void Context::InitializePossibleTransports() {
     application::RdmaEndpointConfig config;
     config.portId = portId;
     config.gidIdx = 3;
-    config.maxMsgsNum = 4096;
+    config.maxMsgsNum = 8192;
 #ifdef ENABLE_BNXT
-    config.maxCqeNum = 4096;
+    config.maxCqeNum = 8192;
 #else
-    config.maxCqeNum = 4096;
+    config.maxCqeNum = 8192;
 #endif
     config.alignment = 4096;
     config.onGpu = true;
