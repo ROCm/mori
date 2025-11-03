@@ -51,7 +51,7 @@ enum class RdmaDeviceVendorId : uint32_t {
   Unknown = 0,
   Mellanox = 0x02c9,
   Broadcom = 0x14E4,
-  Pensando = 0x14E4,
+  Pensando = 0x1dd8,
 };
 
 template <typename T>
@@ -246,8 +246,6 @@ class RdmaDevice {
 
   ibv_device* device;
   ibv_context* defaultContext;
-  struct ibv_pd *pd_parent = nullptr;
-  struct ibv_pd *pd_uxdma;
 
   std::unique_ptr<ibv_device_attr_ex> deviceAttr;
   std::unordered_map<uint32_t, std::unique_ptr<ibv_port_attr>> portAttrMap;

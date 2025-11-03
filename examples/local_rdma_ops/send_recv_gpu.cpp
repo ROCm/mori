@@ -81,7 +81,10 @@ __device__ void RecvThreadKernel(RdmaEndpoint& epRecv, RdmaMemoryRegion mr, int 
       RingDoorbell<P>(epRecv.wqHandle.dbrAddr, dbr_val);
       printf("recv RingDoorbell is done\n");
     }
-
+    if constexpr (P == ProviderType::PSD) {
+      RingDoorbell<P>(epRecv.wqHandle.rqdbrAddr, dbr_val);
+      printf("recv RingDoorbell is done\n");
+    }
 
     int rcv_opcode =
         PollCq<P>(epRecv.cqHandle.cqAddr, epRecv.cqHandle.cqeNum, &epRecv.cqHandle.consIdx);

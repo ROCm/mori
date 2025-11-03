@@ -125,7 +125,7 @@ __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMe
 
 void LocalRdmaOps() {
   int msgSize = 1024;
-  int msgNum = 128;
+  int msgNum = 1024;
 
   // RDMA initialization
   // 1 Create device
@@ -147,7 +147,7 @@ void LocalRdmaOps() {
   RdmaEndpointConfig config;
   config.portId = devicePort.second;
   config.gidIdx = 3;
-  config.maxMsgsNum = 256;
+  config.maxMsgsNum = 64;
   config.maxCqeNum = 256;
   config.alignment = 4096;
   config.onGpu = true;

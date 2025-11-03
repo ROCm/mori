@@ -143,12 +143,16 @@ class IonicQpContainer {
 /* ---------------------------------------------------------------------------------------------- */
 class IonicDeviceContext : public RdmaDeviceContext {
  public:
-  IonicDeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd);
+  IonicDeviceContext(RdmaDevice* rdma_device, ibv_context* context, ibv_pd* inPd);
   ~IonicDeviceContext();
 
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) override;
   virtual void ConnectEndpoint(const RdmaEndpointHandle& local,
                                const RdmaEndpointHandle& remote, uint32_t qpn = 0) override;
+  static void pd_release(ibv_pd* pd, void* pd_context, void* ptr, uint64_t resource_type);
+  static void* pd_alloc_device_uncached(ibv_pd* pd, void* pd_context, size_t size,
+                                        size_t alignment, uint64_t resource_type);
+  void create_parent_domain(ibv_context* context, struct ibv_pd *pd_orig);
 
  private:
   uint32_t pdn;
@@ -163,11 +167,7 @@ class IonicDevice : public RdmaDevice {
   IonicDevice(ibv_device* device);
   ~IonicDevice();
 
-  static void pd_release(ibv_pd* pd, void* pd_context, void* ptr, uint64_t resource_type);
-  static void* pd_alloc_device_uncached(ibv_pd* pd, void* pd_context, size_t size, 
-                                        size_t alignment, uint64_t resource_type);
-  void create_parent_domain(struct ibv_pd *pd_orig);
-  RdmaDeviceContext* CreateRdmaDeviceContext() override;
+ RdmaDeviceContext* CreateRdmaDeviceContext() override;
 };
 }  // namespace application
 }  // namespace mori

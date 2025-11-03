@@ -51,7 +51,6 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
   struct ibv_cq_ex *cq_ex;
 
   cqeNum = config.maxCqeNum;
-  size_t cqSize = 0;// not device memory
 
   memset(&cq_attr, 0, sizeof(struct ibv_cq_init_attr_ex));
   cq_attr.cqe           = cqeNum * 2; //from rocshmem, send&recv?
@@ -68,8 +67,7 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
   cq = ibv_cq_ex_to_cq(cq_ex);
   assert(cq);
 
-  MORI_APP_TRACE("IONIC CQ created: cqn={}, cqeNum={}, cqSize={}",
-                 cqn, cqeNum, cqSize);
+  MORI_APP_TRACE("IONIC CQ created: cqn={}, cqeNum={}", cqn, cqeNum * 2);
 }
 
 IonicCqContainer::~IonicCqContainer() {
@@ -170,18 +168,19 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   struct ibv_qp_init_attr_ex attr;
   int hip_dev_id{-1};
   int err;
-
+  printf("IonicQpContainer, cq:%p, pd:%p, context:%p， config.maxMsgsNum:%d\n", 
+	 cq, pd_uxdma, context, config.maxMsgsNum);
   wqeNum = config.maxMsgsNum;
   memset(&attr, 0, sizeof(struct ibv_qp_init_attr_ex));
   attr.cap.max_send_wr     = wqeNum;
-  //attr.cap.max_recv_wr     = wqeNum;
+  attr.cap.max_recv_wr     = wqeNum;
   attr.cap.max_send_sge    = 1;
   attr.cap.max_inline_data = MAX_INLINE_SIZE;
   attr.sq_sig_all          = 0;
   attr.qp_type             = IBV_QPT_RC;
   attr.comp_mask           = IBV_QP_INIT_ATTR_PD;
   attr.cap.max_send_sge    = 1; 
-  //attr.cap.max_recv_sge    = 1; 
+  attr.cap.max_recv_sge    = 1; 
   attr.pd                  = pd_uxdma;
   attr.send_cq             = cq;
   attr.recv_cq             = cq;
@@ -218,12 +217,12 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   sq_dbval = dvqp.sq.db_val;
   sq_mask = dvqp.sq.mask;
   ionic_sq_buf = reinterpret_cast<ionic_v1_wqe *>(dvqp.sq.ptr);
-
+  printf("sq ptr:%p, sq size:%lu, sq mask:0x%x\n", dvqp.sq.ptr, dvqp.sq.size, dvqp.sq.mask);
   rq_dbreg = gpu_db_rq;
   rq_dbval = dvqp.rq.db_val;
   rq_mask = dvqp.rq.mask;
   ionic_rq_buf = reinterpret_cast<ionic_v1_wqe *>(dvqp.rq.ptr);
-
+  printf("rq ptr:%p, rq size:%lu, rq mask:0x%x\n", dvqp.rq.ptr, dvqp.rq.size, dvqp.rq.mask);
   strncpy(dev_name, qp->context->device->name, sizeof(dev_name));
   dev_name[sizeof(dev_name) - 1] = 0;
 
@@ -254,7 +253,7 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   assert(atomicIbufMr);
 
   MORI_APP_TRACE(
-      "BNXT Atomic ibuf allocated: addr=0x{:x}, slots={}, size={}, lkey=0x{:x}, rkey=0x{:x}",
+      "IONIC Atomic ibuf allocated: addr=0x{:x}, slots={}, size={}, lkey=0x{:x}, rkey=0x{:x}",
       reinterpret_cast<uintptr_t>(atomicIbufAddr), RoundUpPowOfTwo(config.atomicIbufSlots),
       atomicIbufSize, atomicIbufMr->lkey, atomicIbufMr->rkey);  
 }
@@ -319,7 +318,7 @@ void IonicQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
 
   //ah_atter
   memcpy(&attr.ah_attr.grh.dgid, remote_handle.eth.gid, 16);
-  attr.ah_attr.grh.sgid_index = config.gidIdx;
+  attr.ah_attr.grh.sgid_index = /*config.gidIdx*/1;
   attr.ah_attr.port_num = config.portId;
   attr.ah_attr.is_global = 1;
   attr.ah_attr.grh.hop_limit = 1;
@@ -327,8 +326,14 @@ void IonicQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
 
   attr_mask = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_RQ_PSN | IBV_QP_DEST_QPN |
               IBV_QP_AV | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
-
+  printf("ModifyInit2Rtr, remote_handle.psn:%d, remote_handle.qpn:%d, config.gidIdx:%d, config.portId:%d\n",
+         remote_handle.psn, remote_handle.qpn, config.gidIdx, config.portId);
+  for (int i = 0; i< 16; i++) {
+    printf("%02x", remote_handle.eth.gid[i]);
+  }
+  printf("\n");
   err = ibv_modify_qp(qp, &attr, attr_mask);
+  printf("ibv_modify_qp err:%d\n", err);
   assert(err == 0);
 }
 
@@ -356,9 +361,46 @@ void IonicQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        IonicDeviceContext                                      */
 /* ---------------------------------------------------------------------------------------------- */
-IonicDeviceContext::IonicDeviceContext(RdmaDevice* rdma_device, ibv_pd* in_pd)
+void IonicDeviceContext::pd_release(struct ibv_pd* pd, void* pd_context, void* ptr, uint64_t resource_type) {
+  HIP_RUNTIME_CHECK(hipFree(ptr));
+}
+
+void* IonicDeviceContext::pd_alloc_device_uncached(struct ibv_pd* pd, void* pd_context, size_t size,
+                                            size_t alignment, uint64_t resource_type) {
+  void* dev_ptr{nullptr};
+  HIP_RUNTIME_CHECK(hipExtMallocWithFlags(reinterpret_cast<void**>(&dev_ptr), size, hipDeviceMallocUncached));
+  memset(dev_ptr, 0, size);
+  return dev_ptr;
+}
+
+void IonicDeviceContext::create_parent_domain(ibv_context* context, struct ibv_pd *pd_orig) {
+  struct ibv_parent_domain_init_attr pattr;
+
+  memset(&pattr, 0, sizeof(struct ibv_parent_domain_init_attr));
+  pattr.pd         = pd_orig;
+  pattr.td         = nullptr,
+  pattr.comp_mask  = IBV_PARENT_DOMAIN_INIT_ATTR_ALLOCATORS;
+  pattr.free       = IonicDeviceContext::pd_release;
+  pattr.pd_context = nullptr;
+  pattr.alloc      = IonicDeviceContext::pd_alloc_device_uncached;
+  #if 0
+  pd_parent = ibv_alloc_parent_domain(defaultContext, &pattr);
+  assert(pd_parent);
+
+  ionic_dv_pd_set_sqcmb(pd_parent, false, false, false);
+  ionic_dv_pd_set_rqcmb(pd_parent, false, false, false);
+  #endif
+  pd_uxdma = ibv_alloc_parent_domain(context, &pattr);
+  assert(pd_uxdma);
+  printf("create_parent_domain, pd_uxdma:%p\n", pd_uxdma);
+  ionic_dv_pd_set_sqcmb(pd_uxdma, false, false, false);
+  ionic_dv_pd_set_rqcmb(pd_uxdma, false, false, false);
+  ionic_dv_pd_set_udma_mask(pd_uxdma, 1);
+}
+
+IonicDeviceContext::IonicDeviceContext(RdmaDevice* rdma_device, ibv_context* context, ibv_pd* in_pd)
     : RdmaDeviceContext(rdma_device, in_pd) {
-  pd_uxdma = in_pd;
+  create_parent_domain(context, in_pd);
 }
 
 IonicDeviceContext::~IonicDeviceContext() {}
@@ -368,8 +410,9 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
   int ret;
 
   assert(!config.withCompChannel && !config.enableSrq && "not implemented");
-
+  
   IonicCqContainer* cq = new IonicCqContainer(context, config, pd_uxdma);
+  printf("CreateRdmaEndpoint, context:%p, cq->cq:%p, pd_uxdma:%p\n", context, cq->cq, pd_uxdma);
   IonicQpContainer* qp = new IonicQpContainer(context, config, cq->cq, pd_uxdma, this);
 
   RdmaEndpoint endpoint;
@@ -379,15 +422,21 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
 
   // Get gid
   union ibv_gid ibvGid;
-  ret = ibv_query_gid(context, config.portId, config.gidIdx, &ibvGid);
+  ret = ibv_query_gid(context, config.portId, /*config.gidIdx */1, &ibvGid);
   assert(!ret);
   memcpy(endpoint.handle.eth.gid, ibvGid.raw, sizeof(endpoint.handle.eth.gid));
+  for (int i = 0; i< 16; i++) {
+    printf("%02x", endpoint.handle.eth.gid[i]);
+  }
+  printf("\n");
   endpoint.vendorId = RdmaDeviceVendorId::Pensando;
   endpoint.wqHandle.sqAddr = qp->GetSqAddress();
   endpoint.wqHandle.rqAddr = qp->GetRqAddress();
   endpoint.wqHandle.dbrAddr = qp->gpu_db_sq;
-  endpoint.wqHandle.sqWqeNum = qp->wqeNum;
-  endpoint.wqHandle.rqWqeNum = qp->wqeNum;
+  endpoint.wqHandle.sqWqeNum = qp->sq_mask + 1;//qp->wqeNum;
+  endpoint.wqHandle.rqWqeNum = qp->rq_mask + 1;//qp->wqeNum;
+  endpoint.wqHandle.rqdbrAddr = qp->gpu_db_rq;
+
   endpoint.wqHandle.color = true;
   endpoint.wqHandle.sq_dbval = qp->sq_dbval;
   endpoint.wqHandle.rq_dbval = qp->rq_dbval;
@@ -397,6 +446,7 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
   endpoint.cqHandle.cqeNum = cq->cqeNum;
   endpoint.cqHandle.cqeSize = GetIonicCqeSize();
   endpoint.cqHandle.dbrAddr = qp->gpu_db_cq;
+  endpoint.cqHandle.dbrRecAddr = qp->gpu_db_cq;
   endpoint.cqHandle.cq_dbval = qp->cq_dbval;
 
   // Set atomic internal buffer information
@@ -443,49 +493,12 @@ void IonicDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
 IonicDevice::IonicDevice(ibv_device* in_device) : RdmaDevice(in_device) {}
 IonicDevice::~IonicDevice() {}
 
-void IonicDevice::pd_release(struct ibv_pd* pd, void* pd_context, void* ptr, uint64_t resource_type) {
-  HIP_RUNTIME_CHECK(hipFree(ptr));
-}
-
-void* IonicDevice::pd_alloc_device_uncached(struct ibv_pd* pd, void* pd_context, size_t size, 
-                                            size_t alignment, uint64_t resource_type) {
-  void* dev_ptr{nullptr};
-  HIP_RUNTIME_CHECK(hipExtMallocWithFlags(reinterpret_cast<void**>(&dev_ptr), size, hipDeviceMallocUncached));
-  memset(dev_ptr, 0, size);
-  return dev_ptr;
-}
-
-void IonicDevice::create_parent_domain(struct ibv_pd *pd_orig) {
-  struct ibv_parent_domain_init_attr pattr;
-
-  memset(&pattr, 0, sizeof(struct ibv_parent_domain_init_attr));
-  pattr.pd         = pd_orig;
-  pattr.td         = nullptr,
-  pattr.comp_mask  = IBV_PARENT_DOMAIN_INIT_ATTR_ALLOCATORS;
-  pattr.free       = IonicDevice::pd_release;
-  pattr.pd_context = nullptr;
-  pattr.alloc      = IonicDevice::pd_alloc_device_uncached;
-
-  pd_parent = ibv_alloc_parent_domain(defaultContext, &pattr);
-  assert(pd_parent);
-
-  ionic_dv_pd_set_sqcmb(pd_parent, false, false, false);
-  ionic_dv_pd_set_rqcmb(pd_parent, false, false, false);
-
-  pd_uxdma = ibv_alloc_parent_domain(defaultContext, &pattr);
-  assert(pd_uxdma);
-
-  ionic_dv_pd_set_sqcmb(pd_uxdma, false, false, false);
-  ionic_dv_pd_set_rqcmb(pd_uxdma, false, false, false);
-  ionic_dv_pd_set_udma_mask(pd_uxdma, 1);
-}
-
 RdmaDeviceContext* IonicDevice::CreateRdmaDeviceContext() {
   ibv_pd* pd = ibv_alloc_pd(defaultContext);
   assert(pd);
-  	
-  create_parent_domain(pd);
-  return new IonicDeviceContext(this, pd_uxdma);
+  printf("IonicDevice::CreateRdmaDeviceContext, defaultContext:%p, pd:%p\n", defaultContext, pd);  
+
+  return new IonicDeviceContext(this, defaultContext, pd);
 }
 
 }  // namespace application

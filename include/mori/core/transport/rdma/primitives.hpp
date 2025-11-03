@@ -84,6 +84,7 @@ struct WorkQueueHandle {
   void* rqAddr{nullptr};
   void* dbrRecAddr{nullptr};
   void* dbrAddr{nullptr};
+  void* rqdbrAddr{nullptr};
   uint32_t mtuSize{4096};
   uint32_t sqWqeNum{0};
   uint32_t msntblNum{0};

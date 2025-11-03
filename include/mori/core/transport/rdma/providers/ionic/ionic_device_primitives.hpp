@@ -464,7 +464,7 @@ inline __device__ int PollCqOnce<ProviderType::PSD>(void* cqeAddr, uint32_t cqeN
   char* Addr = reinterpret_cast<char *>(cqeAddr) + (cqeIdx * sizeof(struct ionic_v1_cqe));
   struct ionic_v1_cqe* cqe = reinterpret_cast<ionic_v1_cqe*>(Addr);
                                                     
-  printf("consIdx:%u, cqeIdx:%u, cqeAddr:%p", consIdx, cqeIdx, cqeAddr);
+  printf("consIdx:%u, cqeIdx:%u, cqeAddr:%p", consIdx, cqeIdx, Addr);
 
   /* Determine expected color based on cq wrap count */
   uint32_t qtf_color_bit = HTOBE32(IONIC_V1_CQE_COLOR);
