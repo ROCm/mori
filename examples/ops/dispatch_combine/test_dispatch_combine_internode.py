@@ -190,7 +190,7 @@ class EpDispatchCombineTestCase:
             for r in range(self.world_size)
         ]
 
-        # gen weights
+        # gen scales
         all_rank_scales = [
             torch.rand(
                 num_token[r],
@@ -281,7 +281,6 @@ class EpDispatchCombineTestCase:
             all_rank_weights,
             all_rank_scales,
         ) = test_data
-        # dist.barrier()
 
         (
             dispatch_output,
@@ -334,7 +333,7 @@ class EpDispatchCombineTestCase:
             assert torch.equal(
                 dispatch_indices[i], all_rank_indices[src_pe][src_tok_id]
             )
-            # TODO: test output scales
+            assert torch.equal(dispatch_scales[i], all_rank_scales[src_pe][src_tok_id])
 
         if self.rank % self.gpu_per_node == 0:
             print(f"Node {self.rank // self.gpu_per_node} Dispatch Pass")
@@ -347,7 +346,6 @@ class EpDispatchCombineTestCase:
             warp_per_block=16,
         )
         torch.cuda.synchronize()
-
         for i in range(all_rank_num_token[self.rank]):
             pes = [
                 (idx // self.config.num_experts_per_rank)
@@ -413,7 +411,6 @@ class EpDispatchCombineTestCase:
                         f"  max_diff: {torch.abs(got_weight - expected_weight).max()}"
                     )
                 assert weight_match, f"Weight assertion failed for token {i}"
-
         if self.rank % self.gpu_per_node == 0:
             print(f"Node {self.rank // self.gpu_per_node} Combine Pass")
 

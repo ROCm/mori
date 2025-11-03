@@ -87,7 +87,7 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   shmemCombineOutWeightsMemObj =
       ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
 
-  if (config.scaleDim > 0 && config.scaleTypeSize > 0) {
+  if ((config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
     size_t maxScaleSize = config.MaxNumTokensToRecv() * config.scaleDim * config.scaleTypeSize;
     shmemInpScalesMemObj = ShmemMallocAndReturnMemObjPtr(maxScaleSize, hipDeviceMallocUncached);
     shmemOutScalesMemObj = ShmemMallocAndReturnMemObjPtr(maxScaleSize, hipDeviceMallocUncached);
