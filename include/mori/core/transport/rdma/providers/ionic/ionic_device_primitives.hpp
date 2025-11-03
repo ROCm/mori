@@ -51,7 +51,7 @@ inline __device__ uint64_t IonicPostSend(WorkQueueHandle& wq, uint32_t curPostId
   uint16_t wqe_flags = 0;
 
   //to do: need to clear memory
-  if (wq.color) {
+  if ((wqeNum & curPostIdx) == 0) {
     wqe_flags |= HTOBE16(IONIC_V1_FLAG_COLOR);
   }
 
@@ -64,11 +64,6 @@ inline __device__ uint64_t IonicPostSend(WorkQueueHandle& wq, uint32_t curPostId
   wqe->base.num_sge_key = size ? 1 : 0;
   wqe->base.imm_data_key = HTOBE32(0);
 
-  #if 0
-  wqe->common.rdma.remote_va_high = HTOBE32(reinterpret_cast<uint64_t>(raddr) >> 32);
-  wqe->common.rdma.remote_va_low = HTOBE32(reinterpret_cast<uint64_t>(raddr));
-  wqe->common.rdma.remote_rkey = HTOBE32(rkey);
-  #endif
   wqe->common.length = HTOBE32(size);
   wqe->common.pld.sgl[0].va = HTOBE64(reinterpret_cast<uint64_t>(laddr));
   wqe->common.pld.sgl[0].len = HTOBE32(size);
@@ -76,10 +71,10 @@ inline __device__ uint64_t IonicPostSend(WorkQueueHandle& wq, uint32_t curPostId
 
   __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 
-  printf("curPostIdx:%u, wqeIdx:%u, doorbell:%lu", curPostIdx, wqeIdx, wq.sq_dbval | wqeIdx);
+  printf("curPostIdx:%u, wqeIdx:%u, doorbell:%lu", curPostIdx, wqeIdx, wq.sq_dbval | (wqeIdx + 1));
   
   //return doorbell value
-  return wq.sq_dbval | wqeIdx;
+  return wq.sq_dbval | (wqeIdx + 1);
 }
 
 template <>
@@ -123,10 +118,10 @@ inline __device__ uint64_t IonicPostRecv(WorkQueueHandle& wq, uint32_t curPostId
   wqe->common.pld.sgl[0].len = HTOBE32(size);
   wqe->common.pld.sgl[0].lkey = HTOBE32(lkey);
 
-  printf("curPostIdx:%u, wqeIdx:%u, doorbell:%lu", curPostIdx, wqeIdx, wq.rq_dbval | wqeIdx);
+  printf("curPostIdx:%u, wqeIdx:%u, doorbell:%lu", curPostIdx, wqeIdx, wq.rq_dbval | (wqeIdx + 1));
   
   //return doorbell value
-  return wq.rq_dbval | wqeIdx;
+  return wq.rq_dbval | (wqeIdx + 1);
 }
 
 template <>
@@ -158,9 +153,10 @@ inline __device__ uint64_t IonicPostReadWrite(WorkQueueHandle& wq, uint32_t curP
   char* wqeAddr = reinterpret_cast<char *>(queueBuffAddr) + (wqeIdx * sizeof(struct ionic_v1_wqe));
   struct ionic_v1_wqe* wqe = reinterpret_cast<ionic_v1_wqe*>(wqeAddr);
   uint16_t wqe_flags = 0;
-
+  
+  printf("IonicPostReadWrite, wqe:%p, curPostIdx:%d, wqeIdx:%d\n", wqe, curPostIdx, wqeIdx);
   //to do: need to clear memory
-  if (wq.color) {
+  if ((wqeNum & curPostIdx) == 0) {
     wqe_flags |= HTOBE16(IONIC_V1_FLAG_COLOR);
   }
 
@@ -184,10 +180,17 @@ inline __device__ uint64_t IonicPostReadWrite(WorkQueueHandle& wq, uint32_t curP
 
   __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 
-  printf("curPostIdx:%u, wqeIdx:%u, doorbell:%lu", curPostIdx, wqeIdx, wq.sq_dbval | wqeIdx);
-  
+  printf("dump wqe at addr:%p\n", wqeAddr);
+  for (int i = 0; i < 64; i++) {
+    printf("%02x", (unsigned char)wqeAddr[i]);
+    if ((i+1)%4 == 0)
+      printf("\n");
+  }
+
+  printf("IonicPostReadWrite, curPostIdx:%u, wqeIdx:%u, doorbell:0x%lx\n", 
+         curPostIdx, wqeIdx, wq.sq_dbval | (wqeIdx+1));
   //return doorbell value
-  return wq.sq_dbval | wqeIdx;
+  return wq.sq_dbval | (wqeIdx+1);
 }
 
 template <>
@@ -235,7 +238,7 @@ inline __device__ uint64_t IonicPostWriteInline(WorkQueueHandle& wq, uint32_t cu
                                                 bool cqeSignal, uint32_t qpn, void* val,
                                                 uintptr_t raddr, uint64_t rkey, size_t bytes) {
   assert(bytes <= MAX_INLINE_SIZE);
-  assert(!val);
+  assert(val);
   void* queueBuffAddr = wq.sqAddr;
   uint32_t wqeNum = wq.sqWqeNum;
   int32_t size = (int32_t)bytes;
@@ -246,7 +249,7 @@ inline __device__ uint64_t IonicPostWriteInline(WorkQueueHandle& wq, uint32_t cu
 
   //to do: need to clear memory
   wqe_flags |= HTOBE16(IONIC_V1_FLAG_INL);
-  if (wq.color) {
+  if ((wqeNum & curPostIdx) == 0) {
     wqe_flags |= HTOBE16(IONIC_V1_FLAG_COLOR);
   }
 
@@ -258,7 +261,6 @@ inline __device__ uint64_t IonicPostWriteInline(WorkQueueHandle& wq, uint32_t cu
   wqe->base.op = IONIC_V2_OP_RDMA_WRITE;
   wqe->base.num_sge_key = 0;
   wqe->base.imm_data_key = HTOBE32(0);
-  __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 
   wqe->common.rdma.remote_va_high = HTOBE32(reinterpret_cast<uint64_t>(raddr) >> 32);
   wqe->common.rdma.remote_va_low = HTOBE32(reinterpret_cast<uint64_t>(raddr));
@@ -267,10 +269,12 @@ inline __device__ uint64_t IonicPostWriteInline(WorkQueueHandle& wq, uint32_t cu
   wqe->common.length = HTOBE32(size);
   memcpy(wqe->common.pld.data, val, size);
 
-  printf("curPostIdx:%u, wqeIdx:%u, doorbell:%lu", curPostIdx, wqeIdx, wq.sq_dbval | wqeIdx);
+  __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+
+  printf("curPostIdx:%u, wqeIdx:%u, doorbell:%lu\n", curPostIdx, wqeIdx, wq.sq_dbval | (wqeIdx + 1));
   
   //return doorbell value
-  return wq.sq_dbval | wqeIdx;
+  return wq.sq_dbval | (wqeIdx + 1);
 }
 
 template <>
@@ -285,6 +289,7 @@ inline __device__ uint64_t PostWriteInline<ProviderType::PSD>(WorkQueueHandle& w
                                                               void* val, uintptr_t raddr,
                                                               uint64_t rkey, size_t bytes) {
   uint32_t curPostIdx = atomicAdd(&wq.postIdx, 1);
+  printf("PostWriteInline, val:%p\n", val);
   return IonicPostWriteInline(wq, curPostIdx, true, qpn, val, raddr, rkey, bytes);
 }
 
@@ -304,14 +309,13 @@ inline __device__ uint64_t IonicPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t c
   struct ionic_v1_wqe* wqe = reinterpret_cast<ionic_v1_wqe*>(wqeAddr);
   uint16_t wqe_flags = 0;
 
-  if (wq.color) {
+  if ((wqeNum & curPostIdx) == 0) {
     wqe_flags |= HTOBE16(IONIC_V1_FLAG_COLOR);
   }
 
   if (cqeSignal) {
     wqe_flags |= HTOBE16(IONIC_V1_FLAG_SIG);
   }
-  __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 
   uint64_t atomic_data = val_1 ? *static_cast<uint64_t*>(val_1) : 0;
   uint64_t atomic_cmp = val_2 ? *static_cast<uint64_t*>(val_2) : 0;
@@ -360,10 +364,13 @@ inline __device__ uint64_t IonicPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t c
 
   wqe->atomic_v2.local_va = HTOBE64(reinterpret_cast<uint64_t>(laddr));
   wqe->atomic_v2.lkey = HTOBE32(lkey);
-  printf("curPostIdx:%u, wqeIdx:%u, doorbell:%lu", curPostIdx, wqeIdx, wq.sq_dbval | wqeIdx);
+
+  __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+
+  printf("curPostIdx:%u, wqeIdx:%u, doorbell:%lu", curPostIdx, wqeIdx, wq.sq_dbval | (wqeIdx + 1));
 	
   //return doorbell value
-  return wq.sq_dbval | wqeIdx;
+  return wq.sq_dbval | (wqeIdx + 1);
 }
 
 template <>
@@ -425,6 +432,8 @@ inline __device__ void UpdateRecvDbrRecord<ProviderType::PSD>(void* dbrRecAddr, 
 
 template <>
 inline __device__ void RingDoorbell<ProviderType::PSD>(void* dbrAddr, uint64_t dbrVal) {
+  printf("really write doorbell, sq/rq dbrAddr:%p, dbrVal:0x%lx\n", 
+         reinterpret_cast<uint64_t*>(dbrAddr), dbrVal);
   core::AtomicStoreSeqCstSystem(reinterpret_cast<uint64_t*>(dbrAddr), dbrVal);
 }
 
@@ -463,9 +472,18 @@ inline __device__ int PollCqOnce<ProviderType::PSD>(void* cqeAddr, uint32_t cqeN
   uint32_t cqeIdx = consIdx & (cqeNum - 1);
   char* Addr = reinterpret_cast<char *>(cqeAddr) + (cqeIdx * sizeof(struct ionic_v1_cqe));
   struct ionic_v1_cqe* cqe = reinterpret_cast<ionic_v1_cqe*>(Addr);
-                                                    
-  printf("consIdx:%u, cqeIdx:%u, cqeAddr:%p", consIdx, cqeIdx, Addr);
-
+                                                  
+  printf("consIdx:%u, cqeIdx:%u, cqeAddr:%p, qtf_be:0x%08x, cqe->status_length:%d\n",
+	 consIdx, cqeIdx, Addr, 
+	 *(volatile uint32_t *)(&cqe->qid_type_flags), HTOBE32(cqe->status_length));
+  #if 1
+  printf("dump cqe at addr:%p\n", Addr);
+  for (int i = 0; i < 32; i++) {
+    printf("%02x", (unsigned char)Addr[i]);
+    if ((i+1)%4 == 0)
+      printf("\n");
+  }
+  #endif
   /* Determine expected color based on cq wrap count */
   uint32_t qtf_color_bit = HTOBE32(IONIC_V1_CQE_COLOR);
   uint32_t qtf_color_exp = qtf_color_bit;
@@ -494,12 +512,12 @@ inline __device__ int PollCqOnce<ProviderType::PSD>(void* cqeAddr, uint32_t cqeN
   
     printf("QUIET ERROR: qid %u type %u flag %#x status %u msn %u npg %lu\n",
            qid, type, flag, status, msn, npg);
+    return HTOBE32(cqe->status_length);
   }
 
-  int32_t err = HTOBE32(cqe->status_length);
-  printf("poll cqe once, err:%d\n", err);
+  printf("poll cqe one, success\n");
   
-  return err;
+  return 0;
 }
  
 template <>
@@ -516,7 +534,7 @@ inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum, u
   // Handle error cases
   if (err) {
 	 auto error = IonicHandleErrorCqe(err);
-	 printf("[BNXT PollCq] CQE error: %s (opcode: %d) at %s:%d\n", IbvWcStatusString(error), err,
+	 printf("[IONIC PollCq] CQE error: %s (opcode: %d) at %s:%d\n", IbvWcStatusString(error), err,
 			__FILE__, __LINE__);
 	 return err;
   }
@@ -551,8 +569,9 @@ inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum,
 template <>
 inline __device__ void UpdateCqDbrRecord<ProviderType::PSD>(CompletionQueueHandle& cq, void* dbrRecAddr, uint32_t cons_idx,
                                                             uint32_t cqeNum) {
-  uint64_t dbrVal = cq.cq_dbval | ((cq.cqeNum - 1) & (cons_idx + 1));                                                         
+  uint64_t dbrVal = cq.cq_dbval | ((cq.cqeNum - 1) & (cons_idx)); // don't add 1 to cons_idx
   core::AtomicStoreSeqCstSystem(reinterpret_cast<uint64_t*>(dbrRecAddr), dbrVal);
+  printf("UpdateCqDbrRecord, dbrRecAddr:%p, dbrVal:%#lx\n", reinterpret_cast<uint64_t*>(dbrRecAddr), dbrVal);
   return;
 }
 
