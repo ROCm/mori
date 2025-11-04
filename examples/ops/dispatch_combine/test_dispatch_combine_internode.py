@@ -72,11 +72,9 @@ class EpDispatchCombineTestCase:
         self.device = torch.device("cuda", local_rank)
 
         dist.init_process_group(
-            # backend="cpu:gloo,cuda:nccl",
             backend="cpu:gloo",
             rank=self.rank,
             world_size=self.world_size,
-            # device_id=self.device,
         )
 
         print("init process group done")
@@ -90,7 +88,6 @@ class EpDispatchCombineTestCase:
         print(f"I'm pe {mori.shmem.shmem_mype()} in {mori.shmem.shmem_npes()} pes")
 
         self.rng = torch.Generator(device=self.device)
-        # self.rng.manual_seed(int(time.time()) + self.rank)
         self.rng.manual_seed(999)
 
     def cleanup(self):
@@ -420,7 +417,7 @@ class EpDispatchCombineTestCase:
         for i in range(5000):
             if self.rank == 0:
                 print(f"Round {i} begin")
-            test_data = self.gen_test_data(use_max_token_num=True)
+            test_data = self.gen_test_data(use_max_token_num=False)
             if self.rank == 0:
                 print(f"Round {i} gen test_data done")
             self.run_test_once(op, test_data, error_round, i)
@@ -463,7 +460,7 @@ class EpDispatchCombineTestCase:
                 block_num=self.config.block_num,
                 warp_per_block=16,
             )
-            combine_output, combine_output_weight = op.combine(
+            _, _ = op.combine(
                 dispatch_output,
                 dispatch_weights,
                 all_rank_indices[self.rank],
@@ -499,7 +496,7 @@ class EpDispatchCombineTestCase:
                 block_num=self.config.block_num,
                 warp_per_block=16,
             )
-            combine_output, combine_output_weight = op.combine(
+            _, _ = op.combine(
                 dispatch_output,
                 dispatch_weights,
                 all_rank_indices[self.rank],
@@ -595,7 +592,7 @@ class EpDispatchCombineTestCase:
         ll_mode_scale = (
             self.config.max_num_inp_token_per_rank
             * self.config.num_experts_per_token
-            / (total_recv_num_token + 1)
+            / (total_recv_num_token + 1)  # avoid division by zero
         )
         total_rdma_bytes = (
             total_rdma_recv_num_token * self.config.hidden_dim * element_size
@@ -646,8 +643,7 @@ class EpDispatchCombineTestCase:
         for i in range(1):
             if self.rank == 0:
                 print(f"WarmUp Round {i} begin")
-            # self.run_test_once(op, test_data, error_round, i)
-            self.run_bench_once(op, test_data)
+            self.run_test_once(op, test_data, error_round, i)
         assert (
             len(error_round) == 0
         ), f"Warmup failed with errors in rounds: {error_round}"
