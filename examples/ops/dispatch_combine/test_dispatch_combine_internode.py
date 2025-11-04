@@ -91,7 +91,7 @@ class EpDispatchCombineTestCase:
 
         self.rng = torch.Generator(device=self.device)
         # self.rng.manual_seed(int(time.time()) + self.rank)
-        self.rng.manual_seed(666)
+        self.rng.manual_seed(999)
 
     def cleanup(self):
         mori.shmem.shmem_finalize()
@@ -583,7 +583,6 @@ class EpDispatchCombineTestCase:
             combine_output, _ = op.combine(
                 dispatch_output,
                 dispatch_weights,
-                # None,
                 all_rank_indices[self.rank],
                 block_num=self.config.block_num,
                 warp_per_block=16,

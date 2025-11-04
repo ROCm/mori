@@ -276,7 +276,8 @@ def _bench_dispatch_combine(
     world_size,
     port,
     max_num_inp_token_per_rank=128,
-    data_type=torch.bfloat16,
+    # data_type=torch.bfloat16,
+    data_type=torch.float8_e4m3fnuz,
     hidden_dim=7168,
     scale_dim=0,
     scale_type_size=0,
@@ -303,9 +304,9 @@ def _bench_dispatch_combine(
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         mori.shmem.shmem_torch_process_group_init("default")
         op = mori.ops.EpDispatchCombineOp(config)
-        # benchmark.run(op)
+        benchmark.run(op)
         # benchmark.stress(op)
-        benchmark.stress_graph(op)
+        # benchmark.stress_graph(op)
         # benchmark.output()
         # mori.shmem.shmem_finalize()
 

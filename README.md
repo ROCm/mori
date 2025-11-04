@@ -28,6 +28,8 @@ Configurations:
 
 Benchmark result on DeepSeek V3 model configurations:
 
+**Bandwidth Performance**
+
 4096 tokens per batch, 7168 hidden, top-8 experts, FP8 dispatching and BF16 combining
 
 | **Kernels**| **# CUs**| **Dispatch XGMI** |**Dispatch RDMA** |**Combine XGMI**|**Combine RDMA** |
@@ -38,6 +40,17 @@ Benchmark result on DeepSeek V3 model configurations:
 |EP16-V1     | 32       | 185 GB/s          | 57 GB/s          | 172GB/s        | 52GB/s          |
 |EP16-V1     | 80       | 208 GB/s          | 63 GB/s          | 161GB/s        | 49GB/s          |
 
+**Latency Performance**
+
+128 tokens per batch, 7168 hidden, top-8 experts, FP8 dispatching and BF16 combining
+
+| **Kernels**| **# CUs**| **Dispatch Latency** |**Dispatch BW** |**Combine Latency**|**Combine BW** |
+|------------|----------|----------------------|----------------|-------------------|---------------|
+|EP8         | 80       | 37 us                | 176 GB/s       | 99 us             | 107 GB/s      |
+|EP16-V0     | 32       | 226 us               | 33 GB/s        | 296 us            | 49GB/s        |
+|EP16-V1     | 32       | 115 us               | 63 GB/s        | 141 us            | 110GB/s       |
+
+**NOTE**: We show best performance values measured from multiple test rounds to eliminate fluctuations.
 
 ### MORI-IO
 
