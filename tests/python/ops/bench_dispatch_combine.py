@@ -105,10 +105,22 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
 
         element_size = all_rank_input[self.config.rank].element_size()
         total_bytes = total_recv_num_token * self.config.hidden_dim * element_size
+        ll_mode_scale = (
+            self.config.max_num_inp_token_per_rank
+            * self.config.num_experts_per_token
+            / total_recv_num_token
+        )
         disp_bandwidth = total_bytes / (1000**3) / (disp_duration / (10**3))
         comb_bandwidth = total_bytes / (1000**3) / (comb_duration / (10**3))
 
-        return disp_duration, comb_duration, disp_bandwidth, comb_bandwidth, total_bytes
+        return (
+            disp_duration,
+            comb_duration,
+            disp_bandwidth,
+            comb_bandwidth,
+            total_bytes,
+            ll_mode_scale,
+        )
 
     def run(self, op, warmup=1, iters=10):
         test_data = self.gen_test_data()
@@ -125,8 +137,8 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
 
         for i in range(iters):
             self.sync()
-            disp_dur, comb_dur, disp_bw, comb_bw, total_bytes = self.run_once(
-                op, test_data_list[i], False
+            disp_dur, comb_dur, disp_bw, comb_bw, total_bytes, ll_mode_scale = (
+                self.run_once(op, test_data_list[i], False)
             )
 
             disp_dur_list = [torch.zeros(1) for _ in range(self.config.world_size)]
@@ -149,7 +161,6 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 int(torch.tensor(total_bytes_list).mean().item())
             )
 
-        theoretical_peak_bw = 50 * self.config.world_size
         if self.config.rank == 0:
             print("Dispatch result:")
             for i, duration_us in enumerate(disp_duration_us_list):
@@ -159,8 +170,8 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 )
                 print(
                     f"Round {i} duration(us) {duration_us} "
-                    f"bandwidth(GB/s) {disp_bandwidth_GB_list[i]} "
-                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw}({theoretical_peak_bw})"
+                    f"bandwidth(GB/s) {disp_bandwidth_GB_list[i]}"
+                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw} / {algo_bw*ll_mode_scale:.2f}"
                 )
 
             print()
@@ -172,9 +183,92 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 )
                 print(
                     f"Round {i} duration(us) {duration_us} "
-                    f"bandwidth(GB/s) {comb_bandwidth_GB_list[i]} "
-                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw}({theoretical_peak_bw})"
+                    f"bandwidth(GB/s) {comb_bandwidth_GB_list[i]}"
+                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw} / {algo_bw*ll_mode_scale:.2f}"
                 )
+
+    def stress_once(self, op, test_data):
+        (
+            all_rank_num_token,
+            all_rank_indices,
+            all_rank_input,
+            all_rank_weights,
+            all_rank_scales,
+        ) = test_data
+
+        (
+            dispatch_output,
+            dispatch_weights,
+            dispatch_scales,
+            dispatch_indices,
+            dispatch_recv_num_token,
+        ) = op.dispatch(
+            all_rank_input[self.config.rank],
+            all_rank_weights[self.config.rank],
+            # None,
+            all_rank_scales[self.config.rank],
+            all_rank_indices[self.config.rank],
+            block_num=80,
+            warp_per_block=16,
+        )
+
+        combine_output, _ = op.combine(
+            dispatch_output,
+            None,
+            dispatch_indices,
+            block_num=80,
+            warp_per_block=16,
+        )
+        torch.cuda.synchronize()
+
+    def stress(self, op):
+        test_data_list = [self.gen_test_data() for i in range(5)]
+        for i in range(100):
+            if self.config.rank == 0:
+                print(f"Round {i} begin")
+            self.stress_once(op, test_data_list[i % 5])
+
+    def stress_graph(self, op):
+        test_data = self.gen_test_data()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            (
+                all_rank_num_token,
+                all_rank_indices,
+                all_rank_input,
+                all_rank_weights,
+                all_rank_scales,
+            ) = test_data
+
+            (
+                dispatch_output,
+                dispatch_weights,
+                dispatch_scales,
+                dispatch_indices,
+                dispatch_recv_num_token,
+            ) = op.dispatch(
+                all_rank_input[self.config.rank],
+                all_rank_weights[self.config.rank],
+                # None,
+                all_rank_scales[self.config.rank],
+                all_rank_indices[self.config.rank],
+                block_num=80,
+                warp_per_block=16,
+            )
+
+            combine_output, _ = op.combine(
+                dispatch_output,
+                None,
+                dispatch_indices,
+                block_num=80,
+                warp_per_block=16,
+            )
+        torch.cuda.synchronize()
+        for i in range(135):
+            if self.config.rank == 0:
+                print(f"Round {i} begin")
+            g.replay()
+            torch.cuda.synchronize()
 
 
 def _bench_dispatch_combine(
@@ -182,11 +276,12 @@ def _bench_dispatch_combine(
     world_size,
     port,
     max_num_inp_token_per_rank=128,
+    # data_type=torch.bfloat16,
     data_type=torch.float8_e4m3fnuz,
     hidden_dim=7168,
     scale_dim=0,
     scale_type_size=0,
-    num_experts_per_rank=16,
+    num_experts_per_rank=32,
     num_experts_per_token=8,
 ):
     config = mori.ops.EpDispatchCombineConfig(
@@ -210,6 +305,8 @@ def _bench_dispatch_combine(
         mori.shmem.shmem_torch_process_group_init("default")
         op = mori.ops.EpDispatchCombineOp(config)
         benchmark.run(op)
+        # benchmark.stress(op)
+        # benchmark.stress_graph(op)
         # benchmark.output()
         # mori.shmem.shmem_finalize()
 
