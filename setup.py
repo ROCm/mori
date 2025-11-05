@@ -35,9 +35,11 @@ def _get_torch_cmake_prefix_path() -> str:
     return torch.utils.cmake_prefix_path
 
 
+_supported_arch_list = ["gfx942"]
+
+
 def _get_gpu_archs() -> str:
     archs = os.environ.get("PYTORCH_ROCM_ARCH", None)
-
     if not archs:
         import torch
 
@@ -51,7 +53,15 @@ def _get_gpu_archs() -> str:
     if mori_gpu_archs:
         archs = mori_gpu_archs
 
-    return archs.replace(" ", ";")
+    arch_list = archs.replace(" ", ";").split(";")
+
+    # filter out supported architectures
+    valid_arch_list = list(set(_supported_arch_list) & set(arch_list))
+    if len(valid_arch_list) == 0:
+        raise ValueError(
+            f"no supported archs found, supported {_supported_arch_list}, got {arch_list}"
+        )
+    return ";".join(valid_arch_list)
 
 
 class CMakeBuild(build_ext):
