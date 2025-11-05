@@ -68,5 +68,8 @@ application::SymmMemObjPtr ShmemQueryMemObjPtr(void*);
 int ShmemBufferRegister(void* ptr, size_t size);
 int ShmemBufferDeregister(void* ptr, size_t size);
 
+application::SymmMemObjPtr ShmemSymmetricRegister(void* ptr, size_t size);
+int ShmemSymmetricDeregister(void* ptr, size_t size);
+
 }  // namespace shmem
 }  // namespace mori
