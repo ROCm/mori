@@ -35,18 +35,24 @@ def _get_torch_cmake_prefix_path() -> str:
     return torch.utils.cmake_prefix_path
 
 
-def _get_gpu_archs()->str:
+def _get_gpu_archs() -> str:
     archs = os.environ.get("PYTORCH_ROCM_ARCH", None)
-    
+
     if not archs:
         import torch
+
         archs = torch._C._cuda_getArchFlags()
 
     gpu_archs = os.environ.get("GPU_ARCHS", None)
     if gpu_archs:
         archs = gpu_archs
 
+    mori_gpu_archs = os.environ.get("MORI_GPU_ARCHS", None)
+    if mori_gpu_archs:
+        archs = mori_gpu_archs
+
     return archs.replace(" ", ";")
+
 
 class CMakeBuild(build_ext):
     def run(self) -> None:
