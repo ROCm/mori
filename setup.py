@@ -57,6 +57,7 @@ class CMakeBuild(build_ext):
         build_type = os.environ.get("CMAKE_BUILD_TYPE", "Release")
         unroll_value = os.environ.get("WARP_ACCUM_UNROLL", "1")
         use_bnxt = os.environ.get("USE_BNXT", "OFF")
+        gpu_targets = os.environ.get("GPU_TARGETS", "gfx942")
         subprocess.check_call(
             [
                 "cmake",
@@ -64,6 +65,7 @@ class CMakeBuild(build_ext):
                 f"-DCMAKE_BUILD_TYPE={build_type}",
                 f"-DWARP_ACCUM_UNROLL={unroll_value}",
                 f"-DUSE_BNXT={use_bnxt}",
+                f"-DGPU_TARGETS={gpu_targets}",
                 "-B",
                 str(build_dir),
                 "-S",
