@@ -695,15 +695,30 @@ __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
 /* ---------------------------------------------------------------------------------------------- */
 template __global__ void EpDispatchInterNodeV1Kernel<hip_bfloat16>(
     EpDispatchCombineArgs<hip_bfloat16> args);
+
+#if defined(__gfx942__)
 template __global__ void EpDispatchInterNodeV1Kernel<__hip_fp8_e4m3_fnuz>(
     EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
+#elif (defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx950__)) && \
+    template __global__ void EpDispatchInterNodeV1Kernel <__hip_fp8_e4m3>(
+    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
+#endif
+
 template __global__ void EpDispatchInterNodeV1Kernel<float>(EpDispatchCombineArgs<float> args);
 
 template __global__ void EpCombineInterNodeV1Kernel<hip_bfloat16>(
     EpDispatchCombineArgs<hip_bfloat16> args);
+// template __global__ void EpCombineInterNodeV1Kernel<__hip_fp8_e4m3_fnuz>(
+//     EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
+template __global__ void EpCombineInterNodeV1Kernel<float>(EpDispatchCombineArgs<float> args);
+
+#if defined(__gfx942__)
 template __global__ void EpCombineInterNodeV1Kernel<__hip_fp8_e4m3_fnuz>(
     EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
-template __global__ void EpCombineInterNodeV1Kernel<float>(EpDispatchCombineArgs<float> args);
+#elif (defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx950__)) && \
+    template __global__ void EpCombineInterNodeV1Kernel <__hip_fp8_e4m3>(
+    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
+#endif
 
 }  // namespace moe
 }  // namespace mori

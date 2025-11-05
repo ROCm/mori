@@ -47,6 +47,8 @@ inline const char* HipDataTypeToString(hipDataType dtype) {
       return "HIP_R_32F";
     case HIP_R_16BF:
       return "HIP_R_16BF";
+    case HIP_R_8F_E4M3:
+      return "HIP_R_8F_E4M3";
     case HIP_R_8F_E4M3_FNUZ:
       return "HIP_R_8F_E4M3_FNUZ";
     default:
@@ -352,6 +354,8 @@ inline EpDispatchCombineArgsVariant GetEpDispatchCombineArgsByInputType(
       return GetEpDispatchCombineArgs<float>(handle);
     case HIP_R_16BF:
       return GetEpDispatchCombineArgs<hip_bfloat16>(handle);
+    case HIP_R_8F_E4M3:
+      return GetEpDispatchCombineArgs<__hip_fp8_e4m3>(handle);
     case HIP_R_8F_E4M3_FNUZ:
       return GetEpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>(handle);
     default:
