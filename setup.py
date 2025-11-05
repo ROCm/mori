@@ -35,6 +35,19 @@ def _get_torch_cmake_prefix_path() -> str:
     return torch.utils.cmake_prefix_path
 
 
+def _get_gpu_archs()->str:
+    archs = os.environ.get("PYTORCH_ROCM_ARCH", None)
+    
+    if not archs:
+        import torch
+        archs = torch._C._cuda_getArchFlags()
+
+    gpu_archs = os.environ.get("GPU_ARCHS", None)
+    if gpu_archs:
+        archs = gpu_archs
+
+    return archs.replace(" ", ";")
+
 class CMakeBuild(build_ext):
     def run(self) -> None:
         try:
@@ -57,7 +70,7 @@ class CMakeBuild(build_ext):
         build_type = os.environ.get("CMAKE_BUILD_TYPE", "Release")
         unroll_value = os.environ.get("WARP_ACCUM_UNROLL", "1")
         use_bnxt = os.environ.get("USE_BNXT", "OFF")
-        gpu_targets = os.environ.get("GPU_TARGETS", "gfx942")
+        gpu_archs = _get_gpu_archs()
         subprocess.check_call(
             [
                 "cmake",
@@ -65,7 +78,7 @@ class CMakeBuild(build_ext):
                 f"-DCMAKE_BUILD_TYPE={build_type}",
                 f"-DWARP_ACCUM_UNROLL={unroll_value}",
                 f"-DUSE_BNXT={use_bnxt}",
-                f"-DGPU_TARGETS={gpu_targets}",
+                f"-DGPU_TARGETS={gpu_archs}",
                 "-B",
                 str(build_dir),
                 "-S",
