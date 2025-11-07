@@ -151,7 +151,7 @@ int Ring1DAllReduceExecutor<T>::AllGather(T* input, T* output, size_t total_coun
   std::memset(flags, 0, flagsSize);
   application::SymmMemObjPtr flagsObj = shmem::ShmemQueryMemObjPtr(flags);
 
-  AllGatherRingKernel<T><<<1, 1, 0, stream>>>(myPe, npes, memObj, flagsObj);
+  AllGatherRingKernel<T><<<1, config.threadsPerBlock, 0, stream>>>(myPe, npes, memObj, flagsObj);
 
   if (input != output) {
     HIP_RUNTIME_CHECK(
