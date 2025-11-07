@@ -30,8 +30,11 @@ target_link_libraries(atomic_gpu mori_application hip::host hip::device)
 add_executable(put_thread_allgather shmem/put_thread_allgather.cpp)
 target_link_libraries(put_thread_allgather mori_shmem hip::host hip::device)
 
-add_executable(allreduce collective/allreduce.cpp)
-target_link_libraries(allreduce mori_collective hip::host hip::device)
+add_executable(all_reduce collective/all_reduce.cpp)
+target_link_libraries(all_reduce mori_collective hip::host hip::device)
+
+add_executable(all_gather collective/all_gather.cpp)
+target_link_libraries(all_gather mori_shmem hip::host hip::device)
 
 add_executable(concurrent_put_thread shmem/concurrent_put_thread.cpp)
 target_link_libraries(concurrent_put_thread mori_shmem hip::host hip::device)
