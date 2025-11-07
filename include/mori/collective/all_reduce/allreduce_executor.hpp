@@ -23,8 +23,6 @@
 
 #include <hip/hip_runtime.h>
 
-#include "mori/collective/topology_detector.hpp"
-
 namespace mori {
 namespace collective {
 
@@ -32,6 +30,7 @@ namespace collective {
  * Base class for All-Reduce algorithm executors
  * Provides common interface for all algorithm implementations
  */
+template <typename T>
 class AllReduceExecutor {
  public:
   virtual ~AllReduceExecutor() = default;
@@ -42,12 +41,10 @@ class AllReduceExecutor {
    * @param input Input data pointer (device memory)
    * @param output Output data pointer (device memory, can be same as input)
    * @param count Number of elements
-   * @param dtype_size Size of each element in bytes
    * @param stream HIP stream for asynchronous execution
    * @return 0 on success, error code otherwise
    */
-  virtual int Execute(void* input, void* output, size_t count, size_t dtype_size,
-                      hipStream_t stream) = 0;
+  virtual int Execute(T* input, T* output, size_t count, hipStream_t stream) = 0;
 };
 
 }  // namespace collective

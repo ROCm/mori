@@ -21,76 +21,16 @@
 // SOFTWARE.
 #include "mori/collective/all_reduce/ring_1d_executor.hpp"
 
-#include "mori/collective/device/all_gather.hpp"
-#include "mori/collective/device/reduce_scatter.hpp"
-
 namespace mori {
 namespace collective {
 
-Ring1DAllReduceExecutor::Ring1DAllReduceExecutor(int num_ranks, int rank,
-                                                 const AllReduceConfig& config)
-    : numRanks(num_ranks), rank(rank), config(config) {}
+// Only for sample code
+template class Ring1DAllReduceExecutor<float>;
+template class Ring1DAllReduceExecutor<double>;
+template class Ring1DAllReduceExecutor<int32_t>;
+template class Ring1DAllReduceExecutor<uint32_t>;
+template class Ring1DAllReduceExecutor<int64_t>;
+template class Ring1DAllReduceExecutor<uint64_t>;
 
-Ring1DAllReduceExecutor::~Ring1DAllReduceExecutor() {}
-
-int Ring1DAllReduceExecutor::Execute(void* input, void* output, size_t count, size_t dtype_size,
-                                     hipStream_t stream) {
-  // fake input and output
-  int status = ReduceScatter(input, output, count, dtype_size, stream);
-  if (status != 0) {
-    return status;
-  }
-  memset(output, 0, count * dtype_size);
-  status = AllGather(input, output, count, dtype_size, stream);
-  if (status != 0) {
-    return status;
-  }
-  return status;
-}
-
-int Ring1DAllReduceExecutor::ReduceScatter(void* input, void* output_chunk, size_t total_count,
-                                           size_t dtype_size, hipStream_t stream) {
-  int myPe = TopologyDetector::GetMyPe();
-  int npes = TopologyDetector::GetNPes();
-  application::SymmMemObjPtr memObj =
-      shmem::ShmemSymmetricRegister(input, total_count * dtype_size);
-  application::SymmMemObjPtr recvMemObj =
-      shmem::ShmemSymmetricRegister(output_chunk, total_count * dtype_size);
-
-  int flagsSize = npes * sizeof(uint64_t);
-  void* flags = shmem::ShmemMalloc(flagsSize);
-  if (flags == nullptr) {
-    return -1;
-  }
-  memset(flags, 0, flagsSize);
-  application::SymmMemObjPtr flagsObj = shmem::ShmemQueryMemObjPtr(flags);
-  ReduceScatterRingKernel<<<1, 1, 0, stream>>>(myPe, npes, memObj, recvMemObj, flagsObj);
-
-  shmem::ShmemFree(flags);
-
-  return 0;
-}
-
-int Ring1DAllReduceExecutor::AllGather(void* input_chunk, void* output, size_t total_count,
-                                       size_t dtype_size, hipStream_t stream) {
-  int myPe = TopologyDetector::GetMyPe();
-  int npes = TopologyDetector::GetNPes();
-  application::SymmMemObjPtr memObj =
-      shmem::ShmemSymmetricRegister(input_chunk, total_count * dtype_size);
-  application::SymmMemObjPtr recvMemObj =
-      shmem::ShmemSymmetricRegister(output, total_count * dtype_size);
-
-  int flagsSize = npes * sizeof(uint64_t);
-  void* flags = shmem::ShmemMalloc(flagsSize);
-  if (flags == nullptr) {
-    return -1;
-  }
-  memset(flags, 0, flagsSize);
-  application::SymmMemObjPtr flagsObj = shmem::ShmemQueryMemObjPtr(flags);
-  AllGatherRingKernel<<<1, 1, 0, stream>>>(myPe, npes, memObj, recvMemObj, flagsObj);
-
-  shmem::ShmemFree(flags);
-  return 0;
-}
 }  // namespace collective
 }  // namespace mori
