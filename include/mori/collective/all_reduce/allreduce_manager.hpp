@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include "mori/application/utils/check.hpp"
 #include "mori/collective/all_reduce/algorithm_selector.hpp"
 #include "mori/collective/all_reduce/allreduce_config.hpp"
 #include "mori/collective/all_reduce/allreduce_executor.hpp"
@@ -39,6 +40,7 @@ namespace collective {
  * - Executor creation and management
  * - Buffer registration
  */
+template <typename T>
 class AllReduceManager {
  public:
   /**
@@ -65,20 +67,77 @@ class AllReduceManager {
    * @param stream HIP stream for asynchronous execution
    * @return 0 on success, error code otherwise
    */
-  int AllReduce(void* input, void* output, size_t count, size_t dtype_size,
-                hipStream_t stream = nullptr);
+  int AllReduce(T* input, T* output, size_t count, hipStream_t stream = nullptr);
 
   void Finalize();
 
  private:
-  AllReduceConfig config;
-  bool initialized;
+  AllReduceConfig config{};
+  bool initialized = false;
 
-  std::unique_ptr<AllReduceExecutor> executor;
+  std::unique_ptr<AllReduceExecutor<T>> executor;
 
   // Current algorithm selection
-  AllReduceAlgorithm currentAlgorithm;
+  AllReduceAlgorithm currentAlgorithm = AllReduceAlgorithm::INVALID;
 };
+
+template <typename T>
+int AllReduceManager<T>::Initialize(const AllReduceConfig& config) {
+  if (initialized) {
+    return 0;  // Already initialized
+  }
+
+  this->config = config;
+  currentAlgorithm = AllReduceAlgorithm::INTER_RING_1D;
+
+  // Initialize the static TopologyDetector
+  TopologyDetector::Initialize();
+
+  // Create executor using topology information from TopologyDetector
+  executor = std::make_unique<Ring1DAllReduceExecutor<T>>(TopologyDetector::GetNPes(),
+                                                          TopologyDetector::GetMyPe(), config);
+
+  initialized = true;
+  return 0;
+}
+
+template <typename T>
+void AllReduceManager<T>::Finalize() {
+  if (!initialized) {
+    return;
+  }
+
+  executor.reset();
+
+  // Note: TopologyDetector::Finalize() is called separately
+  // since it's a global singleton that might be shared across multiple managers
+  TopologyDetector::Finalize();
+
+  initialized = false;
+}
+
+template <typename T>
+int AllReduceManager<T>::AllReduce(T* input, T* output, size_t count, hipStream_t stream) {
+  bool needToCreateStream = false;
+  if (stream == nullptr) {
+    hipStream_t newStream;
+    HIP_RUNTIME_CHECK(hipStreamCreate(&newStream));
+    stream = newStream;
+    needToCreateStream = true;
+  }
+  int status = executor->Execute(input, output, count, stream);
+  if (status != 0) {
+    if (needToCreateStream) {
+      HIP_RUNTIME_CHECK(hipStreamDestroy(stream));
+    }
+    return status;
+  }
+  HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
+  if (needToCreateStream) {
+    HIP_RUNTIME_CHECK(hipStreamDestroy(stream));
+  }
+  return status;
+}
 
 }  // namespace collective
 }  // namespace mori
