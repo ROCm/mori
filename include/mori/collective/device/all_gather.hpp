@@ -24,19 +24,14 @@
 namespace mori {
 namespace collective {
 
+template <typename T>
 __global__ void AllGatherRingKernel(int myPe, int npes, const application::SymmMemObjPtr memObj,
-                                    const application::SymmMemObjPtr recvMemObj,
                                     const application::SymmMemObjPtr flagsObj) {
   int nextPeer = (myPe + 1) % npes;
-  int prevPeer = (myPe - 1 + npes) % npes;
   int peChunkSize = memObj->size / npes;  // bytes per chunk
-  int elemsPerPe = memObj->size / sizeof(uint32_t);
-  int elemsPerChunk = peChunkSize / sizeof(uint32_t);  // elements per chunk
   int maxRounds = npes - 1;
 
   uint64_t* flagsArray = reinterpret_cast<uint64_t*>(flagsObj->localPtr);
-  uint32_t* recvBase = reinterpret_cast<uint32_t*>(recvMemObj->localPtr);
-  uint32_t* srcBase = reinterpret_cast<uint32_t*>(memObj->localPtr);
 
   application::RdmaMemoryRegion source;
   source.addr = reinterpret_cast<uintptr_t>(memObj->localPtr);
@@ -47,10 +42,6 @@ __global__ void AllGatherRingKernel(int myPe, int npes, const application::SymmM
     int sourceOffset = sendDataRank * peChunkSize;
 
     int recvDataRank = (myPe - i + npes) % npes;
-    int recvOffset = recvDataRank * peChunkSize;
-
-    uint32_t* recvPtr = recvBase + recvOffset / sizeof(uint32_t);
-    uint32_t* oldPtr = srcBase + recvOffset / sizeof(uint32_t);
 
     // Send data to next peer
     shmem::ShmemPutMemNbiThread(memObj, sourceOffset, source, sourceOffset, peChunkSize, nextPeer);
