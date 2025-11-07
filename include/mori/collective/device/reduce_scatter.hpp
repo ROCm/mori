@@ -45,10 +45,10 @@ __global__ void ReduceScatterRingKernel(int myPe, int npes, const application::S
   source.lkey = memObj->lkey;
 
   for (int i = 0; i < maxRounds; i++) {
-    int sendDataRank = ((myPe - i) + npes) % npes;
+    int sendDataRank = ((myPe - i - 1) + npes) % npes;
     int sourceOffset = sendDataRank * peChunkSize;
 
-    int recvDataRank = (myPe - i - 1 + npes) % npes;
+    int recvDataRank = (myPe - i - 2 + npes) % npes;
     int recvOffset = recvDataRank * peChunkSize;
 
     T* recvPtr = recvBase + recvOffset / sizeof(T);
