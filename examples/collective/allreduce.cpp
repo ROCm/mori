@@ -33,7 +33,7 @@ using namespace mori::collective;
 void testReduceScatterRing() {
   int status;
   // Initialize AllReduceManager
-  AllReduceManager allReduceManager;
+  AllReduceManager<uint32_t> allReduceManager;
   AllReduceConfig config;
   status = allReduceManager.Initialize(config);
   assert(!status);
@@ -48,14 +48,9 @@ void testReduceScatterRing() {
   int buffSize = elemsPerPe * sizeof(uint32_t);
 
   // Allocate device memory for data buffer
-  void* dataBuff = nullptr;
+  uint32_t* dataBuff = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&dataBuff, buffSize));
   assert(dataBuff != nullptr);
-
-  void* recvBuff = nullptr;
-  HIP_RUNTIME_CHECK(hipMalloc(&recvBuff, buffSize));
-  assert(recvBuff != nullptr);
-  memset(recvBuff, 0, buffSize);
 
   // Initialize data buffer: each PE initializes all chunks with its PE number + 1
   uint32_t* hostData = new uint32_t[elemsPerPe];
@@ -75,7 +70,7 @@ void testReduceScatterRing() {
   MPI_Barrier(MPI_COMM_WORLD);
 
   // Perform AllReduce operation
-  status = allReduceManager.AllReduce(dataBuff, recvBuff, elemsPerPe, sizeof(uint32_t));
+  status = allReduceManager.AllReduce(dataBuff, dataBuff, elemsPerPe);
   assert(!status);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
