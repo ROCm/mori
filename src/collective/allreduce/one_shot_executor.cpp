@@ -19,43 +19,18 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#pragma once
+#include "mori/collective/all_reduce/one_shot_executor.hpp"
 
 namespace mori {
 namespace collective {
 
-/**
- * Enumeration of available All-Reduce algorithms
- */
-enum class AllReduceAlgorithm {
-  INVALID,
-  INTRA_1_STAGE,  // Intra-node 1 stage
-  INTRA_2_STAGE,  // Intra-node 2 stage
-  INTER_RING_1D,  // Inter-node: Simple 1D Ring (Reduce-Scatter + AllGather)
-  INTER_RING_2D,  // Inter-node: 2D Ring (hierarchical)
-  INTER_ONE_SHOT  // Inter-node: One-shot
-};
-
-/**
- * Configuration parameters for All-Reduce framework
- */
-struct AllReduceConfig {
-  // Threshold for switching between One-shot and 1D Ring
-  // If data size < threshold, use One-shot; otherwise use 1D Ring
-  size_t ringThresholdBytes = 1 * 1024 * 1024;
-  // If rank size < threshold, use One-shot; otherwise use 1D Ring
-  int ringThresholdRanks = 16;
-
-  // Maximum number of blocks for kernel launch
-  int maxBlocks = 80;
-
-  // Threads per block
-  int threadsPerBlock = 512;
-
-  AllReduceAlgorithm algorithm = AllReduceAlgorithm::INVALID;
-
-  size_t dataSizeBytes = 0;
-};
+// Only for sample code
+template class OneShotAllReduceExecutor<float>;
+template class OneShotAllReduceExecutor<double>;
+template class OneShotAllReduceExecutor<int32_t>;
+template class OneShotAllReduceExecutor<uint32_t>;
+template class OneShotAllReduceExecutor<int64_t>;
+template class OneShotAllReduceExecutor<uint64_t>;
 
 }  // namespace collective
 }  // namespace mori

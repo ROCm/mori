@@ -35,6 +35,7 @@ void testReduceScatterRing() {
   // Initialize AllReduceManager
   AllReduceManager<uint32_t> allReduceManager;
   AllReduceConfig config;
+  config.algorithm = AllReduceAlgorithm::INTER_ONE_SHOT;
   status = allReduceManager.Initialize(config);
   assert(!status);
 
