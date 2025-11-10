@@ -25,6 +25,7 @@
 #include "mori/collective/all_reduce/algorithm_selector.hpp"
 #include "mori/collective/all_reduce/allreduce_config.hpp"
 #include "mori/collective/all_reduce/allreduce_executor.hpp"
+#include "mori/collective/all_reduce/one_shot_executor.hpp"
 #include "mori/collective/all_reduce/ring_1d_executor.hpp"
 #include "mori/collective/topology_detector.hpp"
 
@@ -88,14 +89,26 @@ int AllReduceManager<T>::Initialize(const AllReduceConfig& config) {
   }
 
   this->config = config;
-  currentAlgorithm = AllReduceAlgorithm::INTER_RING_1D;
+  currentAlgorithm = config.algorithm;
 
   // Initialize the static TopologyDetector
   TopologyDetector::Initialize();
 
-  // Create executor using topology information from TopologyDetector
-  executor = std::make_unique<Ring1DAllReduceExecutor<T>>(TopologyDetector::GetNPes(),
-                                                          TopologyDetector::GetMyPe(), config);
+  AllReduceAlgorithm algorithm = AlgorithmSelector::Select(
+      config.dataSizeBytes, TopologyDetector::GetNPes(), TopologyDetector::IsIntraNode(), config);
+  if (algorithm == AllReduceAlgorithm::INVALID) {
+    return -1;
+  }
+  currentAlgorithm = algorithm;
+  if (currentAlgorithm == AllReduceAlgorithm::INTER_ONE_SHOT) {
+    executor = std::make_unique<OneShotAllReduceExecutor<T>>(TopologyDetector::GetNPes(),
+                                                             TopologyDetector::GetMyPe(), config);
+  } else if (currentAlgorithm == AllReduceAlgorithm::INTER_RING_1D) {
+    executor = std::make_unique<Ring1DAllReduceExecutor<T>>(TopologyDetector::GetNPes(),
+                                                            TopologyDetector::GetMyPe(), config);
+  } else {
+    return -1;
+  }
 
   initialized = true;
   return 0;
