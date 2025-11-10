@@ -1,8 +1,9 @@
 find_package(MPI REQUIRED)
 
 add_library(
-  mori_collective SHARED allreduce/allreduce_manager.cpp topology_detector.cpp
-                         allreduce/ring_1d_executor.cpp)
+  mori_collective SHARED
+  allreduce/allreduce_manager.cpp topology_detector.cpp
+  allreduce/ring_1d_executor.cpp allreduce/one_shot_executor.cpp)
 
 target_link_libraries(
   mori_collective
