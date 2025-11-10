@@ -27,17 +27,6 @@ namespace mori {
 namespace collective {
 
 /**
- * Enumeration of available All-Reduce algorithms
- */
-enum class AllReduceAlgorithm {
-  INVALID,
-  INTRA_1_STAGE,  // Intra-node 1 stage
-  INTRA_2_STAGE,  // Intra-node 2 stage
-  INTER_RING_1D,  // Inter-node: Simple 1D Ring (Reduce-Scatter + AllGather)
-  INTER_RING_2D   // Inter-node: 2D Ring (hierarchical)
-};
-
-/**
  * AlgorithmSelector: Dynamically selects optimal All-Reduce algorithm
  *
  * Selection criteria:
@@ -58,7 +47,24 @@ class AlgorithmSelector {
    * @return Selected algorithm type
    */
   static AllReduceAlgorithm Select(size_t data_size_bytes, int num_ranks, bool is_intra_node,
-                                   const AllReduceConfig& config = AllReduceConfig());
+                                   const AllReduceConfig& config = AllReduceConfig()) {
+    if (config.algorithm == AllReduceAlgorithm::INVALID) {
+      if (is_intra_node) {
+        if (data_size_bytes < config.ringThresholdBytes) {
+          return AllReduceAlgorithm::INTRA_1_STAGE;
+        } else {
+          return AllReduceAlgorithm::INTRA_2_STAGE;
+        }
+      } else {
+        if (data_size_bytes < config.ringThresholdBytes) {
+          return AllReduceAlgorithm::INTER_ONE_SHOT;
+        } else {
+          return AllReduceAlgorithm::INTER_RING_1D;
+        }
+      }
+    }
+    return config.algorithm;
+  }
 };
 
 }  // namespace collective
