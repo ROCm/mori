@@ -183,6 +183,10 @@ inline __device__ int PollCq(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx,
                              uint16_t* wqeCounter);
 
 template <ProviderType PrvdType>
+inline __device__ int PollCq(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle, 
+		             void* cqAddr, uint32_t cqeNum, uint32_t* consIdx, uint16_t* wqeCounter);
+  
+template <ProviderType PrvdType>
 inline __device__ void UpdateCqDbrRecord(CompletionQueueHandle& cq, void* dbrRecAddr, uint32_t consIdx, uint32_t cqeNum);
 
 template <ProviderType PrvdType>

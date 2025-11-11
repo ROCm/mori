@@ -154,7 +154,7 @@ inline __device__ uint64_t IonicPostReadWrite(WorkQueueHandle& wq, uint32_t curP
   struct ionic_v1_wqe* wqe = reinterpret_cast<ionic_v1_wqe*>(wqeAddr);
   uint16_t wqe_flags = 0;
   
-  printf("IonicPostReadWrite, wqe:%p, curPostIdx:%d, wqeIdx:%d\n", wqe, curPostIdx, wqeIdx);
+  //printf("IonicPostReadWrite, wqe:%p, curPostIdx:%d, wqeIdx:%d\n", wqe, curPostIdx, wqeIdx);
   //to do: need to clear memory
   if ((wqeNum & curPostIdx) == 0) {
     wqe_flags |= HTOBE16(IONIC_V1_FLAG_COLOR);
@@ -180,15 +180,17 @@ inline __device__ uint64_t IonicPostReadWrite(WorkQueueHandle& wq, uint32_t curP
 
   __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 
+  #if 0
   printf("dump wqe at addr:%p\n", wqeAddr);
   for (int i = 0; i < 64; i++) {
     printf("%02x", (unsigned char)wqeAddr[i]);
     if ((i+1)%4 == 0)
       printf("\n");
   }
+  #endif
 
-  printf("IonicPostReadWrite, curPostIdx:%u, wqeIdx:%u, doorbell:0x%lx\n", 
-         curPostIdx, wqeIdx, wq.sq_dbval | (wqeIdx+1));
+  //printf("IonicPostReadWrite, curPostIdx:%u, wqeIdx:%u, doorbell:0x%lx\n", 
+  //       curPostIdx, wqeIdx, wq.sq_dbval | (wqeIdx+1));
   //return doorbell value
   return wq.sq_dbval | (wqeIdx+1);
 }
@@ -432,8 +434,10 @@ inline __device__ void UpdateRecvDbrRecord<ProviderType::PSD>(void* dbrRecAddr, 
 
 template <>
 inline __device__ void RingDoorbell<ProviderType::PSD>(void* dbrAddr, uint64_t dbrVal) {
+  #if 0
   printf("really write doorbell, sq/rq dbrAddr:%p, dbrVal:0x%lx\n", 
          reinterpret_cast<uint64_t*>(dbrAddr), dbrVal);
+  #endif
   core::AtomicStoreSeqCstSystem(reinterpret_cast<uint64_t*>(dbrAddr), dbrVal);
 }
 
@@ -565,6 +569,142 @@ inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum,
 
   return 0;
 }
+
+inline __device__ void PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
+                                   uint64_t activemask, void* cqeAddr, uint32_t cqeNum, uint32_t consIdx) {
+  uint32_t my_logical_lane_id = get_active_lane_num(activemask);
+  uint32_t my_cq_pos = cqHandle.cq_consumer + my_logical_lane_id;
+
+  uint32_t cqeIdx = my_cq_pos & (cqeNum - 1);
+  char* Addr = reinterpret_cast<char *>(cqeAddr) + (cqeIdx * sizeof(struct ionic_v1_cqe));
+  struct ionic_v1_cqe* cqe = reinterpret_cast<ionic_v1_cqe*>(Addr);
+  #if 0
+  printf("PollCqOnce2, block:%u, warp:%u, lane:%u, consIdx:%u, cqeIdx:%u, cqeAddr:%p, qtf_be:0x%08x, cqe->status_length:%d, msn:%u\n",
+	 blockIdx.x, threadIdx.x/warpSize, __lane_id(), my_cq_pos, cqeIdx, Addr,
+	 *(volatile uint32_t *)(&cqe->qid_type_flags), BE32TOH(cqe->status_length), BE32TOH(cqe->send.msg_msn));
+  #endif
+  #if 0
+  printf("dump cqe at addr:%p\n", Addr);
+  for (int i = 0; i < 32; i++) {
+    printf("%02x", (unsigned char)Addr[i]);
+    if ((i+1)%4 == 0)
+      printf("\n");
+  }
+  #endif
+  /* Determine expected color based on cq wrap count */
+  uint32_t qtf_color_bit = IONIC_V1_CQE_COLOR;
+  uint32_t qtf_color_exp = qtf_color_bit;
+  if (my_cq_pos & cqeNum) {
+    qtf_color_exp = 0;
+  }
+
+  /* Check if my cqe color == expected color */
+  // first round: 1 == 1, second round: 0 == 0
+  uint32_t qtf_be = BE32TOH(*(volatile uint32_t *)(&cqe->qid_type_flags));
+  if ((qtf_be & qtf_color_bit) != qtf_color_exp) {
+    //printf("PollCqOnce2, not ready, block:%u, warp:%u, lane:%u\n", blockIdx.x, threadIdx.x/warpSize, __lane_id());
+    return;// CQE just not ready yet, try again
+  }
+
+  uint32_t msn = BE32TOH(cqe->send.msg_msn);
+
+  /* Report if the completion indicates an error. */
+  if (!!(qtf_be & IONIC_V1_CQE_ERROR)) {
+    uint32_t qtf = qtf_be;
+    uint32_t qid = qtf >> IONIC_V1_CQE_QID_SHIFT;
+    uint32_t type = (qtf >> IONIC_V1_CQE_TYPE_SHIFT) & IONIC_V1_CQE_TYPE_MASK;
+    uint32_t flag = qtf & 0xf;
+    uint32_t status = cqe->status_length;
+    uint64_t npg = cqe->send.npg_wqe_idx_timestamp & IONIC_V1_CQE_WQE_IDX_MASK;
+
+    printf("QUIET ERROR: qid %u type %u flag %#x status %u msn %u npg %lu\n",
+           qid, type, flag, status, msn, npg);
+
+	/* No other way to signal an error, so just crash. */
+    abort();
+  }
+  #if 0
+  printf("PollCqOnce2, success, block:%u, warp:%u, lane:%u, qp:%u, msn:%u\n", 
+          blockIdx.x, threadIdx.x/warpSize, __lane_id(), 
+	  qtf_be >> IONIC_V1_CQE_QID_SHIFT, msn);
+  #endif
+  /* Only proceed with the furthest ahead cqe to update the sq state */
+  uint64_t my_lane_mask = 1ull << __lane_id();
+  uint64_t lesser_lane_mask = my_lane_mask - 1;
+  if (my_lane_mask != (__ballot(true) & activemask & ~lesser_lane_mask)) {
+    return;
+  }
+
+  /* update position in the cq */
+  cqHandle.cq_consumer = my_cq_pos + 1;
+
+  /*
+   * Ring cq doorbell frequently enough to avoid cq full.
+   *
+   * NB: IONIC_CQ_GRACE is 100
+   */
+  if (((cqHandle.cq_consumer - cqHandle.cq_dbpos) & (cqHandle.cqeNum - 1)) >= 100) {
+    cqHandle.cq_dbpos = cqHandle.cq_consumer;
+    uint64_t dbrVal = cqHandle.cq_dbval | ((cqHandle.cqeNum - 1) & (cqHandle.cq_dbpos));
+    __atomic_store_n(reinterpret_cast<uint64_t*>(cqHandle.dbrRecAddr), dbrVal, __ATOMIC_SEQ_CST); //TODO:maybe relaxed?
+  }
+
+  wqHandle.doneIdx = msn;
+  return;
+}
+
+template <>
+inline __device__ int PollCq<ProviderType::PSD>(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
+                                                void* cqAddr, uint32_t cqeNum, uint32_t* consIdx, uint16_t* wqeCounter)
+{
+  uint32_t greed = 10;
+  const uint32_t curConsIdx = *consIdx;
+  uint64_t activemask = GetActiveLaneMask();
+  uint32_t cons = wqHandle.dbTouchIdx;  
+  /* wait for sq_msn to catch up or pass cons. */
+  /* 0x800000 - sign bit for 24-bit fields     */
+  while ((wqHandle.doneIdx - cons) & 0x800000) {
+    if (!spin_lock_try_acquire_shared(&cqHandle.pollCqLock, activemask)) {
+      continue;
+    }
+
+    /* with lock acquired, this wave polls cqes until caught up */
+    while ((wqHandle.doneIdx - cons) & 0x800000) {
+      uint32_t old_sq_msn = wqHandle.doneIdx;
+
+      PollCqOnce2(wqHandle, cqHandle, activemask, cqAddr, cqeNum, curConsIdx);
+      asm volatile("" ::: "memory");
+
+      if (!((wqHandle.doneIdx - cons) & 0x800000)) {
+        if (wqHandle.doneIdx == old_sq_msn) {
+          break;
+        }
+        if (!greed) {
+          break;
+        }
+        --greed;
+      }
+    }
+
+    spin_lock_release_shared(&cqHandle.pollCqLock, activemask);
+    break;
+  }
+
+  return 0;
+}
+
+#if 0
+template <>
+inline __device__ int PollCq<ProviderType::PSD>(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle, 
+		                                void* cqAddr, uint32_t cqeNum, uint32_t* consIdx, uint16_t* wqeCounter)
+{
+  uint64_t activemask = GetActiveLaneMask();
+
+  poll_cq_internal(wqHandle, cqHandle, activemask, wqHandle.dbTouchIdx, cqAddr, cqeNum, consIdx);
+  
+  return 0;
+}
+#endif
 
 template <>
 inline __device__ void UpdateCqDbrRecord<ProviderType::PSD>(CompletionQueueHandle& cq, void* dbrRecAddr, uint32_t cons_idx,

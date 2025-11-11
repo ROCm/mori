@@ -443,7 +443,7 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
 
   endpoint.cqHandle.cqAddr = qp->ionic_cq_buf;
   endpoint.cqHandle.consIdx = 0;
-  endpoint.cqHandle.cqeNum = cq->cqeNum;
+  endpoint.cqHandle.cqeNum = qp->cq_mask + 1;
   endpoint.cqHandle.cqeSize = GetIonicCqeSize();
   endpoint.cqHandle.dbrAddr = qp->gpu_db_cq;
   endpoint.cqHandle.dbrRecAddr = qp->gpu_db_cq;

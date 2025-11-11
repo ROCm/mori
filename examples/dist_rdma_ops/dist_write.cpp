@@ -58,7 +58,7 @@ void VerifyBuffer(void* buffer, size_t maxSize, char expected) {
 }
 
 template <ProviderType P>
-inline __device__ void QuiteSerial(RdmaEndpoint* endpoint) {
+inline __device__ void QuietSerial(RdmaEndpoint* endpoint) {
   if (GetActiveLaneNum() != 0) return;
   CompletionQueueHandle& cq = endpoint->cqHandle;
   WorkQueueHandle& wq = endpoint->wqHandle;
@@ -116,7 +116,7 @@ inline __device__ void QuiteSerial(RdmaEndpoint* endpoint) {
 }
 
 template <ProviderType P>
-__device__ void Quite(RdmaEndpoint* endpoint) {
+__device__ void Quiet(RdmaEndpoint* endpoint) {
   constexpr size_t BROADCAST_SIZE = 1024 / warpSize;
   __shared__ uint64_t wqe_broadcast[BROADCAST_SIZE];
   uint8_t warp_id = FlatBlockThreadId() / warpSize;
@@ -193,6 +193,16 @@ __device__ void Quite(RdmaEndpoint* endpoint) {
 }
 
 template <ProviderType P>
+__device__ void QuietPsd(RdmaEndpoint* endpoint) {
+  CompletionQueueHandle* cqHandle = &endpoint->cqHandle;
+  WorkQueueHandle* wqHandle = &endpoint->wqHandle;
+  uint16_t wqe_counter;
+  
+  PollCq<P>(endpoint->wqHandle, endpoint->cqHandle,
+	    cqHandle->cqAddr, cqHandle->cqeNum, &cqHandle->cq_consumer, &wqe_counter);
+}
+
+template <ProviderType P>
 __device__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemoryRegion remoteMr,
                       size_t msg_size) {
   if (msg_size == 0) return;
@@ -257,11 +267,11 @@ __device__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
       break;
     }
     if constexpr (P == ProviderType::MLX5) {
-      Quite<P>(endpoint);
+      Quiet<P>(endpoint);
     } else if constexpr (P == ProviderType::BNXT) {
-      QuiteSerial<P>(endpoint);
+      QuietSerial<P>(endpoint);
     } else if constexpr (P == ProviderType::PSD) {
-      Quite<P>(endpoint);
+      QuietPsd<P>(endpoint);
     }
   }
   uintptr_t srcAddr = localMr.addr + FlatThreadId() * msg_size;
@@ -323,14 +333,14 @@ __global__ void MultiQpWrite(RdmaEndpoint* endpoints, RdmaMemoryRegion localMr,
       Write<P>(endpoints + qp_id, localMr, remoteMr, msg_size);
     }
     if constexpr (P == ProviderType::MLX5) {
-      Quite<P>(endpoints + qp_id);
+      Quiet<P>(endpoints + qp_id);
     } else if constexpr (P == ProviderType::BNXT) {
       for (int t = globalWarpId; t < num_qp; t += globalWarpNum) {
         // printf("qp_offset:%d\n",qp_offset);
-        QuiteSerial<P>(endpoints + t);
+        QuietSerial<P>(endpoints + t);
       }
     } else if constexpr (P == ProviderType::PSD) {
-      Quite<P>(endpoints + qp_id);
+      QuietPsd<P>(endpoints + qp_id);
     }
     __syncthreads();
     if (threadIdx.x == 0) {

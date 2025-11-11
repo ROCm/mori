@@ -104,6 +104,7 @@ struct CompletionQueueHandle {
   uint32_t needConsIdx{0};  // numbers of cqe that should be consumed
   uint32_t activeIdx{0};    // numbers of cqe that under processing but not completed
   uint32_t cq_consumer{0};
+  uint32_t cq_dbpos{0};
   uint32_t cqeNum{0};
   uint32_t cqeSize{0};
   uint32_t pollCqLock{0};
