@@ -183,7 +183,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
   for (int i = warpId; i < nNodes; i += warpNum) {
     if (i == myNode) continue;
     int proxyPe = i * config.gpuPerNode + (config.rank % config.gpuPerNode);
-    if constexpr (DEDUP) {
+    if (DEDUP) {
       for (int tokenId = startTokenIdx + laneId; tokenId < endTokenIdx; tokenId += warpSize) {
         bool shouldSend = false;
         for (int e = 0; e < config.numExpertPerToken; e++) {
@@ -262,12 +262,13 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
 
         size_t remoteIdx = (myNode * config.MaxNumTokensToRecvPerRank() + destTokId);
         if (laneId == 0) {
+          index_t tokenNum = std::min(tokenId + warpSize, endTokenIdx) - tokenId;
           size_t stagingTokOffset = tokenId * xferBytes;
           shmem::ShmemPutMemNbiSignalThread(args.shmemDispatchInpTokMemObj, remoteIdx * xferBytes,
                                             args.shmemStagingTokMemObj, stagingTokOffset,
-                                            warpSize * xferBytes, args.interNodeChunkFlagMemObj,
+                                            tokenNum * xferBytes, args.interNodeChunkFlagMemObj,
                                             (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
-                                            warpSize + 1, core::atomicType::AMO_SET, proxyPe);
+                                            tokenNum + 1, core::atomicType::AMO_SET, proxyPe);
         }
         if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
       }
@@ -442,11 +443,23 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
 
 }  // namespace v1
 
-template <typename T, bool DEDUP>
+template <typename T>
 __global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   if (blockId < config.rdmaBlockNum) {
-    v1::DispatchInterNodeSend<T, DEDUP>(args);
+    v1::DispatchInterNodeSend<T, true>(args);
+    v1::DispatchInterNodeRecv(args);
+  } else {
+    v1::DispatchIntraNode(args);
+  }
+  v1::DispatchSync(args);
+}
+
+template <typename T>
+__global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  if (blockId < config.rdmaBlockNum) {
+    v1::DispatchInterNodeSend<T, false>(args);
     v1::DispatchInterNodeRecv(args);
   } else {
     v1::DispatchIntraNode(args);
@@ -730,18 +743,17 @@ __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                     Template Specialization                                    */
 /* ---------------------------------------------------------------------------------------------- */
-template __global__ void EpDispatchInterNodeV1Kernel<hip_bfloat16, true>(
+template __global__ void EpDispatchInterNodeV1Kernel<hip_bfloat16>(
     EpDispatchCombineArgs<hip_bfloat16> args);
-template __global__ void EpDispatchInterNodeV1Kernel<__hip_fp8_e4m3_fnuz, true>(
+template __global__ void EpDispatchInterNodeV1Kernel<__hip_fp8_e4m3_fnuz>(
     EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
-template __global__ void EpDispatchInterNodeV1Kernel<float, true>(
-    EpDispatchCombineArgs<float> args);
+template __global__ void EpDispatchInterNodeV1Kernel<float>(EpDispatchCombineArgs<float> args);
 
-template __global__ void EpDispatchInterNodeV1Kernel<hip_bfloat16, false>(
+template __global__ void EpDispatchInterNodeV1KernelLowLatency<hip_bfloat16>(
     EpDispatchCombineArgs<hip_bfloat16> args);
-template __global__ void EpDispatchInterNodeV1Kernel<__hip_fp8_e4m3_fnuz, false>(
+template __global__ void EpDispatchInterNodeV1KernelLowLatency<__hip_fp8_e4m3_fnuz>(
     EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
-template __global__ void EpDispatchInterNodeV1Kernel<float, false>(
+template __global__ void EpDispatchInterNodeV1KernelLowLatency<float>(
     EpDispatchCombineArgs<float> args);
 
 template __global__ void EpCombineInterNodeV1Kernel<hip_bfloat16>(

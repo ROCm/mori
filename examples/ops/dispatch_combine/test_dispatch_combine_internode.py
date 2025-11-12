@@ -32,6 +32,7 @@ from tqdm import tqdm
 kernel_type_map = {
     "v0": mori.ops.EpDispatchCombineKernelType.InterNode,
     "v1": mori.ops.EpDispatchCombineKernelType.InterNodeV1,
+    "v1_ll": mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
 }
 
 
@@ -862,7 +863,7 @@ parser.add_argument(
     type=str,
     default="v1",
     help="Type of kernel to test",
-    choices=["v0", "v1"],
+    choices=["v0", "v1", "v1_ll"],
 )
 args_cli = parser.parse_args()
 

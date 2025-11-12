@@ -243,6 +243,7 @@ void RegisterMoriOps(py::module_& m) {
       .value("IntraNode", mori::moe::KernelType::IntraNode)
       .value("InterNode", mori::moe::KernelType::InterNode)
       .value("InterNodeV1", mori::moe::KernelType::InterNodeV1)
+      .value("InterNodeV1LL", mori::moe::KernelType::InterNodeV1LL)
       .export_values();
 
   pybind11::class_<mori::moe::EpDispatchCombineConfig>(m, "EpDispatchCombineConfig")
