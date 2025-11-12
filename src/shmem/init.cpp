@@ -189,9 +189,14 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
 
 int ShmemFinalize() {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
 
   HIP_RUNTIME_CHECK(hipFree(globalGpuStates.transportTypes));
   HIP_RUNTIME_CHECK(hipFree(globalGpuStates.rdmaEndpoints));
+  
+  if (states->rdmaStates->commContext->RdmaTransportEnabled()) {
+    HIP_RUNTIME_CHECK(hipFree(globalGpuStates.endpointLock));
+  }
 
   // Free the static symmetric heap through SymmMemManager
   if (states->memoryStates->staticHeapObj.IsValid()) {
@@ -207,6 +212,7 @@ int ShmemFinalize() {
 
   states->bootStates->bootNet->Finalize();
   delete states->bootStates->bootNet;
+  delete states->bootStates;
 
   states->status = ShmemStatesStatus::Finalized;
   return 0;
