@@ -193,53 +193,86 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
           args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = nullTokenId;
         }
       }
-      uint64_t mask = __ballot(shouldSend) & __activemask();
-      uint64_t num = __popcll(mask);
 
-      if (num == 0) continue;
-
-      index_t flag = 0;
       index_t flagSlotId = 0;
       if (laneId == 0) {
-        // TODO: use block flag counter per node
         flagSlotId = atomicAdd(args.blockFlagCounter + i, 1);
-        // atomicAdd(args.destNodeTokenCounter + i, num);
-        flag = num + 1;
       }
-      flag = __shfl(flag, 0);
       flagSlotId = __shfl(flagSlotId, 0);
 
       index_t destTokIdOffset = flagSlotId * warpSize;
+      index_t destTokId = destTokIdOffset + laneId;
 
-      uint64_t warpOffset = 0;
-      if (laneId > 0) warpOffset = __popcll(mask << (warpSize - laneId));
-      index_t destTokId = destTokIdOffset + warpOffset;
-
-      if (shouldSend) {
-        bool prev = (laneId > 0) ? ((mask >> (laneId - 1)) & 1ULL) : 0;
-        int count = 0;
-        if (!prev) {
-          count = 1;
-          for (int i = laneId + 1; i < warpSize; i++) {
-            if ((mask >> i) & 1ULL) {
-              count++;
-            } else {
-              break;
-            }
-          }
-        }
-        size_t remoteIdx = (myNode * config.MaxNumTokensToRecvPerRank() + destTokId);
-        if (count > 0) {
-          size_t stagingTokOffset = tokenId * xferBytes;
-          shmem::ShmemPutMemNbiSignalThread(args.shmemDispatchInpTokMemObj, remoteIdx * xferBytes,
-                                            args.shmemStagingTokMemObj, stagingTokOffset,
-                                            count * xferBytes, args.interNodeChunkFlagMemObj,
-                                            (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
-                                            flag, core::atomicType::AMO_SET, proxyPe);
-        }
-        args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
+      size_t remoteIdx = (myNode * config.MaxNumTokensToRecvPerRank() + destTokId);
+      if (laneId == 0) {
+        size_t stagingTokOffset = tokenId * xferBytes;
+        shmem::ShmemPutMemNbiSignalThread(args.shmemDispatchInpTokMemObj, remoteIdx * xferBytes,
+                                          args.shmemStagingTokMemObj, stagingTokOffset,
+                                          warpSize * xferBytes, args.interNodeChunkFlagMemObj,
+                                          (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
+                                          warpSize + 1, core::atomicType::AMO_SET, proxyPe);
       }
+      if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
     }
+    // for (int tokenId = startTokenIdx + laneId; tokenId < endTokenIdx; tokenId += warpSize) {
+    //   bool shouldSend = false;
+    //   for (int e = 0; e < config.numExpertPerToken; e++) {
+    //     int destNode = args.tokenIndices[tokenId * numExpertPerToken + e] /
+    //                    config.numExpertPerRank / config.gpuPerNode;
+    //     if (destNode == i) {
+    //       shouldSend |= true;
+    //       args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = nullTokenId;
+    //     }
+    //   }
+    //   uint64_t mask = __ballot(shouldSend) & __activemask();
+    //   uint64_t num = __popcll(mask);
+
+    //   if (num == 0) continue;
+
+    //   index_t flag = 0;
+    //   index_t flagSlotId = 0;
+    //   if (laneId == 0) {
+    //     // TODO: use block flag counter per node
+    //     flagSlotId = atomicAdd(args.blockFlagCounter + i, 1);
+    //     // atomicAdd(args.destNodeTokenCounter + i, num);
+    //     flag = num + 1;
+    //   }
+    //   flag = __shfl(flag, 0);
+    //   flagSlotId = __shfl(flagSlotId, 0);
+
+    //   index_t destTokIdOffset = flagSlotId * warpSize;
+
+    //   uint64_t warpOffset = 0;
+    //   if (laneId > 0) warpOffset = __popcll(mask << (warpSize - laneId));
+    //   index_t destTokId = destTokIdOffset + warpOffset;
+
+    //   if (shouldSend) {
+    //     bool prev = (laneId > 0) ? ((mask >> (laneId - 1)) & 1ULL) : 0;
+    //     int count = 0;
+    //     if (!prev) {
+    //       count = 1;
+    //       for (int i = laneId + 1; i < warpSize; i++) {
+    //         if ((mask >> i) & 1ULL) {
+    //           count++;
+    //         } else {
+    //           break;
+    //         }
+    //       }
+    //     }
+    //     size_t remoteIdx = (myNode * config.MaxNumTokensToRecvPerRank() + destTokId);
+    //     if (count > 0) {
+    //       size_t stagingTokOffset = tokenId * xferBytes;
+    //       shmem::ShmemPutMemNbiSignalThread(args.shmemDispatchInpTokMemObj, remoteIdx *
+    //       xferBytes,
+    //                                         args.shmemStagingTokMemObj, stagingTokOffset,
+    //                                         count * xferBytes, args.interNodeChunkFlagMemObj,
+    //                                         (myNode * maxChunkNum + flagSlotId) *
+    //                                         sizeof(uint64_t), flag, core::atomicType::AMO_SET,
+    //                                         proxyPe);
+    //     }
+    //     args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
+    //   }
+    // }
   }
 
   int finishedWarp = 0;
