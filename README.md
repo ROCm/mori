@@ -35,10 +35,11 @@ Benchmark result on DeepSeek V3 model configurations:
 | **Kernels**| **# CUs**| **Dispatch XGMI** |**Dispatch RDMA** |**Combine XGMI**|**Combine RDMA** |
 |------------|----------|-------------------|------------------|----------------|-----------------|
 |EP8         | 80       | 307 GB/s          | x                | 330 GB/s       | x               |
-|EP16-V0     | 32       | 75 GB/s           | 23 GB/s          | 76 GB/s        | 23GB/s          |
-|EP16-V0     | 80       | 79 GB/s           | 24 GB/s          | 82 GB/s        | 25GB/s          | 
-|EP16-V1     | 32       | 185 GB/s          | 57 GB/s          | 172GB/s        | 52GB/s          |
-|EP16-V1     | 80       | 208 GB/s          | 63 GB/s          | 161GB/s        | 49GB/s          |
+|EP16-V0     | 32       | 75 GB/s           | 23 GB/s          | 76 GB/s        | 23 GB/s          |
+|EP16-V0     | 80       | 79 GB/s           | 24 GB/s          | 82 GB/s        | 25 GB/s          | 
+|EP16-V1     | 32       | 185 GB/s          | 57 GB/s          | 172 GB/s       | 52 GB/s          |
+|EP16-V1     | 80       | 208 GB/s          | 63 GB/s          | 161 GB/s       | 49 GB/s          |
+|EP16-V1-LL  | 32       | 103 GB/s          | 57 GB/s          | 91 GB/s        | 50 GB/s          |
 
 **Latency Performance**
 
@@ -49,6 +50,7 @@ Benchmark result on DeepSeek V3 model configurations:
 |EP8         | 80       | 37 us                | 176 GB/s       | 99 us             | 107 GB/s      |
 |EP16-V0     | 32       | 226 us               | 33 GB/s        | 296 us            | 49GB/s        |
 |EP16-V1     | 32       | 115 us               | 63 GB/s        | 141 us            | 110GB/s       |
+|EP32-V1-LL  | 32       | 157 us               | 48 GB/s        | 280 us            | 55GB/s        |
 
 **NOTE**: We show best performance values measured from multiple test rounds to eliminate fluctuations.
 
