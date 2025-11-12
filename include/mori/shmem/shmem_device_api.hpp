@@ -105,6 +105,29 @@ inline __device__ void ShmemFenceThread(int pe, int qpId) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Point-to-Point                                         */
 /* ---------------------------------------------------------------------------------------------- */
+inline __device__ uint64_t ShmemPtrP2p(const uint64_t destPtr, const int myPe, int destPe) {
+  // If same PE, return the pointer directly
+  if (myPe == destPe) {
+    return destPtr;
+  }
+
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  uintptr_t localAddrInt = static_cast<uintptr_t>(destPtr);
+
+  if (localAddrInt < globalGpuStates->heapBaseAddr ||
+      localAddrInt >= globalGpuStates->heapEndAddr) {
+    assert(false && "dest addr not in symmetric heap");
+    return 0;
+  }
+
+  size_t offset = localAddrInt - globalGpuStates->heapBaseAddr;
+
+  application::SymmMemObj* heapObj = globalGpuStates->heapObj;
+  uint64_t raddr = heapObj->peerPtrs[destPe] + offset;
+
+  return raddr;
+}
+
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        PutNbi APIs                                             */

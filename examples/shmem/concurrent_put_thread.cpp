@@ -42,13 +42,13 @@ __global__ void ConcurrentPutThreadKernel(int myPe, const SymmMemObjPtr memObj) 
     RdmaMemoryRegion source = memObj->GetRdmaMemoryRegion(myPe);
 
     ShmemPutMemNbiThread(memObj, threadOffset, source, threadOffset, sizeof(uint32_t), recvPe, 1);
-    __threadfence_system();
+    // __threadfence_system();
 
-    if (blockIdx.x == 0)
-    {
-      ShmemQuietThread();
-    }
-    
+    // if (blockIdx.x == 0)
+    // {
+    //   ShmemQuietThread();
+    // }
+    ShmemFenceThread();
 
     // __syncthreads();
   } else {
@@ -76,9 +76,18 @@ __global__ void ConcurrentPutThreadKernel_PureAddr(int myPe, uint32_t* localBuff
     if (blockIdx.x == 0) {
       ShmemQuietThread();
     }
+    if (globalTid == 0)
+    {
+      printf("rank %d addr %lu\n", myPe, ShmemPtrP2p(reinterpret_cast<uint64_t>(dest), myPe, recvPe));
+    }
+    
   } else {
     // Wait for data to arrive
     while (atomicAdd(localBuff + globalTid, 0) != sendPe) {
+    }
+    if (globalTid == 0)
+    {
+      printf("rank %d addr %lu\n", myPe, ShmemPtrP2p(reinterpret_cast<uint64_t>(localBuff), myPe, recvPe));
     }
   }
 }
