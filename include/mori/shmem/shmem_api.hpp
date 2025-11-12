@@ -63,6 +63,8 @@ int ShmemFinalize();
 int ShmemMyPe();
 int ShmemNPes();
 
+void ShmemBarrierAll();
+
 enum ShmemTeamType {
   INVALID = -1,
   WORLD = 0,

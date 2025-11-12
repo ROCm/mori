@@ -236,6 +236,15 @@ int ShmemNPes() {
   return states->bootStates->worldSize;
 }
 
+void ShmemBarrierAll() {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
+  
+  MORI_SHMEM_TRACE("ShmemBarrierAll: PE {} entering barrier", states->bootStates->rank);
+  states->bootStates->bootNet->Barrier();
+  MORI_SHMEM_TRACE("ShmemBarrierAll: PE {} exiting barrier", states->bootStates->rank);
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      UniqueId APIs                                            */
 /* ---------------------------------------------------------------------------------------------- */
