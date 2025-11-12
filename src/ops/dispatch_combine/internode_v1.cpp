@@ -271,87 +271,89 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
   int localPeTokenCounter = 0;
   int totalChunkNum = 0;
 
-  for (int k = blockId / numRecvBlock; k < maxChunkNum; k += (config.rdmaBlockNum / numRecvBlock)) {
-    for (int i = 0; i < (nNodes - 1); i++) {
-      int node = (myNode + 1 + i) % nNodes;
-      int startTokenIdx = k * warpSize;
+  // for (int k = blockId / numRecvBlock; k < maxChunkNum; k += (config.rdmaBlockNum /
+  // numRecvBlock)) { for (int i = 0; i < (nNodes - 1); i++) {
+  for (int bid = blockId; bid < numRecvBlock * maxChunkNum * (nNodes - 1);
+       bid += config.rdmaBlockNum) {
+    int k = bid / (numRecvBlock * (nNodes - 1));
+    int i = (bid / numRecvBlock) % (nNodes - 1);
 
-      // Poll completion flags
-      uint64_t thisChunkTokenNum = 0;
-      index_t nodeFlag = 0;
-      if (laneId == 0) {
-        while (1) {
-          thisChunkTokenNum = core::AtomicLoadRelaxedSystem(&chunkFlag[node * maxChunkNum + k]);
-          if (thisChunkTokenNum > 0) break;
+    int node = (myNode + 1 + i) % nNodes;
+    int startTokenIdx = k * warpSize;
 
-          nodeFlag = core::AtomicLoadRelaxedSystem(&nodeRecvTokenNum[node]);
-          if ((nodeFlag > 0) && (startTokenIdx >= (nodeFlag - 1))) {
-            thisChunkTokenNum = 1;
-            break;
-          }
+    // Poll completion flags
+    uint64_t thisChunkTokenNum = 0;
+    index_t nodeFlag = 0;
+    if (laneId == 0) {
+      while (1) {
+        thisChunkTokenNum = core::AtomicLoadRelaxedSystem(&chunkFlag[node * maxChunkNum + k]);
+        if (thisChunkTokenNum > 0) break;
+
+        nodeFlag = core::AtomicLoadRelaxedSystem(&nodeRecvTokenNum[node]);
+        if ((nodeFlag > 0) && (startTokenIdx >= (nodeFlag - 1))) {
+          thisChunkTokenNum = 1;
+          break;
         }
       }
-      thisChunkTokenNum = __shfl(thisChunkTokenNum, 0) - 1;
-      nodeFlag = __shfl(nodeFlag, 0) - 1;
-      totalChunkNum += thisChunkTokenNum;
+    }
+    thisChunkTokenNum = __shfl(thisChunkTokenNum, 0) - 1;
+    nodeFlag = __shfl(nodeFlag, 0) - 1;
+    totalChunkNum += thisChunkTokenNum;
 
-      int endTokenIdx = startTokenIdx + thisChunkTokenNum;
+    int endTokenIdx = startTokenIdx + thisChunkTokenNum;
 
-      for (int j = startTokenIdx + (blockId % numRecvBlock) * warpNum + warpId; j < endTokenIdx;
-           j += numRecvBlock * warpNum) {
-        int tokIdx = node * config.MaxNumTokensToRecvPerRank() + j;
-        index_t* indices =
-            reinterpret_cast<index_t*>(stagingPtr + tokIdx * xferBytes + hiddenBytes);
-        int lanePe = -1;
-        if (laneId < config.numExpertPerToken) {
-          lanePe = indices[laneId] / config.numExpertPerRank;
-          assert((lanePe < config.worldSize) && (lanePe >= 0));
+    for (int j = startTokenIdx + (blockId % numRecvBlock) * warpNum + warpId; j < endTokenIdx;
+         j += numRecvBlock * warpNum) {
+      int tokIdx = node * config.MaxNumTokensToRecvPerRank() + j;
+      index_t* indices = reinterpret_cast<index_t*>(stagingPtr + tokIdx * xferBytes + hiddenBytes);
+      int lanePe = -1;
+      if (laneId < config.numExpertPerToken) {
+        lanePe = indices[laneId] / config.numExpertPerRank;
+        assert((lanePe < config.worldSize) && (lanePe >= 0));
+      }
+      index_t srcTokId = reinterpret_cast<index_t*>(stagingPtr + tokIdx * xferBytes + hiddenBytes +
+                                                    indexBytes + weightBytes + scaleBytes)[0];
+
+      for (int e = 0; e < config.numExpertPerToken; e++) {
+        int destPe = __shfl(lanePe, e);
+        int destNode = destPe / config.gpuPerNode;
+
+        bool shouldSkip = (destNode != myNode) || __any((laneId < e) && (destPe == lanePe));
+        if (shouldSkip) {
+          if (laneId == 0)
+            args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e] = nullTokenId;
+          continue;
         }
-        index_t srcTokId =
-            reinterpret_cast<index_t*>(stagingPtr + tokIdx * xferBytes + hiddenBytes + indexBytes +
-                                       weightBytes + scaleBytes)[0];
-
-        for (int e = 0; e < config.numExpertPerToken; e++) {
-          int destPe = __shfl(lanePe, e);
-          int destNode = destPe / config.gpuPerNode;
-
-          bool shouldSkip = (destNode != myNode) || __any((laneId < e) && (destPe == lanePe));
-          if (shouldSkip) {
-            if (laneId == 0)
-              args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e] = nullTokenId;
-            continue;
-          }
-          int destTokId = 0;
-          if (laneId == 0) {
-            destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
-            args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e] =
-                destPe * config.MaxNumTokensToRecv() + destTokId;
-            args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] = srcTokId;
-          }
-          if ((destPe % config.gpuPerNode) == laneId) localPeTokenCounter++;
-          destTokId = __shfl(destTokId, 0);
+        int destTokId = 0;
+        if (laneId == 0) {
+          destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
+          args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e] =
+              destPe * config.MaxNumTokensToRecv() + destTokId;
+          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] = srcTokId;
+        }
+        if ((destPe % config.gpuPerNode) == laneId) localPeTokenCounter++;
+        destTokId = __shfl(destTokId, 0);
+        core::WarpCopy<uint8_t, 4>(
+            args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>(destPe) +
+                destTokId * hiddenBytes,
+            stagingPtr + tokIdx * xferBytes, hiddenBytes);
+        core::WarpCopy<uint8_t, 4>(
+            args.shmemOutIndicesMemObj->template GetAs<uint8_t*>(destPe) + destTokId * indexBytes,
+            stagingPtr + tokIdx * xferBytes + hiddenBytes, indexBytes);
+        core::WarpCopy<uint8_t, 4>(
+            args.shmemDispatchOutWeightsMemObj->template GetAs<uint8_t*>(destPe) +
+                destTokId * weightBytes,
+            stagingPtr + tokIdx * xferBytes + hiddenBytes + indexBytes, weightBytes);
+        if (args.scalesBuf && (scaleBytes > 0)) {
           core::WarpCopy<uint8_t, 4>(
-              args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>(destPe) +
-                  destTokId * hiddenBytes,
-              stagingPtr + tokIdx * xferBytes, hiddenBytes);
-          core::WarpCopy<uint8_t, 4>(
-              args.shmemOutIndicesMemObj->template GetAs<uint8_t*>(destPe) + destTokId * indexBytes,
-              stagingPtr + tokIdx * xferBytes + hiddenBytes, indexBytes);
-          core::WarpCopy<uint8_t, 4>(
-              args.shmemDispatchOutWeightsMemObj->template GetAs<uint8_t*>(destPe) +
-                  destTokId * weightBytes,
-              stagingPtr + tokIdx * xferBytes + hiddenBytes + indexBytes, weightBytes);
-          if (args.scalesBuf && (scaleBytes > 0)) {
-            core::WarpCopy<uint8_t, 4>(
-                args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) +
-                    destTokId * scaleBytes,
-                stagingPtr + tokIdx * xferBytes + hiddenBytes + indexBytes + weightBytes,
-                scaleBytes);
-          }
+              args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destTokId * scaleBytes,
+              stagingPtr + tokIdx * xferBytes + hiddenBytes + indexBytes + weightBytes, scaleBytes);
         }
       }
     }
   }
+  // }
+  // }
 
   if (laneId < config.gpuPerNode) {
     int destPe = myNode * config.gpuPerNode + laneId;
