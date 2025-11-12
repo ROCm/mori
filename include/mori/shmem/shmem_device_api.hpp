@@ -85,6 +85,23 @@ inline __device__ void ShmemQuietThread(int pe, int qpId) {
   DISPATCH_TRANSPORT_TYPE(ShmemQuietThreadKernel, pe, pe, qpId);
 }
 
+inline __device__ void ShmemFenceThread() {
+  ShmemQuietThread();
+  __threadfence_system();
+}
+
+inline __device__ void ShmemFenceThread(int pe) {
+  ShmemQuietThread(pe);
+  __threadfence_system();
+}
+
+inline __device__ void ShmemFenceThread(int pe, int qpId) {
+  ShmemQuietThread(pe, qpId);
+  __threadfence_system();
+}
+
+
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Point-to-Point                                         */
 /* ---------------------------------------------------------------------------------------------- */
