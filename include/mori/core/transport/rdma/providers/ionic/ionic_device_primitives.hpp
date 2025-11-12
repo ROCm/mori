@@ -59,7 +59,7 @@ inline __device__ uint64_t IonicPostSend(WorkQueueHandle& wq, uint32_t curPostId
     wqe_flags |= HTOBE16(IONIC_V1_FLAG_SIG);
   }
 
-  wqe->base.wqe_idx = wqeIdx;
+  wqe->base.wqe_idx = curPostIdx;
   wqe->base.op = IONIC_V2_OP_SEND;
   wqe->base.num_sge_key = size ? 1 : 0;
   wqe->base.imm_data_key = HTOBE32(0);
@@ -70,11 +70,11 @@ inline __device__ uint64_t IonicPostSend(WorkQueueHandle& wq, uint32_t curPostId
   wqe->common.pld.sgl[0].lkey = HTOBE32(lkey);
 
   __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-
-  printf("curPostIdx:%u, wqeIdx:%u, doorbell:%lu", curPostIdx, wqeIdx, wq.sq_dbval | (wqeIdx + 1));
-  
+  #if 0
+  printf("send, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n", curPostIdx, curPostIdx, ((curPostIdx + 1) & (wqeNum - 1)));
+  #endif  
   //return doorbell value
-  return wq.sq_dbval | (wqeIdx + 1);
+  return wq.sq_dbval | ((curPostIdx + 1) & (wqeNum - 1));
 }
 
 template <>
@@ -104,7 +104,7 @@ inline __device__ uint64_t IonicPostRecv(WorkQueueHandle& wq, uint32_t curPostId
   struct ionic_v1_wqe* wqe = reinterpret_cast<ionic_v1_wqe*>(wqeAddr);
   uint16_t wqe_flags = 0;
 
-  wqe->base.wqe_idx = wqeIdx;
+  wqe->base.wqe_idx = curPostIdx;
   wqe->base.num_sge_key = 1;
   wqe->base.imm_data_key = HTOBE32(0);
 
@@ -117,11 +117,11 @@ inline __device__ uint64_t IonicPostRecv(WorkQueueHandle& wq, uint32_t curPostId
   wqe->common.pld.sgl[0].va = HTOBE64(reinterpret_cast<uint64_t>(laddr));
   wqe->common.pld.sgl[0].len = HTOBE32(size);
   wqe->common.pld.sgl[0].lkey = HTOBE32(lkey);
-
-  printf("curPostIdx:%u, wqeIdx:%u, doorbell:%lu", curPostIdx, wqeIdx, wq.rq_dbval | (wqeIdx + 1));
-  
+  #if 0
+  printf("recv, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n", curPostIdx, curPostIdx, ((curPostIdx + 1) & (wqeNum - 1)));
+  #endif  
   //return doorbell value
-  return wq.rq_dbval | (wqeIdx + 1);
+  return wq.rq_dbval | ((curPostIdx + 1) & (wqeNum - 1));
 }
 
 template <>
@@ -164,7 +164,7 @@ inline __device__ uint64_t IonicPostReadWrite(WorkQueueHandle& wq, uint32_t curP
     wqe_flags |= HTOBE16(IONIC_V1_FLAG_SIG);
   }
 
-  wqe->base.wqe_idx = wqeIdx;
+  wqe->base.wqe_idx = curPostIdx;
   wqe->base.op = isRead ? IONIC_V2_OP_RDMA_READ : IONIC_V2_OP_RDMA_WRITE;
   wqe->base.num_sge_key = size ? 1 : 0;
   wqe->base.imm_data_key = HTOBE32(0);
@@ -178,7 +178,7 @@ inline __device__ uint64_t IonicPostReadWrite(WorkQueueHandle& wq, uint32_t curP
   wqe->common.pld.sgl[0].len = HTOBE32(size);
   wqe->common.pld.sgl[0].lkey = HTOBE32(lkey);
 
-  __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+  __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 
   #if 0
   printf("dump wqe at addr:%p\n", wqeAddr);
@@ -188,11 +188,15 @@ inline __device__ uint64_t IonicPostReadWrite(WorkQueueHandle& wq, uint32_t curP
       printf("\n");
   }
   #endif
-
-  //printf("IonicPostReadWrite, curPostIdx:%u, wqeIdx:%u, doorbell:0x%lx\n", 
-  //       curPostIdx, wqeIdx, wq.sq_dbval | (wqeIdx+1));
+  #if 0
+  printf("Write, block:%u, warp:%u, lane:%u, wqe:%p, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n", 
+         blockIdx.x, threadIdx.x/warpSize, __lane_id(),
+	 wqe, curPostIdx, curPostIdx, ((curPostIdx + 1) & (wqeNum - 1)));
+  #endif
+  //__threadfence_system();
+  //asm volatile("" ::: "memory");
   //return doorbell value
-  return wq.sq_dbval | (wqeIdx+1);
+  return wq.sq_dbval | ((curPostIdx + 1) & (wqeNum - 1));
 }
 
 template <>
@@ -259,7 +263,7 @@ inline __device__ uint64_t IonicPostWriteInline(WorkQueueHandle& wq, uint32_t cu
     wqe_flags |= HTOBE16(IONIC_V1_FLAG_SIG);
   }
 
-  wqe->base.wqe_idx = wqeIdx;
+  wqe->base.wqe_idx = curPostIdx;
   wqe->base.op = IONIC_V2_OP_RDMA_WRITE;
   wqe->base.num_sge_key = 0;
   wqe->base.imm_data_key = HTOBE32(0);
@@ -271,12 +275,15 @@ inline __device__ uint64_t IonicPostWriteInline(WorkQueueHandle& wq, uint32_t cu
   wqe->common.length = HTOBE32(size);
   memcpy(wqe->common.pld.data, val, size);
 
-  __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-
-  printf("curPostIdx:%u, wqeIdx:%u, doorbell:%lu\n", curPostIdx, wqeIdx, wq.sq_dbval | (wqeIdx + 1));
-  
+  __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+  #if 1
+  printf("write inline, block:%u, warp:%u, lane:%u, wqe:%p, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n", 
+	blockIdx.x, threadIdx.x/warpSize, __lane_id(),
+         wqe, curPostIdx, curPostIdx, ((curPostIdx + 1) & (wqeNum - 1)));
+  #endif
+  //asm volatile("" ::: "memory");
   //return doorbell value
-  return wq.sq_dbval | (wqeIdx + 1);
+  return wq.sq_dbval | ((curPostIdx + 1) & (wqeNum - 1));
 }
 
 template <>
@@ -291,7 +298,7 @@ inline __device__ uint64_t PostWriteInline<ProviderType::PSD>(WorkQueueHandle& w
                                                               void* val, uintptr_t raddr,
                                                               uint64_t rkey, size_t bytes) {
   uint32_t curPostIdx = atomicAdd(&wq.postIdx, 1);
-  printf("PostWriteInline, val:%p\n", val);
+  //printf("PostWriteInline, val:%p\n", val);
   return IonicPostWriteInline(wq, curPostIdx, true, qpn, val, raddr, rkey, bytes);
 }
 
@@ -351,7 +358,7 @@ inline __device__ uint64_t IonicPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t c
     }
   }
 
-  wqe->base.wqe_idx = wqeIdx;
+  wqe->base.wqe_idx = curPostIdx;
   wqe->base.op = opcode;
   wqe->base.num_sge_key = 1;
   wqe->base.imm_data_key = HTOBE32(0);
@@ -367,12 +374,15 @@ inline __device__ uint64_t IonicPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t c
   wqe->atomic_v2.local_va = HTOBE64(reinterpret_cast<uint64_t>(laddr));
   wqe->atomic_v2.lkey = HTOBE32(lkey);
 
-  __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-
-  printf("curPostIdx:%u, wqeIdx:%u, doorbell:%lu", curPostIdx, wqeIdx, wq.sq_dbval | (wqeIdx + 1));
-	
+  __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+  #if 1
+  printf("atomic,block:%u, warp:%u, lane:%u, wqe:%p, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n", 
+	 blockIdx.x, threadIdx.x/warpSize, __lane_id(),  
+         wqe, curPostIdx, wqeIdx, ((curPostIdx + 1) & (wqeNum - 1)));
+  #endif	
+  //asm volatile("" ::: "memory");
   //return doorbell value
-  return wq.sq_dbval | (wqeIdx + 1);
+  return wq.sq_dbval | ((curPostIdx + 1) & (wqeNum - 1));
 }
 
 template <>
@@ -434,10 +444,11 @@ inline __device__ void UpdateRecvDbrRecord<ProviderType::PSD>(void* dbrRecAddr, 
 
 template <>
 inline __device__ void RingDoorbell<ProviderType::PSD>(void* dbrAddr, uint64_t dbrVal) {
-  #if 0
+  #if 1
   printf("really write doorbell, sq/rq dbrAddr:%p, dbrVal:0x%lx\n", 
          reinterpret_cast<uint64_t*>(dbrAddr), dbrVal);
   #endif
+  //asm volatile("" ::: "memory");
   core::AtomicStoreSeqCstSystem(reinterpret_cast<uint64_t*>(dbrAddr), dbrVal);
 }
 
@@ -577,8 +588,10 @@ inline __device__ void PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHan
 
   uint32_t cqeIdx = my_cq_pos & (cqeNum - 1);
   char* Addr = reinterpret_cast<char *>(cqeAddr) + (cqeIdx * sizeof(struct ionic_v1_cqe));
+
+  asm volatile("" ::: "memory");
   struct ionic_v1_cqe* cqe = reinterpret_cast<ionic_v1_cqe*>(Addr);
-  #if 0
+  #if 1
   printf("PollCqOnce2, block:%u, warp:%u, lane:%u, consIdx:%u, cqeIdx:%u, cqeAddr:%p, qtf_be:0x%08x, cqe->status_length:%d, msn:%u\n",
 	 blockIdx.x, threadIdx.x/warpSize, __lane_id(), my_cq_pos, cqeIdx, Addr,
 	 *(volatile uint32_t *)(&cqe->qid_type_flags), BE32TOH(cqe->status_length), BE32TOH(cqe->send.msg_msn));
@@ -602,14 +615,14 @@ inline __device__ void PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHan
   // first round: 1 == 1, second round: 0 == 0
   uint32_t qtf_be = BE32TOH(*(volatile uint32_t *)(&cqe->qid_type_flags));
   if ((qtf_be & qtf_color_bit) != qtf_color_exp) {
-    //printf("PollCqOnce2, not ready, block:%u, warp:%u, lane:%u\n", blockIdx.x, threadIdx.x/warpSize, __lane_id());
+    printf("PollCqOnce2, not ready, block:%u, warp:%u, lane:%u\n", blockIdx.x, threadIdx.x/warpSize, __lane_id());
     return;// CQE just not ready yet, try again
   }
 
   uint32_t msn = BE32TOH(cqe->send.msg_msn);
 
   /* Report if the completion indicates an error. */
-  if (!!(qtf_be & IONIC_V1_CQE_ERROR)) {
+  if (!!(qtf_be & IONIC_V1_CQE_ERROR) || msn < wqHandle.doneIdx) {
     uint32_t qtf = qtf_be;
     uint32_t qid = qtf >> IONIC_V1_CQE_QID_SHIFT;
     uint32_t type = (qtf >> IONIC_V1_CQE_TYPE_SHIFT) & IONIC_V1_CQE_TYPE_MASK;
@@ -619,14 +632,21 @@ inline __device__ void PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHan
 
     printf("QUIET ERROR: qid %u type %u flag %#x status %u msn %u npg %lu\n",
            qid, type, flag, status, msn, npg);
-
-	/* No other way to signal an error, so just crash. */
+    #if 1
+    printf("dump cqe at addr:%p\n", Addr);
+    for (int i = 0; i < 32; i++) {
+      printf("%02x", (unsigned char)Addr[i]);
+      if ((i+1)%4 == 0)
+        printf("\n");
+    }
+    #endif
+    /* No other way to signal an error, so just crash. */
     abort();
   }
-  #if 0
-  printf("PollCqOnce2, success, block:%u, warp:%u, lane:%u, qp:%u, msn:%u\n", 
+  #if 1 
+  printf("PollCqOnce2, success, block:%u, warp:%u, lane:%u, qp:%u, my_cq_pos:%u, cqeNum:%u, msn:%u\n", 
           blockIdx.x, threadIdx.x/warpSize, __lane_id(), 
-	  qtf_be >> IONIC_V1_CQE_QID_SHIFT, msn);
+	  qtf_be >> IONIC_V1_CQE_QID_SHIFT, my_cq_pos, cqHandle.cqeNum, msn);
   #endif
   /* Only proceed with the furthest ahead cqe to update the sq state */
   uint64_t my_lane_mask = 1ull << __lane_id();
@@ -671,10 +691,11 @@ inline __device__ int PollCq<ProviderType::PSD>(WorkQueueHandle& wqHandle, Compl
     /* with lock acquired, this wave polls cqes until caught up */
     while ((wqHandle.doneIdx - cons) & 0x800000) {
       uint32_t old_sq_msn = wqHandle.doneIdx;
-
+      //printf("PollCq, before PollCqOnce2, curConsIdx:%u\n", curConsIdx);
+      //asm volatile("" ::: "memory");
       PollCqOnce2(wqHandle, cqHandle, activemask, cqAddr, cqeNum, curConsIdx);
       asm volatile("" ::: "memory");
-
+      //printf("PollCq, after PollCqOnce2, curConsIdx:%u\n", curConsIdx);
       if (!((wqHandle.doneIdx - cons) & 0x800000)) {
         if (wqHandle.doneIdx == old_sq_msn) {
           break;
@@ -711,7 +732,7 @@ inline __device__ void UpdateCqDbrRecord<ProviderType::PSD>(CompletionQueueHandl
                                                             uint32_t cqeNum) {
   uint64_t dbrVal = cq.cq_dbval | ((cq.cqeNum - 1) & (cons_idx)); // don't add 1 to cons_idx
   core::AtomicStoreSeqCstSystem(reinterpret_cast<uint64_t*>(dbrRecAddr), dbrVal);
-  printf("UpdateCqDbrRecord, dbrRecAddr:%p, dbrVal:%#lx\n", reinterpret_cast<uint64_t*>(dbrRecAddr), dbrVal);
+  //printf("UpdateCqDbrRecord, dbrRecAddr:%p, dbrVal:%#lx\n", reinterpret_cast<uint64_t*>(dbrRecAddr), dbrVal);
   return;
 }
 
