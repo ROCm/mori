@@ -40,7 +40,7 @@ void* ShmemMalloc(size_t size) {
   }
 
   // Align to 256 bytes for better performance
-  constexpr size_t ALIGNMENT = 256;
+  constexpr size_t ALIGNMENT = 128;
   size = (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
 
   std::lock_guard<std::mutex> lock(states->memoryStates->heapLock);
@@ -64,6 +64,25 @@ void* ShmemMalloc(size_t size) {
                    states->memoryStates->staticHeapUsed, states->memoryStates->staticHeapSize);
 
   return ptr;
+}
+
+void* ShmemMallocAlign(size_t alignment, size_t size) {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
+
+  if (size == 0) {
+    return nullptr;
+  }
+
+  // Validate alignment: must be power of 2
+  if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+    MORI_SHMEM_ERROR("Invalid alignment: {} (must be a power of 2)", alignment);
+    return nullptr;
+  }
+
+  // Align size to the requested alignment
+  size = (size + alignment - 1) & ~(alignment - 1);
+  return ShmemMalloc(size);
 }
 
 void* ShmemExtMallocWithFlags(size_t size, unsigned int flags) {
