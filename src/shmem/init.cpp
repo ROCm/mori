@@ -22,8 +22,13 @@
 #include <mpi.h>
 
 #include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <memory>
+#include <random>
 
 #include "mori/application/application.hpp"
+#include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/shmem/shmem_api.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "src/shmem/internal.hpp"
@@ -32,7 +37,11 @@ namespace mori {
 namespace shmem {
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                          Initialization */
+/*                                      UniqueId Support                                         */
+/* ---------------------------------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                          Initialization                                       */
 /* ---------------------------------------------------------------------------------------------- */
 __constant__ GpuStates globalGpuStates;
 
@@ -43,7 +52,7 @@ void RdmaStatesInit() {
 
   int rank = states->bootStates->rank;
   int worldSize = states->bootStates->worldSize;
-
+  MORI_SHMEM_TRACE("RdmaStatesInit: rank {}, worldSize {}", rank, worldSize);
   rdmaStates->commContext = new application::Context(*states->bootStates->bootNet);
 }
 
@@ -61,11 +70,11 @@ void MemoryStatesInit() {
   // Size can be configured via environment variable
   const char* heapSizeEnv = std::getenv("MORI_SHMEM_HEAP_SIZE");
   size_t heapSize = DEFAULT_SYMMETRIC_HEAP_SIZE;
-  
+
   if (heapSizeEnv) {
     std::string heapSizeStr(heapSizeEnv);
     size_t multiplier = 1;
-    
+
     // Check for suffix
     if (!heapSizeStr.empty()) {
       char lastChar = heapSizeStr.back();
@@ -77,7 +86,7 @@ void MemoryStatesInit() {
         heapSizeStr.pop_back();
       }
     }
-    
+
     heapSize = std::stoull(heapSizeStr) * multiplier;
   }
 
@@ -102,8 +111,9 @@ void MemoryStatesInit() {
   states->memoryStates->staticHeapUsed = HEAP_INITIAL_OFFSET;
   states->memoryStates->staticHeapObj = heapObj;
 
-  MORI_SHMEM_INFO("Static symmetric heap allocated at {} (local), size {} bytes, initial offset {} bytes",
-                  states->memoryStates->staticHeapBasePtr, heapSize, HEAP_INITIAL_OFFSET);
+  MORI_SHMEM_INFO(
+      "Static symmetric heap allocated at {} (local), size {} bytes, initial offset {} bytes",
+      states->memoryStates->staticHeapBasePtr, heapSize, HEAP_INITIAL_OFFSET);
 }
 
 void GpuStateInit() {
@@ -183,7 +193,6 @@ int ShmemFinalize() {
   HIP_RUNTIME_CHECK(hipFree(globalGpuStates.transportTypes));
   HIP_RUNTIME_CHECK(hipFree(globalGpuStates.rdmaEndpoints));
 
-
   // Free the static symmetric heap through SymmMemManager
   if (states->memoryStates->staticHeapObj.IsValid()) {
     states->memoryStates->symmMemMgr->Free(states->memoryStates->staticHeapBasePtr);
@@ -221,8 +230,131 @@ int ShmemNPes() {
   return states->bootStates->worldSize;
 }
 
-// int ShmemTeamMyPe(ShmemTeamType);
-// int ShmemTeamNPes(ShmemTeamType);
+/* ---------------------------------------------------------------------------------------------- */
+/*                                      UniqueId APIs                                            */
+/* ---------------------------------------------------------------------------------------------- */
+int ShmemGetUniqueId(mori_shmem_uniqueid_t* uid) {
+  if (uid == nullptr) {
+    MORI_SHMEM_ERROR("ShmemGetUniqueId - invalid input argument");
+    return -1;
+  }
+
+  try {
+    const char* ifname = std::getenv("MORI_SOCKET_IFNAME");
+    application::UniqueId socket_uid;
+
+    if (ifname) {
+      std::random_device rd;
+      std::mt19937 gen(rd());
+      std::uniform_int_distribution<int> port_dis(25000, 35000);
+      int random_port = port_dis(gen);
+
+      socket_uid =
+          application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface(ifname, random_port);
+      MORI_SHMEM_INFO("Generated UniqueId with specified interface: {} (port {})", ifname,
+                      random_port);
+    } else {
+      std::random_device rd;
+      std::mt19937 gen(rd());
+      std::uniform_int_distribution<int> port_dis(25000, 35000);
+      int random_port = port_dis(gen);
+
+      socket_uid = application::SocketBootstrapNetwork::GenerateUniqueIdWithLocalAddr(random_port);
+      std::string local_addr = application::SocketBootstrapNetwork::GetLocalNonLoopbackAddress();
+      MORI_SHMEM_INFO("Generated UniqueId with auto-detected interface: {} (port {})", local_addr,
+                      random_port);
+    }
+    static_assert(sizeof(socket_uid) == sizeof(mori_shmem_uniqueid_t),
+                  "UniqueId size mismatch between Socket Bootstrap and mori SHMEM");
+
+    // Copy to mori_shmem_uniqueid_t
+    std::memcpy(uid->data(), &socket_uid, sizeof(socket_uid));
+
+    return 0;
+
+  } catch (const std::exception& e) {
+    MORI_SHMEM_ERROR("ShmemGetUniqueId failed: {}", e.what());
+    return -1;
+  }
+}
+
+int ShmemSetAttrUniqueIdArgs(int rank, int nranks, mori_shmem_uniqueid_t* uid,
+                             mori_shmem_init_attr_t* attr) {
+  if (uid == nullptr || attr == nullptr) {
+    MORI_SHMEM_ERROR("ShmemSetAttrUniqueIdArgs - invalid input argument");
+    return -1;
+  }
+
+  if (rank < 0 || nranks <= 0 || rank >= nranks) {
+    MORI_SHMEM_ERROR("ShmemSetAttrUniqueIdArgs - invalid rank={} or nranks={}", rank, nranks);
+    return -1;
+  }
+
+  // Set attributes
+  attr->rank = rank;
+  attr->nranks = nranks;
+  attr->uid = *uid;
+  attr->mpi_comm = nullptr;  // Not using MPI for UniqueId-based initialization
+
+  return 0;
+}
+
+int ShmemInitAttr(unsigned int flags, mori_shmem_init_attr_t* attr) {
+  if (attr == nullptr ||
+      ((flags != MORI_SHMEM_INIT_WITH_UNIQUEID) && (flags != MORI_SHMEM_INIT_WITH_MPI_COMM))) {
+    MORI_SHMEM_ERROR("ShmemInitAttr - invalid input argument");
+    return -1;
+  }
+
+  if (flags == MORI_SHMEM_INIT_WITH_MPI_COMM) {
+    // Handle MPI-based initialization (delegate to existing ShmemMpiInit)
+    if (attr->mpi_comm == nullptr) {
+      MORI_SHMEM_ERROR("ShmemInitAttr - MPI_Comm is null");
+      return -1;
+    }
+
+    int result = ShmemMpiInit(*reinterpret_cast<MPI_Comm*>(attr->mpi_comm));
+    return (result == 0) ? 0 : -1;
+  }
+
+  if (flags == MORI_SHMEM_INIT_WITH_UNIQUEID) {
+    // Validate UniqueId-based initialization parameters
+    if (attr->nranks <= 0 || attr->rank < 0 || attr->rank >= attr->nranks) {
+      MORI_SHMEM_ERROR("ShmemInitAttr - invalid rank={} or nranks={}", attr->rank, attr->nranks);
+      return -1;
+    }
+
+    try {
+      // Convert mori_shmem_uniqueid_t back to Socket Bootstrap UniqueId
+      application::UniqueId socket_uid;
+      std::memcpy(&socket_uid, attr->uid.data(), sizeof(socket_uid));
+
+      // Create Socket Bootstrap Network
+      auto socket_bootstrap = std::make_unique<application::SocketBootstrapNetwork>(
+          socket_uid, attr->rank, attr->nranks);
+
+      MORI_SHMEM_INFO("Initialized Socket Bootstrap - rank={}, nranks={}", attr->rank,
+                      attr->nranks);
+
+      // Initialize mori SHMEM using the bootstrap network
+      int result = ShmemInit(socket_bootstrap.release());
+
+      if (result != 0) {
+        MORI_SHMEM_ERROR("ShmemInitAttr - ShmemInit failed with code {}", result);
+        return -1;
+      }
+
+      MORI_SHMEM_INFO("Successfully initialized with UniqueId");
+      return 0;
+
+    } catch (const std::exception& e) {
+      MORI_SHMEM_ERROR("ShmemInitAttr failed: {}", e.what());
+      return -1;
+    }
+  }
+
+  return -1;
+}
 
 }  // namespace shmem
 }  // namespace mori
