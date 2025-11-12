@@ -202,7 +202,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
       index_t flagSlotId = 0;
       if (laneId == 0) {
         // TODO: use block flag counter per node
-        flagSlotId = atomicAdd(args.blockFlagCounter, 1);
+        flagSlotId = atomicAdd(args.blockFlagCounter + i, 1);
         // atomicAdd(args.destNodeTokenCounter + i, num);
         flag = num + 1;
       }
@@ -248,7 +248,8 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
   if ((finishedWarp + 1) == (config.rdmaBlockNum * warpNum)) {
     if (laneId < nNodes) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      index_t numTokenSignal = core::AtomicLoadRelaxed(args.blockFlagCounter) * warpSize + 1;
+      index_t numTokenSignal =
+          core::AtomicLoadRelaxed(args.blockFlagCounter + laneId) * warpSize + 1;
       shmem::ShmemPutInt32ImmNbiThread(args.nodeRecvTokenNumMemObj, myNode * sizeof(index_t),
                                        numTokenSignal, proxyPe);
     }
@@ -686,7 +687,11 @@ __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
   // TODO: refactor following state reset code
   if (laneId == 0) {
     args.totalRecvTokenNum[0] = 0;
-    args.blockFlagCounter[0] = 0;
+    // args.blockFlagCounter[0] = 0;
+  }
+
+  if (laneId < nNodes) {
+    args.blockFlagCounter[laneId] = 0;
   }
 }
 
