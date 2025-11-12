@@ -20,6 +20,9 @@ target_link_libraries(put_thread_allgather mori_shmem hip::host hip::device)
 add_executable(concurrent_put_thread shmem/concurrent_put_thread.cpp)
 target_link_libraries(concurrent_put_thread mori_shmem hip::host hip::device)
 
+add_executable(test_put_schar_nbi_thread shmem/test_put_schar_nbi_thread.cpp)
+target_link_libraries(test_put_schar_nbi_thread mori_shmem hip::host hip::device)
+
 add_executable(concurrent_put_imm_thread shmem/concurrent_put_imm_thread.cpp)
 target_link_libraries(concurrent_put_imm_thread mori_shmem hip::host
                       hip::device)
