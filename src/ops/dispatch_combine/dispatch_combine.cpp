@@ -277,6 +277,8 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
           EpDispatchInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeV1) {
           EpDispatchInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
+        } else if (kernelType == KernelType::InterNodeV1LL) {
+          EpDispatchInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else {
@@ -303,7 +305,8 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
         if (kernelType == KernelType::InterNode) {
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
-        } else if (kernelType == KernelType::InterNodeV1) {
+        } else if ((kernelType == KernelType::InterNodeV1) ||
+                   (kernelType == KernelType::InterNodeV1LL)) {
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
