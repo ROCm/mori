@@ -58,7 +58,7 @@ void VerifyBuffer(void* buffer, size_t maxSize, char expected) {
 }
 
 template <ProviderType P>
-inline __device__ void QuiteSerial(RdmaEndpoint* endpoint) {
+inline __device__ void QuietSerial(RdmaEndpoint* endpoint) {
   if (GetActiveLaneNum() != 0) return;
   CompletionQueueHandle& cq = endpoint->cqHandle;
   WorkQueueHandle& wq = endpoint->wqHandle;
@@ -98,9 +98,16 @@ inline __device__ void QuiteSerial(RdmaEndpoint* endpoint) {
       }
       wqe_counter = (wqe_counter + wq.sqWqeNum - 1) % wq.sqWqeNum;
       wqe_id = wq.outstandingWqe[wqe_counter] + 1;
+    } else if constexpr (P == core::ProviderType::PSD) {
+      if (opcode != 0) {
+        uint32_t my_cq_index = my_cq_consumer % cq.cqeNum;
+        assert(false);
+      }
+      wqe_counter = (wqe_counter + wq.sqWqeNum - 1) % wq.sqWqeNum;
+      wqe_id = wq.outstandingWqe[wqe_counter] + 1;
     }
 
-    // core::UpdateCqDbrRecord<P>(cq.dbrRecAddr, (uint32_t)(my_cq_consumer + 1), cq.cqeNum);
+    // core::UpdateCqDbrRecord<P>(cq, cq.dbrRecAddr, (uint32_t)(my_cq_consumer + 1), cq.cqeNum);
 
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
     __hip_atomic_fetch_max(&wq.doneIdx, wqe_id, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -109,7 +116,7 @@ inline __device__ void QuiteSerial(RdmaEndpoint* endpoint) {
 }
 
 template <ProviderType P>
-__device__ void Quite(RdmaEndpoint* endpoint) {
+__device__ void Quiet(RdmaEndpoint* endpoint) {
   constexpr size_t BROADCAST_SIZE = 1024 / warpSize;
   __shared__ uint64_t wqe_broadcast[BROADCAST_SIZE];
   uint8_t warp_id = FlatBlockThreadId() / warpSize;
@@ -173,7 +180,7 @@ __device__ void Quite(RdmaEndpoint* endpoint) {
         completed =
             __hip_atomic_load(&cqHandle->consIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       } while (completed != warp_cq_consumer);
-      UpdateCqDbrRecord<P>(cqHandle->dbrRecAddr, (uint32_t)(warp_cq_consumer + quiet_amount),
+      UpdateCqDbrRecord<P>(endpoint->cqHandle, cqHandle->dbrRecAddr, (uint32_t)(warp_cq_consumer + quiet_amount),
                            cqHandle->cqeNum);
 
       uint64_t doneIdx = wqe_broadcast[warp_id];
@@ -183,6 +190,16 @@ __device__ void Quite(RdmaEndpoint* endpoint) {
                              __HIP_MEMORY_SCOPE_AGENT);
     }
   }
+}
+
+template <ProviderType P>
+__device__ void QuietPsd(RdmaEndpoint* endpoint) {
+  CompletionQueueHandle* cqHandle = &endpoint->cqHandle;
+  WorkQueueHandle* wqHandle = &endpoint->wqHandle;
+  uint16_t wqe_counter;
+  
+  PollCq<P>(endpoint->wqHandle, endpoint->cqHandle,
+	    cqHandle->cqAddr, cqHandle->cqeNum, &cqHandle->cq_consumer, &wqe_counter);
 }
 
 template <ProviderType P>
@@ -216,6 +233,9 @@ __device__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
       warp_sq_counter = warp_msntbl_counter;
       __hip_atomic_fetch_max(&wqHandle->postIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_AGENT);
+    } else if constexpr (P == core::ProviderType::PSD) {
+      warp_sq_counter = __hip_atomic_fetch_add(&wqHandle->postIdx, num_wqes, __ATOMIC_RELAXED,
+                                               __HIP_MEMORY_SCOPE_AGENT);
     } else {
       assert(false);
     }
@@ -229,6 +249,8 @@ __device__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
     my_sq_counter = warp_sq_counter + my_logical_lane_id;
     my_msntbl_counter = warp_msntbl_counter + my_logical_lane_id;
     my_psn_counter = warp_psn_counter + psnCnt * my_logical_lane_id;
+  } else if constexpr (P == core::ProviderType::PSD) {
+    my_sq_counter = warp_sq_counter + my_logical_lane_id;
   } else {
     assert(false);
   }
@@ -245,9 +267,11 @@ __device__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
       break;
     }
     if constexpr (P == ProviderType::MLX5) {
-      Quite<P>(endpoint);
+      Quiet<P>(endpoint);
     } else if constexpr (P == ProviderType::BNXT) {
-      QuiteSerial<P>(endpoint);
+      QuietSerial<P>(endpoint);
+    } else if constexpr (P == ProviderType::PSD) {
+      QuietPsd<P>(endpoint);
     }
   }
   uintptr_t srcAddr = localMr.addr + FlatThreadId() * msg_size;
@@ -262,6 +286,11 @@ __device__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
     wqHandle->outstandingWqe[my_sq_counter % wqHandle->sqWqeNum] = my_sq_counter;
     dbr_val =
         PostWrite<P>(*wqHandle, my_sq_counter, my_msntbl_counter, my_psn_counter, is_leader,
+                     endpoint->handle.qpn, srcAddr, localMr.lkey, dstAddr, remoteMr.rkey, msg_size);
+  } else if constexpr (P == ProviderType::PSD) {
+    wqHandle->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
+    dbr_val =
+        PostWrite<P>(*wqHandle, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
                      endpoint->handle.qpn, srcAddr, localMr.lkey, dstAddr, remoteMr.rkey, msg_size);
   } else {
     assert(false);
@@ -304,12 +333,14 @@ __global__ void MultiQpWrite(RdmaEndpoint* endpoints, RdmaMemoryRegion localMr,
       Write<P>(endpoints + qp_id, localMr, remoteMr, msg_size);
     }
     if constexpr (P == ProviderType::MLX5) {
-      Quite<P>(endpoints + qp_id);
+      Quiet<P>(endpoints + qp_id);
     } else if constexpr (P == ProviderType::BNXT) {
       for (int t = globalWarpId; t < num_qp; t += globalWarpNum) {
         // printf("qp_offset:%d\n",qp_offset);
-        QuiteSerial<P>(endpoints + t);
+        QuietSerial<P>(endpoints + t);
       }
+    } else if constexpr (P == ProviderType::PSD) {
+      QuietPsd<P>(endpoints + qp_id);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -440,6 +471,10 @@ void distRdmaOps(int argc, char* argv[]) {
               devEndpoints, global_mr_handles[0], global_mr_handles[1], size, 1, blockSync, num_qp);
           break;
 #endif
+        case ProviderType::PSD:
+          MultiQpWrite<ProviderType::PSD><<<blocks, threads>>>(
+              devEndpoints, global_mr_handles[0], global_mr_handles[1], size, 1, blockSync, num_qp);
+          break;
         default:
           break;
       }
@@ -470,6 +505,11 @@ void distRdmaOps(int argc, char* argv[]) {
                                                                 warmupIters, blockSync + 1, num_qp);
           break;
 #endif
+        case ProviderType::PSD:
+          MultiQpWrite<ProviderType::PSD><<<blocks, threads>>>(devEndpoints, global_mr_handles[0],
+                                                                global_mr_handles[1], size,
+                                                                warmupIters, blockSync + 1, num_qp);
+          break;
         default:
           break;
       }
@@ -490,6 +530,11 @@ void distRdmaOps(int argc, char* argv[]) {
                                     iters, blockSync + 1 + warmupIters, num_qp);
           break;
 #endif
+        case ProviderType::PSD:
+          MultiQpWrite<ProviderType::PSD>
+              <<<blocks, threads>>>(devEndpoints, global_mr_handles[0], global_mr_handles[1], size,
+                                    iters, blockSync + 1 + warmupIters, num_qp);
+          break;
         default:
           break;
       }

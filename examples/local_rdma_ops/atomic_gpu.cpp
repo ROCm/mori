@@ -50,7 +50,8 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion sendMr,
   uint16_t wqeCounter;
   int opcode = PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum, &epSend.cqHandle.consIdx,
                          &wqeCounter);
-  UpdateCqDbrRecord<P>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx, epSend.cqHandle.cqeNum);
+  epSend.cqHandle.consIdx += 1;
+  UpdateCqDbrRecord<P>(epSend.cqHandle, epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx, epSend.cqHandle.cqeNum);
   printf("wqeCounter = %hu\n", wqeCounter);
   // printf("send block is done, opcode is %d postIdx %u consIdx %u\n", opcode,
   // epSend.wqHandle.postIdx, epSend.cqHandle.consIdx);
@@ -61,10 +62,10 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion sendMr,
   __threadfence_system();
   RingDoorbell<P>(epSend.wqHandle.dbrAddr, dbr_val);
   __threadfence_system();
-  epSend.cqHandle.consIdx += 1;
   opcode = PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum, &epSend.cqHandle.consIdx,
                      &wqeCounter);
-  UpdateCqDbrRecord<P>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx, epSend.cqHandle.cqeNum);
+  epSend.cqHandle.consIdx += 1;
+  UpdateCqDbrRecord<P>(epSend.cqHandle, epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx, epSend.cqHandle.cqeNum);
   printf("wqeCounter = %hu\n", wqeCounter);
   printf("send block is done, opcode is %d postIdx %u consIdx %u\n", opcode,
          epSend.wqHandle.postIdx, epSend.cqHandle.consIdx);
@@ -101,6 +102,9 @@ __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMe
         SendThreadKernel<ProviderType::BNXT>(epSend, mrSend, mrRecv);
         break;
 #endif  // ENABLE_BNXT
+      case ProviderType::PSD:
+        SendThreadKernel<ProviderType::PSD>(epSend, mrSend, mrRecv);
+        break;
       default:
         // unsupported provider
         break;

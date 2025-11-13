@@ -29,6 +29,7 @@
 
 #include "infiniband/verbs.h"
 #include "mori/application/transport/rdma/providers/bnxt/bnxt.hpp"
+#include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
 #include "mori/utils/mori_log.hpp"
@@ -232,6 +233,9 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
         return new BnxtDevice(inDevice);
         break;
 #endif
+      case (static_cast<uint32_t>(RdmaDeviceVendorId::Pensando)):
+        return new IonicDevice(inDevice);
+        break;
       default:
         return nullptr;
     }
