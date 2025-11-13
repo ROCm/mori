@@ -404,11 +404,15 @@ DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint32, uint32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint64, uint64_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int32, int32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Ulong, unsigned long, Thread)
 
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint32, uint32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int32, int32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Ulong, unsigned long, Warp)
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                       Atomic Fetch APIs                                        */
@@ -438,11 +442,63 @@ DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint32, uint32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint64, uint64_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int32, int32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Ulong, unsigned long, Thread)
 
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint32, uint32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int32, int32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Ulong, unsigned long, Warp)
+
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                              Atomic Add Convenience APIs (NonFetch)                            */
+/* ---------------------------------------------------------------------------------------------- */
+#define DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(TypeName, T, Scope)                                     \
+  inline __device__ void Shmem##TypeName##AtomicAdd##Scope(                                      \
+      const application::SymmMemObjPtr dest, size_t destOffset, T val, int pe, int qpId = 0) {   \
+    ShmemAtomicTypeNonFetch##Scope<T>(dest, destOffset, val, core::AMO_ADD, pe, qpId);           \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Ulong, unsigned long, Thread)
+
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Ulong, unsigned long, Warp)
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                              Atomic Add Convenience APIs (Fetch)                               */
+/* ---------------------------------------------------------------------------------------------- */
+#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(TypeName, T, Scope)                               \
+  inline __device__ T Shmem##TypeName##AtomicFetchAdd##Scope(                                    \
+      const application::SymmMemObjPtr dest, size_t destOffset, T val, int pe, int qpId = 0) {   \
+    T compare = 0;                                                                                \
+    return ShmemAtomicTypeFetch##Scope<T>(dest, destOffset, val, compare, core::AMO_FETCH_ADD, pe, qpId); \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Ulong, unsigned long, Thread)
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Ulong, unsigned long, Warp)
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                          Pure Address-Based APIs (OpenSHMEM Style)                             */
@@ -637,11 +693,15 @@ DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Uint32, uint32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Uint64, uint64_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Int32, int32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Ulong, unsigned long, Thread)
 
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Uint32, uint32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Int32, int32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Ulong, unsigned long, Warp)
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                       Atomic Fetch APIs                                        */
@@ -669,11 +729,62 @@ DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Uint32, uint32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Uint64, uint64_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Int32, int32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Ulong, unsigned long, Thread)
 
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Uint32, uint32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Int32, int32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Ulong, unsigned long, Warp)
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                   Atomic Add Convenience APIs (NonFetch, Pure Address)                         */
+/* ---------------------------------------------------------------------------------------------- */
+#define DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(TypeName, T, Scope)                \
+  inline __device__ void Shmem##TypeName##AtomicAdd##Scope(                      \
+      T* dest, T val, int pe, int qpId = 0) {                                    \
+    ShmemAtomicTypeNonFetch##Scope<T>(dest, val, core::AMO_ADD, pe, qpId);       \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Ulong, unsigned long, Thread)
+
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Ulong, unsigned long, Warp)
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                     Atomic Add Convenience APIs (Fetch, Pure Address)                          */
+/* ---------------------------------------------------------------------------------------------- */
+#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(TypeName, T, Scope)          \
+  inline __device__ T Shmem##TypeName##AtomicFetchAdd##Scope(                    \
+      T* dest, T val, int pe, int qpId = 0) {                                    \
+    T compare = 0;                                                                \
+    return ShmemAtomicTypeFetch##Scope<T>(dest, val, compare, core::AMO_FETCH_ADD, pe, qpId); \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Ulong, unsigned long, Thread)
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Ulong, unsigned long, Warp)
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    Wait Until Greater Than APIs                                */
