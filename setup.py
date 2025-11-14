@@ -88,6 +88,14 @@ class CMakeBuild(build_ext):
                 build_dir / "src/io/libmori_io.so",
                 root_dir / "python/mori/libmori_io.so",
             ),
+            (
+                build_dir / "src/shmem/libmori_shmem.a",
+                root_dir / "python/mori/libmori_shmem.a",
+            ),
+            (
+                build_dir / "src/ops/libmori_ops.a",
+                root_dir / "python/mori/libmori_ops.a",
+            ),
         ]
         for src_path, dst_path in files_to_copy:
             shutil.copyfile(src_path, dst_path)
@@ -115,7 +123,7 @@ setup(
     packages=find_packages(where="python"),
     package_dir={"": "python"},
     package_data={
-        "mori": ["libmori_pybinds.so", "libmori_io.so", "libmori_application.so"]
+        "mori": ["libmori_pybinds.so", "libmori_io.so", "libmori_application.so", "libmori_shmem.a", "libmori_ops.a"],
     },
     cmdclass={
         "build_ext": CMakeBuild,

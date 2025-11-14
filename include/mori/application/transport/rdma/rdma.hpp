@@ -183,6 +183,7 @@ class RdmaDeviceContext {
   // TODO: query gid entry by ibv_query_gid_table
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) {
     assert(false && "not implemented");
+    return RdmaEndpoint();
   }
   void ConnectEndpoint(const RdmaEndpoint& local, const RdmaEndpoint& remote, uint32_t qpId = 0) {
     ConnectEndpoint(local.handle, remote.handle, qpId);
