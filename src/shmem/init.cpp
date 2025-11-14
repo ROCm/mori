@@ -31,7 +31,7 @@
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/shmem/shmem_api.hpp"
 #include "mori/utils/mori_log.hpp"
-#include "src/shmem/internal.hpp"
+#include "mori/shmem/internal.hpp"
 
 namespace mori {
 namespace shmem {

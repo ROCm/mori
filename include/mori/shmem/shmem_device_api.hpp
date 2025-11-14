@@ -29,7 +29,7 @@
 #include "mori/shmem/shmem_device_kernels.hpp"
 #include "mori/shmem/shmem_ibgda_kernels.hpp"
 #include "mori/shmem/shmem_p2p_kernels.hpp"
-#include "src/shmem/internal.hpp"
+#include "mori/shmem/internal.hpp"
 
 namespace mori {
 namespace shmem {
