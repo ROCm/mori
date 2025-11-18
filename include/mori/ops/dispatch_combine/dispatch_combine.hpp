@@ -86,8 +86,10 @@ struct EpDispatchCombineConfig {
   // If true, use external buffer which incurs extra copy overhead; otherwise, the kernel assumes
   // the provided buffer is shmemInpTokMemObj
   bool useExternalInpBuffer{true};
+  KernelType kernelType{KernelType::IntraNode};
   int gpuPerNode{8};
   int rdmaBlockNum{1};
+  int numQpPerPe{1};
 
   inline __host__ __device__ int MaxNumTokensToSendPerRank() const { return maxNumInpTokenPerRank; }
 
@@ -222,7 +224,7 @@ class EpDispatchCombineHandle {
   index_t* dispDestTokIdMap{nullptr};
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
-  uint32_t* crossDeviceBarrierFlag{nullptr};
+  uint64_t* crossDeviceBarrierFlag{nullptr};
 
   // Inter-node v1 kernel parameters
   // Signal the completion of inter-node token transfer
@@ -281,7 +283,7 @@ struct EpDispatchCombineArgs {
   index_t* dispDestTokIdMap{nullptr};
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
-  uint32_t* crossDeviceBarrierFlag{nullptr};
+  uint64_t* crossDeviceBarrierFlag{nullptr};
   mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
   index_t* destNodeTokenCounter{nullptr};
   mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;

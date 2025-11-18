@@ -48,6 +48,8 @@ enum ShmemTeamType {
   TEAM_NODE = 2,
 };
 
+int ShmemNumQpPerPe();
+
 // TODO: finish team pe api
 // int ShmemTeamMyPe(ShmemTeamType);
 // int ShmemTeamNPes(ShmemTeamType);
