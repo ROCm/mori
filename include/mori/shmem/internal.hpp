@@ -99,7 +99,7 @@ struct GpuStates {
   application::SymmMemObj* heapObj{nullptr};  // Pointer to the heap's SymmMemObj on device
 };
 
-extern __constant__ GpuStates globalGpuStates;
+extern __constant__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
 
 static __device__ GpuStates* GetGlobalGpuStatesPtr() { return &globalGpuStates; }
 

@@ -43,7 +43,7 @@ namespace shmem {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          Initialization                                       */
 /* ---------------------------------------------------------------------------------------------- */
-__constant__ GpuStates globalGpuStates;
+__constant__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
 
 void RdmaStatesInit() {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
