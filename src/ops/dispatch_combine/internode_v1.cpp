@@ -749,6 +749,10 @@ template __global__ void EpDispatchInterNodeV1Kernel<hip_bfloat16>(
 template __global__ void EpDispatchInterNodeV1Kernel<__hip_fp8_e4m3_fnuz>(
     EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
 #endif
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+template __global__ void EpDispatchInterNodeV1Kernel<__hip_fp8_e4m3>(
+    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
+#endif
 template __global__ void EpDispatchInterNodeV1Kernel<float>(EpDispatchCombineArgs<float> args);
 
 template __global__ void EpDispatchInterNodeV1KernelLowLatency<hip_bfloat16>(
@@ -756,6 +760,10 @@ template __global__ void EpDispatchInterNodeV1KernelLowLatency<hip_bfloat16>(
 #ifdef MORI_FP8_TYPE_FNUZ_ENABLED
 template __global__ void EpDispatchInterNodeV1KernelLowLatency<__hip_fp8_e4m3_fnuz>(
     EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
+#endif
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+template __global__ void EpDispatchInterNodeV1KernelLowLatency<__hip_fp8_e4m3>(
+    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
 #endif
 template __global__ void EpDispatchInterNodeV1KernelLowLatency<float>(
     EpDispatchCombineArgs<float> args);
@@ -765,6 +773,10 @@ template __global__ void EpCombineInterNodeV1Kernel<hip_bfloat16>(
 #ifdef MORI_FP8_TYPE_FNUZ_ENABLED
 template __global__ void EpCombineInterNodeV1Kernel<__hip_fp8_e4m3_fnuz>(
     EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
+#endif
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+template __global__ void EpCombineInterNodeV1Kernel<__hip_fp8_e4m3>(
+    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
 #endif
 template __global__ void EpCombineInterNodeV1Kernel<float>(EpDispatchCombineArgs<float> args);
 
