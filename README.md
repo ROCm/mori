@@ -108,6 +108,7 @@ cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
 
 ### Install with Python
 ```
+# NOTE: for venv build, add --no-build-isolation at the end
 cd mori && pip install -r requirements-build.txt && git submodule update --init --recursive && pip3 install .
 ```
 

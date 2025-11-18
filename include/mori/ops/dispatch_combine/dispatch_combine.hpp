@@ -29,6 +29,7 @@
 #include <variant>
 
 #include "mori/application/application.hpp"
+#include "mori/utils/data_types.hpp"
 
 namespace mori {
 namespace moe {
@@ -293,8 +294,12 @@ struct EpDispatchCombineArgs {
 };
 
 using EpDispatchCombineArgsVariant =
-    std::variant<EpDispatchCombineArgs<float>, EpDispatchCombineArgs<hip_bfloat16>,
-                 EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> >;
+    std::variant<EpDispatchCombineArgs<float>, EpDispatchCombineArgs<hip_bfloat16>
+#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
+                 ,
+                 EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>
+#endif
+                 >;
 
 template <typename T>
 EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle& handle) {
@@ -354,7 +359,9 @@ inline EpDispatchCombineArgsVariant GetEpDispatchCombineArgsByInputType(
     case HIP_R_16BF:
       return GetEpDispatchCombineArgs<hip_bfloat16>(handle);
     case HIP_R_8F_E4M3_FNUZ:
+#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
       return GetEpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>(handle);
+#endif
     default:
       std::ostringstream oss;
       oss << "Unsupported inputType " << HipDataTypeToString(handle.inputType)
