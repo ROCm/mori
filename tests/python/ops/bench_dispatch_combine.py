@@ -31,7 +31,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         super().__init__(config)
 
     def gen_test_data(self):
-        return super().gen_test_data(use_max_token_num=True)
+        return super().gen_test_data(use_max_token_num=False)
 
     def run_once(self, op, test_data, check_result):
         (
@@ -108,7 +108,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         ll_mode_scale = (
             self.config.max_num_inp_token_per_rank
             * self.config.num_experts_per_token
-            / total_recv_num_token
+            / (total_recv_num_token+0.01)
         )
         disp_bandwidth = total_bytes / (1000**3) / (disp_duration / (10**3))
         comb_bandwidth = total_bytes / (1000**3) / (comb_duration / (10**3))
@@ -138,8 +138,9 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         for i in range(iters):
             self.sync()
             disp_dur, comb_dur, disp_bw, comb_bw, total_bytes, ll_mode_scale = (
-                self.run_once(op, test_data_list[i], False)
+                self.run_once(op, test_data_list[i], True)
             )
+            continue
 
             disp_dur_list = [torch.zeros(1) for _ in range(self.config.world_size)]
             disp_bw_list = [torch.zeros(1) for _ in range(self.config.world_size)]
@@ -282,7 +283,7 @@ def _bench_dispatch_combine(
     scale_dim=0,
     scale_type_size=0,
     num_experts_per_rank=32,
-    num_experts_per_token=8,
+    num_experts_per_token=1,
 ):
     config = mori.ops.EpDispatchCombineConfig(
         data_type=data_type,

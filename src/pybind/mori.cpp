@@ -80,7 +80,7 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
       torch::TensorOptions().dtype(mori::GetTorchDataType<float>()).device(torch::kCUDA));
 
   std::optional<torch::Tensor> outScales{std::nullopt};
-  if (handle.config.scaleDim > 0) {
+  if (scales.has_value() && handle.config.scaleDim > 0) {
     outScales =
         torch::from_blob(handle.shmemOutScalesMemObj->Get(),
                          {handle.config.MaxNumTokensToRecv(), handle.config.scaleDim},
