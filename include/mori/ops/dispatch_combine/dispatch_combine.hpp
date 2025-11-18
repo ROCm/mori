@@ -386,6 +386,7 @@ inline EpDispatchCombineArgsVariant GetEpDispatchCombineArgsByInputType(
 #endif
 #ifdef MORI_FP8_TYPE_FNUZ_ENABLED
     case HIP_R_8F_E4M3_FNUZ:
+#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
       return GetEpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>(handle);
 #endif
     default:
