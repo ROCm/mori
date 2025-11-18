@@ -210,6 +210,11 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   cq_mask = dvcq.q.mask;
   ionic_cq_buf = reinterpret_cast<ionic_v1_cqe*>(dvcq.q.ptr);
 
+#ifdef IONIC_CCQE
+  // XXX ABH collapsed cqe prototype
+  dvctx.db_ptr[dvctx.cq_qtype] = dvcq.q.db_val | 0xffff;
+#endif
+
   ionic_dv_qp dvqp;
   ionic_dv_get_qp(&dvqp, qp);
 
