@@ -156,7 +156,7 @@ class IonicDeviceContext : public RdmaDeviceContext {
 
  private:
   uint32_t pdn;
-  struct ibv_pd *pd_uxdma;
+  struct ibv_pd *pd_uxdma[2];
 
   std::unordered_map<uint32_t, IonicCqContainer*> cqPool;
   std::unordered_map<uint32_t, IonicQpContainer*> qpPool;
