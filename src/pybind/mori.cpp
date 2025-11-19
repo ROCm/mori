@@ -317,14 +317,7 @@ torch::Tensor ConvertCombineInput(mori::moe::EpDispatchCombineHandle& handle,
 
   handle.LaunchDispatchSend((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
                             at::cuda::getCurrentHIPStream());
-}
 
-std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, torch::Tensor,
-           torch::Tensor>
-LaunchDispatchRecv(mori::moe::EpDispatchCombineHandle& handle, int kernelType, int blockNum = -1,
-                   int warpPerBlock = -1) {
-  handle.LaunchDispatchRecv((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
-                            at::cuda::getCurrentHIPStream());
   torch::Tensor out =
       torch::from_blob(handle.shmemDispatchOutTokMemObj->Get(),
                        {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
@@ -359,6 +352,12 @@ LaunchDispatchRecv(mori::moe::EpDispatchCombineHandle& handle, int kernelType, i
                            .dtype(mori::GetTorchDataType<mori::moe::index_t>())
                            .device(torch::kCUDA));
   return {out, outWeights, outScales, outIndices, totalRecvTokenNum};
+}
+
+void LaunchDispatchRecv(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
+                        int blockNum = -1, int warpPerBlock = -1) {
+  handle.LaunchDispatchRecv((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
+                            at::cuda::getCurrentHIPStream());
 }
 
 void LaunchReset(mori::moe::EpDispatchCombineHandle& handle) {
@@ -447,10 +446,10 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   funcName = std::string("convert_combine_input");
   m.def(funcName.c_str(), &ConvertCombineInput);
 #endif
-  std::string funcName = std::string("launch_dispatch_send");
+  funcName = std::string("launch_dispatch_send");
   m.def(funcName.c_str(), &LaunchDispatchSend);
 
-  std::string funcName = std::string("launch_dispatch_recv");
+  funcName = std::string("launch_dispatch_recv");
   m.def(funcName.c_str(), &LaunchDispatchRecv);
 
   funcName = std::string("launch_reset");
