@@ -401,7 +401,7 @@ void IonicDeviceContext::create_parent_domain(ibv_context* context, struct ibv_p
     printf("create_parent_domain, pd_uxdma:%p\n", pd_uxdma[i]);
     ionic_dv_pd_set_sqcmb(pd_uxdma[i], false, false, false);
     ionic_dv_pd_set_rqcmb(pd_uxdma[i], false, false, false);
-    ionic_dv_pd_set_udma_mask(pd_uxdma[i], 1);
+    ionic_dv_pd_set_udma_mask(pd_uxdma[i], 1u << i);
   }
 }
 
