@@ -141,6 +141,8 @@ class EpDispatchCombineHandle {
   void LaunchInterNodeCombine(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
 
   void LaunchDispatch(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
+  void LaunchDispatchSend(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
+  void LaunchDispatchRecv(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
   void LaunchCombine(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
   void LaunchReset(hipStream_t = 0);
 

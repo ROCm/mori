@@ -33,6 +33,7 @@
 #include "src/ops/dispatch_combine/internode.hpp"
 #include "src/ops/dispatch_combine/internode_v1.hpp"
 #include "src/ops/dispatch_combine/intranode.hpp"
+#include "src/ops/dispatch_combine/low_latency_async.hpp"
 
 namespace mori {
 namespace moe {
@@ -312,6 +313,57 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
           EpDispatchInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
+        } else {
+          assert(false);
+        }
+      },
+      argsVariant);
+}
+
+void EpDispatchCombineHandle::LaunchDispatchSend(KernelType kernelType, int blockNum,
+                                                 int warpPerBlock, hipStream_t stream) {
+  size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
+  dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
+  dim3 block(warpSize * actualWarpNumPerBlock);
+
+  size_t sharedMemSize =
+      (config.worldSize * actualWarpNumPerBlock + config.numExpertPerRank * actualWarpNumPerBlock +
+       config.numExpertPerRank) *
+      sizeof(index_t);
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
+  std::visit(
+      [&](auto&& args) {
+        using ArgsT = std::decay_t<decltype(args)>;
+        using DataT = typename ArgsT::data_type;
+
+        if (kernelType == KernelType::AsyncLL) {
+          assert(config.useExternalInpBuffer);
+          EpDispatchLowLatencyAsyncSend<<<grid, block, sharedMemSize, stream>>>(args);
+        } else {
+          assert(false);
+        }
+      },
+      argsVariant);
+}
+
+void EpDispatchCombineHandle::LaunchDispatchRecv(KernelType kernelType, int blockNum,
+                                                 int warpPerBlock, hipStream_t stream) {
+  size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
+  dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
+  dim3 block(warpSize * actualWarpNumPerBlock);
+
+  size_t sharedMemSize =
+      (config.worldSize * actualWarpNumPerBlock + config.numExpertPerRank * actualWarpNumPerBlock +
+       config.numExpertPerRank) *
+      sizeof(index_t);
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
+  std::visit(
+      [&](auto&& args) {
+        using ArgsT = std::decay_t<decltype(args)>;
+        using DataT = typename ArgsT::data_type;
+        if (kernelType == KernelType::AsyncLL) {
+          assert(config.useExternalInpBuffer);
+          EpDispatchLowLatencyAsyncRecv<<<grid, block, sharedMemSize, stream>>>(args);
         } else {
           assert(false);
         }
