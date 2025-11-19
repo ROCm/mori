@@ -207,7 +207,7 @@ class RdmaDeviceContext {
  protected:
   ibv_pd* pd{nullptr};
   ibv_srq* srq{nullptr};
-
+  uint16_t qp_counter{0};
   // Shared UDP sport configuration for all RDMA providers
   uint16_t udp_sport_setting[RDMA_UDP_SPORT_ARRAY_SIZE];
 

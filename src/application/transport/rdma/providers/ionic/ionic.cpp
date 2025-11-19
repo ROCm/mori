@@ -209,7 +209,7 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   cq_dbval = dvcq.q.db_val;
   cq_mask = dvcq.q.mask;
   ionic_cq_buf = reinterpret_cast<ionic_v1_cqe*>(dvcq.q.ptr);
-
+  printf("cq ptr:%p, cq size:%lu, cq mask:0x%x\n", dvcq.q.ptr, dvcq.q.size, dvcq.q.mask);
 #ifdef IONIC_CCQE
   // XXX ABH collapsed cqe prototype
   dvctx.db_ptr[dvctx.cq_qtype] = dvcq.q.db_val | 0xffff;
@@ -395,12 +395,14 @@ void IonicDeviceContext::create_parent_domain(ibv_context* context, struct ibv_p
   ionic_dv_pd_set_sqcmb(pd_parent, false, false, false);
   ionic_dv_pd_set_rqcmb(pd_parent, false, false, false);
   #endif
-  pd_uxdma = ibv_alloc_parent_domain(context, &pattr);
-  assert(pd_uxdma);
-  printf("create_parent_domain, pd_uxdma:%p\n", pd_uxdma);
-  ionic_dv_pd_set_sqcmb(pd_uxdma, false, false, false);
-  ionic_dv_pd_set_rqcmb(pd_uxdma, false, false, false);
-  ionic_dv_pd_set_udma_mask(pd_uxdma, 1);
+  for (int i = 0; i < 2; i++) {
+    pd_uxdma[i] = ibv_alloc_parent_domain(context, &pattr);
+    assert(pd_uxdma[i]);
+    printf("create_parent_domain, pd_uxdma:%p\n", pd_uxdma[i]);
+    ionic_dv_pd_set_sqcmb(pd_uxdma[i], false, false, false);
+    ionic_dv_pd_set_rqcmb(pd_uxdma[i], false, false, false);
+    ionic_dv_pd_set_udma_mask(pd_uxdma[i], 1);
+  }
 }
 
 IonicDeviceContext::IonicDeviceContext(RdmaDevice* rdma_device, ibv_context* context, ibv_pd* in_pd)
@@ -416,9 +418,11 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
 
   assert(!config.withCompChannel && !config.enableSrq && "not implemented");
   
-  IonicCqContainer* cq = new IonicCqContainer(context, config, pd_uxdma);
-  printf("CreateRdmaEndpoint, context:%p, cq->cq:%p, pd_uxdma:%p\n", context, cq->cq, pd_uxdma);
-  IonicQpContainer* qp = new IonicQpContainer(context, config, cq->cq, pd_uxdma, this);
+  struct ibv_pd *pd = pd_uxdma[qp_counter & 1];
+  qp_counter++;
+  IonicCqContainer* cq = new IonicCqContainer(context, config, pd);
+  printf("CreateRdmaEndpoint, context:%p, cq->cq:%p, pd_uxdma:%p\n", context, cq->cq, pd);
+  IonicQpContainer* qp = new IonicQpContainer(context, config, cq->cq, pd, this);
 
   RdmaEndpoint endpoint;
   endpoint.handle.psn = 0;
