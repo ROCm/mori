@@ -681,6 +681,7 @@ inline __device__ void PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHan
   return;
 }
 
+#if 0
 template <>
 inline __device__ int PollCq<ProviderType::PSD>(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
                                                 void* cqAddr, uint32_t cqeNum, uint32_t* consIdx, uint16_t* wqeCounter)
@@ -721,16 +722,65 @@ inline __device__ int PollCq<ProviderType::PSD>(WorkQueueHandle& wqHandle, Compl
 
   return 0;
 }
+#endif
 
-#if 0
+#if 1
 template <>
 inline __device__ int PollCq<ProviderType::PSD>(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle, 
 		                                void* cqAddr, uint32_t cqeNum, uint32_t* consIdx, uint16_t* wqeCounter)
 {
+  const uint32_t curWqeIdx = *wqeCounter;	
   uint64_t activemask = GetActiveLaneMask();
+  volatile struct ionic_v1_cqe* cqe = reinterpret_cast<ionic_v1_cqe*>(cqAddr);
 
-  poll_cq_internal(wqHandle, cqHandle, activemask, wqHandle.dbTouchIdx, cqAddr, cqeNum, consIdx);
+  if (false && !is_first_active_lane(activemask)) {
+    return 0;
+  }
+
+#if 0
+#if 1
+  uint32_t sign = 0x8000;
+#else
+  uint32_t sign = wqHandle.sqWqeNum >> 1;
+#endif
   
+  uint32_t msn = BE32TOH(cqe->send.msg_msn);
+  while ((msn - curWqeIdx) & sign) {
+    msn = BE32TOH(cqe->send.msg_msn);
+  }
+#endif
+#if 1
+  // touch index means what have run doobell
+  uint32_t cons = wqHandle.dbTouchIdx;
+  uint32_t msn = BE32TOH(cqe->send.msg_msn);
+
+  // to do: handle the wrap-around later
+  while ((msn - cons) & 0x800000) {
+    msn = BE32TOH(cqe->send.msg_msn);  
+  }
+#endif
+
+  //uint32_t msn = BE32TOH(cqe->send.msg_msn);
+  //*wqeCounter = msn & (wqHandle.sqWqeNum - 1);
+  
+  *wqeCounter = 0;
+  //wqHandle.doneIdx = msn & (wqHandle.sqWqeNum - 1);
+
+  //done index means what have got the msn in cq
+  wqHandle.doneIdx = msn;
+
+  #if 0
+  //to do: update the doorbell on setup
+  if (cqHandle.cq_consumer == 0) {
+    cqHandle.cq_consumer = 1;
+    uint64_t dbrVal = cqHandle.cq_dbval | 0xffff);
+    __atomic_store_n(reinterpret_cast<uint64_t*>(cqHandle.dbrRecAddr), dbrVal, __ATOMIC_SEQ_CST); //TODO:maybe relaxed?
+  }
+  #endif  
+  #if 0
+  printf("update msn, block:%u, warp:%u, lane:%u, msn:%u\n",
+         blockIdx.x, threadIdx.x/warpSize, __lane_id(), msn);
+  #endif
   return 0;
 }
 #endif
