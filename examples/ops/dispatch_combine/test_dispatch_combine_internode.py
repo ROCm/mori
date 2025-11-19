@@ -34,6 +34,7 @@ kernel_type_map = {
     "v0": mori.ops.EpDispatchCombineKernelType.InterNode,
     "v1": mori.ops.EpDispatchCombineKernelType.InterNodeV1,
     "v1_ll": mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
+    "async_ll": mori.ops.EpDispatchCombineKernelType.AsyncLL,
 }
 
 
@@ -284,20 +285,23 @@ class EpDispatchCombineTestCase:
             all_rank_scales,
         ) = test_data
 
-        (
-            dispatch_output,
-            dispatch_weights,
-            dispatch_scales,
-            dispatch_indices,
-            dispatch_recv_num_token,
-        ) = op.dispatch(
-            all_rank_input[self.rank],
-            all_rank_weights[self.rank],
-            all_rank_scales[self.rank],
-            all_rank_indices[self.rank],
-            block_num=self.config.block_num,
-            # warp_per_block=16,
-        )
+        if op.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+            pass
+        else:
+            (
+                dispatch_output,
+                dispatch_weights,
+                dispatch_scales,
+                dispatch_indices,
+                dispatch_recv_num_token,
+            ) = op.dispatch(
+                all_rank_input[self.rank],
+                all_rank_weights[self.rank],
+                all_rank_scales[self.rank],
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+                warp_per_block=16,
+            )
         torch.cuda.synchronize()
 
         rank_counts, _, _ = self.count_token_num(all_rank_indices)
