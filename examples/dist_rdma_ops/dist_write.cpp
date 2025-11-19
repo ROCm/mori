@@ -372,7 +372,11 @@ void distRdmaOps(int argc, char* argv[]) {
   float milliseconds;
   int local_rank = bootNet.GetLocalRank();
   int world_size = bootNet.GetWorldSize();
-  HIP_RUNTIME_CHECK(hipSetDevice(local_rank));
+  if (local_rank == 0)
+    HIP_RUNTIME_CHECK(hipSetDevice(local_rank));
+  else
+    HIP_RUNTIME_CHECK(hipSetDevice(4));//hardcode for now
+
   hipEvent_t start, end;
   HIP_RUNTIME_CHECK(hipEventCreate(&start));
   HIP_RUNTIME_CHECK(hipEventCreate(&end));
