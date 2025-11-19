@@ -83,6 +83,8 @@ class EpDispatchCombineOp:
         )
 
         self._dispatch_func = _cpp_dispatch_combine_factory("launch_dispatch")
+        self._dispatch_send_func = _cpp_dispatch_combine_factory("launch_dispatch_send")
+        self._dispatch_recv_func = _cpp_dispatch_combine_factory("launch_dispatch_recv")
         self._combine_func = _cpp_dispatch_combine_factory("launch_combine")
         self._reset_func = _cpp_dispatch_combine_factory("launch_reset")
         self._get_dispatch_src_token_pos_func = _cpp_dispatch_combine_factory(
@@ -120,6 +122,38 @@ class EpDispatchCombineOp:
             weights,
             scales,
             indices,
+            block_num,
+            warp_per_block,
+        )
+
+    def dispatch_send(
+        self,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        indices: torch.Tensor,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        return self._dispatch_send_func(
+            self._handle,
+            self.config.kernel_type.value,
+            input,
+            weights,
+            scales,
+            indices,
+            block_num,
+            warp_per_block,
+        )
+
+    def dispatch_recv(
+        self,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        return self._dispatch_recv_func(
+            self._handle,
+            self.config.kernel_type.value,
             block_num,
             warp_per_block,
         )

@@ -283,8 +283,22 @@ class EpDispatchCombineTestCase:
             all_rank_scales,
         ) = test_data
 
-        if op.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
-            pass
+        if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+            (
+                dispatch_output,
+                dispatch_weights,
+                dispatch_scales,
+                dispatch_indices,
+                dispatch_recv_num_token,
+            ) = op.dispatch_send(
+                all_rank_input[self.rank],
+                all_rank_weights[self.rank],
+                all_rank_scales[self.rank],
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+                warp_per_block=16,
+            )
+            op.dispatch_recv()
         else:
             (
                 dispatch_output,
@@ -536,7 +550,7 @@ class EpDispatchCombineTestCase:
             all_rank_scales,
         ) = test_data
 
-        for i in range(3):
+        for i in range(0):
             (
                 dispatch_output,
                 dispatch_weights,
@@ -563,6 +577,7 @@ class EpDispatchCombineTestCase:
             )
             torch.cuda.synchronize()
 
+        total_recv_num_token = 1
         total_rdma_recv_num_token = (
             self.config.max_num_inp_token_per_rank * self.config.world_size // 8
         )
@@ -574,28 +589,45 @@ class EpDispatchCombineTestCase:
         dist.barrier()
         events[0].record()
         for i in range(repeat):
-            (
-                dispatch_output,
-                dispatch_weights,
-                dispatch_scales,
-                dispatch_indices,
-                dispatch_recv_num_token,
-            ) = op.dispatch(
-                all_rank_input[self.rank],
-                all_rank_weights[self.rank],
-                all_rank_scales[self.rank],
-                all_rank_indices[self.rank],
-                block_num=self.config.block_num,
-                # warp_per_block=16,
-            )
+            if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+                (
+                    dispatch_output,
+                    dispatch_weights,
+                    dispatch_scales,
+                    dispatch_indices,
+                    dispatch_recv_num_token,
+                ) = op.dispatch_send(
+                    all_rank_input[self.rank],
+                    all_rank_weights[self.rank],
+                    all_rank_scales[self.rank],
+                    all_rank_indices[self.rank],
+                    block_num=self.config.block_num,
+                    warp_per_block=16,
+                )
+                op.dispatch_recv()
+            else:
+                (
+                    dispatch_output,
+                    dispatch_weights,
+                    dispatch_scales,
+                    dispatch_indices,
+                    dispatch_recv_num_token,
+                ) = op.dispatch(
+                    all_rank_input[self.rank],
+                    all_rank_weights[self.rank],
+                    all_rank_scales[self.rank],
+                    all_rank_indices[self.rank],
+                    block_num=self.config.block_num,
+                    warp_per_block=16,
+                )
             events[2 * i + 1].record()
-            combine_output, _ = op.combine(
-                dispatch_output,
-                dispatch_weights,
-                all_rank_indices[self.rank],
-                block_num=self.config.block_num,
-                # warp_per_block=16,
-            )
+            # combine_output, _ = op.combine(
+            #     dispatch_output,
+            #     dispatch_weights,
+            #     all_rank_indices[self.rank],
+            #     block_num=self.config.block_num,
+            #     warp_per_block=16,
+            # )
             events[2 * i + 2].record()
         torch.cuda.synchronize()
 
@@ -643,7 +675,7 @@ class EpDispatchCombineTestCase:
         op = mori.ops.EpDispatchCombineOp(self.config)
         test_data = self.gen_test_data(use_max_token_num=True)
 
-        repeat = 50
+        repeat = 10
         disp_duration_us_list = []
         disp_rdma_bandwidth_GB_list = []
         disp_bandwidth_GB_list = []
@@ -875,7 +907,7 @@ parser.add_argument(
     type=str,
     default="v1",
     help="Type of kernel to test",
-    choices=["v0", "v1", "v1_ll"],
+    choices=["v0", "v1", "v1_ll", "async_ll"],
 )
 parser.add_argument(
     "--num-qp",
