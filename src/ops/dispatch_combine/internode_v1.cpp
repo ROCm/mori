@@ -25,6 +25,7 @@
 #include "mori/core/core.hpp"
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 #include "mori/shmem/shmem.hpp"
+#include "src/ops/dispatch_combine/common.hpp"
 
 namespace mori {
 namespace moe {
@@ -32,34 +33,6 @@ namespace moe {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                   EpDispatchInterNodeV1Kernel                                  */
 /* ---------------------------------------------------------------------------------------------- */
-#define DEF_COMMON_VARS                                                                         \
-  const EpDispatchCombineConfig& config = args.config;                                          \
-  int thdId = threadIdx.x;                                                                      \
-  int thdNum = blockDim.x;                                                                      \
-  int laneId = threadIdx.x & (warpSize - 1);                                                    \
-  int warpId = thdId / warpSize;                                                                \
-  int warpNum = blockDim.x / warpSize;                                                          \
-  int blockNum = gridDim.x;                                                                     \
-  int blockId = blockIdx.x;                                                                     \
-  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;                                      \
-  int globalThdNum = gridDim.x * blockDim.x;                                                    \
-  int globalWarpId = blockIdx.x * warpNum + warpId;                                             \
-  int globalWarpNum = gridDim.x * warpNum;                                                      \
-  int nullTokenId = config.worldSize * config.MaxNumTokensToRecv();                             \
-  int myPe = config.rank;                                                                       \
-  int npes = config.worldSize;                                                                  \
-  int myNode = myPe / config.gpuPerNode;                                                        \
-  int nNodes = npes / config.gpuPerNode;                                                        \
-  int numExpertPerToken = config.numExpertPerToken;                                             \
-  assert(numExpertPerToken < warpSize);                                                         \
-  size_t hiddenBytes = config.hiddenDim * sizeof(T);                                            \
-  size_t indexBytes = config.numExpertPerToken * sizeof(index_t);                               \
-  size_t weightBytes = config.numExpertPerToken * sizeof(float);                                \
-  size_t srcTokenIdBytes = sizeof(index_t);                                                     \
-  size_t scaleBytes = (args.scalesBuf == nullptr) ? 0 : config.scaleDim * config.scaleTypeSize; \
-  size_t xferBytes = hiddenBytes + indexBytes + weightBytes + srcTokenIdBytes + scaleBytes;     \
-  size_t combXferBytes = (args.weightsBuf == nullptr) ? hiddenBytes : hiddenBytes + weightBytes;
-
 namespace v1 {
 template <typename T>
 inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, int tokenId,

@@ -34,12 +34,7 @@
 namespace mori {
 namespace moe {
 
-enum KernelType {
-  IntraNode = 0,
-  InterNode = 1,
-  InterNodeV1 = 2,
-  InterNodeV1LL = 3,
-};
+enum KernelType { IntraNode = 0, InterNode = 1, InterNodeV1 = 2, InterNodeV1LL = 3, AsyncLL = 4 };
 
 inline const char* HipDataTypeToString(hipDataType dtype) {
   switch (dtype) {
