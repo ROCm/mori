@@ -20,9 +20,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import os
+import sys
 import torch
 import torch.distributed as dist
 import socket
+from datetime import timedelta
 from multiprocessing import Queue
 import mori
 import traceback
@@ -61,6 +63,46 @@ def get_free_port():
         return s.getsockname()[1]
 
 
+class KeyErrorMessage(str):
+    r"""str subclass that returns itself in repr"""
+
+    def __repr__(self):
+        return self
+
+
+class ExceptionWrapper:
+    r"""Wraps an exception plus traceback to communicate across processes"""
+
+    def __init__(self, rank, exc_info=None):
+        # It is important that we don't store exc_info, see
+        # NOTE [ Python Traceback Reference Cycle Problem ]
+        if exc_info is None:
+            exc_info = sys.exc_info()
+        self.exc_type = exc_info[0]
+        self.exc_msg = "".join(traceback.format_exception(*exc_info))
+        self.where = f"in rank {rank}"
+
+    def reraise(self):
+        r"""Reraises the wrapped exception in the current thread"""
+        msg = f"Caught {self.exc_type.__name__} {self.where}.\nOriginal {self.exc_msg}"
+        if self.exc_type is KeyError:
+            # KeyError calls repr() on its argument (usually a dict key). This
+            # makes stack traces unreadable. It will not be changed in Python
+            # (https://bugs.python.org/issue2651), so we work around it.
+            msg = KeyErrorMessage(msg)
+        elif getattr(self.exc_type, "message", None):
+            # Some exceptions have first argument as non-str but explicitly
+            # have message field
+            raise self.exc_type(message=msg)
+        try:
+            exception = self.exc_type(msg)
+        except Exception:
+            # If the exception takes multiple arguments or otherwise can't
+            # be constructed, don't try to instantiate since we don't know how to
+            raise RuntimeError(msg) from None
+        raise exception
+
+
 class TorchDistContext:
     def __init__(
         self,
@@ -92,6 +134,7 @@ class TorchDistContext:
             rank=self.rank,
             world_size=self.world_size,
             device_id=device,
+            timeout=timedelta(seconds=10),
         )
 
         world_group = torch.distributed.group.WORLD
@@ -110,6 +153,7 @@ class TorchDistProcessManager:
         self.result_queue = Queue()
         self.processes = []
         self.init_mori_shmem = init_mori_shmem
+        self.on_error = False
 
     @staticmethod
     def _worker(rank, world_size, port, init_shmem, task_queue, result_queue):
@@ -127,7 +171,7 @@ class TorchDistProcessManager:
                     result = func(rank, *args)
                     result_queue.put((rank, result))
                 except Exception:
-                    result_queue.put((rank, traceback.format_exc()))
+                    result_queue.put((rank, ExceptionWrapper(rank=rank)))
 
     def start_workers(self, world_size):
         port = get_free_port()
@@ -149,7 +193,9 @@ class TorchDistProcessManager:
             p.start()
 
     def shutdown(self):
-        for _ in range(len(self.processes)):
+        for idx in range(len(self.processes)):
             self.task_queue.put("STOP")
         for p in self.processes:
+            if self.on_error and p.is_alive():
+                p.terminate()
             p.join()
