@@ -108,7 +108,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         ll_mode_scale = (
             self.config.max_num_inp_token_per_rank
             * self.config.num_experts_per_token
-            / total_recv_num_token
+            / (total_recv_num_token + 0.01)
         )
         disp_bandwidth = total_bytes / (1000**3) / (disp_duration / (10**3))
         comb_bandwidth = total_bytes / (1000**3) / (comb_duration / (10**3))
