@@ -35,7 +35,7 @@ def _get_torch_cmake_prefix_path() -> str:
     return torch.utils.cmake_prefix_path
 
 
-_supported_arch_list = ["gfx942"]
+_supported_arch_list = ["gfx942", "gfx950"]
 
 
 def _get_gpu_archs() -> str:
