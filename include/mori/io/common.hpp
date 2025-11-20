@@ -22,6 +22,7 @@
 #pragma once
 
 #include <msgpack.hpp>
+#include <mutex>
 
 #include "mori/application/transport/p2p/p2p.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
@@ -105,18 +106,24 @@ struct TransferStatus {
   TransferStatus() = default;
   ~TransferStatus() = default;
 
-  StatusCode Code() { return code.load(std::memory_order_relaxed); }
-  uint32_t CodeUint32() { return static_cast<uint32_t>(code.load(std::memory_order_relaxed)); }
+  StatusCode Code() { return code.load(std::memory_order_acquire); }
+  uint32_t CodeUint32() { return static_cast<uint32_t>(code.load(std::memory_order_acquire)); }
 
-  std::string Message() { return msg; }
+  std::string Message() {
+    std::lock_guard<std::mutex> lock(msgMu);
+    return msg;
+  }
 
   bool Init() { return Code() == StatusCode::INIT; }
   bool InProgress() { return Code() == StatusCode::IN_PROGRESS; }
   bool Succeeded() { return Code() == StatusCode::SUCCESS; }
   bool Failed() { return Code() > StatusCode::ERR_BEGIN; }
 
-  void SetCode(enum StatusCode val) { code.store(val, std::memory_order_relaxed); }
-  void SetMessage(const std::string& val) { msg = val; }
+  void SetCode(enum StatusCode val) { code.store(val, std::memory_order_release); }
+  void SetMessage(const std::string& val) {
+    std::lock_guard<std::mutex> lock(msgMu);
+    msg = val;
+  }
 
   void Wait() {
     while (InProgress()) {
@@ -125,6 +132,7 @@ struct TransferStatus {
 
  private:
   std::atomic<StatusCode> code{StatusCode::INIT};
+  mutable std::mutex msgMu;
   std::string msg;
 };
 

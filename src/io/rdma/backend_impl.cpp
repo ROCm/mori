@@ -24,7 +24,6 @@
 #include <sys/epoll.h>
 
 #include <algorithm>
-#include <chrono>
 #include <shared_mutex>
 
 #include "mori/io/logging.hpp"
@@ -293,16 +292,17 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
     } else {
       CqCallbackMessage* msg = reinterpret_cast<CqCallbackMessage*>(wc.wr_id);
       uint32_t lastBatchSize = msg->meta->finishedBatchSize.fetch_add(msg->batchSize);
-      if (msg->meta->status != nullptr) {
+      TransferStatus* statusPtr = msg->meta->status;
+      if (statusPtr != nullptr) {
         if (wc.status == IBV_WC_SUCCESS) {
           if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
             // TODO: should use atomic cas to avoid overwriting failed status
-            msg->meta->status->SetCode(StatusCode::SUCCESS);
-            msg->meta->status->SetMessage(ibv_wc_status_str(wc.status));
+            statusPtr->SetMessage(ibv_wc_status_str(wc.status));
+            statusPtr->SetCode(StatusCode::SUCCESS);
           }
         } else {
-          msg->meta->status->SetCode(StatusCode::ERR_RDMA_OP);
-          msg->meta->status->SetMessage(ibv_wc_status_str(wc.status));
+          statusPtr->SetMessage(ibv_wc_status_str(wc.status));
+          statusPtr->SetCode(StatusCode::ERR_RDMA_OP);
           // set status to nullptr indicate that transfer failed
           msg->meta->status = nullptr;
         }
@@ -310,12 +310,14 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
       MORI_IO_TRACE(
           "NotifManager receive cqe for task {} code {} total batch size {} last batch size {} cur "
           "batch size {}",
-          msg->meta->id, msg->meta->status->CodeUint32(), msg->meta->totalBatchSize, lastBatchSize,
-          msg->batchSize);
+          msg->meta->id,
+          statusPtr != nullptr ? statusPtr->CodeUint32()
+                               : static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
+          msg->meta->totalBatchSize, lastBatchSize, msg->batchSize);
       if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
-        free(msg->meta);
+        delete msg->meta;
       }
-      free(msg);
+      delete msg;
     }
   }
 }
@@ -582,8 +584,8 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
 
   assert(!ret.Init());
   if (ret.Failed() || ret.Succeeded()) {
-    status->SetCode(ret.code);
     status->SetMessage(ret.message);
+    status->SetCode(ret.code);
   }
   if (!ret.Failed()) {
     RdmaNotifyTransfer(eps, status, id);
@@ -607,8 +609,8 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   }
   assert(!ret.Init());
   if (ret.Failed() || ret.Succeeded()) {
-    status->SetCode(ret.code);
     status->SetMessage(ret.message);
+    status->SetCode(ret.code);
   }
   if (!ret.Failed()) {
     RdmaNotifyTransfer(eps, status, id);
