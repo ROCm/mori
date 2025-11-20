@@ -30,10 +30,10 @@ namespace moe {
 
 #define MAX_GPUS_PER_NODE 8
 
-#define DEBUG 0
+#define MORI_INTERNODE_V0_DEBUG 0
 
 __device__ void SyncIfDebugEnabled(const char* msg) {
-#if DEBUG == 1
+#if MORI_INTERNODE_V0_DEBUG == 1
   __syncthreads();
   if ((threadIdx.x == 0) && (blockIdx.x == 0)) {
     shmem::ShmemQuietThread();
@@ -352,7 +352,7 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
       args.crossDeviceBarrierMemObj->template GetAs<volatile uint64_t*>();
   if (thdId < args.config.worldSize) {
     uint64_t currentVal = core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId);
-#if DEBUG == 1
+#if MORI_INTERNODE_V0_DEBUG == 1
     printf("Thread %d: localBarrierPtr[%d] = %lu, expected = %lu\n", thdId, thdId, currentVal,
            (uint64_t)(crossDeviceBarrierFlag * numQps));
 #endif
