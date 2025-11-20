@@ -54,6 +54,8 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
         crossDeviceBarrierFlag);
   }
 
+  if (globalThdId == 0) atomicAdd(args.crossDeviceBarrierFlag, 1);
+
   uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
   if (thdId < args.config.worldSize) {
     while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != crossDeviceBarrierFlag) {
@@ -273,11 +275,6 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
                                 srcWeightsPtr, nullptr, config.numExpertPerToken,
                                 config.numExpertPerToken);
     }
-  }
-
-  if (globalThdId == 0) {
-    __hip_atomic_fetch_add(args.crossDeviceBarrierFlag, 1, __ATOMIC_RELEASE,
-                           __HIP_MEMORY_SCOPE_SYSTEM);
   }
 }
 
