@@ -59,7 +59,8 @@ if(USE_ROCM)
 
   if(DEFINED GPU_TARGETS)
     list(GET GPU_TARGETS 0 GPU_ARCH)
-    message(STATUS "GPU ARCH: ${GPU_ARCH}")
+    message(STATUS "GPU_TARGETS: ${GPU_TARGETS}")
+    # TODO: should iterate all archs
     if(GPU_ARCH MATCHES "^gfx8")
       add_definitions(-D__GFX8__=1)
     elseif(GPU_ARCH MATCHES "^gfx9")

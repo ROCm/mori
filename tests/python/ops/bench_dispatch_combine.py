@@ -108,7 +108,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         ll_mode_scale = (
             self.config.max_num_inp_token_per_rank
             * self.config.num_experts_per_token
-            / total_recv_num_token
+            / (total_recv_num_token + 0.01)
         )
         disp_bandwidth = total_bytes / (1000**3) / (disp_duration / (10**3))
         comb_bandwidth = total_bytes / (1000**3) / (comb_duration / (10**3))
@@ -277,7 +277,6 @@ def _bench_dispatch_combine(
     port,
     max_num_inp_token_per_rank=128,
     data_type=torch.bfloat16,
-    # data_type=torch.float8_e4m3fnuz,
     hidden_dim=7168,
     scale_dim=0,
     scale_type_size=0,
@@ -311,16 +310,22 @@ def _bench_dispatch_combine(
         # mori.shmem.shmem_finalize()
 
 
-def bench_dispatch_combine(max_num_inp_token_per_rank=4096):
+def bench_dispatch_combine(max_num_inp_token_per_rank=4096, dtype=torch.bfloat16):
     world_size = 8
     port = get_free_port()
     torch.multiprocessing.spawn(
         _bench_dispatch_combine,
-        args=(world_size, port, max_num_inp_token_per_rank),
+        args=(world_size, port, max_num_inp_token_per_rank, dtype),
         nprocs=world_size,
         join=True,
     )
 
+
+_DATA_TYPE_MAP = {
+    "bf16": torch.bfloat16,
+    "fp8_e4m3_fnuz": torch.float8_e4m3fnuz,
+    "fp8_e4m3": torch.float8_e4m3fn,
+}
 
 if __name__ == "__main__":
     import argparse
@@ -332,9 +337,17 @@ if __name__ == "__main__":
         default=4096,
         help="Maximum number of input tokens per rank (default: 4096)",
     )
-
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="bf16",
+        choices=["bf16", "fp8_e4m3_fnuz", "fp8_e4m3"],
+        help="Data type of dispatch / combine",
+    )
     args = parser.parse_args()
 
     print(f"Running benchmark with max_tokens_per_rank: {args.max_tokens}")
     print("-" * 60)
-    bench_dispatch_combine(max_num_inp_token_per_rank=args.max_tokens)
+    bench_dispatch_combine(
+        max_num_inp_token_per_rank=args.max_tokens, dtype=_DATA_TYPE_MAP[args.dtype]
+    )
