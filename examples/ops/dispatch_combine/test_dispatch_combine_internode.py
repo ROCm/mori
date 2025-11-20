@@ -933,9 +933,8 @@ def sweep_bench_dispatch_combine(
         world_size,
         max_tokens,
         kernel_type,
-        num_qp,
-        torch.bfloat16,
-        # torch.float8_e4m3fnuz,
+        # torch.bfloat16,
+        torch.float8_e4m3fnuz,
     )
     test_case.setup()
 
