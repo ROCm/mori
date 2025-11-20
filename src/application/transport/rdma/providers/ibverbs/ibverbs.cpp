@@ -46,15 +46,42 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
   endpoint.vendorId = ToRdmaDeviceVendorId(deviceAttr->orig_attr.vendor_id);
   endpoint.handle.psn = 0;
   endpoint.handle.portId = config.portId;
-  endpoint.handle.maxSge = deviceAttr->tm_caps.max_sge;
+  endpoint.handle.maxSge = deviceAttr->orig_attr.max_sge;
 
   const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(config.portId);
   if (portAttr->link_layer == IBV_LINK_LAYER_INFINIBAND) {
     endpoint.handle.ib.lid = portAttr->lid;
   } else if (portAttr->link_layer == IBV_LINK_LAYER_ETHERNET) {
     union ibv_gid gid;
-    SYSCALL_RETURN_ZERO(ibv_query_gid(context, config.portId, config.gidIdx, &gid));
+    int gidIdx = config.gidIdx;
+    if (gidIdx == -1) {
+      // Auto detect
+      bool found = false;
+      for (int i = 0; i < portAttr->gid_tbl_len; ++i) {
+        if (ibv_query_gid(context, config.portId, i, &gid) == 0) {
+          bool is_zero = true;
+          for (int j = 0; j < 16; ++j) {
+            if (gid.raw[j] != 0) {
+              is_zero = false;
+              break;
+            }
+          }
+          if (!is_zero) {
+            gidIdx = i;
+            found = true;
+            break;
+          }
+        }
+      }
+      if (!found) {
+        gidIdx = 0;  // fallback
+        SYSCALL_RETURN_ZERO(ibv_query_gid(context, config.portId, gidIdx, &gid));
+      }
+    } else {
+      SYSCALL_RETURN_ZERO(ibv_query_gid(context, config.portId, gidIdx, &gid));
+    }
     memcpy(endpoint.handle.eth.gid, gid.raw, 16);
+    endpoint.handle.eth.gidIdx = gidIdx;
   } else {
     assert(false && "unsupported link layer");
   }
@@ -132,8 +159,8 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
     union ibv_gid dgid;
     memcpy(dgid.raw, remote.eth.gid, 16);
     attr.ah_attr.grh.dgid = dgid;
-    attr.ah_attr.grh.sgid_index = 3;
-    attr.ah_attr.grh.hop_limit = 1;
+    attr.ah_attr.grh.sgid_index = local.eth.gidIdx;
+    attr.ah_attr.grh.hop_limit = 8;
   }
   flags = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
           IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER | IBV_QP_AV;
