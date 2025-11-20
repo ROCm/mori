@@ -99,7 +99,7 @@ struct InfiniBandEndpointHandle {
 struct EthernetEndpointHandle {
   uint8_t gid[16];
   uint8_t mac[ETHERNET_LL_SIZE];
-  int32_t gidIdx{0};
+  int32_t gidIdx{-1};
 
   constexpr bool operator==(const EthernetEndpointHandle& rhs) const noexcept {
     return std::equal(std::begin(gid), std::end(gid), std::begin(rhs.gid)) &&

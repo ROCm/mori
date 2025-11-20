@@ -109,10 +109,7 @@ struct TransferStatus {
   StatusCode Code() { return code.load(std::memory_order_acquire); }
   uint32_t CodeUint32() { return static_cast<uint32_t>(code.load(std::memory_order_acquire)); }
 
-  std::string Message() {
-    std::lock_guard<std::mutex> lock(msgMu);
-    return msg;
-  }
+  std::string Message() { return msg; }
 
   bool Init() { return Code() == StatusCode::INIT; }
   bool InProgress() { return Code() == StatusCode::IN_PROGRESS; }
