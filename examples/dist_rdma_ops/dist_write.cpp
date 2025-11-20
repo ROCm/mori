@@ -26,6 +26,7 @@
 #include "mori/application/application.hpp"
 #include "mori/application/utils/udma_barrier.h"
 #include "mori/core/core.hpp"
+#include "mori/application/topology/topology.hpp"
 
 using namespace mori;
 using namespace mori::application;
@@ -352,6 +353,49 @@ __global__ void MultiQpWrite(RdmaEndpoint* endpoints, RdmaMemoryRegion localMr,
   }
 }
 
+int GetGpuidByNicName(std::string nic_name) {
+  mori::application::TopoSystem sys{};
+  auto* gpuSys = sys.GetTopoSystemGpu();
+  auto* netSys = sys.GetTopoSystemNet();
+  auto* pciSys = sys.GetTopoSystemPci();
+
+  auto gpus = gpuSys->GetGpus();
+  auto nics = netSys->GetNics();
+
+  for (auto* gpu : gpus) {
+    assert(pciSys->Node(gpu->busId));
+    for (auto* nic : nics) {
+      assert(pciSys->Node(nic->busId));
+      auto* path = pciSys->Path(gpu->busId, nic->busId);
+      auto* gpuPci = pciSys->Node(gpu->busId);
+      auto* nicPci = pciSys->Node(nic->busId);
+      #if 0
+      if (!path) {     
+        printf("gpu %s nic %s no direct link\n", gpu->busId.String().c_str(),
+               nic->busId.String().c_str());
+      } else {
+        printf("gpu %s numa %d, nic %s name %s hops %zu speed %f numa %d\n",
+               gpu->busId.String().c_str(), gpuPci->NumaNode(), nic->busId.String().c_str(),
+               nic->name.c_str(), path->Hops(), nic->totalGbps, nicPci->NumaNode());
+      }
+      #endif
+    }
+  }
+
+  int gpu_id = 0;
+  std::vector<std::string> matches = sys.MatchAllGpusAndNics();
+  for (int i = 0; i < matches.size(); i++) {
+    auto* gpu = gpuSys->GetGpuByLogicalId(i);
+    //printf("gpu %d (%s) matches %s\n", i, gpu->busId.String().c_str(), matches[i].c_str());
+    if (nic_name.compare(matches[i].c_str()) == 0) {
+      gpu_id = i;
+      //printf("GetGpuidByNicName, nic_name:%s, gpu_id:%d\n", nic_name.c_str(), gpu_id);
+    }
+  }
+
+  return gpu_id;
+}
+
 void distRdmaOps(int argc, char* argv[]) {
   BenchmarkConfig args;
   args.readArgs(argc, argv);
@@ -372,15 +416,6 @@ void distRdmaOps(int argc, char* argv[]) {
   float milliseconds;
   int local_rank = bootNet.GetLocalRank();
   int world_size = bootNet.GetWorldSize();
-  if (local_rank == 0)
-    HIP_RUNTIME_CHECK(hipSetDevice(local_rank));
-  else
-    HIP_RUNTIME_CHECK(hipSetDevice(4));//hardcode for now
-
-  hipEvent_t start, end;
-  HIP_RUNTIME_CHECK(hipEventCreate(&start));
-  HIP_RUNTIME_CHECK(hipEventCreate(&end));
-  int num_qp = args.getNumQp();
 
   // RDMA initialization
   // 1 Create device
@@ -388,9 +423,15 @@ void distRdmaOps(int argc, char* argv[]) {
   RdmaDeviceList rdma_devices = rdma_context.GetRdmaDeviceList();
   ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(rdma_devices);
   RdmaDevice* device = activeDevicePortList[local_rank % activeDevicePortList.size()].first;
-  std::cout << "localRank " << local_rank << " select device " << device->Name() << std::endl;
-
   RdmaDeviceContext* device_context = device->CreateRdmaDeviceContext();
+  int gpu_id = GetGpuidByNicName(device->Name());
+  HIP_RUNTIME_CHECK(hipSetDevice(gpu_id));
+  std::cout << "localRank " << local_rank << " gpu id " << gpu_id << " select device " << device->Name() << std::endl;
+  
+  hipEvent_t start, end;
+  HIP_RUNTIME_CHECK(hipEventCreate(&start));
+  HIP_RUNTIME_CHECK(hipEventCreate(&end));
+  int num_qp = args.getNumQp();
 
   // 2 Create an endpoint
   RdmaEndpointConfig config;
