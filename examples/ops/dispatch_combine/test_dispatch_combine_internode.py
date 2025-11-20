@@ -864,8 +864,8 @@ def test_dispatch_combine(
         world_size,
         max_tokens,
         kernel_type,
-        torch.bfloat16,
-        # torch.float8_e4m3fnuz,
+        # torch.bfloat16,
+        torch.float8_e4m3fnuz,
     )
     test_case.setup()
     if cmd == "test":
