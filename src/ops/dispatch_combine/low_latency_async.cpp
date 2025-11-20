@@ -104,8 +104,6 @@ __global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
   for (int destPe = globalWarpId; (destPe < npes) && (destPe != myPe); destPe += globalWarpNum) {
     if (laneId == 0) shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
     int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
-    // if (laneId == 0)
-    //   printf("myPe %d send %d to destPe %d xfer %zu\n", myPe, tokenNum, destPe, xferBytes);
     size_t remoteOffset = (config.MaxNumTokensToSendPerRank() * myPe) * xferBytes;
     size_t localOffset = (config.MaxNumTokensToSendPerRank() * destPe) * xferBytes;
     shmem::ShmemPutMemNbiWarp(args.shmemDispatchInpTokMemObj, remoteOffset,
@@ -113,11 +111,12 @@ __global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
                               destPe);
     shmem::ShmemPutUint32ImmNbiWarp(args.recvTokenNumMemObj, myPe * sizeof(index_t), tokenNum + 1,
                                     destPe);
-
-    // args.recvTokenNumMemObj, myPe * sizeof(index_t), tokenNum + 1,
-    // core::atomicType::AMO_SET, destPe);
+    // shmem::ShmemQuietThread(destPe);
+    // shmem::ShmemPutMemNbiSignalWarp(args.shmemDispatchInpTokMemObj, remoteOffset,
+    //                                 args.shmemStagingTokMemObj, localOffset, tokenNum *
+    //                                 xferBytes, args.recvTokenNumMemObj, myPe * sizeof(index_t),
+    //                                 tokenNum + 1, core::atomicType::AMO_SET, destPe);
   }
-  //   __threadfence_system();
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -137,9 +136,9 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
       //   while (core::AtomicLoadRelaxedSystem(signal) == 0) {
       //     printf("myPe %d destPe %d\n", myPe, destPe);
       //   }
-      index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
-      core::AtomicStoreRelaxedSystem(signal, 0);
-      atomicAdd(args.totalRecvTokenNum, recvTokenNum);
+      //   index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
+      //   core::AtomicStoreRelaxedSystem(signal, 0);
+      //   atomicAdd(args.totalRecvTokenNum, recvTokenNum);
 
       // reset local counter
       args.destPeTokenCounter[destPe] = 0;
