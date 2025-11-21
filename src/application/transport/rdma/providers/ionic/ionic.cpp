@@ -53,7 +53,11 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
   cqeNum = config.maxCqeNum;
 
   memset(&cq_attr, 0, sizeof(struct ibv_cq_init_attr_ex));
+#ifdef IONIC_CCQE
+  cq_attr.cqe           = 0;
+#else
   cq_attr.cqe           = cqeNum * 2; //from rocshmem, send&recv?
+#endif
   cq_attr.cq_context    = nullptr;
   cq_attr.channel       = nullptr;
   cq_attr.comp_vector   = 0;
@@ -173,14 +177,13 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   wqeNum = config.maxMsgsNum;
   memset(&attr, 0, sizeof(struct ibv_qp_init_attr_ex));
   attr.cap.max_send_wr     = wqeNum;
-  attr.cap.max_recv_wr     = wqeNum;
   attr.cap.max_send_sge    = 1;
+  attr.cap.max_recv_wr     = 0;
+  attr.cap.max_recv_sge    = 0;
   attr.cap.max_inline_data = MAX_INLINE_SIZE;
   attr.sq_sig_all          = 0;
   attr.qp_type             = IBV_QPT_RC;
   attr.comp_mask           = IBV_QP_INIT_ATTR_PD;
-  attr.cap.max_send_sge    = 1; 
-  attr.cap.max_recv_sge    = 1; 
   attr.pd                  = pd_uxdma;
   attr.send_cq             = cq;
   attr.recv_cq             = cq;
@@ -209,11 +212,6 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   cq_dbval = dvcq.q.db_val;
   cq_mask = dvcq.q.mask;
   ionic_cq_buf = reinterpret_cast<ionic_v1_cqe*>(dvcq.q.ptr);
-
-#ifdef IONIC_CCQE
-  // XXX ABH collapsed cqe prototype
-  dvctx.db_ptr[dvctx.cq_qtype] = dvcq.q.db_val | 0xffff;
-#endif
 
   ionic_dv_qp dvqp;
   ionic_dv_get_qp(&dvqp, qp);
