@@ -73,7 +73,7 @@ typedef struct device_agent {
 
 class IonicQpContainer {
  public:
-  IonicQpContainer(ibv_context* context, const RdmaEndpointConfig& config, 
+  IonicQpContainer(ibv_context* context, const RdmaEndpointConfig& config,
                    ibv_cq* cq, ibv_pd* pd, IonicDeviceContext* device_context);
   ~IonicQpContainer();
 
@@ -86,7 +86,7 @@ class IonicQpContainer {
   void* GetSqAddress();
   void* GetMsntblAddress();
   void* GetRqAddress();
-  
+
   IonicDeviceContext* GetDeviceContext() { return device_context; }
 
  private:
@@ -106,7 +106,6 @@ class IonicQpContainer {
   char dev_name[24];
   ionic_dv_ctx dvctx;
   ibv_qp* qp{nullptr};
-  
   void* gpu_db_page{nullptr};
   uint64_t *db_page_u64{nullptr};
   uint64_t *gpu_db_page_u64{nullptr};
@@ -114,13 +113,12 @@ class IonicQpContainer {
   uint64_t *gpu_db_cq{nullptr};
   uint64_t *gpu_db_sq{nullptr};
   uint64_t *gpu_db_rq{nullptr};
-  
+
   ionic_dv_cq dvcq;
   uint64_t *cq_dbreg{nullptr};
   uint64_t cq_dbval{0};
   uint64_t cq_mask{0};
   struct ionic_v1_cqe *ionic_cq_buf{nullptr};
-  
   ionic_dv_qp dvqp;
   uint64_t *sq_dbreg{nullptr};
   uint64_t sq_dbval{0};
@@ -131,7 +129,7 @@ class IonicQpContainer {
   uint64_t rq_dbval{0};
   uint64_t rq_mask{0};
   struct ionic_v1_wqe *ionic_rq_buf{nullptr};
-  
+
   // Atomic internal buffer fields
   void* atomicIbufAddr{nullptr};
   size_t atomicIbufSize{0};
@@ -139,7 +137,7 @@ class IonicQpContainer {
 };
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                        BnxtDeviceContext                                       */
+/*                                       IonicDeviceContext                                       */
 /* ---------------------------------------------------------------------------------------------- */
 class IonicDeviceContext : public RdmaDeviceContext {
  public:

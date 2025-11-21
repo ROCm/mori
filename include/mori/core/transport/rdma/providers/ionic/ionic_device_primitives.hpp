@@ -277,7 +277,7 @@ inline __device__ uint64_t IonicPostWriteInline(WorkQueueHandle& wq, uint32_t cu
   __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
   #if 0
   printf("write inline, block:%u, warp:%u, lane:%u, wqe:%p, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n",
-	blockIdx.x, threadIdx.x/warpSize, __lane_id(),
+	 blockIdx.x, threadIdx.x/warpSize, __lane_id(),
          wqe, curPostIdx, curPostIdx, ((curPostIdx + 1) & (wqeNum - 1)));
   #endif
   //asm volatile("" ::: "memory");
@@ -374,6 +374,7 @@ inline __device__ uint64_t IonicPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t c
   wqe->atomic_v2.lkey = HTOBE32(lkey);
 
   __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+
   #if 0
   printf("atomic,block:%u, warp:%u, lane:%u, wqe:%p, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n",
 	 blockIdx.x, threadIdx.x/warpSize, __lane_id(),
@@ -545,7 +546,6 @@ inline __device__ int PollCqOnce<ProviderType::PSD>(void* cqeAddr, uint32_t cqeN
     uint32_t flag = qtf & 0xf;
     uint32_t status = cqe->status_length;
     uint64_t npg = cqe->send.npg_wqe_idx_timestamp & IONIC_V1_CQE_WQE_IDX_MASK;
-
     printf("QUIET ERROR: qid %u type %u flag %#x status %u msn %u npg %lu\n",
            qid, type, flag, status, msn, npg);
     return HTOBE32(cqe->status_length);
@@ -556,7 +556,6 @@ inline __device__ int PollCqOnce<ProviderType::PSD>(void* cqeAddr, uint32_t cqeN
   return 0;
 }
 #endif
-
 template <>
 inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx) {
   const uint32_t curConsIdx = atomicAdd(consIdx, 1);
@@ -635,7 +634,6 @@ inline __device__ void PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHan
   uint32_t cqeIdx = my_cq_pos & (cqeNum - 1);
   char* Addr = reinterpret_cast<char *>(cqeAddr) + (cqeIdx * sizeof(struct ionic_v1_cqe));
 
-  //asm volatile("" ::: "memory");
   struct ionic_v1_cqe* cqe = reinterpret_cast<ionic_v1_cqe*>(Addr);
   #if 0
   printf("PollCqOnce2, block:%u, warp:%u, lane:%u, consIdx:%u, cqeIdx:%u, cqeAddr:%p, qtf_be:0x%08x, cqe->status_length:%d, msn:%u\n",
@@ -666,7 +664,7 @@ inline __device__ void PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHan
            blockIdx.x, threadIdx.x/warpSize, __lane_id(), my_cq_pos, cqeIdx, Addr,
            *(volatile uint32_t *)(&cqe->qid_type_flags), BE32TOH(cqe->status_length), BE32TOH(cqe->send.msg_msn));
     #endif
-    return;// CQE just not ready yet, try again
+   return;// CQE just not ready yet, try again
   }
 
   uint32_t msn = BE32TOH(cqe->send.msg_msn);
@@ -693,6 +691,7 @@ inline __device__ void PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHan
     /* No other way to signal an error, so just crash. */
     abort();
   }
+
   #if 0
   printf("PollCqOnce2, success, block:%u, warp:%u, lane:%u, qp:%u, cqeAddr:%p, my_cq_pos:%u, cqeNum:%u, msn:%u\n",
           blockIdx.x, threadIdx.x/warpSize, __lane_id(),
@@ -779,8 +778,6 @@ inline __device__ int PollCq<ProviderType::PSD>(WorkQueueHandle& wqHandle, Compl
   return 0;
 }
 #endif
-
-
 
 template <>
 inline __device__ void UpdateCqDbrRecord<ProviderType::PSD>(CompletionQueueHandle& cq, void* dbrRecAddr, uint32_t cons_idx,
