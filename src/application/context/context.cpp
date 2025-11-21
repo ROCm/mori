@@ -217,7 +217,7 @@ void Context::InitializePossibleTransports() {
     // Create multiple QPs for this peer
     application::RdmaEndpointConfig config;
     config.portId = portId;
-    config.gidIdx = 3;
+    config.gidIdx = -1;  // auto detect
     config.maxMsgsNum = 4096;
 #ifdef ENABLE_BNXT
     config.maxCqeNum = 4096;

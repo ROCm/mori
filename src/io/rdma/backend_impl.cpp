@@ -24,7 +24,6 @@
 #include <sys/epoll.h>
 
 #include <algorithm>
-#include <chrono>
 #include <shared_mutex>
 
 #include "mori/io/logging.hpp"
@@ -55,10 +54,14 @@ std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
         return {{i, 1}};
       }
     }
-  } else {
-    assert("topo searching for device other than GPU is not implemented yet");
-    return {};
+  } else if (key.loc == MemoryLocationType::CPU) {
+    static std::atomic<int> roundRobinCounter{0};
+    if (!availDevices.empty()) {
+      int idx = roundRobinCounter.fetch_add(1) % availDevices.size();
+      return {{idx, 1}};
+    }
   }
+  assert("topo searching for device other than CPU/GPU is not implemented yet");
   return {};
 }
 
@@ -132,13 +135,13 @@ EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
 application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int portId) {
   application::RdmaEndpointConfig config;
   config.portId = portId;
-  config.gidIdx = 3;
+  config.gidIdx = -1;
   config.maxMsgsNum = 8192;
   config.maxMsgSge = 1;
   config.maxCqeNum = 8192;
   config.alignment = PAGESIZE;
   config.withCompChannel = true;
-  config.enableSrq = true;
+  config.enableSrq = false;
   return config;
 }
 
@@ -210,27 +213,28 @@ void NotifManager::RegisterEndpointByQpn(uint32_t qpn) {
     assert(ep.has_value() && ep->local.ibvHandle.compCh);
     SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_ADD, ep->local.ibvHandle.compCh->fd, &ev));
   }
-}
 
-void NotifManager::RegisterDevice(int devId) {
   std::lock_guard<std::mutex> lock(mu);
-  if (notifCtx.find(devId) != notifCtx.end()) return;
+  if (qpNotifCtx.find(qpn) != qpNotifCtx.end()) return;
 
-  application::RdmaDeviceContext* devCtx = rdma->GetRdmaDeviceContext(devId);
+  std::optional<EpPair> ep = rdma->GetEpPairByQpn(qpn);
+  assert(ep.has_value());
+
+  application::RdmaDeviceContext* devCtx = rdma->GetRdmaDeviceContext(ep->ldevId);
   assert(devCtx);
 
   void* buf;
   SYSCALL_RETURN_ZERO(
-      posix_memalign(reinterpret_cast<void**>(&buf), PAGESIZE, maxNotifNum * sizeof(NotifMessage)));
+      posix_memalign(reinterpret_cast<void**>(&buf), PAGESIZE, notifPerQp * sizeof(NotifMessage)));
   application::RdmaMemoryRegion mr =
-      devCtx->RegisterRdmaMemoryRegion(buf, maxNotifNum * sizeof(NotifMessage));
-  struct ibv_srq* srq = devCtx->GetIbvSrq();
-  assert(srq);
-  notifCtx.insert({devId, {srq, mr}});
+      devCtx->RegisterRdmaMemoryRegion(buf, notifPerQp * sizeof(NotifMessage));
 
-  // Pre post notification receive wr
-  // TODO: should use min(maxNotifNum, maxSrqWrNum)
-  for (uint64_t i = 0; i < maxNotifNum; i++) {
+  qpNotifCtx.insert({qpn, {mr, buf}});
+
+  struct ibv_qp* qp = ep->local.ibvHandle.qp;
+  assert(qp);
+
+  for (uint64_t i = 0; i < notifPerQp; i++) {
     struct ibv_sge sge{};
     sge.addr = mr.addr + i * sizeof(NotifMessage);
     sge.length = sizeof(NotifMessage);
@@ -242,8 +246,8 @@ void NotifManager::RegisterDevice(int devId) {
     wr.num_sge = 1;
 
     struct ibv_recv_wr* bad = nullptr;
-    SYSCALL_RETURN_ZERO(ibv_post_srq_recv(srq, &wr, &bad));
-  };
+    SYSCALL_RETURN_ZERO(ibv_post_recv(qp, &wr, &bad));
+  }
 }
 
 void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
@@ -253,10 +257,9 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
   while (ibv_poll_cq(cq, 1, &wc) > 0) {
     if (wc.opcode == IBV_WC_RECV) {
       std::lock_guard<std::mutex> lock(mu);
-      int devId = ep.ldevId;
 
-      assert(notifCtx.find(devId) != notifCtx.end());
-      DeviceNotifContext& ctx = notifCtx[devId];
+      assert(qpNotifCtx.find(qpn) != qpNotifCtx.end());
+      QpNotifContext& ctx = qpNotifCtx[qpn];
 
       // FIXME: this notif mechenism has bug when notif index is wrapped around
       uint64_t idx = wc.wr_id;
@@ -273,10 +276,6 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
           "NotifManager receive notif message from engine {} id {} qp {} total num {} cur num {}",
           ekey.c_str(), msg.id, msg.qpIndex, msg.totalNum, notifPool[ekey][msg.id]);
       // replenish recv wr
-      // TODO(ditian12): we should replenish recv wr faster, insufficient recv wr is met
-      // frequently when transfer is very fast. Two way to solve this, 1. use srq_limit to
-      // replenish in advance
-      // 2. independent srq entry config (now reuse maxMsgNum)
       struct ibv_sge sge{};
       sge.addr = ctx.mr.addr + idx * sizeof(NotifMessage);
       sge.length = sizeof(NotifMessage);
@@ -287,22 +286,23 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
       wr.sg_list = &sge;
       wr.num_sge = 1;
       struct ibv_recv_wr* bad = nullptr;
-      SYSCALL_RETURN_ZERO(ibv_post_srq_recv(ctx.srq, &wr, &bad));
+      SYSCALL_RETURN_ZERO(ibv_post_recv(ep.local.ibvHandle.qp, &wr, &bad));
     } else if (wc.opcode == IBV_WC_SEND) {
       uint64_t id = wc.wr_id;
     } else {
       CqCallbackMessage* msg = reinterpret_cast<CqCallbackMessage*>(wc.wr_id);
       uint32_t lastBatchSize = msg->meta->finishedBatchSize.fetch_add(msg->batchSize);
-      if (msg->meta->status != nullptr) {
+      TransferStatus* statusPtr = msg->meta->status;
+      if (statusPtr != nullptr) {
         if (wc.status == IBV_WC_SUCCESS) {
           if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
             // TODO: should use atomic cas to avoid overwriting failed status
-            msg->meta->status->SetCode(StatusCode::SUCCESS);
-            msg->meta->status->SetMessage(ibv_wc_status_str(wc.status));
+            statusPtr->SetMessage(ibv_wc_status_str(wc.status));
+            statusPtr->SetCode(StatusCode::SUCCESS);
           }
         } else {
-          msg->meta->status->SetCode(StatusCode::ERR_RDMA_OP);
-          msg->meta->status->SetMessage(ibv_wc_status_str(wc.status));
+          statusPtr->SetMessage(ibv_wc_status_str(wc.status));
+          statusPtr->SetCode(StatusCode::ERR_RDMA_OP);
           // set status to nullptr indicate that transfer failed
           msg->meta->status = nullptr;
         }
@@ -310,12 +310,14 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
       MORI_IO_TRACE(
           "NotifManager receive cqe for task {} code {} total batch size {} last batch size {} cur "
           "batch size {}",
-          msg->meta->id, msg->meta->status->CodeUint32(), msg->meta->totalBatchSize, lastBatchSize,
-          msg->batchSize);
+          msg->meta->id,
+          statusPtr != nullptr ? statusPtr->CodeUint32()
+                               : static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
+          msg->meta->totalBatchSize, lastBatchSize, msg->batchSize);
       if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
-        free(msg->meta);
+        delete msg->meta;
       }
-      free(msg);
+      delete msg;
     }
   }
 }
@@ -428,7 +430,6 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo) {
 
   rdma->ConnectEndpoint(ekey, devId, lep, msg.devId, msg.eph, topo, weight);
   notif->RegisterEndpointByQpn(lep.handle.qpn);
-  notif->RegisterDevice(devId);
   ctx->CloseEndpoint(tcph);
 }
 
@@ -490,7 +491,6 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
       p.WriteMessageRegEndpoint(MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle});
       rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
       notif->RegisterEndpointByQpn(lep.handle.qpn);
-      notif->RegisterDevice(devId);
       SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL));
       break;
     }
@@ -584,8 +584,8 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
 
   assert(!ret.Init());
   if (ret.Failed() || ret.Succeeded()) {
-    status->SetCode(ret.code);
     status->SetMessage(ret.message);
+    status->SetCode(ret.code);
   }
   if (!ret.Failed()) {
     RdmaNotifyTransfer(eps, status, id);
@@ -609,8 +609,8 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   }
   assert(!ret.Init());
   if (ret.Failed() || ret.Succeeded()) {
-    status->SetCode(ret.code);
     status->SetMessage(ret.message);
+    status->SetCode(ret.code);
   }
   if (!ret.Failed()) {
     RdmaNotifyTransfer(eps, status, id);

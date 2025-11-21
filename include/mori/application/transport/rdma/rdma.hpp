@@ -78,7 +78,7 @@ static constexpr size_t ATOMIC_IBUF_SLOT_SIZE = 8;  // Each atomic ibuf slot is 
 /* -------------------------------------------------------------------------- */
 struct RdmaEndpointConfig {
   uint32_t portId{1};
-  uint32_t gidIdx{3};  // TODO: auto detect?
+  int32_t gidIdx{-1};  // -1 means auto detect
   uint32_t maxMsgsNum{128};
   uint32_t maxCqeNum{128};
   uint32_t maxMsgSge{1};
@@ -99,10 +99,11 @@ struct InfiniBandEndpointHandle {
 struct EthernetEndpointHandle {
   uint8_t gid[16];
   uint8_t mac[ETHERNET_LL_SIZE];
+  int32_t gidIdx{-1};
 
   constexpr bool operator==(const EthernetEndpointHandle& rhs) const noexcept {
     return std::equal(std::begin(gid), std::end(gid), std::begin(rhs.gid)) &&
-           std::equal(std::begin(mac), std::end(mac), std::begin(rhs.mac));
+           std::equal(std::begin(mac), std::end(mac), std::begin(rhs.mac)) && gidIdx == rhs.gidIdx;
   }
 };
 
@@ -294,6 +295,7 @@ static std::ostream& operator<<(std::ostream& s,
   for (int i = 0; i < sizeof(handle.mac); i++) {
     ss << int(handle.mac[i]);
   }
+  ss << ", gidIdx: " << std::dec << handle.gidIdx;
   s << ss.str();
   return s;
 }
