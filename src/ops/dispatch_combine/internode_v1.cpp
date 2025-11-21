@@ -266,11 +266,19 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
           index_t tokenNum = std::min(tokenId + warpSize, endTokenIdx) - tokenId;
           size_t stagingTokOffset = tokenId * xferBytes;
           int qpId = (tokenId / warpSize) % config.numQpPerPe;
-          shmem::ShmemPutMemNbiSignalThread(args.shmemDispatchInpTokMemObj, remoteIdx * xferBytes,
-                                            args.shmemStagingTokMemObj, stagingTokOffset,
-                                            tokenNum * xferBytes, args.interNodeChunkFlagMemObj,
+          // shmem::ShmemPutMemNbiSignalThread(args.shmemDispatchInpTokMemObj, remoteIdx *
+          // xferBytes,
+          //                                   args.shmemStagingTokMemObj, stagingTokOffset,
+          //                                   tokenNum * xferBytes, args.interNodeChunkFlagMemObj,
+          //                                   (myNode * maxChunkNum + flagSlotId) *
+          //                                   sizeof(uint64_t), tokenNum + 1,
+          //                                   core::atomicType::AMO_SET, proxyPe, qpId);
+          shmem::ShmemPutMemNbiThread(args.shmemDispatchInpTokMemObj, remoteIdx * xferBytes,
+                                      args.shmemStagingTokMemObj, stagingTokOffset,
+                                      tokenNum * xferBytes, proxyPe, qpId);
+          shmem::ShmemPutUint64ImmNbiThread(args.interNodeChunkFlagMemObj,
                                             (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
-                                            tokenNum + 1, core::atomicType::AMO_SET, proxyPe, qpId);
+                                            tokenNum + 1, proxyPe, qpId);
         }
         if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
       }
