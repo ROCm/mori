@@ -480,7 +480,7 @@ inline __device__ void UpdateDbrAndRingDbRecv<ProviderType::PSD>(void* dbrRecAdd
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Completion Queue                                        */
 /* ---------------------------------------------------------------------------------------------- */
-#ifdef IONIC_CCQE
+#if defined(IONIC_CCQE) && IONIC_CCQE == 1
 template <>
 inline __device__ int PollCqOnce<ProviderType::PSD>(void* cqeAddr, uint32_t cqeNum,
                                                     uint32_t consIdx, uint32_t* wqeIdx) {
@@ -607,7 +607,7 @@ inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum,
   return 0;
 }
 
-#ifdef IONIC_CCQE
+#if defined(IONIC_CCQE) && IONIC_CCQE == 1
 inline __device__ void PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
                                    uint64_t activemask, void* cqeAddr, uint32_t cqeNum, uint32_t consIdx) {
   volatile struct ionic_v1_cqe* cqe = reinterpret_cast<ionic_v1_cqe*>(cqeAddr);
@@ -682,7 +682,7 @@ inline __device__ void PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHan
 
     printf("QUIET ERROR: qid %u type %u flag %#x status %u msn %u npg %lu\n",
            qid, type, flag, status, msn, npg);
-    #if 1
+    #if 0
     printf("dump cqe at addr:%p\n", Addr);
     for (int i = 0; i < 32; i++) {
       printf("%02x", (unsigned char)Addr[i]);
@@ -728,7 +728,7 @@ inline __device__ void PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHan
 }
 #endif
 
-#ifdef IONIC_CCQE
+#if defined(IONIC_CCQE) && IONIC_CCQE == 1
 template <>
 inline __device__ int PollCq<ProviderType::PSD>(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
                                                 void* cqAddr, uint32_t cqeNum, uint32_t* consIdx, uint16_t* wqeCounter)
