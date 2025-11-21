@@ -504,7 +504,7 @@ IonicDevice::~IonicDevice() {}
 RdmaDeviceContext* IonicDevice::CreateRdmaDeviceContext() {
   ibv_pd* pd = ibv_alloc_pd(defaultContext);
   assert(pd);
-  printf("IonicDevice::CreateRdmaDeviceContext, defaultContext:%p, pd:%p\n", defaultContext, pd)
+  printf("IonicDevice::CreateRdmaDeviceContext, defaultContext:%p, pd:%p\n", defaultContext, pd);
 
   return new IonicDeviceContext(this, defaultContext, pd);
 }
