@@ -136,7 +136,7 @@ class NotifManager {
     void* buf;
   };
 
-  uint32_t notifPerQp{128};
+  uint32_t notifPerQp{1024};
   std::unordered_map<uint32_t, QpNotifContext> qpNotifCtx;
   std::unordered_map<EngineKey, std::unordered_map<TransferUniqueId, int>> notifPool;
 

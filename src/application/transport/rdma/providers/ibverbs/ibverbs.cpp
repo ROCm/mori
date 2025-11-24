@@ -171,7 +171,9 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   attr.dest_qp_num = remote.qpn;
   attr.rq_psn = 0;
   attr.max_dest_rd_atomic = devAttr->orig_attr.max_qp_rd_atom;
-  attr.min_rnr_timer = 12;
+  // Set min_rnr_timer to 20 (approx 4.19 ms) to allow receiver more time to replenish buffers
+  // Default was 12 (0.64 ms) which causes RNR exhaustion too quickly under burst
+  attr.min_rnr_timer = 20;
   attr.ah_attr.sl = 0;
   attr.ah_attr.src_path_bits = 0;
   attr.ah_attr.port_num = local.portId;
@@ -184,7 +186,7 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
     memcpy(dgid.raw, remote.eth.gid, 16);
     attr.ah_attr.grh.dgid = dgid;
     attr.ah_attr.grh.sgid_index = local.eth.gidIdx;
-    attr.ah_attr.grh.hop_limit = 1;
+    attr.ah_attr.grh.hop_limit = 16;
   }
   flags = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
           IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER | IBV_QP_AV;
@@ -193,10 +195,11 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   // RTS
   attr.qp_state = IBV_QPS_RTS;
   attr.sq_psn = 0;
-  attr.timeout = 14;
+  attr.timeout = 20;
   attr.retry_cnt = 7;
-  attr.rnr_retry = 7;
+  attr.rnr_retry = 6;
   attr.max_rd_atomic = devAttr->orig_attr.max_qp_init_rd_atom;
+
   flags = IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
           IBV_QP_MAX_QP_RD_ATOMIC;
   SYSCALL_RETURN_ZERO(ibv_modify_qp(qp, &attr, flags));

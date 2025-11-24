@@ -253,71 +253,81 @@ void NotifManager::RegisterEndpointByQpn(uint32_t qpn) {
 void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
   ibv_cq* cq = ep.local.ibvHandle.cq;
 
-  struct ibv_wc wc{};
-  while (ibv_poll_cq(cq, 1, &wc) > 0) {
-    if (wc.opcode == IBV_WC_RECV) {
-      std::lock_guard<std::mutex> lock(mu);
+  const int batchSize = 32;
+  struct ibv_wc wc[batchSize];
+  int n = 0;
 
-      assert(qpNotifCtx.find(qpn) != qpNotifCtx.end());
-      QpNotifContext& ctx = qpNotifCtx[qpn];
+  while ((n = ibv_poll_cq(cq, batchSize, wc)) > 0) {
+    for (int i = 0; i < n; ++i) {
+      if (wc[i].opcode == IBV_WC_RECV) {
+        std::lock_guard<std::mutex> lock(mu);
 
-      // FIXME: this notif mechenism has bug when notif index is wrapped around
-      uint64_t idx = wc.wr_id;
-      NotifMessage msg = reinterpret_cast<NotifMessage*>(ctx.mr.addr)[idx];
-      assert(msg.totalNum > 0);
-      // printf("recv notif for transfer %d\n", tid);
+        assert(qpNotifCtx.find(qpn) != qpNotifCtx.end());
+        QpNotifContext& ctx = qpNotifCtx[qpn];
 
-      EngineKey ekey = ep.remoteEngineKey;
-      if (notifPool[ekey].find(msg.id) == notifPool[ekey].end()) {
-        notifPool[ekey][msg.id] = msg.totalNum;
-      }
-      notifPool[ekey][msg.id] -= 1;
-      MORI_IO_TRACE(
-          "NotifManager receive notif message from engine {} id {} qp {} total num {} cur num {}",
-          ekey.c_str(), msg.id, msg.qpIndex, msg.totalNum, notifPool[ekey][msg.id]);
-      // replenish recv wr
-      struct ibv_sge sge{};
-      sge.addr = ctx.mr.addr + idx * sizeof(NotifMessage);
-      sge.length = sizeof(NotifMessage);
-      sge.lkey = ctx.mr.lkey;
+        // FIXME: this notif mechenism has bug when notif index is wrapped around
+        uint64_t idx = wc[i].wr_id;
+        NotifMessage msg = reinterpret_cast<NotifMessage*>(ctx.mr.addr)[idx];
+        assert(msg.totalNum > 0);
+        // printf("recv notif for transfer %d\n", tid);
 
-      struct ibv_recv_wr wr{};
-      wr.wr_id = idx;
-      wr.sg_list = &sge;
-      wr.num_sge = 1;
-      struct ibv_recv_wr* bad = nullptr;
-      SYSCALL_RETURN_ZERO(ibv_post_recv(ep.local.ibvHandle.qp, &wr, &bad));
-    } else if (wc.opcode == IBV_WC_SEND) {
-      uint64_t id = wc.wr_id;
-    } else {
-      CqCallbackMessage* msg = reinterpret_cast<CqCallbackMessage*>(wc.wr_id);
-      uint32_t lastBatchSize = msg->meta->finishedBatchSize.fetch_add(msg->batchSize);
-      TransferStatus* statusPtr = msg->meta->status;
-      if (statusPtr != nullptr) {
-        if (wc.status == IBV_WC_SUCCESS) {
-          if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
-            // TODO: should use atomic cas to avoid overwriting failed status
-            statusPtr->SetMessage(ibv_wc_status_str(wc.status));
-            statusPtr->SetCode(StatusCode::SUCCESS);
-          }
-        } else {
-          statusPtr->SetMessage(ibv_wc_status_str(wc.status));
-          statusPtr->SetCode(StatusCode::ERR_RDMA_OP);
-          // set status to nullptr indicate that transfer failed
-          msg->meta->status = nullptr;
+        EngineKey ekey = ep.remoteEngineKey;
+        if (notifPool[ekey].find(msg.id) == notifPool[ekey].end()) {
+          notifPool[ekey][msg.id] = msg.totalNum;
         }
+        notifPool[ekey][msg.id] -= 1;
+        MORI_IO_TRACE(
+            "NotifManager receive notif message from engine {} id {} qp {} total num {} cur num {}",
+            ekey.c_str(), msg.id, msg.qpIndex, msg.totalNum, notifPool[ekey][msg.id]);
+        // replenish recv wr
+        struct ibv_sge sge{};
+        sge.addr = ctx.mr.addr + idx * sizeof(NotifMessage);
+        sge.length = sizeof(NotifMessage);
+        sge.lkey = ctx.mr.lkey;
+
+        struct ibv_recv_wr wr{};
+        wr.wr_id = idx;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        struct ibv_recv_wr* bad = nullptr;
+        SYSCALL_RETURN_ZERO(ibv_post_recv(ep.local.ibvHandle.qp, &wr, &bad));
+      } else if (wc[i].opcode == IBV_WC_SEND) {
+        uint64_t id = wc[i].wr_id;
+        if (wc[i].status != IBV_WC_SUCCESS) {
+          MORI_IO_ERROR("NotifManager receive send cqe failed for wr_id {} status {}: {}", id,
+                        wc[i].status, ibv_wc_status_str(wc[i].status));
+        }
+      } else {
+        CqCallbackMessage* msg = reinterpret_cast<CqCallbackMessage*>(wc[i].wr_id);
+        uint32_t lastBatchSize = msg->meta->finishedBatchSize.fetch_add(msg->batchSize);
+        TransferStatus* statusPtr = msg->meta->status;
+        if (statusPtr != nullptr) {
+          if (wc[i].status == IBV_WC_SUCCESS) {
+            if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
+              // TODO: should use atomic cas to avoid overwriting failed status
+              statusPtr->SetMessage(ibv_wc_status_str(wc[i].status));
+              statusPtr->SetCode(StatusCode::SUCCESS);
+            }
+          } else {
+            statusPtr->SetMessage(ibv_wc_status_str(wc[i].status));
+            statusPtr->SetCode(StatusCode::ERR_RDMA_OP);
+            // set status to nullptr indicate that transfer failed
+            msg->meta->status = nullptr;
+          }
+        }
+        MORI_IO_TRACE(
+            "NotifManager receive cqe for task {} code {} total batch size {} last batch size {} "
+            "cur "
+            "batch size {}",
+            msg->meta->id,
+            statusPtr != nullptr ? statusPtr->CodeUint32()
+                                 : static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
+            msg->meta->totalBatchSize, lastBatchSize, msg->batchSize);
+        if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
+          delete msg->meta;
+        }
+        delete msg;
       }
-      MORI_IO_TRACE(
-          "NotifManager receive cqe for task {} code {} total batch size {} last batch size {} cur "
-          "batch size {}",
-          msg->meta->id,
-          statusPtr != nullptr ? statusPtr->CodeUint32()
-                               : static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
-          msg->meta->totalBatchSize, lastBatchSize, msg->batchSize);
-      if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
-        delete msg->meta;
-      }
-      delete msg;
     }
   }
 }
@@ -488,9 +498,9 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
       int rdevId = msg.devId;
       auto [devId, weight] = candidates[0];
       application::RdmaEndpoint lep = rdma->CreateEndpoint(devId);
-      p.WriteMessageRegEndpoint(MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle});
       rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
       notif->RegisterEndpointByQpn(lep.handle.qpn);
+      p.WriteMessageRegEndpoint(MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle});
       SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL));
       break;
     }
@@ -588,7 +598,11 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
     status->SetCode(ret.code);
   }
   if (!ret.Failed()) {
-    RdmaNotifyTransfer(eps, status, id);
+    RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
+    if (notifRet.Failed()) {
+      status->SetMessage(notifRet.message);
+      status->SetCode(notifRet.code);
+    }
   }
 }
 
@@ -613,7 +627,11 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
     status->SetCode(ret.code);
   }
   if (!ret.Failed()) {
-    RdmaNotifyTransfer(eps, status, id);
+    RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
+    if (notifRet.Failed()) {
+      status->SetMessage(notifRet.message);
+      status->SetCode(notifRet.code);
+    }
   }
 }
 
