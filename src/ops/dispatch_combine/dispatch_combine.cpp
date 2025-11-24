@@ -370,7 +370,8 @@ void EpDispatchCombineHandle::LaunchDispatchSend(KernelType kernelType, int bloc
 void EpDispatchCombineHandle::LaunchDispatchRecv(KernelType kernelType, int blockNum,
                                                  int warpPerBlock, hipStream_t stream) {
   size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
-  dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
+  size_t actualBlockNum = (blockNum <= 0) ? config.blockNum : blockNum;
+  dim3 grid(actualBlockNum);
   dim3 block(warpSize * actualWarpNumPerBlock);
 
   size_t sharedMemSize =
@@ -384,6 +385,7 @@ void EpDispatchCombineHandle::LaunchDispatchRecv(KernelType kernelType, int bloc
         using DataT = typename ArgsT::data_type;
         if (kernelType == KernelType::AsyncLL) {
           assert(config.useExternalInpBuffer);
+          assert((actualBlockNum % config.worldSize) == 0);
           EpDispatchLowLatencyAsyncRecv<<<grid, block, sharedMemSize, stream>>>(args);
         } else {
           assert(false);

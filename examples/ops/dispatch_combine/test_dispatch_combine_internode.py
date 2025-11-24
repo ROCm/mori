@@ -62,7 +62,7 @@ class EpDispatchCombineTestCase:
             max_num_inp_token_per_rank=(max_tokens + 63) // 64 * 64,
             num_experts_per_rank=16,
             num_experts_per_token=8,
-            warp_num_per_block=8,
+            warp_num_per_block=16,
             block_num=64,
             max_token_type_size=2,
             kernel_type=kernel_type_map[kernel_type],
@@ -562,30 +562,50 @@ class EpDispatchCombineTestCase:
             all_rank_scales,
         ) = test_data
 
-        for i in range(0):
+        for i in range(1):
             (
                 dispatch_output,
                 dispatch_weights,
                 dispatch_scales,
                 dispatch_indices,
                 dispatch_recv_num_token,
-            ) = op.dispatch(
+            ) = op.dispatch_send(
                 all_rank_input[self.rank],
                 all_rank_weights[self.rank],
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
             )
-            torch.cuda.synchronize()
-            total_recv_num_token = dispatch_recv_num_token[0].item()
-            combine_output, _ = op.combine(
-                dispatch_output,
-                dispatch_weights,
-                # None,
-                all_rank_indices[self.rank],
-            )
+            op.dispatch_recv()
             torch.cuda.synchronize()
 
-        total_recv_num_token = 1
+            # (
+            #     dispatch_output,
+            #     dispatch_weights,
+            #     dispatch_scales,
+            #     dispatch_indices,
+            #     dispatch_recv_num_token,
+            # ) = op.dispatch(
+            #     all_rank_input[self.rank],
+            #     all_rank_weights[self.rank],
+            #     all_rank_scales[self.rank],
+            #     all_rank_indices[self.rank],
+            #     block_num=self.config.block_num,
+            #     warp_per_block=16,
+            # )
+            # torch.cuda.synchronize()
+            # total_recv_num_token = dispatch_recv_num_token[0].item()
+            # combine_output, _ = op.combine(
+            #     dispatch_output,
+            #     dispatch_weights,
+            #     # None,
+            #     all_rank_indices[self.rank],
+            #     block_num=self.config.block_num,
+            #     warp_per_block=16,
+            # )
+            # torch.cuda.synchronize()
+
+        # total_recv_num_token = 1
+        total_recv_num_token = dispatch_recv_num_token[0]
         total_rdma_recv_num_token = (
             self.config.max_num_inp_token_per_rank * self.config.world_size // 8
         )
