@@ -364,12 +364,12 @@ inline EpDispatchCombineArgsVariant GetEpDispatchCombineArgsByInputType(
       return GetEpDispatchCombineArgs<float>(handle);
     case HIP_R_16BF:
       return GetEpDispatchCombineArgs<hip_bfloat16>(handle);
-    case HIP_R_8F_E4M3:
 #ifdef MORI_FP8_TYPE_OCP_ENABLED
+    case HIP_R_8F_E4M3:
       return GetEpDispatchCombineArgs<__hip_fp8_e4m3>(handle);
 #endif
-    case HIP_R_8F_E4M3_FNUZ:
 #ifdef MORI_FP8_TYPE_FNUZ_ENABLED
+    case HIP_R_8F_E4M3_FNUZ:
       return GetEpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>(handle);
 #endif
     default:

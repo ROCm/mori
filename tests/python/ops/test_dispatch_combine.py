@@ -21,7 +21,7 @@
 # SOFTWARE.
 import pytest
 import mori
-from tests.python.utils import TorchDistProcessManager
+from tests.python.utils import TorchDistProcessManager, data_type_supported
 import torch
 import torch.distributed as dist
 
@@ -300,8 +300,15 @@ def _test_dispatch_combine(
         pytest.param(
             torch.float8_e4m3fnuz,
             marks=pytest.mark.skipif(
-                data_type_supported(torch.float8_e4m3fnuz),
+                not data_type_supported(torch.float8_e4m3fnuz),
                 reason="Skip float8_e4m3fnuz, it is not supported",
+            ),
+        ),
+        pytest.param(
+            torch.float8_e4m3fn,
+            marks=pytest.mark.skipif(
+                not data_type_supported(torch.float8_e4m3fn),
+                reason="Skip float8_e4m3fn, it is not supported",
             ),
         ),
     ),
