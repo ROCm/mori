@@ -68,12 +68,8 @@ __global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
 
     if (laneId == 0) {
       // decide token id in dest pe
-      atomicAdd(args.destPeTokenCounter + destPe, 1);
+      destTokId = atomicAdd(args.destPeTokenCounter + destPe, 1);
       args.dispDestTokIdMap[i] = destPe * config.MaxNumTokensToSend() + destTokId;
-
-      // TODO: use a switch to control the writing of this buffer, should only turn on for testing
-      //   args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
-      //       myPe * config.maxNumInpTokenPerRank + srcTokId;
     }
     destTokId = __shfl(destTokId, 0);
 
@@ -94,15 +90,15 @@ __global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
       core::WarpCopy<uint8_t, 4>(
           stagingPtr + stagingTokOffset + hiddenBytes + indexBytes + weightBytes,
           reinterpret_cast<uint8_t*>(args.scalesBuf) + srcTokId * scaleBytes, scaleBytes);
-    if (laneId == 0)
+    if (laneId == 0) {
       reinterpret_cast<index_t*>(stagingPtr + stagingTokOffset + hiddenBytes + indexBytes +
                                  weightBytes + scaleBytes)[0] =
           srcTokId + config.rank * config.maxNumInpTokenPerRank;
+    }
   }
   if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
-  for (int destPe = blockId; (destPe < npes) && (destPe != myPe) && (warpId == 0);
-       destPe += blockNum) {
+  for (int destPe = blockId; (destPe < npes) && (warpId == 0); destPe += blockNum) {
     if (laneId == 0) shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
     int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
     size_t remoteOffset = (config.MaxNumTokensToSendPerRank() * myPe) * xferBytes;
@@ -134,34 +130,48 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   // Polling recv token number signal
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   index_t recvTokenNum = 0;
-  if ((laneId == 0) && (destPe != myPe)) {
+  if (laneId == 0) {
     recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(recvTokenNums + destPe, 0) - 1;
   }
   recvTokenNum = __shfl(recvTokenNum, 0);
 
   // Copy data
-  if (destPe != myPe) {
-    uint8_t* stagingPtr = args.shmemDispatchInpTokMemObj->template GetAs<uint8_t*>() +
-                          (config.MaxNumTokensToSendPerRank() * destPe) * xferBytes;
-    for (int tokenId = (blockId % blocksPerPe) * warpNum + warpId; tokenId < recvTokenNum;
-         tokenId += blocksPerPe * warpNum) {
-      index_t destTokId = 0;
-      if (laneId == 0) destTokId = atomicAdd(args.totalRecvTokenNum, 1);
-      destTokId = __shfl(destTokId, 0);
+  // uint8_t* stagingPtr = (destPe != myPe)
+  //                           ? args.shmemDispatchInpTokMemObj->template GetAs<uint8_t*>()
+  //                           : args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
+  uint8_t* stagingPtr = args.shmemDispatchInpTokMemObj->template GetAs<uint8_t*>();
+  stagingPtr += (config.MaxNumTokensToSendPerRank() * destPe) * xferBytes;
+
+  // if (laneId == 0)
+  //   printf("recv myPe %d destPe %d remote %lu\n", myPe, destPe,
+  //   (config.MaxNumTokensToSendPerRank() * destPe) * xferBytes);
+
+  for (int tokenId = (blockId % blocksPerPe) * warpNum + warpId; tokenId < recvTokenNum;
+       tokenId += blocksPerPe * warpNum) {
+    index_t destTokId = 0;
+    if (laneId == 0) destTokId = atomicAdd(args.totalRecvTokenNum, 1);
+    destTokId = __shfl(destTokId, 0);
+    core::WarpCopy<uint8_t, 4>(
+        args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>() + destTokId * hiddenBytes,
+        stagingPtr + tokenId * xferBytes, hiddenBytes);
+    core::WarpCopy<uint8_t, 4>(
+        args.shmemOutIndicesMemObj->template GetAs<uint8_t*>() + destTokId * indexBytes,
+        stagingPtr + tokenId * xferBytes + hiddenBytes, indexBytes);
+    core::WarpCopy<uint8_t, 4>(
+        args.shmemDispatchOutWeightsMemObj->template GetAs<uint8_t*>() + destTokId * weightBytes,
+        stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes, weightBytes);
+    if (args.scalesBuf && (scaleBytes > 0)) {
       core::WarpCopy<uint8_t, 4>(
-          args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>() + destTokId * hiddenBytes,
-          stagingPtr + tokenId * xferBytes, hiddenBytes);
-      core::WarpCopy<uint8_t, 4>(
-          args.shmemOutIndicesMemObj->template GetAs<uint8_t*>() + destTokId * indexBytes,
-          stagingPtr + tokenId * xferBytes + hiddenBytes, indexBytes);
-      core::WarpCopy<uint8_t, 4>(
-          args.shmemDispatchOutWeightsMemObj->template GetAs<uint8_t*>() + destTokId * weightBytes,
-          stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes, weightBytes);
-      if (args.scalesBuf && (scaleBytes > 0)) {
-        core::WarpCopy<uint8_t, 4>(
-            args.shmemOutScalesMemObj->template GetAs<uint8_t*>() + destTokId * scaleBytes,
-            stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes + weightBytes, scaleBytes);
-      }
+          args.shmemOutScalesMemObj->template GetAs<uint8_t*>() + destTokId * scaleBytes,
+          stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes + weightBytes, scaleBytes);
+    }
+    if (laneId == 0) {
+      // printf("myPe %d destPe %d token id %d src token id %d\n", myPe, destPe, destTokId,
+      // reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes +
+      //                              weightBytes + scaleBytes)[0]);
+      args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[destTokId] =
+          reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes +
+                                     weightBytes + scaleBytes)[0];
     }
   }
 
@@ -174,7 +184,6 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
 
   if ((finishedWarpNum == (2 * globalWarpNum - 1)) && (laneId < npes)) {
     if (laneId < npes) {
-      // atomicAdd(args.totalRecvTokenNum, recvTokenNums[laneId]);
       recvTokenNums[laneId] = 0;
       args.destPeTokenCounter[laneId] = 0;
     }
