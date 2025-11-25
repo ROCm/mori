@@ -203,6 +203,8 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
       last.send_flags = IBV_SEND_SIGNALED;
     }
     struct ibv_send_wr* badWr = nullptr;
+    MORI_IO_INFO("Posting send WR to qp {}, batch index range [{}, {}), signaled {}, wr_id {}", 
+                 eps[epId].local.handle.qpn, st, end, (last.send_flags & IBV_SEND_SIGNALED) ? "true" : "false", last.wr_id);
     int ret = ibv_post_send(eps[epId].local.ibvHandle.qp, &mergedWrs[st].wr, &badWr);
     if (ret != 0) {
       return {StatusCode::ERR_RDMA_OP,

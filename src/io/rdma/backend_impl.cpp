@@ -264,6 +264,8 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
 
   while ((n = ibv_poll_cq(cq, batchSize, wc)) > 0) {
     for (int i = 0; i < n; ++i) {
+      MORI_IO_INFO("Polled CQE: opcode {}, status {} ({}), wr_id {}, qpn {}", 
+                   wc[i].opcode, wc[i].status, ibv_wc_status_str(wc[i].status), wc[i].wr_id, qpn);
       if (wc[i].opcode == IBV_WC_RECV) {
         // Skip RECV processing if notification is disabled
         if (!config.enableNotification) {
@@ -453,6 +455,7 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo) {
   MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
 
   rdma->ConnectEndpoint(ekey, devId, lep, msg.devId, msg.eph, topo, weight);
+  MORI_IO_INFO("Built RDMA connection: local_qpn={} remote_qpn={} remote_engine={}", lep.handle.qpn, msg.eph.qpn, ekey);
   notif->RegisterEndpointByQpn(lep.handle.qpn);
   ctx->CloseEndpoint(tcph);
 }
