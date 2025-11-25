@@ -214,6 +214,11 @@ void NotifManager::RegisterEndpointByQpn(uint32_t qpn) {
     SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_ADD, ep->local.ibvHandle.compCh->fd, &ev));
   }
 
+  // Skip notification setup if disabled
+  if (!config.enableNotification) {
+    return;
+  }
+
   std::lock_guard<std::mutex> lock(mu);
   if (qpNotifCtx.find(qpn) != qpNotifCtx.end()) return;
 
@@ -260,6 +265,12 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
   while ((n = ibv_poll_cq(cq, batchSize, wc)) > 0) {
     for (int i = 0; i < n; ++i) {
       if (wc[i].opcode == IBV_WC_RECV) {
+        // Skip RECV processing if notification is disabled
+        if (!config.enableNotification) {
+          MORI_IO_WARN("Received unexpected RECV completion when notification is disabled");
+          continue;
+        }
+
         std::lock_guard<std::mutex> lock(mu);
 
         assert(qpNotifCtx.find(qpn) != qpNotifCtx.end());
@@ -311,6 +322,9 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
           } else {
             statusPtr->SetMessage(ibv_wc_status_str(wc[i].status));
             statusPtr->SetCode(StatusCode::ERR_RDMA_OP);
+            MORI_IO_ERROR("NotifManager receive cqe failed for task {} code {} status {}",
+                          msg->meta->id, static_cast<uint32_t>(wc[i].status),
+                          ibv_wc_status_str(wc[i].status));
             // set status to nullptr indicate that transfer failed
             msg->meta->status = nullptr;
           }
@@ -597,7 +611,7 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
     status->SetMessage(ret.message);
     status->SetCode(ret.code);
   }
-  if (!ret.Failed()) {
+  if (!ret.Failed() && config.enableNotification) {
     RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
     if (notifRet.Failed()) {
       status->SetMessage(notifRet.message);
@@ -626,7 +640,7 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
     status->SetMessage(ret.message);
     status->SetCode(ret.code);
   }
-  if (!ret.Failed()) {
+  if (!ret.Failed() && config.enableNotification) {
     RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
     if (notifRet.Failed()) {
       status->SetMessage(notifRet.message);
