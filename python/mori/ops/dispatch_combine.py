@@ -464,6 +464,7 @@ class EpDispatchCombineOp:
             EpDispatchCombineKernelType.IntraNode.value,
             EpDispatchCombineKernelType.InterNodeV1.value,
             EpDispatchCombineKernelType.InterNodeV1LL.value,
+            EpDispatchCombineKernelType.AsyncLL.value,
         ):
             return self._get_dispatch_src_token_pos_func(self._handle)
 
