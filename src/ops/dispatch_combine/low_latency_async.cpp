@@ -103,9 +103,10 @@ __global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
     int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
     size_t remoteOffset = (config.MaxNumTokensToSendPerRank() * myPe) * xferBytes;
     size_t localOffset = (config.MaxNumTokensToSendPerRank() * destPe) * xferBytes;
-    shmem::ShmemPutMemNbiWarp(args.shmemDispatchInpTokMemObj, remoteOffset,
-                              args.shmemStagingTokMemObj, localOffset, tokenNum * xferBytes,
-                              destPe);
+    if (destPe != myPe)
+      shmem::ShmemPutMemNbiWarp(args.shmemDispatchInpTokMemObj, remoteOffset,
+                                args.shmemStagingTokMemObj, localOffset, tokenNum * xferBytes,
+                                destPe);
     shmem::ShmemPutInt32ImmNbiWarp(args.recvTokenNumMemObj, myPe * sizeof(index_t), tokenNum + 1,
                                    destPe);
     // shmem::ShmemPutMemNbiSignalWarp(args.shmemDispatchInpTokMemObj, remoteOffset,
@@ -136,15 +137,11 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   recvTokenNum = __shfl(recvTokenNum, 0);
 
   // Copy data
-  // uint8_t* stagingPtr = (destPe != myPe)
-  //                           ? args.shmemDispatchInpTokMemObj->template GetAs<uint8_t*>()
-  //                           : args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
-  uint8_t* stagingPtr = args.shmemDispatchInpTokMemObj->template GetAs<uint8_t*>();
+  uint8_t* stagingPtr = (destPe != myPe)
+                            ? args.shmemDispatchInpTokMemObj->template GetAs<uint8_t*>()
+                            : args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
+  // uint8_t* stagingPtr = args.shmemDispatchInpTokMemObj->template GetAs<uint8_t*>();
   stagingPtr += (config.MaxNumTokensToSendPerRank() * destPe) * xferBytes;
-
-  // if (laneId == 0)
-  //   printf("recv myPe %d destPe %d remote %lu\n", myPe, destPe,
-  //   (config.MaxNumTokensToSendPerRank() * destPe) * xferBytes);
 
   for (int tokenId = (blockId % blocksPerPe) * warpNum + warpId; tokenId < recvTokenNum;
        tokenId += blocksPerPe * warpNum) {

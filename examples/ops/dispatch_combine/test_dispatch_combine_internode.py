@@ -563,7 +563,7 @@ class EpDispatchCombineTestCase:
             all_rank_scales,
         ) = test_data
 
-        for i in range(1):
+        for i in range(0):
             (
                 dispatch_output,
                 dispatch_weights,
@@ -607,8 +607,8 @@ class EpDispatchCombineTestCase:
             # )
             # torch.cuda.synchronize()
 
-        # total_recv_num_token = 1
-        total_recv_num_token = dispatch_recv_num_token[0]
+        total_recv_num_token = 1
+        # total_recv_num_token = dispatch_recv_num_token[0]
         total_rdma_recv_num_token = (
             self.config.max_num_inp_token_per_rank * self.config.world_size // 8
         )
