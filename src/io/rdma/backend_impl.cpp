@@ -59,7 +59,7 @@ std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
     int idx = (roundRobinCounter.fetch_add(1, std::memory_order_relaxed) % availDevices.size());
     return {{idx, 1}};
   }
-  assert("topo searching for device other than CPU/GPU is not implemented yet");
+  assert(false && "topo searching for device other than CPU/GPU is not implemented yet");
   return {};
 }
 
