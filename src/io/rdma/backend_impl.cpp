@@ -56,7 +56,7 @@ std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
     }
   } else if (key.loc == MemoryLocationType::CPU) {
     if (availDevices.empty()) return {};
-    int idx = roundRobinCounter.fetch_add(1) % availDevices.size();
+    int idx = (roundRobinCounter.fetch_add(1, std::memory_order_relaxed) % availDevices.size());
     return {{idx, 1}};
   }
   assert("topo searching for device other than CPU/GPU is not implemented yet");
@@ -260,8 +260,8 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
 
   while ((n = ibv_poll_cq(cq, batchSize, wc)) > 0) {
     for (int i = 0; i < n; ++i) {
-      MORI_IO_INFO("Polled CQE: opcode {}, status {} ({}), wr_id {}, qpn {}", wc[i].opcode,
-                   wc[i].status, ibv_wc_status_str(wc[i].status), wc[i].wr_id, qpn);
+      MORI_IO_TRACE("Polled CQE: opcode {}, status {} ({}), wr_id {}, qpn {}", wc[i].opcode,
+                    wc[i].status, ibv_wc_status_str(wc[i].status), wc[i].wr_id, qpn);
       if (wc[i].opcode == IBV_WC_RECV) {
         // Skip RECV processing if notification is disabled
         if (!config.enableNotification) {
@@ -294,19 +294,17 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
         // frequently when transfer is very fast. Two way to solve this, 1. use srq_limit to
         // replenish in advance
         // 2. independent srq entry config (now reuse maxMsgNum)
-        for (uint64_t i = 0; i < maxNotifNum; i++) {
-          struct ibv_sge sge{};
-          sge.addr = ctx.mr.addr + idx * sizeof(NotifMessage);
-          sge.length = sizeof(NotifMessage);
-          sge.lkey = ctx.mr.lkey;
+        struct ibv_sge sge{};
+        sge.addr = ctx.mr.addr + idx * sizeof(NotifMessage);
+        sge.length = sizeof(NotifMessage);
+        sge.lkey = ctx.mr.lkey;
 
-          struct ibv_recv_wr wr{};
-          wr.wr_id = idx;
-          wr.sg_list = &sge;
-          wr.num_sge = 1;
-          struct ibv_recv_wr* bad = nullptr;
-          SYSCALL_RETURN_ZERO(ibv_post_srq_recv(ctx.srq, &wr, &bad));
-        }
+        struct ibv_recv_wr wr{};
+        wr.wr_id = idx;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        struct ibv_recv_wr* bad = nullptr;
+        SYSCALL_RETURN_ZERO(ibv_post_srq_recv(ctx.srq, &wr, &bad));
       } else if (wc[i].opcode == IBV_WC_SEND) {
         uint64_t id = wc[i].wr_id;
         if (wc[i].status != IBV_WC_SUCCESS) {

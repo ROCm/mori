@@ -96,7 +96,7 @@ class RdmaManager {
   std::unordered_map<uint32_t, EpPair> epsMap;
 
   std::unique_ptr<application::TopoSystem> topo{nullptr};
-  std::atomic<int> roundRobinCounter{0};
+  std::atomic<uint32_t> roundRobinCounter{0};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
