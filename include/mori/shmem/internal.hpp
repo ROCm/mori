@@ -112,23 +112,15 @@ struct RemoteAddrInfo {
   bool valid;
 
   __device__ RemoteAddrInfo() : raddr(0), rkey(0), valid(false) {}
-  __device__ RemoteAddrInfo(uintptr_t r, uintptr_t k)
-      : raddr(r), rkey(k), valid(true) {}
+  __device__ RemoteAddrInfo(uintptr_t r, uintptr_t k) : raddr(r), rkey(k), valid(true) {}
 };
 
 inline __device__ RemoteAddrInfo ShmemAddrToRemoteAddr(const void* localAddr, int pe) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  uintptr_t localAddrInt = reinterpret_cast<uintptr_t>(localAddr);
-
-  // Check if address is in symmetric heap
-  if (localAddrInt < globalGpuStates->heapBaseAddr ||
-      localAddrInt >= globalGpuStates->heapEndAddr) {
-    assert(false && "dest addr not in symmetric heap");
-    return RemoteAddrInfo();
-  }
 
   // Calculate offset within the symmetric heap
-  size_t offset = localAddrInt - globalGpuStates->heapBaseAddr;
+  size_t offset = reinterpret_cast<const char*>(localAddr) -
+                  reinterpret_cast<const char*>(globalGpuStates->heapBaseAddr);
 
   // Get remote address using the heap's SymmMemObj
   application::SymmMemObj* heapObj = globalGpuStates->heapObj;

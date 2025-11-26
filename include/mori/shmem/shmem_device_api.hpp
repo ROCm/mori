@@ -26,10 +26,10 @@
 
 #include "mori/application/application.hpp"
 #include "mori/core/core.hpp"
+#include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_device_kernels.hpp"
 #include "mori/shmem/shmem_ibgda_kernels.hpp"
 #include "mori/shmem/shmem_p2p_kernels.hpp"
-#include "mori/shmem/internal.hpp"
 
 namespace mori {
 namespace shmem {
@@ -100,8 +100,6 @@ inline __device__ void ShmemFenceThread(int pe, int qpId) {
   __threadfence_system();
 }
 
-
-
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Point-to-Point                                         */
 /* ---------------------------------------------------------------------------------------------- */
@@ -112,6 +110,12 @@ inline __device__ uint64_t ShmemPtrP2p(const uint64_t destPtr, const int myPe, i
   }
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+
+  application::TransportType transportType = globalGpuStates->transportTypes[destPe];
+  if (transportType == application::TransportType::RDMA) {
+    return 0;
+  }
+
   uintptr_t localAddrInt = static_cast<uintptr_t>(destPtr);
 
   if (localAddrInt < globalGpuStates->heapBaseAddr ||
@@ -127,7 +131,6 @@ inline __device__ uint64_t ShmemPtrP2p(const uint64_t destPtr, const int myPe, i
 
   return raddr;
 }
-
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        PutNbi APIs                                             */
@@ -452,14 +455,13 @@ DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int64, int64_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Long, long, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Ulong, unsigned long, Warp)
 
-
 /* ---------------------------------------------------------------------------------------------- */
 /*                              Atomic Add Convenience APIs (NonFetch)                            */
 /* ---------------------------------------------------------------------------------------------- */
-#define DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(TypeName, T, Scope)                                     \
-  inline __device__ void Shmem##TypeName##AtomicAdd##Scope(                                      \
-      const application::SymmMemObjPtr dest, size_t destOffset, T val, int pe, int qpId = 0) {   \
-    ShmemAtomicTypeNonFetch##Scope<T>(dest, destOffset, val, core::AMO_ADD, pe, qpId);           \
+#define DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(TypeName, T, Scope)                                   \
+  inline __device__ void Shmem##TypeName##AtomicAdd##Scope(                                    \
+      const application::SymmMemObjPtr dest, size_t destOffset, T val, int pe, int qpId = 0) { \
+    ShmemAtomicTypeNonFetch##Scope<T>(dest, destOffset, val, core::AMO_ADD, pe, qpId);         \
   }
 
 DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Uint32, uint32_t, Thread)
@@ -479,11 +481,12 @@ DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Ulong, unsigned long, Warp)
 /* ---------------------------------------------------------------------------------------------- */
 /*                              Atomic Add Convenience APIs (Fetch)                               */
 /* ---------------------------------------------------------------------------------------------- */
-#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(TypeName, T, Scope)                               \
-  inline __device__ T Shmem##TypeName##AtomicFetchAdd##Scope(                                    \
-      const application::SymmMemObjPtr dest, size_t destOffset, T val, int pe, int qpId = 0) {   \
-    T compare = 0;                                                                                \
-    return ShmemAtomicTypeFetch##Scope<T>(dest, destOffset, val, compare, core::AMO_FETCH_ADD, pe, qpId); \
+#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(TypeName, T, Scope)                                 \
+  inline __device__ T Shmem##TypeName##AtomicFetchAdd##Scope(                                      \
+      const application::SymmMemObjPtr dest, size_t destOffset, T val, int pe, int qpId = 0) {     \
+    T compare = 0;                                                                                 \
+    return ShmemAtomicTypeFetch##Scope<T>(dest, destOffset, val, compare, core::AMO_FETCH_ADD, pe, \
+                                          qpId);                                                   \
   }
 
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Uint32, uint32_t, Thread)
@@ -742,10 +745,9 @@ DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Ulong, unsigned long, Warp)
 /* ---------------------------------------------------------------------------------------------- */
 /*                   Atomic Add Convenience APIs (NonFetch, Pure Address)                         */
 /* ---------------------------------------------------------------------------------------------- */
-#define DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(TypeName, T, Scope)                \
-  inline __device__ void Shmem##TypeName##AtomicAdd##Scope(                      \
-      T* dest, T val, int pe, int qpId = 0) {                                    \
-    ShmemAtomicTypeNonFetch##Scope<T>(dest, val, core::AMO_ADD, pe, qpId);       \
+#define DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(TypeName, T, Scope)                                  \
+  inline __device__ void Shmem##TypeName##AtomicAdd##Scope(T* dest, T val, int pe, int qpId = 0) { \
+    ShmemAtomicTypeNonFetch##Scope<T>(dest, val, core::AMO_ADD, pe, qpId);                         \
   }
 
 DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Uint32, uint32_t, Thread)
@@ -765,10 +767,10 @@ DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Ulong, unsigned long, Warp)
 /* ---------------------------------------------------------------------------------------------- */
 /*                     Atomic Add Convenience APIs (Fetch, Pure Address)                          */
 /* ---------------------------------------------------------------------------------------------- */
-#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(TypeName, T, Scope)          \
-  inline __device__ T Shmem##TypeName##AtomicFetchAdd##Scope(                    \
-      T* dest, T val, int pe, int qpId = 0) {                                    \
-    T compare = 0;                                                                \
+#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(TypeName, T, Scope)                       \
+  inline __device__ T Shmem##TypeName##AtomicFetchAdd##Scope(T* dest, T val, int pe,          \
+                                                             int qpId = 0) {                  \
+    T compare = 0;                                                                            \
     return ShmemAtomicTypeFetch##Scope<T>(dest, val, compare, core::AMO_FETCH_ADD, pe, qpId); \
   }
 
