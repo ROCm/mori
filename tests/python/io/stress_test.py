@@ -332,6 +332,7 @@ class MoriIoStress:
             qp_per_transfer=self.num_qp_per_transfer,
             post_batch_size=-1,
             num_worker_threads=self.num_worker_threads,
+            # enable_notification=False, # For AINIC test
         )
         self.engine.create_backend(BackendType.RDMA, rdma_cfg)
 

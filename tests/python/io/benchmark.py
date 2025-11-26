@@ -276,6 +276,7 @@ class MoriIoBenchmark:
             post_batch_size=-1,
             num_worker_threads=self.num_worker_threads,
             poll_cq_mode=self.poll_cq_mode,
+            # enable_notification=False, # For AINIC test
         )
         self.engine.create_backend(BackendType.RDMA, config)
 

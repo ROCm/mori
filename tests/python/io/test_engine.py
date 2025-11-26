@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import pytest
+import time
 from tests.python.utils import get_free_port
 import torch
 from mori.io import (
@@ -36,7 +37,11 @@ from mori.io import (
 
 
 def create_connected_engine_pair(
-    name_prefix, qp_per_transfer, post_batch_size, num_worker_threads
+    name_prefix,
+    qp_per_transfer,
+    post_batch_size,
+    num_worker_threads,
+    enable_notification=True,
 ):
     config = IOEngineConfig(
         host="127.0.0.1",
@@ -50,6 +55,7 @@ def create_connected_engine_pair(
         qp_per_transfer=qp_per_transfer,
         post_batch_size=post_batch_size,
         num_worker_threads=num_worker_threads,
+        enable_notification=enable_notification,
     )
     initiator.create_backend(BackendType.RDMA, config)
     target.create_backend(BackendType.RDMA, config)
@@ -72,10 +78,18 @@ def pre_connected_engine_pair():
     multhd_initiator, multhd_target = create_connected_engine_pair(
         "multhd", qp_per_transfer=2, post_batch_size=-1, num_worker_threads=2
     )
+    no_notif_initiator, no_notif_target = create_connected_engine_pair(
+        "no_notif",
+        qp_per_transfer=2,
+        post_batch_size=-1,
+        num_worker_threads=1,
+        enable_notification=False,
+    )
 
     engines = {
         "normal": (initiator, target),
         "multhd": (multhd_initiator, multhd_target),
+        "no_notif": (no_notif_initiator, no_notif_target),
     }
     yield engines
 
@@ -169,14 +183,22 @@ def check_transfer_result(
     target_tensor_copy,
     transfer_uid,
     op_type,
+    enable_notification=True,
 ):
     initiator, target = engine_pair
     wait_status(initiator_status)
-    target_status = wait_inbound_status(
-        target, initiator.get_engine_desc().key, transfer_uid
-    )
     assert initiator_status.Succeeded()
-    assert target_status.Succeeded()
+
+    # Only check target inbound status when notification is enabled
+    if enable_notification:
+        target_status = wait_inbound_status(
+            target, initiator.get_engine_desc().key, transfer_uid
+        )
+        assert target_status.Succeeded()
+    else:
+        time.sleep(0.001)
+
+    # Verify data correctness
     assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
 
     if op_type == "read":
@@ -185,7 +207,7 @@ def check_transfer_result(
         assert not torch.equal(target_tensor.cpu(), target_tensor_copy.cpu())
 
 
-@pytest.mark.parametrize("engine_type", ("normal", "multhd"))
+@pytest.mark.parametrize("engine_type", ("normal", "multhd", "no_notif"))
 @pytest.mark.parametrize(
     "enable_sess",
     (
@@ -279,6 +301,7 @@ def test_rdma_backend_ops(
                 )
             uid_status_list.append((transfer_uid, transfer_status))
 
+    enable_notification = engine_type != "no_notif"
     for uid, status in uid_status_list:
         check_transfer_result(
             engine_pair,
@@ -289,6 +312,7 @@ def test_rdma_backend_ops(
             target_tensor_copy,
             uid,
             op_type,
+            enable_notification,
         )
 
 
@@ -312,6 +336,37 @@ def test_err_out_of_range(pre_connected_engine_pair):
 
     assert transfer_status.Failed()
     assert transfer_status.Code() == StatusCode.ERR_INVALID_ARGS
+
+
+def test_notification_disabled():
+    """Test that when notification is disabled, pop_inbound_transfer_status doesn't work."""
+    initiator, target = create_connected_engine_pair(
+        "notif_test",
+        qp_per_transfer=1,
+        post_batch_size=-1,
+        num_worker_threads=1,
+        enable_notification=False,
+    )
+
+    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target), [1, 64]
+    )
+
+    transfer_uid = initiator.allocate_transfer_uid()
+    transfer_status = initiator.write(initiator_mem, 0, target_mem, 0, 64, transfer_uid)
+
+    wait_status(transfer_status)
+    assert transfer_status.Succeeded()
+
+    # Verify data was transferred correctly
+    assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+
+    # pop_inbound_transfer_status should not work (returns None)
+    time.sleep(0.1)
+    inbound_status = target.pop_inbound_transfer_status(
+        initiator.get_engine_desc().key, transfer_uid
+    )
+    assert inbound_status is None  # No notification received
 
 
 def test_no_backend():
