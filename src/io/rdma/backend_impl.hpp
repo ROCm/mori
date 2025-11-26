@@ -49,7 +49,7 @@ class RdmaManager {
   RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* ctx);
   ~RdmaManager() = default;
 
-  application::RdmaEndpointConfig GetRdmaEndpointConfig(int portId);
+  application::RdmaEndpointConfig GetRdmaEndpointConfig(int devId);
 
   // Topology APIs
   std::vector<std::pair<int, int>> Search(TopoKey);

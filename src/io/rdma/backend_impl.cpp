@@ -130,17 +130,31 @@ EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
   return remotes[engine].rTable[key];
 }
 
-application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int portId) {
-  application::RdmaEndpointConfig config;
-  config.portId = portId;
-  config.gidIdx = -1;
-  config.maxMsgsNum = 8192;
-  config.maxMsgSge = 1;
-  config.maxCqeNum = 8192;
-  config.alignment = PAGESIZE;
-  config.withCompChannel = true;
-  config.enableSrq = false;
-  return config;
+application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
+  application::RdmaEndpointConfig epConfig;
+  epConfig.portId = availDevices[devId].second;
+  epConfig.gidIdx = -1;
+  epConfig.maxMsgsNum = 8192;
+  epConfig.maxCqeNum = 8192;
+  epConfig.alignment = PAGESIZE;
+  epConfig.withCompChannel = (config.pollCqMode == PollCqMode::EVENT);
+  // SRQ is only needed when notification mechanism is enabled
+  epConfig.enableSrq = config.enableNotification;
+
+  if (epConfig.enableSrq) {
+    epConfig.maxMsgSge = 1;
+    return epConfig;
+  }
+
+  // Query device capabilities and set maxMsgSge adaptively
+  application::RdmaDevice* device = availDevices[devId].first;
+  const ibv_device_attr_ex* deviceAttr = device->GetDeviceAttr();
+
+  const uint32_t reasonableMaxSge = 16;
+  epConfig.maxMsgSge =
+      std::min(static_cast<uint32_t>(deviceAttr->orig_attr.max_sge), reasonableMaxSge);
+
+  return epConfig;
 }
 
 application::RdmaEndpoint RdmaManager::CreateEndpoint(int devId) {
@@ -148,8 +162,7 @@ application::RdmaEndpoint RdmaManager::CreateEndpoint(int devId) {
 
   application::RdmaDeviceContext* devCtx = GetOrCreateDeviceContext(devId);
 
-  application::RdmaEndpoint rdmaEp =
-      devCtx->CreateRdmaEndpoint(GetRdmaEndpointConfig(availDevices[devId].second));
+  application::RdmaEndpoint rdmaEp = devCtx->CreateRdmaEndpoint(GetRdmaEndpointConfig(devId));
   if (config.pollCqMode == PollCqMode::EVENT)
     SYSCALL_RETURN_ZERO(ibv_req_notify_cq(rdmaEp.ibvHandle.cq, 0));
   return rdmaEp;
