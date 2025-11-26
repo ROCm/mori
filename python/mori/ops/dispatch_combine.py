@@ -98,9 +98,10 @@ class EpDispatchCombineOp:
         )
 
         self._dispatch_func = _cpp_dispatch_combine_factory("launch_dispatch")
-        self._dispatch_send_func = _cpp_dispatch_combine_factory("launch_dispatch_send")
         self._dispatch_recv_func = _cpp_dispatch_combine_factory("launch_dispatch_recv")
         self._combine_func = _cpp_dispatch_combine_factory("launch_combine")
+        self._combine_recv_func = _cpp_dispatch_combine_factory("launch_combine_recv")
+        self._reset_func = _cpp_dispatch_combine_factory("launch_reset")
         self._get_dispatch_src_token_pos_func = _cpp_dispatch_combine_factory(
             "get_dispatch_src_token_pos"
         )
@@ -206,9 +207,7 @@ class EpDispatchCombineOp:
         block_num: int = -1,
         warp_per_block: int = -1,
     ):
-        return self._dispatch_send_func(
-            self._handle,
-            self.config.kernel_type.value,
+        return self.dispatch(
             input,
             weights,
             scales,
@@ -419,6 +418,18 @@ class EpDispatchCombineOp:
             packed_recv_x,
             packed_recv_src_info,
             packed_recv_layout_range,
+            block_num,
+            warp_per_block,
+        )
+
+    def combine_recv(
+        self,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        return self._combine_recv_func(
+            self._handle,
+            self.config.kernel_type.value,
             block_num,
             warp_per_block,
         )

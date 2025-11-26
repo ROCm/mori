@@ -358,16 +358,27 @@ class EpDispatchCombineTestCase:
         if self.rank % self.gpu_per_node == 0:
             print(f"Node {self.rank // self.gpu_per_node} Dispatch Pass")
 
-        combine_output, combine_output_weight = op.combine(
-            dispatch_output,
-            dispatch_weights,
-            all_rank_indices[self.rank],
-            block_num=self.config.block_num,
-            # warp_per_block=16,
-        )
+        if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+            dispatch_weights = None
+            combine_output, combine_output_weigh = op.combine_send(
+                dispatch_output,
+                dispatch_weights,
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+                warp_per_block=16,
+            )
+            op.combine_recv()
+        else:
+            combine_output, combine_output_weight = op.combine(
+                dispatch_output,
+                dispatch_weights,
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+                warp_per_block=16,
+            )
+
         torch.cuda.synchronize()
         for i in range(all_rank_num_token[self.rank]):
-            continue
             pes = [
                 (idx // self.config.num_experts_per_rank)
                 for idx in all_rank_indices[self.rank][i].cpu().tolist()
@@ -727,7 +738,7 @@ class EpDispatchCombineTestCase:
         comb_bandwidth_GB_list = []
 
         error_round = set()
-        for i in range(0):
+        for i in range(1):
             if self.rank == 0:
                 print(f"WarmUp Round {i} begin")
             self.run_test_once(op, test_data, error_round, i)
