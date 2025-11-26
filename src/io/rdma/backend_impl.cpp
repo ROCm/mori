@@ -55,11 +55,9 @@ std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
       }
     }
   } else if (key.loc == MemoryLocationType::CPU) {
-    static std::atomic<int> roundRobinCounter{0};
-    if (!availDevices.empty()) {
-      int idx = roundRobinCounter.fetch_add(1) % availDevices.size();
-      return {{idx, 1}};
-    }
+    if (availDevices.empty()) return {};
+    int idx = roundRobinCounter.fetch_add(1) % availDevices.size();
+    return {{idx, 1}};
   }
   assert("topo searching for device other than CPU/GPU is not implemented yet");
   return {};
