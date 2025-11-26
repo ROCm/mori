@@ -131,13 +131,13 @@ class NotifManager {
 
   // Notification context
  private:
-  struct QpNotifContext {
+  struct DeviceNotifContext {
+    struct ibv_srq* srq;
     application::RdmaMemoryRegion mr;
-    void* buf;
   };
 
-  uint32_t notifPerQp{1024};
-  std::unordered_map<uint32_t, QpNotifContext> qpNotifCtx;
+  uint32_t maxNotifNum{8192};
+  std::unordered_map<int, DeviceNotifContext> notifCtx;
   std::unordered_map<EngineKey, std::unordered_map<TransferUniqueId, int>> notifPool;
 
   std::unordered_map<TransferStatus*, int> localNotif;

@@ -160,7 +160,7 @@ struct RdmaEndpoint {
     } else if (vendorId == RdmaDeviceVendorId::Broadcom) {
       return core::ProviderType::BNXT;
     } else {
-      printf("unknown vendorId %d", vendorId);
+      printf("unknown vendorId %u", static_cast<uint32_t>(vendorId));
       assert(false);
     }
     return core::ProviderType::Unknown;

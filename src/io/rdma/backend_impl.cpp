@@ -213,33 +213,31 @@ void NotifManager::RegisterEndpointByQpn(uint32_t qpn) {
     assert(ep.has_value() && ep->local.ibvHandle.compCh);
     SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_ADD, ep->local.ibvHandle.compCh->fd, &ev));
   }
+}
 
+void NotifManager::RegisterDevice(int devId) {
   // Skip notification setup if disabled
   if (!config.enableNotification) {
     return;
   }
-
   std::lock_guard<std::mutex> lock(mu);
-  if (qpNotifCtx.find(qpn) != qpNotifCtx.end()) return;
+  if (notifCtx.find(devId) != notifCtx.end()) return;
 
-  std::optional<EpPair> ep = rdma->GetEpPairByQpn(qpn);
-  assert(ep.has_value());
-
-  application::RdmaDeviceContext* devCtx = rdma->GetRdmaDeviceContext(ep->ldevId);
+  application::RdmaDeviceContext* devCtx = rdma->GetRdmaDeviceContext(devId);
   assert(devCtx);
 
   void* buf;
   SYSCALL_RETURN_ZERO(
-      posix_memalign(reinterpret_cast<void**>(&buf), PAGESIZE, notifPerQp * sizeof(NotifMessage)));
+      posix_memalign(reinterpret_cast<void**>(&buf), PAGESIZE, maxNotifNum * sizeof(NotifMessage)));
   application::RdmaMemoryRegion mr =
-      devCtx->RegisterRdmaMemoryRegion(buf, notifPerQp * sizeof(NotifMessage));
+      devCtx->RegisterRdmaMemoryRegion(buf, maxNotifNum * sizeof(NotifMessage));
+  struct ibv_srq* srq = devCtx->GetIbvSrq();
+  assert(srq);
+  notifCtx.insert({devId, {srq, mr}});
 
-  qpNotifCtx.insert({qpn, {mr, buf}});
-
-  struct ibv_qp* qp = ep->local.ibvHandle.qp;
-  assert(qp);
-
-  for (uint64_t i = 0; i < notifPerQp; i++) {
+  // Pre post notification receive wr
+  // TODO: should use min(maxNotifNum, maxSrqWrNum)
+  for (uint64_t i = 0; i < maxNotifNum; i++) {
     struct ibv_sge sge{};
     sge.addr = mr.addr + i * sizeof(NotifMessage);
     sge.length = sizeof(NotifMessage);
@@ -251,8 +249,8 @@ void NotifManager::RegisterEndpointByQpn(uint32_t qpn) {
     wr.num_sge = 1;
 
     struct ibv_recv_wr* bad = nullptr;
-    SYSCALL_RETURN_ZERO(ibv_post_recv(qp, &wr, &bad));
-  }
+    SYSCALL_RETURN_ZERO(ibv_post_srq_recv(srq, &wr, &bad));
+  };
 }
 
 void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
@@ -264,8 +262,8 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
 
   while ((n = ibv_poll_cq(cq, batchSize, wc)) > 0) {
     for (int i = 0; i < n; ++i) {
-      MORI_IO_INFO("Polled CQE: opcode {}, status {} ({}), wr_id {}, qpn {}", 
-                   wc[i].opcode, wc[i].status, ibv_wc_status_str(wc[i].status), wc[i].wr_id, qpn);
+      MORI_IO_INFO("Polled CQE: opcode {}, status {} ({}), wr_id {}, qpn {}", wc[i].opcode,
+                   wc[i].status, ibv_wc_status_str(wc[i].status), wc[i].wr_id, qpn);
       if (wc[i].opcode == IBV_WC_RECV) {
         // Skip RECV processing if notification is disabled
         if (!config.enableNotification) {
@@ -274,9 +272,10 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
         }
 
         std::lock_guard<std::mutex> lock(mu);
+        int devId = ep.ldevId;
 
-        assert(qpNotifCtx.find(qpn) != qpNotifCtx.end());
-        QpNotifContext& ctx = qpNotifCtx[qpn];
+        assert(notifCtx.find(devId) != notifCtx.end());
+        DeviceNotifContext& ctx = notifCtx[devId];
 
         // FIXME: this notif mechenism has bug when notif index is wrapped around
         uint64_t idx = wc[i].wr_id;
@@ -293,17 +292,23 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
             "NotifManager receive notif message from engine {} id {} qp {} total num {} cur num {}",
             ekey.c_str(), msg.id, msg.qpIndex, msg.totalNum, notifPool[ekey][msg.id]);
         // replenish recv wr
-        struct ibv_sge sge{};
-        sge.addr = ctx.mr.addr + idx * sizeof(NotifMessage);
-        sge.length = sizeof(NotifMessage);
-        sge.lkey = ctx.mr.lkey;
+        // TODO(ditian12): we should replenish recv wr faster, insufficient recv wr is met
+        // frequently when transfer is very fast. Two way to solve this, 1. use srq_limit to
+        // replenish in advance
+        // 2. independent srq entry config (now reuse maxMsgNum)
+        for (uint64_t i = 0; i < maxNotifNum; i++) {
+          struct ibv_sge sge{};
+          sge.addr = ctx.mr.addr + idx * sizeof(NotifMessage);
+          sge.length = sizeof(NotifMessage);
+          sge.lkey = ctx.mr.lkey;
 
-        struct ibv_recv_wr wr{};
-        wr.wr_id = idx;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        struct ibv_recv_wr* bad = nullptr;
-        SYSCALL_RETURN_ZERO(ibv_post_recv(ep.local.ibvHandle.qp, &wr, &bad));
+          struct ibv_recv_wr wr{};
+          wr.wr_id = idx;
+          wr.sg_list = &sge;
+          wr.num_sge = 1;
+          struct ibv_recv_wr* bad = nullptr;
+          SYSCALL_RETURN_ZERO(ibv_post_srq_recv(ctx.srq, &wr, &bad));
+        }
       } else if (wc[i].opcode == IBV_WC_SEND) {
         uint64_t id = wc[i].wr_id;
         if (wc[i].status != IBV_WC_SUCCESS) {
@@ -455,8 +460,10 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo) {
   MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
 
   rdma->ConnectEndpoint(ekey, devId, lep, msg.devId, msg.eph, topo, weight);
-  MORI_IO_INFO("Built RDMA connection: local_qpn={} remote_qpn={} remote_engine={}", lep.handle.qpn, msg.eph.qpn, ekey);
+  MORI_IO_INFO("Built RDMA connection: local_qpn={} remote_qpn={} remote_engine={}", lep.handle.qpn,
+               msg.eph.qpn, ekey);
   notif->RegisterEndpointByQpn(lep.handle.qpn);
+  notif->RegisterDevice(devId);
   ctx->CloseEndpoint(tcph);
 }
 
@@ -517,6 +524,7 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
       application::RdmaEndpoint lep = rdma->CreateEndpoint(devId);
       rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
       notif->RegisterEndpointByQpn(lep.handle.qpn);
+      notif->RegisterDevice(devId);
       p.WriteMessageRegEndpoint(MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle});
       SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL));
       break;
