@@ -644,13 +644,27 @@ class EpDispatchCombineTestCase:
                     warp_per_block=16,
                 )
             events[2 * i + 1].record()
-            # combine_output, _ = op.combine(
-            #     dispatch_output,
-            #     dispatch_weights,
-            #     all_rank_indices[self.rank],
-            #     block_num=self.config.block_num,
-            #     warp_per_block=16,
-            # )
+            if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+                combine_output, _ = op.combine_send(
+                    dispatch_output,
+                    dispatch_weights,
+                    all_rank_indices[self.rank],
+                    # block_num=self.config.block_num,
+                    block_num=256,
+                    warp_per_block=4,
+                )
+                op.combine_recv(
+                    block_num=256,
+                    warp_per_block=4,
+                )
+            else:
+                combine_output, _ = op.combine(
+                    dispatch_output,
+                    dispatch_weights,
+                    all_rank_indices[self.rank],
+                    block_num=self.config.block_num,
+                    warp_per_block=16,
+                )
             events[2 * i + 2].record()
         torch.cuda.synchronize()
 
@@ -707,7 +721,7 @@ class EpDispatchCombineTestCase:
         comb_bandwidth_GB_list = []
 
         error_round = set()
-        for i in range(1):
+        for i in range(0):
             if self.rank == 0:
                 print(f"WarmUp Round {i} begin")
             self.run_test_once(op, test_data, error_round, i)
