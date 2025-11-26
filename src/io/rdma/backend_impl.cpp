@@ -131,28 +131,22 @@ EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
 }
 
 application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
-  application::RdmaEndpointConfig epConfig;
-  epConfig.portId = availDevices[devId].second;
+  const auto& [device, portId] = availDevices[devId];
+  const auto* deviceAttr = device->GetDeviceAttr();
+
+  application::RdmaEndpointConfig epConfig{};
+  epConfig.portId = portId;
   epConfig.gidIdx = -1;
-  epConfig.maxMsgsNum = 8192;
-  epConfig.maxCqeNum = 8192;
+  epConfig.enableSrq = config.enableNotification;
   epConfig.alignment = PAGESIZE;
   epConfig.withCompChannel = (config.pollCqMode == PollCqMode::EVENT);
-  // SRQ is only needed when notification mechanism is enabled
-  epConfig.enableSrq = config.enableNotification;
 
-  if (epConfig.enableSrq) {
-    epConfig.maxMsgSge = 1;
-    return epConfig;
-  }
+  uint32_t maxQpWr = static_cast<uint32_t>(deviceAttr->orig_attr.max_qp_wr);
+  uint32_t maxCqe = static_cast<uint32_t>(deviceAttr->orig_attr.max_cqe);
 
-  // Query device capabilities and set maxMsgSge adaptively
-  application::RdmaDevice* device = availDevices[devId].first;
-  const ibv_device_attr_ex* deviceAttr = device->GetDeviceAttr();
-
-  const uint32_t reasonableMaxSge = 16;
-  epConfig.maxMsgSge =
-      std::min(static_cast<uint32_t>(deviceAttr->orig_attr.max_sge), reasonableMaxSge);
+  epConfig.maxMsgsNum = std::min(8192u, maxQpWr);
+  epConfig.maxCqeNum = std::min(16384u, maxCqe);
+  epConfig.maxMsgSge = std::min<uint32_t>(deviceAttr->orig_attr.max_sge, 4u);
 
   return epConfig;
 }
