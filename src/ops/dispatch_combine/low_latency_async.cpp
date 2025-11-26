@@ -62,14 +62,15 @@ __global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
     if (__any(condition)) {
       // Indicate that this token is already sent to the destination PE by setting an overflow
       // token index
-      if (laneId == 0) args.dispDestTokIdMap[i] = config.worldSize * config.MaxNumTokensToSend();
+      if (laneId == 0)
+        args.dispDestTokIdMap[i] = config.worldSize * config.MaxNumTokensToSendPerRank();
       continue;
     }
 
     if (laneId == 0) {
       // decide token id in dest pe
       destTokId = atomicAdd(args.destPeTokenCounter + destPe, 1);
-      args.dispDestTokIdMap[i] = destPe * config.MaxNumTokensToSend() + destTokId;
+      args.dispDestTokIdMap[i] = destTokId + config.MaxNumTokensToSendPerRank() * destPe;
     }
     destTokId = __shfl(destTokId, 0);
 
@@ -140,7 +141,6 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   uint8_t* stagingPtr = (destPe != myPe)
                             ? args.shmemDispatchInpTokMemObj->template GetAs<uint8_t*>()
                             : args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
-  // uint8_t* stagingPtr = args.shmemDispatchInpTokMemObj->template GetAs<uint8_t*>();
   stagingPtr += (config.MaxNumTokensToSendPerRank() * destPe) * xferBytes;
 
   for (int tokenId = (blockId % blocksPerPe) * warpNum + warpId; tokenId < recvTokenNum;
@@ -163,9 +163,9 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
           stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes + weightBytes, scaleBytes);
     }
     if (laneId == 0) {
-      // printf("myPe %d destPe %d token id %d src token id %d\n", myPe, destPe, destTokId,
-      // reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes +
-      //                              weightBytes + scaleBytes)[0]);
+      // A map used to recover token ordering at combine send phase
+      args.dispReceiverIdxMap[destTokId] = config.MaxNumTokensToSendPerRank() * destPe + tokenId;
+      // A map used for unit test correctness check
       args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[destTokId] =
           reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes +
                                      weightBytes + scaleBytes)[0];
@@ -181,13 +181,90 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
 
   if ((finishedWarpNum == (2 * globalWarpNum - 1)) && (laneId < npes)) {
     if (laneId < npes) {
-      recvTokenNums[laneId] = 0;
+      // recvTokenNums[laneId] = 0;
       args.destPeTokenCounter[laneId] = 0;
     }
     if (laneId == 0) {
       args.dispatchGridBarrier[0] = 0;
     }
   }
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                  EpCombineLowLatencyAsyncRecv                                  */
+/* ---------------------------------------------------------------------------------------------- */
+template <typename T>
+__global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+
+  // Copy token onto staing buffer for later IBGDA transfer
+  index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
+  uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
+  for (int tokenId = globalWarpId; tokenId < totalRecvTokenNum; tokenId += globalWarpNum) {
+    index_t stagingTokId = 0;
+    if (laneId == 0) stagingTokId = args.dispReceiverIdxMap[tokenId];
+    stagingTokId = __shfl(stagingTokId, 0);
+    core::WarpCopy<uint8_t, 4>(stagingPtr + stagingTokId * hiddenBytes,
+                               reinterpret_cast<uint8_t*>(args.inpTokenBuf) + tokenId * hiddenBytes,
+                               hiddenBytes);
+  }
+  uint32_t barrierFlag = 0;
+  if (laneId == 0) {
+    atomicAdd(args.combineGridBarrier, 1);
+    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
+  }
+  barrierFlag = __shfl(barrierFlag, 0);
+
+  index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
+  for (int destPe = blockId; (destPe < npes) && (warpId == 0); destPe += blockNum) {
+    if (laneId == 0) shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
+    int tokenNum = recvTokenNums[destPe];
+    size_t remoteOffset = (config.MaxNumTokensToSendPerRank() * myPe) * hiddenBytes;
+    size_t localOffset = (config.MaxNumTokensToSendPerRank() * destPe) * hiddenBytes;
+    if (destPe != myPe)
+      shmem::ShmemPutMemNbiWarp(args.shmemCombineInpTokMemObj, remoteOffset,
+                                args.shmemStagingTokMemObj, localOffset, tokenNum * hiddenBytes,
+                                destPe);
+    shmem::ShmemPutUint32ImmNbiThread(args.crossDeviceBarrierMemObj, myPe * sizeof(uint32_t),
+                                      barrierFlag, destPe);
+  }
+  if (globalThdId == 0) printf("combine send\n");
+}
+
+template <typename T>
+__global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+
+  for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+    uint32_t barrierFlag = args.crossDeviceBarrierFlag[0];
+    shmem::ShmemUint32WaitUntilEquals(
+        args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>() + destPe, barrierFlag);
+  }
+
+  extern __shared__ char sharedMem[];
+  T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
+  float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
+                          warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
+
+  for (int tokenId = globalWarpId; tokenId < args.curRankNumToken; tokenId += globalWarpNum) {
+    for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
+      index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
+      index_t destPe = destTokId / config.MaxNumTokensToSendPerRank();
+
+      T* stagingPtr = (destPe != myPe) ? args.shmemCombineInpTokMemObj->template GetAs<T*>()
+                                       : args.shmemStagingTokMemObj->template GetAs<T*>();
+      if (destPe < npes) {
+        srcPtrs[j] = stagingPtr + destTokId * config.hiddenDim;
+      } else {
+        srcPtrs[j] = nullptr;
+      }
+    }
+
+    core::WarpAccum<T, 4>(
+        args.shmemCombineOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim, srcPtrs,
+        nullptr, config.numExpertPerToken, config.hiddenDim);
+  }
+  if (globalThdId == 0) printf("combine recv\n");
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -216,6 +293,30 @@ template __global__ void EpDispatchLowLatencyAsyncRecv<__hip_fp8_e4m3>(
     EpDispatchCombineArgs<__hip_fp8_e4m3> args);
 #endif
 template __global__ void EpDispatchLowLatencyAsyncRecv<float>(EpDispatchCombineArgs<float> args);
+
+template __global__ void EpCombineLowLatencyAsyncSend<hip_bfloat16>(
+    EpDispatchCombineArgs<hip_bfloat16> args);
+#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
+template __global__ void EpCombineLowLatencyAsyncSend<__hip_fp8_e4m3_fnuz>(
+    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
+#endif
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+template __global__ void EpCombineLowLatencyAsyncSend<__hip_fp8_e4m3>(
+    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
+#endif
+template __global__ void EpCombineLowLatencyAsyncSend<float>(EpDispatchCombineArgs<float> args);
+
+template __global__ void EpCombineLowLatencyAsyncRecv<hip_bfloat16>(
+    EpDispatchCombineArgs<hip_bfloat16> args);
+#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
+template __global__ void EpCombineLowLatencyAsyncRecv<__hip_fp8_e4m3_fnuz>(
+    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
+#endif
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+template __global__ void EpCombineLowLatencyAsyncRecv<__hip_fp8_e4m3>(
+    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
+#endif
+template __global__ void EpCombineLowLatencyAsyncRecv<float>(EpDispatchCombineArgs<float> args);
 
 }  // namespace moe
 }  // namespace mori
