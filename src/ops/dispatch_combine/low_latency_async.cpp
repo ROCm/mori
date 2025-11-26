@@ -172,7 +172,6 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
     }
   }
 
-  // Last warp to reset states
   uint32_t finishedWarpNum = 0;
   if (laneId == 0) {
     finishedWarpNum = atomicAdd(args.dispatchGridBarrier, 1);
@@ -181,7 +180,6 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
 
   if ((finishedWarpNum == (2 * globalWarpNum - 1)) && (laneId < npes)) {
     if (laneId < npes) {
-      // recvTokenNums[laneId] = 0;
       args.destPeTokenCounter[laneId] = 0;
     }
     if (laneId == 0) {
@@ -225,10 +223,10 @@ __global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
       shmem::ShmemPutMemNbiWarp(args.shmemCombineInpTokMemObj, remoteOffset,
                                 args.shmemStagingTokMemObj, localOffset, tokenNum * hiddenBytes,
                                 destPe);
-    shmem::ShmemPutUint32ImmNbiThread(args.crossDeviceBarrierMemObj, myPe * sizeof(uint32_t),
-                                      barrierFlag, destPe);
+    shmem::ShmemPutUint32ImmNbiWarp(args.crossDeviceBarrierMemObj, myPe * sizeof(uint32_t),
+                                    barrierFlag, destPe);
+    if (laneId == 0) recvTokenNums[destPe] = 0;
   }
-  if (globalThdId == 0) printf("combine send\n");
 }
 
 template <typename T>
@@ -246,7 +244,16 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
 
-  for (int tokenId = globalWarpId; tokenId < args.curRankNumToken; tokenId += globalWarpNum) {
+  index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
+  index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
+
+  for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
+    index_t tokenId = i / warpsPerToken;
+    index_t inTokenPartId = i % warpsPerToken;
+    index_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
+    index_t hiddenDimSize =
+        std::max(0, std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp));
+
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
       index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
       index_t destPe = destTokId / config.MaxNumTokensToSendPerRank();
@@ -254,17 +261,24 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
       T* stagingPtr = (destPe != myPe) ? args.shmemCombineInpTokMemObj->template GetAs<T*>()
                                        : args.shmemStagingTokMemObj->template GetAs<T*>();
       if (destPe < npes) {
-        srcPtrs[j] = stagingPtr + destTokId * config.hiddenDim;
+        srcPtrs[j] = stagingPtr + destTokId * config.hiddenDim + hiddenDimOffset;
       } else {
         srcPtrs[j] = nullptr;
       }
     }
 
-    core::WarpAccum<T, 4>(
-        args.shmemCombineOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim, srcPtrs,
-        nullptr, config.numExpertPerToken, config.hiddenDim);
+    core::WarpAccum<T, 4>(args.shmemCombineOutTokMemObj->template GetAs<T*>() +
+                              tokenId * config.hiddenDim + hiddenDimOffset,
+                          srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
   }
-  if (globalThdId == 0) printf("combine recv\n");
+
+  if (laneId == 0) {
+    uint32_t finishedWarpNum = atomicAdd(args.combineGridBarrier, 1);
+    if (finishedWarpNum == (2 * globalWarpNum - 1)) {
+      args.combineGridBarrier[0] = 0;
+      atomicAdd(args.crossDeviceBarrierFlag, 1);
+    }
+  }
 }
 
 /* ---------------------------------------------------------------------------------------------- */
