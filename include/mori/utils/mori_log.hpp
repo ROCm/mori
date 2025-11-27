@@ -80,7 +80,7 @@ class ModuleLogger {
     } else {
       // Create new logger
       logger = spdlog::stdout_color_mt(moduleName);
-      logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%n] [%^%l%$] %v");
+      logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%P] [%n] [%^%l%$] %v");
     }
     
     // Determine the log level priority: env var > global setting > provided level

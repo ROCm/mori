@@ -311,13 +311,15 @@ void RegisterMoriIo(pybind11::module_& m) {
   py::class_<mori::io::BackendConfig>(m, "BackendConfig");
 
   py::class_<mori::io::RdmaBackendConfig, mori::io::BackendConfig>(m, "RdmaBackendConfig")
-      .def(py::init<int, int, int, mori::io::PollCqMode>(), py::arg("qp_per_transfer") = 1,
+      .def(py::init<int, int, int, mori::io::PollCqMode, bool>(), py::arg("qp_per_transfer") = 1,
            py::arg("post_batch_size") = -1, py::arg("num_worker_threads") = -1,
-           py::arg("poll_cq_mode") = mori::io::PollCqMode::POLLING)
+           py::arg("poll_cq_mode") = mori::io::PollCqMode::POLLING,
+           py::arg("enable_notification") = true)
       .def_readwrite("qp_per_transfer", &mori::io::RdmaBackendConfig::qpPerTransfer)
       .def_readwrite("post_batch_size", &mori::io::RdmaBackendConfig::postBatchSize)
       .def_readwrite("num_worker_threads", &mori::io::RdmaBackendConfig::numWorkerThreads)
-      .def_readwrite("poll_cq_mode", &mori::io::RdmaBackendConfig::pollCqMode);
+      .def_readwrite("poll_cq_mode", &mori::io::RdmaBackendConfig::pollCqMode)
+      .def_readwrite("enable_notification", &mori::io::RdmaBackendConfig::enableNotification);
 
   py::class_<mori::io::IOEngineConfig>(m, "IOEngineConfig")
       .def(py::init<std::string, uint16_t>(), py::arg("host") = "", py::arg("port") = 0)
@@ -328,6 +330,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def(py::init<>())
       .def("Code", &mori::io::TransferStatus::Code)
       .def("Message", &mori::io::TransferStatus::Message)
+      .def("Update", &mori::io::TransferStatus::Update)
       .def("Init", &mori::io::TransferStatus::Init)
       .def("InProgress", &mori::io::TransferStatus::InProgress)
       .def("Succeeded", &mori::io::TransferStatus::Succeeded)

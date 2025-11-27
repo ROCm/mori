@@ -164,8 +164,8 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
   backend = SelectBackend(local, remote);                                     \
   if (backend == nullptr) {                                                   \
     if (status != nullptr) {                                                  \
-      status->SetCode(StatusCode::ERR_BAD_STATE);                             \
-      status->SetMessage("No available backend found, create backend first"); \
+      status->Update(StatusCode::ERR_BAD_STATE,                               \
+                     "No available backend found, create backend first");     \
     }                                                                         \
     MORI_IO_ERROR("No available backend found, please create backend first"); \
     return;                                                                   \
