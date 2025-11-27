@@ -54,7 +54,8 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, Trans
     int ret = ibv_post_send(ep.ibvHandle.qp, &wr, &bad_wr);
     if (ret != 0) {
       // TODO: set callback status here?
-      return {StatusCode::ERR_RDMA_OP, strerror(errno)};
+      return {StatusCode::ERR_RDMA_OP,
+              "ibv_post_send (notify) failed with " + std::to_string(ret) + ": " + strerror(ret)};
     }
   }
 
@@ -106,7 +107,8 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
 
   const uint64_t localBaseAddr = reinterpret_cast<uint64_t>(local.addr);
   const uint64_t remoteBaseAddr = reinterpret_cast<uint64_t>(remote.addr);
-  const uint32_t maxSge = std::max(eps[0].local.handle.maxSge, 1u); // We assume all endpoints have the same maxSge
+  const uint32_t maxSge =
+      std::max(eps[0].local.handle.maxSge, 1u);  // We assume all endpoints have the same maxSge
 
   std::vector<MergedWorkRequest> mergedWrs;
   mergedWrs.reserve(batchSize);
@@ -200,9 +202,11 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
           reinterpret_cast<uint64_t>(new CqCallbackMessage(callbackMeta, epTotalBatchSize));
       last.send_flags = IBV_SEND_SIGNALED;
     }
-    int ret = ibv_post_send(eps[epId].local.ibvHandle.qp, &mergedWrs[st].wr, nullptr);
+    struct ibv_send_wr* badWr = nullptr;
+    int ret = ibv_post_send(eps[epId].local.ibvHandle.qp, &mergedWrs[st].wr, &badWr);
     if (ret != 0) {
-      return {StatusCode::ERR_RDMA_OP, strerror(errno)};
+      return {StatusCode::ERR_RDMA_OP,
+              "ibv_post_send failed with " + std::to_string(ret) + ": " + strerror(ret)};
     }
     MORI_IO_TRACE("ibv_post_send ep index {} batch index range [{}, {})", epId, st, end);
   }

@@ -475,7 +475,7 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   RdmaEndpoint endpoint;
   endpoint.handle.psn = 0;
   endpoint.handle.portId = config.portId;
-  endpoint.handle.maxSge = deviceAttr->tm_caps.max_sge;
+  endpoint.handle.maxSge = config.maxMsgSge;
 
   HcaCapability hca_cap = QueryHcaCap(context);
 

@@ -24,7 +24,6 @@
 #include <sys/epoll.h>
 
 #include <algorithm>
-#include <chrono>
 #include <shared_mutex>
 
 #include "mori/io/logging.hpp"
@@ -55,10 +54,12 @@ std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
         return {{i, 1}};
       }
     }
-  } else {
-    assert("topo searching for device other than GPU is not implemented yet");
-    return {};
+  } else if (key.loc == MemoryLocationType::CPU) {
+    if (availDevices.empty()) return {};
+    int idx = (roundRobinCounter.fetch_add(1, std::memory_order_relaxed) % availDevices.size());
+    return {{idx, 1}};
   }
+  assert(false && "topo searching for device other than CPU/GPU is not implemented yet");
   return {};
 }
 
@@ -129,17 +130,24 @@ EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
   return remotes[engine].rTable[key];
 }
 
-application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int portId) {
-  application::RdmaEndpointConfig config;
-  config.portId = portId;
-  config.gidIdx = 3;
-  config.maxMsgsNum = 8192;
-  config.maxMsgSge = 1;
-  config.maxCqeNum = 8192;
-  config.alignment = PAGESIZE;
-  config.withCompChannel = true;
-  config.enableSrq = true;
-  return config;
+application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
+  const auto& [device, portId] = availDevices[devId];
+  const auto* deviceAttr = device->GetDeviceAttr();
+
+  application::RdmaEndpointConfig epConfig{};
+  epConfig.portId = portId;
+  epConfig.gidIdx = -1;
+  epConfig.enableSrq = false;
+  epConfig.alignment = PAGESIZE;
+  epConfig.withCompChannel = (config.pollCqMode == PollCqMode::EVENT);
+
+  uint32_t maxQpWr = static_cast<uint32_t>(deviceAttr->orig_attr.max_qp_wr);
+  uint32_t maxCqe = static_cast<uint32_t>(deviceAttr->orig_attr.max_cqe);
+
+  epConfig.maxMsgsNum = std::min(8192u, maxQpWr);
+  epConfig.maxCqeNum = std::min(16384u, maxCqe);
+  epConfig.maxMsgSge = std::min<uint32_t>(deviceAttr->orig_attr.max_sge, 4u);
+  return epConfig;
 }
 
 application::RdmaEndpoint RdmaManager::CreateEndpoint(int devId) {
@@ -147,8 +155,7 @@ application::RdmaEndpoint RdmaManager::CreateEndpoint(int devId) {
 
   application::RdmaDeviceContext* devCtx = GetOrCreateDeviceContext(devId);
 
-  application::RdmaEndpoint rdmaEp =
-      devCtx->CreateRdmaEndpoint(GetRdmaEndpointConfig(availDevices[devId].second));
+  application::RdmaEndpoint rdmaEp = devCtx->CreateRdmaEndpoint(GetRdmaEndpointConfig(devId));
   if (config.pollCqMode == PollCqMode::EVENT)
     SYSCALL_RETURN_ZERO(ibv_req_notify_cq(rdmaEp.ibvHandle.cq, 0));
   return rdmaEp;
@@ -210,27 +217,33 @@ void NotifManager::RegisterEndpointByQpn(uint32_t qpn) {
     assert(ep.has_value() && ep->local.ibvHandle.compCh);
     SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_ADD, ep->local.ibvHandle.compCh->fd, &ev));
   }
-}
 
-void NotifManager::RegisterDevice(int devId) {
+  // Skip notification setup if disabled
+  if (!config.enableNotification) {
+    return;
+  }
+
   std::lock_guard<std::mutex> lock(mu);
-  if (notifCtx.find(devId) != notifCtx.end()) return;
+  if (qpNotifCtx.find(qpn) != qpNotifCtx.end()) return;
 
-  application::RdmaDeviceContext* devCtx = rdma->GetRdmaDeviceContext(devId);
+  std::optional<EpPair> ep = rdma->GetEpPairByQpn(qpn);
+  assert(ep.has_value());
+
+  application::RdmaDeviceContext* devCtx = rdma->GetRdmaDeviceContext(ep->ldevId);
   assert(devCtx);
 
   void* buf;
   SYSCALL_RETURN_ZERO(
-      posix_memalign(reinterpret_cast<void**>(&buf), PAGESIZE, maxNotifNum * sizeof(NotifMessage)));
+      posix_memalign(reinterpret_cast<void**>(&buf), PAGESIZE, notifPerQp * sizeof(NotifMessage)));
   application::RdmaMemoryRegion mr =
-      devCtx->RegisterRdmaMemoryRegion(buf, maxNotifNum * sizeof(NotifMessage));
-  struct ibv_srq* srq = devCtx->GetIbvSrq();
-  assert(srq);
-  notifCtx.insert({devId, {srq, mr}});
+      devCtx->RegisterRdmaMemoryRegion(buf, notifPerQp * sizeof(NotifMessage));
 
-  // Pre post notification receive wr
-  // TODO: should use min(maxNotifNum, maxSrqWrNum)
-  for (uint64_t i = 0; i < maxNotifNum; i++) {
+  qpNotifCtx.insert({qpn, {mr, buf}});
+
+  struct ibv_qp* qp = ep->local.ibvHandle.qp;
+  assert(qp);
+
+  for (uint64_t i = 0; i < notifPerQp; i++) {
     struct ibv_sge sge{};
     sge.addr = mr.addr + i * sizeof(NotifMessage);
     sge.length = sizeof(NotifMessage);
@@ -242,80 +255,94 @@ void NotifManager::RegisterDevice(int devId) {
     wr.num_sge = 1;
 
     struct ibv_recv_wr* bad = nullptr;
-    SYSCALL_RETURN_ZERO(ibv_post_srq_recv(srq, &wr, &bad));
-  };
+    SYSCALL_RETURN_ZERO(ibv_post_recv(qp, &wr, &bad));
+  }
 }
 
 void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
   ibv_cq* cq = ep.local.ibvHandle.cq;
 
-  struct ibv_wc wc{};
-  while (ibv_poll_cq(cq, 1, &wc) > 0) {
-    if (wc.opcode == IBV_WC_RECV) {
-      std::lock_guard<std::mutex> lock(mu);
-      int devId = ep.ldevId;
+  const int batchSize = 32;
+  struct ibv_wc wc[batchSize];
+  int n = 0;
 
-      assert(notifCtx.find(devId) != notifCtx.end());
-      DeviceNotifContext& ctx = notifCtx[devId];
-
-      // FIXME: this notif mechenism has bug when notif index is wrapped around
-      uint64_t idx = wc.wr_id;
-      NotifMessage msg = reinterpret_cast<NotifMessage*>(ctx.mr.addr)[idx];
-      assert(msg.totalNum > 0);
-      // printf("recv notif for transfer %d\n", tid);
-
-      EngineKey ekey = ep.remoteEngineKey;
-      if (notifPool[ekey].find(msg.id) == notifPool[ekey].end()) {
-        notifPool[ekey][msg.id] = msg.totalNum;
-      }
-      notifPool[ekey][msg.id] -= 1;
-      MORI_IO_TRACE(
-          "NotifManager receive notif message from engine {} id {} qp {} total num {} cur num {}",
-          ekey.c_str(), msg.id, msg.qpIndex, msg.totalNum, notifPool[ekey][msg.id]);
-      // replenish recv wr
-      // TODO(ditian12): we should replenish recv wr faster, insufficient recv wr is met
-      // frequently when transfer is very fast. Two way to solve this, 1. use srq_limit to
-      // replenish in advance
-      // 2. independent srq entry config (now reuse maxMsgNum)
-      struct ibv_sge sge{};
-      sge.addr = ctx.mr.addr + idx * sizeof(NotifMessage);
-      sge.length = sizeof(NotifMessage);
-      sge.lkey = ctx.mr.lkey;
-
-      struct ibv_recv_wr wr{};
-      wr.wr_id = idx;
-      wr.sg_list = &sge;
-      wr.num_sge = 1;
-      struct ibv_recv_wr* bad = nullptr;
-      SYSCALL_RETURN_ZERO(ibv_post_srq_recv(ctx.srq, &wr, &bad));
-    } else if (wc.opcode == IBV_WC_SEND) {
-      uint64_t id = wc.wr_id;
-    } else {
-      CqCallbackMessage* msg = reinterpret_cast<CqCallbackMessage*>(wc.wr_id);
-      uint32_t lastBatchSize = msg->meta->finishedBatchSize.fetch_add(msg->batchSize);
-      if (msg->meta->status != nullptr) {
-        if (wc.status == IBV_WC_SUCCESS) {
-          if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
-            // TODO: should use atomic cas to avoid overwriting failed status
-            msg->meta->status->SetCode(StatusCode::SUCCESS);
-            msg->meta->status->SetMessage(ibv_wc_status_str(wc.status));
-          }
-        } else {
-          msg->meta->status->SetCode(StatusCode::ERR_RDMA_OP);
-          msg->meta->status->SetMessage(ibv_wc_status_str(wc.status));
-          // set status to nullptr indicate that transfer failed
-          msg->meta->status = nullptr;
+  while ((n = ibv_poll_cq(cq, batchSize, wc)) > 0) {
+    for (int i = 0; i < n; ++i) {
+      if (wc[i].opcode == IBV_WC_RECV) {
+        // Skip RECV processing if notification is disabled
+        if (!config.enableNotification) {
+          MORI_IO_WARN("Received unexpected RECV completion when notification is disabled");
+          continue;
         }
+
+        std::lock_guard<std::mutex> lock(mu);
+
+        assert(qpNotifCtx.find(qpn) != qpNotifCtx.end());
+        QpNotifContext& ctx = qpNotifCtx[qpn];
+
+        // FIXME: this notif mechenism has bug when notif index is wrapped around
+        uint64_t idx = wc[i].wr_id;
+        NotifMessage msg = reinterpret_cast<NotifMessage*>(ctx.mr.addr)[idx];
+        assert(msg.totalNum > 0);
+        // printf("recv notif for transfer %d\n", tid);
+
+        EngineKey ekey = ep.remoteEngineKey;
+        if (notifPool[ekey].find(msg.id) == notifPool[ekey].end()) {
+          notifPool[ekey][msg.id] = msg.totalNum;
+        }
+        notifPool[ekey][msg.id] -= 1;
+        MORI_IO_TRACE(
+            "NotifManager receive notif message from engine {} id {} qp {} total num {} cur num {}",
+            ekey.c_str(), msg.id, msg.qpIndex, msg.totalNum, notifPool[ekey][msg.id]);
+        // replenish recv wr
+        struct ibv_sge sge{};
+        sge.addr = ctx.mr.addr + idx * sizeof(NotifMessage);
+        sge.length = sizeof(NotifMessage);
+        sge.lkey = ctx.mr.lkey;
+
+        struct ibv_recv_wr wr{};
+        wr.wr_id = idx;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        struct ibv_recv_wr* bad = nullptr;
+        SYSCALL_RETURN_ZERO(ibv_post_recv(ep.local.ibvHandle.qp, &wr, &bad));
+      } else if (wc[i].opcode == IBV_WC_SEND) {
+        uint64_t id = wc[i].wr_id;
+        if (wc[i].status != IBV_WC_SUCCESS) {
+          MORI_IO_ERROR("NotifManager receive send cqe failed for wr_id {} status {}: {}", id,
+                        wc[i].status, ibv_wc_status_str(wc[i].status));
+        }
+      } else {
+        CqCallbackMessage* msg = reinterpret_cast<CqCallbackMessage*>(wc[i].wr_id);
+        uint32_t lastBatchSize = msg->meta->finishedBatchSize.fetch_add(msg->batchSize);
+        TransferStatus* statusPtr = msg->meta->status;
+        if (statusPtr != nullptr) {
+          if (wc[i].status == IBV_WC_SUCCESS) {
+            if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
+              statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
+            }
+          } else {
+            statusPtr->Update(StatusCode::ERR_RDMA_OP, ibv_wc_status_str(wc[i].status));
+            MORI_IO_ERROR("NotifManager receive cqe failed for task {} code {} status {}",
+                          msg->meta->id, static_cast<uint32_t>(wc[i].status),
+                          ibv_wc_status_str(wc[i].status));
+            // set status to nullptr indicate that transfer failed
+            msg->meta->status = nullptr;
+          }
+        }
+        MORI_IO_TRACE(
+            "NotifManager receive cqe for task {} code {} total batch size {} last batch size {} "
+            "cur "
+            "batch size {}",
+            msg->meta->id,
+            statusPtr != nullptr ? statusPtr->CodeUint32()
+                                 : static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
+            msg->meta->totalBatchSize, lastBatchSize, msg->batchSize);
+        if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
+          delete msg->meta;
+        }
+        delete msg;
       }
-      MORI_IO_TRACE(
-          "NotifManager receive cqe for task {} code {} total batch size {} last batch size {} cur "
-          "batch size {}",
-          msg->meta->id, msg->meta->status->CodeUint32(), msg->meta->totalBatchSize, lastBatchSize,
-          msg->batchSize);
-      if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
-        free(msg->meta);
-      }
-      free(msg);
     }
   }
 }
@@ -428,7 +455,8 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo) {
 
   rdma->ConnectEndpoint(ekey, devId, lep, msg.devId, msg.eph, topo, weight);
   notif->RegisterEndpointByQpn(lep.handle.qpn);
-  notif->RegisterDevice(devId);
+  MORI_IO_INFO("Built RdmaConn for engine {} with topo local({},{}) remote({},{})", ekey,
+               topo.local.deviceId, topo.local.loc, topo.remote.deviceId, topo.remote.loc);
   ctx->CloseEndpoint(tcph);
 }
 
@@ -487,10 +515,9 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
       int rdevId = msg.devId;
       auto [devId, weight] = candidates[0];
       application::RdmaEndpoint lep = rdma->CreateEndpoint(devId);
-      p.WriteMessageRegEndpoint(MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle});
       rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
       notif->RegisterEndpointByQpn(lep.handle.qpn);
-      notif->RegisterDevice(devId);
+      p.WriteMessageRegEndpoint(MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle});
       SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL));
       break;
     }
@@ -584,11 +611,13 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
 
   assert(!ret.Init());
   if (ret.Failed() || ret.Succeeded()) {
-    status->SetCode(ret.code);
-    status->SetMessage(ret.message);
+    status->Update(ret.code, ret.message);
   }
-  if (!ret.Failed()) {
-    RdmaNotifyTransfer(eps, status, id);
+  if (!ret.Failed() && config.enableNotification) {
+    RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
+    if (notifRet.Failed()) {
+      status->Update(notifRet.code, notifRet.message);
+    }
   }
 }
 
@@ -609,11 +638,13 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   }
   assert(!ret.Init());
   if (ret.Failed() || ret.Succeeded()) {
-    status->SetCode(ret.code);
-    status->SetMessage(ret.message);
+    status->Update(ret.code, ret.message);
   }
-  if (!ret.Failed()) {
-    RdmaNotifyTransfer(eps, status, id);
+  if (!ret.Failed() && config.enableNotification) {
+    RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
+    if (notifRet.Failed()) {
+      status->Update(notifRet.code, notifRet.message);
+    }
   }
 }
 
