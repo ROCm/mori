@@ -55,13 +55,11 @@ std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
       }
     }
   } else if (key.loc == MemoryLocationType::CPU) {
-    static std::atomic<int> roundRobinCounter{0};
-    if (!availDevices.empty()) {
-      int idx = roundRobinCounter.fetch_add(1) % availDevices.size();
-      return {{idx, 1}};
-    }
+    if (availDevices.empty()) return {};
+    int idx = (roundRobinCounter.fetch_add(1, std::memory_order_relaxed) % availDevices.size());
+    return {{idx, 1}};
   }
-  assert("topo searching for device other than CPU/GPU is not implemented yet");
+  assert(false && "topo searching for device other than CPU/GPU is not implemented yet");
   return {};
 }
 
@@ -132,17 +130,24 @@ EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
   return remotes[engine].rTable[key];
 }
 
-application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int portId) {
-  application::RdmaEndpointConfig config;
-  config.portId = portId;
-  config.gidIdx = -1;
-  config.maxMsgsNum = 8192;
-  config.maxMsgSge = 1;
-  config.maxCqeNum = 8192;
-  config.alignment = PAGESIZE;
-  config.withCompChannel = true;
-  config.enableSrq = false;
-  return config;
+application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
+  const auto& [device, portId] = availDevices[devId];
+  const auto* deviceAttr = device->GetDeviceAttr();
+
+  application::RdmaEndpointConfig epConfig{};
+  epConfig.portId = portId;
+  epConfig.gidIdx = -1;
+  epConfig.enableSrq = false;
+  epConfig.alignment = PAGESIZE;
+  epConfig.withCompChannel = (config.pollCqMode == PollCqMode::EVENT);
+
+  uint32_t maxQpWr = static_cast<uint32_t>(deviceAttr->orig_attr.max_qp_wr);
+  uint32_t maxCqe = static_cast<uint32_t>(deviceAttr->orig_attr.max_cqe);
+
+  epConfig.maxMsgsNum = std::min(8192u, maxQpWr);
+  epConfig.maxCqeNum = std::min(16384u, maxCqe);
+  epConfig.maxMsgSge = std::min<uint32_t>(deviceAttr->orig_attr.max_sge, 4u);
+  return epConfig;
 }
 
 application::RdmaEndpoint RdmaManager::CreateEndpoint(int devId) {
@@ -150,8 +155,7 @@ application::RdmaEndpoint RdmaManager::CreateEndpoint(int devId) {
 
   application::RdmaDeviceContext* devCtx = GetOrCreateDeviceContext(devId);
 
-  application::RdmaEndpoint rdmaEp =
-      devCtx->CreateRdmaEndpoint(GetRdmaEndpointConfig(availDevices[devId].second));
+  application::RdmaEndpoint rdmaEp = devCtx->CreateRdmaEndpoint(GetRdmaEndpointConfig(devId));
   if (config.pollCqMode == PollCqMode::EVENT)
     SYSCALL_RETURN_ZERO(ibv_req_notify_cq(rdmaEp.ibvHandle.cq, 0));
   return rdmaEp;
@@ -454,6 +458,8 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo) {
 
   rdma->ConnectEndpoint(ekey, devId, lep, msg.devId, msg.eph, topo, weight);
   notif->RegisterEndpointByQpn(lep.handle.qpn);
+  MORI_IO_INFO("Built RdmaConn for engine {} with topo local({},{}) remote({},{})", ekey,
+               topo.local.deviceId, topo.local.loc, topo.remote.deviceId, topo.remote.loc);
   ctx->CloseEndpoint(tcph);
 }
 
