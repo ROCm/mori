@@ -330,6 +330,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def(py::init<>())
       .def("Code", &mori::io::TransferStatus::Code)
       .def("Message", &mori::io::TransferStatus::Message)
+      .def("Update", &mori::io::TransferStatus::Update)
       .def("Init", &mori::io::TransferStatus::Init)
       .def("InProgress", &mori::io::TransferStatus::InProgress)
       .def("Succeeded", &mori::io::TransferStatus::Succeeded)

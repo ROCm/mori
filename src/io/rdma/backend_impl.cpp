@@ -319,13 +319,10 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
         if (statusPtr != nullptr) {
           if (wc[i].status == IBV_WC_SUCCESS) {
             if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
-              // TODO: should use atomic cas to avoid overwriting failed status
-              statusPtr->SetMessage(ibv_wc_status_str(wc[i].status));
-              statusPtr->SetCode(StatusCode::SUCCESS);
+              statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
             }
           } else {
-            statusPtr->SetMessage(ibv_wc_status_str(wc[i].status));
-            statusPtr->SetCode(StatusCode::ERR_RDMA_OP);
+            statusPtr->Update(StatusCode::ERR_RDMA_OP, ibv_wc_status_str(wc[i].status));
             MORI_IO_ERROR("NotifManager receive cqe failed for task {} code {} status {}",
                           msg->meta->id, static_cast<uint32_t>(wc[i].status),
                           ibv_wc_status_str(wc[i].status));
@@ -614,14 +611,12 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
 
   assert(!ret.Init());
   if (ret.Failed() || ret.Succeeded()) {
-    status->SetMessage(ret.message);
-    status->SetCode(ret.code);
+    status->Update(ret.code, ret.message);
   }
   if (!ret.Failed() && config.enableNotification) {
     RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
     if (notifRet.Failed()) {
-      status->SetMessage(notifRet.message);
-      status->SetCode(notifRet.code);
+      status->Update(notifRet.code, notifRet.message);
     }
   }
 }
@@ -643,14 +638,12 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   }
   assert(!ret.Init());
   if (ret.Failed() || ret.Succeeded()) {
-    status->SetMessage(ret.message);
-    status->SetCode(ret.code);
+    status->Update(ret.code, ret.message);
   }
   if (!ret.Failed() && config.enableNotification) {
     RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
     if (notifRet.Failed()) {
-      status->SetMessage(notifRet.message);
-      status->SetCode(notifRet.code);
+      status->Update(notifRet.code, notifRet.message);
     }
   }
 }

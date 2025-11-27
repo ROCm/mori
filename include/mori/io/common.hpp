@@ -109,7 +109,19 @@ struct TransferStatus {
   StatusCode Code() { return code.load(std::memory_order_acquire); }
   uint32_t CodeUint32() { return static_cast<uint32_t>(code.load(std::memory_order_acquire)); }
 
-  std::string Message() { return msg; }
+  std::string Message() {
+    std::lock_guard<std::mutex> lock(msgMu);
+    return msg;
+  }
+
+  void Update(enum StatusCode val, const std::string& message) {
+    std::lock_guard<std::mutex> lock(msgMu);
+    StatusCode current = code.load(std::memory_order_relaxed);
+    if (current > StatusCode::ERR_BEGIN) return;
+
+    msg = message;
+    code.store(val, std::memory_order_release);
+  }
 
   bool Init() { return Code() == StatusCode::INIT; }
   bool InProgress() { return Code() == StatusCode::IN_PROGRESS; }
