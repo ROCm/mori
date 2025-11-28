@@ -56,7 +56,7 @@ namespace moe {
   size_t indexBytes = config.numExpertPerToken * sizeof(index_t);                               \
   size_t weightBytes = config.numExpertPerToken * sizeof(float);                                \
   size_t srcTokenIdBytes = sizeof(index_t);                                                     \
-  size_t scaleBytes = (args.scalesBuf == nullptr) ? 0 : config.scaleDim * config.scaleTypeSize; \
+  size_t scaleBytes = (args.config.scaleDim == 0) ? 0 : config.scaleDim * config.scaleTypeSize; \
   size_t xferBytes = hiddenBytes + indexBytes + weightBytes + srcTokenIdBytes + scaleBytes;     \
   size_t combXferBytes = (args.weightsBuf == nullptr) ? hiddenBytes : hiddenBytes + weightBytes;
 
@@ -342,7 +342,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
       int lanePe = -1;
       if (laneId < config.numExpertPerToken) {
         lanePe = indices[laneId] / config.numExpertPerRank;
-        assert((lanePe < config.worldSize) && (lanePe >= 0));
+	      assert((lanePe < config.worldSize) && (lanePe >= 0));
       }
       index_t srcTokId = reinterpret_cast<index_t*>(stagingPtr + tokIdx * xferBytes + hiddenBytes +
                                                     indexBytes + weightBytes + scaleBytes)[0];

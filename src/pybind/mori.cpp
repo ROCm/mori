@@ -58,7 +58,7 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
   }
 
   uint8_t* scalePtr = nullptr;
-  if (scales.has_value() && handle.config.scaleDim > 0) {
+  if (scales.has_value() && (handle.config.scaleDim > 0)) {
     assert(scales->is_contiguous() && scales->element_size() == handle.config.scaleTypeSize);
     scalePtr = reinterpret_cast<uint8_t*>(scales->data_ptr());
   }
@@ -80,7 +80,7 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
       torch::TensorOptions().dtype(mori::GetTorchDataType<float>()).device(torch::kCUDA));
 
   std::optional<torch::Tensor> outScales{std::nullopt};
-  if (scales.has_value() && handle.config.scaleDim > 0) {
+  if (scales.has_value() && (handle.config.scaleDim > 0)) {
     outScales =
         torch::from_blob(handle.shmemOutScalesMemObj->Get(),
                          {handle.config.MaxNumTokensToRecv(), handle.config.scaleDim},
