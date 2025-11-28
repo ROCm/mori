@@ -49,6 +49,7 @@ class EpDispatchCombineConfig:
     kernel_type: EpDispatchCombineKernelType = EpDispatchCombineKernelType.IntraNode
     gpu_per_node: int = 8
     rdma_block_num: int = 0
+    num_qp_per_pe: int = 1
 
 
 def _cpp_dispatch_combine_factory(entity_name):
@@ -74,8 +75,10 @@ class EpDispatchCombineOp:
                 warp_num_per_block=config.warp_num_per_block,
                 block_num=config.block_num,
                 use_external_inp_buf=config.use_external_inp_buf,
+                kernel_type=config.kernel_type,
                 gpu_per_node=config.gpu_per_node,
                 rdma_block_num=config.rdma_block_num,
+                num_qp_per_pe=config.num_qp_per_pe,
             )
         )
 

@@ -24,9 +24,9 @@
 namespace mori {
 namespace core {
 
-#define QUEUE_SIZE 			1
+#define QUEUE_SIZE		1
 #define MAX_INLINE_SIZE		32
-#define IONIC_CCQE 0
-
+//#define IONIC_CCQE           1
+#undef IONIC_CCQE
 }  // namespace core
 }  // namespace mori
