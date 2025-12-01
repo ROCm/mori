@@ -357,7 +357,8 @@ void BnxtQpContainer::ModifyRst2Init() {
   assert(!status);
 }
 
-void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
+void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
+                                     const RdmaEndpointHandle& remote_handle,
                                      const ibv_port_attr& portAttr,
                                      const ibv_device_attr_ex& deviceAttr) {
   struct ibv_qp_attr attr;
@@ -370,7 +371,7 @@ void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
   attr.dest_qp_num = remote_handle.qpn;
 
   memcpy(&attr.ah_attr.grh.dgid, remote_handle.eth.gid, 16);
-  attr.ah_attr.grh.sgid_index = config.gidIdx;
+  attr.ah_attr.grh.sgid_index = local_handle.eth.gidIdx;
   attr.ah_attr.grh.hop_limit = 1;
   attr.ah_attr.sl = 1;
   attr.ah_attr.is_global = 1;
@@ -457,6 +458,7 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   int gidIdx = config.gidIdx;
   if (gidIdx == -1) {
     const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(config.portId);
+    assert(portAttr);
     // Auto detect
     int bestGidIdx = -1;
     int bestScore = -1;
@@ -499,14 +501,11 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
 
     if (bestGidIdx != -1) {
       gidIdx = bestGidIdx;
-      SYSCALL_RETURN_ZERO(ibv_query_gid(context, config.portId, gidIdx, &ibvGid));
     } else {
       gidIdx = 0;  // fallback
-      SYSCALL_RETURN_ZERO(ibv_query_gid(context, config.portId, gidIdx, &ibvGid));
     }
-  } else {
-    SYSCALL_RETURN_ZERO(ibv_query_gid(context, config.portId, gidIdx, &ibvGid));
   }
+  SYSCALL_RETURN_ZERO(ibv_query_gid(context, config.portId, gidIdx, &ibvGid));
   memcpy(endpoint.handle.eth.gid, ibvGid.raw, sizeof(endpoint.handle.eth.gid));
   endpoint.handle.eth.gidIdx = gidIdx;
 
@@ -574,7 +573,7 @@ void BnxtDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   const ibv_device_attr_ex& deviceAttr = *(rdmaDevice->GetDeviceAttr());
   const ibv_port_attr& portAttr = *(rdmaDevice->GetPortAttrMap()->find(local.portId)->second);
   qp->ModifyRst2Init();
-  qp->ModifyInit2Rtr(remote, portAttr, deviceAttr);
+  qp->ModifyInit2Rtr(local, remote, portAttr, deviceAttr);
   qp->ModifyRtr2Rts(local, remote, qpId);
 }
 

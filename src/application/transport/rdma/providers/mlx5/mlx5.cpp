@@ -376,7 +376,8 @@ void Mlx5QpContainer::ModifyRst2Init() {
   assert(!status);
 }
 
-void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
+void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
+                                     const RdmaEndpointHandle& remote_handle,
                                      const ibv_port_attr& portAttr, uint32_t qpId) {
   uint8_t init2rtr_cmd_in[DEVX_ST_SZ_BYTES(init2rtr_qp_in)] = {
       0,
@@ -407,7 +408,7 @@ void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
     memcpy(DEVX_ADDR_OF(qpc, qpc, primary_address_path.rmac_47_32), remote_handle.eth.mac,
            sizeof(remote_handle.eth.mac));
     DEVX_SET(qpc, qpc, primary_address_path.hop_limit, 64);
-    DEVX_SET(qpc, qpc, primary_address_path.src_addr_index, config.gidIdx);
+    DEVX_SET(qpc, qpc, primary_address_path.src_addr_index, local_handle.eth.gidIdx);
     // Use shared UDP sport configuration with qpId-based selection
     uint16_t selected_udp_sport = device_context->GetUdpSport(qpId);
     DEVX_SET(qpc, qpc, primary_address_path.udp_sport, selected_udp_sport | 0xC000);
@@ -484,6 +485,7 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
     int gidIdx = config.gidIdx;
     if (gidIdx == -1) {
       const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(config.portId);
+      assert(portAttr);
       union ibv_gid gid;
       // Auto detect
       int bestGidIdx = -1;
@@ -609,7 +611,7 @@ void Mlx5DeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   const ibv_device_attr_ex* deviceAttr = rdmaDevice->GetDeviceAttr();
   const ibv_port_attr& portAttr = *(rdmaDevice->GetPortAttrMap()->find(local.portId)->second);
   qp->ModifyRst2Init();
-  qp->ModifyInit2Rtr(remote, portAttr, qpId);
+  qp->ModifyInit2Rtr(local, remote, portAttr, qpId);
   qp->ModifyRtr2Rts(local);
 
   MORI_APP_TRACE("MLX5 endpoint connected successfully: local_qpn={}, remote_qpn={}", local_qpn,

@@ -47,6 +47,7 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
   endpoint.handle.maxSge = config.maxMsgSge;
 
   const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(config.portId);
+  assert(portAttr);
   if (portAttr->link_layer == IBV_LINK_LAYER_INFINIBAND) {
     endpoint.handle.ib.lid = portAttr->lid;
   } else if (portAttr->link_layer == IBV_LINK_LAYER_ETHERNET) {
@@ -95,14 +96,12 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
 
       if (bestGidIdx != -1) {
         gidIdx = bestGidIdx;
-        SYSCALL_RETURN_ZERO(ibv_query_gid(context, config.portId, gidIdx, &gid));
       } else {
         gidIdx = 0;  // fallback
-        SYSCALL_RETURN_ZERO(ibv_query_gid(context, config.portId, gidIdx, &gid));
       }
-    } else {
-      SYSCALL_RETURN_ZERO(ibv_query_gid(context, config.portId, gidIdx, &gid));
     }
+    SYSCALL_RETURN_ZERO(ibv_query_gid(context, config.portId, gidIdx, &gid));
+
     memcpy(endpoint.handle.eth.gid, gid.raw, 16);
     endpoint.handle.eth.gidIdx = gidIdx;
   } else {
@@ -164,7 +163,7 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   SYSCALL_RETURN_ZERO(ibv_modify_qp(qp, &attr, flags));
 
   const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(local.portId);
-
+  assert(portAttr);
   // RTR
   attr.qp_state = IBV_QPS_RTR;
   attr.path_mtu = portAttr->active_mtu;
