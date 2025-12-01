@@ -387,7 +387,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
             args.shmemDispatchOutWeightsMemObj->template GetAs<uint8_t*>(destPe) +
                 destTokId * weightBytes,
             stagingPtr + tokIdx * xferBytes + hiddenBytes + indexBytes, weightBytes);
-        if (args.scalesBuf && (scaleBytes > 0)) {
+        if (scaleBytes > 0) {
           core::WarpCopy<uint8_t, 4>(
               args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destTokId * scaleBytes,
               stagingPtr + tokIdx * xferBytes + hiddenBytes + indexBytes + weightBytes, scaleBytes);
