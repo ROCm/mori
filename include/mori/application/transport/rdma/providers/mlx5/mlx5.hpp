@@ -83,12 +83,14 @@ class Mlx5QpContainer {
   ~Mlx5QpContainer();
 
   void ModifyRst2Init();
-  void ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr, uint32_t qpId = 0);
+  void ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
+                      const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr,
+                      uint32_t qpId = 0);
   void ModifyRtr2Rts(const RdmaEndpointHandle& local_handle);
 
   void* GetSqAddress();
   void* GetRqAddress();
-  
+
   Mlx5DeviceContext* GetDeviceContext() { return device_context; }
 
  private:
@@ -115,7 +117,7 @@ class Mlx5QpContainer {
   mlx5dv_devx_uar* qpUar{nullptr};
   void* qpUarPtr{nullptr};
   mlx5dv_devx_obj* qp{nullptr};
-  
+
   // Atomic internal buffer fields
   void* atomicIbufAddr{nullptr};
   size_t atomicIbufSize{0};
@@ -131,8 +133,8 @@ class Mlx5DeviceContext : public RdmaDeviceContext {
   ~Mlx5DeviceContext() override;
 
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) override;
-  virtual void ConnectEndpoint(const RdmaEndpointHandle& local,
-                               const RdmaEndpointHandle& remote, uint32_t qpId = 0) override;
+  virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote,
+                               uint32_t qpId = 0) override;
 
  private:
   uint32_t pdn;

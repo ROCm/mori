@@ -89,6 +89,17 @@ struct RdmaEndpointConfig {
   uint32_t atomicIbufSlots{512};  // Number of atomic internal buffer slots, each slot is 8B
 };
 
+struct GidSelectionResult {
+  int32_t gidIdx{-1};
+  union ibv_gid gid = {};
+  ibv_gid_type gidType{IBV_GID_TYPE_IB};
+  bool fromUser{false};
+  bool valid{false};
+};
+
+GidSelectionResult AutoSelectGidIndex(ibv_context* context, uint32_t portId,
+                                      const ibv_port_attr* portAttr, int32_t configuredGidIdx = -1);
+
 struct InfiniBandEndpointHandle {
   uint32_t lid{0};
   constexpr bool operator==(const InfiniBandEndpointHandle& rhs) const noexcept {

@@ -21,8 +21,12 @@
 // SOFTWARE.
 #include "mori/application/transport/rdma/rdma.hpp"
 
+#include <algorithm>
 #include <cassert>
+#include <cctype>
+#include <climits>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <unordered_set>
@@ -35,6 +39,198 @@
 
 namespace mori {
 namespace application {
+
+namespace {
+std::string TrimWhitespace(const std::string& input) {
+  auto begin = std::find_if_not(input.begin(), input.end(),
+                                [](unsigned char ch) { return std::isspace(ch); });
+  auto end = std::find_if_not(input.rbegin(), input.rend(), [](unsigned char ch) {
+               return std::isspace(ch);
+             }).base();
+  if (begin >= end) return {};
+  return std::string(begin, end);
+}
+
+bool IsZeroGid(const union ibv_gid& gid) {
+  for (const auto byte : gid.raw) {
+    if (byte != 0) return false;
+  }
+  return true;
+}
+
+bool IsIpv4MappedGid(const union ibv_gid& gid) {
+  for (int i = 0; i < 10; ++i) {
+    if (gid.raw[i] != 0) return false;
+  }
+  return gid.raw[10] == 0xff && gid.raw[11] == 0xff;
+}
+
+bool IsLinkLocal(const union ibv_gid& gid) {
+  return gid.raw[0] == 0xfe && (gid.raw[1] & 0xc0) == 0x80;
+}
+
+bool ReadGidTypeFromSysfs(ibv_context* context, uint32_t portId, int index,
+                          ibv_gid_type* out_type) {
+  if (!context || !context->device || !out_type || index < 0) return false;
+
+  char path[PATH_MAX];
+  int written = snprintf(path, sizeof(path), "/sys/class/infiniband/%s/ports/%u/gid_attrs/types/%d",
+                         context->device->name, portId, index);
+  if (written <= 0 || written >= static_cast<int>(sizeof(path))) return false;
+
+  std::ifstream typeFile(path);
+  if (!typeFile.is_open()) return false;
+
+  std::string line;
+  std::getline(typeFile, line);
+  typeFile.close();
+  line = TrimWhitespace(line);
+  if (line.empty()) return false;
+
+  std::transform(line.begin(), line.end(), line.begin(),
+                 [](unsigned char ch) { return std::tolower(ch); });
+
+  if (line.find("v2") != std::string::npos) {
+    *out_type = IBV_GID_TYPE_ROCE_V2;
+    return true;
+  }
+  if (line.find("v1") != std::string::npos) {
+    *out_type = IBV_GID_TYPE_ROCE_V1;
+    return true;
+  }
+  if (line.find("ib") != std::string::npos) {
+    *out_type = IBV_GID_TYPE_IB;
+    return true;
+  }
+
+  return false;
+}
+
+bool QueryGidAtIndex(ibv_context* context, uint32_t portId, int index,
+                     const ibv_port_attr* portAttr, union ibv_gid* out_gid,
+                     ibv_gid_type* out_type) {
+  if (!context || index < 0) return false;
+
+  ibv_gid_entry entry{};
+  if (ibv_query_gid_ex(context, portId, index, &entry, 0) == 0) {
+    if (out_gid) *out_gid = entry.gid;
+    if (out_type) *out_type = static_cast<ibv_gid_type>(entry.gid_type);
+    return true;
+  }
+
+  union ibv_gid legacy_gid{};
+  if (ibv_query_gid(context, portId, index, &legacy_gid) == 0) {
+    if (out_gid) *out_gid = legacy_gid;
+    if (out_type) {
+      ibv_gid_type legacy_type = IBV_GID_TYPE_IB;
+      if (portAttr && portAttr->link_layer == IBV_LINK_LAYER_INFINIBAND) {
+        legacy_type = IBV_GID_TYPE_IB;
+      } else {
+        if (!ReadGidTypeFromSysfs(context, portId, index, &legacy_type)) {
+          legacy_type = IBV_GID_TYPE_ROCE_V1;
+        }
+      }
+      *out_type = legacy_type;
+    }
+    return true;
+  }
+
+  return false;
+}
+
+int ScoreGidCandidate(const union ibv_gid& gid, ibv_gid_type gidType, int index) {
+  if (IsZeroGid(gid)) return INT_MIN;
+
+  bool isIpv4 = IsIpv4MappedGid(gid);
+  bool isLinkLocalGid = IsLinkLocal(gid);
+  bool isGlobalIpv6 = !isIpv4 && !isLinkLocalGid;
+
+  int score = 0;
+
+  if (gidType == IBV_GID_TYPE_ROCE_V2) {
+    score += 1000;
+  } else if (gidType == IBV_GID_TYPE_ROCE_V1) {
+    score += 500;
+  } else {
+    score += 100;
+  }
+
+  if (isIpv4) {
+    score += 200;
+  } else if (isGlobalIpv6) {
+    score += 100;
+  }
+
+  score -= index;  // Prefer smaller indices for deterministic behavior
+  return score;
+}
+
+}  // namespace
+
+GidSelectionResult AutoSelectGidIndex(ibv_context* context, uint32_t portId,
+                                      const ibv_port_attr* portAttr, int32_t configuredGidIdx) {
+  GidSelectionResult result{};
+  result.gidIdx = configuredGidIdx;
+  if (!context) return result;
+
+  if (configuredGidIdx >= 0) {
+    result.fromUser = true;
+    if (QueryGidAtIndex(context, portId, configuredGidIdx, portAttr, &result.gid,
+                        &result.gidType)) {
+      result.valid = true;
+    } else {
+      MORI_APP_WARN("Failed to query user-specified gid index {} on port {}", configuredGidIdx,
+                    portId);
+    }
+    return result;
+  }
+
+  int gidTableLen = portAttr ? static_cast<int>(portAttr->gid_tbl_len) : 0;
+  if (gidTableLen <= 0) gidTableLen = 128;  // Conservative fallback
+
+  int bestScore = INT_MIN;
+  int bestIdx = -1;
+  union ibv_gid bestGid{};
+  ibv_gid_type bestType = IBV_GID_TYPE_IB;
+  bool found = false;
+
+  for (int idx = 0; idx < gidTableLen; ++idx) {
+    union ibv_gid gid{};
+    ibv_gid_type gidType = IBV_GID_TYPE_IB;
+    if (!QueryGidAtIndex(context, portId, idx, portAttr, &gid, &gidType)) continue;
+
+    int score = ScoreGidCandidate(gid, gidType, idx);
+    if (score > bestScore) {
+      bestScore = score;
+      bestIdx = idx;
+      bestGid = gid;
+      bestType = gidType;
+      found = true;
+
+      if (score > 1000 + 200) break;  // Optimal candidate found
+    }
+  }
+
+  if (!found) {
+    if (QueryGidAtIndex(context, portId, 0, portAttr, &bestGid, &bestType)) {
+      bestIdx = 0;
+      found = true;
+    }
+  }
+
+  if (found) {
+    result.gidIdx = bestIdx;
+    result.gid = bestGid;
+    result.gidType = bestType;
+    result.valid = true;
+    MORI_APP_TRACE("Auto-selected GID index {} (type={}) on port {}", bestIdx,
+                   static_cast<int>(bestType), portId);
+  } else {
+    MORI_APP_ERROR("Failed to auto-detect a valid GID on port {}", portId);
+  }
+
+  return result;
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        RdmaDeviceContext                                       */
@@ -297,9 +493,8 @@ void RdmaContext::Initialize() {
 /* ---------------------------------------------------------------------------------------------- */
 void RdmaDeviceContext::InitializeUdpSportConfiguration() {
   // Default UDP sport configuration
-  static constexpr uint16_t DEFAULT_UDP_SPORTS[RDMA_UDP_SPORT_ARRAY_SIZE] = {
-    49153, 49154, 49155, 49156
-  };
+  static constexpr uint16_t DEFAULT_UDP_SPORTS[RDMA_UDP_SPORT_ARRAY_SIZE] = {49153, 49154, 49155,
+                                                                             49156};
 
   // Initialize with defaults
   for (uint32_t i = 0; i < RDMA_UDP_SPORT_ARRAY_SIZE; i++) {
@@ -327,9 +522,8 @@ void RdmaDeviceContext::InitializeUdpSportConfiguration() {
     }
   } else {
     // Check individual environment variables
-    const char* env_vars[RDMA_UDP_SPORT_ARRAY_SIZE] = {
-      "MORI_GOR_PORT1", "MORI_GOR_PORT2", "MORI_GOR_PORT3", "MORI_GOR_PORT4"
-    };
+    const char* env_vars[RDMA_UDP_SPORT_ARRAY_SIZE] = {"MORI_GOR_PORT1", "MORI_GOR_PORT2",
+                                                       "MORI_GOR_PORT3", "MORI_GOR_PORT4"};
 
     for (uint32_t i = 0; i < RDMA_UDP_SPORT_ARRAY_SIZE; i++) {
       const char* env_val = std::getenv(env_vars[i]);
@@ -338,7 +532,8 @@ void RdmaDeviceContext::InitializeUdpSportConfiguration() {
           uint16_t port_val = static_cast<uint16_t>(std::stoul(env_val, nullptr, 0));
           udp_sport_setting[i] = port_val;
         } catch (const std::exception& e) {
-          MORI_APP_WARN("Invalid UDP sport value in {}: {}, using default value", env_vars[i], env_val);
+          MORI_APP_WARN("Invalid UDP sport value in {}: {}, using default value", env_vars[i],
+                        env_val);
         }
       }
     }
