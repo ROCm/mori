@@ -233,9 +233,11 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
         return new BnxtDevice(inDevice);
         break;
 #endif
+#ifdef ENABLE_IONIC	
       case (static_cast<uint32_t>(RdmaDeviceVendorId::Pensando)):
         return new IonicDevice(inDevice);
         break;
+#endif	
       default:
         return nullptr;
     }

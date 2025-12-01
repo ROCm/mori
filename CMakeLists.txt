@@ -21,6 +21,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(USE_ROCM "Whether to use rocm" ON)
 option(USE_BNXT "Whether to use BNXT NIC" OFF)
+option(USE_IONIC "Whether to use IONIC" OFF)
 option(BUILD_EXAMPLES "Whether to build examples" ON)
 option(BUILD_APPLICATION "Whether to build application library" ON)
 option(BUILD_SHMEM "Whether to build shmem library" ON)
@@ -43,6 +44,24 @@ endif()
 message(STATUS "USE_BNXT = ${USE_BNXT}")
 if(USE_BNXT)
   add_compile_definitions(ENABLE_BNXT)
+endif()
+
+find_library(IONIC_LIB
+  NAMES ionic
+  HINTS /lib/x86_64-linux-gnu
+)
+if(IONIC_LIB)
+	message(STATUS "Found ionic library at: ${IONIC_LIB}")
+else()
+  message(
+	  STATUS "Could NOT find ionic library. IONIC features will be disabled.")
+  set(USE_IONIC
+      OFF
+      CACHE BOOL "Enable IONIC features if ionic library is found" FORCE)
+endif()
+message(STATUS "USE_IONIC = ${USE_IONIC}")
+if(USE_IONIC)
+	add_compile_definitions(ENABLE_IONIC)
 endif()
 
 if(NOT DEFINED WARP_ACCUM_UNROLL)

@@ -33,7 +33,7 @@
 
 namespace mori {
 namespace core {
-
+#ifdef ENABLE_IONIC
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           Post Tasks                                           */
 /* ---------------------------------------------------------------------------------------------- */
@@ -804,6 +804,6 @@ inline __device__ int PollCqAndUpdateDbr<ProviderType::PSD>(CompletionQueueHandl
   ReleaseLock(lockVar);
   return err;
 }
-
+#endif
 }  // namespace core
 }  // namespace mori

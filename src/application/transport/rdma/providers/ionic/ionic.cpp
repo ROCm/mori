@@ -35,7 +35,7 @@
 
 namespace mori {
 namespace application {
-
+#ifdef ENABLE_IONIC
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Device Attributes                                       */
 /* ---------------------------------------------------------------------------------------------- */
@@ -508,6 +508,6 @@ RdmaDeviceContext* IonicDevice::CreateRdmaDeviceContext() {
 
   return new IonicDeviceContext(this, defaultContext, pd);
 }
-
+#endif
 }  // namespace application
 }  // namespace mori
