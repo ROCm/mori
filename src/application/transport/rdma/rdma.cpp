@@ -87,19 +87,18 @@ bool ReadGidTypeFromSysfs(ibv_context* context, uint32_t portId, int index,
   line = TrimWhitespace(line);
   if (line.empty()) return false;
 
-  std::string lower = line;
-  std::transform(lower.begin(), lower.end(), lower.begin(),
+  std::transform(line.begin(), line.end(), line.begin(),
                  [](unsigned char ch) { return std::tolower(ch); });
 
-  if (lower.find("v2") != std::string::npos) {
+  if (line.find("v2") != std::string::npos) {
     *out_type = IBV_GID_TYPE_ROCE_V2;
     return true;
   }
-  if (lower.find("v1") != std::string::npos) {
+  if (line.find("v1") != std::string::npos) {
     *out_type = IBV_GID_TYPE_ROCE_V1;
     return true;
   }
-  if (lower.find("ib") != std::string::npos) {
+  if (line.find("ib") != std::string::npos) {
     *out_type = IBV_GID_TYPE_IB;
     return true;
   }
