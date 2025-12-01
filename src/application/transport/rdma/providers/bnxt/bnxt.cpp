@@ -454,9 +454,61 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
 
   // Get gid
   union ibv_gid ibvGid;
-  ret = ibv_query_gid(context, config.portId, config.gidIdx, &ibvGid);
-  assert(!ret);
+  int gidIdx = config.gidIdx;
+  if (gidIdx == -1) {
+    const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(config.portId);
+    // Auto detect
+    int bestGidIdx = -1;
+    int bestScore = -1;
+
+    for (int i = 0; i < portAttr->gid_tbl_len; ++i) {
+      if (ibv_query_gid(context, config.portId, i, &ibvGid) == 0) {
+        bool is_zero = true;
+        for (int j = 0; j < 16; ++j) {
+          if (ibvGid.raw[j] != 0) {
+            is_zero = false;
+            break;
+          }
+        }
+        if (is_zero) continue;
+
+        int score = 0;
+        // Check for IPv4 mapped address: ::ffff:x.x.x.x
+        // Prefix 0-9 bytes are 0, 10-11 bytes are 0xff
+        bool is_ipv4 = true;
+        for (int j = 0; j < 10; ++j) {
+          if (ibvGid.raw[j] != 0) {
+            is_ipv4 = false;
+            break;
+          }
+        }
+        if (is_ipv4 && (ibvGid.raw[10] == 0xff) && (ibvGid.raw[11] == 0xff)) {
+          score = 3;  // Highest priority for IPv4
+        } else if (ibvGid.raw[0] == 0xfe && (ibvGid.raw[1] & 0xc0) == 0x80) {
+          score = 1;  // Low priority for Link Local
+        } else {
+          score = 2;  // Medium priority for other (Global IPv6)
+        }
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestGidIdx = i;
+        }
+      }
+    }
+
+    if (bestGidIdx != -1) {
+      gidIdx = bestGidIdx;
+      SYSCALL_RETURN_ZERO(ibv_query_gid(context, config.portId, gidIdx, &ibvGid));
+    } else {
+      gidIdx = 0;  // fallback
+      SYSCALL_RETURN_ZERO(ibv_query_gid(context, config.portId, gidIdx, &ibvGid));
+    }
+  } else {
+    SYSCALL_RETURN_ZERO(ibv_query_gid(context, config.portId, gidIdx, &ibvGid));
+  }
   memcpy(endpoint.handle.eth.gid, ibvGid.raw, sizeof(endpoint.handle.eth.gid));
+  endpoint.handle.eth.gidIdx = gidIdx;
 
   // Get dbr, bnxt use shared dbr
   struct bnxt_re_dv_db_region_attr dbrAttr{};
