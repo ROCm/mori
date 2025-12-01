@@ -51,101 +51,12 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
   if (portAttr->link_layer == IBV_LINK_LAYER_INFINIBAND) {
     endpoint.handle.ib.lid = portAttr->lid;
   } else if (portAttr->link_layer == IBV_LINK_LAYER_ETHERNET) {
-    union ibv_gid gid;
-    int gidIdx = config.gidIdx;
-    if (gidIdx == -1) {
-      // Auto detect
-      int bestGidIdx = -1;
-      int bestScore = -1;
+    GidSelectionResult gidSelection =
+        AutoSelectGidIndex(context, config.portId, portAttr, config.gidIdx);
+    assert(gidSelection.gidIdx >= 0 && gidSelection.valid);
 
-      for (int i = 0; i < portAttr->gid_tbl_len; ++i) {
-        ibv_gid_entry gidEntry;
-        if (ibv_query_gid_ex(context, config.portId, i, &gidEntry, 0) == 0) {
-          const union ibv_gid& gid = gidEntry.gid;
-          bool is_zero = true;
-          for (int j = 0; j < 16; ++j) {
-            if (gid.raw[j] != 0) {
-              is_zero = false;
-              break;
-            }
-          }
-          if (is_zero) continue;
-
-          int score = 0;
-          // Check for IPv4 mapped address: ::ffff:x.x.x.x
-          // Prefix 0-9 bytes are 0, 10-11 bytes are 0xff
-          bool is_ipv4 = true;
-          for (int j = 0; j < 10; ++j) {
-            if (gid.raw[j] != 0) {
-              is_ipv4 = false;
-              break;
-            }
-          }
-          if (is_ipv4 && (gid.raw[10] == 0xff) && (gid.raw[11] == 0xff)) {
-            score = 30;  // Highest priority for IPv4
-          } else if (gid.raw[0] == 0xfe && (gid.raw[1] & 0xc0) == 0x80) {
-            score = 10;  // Low priority for Link Local
-          } else {
-            score = 20;  // Medium priority for other (Global IPv6)
-          }
-
-          if (gidEntry.gid_type == IBV_GID_TYPE_ROCE_V2) {
-            score += 2;
-          } else if (gidEntry.gid_type == IBV_GID_TYPE_ROCE_V1) {
-            score += 1;
-          }
-
-          if (score > bestScore) {
-            bestScore = score;
-            bestGidIdx = i;
-          }
-        } else {
-          // Fallback to ibv_query_gid if ibv_query_gid_ex fails
-          if (ibv_query_gid(context, config.portId, i, &gid) == 0) {
-            bool is_zero = true;
-            for (int j = 0; j < 16; ++j) {
-              if (gid.raw[j] != 0) {
-                is_zero = false;
-                break;
-              }
-            }
-            if (is_zero) continue;
-
-            int score = 0;
-            bool is_ipv4 = true;
-            for (int j = 0; j < 10; ++j) {
-              if (gid.raw[j] != 0) {
-                is_ipv4 = false;
-                break;
-              }
-            }
-            if (is_ipv4 && (gid.raw[10] == 0xff) && (gid.raw[11] == 0xff)) {
-              score = 30;
-            } else if (gid.raw[0] == 0xfe && (gid.raw[1] & 0xc0) == 0x80) {
-              score = 10;
-            } else {
-              score = 20;
-            }
-            // Cannot determine RoCE version, assume 0 bonus
-
-            if (score > bestScore) {
-              bestScore = score;
-              bestGidIdx = i;
-            }
-          }
-        }
-      }
-
-      if (bestGidIdx != -1) {
-        gidIdx = bestGidIdx;
-      } else {
-        gidIdx = 0;  // fallback
-      }
-    }
-    SYSCALL_RETURN_ZERO(ibv_query_gid(context, config.portId, gidIdx, &gid));
-
-    memcpy(endpoint.handle.eth.gid, gid.raw, 16);
-    endpoint.handle.eth.gidIdx = gidIdx;
+    memcpy(endpoint.handle.eth.gid, gidSelection.gid.raw, 16);
+    endpoint.handle.eth.gidIdx = gidSelection.gidIdx;
   } else {
     assert(false && "unsupported link layer");
   }

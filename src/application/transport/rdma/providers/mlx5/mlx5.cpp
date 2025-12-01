@@ -478,67 +478,16 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   endpoint.handle.portId = config.portId;
   endpoint.handle.maxSge = config.maxMsgSge;
 
+  const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(config.portId);
+  assert(portAttr);
   HcaCapability hca_cap = QueryHcaCap(context);
 
   endpoint.handle.qpn = qp->qpn;
   if (hca_cap.IsEthernet()) {
-    int gidIdx = config.gidIdx;
-    if (gidIdx == -1) {
-      const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(config.portId);
-      assert(portAttr);
-      // Auto detect
-      int bestGidIdx = -1;
-      int bestScore = -1;
-
-      for (int i = 0; i < portAttr->gid_tbl_len; ++i) {
-        ibv_gid_entry gidEntry;
-        SYSCALL_RETURN_ZERO(ibv_query_gid_ex(context, config.portId, i, &gidEntry, 0));
-        const union ibv_gid& currentGid = gidEntry.gid;
-        bool is_zero = true;
-        for (int j = 0; j < 16; ++j) {
-          if (currentGid.raw[j] != 0) {
-            is_zero = false;
-            break;
-          }
-        }
-        if (is_zero) continue;
-
-        int score = 0;
-        // Check for IPv4 mapped address: ::ffff:x.x.x.x
-        // Prefix 0-9 bytes are 0, 10-11 bytes are 0xff
-        bool is_ipv4 = true;
-        for (int j = 0; j < 10; ++j) {
-          if (currentGid.raw[j] != 0) {
-            is_ipv4 = false;
-            break;
-          }
-        }
-        if (is_ipv4 && (currentGid.raw[10] == 0xff) && (currentGid.raw[11] == 0xff)) {
-          score = 30;  // Highest priority for IPv4
-        } else if (currentGid.raw[0] == 0xfe && (currentGid.raw[1] & 0xc0) == 0x80) {
-          score = 10;  // Low priority for Link Local
-        } else {
-          score = 20;  // Medium priority for other (Global IPv6)
-        }
-
-        if (gidEntry.gid_type == IBV_GID_TYPE_ROCE_V2) {
-          score += 2;
-        } else if (gidEntry.gid_type == IBV_GID_TYPE_ROCE_V1) {
-          score += 1;
-        }
-
-        if (score > bestScore) {
-          bestScore = score;
-          bestGidIdx = i;
-        }
-      }
-
-      if (bestGidIdx != -1) {
-        gidIdx = bestGidIdx;
-      } else {
-        gidIdx = 0;  // fallback
-      }
-    }
+    GidSelectionResult gidSelection =
+        AutoSelectGidIndex(context, config.portId, portAttr, config.gidIdx);
+    assert(gidSelection.gidIdx >= 0 && gidSelection.valid);
+    int gidIdx = gidSelection.gidIdx;
 
     uint32_t out[DEVX_ST_SZ_DW(query_roce_address_out)] = {};
     uint32_t in[DEVX_ST_SZ_DW(query_roce_address_in)] = {};
