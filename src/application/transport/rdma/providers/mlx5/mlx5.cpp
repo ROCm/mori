@@ -481,11 +481,62 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
 
   endpoint.handle.qpn = qp->qpn;
   if (hca_cap.IsEthernet()) {
+    int gidIdx = config.gidIdx;
+    if (gidIdx == -1) {
+      const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(config.portId);
+      union ibv_gid gid;
+      // Auto detect
+      int bestGidIdx = -1;
+      int bestScore = -1;
+
+      for (int i = 0; i < portAttr->gid_tbl_len; ++i) {
+        if (ibv_query_gid(context, config.portId, i, &gid) == 0) {
+          bool is_zero = true;
+          for (int j = 0; j < 16; ++j) {
+            if (gid.raw[j] != 0) {
+              is_zero = false;
+              break;
+            }
+          }
+          if (is_zero) continue;
+
+          int score = 0;
+          // Check for IPv4 mapped address: ::ffff:x.x.x.x
+          // Prefix 0-9 bytes are 0, 10-11 bytes are 0xff
+          bool is_ipv4 = true;
+          for (int j = 0; j < 10; ++j) {
+            if (gid.raw[j] != 0) {
+              is_ipv4 = false;
+              break;
+            }
+          }
+          if (is_ipv4 && (gid.raw[10] == 0xff) && (gid.raw[11] == 0xff)) {
+            score = 3;  // Highest priority for IPv4
+          } else if (gid.raw[0] == 0xfe && (gid.raw[1] & 0xc0) == 0x80) {
+            score = 1;  // Low priority for Link Local
+          } else {
+            score = 2;  // Medium priority for other (Global IPv6)
+          }
+
+          if (score > bestScore) {
+            bestScore = score;
+            bestGidIdx = i;
+          }
+        }
+      }
+
+      if (bestGidIdx != -1) {
+        gidIdx = bestGidIdx;
+      } else {
+        gidIdx = 0;  // fallback
+      }
+    }
+
     uint32_t out[DEVX_ST_SZ_DW(query_roce_address_out)] = {};
     uint32_t in[DEVX_ST_SZ_DW(query_roce_address_in)] = {};
 
     DEVX_SET(query_roce_address_in, in, opcode, MLX5_CMD_OP_QUERY_ROCE_ADDRESS);
-    DEVX_SET(query_roce_address_in, in, roce_address_index, config.gidIdx);
+    DEVX_SET(query_roce_address_in, in, roce_address_index, gidIdx);
     DEVX_SET(query_roce_address_in, in, vhca_port_num, config.portId);
 
     int status = mlx5dv_devx_general_cmd(context, in, sizeof(in), out, sizeof(out));
@@ -498,6 +549,7 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
     memcpy(endpoint.handle.eth.mac,
            DEVX_ADDR_OF(query_roce_address_out, out, roce_address.source_mac_47_32),
            sizeof(endpoint.handle.eth.mac));
+    endpoint.handle.eth.gidIdx = gidIdx;
   } else if (hca_cap.IsInfiniBand()) {
     auto mapPtr = GetRdmaDevice()->GetPortAttrMap();
     auto it = mapPtr->find(config.portId);
