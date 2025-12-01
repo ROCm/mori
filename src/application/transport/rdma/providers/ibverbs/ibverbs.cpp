@@ -59,7 +59,9 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
       int bestScore = -1;
 
       for (int i = 0; i < portAttr->gid_tbl_len; ++i) {
-        if (ibv_query_gid(context, config.portId, i, &gid) == 0) {
+        ibv_gid_entry gidEntry;
+        if (ibv_query_gid_ex(context, config.portId, i, &gidEntry, 0) == 0) {
+          const union ibv_gid& gid = gidEntry.gid;
           bool is_zero = true;
           for (int j = 0; j < 16; ++j) {
             if (gid.raw[j] != 0) {
@@ -80,16 +82,56 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
             }
           }
           if (is_ipv4 && (gid.raw[10] == 0xff) && (gid.raw[11] == 0xff)) {
-            score = 3;  // Highest priority for IPv4
+            score = 30;  // Highest priority for IPv4
           } else if (gid.raw[0] == 0xfe && (gid.raw[1] & 0xc0) == 0x80) {
-            score = 1;  // Low priority for Link Local
+            score = 10;  // Low priority for Link Local
           } else {
-            score = 2;  // Medium priority for other (Global IPv6)
+            score = 20;  // Medium priority for other (Global IPv6)
+          }
+
+          if (gidEntry.gid_type == IBV_GID_TYPE_ROCE_V2) {
+            score += 2;
+          } else if (gidEntry.gid_type == IBV_GID_TYPE_ROCE_V1) {
+            score += 1;
           }
 
           if (score > bestScore) {
             bestScore = score;
             bestGidIdx = i;
+          }
+        } else {
+          // Fallback to ibv_query_gid if ibv_query_gid_ex fails
+          if (ibv_query_gid(context, config.portId, i, &gid) == 0) {
+            bool is_zero = true;
+            for (int j = 0; j < 16; ++j) {
+              if (gid.raw[j] != 0) {
+                is_zero = false;
+                break;
+              }
+            }
+            if (is_zero) continue;
+
+            int score = 0;
+            bool is_ipv4 = true;
+            for (int j = 0; j < 10; ++j) {
+              if (gid.raw[j] != 0) {
+                is_ipv4 = false;
+                break;
+              }
+            }
+            if (is_ipv4 && (gid.raw[10] == 0xff) && (gid.raw[11] == 0xff)) {
+              score = 30;
+            } else if (gid.raw[0] == 0xfe && (gid.raw[1] & 0xc0) == 0x80) {
+              score = 10;
+            } else {
+              score = 20;
+            }
+            // Cannot determine RoCE version, assume 0 bonus
+
+            if (score > bestScore) {
+              bestScore = score;
+              bestGidIdx = i;
+            }
           }
         }
       }
