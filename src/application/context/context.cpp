@@ -217,7 +217,11 @@ void Context::InitializePossibleTransports() {
     // Create multiple QPs for this peer
     application::RdmaEndpointConfig config;
     config.portId = portId;
-    config.gidIdx = -1;  // auto detect
+    config.gidIdx = -1;
+    const char* envGidIdx = std::getenv("MORI_IB_GID_INDEX");
+    if (envGidIdx != nullptr) {
+      config.gidIdx = std::atoi(envGidIdx);
+    }
     config.maxMsgsNum = 4096;
 #ifdef ENABLE_BNXT
     config.maxCqeNum = 4096;

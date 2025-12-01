@@ -137,6 +137,11 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
   application::RdmaEndpointConfig epConfig{};
   epConfig.portId = portId;
   epConfig.gidIdx = -1;
+  const char* envGidIdx = std::getenv("MORI_IB_GID_INDEX");
+  if (envGidIdx != nullptr) {
+    epConfig.gidIdx = std::atoi(envGidIdx);
+  }
+
   epConfig.enableSrq = false;
   epConfig.alignment = PAGESIZE;
   epConfig.withCompChannel = (config.pollCqMode == PollCqMode::EVENT);
