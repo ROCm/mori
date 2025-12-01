@@ -96,7 +96,7 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, in
   core::WarpCopy(remoteWeightPtr + destTokId * config.numExpertPerToken,
                  localWeightPtr + tokenId * config.numExpertPerToken, config.numExpertPerToken);
 
-  if ((scaleBytes > 0)) {
+  if (args.scalesBuf && (scaleBytes > 0)) {
     core::WarpCopy(
         args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destTokId * scaleBytes,
         args.scalesBuf + tokenId * scaleBytes, scaleBytes);
@@ -168,7 +168,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
     core::WarpCopy<uint8_t, 4>(stagingPtr + stagingTokOffset + hiddenBytes + indexBytes,
                                reinterpret_cast<uint8_t*>(args.weightsBuf) + tokenId * weightBytes,
                                weightBytes);
-    if ((scaleBytes > 0))
+    if (args.scalesBuf && (scaleBytes > 0))
       core::WarpCopy<uint8_t, 4>(
           stagingPtr + stagingTokOffset + hiddenBytes + indexBytes + weightBytes,
           reinterpret_cast<uint8_t*>(args.scalesBuf) + tokenId * scaleBytes, scaleBytes);
