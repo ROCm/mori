@@ -157,7 +157,7 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
     core::WarpCopy<uint8_t, 4>(
         args.shmemDispatchOutWeightsMemObj->template GetAs<uint8_t*>() + destTokId * weightBytes,
         stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes, weightBytes);
-    if (args.scalesBuf && (scaleBytes > 0)) {
+    if ((scaleBytes > 0)) {
       core::WarpCopy<uint8_t, 4>(
           args.shmemOutScalesMemObj->template GetAs<uint8_t*>() + destTokId * scaleBytes,
           stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes + weightBytes, scaleBytes);
