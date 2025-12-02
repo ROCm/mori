@@ -50,7 +50,7 @@ namespace moe {
   size_t indexBytes = config.numExpertPerToken * sizeof(index_t);                               \
   size_t weightBytes = config.numExpertPerToken * sizeof(float);                                \
   size_t srcTokenIdBytes = sizeof(index_t);                                                     \
-  size_t scaleBytes = (args.scalesBuf == nullptr) ? 0 : config.scaleDim * config.scaleTypeSize; \
+  size_t scaleBytes = (config.scaleDim == 0) ? 0 : config.scaleDim * config.scaleTypeSize; \
   size_t xferBytes = hiddenBytes + indexBytes + weightBytes + srcTokenIdBytes + scaleBytes;     \
   size_t combXferBytes = (args.weightsBuf == nullptr) ? hiddenBytes : hiddenBytes + weightBytes;
 
