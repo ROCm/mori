@@ -24,6 +24,7 @@ import mori
 from tests.python.utils import TorchDistProcessManager, data_type_supported
 import torch
 import torch.distributed as dist
+import random
 
 
 class EpDispatchCombineTestCase:
@@ -54,7 +55,26 @@ class EpDispatchCombineTestCase:
                 device=self.device,
             )
 
+        # # gen indices
+        # all_rank_indices = []
+        # for r in range(self.config.world_size):
+        #     indices = torch.empty(
+        #         num_token[r],
+        #         self.config.num_experts_per_token,
+        #         dtype=torch.int64,
+        #         # device=self.device,
+        #     )
+        #     for i in range(num_token[r]):
+        #         perm = torch.randperm(
+        #             self.config.num_experts_per_rank * self.config.world_size,
+        #             generator=self.rng,
+        #             device=self.device,
+        #         )
+        #         indices[i] = perm[: self.config.num_experts_per_token]
+        #     all_rank_indices.append(indices.to(torch.int32).to(self.device))
         # gen indices
+        # num_experts = self.config.num_experts_per_rank * self.config.world_size
+        # base_seed = 1
         all_rank_indices = []
         for r in range(self.config.world_size):
             indices = torch.empty(

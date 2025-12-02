@@ -112,7 +112,10 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
       if (laneId == 0) {
         // decide token id in dest pe
-        destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
+        destTokId = atomicAdd_system(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
+        // destTokId =
+        //     __hip_atomic_fetch_add(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1,
+        //                            __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
         atomicAdd(args.destPeTokenCounter + destPe, 1);
         args.dispDestTokIdMap[i] = destPe * maxNumTokensToSend + destTokId;
 
