@@ -677,9 +677,9 @@ inline __device__ void PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHan
     uint32_t flag = qtf & 0xf;
     uint32_t status = cqe->status_length;
     uint64_t npg = cqe->send.npg_wqe_idx_timestamp & IONIC_V1_CQE_WQE_IDX_MASK;
-
-    printf("QUIET ERROR: qid %u type %u flag %#x status %u msn %u npg %lu\n",
-           qid, type, flag, status, msn, npg);
+    uint8_t error = IonicHandleErrorCqe(BE32TOH(cqe->status_length));
+    printf("PollCqOnce2, QUIET ERROR: block:%u, warp:%u, lane:%u, error:%u qid %u type %u flag %#x status 0x%08x msn %u npg %lu\n",
+           blockIdx.x, threadIdx.x/warpSize, __lane_id(), error, qid, type, flag, status, msn, npg);
     #if 0
     printf("dump cqe at addr:%p\n", Addr);
     for (int i = 0; i < 32; i++) {
