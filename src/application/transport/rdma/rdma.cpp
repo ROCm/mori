@@ -56,6 +56,7 @@ ibv_context* RdmaDeviceContext::GetIbvContext() { return GetRdmaDevice()->defaul
 application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegion(void* ptr, size_t size,
                                                                           int accessFlag) {
   ibv_mr* mr = ibv_reg_mr(pd, ptr, size, accessFlag);
+  MORI_APP_TRACE("RegisterRdmaMemoryRegion, addr:{}, size:{}, lkey:{}, rkey:{}\n", ptr, size, mr->lkey, mr->rkey);
   assert(mr);
   mrPool.insert({ptr, mr});
   application::RdmaMemoryRegion handle;
@@ -233,9 +234,11 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
         return new BnxtDevice(inDevice);
         break;
 #endif
+#ifdef ENABLE_IONIC	
       case (static_cast<uint32_t>(RdmaDeviceVendorId::Pensando)):
         return new IonicDevice(inDevice);
         break;
+#endif	
       default:
         return nullptr;
     }

@@ -516,10 +516,12 @@ void distRdmaOps(int argc, char* argv[]) {
               devEndpoints, global_mr_handles[0], global_mr_handles[1], size, 1, blockSync, num_qp);
           break;
 #endif
+#ifdef ENABLE_IONIC	  
         case ProviderType::PSD:
           MultiQpWrite<ProviderType::PSD><<<blocks, threads>>>(
               devEndpoints, global_mr_handles[0], global_mr_handles[1], size, 1, blockSync, num_qp);
           break;
+#endif	  
         default:
           break;
       }
@@ -550,11 +552,13 @@ void distRdmaOps(int argc, char* argv[]) {
                                                                 warmupIters, blockSync + 1, num_qp);
           break;
 #endif
+#ifdef ENABLE_IONIC	  
         case ProviderType::PSD:
           MultiQpWrite<ProviderType::PSD><<<blocks, threads>>>(devEndpoints, global_mr_handles[0],
                                                                 global_mr_handles[1], size,
                                                                 warmupIters, blockSync + 1, num_qp);
           break;
+#endif	  
         default:
           break;
       }
@@ -575,11 +579,13 @@ void distRdmaOps(int argc, char* argv[]) {
                                     iters, blockSync + 1 + warmupIters, num_qp);
           break;
 #endif
+#ifdef ENABLE_IONIC	  
         case ProviderType::PSD:
           MultiQpWrite<ProviderType::PSD>
               <<<blocks, threads>>>(devEndpoints, global_mr_handles[0], global_mr_handles[1], size,
                                     iters, blockSync + 1 + warmupIters, num_qp);
           break;
+#endif	  
         default:
           break;
       }
