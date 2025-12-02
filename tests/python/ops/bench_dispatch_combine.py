@@ -303,9 +303,9 @@ def _bench_dispatch_combine(
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         mori.shmem.shmem_torch_process_group_init("default")
         op = mori.ops.EpDispatchCombineOp(config)
-        benchmark.run(op)
-        # benchmark.stress(op)
-        # benchmark.stress_graph(op)
+        # benchmark.run(op)
+        benchmark.stress(op)
+        benchmark.stress_graph(op)
         # benchmark.output()
         # mori.shmem.shmem_finalize()
 
