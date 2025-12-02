@@ -260,7 +260,7 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
 
     core::WarpAccum<T, 4>(args.shmemCombineOutTokMemObj->template GetAs<T*>() +
                               tokenId * config.hiddenDim,
-                          srcPtrs, nullptr, config.numExpertPerToken);
+                          srcPtrs, nullptr, config.numExpertPerToken, config.hiddenDim);
   }
 
   if (laneId == 0) {
