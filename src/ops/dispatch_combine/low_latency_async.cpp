@@ -244,7 +244,7 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
 
-  for (int i = globalWarpId; i < args.curRankNumToken; i += globalWarpNum) {
+  for (int tokenId = globalWarpId; tokenId < args.curRankNumToken; tokenId += globalWarpNum) {
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
       index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
       index_t destPe = destTokId / config.MaxNumTokensToSendPerRank();
