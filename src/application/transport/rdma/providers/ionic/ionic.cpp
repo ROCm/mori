@@ -174,8 +174,8 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   int hip_dev_id{-1};
   int err;
   MORI_APP_TRACE("IonicQpContainer, cq:0x{:x}, pd:0x{:x}, context:0x{:x}, config.maxMsgsNum:{}",
-         reinterpret_cast<uintptr_t>(cq), reinterpret_cast<uintptr_t>(pd_uxdma), 
-	 reinterpret_cast<uintptr_t>(context), config.maxMsgsNum);
+                 reinterpret_cast<uintptr_t>(cq), reinterpret_cast<uintptr_t>(pd_uxdma), 
+	             reinterpret_cast<uintptr_t>(context), config.maxMsgsNum);
   wqeNum = config.maxMsgsNum;
   memset(&attr, 0, sizeof(struct ibv_qp_init_attr_ex));
   attr.cap.max_send_wr     = wqeNum;
