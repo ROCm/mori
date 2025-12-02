@@ -56,6 +56,7 @@ ibv_context* RdmaDeviceContext::GetIbvContext() { return GetRdmaDevice()->defaul
 application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegion(void* ptr, size_t size,
                                                                           int accessFlag) {
   ibv_mr* mr = ibv_reg_mr(pd, ptr, size, accessFlag);
+  MORI_APP_TRACE("RegisterRdmaMemoryRegion, addr:%p, size:%lu, lkey:%lu, rkey:%lu\n", ptr, size, mr->lkey, mr->rkey);
   assert(mr);
   mrPool.insert({ptr, mr});
   application::RdmaMemoryRegion handle;
