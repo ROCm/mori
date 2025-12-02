@@ -110,8 +110,6 @@ __global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
                                 destPe);
     shmem::ShmemPutInt32ImmNbiWarp(args.recvTokenNumMemObj, myPe * sizeof(index_t), tokenNum + 1,
                                    destPe);
-    if (laneId == 0)
-      shmem::ShmemQuietThread(destPe);
     // shmem::ShmemPutMemNbiSignalWarp(args.shmemDispatchInpTokMemObj, remoteOffset,
     //                                 args.shmemStagingTokMemObj, localOffset, tokenNum *
     //                                 xferBytes, args.recvTokenNumMemObj, myPe * sizeof(index_t),
@@ -136,10 +134,6 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   index_t recvTokenNum = 0;
   if (laneId == 0) {
     recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(recvTokenNums + destPe, 0) - 1;
-    // while (core::AtomicLoadRelaxed(recvTokenNums+destPe) == 0) {
-    // if ((warpId == 0))
-    //   printf("myPe %d destPe %d not done\n", myPe, destPe);
-    // }
   }
   recvTokenNum = __shfl(recvTokenNum, 0);
 
