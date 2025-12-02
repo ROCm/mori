@@ -55,8 +55,10 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
   memset(&cq_attr, 0, sizeof(struct ibv_cq_init_attr_ex));
   #ifdef IONIC_CCQE
   cq_attr.cqe           = 0;
+  MORI_APP_TRACE("cqe mode: ccqe mode");
   #else
   cq_attr.cqe           = cqeNum * 2; //from rocshmem, send&recv?
+  MORI_APP_TRACE("cqe mode: normal mode");
   #endif
   cq_attr.cq_context    = nullptr;
   cq_attr.channel       = nullptr;
@@ -171,8 +173,9 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   struct ibv_qp_init_attr_ex attr;
   int hip_dev_id{-1};
   int err;
-  printf("IonicQpContainer, cq:%p, pd:%p, context:%p， config.maxMsgsNum:%d\n",
-	 cq, pd_uxdma, context, config.maxMsgsNum);
+  MORI_APP_TRACE("IonicQpContainer, cq:0x{:x}, pd:0x{:x}, context:0x{:x}, config.maxMsgsNum:{}",
+         reinterpret_cast<uintptr_t>(cq), reinterpret_cast<uintptr_t>(pd_uxdma), 
+	 reinterpret_cast<uintptr_t>(context), config.maxMsgsNum);
   wqeNum = config.maxMsgsNum;
   memset(&attr, 0, sizeof(struct ibv_qp_init_attr_ex));
   attr.cap.max_send_wr     = wqeNum;
@@ -212,7 +215,8 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   cq_dbval = dvcq.q.db_val;
   cq_mask = dvcq.q.mask;
   ionic_cq_buf = reinterpret_cast<ionic_v1_cqe*>(dvcq.q.ptr);
-  printf("cq ptr:%p, cq size:%lu, cq mask:0x%x\n", dvcq.q.ptr, dvcq.q.size, dvcq.q.mask);
+  MORI_APP_TRACE("cq ptr:0x{:x}, cq size:{}, cq mask:0x{:x}", 
+                 reinterpret_cast<uintptr_t>(dvcq.q.ptr), dvcq.q.size, dvcq.q.mask);
 
   ionic_dv_qp dvqp;
   ionic_dv_get_qp(&dvqp, qp);
@@ -221,12 +225,14 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   sq_dbval = dvqp.sq.db_val;
   sq_mask = dvqp.sq.mask;
   ionic_sq_buf = reinterpret_cast<ionic_v1_wqe *>(dvqp.sq.ptr);
-  printf("sq ptr:%p, sq size:%lu, sq mask:0x%x\n", dvqp.sq.ptr, dvqp.sq.size, dvqp.sq.mask);
+  MORI_APP_TRACE("sq ptr:0x{:x}, sq size:{}, sq mask:0x{:x}", 
+                 reinterpret_cast<uintptr_t>(dvqp.sq.ptr), dvqp.sq.size, dvqp.sq.mask);
   rq_dbreg = gpu_db_rq;
   rq_dbval = dvqp.rq.db_val;
   rq_mask = dvqp.rq.mask;
   ionic_rq_buf = reinterpret_cast<ionic_v1_wqe *>(dvqp.rq.ptr);
-  printf("rq ptr:%p, rq size:%lu, rq mask:0x%x\n", dvqp.rq.ptr, dvqp.rq.size, dvqp.rq.mask);
+  MORI_APP_TRACE("rq ptr:0x{:x}, rq size:{}, rq mask:0x{:x}", 
+                 reinterpret_cast<uintptr_t>(dvqp.rq.ptr), dvqp.rq.size, dvqp.rq.mask);
   strncpy(dev_name, qp->context->device->name, sizeof(dev_name));
   dev_name[sizeof(dev_name) - 1] = 0;
 
@@ -330,14 +336,15 @@ void IonicQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
 
   attr_mask = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_RQ_PSN | IBV_QP_DEST_QPN |
               IBV_QP_AV | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
-  printf("ModifyInit2Rtr, remote_handle.psn:%d, remote_handle.qpn:%d, config.gidIdx:%d, config.portId:%d\n",
+  MORI_APP_TRACE("ModifyInit2Rtr, remote_handle.psn:{}, remote_handle.qpn:{}, config.gidIdx:{}, config.portId:{}\n",
          remote_handle.psn, remote_handle.qpn, config.gidIdx, config.portId);
+  #if 0
   for (int i = 0; i< 16; i++) {
     printf("%02x", remote_handle.eth.gid[i]);
   }
   printf("\n");
+  #endif  
   err = ibv_modify_qp(qp, &attr, attr_mask);
-  printf("ibv_modify_qp err:%d\n", err);
   assert(err == 0);
 }
 
@@ -397,7 +404,7 @@ void IonicDeviceContext::create_parent_domain(ibv_context* context, struct ibv_p
   for (int i = 0; i < 2; i++) {
     pd_uxdma[i] = ibv_alloc_parent_domain(context, &pattr);
     assert(pd_uxdma[i]);
-    printf("create_parent_domain, pd_uxdma:%p\n", pd_uxdma[i]);
+    //printf("create_parent_domain, pd_uxdma:%p\n", pd_uxdma[i]);
     ionic_dv_pd_set_sqcmb(pd_uxdma[i], false, false, false);
     ionic_dv_pd_set_rqcmb(pd_uxdma[i], false, false, false);
     ionic_dv_pd_set_udma_mask(pd_uxdma[i], 1u << i);
@@ -420,7 +427,7 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
   struct ibv_pd *pd = pd_uxdma[qp_counter & 1];
   qp_counter++;
   IonicCqContainer* cq = new IonicCqContainer(context, config, pd);
-  printf("CreateRdmaEndpoint, context:%p, cq->cq:%p, pd_uxdma:%p\n", context, cq->cq, pd);
+  //printf("CreateRdmaEndpoint, context:%p, cq->cq:%p, pd_uxdma:%p\n", context, cq->cq, pd);
   IonicQpContainer* qp = new IonicQpContainer(context, config, cq->cq, pd, this);
 
   RdmaEndpoint endpoint;
@@ -433,10 +440,12 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
   ret = ibv_query_gid(context, config.portId, /*config.gidIdx */1, &ibvGid);
   assert(!ret);
   memcpy(endpoint.handle.eth.gid, ibvGid.raw, sizeof(endpoint.handle.eth.gid));
+  #if 0  
   for (int i = 0; i< 16; i++) {
     printf("%02x", endpoint.handle.eth.gid[i]);
   }
   printf("\n");
+  #endif  
   endpoint.vendorId = RdmaDeviceVendorId::Pensando;
   endpoint.wqHandle.sqAddr = qp->GetSqAddress();
   endpoint.wqHandle.rqAddr = qp->GetRqAddress();
@@ -504,8 +513,7 @@ IonicDevice::~IonicDevice() {}
 RdmaDeviceContext* IonicDevice::CreateRdmaDeviceContext() {
   ibv_pd* pd = ibv_alloc_pd(defaultContext);
   assert(pd);
-  printf("IonicDevice::CreateRdmaDeviceContext, defaultContext:%p, pd:%p\n", defaultContext, pd);
-
+  //printf("IonicDevice::CreateRdmaDeviceContext, defaultContext:%p, pd:%p\n", defaultContext, pd);
   return new IonicDeviceContext(this, defaultContext, pd);
 }
 #endif

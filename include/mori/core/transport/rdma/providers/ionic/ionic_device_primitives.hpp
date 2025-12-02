@@ -607,8 +607,8 @@ inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum,
 }
 
 #ifdef IONIC_CCQE
-inline __device__ void PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
-                                   uint64_t activemask, void* cqeAddr, uint32_t cqeNum, uint32_t consIdx) {
+inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
+                                  uint64_t activemask, void* cqeAddr, uint32_t cqeNum, uint32_t consIdx) {
   volatile struct ionic_v1_cqe* cqe = reinterpret_cast<ionic_v1_cqe*>(cqeAddr);
   uint32_t old, msn = HTOBE32(cqe->send.msg_msn);
 
@@ -624,10 +624,11 @@ inline __device__ void PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHan
   }
 
   wqHandle.doneIdx = msn;
+  return 0;
 }
 #else
-inline __device__ void PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
-                                   uint64_t activemask, void* cqeAddr, uint32_t cqeNum, uint32_t consIdx) {
+inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
+                                  uint64_t activemask, void* cqeAddr, uint32_t cqeNum, uint32_t consIdx) {
   uint32_t my_logical_lane_id = get_active_lane_num(activemask);
   uint32_t my_cq_pos = cqHandle.cq_consumer + my_logical_lane_id;
 
@@ -660,11 +661,11 @@ inline __device__ void PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHan
   uint32_t qtf_be = BE32TOH(*(volatile uint32_t *)(&cqe->qid_type_flags));
   if ((qtf_be & qtf_color_bit) != qtf_color_exp) {
     #if 0
-    printf("PollCqOnce2, not ready, block:%u, warp:%u, lane:%u, consIdx:%u, cqeIdx:%u, cqeAddr:%p, qtf_be:0x%08x, cqe->status_length:%d, msn:%u\n",
+    printf("PollCqOnce2, not ready, block:%u, warp:%u, lane:%u, consIdx:%u, cqeIdx:%u, cqeAddr:%p, qtf_be:0x%08x, cqe->status_length:0x%08x, msn:%u\n",
            blockIdx.x, threadIdx.x/warpSize, __lane_id(), my_cq_pos, cqeIdx, Addr,
            *(volatile uint32_t *)(&cqe->qid_type_flags), BE32TOH(cqe->status_length), BE32TOH(cqe->send.msg_msn));
     #endif
-   return;// CQE just not ready yet, try again
+   return 0;// CQE just not ready yet, try again
   }
 
   uint32_t msn = BE32TOH(cqe->send.msg_msn);
@@ -678,8 +679,8 @@ inline __device__ void PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHan
     uint32_t status = cqe->status_length;
     uint64_t npg = cqe->send.npg_wqe_idx_timestamp & IONIC_V1_CQE_WQE_IDX_MASK;
     uint8_t error = IonicHandleErrorCqe(BE32TOH(cqe->status_length));
-    printf("PollCqOnce2, QUIET ERROR: block:%u, warp:%u, lane:%u, error:%u qid %u type %u flag %#x status 0x%08x msn %u npg %lu\n",
-           blockIdx.x, threadIdx.x/warpSize, __lane_id(), error, qid, type, flag, status, msn, npg);
+    printf("PollCqOnce2, QUIET ERROR: block:%u, warp:%u, lane:%u, cqeAddr:%p, error:%u qid %u type %u flag %#x status 0x%08x msn %u npg %lu\n",
+           blockIdx.x, threadIdx.x/warpSize, __lane_id(), Addr, error, qid, type, flag, status, msn, npg);
     #if 1
     printf("dump cqe at addr:%p\n", Addr);
     for (int i = 0; i < 32; i++) {
@@ -701,7 +702,7 @@ inline __device__ void PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHan
   uint64_t my_lane_mask = 1ull << __lane_id();
   uint64_t lesser_lane_mask = my_lane_mask - 1;
   if (my_lane_mask != (__ballot(true) & activemask & ~lesser_lane_mask)) {
-    return;
+    return 0;
   }
 
   /* update position in the cq */
@@ -723,7 +724,7 @@ inline __device__ void PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHan
   }
 
   wqHandle.doneIdx = msn;
-  return;
+  return 0;
 }
 #endif
 
@@ -745,6 +746,7 @@ inline __device__ int PollCq<ProviderType::PSD>(WorkQueueHandle& wqHandle, Compl
   const uint32_t curConsIdx = *consIdx;
   uint64_t activemask = GetActiveLaneMask();
   uint32_t cons = wqHandle.dbTouchIdx;
+  int err;
   /* wait for sq_msn to catch up or pass cons. */
   /* 0x800000 - sign bit for 24-bit fields     */
   while ((wqHandle.doneIdx - cons) & 0x800000) {
@@ -757,7 +759,11 @@ inline __device__ int PollCq<ProviderType::PSD>(WorkQueueHandle& wqHandle, Compl
       uint32_t old_sq_msn = wqHandle.doneIdx;
       //printf("PollCq, before PollCqOnce2, curConsIdx:%u\n", curConsIdx);
       //asm volatile("" ::: "memory");
-      PollCqOnce2(wqHandle, cqHandle, activemask, cqAddr, cqeNum, curConsIdx);
+      err = PollCqOnce2(wqHandle, cqHandle, activemask, cqAddr, cqeNum, curConsIdx);
+      if (err != 0) {
+        printf("PollCq, PollCqOnce2 failed, err:%u\n", err);
+        return err;
+      }
       asm volatile("" ::: "memory");
       //printf("PollCq, after PollCqOnce2, curConsIdx:%u\n", curConsIdx);
       if (!((wqHandle.doneIdx - cons) & 0x800000)) {

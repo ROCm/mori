@@ -183,7 +183,10 @@ inline __device__ void ShmemQuietThreadKernelPsdImpl(int pe, int qpId) {
   core::CompletionQueueHandle& cqHandle = ep[epIndex].cqHandle;
 
   uint16_t wqe_counter;
-  core::PollCq<PrvdType>(wqHandle, cqHandle, cqHandle.cqAddr, cqHandle.cqeNum, &cqHandle.cq_consumer, &wqe_counter);
+  int err;
+  err = core::PollCq<PrvdType>(wqHandle, cqHandle, cqHandle.cqAddr, cqHandle.cqeNum, &cqHandle.cq_consumer, &wqe_counter);
+  if (err != 0)
+    printf("rank %d dest pe %d consIdx %d wc_err %d\n", globalGpuStates->rank, pe, cqHandle.cq_consumer, err);
 }
 
 template <core::ProviderType PrvdType>
