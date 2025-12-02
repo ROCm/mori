@@ -244,16 +244,7 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
 
-  index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
-  index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
-
-  for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
-    index_t tokenId = i / warpsPerToken;
-    index_t inTokenPartId = i % warpsPerToken;
-    index_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
-    index_t hiddenDimSize =
-        std::max(0, std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp));
-
+  for (int i = globalWarpId; i < args.curRankNumToken; i += globalWarpNum) {
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
       index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
       index_t destPe = destTokId / config.MaxNumTokensToSendPerRank();
@@ -261,15 +252,15 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
       T* stagingPtr = (destPe != myPe) ? args.shmemCombineInpTokMemObj->template GetAs<T*>()
                                        : args.shmemStagingTokMemObj->template GetAs<T*>();
       if (destPe < npes) {
-        srcPtrs[j] = stagingPtr + destTokId * config.hiddenDim + hiddenDimOffset;
+        srcPtrs[j] = stagingPtr + destTokId * config.hiddenDim;
       } else {
         srcPtrs[j] = nullptr;
       }
     }
 
     core::WarpAccum<T, 4>(args.shmemCombineOutTokMemObj->template GetAs<T*>() +
-                              tokenId * config.hiddenDim + hiddenDimOffset,
-                          srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
+                              tokenId * config.hiddenDim,
+                          srcPtrs, nullptr, config.numExpertPerToken);
   }
 
   if (laneId == 0) {
