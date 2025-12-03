@@ -142,7 +142,7 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   int64_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<int64_t*>();
   int64_t recvTokenNum = 0;
   if (laneId == 0) {
-    recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(recvTokenNums + destPe, 0) - 1;
+    recvTokenNum = shmem::ShmemInt64WaitUntilGreaterThan(recvTokenNums + destPe, 0) - 1;
   }
   recvTokenNum = __shfl(recvTokenNum, 0);
 
