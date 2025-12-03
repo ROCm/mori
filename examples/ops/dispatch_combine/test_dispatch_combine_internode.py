@@ -482,27 +482,57 @@ class EpDispatchCombineTestCase:
                 all_rank_weights,
                 all_rank_scales,
             ) = test_data_list[i % 5]
-            (
-                dispatch_output,
-                dispatch_weights,
-                dispatch_scales,
-                dispatch_indices,
-                dispatch_recv_num_token,
-            ) = op.dispatch(
-                all_rank_input[self.rank],
-                all_rank_weights[self.rank],
-                all_rank_scales[self.rank],
-                all_rank_indices[self.rank],
-                block_num=self.config.block_num,
-                # warp_per_block=16,
-            )
-            _, _ = op.combine(
-                dispatch_output,
-                dispatch_weights,
-                all_rank_indices[self.rank],
-                block_num=self.config.block_num,
-                # warp_per_block=16,
-            )
+            if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+                (
+                    dispatch_output,
+                    dispatch_weights,
+                    dispatch_scales,
+                    dispatch_indices,
+                    dispatch_recv_num_token,
+                ) = op.dispatch_send(
+                    all_rank_input[self.rank],
+                    all_rank_weights[self.rank],
+                    all_rank_scales[self.rank],
+                    all_rank_indices[self.rank],
+                    block_num=self.config.block_num,
+                    warp_per_block=8,
+                )
+                op.dispatch_recv(
+                    block_num=self.config.block_num,
+                    warp_per_block=8,
+                )
+            else:
+                (
+                    dispatch_output,
+                    dispatch_weights,
+                    dispatch_scales,
+                    dispatch_indices,
+                    dispatch_recv_num_token,
+                ) = op.dispatch(
+                    all_rank_input[self.rank],
+                    all_rank_weights[self.rank],
+                    all_rank_scales[self.rank],
+                    all_rank_indices[self.rank],
+                    block_num=self.config.block_num,
+                )
+            if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+                combine_output, _ = op.combine_send(
+                    dispatch_output,
+                    dispatch_weights,
+                    all_rank_indices[self.rank],
+                    block_num=self.config.block_num,
+                )
+                op.combine_recv(
+                    block_num=self.config.block_num,
+                )
+            else:
+                _, _ = op.combine(
+                    dispatch_output,
+                    dispatch_weights,
+                    all_rank_indices[self.rank],
+                    block_num=self.config.block_num,
+                    # warp_per_block=16,
+                )
             torch.cuda.synchronize()
             time.sleep(0.0001)
 
@@ -518,27 +548,57 @@ class EpDispatchCombineTestCase:
         ) = test_data
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            (
-                dispatch_output,
-                dispatch_weights,
-                dispatch_scales,
-                dispatch_indices,
-                dispatch_recv_num_token,
-            ) = op.dispatch(
-                all_rank_input[self.rank],
-                all_rank_weights[self.rank],
-                all_rank_scales[self.rank],
-                all_rank_indices[self.rank],
-                block_num=self.config.block_num,
-                # warp_per_block=16,
-            )
-            _, _ = op.combine(
-                dispatch_output,
-                dispatch_weights,
-                all_rank_indices[self.rank],
-                block_num=self.config.block_num,
-                # warp_per_block=16,
-            )
+            if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+                (
+                    dispatch_output,
+                    dispatch_weights,
+                    dispatch_scales,
+                    dispatch_indices,
+                    dispatch_recv_num_token,
+                ) = op.dispatch_send(
+                    all_rank_input[self.rank],
+                    all_rank_weights[self.rank],
+                    all_rank_scales[self.rank],
+                    all_rank_indices[self.rank],
+                    block_num=self.config.block_num,
+                    warp_per_block=8,
+                )
+                op.dispatch_recv(
+                    block_num=self.config.block_num,
+                    warp_per_block=8,
+                )
+            else:
+                (
+                    dispatch_output,
+                    dispatch_weights,
+                    dispatch_scales,
+                    dispatch_indices,
+                    dispatch_recv_num_token,
+                ) = op.dispatch(
+                    all_rank_input[self.rank],
+                    all_rank_weights[self.rank],
+                    all_rank_scales[self.rank],
+                    all_rank_indices[self.rank],
+                    block_num=self.config.block_num,
+                )
+            if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+                combine_output, _ = op.combine_send(
+                    dispatch_output,
+                    dispatch_weights,
+                    all_rank_indices[self.rank],
+                    block_num=self.config.block_num,
+                )
+                op.combine_recv(
+                    block_num=self.config.block_num,
+                )
+            else:
+                _, _ = op.combine(
+                    dispatch_output,
+                    dispatch_weights,
+                    all_rank_indices[self.rank],
+                    block_num=self.config.block_num,
+                    # warp_per_block=16,
+                )
         torch.cuda.synchronize()
 
         for i in tqdm(range(5000)):
