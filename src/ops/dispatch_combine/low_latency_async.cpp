@@ -216,7 +216,7 @@ __global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   for (int destPe = blockId; (destPe < npes) && (warpId == 0); destPe += blockNum) {
     if (laneId == 0) shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
-    int tokenNum = recvTokenNums[destPe];
+    int tokenNum = recvTokenNums[destPe]-1;
     size_t remoteOffset = (config.MaxNumTokensToSendPerRank() * myPe) * hiddenBytes;
     size_t localOffset = (config.MaxNumTokensToSendPerRank() * destPe) * hiddenBytes;
     if (destPe != myPe)
