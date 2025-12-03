@@ -130,14 +130,17 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   int destPe = blockId / blocksPerPe;
 
   if (((blockId % blocksPerPe) == 0) && (warpId == 0)) {
-    int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
-    shmem::ShmemPutInt32ImmNbiWarp(args.recvTokenNumMemObj, myPe * sizeof(index_t), tokenNum + 1,
-                                   destPe);
+    int64_t tokenNum = static_cast<int64_t>(core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe));
+    shmem::ShmemAtomicTypeNonFetchWarp<int64_t>(args.recvTokenNumMemObj,
+                                                    myPe * sizeof(int64_t), tokenNum + 1,
+                                                    core::AMO_ADD, destPe);
+    // shmem::ShmemPutInt32ImmNbiWarp(args.recvTokenNumMemObj, myPe * sizeof(int64_t), tokenNum + 1,
+    //                                destPe);
   }
 
   // Polling recv token number signal
-  index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
-  index_t recvTokenNum = 0;
+  int64_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<int64_t*>();
+  int64_t recvTokenNum = 0;
   if (laneId == 0) {
     recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(recvTokenNums + destPe, 0) - 1;
   }
@@ -219,10 +222,10 @@ __global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
   }
   barrierFlag = __shfl(barrierFlag, 0);
 
-  index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
+  int64_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<int64_t*>();
   for (int destPe = blockId; (destPe < npes) && (warpId == 0); destPe += blockNum) {
     if (laneId == 0) shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
-    int tokenNum = recvTokenNums[destPe]-1;
+    int64_t tokenNum = recvTokenNums[destPe]-1;
     size_t remoteOffset = (config.MaxNumTokensToSendPerRank() * myPe) * hiddenBytes;
     size_t localOffset = (config.MaxNumTokensToSendPerRank() * destPe) * hiddenBytes;
     if (destPe != myPe)
