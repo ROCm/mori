@@ -251,7 +251,7 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
 
       T* stagingPtr = (destPe != myPe) ? args.shmemCombineInpTokMemObj->template GetAs<T*>()
                                        : args.shmemStagingTokMemObj->template GetAs<T*>();
-      if ((destPe < npes) || (destPe != myPe)) {
+      if (destPe < npes) {
         srcPtrs[j] = stagingPtr + destTokId * config.hiddenDim;
       } else {
         srcPtrs[j] = nullptr;
