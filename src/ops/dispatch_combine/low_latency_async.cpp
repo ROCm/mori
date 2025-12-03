@@ -108,8 +108,8 @@ __global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
       shmem::ShmemPutMemNbiWarp(args.shmemDispatchInpTokMemObj, remoteOffset,
                                 args.shmemStagingTokMemObj, localOffset, tokenNum * xferBytes,
                                 destPe);
-    shmem::ShmemPutInt32ImmNbiWarp(args.recvTokenNumMemObj, myPe * sizeof(index_t), tokenNum + 1,
-                                   destPe);
+    // shmem::ShmemPutInt32ImmNbiWarp(args.recvTokenNumMemObj, myPe * sizeof(index_t), tokenNum + 1,
+    //                                destPe);
     // shmem::ShmemPutMemNbiSignalWarp(args.shmemDispatchInpTokMemObj, remoteOffset,
     //                                 args.shmemStagingTokMemObj, localOffset, tokenNum *
     //                                 xferBytes, args.recvTokenNumMemObj, myPe * sizeof(index_t),
@@ -128,6 +128,12 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
 
   int blocksPerPe = blockNum / npes;
   int destPe = blockId / blocksPerPe;
+
+  if (((blockId % blocksPerPe) == 0) && (warpId == 0)) {
+    int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
+    shmem::ShmemPutInt32ImmNbiWarp(args.recvTokenNumMemObj, myPe * sizeof(index_t), tokenNum + 1,
+                                   destPe);
+  }
 
   // Polling recv token number signal
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
@@ -223,9 +229,8 @@ __global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
       shmem::ShmemPutMemNbiWarp(args.shmemCombineInpTokMemObj, remoteOffset,
                                 args.shmemStagingTokMemObj, localOffset, tokenNum * hiddenBytes,
                                 destPe);
-    shmem::ShmemPutUint32ImmNbiWarp(args.crossDeviceBarrierMemObj, myPe * sizeof(uint32_t),
-                                    barrierFlag, destPe);
-    shmem::ShmemQuietThread(destPe);
+    // shmem::ShmemPutUint32ImmNbiWarp(args.crossDeviceBarrierMemObj, myPe * sizeof(uint32_t),
+    //                                 barrierFlag, destPe);
     if (laneId == 0) recvTokenNums[destPe] = 0;
   }
 }
@@ -234,8 +239,13 @@ template <typename T>
 __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
 
+  uint32_t barrierFlag = args.crossDeviceBarrierFlag[0];
+  for (int destPe = blockId; (destPe < npes) && (warpId == 0); destPe += blockNum) {
+    shmem::ShmemPutUint32ImmNbiWarp(args.crossDeviceBarrierMemObj, myPe * sizeof(uint32_t),
+                                    barrierFlag, destPe);
+  }
+
   for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-    uint32_t barrierFlag = args.crossDeviceBarrierFlag[0];
     shmem::ShmemUint32WaitUntilEquals(
         args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>() + destPe, barrierFlag);
   }
