@@ -131,11 +131,11 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
 
   if (((blockId % blocksPerPe) == 0) && (warpId == 0)) {
     int64_t tokenNum = static_cast<int64_t>(core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe));
-    shmem::ShmemAtomicTypeNonFetchWarp<int64_t>(args.recvTokenNumMemObj,
-                                                    myPe * sizeof(int64_t), tokenNum + 1,
-                                                    core::AMO_ADD, destPe);
-    // shmem::ShmemPutInt32ImmNbiWarp(args.recvTokenNumMemObj, myPe * sizeof(int64_t), tokenNum + 1,
-    //                                destPe);
+    // shmem::ShmemAtomicTypeNonFetchWarp<int64_t>(args.recvTokenNumMemObj,
+    //                                                 myPe * sizeof(int64_t), tokenNum + 1,
+    //                                                 core::AMO_ADD, destPe);
+    shmem::ShmemPutInt64ImmNbiWarp(args.recvTokenNumMemObj, myPe * sizeof(int64_t), tokenNum + 1,
+                                   destPe);
   }
 
   // Polling recv token number signal
