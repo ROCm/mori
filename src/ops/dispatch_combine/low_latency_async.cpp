@@ -225,6 +225,7 @@ __global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
                                 destPe);
     shmem::ShmemPutUint32ImmNbiWarp(args.crossDeviceBarrierMemObj, myPe * sizeof(uint32_t),
                                     barrierFlag, destPe);
+    shmem::ShmemQuietThread(destPe);
     if (laneId == 0) recvTokenNums[destPe] = 0;
   }
 }
