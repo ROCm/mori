@@ -657,8 +657,6 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   for (int k = globalWarpId; k < maxChunkNum; k+=globalWarpNum) {
     for (int i = 0; i < (nNodes - 1); i++) {
       int node = (myNode + 1 + i) % nNodes;
-      args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>()[node * maxChunkNum + k] = 0;
-      args.interNodeChunkFlagCombine[node * maxChunkNum + k] = 0;
       int proxyPe = node * config.gpuPerNode + (config.rank % config.gpuPerNode);
       int qpId = k % config.numQpPerPe;
       int startTokenIdx = k * warpSize;
@@ -670,6 +668,8 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
           args.shmemStagingTokMemObj,
           (node * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * combXferBytes,
           thisChunkTokenNum * combXferBytes, proxyPe, qpId);
+      args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>()[node * maxChunkNum + k] = 0;
+      args.interNodeChunkFlagCombine[node * maxChunkNum + k] = 0;
     }
   }
 
