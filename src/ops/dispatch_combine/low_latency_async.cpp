@@ -136,6 +136,7 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
     //                                                 core::AMO_ADD, destPe);
     shmem::ShmemPutInt64ImmNbiWarp(args.recvTokenNumMemObj, myPe * sizeof(int64_t), tokenNum + 1,
                                    destPe);
+    shmem::ShmemQuietThread(destPe);
   }
 
   // Polling recv token number signal
@@ -143,7 +144,6 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   int64_t recvTokenNum = 0;
   if (laneId == 0) {
     recvTokenNum = shmem::ShmemInt64WaitUntilGreaterThan(recvTokenNums + destPe, 0) - 1;
-    shmem::ShmemQuietThread(destPe);
   }
   recvTokenNum = __shfl(recvTokenNum, 0);
 
@@ -251,6 +251,7 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   for (int destPe = blockId; (destPe < npes) && (warpId == 0); destPe += blockNum) {
     shmem::ShmemPutUint32ImmNbiWarp(args.crossDeviceBarrierMemObj, myPe * sizeof(uint32_t),
                                     barrierFlag, destPe);
+    shmem::ShmemQuietThread(destPe);
   }
 
   for (int destPe = laneId; destPe < npes; destPe += warpSize) {
