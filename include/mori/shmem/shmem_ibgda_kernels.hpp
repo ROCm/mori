@@ -323,6 +323,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
                                                       size_t sourceOffset, size_t bytes, int pe,
                                                       int qpId) {
   if (bytes == 0) return;
+  assert(sourceOffset + bytes <= source.length && destOffset + bytes <= dest->size);
   uintptr_t laddr = source.addr + sourceOffset;
   uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
   uintptr_t rkey = dest->peerRkeys[pe];
@@ -474,7 +475,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
                                                           size_t destOffset, void* val,
                                                           size_t bytes, int pe, int qpId) {
   if (bytes == 0) return;
-
+  assert(destOffset + bytes <= dest->size);
   uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
   uintptr_t rkey = dest->peerRkeys[pe];
 
@@ -617,6 +618,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId) {
   if (bytes == 0) return;
+  assert(sourceOffset + bytes <= source.length && destOffset + bytes <= dest->size);
   uintptr_t laddr = source.addr + sourceOffset;
   uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
   uintptr_t rkey = dest->peerRkeys[pe];
@@ -708,6 +710,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
   }
 
   // signal
+  assert(signalDestOffset + sizeof(signalValue) <= signalDest->size);
   uint64_t dbr_val;
   uintptr_t signalRaddr = signalDest->peerPtrs[pe] + signalDestOffset;
   uintptr_t signalRkey = signalDest->peerRkeys[pe];
@@ -863,6 +866,7 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
     core::atomicType amoType, int pe, int qpId) {
   if (bytes == 0) return;
+  assert(destOffset + bytes <= dest->size);
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
@@ -1037,6 +1041,7 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelImpl(const application::Symm
                                                          void* compare, size_t bytes,
                                                          core::atomicType amoType, int pe,
                                                          int qpId) {
+  assert(destOffset + bytes <= dest->size);
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
