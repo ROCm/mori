@@ -207,8 +207,8 @@ __global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
 
   // Copy token onto staing buffer for later IBGDA transfer
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
-  // uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
-  uint8_t* stagingPtr = args.shmemCombineInpTokMemObj->template GetAs<uint8_t*>();
+  uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
+  // uint8_t* stagingPtr = args.shmemCombineInpTokMemObj->template GetAs<uint8_t*>();
   for (int tokenId = globalWarpId; tokenId < totalRecvTokenNum; tokenId += globalWarpNum) {
     index_t stagingTokId = 0;
     if (laneId == 0) stagingTokId = args.dispReceiverIdxMap[tokenId];
@@ -231,12 +231,12 @@ __global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
     size_t remoteOffset = (config.MaxNumTokensToSendPerRank() * myPe) * hiddenBytes;
     size_t localOffset = (config.MaxNumTokensToSendPerRank() * destPe) * hiddenBytes;
     if (destPe != myPe)
-      // shmem::ShmemPutMemNbiWarp(args.shmemCombineInpTokMemObj, remoteOffset,
-      //                           args.shmemStagingTokMemObj, localOffset, tokenNum * hiddenBytes,
-      //                           destPe);
-      shmem::ShmemPutMemNbiWarp(args.shmemStagingTokMemObj, remoteOffset,
-                                args.shmemCombineInpTokMemObj, localOffset, tokenNum * hiddenBytes,
+      shmem::ShmemPutMemNbiWarp(args.shmemCombineInpTokMemObj, remoteOffset,
+                                args.shmemStagingTokMemObj, localOffset, tokenNum * hiddenBytes,
                                 destPe);
+      // shmem::ShmemPutMemNbiWarp(args.shmemStagingTokMemObj, remoteOffset,
+      //                           args.shmemCombineInpTokMemObj, localOffset, tokenNum * hiddenBytes,
+      //                           destPe);
     // shmem::ShmemPutUint32ImmNbiWarp(args.crossDeviceBarrierMemObj, myPe * sizeof(uint32_t),
     //                                 barrierFlag, destPe);
     if (laneId == 0) recvTokenNums[destPe] = 0;
@@ -269,10 +269,10 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
       index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
       index_t destPe = destTokId / config.MaxNumTokensToSendPerRank();
 
-      // T* stagingPtr = (destPe != myPe) ? args.shmemCombineInpTokMemObj->template GetAs<T*>()
-      //                                  : args.shmemStagingTokMemObj->template GetAs<T*>();
-      T* stagingPtr = (destPe != myPe) ? args.shmemStagingTokMemObj->template GetAs<T*>()
-                                       : args.shmemCombineInpTokMemObj->template GetAs<T*>();
+      T* stagingPtr = (destPe != myPe) ? args.shmemCombineInpTokMemObj->template GetAs<T*>()
+                                       : args.shmemStagingTokMemObj->template GetAs<T*>();
+      // T* stagingPtr = (destPe != myPe) ? args.shmemStagingTokMemObj->template GetAs<T*>()
+      //                                  : args.shmemCombineInpTokMemObj->template GetAs<T*>();
       if (destPe < npes) {
         srcPtrs[j] = stagingPtr + destTokId * config.hiddenDim;
       } else {
