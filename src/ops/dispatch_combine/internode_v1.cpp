@@ -626,18 +626,44 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
         }
       }
 
-      index_t finished = 0;
-      if (laneId == 0)
-        finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
-      finished = __shfl(finished, 0);
-      if (laneId == 0)
-      shmem::ShmemInt32WaitUntilEquals(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], numRecvBlock * warpNum);
-      if ((finished + 1) < (numRecvBlock * warpNum)) continue;
+      // index_t finished = 0;
+      // if (laneId == 0)
+      //   finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
+      // finished = __shfl(finished, 0);
+      // if (laneId == 0)
+      // shmem::ShmemInt32WaitUntilEquals(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], numRecvBlock * warpNum);
+      // if ((finished + 1) < (numRecvBlock * warpNum)) continue;
 
+      // args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>()[node * maxChunkNum + k] = 0;
+      // args.interNodeChunkFlagCombine[node * maxChunkNum + k] = 0;
+      // int proxyPe = node * config.gpuPerNode + (config.rank % config.gpuPerNode);
+      // int qpId = k % config.numQpPerPe;
+      // shmem::ShmemPutTypeNbiWarp<uint8_t>(
+      //     args.shmemStagingTokMemObj,
+      //     ((myNode + nNodes) * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * combXferBytes,
+      //     args.shmemStagingTokMemObj,
+      //     (node * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * combXferBytes,
+      //     thisChunkTokenNum * combXferBytes, proxyPe, qpId);
+    }
+  }
+  int finishedWarp = 0;
+  uint64_t barrierFlag = 0;
+  if (laneId == 0) {
+    finishedWarp = atomicAdd(args.interNodeBlocksBarrier, 1);
+    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
+    shmem::ShmemInt32WaitUntilEquals(args.interNodeBlocksBarrier, config.rdmaBlockNum * warpNum);
+  }
+
+  for (int k = globalWarpId; k < maxChunkNum; k+=globalWarpNum) {
+    for (int i = 0; i < (nNodes - 1); i++) {
+      int node = (myNode + 1 + i) % nNodes;
       args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>()[node * maxChunkNum + k] = 0;
       args.interNodeChunkFlagCombine[node * maxChunkNum + k] = 0;
       int proxyPe = node * config.gpuPerNode + (config.rank % config.gpuPerNode);
       int qpId = k % config.numQpPerPe;
+      int startTokenIdx = k * warpSize;
+      uint64_t thisChunkTokenNum = chunkFlag[node * maxChunkNum + k];
+      thisChunkTokenNum -= (thisChunkTokenNum > 0) ? 1 : 0;
       shmem::ShmemPutTypeNbiWarp<uint8_t>(
           args.shmemStagingTokMemObj,
           ((myNode + nNodes) * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * combXferBytes,
@@ -646,12 +672,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
           thisChunkTokenNum * combXferBytes, proxyPe, qpId);
     }
   }
-  int finishedWarp = 0;
-  uint64_t barrierFlag = 0;
-  if (laneId == 0) {
-    finishedWarp = atomicAdd(args.interNodeBlocksBarrier, 1);
-    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
-  }
+
   finishedWarp = __shfl(finishedWarp, 0);
   barrierFlag = __shfl(barrierFlag, 0);
   if ((finishedWarp + 1) == (config.rdmaBlockNum * warpNum)) {
