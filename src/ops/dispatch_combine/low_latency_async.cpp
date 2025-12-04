@@ -251,7 +251,7 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   uint64_t barrierFlag = args.crossDeviceBarrierFlag[0];
   for (int destPe = blockId; (destPe < npes) && (warpId == 0); destPe += blockNum) {
     for (int i = 0; i < config.numQpPerPe; i++) {
-      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.crossDeviceBarrierMemObj,
+      shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(args.crossDeviceBarrierMemObj,
                                                        myPe * sizeof(uint64_t), 1,
                                                        core::AMO_ADD, destPe, i);
     }
