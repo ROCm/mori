@@ -230,15 +230,16 @@ __global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
     int64_t tokenNum = recvTokenNums[destPe]-1;
     size_t remoteOffset = (config.MaxNumTokensToSendPerRank() * myPe) * hiddenBytes;
     size_t localOffset = (config.MaxNumTokensToSendPerRank() * destPe) * hiddenBytes;
-    if (destPe != myPe)
-      shmem::ShmemPutMemNbiWarp(args.shmemCombineInpTokMemObj, remoteOffset,
-                                args.shmemStagingTokMemObj, localOffset, tokenNum * hiddenBytes,
-                                destPe);
-      // shmem::ShmemPutMemNbiWarp(args.shmemStagingTokMemObj, remoteOffset,
-      //                           args.shmemCombineInpTokMemObj, localOffset, tokenNum * hiddenBytes,
-      //                           destPe);
-    // shmem::ShmemPutUint32ImmNbiWarp(args.crossDeviceBarrierMemObj, myPe * sizeof(uint32_t),
-    //                                 barrierFlag, destPe);
+    if (destPe != myPe) {
+      for (int i = 0; i < config.numQpPerPe; i++) {
+        int64_t chunkTokenNum = core::CeilDiv(tokenNum, int64_t(config.numQpPerPe));
+        int64_t startIdx = chunkTokenNum*i;
+        chunkTokenNum = std::min(startIdx+chunkTokenNum, tokenNum) - chunkTokenNum;
+        shmem::ShmemPutMemNbiWarp(args.shmemCombineInpTokMemObj, remoteOffset+startIdx*hiddenBytes,
+                                  args.shmemStagingTokMemObj, localOffset+startIdx*hiddenBytes, chunkTokenNum * hiddenBytes,
+                                  destPe, i);
+      }
+    }
     if (laneId == 0) recvTokenNums[destPe] = 0;
   }
 }
@@ -247,16 +248,21 @@ template <typename T>
 __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
 
-  uint32_t barrierFlag = args.crossDeviceBarrierFlag[0];
+  uint64_t barrierFlag = args.crossDeviceBarrierFlag[0];
   for (int destPe = blockId; (destPe < npes) && (warpId == 0); destPe += blockNum) {
-    shmem::ShmemPutUint32ImmNbiWarp(args.crossDeviceBarrierMemObj, myPe * sizeof(uint32_t),
-                                    barrierFlag, destPe);
+    for (int i = 0; i < config.numQpPerPe; i++) {
+      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.crossDeviceBarrierMemObj,
+                                                       myPe * sizeof(uint64_t), 1,
+                                                       core::AMO_ADD, destPe, i);
+    }
+    // shmem::ShmemPutUint32ImmNbiWarp(args.crossDeviceBarrierMemObj, myPe * sizeof(uint32_t),
+    //                                 barrierFlag, destPe);
     shmem::ShmemQuietThread(destPe);
   }
 
   for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-    shmem::ShmemUint32WaitUntilEquals(
-        args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>() + destPe, barrierFlag);
+    shmem::ShmemUint64WaitUntilEquals(
+        args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>() + destPe, barrierFlag*config.numQpPerPe);
   }
 
   extern __shared__ char sharedMem[];
@@ -272,7 +278,7 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
       T* stagingPtr = (destPe != myPe) ? args.shmemCombineInpTokMemObj->template GetAs<T*>()
                                        : args.shmemStagingTokMemObj->template GetAs<T*>();
       // T* stagingPtr = (destPe != myPe) ? args.shmemStagingTokMemObj->template GetAs<T*>()
-      //                                  : args.shmemCombineInpTokMemObj->template GetAs<T*>();
+                                      //  : args.shmemCombineInpTokMemObj->template GetAs<T*>();
       if (destPe < npes) {
         srcPtrs[j] = stagingPtr + destTokId * config.hiddenDim;
       } else {
