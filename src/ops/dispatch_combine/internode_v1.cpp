@@ -651,7 +651,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   if (laneId == 0) {
     finishedWarp = atomicAdd(args.interNodeBlocksBarrier, 1);
     barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
-    shmem::ShmemInt32WaitUntilEquals(args.interNodeBlocksBarrier, config.rdmaBlockNum * warpNum);
+    shmem::ShmemUint32WaitUntilEquals(args.interNodeBlocksBarrier, config.rdmaBlockNum * warpNum);
   }
 
   for (int k = globalWarpId; k < maxChunkNum; k+=globalWarpNum) {
