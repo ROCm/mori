@@ -673,9 +673,14 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
     }
   }
 
+  if (laneId == 0) {
+    finishedWarp = atomicAdd(args.interNodeBlocksBarrier, 1);
+    shmem::ShmemUint32WaitUntilEquals(args.interNodeBlocksBarrier, 2*config.rdmaBlockNum * warpNum);
+  }
+
   finishedWarp = __shfl(finishedWarp, 0);
   barrierFlag = __shfl(barrierFlag, 0);
-  if ((finishedWarp + 1) == (config.rdmaBlockNum * warpNum)) {
+  if ((finishedWarp + 1) == (2*config.rdmaBlockNum * warpNum)) {
     if ((laneId < nNodes) &&
         (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
