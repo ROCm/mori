@@ -630,6 +630,8 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
       if (laneId == 0)
         finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
       finished = __shfl(finished, 0);
+      if (laneId == 0)
+      shmem::ShmemInt32WaitUntilEquals(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], numRecvBlock * warpNum);
       if ((finished + 1) < (numRecvBlock * warpNum)) continue;
 
       args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>()[node * maxChunkNum + k] = 0;
