@@ -249,15 +249,15 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
 
   uint64_t barrierFlag = args.crossDeviceBarrierFlag[0];
-  for (int destPe = blockId; (destPe < npes) && (warpId == 0); destPe += blockNum) {
-    for (int i = 0; i < config.numQpPerPe; i++) {
+  for (int destPe = blockId; destPe < npes; destPe += blockNum) {
+    for (int i = warpId; i < config.numQpPerPe; i += warpNum) {
       shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(args.crossDeviceBarrierMemObj,
                                                        myPe * sizeof(uint64_t), 1,
                                                        core::AMO_ADD, destPe, i);
+      shmem::ShmemQuietThread(destPe, i);
     }
     // shmem::ShmemPutUint32ImmNbiWarp(args.crossDeviceBarrierMemObj, myPe * sizeof(uint32_t),
     //                                 barrierFlag, destPe);
-    shmem::ShmemQuietThread(destPe);
   }
 
   for (int destPe = laneId; destPe < npes; destPe += warpSize) {
