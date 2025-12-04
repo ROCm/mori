@@ -234,7 +234,7 @@ __global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
       for (int i = 0; i < config.numQpPerPe; i++) {
         int64_t chunkTokenNum = core::CeilDiv(tokenNum, int64_t(config.numQpPerPe));
         int64_t startIdx = chunkTokenNum*i;
-        chunkTokenNum = std::min(startIdx+chunkTokenNum, tokenNum) - chunkTokenNum;
+        chunkTokenNum = std::min(startIdx+chunkTokenNum, tokenNum) - startIdx;
         shmem::ShmemPutMemNbiWarp(args.shmemCombineInpTokMemObj, remoteOffset+startIdx*hiddenBytes,
                                   args.shmemStagingTokMemObj, localOffset+startIdx*hiddenBytes, chunkTokenNum * hiddenBytes,
                                   destPe, i);
