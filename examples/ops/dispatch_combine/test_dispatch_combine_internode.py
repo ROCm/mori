@@ -463,7 +463,7 @@ class EpDispatchCombineTestCase:
                 block_num=self.config.block_num,
                 # warp_per_block=16,
             )
-            torch.cuda.synchronize()
+            # torch.cuda.synchronize()
             # print(f"rank {self.rank} round {i} dispatch done")
             # dist.barrier()
             _, _ = op.combine(
