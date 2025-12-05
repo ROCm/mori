@@ -215,6 +215,8 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
         index_t destTokId = destTokIdOffset + warpOffset;
 
         if (shouldSend) {
+#ifndef ENABLE_BNXT
+          // Optimization: Coalesce consecutive tokens into a single RDMA transfer
           bool prev = (laneId > 0) ? ((mask >> (laneId - 1)) & 1ULL) : 0;
           int count = 0;
           if (!prev) {
@@ -237,6 +239,18 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
                 (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t), flag,
                 core::atomicType::AMO_SET, proxyPe, qpId);
           }
+#else
+          size_t remoteIdx = (myNode * config.MaxNumTokensToRecvPerRank() + destTokId);
+          size_t stagingTokOffset = tokenId * xferBytes;
+          int qpId = (tokenId / warpSize) % config.numQpPerPe;
+    
+          shmem::ShmemPutMemNbiSignalThread(args.shmemDispatchInpTokMemObj, remoteIdx * xferBytes,
+                                            args.shmemStagingTokMemObj, stagingTokOffset,
+                                            xferBytes,  // Send exactly 1 token (no coalescing)
+                                            args.interNodeChunkFlagMemObj,
+                                            (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
+                                            flag, core::atomicType::AMO_SET, proxyPe, qpId);
+#endif
           args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
         }
       }
