@@ -464,7 +464,7 @@ class EpDispatchCombineTestCase:
                 # warp_per_block=16,
             )
             torch.cuda.synchronize()
-            print(f"rank {self.rank} round {i} dispatch done")
+            # print(f"rank {self.rank} round {i} dispatch done")
             dist.barrier()
             _, _ = op.combine(
                 dispatch_output,
@@ -474,7 +474,7 @@ class EpDispatchCombineTestCase:
                 # warp_per_block=16,
             )
             torch.cuda.synchronize()
-            print(f"rank {self.rank} round {i} combine done")
+            # print(f"rank {self.rank} round {i} combine done")
             dist.barrier()
             time.sleep(0.0001)
 

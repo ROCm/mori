@@ -416,7 +416,7 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
     if (laneId < config.gpuPerNode) {
       int destPe = myNode * config.gpuPerNode + laneId;
       index_t numTokenSignal = core::AtomicLoadSeqCstSystem(args.destPeTokenCounter + destPe) + 1;
-      printf("Rank %d CombineInterNode warpId %d: destPe %d numTokenSignal %lu\n", myPe, globalWarpId, destPe, numTokenSignal);
+      // printf("Rank %d CombineInterNode warpId %d: destPe %d numTokenSignal %lu\n", myPe, globalWarpId, destPe, numTokenSignal);
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
       core::AtomicStoreSeqCstSystem(signal, numTokenSignal);
     }
@@ -436,7 +436,7 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
       while (true) {
         if (!mySignalReady) {
           recvTokenNum = core::AtomicLoadSeqCstSystem(signal);
-          printf("Rank %d CombineInterNode warpId %d: destPe %d recvTokenNum %lu\n", myPe, globalWarpId, destPe, recvTokenNum);
+          // printf("Rank %d CombineInterNode warpId %d: destPe %d recvTokenNum %lu\n", myPe, globalWarpId, destPe, recvTokenNum);
           mySignalReady = (recvTokenNum > 0);
         }
         
@@ -471,7 +471,7 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
     if (laneId == 0) {
       __hip_atomic_store(&args.dispatchGridBarrier[0], 0, __ATOMIC_RELEASE,
                          __HIP_MEMORY_SCOPE_AGENT);
-      printf("__hip_atomic_store done \n");
+      // printf("__hip_atomic_store done \n");
     }
     // __hip_atomic_store(&args.dispatchGridBarrier[0], 0, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
   }
@@ -710,7 +710,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
     
     // Use warp voting to poll until all active lanes see their barriers ready
     uint64_t expectedValue = barrierFlag * config.numQpPerPe;
-    if (laneId == 0) printf("CombineInterNode warpId %d: barrierFlag %lu expected barrier value: %lu\n", globalWarpId, barrierFlag, expectedValue);
+    // if (laneId == 0) printf("CombineInterNode warpId %d: barrierFlag %lu expected barrier value: %lu\n", globalWarpId, barrierFlag, expectedValue);
 
     bool myBarrierReady = true;  // Default true for inactive or myNode lanes
     
