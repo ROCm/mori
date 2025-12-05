@@ -416,41 +416,78 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
     if (laneId < config.gpuPerNode) {
       int destPe = myNode * config.gpuPerNode + laneId;
       index_t numTokenSignal = core::AtomicLoadSeqCstSystem(args.destPeTokenCounter + destPe) + 1;
+      printf("Rank %d CombineInterNode warpId %d: destPe %d numTokenSignal %lu\n", myPe, globalWarpId, destPe, numTokenSignal);
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
       core::AtomicStoreSeqCstSystem(signal, numTokenSignal);
     }
-    if (laneId == 0) args.dispatchGridBarrier[0] = 0;
+    // if (laneId == 0) args.dispatchGridBarrier[0] = 0;
 
     index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
-    for (int destPe = nodePeOffset + laneId; destPe < (nodePeOffset + config.gpuPerNode);
-         destPe += warpSize) {
+
+    // Use warp voting mechanism to poll until all active lanes see their signals ready
+
+    if (laneId < config.gpuPerNode) {
+      int destPe = myNode * config.gpuPerNode + laneId;
       index_t* signal = recvTokenNums + destPe;
-      index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
-      core::AtomicStoreRelaxedSystem(signal, 0);
-      atomicAdd(args.totalRecvTokenNum, recvTokenNum);
+
+      // Poll until all active threads in the warp see their signal > 0
+      index_t recvTokenNum = 0;
+      bool mySignalReady = false;
+      while (true) {
+        if (!mySignalReady) {
+          recvTokenNum = core::AtomicLoadSeqCstSystem(signal);
+          printf("Rank %d CombineInterNode warpId %d: destPe %d recvTokenNum %lu\n", myPe, globalWarpId, destPe, recvTokenNum);
+          mySignalReady = (recvTokenNum > 0);
+        }
+        
+        // Vote: check if all active lanes have their signals ready
+        uint64_t readyMask = __ballot(mySignalReady);
+        uint64_t activeMask = __activemask();
+        if (readyMask == activeMask) {
+          break;  // All active threads see their signals ready
+        }
+      }
+      
+      // Now all signals are ready, use the last read value
+      // core::AtomicStoreRelaxedSystem(signal, 0);
+      atomicAdd(args.totalRecvTokenNum, recvTokenNum -1);
 
       // reset local counter
-      core::AtomicStoreRelaxed(args.destPeTokenCounter + destPe, 0);
-      core::AtomicStoreRelaxed(recvTokenNums + destPe, 0);
+      core::AtomicStoreSeqCst(args.destPeTokenCounter + destPe, 0);
+      core::AtomicStoreSeqCstSystem(recvTokenNums + destPe, 0);
     }
 
     if (laneId == 0) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
-      atomicAdd(args.crossDeviceBarrierFlag, 1);
+      // atomicAdd(args.crossDeviceBarrierFlag, 1);
+      __hip_atomic_fetch_add(args.crossDeviceBarrierFlag, 1, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+      __threadfence_system();
     }
 
     if (laneId < nNodes) {
       core::AtomicStoreRelaxedSystem(
           args.nodeRecvTokenNumMemObj->template GetAs<index_t*>() + laneId, 0);
     }
+    if (laneId == 0) {
+      __hip_atomic_store(&args.dispatchGridBarrier[0], 0, __ATOMIC_RELEASE,
+                         __HIP_MEMORY_SCOPE_AGENT);
+      printf("__hip_atomic_store done \n");
+    }
+    // __hip_atomic_store(&args.dispatchGridBarrier[0], 0, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
   }
+  if (thdId == 0) {
+    while (__hip_atomic_load(&args.dispatchGridBarrier[0], __ATOMIC_ACQUIRE,
+                             __HIP_MEMORY_SCOPE_AGENT) != 0) {
+      ;
+    }
+  }
+  __syncthreads();
 
   for (int i = globalWarpId; i < nNodes; i += globalWarpNum) {
     int proxyPe = i * config.gpuPerNode + (config.rank % config.gpuPerNode);
     shmem::ShmemQuietThread(proxyPe);
   }
 }
-
 }  // namespace v1
 
 template <typename T>
@@ -648,30 +685,50 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   uint64_t barrierFlag = 0;
   if (laneId == 0) {
     finishedWarp = atomicAdd(args.interNodeBlocksBarrier, 1);
-    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
+    barrierFlag = core::AtomicLoadSeqCst(args.crossDeviceBarrierFlag);
+    // printf("barrierFlag: %lu",barrierFlag);
   }
   finishedWarp = __shfl(finishedWarp, 0);
   barrierFlag = __shfl(barrierFlag, 0);
   if ((finishedWarp + 1) == (config.rdmaBlockNum * warpNum)) {
-    if ((laneId < nNodes) &&
-        (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
-      int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
+    for (int syncNode = 0; syncNode < nNodes; syncNode++){
+      if (syncNode == myNode) continue;
+      int proxyPe = syncNode * config.gpuPerNode + (config.rank % config.gpuPerNode);
+      // shmem::ShmemQuietThread(proxyPe);
       for (int i = 0; i < config.numQpPerPe; i++) {
-        shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.crossDeviceBarrierMemObj,
-                                                       args.config.rank * sizeof(uint64_t), 1,
-                                                       core::AMO_ADD, proxyPe, i);
+        shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(args.crossDeviceBarrierMemObj,
+                                                     args.config.rank * sizeof(uint64_t), 1,
+                                                     core::AMO_ADD, proxyPe, i);
+        asm volatile("" ::: "memory");
+        // shmem::ShmemQuietThread(proxyPe, i);                       
       }
-      // shmem::ShmemPutUint64ImmNbiThread(args.crossDeviceBarrierMemObj,
-      // args.config.rank * sizeof(uint64_t), barrierFlag, proxyPe);
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
 
-    // Wait other nodes
+    // Wait other nodes using warp voting mechanism
     uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
+    
+    // Use warp voting to poll until all active lanes see their barriers ready
+    uint64_t expectedValue = barrierFlag * config.numQpPerPe;
+    if (laneId == 0) printf("CombineInterNode warpId %d: barrierFlag %lu expected barrier value: %lu\n", globalWarpId, barrierFlag, expectedValue);
+
+    bool myBarrierReady = true;  // Default true for inactive or myNode lanes
+    
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
-             (barrierFlag * config.numQpPerPe)) {
+      myBarrierReady = false;
+      while (true) {
+        if (!myBarrierReady) {
+          uint64_t currentValue = core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe);
+          myBarrierReady = (currentValue == expectedValue);
+        }
+        
+        // Vote: check if all active lanes have their barriers ready
+        uint64_t readyMask = __ballot(myBarrierReady);
+        uint64_t activeMask = __activemask();
+        if (readyMask == activeMask) {
+          break;  // All active threads see their barriers ready
+        }
       }
     }
   }
@@ -685,12 +742,19 @@ inline __device__ void CombineAll(EpDispatchCombineArgs<T>& args) {
   uint32_t finishedWarps = 0;
   if (laneId == 0) {
     finishedWarps = atomicAdd(&args.combineGridBarrier[1], 1);
-    shmem::ShmemUint32WaitUntilEquals(&args.combineGridBarrier[1], globalWarpNum);
+    // shmem::ShmemUint32WaitUntilEquals(&args.combineGridBarrier[1], globalWarpNum);
   }
   finishedWarps = __shfl(finishedWarps, 0);
   if (((finishedWarps + 1) == globalWarpNum) && (laneId == 0)) {
-    args.combineGridBarrier[1] = 0;
+    __hip_atomic_store(&args.combineGridBarrier[1], 0, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    // args.combineGridBarrier[1] = 0;
   }
+  while (thdId == 0 &&
+         (__hip_atomic_load(&args.combineGridBarrier[1], __ATOMIC_ACQUIRE,
+                            __HIP_MEMORY_SCOPE_AGENT) != 0)) {
+    ;
+  }
+  __syncthreads();
 
   extern __shared__ char sharedMem[];
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;

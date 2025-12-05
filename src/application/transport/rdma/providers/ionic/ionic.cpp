@@ -332,7 +332,8 @@ void IonicQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
   attr.ah_attr.port_num = config.portId;
   attr.ah_attr.is_global = 1;
   attr.ah_attr.grh.hop_limit = 1;
-  attr.ah_attr.sl = 1;
+  attr.ah_attr.sl = 3;
+  attr.ah_attr.grh.traffic_class = 106;
 
   attr_mask = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_RQ_PSN | IBV_QP_DEST_QPN |
               IBV_QP_AV | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
@@ -356,7 +357,7 @@ void IonicQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
 
   memset(&attr, 0, sizeof(struct ibv_qp_attr));
   attr.qp_state      = IBV_QPS_RTS;
-  attr.timeout       = 14;
+  attr.timeout       = 20;
   attr.retry_cnt     = 7;
   attr.rnr_retry     = 7;
   attr.max_rd_atomic = 15;
