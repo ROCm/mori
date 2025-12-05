@@ -441,7 +441,7 @@ class EpDispatchCombineTestCase:
         if self.rank == 0:
             print("Stress Test")
         test_data_list = [self.gen_test_data(use_max_token_num=False) for i in range(5)]
-        for i in range(5000):
+        for i in tqdm(range(5000)):
             (
                 all_rank_num_token,
                 all_rank_indices,
@@ -465,7 +465,7 @@ class EpDispatchCombineTestCase:
             )
             torch.cuda.synchronize()
             # print(f"rank {self.rank} round {i} dispatch done")
-            dist.barrier()
+            # dist.barrier()
             _, _ = op.combine(
                 dispatch_output,
                 dispatch_weights,
@@ -475,7 +475,7 @@ class EpDispatchCombineTestCase:
             )
             torch.cuda.synchronize()
             # print(f"rank {self.rank} round {i} combine done")
-            dist.barrier()
+            # dist.barrier()
             time.sleep(0.0001)
 
         if self.rank == 0:
