@@ -113,10 +113,8 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       if (laneId == 0) {
         // decide token id in dest pe
         destTokId = atomicAdd_system(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
-        // destTokId =
-        //     __hip_atomic_fetch_add(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1,
-        //                            __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
         atomicAdd(args.destPeTokenCounter + destPe, 1);
+        // __hip_atomic_add(args.destPeTokenCounter + destPe, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_DEVICE) + 1;
         args.dispDestTokIdMap[i] = destPe * maxNumTokensToSend + destTokId;
 
         // TODO: use a switch to control the writing of this buffer, should only turn on for testing
@@ -163,6 +161,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
       // Add 1 so that when token number == 0, receiver side still know the signal is sent
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
+      // index_t numTokenSignal = __hip_atomic_load(args.destPeTokenCounter + destPe, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_DEVICE) + 1;
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
       shmem::ShmemInt32WaitUntilEquals(signal, 0);
       core::AtomicStoreRelaxedSystem(signal, numTokenSignal);

@@ -98,7 +98,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                         _,
                         packed_recv_topk_idx,
                         packed_recv_count,
-                    ) = op.dispatch(
+                    ) = no_zero_copy_op.dispatch(
                         x,
                         topk_weights,
                         None,
@@ -189,7 +189,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                 #         # TODO check recv topk index and weights
 
             # Check combine correctness diff:mori只支持zero_copy为true
-            for zero_copy in (True, ):
+            for zero_copy in (False, ):
                 if zero_copy:
                     if fused_moe_adaption:
                         # buffer.get_next_low_latency_combine_buffer(handle)[:, :] = simulated_gemm_x
@@ -199,8 +199,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                         )
                     else:
                         buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
-                out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-                if fused_moe_adaption:
+                    out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
                     # combined_x, event, hook = buffer.low_latency_combine_rocm(simulated_gemm_x, topk_idx, None, handle,
                     #                                                         async_finish=not return_recv_hook, zero_copy=zero_copy,
                     #                                                         return_recv_hook=return_recv_hook, out=out)
@@ -212,9 +211,18 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                         warp_per_block=4,
                     )
                 else:
-                    combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
-                                                                        async_finish=not return_recv_hook, zero_copy=zero_copy,
-                                                                        return_recv_hook=return_recv_hook, out=out)
+                    out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+                    # combined_x, event, hook = buffer.low_latency_combine_rocm(simulated_gemm_x, topk_idx, None, handle,
+                    #                                                         async_finish=not return_recv_hook, zero_copy=zero_copy,
+                    #                                                         return_recv_hook=return_recv_hook, out=out)
+                    # print(f'simulated_gemm_x[:5, :8]:\n{simulated_gemm_x[:5, :8]}')
+                    combined_x, _ = no_zero_copy_op.combine(
+                        simulated_gemm_x,
+                        None,
+                        packed_recv_topk_idx,
+                        block_num=80,
+                        warp_per_block=4,
+                    )
                 # hook() if return_recv_hook else event.current_stream_wait()
                 torch.cuda.synchronize()
                 if do_check:
@@ -327,6 +335,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         num_selections = (validation_topk_idx[i] != -1).sum().item()
         num_dispatch_comm_bytes += (num_fp8_bytes if bench_use_fp8 else num_bf16_bytes) * num_selections
         num_combine_comm_bytes += num_bf16_bytes * num_selections
+    print(f'[rank {rank}] num_dispatch_comm_bytes {num_dispatch_comm_bytes} num_combine_comm_bytes {num_combine_comm_bytes}')
 
     # Dispatch + combine testing
     avg_t, min_t, max_t = bench(partial(test_func, zero_copy=False, use_fp8=bench_use_fp8, return_recv_hook=False))
