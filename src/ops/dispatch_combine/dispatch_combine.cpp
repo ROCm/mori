@@ -161,6 +161,11 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
 
   HIP_RUNTIME_CHECK(hipMalloc(&destPeTokenCounter, config.worldSize * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(destPeTokenCounter, 0, config.worldSize * sizeof(index_t)));
+  
+  HIP_RUNTIME_CHECK(hipMalloc(&timings, 32*1024*1024));
+  HIP_RUNTIME_CHECK(hipMemset(timings, 0, 32*1024*1024));
+
+  HIP_RUNTIME_CHECK(hipHostMalloc(&h_timings, 32*1024*1024, hipHostMallocMapped));
 
   HIP_RUNTIME_CHECK(
       hipMalloc(&destNodeTokenCounter, config.worldSize / config.gpuPerNode * sizeof(index_t)));
@@ -200,6 +205,7 @@ void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipFree(destPeTokenIdxMap));
   HIP_RUNTIME_CHECK(hipFree(srcPeTokenIdxMap));
   HIP_RUNTIME_CHECK(hipFree(destPeTokenCounter));
+  HIP_RUNTIME_CHECK(hipFree(timings));
   HIP_RUNTIME_CHECK(hipFree(destNodeTokenCounter));
   HIP_RUNTIME_CHECK(hipFree(localPeTokenCounter));
   ShmemFree(dispTokOffsetMemObj->localPtr);

@@ -243,6 +243,8 @@ class EpDispatchCombineHandle {
   index_t* interNodeChunkFlagCombine{nullptr};
   // Map dispatched rdma token chunk index
   index_t* interNodeDispSendMap{nullptr};
+  uint64_t* timings{nullptr};
+  uint64_t* h_timings{nullptr};
 };
 
 template <typename T>
@@ -292,6 +294,7 @@ struct EpDispatchCombineArgs {
   index_t* interNodeDispDestTokIdMap{nullptr};
   index_t* interNodeChunkFlagCombine{nullptr};
   index_t* interNodeDispSendMap{nullptr};
+  uint64_t* timings{nullptr};
 };
 
 using EpDispatchCombineArgsVariant =
@@ -345,6 +348,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.interNodeDispDestTokIdMap = handle.interNodeDispDestTokIdMap;
   args.interNodeChunkFlagCombine = handle.interNodeChunkFlagCombine;
   args.interNodeDispSendMap = handle.interNodeDispSendMap;
+  args.timings = handle.timings;
   return args;
 }
 

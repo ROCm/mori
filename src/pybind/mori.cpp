@@ -69,6 +69,31 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
   handle.LaunchDispatch((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
                         at::cuda::getCurrentHIPStream());
 
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  constexpr int k_num_timings = 32;
+  constexpr int k_dump_num_timings = 4;
+  auto* d_timings = reinterpret_cast<uint64_t*>(handle.timings);
+  HIP_RUNTIME_CHECK(hipMemcpy(handle.h_timings, handle.timings, 32*1024*1024, hipMemcpyDeviceToHost));
+  const auto *h = reinterpret_cast<const uint64_t *>(handle.h_timings);
+
+  if (handle.config.rank==0){
+      // int b = 27;
+      for (int b = 0; b < 72; ++b) {
+          const uint64_t *base = reinterpret_cast<const uint64_t *>(h + b * k_num_timings);
+          double timings[k_dump_num_timings];
+          for (int i = 0; i < k_num_timings && i < k_dump_num_timings; ++i) {
+              timings[i] = double(base[i] - base[0]) / 100.0;
+          }
+
+          printf("[block %3d] d_timings %p", b, d_timings);
+          for (int i = 0; i < k_num_timings && i < k_dump_num_timings; ++i) {
+              printf(" [%d]%.2f", i, timings[i]);
+          }
+          printf("\n");
+      }
+      printf("\n");
+  }
+
   torch::Tensor out =
       torch::from_blob(handle.shmemDispatchOutTokMemObj->Get(),
                        {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
