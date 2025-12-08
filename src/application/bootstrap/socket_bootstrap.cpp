@@ -673,11 +673,18 @@ bool SocketBootstrapNetwork::PhoneHomeProtocol() {
     peer_infos[0].world_size = worldSize;
     memcpy(&peer_infos[0].listen_addr, &listen_socket_.addr, sizeof(SocketAddress));
 
-    // Collect from other ranks
+    // Keep client sockets open to avoid race condition
+    std::vector<Socket> client_sockets(worldSize);
+
+    // Collect from other ranks - keep sockets open
     for (int i = 1; i < worldSize; i++) {
       Socket client_sock;
       if (!AcceptSocket(root_listen_socket, client_sock)) {
         CloseSocket(root_listen_socket);
+        // Close any previously accepted sockets
+        for (int j = 1; j < i; j++) {
+          CloseSocket(client_sockets[j]);
+        }
         return false;
       }
 
@@ -685,40 +692,46 @@ bool SocketBootstrapNetwork::PhoneHomeProtocol() {
       if (!ReceiveData(client_sock, &info, sizeof(info))) {
         CloseSocket(client_sock);
         CloseSocket(root_listen_socket);
+        // Close any previously accepted sockets
+        for (int j = 1; j < i; j++) {
+          CloseSocket(client_sockets[j]);
+        }
         return false;
       }
 
       peer_infos[info.rank] = info;
-      CloseSocket(client_sock);
+      // Keep socket open and store it by rank
+      client_sockets[info.rank] = client_sock;
     }
 
-    // Send next peer address AND all peer addresses to each rank (except self)
+    // Now send peer addresses to each rank using the same sockets
     for (int i = 1; i < worldSize; i++) {
       int next_rank = (i + 1) % worldSize;
 
-      Socket client_sock;
-      if (!AcceptSocket(root_listen_socket, client_sock)) {
-        CloseSocket(root_listen_socket);
-        return false;
-      }
-
       // First send the next peer address (for ring connection)
-      if (!SendData(client_sock, &peer_infos[next_rank].listen_addr, sizeof(SocketAddress))) {
-        CloseSocket(client_sock);
+      if (!SendData(client_sockets[i], &peer_infos[next_rank].listen_addr, sizeof(SocketAddress))) {
         CloseSocket(root_listen_socket);
+        // Close all client sockets
+        for (int j = 1; j < worldSize; j++) {
+          CloseSocket(client_sockets[j]);
+        }
         return false;
       }
 
       // Then send all peer addresses (for AllToAll operations)
       for (int j = 0; j < worldSize; j++) {
-        if (!SendData(client_sock, &peer_infos[j].listen_addr, sizeof(SocketAddress))) {
-          CloseSocket(client_sock);
+        if (!SendData(client_sockets[i], &peer_infos[j].listen_addr, sizeof(SocketAddress))) {
           CloseSocket(root_listen_socket);
+          // Close all client sockets
+          for (int k = 1; k < worldSize; k++) {
+            CloseSocket(client_sockets[k]);
+          }
           return false;
         }
       }
 
-      CloseSocket(client_sock);
+      // Now close the socket after sending all data
+      CloseSocket(client_sockets[i]);
     }
 
     // Store all peer addresses
@@ -729,7 +742,7 @@ bool SocketBootstrapNetwork::PhoneHomeProtocol() {
     CloseSocket(root_listen_socket);
 
   } else {
-    // Non-root rank: send info to root and receive next peer address
+    // Non-root rank: connect once, send info, then receive addresses
     SocketAddress root_addr;
     ExtractAddressFromUniqueId(unique_id_, root_addr);
 
@@ -756,20 +769,7 @@ bool SocketBootstrapNetwork::PhoneHomeProtocol() {
       return false;
     }
 
-    CloseSocket(sock);
-
-    // Wait a bit before requesting next peer address
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    // Receive next peer address from root
-    if (!InitializeSocket(sock)) {
-      return false;
-    }
-
-    if (!ConnectSocket(sock, root_addr)) {
-      return false;
-    }
-
+    // Keep socket open and receive peer addresses on the same connection
     SocketAddress next_addr;
     if (!ReceiveData(sock, &next_addr, sizeof(next_addr))) {
       CloseSocket(sock);
