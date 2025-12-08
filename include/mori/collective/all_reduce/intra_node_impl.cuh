@@ -78,22 +78,6 @@ public:
     }
   }
 
-  /*
-  // allreduce interface, auto select dtype
-  void all_reduce(hipStream_t stream, void* input, void* output, 
-                  size_t count, size_t dtype_size, bool use_new = true, bool registered = false) {
-    if (dtype_size == 2) {
-      all_reduce<half>(stream, reinterpret_cast<half*>(input),
-                      reinterpret_cast<half*>(output), count, use_new, registered);
-    } else if (dtype_size == 4) {
-      all_reduce<float>(stream, reinterpret_cast<float*>(input),
-                       reinterpret_cast<float*>(output), count, use_new, registered);
-    } else {
-      throw std::runtime_error("Unsupported dtype_size: " + std::to_string(dtype_size));
-    }
-  }
-  */
-
   // release all device buffers
   void dispose() {
     kernel_entity_.reset();
