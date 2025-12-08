@@ -229,6 +229,63 @@ int64_t ShmemMyPe() { return mori::shmem::ShmemMyPe(); }
 
 int64_t ShmemNPes() { return mori::shmem::ShmemNPes(); }
 
+// UniqueId-based initialization APIs
+py::bytes ShmemGetUniqueId() {
+  mori::shmem::mori_shmem_uniqueid_t uid;
+  mori::shmem::ShmemGetUniqueId(&uid);
+  return py::bytes(reinterpret_cast<const char*>(uid.data()), uid.size());
+}
+
+int64_t ShmemInitAttr(unsigned int flags, int32_t rank, int32_t nranks, const py::bytes& uid_bytes) {
+  mori::shmem::mori_shmem_init_attr_t attr;
+  mori::shmem::mori_shmem_uniqueid_t uid;
+  
+  // Convert Python bytes to uniqueid
+  Py_ssize_t len = PyBytes_Size(uid_bytes.ptr());
+  const char* data = PyBytes_AsString(uid_bytes.ptr());
+  if (len != MORI_SHMEM_UNIQUE_ID_BYTES) {
+    throw std::runtime_error("Invalid unique ID size");
+  }
+  std::memcpy(uid.data(), data, MORI_SHMEM_UNIQUE_ID_BYTES);
+  
+  // Set attributes
+  mori::shmem::ShmemSetAttrUniqueIdArgs(rank, nranks, &uid, &attr);
+  
+  return mori::shmem::ShmemInitAttr(flags, &attr);
+}
+
+void ShmemBarrierAll() {
+  mori::shmem::ShmemBarrierAll();
+}
+
+// Symmetric memory APIs
+uintptr_t ShmemMalloc(size_t size) {
+  void* ptr = mori::shmem::ShmemMalloc(size);
+  return reinterpret_cast<uintptr_t>(ptr);
+}
+
+uintptr_t ShmemMallocAlign(size_t alignment, size_t size) {
+  void* ptr = mori::shmem::ShmemMallocAlign(alignment, size);
+  return reinterpret_cast<uintptr_t>(ptr);
+}
+
+uintptr_t ShmemExtMallocWithFlags(size_t size, unsigned int flags) {
+  void* ptr = mori::shmem::ShmemExtMallocWithFlags(size, flags);
+  return reinterpret_cast<uintptr_t>(ptr);
+}
+
+void ShmemFree(uintptr_t ptr) {
+  mori::shmem::ShmemFree(reinterpret_cast<void*>(ptr));
+}
+
+int64_t ShmemBufferRegister(uintptr_t ptr, size_t size) {
+  return mori::shmem::ShmemBufferRegister(reinterpret_cast<void*>(ptr), size);
+}
+
+int64_t ShmemBufferDeregister(uintptr_t ptr, size_t size) {
+  return mori::shmem::ShmemBufferDeregister(reinterpret_cast<void*>(ptr), size);
+}
+
 }  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -274,10 +331,62 @@ void RegisterMoriOps(py::module_& m) {
 }
 
 void RegisterMoriShmem(py::module_& m) {
-  m.def("shmem_torch_process_group_init", &ShmemTorchProcessGroupInit);
-  m.def("shmem_finalize", &ShmemFinalize);
-  m.def("shmem_mype", &ShmemMyPe);
-  m.def("shmem_npes", &ShmemNPes);
+  // Initialization flags
+  m.attr("MORI_SHMEM_INIT_WITH_MPI_COMM") = mori::shmem::MORI_SHMEM_INIT_WITH_MPI_COMM;
+  m.attr("MORI_SHMEM_INIT_WITH_UNIQUEID") = mori::shmem::MORI_SHMEM_INIT_WITH_UNIQUEID;
+  
+  // Traditional initialization APIs
+  m.def("shmem_torch_process_group_init", &ShmemTorchProcessGroupInit,
+        py::arg("group_name"),
+        "Initialize shmem from PyTorch process group");
+  
+  // UniqueId-based initialization APIs (nvshmem/rocshmem compatible)
+  m.def("shmem_get_unique_id", &ShmemGetUniqueId,
+        "Get a unique ID for shmem initialization (returns bytes)");
+  
+  m.def("shmem_init_attr", &ShmemInitAttr,
+        py::arg("flags"), py::arg("rank"), py::arg("nranks"), py::arg("unique_id"),
+        "Initialize shmem with attributes (unique_id should be bytes from shmem_get_unique_id)");
+  
+  m.def("shmem_finalize", &ShmemFinalize,
+        "Finalize shmem");
+  
+  // Query APIs
+  m.def("shmem_mype", &ShmemMyPe,
+        "Get my PE (process element) ID");
+  
+  m.def("shmem_npes", &ShmemNPes,
+        "Get number of PEs");
+  
+  // Collective operations
+  m.def("shmem_barrier_all", &ShmemBarrierAll,
+        "Global barrier synchronization");
+  
+  // Symmetric memory management
+  m.def("shmem_malloc", &ShmemMalloc,
+        py::arg("size"),
+        "Allocate symmetric memory (returns address as int)");
+  
+  m.def("shmem_malloc_align", &ShmemMallocAlign,
+        py::arg("alignment"), py::arg("size"),
+        "Allocate aligned symmetric memory (returns address as int)");
+  
+  m.def("shmem_ext_malloc_with_flags", &ShmemExtMallocWithFlags,
+        py::arg("size"), py::arg("flags"),
+        "Allocate symmetric memory with flags (returns address as int)");
+  
+  m.def("shmem_free", &ShmemFree,
+        py::arg("ptr"),
+        "Free symmetric memory (ptr should be int address)");
+  
+  // Buffer registration
+  m.def("shmem_buffer_register", &ShmemBufferRegister,
+        py::arg("ptr"), py::arg("size"),
+        "Register an existing buffer for RDMA (ptr should be int address)");
+  
+  m.def("shmem_buffer_deregister", &ShmemBufferDeregister,
+        py::arg("ptr"), py::arg("size"),
+        "Deregister a buffer from RDMA (ptr should be int address)");
 }
 
 void RegisterMoriIo(pybind11::module_& m) {
