@@ -178,7 +178,8 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       core::WarpCopy(args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
                      args.inpTokenBuf + srcTokOffset, config.hiddenDim);
       RECORD_SECTION_NO_SYNC(3);//warp_copy
-      if (laneId == 0) __hip_atomic_fetch_add(args.destPeTokenCounter + destPe, 1, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);// like atomic_counter_per_expert
+      if (laneId == 0) atomicAdd(args.destPeTokenCounter + destPe, 1);
+      // if (laneId == 0) __hip_atomic_fetch_add(args.destPeTokenCounter + destPe, 1, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);// like atomic_counter_per_expert
       RECORD_SECTION_NO_SYNC(4);
     }
   }
