@@ -671,7 +671,7 @@ inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHand
   uint32_t msn = BE32TOH(cqe->send.msg_msn);
 
   /* Report if the completion indicates an error. */
-  if (!!(qtf_be & IONIC_V1_CQE_ERROR) || msn < wqHandle.doneIdx) {
+  if (!!(qtf_be & IONIC_V1_CQE_ERROR)) {
     uint32_t qtf = qtf_be;
     uint32_t qid = qtf >> IONIC_V1_CQE_QID_SHIFT;
     uint32_t type = (qtf >> IONIC_V1_CQE_TYPE_SHIFT) & IONIC_V1_CQE_TYPE_MASK;
