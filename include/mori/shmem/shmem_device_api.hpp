@@ -839,5 +839,18 @@ DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Int32, int32_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Uint64, uint64_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Int64, int64_t)
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                       Query APIs                                               */
+/* ---------------------------------------------------------------------------------------------- */
+inline __device__ int ShmemMyPe() {
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  return globalGpuStates->rank;
+}
+
+inline __device__ int ShmemNPes() {
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  return globalGpuStates->worldSize;
+}
+
 }  // namespace shmem
 }  // namespace mori
