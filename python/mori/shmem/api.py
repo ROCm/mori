@@ -76,6 +76,22 @@ def shmem_finalize():
     return mori_cpp.shmem_finalize()
 
 
+def shmem_module_init(hip_module: int):
+    """Initialize globalGpuStates in a specific HIP module.
+    
+    This is used by Triton to initialize device symbols in dynamically
+    compiled kernel modules. It copies the current GpuStates values
+    to the module's globalGpuStates symbol.
+    
+    Args:
+        hip_module: HIP module handle (from Triton kernel compilation)
+        
+    Returns:
+        Status code (0 for success)
+    """
+    return mori_cpp.shmem_module_init(hip_module)
+
+
 # Query APIs
 def shmem_mype() -> int:
     """Get my PE (process element) ID.

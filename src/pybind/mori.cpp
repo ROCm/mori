@@ -225,6 +225,10 @@ int64_t ShmemTorchProcessGroupInit(const std::string& groupName) {
 
 int64_t ShmemFinalize() { return mori::shmem::ShmemFinalize(); }
 
+int64_t ShmemModuleInit(uint64_t hipModule) {
+  return mori::shmem::ShmemModuleInit(reinterpret_cast<void*>(hipModule));
+}
+
 int64_t ShmemMyPe() { return mori::shmem::ShmemMyPe(); }
 
 int64_t ShmemNPes() { return mori::shmem::ShmemNPes(); }
@@ -350,6 +354,11 @@ void RegisterMoriShmem(py::module_& m) {
   
   m.def("shmem_finalize", &ShmemFinalize,
         "Finalize shmem");
+  
+  //  Module-specific initialization (for Triton kernels)
+  m.def("shmem_module_init", &ShmemModuleInit,
+        py::arg("hip_module"),
+        "Initialize globalGpuStates in a specific HIP module (for Triton kernels)");
   
   // Query APIs
   m.def("shmem_mype", &ShmemMyPe,

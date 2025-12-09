@@ -29,9 +29,9 @@
 
 #include "mori/application/application.hpp"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
+#include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"
 #include "mori/utils/mori_log.hpp"
-#include "mori/shmem/internal.hpp"
 
 namespace mori {
 namespace shmem {
@@ -43,7 +43,7 @@ namespace shmem {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          Initialization                                       */
 /* ---------------------------------------------------------------------------------------------- */
-__constant__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
+__device__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
 
 void RdmaStatesInit() {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
@@ -164,9 +164,19 @@ void GpuStateInit() {
                   gpuStates.heapEndAddr - gpuStates.heapBaseAddr,
                   reinterpret_cast<uintptr_t>(gpuStates.heapObj));
 
-  // Copy gpu states to constant memory
+  // Copy gpu states to device memory (using hipGetSymbolAddress + hipMemcpy)
+  GpuStates* globalGpuStates_addr = nullptr;
+  HIP_RUNTIME_CHECK(hipGetSymbolAddress(reinterpret_cast<void**>(&globalGpuStates_addr),
+                                        HIP_SYMBOL(globalGpuStates)));
+
+  MORI_SHMEM_INFO("globalGpuStates device address: 0x{:x}",
+                  reinterpret_cast<uintptr_t>(globalGpuStates_addr));
+
   HIP_RUNTIME_CHECK(
-      hipMemcpyToSymbol(globalGpuStates, &gpuStates, sizeof(GpuStates), 0, hipMemcpyHostToDevice));
+      hipMemcpy(globalGpuStates_addr, &gpuStates, sizeof(GpuStates), hipMemcpyDefault));
+
+  MORI_SHMEM_INFO("Successfully copied GpuStates to device (rank={}, worldSize={})", gpuStates.rank,
+                  gpuStates.worldSize);
 }
 
 int ShmemInit(application::BootstrapNetwork* bootNet) {
@@ -193,7 +203,7 @@ int ShmemFinalize() {
 
   HIP_RUNTIME_CHECK(hipFree(globalGpuStates.transportTypes));
   HIP_RUNTIME_CHECK(hipFree(globalGpuStates.rdmaEndpoints));
-  
+
   if (states->rdmaStates->commContext->RdmaTransportEnabled()) {
     HIP_RUNTIME_CHECK(hipFree(globalGpuStates.endpointLock));
   }
@@ -236,10 +246,52 @@ int ShmemNPes() {
   return states->bootStates->worldSize;
 }
 
+int ShmemModuleInit(void* hipModule) {
+
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
+
+  GpuStates* hostGlobalGpuStates_addr = nullptr;
+  HIP_RUNTIME_CHECK(hipGetSymbolAddress(reinterpret_cast<void**>(&hostGlobalGpuStates_addr),
+                                        HIP_SYMBOL(globalGpuStates)));
+
+  // Read the current values from device
+  GpuStates gpuStates;
+  HIP_RUNTIME_CHECK(
+      hipMemcpy(&gpuStates, hostGlobalGpuStates_addr, sizeof(GpuStates), hipMemcpyDeviceToHost));
+
+  // Get the symbol address from the specific module
+  hipModule_t module = static_cast<hipModule_t>(hipModule);
+  GpuStates* moduleGlobalGpuStates_addr = nullptr;
+
+  hipError_t err =
+      hipModuleGetGlobal(reinterpret_cast<hipDeviceptr_t*>(&moduleGlobalGpuStates_addr), nullptr,
+                         module, "_ZN4mori5shmem15globalGpuStatesE");
+
+  if (err != hipSuccess) {
+    MORI_SHMEM_WARN("Failed to get globalGpuStates symbol from module: {} (error code: {})",
+                    hipGetErrorString(err), err);
+    return -1;
+  }
+
+  MORI_SHMEM_INFO("Module globalGpuStates address: 0x{:x} (host lib address: 0x{:x})",
+                  reinterpret_cast<uintptr_t>(moduleGlobalGpuStates_addr),
+                  reinterpret_cast<uintptr_t>(hostGlobalGpuStates_addr));
+
+  // Copy the GpuStates to the module's globalGpuStates
+  HIP_RUNTIME_CHECK(
+      hipMemcpy(moduleGlobalGpuStates_addr, &gpuStates, sizeof(GpuStates), hipMemcpyHostToDevice));
+
+  MORI_SHMEM_INFO("Successfully initialized globalGpuStates in module (rank={}, worldSize={})",
+                  gpuStates.rank, gpuStates.worldSize);
+
+  return 0;
+}
+
 void ShmemBarrierAll() {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
   states->CheckStatusValid();
-  
+
   MORI_SHMEM_TRACE("ShmemBarrierAll: PE {} entering barrier", states->bootStates->rank);
   states->bootStates->bootNet->Barrier();
   MORI_SHMEM_TRACE("ShmemBarrierAll: PE {} exiting barrier", states->bootStates->rank);

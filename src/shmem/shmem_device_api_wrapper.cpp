@@ -24,6 +24,12 @@
 
 #include "mori/shmem/shmem_device_api.hpp"
 
+namespace mori {
+namespace shmem {
+extern __constant__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
+}
+}
+
 extern "C" {
 __device__ __attribute__((visibility("default"))) void shmem_quiet_thread() {
   mori::shmem::ShmemQuietThread();

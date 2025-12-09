@@ -19,10 +19,12 @@ target_link_libraries(
   hip::host
   hip::device
   mlx5)
-target_compile_options(mori_shmem PUBLIC "-fgpu-rdc")
-target_link_options(mori_shmem PUBLIC "-fgpu-rdc")
 
-option(SAVE_TEMPS "Save intermediate compilation files" OFF)
+# Use code object version 5 for compatibility with Triton
+target_compile_options(mori_shmem PUBLIC "-fgpu-rdc" "-mcode-object-version=5")
+target_link_options(mori_shmem PUBLIC "-fgpu-rdc" "-mcode-object-version=5")
+
+option(SAVE_TEMPS "Save intermediate compilation files" ON)
 if(SAVE_TEMPS)
   target_compile_options(mori_shmem PUBLIC "-save-temps=obj")
   message(STATUS "SAVE_TEMPS enabled for mori_shmem - intermediate files will be saved")

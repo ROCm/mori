@@ -60,6 +60,8 @@ int ShmemInitAttr(unsigned int flags, mori_shmem_init_attr_t* attr);
 
 int ShmemFinalize();
 
+int ShmemModuleInit(void* hipModule);
+
 int ShmemMyPe();
 int ShmemNPes();
 
