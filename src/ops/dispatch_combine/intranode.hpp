@@ -43,10 +43,13 @@ __device__ __forceinline__ uint64_t dev_now_ns() { return wall_clock64(); }
   }                                                    \
 } while (0)
 
-#define RECORD_SECTION_NO_SYNC_THR(id, thr) do {                        \
-  if (threadIdx.x == thr) {                              \
-    args.timings[blockIdx.x * NUM_TIMINGS + (id)] = dev_now_ns(); \
-  }                                                    \
+// #define RECORD_SECTION_NO_SYNC_THR(id, thr) do {                        \
+//   if (threadIdx.x == thr) {                              \
+//     args.timings[blockIdx.x * NUM_TIMINGS + (id)] = dev_now_ns(); \
+//   }                                                    \
+// } while (0)
+#define RECORD_SECTION_NO_SYNC_THR(id) do {                        \
+    d_time[blockIdx.x * NUM_TIMINGS + (id)] = dev_now_ns(); \
 } while (0)
 
 namespace mori {
@@ -137,7 +140,9 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
       if (laneId == 0) {
         // decide token id in dest pe
+        RECORD_SECTION_NO_SYNC(1);
         destTokId = atomicAdd_system(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
+        RECORD_SECTION_NO_SYNC(2);
         // atomicAdd(args.destPeTokenCounter + destPe, 1);
         args.dispDestTokIdMap[i] = destPe * maxNumTokensToSend + destTokId;
 
@@ -172,11 +177,11 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       index_t destTokOffset = destTokId * config.hiddenDim;
       core::WarpCopy(args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
                      args.inpTokenBuf + srcTokOffset, config.hiddenDim);
-
-      __hip_atomic_fetch_add(args.destPeTokenCounter + destPe, 1, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);// like atomic_counter_per_expert
+      RECORD_SECTION_NO_SYNC(3);//warp_copy
+      if (laneId == 0) __hip_atomic_fetch_add(args.destPeTokenCounter + destPe, 1, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);// like atomic_counter_per_expert
+      RECORD_SECTION_NO_SYNC(4);
     }
   }
-  RECORD_SECTION(1);
   if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
   // Send token num & token to expert mapping to other ranks
@@ -184,18 +189,20 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       // Wait until all tokens are sent
       shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
+      RECORD_SECTION_NO_SYNC(5); // sync_grid 
       args.dispatchGridBarrier[0] = 0;
 
       // Add 1 so that when token number == 0, receiver side still know the signal is sent
       // index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       index_t numTokenSignal = __hip_atomic_load(args.destPeTokenCounter + destPe, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) + 1;// like ucl::device::LoadAcquire(atomic_counter_per_expert
+      RECORD_SECTION_NO_SYNC(6); // load_finish_counter
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
       shmem::ShmemInt32WaitUntilEquals(signal, 0);
       // core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
       __hip_atomic_store(signal, numTokenSignal, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+      RECORD_SECTION_NO_SYNC(7); // store_counter
     }
   }
-  RECORD_SECTION(2);
 
   // Phase 2: recv token
   // Each warp wait until sender finished by waiting token number signal
@@ -206,9 +213,11 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       // index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
       index_t recvTokenNum;
       while((recvTokenNum = __hip_atomic_load(signal, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM)) == 0);
+      RECORD_SECTION_NO_SYNC(8); // wait_recv_counter
       recvTokenNum = recvTokenNum - 1;
       core::AtomicStoreRelaxedSystem(signal, 0);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
+      RECORD_SECTION_NO_SYNC(9); // atomic_add_packed_recv_count
 
       // reset local counter
       args.destPeTokenCounter[destPe] = 0;
@@ -220,7 +229,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
     }
   }
-  RECORD_SECTION_NO_SYNC(3);
+  RECORD_SECTION(10);
 }
 
 /* ---------------------------------------------------------------------------------------------- */

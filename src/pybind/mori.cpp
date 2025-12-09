@@ -71,24 +71,51 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
 
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   constexpr int k_num_timings = 32;
-  constexpr int k_dump_num_timings = 4;
+  constexpr int k_dump_num_timings = 12;
   auto* d_timings = reinterpret_cast<uint64_t*>(handle.timings);
   HIP_RUNTIME_CHECK(hipMemcpy(handle.h_timings, handle.timings, 32*1024*1024, hipMemcpyDeviceToHost));
   const auto *h = reinterpret_cast<const uint64_t *>(handle.h_timings);
 
-  if (handle.config.rank==0){
+  if (handle.config.rank==7){
       // int b = 27;
-      for (int b = 0; b < 72; ++b) {
+      for (int b = 0; b < blockNum; ++b) {
           const uint64_t *base = reinterpret_cast<const uint64_t *>(h + b * k_num_timings);
           double timings[k_dump_num_timings];
           for (int i = 0; i < k_num_timings && i < k_dump_num_timings; ++i) {
               timings[i] = double(base[i] - base[0]) / 100.0;
           }
 
-          printf("[block %3d] d_timings %p", b, d_timings);
+          printf("[block %3d] ", b);
+
           for (int i = 0; i < k_num_timings && i < k_dump_num_timings; ++i) {
               printf(" [%d]%.2f", i, timings[i]);
           }
+          printf("\n");
+
+          // send
+          printf("[block %3d] ", b);
+          printf("send total(0~4): %.2f", timings[4] - timings[0]);
+          printf(" atomic_add_slot_idx(remote): %.2f", timings[2] - timings[1]);
+          printf(" warp_copy: %.2f", timings[3] - timings[2]);
+          printf(" atomic_finish_counter_per_rank: %.2f", timings[4] - timings[3]);
+
+          printf("\n[block %3d] ", b);
+          printf("sync_grid: %.2f", timings[5] - timings[4]);
+
+          // issue send counter
+          printf("\n[block %3d] ", b);
+          printf("issue total(5~7): %.2f", timings[7] - timings[5]);
+          printf(" load_finish_counter: %.2f", timings[6] - timings[5]);
+          printf(" store_counter: %.2f", timings[7] - timings[6]);
+
+          // recv
+          printf("\n[block %3d] ", b);
+          printf("recv total(7~9): %.2f", timings[9] - timings[7]);
+          printf(" wait_recv_counter: %.2f", timings[8] - timings[7]);
+          printf(" atomic_add_packed_recv_count: %.2f", timings[9] - timings[8]);
+
+          printf("\n[block %3d] ", b);
+          printf("total: %.2f", timings[10] - timings[0]);
           printf("\n");
       }
       printf("\n");
