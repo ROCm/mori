@@ -35,7 +35,7 @@ jobs:
           #git clone https://github.com/zhangfei829/mytest.git
           #git clone https://github.com/ROCm/mori.git
           cd mori
-          rm -rf build
+          #rm -rf build
           git checkout ionic_new_950_1128
           pip install --target /apps/mori-ci/packages -r requirements-build.txt
           git submodule update --init --recursive
@@ -60,7 +60,7 @@ jobs:
           id
           rocm-smi
      
-          opt/rocm/bin/rocminfo
+          /opt/rocm/bin/rocminfo
           #python test.py
           #bash test.sh
           #export PYTHONPATH=/home/runner/actions-runner/_work/mori/mori/mori:$PYTHONPATH
