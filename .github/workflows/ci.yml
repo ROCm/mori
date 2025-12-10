@@ -58,19 +58,8 @@ jobs:
           cd mori
           ls
           id
-          getent group video
-          getent group kvm  
-          getent group render
-          newgrp ci
-          id
-          newgrp video
-          id
-          #groupadd ci && useradd -m -g ci -s /bin/bash ci
-          newgrp video
-          id
-          groups
           rocm-smi
-          
+     
           opt/rocm/bin/rocminfo
           #python test.py
           #bash test.sh
