@@ -64,7 +64,9 @@ jobs:
           id
           newgrp video
           id
-          groupadd ci && useradd -m -g ci -s /bin/bash ci
+          su ci -c
+          id
+          #groupadd ci && useradd -m -g ci -s /bin/bash ci
           newgrp video
           id
           groups
