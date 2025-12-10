@@ -35,8 +35,9 @@ jobs:
           #git clone https://github.com/zhangfei829/mytest.git
           git clone https://github.com/ROCm/mori.git
           cd mori
+          pip install -r requirements-build.txt
           git submodule update --init --recursive
-          pip3 install .
+          pip3 install .  --no-build-isolation
           #make
           ls
   test:
