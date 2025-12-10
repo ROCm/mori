@@ -69,7 +69,16 @@ jobs:
           id
           groups
           rocm-smi
-          #opt/rocm/bin/rocminfo
+          bash -c "
+          # 在新的 shell 中
+          echo '=== 新 shell 会话 ==='
+          id
+
+          # 确保组权限
+          newgrp video << 'INNER'
+          echo '在 video 组中'
+          id"
+          opt/rocm/bin/rocminfo
           #python test.py
           #bash test.sh
           #export PYTHONPATH=/home/runner/actions-runner/_work/mori/mori/mori:$PYTHONPATH
