@@ -35,9 +35,10 @@ jobs:
           #git clone https://github.com/zhangfei829/mytest.git
           git clone https://github.com/ROCm/mori.git
           cd mori
+          git checkout ionic_new_950_1128
           pip install -r requirements-build.txt
           git submodule update --init --recursive
-          pip3 install .  --no-build-isolation
+          USE_IONIC=ON pip3 install . --no-build-isolation --target /apps/mori-ci/python-packages
           #make
           ls
   test:
@@ -57,6 +58,8 @@ jobs:
           ls
           #python test.py
           #bash test.sh
-          export PYTHONPATH=/home/runner/actions-runner/_work/mori/mori/mori:$PYTHONPATH
+          #export PYTHONPATH=/home/runner/actions-runner/_work/mori/mori/mori:$PYTHONPATH
+          export PYTHONPATH=/apps/mori-ci/python-packages:$PYTHONPATH
           #python3 tests/python/ops/bench_dispatch_combine.py
-          pytest -v tests/python/ops/
+          #pytest -v tests/python/ops/
+          mpiexec --allow-run-as-root -x MORI_GLOBAL_LOG_LEVEL=TRACE -np 2 ./build/examples/dist_write -c 4 -t 256 -q 2 
