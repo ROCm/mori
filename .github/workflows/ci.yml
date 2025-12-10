@@ -57,8 +57,9 @@ jobs:
           cd mori
           ls
           id
-          exit 
-          su - ci
+          getent group video
+          getent group kvm  
+          getent group render
           groupadd ci && useradd -m -g ci -s /bin/bash ci
           newgrp video
           id
