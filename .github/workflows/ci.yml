@@ -11,7 +11,7 @@ jobs:
           hostname
           id
           cmake --version
-          #exit
+          #exit 
           source ~/.bashrc
           echo "0. PATH: $PATH"
           export PATH="/home/runner/.local/bin:$PATH"
