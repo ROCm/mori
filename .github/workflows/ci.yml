@@ -30,10 +30,10 @@ jobs:
           pwd
           id  
           ls  
-          rm -rf mori
+          #rm -rf mori
 
           #git clone https://github.com/zhangfei829/mytest.git
-          git clone https://github.com/ROCm/mori.git
+          #git clone https://github.com/ROCm/mori.git
           cd mori
           git checkout ionic_new_950_1128
           pip install -r requirements-build.txt
@@ -56,6 +56,9 @@ jobs:
         run: |
           cd mori
           ls
+          id
+          groups
+          rocm-smi
           #python test.py
           #bash test.sh
           #export PYTHONPATH=/home/runner/actions-runner/_work/mori/mori/mori:$PYTHONPATH
