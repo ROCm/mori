@@ -75,6 +75,25 @@ __device__ __attribute__((visibility("default"))) void shmem_put_double_nbi_thre
 __device__ __attribute__((visibility("default"))) void shmem_put_size_imm_nbi_thread(
     void* dest, void* val, size_t bytes, int pe, int qpId);
 
+__device__ __attribute__((visibility("default"))) void shmem_int_p(int* dest, int val, int pe);
+__device__ __attribute__((visibility("default"))) void shmem_long_p(long* dest, long val, int pe);
+__device__ __attribute__((visibility("default"))) void shmem_longlong_p(long long* dest, long long val, int pe);
+__device__ __attribute__((visibility("default"))) void shmem_float_p(float* dest, float val, int pe);
+__device__ __attribute__((visibility("default"))) void shmem_double_p(double* dest, double val, int pe);
+__device__ __attribute__((visibility("default"))) void shmem_char_p(char* dest, char val, int pe);
+__device__ __attribute__((visibility("default"))) void shmem_short_p(short* dest, short val, int pe);
+
+__device__ __attribute__((visibility("default"))) void shmem_uint_p(unsigned int* dest, unsigned int val, int pe);
+__device__ __attribute__((visibility("default"))) void shmem_ulong_p(unsigned long* dest, unsigned long val, int pe);
+__device__ __attribute__((visibility("default"))) void shmem_ulonglong_p(unsigned long long* dest, unsigned long long val, int pe);
+__device__ __attribute__((visibility("default"))) void shmem_uchar_p(unsigned char* dest, unsigned char val, int pe);
+__device__ __attribute__((visibility("default"))) void shmem_ushort_p(unsigned short* dest, unsigned short val, int pe);
+
+__device__ __attribute__((visibility("default"))) void shmem_int32_p(int32_t* dest, int32_t val, int pe);
+__device__ __attribute__((visibility("default"))) void shmem_int64_p(int64_t* dest, int64_t val, int pe);
+__device__ __attribute__((visibility("default"))) void shmem_uint32_p(uint32_t* dest, uint32_t val, int pe);
+__device__ __attribute__((visibility("default"))) void shmem_uint64_p(uint64_t* dest, uint64_t val, int pe);
+
 // ============================================================================
 // Atomic NonFetch APIs - Thread Scope
 // ============================================================================
