@@ -62,4 +62,4 @@ jobs:
           export PYTHONPATH=/apps/mori-ci/python-packages:$PYTHONPATH
           #python3 tests/python/ops/bench_dispatch_combine.py
           #pytest -v tests/python/ops/
-          mpiexec --allow-run-as-root -x MORI_GLOBAL_LOG_LEVEL=TRACE -np 2 ./build/examples/dist_write -c 4 -t 256 -q 2 
+          mpiexec --allow-run-as-root -x MORI_GLOBAL_LOG_LEVEL=TRACE -np 2 ./build/examples/dist_write -c 1 -t 1 -q 1
