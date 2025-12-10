@@ -12,7 +12,7 @@ jobs:
           id
           cmake --version
           #exit 
-          source ~/.bashrc
+          #source ~/.bashrc
           echo "0. PATH: $PATH"
           export PATH="/home/runner/.local/bin:$PATH"
           cmake --version
