@@ -56,6 +56,7 @@ jobs:
         run: |
           cd mori
           ls
+          groupadd ci && useradd -m -g ci -s /bin/bash ci
           id
           groups
           rocm-smi
