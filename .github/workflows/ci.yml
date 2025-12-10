@@ -69,7 +69,7 @@ jobs:
           id
           groups
           rocm-smi
-          /opt/rocm/bin/rocminfo
+          #opt/rocm/bin/rocminfo
           #python test.py
           #bash test.sh
           #export PYTHONPATH=/home/runner/actions-runner/_work/mori/mori/mori:$PYTHONPATH
