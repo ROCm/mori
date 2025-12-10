@@ -37,7 +37,7 @@ jobs:
           cd mori
           rm -rf build
           git checkout ionic_new_950_1128
-          pip install -r requirements-build.txt
+          pip install --target /apps/mori-ci/packages -r requirements-build.txt
           git submodule update --init --recursive
           USE_IONIC=ON pip3 install . --no-build-isolation --target /apps/mori-ci/python-packages
           #make
