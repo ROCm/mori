@@ -31,7 +31,7 @@
 
 namespace mori {
 namespace application {
-
+#ifdef ENABLE_IONIC
 // BNXT UDP sport configuration constants
 static constexpr uint32_t IONIC_UDP_SPORT_ARRAY_SIZE = 4;
 
@@ -167,5 +167,6 @@ class IonicDevice : public RdmaDevice {
 
  RdmaDeviceContext* CreateRdmaDeviceContext() override;
 };
+#endif
 }  // namespace application
 }  // namespace mori

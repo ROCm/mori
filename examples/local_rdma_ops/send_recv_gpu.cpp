@@ -120,10 +120,12 @@ __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMe
       case ProviderType::BNXT:
         SendThreadKernel<ProviderType::BNXT>(epSend, mrSend, msgSize, msgNum);
         break;
-#endif        
+#endif 
+#ifdef ENABLE_IONIC	
       case ProviderType::PSD:
         SendThreadKernel<ProviderType::PSD>(epSend, mrSend, msgSize, msgNum);
         break;
+#endif	
       default:
         // unsupported provider
         break;
@@ -138,10 +140,12 @@ __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMe
       case ProviderType::BNXT:
         RecvThreadKernel<ProviderType::BNXT>(epRecv, mrRecv, msgSize, msgNum);
         break;
-#endif        
+#endif
+#ifdef ENABLE_IONIC	
       case ProviderType::PSD:
         RecvThreadKernel<ProviderType::PSD>(epRecv, mrRecv, msgSize, msgNum);
         break;
+#endif	
       default:
         // unsupported provider
         break;

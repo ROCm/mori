@@ -34,13 +34,17 @@ namespace shmem {
 
 #ifdef ENABLE_BNXT
 #define DISPATCH_MLX5 0
-#define DISPATCH_PSD  0
 #define DISPATCH_BNXT 1
+#define DISPATCH_PSD  0
+#elif ENABLE_IONIC
+#define DISPATCH_MLX5 0
+#define DISPATCH_BNXT 0
+#define DISPATCH_PSD  1
 #else
 #define DISPATCH_MLX5 1
-#define DISPATCH_PSD  1
 #define DISPATCH_BNXT 0
-#endif
+#define DISPATCH_PSD  0	
+#endif	
 
 #define DISPATCH_PROVIDER_TYPE(func, ...)                             \
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();               \
