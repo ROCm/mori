@@ -175,7 +175,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
       index_t srcTokOffset = srcTokId * config.hiddenDim;
       index_t destTokOffset = destTokId * config.hiddenDim;
-      core::WarpCopy(args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
+      core::WarpCopy<T, 2>(args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
                      args.inpTokenBuf + srcTokOffset, config.hiddenDim);
       RECORD_SECTION_NO_SYNC(3);//warp_copy
       if (laneId == 0) atomicAdd(args.destPeTokenCounter + destPe, 1);
@@ -183,6 +183,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       RECORD_SECTION_NO_SYNC(4);
     }
   }
+  __syncthreads();
   if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
   // Send token num & token to expert mapping to other ranks
