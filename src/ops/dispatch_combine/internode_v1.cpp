@@ -534,7 +534,7 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
     if (laneId < config.gpuPerNode) {
       int destPe = myNode * config.gpuPerNode + laneId;
       core::AtomicStoreRelaxedSystem(
-          args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>(destPe) + args.config.rank,
+          args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>(destPe) + args.config.rank*config.numQpPerPe,
           barrierFlag);
     }
     if (laneId == 0) args.combineGridBarrier[0] = 0;
@@ -544,7 +544,7 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
   if (laneId < config.gpuPerNode) {
     int destPe = myNode * config.gpuPerNode + laneId;
     // uint64_t st = clock64();
-    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe) != barrierFlag) {
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe*config.numQpPerPe) != barrierFlag) {
       // uint64_t now = clock64();
       // if ((now-st)>=1e11) {
       //   printf("myPe %d destPe %d Combine sync barrier %lu expected %lu\n", myPe, destPe,
@@ -682,12 +682,12 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
         (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
       for (int i = 0; i < config.numQpPerPe; i++) {
-        shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.crossDeviceBarrierMemObj,
-                                                       args.config.rank * sizeof(uint64_t), 1,
-                                                       core::AMO_ADD, proxyPe, i);
-        // shmem::ShmemPutUint64ImmNbiThread(args.crossDeviceBarrierMemObj,
-        //                                   (args.config.rank * config.numQpPerPe + i) * sizeof(uint64_t), 
-        //                                   barrierFlag, proxyPe, i);
+        // shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.crossDeviceBarrierMemObj,
+        //                                                args.config.rank * sizeof(uint64_t), 1,
+        //                                                core::AMO_ADD, proxyPe, i);
+        shmem::ShmemPutUint64ImmNbiThread(args.crossDeviceBarrierMemObj,
+                                          (args.config.rank * config.numQpPerPe + i) * sizeof(uint64_t), 
+                                          barrierFlag, proxyPe, i);
       }
       // shmem::ShmemPutUint64ImmNbiThread(args.crossDeviceBarrierMemObj,
       // args.config.rank * sizeof(uint64_t), barrierFlag, proxyPe);
@@ -699,20 +699,20 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
       uint64_t st = clock64();
-      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
-             (barrierFlag * config.numQpPerPe)) {
-      // for (int i = 0; i < config.numQpPerPe; i++) {
-      //   while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe * config.numQpPerPe + i) !=
-      //         barrierFlag) {
+      // while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
+      //        (barrierFlag * config.numQpPerPe)) {
+      for (int i = 0; i < config.numQpPerPe; i++) {
+        while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe * config.numQpPerPe + i) !=
+              barrierFlag) {
           uint64_t now = clock64();
           if ((now-st)>=1e11) {
             printf("myPe %d proxyPe %d barrier %lu expected %lu qpid %d\n",
               myPe, proxyPe, core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe), 
-              barrierFlag, 0);
+              barrierFlag, i);
             // assert(false);
           }
         }
-      // }
+      }
     }
   }
 }

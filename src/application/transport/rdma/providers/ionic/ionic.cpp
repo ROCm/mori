@@ -333,7 +333,7 @@ void IonicQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
   attr.ah_attr.is_global = 1;
   attr.ah_attr.grh.hop_limit = 1;
   // attr.ah_attr.sl = 0;
-  attr.ah_attr.sl = 3;
+  // attr.ah_attr.sl = 3;
   attr.ah_attr.grh.traffic_class = 96;
 
   attr_mask = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_RQ_PSN | IBV_QP_DEST_QPN |
