@@ -328,6 +328,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
     uint64_t thisChunkTokenNum = 0;
     index_t nodeFlag = 0;
     if (laneId == 0) {
+      uint64_t st = clock64();
       while (1) {
         thisChunkTokenNum = core::AtomicLoadRelaxedSystem(&chunkFlag[node * maxChunkNum + k]);
         if (thisChunkTokenNum > 0) break;
@@ -336,6 +337,12 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
         if ((nodeFlag > 0) && (startTokenIdx >= (nodeFlag - 1))) {
           thisChunkTokenNum = 1;
           break;
+        }
+
+        uint64_t now = clock64();
+        if ((now-st)>=1e11) {
+          printf("myPe %d node %d chunk num %d node num%d\n", myPe, node, thisChunkTokenNum, nodeFlag);
+          // assert(false);
         }
       }
     }
@@ -425,18 +432,29 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
     for (int destPe = nodePeOffset + laneId; destPe < (nodePeOffset + config.gpuPerNode);
          destPe += warpSize) {
       index_t* signal = recvTokenNums + destPe;
+      uint64_t st = clock64();
+      while (core::AtomicLoadRelaxedSystem(signal) <= 0) {
+        uint64_t now = clock64();
+        if ((now-st) >= 1e11) {
+          printf("myPe %d destPe %d hang at DispatchSync\n",myPe, destPe);
+          // assert(false);
+        }
+      }
       index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
+      __threadfence_system();
       core::AtomicStoreRelaxedSystem(signal, 0);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
 
       // reset local counter
-      core::AtomicStoreRelaxed(args.destPeTokenCounter + destPe, 0);
-      core::AtomicStoreRelaxed(recvTokenNums + destPe, 0);
+      core::AtomicStoreSeqCst(args.destPeTokenCounter + destPe, 0);
+      core::AtomicStoreSeqCstSystem(recvTokenNums + destPe, 0);
     }
 
     if (laneId == 0) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
-      atomicAdd(args.crossDeviceBarrierFlag, 1);
+      // atomicAdd(args.crossDeviceBarrierFlag, 1);
+      __hip_atomic_fetch_add(args.crossDeviceBarrierFlag, 1, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+      __threadfence_system();
     }
 
     if (laneId < nNodes) {
@@ -525,7 +543,14 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
   uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
   if (laneId < config.gpuPerNode) {
     int destPe = myNode * config.gpuPerNode + laneId;
+    // uint64_t st = clock64();
     while (core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe) != barrierFlag) {
+      // uint64_t now = clock64();
+      // if ((now-st)>=1e11) {
+      //   printf("myPe %d destPe %d Combine sync barrier %lu expected %lu\n", myPe, destPe,
+      //    core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe), barrierFlag);
+      //   // assert(false);
+      // }
     }
   }
 }
@@ -660,6 +685,9 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
         shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.crossDeviceBarrierMemObj,
                                                        args.config.rank * sizeof(uint64_t), 1,
                                                        core::AMO_ADD, proxyPe, i);
+        // shmem::ShmemPutUint64ImmNbiThread(args.crossDeviceBarrierMemObj,
+        //                                   (args.config.rank * config.numQpPerPe + i) * sizeof(uint64_t), 
+        //                                   barrierFlag, proxyPe, i);
       }
       // shmem::ShmemPutUint64ImmNbiThread(args.crossDeviceBarrierMemObj,
       // args.config.rank * sizeof(uint64_t), barrierFlag, proxyPe);
@@ -670,9 +698,21 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
     uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
+      uint64_t st = clock64();
       while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
              (barrierFlag * config.numQpPerPe)) {
-      }
+      // for (int i = 0; i < config.numQpPerPe; i++) {
+      //   while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe * config.numQpPerPe + i) !=
+      //         barrierFlag) {
+          uint64_t now = clock64();
+          if ((now-st)>=1e11) {
+            printf("myPe %d proxyPe %d barrier %lu expected %lu qpid %d\n",
+              myPe, proxyPe, core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe), 
+              barrierFlag, 0);
+            // assert(false);
+          }
+        }
+      // }
     }
   }
 }

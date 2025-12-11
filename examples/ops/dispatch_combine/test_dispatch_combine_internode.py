@@ -136,7 +136,7 @@ class EpDispatchCombineTestCase:
             ).to(self.device)
         else:
             num_token = torch.randint(
-                1,
+                0,
                 self.config.max_num_inp_token_per_rank + 1,
                 [self.world_size],
                 generator=self.rng,
@@ -437,18 +437,19 @@ class EpDispatchCombineTestCase:
 
     def stress_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
-
+        num_test_data = 10
+        sync_interval = 64
         if self.rank == 0:
             print("Stress Test")
-        test_data_list = [self.gen_test_data(use_max_token_num=False) for i in range(5)]
-        for i in tqdm(range(5000)):
+        test_data_list = [self.gen_test_data(use_max_token_num=False) for i in range(num_test_data)]
+        for i in tqdm(range(5000000)):
             (
                 all_rank_num_token,
                 all_rank_indices,
                 all_rank_input,
                 all_rank_weights,
                 all_rank_scales,
-            ) = test_data_list[i % 5]
+            ) = test_data_list[i % num_test_data]
             (
                 dispatch_output,
                 dispatch_weights,
@@ -471,7 +472,11 @@ class EpDispatchCombineTestCase:
                 # warp_per_block=16,
             )
             torch.cuda.synchronize()
-            time.sleep(0.0001)
+            if i % sync_interval == 0:
+                torch.cuda.synchronize()
+                # print(f"round {i} sync")
+            # time.sleep(0.0001)
+        torch.cuda.synchronize()
 
         if self.rank == 0:
             print("Stress Test with CUDA Graph")
@@ -508,7 +513,7 @@ class EpDispatchCombineTestCase:
             )
         torch.cuda.synchronize()
 
-        for i in tqdm(range(5000)):
+        for i in tqdm(range(500000)):
             g.replay()
             torch.cuda.synchronize()
             time.sleep(0.0001)
@@ -643,7 +648,7 @@ class EpDispatchCombineTestCase:
         comb_bandwidth_GB_list = []
 
         error_round = set()
-        for i in range(1):
+        for i in range(0):
             if self.rank == 0:
                 print(f"WarmUp Round {i} begin")
             self.run_test_once(op, test_data, error_round, i)
@@ -832,7 +837,7 @@ def test_dispatch_combine(
         kernel_type,
         num_qp,
         torch.bfloat16,
-        # torch.float8_e4m3fnuz,
+        # torch.float8_e4m3fn
     )
     test_case.setup()
     if cmd == "test":

@@ -781,6 +781,7 @@ __threadfence_system();
     __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
                        __HIP_MEMORY_SCOPE_AGENT);
   }
+  __threadfence_system();
 }
 
 template <>
@@ -967,6 +968,7 @@ __threadfence_system();
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
     __threadfence_system();
     core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
+    __threadfence_system();
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
@@ -1147,11 +1149,13 @@ __threadfence_system();
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
     __threadfence_system();
     core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
+    __threadfence_system();
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
                        __HIP_MEMORY_SCOPE_AGENT);
   }
+    __threadfence_system();
 
   ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
   T ret = *reinterpret_cast<volatile T*>(laddr);

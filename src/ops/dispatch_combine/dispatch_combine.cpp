@@ -223,7 +223,7 @@ void EpDispatchCombineHandle::InitializeBarrier() {
                                   : 1;
   // HIP_RUNTIME_CHECK(hipMemset(crossDeviceBarrierFlag, 1, 1));
   crossDeviceBarrierMemObj =
-      ShmemMallocAndReturnMemObjPtr(barrierSize * 2 * sizeof(uint64_t), hipDeviceMallocUncached);
+      ShmemMallocAndReturnMemObjPtr(barrierSize * 2 * sizeof(uint64_t) * config.numQpPerPe, hipDeviceMallocUncached);
 
   // We allocate one flag for each token, this ensure that we can use all chunk size(>=1)
   size_t interNodeChunkFlagSize =
