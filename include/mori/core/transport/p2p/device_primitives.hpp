@@ -634,7 +634,7 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
 }
 
 #ifndef WARP_ACCUM_UNROLL
-#define WARP_ACCUM_UNROLL 1
+#define WARP_ACCUM_UNROLL 2
 #endif
 
 template <typename T, int VecBytes>
