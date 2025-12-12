@@ -71,25 +71,41 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
 
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   constexpr int k_num_timings = 32;
-  constexpr int k_dump_num_timings = 4;
+  constexpr int k_max_warps_per_block = 16;
+  constexpr int k_dump_num_timings = 12;
+  
+  // Get actual warps per block from config (for printing only active warps)
+  int k_actual_warps_per_block = handle.config.warpNumPerBlock;
+  
   auto* d_timings = reinterpret_cast<uint64_t*>(handle.timings);
   HIP_RUNTIME_CHECK(hipMemcpy(handle.h_timings, handle.timings, 32*1024*1024, hipMemcpyDeviceToHost));
   const auto *h = reinterpret_cast<const uint64_t *>(handle.h_timings);
 
   if (handle.config.rank==0){
-      // int b = 27;
-      for (int b = 0; b < 72; ++b) {
-          const uint64_t *base = reinterpret_cast<const uint64_t *>(h + b * k_num_timings);
-          double timings[k_dump_num_timings];
-          for (int i = 0; i < k_num_timings && i < k_dump_num_timings; ++i) {
-              timings[i] = double(base[i] - base[0]) / 100.0;
-          }
+      // Print warp-level profiling data
+      int numBlocksToPrint = 72;
+      printf("Profiling: %d actual warps per block (layout: %d max warps per block)\n", 
+             k_actual_warps_per_block, k_max_warps_per_block);
+      for (int b = 0; b < numBlocksToPrint; ++b) {
+          for (int w = 0; w < k_actual_warps_per_block; ++w) {
+              // Use MAX_WARPS layout for addressing, even if actual warps is smaller
+              int globalWarpId = b * k_max_warps_per_block + w;
+              const uint64_t *base = h + globalWarpId * k_num_timings;
+              
+              // Skip if no timing data
+              if (base[0] == 0) continue;
+              
+              double timings[k_dump_num_timings];
+              for (int i = 0; i < k_num_timings && i < k_dump_num_timings; ++i) {
+                  timings[i] = double(base[i] - base[0]) / 100.0;
+              }
 
-          printf("[block %3d] d_timings %p", b, d_timings);
-          for (int i = 0; i < k_num_timings && i < k_dump_num_timings; ++i) {
-              printf(" [%d]%.2f", i, timings[i]);
+              printf("[block %3d warp %2d]", b, w);
+              for (int i = 0; i < k_num_timings && i < k_dump_num_timings; ++i) {
+                  printf(" [%d]%.2f", i, timings[i]);
+              }
+              printf("\n");
           }
-          printf("\n");
       }
       printf("\n");
   }
