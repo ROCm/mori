@@ -33,7 +33,7 @@
 
 namespace mori {
 namespace core {
-
+#ifdef ENABLE_IONIC
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           Post Tasks                                           */
 /* ---------------------------------------------------------------------------------------------- */
@@ -481,7 +481,7 @@ inline __device__ void UpdateDbrAndRingDbRecv<ProviderType::PSD>(void* dbrRecAdd
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Completion Queue                                        */
 /* ---------------------------------------------------------------------------------------------- */
-#if defined(IONIC_CCQE) && IONIC_CCQE == 1
+#ifdef IONIC_CCQE
 template <>
 inline __device__ int PollCqOnce<ProviderType::PSD>(void* cqeAddr, uint32_t cqeNum,
                                                     uint32_t consIdx, uint32_t* wqeIdx) {
@@ -606,7 +606,7 @@ inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum,
   return 0;
 }
 
-#if defined(IONIC_CCQE) && IONIC_CCQE == 1
+#ifdef IONIC_CCQE
 inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
                                   uint64_t activemask, void* cqeAddr, uint32_t cqeNum, uint32_t consIdx) {
   volatile struct ionic_v1_cqe* cqe = reinterpret_cast<ionic_v1_cqe*>(cqeAddr);
@@ -681,7 +681,7 @@ inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHand
     uint8_t error = IonicHandleErrorCqe(BE32TOH(cqe->status_length));
     printf("PollCqOnce2, QUIET ERROR: block:%u, warp:%u, lane:%u, cqeAddr:%p, error:%u qid %u type %u flag %#x status 0x%08x msn %u npg %lu\n",
            blockIdx.x, threadIdx.x/warpSize, __lane_id(), Addr, error, qid, type, flag, status, msn, npg);
-    #if 0
+    #if 1
     printf("dump cqe at addr:%p\n", Addr);
     for (int i = 0; i < 32; i++) {
       printf("%02x", (unsigned char)Addr[i]);
@@ -729,7 +729,7 @@ inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHand
 }
 #endif
 
-#if defined(IONIC_CCQE) && IONIC_CCQE == 1
+#ifdef IONIC_CCQE
 template <>
 inline __device__ int PollCq<ProviderType::PSD>(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
                                                 void* cqAddr, uint32_t cqeNum, uint32_t* consIdx, uint16_t* wqeCounter)
@@ -811,6 +811,6 @@ inline __device__ int PollCqAndUpdateDbr<ProviderType::PSD>(CompletionQueueHandl
   ReleaseLock(lockVar);
   return err;
 }
-
+#endif
 }  // namespace core
 }  // namespace mori
