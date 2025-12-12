@@ -406,7 +406,7 @@ void BnxtQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
   int status = bnxt_re_dv_modify_qp(qp, &attr, attr_mask, 0, 0);
   assert(!status);
     // Use qpId to select UDP sport value from the shared configuration (round-robin)
-  uint16_t selected_udp_sport = GetDeviceContext()->GetUdpSport(qpId);
+  uint16_t selected_udp_sport = GetDeviceContext()->GetUdpSport(qpId) + qpId;
   MORI_APP_TRACE("QP {} using UDP sport {} (qpId={}, index={})", qpn, selected_udp_sport, qpId,
                  qpId % RDMA_UDP_SPORT_ARRAY_SIZE);
   status = bnxt_re_dv_modify_qp_udp_sport(qp, selected_udp_sport);
