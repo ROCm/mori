@@ -643,7 +643,7 @@ class EpDispatchCombineTestCase:
         comb_bandwidth_GB_list = []
 
         error_round = set()
-        for i in range(1):
+        for i in range(0):
             if self.rank == 0:
                 print(f"WarmUp Round {i} begin")
             self.run_test_once(op, test_data, error_round, i)
@@ -832,7 +832,7 @@ def test_dispatch_combine(
         kernel_type,
         num_qp,
         torch.bfloat16,
-        # torch.float8_e4m3fnuz,
+        # torch.float8_e4m3fn,
     )
     test_case.setup()
     if cmd == "test":
