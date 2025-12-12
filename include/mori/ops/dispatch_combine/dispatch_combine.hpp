@@ -70,6 +70,9 @@ inline size_t GetHipDataTypeSize(hipDataType dtype) {
 
 using index_t = int32_t;
 
+#define MAX_DEBUG_TIME_SLOTS (16384)
+#define MAX_DEBUG_TIMESTAMP_PER_WARP (64)
+
 #define MAX_EXPERTS_PER_TOKEN (8)
 struct EpDispatchCombineConfig {
   int rank{0};
@@ -243,6 +246,8 @@ class EpDispatchCombineHandle {
   index_t* interNodeChunkFlagCombine{nullptr};
   // Map dispatched rdma token chunk index
   index_t* interNodeDispSendMap{nullptr};
+  // Debug buffer for latency profiling
+  int64_t* debugTimeBuf{nullptr};
 };
 
 template <typename T>
@@ -292,6 +297,7 @@ struct EpDispatchCombineArgs {
   index_t* interNodeDispDestTokIdMap{nullptr};
   index_t* interNodeChunkFlagCombine{nullptr};
   index_t* interNodeDispSendMap{nullptr};
+  int64_t* debugTimeBuf{nullptr};
 };
 
 using EpDispatchCombineArgsVariant =
@@ -345,6 +351,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.interNodeDispDestTokIdMap = handle.interNodeDispDestTokIdMap;
   args.interNodeChunkFlagCombine = handle.interNodeChunkFlagCombine;
   args.interNodeDispSendMap = handle.interNodeDispSendMap;
+  args.debugTimeBuf = handle.debugTimeBuf;
   return args;
 }
 

@@ -35,6 +35,7 @@
 #include "mori/application/application.hpp"
 #include "mori/io/io.hpp"
 #include "mori/ops/ops.hpp"
+#include "mori/ops/dispatch_combine/time_slots.hpp"
 #include "mori/shmem/shmem.hpp"
 #include "src/pybind/torch_utils.hpp"
 
@@ -182,6 +183,13 @@ torch::Tensor GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle
   return out;
 }
 
+torch::Tensor GetDebugTimeBuf(mori::moe::EpDispatchCombineHandle& handle) {
+    auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+    torch::Tensor tensor = torch::from_blob(handle.debugTimeBuf,
+                                            {handle.config.worldSize, MAX_DEBUG_TIME_SLOTS}, options);
+    return tensor;
+}
+
 void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   std::string className = std::string("EpDispatchCombineHandle");
   pybind11::class_<mori::moe::EpDispatchCombineHandle>(m, className.c_str())
@@ -211,6 +219,9 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
 
   funcName = std::string("get_registered_combine_input_buffer");
   m.def(funcName.c_str(), &GetRegisteredCombineInputBuffer);
+
+  funcName = std::string("get_debug_time_buf");
+  m.def(funcName.c_str(), &GetDebugTimeBuf);
 }
 
 }  // namespace
@@ -247,6 +258,11 @@ void RegisterMoriOps(py::module_& m) {
       .value("InterNodeV1", mori::moe::KernelType::InterNodeV1)
       .value("InterNodeV1LL", mori::moe::KernelType::InterNodeV1LL)
       .export_values();
+
+// Export CombineInterNode debug time slot constants
+#define ITEM(name, value) m.attr(#name) = value;
+  TIME_SLOT_ITEMS
+#undef ITEM
 
   pybind11::class_<mori::moe::EpDispatchCombineConfig>(m, "EpDispatchCombineConfig")
       .def(pybind11::init<int, int, int, int, int, int, int, int, int, int, int, bool,

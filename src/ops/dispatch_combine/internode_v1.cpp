@@ -24,6 +24,7 @@
 
 #include "mori/core/core.hpp"
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
+#include "mori/ops/dispatch_combine/time_slots.hpp"
 #include "mori/shmem/shmem.hpp"
 
 namespace mori {
@@ -61,6 +62,15 @@ namespace moe {
   size_t combXferBytes = (args.weightsBuf == nullptr) ? hiddenBytes : hiddenBytes + weightBytes;
 
 namespace v1 {
+
+// Debug time buffer slot indices for CombineInterNode profiling
+// Note: Slots are defined in mori/ops/dispatch_combine/time_slots.hpp
+enum CombineInterNodeTimeSlot {
+#define ITEM(name, value) name = value,
+  TIME_SLOT_ITEMS
+#undef ITEM
+};
+
 template <typename T>
 inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, int tokenId,
                                               int expId, int destPe, int& localPeTokenCounter) {
@@ -578,6 +588,12 @@ template <typename T>
 inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
 
+  // Record start time
+  if (globalWarpId == 0 && laneId == 0) {
+    int base = myPe * MAX_DEBUG_TIME_SLOTS + globalWarpId * MAX_DEBUG_TIMESTAMP_PER_WARP;
+    args.debugTimeBuf[base + SLOT_TIME_START] = clock64();
+  }
+
   constexpr int numRecvBlock = 8;
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
 
@@ -589,6 +605,25 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
   uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
 
+  // Stats Accumulators
+  long long acc_atomic_cycles = 0;
+  long long acc_atomic_count = 0;
+  long long acc_copy_cycles = 0;
+  long long acc_copy_count = 0;
+  long long acc_put_cycles = 0;
+  long long acc_put_count = 0;
+  
+  long long dur_setup = 0;
+  long long dur_acc_tok = 0;
+  long long dur_acc_wgt = 0;
+  long long acc_token_count = 0;
+
+  // Record time before main loop
+  if (globalWarpId == 0 && laneId == 0) {
+    int base = myPe * MAX_DEBUG_TIME_SLOTS + globalWarpId * MAX_DEBUG_TIMESTAMP_PER_WARP;
+    args.debugTimeBuf[base + SLOT_TIME_BEFORE_LOOP] = clock64();
+  }
+
   for (int k = blockId / numRecvBlock; k < maxChunkNum; k += (config.rdmaBlockNum / numRecvBlock)) {
     for (int i = 0; i < (nNodes - 1); i++) {
       int node = (myNode + 1 + i) % nNodes;
@@ -598,6 +633,8 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
       int startTokenIdx = k * warpSize;
       int endTokenIdx = startTokenIdx + thisChunkTokenNum;
 
+      long long t_outer_loop_start = clock64();  // Record outer loop start time
+      long long t_setup_start = t_outer_loop_start;
       for (int j = startTokenIdx + (blockId % numRecvBlock) * warpNum + warpId; j < endTokenIdx;
            j += numRecvBlock * warpNum) {
         int tokIdx = node * config.MaxNumTokensToRecvPerRank() + j;
@@ -617,33 +654,96 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
           }
           args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId] = 0;
         }
+        
+        long long t_acc_tok_start = clock64();
         core::WarpAccum<T, 4>(reinterpret_cast<T*>(stagingPtr + tokIdx * combXferBytes), srcPtrs,
                               nullptr, config.numExpertPerToken, config.hiddenDim);
+        long long t_acc_tok_end = clock64();
+        
+        dur_setup += (t_acc_tok_start - t_setup_start);
+        dur_acc_tok += (t_acc_tok_end - t_acc_tok_start);
+        
+        long long t_acc_wgt_start = clock64();
         if (args.weightsBuf) {
           core::WarpAccum<float, 4>(
               reinterpret_cast<float*>(stagingPtr + tokIdx * combXferBytes + hiddenBytes),
               srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
         }
+        long long t_acc_wgt_end = clock64();
+        dur_acc_wgt += (t_acc_wgt_end - t_acc_wgt_start);
+        
+        acc_token_count += 1;
+        t_setup_start = clock64();  // reset for next iter
       }
 
+      long long t_atomic_start = clock64();
       index_t finished = 0;
       if (laneId == 0)
         finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
       finished = __shfl(finished, 0);
+      long long t_atomic_end = clock64();
+      
+      long long t_put_start = t_atomic_end;
+      long long t_put_end = t_atomic_end;
+      
+      if ((finished + 1) >= (numRecvBlock * warpNum)) {
+        if (laneId == 0) {
+          args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>()[node * maxChunkNum + k] = 0;
+          args.interNodeChunkFlagCombine[node * maxChunkNum + k] = 0;
+        }
+        
+        int proxyPe = node * config.gpuPerNode + (config.rank % config.gpuPerNode);
+        int qpId = k % config.numQpPerPe;
+        
+        t_put_start = clock64();
+        shmem::ShmemPutTypeNbiWarp<uint8_t>(
+            args.shmemStagingTokMemObj,
+            ((myNode + nNodes) * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * combXferBytes,
+            args.shmemStagingTokMemObj,
+            (node * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * combXferBytes,
+            thisChunkTokenNum * combXferBytes, proxyPe, qpId);
+        t_put_end = clock64();
+      }
+      
+      // Update stats
+      long long dur_atomic = t_atomic_end - t_atomic_start;
+      long long dur_put = t_put_end - t_put_start;
+      
+      acc_copy_cycles += (t_atomic_start - t_outer_loop_start);
+      acc_copy_count += 1;
+      acc_atomic_cycles += dur_atomic;
+      acc_atomic_count += 1;
+      
+      if (dur_put > 0) {
+        acc_put_cycles += dur_put;
+        acc_put_count += 1;
+      }
+      
       if ((finished + 1) < (numRecvBlock * warpNum)) continue;
-
-      args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>()[node * maxChunkNum + k] = 0;
-      args.interNodeChunkFlagCombine[node * maxChunkNum + k] = 0;
-      int proxyPe = node * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      int qpId = k % config.numQpPerPe;
-      shmem::ShmemPutTypeNbiWarp<uint8_t>(
-          args.shmemStagingTokMemObj,
-          ((myNode + nNodes) * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * combXferBytes,
-          args.shmemStagingTokMemObj,
-          (node * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * combXferBytes,
-          thisChunkTokenNum * combXferBytes, proxyPe, qpId);
     }
   }
+  
+  // Flush accumulated statistics
+  if (laneId == 0) {
+    int base = myPe * MAX_DEBUG_TIME_SLOTS + globalWarpId * MAX_DEBUG_TIMESTAMP_PER_WARP;
+    args.debugTimeBuf[base + SLOT_ACC_COPY_CYCLES] = acc_copy_cycles;
+    args.debugTimeBuf[base + SLOT_ACC_ATOMIC_CYCLES] = acc_atomic_cycles;
+    args.debugTimeBuf[base + SLOT_ACC_PUT_CYCLES] = acc_put_cycles;
+    args.debugTimeBuf[base + SLOT_ACC_SETUP_DURATION] = dur_setup;
+    args.debugTimeBuf[base + SLOT_ACC_TOKEN_DURATION] = dur_acc_tok;
+    args.debugTimeBuf[base + SLOT_ACC_WEIGHT_DURATION] = dur_acc_wgt;
+    args.debugTimeBuf[base + SLOT_ACC_ITER_COUNT] = acc_copy_count;
+    args.debugTimeBuf[base + SLOT_ACC_ATOMIC_COUNT] = acc_atomic_count;
+    args.debugTimeBuf[base + SLOT_ACC_PUT_COUNT] = acc_put_count;
+    args.debugTimeBuf[base + SLOT_ACC_TOKEN_COUNT] = acc_token_count;
+  }
+  
+  // Record time after main loop
+  if (globalWarpId == 0 && laneId == 0) {
+    int base = myPe * MAX_DEBUG_TIME_SLOTS + globalWarpId * MAX_DEBUG_TIMESTAMP_PER_WARP;
+    args.debugTimeBuf[base + SLOT_TIME_AFTER_LOOP] = clock64();
+  }
+  
   int finishedWarp = 0;
   uint64_t barrierFlag = 0;
   if (laneId == 0) {
@@ -652,6 +752,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   }
   finishedWarp = __shfl(finishedWarp, 0);
   barrierFlag = __shfl(barrierFlag, 0);
+  
   if ((finishedWarp + 1) == (config.rdmaBlockNum * warpNum)) {
     if ((laneId < nNodes) &&
         (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
@@ -661,10 +762,14 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
                                                        args.config.rank * sizeof(uint64_t), 1,
                                                        core::AMO_ADD, proxyPe, i);
       }
-      // shmem::ShmemPutUint64ImmNbiThread(args.crossDeviceBarrierMemObj,
-      // args.config.rank * sizeof(uint64_t), barrierFlag, proxyPe);
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
+
+    // Record time before wait
+    if (globalWarpId == 0 && laneId == 0) {
+      int base = myPe * MAX_DEBUG_TIME_SLOTS + globalWarpId * MAX_DEBUG_TIMESTAMP_PER_WARP;
+      args.debugTimeBuf[base + SLOT_TIME_BEFORE_WAIT] = clock64();
+    }
 
     // Wait other nodes
     uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
@@ -674,6 +779,12 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
              (barrierFlag * config.numQpPerPe)) {
       }
     }
+  }
+  
+  // Record end time
+  if (globalWarpId == 0 && laneId == 0) {
+    int base = myPe * MAX_DEBUG_TIME_SLOTS + globalWarpId * MAX_DEBUG_TIMESTAMP_PER_WARP;
+    args.debugTimeBuf[base + SLOT_TIME_END] = clock64();
   }
 }
 
