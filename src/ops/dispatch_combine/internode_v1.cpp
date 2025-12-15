@@ -235,7 +235,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
                 args.shmemDispatchInpTokMemObj, remoteIdx * xferBytes, args.shmemStagingTokMemObj,
                 stagingTokOffset, count * xferBytes, args.interNodeChunkFlagMemObj,
                 (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t), flag,
-                core::atomicType::AMO_SET, proxyPe, qpId);
+                core::atomicType::AMO_ADD, proxyPe, qpId);
           }
           args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
         }
@@ -272,7 +272,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
                                             tokenNum * xferBytes, args.interNodeChunkFlagMemObj,
                                             (myNode * maxChunkNum + flagSlotId) *
                                             sizeof(uint64_t), tokenNum + 1,
-                                            core::atomicType::AMO_SET, proxyPe, qpId);
+                                            core::atomicType::AMO_ADD, proxyPe, qpId);
           // shmem::ShmemPutMemNbiThread(args.shmemDispatchInpTokMemObj, remoteIdx * xferBytes,
           //                             args.shmemStagingTokMemObj, stagingTokOffset,
           //                             tokenNum * xferBytes, proxyPe, qpId);
@@ -293,8 +293,9 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
       index_t numTokenSignal =
           core::AtomicLoadRelaxed(args.blockFlagCounter + laneId) * warpSize + 1;
-      shmem::ShmemPutInt32ImmNbiThread(args.nodeRecvTokenNumMemObj, myNode * sizeof(index_t),
-                                       numTokenSignal, proxyPe);
+      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.nodeRecvTokenNumMemObj,
+                                                       myNode * sizeof(uint64_t), numTokenSignal,
+                                                       core::AMO_ADD, proxyPe);
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
   }
@@ -308,7 +309,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
 
   uint64_t* chunkFlag = args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>();
-  index_t* nodeRecvTokenNum = args.nodeRecvTokenNumMemObj->template GetAs<index_t*>();
+  uint64_t* nodeRecvTokenNum = args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>();
   uint8_t* stagingPtr = args.shmemDispatchInpTokMemObj->template GetAs<uint8_t*>();
 
   int localPeTokenCounter = 0;
@@ -426,22 +427,22 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
          destPe += warpSize) {
       index_t* signal = recvTokenNums + destPe;
       index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
-      core::AtomicStoreRelaxedSystem(signal, 0);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-
+      __threadfence_system();
       // reset local counter
-      core::AtomicStoreRelaxed(args.destPeTokenCounter + destPe, 0);
-      core::AtomicStoreRelaxed(recvTokenNums + destPe, 0);
+      core::AtomicStoreSeqCstSystem(signal, 0);
+      core::AtomicStoreSeqCstSystem(args.destPeTokenCounter + destPe, 0);
     }
 
     if (laneId == 0) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
       atomicAdd(args.crossDeviceBarrierFlag, 1);
+      args.combineGridBarrier[1] = 0;
     }
 
     if (laneId < nNodes) {
-      core::AtomicStoreRelaxedSystem(
-          args.nodeRecvTokenNumMemObj->template GetAs<index_t*>() + laneId, 0);
+      core::AtomicStoreSeqCstSystem(
+          args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});
     }
   }
 
@@ -672,9 +673,9 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
             finished = __shfl(finished, 0);
             if ((finished + 1) >= (numRecvBlock * warpNum)) {
               if (laneId == 0) {
-                args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>()[node * maxChunkNum + k] =
-                    0;
-                args.interNodeChunkFlagCombine[node * maxChunkNum + k] = 0;
+                core::AtomicStoreSeqCstSystem(args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>()
+                  + node*maxChunkNum + k, uint64_t{0});
+                core::AtomicStoreRelaxedSystem(args.interNodeChunkFlagCombine+ node*maxChunkNum + k, index_t{0});
               }
               int proxyPe = node * config.gpuPerNode + (config.rank % config.gpuPerNode);
               int qpId = k % config.numQpPerPe;
@@ -695,6 +696,10 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
     processedCount += currentBatchSize;
     batchStart += currentBatchSize;
   }
+
+  // TODO: this make sure interNodeChunkFlagMemObj is set to zero before sync with other 
+  // nodes, without this, it may be set by other node first then get override by zero
+  __threadfence_system();
   int finishedWarp = 0;
   uint64_t barrierFlag = 0;
   if (laneId == 0) {
@@ -712,8 +717,6 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
                                                        args.config.rank * sizeof(uint64_t), 1,
                                                        core::AMO_ADD, proxyPe, i);
       }
-      // shmem::ShmemPutUint64ImmNbiThread(args.crossDeviceBarrierMemObj,
-      // args.config.rank * sizeof(uint64_t), barrierFlag, proxyPe);
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
 
@@ -733,14 +736,9 @@ inline __device__ void CombineAll(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
 
   // Wait all warps
-  uint32_t finishedWarps = 0;
   if (laneId == 0) {
-    finishedWarps = atomicAdd(&args.combineGridBarrier[1], 1);
+    atomicAdd(&args.combineGridBarrier[1], 1);
     shmem::ShmemUint32WaitUntilEquals(&args.combineGridBarrier[1], globalWarpNum);
-  }
-  finishedWarps = __shfl(finishedWarps, 0);
-  if (((finishedWarps + 1) == globalWarpNum) && (laneId == 0)) {
-    args.combineGridBarrier[1] = 0;
   }
 
   extern __shared__ char sharedMem[];

@@ -132,7 +132,7 @@ void EpDispatchCombineHandle::InitializeTokenNumSignalBuf() {
   HIP_RUNTIME_CHECK(hipMalloc(&totalRecvTokenNum, sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(totalRecvTokenNum, 0, sizeof(index_t)));
 
-  size_t nodeTokenNumSignalSize = config.worldSize / config.gpuPerNode * sizeof(index_t);
+  size_t nodeTokenNumSignalSize = config.worldSize / config.gpuPerNode * sizeof(uint64_t);
   nodeRecvTokenNumMemObj =
       ShmemMallocAndReturnMemObjPtr(nodeTokenNumSignalSize, hipDeviceMallocUncached);
 }
