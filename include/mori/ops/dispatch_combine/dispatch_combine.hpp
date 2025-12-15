@@ -29,6 +29,7 @@
 #include <variant>
 
 #include "mori/application/application.hpp"
+#include "mori/core/profiler/constants.hpp"
 
 namespace mori {
 namespace moe {
@@ -69,9 +70,6 @@ inline size_t GetHipDataTypeSize(hipDataType dtype) {
 }
 
 using index_t = int32_t;
-
-#define MAX_DEBUG_TIME_SLOTS (16384)
-#define MAX_DEBUG_TIMESTAMP_PER_WARP (64)
 
 #define MAX_EXPERTS_PER_TOKEN (8)
 struct EpDispatchCombineConfig {

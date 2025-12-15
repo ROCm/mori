@@ -611,7 +611,12 @@ class EpDispatchCombineTestCase:
             total_bytes / (1000**3) / (t / (10**3)) for t in comb_duration_list
         ]
 
-        # Output debug timing breakdown
+        try:
+            from mori.cpp import InterNodeV1Slots as P
+        except ImportError:
+            print("Warning: mori.InterNodeV1Slots not found, skipping profiling output")
+            return
+
         local_rank = self.rank % self.config.gpu_per_node
         for r_i in range(self.config.gpu_per_node):
             if local_rank == r_i:
@@ -621,7 +626,6 @@ class EpDispatchCombineTestCase:
                 debug_buf = mori.cpp.get_debug_time_buf(op._handle).cpu()
                 my_times = debug_buf[self.rank]
                 freq_ghz = 1.7  # GPU frequency in GHz
-                MAX_TIMESTAMP_PER_WARP = 64
                 warp_per_block = self.config.warp_num_per_block
                 block_num = self.config.block_num
                 rdma_block_num = self.config.rdma_block_num
@@ -631,13 +635,14 @@ class EpDispatchCombineTestCase:
                     f"Rank {self.rank}: Inspecting {num_warps} warps. RDMA blocks: {rdma_block_num}"
                 )
                 print(
-                    f"{'Warp':<6} {'Block':<6} {'Type':<6} | {'Iter':<5} {'AvgAtm(us)':<10} {'AvgCpy(us)':<10} {'AvgPut(us)':<10} {'PutCnt':<6} | {'TotAtm':<8} {'TotCpy':<8} {'TotPut':<8} | {'T_loop':<8} {'T_tail_W':<8} | {'AvgSet(us)':<11} {'AvgTok(us)':<11} {'AvgWgt(us)':<11}"
+                    f"{'Warp':<6} {'Block':<6} {'Type':<6} | {'Iter':<5} {'AvgAtm(us)':<10} {'AvgLoop(us)':<11} {'AvgPut(us)':<10} {'PutCnt':<6} | {'TotAtm':<8} {'TotLoop':<8} {'TotPut':<8} | {'T_loop':<8} {'T_tail_W':<8} | {'AvgPtr(us)':<11} {'AvgTokAcc(us)':<14} {'AvgWgtAcc(us)':<14}"
                 )
-                print("-" * 185)
+                print("-" * 195)
 
                 for w in range(num_warps):
-                    base = w * MAX_TIMESTAMP_PER_WARP
-                    if base + mori.cpp.SLOT_ACC_TOKEN_COUNT >= my_times.numel():
+                    base = w * 64  # hardcoded stride for now as per legacy
+
+                    if base + P.processed_tok_cnt >= my_times.numel():
                         break
 
                     block_id = w // warp_per_block
@@ -647,129 +652,119 @@ class EpDispatchCombineTestCase:
                     should_print = False
 
                     # Initialize with dashes
-                    s_iter = s_avg_atm = s_avg_cpy = s_avg_put = s_put_cnt = "-"
-                    s_tot_atm = s_tot_cpy = s_tot_put = s_loop = s_tail_w = "-"
-                    s_avg_set = s_avg_tok = s_avg_wgt = "-"
+                    s_iter = s_avg_atm = s_avg_loop = s_avg_put = s_put_cnt = "-"
+                    s_tot_atm = s_tot_loop = s_tot_put = s_t_loop = s_tail_w = "-"
+                    s_avg_ptr_setup = s_avg_tok_accum = s_avg_wgt_accum = "-"
 
                     if is_rdma:
-                        t_start = my_times[base + mori.cpp.SLOT_TIME_START].item()
-                        t_before_loop = my_times[
-                            base + mori.cpp.SLOT_TIME_BEFORE_LOOP
-                        ].item()
-                        t_after_loop = my_times[
-                            base + mori.cpp.SLOT_TIME_AFTER_LOOP
-                        ].item()
+                        t_start = my_times[base + P.start].item()
+                        t_before_loop = my_times[base + P.before_loop].item()
+                        t_after_loop = my_times[base + P.after_loop].item()
 
                         # Accumulated statistics
-                        acc_atomic_cycles = my_times[
-                            base + mori.cpp.SLOT_ACC_ATOMIC_CYCLES
+                        acc_atomic_cycles = my_times[base + P.atomic_cycles].item()
+                        acc_atomic_cnt = my_times[base + P.atomic_count].item()
+                        acc_inner_loop_cycles = my_times[
+                            base + P.inner_loop_cycles
                         ].item()
-                        acc_atomic_cnt = my_times[
-                            base + mori.cpp.SLOT_ACC_ATOMIC_COUNT
+                        acc_inner_loop_cnt = my_times[base + P.inner_loop_count].item()
+                        acc_shmem_put_cycles = my_times[
+                            base + P.shmem_put_cycles
                         ].item()
-                        acc_copy_cycles = my_times[
-                            base + mori.cpp.SLOT_ACC_COPY_CYCLES
-                        ].item()
-                        acc_copy_cnt = my_times[
-                            base + mori.cpp.SLOT_ACC_ITER_COUNT
-                        ].item()
-                        acc_put_cycles = my_times[
-                            base + mori.cpp.SLOT_ACC_PUT_CYCLES
-                        ].item()
-                        acc_put_cnt = my_times[
-                            base + mori.cpp.SLOT_ACC_PUT_COUNT
-                        ].item()
+                        acc_shmem_put_cnt = my_times[base + P.shmem_put_count].item()
 
                         # Tail timing
-                        t_before_wait = my_times[
-                            base + mori.cpp.SLOT_TIME_BEFORE_WAIT
-                        ].item()
-                        t_end = my_times[base + mori.cpp.SLOT_TIME_END].item()
+                        t_before_wait = my_times[base + P.before_wait].item()
+                        t_end = my_times[base + P.end].item()
 
                         if t_start != 0:
                             should_print = True
                             # Loop total time
                             t_loop = (t_after_loop - t_before_loop) / 1000 / freq_ghz
-                            s_loop = f"{t_loop:.2f}"
+                            s_t_loop = f"{t_loop:.2f}"
 
                             # Tail wait time
                             if t_before_wait != 0 and t_end != 0:
                                 t_tail_w = (t_end - t_before_wait) / 1000 / freq_ghz
                                 s_tail_w = f"{t_tail_w:.2f}"
 
-                        if acc_copy_cnt > 0:
+                        if acc_inner_loop_cnt > 0:
                             should_print = True
-                            s_iter = str(int(acc_copy_cnt))
+                            s_iter = str(int(acc_inner_loop_cnt))
 
                             avg_atomic = (
                                 (acc_atomic_cycles / acc_atomic_cnt / 1000 / freq_ghz)
                                 if acc_atomic_cnt > 0
                                 else 0
                             )
-                            avg_copy = (
-                                (acc_copy_cycles / acc_copy_cnt / 1000 / freq_ghz)
-                                if acc_copy_cnt > 0
+                            avg_inner_loop = (
+                                (
+                                    acc_inner_loop_cycles
+                                    / acc_inner_loop_cnt
+                                    / 1000
+                                    / freq_ghz
+                                )
+                                if acc_inner_loop_cnt > 0
                                 else 0
                             )
                             avg_put = (
-                                (acc_put_cycles / acc_put_cnt / 1000 / freq_ghz)
-                                if acc_put_cnt > 0
+                                (
+                                    acc_shmem_put_cycles
+                                    / acc_shmem_put_cnt
+                                    / 1000
+                                    / freq_ghz
+                                )
+                                if acc_shmem_put_cnt > 0
                                 else 0
                             )
 
                             s_avg_atm = f"{avg_atomic:.2f}"
-                            s_avg_cpy = f"{avg_copy:.2f}"
+                            s_avg_loop = f"{avg_inner_loop:.2f}"
                             s_avg_put = f"{avg_put:.2f}"
-                            s_put_cnt = str(int(acc_put_cnt))
+                            s_put_cnt = str(int(acc_shmem_put_cnt))
 
                             tot_atm = acc_atomic_cycles / 1000 / freq_ghz
-                            tot_cpy = acc_copy_cycles / 1000 / freq_ghz
-                            tot_put = acc_put_cycles / 1000 / freq_ghz
+                            tot_loop = acc_inner_loop_cycles / 1000 / freq_ghz
+                            tot_put = acc_shmem_put_cycles / 1000 / freq_ghz
 
                             s_tot_atm = f"{tot_atm:.2f}"
-                            s_tot_cpy = f"{tot_cpy:.2f}"
+                            s_tot_loop = f"{tot_loop:.2f}"
                             s_tot_put = f"{tot_put:.2f}"
 
                             # Read detailed timing breakdowns
-                            dur_setup = my_times[
-                                base + mori.cpp.SLOT_ACC_SETUP_DURATION
-                            ].item()
-                            dur_acc_tok = my_times[
-                                base + mori.cpp.SLOT_ACC_TOKEN_DURATION
-                            ].item()
-                            dur_acc_wgt = my_times[
-                                base + mori.cpp.SLOT_ACC_WEIGHT_DURATION
-                            ].item()
-                            cnt_detail = my_times[
-                                base + mori.cpp.SLOT_ACC_TOKEN_COUNT
-                            ].item()
+                            dur_ptr_setup = my_times[base + P.ptr_setup_dur].item()
+                            dur_tok_accum = my_times[base + P.tok_accum_dur].item()
+                            dur_wgt_accum = my_times[base + P.wgt_accum_dur].item()
+                            cnt_detail = my_times[base + P.processed_tok_cnt].item()
 
                             if cnt_detail > 0:
-                                avg_setup = dur_setup / cnt_detail / 1000 / freq_ghz
-                                avg_tok = dur_acc_tok / cnt_detail / 1000 / freq_ghz
-                                avg_wgt = dur_acc_wgt / cnt_detail / 1000 / freq_ghz
+                                avg_ptr_setup = (
+                                    dur_ptr_setup / cnt_detail / 1000 / freq_ghz
+                                )
+                                avg_tok_accum = (
+                                    dur_tok_accum / cnt_detail / 1000 / freq_ghz
+                                )
+                                avg_wgt_accum = (
+                                    dur_wgt_accum / cnt_detail / 1000 / freq_ghz
+                                )
 
-                                s_avg_set = f"{avg_setup:.2f}"
-                                s_avg_tok = f"{avg_tok:.2f}"
-                                s_avg_wgt = f"{avg_wgt:.2f}"
+                                s_avg_ptr_setup = f"{avg_ptr_setup:.2f}"
+                                s_avg_tok_accum = f"{avg_tok_accum:.2f}"
+                                s_avg_wgt_accum = f"{avg_wgt_accum:.2f}"
                     else:
                         # IntraNode warps (simplified view)
-                        t_start = my_times[base + mori.cpp.SLOT_TIME_START].item()
+                        t_start = my_times[base + P.start].item()
                         if t_start != 0:
                             should_print = True
-                            t_before_loop = my_times[
-                                base + mori.cpp.SLOT_TIME_BEFORE_LOOP
-                            ].item()
-                            t_after_loop = my_times[
-                                base + mori.cpp.SLOT_TIME_AFTER_LOOP
-                            ].item()
+                            t_before_loop = my_times[base + P.before_loop].item()
+                            t_after_loop = my_times[base + P.after_loop].item()
 
                             t_loop = (t_after_loop - t_before_loop) / 1000 / freq_ghz
-                            s_loop = f"{t_loop:.2f}"
+                            s_t_loop = f"{t_loop:.2f}"
 
                     if should_print:
                         print(
-                            f"{w:<6} {block_id:<6} {type_str:<6} | {s_iter:<5} {s_avg_atm:<10} {s_avg_cpy:<10} {s_avg_put:<10} {s_put_cnt:<6} | {s_tot_atm:<8} {s_tot_cpy:<8} {s_tot_put:<8} | {s_loop:<8} {s_tail_w:<8} | {s_avg_set:<11} {s_avg_tok:<11} {s_avg_wgt:<11}"
+                            f"{w:<6} {block_id:<6} {type_str:<6} | {s_iter:<5} {s_avg_atm:<10} {s_avg_loop:<10} {s_avg_put:<10} {s_put_cnt:<6} | {s_tot_atm:<8} {s_tot_loop:<8} {s_tot_put:<8} | {s_t_loop:<8} {s_tail_w:<8} | {s_avg_ptr_setup:<11} {s_avg_tok_accum:<11} {s_avg_wgt_accum:<11}"
                         )
 
             # Wait for other ranks to finish their turn (to avoid interleaving output)
