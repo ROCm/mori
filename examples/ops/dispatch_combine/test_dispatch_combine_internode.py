@@ -437,18 +437,20 @@ class EpDispatchCombineTestCase:
 
     def stress_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
+        num_test_data = 128
+        sync_interval = 128
 
         if self.rank == 0:
             print("Stress Test")
-        test_data_list = [self.gen_test_data(use_max_token_num=False) for i in range(5)]
-        for i in tqdm(range(5000)):
+        test_data_list = [self.gen_test_data(use_max_token_num=False) for i in range(num_test_data)]
+        for i in tqdm(range(10000000)):
             (
                 all_rank_num_token,
                 all_rank_indices,
                 all_rank_input,
                 all_rank_weights,
                 all_rank_scales,
-            ) = test_data_list[i % 5]
+            ) = test_data_list[i % num_test_data]
             (
                 dispatch_output,
                 dispatch_weights,
@@ -470,8 +472,9 @@ class EpDispatchCombineTestCase:
                 block_num=self.config.block_num,
                 # warp_per_block=16,
             )
-            torch.cuda.synchronize()
-            time.sleep(0.0001)
+            if i % sync_interval == 0:
+                torch.cuda.synchronize()
+        torch.cuda.synchronize()
 
         if self.rank == 0:
             print("Stress Test with CUDA Graph")
