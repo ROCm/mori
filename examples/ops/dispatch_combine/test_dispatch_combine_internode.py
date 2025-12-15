@@ -437,12 +437,12 @@ class EpDispatchCombineTestCase:
 
     def stress_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
-        num_test_data = 10
+        num_test_data = 1024
         sync_interval = 64
         if self.rank == 0:
             print("Stress Test")
         test_data_list = [self.gen_test_data(use_max_token_num=False) for i in range(num_test_data)]
-        for i in tqdm(range(5000000)):
+        for i in tqdm(range(100000000)):
             (
                 all_rank_num_token,
                 all_rank_indices,
