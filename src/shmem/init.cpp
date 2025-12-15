@@ -150,6 +150,11 @@ int ShmemNPes() {
   return states->bootStates->worldSize;
 }
 
+int ShmemNumQpPerPe() {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  return states->rdmaStates->commContext->GetNumQpPerPe();
+}
+
 // int ShmemTeamMyPe(ShmemTeamType);
 // int ShmemTeamNPes(ShmemTeamType);
 

@@ -35,7 +35,7 @@ namespace moe {
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>
 inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T> args,
-                                                         const uint32_t crossDeviceBarrierFlag) {
+                                                         const uint64_t crossDeviceBarrierFlag) {
   int thdId = threadIdx.x;
   int laneId = threadIdx.x & (warpSize - 1);
   int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
@@ -50,13 +50,13 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
     shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
     args.combineGridBarrier[0] = 0;
     core::AtomicStoreRelaxedSystem(
-        args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>(globalThdId) + args.config.rank,
+        args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>(globalThdId) + args.config.rank,
         crossDeviceBarrierFlag);
   }
 
   if (globalThdId == 0) atomicAdd(args.crossDeviceBarrierFlag, 1);
 
-  uint32_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint32_t*>();
+  uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
   if (thdId < args.config.worldSize) {
     while (core::AtomicLoadRelaxedSystem(localBarrierPtr + thdId) != crossDeviceBarrierFlag) {
     }
@@ -209,7 +209,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   int myPe = config.rank;
   int npes = config.worldSize;
 
-  const uint32_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
+  const uint64_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
   size_t maxNumTokensToSend = config.MaxNumTokensToSend();
   // Copy input to shmem registered buffer so that other GPUs can access directly
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];

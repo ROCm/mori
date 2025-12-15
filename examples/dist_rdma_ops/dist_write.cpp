@@ -26,6 +26,7 @@
 #include "mori/application/application.hpp"
 #include "mori/application/utils/udma_barrier.h"
 #include "mori/core/core.hpp"
+#include "mori/application/topology/topology.hpp"
 
 using namespace mori;
 using namespace mori::application;
@@ -58,7 +59,7 @@ void VerifyBuffer(void* buffer, size_t maxSize, char expected) {
 }
 
 template <ProviderType P>
-inline __device__ void QuiteSerial(RdmaEndpoint* endpoint) {
+inline __device__ void QuietSerial(RdmaEndpoint* endpoint) {
   if (GetActiveLaneNum() != 0) return;
   CompletionQueueHandle& cq = endpoint->cqHandle;
   WorkQueueHandle& wq = endpoint->wqHandle;
@@ -98,9 +99,16 @@ inline __device__ void QuiteSerial(RdmaEndpoint* endpoint) {
       }
       wqe_counter = (wqe_counter + wq.sqWqeNum - 1) % wq.sqWqeNum;
       wqe_id = wq.outstandingWqe[wqe_counter] + 1;
+    } else if constexpr (P == core::ProviderType::PSD) {
+      if (opcode != 0) {
+        uint32_t my_cq_index = my_cq_consumer % cq.cqeNum;
+        assert(false);
+      }
+      wqe_counter = (wqe_counter + wq.sqWqeNum - 1) % wq.sqWqeNum;
+      wqe_id = wq.outstandingWqe[wqe_counter] + 1;
     }
 
-    // core::UpdateCqDbrRecord<P>(cq.dbrRecAddr, (uint32_t)(my_cq_consumer + 1), cq.cqeNum);
+    // core::UpdateCqDbrRecord<P>(cq, cq.dbrRecAddr, (uint32_t)(my_cq_consumer + 1), cq.cqeNum);
 
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
     __hip_atomic_fetch_max(&wq.doneIdx, wqe_id, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -109,7 +117,7 @@ inline __device__ void QuiteSerial(RdmaEndpoint* endpoint) {
 }
 
 template <ProviderType P>
-__device__ void Quite(RdmaEndpoint* endpoint) {
+__device__ void Quiet(RdmaEndpoint* endpoint) {
   constexpr size_t BROADCAST_SIZE = 1024 / warpSize;
   __shared__ uint64_t wqe_broadcast[BROADCAST_SIZE];
   uint8_t warp_id = FlatBlockThreadId() / warpSize;
@@ -173,7 +181,7 @@ __device__ void Quite(RdmaEndpoint* endpoint) {
         completed =
             __hip_atomic_load(&cqHandle->consIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       } while (completed != warp_cq_consumer);
-      UpdateCqDbrRecord<P>(cqHandle->dbrRecAddr, (uint32_t)(warp_cq_consumer + quiet_amount),
+      UpdateCqDbrRecord<P>(endpoint->cqHandle, cqHandle->dbrRecAddr, (uint32_t)(warp_cq_consumer + quiet_amount),
                            cqHandle->cqeNum);
 
       uint64_t doneIdx = wqe_broadcast[warp_id];
@@ -183,6 +191,16 @@ __device__ void Quite(RdmaEndpoint* endpoint) {
                              __HIP_MEMORY_SCOPE_AGENT);
     }
   }
+}
+
+template <ProviderType P>
+__device__ void QuietPsd(RdmaEndpoint* endpoint) {
+  CompletionQueueHandle* cqHandle = &endpoint->cqHandle;
+  WorkQueueHandle* wqHandle = &endpoint->wqHandle;
+  uint16_t wqe_counter;
+  
+  PollCq<P>(endpoint->wqHandle, endpoint->cqHandle,
+	    cqHandle->cqAddr, cqHandle->cqeNum, &cqHandle->cq_consumer, &wqe_counter);
 }
 
 template <ProviderType P>
@@ -216,6 +234,9 @@ __device__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
       warp_sq_counter = warp_msntbl_counter;
       __hip_atomic_fetch_max(&wqHandle->postIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_AGENT);
+    } else if constexpr (P == core::ProviderType::PSD) {
+      warp_sq_counter = __hip_atomic_fetch_add(&wqHandle->postIdx, num_wqes, __ATOMIC_RELAXED,
+                                               __HIP_MEMORY_SCOPE_AGENT);
     } else {
       assert(false);
     }
@@ -229,6 +250,8 @@ __device__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
     my_sq_counter = warp_sq_counter + my_logical_lane_id;
     my_msntbl_counter = warp_msntbl_counter + my_logical_lane_id;
     my_psn_counter = warp_psn_counter + psnCnt * my_logical_lane_id;
+  } else if constexpr (P == core::ProviderType::PSD) {
+    my_sq_counter = warp_sq_counter + my_logical_lane_id;
   } else {
     assert(false);
   }
@@ -245,9 +268,11 @@ __device__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
       break;
     }
     if constexpr (P == ProviderType::MLX5) {
-      Quite<P>(endpoint);
+      Quiet<P>(endpoint);
     } else if constexpr (P == ProviderType::BNXT) {
-      QuiteSerial<P>(endpoint);
+      QuietSerial<P>(endpoint);
+    } else if constexpr (P == ProviderType::PSD) {
+      QuietPsd<P>(endpoint);
     }
   }
   uintptr_t srcAddr = localMr.addr + FlatThreadId() * msg_size;
@@ -262,6 +287,11 @@ __device__ void Write(RdmaEndpoint* endpoint, RdmaMemoryRegion localMr, RdmaMemo
     wqHandle->outstandingWqe[my_sq_counter % wqHandle->sqWqeNum] = my_sq_counter;
     dbr_val =
         PostWrite<P>(*wqHandle, my_sq_counter, my_msntbl_counter, my_psn_counter, is_leader,
+                     endpoint->handle.qpn, srcAddr, localMr.lkey, dstAddr, remoteMr.rkey, msg_size);
+  } else if constexpr (P == ProviderType::PSD) {
+    wqHandle->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
+    dbr_val =
+        PostWrite<P>(*wqHandle, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
                      endpoint->handle.qpn, srcAddr, localMr.lkey, dstAddr, remoteMr.rkey, msg_size);
   } else {
     assert(false);
@@ -304,12 +334,14 @@ __global__ void MultiQpWrite(RdmaEndpoint* endpoints, RdmaMemoryRegion localMr,
       Write<P>(endpoints + qp_id, localMr, remoteMr, msg_size);
     }
     if constexpr (P == ProviderType::MLX5) {
-      Quite<P>(endpoints + qp_id);
+      Quiet<P>(endpoints + qp_id);
     } else if constexpr (P == ProviderType::BNXT) {
       for (int t = globalWarpId; t < num_qp; t += globalWarpNum) {
         // printf("qp_offset:%d\n",qp_offset);
-        QuiteSerial<P>(endpoints + t);
+        QuietSerial<P>(endpoints + t);
       }
+    } else if constexpr (P == ProviderType::PSD) {
+      QuietPsd<P>(endpoints + qp_id);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -319,6 +351,49 @@ __global__ void MultiQpWrite(RdmaEndpoint* endpoints, RdmaMemoryRegion localMr,
       ;
     }
   }
+}
+
+int GetGpuidByNicName(std::string nic_name) {
+  mori::application::TopoSystem sys{};
+  auto* gpuSys = sys.GetTopoSystemGpu();
+  auto* netSys = sys.GetTopoSystemNet();
+  auto* pciSys = sys.GetTopoSystemPci();
+
+  auto gpus = gpuSys->GetGpus();
+  auto nics = netSys->GetNics();
+
+  for (auto* gpu : gpus) {
+    assert(pciSys->Node(gpu->busId));
+    for (auto* nic : nics) {
+      assert(pciSys->Node(nic->busId));
+      auto* path = pciSys->Path(gpu->busId, nic->busId);
+      auto* gpuPci = pciSys->Node(gpu->busId);
+      auto* nicPci = pciSys->Node(nic->busId);
+      #if 0
+      if (!path) {     
+        printf("gpu %s nic %s no direct link\n", gpu->busId.String().c_str(),
+               nic->busId.String().c_str());
+      } else {
+        printf("gpu %s numa %d, nic %s name %s hops %zu speed %f numa %d\n",
+               gpu->busId.String().c_str(), gpuPci->NumaNode(), nic->busId.String().c_str(),
+               nic->name.c_str(), path->Hops(), nic->totalGbps, nicPci->NumaNode());
+      }
+      #endif
+    }
+  }
+
+  int gpu_id = 0;
+  std::vector<std::string> matches = sys.MatchAllGpusAndNics();
+  for (int i = 0; i < matches.size(); i++) {
+    auto* gpu = gpuSys->GetGpuByLogicalId(i);
+    //printf("gpu %d (%s) matches %s\n", i, gpu->busId.String().c_str(), matches[i].c_str());
+    if (nic_name.compare(matches[i].c_str()) == 0) {
+      gpu_id = i;
+      //printf("GetGpuidByNicName, nic_name:%s, gpu_id:%d\n", nic_name.c_str(), gpu_id);
+    }
+  }
+
+  return gpu_id;
 }
 
 void distRdmaOps(int argc, char* argv[]) {
@@ -341,11 +416,6 @@ void distRdmaOps(int argc, char* argv[]) {
   float milliseconds;
   int local_rank = bootNet.GetLocalRank();
   int world_size = bootNet.GetWorldSize();
-  HIP_RUNTIME_CHECK(hipSetDevice(local_rank));
-  hipEvent_t start, end;
-  HIP_RUNTIME_CHECK(hipEventCreate(&start));
-  HIP_RUNTIME_CHECK(hipEventCreate(&end));
-  int num_qp = args.getNumQp();
 
   // RDMA initialization
   // 1 Create device
@@ -353,9 +423,15 @@ void distRdmaOps(int argc, char* argv[]) {
   RdmaDeviceList rdma_devices = rdma_context.GetRdmaDeviceList();
   ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(rdma_devices);
   RdmaDevice* device = activeDevicePortList[local_rank % activeDevicePortList.size()].first;
-  std::cout << "localRank " << local_rank << " select device " << device->Name() << std::endl;
-
   RdmaDeviceContext* device_context = device->CreateRdmaDeviceContext();
+  int gpu_id = GetGpuidByNicName(device->Name());
+  HIP_RUNTIME_CHECK(hipSetDevice(gpu_id));
+  std::cout << "localRank " << local_rank << " gpu id " << gpu_id << " select device " << device->Name() << std::endl;
+  
+  hipEvent_t start, end;
+  HIP_RUNTIME_CHECK(hipEventCreate(&start));
+  HIP_RUNTIME_CHECK(hipEventCreate(&end));
+  int num_qp = args.getNumQp();
 
   // 2 Create an endpoint
   RdmaEndpointConfig config;
@@ -440,6 +516,12 @@ void distRdmaOps(int argc, char* argv[]) {
               devEndpoints, global_mr_handles[0], global_mr_handles[1], size, 1, blockSync, num_qp);
           break;
 #endif
+#ifdef ENABLE_IONIC	  
+        case ProviderType::PSD:
+          MultiQpWrite<ProviderType::PSD><<<blocks, threads>>>(
+              devEndpoints, global_mr_handles[0], global_mr_handles[1], size, 1, blockSync, num_qp);
+          break;
+#endif	  
         default:
           break;
       }
@@ -470,6 +552,13 @@ void distRdmaOps(int argc, char* argv[]) {
                                                                 warmupIters, blockSync + 1, num_qp);
           break;
 #endif
+#ifdef ENABLE_IONIC	  
+        case ProviderType::PSD:
+          MultiQpWrite<ProviderType::PSD><<<blocks, threads>>>(devEndpoints, global_mr_handles[0],
+                                                                global_mr_handles[1], size,
+                                                                warmupIters, blockSync + 1, num_qp);
+          break;
+#endif	  
         default:
           break;
       }
@@ -490,6 +579,13 @@ void distRdmaOps(int argc, char* argv[]) {
                                     iters, blockSync + 1 + warmupIters, num_qp);
           break;
 #endif
+#ifdef ENABLE_IONIC	  
+        case ProviderType::PSD:
+          MultiQpWrite<ProviderType::PSD>
+              <<<blocks, threads>>>(devEndpoints, global_mr_handles[0], global_mr_handles[1], size,
+                                    iters, blockSync + 1 + warmupIters, num_qp);
+          break;
+#endif	  
         default:
           break;
       }
