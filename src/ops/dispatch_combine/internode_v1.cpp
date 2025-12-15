@@ -584,16 +584,14 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
 
   // Initialize profiler
   using Slot = mori::moe::v1::InterNodeSlot;
-  using Profiler = mori::core::profiler::KernelProfiler<Slot, (int)Slot::MAX_SLOTS>;
+  using Profiler = mori::core::profiler::TraceProfiler<Slot, MAX_TRACE_EVENTS_PER_WARP>;
 
-  int base = myPe * MAX_DEBUG_TIME_SLOTS + globalWarpId * MAX_DEBUG_TIMESTAMP_PER_WARP;
+  size_t base =
+      (size_t)myPe * MAX_DEBUG_TIME_SLOTS + (size_t)globalWarpId * MAX_DEBUG_TIMESTAMP_PER_WARP;
 
-  int flush_start = (int)Slot::InnerLoopCycles;
-  int flush_end = (int)Slot::MAX_SLOTS;
+  Profiler profiler(args.debugTimeBuf + base, laneId);
 
-  Profiler profiler(args.debugTimeBuf, base, laneId, flush_start, flush_end);
-
-  MORI_PROFILE_MARK_IF(profiler, Slot::Start, globalWarpId == 0);
+  MORI_TRACE_SCOPE(profiler, Slot::Start);
 
   constexpr int numRecvBlock = 8;
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
@@ -606,7 +604,9 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
   uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
 
-  MORI_PROFILE_MARK_IF(profiler, Slot::BeforeLoop, globalWarpId == 0);
+  using EventType = mori::core::profiler::EventType;
+
+  if (globalWarpId == 0) profiler.log(Slot::BeforeLoop, EventType::INSTANT);
 
   for (int k = blockId / numRecvBlock; k < maxChunkNum; k += (config.rdmaBlockNum / numRecvBlock)) {
     for (int i = 0; i < (nNodes - 1); i++) {
@@ -616,70 +616,58 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
       thisChunkTokenNum -= (thisChunkTokenNum > 0) ? 1 : 0;
       int startTokenIdx = k * warpSize;
       int endTokenIdx = startTokenIdx + thisChunkTokenNum;
-
-      int64_t loop_start = clock64();
-      int64_t setup_start = loop_start;
-
       for (int j = startTokenIdx + (blockId % numRecvBlock) * warpNum + warpId; j < endTokenIdx;
            j += numRecvBlock * warpNum) {
+        MORI_TRACE_SCOPE(profiler, Slot::InnerLoopCycles);
+
         int tokIdx = node * config.MaxNumTokensToRecvPerRank() + j;
 
-        // Setup source pointers
-        if (laneId < config.numExpertPerToken) {
-          srcPtrs[laneId] = nullptr;
-          srcWeightsPtr[laneId] = nullptr;
-          index_t destTokId =
-              args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId];
-          index_t destPe = destTokId / config.MaxNumTokensToRecv();
-          index_t destNode = destPe / config.gpuPerNode;
-          if (destNode == myNode) {
-            index_t destLocalTokId = destTokId - destPe * config.MaxNumTokensToRecv();
-            srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
-                              destLocalTokId * config.hiddenDim;
-            srcWeightsPtr[laneId] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
-                                    destLocalTokId * config.numExpertPerToken;
+        {
+          MORI_TRACE_SCOPE(profiler, Slot::PointerSetupDuration);
+          if (laneId < config.numExpertPerToken) {
+            srcPtrs[laneId] = nullptr;
+            srcWeightsPtr[laneId] = nullptr;
+            index_t destTokId =
+                args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId];
+            index_t destPe = destTokId / config.MaxNumTokensToRecv();
+            index_t destNode = destPe / config.gpuPerNode;
+            if (destNode == myNode) {
+              index_t destLocalTokId = destTokId - destPe * config.MaxNumTokensToRecv();
+              srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+                                destLocalTokId * config.hiddenDim;
+              srcWeightsPtr[laneId] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
+                                      destLocalTokId * config.numExpertPerToken;
+            }
+            args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId] = 0;
           }
-          args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId] = 0;
         }
 
-        // Accumulate tokens with timing
-        int64_t token_accum_start = clock64();
-        profiler.accum_duration(Slot::PointerSetupDuration, setup_start, token_accum_start);
-
-        core::WarpAccum<T, 4>(reinterpret_cast<T*>(stagingPtr + tokIdx * combXferBytes), srcPtrs,
-                              nullptr, config.numExpertPerToken, config.hiddenDim);
-
-        int64_t weight_accum_start = clock64();
-        profiler.accum_duration(Slot::TokenAccumDuration, token_accum_start, weight_accum_start);
-
-        // Accumulate weights with timing
-        if (args.weightsBuf) {
-          core::WarpAccum<float, 4>(
-              reinterpret_cast<float*>(stagingPtr + tokIdx * combXferBytes + hiddenBytes),
-              srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
+        {
+          MORI_TRACE_SCOPE(profiler, Slot::TokenAccumDuration);
+          core::WarpAccum<T, 4>(reinterpret_cast<T*>(stagingPtr + tokIdx * combXferBytes), srcPtrs,
+                                nullptr, config.numExpertPerToken, config.hiddenDim);
         }
 
-        profiler.accum_duration(Slot::WeightAccumDuration, weight_accum_start, clock64());
-        profiler.increment(Slot::ProcessedTokenCount);
-        setup_start = clock64();
+        {
+          MORI_TRACE_SCOPE(profiler, Slot::WeightAccumDuration);
+          if (args.weightsBuf) {
+            core::WarpAccum<float, 4>(
+                reinterpret_cast<float*>(stagingPtr + tokIdx * combXferBytes + hiddenBytes),
+                srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
+          }
+        }
       }
 
-      // Synchronization and flag update with timing
-      int64_t atomic_start = clock64();
-      profiler.accum_duration(Slot::InnerLoopCycles, loop_start, atomic_start);
-      profiler.increment(Slot::InnerLoopCount);
+      {
+        MORI_TRACE_SCOPE(profiler, Slot::AtomicCycles);
 
-      index_t finished = 0;
-      if (laneId == 0)
-        finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
-      finished = __shfl(finished, 0);
+        index_t finished = 0;
+        if (laneId == 0)
+          finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
+        finished = __shfl(finished, 0);
 
-      int64_t atomic_end = clock64();
-      profiler.accum_duration(Slot::AtomicCycles, atomic_start, atomic_end);
-      profiler.increment(Slot::AtomicCount);
+        if ((finished + 1) < (numRecvBlock * warpNum)) continue;
 
-      // Send data back if all blocks finished
-      if ((finished + 1) >= (numRecvBlock * warpNum)) {
         if (laneId == 0) {
           args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>()[node * maxChunkNum + k] = 0;
           args.interNodeChunkFlagCombine[node * maxChunkNum + k] = 0;
@@ -688,27 +676,21 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
         int proxyPe = node * config.gpuPerNode + (config.rank % config.gpuPerNode);
         int qpId = k % config.numQpPerPe;
 
-        int64_t shmem_put_start = clock64();
-        shmem::ShmemPutTypeNbiWarp<uint8_t>(
-            args.shmemStagingTokMemObj,
-            ((myNode + nNodes) * config.MaxNumTokensToRecvPerRank() + startTokenIdx) *
-                combXferBytes,
-            args.shmemStagingTokMemObj,
-            (node * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * combXferBytes,
-            thisChunkTokenNum * combXferBytes, proxyPe, qpId);
-
-        profiler.accum_duration_if_pos(Slot::ShmemPutCycles, shmem_put_start, clock64());
-        if (clock64() - shmem_put_start > 0) profiler.increment(Slot::ShmemPutCount);
+        {
+          MORI_TRACE_SCOPE(profiler, Slot::ShmemPutCycles);
+          shmem::ShmemPutTypeNbiWarp<uint8_t>(
+              args.shmemStagingTokMemObj,
+              ((myNode + nNodes) * config.MaxNumTokensToRecvPerRank() + startTokenIdx) *
+                  combXferBytes,
+              args.shmemStagingTokMemObj,
+              (node * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * combXferBytes,
+              thisChunkTokenNum * combXferBytes, proxyPe, qpId);
+        }
       }
-
-      if ((finished + 1) < (numRecvBlock * warpNum)) continue;
     }
   }
 
-  // Flush profiling data
-  profiler.flush();
-
-  MORI_PROFILE_MARK_IF(profiler, Slot::AfterLoop, globalWarpId == 0);
+  if (globalWarpId == 0) profiler.log(Slot::AfterLoop, EventType::INSTANT);
 
   // Barrier synchronization
   int finishedWarp = 0;
@@ -732,7 +714,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
 
-    MORI_PROFILE_MARK_IF(profiler, Slot::BeforeWait, globalWarpId == 0);
+    if (globalWarpId == 0) profiler.log(Slot::BeforeWait, EventType::INSTANT);
 
     // Wait other nodes
     uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
@@ -744,7 +726,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
     }
   }
 
-  MORI_PROFILE_MARK_IF(profiler, Slot::End, globalWarpId == 0);
+  if (globalWarpId == 0) profiler.log(Slot::End, EventType::INSTANT);
 }
 
 template <typename T>
