@@ -19,7 +19,18 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#pragma once
+// Constants for Profiling Buffer Size (TraceProfiler)
+//
+// Buffer Layout (per rank):
+// - Each rank has PROFILER_WARPS_PER_RANK warps
+// - Each warp has MAX_TRACE_EVENTS_PER_WARP events
+// - Each event = 2 int64_t: [timestamp, metadata]
+//
+// Metadata Encoding (int64_t):
+//   Bits 0-1:   EventType (0=BEGIN, 1=END, 2=INSTANT)
+//   Bits 2-15:  SlotEnum  (14 bits, supports 16K slots)
+//   Bits 16-31: WarpId    (16 bits, supports 64K warps)
+//   Bits 32-63: Reserved for future use
 
 #define MAX_TRACE_EVENTS_PER_WARP 4096
 #define TRACE_EVENT_SIZE_INT64 2     // Timestamp + Metadata

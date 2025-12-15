@@ -185,8 +185,7 @@ torch::Tensor GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle
 
 torch::Tensor GetDebugTimeBuf(mori::moe::EpDispatchCombineHandle& handle) {
   auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
-  torch::Tensor tensor = torch::from_blob(handle.debugTimeBuf,
-                                          {handle.config.worldSize, MAX_DEBUG_TIME_SLOTS}, options);
+  torch::Tensor tensor = torch::from_blob(handle.debugTimeBuf, {MAX_DEBUG_TIME_SLOTS}, options);
   return tensor;
 }
 

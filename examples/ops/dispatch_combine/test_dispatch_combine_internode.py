@@ -617,154 +617,187 @@ class EpDispatchCombineTestCase:
             print("Warning: mori.InterNodeV1Slots not found, skipping profiling output")
             return
 
+        # Helper function to parse trace events
+        def parse_trace_events(trace_buffer, expected_warp_id=None):
+            """Parse trace event stream: [ts0, meta0, ts1, meta1, ...]
+            Meta encoding: [warpId:16][slot:14][type:2]
+            Returns dict of slot -> list of (timestamp, event_type, warp_id)
+            """
+            events_by_slot = {}
+            i = 0
+            while i + 1 < len(trace_buffer):
+                ts = trace_buffer[i].item()
+                meta = trace_buffer[i + 1].item()
+
+                if ts == 0 and meta == 0:  # End of events
+                    break
+
+                # Decode meta field
+                event_type = meta & 0x3  # Bits 0-1
+                slot = (meta >> 2) & 0x3FFF  # Bits 2-15 (14 bits)
+                warp_id = (meta >> 16) & 0xFFFF  # Bits 16-31 (16 bits)
+
+                # Optional: verify warp_id matches expected
+                if expected_warp_id is not None and warp_id != expected_warp_id:
+                    print(
+                        f"Warning: Warp ID mismatch! Expected {expected_warp_id}, got {warp_id}"
+                    )
+
+                if slot not in events_by_slot:
+                    events_by_slot[slot] = []
+                events_by_slot[slot].append((ts, event_type, warp_id))
+                i += 2
+            return events_by_slot
+
+        def compute_durations(events):
+            """Compute durations from BEGIN/END pairs
+            events: list of (timestamp, event_type, warp_id)
+            """
+            durations = []
+            stack = []
+            for ts, event_type, warp_id in events:
+                if event_type == 0:  # BEGIN
+                    stack.append(ts)
+                elif event_type == 1 and stack:  # END
+                    start_ts = stack.pop()
+                    durations.append(ts - start_ts)
+            return durations
+
+        def get_instant_timestamps(events):
+            """Get all INSTANT event timestamps
+            events: list of (timestamp, event_type, warp_id)
+            """
+            return [ts for ts, event_type, warp_id in events if event_type == 2]
+
         local_rank = self.rank % self.config.gpu_per_node
         for r_i in range(self.config.gpu_per_node):
             if local_rank == r_i:
                 print(
                     f"\n=== Rank {self.rank} (Local {local_rank}) Latency Breakdown ==="
                 )
-                debug_buf = mori.cpp.get_debug_time_buf(op._handle).cpu()
-                my_times = debug_buf[self.rank]
+                # Each PE has its own buffer (memory optimized)
+                my_times = mori.cpp.get_debug_time_buf(op._handle).cpu()
                 freq_ghz = 1.7  # GPU frequency in GHz
                 warp_per_block = self.config.warp_num_per_block
                 block_num = self.config.block_num
                 rdma_block_num = self.config.rdma_block_num
                 num_warps = block_num * warp_per_block
 
+                # Each warp has MAX_DEBUG_TIMESTAMP_PER_WARP int64s
+                # MAX_DEBUG_TIMESTAMP_PER_WARP = MAX_TRACE_EVENTS_PER_WARP * 2 = 4096 * 2 = 8192
+                warp_stride = 8192
+
                 print(
                     f"Rank {self.rank}: Inspecting {num_warps} warps. RDMA blocks: {rdma_block_num}"
                 )
                 print(
-                    f"{'Warp':<6} {'Block':<6} {'Type':<6} | {'Iter':<5} {'AvgAtm(us)':<10} {'AvgLoop(us)':<11} {'AvgPut(us)':<10} {'PutCnt':<6} | {'TotAtm':<8} {'TotLoop':<8} {'TotPut':<8} | {'T_loop':<8} {'T_tail_W':<8} | {'AvgPtr(us)':<11} {'AvgTokAcc(us)':<14} {'AvgWgtAcc(us)':<14}"
+                    f"{'Warp':<6} {'Block':<6} {'Type':<6} | {'Iter':<6} {'AvgLoop(us)':<12} {'AvgAtm(us)':<12} {'AvgPut(us)':<12} | {'TotLoop(us)':<12} {'TotAtm(us)':<12} {'TotPut(us)':<12} | {'AvgPtr(us)':<11} {'AvgTok(us)':<11} {'AvgWgt(us)':<11}"
                 )
-                print("-" * 195)
+                print("-" * 170)
 
                 for w in range(num_warps):
-                    base = w * 64  # hardcoded stride for now as per legacy
+                    base = w * warp_stride
 
-                    if base + P.processed_tok_cnt >= my_times.numel():
+                    if base >= my_times.numel():
                         break
 
                     block_id = w // warp_per_block
                     is_rdma = block_id < rdma_block_num
                     type_str = "RDMA" if is_rdma else "Intra"
 
+                    # Parse trace events for this warp
+                    warp_buffer = my_times[base : base + warp_stride]
+                    events_by_slot = parse_trace_events(warp_buffer, expected_warp_id=w)
+
+                    if not events_by_slot:
+                        continue
+
                     should_print = False
+                    s_iter = s_avg_loop = s_avg_atm = s_avg_put = "-"
+                    s_tot_loop = s_tot_atm = s_tot_put = "-"
+                    s_avg_ptr = s_avg_tok = s_avg_wgt = "-"
 
-                    # Initialize with dashes
-                    s_iter = s_avg_atm = s_avg_loop = s_avg_put = s_put_cnt = "-"
-                    s_tot_atm = s_tot_loop = s_tot_put = s_t_loop = s_tail_w = "-"
-                    s_avg_ptr_setup = s_avg_tok_accum = s_avg_wgt_accum = "-"
-
-                    if is_rdma:
-                        t_start = my_times[base + P.start].item()
-                        t_before_loop = my_times[base + P.before_loop].item()
-                        t_after_loop = my_times[base + P.after_loop].item()
-
-                        # Accumulated statistics
-                        acc_atomic_cycles = my_times[base + P.atomic_cycles].item()
-                        acc_atomic_cnt = my_times[base + P.atomic_count].item()
-                        acc_inner_loop_cycles = my_times[
-                            base + P.inner_loop_cycles
-                        ].item()
-                        acc_inner_loop_cnt = my_times[base + P.inner_loop_count].item()
-                        acc_shmem_put_cycles = my_times[
-                            base + P.shmem_put_cycles
-                        ].item()
-                        acc_shmem_put_cnt = my_times[base + P.shmem_put_count].item()
-
-                        # Tail timing
-                        t_before_wait = my_times[base + P.before_wait].item()
-                        t_end = my_times[base + P.end].item()
-
-                        if t_start != 0:
+                    # Process InnerLoopCycles (the main iteration scope)
+                    if P.inner_loop_cycles in events_by_slot:
+                        loop_durations = compute_durations(
+                            events_by_slot[P.inner_loop_cycles]
+                        )
+                        if loop_durations:
                             should_print = True
-                            # Loop total time
-                            t_loop = (t_after_loop - t_before_loop) / 1000 / freq_ghz
-                            s_t_loop = f"{t_loop:.2f}"
+                            iter_count = len(loop_durations)
+                            s_iter = str(iter_count)
 
-                            # Tail wait time
-                            if t_before_wait != 0 and t_end != 0:
-                                t_tail_w = (t_end - t_before_wait) / 1000 / freq_ghz
-                                s_tail_w = f"{t_tail_w:.2f}"
+                            total_loop_cycles = sum(loop_durations)
+                            avg_loop_cycles = total_loop_cycles / iter_count
 
-                        if acc_inner_loop_cnt > 0:
+                            avg_loop_us = avg_loop_cycles / 1000 / freq_ghz
+                            tot_loop_us = total_loop_cycles / 1000 / freq_ghz
+
+                            s_avg_loop = f"{avg_loop_us:.2f}"
+                            s_tot_loop = f"{tot_loop_us:.2f}"
+
+                    # Process AtomicCycles
+                    if P.atomic_cycles in events_by_slot:
+                        atomic_durations = compute_durations(
+                            events_by_slot[P.atomic_cycles]
+                        )
+                        if atomic_durations:
                             should_print = True
-                            s_iter = str(int(acc_inner_loop_cnt))
-
-                            avg_atomic = (
-                                (acc_atomic_cycles / acc_atomic_cnt / 1000 / freq_ghz)
-                                if acc_atomic_cnt > 0
-                                else 0
-                            )
-                            avg_inner_loop = (
-                                (
-                                    acc_inner_loop_cycles
-                                    / acc_inner_loop_cnt
-                                    / 1000
-                                    / freq_ghz
-                                )
-                                if acc_inner_loop_cnt > 0
-                                else 0
-                            )
-                            avg_put = (
-                                (
-                                    acc_shmem_put_cycles
-                                    / acc_shmem_put_cnt
-                                    / 1000
-                                    / freq_ghz
-                                )
-                                if acc_shmem_put_cnt > 0
-                                else 0
+                            total_atomic_cycles = sum(atomic_durations)
+                            avg_atomic_cycles = total_atomic_cycles / len(
+                                atomic_durations
                             )
 
-                            s_avg_atm = f"{avg_atomic:.2f}"
-                            s_avg_loop = f"{avg_inner_loop:.2f}"
-                            s_avg_put = f"{avg_put:.2f}"
-                            s_put_cnt = str(int(acc_shmem_put_cnt))
+                            avg_atomic_us = avg_atomic_cycles / 1000 / freq_ghz
+                            tot_atomic_us = total_atomic_cycles / 1000 / freq_ghz
 
-                            tot_atm = acc_atomic_cycles / 1000 / freq_ghz
-                            tot_loop = acc_inner_loop_cycles / 1000 / freq_ghz
-                            tot_put = acc_shmem_put_cycles / 1000 / freq_ghz
+                            s_avg_atm = f"{avg_atomic_us:.2f}"
+                            s_tot_atm = f"{tot_atomic_us:.2f}"
 
-                            s_tot_atm = f"{tot_atm:.2f}"
-                            s_tot_loop = f"{tot_loop:.2f}"
-                            s_tot_put = f"{tot_put:.2f}"
-
-                            # Read detailed timing breakdowns
-                            dur_ptr_setup = my_times[base + P.ptr_setup_dur].item()
-                            dur_tok_accum = my_times[base + P.tok_accum_dur].item()
-                            dur_wgt_accum = my_times[base + P.wgt_accum_dur].item()
-                            cnt_detail = my_times[base + P.processed_tok_cnt].item()
-
-                            if cnt_detail > 0:
-                                avg_ptr_setup = (
-                                    dur_ptr_setup / cnt_detail / 1000 / freq_ghz
-                                )
-                                avg_tok_accum = (
-                                    dur_tok_accum / cnt_detail / 1000 / freq_ghz
-                                )
-                                avg_wgt_accum = (
-                                    dur_wgt_accum / cnt_detail / 1000 / freq_ghz
-                                )
-
-                                s_avg_ptr_setup = f"{avg_ptr_setup:.2f}"
-                                s_avg_tok_accum = f"{avg_tok_accum:.2f}"
-                                s_avg_wgt_accum = f"{avg_wgt_accum:.2f}"
-                    else:
-                        # IntraNode warps (simplified view)
-                        t_start = my_times[base + P.start].item()
-                        if t_start != 0:
+                    # Process ShmemPutCycles
+                    if P.shmem_put_cycles in events_by_slot:
+                        put_durations = compute_durations(
+                            events_by_slot[P.shmem_put_cycles]
+                        )
+                        if put_durations:
                             should_print = True
-                            t_before_loop = my_times[base + P.before_loop].item()
-                            t_after_loop = my_times[base + P.after_loop].item()
+                            total_put_cycles = sum(put_durations)
+                            avg_put_cycles = total_put_cycles / len(put_durations)
 
-                            t_loop = (t_after_loop - t_before_loop) / 1000 / freq_ghz
-                            s_t_loop = f"{t_loop:.2f}"
+                            avg_put_us = avg_put_cycles / 1000 / freq_ghz
+                            tot_put_us = total_put_cycles / 1000 / freq_ghz
+
+                            s_avg_put = f"{avg_put_us:.2f}"
+                            s_tot_put = f"{tot_put_us:.2f}"
+
+                    # Process detailed breakdowns
+                    if P.ptr_setup_dur in events_by_slot:
+                        ptr_durations = compute_durations(
+                            events_by_slot[P.ptr_setup_dur]
+                        )
+                        if ptr_durations:
+                            avg_ptr_cycles = sum(ptr_durations) / len(ptr_durations)
+                            s_avg_ptr = f"{avg_ptr_cycles / 1000 / freq_ghz:.2f}"
+
+                    if P.tok_accum_dur in events_by_slot:
+                        tok_durations = compute_durations(
+                            events_by_slot[P.tok_accum_dur]
+                        )
+                        if tok_durations:
+                            avg_tok_cycles = sum(tok_durations) / len(tok_durations)
+                            s_avg_tok = f"{avg_tok_cycles / 1000 / freq_ghz:.2f}"
+
+                    if P.wgt_accum_dur in events_by_slot:
+                        wgt_durations = compute_durations(
+                            events_by_slot[P.wgt_accum_dur]
+                        )
+                        if wgt_durations:
+                            avg_wgt_cycles = sum(wgt_durations) / len(wgt_durations)
+                            s_avg_wgt = f"{avg_wgt_cycles / 1000 / freq_ghz:.2f}"
 
                     if should_print:
                         print(
-                            f"{w:<6} {block_id:<6} {type_str:<6} | {s_iter:<5} {s_avg_atm:<10} {s_avg_loop:<10} {s_avg_put:<10} {s_put_cnt:<6} | {s_tot_atm:<8} {s_tot_loop:<8} {s_tot_put:<8} | {s_t_loop:<8} {s_tail_w:<8} | {s_avg_ptr_setup:<11} {s_avg_tok_accum:<11} {s_avg_wgt_accum:<11}"
+                            f"{w:<6} {block_id:<6} {type_str:<6} | {s_iter:<6} {s_avg_loop:<12} {s_avg_atm:<12} {s_avg_put:<12} | {s_tot_loop:<12} {s_tot_atm:<12} {s_tot_put:<12} | {s_avg_ptr:<11} {s_avg_tok:<11} {s_avg_wgt:<11}"
                         )
 
             # Wait for other ranks to finish their turn (to avoid interleaving output)

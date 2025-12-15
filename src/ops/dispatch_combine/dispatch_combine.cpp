@@ -105,11 +105,9 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   shmemInpIndicesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndicesSize, hipDeviceMallocUncached);
   shmemOutIndicesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndicesSize, hipDeviceMallocUncached);
 
-  // Allocate debug buffer: MAX_DEBUG_TIME_SLOTS int64_t slots per rank
-  HIP_RUNTIME_CHECK(
-      hipMalloc(&debugTimeBuf, config.worldSize * MAX_DEBUG_TIME_SLOTS * sizeof(int64_t)));
-  HIP_RUNTIME_CHECK(
-      hipMemset(debugTimeBuf, 0, config.worldSize * MAX_DEBUG_TIME_SLOTS * sizeof(int64_t)));
+  size_t debugBufSize = MAX_DEBUG_TIME_SLOTS * sizeof(int64_t);
+  HIP_RUNTIME_CHECK(hipMalloc(&debugTimeBuf, debugBufSize));
+  HIP_RUNTIME_CHECK(hipMemset(debugTimeBuf, 0, debugBufSize));
 }
 
 void EpDispatchCombineHandle::FinalizeShmemBuf() {

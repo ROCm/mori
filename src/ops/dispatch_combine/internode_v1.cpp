@@ -586,10 +586,9 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   using Slot = mori::moe::v1::InterNodeSlot;
   using Profiler = mori::core::profiler::TraceProfiler<Slot, MAX_TRACE_EVENTS_PER_WARP>;
 
-  size_t base =
-      (size_t)myPe * MAX_DEBUG_TIME_SLOTS + (size_t)globalWarpId * MAX_DEBUG_TIMESTAMP_PER_WARP;
+  size_t base = (size_t)globalWarpId * MAX_DEBUG_TIMESTAMP_PER_WARP;
 
-  Profiler profiler(args.debugTimeBuf + base, laneId);
+  Profiler profiler(args.debugTimeBuf + base, laneId, globalWarpId);
 
   MORI_TRACE_SCOPE(profiler, Slot::Start);
 

@@ -36,16 +36,21 @@ template <typename SlotEnum, int MaxEventsPerWarp>
 struct TraceProfiler {
   int64_t* warp_buffer;
   int lane_id;
+  int warp_id;
   int offset;
 
-  __device__ TraceProfiler(int64_t* warp_base_ptr, int lid)
-      : warp_buffer(warp_base_ptr), lane_id(lid), offset(0) {}
+  __device__ TraceProfiler(int64_t* warp_base_ptr, int lid, int wid)
+      : warp_buffer(warp_base_ptr), lane_id(lid), warp_id(wid), offset(0) {}
 
   __device__ inline void log(SlotEnum slot, EventType type) {
     // Only lane 0 of each warp writes trace events
     if (lane_id == 0 && offset < MaxEventsPerWarp * 2) {
       int64_t ts = clock64();
-      int64_t meta = ((int64_t)slot << 2) | (int)type;
+      // Meta encoding: [warpId:16][slot:14][type:2]
+      // Bits 0-1:   EventType
+      // Bits 2-15:  SlotEnum
+      // Bits 16-31: WarpId
+      int64_t meta = ((int64_t)warp_id << 16) | ((int64_t)slot << 2) | (int)type;
 
       warp_buffer[offset] = ts;
       warp_buffer[offset + 1] = meta;
