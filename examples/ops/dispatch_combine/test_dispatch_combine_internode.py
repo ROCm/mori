@@ -612,208 +612,23 @@ class EpDispatchCombineTestCase:
         ]
 
         try:
-            from mori.cpp import InterNodeV1Slots as P
+            import mori.kernel_profiler
         except ImportError:
-            print("Warning: mori.InterNodeV1Slots not found, skipping profiling output")
+            print("Warning: mori.kernel_profiler not found, skipping profiling")
             return
 
-        # Helper function to parse trace events
-        def parse_trace_events(trace_buffer, expected_warp_id=None):
-            """Parse trace event stream: [ts0, meta0, ts1, meta1, ...]
-            Meta encoding: [warpId:16][slot:14][type:2]
-            Returns dict of slot -> list of (timestamp, event_type, warp_id)
-            """
-            events_by_slot = {}
-            i = 0
-            while i + 1 < len(trace_buffer):
-                ts = trace_buffer[i].item()
-                meta = trace_buffer[i + 1].item()
+        # Get the debug buffer
+        my_times = mori.cpp.get_debug_time_buf(op._handle)
 
-                if ts == 0 and meta == 0:  # End of events
-                    break
+        # We need to map slot enums to names for the exporter
+        # We can pass mori.cpp.InterNodeV1Slots directly
 
-                # Decode meta field
-                event_type = meta & 0x3  # Bits 0-1
-                slot = (meta >> 2) & 0x3FFF  # Bits 2-15 (14 bits)
-                warp_id = (meta >> 16) & 0xFFFF  # Bits 16-31 (16 bits)
+        output_filename = f"trace_rank_{self.rank}.json"
+        print(f"Exporting trace to {output_filename}...")
 
-                # Optional: verify warp_id matches expected
-                if expected_warp_id is not None and warp_id != expected_warp_id:
-                    print(
-                        f"Warning: Warp ID mismatch! Expected {expected_warp_id}, got {warp_id}"
-                    )
-
-                if slot not in events_by_slot:
-                    events_by_slot[slot] = []
-                events_by_slot[slot].append((ts, event_type, warp_id))
-                i += 2
-            return events_by_slot
-
-        def compute_durations(events):
-            """Compute durations from BEGIN/END pairs
-            events: list of (timestamp, event_type, warp_id)
-            """
-            durations = []
-            stack = []
-            for ts, event_type, warp_id in events:
-                if event_type == 0:  # BEGIN
-                    stack.append(ts)
-                elif event_type == 1 and stack:  # END
-                    start_ts = stack.pop()
-                    durations.append(ts - start_ts)
-            return durations
-
-        def get_instant_timestamps(events):
-            """Get all INSTANT event timestamps
-            events: list of (timestamp, event_type, warp_id)
-            """
-            return [ts for ts, event_type, warp_id in events if event_type == 2]
-
-        local_rank = self.rank % self.config.gpu_per_node
-        for r_i in range(self.config.gpu_per_node):
-            if local_rank == r_i:
-                print(
-                    f"\n=== Rank {self.rank} (Local {local_rank}) Latency Breakdown ==="
-                )
-                # Each PE has its own buffer (memory optimized)
-                my_times = mori.cpp.get_debug_time_buf(op._handle).cpu()
-                freq_ghz = 1.7  # GPU frequency in GHz
-                warp_per_block = self.config.warp_num_per_block
-                block_num = self.config.block_num
-                rdma_block_num = self.config.rdma_block_num
-                num_warps = block_num * warp_per_block
-
-                # Each warp has MAX_DEBUG_TIMESTAMP_PER_WARP int64s
-                # MAX_DEBUG_TIMESTAMP_PER_WARP = MAX_TRACE_EVENTS_PER_WARP * 2 = 4096 * 2 = 8192
-                warp_stride = 8192
-
-                print(
-                    f"Rank {self.rank}: Inspecting {num_warps} warps. RDMA blocks: {rdma_block_num}"
-                )
-                print(
-                    f"{'Warp':<6} {'Block':<6} {'Type':<6} | {'MainLoop(us)':<12} {'Iter':<6} {'AvgLoop(us)':<12} {'AvgAtm(us)':<12} {'AvgPut(us)':<12} | {'TotLoop(us)':<12} {'TotAtm(us)':<12} {'TotPut(us)':<12} | {'AvgPtr(us)':<11} {'AvgTok(us)':<11} {'AvgWgt(us)':<11}"
-                )
-                print("-" * 182)
-
-                for w in range(num_warps):
-                    base = w * warp_stride
-
-                    if base >= my_times.numel():
-                        break
-
-                    block_id = w // warp_per_block
-                    is_rdma = block_id < rdma_block_num
-                    type_str = "RDMA" if is_rdma else "Intra"
-
-                    # Parse trace events for this warp
-                    warp_buffer = my_times[base : base + warp_stride]
-                    events_by_slot = parse_trace_events(warp_buffer, expected_warp_id=w)
-
-                    if not events_by_slot:
-                        continue
-
-                    should_print = False
-                    s_main_loop = s_iter = s_avg_loop = s_avg_atm = s_avg_put = "-"
-                    s_tot_loop = s_tot_atm = s_tot_put = "-"
-                    s_avg_ptr = s_avg_tok = s_avg_wgt = "-"
-
-                    # Process InnerLoopCycles first to determine if this warp did any work
-                    if P.inner_loop_cycles in events_by_slot:
-                        loop_durations = compute_durations(
-                            events_by_slot[P.inner_loop_cycles]
-                        )
-                        if loop_durations:
-                            should_print = True
-                            iter_count = len(loop_durations)
-                            s_iter = str(iter_count)
-
-                            total_loop_cycles = sum(loop_durations)
-                            avg_loop_cycles = total_loop_cycles / iter_count
-
-                            avg_loop_us = avg_loop_cycles / 1000 / freq_ghz
-                            tot_loop_us = total_loop_cycles / 1000 / freq_ghz
-
-                            s_avg_loop = f"{avg_loop_us:.2f}"
-                            s_tot_loop = f"{tot_loop_us:.2f}"
-
-                    # Skip processing other metrics if this warp didn't do any work
-                    if not should_print:
-                        continue
-
-                    # Process MainLoop (entire loop duration)
-                    if P.main_loop in events_by_slot:
-                        main_loop_durations = compute_durations(
-                            events_by_slot[P.main_loop]
-                        )
-                        if main_loop_durations:
-                            total_main_loop_cycles = sum(main_loop_durations)
-                            main_loop_us = total_main_loop_cycles / 1000 / freq_ghz
-                            s_main_loop = f"{main_loop_us:.2f}"
-
-                    # Process AtomicCycles
-                    if P.atomic_cycles in events_by_slot:
-                        atomic_durations = compute_durations(
-                            events_by_slot[P.atomic_cycles]
-                        )
-                        if atomic_durations:
-                            total_atomic_cycles = sum(atomic_durations)
-                            avg_atomic_cycles = total_atomic_cycles / len(
-                                atomic_durations
-                            )
-
-                            avg_atomic_us = avg_atomic_cycles / 1000 / freq_ghz
-                            tot_atomic_us = total_atomic_cycles / 1000 / freq_ghz
-
-                            s_avg_atm = f"{avg_atomic_us:.2f}"
-                            s_tot_atm = f"{tot_atomic_us:.2f}"
-
-                    # Process ShmemPutCycles
-                    if P.shmem_put_cycles in events_by_slot:
-                        put_durations = compute_durations(
-                            events_by_slot[P.shmem_put_cycles]
-                        )
-                        if put_durations:
-                            total_put_cycles = sum(put_durations)
-                            avg_put_cycles = total_put_cycles / len(put_durations)
-
-                            avg_put_us = avg_put_cycles / 1000 / freq_ghz
-                            tot_put_us = total_put_cycles / 1000 / freq_ghz
-
-                            s_avg_put = f"{avg_put_us:.2f}"
-                            s_tot_put = f"{tot_put_us:.2f}"
-
-                    # Process detailed breakdowns
-                    if P.ptr_setup_dur in events_by_slot:
-                        ptr_durations = compute_durations(
-                            events_by_slot[P.ptr_setup_dur]
-                        )
-                        if ptr_durations:
-                            avg_ptr_cycles = sum(ptr_durations) / len(ptr_durations)
-                            s_avg_ptr = f"{avg_ptr_cycles / 1000 / freq_ghz:.2f}"
-
-                    if P.tok_accum_dur in events_by_slot:
-                        tok_durations = compute_durations(
-                            events_by_slot[P.tok_accum_dur]
-                        )
-                        if tok_durations:
-                            avg_tok_cycles = sum(tok_durations) / len(tok_durations)
-                            s_avg_tok = f"{avg_tok_cycles / 1000 / freq_ghz:.2f}"
-
-                    if P.wgt_accum_dur in events_by_slot:
-                        wgt_durations = compute_durations(
-                            events_by_slot[P.wgt_accum_dur]
-                        )
-                        if wgt_durations:
-                            avg_wgt_cycles = sum(wgt_durations) / len(wgt_durations)
-                            s_avg_wgt = f"{avg_wgt_cycles / 1000 / freq_ghz:.2f}"
-
-                    # Print the row (should_print is guaranteed to be True here)
-                    print(
-                        f"{w:<6} {block_id:<6} {type_str:<6} | {s_main_loop:<12} {s_iter:<6} {s_avg_loop:<12} {s_avg_atm:<12} {s_avg_put:<12} | {s_tot_loop:<12} {s_tot_atm:<12} {s_tot_put:<12} | {s_avg_ptr:<11} {s_avg_tok:<11} {s_avg_wgt:<11}"
-                    )
-
-            # Wait for other ranks to finish their turn (to avoid interleaving output)
-            dist.barrier()
+        mori.kernel_profiler.export_to_perfetto(
+            my_times, mori.cpp.InterNodeV1Slots, output_filename, gpu_freq_ghz=1.7
+        )
 
         return (
             disp_duration_list,
