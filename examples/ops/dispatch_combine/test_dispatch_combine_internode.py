@@ -442,7 +442,9 @@ class EpDispatchCombineTestCase:
 
         if self.rank == 0:
             print("Stress Test")
-        test_data_list = [self.gen_test_data(use_max_token_num=False) for i in range(num_test_data)]
+        test_data_list = [
+            self.gen_test_data(use_max_token_num=False) for i in range(num_test_data)
+        ]
         for i in tqdm(range(10000000)):
             (
                 all_rank_num_token,
@@ -623,6 +625,22 @@ class EpDispatchCombineTestCase:
         comb_bandwidth_list = [
             total_bytes / (1000**3) / (t / (10**3)) for t in comb_duration_list
         ]
+
+        try:
+            import mori.kernel_profiler
+        except ImportError:
+            print("Warning: mori.kernel_profiler not found, skipping profiling")
+            return
+
+        my_times = mori.cpp.get_debug_time_buf(op._handle)
+
+        output_filename = f"trace_rank_{self.rank}.json"
+        print(f"Exporting trace to {output_filename}...")
+
+        mori.kernel_profiler.export_to_perfetto(
+            my_times, mori.cpp.InterNodeV1Slots, output_filename, gpu_freq_ghz=1.7
+        )
+
         return (
             disp_duration_list,
             disp_rdma_bandwidth_list,

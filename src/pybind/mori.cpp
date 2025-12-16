@@ -33,6 +33,7 @@
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
 #include "mori/application/application.hpp"
+#include "mori/core/profiler/constants.hpp"
 #include "mori/io/io.hpp"
 #include "mori/ops/ops.hpp"
 #include "mori/shmem/shmem.hpp"
@@ -179,6 +180,12 @@ torch::Tensor GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle
   return out;
 }
 
+torch::Tensor GetDebugTimeBuf(mori::moe::EpDispatchCombineHandle& handle) {
+  auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+  torch::Tensor tensor = torch::from_blob(handle.debugTimeBuf, {MAX_DEBUG_TIME_SLOTS}, options);
+  return tensor;
+}
+
 void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   std::string className = std::string("EpDispatchCombineHandle");
   pybind11::class_<mori::moe::EpDispatchCombineHandle>(m, className.c_str())
@@ -208,6 +215,9 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
 
   funcName = std::string("get_registered_combine_input_buffer");
   m.def(funcName.c_str(), &GetRegisteredCombineInputBuffer);
+
+  funcName = std::string("get_debug_time_buf");
+  m.def(funcName.c_str(), &GetDebugTimeBuf);
 }
 
 }  // namespace
@@ -233,9 +243,21 @@ int64_t ShmemNumQpPerPe() { return mori::shmem::ShmemNumQpPerPe(); }
 /* ---------------------------------------------------------------------------------------------- */
 /*                                             IO APIs                                            */
 /* ---------------------------------------------------------------------------------------------- */
-namespace {}
+#include "mori/ops/dispatch_combine/internode_profile.hpp"
 
 namespace mori {
+namespace pybind {
+
+inline void BindProfilerSlots(pybind11::module_& m, const char* name,
+                              const std::vector<std::pair<const char*, int>>& slots) {
+  auto sub = m.def_submodule(name, "Auto-generated profiler slots");
+  for (const auto& p : slots) {
+    sub.attr(p.first) = p.second;
+  }
+  sub.attr("NUM_SLOTS") = (int)slots.size();
+}
+
+}  // namespace pybind
 
 void RegisterMoriOps(py::module_& m) {
   pybind11::enum_<mori::moe::KernelType>(m, "EpDispatchCombineKernelType")
@@ -244,6 +266,15 @@ void RegisterMoriOps(py::module_& m) {
       .value("InterNodeV1", mori::moe::KernelType::InterNodeV1)
       .value("InterNodeV1LL", mori::moe::KernelType::InterNodeV1LL)
       .export_values();
+
+  // Bind InterNodeV1 slots
+  std::vector<std::pair<const char*, int>> interNodeSlots;
+  int slotCounter = 0;
+#define X(name, str) interNodeSlots.push_back({str, slotCounter++});
+  INTERNODE_V1_SLOTS(X)
+#undef X
+
+  mori::pybind::BindProfilerSlots(m, "InterNodeV1Slots", interNodeSlots);
 
   pybind11::class_<mori::moe::EpDispatchCombineConfig>(m, "EpDispatchCombineConfig")
       .def(pybind11::init<int, int, int, int, int, int, int, int, int, int, int, bool,
