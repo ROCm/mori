@@ -691,9 +691,9 @@ class EpDispatchCombineTestCase:
                     f"Rank {self.rank}: Inspecting {num_warps} warps. RDMA blocks: {rdma_block_num}"
                 )
                 print(
-                    f"{'Warp':<6} {'Block':<6} {'Type':<6} | {'Iter':<6} {'AvgLoop(us)':<12} {'AvgAtm(us)':<12} {'AvgPut(us)':<12} | {'TotLoop(us)':<12} {'TotAtm(us)':<12} {'TotPut(us)':<12} | {'AvgPtr(us)':<11} {'AvgTok(us)':<11} {'AvgWgt(us)':<11}"
+                    f"{'Warp':<6} {'Block':<6} {'Type':<6} | {'MainLoop(us)':<12} {'Iter':<6} {'AvgLoop(us)':<12} {'AvgAtm(us)':<12} {'AvgPut(us)':<12} | {'TotLoop(us)':<12} {'TotAtm(us)':<12} {'TotPut(us)':<12} | {'AvgPtr(us)':<11} {'AvgTok(us)':<11} {'AvgWgt(us)':<11}"
                 )
-                print("-" * 170)
+                print("-" * 182)
 
                 for w in range(num_warps):
                     base = w * warp_stride
@@ -713,11 +713,11 @@ class EpDispatchCombineTestCase:
                         continue
 
                     should_print = False
-                    s_iter = s_avg_loop = s_avg_atm = s_avg_put = "-"
+                    s_main_loop = s_iter = s_avg_loop = s_avg_atm = s_avg_put = "-"
                     s_tot_loop = s_tot_atm = s_tot_put = "-"
                     s_avg_ptr = s_avg_tok = s_avg_wgt = "-"
 
-                    # Process InnerLoopCycles (the main iteration scope)
+                    # Process InnerLoopCycles first to determine if this warp did any work
                     if P.inner_loop_cycles in events_by_slot:
                         loop_durations = compute_durations(
                             events_by_slot[P.inner_loop_cycles]
@@ -736,13 +736,26 @@ class EpDispatchCombineTestCase:
                             s_avg_loop = f"{avg_loop_us:.2f}"
                             s_tot_loop = f"{tot_loop_us:.2f}"
 
+                    # Skip processing other metrics if this warp didn't do any work
+                    if not should_print:
+                        continue
+
+                    # Process MainLoop (entire loop duration)
+                    if P.main_loop in events_by_slot:
+                        main_loop_durations = compute_durations(
+                            events_by_slot[P.main_loop]
+                        )
+                        if main_loop_durations:
+                            total_main_loop_cycles = sum(main_loop_durations)
+                            main_loop_us = total_main_loop_cycles / 1000 / freq_ghz
+                            s_main_loop = f"{main_loop_us:.2f}"
+
                     # Process AtomicCycles
                     if P.atomic_cycles in events_by_slot:
                         atomic_durations = compute_durations(
                             events_by_slot[P.atomic_cycles]
                         )
                         if atomic_durations:
-                            should_print = True
                             total_atomic_cycles = sum(atomic_durations)
                             avg_atomic_cycles = total_atomic_cycles / len(
                                 atomic_durations
@@ -760,7 +773,6 @@ class EpDispatchCombineTestCase:
                             events_by_slot[P.shmem_put_cycles]
                         )
                         if put_durations:
-                            should_print = True
                             total_put_cycles = sum(put_durations)
                             avg_put_cycles = total_put_cycles / len(put_durations)
 
@@ -795,10 +807,10 @@ class EpDispatchCombineTestCase:
                             avg_wgt_cycles = sum(wgt_durations) / len(wgt_durations)
                             s_avg_wgt = f"{avg_wgt_cycles / 1000 / freq_ghz:.2f}"
 
-                    if should_print:
-                        print(
-                            f"{w:<6} {block_id:<6} {type_str:<6} | {s_iter:<6} {s_avg_loop:<12} {s_avg_atm:<12} {s_avg_put:<12} | {s_tot_loop:<12} {s_tot_atm:<12} {s_tot_put:<12} | {s_avg_ptr:<11} {s_avg_tok:<11} {s_avg_wgt:<11}"
-                        )
+                    # Print the row (should_print is guaranteed to be True here)
+                    print(
+                        f"{w:<6} {block_id:<6} {type_str:<6} | {s_main_loop:<12} {s_iter:<6} {s_avg_loop:<12} {s_avg_atm:<12} {s_avg_put:<12} | {s_tot_loop:<12} {s_tot_atm:<12} {s_tot_put:<12} | {s_avg_ptr:<11} {s_avg_tok:<11} {s_avg_wgt:<11}"
+                    )
 
             # Wait for other ranks to finish their turn (to avoid interleaving output)
             dist.barrier()

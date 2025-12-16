@@ -25,25 +25,13 @@
 // The PyBindName is used for automatic Python binding and visualization.
 
 #define INTERNODE_V1_SLOTS(X)              \
-  /* Timestamps */                         \
-  X(Start, "start")                        \
-  X(End, "end")                            \
-  X(BeforeLoop, "before_loop")             \
-  X(AfterLoop, "after_loop")               \
-  X(BeforeWait, "before_wait")             \
-  /* Counters */                           \
+  X(MainLoop, "main_loop")                 \
   X(InnerLoopCycles, "inner_loop_cycles")  \
-  X(InnerLoopCount, "inner_loop_count")    \
   X(AtomicCycles, "atomic_cycles")         \
-  X(AtomicCount, "atomic_count")           \
   X(ShmemPutCycles, "shmem_put_cycles")    \
-  X(ShmemPutCount, "shmem_put_count")      \
-  X(IterCount, "iter_count")               \
-  /* Detailed Metrics */                   \
   X(PointerSetupDuration, "ptr_setup_dur") \
   X(TokenAccumDuration, "tok_accum_dur")   \
-  X(WeightAccumDuration, "wgt_accum_dur")  \
-  X(ProcessedTokenCount, "processed_tok_cnt")
+  X(WeightAccumDuration, "wgt_accum_dur")
 
 namespace mori {
 namespace moe {
