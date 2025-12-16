@@ -31,13 +31,20 @@ __device__ __forceinline__ uint64_t dev_now_ns() { return wall_clock64(); }
 #define NUM_TIMINGS 32
 #define MAX_WARPS_PER_BLOCK 16
 
+#ifndef ENABLE_WARP_PROFILER
+#define ENABLE_WARP_PROFILER 0
+#endif
 
+#if ENABLE_WARP_PROFILER
 #define RECORD_SECTION_WARP(id) do {                        \
   int warpId = threadIdx.x / warpSize;                      \
   if ((threadIdx.x & (warpSize - 1)) == 0) {                \
     args.timings[(blockIdx.x * MAX_WARPS_PER_BLOCK + warpId) * NUM_TIMINGS + (id)] = dev_now_ns(); \
   }                                                    \
 } while (0)
+#else
+#define RECORD_SECTION_WARP(id) do { } while (0)
+#endif
 
 // Block-level profiling (original behavior, for compatibility)
 #define RECORD_SECTION(id) do {                        \
