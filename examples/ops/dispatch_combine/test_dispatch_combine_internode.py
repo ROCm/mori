@@ -629,8 +629,7 @@ class EpDispatchCombineTestCase:
             total_bytes / (1000**3) / (t / (10**3)) for t in comb_duration_list
         ]
 
-        output_filename = f"trace_rank_{self.rank}.json"
-        print(f"Exporting trace to {output_filename}...")
+        output_filename = f"trace_rank_{self.rank}_{time.strftime('%m%d_%H%M%S')}.json"
 
         mori.kernel_profiler.export_to_perfetto(
             my_times, mori.cpp.InterNodeV1Slots, output_filename, gpu_freq_ghz=1.7

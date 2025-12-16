@@ -42,19 +42,24 @@ def _parse_trace_events(trace_buffer):
     for base in range(0, num_elements, warp_stride):
         warp_buffer = trace_buffer[base : base + warp_stride]
 
-        # Iterate events in this warp
+        # Circular buffer handling:
+        # 1. Read all pairs (ts, meta) that are non-zero
+        # 2. Sort by timestamp to restore order
+
+        warp_events = []
         for i in range(0, warp_stride, 2):
             ts = warp_buffer[i].item()
             meta = warp_buffer[i + 1].item()
 
-            if ts == 0 and meta == 0:
-                # End of events for this warp
-                break
-
-            # Skip invalid entries (should not happen but be defensive)
             if ts == 0:
                 continue
 
+            warp_events.append((ts, meta))
+
+        # Sort by timestamp (clock64 is monotonic)
+        warp_events.sort(key=lambda x: x[0])
+
+        for ts, meta in warp_events:
             # Decode meta field
             # Bits 0-1:   EventType (0=BEGIN, 1=END, 2=INSTANT)
             # Bits 2-15:  SlotEnum
@@ -66,6 +71,8 @@ def _parse_trace_events(trace_buffer):
 
             events.append((ts, warp_id, slot, event_type))
 
+    # Sort all events across all warps (optional but good for global timeline)
+    events.sort(key=lambda x: x[0])
     return events
 
 
@@ -158,7 +165,6 @@ def export_to_perfetto(
             else:
                 id_to_name = slot_map
 
-    print("Parsing trace events...")
     raw_events = _parse_trace_events(trace_buffer)
 
     if not raw_events:
@@ -218,8 +224,6 @@ def export_to_perfetto(
 
     trace_events = []
 
-    print(f"Generating {len(sanitized_events)} trace events...")
-
     for ts, warp_id, slot, event_type in sanitized_events:
         # Convert cycles to microseconds (relative to start)
         # Formula: (cycles - initial_cycles) / (freq_ghz * 1000)
@@ -263,65 +267,3 @@ def export_to_perfetto(
         json.dump(trace_data, f, indent=2)
 
     print(f"Trace exported to {filename} ({len(trace_events)} events)")
-
-
-def diagnose_buffer(trace_buffer, gpu_freq_ghz=1.7):
-    """
-    Diagnose profiling buffer usage and potential issues.
-    Args:
-        trace_buffer: torch.Tensor (int64), the raw debug time buffer
-        gpu_freq_ghz: float, GPU frequency in GHz for time conversion
-    Returns:
-        dict with diagnostic information
-    """
-    events = _parse_trace_events(trace_buffer)
-
-    if not events:
-        return {"status": "empty", "message": "No events found in buffer"}
-
-    # Group by warp
-    warp_events = defaultdict(list)
-    for ts, warp_id, slot, event_type in events:
-        warp_events[warp_id].append((ts, slot, event_type))
-
-    # Calculate statistics
-    total_warps = len(warp_events)
-    events_per_warp = {wid: len(evts) for wid, evts in warp_events.items()}
-    max_events = max(events_per_warp.values())
-    min_events = min(events_per_warp.values())
-    avg_events = sum(events_per_warp.values()) / total_warps
-
-    # Check for buffer overflow (approaching 4096 events = 8192 int64s)
-    MAX_EVENTS = 4096
-    warps_near_full = [
-        (wid, cnt) for wid, cnt in events_per_warp.items() if cnt > MAX_EVENTS * 0.9
-    ]
-
-    # Time span
-    all_ts = [ts for ts, _, _, _ in events]
-    time_span_cycles = max(all_ts) - min(all_ts)
-    time_span_ms = time_span_cycles / (gpu_freq_ghz * 1000 * 1000)
-
-    result = {
-        "status": "ok",
-        "total_events": len(events),
-        "total_warps": total_warps,
-        "events_per_warp": {"min": min_events, "max": max_events, "avg": avg_events},
-        "time_span_ms": time_span_ms,
-        "warnings": [],
-    }
-
-    if warps_near_full:
-        result["warnings"].append(
-            f"{len(warps_near_full)} warp(s) have >90% buffer usage. "
-            f"Consider increasing MAX_TRACE_EVENTS_PER_WARP. "
-            f"Warps: {[wid for wid, _ in warps_near_full[:5]]}"
-        )
-
-    if time_span_ms > 1000:
-        result["warnings"].append(
-            f"Time span is very large ({time_span_ms:.0f}ms). "
-            f"This might indicate multiple kernel calls or very long execution."
-        )
-
-    return result
