@@ -51,6 +51,7 @@ enum class RdmaDeviceVendorId : uint32_t {
   Unknown = 0,
   Mellanox = 0x02c9,
   Broadcom = 0x14E4,
+  Pensando = 0x1dd8,
 };
 
 template <typename T>
@@ -170,6 +171,8 @@ struct RdmaEndpoint {
       return core::ProviderType::MLX5;
     } else if (vendorId == RdmaDeviceVendorId::Broadcom) {
       return core::ProviderType::BNXT;
+    } else if (vendorId == RdmaDeviceVendorId::Pensando) {
+      return core::ProviderType::PSD;
     } else {
       printf("unknown vendorId %d", vendorId);
       assert(false);
@@ -216,7 +219,7 @@ class RdmaDeviceContext {
  protected:
   ibv_pd* pd{nullptr};
   ibv_srq* srq{nullptr};
-
+  uint16_t qp_counter{0};
   // Shared UDP sport configuration for all RDMA providers
   uint16_t udp_sport_setting[RDMA_UDP_SPORT_ARRAY_SIZE];
 

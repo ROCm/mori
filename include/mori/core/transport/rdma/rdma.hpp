@@ -27,3 +27,4 @@
 #include "mori/core/transport/rdma/providers/mlx5/mlx5_device_primitives.hpp"
 #include "mori/core/transport/rdma/providers/mlx5/mlx5_host_primitives.hpp"
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_device_primitives.hpp"
+#include "mori/core/transport/rdma/providers/ionic/ionic_device_primitives.hpp"

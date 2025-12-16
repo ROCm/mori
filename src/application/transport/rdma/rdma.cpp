@@ -33,6 +33,7 @@
 
 #include "infiniband/verbs.h"
 #include "mori/application/transport/rdma/providers/bnxt/bnxt.hpp"
+#include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
 #include "mori/utils/mori_log.hpp"
@@ -251,6 +252,7 @@ ibv_context* RdmaDeviceContext::GetIbvContext() { return GetRdmaDevice()->defaul
 application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegion(void* ptr, size_t size,
                                                                           int accessFlag) {
   ibv_mr* mr = ibv_reg_mr(pd, ptr, size, accessFlag);
+  MORI_APP_TRACE("RegisterRdmaMemoryRegion, addr:{}, size:{}, lkey:{}, rkey:{}\n", ptr, size, mr->lkey, mr->rkey);
   assert(mr);
   mrPool.insert({ptr, mr});
   application::RdmaMemoryRegion handle;
@@ -415,7 +417,7 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
   ibv_device_attr_ex device_attr_ex;
   int status = ibv_query_device_ex(context, NULL, &device_attr_ex);
   assert(!status);
-
+  //device_attr_ex.orig_attr.vendor_id = 0x14E4;
   if (backendType == RdmaBackendType::IBVerbs) {
     return new IBVerbsDevice(inDevice);
   } else if (backendType == RdmaBackendType::DirectVerbs) {
@@ -428,6 +430,11 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
         return new BnxtDevice(inDevice);
         break;
 #endif
+#ifdef ENABLE_IONIC	
+      case (static_cast<uint32_t>(RdmaDeviceVendorId::Pensando)):
+        return new IonicDevice(inDevice);
+        break;
+#endif	
       default:
         return nullptr;
     }

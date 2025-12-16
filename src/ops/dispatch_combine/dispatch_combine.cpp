@@ -28,6 +28,7 @@
 
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem.hpp"
+#include "mori/utils/mori_log.hpp"
 #include "src/ops/dispatch_combine/internode.hpp"
 #include "src/ops/dispatch_combine/internode_v1.hpp"
 #include "src/ops/dispatch_combine/intranode.hpp"
@@ -43,8 +44,15 @@ using namespace mori::shmem;
 /* ---------------------------------------------------------------------------------------------- */
 /*                                     EpDispatchCombineHandle                                    */
 /* ---------------------------------------------------------------------------------------------- */
-EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config) : config(config) {
+EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_)
+    : config(config_) {
   assert(IsPowerOf2(config.gpuPerNode) && (config.worldSize % config.gpuPerNode == 0));
+  int shmemNumQpPerPe = ShmemNumQpPerPe();
+  if (config.numQpPerPe > shmemNumQpPerPe) {
+    config.numQpPerPe = shmemNumQpPerPe;
+    MORI_OPS_INFO("numQpPerPe %d larger than shmem numQpPerPe %d, set to %d", config.numQpPerPe,
+                  shmemNumQpPerPe, shmemNumQpPerPe);
+  }
   InitializeShmemBuf();
   InitializeTokenNumSignalBuf();
   InitializeOrderMapBuf();
@@ -125,7 +133,7 @@ void EpDispatchCombineHandle::InitializeTokenNumSignalBuf() {
   HIP_RUNTIME_CHECK(hipMalloc(&totalRecvTokenNum, sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(totalRecvTokenNum, 0, sizeof(index_t)));
 
-  size_t nodeTokenNumSignalSize = config.worldSize / config.gpuPerNode * sizeof(index_t);
+  size_t nodeTokenNumSignalSize = config.worldSize / config.gpuPerNode * sizeof(uint64_t);
   nodeRecvTokenNumMemObj =
       ShmemMallocAndReturnMemObjPtr(nodeTokenNumSignalSize, hipDeviceMallocUncached);
 }
@@ -209,10 +217,14 @@ void EpDispatchCombineHandle::InitializeBarrier() {
   HIP_RUNTIME_CHECK(hipMemset(dispatchGridBarrier, 0, barrierSize));
   HIP_RUNTIME_CHECK(hipMalloc(&combineGridBarrier, barrierSize));
   HIP_RUNTIME_CHECK(hipMemset(combineGridBarrier, 0, barrierSize));
-  HIP_RUNTIME_CHECK(hipMalloc(&crossDeviceBarrierFlag, sizeof(uint32_t)));
-  HIP_RUNTIME_CHECK(hipMemsetD32(crossDeviceBarrierFlag, 1, 1));
-  crossDeviceBarrierMemObj = ShmemMallocAndReturnMemObjPtr(
-      barrierSize * 2 * sizeof(uint64_t) / sizeof(uint32_t), hipDeviceMallocUncached);
+  HIP_RUNTIME_CHECK(hipMalloc(&crossDeviceBarrierFlag, sizeof(uint64_t)));
+  crossDeviceBarrierFlag[0] = ((config.kernelType == KernelType::InterNodeV1) ||
+                               (config.kernelType == KernelType::InterNodeV1LL))
+                                  ? 0
+                                  : 1;
+  // HIP_RUNTIME_CHECK(hipMemset(crossDeviceBarrierFlag, 1, 1));
+  crossDeviceBarrierMemObj =
+      ShmemMallocAndReturnMemObjPtr(barrierSize * 2 * sizeof(uint64_t), hipDeviceMallocUncached);
 
   // We allocate one flag for each token, this ensure that we can use all chunk size(>=1)
   size_t interNodeChunkFlagSize =

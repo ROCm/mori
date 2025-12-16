@@ -56,7 +56,7 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion mr) {
     int opcode =
         PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum, &epSend.cqHandle.consIdx);
     __threadfence_system();
-    UpdateCqDbrRecord<P>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx,
+    UpdateCqDbrRecord<P>(epSend.cqHandle, epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx,
                          epSend.cqHandle.cqeNum);
     // printf("round %d snd_opcode %d\n", i, opcode);
 
@@ -95,6 +95,11 @@ __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMe
         SendThreadKernel<ProviderType::BNXT>(epSend, mrRecv);
         break;
 #endif
+#ifdef ENABLE_IONIC	
+      case ProviderType::PSD:
+        SendThreadKernel<ProviderType::PSD>(epSend, mrRecv);
+        break;
+#endif	
       default:
         // unsupported provider
         break;

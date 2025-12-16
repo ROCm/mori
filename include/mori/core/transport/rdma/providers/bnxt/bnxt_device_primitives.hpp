@@ -756,7 +756,14 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
 }
 
 template <>
-inline __device__ void UpdateCqDbrRecord<ProviderType::BNXT>(void* dbrRecAddr, uint32_t cons_idx,
+inline __device__ int PollCq<ProviderType::BNXT>(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
+                                                 void* cqAddr, uint32_t cqeNum, uint32_t* consIdx, uint16_t* wqeCounter)
+{
+  return 0;
+}
+
+template <>
+inline __device__ void UpdateCqDbrRecord<ProviderType::BNXT>(CompletionQueueHandle& cq, void* dbrRecAddr, uint32_t cons_idx,
                                                              uint32_t cqeNum) {
   uint8_t flags = ((cons_idx + 1) / cqeNum) & (1UL << BNXT_RE_FLAG_EPOCH_HEAD_SHIFT);
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
@@ -767,14 +774,14 @@ inline __device__ void UpdateCqDbrRecord<ProviderType::BNXT>(void* dbrRecAddr, u
 }
 
 template <>
-inline __device__ int PollCqAndUpdateDbr<ProviderType::BNXT>(void* cqAddr, uint32_t cqeSize,
+inline __device__ int PollCqAndUpdateDbr<ProviderType::BNXT>(CompletionQueueHandle& cq, void* cqAddr, uint32_t cqeSize,
                                                              uint32_t cqeNum, uint32_t* consIdx,
                                                              void* dbrRecAddr, uint32_t* lockVar) {
   AcquireLock(lockVar);
 
   int opcode = PollCq<ProviderType::BNXT>(cqAddr, cqeNum, consIdx);
   if (opcode >= 0) {
-    UpdateCqDbrRecord<ProviderType::BNXT>(dbrRecAddr, *consIdx, cqeNum);
+    UpdateCqDbrRecord<ProviderType::BNXT>(cq, dbrRecAddr, *consIdx, cqeNum);
   }
 
   ReleaseLock(lockVar);
