@@ -28,6 +28,7 @@
 #include "mori/application/topology/topology.hpp"
 #include "mori/application/utils/udma_barrier.h"
 #include "mori/core/core.hpp"
+#include "mori/application/topology/topology.hpp"
 
 using namespace mori;
 using namespace mori::application;

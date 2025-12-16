@@ -58,8 +58,15 @@ void SendRecvOnCpu(IbgdaReadWriteReq& send_req, IbgdaReadWriteReq& recv_req,
 
   endpoint_1.cq_handle.consumer_idx += 1;
   endpoint_2.cq_handle.consumer_idx += 1;
+<<<<<<< HEAD
   UpdateCqDbrRecord<ProviderType::MLX5>(endpoint_1.cq_handle, endpoint_1.cq_handle.consumer_idx);
   UpdateCqDbrRecord<ProviderType::MLX5>(endpoint_2.cq_handle, endpoint_2.cq_handle.consumer_idx);
+=======
+  UpdateCqDbrRecord<ProviderType::MLX5>(endpoint_1.cq_handle, endpoint_1.cq_handle.dbr_rec_addr,
+                                        endpoint_1.cq_handle.consumer_idx);
+  UpdateCqDbrRecord<ProviderType::MLX5>(endpoint_2.cq_handle, endpoint_2.cq_handle.dbr_rec_addr,
+                                        endpoint_2.cq_handle.consumer_idx);
+>>>>>>> 379472a (Ionic new 950 1128 (#119))
   udma_to_device_barrier();
 }
 

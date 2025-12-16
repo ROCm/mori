@@ -371,6 +371,21 @@ inline __device__ void ShmemQuietThreadKernelMlnxImpl(int pe, int qpId) {
 }
 
 template <core::ProviderType PrvdType>
+inline __device__ void ShmemQuietThreadKernelPsdImpl(int pe, int qpId) {
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
+  core::WorkQueueHandle& wqHandle = ep[epIndex].wqHandle;
+  core::CompletionQueueHandle& cqHandle = ep[epIndex].cqHandle;
+
+  uint16_t wqe_counter;
+  int err;
+  err = core::PollCq<PrvdType>(wqHandle, cqHandle, cqHandle.cqAddr, cqHandle.cqeNum, &cqHandle.cq_consumer, &wqe_counter);
+  if (err != 0)
+    printf("rank %d dest pe %d consIdx %d wc_err %d\n", globalGpuStates->rank, pe, cqHandle.cq_consumer, err);
+}
+
+template <core::ProviderType PrvdType>
 inline __device__ void ShmemQuietThreadKernelImpl(int pe, int qpId) {
   if constexpr (PrvdType == core::ProviderType::BNXT) {
     ShmemQuietThreadKernelSerialImpl(pe, qpId);
@@ -2280,7 +2295,7 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelAddrImpl(const void* d
                                    laddr, lkey, raddr, rkey, val, val, bytes, amoType);
   }
 
-  // __threadfence_system();
+__threadfence_system();
   if (is_leader) {
     uint64_t db_touched = 0;
     do {
@@ -2288,7 +2303,7 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelAddrImpl(const void* d
     } while (db_touched != warp_sq_counter);
 
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
-    // __threadfence_system();
+    __threadfence_system();
     core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -2436,7 +2451,7 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelAddrImpl(const void* dest, v
                                    laddr, lkey, raddr, rkey, val, compare, bytes, amoType);
   }
 
-  // __threadfence_system();
+__threadfence_system();
   if (is_leader) {
     uint64_t db_touched = 0;
     do {
@@ -2444,7 +2459,7 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelAddrImpl(const void* dest, v
     } while (db_touched != warp_sq_counter);
 
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
-    // __threadfence_system();
+    __threadfence_system();
     core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
 
     __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
