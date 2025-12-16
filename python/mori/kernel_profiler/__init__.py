@@ -21,7 +21,6 @@
 # SOFTWARE.
 
 import json
-import torch
 import warnings
 from collections import defaultdict
 
@@ -70,8 +69,59 @@ def _parse_trace_events(trace_buffer):
     return events
 
 
+def _sanitize_events(raw_events, drop_orphan_ends=True, drop_orphan_begins=True):
+    """
+    Remove orphaned END/BEGIN events so Perfetto timelines stay consistent.
+    - drop_orphan_ends: drop END without a matching BEGIN
+    - drop_orphan_begins: drop BEGIN without a matching END
+    Returns a filtered list sorted by timestamp.
+    """
+    if not raw_events:
+        return []
+
+    raw_events.sort(key=lambda x: x[0])
+
+    filtered = []
+    # Stack per (warp, slot) holds indices of BEGINs in `filtered`
+    stacks = defaultdict(list)
+    # Track which BEGIN indices should be removed (if left unmatched)
+    begin_to_drop = set()
+
+    for idx, (ts, warp_id, slot, event_type) in enumerate(raw_events):
+        key = (warp_id, slot)
+        if event_type == 0:  # BEGIN
+            stacks[key].append(len(filtered))
+            filtered.append((ts, warp_id, slot, event_type))
+        elif event_type == 1:  # END
+            if stacks[key]:
+                stacks[key].pop()
+                filtered.append((ts, warp_id, slot, event_type))
+            else:
+                if not drop_orphan_ends:
+                    filtered.append((ts, warp_id, slot, event_type))
+        else:
+            # INSTANT is always kept
+            filtered.append((ts, warp_id, slot, event_type))
+
+    if drop_orphan_begins:
+        for key, stack in stacks.items():
+            for begin_idx in stack:
+                begin_to_drop.add(begin_idx)
+
+        if begin_to_drop:
+            filtered = [ev for i, ev in enumerate(filtered) if i not in begin_to_drop]
+
+    filtered.sort(key=lambda x: x[0])
+    return filtered
+
+
 def export_to_perfetto(
-    trace_buffer, slot_map, filename, gpu_freq_ghz=1.7, validate_pairs=True
+    trace_buffer,
+    slot_map,
+    filename,
+    gpu_freq_ghz=1.7,
+    validate_pairs=True,
+    sanitize_orphans=True,
 ):
     """
     Export profiling buffer to Perfetto JSON trace format.
@@ -117,20 +167,26 @@ def export_to_perfetto(
         )
         return
 
-    # Sort by timestamp to ensure correct ordering
-    raw_events.sort(key=lambda x: x[0])
+    # Optionally drop orphaned BEGIN/END so Perfetto doesn't show gaps
+    if sanitize_orphans:
+        sanitized_events = _sanitize_events(raw_events)
+        if not sanitized_events:
+            warnings.warn("All events were dropped during sanitization.")
+            return
+    else:
+        sanitized_events = sorted(raw_events, key=lambda x: x[0])
 
-    # Use relative timestamps (subtract first timestamp)
-    initial_ts = raw_events[0][0]
+    # Use relative timestamps (subtract first timestamp after sanitization)
+    initial_ts = sanitized_events[0][0]
 
-    # Validate BEGIN/END pairing if requested
+    # Validate BEGIN/END pairing on the sanitized stream to spot remaining issues
     if validate_pairs:
         from collections import defaultdict
 
         stacks = defaultdict(list)
         orphaned_ends = []
 
-        for ts, warp_id, slot, event_type in raw_events:
+        for ts, warp_id, slot, event_type in sanitized_events:
             key = (warp_id, slot)
             if event_type == 0:  # BEGIN
                 stacks[key].append(ts)
@@ -151,20 +207,20 @@ def export_to_perfetto(
 
         if orphaned_ends:
             warnings.warn(
-                f"Found {len(orphaned_ends)} END events without matching BEGIN. "
-                f"Buffer may have overflowed. First few: {orphaned_ends[:3]}"
+                f"Found {len(orphaned_ends)} END events without matching BEGIN "
+                f"after sanitization. First few: {orphaned_ends[:3]}"
             )
         if orphaned_begins:
             warnings.warn(
-                f"Found {len(orphaned_begins)} BEGIN events without matching END. "
-                f"Kernel may have been interrupted. First few: {orphaned_begins[:3]}"
+                f"Found {len(orphaned_begins)} BEGIN events without matching END "
+                f"after sanitization. First few: {orphaned_begins[:3]}"
             )
 
     trace_events = []
 
-    print(f"Generating {len(raw_events)} trace events...")
+    print(f"Generating {len(sanitized_events)} trace events...")
 
-    for ts, warp_id, slot, event_type in raw_events:
+    for ts, warp_id, slot, event_type in sanitized_events:
         # Convert cycles to microseconds (relative to start)
         # Formula: (cycles - initial_cycles) / (freq_ghz * 1000)
         ts_us = (ts - initial_ts) / (gpu_freq_ghz * 1000.0)

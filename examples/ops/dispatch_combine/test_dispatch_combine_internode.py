@@ -566,6 +566,9 @@ class EpDispatchCombineTestCase:
             f"rank {self.rank} recv {total_recv_num_token} tokens {total_rdma_recv_num_token} rdma tokens"
         )
 
+        my_times = mori.cpp.get_debug_time_buf(op._handle)
+        my_times.zero_()
+
         torch.cuda.synchronize()
         dist.barrier()
         events[0].record()
@@ -625,14 +628,6 @@ class EpDispatchCombineTestCase:
         comb_bandwidth_list = [
             total_bytes / (1000**3) / (t / (10**3)) for t in comb_duration_list
         ]
-
-        try:
-            import mori.kernel_profiler
-        except ImportError:
-            print("Warning: mori.kernel_profiler not found, skipping profiling")
-            return
-
-        my_times = mori.cpp.get_debug_time_buf(op._handle)
 
         output_filename = f"trace_rank_{self.rank}.json"
         print(f"Exporting trace to {output_filename}...")
