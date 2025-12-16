@@ -566,8 +566,9 @@ class EpDispatchCombineTestCase:
             f"rank {self.rank} recv {total_recv_num_token} tokens {total_rdma_recv_num_token} rdma tokens"
         )
 
-        my_times = mori.cpp.get_debug_time_buf(op._handle)
-        my_times.zero_()
+        if hasattr(mori.cpp, "get_debug_time_buf"):
+            my_times = mori.cpp.get_debug_time_buf(op._handle)
+            my_times.zero_()
 
         torch.cuda.synchronize()
         dist.barrier()
@@ -629,11 +630,15 @@ class EpDispatchCombineTestCase:
             total_bytes / (1000**3) / (t / (10**3)) for t in comb_duration_list
         ]
 
-        output_filename = f"trace_rank_{self.rank}_{time.strftime('%m%d_%H%M%S')}.json"
-
-        mori.kernel_profiler.export_to_perfetto(
-            my_times, mori.cpp.InterNodeV1Slots, output_filename, gpu_freq_ghz=1.7
-        )
+        if hasattr(mori.cpp, "CombineInterSlots"):
+            output_filename = (
+                f"trace_rank_{self.rank}_{time.strftime('%m%d_%H%M%S')}.json"
+            )
+            mori.kernel_profiler.export_to_perfetto(
+                my_times, mori.cpp.CombineInterSlots, output_filename, gpu_freq_ghz=1.7
+            )
+            if self.rank == 0:
+                print(f"Profiling data exported to {output_filename}")
 
         return (
             disp_duration_list,

@@ -19,41 +19,20 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#pragma once
+#include "mori/ops/dispatch_combine/internode_profile.hpp"
+#include "mori/pybind/profiler_registry.hpp"
 
-// Format: X(EnumName, PyBindName)
-// The PyBindName is used for automatic Python binding and visualization.
+namespace {
 
-// Profiler Tags for this module
-#define PROFILER_TAG_COMBINE_INTER (1 << 0)
-
-#define COMBINE_INTER_SLOTS(X)                 \
-  X(CombineInterNode, "combine_inter_node")    \
-  X(BatchProcessing, "batch_processing")       \
-  X(ChunkPolling, "chunk_polling")             \
-  X(ChunkReady, "chunk_ready")                 \
-  X(TokenProcessing, "token_processing")       \
-  X(PointerSetup, "pointer_setup")             \
-  X(TokenAccumulation, "token_accumulation")   \
-  X(WeightAccumulation, "weight_accumulation") \
-  X(ChunkCompletion, "chunk_completion")       \
-  X(AtomicIncrement, "atomic_increment")       \
-  X(FlagReset, "flag_reset")                   \
-  X(ShmemPutOp, "shmem_put_op")                \
-  X(BarrierSync, "barrier_sync")               \
-  X(BarrierWait, "barrier_wait")
-
-namespace mori {
-namespace moe {
-namespace v1 {
-
-enum class InterNodeSlot : int {
-#define X(name, str) name,
+void BindCombineInterSlots(pybind11::module_& m) {
+  std::vector<std::pair<const char*, int>> combineInterSlots;
+  int slotCounter = 0;
+#define X(name, str) combineInterSlots.push_back({str, slotCounter++});
   COMBINE_INTER_SLOTS(X)
 #undef X
-      MAX_SLOTS
-};
+  mori::pybind::BindProfilerSlots(m, "CombineInterSlots", combineInterSlots);
+}
 
-}  // namespace v1
-}  // namespace moe
-}  // namespace mori
+MORI_REGISTER_PROFILER_SLOTS(BindCombineInterSlots);
+
+}  // namespace

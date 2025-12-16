@@ -29,6 +29,7 @@ option(BUILD_OPS "Whether to build mori operation kernels" ON)
 option(BUILD_IO "Whether to build mori io library" ON)
 option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
 option(BUILD_TESTS "Whether to build mori CPP tests" ON)
+option(ENABLE_PROFILER "Enable kernel profiling" OFF)
 
 set(CMAKE_LIBRARY_PATH "/usr/local/lib;${CMAKE_LIBRARY_PATH}")
 find_library(BNXT_RE_LIB NAMES bnxt_re)
@@ -46,22 +47,31 @@ if(USE_BNXT)
   add_compile_definitions(ENABLE_BNXT)
 endif()
 
-find_library(IONIC_LIB
+find_library(
+  IONIC_LIB
   NAMES ionic
-  HINTS /lib/x86_64-linux-gnu
-)
+  HINTS /lib/x86_64-linux-gnu)
 if(IONIC_LIB)
-	message(STATUS "Found ionic library at: ${IONIC_LIB}")
+  message(STATUS "Found ionic library at: ${IONIC_LIB}")
 else()
   message(
-	  STATUS "Could NOT find ionic library. IONIC features will be disabled.")
+    STATUS "Could NOT find ionic library. IONIC features will be disabled.")
   set(USE_IONIC
       OFF
       CACHE BOOL "Enable IONIC features if ionic library is found" FORCE)
 endif()
 message(STATUS "USE_IONIC = ${USE_IONIC}")
 if(USE_IONIC)
-	add_compile_definitions(ENABLE_IONIC)
+  add_compile_definitions(ENABLE_IONIC)
+endif()
+
+message(STATUS "ENABLE_PROFILER = ${ENABLE_PROFILER}")
+if(ENABLE_PROFILER)
+  add_compile_definitions(ENABLE_PROFILER)
+  if(DEFINED PROFILER_MASK)
+    add_compile_definitions(PROFILER_MASK=${PROFILER_MASK})
+    message(STATUS "PROFILER_MASK = ${PROFILER_MASK}")
+  endif()
 endif()
 
 if(NOT DEFINED WARP_ACCUM_UNROLL)

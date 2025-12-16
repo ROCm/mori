@@ -1,7 +1,8 @@
 find_package(Torch REQUIRED)
 find_package(PythonLibs REQUIRED)
 
-add_library(mori_pybinds SHARED mori.cpp pybind.cpp)
+add_library(mori_pybinds SHARED mori.cpp pybind.cpp
+                                ../ops/dispatch_combine/pybind_profiler.cpp)
 
 target_include_directories(mori_pybinds PUBLIC ${PYTHON_INCLUDE_DIRS}
                                                ${TORCH_INCLUDE_DIRS})

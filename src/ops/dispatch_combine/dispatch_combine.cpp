@@ -105,9 +105,11 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   shmemInpIndicesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndicesSize, hipDeviceMallocUncached);
   shmemOutIndicesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndicesSize, hipDeviceMallocUncached);
 
+#ifdef ENABLE_PROFILER
   size_t debugBufSize = MAX_DEBUG_TIME_SLOTS * sizeof(int64_t);
   HIP_RUNTIME_CHECK(hipMalloc(&debugTimeBuf, debugBufSize));
   HIP_RUNTIME_CHECK(hipMemset(debugTimeBuf, 0, debugBufSize));
+#endif
 }
 
 void EpDispatchCombineHandle::FinalizeShmemBuf() {
@@ -123,7 +125,9 @@ void EpDispatchCombineHandle::FinalizeShmemBuf() {
   if (shmemOutScalesMemObj.IsValid()) ShmemFree(shmemOutScalesMemObj->localPtr);
   ShmemFree(shmemInpIndicesMemObj->localPtr);
   ShmemFree(shmemOutIndicesMemObj->localPtr);
+#ifdef ENABLE_PROFILER
   HIP_RUNTIME_CHECK(hipFree(debugTimeBuf));
+#endif
 }
 
 void EpDispatchCombineHandle::InitializeTokenNumSignalBuf() {

@@ -62,7 +62,13 @@ struct TraceProfiler {
   }
 };
 
-template <typename ProfilerType, typename SlotEnum>
+// Default mask allows everything if not defined
+#ifndef PROFILER_MASK
+#define PROFILER_MASK 0xFFFFFFFF
+#endif
+
+// Main Template: Enabled = true
+template <bool Enabled, typename ProfilerType, typename SlotEnum>
 struct ProfilerTraceScope {
   ProfilerType& profiler;
   SlotEnum slot;
@@ -75,8 +81,24 @@ struct ProfilerTraceScope {
   __device__ ~ProfilerTraceScope() { profiler.log(slot, EventType::END); }
 };
 
-#define MORI_TRACE_SCOPE(profiler, slot) \
-  mori::core::profiler::ProfilerTraceScope __trace_##__LINE__(profiler, slot)
+// Specialization: Enabled = false
+template <typename ProfilerType, typename SlotEnum>
+struct ProfilerTraceScope<false, ProfilerType, SlotEnum> {
+  __device__ ProfilerTraceScope(ProfilerType&, SlotEnum) {}
+  __device__ ~ProfilerTraceScope() {}
+};
+
+#ifndef ENABLE_PROFILER
+#define MORI_INIT_PROFILER(name, type, ...) ((void)0)
+#define MORI_TRACE_SCOPE(profiler, slot, tag) ((void)0)
+#else
+#define MORI_INIT_PROFILER(name, type, ...) type name(__VA_ARGS__)
+
+#define MORI_TRACE_SCOPE(profiler, slot, tag)                                           \
+  mori::core::profiler::ProfilerTraceScope<((tag) & PROFILER_MASK), decltype(profiler), \
+                                           decltype(slot)>                              \
+  __trace_##__LINE__(profiler, slot)
+#endif
 
 }  // namespace profiler
 }  // namespace core

@@ -579,13 +579,14 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
-  // Initialize profiler
+#ifdef ENABLE_PROFILER
   using Slot = mori::moe::v1::InterNodeSlot;
   using Profiler = mori::core::profiler::TraceProfiler<Slot, MAX_TRACE_EVENTS_PER_WARP>;
 
   size_t base = (size_t)globalWarpId * MAX_DEBUG_TIMESTAMP_PER_WARP;
+#endif
 
-  Profiler profiler(args.debugTimeBuf + base, laneId, globalWarpId);
+  MORI_INIT_PROFILER(profiler, Profiler, args.debugTimeBuf + base, laneId, globalWarpId);
   constexpr int numRecvBlock = 8;
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
 
@@ -607,9 +608,9 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   int processedCount = 0;
   int batchStart = 0;
   {
-    MORI_TRACE_SCOPE(profiler, Slot::CombineInterNode);
+    MORI_TRACE_SCOPE(profiler, Slot::CombineInterNode, PROFILER_TAG_COMBINE_INTER);
     while (processedCount < totalBids) {
-      MORI_TRACE_SCOPE(profiler, Slot::BatchProcessing);
+      MORI_TRACE_SCOPE(profiler, Slot::BatchProcessing, PROFILER_TAG_COMBINE_INTER);
       uint32_t processedMask = 0;
       int currentBatchSize = std::min(totalBids - processedCount, 32);
 
@@ -633,7 +634,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
             uint64_t thisChunkTokenNum = 0;
             int startTokenIdx = k * warpSize;
             {
-              MORI_TRACE_SCOPE(profiler, Slot::ChunkPolling);
+              MORI_TRACE_SCOPE(profiler, Slot::ChunkPolling, PROFILER_TAG_COMBINE_INTER);
               if (laneId == 0) {
                 thisChunkTokenNum = chunkFlag[node * maxChunkNum + k];
                 if (thisChunkTokenNum == 0) {
@@ -647,16 +648,16 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
             }
 
             if (thisChunkTokenNum > 0) {
-              MORI_TRACE_SCOPE(profiler, Slot::ChunkReady);
+              MORI_TRACE_SCOPE(profiler, Slot::ChunkReady, PROFILER_TAG_COMBINE_INTER);
               thisChunkTokenNum -= 1;
               int endTokenIdx = startTokenIdx + thisChunkTokenNum;
 
               for (int j = startTokenIdx + (bid % numRecvBlock) * warpNum + warpId; j < endTokenIdx;
                    j += numRecvBlock * warpNum) {
-                MORI_TRACE_SCOPE(profiler, Slot::TokenProcessing);
+                MORI_TRACE_SCOPE(profiler, Slot::TokenProcessing, PROFILER_TAG_COMBINE_INTER);
                 int tokIdx = node * config.MaxNumTokensToRecvPerRank() + j;
                 {
-                  MORI_TRACE_SCOPE(profiler, Slot::PointerSetup);
+                  MORI_TRACE_SCOPE(profiler, Slot::PointerSetup, PROFILER_TAG_COMBINE_INTER);
                   if (laneId < config.numExpertPerToken) {
                     srcPtrs[laneId] = nullptr;
                     srcWeightsPtr[laneId] = nullptr;
@@ -676,13 +677,13 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
                   }
                 }
                 {
-                  MORI_TRACE_SCOPE(profiler, Slot::TokenAccumulation);
+                  MORI_TRACE_SCOPE(profiler, Slot::TokenAccumulation, PROFILER_TAG_COMBINE_INTER);
                   core::WarpAccum<T, 4>(reinterpret_cast<T*>(stagingPtr + tokIdx * combXferBytes),
                                         srcPtrs, nullptr, config.numExpertPerToken,
                                         config.hiddenDim);
                 }
                 if (args.weightsBuf) {
-                  MORI_TRACE_SCOPE(profiler, Slot::WeightAccumulation);
+                  MORI_TRACE_SCOPE(profiler, Slot::WeightAccumulation, PROFILER_TAG_COMBINE_INTER);
                   core::WarpAccum<float, 4>(
                       reinterpret_cast<float*>(stagingPtr + tokIdx * combXferBytes + hiddenBytes),
                       srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
@@ -690,10 +691,10 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
               }
 
               {
-                MORI_TRACE_SCOPE(profiler, Slot::ChunkCompletion);
+                MORI_TRACE_SCOPE(profiler, Slot::ChunkCompletion, PROFILER_TAG_COMBINE_INTER);
                 index_t finished = 0;
                 {
-                  MORI_TRACE_SCOPE(profiler, Slot::AtomicIncrement);
+                  MORI_TRACE_SCOPE(profiler, Slot::AtomicIncrement, PROFILER_TAG_COMBINE_INTER);
                   if (laneId == 0)
                     finished =
                         atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
@@ -701,7 +702,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
                 }
                 if ((finished + 1) >= (numRecvBlock * warpNum)) {
                   {
-                    MORI_TRACE_SCOPE(profiler, Slot::FlagReset);
+                    MORI_TRACE_SCOPE(profiler, Slot::FlagReset, PROFILER_TAG_COMBINE_INTER);
                     if (laneId == 0) {
                       core::AtomicStoreSeqCstSystem(
                           args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>() +
@@ -712,7 +713,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
                     }
                   }
                   {
-                    MORI_TRACE_SCOPE(profiler, Slot::ShmemPutOp);
+                    MORI_TRACE_SCOPE(profiler, Slot::ShmemPutOp, PROFILER_TAG_COMBINE_INTER);
                     int proxyPe = node * config.gpuPerNode + (config.rank % config.gpuPerNode);
                     int qpId = k % config.numQpPerPe;
                     shmem::ShmemPutTypeNbiWarp<uint8_t>(
@@ -740,7 +741,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   // nodes, without this, it may be set by other node first then get override by zero
   __threadfence_system();
   {
-    MORI_TRACE_SCOPE(profiler, Slot::BarrierSync);
+    MORI_TRACE_SCOPE(profiler, Slot::BarrierSync, PROFILER_TAG_COMBINE_INTER);
     int finishedWarp = 0;
     uint64_t barrierFlag = 0;
     if (laneId == 0) {
@@ -762,7 +763,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
       if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
 
       {
-        MORI_TRACE_SCOPE(profiler, Slot::BarrierWait);
+        MORI_TRACE_SCOPE(profiler, Slot::BarrierWait, PROFILER_TAG_COMBINE_INTER);
         // Wait other nodes
         uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
         if ((laneId < nNodes) && (laneId != myNode)) {
