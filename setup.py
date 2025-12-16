@@ -86,6 +86,7 @@ class CMakeBuild(build_ext):
         build_type = os.environ.get("CMAKE_BUILD_TYPE", "Release")
         unroll_value = os.environ.get("WARP_ACCUM_UNROLL", "1")
         use_bnxt = os.environ.get("USE_BNXT", "OFF")
+        use_ionic = os.environ.get("USE_IONIC", "OFF")
         gpu_archs = _get_gpu_archs()
         subprocess.check_call(
             [
@@ -94,6 +95,7 @@ class CMakeBuild(build_ext):
                 f"-DCMAKE_BUILD_TYPE={build_type}",
                 f"-DWARP_ACCUM_UNROLL={unroll_value}",
                 f"-DUSE_BNXT={use_bnxt}",
+                f"-DUSE_IONIC={use_ionic}",
                 f"-DGPU_TARGETS={gpu_archs}",
                 "-B",
                 str(build_dir),

@@ -36,3 +36,7 @@ def shmem_mype():
 
 def shmem_npes():
     return mori_cpp.shmem_npes()
+
+
+def shmem_num_qp_per_pe():
+    return mori_cpp.shmem_num_qp_per_pe()

@@ -765,20 +765,27 @@ inline __device__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum, 
 }
 
 template <>
-inline __device__ void UpdateCqDbrRecord<ProviderType::MLX5>(void* dbrRecAddr, uint32_t cons_idx,
+inline __device__ int PollCq<ProviderType::MLX5>(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle, 
+	                                         void* cqAddr, uint32_t cqeNum, uint32_t* consIdx, uint16_t* wqeCounter)
+{
+  return 0;
+}
+
+template <>
+inline __device__ void UpdateCqDbrRecord<ProviderType::MLX5>(CompletionQueueHandle& cq, void* dbrRecAddr, uint32_t cons_idx,
                                                              uint32_t cqeNum) {
   reinterpret_cast<uint32_t*>(dbrRecAddr)[MLX5_CQ_SET_CI] = HTOBE32(cons_idx & 0xffffff);
 }
 
 template <>
-inline __device__ int PollCqAndUpdateDbr<ProviderType::MLX5>(void* cqAddr, uint32_t cqeSize,
+inline __device__ int PollCqAndUpdateDbr<ProviderType::MLX5>(CompletionQueueHandle& cq, void* cqAddr, uint32_t cqeSize,
                                                              uint32_t cqeNum, uint32_t* consIdx,
                                                              void* dbrRecAddr, uint32_t* lockVar) {
   AcquireLock(lockVar);
 
   int opcode = PollCq<ProviderType::MLX5>(cqAddr, cqeNum, consIdx);
   if (opcode >= 0) {
-    UpdateCqDbrRecord<ProviderType::MLX5>(dbrRecAddr, *consIdx, cqeNum);
+    UpdateCqDbrRecord<ProviderType::MLX5>(cq, dbrRecAddr, *consIdx, cqeNum);
   }
 
   ReleaseLock(lockVar);

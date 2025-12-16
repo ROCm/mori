@@ -44,6 +44,7 @@ class EpDispatchCombineTestCase:
         world_size,
         max_tokens,
         kernel_type,
+        num_qp,
         dtype=torch.bfloat16,
     ):
         self.rank = rank
@@ -59,12 +60,13 @@ class EpDispatchCombineTestCase:
             max_num_inp_token_per_rank=max_tokens,
             num_experts_per_rank=16,
             num_experts_per_token=8,
-            warp_num_per_block=16,
-            block_num=32,
+            warp_num_per_block=8,
+            block_num=64,
             max_token_type_size=2,
             kernel_type=kernel_type_map[kernel_type],
             gpu_per_node=self.gpu_per_node,
-            rdma_block_num=16,
+            rdma_block_num=32,
+            num_qp_per_pe=num_qp,
         )
 
     def setup(self):
@@ -292,7 +294,7 @@ class EpDispatchCombineTestCase:
             all_rank_scales[self.rank],
             all_rank_indices[self.rank],
             block_num=self.config.block_num,
-            warp_per_block=16,
+            # warp_per_block=16,
         )
         torch.cuda.synchronize()
 
@@ -341,7 +343,7 @@ class EpDispatchCombineTestCase:
             dispatch_weights,
             all_rank_indices[self.rank],
             block_num=self.config.block_num,
-            warp_per_block=16,
+            # warp_per_block=16,
         )
         torch.cuda.synchronize()
         for i in range(all_rank_num_token[self.rank]):
@@ -435,18 +437,20 @@ class EpDispatchCombineTestCase:
 
     def stress_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
+        num_test_data = 128
+        sync_interval = 128
 
         if self.rank == 0:
             print("Stress Test")
-        test_data_list = [self.gen_test_data(use_max_token_num=False) for i in range(5)]
-        for i in tqdm(range(5000)):
+        test_data_list = [self.gen_test_data(use_max_token_num=False) for i in range(num_test_data)]
+        for i in tqdm(range(10000000)):
             (
                 all_rank_num_token,
                 all_rank_indices,
                 all_rank_input,
                 all_rank_weights,
                 all_rank_scales,
-            ) = test_data_list[i % 5]
+            ) = test_data_list[i % num_test_data]
             (
                 dispatch_output,
                 dispatch_weights,
@@ -459,17 +463,18 @@ class EpDispatchCombineTestCase:
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
                 block_num=self.config.block_num,
-                warp_per_block=16,
+                # warp_per_block=16,
             )
             _, _ = op.combine(
                 dispatch_output,
                 dispatch_weights,
                 all_rank_indices[self.rank],
                 block_num=self.config.block_num,
-                warp_per_block=16,
+                # warp_per_block=16,
             )
-            torch.cuda.synchronize()
-            time.sleep(0.0001)
+            if i % sync_interval == 0:
+                torch.cuda.synchronize()
+        torch.cuda.synchronize()
 
         if self.rank == 0:
             print("Stress Test with CUDA Graph")
@@ -495,14 +500,14 @@ class EpDispatchCombineTestCase:
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
                 block_num=self.config.block_num,
-                warp_per_block=16,
+                # warp_per_block=16,
             )
             _, _ = op.combine(
                 dispatch_output,
                 dispatch_weights,
                 all_rank_indices[self.rank],
                 block_num=self.config.block_num,
-                warp_per_block=16,
+                # warp_per_block=16,
             )
         torch.cuda.synchronize()
 
@@ -538,7 +543,7 @@ class EpDispatchCombineTestCase:
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
                 block_num=self.config.block_num,
-                warp_per_block=16,
+                # warp_per_block=16,
             )
             torch.cuda.synchronize()
             total_recv_num_token = dispatch_recv_num_token[0].item()
@@ -548,7 +553,7 @@ class EpDispatchCombineTestCase:
                 # None,
                 all_rank_indices[self.rank],
                 block_num=self.config.block_num,
-                warp_per_block=16,
+                # warp_per_block=16,
             )
             torch.cuda.synchronize()
 
@@ -575,7 +580,7 @@ class EpDispatchCombineTestCase:
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
                 block_num=self.config.block_num,
-                warp_per_block=16,
+                # warp_per_block=16,
             )
             events[2 * i + 1].record()
             combine_output, _ = op.combine(
@@ -583,7 +588,7 @@ class EpDispatchCombineTestCase:
                 dispatch_weights,
                 all_rank_indices[self.rank],
                 block_num=self.config.block_num,
-                warp_per_block=16,
+                # warp_per_block=16,
             )
             events[2 * i + 2].record()
         torch.cuda.synchronize()
@@ -641,7 +646,7 @@ class EpDispatchCombineTestCase:
         comb_bandwidth_GB_list = []
 
         error_round = set()
-        for i in range(1):
+        for i in range(0):
             if self.rank == 0:
                 print(f"WarmUp Round {i} begin")
             self.run_test_once(op, test_data, error_round, i)
@@ -816,7 +821,7 @@ class EpDispatchCombineTestCase:
 
 
 def test_dispatch_combine(
-    local_rank, num_node, gpu_per_node, max_tokens, kernel_type, cmd="test"
+    local_rank, num_node, gpu_per_node, max_tokens, kernel_type, num_qp, cmd="test"
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
@@ -828,6 +833,7 @@ def test_dispatch_combine(
         world_size,
         max_tokens,
         kernel_type,
+        num_qp,
         torch.bfloat16,
         # torch.float8_e4m3fnuz,
     )
@@ -865,6 +871,12 @@ parser.add_argument(
     help="Type of kernel to test",
     choices=["v0", "v1", "v1_ll"],
 )
+parser.add_argument(
+    "--num-qp",
+    type=int,
+    default=1,
+    help="Number of qp per processing endpoint",
+)
 args_cli = parser.parse_args()
 
 if __name__ == "__main__":
@@ -880,6 +892,7 @@ if __name__ == "__main__":
             gpu_per_node,
             args_cli.max_tokens,
             args_cli.kernel_type,
+            args_cli.num_qp,
             args_cli.cmd,
         ),
         nprocs=gpu_per_node,
