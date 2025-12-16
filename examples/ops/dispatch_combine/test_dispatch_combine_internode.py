@@ -61,8 +61,8 @@ class EpDispatchCombineTestCase:
             scale_type_size=4,
             max_num_inp_token_per_rank=(max_tokens + 63) // 64 * 64,
             num_experts_per_rank=16,
-            num_experts_per_token=4,
-            warp_num_per_block=16,
+            num_experts_per_token=8,
+            warp_num_per_block=8,
             block_num=64,
             max_token_type_size=2,
             kernel_type=kernel_type_map[kernel_type],
@@ -977,6 +977,7 @@ def sweep_bench_dispatch_combine(
         world_size,
         max_tokens,
         kernel_type,
+        num_qp,
         torch.bfloat16,
         # torch.float8_e4m3fnuz,
     )
