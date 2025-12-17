@@ -32,15 +32,15 @@
 //   Bits 16-31: WarpId    (16 bits, supports 64K warps)
 //   Bits 32-63: Reserved for future use
 
-#define MAX_TRACE_EVENTS_PER_WARP 4096
+#define MAX_TRACE_EVENTS_PER_WARP 9216
 #define TRACE_EVENT_SIZE_INT64 2     // Timestamp + Metadata
 #define PROFILER_WARPS_PER_RANK 512  // Max warps per rank (64 blocks * 8 warps/block)
 
 // Total buffer size per rank (in int64_t)
-// 4096 * 2 * 512 = 4,194,304 int64s = 32MB per rank.
+// 9216 * 2 * 512 = 9,437,184 int64s = 72MB per rank.
 #define MAX_DEBUG_TIME_SLOTS \
   (MAX_TRACE_EVENTS_PER_WARP * TRACE_EVENT_SIZE_INT64 * PROFILER_WARPS_PER_RANK)
 
 // Per-warp buffer stride (in int64_t elements)
-// 4096 * 2 = 8192 int64s per warp
+// 9216 * 2 = 18,432 int64s per warp
 #define MAX_DEBUG_TIMESTAMP_PER_WARP (MAX_TRACE_EVENTS_PER_WARP * TRACE_EVENT_SIZE_INT64)

@@ -655,6 +655,8 @@ class EpDispatchCombineTestCase:
         test_data = self.gen_test_data(use_max_token_num=True)
 
         repeat = 50
+        if hasattr(mori.cpp, "get_debug_time_buf"):
+            repeat = 1  # for profiling, only run 1 iteration to avoid buffer overflow
         disp_duration_us_list = []
         disp_rdma_bandwidth_GB_list = []
         disp_bandwidth_GB_list = []
@@ -747,6 +749,9 @@ class EpDispatchCombineTestCase:
                 print(
                     f"  bandwidth {comb_bandwidth_GB_list[i]} avg {sum(comb_bandwidth_GB_list[i]) / self.config.world_size:.2f} GB/s"
                 )
+
+        if repeat == 1:
+            return
 
         def collect_metrics(per_round_data):
             minv = min([min(data) for data in per_round_data])

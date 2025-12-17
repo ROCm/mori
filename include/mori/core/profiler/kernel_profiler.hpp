@@ -34,6 +34,8 @@ enum class EventType : uint8_t { BEGIN = 0, END = 1, INSTANT = 2 };
 
 template <typename SlotEnum, int MaxEventsPerWarp>
 struct TraceProfiler {
+  using slot_type = SlotEnum;
+
   int64_t* warp_buffer;
   int lane_id;
   int warp_id;
@@ -47,17 +49,9 @@ struct TraceProfiler {
   }
 
   __device__ inline void log_with_time(SlotEnum slot, EventType type, int64_t ts) {
-    // Only lane 0 of each warp writes trace events
     if (lane_id == 0) {
-      // Meta encoding: [warpId:16][slot:14][type:2]
-      // Bits 0-1:   EventType
-      // Bits 2-15:  SlotEnum
-      // Bits 16-31: WarpId
       int64_t meta = ((int64_t)warp_id << 16) | ((int64_t)slot << 2) | (int)type;
-
-      // Circular buffer: overwrite oldest events if full
       int idx = offset % (MaxEventsPerWarp * 2);
-
       warp_buffer[idx] = ts;
       warp_buffer[idx + 1] = meta;
       offset += 2;
@@ -65,59 +59,91 @@ struct TraceProfiler {
   }
 };
 
-// Default mask allows everything if not defined
 #ifndef PROFILER_MASK
 #define PROFILER_MASK 0xFFFFFFFF
 #endif
 
-// Main Template: Enabled = true
 template <bool Enabled, typename ProfilerType, typename SlotEnum>
-struct ProfilerTraceScope {
+struct ProfilerSpan {
   ProfilerType& profiler;
   SlotEnum slot;
 
-  __device__ ProfilerTraceScope(ProfilerType& prof, SlotEnum target_slot)
-      : profiler(prof), slot(target_slot) {
+  __device__ ProfilerSpan(ProfilerType& prof, SlotEnum s) : profiler(prof), slot(s) {
     profiler.log(slot, EventType::BEGIN);
   }
 
-  __device__ inline void next(SlotEnum next_slot) {
-    if (profiler.lane_id == 0) {
-      int64_t ts = clock64();
-      profiler.log_with_time(slot, EventType::END, ts);
-      profiler.log_with_time(next_slot, EventType::BEGIN, ts);
-    }
-    slot = next_slot;
-  }
-
-  __device__ ~ProfilerTraceScope() { profiler.log(slot, EventType::END); }
+  __device__ ~ProfilerSpan() { profiler.log(slot, EventType::END); }
 };
 
-// Specialization: Enabled = false
 template <typename ProfilerType, typename SlotEnum>
-struct ProfilerTraceScope<false, ProfilerType, SlotEnum> {
-  __device__ ProfilerTraceScope(ProfilerType&, SlotEnum) {}
+struct ProfilerSpan<false, ProfilerType, SlotEnum> {
+  __device__ ProfilerSpan(ProfilerType&, SlotEnum) {}
+  __device__ ~ProfilerSpan() {}
+};
+
+template <bool Enabled, typename ProfilerType, typename SlotEnum>
+struct ProfilerSequential {
+  ProfilerType& profiler;
+  SlotEnum current_slot;
+  bool has_current;
+
+  __device__ ProfilerSequential(ProfilerType& prof)
+      : profiler(prof), current_slot(), has_current(false) {}
+
+  __device__ inline void next(SlotEnum slot) {
+    if (has_current) {
+      if (profiler.lane_id == 0) {
+        int64_t ts = clock64();
+        profiler.log_with_time(current_slot, EventType::END, ts);
+        profiler.log_with_time(slot, EventType::BEGIN, ts);
+      }
+    } else {
+      profiler.log(slot, EventType::BEGIN);
+      has_current = true;
+    }
+    current_slot = slot;
+  }
+
+  __device__ ~ProfilerSequential() {
+    if (has_current) {
+      profiler.log(current_slot, EventType::END);
+    }
+  }
+};
+
+template <typename ProfilerType, typename SlotEnum>
+struct ProfilerSequential<false, ProfilerType, SlotEnum> {
+  __device__ ProfilerSequential(ProfilerType&) {}
   __device__ inline void next(SlotEnum) {}
-  __device__ ~ProfilerTraceScope() {}
+  __device__ ~ProfilerSequential() {}
 };
 
 #ifndef ENABLE_PROFILER
 #define MORI_INIT_PROFILER(name, type, ...) ((void)0)
-#define MORI_TRACE_NAMED_SCOPE(name, profiler, slot, tag) ((void)0)
-#define MORI_TRACE_SCOPE(profiler, slot, tag) ((void)0)
+#define MORI_TRACE_SPAN(profiler, slot, tag) ((void)0)
+#define MORI_TRACE_SEQ(name, profiler, tag) ((void)0)
 #define MORI_TRACE_NEXT(name, slot) ((void)0)
+#define MORI_TRACE_INSTANT(profiler, slot, tag) ((void)0)
 #else
 #define MORI_INIT_PROFILER(name, type, ...) type name(__VA_ARGS__)
 
-#define MORI_TRACE_NAMED_SCOPE(name, profiler, slot, tag)                               \
-  mori::core::profiler::ProfilerTraceScope<((tag) & PROFILER_MASK), decltype(profiler), \
-                                           decltype(slot)>                              \
-  name(profiler, slot)
+#define MORI_TRACE_SPAN(profiler, slot, tag)                                                      \
+  mori::core::profiler::ProfilerSpan<((tag) & PROFILER_MASK), decltype(profiler), decltype(slot)> \
+  __span_##__LINE__(profiler, slot)
 
-#define MORI_TRACE_SCOPE(profiler, slot, tag) \
-  MORI_TRACE_NAMED_SCOPE(__trace_##__LINE__, profiler, slot, tag)
+#define MORI_TRACE_SEQ(name, profiler, tag)                                             \
+  mori::core::profiler::ProfilerSequential<((tag) & PROFILER_MASK), decltype(profiler), \
+                                           typename decltype(profiler)::slot_type>      \
+  name(profiler)
 
 #define MORI_TRACE_NEXT(name, slot) name.next(slot)
+
+#define MORI_TRACE_INSTANT(profiler, slot, tag)                     \
+  do {                                                              \
+    if ((tag) & PROFILER_MASK) {                                    \
+      profiler.log(slot, mori::core::profiler::EventType::INSTANT); \
+    }                                                               \
+  } while (0)
 #endif
 
 }  // namespace profiler
