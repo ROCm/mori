@@ -43,9 +43,12 @@ struct TraceProfiler {
       : warp_buffer(warp_base_ptr), lane_id(lid), warp_id(wid), offset(0) {}
 
   __device__ inline void log(SlotEnum slot, EventType type) {
+    log_with_time(slot, type, clock64());
+  }
+
+  __device__ inline void log_with_time(SlotEnum slot, EventType type, int64_t ts) {
     // Only lane 0 of each warp writes trace events
     if (lane_id == 0) {
-      int64_t ts = clock64();
       // Meta encoding: [warpId:16][slot:14][type:2]
       // Bits 0-1:   EventType
       // Bits 2-15:  SlotEnum
@@ -78,6 +81,15 @@ struct ProfilerTraceScope {
     profiler.log(slot, EventType::BEGIN);
   }
 
+  __device__ inline void next(SlotEnum next_slot) {
+    if (profiler.lane_id == 0) {
+      int64_t ts = clock64();
+      profiler.log_with_time(slot, EventType::END, ts);
+      profiler.log_with_time(next_slot, EventType::BEGIN, ts);
+    }
+    slot = next_slot;
+  }
+
   __device__ ~ProfilerTraceScope() { profiler.log(slot, EventType::END); }
 };
 
@@ -85,19 +97,27 @@ struct ProfilerTraceScope {
 template <typename ProfilerType, typename SlotEnum>
 struct ProfilerTraceScope<false, ProfilerType, SlotEnum> {
   __device__ ProfilerTraceScope(ProfilerType&, SlotEnum) {}
+  __device__ inline void next(SlotEnum) {}
   __device__ ~ProfilerTraceScope() {}
 };
 
 #ifndef ENABLE_PROFILER
 #define MORI_INIT_PROFILER(name, type, ...) ((void)0)
+#define MORI_TRACE_NAMED_SCOPE(name, profiler, slot, tag) ((void)0)
 #define MORI_TRACE_SCOPE(profiler, slot, tag) ((void)0)
+#define MORI_TRACE_NEXT(name, slot) ((void)0)
 #else
 #define MORI_INIT_PROFILER(name, type, ...) type name(__VA_ARGS__)
 
-#define MORI_TRACE_SCOPE(profiler, slot, tag)                                           \
+#define MORI_TRACE_NAMED_SCOPE(name, profiler, slot, tag)                               \
   mori::core::profiler::ProfilerTraceScope<((tag) & PROFILER_MASK), decltype(profiler), \
                                            decltype(slot)>                              \
-  __trace_##__LINE__(profiler, slot)
+  name(profiler, slot)
+
+#define MORI_TRACE_SCOPE(profiler, slot, tag) \
+  MORI_TRACE_NAMED_SCOPE(__trace_##__LINE__, profiler, slot, tag)
+
+#define MORI_TRACE_NEXT(name, slot) name.next(slot)
 #endif
 
 }  // namespace profiler
