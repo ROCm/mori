@@ -19,28 +19,12 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-// Constants for Profiling Buffer Size (TraceProfiler)
-//
-// Buffer Layout (per rank):
-// - Each rank has PROFILER_WARPS_PER_RANK warps
-// - Each warp has MAX_TRACE_EVENTS_PER_WARP events
-// - Each event = 2 int64_t: [timestamp, metadata]
-//
-// Metadata Encoding (int64_t):
-//   Bits 0-1:   EventType (0=BEGIN, 1=END, 2=INSTANT)
-//   Bits 2-15:  SlotEnum  (14 bits, supports 16K slots)
-//   Bits 16-31: WarpId    (16 bits, supports 64K warps)
-//   Bits 32-63: Reserved for future use
 
-#define MAX_TRACE_EVENTS_PER_WARP 9216
-#define TRACE_EVENT_SIZE_INT64 2     // Timestamp + Metadata
-#define PROFILER_WARPS_PER_RANK 512  // Max warps per rank (64 blocks * 8 warps/block)
+#define MAX_TRACE_EVENTS_PER_WARP 16384
+#define TRACE_EVENT_SIZE_INT64 2
+#define PROFILER_WARPS_PER_RANK 512
 
-// Total buffer size per rank (in int64_t)
-// 9216 * 2 * 512 = 9,437,184 int64s = 72MB per rank.
 #define MAX_DEBUG_TIME_SLOTS \
   (MAX_TRACE_EVENTS_PER_WARP * TRACE_EVENT_SIZE_INT64 * PROFILER_WARPS_PER_RANK)
 
-// Per-warp buffer stride (in int64_t elements)
-// 9216 * 2 = 18,432 int64s per warp
 #define MAX_DEBUG_TIMESTAMP_PER_WARP (MAX_TRACE_EVENTS_PER_WARP * TRACE_EVENT_SIZE_INT64)

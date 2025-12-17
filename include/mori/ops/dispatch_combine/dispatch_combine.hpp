@@ -249,8 +249,12 @@ class EpDispatchCombineHandle {
   index_t* interNodeChunkFlagCombine{nullptr};
   // Map dispatched rdma token chunk index
   index_t* interNodeDispSendMap{nullptr};
+#ifdef ENABLE_PROFILER
   // Debug buffer for latency profiling
   int64_t* debugTimeBuf{nullptr};
+  // Per-warp offset counters for profiling
+  unsigned int* debugTimeOffset{nullptr};
+#endif
 };
 
 template <typename T>
@@ -300,7 +304,10 @@ struct EpDispatchCombineArgs {
   index_t* interNodeDispDestTokIdMap{nullptr};
   index_t* interNodeChunkFlagCombine{nullptr};
   index_t* interNodeDispSendMap{nullptr};
+#ifdef ENABLE_PROFILER
   int64_t* debugTimeBuf{nullptr};
+  unsigned int* debugTimeOffset{nullptr};
+#endif
 };
 
 using EpDispatchCombineArgsVariant =
@@ -362,7 +369,10 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.interNodeDispDestTokIdMap = handle.interNodeDispDestTokIdMap;
   args.interNodeChunkFlagCombine = handle.interNodeChunkFlagCombine;
   args.interNodeDispSendMap = handle.interNodeDispSendMap;
+#ifdef ENABLE_PROFILER
   args.debugTimeBuf = handle.debugTimeBuf;
+  args.debugTimeOffset = handle.debugTimeOffset;
+#endif
   return args;
 }
 

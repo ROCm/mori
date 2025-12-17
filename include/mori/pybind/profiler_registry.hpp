@@ -51,7 +51,6 @@ class ProfilerSlotRegistry {
   std::vector<SlotBinder> binders_;
 };
 
-// Helper class for static registration
 struct ProfilerSlotRegistration {
   ProfilerSlotRegistration(SlotBinder binder) { ProfilerSlotRegistry::Get().Register(binder); }
 };
@@ -59,12 +58,10 @@ struct ProfilerSlotRegistration {
 #define MORI_REGISTER_PROFILER_SLOTS(func) \
   static mori::pybind::ProfilerSlotRegistration __mori_profiler_reg_##func##__LINE__(func)
 
-// Helper function to expose to mori.cpp
 inline void RegisterAllProfilerSlots(pybind11::module_& m) {
   ProfilerSlotRegistry::Get().BindAll(m);
 }
 
-// Utility to bind slots to module
 inline void BindProfilerSlots(pybind11::module_& m, const char* name,
                               const std::vector<std::pair<const char*, int>>& slots) {
   auto sub = m.def_submodule(name, "Auto-generated profiler slots");

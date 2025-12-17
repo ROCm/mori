@@ -35,16 +35,11 @@ def _parse_trace_events(trace_buffer):
     if trace_buffer.is_cuda:
         trace_buffer = trace_buffer.cpu()
 
-    # We iterate warp by warp
     num_elements = trace_buffer.numel()
-    warp_stride = 8192
+    warp_stride = 32768  # C++ uses 16384 events * 2 int64 = 32768
 
     for base in range(0, num_elements, warp_stride):
         warp_buffer = trace_buffer[base : base + warp_stride]
-
-        # Circular buffer handling:
-        # 1. Read all pairs (ts, meta) that are non-zero
-        # 2. Sort by timestamp to restore order
 
         warp_events = []
         for i in range(0, warp_stride, 2):
@@ -56,22 +51,15 @@ def _parse_trace_events(trace_buffer):
 
             warp_events.append((ts, meta))
 
-        # Sort by timestamp (clock64 is monotonic)
         warp_events.sort(key=lambda x: x[0])
 
         for ts, meta in warp_events:
-            # Decode meta field
-            # Bits 0-1:   EventType (0=BEGIN, 1=END, 2=INSTANT)
-            # Bits 2-15:  SlotEnum
-            # Bits 16-31: WarpId
-
             event_type = meta & 0x3
             slot = (meta >> 2) & 0x3FFF
             warp_id = (meta >> 16) & 0xFFFF
 
             events.append((ts, warp_id, slot, event_type))
 
-    # Sort all events across all warps (optional but good for global timeline)
     events.sort(key=lambda x: x[0])
     return events
 
@@ -89,17 +77,15 @@ def _sanitize_events(raw_events, drop_orphan_ends=True, drop_orphan_begins=True)
     raw_events.sort(key=lambda x: x[0])
 
     filtered = []
-    # Stack per (warp, slot) holds indices of BEGINs in `filtered`
     stacks = defaultdict(list)
-    # Track which BEGIN indices should be removed (if left unmatched)
     begin_to_drop = set()
 
     for idx, (ts, warp_id, slot, event_type) in enumerate(raw_events):
         key = (warp_id, slot)
-        if event_type == 0:  # BEGIN
+        if event_type == 0:
             stacks[key].append(len(filtered))
             filtered.append((ts, warp_id, slot, event_type))
-        elif event_type == 1:  # END
+        elif event_type == 1:
             if stacks[key]:
                 stacks[key].pop()
                 filtered.append((ts, warp_id, slot, event_type))
@@ -107,7 +93,6 @@ def _sanitize_events(raw_events, drop_orphan_ends=True, drop_orphan_begins=True)
                 if not drop_orphan_ends:
                     filtered.append((ts, warp_id, slot, event_type))
         else:
-            # INSTANT is always kept
             filtered.append((ts, warp_id, slot, event_type))
 
     if drop_orphan_begins:
@@ -130,20 +115,6 @@ def export_to_perfetto(
     validate_pairs=True,
     sanitize_orphans=True,
 ):
-    """
-    Export profiling buffer to Perfetto JSON trace format.
-    Args:
-        trace_buffer: torch.Tensor (int64), the raw debug time buffer
-        slot_map: dict or object with attributes, mapping slot names to integer IDs.
-                  If it's an object/module (like InterNodeV1Slots), we'll extract attributes.
-        filename: str, output filename (e.g., 'trace.json')
-        gpu_freq_ghz: float, GPU frequency in GHz for timestamp conversion.
-                      Default 1.7 GHz (MI300 approx).
-        validate_pairs: bool, if True, validate and report unpaired BEGIN/END events.
-    The generated JSON can be loaded in https://ui.perfetto.dev/
-    """
-
-    # Resolve slot map if it's an object/module
     if not isinstance(slot_map, dict):
         id_to_name = {}
         for name in dir(slot_map):
@@ -155,7 +126,6 @@ def export_to_perfetto(
                 except (AttributeError, TypeError):
                     continue
     else:
-        # Check if keys are int (id->name) or str (name->id)
         if not slot_map:
             id_to_name = {}
         else:
@@ -173,7 +143,6 @@ def export_to_perfetto(
         )
         return
 
-    # Optionally drop orphaned BEGIN/END so Perfetto doesn't show gaps
     if sanitize_orphans:
         sanitized_events = _sanitize_events(raw_events)
         if not sanitized_events:
@@ -182,10 +151,8 @@ def export_to_perfetto(
     else:
         sanitized_events = sorted(raw_events, key=lambda x: x[0])
 
-    # Use relative timestamps (subtract first timestamp after sanitization)
     initial_ts = sanitized_events[0][0]
 
-    # Validate BEGIN/END pairing on the sanitized stream to spot remaining issues
     if validate_pairs:
         from collections import defaultdict
 
@@ -194,9 +161,9 @@ def export_to_perfetto(
 
         for ts, warp_id, slot, event_type in sanitized_events:
             key = (warp_id, slot)
-            if event_type == 0:  # BEGIN
+            if event_type == 0:
                 stacks[key].append(ts)
-            elif event_type == 1:  # END
+            elif event_type == 1:
                 if stacks[key]:
                     stacks[key].pop()
                 else:
@@ -225,13 +192,10 @@ def export_to_perfetto(
     trace_events = []
 
     for ts, warp_id, slot, event_type in sanitized_events:
-        # Convert cycles to microseconds (relative to start)
-        # Formula: (cycles - initial_cycles) / (freq_ghz * 1000)
         ts_us = (ts - initial_ts) / (gpu_freq_ghz * 1000.0)
 
         name = id_to_name.get(slot, f"Unknown_Slot_{slot}")
 
-        # Perfetto Phase types: 'B' (Begin), 'E' (End), 'i' (Instant)
         if event_type == 0:
             ph = "B"
         elif event_type == 1:
@@ -247,20 +211,18 @@ def export_to_perfetto(
             "cat": "gpu_kernel",
             "ph": ph,
             "ts": ts_us,
-            "pid": 0,  # Process ID (single process)
-            "tid": warp_id,  # Thread ID = Warp ID
+            "pid": 0,
+            "tid": warp_id,
         }
 
-        # Add scope for instant events
         if event_type == 2:
-            event["s"] = "t"  # Scope: thread
+            event["s"] = "t"
 
         trace_events.append(event)
 
-    # Perfetto expects "displayTimeUnit" to match actual "ts" unit
     trace_data = {
         "traceEvents": trace_events,
-        "displayTimeUnit": "ms",  # Perfetto will display in ms, ts is in us
+        "displayTimeUnit": "ms",
     }
 
     with open(filename, "w") as f:

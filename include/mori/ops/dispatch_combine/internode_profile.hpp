@@ -24,24 +24,31 @@
 // Format: X(EnumName, PyBindName)
 // The PyBindName is used for automatic Python binding and visualization.
 
-// Profiler Tags for this module
-#define PROFILER_TAG_COMBINE_INTER (1 << 0)
+#define PROFILER_TAG_ALL (1 << 0)
 
-#define COMBINE_INTER_SLOTS(X)                 \
-  X(CombineInterNode, "combine_inter_node")    \
-  X(BatchProcessing, "batch_processing")       \
-  X(ChunkPolling, "chunk_polling")             \
-  X(ChunkReady, "chunk_ready")                 \
-  X(TokenProcessing, "token_processing")       \
-  X(PointerSetup, "pointer_setup")             \
-  X(TokenAccumulation, "token_accumulation")   \
-  X(WeightAccumulation, "weight_accumulation") \
-  X(ChunkCompletion, "chunk_completion")       \
-  X(AtomicIncrement, "atomic_increment")       \
-  X(FlagReset, "flag_reset")                   \
-  X(ShmemPutOp, "shmem_put_op")                \
-  X(BarrierSync, "barrier_sync")               \
-  X(BarrierWait, "barrier_wait")
+#define COMBINE_INTER_SLOTS(X)                \
+  X(DispatchInterSend, "dispatch_inter_send") \
+  X(DispSendStaging, "disp_send_staging")     \
+  X(DispSendRDMA, "disp_send_rdma")           \
+  X(DispatchInterRecv, "dispatch_inter_recv") \
+  X(DispRecvPoll, "disp_recv_poll")           \
+  X(DispRecvProcess, "disp_recv_process")     \
+  X(DispatchIntra, "dispatch_intra")          \
+  X(DispIntraToken, "disp_intra_token")       \
+  X(DispatchSync, "dispatch_sync")            \
+  X(DispSyncBarrier, "disp_sync_barrier")     \
+  X(DispSyncQuiet, "disp_sync_quiet")         \
+  X(CombineSync, "combine_sync")              \
+  X(CombSyncCopy, "comb_sync_copy")           \
+  X(CombSyncBarrier, "comb_sync_barrier")     \
+  X(CombineIntra, "combine_intra")            \
+  X(CombIntraToken, "comb_intra_token")       \
+  X(CombineInterNode, "combine_inter_node")   \
+  X(CombInterChunk, "comb_inter_chunk")       \
+  X(CombInterToken, "comb_inter_token")       \
+  X(CombInterShmem, "comb_inter_shmem")       \
+  X(CombineAll, "combine_all")                \
+  X(CombAllToken, "comb_all_token")
 
 namespace mori {
 namespace moe {

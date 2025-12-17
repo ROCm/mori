@@ -187,6 +187,13 @@ torch::Tensor GetDebugTimeBuf(mori::moe::EpDispatchCombineHandle& handle) {
   torch::Tensor tensor = torch::from_blob(handle.debugTimeBuf, {MAX_DEBUG_TIME_SLOTS}, options);
   return tensor;
 }
+
+torch::Tensor GetDebugTimeOffset(mori::moe::EpDispatchCombineHandle& handle) {
+  auto options = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+  torch::Tensor tensor =
+      torch::from_blob(handle.debugTimeOffset, {PROFILER_WARPS_PER_RANK}, options);
+  return tensor;
+}
 #endif
 
 void DeclareEpDispatchCombineHandle(pybind11::module& m) {
@@ -222,6 +229,9 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
 #ifdef ENABLE_PROFILER
   funcName = std::string("get_debug_time_buf");
   m.def(funcName.c_str(), &GetDebugTimeBuf);
+
+  funcName = std::string("get_debug_time_offset");
+  m.def(funcName.c_str(), &GetDebugTimeOffset);
 #endif
 }
 
@@ -259,7 +269,6 @@ void RegisterMoriOps(py::module_& m) {
       .value("InterNodeV1LL", mori::moe::KernelType::InterNodeV1LL)
       .export_values();
 
-  // Bind InterNodeV1 slots
   mori::pybind::RegisterAllProfilerSlots(m);
 
   pybind11::class_<mori::moe::EpDispatchCombineConfig>(m, "EpDispatchCombineConfig")
