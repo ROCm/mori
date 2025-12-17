@@ -14,6 +14,7 @@ Usage (默认每节点8个GPU):
     Node 1: RANK=1 WORLD_SIZE=2 MASTER_ADDR=node0_ip MASTER_PORT=29500 python test_low_latency.py
 """
 import random
+import numpy as np
 import torch
 import torch.distributed as dist
 from functools import partial
@@ -66,10 +67,10 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     
     if is_multi_node:
         kernel_type = mori.ops.EpDispatchCombineKernelType.InterNodeV1LL
-        scale_dim, scale_type_size, block_num, rdma_block_num = 32, 4, 32, 16
+        scale_dim, scale_type_size, block_num, rdma_block_num, warp_num_per_block = 32, 4, 64, 32, 8
     else:
         kernel_type = mori.ops.EpDispatchCombineKernelType.IntraNode
-        scale_dim, scale_type_size, block_num, rdma_block_num = 0, 0, 80, 0
+        scale_dim, scale_type_size, block_num, rdma_block_num, warp_num_per_block = 0, 0, 80, 0, 16
 
     config = mori.ops.EpDispatchCombineConfig(
         data_type=torch.bfloat16,
@@ -82,12 +83,13 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         max_num_inp_token_per_rank=num_tokens,
         num_experts_per_rank=num_local_experts,
         num_experts_per_token=num_topk,
-        warp_num_per_block=16,
+        warp_num_per_block=warp_num_per_block,
         block_num=block_num,
         use_external_inp_buf=False,
         kernel_type=kernel_type,
         gpu_per_node=gpu_per_node,
-        rdma_block_num=rdma_block_num if is_multi_node else 0,
+        rdma_block_num=rdma_block_num,
+        num_qp_per_pe=4 if is_multi_node else 0,
     )
     mori.shmem.shmem_torch_process_group_init("default")
     op = mori.ops.EpDispatchCombineOp(config)
@@ -103,12 +105,13 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         max_num_inp_token_per_rank=num_tokens,
         num_experts_per_rank=num_local_experts,
         num_experts_per_token=num_topk,
-        warp_num_per_block=16,
+        warp_num_per_block=warp_num_per_block,
         block_num=block_num,
         use_external_inp_buf=True,
         kernel_type=kernel_type,
         gpu_per_node=gpu_per_node,
-        rdma_block_num=rdma_block_num if is_multi_node else 0,
+        rdma_block_num=rdma_block_num,
+        num_qp_per_pe=4 if is_multi_node else 0,
     )
     no_zero_copy_op = mori.ops.EpDispatchCombineOp(no_zero_copy_config)
 
@@ -338,7 +341,6 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                     scales,
                     topk_idx,
                     block_num=block_num,
-                    warp_per_block=16,
                 )
                 # large_gemm_with_hook(hook) if return_recv_hook else None
                 combined_x, _ = no_zero_copy_op.combine(
@@ -346,7 +348,6 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                     None,
                     topk_idx,
                     block_num=block_num,
-                    warp_per_block=16,
                 )
                 # large_gemm_with_hook(hook) if return_recv_hook else None
         else:
@@ -377,19 +378,72 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     print(f'[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
           f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
 
-    # Separate profiling
-    for return_recv_hook in (False, ):
+    # Separate profiling: measure dispatch and combine in one pass with barrier between them
+    group.barrier()
+    
+    use_zero_copy = not is_multi_node
+    current_op = op if use_zero_copy else no_zero_copy_op
+    
+    # Warmup
+    for _ in range(10):
+        (recv_x, recv_topk_weights, recv_scales, recv_topk_idx, recv_count) = current_op.dispatch(
+            x, topk_weights, scales, topk_idx, block_num=block_num
+        )
         group.barrier()
-        kernel_names = ('EpDispatchInterNodeV1KernelLowLatency', 'EpCombineInterNodeV1Kernel') if is_multi_node else ('EpDispatchIntraNodeKernel', 'EpCombineIntraNodeKernel')
-        dispatch_t, combine_t = bench_kineto(partial(test_func, zero_copy=True, use_fp8=bench_use_fp8, return_recv_hook=return_recv_hook),
-                                             kernel_names=kernel_names, barrier_comm_profiling=True,
-                                             suppress_kineto_output=True)
-        if not return_recv_hook:
-            print(f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
-                  f'Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)
-        else:
-            print(f'[rank {rank}] Dispatch send/recv time: {dispatch_t * 2 * 1e6:.2f} us | '
-                  f'Combine send/recv time: {combine_t * 2 * 1e6:.2f} us', flush=True)
+        if use_zero_copy:
+            combine_input = current_op.get_registered_combine_input_buffer(config.data_type)
+            combine_input[:, :].copy_(simulated_gemm_x)
+        combined_x, _ = current_op.combine(
+            simulated_gemm_x, None, topk_idx, block_num=block_num
+        )
+        torch.cuda.synchronize()
+    
+    # Benchmark: measure both dispatch and combine in one iteration
+    dispatch_times = []
+    combine_times = []
+    for _ in range(30):
+        group.barrier()
+        
+        # Time dispatch
+        dispatch_start = torch.cuda.Event(enable_timing=True)
+        dispatch_end = torch.cuda.Event(enable_timing=True)
+        dispatch_start.record()
+        (recv_x, recv_topk_weights, recv_scales, recv_topk_idx, recv_count) = current_op.dispatch(
+            x, topk_weights, scales, topk_idx, block_num=block_num
+        )
+        dispatch_end.record()
+        
+        # Barrier to separate dispatch and combine (before sync to avoid timing barrier wait)
+        group.barrier()
+        torch.cuda.synchronize()
+        # Time combine
+        combine_start = torch.cuda.Event(enable_timing=True)
+        combine_end = torch.cuda.Event(enable_timing=True)
+        if use_zero_copy:
+            combine_input = current_op.get_registered_combine_input_buffer(config.data_type)
+            combine_input[:, :].copy_(simulated_gemm_x)
+        combine_start.record()
+        combined_x, _ = current_op.combine(
+            simulated_gemm_x, None, topk_idx, block_num=block_num
+        )
+        combine_end.record()
+        
+        # Synchronize once at the end to get both timings
+        torch.cuda.synchronize()
+        dispatch_times.append(dispatch_start.elapsed_time(dispatch_end) / 1000.0)  # Convert to seconds
+        combine_times.append(combine_start.elapsed_time(combine_end) / 1000.0)
+    
+    dispatch_avg = np.mean(dispatch_times)
+    dispatch_min = np.min(dispatch_times)
+    dispatch_max = np.max(dispatch_times)
+    combine_avg = np.mean(combine_times)
+    combine_min = np.min(combine_times)
+    combine_max = np.max(combine_times)
+    
+    print(f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_avg:.2f} GB/s, '
+          f'avg_t={dispatch_avg * 1e6:.2f} us (min={dispatch_min * 1e6:.2f}, max={dispatch_max * 1e6:.2f}) | '
+          f'Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_avg:.2f} GB/s, '
+          f'avg_t={combine_avg * 1e6:.2f} us (min={combine_min * 1e6:.2f}, max={combine_max * 1e6:.2f})', flush=True)
 
     return hash_value
 

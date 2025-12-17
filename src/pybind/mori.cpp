@@ -70,9 +70,12 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
                         at::cuda::getCurrentHIPStream());
 
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+#if ENABLE_WARP_PROFILER
+  // Warp-level profiling (enabled via ENABLE_WARP_PROFILER compile option)
   constexpr int k_num_timings = 32;
   constexpr int k_max_warps_per_block = 16;
-  constexpr int k_dump_num_timings = 12;
+  constexpr int k_dump_num_timings = 32;
   
   // Get actual warps per block from config (for printing only active warps)
   int k_actual_warps_per_block = handle.config.warpNumPerBlock;
@@ -109,6 +112,7 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
       }
       printf("\n");
   }
+#endif  // ENABLE_WARP_PROFILER
 
   torch::Tensor out =
       torch::from_blob(handle.shmemDispatchOutTokMemObj->Get(),

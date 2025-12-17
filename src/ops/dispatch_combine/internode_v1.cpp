@@ -36,36 +36,43 @@ __device__ __forceinline__ uint64_t dev_now_ns() { return wall_clock64(); }
 #endif
 
 #if ENABLE_WARP_PROFILER
-#define RECORD_SECTION_WARP(id) do {                        \
-  int warpId = threadIdx.x / warpSize;                      \
-  if ((threadIdx.x & (warpSize - 1)) == 0) {                \
-    args.timings[(blockIdx.x * MAX_WARPS_PER_BLOCK + warpId) * NUM_TIMINGS + (id)] = dev_now_ns(); \
-  }                                                    \
-} while (0)
+#define RECORD_SECTION_WARP(id)                                                        \
+  do {                                                                                 \
+    int warpId = threadIdx.x / warpSize;                                               \
+    if ((threadIdx.x & (warpSize - 1)) == 0) {                                         \
+      args.timings[(blockIdx.x * MAX_WARPS_PER_BLOCK + warpId) * NUM_TIMINGS + (id)] = \
+          dev_now_ns();                                                                \
+    }                                                                                  \
+  } while (0)
 #else
-#define RECORD_SECTION_WARP(id) do { } while (0)
+#define RECORD_SECTION_WARP(id) \
+  do {                          \
+  } while (0)
 #endif
 
 // Block-level profiling (original behavior, for compatibility)
-#define RECORD_SECTION(id) do {                        \
-  __syncthreads();                                     \
-  if (threadIdx.x == 0) {                              \
-    args.timings[blockIdx.x * NUM_TIMINGS + (id)] = dev_now_ns(); \
-  }                                                    \
-  __syncthreads();                                     \
-} while (0)
+#define RECORD_SECTION(id)                                          \
+  do {                                                              \
+    __syncthreads();                                                \
+    if (threadIdx.x == 0) {                                         \
+      args.timings[blockIdx.x * NUM_TIMINGS + (id)] = dev_now_ns(); \
+    }                                                               \
+    __syncthreads();                                                \
+  } while (0)
 
-#define RECORD_SECTION_NO_SYNC(id) do {                        \
-  if (threadIdx.x == 0) {                              \
-    args.timings[blockIdx.x * NUM_TIMINGS + (id)] = dev_now_ns(); \
-  }                                                    \
-} while (0)
+#define RECORD_SECTION_NO_SYNC(id)                                  \
+  do {                                                              \
+    if (threadIdx.x == 0) {                                         \
+      args.timings[blockIdx.x * NUM_TIMINGS + (id)] = dev_now_ns(); \
+    }                                                               \
+  } while (0)
 
-#define RECORD_SECTION_NO_SYNC_THR(id, thr) do {                        \
-  if (threadIdx.x == thr) {                              \
-    args.timings[blockIdx.x * NUM_TIMINGS + (id)] = dev_now_ns(); \
-  }                                                    \
-} while (0)
+#define RECORD_SECTION_NO_SYNC_THR(id, thr)                         \
+  do {                                                              \
+    if (threadIdx.x == thr) {                                       \
+      args.timings[blockIdx.x * NUM_TIMINGS + (id)] = dev_now_ns(); \
+    }                                                               \
+  } while (0)
 
 namespace mori {
 namespace moe {
@@ -147,7 +154,7 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, in
 template <typename T>
 inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
-
+  RECORD_SECTION_WARP(0);
   // Distribute tokens evenly to all blocks
   int blockOffset = config.rdmaBlockNum;
   int xgmiBlockNum = blockNum - config.rdmaBlockNum;
@@ -194,6 +201,7 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
 template <typename T, bool DEDUP>
 inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  RECORD_SECTION_WARP(0);
 
   // Distribute tokens evenly to all blocks
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
@@ -203,7 +211,6 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
   int startTokenIdx = blockChunkNum * blockId * warpSize;
   int endTokenIdx = std::min(startTokenIdx + blockChunkNum * warpSize, args.curRankNumToken);
   RECORD_SECTION_WARP(1);
-  // First copy to staging buffer
   for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
     uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
     size_t stagingTokOffset = tokenId * xferBytes;
@@ -227,7 +234,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
   }
   __syncthreads();
 
-  RECORD_SECTION_WARP(2);  // DispatchInterNodeSend: Staging buffer copy done, RDMA send starting (reuse ID 2)
+  RECORD_SECTION_WARP(2);
 
   // Then send to other nodes
   for (int i = warpId; i < nNodes; i += warpNum) {
@@ -292,6 +299,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
       }
     } else {
       for (int tokenId = startTokenIdx + laneId; tokenId < endTokenIdx; tokenId += warpSize) {
+        RECORD_SECTION_WARP(3);
         bool shouldSend = false;
         for (int e = 0; e < config.numExpertPerToken; e++) {
           int destNode = args.tokenIndices[tokenId * numExpertPerToken + e] /
@@ -301,7 +309,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
             args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = nullTokenId;
           }
         }
-
+        RECORD_SECTION_WARP(4);
         index_t flagSlotId = 0;
         if (laneId == 0) {
           flagSlotId = atomicAdd(args.blockFlagCounter + i, 1);
@@ -312,30 +320,33 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
         index_t destTokId = destTokIdOffset + laneId;
 
         size_t remoteIdx = (myNode * config.MaxNumTokensToRecvPerRank() + destTokId);
+        RECORD_SECTION_WARP(5);
         if (laneId == 0) {
           index_t tokenNum = std::min(tokenId + warpSize, endTokenIdx) - tokenId;
           size_t stagingTokOffset = tokenId * xferBytes;
           int qpId = (tokenId / warpSize) % config.numQpPerPe;
-          // shmem::ShmemPutMemNbiSignalThread(args.shmemDispatchInpTokMemObj, remoteIdx *
-          // xferBytes,
-          //                                   args.shmemStagingTokMemObj, stagingTokOffset,
-          //                                   tokenNum * xferBytes, args.interNodeChunkFlagMemObj,
-          //                                   (myNode * maxChunkNum + flagSlotId) *
-          //                                   sizeof(uint64_t), tokenNum + 1,
-          //                                   core::atomicType::AMO_SET, proxyPe, qpId);
-          shmem::ShmemPutMemNbiThread(args.shmemDispatchInpTokMemObj, remoteIdx * xferBytes,
-                                      args.shmemStagingTokMemObj, stagingTokOffset,
-                                      tokenNum * xferBytes, proxyPe, qpId);
-          shmem::ShmemPutUint64ImmNbiThread(args.interNodeChunkFlagMemObj,
+          RECORD_SECTION_WARP(6);
+          shmem::ShmemPutMemNbiSignalThread(args.shmemDispatchInpTokMemObj, remoteIdx * xferBytes,
+                                            args.shmemStagingTokMemObj, stagingTokOffset,
+                                            tokenNum * xferBytes, args.interNodeChunkFlagMemObj,
                                             (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
-                                            tokenNum + 1, proxyPe, qpId);
+                                            tokenNum + 1, core::atomicType::AMO_SET, proxyPe, qpId);
+          RECORD_SECTION_WARP(7);
+          // shmem::ShmemPutMemNbiThread(args.shmemDispatchInpTokMemObj, remoteIdx * xferBytes,
+          //                             args.shmemStagingTokMemObj, stagingTokOffset,
+          //                             tokenNum * xferBytes, proxyPe, qpId);
+          // shmem::ShmemPutUint64ImmNbiThread(args.interNodeChunkFlagMemObj,
+          //                                   (myNode * maxChunkNum + flagSlotId) *
+          //                                   sizeof(uint64_t), tokenNum + 1, proxyPe, qpId);
         }
+        RECORD_SECTION_WARP(8);
         if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
+        RECORD_SECTION_WARP(9);
       }
     }
   }
 
-  RECORD_SECTION_WARP(3);  // DispatchInterNodeSend: RDMA send complete (reuse ID 3)
+  RECORD_SECTION_WARP(10);  // DispatchInterNodeSend: RDMA send complete (reuse ID 6)
 
   int finishedWarp = 0;
   if (laneId == 0) finishedWarp = atomicAdd(args.interNodeBlocksBarrier, 1);
@@ -345,20 +356,22 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
       index_t numTokenSignal =
           core::AtomicLoadRelaxed(args.blockFlagCounter + laneId) * warpSize + 1;
+      RECORD_SECTION_WARP(11);   
       shmem::ShmemPutInt32ImmNbiThread(args.nodeRecvTokenNumMemObj, myNode * sizeof(index_t),
                                        numTokenSignal, proxyPe);
+      RECORD_SECTION_WARP(12);
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
   }
 
-  RECORD_SECTION_WARP(4);  // DispatchInterNodeSend: After barrier, end (reuse ID 4 with IntraNode end)
+  RECORD_SECTION_WARP(13);
 }
 
 template <typename T>
 inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
 
-  RECORD_SECTION_WARP(5);  // DispatchInterNodeRecv: Start (independent ID)
+  RECORD_SECTION_WARP(14);  // DispatchInterNodeRecv: Start (independent ID)
 
   constexpr int numRecvBlock = 8;
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
@@ -383,6 +396,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
     // Poll completion flags
     uint64_t thisChunkTokenNum = 0;
     index_t nodeFlag = 0;
+    RECORD_SECTION_WARP(15);
     if (laneId == 0) {
       while (1) {
         thisChunkTokenNum = core::AtomicLoadRelaxedSystem(&chunkFlag[node * maxChunkNum + k]);
@@ -401,7 +415,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
 
     int endTokenIdx = startTokenIdx + thisChunkTokenNum;
 
-    RECORD_SECTION_WARP(6);  // DispatchInterNodeRecv: After polling, before processing
+    RECORD_SECTION_WARP(16);  // DispatchInterNodeRecv: After polling, before processing
 
     for (int j = startTokenIdx + (blockId % numRecvBlock) * warpNum + warpId; j < endTokenIdx;
          j += numRecvBlock * warpNum) {
@@ -414,8 +428,9 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
       }
       index_t srcTokId = reinterpret_cast<index_t*>(stagingPtr + tokIdx * xferBytes + hiddenBytes +
                                                     indexBytes + weightBytes + scaleBytes)[0];
-
+      RECORD_SECTION_WARP(17); 
       for (int e = 0; e < config.numExpertPerToken; e++) {
+        RECORD_SECTION_WARP(18); 
         int destPe = __shfl(lanePe, e);
         int destNode = destPe / config.gpuPerNode;
 
@@ -450,33 +465,36 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
               args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destTokId * scaleBytes,
               stagingPtr + tokIdx * xferBytes + hiddenBytes + indexBytes + weightBytes, scaleBytes);
         }
+        RECORD_SECTION_WARP(19);
       }
+      RECORD_SECTION_WARP(20);
     }
   }
   // }
   // }
 
-  RECORD_SECTION_WARP(7);  // DispatchInterNodeRecv: Processing complete
+  RECORD_SECTION_WARP(21);  // DispatchInterNodeRecv: Processing complete
 
   if (laneId < config.gpuPerNode) {
     int destPe = myNode * config.gpuPerNode + laneId;
     int counter = atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
   }
 
-  RECORD_SECTION_WARP(8);  // DispatchInterNodeRecv: End
+  RECORD_SECTION_WARP(22);  // DispatchInterNodeRecv: End
 }
 
 template <typename T>
 inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
 
-  RECORD_SECTION_WARP(9);  // DispatchSync: Start
+  RECORD_SECTION_WARP(23);  // DispatchSync: Start
 
   int nodePeOffset = myNode * config.gpuPerNode;
   int finishedWarp = 0;
   if (laneId == 0) finishedWarp = atomicAdd(args.dispatchGridBarrier, 1);
   finishedWarp = __shfl(finishedWarp, 0);
   if ((finishedWarp + 1) == globalWarpNum) {
+    RECORD_SECTION_WARP(24); 
     if (laneId < config.gpuPerNode) {
       int destPe = myNode * config.gpuPerNode + laneId;
       index_t numTokenSignal = core::AtomicLoadSeqCstSystem(args.destPeTokenCounter + destPe) + 1;
@@ -507,16 +525,19 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
       core::AtomicStoreRelaxedSystem(
           args.nodeRecvTokenNumMemObj->template GetAs<index_t*>() + laneId, 0);
     }
+    RECORD_SECTION_WARP(25); 
   }
 
-  RECORD_SECTION_WARP(10);  // DispatchSync: After barrier sync
+  RECORD_SECTION_WARP(26);  // DispatchSync: After barrier sync
 
   for (int i = globalWarpId; i < nNodes; i += globalWarpNum) {
     int proxyPe = i * config.gpuPerNode + (config.rank % config.gpuPerNode);
+    RECORD_SECTION_WARP(27); 
     shmem::ShmemQuietThread(proxyPe);
+    RECORD_SECTION_WARP(28);
   }
 
-  RECORD_SECTION_WARP(11);  // DispatchSync: After shmem quiet complete
+  RECORD_SECTION_WARP(29);  // DispatchSync: After shmem quiet complete
 }
 
 }  // namespace v1
@@ -524,7 +545,6 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 __global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
-  RECORD_SECTION_WARP(0);  // Start (reuse ID 0 with IntraNode)
   if (blockId < config.rdmaBlockNum) {
     v1::DispatchInterNodeSend<T, true>(args);
     v1::DispatchInterNodeRecv(args);
@@ -554,8 +574,6 @@ namespace v1 {
 template <typename T>
 inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
-
-  RECORD_SECTION_WARP(12);  // CombineSync: Start
 
   // Copy input to shmem registered buffer so that other GPUs can access directly
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
@@ -593,7 +611,6 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
     if (laneId == 0) args.combineGridBarrier[0] = 0;
   }
 
-  RECORD_SECTION_WARP(13);  // CombineSync: After copy to shmem
 
   // Wait other pes to set flag
   uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
@@ -603,14 +620,11 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
     }
   }
 
-  RECORD_SECTION_WARP(14);  // CombineSync: After barrier wait complete
 }
 
 template <typename T>
 inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
-
-  RECORD_SECTION_WARP(15);  // CombineIntraNode: Start (same ID as CombineInterNode start)
 
   // Distribute tokens evenly to all blocks
   int blockOffset = config.rdmaBlockNum;
@@ -651,14 +665,11 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
     }
   }
 
-  RECORD_SECTION_WARP(16);  // CombineIntraNode: After accumulation complete (same ID as CombineInterNode end)
 }
 
 template <typename T>
 inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
-
-  RECORD_SECTION_WARP(15);  // CombineInterNode: Start
 
   constexpr int numRecvBlock = 8;
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
@@ -758,14 +769,11 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
     }
   }
 
-  RECORD_SECTION_WARP(16);  // CombineInterNode: After processing and barrier complete
 }
 
 template <typename T>
 inline __device__ void CombineAll(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
-
-  RECORD_SECTION_WARP(17);  // CombineAll: Start
 
   // Wait all warps
   uint32_t finishedWarps = 0;
@@ -820,7 +828,6 @@ inline __device__ void CombineAll(EpDispatchCombineArgs<T>& args) {
     }
   }
 
-  RECORD_SECTION_WARP(18);  // CombineAll: After final accumulation complete
 }
 }  // namespace v1
 
