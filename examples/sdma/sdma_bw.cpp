@@ -417,7 +417,7 @@ int main(int argc, char** argv)
        .verbose = verbose,
    };
 
-   //runExperiment(srcGpuId, params);
+   runExperiment(srcGpuId, params);
 
    return 0;
 }
