@@ -31,11 +31,11 @@ do
             RESULT_CSV="p2p_xgmi_banwdith_${NUM_DST}dst_${QUEUES_PER_DST}queuesPerDst_${WGS_PER_QUEUE}wgsPerQ_${NUM_WAVES}waves_${NUM_COPY_COMMMANDS}copies.csv"
             #./build/bench/sdma_bw --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands $NUM_COPY_COMMMANDS --numOfQueuesPerDestination $QUEUES_PER_DST --numDestinations $NUM_DST --wgsPerQueue $WGS_PER_QUEUE --warpsPerWG $NUM_WAVES -o $OUTPUT_DIR/$RESULT_CSV  >> log.txt
             ../../build/examples/sdma_bw --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands $NUM_COPY_COMMMANDS --numOfQueuesPerDestination $QUEUES_PER_DST --numDestinations $NUM_DST --wgsPerQueue $WGS_PER_QUEUE --warpsPerWG $NUM_WAVES
-	    if [ $QUEUES_PER_DST -eq $MIN_QUEUES_PER_DST ] && [ $WGS_PER_QUEUE -eq $MIN_WG_PER_QUEUE ] && [ $NUM_WAVES -eq 1 ]; then
+	    #if [ $QUEUES_PER_DST -eq $MIN_QUEUES_PER_DST ] && [ $WGS_PER_QUEUE -eq $MIN_WG_PER_QUEUE ] && [ $NUM_WAVES -eq 1 ]; then
                 #cat $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE 
-            else
+            #else
                 #tail -n +2 $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE 
-            fi
+            #fi
         done
     done
 done
