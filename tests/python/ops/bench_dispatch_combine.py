@@ -33,7 +33,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
     def gen_test_data(self):
         return super().gen_test_data(use_max_token_num=True)
 
-    def run_once(self, op, test_data, check_result):
+    def run_once(self, op, test_data, check_result, block_num, warp_per_block):
         (
             all_rank_num_token,
             all_rank_indices,
@@ -59,8 +59,8 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             # None,
             all_rank_scales[self.config.rank],
             all_rank_indices[self.config.rank],
-            block_num=80,
-            warp_per_block=16,
+            block_num=block_num,
+            warp_per_block=warp_per_block,
         )
         end_event.record()
         self.sync()
@@ -91,8 +91,8 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             # dispatch_weights,
             None,
             dispatch_indices,
-            block_num=80,
-            warp_per_block=4,
+            block_num=block_num,
+            warp_per_block=warp_per_block,
         )
         end_event.record()
         self.sync()
@@ -122,10 +122,10 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             ll_mode_scale,
         )
 
-    def run(self, op, warmup=1, iters=10):
+    def run(self, op, block_num, warp_per_block, warmup=1, iters=10):
         test_data = self.gen_test_data()
         for _ in range(warmup):
-            self.run_once(op, test_data, True)
+            self.run_once(op, test_data, True, block_num, warp_per_block)
 
         disp_duration_us_list = []
         disp_bandwidth_GB_list = []
@@ -138,7 +138,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         for i in range(iters):
             self.sync()
             disp_dur, comb_dur, disp_bw, comb_bw, total_bytes, ll_mode_scale = (
-                self.run_once(op, test_data_list[i], False)
+                self.run_once(op, test_data_list[i], False, block_num, warp_per_block)
             )
 
             disp_dur_list = [torch.zeros(1) for _ in range(self.config.world_size)]
@@ -161,10 +161,15 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 int(torch.tensor(total_bytes_list).mean().item())
             )
 
+        # Find maximum algo_bw for dispatch and combine
+        max_disp_algo_bw = 0
+        max_comb_algo_bw = 0
+
         if self.config.rank == 0:
             print("Dispatch result:")
             for i, duration_us in enumerate(disp_duration_us_list):
                 algo_bw = sum(disp_bandwidth_GB_list[i]) / self.config.world_size
+                max_disp_algo_bw = max(max_disp_algo_bw, algo_bw)
                 bus_bw = int(  # noqa: F841
                     algo_bw * (self.config.world_size - 1) / self.config.world_size
                 )
@@ -178,6 +183,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             print("Combine result:")
             for i, duration_us in enumerate(comb_duration_us_list):
                 algo_bw = sum(comb_bandwidth_GB_list[i]) / self.config.world_size
+                max_comb_algo_bw = max(max_comb_algo_bw, algo_bw)
                 bus_bw = int(  # noqa: F841
                     algo_bw * (self.config.world_size - 1) / self.config.world_size
                 )
@@ -187,7 +193,9 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                     f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw} / {algo_bw*ll_mode_scale:.2f}"
                 )
 
-    def stress_once(self, op, test_data):
+        return max_disp_algo_bw, max_comb_algo_bw
+
+    def stress_once(self, op, test_data, block_num, warp_per_block):
         (
             all_rank_num_token,
             all_rank_indices,
@@ -208,27 +216,27 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             # None,
             all_rank_scales[self.config.rank],
             all_rank_indices[self.config.rank],
-            block_num=80,
-            warp_per_block=16,
+            block_num=block_num,
+            warp_per_block=warp_per_block,
         )
 
         combine_output, _ = op.combine(
             dispatch_output,
             None,
             dispatch_indices,
-            block_num=80,
-            warp_per_block=16,
+            block_num=block_num,
+            warp_per_block=warp_per_block,
         )
         torch.cuda.synchronize()
 
-    def stress(self, op):
+    def stress(self, op, block_num, warp_per_block):
         test_data_list = [self.gen_test_data() for i in range(5)]
         for i in range(100):
             if self.config.rank == 0:
                 print(f"Round {i} begin")
-            self.stress_once(op, test_data_list[i % 5])
+            self.stress_once(op, test_data_list[i % 5], block_num, warp_per_block)
 
-    def stress_graph(self, op):
+    def stress_graph(self, op, block_num, warp_per_block):
         test_data = self.gen_test_data()
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
@@ -252,16 +260,16 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 # None,
                 all_rank_scales[self.config.rank],
                 all_rank_indices[self.config.rank],
-                block_num=80,
-                warp_per_block=16,
+                block_num=block_num,
+                warp_per_block=warp_per_block,
             )
 
             combine_output, _ = op.combine(
                 dispatch_output,
                 None,
                 dispatch_indices,
-                block_num=80,
-                warp_per_block=16,
+                block_num=block_num,
+                warp_per_block=warp_per_block,
             )
         torch.cuda.synchronize()
         for i in range(135):
@@ -275,13 +283,14 @@ def _bench_dispatch_combine(
     rank,
     world_size,
     port,
-    max_num_inp_token_per_rank=128,
-    data_type=torch.bfloat16,
-    hidden_dim=7168,
-    scale_dim=0,
-    scale_type_size=0,
-    num_experts_per_rank=32,
-    num_experts_per_token=8,
+    max_num_inp_token_per_rank,
+    data_type,
+    hidden_dim,
+    scale_dim,
+    scale_type_size,
+    num_experts_per_rank,
+    num_experts_per_token,
+    cmd="bench",
 ):
     config = mori.ops.EpDispatchCombineConfig(
         data_type=data_type,
@@ -297,25 +306,105 @@ def _bench_dispatch_combine(
         warp_num_per_block=16,
         block_num=80,
         use_external_inp_buf=False,
+        gpu_per_node=8,
     )
     benchmark = EpDispatchCombineBenchmark(config)
 
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         mori.shmem.shmem_torch_process_group_init("default")
         op = mori.ops.EpDispatchCombineOp(config)
-        benchmark.run(op)
-        # benchmark.stress(op)
-        # benchmark.stress_graph(op)
-        # benchmark.output()
-        # mori.shmem.shmem_finalize()
+
+        if cmd == "bench":
+            # Single benchmark with default configuration
+            block_num = 80
+            warp_per_block = 16
+            if rank == 0:
+                print(f"\n{'='*60}")
+                print(f"Benchmarking with block_num={block_num}, warp_per_block={warp_per_block}")
+                print(f"{'='*60}")
+            benchmark.run(op, block_num=block_num, warp_per_block=warp_per_block)
+
+        elif cmd == "tuning":
+            # Test different block_num and warp_per_block combinations
+            block_num_list = []
+            # Option 1: Multiples of 8 (excluding powers of 2)
+            block_num_list += [24, 40, 48, 56, 72, 80]
+             # Option 2: Powers of 2 only
+            block_num_list += [2, 4, 8, 16, 32, 64]
+            # Option 3: Multiples of 10 (excluding multiples of 8)
+            block_num_list += [10, 20, 30, 50, 60, 70]
+            # Option 4: Other values
+            block_num_list += [12, 18, 26, 34, 42, 54, 66, 78]
+
+            warp_per_block_list = list(range(2, 17))
+            
+            best_disp_bw = 0
+            best_comb_bw = 0
+            best_disp_config = None
+            best_comb_config = None
+
+            for warp_per_block in warp_per_block_list:
+                for block_num in block_num_list:
+                    if rank == 0:
+                        print(f"\n{'='*60}")
+                        print(f"Testing with block_num={block_num}, warp_per_block={warp_per_block}")
+                        print(f"{'='*60}")
+
+                    disp_bw, comb_bw = benchmark.run(
+                        op, block_num=block_num, warp_per_block=warp_per_block
+                    )
+
+                    if disp_bw > best_disp_bw:
+                        best_disp_bw = disp_bw
+                        best_disp_config = (block_num, warp_per_block)
+
+                    if comb_bw > best_comb_bw:
+                        best_comb_bw = comb_bw
+                        best_comb_config = (block_num, warp_per_block)
+
+            if rank == 0:
+                print(f"\n{'='*60}")
+                print("Performance Summary:")
+                print(f"{'='*60}")
+                print(
+                    f"Best Dispatch  performance: {best_disp_bw:.2f} GB/s at block_num={best_disp_config[0]}, warp_per_block={best_disp_config[1]}"
+                )
+                print(
+                    f"Best Combine   performance: {best_comb_bw:.2f} GB/s at block_num={best_comb_config[0]}, warp_per_block={best_comb_config[1]}"
+                )
+                print(f"{'='*60}")
+
+        elif cmd == "stress":
+            # Stress test
+            block_num = 80
+            warp_per_block = 16
+            if rank == 0:
+                print(f"\n{'='*60}")
+                print(f"Stress testing with block_num={block_num}, warp_per_block={warp_per_block}")
+                print(f"{'='*60}")
+            benchmark.stress(op, block_num=block_num, warp_per_block=warp_per_block)
+            # benchmark.stress_graph(op, block_num=block_num, warp_per_block=warp_per_block)
+        else:
+            raise ValueError(f"Unknown command: {cmd}")
 
 
-def bench_dispatch_combine(max_num_inp_token_per_rank=4096, dtype=torch.bfloat16):
+def bench_dispatch_combine(max_num_inp_token_per_rank, dtype, cmd="bench"):
     world_size = 8
     port = get_free_port()
     torch.multiprocessing.spawn(
         _bench_dispatch_combine,
-        args=(world_size, port, max_num_inp_token_per_rank, dtype),
+        args=(
+            world_size,
+            port,
+            max_num_inp_token_per_rank,
+            dtype,
+            7168,  # hidden_dim
+            0,  # scale_dim
+            0,  # scale_type_size
+            32,  # num_experts_per_rank
+            8,  # num_experts_per_token
+            cmd,
+        ),
         nprocs=world_size,
         join=True,
     )
@@ -344,10 +433,21 @@ if __name__ == "__main__":
         choices=["bf16", "fp8_e4m3_fnuz", "fp8_e4m3"],
         help="Data type of dispatch / combine",
     )
+    parser.add_argument(
+        "--cmd",
+        type=str,
+        default="bench",
+        choices=["bench", "stress", "tuning"],
+        help="Available subcommands: bench (single config), stress (stress test), tuning (test multiple configs)",
+    )
     args = parser.parse_args()
 
-    print(f"Running benchmark with max_tokens_per_rank: {args.max_tokens}")
+    print(
+        f"Running {args.cmd} with max_tokens_per_rank: {args.max_tokens}, dtype: {args.dtype}"
+    )
     print("-" * 60)
     bench_dispatch_combine(
-        max_num_inp_token_per_rank=args.max_tokens, dtype=_DATA_TYPE_MAP[args.dtype]
+        max_num_inp_token_per_rank=args.max_tokens,
+        dtype=_DATA_TYPE_MAP[args.dtype],
+        cmd=args.cmd,
     )
