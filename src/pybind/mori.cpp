@@ -184,14 +184,15 @@ torch::Tensor GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle
 #ifdef ENABLE_PROFILER
 torch::Tensor GetDebugTimeBuf(mori::moe::EpDispatchCombineHandle& handle) {
   auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
-  torch::Tensor tensor = torch::from_blob(handle.debugTimeBuf, {MAX_DEBUG_TIME_SLOTS}, options);
+  torch::Tensor tensor =
+      torch::from_blob(handle.profilerConfig.debugTimeBuf, {MAX_DEBUG_TIME_SLOTS}, options);
   return tensor;
 }
 
 torch::Tensor GetDebugTimeOffset(mori::moe::EpDispatchCombineHandle& handle) {
   auto options = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
   torch::Tensor tensor =
-      torch::from_blob(handle.debugTimeOffset, {PROFILER_WARPS_PER_RANK}, options);
+      torch::from_blob(handle.profilerConfig.debugTimeOffset, {PROFILER_WARPS_PER_RANK}, options);
   return tensor;
 }
 #endif

@@ -28,8 +28,31 @@ namespace mori {
 namespace core {
 
 namespace profiler {
+#ifndef PROFILER_MASK
+#define PROFILER_MASK 0xFFFFFFFF
+#endif
+
+#ifdef ENABLE_PROFILER
 
 enum class EventType : uint8_t { BEGIN = 0, END = 1, INSTANT = 2 };
+
+struct ProfilerConfig {
+  int64_t* debugTimeBuf;
+  unsigned int* debugTimeOffset;
+};
+
+struct ProfilerContext {
+  int64_t* debugTimeBuf;
+  unsigned int* debugTimeOffset;
+  int globalWarpId;
+  int laneId;
+
+  __device__ ProfilerContext(const ProfilerConfig& cfg, int gid, int lid)
+      : debugTimeBuf(cfg.debugTimeBuf),
+        debugTimeOffset(cfg.debugTimeOffset),
+        globalWarpId(gid),
+        laneId(lid) {}
+};
 
 template <typename SlotEnum, int MaxEventsPerWarp>
 struct TraceProfiler {
@@ -40,8 +63,11 @@ struct TraceProfiler {
   int lane_id;
   int warp_id;
 
-  __device__ TraceProfiler(int64_t* warp_base_ptr, unsigned int* offset_ptr, int lid, int wid)
-      : warp_buffer(warp_base_ptr), warp_offset(offset_ptr), lane_id(lid), warp_id(wid) {}
+  __device__ TraceProfiler(const ProfilerContext& ctx)
+      : warp_buffer(ctx.debugTimeBuf),
+        warp_offset(ctx.debugTimeOffset),
+        lane_id(ctx.laneId),
+        warp_id(ctx.globalWarpId) {}
 
   __device__ inline void log(SlotEnum slot, EventType type) {
     log_with_time(slot, type, wall_clock64());
@@ -49,18 +75,14 @@ struct TraceProfiler {
 
   __device__ inline void log_with_time(SlotEnum slot, EventType type, int64_t ts) {
     if (lane_id == 0) {
-      unsigned int idx = atomicAdd(warp_offset, 2);
-      idx = idx % (MaxEventsPerWarp * 2);
+      unsigned int idx = *warp_offset;
+      *warp_offset = (idx + 2) % (MaxEventsPerWarp * 2);
       int64_t meta = ((int64_t)warp_id << 16) | ((int64_t)slot << 2) | (int)type;
       warp_buffer[idx] = ts;
       warp_buffer[idx + 1] = meta;
     }
   }
 };
-
-#ifndef PROFILER_MASK
-#define PROFILER_MASK 0xFFFFFFFF
-#endif
 
 template <bool Enabled, typename ProfilerType, typename SlotEnum>
 struct ProfilerSpan {
@@ -117,23 +139,22 @@ struct ProfilerSequential<false, ProfilerType, SlotEnum> {
   __device__ ~ProfilerSequential() {}
 };
 
-#ifndef ENABLE_PROFILER
-#define MORI_INIT_PROFILER(name, type, ...) ((void)0)
-#define MORI_DECLARE_PROFILER(name, SlotType, args, warpId, laneId) ((void)0)
-#define MORI_TRACE_SPAN(profiler, slot, tag) ((void)0)
-#define MORI_TRACE_SEQ(name, profiler, tag) ((void)0)
-#define MORI_TRACE_NEXT(name, slot) ((void)0)
-#define MORI_TRACE_INSTANT(profiler, slot, tag) ((void)0)
-#else
 #define MORI_INIT_PROFILER(name, type, ...) type name(__VA_ARGS__)
 
-#define MORI_DECLARE_PROFILER(name, SlotType, args, warpId, laneId)                              \
+#define MORI_DECLARE_PROFILER(name, SlotType, ctx)                                               \
   using __ProfilerSlotType_##name = SlotType;                                                    \
   using __ProfilerType_##name =                                                                  \
       mori::core::profiler::TraceProfiler<__ProfilerSlotType_##name, MAX_TRACE_EVENTS_PER_WARP>; \
-  size_t __profiler_base_##name = (size_t)(warpId) * MAX_DEBUG_TIMESTAMP_PER_WARP;               \
-  __ProfilerType_##name name((args).debugTimeBuf + __profiler_base_##name,                       \
-                             (args).debugTimeOffset + warpId, laneId, warpId);
+  size_t __profiler_base_##name = (size_t)(ctx.globalWarpId) * MAX_DEBUG_TIMESTAMP_PER_WARP;     \
+  mori::core::profiler::ProfilerContext __prof_ctx_##name = ctx;                                 \
+  __prof_ctx_##name.debugTimeBuf += __profiler_base_##name;                                      \
+  __prof_ctx_##name.debugTimeOffset += ctx.globalWarpId;                                         \
+  __ProfilerType_##name name(__prof_ctx_##name);
+
+#define MORI_DECLARE_PROFILER_CONTEXT(name, SlotType, CtxType, construction) \
+  using ProfilerContext = CtxType;                                           \
+  using Slot = SlotType;                                                     \
+  MORI_DECLARE_PROFILER(name, SlotType, construction)
 
 #define MORI_TRACE_SPAN(profiler, slot, tag)                                                      \
   mori::core::profiler::ProfilerSpan<((tag) & PROFILER_MASK), decltype(profiler), decltype(slot)> \
@@ -152,6 +173,15 @@ struct ProfilerSequential<false, ProfilerType, SlotEnum> {
       profiler.log(slot, mori::core::profiler::EventType::INSTANT); \
     }                                                               \
   } while (0)
+#else
+#define MORI_INIT_PROFILER(name, type, ...) ((void)0)
+#define MORI_DECLARE_PROFILER(name, SlotType, ctx) ((void)0)
+#define MORI_DECLARE_PROFILER_CONTEXT(name, SlotType, CtxType, construction) ((void)0)
+#define MORI_TRACE_SPAN(profiler, slot, tag) ((void)0)
+#define MORI_TRACE_SEQ(name, profiler, tag) ((void)0)
+#define MORI_TRACE_NEXT(name, slot) ((void)0)
+#define MORI_TRACE_INSTANT(profiler, slot, tag) ((void)0)
+
 #endif
 
 }  // namespace profiler

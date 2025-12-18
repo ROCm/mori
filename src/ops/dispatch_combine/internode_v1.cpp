@@ -62,8 +62,9 @@ namespace moe {
   size_t scaleBytes = (args.config.scaleDim == 0) ? 0 : config.scaleDim * config.scaleTypeSize;  \
   size_t xferBytes = hiddenBytes + indexBytes + weightBytes + srcTokenIdBytes + scaleBytes;      \
   size_t combXferBytes = (args.weightsBuf == nullptr) ? hiddenBytes : hiddenBytes + weightBytes; \
-  using Slot = mori::moe::v1::InterNodeSlot;                                                     \
-  MORI_DECLARE_PROFILER(profiler, Slot, args, globalWarpId, laneId)
+  MORI_DECLARE_PROFILER_CONTEXT(profiler, mori::moe::v1::InterNodeSlot,                          \
+                                mori::core::profiler::ProfilerContext,                           \
+                                ProfilerContext(args.profilerConfig, globalWarpId, laneId))
 
 namespace v1 {
 template <typename T>

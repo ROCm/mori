@@ -30,6 +30,7 @@
 
 #include "mori/application/application.hpp"
 #include "mori/core/profiler/constants.hpp"
+#include "mori/core/profiler/kernel_profiler.hpp"
 #include "mori/utils/data_types.hpp"
 
 namespace mori {
@@ -250,10 +251,7 @@ class EpDispatchCombineHandle {
   // Map dispatched rdma token chunk index
   index_t* interNodeDispSendMap{nullptr};
 #ifdef ENABLE_PROFILER
-  // Debug buffer for latency profiling
-  int64_t* debugTimeBuf{nullptr};
-  // Per-warp offset counters for profiling
-  unsigned int* debugTimeOffset{nullptr};
+  mori::core::profiler::ProfilerConfig profilerConfig;
 #endif
 };
 
@@ -305,8 +303,7 @@ struct EpDispatchCombineArgs {
   index_t* interNodeChunkFlagCombine{nullptr};
   index_t* interNodeDispSendMap{nullptr};
 #ifdef ENABLE_PROFILER
-  int64_t* debugTimeBuf{nullptr};
-  unsigned int* debugTimeOffset{nullptr};
+  mori::core::profiler::ProfilerConfig profilerConfig;
 #endif
 };
 
@@ -370,8 +367,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.interNodeChunkFlagCombine = handle.interNodeChunkFlagCombine;
   args.interNodeDispSendMap = handle.interNodeDispSendMap;
 #ifdef ENABLE_PROFILER
-  args.debugTimeBuf = handle.debugTimeBuf;
-  args.debugTimeOffset = handle.debugTimeOffset;
+  args.profilerConfig = handle.profilerConfig;
 #endif
   return args;
 }
