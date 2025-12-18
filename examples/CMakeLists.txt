@@ -1,4 +1,4 @@
-add_executable(sdma_bw sdma/sdma.cpp utils/args_parser.cpp)
+add_executable(sdma_bw sdma/sdma_bw.cpp utils/args_parser.cpp)
 target_include_directories(sdma_bw PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
 target_link_libraries(sdma_bw mori_application hip::host hip::device)
 
