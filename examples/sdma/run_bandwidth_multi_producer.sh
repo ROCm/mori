@@ -2,7 +2,7 @@
 
 # Ranging copy size from 1KB (2^10) to 1GB (2^30)
 MIN_COPY_SIZE=$((1<<10))
-MAX_COPY_SIZE=$((1<<20))
+MAX_COPY_SIZE=$((1<<22))
 NUM_COPY_COMMMANDS=100
 
 MIN_QUEUES_PER_DST=1
@@ -28,6 +28,8 @@ do
     do
         for (( NUM_WAVES=1; NUM_WAVES<=1; NUM_WAVES*=2 ))
         do
+            echo "==== The GPU nums of destination is $NUM_DST ===="
+            echo "==== queues_per_dst:$QUEUES_PER_DST wgs_per_queue:$WGS_PER_QUEUE warps_per_wg:$NUM_WAVES ===="		
             RESULT_CSV="p2p_xgmi_banwdith_${NUM_DST}dst_${QUEUES_PER_DST}queuesPerDst_${WGS_PER_QUEUE}wgsPerQ_${NUM_WAVES}waves_${NUM_COPY_COMMMANDS}copies.csv"
             #./build/bench/sdma_bw --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands $NUM_COPY_COMMMANDS --numOfQueuesPerDestination $QUEUES_PER_DST --numDestinations $NUM_DST --wgsPerQueue $WGS_PER_QUEUE --warpsPerWG $NUM_WAVES -o $OUTPUT_DIR/$RESULT_CSV  >> log.txt
             ../../build/examples/sdma_bw --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands $NUM_COPY_COMMMANDS --numOfQueuesPerDestination $QUEUES_PER_DST --numDestinations $NUM_DST --wgsPerQueue $WGS_PER_QUEUE --warpsPerWG $NUM_WAVES
