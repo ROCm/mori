@@ -50,7 +50,7 @@ target_link_libraries(
   pci
   mori_logging
   hsa-runtime64
-  hsakmt)
+  hsakmt::hsakmt)
 #  ${IONIC_LIBRARY})
 
 if(USE_BNXT)
