@@ -1,5 +1,6 @@
 find_package(MPI REQUIRED)
 find_package(hsa-runtime64 REQUIRED)
+find_package(hsakmt REQUIRED)
 #find_library(IONIC_LIBRARY 
 #  NAMES ionic 
 #  HINTS /lib/x86_64-linux-gnu
@@ -48,7 +49,8 @@ target_link_libraries(
   rocm_smi64
   pci
   mori_logging
-  hsa-runtime64)
+  hsa-runtime64
+  hsakmt)
 #  ${IONIC_LIBRARY})
 
 if(USE_BNXT)
