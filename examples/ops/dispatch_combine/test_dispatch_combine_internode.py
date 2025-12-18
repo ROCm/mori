@@ -633,12 +633,12 @@ class EpDispatchCombineTestCase:
             total_bytes / (1000**3) / (t / (10**3)) for t in comb_duration_list
         ]
 
-        if hasattr(mori.cpp, "CombineInterSlots"):
+        if hasattr(mori.cpp, "get_debug_time_buf"):
             output_filename = (
                 f"trace_rank_{self.rank}_{time.strftime('%m%d_%H%M%S')}.json"
             )
             mori.kernel_profiler.export_to_perfetto(
-                my_times, mori.cpp.CombineInterSlots, output_filename, gpu_freq_ghz=1.7
+                my_times, output_filename, gpu_freq_ghz=1.7
             )
             if self.rank == 0:
                 print(f"Profiling data exported to {output_filename}")

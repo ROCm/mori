@@ -107,14 +107,50 @@ def _sanitize_events(raw_events, drop_orphan_ends=True, drop_orphan_begins=True)
     return filtered
 
 
+def _discover_all_slots():
+    """Auto-discover all profiler slot enums from mori.cpp module."""
+    try:
+        import mori.cpp as cpp
+    except ImportError:
+        warnings.warn(
+            "Cannot import mori.cpp for auto-discovery. Please provide slot_map explicitly."
+        )
+        return {}
+
+    if hasattr(cpp, "ALL_PROFILER_SLOTS"):
+        return cpp.ALL_PROFILER_SLOTS
+
+    all_slots = {}
+    for attr_name in dir(cpp):
+        if attr_name.endswith("Slots") and not attr_name.startswith("_"):
+            try:
+                enum_class = getattr(cpp, attr_name)
+                for name in dir(enum_class):
+                    if not name.startswith("_"):
+                        value = getattr(enum_class, name)
+                        if isinstance(value, int):
+                            all_slots[value] = name
+            except (AttributeError, TypeError):
+                continue
+
+    return all_slots
+
+
 def export_to_perfetto(
     trace_buffer,
-    slot_map,
-    filename,
+    filename="trace.json",
+    slot_map=None,
     gpu_freq_ghz=1.7,
     validate_pairs=True,
     sanitize_orphans=True,
 ):
+    if slot_map is None:
+        slot_map = _discover_all_slots()
+        if not slot_map:
+            warnings.warn(
+                "No profiler slots discovered. Trace will use generic slot names like 'Unknown_Slot_N'."
+            )
+
     if not isinstance(slot_map, dict):
         id_to_name = {}
         for name in dir(slot_map):

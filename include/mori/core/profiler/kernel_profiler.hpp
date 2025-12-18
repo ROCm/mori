@@ -24,6 +24,12 @@
 
 #include <hip/hip_runtime.h>
 
+#ifdef ENABLE_PROFILER
+#define IF_ENABLE_PROFILER(x) x
+#else
+#define IF_ENABLE_PROFILER(x) ((void)0)
+#endif
+
 namespace mori {
 namespace core {
 

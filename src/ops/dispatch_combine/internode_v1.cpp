@@ -23,11 +23,13 @@
 #include "src/ops/dispatch_combine/internode_v1.hpp"
 
 #include "mori/core/core.hpp"
+#include "mori/ops/dispatch_combine/dispatch_combine.hpp"
+#include "mori/shmem/shmem.hpp"
+#ifdef ENABLE_PROFILER
 #include "mori/core/profiler/constants.hpp"
 #include "mori/core/profiler/kernel_profiler.hpp"
-#include "mori/ops/dispatch_combine/dispatch_combine.hpp"
-#include "mori/ops/dispatch_combine/internode_profile.hpp"
-#include "mori/shmem/shmem.hpp"
+#include "mori/profiler/profiler.hpp"
+#endif
 
 namespace mori {
 namespace moe {
@@ -62,9 +64,8 @@ namespace moe {
   size_t scaleBytes = (args.config.scaleDim == 0) ? 0 : config.scaleDim * config.scaleTypeSize;  \
   size_t xferBytes = hiddenBytes + indexBytes + weightBytes + srcTokenIdBytes + scaleBytes;      \
   size_t combXferBytes = (args.weightsBuf == nullptr) ? hiddenBytes : hiddenBytes + weightBytes; \
-  MORI_DECLARE_PROFILER_CONTEXT(profiler, mori::moe::v1::InterNodeSlot,                          \
-                                mori::core::profiler::ProfilerContext,                           \
-                                ProfilerContext(args.profilerConfig, globalWarpId, laneId))
+  IF_ENABLE_PROFILER(                                                                            \
+      INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId))
 
 namespace v1 {
 template <typename T>
