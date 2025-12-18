@@ -26,6 +26,7 @@ add_library(
   transport/rdma/providers/ionic/ionic.cpp
   transport/rdma/providers/ibverbs/ibverbs.cpp
   transport/tcp/tcp.cpp
+  transport/sdma/anvil.cpp
   memory/symmetric_memory.cpp
   memory/memory_region.cpp
   context/context.cpp
