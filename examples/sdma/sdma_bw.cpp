@@ -360,43 +360,43 @@ int main(int argc, char** argv)
 
    const int srcGpuId = 6;
 
-   //CLI::App app("Shader-initiated SDMA");
+   CLI::App app("Shader-initiated SDMA");
    size_t minCopySize{0};
-   //app.add_option("-b,--minCopySize", minCopySize, "Minimum Transfer Size [B] (per copy command)");
+   app.add_option("-b,--minCopySize", minCopySize, "Minimum Transfer Size [B] (per copy command)");
    size_t maxCopySize{0};
-   //app.add_option("-e,--maxCopySize", maxCopySize, "Maximum Transfer Size [B] (per copy command)");
+   app.add_option("-e,--maxCopySize", maxCopySize, "Maximum Transfer Size [B] (per copy command)");
    size_t numCopyCommands{0};
-   //app.add_option("-c,--numCopyCommands", numCopyCommands, "Number of copy commands (per warp)");
+   app.add_option("-c,--numCopyCommands", numCopyCommands, "Number of copy commands (per warp)");
 
    bool skipVerification{false};
-   //app.add_flag("--skip-verification", skipVerification, "Skip verification");
+   app.add_flag("--skip-verification", skipVerification, "Skip verification");
 
    size_t nWarmupIterations{3};
-   //app.add_option("-w,--warmup", nWarmupIterations, "Number of warmup iterations");
+   app.add_option("-w,--warmup", nWarmupIterations, "Number of warmup iterations");
 
    size_t numIterations{50};
-   //app.add_option("-n,--iterations", numIterations, "Number of iterations");
+   app.add_option("-n,--iterations", numIterations, "Number of iterations");
 
    size_t numDestinations{1};
-   //app.add_option("-d,--numDestinations", numDestinations, "Number of destination GPUs");
+   app.add_option("-d,--numDestinations", numDestinations, "Number of destination GPUs");
 
    size_t numOfQueues{1};
-   //app.add_option("--numOfQueuesPerDestination", numOfQueues,
-   //               "Number of queues per destination, corresponds to number of workgroups/threadblocks");
+   app.add_option("--numOfQueuesPerDestination", numOfQueues,
+                  "Number of queues per destination, corresponds to number of workgroups/threadblocks");
 
    size_t numOfWarpsPerWG{1};
-   //app.add_option("--warpsPerWG", numOfWarpsPerWG, "Number of warps shared the same queue resources");
+   app.add_option("--warpsPerWG", numOfWarpsPerWG, "Number of warps shared the same queue resources");
 
    size_t numOfWGPerQueue{1};
-   //app.add_option("--wgsPerQueue", numOfWGPerQueue, "Number of workgroups shared the same queue resources");
+   app.add_option("--wgsPerQueue", numOfWGPerQueue, "Number of workgroups shared the same queue resources");
 
    std::string resultFileName = "MultiQueueGPU2GPU_Performance.csv";
-   //app.add_option("-o,--outputFile", resultFileName, "Filename for result");
+   app.add_option("-o,--outputFile", resultFileName, "Filename for result");
 
    bool verbose{false};
-   //app.add_flag("-v, --verbose", verbose, "verbose output");
+   app.add_flag("-v, --verbose", verbose, "verbose output");
 
-   //CLI11_PARSE(app, argc, argv);
+   CLI11_PARSE(app, argc, argv);
 
    std::cout << "==== Running shader_bw doing " << numCopyCommands << " copies of size " << minCopySize << " to "
              << maxCopySize << " ====" << std::endl;
