@@ -32,9 +32,9 @@ do
             #./build/bench/sdma_bw --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands $NUM_COPY_COMMMANDS --numOfQueuesPerDestination $QUEUES_PER_DST --numDestinations $NUM_DST --wgsPerQueue $WGS_PER_QUEUE --warpsPerWG $NUM_WAVES -o $OUTPUT_DIR/$RESULT_CSV  >> log.txt
             ../../build/examples/sdma_bw --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands $NUM_COPY_COMMMANDS --numOfQueuesPerDestination $QUEUES_PER_DST --numDestinations $NUM_DST --wgsPerQueue $WGS_PER_QUEUE --warpsPerWG $NUM_WAVES
 	    if [ $QUEUES_PER_DST -eq $MIN_QUEUES_PER_DST ] && [ $WGS_PER_QUEUE -eq $MIN_WG_PER_QUEUE ] && [ $NUM_WAVES -eq 1 ]; then
-                cat $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE 
+                #cat $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE 
             else
-                tail -n +2 $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE 
+                #tail -n +2 $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE 
             fi
         done
     done

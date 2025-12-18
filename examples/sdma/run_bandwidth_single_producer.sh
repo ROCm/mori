@@ -19,8 +19,8 @@ do
     #./build/bench/sdma_bw --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands 1 --numDestinations $NUM_DST -o $OUTPUT_DIR/$RESULT_CSV  >> log.txt
     ../../build/examples/sdma_bw --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands 1 --numDestinations $NUM_DST
     if [ $NUM_DST -eq 1 ]; then
-        cat $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE 
+        #cat $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE 
     else
-        tail -n +2 $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE 
+        #tail -n +2 $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE 
     fi
 done
