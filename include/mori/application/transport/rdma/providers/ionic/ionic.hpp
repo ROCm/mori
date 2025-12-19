@@ -25,9 +25,9 @@
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
 
+#include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/core/transport/rdma/providers/ionic/ionic_dv.h"
 #include "mori/core/transport/rdma/providers/ionic/ionic_fw.h"
-#include "mori/application/transport/rdma/rdma.hpp"
 
 namespace mori {
 namespace application {
@@ -73,12 +73,13 @@ typedef struct device_agent {
 
 class IonicQpContainer {
  public:
-  IonicQpContainer(ibv_context* context, const RdmaEndpointConfig& config,
-                   ibv_cq* cq, ibv_pd* pd, IonicDeviceContext* device_context);
+  IonicQpContainer(ibv_context* context, const RdmaEndpointConfig& config, ibv_cq* cq, ibv_pd* pd,
+                   IonicDeviceContext* device_context);
   ~IonicQpContainer();
 
   void ModifyRst2Init();
-  void ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr,
+  void ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
+                      const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr,
                       uint32_t qpn = 0);
   void ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
                      const RdmaEndpointHandle& remote_handle);
@@ -107,28 +108,28 @@ class IonicQpContainer {
   ionic_dv_ctx dvctx;
   ibv_qp* qp{nullptr};
   void* gpu_db_page{nullptr};
-  uint64_t *db_page_u64{nullptr};
-  uint64_t *gpu_db_page_u64{nullptr};
-  uint64_t *gpu_db_ptr{nullptr};
-  uint64_t *gpu_db_cq{nullptr};
-  uint64_t *gpu_db_sq{nullptr};
-  uint64_t *gpu_db_rq{nullptr};
+  uint64_t* db_page_u64{nullptr};
+  uint64_t* gpu_db_page_u64{nullptr};
+  uint64_t* gpu_db_ptr{nullptr};
+  uint64_t* gpu_db_cq{nullptr};
+  uint64_t* gpu_db_sq{nullptr};
+  uint64_t* gpu_db_rq{nullptr};
 
   ionic_dv_cq dvcq;
-  uint64_t *cq_dbreg{nullptr};
+  uint64_t* cq_dbreg{nullptr};
   uint64_t cq_dbval{0};
   uint64_t cq_mask{0};
-  struct ionic_v1_cqe *ionic_cq_buf{nullptr};
+  struct ionic_v1_cqe* ionic_cq_buf{nullptr};
   ionic_dv_qp dvqp;
-  uint64_t *sq_dbreg{nullptr};
+  uint64_t* sq_dbreg{nullptr};
   uint64_t sq_dbval{0};
   uint64_t sq_mask{0};
-  struct ionic_v1_wqe *ionic_sq_buf{nullptr};
+  struct ionic_v1_wqe* ionic_sq_buf{nullptr};
 
-  uint64_t *rq_dbreg{nullptr};
+  uint64_t* rq_dbreg{nullptr};
   uint64_t rq_dbval{0};
   uint64_t rq_mask{0};
-  struct ionic_v1_wqe *ionic_rq_buf{nullptr};
+  struct ionic_v1_wqe* ionic_rq_buf{nullptr};
 
   // Atomic internal buffer fields
   void* atomicIbufAddr{nullptr};
@@ -145,16 +146,16 @@ class IonicDeviceContext : public RdmaDeviceContext {
   ~IonicDeviceContext();
 
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) override;
-  virtual void ConnectEndpoint(const RdmaEndpointHandle& local,
-                               const RdmaEndpointHandle& remote, uint32_t qpn = 0) override;
+  virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote,
+                               uint32_t qpn = 0) override;
   static void pd_release(ibv_pd* pd, void* pd_context, void* ptr, uint64_t resource_type);
-  static void* pd_alloc_device_uncached(ibv_pd* pd, void* pd_context, size_t size,
-                                        size_t alignment, uint64_t resource_type);
-  void create_parent_domain(ibv_context* context, struct ibv_pd *pd_orig);
+  static void* pd_alloc_device_uncached(ibv_pd* pd, void* pd_context, size_t size, size_t alignment,
+                                        uint64_t resource_type);
+  void create_parent_domain(ibv_context* context, struct ibv_pd* pd_orig);
 
  private:
   uint32_t pdn;
-  struct ibv_pd *pd_uxdma[2];
+  struct ibv_pd* pd_uxdma[2];
 
   std::unordered_map<uint32_t, IonicCqContainer*> cqPool;
   std::unordered_map<uint32_t, IonicQpContainer*> qpPool;
@@ -165,7 +166,7 @@ class IonicDevice : public RdmaDevice {
   IonicDevice(ibv_device* device);
   ~IonicDevice();
 
- RdmaDeviceContext* CreateRdmaDeviceContext() override;
+  RdmaDeviceContext* CreateRdmaDeviceContext() override;
 };
 #endif
 }  // namespace application
