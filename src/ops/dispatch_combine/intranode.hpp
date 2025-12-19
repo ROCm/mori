@@ -25,6 +25,8 @@
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 #include "mori/shmem/shmem.hpp"
 
+#define MORI_P2P_READ 0
+
 namespace mori {
 namespace moe {
 
@@ -213,6 +215,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   size_t maxNumTokensToSend = config.MaxNumTokensToSend();
   // Copy input to shmem registered buffer so that other GPUs can access directly
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
+#if MORI_P2P_READ == 1
   if (args.config.useExternalInpBuffer) {
     for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
       core::WarpCopy(args.shmemCombineInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
@@ -227,6 +230,25 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
           args.weightsBuf + i * config.numExpertPerToken, config.numExpertPerToken);
     }
   }
+#else
+  const size_t hiddenBytes = config.hiddenDim * sizeof(T);
+  const size_t weightBytes = (args.weightsBuf == nullptr) ? config.numExpertPerToken * sizeof(float) : 0;
+  const size_t combXferBytes = hiddenBytes + weightBytes;
+  for (int tokenIdx = globalWarpId; tokenIdx < totalRecvTokenNum; tokenIdx += globalWarpNum) {
+    index_t destTokId = args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe)[tokenIdx];
+    index_t destPe = destTokId / config.MaxNumTokensToRecvPerRank();
+    index_t destLocalTokId = destTokId - destPe * config.MaxNumTokensToRecvPerRank();
+    uint8_t* destStagingPtr = args.shmemCombineInpTokMemObj->template GetAs<uint8_t*>(destPe) +
+                              (myPe * config.MaxNumTokensToRecvPerRank() + destLocalTokId) * combXferBytes;
+    core::WarpCopy(reinterpret_cast<T*>(destStagingPtr),
+                   args.inpTokenBuf + tokenIdx * config.hiddenDim, config.hiddenDim);
+    if (args.weightsBuf) {
+      core::WarpCopy(
+          reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
+          args.weightsBuf + tokenIdx * config.numExpertPerToken, config.numExpertPerToken);
+    }
+  }
+#endif
 
   // Make sure copy on all GPUs are finished
   CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
@@ -255,11 +277,21 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       index_t destPe = destTokId / maxNumTokensToSend;
 
       if (destPe < config.worldSize) {
+#if MORI_P2P_READ == 1
         index_t destLocalTokId = destTokId - destPe * maxNumTokensToSend;
         srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
                      destLocalTokId * config.hiddenDim + hiddenDimOffset;
         srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                            destLocalTokId * config.numExpertPerToken;
+#else
+        srcPtrs[j] = reinterpret_cast<T*>(
+            args.shmemCombineInpTokMemObj->template GetAs<uint8_t*>(myPe) +
+            (destPe * config.MaxNumTokensToRecvPerRank() + tokenId) * combXferBytes) + hiddenDimOffset;
+        srcWeightsPtr[j] = reinterpret_cast<float*>(
+            args.shmemCombineInpTokMemObj->template GetAs<uint8_t*>(myPe) +
+            (destPe * config.MaxNumTokensToRecvPerRank() + tokenId) * combXferBytes +
+            hiddenBytes);
+#endif
       } else {
         srcPtrs[j] = nullptr;
         srcWeightsPtr[j] = nullptr;
