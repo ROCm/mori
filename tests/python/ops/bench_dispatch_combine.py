@@ -33,7 +33,16 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
     def gen_test_data(self):
         return super().gen_test_data(use_max_token_num=True)
 
-    def run_once(self, op, test_data, check_result, dispatch_block_num, dispatch_warp_per_block, combine_block_num, combine_warp_per_block):
+    def run_once(
+        self,
+        op,
+        test_data,
+        check_result,
+        dispatch_block_num,
+        dispatch_warp_per_block,
+        combine_block_num,
+        combine_warp_per_block,
+    ):
         (
             all_rank_num_token,
             all_rank_indices,
@@ -80,7 +89,9 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         total_recv_num_token = dispatch_recv_num_token[0].item()
 
         if not self.config.use_external_inp_buf:
-            combine_input = op.get_registered_combine_input_buffer(self.config.data_type)
+            combine_input = op.get_registered_combine_input_buffer(
+                self.config.data_type
+            )
             combine_input[:total_recv_num_token, :].copy_(
                 dispatch_output[:total_recv_num_token, :]
             )
@@ -221,7 +232,15 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
 
         return max_disp_algo_bw, max_comb_algo_bw
 
-    def stress_once(self, op, test_data, dispatch_block_num, dispatch_warp_per_block, combine_block_num, combine_warp_per_block):
+    def stress_once(
+        self,
+        op,
+        test_data,
+        dispatch_block_num,
+        dispatch_warp_per_block,
+        combine_block_num,
+        combine_warp_per_block,
+    ):
         (
             all_rank_num_token,
             all_rank_indices,
@@ -255,14 +274,35 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         )
         torch.cuda.synchronize()
 
-    def stress(self, op, dispatch_block_num, dispatch_warp_per_block, combine_block_num, combine_warp_per_block):
+    def stress(
+        self,
+        op,
+        dispatch_block_num,
+        dispatch_warp_per_block,
+        combine_block_num,
+        combine_warp_per_block,
+    ):
         test_data_list = [self.gen_test_data() for i in range(5)]
         for i in range(100):
             if self.config.rank == 0:
                 print(f"Round {i} begin")
-            self.stress_once(op, test_data_list[i % 5], dispatch_block_num, dispatch_warp_per_block, combine_block_num, combine_warp_per_block)
+            self.stress_once(
+                op,
+                test_data_list[i % 5],
+                dispatch_block_num,
+                dispatch_warp_per_block,
+                combine_block_num,
+                combine_warp_per_block,
+            )
 
-    def stress_graph(self, op, dispatch_block_num, dispatch_warp_per_block, combine_block_num, combine_warp_per_block):
+    def stress_graph(
+        self,
+        op,
+        dispatch_block_num,
+        dispatch_warp_per_block,
+        combine_block_num,
+        combine_warp_per_block,
+    ):
         test_data = self.gen_test_data()
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
@@ -317,6 +357,7 @@ def _bench_dispatch_combine(
     num_experts_per_rank,
     num_experts_per_token,
     cmd="bench",
+    zero_copy=1,
 ):
     config = mori.ops.EpDispatchCombineConfig(
         data_type=data_type,
@@ -331,7 +372,7 @@ def _bench_dispatch_combine(
         num_experts_per_token=num_experts_per_token,
         warp_num_per_block=16,
         block_num=80,
-        use_external_inp_buf=True,
+        use_external_inp_buf=not zero_copy,  # zero-copy mode requires use_external_inp_buf=False
         gpu_per_node=8,
     )
     benchmark = EpDispatchCombineBenchmark(config)
@@ -340,12 +381,27 @@ def _bench_dispatch_combine(
         mori.shmem.shmem_torch_process_group_init("default")
         op = mori.ops.EpDispatchCombineOp(config)
 
-        if cmd == "bench":
-            # Single benchmark with default configuration
+        # High bandwidth configuration
+        if max_num_inp_token_per_rank > 1024:
             dispatch_block_num = 80
             dispatch_warp_per_block = 16
-            combine_block_num = 80
-            combine_warp_per_block = 4
+            if config.use_external_inp_buf == False:  # zero-copy
+                combine_block_num = 80
+                combine_warp_per_block = 4
+            else:
+                combine_block_num = 80
+                combine_warp_per_block = 16
+        else:  # Low latency configuration
+            dispatch_block_num = 64
+            dispatch_warp_per_block = 16
+            if config.use_external_inp_buf == False:  # zero-copy
+                combine_block_num = 64
+                combine_warp_per_block = 4
+            else:
+                combine_block_num = 64
+                combine_warp_per_block = 16
+
+        if cmd == "bench":
             if rank == 0:
                 print(f"\n{'='*60}")
                 print(
@@ -359,6 +415,29 @@ def _bench_dispatch_combine(
                 combine_block_num=combine_block_num,
                 combine_warp_per_block=combine_warp_per_block,
             )
+
+        elif cmd == "stress":
+            # Stress test
+            if rank == 0:
+                print(f"\n{'='*60}")
+                print(
+                    f"Stress testing with dispatch_block_num={dispatch_block_num}, dispatch_warp_per_block={dispatch_warp_per_block} combine_block_num={combine_block_num}, combine_warp_per_block={combine_warp_per_block}"
+                )
+                print(f"{'='*60}")
+            benchmark.stress(
+                op,
+                dispatch_block_num=dispatch_block_num,
+                dispatch_warp_per_block=dispatch_warp_per_block,
+                combine_block_num=combine_block_num,
+                combine_warp_per_block=combine_warp_per_block,
+            )
+            # benchmark.stress_graph(
+            #     op,
+            #     dispatch_block_num=dispatch_block_num,
+            #     dispatch_warp_per_block=dispatch_warp_per_block,
+            #     combine_block_num=combine_block_num,
+            #     combine_warp_per_block=combine_warp_per_block,
+            # )
 
         elif cmd == "tuning":
             # Test different block_num and warp_per_block combinations
@@ -378,11 +457,13 @@ def _bench_dispatch_combine(
             best_disp_config = None
             best_comb_config = None
 
-            for warp_per_block in warp_per_block_list:
-                for block_num in block_num_list:
+            for block_num in block_num_list:
+                for warp_per_block in warp_per_block_list:
                     if rank == 0:
                         print(f"\n{'='*60}")
-                        print(f"Testing with block_num={block_num}, warp_per_block={warp_per_block}")
+                        print(
+                            f"Testing with block_num={block_num}, warp_per_block={warp_per_block}"
+                        )
                         print(f"{'='*60}")
 
                     disp_bw, comb_bw = benchmark.run(
@@ -413,37 +494,11 @@ def _bench_dispatch_combine(
                 )
                 print(f"{'='*60}")
 
-        elif cmd == "stress":
-            # Stress test
-            dispatch_block_num = 80
-            dispatch_warp_per_block = 16
-            combine_block_num = 80
-            combine_warp_per_block = 4
-            if rank == 0:
-                print(f"\n{'='*60}")
-                print(
-                    f"Stress testing with dispatch_block_num={dispatch_block_num}, dispatch_warp_per_block={dispatch_warp_per_block} combine_block_num={combine_block_num}, combine_warp_per_block={combine_warp_per_block}"
-                )
-                print(f"{'='*60}")
-            benchmark.stress(
-                op,
-                dispatch_block_num=dispatch_block_num,
-                dispatch_warp_per_block=dispatch_warp_per_block,
-                combine_block_num=combine_block_num,
-                combine_warp_per_block=combine_warp_per_block,
-            )
-            # benchmark.stress_graph(
-            #     op,
-            #     dispatch_block_num=dispatch_block_num,
-            #     dispatch_warp_per_block=dispatch_warp_per_block,
-            #     combine_block_num=combine_block_num,
-            #     combine_warp_per_block=combine_warp_per_block,
-            # )
         else:
             raise ValueError(f"Unknown command: {cmd}")
 
 
-def bench_dispatch_combine(max_num_inp_token_per_rank, dtype, cmd="bench"):
+def bench_dispatch_combine(max_num_inp_token_per_rank, dtype, cmd="bench", zero_copy=1):
     world_size = 8
     port = get_free_port()
     torch.multiprocessing.spawn(
@@ -459,6 +514,7 @@ def bench_dispatch_combine(max_num_inp_token_per_rank, dtype, cmd="bench"):
             32,  # num_experts_per_rank
             8,  # num_experts_per_token
             cmd,
+            zero_copy,
         ),
         nprocs=world_size,
         join=True,
@@ -495,14 +551,22 @@ if __name__ == "__main__":
         choices=["bench", "stress", "tuning"],
         help="Available subcommands: bench (single config), stress (stress test), tuning (test multiple configs)",
     )
+    parser.add_argument(
+        "--zero-copy",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="Enable zero-copy mode: 1 (default, enabled) or 0 (disabled). When enabled, sets use_external_inp_buf=False",
+    )
     args = parser.parse_args()
 
     print(
-        f"Running {args.cmd} with max_tokens_per_rank: {args.max_tokens}, dtype: {args.dtype}"
+        f"Running {args.cmd} with max_tokens_per_rank: {args.max_tokens}, dtype: {args.dtype}, zero_copy: {'true' if args.zero_copy else 'false'}"
     )
     print("-" * 60)
     bench_dispatch_combine(
         max_num_inp_token_per_rank=args.max_tokens,
         dtype=_DATA_TYPE_MAP[args.dtype],
         cmd=args.cmd,
+        zero_copy=args.zero_copy,
     )
