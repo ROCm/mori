@@ -18,7 +18,7 @@ do
     echo "==== The GPU nums of destination is $NUM_DST ===="	
     RESULT_CSV="p2p_xgmi_bandwidth_${NUM_DST}dst.csv"
     #./build/bench/sdma_bw --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands 1 --numDestinations $NUM_DST -o $OUTPUT_DIR/$RESULT_CSV  >> log.txt
-    ../../build/examples/sdma_bw --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands 1 --numDestinations $NUM_DST
+    ./build/examples/sdma_bw --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands 1 --numDestinations $NUM_DST
     #if [ $NUM_DST -eq 1 ]; then
         #cat $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE 
     #else
