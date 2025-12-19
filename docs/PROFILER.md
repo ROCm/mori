@@ -51,7 +51,7 @@ __global__ void MyKernelLaunch(MyKernelArgs<T> args) {
   //   4. laneId - lane ID within warp
 
   // Now you can use profiler in trace macros
-  MORI_TRACE_SPAN(profiler, Slot::KernelMain, PROFILER_TAG_ALL);
+  MORI_TRACE_SPAN(profiler, Slot::KernelMain);
   // ... kernel code ...
 }
 ```
@@ -66,7 +66,7 @@ Use the `MORI_TRACE_*` macros to instrument your code. The slot names (e.g., `Sl
 Records `BEGIN` when created and `END` when it goes out of scope.
 ```cpp
 {
-  MORI_TRACE_SPAN(profiler, Slot::Compute, PROFILER_TAG_ALL);
+  MORI_TRACE_SPAN(profiler, Slot::Compute);
   // ... compute intensive code ...
 } // END event logged here
 ```
@@ -74,7 +74,7 @@ Records `BEGIN` when created and `END` when it goes out of scope.
 **Sequential Phases:**
 Useful for loops or state machines where one phase immediately follows another.
 ```cpp
-MORI_TRACE_SEQ(seq, profiler, PROFILER_TAG_ALL);
+MORI_TRACE_SEQ(seq, profiler);
 
 MORI_TRACE_NEXT(seq, Slot::Phase1);
 // ... phase 1 code ...
@@ -87,7 +87,7 @@ MORI_TRACE_NEXT(seq, Slot::Phase2);
 **Instant Events:**
 Log a single point in time.
 ```cpp
-MORI_TRACE_INSTANT(profiler, Slot::Checkpoint, PROFILER_TAG_ALL);
+MORI_TRACE_INSTANT(profiler, Slot::Checkpoint);
 ```
 
 **Note on Slot Names**: You do not need to define `Slot::Compute` manually. The build system's code generator will find `Slot::Compute` in your usage and generate the enum for you.
@@ -137,5 +137,4 @@ The first option is recommended as it automatically discovers all profiler slots
 ## Best Practices
 
 -   **Minimize Scope**: Keep profiled regions granular but not too small (overhead vs visibility).
--   **Tagging**: Use `PROFILER_TAG_ALL` for default tracing. You can define custom masks to enable/disable specific traces at runtime.
 -   **Conditional Compilation**: The `ENABLE_PROFILER` macro controls whether profiling code is compiled. In production builds, this is typically disabled to ensure zero overhead.

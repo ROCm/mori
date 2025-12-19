@@ -88,7 +88,6 @@ class CMakeBuild(build_ext):
         use_bnxt = os.environ.get("USE_BNXT", "OFF")
         use_ionic = os.environ.get("USE_IONIC", "OFF")
         enable_profiler = os.environ.get("ENABLE_PROFILER", "OFF")
-        profiler_mask = os.environ.get("PROFILER_MASK", 0xFFFFFFFF)
         gpu_archs = _get_gpu_archs()
         subprocess.check_call(
             [
@@ -100,7 +99,6 @@ class CMakeBuild(build_ext):
                 f"-DUSE_IONIC={use_ionic}",
                 f"-DGPU_TARGETS={gpu_archs}",
                 f"-DENABLE_PROFILER={enable_profiler}",
-                f"-DPROFILER_MASK={profiler_mask}",
                 "-B",
                 str(build_dir),
                 "-S",

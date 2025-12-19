@@ -123,7 +123,7 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
   int localPeTokenCounter = 0;
 
   {
-    MORI_TRACE_SPAN(profiler, Slot::DispatchIntra, PROFILER_TAG_ALL);
+    MORI_TRACE_SPAN(profiler, Slot::DispatchIntra);
     for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
       int lanePe = -1, laneNode = -1;
       if (laneId < numExpertPerToken) {
@@ -156,7 +156,7 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
 template <typename T, bool DEDUP>
 inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
-  MORI_TRACE_SPAN(profiler, Slot::DispatchInterSend, PROFILER_TAG_ALL);
+  MORI_TRACE_SPAN(profiler, Slot::DispatchInterSend);
 
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
   int totalChunkNum = core::CeilDiv(args.curRankNumToken, warpSize);
@@ -166,7 +166,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
   int endTokenIdx = std::min(startTokenIdx + blockChunkNum * warpSize, args.curRankNumToken);
 
   {
-    MORI_TRACE_SPAN(profiler, Slot::DispSendStaging, PROFILER_TAG_ALL);
+    MORI_TRACE_SPAN(profiler, Slot::DispSendStaging);
     for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
       uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
       size_t stagingTokOffset = tokenId * xferBytes;
@@ -192,7 +192,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
   __syncthreads();
 
   {
-    MORI_TRACE_SPAN(profiler, Slot::DispSendRDMA, PROFILER_TAG_ALL);
+    MORI_TRACE_SPAN(profiler, Slot::DispSendRDMA);
     for (int i = warpId; i < nNodes; i += warpNum) {
       if (i == myNode) continue;
       int proxyPe = i * config.gpuPerNode + (config.rank % config.gpuPerNode);
@@ -316,7 +316,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
-  MORI_TRACE_SPAN(profiler, Slot::DispatchInterRecv, PROFILER_TAG_ALL);
+  MORI_TRACE_SPAN(profiler, Slot::DispatchInterRecv);
 
   constexpr int numRecvBlock = 8;
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
@@ -339,7 +339,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
     uint64_t thisChunkTokenNum = 0;
     index_t nodeFlag = 0;
     {
-      MORI_TRACE_SPAN(profiler, Slot::DispRecvPoll, PROFILER_TAG_ALL);
+      MORI_TRACE_SPAN(profiler, Slot::DispRecvPoll);
       if (laneId == 0) {
         while (1) {
           thisChunkTokenNum = core::AtomicLoadRelaxedSystem(&chunkFlag[node * maxChunkNum + k]);
@@ -360,7 +360,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
     int endTokenIdx = startTokenIdx + thisChunkTokenNum;
 
     {
-      MORI_TRACE_SPAN(profiler, Slot::DispRecvProcess, PROFILER_TAG_ALL);
+      MORI_TRACE_SPAN(profiler, Slot::DispRecvProcess);
       for (int j = startTokenIdx + (blockId % numRecvBlock) * warpNum + warpId; j < endTokenIdx;
            j += numRecvBlock * warpNum) {
         int tokIdx = node * config.MaxNumTokensToRecvPerRank() + j;
@@ -426,12 +426,12 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
-  MORI_TRACE_SPAN(profiler, Slot::DispatchSync, PROFILER_TAG_ALL);
+  MORI_TRACE_SPAN(profiler, Slot::DispatchSync);
 
   int nodePeOffset = myNode * config.gpuPerNode;
   int finishedWarp = 0;
   {
-    MORI_TRACE_SPAN(profiler, Slot::DispSyncBarrier, PROFILER_TAG_ALL);
+    MORI_TRACE_SPAN(profiler, Slot::DispSyncBarrier);
     if (laneId == 0) finishedWarp = atomicAdd(args.dispatchGridBarrier, 1);
     finishedWarp = __shfl(finishedWarp, 0);
     if ((finishedWarp + 1) == globalWarpNum) {
@@ -469,7 +469,7 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
   }
 
   {
-    MORI_TRACE_SPAN(profiler, Slot::DispSyncQuiet, PROFILER_TAG_ALL);
+    MORI_TRACE_SPAN(profiler, Slot::DispSyncQuiet);
     for (int i = globalWarpId; i < nNodes; i += globalWarpNum) {
       int proxyPe = i * config.gpuPerNode + (config.rank % config.gpuPerNode);
       shmem::ShmemQuietThread(proxyPe);
@@ -511,14 +511,14 @@ namespace v1 {
 template <typename T>
 inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
-  MORI_TRACE_SPAN(profiler, Slot::CombineSync, PROFILER_TAG_ALL);
+  MORI_TRACE_SPAN(profiler, Slot::CombineSync);
 
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   int tokenPerBlock = core::CeilDiv(totalRecvTokenNum, blockNum);
   int startTokenIdx = blockId * tokenPerBlock;
   int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, totalRecvTokenNum);
   {
-    MORI_TRACE_SPAN(profiler, Slot::CombSyncCopy, PROFILER_TAG_ALL);
+    MORI_TRACE_SPAN(profiler, Slot::CombSyncCopy);
     for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
       core::WarpCopy(
           args.shmemCombineInpTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim,
@@ -537,7 +537,7 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
   uint64_t barrierFlag = 0;
   int finishedWarp = 0;
   {
-    MORI_TRACE_SPAN(profiler, Slot::CombSyncBarrier, PROFILER_TAG_ALL);
+    MORI_TRACE_SPAN(profiler, Slot::CombSyncBarrier);
     if (laneId == 0) {
       finishedWarp = atomicAdd(args.combineGridBarrier, 1);
       barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
@@ -581,7 +581,7 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
   int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, args.curRankNumToken);
 
   {
-    MORI_TRACE_SPAN(profiler, Slot::CombineIntra, PROFILER_TAG_ALL);
+    MORI_TRACE_SPAN(profiler, Slot::CombineIntra);
     for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
       if (laneId < config.numExpertPerToken) {
         srcPtrs[laneId] = nullptr;
@@ -632,7 +632,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   int processedCount = 0;
   int batchStart = 0;
   {
-    MORI_TRACE_SPAN(profiler, Slot::CombineInterNode, PROFILER_TAG_ALL);
+    MORI_TRACE_SPAN(profiler, Slot::CombineInterNode);
     while (processedCount < totalBids) {
       uint32_t processedMask = 0;
       int currentBatchSize = std::min(totalBids - processedCount, 32);
@@ -670,7 +670,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
 
             if (thisChunkTokenNum > 0) {
               {
-                MORI_TRACE_SPAN(profiler, Slot::CombInterChunk, PROFILER_TAG_ALL);
+                MORI_TRACE_SPAN(profiler, Slot::CombInterChunk);
                 thisChunkTokenNum -= 1;
                 int endTokenIdx = startTokenIdx + thisChunkTokenNum;
 
@@ -712,7 +712,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
                   finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
                 finished = __shfl(finished, 0);
                 if ((finished + 1) >= (numRecvBlock * warpNum)) {
-                  MORI_TRACE_SPAN(profiler, Slot::CombInterShmem, PROFILER_TAG_ALL);
+                  MORI_TRACE_SPAN(profiler, Slot::CombInterShmem);
                   if (laneId == 0) {
                     core::AtomicStoreSeqCstSystem(
                         args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>() +
@@ -796,7 +796,7 @@ inline __device__ void CombineAll(EpDispatchCombineArgs<T>& args) {
   int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, args.curRankNumToken);
 
   {
-    MORI_TRACE_SPAN(profiler, Slot::CombineAll, PROFILER_TAG_ALL);
+    MORI_TRACE_SPAN(profiler, Slot::CombineAll);
     for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
       int lanePe = -1, laneNode = -1;
       if (laneId < config.numExpertPerToken) {

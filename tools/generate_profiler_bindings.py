@@ -285,10 +285,6 @@ def main():
 
 #pragma once
 
-#ifndef PROFILER_TAG_ALL
-#define PROFILER_TAG_ALL (1 << 0)
-#endif
-
 {xmacro_def}
 
 namespace {group.profiler_namespace} {{
