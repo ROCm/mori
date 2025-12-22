@@ -4,7 +4,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
 
-#include "anvil_device.hpp"
+#include "mori/application/transport/sdma/anvil_device.hpp"
 
 __global__ void packet_rate_kernel(void* srcBuf, void* dstBuf, size_t copySize, size_t numCopyCommands,
                                    anvil::SdmaQueueDeviceHandle** deviceHandles, HSAuint64* signals,
