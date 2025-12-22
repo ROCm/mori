@@ -49,6 +49,8 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
     // Set remote flag after all copies are done
     shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
     args.combineGridBarrier[0] = 0;
+
+    __threadfence_system();
     core::AtomicStoreRelaxedSystem(
         args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>(globalThdId) + args.config.rank,
         crossDeviceBarrierFlag);
