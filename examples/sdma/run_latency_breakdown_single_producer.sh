@@ -8,7 +8,7 @@ TIMESTAMP=$(date '+%Y-%m-%d_%Hh%Mm%Ss')
 OUTPUT_DIR="p2p_xgmi_latency"
 SUMMARY_FILE="$OUTPUT_DIR/summary.csv"
 
-mkdir $OUTPUT_DIR
+mkdir -p $OUTPUT_DIR
 touch $SUMMARY_FILE
 
 echo "==== Running shader_latency from $MIN_COPY_SIZE to $MAX_COPY_SIZE ===="
