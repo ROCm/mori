@@ -15,14 +15,14 @@ NUM_DST=1
 NUM_WG_PER_QUEUE=(304) #(1 2 4 8 16 32 64 128 256 304)
 
 TIMESTAMP=$(date '+%Y-%m-%d_%Hh%Mm%Ss')
-OUTPUT_DIR="p2p_xgmi_multiproducer_bandwidth_$TIMESTAMP"
+OUTPUT_DIR="p2p_xgmi_multiproducer_bandwidth"
 SUMMARY_FILE="$OUTPUT_DIR/summary.csv"
 
 mkdir $OUTPUT_DIR
 touch $SUMMARY_FILE
 
 echo "==== Running sdma_bw from $MIN_COPY_SIZE to $MAX_COPY_SIZE ===="
-rm log.txt
+rm -rf log.txt
 for(( QUEUES_PER_DST=MIN_QUEUES_PER_DST; QUEUES_PER_DST<=MAX_QUEUES_PER_DST; QUEUES_PER_DST*=2))
 do
     WGS_PER_QUEUE=$((304 / $QUEUES_PER_DST))
@@ -32,12 +32,13 @@ do
         for (( NUM_WAVES=1; NUM_WAVES<=1; NUM_WAVES*=2 ))
         do
             RESULT_CSV="p2p_xgmi_banwdith_${NUM_DST}dst_${QUEUES_PER_DST}queuesPerDst_${WGS_PER_QUEUE}wgsPerQ_${NUM_WAVES}waves_${NUM_COPY_COMMMANDS}copies.csv"
-            ./build/bench/sdma_bw --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands $NUM_COPY_COMMMANDS --numOfQueuesPerDestination $QUEUES_PER_DST --numDestinations $NUM_DST --wgsPerQueue $WGS_PER_QUEUE --warpsPerWG $NUM_WAVES -o $OUTPUT_DIR/$RESULT_CSV  >> log.txt
-            if [ $QUEUES_PER_DST -eq $MIN_QUEUES_PER_DST ] && [ $NUM_WAVES -eq 1 ]; then
-                cat $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE 
-            else
-                tail -n +2 $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE 
-            fi
+            #./build/bench/sdma_bw --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands $NUM_COPY_COMMMANDS --numOfQueuesPerDestination $QUEUES_PER_DST --numDestinations $NUM_DST --wgsPerQueue $WGS_PER_QUEUE --warpsPerWG $NUM_WAVES -o $OUTPUT_DIR/$RESULT_CSV  >> log.txt
+            ./build/examples/sdma_bw --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands $NUM_COPY_COMMMANDS --numOfQueuesPerDestination $QUEUES_PER_DST --numDestinations $NUM_DST --wgsPerQueue $WGS_PER_QUEUE --warpsPerWG $NUM_WAVES
+	    #if [ $QUEUES_PER_DST -eq $MIN_QUEUES_PER_DST ] && [ $NUM_WAVES -eq 1 ]; then
+            #    cat $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE 
+            #else
+            #    tail -n +2 $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE 
+            #fi
         done
     #done
 done
