@@ -97,6 +97,7 @@ struct GpuStates {
   uintptr_t heapBaseAddr{0};                  // Base address of symmetric heap
   uintptr_t heapEndAddr{0};                   // End address of symmetric heap (base + size)
   application::SymmMemObj* heapObj{nullptr};  // Pointer to the heap's SymmMemObj on device
+  uint64_t* internalSyncPtr{nullptr};  // Pointer to the internal synchronization object
 };
 
 extern __constant__ __attribute__((visibility("default"))) GpuStates globalGpuStates;

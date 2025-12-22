@@ -39,7 +39,7 @@ void* ShmemMalloc(size_t size) {
     return nullptr;
   }
 
-  // Align to 256 bytes for better performance
+  // Align to 128 bytes for better performance
   constexpr size_t ALIGNMENT = 128;
   size = (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
 

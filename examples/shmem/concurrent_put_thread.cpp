@@ -76,26 +76,30 @@ __global__ void ConcurrentPutThreadKernel_PureAddr(int myPe, uint32_t* localBuff
     if (blockIdx.x == 0) {
       ShmemQuietThread();
     }
-    if (globalTid == 0)
-    {
-      printf("rank %d addr %lu\n", myPe, ShmemPtrP2p(reinterpret_cast<uint64_t>(dest), myPe, recvPe));
+    if (globalTid == 0) {
+      printf("rank %d addr %lu\n", myPe,
+             ShmemPtrP2p(reinterpret_cast<uint64_t>(dest), myPe, recvPe));
     }
-    
+
   } else {
     // Wait for data to arrive
     while (atomicAdd(localBuff + globalTid, 0) != sendPe) {
     }
-    if (globalTid == 0)
-    {
-      printf("rank %d addr %lu\n", myPe, ShmemPtrP2p(reinterpret_cast<uint64_t>(localBuff), myPe, recvPe));
+    if (globalTid == 0) {
+      printf("rank %d addr %lu\n", myPe,
+             ShmemPtrP2p(reinterpret_cast<uint64_t>(localBuff), myPe, recvPe));
     }
   }
 }
 
+__global__ void testShmemBarrierAllBlock() { ShmemBarrierAllBlock(); }
+
 void ConcurrentPutThread() {
   int status;
   MPI_Init(NULL, NULL);
-
+  int localRank = -1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &localRank);
+  HIP_RUNTIME_CHECK(hipSetDevice(localRank % 8));
   status = ShmemMpiInit(MPI_COMM_WORLD);
   assert(!status);
 
@@ -119,7 +123,7 @@ void ConcurrentPutThread() {
   if (myPe == 0) {
     printf("\n--- Test 1: Legacy API (SymmMemObjPtr + offset) ---\n");
   }
-  
+
   void* buff1 = ShmemMalloc(buffSize);
   HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff1), myPe, numEle));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
@@ -137,7 +141,7 @@ void ConcurrentPutThread() {
   // Verify Test 1
   std::vector<uint32_t> hostBuff1(numEle);
   HIP_RUNTIME_CHECK(hipMemcpy(hostBuff1.data(), buff1, buffSize, hipMemcpyDeviceToHost));
-  
+
   if (myPe == 1) {
     bool success = true;
     for (int i = 0; i < numEle; i++) {
@@ -160,7 +164,7 @@ void ConcurrentPutThread() {
   if (myPe == 0) {
     printf("\n--- Test 2: Pure Address API ---\n");
   }
-  
+
   void* buff2 = ShmemMalloc(buffSize);
   HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff2), myPe, numEle));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
@@ -168,14 +172,15 @@ void ConcurrentPutThread() {
   if (myPe == 0) {
     printf("Running pure address API test...\n");
   }
-  ConcurrentPutThreadKernel_PureAddr<<<blockNum, threadNum>>>(myPe, reinterpret_cast<uint32_t*>(buff2));
+  ConcurrentPutThreadKernel_PureAddr<<<blockNum, threadNum>>>(myPe,
+                                                              reinterpret_cast<uint32_t*>(buff2));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
-  
+
   // Verify Test 2
   std::vector<uint32_t> hostBuff2(numEle);
   HIP_RUNTIME_CHECK(hipMemcpy(hostBuff2.data(), buff2, buffSize, hipMemcpyDeviceToHost));
-  
+
   if (myPe == 1) {
     bool success = true;
     for (int i = 0; i < numEle; i++) {
@@ -185,10 +190,18 @@ void ConcurrentPutThread() {
       }
     }
   }
-  
+
   if (myPe == 0) {
     // Assume success if we reach here
     printf("✓ Pure address API test PASSED! All %d elements verified.\n", numEle);
+  }
+
+  testShmemBarrierAllBlock<<<1, threadNum>>>();
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+  if (myPe == 0) {
+    // Assume success if we reach here
+    printf("\n--- Test 3: ✓ ShmemBarrierAllBlock test successfully\n");
   }
 
   if (myPe == 0) {

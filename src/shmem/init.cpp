@@ -29,9 +29,9 @@
 
 #include "mori/application/application.hpp"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
+#include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"
 #include "mori/utils/mori_log.hpp"
-#include "mori/shmem/internal.hpp"
 
 namespace mori {
 namespace shmem {
@@ -159,10 +159,27 @@ void GpuStateInit() {
   // by RegisterSymmMemObj (which properly set up peerPtrs and peerRkeys on GPU)
   gpuStates.heapObj = states->memoryStates->staticHeapObj.gpu;
 
-  MORI_SHMEM_INFO("Heap info copied to GPU: base=0x{:x}, end=0x{:x}, size={} bytes, heapObj=0x{:x}",
-                  gpuStates.heapBaseAddr, gpuStates.heapEndAddr,
-                  gpuStates.heapEndAddr - gpuStates.heapBaseAddr,
-                  reinterpret_cast<uintptr_t>(gpuStates.heapObj));
+  constexpr size_t MORI_INTERNAL_SYNC_SIZE = 128 * sizeof(uint64_t);
+  std::lock_guard<std::mutex> lock(states->memoryStates->heapLock);
+  if (states->memoryStates->staticHeapUsed + MORI_INTERNAL_SYNC_SIZE >
+      states->memoryStates->staticHeapSize) {
+    MORI_SHMEM_ERROR("Out of symmetric heap memory! Requested: {} bytes, Available: {} bytes",
+                     MORI_INTERNAL_SYNC_SIZE,
+                     states->memoryStates->staticHeapSize - states->memoryStates->staticHeapUsed);
+  }
+  void* ptr = reinterpret_cast<void*>(heapBase + states->memoryStates->staticHeapUsed);
+  states->memoryStates->staticHeapUsed += MORI_INTERNAL_SYNC_SIZE;
+  states->memoryStates->symmMemMgr->HeapRegisterSymmMemObj(ptr, MORI_INTERNAL_SYNC_SIZE,
+                                                           &states->memoryStates->staticHeapObj);
+
+  gpuStates.internalSyncPtr = reinterpret_cast<uint64_t*>(ptr);
+
+  MORI_SHMEM_INFO(
+      "Heap info copied to GPU: base=0x{:x}, end=0x{:x}, size={} bytes, syncPointer: "
+      "0x{:x},heapObj=0x{:x}",
+      gpuStates.heapBaseAddr, gpuStates.heapEndAddr, gpuStates.heapEndAddr - gpuStates.heapBaseAddr,
+      reinterpret_cast<uintptr_t>(gpuStates.internalSyncPtr),
+      reinterpret_cast<uintptr_t>(gpuStates.heapObj));
 
   // Copy gpu states to constant memory
   HIP_RUNTIME_CHECK(
@@ -193,9 +210,13 @@ int ShmemFinalize() {
 
   HIP_RUNTIME_CHECK(hipFree(globalGpuStates.transportTypes));
   HIP_RUNTIME_CHECK(hipFree(globalGpuStates.rdmaEndpoints));
-  
+
   if (states->rdmaStates->commContext->RdmaTransportEnabled()) {
     HIP_RUNTIME_CHECK(hipFree(globalGpuStates.endpointLock));
+  }
+
+  if (globalGpuStates.internalSyncPtr != nullptr) {
+    states->memoryStates->symmMemMgr->HeapDeregisterSymmMemObj(globalGpuStates.internalSyncPtr);
   }
 
   // Free the static symmetric heap through SymmMemManager
@@ -239,7 +260,7 @@ int ShmemNPes() {
 void ShmemBarrierAll() {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
   states->CheckStatusValid();
-  
+
   MORI_SHMEM_TRACE("ShmemBarrierAll: PE {} entering barrier", states->bootStates->rank);
   states->bootStates->bootNet->Barrier();
   MORI_SHMEM_TRACE("ShmemBarrierAll: PE {} exiting barrier", states->bootStates->rank);
