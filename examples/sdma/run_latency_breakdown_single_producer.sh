@@ -15,6 +15,7 @@ echo "==== Running shader_latency from $MIN_COPY_SIZE to $MAX_COPY_SIZE ===="
 rm -rf log.txt
 for (( NUM_COPY_CMDS=0; NUM_COPY_CMDS<=1; NUM_COPY_CMDS++ ))
 do
+    echo "==== num copy cmds:$NUM_COPY_CMDS ===="	
     RESULT_CSV="p2p_xgmi_latency_${NUM_COPY_CMDS}copies.csv"
     #./build/bench/sdma_latency --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands $NUM_COPY_CMDS --fineGrainedLatency -o $OUTPUT_DIR/$RESULT_CSV  >> log.txt
     ./build/examples/sdma_latency --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands $NUM_COPY_CMDS --fineGrainedLatency
