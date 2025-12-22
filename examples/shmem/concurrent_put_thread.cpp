@@ -94,8 +94,17 @@ __global__ void ConcurrentPutThreadKernel_PureAddr(int myPe, uint32_t* localBuff
     if (blockIdx.x == 0) {
       ShmemQuietThread();
     }
+    if (globalTid == 0) {
+      printf("rank %d addr %lu\n", myPe,
+             ShmemPtrP2p(reinterpret_cast<uint64_t>(dest), myPe, recvPe));
+    }
+
   } else {
     while (atomicAdd(localBuff + globalTid, 0) != sendPe) {
+    }
+    if (globalTid == 0) {
+      printf("rank %d addr %lu\n", myPe,
+             ShmemPtrP2p(reinterpret_cast<uint64_t>(localBuff), myPe, recvPe));
     }
   }
 }
@@ -567,6 +576,8 @@ void Test5_FragmentationReuse(int myPe) {
   }
 }
 
+__global__ void testShmemBarrierAllBlock() { ShmemBarrierAllBlock(); }
+
 void ConcurrentPutThread() {
   int status;
   MPI_Init(NULL, NULL);
@@ -605,6 +616,15 @@ void ConcurrentPutThread() {
   Test4_MixedMallocFree(myPe);
   Test5_FragmentationReuse(myPe);
 
+  constexpr int barrierThreadNum = 128;
+  testShmemBarrierAllBlock<<<1, barrierThreadNum>>>();
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+  if (myPe == 0) {
+    // Assume success if we reach here
+    printf("\n--- Test 6: ✓ ShmemBarrierAllBlock test successfully\n");
+  }
+
   if (myPe == 0) {
     printf("\n=================================================================\n");
     printf("All tests completed!\n");
@@ -615,6 +635,7 @@ void ConcurrentPutThread() {
     printf("  - Test 3: Large multi-chunk allocation (>200MB)\n");
     printf("  - Test 4: Mixed malloc/free with reference counting\n");
     printf("  - Test 5: Fragmentation and VA reuse\n");
+    printf("  - Test 6: ShmemBarrierAllBlock device barrier\n");
     printf("=================================================================\n");
   }
 

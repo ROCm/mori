@@ -465,6 +465,37 @@ void GpuStateInit() {
   // Configure heap information for GPU access
   ConfigureHeapInfoForGpu(&gpuStates, states);
 
+  // Allocate internal synchronization memory for device barriers
+  if (states->mode != ShmemMode::Isolation) {
+    constexpr size_t MORI_INTERNAL_SYNC_SIZE = 128 * sizeof(uint64_t);
+    std::lock_guard<std::mutex> lock(states->memoryStates->heapLock);
+
+    if (states->memoryStates->useVMMHeap && states->memoryStates->vmmHeapInitialized) {
+      uintptr_t heapBase = reinterpret_cast<uintptr_t>(states->memoryStates->vmmHeapBaseAddr);
+      // TODO: allocate from VMM heap for internal sync
+      MORI_SHMEM_WARN("Device barrier sync not yet supported in VMM heap mode");
+    } else {
+      uintptr_t heapBase = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
+      if (states->memoryStates->staticHeapUsed + MORI_INTERNAL_SYNC_SIZE >
+          states->memoryStates->staticHeapSize) {
+        MORI_SHMEM_ERROR(
+            "Out of symmetric heap memory for internal sync! Requested: {} bytes, Available: {} "
+            "bytes",
+            MORI_INTERNAL_SYNC_SIZE,
+            states->memoryStates->staticHeapSize - states->memoryStates->staticHeapUsed);
+      } else {
+        void* ptr = reinterpret_cast<void*>(heapBase + states->memoryStates->staticHeapUsed);
+        states->memoryStates->staticHeapUsed += MORI_INTERNAL_SYNC_SIZE;
+        states->memoryStates->symmMemMgr->RegisterStaticHeapSubRegion(
+            ptr, MORI_INTERNAL_SYNC_SIZE, &states->memoryStates->staticHeapObj);
+        gpuStates.internalSyncPtr = reinterpret_cast<uint64_t*>(ptr);
+        HIP_RUNTIME_CHECK(hipMemset(gpuStates.internalSyncPtr, 0, MORI_INTERNAL_SYNC_SIZE));
+        MORI_SHMEM_TRACE("Internal sync pointer allocated at 0x{:x}",
+                         reinterpret_cast<uintptr_t>(gpuStates.internalSyncPtr));
+      }
+    }
+  }
+
   // Copy complete state to device
   CopyGpuStatesToDevice(&gpuStates);
 }
@@ -621,6 +652,13 @@ int ShmemFinalize() {
 
   // Clean up in reverse order of initialization
   FinalizeGpuStates();
+
+  // Clean up internal sync memory
+  if (globalGpuStates.internalSyncPtr != nullptr) {
+    states->memoryStates->symmMemMgr->DeregisterStaticHeapSubRegion(
+        globalGpuStates.internalSyncPtr);
+  }
+
   FinalizeHeap(states);
   FinalizeAllStates(states);
 

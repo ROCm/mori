@@ -102,6 +102,7 @@ inline __device__ void ShmemFenceThread(int pe, int qpId) {
   ShmemQuietThread(pe, qpId);
   __threadfence_system();
 }
+
 inline __device__ void ShmemQuietThread(int pe, const application::SymmMemObjPtr dest) {
   ShmemQuietThreadKernel<application::TransportType::SDMA>(pe, dest);
 }
@@ -825,6 +826,104 @@ inline __device__ int ShmemNPes() {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   return globalGpuStates->worldSize;
 }
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                       Device Barrier APIs                                      */
+/* ---------------------------------------------------------------------------------------------- */
+inline __device__ void ShmemInternalBarrierThread() {
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  uint64_t* pSync = globalGpuStates->internalSyncPtr;
+  int pe = globalGpuStates->rank;
+  constexpr int coordinatorPe = 0;
+  int n_pes = globalGpuStates->worldSize;
+
+  // Use uint64_t for flag value and sync operations
+  constexpr uint64_t syncValue = 1;
+
+  if (pe == coordinatorPe) {
+    // Wait for all non-leader PEs to signal arrival
+    for (int i = 1; i < n_pes; i++) {
+      ShmemUint64WaitUntilEquals(&pSync[i], syncValue);
+      pSync[i] = 0;
+    }
+    __threadfence_system();
+
+    // Notify all other PEs that barrier is complete
+    for (int i = 1, j = coordinatorPe + 1; i < n_pes; ++i, ++j) {
+      pSync[0] = syncValue;
+      ShmemPutUint64ImmNbiThread(&pSync[0], syncValue, j, 0);
+      __threadfence_system();
+    }
+    pSync[0] = 0;
+  } else {
+    // Non-leader PEs signal arrival to leader
+    size_t pe_offset = (pe - coordinatorPe);
+    pSync[pe_offset] = syncValue;
+    ShmemPutUint64ImmNbiThread(&pSync[pe_offset], syncValue, coordinatorPe, 0);
+    __threadfence_system();
+
+    // Wait for leader to signal completion
+    ShmemUint64WaitUntilEquals(&pSync[0], syncValue);
+    pSync[0] = 0;
+    pSync[pe_offset] = 0;
+    __threadfence_system();
+  }
+}
+
+inline __device__ void ShmemInternalBarrierBlock() {
+  if (threadIdx.x == 0) {
+    // Thread 0 performs the inter-PE barrier
+    GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+    uint64_t* pSync = globalGpuStates->internalSyncPtr;
+    int pe = globalGpuStates->rank;
+    constexpr int coordinatorPe = 0;
+    int n_pes = globalGpuStates->worldSize;
+
+    constexpr uint64_t syncValue = 1;
+
+    if (pe == coordinatorPe) {
+      for (int i = 1; i < n_pes; i++) {
+        ShmemUint64WaitUntilEquals(&pSync[i], syncValue);
+        pSync[i] = 0;
+      }
+      __threadfence_system();
+
+      // Notify all other PEs that barrier is complete
+      for (int i = 1, j = coordinatorPe + 1; i < n_pes; ++i, ++j) {
+        pSync[0] = syncValue;
+        ShmemPutUint64ImmNbiThread(&pSync[0], syncValue, j, 0);
+        __threadfence_system();
+      }
+      pSync[0] = 0;
+    } else {
+      // Non-leader PEs: signal arrival to leader
+      size_t pe_offset = (pe - coordinatorPe);
+      pSync[pe_offset] = syncValue;
+      ShmemPutUint64ImmNbiThread(&pSync[pe_offset], syncValue, coordinatorPe, 0);
+      __threadfence_system();
+
+      // Wait for leader to signal completion
+      ShmemUint64WaitUntilEquals(&pSync[0], syncValue);
+      pSync[0] = 0;
+      pSync[pe_offset] = 0;
+      __threadfence_system();
+    }
+  }
+
+  // All threads in the block wait here until thread 0 completes the inter-PE barrier
+  __syncthreads();
+}
+
+inline __device__ void ShmemBarrierAllThread() {
+  ShmemQuietThread();
+  ShmemInternalBarrierThread();
+}
+
+inline __device__ void ShmemBarrierAllBlock() {
+  ShmemQuietThread();
+  ShmemInternalBarrierBlock();
+}
+
 
 }  // namespace shmem
 }  // namespace mori
