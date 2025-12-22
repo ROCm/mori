@@ -383,7 +383,6 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
           } else {  // zero-copy mode (requires UseP2PRead=true)
             EpCombineIntraNodeKernel<DataT, true><<<grid, block, sharedMemSize, stream>>>(args);
           }
-          EpCombineIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::AsyncLL) {
           assert(config.useExternalInpBuffer);
           EpCombineLowLatencyAsyncSend<<<grid, block, sharedMemSize, stream>>>(args);
