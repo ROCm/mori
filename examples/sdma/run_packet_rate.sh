@@ -6,7 +6,7 @@ TIMESTAMP=$(date '+%Y-%m-%d_%Hh%Mm%Ss')
 OUTPUT_DIR="p2p_xgmi_packet_rate"
 SUMMARY_FILE="$OUTPUT_DIR/summary.csv"
 
-mkdir $OUTPUT_DIR
+mkdir -p $OUTPUT_DIR
 touch $SUMMARY_FILE
 
 echo "==== Running shader_sdma_rate ===="
