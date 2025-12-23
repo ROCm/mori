@@ -151,7 +151,11 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
 
   epConfig.maxMsgsNum = std::min(8192u, maxQpWr);
   epConfig.maxCqeNum = std::min(16384u, maxCqe);
+#ifdef ENABLE_IONIC
+  epConfig.maxMsgSge = std::min<uint32_t>(deviceAttr->orig_attr.max_sge, 2u);
+#else
   epConfig.maxMsgSge = std::min<uint32_t>(deviceAttr->orig_attr.max_sge, 4u);
+#endif
   return epConfig;
 }
 
