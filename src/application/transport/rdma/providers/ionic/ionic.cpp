@@ -347,6 +347,19 @@ void IonicQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
   printf("\n");
   #endif  
   err = ibv_modify_qp(qp, &attr, attr_mask);
+  if (err) {
+    printf("modiyf qp to rtr failed, error = %d\n", err);
+    printf("the local gid:");
+    for (int i = 0; i< 16; i++) {
+      printf("%02x", local_handle.eth.gid[i]);
+    }
+    printf("\n");
+    printf("the remote gid:");
+    for (int i = 0; i< 16; i++) {
+      printf("%02x", remote_handle.eth.gid[i]);
+    }
+    printf("\n");
+  }  
   assert(err == 0);
 }
 
