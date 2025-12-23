@@ -300,7 +300,6 @@ void TopoSystemPci::Load() {
       uint8_t subordinate = pci_read_byte(dev, PCI_SUBORDINATE_BUS);
       for (uint8_t i = secondary; i <= subordinate; i++) {
         uint64_t dspBusId = PciBusId(dev->domain, i, 0, 0).packed;
-        std::cout<< "Add potential parent: "<< PciBusId(dev->domain, i, 0, 0).String()<< " "<< node->BusId().String()<< std::endl;
         if (dsp2dev.find(dspBusId) != dsp2dev.end()) {
           struct pci_dev* lastDev = dsp2dev[dspBusId];
           if (pci_read_byte(dev, PCI_PRIMARY_BUS) < pci_read_byte(lastDev, PCI_PRIMARY_BUS)) continue;
@@ -340,11 +339,9 @@ void TopoSystemPci::Load() {
     uint64_t parentDsp = PciBusId(busId.Domain(), busId.Bus(), 0, 0).packed;
     uint64_t parentBus = 0;
     if (dsp2dev.find(parentDsp) == dsp2dev.end()) {
-      std::cout<< "No parent "<< PciBusId(busId.Domain(), busId.Bus(), 0, 0).String()<< std::endl;
       assert(IsUnderRootComplex(bus2dev[busId.packed]));
       parentBus = PciBusId(busId.Domain(), 0, 0, 0).packed;
     } else {
-      std::cout<< "Has parent "<< PciBusId(busId.Domain(), busId.Bus(), 0, 0).String()<< std::endl;
       pci_dev* dev = dsp2dev[parentDsp];
       parentBus = PciBusId(dev->domain, dev->bus, dev->dev, dev->func).packed;
     }
