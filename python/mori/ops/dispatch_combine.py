@@ -131,6 +131,7 @@ class EpDispatchCombineOp:
         indices: torch.Tensor,
         block_num: int = -1,
         warp_per_block: int = -1,
+        scales: torch.Tensor = None,
         call_reset: bool = False,
     ):
         output = self._combine_func(
@@ -138,12 +139,17 @@ class EpDispatchCombineOp:
             self.config.kernel_type.value,
             input,
             weights,
+            scales,
             indices,
             block_num,
             warp_per_block,
         )
         if call_reset:
             self._reset_func(self._handle)
+        # Backward compatible: if caller didn't pass scales, return only (out, out_weights).
+        if scales is None:
+            out, out_weights, _out_scales = output
+            return out, out_weights
         return output
 
     def reset(self):

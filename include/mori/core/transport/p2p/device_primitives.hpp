@@ -24,9 +24,125 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
 
+#include <type_traits>
+
 #include "mori/core/utils.hpp"
+#include "mori/utils/data_types.hpp"
 namespace mori {
 namespace core {
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                          FP8 helpers                                           */
+/* ---------------------------------------------------------------------------------------------- */
+template <typename T>
+struct Fp8Traits;
+
+template <typename T>
+struct IsFp8Type : std::false_type {};
+
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+template <>
+struct Fp8Traits<__hip_fp8_e4m3> {
+  static constexpr float kMaxFinite = 448.0f;
+};
+
+template <>
+struct IsFp8Type<__hip_fp8_e4m3> : std::true_type {};
+#endif
+
+#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
+template <>
+struct Fp8Traits<__hip_fp8_e4m3_fnuz> {
+  static constexpr float kMaxFinite = 240.0f;
+};
+
+template <>
+struct IsFp8Type<__hip_fp8_e4m3_fnuz> : std::true_type {};
+#endif
+
+template <typename Fp8T>
+__device__ __forceinline__ float LoadScaleElemAsFloat(const uint8_t* __restrict__ scaleBase,
+                                                      int scaleIdx, int scaleTypeSize) {
+  if (scaleTypeSize == 0) return 1.0f;
+  if (scaleTypeSize == sizeof(float)) {
+    return reinterpret_cast<const float*>(scaleBase)[scaleIdx];
+  }
+  if (scaleTypeSize == 1) {
+    const Fp8T v = reinterpret_cast<const Fp8T*>(scaleBase)[scaleIdx];
+    return static_cast<float>(v);
+  }
+  return 1.0f;
+}
+
+template <typename Fp8T>
+__device__ __forceinline__ void StoreScaleFromFloat(uint8_t* __restrict__ scaleBase, int scaleIdx,
+                                                    int scaleTypeSize, float s) {
+  if (scaleTypeSize == 0) return;
+  if (scaleTypeSize == sizeof(float)) {
+    reinterpret_cast<float*>(scaleBase)[scaleIdx] = s;
+    return;
+  }
+  if (scaleTypeSize == 1) {
+    reinterpret_cast<Fp8T*>(scaleBase)[scaleIdx] = Fp8T(s);
+    return;
+  }
+}
+
+template <typename T>
+inline __device__ T WarpReduceMax(T val) {
+  for (int delta = (warpSize >> 1); delta > 0; delta = (delta >> 1)) {
+    T other = __shfl_down(val, delta);
+    val = val > other ? val : other;
+  }
+  return val;
+}
+
+template <typename Fp8T>
+__device__ __forceinline__ void WarpAccumFp8QuantPerDim(
+    Fp8T* __restrict__ dstToken, uint8_t* __restrict__ dstScales,
+    const Fp8T* const* __restrict__ srcs, const uint8_t* const* __restrict__ srcScales,
+    int accumNum, int hiddenDim, int scaleDim, int scaleTypeSize, int scaleBlockId) {
+  const int laneId = threadIdx.x & (warpSize - 1);
+  if (scaleDim <= 0 || scaleTypeSize <= 0) return;
+
+  const int blockElems = (hiddenDim + scaleDim - 1) / scaleDim;
+  const int start = scaleBlockId * blockElems;
+  const int end = min(start + blockElems, hiddenDim);
+
+  float localMaxAbs = 0.0f;
+  for (int idx = start + laneId; idx < end; idx += warpSize) {
+    float acc = 0.0f;
+    for (int i = 0; i < accumNum; ++i) {
+      const Fp8T* srcPtr = srcs[i];
+      if (srcPtr == nullptr) continue;
+      const float s = LoadScaleElemAsFloat<Fp8T>(srcScales[i], scaleBlockId, scaleTypeSize);
+      acc += static_cast<float>(srcPtr[idx]) * s;
+    }
+    localMaxAbs = fmaxf(localMaxAbs, fabsf(acc));
+  }
+  float maxAbs = WarpReduceMax(localMaxAbs);
+  maxAbs = __shfl(maxAbs, 0);
+
+  const float fp8Max = Fp8Traits<Fp8T>::kMaxFinite;
+  float outScale = (maxAbs == 0.0f) ? 1.0f : (maxAbs / fp8Max);
+  if (laneId == 0) {
+    StoreScaleFromFloat<Fp8T>(dstScales, scaleBlockId, scaleTypeSize, outScale);
+  }
+  outScale = __shfl(outScale, 0);
+
+  // Second pass: requantize and store.
+  const float invScale = 1.0f / outScale;
+  for (int idx = start + laneId; idx < end; idx += warpSize) {
+    float acc = 0.0f;
+    for (int i = 0; i < accumNum; ++i) {
+      const Fp8T* srcPtr = srcs[i];
+      if (srcPtr == nullptr) continue;
+      const float s = LoadScaleElemAsFloat<Fp8T>(srcScales[i], scaleBlockId, scaleTypeSize);
+      acc += static_cast<float>(srcPtr[idx]) * s;
+    }
+    dstToken[idx] = Fp8T(acc * invScale);
+  }
+}
 
 template <int VecBytes>
 struct VecTypeSelector {
