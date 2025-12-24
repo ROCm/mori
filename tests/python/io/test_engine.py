@@ -111,6 +111,22 @@ def test_engine_desc():
     assert desc == unpacked_desc
 
 
+def test_engine_desc_port_zero_auto_bind():
+    config = IOEngineConfig(
+        host="127.0.0.1",
+        port=0,
+    )
+    engine = IOEngine(key="engine_port0", config=config)
+    engine.create_backend(BackendType.RDMA)
+
+    desc = engine.get_engine_desc()
+    assert desc.port > 0
+
+    packed_desc = desc.pack()
+    unpacked_desc = EngineDesc.unpack(packed_desc)
+    assert desc == unpacked_desc
+
+
 def test_mem_desc():
     config = IOEngineConfig(
         host="127.0.0.1",

@@ -97,8 +97,24 @@ IOEngine::~IOEngine() {}
 void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
   if (type == BackendType::RDMA) {
     assert(backends.find(type) == backends.end());
-    backends.insert({type, std::make_unique<RdmaBackend>(
-                               desc.key, config, static_cast<const RdmaBackendConfig&>(beConfig))});
+    auto backend = std::make_unique<RdmaBackend>(desc.key, config,
+                                                 static_cast<const RdmaBackendConfig&>(beConfig));
+
+    if (config.port == 0) {
+      auto bound_port_opt = backend->GetListenPort();
+      if (!bound_port_opt.has_value() || bound_port_opt.value() == 0) {
+        MORI_IO_ERROR("IOEngine key {} failed to retrieve bound port after RDMA backend init",
+                      desc.key);
+        assert(false && "Failed to retrieve bound port after RDMA backend init");
+      } else {
+        uint16_t bound_port = bound_port_opt.value();
+        desc.port = bound_port;
+        this->config.port = bound_port;
+        MORI_IO_INFO("IOEngine key {} bound ephemeral port {}", desc.key, bound_port);
+      }
+    }
+
+    backends.insert({type, std::move(backend)});
   } else
     assert(false && "not implemented");
   MORI_IO_INFO("Create backend type {}", static_cast<uint32_t>(type));
