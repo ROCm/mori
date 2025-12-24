@@ -31,8 +31,10 @@ message(STATUS "Python libraries: ${PYTHON_LIBRARIES}")
 
 add_library(mori_pybinds SHARED mori.cpp pybind.cpp)
 
+set(XLA_INCLUDE_DIR /tf/xla) 
 target_include_directories(mori_pybinds PUBLIC ${PYTHON_INCLUDE_DIRS}
-                                               ${TORCH_INCLUDE_DIRS})
+                                               ${TORCH_INCLUDE_DIRS}
+                                               ${XLA_INCLUDE_DIR})
 target_link_directories(mori_pybinds PUBLIC ${TORCH_INSTALL_PREFIX}/lib)
 target_link_libraries(
   mori_pybinds

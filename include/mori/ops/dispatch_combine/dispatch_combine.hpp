@@ -111,7 +111,7 @@ struct EpDispatchCombineConfig {
 
 class EpDispatchCombineHandle {
  public:
-  EpDispatchCombineHandle(EpDispatchCombineConfig config);
+  EpDispatchCombineHandle(const EpDispatchCombineConfig& config);
   ~EpDispatchCombineHandle();
 
   void PrepareInference(hipDataType inputType, void* input, void* output, float* weights,
