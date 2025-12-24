@@ -39,7 +39,8 @@ jobs:
           git checkout ionic_new_950_1128
           pip install --target /apps/mori-ci/packages -r requirements-build.txt
           git submodule update --init --recursive
-          USE_IONIC=ON pip3 install . --no-build-isolation --target /apps/mori-ci/python-packages
+          pip3 install .
+          #USE_IONIC=ON pip3 install . --no-build-isolation --target /apps/mori-ci/python-packages
           #make
           ls
   test:
