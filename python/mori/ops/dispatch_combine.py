@@ -25,6 +25,9 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+import numpy as np
+import jax
+import jax.numpy as jnp
 
 class EpDispatchCombineKernelType(mori_cpp.EpDispatchCombineKernelType):
     def __str__(self):
@@ -103,6 +106,35 @@ class EpDispatchCombineOp:
 
     def get_registered_combine_input_buffer(self, dtype: torch.dtype):
         return self._get_registered_combine_input_buffer(self._handle, dtype)
+    
+    def dispatch_jax(
+        self,
+        input,
+        weights,
+        scales,
+        indices,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        return jax.ffi.ffi_call(
+            "launch_dispatch_ffi",
+            (
+                jax.ShapeDtypeStruct(input.shape, input.dtype),
+                jax.ShapeDtypeStruct((input.shape[0], indices.shape[1]), input.dtype),
+                jax.ShapeDtypeStruct(input.shape, input.dtype),
+                jax.ShapeDtypeStruct(input.shape, input.dtype),
+                jax.ShapeDtypeStruct((), jnp.int32),
+            ),
+        )(
+            #self._handle,
+            input,
+            weights,
+            scales,
+            indices,
+            kernel_type=np.int32(self.config.kernel_type.value),
+            block_num=np.int32(block_num),
+            warp_per_block=np.int32(warp_per_block),
+        )
 
     def dispatch(
         self,

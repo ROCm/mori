@@ -24,6 +24,7 @@
 #include <ATen/hip/HIPContext.h>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
+#include <hip/hip_runtime.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -37,6 +38,23 @@
 #include "mori/ops/ops.hpp"
 #include "mori/shmem/shmem.hpp"
 #include "src/pybind/torch_utils.hpp"
+
+#include "xla/ffi/api/c_api.h"
+#include "xla/ffi/api/ffi.h"
+
+
+using namespace xla::ffi;
+
+namespace mori::moe {
+struct EpDispatchCombineHandleFFI : public EpDispatchCombineHandle {
+
+  static TypeId id;
+  EpDispatchCombineHandleFFI(EpDispatchCombineConfig config) :
+      EpDispatchCombineHandle(std::move(config)) { }
+
+};
+TypeId EpDispatchCombineHandleFFI::id;
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Ops APIs                                            */
@@ -101,6 +119,55 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
                            .device(torch::kCUDA));
   return {out, outWeights, outScales, outIndices, totalRecvTokenNum};
 }
+
+#define XPUT(fmt, ...) fprintf(stderr, fmt"\n", ##__VA_ARGS__)
+
+Error MoriDispatchImpl(
+    // hipStream_t stream,
+    // mori::moe::EpDispatchCombineHandleFFI *handle,
+    int32_t kernel_type,
+    AnyBuffer input,
+    AnyBuffer weights,
+    AnyBuffer scales,
+    AnyBuffer topk_ids,
+    int32_t block_num,
+    int32_t warp_per_block,
+    Result<AnyBuffer> out,
+    Result<AnyBuffer> out_weights,
+    Result<AnyBuffer> out_scales,
+    Result<AnyBuffer> out_indices,
+    Result<BufferR0<S32>> total_recv_token_num) {
+  
+  XPUT("MoriDispatchImpl kernel_type=%d input=%d weights=%d block_num=%d",
+      kernel_type, (int)input.size_bytes(), (int)weights.size_bytes(), block_num);
+  return Error::Success();
+}
+
+
+// Define handlers via FFI macros.
+XLA_FFI_DEFINE_HANDLER(
+    MoriDispatchHandler, MoriDispatchImpl,
+    // Explicit binding to ensure attrs/args order
+    Ffi::Bind()
+        // .Ctx<PlatformStream<hipStream_t>>()
+        // .Ctx<ffi::State<State>>() ??
+        // .Ctx<UserData<mori::moe::EpDispatchCombineHandleFFI>>()
+        //.Attr<Pointer<mori::moe::EpDispatchCombineHandle>>("handle_ptr")
+        .Attr<int32_t>("kernel_type")
+        .Arg<AnyBuffer>()          // input
+        .Arg<AnyBuffer>()          // weights optional
+        .Arg<AnyBuffer>()          // scales optional
+        .Arg<AnyBuffer>()          // topk_ids 
+        .Attr<int32_t>("block_num")
+        .Attr<int32_t>("warp_per_block")
+        .Ret<AnyBuffer>()          // out
+        .Ret<AnyBuffer>()          // out_weights optional
+        .Ret<AnyBuffer>()          // out_scales optional
+        .Ret<AnyBuffer>()          // out_indices 
+        .Ret<BufferR0<S32>>()      // total_recv_token_num
+);
+
+// XLA_FFI_REGISTER_HANDLER(XLA_FFI_GetApi(), "mori.dispatch", "ROCM", MoriDispatchHandler);
 
 // TODO: translate data type
 // template <typename T>
@@ -179,6 +246,13 @@ torch::Tensor GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle
   return out;
 }
 
+template <typename T>
+py::capsule EncapsulateFfiHandler(T* fn) {
+  static_assert(std::is_invocable_r_v<XLA_FFI_Error *, T, XLA_FFI_CallFrame *>,
+                "Encapsulated function must be an XLA FFI handler");
+  return py::capsule(reinterpret_cast<void*>(fn), "my_first_ffi");
+}
+
 void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   std::string className = std::string("EpDispatchCombineHandle");
   pybind11::class_<mori::moe::EpDispatchCombineHandle>(m, className.c_str())
@@ -187,6 +261,10 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
 
   std::string funcName = std::string("launch_dispatch");
   m.def(funcName.c_str(), &LaunchDispatch);
+
+  //m.def(funcName.c_str(), &MoriDispatchHandler);
+  m.def("launch_dispatch_ffi", []() { return EncapsulateFfiHandler(MoriDispatchHandler); },
+      py::return_value_policy::reference);
 
   funcName = std::string("launch_combine");
   m.def(funcName.c_str(), &LaunchCombine);

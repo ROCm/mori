@@ -19,8 +19,17 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import jax
+
 from .dispatch_combine import (
     EpDispatchCombineKernelType,
     EpDispatchCombineConfig,
     EpDispatchCombineOp,
 )
+
+from mori import cpp as mori_cpp
+
+jax.ffi.register_ffi_target("launch_dispatch_ffi", \
+                mori_cpp.launch_dispatch_ffi(), platform="ROCM")
+
+print("registration OK")
