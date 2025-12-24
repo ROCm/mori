@@ -30,7 +30,8 @@ jobs:
           #sudo -i
           pwd
           id
-          ls  
+          ls
+
           #rm -rf mori 
 
           #git clone https://github.com/zhangfei829/mytest.git
