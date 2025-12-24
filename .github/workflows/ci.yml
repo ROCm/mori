@@ -30,8 +30,6 @@ jobs:
           #sudo -i
           pwd
           id
-          id  
-          ls
           ls  
           #rm -rf mori 
 
