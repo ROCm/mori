@@ -228,6 +228,16 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
     }
   }
 
+  // Copy scales (per-token per-block) to registered buffer so other GPUs can access.
+  const int scaleBytes = config.scaleDim * config.scaleTypeSize;
+  if (args.scalesBuf && (scaleBytes > 0)) {
+    for (int i = globalWarpId; i < totalRecvTokenNum * config.scaleDim; i += globalWarpNum) {
+      core::WarpCopy<uint8_t, 4>(
+          args.shmemInpScalesMemObj->template GetAs<uint8_t*>() + i * config.scaleTypeSize,
+          args.scalesBuf + i * config.scaleTypeSize, config.scaleTypeSize);
+    }
+  }
+
   // Make sure copy on all GPUs are finished
   CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
   *args.totalRecvTokenNum = 0;
@@ -237,43 +247,101 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
-
-  index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
-  index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
+  uint8_t** srcScalesPtr = reinterpret_cast<uint8_t**>(sharedMem) +
+                           2 * warpNum * config.numExpertPerToken +
+                           warpId * config.numExpertPerToken;
 
   assert(config.numExpertPerToken < warpSize);
-  for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
-    index_t tokenId = i / warpsPerToken;
-    index_t inTokenPartId = i % warpsPerToken;
-    index_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
-    index_t hiddenDimSize =
-        std::max(0, std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp));
 
-    // Prepare data pointers on different GPUs
-    for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
-      index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
-      index_t destPe = destTokId / maxNumTokensToSend;
+  if constexpr (core::IsFp8Type<T>::value) {
+    // FP8 path: one warp processes one (token, scale_block) pair to ensure correct per-block scale.
+    assert(args.scalesBuf != nullptr);
+    assert(scaleBytes > 0);
+    for (int i = globalWarpId; i < (args.curRankNumToken * config.scaleDim); i += globalWarpNum) {
+      index_t tokenId = i / config.scaleDim;
+      int scaleBlockId = i % config.scaleDim;
 
-      if (destPe < config.worldSize) {
-        index_t destLocalTokId = destTokId - destPe * maxNumTokensToSend;
-        srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
-                     destLocalTokId * config.hiddenDim + hiddenDimOffset;
-        srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
-                           destLocalTokId * config.numExpertPerToken;
-      } else {
-        srcPtrs[j] = nullptr;
-        srcWeightsPtr[j] = nullptr;
+      // Prepare src pointers for this token across experts.
+      for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
+        index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
+        index_t destPe = destTokId / maxNumTokensToSend;
+        if (destPe < config.worldSize) {
+          index_t destLocalTokId = destTokId - destPe * maxNumTokensToSend;
+          srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+                       destLocalTokId * config.hiddenDim;
+          srcScalesPtr[j] = args.shmemInpScalesMemObj->template GetAs<uint8_t*>(destPe) +
+                            destLocalTokId * scaleBytes;
+        } else {
+          srcPtrs[j] = nullptr;
+          srcScalesPtr[j] = nullptr;
+        }
+      }
+
+      T* dstTok = args.shmemCombineOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim;
+      uint8_t* dstScale =
+          args.shmemOutScalesMemObj->template GetAs<uint8_t*>() + tokenId * scaleBytes;
+      const uint8_t* const* srcScalesConst = reinterpret_cast<const uint8_t* const*>(srcScalesPtr);
+      core::WarpAccumFp8QuantPerDim<T>(dstTok, dstScale, srcPtrs, srcScalesConst,
+                                       config.numExpertPerToken, config.hiddenDim, config.scaleDim,
+                                       config.scaleTypeSize, scaleBlockId);
+    }
+
+    // Weights are float: accumulate once per token.
+    if (args.weightsBuf) {
+      for (int tokenId = globalWarpId; tokenId < args.curRankNumToken; tokenId += globalWarpNum) {
+        for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
+          index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
+          index_t destPe = destTokId / maxNumTokensToSend;
+          if (destPe < config.worldSize) {
+            index_t destLocalTokId = destTokId - destPe * maxNumTokensToSend;
+            srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
+                               destLocalTokId * config.numExpertPerToken;
+          } else {
+            srcWeightsPtr[j] = nullptr;
+          }
+        }
+        core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
+                                      tokenId * config.numExpertPerToken,
+                                  srcWeightsPtr, nullptr, config.numExpertPerToken,
+                                  config.numExpertPerToken);
       }
     }
-    core::WarpAccum<T, 4>(args.shmemCombineOutTokMemObj->template GetAs<T*>() +
-                              tokenId * config.hiddenDim + hiddenDimOffset,
-                          srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
+  } else {
+    // BF16/FP32 path: keep previous behavior.
+    index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
+    index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
+    for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
+      index_t tokenId = i / warpsPerToken;
+      index_t inTokenPartId = i % warpsPerToken;
+      index_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
+      index_t hiddenDimSize =
+          std::max(0, std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp));
 
-    if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
-      core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
-                                    tokenId * config.numExpertPerToken,
-                                srcWeightsPtr, nullptr, config.numExpertPerToken,
-                                config.numExpertPerToken);
+      for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
+        index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
+        index_t destPe = destTokId / maxNumTokensToSend;
+
+        if (destPe < config.worldSize) {
+          index_t destLocalTokId = destTokId - destPe * maxNumTokensToSend;
+          srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+                       destLocalTokId * config.hiddenDim + hiddenDimOffset;
+          srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
+                             destLocalTokId * config.numExpertPerToken;
+        } else {
+          srcPtrs[j] = nullptr;
+          srcWeightsPtr[j] = nullptr;
+        }
+      }
+      core::WarpAccum<T, 4>(args.shmemCombineOutTokMemObj->template GetAs<T*>() +
+                                tokenId * config.hiddenDim + hiddenDimOffset,
+                            srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
+
+      if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
+        core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
+                                      tokenId * config.numExpertPerToken,
+                                  srcWeightsPtr, nullptr, config.numExpertPerToken,
+                                  config.numExpertPerToken);
+      }
     }
   }
 }

@@ -312,8 +312,8 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
         using ArgsT = std::decay_t<decltype(args)>;
         using DataT = typename ArgsT::data_type;
 
-        size_t sharedMemSize =
-            actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
+        size_t sharedMemSize = actualWarpNumPerBlock * config.numExpertPerToken *
+                               (sizeof(DataT*) + sizeof(float*) + sizeof(uint8_t*));
         if (kernelType == KernelType::InterNode) {
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
