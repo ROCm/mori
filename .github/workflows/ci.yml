@@ -10,11 +10,12 @@ jobs:
           pwd
           hostname
           id
+          export PATH="/usr/bin:/usr/local/bin:$PATH"
           cmake --version
           #exit 
           #source ~/.bashrc
           echo "0. PATH: $PATH"
-          export PATH="/home/runner/.local/bin:$PATH"
+          #export PATH="/home/runner/.local/bin:$PATH"
           cmake --version
           echo "=== CMake 版本诊断 ==="
           echo "1. PATH: $PATH"
