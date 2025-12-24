@@ -28,13 +28,16 @@ jobs:
           echo "5. 当前 shell: $SHELL"
           #sudo -i
           pwd
+          id
           id  
+          ls
           ls  
           #rm -rf mori 
 
           #git clone https://github.com/zhangfei829/mytest.git
           #git clone https://github.com/ROCm/mori.git
           cd mori
+          ls
           rm -rf build
           git checkout main
           #pip install --target /apps/mori-ci/packages -r requirements-build.txt
