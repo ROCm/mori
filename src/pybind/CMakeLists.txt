@@ -47,7 +47,8 @@ message(STATUS "pybind11 include dir: ${PYBIND11_INCLUDE_DIR}")
 
 if(ENABLE_XLA_FFI)
   add_library(mori_xla_ffi_pybinds SHARED 
-      mori_core.cpp pybind_core.cpp mori_xla_ffi_ops.cpp)
+      mori_core.cpp pybind_core.cpp 
+      mori_xla_ffi_ops.cpp pybind_ffi.cpp)
 
   target_include_directories(
     mori_xla_ffi_pybinds PUBLIC 

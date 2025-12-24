@@ -1,0 +1,50 @@
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+import os
+import sys
+import importlib.util
+import ctypes
+
+cur_dir = os.path.dirname(os.path.abspath(__file__))
+mori_lib_dir = os.path.abspath(os.path.join(cur_dir, ".."))
+
+# no ".so" here
+MODULE_NAME = "libmori_xla_ffi_pybinds"
+LIB_FILE = MODULE_NAME + ".so"
+
+_preload_libs = ["libmori_application.so", "libmori_io.so"]
+for _lib_name in _preload_libs:
+    _lib_full_path = os.path.join(mori_lib_dir, _lib_name)
+    if os.path.exists(_lib_full_path):
+        ctypes.CDLL(_lib_full_path, mode=ctypes.RTLD_GLOBAL)
+
+lib_path = os.path.abspath(os.path.join(cur_dir, f"../{LIB_FILE}"))
+
+spec = importlib.util.spec_from_file_location(MODULE_NAME, lib_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[MODULE_NAME] = module
+spec.loader.exec_module(module)
+
+# re-export symbols
+globals().update({k: v for k, v in module.__dict__.items() if not k.startswith("_")})
+
+from ._ffi_registry import register_ffi_targets
