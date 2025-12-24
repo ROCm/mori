@@ -33,7 +33,7 @@ jobs:
           #rm -rf mori 
 
           #git clone https://github.com/zhangfei829/mytest.git
-          #git clone https://github.com/ROCm/mori.git
+          git clone https://github.com/ROCm/mori.git
           cd mori
           #rm -rf build
           git checkout ionic_new_950_1128
