@@ -24,6 +24,7 @@
 #include <ATen/hip/HIPContext.h>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
+#include <hip/hip_runtime.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -38,14 +39,58 @@
 #include "mori/shmem/shmem.hpp"
 #include "src/pybind/torch_utils.hpp"
 
+#include "xla/ffi/api/c_api.h"
+#include "xla/ffi/api/ffi.h"
+#include "xla/pjrt/c/pjrt_c_api.h"
+#include "xla/pjrt/c/pjrt_c_api_ffi_extension.h"
+#include "xla/pjrt/c/pjrt_c_api_gpu_extension.h"
+// #include "xla/pjrt/c/pjrt_c_api_helpers.h"
+
+using namespace xla::ffi;
+using mori::moe::EpDispatchCombineConfig;
+using mori::moe::EpDispatchCombineHandle;
+using mori::moe::KernelType;
+
+#define XPUT(fmt, ...) fprintf(stderr, fmt"\n", ##__VA_ARGS__)
+
+namespace pjrt {
+
+template <typename ExtType, typename InputType>
+ExtType* FindExtension(InputType* in, PJRT_Extension_Type type) {
+  PJRT_Extension_Base* ext = in->extension_start;
+  while (ext != nullptr) {
+    if (ext->type == type) {
+      return reinterpret_cast<ExtType*>(ext);
+    }
+    ext = ext->next;
+  }
+  // 'type' wasn't found in extension chain
+  return nullptr;
+}
+} // namespace pjrt
+
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Ops APIs                                            */
 /* ---------------------------------------------------------------------------------------------- */
 namespace {
 
+hipDataType FFIType2HipType(DataType dtype) {
+#define XX(A, B) case DataType::A: return B;
+  switch (dtype) {
+    XX(F32, HIP_R_32F)
+    XX(BF16, HIP_R_16BF)
+    XX(F8E4M3FN, HIP_R_8F_E4M3)
+    XX(F8E4M3FNUZ, HIP_R_8F_E4M3_FNUZ)
+    default:
+      throw std::runtime_error("Unsupported scalar type");
+  }
+#undef XX
+}
+
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, torch::Tensor,
            torch::Tensor>
-LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
+LaunchDispatch(EpDispatchCombineHandle& handle, int kernelType,
                const torch::Tensor& input, const std::optional<torch::Tensor>& weights,
                const std::optional<torch::Tensor>& scales, const torch::Tensor& topkIds,
                int blockNum = -1, int warpPerBlock = -1) {
@@ -66,7 +111,7 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
   handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
                           nullptr, weightPtr, scalePtr, topkIds.data_ptr<mori::moe::index_t>(),
                           input.size(0));
-  handle.LaunchDispatch((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
+  handle.LaunchDispatch((KernelType)kernelType, blockNum, warpPerBlock,
                         at::cuda::getCurrentHIPStream());
 
   torch::Tensor out =
@@ -102,10 +147,205 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
   return {out, outWeights, outScales, outIndices, totalRecvTokenNum};
 }
 
+void D2DCopy(void* dst, const void* src, size_t bytes, hipStream_t stream) {
+  hipError_t st = hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, stream);
+  if (st != hipSuccess) {
+    throw std::runtime_error(std::string("hipMemcpyAsync failed: ") + hipGetErrorString(st));
+  }
+}
+
+Error MoriDispatchImpl(
+    hipStream_t stream,
+    EpDispatchCombineHandle *h,
+    int32_t has_scales,
+    int32_t has_weights,
+    int32_t kernel_type,
+    int32_t block_num,
+    int32_t warp_per_block,
+    AnyBuffer input,
+    BufferR2<F32> weights,
+    AnyBuffer scales,
+    BufferR2<S32> topk_ids,
+    Result<AnyBuffer> out,
+    Result<BufferR2<F32>> out_weights,
+    Result<AnyBuffer> out_scales,
+    Result<BufferR2<S32>> out_indices,
+    Result<BufferR0<S32>> total_recv_token_num) try {
+  
+  XPUT("MoriDispatchImpl handle: %d, kernel_type=%d input=%d weights=%d block_num=%d",
+      h->config.rank, kernel_type, (int)input.size_bytes(), (int)weights.size_bytes(), block_num);
+  
+  assert(ByteWidth(topk_ids.element_type()) == sizeof(mori::moe::index_t) &&
+         ByteWidth(out_indices->element_type()) == sizeof(mori::moe::index_t)); 
+  
+  float *weightsPtr = has_weights ? weights.typed_data() : nullptr;
+
+  uint8_t* scalesPtr = nullptr;
+  if (has_scales && h->config.scaleDim > 0) {
+    assert(/*scales->is_contiguous() &&*/ 
+      ByteWidth(scales.element_type()) == h->config.scaleTypeSize);
+    scalesPtr = static_cast< uint8_t *>(scales.untyped_data());
+  }
+
+  // NOTE: why output is set to NULL??
+  h->PrepareInference(FFIType2HipType(input.element_type()), 
+        input.untyped_data(), nullptr, weightsPtr, scalesPtr, 
+        topk_ids.typed_data(), input.dimensions()[0]);
+  h->LaunchDispatch(static_cast< KernelType >(kernel_type), block_num, 
+                                                      warp_per_block, stream);
+
+  D2DCopy(out->untyped_data(), h->shmemDispatchOutTokMemObj->Get(), 
+        out->size_bytes(), stream);
+
+  if (weightsPtr) {
+    D2DCopy(out_weights->untyped_data(), h->shmemDispatchOutWeightsMemObj->Get(), 
+        out_weights->size_bytes(), stream);
+  }
+  if (scalesPtr) {
+    D2DCopy(out_scales->untyped_data(), h->shmemOutScalesMemObj->Get(), 
+        out_scales->size_bytes(), stream);
+  }
+
+  D2DCopy(out_indices->untyped_data(), h->shmemOutIndicesMemObj->Get(), 
+        out_indices->size_bytes(), stream);
+
+  D2DCopy(total_recv_token_num->untyped_data(), h->totalRecvTokenNum, 
+        sizeof(mori::moe::index_t), stream);
+
+  return Error::Success();
+} 
+catch(std::exception& ex) {
+  XPUT("Exception: %s", ex.what());
+  return Error::Internal(ex.what());
+}
+
+// if this does not work, we will have to send Handle fields via Ctx params..
+XLA_FFI_DEFINE_HANDLER(
+    MoriDispatchHandler, MoriDispatchImpl,
+    // Explicit binding to ensure attrs/args order
+    Ffi::Bind()
+        .Ctx<PlatformStream<hipStream_t>>()
+        .Attr<Pointer<EpDispatchCombineHandle>>("handle_ptr")
+        .Attr<int32_t>("has_scales")
+        .Attr<int32_t>("has_weights")
+        .Attr<int32_t>("kernel_type")
+        .Attr<int32_t>("block_num")
+        .Attr<int32_t>("warp_per_block")
+        // .Attrs()
+        //.Ctx<UserData<EpDispatchCombineHandle>>()
+        .Arg<AnyBuffer>()          // input
+        .Arg<BufferR2<F32>>()      // weights optional
+        .Arg<AnyBuffer>()          // scales optional
+        .Arg<BufferR2<S32>>()      // topk_ids 
+        .Ret<AnyBuffer>()          // out
+        .Ret<BufferR2<F32>>()      // out_weights optional
+        .Ret<AnyBuffer>()          // out_scales optional
+        .Ret<BufferR2<S32>>()      // out_indices 
+        .Ret<BufferR0<S32>>()      // total_recv_token_num
+);
+
+Error MoriCombineImpl(
+    hipStream_t stream,
+    EpDispatchCombineHandle *h,
+    int32_t has_weights,
+    int32_t kernel_type,
+    int32_t block_num,
+    int32_t warp_per_block,
+    AnyBuffer input,
+    BufferR2<F32> weights,
+    BufferR2<S32> topk_ids,
+    Result<AnyBuffer> out,
+    Result<BufferR2<F32>> out_weights) try {
+  
+  XPUT("MoriCombineImpl handle: %d, kernel_type=%d input=%d weights=%d block_num=%d",
+      h->config.rank, kernel_type, (int)input.size_bytes(), (int)weights.size_bytes(), block_num);
+  
+  assert(ByteWidth(topk_ids.element_type()) == sizeof(mori::moe::index_t)); 
+  
+  float *weightsPtr = has_weights ? weights.typed_data() : nullptr;
+
+  // NOTE: why output is set to NULL??
+  h->PrepareInference(FFIType2HipType(input.element_type()), 
+        input.untyped_data(), nullptr, weightsPtr, 
+        topk_ids.typed_data(), h->curRankNumToken);
+  h->LaunchCombine(static_cast< KernelType >(kernel_type), block_num, 
+                                                      warp_per_block, stream);
+
+  D2DCopy(out->untyped_data(), h->shmemCombineOutTokMemObj->Get(), 
+        out->size_bytes(), stream);
+  // {handle.config.maxNumInpTokenPerRank, handle.config.hiddenDim},
+
+  if (weightsPtr) {
+    //{handle.config.maxNumInpTokenPerRank, handle.config.numExpertPerToken},
+    D2DCopy(out_weights->untyped_data(), h->shmemCombineOutWeightsMemObj->Get(), 
+        out_weights->size_bytes(), stream);
+  }
+  return Error::Success();
+} 
+catch(std::exception& ex) {
+  XPUT("Exception: %s", ex.what());
+  return Error::Internal(ex.what());
+}
+
+// if this does not work, we will have to send Handle fields via Ctx params..
+XLA_FFI_DEFINE_HANDLER(
+    MoriCombineHandler, MoriCombineImpl,
+    Ffi::Bind()
+        .Ctx<PlatformStream<hipStream_t>>()
+        .Attr<Pointer<EpDispatchCombineHandle>>("handle_ptr")
+        .Attr<int32_t>("has_weights")
+        .Attr<int32_t>("kernel_type")
+        .Attr<int32_t>("block_num")
+        .Attr<int32_t>("warp_per_block")
+        .Arg<AnyBuffer>()          // input
+        .Arg<BufferR2<F32>>()      // weights optional
+        .Arg<BufferR2<S32>>()      // topk_ids 
+        .Ret<AnyBuffer>()          // out
+        .Ret<BufferR2<F32>>()      // out_weights optional
+);
+
+Error MoriResetImpl(hipStream_t stream, EpDispatchCombineHandle *h) {
+  h->LaunchReset(stream);
+  return Error::Success();
+}
+ 
+XLA_FFI_DEFINE_HANDLER(
+    MoriResetHandler, MoriResetImpl,
+    Ffi::Bind()
+        .Ctx<PlatformStream<hipStream_t>>()
+        .Attr<Pointer<EpDispatchCombineHandle>>("handle_ptr")
+);
+
+Error GetDispatchSrcTokenIdJax(
+    hipStream_t stream,
+    EpDispatchCombineHandle *h,
+    Result<BufferR1<S32>> out) try {
+
+  XPUT("tOks received %d", *h->totalRecvTokenNum);
+  D2DCopy(out->untyped_data(), h->dispTokIdToSrcTokIdMemObj->Get(), 
+        out->size_bytes(), stream);
+  // {*handle.totalRecvTokenNum},
+  return Error::Success();
+} 
+catch(std::exception& ex) {
+  XPUT("Exception: %s", ex.what());
+  return Error::Internal(ex.what());
+}
+
+// if this does not work, we will have to send Handle fields via Ctx params..
+XLA_FFI_DEFINE_HANDLER(
+    GetDispatchSrcTokenIdHandler, GetDispatchSrcTokenIdJax,
+    Ffi::Bind()
+        .Ctx<PlatformStream<hipStream_t>>()
+        .Attr<Pointer<EpDispatchCombineHandle>>("handle_ptr")
+        .Ret<BufferR1<S32>>()  
+);
+
+
 // TODO: translate data type
 // template <typename T>
 std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
-    mori::moe::EpDispatchCombineHandle& handle, int kernelType, const torch::Tensor& input,
+    EpDispatchCombineHandle& handle, int kernelType, const torch::Tensor& input,
     const std::optional<torch::Tensor>& weights, const torch::Tensor& topkIds, int blockNum,
     int warpPerBlock) {
   assert(input.is_contiguous() && topkIds.is_contiguous());
@@ -119,7 +359,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
   handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
                           nullptr, weightsPtr, topkIds.data_ptr<mori::moe::index_t>(),
                           handle.curRankNumToken);
-  handle.LaunchCombine((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
+  handle.LaunchCombine((KernelType)kernelType, blockNum, warpPerBlock,
                        at::cuda::getCurrentHIPStream());
 
   auto options = torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA);
@@ -138,21 +378,24 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
   return {out, outWeights};
 }
 
-void LaunchReset(mori::moe::EpDispatchCombineHandle& handle) {
+void LaunchReset(EpDispatchCombineHandle& handle) {
   handle.LaunchReset(at::cuda::getCurrentHIPStream());
 }
 
-torch::Tensor GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle& handle) {
+torch::Tensor GetDispatchSrcTokenId(EpDispatchCombineHandle& handle) {
   auto options = torch::TensorOptions()
                      .dtype(mori::GetTorchDataType<mori::moe::index_t>())
                      .device(torch::kCUDA);
+
+  XPUT("total toks compare dispatch %d", 
+        (int)*handle.totalRecvTokenNum);
   torch::Tensor tensor =
       torch::from_blob(handle.dispTokIdToSrcTokIdMemObj->template GetAs<mori::moe::index_t*>(),
                        {*handle.totalRecvTokenNum}, options);
   return tensor;
 }
 
-torch::Tensor GetDispatchSenderTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
+torch::Tensor GetDispatchSenderTokenIdxMap(EpDispatchCombineHandle& handle) {
   auto options = torch::TensorOptions()
                      .dtype(mori::GetTorchDataType<mori::moe::index_t>())
                      .device(torch::kCUDA);
@@ -161,7 +404,7 @@ torch::Tensor GetDispatchSenderTokenIdxMap(mori::moe::EpDispatchCombineHandle& h
   return tensor;
 }
 
-torch::Tensor GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
+torch::Tensor GetDispatchReceiverTokenIdxMap(EpDispatchCombineHandle& handle) {
   auto options = torch::TensorOptions()
                      .dtype(mori::GetTorchDataType<mori::moe::index_t>())
                      .device(torch::kCUDA);
@@ -170,7 +413,7 @@ torch::Tensor GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle&
   return tensor;
 }
 
-torch::Tensor GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle& handle,
+torch::Tensor GetRegisteredCombineInputBuffer(EpDispatchCombineHandle& handle,
                                               at::ScalarType scalarType) {
   torch::Tensor out =
       torch::from_blob(handle.shmemCombineInpTokMemObj->Get(),
@@ -179,14 +422,87 @@ torch::Tensor GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle
   return out;
 }
 
+template <typename T>
+py::capsule EncapsulateFFI(T* fn) {
+  static_assert(std::is_invocable_r_v<XLA_FFI_Error *, T, XLA_FFI_CallFrame *>,
+                "Encapsulated function must be an XLA FFI handler");
+  return py::capsule(reinterpret_cast<void*>(fn));
+}
+
+template <typename T>
+T get_attr_value(Dictionary& attrs, std::string attr_name) {
+  auto attr = attrs.get<T>(attr_name);
+  if (attr.has_error()) {
+    MORI_OPS_ERROR("Failure in getting attribute value of '{}'", attr_name);
+    return attr.error();
+  }
+  return attr.value();
+}
+
+void JaxPluginSetup(py::capsule pyc_api) {
+  if (std::string_view(pyc_api.name()) != "pjrt_c_api") {
+    throw std::runtime_error(
+              "Argument to user_data_plugin was not a pjrt_c_api capsule.");
+  }
+  auto* c_api = pyc_api.get_pointer<PJRT_Api>();
+  const auto* ffi_ext = pjrt::FindExtension<PJRT_FFI_Extension>(
+      c_api, PJRT_Extension_Type::PJRT_Extension_Type_FFI);
+  const auto* call_ext = pjrt::FindExtension<PJRT_Gpu_Custom_Call>(
+            c_api, PJRT_Extension_Type::PJRT_Extension_Type_Gpu_Custom_Call);
+  if (call_ext == nullptr || ffi_ext == nullptr) {
+    throw std::runtime_error("PJRT FFI and/or custom call extension is not available!");
+  }
+  XPUT("GOT c_api ext: %p", ffi_ext);
+
+  auto register_ffi = [&](std::string_view name, XLA_FFI_Handler *handler){
+#if 0
+    PJRT_FFI_Register_Handler_Args args {
+      .struct_size = sizeof(PJRT_FFI_Register_Handler_Args),
+      .target_name = name.data(),
+      .target_name_size = name.length(),
+      .handler = reinterpret_cast<void*>(handler),
+      .platform_name = "ROCM",
+      .platform_name_size = 4,
+      .traits = PJRT_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE,
+    };
+    auto *err = std::invoke(ffi_ext->register_handler, &args);
+#else
+    PJRT_Gpu_Register_Custom_Call_Args args {
+      .struct_size = PJRT_Gpu_Register_Custom_Call_Args_STRUCT_SIZE,
+      .function_name = name.data(),
+      .function_name_size = name.length(),
+      .api_version = 1,
+      .handler_instantiate = nullptr,
+      .handler_prepare = nullptr,
+      .handler_initialize = nullptr,
+      .handler_execute = reinterpret_cast<void*>(handler),
+    };
+    auto *err = std::invoke(call_ext->custom_call, &args);
+#endif
+    if (err != nullptr) {
+      throw std::runtime_error("Unable to register FFI handler for " + 
+                std::string(name));
+    }
+  }; // register_ffi
+
+  register_ffi("launch_dispatch", MoriDispatchHandler);
+  register_ffi("launch_combine", MoriCombineHandler);
+  register_ffi("launch_reset", MoriResetHandler);
+  register_ffi("get_dispatch_src_token_id", GetDispatchSrcTokenIdHandler);
+}
+
 void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   std::string className = std::string("EpDispatchCombineHandle");
-  pybind11::class_<mori::moe::EpDispatchCombineHandle>(m, className.c_str())
-      .def(pybind11::init<mori::moe::EpDispatchCombineConfig>(),
-           py::arg("config") = mori::moe::EpDispatchCombineConfig{});
+  pybind11::class_<EpDispatchCombineHandle>(m, className.c_str())
+      .def(pybind11::init<EpDispatchCombineConfig>(),
+           py::arg("config") = EpDispatchCombineConfig{})
+      .def("ptr", [](EpDispatchCombineHandle *p) 
+            { return reinterpret_cast<uintptr_t>(p); });
 
-  std::string funcName = std::string("launch_dispatch");
-  m.def(funcName.c_str(), &LaunchDispatch);
+  m.def("pjrt_plugin_setup", &JaxPluginSetup, py::arg("c_api"));
+
+  std::string funcName;
+  m.def("launch_dispatch", &LaunchDispatch);
 
   funcName = std::string("launch_combine");
   m.def(funcName.c_str(), &LaunchCombine);
@@ -195,7 +511,7 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   m.def(funcName.c_str(), &LaunchReset);
 
   funcName = std::string("get_cur_rank_num_token");
-  m.def(funcName.c_str(), &mori::moe::EpDispatchCombineHandle::GetCurRankNumToken);
+  m.def(funcName.c_str(), &EpDispatchCombineHandle::GetCurRankNumToken);
 
   funcName = std::string("get_dispatch_src_token_pos");
   m.def(funcName.c_str(), &GetDispatchSrcTokenId);
@@ -238,14 +554,15 @@ namespace {}
 namespace mori {
 
 void RegisterMoriOps(py::module_& m) {
-  pybind11::enum_<mori::moe::KernelType>(m, "EpDispatchCombineKernelType")
-      .value("IntraNode", mori::moe::KernelType::IntraNode)
-      .value("InterNode", mori::moe::KernelType::InterNode)
-      .value("InterNodeV1", mori::moe::KernelType::InterNodeV1)
-      .value("InterNodeV1LL", mori::moe::KernelType::InterNodeV1LL)
+  pybind11::enum_<KernelType>(m, "EpDispatchCombineKernelType")
+      .value("IntraNode", KernelType::IntraNode)
+      .value("InterNode", KernelType::InterNode)
+      .value("InterNodeV1", KernelType::InterNodeV1)
+      .value("InterNodeV1LL", KernelType::InterNodeV1LL)
       .export_values();
 
-  pybind11::class_<mori::moe::EpDispatchCombineConfig>(m, "EpDispatchCombineConfig")
+#define OO(X) def(#X, &EpDispatchCombineConfig::X)
+  pybind11::class_<EpDispatchCombineConfig>(m, "EpDispatchCombineConfig")
       .def(pybind11::init<int, int, int, int, int, int, int, int, int, int, int, bool,
                           moe::KernelType, int, int, int>(),
            py::arg("rank") = 0, py::arg("world_size") = 0, py::arg("hidden_dim") = 0,
@@ -256,24 +573,28 @@ void RegisterMoriOps(py::module_& m) {
            py::arg("use_external_inp_buf") = true,
            py::arg("kernel_type") = moe::KernelType::IntraNode, py::arg("gpu_per_node") = 8,
            py::arg("rdma_block_num") = 0, py::arg("num_qp_per_pe") = 1)
-      .def_readwrite("rank", &mori::moe::EpDispatchCombineConfig::rank)
-      .def_readwrite("world_size", &mori::moe::EpDispatchCombineConfig::worldSize)
-      .def_readwrite("hidden_dim", &mori::moe::EpDispatchCombineConfig::hiddenDim)
-      .def_readwrite("scale_dim", &mori::moe::EpDispatchCombineConfig::scaleDim)
-      .def_readwrite("scale_type_size", &mori::moe::EpDispatchCombineConfig::scaleTypeSize)
-      .def_readwrite("max_token_type_size", &mori::moe::EpDispatchCombineConfig::maxTokenTypeSize)
+      .def_readwrite("rank", &EpDispatchCombineConfig::rank)
+      .def_readwrite("world_size", &EpDispatchCombineConfig::worldSize)
+      .def_readwrite("hidden_dim", &EpDispatchCombineConfig::hiddenDim)
+      .def_readwrite("scale_dim", &EpDispatchCombineConfig::scaleDim)
+      .def_readwrite("scale_type_size", &EpDispatchCombineConfig::scaleTypeSize)
+      .def_readwrite("max_token_type_size", &EpDispatchCombineConfig::maxTokenTypeSize)
       .def_readwrite("max_num_inp_token_per_rank",
-                     &mori::moe::EpDispatchCombineConfig::maxNumInpTokenPerRank)
-      .def_readwrite("num_experts_per_rank", &mori::moe::EpDispatchCombineConfig::numExpertPerRank)
+                     &EpDispatchCombineConfig::maxNumInpTokenPerRank)
+      .def_readwrite("num_experts_per_rank", &EpDispatchCombineConfig::numExpertPerRank)
       .def_readwrite("num_experts_per_token",
-                     &mori::moe::EpDispatchCombineConfig::numExpertPerToken)
-      .def_readwrite("warp_num_per_block", &mori::moe::EpDispatchCombineConfig::warpNumPerBlock)
-      .def_readwrite("block_num", &mori::moe::EpDispatchCombineConfig::blockNum)
-      .def_readwrite("kernel_type", &mori::moe::EpDispatchCombineConfig::kernelType)
-      .def_readwrite("gpu_per_node", &mori::moe::EpDispatchCombineConfig::gpuPerNode)
-      .def_readwrite("rdma_block_num", &mori::moe::EpDispatchCombineConfig::rdmaBlockNum)
-      .def_readwrite("num_qp_per_pe", &mori::moe::EpDispatchCombineConfig::numQpPerPe);
-
+                     &EpDispatchCombineConfig::numExpertPerToken)
+      .def_readwrite("warp_num_per_block", &EpDispatchCombineConfig::warpNumPerBlock)
+      .def_readwrite("block_num", &EpDispatchCombineConfig::blockNum)
+      .def_readwrite("kernel_type", &EpDispatchCombineConfig::kernelType)
+      .def_readwrite("gpu_per_node", &EpDispatchCombineConfig::gpuPerNode)
+      .def_readwrite("rdma_block_num", &EpDispatchCombineConfig::rdmaBlockNum)
+      .def_readwrite("num_qp_per_pe", &EpDispatchCombineConfig::numQpPerPe)
+      .OO(MaxNumTokensToSendPerRank)
+      .OO(MaxNumTokensToSend)
+      .OO(MaxNumTokensToRecvPerRank)
+      .OO(MaxNumTokensToRecv);
+#undef OO
   DeclareEpDispatchCombineHandle(m);
 }
 
