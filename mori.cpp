@@ -45,12 +45,9 @@ namespace py = pybind11;
 #endif
 
 #include "mori/application/application.hpp"
-#include "mori/core/profiler/constants.hpp"
 #include "mori/io/io.hpp"
 #include "mori/ops/ops.hpp"
-#include "mori/pybind/profiler_registry.hpp"
 #include "mori/shmem/shmem.hpp"
-#include "mori/utils/hip_helper.hpp"
 
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
@@ -90,12 +87,13 @@ namespace {
 hipDataType FFIType2HipType(DataType dtype) {
 #define XX(A, B) case DataType::A: return B;
   switch (dtype) {
+    XX(S32, HIP_R_32F) // we interpret as float32!
     XX(F32, HIP_R_32F)
     XX(BF16, HIP_R_16BF)
     XX(F8E4M3FN, HIP_R_8F_E4M3)
     XX(F8E4M3FNUZ, HIP_R_8F_E4M3_FNUZ)
     default:
-      throw std::runtime_error("Unsupported scalar type");
+      throw std::runtime_error("Unsupported scalar type: " + std::to_string((int)dtype));
   }
 #undef XX
 }
@@ -133,8 +131,8 @@ Error MoriDispatchImpl(
     Result<BufferR2<S32>> out_indices,
     Result<BufferR0<S32>> total_recv_token_num) {
   
-  XPUT("MoriDispatchImpl handle: %d, kernel_type=%d input=%d weights=%d block_num=%d stream: %p",
-      h->config.rank, kernel_type, (int)input.size_bytes(), (int)weights.size_bytes(), block_num, stream);
+  // XPUT("MoriDispatchImpl handle: %d, kernel_type=%d input=%d weights=%d block_num=%d stream: %p",
+  //     h->config.rank, kernel_type, (int)input.size_bytes(), (int)weights.size_bytes(), block_num, stream);
   
   assert(ByteWidth(topk_ids.element_type()) == sizeof(index_t) &&
          ByteWidth(out_indices->element_type()) == sizeof(index_t)); 
@@ -442,24 +440,6 @@ torch::Tensor GetRegisteredCombineInputBuffer(EpDispatchCombineHandle& handle,
                        torch::TensorOptions().dtype(scalarType).device(torch::kCUDA));
   return out;
 }
-
-#ifdef ENABLE_PROFILER
-torch::Tensor GetDebugTimeBuf(mori::moe::EpDispatchCombineHandle& handle) {
-  auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
-  torch::Tensor tensor =
-      torch::from_blob(handle.profilerConfig.debugTimeBuf, {MAX_DEBUG_TIME_SLOTS}, options);
-  return tensor;
-}
-
-torch::Tensor GetDebugTimeOffset(mori::moe::EpDispatchCombineHandle& handle) {
-  auto options = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
-  torch::Tensor tensor =
-      torch::from_blob(handle.profilerConfig.debugTimeOffset, {PROFILER_WARPS_PER_RANK}, options);
-  return tensor;
-}
-#endif
-
-int GetCurDeviceWallClockFreqMhz() { return mori::GetCurDeviceWallClockFreqMhz(); }
 #endif // MORI_ENABLE_TORCH
 
 void JaxPluginSetup(py::capsule pyc_api) {
@@ -535,14 +515,6 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   m.def("get_dispatch_receiver_token_idx_map", &GetDispatchReceiverTokenIdxMap);
   m.def("get_registered_combine_input_buffer", &GetRegisteredCombineInputBuffer);
 #endif // MORI_ENABLE_TORCH
-
-#ifdef ENABLE_PROFILER
-  funcName = std::string("get_debug_time_buf");
-  m.def(funcName.c_str(), &GetDebugTimeBuf);
-
-  funcName = std::string("get_debug_time_offset");
-  m.def(funcName.c_str(), &GetDebugTimeOffset);
-#endif
 }
 
 }  // namespace
@@ -634,6 +606,7 @@ int64_t ShmemNumQpPerPe() { return mori::shmem::ShmemNumQpPerPe(); }
 /* ---------------------------------------------------------------------------------------------- */
 /*                                             IO APIs                                            */
 /* ---------------------------------------------------------------------------------------------- */
+namespace {}
 
 namespace mori {
 
@@ -645,19 +618,17 @@ void RegisterMoriOps(py::module_& m) {
       .value("InterNodeV1LL", KernelType::InterNodeV1LL)
       .export_values();
 
-  mori::pybind::RegisterAllProfilerSlots(m);
-
 #define OO(X) def(#X, &EpDispatchCombineConfig::X)
   pybind11::class_<EpDispatchCombineConfig>(m, "EpDispatchCombineConfig")
       .def(pybind11::init<int, int, int, int, int, int, int, int, int, int, int, bool,
-                          mori::moe::KernelType, int, int, int>(),
+                          moe::KernelType, int, int, int>(),
            py::arg("rank") = 0, py::arg("world_size") = 0, py::arg("hidden_dim") = 0,
            py::arg("scale_dim") = 0, py::arg("scale_type_size") = 0,
            py::arg("max_token_type_size") = 0, py::arg("max_num_inp_token_per_rank") = 0,
            py::arg("num_experts_per_rank") = 0, py::arg("num_experts_per_token") = 0,
            py::arg("warp_num_per_block") = 0, py::arg("block_num") = 0,
            py::arg("use_external_inp_buf") = true,
-           py::arg("kernel_type") = mori::moe::KernelType::IntraNode, py::arg("gpu_per_node") = 8,
+           py::arg("kernel_type") = moe::KernelType::IntraNode, py::arg("gpu_per_node") = 8,
            py::arg("rdma_block_num") = 0, py::arg("num_qp_per_pe") = 1)
       .def_readwrite("rank", &EpDispatchCombineConfig::rank)
       .def_readwrite("world_size", &EpDispatchCombineConfig::worldSize)
@@ -682,9 +653,6 @@ void RegisterMoriOps(py::module_& m) {
       .OO(MaxNumTokensToRecv);
 #undef OO
   DeclareEpDispatchCombineHandle(m);
-
-  m.def("get_cur_device_wall_clock_freq_mhz", &GetCurDeviceWallClockFreqMhz,
-        "Returns clock frequency of current device's wall clock");
 }
 
 void RegisterMoriShmem(py::module_& m) {
@@ -778,7 +746,6 @@ void RegisterMoriIo(pybind11::module_& m) {
       .value("ERR_NOT_FOUND", mori::io::StatusCode::ERR_NOT_FOUND)
       .value("ERR_RDMA_OP", mori::io::StatusCode::ERR_RDMA_OP)
       .value("ERR_BAD_STATE", mori::io::StatusCode::ERR_BAD_STATE)
-      .value("ERR_GPU_OP", mori::io::StatusCode::ERR_GPU_OP)
       .export_values();
 
   py::enum_<mori::io::PollCqMode>(m, "PollCqMode")
@@ -797,11 +764,6 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readwrite("num_worker_threads", &mori::io::RdmaBackendConfig::numWorkerThreads)
       .def_readwrite("poll_cq_mode", &mori::io::RdmaBackendConfig::pollCqMode)
       .def_readwrite("enable_notification", &mori::io::RdmaBackendConfig::enableNotification);
-
-  py::class_<mori::io::XgmiBackendConfig, mori::io::BackendConfig>(m, "XgmiBackendConfig")
-      .def(py::init<int, int>(), py::arg("num_streams") = 64, py::arg("num_events") = 64)
-      .def_readwrite("num_streams", &mori::io::XgmiBackendConfig::numStreams)
-      .def_readwrite("num_events", &mori::io::XgmiBackendConfig::numEvents);
 
   py::class_<mori::io::IOEngineConfig>(m, "IOEngineConfig")
       .def(py::init<std::string, uint16_t>(), py::arg("host") = "", py::arg("port") = 0)
@@ -851,10 +813,6 @@ void RegisterMoriIo(pybind11::module_& m) {
                              })
       .def_readonly("size", &mori::io::MemoryDesc::size)
       .def_readonly("loc", &mori::io::MemoryDesc::loc)
-      .def_property_readonly("ipc_handle",
-                             [](const mori::io::MemoryDesc& desc) {
-                               return py::bytes(desc.ipcHandle.data(), desc.ipcHandle.size());
-                             })
       .def(pybind11::self == pybind11::self)
       .def("pack",
            [](const mori::io::MemoryDesc& d) {

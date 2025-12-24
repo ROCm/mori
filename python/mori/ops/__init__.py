@@ -19,8 +19,16 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-from .dispatch_combine import (
+from jax._src import xla_bridge as xb
+
+from .dispatch_combine_jax import (
     EpDispatchCombineKernelType,
     EpDispatchCombineConfig,
     EpDispatchCombineOp,
+    mori_shmem_init_attr,
 )
+
+from mori import cpp as mori_cpp
+
+xb.register_plugin_callbacks(mori_cpp.pjrt_plugin_setup)
+

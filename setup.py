@@ -40,10 +40,9 @@ _supported_arch_list = ["gfx942", "gfx950"]
 
 def _get_gpu_archs() -> str:
     archs = os.environ.get("PYTORCH_ROCM_ARCH", None)
-    if not archs:
-        import torch
-
-        archs = torch._C._cuda_getArchFlags()
+    #if not archs:
+        #import torch
+        #archs = torch._C._cuda_getArchFlags()
 
     gpu_archs = os.environ.get("GPU_ARCHS", None)
     if gpu_archs:
@@ -53,10 +52,12 @@ def _get_gpu_archs() -> str:
     if mori_gpu_archs:
         archs = mori_gpu_archs
 
-    arch_list = archs.replace(" ", ";").split(";")
-
-    # filter out supported architectures
-    valid_arch_list = list(set(_supported_arch_list) & set(arch_list))
+    if archs:
+        arch_list = archs.replace(" ", ";").split(";")
+        # filter out supported architectures
+        valid_arch_list = list(set(_supported_arch_list) & set(arch_list))
+    else:
+        valid_arch_list = _supported_arch_list
     if len(valid_arch_list) == 0:
         raise ValueError(
             f"no supported archs found, supported {_supported_arch_list}, got {arch_list}"
@@ -105,7 +106,7 @@ class CMakeBuild(build_ext):
                 str(build_dir),
                 "-S",
                 str(root_dir),
-                f"-DCMAKE_PREFIX_PATH={_get_torch_cmake_prefix_path()}",
+                #f"-DCMAKE_PREFIX_PATH={_get_torch_cmake_prefix_path()}",
             ]
         )
         subprocess.check_call(

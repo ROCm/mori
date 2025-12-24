@@ -38,6 +38,9 @@
   #define MORI_PRINTF(...) ((void)0)
 #endif
 
+#define DDD fprintf(stderr, "progress %s:%d\n", __FILE__, __LINE__);
+#define XPUT(fmt, ...) fprintf(stderr, fmt"\n", ##__VA_ARGS__)
+
 namespace mori {
 namespace core {
 

@@ -23,6 +23,9 @@ target_link_libraries(
 # Use code object version 5 for compatibility with Triton
 target_compile_options(mori_shmem PUBLIC "-fgpu-rdc" "-mcode-object-version=5")
 target_link_options(mori_shmem PUBLIC "-fgpu-rdc" "-mcode-object-version=5")
+if (NOT USE_TORCH)
+  set_property(TARGET mori_shmem PROPERTY POSITION_INDEPENDENT_CODE ON)
+endif()
 
 option(SAVE_TEMPS "Save intermediate compilation files" ON)
 if(SAVE_TEMPS)

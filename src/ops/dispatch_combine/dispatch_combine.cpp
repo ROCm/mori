@@ -44,9 +44,11 @@ using namespace mori::shmem;
 /* ---------------------------------------------------------------------------------------------- */
 /*                                     EpDispatchCombineHandle                                    */
 /* ---------------------------------------------------------------------------------------------- */
-EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_)
+EpDispatchCombineHandle::EpDispatchCombineHandle(const EpDispatchCombineConfig& config_)
     : config(config_) {
   assert(IsPowerOf2(config.gpuPerNode) && (config.worldSize % config.gpuPerNode == 0));
+  
+  // HACK HACK
   int shmemNumQpPerPe = ShmemNumQpPerPe();
   if (config.numQpPerPe > shmemNumQpPerPe) {
     config.numQpPerPe = shmemNumQpPerPe;
@@ -62,6 +64,7 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
 }
 
 EpDispatchCombineHandle::~EpDispatchCombineHandle() {
+  // HACK 
   FinalizeShmemBuf();
   FinalizeTokenNumSignalBuf();
   FinalizeOrderMapBuf();

@@ -15,6 +15,8 @@ if(NOT DEFINED CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "")
       CACHE STRING "Choose build type" FORCE)
 endif()
 
+set(XLA_INCLUDE_DIR "/tf/xla" CACHE PATH "XLA include directory for FFI custom calls") 
+
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -22,6 +24,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(USE_ROCM "Whether to use rocm" ON)
 option(USE_BNXT "Whether to use BNXT NIC" OFF)
 option(USE_IONIC "Whether to use IONIC" OFF)
+option(USE_TORCH "Whether to use torch" OFF)
 option(BUILD_EXAMPLES "Whether to build examples" ON)
 option(BUILD_APPLICATION "Whether to build application library" ON)
 option(BUILD_SHMEM "Whether to build shmem library" ON)
@@ -117,6 +120,8 @@ else()
   find_package(CUDAToolkit REQUIRED)
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -expt-relaxed-constexpr")
 endif()
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-literal-operator")
 
 add_library(mori_logging INTERFACE)
 target_include_directories(mori_logging INTERFACE include

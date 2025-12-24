@@ -52,10 +52,10 @@ target_link_libraries(atomic_fetch_thread mori_shmem hip::host hip::device)
 add_executable(context application/context.cpp)
 target_link_libraries(context mori_application hip::host hip::device)
 
-add_executable(test_dispatch_combine_ops
-               ops/dispatch_combine/test_dispatch_combine.cpp)
-target_link_libraries(test_dispatch_combine_ops mori_application mori_shmem
-                      mori_ops hip::host hip::device)
+# add_executable(test_dispatch_combine_ops
+#                ops/dispatch_combine/test_dispatch_combine.cpp)
+# target_link_libraries(test_dispatch_combine_ops mori_application mori_shmem
+#                       mori_ops hip::host hip::device)
 
 add_executable(atomic_perf benchmarks/atomic_perf.cpp utils/args_parser.cpp)
 target_include_directories(atomic_perf
