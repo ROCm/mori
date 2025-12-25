@@ -128,5 +128,53 @@ int ShmemBufferDeregister(void* ptr, size_t size) {
   return 0;
 }
 
+uint64_t ShmemPtrP2p(const uint64_t destPtr, const int myPe, int destPe) {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
+
+  // If same PE, return the pointer directly
+  if (myPe == destPe) {
+    return destPtr;
+  }
+
+  if (destPe < 0 || destPe >= static_cast<int>(states->bootStates->worldSize)) {
+    MORI_SHMEM_ERROR("Invalid destPe: {}", destPe);
+    return 0;
+  }
+
+  application::TransportType transportType = states->rdmaStates->commContext->GetTransportType(destPe);
+  if (transportType == application::TransportType::RDMA) {
+    return 0;
+  }
+
+  uintptr_t localAddrInt = static_cast<uintptr_t>(destPtr);
+
+  // Check if the pointer is within the symmetric heap
+  uintptr_t heapBaseAddr = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
+  uintptr_t heapEndAddr = heapBaseAddr + states->memoryStates->staticHeapSize;
+
+  if (localAddrInt < heapBaseAddr || localAddrInt >= heapEndAddr) {
+    MORI_SHMEM_ERROR("Pointer 0x{:x} is not in symmetric heap [0x{:x}, 0x{:x})", 
+                     localAddrInt, heapBaseAddr, heapEndAddr);
+    return 0;
+  }
+
+  // Calculate offset from heap base
+  size_t offset = localAddrInt - heapBaseAddr;
+
+  // Get the symmetric memory object for the heap
+  application::SymmMemObjPtr heapObj = states->memoryStates->staticHeapObj;
+  if (heapObj->Get() == nullptr) {
+    MORI_SHMEM_ERROR("Failed to get heap symmetric memory object");
+    return 0;
+  }
+
+  uint64_t peerBaseAddr = heapObj->peerPtrs[destPe];
+
+  // Return the remote P2P address
+  uint64_t remoteAddr = peerBaseAddr + offset;
+  return remoteAddr;
+}
+
 }  // namespace shmem
 }  // namespace mori

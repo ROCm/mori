@@ -199,3 +199,22 @@ def shmem_buffer_deregister(ptr: int, size: int) -> int:
         Status code (0 for success)
     """
     return mori_cpp.shmem_buffer_deregister(ptr, size)
+
+
+def shmem_ptr_p2p(dest_ptr: int, my_pe: int, dest_pe: int) -> int:
+    """Convert local symmetric memory pointer to remote P2P address.
+    
+    This function translates a local symmetric memory pointer to the corresponding
+    P2P (Peer-to-Peer) accessible address on a remote PE. This is useful for
+    direct GPU-to-GPU memory access within a node.
+    
+    Args:
+        dest_ptr: Local symmetric memory pointer (as int/uint64)
+        my_pe: My PE (process element) ID
+        dest_pe: Target PE ID to get P2P address for
+        
+    Returns:
+        - Non-zero P2P address: If connection uses P2P transport (same node GPUs)
+        - 0: If connection uses RDMA transport (different nodes) or if pointer is invalid
+    """
+    return mori_cpp.shmem_ptr_p2p(dest_ptr, my_pe, dest_pe)

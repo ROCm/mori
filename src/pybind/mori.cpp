@@ -290,6 +290,11 @@ int64_t ShmemBufferDeregister(uintptr_t ptr, size_t size) {
   return mori::shmem::ShmemBufferDeregister(reinterpret_cast<void*>(ptr), size);
 }
 
+// P2P address translation
+uint64_t ShmemPtrP2p(uint64_t destPtr, int myPe, int destPe) {
+  return mori::shmem::ShmemPtrP2p(destPtr, myPe, destPe);
+}
+
 }  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -396,6 +401,13 @@ void RegisterMoriShmem(py::module_& m) {
   m.def("shmem_buffer_deregister", &ShmemBufferDeregister,
         py::arg("ptr"), py::arg("size"),
         "Deregister a buffer from RDMA (ptr should be int address)");
+  
+  // P2P address translation
+  m.def("shmem_ptr_p2p", &ShmemPtrP2p,
+        py::arg("dest_ptr"), py::arg("my_pe"), py::arg("dest_pe"),
+        "Convert local symmetric memory pointer to remote P2P address. "
+        "Returns 0 if connection uses RDMA or if pointer is invalid. "
+        "Returns P2P accessible address if connection uses P2P transport.");
 }
 
 void RegisterMoriIo(pybind11::module_& m) {

@@ -93,5 +93,7 @@ application::SymmMemObjPtr ShmemQueryMemObjPtr(void*);
 int ShmemBufferRegister(void* ptr, size_t size);
 int ShmemBufferDeregister(void* ptr, size_t size);
 
+uint64_t ShmemPtrP2p(const uint64_t destPtr, const int myPe, int destPe);
+
 }  // namespace shmem
 }  // namespace mori
