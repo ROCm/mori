@@ -10,6 +10,9 @@ add_executable(sdma_latency sdma/sdma_latency.cpp sdma/common.cpp sdma/utils.cpp
 target_include_directories(sdma_latency PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
 target_link_libraries(sdma_latency mori_application hip::host hip::device)
 
+# Find MPI package (required by allreduce_example)
+find_package(MPI REQUIRED)
+
 add_executable(dist_write dist_rdma_ops/dist_write.cpp utils/args_parser.cpp)
 target_include_directories(dist_write
                            PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
@@ -32,6 +35,11 @@ target_link_libraries(put_thread_allgather mori_shmem hip::host hip::device)
 
 add_executable(all_reduce collective/all_reduce.cpp)
 target_link_libraries(all_reduce mori_collective hip::host hip::device)
+
+# Custom allreduce example (using MPI)
+add_executable(allreduce_example collective/allreduce_example.cpp)
+target_link_libraries(allreduce_example mori_collective MPI::MPI_CXX hip::host hip::device)
+target_include_directories(allreduce_example PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
 add_executable(all_gather collective/all_gather.cpp)
 target_link_libraries(all_gather mori_shmem hip::host hip::device)
