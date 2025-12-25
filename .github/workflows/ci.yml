@@ -65,14 +65,14 @@ jobs:
           id -G
           id
           # 查看当前用户在哪些组
-          groups $USER
+          #groups $USER
           # 检查 render 和 video 组是否存在
-          getent group render
-          getent group video
+          #getent group render
+          #getent group video
 
           # 查看 /dev/kfd 权限
-          ls -l /dev/kfd
-          ls -l /dev/dri/
+          #ls -l /dev/kfd
+          #ls -l /dev/dri/
           #rocm-smi 
           #/opt/rocm/bin/rocminfo
           #python test.py
@@ -83,12 +83,12 @@ jobs:
           #python3 tests/python/ops/bench_dispatch_combine.py
           #pytest -v tests/python/ops/
           #ldd ./build/examples/dist_write
-          which mpiexec
-          /usr/bin/mpiexec --version 
-          mpiexec --version
-          ldd /usr/bin/mpiexec
-          ldd /usr/lib/x86_64-linux-gnu/openmpi/lib/openmpi3/mca_pmix_ext3x.so
-          nm -D /usr/lib/x86_64-linux-gnu/openmpi/lib/openmpi3/mca_pmix_ext3x.so | grep pmix_value_load
-          find /usr -name "*pmix*" -type f | xargs nm -D 2>/dev/null | grep pmix_value_load
+          #which mpiexec
+          #/usr/bin/mpiexec --version 
+          #mpiexec --version
+          #ldd /usr/bin/mpiexec
+          #ldd /usr/lib/x86_64-linux-gnu/openmpi/lib/openmpi3/mca_pmix_ext3x.so
+          #nm -D /usr/lib/x86_64-linux-gnu/openmpi/lib/openmpi3/mca_pmix_ext3x.so | grep pmix_value_load
+          #find /usr -name "*pmix*" -type f | xargs nm -D 2>/dev/null | grep pmix_value_load
           mpiexec --allow-run-as-root -x MORI_GLOBAL_LOG_LEVEL=TRACE -np 2 ls
-          #mpiexec --allow-run-as-root -x MORI_GLOBAL_LOG_LEVEL=TRACE -np 2 ./build/examples/dist_write -c 1 -t 1 -q 1
+          mpiexec --allow-run-as-root -x MORI_GLOBAL_LOG_LEVEL=TRACE -np 2 ./build/examples/dist_write -c 1 -t 1 -q 1
