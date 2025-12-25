@@ -10,7 +10,8 @@ jobs:
           pwd
           hostname
           id
-          export PATH="/usr/bin:/usr/local/bin:$PATH"
+          #export PATH="/usr/bin:/usr/local/bin:$PATH"
+          export PATH="/home/fizhang/.local/bin:$PATH"
           cmake --version
           #exit 
           #source ~/.bashrc
