@@ -62,8 +62,7 @@ jobs:
           cd mori
           ls
           id
-          rocm-smi
-     
+          rocm-smi 
           /opt/rocm/bin/rocminfo
           #python test.py
           #bash test.sh
