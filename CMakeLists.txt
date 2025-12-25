@@ -50,7 +50,7 @@ if(NOT DEFINED WARP_ACCUM_UNROLL)
 endif()
 message(STATUS "WARP_ACCUM_UNROLL is set to: ${WARP_ACCUM_UNROLL}")
 add_definitions(-DWARP_ACCUM_UNROLL=${WARP_ACCUM_UNROLL})
-
+add_definitions(-DHIP_ENABLE_WARP_SYNC_BUILTINS)
 if(USE_ROCM)
   list(APPEND CMAKE_PREFIX_PATH "/opt/rocm")
   project(mori LANGUAGES HIP CXX C)
