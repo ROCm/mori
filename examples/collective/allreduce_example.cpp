@@ -118,9 +118,10 @@ int main(int argc, char** argv) {
     // verify results
     hipMemcpy(h_data.data(), d_data, count * sizeof(float), hipMemcpyDeviceToHost);
     bool success = verifyResults(h_data.data(), count, num_ranks);
+    int success_int = success ? 1 : 0;
     
     int global_success;
-    MPI_Allreduce(&success, &global_success, 1, MPI_INT, MPI_LAND, MPI_COMM_WORLD);
+    MPI_Allreduce(&success_int, &global_success, 1, MPI_INT, MPI_LAND, MPI_COMM_WORLD);
     
     if (rank == 0) {
       if (global_success) {

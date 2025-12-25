@@ -251,7 +251,7 @@ private:
   char* open_ipc_handle(const hipIpcMemHandle_t* ipc_handle) {
     // Convert hipIpcMemHandle_t to IPC_KEY for use as map key
     auto [it, new_handle] =
-      ipc_handles_.insert({*((IPC_KEY*)&ipc_handle), nullptr});
+      ipc_handles_.insert({*((const IPC_KEY*)ipc_handle), nullptr});
     // insert success
     if (new_handle) {
       char* ipc_ptr;
