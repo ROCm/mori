@@ -62,6 +62,16 @@ jobs:
           cd mori
           ls
           id
+          # 查看当前用户在哪些组
+groups $USER
+
+# 检查 render 和 video 组是否存在
+getent group render
+getent group video
+
+# 查看 /dev/kfd 权限
+ls -l /dev/kfd
+ls -l /dev/dri/
           rocm-smi 
           /opt/rocm/bin/rocminfo
           #python test.py
