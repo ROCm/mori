@@ -63,10 +63,10 @@ jobs:
           ls
           id
           rocm-smi 
-          #/opt/rocm/bin/rocminfo
+          /opt/rocm/bin/rocminfo
           #python test.py
           #bash test.sh
-          #export PYTHONPATH=/home/runner/actions-runner/_work/mori/mori/mori:$PYTHONPATH
+          export PYTHONPATH=/home/fizhang/actions-runner/_work/mori/mori/mori:$PYTHONPATH
           #export PYTHONPATH=/apps/mori-ci/python-packages:$PYTHONPATH
           #python3 tests/python/ops/bench_dispatch_combine.py
           #pytest -v tests/python/ops/
