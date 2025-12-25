@@ -60,7 +60,9 @@ jobs:
       - name: Run tests
         run: |
           cd mori
-          ls
+          id ci
+          groups
+          id -G
           id
           # 查看当前用户在哪些组
           groups $USER
