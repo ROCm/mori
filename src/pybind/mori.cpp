@@ -45,21 +45,12 @@
 
 using namespace xla::ffi;
 
-namespace mori::moe {
-struct EpDispatchCombineHandleFFI : public EpDispatchCombineHandle {
-
-  static TypeId id;
-  EpDispatchCombineHandleFFI(EpDispatchCombineConfig config) :
-      EpDispatchCombineHandle(std::move(config)) { }
-
-};
-TypeId EpDispatchCombineHandleFFI::id;
-}
-
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Ops APIs                                            */
 /* ---------------------------------------------------------------------------------------------- */
 namespace {
+
+// EpDispatchCombineHandle EpGlobalHandle;
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, torch::Tensor,
            torch::Tensor>
@@ -123,8 +114,8 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
 #define XPUT(fmt, ...) fprintf(stderr, fmt"\n", ##__VA_ARGS__)
 
 Error MoriDispatchImpl(
-    // hipStream_t stream,
-    // mori::moe::EpDispatchCombineHandleFFI *handle,
+    hipStream_t stream,
+    mori::moe::EpDispatchCombineHandle *handle,
     int32_t kernel_type,
     AnyBuffer input,
     AnyBuffer weights,
@@ -138,21 +129,20 @@ Error MoriDispatchImpl(
     Result<AnyBuffer> out_indices,
     Result<BufferR0<S32>> total_recv_token_num) {
   
-  XPUT("MoriDispatchImpl kernel_type=%d input=%d weights=%d block_num=%d",
-      kernel_type, (int)input.size_bytes(), (int)weights.size_bytes(), block_num);
+  XPUT("MoriDispatchImpl handle: %d, kernel_type=%d input=%d weights=%d block_num=%d",
+      handle->config.rank, kernel_type, (int)input.size_bytes(), (int)weights.size_bytes(), block_num);
   return Error::Success();
 }
 
-
-// Define handlers via FFI macros.
+// if this does not work, we will have to send Handle fields via Ctx params..
 XLA_FFI_DEFINE_HANDLER(
     MoriDispatchHandler, MoriDispatchImpl,
     // Explicit binding to ensure attrs/args order
     Ffi::Bind()
-        // .Ctx<PlatformStream<hipStream_t>>()
-        // .Ctx<ffi::State<State>>() ??
-        // .Ctx<UserData<mori::moe::EpDispatchCombineHandleFFI>>()
-        //.Attr<Pointer<mori::moe::EpDispatchCombineHandle>>("handle_ptr")
+        .Ctx<PlatformStream<hipStream_t>>()
+        // .Attrs()
+        //.Ctx<UserData<mori::moe::EpDispatchCombineHandle>>()
+        .Attr<Pointer<mori::moe::EpDispatchCombineHandle>>("handle_ptr")
         .Attr<int32_t>("kernel_type")
         .Arg<AnyBuffer>()          // input
         .Arg<AnyBuffer>()          // weights optional
@@ -247,24 +237,51 @@ torch::Tensor GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle
 }
 
 template <typename T>
-py::capsule EncapsulateFfiHandler(T* fn) {
+py::capsule EncapsulateFFI(T* fn) {
   static_assert(std::is_invocable_r_v<XLA_FFI_Error *, T, XLA_FFI_CallFrame *>,
                 "Encapsulated function must be an XLA FFI handler");
-  return py::capsule(reinterpret_cast<void*>(fn), "my_first_ffi");
+  return py::capsule(reinterpret_cast<void*>(fn));
 }
+
+template <typename T>
+T get_attr_value(Dictionary& attrs, std::string attr_name) {
+  auto attr = attrs.get<T>(attr_name);
+  if (attr.has_error()) {
+    MORI_OPS_ERROR("Failure in getting attribute value of '{}'", attr_name);
+    return attr.error();
+  }
+  return attr.value();
+}
+
+// std::vector< mori::moe::EpDispatchCombineHandle > global_handles;
+
+// void SetDispatchCombineConfig(const mori::moe::EpDispatchCombineConfig& config) {
+
+//   auto it = std::find_if(begin(global_handles), end(global_handles), 
+//         [&config](const auto& h) { return h.config == config; });
+//   if (it == end(global_handles)) {
+//     XPUT("Setting config! rank=%d", config.rank);
+//   }
+// }
 
 void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   std::string className = std::string("EpDispatchCombineHandle");
   pybind11::class_<mori::moe::EpDispatchCombineHandle>(m, className.c_str())
       .def(pybind11::init<mori::moe::EpDispatchCombineConfig>(),
-           py::arg("config") = mori::moe::EpDispatchCombineConfig{});
+           py::arg("config") = mori::moe::EpDispatchCombineConfig{})
+      .def("ptr", [](mori::moe::EpDispatchCombineHandle *p) 
+            { return reinterpret_cast<uintptr_t>(p); });
 
-  std::string funcName = std::string("launch_dispatch");
-  m.def(funcName.c_str(), &LaunchDispatch);
+  // m.def("set_config", &SetDispatchCombineConfig);
 
-  //m.def(funcName.c_str(), &MoriDispatchHandler);
-  m.def("launch_dispatch_ffi", []() { return EncapsulateFfiHandler(MoriDispatchHandler); },
-      py::return_value_policy::reference);
+  std::string funcName;
+  m.def("launch_dispatch", &LaunchDispatch);
+
+  // m.def("handle_type_id",
+  //       []() { return py::capsule(reinterpret_cast<void*>(
+  //             &mori::moe::EpDispatchCombineHandle::id)); });
+
+  m.def("launch_dispatch_ffi", []() { return EncapsulateFFI(MoriDispatchHandler); });
 
   funcName = std::string("launch_combine");
   m.def(funcName.c_str(), &LaunchCombine);

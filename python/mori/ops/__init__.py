@@ -31,5 +31,8 @@ from mori import cpp as mori_cpp
 
 jax.ffi.register_ffi_target("launch_dispatch_ffi", \
                 mori_cpp.launch_dispatch_ffi(), platform="ROCM")
+# jax.ffi.register_ffi_type_id("launch_dispatch_ffi", \
+#                 mori_cpp.handle_type_id(), platform="ROCM")
+
 
 print("registration OK")

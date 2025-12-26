@@ -33,17 +33,19 @@ class PlaygroundTestCase:
         
         op = mori.ops.EpDispatchCombineOp(self.config)
         
-        w,h = 256, 768
-        input = jnp.linspace(-1, 1, w*h).reshape([w, h])
-        weights = jnp.linspace(-1, 1, w*h).reshape([w, h])
-        scales = jnp.linspace(-1, 1, w*h).reshape([w, h])
-        indices = jnp.linspace(0, 100, w*h, dtype=jnp.int32).reshape([w, h])
+        @jax.jit
+        def gen_inputs():
+          w,h = 256, 768
+          input = jnp.linspace(-1, 1, w*h).reshape([w, h])
+          weights = jnp.linspace(-1, 1, w*h).reshape([w, h])
+          scales = jnp.linspace(-1, 1, w*h).reshape([w, h])
+          indices = jnp.linspace(0, 100, w*h, dtype=jnp.int32).reshape([w, h])
+          return input, weights, scales, indices
         
-        res = op.dispatch_jax(
-            input, weights, scales, indices
-        )
+        S = gen_inputs()
+        res = op.dispatch_jax(*S)
         
         
 if __name__ == "__main__":
   print("Start")
-  test_case = PlaygroundTestCase(rank=0, world_size=1)
+  test_case = PlaygroundTestCase(rank=110, world_size=1)

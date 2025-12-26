@@ -15,10 +15,10 @@ if [[ ${full} -eq 1 ]]; then
   cmake -DUSE_ROCM=ON -DCMAKE_BUILD_TYPE=Release \
       -DWARP_ACCUM_UNROLL=1 -DUSE_BNXT=OFF \
       -DGPU_TARGETS=gfx942 \
-      ..
+      .. 
 fi
 
-make -j
+make VERBOSE=1 -j 2>&1 | tee ../yyybuild.log
 
 cp src/pybind/libmori_pybinds.so \
    src/application/libmori_application.so \

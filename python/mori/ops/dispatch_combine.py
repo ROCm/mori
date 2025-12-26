@@ -29,6 +29,9 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from jax._src.lib.mlir import ir
+from jax._src.interpreters import mlir
+
 class EpDispatchCombineKernelType(mori_cpp.EpDispatchCombineKernelType):
     def __str__(self):
         return self.name
@@ -61,11 +64,8 @@ def _cpp_dispatch_combine_factory(entity_name):
 
 class EpDispatchCombineOp:
     def __init__(self, config):
-        self.config = config
-
         handle_class = _cpp_dispatch_combine_factory("EpDispatchCombineHandle")
-        self._handle = handle_class(
-            mori_cpp.EpDispatchCombineConfig(
+        self.config = mori_cpp.EpDispatchCombineConfig(
                 rank=config.rank,
                 world_size=config.world_size,
                 hidden_dim=config.hidden_dim,
@@ -83,7 +83,7 @@ class EpDispatchCombineOp:
                 rdma_block_num=config.rdma_block_num,
                 num_qp_per_pe=config.num_qp_per_pe,
             )
-        )
+        self.handle_ = handle_class(self.config)
 
         self._dispatch_func = _cpp_dispatch_combine_factory("launch_dispatch")
         self._combine_func = _cpp_dispatch_combine_factory("launch_combine")
@@ -105,7 +105,7 @@ class EpDispatchCombineOp:
         )
 
     def get_registered_combine_input_buffer(self, dtype: torch.dtype):
-        return self._get_registered_combine_input_buffer(self._handle, dtype)
+        return self._get_registered_combine_input_buffer(self.handle_, dtype)
     
     def dispatch_jax(
         self,
@@ -126,11 +126,11 @@ class EpDispatchCombineOp:
                 jax.ShapeDtypeStruct((), jnp.int32),
             ),
         )(
-            #self._handle,
             input,
             weights,
             scales,
             indices,
+            handle_ptr=np.int64(self.handle_.ptr()),
             kernel_type=np.int32(self.config.kernel_type.value),
             block_num=np.int32(block_num),
             warp_per_block=np.int32(warp_per_block),
@@ -146,7 +146,7 @@ class EpDispatchCombineOp:
         warp_per_block: int = -1,
     ):
         return self._dispatch_func(
-            self._handle,
+            self.handle_,
             self.config.kernel_type.value,
             input,
             weights,
@@ -166,7 +166,7 @@ class EpDispatchCombineOp:
         call_reset: bool = False,
     ):
         output = self._combine_func(
-            self._handle,
+            self.handle_,
             self.config.kernel_type.value,
             input,
             weights,
@@ -175,11 +175,11 @@ class EpDispatchCombineOp:
             warp_per_block,
         )
         if call_reset:
-            self._reset_func(self._handle)
+            self._reset_func(self.handle_)
         return output
 
     def reset(self):
-        self._reset_func(self._handle)
+        self._reset_func(self.handle_)
 
     def _allgather_with_token_num_padding(self, input, max_token_num):
         shape = list(input.shape)
@@ -220,13 +220,13 @@ class EpDispatchCombineOp:
             EpDispatchCombineKernelType.InterNodeV1.value,
             EpDispatchCombineKernelType.InterNodeV1LL.value,
         ):
-            return self._get_dispatch_src_token_pos_func(self._handle)
+            return self._get_dispatch_src_token_pos_func(self.handle_)
 
         dispatch_sender_token_id_map = self._get_dispatch_sender_token_idx_map_func(
-            self._handle
+            self.handle_
         )
         dispatch_receiver_token_id_map = self._get_dispatch_receiver_token_idx_map_func(
-            self._handle
+            self.handle_
         )
 
         max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank
@@ -235,7 +235,7 @@ class EpDispatchCombineOp:
             self.config.max_num_inp_token_per_rank * self.config.num_experts_per_token,
         )
 
-        cur_rank_num_token = self._get_cur_rank_num_token(self._handle)
+        cur_rank_num_token = self._get_cur_rank_num_token(self.handle_)
         all_rank_num_token = [torch.empty(1) for i in range(self.config.world_size)]
         dist.all_gather(all_rank_num_token, torch.Tensor([cur_rank_num_token]))
 
