@@ -44,11 +44,6 @@ __device__ __attribute__((visibility("default"))) void mori_shmem_fence_thread_p
 __device__ __attribute__((visibility("default"))) void mori_shmem_fence_thread_pe_qp(int pe,
                                                                                      int qpId);
 
-// ============================================================================
-// Point-to-Point APIs
-// ============================================================================
-__device__ __attribute__((visibility("default"))) uint64_t
-mori_shmem_ptr_p2p(const uint64_t destPtr, const int myPe, int destPe);
 
 // ============================================================================
 // PutNbi APIs - Thread Scope (Address-based only)
@@ -201,5 +196,14 @@ __device__ __attribute__((visibility("default"))) void mori_shmem_int64_wait_unt
 // ============================================================================
 __device__ __attribute__((visibility("default"))) int mori_shmem_my_pe();
 __device__ __attribute__((visibility("default"))) int mori_shmem_n_pes();
+
+// ============================================================================
+// Point-to-Point APIs
+// ============================================================================
+__device__ __attribute__((visibility("default"))) uint64_t
+mori_shmem_ptr_p2p(const uint64_t destPtr, const int myPe, int destPe);
+
+__device__ __attribute__((visibility("default"))) uint64_t 
+mori_shmem_ptr(const uint64_t destPtr, int destPe);
 
 }  // extern "C"
