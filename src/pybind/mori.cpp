@@ -113,25 +113,146 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
 
 #define XPUT(fmt, ...) fprintf(stderr, fmt"\n", ##__VA_ARGS__)
 
+hipDataType FFIType2HipType(DataType dtype) {
+#define XX(A, B) case DataType::A: return B;
+  switch (dtype) {
+    XX(F32, HIP_R_32F)
+    XX(BF16, HIP_R_16BF)
+    XX(F8E4M3FN, HIP_R_8F_E4M3)
+    XX(F8E4M3FNUZ, HIP_R_8F_E4M3_FNUZ)
+    default:
+      throw std::runtime_error("Unsupported scalar type");
+  }
+#undef XX
+}
+
+/*
+class AnyBuffer {
+ public:
+  using Dimensions = Span<const int64_t>;
+
+  explicit AnyBuffer(const XLA_FFI_Buffer* buf) : buf_(buf) {
+    assert(buf != nullptr && "XLA_FFI_Buffer must be non-null");
+  }
+
+  DataType element_type() const { return DataType(buf_->dtype); }
+
+  Dimensions dimensions() const { return Dimensions(buf_->dims, buf_->rank); }
+
+  XLA_FFI_ATTRIBUTE_ALWAYS_INLINE size_t size_bytes() const {
+    return ByteWidth(element_type()) * element_count();
+  }
+
+  XLA_FFI_ATTRIBUTE_ALWAYS_INLINE size_t element_count() const {
+    Dimensions dims = dimensions();
+    return std::accumulate(dims.begin(), dims.end(), int64_t{1},
+                           std::multiplies<>());
+  }
+
+  void* untyped_data() const { return buf_->data; }
+
+  template <typename T>
+  T* typed_data() const {
+    assert(internal::NativeTypeToCApiDataType<T>() == buf_->dtype &&
+           "Template type must match the underlying buffer dtype");
+    return reinterpret_cast<T*>(buf_->data);
+  }
+
+  template <typename T>
+  T* reinterpret_data() const {
+    assert(sizeof(T) == ByteWidth(element_type()) &&
+           !(reinterpret_cast<std::uintptr_t>(buf_->data) % alignof(T)) &&
+           "Requested type must have the same byte width and alignment as the "
+           "underlying buffer type");
+    return reinterpret_cast<T*>(buf_->data);
+  }
+
+ private:
+  const XLA_FFI_Buffer* buf_;
+};
+
+*/
+
+void D2DCopy(void* dst, const void* src, size_t bytes, hipStream_t stream) {
+  hipError_t st = hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, stream);
+  if (st != hipSuccess) {
+    throw std::runtime_error(std::string("hipMemcpyAsync failed: ") + hipGetErrorString(st));
+  }
+}
+
 Error MoriDispatchImpl(
     hipStream_t stream,
-    mori::moe::EpDispatchCombineHandle *handle,
+    mori::moe::EpDispatchCombineHandle *h,
     int32_t kernel_type,
     AnyBuffer input,
-    AnyBuffer weights,
+    BufferR2<F32> weights,
     AnyBuffer scales,
-    AnyBuffer topk_ids,
+    BufferR2<S32> topk_ids,
     int32_t block_num,
     int32_t warp_per_block,
     Result<AnyBuffer> out,
-    Result<AnyBuffer> out_weights,
+    Result<BufferR2<F32>> out_weights,
     Result<AnyBuffer> out_scales,
-    Result<AnyBuffer> out_indices,
-    Result<BufferR0<S32>> total_recv_token_num) {
+    Result<BufferR2<S32>> out_indices,
+    Result<BufferR0<S32>> total_recv_token_num) try {
   
   XPUT("MoriDispatchImpl handle: %d, kernel_type=%d input=%d weights=%d block_num=%d",
-      handle->config.rank, kernel_type, (int)input.size_bytes(), (int)weights.size_bytes(), block_num);
+      h->config.rank, kernel_type, (int)input.size_bytes(), (int)weights.size_bytes(), block_num);
+  float* weightPtr = nullptr;
+
+  assert(ByteWidth(topk_ids.element_type()) == sizeof(mori::moe::index_t) &&
+         ByteWidth(out_indices->element_type()) == sizeof(mori::moe::index_t)); 
+  // if (weights.has_value()) 
+  {
+    //assert(weights->is_contiguous());
+    weightPtr = weights.typed_data();
+  }
+
+  uint8_t* scalePtr = nullptr;
+  if (/*scales.has_value() &&*/ (h->config.scaleDim > 0)) {
+    assert(/*scales->is_contiguous() &&*/ 
+      ByteWidth(scales.element_type()) == h->config.scaleTypeSize);
+    scalePtr = static_cast< uint8_t *>(scales.untyped_data());
+    // scale type is given by the config ??
+  }
+
+  // NOTE: why output is set to NULL??
+  h->PrepareInference(FFIType2HipType(input.element_type()), 
+        input.untyped_data(), nullptr, weightPtr, scalePtr, 
+        topk_ids.typed_data(), input.dimensions()[0]);
+  h->LaunchDispatch((mori::moe::KernelType)kernel_type, block_num, 
+                                                      warp_per_block, stream);
+  // we have to use memcpy here!
+  D2DCopy(out->untyped_data(), h->shmemDispatchOutTokMemObj->Get(), 
+        out->size_bytes(), stream);
+  //out size = [h->config.MaxNumTokensToRecv(), h->config.hiddenDim]
+  // type same as input
+
+  D2DCopy(out_weights->untyped_data(), h->shmemDispatchOutWeightsMemObj->Get(), 
+        out_weights->size_bytes(), stream);
+  // out weights size = [h->config.MaxNumTokensToRecv(), h->config.numExpertPerToken]
+  // type float
+
+  if (/*scales.has_value() &&*/ (h->config.scaleDim > 0)) {
+    D2DCopy(out_scales->untyped_data(), h->shmemOutScalesMemObj->Get(), 
+        out_scales->size_bytes(), stream);
+    // out_scales size = [h->config.MaxNumTokensToRecv(), h->config.scaleDim]
+    // type same as scales
+  }
+
+  D2DCopy(out_indices->untyped_data(), h->shmemOutIndicesMemObj->Get(), 
+        out_indices->size_bytes(), stream);
+  // size = [h->config.MaxNumTokensToRecv(), h->config.numExpertPerToken]
+  // type = mori::moe::index_t>() -- int32_t
+
+  D2DCopy(total_recv_token_num->untyped_data(), h->totalRecvTokenNum, 
+        sizeof(mori::moe::index_t), stream);
+
   return Error::Success();
+} 
+catch(std::exception& ex) {
+  XPUT("Exception: %s", ex.what());
+  return Error::Internal(ex.what());
 }
 
 // if this does not work, we will have to send Handle fields via Ctx params..
@@ -145,15 +266,15 @@ XLA_FFI_DEFINE_HANDLER(
         .Attr<Pointer<mori::moe::EpDispatchCombineHandle>>("handle_ptr")
         .Attr<int32_t>("kernel_type")
         .Arg<AnyBuffer>()          // input
-        .Arg<AnyBuffer>()          // weights optional
+        .Arg<BufferR2<F32>>()      // weights optional
         .Arg<AnyBuffer>()          // scales optional
-        .Arg<AnyBuffer>()          // topk_ids 
+        .Arg<BufferR2<S32>>()      // topk_ids 
         .Attr<int32_t>("block_num")
         .Attr<int32_t>("warp_per_block")
         .Ret<AnyBuffer>()          // out
-        .Ret<AnyBuffer>()          // out_weights optional
+        .Ret<BufferR2<F32>>()      // out_weights optional
         .Ret<AnyBuffer>()          // out_scales optional
-        .Ret<AnyBuffer>()          // out_indices 
+        .Ret<BufferR2<S32>>()      // out_indices 
         .Ret<BufferR0<S32>>()      // total_recv_token_num
 );
 
