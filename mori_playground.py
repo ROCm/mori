@@ -1,12 +1,31 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 import mori
+import argparse
 import os
 import time
 
 import torch
 import torch.distributed as dist
+
+def init_distributed():
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--world_size", type=int, default=1)
+  parser.add_argument("--rank", type=int, default=0)
+  parser.add_argument("--coordination_service", type=str, default="")
+  args, _ = parser.parse_known_args()
+
+#   if args.jax_distributed:
+#     dist.initialize(
+#       coordinator_address=args.coordination_service or "localhost:1234",
+#       num_processes=args.process_count,
+#       process_id=args.process_index,
+#     )
+  print(f"[rank {args.rank}] devices = {jax.local_devices()}")
+  return (args.rank, args.world_size)
+
 
 class EpDispatchCombineTestCase:
     def __init__(self, rank, world_size, dtype=torch.bfloat16, jax_dtype=jnp.bfloat16):
@@ -32,19 +51,12 @@ class EpDispatchCombineTestCase:
             gpu_per_node=1,
         )
         
-        # simple rng keyed by time + rank to vary per rank
-        #seed = int(time.time()) + self.rank
-        seed = 777
-        self.rng = jax.random.PRNGKey(seed)
-
     def setup(self):
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "12355"
 
-        torch.cuda.set_device(self.rank)
-        print(f"----------- {rank} zzz")
-        self.device = torch.device("cuda", self.rank)
-        print(f"----------- {rank} {self.device}")
+        torch.cuda.set_device(0) #self.rank)
+        self.device = torch.device("cuda", 0) #self.rank)
         
         dist.init_process_group(
             backend="cpu:gloo,cuda:nccl",
@@ -57,8 +69,12 @@ class EpDispatchCombineTestCase:
         torch._C._distributed_c10d._register_process_group("default", world_group)
         mori.shmem.shmem_torch_process_group_init("default")
 
-        self.rng = torch.Generator(device=self.device)
-        self.rng.manual_seed(int(time.time()) + self.rank)
+        # self.rng = torch.Generator(device=self.device)
+        # self.rng.manual_seed(int(time.time()) + self.rank)
+                # simple rng keyed by time + rank to vary per rank
+        # seed = int(time.time()) + self.rank
+        seed = 777
+        self.rng = jax.random.PRNGKey(seed)
 
     def cleanup(self):
         mori.shmem.shmem_finalize()
@@ -127,15 +143,20 @@ class EpDispatchCombineTestCase:
         self.rng = key
         input_fp32 = jax.random.normal(subkey, (num_tokens, self.config.hidden_dim), 
                             dtype=jnp.float32)
-        input_list = self.allgather_padded(input_fp32.astype(self.config.jax_dtype), self.config.max_num_inp_token_per_rank)
-        input_list = [jnp.array(x, dtype=self.config.jax_dtype) for x in input_list]
+        input_list = self.allgather_padded(input_fp32.astype(self.jax_dtype), self.config.max_num_inp_token_per_rank)
+        input_list = [jnp.array(x, dtype=self.jax_dtype) for x in input_list]
+        
+        print(f"num_tokens {num_tokens}  hidden: {self.config.hidden_dim} ------- indices: {indices.shape} tp {indices.dtype}")
+        print(f"------- weights: {weights.shape} {weights.dtype}")
+        print(f"------- scales_fp32: {scales_fp32.shape} {scales_fp32.dtype}")
+        
 
         return (
             num_tokens,
             indices,
             weights,
             scales_fp32,
-            input_fp32.astype(self.config.jax_dtype),
+            input_fp32.astype(self.jax_dtype),
             indices_list,
             weights_list,
             scales_list,
@@ -200,14 +221,15 @@ def test_dispatch_combine(rank, world_size):
     # test_case = EpDispatchCombineTestCase(rank, world_size, torch.float8_e4m3fnuz)
     test_case = EpDispatchCombineTestCase(rank, world_size, 
                                             torch.bfloat16, jnp.bfloat16)
-    print(f"{rank} start OK")
     test_case.setup()
-    print(f"{rank} setup OK")
     test_case.test_dispatch_combine()
     test_case.cleanup()
 
 if __name__ == "__main__":
-    world_size = 8
-    torch.multiprocessing.spawn(
-        test_dispatch_combine, args=(world_size,), nprocs=world_size, join=True
-    )
+    world_config = init_distributed()
+    test_dispatch_combine(*world_config)
+    
+    # world_size = 8
+    # torch.multiprocessing.spawn(
+    #     test_dispatch_combine, args=(world_size,), nprocs=world_size, join=True
+    # )

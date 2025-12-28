@@ -116,16 +116,20 @@ class EpDispatchCombineOp:
         block_num: int = -1,
         warp_per_block: int = -1,
     ):
+        n_tokens = self.config.MaxNumTokensToRecv()
         return jax.ffi.ffi_call(
-            "launch_dispatch_ffi",
-            (
-                jax.ShapeDtypeStruct(input.shape, input.dtype),
-                jax.ShapeDtypeStruct((input.shape[0], indices.shape[1]), input.dtype),
-                jax.ShapeDtypeStruct(input.shape, input.dtype),
-                jax.ShapeDtypeStruct(input.shape, input.dtype),
-                jax.ShapeDtypeStruct((), jnp.int32),
-            ),
-        )(
+            "launch_dispatch_ffi", (
+                # out
+                jax.ShapeDtypeStruct((n_tokens, self.config.hidden_dim), input.dtype),
+                # out_weights
+                jax.ShapeDtypeStruct((n_tokens, self.config.num_experts_per_token), jnp.float32),
+                # out_scales
+                jax.ShapeDtypeStruct((n_tokens, self.config.scale_dim), scales.dtype),
+                # out_indices
+                jax.ShapeDtypeStruct((n_tokens, self.config.num_experts_per_token), jnp.int32),
+                # total_recv_token_num
+                jax.ShapeDtypeStruct((), jnp.int32)),
+         )(
             input,
             weights,
             scales,
