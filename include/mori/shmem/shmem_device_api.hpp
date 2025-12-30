@@ -41,6 +41,8 @@ namespace shmem {
     func<application::TransportType::RDMA>(__VA_ARGS__);                          \
   } else if (transportType == application::TransportType::P2P) {                  \
     func<application::TransportType::P2P>(__VA_ARGS__);                           \
+  } else if (transportType == application::TransportType::SDMA) {                  \
+    func<application::TransportType::SDMA>(__VA_ARGS__);                           \
   } else {                                                                        \
     assert(false);                                                                \
   }

@@ -27,7 +27,7 @@
 namespace mori {
 namespace application {
 
-enum TransportType { RDMA = 0, P2P = 1 };
+enum TransportType { RDMA = 0, P2P = 1, SDMA = 2 };
 
 }  // namespace application
 }  // namespace mori

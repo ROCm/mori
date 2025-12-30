@@ -45,6 +45,10 @@ struct SymmMemObj {
   // For IPC
   hipIpcMemHandle_t* ipcMemHandles{nullptr};  // should only placed on cpu
 
+  //For Sdma
+  anvil::SdmaQueueDeviceHandle** deviceHandles_d = nullptr;  // should only placed on GPU
+  HSAuint64* signalPtrs = nullptr; // should only placed on GPU
+
   __device__ __host__ RdmaMemoryRegion GetRdmaMemoryRegion(int pe) const {
     RdmaMemoryRegion mr;
     mr.addr = peerPtrs[pe];
