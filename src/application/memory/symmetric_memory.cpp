@@ -25,6 +25,7 @@
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/core/core.hpp"
+#include "mori/application/transport/sdma/anvil.hpp"
 
 namespace mori {
 namespace application {
@@ -122,6 +123,28 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerRkeys, cpuMemObj->peerRkeys,
                               sizeof(uint32_t) * worldSize, hipMemcpyHostToDevice));
 
+  std::vector<int> dstDeviceIds;
+  for (int i = 0; i < worldSize; i++) {
+    if (context.GetTransportType(i) != TransportType::SDMA) continue;
+    if (i == rank) continue;
+    dstDeviceIds.push_back(i%8); // should be intra devices count
+  }
+  if(dstDeviceIds.size() != 0) {
+    int srcDeviceId = rank%8;
+    int numOfQueuesPerDevice = 8;  // all sdma queues are inited
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->deviceHandles_d, dstDeviceIds.size()* numOfQueuesPerDevice* sizeof(anvil::SdmaQueueDeviceHandle*)));
+
+    for (auto& dstDeviceId : dstDeviceIds)
+    { 
+      for (size_t q = 0; q < numOfQueuesPerDevice; q++)
+        {
+          gpuMemObj->deviceHandles_d[dstDeviceId*numOfQueuesPerDevice + q] = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
+        }
+    }
+
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->signalPtrs, sizeof(HSAuint64) * dstDeviceIds.size()* numOfQueuesPerDevice));
+    HIP_RUNTIME_CHECK(hipMemset(signalPtrs, 0, sizeof(HSAuint64) * dstDeviceIds.size()* numOfQueuesPerDevice));
+  }
   memObjPool.insert({localPtr, SymmMemObjPtr{cpuMemObj, gpuMemObj}});
   return memObjPool.at(localPtr);
 }

@@ -35,6 +35,7 @@
 
 #include "mori/application/utils/check.hpp"
 #include "mori/utils/mori_log.hpp"
+#include "mori/application/transport/sdma/anvil.hpp"
 
 namespace mori {
 namespace application {
@@ -110,6 +111,11 @@ void Context::CollectHostNames() {
 
 bool IsP2PDisabled() {
   const char* varName = "MORI_DISABLE_P2P";
+  return getenv(varName) != nullptr;
+}
+
+bool IsSDMAEnabled() {
+  const char* varName = "MORI_ENABLE_SDMA";
   return getenv(varName) != nullptr;
 }
 
@@ -196,7 +202,14 @@ void Context::InitializePossibleTransports() {
         bool canAccessPeer = true;
 
         if ((i == LocalRank()) || canAccessPeer) {
-          transportTypes.push_back(TransportType::P2P);
+          if(IsSDMAEnabled() && (i != LocalRank()) ){
+            transportTypes.push_back(TransportType::SDMA);
+            anvil::EnablePeerAccess(LocalRank()%8, i%8);
+            // Better performance if allocating all 8 queues
+            anvil::anvil.connect(LocalRank()%8, i%8, 8);
+          }else{
+            transportTypes.push_back(TransportType::P2P);
+          }
           for (int qp = 0; qp < numQpPerPe; qp++) {
             rdmaEps.push_back({});
           }
