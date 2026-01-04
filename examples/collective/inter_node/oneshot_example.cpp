@@ -24,7 +24,7 @@
 #include <cassert>
 
 #include "mori/application/utils/check.hpp"
-#include "mori/collective/all_reduce/allreduce_manager.hpp"
+#include "mori/collective/core/allreduce_manager.hpp"
 
 using namespace mori::core;
 using namespace mori::application;

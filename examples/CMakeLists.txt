@@ -33,15 +33,16 @@ target_link_libraries(atomic_gpu mori_application hip::host hip::device)
 add_executable(put_thread_allgather shmem/put_thread_allgather.cpp)
 target_link_libraries(put_thread_allgather mori_shmem hip::host hip::device)
 
-add_executable(all_reduce collective/all_reduce.cpp)
+add_executable(all_reduce collective/inter_node/oneshot_example.cpp)
 target_link_libraries(all_reduce mori_collective hip::host hip::device)
 
-# Custom allreduce example (using MPI)
-add_executable(allreduce_example collective/allreduce_example.cpp)
-target_link_libraries(allreduce_example mori_collective MPI::MPI_CXX hip::host hip::device)
-target_include_directories(allreduce_example PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_executable(allreduce_example collective/intra_node/intra_node_example.cpp)
+target_link_libraries(allreduce_example mori_collective MPI::MPI_CXX hip::host
+                      hip::device)
+target_include_directories(allreduce_example
+                           PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
-add_executable(all_gather collective/all_gather.cpp)
+add_executable(all_gather collective/inter_node/all_gather_example.cpp)
 target_link_libraries(all_gather mori_shmem hip::host hip::device)
 
 add_executable(concurrent_put_thread shmem/concurrent_put_thread.cpp)

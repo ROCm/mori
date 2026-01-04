@@ -20,8 +20,6 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "mori/collective/device/all_gather.hpp"
-
 #include <hip/hip_runtime.h>
 #include <mpi.h>
 
@@ -29,6 +27,7 @@
 #include <cstdio>
 
 #include "mori/application/utils/check.hpp"
+#include "mori/collective/inter_node/kernels/all_gather.hpp"
 #include "mori/shmem/shmem.hpp"
 
 using namespace mori::core;
