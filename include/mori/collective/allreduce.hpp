@@ -19,18 +19,19 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "mori/collective/all_reduce/allreduce_manager.hpp"
 
-namespace mori {
-namespace collective {
+#pragma once
 
-// Only for sample code
-template class AllReduceManager<float>;
-template class AllReduceManager<double>;
-template class AllReduceManager<int32_t>;
-template class AllReduceManager<uint32_t>;
-template class AllReduceManager<int64_t>;
-template class AllReduceManager<uint64_t>;
+// Core API - recommended for most users
+#include "mori/collective/core/allreduce_config.hpp"
+#include "mori/collective/core/allreduce_manager.hpp"
+#include "mori/collective/core/topology_detector.hpp"
 
-}  // namespace collective
-}  // namespace mori
+// Advanced API - for users who need direct executor access
+#include "mori/collective/core/allreduce_executor.hpp"
+#include "mori/collective/inter_node/executors/one_shot.hpp"
+#include "mori/collective/inter_node/executors/ring_1d.hpp"
+#include "mori/collective/intra_node/executor.hpp"
+
+// Algorithm selection
+#include "mori/collective/core/algorithm_selector.hpp"
