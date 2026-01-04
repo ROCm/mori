@@ -94,3 +94,5 @@ jobs:
           #mpiexec --allow-run-as-root -x MORI_GLOBAL_LOG_LEVEL=TRACE -np 2 ls
           mpiexec --allow-run-as-root -x MORI_GLOBAL_LOG_LEVEL=TRACE -np 2 ./build/examples/dist_write -c 4 -t 256 -q 4
           ssh -p 2233 root@banff-pla-r25-14 "hostname"
+          LOO_SOCKET_IFNAME=ens14np0 PYTHONPATH=$(pwd):$PYTHONPATH torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="banff-pla-r25-05" --master_port=1234 examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096
+          ssh -p 2233 root@banff-pla-r25-14 "LOO_SOCKET_IFNAME=ens14np0 PYTHONPATH=$(pwd:$PYTHONPATH torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 --master_addr="banff-pla-r25-05" --master_port=1234 examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096" 
