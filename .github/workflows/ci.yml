@@ -46,7 +46,7 @@ jobs:
           pip3 install . --no-build-isolation
           #USE_IONIC=ON pip3 install . --no-build-isolation --target /apps/mori-ci/python-packages
           #make
-          ls
+          scp -P 2233 -r /home/fizhang/actions-runner/_work/mori/mori/mori root@banff-pla-r25-14:/home/fizhang/actions-runner/_work/mori/mori/
   test:
     name: mori test
     needs: build
@@ -64,7 +64,7 @@ jobs:
           #id ci
           #groups
           #id -G
-          id
+          #id
           # 查看当前用户在哪些组
           #groups $USER
           # 检查 render 和 video 组是否存在
@@ -93,3 +93,4 @@ jobs:
           #find /usr -name "*pmix*" -type f | xargs nm -D 2>/dev/null | grep pmix_value_load
           #mpiexec --allow-run-as-root -x MORI_GLOBAL_LOG_LEVEL=TRACE -np 2 ls
           mpiexec --allow-run-as-root -x MORI_GLOBAL_LOG_LEVEL=TRACE -np 2 ./build/examples/dist_write -c 4 -t 256 -q 4
+          ssh -p 2233 root@banff-pla-r25-14 "hostname"
