@@ -38,6 +38,7 @@ jobs:
           cd mori
           ls
           rm -rf build
+          git config --global --add safe.directory /home/fizhang/actions-runner/_work/mori/mori/mori
           git checkout main
           #pip install --target /apps/mori-ci/packages -r requirements-build.txt
           pip install -r requirements-build.txt
