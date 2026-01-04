@@ -31,6 +31,8 @@
 #include "mori/shmem/shmem_api.hpp"
 #include "src/shmem/internal.hpp"
 
+#include "mori/shmem/shmem_p2p_kernels.hpp"
+
 namespace mori {
 namespace shmem {
 /* ---------------------------------------------------------------------------------------------- */
@@ -71,6 +73,20 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::SDMA
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    PutMemNbi with Signal                                       */
 /* ---------------------------------------------------------------------------------------------- */
+
+template <>
+inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
+    core::atomicType amoType, int pe, int qpId) {
+        ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::P2P>(dest, destOffset, val, bytes, amoType, pe);
+}
+
+template <>
+inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportType::SDMA>(
+    const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
+    core::atomicType amoType, int pe, int qpId) {
+        ShmemAtomicSizeNonFetchWarpKernel<application::TransportType::P2P>(dest, destOffset, val, bytes, amoType, pe);
+}
 
 
 /* ---------------------------------------------------------------------------------------------- */
