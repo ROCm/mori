@@ -28,7 +28,7 @@ jobs:
             echo "   $cmd: $($cmd --version | head -n1)"
           done
           echo "5. 当前 shell: $SHELL"
-          #sudo -i
+          
           pwd
           id
           ls
@@ -77,7 +77,7 @@ jobs:
           #/opt/rocm/bin/rocminfo
           #python test.py
           #bash test.sh
-          #
+          
           export PYTHONPATH=/home/fizhang/actions-runner/_work/mori/mori/mori:$PYTHONPATH
           #export PYTHONPATH=/apps/mori-ci/python-packages:$PYTHONPATH
           #python3 tests/python/ops/bench_dispatch_combine.py
