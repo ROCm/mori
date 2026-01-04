@@ -19,18 +19,18 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "mori/collective/all_reduce/one_shot_executor.hpp"
+#include "mori/collective/core/allreduce_manager.hpp"
 
 namespace mori {
 namespace collective {
 
 // Only for sample code
-template class OneShotAllReduceExecutor<float>;
-template class OneShotAllReduceExecutor<double>;
-template class OneShotAllReduceExecutor<int32_t>;
-template class OneShotAllReduceExecutor<uint32_t>;
-template class OneShotAllReduceExecutor<int64_t>;
-template class OneShotAllReduceExecutor<uint64_t>;
+template class AllReduceManager<float>;
+template class AllReduceManager<double>;
+template class AllReduceManager<int32_t>;
+template class AllReduceManager<uint32_t>;
+template class AllReduceManager<int64_t>;
+template class AllReduceManager<uint64_t>;
 
 }  // namespace collective
 }  // namespace mori

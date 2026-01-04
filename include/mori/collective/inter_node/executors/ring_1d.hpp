@@ -24,11 +24,11 @@
 #include <cstring>
 
 #include "mori/application/utils/check.hpp"
-#include "mori/collective/all_reduce/allreduce_config.hpp"
-#include "mori/collective/all_reduce/allreduce_executor.hpp"
-#include "mori/collective/device/all_gather.hpp"
-#include "mori/collective/device/reduce_scatter.hpp"
-#include "mori/collective/topology_detector.hpp"
+#include "mori/collective/core/allreduce_config.hpp"
+#include "mori/collective/core/allreduce_executor.hpp"
+#include "mori/collective/core/topology_detector.hpp"
+#include "mori/collective/inter_node/kernels/all_gather.hpp"
+#include "mori/collective/inter_node/kernels/reduce_scatter.hpp"
 #include "mori/shmem/shmem.hpp"
 
 namespace mori {

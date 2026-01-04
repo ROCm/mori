@@ -22,12 +22,12 @@
 #pragma once
 
 #include "mori/application/utils/check.hpp"
-#include "mori/collective/all_reduce/algorithm_selector.hpp"
-#include "mori/collective/all_reduce/allreduce_config.hpp"
-#include "mori/collective/all_reduce/allreduce_executor.hpp"
-#include "mori/collective/all_reduce/one_shot_executor.hpp"
-#include "mori/collective/all_reduce/ring_1d_executor.hpp"
-#include "mori/collective/topology_detector.hpp"
+#include "mori/collective/core/algorithm_selector.hpp"
+#include "mori/collective/core/allreduce_config.hpp"
+#include "mori/collective/core/allreduce_executor.hpp"
+#include "mori/collective/core/topology_detector.hpp"
+#include "mori/collective/inter_node/executors/one_shot.hpp"
+#include "mori/collective/inter_node/executors/ring_1d.hpp"
 
 namespace mori {
 namespace collective {

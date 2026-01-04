@@ -21,7 +21,7 @@
 // SOFTWARE.
 #pragma once
 
-#include "mori/collective/all_reduce/allreduce_config.hpp"
+#include "mori/collective/core/allreduce_config.hpp"
 
 namespace mori {
 namespace collective {
