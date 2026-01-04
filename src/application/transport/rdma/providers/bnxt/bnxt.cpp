@@ -224,6 +224,10 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   }
   qpMemInfo.rq_va = reinterpret_cast<uint64_t>(rqUmemAddr);
 
+  // Allocate dedicated db region for this QP
+  dbrAttr = bnxt_re_dv_alloc_db_region(context);
+  assert(dbrAttr != nullptr);
+
   memset(&dv_qp_attr, 0, sizeof(struct bnxt_re_dv_qp_init_attr));
   dv_qp_attr.send_cq = ib_qp_attr.send_cq;
   dv_qp_attr.recv_cq = ib_qp_attr.recv_cq;
@@ -235,6 +239,7 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   dv_qp_attr.qp_type = ib_qp_attr.qp_type;
 
   // dv_qp_attr.qp_handle = qpMemInfo.qp_handle;
+  dv_qp_attr.dbr_handle = dbrAttr;
   dv_qp_attr.sq_len = qpMemInfo.sq_len;
   dv_qp_attr.sq_slots = qpMemInfo.sq_slots;
   dv_qp_attr.sq_wqe_sz = qpMemInfo.sq_wqe_sz;
@@ -332,6 +337,11 @@ void BnxtQpContainer::DestroyQueuePair() {
       HIP_RUNTIME_CHECK(hipHostUnregister(qpUar));
     }
   }
+  if (dbrAttr) {
+    int ret = bnxt_re_dv_free_db_region(context, dbrAttr);
+    assert(!ret);
+    dbrAttr = nullptr;
+  }
   if (qp) bnxt_re_dv_destroy_qp(qp);
 }
 
@@ -405,7 +415,7 @@ void BnxtQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
 
   int status = bnxt_re_dv_modify_qp(qp, &attr, attr_mask, 0, 0);
   assert(!status);
-    // Use qpId to select UDP sport value from the shared configuration (round-robin)
+  // Use qpId to select UDP sport value from the shared configuration (round-robin)
   uint16_t selected_udp_sport = GetDeviceContext()->GetUdpSport(qpId) + qpId;
   MORI_APP_TRACE("QP {} using UDP sport {} (qpId={}, index={})", qpn, selected_udp_sport, qpId,
                  qpId % RDMA_UDP_SPORT_ARRAY_SIZE);
@@ -458,12 +468,7 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   assert(!ret);
   memcpy(endpoint.handle.eth.gid, ibvGid.raw, sizeof(endpoint.handle.eth.gid));
 
-  // Get dbr, bnxt use shared dbr
-  struct bnxt_re_dv_db_region_attr dbrAttr{};
-  ret = bnxt_re_dv_get_default_db_region(context, &dbrAttr);
-  assert(!ret);
-
-  void* uar_host = (void*)dbrAttr.dbr;
+  void* uar_host = (void*)qp->dbrAttr->dbr;
   void* uar_dev = uar_host;
   if (config.onGpu) {
     constexpr uint32_t flag = hipHostRegisterPortable | hipHostRegisterMapped;
@@ -506,9 +511,10 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
 
   MORI_APP_TRACE(
       "BNXT endpoint created: qpn={}, cqn={}, portId={}, gidIdx={}, atomicIbuf addr=0x{:x}, "
-      "nslots={}",
+      "nslots={}, uar_host=0x{:x},uar_dev=0x{:x}",
       qp->qpn, cq->cqn, config.portId, config.gidIdx, endpoint.atomicIbuf.addr,
-      endpoint.atomicIbuf.nslots);
+      endpoint.atomicIbuf.nslots, reinterpret_cast<uintptr_t>(uar_host),
+      reinterpret_cast<uintptr_t>(uar_dev));
 
   return endpoint;
 }

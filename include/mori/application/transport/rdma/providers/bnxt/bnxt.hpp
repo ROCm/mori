@@ -123,6 +123,8 @@ class BnxtQpContainer {
   void* atomicIbufAddr{nullptr};
   size_t atomicIbufSize{0};
   ibv_mr* atomicIbufMr{nullptr};
+
+  struct bnxt_re_dv_db_region_attr* dbrAttr{nullptr};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
