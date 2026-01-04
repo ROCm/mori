@@ -27,9 +27,9 @@
 #include <cstring>
 
 #include "mori/application/utils/check.hpp"
-#include "mori/collective/all_reduce/allreduce_config.hpp"
-#include "mori/collective/all_reduce/allreduce_executor.hpp"
-#include "mori/collective/device/one_shot_allreduce.hpp"
+#include "mori/collective/core/allreduce_config.hpp"
+#include "mori/collective/core/allreduce_executor.hpp"
+#include "mori/collective/inter_node/kernels/one_shot_kernel.hpp"
 #include "mori/shmem/shmem.hpp"
 
 namespace mori {
