@@ -110,13 +110,12 @@ NumProcs=8
 TotalGpus=8
 
 TEST=mori_playground.py
-
-XBASE=$(basename $TEST)
-echo "===== $XBASE"
+#TEST=jax_playground.py
 #TEST=examples/ops/dispatch_combine/test_dispatch_combine.py
 export LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/torch/lib
 
-pkill -9 -c -f mori_playground
+XBASE=$(basename $TEST)
+pkill -9 -c -f $XBASE
 rm -f $XLA_DIR/zzout_*.log
 
 for ((pid = 0; pid < $NumProcs; pid++ )); do

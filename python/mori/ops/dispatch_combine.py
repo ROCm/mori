@@ -247,6 +247,7 @@ class EpDispatchCombineOp:
       EpDispatchCombineKernelType.InterNodeV1.value,
       EpDispatchCombineKernelType.InterNodeV1LL.value,
     ):
+      # here we need to allocate enough space to accomodate '*handle->totalRecvTokenNum' items
       return jax.ffi.ffi_call(
             "get_dispatch_src_token_id", (
             jax.ShapeDtypeStruct((num_tokens,), jnp.int32)),
