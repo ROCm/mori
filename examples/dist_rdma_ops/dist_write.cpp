@@ -181,8 +181,7 @@ __device__ void Quiet(RdmaEndpoint* endpoint) {
         completed =
             __hip_atomic_load(&cqHandle->consIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       } while (completed != warp_cq_consumer);
-      UpdateCqDbrRecord<P>(endpoint->cqHandle, cqHandle->dbrRecAddr, (uint32_t)(warp_cq_consumer + quiet_amount),
-                           cqHandle->cqeNum);
+      UpdateCqDbrRecord<P>(endpoint->cqHandle, (uint32_t)(warp_cq_consumer + quiet_amount));
 
       uint64_t doneIdx = wqe_broadcast[warp_id];
       __hip_atomic_fetch_max(&endpoint->wqHandle.doneIdx, doneIdx, __ATOMIC_RELAXED,

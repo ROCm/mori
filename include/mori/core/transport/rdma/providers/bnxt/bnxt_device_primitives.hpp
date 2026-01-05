@@ -763,25 +763,23 @@ inline __device__ int PollCq<ProviderType::BNXT>(WorkQueueHandle& wqHandle, Comp
 }
 
 template <>
-inline __device__ void UpdateCqDbrRecord<ProviderType::BNXT>(CompletionQueueHandle& cq, void* dbrRecAddr, uint32_t cons_idx,
-                                                             uint32_t cqeNum) {
-  uint8_t flags = ((cons_idx + 1) / cqeNum) & (1UL << BNXT_RE_FLAG_EPOCH_HEAD_SHIFT);
+inline __device__ void UpdateCqDbrRecord<ProviderType::BNXT>(CompletionQueueHandle& cq, uint32_t consIdx) {
+  uint8_t flags = ((consIdx + 1) / cq.cqeNum) & (1UL << BNXT_RE_FLAG_EPOCH_HEAD_SHIFT);
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
-  // uint64_t dbrVal = bnxt_re_init_db_hdr(((cons_idx + 1) | epoch), 0, flags, BNXT_RE_QUE_TYPE_CQ);
+  // uint64_t dbrVal = bnxt_re_init_db_hdr(((consIdx + 1) | epoch), 0, flags, BNXT_RE_QUE_TYPE_CQ);
   uint64_t dbrVal =
-      bnxt_re_init_db_hdr((((cons_idx + 1) % cqeNum) | epoch), 0, flags, BNXT_RE_QUE_TYPE_CQ);
-  core::AtomicStoreSeqCstSystem(reinterpret_cast<uint64_t*>(dbrRecAddr), dbrVal);
+      bnxt_re_init_db_hdr((((consIdx + 1) % cq.cqeNum) | epoch), 0, flags, BNXT_RE_QUE_TYPE_CQ);
+  core::AtomicStoreSeqCstSystem(reinterpret_cast<uint64_t*>(cq.dbrRecAddr), dbrVal);
 }
 
 template <>
-inline __device__ int PollCqAndUpdateDbr<ProviderType::BNXT>(CompletionQueueHandle& cq, void* cqAddr, uint32_t cqeSize,
-                                                             uint32_t cqeNum, uint32_t* consIdx,
-                                                             void* dbrRecAddr, uint32_t* lockVar) {
+inline __device__ int PollCqAndUpdateDbr<ProviderType::BNXT>(CompletionQueueHandle& cq, uint32_t* consIdx,
+                                                             uint32_t* lockVar) {
   AcquireLock(lockVar);
 
-  int opcode = PollCq<ProviderType::BNXT>(cqAddr, cqeNum, consIdx);
+  int opcode = PollCq<ProviderType::BNXT>(cq.cqAddr, cq.cqeNum, consIdx);
   if (opcode >= 0) {
-    UpdateCqDbrRecord<ProviderType::BNXT>(cq, dbrRecAddr, *consIdx, cqeNum);
+    UpdateCqDbrRecord<ProviderType::BNXT>(cq, *consIdx);
   }
 
   ReleaseLock(lockVar);

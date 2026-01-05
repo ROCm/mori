@@ -56,8 +56,7 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion sendMr, 
                                &epSend.cqHandle.consIdx, &wqeIdx);
     epSend.cqHandle.consIdx += 1;
     printf("send PollCq is done, wqeIdx: %hu\n", wqeIdx);
-    UpdateCqDbrRecord<P>(epSend.cqHandle, epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx,
-                         epSend.cqHandle.cqeNum);
+    UpdateCqDbrRecord<P>(epSend.cqHandle, epSend.cqHandle.consIdx);
     printf("send UpdateCqDbrRecord is done\n");
     // printf("snd_opcode %d val %d\n", snd_opcode, reinterpret_cast<char*>(mrSend.addr)[0]);
 

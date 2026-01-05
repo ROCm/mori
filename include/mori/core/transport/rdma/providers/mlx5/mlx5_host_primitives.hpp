@@ -199,8 +199,8 @@ inline __host__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum, ui
 }
 
 template <>
-inline __host__ void UpdateCqDbrRecord<ProviderType::MLX5>(CompletionQueueHandle& cq, void* dbrRecAddr, uint32_t cons_idx) {
-  reinterpret_cast<uint32_t*>(dbrRecAddr)[MLX5_CQ_SET_CI] = HTOBE32(cons_idx & 0xffffff);
+inline __host__ void UpdateCqDbrRecord<ProviderType::MLX5>(CompletionQueueHandle& cq, uint32_t consIdx) {
+  reinterpret_cast<uint32_t*>(cq.dbrRecAddr)[MLX5_CQ_SET_CI] = HTOBE32(consIdx & 0xffffff);
 }
 
 }  // namespace core
