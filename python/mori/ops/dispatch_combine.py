@@ -241,6 +241,7 @@ class EpDispatchCombineOp:
     return output
 
   def get_dispatch_src_token_pos_jax(self):
+    # NOTE this is wrong since it won't be traced!!
     torch.cuda.synchronize()
     if self.config.kernel_type.value in (
       EpDispatchCombineKernelType.IntraNode.value,
