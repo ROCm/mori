@@ -190,16 +190,18 @@ __device__ __forceinline__ void store<16>(void* addr,
 
 template <typename T>
 inline __device__ void ThreadCopy(T* dst, T* src, size_t nelems) {
-  constexpr int vecSize = 16 / sizeof(T);
+  constexpr int VecBytes = 16;
+  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+  constexpr int vecSize = VecBytes / sizeof(T);
   int offset = 0;
 
   while ((offset + vecSize) <= nelems) {
-    reinterpret_cast<uint4*>(dst + offset)[0] = reinterpret_cast<uint4*>(src + offset)[0];
+    store<VecBytes>(dst + offset, reinterpret_cast<DataType*>(src + offset)[0]);
     offset += vecSize;
   }
 
   while (offset < nelems) {
-    dst[offset] = src[offset];
+    store<sizeof(T)>(dst + offset, src[offset]);
     offset += 1;
   }
 }
