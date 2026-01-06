@@ -30,6 +30,7 @@ def init_distributed():
 class EpDispatchCombineTestCase:
     def __init__(self, rank, world_size, dtype=torch.bfloat16, jax_dtype=jnp.bfloat16):
         self.jax_dtype = jax_dtype
+        self.jax_scale_dtype = jnp.float8_e4m3fnuz
         self.rank = rank
         self.world_size = world_size
         self.config = mori.ops.EpDispatchCombineConfig(
@@ -43,9 +44,9 @@ class EpDispatchCombineTestCase:
                 [], dtype=torch.float8_e4m3fnuz
             ).element_size(),
             max_token_type_size=torch.tensor([], dtype=torch.float32).element_size(),
-            max_num_inp_token_per_rank=256, #4096,
-            num_experts_per_rank=4, #32,
-            num_experts_per_token=8,
+            max_num_inp_token_per_rank=111, #4096,
+            num_experts_per_rank=5, #32,
+            num_experts_per_token=13,
             use_external_inp_buf=False,
             kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode,
             gpu_per_node=1,
@@ -76,7 +77,7 @@ class EpDispatchCombineTestCase:
         
         def set_seed():
           return jax.random.PRNGKey(777)
-        self.rng =jax.jit(set_seed)()
+        self.rng = jax.jit(set_seed)()
 
     def cleanup(self):
         mori.shmem.shmem_finalize()
@@ -99,41 +100,11 @@ class EpDispatchCombineTestCase:
         else:
             padded = inp
 
+        tiled = jnp.tile(padded, (self.world_size, 1))
+        print(f"-- pad shape: {padded.shape} --> {tiled.shape}")
         # Return a copy for each "rank"
-        return [np.array(padded.copy()) for _ in range(self.world_size)]
-    
-    def allgather_torch(self, input, max_token_num):
-        
-        input = torch.from_numpy(input).to(self.device)
-        shape = list(input.shape)
-
-        pad_shape = shape.copy()
-        pad_shape[0] = max_token_num - shape[0]
-
-        target_shape = shape.copy()
-        target_shape[0] = max_token_num
-
-        output = [
-            torch.zeros(
-                target_shape,
-                dtype=input.dtype,
-                device=input.device,
-            )
-            for _ in range(self.world_size)
-        ]
-        padded_input = torch.cat(
-            [
-                input,
-                torch.zeros(
-                    pad_shape,
-                    dtype=input.dtype,
-                    device=input.device,
-                ),
-            ],
-            0,
-        )
-        dist.all_gather(output, padded_input)
-        return [x.cpu() for x in output]
+        #return [jnp.array(padded.copy()) for _ in range(self.world_size)]
+        return tiled
 
     #@partial(jax.jit, static_argnums=(0,))
     def gen_test_data(self):
@@ -145,64 +116,45 @@ class EpDispatchCombineTestCase:
         total_experts = self.config.num_experts_per_rank * self.config.world_size
         print(f"----- rank {self.rank} #tokens {num_tokens} #experts {total_experts}")
 
-        # indices_list = []
-        # for rank in range(self.config.world_size):
-        #     indices_np = np.empty((num_tokens, self.config.num_experts_per_token), dtype=np.int64)
-        #     np.random.seed(rank)
-        #     perm = np.random.permutation(total_experts)
-        #     for i in range(num_tokens):
-        #         indices_np[i, :] = perm[: self.config.num_experts_per_token]
-        #     #indices = jnp.array(indices_np, dtype=jnp.int32)
-        #     indices_list.append(indices_np)
-        
-        # indices_list = [jnp.array(x, dtype=jnp.int32) for x in indices_list]
-        # indices=indices_list[self.rank]
-
         # Use numpy for per-row permutation sampling
-        indices_np = np.empty((num_tokens, self.config.num_experts_per_token), dtype=np.int64)
-        np.random.seed(self.rank)
-        perm = np.random.permutation(total_experts)
-        # print(f"----- rank {self.rank} perm {perm}")
-        for i in range(num_tokens):
-            indices_np[i, :] = perm[: self.config.num_experts_per_token]
-        indices = jnp.array(indices_np, dtype=jnp.int32)
-        # zz=jax.random.PRNGKey(self.rank)
-        # perm = jax.random.permutation(zz, total_experts)
-        # indices = jnp.tile(perm[: self.config.num_experts_per_token], (num_tokens, 1))
+        # indices_np = np.empty((num_tokens, self.config.num_experts_per_token), dtype=np.int64)
+        # np.random.seed(self.rank)
+        # perm = np.random.permutation(total_experts)
+        # # print(f"----- rank {self.rank} perm {perm}")
+        # for i in range(num_tokens):
+        #     indices_np[i, :] = perm[: self.config.num_experts_per_token]
+        # indices = jnp.array(indices_np, dtype=jnp.int32)
+        
+        perm = jax.random.permutation(self.rng, total_experts)
+        indices = jnp.tile(perm[: self.config.num_experts_per_token], (num_tokens, 1))
         
         #print(f"indices {indices_np}", flush=True)
         #indices_list = self.allgather_torch(indices_np, self.config.max_num_inp_token_per_rank)
         indices_list = self.allgather_padded(indices, self.config.max_num_inp_token_per_rank)
-        #indices_list = [jnp.array(x, dtype=jnp.int32) for x in indices_list]
 
         # weights: [num_tokens, num_experts_per_token], float32
         weights = jax.random.uniform(self.rng, (num_tokens, self.config.num_experts_per_token), dtype=jnp.float32)
-        #print(f"weights {weights}")
-        
         weights_list = self.allgather_padded(weights, self.config.max_num_inp_token_per_rank)
 
-        # scales (scale_dim == 0 in config; still create shapes)
         if self.config.scale_dim != 0:
             scales_fp32 = jax.random.uniform(self.rng, (num_tokens, self.config.scale_dim), dtype=jnp.float32)
-            scales_list = self.allgather_padded(scales_fp32, self.config.max_num_inp_token_per_rank)
         else:
             scales_fp32 = jnp.zeros((1, 1), dtype=jnp.float32)
-            scales_list = [jnp.zeros((self.config.max_num_inp_token_per_rank, 0), dtype=jnp.float32) for _ in range(self.world_size)]
+        # cast to target type after gather
+        scales_list = self.allgather_padded(scales_fp32, self.config.max_num_inp_token_per_rank).astype(self.jax_scale_dtype)
 
         # input: [num_tokens, hidden_dim]
-        input_fp32 = jax.random.normal(self.rng, (num_tokens, self.config.hidden_dim), 
-                            dtype=jnp.float32)
-        input_list = self.allgather_padded(input_fp32.astype(self.jax_dtype), self.config.max_num_inp_token_per_rank)
-        #input_list = [jnp.array(x, dtype=self.jax_dtype) for x in input_list]
+        input_fp32 = jax.random.normal(self.rng, (num_tokens, self.config.hidden_dim), dtype=jnp.float32)
+        input_list = self.allgather_padded(input_fp32, self.config.max_num_inp_token_per_rank).astype(self.jax_dtype)
         
-        print(f"num_tokens {num_tokens}  hidden: {self.config.hidden_dim} indices: {indices.shape} tp {indices.dtype}")
-        print(f"weights: {weights.shape} {weights.dtype}")
-        print(f"scales_fp32: {scales_fp32.shape} {scales_fp32.dtype}", flush=True)
+        print(f"num_tokens {num_tokens}  hidden: {self.config.hidden_dim} indices: {indices.shape}/{indices.dtype}")
+        print(f"weights: {weights.shape}/{weights.dtype}")
+        print(f"scales_fp32: {scales_fp32.shape}/{scales_fp32.dtype}", flush=True)
 
         return (num_tokens,
             indices,
             weights,
-            scales_fp32,
+            scales_fp32.astype(self.jax_scale_dtype),
             input_fp32.astype(self.jax_dtype),
             indices_list,
             weights_list,
@@ -220,57 +172,78 @@ class EpDispatchCombineTestCase:
             scales_list,
             input_list) = test_data
 
+        jax_out = op.dispatch_jax(
+            input_arr, weights, scales, indices, block_num=80, warp_per_block=16,
+            has_scales=True, has_weights=True,
+        )
+        
+        for buf in list(jax_out):
+            print(f"buf size: {buf.shape} / {buf.dtype}")
+        
         (dispatch_output, 
          dispatch_weights, 
          dispatch_scales, 
          dispatch_indices, 
-         dispatch_recv_num_token) = op.dispatch_jax(
-            input_arr, weights, scales, indices, block_num=80, warp_per_block=16,
-            has_scales=True, has_weights=True,
-        )
-         
-        src_token_pos = op.get_dispatch_src_token_pos().detach().cpu().numpy()
-        #src_token_pos = op.get_dispatch_src_token_pos_jax()
-        print(f"------------ recv num: {dispatch_recv_num_token}")
-        print(f"rank {self.rank} got {num_tokens} tokens received {src_token_pos.shape[0]} tokens", flush=True)
-       
+         dispatch_recv_num_token) = jax_out
 
+        #src_token_pos = op.get_dispatch_src_token_pos().detach().cpu().numpy()
+        src_token_pos = op.get_dispatch_src_token_pos_jax()
+        num_recv = dispatch_recv_num_token
+        print(f"rank {self.rank} got {num_tokens} tokens received {num_recv} tokens", flush=True)
+        src_token_pos = np.array(src_token_pos)[:num_recv]
+        print(f"baze size: {input_list[src_token_pos].shape[0]} === {input_list.shape}")
+
+        @jax.jit
+        def compare(src_pos, base_list, base_out, *args):
+          num = base_list[src_pos].shape[0]
+          x = jnp.all(base_list[src_pos] == base_out[:num,:])
+          for (x_list, x_out) in args:
+            if x_out != None:
+              x = x & jnp.all(x_list[src_pos] == x_out[:num,:])
+          return x
+      
+        assert len(np.unique(src_token_pos)) == len(src_token_pos)
+        assert len(src_token_pos) == int(dispatch_recv_num_token)
+
+        res = compare(src_token_pos, input_list, dispatch_output,
+                    (weights_list, dispatch_weights),
+                    (scales_list, dispatch_scales if self.config.scale_dim != 0 else None),
+                    (indices_list, dispatch_indices if False else None))
+        assert res, f"{self.rank} comparison failed!"
+        # print(f"input_list {input_list.shape} ss {ss.shape} at {src_token_pos.shape} vs {vv.shape}")
+
+        max_tokens = self.config.max_num_inp_token_per_rank
         # Validate dispatch outputs against gathered inputs
-        for i, pos in enumerate(src_token_pos):
-            pos_i = int(pos)
-            src_rank = pos_i // self.config.max_num_inp_token_per_rank
-            src_id = pos_i % self.config.max_num_inp_token_per_rank
-
-            if i % 500 == 0:
-                print(f" rank: {self.rank} == {i}", flush=True)
-            #continue
-            #print(f"- {i} / pos_i {pos_i} / src_id {src_id}")
-            left = np.array(input_list[src_rank][src_id])
-            right = np.array(dispatch_output[i])
-            assert np.array_equal(left, right), f"dispatch_output mismatch at token {i} (rank {self.rank})"
-            continue
+        # for i, pos in enumerate(src_token_pos):
+        #     pos_i = int(pos)
+        #     src_rank = pos_i // max_tokens
+        #     src_id = pos_i % max_tokens
             
-            left_w = np.array(weights_list[src_rank][src_id])
-            right_w = np.array(dispatch_weights[i])
-            assert np.array_equal(left_w, right_w), f"dispatch_weights mismatch at token {i} (rank {self.rank})"
+        #     continue
+            
+            # flatidx = src_rank*max_tokens+src_id
+            # print(f"--- {flatidx} -- {pos_i}")
 
-            if scales_list is not None and self.config.scale_dim != 0:
-                left_s = np.array(scales_list[src_rank][src_id])
-                right_s = np.array(dispatch_scales[i])
-                assert np.array_equal(left_s, right_s), f"dispatch_scales mismatch at token {i} (rank {self.rank})"
+            #continue
+            # #print(f"- {i} / pos_i {pos_i} / src_id {src_id}")
+            # if i % 500 == 0:
+            #     print(f" rank: {self.rank} == {i} ii {input_list.shape} vs {dispatch_output[i].shape}", flush=True)
+            # assert jnp.all(input_list[pos_i] == dispatch_output[i]), f"dispatch_output mismatch at token {i} (rank {self.rank})"
+            # continue
+            
+            # assert jnp.all(weights_list[src_rank][src_id] == dispatch_weights[i]), f"dispatch_weights mismatch at token {i} (rank {self.rank})"
 
-            left_idx = np.array(indices_list[src_rank][src_id])
-            right_idx = np.array(dispatch_indices[i])
+            # if scales_list is not None and self.config.scale_dim != 0:
+            #   assert jnp.all(scales_list[src_rank][src_id] == dispatch_scales[i]), f"dispatch_scales mismatch at token {i} (rank {self.rank})"
+
+            # assert jnp.all(indices_list[src_rank][src_id] == dispatch_indices[i]), f"dispatch_indices mismatch at token {i} (rank {self.rank})"
             
             #if not np.array_equal(left_idx, right_idx):
                 # print(f"lhs = {left_idx} -- {left} -- {left_w}")
                 # print(f"rhs = {right_idx} -- {right} -- {right_w}")
             #    print("ops indices mismatch")
-            #assert np.array_equal(left_idx, right_idx), f"dispatch_indices mismatch at token {i} (rank {self.rank})"
+            #assert np.array_equal(left_idx, right_idx), )"
         print(f"{self.rank} comparison tokens ok", flush=True)
-
-        assert len(np.unique(src_token_pos)) == len(src_token_pos)
-        assert len(src_token_pos) == int(dispatch_recv_num_token)
 
         if self.config.rank == 0:
             print("[rank 0] Dispatch Pass")

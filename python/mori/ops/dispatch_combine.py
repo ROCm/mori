@@ -241,16 +241,17 @@ class EpDispatchCombineOp:
     return output
 
   def get_dispatch_src_token_pos_jax(self):
-      
+    torch.cuda.synchronize()
     if self.config.kernel_type.value in (
       EpDispatchCombineKernelType.IntraNode.value,
       EpDispatchCombineKernelType.InterNodeV1.value,
       EpDispatchCombineKernelType.InterNodeV1LL.value,
     ):
       # here we need to allocate enough space to accomodate '*handle->totalRecvTokenNum' items
+      n_tokens = self.config.MaxNumTokensToRecv()
       return jax.ffi.ffi_call(
             "get_dispatch_src_token_id", (
-            jax.ShapeDtypeStruct((num_tokens,), jnp.int32)),
+            jax.ShapeDtypeStruct((n_tokens,), jnp.int32)),
         )(
             handle_ptr=np.int64(self.handle_.ptr()),
          )
@@ -265,7 +266,6 @@ class EpDispatchCombineOp:
       EpDispatchCombineKernelType.InterNodeV1.value,
       EpDispatchCombineKernelType.InterNodeV1LL.value,
     ):
-      print(f"-------- calling simple _get_dispatch_src_token_pos_func")
       return self._get_dispatch_src_token_pos_func(self.handle_)
 
     dispatch_sender_token_id_map = self._get_dispatch_sender_token_idx_map_func(
