@@ -191,6 +191,8 @@ void Context::InitializePossibleTransports() {
   this->numQpPerPe = numQpPerPe;
   // Initialize transport
   int peerRankInNode = -1;
+  if(!IsP2PDisabled() && IsSDMAEnabled()) anvil::anvil.init();
+
   for (int i = 0; i < WorldSize(); i++) {
     // Check P2P availability
     if (!IsP2PDisabled()) {
@@ -204,9 +206,13 @@ void Context::InitializePossibleTransports() {
         if ((i == LocalRank()) || canAccessPeer) {
           if(IsSDMAEnabled() && (i != LocalRank()) ){
             transportTypes.push_back(TransportType::SDMA);
-            anvil::EnablePeerAccess(LocalRank()%8, i%8);
+
+	    printf("into EnablePeerAccess\n");
+	    anvil::EnablePeerAccess(LocalRank()%8, i%8);
+	    printf("completed EnablePeerAccess, form %d ----> to %d \n", LocalRank()%8, i%8);
             // Better performance if allocating all 8 queues
-            anvil::anvil.connect(LocalRank()%8, i%8, 8);
+            anvil::anvil.connect(LocalRank()%8, i%8, 1);
+	    printf("completed connected\n");
           }else{
             transportTypes.push_back(TransportType::P2P);
           }

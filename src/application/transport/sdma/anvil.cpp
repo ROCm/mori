@@ -29,6 +29,7 @@ auto checkHsaError = [](hsa_status_t s, const char* msg, const char* file, int l
       }                                                                                                                \
    } while (0)
 
+#if 0
 inline void checkHipError(hipError_t err, const char* msg, const char* file, int line)
 {
    if (err != hipSuccess)
@@ -59,6 +60,7 @@ inline void EnablePeerAccess(int const deviceId, int const peerDeviceId)
                 << hipGetErrorString(error) << ")\n";
    }
 }
+#endif
 
 // HSA agents
 std::vector<hsa_agent_t> cpuAgents_;
@@ -134,8 +136,10 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
    // cachedWptr_(detail::gpuCallocUncachedShared<uint64_t>()),
    // committedWptr_(detail::gpuCallocUncachedShared<uint64_t>()) {
    int originalDeviceId;
+   printf("into sdmaqueue  buiding dunc\n");
    CHECK_HIP_ERROR(hipGetDevice(&originalDeviceId)); // Save the current device
-
+    
+   printf("get device succe!\n");
    uint32_t localNodeId;
    hsa_status_t status = hsa_agent_get_info(localAgent, HSA_AGENT_INFO_NODE, &localNodeId);
    if (status != HSA_STATUS_SUCCESS)
@@ -143,6 +147,8 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
       printf("Failure to get device info: 0x%x", status);
       // return status;
    }
+
+   printf("get info secce\n");
 
    // std::cout << "Allocating queue for engine " << engineId << " on device " << localDeviceId << "
    // to device "
@@ -159,8 +165,11 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
    memFlags.ui32.NoNUMABind = 1;
    memFlags.ui32.ExecuteAccess = 1;
    memFlags.ui32.Uncached = 1;
-   // std::cout << "Allocating SDMA Queue Buffer for device: " << localNodeId << std::endl <<
-   // std::flush;
+   
+   std::cout << "Allocating SDMA Queue Buffer for device: " << localNodeId << std::endl <<
+   std::flush;
+
+
    CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(localNodeId, SDMA_QUEUE_SIZE, memFlags, &queueBuffer_), "Failed");
    CHECK_HSAKMT_SUCCESS(hsaKmtMapMemoryToGPU(queueBuffer_, SDMA_QUEUE_SIZE, NULL), "Failed");
 
@@ -190,6 +199,8 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
        .committedWptr = committedWptr_,
        .cachedHwReadIndex = (uint64_t) * (queue_.Queue_read_ptr_aql),
    };
+
+   printf("sdma queue build 1\n");
 
    CHECK_HIP_ERROR(hipMemcpy(deviceHandle_, &handle, sizeof(SdmaQueueDeviceHandle), hipMemcpyHostToDevice));
    CHECK_HIP_ERROR(hipMemcpy(cachedWptr_, &cachedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
@@ -261,6 +272,7 @@ bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels)
       sdma_channels_[dstDeviceId].emplace_back(
           std::make_unique<SdmaQueue>(srcDeviceId, dstDeviceId, gpuAgents_[srcDeviceId], engineId));
    }
+   printf("compete connect!\n");
    return true;
 }
 

@@ -43,38 +43,76 @@ __global__ void RingAllGatherWithPutMemAPIKernel(int myPe, int npes, const SymmM
   for (int i = 0; i < npes - 1; i++) {
     int sendDataRank = ((myPe - i) + npes) % npes;
     int sendOffset = sendDataRank * peChunkSize;
+
+    printf("go into ShmemPutMemNbiThread\n");
     ShmemPutMemNbiThread(memObj, sendOffset, source, sendOffset, peChunkSize, nextPeer);
-    ShmemQuietThread();
+    ShmemQuietThread(nextPeer,memObj);
 
     int recvDataRank = ((sendDataRank - 1) + npes) % npes;
     int recvOffset = recvDataRank * peChunkSize;
     void* recvAddr = reinterpret_cast<char*>(memObj->localPtr) + recvOffset;
 
     // Wait until received
-    printf("rank %d round %d recv rank %d sendoff %d recvoff %d\n", myPe, i, recvDataRank,
+    printf("rank ----- %d round %d recv rank %d sendoff %d recvoff %d\n", myPe, i, recvDataRank,
            sendOffset, recvOffset);
 
     while ((atomicAdd(reinterpret_cast<uint32_t*>(recvAddr), 0)) != (recvDataRank + 1)) {
     }
+    printf("========data recved=======\n");
   }
+}
+
+inline void checkHipError(hipError_t err, const char* msg, const char* file, int line)
+{
+   if (err != hipSuccess)
+   {
+      std::cerr << "HIP error at " << file << ":" << line << " — " << msg << "\n"
+                << "  Code: " << err << " (" << hipGetErrorString(err) << ")" << std::endl;
+      std::exit(EXIT_FAILURE);
+   }
+}
+
+// Allow access to peerDeviceId from deviceId
+inline void EnablePeerAccess(int const deviceId, int const peerDeviceId)
+{
+   int canAccess;
+   CHECK_HIP_ERROR(hipDeviceCanAccessPeer(&canAccess, deviceId, peerDeviceId));
+   if (!canAccess)
+   {
+      std::cerr << "Unable to enable peer access from GPU devices " << deviceId << " to " << peerDeviceId << "\n";
+   }
+
+   CHECK_HIP_ERROR(hipSetDevice(deviceId));
+   hipError_t error = hipDeviceEnablePeerAccess(peerDeviceId, 0);
+   if (error != hipSuccess && error != hipErrorPeerAccessAlreadyEnabled)
+   {
+      std::cerr << "Unable to enable peer to peer access from " << deviceId << "  to " << peerDeviceId << " ("
+                << hipGetErrorString(error) << ")\n";
+   }
 }
 
 void RingAllGatherWithPutMemAPI() {
   int status;
   MPI_Init(NULL, NULL);
-
+  
+  printf("into mpi init\n");
   status = ShmemMpiInit(MPI_COMM_WORLD);
+  printf("finished init\n");
   assert(!status);
 
   // Assume in same node
   int myPe = ShmemMyPe();
   int npes = ShmemNPes();
 
+  HIP_RUNTIME_CHECK(hipSetDevice(myPe%8));
+  printf("xxxxxxxxxxxxxxx mype:%dxxxxxxxxxxxxxxxxxxxx\n",myPe);
+
   // Allocate buffer
   int buffSize = npes * 1024 * sizeof(uint32_t);
   int peChunkSize = buffSize / npes / sizeof(uint32_t);
 
   void* buff = ShmemMalloc(buffSize);
+  printf("rank %d-------addr %p--\n", myPe, buff);
   HIP_RUNTIME_CHECK(
       hipMemsetD32(reinterpret_cast<uint32_t*>(buff) + myPe * peChunkSize, myPe + 1, peChunkSize));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
@@ -85,6 +123,8 @@ void RingAllGatherWithPutMemAPI() {
   for (int i = 0; i < npes; i++) {
     printf("Before rank %d, got %d on %dth chunk\n", myPe,
            reinterpret_cast<uint32_t*>(buff)[i * peChunkSize], i);
+//    if (myPe != i)
+//      EnablePeerAccess(myPe, i);
   }
   // Run put
   RingAllGatherWithPutMemAPIKernel<<<1, 1>>>(myPe, npes, buffObj);
@@ -102,7 +142,7 @@ void RingAllGatherWithPutMemAPI() {
   // Finalize
   ShmemFree(buff);
   ShmemFinalize();
-  MPI_Finalize();
+  //MPI_Finalize();
 }
 
 int main(int argc, char* argv[]) {

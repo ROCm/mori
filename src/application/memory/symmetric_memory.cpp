@@ -54,7 +54,8 @@ void SymmMemManager::HostFree(void* localPtr) {
 
 SymmMemObjPtr SymmMemManager::Malloc(size_t size) {
   void* ptr = nullptr;
-  HIP_RUNTIME_CHECK(hipMalloc(&ptr, size));
+  HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&ptr, size, hipDeviceMallocUncached));
+  //HIP_RUNTIME_CHECK(hipMalloc(&ptr, size));
   HIP_RUNTIME_CHECK(hipMemset(ptr, 0, size));
   return RegisterSymmMemObj(ptr, size);
 }
@@ -91,14 +92,14 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
       static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
   bootNet.Allgather(&handle, cpuMemObj->ipcMemHandles, sizeof(hipIpcMemHandle_t));
   for (int i = 0; i < worldSize; i++) {
-    if (context.GetTransportType(i) != TransportType::P2P) continue;
+    if ((context.GetTransportType(i) != TransportType::P2P) && (context.GetTransportType(i) != TransportType::SDMA) ) continue;
     if (i == rank) continue;
 
     HIP_RUNTIME_CHECK(hipIpcOpenMemHandle(reinterpret_cast<void**>(&cpuMemObj->peerPtrs[i]),
                                           cpuMemObj->ipcMemHandles[i],
                                           hipIpcMemLazyEnablePeerAccess));
   }
-
+ 
   // Rdma context: set lkey and exchange rkeys
   cpuMemObj->peerRkeys = static_cast<uint32_t*>(calloc(worldSize, sizeof(uint32_t)));
   cpuMemObj->peerRkeys[rank] = 0;
@@ -131,19 +132,23 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
   }
   if(dstDeviceIds.size() != 0) {
     int srcDeviceId = rank%8;
-    int numOfQueuesPerDevice = 8;  // all sdma queues are inited
+    int numOfQueuesPerDevice = gpuMemObj->sdmaNumQueue;  // all sdma queues are inited
     HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->deviceHandles_d, dstDeviceIds.size()* numOfQueuesPerDevice* sizeof(anvil::SdmaQueueDeviceHandle*)));
 
     for (auto& dstDeviceId : dstDeviceIds)
     { 
-      for (size_t q = 0; q < numOfQueuesPerDevice; q++)
+      for (size_t q = 0; q <numOfQueuesPerDevice; q++)
         {
           gpuMemObj->deviceHandles_d[dstDeviceId*numOfQueuesPerDevice + q] = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
+	        printf("init, rank:%d, deviceHandles_d:%p, deviceHandles_d[%d]:%p\n", rank, gpuMemObj->deviceHandles_d, dstDeviceId*numOfQueuesPerDevice + q, gpuMemObj->deviceHandles_d[dstDeviceId*numOfQueuesPerDevice + q]);
         }
     }
 
     HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->signalPtrs, sizeof(HSAuint64) * dstDeviceIds.size()* numOfQueuesPerDevice));
-    HIP_RUNTIME_CHECK(hipMemset(signalPtrs, 0, sizeof(HSAuint64) * dstDeviceIds.size()* numOfQueuesPerDevice));
+    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->signalPtrs, 0, sizeof(HSAuint64) * dstDeviceIds.size()* numOfQueuesPerDevice));
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->expectSignalsPtr, sizeof(HSAuint64) * dstDeviceIds.size()* numOfQueuesPerDevice));
+    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->expectSignalsPtr, 0, sizeof(HSAuint64) * dstDeviceIds.size()* numOfQueuesPerDevice));
+
   }
   memObjPool.insert({localPtr, SymmMemObjPtr{cpuMemObj, gpuMemObj}});
   return memObjPool.at(localPtr);

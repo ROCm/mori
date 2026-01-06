@@ -19,7 +19,7 @@ constexpr uint32_t SDMA_QUEUE_SIZE = 256 * 1024; // 256KB
 constexpr HSA_QUEUE_PRIORITY DEFAULT_PRIORITY = HSA_QUEUE_PRIORITY_NORMAL;
 constexpr unsigned int DEFAULT_QUEUE_PERCENTAGE = 100;
 constexpr int MAX_RETRIES = 1 << 30;
-constexpr bool BREAK_ON_RETRIES = false;
+constexpr bool BREAK_ON_RETRIES = true;
 
 __device__ __forceinline__ SDMA_PKT_COPY_LINEAR CreateCopyPacket(void* srcBuf, void* dstBuf, long long int packetSize)
 {
@@ -71,22 +71,26 @@ __device__ __forceinline__ SDMA_PKT_FENCE CreateFencePacket(HSAuint64* address, 
 __device__ __forceinline__ bool waitForSignal(HSAuint64* addr, uint64_t expected)
 {
    int retries = 0;
-
    while (true)
    {
+      //printf("-----waiting in while 111 ------\n");
       uint64_t value = __hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       if (value == expected)
       {
+	 printf("-----signal expected ------\n");
          return true;
       }
+      // printf("-----waiting in while 222 ------\n");
       if constexpr (BREAK_ON_RETRIES)
       {
          if (retries++ == MAX_RETRIES)
          {
+            printf("-----waiting time out------\n");
             break;
          }
       }
    }
+    printf("-----waiting in while 333 ------\n");
    return false;
 }
 
