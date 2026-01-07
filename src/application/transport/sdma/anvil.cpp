@@ -136,19 +136,17 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
    // cachedWptr_(detail::gpuCallocUncachedShared<uint64_t>()),
    // committedWptr_(detail::gpuCallocUncachedShared<uint64_t>()) {
    int originalDeviceId;
-   printf("into sdmaqueue  buiding dunc\n");
+
    CHECK_HIP_ERROR(hipGetDevice(&originalDeviceId)); // Save the current device
     
-   printf("get device succe!\n");
+
    uint32_t localNodeId;
    hsa_status_t status = hsa_agent_get_info(localAgent, HSA_AGENT_INFO_NODE, &localNodeId);
    if (status != HSA_STATUS_SUCCESS)
    {
       printf("Failure to get device info: 0x%x", status);
-      // return status;
+      //return status;
    }
-
-   printf("get info secce\n");
 
    // std::cout << "Allocating queue for engine " << engineId << " on device " << localDeviceId << "
    // to device "
@@ -200,8 +198,6 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
        .cachedHwReadIndex = (uint64_t) * (queue_.Queue_read_ptr_aql),
    };
 
-   printf("sdma queue build 1\n");
-
    CHECK_HIP_ERROR(hipMemcpy(deviceHandle_, &handle, sizeof(SdmaQueueDeviceHandle), hipMemcpyHostToDevice));
    CHECK_HIP_ERROR(hipMemcpy(cachedWptr_, &cachedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
    CHECK_HIP_ERROR(hipMemcpy(committedWptr_, &committedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
@@ -243,19 +239,19 @@ void AnvilLib::init()
       if (status != HSA_STATUS_SUCCESS)
       {
          printf("Failure to open HSA connection: 0x%x", status);
-         // return 1;
+         //return 1;
       }
       status = hsa_iterate_agents(&rocm_hsa_gpu_agent_callback, &gpuAgents_);
       if (status != HSA_STATUS_SUCCESS && status != HSA_STATUS_INFO_BREAK)
       {
          printf("Failure to iterate HSA agents: 0x%x", status);
-         // return 1;
+         //return 1;
       }
       status = hsa_iterate_agents(&rocm_hsa_cpu_agent_callback, &cpuAgents_);
       if (status != HSA_STATUS_SUCCESS && status != HSA_STATUS_INFO_BREAK)
       {
          printf("Failure to iterate HSA agents: 0x%x", status);
-         // return 1;
+         //return 1;
       }
 
       SetUpKFD();
@@ -272,7 +268,6 @@ bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels)
       sdma_channels_[dstDeviceId].emplace_back(
           std::make_unique<SdmaQueue>(srcDeviceId, dstDeviceId, gpuAgents_[srcDeviceId], engineId));
    }
-   printf("compete connect!\n");
    return true;
 }
 

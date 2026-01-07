@@ -140,7 +140,6 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
       for (size_t q = 0; q <numOfQueuesPerDevice; q++)
         {
           gpuMemObj->deviceHandles_d[dstDeviceId*numOfQueuesPerDevice + q] = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
-	        printf("init, rank:%d, deviceHandles_d:%p, deviceHandles_d[%d]:%p\n", rank, gpuMemObj->deviceHandles_d, dstDeviceId*numOfQueuesPerDevice + q, gpuMemObj->deviceHandles_d[dstDeviceId*numOfQueuesPerDevice + q]);
         }
     }
 

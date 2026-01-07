@@ -49,7 +49,7 @@ struct SymmMemObj {
   //For Sdma
   anvil::SdmaQueueDeviceHandle** deviceHandles_d = nullptr;  // should only placed on GPU
   HSAuint64* signalPtrs = nullptr; // should only placed on GPU
-  uint32_t sdmaNumQueue = 8; // should only placed on GPU
+  uint32_t sdmaNumQueue = 8; // number of sdma queue
   HSAuint64* expectSignalsPtr = nullptr; // should only placed on GPU
 
   __device__ __host__ RdmaMemoryRegion GetRdmaMemoryRegion(int pe) const {

@@ -36,30 +36,26 @@ namespace core {
 
 inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_size, 
                                 anvil::SdmaQueueDeviceHandle** deviceHandles, 
-                                HSAuint64* signals, HSAuint64* expectedSignals)
+                                HSAuint64* signals, HSAuint64* expectedSignals, uint32_t queNum)
 {
    uint64_t base = 0;
    uint64_t pendingWptr = 0;
    uint64_t startBase = 0;
    size_t perq_send_size =0;
 
-//   const int warpId = threadIdx.x / warpSize;
-//   const int laneId = threadIdx.x % warpSize;
-//   const int nWarps = blockDim.x / warpSize;
-
-   const size_t rand_size = copy_size/ 8; // per queue rand data
+   const size_t rand_size = copy_size/ queNum; // per queue rand data
 
    char* srcPtr = reinterpret_cast<char*>(srcBuf);
    char* dstPtr = reinterpret_cast<char*>(dstBuf);
 
-   for(int q =0; q<1; q++){
+   for(int q = 0; q < queNum; q++){
       anvil::SdmaQueueDeviceHandle handle = **(deviceHandles+q);
       base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR));
       pendingWptr = base;
       startBase = base;
 
-      if(q < 7) perq_send_size = rand_size;
-      else perq_send_size = copy_size - 7*rand_size;
+      if(q < queNum-1) perq_send_size = rand_size;
+      else perq_send_size = copy_size - (queNum-1)*rand_size;
       
       auto packet_d = anvil::CreateCopyPacket(srcPtr, dstPtr, perq_send_size);
       handle.template placePacket(packet_d, pendingWptr);
@@ -75,27 +71,24 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
       handle.submitPacket(startBase, pendingWptr);
       expectedSignals[q]++;
    }
-   printf("put data finished ...\n");
 
 }
 
 
 inline __device__ void SdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size, 
                                 anvil::SdmaQueueDeviceHandle** deviceHandles, 
-                                HSAuint64* signals, HSAuint64* expectedSignals)
+                                HSAuint64* signals, HSAuint64* expectedSignals, uint32_t queNum)
 {
    uint64_t base = 0;
    uint64_t pendingWptr = 0;
    uint64_t startBase = 0;
    size_t perq_send_size =0;
 
-//   const int warpId = threadIdx.x / warpSize;
    const int laneId = threadIdx.x % warpSize;
-//   const int nWarps = blockDim.x / warpSize;
 
-   if(laneId >= 8) return;
+   if(laneId >= queNum) return;
    int queueId = laneId;
-   const size_t rand_size = copy_size / 8; // per queue rand data
+   const size_t rand_size = copy_size / queNum; // per queue rand data
 
    char* srcPtr = reinterpret_cast<char*>(srcBuf);
    char* dstPtr = reinterpret_cast<char*>(dstBuf);
@@ -105,8 +98,8 @@ inline __device__ void SdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
    pendingWptr = base;
    startBase = base;
 
-   if(queueId < 7) perq_send_size = rand_size;
-   else perq_send_size = copy_size - 7*rand_size;
+   if(queueId < (queNum -1)) perq_send_size = rand_size;
+   else perq_send_size = copy_size - (queNum -1)*rand_size;
    
    auto packet_d = anvil::CreateCopyPacket(srcPtr, dstPtr, perq_send_size);
    handle.template placePacket(packet_d, pendingWptr);
@@ -128,20 +121,18 @@ inline __device__ void SdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Completion Queue                                       */
 /* ---------------------------------------------------------------------------------------------- */
-inline __device__ void SdmaQueitThread(HSAuint64* signals, HSAuint64* expectedSignals)
+inline __device__ void SdmaQueitThread(HSAuint64* signals, HSAuint64* expectedSignals, uint32_t queNum)
 {
-   printf("waiting signal---\n");
-   for(int q =0; q <1; q++){
+   for(int q =0; q < queNum; q++){
       anvil::waitForSignal(signals+q, *(expectedSignals+q));
    }
-   printf("waitting signal finished--- \n");
 }
 
-inline __device__ void SdmaQueitWarp(HSAuint64* signals, HSAuint64* expectedSignals)
+inline __device__ void SdmaQueitWarp(HSAuint64* signals, HSAuint64* expectedSignals, uint32_t queNum)
 {
    const int laneId = threadIdx.x % warpSize;
 
-   if(laneId >=8 ) return;
+   if(laneId >=queNum) return;
    int queueId = laneId;
    anvil::waitForSignal(signals+queueId, *(expectedSignals + queueId));
 }

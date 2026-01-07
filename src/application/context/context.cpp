@@ -207,12 +207,9 @@ void Context::InitializePossibleTransports() {
           if(IsSDMAEnabled() && (i != LocalRank()) ){
             transportTypes.push_back(TransportType::SDMA);
 
-	    printf("into EnablePeerAccess\n");
 	    anvil::EnablePeerAccess(LocalRank()%8, i%8);
-	    printf("completed EnablePeerAccess, form %d ----> to %d \n", LocalRank()%8, i%8);
             // Better performance if allocating all 8 queues
-            anvil::anvil.connect(LocalRank()%8, i%8, 1);
-	    printf("completed connected\n");
+            anvil::anvil.connect(LocalRank()%8, i%8, 8);
           }else{
             transportTypes.push_back(TransportType::P2P);
           }

@@ -73,24 +73,19 @@ __device__ __forceinline__ bool waitForSignal(HSAuint64* addr, uint64_t expected
    int retries = 0;
    while (true)
    {
-      //printf("-----waiting in while 111 ------\n");
       uint64_t value = __hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       if (value == expected)
       {
-	 printf("-----signal expected ------\n");
          return true;
       }
-      // printf("-----waiting in while 222 ------\n");
       if constexpr (BREAK_ON_RETRIES)
       {
          if (retries++ == MAX_RETRIES)
          {
-            printf("-----waiting time out------\n");
             break;
          }
       }
    }
-    printf("-----waiting in while 333 ------\n");
    return false;
 }
 
