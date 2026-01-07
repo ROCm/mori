@@ -521,6 +521,7 @@ class EpDispatchCombineTestCase:
         op = mori.ops.EpDispatchCombineOp(self.config)
         num_test_data = 128
         sync_interval = 128
+        is_fp8 = self.config.data_type in (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
 
         if self.rank == 0:
             print("Stress Test")
@@ -547,25 +548,14 @@ class EpDispatchCombineTestCase:
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
                 block_num=self.config.block_num,
-                # warp_per_block=16,
             )
-            if self.config.data_type in (torch.float8_e4m3fnuz, torch.float8_e4m3fn):
-                _, _, _ = op.combine(
-                    dispatch_output,
-                    dispatch_weights,
-                    all_rank_indices[self.rank],
-                    block_num=self.config.block_num,
-                    # warp_per_block=16,
-                    scales=dispatch_scales,
-                )
-            else:
-                _, _ = op.combine(
-                    dispatch_output,
-                    dispatch_weights,
-                    all_rank_indices[self.rank],
-                    block_num=self.config.block_num,
-                    # warp_per_block=16,
-                )
+            op.combine(
+                dispatch_output,
+                dispatch_weights,
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+                scales=dispatch_scales if is_fp8 else None,
+            )
             if i % sync_interval == 0:
                 torch.cuda.synchronize()
         torch.cuda.synchronize()
@@ -594,25 +584,14 @@ class EpDispatchCombineTestCase:
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
                 block_num=self.config.block_num,
-                # warp_per_block=16,
             )
-            if self.config.data_type in (torch.float8_e4m3fnuz, torch.float8_e4m3fn):
-                _, _, _ = op.combine(
-                    dispatch_output,
-                    dispatch_weights,
-                    all_rank_indices[self.rank],
-                    block_num=self.config.block_num,
-                    # warp_per_block=16,
-                    scales=dispatch_scales,
-                )
-            else:
-                _, _ = op.combine(
-                    dispatch_output,
-                    dispatch_weights,
-                    all_rank_indices[self.rank],
-                    block_num=self.config.block_num,
-                    # warp_per_block=16,
-                )
+            op.combine(
+                dispatch_output,
+                dispatch_weights,
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+                scales=dispatch_scales if is_fp8 else None,
+            )
         torch.cuda.synchronize()
 
         for i in tqdm(range(5000)):
@@ -625,6 +604,7 @@ class EpDispatchCombineTestCase:
     def run_bench_once(self, op, test_data, repeat=10):
         num_events = 2 * repeat + 1
         events = [torch.cuda.Event(enable_timing=True) for i in range(num_events)]
+        is_fp8 = self.config.data_type in (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
 
         (
             all_rank_num_token,
@@ -651,24 +631,13 @@ class EpDispatchCombineTestCase:
             )
             torch.cuda.synchronize()
             total_recv_num_token = dispatch_recv_num_token[0].item()
-            if self.config.data_type in (torch.float8_e4m3fnuz, torch.float8_e4m3fn):
-                combine_output, _, _ = op.combine(
-                    dispatch_output,
-                    dispatch_weights,
-                    all_rank_indices[self.rank],
-                    block_num=self.config.block_num,
-                    # warp_per_block=16,
-                    scales=dispatch_scales,
-                )
-            else:
-                combine_output, _ = op.combine(
-                    dispatch_output,
-                    dispatch_weights,
-                    # None,
-                    all_rank_indices[self.rank],
-                    block_num=self.config.block_num,
-                    # warp_per_block=16,
-                )
+            op.combine(
+                dispatch_output,
+                dispatch_weights,
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+                scales=dispatch_scales if is_fp8 else None,
+            )
             torch.cuda.synchronize()
 
         total_rdma_recv_num_token = (
@@ -697,23 +666,13 @@ class EpDispatchCombineTestCase:
                 # warp_per_block=16,
             )
             events[2 * i + 1].record()
-            if self.config.data_type in (torch.float8_e4m3fnuz, torch.float8_e4m3fn):
-                combine_output, _, _ = op.combine(
-                    dispatch_output,
-                    dispatch_weights,
-                    all_rank_indices[self.rank],
-                    block_num=self.config.block_num,
-                    # warp_per_block=16,
-                    scales=dispatch_scales,
-                )
-            else:
-                combine_output, _ = op.combine(
-                    dispatch_output,
-                    dispatch_weights,
-                    all_rank_indices[self.rank],
-                    block_num=self.config.block_num,
-                    # warp_per_block=16,
-                )
+            op.combine(
+                dispatch_output,
+                dispatch_weights,
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+                scales=dispatch_scales if is_fp8 else None,
+            )
             events[2 * i + 2].record()
         torch.cuda.synchronize()
 
