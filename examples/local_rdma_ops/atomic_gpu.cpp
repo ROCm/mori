@@ -47,12 +47,12 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion sendMr,
   RingDoorbell<P>(epSend.wqHandle.dbrAddr, dbr_val);
   __threadfence_system();
 
-  uint16_t wqeCounter;
+  uint32_t wqeCounter;
   int opcode = PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum, &epSend.cqHandle.consIdx,
                          &wqeCounter);
   epSend.cqHandle.consIdx += 1;
   UpdateCqDbrRecord<P>(epSend.cqHandle, epSend.cqHandle.consIdx);
-  printf("wqeCounter = %hu\n", wqeCounter);
+  printf("wqeCounter = %u\n", wqeCounter);
   // printf("send block is done, opcode is %d postIdx %u consIdx %u\n", opcode,
   // epSend.wqHandle.postIdx, epSend.cqHandle.consIdx);
   amoOp = AMO_FETCH_ADD;

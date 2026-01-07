@@ -180,7 +180,7 @@ inline __device__ int PollCq(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx);
 
 template <ProviderType PrvdType>
 inline __device__ int PollCq(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx,
-                             uint16_t* wqeCounter);
+                             uint32_t* wqeCounter);
 
 template <ProviderType PrvdType>
 inline __device__ int PollCq(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle, 

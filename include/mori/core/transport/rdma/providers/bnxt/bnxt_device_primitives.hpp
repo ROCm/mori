@@ -736,7 +736,7 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
 
 template <>
 inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx,
-                                                 uint16_t* wqeCounter) {
+                                                 uint32_t* wqeCounter) {
   const uint32_t curConsIdx = *consIdx;
   int opcode = -1;
   uint32_t wqeIdx;
@@ -744,7 +744,8 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
     opcode = PollCqOnce<ProviderType::BNXT>(cqAddr, cqeNum, curConsIdx, &wqeIdx);
     asm volatile("" ::: "memory");
   } while (opcode < 0);
-  *wqeCounter = (uint16_t)(wqeIdx & 0xFFFF);
+  // Truncate to 16 bits
+  *wqeCounter = wqeIdx & 0xFFFF;
   if (opcode != BNXT_RE_REQ_ST_OK) {
     auto error = BnxtHandleErrorCqe(opcode);
     printf("[BNXT PollCq] CQE error: %s (opcode: %d), wqeCounter: %u at %s:%d\n",

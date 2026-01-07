@@ -51,11 +51,11 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion sendMr, 
     RingDoorbell<P>(epSend.wqHandle.dbrAddr, dbr_val);
     printf("RingDoorbell is done\n");
     __threadfence_system();
-    uint16_t wqeIdx;
+    uint32_t wqeIdx;
     int snd_opcode = PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum,
                                &epSend.cqHandle.consIdx, &wqeIdx);
     epSend.cqHandle.consIdx += 1;
-    printf("send PollCq is done, wqeIdx: %hu\n", wqeIdx);
+    printf("send PollCq is done, wqeIdx: %u\n", wqeIdx);
     UpdateCqDbrRecord<P>(epSend.cqHandle, epSend.cqHandle.consIdx);
     printf("send UpdateCqDbrRecord is done\n");
     // printf("snd_opcode %d val %d\n", snd_opcode, reinterpret_cast<char*>(mrSend.addr)[0]);

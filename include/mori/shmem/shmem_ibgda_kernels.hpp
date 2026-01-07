@@ -128,7 +128,7 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId) {
     uint32_t my_cq_consumer =
         __hip_atomic_fetch_add(&cq.cq_consumer, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 
-    uint16_t wqe_counter;
+    uint32_t wqe_counter;
     int opcode = core::PollCq<core::ProviderType::BNXT>(cq.cqAddr, cq.cqeNum, &my_cq_consumer, &wqe_counter);
     if (opcode != BNXT_RE_REQ_ST_OK) {
       int rank = globalGpuStates->rank;
@@ -157,81 +157,68 @@ inline __device__ void ShmemQuietThreadKernelPsdImpl(int pe, int qpId) {
 
   constexpr uint32_t PENDING_WORK_MASK = 0x800000;  // Bit 23: sign bit for 24-bit counter
   const uint32_t dbTouchedIdx = wqHandle.dbTouchIdx;
-  uint64_t localDoneIdx = wqHandle.doneIdx;  // Read once into register
-
-  if (!((localDoneIdx - dbTouchedIdx) & PENDING_WORK_MASK)) {
-    return;
-  }
-
-  if (!core::spin_lock_try_acquire_shared(&cqHandle.pollCqLock, activeMask)) {
-    return;
-  }
-
   constexpr uint32_t MAX_GREED = 10;
   constexpr uint32_t CQ_DOORBELL_GRACE = 100;  // IONIC_CQ_GRACE
-  uint32_t greedRemaining = MAX_GREED;
-  uint16_t wqeCounter;
+  uint32_t wqeCounter;
 
-  while ((localDoneIdx - dbTouchedIdx) & PENDING_WORK_MASK) {
-    const uint64_t oldDoneIdx = localDoneIdx;
-
-    const uint32_t curConsIdx = cqHandle.cq_consumer;
-    uint32_t myCqPos = curConsIdx + myLogicalLaneId;
-
-    // Poll CQE
-    const int opcode =
-        core::PollCq<core::ProviderType::PSD>(cqHandle.cqAddr, cqHandle.cqeNum, &myCqPos, &wqeCounter);
-    if (opcode > 0) {
-      // printf("rank %d dest pe %d consIdx %d opcode %d\n", globalGpuStates->rank, pe, myCqPos,
-      //        opcode);
-      assert(false);
+  // Outer loop: retry lock acquisition until work is done
+  while ((wqHandle.doneIdx - dbTouchedIdx) & PENDING_WORK_MASK) {
+    if (!core::spin_lock_try_acquire_shared(&cqHandle.pollCqLock, activeMask)) {
+      continue;  // Lock acquisition failed, retry
     }
 
-    const uint64_t successMask = __ballot(opcode == 0);
-    const int highestLane = core::GetLastActiveLaneID(successMask);
+    // Inner loop: process CQEs while holding the lock
+    uint32_t greedRemaining = MAX_GREED;
+    while ((wqHandle.doneIdx - dbTouchedIdx) & PENDING_WORK_MASK) {
+      const uint64_t oldDoneIdx = wqHandle.doneIdx;
 
-    if (highestLane == -1) {
-      if (greedRemaining == 0) {
-        break;
+      const uint32_t curConsIdx = cqHandle.cq_consumer;
+      uint32_t myCqPos = curConsIdx + myLogicalLaneId;
+
+      // Poll CQE
+      const int opcode =
+          core::PollCq<core::ProviderType::PSD>(cqHandle.cqAddr, cqHandle.cqeNum, &myCqPos, &wqeCounter);
+      if (opcode > 0) {
+        // printf("rank %d dest pe %d consIdx %d opcode %d\n", globalGpuStates->rank, pe, myCqPos,
+        //        opcode);
+        assert(false);
       }
-      --greedRemaining;
-      continue;
+      asm volatile("" ::: "memory");
+
+      const uint64_t successMask = __ballot(opcode == 0);
+      const int highestLane = core::GetLastActiveLaneID(successMask);
+
+      if (highestLane == -1) {
+        continue;
+      }
+
+      if (myLaneId == highestLane) {
+        cqHandle.cq_consumer = myCqPos + 1;
+
+        if (((cqHandle.cq_consumer - cqHandle.cq_dbpos) & (cqHandle.cqeNum - 1)) >=
+            CQ_DOORBELL_GRACE) {
+          cqHandle.cq_dbpos = cqHandle.cq_consumer;
+          core::UpdateCqDbrRecord<core::ProviderType::PSD>(cqHandle, myCqPos + 1);
+        }
+
+        wqHandle.doneIdx = wqeCounter;
+        // __hip_atomic_fetch_max(&wqHandle.doneIdx, wqeCounter, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      }
+
+      if (!((wqHandle.doneIdx - dbTouchedIdx) & PENDING_WORK_MASK)) {
+        if (wqHandle.doneIdx == oldDoneIdx) {
+          break;
+        }
+        if (greedRemaining == 0) {
+          break;
+        }
+        --greedRemaining;
+      }
     }
 
-    if (myLaneId == highestLane) {
-      cqHandle.cq_consumer = myCqPos + 1;
-
-      if (((cqHandle.cq_consumer - cqHandle.cq_dbpos) & (cqHandle.cqeNum - 1)) >=
-          CQ_DOORBELL_GRACE) {
-        cqHandle.cq_dbpos = cqHandle.cq_consumer;
-        core::UpdateCqDbrRecord<core::ProviderType::PSD>(cqHandle, myCqPos + 1);
-      }
-
-      // Update local doneIdx and broadcast to all threads in the warp
-      const uint64_t wqeId = wqHandle.outstandingWqe[wqeCounter];
-      localDoneIdx = (wqeId > localDoneIdx) ? wqeId : localDoneIdx;
-    }
-
-    localDoneIdx = __shfl(localDoneIdx, highestLane);
-
-    asm volatile("" ::: "memory");
-
-    if (!((localDoneIdx - dbTouchedIdx) & PENDING_WORK_MASK)) {
-      if (localDoneIdx == oldDoneIdx) {
-        break;
-      }
-      if (greedRemaining == 0) {
-        break;
-      }
-      --greedRemaining;
-    }
+    core::spin_lock_release_shared(&cqHandle.pollCqLock, activeMask);
+    break;  // Work done, exit outer loop
   }
-
-  if (core::IsFirstActiveLane(activeMask)) {
-    wqHandle.doneIdx = localDoneIdx;
-  }
-
-  core::spin_lock_release_shared(&cqHandle.pollCqLock, activeMask);
 }
 
 inline __device__ void ShmemQuietThreadKernelMlnxImpl(int pe, int qpId) {
@@ -287,7 +274,7 @@ inline __device__ void ShmemQuietThreadKernelMlnxImpl(int pe, int qpId) {
     uint32_t my_cq_index = my_cq_consumer % cq.cqeNum;
 
     if (my_logical_lane_id < quiet_amount) {
-      uint16_t wqe_counter;
+      uint32_t wqe_counter;
       int opcode = core::PollCq<core::ProviderType::MLX5>(cq.cqAddr, cq.cqeNum, &my_cq_consumer, &wqe_counter);
       if (opcode == MLX5_CQE_RESP_ERR || opcode == MLX5_CQE_REQ_ERR) {
         // int rank = globalGpuStates->rank;

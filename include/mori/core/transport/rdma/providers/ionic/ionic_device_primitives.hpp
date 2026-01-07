@@ -583,7 +583,7 @@ inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum, u
 
 template <>
 inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx,
-                                                uint16_t* wqeCounter) {
+                                                uint32_t* wqeCounter) {
   const uint32_t curConsIdx = *consIdx;
   const uint32_t cqeIdx = curConsIdx & (cqeNum - 1);
 
@@ -630,10 +630,10 @@ inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum, u
     return error;
   }
 
-  // Success: extract and return WQE counter
-  *wqeCounter = static_cast<uint16_t>(BE32TOH(cqe->send.msg_msn) & 0xFFFF);
+  *wqeCounter = BE32TOH(cqe->send.msg_msn);
   return 0;
 }
+
 
 #ifdef IONIC_CCQE
 inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,

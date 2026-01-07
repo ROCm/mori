@@ -24,9 +24,9 @@
 
 #include "args_parser.hpp"
 #include "mori/application/application.hpp"
+#include "mori/application/topology/topology.hpp"
 #include "mori/application/utils/udma_barrier.h"
 #include "mori/core/core.hpp"
-#include "mori/application/topology/topology.hpp"
 
 using namespace mori;
 using namespace mori::application;
@@ -81,7 +81,7 @@ inline __device__ void QuietSerial(RdmaEndpoint* endpoint) {
     my_cq_consumer =
         __hip_atomic_fetch_add(&cq.cq_consumer, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 
-    uint16_t wqe_counter;
+    uint32_t wqe_counter;
     uint64_t wqe_id;
     int opcode = core::PollCq<P>(cq.cqAddr, cq.cqeNum, &my_cq_consumer, &wqe_counter);
     // printf("wqe_counter: %u\n",wqe_counter);
@@ -167,7 +167,7 @@ __device__ void Quiet(RdmaEndpoint* endpoint) {
     uint32_t my_cq_index = my_cq_consumer % cqHandle->cqeNum;
     uint64_t wqe_id;
     if (my_logical_lane_id < quiet_amount) {
-      uint16_t wqe_counter;
+      uint32_t wqe_counter;
       PollCq<P>(cqHandle->cqAddr, cqHandle->cqeNum, &my_cq_consumer, &wqe_counter);
       __threadfence_system();
       wqe_id = endpoint->wqHandle.outstandingWqe[wqe_counter];
@@ -194,12 +194,73 @@ __device__ void Quiet(RdmaEndpoint* endpoint) {
 
 template <ProviderType P>
 __device__ void QuietPsd(RdmaEndpoint* endpoint) {
-  CompletionQueueHandle* cqHandle = &endpoint->cqHandle;
-  WorkQueueHandle* wqHandle = &endpoint->wqHandle;
-  uint16_t wqe_counter;
-  
-  PollCq<P>(endpoint->wqHandle, endpoint->cqHandle,
-	    cqHandle->cqAddr, cqHandle->cqeNum, &cqHandle->cq_consumer, &wqe_counter);
+  CompletionQueueHandle& cqHandle = endpoint->cqHandle;
+  WorkQueueHandle& wqHandle = endpoint->wqHandle;
+
+  const uint64_t activeMask = GetActiveLaneMask();
+  const uint32_t myLogicalLaneId = GetActiveLaneNum(activeMask);
+  const int myLaneId = WarpLaneId();
+
+  constexpr uint32_t PENDING_WORK_MASK = 0x800000;  // Bit 23: sign bit for 24-bit counter
+  const uint32_t dbTouchedIdx = wqHandle.dbTouchIdx;
+  constexpr uint32_t MAX_GREED = 10;
+  constexpr uint32_t CQ_DOORBELL_GRACE = 100;  // IONIC_CQ_GRACE
+  uint32_t wqeCounter;
+
+  // Outer loop: retry lock acquisition until work is done
+  while ((wqHandle.doneIdx - dbTouchedIdx) & PENDING_WORK_MASK) {
+    if (!spin_lock_try_acquire_shared(&cqHandle.pollCqLock, activeMask)) {
+      continue;  // Lock acquisition failed, retry
+    }
+
+    // Inner loop: process CQEs while holding the lock
+    uint32_t greedRemaining = MAX_GREED;
+    while ((wqHandle.doneIdx - dbTouchedIdx) & PENDING_WORK_MASK) {
+      const uint64_t oldDoneIdx = wqHandle.doneIdx;
+
+      const uint32_t curConsIdx = cqHandle.cq_consumer;
+      uint32_t myCqPos = curConsIdx + myLogicalLaneId;
+
+      // Poll CQE
+      const int opcode = PollCq<P>(cqHandle.cqAddr, cqHandle.cqeNum, &myCqPos, &wqeCounter);
+      if (opcode > 0) {
+        assert(false);
+      }
+      asm volatile("" ::: "memory");
+
+      const uint64_t successMask = __ballot(opcode == 0);
+      const int highestLane = GetLastActiveLaneID(successMask);
+
+      if (highestLane == -1) {
+        continue;
+      }
+
+      if (myLaneId == highestLane) {
+        cqHandle.cq_consumer = myCqPos + 1;
+
+        if (((cqHandle.cq_consumer - cqHandle.cq_dbpos) & (cqHandle.cqeNum - 1)) >=
+            CQ_DOORBELL_GRACE) {
+          cqHandle.cq_dbpos = cqHandle.cq_consumer;
+          UpdateCqDbrRecord<P>(cqHandle, myCqPos + 1);
+        }
+
+        wqHandle.doneIdx = wqeCounter;
+      }
+
+      if (!((wqHandle.doneIdx - dbTouchedIdx) & PENDING_WORK_MASK)) {
+        if (wqHandle.doneIdx == oldDoneIdx) {
+          break;
+        }
+        if (greedRemaining == 0) {
+          break;
+        }
+        --greedRemaining;
+      }
+    }
+
+    spin_lock_release_shared(&cqHandle.pollCqLock, activeMask);
+    break;  // Work done, exit outer loop
+  }
 }
 
 template <ProviderType P>
@@ -368,7 +429,7 @@ int GetGpuidByNicName(std::string nic_name) {
       auto* path = pciSys->Path(gpu->busId, nic->busId);
       auto* gpuPci = pciSys->Node(gpu->busId);
       auto* nicPci = pciSys->Node(nic->busId);
-      #if 0
+#if 0
       if (!path) {     
         printf("gpu %s nic %s no direct link\n", gpu->busId.String().c_str(),
                nic->busId.String().c_str());
@@ -377,7 +438,7 @@ int GetGpuidByNicName(std::string nic_name) {
                gpu->busId.String().c_str(), gpuPci->NumaNode(), nic->busId.String().c_str(),
                nic->name.c_str(), path->Hops(), nic->totalGbps, nicPci->NumaNode());
       }
-      #endif
+#endif
     }
   }
 
@@ -385,10 +446,10 @@ int GetGpuidByNicName(std::string nic_name) {
   std::vector<std::string> matches = sys.MatchAllGpusAndNics();
   for (int i = 0; i < matches.size(); i++) {
     auto* gpu = gpuSys->GetGpuByLogicalId(i);
-    //printf("gpu %d (%s) matches %s\n", i, gpu->busId.String().c_str(), matches[i].c_str());
+    // printf("gpu %d (%s) matches %s\n", i, gpu->busId.String().c_str(), matches[i].c_str());
     if (nic_name.compare(matches[i].c_str()) == 0) {
       gpu_id = i;
-      //printf("GetGpuidByNicName, nic_name:%s, gpu_id:%d\n", nic_name.c_str(), gpu_id);
+      // printf("GetGpuidByNicName, nic_name:%s, gpu_id:%d\n", nic_name.c_str(), gpu_id);
     }
   }
 
@@ -425,8 +486,9 @@ void distRdmaOps(int argc, char* argv[]) {
   RdmaDeviceContext* device_context = device->CreateRdmaDeviceContext();
   int gpu_id = GetGpuidByNicName(device->Name());
   HIP_RUNTIME_CHECK(hipSetDevice(gpu_id));
-  std::cout << "localRank " << local_rank << " gpu id " << gpu_id << " select device " << device->Name() << std::endl;
-  
+  std::cout << "localRank " << local_rank << " gpu id " << gpu_id << " select device "
+            << device->Name() << std::endl;
+
   hipEvent_t start, end;
   HIP_RUNTIME_CHECK(hipEventCreate(&start));
   HIP_RUNTIME_CHECK(hipEventCreate(&end));
@@ -435,7 +497,11 @@ void distRdmaOps(int argc, char* argv[]) {
   // 2 Create an endpoint
   RdmaEndpointConfig config;
   config.portId = activeDevicePortList[local_rank % activeDevicePortList.size()].second;
+#ifdef ENABLE_IONIC
+  config.gidIdx = 1;
+#else
   config.gidIdx = 3;
+#endif
   config.maxMsgsNum = 8092;
 #ifdef ENABLE_BNXT
   config.maxCqeNum = 1;
@@ -515,12 +581,12 @@ void distRdmaOps(int argc, char* argv[]) {
               devEndpoints, global_mr_handles[0], global_mr_handles[1], size, 1, blockSync, num_qp);
           break;
 #endif
-#ifdef ENABLE_IONIC	  
+#ifdef ENABLE_IONIC
         case ProviderType::PSD:
           MultiQpWrite<ProviderType::PSD><<<blocks, threads>>>(
               devEndpoints, global_mr_handles[0], global_mr_handles[1], size, 1, blockSync, num_qp);
           break;
-#endif	  
+#endif
         default:
           break;
       }
@@ -551,13 +617,13 @@ void distRdmaOps(int argc, char* argv[]) {
                                                                 warmupIters, blockSync + 1, num_qp);
           break;
 #endif
-#ifdef ENABLE_IONIC	  
+#ifdef ENABLE_IONIC
         case ProviderType::PSD:
           MultiQpWrite<ProviderType::PSD><<<blocks, threads>>>(devEndpoints, global_mr_handles[0],
-                                                                global_mr_handles[1], size,
-                                                                warmupIters, blockSync + 1, num_qp);
+                                                               global_mr_handles[1], size,
+                                                               warmupIters, blockSync + 1, num_qp);
           break;
-#endif	  
+#endif
         default:
           break;
       }
@@ -578,13 +644,13 @@ void distRdmaOps(int argc, char* argv[]) {
                                     iters, blockSync + 1 + warmupIters, num_qp);
           break;
 #endif
-#ifdef ENABLE_IONIC	  
+#ifdef ENABLE_IONIC
         case ProviderType::PSD:
-          MultiQpWrite<ProviderType::PSD>
-              <<<blocks, threads>>>(devEndpoints, global_mr_handles[0], global_mr_handles[1], size,
-                                    iters, blockSync + 1 + warmupIters, num_qp);
+          MultiQpWrite<ProviderType::PSD><<<blocks, threads>>>(devEndpoints, global_mr_handles[0],
+                                                               global_mr_handles[1], size, iters,
+                                                               blockSync + 1 + warmupIters, num_qp);
           break;
-#endif	  
+#endif
         default:
           break;
       }

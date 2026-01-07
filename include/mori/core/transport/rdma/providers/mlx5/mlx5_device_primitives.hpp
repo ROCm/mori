@@ -743,7 +743,7 @@ inline __device__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum, 
 
 template <>
 inline __device__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx,
-                                                 uint16_t* wqeCounter) {
+                                                 uint32_t* wqeCounter) {
   uint32_t curConsIdx = *consIdx;
   uint32_t cqeIdx = curConsIdx % cqeNum;
   void* cqeAddr = reinterpret_cast<char*>(cqAddr) + cqeIdx * sizeof(mlx5_cqe64);
@@ -760,6 +760,7 @@ inline __device__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum, 
     // printf("(%s:%d) CQE error: %s\n", __FILE__, __LINE__, IbvWcStatusString(error));
     return opcode;
   }
+  // wqe_counter is 16-bit, ensure high bits are zero
   *wqeCounter = BE16TOH(reinterpret_cast<mlx5_cqe64*>(cqeAddr)->wqe_counter);
   return opcode;
 }
