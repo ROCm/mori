@@ -97,6 +97,9 @@ inline __device__ T WarpReduceMax(T val) {
   return val;
 }
 
+constexpr int kFp8MaxElemsPerLane = 8;
+
+// Legacy function for scalar FP8 quantization (no vectorization, uses no VecTypeSelector)
 template <typename Fp8T>
 __device__ __forceinline__ void WarpAccumFp8QuantPerDim(
     Fp8T* __restrict__ dstToken, uint8_t* __restrict__ dstScales,
@@ -109,7 +112,12 @@ __device__ __forceinline__ void WarpAccumFp8QuantPerDim(
   const int start = scaleBlockId * blockElems;
   const int end = min(start + blockElems, hiddenDim);
 
+  // Local buffer for accumulated values
+  float localAcc[kFp8MaxElemsPerLane];
+  int localCount = 0;
   float localMaxAbs = 0.0f;
+
+  // First pass: accumulate and track max (with local buffering)
   for (int idx = start + laneId; idx < end; idx += warpSize) {
     float acc = 0.0f;
     for (int i = 0; i < accumNum; ++i) {
@@ -118,8 +126,10 @@ __device__ __forceinline__ void WarpAccumFp8QuantPerDim(
       const float s = LoadScaleElemAsFloat<Fp8T>(srcScales[i], scaleBlockId, scaleTypeSize);
       acc += static_cast<float>(srcPtr[idx]) * s;
     }
+    localAcc[localCount++] = acc;
     localMaxAbs = fmaxf(localMaxAbs, fabsf(acc));
   }
+
   float maxAbs = WarpReduceMax(localMaxAbs);
   maxAbs = __shfl(maxAbs, 0);
 
@@ -130,17 +140,11 @@ __device__ __forceinline__ void WarpAccumFp8QuantPerDim(
   }
   outScale = __shfl(outScale, 0);
 
-  // Second pass: requantize and store.
+  // Second pass: quantize from local buffer (no re-read!)
   const float invScale = 1.0f / outScale;
+  int localIdx = 0;
   for (int idx = start + laneId; idx < end; idx += warpSize) {
-    float acc = 0.0f;
-    for (int i = 0; i < accumNum; ++i) {
-      const Fp8T* srcPtr = srcs[i];
-      if (srcPtr == nullptr) continue;
-      const float s = LoadScaleElemAsFloat<Fp8T>(srcScales[i], scaleBlockId, scaleTypeSize);
-      acc += static_cast<float>(srcPtr[idx]) * s;
-    }
-    dstToken[idx] = Fp8T(acc * invScale);
+    dstToken[idx] = Fp8T(localAcc[localIdx++] * invScale);
   }
 }
 
@@ -304,6 +308,212 @@ __device__ __forceinline__ void store<16>(void* addr,
   *(((uint64_t*)addr) + 1) = value.y;
 }
 #endif
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                              Optimized FP8 Accumulation with Quantization                      */
+/* ---------------------------------------------------------------------------------------------- */
+// Process entire hidden dimension at once with VecBytes=4.
+// Key insight: blockElems = (7168+31)/32 = 224 = 56*4, so 4-element vectors never cross block
+// boundaries!
+template <typename Fp8T, int AccumNum>
+__device__ __forceinline__ void WarpAccumFp8QuantAllAtOnce(
+    Fp8T* __restrict__ dstToken, uint8_t* __restrict__ dstScales,
+    const Fp8T* const* __restrict__ srcs, const uint8_t* const* __restrict__ srcScales,
+    int hiddenDim, int scaleDim, int scaleTypeSize) {
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const int blockElems = (hiddenDim + scaleDim - 1) / scaleDim;
+
+  // Use VecBytes=4 for maximum throughput (4 FP8 = 4 bytes = 32-bit load)
+  constexpr int VecBytes = 4;
+  constexpr int vecSize = VecBytes / sizeof(Fp8T);
+  using VecType = typename VecTypeSelector<VecBytes>::dataType;
+
+  // Track max per scale block (32 floats = 128 bytes - acceptable register usage)
+  float localMax[32];
+  for (int sb = 0; sb < scaleDim; ++sb) localMax[sb] = 0.0f;
+
+  const int elemsPerWarp = warpSize * vecSize;  // 64*4 = 256
+  const int laneOffset = laneId * vecSize;
+
+  // Pass 1: Read all data, accumulate, track max per block
+  int offset = 0;
+  while (offset + elemsPerWarp <= hiddenDim) {
+    // All 4 elements in a vector are in the same block (since blockElems % 4 == 0)
+    int sb = (offset + laneOffset) / blockElems;
+    if (sb >= scaleDim) sb = scaleDim - 1;
+
+    // Load scales for this block
+    float blockScales[AccumNum];
+#pragma unroll AccumNum
+    for (int i = 0; i < AccumNum; ++i) {
+      blockScales[i] = (srcs[i] != nullptr && srcScales[i] != nullptr)
+                           ? LoadScaleElemAsFloat<Fp8T>(srcScales[i], sb, scaleTypeSize)
+                           : 1.0f;
+    }
+
+    // Load from all sources
+    VecType srcVecs[AccumNum];
+#pragma unroll AccumNum
+    for (int i = 0; i < AccumNum; ++i) {
+      if (srcs[i] != nullptr) {
+        srcVecs[i] = load<VecBytes>(srcs[i] + offset + laneOffset);
+      }
+    }
+
+    // Accumulate and track max
+    float accVec[vecSize] = {0};
+#pragma unroll AccumNum
+    for (int i = 0; i < AccumNum; ++i) {
+      if (srcs[i] != nullptr) {
+#pragma unroll vecSize
+        for (int j = 0; j < vecSize; ++j) {
+          accVec[j] +=
+              static_cast<float>(reinterpret_cast<const Fp8T*>(&srcVecs[i])[j]) * blockScales[i];
+        }
+      }
+    }
+
+#pragma unroll vecSize
+    for (int j = 0; j < vecSize; ++j) {
+      localMax[sb] = fmaxf(localMax[sb], fabsf(accVec[j]));
+    }
+
+    offset += elemsPerWarp;
+  }
+
+  // Scalar remainder for pass 1
+  for (int idx = offset + laneId; idx < hiddenDim; idx += warpSize) {
+    int sb = idx / blockElems;
+    if (sb >= scaleDim) sb = scaleDim - 1;
+
+    float acc = 0.0f;
+#pragma unroll AccumNum
+    for (int i = 0; i < AccumNum; ++i) {
+      if (srcs[i] != nullptr && srcScales[i] != nullptr) {
+        float scale = LoadScaleElemAsFloat<Fp8T>(srcScales[i], sb, scaleTypeSize);
+        acc += static_cast<float>(srcs[i][idx]) * scale;
+      }
+    }
+    localMax[sb] = fmaxf(localMax[sb], fabsf(acc));
+  }
+
+  // Warp reduce all maxes and compute output scales
+  float invScales[32];
+  for (int sb = 0; sb < scaleDim; ++sb) {
+    float maxAbs = WarpReduceMax(localMax[sb]);
+    maxAbs = __shfl(maxAbs, 0);
+    float outScale = (maxAbs == 0.0f) ? 1.0f : (maxAbs / Fp8Traits<Fp8T>::kMaxFinite);
+    invScales[sb] = 1.0f / outScale;
+    if (laneId == 0) {
+      StoreScaleFromFloat<Fp8T>(dstScales, sb, scaleTypeSize, outScale);
+    }
+  }
+
+  // Pass 2: Read again, accumulate, and requantize
+  offset = 0;
+  while (offset + elemsPerWarp <= hiddenDim) {
+    int sb = (offset + laneOffset) / blockElems;
+    if (sb >= scaleDim) sb = scaleDim - 1;
+
+    // Load scales for this block
+    float blockScales[AccumNum];
+#pragma unroll AccumNum
+    for (int i = 0; i < AccumNum; ++i) {
+      blockScales[i] = (srcs[i] != nullptr && srcScales[i] != nullptr)
+                           ? LoadScaleElemAsFloat<Fp8T>(srcScales[i], sb, scaleTypeSize)
+                           : 1.0f;
+    }
+
+    // Load from all sources
+    VecType srcVecs[AccumNum];
+#pragma unroll AccumNum
+    for (int i = 0; i < AccumNum; ++i) {
+      if (srcs[i] != nullptr) {
+        srcVecs[i] = load<VecBytes>(srcs[i] + offset + laneOffset);
+      }
+    }
+
+    // Accumulate and requantize
+    union {
+      VecType vec;
+      Fp8T vals[vecSize];
+    } outVec;
+
+#pragma unroll vecSize
+    for (int j = 0; j < vecSize; ++j) {
+      float acc = 0.0f;
+#pragma unroll AccumNum
+      for (int i = 0; i < AccumNum; ++i) {
+        if (srcs[i] != nullptr) {
+          acc += static_cast<float>(reinterpret_cast<const Fp8T*>(&srcVecs[i])[j]) * blockScales[i];
+        }
+      }
+      outVec.vals[j] = Fp8T(acc * invScales[sb]);
+    }
+    store<VecBytes>(dstToken + offset + laneOffset, outVec.vec);
+
+    offset += elemsPerWarp;
+  }
+
+  // Scalar remainder for pass 2
+  for (int idx = offset + laneId; idx < hiddenDim; idx += warpSize) {
+    int sb = idx / blockElems;
+    if (sb >= scaleDim) sb = scaleDim - 1;
+
+    float acc = 0.0f;
+#pragma unroll AccumNum
+    for (int i = 0; i < AccumNum; ++i) {
+      if (srcs[i] != nullptr && srcScales[i] != nullptr) {
+        float scale = LoadScaleElemAsFloat<Fp8T>(srcScales[i], sb, scaleTypeSize);
+        acc += static_cast<float>(srcs[i][idx]) * scale;
+      }
+    }
+    dstToken[idx] = Fp8T(acc * invScales[sb]);
+  }
+}
+
+template <typename Fp8T, int AccumNum>
+__device__ __forceinline__ void WarpAccumFp8QuantAllBlocks(
+    Fp8T* __restrict__ dstToken, uint8_t* __restrict__ dstScales,
+    const Fp8T* const* __restrict__ srcs, const uint8_t* const* __restrict__ srcScales,
+    int hiddenDim, int scaleDim, int scaleTypeSize) {
+  if (scaleDim <= 0 || scaleTypeSize <= 0) return;
+
+  // Use all-at-once algorithm with VecBytes=4 for better memory access
+  WarpAccumFp8QuantAllAtOnce<Fp8T, AccumNum>(dstToken, dstScales, srcs, srcScales, hiddenDim,
+                                             scaleDim, scaleTypeSize);
+}
+
+template <typename Fp8T>
+__device__ __forceinline__ void WarpAccumFp8Quant(Fp8T* __restrict__ dstToken,
+                                                  uint8_t* __restrict__ dstScales,
+                                                  const Fp8T* const* __restrict__ srcs,
+                                                  const uint8_t* const* __restrict__ srcScales,
+                                                  int accumNum, int hiddenDim, int scaleDim,
+                                                  int scaleTypeSize) {
+#define FP8_QUANT_CASE(N)                                                                          \
+  case N:                                                                                          \
+    WarpAccumFp8QuantAllBlocks<Fp8T, N>(dstToken, dstScales, srcs, srcScales, hiddenDim, scaleDim, \
+                                        scaleTypeSize);                                            \
+    break;
+
+  switch (accumNum) {
+    FP8_QUANT_CASE(1)
+    FP8_QUANT_CASE(2)
+    FP8_QUANT_CASE(4)
+    FP8_QUANT_CASE(6)
+    FP8_QUANT_CASE(8)
+    FP8_QUANT_CASE(10)
+    default:
+      // Fallback for unexpected accumNum - process block by block
+      for (int sb = 0; sb < scaleDim; ++sb) {
+        WarpAccumFp8QuantPerDim(dstToken, dstScales, srcs, srcScales, accumNum, hiddenDim, scaleDim,
+                                scaleTypeSize, sb);
+      }
+      break;
+  }
+#undef FP8_QUANT_CASE
+}
 
 template <typename T>
 inline __device__ void ThreadCopy(T* dst, T* src, size_t nelems) {

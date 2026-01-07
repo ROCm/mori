@@ -713,11 +713,9 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
       uint8_t* dstScale = stagingPtr + tokenId * combXferBytes + hiddenBytes +
                           ((args.weightsBuf == nullptr) ? 0 : weightBytes);
       const uint8_t* const* srcScalesConst = reinterpret_cast<const uint8_t* const*>(srcScalesPtr);
-      for (int sb = 0; sb < config.scaleDim; ++sb) {
-        core::WarpAccumFp8QuantPerDim<T>(dstTok, dstScale, srcPtrs, srcScalesConst,
-                                         config.numExpertPerToken, config.hiddenDim,
-                                         config.scaleDim, config.scaleTypeSize, sb);
-      }
+      core::WarpAccumFp8Quant<T>(dstTok, dstScale, srcPtrs, srcScalesConst,
+                                 config.numExpertPerToken, config.hiddenDim, config.scaleDim,
+                                 config.scaleTypeSize);
     } else {
       core::WarpAccum<T, 4>(reinterpret_cast<T*>(stagingPtr + tokenId * combXferBytes), srcPtrs,
                             nullptr, config.numExpertPerToken, config.hiddenDim);
@@ -829,11 +827,9 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
                                     ((args.weightsBuf == nullptr) ? 0 : weightBytes);
                 const uint8_t* const* srcScalesConst =
                     reinterpret_cast<const uint8_t* const*>(srcScalesPtr);
-                for (int sb = 0; sb < config.scaleDim; ++sb) {
-                  core::WarpAccumFp8QuantPerDim<T>(dstTok, dstScale, srcPtrs, srcScalesConst,
-                                                   config.numExpertPerToken, config.hiddenDim,
-                                                   config.scaleDim, config.scaleTypeSize, sb);
-                }
+                core::WarpAccumFp8Quant<T>(dstTok, dstScale, srcPtrs, srcScalesConst,
+                                           config.numExpertPerToken, config.hiddenDim,
+                                           config.scaleDim, config.scaleTypeSize);
               } else {
                 core::WarpAccum<T, 4>(reinterpret_cast<T*>(stagingPtr + tokIdx * combXferBytes),
                                       srcPtrs, nullptr, config.numExpertPerToken, config.hiddenDim);
@@ -967,11 +963,8 @@ inline __device__ void CombineAll(EpDispatchCombineArgs<T>& args) {
       uint8_t* dstScale =
           args.shmemOutScalesMemObj->template GetAs<uint8_t*>() + tokenId * scaleBytes;
       const uint8_t* const* srcScalesConst = reinterpret_cast<const uint8_t* const*>(srcScalesPtrs);
-      for (int sb = 0; sb < config.scaleDim; ++sb) {
-        core::WarpAccumFp8QuantPerDim<T>(dstTok, dstScale, srcPtrs, srcScalesConst, nNodes,
-                                         config.hiddenDim, config.scaleDim, config.scaleTypeSize,
-                                         sb);
-      }
+      core::WarpAccumFp8Quant<T>(dstTok, dstScale, srcPtrs, srcScalesConst, nNodes,
+                                 config.hiddenDim, config.scaleDim, config.scaleTypeSize);
     } else {
       core::WarpAccum<T, 4>(
           args.shmemCombineOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim, srcPtrs,
