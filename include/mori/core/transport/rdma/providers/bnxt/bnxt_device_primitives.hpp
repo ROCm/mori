@@ -493,7 +493,7 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
   uint32_t opcode = BNXT_RE_WR_OPCD_ATOMIC_FA;
   uint64_t data = val_1 ? *static_cast<uint64_t*>(val_1) : 0;
   uint64_t cmp = val_2 ? *static_cast<uint64_t*>(val_2) : 0;
-  // printf("BNXT atomic values: data=0x%lx, cmp=0x%lx\n", data, cmp);
+  // MORI_PRINTF("BNXT atomic values: data=0x%lx, cmp=0x%lx\n", data, cmp);
 
   switch (amo_op) {
     case AMO_FETCH_INC:
@@ -518,7 +518,7 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
       break;
     }
     default: {
-      printf("Error: unsupported atomic type (%d)\n", amo_op);
+      MORI_PRINTF("Error: unsupported atomic type (%d)\n", amo_op);
       assert(0);
     }
   }
@@ -726,7 +726,7 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
   // Handle error cases
   if (opcode != BNXT_RE_REQ_ST_OK) {
     auto error = BnxtHandleErrorCqe(opcode);
-    printf("[BNXT PollCq] CQE error: %s (opcode: %d) at %s:%d\n", IbvWcStatusString(error), opcode,
+    MORI_PRINTF("[BNXT PollCq] CQE error: %s (opcode: %d) at %s:%d\n", IbvWcStatusString(error), opcode,
            __FILE__, __LINE__);
     return opcode;
   }
@@ -748,7 +748,7 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
   *wqeCounter = wqeIdx & 0xFFFF;
   if (opcode != BNXT_RE_REQ_ST_OK) {
     auto error = BnxtHandleErrorCqe(opcode);
-    printf("[BNXT PollCq] CQE error: %s (opcode: %d), wqeCounter: %u at %s:%d\n",
+    MORI_PRINTF("[BNXT PollCq] CQE error: %s (opcode: %d), wqeCounter: %u at %s:%d\n",
            IbvWcStatusString(error), opcode, *wqeCounter, __FILE__, __LINE__);
     return opcode;
   }

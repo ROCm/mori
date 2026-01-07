@@ -131,13 +131,13 @@ __host__ uint64_t PostRead<ProviderType::MLX5>(void* queue_buff_addr, uint32_t w
 template <>
 __host__ void UpdateSendDbrRecord<ProviderType::MLX5>(void* dbrRecAddr, uint32_t wqe_idx) {
   reinterpret_cast<uint32_t*>(dbrRecAddr)[MLX5_SND_DBR] = htobe32(wqe_idx & 0xffff);
-  printf("send idx %d\n", wqe_idx);
+  MORI_PRINTF("send idx %d\n", wqe_idx);
 }
 
 template <>
 __host__ void UpdateRecvDbrRecord<ProviderType::MLX5>(void* dbrRecAddr, uint32_t wqe_idx) {
   reinterpret_cast<uint32_t*>(dbrRecAddr)[MLX5_RCV_DBR] = HTOBE32(wqe_idx & 0xffff);
-  printf("recv idx %d\n", wqe_idx);
+  MORI_PRINTF("recv idx %d\n", wqe_idx);
 }
 
 template <>
@@ -182,7 +182,7 @@ inline __host__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum, ui
   int opcode = -1;
   do {
     opcode = PollCqOnce<ProviderType::MLX5>(cqAddr, cqeNum, consIdx);
-    // printf("op code %d\n", opcode);
+    // MORI_PRINTF("op code %d\n", opcode);
   } while (opcode < 0);
   udma_from_device_barrier();
 
@@ -191,7 +191,7 @@ inline __host__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum, ui
     void* cqe_addr = reinterpret_cast<char*>(cqAddr) + idx * sizeof(mlx5_cqe64);
     mlx5_err_cqe* ecqe = reinterpret_cast<mlx5_err_cqe*>(cqe_addr);
     auto error = Mlx5HandleErrorCqe(ecqe);
-    printf("%s\n", IbvWcStatusString(error));
+    MORI_PRINTF("%s\n", IbvWcStatusString(error));
     assert(false);
   }
 

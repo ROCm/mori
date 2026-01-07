@@ -71,7 +71,7 @@ inline __device__ uint64_t IonicPostSend(WorkQueueHandle& wq, uint32_t curPostId
 
   __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 #if 0
-  printf("send, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n", curPostIdx, curPostIdx, ((curPostIdx + 1) & (wqeNum - 1)));
+  MORI_PRINTF("send, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n", curPostIdx, curPostIdx, ((curPostIdx + 1) & (wqeNum - 1)));
 #endif
   // return doorbell value
   return wq.sq_dbval | ((curPostIdx + 1) & (wqeNum - 1));
@@ -118,7 +118,7 @@ inline __device__ uint64_t IonicPostRecv(WorkQueueHandle& wq, uint32_t curPostId
   wqe->common.pld.sgl[0].len = HTOBE32(size);
   wqe->common.pld.sgl[0].lkey = HTOBE32(lkey);
 #if 0
-  printf("recv, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n", curPostIdx, curPostIdx, ((curPostIdx + 1) & (wqeNum - 1)));
+  MORI_PRINTF("recv, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n", curPostIdx, curPostIdx, ((curPostIdx + 1) & (wqeNum - 1)));
 #endif
   // return doorbell value
   return wq.rq_dbval | ((curPostIdx + 1) & (wqeNum - 1));
@@ -156,7 +156,7 @@ inline __device__ uint64_t IonicPostReadWrite(WorkQueueHandle& wq, uint32_t curP
   struct ionic_v1_wqe* wqe = reinterpret_cast<ionic_v1_wqe*>(wqeAddr);
   uint16_t wqe_flags = 0;
 
-  // printf("IonicPostReadWrite, wqe:%p, curPostIdx:%d, wqeIdx:%d\n", wqe, curPostIdx, wqeIdx);
+  // MORI_PRINTF("IonicPostReadWrite, wqe:%p, curPostIdx:%d, wqeIdx:%d\n", wqe, curPostIdx, wqeIdx);
   // to do: need to clear memory
   if ((wqeNum & curPostIdx) == 0) {
     wqe_flags |= HTOBE16(IONIC_V1_FLAG_COLOR);
@@ -183,15 +183,15 @@ inline __device__ uint64_t IonicPostReadWrite(WorkQueueHandle& wq, uint32_t curP
   __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 
 #if 0
-  printf("dump wqe at addr:%p\n", wqeAddr);
+  MORI_PRINTF("dump wqe at addr:%p\n", wqeAddr);
   for (int i = 0; i < 64; i++) {
-    printf("%02x", (unsigned char)wqeAddr[i]);
+    MORI_PRINTF("%02x", (unsigned char)wqeAddr[i]);
     if ((i+1)%4 == 0)
-      printf("\n");
+      MORI_PRINTF("\n");
   }
 #endif
 #if 0
-  printf("Write, block:%u, warp:%u, lane:%u, wqe:%p, raddr:%p, rkey:%lu, len:%u, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n",
+  MORI_PRINTF("Write, block:%u, warp:%u, lane:%u, wqe:%p, raddr:%p, rkey:%lu, len:%u, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n",
          blockIdx.x, threadIdx.x/warpSize, __lane_id(),
 	 wqe, raddr, rkey, size, curPostIdx, curPostIdx, ((curPostIdx + 1) & (wqeNum - 1)));
 #endif
@@ -278,7 +278,7 @@ inline __device__ uint64_t IonicPostWriteInline(WorkQueueHandle& wq, uint32_t cu
 
   __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 #if 0
-  printf("write inline, block:%u, warp:%u, lane:%u, wqe:%p, raddr:%p, rkey:%lu, size:%u, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n",
+  MORI_PRINTF("write inline, block:%u, warp:%u, lane:%u, wqe:%p, raddr:%p, rkey:%lu, size:%u, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n",
 	 blockIdx.x, threadIdx.x/warpSize, __lane_id(),
          wqe, raddr, rkey, size, curPostIdx, curPostIdx, ((curPostIdx + 1) & (wqeNum - 1)));
 #endif
@@ -299,7 +299,7 @@ inline __device__ uint64_t PostWriteInline<ProviderType::PSD>(WorkQueueHandle& w
                                                               void* val, uintptr_t raddr,
                                                               uint64_t rkey, size_t bytes) {
   uint32_t curPostIdx = atomicAdd(&wq.postIdx, 1);
-  // printf("PostWriteInline, val:%p\n", val);
+  // MORI_PRINTF("PostWriteInline, val:%p\n", val);
   return IonicPostWriteInline(wq, curPostIdx, true, qpn, val, raddr, rkey, bytes);
 }
 
@@ -354,7 +354,7 @@ inline __device__ uint64_t IonicPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t c
       break;
     }
     default: {
-      printf("Error: unsupported atomic type (%d)\n", amo_op);
+      MORI_PRINTF("Error: unsupported atomic type (%d)\n", amo_op);
       assert(0);
     }
   }
@@ -378,7 +378,7 @@ inline __device__ uint64_t IonicPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t c
   __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 
 #if 0
-  printf("atomic,block:%u, warp:%u, lane:%u, wqe:%p, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n",
+  MORI_PRINTF("atomic,block:%u, warp:%u, lane:%u, wqe:%p, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n",
 	 blockIdx.x, threadIdx.x/warpSize, __lane_id(),
          wqe, curPostIdx, wqeIdx, ((curPostIdx + 1) & (wqeNum - 1)));
 #endif
@@ -447,7 +447,7 @@ inline __device__ void UpdateRecvDbrRecord<ProviderType::PSD>(void* dbrRecAddr, 
 template <>
 inline __device__ void RingDoorbell<ProviderType::PSD>(void* dbrAddr, uint64_t dbrVal) {
 #if 0
-  printf("really update sq doorbell, block:%u, warp:%u, lane:%u, sq/rq dbrAddr:%p, dbrVal:0x%lx\n",
+  MORI_PRINTF("really update sq doorbell, block:%u, warp:%u, lane:%u, sq/rq dbrAddr:%p, dbrVal:0x%lx\n",
          blockIdx.x, threadIdx.x/warpSize, __lane_id(), reinterpret_cast<uint64_t*>(dbrAddr), dbrVal);
 #endif
   // asm volatile("" ::: "memory");
@@ -490,15 +490,15 @@ inline __device__ int PollCqOnce<ProviderType::PSD>(void* cqeAddr, uint32_t cqeN
   volatile struct ionic_v1_cqe* cqe = reinterpret_cast<ionic_v1_cqe*>(cqeAddr);
   uint32_t old, msn = HTOBE32(cqe->send.msg_msn);
 
-  printf("ABH %s:%d here cons %#x msn %#x\n", __func__, __LINE__, consIdx, msn);
+  MORI_PRINTF("ABH %s:%d here cons %#x msn %#x\n", __func__, __LINE__, consIdx, msn);
   while ((msn - consIdx) & 0x800000) {
     old = msn;
     msn = HTOBE32(cqe->send.msg_msn);
     if (msn != old) {
-      printf("ABH %s:%d here cons %#x msn %#x\n", __func__, __LINE__, consIdx, msn);
+      MORI_PRINTF("ABH %s:%d here cons %#x msn %#x\n", __func__, __LINE__, consIdx, msn);
     }
   }
-  printf("ABH %s:%d here - msn %#x\n", __func__, __LINE__, msn);
+  MORI_PRINTF("ABH %s:%d here - msn %#x\n", __func__, __LINE__, msn);
 
   *wqeIdx = msn;
 
@@ -512,14 +512,14 @@ inline __device__ int PollCqOnce<ProviderType::PSD>(void* cqeAddr, uint32_t cqeN
   char* Addr = reinterpret_cast<char*>(cqeAddr) + (cqeIdx * sizeof(struct ionic_v1_cqe));
   struct ionic_v1_cqe* cqe = reinterpret_cast<ionic_v1_cqe*>(Addr);
 
-  printf("ABH %s:%d consIdx:%u, cqeIdx:%u, cqeAddr:%p, qtf_be:0x%08x, cqe->status_length:%d\n",
+  MORI_PRINTF("ABH %s:%d consIdx:%u, cqeIdx:%u, cqeAddr:%p, qtf_be:0x%08x, cqe->status_length:%d\n",
          __func__, __LINE__, consIdx, cqeIdx, Addr, *(volatile uint32_t*)(&cqe->qid_type_flags),
          HTOBE32(cqe->status_length));
 #if 1
-  printf("dump cqe at addr:%p\n", Addr);
+  MORI_PRINTF("dump cqe at addr:%p\n", Addr);
   for (int i = 0; i < 32; i++) {
-    printf("%02x", (unsigned char)Addr[i]);
-    if ((i + 1) % 4 == 0) printf("\n");
+    MORI_PRINTF("%02x", (unsigned char)Addr[i]);
+    if ((i + 1) % 4 == 0) MORI_PRINTF("\n");
   }
 #endif
   /* Determine expected color based on cq wrap count */
@@ -533,7 +533,7 @@ inline __device__ int PollCqOnce<ProviderType::PSD>(void* cqeAddr, uint32_t cqeN
   // first round: 1 == 1, second round: 0 == 0
   uint32_t qtf_be = *(volatile uint32_t*)(&cqe->qid_type_flags);
   if ((qtf_be & qtf_color_bit) != qtf_color_exp) {
-    printf("cqe not ready\n");
+    MORI_PRINTF("cqe not ready\n");
     return -1;  // CQE just not ready yet, try again
   }
 
@@ -547,12 +547,12 @@ inline __device__ int PollCqOnce<ProviderType::PSD>(void* cqeAddr, uint32_t cqeN
     uint32_t flag = qtf & 0xf;
     uint32_t status = cqe->status_length;
     uint64_t npg = cqe->send.npg_wqe_idx_timestamp & IONIC_V1_CQE_WQE_IDX_MASK;
-    printf("QUIET ERROR: qid %u type %u flag %#x status %u msn %u npg %lu\n", qid, type, flag,
+    MORI_PRINTF("QUIET ERROR: qid %u type %u flag %#x status %u msn %u npg %lu\n", qid, type, flag,
            status, msn, npg);
     return HTOBE32(cqe->status_length);
   }
 
-  printf("poll cqe one, success\n");
+  MORI_PRINTF("poll cqe one, success\n");
 
   return 0;
 }
@@ -573,7 +573,7 @@ inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum, u
   // Handle error cases
   if (err) {
     auto error = IonicHandleErrorCqe(err);
-    printf("[IONIC PollCq] CQE error: %s (opcode: %d) at %s:%d\n", IbvWcStatusString(error), err,
+    MORI_PRINTF("[IONIC PollCq] CQE error: %s (opcode: %d) at %s:%d\n", IbvWcStatusString(error), err,
            __FILE__, __LINE__);
     return err;
   }
@@ -610,7 +610,7 @@ inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum, u
     const uint32_t msn = BE32TOH(cqe->send.msg_msn) & 0xFFFF;
     const uint8_t error = IonicHandleErrorCqe(status);
 
-    // printf(
+    // MORI_PRINTF(
     //     "PollCqOnce2, QUIET ERROR: block:%u, warp:%u, lane:%u, cqeAddr:%p, error:%u "
     //     "qid %u type %u flag %#x status 0x%08x msn %u npg %lu\n",
     //     blockIdx.x, threadIdx.x / warpSize, __lane_id(), cqeAddr, error, qid, type, flags, status,
@@ -618,11 +618,11 @@ inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum, u
 
 #if 0
     // Debug: dump raw CQE contents
-    printf("dump cqe at addr:%p\n", cqeAddr);
+    MORI_PRINTF("dump cqe at addr:%p\n", cqeAddr);
     for (int i = 0; i < 32; i++) {
-      printf("%02x", static_cast<unsigned char>(cqeAddr[i]));
+      MORI_PRINTF("%02x", static_cast<unsigned char>(cqeAddr[i]));
       if ((i + 1) % 4 == 0) {
-        printf("\n");
+        MORI_PRINTF("\n");
       }
     }
 #endif
@@ -644,12 +644,12 @@ inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHand
 
   consIdx = wqHandle.dbTouchIdx;
 
-  // printf("ABH %s:%d here cons %#x msn %#x\n", __func__, __LINE__, consIdx, msn);
+  // MORI_PRINTF("ABH %s:%d here cons %#x msn %#x\n", __func__, __LINE__, consIdx, msn);
   while ((msn - consIdx) & 0x800000) {
     old = msn;
     msn = HTOBE32(cqe->send.msg_msn);
     if (msn != old) {
-      // printf("ABH %s:%d here cons %#x msn %#x\n", __func__, __LINE__, consIdx, msn);
+      // MORI_PRINTF("ABH %s:%d here cons %#x msn %#x\n", __func__, __LINE__, consIdx, msn);
     }
   }
 
@@ -668,16 +668,16 @@ inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHand
 
   struct ionic_v1_cqe* cqe = reinterpret_cast<ionic_v1_cqe*>(Addr);
 #if 0
-  printf("PollCqOnce2, block:%u, warp:%u, lane:%u, consIdx:%u, cqeIdx:%u, cqeAddr:%p, qtf_be:0x%08x, cqe->status_length:%d, msn:%u\n",
+  MORI_PRINTF("PollCqOnce2, block:%u, warp:%u, lane:%u, consIdx:%u, cqeIdx:%u, cqeAddr:%p, qtf_be:0x%08x, cqe->status_length:%d, msn:%u\n",
 	 blockIdx.x, threadIdx.x/warpSize, __lane_id(), my_cq_pos, cqeIdx, Addr,
 	 *(volatile uint32_t *)(&cqe->qid_type_flags), BE32TOH(cqe->status_length), BE32TOH(cqe->send.msg_msn));
 #endif
 #if 0
-  printf("dump cqe at addr:%p\n", Addr);
+  MORI_PRINTF("dump cqe at addr:%p\n", Addr);
   for (int i = 0; i < 32; i++) {
-    printf("%02x", (unsigned char)Addr[i]);
+    MORI_PRINTF("%02x", (unsigned char)Addr[i]);
     if ((i+1)%4 == 0)
-      printf("\n");
+      MORI_PRINTF("\n");
   }
 #endif
   /* Determine expected color based on cq wrap count */
@@ -692,7 +692,7 @@ inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHand
   uint32_t qtf_be = BE32TOH(*(volatile uint32_t*)(&cqe->qid_type_flags));
   if ((qtf_be & qtf_color_bit) != qtf_color_exp) {
 #if 0
-    printf("PollCqOnce2, not ready, block:%u, warp:%u, lane:%u, consIdx:%u, cqeIdx:%u, cqeAddr:%p, qtf_be:0x%08x, cqe->status_length:0x%08x, msn:%u\n",
+    MORI_PRINTF("PollCqOnce2, not ready, block:%u, warp:%u, lane:%u, consIdx:%u, cqeIdx:%u, cqeAddr:%p, qtf_be:0x%08x, cqe->status_length:0x%08x, msn:%u\n",
            blockIdx.x, threadIdx.x/warpSize, __lane_id(), my_cq_pos, cqeIdx, Addr,
            *(volatile uint32_t *)(&cqe->qid_type_flags), BE32TOH(cqe->status_length), BE32TOH(cqe->send.msg_msn));
 #endif
@@ -710,16 +710,16 @@ inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHand
     uint32_t status = cqe->status_length;
     uint64_t npg = cqe->send.npg_wqe_idx_timestamp & IONIC_V1_CQE_WQE_IDX_MASK;
     uint8_t error = IonicHandleErrorCqe(BE32TOH(cqe->status_length));
-    printf(
+    MORI_PRINTF(
         "PollCqOnce2, QUIET ERROR: block:%u, warp:%u, lane:%u, cqeAddr:%p, error:%u qid %u type %u "
         "flag %#x status 0x%08x msn %u npg %lu\n",
         blockIdx.x, threadIdx.x / warpSize, __lane_id(), Addr, error, qid, type, flag, status, msn,
         npg);
 #if 1
-    printf("dump cqe at addr:%p\n", Addr);
+    MORI_PRINTF("dump cqe at addr:%p\n", Addr);
     for (int i = 0; i < 32; i++) {
-      printf("%02x", (unsigned char)Addr[i]);
-      if ((i + 1) % 4 == 0) printf("\n");
+      MORI_PRINTF("%02x", (unsigned char)Addr[i]);
+      if ((i + 1) % 4 == 0) MORI_PRINTF("\n");
     }
 #endif
     /* No other way to signal an error, so just crash. */
@@ -728,7 +728,7 @@ inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHand
   }
 
 #if 0
-  printf("PollCqOnce2, success, block:%u, warp:%u, lane:%u, qp:%u, cqeAddr:%p, my_cq_pos:%u, cqeNum:%u, msn:%u\n",
+  MORI_PRINTF("PollCqOnce2, success, block:%u, warp:%u, lane:%u, qp:%u, cqeAddr:%p, my_cq_pos:%u, cqeNum:%u, msn:%u\n",
           blockIdx.x, threadIdx.x/warpSize, __lane_id(),
 	  qtf_be >> IONIC_V1_CQE_QID_SHIFT, Addr, my_cq_pos, cqHandle.cqeNum, msn);
 #endif
@@ -751,7 +751,7 @@ inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHand
     cqHandle.cq_dbpos = cqHandle.cq_consumer;
     uint64_t dbrVal = cqHandle.cq_dbval | ((cqHandle.cqeNum - 1) & (cqHandle.cq_dbpos));
 #if 0
-    printf("update cq doorbell, block:%u, warp:%u, lane:%u, cq dbrAddr:%p, dbrVal:0x%lx, cq_consumer:%u\n",
+    MORI_PRINTF("update cq doorbell, block:%u, warp:%u, lane:%u, cq dbrAddr:%p, dbrVal:0x%lx, cq_consumer:%u\n",
            blockIdx.x, threadIdx.x/warpSize, __lane_id(), reinterpret_cast<uint64_t*>(cqHandle.dbrRecAddr), dbrVal, cqHandle.cq_consumer);
 #endif
     __atomic_store_n(reinterpret_cast<uint64_t*>(cqHandle.dbrRecAddr), dbrVal,
@@ -794,15 +794,15 @@ inline __device__ int PollCq<ProviderType::PSD>(WorkQueueHandle& wqHandle,
     /* with lock acquired, this wave polls cqes until caught up */
     while ((wqHandle.doneIdx - cons) & 0x800000) {
       uint32_t old_sq_msn = wqHandle.doneIdx;
-      // printf("PollCq, before PollCqOnce2, curConsIdx:%u\n", curConsIdx);
+      // MORI_PRINTF("PollCq, before PollCqOnce2, curConsIdx:%u\n", curConsIdx);
       // asm volatile("" ::: "memory");
       err = PollCqOnce2(wqHandle, cqHandle, activemask, cqAddr, cqeNum, curConsIdx);
       if (err != 0) {
-        printf("PollCq, PollCqOnce2 failed, err:%u\n", err);
+        MORI_PRINTF("PollCq, PollCqOnce2 failed, err:%u\n", err);
         return err;
       }
       asm volatile("" ::: "memory");
-      // printf("PollCq, after PollCqOnce2, curConsIdx:%u\n", curConsIdx);
+      // MORI_PRINTF("PollCq, after PollCqOnce2, curConsIdx:%u\n", curConsIdx);
       if (!((wqHandle.doneIdx - cons) & 0x800000)) {
         if (wqHandle.doneIdx == old_sq_msn) {
           break;
@@ -829,7 +829,7 @@ inline __device__ void UpdateCqDbrRecord<ProviderType::PSD>(CompletionQueueHandl
   uint64_t dbrVal = cq.cq_dbval | ((cq.cqeNum - 1) & consIdx);  // don't add 1 to consIdx
   __atomic_store_n(reinterpret_cast<uint64_t*>(cq.dbrRecAddr), dbrVal,
                      __ATOMIC_SEQ_CST); 
-  // printf("UpdateCqDbrRecord, dbrRecAddr:%p, dbrVal:%#lx\n",
+  // MORI_PRINTF("UpdateCqDbrRecord, dbrRecAddr:%p, dbrVal:%#lx\n",
   // reinterpret_cast<uint64_t*>(cq.dbrRecAddr), dbrVal);
   return;
 #endif

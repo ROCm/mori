@@ -133,7 +133,7 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId) {
     if (opcode != BNXT_RE_REQ_ST_OK) {
       int rank = globalGpuStates->rank;
       uint32_t my_cq_index = my_cq_consumer % cq.cqeNum;
-      // printf("rank %d dest pe %d consIdx %d opcode %d\n", rank, pe, my_cq_index, opcode);
+      MORI_PRINTF("rank %d dest pe %d consIdx %d opcode %d\n", rank, pe, my_cq_index, opcode);
       assert(false);
     }
     wqe_counter = (wqe_counter + wq.sqWqeNum - 1) % wq.sqWqeNum;
@@ -179,8 +179,8 @@ inline __device__ void ShmemQuietThreadKernelPsdImpl(int pe, int qpId) {
       const int opcode =
           core::PollCq<core::ProviderType::PSD>(cqHandle.cqAddr, cqHandle.cqeNum, &myCqPos, &wqeCounter);
       if (opcode > 0) {
-        // printf("rank %d dest pe %d consIdx %d opcode %d\n", globalGpuStates->rank, pe, myCqPos,
-        //        opcode);
+        MORI_PRINTF("rank %d dest pe %d consIdx %d opcode %d\n", globalGpuStates->rank, pe, myCqPos,
+               opcode);
         assert(false);
       }
       asm volatile("" ::: "memory");
@@ -277,9 +277,9 @@ inline __device__ void ShmemQuietThreadKernelMlnxImpl(int pe, int qpId) {
       uint32_t wqe_counter;
       int opcode = core::PollCq<core::ProviderType::MLX5>(cq.cqAddr, cq.cqeNum, &my_cq_consumer, &wqe_counter);
       if (opcode == MLX5_CQE_RESP_ERR || opcode == MLX5_CQE_REQ_ERR) {
-        // int rank = globalGpuStates->rank;
-        // printf("rank %d dest pe %d consIdx %d opcode %d\n", rank, pe, my_cq_index, opcode);
-        // core::DumpMlx5Wqe(wq.sqAddr, my_cq_index);
+        int rank = globalGpuStates->rank;
+        MORI_PRINTF("rank %d dest pe %d consIdx %d opcode %d\n", rank, pe, my_cq_index, opcode);
+        core::DumpMlx5Wqe(wq.sqAddr, my_cq_index);
         assert(false);
       }
       uint64_t wqe_id = wq.outstandingWqe[wqe_counter];
