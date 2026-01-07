@@ -76,14 +76,14 @@ class EpDispatchCombineTestCase:
         # seed = int(time.time()) + self.rank
         
         def set_seed():
-          return jax.random.PRNGKey(777)
+          return jax.random.PRNGKey(777 + self.rank)
         self.rng = jax.jit(set_seed)()
 
     def cleanup(self):
         mori.shmem.shmem_finalize()
         dist.destroy_process_group()
         
-    def allgather_padded_old(self, inp: jnp.ndarray, max_token_num: int): # -> List[jnp.ndarray]:
+    def allgather_padded_emu(self, inp: jnp.ndarray, max_token_num: int):
         shape = list(inp.shape)
         pad_len = max_token_num - shape[0]
         if pad_len > 0:
@@ -96,42 +96,10 @@ class EpDispatchCombineTestCase:
         print(f"-- pad shape: {padded.shape} --> {tiled.shape}")
         return tiled
     
-    def allgather_padded(self, inp: jnp.ndarray, max_token_num: int):
-        padded = jnp.pad(inp,
-            [(0, max_token_num - inp.shape[0])] + [(0, 0)] * (inp.ndim - 1),
-        )
-        
-        @functools.partial(jax.pmap, axis_name="i")
-        def allgather_padded(padded):
-            return jax.lax.all_gather(padded, axis_name="i")
-        
-        padded = jnp.expand_dims(padded, axis=0) 
-        gathered = allgather_padded(padded)[0] # drop 0th degenerate axis
-        gathered = gathered.reshape(-1, *gathered.shape[2:])
-        print(f"-- pad shape: {padded.shape} --> {gathered.shape}")
-        return gathered
-    
-    # def _allgather_padded_impl(self, max_token_num: int, inp: jnp.ndarray):
-    #     padded = jnp.pad(inp,
-    #         [(0, max_token_num - inp.shape[0])] + [(0, 0)] * (inp.ndim - 1),
-    #     )
-    #     gathered = jax.lax.all_gather(padded, axis_name="i")
-    #     gathered = gathered.reshape(-1, *gathered.shape[2:])
-    #     return gathered
-    
-    def make_mesh(self):
-       devices = np.array(jax.devices())
-       return jax.sharding.Mesh(devices, axis_names=("i",))
-
-    def gen_test_data(self):
+    def gen_test_data(self, num_tokens):
         max_tokens = self.config.max_num_inp_token_per_rank
-        random.seed(333 + self.rank)
-        num_tokens = int(random.randint(1, max_tokens + 1))
-        mesh = self.make_mesh()
 
-        @jax.jit
-        @partial(shard_map, mesh=mesh, in_specs=P(), out_specs=P(), check_rep=False)
-        def ZZ(inp):
+        def all_gather(inp):
             padded = jnp.pad(inp,
                 [(0, max_tokens - inp.shape[0])] + [(0, 0)] * (inp.ndim - 1),
             )
@@ -139,13 +107,9 @@ class EpDispatchCombineTestCase:
             gathered = gathered.reshape(-1, *gathered.shape[2:])
             return gathered
         
-        def all_gather(inp):
-            return ZZ(inp)
-            #return self.allgather_padded_old(inp, max_tokens)
-        
         # indices: shape [num_tokens, num_experts_per_token]
         total_experts = self.config.num_experts_per_rank * self.config.world_size
-        print(f"----- rank {self.rank} #tokens {num_tokens} #experts {total_experts}")
+        # print(f"----- rank {self.rank} #tokens {num_tokens} #experts {total_experts}")
 
         # Use numpy for per-row permutation sampling
         # indices_np = np.empty((num_tokens, self.config.num_experts_per_token), dtype=np.int64)
@@ -209,6 +173,7 @@ class EpDispatchCombineTestCase:
             has_scales=True, has_weights=True,
         )
         
+        # NOTE this cannot be jitted because get_dispatch_src_token_pos_jax requires syncrhonize before !!!
         #src_token_pos = op.get_dispatch_src_token_pos().detach().cpu().numpy()
         src_token_pos = op.get_dispatch_src_token_pos_jax()
         # jax.block_until_ready(src_token_pos)
@@ -231,6 +196,7 @@ class EpDispatchCombineTestCase:
         assert np.unique(src_token_pos).size == src_token_pos.size
         assert src_token_pos.size == int(dispatch_recv_num_token)
 
+        # Validate dispatch outputs against gathered inputs
         res = compare(src_token_pos, input_list, dispatch_output,
                     (weights_list, dispatch_weights),
                     (scales_list, dispatch_scales if self.config.scale_dim != 0 else None),
@@ -238,72 +204,37 @@ class EpDispatchCombineTestCase:
         assert res, f"{self.rank} comparison failed!"
         # print(f"input_list {input_list.shape} ss {ss.shape} at {src_token_pos.shape} vs {vv.shape}")
 
-        max_tokens = self.config.max_num_inp_token_per_rank
-        # Validate dispatch outputs against gathered inputs
-        # for i, pos in enumerate(src_token_pos):
-        #     pos_i = int(pos)
-        #     src_rank = pos_i // max_tokens
-        #     src_id = pos_i % max_tokens
-            
-        #     continue
-            
-            # flatidx = src_rank*max_tokens+src_id
-            # print(f"--- {flatidx} -- {pos_i}")
-
-            #continue
-            # #print(f"- {i} / pos_i {pos_i} / src_id {src_id}")
-            # if i % 500 == 0:
-            #     print(f" rank: {self.rank} == {i} ii {input_list.shape} vs {dispatch_output[i].shape}", flush=True)
-            # assert jnp.all(input_list[pos_i] == dispatch_output[i]), f"dispatch_output mismatch at token {i} (rank {self.rank})"
-            # continue
-            
-            # assert jnp.all(weights_list[src_rank][src_id] == dispatch_weights[i]), f"dispatch_weights mismatch at token {i} (rank {self.rank})"
-
-            # if scales_list is not None and self.config.scale_dim != 0:
-            #   assert jnp.all(scales_list[src_rank][src_id] == dispatch_scales[i]), f"dispatch_scales mismatch at token {i} (rank {self.rank})"
-
-            # assert jnp.all(indices_list[src_rank][src_id] == dispatch_indices[i]), f"dispatch_indices mismatch at token {i} (rank {self.rank})"
-            
-            #if not np.array_equal(left_idx, right_idx):
-                # print(f"lhs = {left_idx} -- {left} -- {left_w}")
-                # print(f"rhs = {right_idx} -- {right} -- {right_w}")
-            #    print("ops indices mismatch")
-            #assert np.array_equal(left_idx, right_idx), )"
         print(f"{self.rank} comparison tokens ok", flush=True)
 
-        if self.config.rank == 0:
-            print("[rank 0] Dispatch Pass")
-
-        
     def test_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
+        random.seed(333 + self.rank)
+        max_tokens = self.config.max_num_inp_token_per_rank
+        num_tokens = int(random.randint(1, max_tokens + 1))
+        
+        devices = np.array(jax.devices())
+        mesh = jax.sharding.Mesh(devices, axis_names=("i",))
+        
+        #@jax.jit
+        #@partial(shard_map, mesh=mesh, in_specs=P(), out_specs=P(), check_rep=False)
+        jitted_gen = jax.jit(shard_map(partial(self.gen_test_data, num_tokens),
+                    mesh=mesh, in_specs=(), out_specs=(P(None), # num_tokens
+                                                       P(), # indices
+                                                       P(), # weights
+                                                       P(), # scales
+                                                       P(), # input
+                                                       P(), # indices_list
+                                                       P(), # weights_list
+                                                       P(), # scales_list
+                                                       P(),), # input_list
+                    check_rep=False), static_argnums=())
         for _ in range(1):
-            test_data = self.gen_test_data()
+            test_data = jitted_gen() 
             print(f"{self.rank} en_test_data OK")
             self.run_test_once(op, test_data)
         del op
 
-        # op = mori.ops.EpDispatchCombineOp(self.config)
-        
-        # @jax.jit
-        # def gen_inputs():
-        #   w,h = 256, 768
-        #   input = jnp.linspace(-1, 1, w*h).reshape([w, h])
-        #   weights = jnp.linspace(-1, 1, w*h).reshape([w, h])
-        #   scales = jnp.linspace(-1, 1, w*h).reshape([w, h])
-        #   indices = jnp.linspace(0, 100, w*h, dtype=jnp.int32).reshape([w, h])
-        #   return input, weights, scales, indices
-        
-        # S = gen_inputs()
-        # res = op.dispatch_jax(*S)
-
-# if __name__ == "__main__":
-#   print("Start")
-#   test_case = PlaygroundTestCase(rank=110, world_size=1)
-
-
 def test_dispatch_combine(rank, world_size):
-    # test_case = EpDispatchCombineTestCase(rank, world_size, torch.float8_e4m3fnuz)
     test_case = EpDispatchCombineTestCase(rank, world_size, 
                                             torch.bfloat16, jnp.bfloat16)
     test_case.setup()
@@ -314,7 +245,3 @@ if __name__ == "__main__":
     world_config = init_distributed()
     test_dispatch_combine(*world_config)
     
-    # world_size = 8
-    # torch.multiprocessing.spawn(
-    #     test_dispatch_combine, args=(world_size,), nprocs=world_size, join=True
-    # )

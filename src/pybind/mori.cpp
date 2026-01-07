@@ -201,7 +201,6 @@ Error MoriDispatchImpl(
   if (weightsPtr) {
     D2DCopy(out_weights->untyped_data(), h->shmemDispatchOutWeightsMemObj->Get(), 
         out_weights->size_bytes(), stream);
-    //  hipMemsetAsync(out_weights->untyped_data(), 0xff, 16, stream);
   }
   if (scalesPtr) {
     D2DCopy(out_scales->untyped_data(), h->shmemOutScalesMemObj->Get(), 
