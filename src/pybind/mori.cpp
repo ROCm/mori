@@ -19,6 +19,10 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+
+// Do not compile device-side code since we do not have any kernels here..
+#ifndef __HIP_DEVICE_COMPILE__
+
 #include "src/pybind/mori.hpp"
 
 #include <ATen/hip/HIPContext.h>
@@ -72,7 +76,7 @@ ExtType* FindExtension(InputType* in, PJRT_Extension_Type type) {
 
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                            Ops APIs                                            */
+/*                                          XLA Ops APIs                                          */
 /* ---------------------------------------------------------------------------------------------- */
 namespace {
 
@@ -88,6 +92,202 @@ hipDataType FFIType2HipType(DataType dtype) {
   }
 #undef XX
 }
+
+template <typename T>
+T get_attr_value(Dictionary& attrs, std::string attr_name) {
+  auto attr = attrs.get<T>(attr_name);
+  if (attr.has_error()) {
+    MORI_OPS_ERROR("Failure in getting attribute value of '{}'", attr_name);
+    return attr.error();
+  }
+  return attr.value();
+}
+
+void GpuCopy(void* dst, const void* src, size_t bytes, hipStream_t stream, 
+        hipMemcpyKind copy_dir = hipMemcpyDeviceToDevice) {
+  HIP_RUNTIME_CHECK(hipMemcpyAsync(dst, src, bytes, copy_dir, stream));
+}
+
+Error MoriDispatchImpl(
+    hipStream_t stream,
+    EpDispatchCombineHandle *h,
+    int32_t has_scales,
+    int32_t has_weights,
+    int32_t kernel_type,
+    int32_t block_num,
+    int32_t warp_per_block,
+    AnyBuffer input,
+    BufferR2<F32> weights,
+    AnyBuffer scales,
+    BufferR2<S32> topk_ids,
+    Result<AnyBuffer> out,
+    Result<BufferR2<F32>> out_weights,
+    Result<AnyBuffer> out_scales,
+    Result<BufferR2<S32>> out_indices,
+    Result<BufferR0<S32>> total_recv_token_num) {
+  
+  XPUT("MoriDispatchImpl handle: %d, kernel_type=%d input=%d weights=%d block_num=%d stream: %p",
+      h->config.rank, kernel_type, (int)input.size_bytes(), (int)weights.size_bytes(), block_num, stream);
+  
+  assert(ByteWidth(topk_ids.element_type()) == sizeof(index_t) &&
+         ByteWidth(out_indices->element_type()) == sizeof(index_t)); 
+  
+  float *weightsPtr = has_weights ? weights.typed_data() : nullptr;
+
+  uint8_t* scalesPtr = nullptr;
+  if (has_scales && h->config.scaleDim > 0) {
+    assert(/*scales->is_contiguous() &&*/ 
+      ByteWidth(scales.element_type()) == h->config.scaleTypeSize);
+    scalesPtr = static_cast< uint8_t *>(scales.untyped_data());
+  }
+
+  // NOTE: why output is set to NULL??
+  h->PrepareInference(FFIType2HipType(input.element_type()), 
+        input.untyped_data(), nullptr, weightsPtr, scalesPtr, 
+        topk_ids.typed_data(), input.dimensions()[0]);
+  h->LaunchDispatch(static_cast< KernelType >(kernel_type), block_num, 
+                                                      warp_per_block, stream);
+
+  GpuCopy(out->untyped_data(), h->shmemDispatchOutTokMemObj->Get(), 
+        out->size_bytes(), stream);
+
+  if (weightsPtr) {
+    GpuCopy(out_weights->untyped_data(), h->shmemDispatchOutWeightsMemObj->Get(), 
+        out_weights->size_bytes(), stream);
+  }
+  if (scalesPtr) {
+    GpuCopy(out_scales->untyped_data(), h->shmemOutScalesMemObj->Get(), 
+        out_scales->size_bytes(), stream);
+  }
+
+  GpuCopy(out_indices->untyped_data(), h->shmemOutIndicesMemObj->Get(), 
+        out_indices->size_bytes(), stream);
+
+  GpuCopy(total_recv_token_num->untyped_data(), h->totalRecvTokenNum, 
+        sizeof(index_t), stream);
+
+  return Error::Success();
+}
+
+// if this does not work, we will have to send Handle fields via Ctx params..
+XLA_FFI_DEFINE_HANDLER(
+    MoriDispatchHandler, MoriDispatchImpl,
+    // Explicit binding to ensure attrs/args order
+    Ffi::Bind()
+        .Ctx<PlatformStream<hipStream_t>>()
+        .Attr<Pointer<EpDispatchCombineHandle>>("handle_ptr")
+        .Attr<int32_t>("has_scales")
+        .Attr<int32_t>("has_weights")
+        .Attr<int32_t>("kernel_type")
+        .Attr<int32_t>("block_num")
+        .Attr<int32_t>("warp_per_block")
+        // .Attrs()
+        //.Ctx<UserData<EpDispatchCombineHandle>>()
+        .Arg<AnyBuffer>()          // input
+        .Arg<BufferR2<F32>>()      // weights optional
+        .Arg<AnyBuffer>()          // scales optional
+        .Arg<BufferR2<S32>>()      // topk_ids 
+        .Ret<AnyBuffer>()          // out
+        .Ret<BufferR2<F32>>()      // out_weights optional
+        .Ret<AnyBuffer>()          // out_scales optional
+        .Ret<BufferR2<S32>>()      // out_indices 
+        .Ret<BufferR0<S32>>()      // total_recv_token_num
+);
+
+Error MoriCombineImpl(
+    hipStream_t stream,
+    EpDispatchCombineHandle *h,
+    int32_t has_weights,
+    int32_t kernel_type,
+    int32_t block_num,
+    int32_t warp_per_block,
+    AnyBuffer input,
+    BufferR2<F32> weights,
+    BufferR2<S32> topk_ids,
+    Result<AnyBuffer> out,
+    Result<BufferR2<F32>> out_weights) {
+  
+  XPUT("MoriCombineImpl handle: %d, kernel_type=%d input=%d weights=%d block_num=%d",
+      h->config.rank, kernel_type, (int)input.size_bytes(), (int)weights.size_bytes(), block_num);
+  
+  assert(ByteWidth(topk_ids.element_type()) == sizeof(index_t)); 
+  
+  float *weightsPtr = has_weights ? weights.typed_data() : nullptr;
+
+  // NOTE: why output is set to NULL??
+  h->PrepareInference(FFIType2HipType(input.element_type()), 
+        input.untyped_data(), nullptr, weightsPtr, 
+        topk_ids.typed_data(), h->curRankNumToken);
+  h->LaunchCombine(static_cast< KernelType >(kernel_type), block_num, 
+                                                      warp_per_block, stream);
+
+  GpuCopy(out->untyped_data(), h->shmemCombineOutTokMemObj->Get(), 
+        out->size_bytes(), stream);
+  // {handle.config.maxNumInpTokenPerRank, handle.config.hiddenDim},
+
+  if (weightsPtr) {
+    //{handle.config.maxNumInpTokenPerRank, handle.config.numExpertPerToken},
+    GpuCopy(out_weights->untyped_data(), h->shmemCombineOutWeightsMemObj->Get(), 
+        out_weights->size_bytes(), stream);
+  }
+  return Error::Success();
+} 
+
+// if this does not work, we will have to send Handle fields via Ctx params..
+XLA_FFI_DEFINE_HANDLER(
+    MoriCombineHandler, MoriCombineImpl,
+    Ffi::Bind()
+        .Ctx<PlatformStream<hipStream_t>>()
+        .Attr<Pointer<EpDispatchCombineHandle>>("handle_ptr")
+        .Attr<int32_t>("has_weights")
+        .Attr<int32_t>("kernel_type")
+        .Attr<int32_t>("block_num")
+        .Attr<int32_t>("warp_per_block")
+        .Arg<AnyBuffer>()          // input
+        .Arg<BufferR2<F32>>()      // weights optional
+        .Arg<BufferR2<S32>>()      // topk_ids 
+        .Ret<AnyBuffer>()          // out
+        .Ret<BufferR2<F32>>()      // out_weights optional
+);
+
+Error MoriResetImpl(hipStream_t stream, EpDispatchCombineHandle *h) {
+  h->LaunchReset(stream);
+  return Error::Success();
+}
+ 
+XLA_FFI_DEFINE_HANDLER(
+    MoriResetHandler, MoriResetImpl,
+    Ffi::Bind()
+        .Ctx<PlatformStream<hipStream_t>>()
+        .Attr<Pointer<EpDispatchCombineHandle>>("handle_ptr")
+);
+
+Error GetDispatchSrcTokenIdJax(hipStream_t stream, EpDispatchCombineHandle *h,
+    BufferR0<S32> total_recv_token_num,
+    Result<BufferR1<S32>> out) {
+  //XPUT("GetDispatchSrcTokenIdJax stream: %p", stream);
+  // NOTE here we read the whole buffer but the actual # of tokens received could be less
+  // we do nto want to read it since it requires explitic stream syncrhonize otherwise
+  GpuCopy(out->untyped_data(), h->dispTokIdToSrcTokIdMemObj->Get(), 
+              out->size_bytes(), stream);
+  return Error::Success();
+} 
+
+// if this does not work, we will have to send Handle fields via Ctx params..
+XLA_FFI_DEFINE_HANDLER(
+    GetDispatchSrcTokenIdHandler, GetDispatchSrcTokenIdJax,
+    Ffi::Bind()
+        .Ctx<PlatformStream<hipStream_t>>()
+        .Attr<Pointer<EpDispatchCombineHandle>>("handle_ptr")
+        // this buffer is actually not used by we need it in order to ensure
+        // correct order of FFI calls
+        .Arg<BufferR0<S32>>()
+        .Ret<BufferR1<S32>>()
+);
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                            Ops APIs                                            */
+/* ---------------------------------------------------------------------------------------------- */
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, torch::Tensor,
            torch::Tensor>
@@ -147,200 +347,6 @@ LaunchDispatch(EpDispatchCombineHandle& handle, int kernelType,
                            .device(torch::kCUDA));
   return {out, outWeights, outScales, outIndices, totalRecvTokenNum};
 }
-
-void D2DCopy(void* dst, const void* src, size_t bytes, hipStream_t stream) {
-  hipError_t st = hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, stream);
-  if (st != hipSuccess) {
-    throw std::runtime_error(std::string("hipMemcpyAsync failed: ") + hipGetErrorString(st));
-  }
-}
-
-Error MoriDispatchImpl(
-    hipStream_t stream,
-    EpDispatchCombineHandle *h,
-    int32_t has_scales,
-    int32_t has_weights,
-    int32_t kernel_type,
-    int32_t block_num,
-    int32_t warp_per_block,
-    AnyBuffer input,
-    BufferR2<F32> weights,
-    AnyBuffer scales,
-    BufferR2<S32> topk_ids,
-    Result<AnyBuffer> out,
-    Result<BufferR2<F32>> out_weights,
-    Result<AnyBuffer> out_scales,
-    Result<BufferR2<S32>> out_indices,
-    Result<BufferR0<S32>> total_recv_token_num) try {
-  
-  XPUT("MoriDispatchImpl handle: %d, kernel_type=%d input=%d weights=%d block_num=%d",
-      h->config.rank, kernel_type, (int)input.size_bytes(), (int)weights.size_bytes(), block_num);
-  
-  assert(ByteWidth(topk_ids.element_type()) == sizeof(index_t) &&
-         ByteWidth(out_indices->element_type()) == sizeof(index_t)); 
-  
-  float *weightsPtr = has_weights ? weights.typed_data() : nullptr;
-
-  uint8_t* scalesPtr = nullptr;
-  if (has_scales && h->config.scaleDim > 0) {
-    assert(/*scales->is_contiguous() &&*/ 
-      ByteWidth(scales.element_type()) == h->config.scaleTypeSize);
-    scalesPtr = static_cast< uint8_t *>(scales.untyped_data());
-  }
-
-  // NOTE: why output is set to NULL??
-  h->PrepareInference(FFIType2HipType(input.element_type()), 
-        input.untyped_data(), nullptr, weightsPtr, scalesPtr, 
-        topk_ids.typed_data(), input.dimensions()[0]);
-  h->LaunchDispatch(static_cast< KernelType >(kernel_type), block_num, 
-                                                      warp_per_block, stream);
-
-  D2DCopy(out->untyped_data(), h->shmemDispatchOutTokMemObj->Get(), 
-        out->size_bytes(), stream);
-
-  if (weightsPtr) {
-    D2DCopy(out_weights->untyped_data(), h->shmemDispatchOutWeightsMemObj->Get(), 
-        out_weights->size_bytes(), stream);
-  }
-  if (scalesPtr) {
-    D2DCopy(out_scales->untyped_data(), h->shmemOutScalesMemObj->Get(), 
-        out_scales->size_bytes(), stream);
-  }
-
-  D2DCopy(out_indices->untyped_data(), h->shmemOutIndicesMemObj->Get(), 
-        out_indices->size_bytes(), stream);
-
-  D2DCopy(total_recv_token_num->untyped_data(), h->totalRecvTokenNum, 
-        sizeof(index_t), stream);
-
-  return Error::Success();
-} 
-catch(std::exception& ex) {
-  XPUT("Exception: %s", ex.what());
-  return Error::Internal(ex.what());
-}
-
-// if this does not work, we will have to send Handle fields via Ctx params..
-XLA_FFI_DEFINE_HANDLER(
-    MoriDispatchHandler, MoriDispatchImpl,
-    // Explicit binding to ensure attrs/args order
-    Ffi::Bind()
-        .Ctx<PlatformStream<hipStream_t>>()
-        .Attr<Pointer<EpDispatchCombineHandle>>("handle_ptr")
-        .Attr<int32_t>("has_scales")
-        .Attr<int32_t>("has_weights")
-        .Attr<int32_t>("kernel_type")
-        .Attr<int32_t>("block_num")
-        .Attr<int32_t>("warp_per_block")
-        // .Attrs()
-        //.Ctx<UserData<EpDispatchCombineHandle>>()
-        .Arg<AnyBuffer>()          // input
-        .Arg<BufferR2<F32>>()      // weights optional
-        .Arg<AnyBuffer>()          // scales optional
-        .Arg<BufferR2<S32>>()      // topk_ids 
-        .Ret<AnyBuffer>()          // out
-        .Ret<BufferR2<F32>>()      // out_weights optional
-        .Ret<AnyBuffer>()          // out_scales optional
-        .Ret<BufferR2<S32>>()      // out_indices 
-        .Ret<BufferR0<S32>>()      // total_recv_token_num
-);
-
-Error MoriCombineImpl(
-    hipStream_t stream,
-    EpDispatchCombineHandle *h,
-    int32_t has_weights,
-    int32_t kernel_type,
-    int32_t block_num,
-    int32_t warp_per_block,
-    AnyBuffer input,
-    BufferR2<F32> weights,
-    BufferR2<S32> topk_ids,
-    Result<AnyBuffer> out,
-    Result<BufferR2<F32>> out_weights) try {
-  
-  XPUT("MoriCombineImpl handle: %d, kernel_type=%d input=%d weights=%d block_num=%d",
-      h->config.rank, kernel_type, (int)input.size_bytes(), (int)weights.size_bytes(), block_num);
-  
-  assert(ByteWidth(topk_ids.element_type()) == sizeof(index_t)); 
-  
-  float *weightsPtr = has_weights ? weights.typed_data() : nullptr;
-
-  // NOTE: why output is set to NULL??
-  h->PrepareInference(FFIType2HipType(input.element_type()), 
-        input.untyped_data(), nullptr, weightsPtr, 
-        topk_ids.typed_data(), h->curRankNumToken);
-  h->LaunchCombine(static_cast< KernelType >(kernel_type), block_num, 
-                                                      warp_per_block, stream);
-
-  D2DCopy(out->untyped_data(), h->shmemCombineOutTokMemObj->Get(), 
-        out->size_bytes(), stream);
-  // {handle.config.maxNumInpTokenPerRank, handle.config.hiddenDim},
-
-  if (weightsPtr) {
-    //{handle.config.maxNumInpTokenPerRank, handle.config.numExpertPerToken},
-    D2DCopy(out_weights->untyped_data(), h->shmemCombineOutWeightsMemObj->Get(), 
-        out_weights->size_bytes(), stream);
-  }
-  return Error::Success();
-} 
-catch(std::exception& ex) {
-  XPUT("Exception: %s", ex.what());
-  return Error::Internal(ex.what());
-}
-
-// if this does not work, we will have to send Handle fields via Ctx params..
-XLA_FFI_DEFINE_HANDLER(
-    MoriCombineHandler, MoriCombineImpl,
-    Ffi::Bind()
-        .Ctx<PlatformStream<hipStream_t>>()
-        .Attr<Pointer<EpDispatchCombineHandle>>("handle_ptr")
-        .Attr<int32_t>("has_weights")
-        .Attr<int32_t>("kernel_type")
-        .Attr<int32_t>("block_num")
-        .Attr<int32_t>("warp_per_block")
-        .Arg<AnyBuffer>()          // input
-        .Arg<BufferR2<F32>>()      // weights optional
-        .Arg<BufferR2<S32>>()      // topk_ids 
-        .Ret<AnyBuffer>()          // out
-        .Ret<BufferR2<F32>>()      // out_weights optional
-);
-
-Error MoriResetImpl(hipStream_t stream, EpDispatchCombineHandle *h) {
-  h->LaunchReset(stream);
-  return Error::Success();
-}
- 
-XLA_FFI_DEFINE_HANDLER(
-    MoriResetHandler, MoriResetImpl,
-    Ffi::Bind()
-        .Ctx<PlatformStream<hipStream_t>>()
-        .Attr<Pointer<EpDispatchCombineHandle>>("handle_ptr")
-);
-
-Error GetDispatchSrcTokenIdJax(hipStream_t stream, EpDispatchCombineHandle *h,
-    Result<BufferR1<S32>> out) try {
-
-  size_t real_bytes = h->totalRecvTokenNum[0] * sizeof(index_t);
-  assert(out->size_bytes() >= real_bytes);
-  //XPUT("GetDispatchSrcTokenIdJax num_tokens: %d", (int)real_bytes / sizeof(index_t));
-  D2DCopy(out->untyped_data(), h->dispTokIdToSrcTokIdMemObj->Get(), 
-              real_bytes, stream);
-  return Error::Success();
-} 
-catch(std::exception& ex) {
-  XPUT("Exception: %s", ex.what());
-  return Error::Internal(ex.what());
-}
-
-// if this does not work, we will have to send Handle fields via Ctx params..
-XLA_FFI_DEFINE_HANDLER(
-    GetDispatchSrcTokenIdHandler, GetDispatchSrcTokenIdJax,
-    Ffi::Bind()
-        .Ctx<PlatformStream<hipStream_t>>()
-        .Attr<Pointer<EpDispatchCombineHandle>>("handle_ptr")
-        .Ret<BufferR1<S32>>()  
-);
-
 
 // TODO: translate data type
 // template <typename T>
@@ -419,23 +425,6 @@ torch::Tensor GetRegisteredCombineInputBuffer(EpDispatchCombineHandle& handle,
                        {handle.config.MaxNumTokensToRecv(), handle.config.hiddenDim},
                        torch::TensorOptions().dtype(scalarType).device(torch::kCUDA));
   return out;
-}
-
-template <typename T>
-py::capsule EncapsulateFFI(T* fn) {
-  static_assert(std::is_invocable_r_v<XLA_FFI_Error *, T, XLA_FFI_CallFrame *>,
-                "Encapsulated function must be an XLA FFI handler");
-  return py::capsule(reinterpret_cast<void*>(fn));
-}
-
-template <typename T>
-T get_attr_value(Dictionary& attrs, std::string attr_name) {
-  auto attr = attrs.get<T>(attr_name);
-  if (attr.has_error()) {
-    MORI_OPS_ERROR("Failure in getting attribute value of '{}'", attr_name);
-    return attr.error();
-  }
-  return attr.value();
 }
 
 void JaxPluginSetup(py::capsule pyc_api) {
@@ -736,3 +725,5 @@ void RegisterMoriIo(pybind11::module_& m) {
 }
 
 }  // namespace mori
+
+#endif // __HIP_DEVICE_COMPILE__

@@ -143,9 +143,7 @@ class EpDispatchCombineTestCase:
         print(f"weights: {weights.shape}/{weights.dtype}")
         print(f"scales_fp32: {scales_fp32.shape}/{scales_fp32.dtype}", flush=True)
 
-        return (num_tokens,
-            indices,
-            weights,
+        return (indices, weights,
             scales_fp32.astype(self.jax_scale_dtype),
             input_fp32.astype(self.jax_dtype),
             indices_list,
@@ -153,36 +151,30 @@ class EpDispatchCombineTestCase:
             scales_list,
             input_list)
         
-    def run_test_once(self, op, test_data):
-        (num_tokens,
-            indices,
-            weights,
-            scales,
-            input_arr,
-            indices_list,
-            weights_list,
-            scales_list,
-            input_list) = test_data
+    def run_test_once(self, op, num_tokens, test_data):
+        (indices, weights, scales, inputs,
+         indices_list, weights_list, scales_list, input_list) = test_data
 
+        @jax.jit
+        def ffi_calls(*args):
+            (*dispatch_out, num) = op.dispatch_jax(
+                *args, block_num=80, warp_per_block=16,
+                        has_scales=True, has_weights=True)
+            src_token_pos = op.get_dispatch_src_token_pos_jax(num)
+            return (*dispatch_out, num), src_token_pos
+            
         (dispatch_output, 
-         dispatch_weights, 
-         dispatch_scales, 
-         dispatch_indices, 
-         dispatch_recv_num_token) = op.dispatch_jax(
-            input_arr, weights, scales, indices, block_num=80, warp_per_block=16,
-            has_scales=True, has_weights=True,
-        )
+            dispatch_weights, 
+            dispatch_scales, 
+            dispatch_indices, 
+            dispatch_recv_num_token), src_token_pos = ffi_calls(inputs, weights, scales, indices)
         
-        # NOTE this cannot be jitted because get_dispatch_src_token_pos_jax requires syncrhonize before !!!
         #src_token_pos = op.get_dispatch_src_token_pos().detach().cpu().numpy()
-        src_token_pos = op.get_dispatch_src_token_pos_jax()
-        # jax.block_until_ready(src_token_pos)
         num_recv = dispatch_recv_num_token
         print(f"rank {self.rank} got {num_tokens} tokens received {num_recv} tokens", flush=True)
-        
         src_token_pos = np.array(src_token_pos)[:num_recv]
-        print(f"len: {len(src_token_pos)} sz {src_token_pos.size} shape {src_token_pos.shape}")
-        print(f"baze size: {input_list[src_token_pos].shape[0]} === {input_list.shape}")
+        #print(f"len: {len(src_token_pos)} sz {src_token_pos.size} shape {src_token_pos.shape}")
+        #print(f"baze size: {input_list[src_token_pos].shape[0]} === {input_list.shape}")
 
         @jax.jit
         def compare(src_pos, base_list, base_out, *args):
@@ -191,9 +183,11 @@ class EpDispatchCombineTestCase:
           for (x_list, x_out) in args:
             if x_out != None:
               x = x & jnp.all(x_list[src_pos] == x_out[:num,:])
+          sorted_pos = jnp.sort(src_pos)
+          # this means that all elements of sorted_pos must be unique
+          x = x & jnp.all(sorted_pos[1:] != sorted_pos[:-1])
           return x
       
-        assert np.unique(src_token_pos).size == src_token_pos.size
         assert src_token_pos.size == int(dispatch_recv_num_token)
 
         # Validate dispatch outputs against gathered inputs
@@ -218,8 +212,7 @@ class EpDispatchCombineTestCase:
         #@jax.jit
         #@partial(shard_map, mesh=mesh, in_specs=P(), out_specs=P(), check_rep=False)
         jitted_gen = jax.jit(shard_map(partial(self.gen_test_data, num_tokens),
-                    mesh=mesh, in_specs=(), out_specs=(P(None), # num_tokens
-                                                       P(), # indices
+                    mesh=mesh, in_specs=(), out_specs=(P(), # indices
                                                        P(), # weights
                                                        P(), # scales
                                                        P(), # input
@@ -231,7 +224,7 @@ class EpDispatchCombineTestCase:
         for _ in range(1):
             test_data = jitted_gen() 
             print(f"{self.rank} en_test_data OK")
-            self.run_test_once(op, test_data)
+            self.run_test_once(op, num_tokens, test_data)
         del op
 
 def test_dispatch_combine(rank, world_size):

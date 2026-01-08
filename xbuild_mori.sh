@@ -11,18 +11,38 @@ mkdir -p build
 pushd build
 
 if [[ ${full} -eq 1 ]]; then
+
+ apt-get install -y \
+    git \
+   ibverbs-utils \
+    libpci-dev \
+    libdw1 \
+    cython3 
+
+# NOTE this would screw up hipcc installation!!!
+# better install MPI manually
+    #openmpi-bin \
+    #libopenmpi-dev \
+    #locales
+
   rm -rf *
   cmake -DUSE_ROCM=ON -DCMAKE_BUILD_TYPE=Release \
       -DWARP_ACCUM_UNROLL=1 -DUSE_BNXT=OFF \
-      -DGPU_TARGETS=gfx942 \
+      -DGPU_TARGETS=gfx950 \
       .. 
+
+   
 fi
 
-make VERBOSE=0 -j 2>&1 | tee ../yyybuild.log
+make VERBOSE=1 -j 2>&1 | tee ../yyybuild.log
 
 cp src/pybind/libmori_pybinds.so \
    src/application/libmori_application.so \
    src/io/libmori_io.so \
-   /tf/mori_deepep/mori/python/mori
+   /tf/mori/python/mori
 
 popd
+
+if [[ ${full} -eq 1 ]]; then
+  pip3 install -e .
+fi
