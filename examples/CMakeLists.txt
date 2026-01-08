@@ -37,6 +37,13 @@ target_link_libraries(intra_node_benchmark mori_collective MPI::MPI_CXX
 target_include_directories(intra_node_benchmark
                            PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
+add_executable(inter_node_benchmark
+               collective/inter_node/inter_node_benchmark.cpp)
+target_link_libraries(inter_node_benchmark mori_collective mori_shmem
+                      MPI::MPI_CXX hip::host hip::device)
+target_include_directories(inter_node_benchmark
+                           PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
 add_executable(all_gather collective/inter_node/all_gather_example.cpp)
 target_link_libraries(all_gather mori_shmem hip::host hip::device)
 
