@@ -42,7 +42,7 @@ __global__ void packet_rate_kernel(void* srcBuf, void* dstBuf, size_t copy_size,
 
          auto packet = anvil::CreateCopyPacket(srcPtr, dstPtr, copy_size);
 
-         handle.template placePacket(packet, pendingWptr);
+         handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet, pendingWptr);
          srcPtr += copy_size;
          dstPtr += copy_size;
       }
