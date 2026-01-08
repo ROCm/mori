@@ -21,7 +21,4 @@
 // SOFTWARE.
 #pragma once
 
-#include "mori/core/transport/p2p/p2p.hpp"
-#include "mori/core/transport/rdma/rdma.hpp"
-#include "mori/core/transport/sdma/sdma.hpp"
-#include "mori/core/utils.hpp"
+#include "mori/core/transport/sdma/device_primitives.hpp"

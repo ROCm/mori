@@ -29,6 +29,7 @@
 #include "mori/shmem/shmem_device_kernels.hpp"
 #include "mori/shmem/shmem_ibgda_kernels.hpp"
 #include "mori/shmem/shmem_p2p_kernels.hpp"
+#include "mori/shmem/shmem_sdma_kernels.hpp"
 #include "src/shmem/internal.hpp"
 
 namespace mori {
@@ -41,6 +42,8 @@ namespace shmem {
     func<application::TransportType::RDMA>(__VA_ARGS__);                          \
   } else if (transportType == application::TransportType::P2P) {                  \
     func<application::TransportType::P2P>(__VA_ARGS__);                           \
+  } else if (transportType == application::TransportType::SDMA) {                 \
+    func<application::TransportType::SDMA>(__VA_ARGS__);                          \
   } else {                                                                        \
     assert(false);                                                                \
   }
@@ -84,6 +87,11 @@ inline __device__ void ShmemQuietThread(int pe) {
 inline __device__ void ShmemQuietThread(int pe, int qpId) {
   DISPATCH_TRANSPORT_TYPE(ShmemQuietThreadKernel, pe, pe, qpId);
 }
+
+inline __device__ void ShmemQuietThread(int pe, const application::SymmMemObjPtr dest) {
+  ShmemQuietThreadKernel<application::TransportType::SDMA>(pe,dest);
+}
+
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Point-to-Point                                         */

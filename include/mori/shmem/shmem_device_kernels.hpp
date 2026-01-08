@@ -103,5 +103,8 @@ inline __device__ void ShmemQuietThreadKernel(int pe);
 template <application::TransportType>
 inline __device__ void ShmemQuietThreadKernel(int pe, int qpId);
 
+template <application::TransportType>
+inline __device__ void ShmemQuietThreadKernel(int pe, const application::SymmMemObjPtr dest);
+
 }  // namespace shmem
 }  // namespace mori
