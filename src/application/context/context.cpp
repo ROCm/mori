@@ -207,7 +207,7 @@ void Context::InitializePossibleTransports() {
           if(IsSDMAEnabled() && (i != LocalRank()) ){
             transportTypes.push_back(TransportType::SDMA);
 
-	    anvil::EnablePeerAccess(LocalRank()%8, i%8);
+	          anvil::EnablePeerAccess(LocalRank()%8, i%8);
             // Better performance if allocating all 8 queues
             anvil::anvil.connect(LocalRank()%8, i%8, 8);
           }else{

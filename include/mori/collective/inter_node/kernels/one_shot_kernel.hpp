@@ -47,6 +47,7 @@ __global__ void OneShotAllReduceKernel(int myPe, int npes,
   T* __restrict__ dst = reinterpret_cast<T*>(dstMemObj->localPtr);
   T* __restrict__ scratch = reinterpret_cast<T*>(scratchMemObj->localPtr);
   uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
+  int flag_val = 1;
 
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
@@ -78,10 +79,12 @@ __global__ void OneShotAllReduceKernel(int myPe, int npes,
         sendBytes = remaining;
       }
       size_t destByteOffset = static_cast<size_t>(myPe) * bytesPerPeer + threadByteOffset;
-      shmem::ShmemPutMemNbiSignalThread<true>(
-          scratchMemObj, destByteOffset, srcMemObj, threadByteOffset, sendBytes, flagsMemObj,
-          static_cast<size_t>(myPe) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, remotePe);
-      shmem::ShmemQuietThread();
+//    shmem::ShmemPutMemNbiSignalThread<true>(
+//          scratchMemObj, destByteOffset, srcMemObj, threadByteOffset, sendBytes, flagsMemObj,
+//          static_cast<size_t>(myPe) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, remotePe);
+      shmem::ShmemPutMemNbiThreadKernel(scratchMemObj, destByteOffset, srcMemObj, threadByteOffset, sendBytes, remotePe);
+      shmem::ShmemQuietThread(remotePe,scratchMemObj);
+      shmem::ShmemAtomicSizeNonFetchThreadKernel(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8, core::atomicType::AMO_ADD, remotePe);
     }
     __syncthreads();
   }
