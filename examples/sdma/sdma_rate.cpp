@@ -67,7 +67,7 @@ void runExperiment(int srcDeviceId, int dstDeviceId, const ExperimentParams& par
    // 2. Resource Allocation
    //==============================
 
-   int wgSize = params.numOfQueues * warpSize;
+   int wgSize = params.numOfQueues * WARP_SIZE;
    size_t totalNumWarps = params.numOfQueues;
 
    // Allocate signals, one for each warp
