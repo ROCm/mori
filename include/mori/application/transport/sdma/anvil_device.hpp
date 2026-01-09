@@ -1,7 +1,7 @@
 #pragma once
 
 #include <stdint.h> // Required for uint32_t
-
+#include <cassert>
 #include <hip/hip_ext.h>
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>

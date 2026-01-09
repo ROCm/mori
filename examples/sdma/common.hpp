@@ -9,6 +9,8 @@
 #include <string_view>
 #include <vector>
 
+constexpr int WARP_SIZE = 64;
+
 // stdout header fields
 constexpr std::array<std::string_view, 13> headerFields = {
     "Src",   // Src GPU

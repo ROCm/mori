@@ -72,7 +72,7 @@ __global__ void multiQueueSDMATransfer(size_t iteration_id, void* srcBuf, void* 
             timestamp_breakdown->entailPacket_st[packetGlobalIndex] = wall_clock64();
          }
 
-         handle.template placePacket(packet, pendingWptr);
+         handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet, pendingWptr);
 
          if constexpr (TIMESTAMPING_EN)
          {
