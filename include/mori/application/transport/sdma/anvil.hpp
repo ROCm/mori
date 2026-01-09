@@ -5,6 +5,7 @@
 #include "hsakmt/hsakmttypes.h"
 
 #include <array>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>

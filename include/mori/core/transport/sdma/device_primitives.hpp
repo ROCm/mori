@@ -58,7 +58,7 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
       else perq_send_size = copy_size - (queNum-1)*rand_size;
       
       auto packet_d = anvil::CreateCopyPacket(srcPtr, dstPtr, perq_send_size);
-      handle.template placePacket(packet_d, pendingWptr);
+      handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet_d, pendingWptr);
       srcPtr += perq_send_size;
       dstPtr += perq_send_size;
 
@@ -102,7 +102,7 @@ inline __device__ void SdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
    else perq_send_size = copy_size - (queNum -1)*rand_size;
    
    auto packet_d = anvil::CreateCopyPacket(srcPtr, dstPtr, perq_send_size);
-   handle.template placePacket(packet_d, pendingWptr);
+   handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet_d, pendingWptr);
    srcPtr += perq_send_size;
    dstPtr += perq_send_size;
 
