@@ -83,7 +83,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType
       reinterpret_cast<uint4*>(destPtr)[0] = reinterpret_cast<uint4*>(val)[0];
       break;
     default:
-      printf(
+      MORI_PRINTF(
           "Size must be one of [1,2,4,8,16] bytes, got %lu, for arbitrary size, use ShmemPutMemNbi "
           "APIs",
           bytes);
@@ -276,7 +276,7 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::Transpor
           break;
 
         default:
-          printf("Error: Unsupported 4-byte atomicType (%d) in NonFetchThreadKernel.\n", amoType);
+          MORI_PRINTF("Error: Unsupported 4-byte atomicType (%d) in NonFetchThreadKernel.\n", amoType);
           break;
       }
       break;
@@ -330,13 +330,13 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::Transpor
           casLoop64(amoType, argVal);
           break;
         default:
-          printf("Error: Unsupported 8-byte atomicType (%d) in NonFetchThreadKernel.\n", amoType);
+          MORI_PRINTF("Error: Unsupported 8-byte atomicType (%d) in NonFetchThreadKernel.\n", amoType);
           break;
       }
       break;
     }
     default:
-      printf("Error: Unsupported data size (%zu bytes) in NonFetchThreadKernel.\n", bytes);
+      MORI_PRINTF("Error: Unsupported data size (%zu bytes) in NonFetchThreadKernel.\n", bytes);
       break;
   }
 }
@@ -429,9 +429,9 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelImplP2P(const application::S
     } break;
     default:
       if constexpr (sizeof(T) == 4) {
-        printf("Error: Unsupported 4-byte atomicType (%d) in TypeFetchThreadKernel.\n", amoType);
+        MORI_PRINTF("Error: Unsupported 4-byte atomicType (%d) in TypeFetchThreadKernel.\n", amoType);
       } else if constexpr (sizeof(T) == 8) {
-        printf("Error: Unsupported 8-byte atomicType (%d) in TypeFetchThreadKernel.\n", amoType);
+        MORI_PRINTF("Error: Unsupported 8-byte atomicType (%d) in TypeFetchThreadKernel.\n", amoType);
       }
       break;
   }

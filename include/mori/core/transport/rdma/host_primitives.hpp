@@ -69,7 +69,7 @@ template <ProviderType PrvdType>
 static __host__ int PollCq(void* cqAddr, uint32_t cqeNum, uint32_t& consIdx);
 
 template <ProviderType PrvdType>
-static __host__ void UpdateCqDbrRecord(CompletionQueueHandle& cq, void* dbrRecAddr, uint32_t cons_idx);
+static __host__ void UpdateCqDbrRecord(CompletionQueueHandle& cq, uint32_t consIdx);
 
 }  // namespace core
 }  // namespace mori
