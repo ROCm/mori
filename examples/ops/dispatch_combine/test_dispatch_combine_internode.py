@@ -26,7 +26,7 @@ import torch
 import torch.distributed as dist
 import argparse
 
-os.environ["MORI_SHMEM_HEAP_SIZE"] = "4G"
+os.environ["MORI_SHMEM_HEAP_SIZE"] = "6G"
 
 kernel_type_map = {
     "v0": mori.ops.EpDispatchCombineKernelType.InterNode,

@@ -32,6 +32,13 @@
 namespace mori {
 namespace shmem {
 
+// Shmem operation mode
+enum class ShmemMode {
+  Isolation,   // Original mode: each allocation gets its own SymmMemObj
+  StaticHeap,   // single static heap with unified memory space
+  VMHeap   // TODO: implement virtual memory heap
+};
+
 // Configuration for static symmetric heap
 constexpr size_t DEFAULT_SYMMETRIC_HEAP_SIZE = 2ULL * 1024 * 1024 * 1024;  // 2GB default
 
@@ -52,6 +59,7 @@ struct MemoryStates {
   application::SymmMemManager* symmMemMgr{nullptr};
   application::RdmaMemoryRegionManager* mrMgr{nullptr};
 
+  // Static heap mode fields (only used when mode == StaticHeap)
   void* staticHeapBasePtr{nullptr};          // Base address of the static symmetric heap
   size_t staticHeapSize{0};                  // Total size of the static heap
   size_t staticHeapUsed{0};                  // Currently used bytes
@@ -67,6 +75,7 @@ enum ShmemStatesStatus {
 
 struct ShmemStates {
   ShmemStatesStatus status{ShmemStatesStatus::New};
+  ShmemMode mode{ShmemMode::StaticHeap};  // Default to static heap mode
   BootStates* bootStates{nullptr};
   RdmaStates* rdmaStates{nullptr};
   MemoryStates* memoryStates{nullptr};
@@ -118,6 +127,19 @@ struct RemoteAddrInfo {
 
 inline __device__ RemoteAddrInfo ShmemAddrToRemoteAddr(const void* localAddr, int pe) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  uintptr_t localAddrInt = reinterpret_cast<uintptr_t>(localAddr);
+
+  if (globalGpuStates->heapObj == nullptr) {
+    assert(false);
+    return RemoteAddrInfo();
+  }
+
+  // Check if address is in symmetric heap
+  if (localAddrInt < globalGpuStates->heapBaseAddr ||
+      localAddrInt >= globalGpuStates->heapEndAddr) {
+    assert(false);
+    return RemoteAddrInfo();
+  }
 
   // Calculate offset within the symmetric heap
   size_t offset = reinterpret_cast<const char*>(localAddr) -
