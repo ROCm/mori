@@ -288,8 +288,11 @@ SdmaQueue* AnvilLib::getSdmaQueue(int srcDeviceId, int dstDeviceId, int channel_
 
 AnvilLib& AnvilLib::getInstance()
 {
-   static AnvilLib instance;
-   return instance;
+   static AnvilLib *instance;
+   if (instance == nullptr) {
+     instance = new AnvilLib();
+   }
+   return *instance;
 }
 
 int AnvilLib::getOamId(int deviceId)
