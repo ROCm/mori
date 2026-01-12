@@ -37,5 +37,8 @@ __global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> a
 template <typename T>
 __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args);
 
+template <typename T>
+__global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args);
+
 }  // namespace moe
 }  // namespace mori

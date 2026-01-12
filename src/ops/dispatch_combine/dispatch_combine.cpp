@@ -317,10 +317,12 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
         if (kernelType == KernelType::InterNode) {
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
-        } else if ((kernelType == KernelType::InterNodeV1) ||
-                   (kernelType == KernelType::InterNodeV1LL)) {
+        } else if (kernelType == KernelType::InterNodeV1) {
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
+        } else if (kernelType == KernelType::InterNodeV1LL) {
+          assert(config.useExternalInpBuffer);
+          EpCombineInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           if (config.useExternalInpBuffer) {
             // UseP2PRead=false: does not support zero-copy and provides better bandwidth and lower latency

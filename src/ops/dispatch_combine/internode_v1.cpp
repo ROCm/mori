@@ -551,7 +551,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
 }
 
 template <typename T>
-inline __device__ void DispatchInterNodeRecvOptimV1(EpDispatchCombineArgs<T>& args) {
+inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
 
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
@@ -709,11 +709,9 @@ template <typename T>
 __global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   if (blockId < config.rdmaBlockNum) {
-    // v1::DispatchInterNodeSend<T, false>(args);
     v1::DispatchInterNodeLLSend<T>(args);
-    // v1::DispatchInterNodeRecv(args);
     // TODO: figure out why when num of tokens is not multiples of 64, perf is degraded severely
-    v1::DispatchInterNodeRecvOptimV1(args);
+    v1::DispatchInterNodeLLRecv(args);
   } else {
     v1::DispatchIntraNode(args);
   }
@@ -818,7 +816,7 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
 }
 
 template <typename T>
-inline __device__ void CombineIntraNodeOptim(EpDispatchCombineArgs<T>& args) {
+inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
 
   // Distribute tokens evenly to all blocks
@@ -1005,25 +1003,6 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   finishedWarp = __shfl(finishedWarp, 0);
   barrierFlag = __shfl(barrierFlag, 0);
 
-
-  // for (int i = globalWarpId; i < (nNodes-1)*maxChunkNum; i += config.rdmaBlockNum*warpNum) {
-  //   int k = i % maxChunkNum;
-  //   int node = (myNode + 1 + i/maxChunkNum) % nNodes;
-  //   int proxyPe = node * config.gpuPerNode + (config.rank % config.gpuPerNode);
-  //   int qpId = k % config.numQpPerPe;
-  //   uint64_t thisChunkTokenNum = chunkFlag[node*maxChunkNum + k] - 1;
-  //   if (laneId == 0)
-  //   core::AtomicStoreSeqCstSystem(&chunkFlag[node*maxChunkNum + k], uint64_t{0});
-  //   if (thisChunkTokenNum<=0) continue;
-    // shmem::ShmemPutTypeNbiWarp<uint8_t>(
-    //     args.shmemStagingTokMemObj,
-    //     ((myNode + nNodes) * config.MaxNumTokensToRecvPerRank() + k*warpSize) *
-    //         combXferBytes,
-    //     args.shmemStagingTokMemObj,
-    //     (node * config.MaxNumTokensToRecvPerRank() + k*warpSize) * combXferBytes,
-    //     thisChunkTokenNum * combXferBytes, proxyPe, qpId);
-  // }
-
   if ((finishedWarp + 1) == (config.rdmaBlockNum * warpNum)) {
     if ((laneId < nNodes) &&
         (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
@@ -1044,15 +1023,15 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
              (barrierFlag * config.numQpPerPe)) {
       }
     }
-    // if (laneId < nNodes) {
-    //   core::AtomicStoreSeqCstSystem(
-    //       args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});
-    // }
+    if (laneId < nNodes) {
+      core::AtomicStoreSeqCstSystem(
+          args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});
+    }
   }
 }
 
 template <typename T>
-inline __device__ void CombineInterNodeOptim(EpDispatchCombineArgs<T>& args) {
+inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
 
   constexpr int numRecvBlock = 8;
@@ -1248,11 +1227,30 @@ __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
 
   v1::CombineSync(args);
   if (blockId < config.rdmaBlockNum) {
-    // v1::CombineInterNode(args);
-    v1::CombineInterNodeOptim(args);
+    v1::CombineInterNode(args);
   } else {
-    // v1::CombineIntraNode(args);
-    v1::CombineIntraNodeOptim(args);
+    v1::CombineIntraNode(args);
+  }
+  v1::CombineAll(args);
+
+  if (laneId == 0) {
+    args.totalRecvTokenNum[0] = 0;
+  }
+
+  if (laneId < nNodes) {
+    args.blockFlagCounter[laneId] = 0;
+  }
+}
+
+template <typename T>
+__global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+
+  v1::CombineSync(args);
+  if (blockId < config.rdmaBlockNum) {
+    v1::CombineInterNodeLL(args);
+  } else {
+    v1::CombineIntraNodeLL(args);
   }
   v1::CombineAll(args);
 
@@ -1304,6 +1302,19 @@ template __global__ void EpCombineInterNodeV1Kernel<__hip_fp8_e4m3>(
     EpDispatchCombineArgs<__hip_fp8_e4m3> args);
 #endif
 template __global__ void EpCombineInterNodeV1Kernel<float>(EpDispatchCombineArgs<float> args);
+
+template __global__ void EpCombineInterNodeV1KernelLowLatency<hip_bfloat16>(
+    EpDispatchCombineArgs<hip_bfloat16> args);
+#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
+template __global__ void EpCombineInterNodeV1KernelLowLatency<__hip_fp8_e4m3_fnuz>(
+    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
+#endif
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+template __global__ void EpCombineInterNodeV1KernelLowLatency<__hip_fp8_e4m3>(
+    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
+#endif
+template __global__ void EpCombineInterNodeV1KernelLowLatency<float>(EpDispatchCombineArgs<float> args);
+
 
 }  // namespace moe
 }  // namespace mori
