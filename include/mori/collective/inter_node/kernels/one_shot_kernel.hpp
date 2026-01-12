@@ -30,15 +30,13 @@
 namespace mori {
 namespace collective {
 
-// One-shot all-reduce: single phase.
-// Every GPU reads the full buffer from all peers, accumulates locally, and writes the result.
 template <typename T>
-__global__ void OneShotAllReduceKernel(int myPe, int npes,
-                                       const application::SymmMemObjPtr srcMemObj,
-                                       const application::SymmMemObjPtr dstMemObj,
-                                       const application::SymmMemObjPtr scratchMemObj,
-                                       const application::SymmMemObjPtr flagsMemObj,
-                                       size_t elementCount) {
+__global__ void OneShotAllReduceKernelSingleBlock(int myPe, int npes,
+                                                  const application::SymmMemObjPtr srcMemObj,
+                                                  const application::SymmMemObjPtr dstMemObj,
+                                                  const application::SymmMemObjPtr scratchMemObj,
+                                                  const application::SymmMemObjPtr flagsMemObj,
+                                                  size_t elementCount, uint64_t epoch) {
   if (elementCount == 0 || npes <= 0) {
     return;
   }
@@ -48,71 +46,90 @@ __global__ void OneShotAllReduceKernel(int myPe, int npes,
   T* __restrict__ scratch = reinterpret_cast<T*>(scratchMemObj->localPtr);
   uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
 
-  const size_t threadLinearId =
-      static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
-  const size_t threadsPerGrid = static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
-  const size_t stride = threadsPerGrid > 0 ? threadsPerGrid : 1;
+  const int tid = threadIdx.x;
+  const int numThreads = blockDim.x;
+  const size_t totalBytes = elementCount * sizeof(T);
 
-  const size_t bytesPerElement = sizeof(T);
-  const size_t bytesPerPeer = elementCount * bytesPerElement;
-  const size_t elemsPerPeer = elementCount;
+  if (npes == 1) {
+    for (size_t idx = tid; idx < elementCount; idx += numThreads) {
+      dst[idx] = src[idx];
+    }
+    return;
+  }
 
-  for (size_t idx = threadLinearId; idx < elementCount; idx += stride) {
-    dst[idx] = src[idx];
+  const size_t bytesPerThread = (totalBytes + numThreads - 1) / numThreads;
+  const size_t myByteStart = static_cast<size_t>(tid) * bytesPerThread;
+
+  if (myByteStart < totalBytes) {
+    size_t myByteEnd = myByteStart + bytesPerThread;
+    if (myByteEnd > totalBytes) {
+      myByteEnd = totalBytes;
+    }
+    const size_t myBytes = myByteEnd - myByteStart;
+
+    for (int remotePe = 0; remotePe < npes; ++remotePe) {
+      if (remotePe == myPe) {
+        continue;
+      }
+      size_t destByteOffset = static_cast<size_t>(myPe) * totalBytes + myByteStart;
+      shmem::ShmemPutMemNbiThread(scratchMemObj, destByteOffset, srcMemObj, myByteStart, myBytes,
+                                  remotePe);
+    }
+  }
+
+  __threadfence_system();
+  shmem::ShmemQuietThread();
+  __syncthreads();
+
+  if (tid == 0) {
+    for (int remotePe = 0; remotePe < npes; ++remotePe) {
+      if (remotePe == myPe) {
+        continue;
+      }
+      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(flagsMemObj,
+                                                     static_cast<size_t>(myPe) * sizeof(uint64_t),
+                                                     epoch, core::atomicType::AMO_SET, remotePe);
+    }
   }
   __syncthreads();
 
-  const size_t bytesPerThread =
-      (bytesPerPeer + stride - 1) / stride;  // ceil division to cover all bytes
-
-  for (int remotePe = 0; remotePe < npes; ++remotePe) {
-    if (remotePe == myPe) {
-      continue;
-    }
-
-    size_t threadByteOffset = bytesPerThread * threadLinearId;
-    if (threadByteOffset < bytesPerPeer) {
-      size_t sendBytes = bytesPerThread;
-      size_t remaining = bytesPerPeer - threadByteOffset;
-      if (sendBytes > remaining) {
-        sendBytes = remaining;
-      }
-      size_t destByteOffset = static_cast<size_t>(myPe) * bytesPerPeer + threadByteOffset;
-      shmem::ShmemPutMemNbiSignalThread<true>(
-          scratchMemObj, destByteOffset, srcMemObj, threadByteOffset, sendBytes, flagsMemObj,
-          static_cast<size_t>(myPe) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, remotePe);
-      shmem::ShmemQuietThread();
-    }
-    __syncthreads();
-  }
-
-  for (int sender = 0; sender < npes; ++sender) {
+  for (int sender = tid; sender < npes; sender += numThreads) {
     if (sender == myPe) {
       continue;
     }
 
-    if (threadLinearId == 0) {
-      int spinCount = 0;
-      while (core::AtomicLoadRelaxed(flags + sender) == 0) {
-        ++spinCount;
-        if (spinCount > 10000000) {
-          printf("PE %d: Timeout waiting for data from peer %d\n", myPe, sender);
-          break;
-        }
+    const int maxSpinCount = 100000000;
+    int spinCount = 0;
+    uint64_t flagValue;
+
+    do {
+      flagValue = core::AtomicLoadSeqCstSystem(flags + sender);
+      if (flagValue >= epoch) {
+        break;
       }
-    }
-    __syncthreads();
+      spinCount++;
+      if (spinCount > maxSpinCount) {
+        printf("PE %d: Timeout waiting for data from peer %d (epoch %lu, got %lu)\n", myPe, sender,
+               epoch, flagValue);
+        break;
+      }
+    } while (true);
+  }
 
-    size_t senderBase = static_cast<size_t>(sender) * elemsPerPeer;
-    for (size_t idx = threadLinearId; idx < elementCount; idx += stride) {
-      dst[idx] += scratch[senderBase + idx];
-    }
-    __syncthreads();
+  __syncthreads();
+  __threadfence_system();
 
-    if (threadLinearId == 0) {
-      flags[sender] = 0;
+  for (size_t idx = tid; idx < elementCount; idx += numThreads) {
+    T acc = src[idx];
+
+    for (int sender = 0; sender < npes; ++sender) {
+      if (sender == myPe) {
+        continue;
+      }
+      acc += scratch[static_cast<size_t>(sender) * elementCount + idx];
     }
-    __syncthreads();
+
+    dst[idx] = acc;
   }
 }
 

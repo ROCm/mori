@@ -1,13 +1,18 @@
-add_executable(sdma_bw sdma/sdma_bw.cpp sdma/common.cpp sdma/utils.cpp sdma/sdma_bw_kernel.cpp utils/args_parser.cpp)
+add_executable(sdma_bw sdma/sdma_bw.cpp sdma/common.cpp sdma/utils.cpp
+                       sdma/sdma_bw_kernel.cpp utils/args_parser.cpp)
 target_include_directories(sdma_bw PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
 target_link_libraries(sdma_bw mori_application hip::host hip::device)
 
-add_executable(sdma_rate sdma/sdma_rate.cpp sdma/common.cpp sdma/utils.cpp sdma/sdma_rate_kernel.cpp utils/args_parser.cpp)
+add_executable(sdma_rate sdma/sdma_rate.cpp sdma/common.cpp sdma/utils.cpp
+                         sdma/sdma_rate_kernel.cpp utils/args_parser.cpp)
 target_include_directories(sdma_rate PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
 target_link_libraries(sdma_rate mori_application hip::host hip::device)
 
-add_executable(sdma_latency sdma/sdma_latency.cpp sdma/common.cpp sdma/utils.cpp sdma/sdma_latency_kernel.cpp utils/args_parser.cpp)
-target_include_directories(sdma_latency PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
+add_executable(
+  sdma_latency sdma/sdma_latency.cpp sdma/common.cpp sdma/utils.cpp
+               sdma/sdma_latency_kernel.cpp utils/args_parser.cpp)
+target_include_directories(sdma_latency
+                           PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
 target_link_libraries(sdma_latency mori_application hip::host hip::device)
 
 # Find MPI package (required by allreduce_example)
@@ -47,6 +52,13 @@ add_executable(intra_node_benchmark
 target_link_libraries(intra_node_benchmark mori_collective MPI::MPI_CXX
                       hip::host hip::device)
 target_include_directories(intra_node_benchmark
+                           PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
+add_executable(inter_node_benchmark
+               collective/inter_node/inter_node_benchmark.cpp)
+target_link_libraries(inter_node_benchmark mori_collective mori_shmem
+                      MPI::MPI_CXX hip::host hip::device)
+target_include_directories(inter_node_benchmark
                            PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
 add_executable(all_gather collective/inter_node/all_gather_example.cpp)

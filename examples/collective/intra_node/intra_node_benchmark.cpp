@@ -31,6 +31,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <numeric>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -200,6 +201,9 @@ int main(int argc, char** argv) {
 
   MPI_Barrier(MPI_COMM_WORLD);
 
+  std::vector<double> alg_bw_results;
+  std::vector<double> bus_bw_results;
+
   for (size_t bytes = args.min_bytes; bytes <= args.max_bytes; bytes *= args.step_factor) {
     size_t count = bytes / sizeof(T);
     if (count == 0) continue;
@@ -264,12 +268,35 @@ int main(int argc, char** argv) {
       double alg_bw = (double)bytes / (avg_time_us * 1e-6) / 1e9;  // GB/s
       double bus_bw = alg_bw * estimateBusFactor(bytes, num_ranks);
 
+      alg_bw_results.push_back(alg_bw);
+      bus_bw_results.push_back(bus_bw);
+
       std::cout << std::setw(15) << formatBytes(bytes) << std::setw(15) << count << std::setw(10)
                 << "float" << std::setw(10) << "sum" << std::setw(15) << std::fixed
                 << std::setprecision(2) << avg_time_us << std::setw(15) << std::fixed
                 << std::setprecision(2) << alg_bw << std::setw(15) << std::fixed
                 << std::setprecision(2) << bus_bw << std::endl;
     }
+  }
+
+  if (rank == 0 && !alg_bw_results.empty()) {
+    double max_alg_bw = *std::max_element(alg_bw_results.begin(), alg_bw_results.end());
+    double avg_alg_bw =
+        std::accumulate(alg_bw_results.begin(), alg_bw_results.end(), 0.0) / alg_bw_results.size();
+    double max_bus_bw = *std::max_element(bus_bw_results.begin(), bus_bw_results.end());
+    double avg_bus_bw =
+        std::accumulate(bus_bw_results.begin(), bus_bw_results.end(), 0.0) / bus_bw_results.size();
+
+    std::cout << std::endl;
+    std::cout << "# Summary Statistics" << std::endl;
+    std::cout << "# Max Algo BW: " << std::fixed << std::setprecision(2) << max_alg_bw << " GB/s"
+              << std::endl;
+    std::cout << "# Avg Algo BW: " << std::fixed << std::setprecision(2) << avg_alg_bw << " GB/s"
+              << std::endl;
+    std::cout << "# Max Bus BW:  " << std::fixed << std::setprecision(2) << max_bus_bw << " GB/s"
+              << std::endl;
+    std::cout << "# Avg Bus BW:  " << std::fixed << std::setprecision(2) << avg_bus_bw << " GB/s"
+              << std::endl;
   }
 
   HIP_CHECK(hipFree(d_in));

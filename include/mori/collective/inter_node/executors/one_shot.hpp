@@ -40,14 +40,34 @@ class OneShotAllReduceExecutor : public AllReduceExecutor<T> {
  public:
   OneShotAllReduceExecutor(int num_ranks, int rank,
                            const AllReduceConfig& config = AllReduceConfig());
-  ~OneShotAllReduceExecutor() override = default;
+  ~OneShotAllReduceExecutor() override;
 
   int Execute(T* input, T* output, size_t count, hipStream_t stream) override;
 
+  int RegisterBuffers(T* input, T* output, size_t maxCount);
+  void DeregisterBuffers();
+
  private:
+  int InitializeScratchBuffers(size_t maxBytes, hipStream_t stream);
+  void FinalizeScratchBuffers();
+
   int numRanks;
   int rank;
   AllReduceConfig config;
+
+  void* scratchBuffer{nullptr};
+  void* flagsBuffer{nullptr};
+  application::SymmMemObjPtr scratchMemObj;
+  application::SymmMemObjPtr flagsMemObj;
+  size_t currentMaxBytes{0};
+
+  application::SymmMemObjPtr registeredInputMemObj;
+  application::SymmMemObjPtr registeredOutputMemObj;
+  T* registeredInput{nullptr};
+  T* registeredOutput{nullptr};
+  size_t registeredMaxCount{0};
+
+  uint64_t epoch{0};
 };
 
 template <typename T>
@@ -56,69 +76,193 @@ OneShotAllReduceExecutor<T>::OneShotAllReduceExecutor(int num_ranks, int rank,
     : numRanks(num_ranks), rank(rank), config(config) {}
 
 template <typename T>
+OneShotAllReduceExecutor<T>::~OneShotAllReduceExecutor() {
+  DeregisterBuffers();
+  FinalizeScratchBuffers();
+}
+
+template <typename T>
+int OneShotAllReduceExecutor<T>::InitializeScratchBuffers(size_t maxBytes, hipStream_t stream) {
+  if (maxBytes <= currentMaxBytes && scratchBuffer != nullptr && flagsBuffer != nullptr) {
+    return 0;
+  }
+
+  FinalizeScratchBuffers();
+
+  const size_t scratchBytes = maxBytes * static_cast<size_t>(numRanks);
+  scratchBuffer = shmem::ShmemMalloc(scratchBytes);
+  if (scratchBuffer == nullptr) {
+    return -1;
+  }
+  scratchMemObj = shmem::ShmemQueryMemObjPtr(scratchBuffer);
+  if (!scratchMemObj.IsValid()) {
+    shmem::ShmemFree(scratchBuffer);
+    scratchBuffer = nullptr;
+    return -1;
+  }
+
+  const size_t flagsBytes = static_cast<size_t>(numRanks) * sizeof(uint64_t);
+  flagsBuffer = shmem::ShmemMalloc(flagsBytes);
+  if (flagsBuffer == nullptr) {
+    shmem::ShmemFree(scratchBuffer);
+    scratchBuffer = nullptr;
+    return -1;
+  }
+  flagsMemObj = shmem::ShmemQueryMemObjPtr(flagsBuffer);
+  if (!flagsMemObj.IsValid()) {
+    shmem::ShmemFree(flagsBuffer);
+    shmem::ShmemFree(scratchBuffer);
+    flagsBuffer = nullptr;
+    scratchBuffer = nullptr;
+    return -1;
+  }
+
+  hipError_t err = hipMemsetAsync(flagsBuffer, 0, flagsBytes, stream);
+  if (err != hipSuccess) {
+    shmem::ShmemFree(flagsBuffer);
+    shmem::ShmemFree(scratchBuffer);
+    flagsBuffer = nullptr;
+    scratchBuffer = nullptr;
+    return -1;
+  }
+  hipStreamSynchronize(stream);
+
+  currentMaxBytes = maxBytes;
+  return 0;
+}
+
+template <typename T>
+void OneShotAllReduceExecutor<T>::FinalizeScratchBuffers() {
+  hipDeviceSynchronize();
+
+  if (flagsBuffer) {
+    shmem::ShmemFree(flagsBuffer);
+    flagsBuffer = nullptr;
+  }
+  if (scratchBuffer) {
+    shmem::ShmemFree(scratchBuffer);
+    scratchBuffer = nullptr;
+  }
+  currentMaxBytes = 0;
+  flagsMemObj = {};
+  scratchMemObj = {};
+}
+
+template <typename T>
+int OneShotAllReduceExecutor<T>::RegisterBuffers(T* input, T* output, size_t maxCount) {
+  DeregisterBuffers();
+
+  const size_t totalBytes = maxCount * sizeof(T);
+  registeredInputMemObj = shmem::ShmemSymmetricRegister(static_cast<void*>(input), totalBytes);
+  if (!registeredInputMemObj.IsValid()) {
+    return -1;
+  }
+
+  if (input == output) {
+    registeredOutputMemObj = registeredInputMemObj;
+  } else {
+    registeredOutputMemObj = shmem::ShmemSymmetricRegister(static_cast<void*>(output), totalBytes);
+    if (!registeredOutputMemObj.IsValid()) {
+      shmem::ShmemSymmetricDeregister(input, totalBytes);
+      registeredInputMemObj = {};
+      return -1;
+    }
+  }
+
+  registeredInput = input;
+  registeredOutput = output;
+  registeredMaxCount = maxCount;
+  return 0;
+}
+
+template <typename T>
+void OneShotAllReduceExecutor<T>::DeregisterBuffers() {
+  if (registeredInput && registeredInputMemObj.IsValid()) {
+    shmem::ShmemSymmetricDeregister(registeredInput, registeredMaxCount * sizeof(T));
+  }
+  if (registeredOutput && registeredOutput != registeredInput && registeredOutputMemObj.IsValid()) {
+    shmem::ShmemSymmetricDeregister(registeredOutput, registeredMaxCount * sizeof(T));
+  }
+  registeredInputMemObj = {};
+  registeredOutputMemObj = {};
+  registeredInput = nullptr;
+  registeredOutput = nullptr;
+  registeredMaxCount = 0;
+}
+
+template <typename T>
 int OneShotAllReduceExecutor<T>::Execute(T* input, T* output, size_t count, hipStream_t stream) {
   if (count == 0) {
     return 0;
   }
 
   const size_t totalBytes = count * sizeof(T);
-  const size_t scratchBytes = totalBytes * static_cast<size_t>(numRanks);
 
-  application::SymmMemObjPtr srcMemObj =
-      shmem::ShmemSymmetricRegister(static_cast<void*>(input), totalBytes);
-  if (!srcMemObj.IsValid()) {
+  if (InitializeScratchBuffers(totalBytes, stream) != 0) {
     return -1;
   }
 
+  application::SymmMemObjPtr srcMemObj;
   application::SymmMemObjPtr dstMemObj;
+  bool needTempInputReg = false;
+  bool needTempOutputReg = false;
+
+  if (registeredInput == input && registeredInputMemObj.IsValid() && count <= registeredMaxCount) {
+    srcMemObj = registeredInputMemObj;
+  } else {
+    srcMemObj = shmem::ShmemSymmetricRegister(static_cast<void*>(input), totalBytes);
+    if (!srcMemObj.IsValid()) {
+      return -1;
+    }
+    needTempInputReg = true;
+  }
+
   if (input == output) {
     dstMemObj = srcMemObj;
+  } else if (registeredOutput == output && registeredOutputMemObj.IsValid() &&
+             count <= registeredMaxCount) {
+    dstMemObj = registeredOutputMemObj;
   } else {
     dstMemObj = shmem::ShmemSymmetricRegister(static_cast<void*>(output), totalBytes);
     if (!dstMemObj.IsValid()) {
+      if (needTempInputReg) {
+        shmem::ShmemSymmetricDeregister(input, totalBytes);
+      }
       return -1;
     }
+    needTempOutputReg = true;
   }
 
-  void* scratchBuffer = shmem::ShmemMalloc(scratchBytes);
-  if (scratchBuffer == nullptr) {
-    return -1;
-  }
-  application::SymmMemObjPtr scratchMemObj = shmem::ShmemQueryMemObjPtr(scratchBuffer);
-  if (!scratchMemObj.IsValid()) {
-    shmem::ShmemFree(scratchBuffer);
-    return -1;
-  }
+  epoch++;
 
-  const size_t flagsBytes = static_cast<size_t>(numRanks) * sizeof(uint64_t);
-  void* flagsBuffer = shmem::ShmemMalloc(flagsBytes);
-  if (flagsBuffer == nullptr) {
-    shmem::ShmemFree(scratchBuffer);
-    return -1;
-  }
-  std::memset(flagsBuffer, 0, flagsBytes);
-  application::SymmMemObjPtr flagsMemObj = shmem::ShmemQueryMemObjPtr(flagsBuffer);
-  if (!flagsMemObj.IsValid()) {
-    shmem::ShmemFree(flagsBuffer);
-    shmem::ShmemFree(scratchBuffer);
-    return -1;
-  }
+  const int threadsPerBlock = config.threadsPerBlock > 0 ? config.threadsPerBlock : 256;
 
-  const int threadsPerBlock = config.threadsPerBlock > 0 ? config.threadsPerBlock : 1;
-  int blocks = static_cast<int>((count + threadsPerBlock - 1) / threadsPerBlock);
-  if (blocks <= 0) {
-    blocks = 1;
-  }
-  if (config.maxBlocks > 0 && blocks > config.maxBlocks) {
-    blocks = config.maxBlocks;
-  }
+  OneShotAllReduceKernelSingleBlock<T><<<1, threadsPerBlock, 0, stream>>>(
+      rank, numRanks, srcMemObj, dstMemObj, scratchMemObj, flagsMemObj, count, epoch);
 
-  OneShotAllReduceKernel<T><<<blocks, threadsPerBlock, 0, stream>>>(
-      rank, numRanks, srcMemObj, dstMemObj, scratchMemObj, flagsMemObj, count);
   hipError_t kernelStatus = hipGetLastError();
-  shmem::ShmemFree(scratchBuffer);
-  shmem::ShmemFree(flagsBuffer);
-  HIP_RUNTIME_CHECK(kernelStatus);
+  if (kernelStatus != hipSuccess) {
+    if (needTempInputReg || needTempOutputReg) {
+      hipStreamSynchronize(stream);
+      if (needTempInputReg) {
+        shmem::ShmemSymmetricDeregister(input, totalBytes);
+      }
+      if (needTempOutputReg && input != output) {
+        shmem::ShmemSymmetricDeregister(output, totalBytes);
+      }
+    }
+    return -1;
+  }
+
+  if (needTempInputReg || needTempOutputReg) {
+    hipStreamSynchronize(stream);
+    if (needTempInputReg) {
+      shmem::ShmemSymmetricDeregister(input, totalBytes);
+    }
+    if (needTempOutputReg && input != output) {
+      shmem::ShmemSymmetricDeregister(output, totalBytes);
+    }
+  }
 
   return 0;
 }
