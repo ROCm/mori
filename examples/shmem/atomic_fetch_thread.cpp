@@ -168,22 +168,13 @@ void testAtomicFetchThread() {
     printf("=================================================================\n");
   }
 
-  if (myPe == 0) {
-    printf("=================================================================\n");
-    printf("Testing both Legacy and Pure Address APIs (Atomic Fetch)\n");
-    printf("=================================================================\n");
-  }
-
   void* buff = ShmemMalloc(buffSize);
   SymmMemObjPtr buffObj = ShmemQueryMemObjPtr(buff);
   assert(buffObj.IsValid());
 
   // Run atomic fetch operations for different types
   for (int iteration = 0; iteration < 3; iteration++) {
-  // Run atomic fetch operations for different types
-  for (int iteration = 0; iteration < 3; iteration++) {
     if (myPe == 0) {
-      printf("\n========== Iteration %d ==========\n", iteration + 1);
       printf("\n========== Iteration %d ==========\n", iteration + 1);
     }
 
@@ -534,12 +525,6 @@ void testAtomicFetchThread() {
       printf("\nIteration %d completed successfully!\n", iteration + 1);
     }
     sleep(1);
-  }
-
-  if (myPe == 0) {
-    printf("\n=================================================================\n");
-    printf("All Atomic Fetch tests completed!\n");
-    printf("=================================================================\n");
   }
 
   if (myPe == 0) {

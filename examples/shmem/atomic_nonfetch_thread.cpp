@@ -198,22 +198,13 @@ void testAtomicNonFetchThread() {
     printf("=================================================================\n");
   }
 
-  if (myPe == 0) {
-    printf("=================================================================\n");
-    printf("Testing both Legacy and Pure Address APIs (Atomic NonFetch)\n");
-    printf("=================================================================\n");
-  }
-
   void* buff = ShmemExtMallocWithFlags(buffSize, hipDeviceMallocUncached);
   SymmMemObjPtr buffObj = ShmemQueryMemObjPtr(buff);
   assert(buffObj.IsValid());
 
   // Run atomic operations for different types
   for (int iteration = 0; iteration < 3; iteration++) {
-  // Run atomic operations for different types
-  for (int iteration = 0; iteration < 3; iteration++) {
     if (myPe == 0) {
-      printf("\n========== Iteration %d ==========\n", iteration + 1);
       printf("\n========== Iteration %d ==========\n", iteration + 1);
     }
 
@@ -564,12 +555,6 @@ void testAtomicNonFetchThread() {
       printf("\nIteration %d completed successfully!\n", iteration + 1);
     }
     sleep(1);
-  }
-
-  if (myPe == 0) {
-    printf("\n=================================================================\n");
-    printf("All Atomic NonFetch tests completed!\n");
-    printf("=================================================================\n");
   }
 
   if (myPe == 0) {
