@@ -25,12 +25,15 @@ import os
 import torch
 import torch.distributed as dist
 import argparse
+import time
+from tqdm import tqdm
 
 os.environ["MORI_SHMEM_HEAP_SIZE"] = "6G"
 
 kernel_type_map = {
     "v0": mori.ops.EpDispatchCombineKernelType.InterNode,
     "v1": mori.ops.EpDispatchCombineKernelType.InterNodeV1,
+    "v1_ll": mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
 }
 
 
@@ -42,6 +45,7 @@ class EpDispatchCombineTestCase:
         world_size,
         max_tokens,
         kernel_type,
+        num_qp,
         dtype=torch.bfloat16,
     ):
         self.rank = rank
@@ -56,14 +60,14 @@ class EpDispatchCombineTestCase:
             scale_type_size=4,
             max_num_inp_token_per_rank=max_tokens,
             num_experts_per_rank=16,
-            # num_experts_per_rank=256 // world_size,
             num_experts_per_token=8,
-            warp_num_per_block=16,
-            block_num=80,
+            warp_num_per_block=8,
+            block_num=64,
             max_token_type_size=2,
             kernel_type=kernel_type_map[kernel_type],
             gpu_per_node=self.gpu_per_node,
-            rdma_block_num=64,
+            rdma_block_num=32,
+            num_qp_per_pe=num_qp,
         )
 
     def setup(self):
@@ -72,10 +76,9 @@ class EpDispatchCombineTestCase:
         self.device = torch.device("cuda", local_rank)
 
         dist.init_process_group(
-            backend="cpu:gloo,cuda:nccl",
+            backend="cpu:gloo",
             rank=self.rank,
             world_size=self.world_size,
-            device_id=self.device,
         )
 
         print("init process group done")
@@ -89,8 +92,7 @@ class EpDispatchCombineTestCase:
         print(f"I'm pe {mori.shmem.shmem_mype()} in {mori.shmem.shmem_npes()} pes")
 
         self.rng = torch.Generator(device=self.device)
-        # self.rng.manual_seed(int(time.time()) + self.rank)
-        self.rng.manual_seed(3210)
+        self.rng.manual_seed(999)
 
     def cleanup(self):
         mori.shmem.shmem_finalize()
@@ -142,26 +144,25 @@ class EpDispatchCombineTestCase:
                 device=self.device,
             )
 
-        # gen indices
+        # gen indices - vectorized version for speed
+        num_total_experts = self.config.num_experts_per_rank * self.config.world_size
         all_rank_indices = []
         for r in range(self.world_size):
-            indices = torch.empty(
-                num_token[r],
-                self.config.num_experts_per_token,
-                dtype=torch.int64,
-                # device=self.device,
+            num_tok = num_token[r].item()
+            # Generate random floats and use argsort to get permutations
+            # This is much faster than calling randperm in a loop
+            random_vals = torch.rand(
+                num_tok,
+                num_total_experts,
+                generator=self.rng,
+                device=self.device,
             )
-            for i in range(num_token[r]):
-                perm = torch.randperm(
-                    self.config.num_experts_per_rank * self.config.world_size,
-                    generator=self.rng,
-                    device=self.device,
-                )
-                indices[i] = perm[: self.config.num_experts_per_token]
-            all_rank_indices.append(indices.to(torch.int32).to(self.device))
+            # argsort gives us a random permutation, take first K columns
+            indices = torch.argsort(random_vals, dim=1)[:, : self.config.num_experts_per_token]
+            all_rank_indices.append(indices.to(torch.int32))
 
-        num_total_experts = self.config.num_experts_per_rank * self.config.world_size
-        num_nodes = self.config.world_size // self.config.gpu_per_node
+        # num_total_experts = self.config.num_experts_per_rank * self.config.world_size
+        # num_nodes = self.config.world_size // self.config.gpu_per_node
 
         # even_indices = (
         #     torch.arange(
@@ -189,7 +190,7 @@ class EpDispatchCombineTestCase:
             for r in range(self.world_size)
         ]
 
-        # gen weights
+        # gen scales
         all_rank_scales = [
             torch.rand(
                 num_token[r],
@@ -280,7 +281,6 @@ class EpDispatchCombineTestCase:
             all_rank_weights,
             all_rank_scales,
         ) = test_data
-        dist.barrier()
 
         (
             dispatch_output,
@@ -291,14 +291,12 @@ class EpDispatchCombineTestCase:
         ) = op.dispatch(
             all_rank_input[self.rank],
             all_rank_weights[self.rank],
-            # None,
             all_rank_scales[self.rank],
             all_rank_indices[self.rank],
             block_num=self.config.block_num,
-            warp_per_block=16,
+            # warp_per_block=16,
         )
         torch.cuda.synchronize()
-        dist.barrier()
 
         rank_counts, _, _ = self.count_token_num(all_rank_indices)
 
@@ -335,24 +333,19 @@ class EpDispatchCombineTestCase:
             assert torch.equal(
                 dispatch_indices[i], all_rank_indices[src_pe][src_tok_id]
             )
-            # TODO: test output scales
+            assert torch.equal(dispatch_scales[i], all_rank_scales[src_pe][src_tok_id])
 
         if self.rank % self.gpu_per_node == 0:
             print(f"Node {self.rank // self.gpu_per_node} Dispatch Pass")
-
-        torch.cuda.synchronize()
-        dist.barrier()
 
         combine_output, combine_output_weight = op.combine(
             dispatch_output,
             dispatch_weights,
             all_rank_indices[self.rank],
             block_num=self.config.block_num,
-            warp_per_block=16,
+            # warp_per_block=16,
         )
         torch.cuda.synchronize()
-        dist.barrier()
-
         for i in range(all_rank_num_token[self.rank]):
             pes = [
                 (idx // self.config.num_experts_per_rank)
@@ -393,32 +386,31 @@ class EpDispatchCombineTestCase:
                 assert False
                 # pass
 
-        if (dispatch_weights is not None) and (
-            self.config.kernel_type != mori.ops.EpDispatchCombineKernelType.InterNodeV1
-        ):
-            got_weight, expected_weight = (
-                combine_output_weight[i],
-                all_rank_weights[self.rank][i] * unique_pes,
-            )
-            weight_match = torch.allclose(
-                got_weight, expected_weight, atol=1e-5, rtol=1e-5
-            )
-            if not weight_match and self.config.rank == 0:
-                print(f"Weight mismatch for token {i}:")
-                print(
-                    f"  indices[{i}]: {all_rank_indices[self.rank][i].cpu().tolist()}"
+            if dispatch_weights is not None:
+                got_weight, expected_weight = (
+                    combine_output_weight[i],
+                    all_rank_weights[self.rank][i] * final_unique_pes,
                 )
-                print(f"  pes: {pes}")
-                print(f"  unique_pes: {unique_pes}")
-                print(f"  got_weight: {got_weight}")
-                print(
-                    f"  expected_weight (weights[{i}] * {unique_pes}): {expected_weight}"
+                weight_match = torch.allclose(
+                    got_weight, expected_weight, atol=1e-5, rtol=1e-5
                 )
-                print(f"  original weights[{i}]: {all_rank_weights[self.rank][i]}")
-                print(f"  diff: {torch.abs(got_weight - expected_weight)}")
-                print(f"  max_diff: {torch.abs(got_weight - expected_weight).max()}")
-            assert weight_match, f"Weight assertion failed for token {i}"
-
+                if not weight_match and self.config.rank == 0:
+                    print(f"Weight mismatch for token {i}:")
+                    print(
+                        f"  indices[{i}]: {all_rank_indices[self.rank][i].cpu().tolist()}"
+                    )
+                    print(f"  pes: {pes}")
+                    print(f"  unique_pes: {unique_pes}")
+                    print(f"  got_weight: {got_weight}")
+                    print(
+                        f"  expected_weight (weights[{i}] * {unique_pes}): {expected_weight}"
+                    )
+                    print(f"  original weights[{i}]: {all_rank_weights[self.rank][i]}")
+                    print(f"  diff: {torch.abs(got_weight - expected_weight)}")
+                    print(
+                        f"  max_diff: {torch.abs(got_weight - expected_weight).max()}"
+                    )
+                assert weight_match, f"Weight assertion failed for token {i}"
         if self.rank % self.gpu_per_node == 0:
             print(f"Node {self.rank // self.gpu_per_node} Combine Pass")
 
@@ -443,7 +435,93 @@ class EpDispatchCombineTestCase:
 
         del op
 
-    def run_bench_once(self, op, test_data):
+    def stress_dispatch_combine(self):
+        op = mori.ops.EpDispatchCombineOp(self.config)
+        num_test_data = 128
+        sync_interval = 128
+
+        if self.rank == 0:
+            print("Stress Test")
+        test_data_list = [self.gen_test_data(use_max_token_num=False) for i in range(num_test_data)]
+        for i in tqdm(range(10000000)):
+            (
+                all_rank_num_token,
+                all_rank_indices,
+                all_rank_input,
+                all_rank_weights,
+                all_rank_scales,
+            ) = test_data_list[i % num_test_data]
+            (
+                dispatch_output,
+                dispatch_weights,
+                dispatch_scales,
+                dispatch_indices,
+                dispatch_recv_num_token,
+            ) = op.dispatch(
+                all_rank_input[self.rank],
+                all_rank_weights[self.rank],
+                all_rank_scales[self.rank],
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+                # warp_per_block=16,
+            )
+            _, _ = op.combine(
+                dispatch_output,
+                dispatch_weights,
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+                # warp_per_block=16,
+            )
+            if i % sync_interval == 0:
+                torch.cuda.synchronize()
+        torch.cuda.synchronize()
+
+        if self.rank == 0:
+            print("Stress Test with CUDA Graph")
+        test_data = self.gen_test_data(use_max_token_num=False)
+        (
+            all_rank_num_token,
+            all_rank_indices,
+            all_rank_input,
+            all_rank_weights,
+            all_rank_scales,
+        ) = test_data
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            (
+                dispatch_output,
+                dispatch_weights,
+                dispatch_scales,
+                dispatch_indices,
+                dispatch_recv_num_token,
+            ) = op.dispatch(
+                all_rank_input[self.rank],
+                all_rank_weights[self.rank],
+                all_rank_scales[self.rank],
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+                # warp_per_block=16,
+            )
+            _, _ = op.combine(
+                dispatch_output,
+                dispatch_weights,
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+                # warp_per_block=16,
+            )
+        torch.cuda.synchronize()
+
+        for i in tqdm(range(5000)):
+            g.replay()
+            torch.cuda.synchronize()
+            time.sleep(0.0001)
+
+        del op
+
+    def run_bench_once(self, op, test_data, repeat=10):
+        num_events = 2 * repeat + 1
+        events = [torch.cuda.Event(enable_timing=True) for i in range(num_events)]
+
         (
             all_rank_num_token,
             all_rank_indices,
@@ -452,43 +530,33 @@ class EpDispatchCombineTestCase:
             all_rank_scales,
         ) = test_data
 
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
+        for i in range(3):
+            (
+                dispatch_output,
+                dispatch_weights,
+                dispatch_scales,
+                dispatch_indices,
+                dispatch_recv_num_token,
+            ) = op.dispatch(
+                all_rank_input[self.rank],
+                all_rank_weights[self.rank],
+                all_rank_scales[self.rank],
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+                # warp_per_block=16,
+            )
+            torch.cuda.synchronize()
+            total_recv_num_token = dispatch_recv_num_token[0].item()
+            combine_output, _ = op.combine(
+                dispatch_output,
+                dispatch_weights,
+                # None,
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+                # warp_per_block=16,
+            )
+            torch.cuda.synchronize()
 
-        torch.cuda.synchronize()
-        dist.barrier()
-        start_event.record()
-        (
-            dispatch_output,
-            dispatch_weights,
-            dispatch_scales,
-            dispatch_indices,
-            dispatch_recv_num_token,
-        ) = op.dispatch(
-            all_rank_input[self.rank],
-            all_rank_weights[self.rank],
-            all_rank_scales[self.rank],
-            all_rank_indices[self.rank],
-            block_num=self.config.block_num,
-            warp_per_block=16,
-        )
-        end_event.record()
-        torch.cuda.synchronize()
-        disp_duration = start_event.elapsed_time(end_event)
-
-        dist.barrier()
-        total_recv_num_token = dispatch_recv_num_token[0].item()
-        max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank
-
-        my_node = self.rank // self.gpu_per_node
-        total_rdma_recv_num_token = 0
-        src_token_pos = op.get_dispatch_src_token_pos().cpu().tolist()
-        for i, src_token_id in enumerate(src_token_pos):
-            src_pe = src_token_id // max_num_token_to_send_per_rank
-            src_node = src_pe // self.gpu_per_node
-            # if src_node != my_node:
-            #     total_rdma_recv_num_token += 1
-        # if self.config.kernel_type is mori.ops.EpDispatchCombineKernelType.InterNodeV1:
         total_rdma_recv_num_token = (
             self.config.max_num_inp_token_per_rank * self.config.world_size // 8
         )
@@ -496,45 +564,80 @@ class EpDispatchCombineTestCase:
             f"rank {self.rank} recv {total_recv_num_token} tokens {total_rdma_recv_num_token} rdma tokens"
         )
 
+        torch.cuda.synchronize()
+        dist.barrier()
+        events[0].record()
+        for i in range(repeat):
+            (
+                dispatch_output,
+                dispatch_weights,
+                dispatch_scales,
+                dispatch_indices,
+                dispatch_recv_num_token,
+            ) = op.dispatch(
+                all_rank_input[self.rank],
+                all_rank_weights[self.rank],
+                all_rank_scales[self.rank],
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+                # warp_per_block=16,
+            )
+            events[2 * i + 1].record()
+            combine_output, _ = op.combine(
+                dispatch_output,
+                dispatch_weights,
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+                # warp_per_block=16,
+            )
+            events[2 * i + 2].record()
+        torch.cuda.synchronize()
+
         element_size = all_rank_input[self.rank].element_size()
         total_bytes = total_recv_num_token * self.config.hidden_dim * element_size
+        ll_mode_scale = (
+            self.config.max_num_inp_token_per_rank
+            * self.config.num_experts_per_token
+            / (total_recv_num_token + 1)  # avoid division by zero
+        )
         total_rdma_bytes = (
             total_rdma_recv_num_token * self.config.hidden_dim * element_size
         )
-        disp_rdma_bandwidth = total_rdma_bytes / (1000**3) / (disp_duration / (10**3))
-        disp_bandwidth = total_bytes / (1000**3) / (disp_duration / (10**3))
 
-        torch.cuda.synchronize()
-        dist.barrier()
-        start_event.record()
-        combine_output, _ = op.combine(
-            dispatch_output,
-            None,
-            all_rank_indices[self.rank],
-            block_num=self.config.block_num,
-            warp_per_block=16,
-        )
-        end_event.record()
-        torch.cuda.synchronize()
-        comb_duration = start_event.elapsed_time(end_event)
-        comb_rdma_bandwidth = total_rdma_bytes / (1000**3) / (comb_duration / (10**3))
-        comb_bandwidth = total_bytes / (1000**3) / (comb_duration / (10**3))
+        disp_duration_list = []
+        comb_duration_list = []
+        for i in range(1, num_events, 2):
+            disp_duration_list.append(events[i - 1].elapsed_time(events[i]))
+            comb_duration_list.append(events[i].elapsed_time(events[i + 1]))
 
-        op.reset()
-        torch.cuda.synchronize()
+        disp_rdma_bandwidth_list = [
+            total_rdma_bytes / (1000**3) / (t / (10**3)) for t in disp_duration_list
+        ]
+        disp_bandwidth_list = [
+            total_bytes / (1000**3) / (t / (10**3)) for t in disp_duration_list
+        ]
+
+        comb_rdma_bandwidth_list = [
+            total_rdma_bytes / (1000**3) / (t / (10**3)) for t in comb_duration_list
+        ]
+        comb_bandwidth_list = [
+            total_bytes / (1000**3) / (t / (10**3)) for t in comb_duration_list
+        ]
         return (
-            disp_duration,
-            disp_rdma_bandwidth,
-            disp_bandwidth,
-            comb_duration,
-            comb_rdma_bandwidth,
-            comb_bandwidth,
+            disp_duration_list,
+            disp_rdma_bandwidth_list,
+            disp_bandwidth_list,
+            comb_duration_list,
+            comb_rdma_bandwidth_list,
+            comb_bandwidth_list,
+            ll_mode_scale,
         )
 
     def bench_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
         test_data = self.gen_test_data(use_max_token_num=True)
 
+        repeat = 50
         disp_duration_us_list = []
         disp_rdma_bandwidth_GB_list = []
         disp_bandwidth_GB_list = []
@@ -543,7 +646,7 @@ class EpDispatchCombineTestCase:
         comb_bandwidth_GB_list = []
 
         error_round = set()
-        for i in range(1):
+        for i in range(0):
             if self.rank == 0:
                 print(f"WarmUp Round {i} begin")
             self.run_test_once(op, test_data, error_round, i)
@@ -551,18 +654,17 @@ class EpDispatchCombineTestCase:
             len(error_round) == 0
         ), f"Warmup failed with errors in rounds: {error_round}"
 
-        for i in range(20):
-            if self.rank == 0:
-                print(f"Round {i} begin")
-            (
-                disp_duration,
-                disp_rdma_bandwidth,
-                disp_bandwidth,
-                comb_duration,
-                comb_rdma_bandwidth,
-                comb_bandwidth,
-            ) = self.run_bench_once(op, test_data)
+        (
+            disp_duration,
+            disp_rdma_bandwidth,
+            disp_bandwidth,
+            comb_duration,
+            comb_rdma_bandwidth,
+            comb_bandwidth,
+            ll_mode_scale,
+        ) = self.run_bench_once(op, test_data, repeat)
 
+        for i in range(repeat):
             disp_duration_output = [torch.zeros(1) for _ in range(self.world_size)]
             disp_rdma_bandwidth_output = [
                 torch.zeros(1) for _ in range(self.world_size)
@@ -574,16 +676,20 @@ class EpDispatchCombineTestCase:
             ]
             comb_bandwidth_output = [torch.zeros(1) for _ in range(self.world_size)]
 
-            dist.all_gather(disp_duration_output, torch.tensor([disp_duration * 1000]))
             dist.all_gather(
-                disp_rdma_bandwidth_output, torch.tensor([disp_rdma_bandwidth])
+                disp_duration_output, torch.tensor([disp_duration[i] * 1000])
             )
-            dist.all_gather(disp_bandwidth_output, torch.tensor([disp_bandwidth]))
-            dist.all_gather(comb_duration_output, torch.tensor([comb_duration * 1000]))
             dist.all_gather(
-                comb_rdma_bandwidth_output, torch.tensor([comb_rdma_bandwidth])
+                disp_rdma_bandwidth_output, torch.tensor([disp_rdma_bandwidth[i]])
             )
-            dist.all_gather(comb_bandwidth_output, torch.tensor([comb_bandwidth]))
+            dist.all_gather(disp_bandwidth_output, torch.tensor([disp_bandwidth[i]]))
+            dist.all_gather(
+                comb_duration_output, torch.tensor([comb_duration[i] * 1000])
+            )
+            dist.all_gather(
+                comb_rdma_bandwidth_output, torch.tensor([comb_rdma_bandwidth[i]])
+            )
+            dist.all_gather(comb_bandwidth_output, torch.tensor([comb_bandwidth[i]]))
 
             disp_duration_us_list.append([int(t.item()) for t in disp_duration_output])
             disp_rdma_bandwidth_GB_list.append(
@@ -625,64 +731,97 @@ class EpDispatchCombineTestCase:
                     f"  bandwidth {comb_bandwidth_GB_list[i]} avg {sum(comb_bandwidth_GB_list[i]) / self.config.world_size:.2f} GB/s"
                 )
 
-        disp_bandwidth_GB_list = disp_bandwidth_GB_list[0:]
-        avg_disp_bw_per_round = [
-            (sum(round_bw) / len(round_bw)) for round_bw in disp_bandwidth_GB_list
+        def collect_metrics(per_round_data):
+            minv = min([min(data) for data in per_round_data])
+            maxv = max([max(data) for data in per_round_data])
+            avgl = [(sum(data) / len(data)) for data in per_round_data]
+            avgv = sum(avgl) / len(avgl)
+            return int(minv), int(maxv), int(avgv)
+
+        disp_bw = collect_metrics(disp_bandwidth_GB_list[1:])
+        disp_rdma_bw = collect_metrics(disp_rdma_bandwidth_GB_list[1:])
+        disp_ll_bw = [int(e * ll_mode_scale) for e in disp_bw]
+        disp_lat = collect_metrics(disp_duration_us_list[1:])
+
+        comb_bw = collect_metrics(comb_bandwidth_GB_list[1:])
+        comb_rdma_bw = collect_metrics(comb_rdma_bandwidth_GB_list[1:])
+        comb_ll_bw = [int(e * ll_mode_scale) for e in comb_bw]
+        comb_lat = collect_metrics(comb_duration_us_list[1:])
+
+        from prettytable import PrettyTable
+
+        disp_table = PrettyTable()
+        comb_table = PrettyTable()
+        field_names = [
+            "Metrics",
+            "RDMA Bandwidth (GB/s)",
+            "XGMI Bandwidth (GB/s)",
+            "LL Bandwidth (GB/s)",
+            "Latency (us)",
         ]
-        avg_disp_rdma_bw_per_round = [
-            (sum(round_bw) / len(round_bw)) for round_bw in disp_rdma_bandwidth_GB_list
-        ]
-        avg_disp_bw = sum(avg_disp_bw_per_round) / len(avg_disp_bw_per_round)
-        avg_disp_rdma_bw = sum(avg_disp_rdma_bw_per_round) / len(
-            avg_disp_rdma_bw_per_round
+        disp_table.title = "Dispatch Performance"
+        disp_table.field_names = field_names
+        disp_table.add_rows(
+            [
+                [
+                    "Best",
+                    disp_rdma_bw[1],
+                    disp_bw[1],
+                    disp_ll_bw[1],
+                    disp_lat[0],
+                ],
+                [
+                    "Worst",
+                    disp_rdma_bw[0],
+                    disp_bw[0],
+                    disp_ll_bw[0],
+                    disp_lat[1],
+                ],
+                [
+                    "Average",
+                    disp_rdma_bw[2],
+                    disp_bw[2],
+                    disp_ll_bw[2],
+                    disp_lat[2],
+                ],
+            ]
         )
-
-        comb_bandwidth_GB_list = comb_bandwidth_GB_list[0:]
-        avg_comb_bw_per_round = [
-            (sum(round_bw) / len(round_bw)) for round_bw in comb_bandwidth_GB_list
-        ]
-        avg_comb_rdma_bw_per_round = [
-            (sum(round_bw) / len(round_bw)) for round_bw in comb_rdma_bandwidth_GB_list
-        ]
-        avg_comb_bw = sum(avg_comb_bw_per_round) / len(avg_comb_bw_per_round)
-        avg_comb_rdma_bw = sum(avg_comb_rdma_bw_per_round) / len(
-            avg_comb_rdma_bw_per_round
+        comb_table.field_names = field_names
+        comb_table.title = "Combine Performance"
+        comb_table.add_rows(
+            [
+                [
+                    "Best",
+                    comb_rdma_bw[1],
+                    comb_bw[1],
+                    comb_ll_bw[1],
+                    comb_lat[0],
+                ],
+                [
+                    "Worst",
+                    comb_rdma_bw[0],
+                    comb_bw[0],
+                    comb_ll_bw[0],
+                    comb_lat[1],
+                ],
+                [
+                    "Average",
+                    comb_rdma_bw[2],
+                    comb_bw[2],
+                    comb_ll_bw[2],
+                    comb_lat[2],
+                ],
+            ]
         )
-
-        disp_duration_us_list = disp_duration_us_list[0:]
-        avg_disp_lat_per_round = [
-            sum(round_duration) / len(round_duration)
-            for round_duration in disp_duration_us_list
-        ]
-        avg_disp_lat = sum(avg_disp_lat_per_round) / len(avg_disp_lat_per_round)
-
-        comb_duration_us_list = comb_duration_us_list[0:]
-        avg_comb_lat_per_round = [
-            sum(round_duration) / len(round_duration)
-            for round_duration in comb_duration_us_list
-        ]
-        avg_comb_lat = sum(avg_comb_lat_per_round) / len(avg_comb_lat_per_round)
-
-        best_disp_bw = max(avg_disp_bw_per_round)
-        best_disp_rdma_bw = max(avg_disp_rdma_bw_per_round)
-        best_comb_bw = max(avg_comb_bw_per_round)
-        best_comb_rdma_bw = max(avg_comb_rdma_bw_per_round)
-
-        best_disp_lat = min(avg_disp_lat_per_round)
-        best_comb_lat = min(avg_comb_lat_per_round)
-
         if self.rank == 0:
-            print(
-                f"dispatch: best/avg RDMA bandwidth {best_disp_rdma_bw:.2f} / {avg_disp_rdma_bw:.2f} XGMI bandwidth {best_disp_bw:.2f} / {avg_disp_bw:.2f} GB/s | "
-                f"best/avg latency {best_disp_lat:.2f} / {avg_disp_lat:.2f} µs\n"
-                f"combine: best/avg RDMA bandwidth {best_comb_rdma_bw:.2f} / {avg_comb_rdma_bw:.2f} XGMI bandwidth {best_comb_bw:.2f} / {avg_comb_bw:.2f} GB/s | "
-                f"best/avg latency {best_comb_lat:.2f} / {avg_comb_lat:.2f} µs"
-            )
+            print(disp_table)
+            print(comb_table)
+
         del op
 
 
 def test_dispatch_combine(
-    local_rank, num_node, gpu_per_node, max_tokens, kernel_type, is_bench=False
+    local_rank, num_node, gpu_per_node, max_tokens, kernel_type, num_qp, cmd="test"
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
@@ -694,22 +833,30 @@ def test_dispatch_combine(
         world_size,
         max_tokens,
         kernel_type,
+        num_qp,
         torch.bfloat16,
         # torch.float8_e4m3fnuz,
     )
     test_case.setup()
-    if is_bench:
-        test_case.bench_dispatch_combine()
-    else:
+    if cmd == "test":
         test_case.test_dispatch_combine()
+    elif cmd == "bench":
+        test_case.bench_dispatch_combine()
+    elif cmd == "stress":
+        test_case.stress_dispatch_combine()
+    else:
+        raise ValueError(f"unsupported command: {cmd}")
+
     test_case.cleanup()
 
 
 parser = argparse.ArgumentParser(description="dispatch/combine internode test")
 parser.add_argument(
-    "--bench",
-    action="store_true",
-    help="Set this flag True to run benchmark into test_dispatch_combine",
+    "--cmd",
+    type=str,
+    default="test",
+    choices=["test", "bench", "stress"],
+    help="Available subcommands: test, bench, stress",
 )
 parser.add_argument(
     "--max-tokens",
@@ -722,7 +869,13 @@ parser.add_argument(
     type=str,
     default="v1",
     help="Type of kernel to test",
-    choices=["v0", "v1"],
+    choices=["v0", "v1", "v1_ll"],
+)
+parser.add_argument(
+    "--num-qp",
+    type=int,
+    default=1,
+    help="Number of qp per processing endpoint",
 )
 args_cli = parser.parse_args()
 
@@ -739,7 +892,8 @@ if __name__ == "__main__":
             gpu_per_node,
             args_cli.max_tokens,
             args_cli.kernel_type,
-            args_cli.bench,
+            args_cli.num_qp,
+            args_cli.cmd,
         ),
         nprocs=gpu_per_node,
         join=True,

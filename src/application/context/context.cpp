@@ -35,6 +35,7 @@
 
 #include "mori/application/utils/check.hpp"
 #include "mori/utils/mori_log.hpp"
+#include "mori/application/transport/sdma/anvil.hpp"
 
 namespace mori {
 namespace application {
@@ -113,6 +114,11 @@ bool IsP2PDisabled() {
   return getenv(varName) != nullptr;
 }
 
+bool IsSDMAEnabled() {
+  const char* varName = "MORI_ENABLE_SDMA";
+  return getenv(varName) != nullptr;
+}
+
 void Context::InitializePossibleTransports() {
   // Find my rank in node
   for (int i = 0; i <= LocalRank(); i++) {
@@ -186,6 +192,8 @@ void Context::InitializePossibleTransports() {
   this->numQpPerPe = numQpPerPe;
   // Initialize transport
   int peerRankInNode = -1;
+  if(!IsP2PDisabled() && IsSDMAEnabled()) anvil::anvil.init();
+
   for (int i = 0; i < WorldSize(); i++) {
     // Check P2P availability
     if (!IsP2PDisabled()) {
@@ -197,7 +205,15 @@ void Context::InitializePossibleTransports() {
         bool canAccessPeer = true;
 
         if ((i == LocalRank()) || canAccessPeer) {
-          transportTypes.push_back(TransportType::P2P);
+          if(IsSDMAEnabled() && (i != LocalRank()) ){
+            transportTypes.push_back(TransportType::SDMA);
+
+	    anvil::EnablePeerAccess(LocalRank()%8, i%8);
+            // Better performance if allocating all 8 queues
+            anvil::anvil.connect(LocalRank()%8, i%8, 8);
+          }else{
+            transportTypes.push_back(TransportType::P2P);
+          }
           for (int qp = 0; qp < numQpPerPe; qp++) {
             rdmaEps.push_back({});
           }
@@ -218,7 +234,11 @@ void Context::InitializePossibleTransports() {
     // Create multiple QPs for this peer
     application::RdmaEndpointConfig config;
     config.portId = portId;
-    config.gidIdx = 3;
+    config.gidIdx = -1;
+    const char* envGidIdx = std::getenv("MORI_IB_GID_INDEX");
+    if (envGidIdx != nullptr) {
+      config.gidIdx = std::atoi(envGidIdx);
+    }
     config.maxMsgsNum = 4096;
 #ifdef ENABLE_BNXT
     config.maxCqeNum = 1;

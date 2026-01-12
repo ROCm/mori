@@ -34,6 +34,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <iostream>
 
 extern "C" {
 #include <pci/pci.h>
@@ -296,10 +297,16 @@ void TopoSystemPci::Load() {
 
     if (headerType == PCI_HEADER_TYPE_BRIDGE) {
       uint8_t secondary = pci_read_byte(dev, PCI_SECONDARY_BUS);
-      uint64_t globalSecondary = PciBusId(dev->domain, secondary, 0, 0).packed;
-      assert(dsp2dev.find(globalSecondary) == dsp2dev.end());
-      dsp2dev.insert({globalSecondary, dev});
-      assert(dev->bus == pci_read_byte(dev, PCI_PRIMARY_BUS));
+      uint8_t subordinate = pci_read_byte(dev, PCI_SUBORDINATE_BUS);
+      for (uint8_t i = secondary; i <= subordinate; i++) {
+        uint64_t dspBusId = PciBusId(dev->domain, i, 0, 0).packed;
+        if (dsp2dev.find(dspBusId) != dsp2dev.end()) {
+          struct pci_dev* lastDev = dsp2dev[dspBusId];
+          if (pci_read_byte(dev, PCI_PRIMARY_BUS) < pci_read_byte(lastDev, PCI_PRIMARY_BUS)) continue;
+        }
+        dsp2dev.insert({dspBusId, dev});
+        assert(dev->bus == pci_read_byte(dev, PCI_PRIMARY_BUS));
+      }
     }
 
     bus2dev.insert({node->BusId().packed, dev});

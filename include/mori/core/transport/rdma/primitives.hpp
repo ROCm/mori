@@ -35,8 +35,10 @@ enum ProviderType {
   MLX5 = 1,
   // Broadcom direct verbs
   BNXT = 2,
+  // Pensando direct verbs
+  PSD = 3,
   // Ib verbs
-  IBVERBS = 3,
+  IBVERBS = 4,
 };
 
 typedef enum {
@@ -82,12 +84,16 @@ struct WorkQueueHandle {
   void* rqAddr{nullptr};
   void* dbrRecAddr{nullptr};
   void* dbrAddr{nullptr};
+  void* rqdbrAddr{nullptr};
   uint32_t mtuSize{4096};
   uint32_t sqWqeNum{0};
   uint32_t msntblNum{0};
   uint32_t rqWqeNum{0};
   uint32_t postSendLock{0};
   uint64_t outstandingWqe[OUTSTANDING_TABLE_SIZE]{0};
+  bool color;
+  uint64_t sq_dbval{0};
+  uint64_t rq_dbval{0};
 };
 
 struct CompletionQueueHandle {
@@ -98,9 +104,11 @@ struct CompletionQueueHandle {
   uint32_t needConsIdx{0};  // numbers of cqe that should be consumed
   uint32_t activeIdx{0};    // numbers of cqe that under processing but not completed
   uint32_t cq_consumer{0};
+  uint32_t cq_dbpos{0};
   uint32_t cqeNum{0};
   uint32_t cqeSize{0};
   uint32_t pollCqLock{0};
+  uint64_t cq_dbval{0};
 };
 
 struct IBVerbsHandle {

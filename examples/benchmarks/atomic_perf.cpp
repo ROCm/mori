@@ -49,8 +49,7 @@ __global__ void Atomic(RdmaEndpoint& endpoint, RdmaMemoryRegion localMr, RdmaMem
                                      &endpoint.wqHandle.postSendLock);
     __threadfence_system();
     int snd_opcode = PollCqAndUpdateDbr<ProviderType::MLX5>(
-        endpoint.cqHandle.cqAddr, endpoint.cqHandle.cqeSize, endpoint.cqHandle.cqeNum,
-        &endpoint.cqHandle.consIdx, endpoint.cqHandle.dbrRecAddr, &endpoint.cqHandle.pollCqLock);
+        endpoint.cqHandle, &endpoint.cqHandle.consIdx, &endpoint.cqHandle.pollCqLock);
 
     printf("postIdx: %d, consIdx: %d\n", endpoint.wqHandle.postIdx, endpoint.cqHandle.consIdx);
   }

@@ -29,6 +29,7 @@
 #include <variant>
 
 #include "mori/application/application.hpp"
+#include "mori/utils/data_types.hpp"
 
 namespace mori {
 namespace moe {
@@ -37,6 +38,7 @@ enum KernelType {
   IntraNode = 0,
   InterNode = 1,
   InterNodeV1 = 2,
+  InterNodeV1LL = 3,
 };
 
 inline const char* HipDataTypeToString(hipDataType dtype) {
@@ -47,6 +49,8 @@ inline const char* HipDataTypeToString(hipDataType dtype) {
       return "HIP_R_32F";
     case HIP_R_16BF:
       return "HIP_R_16BF";
+    case HIP_R_8F_E4M3:
+      return "HIP_R_8F_E4M3";
     case HIP_R_8F_E4M3_FNUZ:
       return "HIP_R_8F_E4M3_FNUZ";
     default:
@@ -60,6 +64,8 @@ inline size_t GetHipDataTypeSize(hipDataType dtype) {
       return sizeof(float);
     case HIP_R_16BF:
       return sizeof(hip_bfloat16);
+    case HIP_R_8F_E4M3:
+      return sizeof(__hip_fp8_e4m3);
     case HIP_R_8F_E4M3_FNUZ:
       return sizeof(__hip_fp8_e4m3_fnuz);
     default:
@@ -85,8 +91,10 @@ struct EpDispatchCombineConfig {
   // If true, use external buffer which incurs extra copy overhead; otherwise, the kernel assumes
   // the provided buffer is shmemInpTokMemObj
   bool useExternalInpBuffer{true};
+  KernelType kernelType{KernelType::IntraNode};
   int gpuPerNode{8};
   int rdmaBlockNum{1};
+  int numQpPerPe{1};
 
   inline __host__ __device__ int MaxNumTokensToSendPerRank() const { return maxNumInpTokenPerRank; }
 
@@ -221,12 +229,12 @@ class EpDispatchCombineHandle {
   index_t* dispDestTokIdMap{nullptr};
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
-  uint32_t* crossDeviceBarrierFlag{nullptr};
+  uint64_t* crossDeviceBarrierFlag{nullptr};
 
   // Inter-node v1 kernel parameters
   // Signal the completion of inter-node token transfer
   mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
-  // Signal the number of tokens transfered from other nodes
+  // Signal the number of tokens transferred from other nodes
   mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;
   // Count the number of tokens sent to other nodes
   index_t* destNodeTokenCounter{nullptr};
@@ -280,7 +288,7 @@ struct EpDispatchCombineArgs {
   index_t* dispDestTokIdMap{nullptr};
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
-  uint32_t* crossDeviceBarrierFlag{nullptr};
+  uint64_t* crossDeviceBarrierFlag{nullptr};
   mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
   index_t* destNodeTokenCounter{nullptr};
   mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;
@@ -292,8 +300,16 @@ struct EpDispatchCombineArgs {
 };
 
 using EpDispatchCombineArgsVariant =
-    std::variant<EpDispatchCombineArgs<float>, EpDispatchCombineArgs<hip_bfloat16>,
-                 EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> >;
+    std::variant<EpDispatchCombineArgs<float>, EpDispatchCombineArgs<hip_bfloat16>
+#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
+                 ,
+                 EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>
+#endif
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+                 ,
+                 EpDispatchCombineArgs<__hip_fp8_e4m3>
+#endif
+                 >;
 
 template <typename T>
 EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle& handle) {
@@ -352,8 +368,14 @@ inline EpDispatchCombineArgsVariant GetEpDispatchCombineArgsByInputType(
       return GetEpDispatchCombineArgs<float>(handle);
     case HIP_R_16BF:
       return GetEpDispatchCombineArgs<hip_bfloat16>(handle);
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+    case HIP_R_8F_E4M3:
+      return GetEpDispatchCombineArgs<__hip_fp8_e4m3>(handle);
+#endif
+#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
     case HIP_R_8F_E4M3_FNUZ:
       return GetEpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>(handle);
+#endif
     default:
       std::ostringstream oss;
       oss << "Unsupported inputType " << HipDataTypeToString(handle.inputType)

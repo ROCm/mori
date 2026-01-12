@@ -26,6 +26,7 @@
 
 #include "infiniband/mlx5dv.h"
 #include "mori/core/transport/rdma/device_primitives.hpp"
+#include "mori/core/utils.hpp"
 
 #ifdef ENABLE_BNXT
 extern "C" {
@@ -36,6 +37,8 @@ extern "C" {
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_re_hsi.h"
 }
 #endif
+#include "mori/core/transport/rdma/providers/ionic/ionic_dv.h"
+#include "mori/core/transport/rdma/providers/ionic/ionic_fw.h"
 
 namespace mori {
 namespace core {
@@ -104,6 +107,41 @@ static __device__ __host__ enum ibv_wc_status BnxtHandleErrorCqe(int status) {
   }
 }
 
+static __device__ __host__ enum ibv_wc_status IonicHandleErrorCqe(int status)
+{
+	switch (status) {
+	case IONIC_STS_OK:
+		return IBV_WC_SUCCESS;
+	case IONIC_STS_LOCAL_LEN_ERR:
+		return IBV_WC_LOC_LEN_ERR;
+	case IONIC_STS_LOCAL_QP_OPER_ERR:
+		return IBV_WC_LOC_QP_OP_ERR;
+	case IONIC_STS_LOCAL_PROT_ERR:
+		return IBV_WC_LOC_PROT_ERR;
+	case IONIC_STS_WQE_FLUSHED_ERR:
+		return IBV_WC_WR_FLUSH_ERR;
+	case IONIC_STS_MEM_MGMT_OPER_ERR:
+		return IBV_WC_MW_BIND_ERR;
+	case IONIC_STS_BAD_RESP_ERR:
+		return IBV_WC_BAD_RESP_ERR;
+	case IONIC_STS_LOCAL_ACC_ERR:
+		return IBV_WC_LOC_ACCESS_ERR;
+	case IONIC_STS_REMOTE_INV_REQ_ERR:
+		return IBV_WC_REM_INV_REQ_ERR;
+	case IONIC_STS_REMOTE_ACC_ERR:
+		return IBV_WC_REM_ACCESS_ERR;
+	case IONIC_STS_REMOTE_OPER_ERR:
+		return IBV_WC_REM_OP_ERR;
+	case IONIC_STS_RETRY_EXCEEDED:
+		return IBV_WC_RETRY_EXC_ERR;
+	case IONIC_STS_RNR_RETRY_EXCEEDED:
+		return IBV_WC_RNR_RETRY_EXC_ERR;
+	case IONIC_STS_XRC_VIO_ERR:
+	default:
+		return IBV_WC_GENERAL_ERR;
+	}
+}
+
 static __device__ __host__ const char* IbvWcStatusString(enum ibv_wc_status status) {
   static const char* const wc_status_str[] = {
       /* IBV_WC_SUCCESS*/ "success",
@@ -149,7 +187,7 @@ static __device__ __host__ void DumpMlx5Wqe(void* wqeBaseAddr, uint32_t idx) {
   mlx5_wqe_data_seg* wqeDataSeg = reinterpret_cast<mlx5_wqe_data_seg*>(
       wqeAddr + sizeof(mlx5_wqe_ctrl_seg) + sizeof(mlx5_wqe_raddr_seg));
   uint32_t bytes = BE32TOH(wqeDataSeg->byte_count);
-  printf("Wqe: opcode = 0x%02x, wqeIdx = %u, opmod = 0x%02x bytes %d\n", opcode, wqeIdx, opmod,
+  MORI_PRINTF("Wqe: opcode = 0x%02x, wqeIdx = %u, opmod = 0x%02x bytes %d\n", opcode, wqeIdx, opmod,
          bytes);
 }
 

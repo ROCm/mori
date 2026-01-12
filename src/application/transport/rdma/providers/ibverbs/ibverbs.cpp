@@ -21,8 +21,6 @@
 // SOFTWARE.
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 
-#include <iostream>
-
 #include "mori/application/utils/check.hpp"
 namespace mori {
 namespace application {
@@ -46,15 +44,19 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
   endpoint.vendorId = ToRdmaDeviceVendorId(deviceAttr->orig_attr.vendor_id);
   endpoint.handle.psn = 0;
   endpoint.handle.portId = config.portId;
-  endpoint.handle.maxSge = deviceAttr->tm_caps.max_sge;
+  endpoint.handle.maxSge = config.maxMsgSge;
 
   const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(config.portId);
+  assert(portAttr);
   if (portAttr->link_layer == IBV_LINK_LAYER_INFINIBAND) {
     endpoint.handle.ib.lid = portAttr->lid;
   } else if (portAttr->link_layer == IBV_LINK_LAYER_ETHERNET) {
-    union ibv_gid gid;
-    SYSCALL_RETURN_ZERO(ibv_query_gid(context, config.portId, config.gidIdx, &gid));
-    memcpy(endpoint.handle.eth.gid, gid.raw, 16);
+    GidSelectionResult gidSelection =
+        AutoSelectGidIndex(context, config.portId, portAttr, config.gidIdx);
+    assert(gidSelection.gidIdx >= 0 && gidSelection.valid);
+
+    memcpy(endpoint.handle.eth.gid, gidSelection.gid.raw, 16);
+    endpoint.handle.eth.gidIdx = gidSelection.gidIdx;
   } else {
     assert(false && "unsupported link layer");
   }
@@ -111,11 +113,13 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   attr.pkey_index = 0;
   attr.qp_access_flags = MR_DEFAULT_ACCESS_FLAG;
   flags = IBV_QP_STATE | IBV_QP_PORT | IBV_QP_PKEY_INDEX | IBV_QP_ACCESS_FLAGS;
-  ibv_modify_qp(qp, &attr, flags);
+  SYSCALL_RETURN_ZERO(ibv_modify_qp(qp, &attr, flags));
 
+  const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(local.portId);
+  assert(portAttr);
   // RTR
   attr.qp_state = IBV_QPS_RTR;
-  attr.path_mtu = IBV_MTU_4096;
+  attr.path_mtu = portAttr->active_mtu;
   attr.dest_qp_num = remote.qpn;
   attr.rq_psn = 0;
   attr.max_dest_rd_atomic = devAttr->orig_attr.max_qp_rd_atom;
@@ -124,7 +128,6 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   attr.ah_attr.src_path_bits = 0;
   attr.ah_attr.port_num = local.portId;
 
-  const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(local.portId);
   if (portAttr->link_layer == IBV_LINK_LAYER_INFINIBAND) {
     attr.ah_attr.dlid = remote.ib.lid;
   } else if (portAttr->link_layer == IBV_LINK_LAYER_ETHERNET) {
@@ -132,12 +135,12 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
     union ibv_gid dgid;
     memcpy(dgid.raw, remote.eth.gid, 16);
     attr.ah_attr.grh.dgid = dgid;
-    attr.ah_attr.grh.sgid_index = 3;
-    attr.ah_attr.grh.hop_limit = 1;
+    attr.ah_attr.grh.sgid_index = local.eth.gidIdx;
+    attr.ah_attr.grh.hop_limit = 16;
   }
   flags = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
           IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER | IBV_QP_AV;
-  ibv_modify_qp(qp, &attr, flags);
+  SYSCALL_RETURN_ZERO(ibv_modify_qp(qp, &attr, flags));
 
   // RTS
   attr.qp_state = IBV_QPS_RTS;
@@ -148,7 +151,7 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   attr.max_rd_atomic = devAttr->orig_attr.max_qp_init_rd_atom;
   flags = IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
           IBV_QP_MAX_QP_RD_ATOMIC;
-  ibv_modify_qp(qp, &attr, flags);
+  SYSCALL_RETURN_ZERO(ibv_modify_qp(qp, &attr, flags));
 }
 
 /* ---------------------------------------------------------------------------------------------- */

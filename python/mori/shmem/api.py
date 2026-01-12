@@ -218,3 +218,11 @@ def shmem_ptr_p2p(dest_ptr: int, my_pe: int, dest_pe: int) -> int:
         - 0: If connection uses RDMA transport (different nodes) or if pointer is invalid
     """
     return mori_cpp.shmem_ptr_p2p(dest_ptr, my_pe, dest_pe)
+
+def shmem_num_qp_per_pe():
+    """Get number of QPs per PE.
+    
+    Returns:
+        Number of QPs per PE
+    """
+    return mori_cpp.shmem_num_qp_per_pe()

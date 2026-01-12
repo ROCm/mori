@@ -45,22 +45,25 @@ struct BackendConfig {
 struct RdmaBackendConfig : public BackendConfig {
   RdmaBackendConfig() : BackendConfig(BackendType::RDMA) {}
   RdmaBackendConfig(int qpPerTransfer_, int postBatchSize_, int numWorkerThreads_,
-                    PollCqMode pollCqMode_)
+                    PollCqMode pollCqMode_, bool enableNotification_)
       : BackendConfig(BackendType::RDMA),
         qpPerTransfer(qpPerTransfer_),
         postBatchSize(postBatchSize_),
         numWorkerThreads(numWorkerThreads_),
-        pollCqMode(pollCqMode_) {}
+        pollCqMode(pollCqMode_),
+        enableNotification(enableNotification_) {}
 
   int qpPerTransfer{1};
   int postBatchSize{-1};
   int numWorkerThreads{1};
   PollCqMode pollCqMode{PollCqMode::POLLING};
+  bool enableNotification{true};  // Enable/disable notification mechanism for transfer completion
 };
 
 inline std::ostream& operator<<(std::ostream& os, const RdmaBackendConfig& c) {
   return os << "qpPerTransfer[" << c.qpPerTransfer << "] postBatchSize[" << c.postBatchSize
-            << "] numWorkerThreads[" << c.numWorkerThreads << "]";
+            << "] numWorkerThreads[" << c.numWorkerThreads << "] enableNotification["
+            << c.enableNotification << "]";
 }
 
 /* ---------------------------------------------------------------------------------------------- */

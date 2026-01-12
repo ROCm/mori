@@ -30,6 +30,7 @@
 #include "mori/shmem/shmem_device_kernels.hpp"
 #include "mori/shmem/shmem_ibgda_kernels.hpp"
 #include "mori/shmem/shmem_p2p_kernels.hpp"
+#include "mori/shmem/shmem_sdma_kernels.hpp"
 
 namespace mori {
 namespace shmem {
@@ -41,6 +42,8 @@ namespace shmem {
     func<application::TransportType::RDMA>(__VA_ARGS__);                          \
   } else if (transportType == application::TransportType::P2P) {                  \
     func<application::TransportType::P2P>(__VA_ARGS__);                           \
+  } else if (transportType == application::TransportType::SDMA) {                 \
+    func<application::TransportType::SDMA>(__VA_ARGS__);                          \
   } else {                                                                        \
     assert(false);                                                                \
   }
@@ -98,6 +101,9 @@ inline __device__ void ShmemFenceThread(int pe) {
 inline __device__ void ShmemFenceThread(int pe, int qpId) {
   ShmemQuietThread(pe, qpId);
   __threadfence_system();
+}
+inline __device__ void ShmemQuietThread(int pe, const application::SymmMemObjPtr dest) {
+  ShmemQuietThreadKernel<application::TransportType::SDMA>(pe, dest);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -162,8 +168,8 @@ DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Warp)
       const application::RdmaMemoryRegion& source, size_t srcElmOffset, size_t nelems, int pe, \
       int qpId = 0) {                                                                          \
     constexpr size_t typeSize = sizeof(T);                                                     \
-    ShmemPutMemNbi##Scope(dest, destElmOffset * typeSize, source, srcElmOffset * typeSize,     \
-                          nelems * typeSize, pe, qpId);                                        \
+    ShmemPutMemNbi##Scope(dest, destElmOffset* typeSize, source, srcElmOffset* typeSize,       \
+                          nelems* typeSize, pe, qpId);                                         \
   }                                                                                            \
   template <typename T>                                                                        \
   inline __device__ void ShmemPutTypeNbi##Scope(                                               \

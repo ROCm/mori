@@ -42,6 +42,8 @@ inline torch::Dtype GetTorchDataType() {
     return torch::kUInt64;
   } else if constexpr (std::is_same_v<T, hip_bfloat16>) {
     return torch::kBFloat16;
+  } else if constexpr (std::is_same_v<T, __hip_fp8_e4m3>) {
+    return torch::kFloat8_e4m3fn;
   } else if constexpr (std::is_same_v<T, __hip_fp8_e4m3_fnuz>) {
     return torch::kFloat8_e4m3fnuz;
   } else {
@@ -55,6 +57,8 @@ inline hipDataType ScalarTypeToHipDataType(at::ScalarType scalarType) {
       return HIP_R_32F;
     case at::kBFloat16:
       return HIP_R_16BF;
+    case at::kFloat8_e4m3fn:
+      return HIP_R_8F_E4M3;
     case at::kFloat8_e4m3fnuz:
       return HIP_R_8F_E4M3_FNUZ;
     default:

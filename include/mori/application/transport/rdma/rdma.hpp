@@ -51,6 +51,7 @@ enum class RdmaDeviceVendorId : uint32_t {
   Unknown = 0,
   Mellanox = 0x02c9,
   Broadcom = 0x14E4,
+  Pensando = 0x1dd8,
 };
 
 template <typename T>
@@ -78,7 +79,7 @@ static constexpr size_t ATOMIC_IBUF_SLOT_SIZE = 8;  // Each atomic ibuf slot is 
 /* -------------------------------------------------------------------------- */
 struct RdmaEndpointConfig {
   uint32_t portId{1};
-  uint32_t gidIdx{3};  // TODO: auto detect?
+  int32_t gidIdx{-1};  // -1 means auto detect
   uint32_t maxMsgsNum{128};
   uint32_t maxCqeNum{128};
   uint32_t maxMsgSge{1};
@@ -88,6 +89,17 @@ struct RdmaEndpointConfig {
   bool enableSrq{false};
   uint32_t atomicIbufSlots{512};  // Number of atomic internal buffer slots, each slot is 8B
 };
+
+struct GidSelectionResult {
+  int32_t gidIdx{-1};
+  union ibv_gid gid = {};
+  ibv_gid_type gidType{IBV_GID_TYPE_IB};
+  bool fromUser{false};
+  bool valid{false};
+};
+
+GidSelectionResult AutoSelectGidIndex(ibv_context* context, uint32_t portId,
+                                      const ibv_port_attr* portAttr, int32_t configuredGidIdx = -1);
 
 struct InfiniBandEndpointHandle {
   uint32_t lid{0};
@@ -99,10 +111,11 @@ struct InfiniBandEndpointHandle {
 struct EthernetEndpointHandle {
   uint8_t gid[16];
   uint8_t mac[ETHERNET_LL_SIZE];
+  int32_t gidIdx{-1};
 
   constexpr bool operator==(const EthernetEndpointHandle& rhs) const noexcept {
     return std::equal(std::begin(gid), std::end(gid), std::begin(rhs.gid)) &&
-           std::equal(std::begin(mac), std::end(mac), std::begin(rhs.mac));
+           std::equal(std::begin(mac), std::end(mac), std::begin(rhs.mac)) && gidIdx == rhs.gidIdx;
   }
 };
 
@@ -158,6 +171,8 @@ struct RdmaEndpoint {
       return core::ProviderType::MLX5;
     } else if (vendorId == RdmaDeviceVendorId::Broadcom) {
       return core::ProviderType::BNXT;
+    } else if (vendorId == RdmaDeviceVendorId::Pensando) {
+      return core::ProviderType::PSD;
     } else {
       printf("unknown vendorId %d", vendorId);
       assert(false);
@@ -205,7 +220,7 @@ class RdmaDeviceContext {
  protected:
   ibv_pd* pd{nullptr};
   ibv_srq* srq{nullptr};
-
+  uint16_t qp_counter{0};
   // Shared UDP sport configuration for all RDMA providers
   uint16_t udp_sport_setting[RDMA_UDP_SPORT_ARRAY_SIZE];
 
@@ -295,6 +310,7 @@ static std::ostream& operator<<(std::ostream& s,
   for (int i = 0; i < sizeof(handle.mac); i++) {
     ss << int(handle.mac[i]);
   }
+  ss << ", gidIdx: " << std::dec << handle.gidIdx;
   s << ss.str();
   return s;
 }

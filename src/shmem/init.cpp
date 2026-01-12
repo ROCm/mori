@@ -450,5 +450,13 @@ int ShmemInitAttr(unsigned int flags, mori_shmem_init_attr_t* attr) {
   return -1;
 }
 
+int ShmemNumQpPerPe() {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  return states->rdmaStates->commContext->GetNumQpPerPe();
+}
+
+// int ShmemTeamMyPe(ShmemTeamType);
+// int ShmemTeamNPes(ShmemTeamType);
+
 }  // namespace shmem
 }  // namespace mori

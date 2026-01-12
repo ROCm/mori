@@ -28,16 +28,31 @@ Configurations:
 
 Benchmark result on DeepSeek V3 model configurations:
 
+**Bandwidth Performance**
+
 4096 tokens per batch, 7168 hidden, top-8 experts, FP8 dispatching and BF16 combining
 
 | **Kernels**| **# CUs**| **Dispatch XGMI** |**Dispatch RDMA** |**Combine XGMI**|**Combine RDMA** |
 |------------|----------|-------------------|------------------|----------------|-----------------|
-|EP8         | 80       | 307 GB/s          | x                | 285 GB/s       | x               |
-|EP16-V0     | 32       | 75 GB/s           | 23 GB/s          | 76 GB/s        | 23GB/s          |
-|EP16-V0     | 80       | 79 GB/s           | 24 GB/s          | 82 GB/s        | 25GB/s          | 
-|EP16-V1     | 32       | 185 GB/s          | 57 GB/s          | 172GB/s        | 52GB/s          |
-|EP16-V1     | 80       | 208 GB/s          | 63 GB/s          | 161GB/s        | 49GB/s          |
+|EP8         | 80       | 307 GB/s          | x                | 330 GB/s       | x               |
+|EP16-V0     | 32       | 75 GB/s           | 23 GB/s          | 76 GB/s        | 23 GB/s          |
+|EP16-V0     | 80       | 79 GB/s           | 24 GB/s          | 82 GB/s        | 25 GB/s          | 
+|EP16-V1     | 32       | 185 GB/s          | 57 GB/s          | 172 GB/s       | 52 GB/s          |
+|EP16-V1     | 80       | 208 GB/s          | 63 GB/s          | 161 GB/s       | 49 GB/s          |
+|EP32-V1-LL  | 32       | 103 GB/s          | 57 GB/s          | 91 GB/s        | 50 GB/s          |
 
+**Latency Performance**
+
+128 tokens per batch, 7168 hidden, top-8 experts, FP8 dispatching and BF16 combining
+
+| **Kernels**| **# CUs**| **Dispatch Latency** |**Dispatch BW** |**Combine Latency**|**Combine BW** |
+|------------|----------|----------------------|----------------|-------------------|---------------|
+|EP8         | 64       | 35 us                | 134 GB/s       | 47 us             | 204 GB/s      |
+|EP16-V0     | 32       | 226 us               | 33 GB/s        | 296 us            | 49GB/s        |
+|EP16-V1     | 32       | 115 us               | 63 GB/s        | 141 us            | 110GB/s       |
+|EP32-V1-LL  | 32       | 157 us               | 48 GB/s        | 280 us            | 55GB/s        |
+
+**NOTE**: We show best performance values measured from multiple test rounds to eliminate fluctuations.
 
 ### MORI-IO
 
@@ -93,6 +108,7 @@ cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
 
 ### Install with Python
 ```
+# NOTE: for venv build, add --no-build-isolation at the end
 cd mori && pip install -r requirements-build.txt && git submodule update --init --recursive && pip3 install .
 ```
 

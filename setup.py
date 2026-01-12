@@ -35,6 +35,35 @@ def _get_torch_cmake_prefix_path() -> str:
     return torch.utils.cmake_prefix_path
 
 
+_supported_arch_list = ["gfx942", "gfx950"]
+
+
+def _get_gpu_archs() -> str:
+    archs = os.environ.get("PYTORCH_ROCM_ARCH", None)
+    if not archs:
+        import torch
+
+        archs = torch._C._cuda_getArchFlags()
+
+    gpu_archs = os.environ.get("GPU_ARCHS", None)
+    if gpu_archs:
+        archs = gpu_archs
+
+    mori_gpu_archs = os.environ.get("MORI_GPU_ARCHS", None)
+    if mori_gpu_archs:
+        archs = mori_gpu_archs
+
+    arch_list = archs.replace(" ", ";").split(";")
+
+    # filter out supported architectures
+    valid_arch_list = list(set(_supported_arch_list) & set(arch_list))
+    if len(valid_arch_list) == 0:
+        raise ValueError(
+            f"no supported archs found, supported {_supported_arch_list}, got {arch_list}"
+        )
+    return ";".join(valid_arch_list)
+
+
 class CMakeBuild(build_ext):
     def run(self) -> None:
         try:
@@ -57,6 +86,9 @@ class CMakeBuild(build_ext):
         build_type = os.environ.get("CMAKE_BUILD_TYPE", "Release")
         unroll_value = os.environ.get("WARP_ACCUM_UNROLL", "1")
         use_bnxt = os.environ.get("USE_BNXT", "OFF")
+        use_ionic = os.environ.get("USE_IONIC", "OFF")
+        enable_debug_printf = os.environ.get("ENABLE_DEBUG_PRINTF", "OFF")
+        gpu_archs = _get_gpu_archs()
         subprocess.check_call(
             [
                 "cmake",
@@ -64,6 +96,9 @@ class CMakeBuild(build_ext):
                 f"-DCMAKE_BUILD_TYPE={build_type}",
                 f"-DWARP_ACCUM_UNROLL={unroll_value}",
                 f"-DUSE_BNXT={use_bnxt}",
+                f"-DUSE_IONIC={use_ionic}",
+                f"-DENABLE_DEBUG_PRINTF={enable_debug_printf}",
+                f"-DGPU_TARGETS={gpu_archs}",
                 "-B",
                 str(build_dir),
                 "-S",

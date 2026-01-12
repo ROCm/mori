@@ -21,6 +21,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(USE_ROCM "Whether to use rocm" ON)
 option(USE_BNXT "Whether to use BNXT NIC" OFF)
+option(USE_IONIC "Whether to use IONIC" OFF)
 option(BUILD_EXAMPLES "Whether to build examples" ON)
 option(BUILD_APPLICATION "Whether to build application library" ON)
 option(BUILD_SHMEM "Whether to build shmem library" ON)
@@ -28,6 +29,7 @@ option(BUILD_OPS "Whether to build mori operation kernels" ON)
 option(BUILD_IO "Whether to build mori io library" ON)
 option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
 option(BUILD_TESTS "Whether to build mori CPP tests" ON)
+option(ENABLE_DEBUG_PRINTF "Enable debug printf in device kernels" OFF)
 
 set(CMAKE_LIBRARY_PATH "/usr/local/lib;${CMAKE_LIBRARY_PATH}")
 find_library(BNXT_RE_LIB NAMES bnxt_re)
@@ -45,6 +47,29 @@ if(USE_BNXT)
   add_compile_definitions(ENABLE_BNXT)
 endif()
 
+find_library(IONIC_LIB
+  NAMES ionic
+  HINTS /lib/x86_64-linux-gnu
+)
+if(IONIC_LIB)
+	message(STATUS "Found ionic library at: ${IONIC_LIB}")
+else()
+  message(
+	  STATUS "Could NOT find ionic library. IONIC features will be disabled.")
+  set(USE_IONIC
+      OFF
+      CACHE BOOL "Enable IONIC features if ionic library is found" FORCE)
+endif()
+message(STATUS "USE_IONIC = ${USE_IONIC}")
+if(USE_IONIC)
+	add_compile_definitions(ENABLE_IONIC)
+endif()
+
+message(STATUS "ENABLE_DEBUG_PRINTF = ${ENABLE_DEBUG_PRINTF}")
+if(ENABLE_DEBUG_PRINTF)
+  add_compile_definitions(MORI_ENABLE_DEBUG_PRINTF)
+endif()
+
 if(NOT DEFINED WARP_ACCUM_UNROLL)
   set(WARP_ACCUM_UNROLL 1)
 endif()
@@ -59,12 +84,14 @@ if(USE_ROCM)
 
   if(DEFINED GPU_TARGETS)
     list(GET GPU_TARGETS 0 GPU_ARCH)
-    message(STATUS "GPU ARCH: ${GPU_ARCH}")
+    message(STATUS "GPU_TARGETS: ${GPU_TARGETS}")
+    # TODO: should iterate all archs
     if(GPU_ARCH MATCHES "^gfx8")
       add_definitions(-D__GFX8__=1)
     elseif(GPU_ARCH MATCHES "^gfx9")
       add_definitions(-D__GFX9__=1)
     endif()
+    set(HIP_HIPCC_FLAGS "--amdgpu-target=${GPU_TARGETS}")
   endif()
 else()
   set(CUDA_HOME /usr/local/cuda)
@@ -86,10 +113,8 @@ else()
 endif()
 
 add_library(mori_logging INTERFACE)
-target_include_directories(mori_logging INTERFACE 
-    include 
-    3rdparty/spdlog/include)
-
+target_include_directories(mori_logging INTERFACE include
+                                                  3rdparty/spdlog/include)
 
 if(BUILD_EXAMPLES)
   set(BUILD_APPLICATION ON)

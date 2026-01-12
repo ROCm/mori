@@ -21,7 +21,7 @@
 # SOFTWARE.
 import pytest
 import mori
-from tests.python.utils import TorchDistProcessManager
+from tests.python.utils import TorchDistProcessManager, data_type_supported
 import torch
 import torch.distributed as dist
 
@@ -293,7 +293,26 @@ def _test_dispatch_combine(
 
 # TODO: create a sub process group so that we can test worlds size < 8
 @pytest.mark.parametrize("world_size", (8,))
-@pytest.mark.parametrize("data_type", (torch.float8_e4m3fnuz, torch.bfloat16))
+@pytest.mark.parametrize(
+    "data_type",
+    (
+        torch.bfloat16,
+        pytest.param(
+            torch.float8_e4m3fnuz,
+            marks=pytest.mark.skipif(
+                not data_type_supported(torch.float8_e4m3fnuz),
+                reason="Skip float8_e4m3fnuz, it is not supported",
+            ),
+        ),
+        pytest.param(
+            torch.float8_e4m3fn,
+            marks=pytest.mark.skipif(
+                not data_type_supported(torch.float8_e4m3fn),
+                reason="Skip float8_e4m3fn, it is not supported",
+            ),
+        ),
+    ),
+)
 @pytest.mark.parametrize("hidden_dim", (7168, 4096))
 @pytest.mark.parametrize("scale_dim", (0, 32))
 @pytest.mark.parametrize("scale_type_size", (1, 4))
