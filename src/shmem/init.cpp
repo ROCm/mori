@@ -57,53 +57,58 @@ void MemoryStatesInit() {
   states->memoryStates->mrMgr =
       new application::RdmaMemoryRegionManager(*context->GetRdmaDeviceContext());
 
-  // Allocate static symmetric heap
-  // Size can be configured via environment variable
-  const char* heapSizeEnv = std::getenv("MORI_SHMEM_HEAP_SIZE");
-  size_t heapSize = DEFAULT_SYMMETRIC_HEAP_SIZE;
-  
-  if (heapSizeEnv) {
-    std::string heapSizeStr(heapSizeEnv);
-    size_t multiplier = 1;
+  // Only allocate static heap in StaticHeap mode
+  if (states->mode == ShmemMode::StaticHeap) {
+    // Allocate static symmetric heap
+    // Size can be configured via environment variable
+    const char* heapSizeEnv = std::getenv("MORI_SHMEM_HEAP_SIZE");
+    size_t heapSize = DEFAULT_SYMMETRIC_HEAP_SIZE;
     
-    // Check for suffix
-    if (!heapSizeStr.empty()) {
-      char lastChar = heapSizeStr.back();
-      if (lastChar == 'G' || lastChar == 'g') {
-        multiplier = 1024ULL * 1024ULL * 1024ULL;  // GiB
-        heapSizeStr.pop_back();
-      } else if (lastChar == 'M' || lastChar == 'm') {
-        multiplier = 1024ULL * 1024ULL;  // MiB
-        heapSizeStr.pop_back();
+    if (heapSizeEnv) {
+      std::string heapSizeStr(heapSizeEnv);
+      size_t multiplier = 1;
+      
+      // Check for suffix
+      if (!heapSizeStr.empty()) {
+        char lastChar = heapSizeStr.back();
+        if (lastChar == 'G' || lastChar == 'g') {
+          multiplier = 1024ULL * 1024ULL * 1024ULL;  // GiB
+          heapSizeStr.pop_back();
+        } else if (lastChar == 'M' || lastChar == 'm') {
+          multiplier = 1024ULL * 1024ULL;  // MiB
+          heapSizeStr.pop_back();
+        }
       }
+      
+      heapSize = std::stoull(heapSizeStr) * multiplier;
     }
-    
-    heapSize = std::stoull(heapSizeStr) * multiplier;
+
+    MORI_SHMEM_INFO("Allocating static symmetric heap of size {} bytes ({} MB)", heapSize,
+                    heapSize / (1024 * 1024));
+
+    // Allocate the symmetric heap using the SymmMemManager
+    application::SymmMemObjPtr heapObj =
+        states->memoryStates->symmMemMgr->ExtMallocWithFlags(heapSize, hipDeviceMallocUncached);
+    if (!heapObj.IsValid()) {
+      MORI_SHMEM_ERROR("Failed to allocate static symmetric heap!");
+      throw std::runtime_error("Failed to allocate static symmetric heap");
+    }
+
+    states->memoryStates->staticHeapBasePtr = heapObj.cpu->localPtr;
+    states->memoryStates->staticHeapSize = heapSize;
+    // IMPORTANT: Start with a small offset to avoid collision between heap base address
+    // and first ShmemMalloc allocation. Without this, when staticHeapUsed == 0,
+    // the first ShmemMalloc would return staticHeapBasePtr, which is the same address
+    // as the heap itself in memObjPool, causing the heap's SymmMemObj to be overwritten.
+    constexpr size_t HEAP_INITIAL_OFFSET = 256;
+    states->memoryStates->staticHeapUsed = HEAP_INITIAL_OFFSET;
+    states->memoryStates->staticHeapObj = heapObj;
+
+    MORI_SHMEM_INFO("Static symmetric heap allocated at {} (local), size {} bytes, initial offset {} bytes",
+                    states->memoryStates->staticHeapBasePtr, heapSize, HEAP_INITIAL_OFFSET);
+  } else {
+    MORI_SHMEM_INFO("Running in isolation mode (no static heap)");
   }
-
-  MORI_SHMEM_INFO("Allocating static symmetric heap of size {} bytes ({} MB)", heapSize,
-                  heapSize / (1024 * 1024));
-
-  // Allocate the symmetric heap using the SymmMemManager
-  application::SymmMemObjPtr heapObj =
-      states->memoryStates->symmMemMgr->ExtMallocWithFlags(heapSize, hipDeviceMallocUncached);
-  if (!heapObj.IsValid()) {
-    MORI_SHMEM_ERROR("Failed to allocate static symmetric heap!");
-    throw std::runtime_error("Failed to allocate static symmetric heap");
-  }
-
-  states->memoryStates->staticHeapBasePtr = heapObj.cpu->localPtr;
-  states->memoryStates->staticHeapSize = heapSize;
-  // IMPORTANT: Start with a small offset to avoid collision between heap base address
-  // and first ShmemMalloc allocation. Without this, when staticHeapUsed == 0,
-  // the first ShmemMalloc would return staticHeapBasePtr, which is the same address
-  // as the heap itself in memObjPool, causing the heap's SymmMemObj to be overwritten.
-  constexpr size_t HEAP_INITIAL_OFFSET = 256;
-  states->memoryStates->staticHeapUsed = HEAP_INITIAL_OFFSET;
-  states->memoryStates->staticHeapObj = heapObj;
-
-  MORI_SHMEM_INFO("Static symmetric heap allocated at {} (local), size {} bytes, initial offset {} bytes",
-                  states->memoryStates->staticHeapBasePtr, heapSize, HEAP_INITIAL_OFFSET);
 }
 
 void GpuStateInit() {
@@ -140,19 +145,26 @@ void GpuStateInit() {
     HIP_RUNTIME_CHECK(hipMemset(gpuStates.endpointLock, 0, lockSize));
   }
 
-  // Copy static symmetric heap info to GPU
-  uintptr_t heapBase = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
-  gpuStates.heapBaseAddr = heapBase;
-  gpuStates.heapEndAddr = heapBase + states->memoryStates->staticHeapSize;
+  // Copy static symmetric heap info to GPU (only in StaticHeap mode)
+  if (states->mode == ShmemMode::StaticHeap) {
+    uintptr_t heapBase = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
+    gpuStates.heapBaseAddr = heapBase;
+    gpuStates.heapEndAddr = heapBase + states->memoryStates->staticHeapSize;
 
-  // Use the GPU-side SymmMemObj pointer that was already allocated and initialized
-  // by RegisterSymmMemObj (which properly set up peerPtrs and peerRkeys on GPU)
-  gpuStates.heapObj = states->memoryStates->staticHeapObj.gpu;
+    // Use the GPU-side SymmMemObj pointer that was already allocated and initialized
+    // by RegisterSymmMemObj (which properly set up peerPtrs and peerRkeys on GPU)
+    gpuStates.heapObj = states->memoryStates->staticHeapObj.gpu;
 
-  MORI_SHMEM_INFO("Heap info copied to GPU: base=0x{:x}, end=0x{:x}, size={} bytes, heapObj=0x{:x}",
-                  gpuStates.heapBaseAddr, gpuStates.heapEndAddr,
-                  gpuStates.heapEndAddr - gpuStates.heapBaseAddr,
-                  reinterpret_cast<uintptr_t>(gpuStates.heapObj));
+    MORI_SHMEM_INFO("Heap info copied to GPU: base=0x{:x}, end=0x{:x}, size={} bytes, heapObj=0x{:x}",
+                    gpuStates.heapBaseAddr, gpuStates.heapEndAddr,
+                    gpuStates.heapEndAddr - gpuStates.heapBaseAddr,
+                    reinterpret_cast<uintptr_t>(gpuStates.heapObj));
+  } else {
+    // In isolation mode, no heap info needed
+    gpuStates.heapBaseAddr = 0;
+    gpuStates.heapEndAddr = 0;
+    gpuStates.heapObj = nullptr;
+  }
 
   // Copy gpu states to constant memory
   HIP_RUNTIME_CHECK(
@@ -163,6 +175,26 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
   int status;
 
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
+
+  // Determine mode from environment variable
+  const char* modeEnv = std::getenv("MORI_SHMEM_MODE");
+  if (modeEnv) {
+    std::string modeStr(modeEnv);
+    if (modeStr == "isolation" || modeStr == "ISOLATION") {
+      states->mode = ShmemMode::Isolation;
+      MORI_SHMEM_INFO("Running in isolation mode");
+    } else if (modeStr == "static_heap" || modeStr == "STATIC_HEAP") {
+      states->mode = ShmemMode::StaticHeap;
+      MORI_SHMEM_INFO("Running in static heap mode");
+    } else {
+      MORI_SHMEM_WARN("Unknown MORI_SHMEM_MODE '{}', defaulting to static_heap", modeStr);
+      states->mode = ShmemMode::StaticHeap;
+    }
+  } else {
+    // Default to static heap mode
+    states->mode = ShmemMode::StaticHeap;
+    MORI_SHMEM_INFO("MORI_SHMEM_MODE not set, defaulting to static heap mode");
+  }
 
   states->bootStates = new BootStates();
   states->bootStates->bootNet = bootNet;
@@ -183,9 +215,8 @@ int ShmemFinalize() {
   HIP_RUNTIME_CHECK(hipFree(globalGpuStates.transportTypes));
   HIP_RUNTIME_CHECK(hipFree(globalGpuStates.rdmaEndpoints));
 
-
-  // Free the static symmetric heap through SymmMemManager
-  if (states->memoryStates->staticHeapObj.IsValid()) {
+  // Free the static symmetric heap through SymmMemManager (only in StaticHeap mode)
+  if (states->mode == ShmemMode::StaticHeap && states->memoryStates->staticHeapObj.IsValid()) {
     states->memoryStates->symmMemMgr->Free(states->memoryStates->staticHeapBasePtr);
   }
 

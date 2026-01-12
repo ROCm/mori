@@ -29,8 +29,6 @@
 namespace mori {
 namespace shmem {
 
-// Simple bump allocator for static symmetric heap
-// TODO: Implement a proper free list allocator for better memory reuse
 void* ShmemMalloc(size_t size) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
   states->CheckStatusValid();
@@ -39,38 +37,68 @@ void* ShmemMalloc(size_t size) {
     return nullptr;
   }
 
-  // Align to 256 bytes for better performance
-  constexpr size_t ALIGNMENT = 256;
-  size = (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+  // Use different allocation strategies based on mode
+  if (states->mode == ShmemMode::StaticHeap) {
+    // Static heap mode: bump allocator from pre-allocated heap
+    // Align to 256 bytes for better performance
+    constexpr size_t ALIGNMENT = 256;
+    size = (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
 
-  std::lock_guard<std::mutex> lock(states->memoryStates->heapLock);
+    std::lock_guard<std::mutex> lock(states->memoryStates->heapLock);
 
-  // Check if we have enough space
-  if (states->memoryStates->staticHeapUsed + size > states->memoryStates->staticHeapSize) {
-    MORI_SHMEM_ERROR("Out of symmetric heap memory! Requested: {} bytes, Available: {} bytes", size,
-                     states->memoryStates->staticHeapSize - states->memoryStates->staticHeapUsed);
+    // Check if we have enough space
+    if (states->memoryStates->staticHeapUsed + size > states->memoryStates->staticHeapSize) {
+      MORI_SHMEM_ERROR("Out of symmetric heap memory! Requested: {} bytes, Available: {} bytes", size,
+                       states->memoryStates->staticHeapSize - states->memoryStates->staticHeapUsed);
+      return nullptr;
+    }
+
+    // Allocate from the bump pointer
+    uintptr_t baseAddr = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
+    void* ptr = reinterpret_cast<void*>(baseAddr + states->memoryStates->staticHeapUsed);
+    states->memoryStates->staticHeapUsed += size;
+
+    states->memoryStates->symmMemMgr->HeapRegisterSymmMemObj(ptr, size,
+                                                             &states->memoryStates->staticHeapObj);
+    MORI_SHMEM_TRACE("Allocated {} bytes at offset {} (total used: {} / {})", size,
+                     reinterpret_cast<uintptr_t>(ptr) - baseAddr,
+                     states->memoryStates->staticHeapUsed, states->memoryStates->staticHeapSize);
+
+    return ptr;
+  } else {
+    // Isolation mode: each allocation gets its own SymmMemObj
+    application::SymmMemObjPtr obj = states->memoryStates->symmMemMgr->Malloc(size);
+    MORI_SHMEM_TRACE("Allocated shared memory of size {} in isolation mode", size);
+    if (obj.IsValid()) {
+      return obj.cpu->localPtr;
+    }
     return nullptr;
   }
-
-  // Allocate from the bump pointer
-  uintptr_t baseAddr = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
-  void* ptr = reinterpret_cast<void*>(baseAddr + states->memoryStates->staticHeapUsed);
-  states->memoryStates->staticHeapUsed += size;
-
-  states->memoryStates->symmMemMgr->HeapRegisterSymmMemObj(ptr, size,
-                                                           &states->memoryStates->staticHeapObj);
-  MORI_SHMEM_TRACE("Allocated {} bytes at offset {} (total used: {} / {})", size,
-                   reinterpret_cast<uintptr_t>(ptr) - baseAddr,
-                   states->memoryStates->staticHeapUsed, states->memoryStates->staticHeapSize);
-
-  return ptr;
 }
 
 void* ShmemExtMallocWithFlags(size_t size, unsigned int flags) {
-  // For now, ignore flags and use the same allocator
-  // TODO: Support different allocation flags if needed
-  MORI_SHMEM_TRACE("Allocated shared memory of size {} with flags {} (flags ignored)", size, flags);
-  return ShmemMalloc(size);
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
+
+  if (size == 0) {
+    return nullptr;
+  }
+
+  // Use different allocation strategies based on mode
+  if (states->mode == ShmemMode::StaticHeap) {
+    // In static heap mode, flags are ignored - use the same allocator as ShmemMalloc
+    MORI_SHMEM_TRACE("Allocated shared memory of size {} with flags {} (flags ignored in static heap mode)", size, flags);
+    return ShmemMalloc(size);
+  } else {
+    // Isolation mode: use ExtMallocWithFlags directly
+    application::SymmMemObjPtr obj =
+        states->memoryStates->symmMemMgr->ExtMallocWithFlags(size, flags);
+    MORI_SHMEM_TRACE("Allocated shared memory of size {} with flags {} in isolation mode", size, flags);
+    if (obj.IsValid()) {
+      return obj.cpu->localPtr;
+    }
+    return nullptr;
+  }
 }
 
 void ShmemFree(void* localPtr) {
@@ -81,7 +109,15 @@ void ShmemFree(void* localPtr) {
     return;
   }
 
-  states->memoryStates->symmMemMgr->HeapDeregisterSymmMemObj(localPtr);
+  // Use different deallocation strategies based on mode
+  if (states->mode == ShmemMode::StaticHeap) {
+    // Static heap mode: just deregister from the pool (no actual free)
+    // TODO: Implement a proper free list allocator for better memory reuse
+    states->memoryStates->symmMemMgr->HeapDeregisterSymmMemObj(localPtr);
+  } else {
+    // Isolation mode: free the memory and deregister
+    states->memoryStates->symmMemMgr->Free(localPtr);
+  }
 }
 
 application::SymmMemObjPtr ShmemQueryMemObjPtr(void* localPtr) {

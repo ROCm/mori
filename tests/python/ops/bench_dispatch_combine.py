@@ -24,8 +24,9 @@ from tests.python.ops.test_dispatch_combine import EpDispatchCombineTestCase
 from tests.python.utils import TorchDistContext, get_free_port
 import torch
 import torch.distributed as dist
+import os
 
-
+os.environ["MORI_SHMEM_HEAP_SIZE"] = "6G"
 class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
     def __init__(self, config):
         super().__init__(config)
