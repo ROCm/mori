@@ -421,8 +421,8 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
 
   while (true) {
     uint64_t db_touched =
-        __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+        __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint64_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     uint64_t num_active_sq_entries = db_touched - db_done;
     uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
     uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
@@ -721,8 +721,8 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
 
   while (true) {
     uint64_t db_touched =
-        __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+        __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    uint64_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     uint64_t num_active_sq_entries = db_touched - db_done;
     uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
     uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_wqes - db_touched;
