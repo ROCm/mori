@@ -177,6 +177,20 @@ void testAtomicNonFetchThread() {
   int status;
   MPI_Init(NULL, NULL);
 
+  // Set GPU device based on local rank
+  MPI_Comm localComm;
+  MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &localComm);
+  
+  int localRank;
+  MPI_Comm_rank(localComm, &localRank);
+  
+  int deviceCount;
+  HIP_RUNTIME_CHECK(hipGetDeviceCount(&deviceCount));
+  int deviceId = localRank % deviceCount;
+  HIP_RUNTIME_CHECK(hipSetDevice(deviceId));
+  
+  printf("Local rank %d setting GPU device %d (total %d devices)\n", localRank, deviceId, deviceCount);
+
   status = ShmemMpiInit(MPI_COMM_WORLD);
   assert(!status);
 
@@ -565,6 +579,7 @@ void testAtomicNonFetchThread() {
 
   // Finalize
   ShmemFree(buff);
+  MPI_Comm_free(&localComm);
   ShmemFinalize();
 }
 
