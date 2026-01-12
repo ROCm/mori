@@ -125,7 +125,14 @@ int OneShotAllReduceExecutor<T>::InitializeScratchBuffers(size_t maxBytes, hipSt
     scratchBuffer = nullptr;
     return -1;
   }
-  hipStreamSynchronize(stream);
+  err = hipStreamSynchronize(stream);
+  if (err != hipSuccess) {
+    shmem::ShmemFree(flagsBuffer);
+    shmem::ShmemFree(scratchBuffer);
+    flagsBuffer = nullptr;
+    scratchBuffer = nullptr;
+    return -1;
+  }
 
   currentMaxBytes = maxBytes;
   return 0;
@@ -133,7 +140,7 @@ int OneShotAllReduceExecutor<T>::InitializeScratchBuffers(size_t maxBytes, hipSt
 
 template <typename T>
 void OneShotAllReduceExecutor<T>::FinalizeScratchBuffers() {
-  hipDeviceSynchronize();
+  (void)hipDeviceSynchronize();
 
   if (flagsBuffer) {
     shmem::ShmemFree(flagsBuffer);
@@ -243,7 +250,7 @@ int OneShotAllReduceExecutor<T>::Execute(T* input, T* output, size_t count, hipS
   hipError_t kernelStatus = hipGetLastError();
   if (kernelStatus != hipSuccess) {
     if (needTempInputReg || needTempOutputReg) {
-      hipStreamSynchronize(stream);
+      (void)hipStreamSynchronize(stream);
       if (needTempInputReg) {
         shmem::ShmemSymmetricDeregister(input, totalBytes);
       }
@@ -255,12 +262,15 @@ int OneShotAllReduceExecutor<T>::Execute(T* input, T* output, size_t count, hipS
   }
 
   if (needTempInputReg || needTempOutputReg) {
-    hipStreamSynchronize(stream);
+    hipError_t syncErr = hipStreamSynchronize(stream);
     if (needTempInputReg) {
       shmem::ShmemSymmetricDeregister(input, totalBytes);
     }
     if (needTempOutputReg && input != output) {
       shmem::ShmemSymmetricDeregister(output, totalBytes);
+    }
+    if (syncErr != hipSuccess) {
+      return -1;
     }
   }
 

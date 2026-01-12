@@ -32,6 +32,16 @@
 
 #include "mori/collective/intra_node/executor.hpp"
 
+#define HIP_CHECK(call)                                                   \
+  do {                                                                    \
+    hipError_t err = call;                                                \
+    if (err != hipSuccess) {                                              \
+      std::cerr << "HIP error at " << __FILE__ << ":" << __LINE__ << ": " \
+                << hipGetErrorString(err) << std::endl;                   \
+      MPI_Abort(MPI_COMM_WORLD, 1);                                       \
+    }                                                                     \
+  } while (0)
+
 // Helper function to initialize data
 void initializeData(float* data, size_t count, int rank) {
   for (size_t i = 0; i < count; i++) {
@@ -80,7 +90,7 @@ int main(int argc, char** argv) {
 
   try {
     // set device
-    hipSetDevice(rank);
+    HIP_CHECK(hipSetDevice(rank));
 
     // ===== step 1: initialize executor (using polymorphism with smart pointer) =====
     if (rank == 0) {
@@ -102,16 +112,16 @@ int main(int argc, char** argv) {
 
     // allocate device memory
     float* d_data;
-    hipMalloc(&d_data, count * sizeof(float));
+    HIP_CHECK(hipMalloc(&d_data, count * sizeof(float)));
 
     // initialize input data
     std::vector<float> h_data(count);
     initializeData(h_data.data(), count, rank);
-    hipMemcpy(d_data, h_data.data(), count * sizeof(float), hipMemcpyHostToDevice);
+    HIP_CHECK(hipMemcpy(d_data, h_data.data(), count * sizeof(float), hipMemcpyHostToDevice));
 
     // create stream
     hipStream_t stream;
-    hipStreamCreate(&stream);
+    HIP_CHECK(hipStreamCreate(&stream));
 
     // ===== step 2: execute AllReduce (can be called multiple times) =====
     if (rank == 0) {
@@ -131,10 +141,10 @@ int main(int argc, char** argv) {
       MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    hipStreamSynchronize(stream);
+    HIP_CHECK(hipStreamSynchronize(stream));
 
     // verify results
-    hipMemcpy(h_data.data(), d_data, count * sizeof(float), hipMemcpyDeviceToHost);
+    HIP_CHECK(hipMemcpy(h_data.data(), d_data, count * sizeof(float), hipMemcpyDeviceToHost));
     bool success = verifyResults(h_data.data(), count, num_ranks);
     int success_int = success ? 1 : 0;
 
@@ -159,11 +169,11 @@ int main(int argc, char** argv) {
     for (int iter = 0; iter < 5; iter++) {
       // reinitialize data
       initializeData(h_data.data(), count, rank);
-      hipMemcpy(d_data, h_data.data(), count * sizeof(float), hipMemcpyHostToDevice);
+      HIP_CHECK(hipMemcpy(d_data, h_data.data(), count * sizeof(float), hipMemcpyHostToDevice));
 
       // execute AllReduce (completely same call)
       result = executor->Execute(d_data, d_data, count, stream);
-      hipStreamSynchronize(stream);
+      HIP_CHECK(hipStreamSynchronize(stream));
 
       if (result != 0) {
         std::cerr << "  Rank " << rank << ": ✗ call " << iter + 1 << " failed" << std::endl;
@@ -184,8 +194,8 @@ int main(int argc, char** argv) {
     }
 
     // clean up
-    hipFree(d_data);
-    hipStreamDestroy(stream);
+    HIP_CHECK(hipFree(d_data));
+    HIP_CHECK(hipStreamDestroy(stream));
 
     MPI_Finalize();
     return 0;
