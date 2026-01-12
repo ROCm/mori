@@ -26,6 +26,7 @@ from tests.python.utils import TorchDistProcessManager
 import torch
 import torch.distributed as dist
 
+os.environ["MORI_SHMEM_HEAP_SIZE"] = "6G"
 
 class EpDispatchCombineTestCase:
     def __init__(self, config):
