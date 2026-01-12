@@ -72,11 +72,11 @@ void MemoryStatesInit() {
     // Size can be configured via environment variable
     const char* heapSizeEnv = std::getenv("MORI_SHMEM_HEAP_SIZE");
     size_t heapSize = DEFAULT_SYMMETRIC_HEAP_SIZE;
-    
+
     if (heapSizeEnv) {
       std::string heapSizeStr(heapSizeEnv);
       size_t multiplier = 1;
-      
+
       // Check for suffix
       if (!heapSizeStr.empty()) {
         char lastChar = heapSizeStr.back();
@@ -88,7 +88,7 @@ void MemoryStatesInit() {
           heapSizeStr.pop_back();
         }
       }
-      
+
       heapSize = std::stoull(heapSizeStr) * multiplier;
     }
 
@@ -113,8 +113,9 @@ void MemoryStatesInit() {
     states->memoryStates->staticHeapUsed = HEAP_INITIAL_OFFSET;
     states->memoryStates->staticHeapObj = heapObj;
 
-    MORI_SHMEM_INFO("Static symmetric heap allocated at {} (local), size {} bytes, initial offset {} bytes",
-                    states->memoryStates->staticHeapBasePtr, heapSize, HEAP_INITIAL_OFFSET);
+    MORI_SHMEM_INFO(
+        "Static symmetric heap allocated at {} (local), size {} bytes, initial offset {} bytes",
+        states->memoryStates->staticHeapBasePtr, heapSize, HEAP_INITIAL_OFFSET);
   } else {
     MORI_SHMEM_INFO("Running in isolation mode (no static heap)");
   }
@@ -164,10 +165,11 @@ void GpuStateInit() {
     // by RegisterSymmMemObj (which properly set up peerPtrs and peerRkeys on GPU)
     gpuStates.heapObj = states->memoryStates->staticHeapObj.gpu;
 
-    MORI_SHMEM_INFO("Heap info copied to GPU: base=0x{:x}, end=0x{:x}, size={} bytes, heapObj=0x{:x}",
-                    gpuStates.heapBaseAddr, gpuStates.heapEndAddr,
-                    gpuStates.heapEndAddr - gpuStates.heapBaseAddr,
-                    reinterpret_cast<uintptr_t>(gpuStates.heapObj));
+    MORI_SHMEM_INFO(
+        "Heap info copied to GPU: base=0x{:x}, end=0x{:x}, size={} bytes, heapObj=0x{:x}",
+        gpuStates.heapBaseAddr, gpuStates.heapEndAddr,
+        gpuStates.heapEndAddr - gpuStates.heapBaseAddr,
+        reinterpret_cast<uintptr_t>(gpuStates.heapObj));
   } else {
     // In isolation mode, no heap info needed
     gpuStates.heapBaseAddr = 0;
@@ -176,15 +178,15 @@ void GpuStateInit() {
   }
 
   // Copy gpu states to device memory (using hipGetSymbolAddress + hipMemcpy)
-  GpuStates* globalGpuStates_addr = nullptr;
-  HIP_RUNTIME_CHECK(hipGetSymbolAddress(reinterpret_cast<void**>(&globalGpuStates_addr),
+  GpuStates* globalGpuStatesAddr = nullptr;
+  HIP_RUNTIME_CHECK(hipGetSymbolAddress(reinterpret_cast<void**>(&globalGpuStatesAddr),
                                         HIP_SYMBOL(globalGpuStates)));
 
   MORI_SHMEM_INFO("globalGpuStates device address: 0x{:x}",
-                  reinterpret_cast<uintptr_t>(globalGpuStates_addr));
+                  reinterpret_cast<uintptr_t>(globalGpuStatesAddr));
 
   HIP_RUNTIME_CHECK(
-      hipMemcpy(globalGpuStates_addr, &gpuStates, sizeof(GpuStates), hipMemcpyDefault));
+      hipMemcpy(globalGpuStatesAddr, &gpuStates, sizeof(GpuStates), hipMemcpyDefault));
 
   MORI_SHMEM_INFO("Successfully copied GpuStates to device (rank={}, worldSize={})", gpuStates.rank,
                   gpuStates.worldSize);
@@ -274,26 +276,24 @@ int ShmemNPes() {
 }
 
 int ShmemModuleInit(void* hipModule) {
-
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
   states->CheckStatusValid();
 
-  GpuStates* hostGlobalGpuStates_addr = nullptr;
-  HIP_RUNTIME_CHECK(hipGetSymbolAddress(reinterpret_cast<void**>(&hostGlobalGpuStates_addr),
+  GpuStates* hostGlobalGpuStatesAddr = nullptr;
+  HIP_RUNTIME_CHECK(hipGetSymbolAddress(reinterpret_cast<void**>(&hostGlobalGpuStatesAddr),
                                         HIP_SYMBOL(globalGpuStates)));
 
   // Read the current values from device
   GpuStates gpuStates;
   HIP_RUNTIME_CHECK(
-      hipMemcpy(&gpuStates, hostGlobalGpuStates_addr, sizeof(GpuStates), hipMemcpyDeviceToHost));
+      hipMemcpy(&gpuStates, hostGlobalGpuStatesAddr, sizeof(GpuStates), hipMemcpyDeviceToHost));
 
   // Get the symbol address from the specific module
   hipModule_t module = static_cast<hipModule_t>(hipModule);
-  GpuStates* moduleGlobalGpuStates_addr = nullptr;
+  GpuStates* moduleGlobalGpuStatesAddr = nullptr;
 
-  hipError_t err =
-      hipModuleGetGlobal(reinterpret_cast<hipDeviceptr_t*>(&moduleGlobalGpuStates_addr), nullptr,
-                         module, "_ZN4mori5shmem15globalGpuStatesE");
+  hipError_t err = hipModuleGetGlobal(reinterpret_cast<hipDeviceptr_t*>(&moduleGlobalGpuStatesAddr),
+                                      nullptr, module, "_ZN4mori5shmem15globalGpuStatesE");
 
   if (err != hipSuccess) {
     MORI_SHMEM_WARN("Failed to get globalGpuStates symbol from module: {} (error code: {})",
@@ -302,12 +302,12 @@ int ShmemModuleInit(void* hipModule) {
   }
 
   MORI_SHMEM_INFO("Module globalGpuStates address: 0x{:x} (host lib address: 0x{:x})",
-                  reinterpret_cast<uintptr_t>(moduleGlobalGpuStates_addr),
-                  reinterpret_cast<uintptr_t>(hostGlobalGpuStates_addr));
+                  reinterpret_cast<uintptr_t>(moduleGlobalGpuStatesAddr),
+                  reinterpret_cast<uintptr_t>(hostGlobalGpuStatesAddr));
 
   // Copy the GpuStates to the module's globalGpuStates
   HIP_RUNTIME_CHECK(
-      hipMemcpy(moduleGlobalGpuStates_addr, &gpuStates, sizeof(GpuStates), hipMemcpyHostToDevice));
+      hipMemcpy(moduleGlobalGpuStatesAddr, &gpuStates, sizeof(GpuStates), hipMemcpyHostToDevice));
 
   MORI_SHMEM_INFO("Successfully initialized globalGpuStates in module (rank={}, worldSize={})",
                   gpuStates.rank, gpuStates.worldSize);
@@ -354,8 +354,8 @@ int ShmemGetUniqueId(mori_shmem_uniqueid_t* uid) {
       int random_port = port_dis(gen);
 
       socket_uid = application::SocketBootstrapNetwork::GenerateUniqueIdWithLocalAddr(random_port);
-      std::string local_addr = application::SocketBootstrapNetwork::GetLocalNonLoopbackAddress();
-      MORI_SHMEM_INFO("Generated UniqueId with auto-detected interface: {} (port {})", local_addr,
+      std::string localAddr = application::SocketBootstrapNetwork::GetLocalNonLoopbackAddress();
+      MORI_SHMEM_INFO("Generated UniqueId with auto-detected interface: {} (port {})", localAddr,
                       random_port);
     }
     static_assert(sizeof(socket_uid) == sizeof(mori_shmem_uniqueid_t),
