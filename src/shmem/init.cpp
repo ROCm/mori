@@ -88,7 +88,6 @@ void MemoryStatesInit() {
           heapSizeStr.pop_back();
         }
       }
-
       heapSize = std::stoull(heapSizeStr) * multiplier;
     }
 
