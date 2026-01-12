@@ -62,7 +62,7 @@ class EpDispatchCombineTestCase:
             max_num_inp_token_per_rank=max_tokens,
             num_experts_per_rank=16,
             num_experts_per_token=8,
-            warp_num_per_block=8,
+            warp_num_per_block=16,
             block_num=64,
             max_token_type_size=2,
             kernel_type=kernel_type_map[kernel_type],
@@ -296,9 +296,10 @@ class EpDispatchCombineTestCase:
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
                 block_num=self.config.block_num,
-                warp_per_block=16,
             )
-            op.dispatch_recv()
+            op.dispatch_recv(
+                block_num=self.config.block_num,
+            )
         else:
             (
                 dispatch_output,
@@ -363,9 +364,10 @@ class EpDispatchCombineTestCase:
                 dispatch_weights,
                 all_rank_indices[self.rank],
                 block_num=self.config.block_num,
-                warp_per_block=16,
             )
-            op.combine_recv()
+            op.combine_recv(
+                block_num=self.config.block_num,
+            )
         else:
             combine_output, combine_output_weight = op.combine(
                 dispatch_output,
@@ -575,7 +577,6 @@ class EpDispatchCombineTestCase:
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
                 block_num=self.config.block_num,
-                # warp_per_block=16,
             )
             op.dispatch_recv()
             torch.cuda.synchronize()
@@ -632,9 +633,10 @@ class EpDispatchCombineTestCase:
                     all_rank_scales[self.rank],
                     all_rank_indices[self.rank],
                     block_num=self.config.block_num,
-                    warp_per_block=16,
                 )
-                op.dispatch_recv()
+                op.dispatch_recv(
+                    block_num=self.config.block_num,
+                )
             else:
                 (
                     dispatch_output,
@@ -656,13 +658,10 @@ class EpDispatchCombineTestCase:
                     dispatch_output,
                     dispatch_weights,
                     all_rank_indices[self.rank],
-                    # block_num=self.config.block_num,
-                    block_num=256,
-                    warp_per_block=4,
+                    block_num=self.config.block_num,
                 )
                 op.combine_recv(
-                    block_num=256,
-                    warp_per_block=4,
+                    block_num=self.config.block_num,
                 )
             else:
                 combine_output, _ = op.combine(
