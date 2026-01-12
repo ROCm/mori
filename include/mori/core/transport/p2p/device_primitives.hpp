@@ -197,19 +197,22 @@ inline __device__ void ThreadCopy(T* dst, T* src, size_t nelems) {
   int offset = 0;
 
   while ((offset + vecSize) <= nelems) {
-    store<VecBytes>(dst + offset, reinterpret_cast<DataType*>(src + offset)[0]);
+    reinterpret_cast<uint4*>(dst + offset)[0] = reinterpret_cast<uint4*>(src + offset)[0];
+    // store<VecBytes>(dst + offset, reinterpret_cast<DataType*>(src + offset)[0]);
     offset += vecSize;
   }
 
   while (offset < nelems) {
-    store<sizeof(T)>(dst + offset, src[offset]);
+    dst[offset] = src[offset];
+    // store<sizeof(T)>(dst + offset, src[offset]);
     offset += 1;
   }
 }
 
-template <typename T, int VecBytes, int Unroll>
+template <typename T, int Unroll>
 inline __device__ void WarpCopyImpl(T* __restrict__ dst, const T* __restrict__ src, size_t& offset,
                                     size_t nelems) {
+  constexpr int VecBytes = 16;
   constexpr int vecSize = VecBytes / sizeof(T);
   int laneId = threadIdx.x & (warpSize - 1);
   using DataType = typename VecTypeSelector<VecBytes>::dataType;
@@ -232,14 +235,14 @@ inline __device__ void WarpCopyImpl(T* __restrict__ dst, const T* __restrict__ s
   }
 }
 
-template <typename T, int VecBytes = 16, int Unroll = 1>
+template <typename T, int Unroll = 1>
 inline __device__ void WarpCopy(T* __restrict__ dst, const T* __restrict__ src, size_t nelems) {
   int laneId = threadIdx.x & (warpSize - 1);
 
   size_t offset = 0;
-  WarpCopyImpl<T, VecBytes, Unroll>(dst, src, offset, nelems);
+  WarpCopyImpl<T, Unroll>(dst, src, offset, nelems);
   if constexpr (Unroll > 1) {
-    WarpCopyImpl<T, VecBytes, 1>(dst, src, offset, nelems);
+    WarpCopyImpl<T, 1>(dst, src, offset, nelems);
   }
 
   offset += laneId;
