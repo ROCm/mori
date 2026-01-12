@@ -126,16 +126,16 @@ void Context::InitializePossibleTransports() {
   ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(devices);
 
   if (rankInNode == 0) {
-    std::cout << "rank " << LocalRank() << " RDMA devices: ";
+    std::string rdma_devices;
     if (activeDevicePortList.empty()) {
-      std::cout << "None" << std::endl;
+      rdma_devices = "None";
     } else {
       for (size_t i = 0; i < activeDevicePortList.size(); ++i) {
-        if (i > 0) std::cout << ", ";
-        std::cout << activeDevicePortList[i].first->Name();
+        if (i > 0) rdma_devices += ", ";
+        rdma_devices += activeDevicePortList[i].first->Name();
       }
-      std::cout << std::endl;
     }
+    MORI_APP_INFO("rank {} RDMA devices: {}", LocalRank(), rdma_devices);
   }
 
   // Match gpu and nic
@@ -170,11 +170,10 @@ void Context::InitializePossibleTransports() {
   }
 
   if (device == nullptr) {
-    std::cout << "rank " << LocalRank() << " rankInNode " << rankInNode << " select no device"
-              << std::endl;
+    MORI_APP_INFO("rank {} rankInNode {} select no device", LocalRank(), rankInNode);
   } else {
-    std::cout << "rank " << LocalRank() << " rankInNode " << rankInNode << " select device "
-              << "[" << devicePortId << "] " << device->Name() << std::endl;
+    MORI_APP_INFO("rank {} rankInNode {} select device [{}] {}", LocalRank(), rankInNode,
+                  devicePortId, device->Name());
   }
 
   int numQpPerPe = 4;
