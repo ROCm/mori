@@ -247,7 +247,7 @@ std::optional<uint8_t> ReadUint8FromEnvVar(const std::string& name) {
   // Check conversion errors
   errno = 0;
   char* end = nullptr;
-  unsigned long parsed = std::strtoul(val, nullptr, 10);
+  unsigned long parsed = std::strtoul(val, end, 10);
   if (errno != 0 || end == val || *end != '\0') {
     return std::nullopt;
   }
