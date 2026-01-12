@@ -304,7 +304,7 @@ void TopoSystemPci::Load() {
           struct pci_dev* lastDev = dsp2dev[dspBusId];
           if (pci_read_byte(dev, PCI_PRIMARY_BUS) < pci_read_byte(lastDev, PCI_PRIMARY_BUS)) continue;
         }
-        dsp2dev.insert({dspBusId, dev});
+        dsp2dev[dspBusId] = dev;
         assert(dev->bus == pci_read_byte(dev, PCI_PRIMARY_BUS));
       }
     }
