@@ -35,7 +35,7 @@
 #include "mori/application/utils/math.hpp"
 #include "mori/utils/mori_log.hpp"
 
-// #define USE_BNXT_DEFAULT_DBR
+#define USE_BNXT_DEFAULT_DBR
 
 #ifdef ENABLE_BNXT
 namespace std {
