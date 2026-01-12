@@ -198,6 +198,7 @@ SymmMemObjPtr SymmMemManager::HeapRegisterSymmMemObj(void* localPtr, size_t size
   cpuMemObj->peerRkeys = static_cast<uint32_t*>(calloc(worldSize, sizeof(uint32_t)));
   memcpy(cpuMemObj->peerRkeys, heapObj->cpu->peerRkeys, sizeof(uint32_t) * worldSize);
   cpuMemObj->lkey = heapObj->cpu->lkey;
+  cpuMemObj->sdmaNumQueue = heapObj->cpu->sdmaNumQueue;
 
   SymmMemObj* gpuMemObj;
   HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj, sizeof(SymmMemObj)));
@@ -210,6 +211,23 @@ SymmMemObjPtr SymmMemManager::HeapRegisterSymmMemObj(void* localPtr, size_t size
   HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->peerRkeys, sizeof(uint32_t) * worldSize));
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerRkeys, cpuMemObj->peerRkeys,
                               sizeof(uint32_t) * worldSize, hipMemcpyHostToDevice));
+
+  // Copy SDMA resources from heap object (shared across all heap allocations)
+  if (heapObj->gpu->deviceHandles_d != nullptr) {
+    std::vector<int> dstDeviceIds;
+    for (int i = 0; i < worldSize; i++) {
+      if (context.GetTransportType(i) != TransportType::SDMA) continue;
+      if (i == rank) continue;
+      dstDeviceIds.push_back(i % 8);  // should be intra devices count
+    }
+
+    if (dstDeviceIds.size() != 0) {
+      int numOfQueuesPerDevice = cpuMemObj->sdmaNumQueue;
+      gpuMemObj->deviceHandles_d = heapObj->gpu->deviceHandles_d;
+      gpuMemObj->signalPtrs = heapObj->gpu->signalPtrs;
+      gpuMemObj->expectSignalsPtr = heapObj->gpu->expectSignalsPtr;
+    }
+  }
 
   memObjPool.insert({localPtr, SymmMemObjPtr{cpuMemObj, gpuMemObj}});
   return memObjPool.at(localPtr);

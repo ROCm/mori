@@ -1,6 +1,6 @@
 find_package(MPI REQUIRED)
 
-option(BUILD_SHMEM_DEVICE_WRAPPER "Build SHMEM device API wrapper" ON)
+option(BUILD_SHMEM_DEVICE_WRAPPER "Build SHMEM device API wrapper" OFF)
 
 if(BUILD_SHMEM_DEVICE_WRAPPER)
   add_library(mori_shmem init.cpp memory.cpp shmem_device_api_wrapper.cpp)
