@@ -25,6 +25,7 @@
 
 #include <cassert>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -182,6 +183,13 @@ struct RdmaEndpoint {
 };
 
 class RdmaDevice;
+
+/* -------------------------------------------------------------------------- */
+/*                             Rdma Configurations                            */
+/* -------------------------------------------------------------------------- */
+
+std::optional<uint8_t> ReadRdmaServiceLevelEnv();
+std::optional<uint8_t> ReadRdmaTrafficClassEnv();
 
 /* -------------------------------------------------------------------------- */
 /*                              RdmaDeviceContext                             */

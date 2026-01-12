@@ -391,9 +391,15 @@ void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
   memcpy(&attr.ah_attr.grh.dgid, remote_handle.eth.gid, 16);
   attr.ah_attr.grh.sgid_index = local_handle.eth.gidIdx;
   attr.ah_attr.grh.hop_limit = 1;
-  attr.ah_attr.sl = 1;
   attr.ah_attr.is_global = 1;
   attr.ah_attr.port_num = config.portId;
+  attr.ah_attr.sl = ReadRdmaServiceLevelEnv().value_or(1);
+  std::optional<uint8_t> tc = ReadRdmaTrafficClassEnv();
+  if (tc.has_value()) {
+    attr.ah_attr.grh.traffic_class = tc.value();
+  }
+  MORI_APP_INFO("bnxt attr.ah_attr.sl:{} attr.ah_attr.grh.traffic_class:{}", attr.ah_attr.sl,
+                attr.ah_attr.grh.traffic_class);
 
   // TODO: max_dest_rd_atomic whether affect nums of amo/rd
   attr.max_dest_rd_atomic = deviceAttr.orig_attr.max_qp_rd_atom;
