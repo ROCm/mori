@@ -28,13 +28,14 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <unordered_set>
 
 #include "infiniband/verbs.h"
 #include "mori/application/transport/rdma/providers/bnxt/bnxt.hpp"
-#include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
+#include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
 #include "mori/utils/mori_log.hpp"
 
@@ -233,6 +234,36 @@ GidSelectionResult AutoSelectGidIndex(ibv_context* context, uint32_t portId,
   return result;
 }
 
+/* -------------------------------------------------------------------------- */
+/*                             Rdma Configurations                            */
+/* -------------------------------------------------------------------------- */
+
+std::optional<uint8_t> ReadUint8FromEnvVar(const std::string& name) {
+  const char* val = std::getenv(name.c_str());
+  if (!val) {
+    return std::nullopt;  // env not set
+  }
+
+  // Check conversion errors
+  errno = 0;
+  char* end = nullptr;
+  unsigned long parsed = std::strtoul(val, nullptr, 10);
+  if (errno != 0 || end == val || *end != '\0') {
+    return std::nullopt;
+  }
+
+  // Range check for uint8_t
+  if (parsed > std::numeric_limits<uint8_t>::max()) {
+    return std::nullopt;
+  }
+
+  return static_cast<uint8_t>(parsed);
+}
+
+std::optional<uint8_t> ReadRdmaServiceLevelEnv() { return ReadUint8FromEnvVar("MORI_RDMA_SL"); }
+
+std::optional<uint8_t> ReadRdmaTrafficClassEnv() { return ReadUint8FromEnvVar("MORI_RDMA_TC"); }
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        RdmaDeviceContext                                       */
 /* ---------------------------------------------------------------------------------------------- */
@@ -252,7 +283,8 @@ ibv_context* RdmaDeviceContext::GetIbvContext() { return GetRdmaDevice()->defaul
 application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegion(void* ptr, size_t size,
                                                                           int accessFlag) {
   ibv_mr* mr = ibv_reg_mr(pd, ptr, size, accessFlag);
-  MORI_APP_TRACE("RegisterRdmaMemoryRegion, addr:{}, size:{}, lkey:{}, rkey:{}\n", ptr, size, mr->lkey, mr->rkey);
+  MORI_APP_TRACE("RegisterRdmaMemoryRegion, addr:{}, size:{}, lkey:{}, rkey:{}\n", ptr, size,
+                 mr->lkey, mr->rkey);
   assert(mr);
   mrPool.insert({ptr, mr});
   application::RdmaMemoryRegion handle;
@@ -417,7 +449,7 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
   ibv_device_attr_ex device_attr_ex;
   int status = ibv_query_device_ex(context, NULL, &device_attr_ex);
   assert(!status);
-  //device_attr_ex.orig_attr.vendor_id = 0x14E4;
+  // device_attr_ex.orig_attr.vendor_id = 0x14E4;
   if (backendType == RdmaBackendType::IBVerbs) {
     return new IBVerbsDevice(inDevice);
   } else if (backendType == RdmaBackendType::DirectVerbs) {
@@ -430,11 +462,11 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
         return new BnxtDevice(inDevice);
         break;
 #endif
-#ifdef ENABLE_IONIC	
+#ifdef ENABLE_IONIC
       case (static_cast<uint32_t>(RdmaDeviceVendorId::Pensando)):
         return new IonicDevice(inDevice);
         break;
-#endif	
+#endif
       default:
         return nullptr;
     }
