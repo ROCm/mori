@@ -29,6 +29,15 @@
 #endif
 #endif
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                         Debug Printf                                           */
+/* ---------------------------------------------------------------------------------------------- */
+#ifdef MORI_ENABLE_DEBUG_PRINTF
+  #define MORI_PRINTF(...) printf(__VA_ARGS__)
+#else
+  #define MORI_PRINTF(...) ((void)0)
+#endif
+
 namespace mori {
 namespace core {
 
