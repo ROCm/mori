@@ -23,6 +23,7 @@
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
+
 #include "mori/core/utils.hpp"
 namespace mori {
 namespace core {
@@ -190,16 +191,20 @@ __device__ __forceinline__ void store<16>(void* addr,
 
 template <typename T>
 inline __device__ void ThreadCopy(T* dst, T* src, size_t nelems) {
-  constexpr int vecSize = 16 / sizeof(T);
+  constexpr int VecBytes = 16;
+  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+  constexpr int vecSize = VecBytes / sizeof(T);
   int offset = 0;
 
   while ((offset + vecSize) <= nelems) {
     reinterpret_cast<uint4*>(dst + offset)[0] = reinterpret_cast<uint4*>(src + offset)[0];
+    // store<VecBytes>(dst + offset, reinterpret_cast<DataType*>(src + offset)[0]);
     offset += vecSize;
   }
 
   while (offset < nelems) {
     dst[offset] = src[offset];
+    // store<sizeof(T)>(dst + offset, src[offset]);
     offset += 1;
   }
 }
@@ -478,9 +483,11 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
   const size_t laneOffset = laneId * vecSize;
 
   float scales[AccumNum];
+  const T* cached_srcs[AccumNum];
 #pragma unroll AccumNum
   for (int i = 0; i < AccumNum; ++i) {
     scales[i] = (srcScales == nullptr) ? 1.0f : srcScales[i];
+    cached_srcs[i] = srcs[i];
   }
 
   for (size_t iter = 0; iter < numIters; ++iter) {
@@ -489,12 +496,13 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
     DataType srcVals[AccumNum];
 #pragma unroll AccumNum
     for (int i = 0; i < AccumNum; ++i) {
-      if (srcs[i] != nullptr) srcVals[i] = load<VecBytes>(srcs[i] + offset + laneOffset);
+      if (cached_srcs[i] != nullptr)
+        srcVals[i] = load<VecBytes>(cached_srcs[i] + offset + laneOffset);
     }
 
 #pragma unroll AccumNum
     for (int i = 0; i < AccumNum; ++i) {
-      if (srcs[i] != nullptr) {
+      if (cached_srcs[i] != nullptr) {
 #pragma unroll vecSize
         for (int j = 0; j < vecSize; ++j) {
           accumValFp32[j] += float(reinterpret_cast<const T*>(srcVals + i)[j]) * scales[i];
@@ -630,7 +638,7 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
 }
 
 #ifndef WARP_ACCUM_UNROLL
-#define WARP_ACCUM_UNROLL 1
+#define WARP_ACCUM_UNROLL 2
 #endif
 
 template <typename T, int VecBytes>

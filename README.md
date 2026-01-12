@@ -47,7 +47,7 @@ Benchmark result on DeepSeek V3 model configurations:
 
 | **Kernels**| **# CUs**| **Dispatch Latency** |**Dispatch BW** |**Combine Latency**|**Combine BW** |
 |------------|----------|----------------------|----------------|-------------------|---------------|
-|EP8         | 80       | 37 us                | 176 GB/s       | 99 us             | 107 GB/s      |
+|EP8         | 64       | 35 us                | 134 GB/s       | 47 us             | 204 GB/s      |
 |EP16-V0     | 32       | 226 us               | 33 GB/s        | 296 us            | 49GB/s        |
 |EP16-V1     | 32       | 115 us               | 63 GB/s        | 141 us            | 110GB/s       |
 |EP32-V1-LL  | 32       | 157 us               | 48 GB/s        | 280 us            | 55GB/s        |

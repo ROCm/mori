@@ -20,3 +20,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 from .api import *
+from .tensor_utils import (
+    MoriShmemBuffer,
+    mori_shmem_create_tensor,
+    symm_mori_shmem_tensor,
+    mori_shmem_create_tensor_list_intra_node,
+)

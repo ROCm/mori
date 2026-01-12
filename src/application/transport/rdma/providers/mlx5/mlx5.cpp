@@ -30,8 +30,8 @@
 #include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
 #include "mori/utils/mori_log.hpp"
-#include "src/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
-#include "src/application/transport/rdma/providers/mlx5/mlx5_prm.hpp"
+#include "mori/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
+#include "mori/application/transport/rdma/providers/mlx5/mlx5_prm.hpp"
 
 namespace mori {
 namespace application {
@@ -376,7 +376,8 @@ void Mlx5QpContainer::ModifyRst2Init() {
   assert(!status);
 }
 
-void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
+void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
+                                     const RdmaEndpointHandle& remote_handle,
                                      const ibv_port_attr& portAttr, uint32_t qpId) {
   uint8_t init2rtr_cmd_in[DEVX_ST_SZ_BYTES(init2rtr_qp_in)] = {
       0,
@@ -407,7 +408,7 @@ void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
     memcpy(DEVX_ADDR_OF(qpc, qpc, primary_address_path.rmac_47_32), remote_handle.eth.mac,
            sizeof(remote_handle.eth.mac));
     DEVX_SET(qpc, qpc, primary_address_path.hop_limit, 64);
-    DEVX_SET(qpc, qpc, primary_address_path.src_addr_index, config.gidIdx);
+    DEVX_SET(qpc, qpc, primary_address_path.src_addr_index, local_handle.eth.gidIdx);
     // Use shared UDP sport configuration with qpId-based selection
     uint16_t selected_udp_sport = device_context->GetUdpSport(qpId);
     DEVX_SET(qpc, qpc, primary_address_path.udp_sport, selected_udp_sport | 0xC000);
@@ -475,17 +476,24 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   RdmaEndpoint endpoint;
   endpoint.handle.psn = 0;
   endpoint.handle.portId = config.portId;
-  endpoint.handle.maxSge = deviceAttr->tm_caps.max_sge;
+  endpoint.handle.maxSge = config.maxMsgSge;
 
+  const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(config.portId);
+  assert(portAttr);
   HcaCapability hca_cap = QueryHcaCap(context);
 
   endpoint.handle.qpn = qp->qpn;
   if (hca_cap.IsEthernet()) {
+    GidSelectionResult gidSelection =
+        AutoSelectGidIndex(context, config.portId, portAttr, config.gidIdx);
+    assert(gidSelection.gidIdx >= 0 && gidSelection.valid);
+    int gidIdx = gidSelection.gidIdx;
+
     uint32_t out[DEVX_ST_SZ_DW(query_roce_address_out)] = {};
     uint32_t in[DEVX_ST_SZ_DW(query_roce_address_in)] = {};
 
     DEVX_SET(query_roce_address_in, in, opcode, MLX5_CMD_OP_QUERY_ROCE_ADDRESS);
-    DEVX_SET(query_roce_address_in, in, roce_address_index, config.gidIdx);
+    DEVX_SET(query_roce_address_in, in, roce_address_index, gidIdx);
     DEVX_SET(query_roce_address_in, in, vhca_port_num, config.portId);
 
     int status = mlx5dv_devx_general_cmd(context, in, sizeof(in), out, sizeof(out));
@@ -498,6 +506,7 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
     memcpy(endpoint.handle.eth.mac,
            DEVX_ADDR_OF(query_roce_address_out, out, roce_address.source_mac_47_32),
            sizeof(endpoint.handle.eth.mac));
+    endpoint.handle.eth.gidIdx = gidIdx;
   } else if (hca_cap.IsInfiniBand()) {
     auto mapPtr = GetRdmaDevice()->GetPortAttrMap();
     auto it = mapPtr->find(config.portId);
@@ -538,7 +547,7 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   MORI_APP_TRACE(
       "MLX5 endpoint created: qpn={}, cqn={}, portId={}, gidIdx={}, atomicIbuf addr=0x{:x}, "
       "nslots={}",
-      qp->qpn, cq->cqn, config.portId, config.gidIdx, endpoint.atomicIbuf.addr,
+      qp->qpn, cq->cqn, config.portId, endpoint.handle.eth.gidIdx, endpoint.atomicIbuf.addr,
       endpoint.atomicIbuf.nslots);
 
   return endpoint;
@@ -557,7 +566,7 @@ void Mlx5DeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   const ibv_device_attr_ex* deviceAttr = rdmaDevice->GetDeviceAttr();
   const ibv_port_attr& portAttr = *(rdmaDevice->GetPortAttrMap()->find(local.portId)->second);
   qp->ModifyRst2Init();
-  qp->ModifyInit2Rtr(remote, portAttr, qpId);
+  qp->ModifyInit2Rtr(local, remote, portAttr, qpId);
   qp->ModifyRtr2Rts(local);
 
   MORI_APP_TRACE("MLX5 endpoint connected successfully: local_qpn={}, remote_qpn={}", local_qpn,

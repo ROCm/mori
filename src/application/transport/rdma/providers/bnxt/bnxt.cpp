@@ -35,6 +35,8 @@
 #include "mori/application/utils/math.hpp"
 #include "mori/utils/mori_log.hpp"
 
+#define USE_BNXT_DEFAULT_DBR
+
 #ifdef ENABLE_BNXT
 namespace std {
 static std::ostream& operator<<(std::ostream& s, const bnxt_re_dv_qp_mem_info& m) {
@@ -224,6 +226,12 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   }
   qpMemInfo.rq_va = reinterpret_cast<uint64_t>(rqUmemAddr);
 
+#ifndef USE_BNXT_DEFAULT_DBR
+  // Allocate dedicated db region for this QP
+  dbrAttr = bnxt_re_dv_alloc_db_region(context);
+  assert(dbrAttr != nullptr);
+#endif
+
   memset(&dv_qp_attr, 0, sizeof(struct bnxt_re_dv_qp_init_attr));
   dv_qp_attr.send_cq = ib_qp_attr.send_cq;
   dv_qp_attr.recv_cq = ib_qp_attr.recv_cq;
@@ -235,6 +243,9 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   dv_qp_attr.qp_type = ib_qp_attr.qp_type;
 
   // dv_qp_attr.qp_handle = qpMemInfo.qp_handle;
+#ifndef USE_BNXT_DEFAULT_DBR
+  dv_qp_attr.dbr_handle = dbrAttr;
+#endif
   dv_qp_attr.sq_len = qpMemInfo.sq_len;
   dv_qp_attr.sq_slots = qpMemInfo.sq_slots;
   dv_qp_attr.sq_wqe_sz = qpMemInfo.sq_wqe_sz;
@@ -332,6 +343,13 @@ void BnxtQpContainer::DestroyQueuePair() {
       HIP_RUNTIME_CHECK(hipHostUnregister(qpUar));
     }
   }
+#ifndef USE_BNXT_DEFAULT_DBR
+  if (dbrAttr) {
+    int ret = bnxt_re_dv_free_db_region(context, dbrAttr);
+    assert(!ret);
+    dbrAttr = nullptr;
+  }
+#endif
   if (qp) bnxt_re_dv_destroy_qp(qp);
 }
 
@@ -357,7 +375,8 @@ void BnxtQpContainer::ModifyRst2Init() {
   assert(!status);
 }
 
-void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
+void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
+                                     const RdmaEndpointHandle& remote_handle,
                                      const ibv_port_attr& portAttr,
                                      const ibv_device_attr_ex& deviceAttr) {
   struct ibv_qp_attr attr;
@@ -370,11 +389,17 @@ void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
   attr.dest_qp_num = remote_handle.qpn;
 
   memcpy(&attr.ah_attr.grh.dgid, remote_handle.eth.gid, 16);
-  attr.ah_attr.grh.sgid_index = config.gidIdx;
+  attr.ah_attr.grh.sgid_index = local_handle.eth.gidIdx;
   attr.ah_attr.grh.hop_limit = 1;
-  attr.ah_attr.sl = 1;
   attr.ah_attr.is_global = 1;
   attr.ah_attr.port_num = config.portId;
+  attr.ah_attr.sl = ReadRdmaServiceLevelEnv().value_or(1);
+  std::optional<uint8_t> tc = ReadRdmaTrafficClassEnv();
+  if (tc.has_value()) {
+    attr.ah_attr.grh.traffic_class = tc.value();
+  }
+  MORI_APP_INFO("bnxt attr.ah_attr.sl:{} attr.ah_attr.grh.traffic_class:{}", attr.ah_attr.sl,
+                attr.ah_attr.grh.traffic_class);
 
   // TODO: max_dest_rd_atomic whether affect nums of amo/rd
   attr.max_dest_rd_atomic = deviceAttr.orig_attr.max_qp_rd_atom;
@@ -405,16 +430,15 @@ void BnxtQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
 
   int status = bnxt_re_dv_modify_qp(qp, &attr, attr_mask, 0, 0);
   assert(!status);
-    // Use qpId to select UDP sport value from the shared configuration (round-robin)
+  // Use qpId to select UDP sport value from the shared configuration (round-robin)
   uint16_t selected_udp_sport = GetDeviceContext()->GetUdpSport(qpId);
   MORI_APP_TRACE("QP {} using UDP sport {} (qpId={}, index={})", qpn, selected_udp_sport, qpId,
                  qpId % RDMA_UDP_SPORT_ARRAY_SIZE);
   status = bnxt_re_dv_modify_qp_udp_sport(qp, selected_udp_sport);
   if (status) {
-    MORI_APP_ERROR("Failed to set UDP sport {} for QP {}: error code {}", selected_udp_sport, qpn,
+    MORI_APP_WARN("Failed to set UDP sport {} for QP {}: error code {}", selected_udp_sport, qpn,
                    status);
   }
-  assert(!status);
   MORI_APP_TRACE("bnxt_re_dv_modify_qp_udp_sport is done, return {}", status);
 }
 
@@ -448,22 +472,28 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   RdmaEndpoint endpoint;
   endpoint.handle.psn = 0;
   endpoint.handle.portId = config.portId;
-  endpoint.handle.maxSge = deviceAttr->tm_caps.max_sge;
+  endpoint.handle.maxSge = config.maxMsgSge;
 
   endpoint.handle.qpn = qp->qpn;
 
-  // Get gid
-  union ibv_gid ibvGid;
-  ret = ibv_query_gid(context, config.portId, config.gidIdx, &ibvGid);
-  assert(!ret);
-  memcpy(endpoint.handle.eth.gid, ibvGid.raw, sizeof(endpoint.handle.eth.gid));
+  const ibv_port_attr* gidPortAttr = GetRdmaDevice()->GetPortAttr(config.portId);
+  assert(gidPortAttr);
+  GidSelectionResult gidSelection =
+      AutoSelectGidIndex(context, config.portId, gidPortAttr, config.gidIdx);
+  assert(gidSelection.gidIdx >= 0 && gidSelection.valid);
+  memcpy(endpoint.handle.eth.gid, gidSelection.gid.raw, sizeof(endpoint.handle.eth.gid));
+  endpoint.handle.eth.gidIdx = gidSelection.gidIdx;
 
-  // Get dbr, bnxt use shared dbr
+#ifdef USE_BNXT_DEFAULT_DBR
+  // Get default shared db region
   struct bnxt_re_dv_db_region_attr dbrAttr{};
   ret = bnxt_re_dv_get_default_db_region(context, &dbrAttr);
   assert(!ret);
-
   void* uar_host = (void*)dbrAttr.dbr;
+#else
+  // Use the db region allocated during QP creation
+  void* uar_host = (void*)qp->dbrAttr->dbr;
+#endif
   void* uar_dev = uar_host;
   if (config.onGpu) {
     constexpr uint32_t flag = hipHostRegisterPortable | hipHostRegisterMapped;
@@ -506,9 +536,10 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
 
   MORI_APP_TRACE(
       "BNXT endpoint created: qpn={}, cqn={}, portId={}, gidIdx={}, atomicIbuf addr=0x{:x}, "
-      "nslots={}",
-      qp->qpn, cq->cqn, config.portId, config.gidIdx, endpoint.atomicIbuf.addr,
-      endpoint.atomicIbuf.nslots);
+      "nslots={}, uar_host=0x{:x},uar_dev=0x{:x}",
+      qp->qpn, cq->cqn, config.portId, gidSelection.gidIdx, endpoint.atomicIbuf.addr,
+      endpoint.atomicIbuf.nslots, reinterpret_cast<uintptr_t>(uar_host),
+      reinterpret_cast<uintptr_t>(uar_dev));
 
   return endpoint;
 }
@@ -522,7 +553,7 @@ void BnxtDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   const ibv_device_attr_ex& deviceAttr = *(rdmaDevice->GetDeviceAttr());
   const ibv_port_attr& portAttr = *(rdmaDevice->GetPortAttrMap()->find(local.portId)->second);
   qp->ModifyRst2Init();
-  qp->ModifyInit2Rtr(remote, portAttr, deviceAttr);
+  qp->ModifyInit2Rtr(local, remote, portAttr, deviceAttr);
   qp->ModifyRtr2Rts(local, remote, qpId);
 }
 

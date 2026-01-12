@@ -80,11 +80,13 @@ class BnxtDeviceContext;  // Forward declaration
 
 class BnxtQpContainer {
  public:
-  BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig& config, ibv_cq* cq, ibv_pd* pd, BnxtDeviceContext* device_context);
+  BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig& config, ibv_cq* cq, ibv_pd* pd,
+                  BnxtDeviceContext* device_context);
   ~BnxtQpContainer();
 
   void ModifyRst2Init();
-  void ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr,
+  void ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
+                      const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr,
                       const ibv_device_attr_ex& deviceAttr);
   void ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
                      const RdmaEndpointHandle& remote_handle, uint32_t qpId = 0);
@@ -92,7 +94,7 @@ class BnxtQpContainer {
   void* GetSqAddress();
   void* GetMsntblAddress();
   void* GetRqAddress();
-  
+
   BnxtDeviceContext* GetDeviceContext() { return device_context; }
 
  private:
@@ -118,11 +120,13 @@ class BnxtQpContainer {
   void* qpUar{nullptr};
   void* qpUarPtr{nullptr};
   ibv_qp* qp{nullptr};
-  
+
   // Atomic internal buffer fields
   void* atomicIbufAddr{nullptr};
   size_t atomicIbufSize{0};
   ibv_mr* atomicIbufMr{nullptr};
+
+  struct bnxt_re_dv_db_region_attr* dbrAttr{nullptr};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -134,8 +138,8 @@ class BnxtDeviceContext : public RdmaDeviceContext {
   ~BnxtDeviceContext();
 
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) override;
-  virtual void ConnectEndpoint(const RdmaEndpointHandle& local,
-                               const RdmaEndpointHandle& remote, uint32_t qpId = 0) override;
+  virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote,
+                               uint32_t qpId = 0) override;
 
  private:
   uint32_t pdn;

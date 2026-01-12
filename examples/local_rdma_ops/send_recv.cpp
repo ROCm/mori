@@ -58,10 +58,8 @@ void SendRecvOnCpu(IbgdaReadWriteReq& send_req, IbgdaReadWriteReq& recv_req,
 
   endpoint_1.cq_handle.consumer_idx += 1;
   endpoint_2.cq_handle.consumer_idx += 1;
-  UpdateCqDbrRecord<ProviderType::MLX5>(endpoint_1.cq_handle.dbr_rec_addr,
-                                        endpoint_1.cq_handle.consumer_idx);
-  UpdateCqDbrRecord<ProviderType::MLX5>(endpoint_2.cq_handle.dbr_rec_addr,
-                                        endpoint_2.cq_handle.consumer_idx);
+  UpdateCqDbrRecord<ProviderType::MLX5>(endpoint_1.cq_handle, endpoint_1.cq_handle.consumer_idx);
+  UpdateCqDbrRecord<ProviderType::MLX5>(endpoint_2.cq_handle, endpoint_2.cq_handle.consumer_idx);
   udma_to_device_barrier();
 }
 

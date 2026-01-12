@@ -21,6 +21,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(USE_ROCM "Whether to use rocm" ON)
 option(USE_BNXT "Whether to use BNXT NIC" OFF)
+option(USE_IONIC "Whether to use IONIC" OFF)
 option(BUILD_EXAMPLES "Whether to build examples" ON)
 option(BUILD_APPLICATION "Whether to build application library" ON)
 option(BUILD_SHMEM "Whether to build shmem library" ON)
@@ -28,6 +29,7 @@ option(BUILD_OPS "Whether to build mori operation kernels" ON)
 option(BUILD_IO "Whether to build mori io library" ON)
 option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
 option(BUILD_TESTS "Whether to build mori CPP tests" ON)
+option(ENABLE_DEBUG_PRINTF "Enable debug printf in device kernels" OFF)
 
 set(CMAKE_LIBRARY_PATH "/usr/local/lib;${CMAKE_LIBRARY_PATH}")
 find_library(BNXT_RE_LIB NAMES bnxt_re)
@@ -45,12 +47,35 @@ if(USE_BNXT)
   add_compile_definitions(ENABLE_BNXT)
 endif()
 
+find_library(IONIC_LIB
+  NAMES ionic
+  HINTS /lib/x86_64-linux-gnu
+)
+if(IONIC_LIB)
+	message(STATUS "Found ionic library at: ${IONIC_LIB}")
+else()
+  message(
+	  STATUS "Could NOT find ionic library. IONIC features will be disabled.")
+  set(USE_IONIC
+      OFF
+      CACHE BOOL "Enable IONIC features if ionic library is found" FORCE)
+endif()
+message(STATUS "USE_IONIC = ${USE_IONIC}")
+if(USE_IONIC)
+	add_compile_definitions(ENABLE_IONIC)
+endif()
+
+message(STATUS "ENABLE_DEBUG_PRINTF = ${ENABLE_DEBUG_PRINTF}")
+if(ENABLE_DEBUG_PRINTF)
+  add_compile_definitions(MORI_ENABLE_DEBUG_PRINTF)
+endif()
+
 if(NOT DEFINED WARP_ACCUM_UNROLL)
   set(WARP_ACCUM_UNROLL 1)
 endif()
 message(STATUS "WARP_ACCUM_UNROLL is set to: ${WARP_ACCUM_UNROLL}")
 add_definitions(-DWARP_ACCUM_UNROLL=${WARP_ACCUM_UNROLL})
-
+add_definitions(-DHIP_ENABLE_WARP_SYNC_BUILTINS)
 if(USE_ROCM)
   list(APPEND CMAKE_PREFIX_PATH "/opt/rocm")
   project(mori LANGUAGES HIP CXX C)

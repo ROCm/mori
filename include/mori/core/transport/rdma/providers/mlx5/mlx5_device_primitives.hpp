@@ -575,7 +575,7 @@ inline __device__ uint64_t mlx5PrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
       break;
     }
     default: {
-      printf("Error: unsupported atomic type (%d)\n", amo_op);
+      MORI_PRINTF("Error: unsupported atomic type (%d)\n", amo_op);
       assert(0);
     }
   }
@@ -735,7 +735,7 @@ inline __device__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum, 
 
   if (opcode == MLX5_CQE_RESP_ERR || opcode == MLX5_CQE_REQ_ERR) {
     auto error = Mlx5HandleErrorCqe(reinterpret_cast<mlx5_err_cqe*>(cqeAddr));
-    printf("(%s:%d) CQE error: %s\n", __FILE__, __LINE__, IbvWcStatusString(error));
+    MORI_PRINTF("(%s:%d) CQE error: %s\n", __FILE__, __LINE__, IbvWcStatusString(error));
     return opcode;
   }
   return opcode;
@@ -743,7 +743,7 @@ inline __device__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum, 
 
 template <>
 inline __device__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx,
-                                                 uint16_t* wqeCounter) {
+                                                 uint32_t* wqeCounter) {
   uint32_t curConsIdx = *consIdx;
   uint32_t cqeIdx = curConsIdx % cqeNum;
   void* cqeAddr = reinterpret_cast<char*>(cqAddr) + cqeIdx * sizeof(mlx5_cqe64);
@@ -757,28 +757,34 @@ inline __device__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum, 
 
   if (opcode == MLX5_CQE_RESP_ERR || opcode == MLX5_CQE_REQ_ERR) {
     auto error = Mlx5HandleErrorCqe(reinterpret_cast<mlx5_err_cqe*>(cqeAddr));
-    printf("(%s:%d) CQE error: %s\n", __FILE__, __LINE__, IbvWcStatusString(error));
+    // MORI_PRINTF("(%s:%d) CQE error: %s\n", __FILE__, __LINE__, IbvWcStatusString(error));
     return opcode;
   }
+  // wqe_counter is 16-bit, ensure high bits are zero
   *wqeCounter = BE16TOH(reinterpret_cast<mlx5_cqe64*>(cqeAddr)->wqe_counter);
   return opcode;
 }
 
 template <>
-inline __device__ void UpdateCqDbrRecord<ProviderType::MLX5>(void* dbrRecAddr, uint32_t cons_idx,
-                                                             uint32_t cqeNum) {
-  reinterpret_cast<uint32_t*>(dbrRecAddr)[MLX5_CQ_SET_CI] = HTOBE32(cons_idx & 0xffffff);
+inline __device__ int PollCq<ProviderType::MLX5>(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle, 
+	                                         void* cqAddr, uint32_t cqeNum, uint32_t* consIdx, uint16_t* wqeCounter)
+{
+  return 0;
 }
 
 template <>
-inline __device__ int PollCqAndUpdateDbr<ProviderType::MLX5>(void* cqAddr, uint32_t cqeSize,
-                                                             uint32_t cqeNum, uint32_t* consIdx,
-                                                             void* dbrRecAddr, uint32_t* lockVar) {
+inline __device__ void UpdateCqDbrRecord<ProviderType::MLX5>(CompletionQueueHandle& cq, uint32_t consIdx) {
+  reinterpret_cast<uint32_t*>(cq.dbrRecAddr)[MLX5_CQ_SET_CI] = HTOBE32(consIdx & 0xffffff);
+}
+
+template <>
+inline __device__ int PollCqAndUpdateDbr<ProviderType::MLX5>(CompletionQueueHandle& cq, uint32_t* consIdx,
+                                                             uint32_t* lockVar) {
   AcquireLock(lockVar);
 
-  int opcode = PollCq<ProviderType::MLX5>(cqAddr, cqeNum, consIdx);
+  int opcode = PollCq<ProviderType::MLX5>(cq.cqAddr, cq.cqeNum, consIdx);
   if (opcode >= 0) {
-    UpdateCqDbrRecord<ProviderType::MLX5>(dbrRecAddr, *consIdx, cqeNum);
+    UpdateCqDbrRecord<ProviderType::MLX5>(cq, *consIdx);
   }
 
   ReleaseLock(lockVar);

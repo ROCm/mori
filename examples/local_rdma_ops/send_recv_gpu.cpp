@@ -56,8 +56,7 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion mr, int 
     int snd_opcode =
         PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum, &epSend.cqHandle.consIdx);
     printf("send PollCq is done\n");
-    UpdateCqDbrRecord<P>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx,
-                         epSend.cqHandle.cqeNum);
+    UpdateCqDbrRecord<P>(epSend.cqHandle, epSend.cqHandle.consIdx);
     printf("send UpdateCqDbrRecord is done\n");
     // printf("snd_opcode %d val %d\n", snd_opcode, reinterpret_cast<char*>(mrSend.addr)[0]);
   }
@@ -81,13 +80,15 @@ __device__ void RecvThreadKernel(RdmaEndpoint& epRecv, RdmaMemoryRegion mr, int 
       RingDoorbell<P>(epRecv.wqHandle.dbrAddr, dbr_val);
       printf("recv RingDoorbell is done\n");
     }
-
+    if constexpr (P == ProviderType::PSD) {
+      RingDoorbell<P>(epRecv.wqHandle.rqdbrAddr, dbr_val);
+      printf("recv RingDoorbell is done\n");
+    }
 
     int rcv_opcode =
         PollCq<P>(epRecv.cqHandle.cqAddr, epRecv.cqHandle.cqeNum, &epRecv.cqHandle.consIdx);
     printf("recv PollCq is done\n");
-    UpdateCqDbrRecord<P>(epRecv.cqHandle.dbrRecAddr, epRecv.cqHandle.consIdx,
-                         epRecv.cqHandle.cqeNum);
+    UpdateCqDbrRecord<P>(epRecv.cqHandle, epRecv.cqHandle.consIdx);
     printf("recv UpdateCqDbrRecord is done\n");
 
     for (int j = 0; j < msgSize; j++) {
@@ -117,7 +118,12 @@ __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMe
       case ProviderType::BNXT:
         SendThreadKernel<ProviderType::BNXT>(epSend, mrSend, msgSize, msgNum);
         break;
-#endif        
+#endif 
+#ifdef ENABLE_IONIC	
+      case ProviderType::PSD:
+        SendThreadKernel<ProviderType::PSD>(epSend, mrSend, msgSize, msgNum);
+        break;
+#endif	
       default:
         // unsupported provider
         break;
@@ -132,7 +138,12 @@ __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMe
       case ProviderType::BNXT:
         RecvThreadKernel<ProviderType::BNXT>(epRecv, mrRecv, msgSize, msgNum);
         break;
-#endif        
+#endif
+#ifdef ENABLE_IONIC	
+      case ProviderType::PSD:
+        RecvThreadKernel<ProviderType::PSD>(epRecv, mrRecv, msgSize, msgNum);
+        break;
+#endif	
       default:
         // unsupported provider
         break;

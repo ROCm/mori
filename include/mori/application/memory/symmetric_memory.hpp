@@ -31,6 +31,7 @@
 #include "mori/application/bootstrap/bootstrap.hpp"
 #include "mori/application/context/context.hpp"
 #include "mori/application/transport/transport.hpp"
+#include "mori/application/transport/sdma/anvil.hpp"
 
 namespace mori {
 namespace application {
@@ -44,6 +45,12 @@ struct SymmMemObj {
   uint32_t* peerRkeys{nullptr};
   // For IPC
   hipIpcMemHandle_t* ipcMemHandles{nullptr};  // should only placed on cpu
+
+  //For Sdma
+  anvil::SdmaQueueDeviceHandle** deviceHandles_d = nullptr;  // should only placed on GPU
+  HSAuint64* signalPtrs = nullptr; // should only placed on GPU
+  uint32_t sdmaNumQueue = 8; // number of sdma queue
+  HSAuint64* expectSignalsPtr = nullptr; // should only placed on GPU
 
   __device__ __host__ RdmaMemoryRegion GetRdmaMemoryRegion(int pe) const {
     RdmaMemoryRegion mr;
@@ -97,6 +104,9 @@ class SymmMemManager {
 
   SymmMemObjPtr RegisterSymmMemObj(void* localPtr, size_t size);
   void DeregisterSymmMemObj(void* localPtr);
+
+  SymmMemObjPtr HeapRegisterSymmMemObj(void* localPtr, size_t size, SymmMemObjPtr* heapObj);
+  void HeapDeregisterSymmMemObj(void* localPtr);
 
   SymmMemObjPtr Get(void* localPtr) const;
 

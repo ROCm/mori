@@ -1,3 +1,15 @@
+add_executable(sdma_bw sdma/sdma_bw.cpp sdma/common.cpp sdma/utils.cpp sdma/sdma_bw_kernel.cpp utils/args_parser.cpp)
+target_include_directories(sdma_bw PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
+target_link_libraries(sdma_bw mori_application hip::host hip::device)
+
+add_executable(sdma_rate sdma/sdma_rate.cpp sdma/common.cpp sdma/utils.cpp sdma/sdma_rate_kernel.cpp utils/args_parser.cpp)
+target_include_directories(sdma_rate PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
+target_link_libraries(sdma_rate mori_application hip::host hip::device)
+
+add_executable(sdma_latency sdma/sdma_latency.cpp sdma/common.cpp sdma/utils.cpp sdma/sdma_latency_kernel.cpp utils/args_parser.cpp)
+target_include_directories(sdma_latency PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
+target_link_libraries(sdma_latency mori_application hip::host hip::device)
+
 add_executable(dist_write dist_rdma_ops/dist_write.cpp utils/args_parser.cpp)
 target_include_directories(dist_write PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
 target_link_libraries(dist_write mori_application hip::host hip::device)
@@ -19,6 +31,9 @@ target_link_libraries(put_thread_allgather mori_shmem hip::host hip::device)
 
 add_executable(concurrent_put_thread shmem/concurrent_put_thread.cpp)
 target_link_libraries(concurrent_put_thread mori_shmem hip::host hip::device)
+
+add_executable(test_put_schar_nbi_thread shmem/test_put_schar_nbi_thread.cpp)
+target_link_libraries(test_put_schar_nbi_thread mori_shmem hip::host hip::device)
 
 add_executable(concurrent_put_imm_thread shmem/concurrent_put_imm_thread.cpp)
 target_link_libraries(concurrent_put_imm_thread mori_shmem hip::host

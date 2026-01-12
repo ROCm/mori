@@ -63,11 +63,12 @@ def get_free_port():
 
 def data_type_supported(dtype):
     arch = torch.cuda.get_device_capability(0)
-    arch_str = "".join(map(str, arch))
+    arch_int = int("".join(map(str, arch)))
     if dtype is torch.float8_e4m3fnuz:
-        return arch_str == "94"
+        return arch_int == 94
     if dtype is torch.float8_e4m3fn:
-        return arch_str == "95"
+        return arch_int >= 95
+    return True
 
 
 class TorchDistContext:
