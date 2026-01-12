@@ -15,7 +15,9 @@ inline void checkError(hipError_t err, const char* msg, const char* file, int li
    }
 }
 
+#ifndef CHECK_HIP_ERROR
 #define CHECK_HIP_ERROR(cmd) checkError((cmd), #cmd, __FILE__, __LINE__)
+#endif
 
 auto checkHsaError = [](hsa_status_t s, const char* msg, const char* file, int line) {
    if (s != HSA_STATUS_SUCCESS)

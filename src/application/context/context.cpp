@@ -163,7 +163,8 @@ void Context::InitializePossibleTransports() {
     HIP_RUNTIME_CHECK(hipGetDevice(&deviceId));
     topo.reset(new TopoSystem());
     std::string nicName = topo->MatchGpuAndNic(deviceId);
-
+    MORI_APP_TRACE("rank {} rankInNode {} matched nic {} for gpu {}", LocalRank(),
+                   rankInNode, nicName, deviceId);
     for (int i = 0; i < activeDevicePortList.size(); i++) {
       auto& dp = activeDevicePortList[i];
       if (dp.first->Name() != nicName) continue;

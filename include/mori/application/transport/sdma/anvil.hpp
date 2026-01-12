@@ -94,7 +94,7 @@ inline void checkHipError(hipError_t err, const char* msg, const char* file, int
    }
 }
 
-#define CHECK_HIP_ERROR(cmd) checkHipError((cmd), #cmd, __FILE__, __LINE__)
+#define CHECK_HIP_ERROR(cmd) anvil::checkHipError((cmd), #cmd, __FILE__, __LINE__)
 // Allow access to peerDeviceId from deviceId
 inline void EnablePeerAccess(int const deviceId, int const peerDeviceId)
 {

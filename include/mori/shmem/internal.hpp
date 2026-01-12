@@ -108,7 +108,8 @@ struct GpuStates {
   application::SymmMemObj* heapObj{nullptr};  // Pointer to the heap's SymmMemObj on device
 };
 
-extern __constant__ GpuStates globalGpuStates;
+// Changed from __constant__ to __device__ to allow hipMemcpyToSymbol updates (like rocshmem)
+extern __device__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
 
 static __device__ GpuStates* GetGlobalGpuStatesPtr() { return &globalGpuStates; }
 
@@ -121,8 +122,7 @@ struct RemoteAddrInfo {
   bool valid;
 
   __device__ RemoteAddrInfo() : raddr(0), rkey(0), valid(false) {}
-  __device__ RemoteAddrInfo(uintptr_t r, uintptr_t k)
-      : raddr(r), rkey(k), valid(true) {}
+  __device__ RemoteAddrInfo(uintptr_t r, uintptr_t k) : raddr(r), rkey(k), valid(true) {}
 };
 
 inline __device__ RemoteAddrInfo ShmemAddrToRemoteAddr(const void* localAddr, int pe) {
@@ -142,7 +142,8 @@ inline __device__ RemoteAddrInfo ShmemAddrToRemoteAddr(const void* localAddr, in
   }
 
   // Calculate offset within the symmetric heap
-  size_t offset = localAddrInt - globalGpuStates->heapBaseAddr;
+  size_t offset = reinterpret_cast<const char*>(localAddr) -
+                  reinterpret_cast<const char*>(globalGpuStates->heapBaseAddr);
 
   // Get remote address using the heap's SymmMemObj
   application::SymmMemObj* heapObj = globalGpuStates->heapObj;
