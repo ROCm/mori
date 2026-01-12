@@ -430,10 +430,9 @@ void BnxtQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
                  qpId % RDMA_UDP_SPORT_ARRAY_SIZE);
   status = bnxt_re_dv_modify_qp_udp_sport(qp, selected_udp_sport);
   if (status) {
-    MORI_APP_ERROR("Failed to set UDP sport {} for QP {}: error code {}", selected_udp_sport, qpn,
+    MORI_APP_WARN("Failed to set UDP sport {} for QP {}: error code {}", selected_udp_sport, qpn,
                    status);
   }
-  assert(!status);
   MORI_APP_TRACE("bnxt_re_dv_modify_qp_udp_sport is done, return {}", status);
 }
 

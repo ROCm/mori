@@ -21,6 +21,7 @@ add_library(
   mori_application SHARED
   bootstrap/mpi_bootstrap.cpp
   bootstrap/torch_bootstrap.cpp
+  bootstrap/socket_bootstrap.cpp
   transport/rdma/rdma.cpp
   transport/rdma/providers/mlx5/mlx5.cpp
   transport/rdma/providers/bnxt/bnxt.cpp

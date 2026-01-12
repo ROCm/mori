@@ -42,13 +42,13 @@ __global__ void ConcurrentPutThreadKernel(int myPe, const SymmMemObjPtr memObj) 
     RdmaMemoryRegion source = memObj->GetRdmaMemoryRegion(myPe);
 
     ShmemPutMemNbiThread(memObj, threadOffset, source, threadOffset, sizeof(uint32_t), recvPe, 1);
-    __threadfence_system();
+    // __threadfence_system();
 
-    if (blockIdx.x == 0)
-    {
-      ShmemQuietThread();
-    }
-    
+    // if (blockIdx.x == 0)
+    // {
+    //   ShmemQuietThread();
+    // }
+    ShmemFenceThread();
 
     // __syncthreads();
   } else {
@@ -76,9 +76,18 @@ __global__ void ConcurrentPutThreadKernel_PureAddr(int myPe, uint32_t* localBuff
     if (blockIdx.x == 0) {
       ShmemQuietThread();
     }
+    if (globalTid == 0)
+    {
+      printf("rank %d addr %lu\n", myPe, ShmemPtrP2p(reinterpret_cast<uint64_t>(dest), myPe, recvPe));
+    }
+    
   } else {
     // Wait for data to arrive
     while (atomicAdd(localBuff + globalTid, 0) != sendPe) {
+    }
+    if (globalTid == 0)
+    {
+      printf("rank %d addr %lu\n", myPe, ShmemPtrP2p(reinterpret_cast<uint64_t>(localBuff), myPe, recvPe));
     }
   }
 }
@@ -86,6 +95,19 @@ __global__ void ConcurrentPutThreadKernel_PureAddr(int myPe, uint32_t* localBuff
 void ConcurrentPutThread() {
   int status;
   MPI_Init(NULL, NULL);
+
+  // Set GPU device based on local rank
+  int localRank;
+  MPI_Comm localComm;
+  MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &localComm);
+  MPI_Comm_rank(localComm, &localRank);
+  
+  int deviceCount;
+  HIP_RUNTIME_CHECK(hipGetDeviceCount(&deviceCount));
+  int deviceId = localRank % deviceCount;
+  HIP_RUNTIME_CHECK(hipSetDevice(deviceId));
+  
+  printf("Local rank %d setting GPU device %d (total %d devices)\n", localRank, deviceId, deviceCount);
 
   status = ShmemMpiInit(MPI_COMM_WORLD);
   assert(!status);
@@ -191,6 +213,7 @@ void ConcurrentPutThread() {
   // Cleanup
   ShmemFree(buff1);
   ShmemFree(buff2);
+  MPI_Comm_free(&localComm);
   ShmemFinalize();
 }
 

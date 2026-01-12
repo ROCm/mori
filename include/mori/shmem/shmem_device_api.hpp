@@ -26,11 +26,11 @@
 
 #include "mori/application/application.hpp"
 #include "mori/core/core.hpp"
+#include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_device_kernels.hpp"
 #include "mori/shmem/shmem_ibgda_kernels.hpp"
 #include "mori/shmem/shmem_p2p_kernels.hpp"
 #include "mori/shmem/shmem_sdma_kernels.hpp"
-#include "src/shmem/internal.hpp"
 
 namespace mori {
 namespace shmem {
@@ -88,14 +88,55 @@ inline __device__ void ShmemQuietThread(int pe, int qpId) {
   DISPATCH_TRANSPORT_TYPE(ShmemQuietThreadKernel, pe, pe, qpId);
 }
 
-inline __device__ void ShmemQuietThread(int pe, const application::SymmMemObjPtr dest) {
-  ShmemQuietThreadKernel<application::TransportType::SDMA>(pe,dest);
+inline __device__ void ShmemFenceThread() {
+  ShmemQuietThread();
+  __threadfence_system();
 }
 
+inline __device__ void ShmemFenceThread(int pe) {
+  ShmemQuietThread(pe);
+  __threadfence_system();
+}
+
+inline __device__ void ShmemFenceThread(int pe, int qpId) {
+  ShmemQuietThread(pe, qpId);
+  __threadfence_system();
+}
+inline __device__ void ShmemQuietThread(int pe, const application::SymmMemObjPtr dest) {
+  ShmemQuietThreadKernel<application::TransportType::SDMA>(pe, dest);
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Point-to-Point                                         */
 /* ---------------------------------------------------------------------------------------------- */
+inline __device__ uint64_t ShmemPtrP2p(const uint64_t destPtr, const int myPe, int destPe) {
+  // If same PE, return the pointer directly
+  if (myPe == destPe) {
+    return destPtr;
+  }
+
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+
+  application::TransportType transportType = globalGpuStates->transportTypes[destPe];
+  if (transportType == application::TransportType::RDMA) {
+    return 0;
+  }
+
+  uintptr_t localAddrInt = static_cast<uintptr_t>(destPtr);
+
+  if (localAddrInt < globalGpuStates->heapBaseAddr ||
+      localAddrInt >= globalGpuStates->heapEndAddr) {
+    assert(false && "dest addr not in symmetric heap");
+    return 0;
+  }
+
+  size_t offset = localAddrInt - globalGpuStates->heapBaseAddr;
+
+  application::SymmMemObj* heapObj = globalGpuStates->heapObj;
+  uint64_t raddr = heapObj->peerPtrs[destPe] + offset;
+
+  return raddr;
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        PutNbi APIs                                             */
@@ -127,8 +168,8 @@ DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Warp)
       const application::RdmaMemoryRegion& source, size_t srcElmOffset, size_t nelems, int pe, \
       int qpId = 0) {                                                                          \
     constexpr size_t typeSize = sizeof(T);                                                     \
-    ShmemPutMemNbi##Scope(dest, destElmOffset * typeSize, source, srcElmOffset * typeSize,     \
-                          nelems * typeSize, pe, qpId);                                        \
+    ShmemPutMemNbi##Scope(dest, destElmOffset* typeSize, source, srcElmOffset* typeSize,       \
+                          nelems* typeSize, pe, qpId);                                         \
   }                                                                                            \
   template <typename T>                                                                        \
   inline __device__ void ShmemPutTypeNbi##Scope(                                               \
@@ -159,6 +200,7 @@ DEFINE_SHMEM_PUT_TYPE_NBI_API_TEMPLATE(Warp)
 
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint8, uint8_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Int8, int8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Schar, signed char, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint16, uint16_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Int16, int16_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint32, uint32_t, Thread)
@@ -170,6 +212,7 @@ DEFINE_SHMEM_PUT_TYPE_NBI_API(Double, double, Thread)
 
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint8, uint8_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Int8, int8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Schar, signed char, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint16, uint16_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Int16, int16_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint32, uint32_t, Warp)
@@ -214,6 +257,7 @@ SHMEM_PUT_TYPE_IMM_NBI_API_TEMPLATE(Warp)
 
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint8, uint8_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int8, int8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Schar, signed char, Thread)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint16, uint16_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int16, int16_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint32, uint32_t, Thread)
@@ -223,6 +267,7 @@ DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int64, int64_t, Thread)
 
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint8, uint8_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int8, int8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Schar, signed char, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint16, uint16_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int16, int16_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint32, uint32_t, Warp)
@@ -313,6 +358,7 @@ DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API_TEMPLATE(Warp)
 
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint8, uint8_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int8, int8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Schar, signed char, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint16, uint16_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int16, int16_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint32, uint32_t, Thread)
@@ -324,6 +370,7 @@ DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Double, double, Thread)
 
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint8, uint8_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int8, int8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Schar, signed char, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint16, uint16_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int16, int16_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint32, uint32_t, Warp)
@@ -366,11 +413,15 @@ DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint32, uint32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint64, uint64_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int32, int32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Ulong, unsigned long, Thread)
 
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint32, uint32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int32, int32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Ulong, unsigned long, Warp)
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                       Atomic Fetch APIs                                        */
@@ -400,11 +451,63 @@ DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint32, uint32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint64, uint64_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int32, int32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Ulong, unsigned long, Thread)
 
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint32, uint32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int32, int32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Ulong, unsigned long, Warp)
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                              Atomic Add Convenience APIs (NonFetch)                            */
+/* ---------------------------------------------------------------------------------------------- */
+#define DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(TypeName, T, Scope)                                   \
+  inline __device__ void Shmem##TypeName##AtomicAdd##Scope(                                    \
+      const application::SymmMemObjPtr dest, size_t destOffset, T val, int pe, int qpId = 0) { \
+    ShmemAtomicTypeNonFetch##Scope<T>(dest, destOffset, val, core::AMO_ADD, pe, qpId);         \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Ulong, unsigned long, Thread)
+
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Ulong, unsigned long, Warp)
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                              Atomic Add Convenience APIs (Fetch)                               */
+/* ---------------------------------------------------------------------------------------------- */
+#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(TypeName, T, Scope)                                 \
+  inline __device__ T Shmem##TypeName##AtomicFetchAdd##Scope(                                      \
+      const application::SymmMemObjPtr dest, size_t destOffset, T val, int pe, int qpId = 0) {     \
+    T compare = 0;                                                                                 \
+    return ShmemAtomicTypeFetch##Scope<T>(dest, destOffset, val, compare, core::AMO_FETCH_ADD, pe, \
+                                          qpId);                                                   \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Ulong, unsigned long, Thread)
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Ulong, unsigned long, Warp)
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                          Pure Address-Based APIs (OpenSHMEM Style)                             */
@@ -439,6 +542,7 @@ DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API_TEMPLATE(Warp)
 
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint8, uint8_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int8, int8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Schar, signed char, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint16, uint16_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int16, int16_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint32, uint32_t, Thread)
@@ -450,6 +554,7 @@ DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Double, double, Thread)
 
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint8, uint8_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int8, int8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Schar, signed char, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint16, uint16_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int16, int16_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint32, uint32_t, Warp)
@@ -488,6 +593,7 @@ SHMEM_PUT_TYPE_IMM_NBI_ADDR_API_TEMPLATE(Warp)
 
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Uint8, uint8_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Int8, int8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Schar, signed char, Thread)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Uint16, uint16_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Int16, int16_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Uint32, uint32_t, Thread)
@@ -497,6 +603,7 @@ DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Int64, int64_t, Thread)
 
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Uint8, uint8_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Int8, int8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Schar, signed char, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Uint16, uint16_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Int16, int16_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Uint32, uint32_t, Warp)
@@ -543,6 +650,7 @@ DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API_TEMPLATE(Warp)
 
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint8, uint8_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int8, int8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Schar, signed char, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint16, uint16_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int16, int16_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint32, uint32_t, Thread)
@@ -554,6 +662,7 @@ DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Double, double, Thread)
 
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint8, uint8_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int8, int8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Schar, signed char, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint16, uint16_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int16, int16_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint32, uint32_t, Warp)
@@ -593,11 +702,15 @@ DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Uint32, uint32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Uint64, uint64_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Int32, int32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Ulong, unsigned long, Thread)
 
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Uint32, uint32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Int32, int32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Ulong, unsigned long, Warp)
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                       Atomic Fetch APIs                                        */
@@ -625,11 +738,61 @@ DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Uint32, uint32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Uint64, uint64_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Int32, int32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Ulong, unsigned long, Thread)
 
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Uint32, uint32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Int32, int32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Ulong, unsigned long, Warp)
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                   Atomic Add Convenience APIs (NonFetch, Pure Address)                         */
+/* ---------------------------------------------------------------------------------------------- */
+#define DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(TypeName, T, Scope)                                  \
+  inline __device__ void Shmem##TypeName##AtomicAdd##Scope(T* dest, T val, int pe, int qpId = 0) { \
+    ShmemAtomicTypeNonFetch##Scope<T>(dest, val, core::AMO_ADD, pe, qpId);                         \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Ulong, unsigned long, Thread)
+
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Ulong, unsigned long, Warp)
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                     Atomic Add Convenience APIs (Fetch, Pure Address)                          */
+/* ---------------------------------------------------------------------------------------------- */
+#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(TypeName, T, Scope)                       \
+  inline __device__ T Shmem##TypeName##AtomicFetchAdd##Scope(T* dest, T val, int pe,          \
+                                                             int qpId = 0) {                  \
+    T compare = 0;                                                                            \
+    return ShmemAtomicTypeFetch##Scope<T>(dest, val, compare, core::AMO_FETCH_ADD, pe, qpId); \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Ulong, unsigned long, Thread)
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Ulong, unsigned long, Warp)
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    Wait Until Greater Than APIs                                */
@@ -650,6 +813,7 @@ inline __device__ T ShmemTypeWaitUntilGreaterThan(T* addr, T val) {
 
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Uint8, uint8_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Int8, int8_t)
+DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Schar, signed char)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Uint16, uint16_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Int16, int16_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Uint32, uint32_t)
@@ -673,12 +837,26 @@ inline __device__ void ShmemTypeWaitUntilEquals(T* addr, T val) {
 
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Uint8, uint8_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Int8, int8_t)
+DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Schar, signed char)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Uint16, uint16_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Int16, int16_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Uint32, uint32_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Int32, int32_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Uint64, uint64_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Int64, int64_t)
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                       Query APIs                                               */
+/* ---------------------------------------------------------------------------------------------- */
+inline __device__ int ShmemMyPe() {
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  return globalGpuStates->rank;
+}
+
+inline __device__ int ShmemNPes() {
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  return globalGpuStates->worldSize;
+}
 
 }  // namespace shmem
 }  // namespace mori

@@ -24,7 +24,7 @@
 #include "mori/application/memory/symmetric_memory.hpp"
 #include "mori/shmem/shmem_api.hpp"
 #include "mori/utils/mori_log.hpp"
-#include "src/shmem/internal.hpp"
+#include "mori/shmem/internal.hpp"
 
 namespace mori {
 namespace shmem {
@@ -76,9 +76,48 @@ void* ShmemMalloc(size_t size) {
   }
 }
 
+void* ShmemMallocAlign(size_t alignment, size_t size) {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
+
+  if (size == 0) {
+    return nullptr;
+  }
+
+  // Validate alignment: must be power of 2
+  if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+    MORI_SHMEM_ERROR("Invalid alignment: {} (must be a power of 2)", alignment);
+    return nullptr;
+  }
+
+  // Align size to the requested alignment
+  size = (size + alignment - 1) & ~(alignment - 1);
+  return ShmemMalloc(size);
+}
+
 void* ShmemExtMallocWithFlags(size_t size, unsigned int flags) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
   states->CheckStatusValid();
+
+  if (size == 0) {
+    return nullptr;
+  }
+
+  // Use different allocation strategies based on mode
+  if (states->mode == ShmemMode::StaticHeap) {
+    // In static heap mode, flags are ignored - use the same allocator as ShmemMalloc
+    MORI_SHMEM_TRACE("Allocated shared memory of size {} with flags {} (flags ignored in static heap mode)", size, flags);
+    return ShmemMalloc(size);
+  } else {
+    // Isolation mode: use ExtMallocWithFlags directly
+    application::SymmMemObjPtr obj =
+        states->memoryStates->symmMemMgr->ExtMallocWithFlags(size, flags);
+    MORI_SHMEM_TRACE("Allocated shared memory of size {} with flags {} in isolation mode", size, flags);
+    if (obj.IsValid()) {
+      return obj.cpu->localPtr;
+    }
+    return nullptr;
+  }
 
   if (size == 0) {
     return nullptr;
@@ -118,11 +157,30 @@ void ShmemFree(void* localPtr) {
     // Isolation mode: free the memory and deregister
     states->memoryStates->symmMemMgr->Free(localPtr);
   }
+
+  if (localPtr == nullptr) {
+    return;
+  }
+
+  // Use different deallocation strategies based on mode
+  if (states->mode == ShmemMode::StaticHeap) {
+    // Static heap mode: just deregister from the pool (no actual free)
+    // TODO: Implement a proper free list allocator for better memory reuse
+    states->memoryStates->symmMemMgr->HeapDeregisterSymmMemObj(localPtr);
+  } else {
+    // Isolation mode: free the memory and deregister
+    states->memoryStates->symmMemMgr->Free(localPtr);
+  }
 }
 
 application::SymmMemObjPtr ShmemQueryMemObjPtr(void* localPtr) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
   states->CheckStatusValid();
+
+  if (localPtr == nullptr) {
+    return application::SymmMemObjPtr{nullptr, nullptr};
+  }
+
 
   if (localPtr == nullptr) {
     return application::SymmMemObjPtr{nullptr, nullptr};
@@ -143,6 +201,54 @@ int ShmemBufferDeregister(void* ptr, size_t size) {
   states->CheckStatusValid();
   states->memoryStates->mrMgr->DeregisterBuffer(ptr);
   return 0;
+}
+
+uint64_t ShmemPtrP2p(const uint64_t destPtr, const int myPe, int destPe) {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
+
+  // If same PE, return the pointer directly
+  if (myPe == destPe) {
+    return destPtr;
+  }
+
+  if (destPe < 0 || destPe >= static_cast<int>(states->bootStates->worldSize)) {
+    MORI_SHMEM_ERROR("Invalid destPe: {}", destPe);
+    return 0;
+  }
+
+  application::TransportType transportType = states->rdmaStates->commContext->GetTransportType(destPe);
+  if (transportType == application::TransportType::RDMA) {
+    return 0;
+  }
+
+  uintptr_t localAddrInt = static_cast<uintptr_t>(destPtr);
+
+  // Check if the pointer is within the symmetric heap
+  uintptr_t heapBaseAddr = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
+  uintptr_t heapEndAddr = heapBaseAddr + states->memoryStates->staticHeapSize;
+
+  if (localAddrInt < heapBaseAddr || localAddrInt >= heapEndAddr) {
+    MORI_SHMEM_ERROR("Pointer 0x{:x} is not in symmetric heap [0x{:x}, 0x{:x})", 
+                     localAddrInt, heapBaseAddr, heapEndAddr);
+    return 0;
+  }
+
+  // Calculate offset from heap base
+  size_t offset = localAddrInt - heapBaseAddr;
+
+  // Get the symmetric memory object for the heap
+  application::SymmMemObjPtr heapObj = states->memoryStates->staticHeapObj;
+  if (heapObj->Get() == nullptr) {
+    MORI_SHMEM_ERROR("Failed to get heap symmetric memory object");
+    return 0;
+  }
+
+  uint64_t peerBaseAddr = heapObj->peerPtrs[destPe];
+
+  // Return the remote P2P address
+  uint64_t remoteAddr = peerBaseAddr + offset;
+  return remoteAddr;
 }
 
 }  // namespace shmem
