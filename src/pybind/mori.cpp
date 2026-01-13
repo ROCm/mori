@@ -56,8 +56,6 @@ using mori::moe::EpDispatchCombineHandle;
 using mori::moe::KernelType;
 using mori::moe::index_t;
 
-#define XPUT(fmt, ...) fprintf(stderr, fmt"\n", ##__VA_ARGS__)
-
 namespace pjrt {
 
 template <typename ExtType, typename InputType>
