@@ -140,7 +140,8 @@ void EpDispatchCombineHandle::FinalizeShmemBuf() {
 }
 
 void EpDispatchCombineHandle::InitializeTokenNumSignalBuf() {
-  size_t tokenNumSignalSize = config.worldSize * sizeof(index_t) * 2;
+  // NOTE: config.numQpPerPe is for async kernel's multi-qp optimization
+  size_t tokenNumSignalSize = config.worldSize * sizeof(index_t) * 2 * config.numQpPerPe;
   recvTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
   sendTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
   // The extra *2 is for the laddr.
