@@ -66,6 +66,19 @@ inline std::ostream& operator<<(std::ostream& os, const RdmaBackendConfig& c) {
             << c.enableNotification << "]";
 }
 
+struct XgmiBackendConfig : public BackendConfig {
+  XgmiBackendConfig() : BackendConfig(BackendType::XGMI) {}
+  XgmiBackendConfig(int numStreams_, int numEvents_)
+      : BackendConfig(BackendType::XGMI), numStreams(numStreams_), numEvents(numEvents_) {}
+
+  int numStreams{64};
+  int numEvents{64};
+};
+
+inline std::ostream& operator<<(std::ostream& os, const XgmiBackendConfig& c) {
+  return os << "numStreams[" << c.numStreams << "] numEvents[" << c.numEvents << "]";
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         BackendSession                                         */
 /* ---------------------------------------------------------------------------------------------- */
@@ -142,9 +155,10 @@ class Backend {
 
   virtual BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote) = 0;
 
-  // Take the transfer status of an inbound op
   virtual bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                         TransferStatus* status) = 0;
+
+  virtual bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const { return true; }
 };
 
 }  // namespace io

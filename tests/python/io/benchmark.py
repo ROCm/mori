@@ -30,6 +30,7 @@ from mori.io import (
     MemoryDesc,
     PollCqMode,
     RdmaBackendConfig,
+    XgmiBackendConfig,
     set_log_level,
 )
 import argparse
@@ -42,7 +43,40 @@ from prettytable import PrettyTable
 def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark MORI-IO")
     parser.add_argument(
-        "--host", type=str, help="Host IP for mori io engine OOB communication"
+        "--backend",
+        type=str,
+        choices=["rdma", "xgmi"],
+        default="rdma",
+        help="Backend type: 'rdma' for cross-node, 'xgmi' for intra-node GPU-to-GPU (default: rdma)",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        help="Host IP for mori io engine OOB communication (RDMA only)",
+    )
+    parser.add_argument(
+        "--src-gpu",
+        type=int,
+        default=0,
+        help="Source GPU device ID for XGMI mode (default: 0)",
+    )
+    parser.add_argument(
+        "--dst-gpu",
+        type=int,
+        default=1,
+        help="Destination GPU device ID for XGMI mode (default: 1)",
+    )
+    parser.add_argument(
+        "--num-streams",
+        type=int,
+        default=64,
+        help="Number of HIP streams per device for XGMI mode (default: 64)",
+    )
+    parser.add_argument(
+        "--num-events",
+        type=int,
+        default=64,
+        help="Number of HIP events per device for XGMI mode (default: 64)",
     )
     parser.add_argument(
         "--op-type",
@@ -153,50 +187,60 @@ class MoriIoBenchmark:
     def __init__(
         self,
         op_type: str,
-        host: str,
-        port: int,
-        node_rank: int,
-        rank_in_node: int,
         buffer_size: int,
         transfer_batch_size: int,
         enable_batch_transfer: bool = False,
         enable_sess: bool = False,
-        num_initiator_dev: int = 1,
-        num_target_dev: int = 1,
-        num_qp_per_transfer: int = 1,
-        num_worker_threads: int = 1,
-        poll_cq_mode: str = "polling",
         iters: int = 128,
         sweep: bool = False,
         sweep_batch: bool = False,
         sweep_start_size: int = 8,
         sweep_max_size: int = 2**20,
+        backend_type: str = "rdma",
+        host: str = "",
+        port: int = 0,
+        node_rank: int = 0,
+        rank_in_node: int = 0,
+        num_initiator_dev: int = 1,
+        num_target_dev: int = 1,
+        num_qp_per_transfer: int = 1,
+        num_worker_threads: int = 1,
+        poll_cq_mode: str = "polling",
+        src_gpu: int = 0,
+        dst_gpu: int = 1,
+        num_streams: int = 64,
+        num_events: int = 64,
     ):
         self.op_type = op_type
+        self.buffer_size = buffer_size
+        self.transfer_batch_size = transfer_batch_size
+        self.enable_batch_transfer = enable_batch_transfer
+        self.enable_sess = enable_sess
+        self.iters = iters
+        self.sweep = sweep
+        self.sweep_batch = sweep_batch
+        self.sweep_start_size = sweep_start_size
+        self.sweep_max_size = sweep_max_size
+        self.backend_type = backend_type
+
         self.host = host
         self.port = port
         self.node_rank = node_rank
         self.role_rank = rank_in_node
         self.num_initiator_dev = num_initiator_dev
         self.num_target_dev = num_target_dev
-        assert self.num_initiator_dev == self.num_target_dev
-        self.buffer_size = buffer_size
-        self.transfer_batch_size = transfer_batch_size
-        self.enable_batch_transfer = enable_batch_transfer
-        self.enable_sess = enable_sess
         self.num_qp_per_transfer = num_qp_per_transfer
         self.num_worker_threads = num_worker_threads
         self.poll_cq_mode = (
             PollCqMode.POLLING if poll_cq_mode == "polling" else PollCqMode.EVENT
         )
-        self.iters = iters
-        self.sweep = sweep
-        self.sweep_batch = sweep_batch
-        self.sweep_start_size = sweep_start_size
-        self.sweep_max_size = sweep_max_size
+
+        self.src_gpu = src_gpu
+        self.dst_gpu = dst_gpu
+        self.num_streams = num_streams
+        self.num_events = num_events
 
         if self.sweep:
-            # basic validation
             if self.sweep_start_size <= 0 or self.sweep_max_size <= 0:
                 raise ValueError("Sweep sizes must be positive integers")
             if self.sweep_start_size > self.sweep_max_size:
@@ -204,6 +248,13 @@ class MoriIoBenchmark:
                     f"start-buffer-size ({self.sweep_start_size}) should not exceed max-buffer-size ({self.sweep_max_size})"
                 )
 
+        if self.backend_type == "xgmi":
+            self._setup_xgmi()
+        else:
+            self._setup_rdma()
+
+    def _setup_rdma(self):
+        assert self.num_initiator_dev == self.num_target_dev
         self.world_size = self.num_initiator_dev + self.num_target_dev
         if self.node_rank == 0:
             self.global_rank = self.role_rank
@@ -217,23 +268,44 @@ class MoriIoBenchmark:
             self.device, dtype=torch.float8_e4m3fnuz
         )
 
+    def _setup_xgmi(self):
+        self.role = EngineRole.INITIATOR
+        self.src_device = torch.device("cuda", self.src_gpu)
+        self.dst_device = torch.device("cuda", self.dst_gpu)
+
+        self.tensor = torch.randn(self.buffer_size * self.transfer_batch_size).to(
+            self.src_device, dtype=torch.float8_e4m3fnuz
+        )
+        self.target_tensor = torch.zeros(
+            self.buffer_size * self.transfer_batch_size
+        ).to(self.dst_device, dtype=torch.float8_e4m3fnuz)
+
     def print_config(self):
         print("MORI-IO Benchmark Configurations:")
+        print(f"  backend: {self.backend_type.upper()}")
         print(f"  op_type: {self.op_type}")
-        print(f"  host: {self.host}")
-        print(f"  port: {self.port}")
-        print(f"  node_rank: {self.node_rank}")
-        print(f"  role: {self.role}")
-        print(f"  role_rank: {self.role_rank}")
-        print(f"  num_initiator_dev: {self.num_initiator_dev}")
-        print(f"  num_target_dev: {self.num_target_dev}")
+
+        if self.backend_type == "xgmi":
+            print(f"  src_gpu: {self.src_gpu}")
+            print(f"  dst_gpu: {self.dst_gpu}")
+            print(f"  num_streams: {self.num_streams}")
+            print(f"  num_events: {self.num_events}")
+        else:
+            print(f"  host: {self.host}")
+            print(f"  port: {self.port}")
+            print(f"  node_rank: {self.node_rank}")
+            print(f"  role: {self.role}")
+            print(f"  role_rank: {self.role_rank}")
+            print(f"  num_initiator_dev: {self.num_initiator_dev}")
+            print(f"  num_target_dev: {self.num_target_dev}")
+            print(f"  num_qp_per_transfer: {self.num_qp_per_transfer}")
+            print(f"  num_worker_threads: {self.num_worker_threads}")
+            print(f"  poll_cq_mode: {self.poll_cq_mode}")
+
         print(f"  buffer_size: {self.buffer_size} B")
         print(f"  transfer_batch_size: {self.transfer_batch_size}")
         print(f"  enable_batch_transfer: {self.enable_batch_transfer}")
         print(f"  enable_sess: {self.enable_sess}")
-        print(f"  num_qp_per_transfer: {self.num_qp_per_transfer}")
-        print(f"  num_worker_threads: {self.num_worker_threads}")
-        print(f"  poll_cq_mode: {self.poll_cq_mode}")
         print(f"  iters: {self.iters}")
         print()
 
@@ -252,6 +324,12 @@ class MoriIoBenchmark:
         return bytes(t.tolist())
 
     def validate(self):
+        if self.backend_type == "xgmi":
+            self._validate_xgmi()
+        else:
+            self._validate_rdma()
+
+    def _validate_rdma(self):
         if self.role is EngineRole.INITIATOR:
             int8_tensor = torch.empty(
                 self.buffer_size * self.transfer_batch_size,
@@ -265,7 +343,27 @@ class MoriIoBenchmark:
             int8_view = self.tensor.view(torch.uint8)
             dist.send(int8_view, dst=self.role_rank)
 
+    def _validate_xgmi(self):
+        transfer_uid = self.engine.allocate_transfer_uid()
+        status = self.engine.write(
+            self.mem, 0, self.target_mem, 0, self.buffer_size, transfer_uid
+        )
+        status.Wait()
+        assert status.Succeeded()
+
+        src_cpu = self.tensor[: self.buffer_size].cpu()
+        dst_cpu = self.target_tensor[: self.buffer_size].cpu()
+        assert torch.equal(
+            src_cpu.view(torch.uint8), dst_cpu.view(torch.uint8)
+        ), "Validation failed: data mismatch"
+
     def initialize(self):
+        if self.backend_type == "xgmi":
+            self._initialize_xgmi()
+        else:
+            self._initialize_rdma()
+
+    def _initialize_rdma(self):
         config = IOEngineConfig(
             host=self.host,
             port=self.port,
@@ -307,102 +405,117 @@ class MoriIoBenchmark:
             self.target_mem = MemoryDesc.unpack(target_mem_desc)
             self.sess = self.engine.create_session(self.mem, self.target_mem)
 
+    def _initialize_xgmi(self):
+        config = IOEngineConfig(host="", port=0)
+        self.engine = IOEngine(key="xgmi-benchmark", config=config)
+
+        xgmi_config = XgmiBackendConfig(
+            num_streams=self.num_streams,
+            num_events=self.num_events,
+        )
+        self.engine.create_backend(BackendType.XGMI, xgmi_config)
+
+        self.mem = self.engine.register_torch_tensor(self.tensor)
+        self.target_mem = self.engine.register_torch_tensor(self.target_tensor)
+
+        if self.enable_sess:
+            self.sess = self.engine.create_session(self.mem, self.target_mem)
+
     def run_single_once(self, buffer_size, transfer_batch_size):
         assert buffer_size <= self.buffer_size
-        if self.role is EngineRole.INITIATOR:
-            status_list = []
-            transfer_uids = []
-
-            for i in range(transfer_batch_size):
-                transfer_uids.append(self.engine.allocate_transfer_uid())
-
-            func, arg_list = None, []
-            for i in range(transfer_batch_size):
-                offset = buffer_size * i
-                if self.enable_sess:
-                    func = self.sess.read if self.op_type == "read" else self.sess.write
-                    arg_list.append(
-                        (
-                            offset,
-                            offset,
-                            buffer_size,
-                            transfer_uids[i],
-                        )
-                    )
-                else:
-                    func = (
-                        self.engine.read
-                        if self.op_type == "read"
-                        else self.engine.write
-                    )
-                    arg_list.append(
-                        (
-                            self.mem,
-                            offset,
-                            self.target_mem,
-                            offset,
-                            buffer_size,
-                            transfer_uids[i],
-                        )
-                    )
-
-            st = time.time()
-            for i in range(transfer_batch_size):
-                status = func(*arg_list[i])
-                status_list.append(status)
-            for i, status in enumerate(status_list):
-                status.Wait()
-            duration = time.time() - st
-            for status in status_list:
-                assert status.Succeeded()
-            return duration
-        else:
+        if self.backend_type == "rdma" and self.role is EngineRole.TARGET:
             return 0
+
+        status_list = []
+        transfer_uids = []
+
+        for i in range(transfer_batch_size):
+            transfer_uids.append(self.engine.allocate_transfer_uid())
+
+        func, arg_list = None, []
+        for i in range(transfer_batch_size):
+            offset = buffer_size * i
+            if self.enable_sess:
+                func = self.sess.read if self.op_type == "read" else self.sess.write
+                arg_list.append(
+                    (
+                        offset,
+                        offset,
+                        buffer_size,
+                        transfer_uids[i],
+                    )
+                )
+            else:
+                func = self.engine.read if self.op_type == "read" else self.engine.write
+                arg_list.append(
+                    (
+                        self.mem,
+                        offset,
+                        self.target_mem,
+                        offset,
+                        buffer_size,
+                        transfer_uids[i],
+                    )
+                )
+
+        st = time.time()
+        for i in range(transfer_batch_size):
+            status = func(*arg_list[i])
+            status_list.append(status)
+        for status in status_list:
+            status.Wait()
+        duration = time.time() - st
+
+        for status in status_list:
+            assert status.Succeeded(), f"Transfer failed: {status.Message()}"
+        return duration
 
     def run_batch_once(self, buffer_size, transfer_batch_size):
         assert buffer_size <= self.buffer_size
-        if self.role is EngineRole.INITIATOR:
-            offsets = [(i * buffer_size) for i in range(transfer_batch_size)]
-            sizes = [buffer_size for _ in range(transfer_batch_size)]
-            transfer_uid = self.engine.allocate_transfer_uid()
-            func, args = None, None
-            if self.enable_sess:
-                func = (
-                    self.sess.batch_read
-                    if self.op_type == "read"
-                    else self.sess.batch_write
-                )
-                args = (
-                    offsets,
-                    offsets,
-                    sizes,
-                    transfer_uid,
-                )
-                st = time.time()
-                transfer_status = func(*args)
-
-            else:
-                func = (
-                    self.engine.batch_read
-                    if self.op_type == "read"
-                    else self.engine.batch_write
-                )
-                args = (
-                    [self.mem],
-                    [offsets],
-                    [self.target_mem],
-                    [offsets],
-                    [sizes],
-                    [transfer_uid],
-                )
-                st = time.time()
-                transfer_status = func(*args)[0]
-            transfer_status.Wait()
-            duration = time.time() - st
-            assert transfer_status.Succeeded()
-            return duration
-        else:
+        if self.backend_type == "rdma" and self.role is EngineRole.TARGET:
             return 0
+
+        offsets = [(i * buffer_size) for i in range(transfer_batch_size)]
+        sizes = [buffer_size for _ in range(transfer_batch_size)]
+        transfer_uid = self.engine.allocate_transfer_uid()
+
+        if self.enable_sess:
+            func = (
+                self.sess.batch_read
+                if self.op_type == "read"
+                else self.sess.batch_write
+            )
+            args = (
+                offsets,
+                offsets,
+                sizes,
+                transfer_uid,
+            )
+            st = time.time()
+            transfer_status = func(*args)
+        else:
+            func = (
+                self.engine.batch_read
+                if self.op_type == "read"
+                else self.engine.batch_write
+            )
+            args = (
+                [self.mem],
+                [offsets],
+                [self.target_mem],
+                [offsets],
+                [sizes],
+                [transfer_uid],
+            )
+            st = time.time()
+            transfer_status = func(*args)[0]
+
+        transfer_status.Wait()
+        duration = time.time() - st
+        assert (
+            transfer_status.Succeeded()
+        ), f"Batch transfer failed: {transfer_status.Message()}"
+        return duration
 
     def run_once(self, buffer_size, transfer_batch_size):
         if self.enable_batch_transfer:
@@ -412,33 +525,124 @@ class MoriIoBenchmark:
 
     def _run_and_compute(self, buffer_size, transfer_batch_size, iters):
         latency = []
-        for i in range(iters):
+        for _ in range(iters):
             duration = self.run_once(buffer_size, transfer_batch_size)
             latency.append(duration)
 
-        if self.role is EngineRole.TARGET:
+        if self.backend_type == "rdma" and self.role is EngineRole.TARGET:
             return 0, 0, 0, 0, 0
 
         total_mem_mb = buffer_size * transfer_batch_size / (10**6)
-
         avg_duration = sum(latency) / len(latency)
         min_duration = min(latency)
-        avg_duration_us, min_duration_us = avg_duration * (10**6), min_duration * (
-            10**6
-        )
-
+        avg_duration_us = avg_duration * (10**6)
+        min_duration_us = min_duration * (10**6)
         avg_bw = total_mem_mb / (10**3) / avg_duration
         max_bw = total_mem_mb / (10**3) / min_duration
 
-        return (
-            total_mem_mb,
-            avg_duration_us,
-            min_duration_us,
-            avg_bw,
-            max_bw,
+        return total_mem_mb, avg_duration_us, min_duration_us, avg_bw, max_bw
+
+    def _get_table_title(self):
+        if self.backend_type == "xgmi":
+            return f"XGMI Benchmark: GPU{self.src_gpu} -> GPU{self.dst_gpu}"
+        else:
+            return f"RDMA Benchmark: Initiator Rank {self.role_rank}"
+
+    def _run_benchmark_loop(self):
+        self.run_once(self.buffer_size, self.transfer_batch_size)
+
+        table = PrettyTable(
+            field_names=[
+                "MsgSize (B)",
+                "BatchSize",
+                "TotalSize (MB)",
+                "Max BW (GB/s)",
+                "Avg BW (GB/s)",
+                "Min Lat (us)",
+                "Avg Lat (us)",
+            ],
+            title=self._get_table_title(),
         )
 
+        if self.sweep:
+            cur_size = self.sweep_start_size
+            max_size = self.sweep_max_size
+            while cur_size <= max_size:
+                if self.backend_type == "rdma":
+                    dist.barrier()
+                total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
+                    self._run_and_compute(
+                        cur_size, self.transfer_batch_size, self.iters
+                    )
+                )
+                table.add_row(
+                    [
+                        cur_size,
+                        self.transfer_batch_size,
+                        f"{total_mem_mb:.2f}",
+                        f"{max_bw:.2f}",
+                        f"{avg_bw:.2f}",
+                        f"{min_duration:.2f}",
+                        f"{avg_duration:.2f}",
+                    ]
+                )
+                cur_size *= 2
+        elif self.sweep_batch:
+            cur_transfer_batch_size = 1
+            max_transfer_batch_size = 32768
+            while cur_transfer_batch_size <= max_transfer_batch_size:
+                if self.backend_type == "rdma":
+                    dist.barrier()
+                total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
+                    self._run_and_compute(
+                        self.buffer_size, cur_transfer_batch_size, self.iters
+                    )
+                )
+                table.add_row(
+                    [
+                        self.buffer_size,
+                        cur_transfer_batch_size,
+                        f"{total_mem_mb:.2f}",
+                        f"{max_bw:.2f}",
+                        f"{avg_bw:.2f}",
+                        f"{min_duration:.2f}",
+                        f"{avg_duration:.2f}",
+                    ]
+                )
+                cur_transfer_batch_size *= 2
+        else:
+            total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
+                self._run_and_compute(
+                    self.buffer_size, self.transfer_batch_size, self.iters
+                )
+            )
+            table.add_row(
+                [
+                    self.buffer_size,
+                    self.transfer_batch_size,
+                    f"{total_mem_mb:.2f}",
+                    f"{max_bw:.2f}",
+                    f"{avg_bw:.2f}",
+                    f"{min_duration:.2f}",
+                    f"{avg_duration:.2f}",
+                ]
+            )
+
+        if self.backend_type == "xgmi" or self.role is EngineRole.INITIATOR:
+            print(table)
+
     def run(self):
+        if self.backend_type == "xgmi":
+            self._run_xgmi()
+        else:
+            self._run_rdma()
+
+    def _run_xgmi(self):
+        self.initialize()
+        self.validate()
+        self._run_benchmark_loop()
+
+    def _run_rdma(self):
         with TorchDistContext(
             rank=self.global_rank,
             world_size=self.world_size,
@@ -452,83 +656,7 @@ class MoriIoBenchmark:
             self.validate()
             self.run_once(self.buffer_size, self.transfer_batch_size)
             dist.barrier()
-
-            iters = self.iters
-            table = PrettyTable(
-                field_names=[
-                    "MsgSize (B)",
-                    "BatchSize",
-                    "TotalSize (MB)",
-                    "Max BW (GB/s)",
-                    "Avg Bw (GB/s)",
-                    "Min Lat (us)",
-                    "Avg Lat (us)",
-                ],
-                title=f"Initiator Rank {self.role_rank}",
-            )
-
-            if self.sweep:
-                cur_size = self.sweep_start_size
-                max_size = self.sweep_max_size
-                while cur_size <= max_size:
-                    dist.barrier()
-                    total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
-                        self._run_and_compute(cur_size, self.transfer_batch_size, iters)
-                    )
-                    table.add_row(
-                        [
-                            cur_size,
-                            self.transfer_batch_size,
-                            f"{total_mem_mb:.2f}",
-                            f"{max_bw:.2f}",
-                            f"{avg_bw:.2f}",
-                            f"{min_duration:.2f}",
-                            f"{avg_duration:.2f}",
-                        ]
-                    )
-                    cur_size *= 2
-            elif self.sweep_batch:
-                cur_transfer_batch_size = 1
-                max_transfer_batch_size = 32768
-                while cur_transfer_batch_size <= max_transfer_batch_size:
-                    dist.barrier()
-                    total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
-                        self._run_and_compute(
-                            self.buffer_size, cur_transfer_batch_size, iters
-                        )
-                    )
-                    table.add_row(
-                        [
-                            self.buffer_size,
-                            cur_transfer_batch_size,
-                            f"{total_mem_mb:.2f}",
-                            f"{max_bw:.2f}",
-                            f"{avg_bw:.2f}",
-                            f"{min_duration:.2f}",
-                            f"{avg_duration:.2f}",
-                        ]
-                    )
-                    cur_transfer_batch_size *= 2
-            else:
-                total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
-                    self._run_and_compute(
-                        self.buffer_size, self.transfer_batch_size, iters
-                    )
-                )
-                table.add_row(
-                    [
-                        self.buffer_size,
-                        self.transfer_batch_size,
-                        f"{total_mem_mb:.2f}",
-                        f"{max_bw:.2f}",
-                        f"{avg_bw:.2f}",
-                        f"{min_duration:.2f}",
-                        f"{avg_duration:.2f}",
-                    ]
-                )
-
-            if self.role is EngineRole.INITIATOR:
-                print(table)
+            self._run_benchmark_loop()
 
 
 def benchmark_engine(local_rank, node_rank, args):
@@ -539,33 +667,74 @@ def benchmark_engine(local_rank, node_rank, args):
     max_transfer_batch_size = args.transfer_batch_size
     if args.all_batch:
         max_transfer_batch_size = max(max_transfer_batch_size, 2**15)
+
     bench = MoriIoBenchmark(
         op_type=args.op_type,
-        host=args.host,
-        port=get_free_port(),
-        node_rank=node_rank,
-        rank_in_node=local_rank,
         buffer_size=max_buffer_size,
         transfer_batch_size=max_transfer_batch_size,
         enable_batch_transfer=args.enable_batch_transfer,
         enable_sess=args.enable_sess,
-        num_initiator_dev=args.num_initiator_dev,
-        num_target_dev=args.num_target_dev,
-        num_qp_per_transfer=args.num_qp_per_transfer,
-        num_worker_threads=args.num_worker_threads,
-        poll_cq_mode=args.poll_cq_mode,
         iters=args.iters,
         sweep=args.all,
         sweep_batch=args.all_batch,
         sweep_start_size=args.sweep_start_size,
         sweep_max_size=args.sweep_max_size,
+        backend_type="rdma",
+        host=args.host,
+        port=get_free_port(),
+        node_rank=node_rank,
+        rank_in_node=local_rank,
+        num_initiator_dev=args.num_initiator_dev,
+        num_target_dev=args.num_target_dev,
+        num_qp_per_transfer=args.num_qp_per_transfer,
+        num_worker_threads=args.num_worker_threads,
+        poll_cq_mode=args.poll_cq_mode,
     )
     bench.print_config()
     bench.run()
 
 
-def benchmark():
-    args = parse_args()
+def benchmark_xgmi(args):
+    set_log_level(args.log_level)
+
+    num_gpus = torch.cuda.device_count()
+    if args.src_gpu >= num_gpus or args.dst_gpu >= num_gpus:
+        raise ValueError(f"Invalid GPU ID. Available GPUs: 0-{num_gpus-1}")
+
+    if args.src_gpu == args.dst_gpu:
+        print(
+            "Warning: src_gpu and dst_gpu are the same. This will be a device-local transfer."
+        )
+
+    max_buffer_size = args.buffer_size
+    if args.all:
+        max_buffer_size = max(max_buffer_size, args.sweep_max_size)
+    max_transfer_batch_size = args.transfer_batch_size
+    if args.all_batch:
+        max_transfer_batch_size = max(max_transfer_batch_size, 2**15)
+
+    bench = MoriIoBenchmark(
+        op_type=args.op_type,
+        buffer_size=max_buffer_size,
+        transfer_batch_size=max_transfer_batch_size,
+        enable_batch_transfer=args.enable_batch_transfer,
+        enable_sess=args.enable_sess,
+        iters=args.iters,
+        sweep=args.all,
+        sweep_batch=args.all_batch,
+        sweep_start_size=args.sweep_start_size,
+        sweep_max_size=args.sweep_max_size,
+        backend_type="xgmi",
+        src_gpu=args.src_gpu,
+        dst_gpu=args.dst_gpu,
+        num_streams=args.num_streams,
+        num_events=args.num_events,
+    )
+    bench.print_config()
+    bench.run()
+
+
+def benchmark_rdma(args):
     if args.all:
         if args.sweep_start_size > args.sweep_max_size:
             raise ValueError(
@@ -573,8 +742,10 @@ def benchmark():
             )
         if args.sweep_start_size <= 0 or args.sweep_max_size <= 0:
             raise ValueError("Sweep sizes must be positive integers")
+
     num_node = int(os.environ["WORLD_SIZE"])
     assert num_node == 2
+
     node_rank = int(os.environ["RANK"])
     nprocs = args.num_initiator_dev if node_rank == 0 else args.num_target_dev
     torch.multiprocessing.spawn(
@@ -586,6 +757,15 @@ def benchmark():
         nprocs=nprocs,
         join=True,
     )
+
+
+def benchmark():
+    args = parse_args()
+
+    if args.backend == "xgmi":
+        benchmark_xgmi(args)
+    else:
+        benchmark_rdma(args)
 
 
 if __name__ == "__main__":
