@@ -446,6 +446,11 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readwrite("poll_cq_mode", &mori::io::RdmaBackendConfig::pollCqMode)
       .def_readwrite("enable_notification", &mori::io::RdmaBackendConfig::enableNotification);
 
+  py::class_<mori::io::XgmiBackendConfig, mori::io::BackendConfig>(m, "XgmiBackendConfig")
+      .def(py::init<int, int>(), py::arg("num_streams") = 64, py::arg("num_events") = 64)
+      .def_readwrite("num_streams", &mori::io::XgmiBackendConfig::numStreams)
+      .def_readwrite("num_events", &mori::io::XgmiBackendConfig::numEvents);
+
   py::class_<mori::io::IOEngineConfig>(m, "IOEngineConfig")
       .def(py::init<std::string, uint16_t>(), py::arg("host") = "", py::arg("port") = 0)
       .def_readwrite("host", &mori::io::IOEngineConfig::host)

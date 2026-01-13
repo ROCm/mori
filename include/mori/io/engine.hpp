@@ -109,7 +109,6 @@ class IOEngine {
   Backend* SelectBackend(const MemoryDesc& local, const MemoryDesc& remote);
 
  public:
-  // Config and descriptors
   IOEngineConfig config;
   EngineDesc desc;
 

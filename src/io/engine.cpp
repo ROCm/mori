@@ -23,6 +23,7 @@
 
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/backend_impl.hpp"
+#include "src/io/xgmi/backend_impl.hpp"
 
 namespace mori {
 namespace io {
@@ -88,8 +89,7 @@ IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
   desc.hostname = std::string(hostname);
   desc.host = config.host;
   desc.port = config.port;
-  MORI_IO_INFO("Create engine key {} hostname {} host {}, port {}", key, hostname, config.host,
-               config.port);
+  MORI_IO_INFO("Create engine key {} hostname {}", key, hostname);
 }
 
 IOEngine::~IOEngine() {}
@@ -115,8 +115,14 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
     }
 
     backends.insert({type, std::move(backend)});
-  } else
+  } else if (type == BackendType::XGMI) {
+    assert(backends.find(type) == backends.end());
+    auto backend = std::make_unique<XgmiBackend>(desc.key, config,
+                                                 static_cast<const XgmiBackendConfig&>(beConfig));
+    backends.insert({type, std::move(backend)});
+  } else {
     assert(false && "not implemented");
+  }
   MORI_IO_INFO("Create backend type {}", static_cast<uint32_t>(type));
 }
 
@@ -126,7 +132,8 @@ void IOEngine::RegisterRemoteEngine(const EngineDesc& remote) {
   for (auto& it : backends) {
     it.second->RegisterRemoteEngine(remote);
   }
-  MORI_IO_INFO("Register remote engine {}", remote.key.c_str());
+  MORI_IO_INFO("Register remote engine {} hostname {}", remote.key.c_str(),
+               remote.hostname.c_str());
 }
 
 void IOEngine::DeregisterRemoteEngine(const EngineDesc& remote) {
@@ -173,6 +180,17 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
   if (backends.empty()) {
     return nullptr;
   }
+
+  auto xgmiIt = backends.find(BackendType::XGMI);
+  if (xgmiIt != backends.end() && xgmiIt->second->CanHandle(local, remote)) {
+    return xgmiIt->second.get();
+  }
+
+  auto rdmaIt = backends.find(BackendType::RDMA);
+  if (rdmaIt != backends.end()) {
+    return rdmaIt->second.get();
+  }
+
   return backends.begin()->second.get();
 }
 

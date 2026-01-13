@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <functional>
 #include <msgpack.hpp>
 #include <mutex>
 
@@ -135,14 +136,21 @@ struct TransferStatus {
   }
 
   void Wait() {
+    if (waitCallback) {
+      waitCallback();
+      return;
+    }
     while (InProgress()) {
     }
   }
+
+  void SetWaitCallback(std::function<void()> cb) { waitCallback = std::move(cb); }
 
  private:
   std::atomic<StatusCode> code{StatusCode::INIT};
   mutable std::mutex msgMu;
   std::string msg;
+  std::function<void()> waitCallback;
 };
 
 using SizeVec = std::vector<size_t>;
