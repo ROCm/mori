@@ -113,7 +113,7 @@ int OneShotAllReduceExecutor<T>::Execute(T* input, T* output, size_t count, hipS
     blocks = config.maxBlocks;
   }
 
-  OneShotAllReduceKernel<T><<<blocks, threadsPerBlock, 0, stream>>>(
+  OneShotAllReduceKernel<T><<<blocks, 512, 0, stream>>>(
       rank, numRanks, srcMemObj, dstMemObj, scratchMemObj, flagsMemObj, count);
   hipError_t kernelStatus = hipGetLastError();
   shmem::ShmemFree(scratchBuffer);

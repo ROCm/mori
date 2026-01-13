@@ -98,8 +98,8 @@ __global__ void OneShotAllReduceKernel(int myPe, int npes,
     shmem::ShmemPutMemNbiWarp(scratchMemObj, 0, srcMemObj, 0, bytesPerPeer, warpId);
     //shmem::ShmemQuietWarp(warpId,scratchMemObj);
     if(laneId == 0){
-      shmem::ShmemQuietThread(remotePe,scratchMemObj);
-      shmem::ShmemAtomicSizeNonFetchThreadKernel(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8, core::atomicType::AMO_ADD, warpId);
+      shmem::ShmemQuietThread(warpId,scratchMemObj);
+      shmem::ShmemAtomicSizeNonFetchThread(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8, core::atomicType::AMO_ADD, warpId);
     }
       
   }
