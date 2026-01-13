@@ -194,6 +194,7 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
     }
     if (laneId == 0) {
       args.dispatchGridBarrier[0] = 0;
+      atomicAdd(args.crossDeviceBarrierFlag, 1);
     }
   }
 }
@@ -216,18 +217,17 @@ __global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
                                reinterpret_cast<uint8_t*>(args.inpTokenBuf) + tokenId * hiddenBytes,
                                hiddenBytes);
   }
-  uint32_t barrierFlag = 0;
   if (laneId == 0) {
     atomicAdd(args.combineGridBarrier, 1);
-    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
   }
-  barrierFlag = __shfl(barrierFlag, 0);
 
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       if (laneId == 0) shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
-      int tokenNum = recvTokenNums[destPe * config.numQpPerPe];
+      int tokenNum = recvTokenNums[destPe * config.numQpPerPe + qpId];
+      // Reset to zero for later reuse
+      recvTokenNums[destPe * config.numQpPerPe + qpId] = 0;
       int tokenChunkNum = core::CeilDiv(tokenNum, config.numQpPerPe);
       int thisChunkTokenNum = std::min(tokenChunkNum, tokenNum - qpId * tokenChunkNum);
       size_t remoteOffset =
@@ -293,12 +293,8 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   finishedWarpNum = __shfl(finishedWarpNum, 0);
 
   if (finishedWarpNum == (2 * globalWarpNum - 1)) {
-    for (int i = laneId; i < config.numQpPerPe * npes; i += warpSize) {
-      args.recvTokenNumMemObj->template GetAs<index_t*>()[i] = 0;
-    }
     if (laneId == 0) {
       args.combineGridBarrier[0] = 0;
-      atomicAdd(args.crossDeviceBarrierFlag, 1);
     }
   }
 }
