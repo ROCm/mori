@@ -253,7 +253,8 @@ void EpDispatchCombineHandle::InitializeBarrier() {
   HIP_RUNTIME_CHECK(hipMemset(combineGridBarrier, 0, barrierSize));
   HIP_RUNTIME_CHECK(hipMalloc(&crossDeviceBarrierFlag, sizeof(uint64_t)));
   crossDeviceBarrierFlag[0] = ((config.kernelType == KernelType::InterNodeV1) ||
-                               (config.kernelType == KernelType::InterNodeV1LL))
+                               (config.kernelType == KernelType::InterNodeV1LL) ||
+                               (config.kernelType == KernelType::AsyncLL))
                                   ? 0
                                   : 1;
   // HIP_RUNTIME_CHECK(hipMemset(crossDeviceBarrierFlag, 1, 1));
