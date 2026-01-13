@@ -383,141 +383,144 @@ def test_main(
 
     # Check dispatch correctness
     do_check = True
-    zero_copy = False
-    test_op = zero_copy_op if zero_copy else non_zero_copy_op
-    test_config = zero_copy_config if zero_copy else non_zero_copy_config
-    hash_value, num_times = 0, 0
-    if fused_moe_adaption:
-        (
-            packed_recv_x,
-            packed_recv_topk_weights,
-            _,
-            packed_recv_topk_idx,
-            packed_recv_count,
-        ) = test_op.dispatch(
-            x,
-            topk_weights,
+    for zero_copy in (False, True):
+        # multiple node does not support zero_copy
+        if multi_node and zero_copy:
+            continue
+        test_op = zero_copy_op if zero_copy else non_zero_copy_op
+        test_config = zero_copy_config if zero_copy else non_zero_copy_config
+        hash_value, num_times = 0, 0
+        if fused_moe_adaption:
+            (
+                packed_recv_x,
+                packed_recv_topk_weights,
+                _,
+                packed_recv_topk_idx,
+                packed_recv_count,
+            ) = test_op.dispatch(
+                x,
+                topk_weights,
+                None,
+                topk_idx,
+                block_num=dispatch_block_num,
+                warp_per_block=dispatch_warp_per_block,
+            )
+        else:
+            assert False, "fused_moe_adaption=False is not implemented"
+        torch.cuda.synchronize()
+
+        assert fused_moe_adaption == (
+            (packed_recv_x.ndim != 3)
+        ), f"{fused_moe_adaption} != {(packed_recv_x.ndim != 3)}"
+        simulated_gemm_x = packed_recv_x.clone()
+        all_topk_idx = torch.empty(
+            (num_ranks, num_tokens, num_topk),
+            dtype=validation_topk_idx.dtype,
+            device="cuda",
+        )
+        dist.all_gather_into_tensor(all_topk_idx, validation_topk_idx, group=group)
+        # for checking topk index correctness
+        all_origin_topk_idx = torch.empty(
+            (num_ranks, num_tokens, num_topk),
+            dtype=topk_idx.dtype,
+            device="cuda",
+        )
+        dist.all_gather_into_tensor(all_origin_topk_idx, topk_idx, group=group)
+
+        all_topk_weights = torch.empty(
+            (num_ranks, num_tokens, num_topk),
+            dtype=topk_weights.dtype,
+            device="cuda",
+        )
+        dist.all_gather_into_tensor(all_topk_weights, topk_weights, group=group)
+
+        if do_check and fused_moe_adaption:
+            global_recv_x = packed_recv_x
+
+            # Check expert indices
+            num_total_valid_tokens = packed_recv_count.item()
+            assert (
+                num_total_valid_tokens
+                == (all_topk_idx // num_local_experts == rank).sum().item()
+            ), f"{num_total_valid_tokens} != {(all_topk_idx // num_local_experts == rank).sum().item()}"
+
+            # Check received data
+            src_token_pos = test_op.get_dispatch_src_token_pos()
+
+            rank_token_counts = {}
+            for i, pos in enumerate(src_token_pos[:num_total_valid_tokens]):
+                src_rank = int(pos) // test_config.max_num_inp_token_per_rank
+                src_id = int(pos) % test_config.max_num_inp_token_per_rank
+                recv_token = global_recv_x[i]
+
+                # Check that token values are consistent (amin == amax for first hidden-128 dims)
+                recv_token_amin = recv_token[:-128].amin()
+                recv_token_amax = recv_token[:-128].amax()
+                assert torch.equal(
+                    recv_token_amin, recv_token_amax
+                ), f"Token {i} values inconsistent: amin={recv_token_amin}, amax={recv_token_amax}"
+
+                # Check that all values in first hidden-128 dims equal src_rank - rank_offset
+                expected_value = src_rank - rank_offset
+                assert (
+                    recv_token[:-128] - expected_value
+                ).sum().item() == 0, f"Token {i} from rank {src_rank} has incorrect values, expected all {expected_value}"
+
+                # Check that last 128 dims contain source token ID
+                assert (
+                    recv_token[-128:] - src_id
+                ).sum().item() == 0, f"Token {i} last 128 dims should be {src_id}"
+
+                # Verify topk_idx and topk_weights
+                assert torch.equal(
+                    packed_recv_topk_idx[i], all_origin_topk_idx[src_rank, src_id]
+                )
+                assert torch.equal(
+                    packed_recv_topk_weights[i], all_topk_weights[src_rank, src_id]
+                )
+
+                # Count tokens from each rank
+                rank_token_counts[src_rank] = rank_token_counts.get(src_rank, 0) + 1
+
+                hash_value ^= hash_tensor(recv_token.unsqueeze(0))
+            # Verify token counts from each rank match expectations
+            for src_rank in range(num_ranks):
+                expected_count = (
+                    (all_topk_idx[src_rank] // num_local_experts == rank).sum().item()
+                )
+                actual_count = rank_token_counts.get(src_rank, 0)
+                assert (
+                    actual_count == expected_count
+                ), f"Received {actual_count} tokens from rank {src_rank}, expected {expected_count}"
+
+        # Check combine correctness
+        if zero_copy:
+            combine_input = test_op.get_registered_combine_input_buffer(
+                test_config.data_type
+            )
+            combine_input[:, :].copy_(simulated_gemm_x)
+        out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+        combined_x, _ = test_op.combine(
+            simulated_gemm_x,
             None,
             topk_idx,
-            block_num=dispatch_block_num,
-            warp_per_block=dispatch_warp_per_block,
+            block_num=combine_block_num,
+            warp_per_block=combine_warp_per_block,
         )
-    else:
-        assert False, "fused_moe_adaption=False is not implemented"
-    torch.cuda.synchronize()
-
-    assert fused_moe_adaption == (
-        (packed_recv_x.ndim != 3)
-    ), f"{fused_moe_adaption} != {(packed_recv_x.ndim != 3)}"
-    simulated_gemm_x = packed_recv_x.clone()
-    all_topk_idx = torch.empty(
-        (num_ranks, num_tokens, num_topk),
-        dtype=validation_topk_idx.dtype,
-        device="cuda",
-    )
-    dist.all_gather_into_tensor(all_topk_idx, validation_topk_idx, group=group)
-    # for checking topk index correctness
-    all_origin_topk_idx = torch.empty(
-        (num_ranks, num_tokens, num_topk),
-        dtype=topk_idx.dtype,
-        device="cuda",
-    )
-    dist.all_gather_into_tensor(all_origin_topk_idx, topk_idx, group=group)
-
-    all_topk_weights = torch.empty(
-        (num_ranks, num_tokens, num_topk),
-        dtype=topk_weights.dtype,
-        device="cuda",
-    )
-    dist.all_gather_into_tensor(all_topk_weights, topk_weights, group=group)
-
-    if do_check and fused_moe_adaption:
-        global_recv_x = packed_recv_x
-
-        # Check expert indices
-        num_total_valid_tokens = packed_recv_count.item()
-        assert (
-            num_total_valid_tokens
-            == (all_topk_idx // num_local_experts == rank).sum().item()
-        ), f"{num_total_valid_tokens} != {(all_topk_idx // num_local_experts == rank).sum().item()}"
-
-        # Check received data
-        src_token_pos = test_op.get_dispatch_src_token_pos()
-
-        rank_token_counts = {}
-        for i, pos in enumerate(src_token_pos[:num_total_valid_tokens]):
-            src_rank = int(pos) // test_config.max_num_inp_token_per_rank
-            src_id = int(pos) % test_config.max_num_inp_token_per_rank
-            recv_token = global_recv_x[i]
-
-            # Check that token values are consistent (amin == amax for first hidden-128 dims)
-            recv_token_amin = recv_token[:-128].amin()
-            recv_token_amax = recv_token[:-128].amax()
-            assert torch.equal(
-                recv_token_amin, recv_token_amax
-            ), f"Token {i} values inconsistent: amin={recv_token_amin}, amax={recv_token_amax}"
-
-            # Check that all values in first hidden-128 dims equal src_rank - rank_offset
-            expected_value = src_rank - rank_offset
-            assert (
-                recv_token[:-128] - expected_value
-            ).sum().item() == 0, f"Token {i} from rank {src_rank} has incorrect values, expected all {expected_value}"
-
-            # Check that last 128 dims contain source token ID
-            assert (
-                recv_token[-128:] - src_id
-            ).sum().item() == 0, f"Token {i} last 128 dims should be {src_id}"
-
-            # Verify topk_idx and topk_weights
-            assert torch.equal(
-                packed_recv_topk_idx[i], all_origin_topk_idx[src_rank, src_id]
+        torch.cuda.synchronize()
+        if do_check:
+            diff = calc_diff(
+                x * (validation_topk_idx != -1).sum(dim=-1).view(-1, 1),
+                combined_x,
             )
-            assert torch.equal(
-                packed_recv_topk_weights[i], all_topk_weights[src_rank, src_id]
-            )
-
-            # Count tokens from each rank
-            rank_token_counts[src_rank] = rank_token_counts.get(src_rank, 0) + 1
-
-            hash_value ^= hash_tensor(recv_token.unsqueeze(0))
-        # Verify token counts from each rank match expectations
-        for src_rank in range(num_ranks):
-            expected_count = (
-                (all_topk_idx[src_rank] // num_local_experts == rank).sum().item()
-            )
-            actual_count = rank_token_counts.get(src_rank, 0)
-            assert (
-                actual_count == expected_count
-            ), f"Received {actual_count} tokens from rank {src_rank}, expected {expected_count}"
-
-    # Check combine correctness
-    if zero_copy:
-        combine_input = test_op.get_registered_combine_input_buffer(
-            test_config.data_type
-        )
-        combine_input[:, :].copy_(simulated_gemm_x)
-    out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
-    combined_x, _ = test_op.combine(
-        simulated_gemm_x,
-        None,
-        topk_idx,
-        block_num=combine_block_num,
-        warp_per_block=combine_warp_per_block,
-    )
-    torch.cuda.synchronize()
-    if do_check:
-        diff = calc_diff(
-            x * (validation_topk_idx != -1).sum(dim=-1).view(-1, 1),
-            combined_x,
-        )
-        assert torch.isnan(combined_x).sum().item() == 0
-        assert diff < 1e-5, f"Error: {diff=}, {zero_copy=}"
-        hash_value ^= hash_tensor(combined_x)
+            assert torch.isnan(combined_x).sum().item() == 0
+            assert diff < 1e-5, f"Error: {diff=}, {zero_copy=}"
+            hash_value ^= hash_tensor(combined_x)
 
     # noinspection PyShadowingNames
     def test_func(zero_copy: bool, use_fp8: bool):
         bench_op = zero_copy_op if zero_copy else non_zero_copy_op
-        # multiple node do not support zero copy
+        # multiple node does not support zero_copy
         if multi_node:
             bench_op = non_zero_copy_op
         (
