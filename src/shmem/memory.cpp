@@ -118,26 +118,6 @@ void* ShmemExtMallocWithFlags(size_t size, unsigned int flags) {
     }
     return nullptr;
   }
-
-  if (size == 0) {
-    return nullptr;
-  }
-
-  // Use different allocation strategies based on mode
-  if (states->mode == ShmemMode::StaticHeap) {
-    // In static heap mode, flags are ignored - use the same allocator as ShmemMalloc
-    MORI_SHMEM_TRACE("Allocated shared memory of size {} with flags {} (flags ignored in static heap mode)", size, flags);
-    return ShmemMalloc(size);
-  } else {
-    // Isolation mode: use ExtMallocWithFlags directly
-    application::SymmMemObjPtr obj =
-        states->memoryStates->symmMemMgr->ExtMallocWithFlags(size, flags);
-    MORI_SHMEM_TRACE("Allocated shared memory of size {} with flags {} in isolation mode", size, flags);
-    if (obj.IsValid()) {
-      return obj.cpu->localPtr;
-    }
-    return nullptr;
-  }
 }
 
 void ShmemFree(void* localPtr) {
@@ -157,30 +137,11 @@ void ShmemFree(void* localPtr) {
     // Isolation mode: free the memory and deregister
     states->memoryStates->symmMemMgr->Free(localPtr);
   }
-
-  if (localPtr == nullptr) {
-    return;
-  }
-
-  // Use different deallocation strategies based on mode
-  if (states->mode == ShmemMode::StaticHeap) {
-    // Static heap mode: just deregister from the pool (no actual free)
-    // TODO: Implement a proper free list allocator for better memory reuse
-    states->memoryStates->symmMemMgr->HeapDeregisterSymmMemObj(localPtr);
-  } else {
-    // Isolation mode: free the memory and deregister
-    states->memoryStates->symmMemMgr->Free(localPtr);
-  }
 }
 
 application::SymmMemObjPtr ShmemQueryMemObjPtr(void* localPtr) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
   states->CheckStatusValid();
-
-  if (localPtr == nullptr) {
-    return application::SymmMemObjPtr{nullptr, nullptr};
-  }
-
 
   if (localPtr == nullptr) {
     return application::SymmMemObjPtr{nullptr, nullptr};

@@ -192,8 +192,6 @@ void GpuStateInit() {
 }
 
 int ShmemInit(application::BootstrapNetwork* bootNet) {
-  int status;
-
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
 
   // Determine mode from environment variable
@@ -336,22 +334,18 @@ int ShmemGetUniqueId(mori_shmem_uniqueid_t* uid) {
     const char* ifname = std::getenv("MORI_SOCKET_IFNAME");
     application::UniqueId socket_uid;
 
-    if (ifname) {
-      std::random_device rd;
-      std::mt19937 gen(rd());
-      std::uniform_int_distribution<int> port_dis(25000, 35000);
-      int random_port = port_dis(gen);
+    // Generate random port for UniqueId
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> port_dis(25000, 35000);
+    int random_port = port_dis(gen);
 
+    if (ifname) {
       socket_uid =
           application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface(ifname, random_port);
       MORI_SHMEM_INFO("Generated UniqueId with specified interface: {} (port {})", ifname,
                       random_port);
     } else {
-      std::random_device rd;
-      std::mt19937 gen(rd());
-      std::uniform_int_distribution<int> port_dis(25000, 35000);
-      int random_port = port_dis(gen);
-
       socket_uid = application::SocketBootstrapNetwork::GenerateUniqueIdWithLocalAddr(random_port);
       std::string localAddr = application::SocketBootstrapNetwork::GetLocalNonLoopbackAddress();
       MORI_SHMEM_INFO("Generated UniqueId with auto-detected interface: {} (port {})", localAddr,
