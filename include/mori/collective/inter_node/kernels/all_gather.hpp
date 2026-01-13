@@ -41,12 +41,14 @@ __global__ void AllGatherRingKernel(int myPe, int npes, const application::SymmM
   const int threadLinearId = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
   const size_t bytesPerThread =
       threadsPerBlock > 0 ? (peChunkSize + threadsPerBlock - 1) / threadsPerBlock : peChunkSize;
+  int warpId = threadLinearId / warpSize;
 
   for (int i = 0; i < maxRounds; i++) {
     int sendDataRank = (myPe - i + npes) % npes;
     int recvDataRank = (myPe - i - 1 + npes) % npes;
 
     size_t chunkBaseOffset = static_cast<size_t>(sendDataRank) * peChunkSize;
+#if 0
     size_t threadOffsetWithinChunk = bytesPerThread * static_cast<size_t>(threadLinearId);
 
     if (threadOffsetWithinChunk < peChunkSize) {
@@ -60,17 +62,30 @@ __global__ void AllGatherRingKernel(int myPe, int npes, const application::SymmM
       // Each thread pushes a disjoint slice of the current chunk to the next peer.
       shmem::ShmemPutMemNbiThread(memObj, sourceOffset, source, sourceOffset, sendBytes, nextPeer);
     }
+#endif
+    if(warpId == 0){
+      if(sendDataRank != npes-1){
+        shmem::ShmemPutMemNbiWarp(memObj,  chunkBaseOffset, source,  chunkBaseOffset, peChunkSize, nextPeer);
+      }
+      else{
+        size_t sendBytes = memObj->size - peChunkSize*(npes-1);
+        shmem::ShmemPutMemNbiWarp(memObj,  chunkBaseOffset, source,  chunkBaseOffset, sendBytes, nextPeer);
+      }
+    }
 
-    __threadfence_system();
-    shmem::ShmemQuietThread();
-    __syncthreads();
-
-    if (threadLinearId == 0) {
-      __threadfence_system();
-      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(flagsObj, sendDataRank * sizeof(uint64_t), 1,
-                                                     core::atomicType::AMO_ADD, nextPeer);
+//    __threadfence_system();
+    if(threadLinearId == 0){
+      shmem::ShmemQuietThread(nextPeer,scratchMemObj);
+      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(flagsObj, sendDataRank * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, nextPeer);
     }
     __syncthreads();
+
+//    if (threadLinearId == 0) {
+//      __threadfence_system();
+//      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(flagsObj, sendDataRank * sizeof(uint64_t), 1,
+//                                                     core::atomicType::AMO_ADD, nextPeer);
+//    }
+//    __syncthreads();
 
     if (threadLinearId == 0) {
       int spinCount = 0;

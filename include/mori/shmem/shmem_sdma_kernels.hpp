@@ -52,7 +52,7 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SD
     HSAuint64* signals = dest->signalPtrs + pe*dest->sdmaNumQueue;
     HSAuint64* expectedSignals = dest->expectSignalsPtr + pe*dest->sdmaNumQueue;
 
-    core::SdmaPutThread(srcPtr, dstPtr, bytes, devicehandles, signals, expectedSignals, dest->sdmaNumQueue);
+    core::SdmaPutThread(srcPtr, dstPtr, bytes, devicehandles, signals, expectedSignals, dest->sdmaNumQueue, qpId);
 }
 
 template <>
