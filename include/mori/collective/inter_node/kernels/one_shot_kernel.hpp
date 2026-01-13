@@ -58,6 +58,9 @@ __global__ void OneShotAllReduceKernel(int myPe, int npes,
   const size_t bytesPerPeer = elementCount * bytesPerElement;
   const size_t elemsPerPeer = elementCount;
 
+  int warpId = threadLinearId / warpSize;
+  const int laneId = threadIdx.x % warpSize;
+
   for (size_t idx = threadLinearId; idx < elementCount; idx += stride) {
     dst[idx] = src[idx];
   }
@@ -66,6 +69,7 @@ __global__ void OneShotAllReduceKernel(int myPe, int npes,
   const size_t bytesPerThread =
       (bytesPerPeer + stride - 1) / stride;  // ceil division to cover all bytes
 
+#if 0
   for (int remotePe = 0; remotePe < npes; ++remotePe) {
     if (remotePe == myPe) {
       continue;
@@ -81,13 +85,25 @@ __global__ void OneShotAllReduceKernel(int myPe, int npes,
       size_t destByteOffset = static_cast<size_t>(myPe) * bytesPerPeer + threadByteOffset;
 //    shmem::ShmemPutMemNbiSignalThread<true>(
 //          scratchMemObj, destByteOffset, srcMemObj, threadByteOffset, sendBytes, flagsMemObj,
-//          static_cast<size_t>(myPe) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, remotePe);
-      shmem::ShmemPutMemNbiThreadKernel(scratchMemObj, destByteOffset, srcMemObj, threadByteOffset, sendBytes, remotePe);
+//          static_cast<size_t>(myPe) * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, remotePe);ShmemPutMemNbiThread
+      shmem::ShmemPutMemNbiThread(scratchMemObj, destByteOffset, srcMemObj, threadByteOffset, sendBytes, remotePe);
       shmem::ShmemQuietThread(remotePe,scratchMemObj);
-      shmem::ShmemAtomicSizeNonFetchThreadKernel(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8, core::atomicType::AMO_ADD, remotePe);
+      shmem::ShmemAtomicSizeNonFetchThread(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8, core::atomicType::AMO_ADD, remotePe);
     }
     __syncthreads();
   }
+#endif
+
+  if(warpId < npes && warpId != myPe){
+    shmem::ShmemPutMemNbiWarp(scratchMemObj, 0, srcMemObj, 0, bytesPerPeer, warpId);
+    //shmem::ShmemQuietWarp(warpId,scratchMemObj);
+    if(laneId == 0){
+      shmem::ShmemQuietThread(remotePe,scratchMemObj);
+      shmem::ShmemAtomicSizeNonFetchThreadKernel(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8, core::atomicType::AMO_ADD, warpId);
+    }
+      
+  }
+  __syncthreads();
 
   for (int sender = 0; sender < npes; ++sender) {
     if (sender == myPe) {
