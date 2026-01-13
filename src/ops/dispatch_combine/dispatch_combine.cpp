@@ -123,7 +123,8 @@ void EpDispatchCombineHandle::FinalizeShmemBuf() {
 }
 
 void EpDispatchCombineHandle::InitializeTokenNumSignalBuf() {
-  size_t tokenNumSignalSize = config.worldSize * sizeof(index_t) * 2;
+  // NOTE: config.numQpPerPe is for async kernel's multi-qp optimization
+  size_t tokenNumSignalSize = config.worldSize * sizeof(index_t) * 2 * config.numQpPerPe;
   recvTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
   sendTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
   // The extra *2 is for the laddr.
@@ -354,9 +355,10 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
           EpCombineInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           if (config.useExternalInpBuffer) {
-            // UseP2PRead=false: does not support zero-copy and provides better bandwidth and lower latency
+            // UseP2PRead=false: does not support zero-copy and provides better bandwidth and lower
+            // latency
             EpCombineIntraNodeKernel<DataT, false><<<grid, block, sharedMemSize, stream>>>(args);
-          } else { // zero-copy mode (requires UseP2PRead=true)
+          } else {  // zero-copy mode (requires UseP2PRead=true)
             EpCombineIntraNodeKernel<DataT, true><<<grid, block, sharedMemSize, stream>>>(args);
           }
         } else if (kernelType == KernelType::AsyncLL) {

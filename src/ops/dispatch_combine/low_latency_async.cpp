@@ -99,21 +99,29 @@ __global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
   }
   if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
-  for (int destPe = blockId; (destPe < npes) && (warpId == 0); destPe += blockNum) {
-    if (laneId == 0) shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
-    int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
-    size_t remoteOffset = (config.MaxNumTokensToSendPerRank() * myPe) * xferBytes;
-    size_t localOffset = (config.MaxNumTokensToSendPerRank() * destPe) * xferBytes;
-    if (destPe != myPe)
-      shmem::ShmemPutMemNbiWarp(args.shmemDispatchInpTokMemObj, remoteOffset,
-                                args.shmemStagingTokMemObj, localOffset, tokenNum * xferBytes,
-                                destPe);
-    shmem::ShmemPutInt32ImmNbiWarp(args.recvTokenNumMemObj, myPe * sizeof(index_t), tokenNum + 1,
-                                   destPe);
-    // shmem::ShmemPutMemNbiSignalWarp(args.shmemDispatchInpTokMemObj, remoteOffset,
-    //                                 args.shmemStagingTokMemObj, localOffset, tokenNum *
-    //                                 xferBytes, args.recvTokenNumMemObj, myPe * sizeof(index_t),
-    //                                 tokenNum + 1, core::atomicType::AMO_SET, destPe);
+  index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
+  for (int destPe = blockId; destPe < npes; destPe += blockNum) {
+    for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
+      if (laneId == 0) shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
+      int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
+      int tokenChunkNum = core::CeilDiv(tokenNum, config.numQpPerPe);
+      int thisChunkTokenNum = std::min(tokenChunkNum, tokenNum - qpId * tokenChunkNum);
+      size_t remoteOffset =
+          (config.MaxNumTokensToSendPerRank() * myPe + tokenChunkNum * qpId) * xferBytes;
+      size_t localOffset =
+          (config.MaxNumTokensToSendPerRank() * destPe + tokenChunkNum * qpId) * xferBytes;
+      if (destPe != myPe)
+        shmem::ShmemPutMemNbiWarp(args.shmemDispatchInpTokMemObj, remoteOffset,
+                                  args.shmemStagingTokMemObj, localOffset,
+                                  thisChunkTokenNum * xferBytes, destPe, qpId);
+      shmem::ShmemPutInt32ImmNbiWarp(args.recvTokenNumMemObj,
+                                     (myPe * config.numQpPerPe + qpId) * sizeof(index_t),
+                                     tokenNum + 1, destPe, qpId);
+      // shmem::ShmemPutMemNbiSignalWarp(args.shmemDispatchInpTokMemObj, remoteOffset,
+      //                                 args.shmemStagingTokMemObj, localOffset, tokenNum *
+      //                                 xferBytes, args.recvTokenNumMemObj, myPe * sizeof(index_t),
+      //                                 tokenNum + 1, core::atomicType::AMO_SET, destPe);
+    }
   }
   if (globalThdId == 0) args.totalRecvTokenNum[0] = 0;
 }
@@ -132,8 +140,10 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   // Polling recv token number signal
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   index_t recvTokenNum = 0;
-  if (laneId == 0) {
-    recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(recvTokenNums + destPe, 0) - 1;
+  if (laneId < config.numQpPerPe) {
+    recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(
+                       recvTokenNums + destPe * config.numQpPerPe + laneId, 0) -
+                   1;
   }
   recvTokenNum = __shfl(recvTokenNum, 0);
 
@@ -217,17 +227,19 @@ __global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       if (laneId == 0) shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
-      int tokenNum = recvTokenNums[destPe];
+      int tokenNum = recvTokenNums[destPe * config.numQpPerPe];
       int tokenChunkNum = core::CeilDiv(tokenNum, config.numQpPerPe);
       int thisChunkTokenNum = std::min(tokenChunkNum, tokenNum - qpId * tokenChunkNum);
-      size_t remoteOffset = (config.MaxNumTokensToSendPerRank() * myPe + tokenChunkNum*qpId) * hiddenBytes;
-      size_t localOffset = (config.MaxNumTokensToSendPerRank() * destPe + tokenChunkNum*qpId) * hiddenBytes;
+      size_t remoteOffset =
+          (config.MaxNumTokensToSendPerRank() * myPe + tokenChunkNum * qpId) * hiddenBytes;
+      size_t localOffset =
+          (config.MaxNumTokensToSendPerRank() * destPe + tokenChunkNum * qpId) * hiddenBytes;
       if (destPe != myPe)
         shmem::ShmemPutMemNbiWarp(args.shmemCombineInpTokMemObj, remoteOffset,
-                                  args.shmemStagingTokMemObj, localOffset, thisChunkTokenNum * hiddenBytes,
-                                  destPe);
-      shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(args.crossDeviceBarrierMemObj, myPe * sizeof(uint64_t),
-                                      1, core::AMO_ADD, destPe, qpId);
+                                  args.shmemStagingTokMemObj, localOffset,
+                                  thisChunkTokenNum * hiddenBytes, destPe);
+      shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
+          args.crossDeviceBarrierMemObj, myPe * sizeof(uint64_t), 1, core::AMO_ADD, destPe, qpId);
     }
   }
 }
@@ -239,7 +251,8 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   for (int destPe = laneId; destPe < npes; destPe += warpSize) {
     uint32_t barrierFlag = args.crossDeviceBarrierFlag[0];
     shmem::ShmemUint64WaitUntilEquals(
-        args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>() + destPe, barrierFlag*config.numQpPerPe);
+        args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>() + destPe,
+        barrierFlag * config.numQpPerPe);
   }
 
   extern __shared__ char sharedMem[];
@@ -275,14 +288,13 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
                           srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
   }
 
-
   uint32_t finishedWarpNum = 0;
   if (laneId == 0) finishedWarpNum = atomicAdd(args.combineGridBarrier, 1);
   finishedWarpNum = __shfl(finishedWarpNum, 0);
 
   if (finishedWarpNum == (2 * globalWarpNum - 1)) {
-    if (laneId < npes) {
-      args.recvTokenNumMemObj->template GetAs<index_t*>()[laneId] = 0;
+    for (int i = laneId; i < config.numQpPerPe * npes; i += warpSize) {
+      args.recvTokenNumMemObj->template GetAs<index_t*>()[i] = 0;
     }
     if (laneId == 0) {
       args.combineGridBarrier[0] = 0;
