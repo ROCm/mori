@@ -217,7 +217,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   const size_t hiddenBytes = config.hiddenDim * sizeof(T);
   const size_t weightBytes =
-      (args.weightsBuf == nullptr) ? config.numExpertPerToken * sizeof(float) : 0;
+      (args.weightsBuf == nullptr) ? 0 : config.numExpertPerToken * sizeof(float);
   const size_t combXferBytes = hiddenBytes + weightBytes;
   if constexpr (UseP2PRead) {
     if (args.config.useExternalInpBuffer) {
