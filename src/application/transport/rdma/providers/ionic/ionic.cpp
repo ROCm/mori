@@ -26,6 +26,7 @@
 #include <infiniband/verbs.h>
 
 #include <iostream>
+#include <optional>
 
 #include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
@@ -328,9 +329,13 @@ void IonicQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
   attr.ah_attr.port_num = config.portId;
   attr.ah_attr.is_global = 1;
   attr.ah_attr.grh.hop_limit = 1;
-  // attr.ah_attr.sl = 0;
-  attr.ah_attr.sl = 3;
-  attr.ah_attr.grh.traffic_class = 96;
+  attr.ah_attr.sl = ReadRdmaServiceLevelEnv().value_or(0);
+  std::optional<uint8_t> tc = ReadRdmaTrafficClassEnv();
+  if (tc.has_value()) {
+    attr.ah_attr.grh.traffic_class = tc.value();
+  }
+  MORI_APP_INFO("ionic attr.ah_attr.sl:{} attr.ah_attr.grh.traffic_class:{}", attr.ah_attr.sl,
+                attr.ah_attr.grh.traffic_class);
 
   attr_mask = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_RQ_PSN | IBV_QP_DEST_QPN | IBV_QP_AV |
               IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;

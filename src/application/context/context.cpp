@@ -35,6 +35,7 @@
 
 #include "mori/application/utils/check.hpp"
 #include "mori/utils/mori_log.hpp"
+#include "mori/application/transport/sdma/anvil.hpp"
 
 namespace mori {
 namespace application {
@@ -113,6 +114,11 @@ bool IsP2PDisabled() {
   return getenv(varName) != nullptr;
 }
 
+bool IsSDMAEnabled() {
+  const char* varName = "MORI_ENABLE_SDMA";
+  return getenv(varName) != nullptr;
+}
+
 void Context::InitializePossibleTransports() {
   // Find my rank in node
   for (int i = 0; i <= LocalRank(); i++) {
@@ -126,16 +132,16 @@ void Context::InitializePossibleTransports() {
   ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(devices);
 
   if (rankInNode == 0) {
-    std::cout << "rank " << LocalRank() << " RDMA devices: ";
+    std::string rdma_devices;
     if (activeDevicePortList.empty()) {
-      std::cout << "None" << std::endl;
+      rdma_devices = "None";
     } else {
       for (size_t i = 0; i < activeDevicePortList.size(); ++i) {
-        if (i > 0) std::cout << ", ";
-        std::cout << activeDevicePortList[i].first->Name();
+        if (i > 0) rdma_devices += ", ";
+        rdma_devices += activeDevicePortList[i].first->Name();
       }
-      std::cout << std::endl;
     }
+    MORI_APP_INFO("rank {} RDMA devices: {}", LocalRank(), rdma_devices);
   }
 
   // Match gpu and nic
@@ -157,7 +163,8 @@ void Context::InitializePossibleTransports() {
     HIP_RUNTIME_CHECK(hipGetDevice(&deviceId));
     topo.reset(new TopoSystem());
     std::string nicName = topo->MatchGpuAndNic(deviceId);
-
+    MORI_APP_TRACE("rank {} rankInNode {} matched nic {} for gpu {}", LocalRank(),
+                   rankInNode, nicName, deviceId);
     for (int i = 0; i < activeDevicePortList.size(); i++) {
       auto& dp = activeDevicePortList[i];
       if (dp.first->Name() != nicName) continue;
@@ -170,11 +177,10 @@ void Context::InitializePossibleTransports() {
   }
 
   if (device == nullptr) {
-    std::cout << "rank " << LocalRank() << " rankInNode " << rankInNode << " select no device"
-              << std::endl;
+    MORI_APP_INFO("rank {} rankInNode {} select no device", LocalRank(), rankInNode);
   } else {
-    std::cout << "rank " << LocalRank() << " rankInNode " << rankInNode << " select device "
-              << "[" << devicePortId << "] " << device->Name() << std::endl;
+    MORI_APP_INFO("rank {} rankInNode {} select device [{}] {}", LocalRank(), rankInNode,
+                  devicePortId, device->Name());
   }
 
   int numQpPerPe = 4;
@@ -185,6 +191,8 @@ void Context::InitializePossibleTransports() {
   this->numQpPerPe = numQpPerPe;
   // Initialize transport
   int peerRankInNode = -1;
+  if(!IsP2PDisabled() && IsSDMAEnabled()) anvil::anvil.init();
+
   for (int i = 0; i < WorldSize(); i++) {
     // Check P2P availability
     if (!IsP2PDisabled()) {
@@ -196,7 +204,15 @@ void Context::InitializePossibleTransports() {
         bool canAccessPeer = true;
 
         if ((i == LocalRank()) || canAccessPeer) {
-          transportTypes.push_back(TransportType::P2P);
+          if(IsSDMAEnabled() && (i != LocalRank()) ){
+            transportTypes.push_back(TransportType::SDMA);
+
+	    anvil::EnablePeerAccess(LocalRank()%8, i%8);
+            // Better performance if allocating all 8 queues
+            anvil::anvil.connect(LocalRank()%8, i%8, 8);
+          }else{
+            transportTypes.push_back(TransportType::P2P);
+          }
           for (int qp = 0; qp < numQpPerPe; qp++) {
             rdmaEps.push_back({});
           }

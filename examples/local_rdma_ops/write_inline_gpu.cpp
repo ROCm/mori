@@ -56,8 +56,7 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion mr) {
     int opcode =
         PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum, &epSend.cqHandle.consIdx);
     __threadfence_system();
-    UpdateCqDbrRecord<P>(epSend.cqHandle, epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx,
-                         epSend.cqHandle.cqeNum);
+    UpdateCqDbrRecord<P>(epSend.cqHandle, epSend.cqHandle.consIdx);
     // printf("round %d snd_opcode %d\n", i, opcode);
 
     raddr += i;

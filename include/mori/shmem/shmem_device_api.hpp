@@ -26,10 +26,11 @@
 
 #include "mori/application/application.hpp"
 #include "mori/core/core.hpp"
+#include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_device_kernels.hpp"
 #include "mori/shmem/shmem_ibgda_kernels.hpp"
 #include "mori/shmem/shmem_p2p_kernels.hpp"
-#include "src/shmem/internal.hpp"
+#include "mori/shmem/shmem_sdma_kernels.hpp"
 
 namespace mori {
 namespace shmem {
@@ -41,6 +42,8 @@ namespace shmem {
     func<application::TransportType::RDMA>(__VA_ARGS__);                          \
   } else if (transportType == application::TransportType::P2P) {                  \
     func<application::TransportType::P2P>(__VA_ARGS__);                           \
+  } else if (transportType == application::TransportType::SDMA) {                 \
+    func<application::TransportType::SDMA>(__VA_ARGS__);                          \
   } else {                                                                        \
     assert(false);                                                                \
   }
@@ -85,9 +88,55 @@ inline __device__ void ShmemQuietThread(int pe, int qpId) {
   DISPATCH_TRANSPORT_TYPE(ShmemQuietThreadKernel, pe, pe, qpId);
 }
 
+inline __device__ void ShmemFenceThread() {
+  ShmemQuietThread();
+  __threadfence_system();
+}
+
+inline __device__ void ShmemFenceThread(int pe) {
+  ShmemQuietThread(pe);
+  __threadfence_system();
+}
+
+inline __device__ void ShmemFenceThread(int pe, int qpId) {
+  ShmemQuietThread(pe, qpId);
+  __threadfence_system();
+}
+inline __device__ void ShmemQuietThread(int pe, const application::SymmMemObjPtr dest) {
+  ShmemQuietThreadKernel<application::TransportType::SDMA>(pe, dest);
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Point-to-Point                                         */
 /* ---------------------------------------------------------------------------------------------- */
+inline __device__ uint64_t ShmemPtrP2p(const uint64_t destPtr, const int myPe, int destPe) {
+  // If same PE, return the pointer directly
+  if (myPe == destPe) {
+    return destPtr;
+  }
+
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+
+  application::TransportType transportType = globalGpuStates->transportTypes[destPe];
+  if (transportType == application::TransportType::RDMA) {
+    return 0;
+  }
+
+  uintptr_t localAddrInt = static_cast<uintptr_t>(destPtr);
+
+  if (localAddrInt < globalGpuStates->heapBaseAddr ||
+      localAddrInt >= globalGpuStates->heapEndAddr) {
+    assert(false && "dest addr not in symmetric heap");
+    return 0;
+  }
+
+  size_t offset = localAddrInt - globalGpuStates->heapBaseAddr;
+
+  application::SymmMemObj* heapObj = globalGpuStates->heapObj;
+  uint64_t raddr = heapObj->peerPtrs[destPe] + offset;
+
+  return raddr;
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        PutNbi APIs                                             */
@@ -119,8 +168,8 @@ DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Warp)
       const application::RdmaMemoryRegion& source, size_t srcElmOffset, size_t nelems, int pe, \
       int qpId = 0) {                                                                          \
     constexpr size_t typeSize = sizeof(T);                                                     \
-    ShmemPutMemNbi##Scope(dest, destElmOffset * typeSize, source, srcElmOffset * typeSize,     \
-                          nelems * typeSize, pe, qpId);                                        \
+    ShmemPutMemNbi##Scope(dest, destElmOffset* typeSize, source, srcElmOffset* typeSize,       \
+                          nelems* typeSize, pe, qpId);                                         \
   }                                                                                            \
   template <typename T>                                                                        \
   inline __device__ void ShmemPutTypeNbi##Scope(                                               \
@@ -151,6 +200,7 @@ DEFINE_SHMEM_PUT_TYPE_NBI_API_TEMPLATE(Warp)
 
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint8, uint8_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Int8, int8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Schar, signed char, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint16, uint16_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Int16, int16_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint32, uint32_t, Thread)
@@ -162,6 +212,7 @@ DEFINE_SHMEM_PUT_TYPE_NBI_API(Double, double, Thread)
 
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint8, uint8_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Int8, int8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Schar, signed char, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint16, uint16_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Int16, int16_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint32, uint32_t, Warp)
@@ -206,6 +257,7 @@ SHMEM_PUT_TYPE_IMM_NBI_API_TEMPLATE(Warp)
 
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint8, uint8_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int8, int8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Schar, signed char, Thread)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint16, uint16_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int16, int16_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint32, uint32_t, Thread)
@@ -215,6 +267,7 @@ DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int64, int64_t, Thread)
 
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint8, uint8_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int8, int8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Schar, signed char, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint16, uint16_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int16, int16_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Uint32, uint32_t, Warp)
@@ -226,27 +279,27 @@ DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int64, int64_t, Warp)
 /*                                      PutNbi with Signal APIs                                   */
 /* ---------------------------------------------------------------------------------------------- */
 // PutNbi with Signal - Memory version
-#define DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Scope)                                        \
-  template <bool onlyOneSignal = true>                                                             \
-  inline __device__ void ShmemPutMemNbiSignal##Scope(                                              \
-      const application::SymmMemObjPtr dest, size_t destOffset,                                    \
-      const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,              \
-      const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,  \
-      core::atomicType signalOp, int pe, int qpId = 0) {                                           \
-    DISPATCH_TRANSPORT_TYPE_WITH_BOOL(ShmemPutMemNbiSignal##Scope##Kernel, onlyOneSignal, pe,      \
-                                     dest, destOffset, source, sourceOffset, bytes, signalDest,    \
-                                     signalDestOffset, signalValue, signalOp, pe, qpId);           \
-  }                                                                                                \
-  template <bool onlyOneSignal = true>                                                             \
-  inline __device__ void ShmemPutMemNbiSignal##Scope(                                              \
-      const application::SymmMemObjPtr dest, size_t destOffset,                                    \
-      const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,                  \
-      const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,  \
-      core::atomicType signalOp, int pe, int qpId = 0) {                                           \
-    int rank = GetGlobalGpuStatesPtr()->rank;                                                      \
-    ShmemPutMemNbiSignal##Scope<onlyOneSignal>(                                                    \
-        dest, destOffset, source->GetRdmaMemoryRegion(rank), sourceOffset, bytes, signalDest,      \
-        signalDestOffset, signalValue, signalOp, pe, qpId);                                        \
+#define DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Scope)                                       \
+  template <bool onlyOneSignal = true>                                                            \
+  inline __device__ void ShmemPutMemNbiSignal##Scope(                                             \
+      const application::SymmMemObjPtr dest, size_t destOffset,                                   \
+      const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,             \
+      const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue, \
+      core::atomicType signalOp, int pe, int qpId = 0) {                                          \
+    DISPATCH_TRANSPORT_TYPE_WITH_BOOL(ShmemPutMemNbiSignal##Scope##Kernel, onlyOneSignal, pe,     \
+                                      dest, destOffset, source, sourceOffset, bytes, signalDest,  \
+                                      signalDestOffset, signalValue, signalOp, pe, qpId);         \
+  }                                                                                               \
+  template <bool onlyOneSignal = true>                                                            \
+  inline __device__ void ShmemPutMemNbiSignal##Scope(                                             \
+      const application::SymmMemObjPtr dest, size_t destOffset,                                   \
+      const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,                 \
+      const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue, \
+      core::atomicType signalOp, int pe, int qpId = 0) {                                          \
+    int rank = GetGlobalGpuStatesPtr()->rank;                                                     \
+    ShmemPutMemNbiSignal##Scope<onlyOneSignal>(                                                   \
+        dest, destOffset, source->GetRdmaMemoryRegion(rank), sourceOffset, bytes, signalDest,     \
+        signalDestOffset, signalValue, signalOp, pe, qpId);                                       \
   }
 
 DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Thread)
@@ -281,30 +334,31 @@ DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API_TEMPLATE(Warp)
 
 // PutNbi with Signal - Concrete typed versions
-#define DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(TypeName, T, Scope)                                   \
-  template <bool onlyOneSignal = true>                                                             \
-  inline __device__ void ShmemPut##TypeName##NbiSignal##Scope(                                     \
-      const application::SymmMemObjPtr dest, size_t destElmOffset,                                 \
-      const application::RdmaMemoryRegion& source, size_t srcElmOffset, size_t nelems,             \
-      const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,  \
-      core::atomicType signalOp, int pe, int qpId = 0) {                                           \
-    ShmemPutTypeNbiSignal##Scope<T, onlyOneSignal>(dest, destElmOffset, source, srcElmOffset,      \
-                                                   nelems, signalDest, signalDestOffset,           \
-                                                   signalValue, signalOp, pe, qpId);               \
-  }                                                                                                \
-  template <bool onlyOneSignal = true>                                                             \
-  inline __device__ void ShmemPut##TypeName##NbiSignal##Scope(                                     \
-      const application::SymmMemObjPtr dest, size_t destElmOffset,                                 \
-      const application::SymmMemObjPtr source, size_t srcElmOffset, size_t nelems,                 \
-      const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,  \
-      core::atomicType signalOp, int pe, int qpId = 0) {                                           \
-    ShmemPutTypeNbiSignal##Scope<T, onlyOneSignal>(dest, destElmOffset, source, srcElmOffset,      \
-                                                   nelems, signalDest, signalDestOffset,           \
-                                                   signalValue, signalOp, pe, qpId);               \
+#define DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(TypeName, T, Scope)                                  \
+  template <bool onlyOneSignal = true>                                                            \
+  inline __device__ void ShmemPut##TypeName##NbiSignal##Scope(                                    \
+      const application::SymmMemObjPtr dest, size_t destElmOffset,                                \
+      const application::RdmaMemoryRegion& source, size_t srcElmOffset, size_t nelems,            \
+      const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue, \
+      core::atomicType signalOp, int pe, int qpId = 0) {                                          \
+    ShmemPutTypeNbiSignal##Scope<T, onlyOneSignal>(dest, destElmOffset, source, srcElmOffset,     \
+                                                   nelems, signalDest, signalDestOffset,          \
+                                                   signalValue, signalOp, pe, qpId);              \
+  }                                                                                               \
+  template <bool onlyOneSignal = true>                                                            \
+  inline __device__ void ShmemPut##TypeName##NbiSignal##Scope(                                    \
+      const application::SymmMemObjPtr dest, size_t destElmOffset,                                \
+      const application::SymmMemObjPtr source, size_t srcElmOffset, size_t nelems,                \
+      const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue, \
+      core::atomicType signalOp, int pe, int qpId = 0) {                                          \
+    ShmemPutTypeNbiSignal##Scope<T, onlyOneSignal>(dest, destElmOffset, source, srcElmOffset,     \
+                                                   nelems, signalDest, signalDestOffset,          \
+                                                   signalValue, signalOp, pe, qpId);              \
   }
 
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint8, uint8_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int8, int8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Schar, signed char, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint16, uint16_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int16, int16_t, Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint32, uint32_t, Thread)
@@ -316,6 +370,7 @@ DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Double, double, Thread)
 
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint8, uint8_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int8, int8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Schar, signed char, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint16, uint16_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int16, int16_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint32, uint32_t, Warp)
@@ -358,11 +413,15 @@ DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint32, uint32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint64, uint64_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int32, int32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Ulong, unsigned long, Thread)
 
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint32, uint32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int32, int32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_API(Ulong, unsigned long, Warp)
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                       Atomic Fetch APIs                                        */
@@ -392,11 +451,348 @@ DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint32, uint32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint64, uint64_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int32, int32_t, Thread)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Ulong, unsigned long, Thread)
 
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint32, uint32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int32, int32_t, Warp)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_API(Ulong, unsigned long, Warp)
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                              Atomic Add Convenience APIs (NonFetch)                            */
+/* ---------------------------------------------------------------------------------------------- */
+#define DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(TypeName, T, Scope)                                   \
+  inline __device__ void Shmem##TypeName##AtomicAdd##Scope(                                    \
+      const application::SymmMemObjPtr dest, size_t destOffset, T val, int pe, int qpId = 0) { \
+    ShmemAtomicTypeNonFetch##Scope<T>(dest, destOffset, val, core::AMO_ADD, pe, qpId);         \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Ulong, unsigned long, Thread)
+
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_API(Ulong, unsigned long, Warp)
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                              Atomic Add Convenience APIs (Fetch)                               */
+/* ---------------------------------------------------------------------------------------------- */
+#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(TypeName, T, Scope)                                 \
+  inline __device__ T Shmem##TypeName##AtomicFetchAdd##Scope(                                      \
+      const application::SymmMemObjPtr dest, size_t destOffset, T val, int pe, int qpId = 0) {     \
+    T compare = 0;                                                                                 \
+    return ShmemAtomicTypeFetch##Scope<T>(dest, destOffset, val, compare, core::AMO_FETCH_ADD, pe, \
+                                          qpId);                                                   \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Ulong, unsigned long, Thread)
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Ulong, unsigned long, Warp)
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                          Pure Address-Based APIs (OpenSHMEM Style)                             */
+/* ---------------------------------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------------------------------- */
+/*                                        PutNbi APIs                                             */
+/* ---------------------------------------------------------------------------------------------- */
+#define DEFINE_SHMEM_PUT_MEM_NBI_ADDR_API_TEMPLATE(Scope)                                      \
+  inline __device__ void ShmemPutMemNbi##Scope(void* dest, const void* source, size_t bytes,   \
+                                               int pe, int qpId = 0) {                         \
+    DISPATCH_TRANSPORT_TYPE(ShmemPutMemNbi##Scope##Kernel, pe, dest, source, bytes, pe, qpId); \
+  }
+
+DEFINE_SHMEM_PUT_MEM_NBI_ADDR_API_TEMPLATE(Thread)
+DEFINE_SHMEM_PUT_MEM_NBI_ADDR_API_TEMPLATE(Warp)
+
+#define DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API_TEMPLATE(Scope)                                       \
+  template <typename T>                                                                          \
+  inline __device__ void ShmemPutTypeNbi##Scope(T* dest, const T* source, size_t nelems, int pe, \
+                                                int qpId = 0) {                                  \
+    ShmemPutMemNbi##Scope(dest, source, nelems * sizeof(T), pe, qpId);                           \
+  }
+
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API_TEMPLATE(Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API_TEMPLATE(Warp)
+
+#define DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(TypeName, T, Scope)                                   \
+  inline __device__ void ShmemPut##TypeName##Nbi##Scope(T* dest, const T* source, size_t nelems, \
+                                                        int pe, int qpId = 0) {                  \
+    ShmemPutTypeNbi##Scope<T>(dest, source, nelems, pe, qpId);                                   \
+  }
+
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint8, uint8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int8, int8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Schar, signed char, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint16, uint16_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int16, int16_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Float, float, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Double, double, Thread)
+
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint8, uint8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int8, int8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Schar, signed char, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint16, uint16_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int16, int16_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Float, float, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Double, double, Warp)
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                       PutNbi Inline APIs                                       */
+/* ---------------------------------------------------------------------------------------------- */
+#define SHMEM_PUT_SIZE_IMM_NBI_ADDR_API(Scope)                                                  \
+  inline __device__ void ShmemPutSizeImmNbi##Scope(void* dest, void* val, size_t bytes, int pe, \
+                                                   int qpId = 0) {                              \
+    DISPATCH_TRANSPORT_TYPE(ShmemPutSizeImmNbi##Scope##Kernel, pe, dest, val, bytes, pe, qpId); \
+  }
+
+SHMEM_PUT_SIZE_IMM_NBI_ADDR_API(Thread)
+SHMEM_PUT_SIZE_IMM_NBI_ADDR_API(Warp)
+
+#define SHMEM_PUT_TYPE_IMM_NBI_ADDR_API_TEMPLATE(Scope)                                    \
+  template <typename T>                                                                    \
+  inline __device__ void ShmemPutTypeImmNbi##Scope(T* dest, T val, int pe, int qpId = 0) { \
+    static_assert(sizeof(T) <= core::MaxInlineDataSizePerWqe);                             \
+    ShmemPutSizeImmNbi##Scope(dest, &val, sizeof(T), pe, qpId);                            \
+  }
+
+SHMEM_PUT_TYPE_IMM_NBI_ADDR_API_TEMPLATE(Thread)
+SHMEM_PUT_TYPE_IMM_NBI_ADDR_API_TEMPLATE(Warp)
+
+#define DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(TypeName, T, Scope)                                 \
+  inline __device__ void ShmemPut##TypeName##ImmNbi##Scope(T* dest, T val, int pe, int qpId = 0) { \
+    ShmemPutTypeImmNbi##Scope<T>(dest, val, pe, qpId);                                             \
+  }
+
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Uint8, uint8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Int8, int8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Schar, signed char, Thread)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Uint16, uint16_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Int16, int16_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Int64, int64_t, Thread)
+
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Uint8, uint8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Int8, int8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Schar, signed char, Warp)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Uint16, uint16_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Int16, int16_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Int64, int64_t, Warp)
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                      PutNbi with Signal APIs                                   */
+/* ---------------------------------------------------------------------------------------------- */
+#define DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_ADDR_API_TEMPLATE(Scope)                                  \
+  template <bool onlyOneSignal = true>                                                            \
+  inline __device__ void ShmemPutMemNbiSignal##Scope(                                             \
+      void* dest, const void* source, size_t bytes, void* signalDest, uint64_t signalValue,       \
+      core::atomicType signalOp, int pe, int qpId = 0) {                                          \
+    DISPATCH_TRANSPORT_TYPE_WITH_BOOL(ShmemPutMemNbiSignal##Scope##Kernel, onlyOneSignal, pe,     \
+                                      dest, source, bytes, signalDest, signalValue, signalOp, pe, \
+                                      qpId);                                                      \
+  }
+
+DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_ADDR_API_TEMPLATE(Thread)
+DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_ADDR_API_TEMPLATE(Warp)
+
+#define DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API_TEMPLATE(Scope)                            \
+  template <typename T, bool onlyOneSignal = true>                                           \
+  inline __device__ void ShmemPutTypeNbiSignal##Scope(                                       \
+      T* dest, const T* source, size_t nelems, uint64_t* signalDest, uint64_t signalValue,   \
+      core::atomicType signalOp, int pe, int qpId = 0) {                                     \
+    ShmemPutMemNbiSignal##Scope<onlyOneSignal>(dest, source, nelems * sizeof(T), signalDest, \
+                                               signalValue, signalOp, pe, qpId);             \
+  }
+
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API_TEMPLATE(Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API_TEMPLATE(Warp)
+
+#define DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(TypeName, T, Scope)                             \
+  template <bool onlyOneSignal = true>                                                            \
+  inline __device__ void ShmemPut##TypeName##NbiSignal##Scope(                                    \
+      T* dest, const T* source, size_t nelems, uint64_t* signalDest, uint64_t signalValue,        \
+      core::atomicType signalOp, int pe, int qpId = 0) {                                          \
+    ShmemPutTypeNbiSignal##Scope<T, onlyOneSignal>(dest, source, nelems, signalDest, signalValue, \
+                                                   signalOp, pe, qpId);                           \
+  }
+
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint8, uint8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int8, int8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Schar, signed char, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint16, uint16_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int16, int16_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Float, float, Thread)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Double, double, Thread)
+
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint8, uint8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int8, int8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Schar, signed char, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint16, uint16_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int16, int16_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Float, float, Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Double, double, Warp)
+
+#define SHMEM_ATOMIC_SIZE_NONFETCH_ADDR_API_TEMPLATE(Scope)                                        \
+  inline __device__ void ShmemAtomicSizeNonFetch##Scope(                                           \
+      void* dest, void* val, size_t bytes, core::atomicType amoType, int pe, int qpId = 0) {       \
+    DISPATCH_TRANSPORT_TYPE(ShmemAtomicSizeNonFetch##Scope##Kernel, pe, dest, val, bytes, amoType, \
+                            pe, qpId);                                                             \
+  }
+
+SHMEM_ATOMIC_SIZE_NONFETCH_ADDR_API_TEMPLATE(Thread)
+SHMEM_ATOMIC_SIZE_NONFETCH_ADDR_API_TEMPLATE(Warp)
+
+#define SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API_TEMPLATE(Scope)                                       \
+  template <typename T>                                                                           \
+  inline __device__ void ShmemAtomicTypeNonFetch##Scope(T* dest, T val, core::atomicType amoType, \
+                                                        int pe, int qpId = 0) {                   \
+    ShmemAtomicSizeNonFetch##Scope(dest, &val, sizeof(T), amoType, pe, qpId);                     \
+  }
+
+SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API_TEMPLATE(Thread)
+SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API_TEMPLATE(Warp)
+
+#define DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(TypeName, T, Scope)  \
+  inline __device__ void ShmemAtomic##TypeName##NonFetch##Scope(        \
+      T* dest, T val, core::atomicType amoType, int pe, int qpId = 0) { \
+    ShmemAtomicTypeNonFetch##Scope<T>(dest, val, amoType, pe, qpId);    \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Ulong, unsigned long, Thread)
+
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_NONFETCH_ADDR_API(Ulong, unsigned long, Warp)
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                       Atomic Fetch APIs                                        */
+/* ---------------------------------------------------------------------------------------------- */
+#define SHMEM_ATOMIC_TYPE_FETCH_ADDR_API_TEMPLATE(Scope)                                           \
+  template <typename T>                                                                            \
+  inline __device__ T ShmemAtomicTypeFetch##Scope(                                                 \
+      T* dest, T val, T compare, core::atomicType amoType, int pe, int qpId = 0) {                 \
+    T result =                                                                                     \
+        DISPATCH_TRANSPORT_DATA_TYPE_WITH_RETURN(ShmemAtomicTypeFetch##Scope##Kernel, pe, T, dest, \
+                                                 &val, &compare, sizeof(T), amoType, pe, qpId);    \
+    return result;                                                                                 \
+  }
+
+SHMEM_ATOMIC_TYPE_FETCH_ADDR_API_TEMPLATE(Thread)
+SHMEM_ATOMIC_TYPE_FETCH_ADDR_API_TEMPLATE(Warp)
+
+#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(TypeName, T, Scope)                \
+  inline __device__ T ShmemAtomic##TypeName##Fetch##Scope(                         \
+      T* dest, T val, T compare, core::atomicType amoType, int pe, int qpId = 0) { \
+    return ShmemAtomicTypeFetch##Scope<T>(dest, val, compare, amoType, pe, qpId);  \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Ulong, unsigned long, Thread)
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADDR_API(Ulong, unsigned long, Warp)
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                   Atomic Add Convenience APIs (NonFetch, Pure Address)                         */
+/* ---------------------------------------------------------------------------------------------- */
+#define DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(TypeName, T, Scope)                                  \
+  inline __device__ void Shmem##TypeName##AtomicAdd##Scope(T* dest, T val, int pe, int qpId = 0) { \
+    ShmemAtomicTypeNonFetch##Scope<T>(dest, val, core::AMO_ADD, pe, qpId);                         \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Ulong, unsigned long, Thread)
+
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_ADD_ADDR_API(Ulong, unsigned long, Warp)
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                     Atomic Add Convenience APIs (Fetch, Pure Address)                          */
+/* ---------------------------------------------------------------------------------------------- */
+#define DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(TypeName, T, Scope)                       \
+  inline __device__ T Shmem##TypeName##AtomicFetchAdd##Scope(T* dest, T val, int pe,          \
+                                                             int qpId = 0) {                  \
+    T compare = 0;                                                                            \
+    return ShmemAtomicTypeFetch##Scope<T>(dest, val, compare, core::AMO_FETCH_ADD, pe, qpId); \
+  }
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Long, long, Thread)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Ulong, unsigned long, Thread)
+
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Long, long, Warp)
+DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_ADDR_API(Ulong, unsigned long, Warp)
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    Wait Until Greater Than APIs                                */
@@ -417,6 +813,7 @@ inline __device__ T ShmemTypeWaitUntilGreaterThan(T* addr, T val) {
 
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Uint8, uint8_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Int8, int8_t)
+DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Schar, signed char)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Uint16, uint16_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Int16, int16_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_GREATER_THAN(Uint32, uint32_t)
@@ -440,12 +837,26 @@ inline __device__ void ShmemTypeWaitUntilEquals(T* addr, T val) {
 
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Uint8, uint8_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Int8, int8_t)
+DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Schar, signed char)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Uint16, uint16_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Int16, int16_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Uint32, uint32_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Int32, int32_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Uint64, uint64_t)
 DEFINE_SHMEM_TYPE_WAIT_UNTIL_EQUAL(Int64, int64_t)
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                       Query APIs                                               */
+/* ---------------------------------------------------------------------------------------------- */
+inline __device__ int ShmemMyPe() {
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  return globalGpuStates->rank;
+}
+
+inline __device__ int ShmemNPes() {
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  return globalGpuStates->worldSize;
+}
 
 }  // namespace shmem
 }  // namespace mori

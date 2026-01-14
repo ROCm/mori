@@ -28,6 +28,7 @@ import argparse
 import time
 from tqdm import tqdm
 
+os.environ["MORI_SHMEM_HEAP_SIZE"] = "6G"
 
 kernel_type_map = {
     "v0": mori.ops.EpDispatchCombineKernelType.InterNode,
@@ -143,23 +144,22 @@ class EpDispatchCombineTestCase:
                 device=self.device,
             )
 
-        # gen indices
+        # gen indices - vectorized version for speed
+        num_total_experts = self.config.num_experts_per_rank * self.config.world_size
         all_rank_indices = []
         for r in range(self.world_size):
-            indices = torch.empty(
-                num_token[r],
-                self.config.num_experts_per_token,
-                dtype=torch.int64,
-                # device=self.device,
+            num_tok = num_token[r].item()
+            # Generate random floats and use argsort to get permutations
+            # This is much faster than calling randperm in a loop
+            random_vals = torch.rand(
+                num_tok,
+                num_total_experts,
+                generator=self.rng,
+                device=self.device,
             )
-            for i in range(num_token[r]):
-                perm = torch.randperm(
-                    self.config.num_experts_per_rank * self.config.world_size,
-                    generator=self.rng,
-                    device=self.device,
-                )
-                indices[i] = perm[: self.config.num_experts_per_token]
-            all_rank_indices.append(indices.to(torch.int32).to(self.device))
+            # argsort gives us a random permutation, take first K columns
+            indices = torch.argsort(random_vals, dim=1)[:, : self.config.num_experts_per_token]
+            all_rank_indices.append(indices.to(torch.int32))
 
         # num_total_experts = self.config.num_experts_per_rank * self.config.world_size
         # num_nodes = self.config.world_size // self.config.gpu_per_node

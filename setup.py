@@ -87,6 +87,7 @@ class CMakeBuild(build_ext):
         unroll_value = os.environ.get("WARP_ACCUM_UNROLL", "1")
         use_bnxt = os.environ.get("USE_BNXT", "OFF")
         use_ionic = os.environ.get("USE_IONIC", "OFF")
+        enable_debug_printf = os.environ.get("ENABLE_DEBUG_PRINTF", "OFF")
         gpu_archs = _get_gpu_archs()
         subprocess.check_call(
             [
@@ -96,6 +97,7 @@ class CMakeBuild(build_ext):
                 f"-DWARP_ACCUM_UNROLL={unroll_value}",
                 f"-DUSE_BNXT={use_bnxt}",
                 f"-DUSE_IONIC={use_ionic}",
+                f"-DENABLE_DEBUG_PRINTF={enable_debug_printf}",
                 f"-DGPU_TARGETS={gpu_archs}",
                 "-B",
                 str(build_dir),
@@ -120,6 +122,14 @@ class CMakeBuild(build_ext):
             (
                 build_dir / "src/io/libmori_io.so",
                 root_dir / "python/mori/libmori_io.so",
+            ),
+            (
+                build_dir / "src/shmem/libmori_shmem.a",
+                root_dir / "python/mori/libmori_shmem.a",
+            ),
+            (
+                build_dir / "src/ops/libmori_ops.a",
+                root_dir / "python/mori/libmori_ops.a",
             ),
         ]
         for src_path, dst_path in files_to_copy:
@@ -148,7 +158,7 @@ setup(
     packages=find_packages(where="python"),
     package_dir={"": "python"},
     package_data={
-        "mori": ["libmori_pybinds.so", "libmori_io.so", "libmori_application.so"]
+        "mori": ["libmori_pybinds.so", "libmori_io.so", "libmori_application.so", "libmori_shmem.a", "libmori_ops.a"],
     },
     cmdclass={
         "build_ext": CMakeBuild,
