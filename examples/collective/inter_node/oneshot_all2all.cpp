@@ -24,7 +24,7 @@
 #include <cassert>
 
 #include "mori/application/utils/check.hpp"
-#include "mori/collective/core/allreduce_manager.hpp"
+#include "mori/collective/core/all2all_manager.hpp"
 
 using namespace mori::core;
 using namespace mori::application;
@@ -36,7 +36,7 @@ void testAll2all() {
   All2allManager<uint32_t> all2allManager;
   All2allConfig config;
   config.algorithm = All2allAlgorithm::INTER_ONE_SHOT;
-  status = all2llManager.Initialize(config);
+  status = all2allManager.Initialize(config);
   assert(!status);
 
   int myPe = TopologyDetector::GetMyPe();

@@ -104,8 +104,8 @@ int All2allManager<T>::Initialize(const All2allConfig& config) {
     executor = std::make_unique<OneShotAll2allExecutor<T>>(TopologyDetector::GetNPes(),
                                                              TopologyDetector::GetMyPe(), config);
   } else if (currentAlgorithm == AllReduceAlgorithm::INTER_RING_1D) {
-    executor = std::make_unique<Ring1DAll2allExecutor<T>>(TopologyDetector::GetNPes(),
-                                                            TopologyDetector::GetMyPe(), config);
+    //executor = std::make_unique<Ring1DAll2allExecutor<T>>(TopologyDetector::GetNPes(),
+    //                                                        TopologyDetector::GetMyPe(), config);
   } else {
     return -1;
   }

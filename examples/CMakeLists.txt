@@ -36,6 +36,9 @@ target_link_libraries(put_thread_allgather mori_shmem hip::host hip::device)
 add_executable(all_reduce collective/inter_node/oneshot_example.cpp)
 target_link_libraries(all_reduce mori_collective hip::host hip::device)
 
+add_executable(all2all collective/inter_node/oneshot_all2all.cpp)
+target_link_libraries(all2all mori_collective hip::host hip::device)
+
 add_executable(allreduce_example collective/intra_node/intra_node_example.cpp)
 target_link_libraries(allreduce_example mori_collective MPI::MPI_CXX hip::host
                       hip::device)

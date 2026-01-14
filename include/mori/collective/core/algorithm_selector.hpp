@@ -21,7 +21,7 @@
 // SOFTWARE.
 #pragma once
 
-#include "mori/collective/core/allreduce_config.hpp"
+#include "mori/collective/core/all2all_config.hpp"
 
 namespace mori {
 namespace collective {
@@ -65,6 +65,26 @@ class AlgorithmSelector {
     }
     return config.algorithm;
   }
+
+  static All2allAlgorithm Select(size_t data_size_bytes, int num_ranks, bool is_intra_node,
+                                 const All2allConfig& config = All2allConfig()) {
+    if (config.algorithm == All2allAlgorithm::INVALID) {
+      if (is_intra_node) {
+        if (data_size_bytes < config.ringThresholdBytes) {
+          return All2allAlgorithm::INTRA_1_STAGE;
+        } else {
+          return All2allAlgorithm::INTRA_2_STAGE;
+        }
+      } else {
+        if (data_size_bytes < config.ringThresholdBytes) {
+          return All2allAlgorithm::INTER_ONE_SHOT;
+        } else {
+          return All2allAlgorithm::INTER_RING_1D;
+        }
+      }
+    }
+    return config.algorithm;
+  }  
 };
 
 }  // namespace collective
