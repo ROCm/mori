@@ -52,6 +52,9 @@ target_include_directories(intra_node_benchmark
 add_executable(all_gather collective/inter_node/all_gather_example.cpp)
 target_link_libraries(all_gather mori_shmem hip::host hip::device)
 
+add_executable(allgather_sdma collective/sdma_allgather_example.cpp)
+target_link_libraries(allgather_sdma mori_shmem hip::host hip::device)
+
 add_executable(concurrent_put_thread shmem/concurrent_put_thread.cpp)
 target_link_libraries(concurrent_put_thread mori_shmem hip::host hip::device)
 
