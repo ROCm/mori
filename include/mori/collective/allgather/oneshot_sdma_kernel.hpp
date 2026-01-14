@@ -65,9 +65,10 @@ __global__ void OneShotAllGatharSdmaKernel(int myPe, int npes,
     const size_t sendBytes_rand = bytesPerPeer/8;
     size_t destByteOffset = myPe*bytesPerPeer + qId*sendBytes_rand;
     size_t srcByteOffset = qId*sendBytes_rand;
+    size_t sendBytes = 0;
 
-    if( qId == 7) const size_t sendBytes = bytesPerPeer - 7*sendBytes_rand;
-    else  const size_t sendBytes = sendBytes_rand;
+    if( qId == 7) sendBytes = bytesPerPeer - 7*sendBytes_rand;
+    else sendBytes = sendBytes_rand;
 
     if(remotePe != myPe)
         shmem::ShmemPutMemNbiThread(dstMemObj, destByteOffset, srcMemObj, srcByteOffset, sendBytes, remotePe, qId);

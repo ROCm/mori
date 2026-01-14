@@ -174,7 +174,7 @@ void testOneShotSdmaAllGather() {
   }
 
   // Cleanup
-  ShmemFree(dataBuff);
+  ShmemFree(outPutBuff);
   ShmemFree(flagsBuff);
   delete[] hostData;
 
