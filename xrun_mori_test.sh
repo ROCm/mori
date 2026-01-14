@@ -57,7 +57,7 @@ export TF_CPP_MIN_LOG_LEVEL=1 TF_CPP_MIN_VLOG_LEVEL=0 TF_CPP_MAX_LOG_LEVEL=5
 
 #export TF_FORCE_UNIFIED_MEMORY=true
 # export XLA_PYTHON_CLIENT_ALLOCATOR=bfc
-export XLA_CLIENT_MEM_FRACTION=0.5
+export XLA_CLIENT_MEM_FRACTION=0.35
 # export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
 export HSA_NO_SCRATCH_RECLAIM=1
@@ -111,31 +111,42 @@ export XLA_FLAGS="--xla_gpu_enable_cublaslt=true \
 NumProcs=8
 TotalGpus=8
 
-export LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/torch/lib
+#HIPLIB=/tf/clr/build/hipamd/lib/libamdhip64.so
+export LD_LIBRARY_PATH=/usr/rocm/lib:/usr/local/lib/python3.12/dist-packages/torch/lib
+
+#export LD_LIBRARY_PATH=torch_libs
+# this is go get rid of 'request to allocate mask for invalid number: Invalid argument'
+export LD_PRELOAD=/lib/x86_64-linux-gnu/libnuma.so.1:$HIPLIB:/opt/rocm/lib/libroctracer64.so
+# export MORI_SHMEM_MODE=ISOLATION
+export MORI_SHMEM_HEAP_SIZE=4G
+
+# install debug packages for more insights
+# apt install hip-runtime-amd-dbgsym hsa-rocr-dbgsym rocm-core-dbgsym rocprofiler-dbgsym rocprofiler-sdk-dbgsym
 
 TEST=mori_playground.py
-#TEST=jax_playground.py
+# TEST=jax_playground.py
 #TEST=torch_test_dc.py
-# TEST=examples/ops/dispatch_combine/test_dispatch_combine.py
+#TEST=examples/ops/dispatch_combine/test_dispatch_combine.py
 # TEST=tests/python/ops/test_dispatch_combine.py
 
 XBASE=$(basename $TEST)
-pkill -9 -c -f $XBASE
+pkill -9 -c -f python #$XBASE
 rm -f $XLA_DIR/zzout_*.log
 
 # PYEXEC=$(which pytest)
 # PYTHONPATH=/tf/mori $PYEXEC -s $TEST
 # exit 0
 
-for ((pid = 0; pid < $NumProcs; pid++ )); do
 
+for ((pid = 0; pid < $NumProcs; pid++ )); do
   last_id=$(($NumProcs - 1))
   div=$(($TotalGpus/$NumProcs))
   gpus=$(seq -s, $((pid*div)) $((pid*div+div-1)))
-  if [[ pid -eq last_id ]]; then
+
+  if [[ pid -eq last_id ]] && [[ ${debug} -eq 1 ]]; then
     NODE_RANK=$pid \
     HIP_VISIBLE_DEVICES=$gpus \
-    $GDB $ROCPROF $PYEXEC $TEST --world_size=$NumProcs --rank=$pid 2>&1 | tee $XLA_DIR/zzzrun.log &
+    $GDB $ROCPROF $PYEXEC $TEST --world_size=$NumProcs --rank=$pid 2>&1 | tee $XLA_DIR/zzout_$pid.log
   else
     NODE_RANK=$pid \
     HIP_VISIBLE_DEVICES=$gpus \

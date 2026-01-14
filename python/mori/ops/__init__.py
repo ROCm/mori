@@ -21,18 +21,14 @@
 # SOFTWARE.
 from jax._src import xla_bridge as xb
 
-from .dispatch_combine import (
+from .dispatch_combine_jax import (
     EpDispatchCombineKernelType,
     EpDispatchCombineConfig,
     EpDispatchCombineOp,
+    mori_shmem_init_attr,
 )
 
 from mori import cpp as mori_cpp
 
 xb.register_plugin_callbacks(mori_cpp.pjrt_plugin_setup)
-
-# jax.ffi.register_ffi_target("launch_dispatch_ffi", \
-#                 mori_cpp.launch_dispatch_ffi(), platform="ROCM")
-# jax.ffi.register_ffi_type_id("launch_dispatch_ffi", \
-#                 mori_cpp.handle_type_id(), platform="ROCM")
 

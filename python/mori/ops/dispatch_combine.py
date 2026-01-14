@@ -25,14 +25,9 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
-import numpy as np
-import jax
-import jax.numpy as jnp
-
 class EpDispatchCombineKernelType(mori_cpp.EpDispatchCombineKernelType):
     def __str__(self):
         return self.name
-
 
 @dataclass
 class EpDispatchCombineConfig:
@@ -53,7 +48,6 @@ class EpDispatchCombineConfig:
     gpu_per_node: int = 8
     rdma_block_num: int = 0
     num_qp_per_pe: int = 1
-
 
 def _cpp_dispatch_combine_factory(entity_name):
     return getattr(mori_cpp, entity_name)
@@ -103,67 +97,6 @@ class EpDispatchCombineOp:
     def get_registered_combine_input_buffer(self, dtype: torch.dtype):
         return self._get_registered_combine_input_buffer(self.handle_, dtype)
     
-    def dispatch_jax(self, input, weights, scales, indices,
-                                                                has_weights = True, has_scales = True, 
-                                                                block_num: int = -1, warp_per_block: int = -1):
-        n_tokens = self.config.MaxNumTokensToRecv()
-        has_scales = has_scales and self.config.scale_dim > 0
-        return jax.ffi.ffi_call(
-            "launch_dispatch", (
-                # out
-                jax.ShapeDtypeStruct((n_tokens, self.config.hidden_dim), input.dtype),
-                # out_weights
-                jax.ShapeDtypeStruct((n_tokens, self.config.num_experts_per_token) if has_weights else (1,1), jnp.float32),
-                # out_scales
-                jax.ShapeDtypeStruct((n_tokens, self.config.scale_dim) if has_scales else (1,1), scales.dtype),
-                # out_indices
-                jax.ShapeDtypeStruct((n_tokens, self.config.num_experts_per_token), jnp.int32),
-                # total_recv_token_num
-                jax.ShapeDtypeStruct((), jnp.int32)),
-        )(
-            input,
-            weights,
-            scales,
-            indices,
-            handle_ptr=np.int64(self.handle_.ptr()),
-            kernel_type=np.int32(self.config.kernel_type.value),
-            block_num=np.int32(block_num),
-            warp_per_block=np.int32(warp_per_block),
-            has_scales=np.int32(has_scales),
-            has_weights=np.int32(has_weights),
-        )
-        
-    def combine_jax(
-        self, input, weights, indices,
-        has_weights = True,
-        block_num: int = -1,
-        warp_per_block: int = -1,
-        call_reset: bool = False,
-    ):
-        n_tokens = self.config.max_num_inp_token_per_rank
-        output = jax.ffi.ffi_call(
-            "launch_combine", (
-                # out
-                jax.ShapeDtypeStruct((n_tokens, self.config.hidden_dim), input.dtype),
-                # out_weights
-                jax.ShapeDtypeStruct((n_tokens, self.config.num_experts_per_token) if has_weights else (1,1), jnp.float32)),
-        )(
-            input,
-            weights,
-            indices,
-            handle_ptr=np.int64(self.handle_.ptr()),
-            kernel_type=np.int32(self.config.kernel_type.value),
-            block_num=np.int32(block_num),
-            warp_per_block=np.int32(warp_per_block),
-            has_weights=np.int32(has_weights),
-        )
-        if call_reset:
-            jax.ffi.ffi_call(
-                 "launch_reset", ())(
-                    handle_ptr=np.int64(self.handle_.ptr()),
-            )
-        return output
-
     def dispatch(
         self,
         input: torch.Tensor,
@@ -239,24 +172,6 @@ class EpDispatchCombineOp:
         )
         dist.all_gather(output, padded_input)
         return output
-
-    def get_dispatch_src_token_pos_jax(self, total_recv_token_num):
-        if self.config.kernel_type.value in (
-            EpDispatchCombineKernelType.IntraNode.value,
-            EpDispatchCombineKernelType.InterNodeV1.value,
-            EpDispatchCombineKernelType.InterNodeV1LL.value,
-        ):
-            # here we need to allocate enough space to accomodate handle->totalRecvTokenNum[0] items
-            n_tokens = self.config.MaxNumTokensToRecv()
-            return jax.ffi.ffi_call(
-                        "get_dispatch_src_token_id", (
-                        jax.ShapeDtypeStruct((n_tokens,), jnp.int32)),
-                )(
-                        total_recv_token_num, 
-                        handle_ptr=np.int64(self.handle_.ptr()),
-                 )
-    
-        raise NotImplementedError
 
     def get_dispatch_src_token_pos(self):
         torch.cuda.synchronize()

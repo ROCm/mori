@@ -3,15 +3,13 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 # from jax.experimental.pjit import pjit
 from jax.experimental.shard_map import shard_map
+from jax._src import xla_bridge as xb
 import numpy as np
 
 import random
 import mori
 import argparse, os, time, functools
 from functools import partial
-
-import torch
-import torch.distributed as dist
 
 def init_distributed():
   parser = argparse.ArgumentParser()
@@ -25,15 +23,26 @@ def init_distributed():
       num_processes=args.world_size,
       process_id=args.rank)
   print(f"[rank {args.rank}] devices = {jax.local_devices()}")
+  
+#   Z = xb.backends()["rocm"]
+#   print(f"xla backend {Z} -- {dir(Z)}")
+#   if args.rank == 0:
+#     unique_id = np.arange(100)
+#   else:
+#     unique_id = None
+#   unique_id = multihost_utils.broadcast_one_to_all(unique_id)
+ 
+#   print(f"{args.rank} --- id: {unique_id}")
+  
   return (args.rank, args.world_size)
 
 
 class EpDispatchCombineTestCase:
-    def __init__(self, rank, world_size, dtype=torch.bfloat16, jax_dtype=jnp.bfloat16):
-        self.jax_dtype = jax_dtype
+    def __init__(self, rank, world_size, dtype=jnp.bfloat16):
         self.jax_scale_dtype = jnp.float8_e4m3fnuz
         self.rank = rank
         self.world_size = world_size
+        
         self.config = mori.ops.EpDispatchCombineConfig(
             data_type=dtype,
             rank=self.rank,
@@ -41,10 +50,8 @@ class EpDispatchCombineTestCase:
             hidden_dim=434, #7168,
             # scale_dim=32,
             scale_dim=0,
-            scale_type_size=torch.tensor(
-                [], dtype=torch.float8_e4m3fnuz
-            ).element_size(),
-            max_token_type_size=torch.tensor([], dtype=torch.float32).element_size(),
+            scale_type_size=jnp.dtype(self.jax_scale_dtype).itemsize,
+            max_token_type_size=jnp.dtype(jnp.float32).itemsize,
             max_num_inp_token_per_rank=111, #4096,
             num_experts_per_rank=5, #32,
             num_experts_per_token=13,
@@ -54,26 +61,10 @@ class EpDispatchCombineTestCase:
         )
         
     def setup(self):
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "12355"
-        
-        torch.cuda.set_device(0) #self.rank)
-        self.device = torch.device("cuda", 0) #self.rank)
-        
-        dist.init_process_group(
-            backend="cpu:gloo,cuda:nccl",
-            rank=self.rank,
-            world_size=self.world_size,
-            device_id=self.device,
-        )
-        world_group = torch.distributed.group.WORLD
-        assert world_group is not None
-        torch._C._distributed_c10d._register_process_group("default", world_group)
-        mori.shmem.shmem_torch_process_group_init("default")
-        
         # self.rng.manual_seed(int(time.time()) + self.rank)
                 # simple rng keyed by time + rank to vary per rank
         # seed = int(time.time()) + self.rank
+        mori.ops.mori_shmem_init_attr(self.rank, self.world_size)
         
         def set_seed():
           return jax.random.PRNGKey(777 + self.rank)
@@ -81,7 +72,6 @@ class EpDispatchCombineTestCase:
 
     def cleanup(self):
         mori.shmem.shmem_finalize()
-        dist.destroy_process_group()
         
     def allgather_padded_emu(self, inp: jnp.ndarray, max_token_num: int):
         shape = list(inp.shape)
@@ -130,7 +120,7 @@ class EpDispatchCombineTestCase:
 
         # input: [num_tokens, hidden_dim] - this 
         input_fp32 = jax.random.normal(self.rng, (num_tokens, self.config.hidden_dim), dtype=jnp.float32)
-        input_list = all_gather(input_fp32).astype(self.jax_dtype)
+        input_list = all_gather(input_fp32).astype(self.config.data_type)
         
         print(f"num_tokens {num_tokens}  hidden: {self.config.hidden_dim} indices: {indices.shape}/{indices.dtype}")
         print(f"weights: {weights.shape}/{weights.dtype}")
@@ -138,7 +128,7 @@ class EpDispatchCombineTestCase:
 
         return (indices, weights,
             scales_fp32.astype(self.jax_scale_dtype),
-            input_fp32.astype(self.jax_dtype),
+            input_fp32.astype(self.config.data_type),
             indices_list,
             weights_list,
             scales_list,
@@ -154,15 +144,15 @@ class EpDispatchCombineTestCase:
             dispatch_weights, 
             dispatch_scales, 
             dispatch_indices, 
-            num) = op.dispatch_jax(
+            num) = op.dispatch(
                 inputs, weights, scales, indices, 
                 block_num=80, warp_per_block=16,
                 has_scales=True, has_weights=True)
-            src_token_pos = op.get_dispatch_src_token_pos_jax(num)
+            src_token_pos = op.get_dispatch_src_token_pos(num)
         
             (combine_output, 
-            combine_weights) = op.combine_jax(
-                dispatch_output.astype(self.jax_dtype), 
+            combine_weights) = op.combine(
+                dispatch_output.astype(self.config.data_type), 
                 dispatch_weights, indices,
                 has_weights=True,
                 block_num=80, warp_per_block=8,
@@ -194,7 +184,8 @@ class EpDispatchCombineTestCase:
         # combine_weights: [max_num_inp_tokens_per_rank, num_experts_per_token]
         
         num_recv = dispatch_recv_num_token
-        print(f"rank {self.rank} got {num_tokens} tokens received {num_recv} tokens", flush=True)
+        print(f"dispatch_output: {dispatch_output.shape} dispatch_weights: {dispatch_weights.shape}")
+        print(f"rank {self.rank} got {num_tokens} / received {num_recv} tokens", flush=True)
         
         src_num_recv_token_pos = np.array(src_token_pos)[:num_recv]
         #print(f"len: {len(src_token_pos)} sz {src_token_pos.size} shape {src_token_pos.shape}")
@@ -238,7 +229,7 @@ class EpDispatchCombineTestCase:
             pes_sorted = jnp.sort(pes, axis=-1)
             unique_pes = 1 + jnp.sum(pes_sorted[:, 1:] != pes_sorted[:, :-1], axis=-1)
         
-            expected_output = inputs.astype(self.jax_dtype) * unique_pes[:, None]
+            expected_output = inputs.astype(self.config.data_type) * unique_pes[:, None]
             expected_weight = weights * unique_pes[:, None]
             
             ok_output = jnp.allclose(
@@ -286,8 +277,7 @@ class EpDispatchCombineTestCase:
         del op
 
 def test_dispatch_combine(rank, world_size):
-    test_case = EpDispatchCombineTestCase(rank, world_size, 
-                                            torch.bfloat16, jnp.bfloat16)
+    test_case = EpDispatchCombineTestCase(rank, world_size, jnp.bfloat16)
     test_case.setup()
     test_case.test_dispatch_combine()
     test_case.cleanup()

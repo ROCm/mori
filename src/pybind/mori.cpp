@@ -25,23 +25,30 @@
 
 #include "src/pybind/mori.hpp"
 
+// #define MORI_ENABLE_TORCH
+#ifdef MORI_ENABLE_TORCH
 #include <ATen/hip/HIPContext.h>
+#endif
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <torch/python.h>
 
+#ifdef MORI_ENABLE_TORCH
+#include <torch/python.h>
 #include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
+#include "src/pybind/torch_utils.hpp"
+#else
+namespace py = pybind11;
+#endif
 
 #include "mori/application/application.hpp"
 #include "mori/io/io.hpp"
 #include "mori/ops/ops.hpp"
 #include "mori/shmem/shmem.hpp"
-#include "src/pybind/torch_utils.hpp"
 
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
@@ -295,6 +302,7 @@ XLA_FFI_DEFINE_HANDLER(
 /*                                            Ops APIs                                            */
 /* ---------------------------------------------------------------------------------------------- */
 
+#ifdef MORI_ENABLE_TORCH
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, torch::Tensor,
            torch::Tensor>
 LaunchDispatch(EpDispatchCombineHandle& handle, int kernelType,
@@ -432,6 +440,7 @@ torch::Tensor GetRegisteredCombineInputBuffer(EpDispatchCombineHandle& handle,
                        torch::TensorOptions().dtype(scalarType).device(torch::kCUDA));
   return out;
 }
+#endif // MORI_ENABLE_TORCH
 
 void JaxPluginSetup(py::capsule pyc_api) {
   if (std::string_view(pyc_api.name()) != "pjrt_c_api") {
@@ -494,29 +503,18 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
 
   m.def("pjrt_plugin_setup", &JaxPluginSetup, py::arg("c_api"));
 
+  m.def("get_cur_rank_num_token", &EpDispatchCombineHandle::GetCurRankNumToken);
+
+#ifdef MORI_ENABLE_TORCH
   std::string funcName;
   m.def("launch_dispatch", &LaunchDispatch);
-
-  funcName = std::string("launch_combine");
-  m.def(funcName.c_str(), &LaunchCombine);
-
-  funcName = std::string("launch_reset");
-  m.def(funcName.c_str(), &LaunchReset);
-
-  funcName = std::string("get_cur_rank_num_token");
-  m.def(funcName.c_str(), &EpDispatchCombineHandle::GetCurRankNumToken);
-
-  funcName = std::string("get_dispatch_src_token_pos");
-  m.def(funcName.c_str(), &GetDispatchSrcTokenId);
-
-  funcName = std::string("get_dispatch_sender_token_idx_map");
-  m.def(funcName.c_str(), &GetDispatchSenderTokenIdxMap);
-
-  funcName = std::string("get_dispatch_receiver_token_idx_map");
-  m.def(funcName.c_str(), &GetDispatchReceiverTokenIdxMap);
-
-  funcName = std::string("get_registered_combine_input_buffer");
-  m.def(funcName.c_str(), &GetRegisteredCombineInputBuffer);
+  m.def("launch_combine", &LaunchCombine);
+  m.def("launch_reset", &LaunchReset);
+  m.def("get_dispatch_src_token_pos", &GetDispatchSrcTokenId);
+  m.def("get_dispatch_sender_token_idx_map", &GetDispatchSenderTokenIdxMap);
+  m.def("get_dispatch_receiver_token_idx_map", &GetDispatchReceiverTokenIdxMap);
+  m.def("get_registered_combine_input_buffer", &GetRegisteredCombineInputBuffer);
+#endif // MORI_ENABLE_TORCH
 }
 
 }  // namespace
@@ -525,9 +523,12 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
 /*                                           Shmem APIs                                           */
 /* ---------------------------------------------------------------------------------------------- */
 namespace {
+
+#ifdef MORI_ENABLE_TORCH
 int64_t ShmemTorchProcessGroupInit(const std::string& groupName) {
   return mori::shmem::ShmemTorchProcessGroupInit(groupName);
 }
+#endif
 
 int64_t ShmemFinalize() { return mori::shmem::ShmemFinalize(); }
 
@@ -659,9 +660,11 @@ void RegisterMoriShmem(py::module_& m) {
   m.attr("MORI_SHMEM_INIT_WITH_MPI_COMM") = mori::shmem::MORI_SHMEM_INIT_WITH_MPI_COMM;
   m.attr("MORI_SHMEM_INIT_WITH_UNIQUEID") = mori::shmem::MORI_SHMEM_INIT_WITH_UNIQUEID;
 
+#ifdef MORI_ENABLE_TORCH
   // Traditional initialization APIs
   m.def("shmem_torch_process_group_init", &ShmemTorchProcessGroupInit, py::arg("group_name"),
         "Initialize shmem from PyTorch process group");
+#endif 
 
   // UniqueId-based initialization APIs (nvshmem/rocshmem compatible)
   m.def("shmem_get_unique_id", &ShmemGetUniqueId,
@@ -710,7 +713,9 @@ void RegisterMoriShmem(py::module_& m) {
         "Convert local symmetric memory pointer to remote P2P address. "
         "Returns 0 if connection uses RDMA or if pointer is invalid. "
         "Returns P2P accessible address if connection uses P2P transport.");
+#ifdef MORI_ENABLE_TORCH
   m.def("shmem_torch_process_group_init", &ShmemTorchProcessGroupInit);
+#endif
   m.def("shmem_finalize", &ShmemFinalize);
   m.def("shmem_mype", &ShmemMyPe);
   m.def("shmem_npes", &ShmemNPes);
