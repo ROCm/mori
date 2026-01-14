@@ -62,7 +62,7 @@ void testOneShotSdmaAllGather() {
   assert(inPutBuff != nullptr);
 
   // Initialize data buffer: each PE initializes only its own chunk
-  uint32_t* hostData = new uint32_t[elemsPerPe];
+  uint32_t* hostData = new uint32_t[elemsPerPe*npes];
   memset(hostData, 0, elemsPerPe);
 
   // Each PE fills its own chunk with its PE ID
@@ -95,14 +95,14 @@ void testOneShotSdmaAllGather() {
   assert(flagsBuffObj.IsValid());
 
   // Print initial data (only this PE's chunk should be non-zero)
-  HIP_RUNTIME_CHECK(hipMemcpy(hostData, inPutBuff, bytesPerPe, hipMemcpyDeviceToHost));
+  HIP_RUNTIME_CHECK(hipMemcpy(hostData + myPe*elemsPerPe, inPutBuff, bytesPerPe, hipMemcpyDeviceToHost));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
   printf("PE %d: Initial data (showing first 4 elements of each chunk):\n", myPe);
   for (int pe = 0; pe < npes; pe++) {
     printf("  Chunk %d: ", pe);
     for (int i = 0; i < 4 && i < elemsPerPe; i++) {
-      printf("%u ", hostData[i]);
+      printf("%u ", hostData[i + myPe*elemsPerPe]);
     }
     printf("...\n");
   }
@@ -130,7 +130,7 @@ void testOneShotSdmaAllGather() {
   MPI_Barrier(MPI_COMM_WORLD);
 
   // Copy result back to host for verification
-  HIP_RUNTIME_CHECK(hipMemcpy(hostData, dataBuff, totalBytes, hipMemcpyDeviceToHost));
+  HIP_RUNTIME_CHECK(hipMemcpy(hostData, outPutBuff, totalBytes, hipMemcpyDeviceToHost));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
   printf("PE %d: AllGather result (showing first 4 elements of each chunk):\n", myPe);

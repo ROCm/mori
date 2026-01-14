@@ -75,7 +75,7 @@ __global__ void AllGatherRingKernel(int myPe, int npes, const application::SymmM
 
 //    __threadfence_system();
     if(threadLinearId == 0){
-      shmem::ShmemQuietThread(nextPeer,scratchMemObj);
+      shmem::ShmemQuietThread(nextPeer,memObj);
       shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(flagsObj, sendDataRank * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, nextPeer);
     }
     __syncthreads();
