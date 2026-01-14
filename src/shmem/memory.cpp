@@ -44,24 +44,52 @@ void* ShmemMalloc(size_t size) {
     constexpr size_t ALIGNMENT = 256;
     size = (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
 
-    std::lock_guard<std::mutex> lock(states->memoryStates->heapLock);
+    void* ptr;
+    
+    {
+      std::lock_guard<std::mutex> lock(states->memoryStates->heapLock);
 
-    // Check if we have enough space
-    if (states->memoryStates->staticHeapUsed + size > states->memoryStates->staticHeapSize) {
-      MORI_SHMEM_ERROR("Out of symmetric heap memory! Requested: {} bytes, Available: {} bytes", size,
-                       states->memoryStates->staticHeapSize - states->memoryStates->staticHeapUsed);
-      return nullptr;
+      // Check if we have enough space
+      if (states->memoryStates->staticHeapUsed + size > states->memoryStates->staticHeapSize) {
+        MORI_SHMEM_ERROR("Out of symmetric heap memory! Requested: {} bytes, Available: {} bytes", size,
+                         states->memoryStates->staticHeapSize - states->memoryStates->staticHeapUsed);
+        return nullptr;
+      }
+
+      // Allocate from the bump pointer
+      uintptr_t baseAddr = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
+      ptr = reinterpret_cast<void*>(baseAddr + states->memoryStates->staticHeapUsed);
+      states->memoryStates->staticHeapUsed += size;
     }
 
-    // Allocate from the bump pointer
-    uintptr_t baseAddr = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
-    void* ptr = reinterpret_cast<void*>(baseAddr + states->memoryStates->staticHeapUsed);
-    states->memoryStates->staticHeapUsed += size;
+    // CRITICAL: Synchronize staticHeapUsed across all ranks
+    application::BootstrapNetwork& bootNet = *states->bootStates->bootNet;
+    int rank = bootNet.GetLocalRank();
+    int worldSize = bootNet.GetWorldSize();
+    
+    size_t myHeapUsed = states->memoryStates->staticHeapUsed;
+    size_t* allHeapUsed = static_cast<size_t*>(malloc(worldSize * sizeof(size_t)));
+    bootNet.Allgather(&myHeapUsed, allHeapUsed, sizeof(size_t));
+    
+    // Verify all ranks have consistent staticHeapUsed
+    for (int i = 0; i < worldSize; i++) {
+      if (allHeapUsed[i] != myHeapUsed) {
+        MORI_SHMEM_ERROR("Rank {} staticHeapUsed mismatch! My: {}, Rank {}: {}",
+                         rank, myHeapUsed, i, allHeapUsed[i]);
+        free(allHeapUsed);
+        return nullptr;
+      }
+    }
+    free(allHeapUsed);
 
     states->memoryStates->symmMemMgr->HeapRegisterSymmMemObj(ptr, size,
                                                              &states->memoryStates->staticHeapObj);
-    MORI_SHMEM_TRACE("Allocated {} bytes at offset {} (total used: {} / {})", size,
-                     reinterpret_cast<uintptr_t>(ptr) - baseAddr,
+    
+    uintptr_t baseAddr = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
+    uintptr_t ptrValue = reinterpret_cast<uintptr_t>(ptr);
+    MORI_SHMEM_TRACE("Allocated {} bytes at ptr={:#x} (offset={}, aligned to 256={}) (total used: {} / {})", 
+                     size, ptrValue, ptrValue - baseAddr, 
+                     (ptrValue % 256 == 0 ? "yes" : "no"),
                      states->memoryStates->staticHeapUsed, states->memoryStates->staticHeapSize);
 
     return ptr;
