@@ -20,7 +20,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #pragma once
-
+#include "mori/collective/core/allreduce_config.hpp"
 #include "mori/collective/core/all2all_config.hpp"
 
 namespace mori {
