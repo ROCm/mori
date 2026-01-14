@@ -123,5 +123,93 @@ int OneShotAllReduceExecutor<T>::Execute(T* input, T* output, size_t count, hipS
   return 0;
 }
 
+template <typename T>
+class OneShotAll2allExecutor : public All2allExecutor<T> {
+ public:
+  OneShotAll2allExecutor(int num_ranks, int rank,
+                           const All2allConfig& config = All2allConfig());
+  ~OneShotAll2allExecutor() override = default;
+
+  int Execute(T* input, T* output, size_t count, hipStream_t stream) override;
+
+ private:
+  int numRanks;
+  int rank;
+  All2allConfig config;
+};
+
+template <typename T>
+OneShotAll2allExecutor<T>::OneShotAll2allExecutor(int num_ranks, int rank,
+                                                      const All2allConfig& config)
+    : numRanks(num_ranks), rank(rank), config(config) {}
+
+template <typename T>
+int OneShotAll2allExecutor<T>::Execute(T* input, T* output, size_t count, hipStream_t stream) {
+  if (count == 0) {
+    return 0;
+  }
+
+  const size_t totalBytes = count * sizeof(T);
+  const size_t scratchBytes = totalBytes * static_cast<size_t>(numRanks);
+
+  application::SymmMemObjPtr srcMemObj =
+      shmem::ShmemSymmetricRegister(static_cast<void*>(input), totalBytes);
+  if (!srcMemObj.IsValid()) {
+    return -1;
+  }
+
+  application::SymmMemObjPtr dstMemObj;
+  if (input == output) {
+    dstMemObj = srcMemObj;
+  } else {
+    dstMemObj = shmem::ShmemSymmetricRegister(static_cast<void*>(output), totalBytes);
+    if (!dstMemObj.IsValid()) {
+      return -1;
+    }
+  }
+
+  void* scratchBuffer = shmem::ShmemMalloc(scratchBytes);
+  if (scratchBuffer == nullptr) {
+    return -1;
+  }
+  application::SymmMemObjPtr scratchMemObj = shmem::ShmemQueryMemObjPtr(scratchBuffer);
+  if (!scratchMemObj.IsValid()) {
+    shmem::ShmemFree(scratchBuffer);
+    return -1;
+  }
+
+  const size_t flagsBytes = static_cast<size_t>(numRanks) * sizeof(uint64_t);
+  void* flagsBuffer = shmem::ShmemMalloc(flagsBytes);
+  if (flagsBuffer == nullptr) {
+    shmem::ShmemFree(scratchBuffer);
+    return -1;
+  }
+  std::memset(flagsBuffer, 0, flagsBytes);
+  application::SymmMemObjPtr flagsMemObj = shmem::ShmemQueryMemObjPtr(flagsBuffer);
+  if (!flagsMemObj.IsValid()) {
+    shmem::ShmemFree(flagsBuffer);
+    shmem::ShmemFree(scratchBuffer);
+    return -1;
+  }
+
+  const int threadsPerBlock = config.threadsPerBlock > 0 ? config.threadsPerBlock : 1;
+  int blocks = static_cast<int>((count + threadsPerBlock - 1) / threadsPerBlock);
+  if (blocks <= 0) {
+    blocks = 1;
+  }
+  if (config.maxBlocks > 0 && blocks > config.maxBlocks) {
+    blocks = config.maxBlocks;
+  }
+
+  OneShotAll2allKernel<T><<<blocks, 512, 0, stream>>>(
+      rank, numRanks, srcMemObj, dstMemObj, scratchMemObj, flagsMemObj, count);
+  hipError_t kernelStatus = hipGetLastError();
+  shmem::ShmemFree(scratchBuffer);
+  shmem::ShmemFree(flagsBuffer);
+  HIP_RUNTIME_CHECK(kernelStatus);
+
+  return 0;
+}
+
 }  // namespace collective
-}  // namespace mori
+}  // naespace mori
