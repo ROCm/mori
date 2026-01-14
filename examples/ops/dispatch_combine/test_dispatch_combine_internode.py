@@ -34,6 +34,7 @@ kernel_type_map = {
     "v0": mori.ops.EpDispatchCombineKernelType.InterNode,
     "v1": mori.ops.EpDispatchCombineKernelType.InterNodeV1,
     "v1_ll": mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
+    "async_ll": mori.ops.EpDispatchCombineKernelType.AsyncLL,
 }
 
 
@@ -61,7 +62,7 @@ class EpDispatchCombineTestCase:
             max_num_inp_token_per_rank=max_tokens,
             num_experts_per_rank=16,
             num_experts_per_token=8,
-            warp_num_per_block=8,
+            warp_num_per_block=16,
             block_num=64,
             max_token_type_size=2,
             kernel_type=kernel_type_map[kernel_type],
@@ -282,20 +283,38 @@ class EpDispatchCombineTestCase:
             all_rank_scales,
         ) = test_data
 
-        (
-            dispatch_output,
-            dispatch_weights,
-            dispatch_scales,
-            dispatch_indices,
-            dispatch_recv_num_token,
-        ) = op.dispatch(
-            all_rank_input[self.rank],
-            all_rank_weights[self.rank],
-            all_rank_scales[self.rank],
-            all_rank_indices[self.rank],
-            block_num=self.config.block_num,
-            # warp_per_block=16,
-        )
+        if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+            (
+                dispatch_output,
+                dispatch_weights,
+                dispatch_scales,
+                dispatch_indices,
+                dispatch_recv_num_token,
+            ) = op.dispatch_send(
+                all_rank_input[self.rank],
+                all_rank_weights[self.rank],
+                all_rank_scales[self.rank],
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+            )
+            op.dispatch_recv(
+                block_num=self.config.block_num,
+            )
+        else:
+            (
+                dispatch_output,
+                dispatch_weights,
+                dispatch_scales,
+                dispatch_indices,
+                dispatch_recv_num_token,
+            ) = op.dispatch(
+                all_rank_input[self.rank],
+                all_rank_weights[self.rank],
+                all_rank_scales[self.rank],
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+                warp_per_block=16,
+            )
         torch.cuda.synchronize()
 
         rank_counts, _, _ = self.count_token_num(all_rank_indices)
@@ -338,13 +357,26 @@ class EpDispatchCombineTestCase:
         if self.rank % self.gpu_per_node == 0:
             print(f"Node {self.rank // self.gpu_per_node} Dispatch Pass")
 
-        combine_output, combine_output_weight = op.combine(
-            dispatch_output,
-            dispatch_weights,
-            all_rank_indices[self.rank],
-            block_num=self.config.block_num,
-            # warp_per_block=16,
-        )
+        if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+            dispatch_weights = None
+            combine_output, combine_output_weigh = op.combine_send(
+                dispatch_output,
+                dispatch_weights,
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+            )
+            op.combine_recv(
+                block_num=self.config.block_num,
+            )
+        else:
+            combine_output, combine_output_weight = op.combine(
+                dispatch_output,
+                dispatch_weights,
+                all_rank_indices[self.rank],
+                block_num=self.config.block_num,
+                warp_per_block=16,
+            )
+
         torch.cuda.synchronize()
         for i in range(all_rank_num_token[self.rank]):
             pes = [
@@ -532,33 +564,51 @@ class EpDispatchCombineTestCase:
             all_rank_scales,
         ) = test_data
 
-        for i in range(3):
+        for i in range(0):
             (
                 dispatch_output,
                 dispatch_weights,
                 dispatch_scales,
                 dispatch_indices,
                 dispatch_recv_num_token,
-            ) = op.dispatch(
+            ) = op.dispatch_send(
                 all_rank_input[self.rank],
                 all_rank_weights[self.rank],
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
                 block_num=self.config.block_num,
-                # warp_per_block=16,
             )
-            torch.cuda.synchronize()
-            total_recv_num_token = dispatch_recv_num_token[0].item()
-            combine_output, _ = op.combine(
-                dispatch_output,
-                dispatch_weights,
-                # None,
-                all_rank_indices[self.rank],
-                block_num=self.config.block_num,
-                # warp_per_block=16,
-            )
+            op.dispatch_recv()
             torch.cuda.synchronize()
 
+            # (
+            #     dispatch_output,
+            #     dispatch_weights,
+            #     dispatch_scales,
+            #     dispatch_indices,
+            #     dispatch_recv_num_token,
+            # ) = op.dispatch(
+            #     all_rank_input[self.rank],
+            #     all_rank_weights[self.rank],
+            #     all_rank_scales[self.rank],
+            #     all_rank_indices[self.rank],
+            #     block_num=self.config.block_num,
+            #     warp_per_block=16,
+            # )
+            # torch.cuda.synchronize()
+            # total_recv_num_token = dispatch_recv_num_token[0].item()
+            # combine_output, _ = op.combine(
+            #     dispatch_output,
+            #     dispatch_weights,
+            #     # None,
+            #     all_rank_indices[self.rank],
+            #     block_num=self.config.block_num,
+            #     warp_per_block=16,
+            # )
+            # torch.cuda.synchronize()
+
+        total_recv_num_token = 1
+        # total_recv_num_token = dispatch_recv_num_token[0]
         total_rdma_recv_num_token = (
             self.config.max_num_inp_token_per_rank * self.config.world_size // 8
         )
@@ -570,28 +620,57 @@ class EpDispatchCombineTestCase:
         dist.barrier()
         events[0].record()
         for i in range(repeat):
-            (
-                dispatch_output,
-                dispatch_weights,
-                dispatch_scales,
-                dispatch_indices,
-                dispatch_recv_num_token,
-            ) = op.dispatch(
-                all_rank_input[self.rank],
-                all_rank_weights[self.rank],
-                all_rank_scales[self.rank],
-                all_rank_indices[self.rank],
-                block_num=self.config.block_num,
-                # warp_per_block=16,
-            )
+            if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+                (
+                    dispatch_output,
+                    dispatch_weights,
+                    dispatch_scales,
+                    dispatch_indices,
+                    dispatch_recv_num_token,
+                ) = op.dispatch_send(
+                    all_rank_input[self.rank],
+                    all_rank_weights[self.rank],
+                    all_rank_scales[self.rank],
+                    all_rank_indices[self.rank],
+                    block_num=self.config.block_num,
+                )
+                op.dispatch_recv(
+                    block_num=self.config.block_num,
+                )
+            else:
+                (
+                    dispatch_output,
+                    dispatch_weights,
+                    dispatch_scales,
+                    dispatch_indices,
+                    dispatch_recv_num_token,
+                ) = op.dispatch(
+                    all_rank_input[self.rank],
+                    all_rank_weights[self.rank],
+                    all_rank_scales[self.rank],
+                    all_rank_indices[self.rank],
+                    block_num=self.config.block_num,
+                    warp_per_block=16,
+                )
             events[2 * i + 1].record()
-            combine_output, _ = op.combine(
-                dispatch_output,
-                dispatch_weights,
-                all_rank_indices[self.rank],
-                block_num=self.config.block_num,
-                # warp_per_block=16,
-            )
+            if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+                combine_output, _ = op.combine_send(
+                    dispatch_output,
+                    dispatch_weights,
+                    all_rank_indices[self.rank],
+                    block_num=self.config.block_num,
+                )
+                op.combine_recv(
+                    block_num=self.config.block_num,
+                )
+            else:
+                combine_output, _ = op.combine(
+                    dispatch_output,
+                    dispatch_weights,
+                    all_rank_indices[self.rank],
+                    block_num=self.config.block_num,
+                    warp_per_block=16,
+                )
             events[2 * i + 2].record()
         torch.cuda.synchronize()
 
@@ -639,7 +718,7 @@ class EpDispatchCombineTestCase:
         op = mori.ops.EpDispatchCombineOp(self.config)
         test_data = self.gen_test_data(use_max_token_num=True)
 
-        repeat = 50
+        repeat = 10
         disp_duration_us_list = []
         disp_rdma_bandwidth_GB_list = []
         disp_bandwidth_GB_list = []
@@ -871,7 +950,7 @@ parser.add_argument(
     type=str,
     default="v1",
     help="Type of kernel to test",
-    choices=["v0", "v1", "v1_ll"],
+    choices=["v0", "v1", "v1_ll", "async_ll"],
 )
 parser.add_argument(
     "--num-qp",
