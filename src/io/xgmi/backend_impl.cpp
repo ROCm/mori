@@ -120,6 +120,11 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   assert(batchSize == localOffsets.size());
   assert(batchSize == remoteOffsets.size());
 
+  if (batchSize == 0) {
+    status->SetCode(StatusCode::SUCCESS);
+    return;
+  }
+
   const int srcDevice = isRead ? remoteDevice : localDevice;
   const int dstDevice = isRead ? localDevice : remoteDevice;
 
@@ -140,31 +145,76 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
     return;
   }
 
-  for (size_t i = 0; i < batchSize; ++i) {
-    void* src = isRead ? static_cast<char*>(remoteAddr) + remoteOffsets[i]
-                       : static_cast<char*>(localAddr) + localOffsets[i];
-    void* dst = isRead ? static_cast<char*>(localAddr) + localOffsets[i]
-                       : static_cast<char*>(remoteAddr) + remoteOffsets[i];
+  size_t runStartIdx = 0;
+  size_t runLocalOff = 0;
+  size_t runRemoteOff = 0;
+  size_t runSize = 0;
+  bool hasRun = false;
+
+  auto flush_run = [&](size_t failedAtIdx) -> bool {
+    if (!hasRun) return true;
+
+    void* src = isRead ? static_cast<char*>(remoteAddr) + runRemoteOff
+                       : static_cast<char*>(localAddr) + runLocalOff;
+    void* dst = isRead ? static_cast<char*>(localAddr) + runLocalOff
+                       : static_cast<char*>(remoteAddr) + runRemoteOff;
 
     if (srcDevice == dstDevice) {
-      err = hipMemcpyAsync(dst, src, sizes[i], hipMemcpyDeviceToDevice, stream);
+      err = hipMemcpyAsync(dst, src, runSize, hipMemcpyDeviceToDevice, stream);
       if (err != hipSuccess) {
         status->Update(StatusCode::ERR_RDMA_OP,
-                       std::string("XGMI: hipMemcpyAsync failed at batch ") + std::to_string(i) +
-                           ": " + hipGetErrorString(err));
-        eventPool->PutEvent(event, dstDevice);
-        return;
+                       std::string("XGMI: hipMemcpyAsync failed at batch ") +
+                           std::to_string(failedAtIdx) + ": " + hipGetErrorString(err));
+        return false;
       }
     } else {
-      err = hipMemcpyPeerAsync(dst, dstDevice, src, srcDevice, sizes[i], stream);
+      err = hipMemcpyPeerAsync(dst, dstDevice, src, srcDevice, runSize, stream);
       if (err != hipSuccess) {
         status->Update(StatusCode::ERR_RDMA_OP,
                        std::string("XGMI: hipMemcpyPeerAsync failed at batch ") +
-                           std::to_string(i) + ": " + hipGetErrorString(err));
-        eventPool->PutEvent(event, dstDevice);
-        return;
+                           std::to_string(failedAtIdx) + ": " + hipGetErrorString(err));
+        return false;
       }
     }
+    return true;
+  };
+
+  for (size_t i = 0; i < batchSize; ++i) {
+    const size_t sz = sizes[i];
+    if (sz == 0) continue;
+
+    if (!hasRun) {
+      runStartIdx = i;
+      runLocalOff = localOffsets[i];
+      runRemoteOff = remoteOffsets[i];
+      runSize = sz;
+      hasRun = true;
+      continue;
+    }
+
+    const bool remoteContiguous = (runRemoteOff + runSize) == remoteOffsets[i];
+    const bool localContiguous = (runLocalOff + runSize) == localOffsets[i];
+
+    if (remoteContiguous && localContiguous) {
+      runSize += sz;
+      continue;
+    }
+
+    if (!flush_run(runStartIdx)) {
+      eventPool->PutEvent(event, dstDevice);
+      return;
+    }
+
+    runStartIdx = i;
+    runLocalOff = localOffsets[i];
+    runRemoteOff = remoteOffsets[i];
+    runSize = sz;
+    hasRun = true;
+  }
+
+  if (!flush_run(runStartIdx)) {
+    eventPool->PutEvent(event, dstDevice);
+    return;
   }
 
   err = hipEventRecord(event, stream);
