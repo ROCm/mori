@@ -59,7 +59,6 @@ __global__ void AtomicFetchThreadKernel(int myPe, const SymmMemObjPtr memObj) {
     __threadfence_system();
     if (ret == gridDim.x * blockDim.x) {
       printf("Legacy API: globalTid: %d ret = %lu atomic fetch is ok!~\n", globalTid, (uint64_t)ret);
-      printf("Legacy API: globalTid: %d ret = %lu atomic fetch is ok!~\n", globalTid, (uint64_t)ret);
     }
   } else {
     while (AtomicLoadRelaxed(reinterpret_cast<T*>(memObj->localPtr) + 2) !=
@@ -196,14 +195,8 @@ void testAtomicFetchThread() {
     if (myPe == 0) {
       printf("\n--- Test 1: Legacy API (uint64_t) ---\n");
     }
-    // ===== Test 1: Legacy API with uint64_t =====
-    if (myPe == 0) {
-      printf("\n--- Test 1: Legacy API (uint64_t) ---\n");
-    }
     myHipMemsetD64(buff, myPe, numEle);
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-
     MPI_Barrier(MPI_COMM_WORLD);
 
     AtomicFetchThreadKernel<uint64_t><<<blockNum, threadNum>>>(myPe, buffObj);
@@ -237,38 +230,8 @@ void testAtomicFetchThread() {
     if (myPe == 0) {
       printf("\n--- Test 3: Legacy API (int64_t) ---\n");
     }
-    
-    if (myPe == 0) {
-      uint64_t result = *(reinterpret_cast<uint64_t*>(buff) + 2);
-      printf("✓ Legacy API uint64_t test completed. Result at index 2: %lu\n", result);
-    }
-
-    // ===== Test 2: Pure Address API with uint64_t =====
-    if (myPe == 0) {
-      printf("\n--- Test 2: Pure Address API (uint64_t) ---\n");
-    }
     myHipMemsetD64(buff, myPe, numEle);
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    AtomicFetchThreadKernel_PureAddr<uint64_t><<<blockNum, threadNum>>>(
-        myPe, reinterpret_cast<uint64_t*>(buff));
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-    
-    if (myPe == 0) {
-      uint64_t result = *(reinterpret_cast<uint64_t*>(buff) + 2);
-      printf("✓ Pure Address API uint64_t test completed. Result at index 2: %lu\n", result);
-    }
-
-    // ===== Test 3: Legacy API with int64_t =====
-    if (myPe == 0) {
-      printf("\n--- Test 3: Legacy API (int64_t) ---\n");
-    }
-    myHipMemsetD64(buff, myPe, numEle);
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-
     MPI_Barrier(MPI_COMM_WORLD);
 
     AtomicFetchThreadKernel<int64_t><<<blockNum, threadNum>>>(myPe, buffObj);
@@ -302,38 +265,8 @@ void testAtomicFetchThread() {
     if (myPe == 0) {
       printf("\n--- Test 5: Legacy API (uint32_t) ---\n");
     }
-    
-    if (myPe == 0) {
-      int64_t result = *(reinterpret_cast<int64_t*>(buff) + 2);
-      printf("✓ Legacy API int64_t test completed. Result at index 2: %ld\n", result);
-    }
-
-    // ===== Test 4: Pure Address API with int64_t =====
-    if (myPe == 0) {
-      printf("\n--- Test 4: Pure Address API (int64_t) ---\n");
-    }
-    myHipMemsetD64(buff, myPe, numEle);
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    AtomicFetchThreadKernel_PureAddr<int64_t><<<blockNum, threadNum>>>(
-        myPe, reinterpret_cast<int64_t*>(buff));
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-    
-    if (myPe == 0) {
-      int64_t result = *(reinterpret_cast<int64_t*>(buff) + 2);
-      printf("✓ Pure Address API int64_t test completed. Result at index 2: %ld\n", result);
-    }
-
-    // ===== Test 5: Legacy API with uint32_t =====
-    if (myPe == 0) {
-      printf("\n--- Test 5: Legacy API (uint32_t) ---\n");
-    }
     HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff), myPe, numEle));
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-
     MPI_Barrier(MPI_COMM_WORLD);
 
     AtomicFetchThreadKernel<uint32_t><<<blockNum, threadNum>>>(myPe, buffObj);
@@ -367,38 +300,8 @@ void testAtomicFetchThread() {
     if (myPe == 0) {
       printf("\n--- Test 7: Legacy API (int32_t) ---\n");
     }
-    
-    if (myPe == 0) {
-      uint32_t result = *(reinterpret_cast<uint32_t*>(buff) + 2);
-      printf("✓ Legacy API uint32_t test completed. Result at index 2: %u\n", result);
-    }
-
-    // ===== Test 6: Pure Address API with uint32_t =====
-    if (myPe == 0) {
-      printf("\n--- Test 6: Pure Address API (uint32_t) ---\n");
-    }
-    HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff), myPe, numEle));
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    AtomicFetchThreadKernel_PureAddr<uint32_t><<<blockNum, threadNum>>>(
-        myPe, reinterpret_cast<uint32_t*>(buff));
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-    
-    if (myPe == 0) {
-      uint32_t result = *(reinterpret_cast<uint32_t*>(buff) + 2);
-      printf("✓ Pure Address API uint32_t test completed. Result at index 2: %u\n", result);
-    }
-
-    // ===== Test 7: Legacy API with int32_t =====
-    if (myPe == 0) {
-      printf("\n--- Test 7: Legacy API (int32_t) ---\n");
-    }
     HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<int32_t*>(buff), myPe, numEle));
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-
     MPI_Barrier(MPI_COMM_WORLD);
 
     AtomicFetchThreadKernel<int32_t><<<blockNum, threadNum>>>(myPe, buffObj);
@@ -535,7 +438,6 @@ void testAtomicFetchThread() {
 
     MPI_Barrier(MPI_COMM_WORLD);
     if (myPe == 0) {
-      printf("\nIteration %d completed successfully!\n", iteration + 1);
       printf("\nIteration %d completed successfully!\n", iteration + 1);
     }
     sleep(1);

@@ -146,6 +146,54 @@ void* ShmemExtMallocWithFlags(size_t size, unsigned int flags) {
     }
     return nullptr;
   }
+
+
+  // Check if using VMM heap
+  if (states->memoryStates->useVMMHeap && states->memoryStates->vmmHeapInitialized) {
+    // Use VMM-based allocation
+    application::SymmMemObjPtr memObj = states->memoryStates->symmMemMgr->VMMAllocChunk(size);
+    if (!memObj.IsValid()) {
+      MORI_SHMEM_ERROR("VMM allocation failed for size {} bytes", size);
+      return nullptr;
+    }
+    
+    MORI_SHMEM_TRACE("VMM allocated {} bytes at {}", size, memObj.cpu->localPtr);
+    return memObj.cpu->localPtr;
+  } else {
+    // Use traditional static heap bump allocator
+    // Align to 256 bytes for better performance
+    constexpr size_t ALIGNMENT = 256;
+    size = (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+
+    std::lock_guard<std::mutex> lock(states->memoryStates->heapLock);
+
+    // Check if we have enough space
+    if (states->memoryStates->staticHeapUsed + size > states->memoryStates->staticHeapSize) {
+      MORI_SHMEM_ERROR("Out of symmetric heap memory! Requested: {} bytes, Available: {} bytes", size,
+                       states->memoryStates->staticHeapSize - states->memoryStates->staticHeapUsed);
+      return nullptr;
+    }
+
+    // Allocate from the bump pointer
+    uintptr_t baseAddr = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
+    void* ptr = reinterpret_cast<void*>(baseAddr + states->memoryStates->staticHeapUsed);
+    states->memoryStates->staticHeapUsed += size;
+
+    states->memoryStates->symmMemMgr->HeapRegisterSymmMemObj(ptr, size,
+                                                             &states->memoryStates->staticHeapObj);
+    MORI_SHMEM_TRACE("Static heap allocated {} bytes at offset {} (total used: {} / {})", size,
+                     reinterpret_cast<uintptr_t>(ptr) - baseAddr,
+                     states->memoryStates->staticHeapUsed, states->memoryStates->staticHeapSize);
+
+    return ptr;
+  }
+}
+
+void* ShmemExtMallocWithFlags(size_t size, unsigned int flags) {
+  // For now, ignore flags and use the same allocator
+  // TODO: Support different allocation flags if needed
+  MORI_SHMEM_TRACE("Allocated shared memory of size {} with flags {} (flags ignored)", size, flags);
+  return ShmemMalloc(size);
 }
 
 void ShmemFree(void* localPtr) {
@@ -164,6 +212,17 @@ void ShmemFree(void* localPtr) {
   } else {
     // Isolation mode: free the memory and deregister
     states->memoryStates->symmMemMgr->Free(localPtr);
+  }
+  // Check if using VMM heap
+  if (states->memoryStates->useVMMHeap && states->memoryStates->vmmHeapInitialized) {
+    // Use VMM-based deallocation (true free)
+    states->memoryStates->symmMemMgr->VMMFreeChunk(localPtr);
+    MORI_SHMEM_TRACE("VMM freed memory at {}", localPtr);
+  } else {
+    // For static heap, we can only deregister but not actually free
+    // (bump allocator limitation)
+    states->memoryStates->symmMemMgr->HeapDeregisterSymmMemObj(localPtr);
+    MORI_SHMEM_TRACE("Static heap deregistered memory at {} (memory not reclaimed)", localPtr);
   }
 }
 

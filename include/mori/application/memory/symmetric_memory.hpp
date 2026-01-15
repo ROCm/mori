@@ -32,6 +32,7 @@
 #include "mori/application/context/context.hpp"
 #include "mori/application/transport/transport.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
+#include "mori/application/memory/vmm_va_manager.hpp"
 
 namespace mori {
 namespace application {
@@ -41,7 +42,7 @@ struct SymmMemObj {
   uintptr_t* peerPtrs{nullptr};
   size_t size{0};
   // For Rdma
-  uint32_t lkey{0};
+  uint32_t lkey{nullptr};
   uint32_t* peerRkeys{nullptr};
   // For IPC
   hipIpcMemHandle_t* ipcMemHandles{nullptr};  // should only placed on cpu
@@ -102,11 +103,27 @@ class SymmMemManager {
   SymmMemObjPtr ExtMallocWithFlags(size_t size, unsigned int flags);
   void Free(void* localPtr);
 
-  SymmMemObjPtr RegisterSymmMemObj(void* localPtr, size_t size);
+  SymmMemObjPtr RegisterSymmMemObj(void* localPtr, size_t size, bool heap_begin = false);
   void DeregisterSymmMemObj(void* localPtr);
 
   SymmMemObjPtr HeapRegisterSymmMemObj(void* localPtr, size_t size, SymmMemObjPtr* heapObj);
   void HeapDeregisterSymmMemObj(void* localPtr);
+
+  // VMM-based symmetric memory management
+  bool InitializeVMMHeap(size_t virtualSize, size_t chunkSize = 0);
+  void FinalizeVMMHeap();
+  SymmMemObjPtr VMMAllocChunk(size_t size, uint32_t allocType = hipMemAllocationTypePinned);
+  void VMMFreeChunk(void* localPtr);
+  bool IsVMMSupported() const;
+  SymmMemObjPtr VMMRegisterSymmMemObj(void* localPtr, size_t size, size_t startChunk, size_t numChunks);
+  
+  // Cross-process VMM memory sharing
+  bool VMMImportPeerMemory(int peerPe, void* localBaseAddr, size_t offset, size_t size, 
+                          const std::vector<int>& shareableHandles);
+
+  // Get VMM heap object (for accessing peer addresses and RDMA keys)
+  SymmMemObjPtr GetVMMHeapObj() const { return vmmHeapObj; }
+
 
   SymmMemObjPtr Get(void* localPtr) const;
 
@@ -114,6 +131,50 @@ class SymmMemManager {
   BootstrapNetwork& bootNet;
   Context& context;
   std::unordered_map<void*, SymmMemObjPtr> memObjPool;
+
+  // VMM heap management
+  struct VMMChunkInfo {
+    hipMemGenericAllocationHandle_t handle;
+    int shareableHandle;  // File descriptor for POSIX systems (for P2P)
+    size_t size;          // Chunk size (always equals granularity/vmmChunkSize)
+    bool isAllocated;
+    
+    // RDMA registration info (per-chunk, for RDMA transport)
+    uint32_t lkey;                        // Local key for RDMA access
+    std::vector<uint32_t> peerRkeys;      // Remote keys from all PEs
+    bool rdmaRegistered;                  // Whether this chunk is RDMA registered
+    
+    VMMChunkInfo() 
+        : handle(0), shareableHandle(-1), size(0), 
+          isAllocated(false), lkey(0), rdmaRegistered(false) {}
+  };
+  
+  // VA allocation tracking for memory reuse
+  struct VMMAllocation {
+    void* vaPtr;           // Virtual address pointer
+    size_t size;           // Allocation size
+    size_t startChunk;     // Starting chunk index
+    size_t numChunks;      // Number of chunks
+    bool hasPhysicalMem;   // Whether physical memory is allocated
+  };
+
+  bool vmmInitialized{false};
+  void* vmmVirtualBasePtr{nullptr}; 
+  size_t vmmVirtualSize{0};
+  size_t vmmChunkSize{0};
+  size_t vmmMinChunkSize{0};
+  size_t vmmMaxChunks{0};
+  std::vector<VMMChunkInfo> vmmChunks;
+  std::mutex vmmLock;
+  bool vmmRdmaRegistered{false};
+  SymmMemObjPtr vmmHeapObj{nullptr, nullptr};  // Represents the entire VMM heap
+
+  // Multi-PE virtual address spaces for cross-process mapping
+  std::vector<void*> vmmPeerBasePtrs;  // Virtual base addresses for each PE
+  size_t vmmPerPeerSize{0};  // Size of virtual address space per PE
+  
+  // VA Manager for tracking allocations and enabling reuse
+  std::unique_ptr<VMMVAManager> vmmVAManager;
 };
 
 }  // namespace application
