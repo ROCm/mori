@@ -41,9 +41,9 @@ enum class ShmemMode {
 };
 
 
-constexpr size_t DEFAULT_SYMMETRIC_HEAP_SIZE = 2ULL * 1024 * 1024 * 1024;  // 2GB default
 constexpr size_t DEFAULT_STATIC_SYMMETRIC_HEAP_SIZE = 2ULL * 1024 * 1024 * 1024;  // 2GB default
 constexpr size_t DEFAULT_VMM_SYMMETRIC_HEAP_SIZE = 8ULL * 1024 * 1024 * 1024;  // 8GB default
+constexpr size_t DEFAULT_VMM_MIN_CHUNK_SIZE = 64ULL * 1024 * 1024;  // 64MB default
 
 
 struct BootStates {

@@ -27,14 +27,12 @@
 #include <memory>
 #include <random>
 
-
 #include "hip/hip_runtime.h"
 #include "mori/application/application.hpp"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"
 #include "mori/utils/mori_log.hpp"
-
 
 namespace mori {
 namespace shmem {
@@ -47,6 +45,63 @@ namespace shmem {
 /*                                          Initialization                                       */
 /* ---------------------------------------------------------------------------------------------- */
 __device__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
+
+// Helper function to parse size strings with various suffixes (G/GB/GiB, M/MB/MiB, K/KB/KiB)
+static size_t ParseSizeString(const std::string& sizeStr) {
+  if (sizeStr.empty()) {
+    return 0;
+  }
+
+  std::string numStr = sizeStr;
+  size_t multiplier = 1;
+
+  // Try three-character suffixes first (GiB, MiB, KiB)
+  if (numStr.size() >= 3) {
+    std::string suffix = numStr.substr(numStr.size() - 3);
+    if (suffix == "GiB" || suffix == "gib") {
+      multiplier = 1024ULL * 1024ULL * 1024ULL;
+      numStr.erase(numStr.size() - 3);
+    } else if (suffix == "MiB" || suffix == "mib") {
+      multiplier = 1024ULL * 1024ULL;
+      numStr.erase(numStr.size() - 3);
+    } else if (suffix == "KiB" || suffix == "kib") {
+      multiplier = 1024ULL;
+      numStr.erase(numStr.size() - 3);
+    }
+  }
+
+  // Try two-character suffixes (GB, MB, KB)
+  if (multiplier == 1 && numStr.size() >= 2) {
+    std::string suffix = numStr.substr(numStr.size() - 2);
+    if (suffix == "GB" || suffix == "gb" || suffix == "Gb") {
+      multiplier = 1024ULL * 1024ULL * 1024ULL;
+      numStr.erase(numStr.size() - 2);
+    } else if (suffix == "MB" || suffix == "mb" || suffix == "Mb") {
+      multiplier = 1024ULL * 1024ULL;
+      numStr.erase(numStr.size() - 2);
+    } else if (suffix == "KB" || suffix == "kb" || suffix == "Kb") {
+      multiplier = 1024ULL;
+      numStr.erase(numStr.size() - 2);
+    }
+  }
+
+  // Fallback to single-character suffixes (G, M, K)
+  if (multiplier == 1 && !numStr.empty()) {
+    char lastChar = numStr.back();
+    if (lastChar == 'G' || lastChar == 'g') {
+      multiplier = 1024ULL * 1024ULL * 1024ULL;
+      numStr.pop_back();
+    } else if (lastChar == 'M' || lastChar == 'm') {
+      multiplier = 1024ULL * 1024ULL;
+      numStr.pop_back();
+    } else if (lastChar == 'K' || lastChar == 'k') {
+      multiplier = 1024ULL;
+      numStr.pop_back();
+    }
+  }
+
+  return std::stoull(numStr) * multiplier;
+}
 
 bool IsROCmVersionGreaterThan7() {
   // Check HIP version which corresponds to ROCm version
@@ -63,7 +118,7 @@ bool IsROCmVersionGreaterThan7() {
   MORI_SHMEM_INFO("Detected HIP version: {}.{} (version code: {})", hip_major, hip_minor,
                   hipVersion);
 
-  return hip_major >= 6;
+  return hip_major > 6;
 }
 
 void RdmaStatesInit() {
@@ -73,8 +128,8 @@ void RdmaStatesInit() {
 
   int rank = states->bootStates->rank;
   int worldSize = states->bootStates->worldSize;
-  MORI_SHMEM_TRACE("RdmaStatesInit: rank {}, worldSize {}", rank, worldSize);
   rdmaStates->commContext = new application::Context(*states->bootStates->bootNet);
+  MORI_SHMEM_TRACE("RdmaStatesInit: rank {}, worldSize {}", rank, worldSize);
 }
 
 void MemoryStatesInit() {
@@ -87,176 +142,79 @@ void MemoryStatesInit() {
   states->memoryStates->mrMgr =
       new application::RdmaMemoryRegionManager(*context->GetRdmaDeviceContext());
 
-
-  // Only allocate static heap in StaticHeap mode
-  if (states->mode == ShmemMode::StaticHeap) {
-    // Allocate static symmetric heap
-    // Size can be configured via environment variable
-    const char* heapSizeEnv = std::getenv("MORI_SHMEM_HEAP_SIZE");
-    size_t heapSize = DEFAULT_SYMMETRIC_HEAP_SIZE;
-
-    if (heapSizeEnv) {
-      std::string heapSizeStr(heapSizeEnv);
-      size_t multiplier = 1;
-
-      // Check for suffix
-      if (!heapSizeStr.empty()) {
-        char lastChar = heapSizeStr.back();
-        if (lastChar == 'G' || lastChar == 'g') {
-          multiplier = 1024ULL * 1024ULL * 1024ULL;  // GiB
-          heapSizeStr.pop_back();
-        } else if (lastChar == 'M' || lastChar == 'm') {
-          multiplier = 1024ULL * 1024ULL;  // MiB
-          heapSizeStr.pop_back();
-        }
-      }
-      heapSize = std::stoull(heapSizeStr) * multiplier;
-    }
-
-    MORI_SHMEM_INFO("Allocating static symmetric heap of size {} bytes ({} MB)", heapSize,
-                    heapSize / (1024 * 1024));
-
-    // Allocate the symmetric heap using the SymmMemManager
-    application::SymmMemObjPtr heapObj =
-        states->memoryStates->symmMemMgr->ExtMallocWithFlags(heapSize, hipDeviceMallocUncached);
-    if (!heapObj.IsValid()) {
-      MORI_SHMEM_ERROR("Failed to allocate static symmetric heap!");
-      throw std::runtime_error("Failed to allocate static symmetric heap");
-    }
-
-    states->memoryStates->staticHeapBasePtr = heapObj.cpu->localPtr;
-    states->memoryStates->staticHeapSize = heapSize;
-    // IMPORTANT: Start with a small offset to avoid collision between heap base address
-    // and first ShmemMalloc allocation. Without this, when staticHeapUsed == 0,
-    // the first ShmemMalloc would return staticHeapBasePtr, which is the same address
-    // as the heap itself in memObjPool, causing the heap's SymmMemObj to be overwritten.
-    constexpr size_t HEAP_INITIAL_OFFSET = 256;
-    states->memoryStates->staticHeapUsed = HEAP_INITIAL_OFFSET;
-    states->memoryStates->staticHeapObj = heapObj;
-
-    MORI_SHMEM_INFO(
-        "Static symmetric heap allocated at {} (local), size {} bytes, initial offset {} bytes",
-        states->memoryStates->staticHeapBasePtr, heapSize, HEAP_INITIAL_OFFSET);
-  } else {
-    MORI_SHMEM_INFO("Running in isolation mode (no static heap)");
-  }
-  // TODO!!!
-  // Auto-select heap type based on ROCm version and other factors
-  bool useVMM = false;
-
-  // Check if ROCm version supports VMM (>= 7.0)
-  bool rocmSupportsVMM = IsROCmVersionGreaterThan7();
-
-  // Check hardware VMM support
-  bool hardwareSupportsVMM = states->memoryStates->symmMemMgr->IsVMMSupported();
-
-  // Check environment variable override
-  const char* forceVMMEnv = std::getenv("MORI_SHMEM_USE_VMM");
-  if (forceVMMEnv) {
-    useVMM = (std::string(forceVMMEnv) == "1" || std::string(forceVMMEnv) == "true" ||
-              std::string(forceVMMEnv) == "TRUE");
-    MORI_SHMEM_INFO("VMM usage forced by environment variable: {}",
-                    useVMM ? "enabled" : "disabled");
-  } else {
-    // Auto-select based on ROCm version and hardware support
-    useVMM = rocmSupportsVMM && hardwareSupportsVMM;
-    MORI_SHMEM_INFO(
-        "Auto-selecting heap type: ROCm >= 7.0: {}, Hardware VMM support: {}, Using VMM: {}",
-        rocmSupportsVMM, hardwareSupportsVMM, useVMM);
+  // Handle different heap modes
+  if (states->mode == ShmemMode::Isolation) {
+    MORI_SHMEM_INFO("Running in isolation mode (no heap allocation)");
+    return;
   }
 
-  if (useVMM) {
-    // Initialize VMM-based dynamic heap
-    const char* chunkSizeEnv = std::getenv("MORI_SHMEM_VMM_CHUNK_SIZE");
-    size_t chunkSize = 0;
-    const char* vmmHeapSizeEnv = std::getenv("MORI_SHMEM_VMM_HEAP_SIZE");
-    size_t vmmHeapSize = DEFAULT_VMM_SYMMETRIC_HEAP_SIZE;
-    size_t vmmMultiplier = 1;
-    if (chunkSizeEnv) {
-      std::string chunkSizeStr(chunkSizeEnv);
+  // For VMHeap mode, check VMM support first
+  if (states->mode == ShmemMode::VMHeap) {
+    MORI_SHMEM_INFO("VMM heap mode selected, checking VMM support...");
 
-      if (!chunkSizeStr.empty()) {
-        char lastChar = chunkSizeStr.back();
-        if (lastChar == 'M' || lastChar == 'm') {
-          vmmMultiplier = 1024ULL * 1024ULL;  // MiB
-          chunkSizeStr.pop_back();
-        } else if (lastChar == 'K' || lastChar == 'k') {
-          vmmMultiplier = 1024ULL;  // KiB
-          chunkSizeStr.pop_back();
-        }
+    // Check if ROCm version supports VMM (>= 7.0) and hardware VMM support
+    bool rocmSupportsVMM = IsROCmVersionGreaterThan7();
+    bool hardwareSupportsVMM = states->memoryStates->symmMemMgr->IsVMMSupported();
+    MORI_SHMEM_INFO("VMM support check: ROCm >= 7.0: {}, Hardware VMM: {}", rocmSupportsVMM,
+                    hardwareSupportsVMM);
+
+    if (rocmSupportsVMM && hardwareSupportsVMM) {
+      // VMM is supported, initialize VMM heap
+      const char* chunkSizeEnv = std::getenv("MORI_SHMEM_VMM_CHUNK_SIZE");
+      size_t chunkSize = 0;
+      const char* vmmHeapSizeEnv = std::getenv("MORI_SHMEM_HEAP_SIZE");
+      size_t vmmHeapSize = DEFAULT_VMM_SYMMETRIC_HEAP_SIZE;
+
+      if (chunkSizeEnv) {
+        chunkSize = std::max(ParseSizeString(chunkSizeEnv), DEFAULT_VMM_MIN_CHUNK_SIZE);
       }
 
-      chunkSize = std::stoull(chunkSizeStr) * vmmMultiplier;
-    }
-
-    if (vmmHeapSizeEnv) {
-      std::string vmmHeapSizeStr(vmmHeapSizeEnv);
-
-      // Check for suffix
-      if (!vmmHeapSizeStr.empty()) {
-        char lastChar = vmmHeapSizeStr.back();
-        if (lastChar == 'G' || lastChar == 'g') {
-          vmmMultiplier = 1024ULL * 1024ULL * 1024ULL;  // GiB
-          vmmHeapSizeStr.pop_back();
-        } else if (lastChar == 'M' || lastChar == 'm') {
-          vmmMultiplier = 1024ULL * 1024ULL;  // MiB
-          vmmHeapSizeStr.pop_back();
-        }
+      if (vmmHeapSizeEnv) {
+        vmmHeapSize = ParseSizeString(vmmHeapSizeEnv);
       }
 
-      vmmHeapSize = std::stoull(vmmHeapSizeStr) * vmmMultiplier;
-    }
+      MORI_SHMEM_INFO(
+          "Initializing VMM-based dynamic heap: virtual size {} bytes ({} MB), chunk size {} bytes "
+          "({} KB)",
+          vmmHeapSize, vmmHeapSize / (1024 * 1024), chunkSize, chunkSize / 1024);
 
-    MORI_SHMEM_INFO(
-        "Initializing VMM-based dynamic heap: virtual size {} bytes ({} MB), chunk size {} bytes "
-        "({} KB)",
-        vmmHeapSize, vmmHeapSize / (1024 * 1024), chunkSize, chunkSize / 1024);
+      bool vmmSuccess = states->memoryStates->symmMemMgr->InitializeVMMHeap(vmmHeapSize, chunkSize);
+      if (vmmSuccess) {
+        states->memoryStates->useVMMHeap = true;
+        states->memoryStates->vmmHeapInitialized = true;
+        states->memoryStates->vmmHeapVirtualSize = vmmHeapSize;
+        states->memoryStates->vmmHeapChunkSize = chunkSize;
+        states->memoryStates->vmmHeapObj = states->memoryStates->symmMemMgr->GetVMMHeapObj();
+        states->memoryStates->vmmHeapBaseAddr = states->memoryStates->vmmHeapObj.cpu->localPtr;
 
-    bool vmmSuccess = states->memoryStates->symmMemMgr->InitializeVMMHeap(vmmHeapSize, chunkSize);
-    if (vmmSuccess) {
-      states->memoryStates->useVMMHeap = true;
-      states->memoryStates->vmmHeapInitialized = true;
-      states->memoryStates->vmmHeapVirtualSize = vmmHeapSize;
-      states->memoryStates->vmmHeapChunkSize = chunkSize;
-      states->memoryStates->vmmHeapObj = states->memoryStates->symmMemMgr->GetVMMHeapObj();
-      states->memoryStates->vmmHeapBaseAddr = states->memoryStates->vmmHeapObj.cpu->localPtr;
-
-      MORI_SHMEM_INFO("VMM-based dynamic heap initialized successfully");
-      return;
+        MORI_SHMEM_INFO("VMM-based dynamic heap initialized successfully");
+        return;
+      } else {
+        states->mode = ShmemMode::StaticHeap;
+        MORI_SHMEM_WARN("Failed to initialize VMM heap, falling back to static heap");
+      }
     } else {
-      MORI_SHMEM_WARN("Failed to initialize VMM heap, falling back to static heap");
+      states->mode = ShmemMode::StaticHeap;
+      MORI_SHMEM_WARN("VMM not supported (ROCm: {}, Hardware: {}), falling back to static heap",
+                      rocmSupportsVMM, hardwareSupportsVMM);
     }
-  } else {
-    MORI_SHMEM_INFO("VMM not supported or disabled, using static heap");
   }
 
-  // Fallback to static heap allocation
+  // StaticHeap mode or fallback from VMHeap mode
+  MORI_SHMEM_INFO("Allocating static symmetric heap");
+
   // Configure heap size
-  const char* heapSizeEnv = std::getenv("MORI_SHMEM_STATIC_HEAP_SIZE");
+  const char* heapSizeEnv = std::getenv("MORI_SHMEM_HEAP_SIZE");
   size_t heapSize = DEFAULT_STATIC_SYMMETRIC_HEAP_SIZE;
 
   if (heapSizeEnv) {
-    std::string heapSizeStr(heapSizeEnv);
-    size_t multiplier = 1;
-
-    // Check for suffix
-    if (!heapSizeStr.empty()) {
-      char lastChar = heapSizeStr.back();
-      if (lastChar == 'G' || lastChar == 'g') {
-        multiplier = 1024ULL * 1024ULL * 1024ULL;  // GiB
-        heapSizeStr.pop_back();
-      } else if (lastChar == 'M' || lastChar == 'm') {
-        multiplier = 1024ULL * 1024ULL;  // MiB
-        heapSizeStr.pop_back();
-      }
-    }
-
-    heapSize = std::stoull(heapSizeStr) * multiplier;
+    heapSize = ParseSizeString(heapSizeEnv);
   }
+
   MORI_SHMEM_INFO("Allocating static symmetric heap of size {} bytes ({} MB)", heapSize,
                   heapSize / (1024 * 1024));
 
-  // Allocate the symmetric heap using the SymmMemManager
+  // Allocate the symmetric heap
   void* staticHeapPtr = nullptr;
   HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&staticHeapPtr, heapSize, hipDeviceMallocUncached));
   HIP_RUNTIME_CHECK(hipMemset(staticHeapPtr, 0, heapSize));
@@ -281,7 +239,6 @@ void MemoryStatesInit() {
   MORI_SHMEM_INFO(
       "Static symmetric heap allocated at {} (local), size {} bytes, initial offset {} bytes",
       states->memoryStates->staticHeapBasePtr, heapSize, HEAP_INITIAL_OFFSET);
-
 }
 
 void GpuStateInit() {
@@ -318,29 +275,6 @@ void GpuStateInit() {
     HIP_RUNTIME_CHECK(hipMemset(gpuStates.endpointLock, 0, lockSize));
   }
 
-
-  // Copy static symmetric heap info to GPU (only in StaticHeap mode)
-  if (states->mode == ShmemMode::StaticHeap) {
-    uintptr_t heapBase = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
-    gpuStates.heapBaseAddr = heapBase;
-    gpuStates.heapEndAddr = heapBase + states->memoryStates->staticHeapSize;
-
-    // Use the GPU-side SymmMemObj pointer that was already allocated and initialized
-    // by RegisterSymmMemObj (which properly set up peerPtrs and peerRkeys on GPU)
-    gpuStates.heapObj = states->memoryStates->staticHeapObj.gpu;
-
-    MORI_SHMEM_INFO(
-        "Heap info copied to GPU: base=0x{:x}, end=0x{:x}, size={} bytes, heapObj=0x{:x}",
-        gpuStates.heapBaseAddr, gpuStates.heapEndAddr,
-        gpuStates.heapEndAddr - gpuStates.heapBaseAddr,
-        reinterpret_cast<uintptr_t>(gpuStates.heapObj));
-  } else {
-    // In isolation mode, no heap info needed
-    gpuStates.heapBaseAddr = 0;
-    gpuStates.heapEndAddr = 0;
-    gpuStates.heapObj = nullptr;
-  }
-
   // Copy gpu states to device memory (using hipGetSymbolAddress + hipMemcpy)
   GpuStates* globalGpuStatesAddr = nullptr;
   HIP_RUNTIME_CHECK(hipGetSymbolAddress(reinterpret_cast<void**>(&globalGpuStatesAddr),
@@ -349,27 +283,44 @@ void GpuStateInit() {
   MORI_SHMEM_INFO("globalGpuStates device address: 0x{:x}",
                   reinterpret_cast<uintptr_t>(globalGpuStatesAddr));
 
-
   // Copy symmetric heap info to GPU
   gpuStates.useVMMHeap = states->memoryStates->useVMMHeap;
 
-  if (states->memoryStates->useVMMHeap) {
+  if (states->mode == ShmemMode::Isolation) {
+    // In isolation mode, no heap info needed
+    gpuStates.heapBaseAddr = 0;
+    gpuStates.heapEndAddr = 0;
+    gpuStates.heapObj = nullptr;
+    MORI_SHMEM_INFO("Isolation mode: no heap info copied to GPU");
+  } else if (states->memoryStates->useVMMHeap && states->memoryStates->vmmHeapInitialized) {
+    // VMM heap mode
     uintptr_t heapBase = reinterpret_cast<uintptr_t>(states->memoryStates->vmmHeapBaseAddr);
     gpuStates.heapBaseAddr = heapBase;
     gpuStates.heapEndAddr = heapBase + states->memoryStates->vmmHeapVirtualSize;
     gpuStates.heapObj = states->memoryStates->vmmHeapObj.gpu;
-  } else {
-    // Traditional static heap
+    MORI_SHMEM_INFO(
+        "VMM heap info copied to GPU: base=0x{:x}, end=0x{:x}, size={} bytes, heapObj=0x{:x}",
+        gpuStates.heapBaseAddr, gpuStates.heapEndAddr,
+        gpuStates.heapEndAddr - gpuStates.heapBaseAddr,
+        reinterpret_cast<uintptr_t>(gpuStates.heapObj));
+  } else if (states->memoryStates->staticHeapObj.IsValid()) {
+    // Static heap mode (or fallback from VMM)
     uintptr_t heapBase = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
     gpuStates.heapBaseAddr = heapBase;
     gpuStates.heapEndAddr = heapBase + states->memoryStates->staticHeapSize;
     gpuStates.heapObj = states->memoryStates->staticHeapObj.gpu;
+    MORI_SHMEM_INFO(
+        "Static heap info copied to GPU: base=0x{:x}, end=0x{:x}, size={} bytes, heapObj=0x{:x}",
+        gpuStates.heapBaseAddr, gpuStates.heapEndAddr,
+        gpuStates.heapEndAddr - gpuStates.heapBaseAddr,
+        reinterpret_cast<uintptr_t>(gpuStates.heapObj));
+  } else {
+    // No heap allocated (shouldn't happen in normal flow)
+    gpuStates.heapBaseAddr = 0;
+    gpuStates.heapEndAddr = 0;
+    gpuStates.heapObj = nullptr;
+    MORI_SHMEM_WARN("No valid heap found, GPU heap info set to null");
   }
-
-  MORI_SHMEM_INFO("Heap info copied to GPU: base=0x{:x}, end=0x{:x}, size={} bytes, heapObj=0x{:x}",
-                  gpuStates.heapBaseAddr, gpuStates.heapEndAddr,
-                  gpuStates.heapEndAddr - gpuStates.heapBaseAddr,
-                  reinterpret_cast<uintptr_t>(gpuStates.heapObj));
 
   // Copy gpu states to constant memory
 
@@ -393,6 +344,9 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
     } else if (modeStr == "static_heap" || modeStr == "STATIC_HEAP") {
       states->mode = ShmemMode::StaticHeap;
       MORI_SHMEM_INFO("Running in static heap mode");
+    } else if (modeStr == "vmm_heap" || modeStr == "VMM_HEAP") {
+      states->mode = ShmemMode::VMHeap;
+      MORI_SHMEM_INFO("Running in VMM heap mode");
     } else {
       MORI_SHMEM_WARN("Unknown MORI_SHMEM_MODE '{}', defaulting to static_heap", modeStr);
       states->mode = ShmemMode::StaticHeap;
@@ -423,36 +377,40 @@ int ShmemFinalize() {
   HIP_RUNTIME_CHECK(hipFree(globalGpuStates.transportTypes));
   HIP_RUNTIME_CHECK(hipFree(globalGpuStates.rdmaEndpoints));
 
-  // Free the static symmetric heap through SymmMemManager (only in StaticHeap mode)
-  if (states->mode == ShmemMode::StaticHeap && states->memoryStates->staticHeapObj.IsValid()) {
-    states->memoryStates->symmMemMgr->Free(states->memoryStates->staticHeapBasePtr);
+  // Clean up heap based on what was actually allocated
+  if (states->mode != ShmemMode::Isolation) {
+    if (states->memoryStates->useVMMHeap && states->memoryStates->vmmHeapInitialized) {
+      // Clean up VMM heap
+      MORI_SHMEM_INFO("Finalizing VMM heap");
+      states->memoryStates->symmMemMgr->FinalizeVMMHeap();
+    } else if (states->memoryStates->staticHeapObj.IsValid()) {
+      // Clean up static heap
+      MORI_SHMEM_INFO("Finalizing static heap");
 
-  // Clean up heap (VMM or static)
-  if (states->memoryStates->useVMMHeap && states->memoryStates->vmmHeapInitialized) {
-    // Finalize VMM heap
-    states->memoryStates->symmMemMgr->FinalizeVMMHeap();
-  } else if (states->memoryStates->staticHeapObj.IsValid()) {
-    free(states->memoryStates->staticHeapObj.cpu->peerPtrs);
-    free(states->memoryStates->staticHeapObj.cpu->peerRkeys);
-    free(states->memoryStates->staticHeapObj.cpu->ipcMemHandles);
-    
-    // Deregister RDMA memory region
-    application::RdmaDeviceContext* rdmaDeviceContext = 
-        states->rdmaStates->commContext->GetRdmaDeviceContext();
-    if (rdmaDeviceContext) {
-      rdmaDeviceContext->DeregisterRdmaMemoryRegion(states->memoryStates->staticHeapBasePtr);
+      // Free CPU-side metadata
+      free(states->memoryStates->staticHeapObj.cpu->peerPtrs);
+      free(states->memoryStates->staticHeapObj.cpu->peerRkeys);
+      free(states->memoryStates->staticHeapObj.cpu->ipcMemHandles);
+
+      // Deregister RDMA memory region
+      application::RdmaDeviceContext* rdmaDeviceContext =
+          states->rdmaStates->commContext->GetRdmaDeviceContext();
+      if (rdmaDeviceContext) {
+        rdmaDeviceContext->DeregisterRdmaMemoryRegion(states->memoryStates->staticHeapBasePtr);
+      }
+
+      free(states->memoryStates->staticHeapObj.cpu);
+
+      // Clean up GPU side metadata
+      HIP_RUNTIME_CHECK(hipFree(states->memoryStates->staticHeapObj.gpu->peerPtrs));
+      HIP_RUNTIME_CHECK(hipFree(states->memoryStates->staticHeapObj.gpu->peerRkeys));
+      HIP_RUNTIME_CHECK(hipFree(states->memoryStates->staticHeapObj.gpu));
+
+      // Free the actual heap memory
+      HIP_RUNTIME_CHECK(hipFree(states->memoryStates->staticHeapBasePtr));
     }
-    
-    free(states->memoryStates->staticHeapObj.cpu);
-    
-    // Clean up GPU side
-    HIP_RUNTIME_CHECK(hipFree(states->memoryStates->staticHeapObj.gpu->peerPtrs));
-    HIP_RUNTIME_CHECK(hipFree(states->memoryStates->staticHeapObj.gpu->peerRkeys));
-    HIP_RUNTIME_CHECK(hipFree(states->memoryStates->staticHeapObj.gpu));
-    
-    // Free the actual heap memory
-    HIP_RUNTIME_CHECK(hipFree(states->memoryStates->staticHeapBasePtr));
-
+  } else {
+    MORI_SHMEM_INFO("Isolation mode: no heap to finalize");
   }
 
   delete states->memoryStates->symmMemMgr;

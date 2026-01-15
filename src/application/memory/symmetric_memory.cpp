@@ -27,13 +27,10 @@
 #include "hip/hip_runtime.h"
 #include "mori/application/bootstrap/local_bootstrap.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
+#include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/core/core.hpp"
-<<<<<<< HEAD
-#include "mori/application/transport/sdma/anvil.hpp"
-=======
 #include "mori/utils/mori_log.hpp"
->>>>>>> jiahzhou/shmem_remaining_api
 
 namespace mori {
 
@@ -64,7 +61,7 @@ void SymmMemManager::HostFree(void* localPtr) {
 SymmMemObjPtr SymmMemManager::Malloc(size_t size) {
   void* ptr = nullptr;
   HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&ptr, size, hipDeviceMallocUncached));
-  //HIP_RUNTIME_CHECK(hipMalloc(&ptr, size));
+  // HIP_RUNTIME_CHECK(hipMalloc(&ptr, size));
   HIP_RUNTIME_CHECK(hipMemset(ptr, 0, size));
   return RegisterSymmMemObj(ptr, size);
 }
@@ -101,14 +98,16 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
   bootNet.Allgather(&handle, cpuMemObj->ipcMemHandles, sizeof(hipIpcMemHandle_t));
   for (int i = 0; i < worldSize; i++) {
-    if ((context.GetTransportType(i) != TransportType::P2P) && (context.GetTransportType(i) != TransportType::SDMA) ) continue;
+    if ((context.GetTransportType(i) != TransportType::P2P) &&
+        (context.GetTransportType(i) != TransportType::SDMA))
+      continue;
     if (i == rank) continue;
 
     HIP_RUNTIME_CHECK(hipIpcOpenMemHandle(reinterpret_cast<void**>(&cpuMemObj->peerPtrs[i]),
                                           cpuMemObj->ipcMemHandles[i],
                                           hipIpcMemLazyEnablePeerAccess));
   }
- 
+
   // Rdma context: set lkey and exchange rkeys
   cpuMemObj->peerRkeys = static_cast<uint32_t*>(calloc(worldSize, sizeof(uint32_t)));
   cpuMemObj->peerRkeys[rank] = 0;
@@ -133,35 +132,35 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerRkeys, cpuMemObj->peerRkeys,
                               sizeof(uint32_t) * worldSize, hipMemcpyHostToDevice));
 
-<<<<<<< HEAD
   std::vector<int> dstDeviceIds;
   for (int i = 0; i < worldSize; i++) {
     if (context.GetTransportType(i) != TransportType::SDMA) continue;
     if (i == rank) continue;
-    dstDeviceIds.push_back(i%8); // should be intra devices count
+    dstDeviceIds.push_back(i % 8);  // should be intra devices count
   }
-  if(dstDeviceIds.size() != 0) {
-    int srcDeviceId = rank%8;
+  if (dstDeviceIds.size() != 0) {
+    int srcDeviceId = rank % 8;
     int numOfQueuesPerDevice = gpuMemObj->sdmaNumQueue;  // all sdma queues are inited
-    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->deviceHandles_d, dstDeviceIds.size()* numOfQueuesPerDevice* sizeof(anvil::SdmaQueueDeviceHandle*)));
+    HIP_RUNTIME_CHECK(hipMalloc(
+        &gpuMemObj->deviceHandles_d,
+        dstDeviceIds.size() * numOfQueuesPerDevice * sizeof(anvil::SdmaQueueDeviceHandle*)));
 
-    for (auto& dstDeviceId : dstDeviceIds)
-    { 
-      for (size_t q = 0; q <numOfQueuesPerDevice; q++)
-        {
-          gpuMemObj->deviceHandles_d[dstDeviceId*numOfQueuesPerDevice + q] = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
-        }
+    for (auto& dstDeviceId : dstDeviceIds) {
+      for (size_t q = 0; q < numOfQueuesPerDevice; q++) {
+        gpuMemObj->deviceHandles_d[dstDeviceId * numOfQueuesPerDevice + q] =
+            anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
+      }
     }
 
-    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->signalPtrs, sizeof(HSAuint64) * dstDeviceIds.size()* numOfQueuesPerDevice));
-    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->signalPtrs, 0, sizeof(HSAuint64) * dstDeviceIds.size()* numOfQueuesPerDevice));
-    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->expectSignalsPtr, sizeof(HSAuint64) * dstDeviceIds.size()* numOfQueuesPerDevice));
-    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->expectSignalsPtr, 0, sizeof(HSAuint64) * dstDeviceIds.size()* numOfQueuesPerDevice));
-
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->signalPtrs,
+                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
+    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->signalPtrs, 0,
+                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->expectSignalsPtr,
+                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
+    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->expectSignalsPtr, 0,
+                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
   }
-  memObjPool.insert({localPtr, SymmMemObjPtr{cpuMemObj, gpuMemObj}});
-  return memObjPool.at(localPtr);
-=======
   SymmMemObjPtr result{cpuMemObj, gpuMemObj};
   if (!heap_begin) {
     memObjPool.insert({localPtr, result});
@@ -169,7 +168,6 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   } else {
     return result;
   }
->>>>>>> jiahzhou/shmem_remaining_api
 }
 
 void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
@@ -217,10 +215,7 @@ SymmMemObjPtr SymmMemManager::HeapRegisterSymmMemObj(void* localPtr, size_t size
   cpuMemObj->peerRkeys = static_cast<uint32_t*>(calloc(worldSize, sizeof(uint32_t)));
   memcpy(cpuMemObj->peerRkeys, heapObj->cpu->peerRkeys, sizeof(uint32_t) * worldSize);
   cpuMemObj->lkey = heapObj->cpu->lkey;
-<<<<<<< HEAD
   cpuMemObj->sdmaNumQueue = heapObj->cpu->sdmaNumQueue;
-=======
->>>>>>> jiahzhou/shmem_remaining_api
 
   SymmMemObj* gpuMemObj;
   HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj, sizeof(SymmMemObj)));
@@ -234,7 +229,6 @@ SymmMemObjPtr SymmMemManager::HeapRegisterSymmMemObj(void* localPtr, size_t size
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerRkeys, cpuMemObj->peerRkeys,
                               sizeof(uint32_t) * worldSize, hipMemcpyHostToDevice));
 
-<<<<<<< HEAD
   // Copy SDMA resources from heap object (shared across all heap allocations)
   if (heapObj->gpu->deviceHandles_d != nullptr) {
     std::vector<int> dstDeviceIds;
@@ -252,8 +246,6 @@ SymmMemObjPtr SymmMemManager::HeapRegisterSymmMemObj(void* localPtr, size_t size
     }
   }
 
-=======
->>>>>>> jiahzhou/shmem_remaining_api
   memObjPool.insert({localPtr, SymmMemObjPtr{cpuMemObj, gpuMemObj}});
   return memObjPool.at(localPtr);
 }
@@ -282,16 +274,14 @@ SymmMemObjPtr SymmMemManager::Get(void* localPtr) const {
 
 // VMM-based symmetric memory management implementation
 bool SymmMemManager::IsVMMSupported() const {
-  int vmm = 0;
   int currentDev = 0;
-  hipError_t result = hipGetDevice(&currentDev);
-  if (result != hipSuccess) {
-    return false;  // Cannot get current device
+  if (hipGetDevice(&currentDev) != hipSuccess) {
+    return false;
   }
 
-  result =
-      hipDeviceGetAttribute(&vmm, hipDeviceAttributeVirtualMemoryManagementSupported, currentDev);
-  return (result == hipSuccess && vmm != 0);
+  int vmm = 0;
+  return (hipDeviceGetAttribute(&vmm, hipDeviceAttributeVirtualMemoryManagementSupported, 
+                                currentDev) == hipSuccess && vmm != 0);
 }
 
 bool SymmMemManager::InitializeVMMHeap(size_t virtualSize, size_t chunkSize) {
@@ -301,15 +291,10 @@ bool SymmMemManager::InitializeVMMHeap(size_t virtualSize, size_t chunkSize) {
     return true;  // Already initialized
   }
 
-  if (!IsVMMSupported()) {
-    return false;  // VMM not supported
-  }
-
   // Determine optimal chunk size if not provided
   if (chunkSize == 0) {
     int currentDev = 0;
-    hipError_t result = hipGetDevice(&currentDev);
-    if (result != hipSuccess) {
+    if (hipGetDevice(&currentDev) != hipSuccess) {
       return false;
     }
 
@@ -318,34 +303,41 @@ bool SymmMemManager::InitializeVMMHeap(size_t virtualSize, size_t chunkSize) {
     allocProp.location.type = hipMemLocationTypeDevice;
     allocProp.location.id = currentDev;
 
+    // Try to get recommended granularity first
     size_t granularity = 0;
-    result = hipMemGetAllocationGranularity(&granularity, &allocProp,
-                                            hipMemAllocationGranularityRecommended);
+    hipError_t result = hipMemGetAllocationGranularity(&granularity, &allocProp,
+                                                        hipMemAllocationGranularityRecommended);
     if (result == hipSuccess && granularity > 0) {
-      chunkSize = granularity;
+      // Use the larger of recommended granularity and default minimum
+      chunkSize = std::max(granularity, DEFAULT_VMM_MIN_CHUNK_SIZE);
+      
+      // Get minimum granularity for vmmMinChunkSize
       size_t minGranularity = 0;
-      result = hipMemGetAllocationGranularity(&minGranularity, &allocProp,
-                                              hipMemAllocationGranularityMinimum);
-      if (result == hipSuccess && minGranularity > 0) {
+      if (hipMemGetAllocationGranularity(&minGranularity, &allocProp,
+                                         hipMemAllocationGranularityMinimum) == hipSuccess &&
+          minGranularity > 0) {
         vmmMinChunkSize = minGranularity;
       } else {
-        vmmMinChunkSize = 4 * 1024;
+        vmmMinChunkSize = 4 * 1024;  // 4KB fallback
       }
     } else {
-      // Fallback to minimal granularity if recommended fails
-      result = hipMemGetAllocationGranularity(&granularity, &allocProp,
-                                              hipMemAllocationGranularityMinimum);
-      if (result == hipSuccess && granularity > 0) {
-        chunkSize = granularity;
+      // Fallback: try to get minimal granularity if recommended fails
+      if (hipMemGetAllocationGranularity(&granularity, &allocProp,
+                                         hipMemAllocationGranularityMinimum) == hipSuccess &&
+          granularity > 0) {
+        chunkSize = std::max(granularity, DEFAULT_VMM_MIN_CHUNK_SIZE);
         vmmMinChunkSize = granularity;
       } else {
-        // Final fallback to 2MB
-        chunkSize = 2 * 1024 * 1024;
-        vmmMinChunkSize = 4 * 1024;
+        // Final fallback: use default minimum
+        chunkSize = DEFAULT_VMM_MIN_CHUNK_SIZE;
+        vmmMinChunkSize = 4 * 1024;  // 4KB fallback
       }
     }
+  } else {
+    // User provided chunk size, ensure it's not too small
+    chunkSize = std::max(chunkSize, DEFAULT_VMM_MIN_CHUNK_SIZE);
   }
-
+  
   int worldSize = bootNet.GetWorldSize();
   int myPe = bootNet.GetLocalRank();
 
@@ -443,8 +435,8 @@ bool SymmMemManager::InitializeVMMHeap(size_t virtualSize, size_t chunkSize) {
   HIP_RUNTIME_CHECK(hipMemcpy(gpuHeapObj->peerRkeys, cpuHeapObj->peerRkeys,
                               sizeof(uint32_t) * worldSize * vmmMaxChunks, hipMemcpyHostToDevice));
   HIP_RUNTIME_CHECK(hipMalloc(&gpuHeapObj->lkey, sizeof(uint32_t) * vmmMaxChunks));
-  HIP_RUNTIME_CHECK(hipMemcpy(gpuHeapObj->lkey, cpuHeapObj->lkey,
-                              sizeof(uint32_t) * vmmMaxChunks, hipMemcpyHostToDevice));
+  HIP_RUNTIME_CHECK(hipMemcpy(gpuHeapObj->lkey, cpuHeapObj->lkey, sizeof(uint32_t) * vmmMaxChunks,
+                              hipMemcpyHostToDevice));
 
   // Store the VMM heap object
   vmmHeapObj = SymmMemObjPtr{cpuHeapObj, gpuHeapObj};
