@@ -259,7 +259,12 @@ int ShmemMpiInit(MPI_Comm mpiComm) {
 }
 
 int ShmemTorchProcessGroupInit(const std::string& groupName) {
+#ifdef MORI_ENABLE_TORCH
   return ShmemInit(new application::TorchBootstrapNetwork(groupName));
+#else
+  MORI_SHMEM_ERROR("TorchBootstrapNetwork is not available!");
+  return -1;
+#endif
 }
 
 int ShmemMyPe() {

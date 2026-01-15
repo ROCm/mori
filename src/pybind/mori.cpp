@@ -25,7 +25,6 @@
 
 #include "src/pybind/mori.hpp"
 
-// #define MORI_ENABLE_TORCH
 #ifdef MORI_ENABLE_TORCH
 #include <ATen/hip/HIPContext.h>
 #endif

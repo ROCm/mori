@@ -6,6 +6,8 @@ from jax.experimental.shard_map import shard_map
 from jax._src import xla_bridge as xb
 import numpy as np
 
+from jax.experimental import multihost_utils
+
 import random
 import mori
 import argparse, os, time, functools
@@ -22,20 +24,9 @@ def init_distributed():
       coordinator_address=args.coordination_service or "localhost:12345",
       num_processes=args.world_size,
       process_id=args.rank)
-  print(f"[rank {args.rank}] devices = {jax.local_devices()}")
-  
-#   Z = xb.backends()["rocm"]
-#   print(f"xla backend {Z} -- {dir(Z)}")
-#   if args.rank == 0:
-#     unique_id = np.arange(100)
-#   else:
-#     unique_id = None
-#   unique_id = multihost_utils.broadcast_one_to_all(unique_id)
- 
-#   print(f"{args.rank} --- id: {unique_id}")
+  print(f"[rank {args.rank}] local_dev: {jax.local_devices()}")
   
   return (args.rank, args.world_size)
-
 
 class EpDispatchCombineTestCase:
     def __init__(self, rank, world_size, dtype=jnp.bfloat16):
@@ -285,4 +276,3 @@ def test_dispatch_combine(rank, world_size):
 if __name__ == "__main__":
     world_config = init_distributed()
     test_dispatch_combine(*world_config)
-    

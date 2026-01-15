@@ -112,11 +112,10 @@ NumProcs=8
 TotalGpus=8
 
 #HIPLIB=/tf/clr/build/hipamd/lib/libamdhip64.so
-export LD_LIBRARY_PATH=/usr/rocm/lib:/usr/local/lib/python3.12/dist-packages/torch/lib
+#export LD_LIBRARY_PATH=/usr/rocm/lib:/usr/local/lib/python3.12/dist-packages/torch/lib
 
-#export LD_LIBRARY_PATH=torch_libs
 # this is go get rid of 'request to allocate mask for invalid number: Invalid argument'
-export LD_PRELOAD=/lib/x86_64-linux-gnu/libnuma.so.1:$HIPLIB:/opt/rocm/lib/libroctracer64.so
+#export LD_PRELOAD=/lib/x86_64-linux-gnu/libnuma.so.1:$HIPLIB:/opt/rocm/lib/libroctracer64.so
 # export MORI_SHMEM_MODE=ISOLATION
 export MORI_SHMEM_HEAP_SIZE=4G
 
