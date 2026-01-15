@@ -38,14 +38,17 @@ class EpDispatchCombineTestCase:
             data_type=dtype,
             rank=self.rank,
             world_size=self.world_size,
-            hidden_dim=434, #7168,
-            # scale_dim=32,
-            scale_dim=0,
+            hidden_dim=7168,
+            #hidden_dim=434,
+            scale_dim=32,
+            #scale_dim=0,
             scale_type_size=jnp.dtype(self.jax_scale_dtype).itemsize,
             max_token_type_size=jnp.dtype(jnp.float32).itemsize,
-            max_num_inp_token_per_rank=111, #4096,
-            num_experts_per_rank=5, #32,
-            num_experts_per_token=13,
+            max_num_inp_token_per_rank=4096,
+            #max_num_inp_token_per_rank=111,
+            num_experts_per_rank=32,
+            #num_experts_per_rank=5,
+            num_experts_per_token=56, # must be < warp_size
             use_external_inp_buf=True, # we need extra copy for external buf
             kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode,
             gpu_per_node=1,
@@ -187,18 +190,19 @@ class EpDispatchCombineTestCase:
           Y = base_list[src_pos]
           N = Y.shape[0]
           mask = jnp.arange(N) < num
-          mask = mask[:,None]  # expand to [N,?]
-          x = jnp.all((Y == base_out) | (~mask))
+          mask2D = mask[:,None]  # expand to [N,?]
+          x = jnp.all((Y == base_out) | (~mask2D))
           for (x_list, x_out) in args:
             if x_out != None:
-              x = x & jnp.all((x_list[src_pos] == x_out) | (~mask))
+              x = x & jnp.all((x_list[src_pos] == x_out) | (~mask2D))
           # we make an assumption that maxv does not collide with src_pos
+          # checking that src_pos[:N] contains only unique values
           maxv = jnp.iinfo(src_pos.dtype).max
           S_masked = jnp.where(mask, src_pos, maxv)
           S_sorted = jnp.sort(S_masked)
           eq_adjacent = S_sorted[1:] == S_sorted[:-1]
           valid = (S_sorted[1:] != maxv) & (S_sorted[:-1] != maxv)
-          #x = x & ~jnp.any(eq_adjacent & valid)
+          x = x & ~jnp.any(eq_adjacent & valid)
           return x
       
         assert src_num_recv_token_pos.size == int(dispatch_recv_num_token)
@@ -215,26 +219,55 @@ class EpDispatchCombineTestCase:
         
         @jax.jit
         def validate_combine(combine_output, combine_weights, 
-                            inputs, weights, indices, num_experts_per_rank):
+                            inputs, weights, indices, num_experts_per_rank, num_tokens):
+            # NOTE: If `num_tokens` is truly a runtime (traced) value, you cannot slice to
+            # `[:num_tokens, :]` under `jit` because it would create a dynamic output shape.
+            # The standard pattern is: keep arrays padded to a fixed `max_tokens` and use a mask.
+            max_tokens = combine_output.shape[0]
+            mask_1d = jnp.arange(max_tokens) < num_tokens
+
+            def masked_allclose(a, b, mask, *, atol, rtol):
+                # `mask` is 1D over tokens; broadcast across remaining dims.
+                broad_mask = mask.reshape((mask.shape[0],) + (1,) * (a.ndim - 1))
+                diff = jnp.abs(a - b)
+                tol = atol + rtol * jnp.abs(b)
+                ok = diff <= tol
+                return jnp.all(ok | (~broad_mask))
+            
             pes = indices // num_experts_per_rank
             pes_sorted = jnp.sort(pes, axis=-1)
             unique_pes = 1 + jnp.sum(pes_sorted[:, 1:] != pes_sorted[:, :-1], axis=-1)
-        
-            expected_output = inputs.astype(self.config.data_type) * unique_pes[:, None]
-            expected_weight = weights * unique_pes[:, None]
             
-            ok_output = jnp.allclose(
+            Xinputs = inputs.astype(self.config.data_type) * unique_pes[:, None]
+            Xweights = weights * unique_pes[:, None]
+
+            # Pad `inputs/weights/indices` up to `max_tokens` so the validation is shape-stable.
+            # (This is only fully "runtime-num_tokens-jittable" if upstream already provides
+            # fixed-shape tensors; otherwise you'll still recompile when shapes change.)
+            inputs_buf = jnp.zeros((max_tokens, Xinputs.shape[1]), dtype=Xinputs.dtype)
+            inputs_buf = jax.lax.dynamic_update_slice(inputs_buf, Xinputs, (0, 0))
+
+            weights_buf = jnp.zeros((max_tokens, Xweights.shape[1]), dtype=Xweights.dtype)
+            weights_buf = jax.lax.dynamic_update_slice(weights_buf, Xweights, (0, 0))
+
+            expected_output = inputs_buf
+            expected_weight = weights_buf
+            
+            ok_output = masked_allclose(
                 combine_output.astype(jnp.float32),
                 expected_output.astype(jnp.float32),
+                mask_1d,
                 atol=1e-2, rtol=1e-2)
-            ok_weight = jnp.allclose(
-                combine_weights, expected_weight,
+            ok_weight = masked_allclose(
+                combine_weights,
+                expected_weight,
+                mask_1d,
                 atol=1e-5, rtol=1e-5)
             return ok_output & ok_weight
             
-        res = validate_combine(combine_output[:num_tokens,:], 
-                              combine_weights[:num_tokens,:], 
-                    inputs, weights, indices, self.config.num_experts_per_rank)
+        res = validate_combine(combine_output,
+                              combine_weights,
+                    inputs, weights, indices, self.config.num_experts_per_rank, num_tokens)
         assert res, f"{self.rank} validate_combine failed!"
         
         print(f"{self.rank} combine tokens ok", flush=True)

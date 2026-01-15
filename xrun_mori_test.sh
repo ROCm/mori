@@ -117,7 +117,7 @@ TotalGpus=8
 # this is go get rid of 'request to allocate mask for invalid number: Invalid argument'
 #export LD_PRELOAD=/lib/x86_64-linux-gnu/libnuma.so.1:$HIPLIB:/opt/rocm/lib/libroctracer64.so
 # export MORI_SHMEM_MODE=ISOLATION
-export MORI_SHMEM_HEAP_SIZE=4G
+export MORI_SHMEM_HEAP_SIZE=16G
 
 # install debug packages for more insights
 # apt install hip-runtime-amd-dbgsym hsa-rocr-dbgsym rocm-core-dbgsym rocprofiler-dbgsym rocprofiler-sdk-dbgsym
