@@ -59,7 +59,7 @@ __global__ void OneShotAllGatharSdmaKernel(int myPe, int npes,
   int warpId = threadLinearId / warpSize;
   const int laneId = threadIdx.x % warpSize;
 
-  if(threadLinearId < 64){
+  if(threadLinearId < npes*8){
     int qId = threadLinearId%8;
     int remotePe = threadLinearId/8;
     const size_t sendBytes_rand = bytesPerPeer/8;
@@ -70,13 +70,10 @@ __global__ void OneShotAllGatharSdmaKernel(int myPe, int npes,
     if( qId == 7) sendBytes = bytesPerPeer - 7*sendBytes_rand;
     else sendBytes = sendBytes_rand;
 
-    if(remotePe != myPe)
-        shmem::ShmemPutMemNbiThread(dstMemObj, destByteOffset, srcMemObj, srcByteOffset, sendBytes, remotePe, qId);
-    }
+    shmem::ShmemPutMemNbiThread(dstMemObj, destByteOffset, srcMemObj, srcByteOffset, sendBytes, remotePe, qId);
+  }
 
-  T* __restrict__ myPe_dst = dst + myPe*bytesPerPeer;
-  core::WarpCopy<T>(myPe_dst,src,elementCount);
-  if( threadLinearId < 8){
+  if(threadLinearId < npes){
     int remotePe = threadLinearId;
     shmem::ShmemQuietThread(remotePe,dstMemObj);
     shmem::ShmemAtomicSizeNonFetchThread(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8, core::atomicType::AMO_ADD,remotePe);
