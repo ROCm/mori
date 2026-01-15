@@ -59,9 +59,9 @@ __global__ void OneShotAllGatharSdmaKernel(int myPe, int npes,
   int warpId = threadLinearId / warpSize;
   const int laneId = threadIdx.x % warpSize;
 
-  if(threadLinearId < npes*8){
-    int qId = threadLinearId%8;
-    int remotePe = threadLinearId/8;
+  if(threadLinearId < npes * dstMemObj->sdmaNumQueue){
+    int qId = threadLinearId % dstMemObj->sdmaNumQueue;
+    int remotePe = threadLinearId / dstMemObj->sdmaNumQueue;
     const size_t sendBytes_rand = bytesPerPeer/8;
     size_t destByteOffset = myPe*bytesPerPeer + qId*sendBytes_rand;
     size_t srcByteOffset = qId*sendBytes_rand;
