@@ -28,6 +28,7 @@
 
 #include "mori/application/utils/check.hpp"
 #include "mori/collective/allgather/oneshot_sdma_kernel.hpp"
+#include "mori/collective/allgather/oneshot_sdma_async_kernel.hpp"
 #include "mori/shmem/shmem.hpp"
 
 using namespace mori::core;
@@ -118,7 +119,14 @@ void testOneShotSdmaAllGather() {
   // Launch AllGather kernel
   const int blockSize = 256;
   const int numBlocks = 1;
-  OneShotAllGatharSdmaKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
+  bool use_async = 1;
+  if(!use_async)
+    OneShotAllGatharSdmaKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
+  else{
+    OneShotAllGatharSdmaAsyncPutKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
+    OneShotAllGatharSdmaAsyncWaitKernel<<<numBlocks, blockSize>>>(myPe, npes,  outPutBuffObj, flagsBuffObj);
+  }
+
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
   MPI_Barrier(MPI_COMM_WORLD);

@@ -32,7 +32,7 @@ namespace collective {
 // One-shot all-reduce: single phase.
 // Every GPU reads the full buffer from all peers, accumulates locally, and writes the result.
 template <typename T>
-__global__ void OneShotAllGatharSdmaKernel(int myPe, int npes,
+__global__ void OneShotAllGatharSdmaAsyncPutKernel(int myPe, int npes,
                                        const application::SymmMemObjPtr srcMemObj,
                                        const application::SymmMemObjPtr dstMemObj,
                                        const application::SymmMemObjPtr flagsMemObj,
@@ -44,7 +44,6 @@ __global__ void OneShotAllGatharSdmaKernel(int myPe, int npes,
   T* __restrict__ src = reinterpret_cast<T*>(srcMemObj->localPtr);
   T* __restrict__ dst = reinterpret_cast<T*>(dstMemObj->localPtr);
   uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
-  int flag_val = 1;
 
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
@@ -71,6 +70,13 @@ __global__ void OneShotAllGatharSdmaKernel(int myPe, int npes,
 
     shmem::ShmemPutMemNbiThread(dstMemObj, destByteOffset, srcMemObj, srcByteOffset, sendBytes, remotePe, qId);
   }
+}
+
+__global__ void OneShotAllGatharSdmaAsyncWaitKernel(int myPe, int npes,
+                                        const application::SymmMemObjPtr dstMemObj,
+                                        const application::SymmMemObjPtr flagsMemObj) {
+  int flag_val = 1;
+  const size_t threadLinearId = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
 
   if(threadLinearId < npes){
     int remotePe = threadLinearId;
