@@ -76,6 +76,8 @@ __global__ void OneShotAllGatharSdmaAsyncWaitKernel(int myPe, int npes,
                                         const application::SymmMemObjPtr dstMemObj,
                                         const application::SymmMemObjPtr flagsMemObj) {
   int flag_val = 1;
+  uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
+
   const size_t threadLinearId = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
 
   if(threadLinearId < npes){
