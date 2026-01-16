@@ -93,7 +93,16 @@ void* ShmemMalloc(size_t size) {
                      states->memoryStates->staticHeapUsed, states->memoryStates->staticHeapSize);
 
     return ptr;
-  } else {
+  } else if (states->mode == ShmemMode::VMHeap) {
+    // VMM heap mode: use VMM-based allocation
+    application::SymmMemObjPtr obj = states->memoryStates->symmMemMgr->VMMAllocChunk(size);
+    MORI_SHMEM_TRACE("Allocated shared memory of size {} in VMM heap mode", size);
+    if (obj.IsValid()) {
+      return obj.cpu->localPtr;
+    }
+    return nullptr;
+  }
+  else {
     // Isolation mode: each allocation gets its own SymmMemObj
     application::SymmMemObjPtr obj = states->memoryStates->symmMemMgr->Malloc(size);
     MORI_SHMEM_TRACE("Allocated shared memory of size {} in isolation mode", size);

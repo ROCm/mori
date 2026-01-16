@@ -108,6 +108,9 @@ uintptr_t VMMVAManager::Allocate(size_t size, size_t alignment) {
       // Create a small free block for the alignment waste
       VABlock wasteBlock(block.startAddr, alignmentWaste, true);
       
+      // Calculate the size after removing waste
+      size_t adjustedSize = block.size - alignmentWaste;
+      
       // Remove old end address mapping
       endAddrToStartAddr_.erase(block.startAddr + block.size);
       
@@ -115,23 +118,41 @@ uintptr_t VMMVAManager::Allocate(size_t size, size_t alignment) {
       blocks_[wasteBlock.startAddr] = wasteBlock;
       endAddrToStartAddr_[wasteBlock.startAddr + wasteBlock.size] = wasteBlock.startAddr;
       
-      // Update the current block
-      block.startAddr = allocAddr;
-      block.size -= alignmentWaste;
-      
-      // Update blocks_ map with new key
+      // Remove the old block (iterator will be invalidated, but we don't use it anymore)
       blocks_.erase(it);
-      blocks_[block.startAddr] = block;
       
-      // Update iterator to point to the adjusted block
-      it = blocks_.find(block.startAddr);
-      if (it == blocks_.end()) {
-        MORI_APP_ERROR("VMMVAManager::Allocate internal error after alignment adjustment");
-        return 0;
+      // Now allocate directly from the adjusted block
+      // Case 1: Exact fit after adjustment
+      if (adjustedSize == alignedSize) {
+        VABlock allocBlock(allocAddr, alignedSize, false);
+        blocks_[allocAddr] = allocBlock;
+        endAddrToStartAddr_[allocAddr + alignedSize] = allocAddr;
+        
+        MORI_APP_TRACE("VMMVAManager::Allocate exact fit after alignment at {:p}, size={}", 
+                       reinterpret_cast<void*>(allocAddr), alignedSize);
+        return allocAddr;
       }
+      
+      // Case 2: Split after adjustment
+      size_t remainingSize = adjustedSize - alignedSize;
+      
+      // Create allocated block
+      VABlock allocBlock(allocAddr, alignedSize, false);
+      blocks_[allocAddr] = allocBlock;
+      endAddrToStartAddr_[allocAddr + alignedSize] = allocAddr;
+      
+      // Create remaining free block
+      uintptr_t remainingAddr = allocAddr + alignedSize;
+      VABlock remainingBlock(remainingAddr, remainingSize, true);
+      blocks_[remainingAddr] = remainingBlock;
+      endAddrToStartAddr_[remainingAddr + remainingSize] = remainingAddr;
+      
+      MORI_APP_TRACE("VMMVAManager::Allocate split after alignment at {:p}, allocated={}, remaining={}", 
+                     reinterpret_cast<void*>(allocAddr), alignedSize, remainingSize);
+      return allocAddr;
     }
     
-    // Now allocate from the (possibly adjusted) block
+    // No alignment waste, allocate directly from the current block
     VABlock& currentBlock = it->second;
     
     // Case 1: Exact fit

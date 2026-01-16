@@ -74,6 +74,13 @@ void LocalBootstrapNetwork::Finalize() {
     }
   }
   
+  // Clean up barrier files
+  std::string arriveFile = socketBasePath_ + "barrier_arrive_" + std::to_string(localRank);
+  unlink(arriveFile.c_str());
+  
+  std::string departFile = socketBasePath_ + "barrier_depart_" + std::to_string(localRank);
+  unlink(departFile.c_str());
+  
   initialized_ = false;
 }
 
@@ -90,42 +97,83 @@ void LocalBootstrapNetwork::AllToAll(void* sendbuf, void* recvbuf, size_t sendco
   throw std::runtime_error("LocalBootstrapNetwork::AllToAll not implemented");
 }
 
-void LocalBootstrapNetwork::Barrier() {  
-  std::string barrierPath = socketBasePath_ + "barrier_" + std::to_string(localRank);
+void LocalBootstrapNetwork::Barrier() {
+  // Two-phase barrier to avoid race conditions
   
-  // Create barrier file
-  int fd = open(barrierPath.c_str(), O_CREAT | O_WRONLY, 0666);
+  // Phase 1: All processes arrive
+  std::string arriveFile = socketBasePath_ + "barrier_arrive_" + std::to_string(localRank);
+  int fd = open(arriveFile.c_str(), O_CREAT | O_WRONLY, 0666);
   if (fd >= 0) {
     close(fd);
   }
   
-  // Wait for all other ranks' barrier files
-  bool allReady = false;
-  int maxRetries = 1000;
+  // Wait for all peers to arrive
+  int maxRetries = 1000;  // 10 seconds timeout
   int retries = 0;
+  bool allArrived = false;
   
-  while (!allReady && retries < maxRetries) {
-    allReady = true;
+  while (!allArrived && retries < maxRetries) {
+    allArrived = true;
     for (int peer = 0; peer < worldSize; ++peer) {
-      std::string peerBarrierPath = socketBasePath_ + "barrier_" + std::to_string(peer);
-      if (access(peerBarrierPath.c_str(), F_OK) != 0) {
-        allReady = false;
+      if (peer == localRank) continue;  // Skip self
+      
+      std::string peerArriveFile = socketBasePath_ + "barrier_arrive_" + std::to_string(peer);
+      if (access(peerArriveFile.c_str(), F_OK) != 0) {
+        allArrived = false;
         break;
       }
     }
     
-    if (!allReady) {
+    if (!allArrived) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
       retries++;
     }
   }
   
-  // Clean up barrier file
-  unlink(barrierPath.c_str());
-  
-  if (retries >= maxRetries) {
-    MORI_APP_WARN("LocalBootstrapNetwork::Barrier timeout for rank {}", localRank);
+  if (!allArrived) {
+    MORI_APP_ERROR("LocalBootstrapNetwork::Barrier phase 1 timeout for rank {}", localRank);
+    return;
   }
+  
+  // Phase 2: Signal departure (safe to proceed)
+  std::string departFile = socketBasePath_ + "barrier_depart_" + std::to_string(localRank);
+  fd = open(departFile.c_str(), O_CREAT | O_WRONLY, 0666);
+  if (fd >= 0) {
+    close(fd);
+  }
+  
+  // Wait for all peers to depart
+  retries = 0;
+  bool allDeparted = false;
+  
+  while (!allDeparted && retries < maxRetries) {
+    allDeparted = true;
+    for (int peer = 0; peer < worldSize; ++peer) {
+      if (peer == localRank) continue;  // Skip self
+      
+      std::string peerDepartFile = socketBasePath_ + "barrier_depart_" + std::to_string(peer);
+      if (access(peerDepartFile.c_str(), F_OK) != 0) {
+        allDeparted = false;
+        break;
+      }
+    }
+    
+    if (!allDeparted) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      retries++;
+    }
+  }
+  
+  if (!allDeparted) {
+    MORI_APP_ERROR("LocalBootstrapNetwork::Barrier phase 2 timeout for rank {}", localRank);
+    return;
+  }
+  
+  // Now safe to cleanup
+  unlink(arriveFile.c_str());
+  unlink(departFile.c_str());
+  
+  MORI_APP_TRACE("Rank {} completed barrier", localRank);
 }
 
 int LocalBootstrapNetwork::SendFD(int socket_fd, int fd) {
@@ -187,7 +235,15 @@ int LocalBootstrapNetwork::ReceiveFD(int socket_fd) {
 }
 
 std::string LocalBootstrapNetwork::GetSocketPath(int rank1, int rank2) const {
-  return socketBasePath_ + std::to_string(rank1) + "_" + std::to_string(rank2);
+  std::string path = socketBasePath_ + std::to_string(rank1) + "_" + std::to_string(rank2);
+  
+  // Unix domain socket path limit is 108 bytes (sizeof(sockaddr_un.sun_path))
+  if (path.length() >= 108) {
+    MORI_APP_ERROR("Socket path too long ({} bytes): {}", path.length(), path);
+    throw std::runtime_error("Socket path exceeds maximum length of 108 bytes");
+  }
+  
+  return path;
 }
 
 bool LocalBootstrapNetwork::ExchangeFileDescriptors(
@@ -271,6 +327,15 @@ bool LocalBootstrapNetwork::ExchangeFileDescriptors(
         if (receivedFd < 0) {
           MORI_APP_ERROR("Rank {} failed to receive FD {} from peer {}: {}", 
                         localRank, i, peer, strerror(errno));
+          
+          // Close any FDs already received from this peer
+          for (size_t j = 0; j < i; ++j) {
+            if (allFds[peer][j] >= 0) {
+              close(allFds[peer][j]);
+              allFds[peer][j] = -1;
+            }
+          }
+          
           close(client_fd);
           close(server_fd);
           unlink(socketPath.c_str());
@@ -300,14 +365,17 @@ bool LocalBootstrapNetwork::ExchangeFileDescriptors(
       std::string peerSocketPath = GetSocketPath(peer, localRank);
       strncpy(addr.sun_path, peerSocketPath.c_str(), sizeof(addr.sun_path) - 1);
       
-      // Retry connection
+      // Retry connection (up to 5 seconds)
+      const int MAX_CONNECT_RETRIES = 500;
+      const int RETRY_INTERVAL_MS = 10;
       bool connected = false;
-      for (int retry = 0; retry < 100 && !connected; ++retry) {
+      
+      for (int retry = 0; retry < MAX_CONNECT_RETRIES && !connected; ++retry) {
         if (connect(client_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
           connected = true;
           break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_INTERVAL_MS));
       }
       
       if (!connected) {
@@ -323,6 +391,15 @@ bool LocalBootstrapNetwork::ExchangeFileDescriptors(
         if (receivedFd < 0) {
           MORI_APP_ERROR("Rank {} failed to receive FD {} from peer {}: {}", 
                         localRank, i, peer, strerror(errno));
+          
+          // Close any FDs already received from this peer
+          for (size_t j = 0; j < i; ++j) {
+            if (allFds[peer][j] >= 0) {
+              close(allFds[peer][j]);
+              allFds[peer][j] = -1;
+            }
+          }
+          
           close(client_fd);
           return false;
         }
@@ -334,6 +411,15 @@ bool LocalBootstrapNetwork::ExchangeFileDescriptors(
         if (SendFD(client_fd, localFds[i]) < 0) {
           MORI_APP_ERROR("Rank {} failed to send FD {} to peer {}: {}", 
                         localRank, i, peer, strerror(errno));
+          
+          // Close all FDs received from this peer (send failed after receive)
+          for (size_t j = 0; j < numFds; ++j) {
+            if (allFds[peer][j] >= 0) {
+              close(allFds[peer][j]);
+              allFds[peer][j] = -1;
+            }
+          }
+          
           close(client_fd);
           return false;
         }

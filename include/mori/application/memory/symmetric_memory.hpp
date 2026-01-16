@@ -25,6 +25,7 @@
 #include <linux/types.h>
 #include <stdint.h>
 
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -138,14 +139,17 @@ class SymmMemManager {
     int shareableHandle;  // File descriptor for POSIX systems (for P2P)
     size_t size;          // Chunk size (always equals granularity/vmmChunkSize)
     bool isAllocated;
-    
+
     // RDMA registration info (per-chunk, for RDMA transport)
     uint32_t lkey;                        // Local key for RDMA access
     std::vector<uint32_t> peerRkeys;      // Remote keys from all PEs
     bool rdmaRegistered;                  // Whether this chunk is RDMA registered
-    
-    VMMChunkInfo() 
-        : handle(0), shareableHandle(-1), size(0), 
+
+    // P2P mapping tracking: which peers have already mapped this chunk
+    std::set<int> mappedPeers;            // Set of peer ranks that have imported and mapped this chunk
+
+    VMMChunkInfo()
+        : handle(0), shareableHandle(-1), size(0),
           isAllocated(false), lkey(0), rdmaRegistered(false) {}
   };
   
