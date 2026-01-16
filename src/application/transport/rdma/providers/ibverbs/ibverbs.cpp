@@ -22,6 +22,7 @@
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 
 #include "mori/application/utils/check.hpp"
+#include "mori/utils/mori_log.hpp"
 namespace mori {
 namespace application {
 
@@ -124,9 +125,15 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   attr.rq_psn = 0;
   attr.max_dest_rd_atomic = devAttr->orig_attr.max_qp_rd_atom;
   attr.min_rnr_timer = 12;
-  attr.ah_attr.sl = 0;
   attr.ah_attr.src_path_bits = 0;
   attr.ah_attr.port_num = local.portId;
+  attr.ah_attr.sl = ReadRdmaServiceLevelEnv().value_or(0);
+  std::optional<uint8_t> tc = ReadRdmaTrafficClassEnv();
+  if (tc.has_value()) {
+    attr.ah_attr.grh.traffic_class = tc.value();
+  }
+  MORI_APP_INFO("ibverbs attr.ah_attr.sl:{} attr.ah_attr.grh.traffic_class:{}", attr.ah_attr.sl,
+                attr.ah_attr.grh.traffic_class);
 
   if (portAttr->link_layer == IBV_LINK_LAYER_INFINIBAND) {
     attr.ah_attr.dlid = remote.ib.lid;

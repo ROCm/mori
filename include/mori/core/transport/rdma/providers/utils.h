@@ -26,6 +26,7 @@
 
 #include "infiniband/mlx5dv.h"
 #include "mori/core/transport/rdma/device_primitives.hpp"
+#include "mori/core/utils.hpp"
 
 #ifdef ENABLE_BNXT
 extern "C" {
@@ -186,7 +187,7 @@ static __device__ __host__ void DumpMlx5Wqe(void* wqeBaseAddr, uint32_t idx) {
   mlx5_wqe_data_seg* wqeDataSeg = reinterpret_cast<mlx5_wqe_data_seg*>(
       wqeAddr + sizeof(mlx5_wqe_ctrl_seg) + sizeof(mlx5_wqe_raddr_seg));
   uint32_t bytes = BE32TOH(wqeDataSeg->byte_count);
-  printf("Wqe: opcode = 0x%02x, wqeIdx = %u, opmod = 0x%02x bytes %d\n", opcode, wqeIdx, opmod,
+  MORI_PRINTF("Wqe: opcode = 0x%02x, wqeIdx = %u, opmod = 0x%02x bytes %d\n", opcode, wqeIdx, opmod,
          bytes);
 }
 

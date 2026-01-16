@@ -404,7 +404,7 @@ void BindAllProfilerSlots(pybind11::module_& m) {
   // {group.enum_name} (prefixed as "{prefix}.*")
   {{
     int counter = 0;
-#define X(name, str) all_slots[pybind11::int_(counter++)] = pybind11::str("{prefix}." str);
+#define X(name, py_str) all_slots[pybind11::int_(counter++)] = pybind11::cast(std::string("{prefix}.") + py_str);
     {xmacro_name}(X)
 #undef X
   }}
@@ -417,7 +417,7 @@ void BindAllProfilerSlots(pybind11::module_& m) {
   // Merge {group.enum_name}
   {{
     int counter = 0;
-#define X(name, str) all_slots[pybind11::int_(counter++)] = pybind11::str(str);
+#define X(name, py_str) all_slots[pybind11::int_(counter++)] = pybind11::cast(py_str);
     {xmacro_name}(X)
 #undef X
   }}

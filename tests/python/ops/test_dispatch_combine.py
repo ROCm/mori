@@ -19,13 +19,14 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import os
 import pytest
 import mori
 from tests.python.utils import TorchDistProcessManager, data_type_supported
 import torch
 import torch.distributed as dist
 
-
+os.environ["MORI_SHMEM_HEAP_SIZE"] = "4G"
 class EpDispatchCombineTestCase:
     def __init__(self, config):
         self.config = config
@@ -179,15 +180,19 @@ class EpDispatchCombineTestCase:
             result_match = torch.allclose(
                 got.float(), expected.float(), atol=1e-2, rtol=1e-2
             )
-            if not result_match and self.config.rank == 0:
-                print(f"Result mismatch for token {i}:")
+            if not result_match:
+                print(f"Rank[{self.config.rank}] result mismatch for token {i}:")
                 print(
-                    f"  indices[{i}]: {all_rank_indices[self.config.rank][i].cpu().tolist()}"
+                    f"Rank[{self.config.rank}]   indices[{i}]: {all_rank_indices[self.config.rank][i].cpu().tolist()}"
                 )
-                print(f"  pes: {pes}")
-                print(f"  unique_pes: {unique_pes}")
-                print(f"  got: {got}")
-                print(f"  expected : {expected}")
+                print(f"Rank[{self.config.rank}]   pes: {pes}")
+                print(f"Rank[{self.config.rank}]   unique_pes: {unique_pes}")
+                print(f"Rank[{self.config.rank}]   got: {got}")
+                print(f"Rank[{self.config.rank}]   expected : {expected}")
+                print(
+                    f"Rank[{self.config.rank}]   input : {all_rank_input[self.config.rank][i].to(torch.float32)}"
+                )
+            assert result_match
 
             if combine_output_weight is not None:
                 got_weight, expected_weight = (
@@ -197,17 +202,18 @@ class EpDispatchCombineTestCase:
                 weight_match = torch.allclose(
                     got_weight, expected_weight, atol=1e-5, rtol=1e-5
                 )
-                if not weight_match and self.config.rank == 0:
-                    print(f"Weight mismatch for token {i}:")
+                if not weight_match:
+                    print(f"Rank[{self.config.rank}] Weight mismatch for token {i}:")
                     print(
-                        f"  indices[{i}]: {all_rank_indices[self.config.rank][i].cpu().tolist()}"
+                        f"Rank[{self.config.rank}]   indices[{i}]: {all_rank_indices[self.config.rank][i].cpu().tolist()}"
                     )
-                    print(f"  pes: {pes}")
-                    print(f"  unique_pes: {unique_pes}")
-                    print(f"  got_weight: {got_weight}")
+                    print(f"Rank[{self.config.rank}]   pes: {pes}")
+                    print(f"Rank[{self.config.rank}]   unique_pes: {unique_pes}")
+                    print(f"Rank[{self.config.rank}]   got_weight: {got_weight}")
                     print(
-                        f"  expected_weight (weights[{i}] * {unique_pes}): {expected_weight}"
+                        f"Rank[{self.config.rank}]   expected_weight (weights[{i}] * {unique_pes}): {expected_weight}"
                     )
+                assert weight_match
 
     def run_test_once(self, op, test_data):
         (
@@ -240,6 +246,14 @@ class EpDispatchCombineTestCase:
             dispatch_recv_num_token,
         )
 
+        total_recv_num_token = dispatch_recv_num_token[0].item()
+        if not self.config.use_external_inp_buf:
+            combine_input = op.get_registered_combine_input_buffer(
+                self.config.data_type
+            )
+            combine_input[:total_recv_num_token, :].copy_(
+                dispatch_output[:total_recv_num_token, :]
+            )
         combine_output, combine_output_weight = op.combine(
             dispatch_output, dispatch_weights, dispatch_indices, call_reset=False
         )
@@ -270,6 +284,7 @@ def _test_dispatch_combine(
     max_num_inp_token_per_rank,
     num_experts_per_rank,
     num_experts_per_token,
+    use_external_inp_buf,
 ):
     config = mori.ops.EpDispatchCombineConfig(
         data_type=data_type,
@@ -284,6 +299,7 @@ def _test_dispatch_combine(
         max_token_type_size=4,
         block_num=40,
         warp_num_per_block=8,
+        use_external_inp_buf=use_external_inp_buf,
     )
     op = mori.ops.EpDispatchCombineOp(config)
     test_case = EpDispatchCombineTestCase(config)
@@ -319,6 +335,7 @@ def _test_dispatch_combine(
 @pytest.mark.parametrize("max_num_inp_token_per_rank", (1, 128))
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
 @pytest.mark.parametrize("num_experts_per_token", (8,))
+@pytest.mark.parametrize("use_external_inp_buf", (True, False))
 def test_dispatch_combine(
     torch_dist_process_manager,
     world_size,
@@ -329,6 +346,7 @@ def test_dispatch_combine(
     max_num_inp_token_per_rank,
     num_experts_per_rank,
     num_experts_per_token,
+    use_external_inp_buf,
 ):
     for i in range(world_size):
         torch_dist_process_manager.task_queue.put(
@@ -343,6 +361,7 @@ def test_dispatch_combine(
                     max_num_inp_token_per_rank,
                     num_experts_per_rank,
                     num_experts_per_token,
+                    use_external_inp_buf,
                 ],
             )
         )

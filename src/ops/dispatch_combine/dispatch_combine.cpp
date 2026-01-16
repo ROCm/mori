@@ -248,8 +248,8 @@ void EpDispatchCombineHandle::InitializeBarrier() {
   HIP_RUNTIME_CHECK(hipMalloc(&interNodeChunkFlagCombine, interNodeChunkFlagSize));
   HIP_RUNTIME_CHECK(hipMemset(interNodeChunkFlagCombine, 0, interNodeChunkFlagSize));
 
-  HIP_RUNTIME_CHECK(hipMalloc(&interNodeBlocksBarrier, sizeof(index_t)));
-  HIP_RUNTIME_CHECK(hipMemset(interNodeBlocksBarrier, 0, sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMalloc(&interNodeBlocksBarrier, 4 * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMemset(interNodeBlocksBarrier, 0, 4 * sizeof(index_t)));
 }
 
 void EpDispatchCombineHandle::FinalizeBarrier() {
@@ -336,7 +336,12 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
-          EpCombineIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
+          if (config.useExternalInpBuffer) {
+            // UseP2PRead=false: does not support zero-copy and provides better bandwidth and lower latency
+            EpCombineIntraNodeKernel<DataT, false><<<grid, block, sharedMemSize, stream>>>(args);
+          } else { // zero-copy mode (requires UseP2PRead=true)
+            EpCombineIntraNodeKernel<DataT, true><<<grid, block, sharedMemSize, stream>>>(args);
+          }
         } else {
           assert(false);
         }

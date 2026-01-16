@@ -24,6 +24,7 @@
 #include <infiniband/verbs.h>
 
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -153,6 +154,11 @@ class ControlPlaneServer {
                      NotifManager*);
   ~ControlPlaneServer();
 
+  std::optional<uint16_t> GetListenPort() const {
+    if (!ctx) return std::nullopt;
+    return static_cast<uint16_t>(ctx->GetPort());
+  }
+
   // Remote engine meta management
   void RegisterRemoteEngine(const EngineDesc&);
   void DeregisterRemoteEngine(const EngineDesc&);
@@ -227,6 +233,11 @@ class RdmaBackend : public Backend {
  public:
   RdmaBackend(EngineKey, const IOEngineConfig&, const RdmaBackendConfig&);
   ~RdmaBackend();
+
+  std::optional<uint16_t> GetListenPort() const {
+    if (!server) return std::nullopt;
+    return server->GetListenPort();
+  }
 
   void RegisterRemoteEngine(const EngineDesc&);
   void DeregisterRemoteEngine(const EngineDesc&);

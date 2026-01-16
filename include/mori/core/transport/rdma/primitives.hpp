@@ -38,7 +38,7 @@ enum ProviderType {
   // Pensando direct verbs
   PSD = 3,
   // Ib verbs
-  IBVERBS = 3,
+  IBVERBS = 4,
 };
 
 typedef enum {
