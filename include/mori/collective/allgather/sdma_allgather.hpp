@@ -22,14 +22,16 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
+#include "oneshot_sdma_kernel.hpp"
+
 namespace mori {
 namespace collective {
 
 template <typename T>
 int AllGather_sdma(T* input, T* output, size_t total_count,
                                           hipStream_t stream) {
-  int myPe = TopologyDetector::GetMyPe();
-  int npes = TopologyDetector::GetNPes();
+  int myPe = ShmemMyPe();
+  int npes = ShmemNPes();
   size_t dtype_size = sizeof(T);
 
   application::SymmMemObjPtr inPutBuffObj =
@@ -43,11 +45,11 @@ int AllGather_sdma(T* input, T* output, size_t total_count,
   if (flags == nullptr) {
     return -1;
   }
-  std::memset(flags, 0, flagsSize);
+  memset(flags, 0, flagsSize);
   application::SymmMemObjPtr flagsObj = shmem::ShmemQueryMemObjPtr(flags);
 
   OneShotAllGatharSdmaKernel<T><<<1, 256, 0, stream>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
-  
+
   shmem::ShmemFree(flags);
   return 0;
 }

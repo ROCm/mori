@@ -128,7 +128,7 @@ void testOneShotSdmaAllGather() {
 
   double start = MPI_Wtime();
   if(1)
-    AllGather_sdma(inPutBuff, outPutBuff, elemsPerPe, stream)
+    AllGather_sdma(inPutBuff, outPutBuff, elemsPerPe, stream);
     //OneShotAllGatharSdmaKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
 
   else{
