@@ -38,7 +38,7 @@ int AllGather_sdma(T* input, T* output, size_t total_count,
       shmem::ShmemSymmetricRegister(static_cast<void*>(input), total_count * dtype_size);
 
   application::SymmMemObjPtr outPutBuffObj =
-      shmem::ShmemSymmetricRegister(static_cast<void*>(input), total_count * dtype_size * npes);
+      shmem::ShmemSymmetricRegister(static_cast<void*>(output), total_count * dtype_size * npes);
 
   int flagsSize = npes * sizeof(uint64_t);
   void* flags = shmem::ShmemMalloc(flagsSize);
@@ -47,9 +47,10 @@ int AllGather_sdma(T* input, T* output, size_t total_count,
   }
   memset(flags, 0, flagsSize);
   application::SymmMemObjPtr flagsObj = shmem::ShmemQueryMemObjPtr(flags);
+
   assert(inPutBuffObj.IsValid());
   assert(outPutBuffObj.IsValid());
-  assert(flagsBuffObj.IsValid());
+  assert(flagsObj.IsValid());
 
   OneShotAllGatherSdmaKernel<T><<<1, 256>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
 
