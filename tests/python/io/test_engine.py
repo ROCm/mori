@@ -32,6 +32,7 @@ from mori.io import (
     StatusCode,
     MemoryLocationType,
     RdmaBackendConfig,
+    XgmiBackendConfig,
     set_log_level,
 )
 
@@ -418,3 +419,109 @@ def test_no_backend():
 
     sess = initiator.create_session(initiator_mem, target_mem)
     assert sess is None
+
+
+@pytest.fixture(scope="module")
+def xgmi_engine():
+    set_log_level("info")
+    config = IOEngineConfig(host="", port=0)
+    engine = IOEngine(key="xgmi_engine", config=config)
+    xgmi_config = XgmiBackendConfig(num_streams=64, num_events=64)
+    engine.create_backend(BackendType.XGMI, xgmi_config)
+    yield engine
+
+
+def alloc_xgmi_mem(engine, src_gpu, dst_gpu, shape):
+    src_tensor = torch.randn(
+        shape, device=torch.device("cuda", src_gpu), dtype=torch.float32
+    )
+    dst_tensor = torch.zeros(
+        shape, device=torch.device("cuda", dst_gpu), dtype=torch.float32
+    )
+    src_mem = engine.register_torch_tensor(src_tensor)
+    dst_mem = engine.register_torch_tensor(dst_tensor)
+    return src_tensor, dst_tensor, src_mem, dst_mem
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+@pytest.mark.parametrize("enable_sess", (True, False))
+@pytest.mark.parametrize("enable_batch", (True, False))
+@pytest.mark.parametrize("op_type", ("write", "read"))
+@pytest.mark.parametrize("batch_size", (1, 16))
+@pytest.mark.parametrize("buffer_size", (64, 4096))
+def test_xgmi_backend_ops(
+    xgmi_engine, enable_sess, enable_batch, op_type, batch_size, buffer_size
+):
+    src_tensor, dst_tensor, src_mem, dst_mem = alloc_xgmi_mem(
+        xgmi_engine, src_gpu=0, dst_gpu=1, shape=[batch_size, buffer_size]
+    )
+
+    if op_type == "read":
+        src_tensor, dst_tensor = dst_tensor, src_tensor
+        src_mem, dst_mem = dst_mem, src_mem
+
+    sess = xgmi_engine.create_session(src_mem, dst_mem)
+    offsets = [i * buffer_size * 4 for i in range(batch_size)]
+    sizes = [buffer_size * 4 for _ in range(batch_size)]
+
+    if enable_batch:
+        if enable_sess:
+            transfer_uid = sess.allocate_transfer_uid()
+            func = sess.batch_read if op_type == "read" else sess.batch_write
+            status = func(offsets, offsets, sizes, transfer_uid)
+        else:
+            transfer_uid = xgmi_engine.allocate_transfer_uid()
+            func = (
+                xgmi_engine.batch_read if op_type == "read" else xgmi_engine.batch_write
+            )
+            status = func(
+                [src_mem], [offsets], [dst_mem], [offsets], [sizes], [transfer_uid]
+            )[0]
+    else:
+        statuses = []
+        for i in range(batch_size):
+            if enable_sess:
+                transfer_uid = sess.allocate_transfer_uid()
+                func = sess.read if op_type == "read" else sess.write
+                status = func(offsets[i], offsets[i], sizes[i], transfer_uid)
+            else:
+                transfer_uid = xgmi_engine.allocate_transfer_uid()
+                func = xgmi_engine.read if op_type == "read" else xgmi_engine.write
+                status = func(
+                    src_mem, offsets[i], dst_mem, offsets[i], sizes[i], transfer_uid
+                )
+            statuses.append(status)
+
+        for s in statuses:
+            s.Wait()
+            assert s.Succeeded()
+        assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
+        return
+
+    status.Wait()
+    assert status.Succeeded()
+    assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 1, reason="requires GPU")
+def test_xgmi_same_device(xgmi_engine):
+    src_tensor, dst_tensor, src_mem, dst_mem = alloc_xgmi_mem(
+        xgmi_engine, src_gpu=0, dst_gpu=0, shape=(1024,)
+    )
+    transfer_uid = xgmi_engine.allocate_transfer_uid()
+    status = xgmi_engine.write(src_mem, 0, dst_mem, 0, 1024 * 4, transfer_uid)
+    status.Wait()
+    assert status.Succeeded()
+    assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_xgmi_no_inbound_notification(xgmi_engine):
+    src_tensor, dst_tensor, src_mem, dst_mem = alloc_xgmi_mem(
+        xgmi_engine, src_gpu=0, dst_gpu=1, shape=(1024,)
+    )
+    transfer_uid = xgmi_engine.allocate_transfer_uid()
+    status = xgmi_engine.write(src_mem, 0, dst_mem, 0, 1024 * 4, transfer_uid)
+    status.Wait()
+    assert status.Succeeded()
+    assert xgmi_engine.pop_inbound_transfer_status("any_key", transfer_uid) is None
