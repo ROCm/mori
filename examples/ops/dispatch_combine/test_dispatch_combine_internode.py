@@ -566,6 +566,13 @@ class EpDispatchCombineTestCase:
             f"rank {self.rank} recv {total_recv_num_token} tokens {total_rdma_recv_num_token} rdma tokens"
         )
 
+        if hasattr(mori.cpp, "get_debug_time_buf"):
+            my_times = mori.cpp.get_debug_time_buf(op._handle)
+            my_times.zero_()
+            if hasattr(mori.cpp, "get_debug_time_offset"):
+                my_offsets = mori.cpp.get_debug_time_offset(op._handle)
+                my_offsets.zero_()
+
         torch.cuda.synchronize()
         dist.barrier()
         events[0].record()
@@ -625,6 +632,17 @@ class EpDispatchCombineTestCase:
         comb_bandwidth_list = [
             total_bytes / (1000**3) / (t / (10**3)) for t in comb_duration_list
         ]
+
+        if hasattr(mori.cpp, "get_debug_time_buf"):
+            output_filename = (
+                f"trace_rank_{self.rank}_{time.strftime('%m%d_%H%M%S')}.json"
+            )
+            mori.kernel_profiler.export_to_perfetto(
+                my_times, output_filename, gpu_freq_ghz=1.7
+            )
+            if self.rank == 0:
+                print(f"Profiling data exported to {output_filename}")
+
         return (
             disp_duration_list,
             disp_rdma_bandwidth_list,
@@ -640,6 +658,8 @@ class EpDispatchCombineTestCase:
         test_data = self.gen_test_data(use_max_token_num=True)
 
         repeat = 50
+        if hasattr(mori.cpp, "get_debug_time_buf"):
+            repeat = 1  # for profiling, only run 1 iteration to avoid buffer overflow
         disp_duration_us_list = []
         disp_rdma_bandwidth_GB_list = []
         disp_bandwidth_GB_list = []
@@ -732,6 +752,9 @@ class EpDispatchCombineTestCase:
                 print(
                     f"  bandwidth {comb_bandwidth_GB_list[i]} avg {sum(comb_bandwidth_GB_list[i]) / self.config.world_size:.2f} GB/s"
                 )
+
+        if repeat == 1:
+            return
 
         def collect_metrics(per_round_data):
             minv = min([min(data) for data in per_round_data])
