@@ -30,8 +30,8 @@ namespace collective {
 template <typename T>
 int AllGather_sdma(T* input, T* output, size_t total_count,
                                           hipStream_t stream) {
-  int myPe = ShmemMyPe();
-  int npes = ShmemNPes();
+  int myPe =  shmem::ShmemMyPe();
+  int npes =  shmem::ShmemNPes();
   size_t dtype_size = sizeof(T);
 
   application::SymmMemObjPtr inPutBuffObj =
@@ -48,7 +48,7 @@ int AllGather_sdma(T* input, T* output, size_t total_count,
   memset(flags, 0, flagsSize);
   application::SymmMemObjPtr flagsObj = shmem::ShmemQueryMemObjPtr(flags);
 
-  OneShotAllGatharSdmaKernel<T><<<1, 256, 0, stream>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
+  OneShotAllGatherSdmaKernel<T><<<1, 256, 0, stream>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
 
   shmem::ShmemFree(flags);
   return 0;
