@@ -79,6 +79,7 @@ void testOneShotSdmaAllGather() {
   HIP_RUNTIME_CHECK(hipMemcpy(inPutBuff, hostData, bytesPerPe, hipMemcpyHostToDevice));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
+#if 0
   // Get symmetric memory object pointer
   SymmMemObjPtr outPutBuffObj = ShmemQueryMemObjPtr(outPutBuff);
   assert(outPutBuffObj.IsValid());
@@ -98,6 +99,7 @@ void testOneShotSdmaAllGather() {
   // Get symmetric memory object pointer for flags
   SymmMemObjPtr flagsBuffObj = ShmemQueryMemObjPtr(flagsBuff);
   assert(flagsBuffObj.IsValid());
+  #endif
 
   // Print initial data (only this PE's chunk should be non-zero)
   HIP_RUNTIME_CHECK(hipMemcpy(hostData + myPe*elemsPerPe, inPutBuff, bytesPerPe, hipMemcpyDeviceToHost));
@@ -199,8 +201,10 @@ void testOneShotSdmaAllGather() {
   }
 
   // Cleanup
-  ShmemFree(outPutBuff);
-  ShmemFree(flagsBuff);
+  //ShmemFree(outPutBuff);
+  hipfree(outPutBuff);
+  hipfree(inPutBuff);
+  //ShmemFree(flagsBuff);
   delete[] hostData;
 
   ShmemFinalize();
