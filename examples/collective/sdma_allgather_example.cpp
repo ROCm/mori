@@ -147,7 +147,8 @@ void testOneShotSdmaAllGather() {
     printf("=== AllGather Operation Completed ===\n\n");
     double global_bandwidth = totalBytes / global_max_duration;
     global_bandwidth /= (1024.0 * 1024.0 * 1024.0);
-    printf("========global bandwidth (base on slowest progress): %.2f GB/s ======== \n", global_bandwidth);
+    printf("========global bandwidth (base on slowest progress): %.6f GB/s ======== \n", global_bandwidth);
+    printf("========global max time %.9f ======== \n", global_max_duration);
   }
   MPI_Barrier(MPI_COMM_WORLD);
 
