@@ -158,7 +158,9 @@ class EpDispatchCombineTestCase:
                 device=self.device,
             )
             # argsort gives us a random permutation, take first K columns
-            indices = torch.argsort(random_vals, dim=1)[:, : self.config.num_experts_per_token]
+            indices = torch.argsort(random_vals, dim=1)[
+                :, : self.config.num_experts_per_token
+            ]
             all_rank_indices.append(indices.to(torch.int32))
 
         # num_total_experts = self.config.num_experts_per_rank * self.config.world_size
@@ -427,7 +429,7 @@ class EpDispatchCombineTestCase:
                     self.config.scale_dim,
                 )
                 expected_f = inp_f * final_unique_pes
-                ok = torch.allclose(got_f, expected_f, atol=3e-1, rtol=3e-1)
+                ok = torch.allclose(got_f, expected_f, atol=5e-2, rtol=5e-2)
             else:
                 got, expected = combine_output[i], (
                     all_rank_input[self.rank][i].to(torch.float32) * final_unique_pes
@@ -442,8 +444,24 @@ class EpDispatchCombineTestCase:
                     torch.float8_e4m3fnuz,
                     torch.float8_e4m3fn,
                 ):
-                    print(f"{self.rank} got(dequant fp32): ", got_f)
-                    print(f"{self.rank} expected(fp32): ", expected_f)
+                    # Compute detailed error statistics
+                    abs_diff = (got_f - expected_f).abs()
+                    max_abs_diff = abs_diff.max().item()
+                    mean_abs_diff = abs_diff.mean().item()
+                    rel_diff = abs_diff / (expected_f.abs() + 1e-8)
+                    max_rel_diff = rel_diff.max().item()
+                    mean_rel_diff = rel_diff.mean().item()
+                    print(f"{self.rank} Error Statistics:")
+                    print(f"  max_abs_diff: {max_abs_diff:.6f}")
+                    print(f"  mean_abs_diff: {mean_abs_diff:.6f}")
+                    print(
+                        f"  max_rel_diff: {max_rel_diff:.6f} ({max_rel_diff*100:.2f}%)"
+                    )
+                    print(
+                        f"  mean_rel_diff: {mean_rel_diff:.6f} ({mean_rel_diff*100:.2f}%)"
+                    )
+                    print(f"{self.rank} got(dequant fp32) first 32: ", got_f[0, :32])
+                    print(f"{self.rank} expected(fp32) first 32: ", expected_f[0, :32])
                     print(
                         f"{self.rank} out_scales(fp32): ",
                         combine_output_scales[i : i + 1].float(),
@@ -452,8 +470,6 @@ class EpDispatchCombineTestCase:
                         f"{self.rank} inp_scales(fp32): ",
                         all_rank_scales[self.rank][i : i + 1].float(),
                     )
-                    print(f"{self.rank} out(fp8 raw): ", combine_output[i])
-                    print(f"{self.rank} inp(fp8 raw): ", all_rank_input[self.rank][i])
                 else:
                     print(
                         f"{self.rank} got: ",
@@ -462,9 +478,6 @@ class EpDispatchCombineTestCase:
                         expected,
                         all_rank_input[self.rank][i],
                     )
-                # delta = got.float() - expected.float()
-                # print(self.rank, "delta:", delta)
-                # error_round.add(round)
                 assert False
                 # pass
 

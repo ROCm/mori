@@ -97,51 +97,6 @@ inline __device__ T WarpReduceMax(T val) {
   return val;
 }
 
-constexpr int kFp8MaxElemsPerLane = 8;
-
-template <typename Fp8T>
-__device__ __forceinline__ void WarpAccumFp8QuantPerDim(
-    Fp8T* __restrict__ dstToken, uint8_t* __restrict__ dstScales,
-    const Fp8T* const* __restrict__ srcs, const uint8_t* const* __restrict__ srcScales,
-    int accumNum, int hiddenDim, int scaleDim, int scaleTypeSize, int scaleBlockId) {
-  const int laneId = threadIdx.x & (warpSize - 1);
-  const int blockElems = (hiddenDim + scaleDim - 1) / scaleDim;
-  const int start = scaleBlockId * blockElems;
-  const int end = min(start + blockElems, hiddenDim);
-
-  float localAcc[kFp8MaxElemsPerLane];
-  int localCount = 0;
-  float localMaxAbs = 0.0f;
-
-  for (int idx = start + laneId; idx < end; idx += warpSize) {
-    float acc = 0.0f;
-    for (int i = 0; i < accumNum; ++i) {
-      const Fp8T* srcPtr = srcs[i];
-      if (srcPtr == nullptr) continue;
-      const float s = LoadScaleElemAsFloat<Fp8T>(srcScales[i], scaleBlockId, scaleTypeSize);
-      acc += static_cast<float>(srcPtr[idx]) * s;
-    }
-    localAcc[localCount++] = acc;
-    localMaxAbs = fmaxf(localMaxAbs, fabsf(acc));
-  }
-
-  float maxAbs = WarpReduceMax(localMaxAbs);
-  maxAbs = __shfl(maxAbs, 0);
-
-  const float fp8Max = Fp8Traits<Fp8T>::kMaxFinite;
-  float outScale = (maxAbs == 0.0f) ? 1.0f : (maxAbs / fp8Max);
-  if (laneId == 0) {
-    StoreScaleFromFloat<Fp8T>(dstScales, scaleBlockId, scaleTypeSize, outScale);
-  }
-  outScale = __shfl(outScale, 0);
-
-  const float invScale = 1.0f / outScale;
-  int localIdx = 0;
-  for (int idx = start + laneId; idx < end; idx += warpSize) {
-    dstToken[idx] = Fp8T(localAcc[localIdx++] * invScale);
-  }
-}
-
 template <int VecBytes>
 struct VecTypeSelector {
   using type = void;
@@ -303,106 +258,101 @@ __device__ __forceinline__ void store<16>(void* addr,
 }
 #endif
 
+// Maximum supported scale dimension (number of scale blocks per token)
+constexpr int kFp8MaxScaleDim = 32;
+
+/* ---------------------------------------------------------------------------------------------- */
+/*            WarpAccumFp8QuantPerBlock: Process one scale block with vectorized access          */
+/* ---------------------------------------------------------------------------------------------- */
 template <typename Fp8T, int AccumNum>
-__device__ __forceinline__ void WarpAccumFp8QuantAllAtOnce(
+__device__ __forceinline__ void WarpAccumFp8QuantPerBlock(
     Fp8T* __restrict__ dstToken, uint8_t* __restrict__ dstScales,
     const Fp8T* const* __restrict__ srcs, const uint8_t* const* __restrict__ srcScales,
-    int hiddenDim, int scaleDim, int scaleTypeSize) {
+    int hiddenDim, int scaleTypeSize, int scaleBlockId, int blockElems) {
   const int laneId = threadIdx.x & (warpSize - 1);
-  const int blockElems = (hiddenDim + scaleDim - 1) / scaleDim;
+  const int start = scaleBlockId * blockElems;
+  const int end = min(start + blockElems, hiddenDim);
+  const int blockLen = end - start;
 
+  // Load scales for this block from all sources
+  float srcBlockScales[AccumNum];
+#pragma unroll AccumNum
+  for (int i = 0; i < AccumNum; ++i) {
+    srcBlockScales[i] = (srcs[i] != nullptr && srcScales[i] != nullptr)
+                            ? LoadScaleElemAsFloat<Fp8T>(srcScales[i], scaleBlockId, scaleTypeSize)
+                            : 0.0f;
+  }
+
+  // Pass 1: Find max absolute value
   constexpr int VecBytes = 4;
-  constexpr int vecSize = VecBytes / sizeof(Fp8T);
+  constexpr int vecSize = VecBytes / sizeof(Fp8T);  // 4 for FP8
   using VecType = typename VecTypeSelector<VecBytes>::dataType;
 
-  float localMax[32];
-  for (int sb = 0; sb < scaleDim; ++sb) localMax[sb] = 0.0f;
-
   const int elemsPerWarp = warpSize * vecSize;  // 64*4 = 256
-  const int laneOffset = laneId * vecSize;
+  float localMaxAbs = 0.0f;
 
+  // Vectorized loop
   int offset = 0;
-  while (offset + elemsPerWarp <= hiddenDim) {
-    int sb = (offset + laneOffset) / blockElems;
-
-    float blockScales[AccumNum];
-#pragma unroll AccumNum
-    for (int i = 0; i < AccumNum; ++i) {
-      blockScales[i] = (srcs[i] != nullptr && srcScales[i] != nullptr)
-                           ? LoadScaleElemAsFloat<Fp8T>(srcScales[i], sb, scaleTypeSize)
-                           : 1.0f;
-    }
-
-    VecType srcVecs[AccumNum];
-#pragma unroll AccumNum
-    for (int i = 0; i < AccumNum; ++i) {
-      if (srcs[i] != nullptr) {
-        srcVecs[i] = load<VecBytes>(srcs[i] + offset + laneOffset);
-      }
-    }
+  while (offset + elemsPerWarp <= blockLen) {
+    const int globalOffset = start + offset + laneId * vecSize;
 
     float accVec[vecSize] = {0};
 #pragma unroll AccumNum
     for (int i = 0; i < AccumNum; ++i) {
       if (srcs[i] != nullptr) {
+        VecType srcVec = load<VecBytes>(srcs[i] + globalOffset);
 #pragma unroll vecSize
         for (int j = 0; j < vecSize; ++j) {
           accVec[j] +=
-              static_cast<float>(reinterpret_cast<const Fp8T*>(&srcVecs[i])[j]) * blockScales[i];
+              static_cast<float>(reinterpret_cast<const Fp8T*>(&srcVec)[j]) * srcBlockScales[i];
         }
       }
     }
 
 #pragma unroll vecSize
     for (int j = 0; j < vecSize; ++j) {
-      localMax[sb] = fmaxf(localMax[sb], fabsf(accVec[j]));
+      localMaxAbs = fmaxf(localMaxAbs, fabsf(accVec[j]));
     }
-
     offset += elemsPerWarp;
   }
 
-  for (int idx = offset + laneId; idx < hiddenDim; idx += warpSize) {
-    int sb = idx / blockElems;
-
+  for (int idx = start + offset + laneId; idx < end; idx += warpSize) {
     float acc = 0.0f;
 #pragma unroll AccumNum
     for (int i = 0; i < AccumNum; ++i) {
-      if (srcs[i] != nullptr && srcScales[i] != nullptr) {
-        float scale = LoadScaleElemAsFloat<Fp8T>(srcScales[i], sb, scaleTypeSize);
-        acc += static_cast<float>(srcs[i][idx]) * scale;
+      if (srcs[i] != nullptr) {
+        acc += static_cast<float>(srcs[i][idx]) * srcBlockScales[i];
       }
     }
-    localMax[sb] = fmaxf(localMax[sb], fabsf(acc));
+    localMaxAbs = fmaxf(localMaxAbs, fabsf(acc));
   }
 
-  float invScales[32];
-  for (int sb = 0; sb < scaleDim; ++sb) {
-    float maxAbs = WarpReduceMax(localMax[sb]);
-    maxAbs = __shfl(maxAbs, 0);
-    float outScale = (maxAbs == 0.0f) ? 1.0f : (maxAbs / Fp8Traits<Fp8T>::kMaxFinite);
-    invScales[sb] = 1.0f / outScale;
-    if (laneId == 0) {
-      StoreScaleFromFloat<Fp8T>(dstScales, sb, scaleTypeSize, outScale);
-    }
+  // Reduce across warp
+  float maxAbs = WarpReduceMax(localMaxAbs);
+  maxAbs = __shfl(maxAbs, 0);
+
+  // Pass 2: Compute and store quantized output
+  const float fp8Max = Fp8Traits<Fp8T>::kMaxFinite;
+  float outScale = (maxAbs == 0.0f) ? 1.0f : (maxAbs / fp8Max);
+  if (laneId == 0) {
+    StoreScaleFromFloat<Fp8T>(dstScales, scaleBlockId, scaleTypeSize, outScale);
   }
+  const float invScale = 1.0f / outScale;
 
   offset = 0;
-  while (offset + elemsPerWarp <= hiddenDim) {
-    int sb = (offset + laneOffset) / blockElems;
+  while (offset + elemsPerWarp <= blockLen) {
+    const int globalOffset = start + offset + laneId * vecSize;
 
-    float blockScales[AccumNum];
-#pragma unroll AccumNum
-    for (int i = 0; i < AccumNum; ++i) {
-      blockScales[i] = (srcs[i] != nullptr && srcScales[i] != nullptr)
-                           ? LoadScaleElemAsFloat<Fp8T>(srcScales[i], sb, scaleTypeSize)
-                           : 1.0f;
-    }
-
-    VecType srcVecs[AccumNum];
+    float accVec[vecSize] = {0};
 #pragma unroll AccumNum
     for (int i = 0; i < AccumNum; ++i) {
       if (srcs[i] != nullptr) {
-        srcVecs[i] = load<VecBytes>(srcs[i] + offset + laneOffset);
+        VecType srcVec = load<VecBytes>(srcs[i] + globalOffset);
+#pragma unroll vecSize
+        for (int j = 0; j < vecSize; ++j) {
+          accVec[j] +=
+              static_cast<float>(reinterpret_cast<const Fp8T*>(&srcVec)[j]) * srcBlockScales[i];
+        }
       }
     }
 
@@ -410,38 +360,78 @@ __device__ __forceinline__ void WarpAccumFp8QuantAllAtOnce(
       VecType vec;
       Fp8T vals[vecSize];
     } outVec;
-
 #pragma unroll vecSize
     for (int j = 0; j < vecSize; ++j) {
-      float acc = 0.0f;
-#pragma unroll AccumNum
-      for (int i = 0; i < AccumNum; ++i) {
-        if (srcs[i] != nullptr) {
-          acc += static_cast<float>(reinterpret_cast<const Fp8T*>(&srcVecs[i])[j]) * blockScales[i];
-        }
-      }
-      outVec.vals[j] = Fp8T(acc * invScales[sb]);
+      outVec.vals[j] = Fp8T(accVec[j] * invScale);
     }
-    store<VecBytes>(dstToken + offset + laneOffset, outVec.vec);
+    store<VecBytes>(dstToken + globalOffset, outVec.vec);
 
     offset += elemsPerWarp;
   }
 
-  for (int idx = offset + laneId; idx < hiddenDim; idx += warpSize) {
-    int sb = idx / blockElems;
-
+  for (int idx = start + offset + laneId; idx < end; idx += warpSize) {
     float acc = 0.0f;
 #pragma unroll AccumNum
     for (int i = 0; i < AccumNum; ++i) {
-      if (srcs[i] != nullptr && srcScales[i] != nullptr) {
-        float scale = LoadScaleElemAsFloat<Fp8T>(srcScales[i], sb, scaleTypeSize);
-        acc += static_cast<float>(srcs[i][idx]) * scale;
+      if (srcs[i] != nullptr) {
+        acc += static_cast<float>(srcs[i][idx]) * srcBlockScales[i];
       }
     }
-    dstToken[idx] = Fp8T(acc * invScales[sb]);
+    dstToken[idx] = Fp8T(acc * invScale);
   }
 }
 
+/* ---------------------------------------------------------------------------------------------- */
+/*     WarpAccumFp8QuantPerBlockDynamic: Dynamic accumNum version (for uncommon accumNum values) */
+/* ---------------------------------------------------------------------------------------------- */
+template <typename Fp8T>
+__device__ __forceinline__ void WarpAccumFp8QuantPerBlockDynamic(
+    Fp8T* __restrict__ dstToken, uint8_t* __restrict__ dstScales,
+    const Fp8T* const* __restrict__ srcs, const uint8_t* const* __restrict__ srcScales,
+    int accumNum, int hiddenDim, int scaleTypeSize, int scaleBlockId, int blockElems) {
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const int start = scaleBlockId * blockElems;
+  const int end = min(start + blockElems, hiddenDim);
+
+  float localMaxAbs = 0.0f;
+
+  for (int idx = start + laneId; idx < end; idx += warpSize) {
+    float acc = 0.0f;
+    for (int i = 0; i < accumNum; ++i) {
+      if (srcs[i] != nullptr && srcScales[i] != nullptr) {
+        float scale = LoadScaleElemAsFloat<Fp8T>(srcScales[i], scaleBlockId, scaleTypeSize);
+        acc += static_cast<float>(srcs[i][idx]) * scale;
+      }
+    }
+    localMaxAbs = fmaxf(localMaxAbs, fabsf(acc));
+  }
+
+  // Reduce across warp
+  float maxAbs = WarpReduceMax(localMaxAbs);
+  maxAbs = __shfl(maxAbs, 0);
+
+  const float fp8Max = Fp8Traits<Fp8T>::kMaxFinite;
+  float outScale = (maxAbs == 0.0f) ? 1.0f : (maxAbs / fp8Max);
+  if (laneId == 0) {
+    StoreScaleFromFloat<Fp8T>(dstScales, scaleBlockId, scaleTypeSize, outScale);
+  }
+  const float invScale = 1.0f / outScale;
+
+  for (int idx = start + laneId; idx < end; idx += warpSize) {
+    float acc = 0.0f;
+    for (int i = 0; i < accumNum; ++i) {
+      if (srcs[i] != nullptr && srcScales[i] != nullptr) {
+        float scale = LoadScaleElemAsFloat<Fp8T>(srcScales[i], scaleBlockId, scaleTypeSize);
+        acc += static_cast<float>(srcs[i][idx]) * scale;
+      }
+    }
+    dstToken[idx] = Fp8T(acc * invScale);
+  }
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                      WarpAccumFp8Quant                                        */
+/* ---------------------------------------------------------------------------------------------- */
 template <typename Fp8T>
 __device__ __forceinline__ void WarpAccumFp8Quant(Fp8T* __restrict__ dstToken,
                                                   uint8_t* __restrict__ dstScales,
@@ -451,27 +441,33 @@ __device__ __forceinline__ void WarpAccumFp8Quant(Fp8T* __restrict__ dstToken,
                                                   int scaleTypeSize) {
   if (scaleDim <= 0 || scaleTypeSize <= 0) return;
 
-#define FP8_QUANT_CASE(N)                                                                          \
-  case N:                                                                                          \
-    WarpAccumFp8QuantAllAtOnce<Fp8T, N>(dstToken, dstScales, srcs, srcScales, hiddenDim, scaleDim, \
-                                        scaleTypeSize);                                            \
+  assert(scaleDim <= kFp8MaxScaleDim);
+
+  const int blockElems = (hiddenDim + scaleDim - 1) / scaleDim;
+#define FP8_QUANT_PERBLOCK_CASE(N)                                                        \
+  case N:                                                                                 \
+    for (int sb = 0; sb < scaleDim; ++sb) {                                               \
+      WarpAccumFp8QuantPerBlock<Fp8T, N>(dstToken, dstScales, srcs, srcScales, hiddenDim, \
+                                         scaleTypeSize, sb, blockElems);                  \
+    }                                                                                     \
     break;
 
   switch (accumNum) {
-    FP8_QUANT_CASE(1)
-    FP8_QUANT_CASE(2)
-    FP8_QUANT_CASE(4)
-    FP8_QUANT_CASE(6)
-    FP8_QUANT_CASE(8)
-    FP8_QUANT_CASE(10)
+    FP8_QUANT_PERBLOCK_CASE(1)
+    FP8_QUANT_PERBLOCK_CASE(2)
+    FP8_QUANT_PERBLOCK_CASE(4)
+    FP8_QUANT_PERBLOCK_CASE(6)
+    FP8_QUANT_PERBLOCK_CASE(8)
+    FP8_QUANT_PERBLOCK_CASE(10)
+    FP8_QUANT_PERBLOCK_CASE(16)
     default:
       for (int sb = 0; sb < scaleDim; ++sb) {
-        WarpAccumFp8QuantPerDim(dstToken, dstScales, srcs, srcScales, accumNum, hiddenDim, scaleDim,
-                                scaleTypeSize, sb);
+        WarpAccumFp8QuantPerBlockDynamic<Fp8T>(dstToken, dstScales, srcs, srcScales, accumNum,
+                                               hiddenDim, scaleTypeSize, sb, blockElems);
       }
       break;
   }
-#undef FP8_QUANT_CASE
+#undef FP8_QUANT_PERBLOCK_CASE
 }
 
 template <typename T>

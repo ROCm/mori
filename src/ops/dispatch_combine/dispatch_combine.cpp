@@ -76,10 +76,21 @@ mori::application::SymmMemObjPtr ShmemMallocAndReturnMemObjPtr(size_t size, unsi
 void EpDispatchCombineHandle::InitializeShmemBuf() {
   size_t maxTokenSize = static_cast<ssize_t>(config.MaxNumTokensToRecv()) * config.hiddenDim *
                         config.maxTokenTypeSize;
-  size_t maxStagingTokSize = static_cast<ssize_t>(config.MaxNumTokensToRecv()) *
-                             (config.hiddenDim * config.maxTokenTypeSize +
-                              (sizeof(float) + sizeof(index_t)) * config.numExpertPerToken +
-                              config.scaleDim * config.scaleTypeSize);
+
+  size_t xferBytes = config.hiddenDim * config.maxTokenTypeSize +
+                     (sizeof(float) + sizeof(index_t)) * config.numExpertPerToken +
+                     config.scaleDim * config.scaleTypeSize + sizeof(index_t);
+  size_t maxDispatchStagingSize = config.MaxNumTokensToRecv() * xferBytes;
+
+  size_t hiddenBytes = config.hiddenDim * config.maxTokenTypeSize;
+  size_t weightBytes = config.numExpertPerToken * sizeof(float);
+  size_t scaleBytes = config.scaleDim * config.scaleTypeSize;
+  size_t combXferBytes = hiddenBytes + weightBytes + scaleBytes + sizeof(index_t);
+  int nNodes = config.worldSize / config.gpuPerNode;
+  size_t maxCombineStagingSize = 2 * nNodes * config.maxNumInpTokenPerRank * combXferBytes;
+
+  size_t maxStagingTokSize = std::max(maxDispatchStagingSize, maxCombineStagingSize);
+
   shmemDispatchInpTokMemObj =
       ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
   shmemCombineInpTokMemObj =
@@ -177,8 +188,8 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipMalloc(&dispDestTokIdMap, maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispDestTokIdMap, 0, maxNumOutToken * sizeof(index_t)));
 
-  size_t maxNumInterNodeToken = config.worldSize / config.gpuPerNode *
-                                config.maxNumInpTokenPerRank * config.numExpertPerToken;
+  size_t maxNumInterNodeToken =
+      config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken;
   HIP_RUNTIME_CHECK(hipMalloc(&interNodeDispDestTokIdMap, maxNumInterNodeToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(
       hipMemset(interNodeDispDestTokIdMap, 0, maxNumInterNodeToken * sizeof(index_t)));
@@ -323,9 +334,8 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
           EpCombineInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           if (config.useExternalInpBuffer) {
-            // UseP2PRead=false: does not support zero-copy and provides better bandwidth and lower latency
             EpCombineIntraNodeKernel<DataT, false><<<grid, block, sharedMemSize, stream>>>(args);
-          } else { // zero-copy mode (requires UseP2PRead=true)
+          } else {
             EpCombineIntraNodeKernel<DataT, true><<<grid, block, sharedMemSize, stream>>>(args);
           }
         } else {

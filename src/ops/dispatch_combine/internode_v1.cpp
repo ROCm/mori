@@ -59,8 +59,8 @@ namespace moe {
   size_t scaleBytes = (args.config.scaleDim == 0) ? 0 : config.scaleDim * config.scaleTypeSize; \
   size_t xferBytes = hiddenBytes + indexBytes + weightBytes + srcTokenIdBytes + scaleBytes;     \
   size_t combScaleBytes = (args.scalesBuf && (scaleBytes > 0)) ? scaleBytes : 0;                \
-  size_t combXferBytes =                                                                        \
-      hiddenBytes + ((args.weightsBuf == nullptr) ? 0 : weightBytes) + combScaleBytes;
+  size_t combXferBytes = hiddenBytes + ((args.weightsBuf == nullptr) ? 0 : weightBytes) +       \
+                         combScaleBytes + srcTokenIdBytes;
 
 namespace v1 {
 template <typename T>
@@ -490,13 +490,13 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
         bool shouldSkip = (destNode != myNode) || __any((laneId < e) && (destPe == lanePe));
         if (shouldSkip) {
           if (laneId == 0)
-            args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e] = nullTokenId;
+            args.interNodeDispDestTokIdMap[srcTokId * config.numExpertPerToken + e] = nullTokenId;
           continue;
         }
         int destTokId = 0;
         if (laneId == 0) {
           destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
-          args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e] =
+          args.interNodeDispDestTokIdMap[srcTokId * config.numExpertPerToken + e] =
               destPe * config.MaxNumTokensToRecv() + destTokId;
           args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] = srcTokId;
         }
@@ -725,6 +725,13 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
           reinterpret_cast<float*>(stagingPtr + tokenId * combXferBytes + hiddenBytes),
           srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
     }
+    if (laneId == 0) {
+      index_t srcTokId = config.rank * config.maxNumInpTokenPerRank + tokenId;
+      index_t* dstSrcTokId = reinterpret_cast<index_t*>(
+          stagingPtr + tokenId * combXferBytes + hiddenBytes +
+          ((args.weightsBuf == nullptr) ? 0 : weightBytes) + combScaleBytes);
+      *dstSrcTokId = srcTokId;
+    }
   }
 }
 
@@ -745,7 +752,8 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   uint8_t** srcScalesPtr = reinterpret_cast<uint8_t**>(sharedMem) +
                            2 * warpNum * config.numExpertPerToken +
                            warpId * config.numExpertPerToken;
-  uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
+  uint8_t* dispatchStagingPtr = args.shmemDispatchInpTokMemObj->template GetAs<uint8_t*>();
+  uint8_t* combineStagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
 
   int totalBids = 0;
   for (int bid = blockId; bid < numRecvBlock * maxChunkNum * (nNodes - 1);
@@ -796,48 +804,84 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
 
             for (int j = startTokenIdx + (bid % numRecvBlock) * warpNum + warpId; j < endTokenIdx;
                  j += numRecvBlock * warpNum) {
-              int tokIdx = node * config.MaxNumTokensToRecvPerRank() + j;
+              int dispTokIdx = node * config.MaxNumTokensToRecvPerRank() + j;
+              int combTokIdx = node * config.MaxNumTokensToRecvPerRank() + j;
+
+              index_t srcTokId =
+                  *reinterpret_cast<index_t*>(dispatchStagingPtr + dispTokIdx * xferBytes +
+                                              hiddenBytes + indexBytes + weightBytes + scaleBytes);
+
+              int localSrcCount = 0;
               if (laneId < config.numExpertPerToken) {
                 srcPtrs[laneId] = nullptr;
                 srcWeightsPtr[laneId] = nullptr;
                 srcScalesPtr[laneId] = nullptr;
                 index_t destTokId =
-                    args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId];
-                index_t destPe = destTokId / config.MaxNumTokensToRecv();
-                index_t destNode = destPe / config.gpuPerNode;
-                if (destNode == myNode) {
-                  index_t destLocalTokId = destTokId - destPe * config.MaxNumTokensToRecv();
-                  srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
-                                    destLocalTokId * config.hiddenDim;
-                  srcWeightsPtr[laneId] =
-                      args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
-                      destLocalTokId * config.numExpertPerToken;
-                  if (combScaleBytes > 0) {
-                    srcScalesPtr[laneId] =
-                        args.shmemInpScalesMemObj->template GetAs<uint8_t*>(destPe) +
-                        destLocalTokId * scaleBytes;
+                    args.interNodeDispDestTokIdMap[srcTokId * config.numExpertPerToken + laneId];
+                if (destTokId != nullTokenId && destTokId != 0) {
+                  index_t destPe = destTokId / config.MaxNumTokensToRecv();
+                  index_t destNode = destPe / config.gpuPerNode;
+                  if (destNode == myNode) {
+                    index_t destLocalTokId = destTokId - destPe * config.MaxNumTokensToRecv();
+                    srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+                                      destLocalTokId * config.hiddenDim;
+                    srcWeightsPtr[laneId] =
+                        args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
+                        destLocalTokId * config.numExpertPerToken;
+                    if (combScaleBytes > 0) {
+                      srcScalesPtr[laneId] =
+                          args.shmemInpScalesMemObj->template GetAs<uint8_t*>(destPe) +
+                          destLocalTokId * scaleBytes;
+                    }
+                    localSrcCount = 1;
                   }
                 }
-                args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId] = 0;
+                args.interNodeDispDestTokIdMap[srcTokId * config.numExpertPerToken + laneId] = 0;
               }
-              if constexpr (core::IsFp8Type<T>::value) {
-                assert(combScaleBytes > 0);
-                T* dstTok = reinterpret_cast<T*>(stagingPtr + tokIdx * combXferBytes);
-                uint8_t* dstScale = stagingPtr + tokIdx * combXferBytes + hiddenBytes +
-                                    ((args.weightsBuf == nullptr) ? 0 : weightBytes);
-                const uint8_t* const* srcScalesConst =
-                    reinterpret_cast<const uint8_t* const*>(srcScalesPtr);
-                core::WarpAccumFp8Quant<T>(dstTok, dstScale, srcPtrs, srcScalesConst,
-                                           config.numExpertPerToken, config.hiddenDim,
-                                           config.scaleDim, config.scaleTypeSize);
-              } else {
-                core::WarpAccum<T, 4>(reinterpret_cast<T*>(stagingPtr + tokIdx * combXferBytes),
-                                      srcPtrs, nullptr, config.numExpertPerToken, config.hiddenDim);
+
+              for (int delta = 1; delta < config.numExpertPerToken; delta++) {
+                localSrcCount += __shfl(localSrcCount, laneId ^ delta);
               }
-              if (args.weightsBuf) {
-                core::WarpAccum<float, 4>(
-                    reinterpret_cast<float*>(stagingPtr + tokIdx * combXferBytes + hiddenBytes),
-                    srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
+              localSrcCount = __shfl(localSrcCount, 0);
+
+              core::WarpCopy<uint8_t, 4>(combineStagingPtr + combTokIdx * combXferBytes,
+                                         dispatchStagingPtr + dispTokIdx * xferBytes, hiddenBytes);
+              if (combScaleBytes > 0) {
+                core::WarpCopy<uint8_t, 4>(combineStagingPtr + combTokIdx * combXferBytes +
+                                               hiddenBytes +
+                                               ((args.weightsBuf == nullptr) ? 0 : weightBytes),
+                                           dispatchStagingPtr + dispTokIdx * xferBytes +
+                                               hiddenBytes + indexBytes + weightBytes,
+                                           combScaleBytes);
+              }
+              if (laneId == 0) {
+                *reinterpret_cast<index_t*>(
+                    combineStagingPtr + combTokIdx * combXferBytes + hiddenBytes +
+                    ((args.weightsBuf == nullptr) ? 0 : weightBytes) + combScaleBytes) = srcTokId;
+              }
+
+              if (localSrcCount > 0) {
+                if constexpr (core::IsFp8Type<T>::value) {
+                  assert(combScaleBytes > 0);
+                  T* dstTok = reinterpret_cast<T*>(combineStagingPtr + combTokIdx * combXferBytes);
+                  uint8_t* dstScale = combineStagingPtr + combTokIdx * combXferBytes + hiddenBytes +
+                                      ((args.weightsBuf == nullptr) ? 0 : weightBytes);
+                  const uint8_t* const* srcScalesConst =
+                      reinterpret_cast<const uint8_t* const*>(srcScalesPtr);
+                  core::WarpAccumFp8Quant<T>(dstTok, dstScale, srcPtrs, srcScalesConst,
+                                             config.numExpertPerToken, config.hiddenDim,
+                                             config.scaleDim, config.scaleTypeSize);
+                } else {
+                  core::WarpAccum<T, 4>(
+                      reinterpret_cast<T*>(combineStagingPtr + combTokIdx * combXferBytes), srcPtrs,
+                      nullptr, config.numExpertPerToken, config.hiddenDim);
+                }
+                if (args.weightsBuf) {
+                  core::WarpAccum<float, 4>(
+                      reinterpret_cast<float*>(combineStagingPtr + combTokIdx * combXferBytes +
+                                               hiddenBytes),
+                      srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
+                }
               }
             }
 
