@@ -47,8 +47,11 @@ int AllGather_sdma(T* input, T* output, size_t total_count,
   }
   memset(flags, 0, flagsSize);
   application::SymmMemObjPtr flagsObj = shmem::ShmemQueryMemObjPtr(flags);
+  assert(inPutBuffObj.IsValid());
+  assert(outPutBuffObj.IsValid());
+  assert(flagsBuffObj.IsValid());
 
-  OneShotAllGatherSdmaKernel<T><<<1, 256, 0, stream>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
+  OneShotAllGatherSdmaKernel<T><<<1, 256>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
 
   shmem::ShmemFree(flags);
   return 0;
