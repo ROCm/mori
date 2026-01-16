@@ -58,12 +58,12 @@ void testOneShotSdmaAllGather() {
 
   //void* outPutBuff = ShmemMalloc(totalBytes);
   uint32_t* outPutBuff = nullptr;
-  HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&outPutBuff, totalBytes, hipDeviceMallocUncached));
+  HIP_RUNTIME_CHECK(hipExtMallocWithFlags((void**)&outPutBuff, totalBytes, hipDeviceMallocUncached));
   assert(outPutBuff != nullptr);
 
   // void* inPutBuff = ShmemMalloc(bytesPerPe);
   uint32_t* inPutBuff = nullptr;
-  HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&inPutBuff, totalBytes, hipDeviceMallocUncached));
+  HIP_RUNTIME_CHECK(hipExtMallocWithFlags((void**)&inPutBuff, totalBytes, hipDeviceMallocUncached));
   assert(inPutBuff != nullptr);
 
   // Initialize data buffer: each PE initializes only its own chunk
