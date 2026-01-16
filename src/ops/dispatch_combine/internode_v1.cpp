@@ -326,6 +326,7 @@ template <typename T>
 inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
 
+  /*
   // Distribute tokens evenly to all blocks (optimized for LL scenario with small token counts)
   int tokenPerBlock = core::CeilDiv(args.curRankNumToken, config.rdmaBlockNum);
 
@@ -371,6 +372,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
                                __HIP_MEMORY_SCOPE_AGENT) != 0);
     }
   }
+  */
 
   // Then send to other nodes
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
@@ -431,7 +433,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
     }
   }
 
-  finishedWarp = 0;
+  int finishedWarp = 0;
   if (laneId == 0) finishedWarp = atomicAdd(&args.interNodeBlocksBarrier[1], 1);
   finishedWarp = __shfl(finishedWarp, 0);
   if ((finishedWarp + 1) == (config.rdmaBlockNum * warpNum)) {
