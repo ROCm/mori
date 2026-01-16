@@ -28,6 +28,7 @@
 
 #include "mori/application/utils/check.hpp"
 #include "mori/collective/allgather/oneshot_sdma_kernel.hpp"
+#include "mori/collective/allgather/sdma_allgather.hpp"
 #include "mori/collective/allgather/oneshot_sdma_async_kernel.hpp"
 #include "mori/shmem/shmem.hpp"
 
@@ -55,11 +56,14 @@ void testOneShotSdmaAllGather() {
   const size_t bytesPerPe = elemsPerPe * sizeof(uint32_t);
   const size_t totalBytes = bytesPerPe * npes;  // Total buffer size
 
-  // Allocate data buffer - each PE will fill its own chunk initially
-  void* outPutBuff = ShmemMalloc(totalBytes);
+  //void* outPutBuff = ShmemMalloc(totalBytes);
+  uint32_t* outPutBuff = nullptr;
+  HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&outPutBuff, totalBytes, hipDeviceMallocUncached));
   assert(outPutBuff != nullptr);
 
-  void* inPutBuff = ShmemMalloc(bytesPerPe);
+  // void* inPutBuff = ShmemMalloc(bytesPerPe);
+  uint32_t* inPutBuff = nullptr;
+  HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&inPutBuff, totalBytes, hipDeviceMallocUncached));
   assert(inPutBuff != nullptr);
 
   // Initialize data buffer: each PE initializes only its own chunk
@@ -108,39 +112,50 @@ void testOneShotSdmaAllGather() {
     printf("...\n");
   }
 
-  MPI_Barrier(MPI_COMM_WORLD);
+  // Launch AllGather kernel
+  const int blockSize = 256;
+  const int numBlocks = 1;
+  bool use_async = 1;
+  hipStream_t stream;
+  HIP_RUNTIME_CHECK(hipStreamCreate(&stream));
 
+  MPI_Barrier(MPI_COMM_WORLD);
   if (myPe == 0) {
     printf("\n=== Starting AllGather Operation ===\n\n");
   }
 
   MPI_Barrier(MPI_COMM_WORLD);
 
-  // Launch AllGather kernel
-  const int blockSize = 256;
-  const int numBlocks = 1;
-  bool use_async = 1;
-  if(!use_async)
-    OneShotAllGatharSdmaKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
+  double start = MPI_Wtime();
+  if(1)
+    AllGather_sdma(inPutBuff, outPutBuff, elemsPerPe, stream)
+    //OneShotAllGatharSdmaKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
+
   else{
-    OneShotAllGatharSdmaAsyncPutKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
-    OneShotAllGatharSdmaAsyncWaitKernel<<<numBlocks, blockSize>>>(myPe, npes,  outPutBuffObj, flagsBuffObj);
+//    OneShotAllGatharSdmaAsyncPutKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
+//    OneShotAllGatharSdmaAsyncWaitKernel<<<numBlocks, blockSize>>>(myPe, npes,  outPutBuffObj, flagsBuffObj);
   }
-
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  double end = MPI_Wtime();
+  double local_duration = end - start;
 
+  double global_max_duration;
+  MPI_Reduce(&local_duration, &global_max_duration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
   MPI_Barrier(MPI_COMM_WORLD);
 
   if (myPe == 0) {
     printf("=== AllGather Operation Completed ===\n\n");
+    double global_bandwidth = totalBytes / global_max_duration;
+    global_bandwidth /= (1024.0 * 1024.0 * 1024.0);
+    printf("========global bandwidth (base on slowest progress): %.2f GB/s ======== \n", global_bandwidth);
   }
-
   MPI_Barrier(MPI_COMM_WORLD);
 
   // Copy result back to host for verification
   HIP_RUNTIME_CHECK(hipMemcpy(hostData, outPutBuff, totalBytes, hipMemcpyDeviceToHost));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
+  #if 0
   printf("PE %d: AllGather result (showing first 4 elements of each chunk):\n", myPe);
   for (int pe = 0; pe < npes; pe++) {
     printf("  Chunk %d: ", pe);
@@ -149,6 +164,7 @@ void testOneShotSdmaAllGather() {
     }
     printf("...\n");
   }
+  #endif
 
   // Verify the result
   bool success = true;

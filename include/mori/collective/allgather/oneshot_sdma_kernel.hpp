@@ -28,11 +28,8 @@
 
 namespace mori {
 namespace collective {
-
-// One-shot all-reduce: single phase.
-// Every GPU reads the full buffer from all peers, accumulates locally, and writes the result.
 template <typename T>
-__global__ void OneShotAllGatharSdmaKernel(int myPe, int npes,
+__global__ void OneShotAllGatherSdmaKernel(int myPe, int npes,
                                        const application::SymmMemObjPtr srcMemObj,
                                        const application::SymmMemObjPtr dstMemObj,
                                        const application::SymmMemObjPtr flagsMemObj,
