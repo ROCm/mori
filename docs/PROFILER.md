@@ -26,7 +26,14 @@ Ensure you have the profiler headers available. The main entry point is typicall
 
 In your kernel or device function, you need to initialize the profiler context. It is recommended to use the generated `<FILENAME>_PROFILER_INIT_CONTEXT` macro, which handles wrapping and namespacing for you.
 
-The macro naming follows the pattern: `<UPPERCASE_FILENAME>_PROFILER_INIT_CONTEXT`, where `FILENAME` is the base name of your source file (e.g., `my_kernel.cpp` → `MY_KERNEL_PROFILER_INIT_CONTEXT`).
+**Naming Convention**: All generated names are derived from the source filename (without extension). For example, if your file is `my_kernel.cpp`:
+
+| Generated Item | Naming Pattern | Example |
+|---------------|----------------|---------|
+| C++ Macro | `<UPPERCASE_FILENAME>_PROFILER_INIT_CONTEXT` | `MY_KERNEL_PROFILER_INIT_CONTEXT` |
+| Python Module | `mori.cpp.<CamelCaseFilename>Slots` | `mori.cpp.MyKernelSlots` |
+
+> **Note**: For filenames with underscores like `internode_v1.cpp`, the CamelCase conversion produces `InternodeV1`, so the Python module would be `mori.cpp.InternodeV1Slots`.
 
 ```cpp
 // Example: in a file named 'my_kernel.cpp'
@@ -94,39 +101,71 @@ MORI_TRACE_INSTANT(profiler, Slot::Checkpoint);
 
 ## Build & Code Generation
 
+### Enabling the Profiler
+
+To enable profiling, set the `ENABLE_PROFILER` option before building:
+
+```bash
+# Using setup.py
+ENABLE_PROFILER=ON pip install -e .
+
+# Using CMake directly
+cmake -DENABLE_PROFILER=ON -B build -S .
+cmake --build build
+```
+
+### Code Generation
+
 The profiler relies on a code generation script `tools/generate_profiler_bindings.py`. This script:
 1.  Scans `src/` for `MORI_TRACE_*` usage.
 2.  Extracts unique slot names.
-3.  Generates C++ headers (e.g., `include/mori/profiler/.../slots.hpp`).
+3.  Generates C++ headers into the build directory (e.g., `build/generated/include/mori/profiler/.../slots.hpp`).
 4.  Generates Python bindings to map enum values to strings.
 
-This is typically integrated into your `CMakeLists.txt`. If you add new slots, simply rebuild the project, and the new slots will be available in Python.
+This is integrated into CMake and runs automatically at configure time. If you add new slots, simply rebuild the project, and the new slots will be available in Python.
 
 ## Python Analysis
 
-After running your kernel and copying the debug buffer back to the host, use the Python API to export the trace.
+After running your kernel, use the Python API to export the trace.
 
 ```python
-import torch
 import mori
 from mori.kernel_profiler import export_to_perfetto
 
-# ... run kernel ...
-# Copy debug buffer from device to host
-# debug_buffer_gpu comes from your ProfilerConfig
-debug_buffer_cpu = debug_buffer_gpu.cpu()
+# Create and run your operation
+op = mori.ops.EpDispatchCombineOp(config)
+# ... run dispatch/combine ...
 
-# Option 1: Auto-discover all slots (simplest, recommended)
-export_to_perfetto(debug_buffer_cpu, "trace.json")
+# Get debug buffer from handle (only available when ENABLE_PROFILER=ON)
+if hasattr(mori.cpp, "get_debug_time_buf"):
+    trace_buffer = mori.cpp.get_debug_time_buf(op._handle)
 
-# Option 2: Use the merged ALL_PROFILER_SLOTS (explicit)
-export_to_perfetto(debug_buffer_cpu, "trace.json", mori.cpp.ALL_PROFILER_SLOTS)
+    # Option 1: Auto-discover all slots (simplest, recommended)
+    export_to_perfetto(trace_buffer, "trace.json")
 
-# Option 3: Use specific module slots (if you know which module)
-export_to_perfetto(debug_buffer_cpu, "trace.json", mori.cpp.InternodeV1Slots)
+    # Option 2: Use the merged ALL_PROFILER_SLOTS (explicit)
+    export_to_perfetto(trace_buffer, "trace.json", mori.cpp.ALL_PROFILER_SLOTS)
+
+    # Option 3: Use specific module slots (if you know which module)
+    # Module name is derived from filename: internode_v1.cpp -> InternodeV1Slots
+    export_to_perfetto(trace_buffer, "trace.json", mori.cpp.InternodeV1Slots)
 ```
 
 The first option is recommended as it automatically discovers all profiler slots from your build.
+
+### GPU Frequency Configuration
+
+The `gpu_freq_ghz` parameter converts raw GPU clock cycles to microseconds. The default `1.7` is approximate for MI300X.
+
+To get accurate timing:
+1. Query the actual SCLK frequency:
+   ```bash
+   rocm-smi --showclocks
+   ```
+2. Pass the value to `export_to_perfetto`:
+   ```python
+   export_to_perfetto(trace_buffer, "trace.json", gpu_freq_ghz=1.9)
+   ```
 
 ### Viewing the Trace
 
@@ -138,3 +177,14 @@ The first option is recommended as it automatically discovers all profiler slots
 
 -   **Minimize Scope**: Keep profiled regions granular but not too small (overhead vs visibility).
 -   **Conditional Compilation**: The `ENABLE_PROFILER` macro controls whether profiling code is compiled. In production builds, this is typically disabled to ensure zero overhead.
+-   **Buffer Limits**: Each warp can store up to 16384 events in a circular buffer. The system supports up to 512 warps per rank by default. If profiling long-running kernels or multiple iterations, clear the buffer between runs to avoid data overlap:
+    ```python
+    trace_buffer = mori.cpp.get_debug_time_buf(handle)
+    trace_buffer.zero_()  # Clear before next profiled iteration
+
+    # Also clear the offset buffer if needed
+    if hasattr(mori.cpp, "get_debug_time_offset"):
+        offset_buffer = mori.cpp.get_debug_time_offset(handle)
+        offset_buffer.zero_()
+    ```
+-   **Single Iteration for Profiling**: When profiling, consider running only one iteration to get a clean trace without buffer wraparound.
