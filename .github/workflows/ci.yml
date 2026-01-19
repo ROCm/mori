@@ -32,9 +32,9 @@ jobs:
           pwd
           id
           ls
-          #rm -rf mori 
+          rm -rf mori 
           #git clone https://github.com/zhangfei829/mytest.git
-          #git clone https://github.com/ROCm/mori.git
+          git clone https://github.com/ROCm/mori.git
           cd mori
           ls
           rm -rf build
@@ -46,7 +46,7 @@ jobs:
           pip3 install . --no-build-isolation
           #USE_IONIC=ON pip3 install . --no-build-isolation --target /apps/mori-ci/python-packages
           #make
-          scp -P 2233 -r /home/fizhang/actions-runner/_work/mori/mori/mori root@banff-pla-r25-14:/home/fizhang/actions-runner/_work/mori/mori/
+          #scp -P 2233 -r /home/fizhang/actions-runner/_work/mori/mori/mori root@banff-pla-r25-14:/home/fizhang/actions-runner/_work/mori/mori/
   test:
     name: mori test
     needs: build
