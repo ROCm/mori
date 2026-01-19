@@ -108,19 +108,19 @@ jobs:
           echo "1. mori-shmem test case: test_api.py"
           pytest ./tests/python/shmem/test_api.py
 
-          echo "2. mori-shmem test case: test_api.py"
-          mpiexec --allow-run-as-root np 2 ./build/examples/concurrent_put_thread
+          echo "2. mori-shmem test case: concurrent_put_thread"
+          mpiexec --allow-run-as-root -np 2 ./build/examples/concurrent_put_thread
 
-          echo "3. mori-shmem test case: test_api.py"
+          echo "3. mori-shmem test case: concurrent_put_imm_thread"
           mpiexec --allow-run-as-root  -np 2 ./build/examples/concurrent_put_imm_thread
 
-          echo "4. mori-shmem test case: test_api.py"
+          echo "4. mori-shmem test case: concurrent_put_signal_thread"
           mpiexec --allow-run-as-root  -np 2 ./build/examples/concurrent_put_signal_thread
 
-          echo "1. mori-ep test case: test_api.py"
+          echo "1. mori-ep test case: test_dispatch_combine.py"
           pytest ./tests/python/ops/test_dispatch_combine.py
 
-          echo "3. mori-ep test case: bench"
+          echo "3. mori-ep test case: bench_dispatch_combine.py"
           pytest ./tests/python/ops/bench_dispatch_combine.py
 
           echo "3. mori-ep test case: bench"
