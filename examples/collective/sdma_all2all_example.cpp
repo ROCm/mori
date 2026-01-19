@@ -36,7 +36,7 @@ using namespace mori::application;
 using namespace mori::shmem;
 using namespace mori::collective;
 
-void testOneShotSdmaAllGather() {
+void testOneShotSdmaAll2all() {
   int status;
 
   // Initialize SHMEM
@@ -194,6 +194,6 @@ void testOneShotSdmaAllGather() {
 }
 
 int main(int argc, char* argv[]) {
-  testOneShotSdmaAllGather();
+  testOneShotSdmaAll2all();
   return 0;
 }
