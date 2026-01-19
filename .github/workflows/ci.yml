@@ -18,17 +18,6 @@ jobs:
           echo "0. PATH: $PATH"
           #export PATH="/home/runner/.local/bin:$PATH"
           cmake --version
-          echo "=== CMake 版本诊断 ==="
-          echo "1. PATH: $PATH"
-          echo "2. which cmake: $(which cmake)"
-          echo "3. 所有 cmake 路径:"
-          which -a cmake
-          echo "4. 各路径版本:"
-          for cmd in $(which -a cmake); do
-            echo "   $cmd: $($cmd --version | head -n1)"
-          done
-          echo "5. 当前 shell: $SHELL"
-          
           pwd
           id
           ls
