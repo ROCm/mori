@@ -128,7 +128,5 @@ jobs:
           
           #echo "4. mori-ep test case: inter bench"
           #ssh -p 2233 root@banff-pla-r25-14 "hostname"
-          #GLOO_SOCKET_IFNAME=ens14np0 PYTHONPATH=$(pwd):$PYTHONPATH torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="banff-pla-r25-05" --master_port=1234 examples/ops/dispatch_combine/test_di
-spatch_combine_internode.py --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096 &
-          #ssh -p 2233 root@banff-pla-r25-14 "GLOO_SOCKET_IFNAME=ens14np0 PYTHONPATH=$(pwd):$PYTHONPATH /opt/conda/envs/py_3.10/bin/torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 --master_addr='banff-pla-r
-25-05' --master_port=1234 /home/fizhang/actions-runner/_work/mori/mori/mori/examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096 &"          
+          #GLOO_SOCKET_IFNAME=ens14np0 PYTHONPATH=$(pwd):$PYTHONPATH torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="banff-pla-r25-05" --master_port=1234 examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096 &
+          #ssh -p 2233 root@banff-pla-r25-14 "GLOO_SOCKET_IFNAME=ens14np0 PYTHONPATH=$(pwd):$PYTHONPATH /opt/conda/envs/py_3.10/bin/torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 --master_addr='banff-pla-r25-05' --master_port=1234 /home/fizhang/actions-runner/_work/mori/mori/mori/examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096 &"          
