@@ -60,6 +60,7 @@ jobs:
       #- run: pip install -r requirements.txt
       - name: Run tests
         run: |
+          pwd
           cd mori
           #id ci
           #groups
@@ -79,7 +80,7 @@ jobs:
           #python test.py
           #bash test.sh
           
-          export PYTHONPATH=/home/fizhang/actions-runner/_work/mori/mori/mori:$PYTHONPATH
+          export PYTHONPATH=/root/actions-runner/_work/mori/mori/mori:$PYTHONPATH
           #export PYTHONPATH=/apps/mori-ci/python-packages:$PYTHONPATH
           #python3 tests/python/ops/bench_dispatch_combine.py
           #pytest -v tests/python/ops/
