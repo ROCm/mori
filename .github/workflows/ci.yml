@@ -64,7 +64,6 @@ jobs:
           pwd
           ls
           cd mori
-          ls
           #id ci
           #groups
           #id -G
