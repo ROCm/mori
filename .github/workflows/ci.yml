@@ -120,8 +120,8 @@ jobs:
           echo "1. mori-ep test case: test_dispatch_combine.py"
           pytest ./tests/python/ops/test_dispatch_combine.py
 
-          echo "3. mori-ep test case: bench_dispatch_combine.py"
-          pytest ./tests/python/ops/bench_dispatch_combine.py
+          echo "2. mori-ep test case: bench_dispatch_combine.py"
+          python3 ./tests/python/ops/bench_dispatch_combine.py
 
           echo "3. mori-ep test case: bench"
           GLOO_SOCKET_IFNAME=enp81s0f1 PYTHONPATH=/apps/fizhang/4node/mori:$PYTHONPATH torchrun --nnodes=1 --node_rank=0 --nproc_per_node=1 --master_addr="smci355-ccs-aus-n08-29" --master_port=2222 examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096
