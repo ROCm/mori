@@ -236,6 +236,10 @@ void MemoryStatesInit() {
   states->memoryStates->staticHeapUsed = HEAP_INITIAL_OFFSET;
   states->memoryStates->staticHeapObj = heapObj;
 
+  // Initialize VA manager for static heap to enable memory reuse
+  states->memoryStates->symmMemMgr->InitHeapVAManager(
+      reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr), heapSize);
+
   MORI_SHMEM_INFO(
       "Static symmetric heap allocated at {} (local), size {} bytes, initial offset {} bytes",
       states->memoryStates->staticHeapBasePtr, heapSize, HEAP_INITIAL_OFFSET);
@@ -292,7 +296,8 @@ void GpuStateInit() {
     gpuStates.heapEndAddr = 0;
     gpuStates.heapObj = nullptr;
     MORI_SHMEM_INFO("Isolation mode: no heap info copied to GPU");
-  } else if (states->memoryStates->useVMMHeap && states->memoryStates->vmmHeapInitialized) {
+  } else if (states->mode == ShmemMode::VMHeap && states->memoryStates->useVMMHeap &&
+             states->memoryStates->vmmHeapInitialized) {
     // VMM heap mode
     uintptr_t heapBase = reinterpret_cast<uintptr_t>(states->memoryStates->vmmHeapBaseAddr);
     gpuStates.heapBaseAddr = heapBase;
@@ -303,8 +308,8 @@ void GpuStateInit() {
         gpuStates.heapBaseAddr, gpuStates.heapEndAddr,
         gpuStates.heapEndAddr - gpuStates.heapBaseAddr,
         reinterpret_cast<uintptr_t>(gpuStates.heapObj));
-  } else if (states->memoryStates->staticHeapObj.IsValid()) {
-    // Static heap mode (or fallback from VMM)
+  } else if (states->mode == ShmemMode::StaticHeap && states->memoryStates->staticHeapObj.IsValid()) {
+    // Static heap mode
     uintptr_t heapBase = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
     gpuStates.heapBaseAddr = heapBase;
     gpuStates.heapEndAddr = heapBase + states->memoryStates->staticHeapSize;
@@ -315,11 +320,12 @@ void GpuStateInit() {
         gpuStates.heapEndAddr - gpuStates.heapBaseAddr,
         reinterpret_cast<uintptr_t>(gpuStates.heapObj));
   } else {
-    // No heap allocated (shouldn't happen in normal flow)
+    // Mode/heap mismatch or invalid configuration
     gpuStates.heapBaseAddr = 0;
     gpuStates.heapEndAddr = 0;
     gpuStates.heapObj = nullptr;
-    MORI_SHMEM_WARN("No valid heap found, GPU heap info set to null");
+    MORI_SHMEM_WARN("Invalid heap configuration for mode {}, GPU heap info set to null",
+                    static_cast<int>(states->mode));
   }
 
   // Copy gpu states to constant memory

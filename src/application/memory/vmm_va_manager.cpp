@@ -28,22 +28,22 @@
 namespace mori {
 namespace application {
 
-VMMVAManager::VMMVAManager(uintptr_t baseAddr, size_t totalSize, size_t granularity)
+HeapVAManager::HeapVAManager(uintptr_t baseAddr, size_t totalSize, size_t granularity)
     : baseAddr_(baseAddr), totalSize_(totalSize), granularity_(granularity) {
   // Initialize with one large free block
   VABlock initialBlock(baseAddr, totalSize, true);
   blocks_[baseAddr] = initialBlock;
   endAddrToStartAddr_[baseAddr + totalSize] = baseAddr;
   
-  MORI_APP_INFO("VMMVAManager initialized: baseAddr={:p}, totalSize={} bytes, granularity={} bytes", 
+  MORI_APP_INFO("HeapVAManager initialized: baseAddr={:p}, totalSize={} bytes, granularity={} bytes", 
                 reinterpret_cast<void*>(baseAddr), totalSize, granularity);
 }
 
-size_t VMMVAManager::AlignSize(size_t size, size_t alignment) {
+size_t HeapVAManager::AlignSize(size_t size, size_t alignment) {
   return (size + alignment - 1) & ~(alignment - 1);
 }
 
-uintptr_t VMMVAManager::Allocate(size_t size, size_t alignment) {
+uintptr_t HeapVAManager::Allocate(size_t size, size_t alignment) {
   std::lock_guard<std::mutex> lock(mutex_);
   
   if (size == 0) {
@@ -53,7 +53,7 @@ uintptr_t VMMVAManager::Allocate(size_t size, size_t alignment) {
   // Align the requested size
   size_t alignedSize = AlignSize(size, alignment);
   
-  MORI_APP_TRACE("VMMVAManager::Allocate requesting {} bytes (aligned: {}), granularity: {}", 
+  MORI_APP_TRACE("HeapVAManager::Allocate requesting {} bytes (aligned: {}), granularity: {}", 
                  size, alignedSize, granularity_);
   
   // First-fit search: iterate through blocks_ map (already sorted by address)
@@ -86,7 +86,7 @@ uintptr_t VMMVAManager::Allocate(size_t size, size_t alignment) {
       
       // If allocation would cross the boundary, skip to next boundary (only once)
       if (allocEnd > nextBoundary) {
-        MORI_APP_TRACE("VMMVAManager::Allocate: allocation would cross granularity boundary "
+        MORI_APP_TRACE("HeapVAManager::Allocate: allocation would cross granularity boundary "
                        "at {:p}, skipping to next boundary at {:p}",
                        reinterpret_cast<void*>(nextBoundary),
                        reinterpret_cast<void*>(nextBoundary));
@@ -128,7 +128,7 @@ uintptr_t VMMVAManager::Allocate(size_t size, size_t alignment) {
         blocks_[allocAddr] = allocBlock;
         endAddrToStartAddr_[allocAddr + alignedSize] = allocAddr;
         
-        MORI_APP_TRACE("VMMVAManager::Allocate exact fit after alignment at {:p}, size={}", 
+        MORI_APP_TRACE("HeapVAManager::Allocate exact fit after alignment at {:p}, size={}", 
                        reinterpret_cast<void*>(allocAddr), alignedSize);
         return allocAddr;
       }
@@ -147,7 +147,7 @@ uintptr_t VMMVAManager::Allocate(size_t size, size_t alignment) {
       blocks_[remainingAddr] = remainingBlock;
       endAddrToStartAddr_[remainingAddr + remainingSize] = remainingAddr;
       
-      MORI_APP_TRACE("VMMVAManager::Allocate split after alignment at {:p}, allocated={}, remaining={}", 
+      MORI_APP_TRACE("HeapVAManager::Allocate split after alignment at {:p}, allocated={}, remaining={}", 
                      reinterpret_cast<void*>(allocAddr), alignedSize, remainingSize);
       return allocAddr;
     }
@@ -159,7 +159,7 @@ uintptr_t VMMVAManager::Allocate(size_t size, size_t alignment) {
     if (currentBlock.size == alignedSize) {
       currentBlock.isFree = false;
       // No need to update endAddrToStartAddr_ as size doesn't change
-      MORI_APP_TRACE("VMMVAManager::Allocate found exact fit at {:p}, size={}", 
+      MORI_APP_TRACE("HeapVAManager::Allocate found exact fit at {:p}, size={}", 
                      reinterpret_cast<void*>(allocAddr), alignedSize);
       return allocAddr;
     }
@@ -181,23 +181,23 @@ uintptr_t VMMVAManager::Allocate(size_t size, size_t alignment) {
     blocks_[remainingAddr] = remainingBlock;
     endAddrToStartAddr_[remainingAddr + remainingSize] = remainingAddr;
     
-    MORI_APP_TRACE("VMMVAManager::Allocate split block at {:p}, allocated={}, remaining={}", 
+    MORI_APP_TRACE("HeapVAManager::Allocate split block at {:p}, allocated={}, remaining={}", 
                    reinterpret_cast<void*>(allocAddr), alignedSize, remainingSize);
     return allocAddr;
   }
   
   // No suitable free block found
-  MORI_APP_WARN("VMMVAManager::Allocate failed: no free block of size {} bytes available", alignedSize);
+  MORI_APP_WARN("HeapVAManager::Allocate failed: no free block of size {} bytes available", alignedSize);
   return 0;
 }
 
-bool VMMVAManager::Free(uintptr_t addr) {
+bool HeapVAManager::Free(uintptr_t addr) {
   std::lock_guard<std::mutex> lock(mutex_);
   
   // Find the block in the map
   auto it = blocks_.find(addr);
   if (it == blocks_.end()) {
-    MORI_APP_ERROR("VMMVAManager::Free failed: address {:p} not found", 
+    MORI_APP_ERROR("HeapVAManager::Free failed: address {:p} not found", 
                    reinterpret_cast<void*>(addr));
     return false;
   }
@@ -205,12 +205,12 @@ bool VMMVAManager::Free(uintptr_t addr) {
   VABlock& block = it->second;
   
   if (block.isFree) {
-    MORI_APP_WARN("VMMVAManager::Free: block at {:p} already free (double free?)", 
+    MORI_APP_WARN("HeapVAManager::Free: block at {:p} already free (double free?)", 
                   reinterpret_cast<void*>(addr));
     return false;
   }
   
-  MORI_APP_TRACE("VMMVAManager::Free freeing block at {:p}, size={}", 
+  MORI_APP_TRACE("HeapVAManager::Free freeing block at {:p}, size={}", 
                  reinterpret_cast<void*>(addr), block.size);
   
   // Mark as free
@@ -222,7 +222,7 @@ bool VMMVAManager::Free(uintptr_t addr) {
   return true;
 }
 
-void VMMVAManager::CoalesceAdjacentBlocks(uintptr_t addr) {
+void HeapVAManager::CoalesceAdjacentBlocks(uintptr_t addr) {
   // Must be called with mutex already locked
   // This function immediately coalesces the block at addr with adjacent free blocks
   // Using map iterators for O(log n) neighbor lookup
@@ -244,7 +244,7 @@ void VMMVAManager::CoalesceAdjacentBlocks(uintptr_t addr) {
   if (nextIt != blocks_.end() && nextIt->second.isFree) {
     VABlock& nextBlock = nextIt->second;
     
-    MORI_APP_TRACE("VMMVAManager coalescing block at {:p} (size={}) with next block at {:p} (size={})", 
+    MORI_APP_TRACE("HeapVAManager coalescing block at {:p} (size={}) with next block at {:p} (size={})", 
                    reinterpret_cast<void*>(currentBlock.startAddr), currentBlock.size,
                    reinterpret_cast<void*>(nextBlock.startAddr), nextBlock.size);
     
@@ -273,7 +273,7 @@ void VMMVAManager::CoalesceAdjacentBlocks(uintptr_t addr) {
     if (prevIt != blocks_.end() && prevIt->second.isFree) {
       VABlock& prevBlock = prevIt->second;
       
-      MORI_APP_TRACE("VMMVAManager coalescing block at {:p} (size={}) with prev block at {:p} (size={})", 
+      MORI_APP_TRACE("HeapVAManager coalescing block at {:p} (size={}) with prev block at {:p} (size={})", 
                      reinterpret_cast<void*>(currentBlock.startAddr), currentBlock.size,
                      reinterpret_cast<void*>(prevBlock.startAddr), prevBlock.size);
       
@@ -294,10 +294,10 @@ void VMMVAManager::CoalesceAdjacentBlocks(uintptr_t addr) {
     }
   }
   
-  MORI_APP_TRACE("VMMVAManager coalescing completed, total blocks: {}", blocks_.size());
+  MORI_APP_TRACE("HeapVAManager coalescing completed, total blocks: {}", blocks_.size());
 }
 
-void VMMVAManager::CoalesceFreeBlocks() {
+void HeapVAManager::CoalesceFreeBlocks() {
   // Legacy full-scan method - now less efficient than CoalesceAdjacentBlocks
   // Kept for compatibility but not recommended
   // The new map-based implementation makes this less useful
@@ -324,7 +324,7 @@ void VMMVAManager::CoalesceFreeBlocks() {
       auto nextIt = blocks_.find(currentEnd);
       
       if (nextIt != blocks_.end() && nextIt->second.isFree) {
-        MORI_APP_TRACE("VMMVAManager full coalesce: merging {:p} and {:p}",
+        MORI_APP_TRACE("HeapVAManager full coalesce: merging {:p} and {:p}",
                        reinterpret_cast<void*>(it->first),
                        reinterpret_cast<void*>(nextIt->first));
         
@@ -349,7 +349,7 @@ void VMMVAManager::CoalesceFreeBlocks() {
   }
 }
 
-size_t VMMVAManager::GetBlockSize(uintptr_t addr) const {
+size_t HeapVAManager::GetBlockSize(uintptr_t addr) const {
   std::lock_guard<std::mutex> lock(mutex_);
   
   auto it = blocks_.find(addr);
@@ -360,7 +360,7 @@ size_t VMMVAManager::GetBlockSize(uintptr_t addr) const {
   return it->second.size;
 }
 
-void VMMVAManager::GetStats(size_t& totalBlocks, size_t& freeBlocks, 
+void HeapVAManager::GetStats(size_t& totalBlocks, size_t& freeBlocks, 
                            size_t& allocatedBlocks, size_t& totalFreeSpace, 
                            size_t& largestFreeBlock) const {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -383,14 +383,14 @@ void VMMVAManager::GetStats(size_t& totalBlocks, size_t& freeBlocks,
   }
 }
 
-bool VMMVAManager::IsValidAddress(uintptr_t addr) const {
+bool HeapVAManager::IsValidAddress(uintptr_t addr) const {
   return addr >= baseAddr_ && addr < baseAddr_ + totalSize_;
 }
 
-void VMMVAManager::Reset() {
+void HeapVAManager::Reset() {
   std::lock_guard<std::mutex> lock(mutex_);
   
-  MORI_APP_INFO("VMMVAManager::Reset clearing all allocations");
+  MORI_APP_INFO("HeapVAManager::Reset clearing all allocations");
   
   blocks_.clear();
   endAddrToStartAddr_.clear();

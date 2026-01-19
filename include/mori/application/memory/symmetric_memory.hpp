@@ -43,8 +43,16 @@ struct SymmMemObj {
   uintptr_t* peerPtrs{nullptr};
   size_t size{0};
   // For Rdma
-  uint32_t lkey{nullptr};
+  uint32_t lkey{0};
   uint32_t* peerRkeys{nullptr};
+  
+  // For VMM allocations: which chunks this object spans
+  uint32_t* vmmLkeys{nullptr};
+  uint32_t* vmmRkeys{nullptr};
+  size_t startChunk{0};
+  size_t numChunks{0};
+  uint8_t chunkSizeShift{0};
+  int worldSize{0};
   // For IPC
   hipIpcMemHandle_t* ipcMemHandles{nullptr};  // should only placed on cpu
 
@@ -61,6 +69,26 @@ struct SymmMemObj {
     mr.rkey = peerRkeys[pe];
     mr.length = size;
     return mr;
+  }
+
+  // Get RDMA lkey for a given offset (handles both static heap and VMM heap)
+  inline __device__ __host__ uint32_t GetLkey(size_t offset = 0) const {
+    if (vmmLkeys) {
+      // VMM allocation: use bit shift for fast division
+      size_t chunkIdx = startChunk + (offset >> chunkSizeShift);
+      return vmmLkeys[chunkIdx];
+    }
+    return lkey;
+  }
+
+  // Get RDMA rkey for a given PE and offset (handles both static heap and VMM heap)
+  inline __device__ __host__ uint32_t GetRkey(int pe, size_t offset = 0) const {
+    if (vmmRkeys) {
+      // VMM allocation: use bit shift for fast division
+      size_t chunkIdx = startChunk + (offset >> chunkSizeShift);
+      return vmmRkeys[chunkIdx * worldSize + pe];
+    }
+    return peerRkeys[pe];
   }
 
   // Get pointers
@@ -127,6 +155,14 @@ class SymmMemManager {
 
 
   SymmMemObjPtr Get(void* localPtr) const;
+  
+  // Get the heap VA manager (for both VMM and Static heap)
+  HeapVAManager* GetHeapVAManager() const { return heapVAManager.get(); }
+  
+  // Initialize heap VA manager (for both VMM and Static heap)
+  void InitHeapVAManager(uintptr_t baseAddr, size_t size, size_t granularity = 0) {
+    heapVAManager = std::make_unique<HeapVAManager>(baseAddr, size, granularity);
+  }
 
  private:
   BootstrapNetwork& bootNet;
@@ -177,8 +213,8 @@ class SymmMemManager {
   std::vector<void*> vmmPeerBasePtrs;  // Virtual base addresses for each PE
   size_t vmmPerPeerSize{0};  // Size of virtual address space per PE
   
-  // VA Manager for tracking allocations and enabling reuse
-  std::unique_ptr<VMMVAManager> vmmVAManager;
+  // VA Manager for tracking allocations and enabling reuse (used by both VMM and Static heap)
+  std::unique_ptr<HeapVAManager> heapVAManager;
 };
 
 }  // namespace application

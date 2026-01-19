@@ -46,9 +46,9 @@ struct VABlock {
 };
 
 /**
- * @brief VMM Virtual Address Manager
+ * @brief Heap Virtual Address Manager
  * 
- * This manager tracks virtual address allocations within the VMM heap.
+ * This manager tracks virtual address allocations within heaps (VMM or Static).
  * It implements a first-fit allocation strategy and automatically coalesces
  * adjacent free blocks to reduce fragmentation.
  * 
@@ -58,18 +58,18 @@ struct VABlock {
  * - Thread-safe: All operations are protected by mutex
  * - Efficient lookup: Uses sorted list for fast allocation search
  */
-class VMMVAManager {
+class HeapVAManager {
  public:
   /**
    * @brief Construct a new VA Manager
    * 
-   * @param baseAddr Base virtual address of the VMM heap
-   * @param totalSize Total size of the VMM heap virtual address space
-   * @param granularity Physical memory allocation granularity (for RDMA boundary alignment)
+   * @param baseAddr Base virtual address of the heap
+   * @param totalSize Total size of the heap virtual address space
+   * @param granularity Physical memory allocation granularity (for RDMA boundary alignment, default 0)
    */
-  VMMVAManager(uintptr_t baseAddr, size_t totalSize, size_t granularity = 0);
+  HeapVAManager(uintptr_t baseAddr, size_t totalSize, size_t granularity = 0);
   
-  ~VMMVAManager() = default;
+  ~HeapVAManager() = default;
 
   /**
    * @brief Allocate a virtual address block
