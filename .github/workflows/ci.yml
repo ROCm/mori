@@ -32,9 +32,9 @@ jobs:
           pwd
           id
           ls
-          rm -rf mori 
+          #rm -rf mori 
           #git clone https://github.com/zhangfei829/mytest.git
-          git clone https://github.com/ROCm/mori.git
+          #git clone https://github.com/ROCm/mori.git
           cd mori
           ls
           rm -rf build
@@ -42,7 +42,7 @@ jobs:
           git checkout main
           #pip install --target /apps/mori-ci/packages -r requirements-build.txt
           pip install -r requirements-build.txt
-          #git submodule update --init --recursive 
+          git submodule update --init --recursive 
           pip3 install . --no-build-isolation
           #USE_IONIC=ON pip3 install . --no-build-isolation --target /apps/mori-ci/python-packages
           #make
