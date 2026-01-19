@@ -28,8 +28,8 @@
 
 #include "mori/application/application.hpp"
 #include "mori/core/core.hpp"
-#include "mori/shmem/shmem_api.hpp"
 #include "mori/shmem/internal.hpp"
+#include "mori/shmem/shmem_api.hpp"
 
 namespace mori {
 namespace shmem {
@@ -40,9 +40,9 @@ namespace shmem {
 template <>
 inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::P2P>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe,
-    int qpId) {
-  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source.addr + sourceOffset);
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  uint8_t* srcPtr =
+      reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   core::ThreadCopy<uint8_t>(destPtr, srcPtr, bytes);
 }
@@ -50,9 +50,9 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::P2
 template <>
 inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::P2P>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe,
-    int qpId) {
-  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source.addr + sourceOffset);
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  uint8_t* srcPtr =
+      reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
 }
@@ -107,13 +107,14 @@ inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::
 template <>
 inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::P2P, true>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId) {
   if (bytes == 0) return;
 
   // Execute put operation
-  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source.addr + sourceOffset);
+  uint8_t* srcPtr =
+      reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   core::ThreadCopy<uint8_t>(destPtr, srcPtr, bytes);
 
@@ -139,13 +140,14 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportTy
 template <>
 inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::P2P, false>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId) {
   if (bytes == 0) return;
 
   // Execute put operation
-  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source.addr + sourceOffset);
+  uint8_t* srcPtr =
+      reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   core::ThreadCopy<uint8_t>(destPtr, srcPtr, bytes);
 
@@ -164,13 +166,14 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportTy
 template <>
 inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::P2P, true>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId) {
   if (bytes == 0) return;
 
   // Execute put operation (all lanes participate)
-  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source.addr + sourceOffset);
+  uint8_t* srcPtr =
+      reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
 
@@ -192,13 +195,14 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType
 template <>
 inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::P2P, false>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId) {
   if (bytes == 0) return;
 
   // Execute put operation (all lanes participate)
-  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source.addr + sourceOffset);
+  uint8_t* srcPtr =
+      reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
 
@@ -274,7 +278,8 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::Transpor
           break;
 
         default:
-          MORI_PRINTF("Error: Unsupported 4-byte atomicType (%d) in NonFetchThreadKernel.\n", amoType);
+          MORI_PRINTF("Error: Unsupported 4-byte atomicType (%d) in NonFetchThreadKernel.\n",
+                      amoType);
           break;
       }
       break;
@@ -328,7 +333,8 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::Transpor
           casLoop64(amoType, argVal);
           break;
         default:
-          MORI_PRINTF("Error: Unsupported 8-byte atomicType (%d) in NonFetchThreadKernel.\n", amoType);
+          MORI_PRINTF("Error: Unsupported 8-byte atomicType (%d) in NonFetchThreadKernel.\n",
+                      amoType);
           break;
       }
       break;
@@ -427,9 +433,11 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelImplP2P(const application::S
     } break;
     default:
       if constexpr (sizeof(T) == 4) {
-        MORI_PRINTF("Error: Unsupported 4-byte atomicType (%d) in TypeFetchThreadKernel.\n", amoType);
+        MORI_PRINTF("Error: Unsupported 4-byte atomicType (%d) in TypeFetchThreadKernel.\n",
+                    amoType);
       } else if constexpr (sizeof(T) == 8) {
-        MORI_PRINTF("Error: Unsupported 8-byte atomicType (%d) in TypeFetchThreadKernel.\n", amoType);
+        MORI_PRINTF("Error: Unsupported 8-byte atomicType (%d) in TypeFetchThreadKernel.\n",
+                    amoType);
       }
       break;
   }

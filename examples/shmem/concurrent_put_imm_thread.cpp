@@ -39,8 +39,6 @@ __global__ void ConcurrentPutImmThreadKernel(int myPe, const SymmMemObjPtr memOb
   int threadOffset = globalTid * sizeof(uint32_t);
 
   if (myPe == sendPe) {
-    RdmaMemoryRegion source = memObj->GetRdmaMemoryRegion(myPe);
-
     ShmemPutSizeImmNbiThread(memObj, threadOffset, &val, sizeof(uint32_t), recvPe);
     __threadfence_system();
 

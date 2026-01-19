@@ -26,8 +26,8 @@
 
 #include "mori/application/application.hpp"
 #include "mori/core/core.hpp"
-#include "mori/shmem/shmem_api.hpp"
 #include "mori/shmem/internal.hpp"
+#include "mori/shmem/shmem_api.hpp"
 
 namespace mori {
 namespace shmem {
@@ -129,7 +129,8 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId) {
         __hip_atomic_fetch_add(&cq.cq_consumer, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 
     uint32_t wqe_counter;
-    int opcode = core::PollCq<core::ProviderType::BNXT>(cq.cqAddr, cq.cqeNum, &my_cq_consumer, &wqe_counter);
+    int opcode =
+        core::PollCq<core::ProviderType::BNXT>(cq.cqAddr, cq.cqeNum, &my_cq_consumer, &wqe_counter);
     if (opcode != BNXT_RE_REQ_ST_OK) {
       int rank = globalGpuStates->rank;
       uint32_t my_cq_index = my_cq_consumer % cq.cqeNum;
@@ -176,11 +177,11 @@ inline __device__ void ShmemQuietThreadKernelPsdImpl(int pe, int qpId) {
       uint32_t myCqPos = curConsIdx + myLogicalLaneId;
 
       // Poll CQE
-      const int opcode =
-          core::PollCq<core::ProviderType::PSD>(cqHandle.cqAddr, cqHandle.cqeNum, &myCqPos, &wqeCounter);
+      const int opcode = core::PollCq<core::ProviderType::PSD>(cqHandle.cqAddr, cqHandle.cqeNum,
+                                                               &myCqPos, &wqeCounter);
       if (opcode > 0) {
         MORI_PRINTF("rank %d dest pe %d consIdx %d opcode %d\n", globalGpuStates->rank, pe, myCqPos,
-               opcode);
+                    opcode);
         assert(false);
       }
       asm volatile("" ::: "memory");
@@ -202,7 +203,8 @@ inline __device__ void ShmemQuietThreadKernelPsdImpl(int pe, int qpId) {
         }
 
         wqHandle.doneIdx = wqeCounter;
-        // __hip_atomic_fetch_max(&wqHandle.doneIdx, wqeCounter, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        // __hip_atomic_fetch_max(&wqHandle.doneIdx, wqeCounter, __ATOMIC_RELAXED,
+        // __HIP_MEMORY_SCOPE_AGENT);
       }
 
       if (!((wqHandle.doneIdx - dbTouchedIdx) & PENDING_WORK_MASK)) {
@@ -263,8 +265,8 @@ inline __device__ void ShmemQuietThreadKernelMlnxImpl(int pe, int qpId) {
                                                     __ATOMIC_RELAXED, __ATOMIC_RELAXED,
                                                     __HIP_MEMORY_SCOPE_AGENT);
         if (done) {
-          warp_cq_consumer = __hip_atomic_fetch_add(&cq.cq_consumer, quiet_amount,
-                                                    __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+          warp_cq_consumer = __hip_atomic_fetch_add(&cq.cq_consumer, quiet_amount, __ATOMIC_RELAXED,
+                                                    __HIP_MEMORY_SCOPE_AGENT);
         }
       }
       done = __shfl(done, leader_phys_lane_id);
@@ -275,7 +277,8 @@ inline __device__ void ShmemQuietThreadKernelMlnxImpl(int pe, int qpId) {
 
     if (my_logical_lane_id < quiet_amount) {
       uint32_t wqe_counter;
-      int opcode = core::PollCq<core::ProviderType::MLX5>(cq.cqAddr, cq.cqeNum, &my_cq_consumer, &wqe_counter);
+      int opcode = core::PollCq<core::ProviderType::MLX5>(cq.cqAddr, cq.cqeNum, &my_cq_consumer,
+                                                          &wqe_counter);
       if (opcode == MLX5_CQE_RESP_ERR || opcode == MLX5_CQE_REQ_ERR) {
         int rank = globalGpuStates->rank;
         MORI_PRINTF("rank %d dest pe %d consIdx %d opcode %d\n", rank, pe, my_cq_index, opcode);
@@ -293,13 +296,13 @@ inline __device__ void ShmemQuietThreadKernelMlnxImpl(int pe, int qpId) {
         completed = __hip_atomic_load(&cq.consIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       } while (completed != warp_cq_consumer);
 
-      core::UpdateCqDbrRecord<core::ProviderType::MLX5>(cq, (uint32_t)(warp_cq_consumer + quiet_amount));
+      core::UpdateCqDbrRecord<core::ProviderType::MLX5>(
+          cq, (uint32_t)(warp_cq_consumer + quiet_amount));
 
       __atomic_signal_fence(__ATOMIC_SEQ_CST);
       uint64_t doneIdx = wqe_broadcast[warp_id];
       __hip_atomic_fetch_max(&wq.doneIdx, doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      __hip_atomic_fetch_add(&cq.consIdx, quiet_amount, __ATOMIC_RELAXED,
-                             __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_fetch_add(&cq.consIdx, quiet_amount, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
   }
 }
@@ -358,12 +361,13 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(
 template <core::ProviderType PrvdType>
 inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMemObjPtr dest,
                                                       size_t destOffset,
-                                                      const application::RdmaMemoryRegion& source,
+                                                      const application::SymmMemObjPtr source,
                                                       size_t sourceOffset, size_t bytes, int pe,
                                                       int qpId) {
   if (bytes == 0) return;
-  // assert(sourceOffset + bytes <= source.length && destOffset + bytes <= dest->size);
-  uintptr_t laddr = source.addr + sourceOffset;
+  // assert(sourceOffset + bytes <= source->size && destOffset + bytes <= dest->size);
+  uintptr_t laddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset;
+  uintptr_t lkey = source->lkey;
   uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
   uintptr_t rkey = dest->peerRkeys[pe];
 
@@ -435,15 +439,15 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
   if constexpr (PrvdType == core::ProviderType::MLX5) {
     wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
     dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
-                                        qpn, laddr, source.lkey, raddr, rkey, bytes);
+                                        qpn, laddr, lkey, raddr, rkey, bytes);
   } else if constexpr (PrvdType == core::ProviderType::BNXT) {
     wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
     dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter,
-                                        is_leader, qpn, laddr, source.lkey, raddr, rkey, bytes);
+                                        is_leader, qpn, laddr, lkey, raddr, rkey, bytes);
   } else if constexpr (PrvdType == core::ProviderType::PSD) {
     wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
     dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
-                                        qpn, laddr, source.lkey, raddr, rkey, bytes);
+                                        qpn, laddr, lkey, raddr, rkey, bytes);
   } else {
     static_assert(false);
   }
@@ -469,8 +473,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
 template <>
 inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe,
-    int qpId) {
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
   bool need_turn{true};
   uint64_t turns = __ballot(need_turn);
   while (turns) {
@@ -488,7 +491,7 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::RD
 template <core::ProviderType PrvdType>
 inline __device__ void ShmemPutMemNbiWarpKernelImpl(const application::SymmMemObjPtr dest,
                                                     size_t destOffset,
-                                                    const application::RdmaMemoryRegion& source,
+                                                    const application::SymmMemObjPtr source,
                                                     size_t sourceOffset, size_t bytes, int pe,
                                                     int qpId) {
   int laneId = threadIdx.x & (warpSize - 1);
@@ -501,8 +504,7 @@ inline __device__ void ShmemPutMemNbiWarpKernelImpl(const application::SymmMemOb
 template <>
 inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe,
-    int qpId) {
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
   DISPATCH_PROVIDER_TYPE_COMPILE_TIME(ShmemPutMemNbiWarpKernelImpl, dest, destOffset, source,
                                       sourceOffset, bytes, pe, qpId);
 }
@@ -653,12 +655,13 @@ inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::
 template <core::ProviderType PrvdType, bool onlyOneSignal = true>
 inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId) {
   if (bytes == 0) return;
-  // assert(sourceOffset + bytes <= source.length && destOffset + bytes <= dest->size);
-  uintptr_t laddr = source.addr + sourceOffset;
+  // assert(sourceOffset + bytes <= source->size && destOffset + bytes <= dest->size);
+  uintptr_t laddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset;
+  uintptr_t lkey = source->lkey;
   uintptr_t raddr = dest->peerPtrs[pe] + destOffset;
   uintptr_t rkey = dest->peerRkeys[pe];
 
@@ -735,15 +738,15 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
   if constexpr (PrvdType == core::ProviderType::MLX5) {
     wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
     core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, false, qpn, laddr,
-                              source.lkey, raddr, rkey, bytes);
+                              lkey, raddr, rkey, bytes);
   } else if constexpr (PrvdType == core::ProviderType::BNXT) {
     wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
     core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter, false, qpn,
-                              laddr, source.lkey, raddr, rkey, bytes);
+                              laddr, lkey, raddr, rkey, bytes);
   } else if constexpr (PrvdType == core::ProviderType::PSD) {
     wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
     core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, false, qpn, laddr,
-                              source.lkey, raddr, rkey, bytes);
+                              lkey, raddr, rkey, bytes);
   } else {
     static_assert(false);
   }
@@ -825,7 +828,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
 template <>
 inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::RDMA, true>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId) {
   bool need_turn{true};
@@ -846,7 +849,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportTy
 template <>
 inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::RDMA, false>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId) {
   bool need_turn{true};
@@ -867,7 +870,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportTy
 template <core::ProviderType PrvdType, bool onlyOneSignal = true>
 inline __device__ void ShmemPutMemNbiSignalWarpKernelImpl(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId) {
   int laneId = threadIdx.x & (warpSize - 1);
@@ -881,7 +884,7 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernelImpl(
 template <>
 inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::RDMA, true>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId) {
   DISPATCH_PROVIDER_TYPE_COMPILE_TIME_WITH_BOOL(ShmemPutMemNbiSignalWarpKernelImpl, true, dest,
@@ -892,7 +895,7 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType
 template <>
 inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::RDMA, false>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId) {
   DISPATCH_PROVIDER_TYPE_COMPILE_TIME_WITH_BOOL(ShmemPutMemNbiSignalWarpKernelImpl, false, dest,

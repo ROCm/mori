@@ -40,10 +40,8 @@ __global__ void ConcurrentPutSignalThreadKernelAdd(int myPe, const SymmMemObjPtr
   int threadOffset = globalTid * sizeof(uint32_t);
 
   if (myPe == sendPe) {
-    RdmaMemoryRegion source = dataObj->GetRdmaMemoryRegion(myPe);
-
     // Test onlyOneSignal=true with AMO_ADD: only leader thread signals
-    ShmemPutMemNbiSignalThread<true>(dataObj, threadOffset, source, threadOffset,
+    ShmemPutMemNbiSignalThread<true>(dataObj, threadOffset, dataObj, threadOffset,
                                      sizeof(uint32_t), signalObj, 0, 1, atomicType::AMO_ADD,
                                      recvPe, 0);
     __threadfence_system();
@@ -122,11 +120,9 @@ __global__ void ConcurrentPutSignalThreadKernelSet(int myPe, const SymmMemObjPtr
   int globalWarpId = globalTid / warpSize;
 
   if (myPe == sendPe) {
-    RdmaMemoryRegion source = dataObj->GetRdmaMemoryRegion(myPe);
-
     // Test onlyOneSignal=true with AMO_SET: each warp sets its own signal slot
     // Use warp ID as offset to avoid overwriting other warps' signals
-    ShmemPutMemNbiSignalThread<true>(dataObj, threadOffset, source, threadOffset,
+    ShmemPutMemNbiSignalThread<true>(dataObj, threadOffset, dataObj, threadOffset,
                                      sizeof(uint32_t), signalObj, globalWarpId * sizeof(uint64_t), 
                                      MAGIC_VALUE, atomicType::AMO_SET, recvPe, 0);
     __threadfence_system();

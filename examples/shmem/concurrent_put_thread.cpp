@@ -39,9 +39,7 @@ __global__ void ConcurrentPutThreadKernel(int myPe, const SymmMemObjPtr memObj) 
   int threadOffset = globalTid * sizeof(uint32_t);
 
   if (myPe == sendPe) {
-    RdmaMemoryRegion source = memObj->GetRdmaMemoryRegion(myPe);
-
-    ShmemPutMemNbiThread(memObj, threadOffset, source, threadOffset, sizeof(uint32_t), recvPe, 1);
+    ShmemPutMemNbiThread(memObj, threadOffset, memObj, threadOffset, sizeof(uint32_t), recvPe, 1);
     ShmemFenceThread();
   } else {
     while (atomicAdd(reinterpret_cast<uint32_t*>(memObj->localPtr) + globalTid, 0) != sendPe) {

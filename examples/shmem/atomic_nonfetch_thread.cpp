@@ -55,8 +55,6 @@ __global__ void AtomicNonFetchThreadKernel(int myPe, const SymmMemObjPtr memObj)
   int threadOffset = globalTid * sizeof(T);
 
   if (myPe == sendPe) {
-    RdmaMemoryRegion source = memObj->GetRdmaMemoryRegion(sendPe);
-
     if (globalWarpId % 2 == 0) {
       ShmemAtomicTypeNonFetchThread<T>(memObj, 2 * sizeof(T), 1, AMO_ADD, recvPe);
     } else {
