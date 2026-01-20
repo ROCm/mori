@@ -437,7 +437,7 @@ RdmaContext::RdmaContext(RdmaBackendType backendType) : backendType(backendType)
 
 RdmaContext::~RdmaContext() {
   if (deviceList) ibv_free_device_list(deviceList);
-  for (RdmaDevice* device : rdmaDeviceList) free(device);
+  for (RdmaDevice* device : rdmaDeviceList) delete device;
 }
 
 const RdmaDeviceList& RdmaContext::GetRdmaDeviceList() const { return rdmaDeviceList; }
