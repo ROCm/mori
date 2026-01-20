@@ -206,55 +206,6 @@ __global__ void ConcurrentPutSignalThreadKernelSet_PureAddr(int myPe, uint32_t* 
   }
 }
 
-// New API: Using pure addresses with AMO_SET
-__global__ void ConcurrentPutSignalThreadKernelSet_PureAddr(int myPe, uint32_t* dataBuff,
-                                                             uint64_t* signalBuff) {
-  constexpr int sendPe = 0;
-  constexpr int recvPe = 1;
-  constexpr uint64_t MAGIC_VALUE = 0xDEADBEEF;
-
-  int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
-  int globalWarpId = globalTid / warpSize;
-
-  if (myPe == sendPe) {
-    uint32_t* src = dataBuff + globalTid;
-    uint32_t* dest = dataBuff + globalTid;
-
-    // Test onlyOneSignal=true with AMO_SET: each warp sets its own signal slot
-    // Use warp ID as index to avoid overwriting other warps' signals
-    ShmemPutMemNbiSignalThread<true>(dest, src, sizeof(uint32_t), signalBuff + globalWarpId, 
-                                     MAGIC_VALUE, atomicType::AMO_SET, recvPe, 0);
-    __threadfence_system();
-
-    if (blockIdx.x == 0) {
-      ShmemQuietThread();
-    }
-  } else {
-    // Receiver: wait for all warps' signals to be set to magic value
-    int totalWarps = (blockDim.x * gridDim.x) / warpSize;
-    if (threadIdx.x == 0) {
-      bool allReceived = false;
-      while (!allReceived) {
-        allReceived = true;
-        for (int warpId = 0; warpId < totalWarps; warpId++) {
-          if (atomicAdd(&signalBuff[warpId], 0) != MAGIC_VALUE) {
-            allReceived = false;
-            break;
-          }
-        }
-      }
-    }
-    __syncthreads();
-
-    // Verify data
-    uint32_t receivedData = atomicAdd(dataBuff + globalTid, 0);
-    if (receivedData != sendPe) {
-      printf("PE %d, thread %d: Data mismatch! Expected %d, got %d\n", myPe, globalTid, sendPe,
-             receivedData);
-    }
-  }
-}
-
 void ConcurrentPutSignalThread() {
   int status;
   MPI_Init(NULL, NULL);

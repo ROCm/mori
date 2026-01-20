@@ -36,15 +36,11 @@ __global__ void RingAllGatherWithPutMemAPIKernel(int myPe, int npes, const SymmM
   int nextPeer = (myPe + 1) % npes;
   int peChunkSize = memObj->size / npes;
 
-  RdmaMemoryRegion source;
-  source.addr = reinterpret_cast<uintptr_t>(memObj->localPtr);
-  source.lkey = memObj->lkey;
-
   for (int i = 0; i < npes - 1; i++) {
     int sendDataRank = ((myPe - i) + npes) % npes;
     int sendOffset = sendDataRank * peChunkSize;
 
-    ShmemPutMemNbiThread(memObj, sendOffset, source, sendOffset, peChunkSize, nextPeer);
+    ShmemPutMemNbiThread(memObj, sendOffset, memObj, sendOffset, peChunkSize, nextPeer);
     ShmemQuietThread(nextPeer,memObj);
 
     int recvDataRank = ((sendDataRank - 1) + npes) % npes;

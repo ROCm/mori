@@ -28,6 +28,7 @@
 #include "mori/application/bootstrap/local_bootstrap.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
+#include "mori/shmem/internal.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/core/core.hpp"
 #include "mori/utils/mori_log.hpp"
@@ -311,7 +312,7 @@ bool SymmMemManager::InitializeVMMHeap(size_t virtualSize, size_t chunkSize) {
                                                        hipMemAllocationGranularityRecommended);
     if (result == hipSuccess && granularity > 0) {
       // Use the larger of recommended granularity and default minimum
-      chunkSize = std::max(granularity, DEFAULT_VMM_MIN_CHUNK_SIZE);
+      chunkSize = std::max(granularity, shmem::DEFAULT_VMM_MIN_CHUNK_SIZE);
 
       // Get minimum granularity for vmmMinChunkSize
       size_t minGranularity = 0;
@@ -327,17 +328,17 @@ bool SymmMemManager::InitializeVMMHeap(size_t virtualSize, size_t chunkSize) {
       if (hipMemGetAllocationGranularity(&granularity, &allocProp,
                                          hipMemAllocationGranularityMinimum) == hipSuccess &&
           granularity > 0) {
-        chunkSize = std::max(granularity, DEFAULT_VMM_MIN_CHUNK_SIZE);
+        chunkSize = std::max(granularity, shmem::DEFAULT_VMM_MIN_CHUNK_SIZE);
         vmmMinChunkSize = granularity;
       } else {
         // Final fallback: use default minimum
-        chunkSize = DEFAULT_VMM_MIN_CHUNK_SIZE;
+        chunkSize = shmem::DEFAULT_VMM_MIN_CHUNK_SIZE;
         vmmMinChunkSize = 4 * 1024;  // 4KB fallback
       }
     }
   } else {
     // User provided chunk size, ensure it's not too small
-    chunkSize = std::max(chunkSize, DEFAULT_VMM_MIN_CHUNK_SIZE);
+    chunkSize = std::max(chunkSize, shmem::DEFAULT_VMM_MIN_CHUNK_SIZE);
   }
 
   int worldSize = bootNet.GetWorldSize();
