@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <array>
 #include <functional>
 #include <msgpack.hpp>
 #include <mutex>
@@ -84,6 +85,8 @@ struct EngineDesc {
 
 using MemoryUniqueId = uint32_t;
 
+constexpr size_t kIpcHandleSize = 64;
+
 struct MemoryDesc {
   EngineKey engineKey;
   MemoryUniqueId id{0};
@@ -91,13 +94,14 @@ struct MemoryDesc {
   uintptr_t data{0};
   size_t size{0};
   MemoryLocationType loc;
+  std::array<char, kIpcHandleSize> ipcHandle{};
 
   constexpr bool operator==(const MemoryDesc& rhs) const noexcept {
     return (engineKey == rhs.engineKey) && (id == rhs.id) && (deviceId == rhs.deviceId) &&
            (data == rhs.data) && (size == rhs.size) && (loc == rhs.loc);
   }
 
-  MSGPACK_DEFINE(engineKey, id, deviceId, data, size, loc);
+  MSGPACK_DEFINE(engineKey, id, deviceId, data, size, loc, ipcHandle);
 };
 
 using TransferUniqueId = uint64_t;

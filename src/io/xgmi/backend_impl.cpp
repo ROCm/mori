@@ -24,6 +24,7 @@
 #include <limits.h>
 #include <unistd.h>
 
+#include <cstring>
 #include <sstream>
 
 #include "mori/io/logging.hpp"
@@ -340,7 +341,7 @@ void XgmiBackend::DeregisterRemoteEngine(const EngineDesc& desc) {
   MORI_IO_TRACE("XGMI: Deregistered remote engine {}", desc.key);
 }
 
-void XgmiBackend::RegisterMemory(const MemoryDesc& desc) {
+void XgmiBackend::RegisterMemory(MemoryDesc& desc) {
   if (desc.loc != MemoryLocationType::GPU) {
     MORI_IO_TRACE("XGMI: Skipping non-GPU memory registration for id={}", desc.id);
     return;
@@ -353,6 +354,9 @@ void XgmiBackend::RegisterMemory(const MemoryDesc& desc) {
                  hipGetErrorString(err));
     return;
   }
+
+  static_assert(sizeof(handle) == kIpcHandleSize, "IPC handle size mismatch");
+  std::memcpy(desc.ipcHandle.data(), &handle, sizeof(handle));
 
   std::unique_lock<std::shared_mutex> lock(ipcMutex);
   localIpcHandles[desc.id] = handle;
@@ -371,14 +375,37 @@ void* XgmiBackend::GetRemappedAddress(const MemoryDesc& desc) {
     return reinterpret_cast<void*>(desc.data);
   }
 
-  std::shared_lock<std::shared_mutex> rlock(ipcMutex);
-  auto it = remoteIpcHandles.find(desc.id);
-  if (it != remoteIpcHandles.end() && it->second.remappedAddr != nullptr) {
-    return it->second.remappedAddr;
+  {
+    std::shared_lock<std::shared_mutex> rlock(ipcMutex);
+    auto it = remoteIpcHandles.find(desc.id);
+    if (it != remoteIpcHandles.end() && it->second.remappedAddr != nullptr) {
+      return it->second.remappedAddr;
+    }
   }
-  rlock.unlock();
 
-  return reinterpret_cast<void*>(desc.data);
+  hipIpcMemHandle_t handle;
+  static_assert(sizeof(handle) == kIpcHandleSize, "IPC handle size mismatch");
+  std::memcpy(&handle, desc.ipcHandle.data(), sizeof(handle));
+
+  hipError_t err = hipSetDevice(desc.deviceId);
+  if (err != hipSuccess) {
+    MORI_IO_WARN("XGMI: Failed to set device {} for IPC open: {}", desc.deviceId,
+                 hipGetErrorString(err));
+    return nullptr;
+  }
+
+  void* remappedAddr = nullptr;
+  err = hipIpcOpenMemHandle(&remappedAddr, handle, hipIpcMemLazyEnablePeerAccess);
+  if (err != hipSuccess) {
+    MORI_IO_WARN("XGMI: Failed to open IPC handle for id={}: {}", desc.id, hipGetErrorString(err));
+    return nullptr;
+  }
+
+  std::unique_lock<std::shared_mutex> wlock(ipcMutex);
+  remoteIpcHandles[desc.id] = {handle, remappedAddr, desc.size};
+  MORI_IO_TRACE("XGMI: Opened IPC handle for id={}, remapped={}", desc.id,
+                reinterpret_cast<uintptr_t>(remappedAddr));
+  return remappedAddr;
 }
 
 void XgmiBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,

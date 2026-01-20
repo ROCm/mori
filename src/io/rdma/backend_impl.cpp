@@ -469,7 +469,7 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo) {
   ctx->CloseEndpoint(tcph);
 }
 
-void ControlPlaneServer::RegisterMemory(const MemoryDesc& desc) {
+void ControlPlaneServer::RegisterMemory(MemoryDesc& desc) {
   std::lock_guard<std::mutex> lock(mu);
   mems[desc.id] = desc;
 }
@@ -706,7 +706,7 @@ void RdmaBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   server->DeregisterRemoteEngine(rdesc);
 }
 
-void RdmaBackend::RegisterMemory(const MemoryDesc& desc) { server->RegisterMemory(desc); }
+void RdmaBackend::RegisterMemory(MemoryDesc& desc) { server->RegisterMemory(desc); }
 
 void RdmaBackend::DeregisterMemory(const MemoryDesc& desc) {
   server->DeregisterMemory(desc);

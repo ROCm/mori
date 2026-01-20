@@ -525,3 +525,105 @@ def test_xgmi_no_inbound_notification(xgmi_engine):
     status.Wait()
     assert status.Succeeded()
     assert xgmi_engine.pop_inbound_transfer_status("any_key", transfer_uid) is None
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_xgmi_cross_engine_transfer():
+    set_log_level("info")
+
+    config = IOEngineConfig(host="", port=0)
+    engine_a = IOEngine(key="xgmi_engine_a", config=config)
+    engine_b = IOEngine(key="xgmi_engine_b", config=config)
+
+    xgmi_config = XgmiBackendConfig(num_streams=64, num_events=64)
+    engine_a.create_backend(BackendType.XGMI, xgmi_config)
+    engine_b.create_backend(BackendType.XGMI, xgmi_config)
+
+    engine_a.register_remote_engine(engine_b.get_engine_desc())
+    engine_b.register_remote_engine(engine_a.get_engine_desc())
+
+    src_tensor = torch.randn(1024, device=torch.device("cuda", 0), dtype=torch.float32)
+    dst_tensor = torch.zeros(1024, device=torch.device("cuda", 1), dtype=torch.float32)
+
+    src_mem = engine_a.register_torch_tensor(src_tensor)
+    dst_mem = engine_b.register_torch_tensor(dst_tensor)
+
+    assert any(
+        b != 0 for b in src_mem.ipc_handle
+    ), "IPC handle should be filled by XGMI backend"
+    assert any(
+        b != 0 for b in dst_mem.ipc_handle
+    ), "IPC handle should be filled by XGMI backend"
+
+    src_mem_packed = src_mem.pack()
+    dst_mem_packed = dst_mem.pack()
+
+    remote_src_mem = MemoryDesc.unpack(src_mem_packed)
+    remote_dst_mem = MemoryDesc.unpack(dst_mem_packed)
+
+    assert (
+        remote_src_mem.ipc_handle == src_mem.ipc_handle
+    ), "IPC handle should survive serialization"
+    assert (
+        remote_dst_mem.ipc_handle == dst_mem.ipc_handle
+    ), "IPC handle should survive serialization"
+
+    transfer_uid = engine_b.allocate_transfer_uid()
+    status = engine_b.read(dst_mem, 0, remote_src_mem, 0, 1024 * 4, transfer_uid)
+    status.Wait()
+    assert status.Succeeded()
+    assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
+
+    dst_tensor.zero_()
+    assert not torch.equal(src_tensor.cpu(), dst_tensor.cpu())
+    transfer_uid = engine_a.allocate_transfer_uid()
+    status = engine_a.write(src_mem, 0, remote_dst_mem, 0, 1024 * 4, transfer_uid)
+    status.Wait()
+    assert status.Succeeded()
+    assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
+
+    dst_tensor.zero_()
+    sess = engine_b.create_session(dst_mem, remote_src_mem)
+    assert sess is not None
+    transfer_uid = sess.allocate_transfer_uid()
+    status = sess.read(0, 0, 1024 * 4, transfer_uid)
+    status.Wait()
+    assert status.Succeeded()
+    assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
+
+    dst_tensor.zero_()
+    sess = engine_a.create_session(src_mem, remote_dst_mem)
+    assert sess is not None
+    transfer_uid = sess.allocate_transfer_uid()
+    status = sess.write(0, 0, 1024 * 4, transfer_uid)
+    status.Wait()
+    assert status.Succeeded()
+    assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
+
+    dst_tensor.zero_()
+    offsets = [0, 512 * 4, 768 * 4]
+    sizes = [256 * 4, 256 * 4, 256 * 4]
+    transfer_uid = engine_b.allocate_transfer_uid()
+    status = engine_b.batch_read(
+        [dst_mem], [offsets], [remote_src_mem], [offsets], [sizes], [transfer_uid]
+    )[0]
+    status.Wait()
+    assert status.Succeeded()
+    assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
+
+    dst_tensor.zero_()
+    transfer_uid = engine_a.allocate_transfer_uid()
+    status = engine_a.batch_write(
+        [src_mem], [offsets], [remote_dst_mem], [offsets], [sizes], [transfer_uid]
+    )[0]
+    status.Wait()
+    assert status.Succeeded()
+    assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
+
+    dst_tensor.zero_()
+    sess = engine_b.create_session(dst_mem, remote_src_mem)
+    transfer_uid = sess.allocate_transfer_uid()
+    status = sess.batch_read(offsets, offsets, sizes, transfer_uid)
+    status.Wait()
+    assert status.Succeeded()
+    assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())

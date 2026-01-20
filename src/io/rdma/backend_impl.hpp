@@ -167,7 +167,7 @@ class ControlPlaneServer {
   void BuildRdmaConn(EngineKey, TopoKeyPair);
 
   // MemoryRegion management
-  void RegisterMemory(const MemoryDesc&);
+  void RegisterMemory(MemoryDesc&);
   void DeregisterMemory(const MemoryDesc&);
   application::RdmaMemoryRegion AskRemoteMemoryRegion(EngineKey, int rdevId, MemoryUniqueId);
 
@@ -241,7 +241,7 @@ class RdmaBackend : public Backend {
 
   void RegisterRemoteEngine(const EngineDesc&);
   void DeregisterRemoteEngine(const EngineDesc&);
-  void RegisterMemory(const MemoryDesc& desc);
+  void RegisterMemory(MemoryDesc& desc);
   void DeregisterMemory(const MemoryDesc& desc);
   void ReadWrite(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
                  size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id,

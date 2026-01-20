@@ -123,7 +123,7 @@ class Backend {
   virtual void RegisterRemoteEngine(const EngineDesc&) = 0;
   virtual void DeregisterRemoteEngine(const EngineDesc&) = 0;
 
-  virtual void RegisterMemory(const MemoryDesc& desc) = 0;
+  virtual void RegisterMemory(MemoryDesc& desc) = 0;
   virtual void DeregisterMemory(const MemoryDesc& desc) = 0;
 
   virtual void ReadWrite(const MemoryDesc& localDest, size_t localOffset,

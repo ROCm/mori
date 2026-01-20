@@ -77,7 +77,7 @@ class XgmiBackend : public Backend {
 
   void RegisterRemoteEngine(const EngineDesc&) override;
   void DeregisterRemoteEngine(const EngineDesc&) override;
-  void RegisterMemory(const MemoryDesc& desc) override;
+  void RegisterMemory(MemoryDesc& desc) override;
   void DeregisterMemory(const MemoryDesc& desc) override;
   void ReadWrite(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
                  size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id,
