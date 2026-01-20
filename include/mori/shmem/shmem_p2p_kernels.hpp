@@ -480,9 +480,13 @@ DEFINE_SHMEM_ATOMIC_TYPE_FETCH_WARP_KERNEL_P2P(Int64, int64_t)
 template <>
 inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::P2P>(
     const void* dest, const void* source, size_t bytes, int pe, int qpId) {
-  RemoteAddrInfo remoteInfo = ShmemAddrToRemoteAddr(dest, pe);
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  
+  uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
+  size_t offset = destAddr - globalGpuStates->heapBaseAddr;
+  
   uint8_t* srcPtr = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(source));
-  uint8_t* destPtr = reinterpret_cast<uint8_t*>(remoteInfo.raddr);
+  uint8_t* destPtr = reinterpret_cast<uint8_t*>(globalGpuStates->heapObj->peerPtrs[pe] + offset);
   core::ThreadCopy<uint8_t>(destPtr, srcPtr, bytes);
 }
 
@@ -491,9 +495,13 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::P2P>
                                                                                  const void* source,
                                                                                  size_t bytes,
                                                                                  int pe, int qpId) {
-  RemoteAddrInfo remoteInfo = ShmemAddrToRemoteAddr(dest, pe);
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  
+  uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
+  size_t offset = destAddr - globalGpuStates->heapBaseAddr;
+  
   uint8_t* srcPtr = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(source));
-  uint8_t* destPtr = reinterpret_cast<uint8_t*>(remoteInfo.raddr);
+  uint8_t* destPtr = reinterpret_cast<uint8_t*>(globalGpuStates->heapObj->peerPtrs[pe] + offset);
   core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
 }
 
@@ -501,8 +509,12 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::P2P>
 template <>
 inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::P2P>(
     const void* dest, void* val, size_t bytes, int pe, int qpId) {
-  RemoteAddrInfo remoteInfo = ShmemAddrToRemoteAddr(dest, pe);
-  uint8_t* destPtr = reinterpret_cast<uint8_t*>(remoteInfo.raddr);
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  
+  uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
+  size_t offset = destAddr - globalGpuStates->heapBaseAddr;
+  
+  uint8_t* destPtr = reinterpret_cast<uint8_t*>(globalGpuStates->heapObj->peerPtrs[pe] + offset);
   switch (bytes) {
     case 1:
       core::AtomicStoreRelaxedSystem(destPtr, reinterpret_cast<uint8_t*>(val)[0]);
@@ -542,14 +554,17 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportTy
     uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
   if (bytes == 0) return;
 
-  // Translate dest address to remote address
-  RemoteAddrInfo destInfo = ShmemAddrToRemoteAddr(dest, pe);
-  // Translate signal dest address to remote address
-  RemoteAddrInfo signalDestInfo = ShmemAddrToRemoteAddr(signalDest, pe);
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  
+  // Calculate remote addresses directly (P2P doesn't need RDMA keys)
+  uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
+  size_t destOffset = destAddr - globalGpuStates->heapBaseAddr;
+  uintptr_t signalDestAddr = reinterpret_cast<uintptr_t>(signalDest);
+  size_t signalDestOffset = signalDestAddr - globalGpuStates->heapBaseAddr;
 
   // Execute put operation
   uint8_t* srcPtr = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(source));
-  uint8_t* destPtr = reinterpret_cast<uint8_t*>(destInfo.raddr);
+  uint8_t* destPtr = reinterpret_cast<uint8_t*>(globalGpuStates->heapObj->peerPtrs[pe] + destOffset);
   core::ThreadCopy<uint8_t>(destPtr, srcPtr, bytes);
 
   // Execute signal operation (only once for onlyOneSignal=true)
@@ -559,7 +574,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportTy
   bool is_leader = (my_logical_lane_id == num_active_lanes - 1);
 
   if (is_leader) {
-    uint64_t* signalPtr = reinterpret_cast<uint64_t*>(signalDestInfo.raddr);
+    uint64_t* signalPtr = reinterpret_cast<uint64_t*>(globalGpuStates->heapObj->peerPtrs[pe] + signalDestOffset);
     if (signalOp == core::atomicType::AMO_SET || signalOp == core::atomicType::AMO_SIGNAL_SET) {
       core::AtomicStoreSeqCstSystem(signalPtr, signalValue);
     } else if (signalOp == core::atomicType::AMO_ADD ||
@@ -577,18 +592,20 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportTy
     uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
   if (bytes == 0) return;
 
-  // Translate dest address to remote address
-  RemoteAddrInfo destInfo = ShmemAddrToRemoteAddr(dest, pe);
-  // Translate signal dest address to remote address
-  RemoteAddrInfo signalDestInfo = ShmemAddrToRemoteAddr(signalDest, pe);
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  
+  uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
+  size_t destOffset = destAddr - globalGpuStates->heapBaseAddr;
+  uintptr_t signalDestAddr = reinterpret_cast<uintptr_t>(signalDest);
+  size_t signalDestOffset = signalDestAddr - globalGpuStates->heapBaseAddr;
 
   // Execute put operation
   uint8_t* srcPtr = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(source));
-  uint8_t* destPtr = reinterpret_cast<uint8_t*>(destInfo.raddr);
+  uint8_t* destPtr = reinterpret_cast<uint8_t*>(globalGpuStates->heapObj->peerPtrs[pe] + destOffset);
   core::ThreadCopy<uint8_t>(destPtr, srcPtr, bytes);
 
   // Execute signal operation (every thread signals for onlyOneSignal=false)
-  uint64_t* signalPtr = reinterpret_cast<uint64_t*>(signalDestInfo.raddr);
+  uint64_t* signalPtr = reinterpret_cast<uint64_t*>(globalGpuStates->heapObj->peerPtrs[pe] + signalDestOffset);
   if (signalOp == core::atomicType::AMO_SET || signalOp == core::atomicType::AMO_SIGNAL_SET) {
     core::AtomicStoreSeqCstSystem(signalPtr, signalValue);
   } else if (signalOp == core::atomicType::AMO_ADD ||
@@ -605,21 +622,22 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType
     uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
   if (bytes == 0) return;
 
-  // Translate dest address to remote address
-  RemoteAddrInfo destInfo = ShmemAddrToRemoteAddr(dest, pe);
-
-  // Translate signal dest address to remote address
-  RemoteAddrInfo signalDestInfo = ShmemAddrToRemoteAddr(signalDest, pe);
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  
+  uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
+  size_t destOffset = destAddr - globalGpuStates->heapBaseAddr;
+  uintptr_t signalDestAddr = reinterpret_cast<uintptr_t>(signalDest);
+  size_t signalDestOffset = signalDestAddr - globalGpuStates->heapBaseAddr;
 
   // Execute put operation (all lanes participate)
   uint8_t* srcPtr = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(source));
-  uint8_t* destPtr = reinterpret_cast<uint8_t*>(destInfo.raddr);
+  uint8_t* destPtr = reinterpret_cast<uint8_t*>(globalGpuStates->heapObj->peerPtrs[pe] + destOffset);
   core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
 
   // Execute signal operation (only lane 0 for onlyOneSignal=true)
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {
-    uint64_t* signalPtr = reinterpret_cast<uint64_t*>(signalDestInfo.raddr);
+    uint64_t* signalPtr = reinterpret_cast<uint64_t*>(globalGpuStates->heapObj->peerPtrs[pe] + signalDestOffset);
     if (signalOp == core::atomicType::AMO_SET || signalOp == core::atomicType::AMO_SIGNAL_SET) {
       core::AtomicStoreSeqCstSystem(signalPtr, signalValue);
     } else if (signalOp == core::atomicType::AMO_ADD ||
@@ -637,19 +655,20 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType
     uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
   if (bytes == 0) return;
 
-  // Translate dest address to remote address
-  RemoteAddrInfo destInfo = ShmemAddrToRemoteAddr(dest, pe);
-
-  // Translate signal dest address to remote address
-  RemoteAddrInfo signalDestInfo = ShmemAddrToRemoteAddr(signalDest, pe);
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  
+  uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
+  size_t destOffset = destAddr - globalGpuStates->heapBaseAddr;
+  uintptr_t signalDestAddr = reinterpret_cast<uintptr_t>(signalDest);
+  size_t signalDestOffset = signalDestAddr - globalGpuStates->heapBaseAddr;
 
   // Execute put operation (all lanes participate)
   uint8_t* srcPtr = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(source));
-  uint8_t* destPtr = reinterpret_cast<uint8_t*>(destInfo.raddr);
+  uint8_t* destPtr = reinterpret_cast<uint8_t*>(globalGpuStates->heapObj->peerPtrs[pe] + destOffset);
   core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
 
   // Execute signal operation (all lanes signal for onlyOneSignal=false)
-  uint64_t* signalPtr = reinterpret_cast<uint64_t*>(signalDestInfo.raddr);
+  uint64_t* signalPtr = reinterpret_cast<uint64_t*>(globalGpuStates->heapObj->peerPtrs[pe] + signalDestOffset);
   if (signalOp == core::atomicType::AMO_SET || signalOp == core::atomicType::AMO_SIGNAL_SET) {
     core::AtomicStoreSeqCstSystem(signalPtr, signalValue);
   } else if (signalOp == core::atomicType::AMO_ADD ||
@@ -664,9 +683,12 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType
 template <>
 inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::P2P>(
     const void* dest, void* val, size_t bytes, core::atomicType amoType, int pe, int qpId) {
-  RemoteAddrInfo remoteInfo = ShmemAddrToRemoteAddr(dest, pe);
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  
+  uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
+  size_t offset = destAddr - globalGpuStates->heapBaseAddr;
 
-  uint8_t* destPtr = reinterpret_cast<uint8_t*>(remoteInfo.raddr);
+  uint8_t* destPtr = reinterpret_cast<uint8_t*>(globalGpuStates->heapObj->peerPtrs[pe] + offset);
   switch (bytes) {
     case 4: {
       int argVal = *reinterpret_cast<int*>(val);
@@ -792,8 +814,12 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelImplP2P_Addr(const void* des
                                                                  void* compare, size_t bytes,
                                                                  core::atomicType amoType, int pe,
                                                                  int qpId) {
-  RemoteAddrInfo remoteInfo = ShmemAddrToRemoteAddr(dest, pe);
-  T* destPtr = reinterpret_cast<T*>(remoteInfo.raddr);
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  
+  uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
+  size_t offset = destAddr - globalGpuStates->heapBaseAddr;
+  
+  T* destPtr = reinterpret_cast<T*>(globalGpuStates->heapObj->peerPtrs[pe] + offset);
   T* fetchResPtr = reinterpret_cast<T*>(val);
   T cmpVal = (compare != nullptr) ? *reinterpret_cast<T*>(compare) : T{};
 
