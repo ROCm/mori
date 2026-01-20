@@ -48,7 +48,7 @@ namespace io {
 class RdmaManager {
  public:
   RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* ctx);
-  ~RdmaManager() = default;
+  ~RdmaManager();
 
   application::RdmaEndpointConfig GetRdmaEndpointConfig(int devId);
 

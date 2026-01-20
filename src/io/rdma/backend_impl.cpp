@@ -45,6 +45,20 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
   topo.reset(new application::TopoSystem());
 }
 
+RdmaManager::~RdmaManager() {
+  for (auto* devCtx : deviceCtxs) {
+    if (devCtx != nullptr) {
+      delete devCtx;
+    }
+  }
+  deviceCtxs.clear();
+
+  if (ctx != nullptr) {
+    delete ctx;
+    ctx = nullptr;
+  }
+}
+
 std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
   if (key.loc == MemoryLocationType::GPU) {
     std::string nicName = topo->MatchGpuAndNic(key.deviceId);
