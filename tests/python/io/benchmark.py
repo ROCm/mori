@@ -79,6 +79,11 @@ def parse_args():
         help="Number of HIP events per device for XGMI mode (default: 64)",
     )
     parser.add_argument(
+        "--xgmi-multiprocess",
+        action="store_true",
+        help="Enable multi-process mode for XGMI backend to test cross-process GPU communication (default: False)",
+    )
+    parser.add_argument(
         "--op-type",
         type=str,
         choices=["read", "write"],
@@ -210,6 +215,7 @@ class MoriIoBenchmark:
         dst_gpu: int = 1,
         num_streams: int = 64,
         num_events: int = 64,
+        xgmi_multiprocess: bool = False,
     ):
         self.op_type = op_type
         self.buffer_size = buffer_size
@@ -239,6 +245,7 @@ class MoriIoBenchmark:
         self.dst_gpu = dst_gpu
         self.num_streams = num_streams
         self.num_events = num_events
+        self.xgmi_multiprocess = xgmi_multiprocess
 
         if self.sweep:
             if self.sweep_start_size <= 0 or self.sweep_max_size <= 0:
@@ -269,16 +276,31 @@ class MoriIoBenchmark:
         )
 
     def _setup_xgmi(self):
-        self.role = EngineRole.INITIATOR
-        self.src_device = torch.device("cuda", self.src_gpu)
-        self.dst_device = torch.device("cuda", self.dst_gpu)
+        if self.xgmi_multiprocess:
+            self.world_size = 2
+            if self.node_rank == 0:
+                self.global_rank = self.role_rank
+                self.role = EngineRole.INITIATOR
+                self.device = torch.device("cuda", self.src_gpu)
+            else:
+                self.global_rank = self.role_rank + 1
+                self.role = EngineRole.TARGET
+                self.device = torch.device("cuda", self.dst_gpu)
 
-        self.tensor = torch.randn(self.buffer_size * self.transfer_batch_size).to(
-            self.src_device, dtype=torch.float8_e4m3fnuz
-        )
-        self.target_tensor = torch.zeros(
-            self.buffer_size * self.transfer_batch_size
-        ).to(self.dst_device, dtype=torch.float8_e4m3fnuz)
+            self.tensor = torch.randn(self.buffer_size * self.transfer_batch_size).to(
+                self.device, dtype=torch.float8_e4m3fnuz
+            )
+        else:
+            self.role = EngineRole.INITIATOR
+            self.src_device = torch.device("cuda", self.src_gpu)
+            self.dst_device = torch.device("cuda", self.dst_gpu)
+
+            self.tensor = torch.randn(self.buffer_size * self.transfer_batch_size).to(
+                self.src_device, dtype=torch.float8_e4m3fnuz
+            )
+            self.target_tensor = torch.zeros(
+                self.buffer_size * self.transfer_batch_size
+            ).to(self.dst_device, dtype=torch.float8_e4m3fnuz)
 
     def print_config(self):
         print("MORI-IO Benchmark Configurations:")
@@ -286,6 +308,7 @@ class MoriIoBenchmark:
         print(f"  op_type: {self.op_type}")
 
         if self.backend_type == "xgmi":
+            print(f"  xgmi_multiprocess: {self.xgmi_multiprocess}")
             print(f"  src_gpu: {self.src_gpu}")
             print(f"  dst_gpu: {self.dst_gpu}")
             print(f"  num_streams: {self.num_streams}")
@@ -344,18 +367,29 @@ class MoriIoBenchmark:
             dist.send(int8_view, dst=self.role_rank)
 
     def _validate_xgmi(self):
-        transfer_uid = self.engine.allocate_transfer_uid()
-        status = self.engine.write(
-            self.mem, 0, self.target_mem, 0, self.buffer_size, transfer_uid
-        )
-        status.Wait()
-        assert status.Succeeded()
+        if self.xgmi_multiprocess:
+            if self.role is EngineRole.INITIATOR:
+                transfer_uid = self.engine.allocate_transfer_uid()
+                status = self.engine.write(
+                    self.mem, 0, self.target_mem, 0, self.buffer_size, transfer_uid
+                )
+                status.Wait()
+                assert status.Succeeded()
+            else:
+                time.sleep(0.5)
+        else:
+            transfer_uid = self.engine.allocate_transfer_uid()
+            status = self.engine.write(
+                self.mem, 0, self.target_mem, 0, self.buffer_size, transfer_uid
+            )
+            status.Wait()
+            assert status.Succeeded()
 
-        src_cpu = self.tensor[: self.buffer_size].cpu()
-        dst_cpu = self.target_tensor[: self.buffer_size].cpu()
-        assert torch.equal(
-            src_cpu.view(torch.uint8), dst_cpu.view(torch.uint8)
-        ), "Validation failed: data mismatch"
+            src_cpu = self.tensor[: self.buffer_size].cpu()
+            dst_cpu = self.target_tensor[: self.buffer_size].cpu()
+            assert torch.equal(
+                src_cpu.view(torch.uint8), dst_cpu.view(torch.uint8)
+            ), "Validation failed: data mismatch"
 
     def initialize(self):
         if self.backend_type == "xgmi":
@@ -407,7 +441,13 @@ class MoriIoBenchmark:
 
     def _initialize_xgmi(self):
         config = IOEngineConfig(host="", port=0)
-        self.engine = IOEngine(key="xgmi-benchmark", config=config)
+
+        if self.xgmi_multiprocess:
+            engine_key = f"xgmi-{self.role.name}-{self.role_rank}"
+        else:
+            engine_key = "xgmi-benchmark"
+
+        self.engine = IOEngine(key=engine_key, config=config)
 
         xgmi_config = XgmiBackendConfig(
             num_streams=self.num_streams,
@@ -415,15 +455,48 @@ class MoriIoBenchmark:
         )
         self.engine.create_backend(BackendType.XGMI, xgmi_config)
 
-        self.mem = self.engine.register_torch_tensor(self.tensor)
-        self.target_mem = self.engine.register_torch_tensor(self.target_tensor)
+        if self.xgmi_multiprocess:
+            self.engine_desc = self.engine.get_engine_desc()
+            engine_desc_bytes = self.engine_desc.pack()
 
-        if self.enable_sess:
-            self.sess = self.engine.create_session(self.mem, self.target_mem)
+            if self.role is EngineRole.INITIATOR:
+                target_engine_desc_bytes = self.recv_bytes(src=self.global_rank + 1)
+                target_engine_desc = EngineDesc.unpack(target_engine_desc_bytes)
+                self.engine.register_remote_engine(target_engine_desc)
+                self.send_bytes(engine_desc_bytes, dst=self.global_rank + 1)
+            else:
+                self.send_bytes(engine_desc_bytes, dst=self.global_rank - 1)
+                initiator_engine_desc_bytes = self.recv_bytes(src=self.global_rank - 1)
+                initiator_engine_desc = EngineDesc.unpack(initiator_engine_desc_bytes)
+                self.engine.register_remote_engine(initiator_engine_desc)
+
+            self.mem = self.engine.register_torch_tensor(self.tensor)
+
+            mem_desc_bytes = self.mem.pack()
+            if self.role is EngineRole.INITIATOR:
+                target_mem_desc_bytes = self.recv_bytes(src=self.global_rank + 1)
+                self.target_mem = MemoryDesc.unpack(target_mem_desc_bytes)
+                self.send_bytes(mem_desc_bytes, dst=self.global_rank + 1)
+            else:
+                self.send_bytes(mem_desc_bytes, dst=self.global_rank - 1)
+                initiator_mem_desc_bytes = self.recv_bytes(src=self.global_rank - 1)
+                self.target_mem = MemoryDesc.unpack(initiator_mem_desc_bytes)
+
+            if self.enable_sess:
+                self.sess = self.engine.create_session(self.mem, self.target_mem)
+        else:
+            self.mem = self.engine.register_torch_tensor(self.tensor)
+            self.target_mem = self.engine.register_torch_tensor(self.target_tensor)
+
+            if self.enable_sess:
+                self.sess = self.engine.create_session(self.mem, self.target_mem)
 
     def run_single_once(self, buffer_size, transfer_batch_size):
         assert buffer_size <= self.buffer_size
-        if self.backend_type == "rdma" and self.role is EngineRole.TARGET:
+        if (
+            self.backend_type == "rdma"
+            or (self.backend_type == "xgmi" and self.xgmi_multiprocess)
+        ) and self.role is EngineRole.TARGET:
             return 0
 
         status_list = []
@@ -472,7 +545,10 @@ class MoriIoBenchmark:
 
     def run_batch_once(self, buffer_size, transfer_batch_size):
         assert buffer_size <= self.buffer_size
-        if self.backend_type == "rdma" and self.role is EngineRole.TARGET:
+        if (
+            self.backend_type == "rdma"
+            or (self.backend_type == "xgmi" and self.xgmi_multiprocess)
+        ) and self.role is EngineRole.TARGET:
             return 0
 
         offsets = [(i * buffer_size) for i in range(transfer_batch_size)]
@@ -529,7 +605,10 @@ class MoriIoBenchmark:
             duration = self.run_once(buffer_size, transfer_batch_size)
             latency.append(duration)
 
-        if self.backend_type == "rdma" and self.role is EngineRole.TARGET:
+        if self.role is EngineRole.TARGET and (
+            self.backend_type == "rdma"
+            or (self.backend_type == "xgmi" and self.xgmi_multiprocess)
+        ):
             return 0, 0, 0, 0, 0
 
         total_mem_mb = buffer_size * transfer_batch_size / (10**6)
@@ -544,7 +623,10 @@ class MoriIoBenchmark:
 
     def _get_table_title(self):
         if self.backend_type == "xgmi":
-            return f"XGMI Benchmark: GPU{self.src_gpu} -> GPU{self.dst_gpu}"
+            if self.xgmi_multiprocess:
+                return f"XGMI Multiprocess Benchmark: Rank {self.role_rank} ({self.role.name})"
+            else:
+                return f"XGMI Benchmark: GPU{self.src_gpu} -> GPU{self.dst_gpu}"
         else:
             return f"RDMA Benchmark: Initiator Rank {self.role_rank}"
 
@@ -568,7 +650,9 @@ class MoriIoBenchmark:
             cur_size = self.sweep_start_size
             max_size = self.sweep_max_size
             while cur_size <= max_size:
-                if self.backend_type == "rdma":
+                if self.backend_type == "rdma" or (
+                    self.backend_type == "xgmi" and self.xgmi_multiprocess
+                ):
                     dist.barrier()
                 total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
                     self._run_and_compute(
@@ -591,7 +675,9 @@ class MoriIoBenchmark:
             cur_transfer_batch_size = 1
             max_transfer_batch_size = 32768
             while cur_transfer_batch_size <= max_transfer_batch_size:
-                if self.backend_type == "rdma":
+                if self.backend_type == "rdma" or (
+                    self.backend_type == "xgmi" and self.xgmi_multiprocess
+                ):
                     dist.barrier()
                 total_mem_mb, avg_duration, min_duration, avg_bw, max_bw = (
                     self._run_and_compute(
@@ -628,7 +714,9 @@ class MoriIoBenchmark:
                 ]
             )
 
-        if self.backend_type == "xgmi" or self.role is EngineRole.INITIATOR:
+        if (
+            self.backend_type == "xgmi" and not self.xgmi_multiprocess
+        ) or self.role is EngineRole.INITIATOR:
             print(table)
 
     def run(self):
@@ -638,17 +726,43 @@ class MoriIoBenchmark:
             self._run_rdma()
 
     def _run_xgmi(self):
-        self.initialize()
-        self.validate()
-        self._run_benchmark_loop()
+        if self.xgmi_multiprocess:
+            context_device_id = (
+                self.device.index
+                if hasattr(self, "device") and self.device.index is not None
+                else self.role_rank
+            )
+            with TorchDistContext(
+                rank=self.global_rank,
+                world_size=self.world_size,
+                master_addr=None,
+                master_port=None,
+                device_id=context_device_id,
+                backend="gloo",
+            ):
+                self.initialize()
+                self.run_once(self.buffer_size, self.transfer_batch_size)
+                self.validate()
+                self.run_once(self.buffer_size, self.transfer_batch_size)
+                dist.barrier()
+                self._run_benchmark_loop()
+        else:
+            self.initialize()
+            self.validate()
+            self._run_benchmark_loop()
 
     def _run_rdma(self):
+        context_device_id = (
+            self.device.index
+            if hasattr(self, "device") and self.device.index is not None
+            else self.role_rank
+        )
         with TorchDistContext(
             rank=self.global_rank,
             world_size=self.world_size,
             master_addr=None,
             master_port=None,
-            device_id=self.role_rank,
+            device_id=context_device_id,
             backend="gloo",
         ):
             self.initialize()
@@ -657,6 +771,39 @@ class MoriIoBenchmark:
             self.run_once(self.buffer_size, self.transfer_batch_size)
             dist.barrier()
             self._run_benchmark_loop()
+
+
+def benchmark_xgmi_worker(local_rank, node_rank, args):
+    set_log_level(args.log_level)
+    max_buffer_size = args.buffer_size
+    if args.all:
+        max_buffer_size = max(max_buffer_size, args.sweep_max_size)
+    max_transfer_batch_size = args.transfer_batch_size
+    if args.all_batch:
+        max_transfer_batch_size = max(max_transfer_batch_size, 2**15)
+
+    bench = MoriIoBenchmark(
+        op_type=args.op_type,
+        buffer_size=max_buffer_size,
+        transfer_batch_size=max_transfer_batch_size,
+        enable_batch_transfer=args.enable_batch_transfer,
+        enable_sess=args.enable_sess,
+        iters=args.iters,
+        sweep=args.all,
+        sweep_batch=args.all_batch,
+        sweep_start_size=args.sweep_start_size,
+        sweep_max_size=args.sweep_max_size,
+        backend_type="xgmi",
+        node_rank=node_rank,
+        rank_in_node=local_rank,
+        src_gpu=args.src_gpu,
+        dst_gpu=args.dst_gpu,
+        num_streams=args.num_streams,
+        num_events=args.num_events,
+        xgmi_multiprocess=True,
+    )
+    bench.print_config()
+    bench.run()
 
 
 def benchmark_engine(local_rank, node_rank, args):
@@ -695,8 +842,6 @@ def benchmark_engine(local_rank, node_rank, args):
 
 
 def benchmark_xgmi(args):
-    set_log_level(args.log_level)
-
     num_gpus = torch.cuda.device_count()
     if args.src_gpu >= num_gpus or args.dst_gpu >= num_gpus:
         raise ValueError(f"Invalid GPU ID. Available GPUs: 0-{num_gpus-1}")
@@ -706,32 +851,50 @@ def benchmark_xgmi(args):
             "Warning: src_gpu and dst_gpu are the same. This will be a device-local transfer."
         )
 
-    max_buffer_size = args.buffer_size
-    if args.all:
-        max_buffer_size = max(max_buffer_size, args.sweep_max_size)
-    max_transfer_batch_size = args.transfer_batch_size
-    if args.all_batch:
-        max_transfer_batch_size = max(max_transfer_batch_size, 2**15)
+    if args.xgmi_multiprocess:
+        num_node = int(os.environ.get("WORLD_SIZE", "2"))
+        if num_node != 2:
+            raise ValueError(
+                f"XGMI multi-process mode requires WORLD_SIZE=2, got {num_node}"
+            )
 
-    bench = MoriIoBenchmark(
-        op_type=args.op_type,
-        buffer_size=max_buffer_size,
-        transfer_batch_size=max_transfer_batch_size,
-        enable_batch_transfer=args.enable_batch_transfer,
-        enable_sess=args.enable_sess,
-        iters=args.iters,
-        sweep=args.all,
-        sweep_batch=args.all_batch,
-        sweep_start_size=args.sweep_start_size,
-        sweep_max_size=args.sweep_max_size,
-        backend_type="xgmi",
-        src_gpu=args.src_gpu,
-        dst_gpu=args.dst_gpu,
-        num_streams=args.num_streams,
-        num_events=args.num_events,
-    )
-    bench.print_config()
-    bench.run()
+        node_rank = int(os.environ.get("RANK", "0"))
+        nprocs = 1
+        torch.multiprocessing.spawn(
+            benchmark_xgmi_worker,
+            args=(node_rank, args),
+            nprocs=nprocs,
+            join=True,
+        )
+    else:
+        set_log_level(args.log_level)
+        max_buffer_size = args.buffer_size
+        if args.all:
+            max_buffer_size = max(max_buffer_size, args.sweep_max_size)
+        max_transfer_batch_size = args.transfer_batch_size
+        if args.all_batch:
+            max_transfer_batch_size = max(max_transfer_batch_size, 2**15)
+
+        bench = MoriIoBenchmark(
+            op_type=args.op_type,
+            buffer_size=max_buffer_size,
+            transfer_batch_size=max_transfer_batch_size,
+            enable_batch_transfer=args.enable_batch_transfer,
+            enable_sess=args.enable_sess,
+            iters=args.iters,
+            sweep=args.all,
+            sweep_batch=args.all_batch,
+            sweep_start_size=args.sweep_start_size,
+            sweep_max_size=args.sweep_max_size,
+            backend_type="xgmi",
+            src_gpu=args.src_gpu,
+            dst_gpu=args.dst_gpu,
+            num_streams=args.num_streams,
+            num_events=args.num_events,
+            xgmi_multiprocess=False,
+        )
+        bench.print_config()
+        bench.run()
 
 
 def benchmark_rdma(args):
