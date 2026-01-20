@@ -449,6 +449,8 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
   ibv_device_attr_ex device_attr_ex;
   int status = ibv_query_device_ex(context, NULL, &device_attr_ex);
   assert(!status);
+  ibv_close_device(context);
+
   // device_attr_ex.orig_attr.vendor_id = 0x14E4;
   if (backendType == RdmaBackendType::IBVerbs) {
     return new IBVerbsDevice(inDevice);

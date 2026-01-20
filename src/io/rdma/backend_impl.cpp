@@ -610,6 +610,10 @@ void ControlPlaneServer::Start() {
 void ControlPlaneServer::Shutdown() {
   running.store(false);
   if (thd.joinable()) thd.join();
+  if (epfd >= 0) {
+    close(epfd);
+    epfd = -1;
+  }
 }
 
 /* ----------------------------------------------------------------------------------------------
