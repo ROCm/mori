@@ -499,6 +499,10 @@ void RegisterMoriIo(pybind11::module_& m) {
                              })
       .def_readonly("size", &mori::io::MemoryDesc::size)
       .def_readonly("loc", &mori::io::MemoryDesc::loc)
+      .def_property_readonly("ipc_handle",
+                             [](const mori::io::MemoryDesc& desc) {
+                               return py::bytes(desc.ipcHandle.data(), desc.ipcHandle.size());
+                             })
       .def(pybind11::self == pybind11::self)
       .def("pack",
            [](const mori::io::MemoryDesc& d) {

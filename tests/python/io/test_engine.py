@@ -601,8 +601,8 @@ def test_xgmi_cross_engine_transfer():
     assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
 
     dst_tensor.zero_()
-    offsets = [0, 512 * 4, 768 * 4]
-    sizes = [256 * 4, 256 * 4, 256 * 4]
+    offsets = [0 * 4, 256 * 4, 512 * 4, 768 * 4]
+    sizes = [256 * 4, 256 * 4, 256 * 4, 256 * 4]
     transfer_uid = engine_b.allocate_transfer_uid()
     status = engine_b.batch_read(
         [dst_mem], [offsets], [remote_src_mem], [offsets], [sizes], [transfer_uid]

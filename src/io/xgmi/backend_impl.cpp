@@ -308,7 +308,11 @@ void XgmiBackend::InitializeP2PAccess() {
 
       if (canAccess) {
         hipError_t enableErr = hipDeviceEnablePeerAccess(j, 0);
-        if (enableErr != hipSuccess && enableErr != hipErrorPeerAccessAlreadyEnabled) {
+        if (enableErr == hipErrorPeerAccessAlreadyEnabled) {
+          hipGetLastError();
+          p2pMatrix[i][j] = true;
+          MORI_IO_TRACE("XGMI: P2P access already enabled from device {} to {}", i, j);
+        } else if (enableErr != hipSuccess) {
           MORI_IO_WARN("XGMI: Failed to enable P2P access from device {} to {}: {}", i, j,
                        hipGetErrorString(enableErr));
         } else {
@@ -370,7 +374,7 @@ void XgmiBackend::DeregisterMemory(const MemoryDesc& desc) {
   MORI_IO_TRACE("XGMI: Deregistered memory id={}", desc.id);
 }
 
-void* XgmiBackend::GetRemappedAddress(const MemoryDesc& desc) {
+void* XgmiBackend::GetRemappedAddress(const MemoryDesc& desc, int localDeviceId) {
   if (desc.engineKey == myEngKey) {
     return reinterpret_cast<void*>(desc.data);
   }
@@ -387,9 +391,9 @@ void* XgmiBackend::GetRemappedAddress(const MemoryDesc& desc) {
   static_assert(sizeof(handle) == kIpcHandleSize, "IPC handle size mismatch");
   std::memcpy(&handle, desc.ipcHandle.data(), sizeof(handle));
 
-  hipError_t err = hipSetDevice(desc.deviceId);
+  hipError_t err = hipSetDevice(localDeviceId);
   if (err != hipSuccess) {
-    MORI_IO_WARN("XGMI: Failed to set device {} for IPC open: {}", desc.deviceId,
+    MORI_IO_WARN("XGMI: Failed to set device {} for IPC open: {}", localDeviceId,
                  hipGetErrorString(err));
     return nullptr;
   }
@@ -397,6 +401,11 @@ void* XgmiBackend::GetRemappedAddress(const MemoryDesc& desc) {
   void* remappedAddr = nullptr;
   err = hipIpcOpenMemHandle(&remappedAddr, handle, hipIpcMemLazyEnablePeerAccess);
   if (err != hipSuccess) {
+    hipGetLastError();
+    if (IsP2PAccessible(localDeviceId, desc.deviceId)) {
+      MORI_IO_TRACE("XGMI: IPC failed, using direct P2P pointer for id={}", desc.id);
+      return reinterpret_cast<void*>(desc.data);
+    }
     MORI_IO_WARN("XGMI: Failed to open IPC handle for id={}: {}", desc.id, hipGetErrorString(err));
     return nullptr;
   }
@@ -434,9 +443,9 @@ void XgmiBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loc
 }
 
 BackendSession* XgmiBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote) {
-  void* localAddr = GetRemappedAddress(local);
-  void* remoteAddr = GetRemappedAddress(remote);
   int localDevice = local.deviceId;
+  void* localAddr = GetRemappedAddress(local, localDevice);
+  void* remoteAddr = GetRemappedAddress(remote, localDevice);
   int remoteDevice = remote.deviceId;
 
   if (!IsP2PAccessible(localDevice, remoteDevice)) {
@@ -459,7 +468,7 @@ XgmiBackendSession* XgmiBackend::GetOrCreateSessionCached(const MemoryDesc& loca
   }
 
   void* localAddr = reinterpret_cast<void*>(local.data);
-  void* remoteAddr = GetRemappedAddress(remote);
+  void* remoteAddr = GetRemappedAddress(remote, local.deviceId);
   int localDevice = local.deviceId;
   int remoteDevice = remote.deviceId;
 

@@ -95,7 +95,7 @@ class XgmiBackend : public Backend {
 
  private:
   void InitializeP2PAccess();
-  void* GetRemappedAddress(const MemoryDesc& desc);
+  void* GetRemappedAddress(const MemoryDesc& desc, int localDeviceId);
 
   struct SessionCacheKey {
     EngineKey remoteEngineKey;
