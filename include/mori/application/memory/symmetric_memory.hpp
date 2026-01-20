@@ -33,10 +33,18 @@
 #include "mori/application/context/context.hpp"
 #include "mori/application/transport/transport.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
-#include "mori/application/memory/vmm_va_manager.hpp"
+#include "mori/application/memory/va_manager.hpp"
 
 namespace mori {
 namespace application {
+
+struct VMMChunkKey {
+  uint32_t key;           // RDMA lkey or rkey
+  uintptr_t next_addr;    // Address of next chunk boundary (for calculating chunk_size)
+  
+  VMMChunkKey() : key(0), next_addr(0) {}
+  VMMChunkKey(uint32_t k, uintptr_t addr) : key(k), next_addr(addr) {}
+};
 
 struct SymmMemObj {
   void* localPtr{nullptr};
@@ -46,12 +54,12 @@ struct SymmMemObj {
   uint32_t lkey{0};
   uint32_t* peerRkeys{nullptr};
   
-  // For VMM allocations: which chunks this object spans
-  uint32_t* vmmLkeys{nullptr};
-  uint32_t* vmmRkeys{nullptr};
-  size_t startChunk{0};
-  size_t numChunks{0};
-  uint8_t chunkSizeShift{0};
+  // For VMM allocations: chunk key information (nvshmem-style)
+  // vmmLkeyInfo[i] contains lkey and next_addr for chunk i
+  // vmmRkeyInfo[i * worldSize + pe] contains rkey and next_addr for chunk i, PE pe
+  VMMChunkKey* vmmLkeyInfo{nullptr};
+  VMMChunkKey* vmmRkeyInfo{nullptr};
+  size_t vmmNumChunks{0};       // Total number of chunks in VMM heap
   int worldSize{0};
   // For IPC
   hipIpcMemHandle_t* ipcMemHandles{nullptr};  // should only placed on cpu
@@ -71,25 +79,9 @@ struct SymmMemObj {
     return mr;
   }
 
-  // Get RDMA lkey for a given offset (handles both static heap and VMM heap)
-  inline __device__ __host__ uint32_t GetLkey(size_t offset = 0) const {
-    if (vmmLkeys) {
-      // VMM allocation: use bit shift for fast division
-      size_t chunkIdx = startChunk + (offset >> chunkSizeShift);
-      return vmmLkeys[chunkIdx];
-    }
-    return lkey;
-  }
-
-  // Get RDMA rkey for a given PE and offset (handles both static heap and VMM heap)
-  inline __device__ __host__ uint32_t GetRkey(int pe, size_t offset = 0) const {
-    if (vmmRkeys) {
-      // VMM allocation: use bit shift for fast division
-      size_t chunkIdx = startChunk + (offset >> chunkSizeShift);
-      return vmmRkeys[chunkIdx * worldSize + pe];
-    }
-    return peerRkeys[pe];
-  }
+  // Note: RDMA key lookup for heap allocations should use GetLkeyAndChunkSize
+  // and GetRaddrRkeyAndChunkSize in shmem_ibgda_kernels.hpp instead.
+  // Those functions handle both VMM and static heap modes efficiently.
 
   // Get pointers
   inline __device__ __host__ void* Get() const { return localPtr; }

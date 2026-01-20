@@ -121,6 +121,7 @@ struct GpuStates {
 
   // Heap information (supports both static and VMM modes)
   bool useVMMHeap{false};                     // Whether using VMM-based heap
+  uint8_t vmmChunkSizeShift{0};               // log2(chunkSize) for VMM heap, 0 for static heap
   uintptr_t heapBaseAddr{0};                  // Base address of symmetric heap
   uintptr_t heapEndAddr{0};                   // End address of symmetric heap (base + size)
   application::SymmMemObj* heapObj{nullptr};  // Pointer to the heap's SymmMemObj on device

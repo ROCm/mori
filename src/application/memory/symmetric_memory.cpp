@@ -260,7 +260,7 @@ void SymmMemManager::HeapDeregisterSymmMemObj(void* localPtr) {
   free(memObjPtr.cpu->peerPtrs);
   free(memObjPtr.cpu->peerRkeys);  // nullptr for VMM objects (safe to free)
   free(memObjPtr.cpu->ipcMemHandles);
-  // Note: vmmLkeys and vmmRkeys are NOT freed here - they point to shared vmmHeapObj arrays
+  // Note: vmmLkeyInfo and vmmRkeyInfo are NOT freed here - they point to shared vmmHeapObj arrays
   free(memObjPtr.cpu);
   HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerPtrs));
   HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerRkeys));  // nullptr for VMM objects (safe to free)
@@ -413,14 +413,32 @@ bool SymmMemManager::InitializeVMMHeap(size_t virtualSize, size_t chunkSize) {
   cpuHeapObj->ipcMemHandles =
       static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
 
-  // For VMM heap: use vmmRkeys and vmmLkeys (each chunk has its own RDMA registration)
+  // For VMM heap: use VMMChunkKey arrays (nvshmem-style: key + next_addr per chunk)
   // Static heap uses lkey (single value) and peerRkeys (array per PE)
-  // VMM heap uses vmmLkeys (array per chunk) and vmmRkeys (array per chunk × worldSize)
-  cpuHeapObj->vmmRkeys =
-      static_cast<uint32_t*>(calloc(worldSize * vmmMaxChunks, sizeof(uint32_t)));
-  cpuHeapObj->vmmLkeys = static_cast<uint32_t*>(calloc(vmmMaxChunks, sizeof(uint32_t)));
-  memset(cpuHeapObj->vmmRkeys, 0, sizeof(uint32_t) * worldSize * vmmMaxChunks);
-  memset(cpuHeapObj->vmmLkeys, 0, sizeof(uint32_t) * vmmMaxChunks);
+  // VMM heap uses vmmLkeyInfo (array per chunk) and vmmRkeyInfo (array per chunk × worldSize)
+  
+  // Calculate next_addr for each chunk
+  uintptr_t heapBase = reinterpret_cast<uintptr_t>(vmmVirtualBasePtr);
+  
+  cpuHeapObj->vmmLkeyInfo = static_cast<VMMChunkKey*>(calloc(vmmMaxChunks, sizeof(VMMChunkKey)));
+  cpuHeapObj->vmmRkeyInfo = static_cast<VMMChunkKey*>(calloc(worldSize * vmmMaxChunks, sizeof(VMMChunkKey)));
+  
+  // Initialize VMMChunkKey arrays with next_addr values
+  for (size_t i = 0; i < vmmMaxChunks; ++i) {
+    uintptr_t chunkEnd = heapBase + (i + 1) * vmmChunkSize;
+    uintptr_t heapEnd = heapBase + virtualSize;
+    cpuHeapObj->vmmLkeyInfo[i].next_addr = (chunkEnd < heapEnd) ? chunkEnd : heapEnd;
+    cpuHeapObj->vmmLkeyInfo[i].key = 0;  // Will be set when chunk is allocated
+    
+    // Initialize rkey info for all PEs
+    for (int pe = 0; pe < worldSize; ++pe) {
+      cpuHeapObj->vmmRkeyInfo[i * worldSize + pe].next_addr = cpuHeapObj->vmmLkeyInfo[i].next_addr;
+      cpuHeapObj->vmmRkeyInfo[i * worldSize + pe].key = 0;  // Will be set when chunk is allocated
+    }
+  }
+  
+  cpuHeapObj->vmmNumChunks = vmmMaxChunks;
+  cpuHeapObj->worldSize = worldSize;
   
   // Keep lkey and peerRkeys as nullptr for VMM heap to distinguish from static heap
   cpuHeapObj->lkey = 0;
@@ -435,13 +453,17 @@ bool SymmMemManager::InitializeVMMHeap(size_t virtualSize, size_t chunkSize) {
   HIP_RUNTIME_CHECK(hipMemcpy(gpuHeapObj->peerPtrs, cpuHeapObj->peerPtrs,
                               sizeof(uintptr_t) * worldSize, hipMemcpyHostToDevice));
 
-  // Allocate and copy VMM-specific RDMA keys to GPU
-  HIP_RUNTIME_CHECK(hipMalloc(&gpuHeapObj->vmmRkeys, sizeof(uint32_t) * worldSize * vmmMaxChunks));
-  HIP_RUNTIME_CHECK(hipMemcpy(gpuHeapObj->vmmRkeys, cpuHeapObj->vmmRkeys,
-                              sizeof(uint32_t) * worldSize * vmmMaxChunks, hipMemcpyHostToDevice));
-  HIP_RUNTIME_CHECK(hipMalloc(&gpuHeapObj->vmmLkeys, sizeof(uint32_t) * vmmMaxChunks));
-  HIP_RUNTIME_CHECK(hipMemcpy(gpuHeapObj->vmmLkeys, cpuHeapObj->vmmLkeys, 
-                              sizeof(uint32_t) * vmmMaxChunks, hipMemcpyHostToDevice));
+  // Allocate and copy VMM-specific RDMA key info to GPU
+  HIP_RUNTIME_CHECK(hipMalloc(&gpuHeapObj->vmmLkeyInfo, sizeof(VMMChunkKey) * vmmMaxChunks));
+  HIP_RUNTIME_CHECK(hipMemcpy(gpuHeapObj->vmmLkeyInfo, cpuHeapObj->vmmLkeyInfo,
+                              sizeof(VMMChunkKey) * vmmMaxChunks, hipMemcpyHostToDevice));
+  
+  HIP_RUNTIME_CHECK(hipMalloc(&gpuHeapObj->vmmRkeyInfo, sizeof(VMMChunkKey) * worldSize * vmmMaxChunks));
+  HIP_RUNTIME_CHECK(hipMemcpy(gpuHeapObj->vmmRkeyInfo, cpuHeapObj->vmmRkeyInfo,
+                              sizeof(VMMChunkKey) * worldSize * vmmMaxChunks, hipMemcpyHostToDevice));
+  
+  gpuHeapObj->vmmNumChunks = vmmMaxChunks;
+  gpuHeapObj->worldSize = worldSize;
   
   // Set lkey and peerRkeys to 0/nullptr for VMM heap
   gpuHeapObj->lkey = 0;
@@ -503,13 +525,13 @@ void SymmMemManager::FinalizeVMMHeap() {
   // Clean up VMM heap object
   if (vmmHeapObj.IsValid()) {
     free(vmmHeapObj.cpu->peerPtrs);
-    free(vmmHeapObj.cpu->vmmRkeys);
-    free(vmmHeapObj.cpu->vmmLkeys);
+    free(vmmHeapObj.cpu->vmmRkeyInfo);
+    free(vmmHeapObj.cpu->vmmLkeyInfo);
     free(vmmHeapObj.cpu->ipcMemHandles);
     free(vmmHeapObj.cpu);
     HIP_RUNTIME_CHECK(hipFree(vmmHeapObj.gpu->peerPtrs));
-    HIP_RUNTIME_CHECK(hipFree(vmmHeapObj.gpu->vmmRkeys));
-    HIP_RUNTIME_CHECK(hipFree(vmmHeapObj.gpu->vmmLkeys));
+    HIP_RUNTIME_CHECK(hipFree(vmmHeapObj.gpu->vmmRkeyInfo));
+    HIP_RUNTIME_CHECK(hipFree(vmmHeapObj.gpu->vmmLkeyInfo));
     HIP_RUNTIME_CHECK(hipFree(vmmHeapObj.gpu));
     vmmHeapObj = SymmMemObjPtr{nullptr, nullptr};
   }
@@ -864,9 +886,9 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
         vmmChunks[chunkIdx].rdmaRegistered = true;
         localChunkRkeys[i] = mr.rkey;
 
-        // Update vmmHeapObj's vmmLkeys and vmmRkeys arrays
-        vmmHeapObj.cpu->vmmLkeys[chunkIdx] = mr.lkey;
-        vmmHeapObj.cpu->vmmRkeys[chunkIdx * worldSize + rank] = mr.rkey;
+        // Update vmmHeapObj's VMMChunkKey arrays (key is set, next_addr already initialized)
+        vmmHeapObj.cpu->vmmLkeyInfo[chunkIdx].key = mr.lkey;
+        vmmHeapObj.cpu->vmmRkeyInfo[chunkIdx * worldSize + rank].key = mr.rkey;
 
         MORI_APP_TRACE("VMMAlloc: rank={} RDMA chunk={} addr={:p} lkey={} rkey={}", rank, chunkIdx,
                        chunkPtr, mr.lkey, mr.rkey);
@@ -892,24 +914,24 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
           uint32_t rkeyValue = allChunkRkeysFlat[pe * chunksNeeded + i];
           vmmChunks[chunkIdx].peerRkeys[pe] = rkeyValue;
           
-          // Update vmmHeapObj's vmmRkeys array
-          vmmHeapObj.cpu->vmmRkeys[chunkIdx * worldSize + pe] = rkeyValue;
+          // Update vmmHeapObj's VMMChunkKey rkey info
+          vmmHeapObj.cpu->vmmRkeyInfo[chunkIdx * worldSize + pe].key = rkeyValue;
         }
       }
       
-      // Synchronize updated keys to GPU for these chunks
-      size_t keysOffset = startChunk * worldSize * sizeof(uint32_t);
-      size_t keysSize = chunksNeeded * worldSize * sizeof(uint32_t);
+      // Synchronize updated VMMChunkKey to GPU for these chunks
+      size_t keysOffset = startChunk * worldSize * sizeof(VMMChunkKey);
+      size_t keysSize = chunksNeeded * worldSize * sizeof(VMMChunkKey);
       HIP_RUNTIME_CHECK(hipMemcpy(
-          reinterpret_cast<char*>(vmmHeapObj.gpu->vmmRkeys) + keysOffset,
-          vmmHeapObj.cpu->vmmRkeys + startChunk * worldSize,
+          reinterpret_cast<char*>(vmmHeapObj.gpu->vmmRkeyInfo) + keysOffset,
+          vmmHeapObj.cpu->vmmRkeyInfo + startChunk * worldSize,
           keysSize, hipMemcpyHostToDevice));
       
-      // Synchronize lkeys to GPU
+      // Synchronize lkey info to GPU
       HIP_RUNTIME_CHECK(hipMemcpy(
-          vmmHeapObj.gpu->vmmLkeys + startChunk,
-          vmmHeapObj.cpu->vmmLkeys + startChunk,
-          chunksNeeded * sizeof(uint32_t), hipMemcpyHostToDevice));
+          vmmHeapObj.gpu->vmmLkeyInfo + startChunk,
+          vmmHeapObj.cpu->vmmLkeyInfo + startChunk,
+          chunksNeeded * sizeof(VMMChunkKey), hipMemcpyHostToDevice));
     }
   } else {
     // Step 4: Reuse existing physical memory (VA was previously allocated)
@@ -972,10 +994,10 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
         vmmChunks[idx].lkey = 0;
         std::fill(vmmChunks[idx].peerRkeys.begin(), vmmChunks[idx].peerRkeys.end(), 0);
         
-        // Clear vmmHeapObj's vmmLkeys and vmmRkeys arrays for this chunk
-        vmmHeapObj.cpu->vmmLkeys[idx] = 0;
+        // Clear vmmHeapObj's VMMChunkKey arrays for this chunk (keep next_addr, clear key)
+        vmmHeapObj.cpu->vmmLkeyInfo[idx].key = 0;
         for (int pe = 0; pe < worldSize; ++pe) {
-          vmmHeapObj.cpu->vmmRkeys[idx * worldSize + pe] = 0;
+          vmmHeapObj.cpu->vmmRkeyInfo[idx * worldSize + pe].key = 0;
         }
         
         MORI_APP_TRACE("VMMFreeChunk: RANK {} deregistered RDMA for chunk {} at {:p}", rank, idx,
@@ -992,19 +1014,19 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
     }
   }
 
-  // Synchronize cleared keys to GPU for freed chunks
+  // Synchronize cleared VMMChunkKey to GPU for freed chunks
   if (chunksToFree > 0) {
-    size_t keysOffset = chunkIdx * worldSize * sizeof(uint32_t);
-    size_t keysSize = chunksToFree * worldSize * sizeof(uint32_t);
+    size_t keysOffset = chunkIdx * worldSize * sizeof(VMMChunkKey);
+    size_t keysSize = chunksToFree * worldSize * sizeof(VMMChunkKey);
     HIP_RUNTIME_CHECK(hipMemcpy(
-        reinterpret_cast<char*>(vmmHeapObj.gpu->vmmRkeys) + keysOffset,
-        vmmHeapObj.cpu->vmmRkeys + chunkIdx * worldSize,
+        reinterpret_cast<char*>(vmmHeapObj.gpu->vmmRkeyInfo) + keysOffset,
+        vmmHeapObj.cpu->vmmRkeyInfo + chunkIdx * worldSize,
         keysSize, hipMemcpyHostToDevice));
     
     HIP_RUNTIME_CHECK(hipMemcpy(
-        vmmHeapObj.gpu->vmmLkeys + chunkIdx,
-        vmmHeapObj.cpu->vmmLkeys + chunkIdx,
-        chunksToFree * sizeof(uint32_t), hipMemcpyHostToDevice));
+        vmmHeapObj.gpu->vmmLkeyInfo + chunkIdx,
+        vmmHeapObj.cpu->vmmLkeyInfo + chunkIdx,
+        chunksToFree * sizeof(VMMChunkKey), hipMemcpyHostToDevice));
   }
 
   // Also unmap from peer virtual address spaces for P2P accessible PEs
@@ -1062,23 +1084,19 @@ SymmMemObjPtr SymmMemManager::VMMRegisterSymmMemObj(void* localPtr, size_t size,
   cpuMemObj->ipcMemHandles =
       static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
 
-  // For VMM allocations: directly point to vmmHeapObj's key arrays (shared across all VMM objects)
-  // This allows accessing keys for all chunks this allocation spans
-  cpuMemObj->vmmLkeys = vmmHeapObj.cpu->vmmLkeys;
-  cpuMemObj->vmmRkeys = vmmHeapObj.cpu->vmmRkeys;
-  cpuMemObj->startChunk = startChunk;
-  cpuMemObj->numChunks = numChunks;
-  // Store log2(chunkSize) for fast division using bit shift
-  cpuMemObj->chunkSizeShift = static_cast<uint8_t>(__builtin_ctzll(vmmChunkSize));
+  // For VMM allocations: directly point to vmmHeapObj's VMMChunkKey arrays (shared across all VMM objects)
+  // This allows accessing keys for all chunks in the heap
+  cpuMemObj->vmmLkeyInfo = vmmHeapObj.cpu->vmmLkeyInfo;
+  cpuMemObj->vmmRkeyInfo = vmmHeapObj.cpu->vmmRkeyInfo;
+  cpuMemObj->vmmNumChunks = vmmHeapObj.cpu->vmmNumChunks;
   cpuMemObj->worldSize = worldSize;
   
   // Keep lkey and peerRkeys as nullptr/0 for VMM allocations to distinguish from static heap
   cpuMemObj->lkey = 0;
   cpuMemObj->peerRkeys = nullptr;
 
-  MORI_APP_TRACE("VMMRegister: chunk={} numChunks={} chunkSize={} (shift={}) spans [{}, {})",
-                 startChunk, numChunks, vmmChunkSize, cpuMemObj->chunkSizeShift, startChunk,
-                 startChunk + numChunks);
+  MORI_APP_TRACE("VMMRegister: startChunk={} numChunks={} chunkSize={} spans [{}, {})",
+                 startChunk, numChunks, vmmChunkSize, startChunk, startChunk + numChunks);
   SymmMemObj* gpuMemObj;
   HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj, sizeof(SymmMemObj)));
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj, cpuMemObj, sizeof(SymmMemObj), hipMemcpyHostToDevice));
@@ -1087,9 +1105,9 @@ SymmMemObjPtr SymmMemManager::VMMRegisterSymmMemObj(void* localPtr, size_t size,
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerPtrs, cpuMemObj->peerPtrs,
                               sizeof(uintptr_t) * worldSize, hipMemcpyHostToDevice));
 
-  // For VMM allocations: point to vmmHeapObj's GPU key arrays (not allocating new memory)
-  gpuMemObj->vmmLkeys = vmmHeapObj.gpu->vmmLkeys;
-  gpuMemObj->vmmRkeys = vmmHeapObj.gpu->vmmRkeys;
+  // For VMM allocations: point to vmmHeapObj's GPU VMMChunkKey arrays (not allocating new memory)
+  gpuMemObj->vmmLkeyInfo = vmmHeapObj.gpu->vmmLkeyInfo;
+  gpuMemObj->vmmRkeyInfo = vmmHeapObj.gpu->vmmRkeyInfo;
   gpuMemObj->peerRkeys = nullptr;  // Not used for VMM allocations
 
   memObjPool.insert({localPtr, SymmMemObjPtr{cpuMemObj, gpuMemObj}});

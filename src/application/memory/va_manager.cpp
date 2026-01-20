@@ -20,7 +20,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "mori/application/memory/vmm_va_manager.hpp"
+#include "mori/application/memory/va_manager.hpp"
 #include "mori/utils/mori_log.hpp"
 
 #include <algorithm>

@@ -31,7 +31,7 @@ add_library(
   transport/tcp/tcp.cpp
   transport/sdma/anvil.cpp
   memory/symmetric_memory.cpp
-  memory/vmm_va_manager.cpp
+  memory/va_manager.cpp
   memory/memory_region.cpp
   context/context.cpp
   topology/gpu.cpp

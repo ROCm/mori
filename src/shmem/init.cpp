@@ -295,6 +295,7 @@ void GpuStateInit() {
     gpuStates.heapBaseAddr = 0;
     gpuStates.heapEndAddr = 0;
     gpuStates.heapObj = nullptr;
+    gpuStates.vmmChunkSizeShift = 0;
     MORI_SHMEM_INFO("Isolation mode: no heap info copied to GPU");
   } else if (states->mode == ShmemMode::VMHeap && states->memoryStates->useVMMHeap &&
              states->memoryStates->vmmHeapInitialized) {
@@ -303,17 +304,20 @@ void GpuStateInit() {
     gpuStates.heapBaseAddr = heapBase;
     gpuStates.heapEndAddr = heapBase + states->memoryStates->vmmHeapVirtualSize;
     gpuStates.heapObj = states->memoryStates->vmmHeapObj.gpu;
+    gpuStates.vmmChunkSizeShift = static_cast<uint8_t>(__builtin_ctzll(states->memoryStates->vmmHeapChunkSize));
     MORI_SHMEM_INFO(
-        "VMM heap info copied to GPU: base=0x{:x}, end=0x{:x}, size={} bytes, heapObj=0x{:x}",
+        "VMM heap info copied to GPU: base=0x{:x}, end=0x{:x}, size={} bytes, chunkSize={} (shift={}), heapObj=0x{:x}",
         gpuStates.heapBaseAddr, gpuStates.heapEndAddr,
         gpuStates.heapEndAddr - gpuStates.heapBaseAddr,
+        states->memoryStates->vmmHeapChunkSize, gpuStates.vmmChunkSizeShift,
         reinterpret_cast<uintptr_t>(gpuStates.heapObj));
   } else if (states->mode == ShmemMode::StaticHeap && states->memoryStates->staticHeapObj.IsValid()) {
-    // Static heap mode
+    // Static heap mode (no chunking, single RDMA registration)
     uintptr_t heapBase = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
     gpuStates.heapBaseAddr = heapBase;
     gpuStates.heapEndAddr = heapBase + states->memoryStates->staticHeapSize;
     gpuStates.heapObj = states->memoryStates->staticHeapObj.gpu;
+    gpuStates.vmmChunkSizeShift = 0;  // No chunking for static heap
     MORI_SHMEM_INFO(
         "Static heap info copied to GPU: base=0x{:x}, end=0x{:x}, size={} bytes, heapObj=0x{:x}",
         gpuStates.heapBaseAddr, gpuStates.heapEndAddr,
@@ -324,8 +328,13 @@ void GpuStateInit() {
     gpuStates.heapBaseAddr = 0;
     gpuStates.heapEndAddr = 0;
     gpuStates.heapObj = nullptr;
-    MORI_SHMEM_WARN("Invalid heap configuration for mode {}, GPU heap info set to null",
-                    static_cast<int>(states->mode));
+    gpuStates.vmmChunkSizeShift = 0;
+    MORI_SHMEM_ERROR("Invalid heap configuration for mode {}: mode={}, useVMMHeap={}, "
+                     "vmmHeapInitialized={}, staticHeapValid={}",
+                     static_cast<int>(states->mode), static_cast<int>(states->mode),
+                     states->memoryStates->useVMMHeap, 
+                     states->memoryStates->vmmHeapInitialized,
+                     states->memoryStates->staticHeapObj.IsValid());
   }
 
   // Copy gpu states to constant memory
