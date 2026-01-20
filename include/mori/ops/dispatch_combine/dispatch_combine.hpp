@@ -95,6 +95,7 @@ struct EpDispatchCombineConfig {
   int gpuPerNode{8};
   int rdmaBlockNum{1};
   int numQpPerPe{1};
+  int numSdmaQueuesPerPe{8};
 
   inline __host__ __device__ int MaxNumTokensToSendPerRank() const { return maxNumInpTokenPerRank; }
 
@@ -161,6 +162,9 @@ class EpDispatchCombineHandle {
 
   void InitializeBarrier();
   void FinalizeBarrier();
+
+  void InitializeSdma();
+  void FinalizeSdma();
 
  public:
   // Number of tokens on this rank and size of scale data type, updated at each round of inference
@@ -248,6 +252,11 @@ class EpDispatchCombineHandle {
   index_t* interNodeChunkFlagCombine{nullptr};
   // Map dispatched rdma token chunk index
   index_t* interNodeDispSendMap{nullptr};
+
+  // SDMA queue handles for GPU kernel access
+  anvil::SdmaQueueDeviceHandle** sdmaQueueHandles{nullptr};
+  HSAuint64* sdmaSignalPtrs{nullptr};
+  HSAuint64* sdmaExpectSignalsPtr{nullptr};
 };
 
 template <typename T>
@@ -297,6 +306,10 @@ struct EpDispatchCombineArgs {
   index_t* interNodeDispDestTokIdMap{nullptr};
   index_t* interNodeChunkFlagCombine{nullptr};
   index_t* interNodeDispSendMap{nullptr};
+
+  anvil::SdmaQueueDeviceHandle** sdmaQueueHandles{nullptr};
+  HSAuint64* sdmaSignalPtrs{nullptr};
+  HSAuint64* sdmaExpectSignalsPtr{nullptr};
 };
 
 using EpDispatchCombineArgsVariant =
@@ -358,6 +371,9 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.interNodeDispDestTokIdMap = handle.interNodeDispDestTokIdMap;
   args.interNodeChunkFlagCombine = handle.interNodeChunkFlagCombine;
   args.interNodeDispSendMap = handle.interNodeDispSendMap;
+  args.sdmaQueueHandles = handle.sdmaQueueHandles;
+  args.sdmaSignalPtrs = handle.sdmaSignalPtrs;
+  args.sdmaExpectSignalsPtr = handle.sdmaExpectSignalsPtr;
   return args;
 }
 

@@ -25,6 +25,8 @@
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 #include "mori/shmem/shmem.hpp"
 
+#define ENABLE_SDMA 1
+
 namespace mori {
 namespace moe {
 
@@ -85,18 +87,25 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
   int myPe = config.rank;
   int npes = config.worldSize;
+#if ENABLE_SDMA == 1
+  const auto nSdmaQueues = npes * config.numSdmaQueuesPerPe;
+#endif
 
   size_t maxNumTokensToSend = config.MaxNumTokensToSend();
 
   if (args.tokenIndices && args.inpTokenBuf) {
     // Phase1: send token
     // Each warp compute token offset on destinition PE
+#if ENABLE_SDMA == 1
+    uint64_t sdmaQueueMask = 0;
+#endif
     for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
          i += globalWarpNum) {
       index_t srcTokId = i / config.numExpertPerToken;
       index_t destExpert = args.tokenIndices[i];
       index_t destPe = destExpert / config.numExpertPerRank;
       index_t destTokId = 0;
+      index_t dispTokId = 0;
 
       // Deduplicate
       assert(config.numExpertPerToken < warpSize);
@@ -115,7 +124,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       if (laneId == 0) {
         // decide token id in dest pe
         destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
-        atomicAdd(args.destPeTokenCounter + destPe, 1);
+        dispTokId = atomicAdd(args.destPeTokenCounter + destPe, 1);
         args.dispDestTokIdMap[i] = destPe * maxNumTokensToSend + destTokId;
 
         // TODO: use a switch to control the writing of this buffer, should only turn on for testing
@@ -147,9 +156,49 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
       index_t srcTokOffset = srcTokId * config.hiddenDim;
       index_t destTokOffset = destTokId * config.hiddenDim;
+#if ENABLE_SDMA == 0
       core::WarpCopy(args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
                      args.inpTokenBuf + srcTokOffset, config.hiddenDim);
+#else
+      if (destPe == myPe) {
+        core::WarpCopy(args.shmemDispatchOutTokMemObj->template GetAs<T*>(destPe) + destTokOffset,
+                       args.inpTokenBuf + srcTokOffset, config.hiddenDim);
+      } else {
+        if (laneId == 0) {
+          // int queueIdx =
+          //     destPe * config.numSdmaQueuesPerPe + (dispTokId % config.numSdmaQueuesPerPe);
+          int queueIdx =
+              destPe * config.numSdmaQueuesPerPe + (globalWarpId % config.numSdmaQueuesPerPe);
+          anvil::put(*args.sdmaQueueHandles[queueIdx],
+                     args.shmemDispatchOutTokMemObj->template GetAs<char*>(destPe) +
+                         destTokOffset * sizeof(T),
+                     reinterpret_cast<char*>(args.inpTokenBuf) + srcTokOffset * sizeof(T),
+                     config.hiddenDim * sizeof(T));
+          sdmaQueueMask |= 1ULL << queueIdx;
+        }
+      }
+#endif
     }
+
+#if ENABLE_SDMA == 1
+    if (laneId == 0) {
+      // Signal all active queues
+      for (uint64_t mask = sdmaQueueMask; mask != 0; ) {
+        int queueIdx = __ffsll(static_cast<unsigned long long>(mask)) - 1;
+        anvil::signal(*args.sdmaQueueHandles[queueIdx],
+                      args.sdmaSignalPtrs + (globalWarpId * nSdmaQueues + queueIdx));
+        ++args.sdmaExpectSignalsPtr[globalWarpId * nSdmaQueues + queueIdx];
+        mask &= ~(1ULL << queueIdx);
+      }
+      // Wait for all signals
+      for (uint64_t mask = sdmaQueueMask; mask != 0; ) {
+        int queueIdx = __ffsll(static_cast<unsigned long long>(mask)) - 1;
+        anvil::waitForSignal(args.sdmaSignalPtrs + (globalWarpId * nSdmaQueues + queueIdx),
+                             args.sdmaExpectSignalsPtr[globalWarpId * nSdmaQueues + queueIdx]);
+        mask &= ~(1ULL << queueIdx);
+      }
+    }
+#endif
   }
   if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 

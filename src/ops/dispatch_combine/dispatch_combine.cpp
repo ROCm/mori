@@ -56,6 +56,7 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
   InitializeTokenNumSignalBuf();
   InitializeOrderMapBuf();
   InitializeBarrier();
+  InitializeSdma();
 }
 
 EpDispatchCombineHandle::~EpDispatchCombineHandle() {
@@ -63,6 +64,7 @@ EpDispatchCombineHandle::~EpDispatchCombineHandle() {
   FinalizeTokenNumSignalBuf();
   FinalizeOrderMapBuf();
   FinalizeBarrier();
+  FinalizeSdma();
 }
 
 mori::application::SymmMemObjPtr ShmemMallocAndReturnMemObjPtr(size_t size, unsigned int flags) {
@@ -246,6 +248,48 @@ void EpDispatchCombineHandle::FinalizeBarrier() {
   HIP_RUNTIME_CHECK(hipFree(interNodeBlocksBarrier));
   ShmemFree(crossDeviceBarrierMemObj->localPtr);
   ShmemFree(interNodeChunkFlagMemObj->localPtr);
+}
+
+void EpDispatchCombineHandle::InitializeSdma() {
+  size_t totalNumQueues = config.numSdmaQueuesPerPe * config.gpuPerNode;
+  int srcDeviceId = config.rank % config.gpuPerNode;
+  HIP_RUNTIME_CHECK(
+      hipMalloc(&sdmaQueueHandles, totalNumQueues * sizeof(anvil::SdmaQueueDeviceHandle*)));
+  for (int dstDeviceId = 0; dstDeviceId < config.gpuPerNode; dstDeviceId++) {
+    if (dstDeviceId == srcDeviceId) continue;
+    for (size_t q = 0; q < config.numSdmaQueuesPerPe; q++) {
+      sdmaQueueHandles[dstDeviceId * config.numSdmaQueuesPerPe + q] =
+          anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
+    }
+  }
+
+  // HIP_RUNTIME_CHECK(
+  //     hipMalloc(&sdmaSignalPtrs, sizeof(HSAuint64) * config.gpuPerNode * config.numSdmaQueuesPerPe));
+  // HIP_RUNTIME_CHECK(
+  //     hipMemset(sdmaSignalPtrs, 0, sizeof(HSAuint64) * config.gpuPerNode * config.numSdmaQueuesPerPe));
+
+  // HIP_RUNTIME_CHECK(hipMalloc(&sdmaExpectSignalsPtr,
+  //                             sizeof(HSAuint64) * config.gpuPerNode * config.numSdmaQueuesPerPe));
+  // HIP_RUNTIME_CHECK(hipMemset(sdmaExpectSignalsPtr, 0,
+  //                             sizeof(HSAuint64) * config.gpuPerNode * config.numSdmaQueuesPerPe));
+
+  const auto numWarps = config.warpNumPerBlock * config.blockNum;
+  HIP_RUNTIME_CHECK(hipMalloc(
+      &sdmaSignalPtrs, sizeof(HSAuint64) * numWarps * config.gpuPerNode * config.numSdmaQueuesPerPe));
+  HIP_RUNTIME_CHECK(hipMemset(
+      sdmaSignalPtrs, 0, sizeof(HSAuint64) * numWarps * config.gpuPerNode * config.numSdmaQueuesPerPe));
+
+  HIP_RUNTIME_CHECK(hipMalloc(&sdmaExpectSignalsPtr, sizeof(HSAuint64) * numWarps *
+                                                         config.gpuPerNode * config.numSdmaQueuesPerPe));
+  HIP_RUNTIME_CHECK(
+      hipMemset(sdmaExpectSignalsPtr, 0,
+                sizeof(HSAuint64) * numWarps * config.gpuPerNode * config.numSdmaQueuesPerPe));
+}
+
+void EpDispatchCombineHandle::FinalizeSdma() {
+  HIP_RUNTIME_CHECK(hipFree(sdmaQueueHandles));
+  HIP_RUNTIME_CHECK(hipFree(sdmaSignalPtrs));
+  HIP_RUNTIME_CHECK(hipFree(sdmaExpectSignalsPtr));
 }
 
 void EpDispatchCombineHandle::LaunchIntraNodeDispatch(int blockNum, int warpPerBlock,
