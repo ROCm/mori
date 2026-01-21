@@ -52,7 +52,7 @@ void testOneShotSdmaAllGather() {
 
   // Configuration
   // Each PE contributes a chunk of data; all PEs will have all chunks after AllGather
-  const int elemsPerPe = 1024 * 1024;  // Number of elements each PE contributes
+  const int elemsPerPe = 1024 * 1024 * 128;  // Number of elements each PE contributes
   const size_t bytesPerPe = elemsPerPe * sizeof(uint32_t);
   const size_t totalBytes = bytesPerPe * npes;  // Total buffer size
 

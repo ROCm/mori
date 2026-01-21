@@ -127,7 +127,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
   std::vector<int> dstDeviceIds;
   for (int i = 0; i < worldSize; i++) {
     if (context.GetTransportType(i) != TransportType::SDMA) continue;
-    if (i == rank) continue;
+    //if (i == rank) continue;
     dstDeviceIds.push_back(i%8); // should be intra devices count
   }
   if(dstDeviceIds.size() != 0) {
