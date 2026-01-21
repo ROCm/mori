@@ -24,13 +24,13 @@
 #include <hip/hip_runtime.h>
 
 namespace mori {
-int GetMultiProcessorCount(int device) {
+inline int GetMultiProcessorCount(int device) {
   hipDeviceProp_t prop;
   HIP_RUNTIME_CHECK(hipGetDeviceProperties(&prop, device));
   return prop.multiProcessorCount;
 }
 
-int GetCurDeviceMultiProcessorCount() {
+inline int GetCurDeviceMultiProcessorCount() {
   int device = 0;
   HIP_RUNTIME_CHECK(hipGetDevice(&device));
   return GetMultiProcessorCount(device);

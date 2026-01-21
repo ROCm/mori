@@ -139,27 +139,6 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
       DispatchIntraNodeBlock(args, tokenId, inTokenExpertId, destPe, localPeTokenCounter);
     }
   }
-  // for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
-  //   int lanePe = -1, laneNode = -1;
-  //   if (laneId < numExpertPerToken) {
-  //     lanePe = (args.tokenIndices[tokenId * numExpertPerToken + laneId] /
-  //     config.numExpertPerRank); laneNode = lanePe / config.gpuPerNode;
-  //   };
-
-  //   // Send to other pes in myNode
-  //   for (int e = 0; e < config.numExpertPerToken; e++) {
-  //     int tokenExpertId = tokenId * config.numExpertPerToken + e;
-  //     int destPe = __shfl(lanePe, e);
-  //     int destNode = destPe / config.gpuPerNode;
-  //     if (destNode == myNode) {
-  //       if (__any((laneId < e) && (destPe == lanePe))) {
-  //         if (laneId == 0) args.dispDestTokIdMap[tokenExpertId] = nullTokenId;
-  //         continue;
-  //       }
-  //       DispatchIntraNodeBlock(args, tokenId, e, destPe, localPeTokenCounter);
-  //     }
-  //   }
-  // }
   if (laneId < config.gpuPerNode) {
     int destPe = myNode * config.gpuPerNode + laneId;
     int counter = atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
@@ -382,11 +361,6 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
         size_t stagingTokOffset = tokenId * xferBytes;
         int qpId = (tokenId / warpSize) % config.numQpPerPe;
 
-        // printf(
-        //     "BlockId=%d, WarpId=%d, tokenId=%d, remoteIdx=%lu, xferBytes=%lu, "
-        //     "stagingTokOffset=%lu, tokenNum=%d, proxyPe=%d, qpId=%d, flagSlotId=%d\n",
-        //     blockId, warpId, tokenId, remoteIdx, xferBytes, stagingTokOffset, tokenNum, proxyPe,
-        //     qpId, flagSlotId);
         shmem::ShmemPutMemNbiSignalThread(args.shmemDispatchInpTokMemObj, remoteIdx * xferBytes,
                                           args.shmemStagingTokMemObj, stagingTokOffset,
                                           tokenNum * xferBytes, args.interNodeChunkFlagMemObj,
@@ -646,11 +620,6 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
       atomicAdd(args.crossDeviceBarrierFlag, 1);
       args.combineGridBarrier[1] = 0;
     }
-
-    // if (laneId < nNodes) {
-    //   core::AtomicStoreSeqCstSystem(
-    //       args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});
-    // }
   }
 
   for (int i = globalWarpId; i < nNodes; i += globalWarpNum) {
@@ -676,12 +645,12 @@ __global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
 template <typename T>
 __global__ void EpDispatchCopyToStaging(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  if (args.curRankNumToken == 0) return;
 
   index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
   index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
 
   // First copy to staging buffer
-  // for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
   for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
     index_t tokenId = i / warpsPerToken;
     index_t inTokenPartId = i % warpsPerToken;
@@ -718,7 +687,6 @@ __global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> a
   DEF_COMMON_VARS;
   if (blockId < config.rdmaBlockNum) {
     v1::DispatchInterNodeLLSend<T>(args);
-    // TODO: figure out why when num of tokens is not multiples of 64, perf is degraded severely
     v1::DispatchInterNodeLLRecv(args);
   } else {
     v1::DispatchIntraNode(args);
@@ -826,6 +794,7 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  if (args.curRankNumToken == 0) return;
 
   // Distribute tokens evenly to all blocks
   int blockOffset = config.rdmaBlockNum;
@@ -1000,16 +969,15 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
     batchStart += currentBatchSize;
   }
 
-  // TODO: this make sure interNodeChunkFlagMemObj is set to zero before sync with other
-  // nodes, without this, it may be set by other node first then get override by zero
+  // Ensure all prior writes (in particular zeroing interNodeChunkFlagMemObj) are visible
+  // to other nodes before participating in the cross-device barrier, so a remote node
+  // never observes a non-zero flag that is subsequently overwritten with zero
   __threadfence_system();
   int finishedWarp = 0;
   uint64_t barrierFlag = 0;
   if (laneId == 0) {
     finishedWarp = atomicAdd(args.interNodeBlocksBarrier, 1);
     barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
-    // shmem::ShmemUint32WaitUntilEquals(&args.interNodeBlocksBarrier[0], config.rdmaBlockNum *
-    // warpNum);
   }
   finishedWarp = __shfl(finishedWarp, 0);
   barrierFlag = __shfl(barrierFlag, 0);
@@ -1065,6 +1033,8 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
     if (nodeCount == 0) continue;
 
     // int warpsPerToken = (rdmaWarpNum + nodeCount - 1) / nodeCount;
+    // NOTE: Using a fixed value of 4 for warpsPerToken instead of the dynamic formula above is
+    // an intentional tuning choice.
     int warpsPerToken = 4;
     int hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
 
@@ -1095,7 +1065,6 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
             srcWeightsPtr[laneId] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                                     destLocalTokId * config.numExpertPerToken;
           }
-          // args.interNodeDispDestTokIdMap[globalTokenId * config.numExpertPerToken + laneId] = 0;
         }
         core::WarpAccum<T, 4>(
             reinterpret_cast<T*>(stagingPtr + globalTokenId * combXferBytes) + hiddenDimOffset,
@@ -1132,8 +1101,9 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
     }
   }
 
-  // TODO: this make sure interNodeChunkFlagMemObj is set to zero before sync with other
-  // nodes, without this, it may be set by other node first then get override by zero
+  // Ensure all prior writes (in particular zeroing interNodeChunkFlagMemObj) are visible
+  // to other nodes before participating in the cross-device barrier, so a remote node
+  // never observes a non-zero flag that is subsequently overwritten with zero
   __threadfence_system();
   int finishedWarp = 0;
   uint64_t barrierFlag = 0;
@@ -1175,7 +1145,7 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void CombineAll(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
-
+  if (args.curRankNumToken == 0) return;
   // Wait all warps
   if (laneId == 0) {
     atomicAdd(&args.combineGridBarrier[1], 1);
@@ -1246,6 +1216,11 @@ __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
 template <typename T>
 __global__ void EpCombineAll(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  if (globalWarpId == 0) {
+    if (laneId == 0) args.totalRecvTokenNum[0] = 0;
+    if (laneId < nNodes) args.blockFlagCounter[laneId] = 0;
+  }
+  if (args.curRankNumToken == 0) return;
 
   extern __shared__ char sharedMem[];
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
@@ -1291,16 +1266,6 @@ __global__ void EpCombineAll(EpDispatchCombineArgs<T> args) {
       core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
                                     tokenId * config.numExpertPerToken,
                                 srcWeightsPtrs, nullptr, nNodes, config.numExpertPerToken);
-    }
-  }
-
-  if (globalWarpId == 0) {
-    if (laneId == 0) {
-      args.totalRecvTokenNum[0] = 0;
-    }
-
-    if (laneId < nNodes) {
-      args.blockFlagCounter[laneId] = 0;
     }
   }
 }
