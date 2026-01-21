@@ -37,10 +37,14 @@ StreamPool::StreamPool(int numStreamsPerDevice) : numStreamsPerDevice_(numStream
 }
 
 StreamPool::~StreamPool() {
+  hipError_t err;
   for (auto& deviceEntry : streams_) {
     for (auto stream : deviceEntry.second) {
       if (stream != nullptr) {
-        hipStreamDestroy(stream);
+        err = hipStreamDestroy(stream);
+        if (err != hipSuccess) {
+          MORI_IO_ERROR("StreamPool: Failed to destroy stream: {}", hipGetErrorString(err));
+        }
       }
     }
   }
