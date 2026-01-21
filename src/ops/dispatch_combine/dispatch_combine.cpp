@@ -28,6 +28,7 @@
 
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem.hpp"
+#include "mori/utils/hip_helper.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "src/ops/dispatch_combine/internode.hpp"
 #include "src/ops/dispatch_combine/internode_v1.hpp"
@@ -56,6 +57,8 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
   InitializeTokenNumSignalBuf();
   InitializeOrderMapBuf();
   InitializeBarrier();
+
+  this->cuCount = GetCurDeviceMultiProcessorCount();
 }
 
 EpDispatchCombineHandle::~EpDispatchCombineHandle() {
@@ -290,7 +293,7 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
         } else if (kernelType == KernelType::InterNodeV1) {
           EpDispatchInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeV1LL) {
-          EpDispatchCopyToStaging<<<256, block, 0, stream>>>(args);
+          EpDispatchCopyToStaging<<<this->cuCount, block, 0, stream>>>(args);
           EpDispatchInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
@@ -324,7 +327,7 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
         } else if (kernelType == KernelType::InterNodeV1LL) {
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
-          EpCombineAll<<<256, block, sharedMemSize, stream>>>(args);
+          EpCombineAll<<<this->cuCount, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           if (config.useExternalInpBuffer) {
             // UseP2PRead=false: does not support zero-copy and provides better bandwidth and lower

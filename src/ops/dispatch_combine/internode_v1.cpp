@@ -373,7 +373,6 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
     }
   }
   */
-
   // Then send to other nodes
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
   int totalChunkNum = core::CeilDiv(args.curRankNumToken, warpSize);
@@ -577,6 +576,8 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
     uint64_t thisChunkTokenNum = 0;
     index_t nodeFlag = 0;
     if (laneId == 0) {
+      uint64_t barrierFlag = args.crossDeviceBarrierFlag[0];
+      // size_t start = clock64();
       while (1) {
         thisChunkTokenNum = core::AtomicLoadRelaxedSystem(&chunkFlag[node * maxChunkNum + k]);
         if (thisChunkTokenNum > 0) break;
@@ -586,6 +587,12 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
           thisChunkTokenNum = 1;
           break;
         }
+
+        // size_t now = clock64();
+        // if ((now - start) >= 6e10) {
+        //   printf("myPe %d disp inter node timeout %lu %lu flag %lu\n", myPe, thisChunkTokenNum,
+        //          nodeFlag, barrierFlag);
+        // }
       }
     }
     thisChunkTokenNum = __shfl(thisChunkTokenNum, 0) - 1;
@@ -809,7 +816,12 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
   uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
   if (laneId < config.gpuPerNode) {
     int destPe = myNode * config.gpuPerNode + laneId;
+    // size_t start = clock64();
     while (core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe) != barrierFlag) {
+      // size_t now = clock64();
+      // if ((now - start) >= 6e10) {
+      //   printf("combine sync timeout\n");
+      // }
     }
   }
 }
@@ -1050,6 +1062,10 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   barrierFlag = __shfl(barrierFlag, 0);
 
   if ((finishedWarp + 1) == (config.rdmaBlockNum * warpNum)) {
+    if (laneId < nNodes) {
+      core::AtomicStoreSeqCstSystem(
+          args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});
+    }
     if ((laneId < nNodes) &&
         (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
@@ -1065,13 +1081,14 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
     uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
+      // size_t start = clock64();
       while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
              (barrierFlag * config.numQpPerPe)) {
+        // size_t now = clock64();
+        // if ((now - start) >= 6e10) {
+        //   printf("combine inter node timeout\n");
+        // }
       }
-    }
-    if (laneId < nNodes) {
-      core::AtomicStoreSeqCstSystem(
-          args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});
     }
   }
 }
@@ -1180,6 +1197,10 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
   barrierFlag = __shfl(barrierFlag, 0);
 
   if ((finishedWarp + 1) == (config.rdmaBlockNum * warpNum)) {
+    if (laneId < nNodes) {
+      core::AtomicStoreSeqCstSystem(
+          args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});
+    }
     if ((laneId < nNodes) &&
         (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
@@ -1188,6 +1209,7 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
                                                        args.config.rank * sizeof(uint64_t), 1,
                                                        core::AMO_ADD, proxyPe, i);
       }
+      __threadfence_system();
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
 
@@ -1195,14 +1217,16 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
     uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
+      // size_t start = clock64();
       while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
              (barrierFlag * config.numQpPerPe)) {
+        // size_t now = clock64();
+        // if ((now - start) >= 6e10) {
+        // printf("myPe %d combine inter node timeout %lu %lu\n", myPe,
+        //        core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe),
+        //        (barrierFlag * config.numQpPerPe));
+        // }
       }
-    }
-
-    if (laneId < nNodes) {
-      core::AtomicStoreSeqCstSystem(
-          args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});
     }
   }
 }

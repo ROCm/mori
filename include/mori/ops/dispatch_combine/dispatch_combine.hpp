@@ -165,6 +165,7 @@ class EpDispatchCombineHandle {
  public:
   // Number of tokens on this rank and size of scale data type, updated at each round of inference
   index_t curRankNumToken{0};
+  index_t cuCount{0};
 
  public:
   // Config
