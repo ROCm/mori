@@ -23,12 +23,13 @@
 
 #include <hip/hip_runtime.h>
 #include "oneshot_sdma_kernel.hpp"
+#include <mpi.h>
 
 namespace mori {
 namespace collective {
 
 template <typename T>
-int AllGather_sdma(T* input, T* output, size_t total_count,
+double AllGather_sdma(T* input, T* output, size_t total_count,
                                           hipStream_t stream) {
   int myPe =  shmem::ShmemMyPe();
   int npes =  shmem::ShmemNPes();
@@ -52,10 +53,13 @@ int AllGather_sdma(T* input, T* output, size_t total_count,
   assert(outPutBuffObj.IsValid());
   assert(flagsObj.IsValid());
 
+  double start = MPI_Wtime();
   OneShotAllGatherSdmaKernel<T><<<1, 256>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
+  double end = MPI_Wtime();
 
-  shmem::ShmemFree(flags);
-  return 0;
+   
+  //shmem::ShmemFree(flags);
+  return end-start;
 }
 }
 }

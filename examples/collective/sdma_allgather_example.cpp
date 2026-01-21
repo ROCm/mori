@@ -129,17 +129,17 @@ void testOneShotSdmaAllGather() {
   MPI_Barrier(MPI_COMM_WORLD);
 
   double start = MPI_Wtime();
-  if(1)
-    AllGather_sdma<uint32_t>(inPutBuff, outPutBuff, elemsPerPe, stream);
+ // if(1)
+  double local_duration = AllGather_sdma<uint32_t>(inPutBuff, outPutBuff, elemsPerPe, stream);
     //OneShotAllGatharSdmaKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
 
-  else{
+//  else{
 //    OneShotAllGatharSdmaAsyncPutKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
 //    OneShotAllGatharSdmaAsyncWaitKernel<<<numBlocks, blockSize>>>(myPe, npes,  outPutBuffObj, flagsBuffObj);
-  }
+//  }
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   double end = MPI_Wtime();
-  double local_duration = end - start;
+//  double local_duration = end - start;
 
   double global_max_duration;
   MPI_Reduce(&local_duration, &global_max_duration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
