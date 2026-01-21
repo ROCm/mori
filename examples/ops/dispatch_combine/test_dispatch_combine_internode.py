@@ -445,7 +445,7 @@ class EpDispatchCombineTestCase:
         test_data_list = [
             self.gen_test_data(use_max_token_num=False) for i in range(num_test_data)
         ]
-        for i in tqdm(range(100)):
+        for i in tqdm(range(5000)):
             (
                 all_rank_num_token,
                 all_rank_indices,
