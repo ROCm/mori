@@ -291,6 +291,7 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
           assert(config.useExternalInpBuffer);
           EpDispatchInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeV1) {
+          EpDispatchCopyToStaging<<<this->cuCount, block, 0, stream>>>(args);
           EpDispatchInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeV1LL) {
           EpDispatchCopyToStaging<<<this->cuCount, block, 0, stream>>>(args);
@@ -324,6 +325,7 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
         } else if (kernelType == KernelType::InterNodeV1) {
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
+          EpCombineAll<<<this->cuCount, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeV1LL) {
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
