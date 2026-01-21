@@ -92,7 +92,7 @@ jobs:
           
           echo "4. mori-ep test case: inter bench"
           #export MORI_RDMA_DEVICES=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_6,ionic_7
-          #ssh -p 2233 root@smci355-ccs-aus-n08-33 "hostname"
+          #ssh -p 2233 root@smci355-ccs-aus-n08-33 "hostname" 
           ssh -p 2233 root@smci355-ccs-aus-n08-33 "GLOO_SOCKET_IFNAME=enp81s0f1 /opt/venv/bin/torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr='smci355-ccs-aus-n08-33' --master_port=1234 /root/actions-runner/_work/mori/mori/mori/examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096 &" &
           GLOO_SOCKET_IFNAME=enp81s0f1 torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 --master_addr="smci355-ccs-aus-n08-33" --master_port=1234 examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096
 
