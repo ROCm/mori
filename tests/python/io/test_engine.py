@@ -182,8 +182,8 @@ def alloc_and_register_mem(engine_pair, shape):
     # register memory buffer
     device1 = torch.device("cuda", 0)
     device2 = torch.device("cuda", 1)
-    tensor1 = torch.randn(shape).to(device1, dtype=torch.uint8)
-    tensor2 = torch.randn(shape).to(device2, dtype=torch.uint8)
+    tensor1 = torch.randint(1, 256, shape, dtype=torch.uint8, device=device1)
+    tensor2 = torch.randint(1, 256, shape, dtype=torch.uint8, device=device2)
 
     initiator_mem = initiator.register_torch_tensor(tensor1)
     target_mem = target.register_torch_tensor(tensor2)
