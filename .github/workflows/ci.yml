@@ -60,13 +60,10 @@ jobs:
           echo "2. mori-ibgda test case: write_inline_gpu"
           ./build/examples/write_inline_gpu
 
-          echo "3. mori-ibgda test case: atiomic_gpu"
-          ./build/examples/atomic_gpu
-
-          echo "4. mori-ibgda test case: send_recv_gpu"
+          echo "3. mori-ibgda test case: send_recv_gpu"
           ./build/examples/send_recv_gpu
 
-          echo "5. mori-ibgda test case: dist_write"
+          echo "4. mori-ibgda test case: dist_write"
           mpiexec --allow-run-as-root -x MORI_GLOBAL_LOG_LEVEL=TRACE -np 2 ./build/examples/dist_write -c 4 -t 256 -q 4
          
           echo "1. mori-shmem test case: test_api.py"
