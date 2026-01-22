@@ -54,7 +54,7 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
   assert(flagsObj.IsValid());
 
   double start = MPI_Wtime();
-  OneShotAllGatherSdmaKernel<T><<<1, 256>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
+  OneShotAllGatherSdmaKernel<T><<<1, 512>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
   double end = MPI_Wtime();
 
    
