@@ -21,30 +21,18 @@
 // SOFTWARE.
 #pragma once
 
-#include "mori/core/core.hpp"
-#include "mori/ops/dispatch_combine/dispatch_combine.hpp"
-#include "mori/shmem/shmem.hpp"
+#include <hip/hip_runtime.h>
 
 namespace mori {
-namespace moe {
+inline int GetMultiProcessorCount(int device) {
+  hipDeviceProp_t prop;
+  HIP_RUNTIME_CHECK(hipGetDeviceProperties(&prop, device));
+  return prop.multiProcessorCount;
+}
 
-template <typename T>
-__global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args);
-
-template <typename T>
-__global__ void EpDispatchCopyToStaging(EpDispatchCombineArgs<T> args);
-
-template <typename T>
-__global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args);
-
-template <typename T>
-__global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args);
-
-template <typename T>
-__global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args);
-
-template <typename T>
-__global__ void EpCombineAll(EpDispatchCombineArgs<T> args);
-
-}  // namespace moe
+inline int GetCurDeviceMultiProcessorCount() {
+  int device = 0;
+  HIP_RUNTIME_CHECK(hipGetDevice(&device));
+  return GetMultiProcessorCount(device);
+}
 }  // namespace mori
