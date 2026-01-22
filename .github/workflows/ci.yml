@@ -2,10 +2,13 @@ name: mori
 on:
   push:
   workflow_dispatch:
+  schedule:
+    - cron: '30 5 * * *'
 jobs:
   build:
     name: mori build
     runs-on: label-1
+    timeout-minutes: 10
     steps:
       - name: clone source code
         run: |
@@ -35,6 +38,7 @@ jobs:
     name: mori test
     needs: build
     runs-on: label-1
+    timeout-minutes: 10
     steps:
         #- uses: actions/checkout@v4
         #- name: Set up Python
@@ -97,4 +101,12 @@ jobs:
           echo "5. mori-ep test case: inter stress"
           ssh -p 2233 root@smci355-ccs-aus-n08-33 "GLOO_SOCKET_IFNAME=enp81s0f1 /opt/venv/bin/torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr='smci355-ccs-aus-n08-33' --master_port=1234 /root/actions-runner/_work/mori/mori/mori/examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd stress --kernel-type v1 --num-qp 2 --max-tokens 128 &" &
           GLOO_SOCKET_IFNAME=enp81s0f1 torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 --master_addr="smci355-ccs-aus-n08-33" --master_port=1234 examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd stress --kernel-type v1 --num-qp 2 --max-tokens 128
-          
+
+      - name: ❌ Notify on failure
+        if: failure()
+        run: |
+          echo "::error::[ALERT] MORI CI TEST FAILED!"
+          echo "Workflow: ${{ github.workflow }}"
+          echo "Repository: ${{ github.repository }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Run URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"          
