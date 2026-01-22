@@ -48,7 +48,6 @@ jobs:
           pwd
           ls
           cd mori
-          
           export PYTHONPATH=/root/actions-runner/_work/mori/mori/mori:$PYTHONPATH
           #mpiexec --allow-run-as-root -x MORI_GLOBAL_LOG_LEVEL=TRACE -np 2 ls
           echo "1. mori-io test case: test_engine.py"
