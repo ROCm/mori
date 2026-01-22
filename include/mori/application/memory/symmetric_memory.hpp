@@ -79,9 +79,6 @@ struct SymmMemObj {
     return mr;
   }
 
-  // Note: RDMA key lookup for heap allocations should use GetLkeyAndChunkSize
-  // and GetRaddrRkeyAndChunkSize in shmem_ibgda_kernels.hpp instead.
-  // Those functions handle both VMM and static heap modes efficiently.
 
   // Get pointers
   inline __device__ __host__ void* Get() const { return localPtr; }
@@ -167,6 +164,7 @@ class SymmMemManager {
     int shareableHandle;  // File descriptor for POSIX systems (for P2P)
     size_t size;          // Chunk size (always equals granularity/vmmChunkSize)
     bool isAllocated;
+    int refCount;         // Reference count: how many allocations are using this chunk
 
     // RDMA registration info (per-chunk, for RDMA transport)
     uint32_t lkey;                        // Local key for RDMA access
@@ -181,7 +179,7 @@ class SymmMemManager {
 
     VMMChunkInfo()
         : handle(0), shareableHandle(-1), size(0),
-          isAllocated(false), lkey(0), rdmaRegistered(false) {}
+          isAllocated(false), refCount(0), lkey(0), rdmaRegistered(false) {}
   };
   
   // VA allocation tracking for memory reuse

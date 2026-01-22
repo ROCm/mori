@@ -252,6 +252,9 @@ SymmMemObjPtr SymmMemManager::HeapRegisterSymmMemObj(void* localPtr, size_t size
 }
 
 void SymmMemManager::HeapDeregisterSymmMemObj(void* localPtr) {
+  // Note: Despite the name "Heap", this function is used by BOTH Static Heap and VMM Heap modes
+  // It safely handles differences (e.g., peerRkeys is nullptr for VMM allocations)
+  
   if (memObjPool.find(localPtr) == memObjPool.end()) return;
 
   // No need to deregister RDMA memory region - this is a sub-region of the heap
@@ -566,7 +569,6 @@ void SymmMemManager::FinalizeVMMHeap() {
   }
 
   // Step 4: Free virtual address space (entire multi-PE space)
-  // Now safe to free since all chunks (local and peer) are unmapped
   if (vmmVirtualBasePtr) {
     size_t totalVirtualSize = vmmPerPeerSize * worldSize;
     MORI_APP_TRACE("FinalizeVMMHeap: Freeing virtual address space at {:p}, size={} bytes",
@@ -701,10 +703,11 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
     for (size_t i = 0; i < chunksNeeded; ++i) {
       size_t chunkIdx = startChunk + i;
 
-      // Skip chunks that already have physical memory allocated
+      // Reuse chunks that already have physical memory allocated
       if (chunkIdx < vmmMaxChunks && vmmChunks[chunkIdx].isAllocated) {
-        MORI_APP_TRACE("VMMAlloc: rank={} skip chunk {} (allocated, fd={})", rank, chunkIdx,
-                       vmmChunks[chunkIdx].shareableHandle);
+        vmmChunks[chunkIdx].refCount++;
+        MORI_APP_TRACE("VMMAlloc: rank={} reusing chunk {} (refCount={}, fd={})", rank, chunkIdx,
+                       vmmChunks[chunkIdx].refCount, vmmChunks[chunkIdx].shareableHandle);
         continue;
       }
 
@@ -715,11 +718,18 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
       if (result != hipSuccess) {
         MORI_APP_WARN("VMMAlloc failed: hipMemCreate chunk={} size={} type={} dev={} err={}",
                       chunkIdx, vmmChunkSize, allocType, currentDev, result);
-        // Cleanup already allocated chunks
+        // Cleanup: revert reference counts for already processed chunks
         for (size_t j = 0; j < i; ++j) {
           size_t cleanupIdx = startChunk + j;
-          HIP_RUNTIME_CHECK(hipMemRelease(vmmChunks[cleanupIdx].handle));
-          vmmChunks[cleanupIdx].isAllocated = false;
+          if (vmmChunks[cleanupIdx].refCount > 1) {
+            // This was a reused chunk, just decrement refCount
+            vmmChunks[cleanupIdx].refCount--;
+          } else if (vmmChunks[cleanupIdx].refCount == 1) {
+            // This was newly created in this allocation, fully release it
+            HIP_RUNTIME_CHECK(hipMemRelease(vmmChunks[cleanupIdx].handle));
+            vmmChunks[cleanupIdx].isAllocated = false;
+            vmmChunks[cleanupIdx].refCount = 0;
+          }
         }
         heapVAManager->Free(allocAddr);  // Free the VA on failure
         return SymmMemObjPtr{nullptr, nullptr};
@@ -731,14 +741,21 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
         MORI_APP_WARN("VMMAlloc failed: hipMemMap chunk={} addr={:p} size={} err={}", chunkIdx,
                       localChunkPtr, vmmChunkSize, result);
         HIP_RUNTIME_CHECK(hipMemRelease(vmmChunks[chunkIdx].handle));
-        // Cleanup already allocated chunks
+        // Cleanup: revert reference counts for already processed chunks
         for (size_t j = 0; j < i; ++j) {
           size_t cleanupIdx = startChunk + j;
-          void* cleanupPtr = static_cast<void*>(static_cast<char*>(vmmPeerBasePtrs[rank]) +
-                                                cleanupIdx * vmmChunkSize);
-          HIP_RUNTIME_CHECK(hipMemUnmap(cleanupPtr, vmmChunkSize));
-          HIP_RUNTIME_CHECK(hipMemRelease(vmmChunks[cleanupIdx].handle));
-          vmmChunks[cleanupIdx].isAllocated = false;
+          if (vmmChunks[cleanupIdx].refCount > 1) {
+            // This was a reused chunk, just decrement refCount
+            vmmChunks[cleanupIdx].refCount--;
+          } else if (vmmChunks[cleanupIdx].refCount == 1) {
+            // This was newly created in this allocation, fully release it
+            void* cleanupPtr = static_cast<void*>(static_cast<char*>(vmmPeerBasePtrs[rank]) +
+                                                  cleanupIdx * vmmChunkSize);
+            HIP_RUNTIME_CHECK(hipMemUnmap(cleanupPtr, vmmChunkSize));
+            HIP_RUNTIME_CHECK(hipMemRelease(vmmChunks[cleanupIdx].handle));
+            vmmChunks[cleanupIdx].isAllocated = false;
+            vmmChunks[cleanupIdx].refCount = 0;
+          }
         }
         heapVAManager->Free(allocAddr);  // Free the VA on failure
         return SymmMemObjPtr{nullptr, nullptr};
@@ -756,14 +773,21 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
                       localChunkPtr, result);
         HIP_RUNTIME_CHECK(hipMemUnmap(localChunkPtr, vmmChunkSize));
         HIP_RUNTIME_CHECK(hipMemRelease(vmmChunks[chunkIdx].handle));
-        // Cleanup already allocated chunks
+        // Cleanup: revert reference counts for already processed chunks
         for (size_t j = 0; j < i; ++j) {
           size_t cleanupIdx = startChunk + j;
-          void* cleanupPtr = static_cast<void*>(static_cast<char*>(vmmPeerBasePtrs[rank]) +
-                                                cleanupIdx * vmmChunkSize);
-          HIP_RUNTIME_CHECK(hipMemUnmap(cleanupPtr, vmmChunkSize));
-          HIP_RUNTIME_CHECK(hipMemRelease(vmmChunks[cleanupIdx].handle));
-          vmmChunks[cleanupIdx].isAllocated = false;
+          if (vmmChunks[cleanupIdx].refCount > 1) {
+            // This was a reused chunk, just decrement refCount
+            vmmChunks[cleanupIdx].refCount--;
+          } else if (vmmChunks[cleanupIdx].refCount == 1) {
+            // This was newly created in this allocation, fully release it
+            void* cleanupPtr = static_cast<void*>(static_cast<char*>(vmmPeerBasePtrs[rank]) +
+                                                  cleanupIdx * vmmChunkSize);
+            HIP_RUNTIME_CHECK(hipMemUnmap(cleanupPtr, vmmChunkSize));
+            HIP_RUNTIME_CHECK(hipMemRelease(vmmChunks[cleanupIdx].handle));
+            vmmChunks[cleanupIdx].isAllocated = false;
+            vmmChunks[cleanupIdx].refCount = 0;
+          }
         }
         heapVAManager->Free(allocAddr);  // Free the VA on failure
         return SymmMemObjPtr{nullptr, nullptr};
@@ -786,6 +810,7 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
                      localChunkPtr);
 
       vmmChunks[chunkIdx].isAllocated = true;
+      vmmChunks[chunkIdx].refCount = 1;  // Initial reference count
       vmmChunks[chunkIdx].size = vmmChunkSize;  // Both virtual and physical use granularity size
     }
 
@@ -1066,8 +1091,6 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
     return;  // Not in local PE's VMM range
   }
 
-  size_t chunkIdx = (ptrAddr - baseAddr) / vmmChunkSize;
-
   // Find allocation size by checking registered object
   auto it = memObjPool.find(localPtr);
   if (it == memObjPool.end()) {
@@ -1075,9 +1098,19 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
   }
 
   size_t allocSize = it->second.cpu->size;
-  size_t chunksToFree = (allocSize + vmmChunkSize - 1) / vmmChunkSize;
+  
+  // Calculate chunk range correctly
+  size_t offset = ptrAddr - baseAddr;
+  size_t startChunk = offset / vmmChunkSize;
+  size_t endOffset = offset + allocSize;
+  size_t endChunk = (endOffset + vmmChunkSize - 1) / vmmChunkSize;
+  size_t chunksToFree = endChunk - startChunk;
+  
+  size_t chunkIdx = startChunk;
+  
+  MORI_APP_TRACE("VMMFreeChunk: RANK {} freeing ptr={:p} size={} chunks=[{},{})", rank, 
+                 localPtr, allocSize, startChunk, endChunk);
 
-  // Free VA from VA manager
   if (heapVAManager) {
     heapVAManager->Free(ptrAddr);
     MORI_APP_TRACE("VMMFreeChunk: RANK {} freed VA at 0x{:x} of size {} bytes", rank, ptrAddr,
@@ -1085,17 +1118,15 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
   }
 
   // Step 1: First unmap from peer virtual address spaces for P2P accessible PEs
-  // This must be done BEFORE clearing importedHandles in the local chunks!
   for (int pe = 0; pe < worldSize; ++pe) {
     if (pe == rank) continue;  // Skip self
 
-    // Only unmap from P2P accessible PEs where we previously mapped
     if (context.GetTransportType(pe) == TransportType::P2P && vmmPeerBasePtrs[pe] != nullptr) {
       for (size_t i = 0; i < chunksToFree; ++i) {
         size_t idx = chunkIdx + i;
 
-        // Only unmap if this peer actually mapped this chunk
-        if (idx < vmmMaxChunks && vmmChunks[idx].mappedPeers.count(pe) > 0) {
+        if (idx < vmmMaxChunks && vmmChunks[idx].isAllocated && vmmChunks[idx].refCount == 1 &&
+            vmmChunks[idx].mappedPeers.count(pe) > 0) {
           void* peerChunkPtr =
               static_cast<void*>(static_cast<char*>(vmmPeerBasePtrs[pe]) + idx * vmmChunkSize);
 
@@ -1122,62 +1153,81 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
     }
   }
 
-  // Step 2: Now free chunks from local PE's virtual address space
+  // Step 2: Free chunks from local PE's virtual address space
   RdmaDeviceContext* rdmaDeviceContext = context.GetRdmaDeviceContext();
   for (size_t i = 0; i < chunksToFree; ++i) {
     size_t idx = chunkIdx + i;
     if (idx < vmmMaxChunks && vmmChunks[idx].isAllocated) {
-      void* chunkPtr =
-          static_cast<void*>(static_cast<char*>(vmmPeerBasePtrs[rank]) + idx * vmmChunkSize);
+      vmmChunks[idx].refCount--;
+      
+      MORI_APP_TRACE("VMMFreeChunk: RANK {} decrement chunk {} refCount to {}", rank, idx,
+                     vmmChunks[idx].refCount);
+      
+      // Only release physical resources when refCount reaches 0
+      if (vmmChunks[idx].refCount == 0) {
+        void* chunkPtr =
+            static_cast<void*>(static_cast<char*>(vmmPeerBasePtrs[rank]) + idx * vmmChunkSize);
 
-      // Deregister RDMA memory region if registered
-      if (vmmChunks[idx].rdmaRegistered && rdmaDeviceContext) {
-        rdmaDeviceContext->DeregisterRdmaMemoryRegion(chunkPtr);
-        vmmChunks[idx].rdmaRegistered = false;
-        vmmChunks[idx].lkey = 0;
-        std::fill(vmmChunks[idx].peerRkeys.begin(), vmmChunks[idx].peerRkeys.end(), 0);
-        
-        // Clear vmmHeapObj's VMMChunkKey arrays for this chunk (keep next_addr, clear key)
-        vmmHeapObj.cpu->vmmLkeyInfo[idx].key = 0;
-        for (int pe = 0; pe < worldSize; ++pe) {
-          vmmHeapObj.cpu->vmmRkeyInfo[idx * worldSize + pe].key = 0;
+        // Deregister RDMA memory region if registered
+        if (vmmChunks[idx].rdmaRegistered && rdmaDeviceContext) {
+          rdmaDeviceContext->DeregisterRdmaMemoryRegion(chunkPtr);
+          vmmChunks[idx].rdmaRegistered = false;
+          vmmChunks[idx].lkey = 0;
+          std::fill(vmmChunks[idx].peerRkeys.begin(), vmmChunks[idx].peerRkeys.end(), 0);
+          
+          // Clear vmmHeapObj's VMMChunkKey arrays for this chunk (keep next_addr, clear key)
+          vmmHeapObj.cpu->vmmLkeyInfo[idx].key = 0;
+          for (int pe = 0; pe < worldSize; ++pe) {
+            vmmHeapObj.cpu->vmmRkeyInfo[idx * worldSize + pe].key = 0;
+          }
+          
+          MORI_APP_TRACE("VMMFreeChunk: RANK {} deregistered RDMA for chunk {} at {:p}", rank, idx,
+                         chunkPtr);
         }
+
+        // Close shareable file descriptor to prevent FD leak
+        if (vmmChunks[idx].shareableHandle != -1) {
+          close(vmmChunks[idx].shareableHandle);
+          MORI_APP_TRACE("VMMFreeChunk: RANK {} closed FD {} for chunk {}", rank,
+                         vmmChunks[idx].shareableHandle, idx);
+        }
+
+        HIP_RUNTIME_CHECK(hipMemUnmap(chunkPtr, vmmChunkSize));
+        HIP_RUNTIME_CHECK(hipMemRelease(vmmChunks[idx].handle));
+        vmmChunks[idx].isAllocated = false;
+        vmmChunks[idx].size = 0;
+        vmmChunks[idx].shareableHandle = -1;
+        vmmChunks[idx].mappedPeers.clear();
+        vmmChunks[idx].importedHandles.clear();
         
-        MORI_APP_TRACE("VMMFreeChunk: RANK {} deregistered RDMA for chunk {} at {:p}", rank, idx,
-                       chunkPtr);
+        MORI_APP_TRACE("VMMFreeChunk: RANK {} fully released chunk {} (physical resources freed)",
+                       rank, idx);
+      } else {
+        MORI_APP_TRACE("VMMFreeChunk: RANK {} chunk {} still in use (refCount={}), physical resources retained",
+                       rank, idx, vmmChunks[idx].refCount);
       }
-
-      // Close shareable file descriptor to prevent FD leak
-      if (vmmChunks[idx].shareableHandle != -1) {
-        close(vmmChunks[idx].shareableHandle);
-        MORI_APP_TRACE("VMMFreeChunk: RANK {} closed FD {} for chunk {}", rank,
-                       vmmChunks[idx].shareableHandle, idx);
-      }
-
-      // All chunks use granularity size (vmmChunkSize)
-      HIP_RUNTIME_CHECK(hipMemUnmap(chunkPtr, vmmChunkSize));
-      HIP_RUNTIME_CHECK(hipMemRelease(vmmChunks[idx].handle));
-      vmmChunks[idx].isAllocated = false;
-      vmmChunks[idx].size = 0;
-      vmmChunks[idx].shareableHandle = -1;
-      vmmChunks[idx].mappedPeers.clear();  // Clear peer mapping tracking
-      vmmChunks[idx].importedHandles.clear();  // Now safe to clear (already released above)
     }
   }
 
-  // Step 3: Synchronize cleared VMMChunkKey to GPU for freed chunks
-  if (chunksToFree > 0) {
-    size_t keysOffset = chunkIdx * worldSize * sizeof(VMMChunkKey);
-    size_t keysSize = chunksToFree * worldSize * sizeof(VMMChunkKey);
-    HIP_RUNTIME_CHECK(hipMemcpy(
-        reinterpret_cast<char*>(vmmHeapObj.gpu->vmmRkeyInfo) + keysOffset,
-        vmmHeapObj.cpu->vmmRkeyInfo + chunkIdx * worldSize,
-        keysSize, hipMemcpyHostToDevice));
-    
-    HIP_RUNTIME_CHECK(hipMemcpy(
-        vmmHeapObj.gpu->vmmLkeyInfo + chunkIdx,
-        vmmHeapObj.cpu->vmmLkeyInfo + chunkIdx,
-        chunksToFree * sizeof(VMMChunkKey), hipMemcpyHostToDevice));
+  // Step 3: Synchronize cleared VMMChunkKey to GPU for fully freed chunks (refCount == 0)
+  for (size_t i = 0; i < chunksToFree; ++i) {
+    size_t idx = chunkIdx + i;
+    if (idx < vmmMaxChunks && !vmmChunks[idx].isAllocated) {
+      // This chunk was fully freed (refCount reached 0), sync cleared keys to GPU
+      size_t keysOffset = idx * worldSize * sizeof(VMMChunkKey);
+      size_t keysSize = worldSize * sizeof(VMMChunkKey);
+      HIP_RUNTIME_CHECK(hipMemcpy(
+          reinterpret_cast<char*>(vmmHeapObj.gpu->vmmRkeyInfo) + keysOffset,
+          vmmHeapObj.cpu->vmmRkeyInfo + idx * worldSize,
+          keysSize, hipMemcpyHostToDevice));
+      
+      HIP_RUNTIME_CHECK(hipMemcpy(
+          vmmHeapObj.gpu->vmmLkeyInfo + idx,
+          vmmHeapObj.cpu->vmmLkeyInfo + idx,
+          sizeof(VMMChunkKey), hipMemcpyHostToDevice));
+      
+      MORI_APP_TRACE("VMMFreeChunk: RANK {} synced cleared keys to GPU for chunk {}", rank, idx);
+    }
   }
 
   HeapDeregisterSymmMemObj(localPtr);
