@@ -1,5 +1,7 @@
 name: mori
-on: push
+on:
+  push:
+  workflow_dispatch:
 jobs:
   build:
     name: mori build
