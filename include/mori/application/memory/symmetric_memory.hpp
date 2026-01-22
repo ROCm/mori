@@ -175,6 +175,9 @@ class SymmMemManager {
 
     // P2P mapping tracking: which peers have already mapped this chunk
     std::set<int> mappedPeers;            // Set of peer ranks that have imported and mapped this chunk
+    
+    // P2P imported handles tracking: handles imported from other PEs need to be released
+    std::map<int, hipMemGenericAllocationHandle_t> importedHandles;  // pe -> imported handle
 
     VMMChunkInfo()
         : handle(0), shareableHandle(-1), size(0),

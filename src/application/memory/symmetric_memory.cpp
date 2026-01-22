@@ -491,7 +491,7 @@ void SymmMemManager::FinalizeVMMHeap() {
 
   int rank = bootNet.GetLocalRank();
 
-  // Deregister per-chunk RDMA registrations
+  // Deregister per-chunk RDMA registrations and clean up resources
   RdmaDeviceContext* rdmaDeviceContext = context.GetRdmaDeviceContext();
   if (rdmaDeviceContext) {
     for (size_t i = 0; i < vmmMaxChunks; ++i) {
@@ -504,35 +504,107 @@ void SymmMemManager::FinalizeVMMHeap() {
     }
   }
 
-  // Free all allocated chunks in local PE's virtual address space
+  // Step 1: First unmap all peer virtual address spaces (imported chunks)
+  // This must be done before unmapping local chunks and before releasing imported handles
+  int worldSize = bootNet.GetWorldSize();
+  for (int pe = 0; pe < worldSize; ++pe) {
+    if (pe == rank) continue;  // Skip self
+    
+    // Only process P2P accessible PEs
+    if (context.GetTransportType(pe) == TransportType::P2P && vmmPeerBasePtrs[pe] != nullptr) {
+      for (size_t i = 0; i < vmmMaxChunks; ++i) {
+        if (vmmChunks[i].mappedPeers.count(pe) > 0) {
+          void* peerChunkPtr =
+              static_cast<void*>(static_cast<char*>(vmmPeerBasePtrs[pe]) + i * vmmChunkSize);
+          
+          hipError_t result = hipMemUnmap(peerChunkPtr, vmmChunkSize);
+          if (result != hipSuccess) {
+            MORI_APP_WARN("FinalizeVMMHeap: Failed to unmap peer chunk {} from PE {}, err={}",
+                          i, pe, result);
+          } else {
+            MORI_APP_TRACE("FinalizeVMMHeap: Unmapped chunk {} from PE {} at {:p}",
+                           i, pe, peerChunkPtr);
+          }
+        }
+      }
+    }
+  }
+
+  // Step 2: Free all allocated chunks in local PE's virtual address space
   for (size_t i = 0; i < vmmMaxChunks; ++i) {
     if (vmmChunks[i].isAllocated) {
       void* chunkPtr =
           static_cast<void*>(static_cast<char*>(vmmPeerBasePtrs[rank]) + i * vmmChunkSize);
+      
+      // Close shareable file descriptor to prevent FD leak
+      if (vmmChunks[i].shareableHandle != -1) {
+        close(vmmChunks[i].shareableHandle);
+        MORI_APP_TRACE("FinalizeVMMHeap: Closed FD {} for chunk {}", 
+                       vmmChunks[i].shareableHandle, i);
+        vmmChunks[i].shareableHandle = -1;
+      }
+      
+      // Release all imported handles from P2P peers
+      for (auto& pair : vmmChunks[i].importedHandles) {
+        HIP_RUNTIME_CHECK(hipMemRelease(pair.second));
+        MORI_APP_TRACE("FinalizeVMMHeap: Released imported handle from PE {} for chunk {}",
+                       pair.first, i);
+      }
+      vmmChunks[i].importedHandles.clear();
+      
       // All chunks use granularity size (vmmChunkSize)
       HIP_RUNTIME_CHECK(hipMemUnmap(chunkPtr, vmmChunkSize));
       HIP_RUNTIME_CHECK(hipMemRelease(vmmChunks[i].handle));
+      vmmChunks[i].isAllocated = false;
     }
   }
 
-  // Free virtual address space (entire multi-PE space)
+  // Step 3: Synchronize GPU to ensure all operations are complete
+  hipError_t syncResult = hipDeviceSynchronize();
+  if (syncResult != hipSuccess) {
+    MORI_APP_WARN("FinalizeVMMHeap: hipDeviceSynchronize failed: {}", syncResult);
+  }
+
+  // Step 4: Free virtual address space (entire multi-PE space)
+  // Now safe to free since all chunks (local and peer) are unmapped
   if (vmmVirtualBasePtr) {
-    size_t totalVirtualSize = vmmPerPeerSize * bootNet.GetWorldSize();
+    size_t totalVirtualSize = vmmPerPeerSize * worldSize;
+    MORI_APP_TRACE("FinalizeVMMHeap: Freeing virtual address space at {:p}, size={} bytes",
+                   vmmVirtualBasePtr, totalVirtualSize);
     HIP_RUNTIME_CHECK(hipMemAddressFree(vmmVirtualBasePtr, totalVirtualSize));
     vmmVirtualBasePtr = nullptr;
   }
 
-  // Clean up VMM heap object
+  // Step 5: Clean up VMM heap object
   if (vmmHeapObj.IsValid()) {
-    free(vmmHeapObj.cpu->peerPtrs);
-    free(vmmHeapObj.cpu->vmmRkeyInfo);
-    free(vmmHeapObj.cpu->vmmLkeyInfo);
-    free(vmmHeapObj.cpu->ipcMemHandles);
-    free(vmmHeapObj.cpu);
-    HIP_RUNTIME_CHECK(hipFree(vmmHeapObj.gpu->peerPtrs));
-    HIP_RUNTIME_CHECK(hipFree(vmmHeapObj.gpu->vmmRkeyInfo));
-    HIP_RUNTIME_CHECK(hipFree(vmmHeapObj.gpu->vmmLkeyInfo));
-    HIP_RUNTIME_CHECK(hipFree(vmmHeapObj.gpu));
+    // Free CPU-side memory first
+    if (vmmHeapObj.cpu) {
+      free(vmmHeapObj.cpu->peerPtrs);
+      free(vmmHeapObj.cpu->vmmRkeyInfo);
+      free(vmmHeapObj.cpu->vmmLkeyInfo);
+      free(vmmHeapObj.cpu->ipcMemHandles);
+      free(vmmHeapObj.cpu);
+      vmmHeapObj.cpu = nullptr;
+    }
+    
+    // Free GPU-side memory with synchronization
+    if (vmmHeapObj.gpu) {
+      hipError_t err;
+      if ((err = hipFree(vmmHeapObj.gpu->peerPtrs)) != hipSuccess) {
+        MORI_APP_WARN("FinalizeVMMHeap: Failed to free GPU peerPtrs: {}", err);
+      }
+      if ((err = hipFree(vmmHeapObj.gpu->vmmRkeyInfo)) != hipSuccess) {
+        MORI_APP_WARN("FinalizeVMMHeap: Failed to free GPU vmmRkeyInfo: {}", err);
+      }
+      if ((err = hipFree(vmmHeapObj.gpu->vmmLkeyInfo)) != hipSuccess) {
+        MORI_APP_WARN("FinalizeVMMHeap: Failed to free GPU vmmLkeyInfo: {}", err);
+      }
+      if ((err = hipFree(vmmHeapObj.gpu)) != hipSuccess) {
+        MORI_APP_WARN("FinalizeVMMHeap: Failed to free GPU states: {}", err);
+      }
+      vmmHeapObj.gpu = nullptr;
+    }
+    
     vmmHeapObj = SymmMemObjPtr{nullptr, nullptr};
   }
 
@@ -653,19 +725,6 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
         return SymmMemObjPtr{nullptr, nullptr};
       }
 
-      // Export shareable handle for cross-process sharing
-      result = hipMemExportToShareableHandle((void*)&vmmChunks[chunkIdx].shareableHandle,
-                                             vmmChunks[chunkIdx].handle,
-                                             hipMemHandleTypePosixFileDescriptor, 0);
-      if (result != hipSuccess) {
-        MORI_APP_WARN("VMMAlloc: hipMemExport failed chunk={} err={}, P2P may not work", chunkIdx,
-                      result);
-        vmmChunks[chunkIdx].shareableHandle = -1;
-      }
-      localShareableHandles[i] = vmmChunks[chunkIdx].shareableHandle;
-      MORI_APP_TRACE("VMMAlloc: rank={} created chunk={} size={} fd={}", rank, chunkIdx,
-                     vmmChunkSize, vmmChunks[chunkIdx].shareableHandle);
-
       // Map physical memory to local virtual address
       result = hipMemMap(localChunkPtr, vmmChunkSize, 0, vmmChunks[chunkIdx].handle, 0);
       if (result != hipSuccess) {
@@ -710,6 +769,19 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
         return SymmMemObjPtr{nullptr, nullptr};
       }
 
+      // Export shareable handle for cross-process sharing (MUST be after Map and SetAccess)
+      result = hipMemExportToShareableHandle((void*)&vmmChunks[chunkIdx].shareableHandle,
+                                             vmmChunks[chunkIdx].handle,
+                                             hipMemHandleTypePosixFileDescriptor, 0);
+      if (result != hipSuccess) {
+        MORI_APP_WARN("VMMAlloc: hipMemExport failed chunk={} err={}, P2P may not work", chunkIdx,
+                      result);
+        vmmChunks[chunkIdx].shareableHandle = -1;
+      }
+      localShareableHandles[i] = vmmChunks[chunkIdx].shareableHandle;
+      MORI_APP_TRACE("VMMAlloc: rank={} created chunk={} size={} fd={}", rank, chunkIdx,
+                     vmmChunkSize, vmmChunks[chunkIdx].shareableHandle);
+
       MORI_APP_TRACE("VMMAlloc: rank={} set access chunk={} addr={:p}", rank, chunkIdx,
                      localChunkPtr);
 
@@ -749,6 +821,38 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
 
       application::LocalBootstrapNetwork localBootstrap(myPeerRank, p2pWorldSize);
       localBootstrap.Initialize();
+
+      // Verify chunk allocation consistency across P2P peers
+      struct ChunkInfo {
+        size_t startChunk;
+        size_t chunksNeeded;
+      };
+      ChunkInfo myChunkInfo = {startChunk, chunksNeeded};
+      std::vector<ChunkInfo> allChunkInfo(p2pWorldSize);
+      
+      bootNet.Allgather(&myChunkInfo, allChunkInfo.data(), sizeof(ChunkInfo));
+      
+      // Check if all P2P peers have the same chunk allocation
+      bool chunkConsistent = true;
+      for (int i = 0; i < p2pWorldSize; ++i) {
+        if (allChunkInfo[i].startChunk != startChunk || 
+            allChunkInfo[i].chunksNeeded != chunksNeeded) {
+          MORI_APP_ERROR(
+              "VMMAlloc: rank={} chunk mismatch! Self=[{},+{}), peer_rank={}(global={}) has=[{},+{})",
+              rank, startChunk, chunksNeeded, i, sortedP2pPeers[i],
+              allChunkInfo[i].startChunk, allChunkInfo[i].chunksNeeded);
+          chunkConsistent = false;
+        }
+      }
+      
+      if (!chunkConsistent) {
+        MORI_APP_ERROR("VMMAlloc: rank={} aborting due to inconsistent chunk allocation", rank);
+        localBootstrap.Finalize();
+        return SymmMemObjPtr();
+      }
+      
+      MORI_APP_TRACE("VMMAlloc: rank={} verified all {} P2P peers have matching chunks=[{},+{})",
+                     rank, p2pWorldSize - 1, startChunk, chunksNeeded);
 
       // Prepare local FDs for exchange
       std::vector<int> localFdsForExchange;
@@ -837,9 +941,10 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
             MORI_APP_WARN("Failed hipMemSetAccess PE={} chunk={} err={}", pe, i, result);
           }
 
-          // Mark this chunk as mapped from this peer
+          // Mark this chunk as mapped from this peer and save the imported handle
           if (chunkIdx < vmmMaxChunks) {
             vmmChunks[chunkIdx].mappedPeers.insert(pe);
+            vmmChunks[chunkIdx].importedHandles[pe] = importedHandle;  // Save for cleanup
           }
 
           MORI_APP_TRACE("Mapped chunk={} from PE={} to {:p}", i, pe, peerChunkPtr);
@@ -979,7 +1084,45 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
                    allocSize);
   }
 
-  // Free chunks from local PE's virtual address space
+  // Step 1: First unmap from peer virtual address spaces for P2P accessible PEs
+  // This must be done BEFORE clearing importedHandles in the local chunks!
+  for (int pe = 0; pe < worldSize; ++pe) {
+    if (pe == rank) continue;  // Skip self
+
+    // Only unmap from P2P accessible PEs where we previously mapped
+    if (context.GetTransportType(pe) == TransportType::P2P && vmmPeerBasePtrs[pe] != nullptr) {
+      for (size_t i = 0; i < chunksToFree; ++i) {
+        size_t idx = chunkIdx + i;
+
+        // Only unmap if this peer actually mapped this chunk
+        if (idx < vmmMaxChunks && vmmChunks[idx].mappedPeers.count(pe) > 0) {
+          void* peerChunkPtr =
+              static_cast<void*>(static_cast<char*>(vmmPeerBasePtrs[pe]) + idx * vmmChunkSize);
+
+          // All chunks use granularity size (vmmChunkSize)
+          hipError_t result = hipMemUnmap(peerChunkPtr, vmmChunkSize);
+          if (result != hipSuccess) {
+            MORI_APP_WARN("Failed to unmap peer memory for PE {} chunk {}, hipError: {}", pe, idx,
+                          result);
+          } else {
+            // Release the imported handle if exists
+            auto handleIt = vmmChunks[idx].importedHandles.find(pe);
+            if (handleIt != vmmChunks[idx].importedHandles.end()) {
+              HIP_RUNTIME_CHECK(hipMemRelease(handleIt->second));
+              vmmChunks[idx].importedHandles.erase(handleIt);
+              MORI_APP_TRACE("VMMFreeChunk: RANK {} released imported handle from PE {} for chunk {}",
+                             rank, pe, idx);
+            }
+            
+            // Successfully unmapped, remove from mappedPeers
+            vmmChunks[idx].mappedPeers.erase(pe);
+          }
+        }
+      }
+    }
+  }
+
+  // Step 2: Now free chunks from local PE's virtual address space
   RdmaDeviceContext* rdmaDeviceContext = context.GetRdmaDeviceContext();
   for (size_t i = 0; i < chunksToFree; ++i) {
     size_t idx = chunkIdx + i;
@@ -1004,6 +1147,13 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
                        chunkPtr);
       }
 
+      // Close shareable file descriptor to prevent FD leak
+      if (vmmChunks[idx].shareableHandle != -1) {
+        close(vmmChunks[idx].shareableHandle);
+        MORI_APP_TRACE("VMMFreeChunk: RANK {} closed FD {} for chunk {}", rank,
+                       vmmChunks[idx].shareableHandle, idx);
+      }
+
       // All chunks use granularity size (vmmChunkSize)
       HIP_RUNTIME_CHECK(hipMemUnmap(chunkPtr, vmmChunkSize));
       HIP_RUNTIME_CHECK(hipMemRelease(vmmChunks[idx].handle));
@@ -1011,10 +1161,11 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
       vmmChunks[idx].size = 0;
       vmmChunks[idx].shareableHandle = -1;
       vmmChunks[idx].mappedPeers.clear();  // Clear peer mapping tracking
+      vmmChunks[idx].importedHandles.clear();  // Now safe to clear (already released above)
     }
   }
 
-  // Synchronize cleared VMMChunkKey to GPU for freed chunks
+  // Step 3: Synchronize cleared VMMChunkKey to GPU for freed chunks
   if (chunksToFree > 0) {
     size_t keysOffset = chunkIdx * worldSize * sizeof(VMMChunkKey);
     size_t keysSize = chunksToFree * worldSize * sizeof(VMMChunkKey);
@@ -1027,34 +1178,6 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
         vmmHeapObj.gpu->vmmLkeyInfo + chunkIdx,
         vmmHeapObj.cpu->vmmLkeyInfo + chunkIdx,
         chunksToFree * sizeof(VMMChunkKey), hipMemcpyHostToDevice));
-  }
-
-  // Also unmap from peer virtual address spaces for P2P accessible PEs
-  for (int pe = 0; pe < worldSize; ++pe) {
-    if (pe == rank) continue;  // Skip self, already unmapped above
-
-    // Only unmap from P2P accessible PEs where we previously mapped
-    if (context.GetTransportType(pe) == TransportType::P2P && vmmPeerBasePtrs[pe] != nullptr) {
-      for (size_t i = 0; i < chunksToFree; ++i) {
-        size_t idx = chunkIdx + i;
-
-        // Only unmap if this peer actually mapped this chunk
-        if (idx < vmmMaxChunks && vmmChunks[idx].mappedPeers.count(pe) > 0) {
-          void* peerChunkPtr =
-              static_cast<void*>(static_cast<char*>(vmmPeerBasePtrs[pe]) + idx * vmmChunkSize);
-
-          // All chunks use granularity size (vmmChunkSize)
-          hipError_t result = hipMemUnmap(peerChunkPtr, vmmChunkSize);
-          if (result != hipSuccess) {
-            MORI_APP_WARN("Failed to unmap peer memory for PE {} chunk {}, hipError: {}", pe, idx,
-                          result);
-          } else {
-            // Successfully unmapped, remove from mappedPeers
-            vmmChunks[idx].mappedPeers.erase(pe);
-          }
-        }
-      }
-    }
   }
 
   HeapDeregisterSymmMemObj(localPtr);
