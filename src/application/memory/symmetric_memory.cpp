@@ -369,11 +369,20 @@ bool SymmMemManager::InitializeVMMHeap(size_t virtualSize, size_t chunkSize) {
                 totalVirtualSize);
 
   // Reserve virtual address space for all PEs
-  hipError_t result = hipMemAddressReserve(&vmmVirtualBasePtr, totalVirtualSize, 0, nullptr, 0);
+  hipError_t result = hipMemAddressReserve(&vmmVirtualBasePtr, totalVirtualSize, chunkSize, nullptr, 0);
   if (result != hipSuccess) {
-    MORI_APP_WARN("VMM Init failed: hipMemAddressReserve size={} err={}", totalVirtualSize, result);
+    MORI_APP_ERROR("VMM Init failed: hipMemAddressReserve size={} align={} err={}", totalVirtualSize, chunkSize, result);
     return false;
   }
+  
+  // Verify the returned address is indeed aligned to chunkSize
+  if (reinterpret_cast<uintptr_t>(vmmVirtualBasePtr) % chunkSize != 0) {
+    MORI_APP_WARN("VMM Init: vmmVirtualBasePtr {:p} is NOT aligned to chunkSize={} (HIP may not support alignment, but this is OK)", 
+                  vmmVirtualBasePtr, chunkSize);
+  }
+  
+  MORI_APP_INFO("VMM Init: rank={} vmmVirtualBasePtr={:p} (aligned to {} bytes)", 
+                myPe, vmmVirtualBasePtr, chunkSize);
 
   // Set up peer base pointers for each PE
   vmmPeerBasePtrs.resize(worldSize);
@@ -636,7 +645,10 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
   int rank = bootNet.GetLocalRank();
 
   // Step 1: Allocate virtual address from VA manager (may reuse freed VA)
+  // No barrier needed here - ShmemMalloc entry barrier ensures synchronized entry
+  // VA Manager is deterministic: same state + same inputs = same output
   uintptr_t allocAddr = heapVAManager->Allocate(size, 256);
+  
   if (allocAddr == 0) {
     MORI_APP_ERROR("VMMAllocChunk failed: VA allocation failed for size {} bytes", size);
 
@@ -651,9 +663,39 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
 
   void* startPtr = reinterpret_cast<void*>(allocAddr);
 
-  // Calculate chunk information, [startChunk, endChunk)
+  // Step 2: Verify VA allocation consistency across all PEs
   uintptr_t baseAddr = reinterpret_cast<uintptr_t>(vmmPeerBasePtrs[rank]);
   size_t offset = allocAddr - baseAddr;
+  
+  struct VAInfo {
+    size_t offset;  // Offset relative to each PE's heap base (must be identical)
+    size_t size;    // Allocation size (must be identical)
+  };
+  VAInfo myVAInfo = {offset, size};
+  std::vector<VAInfo> allVAInfo(worldSize);
+  
+  bootNet.Allgather(&myVAInfo, allVAInfo.data(), sizeof(VAInfo));
+  
+  bool vaConsistent = true;
+  for (int pe = 0; pe < worldSize; ++pe) {
+    if (allVAInfo[pe].offset != offset || allVAInfo[pe].size != size) {
+      MORI_APP_ERROR(
+          "VMMAlloc: rank={} symmetric memory violated! Self: offset=0x{:x} size={}, PE {}: offset=0x{:x} size={}",
+          rank, offset, size, pe, allVAInfo[pe].offset, allVAInfo[pe].size);
+      vaConsistent = false;
+    }
+  }
+  
+  if (!vaConsistent) {
+    MORI_APP_ERROR("VMMAlloc: rank={} aborting due to inconsistent offset/size (symmetric memory requirement)", rank);
+    heapVAManager->Free(allocAddr);
+    return SymmMemObjPtr{nullptr, nullptr};
+  }
+  
+  MORI_APP_TRACE("VMMAlloc: rank={} verified all {} PEs have matching offset=0x{:x} size={}", 
+                 rank, worldSize, offset, size);
+
+  // Calculate chunk information, [startChunk, endChunk) (using already calculated offset)
   size_t startChunk = offset / vmmChunkSize;
   size_t endOffset = offset + size;
   size_t endChunk = (endOffset + vmmChunkSize - 1) / vmmChunkSize;
@@ -1111,6 +1153,37 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
   MORI_APP_TRACE("VMMFreeChunk: RANK {} freeing ptr={:p} size={} chunks=[{},{})", rank, 
                  localPtr, allocSize, startChunk, endChunk);
 
+  // Verify free consistency across all PEs (symmetric memory requirement)
+  // Note: ShmemFree has already synchronized all PEs before calling this function
+  struct FreeInfo {
+    size_t offset;  // Offset relative to each PE's heap base (must be identical)
+    size_t size;    // Allocation size (must be identical)
+  };
+  FreeInfo myFreeInfo = {offset, allocSize};
+  std::vector<FreeInfo> allFreeInfo(worldSize);
+  
+  bootNet.Allgather(&myFreeInfo, allFreeInfo.data(), sizeof(FreeInfo));
+  
+  bool freeConsistent = true;
+  for (int pe = 0; pe < worldSize; ++pe) {
+    if (allFreeInfo[pe].offset != offset || allFreeInfo[pe].size != allocSize) {
+      MORI_APP_ERROR(
+          "VMMFree: rank={} symmetric memory violated! Self: offset=0x{:x} size={}, PE {}: offset=0x{:x} size={}",
+          rank, offset, allocSize, pe, allFreeInfo[pe].offset, allFreeInfo[pe].size);
+      freeConsistent = false;
+    }
+  }
+  
+  if (!freeConsistent) {
+    MORI_APP_ERROR("VMMFree: rank={} detected inconsistent free, but continuing (may cause future issues)", rank);
+    // Don't abort here - just log the error and continue to avoid resource leaks
+  } else {
+    MORI_APP_TRACE("VMMFree: rank={} verified all {} PEs freeing matching offset=0x{:x} size={}", 
+                   rank, worldSize, offset, allocSize);
+  }
+
+  // No barrier needed here - ShmemFree entry barrier ensures synchronized entry
+  // VA Manager is deterministic: same state + same inputs = same output
   if (heapVAManager) {
     heapVAManager->Free(ptrAddr);
     MORI_APP_TRACE("VMMFreeChunk: RANK {} freed VA at 0x{:x} of size {} bytes", rank, ptrAddr,
@@ -1231,6 +1304,9 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
   }
 
   HeapDeregisterSymmMemObj(localPtr);
+  
+  // Note: ShmemFree will synchronize all PEs after this function returns
+  MORI_APP_TRACE("VMMFreeChunk: rank={} free complete", rank);
 }
 
 SymmMemObjPtr SymmMemManager::VMMRegisterSymmMemObj(void* localPtr, size_t size, size_t startChunk,

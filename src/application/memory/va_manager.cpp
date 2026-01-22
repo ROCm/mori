@@ -80,18 +80,17 @@ uintptr_t HeapVAManager::Allocate(size_t size, size_t alignment) {
     if (granularity_ > 0) {
       uintptr_t allocEnd = alignedAddr + alignedSize;
       
-      // Calculate the next granularity boundary
-      uintptr_t startBoundary = (alignedAddr / granularity_) * granularity_;
-      uintptr_t nextBoundary = startBoundary + granularity_;
+      size_t relativeOffset = alignedAddr - baseAddr_;
+      size_t startBoundary = (relativeOffset / granularity_) * granularity_;
+      size_t nextBoundary = startBoundary + granularity_;
+      uintptr_t nextBoundaryAddr = baseAddr_ + nextBoundary;
       
-      // If allocation would cross the boundary, skip to next boundary (only once)
-      if (allocEnd > nextBoundary) {
+      if (allocEnd > nextBoundaryAddr) {
         MORI_APP_TRACE("HeapVAManager::Allocate: allocation would cross granularity boundary "
-                       "at {:p}, skipping to next boundary at {:p}",
-                       reinterpret_cast<void*>(nextBoundary),
-                       reinterpret_cast<void*>(nextBoundary));
+                       "at relative offset 0x{:x}, skipping to next boundary at 0x{:x}",
+                       nextBoundary, nextBoundary);
         
-        allocAddr = nextBoundary;
+        allocAddr = nextBoundaryAddr;
         
         // Check if the next boundary is still within this free block
         if (allocAddr + alignedSize > block.startAddr + block.size) {

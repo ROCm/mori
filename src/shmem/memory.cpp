@@ -45,6 +45,7 @@ void* ShmemMalloc(size_t size) {
     
     // Use VA manager to allocate address (thread-safe, handles reuse)
     uintptr_t allocAddr = states->memoryStates->symmMemMgr->GetHeapVAManager()->Allocate(size, ALIGNMENT);
+    
     if (allocAddr == 0) {
       MORI_SHMEM_ERROR("Out of symmetric heap memory! Requested: {} bytes (aligned)", size);
       return nullptr;
@@ -66,10 +67,7 @@ void* ShmemMalloc(size_t size) {
     // VMM heap mode: use VMM-based allocation
     application::SymmMemObjPtr obj = states->memoryStates->symmMemMgr->VMMAllocChunk(size);
     MORI_SHMEM_TRACE("Allocated {} bytes in VMM heap mode", size);
-    if (obj.IsValid()) {
-      return obj.cpu->localPtr;
-    }
-    return nullptr;
+    return obj.IsValid() ? obj.cpu->localPtr : nullptr;
   } else if (states->mode == ShmemMode::Isolation) {
     // Isolation mode: each allocation gets its own SymmMemObj
     application::SymmMemObjPtr obj = states->memoryStates->symmMemMgr->Malloc(size);

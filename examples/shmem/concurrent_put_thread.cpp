@@ -73,18 +73,20 @@ __global__ void ConcurrentPutThreadKernel(int myPe, const SymmMemObjPtr memObj) 
 }
 
 // New API: Using pure addresses
-__global__ void ConcurrentPutThreadKernel_PureAddr(int myPe, uint32_t* localBuff) {
+__global__ void ConcurrentPutThreadKernel_PureAddr(int myPe, uint32_t* localBuff, size_t numElements) {
   constexpr int sendPe = 0;
   constexpr int recvPe = 1;
 
   int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
+  
+  if (globalTid >= numElements) {
+    return;
+  }
 
   if (myPe == sendPe) {
-    // Calculate source and destination addresses
     uint32_t* src = localBuff + globalTid;
     uint32_t* dest = localBuff + globalTid;
 
-    // Use pure address-based API
     ShmemPutMemNbiThread(dest, src, sizeof(uint32_t), recvPe, 1);
     __threadfence_system();
 
@@ -92,7 +94,6 @@ __global__ void ConcurrentPutThreadKernel_PureAddr(int myPe, uint32_t* localBuff
       ShmemQuietThread();
     }
   } else {
-    // Wait for data to arrive
     while (atomicAdd(localBuff + globalTid, 0) != sendPe) {
     }
   }
@@ -106,7 +107,6 @@ __global__ void DirectAccessTestKernel(int myPe, const SymmMemObjPtr memObj, uin
   int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
   
   if (globalTid == 0) {
-    // Print address information for debugging
     printf("PE %d: localPtr = %p\n", myPe, memObj->localPtr);
     if (memObj->peerPtrs) {
       printf("PE %d: peerPtrs[0] = %p\n", myPe, (void*)memObj->peerPtrs[0]);
@@ -117,12 +117,9 @@ __global__ void DirectAccessTestKernel(int myPe, const SymmMemObjPtr memObj, uin
   __syncthreads();
   
   if (myPe == sendPe && globalTid < 1) {
-    // Try to write directly to peer's memory using peer pointer
     if (peerBuffer != nullptr) {
-      // Test 1: Write a pattern to peer memory
       uint32_t testValue = 0xABCD0000 + globalTid;
       
-      // Attempt direct write to peer memory
       __threadfence_system();
       peerBuffer[globalTid] = testValue;
       __threadfence_system();
@@ -133,11 +130,9 @@ __global__ void DirectAccessTestKernel(int myPe, const SymmMemObjPtr memObj, uin
       }
     }
   } else if (myPe == recvPe && globalTid < 1) {
-    // Wait for data and verify
     uint32_t expected = 0xABCD0000 + globalTid;
     uint32_t* localBuff = reinterpret_cast<uint32_t*>(memObj->localPtr);
     
-    // Wait for the write to arrive (with timeout)
     int timeout = 1000000;
     while (timeout-- > 0 && localBuff[globalTid] != expected) {
       __threadfence_system();
@@ -196,6 +191,11 @@ void Test0_DirectGPUAccess(int myPe) {
   
   if (myPe == 0) {
     printf("Running direct access test...\n");
+  }
+  
+  MPI_Barrier(MPI_COMM_WORLD);
+  
+  if (myPe == 0) {
     uint32_t* peerAddr = reinterpret_cast<uint32_t*>(buffObj.cpu->peerPtrs[1]);
     DirectAccessTestKernel<<<2, 64>>>(myPe, buffObj, peerAddr, d_accessResult);
   } else {
@@ -251,6 +251,8 @@ void Test1_LegacyAPI(int myPe) {
   if (myPe == 0) {
     printf("Running legacy API test...\n");
   }
+  
+  MPI_Barrier(MPI_COMM_WORLD);
   ConcurrentPutThreadKernel<<<blockNum, threadNum>>>(myPe, buffObj);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
@@ -284,6 +286,16 @@ void Test2_PureAddressAPI(int myPe) {
     printf("\n--- Test 2: Pure Address API ---\n");
   }
   
+  const char* shmemMode = std::getenv("MORI_SHMEM_MODE");
+  bool skipPureAddress = (shmemMode != nullptr && std::string(shmemMode) == "ISOLATION");
+  
+  if (skipPureAddress) {
+    if (myPe == 0) {
+      printf("⊘ SKIPPED (MORI_SHMEM_MODE=ISOLATION - pure address API not supported in isolation mode)\n");
+    }
+    return;
+  }
+  
   constexpr int threadNum = 128;
   constexpr int blockNum = 3;
   int numEle = threadNum * blockNum;
@@ -296,7 +308,9 @@ void Test2_PureAddressAPI(int myPe) {
   if (myPe == 0) {
     printf("Running pure address API test...\n");
   }
-  ConcurrentPutThreadKernel_PureAddr<<<blockNum, threadNum>>>(myPe, reinterpret_cast<uint32_t*>(buff));
+  
+  MPI_Barrier(MPI_COMM_WORLD);
+  ConcurrentPutThreadKernel_PureAddr<<<blockNum, threadNum>>>(myPe, reinterpret_cast<uint32_t*>(buff), numEle);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
   
@@ -329,6 +343,16 @@ void Test3_LargeMultiChunk(int myPe) {
     printf("\n--- Test 3: Large Multi-Chunk Allocation (>200MB) ---\n");
   }
   
+  const char* shmemMode = std::getenv("MORI_SHMEM_MODE");
+  bool skipPureAddress = (shmemMode != nullptr && std::string(shmemMode) == "ISOLATION");
+  
+  if (skipPureAddress) {
+    if (myPe == 0) {
+      printf("⊘ SKIPPED (MORI_SHMEM_MODE=ISOLATION - pure address API not supported in isolation mode)\n");
+    }
+    return;
+  }
+  
   constexpr size_t largeSize = 200 * 1024 * 1024;  // 200 MB
   constexpr size_t largeNumEle = largeSize / sizeof(uint32_t);
   
@@ -346,19 +370,21 @@ void Test3_LargeMultiChunk(int myPe) {
     printf("Testing large data transfer with pure address API...\n");
   }
   
+  MPI_Barrier(MPI_COMM_WORLD);
   constexpr int largeBlockNum = 1024;
   constexpr int largeThreadNum = 256;
-  ConcurrentPutThreadKernel_PureAddr<<<largeBlockNum, largeThreadNum>>>(myPe, reinterpret_cast<uint32_t*>(largeBuff));
+  constexpr size_t testElements = largeBlockNum * largeThreadNum;
+  
+  ConcurrentPutThreadKernel_PureAddr<<<largeBlockNum, largeThreadNum>>>(myPe, reinterpret_cast<uint32_t*>(largeBuff), testElements);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
   
-  constexpr size_t sampleSize = largeBlockNum * largeThreadNum;
-  std::vector<uint32_t> hostLargeBuff(sampleSize);
-  HIP_RUNTIME_CHECK(hipMemcpy(hostLargeBuff.data(), largeBuff, sampleSize * sizeof(uint32_t), hipMemcpyDeviceToHost));
+  std::vector<uint32_t> hostLargeBuff(testElements);
+  HIP_RUNTIME_CHECK(hipMemcpy(hostLargeBuff.data(), largeBuff, testElements * sizeof(uint32_t), hipMemcpyDeviceToHost));
   
   if (myPe == 1) {
     bool success = true;
-    for (size_t i = 0; i < sampleSize; i++) {
+    for (size_t i = 0; i < testElements; i++) {
       if (hostLargeBuff[i] != 0) {
         printf("Error at index %zu: expected 0, got %u\n", i, hostLargeBuff[i]);
         success = false;
@@ -371,11 +397,10 @@ void Test3_LargeMultiChunk(int myPe) {
   }
   
   if (myPe == 0) {
-    printf("✓ Large multi-chunk allocation test PASSED! Verified %zu elements.\n", sampleSize);
+    printf("✓ Large multi-chunk allocation test PASSED! Verified %zu elements (200MB allocation successful).\n", testElements);
   }
   
   ShmemFree(largeBuff);
-  MPI_Barrier(MPI_COMM_WORLD);
 }
 
 void Test4_MixedMallocFree(int myPe) {
@@ -393,7 +418,6 @@ void Test4_MixedMallocFree(int myPe) {
   if (myPe == 0) {
     printf("Step 1: Allocated buffer A (%zu MB)\n", sizeA / (1024*1024));
   }
-  MPI_Barrier(MPI_COMM_WORLD);
   
   constexpr size_t sizeB = 100 * 1024 * 1024;
   void* buffB = ShmemMalloc(sizeB);
@@ -404,7 +428,6 @@ void Test4_MixedMallocFree(int myPe) {
   if (myPe == 0) {
     printf("Step 2: Allocated buffer B (%zu MB)\n", sizeB / (1024*1024));
   }
-  MPI_Barrier(MPI_COMM_WORLD);
   
   uint32_t testValA;
   HIP_RUNTIME_CHECK(hipMemcpy(&testValA, buffA, sizeof(uint32_t), hipMemcpyDeviceToHost));
@@ -416,7 +439,6 @@ void Test4_MixedMallocFree(int myPe) {
     printf("Step 3: Freeing buffer A (shared chunks should remain allocated)...\n");
   }
   ShmemFree(buffA);
-  MPI_Barrier(MPI_COMM_WORLD);
   
   uint32_t testValB;
   HIP_RUNTIME_CHECK(hipMemcpy(&testValB, buffB, sizeof(uint32_t), hipMemcpyDeviceToHost));
@@ -435,13 +457,11 @@ void Test4_MixedMallocFree(int myPe) {
   if (myPe == 0) {
     printf("Step 4: Updated buffer B after freeing A...\n");
   }
-  MPI_Barrier(MPI_COMM_WORLD);
   
   if (myPe == 0) {
     printf("Step 5: Freeing buffer B (all shared chunks should now be released)...\n");
   }
   ShmemFree(buffB);
-  MPI_Barrier(MPI_COMM_WORLD);
   
   if (myPe == 0) {
     printf("✓ Mixed malloc/free test PASSED! Reference counting verified.\n");
@@ -468,7 +488,6 @@ void Test5_FragmentationReuse(int myPe) {
                                    0x1000 * i + myPe, fragmentSize / sizeof(uint32_t)));
   }
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-  MPI_Barrier(MPI_COMM_WORLD);
   
   if (myPe == 0) {
     printf("Freeing alternating fragments (creating fragmentation)...\n");
@@ -478,7 +497,6 @@ void Test5_FragmentationReuse(int myPe) {
     ShmemFree(fragments[i]);
     fragments[i] = nullptr;
   }
-  MPI_Barrier(MPI_COMM_WORLD);
   
   bool allValid = true;
   for (int i = 1; i < numFragments; i += 2) {
@@ -506,7 +524,6 @@ void Test5_FragmentationReuse(int myPe) {
                                    0x2000 * i + myPe, fragmentSize / sizeof(uint32_t)));
   }
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-  MPI_Barrier(MPI_COMM_WORLD);
   
   allValid = true;
   for (int i = 0; i < numFragments; i++) {
@@ -527,7 +544,6 @@ void Test5_FragmentationReuse(int myPe) {
   for (int i = 0; i < numFragments; i++) {
     ShmemFree(fragments[i]);
   }
-  MPI_Barrier(MPI_COMM_WORLD);
   
   if (myPe == 0) {
     printf("✓ Fragmentation and VA reuse test PASSED!\n");
@@ -538,7 +554,6 @@ void ConcurrentPutThread() {
   int status;
   MPI_Init(NULL, NULL);
 
-  // Set GPU device based on local rank
   MPI_Comm localComm;
   MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &localComm);
   
@@ -561,11 +576,10 @@ void ConcurrentPutThread() {
 
   if (myPe == 0) {
     printf("=================================================================\n");
-    printf("MORI VMM Heap Comprehensive Test Suite\n");
+    printf("MORI SHMEM Comprehensive Test Suite\n");
     printf("=================================================================\n");
   }
 
-  // Run all tests
   Test0_DirectGPUAccess(myPe);
   Test1_LegacyAPI(myPe);
   Test2_PureAddressAPI(myPe);
