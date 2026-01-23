@@ -2,6 +2,10 @@ add_executable(sdma_bw sdma/sdma_bw.cpp sdma/common.cpp sdma/utils.cpp sdma/sdma
 target_include_directories(sdma_bw PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
 target_link_libraries(sdma_bw mori_application hip::host hip::device)
 
+add_executable(sdma_bw_allgather sdma/sdma_bw_allgather.cpp sdma/common.cpp sdma/utils.cpp sdma/sdma_bw_kernel.cpp utils/args_parser.cpp)
+target_include_directories(sdma_bw_allgather PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
+target_link_libraries(sdma_bw_gather mori_application hip::host hip::device)
+
 add_executable(sdma_rate sdma/sdma_rate.cpp sdma/common.cpp sdma/utils.cpp sdma/sdma_rate_kernel.cpp utils/args_parser.cpp)
 target_include_directories(sdma_rate PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
 target_link_libraries(sdma_rate mori_application hip::host hip::device)
