@@ -55,24 +55,20 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes,
   int warpId = threadLinearId / warpSize;
   const int laneId = threadIdx.x % warpSize;
 
-  if(laneId == 0){
-    int qId = 0;//threadLinearId % dstMemObj->sdmaNumQueue;
-    int remotePe = warpId;//threadLinearId / dstMemObj->sdmaNumQueue;
-    //const size_t sendBytes_rand = bytesPerPeer/8;
+  if(warpId < npes){
+    int remotePe = warpId;
     size_t destByteOffset = myPe*bytesPerPeer;
     size_t srcByteOffset = 0;
     size_t sendBytes = bytesPerPeer;
 
-    //if( qId == 7) sendBytes = bytesPerPeer - 7*sendBytes_rand;
-    //else sendBytes = sendBytes_rand;
-
-    shmem::ShmemPutMemNbiThread(dstMemObj, destByteOffset, srcMemObj, srcByteOffset, sendBytes, remotePe, qId);
+    shmem::ShmemPutMemNbiWarp(dstMemObj, destByteOffset, srcMemObj, srcByteOffset, sendBytes, remotePe);
   }
 
-  if(threadLinearId < npes){
-    int remotePe = threadLinearId;
-    shmem::ShmemQuietThread(remotePe,dstMemObj);
-    shmem::ShmemAtomicSizeNonFetchThread(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8, core::atomicType::AMO_ADD,remotePe);
+  if(warpId < npes){
+    int remotePe =WarpId;
+    if(lanId == 0)
+      shmem::ShmemQuietThread(remotePe, dstMemObj);
+    shmem::ShmemAtomicSizeNonFetchWarp(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8, core::atomicType::AMO_ADD, remotePe);
   }
   __syncthreads();
 
