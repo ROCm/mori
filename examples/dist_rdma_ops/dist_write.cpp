@@ -536,10 +536,58 @@ void distRdmaOps(int argc, char* argv[]) {
 
   // 4 Register buffer and block sync memory
   void* buffer;
+  hipMemGenericAllocationHandle_t vmmHandle;  // VMM handle (only used if useVMM is true)
   size_t totalSize = maxSize * blocks * threads;
   assert(totalSize <= 0x1000000000ULL && "Error: totalSize cannot exceed 64GB!");
-  HIP_RUNTIME_CHECK(hipMalloc(&buffer, totalSize));
-  HIP_RUNTIME_CHECK(hipMemset(buffer, local_rank, totalSize));
+  
+  bool useVMM = args.getUseVMM();
+  
+  if (useVMM) {
+    // Use VMM-based allocation
+    std::cout << "Local rank " << local_rank << " using VMM allocation for buffer (size=" 
+              << totalSize << " bytes)" << std::endl;
+    
+    // Determine chunk size (align to 64MB for VMM)
+    constexpr size_t DEFAULT_VMM_CHUNK_SIZE = 64 * 1024 * 1024;  // 64MB
+    size_t chunkSize = DEFAULT_VMM_CHUNK_SIZE;
+    
+    // Round up totalSize to multiple of chunkSize
+    size_t alignedSize = ((totalSize + chunkSize - 1) / chunkSize) * chunkSize;
+    
+    // Reserve virtual address space
+    HIP_RUNTIME_CHECK(hipMemAddressReserve(&buffer, alignedSize, chunkSize, nullptr, 0));
+    
+    // Create physical memory handle
+    hipMemAllocationProp allocProp = {};
+    allocProp.type = hipMemAllocationTypePinned;
+    allocProp.location.type = hipMemLocationTypeDevice;
+    allocProp.location.id = gpu_id;
+    allocProp.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
+    
+    HIP_RUNTIME_CHECK(hipMemCreate(&vmmHandle, alignedSize, &allocProp, 0));
+    
+    // Map physical memory to virtual address
+    HIP_RUNTIME_CHECK(hipMemMap(buffer, alignedSize, 0, vmmHandle, 0));
+    
+    // Set access permissions
+    hipMemAccessDesc accessDesc;
+    accessDesc.location.type = hipMemLocationTypeDevice;
+    accessDesc.location.id = gpu_id;
+    accessDesc.flags = hipMemAccessFlagsProtReadWrite;
+    HIP_RUNTIME_CHECK(hipMemSetAccess(buffer, alignedSize, &accessDesc, 1));
+    
+    // Initialize buffer
+    HIP_RUNTIME_CHECK(hipMemset(buffer, local_rank, totalSize));
+    
+    std::cout << "Local rank " << local_rank << " VMM buffer allocated at " << buffer 
+              << " (aligned size=" << alignedSize << ")" << std::endl;
+  } else {
+    // Use standard hipMalloc
+    std::cout << "Local rank " << local_rank << " using hipMalloc for buffer (size=" 
+              << totalSize << " bytes)" << std::endl;
+    HIP_RUNTIME_CHECK(hipMalloc(&buffer, totalSize));
+    HIP_RUNTIME_CHECK(hipMemset(buffer, local_rank, totalSize));
+  }
   uint32_t* blockSync;
   HIP_RUNTIME_CHECK(hipMalloc(&blockSync, (warmupIters + iters + 1) * sizeof(uint32_t)));
   HIP_RUNTIME_CHECK(hipMemset(blockSync, 0, (warmupIters + iters + 1) * sizeof(uint32_t)));
@@ -683,7 +731,24 @@ void distRdmaOps(int argc, char* argv[]) {
   }
 
   bootNet.Finalize();
-  HIP_RUNTIME_CHECK(hipFree(buffer));
+  
+  // Cleanup buffer
+  if (useVMM) {
+    // VMM cleanup
+    constexpr size_t DEFAULT_VMM_CHUNK_SIZE = 64 * 1024 * 1024;  // 64MB
+    size_t chunkSize = DEFAULT_VMM_CHUNK_SIZE;
+    size_t alignedSize = ((totalSize + chunkSize - 1) / chunkSize) * chunkSize;
+    
+    HIP_RUNTIME_CHECK(hipMemUnmap(buffer, alignedSize));
+    HIP_RUNTIME_CHECK(hipMemRelease(vmmHandle));
+    HIP_RUNTIME_CHECK(hipMemAddressFree(buffer, alignedSize));
+    
+    std::cout << "Local rank " << local_rank << " VMM buffer cleaned up" << std::endl;
+  } else {
+    // Standard hipFree
+    HIP_RUNTIME_CHECK(hipFree(buffer));
+  }
+  
   HIP_RUNTIME_CHECK(hipFree(devEndpoints));
   HIP_RUNTIME_CHECK(hipHostFree(bwTable));
   HIP_RUNTIME_CHECK(hipHostFree(sizeTable));

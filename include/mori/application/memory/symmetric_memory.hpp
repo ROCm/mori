@@ -141,7 +141,9 @@ class SymmMemManager {
 
   // Get VMM heap object (for accessing peer addresses and RDMA keys)
   SymmMemObjPtr GetVMMHeapObj() const { return vmmHeapObj; }
-
+  
+  // Get VMM heap chunk size
+  size_t GetVMMChunkSize() const { return vmmChunkSize; }
 
   SymmMemObjPtr Get(void* localPtr) const;
   

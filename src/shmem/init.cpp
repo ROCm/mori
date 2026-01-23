@@ -118,7 +118,7 @@ bool IsROCmVersionGreaterThan7() {
   MORI_SHMEM_INFO("Detected HIP version: {}.{} (version code: {})", hip_major, hip_minor,
                   hipVersion);
 
-  return hip_major > 6;
+  return hip_major >= 6;
 }
 
 void RdmaStatesInit() {
@@ -183,7 +183,7 @@ void MemoryStatesInit() {
         states->memoryStates->useVMMHeap = true;
         states->memoryStates->vmmHeapInitialized = true;
         states->memoryStates->vmmHeapVirtualSize = vmmHeapSize;
-        states->memoryStates->vmmHeapChunkSize = chunkSize;
+        states->memoryStates->vmmHeapChunkSize = states->memoryStates->symmMemMgr->GetVMMChunkSize(); 
         states->memoryStates->vmmHeapObj = states->memoryStates->symmMemMgr->GetVMMHeapObj();
         states->memoryStates->vmmHeapBaseAddr = states->memoryStates->vmmHeapObj.cpu->localPtr;
 
