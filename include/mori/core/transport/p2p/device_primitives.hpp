@@ -24,6 +24,8 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
 
+#include <type_traits>
+
 #include "mori/core/utils.hpp"
 namespace mori {
 namespace core {
@@ -373,32 +375,62 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
   const int elemsPerWarp = warpSize * vecSize;
   const size_t numIters = (nelems - offset) / elemsPerWarp;
   const size_t laneOffset = laneId * vecSize;
-  for (size_t iter = 0; iter < numIters; ++iter) {
-    float accumValFp32[vecSize] = {0};
+  if constexpr (std::is_same_v<T, __hip_fp8_e4m3> || std::is_same_v<T, __hip_fp8_e4m3_fnuz>) {
+    union {
+      DataType raw;
+      uint8_t bytes[VecBytes];
+    } vec;
+    for (size_t iter = 0; iter < numIters; ++iter) {
+      float accumValFp32[vecSize] = {0};
 #pragma unroll
-    for (int i = 0; i < accumNum; ++i) {
-      if (srcs[i] == nullptr) continue;
-      DataType srcVal = load<VecBytes>(srcs[i] + offset + laneOffset);
-      float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
+      for (int i = 0; i < accumNum; ++i) {
+        if (srcs[i] == nullptr) continue;
+        vec.raw = load<VecBytes>(srcs[i] + offset + laneOffset);
+        float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
+#pragma unroll
+        for (int j = 0; j < vecSize; ++j) {
+          T v;
+          v.__x = static_cast<__hip_fp8_storage_t>(vec.bytes[j]);
+          accumValFp32[j] += float(v) * srcScale;
+        }
+      }
+
 #pragma unroll
       for (int j = 0; j < vecSize; ++j) {
-        accumValFp32[j] += float(reinterpret_cast<const T*>(&srcVal)[j]) * srcScale;
+        T q = T(accumValFp32[j]);
+        vec.bytes[j] = static_cast<uint8_t>(q.__x);
       }
-    }
+      store<VecBytes>(dest + offset + laneOffset, vec.raw);
 
-    union {
-      DataType accumVec;
-      T accumVal[vecSize];
-    };
+      offset += elemsPerWarp;
+    }
+  } else {
+    for (size_t iter = 0; iter < numIters; ++iter) {
+      float accumValFp32[vecSize] = {0};
 #pragma unroll
-    for (int j = 0; j < vecSize; ++j) {
-      accumVal[j] = T(accumValFp32[j]);
+      for (int i = 0; i < accumNum; ++i) {
+        if (srcs[i] == nullptr) continue;
+        DataType srcVal = load<VecBytes>(srcs[i] + offset + laneOffset);
+        float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
+#pragma unroll
+        for (int j = 0; j < vecSize; ++j) {
+          accumValFp32[j] += float(reinterpret_cast<const T*>(&srcVal)[j]) * srcScale;
+        }
+      }
+
+      union {
+        DataType accumVec;
+        T accumVal[vecSize];
+      };
+#pragma unroll
+      for (int j = 0; j < vecSize; ++j) {
+        accumVal[j] = T(accumValFp32[j]);
+      }
+      store<VecBytes>(dest + offset + laneOffset, accumVec);
+
+      offset += elemsPerWarp;
     }
-    store<VecBytes>(dest + offset + laneOffset, accumVec);
-
-    offset += elemsPerWarp;
   }
-
   // remaining size
   offset += laneId;
   while (offset < nelems) {
@@ -433,39 +465,80 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
   const int laneId = threadIdx.x & (warpSize - 1);
   const size_t laneOffset = laneId * vecSize;
 
-  for (size_t iter = 0; iter < numIters; iter++) {
-    float accumValFp32[Unroll][vecSize] = {0};
+  if constexpr (std::is_same_v<T, __hip_fp8_e4m3> || std::is_same_v<T, __hip_fp8_e4m3_fnuz>) {
+    union {
+      DataType raw;
+      uint8_t bytes[VecBytes];
+    } vec;
+
+    for (size_t iter = 0; iter < numIters; iter++) {
+      float accumValFp32[Unroll][vecSize] = {0};
 
 #pragma unroll AccumNum
-    for (int i = 0; i < AccumNum; ++i) {
-      const T* srcPtr = srcs[i];
-      if (srcPtr == nullptr) continue;
+      for (int i = 0; i < AccumNum; ++i) {
+        const T* srcPtr = srcs[i];
+        if (srcPtr == nullptr) continue;
+        float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
+
+#pragma unroll Unroll
+        for (int u = 0; u < Unroll; u++) {
+          vec.raw = load<VecBytes>(srcPtr + offset + laneOffset + u * warpSize * vecSize);
+#pragma unroll vecSize
+          for (int j = 0; j < vecSize; ++j) {
+            T v;
+            v.__x = static_cast<__hip_fp8_storage_t>(vec.bytes[j]);
+            accumValFp32[u][j] += float(v) * srcScale;
+          }
+        }
+      }
 
 #pragma unroll Unroll
       for (int u = 0; u < Unroll; u++) {
-        DataType srcVals = load<VecBytes>(srcPtr + offset + laneOffset + u * warpSize * vecSize);
-        float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
 #pragma unroll vecSize
         for (int j = 0; j < vecSize; ++j) {
-          accumValFp32[u][j] += float(reinterpret_cast<const T*>(&srcVals)[j]) * srcScale;
+          T q = T(accumValFp32[u][j]);
+          vec.bytes[j] = static_cast<uint8_t>(q.__x);
+        }
+        store<VecBytes>(dest + offset + laneOffset + u * warpSize * vecSize, vec.raw);
+      }
+
+      offset += elemsPerWarp;
+    }
+  } else {
+    for (size_t iter = 0; iter < numIters; iter++) {
+      float accumValFp32[Unroll][vecSize] = {0};
+
+#pragma unroll AccumNum
+      for (int i = 0; i < AccumNum; ++i) {
+        const T* srcPtr = srcs[i];
+        if (srcPtr == nullptr) continue;
+
+#pragma unroll Unroll
+        for (int u = 0; u < Unroll; u++) {
+          DataType srcVals = load<VecBytes>(srcPtr + offset + laneOffset + u * warpSize * vecSize);
+          float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
+#pragma unroll vecSize
+          for (int j = 0; j < vecSize; ++j) {
+            accumValFp32[u][j] += float(reinterpret_cast<const T*>(&srcVals)[j]) * srcScale;
+          }
         }
       }
-    }
 
-    union {
-      DataType accumVec[Unroll];
-      T accumVal[Unroll][vecSize];
-    };
+      union {
+        DataType accumVec[Unroll];
+        T accumVal[Unroll][vecSize];
+      };
 #pragma unroll Unroll
-    for (int u = 0; u < Unroll; u++) {
+      for (int u = 0; u < Unroll; u++) {
 #pragma unroll vecSize
-      for (int j = 0; j < vecSize; ++j) {
-        accumVal[u][j] = T(accumValFp32[u][j]);
+        for (int j = 0; j < vecSize; ++j) {
+          accumVal[u][j] = T(accumValFp32[u][j]);
+        }
+        store<VecBytes>(dest + offset + laneOffset + u * warpSize * vecSize, accumVec[u]);
       }
-      store<VecBytes>(dest + offset + laneOffset + u * warpSize * vecSize, accumVec[u]);
-    }
 
-    offset += elemsPerWarp;
+      offset += elemsPerWarp;
+    }
   }
 }
 
@@ -490,37 +563,76 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
     cached_srcs[i] = srcs[i];
   }
 
-  for (size_t iter = 0; iter < numIters; ++iter) {
-    float accumValFp32[vecSize] = {0};
+  if constexpr (std::is_same_v<T, __hip_fp8_e4m3> || std::is_same_v<T, __hip_fp8_e4m3_fnuz>) {
+    union {
+      DataType raw;
+      uint8_t bytes[VecBytes];
+    } vec;
+    for (size_t iter = 0; iter < numIters; ++iter) {
+      float accumValFp32[vecSize] = {0};
 
-    DataType srcVals[AccumNum];
+      DataType srcVals[AccumNum];
 #pragma unroll AccumNum
-    for (int i = 0; i < AccumNum; ++i) {
-      if (cached_srcs[i] != nullptr)
-        srcVals[i] = load<VecBytes>(cached_srcs[i] + offset + laneOffset);
-    }
+      for (int i = 0; i < AccumNum; ++i) {
+        if (cached_srcs[i] != nullptr)
+          srcVals[i] = load<VecBytes>(cached_srcs[i] + offset + laneOffset);
+      }
 
 #pragma unroll AccumNum
-    for (int i = 0; i < AccumNum; ++i) {
-      if (cached_srcs[i] != nullptr) {
+      for (int i = 0; i < AccumNum; ++i) {
+        if (cached_srcs[i] != nullptr) {
+          vec.raw = srcVals[i];
 #pragma unroll vecSize
-        for (int j = 0; j < vecSize; ++j) {
-          accumValFp32[j] += float(reinterpret_cast<const T*>(srcVals + i)[j]) * scales[i];
+          for (int j = 0; j < vecSize; ++j) {
+            T v;
+            v.__x = static_cast<__hip_fp8_storage_t>(vec.bytes[j]);
+            accumValFp32[j] += float(v) * scales[i];
+          }
         }
       }
-    }
 
-    union {
-      DataType accumVec;
-      T accumVal[vecSize];
-    };
 #pragma unroll vecSize
-    for (int j = 0; j < vecSize; ++j) {
-      accumVal[j] = T(accumValFp32[j]);
-    }
-    store<VecBytes>(dest + offset + laneOffset, accumVec);
+      for (int j = 0; j < vecSize; ++j) {
+        T q = T(accumValFp32[j]);
+        vec.bytes[j] = static_cast<uint8_t>(q.__x);
+      }
+      store<VecBytes>(dest + offset + laneOffset, vec.raw);
 
-    offset += elemsPerWarp;
+      offset += elemsPerWarp;
+    }
+  } else {
+    for (size_t iter = 0; iter < numIters; ++iter) {
+      float accumValFp32[vecSize] = {0};
+
+      DataType srcVals[AccumNum];
+#pragma unroll AccumNum
+      for (int i = 0; i < AccumNum; ++i) {
+        if (cached_srcs[i] != nullptr)
+          srcVals[i] = load<VecBytes>(cached_srcs[i] + offset + laneOffset);
+      }
+
+#pragma unroll AccumNum
+      for (int i = 0; i < AccumNum; ++i) {
+        if (cached_srcs[i] != nullptr) {
+#pragma unroll vecSize
+          for (int j = 0; j < vecSize; ++j) {
+            accumValFp32[j] += float(reinterpret_cast<const T*>(srcVals + i)[j]) * scales[i];
+          }
+        }
+      }
+
+      union {
+        DataType accumVec;
+        T accumVal[vecSize];
+      };
+#pragma unroll vecSize
+      for (int j = 0; j < vecSize; ++j) {
+        accumVal[j] = T(accumValFp32[j]);
+      }
+      store<VecBytes>(dest + offset + laneOffset, accumVec);
+
+      offset += elemsPerWarp;
+    }
   }
 }
 

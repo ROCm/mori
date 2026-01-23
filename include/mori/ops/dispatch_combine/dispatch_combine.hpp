@@ -298,6 +298,56 @@ struct EpDispatchCombineArgs {
   index_t* interNodeDispDestTokIdMap{nullptr};
   index_t* interNodeChunkFlagCombine{nullptr};
   index_t* interNodeDispSendMap{nullptr};
+
+  template <typename U>
+  __host__ __device__ EpDispatchCombineArgs<U> Rebind() const {
+    EpDispatchCombineArgs<U> out;
+    out.config = config;
+    out.curRankNumToken = curRankNumToken;
+    out.tokenIndices = tokenIndices;
+    out.inpTokenBuf = reinterpret_cast<U*>(inpTokenBuf);
+    out.outTokenBuf = reinterpret_cast<U*>(outTokenBuf);
+    out.weightsBuf = weightsBuf;
+    out.scalesBuf = scalesBuf;
+    out.shmemDispatchInpTokMemObj = shmemDispatchInpTokMemObj;
+    out.shmemCombineInpTokMemObj = shmemCombineInpTokMemObj;
+    out.shmemDispatchOutTokMemObj = shmemDispatchOutTokMemObj;
+    out.shmemCombineOutTokMemObj = shmemCombineOutTokMemObj;
+    out.shmemStagingTokMemObj = shmemStagingTokMemObj;
+    out.shmemInpWeightsMemObj = shmemInpWeightsMemObj;
+    out.shmemDispatchOutWeightsMemObj = shmemDispatchOutWeightsMemObj;
+    out.shmemCombineOutWeightsMemObj = shmemCombineOutWeightsMemObj;
+    out.shmemInpScalesMemObj = shmemInpScalesMemObj;
+    out.shmemOutScalesMemObj = shmemOutScalesMemObj;
+    out.shmemInpIndicesMemObj = shmemInpIndicesMemObj;
+    out.shmemOutIndicesMemObj = shmemOutIndicesMemObj;
+    out.recvTokenNumMemObj = recvTokenNumMemObj;
+    out.sendTokenNumMemObj = sendTokenNumMemObj;
+    out.sendAtomicSignalMemObj = sendAtomicSignalMemObj;
+    out.dispatchGridBarrier = dispatchGridBarrier;
+    out.combineGridBarrier = combineGridBarrier;
+    out.destPeTokenCounter = destPeTokenCounter;
+    out.localPeTokenCounter = localPeTokenCounter;
+    out.dispReceiverIdxMap = dispReceiverIdxMap;
+    out.dispSenderIdxMap = dispSenderIdxMap;
+    out.destPeTokenIdxMap = destPeTokenIdxMap;
+    out.srcPeTokenIdxMap = srcPeTokenIdxMap;
+    out.dispTokOffsetMemObj = dispTokOffsetMemObj;
+    out.dispTokIdToSrcTokIdMemObj = dispTokIdToSrcTokIdMemObj;
+    out.dispDestTokIdMap = dispDestTokIdMap;
+    out.totalRecvTokenNum = totalRecvTokenNum;
+    out.crossDeviceBarrierMemObj = crossDeviceBarrierMemObj;
+    out.crossDeviceBarrierFlag = crossDeviceBarrierFlag;
+    out.interNodeChunkFlagMemObj = interNodeChunkFlagMemObj;
+    out.destNodeTokenCounter = destNodeTokenCounter;
+    out.nodeRecvTokenNumMemObj = nodeRecvTokenNumMemObj;
+    out.blockFlagCounter = blockFlagCounter;
+    out.interNodeBlocksBarrier = interNodeBlocksBarrier;
+    out.interNodeDispDestTokIdMap = interNodeDispDestTokIdMap;
+    out.interNodeChunkFlagCombine = interNodeChunkFlagCombine;
+    out.interNodeDispSendMap = interNodeDispSendMap;
+    return out;
+  }
 };
 
 using EpDispatchCombineArgsVariant =

@@ -26,6 +26,8 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
 
+#include <type_traits>
+
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem.hpp"
 #include "mori/utils/hip_helper.hpp"
@@ -324,8 +326,15 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
           EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeV1) {
           assert(config.useExternalInpBuffer);
-          EpCombineInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
-          EpCombineAll<<<this->multiProcessorCount, block, sharedMemSize, stream>>>(args);
+          if constexpr (std::is_same_v<DataT, __hip_fp8_e4m3> ||
+                        std::is_same_v<DataT, __hip_fp8_e4m3_fnuz>) {
+            EpCombineInterNodeV1KernelFp8Accum<<<grid, block, sharedMemSize, stream>>>(args);
+            EpCombineAllFp8FromBf16<<<this->multiProcessorCount, block, sharedMemSize, stream>>>(
+                args);
+          } else {
+            EpCombineInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
+            EpCombineAll<<<this->multiProcessorCount, block, sharedMemSize, stream>>>(args);
+          }
         } else if (kernelType == KernelType::InterNodeV1LL) {
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);

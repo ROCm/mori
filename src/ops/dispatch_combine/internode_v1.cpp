@@ -748,6 +748,58 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
 }
 
 template <typename T>
+inline __device__ void CombineSyncFp8ToBf16(EpDispatchCombineArgs<T>& args) {
+  DEF_COMMON_VARS;
+
+  index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
+  int tokenPerBlock = core::CeilDiv(totalRecvTokenNum, blockNum);
+  int startTokenIdx = blockId * tokenPerBlock;
+  int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, totalRecvTokenNum);
+
+  for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
+    hip_bfloat16* dst =
+        args.shmemCombineInpTokMemObj->template GetAs<hip_bfloat16*>() + tokenId * config.hiddenDim;
+    const T* src = args.inpTokenBuf + tokenId * config.hiddenDim;
+    for (int j = laneId; j < config.hiddenDim; j += warpSize) {
+      dst[j] = hip_bfloat16(float(src[j]));
+    }
+  }
+
+  if (args.weightsBuf) {
+    for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
+      core::WarpCopy(
+          args.shmemInpWeightsMemObj->template GetAs<float*>() + tokenId * config.numExpertPerToken,
+          args.weightsBuf + tokenId * config.numExpertPerToken, config.numExpertPerToken);
+    }
+  }
+
+  uint64_t barrierFlag = 0;
+  int finishedWarp = 0;
+  if (laneId == 0) {
+    finishedWarp = atomicAdd(args.combineGridBarrier, 1);
+    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
+  }
+  finishedWarp = __shfl(finishedWarp, 0);
+  barrierFlag = __shfl(barrierFlag, 0);
+  if ((finishedWarp + 1) == (blockNum * warpNum)) {
+    if (laneId < config.gpuPerNode) {
+      int destPe = myNode * config.gpuPerNode + laneId;
+      core::AtomicStoreRelaxedSystem(
+          args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>(destPe) + args.config.rank,
+          barrierFlag);
+    }
+    if (laneId == 0) args.combineGridBarrier[0] = 0;
+  }
+
+  uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
+  if (laneId < config.gpuPerNode) {
+    int destPe = myNode * config.gpuPerNode + laneId;
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe) != barrierFlag) {
+    }
+  }
+}
+
+template <typename T>
 inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
 
@@ -1271,6 +1323,97 @@ __global__ void EpCombineAll(EpDispatchCombineArgs<T> args) {
 }
 
 template <typename T>
+__global__ void EpCombineInterNodeV1KernelFp8Accum(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+
+  v1::CombineSyncFp8ToBf16(args);
+  EpDispatchCombineArgs<hip_bfloat16> bf16Args = args.template Rebind<hip_bfloat16>();
+
+  if (blockId < config.rdmaBlockNum) {
+    v1::CombineInterNode(bf16Args);
+  } else {
+    v1::CombineIntraNode(bf16Args);
+  }
+}
+
+template <typename T>
+__global__ void EpCombineAllFp8FromBf16(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+
+  if (globalWarpId == 0) {
+    if (laneId == 0) args.totalRecvTokenNum[0] = 0;
+    if (laneId < nNodes) args.blockFlagCounter[laneId] = 0;
+  }
+  if (args.curRankNumToken == 0) return;
+
+  extern __shared__ char sharedMem[];
+  hip_bfloat16** srcPtrs =
+      reinterpret_cast<hip_bfloat16**>(sharedMem) + warpId * config.numExpertPerToken;
+  float** srcWeightsPtrs = reinterpret_cast<float**>(sharedMem) +
+                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
+
+  size_t hiddenBytesBf16 = config.hiddenDim * sizeof(hip_bfloat16);
+  size_t combXferBytesBf16 =
+      (args.weightsBuf == nullptr) ? hiddenBytesBf16 : hiddenBytesBf16 + weightBytes;
+
+  uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>() +
+                        nNodes * config.MaxNumTokensToRecvPerRank() * combXferBytesBf16;
+
+  index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
+  index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
+
+  for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
+    index_t tokenId = i / warpsPerToken;
+    index_t inTokenPartId = i % warpsPerToken;
+    index_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
+    index_t hiddenDimSize =
+        std::max(0, std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp));
+
+    int lanePe = -1;
+    int laneNode = -1;
+    if (laneId < config.numExpertPerToken) {
+      lanePe = (args.tokenIndices[tokenId * numExpertPerToken + laneId] / config.numExpertPerRank);
+      laneNode = lanePe / config.gpuPerNode;
+    }
+
+    if (laneId < nNodes) {
+      srcPtrs[laneId] = nullptr;
+      srcWeightsPtrs[laneId] = nullptr;
+    }
+
+    for (int n = 0; n < nNodes; n++) {
+      if (__any(laneNode == n) && (laneId == 0)) {
+        int mappedId = (n == myNode) ? tokenId : args.interNodeDispSendMap[nNodes * tokenId + n];
+        uint8_t* base =
+            stagingPtr + (n * config.MaxNumTokensToRecvPerRank() + mappedId) * combXferBytesBf16;
+        srcPtrs[n] = reinterpret_cast<hip_bfloat16*>(base) + hiddenDimOffset;
+        srcWeightsPtrs[n] = reinterpret_cast<float*>(base + hiddenBytesBf16);
+      }
+    }
+    __syncwarp();
+
+    T* outTok = args.shmemCombineOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim +
+                hiddenDimOffset;
+
+    for (int j = laneId; j < hiddenDimSize; j += warpSize) {
+      float sum = 0.0f;
+#pragma unroll
+      for (int n = 0; n < nNodes; n++) {
+        hip_bfloat16* p = srcPtrs[n];
+        if (p != nullptr) sum += float(p[j]);
+      }
+      outTok[j] = T(sum);
+    }
+
+    if (args.weightsBuf && (inTokenPartId == warpsPerToken - 1)) {
+      core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
+                                    tokenId * config.numExpertPerToken,
+                                srcWeightsPtrs, nullptr, nNodes, config.numExpertPerToken);
+    }
+  }
+}
+
+template <typename T>
 __global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
 
@@ -1335,6 +1478,18 @@ template __global__ void EpCombineInterNodeV1KernelLowLatency<__hip_fp8_e4m3>(
 template __global__ void EpCombineInterNodeV1KernelLowLatency<float>(
     EpDispatchCombineArgs<float> args);
 
+#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
+template __global__ void EpCombineInterNodeV1KernelFp8Accum<__hip_fp8_e4m3_fnuz>(
+    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
+template __global__ void EpCombineAllFp8FromBf16<__hip_fp8_e4m3_fnuz>(
+    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
+#endif
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+template __global__ void EpCombineInterNodeV1KernelFp8Accum<__hip_fp8_e4m3>(
+    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
+template __global__ void EpCombineAllFp8FromBf16<__hip_fp8_e4m3>(
+    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
+#endif
 template __global__ void EpCombineAll<hip_bfloat16>(EpDispatchCombineArgs<hip_bfloat16> args);
 #ifdef MORI_FP8_TYPE_FNUZ_ENABLED
 template __global__ void EpCombineAll<__hip_fp8_e4m3_fnuz>(

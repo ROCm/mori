@@ -36,6 +36,12 @@ kernel_type_map = {
     "v1_ll": mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
 }
 
+dtype_map = {
+    "bf16": torch.bfloat16,
+    "fp8_e4m3fnuz": torch.float8_e4m3fnuz,
+    "fp8_e4m3fn": torch.float8_e4m3fn,
+}
+
 
 class EpDispatchCombineTestCase:
     def __init__(
@@ -923,6 +929,7 @@ def test_dispatch_combine(
     max_tokens,
     kernel_type,
     num_qp,
+    dtype,
     cmd="test",
     sweep_token_interval=64,
 ):
@@ -938,8 +945,7 @@ def test_dispatch_combine(
             max_tokens,
             kernel_type,
             num_qp,
-            torch.bfloat16,
-            # torch.float8_e4m3fnuz,
+            dtype_map[dtype],
         )
         test_case.setup()
         if cmd == "test":
@@ -996,6 +1002,13 @@ parser.add_argument(
     default=1,
     help="Number of qp per processing endpoint",
 )
+parser.add_argument(
+    "--dtype",
+    type=str,
+    default="bf16",
+    choices=list(dtype_map.keys()),
+    help="Input dtype",
+)
 args_cli = parser.parse_args()
 
 if __name__ == "__main__":
@@ -1003,7 +1016,6 @@ if __name__ == "__main__":
     gpu_per_node = int(gpu_per_node) if gpu_per_node is not None else 8
     num_node = int(os.environ["WORLD_SIZE"])
 
-    world_size = num_node * gpu_per_node
     torch.multiprocessing.spawn(
         test_dispatch_combine,
         args=(
@@ -1012,6 +1024,7 @@ if __name__ == "__main__":
             args_cli.max_tokens,
             args_cli.kernel_type,
             args_cli.num_qp,
+            args_cli.dtype,
             args_cli.cmd,
             args_cli.sweep_token_interval,
         ),
