@@ -65,8 +65,8 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes,
   }
 
   if(warpId < npes){
-    int remotePe =WarpId;
-    if(lanId == 0)
+    int remotePe =warpId;
+    if(laneId == 0)
       shmem::ShmemQuietThread(remotePe, dstMemObj);
     shmem::ShmemAtomicSizeNonFetchWarp(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8, core::atomicType::AMO_ADD, remotePe);
   }
