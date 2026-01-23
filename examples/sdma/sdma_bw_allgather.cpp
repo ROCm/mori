@@ -894,13 +894,13 @@ void runExperimentMPI(int srcDeviceId, int mpiRank, int mpiSize, const Experimen
     // Write results to file
     report.writeFile();
 
-    std::cout << "Process " << mpiRank << ": Experiment completed, results saved to "
-              << localResultFileName << std::endl;
+    //std::cout << "Process " << mpiRank << ": Experiment completed, results saved to "
+    //          << localResultFileName << std::endl;
 
     // =============================
     // 10. Resource cleanup (including IPC memory)
     // =============================
-    std::cout << "Process " << mpiRank << ": Starting resource cleanup..." << std::endl;
+    //std::cout << "Process " << mpiRank << ": Starting resource cleanup..." << std::endl;
 
     // Close IPC memory handles
     for (int i = 0; i < mpiSize; i++) {
@@ -910,7 +910,7 @@ void runExperimentMPI(int srcDeviceId, int mpiRank, int mpiSize, const Experimen
                 std::cerr << "Process " << mpiRank << ": Warning: Failed to close IPC memory handle for process " << i
                           << ": " << hipGetErrorString(close_err) << std::endl;
             } else {
-                std::cout << "Process " << mpiRank << ": Closed IPC memory for process " << i << std::endl;
+                //std::cout << "Process " << mpiRank << ": Closed IPC memory for process " << i << std::endl;
             }
         }
     }
@@ -931,7 +931,7 @@ void runExperimentMPI(int srcDeviceId, int mpiRank, int mpiSize, const Experimen
         (void)hipDeviceDisablePeerAccess(dstDeviceId);
     }
 
-    std::cout << "Process " << mpiRank << ": Resource cleanup completed" << std::endl;
+    //std::cout << "Process " << mpiRank << ": Resource cleanup completed" << std::endl;
 }
 
 int main(int argc, char** argv)
