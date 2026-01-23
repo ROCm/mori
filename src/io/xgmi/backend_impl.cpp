@@ -54,7 +54,7 @@ void XgmiBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
 
   hipError_t err = hipSetDevice(dstDevice);
   if (err != hipSuccess) {
-    status->Update(StatusCode::ERR_RDMA_OP,
+    status->Update(StatusCode::ERR_GPU_OP,
                    std::string("XGMI: Failed to set device: ") + hipGetErrorString(err));
     return;
   }
@@ -77,7 +77,7 @@ void XgmiBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
   if (srcDevice == dstDevice) {
     err = hipMemcpyAsync(dst, src, size, hipMemcpyDeviceToDevice, stream);
     if (err != hipSuccess) {
-      status->Update(StatusCode::ERR_RDMA_OP,
+      status->Update(StatusCode::ERR_GPU_OP,
                      std::string("XGMI: hipMemcpyAsync failed: ") + hipGetErrorString(err));
       eventPool->PutEvent(event, dstDevice);
       return;
@@ -85,7 +85,7 @@ void XgmiBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
   } else {
     err = hipMemcpyPeerAsync(dst, dstDevice, src, srcDevice, size, stream);
     if (err != hipSuccess) {
-      status->Update(StatusCode::ERR_RDMA_OP,
+      status->Update(StatusCode::ERR_GPU_OP,
                      std::string("XGMI: hipMemcpyPeerAsync failed: ") + hipGetErrorString(err));
       eventPool->PutEvent(event, dstDevice);
       return;
@@ -94,7 +94,7 @@ void XgmiBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
 
   err = hipEventRecord(event, stream);
   if (err != hipSuccess) {
-    status->Update(StatusCode::ERR_RDMA_OP,
+    status->Update(StatusCode::ERR_GPU_OP,
                    std::string("XGMI: hipEventRecord failed: ") + hipGetErrorString(err));
     eventPool->PutEvent(event, dstDevice);
     return;
@@ -106,7 +106,7 @@ void XgmiBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
     if (err == hipSuccess) {
       status->SetCode(StatusCode::SUCCESS);
     } else {
-      status->Update(StatusCode::ERR_RDMA_OP,
+      status->Update(StatusCode::ERR_GPU_OP,
                      std::string("XGMI: hipEventSynchronize failed: ") + hipGetErrorString(err));
     }
     pool->PutEvent(event, dstDevice);
@@ -131,7 +131,7 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
 
   hipError_t err = hipSetDevice(dstDevice);
   if (err != hipSuccess) {
-    status->Update(StatusCode::ERR_RDMA_OP,
+    status->Update(StatusCode::ERR_GPU_OP,
                    std::string("XGMI: Failed to set device: ") + hipGetErrorString(err));
     return;
   }
@@ -163,7 +163,7 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
     if (srcDevice == dstDevice) {
       err = hipMemcpyAsync(dst, src, runSize, hipMemcpyDeviceToDevice, stream);
       if (err != hipSuccess) {
-        status->Update(StatusCode::ERR_RDMA_OP,
+        status->Update(StatusCode::ERR_GPU_OP,
                        std::string("XGMI: hipMemcpyAsync failed at batch ") +
                            std::to_string(failedAtIdx) + ": " + hipGetErrorString(err));
         return false;
@@ -171,7 +171,7 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
     } else {
       err = hipMemcpyPeerAsync(dst, dstDevice, src, srcDevice, runSize, stream);
       if (err != hipSuccess) {
-        status->Update(StatusCode::ERR_RDMA_OP,
+        status->Update(StatusCode::ERR_GPU_OP,
                        std::string("XGMI: hipMemcpyPeerAsync failed at batch ") +
                            std::to_string(failedAtIdx) + ": " + hipGetErrorString(err));
         return false;
@@ -220,7 +220,7 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
 
   err = hipEventRecord(event, stream);
   if (err != hipSuccess) {
-    status->Update(StatusCode::ERR_RDMA_OP,
+    status->Update(StatusCode::ERR_GPU_OP,
                    std::string("XGMI: hipEventRecord failed: ") + hipGetErrorString(err));
     eventPool->PutEvent(event, dstDevice);
     return;
@@ -232,7 +232,7 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
     if (err == hipSuccess) {
       status->SetCode(StatusCode::SUCCESS);
     } else {
-      status->Update(StatusCode::ERR_RDMA_OP,
+      status->Update(StatusCode::ERR_GPU_OP,
                      std::string("XGMI: hipEventSynchronize failed: ") + hipGetErrorString(err));
     }
     pool->PutEvent(event, dstDevice);

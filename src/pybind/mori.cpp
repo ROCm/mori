@@ -427,6 +427,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .value("ERR_NOT_FOUND", mori::io::StatusCode::ERR_NOT_FOUND)
       .value("ERR_RDMA_OP", mori::io::StatusCode::ERR_RDMA_OP)
       .value("ERR_BAD_STATE", mori::io::StatusCode::ERR_BAD_STATE)
+      .value("ERR_GPU_OP", mori::io::StatusCode::ERR_GPU_OP)
       .export_values();
 
   py::enum_<mori::io::PollCqMode>(m, "PollCqMode")
