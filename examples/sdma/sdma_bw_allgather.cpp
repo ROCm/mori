@@ -744,8 +744,8 @@ void runExperimentMPI(int srcDeviceId, int mpiRank, int mpiSize, const Experimen
                 }
                 gettimeofday(&end, NULL);
                 elapsed = get_time_diff(&start, &end);
-                printf("rank:%u, iter:%u, start sec:%llu, usec:%llu, end sec:%llu, usec:%llu, consume time: %.6f, time delta: %.2f%%) \n",
-                   mpiRank, iter, start.tv_sec, start.tv_usec, end.tv_sec, end.tv_usec, elapsed, (elapsed - 0.1) / 0.1 * 100);
+                printf("rank:%u, iter:%u, start sec:%llu, usec:%llu, end sec:%llu, usec:%llu, consume time: %.6f) \n",
+                   mpiRank, iter, start.tv_sec, start.tv_usec, end.tv_sec, end.tv_usec, elapsed);
 
                 expectedSignal++;
             }
