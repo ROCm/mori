@@ -1543,8 +1543,11 @@ inline __device__ void ShmemPutMemNbiThreadKernelAddrImpl(const void* dest, cons
         warp_sq_counter = warp_msntbl_counter;
         __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
                                __HIP_MEMORY_SCOPE_AGENT);
+      } else if constexpr (PrvdType == core::ProviderType::PSD) {
+        warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
+                                                 __HIP_MEMORY_SCOPE_AGENT);
       } else {
-        assert(false);
+        static_assert(false);
       }
     }
     warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
@@ -1556,8 +1559,10 @@ inline __device__ void ShmemPutMemNbiThreadKernelAddrImpl(const void* dest, cons
       my_sq_counter = warp_sq_counter + my_logical_lane_id;
       my_msntbl_counter = warp_msntbl_counter + my_logical_lane_id;
       my_psn_counter = warp_psn_counter + my_logical_lane_id * psnCnt;
+    } else if constexpr (PrvdType == core::ProviderType::PSD) {
+      my_sq_counter = warp_sq_counter + my_logical_lane_id;
     } else {
-      assert(false);
+      static_assert(false);
     }
 
     while (true) {
@@ -1578,13 +1583,17 @@ inline __device__ void ShmemPutMemNbiThreadKernelAddrImpl(const void* dest, cons
     if constexpr (PrvdType == core::ProviderType::MLX5) {
       wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
       dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, 
-                                          false, qpn, srcAddr, lkey, raddr, rkey, transfer_size);
+                                          is_leader, qpn, srcAddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
       wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
       dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter,
-                                          false, qpn, srcAddr, lkey, raddr, rkey, transfer_size);
+                                          is_leader, qpn, srcAddr, lkey, raddr, rkey, transfer_size);
+    } else if constexpr (PrvdType == core::ProviderType::PSD) {
+      wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
+      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, 
+                                          is_leader, qpn, srcAddr, lkey, raddr, rkey, transfer_size);
     } else {
-      assert(false);
+      static_assert(false);
     }
 
     __threadfence_system();
@@ -1692,8 +1701,15 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelAddrImpl(const void* dest, 
     my_sq_counter = warp_sq_counter + my_logical_lane_id;
     my_msntbl_counter = warp_msntbl_counter + my_logical_lane_id;
     my_psn_counter = warp_psn_counter + my_logical_lane_id;
+  } else if constexpr (PrvdType == core::ProviderType::PSD) {
+    if (is_leader) {
+      warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
+                                               __HIP_MEMORY_SCOPE_AGENT);
+    }
+    warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
+    my_sq_counter = warp_sq_counter + my_logical_lane_id;
   } else {
-    assert(false);
+    static_assert(false);
   }
 
   while (true) {
@@ -1718,8 +1734,12 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelAddrImpl(const void* dest, 
     wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
     dbr_val = core::PostWriteInline<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter,
                                               is_leader, qpn, val, raddr, rkey, bytes);
+  } else if constexpr (PrvdType == core::ProviderType::PSD) {
+    wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
+    dbr_val = core::PostWriteInline<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter,
+                                              is_leader, qpn, val, raddr, rkey, bytes);
   } else {
-    assert(false);
+    static_assert(false);
   }
 
   if (is_leader) {
@@ -1822,8 +1842,11 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
       warp_sq_counter = warp_msntbl_counter;
       __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_AGENT);
+    } else if constexpr (PrvdType == core::ProviderType::PSD) {
+      warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_wqes, __ATOMIC_RELAXED,
+                                               __HIP_MEMORY_SCOPE_AGENT);
     } else {
-      assert(false);
+      static_assert(false);
     }
   }
   warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
@@ -1837,8 +1860,10 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
         warp_msntbl_counter + (onlyOneSignal ? my_logical_lane_id : my_logical_lane_id * 2);
     my_psn_counter = warp_psn_counter + (onlyOneSignal ? psnCnt * my_logical_lane_id
                                                        : (psnCnt + 1) * my_logical_lane_id);
+  } else if constexpr (PrvdType == core::ProviderType::PSD) {
+    my_sq_counter = warp_sq_counter + (onlyOneSignal ? my_logical_lane_id : my_logical_lane_id * 2);
   } else {
-    assert(false);
+    static_assert(false);
   }
 
   while (true) {
@@ -1863,8 +1888,12 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
     wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
     core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter, false, qpn,
                               laddr, lkey, raddr, rkey, bytes);
+  } else if constexpr (PrvdType == core::ProviderType::PSD) {
+    wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
+    core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, false, qpn, laddr,
+                              lkey, raddr, rkey, bytes);
   } else {
-    assert(false);
+    static_assert(false);
   }
 
   // signal
@@ -1883,6 +1912,11 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
         dbr_val = core::PostWriteInline<PrvdType>(*wq, my_sq_counter + 1, my_msntbl_counter + 1,
                                                   my_psn_counter + 1, is_leader, qpn, &signalValue,
                                                   signalRaddr, signalRkey, sizeof(signalValue));
+      } else if constexpr (PrvdType == core::ProviderType::PSD) {
+        wq->outstandingWqe[(my_sq_counter + 1) % OUTSTANDING_TABLE_SIZE] = my_sq_counter + 1;
+        dbr_val = core::PostWriteInline<PrvdType>(*wq, my_sq_counter + 1, my_sq_counter + 1,
+                                                  my_sq_counter + 1, is_leader, qpn, &signalValue,
+                                                  signalRaddr, signalRkey, sizeof(signalValue));
       }
     }
   } else if (signalOp == core::atomicType::AMO_ADD ||
@@ -1900,6 +1934,12 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
         wq->outstandingWqe[(my_sq_counter + 1) % wq->sqWqeNum] = my_sq_counter + 1;
         dbr_val = core::PostAtomic<PrvdType>(
             *wq, my_sq_counter + 1, my_msntbl_counter + 1, my_psn_counter + 1, is_leader, qpn,
+            ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
+            sizeof(signalValue), core::atomicType::AMO_ADD);
+      } else if constexpr (PrvdType == core::ProviderType::PSD) {
+        wq->outstandingWqe[(my_sq_counter + 1) % OUTSTANDING_TABLE_SIZE] = my_sq_counter + 1;
+        dbr_val = core::PostAtomic<PrvdType>(
+            *wq, my_sq_counter + 1, my_sq_counter + 1, my_sq_counter + 1, is_leader, qpn,
             ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
             sizeof(signalValue), core::atomicType::AMO_ADD);
       }
@@ -2046,8 +2086,15 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelAddrImpl(const void* d
     my_sq_counter = warp_sq_counter + my_logical_lane_id;
     my_msntbl_counter = warp_msntbl_counter + my_logical_lane_id;
     my_psn_counter = warp_psn_counter + my_logical_lane_id;
+  } else if constexpr (PrvdType == core::ProviderType::PSD) {
+    if (is_leader) {
+      warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
+                                               __HIP_MEMORY_SCOPE_AGENT);
+    }
+    warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
+    my_sq_counter = warp_sq_counter + my_logical_lane_id;
   } else {
-    assert(false);
+    static_assert(false);
   }
 
   while (true) {
@@ -2065,6 +2112,8 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelAddrImpl(const void* d
     wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
   } else if constexpr (PrvdType == core::ProviderType::BNXT) {
     wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
+  } else if constexpr (PrvdType == core::ProviderType::PSD) {
+    wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
   }
 
   uint64_t dbr_val;
@@ -2076,6 +2125,10 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelAddrImpl(const void* d
     dbr_val =
         core::PostAtomic<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter, is_leader,
                                    qpn, laddr, lkey, raddr, rkey, val, val, bytes, amoType);
+  } else if constexpr (PrvdType == core::ProviderType::PSD) {
+    dbr_val =
+        core::PostAtomic<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader, qpn,
+                                   laddr, lkey, raddr, rkey, val, val, bytes, amoType);
   }
 
   // __threadfence_system();
@@ -2189,8 +2242,15 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelAddrImpl(const void* dest, v
     my_sq_counter = warp_sq_counter + my_logical_lane_id;
     my_msntbl_counter = warp_msntbl_counter + my_logical_lane_id;
     my_psn_counter = warp_psn_counter + my_logical_lane_id;
+  } else if constexpr (PrvdType == core::ProviderType::PSD) {
+    if (is_leader) {
+      warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
+                                               __HIP_MEMORY_SCOPE_AGENT);
+    }
+    warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
+    my_sq_counter = warp_sq_counter + my_logical_lane_id;
   } else {
-    assert(false);
+    static_assert(false);
   }
 
   while (true) {
@@ -2208,6 +2268,8 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelAddrImpl(const void* dest, v
     wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
   } else if constexpr (PrvdType == core::ProviderType::BNXT) {
     wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
+  } else if constexpr (PrvdType == core::ProviderType::PSD) {
+    wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
   }
 
   uint64_t dbr_val;
@@ -2219,6 +2281,10 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelAddrImpl(const void* dest, v
     dbr_val =
         core::PostAtomic<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter, is_leader,
                                    qpn, laddr, lkey, raddr, rkey, val, compare, bytes, amoType);
+  } else if constexpr (PrvdType == core::ProviderType::PSD) {
+    dbr_val =
+        core::PostAtomic<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader, qpn,
+                                   laddr, lkey, raddr, rkey, val, compare, bytes, amoType);
   }
 
   // __threadfence_system();
