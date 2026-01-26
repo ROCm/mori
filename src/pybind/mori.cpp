@@ -33,9 +33,12 @@
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
 #include "mori/application/application.hpp"
+#include "mori/core/profiler/constants.hpp"
 #include "mori/io/io.hpp"
 #include "mori/ops/ops.hpp"
+#include "mori/pybind/profiler_registry.hpp"
 #include "mori/shmem/shmem.hpp"
+#include "mori/utils/hip_helper.hpp"
 #include "src/pybind/torch_utils.hpp"
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -179,6 +182,24 @@ torch::Tensor GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle
   return out;
 }
 
+#ifdef ENABLE_PROFILER
+torch::Tensor GetDebugTimeBuf(mori::moe::EpDispatchCombineHandle& handle) {
+  auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+  torch::Tensor tensor =
+      torch::from_blob(handle.profilerConfig.debugTimeBuf, {MAX_DEBUG_TIME_SLOTS}, options);
+  return tensor;
+}
+
+torch::Tensor GetDebugTimeOffset(mori::moe::EpDispatchCombineHandle& handle) {
+  auto options = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+  torch::Tensor tensor =
+      torch::from_blob(handle.profilerConfig.debugTimeOffset, {PROFILER_WARPS_PER_RANK}, options);
+  return tensor;
+}
+#endif
+
+int GetCurDeviceWallClockFreqMhz() { return mori::GetCurDeviceWallClockFreqMhz(); }
+
 void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   std::string className = std::string("EpDispatchCombineHandle");
   pybind11::class_<mori::moe::EpDispatchCombineHandle>(m, className.c_str())
@@ -208,6 +229,14 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
 
   funcName = std::string("get_registered_combine_input_buffer");
   m.def(funcName.c_str(), &GetRegisteredCombineInputBuffer);
+
+#ifdef ENABLE_PROFILER
+  funcName = std::string("get_debug_time_buf");
+  m.def(funcName.c_str(), &GetDebugTimeBuf);
+
+  funcName = std::string("get_debug_time_offset");
+  m.def(funcName.c_str(), &GetDebugTimeOffset);
+#endif
 }
 
 }  // namespace
@@ -296,7 +325,6 @@ int64_t ShmemNumQpPerPe() { return mori::shmem::ShmemNumQpPerPe(); }
 /* ---------------------------------------------------------------------------------------------- */
 /*                                             IO APIs                                            */
 /* ---------------------------------------------------------------------------------------------- */
-namespace {}
 
 namespace mori {
 
@@ -308,16 +336,18 @@ void RegisterMoriOps(py::module_& m) {
       .value("InterNodeV1LL", mori::moe::KernelType::InterNodeV1LL)
       .export_values();
 
+  mori::pybind::RegisterAllProfilerSlots(m);
+
   pybind11::class_<mori::moe::EpDispatchCombineConfig>(m, "EpDispatchCombineConfig")
       .def(pybind11::init<int, int, int, int, int, int, int, int, int, int, int, bool,
-                          moe::KernelType, int, int, int>(),
+                          mori::moe::KernelType, int, int, int>(),
            py::arg("rank") = 0, py::arg("world_size") = 0, py::arg("hidden_dim") = 0,
            py::arg("scale_dim") = 0, py::arg("scale_type_size") = 0,
            py::arg("max_token_type_size") = 0, py::arg("max_num_inp_token_per_rank") = 0,
            py::arg("num_experts_per_rank") = 0, py::arg("num_experts_per_token") = 0,
            py::arg("warp_num_per_block") = 0, py::arg("block_num") = 0,
            py::arg("use_external_inp_buf") = true,
-           py::arg("kernel_type") = moe::KernelType::IntraNode, py::arg("gpu_per_node") = 8,
+           py::arg("kernel_type") = mori::moe::KernelType::IntraNode, py::arg("gpu_per_node") = 8,
            py::arg("rdma_block_num") = 0, py::arg("num_qp_per_pe") = 1)
       .def_readwrite("rank", &mori::moe::EpDispatchCombineConfig::rank)
       .def_readwrite("world_size", &mori::moe::EpDispatchCombineConfig::worldSize)
@@ -338,6 +368,9 @@ void RegisterMoriOps(py::module_& m) {
       .def_readwrite("num_qp_per_pe", &mori::moe::EpDispatchCombineConfig::numQpPerPe);
 
   DeclareEpDispatchCombineHandle(m);
+
+  m.def("get_cur_device_wall_clock_freq_mhz", &GetCurDeviceWallClockFreqMhz,
+        "Returns clock frequency of current device's wall clock");
 }
 
 void RegisterMoriShmem(py::module_& m) {

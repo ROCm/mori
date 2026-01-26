@@ -29,6 +29,8 @@
 #include <variant>
 
 #include "mori/application/application.hpp"
+#include "mori/core/profiler/constants.hpp"
+#include "mori/core/profiler/kernel_profiler.hpp"
 #include "mori/utils/data_types.hpp"
 
 namespace mori {
@@ -249,6 +251,9 @@ class EpDispatchCombineHandle {
   index_t* interNodeChunkFlagCombine{nullptr};
   // Map dispatched rdma token chunk index
   index_t* interNodeDispSendMap{nullptr};
+#ifdef ENABLE_PROFILER
+  mori::core::profiler::ProfilerConfig profilerConfig;
+#endif
 };
 
 template <typename T>
@@ -298,6 +303,9 @@ struct EpDispatchCombineArgs {
   index_t* interNodeDispDestTokIdMap{nullptr};
   index_t* interNodeChunkFlagCombine{nullptr};
   index_t* interNodeDispSendMap{nullptr};
+#ifdef ENABLE_PROFILER
+  mori::core::profiler::ProfilerConfig profilerConfig;
+#endif
 };
 
 using EpDispatchCombineArgsVariant =
@@ -359,6 +367,9 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.interNodeDispDestTokIdMap = handle.interNodeDispDestTokIdMap;
   args.interNodeChunkFlagCombine = handle.interNodeChunkFlagCombine;
   args.interNodeDispSendMap = handle.interNodeDispSendMap;
+#ifdef ENABLE_PROFILER
+  args.profilerConfig = handle.profilerConfig;
+#endif
   return args;
 }
 

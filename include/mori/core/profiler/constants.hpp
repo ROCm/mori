@@ -19,33 +19,12 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#pragma once
 
-#include <hip/hip_runtime.h>
+#define MAX_TRACE_EVENTS_PER_WARP 16384
+#define TRACE_EVENT_SIZE_INT64 2
+#define PROFILER_WARPS_PER_RANK 4096
 
-namespace mori {
-inline int GetMultiProcessorCount(int device) {
-  hipDeviceProp_t prop;
-  HIP_RUNTIME_CHECK(hipGetDeviceProperties(&prop, device));
-  return prop.multiProcessorCount;
-}
+#define MAX_DEBUG_TIME_SLOTS \
+  (MAX_TRACE_EVENTS_PER_WARP * TRACE_EVENT_SIZE_INT64 * PROFILER_WARPS_PER_RANK)
 
-inline int GetCurDeviceMultiProcessorCount() {
-  int device = 0;
-  HIP_RUNTIME_CHECK(hipGetDevice(&device));
-  return GetMultiProcessorCount(device);
-}
-
-inline int GetDeviceWallClockFreqMhz(int device) {
-  int rate;
-  HIP_RUNTIME_CHECK(hipDeviceGetAttribute(&rate, hipDeviceAttributeWallClockRate, device));
-  return rate;
-}
-
-inline int GetCurDeviceWallClockFreqMhz() {
-  int device = 0;
-  HIP_RUNTIME_CHECK(hipGetDevice(&device));
-  return GetDeviceWallClockFreqMhz(device);
-}
-
-}  // namespace mori
+#define MAX_DEBUG_TIMESTAMP_PER_WARP (MAX_TRACE_EVENTS_PER_WARP * TRACE_EVENT_SIZE_INT64)

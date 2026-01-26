@@ -576,6 +576,13 @@ class EpDispatchCombineTestCase:
             f"rank {self.rank} recv {total_recv_num_token} tokens {total_rdma_recv_num_token} rdma tokens"
         )
 
+        if hasattr(mori.cpp, "get_debug_time_buf"):
+            my_times = mori.cpp.get_debug_time_buf(op._handle)
+            my_times.zero_()
+            if hasattr(mori.cpp, "get_debug_time_offset"):
+                my_offsets = mori.cpp.get_debug_time_offset(op._handle)
+                my_offsets.zero_()
+
         torch.cuda.synchronize()
         dist.barrier()
         events[0].record()
@@ -635,6 +642,15 @@ class EpDispatchCombineTestCase:
         comb_bandwidth_list = [
             total_bytes / (1000**3) / (t / (10**3)) for t in comb_duration_list
         ]
+
+        if hasattr(mori.cpp, "get_debug_time_buf"):
+            output_filename = (
+                f"trace_rank_{self.rank}_{time.strftime('%m%d_%H%M%S')}.json"
+            )
+            mori.kernel_profiler.export_to_perfetto(my_times, output_filename)
+            if self.rank == 0:
+                print(f"Profiling data exported to {output_filename}")
+
         return (
             disp_duration_list,
             disp_rdma_bandwidth_list,
@@ -745,6 +761,9 @@ class EpDispatchCombineTestCase:
                     f"  bandwidth {comb_bandwidth_GB_list[i]} avg {sum(comb_bandwidth_GB_list[i]) / self.config.world_size:.2f} GB/s"
                 )
 
+        if repeat == 1:
+            return
+
         def collect_metrics(per_round_data):
             minv = min([min(data) for data in per_round_data])
             maxv = max([max(data) for data in per_round_data])
@@ -840,6 +859,20 @@ class EpDispatchCombineTestCase:
             comb_lat,
         )
 
+    def profile_dispatch_combine(self, max_num_token):
+        op = mori.ops.EpDispatchCombineOp(self.config)
+        test_data = self.gen_test_data(
+            max_num_token=max_num_token, use_max_token_num=True
+        )
+
+        repeat = 3
+        if not hasattr(mori.cpp, "get_debug_time_buf"):
+            raise RuntimeError(
+                "to use profiling command, re-compile MORI with ENABLE_PROFILER=ON"
+            )
+
+        self.run_bench_once(max_num_token, op, test_data, repeat)
+
 
 def sweep_bench_dispatch_combine(
     local_rank,
@@ -930,7 +963,7 @@ def test_dispatch_combine(
     node_rank = int(os.environ["RANK"])
     global_rank = node_rank * gpu_per_node + local_rank
 
-    if cmd in ("test", "bench", "stress"):
+    if cmd in ("test", "bench", "stress", "profile"):
         test_case = EpDispatchCombineTestCase(
             global_rank,
             gpu_per_node,
@@ -948,6 +981,8 @@ def test_dispatch_combine(
             test_case.bench_dispatch_combine(max_tokens)
         elif cmd == "stress":
             test_case.stress_dispatch_combine()
+        elif cmd == "profile":
+            test_case.profile_dispatch_combine(max_tokens)
         test_case.cleanup()
     elif cmd == "sweep_bench":
         sweep_bench_dispatch_combine(
@@ -968,7 +1003,7 @@ parser.add_argument(
     "--cmd",
     type=str,
     default="test",
-    choices=["test", "bench", "stress", "sweep_bench"],
+    choices=["test", "bench", "stress", "sweep_bench", "profile"],
     help="Available subcommands: test, bench, stress, sweep_bench",
 )
 parser.add_argument(

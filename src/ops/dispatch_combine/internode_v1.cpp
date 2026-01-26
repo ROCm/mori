@@ -25,6 +25,11 @@
 #include "mori/core/core.hpp"
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 #include "mori/shmem/shmem.hpp"
+#ifdef ENABLE_PROFILER
+#include "mori/core/profiler/constants.hpp"
+#include "mori/core/profiler/kernel_profiler.hpp"
+#include "mori/profiler/profiler.hpp"
+#endif
 
 namespace mori {
 namespace moe {
@@ -32,33 +37,35 @@ namespace moe {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                   EpDispatchInterNodeV1Kernel                                  */
 /* ---------------------------------------------------------------------------------------------- */
-#define DEF_COMMON_VARS                                                                         \
-  const EpDispatchCombineConfig& config = args.config;                                          \
-  int thdId = threadIdx.x;                                                                      \
-  int thdNum = blockDim.x;                                                                      \
-  int laneId = threadIdx.x & (warpSize - 1);                                                    \
-  int warpId = thdId / warpSize;                                                                \
-  int warpNum = blockDim.x / warpSize;                                                          \
-  int blockNum = gridDim.x;                                                                     \
-  int blockId = blockIdx.x;                                                                     \
-  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;                                      \
-  int globalThdNum = gridDim.x * blockDim.x;                                                    \
-  int globalWarpId = blockIdx.x * warpNum + warpId;                                             \
-  int globalWarpNum = gridDim.x * warpNum;                                                      \
-  int nullTokenId = config.worldSize * config.MaxNumTokensToRecv();                             \
-  int myPe = config.rank;                                                                       \
-  int npes = config.worldSize;                                                                  \
-  int myNode = myPe / config.gpuPerNode;                                                        \
-  int nNodes = npes / config.gpuPerNode;                                                        \
-  int numExpertPerToken = config.numExpertPerToken;                                             \
-  assert(numExpertPerToken < warpSize);                                                         \
-  size_t hiddenBytes = config.hiddenDim * sizeof(T);                                            \
-  size_t indexBytes = config.numExpertPerToken * sizeof(index_t);                               \
-  size_t weightBytes = config.numExpertPerToken * sizeof(float);                                \
-  size_t srcTokenIdBytes = sizeof(index_t);                                                     \
-  size_t scaleBytes = (args.config.scaleDim == 0) ? 0 : config.scaleDim * config.scaleTypeSize; \
-  size_t xferBytes = hiddenBytes + indexBytes + weightBytes + srcTokenIdBytes + scaleBytes;     \
-  size_t combXferBytes = (args.weightsBuf == nullptr) ? hiddenBytes : hiddenBytes + weightBytes;
+#define DEF_COMMON_VARS                                                                          \
+  const EpDispatchCombineConfig& config = args.config;                                           \
+  int thdId = threadIdx.x;                                                                       \
+  int thdNum = blockDim.x;                                                                       \
+  int laneId = threadIdx.x & (warpSize - 1);                                                     \
+  int warpId = thdId / warpSize;                                                                 \
+  int warpNum = blockDim.x / warpSize;                                                           \
+  int blockNum = gridDim.x;                                                                      \
+  int blockId = blockIdx.x;                                                                      \
+  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;                                       \
+  int globalThdNum = gridDim.x * blockDim.x;                                                     \
+  int globalWarpId = blockIdx.x * warpNum + warpId;                                              \
+  int globalWarpNum = gridDim.x * warpNum;                                                       \
+  int nullTokenId = config.worldSize * config.MaxNumTokensToRecv();                              \
+  int myPe = config.rank;                                                                        \
+  int npes = config.worldSize;                                                                   \
+  int myNode = myPe / config.gpuPerNode;                                                         \
+  int nNodes = npes / config.gpuPerNode;                                                         \
+  int numExpertPerToken = config.numExpertPerToken;                                              \
+  assert(numExpertPerToken < warpSize);                                                          \
+  size_t hiddenBytes = config.hiddenDim * sizeof(T);                                             \
+  size_t indexBytes = config.numExpertPerToken * sizeof(index_t);                                \
+  size_t weightBytes = config.numExpertPerToken * sizeof(float);                                 \
+  size_t srcTokenIdBytes = sizeof(index_t);                                                      \
+  size_t scaleBytes = (args.config.scaleDim == 0) ? 0 : config.scaleDim * config.scaleTypeSize;  \
+  size_t xferBytes = hiddenBytes + indexBytes + weightBytes + srcTokenIdBytes + scaleBytes;      \
+  size_t combXferBytes = (args.weightsBuf == nullptr) ? hiddenBytes : hiddenBytes + weightBytes; \
+  IF_ENABLE_PROFILER(                                                                            \
+      INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId))
 
 namespace v1 {
 template <typename T>
@@ -106,8 +113,8 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, in
 template <typename T>
 inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::DispatchIntra);
 
-  // Distribute tokens evenly to all blocks
   int blockOffset = config.rdmaBlockNum;
   int xgmiBlockNum = blockNum - config.rdmaBlockNum;
   int tokenPerBlock = (args.curRankNumToken + xgmiBlockNum - 1) / xgmiBlockNum;
@@ -139,6 +146,7 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
       DispatchIntraNodeBlock(args, tokenId, inTokenExpertId, destPe, localPeTokenCounter);
     }
   }
+
   if (laneId < config.gpuPerNode) {
     int destPe = myNode * config.gpuPerNode + laneId;
     int counter = atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
@@ -148,8 +156,8 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
 template <typename T, bool DEDUP>
 inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::DispatchInterNodeSend);
 
-  // Distribute tokens evenly to all blocks
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
   int totalChunkNum = core::CeilDiv(args.curRankNumToken, warpSize);
   int blockChunkNum = core::CeilDiv(totalChunkNum, config.rdmaBlockNum);
@@ -274,55 +282,8 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::DispatchInterNodeLLSend);
 
-  // NOTE: comment out the following code as we use separate kernels to copy data
-  /*
-  // Distribute tokens evenly to all blocks (optimized for LL scenario with small token counts)
-  int tokenPerBlock = core::CeilDiv(args.curRankNumToken, config.rdmaBlockNum);
-
-  int startTokenIdx = blockId * tokenPerBlock;
-  int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, args.curRankNumToken);
-
-  // First copy to staging buffer
-  for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
-    uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
-    size_t stagingTokOffset = tokenId * xferBytes;
-    core::WarpCopy<uint8_t, 4>(stagingPtr + stagingTokOffset,
-                               reinterpret_cast<uint8_t*>(args.inpTokenBuf) + tokenId * hiddenBytes,
-                               hiddenBytes);
-    core::WarpCopy<uint8_t, 4>(stagingPtr + stagingTokOffset + hiddenBytes,
-                               reinterpret_cast<uint8_t*>(args.tokenIndices) + tokenId * indexBytes,
-                               indexBytes);
-    core::WarpCopy<uint8_t, 4>(stagingPtr + stagingTokOffset + hiddenBytes + indexBytes,
-                               reinterpret_cast<uint8_t*>(args.weightsBuf) + tokenId * weightBytes,
-                               weightBytes);
-    if (args.scalesBuf && (scaleBytes > 0))
-      core::WarpCopy<uint8_t, 4>(
-          stagingPtr + stagingTokOffset + hiddenBytes + indexBytes + weightBytes,
-          reinterpret_cast<uint8_t*>(args.scalesBuf) + tokenId * scaleBytes, scaleBytes);
-    if (laneId == 0)
-      reinterpret_cast<index_t*>(stagingPtr + stagingTokOffset + hiddenBytes + indexBytes +
-                                 weightBytes + scaleBytes)[0] =
-          tokenId + config.rank * config.maxNumInpTokenPerRank;
-  }
-  __syncthreads();
-
-  // sync all rdma blocks
-  int finishedWarp = 0;
-  if (laneId == 0) finishedWarp = atomicAdd(args.interNodeBlocksBarrier, 1);
-  finishedWarp = __shfl(finishedWarp, 0);
-  if ((finishedWarp + 1) == (config.rdmaBlockNum * warpNum)) {
-    if (laneId == 0) {
-      __hip_atomic_store(&args.interNodeBlocksBarrier[0], 0, __ATOMIC_RELEASE,
-                         __HIP_MEMORY_SCOPE_AGENT);
-    }
-  } else {
-    if (laneId == 0) {
-      while (__hip_atomic_load(&args.interNodeBlocksBarrier[0], __ATOMIC_ACQUIRE,
-                               __HIP_MEMORY_SCOPE_AGENT) != 0);
-    }
-  }
-  */
   // Then send to other nodes
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
   int totalChunkNum = core::CeilDiv(args.curRankNumToken, warpSize);
@@ -390,6 +351,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::DispatchInterNodeRecv);
 
   constexpr int numRecvBlock = 8;
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
@@ -409,7 +371,6 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
     int node = (myNode + 1 + i) % nNodes;
     int startTokenIdx = k * warpSize;
 
-    // Poll completion flags
     uint64_t thisChunkTokenNum = 0;
     index_t nodeFlag = 0;
     if (laneId == 0) {
@@ -490,6 +451,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::DispatchInterNodeLLRecv);
 
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
 
@@ -589,6 +551,7 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::DispatchSync);
 
   int nodePeOffset = myNode * config.gpuPerNode;
   int finishedWarp = 0;
@@ -645,6 +608,7 @@ __global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
 template <typename T>
 __global__ void EpDispatchCopyToStaging(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::EpDispatchCopyToStaging);
   if (args.curRankNumToken == 0) return;
 
   index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
@@ -702,8 +666,8 @@ namespace v1 {
 template <typename T>
 inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::CombineSync);
 
-  // Copy input to shmem registered buffer so that other GPUs can access directly
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   int tokenPerBlock = core::CeilDiv(totalRecvTokenNum, blockNum);
   int startTokenIdx = blockId * tokenPerBlock;
@@ -720,7 +684,6 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
     }
   }
 
-  // After all warps copy done, set barrier flag
   uint64_t barrierFlag = 0;
   int finishedWarp = 0;
   if (laneId == 0) {
@@ -738,7 +701,6 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
     }
     if (laneId == 0) args.combineGridBarrier[0] = 0;
   }
-  // Wait other pes to set flag
   uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
   if (laneId < config.gpuPerNode) {
     int destPe = myNode * config.gpuPerNode + laneId;
@@ -750,8 +712,8 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::CombineIntraNode);
 
-  // Distribute tokens evenly to all blocks
   int blockOffset = config.rdmaBlockNum;
   int xgmiBlockNum = blockNum - config.rdmaBlockNum;
 
@@ -794,6 +756,8 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::CombineIntraNodeLL);
+
   if (args.curRankNumToken == 0) return;
 
   // Distribute tokens evenly to all blocks
@@ -847,6 +811,7 @@ inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::CombineInterNode);
 
   constexpr int numRecvBlock = 8;
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
@@ -868,7 +833,6 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
 
   int processedCount = 0;
   int batchStart = 0;
-
   while (processedCount < totalBids) {
     uint32_t processedMask = 0;
     int currentBatchSize = std::min(totalBids - processedCount, 32);
@@ -892,6 +856,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
 
           uint64_t thisChunkTokenNum = 0;
           int startTokenIdx = k * warpSize;
+
           if (laneId == 0) {
             thisChunkTokenNum = chunkFlag[node * maxChunkNum + k];
             if (thisChunkTokenNum == 0) {
@@ -910,6 +875,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
             for (int j = startTokenIdx + (bid % numRecvBlock) * warpNum + warpId; j < endTokenIdx;
                  j += numRecvBlock * warpNum) {
               int tokIdx = node * config.MaxNumTokensToRecvPerRank() + j;
+
               if (laneId < config.numExpertPerToken) {
                 srcPtrs[laneId] = nullptr;
                 srcWeightsPtr[laneId] = nullptr;
@@ -927,8 +893,10 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
                 }
                 args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId] = 0;
               }
+
               core::WarpAccum<T, 4>(reinterpret_cast<T*>(stagingPtr + tokIdx * combXferBytes),
                                     srcPtrs, nullptr, config.numExpertPerToken, config.hiddenDim);
+
               if (args.weightsBuf) {
                 core::WarpAccum<float, 4>(
                     reinterpret_cast<float*>(stagingPtr + tokIdx * combXferBytes + hiddenBytes),
@@ -973,6 +941,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   // to other nodes before participating in the cross-device barrier, so a remote node
   // never observes a non-zero flag that is subsequently overwritten with zero
   __threadfence_system();
+
   int finishedWarp = 0;
   uint64_t barrierFlag = 0;
   if (laneId == 0) {
@@ -998,7 +967,6 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
 
-    // Wait other nodes
     uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
@@ -1012,6 +980,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::CombineInterNodeLL);
 
   constexpr int numRecvBlock = 8;
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
@@ -1145,6 +1114,8 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void CombineAll(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::CombineAll);
+
   if (args.curRankNumToken == 0) return;
   // Wait all warps
   if (laneId == 0) {
@@ -1216,6 +1187,8 @@ __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
 template <typename T>
 __global__ void EpCombineAll(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::EpCombineAll);
+
   if (globalWarpId == 0) {
     if (laneId == 0) args.totalRecvTokenNum[0] = 0;
     if (laneId < nNodes) args.blockFlagCounter[laneId] = 0;
