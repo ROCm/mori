@@ -38,6 +38,7 @@
 #include "mori/ops/ops.hpp"
 #include "mori/pybind/profiler_registry.hpp"
 #include "mori/shmem/shmem.hpp"
+#include "mori/utils/hip_helper.hpp"
 #include "src/pybind/torch_utils.hpp"
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -196,6 +197,8 @@ torch::Tensor GetDebugTimeOffset(mori::moe::EpDispatchCombineHandle& handle) {
   return tensor;
 }
 #endif
+
+int GetCurDeviceWallClockFreqMhz() { return mori::GetCurDeviceWallClockFreqMhz(); }
 
 void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   std::string className = std::string("EpDispatchCombineHandle");
@@ -365,6 +368,9 @@ void RegisterMoriOps(py::module_& m) {
       .def_readwrite("num_qp_per_pe", &mori::moe::EpDispatchCombineConfig::numQpPerPe);
 
   DeclareEpDispatchCombineHandle(m);
+
+  m.def("get_cur_device_wall_clock_freq_mhz", &GetCurDeviceWallClockFreqMhz,
+        "Returns clock frequency of current device's wall clock");
 }
 
 void RegisterMoriShmem(py::module_& m) {

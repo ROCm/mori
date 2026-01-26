@@ -113,6 +113,7 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, in
 template <typename T>
 inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::DispatchIntra);
 
   int blockOffset = config.rdmaBlockNum;
   int xgmiBlockNum = blockNum - config.rdmaBlockNum;
@@ -122,7 +123,6 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
 
   int localPeTokenCounter = 0;
 
-  MORI_TRACE_SPAN(profiler, Slot::DispatchIntra);
   for (int i = warpId; i < (endTokenIdx - startTokenIdx) * config.numExpertPerToken; i += warpNum) {
     index_t tokenId = i / config.numExpertPerToken + startTokenIdx;
     index_t destPe =
@@ -156,6 +156,7 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
 template <typename T, bool DEDUP>
 inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::DispatchInterNodeSend);
 
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
   int totalChunkNum = core::CeilDiv(args.curRankNumToken, warpSize);
@@ -281,56 +282,8 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
-
-  // NOTE: comment out the following code as we use separate kernels to copy data
-  /*
-  // Distribute tokens evenly to all blocks (optimized for LL scenario with small token counts)
-  int tokenPerBlock = core::CeilDiv(args.curRankNumToken, config.rdmaBlockNum);
-
-  int startTokenIdx = blockId * tokenPerBlock;
-  int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, args.curRankNumToken);
-
-  // First copy to staging buffer
-  for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
-    uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
-    size_t stagingTokOffset = tokenId * xferBytes;
-    core::WarpCopy<uint8_t, 4>(stagingPtr + stagingTokOffset,
-                               reinterpret_cast<uint8_t*>(args.inpTokenBuf) + tokenId * hiddenBytes,
-                               hiddenBytes);
-    core::WarpCopy<uint8_t, 4>(stagingPtr + stagingTokOffset + hiddenBytes,
-                               reinterpret_cast<uint8_t*>(args.tokenIndices) + tokenId * indexBytes,
-                               indexBytes);
-    core::WarpCopy<uint8_t, 4>(stagingPtr + stagingTokOffset + hiddenBytes + indexBytes,
-                               reinterpret_cast<uint8_t*>(args.weightsBuf) + tokenId * weightBytes,
-                               weightBytes);
-    if (args.scalesBuf && (scaleBytes > 0))
-      core::WarpCopy<uint8_t, 4>(
-          stagingPtr + stagingTokOffset + hiddenBytes + indexBytes + weightBytes,
-          reinterpret_cast<uint8_t*>(args.scalesBuf) + tokenId * scaleBytes, scaleBytes);
-    if (laneId == 0)
-      reinterpret_cast<index_t*>(stagingPtr + stagingTokOffset + hiddenBytes + indexBytes +
-                                 weightBytes + scaleBytes)[0] =
-          tokenId + config.rank * config.maxNumInpTokenPerRank;
-  }
-  __syncthreads();
-
-  // sync all rdma blocks
-  int finishedWarp = 0;
-  if (laneId == 0) finishedWarp = atomicAdd(args.interNodeBlocksBarrier, 1);
-  finishedWarp = __shfl(finishedWarp, 0);
-  if ((finishedWarp + 1) == (config.rdmaBlockNum * warpNum)) {
-    if (laneId == 0) {
-      __hip_atomic_store(&args.interNodeBlocksBarrier[0], 0, __ATOMIC_RELEASE,
-                         __HIP_MEMORY_SCOPE_AGENT);
-    }
-  } else {
-    if (laneId == 0) {
-      while (__hip_atomic_load(&args.interNodeBlocksBarrier[0], __ATOMIC_ACQUIRE,
-                               __HIP_MEMORY_SCOPE_AGENT) != 0);
-    }
-  }
-  */
   MORI_TRACE_SPAN(profiler, Slot::DispatchInterNodeLLSend);
+
   // Then send to other nodes
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
   int totalChunkNum = core::CeilDiv(args.curRankNumToken, warpSize);
@@ -398,6 +351,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::DispatchInterNodeRecv);
 
   constexpr int numRecvBlock = 8;
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
@@ -712,6 +666,7 @@ namespace v1 {
 template <typename T>
 inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::CombineSync);
 
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   int tokenPerBlock = core::CeilDiv(totalRecvTokenNum, blockNum);
@@ -757,6 +712,7 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::CombineIntraNode);
 
   int blockOffset = config.rdmaBlockNum;
   int xgmiBlockNum = blockNum - config.rdmaBlockNum;
@@ -800,6 +756,8 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::CombineIntraNodeLL);
+
   if (args.curRankNumToken == 0) return;
 
   // Distribute tokens evenly to all blocks
@@ -853,6 +811,8 @@ inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::CombineInterNode);
+
   constexpr int numRecvBlock = 8;
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
 
@@ -1020,6 +980,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::CombineInterNodeLL);
 
   constexpr int numRecvBlock = 8;
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
@@ -1153,6 +1114,8 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void CombineAll(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::CombineAll);
+
   if (args.curRankNumToken == 0) return;
   // Wait all warps
   if (laneId == 0) {
@@ -1224,6 +1187,8 @@ __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
 template <typename T>
 __global__ void EpCombineAll(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::EpCombineAll);
+
   if (globalWarpId == 0) {
     if (laneId == 0) args.totalRecvTokenNum[0] = 0;
     if (laneId < nNodes) args.blockFlagCounter[laneId] = 0;

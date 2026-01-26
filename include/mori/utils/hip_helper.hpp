@@ -35,4 +35,17 @@ inline int GetCurDeviceMultiProcessorCount() {
   HIP_RUNTIME_CHECK(hipGetDevice(&device));
   return GetMultiProcessorCount(device);
 }
+
+inline int GetDeviceWallClockFreqMhz(int device) {
+  int rate;
+  HIP_RUNTIME_CHECK(hipDeviceGetAttribute(&rate, hipDeviceAttributeWallClockRate, device));
+  return rate;
+}
+
+inline int GetCurDeviceWallClockFreqMhz() {
+  int device = 0;
+  HIP_RUNTIME_CHECK(hipGetDevice(&device));
+  return GetDeviceWallClockFreqMhz(device);
+}
+
 }  // namespace mori

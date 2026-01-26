@@ -23,6 +23,7 @@
 import json
 import warnings
 from collections import defaultdict
+from mori import cpp as mori_cpp
 
 
 def _parse_trace_events(trace_buffer):
@@ -140,10 +141,13 @@ def export_to_perfetto(
     trace_buffer,
     filename="trace.json",
     slot_map=None,
-    gpu_freq_ghz=1.7,
+    gpu_freq_ghz=None,
     validate_pairs=True,
     sanitize_orphans=True,
 ):
+    if not gpu_freq_ghz:
+        gpu_freq_ghz = mori_cpp.get_cur_device_wall_clock_freq_mhz() / 1e6
+
     if slot_map is None:
         slot_map = _discover_all_slots()
         if not slot_map:
