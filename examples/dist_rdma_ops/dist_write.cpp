@@ -541,6 +541,12 @@ void distRdmaOps(int argc, char* argv[]) {
   assert(totalSize <= 0x1000000000ULL && "Error: totalSize cannot exceed 64GB!");
   
   bool useVMM = args.getUseVMM();
+  size_t bufferSize = totalSize;  // Actual allocated size (may differ from totalSize for VMM)
+  size_t vmmChunkSize = 0;         // VMM chunk size for cleanup
+  
+  // Exchange GPU IDs across all ranks for VMM cross-GPU access
+  std::vector<int> all_gpu_ids(world_size);
+  bootNet.Allgather(&gpu_id, all_gpu_ids.data(), sizeof(int));
   
   if (useVMM) {
     // Use VMM-based allocation
@@ -549,13 +555,13 @@ void distRdmaOps(int argc, char* argv[]) {
     
     // Determine chunk size (align to 64MB for VMM)
     constexpr size_t DEFAULT_VMM_CHUNK_SIZE = 64 * 1024 * 1024;  // 64MB
-    size_t chunkSize = DEFAULT_VMM_CHUNK_SIZE;
+    vmmChunkSize = DEFAULT_VMM_CHUNK_SIZE;
     
     // Round up totalSize to multiple of chunkSize
-    size_t alignedSize = ((totalSize + chunkSize - 1) / chunkSize) * chunkSize;
+    bufferSize = ((totalSize + vmmChunkSize - 1) / vmmChunkSize) * vmmChunkSize;
     
     // Reserve virtual address space
-    HIP_RUNTIME_CHECK(hipMemAddressReserve(&buffer, alignedSize, chunkSize, nullptr, 0));
+    HIP_RUNTIME_CHECK(hipMemAddressReserve(&buffer, bufferSize, vmmChunkSize, nullptr, 0));
     
     // Create physical memory handle
     hipMemAllocationProp allocProp = {};
@@ -564,23 +570,33 @@ void distRdmaOps(int argc, char* argv[]) {
     allocProp.location.id = gpu_id;
     allocProp.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
     
-    HIP_RUNTIME_CHECK(hipMemCreate(&vmmHandle, alignedSize, &allocProp, 0));
+    HIP_RUNTIME_CHECK(hipMemCreate(&vmmHandle, bufferSize, &allocProp, 0));
     
     // Map physical memory to virtual address
-    HIP_RUNTIME_CHECK(hipMemMap(buffer, alignedSize, 0, vmmHandle, 0));
+    HIP_RUNTIME_CHECK(hipMemMap(buffer, bufferSize, 0, vmmHandle, 0));
     
-    // Set access permissions
-    hipMemAccessDesc accessDesc;
-    accessDesc.location.type = hipMemLocationTypeDevice;
-    accessDesc.location.id = gpu_id;
-    accessDesc.flags = hipMemAccessFlagsProtReadWrite;
-    HIP_RUNTIME_CHECK(hipMemSetAccess(buffer, alignedSize, &accessDesc, 1));
+    // Set access permissions for ALL GPUs to enable RDMA cross-GPU access
+    std::vector<hipMemAccessDesc> accessDescs(world_size);
+    for (int i = 0; i < world_size; ++i) {
+      accessDescs[i].location.type = hipMemLocationTypeDevice;
+      accessDescs[i].location.id = all_gpu_ids[i];
+      accessDescs[i].flags = hipMemAccessFlagsProtReadWrite;
+    }
+    HIP_RUNTIME_CHECK(hipMemSetAccess(buffer, bufferSize, accessDescs.data(), world_size));
+    
+    std::cout << "Local rank " << local_rank << " VMM buffer: set access for " << world_size 
+              << " GPUs [";
+    for (int i = 0; i < world_size; ++i) {
+      std::cout << all_gpu_ids[i];
+      if (i < world_size - 1) std::cout << ", ";
+    }
+    std::cout << "]" << std::endl;
     
     // Initialize buffer
     HIP_RUNTIME_CHECK(hipMemset(buffer, local_rank, totalSize));
     
     std::cout << "Local rank " << local_rank << " VMM buffer allocated at " << buffer 
-              << " (aligned size=" << alignedSize << ")" << std::endl;
+              << " (requested=" << totalSize << " aligned=" << bufferSize << ")" << std::endl;
   } else {
     // Use standard hipMalloc
     std::cout << "Local rank " << local_rank << " using hipMalloc for buffer (size=" 
@@ -594,8 +610,9 @@ void distRdmaOps(int argc, char* argv[]) {
 
   // assert(!posix_memalign(&buffer_1, 4096, allreduce_size));
   // memset(buffer_1, 1, allreduce_size);
+  // Register RDMA memory region with the actual allocated size (bufferSize, not totalSize)
   RdmaMemoryRegion mr_handle =
-      device_context->RegisterRdmaMemoryRegion(buffer, totalSize, MR_ACCESS_FLAG);
+      device_context->RegisterRdmaMemoryRegion(buffer, bufferSize, MR_ACCESS_FLAG);
   std::vector<RdmaMemoryRegion> global_mr_handles(world_size);
   bootNet.Allgather(&mr_handle, global_mr_handles.data(), sizeof(mr_handle));
   global_mr_handles[local_rank] = mr_handle;
@@ -734,16 +751,13 @@ void distRdmaOps(int argc, char* argv[]) {
   
   // Cleanup buffer
   if (useVMM) {
-    // VMM cleanup
-    constexpr size_t DEFAULT_VMM_CHUNK_SIZE = 64 * 1024 * 1024;  // 64MB
-    size_t chunkSize = DEFAULT_VMM_CHUNK_SIZE;
-    size_t alignedSize = ((totalSize + chunkSize - 1) / chunkSize) * chunkSize;
-    
-    HIP_RUNTIME_CHECK(hipMemUnmap(buffer, alignedSize));
+    // VMM cleanup using the saved bufferSize
+    HIP_RUNTIME_CHECK(hipMemUnmap(buffer, bufferSize));
     HIP_RUNTIME_CHECK(hipMemRelease(vmmHandle));
-    HIP_RUNTIME_CHECK(hipMemAddressFree(buffer, alignedSize));
+    HIP_RUNTIME_CHECK(hipMemAddressFree(buffer, bufferSize));
     
-    std::cout << "Local rank " << local_rank << " VMM buffer cleaned up" << std::endl;
+    std::cout << "Local rank " << local_rank << " VMM buffer cleaned up (size=" 
+              << bufferSize << ")" << std::endl;
   } else {
     // Standard hipFree
     HIP_RUNTIME_CHECK(hipFree(buffer));
