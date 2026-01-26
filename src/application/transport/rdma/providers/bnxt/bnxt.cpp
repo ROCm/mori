@@ -437,7 +437,7 @@ void BnxtQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
   status = bnxt_re_dv_modify_qp_udp_sport(qp, selected_udp_sport);
   if (status) {
     MORI_APP_WARN("Failed to set UDP sport {} for QP {}: error code {}", selected_udp_sport, qpn,
-                   status);
+                  status);
   }
   MORI_APP_TRACE("bnxt_re_dv_modify_qp_udp_sport is done, return {}", status);
 }
@@ -457,7 +457,16 @@ BnxtDeviceContext::BnxtDeviceContext(RdmaDevice* rdma_device, ibv_pd* in_pd)
   pdn = dvpd.pdn;
 }
 
-BnxtDeviceContext::~BnxtDeviceContext() {}
+BnxtDeviceContext::~BnxtDeviceContext() {
+  for (auto& it : qpPool) {
+    delete it.second;
+  }
+  qpPool.clear();
+  for (auto& it : cqPool) {
+    delete it.second;
+  }
+  cqPool.clear();
+}
 
 RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& config) {
   ibv_context* context = GetIbvContext();
