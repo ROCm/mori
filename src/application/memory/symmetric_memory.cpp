@@ -548,10 +548,10 @@ void SymmMemManager::FinalizeVMMHeap() {
       void* chunkPtr =
           static_cast<void*>(static_cast<char*>(vmmPeerBasePtrs[rank]) + i * vmmChunkSize);
       
-      // Close shareable file descriptor to prevent FD leak
+      // Close shareable file descriptor to prevent FD leak (shared by P2P and RDMA)
       if (vmmChunks[i].shareableHandle != -1) {
         close(vmmChunks[i].shareableHandle);
-        MORI_APP_TRACE("FinalizeVMMHeap: Closed FD {} for chunk {}", 
+        MORI_APP_TRACE("FinalizeVMMHeap: Closed FD {} for chunk {} (P2P & RDMA)", 
                        vmmChunks[i].shareableHandle, i);
         vmmChunks[i].shareableHandle = -1;
       }
@@ -836,17 +836,19 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
       }
 
       // Export shareable handle for cross-process sharing (MUST be after Map and SetAccess)
+      // This FD is used for both P2P (hipMemImportFromShareableHandle) and RDMA (ibv_reg_dmabuf_mr)
       result = hipMemExportToShareableHandle((void*)&vmmChunks[chunkIdx].shareableHandle,
                                              vmmChunks[chunkIdx].handle,
                                              hipMemHandleTypePosixFileDescriptor, 0);
       if (result != hipSuccess) {
-        MORI_APP_WARN("VMMAlloc: hipMemExport failed chunk={} err={}, P2P may not work", chunkIdx,
+        MORI_APP_WARN("VMMAlloc: hipMemExport failed chunk={} err={}, P2P and RDMA may not work", chunkIdx,
                       result);
         vmmChunks[chunkIdx].shareableHandle = -1;
       }
       localShareableHandles[i] = vmmChunks[chunkIdx].shareableHandle;
-      MORI_APP_TRACE("VMMAlloc: rank={} created chunk={} size={} fd={}", rank, chunkIdx,
-                     vmmChunkSize, vmmChunks[chunkIdx].shareableHandle);
+      
+      MORI_APP_TRACE("VMMAlloc: rank={} created chunk={} size={} fd={} (shared for P2P & RDMA)", 
+                     rank, chunkIdx, vmmChunkSize, vmmChunks[chunkIdx].shareableHandle);
 
       MORI_APP_TRACE("VMMAlloc: rank={} set access chunk={} addr={:p}", rank, chunkIdx,
                      localChunkPtr);
@@ -1049,9 +1051,17 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
         void* chunkPtr =
             static_cast<void*>(static_cast<char*>(vmmPeerBasePtrs[rank]) + chunkIdx * vmmChunkSize);
 
-        // Register this chunk for RDMA access (use granularity size)
+        // Register this chunk for RDMA access using dmabuf (VMM memory requires dmabuf registration)
+        // Reuse the same FD that was exported for P2P (shareableHandle serves dual purpose)
+        int dmabufFd = vmmChunks[chunkIdx].shareableHandle;
+        if (dmabufFd < 0) {
+          MORI_APP_ERROR("VMMAlloc: rank={} chunk={} fd not exported, cannot register RDMA", 
+                         rank, chunkIdx);
+          continue;
+        }
+        
         application::RdmaMemoryRegion mr =
-            rdmaDeviceContext->RegisterRdmaMemoryRegion(chunkPtr, vmmChunkSize);
+            rdmaDeviceContext->RegisterRdmaMemoryRegionDmabuf(chunkPtr, vmmChunkSize, dmabufFd);
 
         vmmChunks[chunkIdx].lkey = mr.lkey;
         vmmChunks[chunkIdx].peerRkeys[rank] = mr.rkey;
@@ -1062,8 +1072,8 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
         vmmHeapObj.cpu->vmmLkeyInfo[chunkIdx].key = mr.lkey;
         vmmHeapObj.cpu->vmmRkeyInfo[chunkIdx * worldSize + rank].key = mr.rkey;
 
-        MORI_APP_TRACE("VMMAlloc: rank={} RDMA chunk={} addr={:p} lkey={} rkey={}", rank, chunkIdx,
-                       chunkPtr, mr.lkey, mr.rkey);
+        MORI_APP_TRACE("VMMAlloc: rank={} RDMA chunk={} addr={:p} fd={} lkey={} rkey={}", 
+                       rank, chunkIdx, chunkPtr, dmabufFd, mr.lkey, mr.rkey);
       }
 
       std::vector<uint32_t> allChunkRkeysFlat(worldSize * chunksNeeded, 0);
@@ -1258,10 +1268,10 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
                          chunkPtr);
         }
 
-        // Close shareable file descriptor to prevent FD leak
+        // Close shareable file descriptor to prevent FD leak (shared by P2P and RDMA)
         if (vmmChunks[idx].shareableHandle != -1) {
           close(vmmChunks[idx].shareableHandle);
-          MORI_APP_TRACE("VMMFreeChunk: RANK {} closed FD {} for chunk {}", rank,
+          MORI_APP_TRACE("VMMFreeChunk: RANK {} closed FD {} for chunk {} (P2P & RDMA)", rank,
                          vmmChunks[idx].shareableHandle, idx);
         }
 

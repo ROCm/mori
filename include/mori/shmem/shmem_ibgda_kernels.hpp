@@ -109,61 +109,63 @@ namespace shmem {
 /*                                    VMM Heap Helper Functions                                   */
 /* ---------------------------------------------------------------------------------------------- */
 // Query VMM local key with chunk boundary calculation
-inline __device__ void VmmQueryLocalKey(uintptr_t addr,
-                                        size_t max_size,
-                                        uint32_t& out_lkey,
+inline __device__ void VmmQueryLocalKey(uintptr_t addr, size_t max_size, uint32_t& out_lkey,
                                         size_t& out_chunk_size) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::SymmMemObj* heapObj = globalGpuStates->heapObj;
   uintptr_t heapBase = globalGpuStates->heapBaseAddr;
-  
+
   size_t offsetFromHeapBase = addr - heapBase;
   size_t chunkIdx = offsetFromHeapBase >> globalGpuStates->vmmChunkSizeShift;
-  
+
   application::VMMChunkKey chunkKey = heapObj->vmmLkeyInfo[chunkIdx];
-  
+
   out_lkey = chunkKey.key;
   size_t chunk_remaining = chunkKey.next_addr - addr;
   out_chunk_size = chunk_remaining < max_size ? chunk_remaining : max_size;
+  MORI_PRINTF(
+      "blockId %d, threadId %d VMM Heap: single transfer,chunkIdx: %zu, srcAddr: %p, lkey: %x, "
+      "chunk_remaining: %zu, out_chunk_size: %zu\n",
+      blockIdx.x, threadIdx.x, chunkIdx, addr, out_lkey, chunk_remaining, out_chunk_size);
 }
 
 // Query VMM remote address and key with chunk boundary calculation
-inline __device__ void VmmQueryRemoteAddr(uintptr_t addr,
-                                          int pe,
-                                          size_t max_size,
-                                          uintptr_t& out_raddr,
-                                          uint32_t& out_rkey,
+inline __device__ void VmmQueryRemoteAddr(uintptr_t addr, int pe, size_t max_size,
+                                          uintptr_t& out_raddr, uint32_t& out_rkey,
                                           size_t& out_chunk_size) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::SymmMemObj* heapObj = globalGpuStates->heapObj;
   uintptr_t heapBase = globalGpuStates->heapBaseAddr;
-  
+
   size_t offsetFromHeapBase = addr - heapBase;
   size_t chunkIdx = offsetFromHeapBase >> globalGpuStates->vmmChunkSizeShift;
-  
+
   out_raddr = heapObj->peerPtrs[pe] + offsetFromHeapBase;
-  
+
   application::VMMChunkKey chunkKey = heapObj->vmmRkeyInfo[chunkIdx * heapObj->worldSize + pe];
-  
+
   out_rkey = chunkKey.key;
   size_t chunk_remaining = chunkKey.next_addr - addr;
   out_chunk_size = chunk_remaining < max_size ? chunk_remaining : max_size;
+  MORI_PRINTF(
+      "blockId %d, threadId %d VMM Heap: single transfer,chunkIdx: %zu, dstAddr: %p, raddr: %lx, "
+      "rkey: %x, chunk_remaining: %zu, out_chunk_size: %zu\n",
+      blockIdx.x, threadIdx.x, chunkIdx, addr, out_raddr, out_rkey, chunk_remaining,
+      out_chunk_size);
 }
 
 // Lookup VMM remote address and key (for small fixed-size transfers)
-inline __device__ void VmmLookupRemote(uintptr_t addr,
-                                       int pe,
-                                       uintptr_t& out_raddr,
+inline __device__ void VmmLookupRemote(uintptr_t addr, int pe, uintptr_t& out_raddr,
                                        uint32_t& out_rkey) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::SymmMemObj* heapObj = globalGpuStates->heapObj;
   uintptr_t heapBase = globalGpuStates->heapBaseAddr;
-  
+
   size_t offsetFromHeapBase = addr - heapBase;
   size_t chunkIdx = offsetFromHeapBase >> globalGpuStates->vmmChunkSizeShift;
-  
+
   out_raddr = heapObj->peerPtrs[pe] + offsetFromHeapBase;
-  
+
   out_rkey = heapObj->vmmRkeyInfo[chunkIdx * heapObj->worldSize + pe].key;
 }
 
@@ -426,7 +428,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
                                                       size_t sourceOffset, size_t bytes, int pe,
                                                       int qpId) {
   if (bytes == 0) return;
-  
+
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
@@ -434,22 +436,36 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
   uint32_t qpn = ep[epIndex].handle.qpn;
 
-  uint64_t activemask = core::GetActiveLaneMask();
-  uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
-  uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
-  bool is_leader{my_logical_lane_id == num_active_lanes - 1};
-  const uint64_t leader_phys_lane_id = core::GetLastActiveLaneID(activemask);
-  
   bool needsChunking = globalGpuStates->useVMMHeap;
   size_t currentOffset = 0;
   size_t remaining = bytes;
-  
-  while (remaining > 0) {
+
+  while (true) {
+    // Check if current thread still has data to transfer
+    bool has_remaining = (remaining > 0);
+    
+    // Synchronize within warp: get mask of threads that still have work
+    uint64_t activemask = __ballot(has_remaining);
+    if (activemask == 0) {
+      break;  // All threads in warp are done
+    }
+    
+    // Recalculate active lane info for threads with remaining data
+    uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
+    uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
+    bool is_leader{my_logical_lane_id == num_active_lanes - 1};
+    const uint64_t leader_phys_lane_id = core::GetLastActiveLaneID(activemask);
+    
+    // Inactive threads skip actual work but stay synchronized
+    if (!has_remaining) {
+      continue;
+    }
+
     // Get RDMA keys and addresses based on mode
     uint32_t lkey, rkey;
     uintptr_t srcAddr, raddr;
     size_t transfer_size;
-    
+
     if (!needsChunking) {
       // Isolation or Static Heap - direct access
       // Keys are uniform, transfer entire remaining bytes in one shot
@@ -463,14 +479,18 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
       srcAddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset + currentOffset;
       size_t src_chunk_size;
       VmmQueryLocalKey(srcAddr, remaining, lkey, src_chunk_size);
-      
+
       uintptr_t dstAddr = reinterpret_cast<uintptr_t>(dest->localPtr) + destOffset + currentOffset;
       size_t dst_chunk_size;
       VmmQueryRemoteAddr(dstAddr, pe, remaining, raddr, rkey, dst_chunk_size);
-      
+
       transfer_size = src_chunk_size < dst_chunk_size ? src_chunk_size : dst_chunk_size;
+      // MORI_PRINTF("blockId %d, threadId %d VMM Heap: single transfer,srcAddr: %p, dstAddr: %p,
+      // lkey: %x, raddr: %lx, rkey: %x, transfer_size: %zu\n", blockIdx.x, threadIdx.x, srcAddr,
+      // dstAddr, lkey, raddr, rkey, transfer_size);
     }
-    
+    MORI_PRINTF("blockIdx.x=%d, threadIdx.x=%d, remaining=%zu, transfer_size=%zu\n", blockIdx.x,
+                threadIdx.x, remaining, transfer_size);
     // Post RDMA write (unified code for both fast and slow paths)
     uint32_t warp_sq_counter{0};
     uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
@@ -485,8 +505,9 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
         warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT);
       } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-        core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, psnCnt * num_active_lanes,
-                                            &warp_msntbl_counter, &warp_psn_counter);
+        core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes,
+                                            psnCnt * num_active_lanes, &warp_msntbl_counter,
+                                            &warp_psn_counter);
         warp_sq_counter = warp_msntbl_counter;
         __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
                                __HIP_MEMORY_SCOPE_AGENT);
@@ -515,7 +536,8 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
     while (true) {
       uint64_t db_touched =
           __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      uint64_t db_done =
+          __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       uint64_t num_active_sq_entries = db_touched - db_done;
       uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
       uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
@@ -524,20 +546,23 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
       }
       ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
     }
-    
+
     uint64_t dbr_val;
     if constexpr (PrvdType == core::ProviderType::MLX5) {
       wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
-      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
-                                          qpn, srcAddr, lkey, raddr, rkey, transfer_size);
+      dbr_val =
+          core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
+                                    qpn, srcAddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
       wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
-      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter,
-                                          is_leader, qpn, srcAddr, lkey, raddr, rkey, transfer_size);
+      dbr_val =
+          core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter,
+                                    is_leader, qpn, srcAddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::PSD) {
       wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
-      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
-                                          qpn, srcAddr, lkey, raddr, rkey, transfer_size);
+      dbr_val =
+          core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
+                                    qpn, srcAddr, lkey, raddr, rkey, transfer_size);
     } else {
       static_assert(false);
     }
@@ -558,7 +583,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
                          __HIP_MEMORY_SCOPE_AGENT);
     }
     __threadfence_system();
-      
+
     // Move to next chunk (for VMM heap) or exit loop (for Isolation/Static heap)
     currentOffset += transfer_size;
     remaining -= transfer_size;
@@ -612,9 +637,9 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
                                                           size_t bytes, int pe, int qpId) {
   if (bytes == 0) return;
   // assert(destOffset + bytes <= dest->size);
-  
+
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  
+
   // Get correct rkey for VMM heap or use direct rkey for Isolation/Static Heap
   uintptr_t raddr;
   uint32_t rkey;
@@ -774,22 +799,36 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
   uint32_t qpn = ep[epIndex].handle.qpn;
 
-  uint64_t activemask = core::GetActiveLaneMask();
-  uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
-  uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
-  bool is_leader{my_logical_lane_id == num_active_lanes - 1};
-  const uint64_t leader_phys_lane_id = core::GetLastActiveLaneID(activemask);
-  
   bool needsChunking = globalGpuStates->useVMMHeap;
   size_t currentOffset = 0;
   size_t remaining = bytes;
-  
-  while (remaining > 0) {
+
+  while (true) {
+    // Check if current thread still has data to transfer
+    bool has_remaining = (remaining > 0);
+    
+    // Synchronize within warp: get mask of threads that still have work
+    uint64_t activemask = __ballot(has_remaining);
+    if (activemask == 0) {
+      break;  // All threads in warp are done
+    }
+    
+    // Recalculate active lane info for threads with remaining data
+    uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
+    uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
+    bool is_leader{my_logical_lane_id == num_active_lanes - 1};
+    const uint64_t leader_phys_lane_id = core::GetLastActiveLaneID(activemask);
+    
+    // Inactive threads skip actual work but stay synchronized
+    if (!has_remaining) {
+      continue;
+    }
+
     // Get RDMA keys and addresses for current chunk
     uint32_t lkey, rkey;
     uintptr_t laddr, raddr;
     size_t transfer_size;
-    
+
     if (!needsChunking) {
       // Fast path: Isolation or Static Heap
       lkey = source->lkey;
@@ -799,19 +838,27 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
       transfer_size = remaining;
     } else {
       // Slow path: VMM Heap - query keys for current chunk
-      uintptr_t srcAddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset + currentOffset;
+      uintptr_t srcAddr =
+          reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset + currentOffset;
       size_t src_chunk_size;
       VmmQueryLocalKey(srcAddr, remaining, lkey, src_chunk_size);
       laddr = srcAddr;
-      
+
       uintptr_t dstAddr = reinterpret_cast<uintptr_t>(dest->localPtr) + destOffset + currentOffset;
       size_t dst_chunk_size;
       VmmQueryRemoteAddr(dstAddr, pe, remaining, raddr, rkey, dst_chunk_size);
-      
+
       transfer_size = src_chunk_size < dst_chunk_size ? src_chunk_size : dst_chunk_size;
     }
+
+    // Each thread checks if this is its last chunk
+    bool my_is_last_chunk = (transfer_size == remaining);
     
-    bool isLastChunk = (transfer_size == remaining);
+    // Synchronize: only send signal if ALL active threads are on their last chunk
+    // This ensures warp-uniform decision on num_wqes
+    uint64_t all_last_mask = __ballot(my_is_last_chunk);
+    bool isLastChunk = (all_last_mask == activemask);
+    
     uint32_t warp_sq_counter{0};
     uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
     uint32_t my_sq_counter{0}, my_msntbl_counter{0}, my_psn_counter{0};
@@ -832,8 +879,8 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
         if (isLastChunk) {
           total_psn += (onlyOneSignal ? 1 : num_active_lanes);
         }
-        core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, total_psn,
-                                            &warp_msntbl_counter, &warp_psn_counter);
+        core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, total_psn, &warp_msntbl_counter,
+                                            &warp_psn_counter);
         warp_sq_counter = warp_msntbl_counter;
         __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
                                __HIP_MEMORY_SCOPE_AGENT);
@@ -846,15 +893,22 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
     }
     warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
     if constexpr (PrvdType == core::ProviderType::MLX5) {
-      my_sq_counter = warp_sq_counter + (isLastChunk && !onlyOneSignal ? my_logical_lane_id * 2 : my_logical_lane_id);
+      my_sq_counter = warp_sq_counter +
+                      (isLastChunk && !onlyOneSignal ? my_logical_lane_id * 2 : my_logical_lane_id);
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
       warp_msntbl_counter = __shfl(warp_msntbl_counter, leader_phys_lane_id);
       warp_psn_counter = __shfl(warp_psn_counter, leader_phys_lane_id);
-      my_sq_counter = warp_sq_counter + (isLastChunk && !onlyOneSignal ? my_logical_lane_id * 2 : my_logical_lane_id);
-      my_msntbl_counter = warp_msntbl_counter + (isLastChunk && !onlyOneSignal ? my_logical_lane_id * 2 : my_logical_lane_id);
-      my_psn_counter = warp_psn_counter + (isLastChunk && !onlyOneSignal ? (psnCnt + 1) * my_logical_lane_id : psnCnt * my_logical_lane_id);
+      my_sq_counter = warp_sq_counter +
+                      (isLastChunk && !onlyOneSignal ? my_logical_lane_id * 2 : my_logical_lane_id);
+      my_msntbl_counter =
+          warp_msntbl_counter +
+          (isLastChunk && !onlyOneSignal ? my_logical_lane_id * 2 : my_logical_lane_id);
+      my_psn_counter =
+          warp_psn_counter + (isLastChunk && !onlyOneSignal ? (psnCnt + 1) * my_logical_lane_id
+                                                            : psnCnt * my_logical_lane_id);
     } else if constexpr (PrvdType == core::ProviderType::PSD) {
-      my_sq_counter = warp_sq_counter + (isLastChunk && !onlyOneSignal ? my_logical_lane_id * 2 : my_logical_lane_id);
+      my_sq_counter = warp_sq_counter +
+                      (isLastChunk && !onlyOneSignal ? my_logical_lane_id * 2 : my_logical_lane_id);
     } else {
       static_assert(false);
     }
@@ -862,7 +916,8 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
     while (true) {
       uint64_t db_touched =
           __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      uint64_t db_done =
+          __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       uint64_t num_active_sq_entries = db_touched - db_done;
       uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
       uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_wqes - db_touched;
@@ -871,25 +926,22 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
       }
       ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
     }
-    
+
     // Post RDMA write for this chunk
     // Note: PostWrite always returns a valid doorbell value, regardless of cqeSignal
     uint64_t dbr_val;
     if constexpr (PrvdType == core::ProviderType::MLX5) {
       wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
-      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, 
-                                          false, qpn, laddr,
-                                          lkey, raddr, rkey, transfer_size);
+      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
+                                          qpn, laddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
       wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
-      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter, 
-                                          false, qpn,
-                                          laddr, lkey, raddr, rkey, transfer_size);
+      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter,
+                                          is_leader, qpn, laddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::PSD) {
       wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
-      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, 
-                                          false, qpn, laddr,
-                                          lkey, raddr, rkey, transfer_size);
+      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
+                                          qpn, laddr, lkey, raddr, rkey, transfer_size);
     } else {
       static_assert(false);
     }
@@ -897,27 +949,34 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
     // Post signal only for the last chunk (and update dbr_val)
     if (isLastChunk) {
       // assert(signalDestOffset + sizeof(signalValue) <= signalDest->size);
-      uintptr_t signalRaddr = signalDest->peerPtrs[pe] + signalDestOffset;
-      uintptr_t signalRkey = signalDest->peerRkeys[pe];
+      uintptr_t signalRaddr;
+      uint32_t signalRkey;
+      if (!needsChunking) {
+        signalRaddr = signalDest->peerPtrs[pe] + signalDestOffset;
+        signalRkey = signalDest->peerRkeys[pe];
+      } else {
+        uintptr_t signalAddr = reinterpret_cast<uintptr_t>(signalDest->localPtr) + signalDestOffset;
+        VmmLookupRemote(signalAddr, pe, signalRaddr, signalRkey);
+      }
       if (signalOp == core::atomicType::AMO_SET || signalOp == core::atomicType::AMO_SIGNAL_SET) {
         // TODO: not support masked atomic yet, use write inline for now
         bool should_signal = onlyOneSignal ? is_leader : true;
         if (should_signal) {
           if constexpr (PrvdType == core::ProviderType::MLX5) {
             wq->outstandingWqe[(my_sq_counter + 1) % OUTSTANDING_TABLE_SIZE] = my_sq_counter + 1;
-            dbr_val = core::PostWriteInline<PrvdType>(*wq, my_sq_counter + 1, my_sq_counter + 1,
-                                                      my_sq_counter + 1, is_leader, qpn, &signalValue,
-                                                      signalRaddr, signalRkey, sizeof(signalValue));
+            dbr_val = core::PostWriteInline<PrvdType>(
+                *wq, my_sq_counter + 1, my_sq_counter + 1, my_sq_counter + 1, is_leader, qpn,
+                &signalValue, signalRaddr, signalRkey, sizeof(signalValue));
           } else if constexpr (PrvdType == core::ProviderType::BNXT) {
             wq->outstandingWqe[(my_sq_counter + 1) % wq->sqWqeNum] = my_sq_counter + 1;
-            dbr_val = core::PostWriteInline<PrvdType>(*wq, my_sq_counter + 1, my_msntbl_counter + 1,
-                                                      my_psn_counter + psnCnt, is_leader, qpn, &signalValue,
-                                                      signalRaddr, signalRkey, sizeof(signalValue));
+            dbr_val = core::PostWriteInline<PrvdType>(
+                *wq, my_sq_counter + 1, my_msntbl_counter + 1, my_psn_counter + psnCnt, is_leader,
+                qpn, &signalValue, signalRaddr, signalRkey, sizeof(signalValue));
           } else if constexpr (PrvdType == core::ProviderType::PSD) {
             wq->outstandingWqe[(my_sq_counter + 1) % OUTSTANDING_TABLE_SIZE] = my_sq_counter + 1;
-            dbr_val = core::PostWriteInline<PrvdType>(*wq, my_sq_counter + 1, my_sq_counter + 1,
-                                                      my_sq_counter + 1, is_leader, qpn, &signalValue,
-                                                      signalRaddr, signalRkey, sizeof(signalValue));
+            dbr_val = core::PostWriteInline<PrvdType>(
+                *wq, my_sq_counter + 1, my_sq_counter + 1, my_sq_counter + 1, is_leader, qpn,
+                &signalValue, signalRaddr, signalRkey, sizeof(signalValue));
           }
         }
       } else if (signalOp == core::atomicType::AMO_ADD ||
@@ -934,8 +993,8 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
           } else if constexpr (PrvdType == core::ProviderType::BNXT) {
             wq->outstandingWqe[(my_sq_counter + 1) % wq->sqWqeNum] = my_sq_counter + 1;
             dbr_val = core::PostAtomic<PrvdType>(
-                *wq, my_sq_counter + 1, my_msntbl_counter + 1, my_psn_counter + psnCnt, is_leader, qpn,
-                ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
+                *wq, my_sq_counter + 1, my_msntbl_counter + 1, my_psn_counter + psnCnt, is_leader,
+                qpn, ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
                 sizeof(signalValue), core::atomicType::AMO_ADD);
           } else if constexpr (PrvdType == core::ProviderType::PSD) {
             wq->outstandingWqe[(my_sq_counter + 1) % OUTSTANDING_TABLE_SIZE] = my_sq_counter + 1;
@@ -968,7 +1027,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
                          __HIP_MEMORY_SCOPE_AGENT);
     }
     __threadfence_system();
-    
+
     // Move to next chunk
     currentOffset += transfer_size;
     remaining -= transfer_size;
@@ -1080,7 +1139,7 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
     raddr = dest->peerPtrs[pe] + destOffset;
     rkey = dest->peerRkeys[pe];
   }
-  
+
   uintptr_t laddr = ibuf->addr;
   uintptr_t lkey = ibuf->lkey;
 
@@ -1267,7 +1326,7 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelImpl(const application::Symm
   uint32_t my_slot_index = my_slot & (ibuf->nslots - 1);
   uintptr_t laddr = ibuf->addr + (my_slot_index + 1) * application::ATOMIC_IBUF_SLOT_SIZE;
   uintptr_t lkey = ibuf->lkey;
-  
+
   // Get correct rkey for VMM heap or use direct rkey for Isolation/Static Heap
   uintptr_t raddr;
   uint32_t rkey;
@@ -1439,8 +1498,8 @@ DEFINE_SHMEM_ATOMIC_TYPE_FETCH_WARP_KERNEL(Int64, int64_t)
 
 // Convert SHMEM heap address to remote address and key
 // Supports both Static Heap and VMM Heap modes
-inline __device__ void QueryRemoteAddr(const void* localAddr, int pe,
-                                       uintptr_t& out_raddr, uint32_t& out_rkey) {
+inline __device__ void QueryRemoteAddr(const void* localAddr, int pe, uintptr_t& out_raddr,
+                                       uint32_t& out_rkey) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   uintptr_t localAddrInt = reinterpret_cast<uintptr_t>(localAddr);
 
@@ -1489,20 +1548,34 @@ inline __device__ void ShmemPutMemNbiThreadKernelAddrImpl(const void* dest, cons
 
   // Determine if chunking is needed (VMM heap mode)
   bool needsChunking = globalGpuStates->useVMMHeap;
-  
+
   uintptr_t srcStartAddr = reinterpret_cast<uintptr_t>(source);
   uintptr_t dstStartAddr = reinterpret_cast<uintptr_t>(dest);
   size_t remaining = bytes;
   size_t currentOffset = 0;
 
-  uint64_t activemask = core::GetActiveLaneMask();
-  uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
-  uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
-  bool is_leader{my_logical_lane_id == num_active_lanes - 1};
-  const uint64_t leader_phys_lane_id = core::GetLastActiveLaneID(activemask);
-
   // Main loop: process one chunk per iteration
-  while (remaining > 0) {
+  while (true) {
+    // Check if current thread still has data to transfer
+    bool has_remaining = (remaining > 0);
+    
+    // Synchronize within warp: get mask of threads that still have work
+    uint64_t activemask = __ballot(has_remaining);
+    if (activemask == 0) {
+      break;  // All threads in warp are done
+    }
+    
+    // Recalculate active lane info for threads with remaining data
+    uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
+    uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
+    bool is_leader{my_logical_lane_id == num_active_lanes - 1};
+    const uint64_t leader_phys_lane_id = core::GetLastActiveLaneID(activemask);
+    
+    // Inactive threads skip actual work but stay synchronized
+    if (!has_remaining) {
+      continue;
+    }
+
     // Determine transfer size for this chunk
     uintptr_t srcAddr = srcStartAddr + currentOffset;
     uintptr_t dstAddr = dstStartAddr + currentOffset;
@@ -1524,7 +1597,8 @@ inline __device__ void ShmemPutMemNbiThreadKernelAddrImpl(const void* dest, cons
       VmmQueryRemoteAddr(dstAddr, pe, remaining, raddr, rkey, dst_chunk_size);
       transfer_size = src_chunk_size < dst_chunk_size ? src_chunk_size : dst_chunk_size;
     }
-
+    MORI_PRINTF("blockIdx.x=%d, threadIdx.x=%d, remaining=%zu, transfer_size=%zu\n", blockIdx.x,
+                threadIdx.x, remaining, transfer_size);
     uint32_t warp_sq_counter{0};
     uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
     uint32_t my_sq_counter{0}, my_msntbl_counter{0}, my_psn_counter{0};
@@ -1538,8 +1612,9 @@ inline __device__ void ShmemPutMemNbiThreadKernelAddrImpl(const void* dest, cons
         warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT);
       } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-        core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes, psnCnt * num_active_lanes,
-                                            &warp_msntbl_counter, &warp_psn_counter);
+        core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes,
+                                            psnCnt * num_active_lanes, &warp_msntbl_counter,
+                                            &warp_psn_counter);
         warp_sq_counter = warp_msntbl_counter;
         __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
                                __HIP_MEMORY_SCOPE_AGENT);
@@ -1568,7 +1643,8 @@ inline __device__ void ShmemPutMemNbiThreadKernelAddrImpl(const void* dest, cons
     while (true) {
       uint64_t db_touched =
           __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      uint64_t db_done =
+          __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       uint64_t num_active_sq_entries = db_touched - db_done;
       uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
       uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
@@ -1577,21 +1653,24 @@ inline __device__ void ShmemPutMemNbiThreadKernelAddrImpl(const void* dest, cons
       }
       ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
     }
-    
+
     // Post RDMA write for this chunk
     uint64_t dbr_val;
     if constexpr (PrvdType == core::ProviderType::MLX5) {
       wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
-      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, 
-                                          is_leader, qpn, srcAddr, lkey, raddr, rkey, transfer_size);
+      dbr_val =
+          core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
+                                    qpn, srcAddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
       wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
-      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter,
-                                          is_leader, qpn, srcAddr, lkey, raddr, rkey, transfer_size);
+      dbr_val =
+          core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter,
+                                    is_leader, qpn, srcAddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::PSD) {
       wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
-      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, 
-                                          is_leader, qpn, srcAddr, lkey, raddr, rkey, transfer_size);
+      dbr_val =
+          core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
+                                    qpn, srcAddr, lkey, raddr, rkey, transfer_size);
     } else {
       static_assert(false);
     }
@@ -1613,7 +1692,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelAddrImpl(const void* dest, cons
                          __HIP_MEMORY_SCOPE_AGENT);
     }
     __threadfence_system();
-    
+
     // Move to next chunk
     currentOffset += transfer_size;
     remaining -= transfer_size;
@@ -1805,161 +1884,231 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
   uint32_t qpn = ep[epIndex].handle.qpn;
 
-  // Convert addresses to remote addresses (supports both Static Heap and VMM Heap)
-  uintptr_t laddr = reinterpret_cast<uintptr_t>(source);
-  uint32_t lkey = globalGpuStates->heapObj->lkey;
-  uintptr_t raddr;
-  uint32_t rkey;
-  QueryRemoteAddr(dest, pe, raddr, rkey);
+  // Determine if chunking is needed (VMM heap mode)
+  bool needsChunking = globalGpuStates->useVMMHeap;
 
+  // Query signal destination address once (signal always goes to same address)
   uintptr_t signalRaddr;
   uint32_t signalRkey;
   QueryRemoteAddr(signalDest, pe, signalRaddr, signalRkey);
 
-  uint64_t activemask = core::GetActiveLaneMask();
-  uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
-  uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
-  bool is_leader{my_logical_lane_id == num_active_lanes - 1};
-  const uint64_t leader_phys_lane_id = core::GetLastActiveLaneID(activemask);
-  uint32_t warp_sq_counter{0};
-  uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
-  uint32_t my_sq_counter{0}, my_msntbl_counter{0}, my_psn_counter{0};
-  uint32_t psnCnt = 0;
-  uint32_t num_wqes = onlyOneSignal ? num_active_lanes + 1 : num_active_lanes * 2;
+  uintptr_t srcStartAddr = reinterpret_cast<uintptr_t>(source);
+  uintptr_t dstStartAddr = reinterpret_cast<uintptr_t>(dest);
+  size_t remaining = bytes;
+  size_t currentOffset = 0;
 
-  if constexpr (PrvdType == core::ProviderType::BNXT) {
-    psnCnt = (bytes + wq->mtuSize - 1) / wq->mtuSize;
-  }
-  if (is_leader) {
+  // Main loop: process one chunk per iteration
+  while (true) {
+    // Check if current thread still has data to transfer
+    bool has_remaining = (remaining > 0);
+    
+    // Synchronize within warp: get mask of threads that still have work
+    uint64_t activemask = __ballot(has_remaining);
+    if (activemask == 0) {
+      break;  // All threads in warp are done
+    }
+    
+    // Recalculate active lane info for threads with remaining data
+    uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
+    uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
+    bool is_leader{my_logical_lane_id == num_active_lanes - 1};
+    const uint64_t leader_phys_lane_id = core::GetLastActiveLaneID(activemask);
+    
+    // Inactive threads skip actual work but stay synchronized
+    if (!has_remaining) {
+      continue;
+    }
+
+    // Determine transfer size for this chunk
+    uintptr_t srcAddr = srcStartAddr + currentOffset;
+    uintptr_t dstAddr = dstStartAddr + currentOffset;
+    uint32_t lkey = globalGpuStates->heapObj->lkey;
+    uintptr_t raddr;
+    uint32_t rkey;
+    size_t transfer_size;
+
+    if (!needsChunking) {
+      // Static Heap: single transfer, direct rkey access
+      transfer_size = remaining;
+      size_t offset = dstAddr - globalGpuStates->heapBaseAddr;
+      raddr = globalGpuStates->heapObj->peerPtrs[pe] + offset;
+      rkey = globalGpuStates->heapObj->peerRkeys[pe];
+    } else {
+      // VMM Heap: get chunk-specific rkey and size
+      size_t src_chunk_size, dst_chunk_size;
+      VmmQueryLocalKey(srcAddr, remaining, lkey, src_chunk_size);
+      VmmQueryRemoteAddr(dstAddr, pe, remaining, raddr, rkey, dst_chunk_size);
+      transfer_size = src_chunk_size < dst_chunk_size ? src_chunk_size : dst_chunk_size;
+    }
+
+    // Each thread checks if this is its last chunk
+    bool my_is_last_chunk = (transfer_size == remaining);
+    
+    // Synchronize: only send signal if ALL active threads are on their last chunk
+    // This ensures warp-uniform decision on num_wqes
+    uint64_t all_last_mask = __ballot(my_is_last_chunk);
+    bool isLastChunk = (all_last_mask == activemask);
+    
+    uint32_t warp_sq_counter{0};
+    uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
+    uint32_t my_sq_counter{0}, my_msntbl_counter{0}, my_psn_counter{0};
+    uint32_t psnCnt = 0;
+    // For last chunk: add 1 WQE for signal; for other chunks: just put
+    uint32_t num_wqes = isLastChunk ? (onlyOneSignal ? num_active_lanes + 1 : num_active_lanes * 2)
+                                    : num_active_lanes;
+
+    if constexpr (PrvdType == core::ProviderType::BNXT) {
+      psnCnt = (transfer_size + wq->mtuSize - 1) / wq->mtuSize;
+    }
+    if (is_leader) {
+      if constexpr (PrvdType == core::ProviderType::MLX5) {
+        warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_wqes, __ATOMIC_RELAXED,
+                                                 __HIP_MEMORY_SCOPE_AGENT);
+      } else if constexpr (PrvdType == core::ProviderType::BNXT) {
+        uint32_t total_psn = psnCnt * num_active_lanes;
+        if (isLastChunk) {
+          total_psn += (onlyOneSignal ? 1 : num_active_lanes);
+        }
+        core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_wqes, total_psn, &warp_msntbl_counter,
+                                            &warp_psn_counter);
+        warp_sq_counter = warp_msntbl_counter;
+        __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
+                               __HIP_MEMORY_SCOPE_AGENT);
+      } else if constexpr (PrvdType == core::ProviderType::PSD) {
+        warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_wqes, __ATOMIC_RELAXED,
+                                                 __HIP_MEMORY_SCOPE_AGENT);
+      } else {
+        static_assert(false);
+      }
+    }
+    warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
     if constexpr (PrvdType == core::ProviderType::MLX5) {
-      warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_wqes, __ATOMIC_RELAXED,
-                                               __HIP_MEMORY_SCOPE_AGENT);
+      my_sq_counter = warp_sq_counter +
+                      (isLastChunk && !onlyOneSignal ? my_logical_lane_id * 2 : my_logical_lane_id);
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-      core::atomic_add_packed_msn_and_psn(
-          &wq->msnPack, num_wqes,
-          psnCnt * num_active_lanes + (onlyOneSignal ? 1 : num_active_lanes), &warp_msntbl_counter,
-          &warp_psn_counter);
-      warp_sq_counter = warp_msntbl_counter;
-      __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
-                             __HIP_MEMORY_SCOPE_AGENT);
+      warp_msntbl_counter = __shfl(warp_msntbl_counter, leader_phys_lane_id);
+      warp_psn_counter = __shfl(warp_psn_counter, leader_phys_lane_id);
+      my_sq_counter = warp_sq_counter +
+                      (isLastChunk && !onlyOneSignal ? my_logical_lane_id * 2 : my_logical_lane_id);
+      my_msntbl_counter =
+          warp_msntbl_counter +
+          (isLastChunk && !onlyOneSignal ? my_logical_lane_id * 2 : my_logical_lane_id);
+      my_psn_counter =
+          warp_psn_counter + (isLastChunk && !onlyOneSignal ? (psnCnt + 1) * my_logical_lane_id
+                                                            : psnCnt * my_logical_lane_id);
     } else if constexpr (PrvdType == core::ProviderType::PSD) {
-      warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_wqes, __ATOMIC_RELAXED,
-                                               __HIP_MEMORY_SCOPE_AGENT);
+      my_sq_counter = warp_sq_counter +
+                      (isLastChunk && !onlyOneSignal ? my_logical_lane_id * 2 : my_logical_lane_id);
     } else {
       static_assert(false);
     }
-  }
-  warp_sq_counter = __shfl(warp_sq_counter, leader_phys_lane_id);
-  if constexpr (PrvdType == core::ProviderType::MLX5) {
-    my_sq_counter = warp_sq_counter + (onlyOneSignal ? my_logical_lane_id : my_logical_lane_id * 2);
-  } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-    warp_msntbl_counter = __shfl(warp_msntbl_counter, leader_phys_lane_id);
-    warp_psn_counter = __shfl(warp_psn_counter, leader_phys_lane_id);
-    my_sq_counter = warp_sq_counter + (onlyOneSignal ? my_logical_lane_id : my_logical_lane_id * 2);
-    my_msntbl_counter =
-        warp_msntbl_counter + (onlyOneSignal ? my_logical_lane_id : my_logical_lane_id * 2);
-    my_psn_counter = warp_psn_counter + (onlyOneSignal ? psnCnt * my_logical_lane_id
-                                                       : (psnCnt + 1) * my_logical_lane_id);
-  } else if constexpr (PrvdType == core::ProviderType::PSD) {
-    my_sq_counter = warp_sq_counter + (onlyOneSignal ? my_logical_lane_id : my_logical_lane_id * 2);
-  } else {
-    static_assert(false);
-  }
 
-  while (true) {
-    uint64_t db_touched =
-        __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t db_done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
-    uint64_t num_active_sq_entries = db_touched - db_done;
-    uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
-    uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_wqes - db_touched;
-    if (num_free_entries > num_entries_until_warp_last_entry) {
-      break;
+    while (true) {
+      uint64_t db_touched =
+          __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      uint64_t db_done =
+          __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      uint64_t num_active_sq_entries = db_touched - db_done;
+      uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
+      uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_wqes - db_touched;
+      if (num_free_entries > num_entries_until_warp_last_entry) {
+        break;
+      }
+      ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
     }
-    ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
-  }
 
-  // putmem nbi
-  if constexpr (PrvdType == core::ProviderType::MLX5) {
-    wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
-    core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, false, qpn, laddr,
-                              lkey, raddr, rkey, bytes);
-  } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-    wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
-    core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter, false, qpn,
-                              laddr, lkey, raddr, rkey, bytes);
-  } else if constexpr (PrvdType == core::ProviderType::PSD) {
-    wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
-    core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, false, qpn, laddr,
-                              lkey, raddr, rkey, bytes);
-  } else {
-    static_assert(false);
-  }
+    // Post RDMA write for this chunk
+    uint64_t dbr_val;
+    if constexpr (PrvdType == core::ProviderType::MLX5) {
+      wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
+      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, false,
+                                          qpn, srcAddr, lkey, raddr, rkey, transfer_size);
+    } else if constexpr (PrvdType == core::ProviderType::BNXT) {
+      wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
+      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter,
+                                          false, qpn, srcAddr, lkey, raddr, rkey, transfer_size);
+    } else if constexpr (PrvdType == core::ProviderType::PSD) {
+      wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
+      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, false,
+                                          qpn, srcAddr, lkey, raddr, rkey, transfer_size);
+    } else {
+      static_assert(false);
+    }
 
-  // signal
-  uint64_t dbr_val;
-  if (signalOp == core::atomicType::AMO_SET || signalOp == core::atomicType::AMO_SIGNAL_SET) {
-    // TODO: not support masked atomic yet, use write inline for now
-    bool should_signal = onlyOneSignal ? is_leader : true;
-    if (should_signal) {
-      if constexpr (PrvdType == core::ProviderType::MLX5) {
-        wq->outstandingWqe[(my_sq_counter + 1) % OUTSTANDING_TABLE_SIZE] = my_sq_counter + 1;
-        dbr_val = core::PostWriteInline<PrvdType>(*wq, my_sq_counter + 1, my_sq_counter + 1,
-                                                  my_sq_counter + 1, is_leader, qpn, &signalValue,
-                                                  signalRaddr, signalRkey, sizeof(signalValue));
-      } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-        wq->outstandingWqe[(my_sq_counter + 1) % wq->sqWqeNum] = my_sq_counter + 1;
-        dbr_val = core::PostWriteInline<PrvdType>(*wq, my_sq_counter + 1, my_msntbl_counter + 1,
-                                                  my_psn_counter + 1, is_leader, qpn, &signalValue,
-                                                  signalRaddr, signalRkey, sizeof(signalValue));
-      } else if constexpr (PrvdType == core::ProviderType::PSD) {
-        wq->outstandingWqe[(my_sq_counter + 1) % OUTSTANDING_TABLE_SIZE] = my_sq_counter + 1;
-        dbr_val = core::PostWriteInline<PrvdType>(*wq, my_sq_counter + 1, my_sq_counter + 1,
-                                                  my_sq_counter + 1, is_leader, qpn, &signalValue,
-                                                  signalRaddr, signalRkey, sizeof(signalValue));
+    // Post signal only for the last chunk
+    if (isLastChunk) {
+      if (signalOp == core::atomicType::AMO_SET || signalOp == core::atomicType::AMO_SIGNAL_SET) {
+        // TODO: not support masked atomic yet, use write inline for now
+        bool should_signal = onlyOneSignal ? is_leader : true;
+        if (should_signal) {
+          if constexpr (PrvdType == core::ProviderType::MLX5) {
+            wq->outstandingWqe[(my_sq_counter + 1) % OUTSTANDING_TABLE_SIZE] = my_sq_counter + 1;
+            dbr_val = core::PostWriteInline<PrvdType>(
+                *wq, my_sq_counter + 1, my_sq_counter + 1, my_sq_counter + 1, is_leader, qpn,
+                &signalValue, signalRaddr, signalRkey, sizeof(signalValue));
+          } else if constexpr (PrvdType == core::ProviderType::BNXT) {
+            wq->outstandingWqe[(my_sq_counter + 1) % wq->sqWqeNum] = my_sq_counter + 1;
+            dbr_val = core::PostWriteInline<PrvdType>(
+                *wq, my_sq_counter + 1, my_msntbl_counter + 1, my_psn_counter + psnCnt, is_leader,
+                qpn, &signalValue, signalRaddr, signalRkey, sizeof(signalValue));
+          } else if constexpr (PrvdType == core::ProviderType::PSD) {
+            wq->outstandingWqe[(my_sq_counter + 1) % OUTSTANDING_TABLE_SIZE] = my_sq_counter + 1;
+            dbr_val = core::PostWriteInline<PrvdType>(
+                *wq, my_sq_counter + 1, my_sq_counter + 1, my_sq_counter + 1, is_leader, qpn,
+                &signalValue, signalRaddr, signalRkey, sizeof(signalValue));
+          }
+        }
+      } else if (signalOp == core::atomicType::AMO_ADD ||
+                 signalOp == core::atomicType::AMO_SIGNAL_ADD) {
+        core::IbufHandle* ibuf = &ep[epIndex].atomicIbuf;
+        bool should_signal = onlyOneSignal ? is_leader : true;
+        if (should_signal) {
+          if constexpr (PrvdType == core::ProviderType::MLX5) {
+            wq->outstandingWqe[(my_sq_counter + 1) % OUTSTANDING_TABLE_SIZE] = my_sq_counter + 1;
+            dbr_val = core::PostAtomic<PrvdType>(
+                *wq, my_sq_counter + 1, my_sq_counter + 1, my_sq_counter + 1, is_leader, qpn,
+                ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
+                sizeof(signalValue), core::atomicType::AMO_ADD);
+          } else if constexpr (PrvdType == core::ProviderType::BNXT) {
+            wq->outstandingWqe[(my_sq_counter + 1) % wq->sqWqeNum] = my_sq_counter + 1;
+            dbr_val = core::PostAtomic<PrvdType>(
+                *wq, my_sq_counter + 1, my_msntbl_counter + 1, my_psn_counter + psnCnt, is_leader,
+                qpn, ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
+                sizeof(signalValue), core::atomicType::AMO_ADD);
+          } else if constexpr (PrvdType == core::ProviderType::PSD) {
+            wq->outstandingWqe[(my_sq_counter + 1) % OUTSTANDING_TABLE_SIZE] = my_sq_counter + 1;
+            dbr_val = core::PostAtomic<PrvdType>(
+                *wq, my_sq_counter + 1, my_sq_counter + 1, my_sq_counter + 1, is_leader, qpn,
+                ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
+                sizeof(signalValue), core::atomicType::AMO_ADD);
+          }
+        }
+      } else {
+        assert(false && "signal unsupported atomic type");
       }
     }
-  } else if (signalOp == core::atomicType::AMO_ADD ||
-             signalOp == core::atomicType::AMO_SIGNAL_ADD) {
-    core::IbufHandle* ibuf = &ep[epIndex].atomicIbuf;
-    bool should_signal = onlyOneSignal ? is_leader : true;
-    if (should_signal) {
-      if constexpr (PrvdType == core::ProviderType::MLX5) {
-        wq->outstandingWqe[(my_sq_counter + 1) % OUTSTANDING_TABLE_SIZE] = my_sq_counter + 1;
-        dbr_val = core::PostAtomic<PrvdType>(
-            *wq, my_sq_counter + 1, my_sq_counter + 1, my_sq_counter + 1, is_leader, qpn,
-            ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
-            sizeof(signalValue), core::atomicType::AMO_ADD);
-      } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-        wq->outstandingWqe[(my_sq_counter + 1) % wq->sqWqeNum] = my_sq_counter + 1;
-        dbr_val = core::PostAtomic<PrvdType>(
-            *wq, my_sq_counter + 1, my_msntbl_counter + 1, my_psn_counter + 1, is_leader, qpn,
-            ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
-            sizeof(signalValue), core::atomicType::AMO_ADD);
-      } else if constexpr (PrvdType == core::ProviderType::PSD) {
-        wq->outstandingWqe[(my_sq_counter + 1) % OUTSTANDING_TABLE_SIZE] = my_sq_counter + 1;
-        dbr_val = core::PostAtomic<PrvdType>(
-            *wq, my_sq_counter + 1, my_sq_counter + 1, my_sq_counter + 1, is_leader, qpn,
-            ibuf->addr, ibuf->lkey, signalRaddr, signalRkey, &signalValue, &signalValue,
-            sizeof(signalValue), core::atomicType::AMO_ADD);
-      }
+
+    __threadfence_system();
+    if (is_leader) {
+      uint64_t db_touched{0};
+      do {
+        db_touched = __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      } while (db_touched != warp_sq_counter);
+
+      core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_wqes);
+      __threadfence_system();
+      core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
+      __threadfence_system();
+
+      __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
     }
-  } else {
-    assert(false && "signal unsupported atomic type");
-  }
+    __threadfence_system();
 
-  if (is_leader) {
-    uint64_t db_touched{0};
-    do {
-      db_touched = __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    } while (db_touched != warp_sq_counter);
-
-    core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_wqes);
-    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
-
-    __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_wqes, __ATOMIC_RELAXED,
-                       __HIP_MEMORY_SCOPE_AGENT);
+    // Move to next chunk
+    currentOffset += transfer_size;
+    remaining -= transfer_size;
   }
 }
 
@@ -2211,7 +2360,7 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelAddrImpl(const void* dest, v
   uint32_t my_slot_index = my_slot & (ibuf->nslots - 1);
   uintptr_t laddr = ibuf->addr + (my_slot_index + 1) * application::ATOMIC_IBUF_SLOT_SIZE;
   uint32_t lkey = ibuf->lkey;
-  
+
   // Convert addresses to remote addresses (supports both Static Heap and VMM Heap)
   uintptr_t raddr;
   uint32_t rkey;

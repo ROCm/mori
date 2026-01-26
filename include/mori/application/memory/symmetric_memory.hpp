@@ -163,7 +163,7 @@ class SymmMemManager {
   // VMM heap management
   struct VMMChunkInfo {
     hipMemGenericAllocationHandle_t handle;
-    int shareableHandle;  // File descriptor for POSIX systems (for P2P)
+    int shareableHandle;  // File descriptor for POSIX systems (shared by P2P and RDMA/dmabuf)
     size_t size;          // Chunk size (always equals granularity/vmmChunkSize)
     bool isAllocated;
     int refCount;         // Reference count: how many allocations are using this chunk

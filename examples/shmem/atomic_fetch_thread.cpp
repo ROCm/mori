@@ -22,6 +22,8 @@
 #include <mpi.h>
 
 #include <cassert>
+#include <cstdlib>
+#include <string>
 
 #include "mori/application/utils/check.hpp"
 #include "mori/shmem/shmem.hpp"
@@ -185,6 +187,10 @@ void testAtomicFetchThread() {
   SymmMemObjPtr buffObj = ShmemQueryMemObjPtr(buff);
   assert(buffObj.IsValid());
 
+  // Check if we should skip pure address API tests
+  const char* shmemMode = std::getenv("MORI_SHMEM_MODE");
+  bool skipPureAddress = (shmemMode != nullptr && std::string(shmemMode) == "ISOLATION");
+
   // Run atomic fetch operations for different types
   for (int iteration = 0; iteration < 3; iteration++) {
     if (myPe == 0) {
@@ -204,7 +210,8 @@ void testAtomicFetchThread() {
     MPI_Barrier(MPI_COMM_WORLD);
     
     if (myPe == 0) {
-      uint64_t result = *(reinterpret_cast<uint64_t*>(buff) + 2);
+      uint64_t result;
+      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<uint64_t*>(buff) + 2, sizeof(uint64_t), hipMemcpyDeviceToHost));
       printf("✓ Legacy API uint64_t test completed. Result at index 2: %lu\n", result);
     }
 
@@ -212,18 +219,25 @@ void testAtomicFetchThread() {
     if (myPe == 0) {
       printf("\n--- Test 2: Pure Address API (uint64_t) ---\n");
     }
-    myHipMemsetD64(buff, myPe, numEle);
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
+    if (skipPureAddress) {
+      if (myPe == 0) {
+        printf("⊘ SKIPPED (MORI_SHMEM_MODE=ISOLATION)\n");
+      }
+    } else {
+      myHipMemsetD64(buff, myPe, numEle);
+      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+      MPI_Barrier(MPI_COMM_WORLD);
 
-    AtomicFetchThreadKernel_PureAddr<uint64_t><<<blockNum, threadNum>>>(
-        myPe, reinterpret_cast<uint64_t*>(buff));
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-    
-    if (myPe == 0) {
-      uint64_t result = *(reinterpret_cast<uint64_t*>(buff) + 2);
-      printf("✓ Pure Address API uint64_t test completed. Result at index 2: %lu\n", result);
+      AtomicFetchThreadKernel_PureAddr<uint64_t><<<blockNum, threadNum>>>(
+          myPe, reinterpret_cast<uint64_t*>(buff));
+      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+      MPI_Barrier(MPI_COMM_WORLD);
+      
+      if (myPe == 0) {
+        uint64_t result;
+        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<uint64_t*>(buff) + 2, sizeof(uint64_t), hipMemcpyDeviceToHost));
+        printf("✓ Pure Address API uint64_t test completed. Result at index 2: %lu\n", result);
+      }
     }
 
     // ===== Test 3: Legacy API with int64_t =====
@@ -239,7 +253,8 @@ void testAtomicFetchThread() {
     MPI_Barrier(MPI_COMM_WORLD);
     
     if (myPe == 0) {
-      int64_t result = *(reinterpret_cast<int64_t*>(buff) + 2);
+      int64_t result;
+      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<int64_t*>(buff) + 2, sizeof(int64_t), hipMemcpyDeviceToHost));
       printf("✓ Legacy API int64_t test completed. Result at index 2: %ld\n", result);
     }
 
@@ -247,18 +262,25 @@ void testAtomicFetchThread() {
     if (myPe == 0) {
       printf("\n--- Test 4: Pure Address API (int64_t) ---\n");
     }
-    myHipMemsetD64(buff, myPe, numEle);
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
+    if (skipPureAddress) {
+      if (myPe == 0) {
+        printf("⊘ SKIPPED (MORI_SHMEM_MODE=ISOLATION)\n");
+      }
+    } else {
+      myHipMemsetD64(buff, myPe, numEle);
+      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+      MPI_Barrier(MPI_COMM_WORLD);
 
-    AtomicFetchThreadKernel_PureAddr<int64_t><<<blockNum, threadNum>>>(
-        myPe, reinterpret_cast<int64_t*>(buff));
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-    
-    if (myPe == 0) {
-      int64_t result = *(reinterpret_cast<int64_t*>(buff) + 2);
-      printf("✓ Pure Address API int64_t test completed. Result at index 2: %ld\n", result);
+      AtomicFetchThreadKernel_PureAddr<int64_t><<<blockNum, threadNum>>>(
+          myPe, reinterpret_cast<int64_t*>(buff));
+      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+      MPI_Barrier(MPI_COMM_WORLD);
+      
+      if (myPe == 0) {
+        int64_t result;
+        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<int64_t*>(buff) + 2, sizeof(int64_t), hipMemcpyDeviceToHost));
+        printf("✓ Pure Address API int64_t test completed. Result at index 2: %ld\n", result);
+      }
     }
 
     // ===== Test 5: Legacy API with uint32_t =====
@@ -274,7 +296,8 @@ void testAtomicFetchThread() {
     MPI_Barrier(MPI_COMM_WORLD);
     
     if (myPe == 0) {
-      uint32_t result = *(reinterpret_cast<uint32_t*>(buff) + 2);
+      uint32_t result;
+      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<uint32_t*>(buff) + 2, sizeof(uint32_t), hipMemcpyDeviceToHost));
       printf("✓ Legacy API uint32_t test completed. Result at index 2: %u\n", result);
     }
 
@@ -282,18 +305,25 @@ void testAtomicFetchThread() {
     if (myPe == 0) {
       printf("\n--- Test 6: Pure Address API (uint32_t) ---\n");
     }
-    HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff), myPe, numEle));
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
+    if (skipPureAddress) {
+      if (myPe == 0) {
+        printf("⊘ SKIPPED (MORI_SHMEM_MODE=ISOLATION)\n");
+      }
+    } else {
+      HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff), myPe, numEle));
+      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+      MPI_Barrier(MPI_COMM_WORLD);
 
-    AtomicFetchThreadKernel_PureAddr<uint32_t><<<blockNum, threadNum>>>(
-        myPe, reinterpret_cast<uint32_t*>(buff));
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-    
-    if (myPe == 0) {
-      uint32_t result = *(reinterpret_cast<uint32_t*>(buff) + 2);
-      printf("✓ Pure Address API uint32_t test completed. Result at index 2: %u\n", result);
+      AtomicFetchThreadKernel_PureAddr<uint32_t><<<blockNum, threadNum>>>(
+          myPe, reinterpret_cast<uint32_t*>(buff));
+      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+      MPI_Barrier(MPI_COMM_WORLD);
+      
+      if (myPe == 0) {
+        uint32_t result;
+        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<uint32_t*>(buff) + 2, sizeof(uint32_t), hipMemcpyDeviceToHost));
+        printf("✓ Pure Address API uint32_t test completed. Result at index 2: %u\n", result);
+      }
     }
 
     // ===== Test 7: Legacy API with int32_t =====
@@ -309,7 +339,8 @@ void testAtomicFetchThread() {
     MPI_Barrier(MPI_COMM_WORLD);
     
     if (myPe == 0) {
-      int32_t result = *(reinterpret_cast<int32_t*>(buff) + 2);
+      int32_t result;
+      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<int32_t*>(buff) + 2, sizeof(int32_t), hipMemcpyDeviceToHost));
       printf("✓ Legacy API int32_t test completed. Result at index 2: %d\n", result);
     }
 
@@ -317,18 +348,25 @@ void testAtomicFetchThread() {
     if (myPe == 0) {
       printf("\n--- Test 8: Pure Address API (int32_t) ---\n");
     }
-    HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<int32_t*>(buff), myPe, numEle));
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
+    if (skipPureAddress) {
+      if (myPe == 0) {
+        printf("⊘ SKIPPED (MORI_SHMEM_MODE=ISOLATION)\n");
+      }
+    } else {
+      HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<int32_t*>(buff), myPe, numEle));
+      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+      MPI_Barrier(MPI_COMM_WORLD);
 
-    AtomicFetchThreadKernel_PureAddr<int32_t><<<blockNum, threadNum>>>(
-        myPe, reinterpret_cast<int32_t*>(buff));
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-    
-    if (myPe == 0) {
-      int32_t result = *(reinterpret_cast<int32_t*>(buff) + 2);
-      printf("✓ Pure Address API int32_t test completed. Result at index 2: %d\n", result);
+      AtomicFetchThreadKernel_PureAddr<int32_t><<<blockNum, threadNum>>>(
+          myPe, reinterpret_cast<int32_t*>(buff));
+      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+      MPI_Barrier(MPI_COMM_WORLD);
+      
+      if (myPe == 0) {
+        int32_t result;
+        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<int32_t*>(buff) + 2, sizeof(int32_t), hipMemcpyDeviceToHost));
+        printf("✓ Pure Address API int32_t test completed. Result at index 2: %d\n", result);
+      }
     }
 
     // ===== Test 9: Legacy API with long =====
@@ -344,7 +382,8 @@ void testAtomicFetchThread() {
     MPI_Barrier(MPI_COMM_WORLD);
     
     if (myPe == 0) {
-      long result = *(reinterpret_cast<long*>(buff) + 2);
+      long result;
+      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<long*>(buff) + 2, sizeof(long), hipMemcpyDeviceToHost));
       printf("✓ Legacy API long test completed. Result at index 2: %ld\n", result);
     }
 
@@ -352,18 +391,25 @@ void testAtomicFetchThread() {
     if (myPe == 0) {
       printf("\n--- Test 10: Pure Address API (long) ---\n");
     }
-    myHipMemsetD64(buff, myPe, numEle);
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
+    if (skipPureAddress) {
+      if (myPe == 0) {
+        printf("⊘ SKIPPED (MORI_SHMEM_MODE=ISOLATION)\n");
+      }
+    } else {
+      myHipMemsetD64(buff, myPe, numEle);
+      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+      MPI_Barrier(MPI_COMM_WORLD);
 
-    AtomicFetchThreadKernel_PureAddr<long><<<blockNum, threadNum>>>(
-        myPe, reinterpret_cast<long*>(buff));
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-    
-    if (myPe == 0) {
-      long result = *(reinterpret_cast<long*>(buff) + 2);
-      printf("✓ Pure Address API long test completed. Result at index 2: %ld\n", result);
+      AtomicFetchThreadKernel_PureAddr<long><<<blockNum, threadNum>>>(
+          myPe, reinterpret_cast<long*>(buff));
+      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+      MPI_Barrier(MPI_COMM_WORLD);
+      
+      if (myPe == 0) {
+        long result;
+        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<long*>(buff) + 2, sizeof(long), hipMemcpyDeviceToHost));
+        printf("✓ Pure Address API long test completed. Result at index 2: %ld\n", result);
+      }
     }
 
     // ===== Test 11: Legacy API with unsigned long =====
@@ -379,7 +425,8 @@ void testAtomicFetchThread() {
     MPI_Barrier(MPI_COMM_WORLD);
     
     if (myPe == 0) {
-      unsigned long result = *(reinterpret_cast<unsigned long*>(buff) + 2);
+      unsigned long result;
+      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<unsigned long*>(buff) + 2, sizeof(unsigned long), hipMemcpyDeviceToHost));
       printf("✓ Legacy API unsigned long test completed. Result at index 2: %lu\n", result);
     }
 
@@ -387,18 +434,25 @@ void testAtomicFetchThread() {
     if (myPe == 0) {
       printf("\n--- Test 12: Pure Address API (unsigned long) ---\n");
     }
-    myHipMemsetD64(buff, myPe, numEle);
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
+    if (skipPureAddress) {
+      if (myPe == 0) {
+        printf("⊘ SKIPPED (MORI_SHMEM_MODE=ISOLATION)\n");
+      }
+    } else {
+      myHipMemsetD64(buff, myPe, numEle);
+      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+      MPI_Barrier(MPI_COMM_WORLD);
 
-    AtomicFetchThreadKernel_PureAddr<unsigned long><<<blockNum, threadNum>>>(
-        myPe, reinterpret_cast<unsigned long*>(buff));
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-    
-    if (myPe == 0) {
-      unsigned long result = *(reinterpret_cast<unsigned long*>(buff) + 2);
-      printf("✓ Pure Address API unsigned long test completed. Result at index 2: %lu\n", result);
+      AtomicFetchThreadKernel_PureAddr<unsigned long><<<blockNum, threadNum>>>(
+          myPe, reinterpret_cast<unsigned long*>(buff));
+      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+      MPI_Barrier(MPI_COMM_WORLD);
+      
+      if (myPe == 0) {
+        unsigned long result;
+        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<unsigned long*>(buff) + 2, sizeof(unsigned long), hipMemcpyDeviceToHost));
+        printf("✓ Pure Address API unsigned long test completed. Result at index 2: %lu\n", result);
+      }
     }
 
     // ===== Test 13: AtomicFetchAdd Convenience API with unsigned long (Legacy) =====
@@ -414,7 +468,8 @@ void testAtomicFetchThread() {
     MPI_Barrier(MPI_COMM_WORLD);
     
     if (myPe == 0) {
-      unsigned long result = *(reinterpret_cast<unsigned long*>(buff) + 2);
+      unsigned long result;
+      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<unsigned long*>(buff) + 2, sizeof(unsigned long), hipMemcpyDeviceToHost));
       printf("✓ ShmemUlongAtomicFetchAddThread API test completed. Result at index 2: %lu\n", result);
     }
 
@@ -422,18 +477,25 @@ void testAtomicFetchThread() {
     if (myPe == 0) {
       printf("\n--- Test 14: ShmemUlongAtomicFetchAddThread API (Pure Address) ---\n");
     }
-    myHipMemsetD64(buff, myPe, numEle);
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
+    if (skipPureAddress) {
+      if (myPe == 0) {
+        printf("⊘ SKIPPED (MORI_SHMEM_MODE=ISOLATION)\n");
+      }
+    } else {
+      myHipMemsetD64(buff, myPe, numEle);
+      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+      MPI_Barrier(MPI_COMM_WORLD);
 
-    UlongAtomicFetchAddThreadKernel_PureAddr<<<blockNum, threadNum>>>(
-        myPe, reinterpret_cast<unsigned long*>(buff));
-    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-    
-    if (myPe == 0) {
-      unsigned long result = *(reinterpret_cast<unsigned long*>(buff) + 2);
-      printf("✓ ShmemUlongAtomicFetchAddThread API (Pure Address) test completed. Result at index 2: %lu\n", result);
+      UlongAtomicFetchAddThreadKernel_PureAddr<<<blockNum, threadNum>>>(
+          myPe, reinterpret_cast<unsigned long*>(buff));
+      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+      MPI_Barrier(MPI_COMM_WORLD);
+      
+      if (myPe == 0) {
+        unsigned long result;
+        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<unsigned long*>(buff) + 2, sizeof(unsigned long), hipMemcpyDeviceToHost));
+        printf("✓ ShmemUlongAtomicFetchAddThread API (Pure Address) test completed. Result at index 2: %lu\n", result);
+      }
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
