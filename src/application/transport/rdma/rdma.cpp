@@ -272,8 +272,13 @@ RdmaDeviceContext::RdmaDeviceContext(RdmaDevice* device, ibv_pd* inPd) : device(
 }
 
 RdmaDeviceContext::~RdmaDeviceContext() {
-  ibv_dealloc_pd(pd);
+  for (auto& it : mrPool) {
+    ibv_dereg_mr(it.second);
+  }
+  mrPool.clear();
+
   if (srq != nullptr) ibv_destroy_srq(srq);
+  ibv_dealloc_pd(pd);
 }
 
 RdmaDevice* RdmaDeviceContext::GetRdmaDevice() { return device; }
