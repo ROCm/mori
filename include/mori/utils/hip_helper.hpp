@@ -21,34 +21,31 @@
 // SOFTWARE.
 #pragma once
 
-#include "infiniband/verbs.h"
-#include "mori/application/transport/rdma/rdma.hpp"
+#include <hip/hip_runtime.h>
 
 namespace mori {
-namespace application {
+inline int GetMultiProcessorCount(int device) {
+  hipDeviceProp_t prop;
+  HIP_RUNTIME_CHECK(hipGetDeviceProperties(&prop, device));
+  return prop.multiProcessorCount;
+}
 
-class IBVerbsDeviceContext : public RdmaDeviceContext {
- public:
-  IBVerbsDeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd);
-  ~IBVerbsDeviceContext() override;
+inline int GetCurDeviceMultiProcessorCount() {
+  int device = 0;
+  HIP_RUNTIME_CHECK(hipGetDevice(&device));
+  return GetMultiProcessorCount(device);
+}
 
-  virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) override;
-  virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote,
-                               uint32_t qpId = 0) override;
+inline int GetDeviceWallClockFreqMhz(int device) {
+  int rate;
+  HIP_RUNTIME_CHECK(hipDeviceGetAttribute(&rate, hipDeviceAttributeWallClockRate, device));
+  return rate;
+}
 
- private:
-  std::unordered_map<void*, ibv_cq*> cqPool;
-  std::unordered_map<uint32_t, ibv_qp*> qpPool;
-  std::vector<ibv_comp_channel*> compChPool;
-};
+inline int GetCurDeviceWallClockFreqMhz() {
+  int device = 0;
+  HIP_RUNTIME_CHECK(hipGetDevice(&device));
+  return GetDeviceWallClockFreqMhz(device);
+}
 
-class IBVerbsDevice : public RdmaDevice {
- public:
-  IBVerbsDevice(ibv_device* device);
-  ~IBVerbsDevice() override;
-
-  RdmaDeviceContext* CreateRdmaDeviceContext() override;
-};
-
-}  // namespace application
 }  // namespace mori

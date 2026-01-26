@@ -1,6 +1,6 @@
-# Mori Kernel Profiler
+# MORI-VIZ (Visualizer)
 
-Mori provides a high-performance, low-overhead kernel profiler designed to trace GPU execution at the warp level. It allows developers to instrument C++ kernel code with minimal impact on performance and visualize the execution timelines using [Perfetto](https://ui.perfetto.dev/).
+MORI-VIZ is a high-performance, low-overhead kernel profiler designed to trace GPU execution at the warp level. It allows developers to instrument C++ kernel code with minimal impact on performance and visualize the execution timelines using [Perfetto](https://ui.perfetto.dev/).
 
 ## Overview
 
@@ -153,18 +153,13 @@ if hasattr(mori.cpp, "get_debug_time_buf"):
 
 The first option is recommended as it automatically discovers all profiler slots from your build.
 
-### GPU Frequency Configuration
+### Device-side elapsed time meauerment
 
-The `gpu_freq_ghz` parameter converts raw GPU clock cycles to microseconds. The default `1.7` is approximate for MI300X.
+MORI-VIZ use `wall_clock64` to measure device-side elapsed time. The `gpu_freq_ghz` parameter can be used to set hardware frequency for `wall_clock64`, by default mori query it through `hipDeviceGetAttribute(&rate, hipDeviceAttributeWallClockRate, device)` API. to override it:
 
-To get accurate timing:
-1. Query the actual SCLK frequency:
-   ```bash
-   rocm-smi --showclocks
-   ```
-2. Pass the value to `export_to_perfetto`:
+Pass the value to `export_to_perfetto`:
    ```python
-   export_to_perfetto(trace_buffer, "trace.json", gpu_freq_ghz=1.9)
+   export_to_perfetto(trace_buffer, "trace.json", gpu_freq_ghz=0.1)
    ```
 
 ### Viewing the Trace

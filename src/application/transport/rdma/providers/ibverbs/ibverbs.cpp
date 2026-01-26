@@ -35,6 +35,9 @@ IBVerbsDeviceContext::IBVerbsDeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd
 IBVerbsDeviceContext::~IBVerbsDeviceContext() {
   for (auto& it : qpPool) ibv_destroy_qp(it.second);
   for (auto& it : cqPool) ibv_destroy_cq(it.second);
+  for (auto* compCh : compChPool) {
+    if (compCh) ibv_destroy_comp_channel(compCh);
+  }
 }
 
 RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& config) {
@@ -96,6 +99,9 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
 
   cqPool.insert({endpoint.ibvHandle.cq, endpoint.ibvHandle.cq});
   qpPool.insert({endpoint.ibvHandle.qp->qp_num, endpoint.ibvHandle.qp});
+  if (endpoint.ibvHandle.compCh) {
+    compChPool.push_back(endpoint.ibvHandle.compCh);
+  }
   return endpoint;
 }
 

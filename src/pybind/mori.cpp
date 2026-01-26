@@ -38,6 +38,7 @@
 #include "mori/ops/ops.hpp"
 #include "mori/pybind/profiler_registry.hpp"
 #include "mori/shmem/shmem.hpp"
+#include "mori/utils/hip_helper.hpp"
 #include "src/pybind/torch_utils.hpp"
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -196,6 +197,8 @@ torch::Tensor GetDebugTimeOffset(mori::moe::EpDispatchCombineHandle& handle) {
   return tensor;
 }
 #endif
+
+int GetCurDeviceWallClockFreqMhz() { return mori::GetCurDeviceWallClockFreqMhz(); }
 
 void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   std::string className = std::string("EpDispatchCombineHandle");
@@ -365,6 +368,9 @@ void RegisterMoriOps(py::module_& m) {
       .def_readwrite("num_qp_per_pe", &mori::moe::EpDispatchCombineConfig::numQpPerPe);
 
   DeclareEpDispatchCombineHandle(m);
+
+  m.def("get_cur_device_wall_clock_freq_mhz", &GetCurDeviceWallClockFreqMhz,
+        "Returns clock frequency of current device's wall clock");
 }
 
 void RegisterMoriShmem(py::module_& m) {
@@ -454,6 +460,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .value("ERR_NOT_FOUND", mori::io::StatusCode::ERR_NOT_FOUND)
       .value("ERR_RDMA_OP", mori::io::StatusCode::ERR_RDMA_OP)
       .value("ERR_BAD_STATE", mori::io::StatusCode::ERR_BAD_STATE)
+      .value("ERR_GPU_OP", mori::io::StatusCode::ERR_GPU_OP)
       .export_values();
 
   py::enum_<mori::io::PollCqMode>(m, "PollCqMode")
@@ -472,6 +479,11 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readwrite("num_worker_threads", &mori::io::RdmaBackendConfig::numWorkerThreads)
       .def_readwrite("poll_cq_mode", &mori::io::RdmaBackendConfig::pollCqMode)
       .def_readwrite("enable_notification", &mori::io::RdmaBackendConfig::enableNotification);
+
+  py::class_<mori::io::XgmiBackendConfig, mori::io::BackendConfig>(m, "XgmiBackendConfig")
+      .def(py::init<int, int>(), py::arg("num_streams") = 64, py::arg("num_events") = 64)
+      .def_readwrite("num_streams", &mori::io::XgmiBackendConfig::numStreams)
+      .def_readwrite("num_events", &mori::io::XgmiBackendConfig::numEvents);
 
   py::class_<mori::io::IOEngineConfig>(m, "IOEngineConfig")
       .def(py::init<std::string, uint16_t>(), py::arg("host") = "", py::arg("port") = 0)
@@ -521,6 +533,10 @@ void RegisterMoriIo(pybind11::module_& m) {
                              })
       .def_readonly("size", &mori::io::MemoryDesc::size)
       .def_readonly("loc", &mori::io::MemoryDesc::loc)
+      .def_property_readonly("ipc_handle",
+                             [](const mori::io::MemoryDesc& desc) {
+                               return py::bytes(desc.ipcHandle.data(), desc.ipcHandle.size());
+                             })
       .def(pybind11::self == pybind11::self)
       .def("pack",
            [](const mori::io::MemoryDesc& d) {

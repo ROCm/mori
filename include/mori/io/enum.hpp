@@ -48,7 +48,8 @@ enum class StatusCode : uint32_t {
   ERR_INVALID_ARGS = 11,
   ERR_NOT_FOUND = 12,
   ERR_RDMA_OP = 13,
-  ERR_BAD_STATE = 14
+  ERR_BAD_STATE = 14,
+  ERR_GPU_OP = 15
 };
 
 enum class PollCqMode : uint32_t { POLLING = 0, EVENT = 1 };
