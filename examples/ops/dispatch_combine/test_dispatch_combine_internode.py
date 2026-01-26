@@ -648,7 +648,7 @@ class EpDispatchCombineTestCase:
                 f"trace_rank_{self.rank}_{time.strftime('%m%d_%H%M%S')}.json"
             )
             mori.kernel_profiler.export_to_perfetto(
-                my_times, output_filename, gpu_freq_ghz=1.7
+                my_times, output_filename, gpu_freq_ghz=0.1
             )
             if self.rank == 0:
                 print(f"Profiling data exported to {output_filename}")
