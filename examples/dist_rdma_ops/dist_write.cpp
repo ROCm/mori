@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include <hip/hip_runtime.h>
 #include <mpi.h>
+#include <unistd.h>
 
 #include "args_parser.hpp"
 #include "mori/application/application.hpp"
@@ -537,6 +538,7 @@ void distRdmaOps(int argc, char* argv[]) {
   // 4 Register buffer and block sync memory
   void* buffer;
   hipMemGenericAllocationHandle_t vmmHandle;  // VMM handle (only used if useVMM is true)
+  int vmmDmabufFd = -1;  // dmabuf file descriptor for VMM memory
   size_t totalSize = maxSize * blocks * threads;
   assert(totalSize <= 0x1000000000ULL && "Error: totalSize cannot exceed 64GB!");
   
@@ -592,6 +594,12 @@ void distRdmaOps(int argc, char* argv[]) {
     }
     std::cout << "]" << std::endl;
     
+    // Export VMM handle as dmabuf fd for RDMA registration
+    HIP_RUNTIME_CHECK(hipMemExportToShareableHandle(
+        &vmmDmabufFd, vmmHandle, hipMemHandleTypePosixFileDescriptor, 0));
+    
+    std::cout << "Local rank " << local_rank << " VMM dmabuf fd: " << vmmDmabufFd << std::endl;
+    
     // Initialize buffer
     HIP_RUNTIME_CHECK(hipMemset(buffer, local_rank, totalSize));
     
@@ -604,15 +612,20 @@ void distRdmaOps(int argc, char* argv[]) {
     HIP_RUNTIME_CHECK(hipMalloc(&buffer, totalSize));
     HIP_RUNTIME_CHECK(hipMemset(buffer, local_rank, totalSize));
   }
+  
   uint32_t* blockSync;
   HIP_RUNTIME_CHECK(hipMalloc(&blockSync, (warmupIters + iters + 1) * sizeof(uint32_t)));
   HIP_RUNTIME_CHECK(hipMemset(blockSync, 0, (warmupIters + iters + 1) * sizeof(uint32_t)));
 
-  // assert(!posix_memalign(&buffer_1, 4096, allreduce_size));
-  // memset(buffer_1, 1, allreduce_size);
-  // Register RDMA memory region with the actual allocated size (bufferSize, not totalSize)
-  RdmaMemoryRegion mr_handle =
-      device_context->RegisterRdmaMemoryRegion(buffer, bufferSize, MR_ACCESS_FLAG);
+  RdmaMemoryRegion mr_handle;
+  if (useVMM && vmmDmabufFd >= 0) {
+    // Use dmabuf registration for VMM memory
+    mr_handle = device_context->RegisterRdmaMemoryRegionDmabuf(buffer, bufferSize, vmmDmabufFd, MR_ACCESS_FLAG);
+    std::cout << "Local rank " << local_rank << " registered VMM buffer via dmabuf (fd=" << vmmDmabufFd << ")" << std::endl;
+  } else {
+    // Use standard registration for hipMalloc memory
+    mr_handle = device_context->RegisterRdmaMemoryRegion(buffer, bufferSize, MR_ACCESS_FLAG);
+  }
   std::vector<RdmaMemoryRegion> global_mr_handles(world_size);
   bootNet.Allgather(&mr_handle, global_mr_handles.data(), sizeof(mr_handle));
   global_mr_handles[local_rank] = mr_handle;
@@ -751,13 +764,16 @@ void distRdmaOps(int argc, char* argv[]) {
   
   // Cleanup buffer
   if (useVMM) {
+    // Close dmabuf fd if it was opened
+    if (vmmDmabufFd >= 0) {
+      close(vmmDmabufFd);
+    }
+    
     // VMM cleanup using the saved bufferSize
     HIP_RUNTIME_CHECK(hipMemUnmap(buffer, bufferSize));
     HIP_RUNTIME_CHECK(hipMemRelease(vmmHandle));
     HIP_RUNTIME_CHECK(hipMemAddressFree(buffer, bufferSize));
     
-    std::cout << "Local rank " << local_rank << " VMM buffer cleaned up (size=" 
-              << bufferSize << ")" << std::endl;
   } else {
     // Standard hipFree
     HIP_RUNTIME_CHECK(hipFree(buffer));
