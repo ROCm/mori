@@ -24,6 +24,7 @@
 #include <pthread.h>
 #include <sched.h>
 
+#include <cstring>
 #include <future>
 
 #include "mori/io/logging.hpp"
@@ -63,11 +64,17 @@ void MultithreadExecutor::Worker::MainLoop() {
 
   cpu_set_t cpuset;
   CPU_ZERO(&cpuset);
-  CPU_SET(workerId + coreOffset, &cpuset);
+  int targetCore = workerId + coreOffset;
+  CPU_SET(targetCore, &cpuset);
 
   int rc = pthread_setaffinity_np(thd.native_handle(), sizeof(cpu_set_t), &cpuset);
   if (rc != 0) {
-    throw std::runtime_error("Error setting thread affinity");
+    MORI_IO_WARN(
+        "worker {} failed to set affinity to core {}: errno={} ({}). "
+        "Worker will run on any available core. "
+        "This is usually caused by: CPU not available in cpuset, "
+        "NUMA configuration, or container CPU limits.",
+        workerId, targetCore, rc, strerror(rc));
   }
 
   MORI_IO_INFO("worker {} enter main loop, running on core {}", workerId, sched_getcpu());
