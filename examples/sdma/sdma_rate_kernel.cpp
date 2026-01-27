@@ -1,3 +1,11 @@
+/**
+ * @acknowledgements:
+ * - Original implementation by: Sidler, David
+ * - Source: https://github.com/AARInternal/shader_sdma
+ * 
+ * @note: This code is adapted/modified from the implementation by Sidler, David
+ */
+
 #include "sdma_rate_kernel.h"
 
 __global__ void packet_rate_kernel(void* srcBuf, void* dstBuf, size_t copy_size, size_t numCopyCommands,
