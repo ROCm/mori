@@ -104,10 +104,10 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
 
 // TODO: translate data type
 // template <typename T>
-std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>> LaunchCombine(
     mori::moe::EpDispatchCombineHandle& handle, int kernelType, const torch::Tensor& input,
     const std::optional<torch::Tensor>& weights, const torch::Tensor& topkIds, int blockNum,
-    int warpPerBlock) {
+    int warpPerBlock, const std::optional<torch::Tensor>& scales) {
   assert(input.is_contiguous() && topkIds.is_contiguous());
 
   float* weightsPtr = nullptr;
@@ -116,8 +116,14 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
     weightsPtr = weights->data_ptr<float>();
   }
 
+  uint8_t* scalesPtr = nullptr;
+  if (scales.has_value() && scales->numel() != 0) {
+    assert(scales->is_contiguous());
+    scalesPtr = reinterpret_cast<uint8_t*>(scales->data_ptr());
+  }
+
   handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
-                          nullptr, weightsPtr, topkIds.data_ptr<mori::moe::index_t>(),
+                          nullptr, weightsPtr, scalesPtr, topkIds.data_ptr<mori::moe::index_t>(),
                           handle.curRankNumToken);
   handle.LaunchCombine((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
                        at::cuda::getCurrentHIPStream());
@@ -135,7 +141,15 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
                          torch::TensorOptions().dtype(weights->scalar_type()).device(torch::kCUDA));
   }
 
-  return {out, outWeights};
+  std::optional<torch::Tensor> outScales{std::nullopt};
+  if (scalesPtr && (handle.config.scaleDim > 0)) {
+    outScales =
+        torch::from_blob(handle.shmemOutScalesMemObj->Get(),
+                         {handle.config.maxNumInpTokenPerRank, handle.config.scaleDim},
+                         torch::TensorOptions().dtype(scales->scalar_type()).device(torch::kCUDA));
+  }
+
+  return {out, outWeights, outScales};
 }
 
 void LaunchReset(mori::moe::EpDispatchCombineHandle& handle) {

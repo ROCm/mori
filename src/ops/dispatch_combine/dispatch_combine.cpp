@@ -329,8 +329,12 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
           if constexpr (std::is_same_v<DataT, __hip_fp8_e4m3> ||
                         std::is_same_v<DataT, __hip_fp8_e4m3_fnuz>) {
             EpCombineInterNodeV1KernelFp8Accum<<<grid, block, sharedMemSize, stream>>>(args);
-            EpCombineAllFp8FromBf16<<<this->multiProcessorCount, block, sharedMemSize, stream>>>(
-                args);
+
+            int nNodes = config.worldSize / config.gpuPerNode;
+            size_t fp8AllSharedMemSize = nNodes * (sizeof(hip_bfloat16*) + sizeof(float*)) +
+                                         config.scaleDim * (sizeof(uint32_t) + sizeof(float));
+            EpCombineAllFp8FromBf16<<<this->multiProcessorCount, block, fp8AllSharedMemSize,
+                                      stream>>>(args);
           } else {
             EpCombineInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
             EpCombineAll<<<this->multiProcessorCount, block, sharedMemSize, stream>>>(args);

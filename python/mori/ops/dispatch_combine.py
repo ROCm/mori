@@ -22,6 +22,7 @@
 from mori import cpp as mori_cpp
 
 from dataclasses import dataclass
+from typing import Optional
 import torch
 import torch.distributed as dist
 
@@ -129,6 +130,7 @@ class EpDispatchCombineOp:
         input: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
+        scales: Optional[torch.Tensor] = None,
         block_num: int = -1,
         warp_per_block: int = -1,
         call_reset: bool = False,
@@ -141,9 +143,12 @@ class EpDispatchCombineOp:
             indices,
             block_num,
             warp_per_block,
+            scales,
         )
         if call_reset:
             self._reset_func(self._handle)
+        if scales is None:
+            return output[0], output[1]
         return output
 
     def reset(self):

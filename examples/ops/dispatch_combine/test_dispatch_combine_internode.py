@@ -198,31 +198,48 @@ class EpDispatchCombineTestCase:
             for r in range(self.world_size)
         ]
 
-        # gen scales
+        # gen scales (must be > 0 for fp8-with-scale semantics)
         all_rank_scales = [
-            torch.rand(
-                num_token[r],
-                self.config.scale_dim,
-                dtype=torch.float32,
-                generator=self.rng,
-                device=self.device,
+            (
+                0.1
+                + torch.rand(
+                    num_token[r],
+                    self.config.scale_dim,
+                    dtype=torch.float32,
+                    generator=self.rng,
+                    device=self.device,
+                )
             )
             for r in range(self.world_size)
         ]
 
         # gen input & output
-        # some functions such as randn and cat are not implemented for fp8
+        # For FP8-with-scale semantics, store x_fp8 = quantize(x_real / scale).
+        assert (
+            self.config.hidden_dim % self.config.scale_dim == 0
+        ), "hidden_dim must be divisible by scale_dim"
+        group_size = self.config.hidden_dim // self.config.scale_dim
+
         all_rank_input = []
         for r in range(self.world_size):
-            all_rank_input.append(
+            x_real = (
                 torch.randn(
                     num_token[r],
                     self.config.hidden_dim,
                     dtype=torch.float32,
                     generator=self.rng,
                     device=self.device,
-                ).to(self.config.data_type)
+                )
+                * 0.1
             )
+            if self.config.data_type in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+                scales_expanded = all_rank_scales[r].repeat_interleave(
+                    group_size, dim=1
+                )
+                x_fp8 = (x_real / scales_expanded).to(self.config.data_type)
+                all_rank_input.append(x_fp8)
+            else:
+                all_rank_input.append(x_real.to(self.config.data_type))
 
         return (
             num_token,
@@ -346,14 +363,19 @@ class EpDispatchCombineTestCase:
         if self.rank % self.gpu_per_node == 0:
             print(f"Node {self.rank // self.gpu_per_node} Dispatch Pass")
 
-        combine_output, combine_output_weight = op.combine(
+        combine_output, combine_output_weight, combine_scales = op.combine(
             dispatch_output,
             dispatch_weights,
             all_rank_indices[self.rank],
+            scales=dispatch_scales,
             block_num=self.config.block_num,
             # warp_per_block=16,
         )
         torch.cuda.synchronize()
+
+        group_size = self.config.hidden_dim // self.config.scale_dim
+        combine_scales_expanded = combine_scales.repeat_interleave(group_size, dim=1)
+
         for i in range(all_rank_num_token[self.rank]):
             pes = [
                 (idx // self.config.num_experts_per_rank)
@@ -371,28 +393,41 @@ class EpDispatchCombineTestCase:
             if final_unique_pes == 0:
                 continue
 
-            got, expected = combine_output[i], (
-                all_rank_input[self.rank][i].to(torch.float32) * final_unique_pes
-            ).to(self.config.data_type)
+            if self.config.data_type in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+                inp_scales_expanded = all_rank_scales[self.rank][i].repeat_interleave(
+                    group_size
+                )
+                inp_real = all_rank_input[self.rank][i].float() * inp_scales_expanded
+                expected_real = inp_real * final_unique_pes
+                got_real = combine_output[i].float() * combine_scales_expanded[i]
+                ok = torch.allclose(got_real, expected_real, atol=2e-1, rtol=1e-1)
+            else:
+                got, expected = combine_output[i], (
+                    all_rank_input[self.rank][i].to(torch.float32) * final_unique_pes
+                ).to(self.config.data_type)
+                ok = torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
-            ok = torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
             if not ok:
                 print(
                     self.rank,
                     f"token {i} pes {pes} unique pes {unique_pes} unique innode pes {unique_innode_pes}",
                 )
-                print(
-                    f"{self.rank} got: ",
-                    got,
-                    f"{self.rank} expected: ",
-                    expected,
-                    all_rank_input[self.rank][i],
-                )
-                # delta = got.float() - expected.float()
-                # print(self.rank, "delta:", delta)
-                # error_round.add(round)
+                if self.config.data_type in (
+                    torch.float8_e4m3fn,
+                    torch.float8_e4m3fnuz,
+                ):
+                    print(f"{self.rank} got_real: ", got_real)
+                    print(f"{self.rank} expected_real: ", expected_real)
+                    print("inp_fp8:", all_rank_input[self.rank][i])
+                else:
+                    print(
+                        f"{self.rank} got: ",
+                        got,
+                        f"{self.rank} expected: ",
+                        expected,
+                        all_rank_input[self.rank][i],
+                    )
                 assert False
-                # pass
 
             if dispatch_weights is not None:
                 got_weight, expected_weight = (
@@ -402,22 +437,6 @@ class EpDispatchCombineTestCase:
                 weight_match = torch.allclose(
                     got_weight, expected_weight, atol=1e-5, rtol=1e-5
                 )
-                if not weight_match and self.config.rank == 0:
-                    print(f"Weight mismatch for token {i}:")
-                    print(
-                        f"  indices[{i}]: {all_rank_indices[self.rank][i].cpu().tolist()}"
-                    )
-                    print(f"  pes: {pes}")
-                    print(f"  unique_pes: {unique_pes}")
-                    print(f"  got_weight: {got_weight}")
-                    print(
-                        f"  expected_weight (weights[{i}] * {unique_pes}): {expected_weight}"
-                    )
-                    print(f"  original weights[{i}]: {all_rank_weights[self.rank][i]}")
-                    print(f"  diff: {torch.abs(got_weight - expected_weight)}")
-                    print(
-                        f"  max_diff: {torch.abs(got_weight - expected_weight).max()}"
-                    )
                 assert weight_match, f"Weight assertion failed for token {i}"
         if self.rank % self.gpu_per_node == 0:
             print(f"Node {self.rank // self.gpu_per_node} Combine Pass")
@@ -482,10 +501,11 @@ class EpDispatchCombineTestCase:
                 block_num=self.config.block_num,
                 # warp_per_block=16,
             )
-            _, _ = op.combine(
+            _, _, _ = op.combine(
                 dispatch_output,
                 dispatch_weights,
                 all_rank_indices[self.rank],
+                scales=dispatch_scales,
                 block_num=self.config.block_num,
                 # warp_per_block=16,
             )
@@ -522,10 +542,11 @@ class EpDispatchCombineTestCase:
                 block_num=self.config.block_num,
                 # warp_per_block=16,
             )
-            _, _ = op.combine(
+            _, _, _ = op.combine(
                 dispatch_output,
                 dispatch_weights,
                 all_rank_indices[self.rank],
+                scales=dispatch_scales,
                 block_num=self.config.block_num,
                 # warp_per_block=16,
             )
@@ -567,11 +588,11 @@ class EpDispatchCombineTestCase:
             )
             torch.cuda.synchronize()
             total_recv_num_token = dispatch_recv_num_token[0].item()
-            combine_output, _ = op.combine(
+            combine_output, _, _ = op.combine(
                 dispatch_output,
                 dispatch_weights,
-                # None,
                 all_rank_indices[self.rank],
+                scales=dispatch_scales,
                 block_num=self.config.block_num,
                 # warp_per_block=16,
             )
@@ -601,10 +622,11 @@ class EpDispatchCombineTestCase:
                 # warp_per_block=16,
             )
             events[2 * i + 1].record()
-            combine_output, _ = op.combine(
+            combine_output, _, _ = op.combine(
                 dispatch_output,
                 dispatch_weights,
                 all_rank_indices[self.rank],
+                scales=dispatch_scales,
                 block_num=self.config.block_num,
                 # warp_per_block=16,
             )
