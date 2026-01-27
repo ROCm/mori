@@ -144,7 +144,7 @@ void testOneShotSdmaAllGather() {
 //  double local_duration = end - start;
 
   double global_max_duration;
-  MPI_Reduce(&local_duration, &globaql_max_duration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+  MPI_Reduce(&local_duration, &global_max_duration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
   MPI_Barrier(MPI_COMM_WORLD);
 
   if (myPe == 0) {
