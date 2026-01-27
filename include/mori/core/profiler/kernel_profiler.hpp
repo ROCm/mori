@@ -1,0 +1,181 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+#pragma once
+
+#include <hip/hip_runtime.h>
+
+#ifdef ENABLE_PROFILER
+#define IF_ENABLE_PROFILER(x) x
+#else
+#define IF_ENABLE_PROFILER(x) ((void)0)
+#endif
+
+namespace mori {
+namespace core {
+
+namespace profiler {
+
+#ifdef ENABLE_PROFILER
+
+enum class EventType : uint8_t { BEGIN = 0, END = 1, INSTANT = 2 };
+
+struct ProfilerConfig {
+  int64_t* debugTimeBuf;
+  unsigned int* debugTimeOffset;
+};
+
+struct ProfilerContext {
+  int64_t* debugTimeBuf;
+  unsigned int* debugTimeOffset;
+  int globalWarpId;
+  int laneId;
+
+  __device__ ProfilerContext(const ProfilerConfig& cfg, int gid, int lid)
+      : debugTimeBuf(cfg.debugTimeBuf),
+        debugTimeOffset(cfg.debugTimeOffset),
+        globalWarpId(gid),
+        laneId(lid) {}
+};
+
+template <typename SlotEnum, int MaxEventsPerWarp>
+struct TraceProfiler {
+  using slot_type = SlotEnum;
+
+  int64_t* warp_buffer;
+  unsigned int* warp_offset;
+  int lane_id;
+  int warp_id;
+
+  __device__ TraceProfiler(const ProfilerContext& ctx)
+      : warp_buffer(ctx.debugTimeBuf),
+        warp_offset(ctx.debugTimeOffset),
+        lane_id(ctx.laneId),
+        warp_id(ctx.globalWarpId) {}
+
+  __device__ inline void log(SlotEnum slot, EventType type) {
+    log_with_time(slot, type, wall_clock64());
+  }
+
+  __device__ inline void log_with_time(SlotEnum slot, EventType type, int64_t ts) {
+    if (lane_id == 0) {
+      unsigned int idx = *warp_offset;
+      *warp_offset = (idx + 2) % (MaxEventsPerWarp * 2);
+      int64_t meta = ((int64_t)warp_id << 16) | ((int64_t)slot << 2) | (int)type;
+      warp_buffer[idx] = ts;
+      warp_buffer[idx + 1] = meta;
+    }
+  }
+};
+
+template <bool Enabled, typename ProfilerType, typename SlotEnum>
+struct ProfilerSpan {
+  ProfilerType& profiler;
+  SlotEnum slot;
+
+  __device__ ProfilerSpan(ProfilerType& prof, SlotEnum s) : profiler(prof), slot(s) {
+    profiler.log(slot, EventType::BEGIN);
+  }
+
+  __device__ ~ProfilerSpan() { profiler.log(slot, EventType::END); }
+};
+
+template <typename ProfilerType, typename SlotEnum>
+struct ProfilerSpan<false, ProfilerType, SlotEnum> {
+  __device__ ProfilerSpan(ProfilerType&, SlotEnum) {}
+  __device__ ~ProfilerSpan() {}
+};
+
+template <bool Enabled, typename ProfilerType, typename SlotEnum>
+struct ProfilerSequential {
+  ProfilerType& profiler;
+  SlotEnum current_slot;
+  bool has_current;
+
+  __device__ ProfilerSequential(ProfilerType& prof)
+      : profiler(prof), current_slot(), has_current(false) {}
+
+  __device__ inline void next(SlotEnum slot) {
+    if (has_current) {
+      if (profiler.lane_id == 0) {
+        int64_t ts = wall_clock64();
+        profiler.log_with_time(current_slot, EventType::END, ts);
+        profiler.log_with_time(slot, EventType::BEGIN, ts);
+      }
+    } else {
+      profiler.log(slot, EventType::BEGIN);
+      has_current = true;
+    }
+    current_slot = slot;
+  }
+
+  __device__ ~ProfilerSequential() {
+    if (has_current) {
+      profiler.log(current_slot, EventType::END);
+    }
+  }
+};
+
+template <typename ProfilerType, typename SlotEnum>
+struct ProfilerSequential<false, ProfilerType, SlotEnum> {
+  __device__ ProfilerSequential(ProfilerType&) {}
+  __device__ inline void next(SlotEnum) {}
+  __device__ ~ProfilerSequential() {}
+};
+
+#define MORI_DECLARE_PROFILER_CONTEXT(name, SlotType, CtxType, construction)    \
+  using ProfilerContext = CtxType;                                              \
+  using Slot = SlotType;                                                        \
+  using __ProfilerType_##name =                                                 \
+      mori::core::profiler::TraceProfiler<SlotType, MAX_TRACE_EVENTS_PER_WARP>; \
+  ProfilerContext __prof_ctx_##name = construction;                             \
+  size_t __profiler_base_##name =                                               \
+      (size_t)(__prof_ctx_##name.globalWarpId) * MAX_DEBUG_TIMESTAMP_PER_WARP;  \
+  __prof_ctx_##name.debugTimeBuf += __profiler_base_##name;                     \
+  __prof_ctx_##name.debugTimeOffset += __prof_ctx_##name.globalWarpId;          \
+  __ProfilerType_##name name(__prof_ctx_##name)
+
+#define MORI_TRACE_SPAN(profiler, slot)                                                           \
+  mori::core::profiler::ProfilerSpan<true, decltype(profiler), decltype(slot)> __span_##__LINE__( \
+      profiler, slot)
+
+#define MORI_TRACE_SEQ(name, profiler)                                             \
+  mori::core::profiler::ProfilerSequential<true, decltype(profiler),               \
+                                           typename decltype(profiler)::slot_type> \
+  name(profiler)
+
+#define MORI_TRACE_NEXT(name, slot) name.next(slot)
+
+#define MORI_TRACE_INSTANT(profiler, slot) \
+  profiler.log(slot, mori::core::profiler::EventType::INSTANT)
+#else
+#define MORI_DECLARE_PROFILER_CONTEXT(name, SlotType, CtxType, construction) ((void)0)
+#define MORI_TRACE_SPAN(profiler, slot) ((void)0)
+#define MORI_TRACE_SEQ(name, profiler) ((void)0)
+#define MORI_TRACE_NEXT(name, slot) ((void)0)
+#define MORI_TRACE_INSTANT(profiler, slot) ((void)0)
+
+#endif
+
+}  // namespace profiler
+}  // namespace core
+}  // namespace mori

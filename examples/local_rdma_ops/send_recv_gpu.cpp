@@ -65,12 +65,11 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion mr, int 
 template <ProviderType P>
 __device__ void RecvThreadKernel(RdmaEndpoint& epRecv, RdmaMemoryRegion mr, int msgSize,
                                  int msgNum) {
-
   for (int i = 0; i < msgNum; i++) {
     uint8_t sendVal = i;
 
     __threadfence_system();
-    uint64_t dbr_val =  PostRecv<P>(epRecv.wqHandle, epRecv.handle.qpn, mr.addr, mr.lkey, msgSize);
+    uint64_t dbr_val = PostRecv<P>(epRecv.wqHandle, epRecv.handle.qpn, mr.addr, mr.lkey, msgSize);
     printf("PostRecv is done\n");
     __threadfence_system();
     UpdateRecvDbrRecord<P>(epRecv.wqHandle.dbrRecAddr, epRecv.wqHandle.postIdx);
@@ -114,16 +113,16 @@ __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMe
       case ProviderType::MLX5:
         SendThreadKernel<ProviderType::MLX5>(epSend, mrSend, msgSize, msgNum);
         break;
-#ifdef ENABLE_BNXT        
+#ifdef ENABLE_BNXT
       case ProviderType::BNXT:
         SendThreadKernel<ProviderType::BNXT>(epSend, mrSend, msgSize, msgNum);
         break;
-#endif 
-#ifdef ENABLE_IONIC	
+#endif
+#ifdef ENABLE_IONIC
       case ProviderType::PSD:
         SendThreadKernel<ProviderType::PSD>(epSend, mrSend, msgSize, msgNum);
         break;
-#endif	
+#endif
       default:
         // unsupported provider
         break;
@@ -134,16 +133,16 @@ __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMe
       case ProviderType::MLX5:
         RecvThreadKernel<ProviderType::MLX5>(epRecv, mrRecv, msgSize, msgNum);
         break;
-#ifdef ENABLE_BNXT        
+#ifdef ENABLE_BNXT
       case ProviderType::BNXT:
         RecvThreadKernel<ProviderType::BNXT>(epRecv, mrRecv, msgSize, msgNum);
         break;
 #endif
-#ifdef ENABLE_IONIC	
+#ifdef ENABLE_IONIC
       case ProviderType::PSD:
         RecvThreadKernel<ProviderType::PSD>(epRecv, mrRecv, msgSize, msgNum);
         break;
-#endif	
+#endif
       default:
         // unsupported provider
         break;
@@ -174,7 +173,7 @@ void LocalRdmaOps() {
   // 2 Create an endpoint
   RdmaEndpointConfig config;
   config.portId = devicePort.second;
-  //config.gidIdx = 3;
+  // config.gidIdx = 3;
   config.maxMsgsNum = 256;
   config.maxCqeNum = 256;
   config.alignment = 4096;
