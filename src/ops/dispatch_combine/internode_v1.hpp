@@ -47,6 +47,11 @@ template <typename T>
 __global__ void EpCombineAllFp8FromBf16(EpDispatchCombineArgs<T> args);
 
 template <typename T>
+__global__ void EpCombineInterNodeV1KernelFp8Direct(EpDispatchCombineArgs<T> args);
+
+template <typename T>
+__global__ void EpCombineAllFp8Direct(EpDispatchCombineArgs<T> args);
+template <typename T>
 __global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args);
 
 template <typename T>
