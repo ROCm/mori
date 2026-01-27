@@ -45,6 +45,20 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
   topo.reset(new application::TopoSystem());
 }
 
+RdmaManager::~RdmaManager() {
+  for (auto* devCtx : deviceCtxs) {
+    if (devCtx != nullptr) {
+      delete devCtx;
+    }
+  }
+  deviceCtxs.clear();
+
+  if (ctx != nullptr) {
+    delete ctx;
+    ctx = nullptr;
+  }
+}
+
 std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
   if (key.loc == MemoryLocationType::GPU) {
     std::string nicName = topo->MatchGpuAndNic(key.deviceId);
@@ -469,7 +483,7 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo) {
   ctx->CloseEndpoint(tcph);
 }
 
-void ControlPlaneServer::RegisterMemory(const MemoryDesc& desc) {
+void ControlPlaneServer::RegisterMemory(MemoryDesc& desc) {
   std::lock_guard<std::mutex> lock(mu);
   mems[desc.id] = desc;
 }
@@ -596,6 +610,10 @@ void ControlPlaneServer::Start() {
 void ControlPlaneServer::Shutdown() {
   running.store(false);
   if (thd.joinable()) thd.join();
+  if (epfd >= 0) {
+    close(epfd);
+    epfd = -1;
+  }
 }
 
 /* ----------------------------------------------------------------------------------------------
@@ -706,7 +724,7 @@ void RdmaBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   server->DeregisterRemoteEngine(rdesc);
 }
 
-void RdmaBackend::RegisterMemory(const MemoryDesc& desc) { server->RegisterMemory(desc); }
+void RdmaBackend::RegisterMemory(MemoryDesc& desc) { server->RegisterMemory(desc); }
 
 void RdmaBackend::DeregisterMemory(const MemoryDesc& desc) {
   server->DeregisterMemory(desc);

@@ -118,6 +118,16 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   size_t maxIndicesSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(index_t);
   shmemInpIndicesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndicesSize, hipDeviceMallocUncached);
   shmemOutIndicesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndicesSize, hipDeviceMallocUncached);
+
+#ifdef ENABLE_PROFILER
+  size_t debugBufSize = MAX_DEBUG_TIME_SLOTS * sizeof(int64_t);
+  HIP_RUNTIME_CHECK(hipMalloc(&profilerConfig.debugTimeBuf, debugBufSize));
+  HIP_RUNTIME_CHECK(hipMemset(profilerConfig.debugTimeBuf, 0, debugBufSize));
+
+  size_t offsetBufSize = PROFILER_WARPS_PER_RANK * sizeof(unsigned int);
+  HIP_RUNTIME_CHECK(hipMalloc(&profilerConfig.debugTimeOffset, offsetBufSize));
+  HIP_RUNTIME_CHECK(hipMemset(profilerConfig.debugTimeOffset, 0, offsetBufSize));
+#endif
 }
 
 void EpDispatchCombineHandle::FinalizeShmemBuf() {
@@ -133,6 +143,10 @@ void EpDispatchCombineHandle::FinalizeShmemBuf() {
   if (shmemOutScalesMemObj.IsValid()) ShmemFree(shmemOutScalesMemObj->localPtr);
   ShmemFree(shmemInpIndicesMemObj->localPtr);
   ShmemFree(shmemOutIndicesMemObj->localPtr);
+#ifdef ENABLE_PROFILER
+  HIP_RUNTIME_CHECK(hipFree(profilerConfig.debugTimeBuf));
+  HIP_RUNTIME_CHECK(hipFree(profilerConfig.debugTimeOffset));
+#endif
 }
 
 void EpDispatchCombineHandle::InitializeTokenNumSignalBuf() {

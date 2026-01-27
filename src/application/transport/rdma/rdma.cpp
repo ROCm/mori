@@ -272,8 +272,13 @@ RdmaDeviceContext::RdmaDeviceContext(RdmaDevice* device, ibv_pd* inPd) : device(
 }
 
 RdmaDeviceContext::~RdmaDeviceContext() {
-  ibv_dealloc_pd(pd);
+  for (auto& it : mrPool) {
+    ibv_dereg_mr(it.second);
+  }
+  mrPool.clear();
+
   if (srq != nullptr) ibv_destroy_srq(srq);
+  ibv_dealloc_pd(pd);
 }
 
 RdmaDevice* RdmaDeviceContext::GetRdmaDevice() { return device; }
@@ -437,7 +442,7 @@ RdmaContext::RdmaContext(RdmaBackendType backendType) : backendType(backendType)
 
 RdmaContext::~RdmaContext() {
   if (deviceList) ibv_free_device_list(deviceList);
-  for (RdmaDevice* device : rdmaDeviceList) free(device);
+  for (RdmaDevice* device : rdmaDeviceList) delete device;
 }
 
 const RdmaDeviceList& RdmaContext::GetRdmaDeviceList() const { return rdmaDeviceList; }
@@ -449,6 +454,8 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
   ibv_device_attr_ex device_attr_ex;
   int status = ibv_query_device_ex(context, NULL, &device_attr_ex);
   assert(!status);
+  ibv_close_device(context);
+
   // device_attr_ex.orig_attr.vendor_id = 0x14E4;
   if (backendType == RdmaBackendType::IBVerbs) {
     return new IBVerbsDevice(inDevice);

@@ -1,3 +1,11 @@
+/**
+ * @acknowledgements:
+ * - Original implementation by: Sidler, David
+ * - Source: https://github.com/AARInternal/shader_sdma
+ * 
+ * @note: This code is adapted/modified from the implementation by Sidler, David
+ */
+
 // CLI11: Version 2.5.0
 // Originally designed by Henry Schreiner
 // https://github.com/CLIUtils/CLI11

@@ -422,7 +422,17 @@ IonicDeviceContext::IonicDeviceContext(RdmaDevice* rdma_device, ibv_context* con
   create_parent_domain(context, in_pd);
 }
 
-IonicDeviceContext::~IonicDeviceContext() {}
+IonicDeviceContext::~IonicDeviceContext() {
+  for (auto& it : qpPool) {
+    delete it.second;
+  }
+  qpPool.clear();
+
+  for (auto& it : cqPool) {
+    delete it.second;
+  }
+  cqPool.clear();
+}
 
 RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& config) {
   ibv_context* context = GetIbvContext();

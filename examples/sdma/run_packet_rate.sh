@@ -1,3 +1,11 @@
+/**
+ * @acknowledgements:
+ * - Original implementation by: Sidler, David
+ * - Source: https://github.com/AARInternal/shader_sdma
+ * 
+ * @note: This code is adapted/modified from the implementation by Sidler, David
+ */
+ 
 #!/bin/bash
 
 NUM_COPY_CMDS=10000
