@@ -130,8 +130,10 @@ void testOneShotSdmaAllGather() {
 
   double start = MPI_Wtime();
  // if(1)
-  double local_duration = AllGather_sdma<uint32_t>(inPutBuff, outPutBuff, elemsPerPe, stream);
-    //OneShotAllGatharSdmaKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
+  double local_duration = 0;
+ for(int i = 0; i<20; i++){
+   local_duration = AllGather_sdma<uint32_t>(inPutBuff, outPutBuff, elemsPerPe, stream);
+}  //OneShotAllGatharSdmaKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
 
 //  else{
 //    OneShotAllGatharSdmaAsyncPutKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
@@ -142,7 +144,7 @@ void testOneShotSdmaAllGather() {
 //  double local_duration = end - start;
 
   double global_max_duration;
-  MPI_Reduce(&local_duration, &global_max_duration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+  MPI_Reduce(&local_duration, &globaql_max_duration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
   MPI_Barrier(MPI_COMM_WORLD);
 
   if (myPe == 0) {

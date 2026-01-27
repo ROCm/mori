@@ -55,6 +55,7 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
 
   double start = MPI_Wtime();
   OneShotAllGatherSdmaKernel<T><<<1, 512>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
+  hipDeviceSynchronize();
   double end = MPI_Wtime();
 
    

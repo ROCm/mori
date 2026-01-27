@@ -38,15 +38,15 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes,
     return;
   }
 
-  T* __restrict__ src = reinterpret_cast<T*>(srcMemObj->localPtr);
-  T* __restrict__ dst = reinterpret_cast<T*>(dstMemObj->localPtr);
+//  T* __restrict__ src = reinterpret_cast<T*>(srcMemObj->localPtr);
+//  T* __restrict__ dst = reinterpret_cast<T*>(dstMemObj->localPtr);
   uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
   int flag_val = 1;
 
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
-  const size_t threadsPerGrid = static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
-  const size_t stride = threadsPerGrid > 0 ? threadsPerGrid : 1;
+//  const size_t threadsPerGrid = static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
+//  const size_t stride = threadsPerGrid > 0 ? threadsPerGrid : 1;
 
   const size_t bytesPerElement = sizeof(T);
   const size_t bytesPerPeer = elementCount * bytesPerElement;
@@ -55,20 +55,18 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes,
   int warpId = threadLinearId / warpSize;
   const int laneId = threadIdx.x % warpSize;
 
-  if(warpId < npes){
+  if(warpId < npes && laneId == 0){
     int remotePe = warpId;
     size_t destByteOffset = myPe*bytesPerPeer;
     size_t srcByteOffset = 0;
     size_t sendBytes = bytesPerPeer;
-
-    shmem::ShmemPutMemNbiWarp(dstMemObj, destByteOffset, srcMemObj, srcByteOffset, sendBytes, remotePe);
+    shmem::ShmemPutMemNbiThread(dstMemObj, destByteOffset, srcMemObj, srcByteOffset, sendBytes, remotePe);
   }
 
-  if(warpId < npes){
+  if(warpId < npes && laneId == 0){
     int remotePe =warpId;
-    if(laneId == 0)
-      shmem::ShmemQuietThread(remotePe, dstMemObj);
-    shmem::ShmemAtomicSizeNonFetchWarp(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8, core::atomicType::AMO_ADD, remotePe);
+    shmem::ShmemQuietThread(remotePe, dstMemObj);
+    shmem::ShmemAtomicSizeNonFetchThread(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8, core::atomicType::AMO_ADD, remotePe);
   }
   __syncthreads();
 
