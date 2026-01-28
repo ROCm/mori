@@ -70,12 +70,6 @@ add_executable(ibverbs_test application/ibverbs_test.cpp)
 target_link_libraries(ibverbs_test mori_application mori_shmem hip::host
                       hip::device)
 
-add_executable(test_gpu_vmm utils/test_gpu_vmm.cpp)
-target_link_libraries(test_gpu_vmm mori_application hip::host hip::device)
-
 add_executable(test_vmm_mpi_write utils/test_vmm_mpi_write.cpp)
 target_link_libraries(test_vmm_mpi_write mori_application hip::host hip::device)
-
-add_executable(test_vmm_mpi_fd_direct utils/test_vmm_mpi_fd_direct.cpp)
-target_link_libraries(test_vmm_mpi_fd_direct mori_application hip::host hip::device)
 
