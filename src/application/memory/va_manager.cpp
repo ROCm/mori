@@ -186,7 +186,9 @@ uintptr_t HeapVAManager::Allocate(size_t size, size_t alignment) {
   }
   
   // No suitable free block found
-  MORI_APP_WARN("HeapVAManager::Allocate failed: no free block of size {} bytes available", alignedSize);
+  MORI_APP_ERROR("Out of heap memory! Requested: {} bytes (aligned), Current heap size: {} bytes. "
+                 "Hint: Increase via MORI_SHMEM_HEAP_SIZE (default: 2GB for Static, 8GB for VMM)", 
+                 alignedSize, totalSize_);
   return 0;
 }
 
