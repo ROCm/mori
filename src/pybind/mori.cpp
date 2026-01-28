@@ -440,17 +440,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
   );
 
   // 在现有的绑定后添加
-  m.def("shmem_symmetric_register",
-    [](uintptr_t ptr, size_t size) -> uintptr_t {
-      auto mem_obj = mori::shmem::ShmemSymmetricRegister(
-          reinterpret_cast<void*>(ptr), size);
-      // 返回内存对象句柄（需要查看SymmMemObjPtr的实现）
-      return reinterpret_cast<uintptr_t>(mem_obj.GetHandle());
-    },
-    py::arg("ptr"),
-    py::arg("size"),
-    "Register symmetric memory"
-  );
+
   
   m.def("shmem_malloc",
     [](size_t size) -> uintptr_t {
@@ -487,18 +477,67 @@ void RegisterMoriCcl(pybind11::module_& m) {
   
   //int32
   m.def("all2all_sdma_int32", 
-    [](uintptr_t input_ptr, uintptr_t output_ptr, size_t count, uintptr_t stream) {
-      return mori::collective::All2all_sdma<int32_t>(
+    [](uintptr_t input_ptr, uintptr_t output_ptr, size_t count, uintptr_t stream) -> double {
+    // 添加详细的调试信息
+    printf("[PYBIND_DEBUG] === all2all_sdma_int32 ENTRY ===\n");
+    printf("[PYBIND_DEBUG] input_ptr: %p (0x%lx)\n", 
+           reinterpret_cast<void*>(input_ptr), input_ptr);
+    printf("[PYBIND_DEBUG] output_ptr: %p (0x%lx)\n", 
+           reinterpret_cast<void*>(output_ptr), output_ptr);
+    printf("[PYBIND_DEBUG] count: %zu\n", count);
+    printf("[PYBIND_DEBUG] stream: %p (0x%lx)\n", 
+           reinterpret_cast<void*>(stream), stream);
+    
+    // 获取SHMEM状态
+    int myPe = mori::shmem::ShmemMyPe();
+    int npes = mori::shmem::ShmemNPes();
+    printf("[PYBIND_DEBUG] PE %d of %d\n", myPe, npes);
+    
+    // 验证指针
+    if (input_ptr == 0) {
+      printf("[PYBIND_ERROR] input_ptr is ZERO!\n");
+      return -100.0;
+    }
+    if (output_ptr == 0) {
+      printf("[PYBIND_ERROR] output_ptr is ZERO!\n");
+      return -101.0;
+    }
+    
+    // 计算预期的大小
+    size_t input_size_bytes = count * sizeof(int32_t);
+    size_t output_size_bytes = count * sizeof(int32_t) * npes;
+    printf("[PYBIND_DEBUG] Expected sizes: input=%zu bytes, output=%zu bytes\n",
+           input_size_bytes, output_size_bytes);
+    
+    try {
+      // 调用C++函数
+      printf("[PYBIND_DEBUG] Calling mori::collective::All2all_sdma<int32_t>\n");
+      
+      double result = mori::collective::All2all_sdma<int32_t>(
           reinterpret_cast<int32_t*>(input_ptr),
           reinterpret_cast<int32_t*>(output_ptr),
           count,
           reinterpret_cast<hipStream_t>(stream));
-    }, 
-    py::arg("input_ptr"), 
-    py::arg("output_ptr"), 
-    py::arg("count"), 
-    py::arg("stream") = 0,
-    "All2All SDMA for int32"
+      
+      printf("[PYBIND_DEBUG] Function returned: %f\n", result);
+      printf("[PYBIND_DEBUG] === all2all_sdma_int32 EXIT ===\n");
+      
+      return result;
+      
+    } catch (const std::exception& e) {
+      printf("[PYBIND_ERROR] Exception: %s\n", e.what());
+      return -999.0;
+    } catch (...) {
+      printf("[PYBIND_ERROR] Unknown exception\n");
+      return -999.0;
+    }
+  }, 
+  py::arg("input_ptr"), 
+  py::arg("output_ptr"), 
+  py::arg("count"), 
+  py::arg("stream") = 0,
+  "All2All SDMA for int32"
   );
+
 }
 }  // namespace mori
