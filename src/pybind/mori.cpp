@@ -416,4 +416,37 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus);
 }
 
+void RegisterMoriCcl(pybind11::module_& m) {
+  // float32
+  m.def("all2all_sdma", 
+    [](uintptr_t input_ptr, uintptr_t output_ptr, size_t count, uintptr_t stream) {
+      return mori::collective::All2all_sdma<float>(
+          reinterpret_cast<float*>(input_ptr),
+          reinterpret_cast<float*>(output_ptr),
+          count,
+          reinterpret_cast<hipStream_t>(stream));
+    }, 
+    py::arg("input_ptr"), 
+    py::arg("output_ptr"), 
+    py::arg("count"), 
+    py::arg("stream") = 0,
+    "All2All SDMA operation for float32"
+  );
+  
+  //int32
+  m.def("all2all_sdma_int32", 
+    [](uintptr_t input_ptr, uintptr_t output_ptr, size_t count, uintptr_t stream) {
+      return mori::collective::All2all_sdma<int32_t>(
+          reinterpret_cast<int32_t*>(input_ptr),
+          reinterpret_cast<int32_t*>(output_ptr),
+          count,
+          reinterpret_cast<hipStream_t>(stream));
+    }, 
+    py::arg("input_ptr"), 
+    py::arg("output_ptr"), 
+    py::arg("count"), 
+    py::arg("stream") = 0,
+    "All2All SDMA for int32"
+  );
+}
 }  // namespace mori
