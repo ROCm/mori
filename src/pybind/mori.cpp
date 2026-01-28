@@ -37,6 +37,7 @@
 #include "mori/ops/ops.hpp"
 #include "mori/shmem/shmem.hpp"
 #include "src/pybind/torch_utils.hpp"
+#include "mori/collective/collective.hpp"
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Ops APIs                                            */
