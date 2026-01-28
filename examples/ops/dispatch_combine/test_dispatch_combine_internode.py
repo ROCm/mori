@@ -500,7 +500,7 @@ class EpDispatchCombineTestCase:
                 dispatch_scales,
                 dispatch_indices,
                 dispatch_recv_num_token,
-            ) = op.dispatch(
+            ) = op.dispatch_send(
                 all_rank_input[self.rank],
                 all_rank_weights[self.rank],
                 all_rank_scales[self.rank],
@@ -508,13 +508,15 @@ class EpDispatchCombineTestCase:
                 block_num=self.config.block_num,
                 # warp_per_block=16,
             )
-            _, _ = op.combine(
+            op.dispatch_recv(block_num=self.config.block_num)
+            _, _ = op.combine_send(
                 dispatch_output,
                 dispatch_weights,
                 all_rank_indices[self.rank],
                 block_num=self.config.block_num,
                 # warp_per_block=16,
             )
+            op.combine_recv(block_num=self.config.block_num)
             if i % sync_interval == 0:
                 torch.cuda.synchronize()
         torch.cuda.synchronize()
@@ -589,7 +591,7 @@ class EpDispatchCombineTestCase:
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
             )
-            op.dispatch_recv()
+            op.dispatch_recv(block_num=self.config.block_num)
             torch.cuda.synchronize()
 
             # (
