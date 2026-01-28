@@ -54,7 +54,7 @@ void LocalBootstrapNetwork::Initialize() {
     return;
   }
   
-  MORI_APP_INFO("LocalBootstrapNetwork initializing: rank={}, worldSize={}", 
+  MORI_APP_TRACE("LocalBootstrapNetwork initializing: rank={}, worldSize={}", 
                 localRank, worldSize);
   initialized_ = true;
 }
@@ -64,7 +64,7 @@ void LocalBootstrapNetwork::Finalize() {
     return;
   }
   
-  MORI_APP_INFO("LocalBootstrapNetwork finalizing: rank={}", localRank);
+  MORI_APP_TRACE("LocalBootstrapNetwork finalizing: rank={}", localRank);
   
   // Clean up any remaining socket files created by this rank
   for (int peer = 0; peer < worldSize; ++peer) {

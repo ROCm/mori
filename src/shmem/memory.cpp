@@ -49,9 +49,9 @@ static void* AllocateStaticHeap(ShmemStates* states, size_t size) {
 
   void* ptr = reinterpret_cast<void*>(allocAddr);
 
-  // Register the allocated region as a sub-object of the static heap
-  states->memoryStates->symmMemMgr->HeapRegisterSymmMemObj(ptr, size,
-                                                           &states->memoryStates->staticHeapObj);
+  // Register the allocated region as a sub-region of the static heap
+  states->memoryStates->symmMemMgr->RegisterStaticHeapSubRegion(ptr, size,
+                                                                &states->memoryStates->staticHeapObj);
 
   uintptr_t baseAddr = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
   MORI_SHMEM_TRACE("Allocated {} bytes at ptr={:#x} (offset={}, aligned to 256={})", size,
@@ -107,8 +107,8 @@ static void* AllocateIsolationWithFlags(ShmemStates* states, size_t size, unsign
 
 // Free memory in static heap mode
 static void FreeStaticHeap(ShmemStates* states, void* localPtr) {
-  // Deregister from SymmMemObj pool
-  states->memoryStates->symmMemMgr->HeapDeregisterSymmMemObj(localPtr);
+  // Deregister static heap sub-region from SymmMemObj pool
+  states->memoryStates->symmMemMgr->DeregisterStaticHeapSubRegion(localPtr);
 
   // Free the VA address in VA manager (enables reuse)
   uintptr_t addr = reinterpret_cast<uintptr_t>(localPtr);

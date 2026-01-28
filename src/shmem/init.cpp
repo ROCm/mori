@@ -261,6 +261,16 @@ static bool TryInitializeVMMHeap(ShmemStates* states, application::HeapType heap
     states->memoryStates->vmmHeapObj = states->memoryStates->symmMemMgr->GetVMMHeapObj();
     states->memoryStates->vmmHeapBaseAddr = states->memoryStates->vmmHeapObj.cpu->localPtr;
 
+    // Initialize VA Manager for VMM heap to enable memory reuse
+    // Pass granularity (chunkSize) to ensure VA blocks don't cross physical memory boundaries
+    states->memoryStates->symmMemMgr->InitHeapVAManager(
+        reinterpret_cast<uintptr_t>(states->memoryStates->vmmHeapBaseAddr),
+        vmmHeapSize,
+        states->memoryStates->vmmHeapChunkSize);
+
+    MORI_SHMEM_TRACE("VMM heap VA Manager initialized: base={}, size={} bytes, granularity={} bytes",
+                     states->memoryStates->vmmHeapBaseAddr, vmmHeapSize,
+                     states->memoryStates->vmmHeapChunkSize);
     MORI_SHMEM_INFO("VMM heap initialized successfully");
     return true;
   } else {
