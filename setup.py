@@ -122,7 +122,7 @@ class CMakeBuild(build_ext):
                 root_dir / "python/mori/libmori_io.so",
             ),
             (
-                build_dir / "src/io/libmori_collective.so",
+                build_dir / "src/collective/libmori_collective.so",
                 root_dir / "python/mori/libmori_collective.so",
             ),			
         ]
