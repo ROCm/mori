@@ -121,6 +121,10 @@ class CMakeBuild(build_ext):
                 build_dir / "src/io/libmori_io.so",
                 root_dir / "python/mori/libmori_io.so",
             ),
+            (
+                build_dir / "src/io/libmori_collective.so",
+                root_dir / "python/mori/libmori_collective.so",
+            ),			
         ]
         for src_path, dst_path in files_to_copy:
             shutil.copyfile(src_path, dst_path)
@@ -148,7 +152,7 @@ setup(
     packages=find_packages(where="python"),
     package_dir={"": "python"},
     package_data={
-        "mori": ["libmori_pybinds.so", "libmori_io.so", "libmori_application.so"]
+        "mori": ["libmori_pybinds.so", "libmori_io.so", "libmori_application.so", "libmori_collective.so"]
     },
     cmdclass={
         "build_ext": CMakeBuild,

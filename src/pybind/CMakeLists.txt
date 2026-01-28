@@ -10,7 +10,7 @@ target_link_libraries(
   mori_pybinds
   mori_ops
   mori_io
-  mori_ccl
+  mori_collective
   ${TORCH_LIBRARIES}
   torch_python
   hip::host
