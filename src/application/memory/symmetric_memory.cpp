@@ -293,7 +293,7 @@ bool SymmMemManager::IsVMMSupported() const {
           vmm != 0);
 }
 
-bool SymmMemManager::InitializeVMMHeap(size_t virtualSize, size_t chunkSize) {
+bool SymmMemManager::InitializeVMMHeap(size_t virtualSize, size_t chunkSize, HeapType heapType) {
   std::lock_guard<std::mutex> lock(vmmLock);
 
   if (vmmInitialized) {
@@ -308,7 +308,16 @@ bool SymmMemManager::InitializeVMMHeap(size_t virtualSize, size_t chunkSize) {
     }
 
     hipMemAllocationProp allocProp = {};
+#if HIP_VERSION >= 70000000  // ROCm 7.0+
+    allocProp.type = heapType == HeapType::Normal ? hipMemAllocationTypePinned : hipMemAllocationTypeUncached;
+#else
+    // ROCm < 7.0: hipMemAllocationTypeUncached not supported, fallback to Pinned
     allocProp.type = hipMemAllocationTypePinned;
+    if (heapType == HeapType::Uncached) {
+      MORI_APP_WARN("Uncached heap type requested but ROCm version < 7.0 does not support "
+                    "hipMemAllocationTypeUncached, falling back to Pinned memory");
+    }
+#endif
     allocProp.location.type = hipMemLocationTypeDevice;
     allocProp.location.id = currentDev;
 
@@ -636,7 +645,7 @@ void SymmMemManager::FinalizeVMMHeap() {
   vmmInitialized = false;
 }
 
-SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
+SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, HeapType heapType) {
   std::lock_guard<std::mutex> lock(vmmLock);
 
   if (!vmmInitialized || !heapVAManager) {
@@ -730,8 +739,16 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
     }
 
     hipMemAllocationProp allocProp = {};
-    // allocProp.type = static_cast<hipMemAllocationType>(allocType);
-    allocProp.type = hipMemAllocationTypeUncached;
+#if HIP_VERSION >= 70000000  // ROCm 7.0+
+    allocProp.type = heapType == HeapType::Normal ? hipMemAllocationTypePinned : hipMemAllocationTypeUncached;
+#else
+    // ROCm < 7.0: hipMemAllocationTypeUncached not supported, fallback to Pinned
+    allocProp.type = hipMemAllocationTypePinned;
+    if (heapType == HeapType::Uncached) {
+      MORI_APP_WARN("Uncached heap type requested but ROCm version < 7.0 does not support "
+                    "hipMemAllocationTypeUncached, falling back to Pinned memory");
+    }
+#endif
     allocProp.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
     allocProp.location.type = hipMemLocationTypeDevice;
     allocProp.location.id = currentDev;
@@ -762,8 +779,9 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
 
       result = hipMemCreate(&vmmChunks[chunkIdx].handle, vmmChunkSize, &allocProp, 0);
       if (result != hipSuccess) {
+        const char* heapTypeStr = (heapType == HeapType::Normal) ? "Normal" : "Uncached";
         MORI_APP_WARN("VMMAlloc failed: hipMemCreate chunk={} size={} type={} dev={} err={}",
-                      chunkIdx, vmmChunkSize, allocType, currentDev, result);
+                      chunkIdx, vmmChunkSize, heapTypeStr, currentDev, result);
         // Cleanup: revert reference counts for already processed chunks
         for (size_t j = 0; j < i; ++j) {
           size_t cleanupIdx = startChunk + j;

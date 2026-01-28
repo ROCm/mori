@@ -40,7 +40,6 @@ enum class ShmemMode {
   VMHeap   // TODO: implement virtual memory heap
 };
 
-
 constexpr size_t DEFAULT_STATIC_SYMMETRIC_HEAP_SIZE = 2ULL * 1024 * 1024 * 1024;  // 2GB default
 constexpr size_t DEFAULT_VMM_SYMMETRIC_HEAP_SIZE = 8ULL * 1024 * 1024 * 1024;  // 8GB default
 constexpr size_t DEFAULT_VMM_MIN_CHUNK_SIZE = 64ULL * 1024 * 1024;  // 64MB default
@@ -65,6 +64,7 @@ struct MemoryStates {
 
   // Static heap mode fields (only used when mode == StaticHeap)
   std::mutex heapLock;                       // Lock for thread-safe allocation
+  application::HeapType heapType{application::HeapType::Uncached};     // Type of heap memory (default: uncached)
 
   // Static heap
   void* staticHeapBasePtr{nullptr};          // Base address of the static symmetric heap
@@ -144,65 +144,6 @@ struct RemoteAddrInfo {
   __device__ RemoteAddrInfo(uintptr_t r, uintptr_t k) : raddr(r), rkey(k), valid(true) {}
 };
 
-inline __device__ RemoteAddrInfo ShmemAddrToRemoteAddr(const void* localAddr, int pe) {
-  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  uintptr_t localAddrInt = reinterpret_cast<uintptr_t>(localAddr);
-  // TODO!!!
-
-  if (globalGpuStates->heapObj == nullptr) {
-    assert(false);
-    return RemoteAddrInfo();
-  }
-
-  // Check if address is in symmetric heap
-  if (localAddrInt < globalGpuStates->heapBaseAddr ||
-      localAddrInt >= globalGpuStates->heapEndAddr) {
-    assert(false);
-    return RemoteAddrInfo();
-  }
-
-  // Calculate offset within the symmetric heap
-  size_t offset = reinterpret_cast<const char*>(localAddr) -
-                  reinterpret_cast<const char*>(globalGpuStates->heapBaseAddr);
-
-  // Get remote address using the heap's SymmMemObj
-  application::SymmMemObj* heapObj = globalGpuStates->heapObj;
-  uintptr_t raddr = heapObj->peerPtrs[pe] + offset;
-  uintptr_t rkey = heapObj->peerRkeys[pe];
-
-  return RemoteAddrInfo(raddr, rkey);
-
-  if (globalGpuStates->useVMMHeap) {
-    // VMM mode: All PEs see the same virtual address
-    // This greatly simplifies address translation
-    uintptr_t raddr = localAddrInt;  // Same virtual address for all PEs
-    
-    // For RDMA, we still need the correct rkey
-    // In VMM mode, each allocation has its own SymmMemObj with proper rkeys
-    // For now, we'll use a simplified approach (rkey would be obtained from the allocation's SymmMemObj)
-    uintptr_t rkey = 0;  // TODO: Implement proper rkey lookup for VMM allocations
-    
-    return RemoteAddrInfo(raddr, rkey);
-  } else {
-    // Static heap mode - traditional offset-based approach
-    if (localAddrInt < globalGpuStates->heapBaseAddr ||
-        localAddrInt >= globalGpuStates->heapEndAddr) {
-      assert(false && "dest addr not in symmetric heap");
-      return RemoteAddrInfo();
-    }
-
-    // Calculate offset within the symmetric heap
-    size_t offset = localAddrInt - globalGpuStates->heapBaseAddr;
-
-    // Get remote address using the heap's SymmMemObj
-    application::SymmMemObj* heapObj = globalGpuStates->heapObj;
-    uintptr_t raddr = heapObj->peerPtrs[pe] + offset;
-    uintptr_t rkey = heapObj->peerRkeys[pe];
-
-    return RemoteAddrInfo(raddr, rkey);
-  }
-
-}
 
 class ShmemStatesSingleton {
  public:

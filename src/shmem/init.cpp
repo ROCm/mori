@@ -118,7 +118,7 @@ bool IsROCmVersionGreaterThan7() {
   MORI_SHMEM_INFO("Detected HIP version: {}.{} (version code: {})", hip_major, hip_minor,
                   hipVersion);
 
-  return hip_major >= 6;
+  return hip_major >= 7;
 }
 
 void RdmaStatesInit() {
@@ -147,6 +147,28 @@ void MemoryStatesInit() {
     MORI_SHMEM_INFO("Running in isolation mode (no heap allocation)");
     return;
   }
+
+  // Configure heap type based on environment variable (before heap initialization)
+  const char* heapTypeEnv = std::getenv("MORI_SHMEM_HEAP_TYPE");
+  application::HeapType heapType = application::HeapType::Uncached;  // Default to uncached
+  
+  if (heapTypeEnv) {
+    std::string heapTypeStr(heapTypeEnv);
+    if (heapTypeStr == "normal" || heapTypeStr == "NORMAL") {
+      heapType = application::HeapType::Normal;
+      MORI_SHMEM_INFO("Using normal (cached) heap type");
+    } else if (heapTypeStr == "uncached" || heapTypeStr == "UNCACHED") {
+      heapType = application::HeapType::Uncached;
+      MORI_SHMEM_INFO("Using uncached heap type");
+    } else {
+      MORI_SHMEM_WARN("Unknown MORI_SHMEM_HEAP_TYPE '{}', defaulting to uncached", heapTypeStr);
+    }
+  } else {
+    MORI_SHMEM_INFO("MORI_SHMEM_HEAP_TYPE not set, defaulting to uncached");
+  }
+
+  // Store heap type in memory states
+  states->memoryStates->heapType = heapType;
 
   // For VMHeap mode, check VMM support first
   if (states->mode == ShmemMode::VMHeap) {
@@ -178,7 +200,7 @@ void MemoryStatesInit() {
           "({} KB)",
           vmmHeapSize, vmmHeapSize / (1024 * 1024), chunkSize, chunkSize / 1024);
 
-      bool vmmSuccess = states->memoryStates->symmMemMgr->InitializeVMMHeap(vmmHeapSize, chunkSize);
+      bool vmmSuccess = states->memoryStates->symmMemMgr->InitializeVMMHeap(vmmHeapSize, chunkSize, heapType);
       if (vmmSuccess) {
         states->memoryStates->useVMMHeap = true;
         states->memoryStates->vmmHeapInitialized = true;
@@ -214,9 +236,13 @@ void MemoryStatesInit() {
   MORI_SHMEM_INFO("Allocating static symmetric heap of size {} bytes ({} MB)", heapSize,
                   heapSize / (1024 * 1024));
 
-  // Allocate the symmetric heap
+  // Allocate the symmetric heap using the configured heap type
   void* staticHeapPtr = nullptr;
-  HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&staticHeapPtr, heapSize, hipDeviceMallocUncached));
+  if (states->memoryStates->heapType == application::HeapType::Uncached) {
+    HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&staticHeapPtr, heapSize, hipDeviceMallocUncached));
+  } else {
+    HIP_RUNTIME_CHECK(hipMalloc(&staticHeapPtr, heapSize));
+  }
   HIP_RUNTIME_CHECK(hipMemset(staticHeapPtr, 0, heapSize));
   application::SymmMemObjPtr heapObj =
       states->memoryStates->symmMemMgr->RegisterSymmMemObj(staticHeapPtr, heapSize, true);

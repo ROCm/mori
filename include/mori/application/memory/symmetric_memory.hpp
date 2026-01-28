@@ -38,6 +38,12 @@
 namespace mori {
 namespace application {
 
+// Heap type for memory allocation
+enum class HeapType {
+  Normal,    // Normal cached memory
+  Uncached   // Uncached memory
+};
+
 struct VMMChunkKey {
   uint32_t key;           // RDMA lkey or rkey
   uintptr_t next_addr;    // Address of next chunk boundary (for calculating chunk_size)
@@ -128,9 +134,9 @@ class SymmMemManager {
   void HeapDeregisterSymmMemObj(void* localPtr);
 
   // VMM-based symmetric memory management
-  bool InitializeVMMHeap(size_t virtualSize, size_t chunkSize = 0);
+  bool InitializeVMMHeap(size_t virtualSize, size_t chunkSize = 0, HeapType heapType = HeapType::Uncached);
   void FinalizeVMMHeap();
-  SymmMemObjPtr VMMAllocChunk(size_t size, uint32_t allocType = hipMemAllocationTypePinned);
+  SymmMemObjPtr VMMAllocChunk(size_t size, HeapType heapType = HeapType::Uncached);
   void VMMFreeChunk(void* localPtr);
   bool IsVMMSupported() const;
   SymmMemObjPtr VMMRegisterSymmMemObj(void* localPtr, size_t size, size_t startChunk, size_t numChunks);
