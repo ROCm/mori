@@ -480,6 +480,24 @@ class EpDispatchCombineTestCase:
                     )
                 assert False
                 # pass
+            if self.config.data_type in (
+                torch.float8_e4m3fnuz,
+                torch.float8_e4m3fn,
+            ):
+                # Compute detailed error statistics
+                abs_diff = (got_f - expected_f).abs()
+                max_abs_diff = abs_diff.max().item()
+                mean_abs_diff = abs_diff.mean().item()
+                rel_diff = abs_diff / (expected_f.abs() + 1e-8)
+                max_rel_diff = rel_diff.max().item()
+                mean_rel_diff = rel_diff.mean().item()
+                print(f"{self.rank} Error Statistics:")
+                print(f"  max_abs_diff: {max_abs_diff:.6f}")
+                print(f"  mean_abs_diff: {mean_abs_diff:.6f}")
+                print(f"  max_rel_diff: {max_rel_diff:.6f} ({max_rel_diff*100:.2f}%)")
+                print(
+                    f"  mean_rel_diff: {mean_rel_diff:.6f} ({mean_rel_diff*100:.2f}%)"
+                )
 
             if dispatch_weights is not None:
                 got_weight, expected_weight = (
