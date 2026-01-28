@@ -928,7 +928,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
                 srcScalesPtr[laneId] = nullptr;
                 index_t destTokId =
                     args.interNodeDispDestTokIdMap[srcTokId * config.numExpertPerToken + laneId];
-                if (destTokId != nullTokenId && destTokId != 0) {
+                if (destTokId != nullTokenId) {
                   index_t destPe = destTokId / config.MaxNumTokensToRecv();
                   index_t destNode = destPe / config.gpuPerNode;
                   if (destNode == myNode) {
@@ -946,7 +946,8 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
                     localSrcCount = 1;
                   }
                 }
-                args.interNodeDispDestTokIdMap[srcTokId * config.numExpertPerToken + laneId] = 0;
+                args.interNodeDispDestTokIdMap[srcTokId * config.numExpertPerToken + laneId] =
+                    nullTokenId;
               }
 
               for (int delta = 1; delta < config.numExpertPerToken; delta++) {
