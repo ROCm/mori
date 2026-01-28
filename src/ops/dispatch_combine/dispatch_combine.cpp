@@ -113,6 +113,10 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
     size_t maxScaleSize = config.MaxNumTokensToRecv() * config.scaleDim * config.scaleTypeSize;
     shmemInpScalesMemObj = ShmemMallocAndReturnMemObjPtr(maxScaleSize, hipDeviceMallocUncached);
     shmemOutScalesMemObj = ShmemMallocAndReturnMemObjPtr(maxScaleSize, hipDeviceMallocUncached);
+    size_t maxCombineOutScaleSize =
+        static_cast<size_t>(config.maxNumInpTokenPerRank) * config.scaleDim * config.scaleTypeSize;
+    shmemCombineOutScalesMemObj =
+        ShmemMallocAndReturnMemObjPtr(maxCombineOutScaleSize, hipDeviceMallocUncached);
   }
 
   size_t maxIndicesSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(index_t);
@@ -141,6 +145,7 @@ void EpDispatchCombineHandle::FinalizeShmemBuf() {
   ShmemFree(shmemCombineOutWeightsMemObj->localPtr);
   if (shmemInpScalesMemObj.IsValid()) ShmemFree(shmemInpScalesMemObj->localPtr);
   if (shmemOutScalesMemObj.IsValid()) ShmemFree(shmemOutScalesMemObj->localPtr);
+  if (shmemCombineOutScalesMemObj.IsValid()) ShmemFree(shmemCombineOutScalesMemObj->localPtr);
   ShmemFree(shmemInpIndicesMemObj->localPtr);
   ShmemFree(shmemOutIndicesMemObj->localPtr);
 #ifdef ENABLE_PROFILER

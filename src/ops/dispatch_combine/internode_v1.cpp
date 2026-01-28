@@ -1263,7 +1263,7 @@ inline __device__ void CombineAll(EpDispatchCombineArgs<T>& args) {
       assert(combScaleBytes > 0);
       T* dstTok = args.shmemCombineOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim;
       uint8_t* dstScale =
-          args.shmemOutScalesMemObj->template GetAs<uint8_t*>() + tokenId * scaleBytes;
+          args.shmemCombineOutScalesMemObj->template GetAs<uint8_t*>() + tokenId * scaleBytes;
       const uint8_t* const* srcScalesConst = reinterpret_cast<const uint8_t* const*>(srcScalesPtrs);
       core::WarpAccumFp8Quant<T>(dstTok, dstScale, srcPtrs, srcScalesConst, nNodes,
                                  config.hiddenDim, config.scaleDim, config.scaleTypeSize);
@@ -1349,7 +1349,7 @@ __global__ void EpCombineAll(EpDispatchCombineArgs<T> args) {
 
       T* dstTok = args.shmemCombineOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim;
       uint8_t* dstScale =
-          args.shmemOutScalesMemObj->template GetAs<uint8_t*>() + tokenId * scaleBytes;
+          args.shmemCombineOutScalesMemObj->template GetAs<uint8_t*>() + tokenId * scaleBytes;
       const T* const* srcPtrsConst = reinterpret_cast<const T* const*>(srcPtrs);
       const uint8_t* const* srcScalesConst = reinterpret_cast<const uint8_t* const*>(srcScalesPtrs);
       core::WarpAccumFp8Quant<T>(dstTok, dstScale, srcPtrsConst, srcScalesConst, nNodes,

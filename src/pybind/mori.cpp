@@ -153,7 +153,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Ten
   std::optional<torch::Tensor> outScales{std::nullopt};
   if (scalePtr && (handle.config.scaleDim > 0)) {
     outScales =
-        torch::from_blob(handle.shmemOutScalesMemObj->Get(),
+        torch::from_blob(handle.shmemCombineOutScalesMemObj->Get(),
                          {handle.config.maxNumInpTokenPerRank, handle.config.scaleDim},
                          torch::TensorOptions().dtype(scales->scalar_type()).device(torch::kCUDA));
   }

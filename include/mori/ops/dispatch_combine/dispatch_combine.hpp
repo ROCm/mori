@@ -195,6 +195,7 @@ class EpDispatchCombineHandle {
   mori::application::SymmMemObjPtr shmemCombineOutWeightsMemObj;
   mori::application::SymmMemObjPtr shmemInpScalesMemObj;
   mori::application::SymmMemObjPtr shmemOutScalesMemObj;
+  mori::application::SymmMemObjPtr shmemCombineOutScalesMemObj;
   mori::application::SymmMemObjPtr shmemInpIndicesMemObj;
   mori::application::SymmMemObjPtr shmemOutIndicesMemObj;
 
@@ -276,6 +277,7 @@ struct EpDispatchCombineArgs {
   mori::application::SymmMemObjPtr shmemCombineOutWeightsMemObj;
   mori::application::SymmMemObjPtr shmemInpScalesMemObj;
   mori::application::SymmMemObjPtr shmemOutScalesMemObj;
+  mori::application::SymmMemObjPtr shmemCombineOutScalesMemObj;
   mori::application::SymmMemObjPtr shmemInpIndicesMemObj;
   mori::application::SymmMemObjPtr shmemOutIndicesMemObj;
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
@@ -342,6 +344,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.shmemCombineOutWeightsMemObj = handle.shmemCombineOutWeightsMemObj;
   args.shmemInpScalesMemObj = handle.shmemInpScalesMemObj;
   args.shmemOutScalesMemObj = handle.shmemOutScalesMemObj;
+  args.shmemCombineOutScalesMemObj = handle.shmemCombineOutScalesMemObj;
   args.shmemInpIndicesMemObj = handle.shmemInpIndicesMemObj;
   args.shmemOutIndicesMemObj = handle.shmemOutIndicesMemObj;
   args.recvTokenNumMemObj = handle.recvTokenNumMemObj;
