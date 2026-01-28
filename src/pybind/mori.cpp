@@ -438,7 +438,37 @@ void RegisterMoriCcl(pybind11::module_& m) {
     },
     "Get number of SHMEM PEs"
   );
+
+  // 在现有的绑定后添加
+  m.def("shmem_symmetric_register",
+    [](uintptr_t ptr, size_t size) -> uintptr_t {
+      auto mem_obj = mori::shmem::ShmemSymmetricRegister(
+          reinterpret_cast<void*>(ptr), size);
+      // 返回内存对象句柄（需要查看SymmMemObjPtr的实现）
+      return reinterpret_cast<uintptr_t>(mem_obj.GetHandle());
+    },
+    py::arg("ptr"),
+    py::arg("size"),
+    "Register symmetric memory"
+  );
   
+  m.def("shmem_malloc",
+    [](size_t size) -> uintptr_t {
+      void* ptr = mori::shmem::ShmemMalloc(size);
+      return reinterpret_cast<uintptr_t>(ptr);
+    },
+    py::arg("size"),
+    "Allocate symmetric memory"
+  );
+  
+  m.def("shmem_free",
+    [](uintptr_t ptr) {
+      mori::shmem::ShmemFree(reinterpret_cast<void*>(ptr));
+    },
+    py::arg("ptr"),
+    "Free symmetric memory"
+  );
+    
   // float32
   m.def("all2all_sdma", 
     [](uintptr_t input_ptr, uintptr_t output_ptr, size_t count, uintptr_t stream) {
