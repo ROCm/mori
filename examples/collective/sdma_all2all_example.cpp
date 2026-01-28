@@ -22,15 +22,15 @@
 
 #include <hip/hip_runtime.h>
 #include <mpi.h>
-
 #include <cassert>
 #include <cstdio>
 
 #include "mori/application/utils/check.hpp"
+#include "mori/collective/all2all/sdma_all2all.hpp"
 #include "mori/collective/all2all/oneshot_all2all_sdma_kernel.hpp"
 #include "mori/collective/all2all/oneshot_all2all_sdma_async_kernel.hpp"
 #include "mori/shmem/shmem.hpp"
-
+ 
 using namespace mori::core;
 using namespace mori::application;
 using namespace mori::shmem;
@@ -46,42 +46,52 @@ void testOneShotSdmaAll2all() {
 
   int myPe = ShmemMyPe();
   int npes = ShmemNPes();
-
+ 
   printf("PE %d of %d started\n", myPe, npes);
-
+ 
   // Configuration
   // Each PE contributes a chunk of data; all PEs will have all chunks after AllGather
-  const int elemsPerPe = 1024 * 1024;  // Number of elements each PE contributes
+  const int elemsPerPe = 8 * 1024 * 1024;  // Number of elements each PE contributes
   const size_t bytesPerPe = elemsPerPe * sizeof(uint32_t);
   const size_t totalBytes = bytesPerPe * npes;  // Total buffer size
-
+ 
+  #if 0
   // Allocate data buffer - each PE will fill its own chunk initially
   void* outPutBuff = ShmemMalloc(totalBytes);
   assert(outPutBuff != nullptr);
-
   void* inPutBuff = ShmemMalloc(totalBytes);
   assert(inPutBuff != nullptr);
-
+  #endif
+  //void* outPutBuff = ShmemMalloc(totalBytes);
+  uint32_t* outPutBuff = nullptr;
+  HIP_RUNTIME_CHECK(hipExtMallocWithFlags((void**)&outPutBuff, totalBytes, hipDeviceMallocUncached));
+  assert(outPutBuff != nullptr);
+  // void* inPutBuff = ShmemMalloc(bytesPerPe);
+  uint32_t* inPutBuff = nullptr;
+  HIP_RUNTIME_CHECK(hipExtMallocWithFlags((void**)&inPutBuff, totalBytes, hipDeviceMallocUncached));
+  assert(inPutBuff != nullptr);
+ 
   // Initialize data buffer: each PE initializes only its own chunk
   uint32_t* hostData = new uint32_t[elemsPerPe*npes];
   memset(hostData, 0, totalBytes);
-
+ 
   // Each PE fills its own chunk with its PE ID
   for (int k = 0; k < npes; k++) {
     for (int i = 0; i < elemsPerPe; i++) {
       hostData[k*elemsPerPe + i] = k + (myPe + 1) * 100;  // Using PE_ID + 100 for clarity
     }
   }
-
+ 
   // Copy initialized data to device
   HIP_RUNTIME_CHECK(hipMemcpy(inPutBuff, hostData, totalBytes, hipMemcpyHostToDevice));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
+  #if 0
   // Get symmetric memory object pointer
   SymmMemObjPtr outPutBuffObj = ShmemQueryMemObjPtr(outPutBuff);
   assert(outPutBuffObj.IsValid());
-
   SymmMemObjPtr inPutBuffObj = ShmemQueryMemObjPtr(inPutBuff);
+
   assert(inPutBuffObj.IsValid());
 
   // Allocate flags buffer for synchronization
@@ -92,10 +102,11 @@ void testOneShotSdmaAll2all() {
   // Initialize flags to zero
   HIP_RUNTIME_CHECK(hipMemset(flagsBuff, 0, flagsSize));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-
+ 
   // Get symmetric memory object pointer for flags
   SymmMemObjPtr flagsBuffObj = ShmemQueryMemObjPtr(flagsBuff);
   assert(flagsBuffObj.IsValid());
+  #endif
 
   // Print initial data (only this PE's chunk should be non-zero)
   //HIP_RUNTIME_CHECK(hipMemcpy(hostData + myPe*elemsPerPe, inPutBuff, bytesPerPe, hipMemcpyDeviceToHost));
@@ -109,42 +120,38 @@ void testOneShotSdmaAll2all() {
     }
     printf("...\n");
   }
+ 
+  const int blockSize = 256;
+  const int numBlocks = 1;
+  bool use_async = 0;
 
+  hipStream_t stream;
+  HIP_RUNTIME_CHECK(hipStreamCreate(&stream));
   MPI_Barrier(MPI_COMM_WORLD);
 
   if (myPe == 0) {
     printf("\n=== Starting All2all Operation ===\n\n");
   }
-
   MPI_Barrier(MPI_COMM_WORLD);
 
-  // Launch AllGather kernel
-  const int blockSize = 256;
-  const int numBlocks = 1;
-  bool use_async = 1;
+  #if 1
+  double local_duration;
   if(!use_async) {
-    printf("use non-async sdma mode\n");
-    OneShotAll2allSdmaKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
+    for (int i = 0; i < 10; i++) {
+      local_duration = All2all_sdma<uint32_t>(inPutBuff, outPutBuff, elemsPerPe, stream);
+    }
+    //OneShotAllGatharSdmaKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
   } else {
-    printf("use async sdma mode\n");	  
-    OneShotAll2allSdmaAsyncPutKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
-    OneShotAll2allSdmaAsyncWaitKernel<<<numBlocks, blockSize>>>(myPe, npes,  outPutBuffObj, flagsBuffObj);
+      //OneShotAllGatharSdmaAsyncPutKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
+      //OneShotAllGatharSdmaAsyncWaitKernel<<<numBlocks, blockSize>>>(myPe, npes,  outPutBuffObj, flagsBuffObj);
   }
+  #endif
 
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-
-  MPI_Barrier(MPI_COMM_WORLD);
-
-  if (myPe == 0) {
-    printf("=== All2all Operation Completed ===\n\n");
-  }
-
-  MPI_Barrier(MPI_COMM_WORLD);
-
+ 
   // Copy result back to host for verification
   HIP_RUNTIME_CHECK(hipMemcpy(hostData, outPutBuff, totalBytes, hipMemcpyDeviceToHost));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-
   printf("PE %d: All2all result (showing first 4 elements of each chunk):\n", myPe);
   for (int pe = 0; pe < npes; pe++) {
     printf("  Chunk %d: ", pe);
@@ -168,15 +175,28 @@ void testOneShotSdmaAll2all() {
     }
     if (!success) break;
   }
-
+ 
   MPI_Barrier(MPI_COMM_WORLD);
-
+ 
   if (success) {
     printf("PE %d: Verification PASSED!\n", myPe);
   }
-
   MPI_Barrier(MPI_COMM_WORLD);
 
+  double global_max_duration;
+  MPI_Reduce(&local_duration, &global_max_duration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+  MPI_Barrier(MPI_COMM_WORLD);
+  double local_bandwidth = totalBytes / local_duration;
+  local_bandwidth /= (1024.0 * 1024.0 * 1024.0);
+  printf("========myPe:%u, totalBytes:%.9fGB, local time:%.9f, local_bandwidth:%.9f\n", myPe, totalBytes/(1024.0 * 1024.0 * 1024.0), local_duration, local_bandwidth);
+
+  if (myPe == 0) {
+    printf("=== All2all Operation Completed ===\n\n");
+    double global_bandwidth = totalBytes / global_max_duration;
+    global_bandwidth /= (1024.0 * 1024.0 * 1024.0);
+    printf("========myPe:%u, totalBytes:%.9fGB, global time:%.9f, global_bandwidth:%.9f\n", myPe, totalBytes/(1024.0 * 1024.0 * 1024.0), global_max_duration, global_bandwidth);
+  }
+ 
   if (myPe == 0) {
     if (success) {
       printf("\n=== All2all Test Completed Successfully! ===\n");
@@ -184,15 +204,16 @@ void testOneShotSdmaAll2all() {
       printf("\n=== All2all Test FAILED! ===\n");
     }
   }
-
+ 
   // Cleanup
-  ShmemFree(outPutBuff);
-  ShmemFree(flagsBuff);
+  //ShmemFree(outPutBuff);
+  hipFree(outPutBuff);
+  hipFree(inPutBuff);
+  //ShmemFree(flagsBuff);
   delete[] hostData;
-
   ShmemFinalize();
 }
-
+ 
 int main(int argc, char* argv[]) {
   testOneShotSdmaAll2all();
   return 0;
