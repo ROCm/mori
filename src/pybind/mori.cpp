@@ -418,6 +418,27 @@ void RegisterMoriIo(pybind11::module_& m) {
 }
 
 void RegisterMoriCcl(pybind11::module_& m) {
+  m.def("shmem_mpi_init",
+    []() -> int {
+      return mori::shmem::ShmemMpiInit(MPI_COMM_WORLD);
+    },
+    "Initialize SHMEM with MPI"
+  );
+
+  m.def("shmem_my_pe",
+    []() -> int {
+      return mori::shmem::ShmemMyPe();
+    },
+    "Get SHMEM PE rank"
+  );
+
+  m.def("shmem_n_pes",
+    []() -> int {
+      return mori::shmem::ShmemNPes();
+    },
+    "Get number of SHMEM PEs"
+  );
+  
   // float32
   m.def("all2all_sdma", 
     [](uintptr_t input_ptr, uintptr_t output_ptr, size_t count, uintptr_t stream) {
