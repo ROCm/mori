@@ -83,7 +83,9 @@ class EpDispatchCombineOp:
         )
 
         self._dispatch_func = _cpp_dispatch_combine_factory("launch_dispatch")
+        self._dispatch_recv_func = _cpp_dispatch_combine_factory("launch_dispatch_recv")
         self._combine_func = _cpp_dispatch_combine_factory("launch_combine")
+        self._combine_recv_func = _cpp_dispatch_combine_factory("launch_combine_recv")
         self._reset_func = _cpp_dispatch_combine_factory("launch_reset")
         self._get_dispatch_src_token_pos_func = _cpp_dispatch_combine_factory(
             "get_dispatch_src_token_pos"
@@ -124,6 +126,36 @@ class EpDispatchCombineOp:
             warp_per_block,
         )
 
+    def dispatch_send(
+        self,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        indices: torch.Tensor,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        return self.dispatch(
+            input,
+            weights,
+            scales,
+            indices,
+            block_num,
+            warp_per_block,
+        )
+
+    def dispatch_recv(
+        self,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        return self._dispatch_recv_func(
+            self._handle,
+            self.config.kernel_type.value,
+            block_num,
+            warp_per_block,
+        )
+
     def combine(
         self,
         input: torch.Tensor,
@@ -145,6 +177,31 @@ class EpDispatchCombineOp:
         if call_reset:
             self._reset_func(self._handle)
         return output
+
+    def combine_send(
+        self,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+        call_reset: bool = False,
+    ):
+        return self.combine(
+            input, weights, indices, block_num, warp_per_block, call_reset
+        )
+
+    def combine_recv(
+        self,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        return self._combine_recv_func(
+            self._handle,
+            self.config.kernel_type.value,
+            block_num,
+            warp_per_block,
+        )
 
     def reset(self):
         self._reset_func(self._handle)
@@ -187,6 +244,7 @@ class EpDispatchCombineOp:
             EpDispatchCombineKernelType.IntraNode.value,
             EpDispatchCombineKernelType.InterNodeV1.value,
             EpDispatchCombineKernelType.InterNodeV1LL.value,
+            EpDispatchCombineKernelType.AsyncLL.value,
         ):
             return self._get_dispatch_src_token_pos_func(self._handle)
 
