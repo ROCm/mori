@@ -23,6 +23,8 @@
 
 #include <map>
 #include <vector>
+#include <fcntl.h>
+#include <cerrno>
 
 #include "hip/hip_runtime.h"
 #include "mori/application/bootstrap/local_bootstrap.hpp"
@@ -31,6 +33,7 @@
 #include "mori/shmem/internal.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/core/core.hpp"
+#include "mori/utils/hip_compat.hpp"
 #include "mori/utils/mori_log.hpp"
 
 namespace mori {
@@ -727,7 +730,8 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
     }
 
     hipMemAllocationProp allocProp = {};
-    allocProp.type = static_cast<hipMemAllocationType>(allocType);
+    // allocProp.type = static_cast<hipMemAllocationType>(allocType);
+    allocProp.type = hipMemAllocationTypeUncached;
     allocProp.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
     allocProp.location.type = hipMemLocationTypeDevice;
     allocProp.location.id = currentDev;
@@ -897,19 +901,21 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
         size_t chunksNeeded;
       };
       ChunkInfo myChunkInfo = {startChunk, chunksNeeded};
-      std::vector<ChunkInfo> allChunkInfo(p2pWorldSize);
+      // Use worldSize buffer to collect from all ranks (avoid buffer overflow)
+      std::vector<ChunkInfo> allChunkInfo(worldSize);
       
       bootNet.Allgather(&myChunkInfo, allChunkInfo.data(), sizeof(ChunkInfo));
       
       // Check if all P2P peers have the same chunk allocation
       bool chunkConsistent = true;
       for (int i = 0; i < p2pWorldSize; ++i) {
-        if (allChunkInfo[i].startChunk != startChunk || 
-            allChunkInfo[i].chunksNeeded != chunksNeeded) {
+        int globalRank = sortedP2pPeers[i];  // Map peer index to global rank
+        if (allChunkInfo[globalRank].startChunk != startChunk || 
+            allChunkInfo[globalRank].chunksNeeded != chunksNeeded) {
           MORI_APP_ERROR(
-              "VMMAlloc: rank={} chunk mismatch! Self=[{},+{}), peer_rank={}(global={}) has=[{},+{})",
-              rank, startChunk, chunksNeeded, i, sortedP2pPeers[i],
-              allChunkInfo[i].startChunk, allChunkInfo[i].chunksNeeded);
+              "VMMAlloc: rank={} chunk mismatch! Self=[{},+{}), peer_idx={} global_rank={} has=[{},+{})",
+              rank, startChunk, chunksNeeded, i, globalRank,
+              allChunkInfo[globalRank].startChunk, allChunkInfo[globalRank].chunksNeeded);
           chunkConsistent = false;
         }
       }
@@ -983,8 +989,10 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, uint32_t allocType) {
 
           // Import the shareable handle from the target PE
           hipMemGenericAllocationHandle_t importedHandle;
-          result = hipMemImportFromShareableHandle(&importedHandle, (void*)&handleValue,
-                                                   hipMemHandleTypePosixFileDescriptor);
+          result = hipMemImportFromShareableHandleCompat(
+              &importedHandle,
+              handleValue,
+              hipMemHandleTypePosixFileDescriptor);
           if (result != hipSuccess) {
             MORI_APP_WARN("Failed to import shareable handle from PE {}, chunk {}, hipError: {}",
                           pe, i, result);
@@ -1406,8 +1414,10 @@ bool SymmMemManager::VMMImportPeerMemory(int peerPe, void* localBaseAddr, size_t
     hipMemGenericAllocationHandle_t importedHandle;
 
     // Import the shareable handle
-    hipError_t result = hipMemImportFromShareableHandle(
-        &importedHandle, (void*)&shareableHandles[i], hipMemHandleTypePosixFileDescriptor);
+    hipError_t result = hipMemImportFromShareableHandleCompat(
+        &importedHandle,
+        shareableHandles[i],
+        hipMemHandleTypePosixFileDescriptor);
     if (result != hipSuccess) {
       MORI_APP_WARN("VMMImport failed: hipMemImport chunk={} err={}", i, result);
 

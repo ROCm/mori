@@ -42,6 +42,7 @@
  */
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_version.h>
 #include <mpi.h>
 #include <iostream>
 #include <vector>
@@ -51,6 +52,8 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <errno.h>
+
+#include "mori/utils/hip_compat.hpp"
 
 #define HIP_CHECK(call) \
     do { \
@@ -297,6 +300,18 @@ int main(int argc, char** argv) {
     int rank, size;
     MPI_CHECK(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
     MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &size));
+    
+    // Print ROCm version info (rank 0 only)
+    if (rank == 0) {
+        std::cout << "ROCm Version: " << HIP_VERSION_MAJOR << "." 
+                  << HIP_VERSION_MINOR << "." << HIP_VERSION_PATCH << std::endl;
+#if HIP_VERSION >= 70100000
+        std::cout << "Using ROCm 7.1.0+ API" << std::endl;
+#else
+        std::cout << "Using ROCm 7.0.x API" << std::endl;
+        std::cout << "Note: ROCm 7.1.1+ has improved VMM support" << std::endl;
+#endif
+    }
     
     if (size != 2) {
         if (rank == 0) {
@@ -659,9 +674,9 @@ int main(int argc, char** argv) {
             
             // Import handle
             std::cout << "[Rank 0] Importing Rank 1's handle...\n";
-            HIP_CHECK(hipMemImportFromShareableHandle(
+            HIP_CHECK(hipMemImportFromShareableHandleCompat(
                 &memHandle,
-                (void*)&shareableFd,
+                shareableFd,
                 hipMemHandleTypePosixFileDescriptor));
             std::cout << "[Rank 0] ✅ Handle imported\n";
             
@@ -1004,9 +1019,9 @@ int main(int argc, char** argv) {
         
         // Step 2: Import the shareable handle
         std::cout << "[Rank 1] Importing shareable handle...\n";
-        HIP_CHECK(hipMemImportFromShareableHandle(
+        HIP_CHECK(hipMemImportFromShareableHandleCompat(
             &memHandle,
-            (void*)&shareableFd,
+            shareableFd,
             hipMemHandleTypePosixFileDescriptor));
         std::cout << "[Rank 1] ✅ Handle imported\n";
         
