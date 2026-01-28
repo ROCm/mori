@@ -475,69 +475,45 @@ void RegisterMoriCcl(pybind11::module_& m) {
     "All2All SDMA operation for float32"
   );
   
-  //int32
-  m.def("all2all_sdma_int32", 
-    [](uintptr_t input_ptr, uintptr_t output_ptr, size_t count, uintptr_t stream) -> double {
-    // 添加详细的调试信息
-    printf("[PYBIND_DEBUG] === all2all_sdma_int32 ENTRY ===\n");
-    printf("[PYBIND_DEBUG] input_ptr: %p (0x%lx)\n", 
-           reinterpret_cast<void*>(input_ptr), input_ptr);
-    printf("[PYBIND_DEBUG] output_ptr: %p (0x%lx)\n", 
-           reinterpret_cast<void*>(output_ptr), output_ptr);
-    printf("[PYBIND_DEBUG] count: %zu\n", count);
-    printf("[PYBIND_DEBUG] stream: %p (0x%lx)\n", 
-           reinterpret_cast<void*>(stream), stream);
-    
-    // 获取SHMEM状态
-    int myPe = mori::shmem::ShmemMyPe();
-    int npes = mori::shmem::ShmemNPes();
-    printf("[PYBIND_DEBUG] PE %d of %d\n", myPe, npes);
-    
-    // 验证指针
-    if (input_ptr == 0) {
-      printf("[PYBIND_ERROR] input_ptr is ZERO!\n");
-      return -100.0;
-    }
-    if (output_ptr == 0) {
-      printf("[PYBIND_ERROR] output_ptr is ZERO!\n");
-      return -101.0;
-    }
-    
-    // 计算预期的大小
-    size_t input_size_bytes = count * sizeof(int32_t);
-    size_t output_size_bytes = count * sizeof(int32_t) * npes;
-    printf("[PYBIND_DEBUG] Expected sizes: input=%zu bytes, output=%zu bytes\n",
-           input_size_bytes, output_size_bytes);
+// 修改all2all_sdma_int32绑定
+m.def("all2all_sdma_int32", 
+  [](uintptr_t input_ptr, uintptr_t output_ptr, size_t count) -> double {
+    printf("[PYBIND] all2all_sdma_int32 called (without stream parameter)\n");
     
     try {
-      // 调用C++函数
-      printf("[PYBIND_DEBUG] Calling mori::collective::All2all_sdma<int32_t>\n");
+      // 创建hip stream（像C++示例一样）
+      hipStream_t stream;
+      hipError_t stream_err = hipStreamCreate(&stream);
+      if (stream_err != hipSuccess) {
+        printf("[PYBIND_ERROR] Failed to create stream: %s\n", hipGetErrorString(stream_err));
+        return -1.0;
+      }
       
+      printf("[PYBIND] Created stream: %p\n", stream);
+      
+      // 调用函数
       double result = mori::collective::All2all_sdma<int32_t>(
           reinterpret_cast<int32_t*>(input_ptr),
           reinterpret_cast<int32_t*>(output_ptr),
           count,
-          reinterpret_cast<hipStream_t>(stream));
+          stream);
       
-      printf("[PYBIND_DEBUG] Function returned: %f\n", result);
-      printf("[PYBIND_DEBUG] === all2all_sdma_int32 EXIT ===\n");
+      // 销毁stream
+      hipStreamDestroy(stream);
       
       return result;
       
     } catch (const std::exception& e) {
       printf("[PYBIND_ERROR] Exception: %s\n", e.what());
       return -999.0;
-    } catch (...) {
-      printf("[PYBIND_ERROR] Unknown exception\n");
-      return -999.0;
     }
   }, 
   py::arg("input_ptr"), 
   py::arg("output_ptr"), 
-  py::arg("count"), 
-  py::arg("stream") = 0,
-  "All2All SDMA for int32"
-  );
+  py::arg("count"),
+  "All2All SDMA for int32 (creates its own stream)"
+);
+
 
 }
 }  // namespace mori
