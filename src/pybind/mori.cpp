@@ -476,44 +476,192 @@ void RegisterMoriCcl(pybind11::module_& m) {
   );
   
 // 修改all2all_sdma_int32绑定
+// 修改all2all_sdma_int32绑定，添加详细的错误检查
 m.def("all2all_sdma_int32", 
   [](uintptr_t input_ptr, uintptr_t output_ptr, size_t count) -> double {
-    printf("[PYBIND] all2all_sdma_int32 called (without stream parameter)\n");
+    printf("[PYBIND] === all2all_sdma_int32 START ===\n");
+    printf("[PYBIND] input_ptr=%p, output_ptr=%p, count=%zu\n",
+           reinterpret_cast<void*>(input_ptr),
+           reinterpret_cast<void*>(output_ptr),
+           count);
+    
+    hipStream_t stream = nullptr;
+    double result = -999.0;
+    void* flags = nullptr;
     
     try {
-      // 创建hip stream（像C++示例一样）
-      hipStream_t stream;
+      // 获取SHMEM信息
+      int myPe = mori::shmem::ShmemMyPe();
+      int npes = mori::shmem::ShmemNPes();
+      printf("[PYBIND] PE %d of %d\n", myPe, npes);
+      
+      // 1. 创建hip stream
+      printf("[PYBIND] Step 1: Creating hip stream...\n");
       hipError_t stream_err = hipStreamCreate(&stream);
       if (stream_err != hipSuccess) {
-        printf("[PYBIND_ERROR] Failed to create stream: %s\n", hipGetErrorString(stream_err));
+        printf("[PYBIND_ERROR] hipStreamCreate failed: %s (code: %d)\n", 
+               hipGetErrorString(stream_err), stream_err);
         return -1.0;
       }
+      printf("[PYBIND] Stream created: %p\n", stream);
       
-      printf("[PYBIND] Created stream: %p\n", stream);
+      size_t dtype_size = sizeof(int32_t);
+      size_t input_size = count * dtype_size;
+      size_t output_size = count * dtype_size * npes;
       
-      // 调用函数
-      double result = mori::collective::All2all_sdma<int32_t>(
-          reinterpret_cast<int32_t*>(input_ptr),
-          reinterpret_cast<int32_t*>(output_ptr),
-          count,
-          stream);
+      printf("[PYBIND] Sizes: dtype=%zu, input=%zu, output=%zu\n",
+             dtype_size, input_size, output_size);
       
-      // 销毁stream
+      void* input = reinterpret_cast<void*>(input_ptr);
+      void* output = reinterpret_cast<void*>(output_ptr);
+      
+      // 2. 注册输入内存
+      printf("[PYBIND] Step 2: Registering input memory at %p (size=%zu)...\n", 
+             input, input_size);
+      auto inPutBuffObj = mori::shmem::ShmemSymmetricRegister(input, input_size);
+      if (!inPutBuffObj.IsValid()) {
+        printf("[PYBIND_ERROR] ShmemSymmetricRegister for input failed!\n");
+        printf("[PYBIND_ERROR] inPutBuffObj.cpu=%p, inPutBuffObj.gpu=%p\n",
+               inPutBuffObj.cpu, inPutBuffObj.gpu);
+        hipStreamDestroy(stream);
+        return -2.0;
+      }
+      printf("[PYBIND] Input registered successfully\n");
+      
+      // 3. 注册输出内存
+      printf("[PYBIND] Step 3: Registering output memory at %p (size=%zu)...\n", 
+             output, output_size);
+      auto outPutBuffObj = mori::shmem::ShmemSymmetricRegister(output, output_size);
+      if (!outPutBuffObj.IsValid()) {
+        printf("[PYBIND_ERROR] ShmemSymmetricRegister for output failed!\n");
+        printf("[PYBIND_ERROR] outPutBuffObj.cpu=%p, outPutBuffObj.gpu=%p\n",
+               outPutBuffObj.cpu, outPutBuffObj.gpu);
+        hipStreamDestroy(stream);
+        return -3.0;
+      }
+      printf("[PYBIND] Output registered successfully\n");
+      
+      // 4. 分配标志内存
+      size_t flagsSize = npes * sizeof(uint64_t);
+      printf("[PYBIND] Step 4: Allocating flags memory (%zu bytes)...\n", flagsSize);
+      flags = mori::shmem::ShmemMalloc(flagsSize);
+      if (flags == nullptr) {
+        printf("[PYBIND_ERROR] ShmemMalloc failed!\n");
+        hipStreamDestroy(stream);
+        return -4.0;
+      }
+      printf("[PYBIND] Flags allocated at %p\n", flags);
+      
+      // 5. 初始化标志
+      printf("[PYBIND] Step 5: Initializing flags with hipMemset...\n");
+      hipError_t memset_err = hipMemset(flags, 0, flagsSize);
+      if (memset_err != hipSuccess) {
+        printf("[PYBIND_ERROR] hipMemset failed: %s (code: %d)\n", 
+               hipGetErrorString(memset_err), memset_err);
+        mori::shmem::ShmemFree(flags);
+        hipStreamDestroy(stream);
+        return -5.0;
+      }
+      
+      // 6. 同步stream
+      printf("[PYBIND] Step 6: Synchronizing stream...\n");
+      hipError_t sync_err = hipStreamSynchronize(stream);
+      if (sync_err != hipSuccess) {
+        printf("[PYBIND_ERROR] hipStreamSynchronize failed: %s (code: %d)\n",
+               hipGetErrorString(sync_err), sync_err);
+        mori::shmem::ShmemFree(flags);
+        hipStreamDestroy(stream);
+        return -6.0;
+      }
+      printf("[PYBIND] Stream synchronized\n");
+      
+      // 7. 获取标志内存对象
+      printf("[PYBIND] Step 7: Querying flags memory object...\n");
+      auto flagsObj = mori::shmem::ShmemQueryMemObjPtr(flags);
+      if (!flagsObj.IsValid()) {
+        printf("[PYBIND_ERROR] ShmemQueryMemObjPtr failed!\n");
+        printf("[PYBIND_ERROR] flagsObj.cpu=%p, flagsObj.gpu=%p\n",
+               flagsObj.cpu, flagsObj.gpu);
+        mori::shmem::ShmemFree(flags);
+        hipStreamDestroy(stream);
+        return -7.0;
+      }
+      printf("[PYBIND] Flags memory object obtained\n");
+      
+      // 8. 打印所有参数
+      printf("[PYBIND] Step 8: Launching kernel with parameters:\n");
+      printf("[PYBIND]   myPe=%d, npes=%d\n", myPe, npes);
+      printf("[PYBIND]   inPutBuffObj.cpu=%p, .gpu=%p\n", 
+             inPutBuffObj.cpu, inPutBuffObj.gpu);
+      printf("[PYBIND]   outPutBuffObj.cpu=%p, .gpu=%p\n", 
+             outPutBuffObj.cpu, outPutBuffObj.gpu);
+      printf("[PYBIND]   flagsObj.cpu=%p, .gpu=%p\n", 
+             flagsObj.cpu, flagsObj.gpu);
+      printf("[PYBIND]   elementCount=%zu\n", count);
+      
+      // 9. 启动内核
+      printf("[PYBIND] Step 9: Launching OneShotAll2allSdmaKernel...\n");
+      double start = MPI_Wtime();
+      mori::collective::OneShotAll2allSdmaKernel<int32_t><<<1, 512, 0, stream>>>(
+          myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, count);
+      
+      // 10. 同步等待完成
+      printf("[PYBIND] Step 10: Synchronizing after kernel launch...\n");
+      hipError_t kernel_sync_err = hipStreamSynchronize(stream);
+      if (kernel_sync_err != hipSuccess) {
+        printf("[PYBIND_ERROR] Kernel synchronization failed: %s (code: %d)\n", 
+               hipGetErrorString(kernel_sync_err), kernel_sync_err);
+        
+        // 检查是否有更详细的错误信息
+        hipError_t last_err = hipGetLastError();
+        if (last_err != hipSuccess) {
+          printf("[PYBIND_ERROR] Last HIP error: %s (code: %d)\n",
+                 hipGetErrorString(last_err), last_err);
+        }
+        
+        mori::shmem::ShmemFree(flags);
+        hipStreamDestroy(stream);
+        return -8.0;
+      }
+      
+      double end = MPI_Wtime();
+      result = end - start;
+      
+      printf("[PYBIND] Step 11: Kernel completed in %.9f seconds\n", result);
+      
+      // 11. 清理
+      printf("[PYBIND] Step 12: Cleaning up...\n");
+      mori::shmem::ShmemFree(flags);
       hipStreamDestroy(stream);
       
+      printf("[PYBIND] === all2all_sdma_int32 SUCCESS ===\n");
       return result;
       
     } catch (const std::exception& e) {
       printf("[PYBIND_ERROR] Exception: %s\n", e.what());
+      if (flags != nullptr) {
+        mori::shmem::ShmemFree(flags);
+      }
+      if (stream != nullptr) {
+        hipStreamDestroy(stream);
+      }
+      return -999.0;
+    } catch (...) {
+      printf("[PYBIND_ERROR] Unknown exception\n");
+      if (flags != nullptr) {
+        mori::shmem::ShmemFree(flags);
+      }
+      if (stream != nullptr) {
+        hipStreamDestroy(stream);
+      }
       return -999.0;
     }
   }, 
   py::arg("input_ptr"), 
   py::arg("output_ptr"), 
   py::arg("count"),
-  "All2All SDMA for int32 (creates its own stream)"
+  "All2All SDMA for int32"
 );
-
 
 }
 }  // namespace mori
