@@ -193,8 +193,12 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
   }
 
   if(myPe == 0){
+    double global_bandwidth = total_count * dtype_size * npes /(tc/50.0);
+    global_bandwidth /= (1024.0 * 1024.0 * 1024.0);
+
     printf("============ avg sequential gemm time  :%0.9f    ms============= \n", tg/50.0);
     printf("============ avg sequential coll time  :%0.9f    ms============= \n", tc/50.0);
+    printf("============ avg sequential coll bw    :%0.9f    GB/s =========== \n", global_bandwidth*1000);
     //printf("============ avg sequential total time :%0.9f    ms============= \n", tt/10.0);
   }
 
@@ -236,7 +240,7 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
     global_bandwidth /= (1024.0 * 1024.0 * 1024.0);
 
     printf("============ avg coll time    :%0.9f    ms============= \n", total_c/50.0);
-    printf("============ avg coll bw      :%0.9f    GB/s ============= \n", global_bandwidth);
+    printf("============ avg coll bw      :%0.9f    GB/s ============= \n", global_bandwidth*1000);
     printf("============ avg gemm time    :%0.9f    ms============= \n", total_g/50.0);
     printf("============ avg overlap time :%0.9f    ms============= \n", total/50.0);
   }
