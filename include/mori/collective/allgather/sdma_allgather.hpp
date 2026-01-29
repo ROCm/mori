@@ -151,7 +151,8 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
   float tc = 0;
   float tt = 0;
   ///hipblasHandle_t handle_d;
-  //hipblasCreate(&handle_d); 
+  //hipblasCreate(&handle_d);
+  hipStreamSynchronize(gstream); 
   for(int i=0;i<10;i++){
     hipEventRecord(start_s, gstream);
     hipblasGemmEx(handle,
@@ -165,7 +166,7 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
                 HIPBLAS_COMPUTE_32F,  // 计算精度为FP32                                                                                                                                                                   
                 HIPBLAS_GEMM_DEFAULT);
     hipEventRecord(mid_1);
-     hipStreamSynchronize(gstream);
+    hipStreamSynchronize(gstream);
 
     //float mssc;
     float mssg;
