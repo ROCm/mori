@@ -199,4 +199,3 @@ public:
 } // namespace mori
 
 #endif // ONESHOT_ALL2ALL_SDMA_CLASS_HPP
-root@sdma-test:~/fizhang/mori#
