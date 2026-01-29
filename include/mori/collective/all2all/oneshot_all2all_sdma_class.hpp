@@ -5,6 +5,7 @@
 #include <mpi.h>
 #include <memory>
 #include <cstdint>
+#include <atomic>
 
 // Include necessary headers
 #include "mori/application/application.hpp"
@@ -39,11 +40,20 @@ private:
     size_t output_transit_buffer_size_;
     application::SymmMemObjPtr output_transit_buffer_obj_;
     std::unique_ptr<void, ShmemDeleter> output_transit_buffer_ptr_;
-    
+
+    // ================ NEW: Async state variables ================
+    std::atomic<bool> async_in_progress_;      // Flag indicating async operation is active
+    T* async_input_;                           // Saved input pointer for async operation
+    T* async_output_;                          // Saved output pointer for async operation
+    size_t async_total_count_;                 // Saved element count for async operation
+    hipStream_t async_stream_;                 // Saved stream for async operation
+    double async_start_time_;                  // Start time for async operation
+    // ============================================================
+
     // Disable copy constructor and assignment operator
     All2allSdma(const All2allSdma&) = delete;
     All2allSdma& operator=(const All2allSdma&) = delete;
-    
+
     // Internal methods
     bool ensure_buffer_size(void*& buffer, 
                            std::unique_ptr<void, ShmemDeleter>& buffer_ptr,
@@ -80,17 +90,45 @@ public:
 
     /**
      * @brief 执行All2All SDMA操作
-     * @param input 输入数据指针
-     * @param output 输出数据指针
-     * @param total_count 每个PE的数据元素数量
-     * @param stream HIP流
-     * @return 执行时间（秒），如果失败返回-1
+     * @param input Input data pointer
+     * @param output Output data pointer
+     * @param total_count Number of data elements per PE
+     * @param stream HIP stream
+     * @return true if successful, false otherwise
+     */
+    bool start_async(T* input, T* output, size_t total_count, hipStream_t stream = nullptr);
+
+    /**
+     * @brief Wait for asynchronous All2All operation to complete (WAIT phase)
+     * @param stream HIP stream (optional, can be different from start_async stream)
+     * @return Execution time in seconds, -1.0 if failed
+     */
+    double wait_async(hipStream_t stream = nullptr);
+
+    /**
+     * @brief Check if async operation is in progress
+     * @return true if async operation is active
+     */
+    bool is_async_in_progress() const { return async_in_progress_; }
+
+    /**
+     * @brief Cancel ongoing async operation
+     */
+    void cancel_async();
+    // =======================================================
+
+    /**
+     * @brief Executes synchronous All2All SDMA operation
+     * @param input Input data pointer
+     * @param output Output data pointer
+     * @param total_count Number of data elements per PE
+     * @param stream HIP stream
+     * @return Execution time in seconds, returns -1.0 if failed
      */
     double operator()(T* input, T* output, size_t total_count, hipStream_t stream = nullptr);
 
     /**
-     * @brief 获取标志位对称内存对象
-     * @return SymmMemObjPtr 标志位内存对象
+     * @brief Gets flag symmetric memory object
      */
     application::SymmMemObjPtr getFlagsObj() const { return flagsObj_; }
     

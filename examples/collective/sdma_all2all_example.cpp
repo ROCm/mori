@@ -275,12 +275,67 @@ void testOneShotSdmaAll2all() {
         myPe, npes, input_buffer_size, output_buffer_size);
 
   printf("PE %d: All2allSdma created successfully\n", myPe);
+
   // Execute All2All operation
   printf("PE %d: Executing All2All...\n", myPe);
-  double execution_time;
-  for (int i = 0; i < 10; i++)
-    execution_time = (*all2all_obj)(inPutBuff, outPutBuff, elemsPerPe, stream);
- 
+  double execution_time = -1.0;
+  bool use_async = 0;  // Set to 1 for async mode, 0 for sync mode
+
+  if (use_async == 0) {
+    // Synchronous mode (original logic)
+    for (int i = 0; i < 10; i++) {
+      execution_time = (*all2all_obj)(inPutBuff, outPutBuff, elemsPerPe, stream);
+    }
+  } else {
+    // Asynchronous mode
+    printf("PE %d: Using ASYNC mode (start_async + wait_async)\n", myPe);
+
+    // Test multiple async operations
+    for (int i = 0; i < 10; i++) {
+      if (myPe == 0) {
+        printf("\n--- Iteration %d ---\n", i + 1);
+      }
+
+      MPI_Barrier(MPI_COMM_WORLD);
+
+      #if 0
+      // Check if there's an async operation already in progress
+      if (all2all_obj->is_async_in_progress()) {
+        printf("PE %d: Warning: Async operation already in progress, cancelling...\n", myPe);
+        all2all_obj->cancel_async();
+      }
+      #endif
+
+      // Step 1: Start async operation (PUT phase)
+      bool started = all2all_obj->start_async(inPutBuff, outPutBuff, elemsPerPe, stream);
+      if (!started) {
+        fprintf(stderr, "PE %d: Failed to start async operation\n", myPe);
+        break;
+      }
+
+      printf("PE %d: Async operation started successfully\n", myPe);
+
+      // Perform other computations while waiting (simulated)
+      if (myPe == 0) {
+        printf("PE 0: Performing other computations while All2All is in progress...\n");
+        // Add other GPU computations here
+      }
+
+      // Step 2: Wait for async operation to complete (WAIT phase)
+      execution_time = all2all_obj->wait_async(stream);
+
+      if (execution_time < 0) {
+        fprintf(stderr, "PE %d: Async operation failed\n", myPe);
+        break;
+      }
+
+      printf("PE %d: Async iteration %d completed in %.6f seconds\n", myPe, i + 1, execution_time);
+
+      // Add synchronization between iterations to ensure all PEs complete
+      MPI_Barrier(MPI_COMM_WORLD);
+    }
+  }
+
   //CHECK_HIP(hipStreamSynchronize(stream));
 
   if (execution_time < 0) {
