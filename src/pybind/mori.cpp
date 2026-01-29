@@ -28,7 +28,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/python.h>
-
+#include <pybind11/numpy.h>
+#include <pybind11/stl.h>
 #include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
