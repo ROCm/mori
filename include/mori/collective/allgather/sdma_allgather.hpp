@@ -156,8 +156,14 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
     total_g += msg;    
 
   }
+
+
   if(myPe == 0){
+    double global_bandwidth = total_count * dtype_size * npes /total_c/10.0;
+    global_bandwidth /= (1024.0 * 1024.0 * 1024.0);
+
     printf("============ avg coll time :%0.9f ============= \n", total_c/10.0);
+    printf("============ avg coll bw  :%0.9f GB/s ============= \n", global_bandwidth);
     printf("============ avg gemm time :%0.9f ============= \n", total_g/10.0);
   }
 
