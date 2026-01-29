@@ -37,7 +37,7 @@ namespace collective {
 template <typename T>
 double AllGather_sdma(T* input, T* output, size_t total_count,
                                           hipStream_t stream_ccl) {
-
+  int m = 8192, n = 8192, k = 8192;
   // 创建hipBLAS句柄和stream
   hipblasHandle_t handle;
   hipblasCreate(&handle);
