@@ -121,8 +121,9 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
                     HIPBLAS_COMPUTE_32F,  // 计算精度为FP32                                                                                                                                                                   
                     HIPBLAS_GEMM_DEFAULT);                                                                                                                                                                              
   }                                                                                                                                                                                                                    
-  hipStreamSynchronize(gstream);  
+  hipStreamSynchronize(gstream);
 
+  MPI_Barrier(MPI_COMM_WORLD);  
   hipStreamSynchronize(stream_ccl); //warm up
   for(int i =0 ; i<10;i++)
     OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream_ccl>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);                                                                                                                                                                                                                  
