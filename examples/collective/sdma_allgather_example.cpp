@@ -131,9 +131,9 @@ void testOneShotSdmaAllGather() {
   double start = MPI_Wtime();
  // if(1)
   double local_duration = 0;
- for(int i = 0; i<20; i++){
+ //for(int i = 0; i<20; i++){
    local_duration = AllGather_sdma<uint32_t>(inPutBuff, outPutBuff, elemsPerPe, stream_ccl);
-}  //OneShotAllGatharSdmaKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
+//}  //OneShotAllGatharSdmaKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
 
 //  else{
 //    OneShotAllGatharSdmaAsyncPutKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
@@ -142,7 +142,7 @@ void testOneShotSdmaAllGather() {
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   double end = MPI_Wtime();
 //  double local_duration = end - start;
-
+#if 0
   double global_max_duration;
   MPI_Reduce(&local_duration, &global_max_duration, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
   MPI_Barrier(MPI_COMM_WORLD);
@@ -155,6 +155,7 @@ void testOneShotSdmaAllGather() {
     printf("========global max time %.9f ======== \n", global_max_duration);
   }
   MPI_Barrier(MPI_COMM_WORLD);
+#endif
 
   // Copy result back to host for verification
   HIP_RUNTIME_CHECK(hipMemcpy(hostData, outPutBuff, totalBytes, hipMemcpyDeviceToHost));
