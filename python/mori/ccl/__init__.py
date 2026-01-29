@@ -1,4 +1,3 @@
-# /root/mori/python/mori/ccl/__init__.py
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
 # MIT License
@@ -22,5 +21,7 @@
 # SOFTWARE.
 
 from .collective import All2allSdma
+from .collective import AllgatherSdma
 
 __all__ = ['All2allSdma']
+__all__ = ['AllgatherSdma']
