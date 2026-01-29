@@ -69,3 +69,7 @@ target_link_libraries(accum_perf mori_application mori_shmem hip::host
 add_executable(ibverbs_test application/ibverbs_test.cpp)
 target_link_libraries(ibverbs_test mori_application mori_shmem hip::host
                       hip::device)
+
+add_executable(test_vmm_mpi_write utils/test_vmm_mpi_write.cpp)
+target_link_libraries(test_vmm_mpi_write mori_application hip::host hip::device)
+
