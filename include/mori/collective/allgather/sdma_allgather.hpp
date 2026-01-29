@@ -161,7 +161,7 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
     printf("============ avg gemm time :%0.9f ============= \n", total_g/10.0);
   }
 
-  return total_ms;
+  return total_c;
 }
 }
 }
