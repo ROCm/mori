@@ -132,13 +132,13 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
   MPI_Barrier(MPI_COMM_WORLD);
   //double start = MPI_Wtime();
   for(int i=0;i<10;i++){
-    hipEventRecord(start);
+    hipEventRecord(start,stream_ccl);
     OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream_ccl>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
     hipblasGemmEx(handle, HIPBLAS_OP_N, HIPBLAS_OP_N,m, n, k,&alpha,dA, HIPBLAS_R_16F, m,dB, HIPBLAS_R_16F, k,&beta,dC, HIPBLAS_R_16F, m,HIPBLAS_COMPUTE_32F,  // 计算精度为FP32
                      HIPBLAS_GEMM_DEFAULT);
     hipStreamSynchronize(gstream);
     hipStreamSynchronize(stream_ccl);
-    hipEventRecord(stop);
+    hipEventRecord(stop,stream_ccl);
 
     float ms;                                                                                                                                                                                                        
     hipEventElapsedTime(&ms, start, stop);                                                                                                                                                                           
