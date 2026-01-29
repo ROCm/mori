@@ -150,11 +150,11 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
   float tg = 0;
   float tc = 0;
   float tt = 0;
-  hipblasHandle_t handle_d;
-  hipblasCreate(&handle_d); 
+  ///hipblasHandle_t handle_d;
+  //hipblasCreate(&handle_d); 
   for(int i=0;i<10;i++){
-    hipEventRecord(start_s);
-    hipblasGemmEx(handle_d,
+    hipEventRecord(start_s, gstream);
+    hipblasGemmEx(handle,
                 HIPBLAS_OP_N, HIPBLAS_OP_N,
                 m, n, k,
                 &alpha,
@@ -165,26 +165,31 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
                 HIPBLAS_COMPUTE_32F,  // 计算精度为FP32                                                                                                                                                                   
                 HIPBLAS_GEMM_DEFAULT);
     hipEventRecord(mid_1);
-    MPI_Barrier(MPI_COMM_WORLD); 
-    hipEventRecord(mid_2); 
-    OneShotAllGatherSdmaKernel<T><<<1, 512>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
-    hipEventRecord(stop_s);
-    hipDeviceSynchronize();
+     hipStreamSynchronize(gstream);
 
-    float mssc;
+    //float mssc;
     float mssg;
-    float msst;                                                                                                                                                                                                        
+    //float msst;                                                                                                                                                                                                        
     hipEventElapsedTime(&mssg, start_s, mid_1);
-    hipEventElapsedTime(&mssc, mid_2,  stop_s);
-    hipEventElapsedTime(&msst, start_s, stop_s);
+    //hipEventElapsedTime(&mssc, mid_2,  stop_s);
+    //hipEventElapsedTime(&msst, start_s, stop_s);
     tg += mssg;
-    tc += mssc;
-    tt += msst; 
+    //tc += mssc;
+    //tt += msst; 
   }
+
+
+  //    hipEventRecord(mid_2); 
+  //  OneShotAllGatherSdmaKernel<T><<<1, 512>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
+  //  hipEventRecord(stop_s);
+  //  hipDeviceSynchronize();
+
+
+
   if(myPe == 0){
     printf("============ avg sequential gemm time  :%0.9f    ms============= \n", tg/10.0);
-    printf("============ avg sequential coll time  :%0.9f    ms============= \n", tc/10.0);
-    printf("============ avg sequential total time :%0.9f    ms============= \n", tt/10.0);
+    //printf("============ avg sequential coll time  :%0.9f    ms============= \n", tc/10.0);
+    //printf("============ avg sequential total time :%0.9f    ms============= \n", tt/10.0);
   }
 
 
