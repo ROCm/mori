@@ -430,4 +430,3 @@ int main(int argc, char* argv[]) {
   testOneShotSdmaAllgather();
   return 0;
 }
-root@sdma-test:~/fizhang/mori#
