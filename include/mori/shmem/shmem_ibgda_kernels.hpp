@@ -443,19 +443,19 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
   while (true) {
     // Check if current thread still has data to transfer
     bool has_remaining = (remaining > 0);
-    
+
     // Synchronize within warp: get mask of threads that still have work
     uint64_t activemask = __ballot(has_remaining);
     if (activemask == 0) {
       break;  // All threads in warp are done
     }
-    
+
     // Recalculate active lane info for threads with remaining data
     uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
     uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
     bool is_leader{my_logical_lane_id == num_active_lanes - 1};
     const uint64_t leader_phys_lane_id = core::GetLastActiveLaneID(activemask);
-    
+
     // Inactive threads skip actual work but stay synchronized
     if (!has_remaining) {
       continue;
@@ -806,19 +806,19 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
   while (true) {
     // Check if current thread still has data to transfer
     bool has_remaining = (remaining > 0);
-    
+
     // Synchronize within warp: get mask of threads that still have work
     uint64_t activemask = __ballot(has_remaining);
     if (activemask == 0) {
       break;  // All threads in warp are done
     }
-    
+
     // Recalculate active lane info for threads with remaining data
     uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
     uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
     bool is_leader{my_logical_lane_id == num_active_lanes - 1};
     const uint64_t leader_phys_lane_id = core::GetLastActiveLaneID(activemask);
-    
+
     // Inactive threads skip actual work but stay synchronized
     if (!has_remaining) {
       continue;
@@ -853,12 +853,12 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
 
     // Each thread checks if this is its last chunk
     bool my_is_last_chunk = (transfer_size == remaining);
-    
+
     // Synchronize: only send signal if ALL active threads are on their last chunk
     // This ensures warp-uniform decision on num_wqes
     uint64_t all_last_mask = __ballot(my_is_last_chunk);
     bool isLastChunk = (all_last_mask == activemask);
-    
+
     uint32_t warp_sq_counter{0};
     uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
     uint32_t my_sq_counter{0}, my_msntbl_counter{0}, my_psn_counter{0};
@@ -932,16 +932,16 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
     uint64_t dbr_val;
     if constexpr (PrvdType == core::ProviderType::MLX5) {
       wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
-      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
-                                          qpn, laddr, lkey, raddr, rkey, transfer_size);
+      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter,
+                                          is_leader, qpn, laddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
       wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
       dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter,
                                           is_leader, qpn, laddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::PSD) {
       wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
-      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
-                                          qpn, laddr, lkey, raddr, rkey, transfer_size);
+      dbr_val = core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter,
+                                          is_leader, qpn, laddr, lkey, raddr, rkey, transfer_size);
     } else {
       static_assert(false);
     }
@@ -1558,19 +1558,19 @@ inline __device__ void ShmemPutMemNbiThreadKernelAddrImpl(const void* dest, cons
   while (true) {
     // Check if current thread still has data to transfer
     bool has_remaining = (remaining > 0);
-    
+
     // Synchronize within warp: get mask of threads that still have work
     uint64_t activemask = __ballot(has_remaining);
     if (activemask == 0) {
       break;  // All threads in warp are done
     }
-    
+
     // Recalculate active lane info for threads with remaining data
     uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
     uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
     bool is_leader{my_logical_lane_id == num_active_lanes - 1};
     const uint64_t leader_phys_lane_id = core::GetLastActiveLaneID(activemask);
-    
+
     // Inactive threads skip actual work but stay synchronized
     if (!has_remaining) {
       continue;
@@ -1901,19 +1901,19 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
   while (true) {
     // Check if current thread still has data to transfer
     bool has_remaining = (remaining > 0);
-    
+
     // Synchronize within warp: get mask of threads that still have work
     uint64_t activemask = __ballot(has_remaining);
     if (activemask == 0) {
       break;  // All threads in warp are done
     }
-    
+
     // Recalculate active lane info for threads with remaining data
     uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
     uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
     bool is_leader{my_logical_lane_id == num_active_lanes - 1};
     const uint64_t leader_phys_lane_id = core::GetLastActiveLaneID(activemask);
-    
+
     // Inactive threads skip actual work but stay synchronized
     if (!has_remaining) {
       continue;
@@ -1943,12 +1943,12 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
 
     // Each thread checks if this is its last chunk
     bool my_is_last_chunk = (transfer_size == remaining);
-    
+
     // Synchronize: only send signal if ALL active threads are on their last chunk
     // This ensures warp-uniform decision on num_wqes
     uint64_t all_last_mask = __ballot(my_is_last_chunk);
     bool isLastChunk = (all_last_mask == activemask);
-    
+
     uint32_t warp_sq_counter{0};
     uint32_t warp_msntbl_counter{0}, warp_psn_counter{0};
     uint32_t my_sq_counter{0}, my_msntbl_counter{0}, my_psn_counter{0};

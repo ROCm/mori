@@ -160,8 +160,8 @@ DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Warp)
       const application::SymmMemObjPtr source, size_t srcElmOffset, size_t nelems, int pe, \
       int qpId = 0) {                                                                      \
     constexpr size_t typeSize = sizeof(T);                                                 \
-    ShmemPutMemNbi##Scope(dest, destElmOffset* typeSize, source, srcElmOffset* typeSize,   \
-                          nelems* typeSize, pe, qpId);                                     \
+    ShmemPutMemNbi##Scope(dest, destElmOffset * typeSize, source, srcElmOffset * typeSize, \
+                          nelems * typeSize, pe, qpId);                                    \
   }
 
 DEFINE_SHMEM_PUT_TYPE_NBI_API_TEMPLATE(Thread)

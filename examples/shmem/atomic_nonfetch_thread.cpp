@@ -176,16 +176,17 @@ void testAtomicNonFetchThread() {
   // Set GPU device based on local rank
   MPI_Comm localComm;
   MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &localComm);
-  
+
   int localRank;
   MPI_Comm_rank(localComm, &localRank);
-  
+
   int deviceCount;
   HIP_RUNTIME_CHECK(hipGetDeviceCount(&deviceCount));
   int deviceId = localRank % deviceCount;
   HIP_RUNTIME_CHECK(hipSetDevice(deviceId));
-  
-  printf("Local rank %d setting GPU device %d (total %d devices)\n", localRank, deviceId, deviceCount);
+
+  printf("Local rank %d setting GPU device %d (total %d devices)\n", localRank, deviceId,
+         deviceCount);
 
   status = ShmemMpiInit(MPI_COMM_WORLD);
   assert(!status);
@@ -233,10 +234,11 @@ void testAtomicNonFetchThread() {
     AtomicNonFetchThreadKernel<uint64_t><<<blockNum, threadNum>>>(myPe, buffObj);
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
-    
+
     if (myPe == 0) {
       uint64_t result;
-      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<uint64_t*>(buff) + 2, sizeof(uint64_t), hipMemcpyDeviceToHost));
+      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<uint64_t*>(buff) + 2, sizeof(uint64_t),
+                                  hipMemcpyDeviceToHost));
       printf("✓ Legacy API uint64_t test completed. Result at index 2: %lu\n", result);
     }
 
@@ -253,14 +255,15 @@ void testAtomicNonFetchThread() {
       HIP_RUNTIME_CHECK(hipDeviceSynchronize());
       MPI_Barrier(MPI_COMM_WORLD);
 
-      AtomicNonFetchThreadKernel_PureAddr<uint64_t><<<blockNum, threadNum>>>(
-          myPe, reinterpret_cast<uint64_t*>(buff));
+      AtomicNonFetchThreadKernel_PureAddr<uint64_t>
+          <<<blockNum, threadNum>>>(myPe, reinterpret_cast<uint64_t*>(buff));
       HIP_RUNTIME_CHECK(hipDeviceSynchronize());
       MPI_Barrier(MPI_COMM_WORLD);
-      
+
       if (myPe == 0) {
         uint64_t result;
-        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<uint64_t*>(buff) + 2, sizeof(uint64_t), hipMemcpyDeviceToHost));
+        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<uint64_t*>(buff) + 2,
+                                    sizeof(uint64_t), hipMemcpyDeviceToHost));
         printf("✓ Pure Address API uint64_t test completed. Result at index 2: %lu\n", result);
       }
     }
@@ -276,10 +279,11 @@ void testAtomicNonFetchThread() {
     AtomicNonFetchThreadKernel<int64_t><<<blockNum, threadNum>>>(myPe, buffObj);
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
-    
+
     if (myPe == 0) {
       int64_t result;
-      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<int64_t*>(buff) + 2, sizeof(int64_t), hipMemcpyDeviceToHost));
+      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<int64_t*>(buff) + 2, sizeof(int64_t),
+                                  hipMemcpyDeviceToHost));
       printf("✓ Legacy API int64_t test completed. Result at index 2: %ld\n", result);
     }
 
@@ -296,14 +300,15 @@ void testAtomicNonFetchThread() {
       HIP_RUNTIME_CHECK(hipDeviceSynchronize());
       MPI_Barrier(MPI_COMM_WORLD);
 
-      AtomicNonFetchThreadKernel_PureAddr<int64_t><<<blockNum, threadNum>>>(
-          myPe, reinterpret_cast<int64_t*>(buff));
+      AtomicNonFetchThreadKernel_PureAddr<int64_t>
+          <<<blockNum, threadNum>>>(myPe, reinterpret_cast<int64_t*>(buff));
       HIP_RUNTIME_CHECK(hipDeviceSynchronize());
       MPI_Barrier(MPI_COMM_WORLD);
-      
+
       if (myPe == 0) {
         int64_t result;
-        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<int64_t*>(buff) + 2, sizeof(int64_t), hipMemcpyDeviceToHost));
+        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<int64_t*>(buff) + 2, sizeof(int64_t),
+                                    hipMemcpyDeviceToHost));
         printf("✓ Pure Address API int64_t test completed. Result at index 2: %ld\n", result);
       }
     }
@@ -319,10 +324,11 @@ void testAtomicNonFetchThread() {
     AtomicNonFetchThreadKernel<uint32_t><<<blockNum, threadNum>>>(myPe, buffObj);
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
-    
+
     if (myPe == 0) {
       uint32_t result;
-      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<uint32_t*>(buff) + 2, sizeof(uint32_t), hipMemcpyDeviceToHost));
+      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<uint32_t*>(buff) + 2, sizeof(uint32_t),
+                                  hipMemcpyDeviceToHost));
       printf("✓ Legacy API uint32_t test completed. Result at index 2: %u\n", result);
     }
 
@@ -339,14 +345,15 @@ void testAtomicNonFetchThread() {
       HIP_RUNTIME_CHECK(hipDeviceSynchronize());
       MPI_Barrier(MPI_COMM_WORLD);
 
-      AtomicNonFetchThreadKernel_PureAddr<uint32_t><<<blockNum, threadNum>>>(
-          myPe, reinterpret_cast<uint32_t*>(buff));
+      AtomicNonFetchThreadKernel_PureAddr<uint32_t>
+          <<<blockNum, threadNum>>>(myPe, reinterpret_cast<uint32_t*>(buff));
       HIP_RUNTIME_CHECK(hipDeviceSynchronize());
       MPI_Barrier(MPI_COMM_WORLD);
-      
+
       if (myPe == 0) {
         uint32_t result;
-        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<uint32_t*>(buff) + 2, sizeof(uint32_t), hipMemcpyDeviceToHost));
+        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<uint32_t*>(buff) + 2,
+                                    sizeof(uint32_t), hipMemcpyDeviceToHost));
         printf("✓ Pure Address API uint32_t test completed. Result at index 2: %u\n", result);
       }
     }
@@ -362,10 +369,11 @@ void testAtomicNonFetchThread() {
     AtomicNonFetchThreadKernel<int32_t><<<blockNum, threadNum>>>(myPe, buffObj);
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
-    
+
     if (myPe == 0) {
       int32_t result;
-      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<int32_t*>(buff) + 2, sizeof(int32_t), hipMemcpyDeviceToHost));
+      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<int32_t*>(buff) + 2, sizeof(int32_t),
+                                  hipMemcpyDeviceToHost));
       printf("✓ Legacy API int32_t test completed. Result at index 2: %d\n", result);
     }
 
@@ -382,14 +390,15 @@ void testAtomicNonFetchThread() {
       HIP_RUNTIME_CHECK(hipDeviceSynchronize());
       MPI_Barrier(MPI_COMM_WORLD);
 
-      AtomicNonFetchThreadKernel_PureAddr<int32_t><<<blockNum, threadNum>>>(
-          myPe, reinterpret_cast<int32_t*>(buff));
+      AtomicNonFetchThreadKernel_PureAddr<int32_t>
+          <<<blockNum, threadNum>>>(myPe, reinterpret_cast<int32_t*>(buff));
       HIP_RUNTIME_CHECK(hipDeviceSynchronize());
       MPI_Barrier(MPI_COMM_WORLD);
-      
+
       if (myPe == 0) {
         int32_t result;
-        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<int32_t*>(buff) + 2, sizeof(int32_t), hipMemcpyDeviceToHost));
+        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<int32_t*>(buff) + 2, sizeof(int32_t),
+                                    hipMemcpyDeviceToHost));
         printf("✓ Pure Address API int32_t test completed. Result at index 2: %d\n", result);
       }
     }
@@ -405,10 +414,11 @@ void testAtomicNonFetchThread() {
     AtomicNonFetchThreadKernel<long><<<blockNum, threadNum>>>(myPe, buffObj);
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
-    
+
     if (myPe == 0) {
       long result;
-      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<long*>(buff) + 2, sizeof(long), hipMemcpyDeviceToHost));
+      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<long*>(buff) + 2, sizeof(long),
+                                  hipMemcpyDeviceToHost));
       printf("✓ Legacy API long test completed. Result at index 2: %ld\n", result);
     }
 
@@ -425,14 +435,15 @@ void testAtomicNonFetchThread() {
       HIP_RUNTIME_CHECK(hipDeviceSynchronize());
       MPI_Barrier(MPI_COMM_WORLD);
 
-      AtomicNonFetchThreadKernel_PureAddr<long><<<blockNum, threadNum>>>(
-          myPe, reinterpret_cast<long*>(buff));
+      AtomicNonFetchThreadKernel_PureAddr<long>
+          <<<blockNum, threadNum>>>(myPe, reinterpret_cast<long*>(buff));
       HIP_RUNTIME_CHECK(hipDeviceSynchronize());
       MPI_Barrier(MPI_COMM_WORLD);
-      
+
       if (myPe == 0) {
         long result;
-        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<long*>(buff) + 2, sizeof(long), hipMemcpyDeviceToHost));
+        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<long*>(buff) + 2, sizeof(long),
+                                    hipMemcpyDeviceToHost));
         printf("✓ Pure Address API long test completed. Result at index 2: %ld\n", result);
       }
     }
@@ -448,10 +459,11 @@ void testAtomicNonFetchThread() {
     AtomicNonFetchThreadKernel<unsigned long><<<blockNum, threadNum>>>(myPe, buffObj);
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
-    
+
     if (myPe == 0) {
       unsigned long result;
-      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<unsigned long*>(buff) + 2, sizeof(unsigned long), hipMemcpyDeviceToHost));
+      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<unsigned long*>(buff) + 2,
+                                  sizeof(unsigned long), hipMemcpyDeviceToHost));
       printf("✓ Legacy API unsigned long test completed. Result at index 2: %lu\n", result);
     }
 
@@ -468,14 +480,15 @@ void testAtomicNonFetchThread() {
       HIP_RUNTIME_CHECK(hipDeviceSynchronize());
       MPI_Barrier(MPI_COMM_WORLD);
 
-      AtomicNonFetchThreadKernel_PureAddr<unsigned long><<<blockNum, threadNum>>>(
-          myPe, reinterpret_cast<unsigned long*>(buff));
+      AtomicNonFetchThreadKernel_PureAddr<unsigned long>
+          <<<blockNum, threadNum>>>(myPe, reinterpret_cast<unsigned long*>(buff));
       HIP_RUNTIME_CHECK(hipDeviceSynchronize());
       MPI_Barrier(MPI_COMM_WORLD);
-      
+
       if (myPe == 0) {
         unsigned long result;
-        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<unsigned long*>(buff) + 2, sizeof(unsigned long), hipMemcpyDeviceToHost));
+        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<unsigned long*>(buff) + 2,
+                                    sizeof(unsigned long), hipMemcpyDeviceToHost));
         printf("✓ Pure Address API unsigned long test completed. Result at index 2: %lu\n", result);
       }
     }
@@ -491,10 +504,11 @@ void testAtomicNonFetchThread() {
     UlongAtomicAddThreadKernel<<<blockNum, threadNum>>>(myPe, buffObj);
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
-    
+
     if (myPe == 0) {
       unsigned long result;
-      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<unsigned long*>(buff) + 2, sizeof(unsigned long), hipMemcpyDeviceToHost));
+      HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<unsigned long*>(buff) + 2,
+                                  sizeof(unsigned long), hipMemcpyDeviceToHost));
       printf("✓ ShmemUlongAtomicAddThread API test completed. Result at index 2: %lu\n", result);
     }
 
@@ -515,11 +529,15 @@ void testAtomicNonFetchThread() {
           myPe, reinterpret_cast<unsigned long*>(buff));
       HIP_RUNTIME_CHECK(hipDeviceSynchronize());
       MPI_Barrier(MPI_COMM_WORLD);
-      
+
       if (myPe == 0) {
         unsigned long result;
-        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<unsigned long*>(buff) + 2, sizeof(unsigned long), hipMemcpyDeviceToHost));
-        printf("✓ ShmemUlongAtomicAddThread API (Pure Address) test completed. Result at index 2: %lu\n", result);
+        HIP_RUNTIME_CHECK(hipMemcpy(&result, reinterpret_cast<unsigned long*>(buff) + 2,
+                                    sizeof(unsigned long), hipMemcpyDeviceToHost));
+        printf(
+            "✓ ShmemUlongAtomicAddThread API (Pure Address) test completed. Result at index 2: "
+            "%lu\n",
+            result);
       }
     }
 

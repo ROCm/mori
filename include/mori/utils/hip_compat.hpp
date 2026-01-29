@@ -27,22 +27,18 @@
 
 /**
  * @brief Compatibility wrapper for hipMemImportFromShareableHandle
- * 
+ *
  * ROCm 7.0.x expects (void*)&fd, 7.1.0+ changed to expect (void*)(uintptr_t)fd
  */
-inline hipError_t hipMemImportFromShareableHandleCompat(
-    hipMemGenericAllocationHandle_t* handle,
-    int fd,
-    hipMemAllocationHandleType handleType)
-{
+inline hipError_t hipMemImportFromShareableHandleCompat(hipMemGenericAllocationHandle_t* handle,
+                                                        int fd,
+                                                        hipMemAllocationHandleType handleType) {
 #if HIP_VERSION >= 70100000
-    // ROCm 7.1.0+: FD value as pointer
-    return hipMemImportFromShareableHandle(
-        handle,
-        reinterpret_cast<void*>(static_cast<uintptr_t>(fd)),
-        handleType);
+  // ROCm 7.1.0+: FD value as pointer
+  return hipMemImportFromShareableHandle(
+      handle, reinterpret_cast<void*>(static_cast<uintptr_t>(fd)), handleType);
 #else
-    // ROCm 7.0.x or older: Pointer to FD
-    return hipMemImportFromShareableHandle(handle, (void*)&fd, handleType);
+  // ROCm 7.0.x or older: Pointer to FD
+  return hipMemImportFromShareableHandle(handle, (void*)&fd, handleType);
 #endif
 }

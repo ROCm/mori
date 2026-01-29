@@ -284,8 +284,9 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegion(void* 
                                                                           int accessFlag) {
   ibv_mr* mr = ibv_reg_mr(pd, ptr, size, accessFlag);
   if (!mr) {
-    MORI_APP_ERROR("RegisterRdmaMemoryRegion failed! addr:{}, size:{}, accessFlag:{}, errno:{} ({})",
-                   ptr, size, accessFlag, errno, strerror(errno));
+    MORI_APP_ERROR(
+        "RegisterRdmaMemoryRegion failed! addr:{}, size:{}, accessFlag:{}, errno:{} ({})", ptr,
+        size, accessFlag, errno, strerror(errno));
     std::abort();
   }
   MORI_APP_TRACE("RegisterRdmaMemoryRegion, addr:{}, size:{}, lkey:{}, rkey:{}\n", ptr, size,
@@ -299,17 +300,22 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegion(void* 
   return handle;
 }
 
-application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(void* ptr, size_t size,
-                                                                                 int dmabuf_fd,
-                                                                                 int accessFlag) {
-  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, 0, size, reinterpret_cast<uint64_t>(ptr), dmabuf_fd, accessFlag);
+application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(void* ptr,
+                                                                                size_t size,
+                                                                                int dmabuf_fd,
+                                                                                int accessFlag) {
+  ibv_mr* mr =
+      ibv_reg_dmabuf_mr(pd, 0, size, reinterpret_cast<uint64_t>(ptr), dmabuf_fd, accessFlag);
   if (!mr) {
-    MORI_APP_ERROR("RegisterRdmaMemoryRegionDmabuf failed! addr:{}, size:{}, dmabuf_fd:{}, accessFlag:{}, errno:{} ({})",
-                   ptr, size, dmabuf_fd, accessFlag, errno, strerror(errno));
+    MORI_APP_ERROR(
+        "RegisterRdmaMemoryRegionDmabuf failed! addr:{}, size:{}, dmabuf_fd:{}, accessFlag:{}, "
+        "errno:{} ({})",
+        ptr, size, dmabuf_fd, accessFlag, errno, strerror(errno));
     std::abort();
   }
-  MORI_APP_TRACE("RegisterRdmaMemoryRegionDmabuf, addr:{}, size:{}, dmabuf_fd:{}, lkey:{}, rkey:{}\n",
-                 ptr, size, dmabuf_fd, mr->lkey, mr->rkey);
+  MORI_APP_TRACE(
+      "RegisterRdmaMemoryRegionDmabuf, addr:{}, size:{}, dmabuf_fd:{}, lkey:{}, rkey:{}\n", ptr,
+      size, dmabuf_fd, mr->lkey, mr->rkey);
   mrPool.insert({ptr, mr});
   application::RdmaMemoryRegion handle;
   handle.addr = reinterpret_cast<uintptr_t>(ptr);

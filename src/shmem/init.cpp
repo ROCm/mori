@@ -144,7 +144,7 @@ void RdmaStatesInit() {
 static application::HeapType ConfigureHeapType() {
   const char* heapTypeEnv = std::getenv("MORI_SHMEM_HEAP_TYPE");
   application::HeapType heapType = application::HeapType::Uncached;  // Default to uncached
-  
+
   if (heapTypeEnv) {
     std::string heapTypeStr(heapTypeEnv);
     if (heapTypeStr == "normal" || heapTypeStr == "NORMAL") {
@@ -160,7 +160,7 @@ static application::HeapType ConfigureHeapType() {
   } else {
     MORI_SHMEM_INFO("MORI_SHMEM_HEAP_TYPE not set, defaulting to uncached");
   }
-  
+
   return heapType;
 }
 
@@ -184,7 +184,7 @@ static void InitializeStaticHeap(ShmemStates* states, application::HeapType heap
   } else {
     HIP_RUNTIME_CHECK(hipMalloc(&staticHeapPtr, heapSize));
   }
-  
+
   // Initialize memory
   HIP_RUNTIME_CHECK(hipMemset(staticHeapPtr, 0, heapSize));
 
@@ -201,7 +201,7 @@ static void InitializeStaticHeap(ShmemStates* states, application::HeapType heap
   states->memoryStates->staticHeapBasePtr = heapObj.cpu->localPtr;
   states->memoryStates->staticHeapSize = heapSize;
   states->memoryStates->staticHeapObj = heapObj;
-  
+
   // IMPORTANT: Start with a small offset to avoid collision between heap base address
   // and first ShmemMalloc allocation. Without this, when staticHeapUsed == 0,
   // the first ShmemMalloc would return staticHeapBasePtr, which is the same address
@@ -225,7 +225,8 @@ static bool TryInitializeVMMHeap(ShmemStates* states, application::HeapType heap
   // Check ROCm and hardware VMM support
   bool rocmSupportsVMM = IsROCmVersionGreaterThan7();
   bool hardwareSupportsVMM = states->memoryStates->symmMemMgr->IsVMMSupported();
-  MORI_SHMEM_INFO("VMM support: ROCm >= 7.0: {}, Hardware: {}", rocmSupportsVMM, hardwareSupportsVMM);
+  MORI_SHMEM_INFO("VMM support: ROCm >= 7.0: {}, Hardware: {}", rocmSupportsVMM,
+                  hardwareSupportsVMM);
 
   if (!rocmSupportsVMM || !hardwareSupportsVMM) {
     MORI_SHMEM_INFO("VMM not supported, will fallback to static heap");
@@ -235,7 +236,7 @@ static bool TryInitializeVMMHeap(ShmemStates* states, application::HeapType heap
   // Parse VMM configuration from environment variables
   const char* chunkSizeEnv = std::getenv("MORI_SHMEM_VMM_CHUNK_SIZE");
   const char* vmmHeapSizeEnv = std::getenv("MORI_SHMEM_HEAP_SIZE");
-  
+
   size_t chunkSize = 0;  // 0 means auto-detect
   size_t vmmHeapSize = DEFAULT_VMM_SYMMETRIC_HEAP_SIZE;
 
@@ -250,8 +251,9 @@ static bool TryInitializeVMMHeap(ShmemStates* states, application::HeapType heap
                    vmmHeapSize, vmmHeapSize / (1024 * 1024), chunkSize, chunkSize / 1024);
 
   // Try to initialize VMM heap
-  bool success = states->memoryStates->symmMemMgr->InitializeVMMHeap(vmmHeapSize, chunkSize, heapType);
-  
+  bool success =
+      states->memoryStates->symmMemMgr->InitializeVMMHeap(vmmHeapSize, chunkSize, heapType);
+
   if (success) {
     // Store VMM heap metadata
     states->memoryStates->useVMMHeap = true;
@@ -264,13 +266,12 @@ static bool TryInitializeVMMHeap(ShmemStates* states, application::HeapType heap
     // Initialize VA Manager for VMM heap to enable memory reuse
     // Pass granularity (chunkSize) to ensure VA blocks don't cross physical memory boundaries
     states->memoryStates->symmMemMgr->InitHeapVAManager(
-        reinterpret_cast<uintptr_t>(states->memoryStates->vmmHeapBaseAddr),
-        vmmHeapSize,
+        reinterpret_cast<uintptr_t>(states->memoryStates->vmmHeapBaseAddr), vmmHeapSize,
         states->memoryStates->vmmHeapChunkSize);
 
-    MORI_SHMEM_TRACE("VMM heap VA Manager initialized: base={}, size={} bytes, granularity={} bytes",
-                     states->memoryStates->vmmHeapBaseAddr, vmmHeapSize,
-                     states->memoryStates->vmmHeapChunkSize);
+    MORI_SHMEM_TRACE(
+        "VMM heap VA Manager initialized: base={}, size={} bytes, granularity={} bytes",
+        states->memoryStates->vmmHeapBaseAddr, vmmHeapSize, states->memoryStates->vmmHeapChunkSize);
     MORI_SHMEM_INFO("VMM heap initialized successfully");
     return true;
   } else {
@@ -318,12 +319,12 @@ void MemoryStatesInit() {
       // Fall through to StaticHeap case
       [[fallthrough]];
     }
-    
+
     case ShmemMode::StaticHeap: {
       InitializeStaticHeap(states, heapType);
       break;
     }
-    
+
     default: {
       MORI_SHMEM_ERROR("Unknown heap mode: {}", static_cast<int>(states->mode));
       throw std::runtime_error("Unknown heap mode");
@@ -338,14 +339,12 @@ void MemoryStatesInit() {
 // Copy transport types to GPU device memory
 static void CopyTransportTypesToGpu(GpuStates* gpuStates, const ShmemStates* states) {
   int worldSize = states->bootStates->worldSize;
-  
+
   HIP_RUNTIME_CHECK(
       hipMalloc(&gpuStates->transportTypes, sizeof(application::TransportType) * worldSize));
-  HIP_RUNTIME_CHECK(
-      hipMemcpy(gpuStates->transportTypes, 
-                states->rdmaStates->commContext->GetTransportTypes().data(),
-                sizeof(application::TransportType) * worldSize, 
-                hipMemcpyHostToDevice));
+  HIP_RUNTIME_CHECK(hipMemcpy(
+      gpuStates->transportTypes, states->rdmaStates->commContext->GetTransportTypes().data(),
+      sizeof(application::TransportType) * worldSize, hipMemcpyHostToDevice));
 }
 
 // Copy RDMA endpoints to GPU device memory
@@ -355,15 +354,13 @@ static void CopyRdmaEndpointsToGpu(GpuStates* gpuStates, const ShmemStates* stat
   }
 
   size_t numEndpoints = gpuStates->worldSize * gpuStates->numQpPerPe;
-  
+
   // Allocate and copy endpoints
   HIP_RUNTIME_CHECK(
       hipMalloc(&gpuStates->rdmaEndpoints, sizeof(application::RdmaEndpoint) * numEndpoints));
-  HIP_RUNTIME_CHECK(
-      hipMemcpy(gpuStates->rdmaEndpoints, 
-                states->rdmaStates->commContext->GetRdmaEndpoints().data(),
-                sizeof(application::RdmaEndpoint) * numEndpoints, 
-                hipMemcpyHostToDevice));
+  HIP_RUNTIME_CHECK(hipMemcpy(
+      gpuStates->rdmaEndpoints, states->rdmaStates->commContext->GetRdmaEndpoints().data(),
+      sizeof(application::RdmaEndpoint) * numEndpoints, hipMemcpyHostToDevice));
 
   // Allocate and initialize endpoint locks
   size_t lockSize = numEndpoints * sizeof(uint32_t);
@@ -393,9 +390,9 @@ static void ConfigureHeapInfoForGpu(GpuStates* gpuStates, const ShmemStates* sta
         gpuStates->heapBaseAddr = heapBase;
         gpuStates->heapEndAddr = heapBase + states->memoryStates->vmmHeapVirtualSize;
         gpuStates->heapObj = states->memoryStates->vmmHeapObj.gpu;
-        gpuStates->vmmChunkSizeShift = 
+        gpuStates->vmmChunkSizeShift =
             static_cast<uint8_t>(__builtin_ctzll(states->memoryStates->vmmHeapChunkSize));
-        
+
         MORI_SHMEM_TRACE(
             "VMM heap configured for GPU: base=0x{:x}, end=0x{:x}, size={} bytes, "
             "chunkSize={} (shift={}), heapObj=0x{:x}",
@@ -417,9 +414,10 @@ static void ConfigureHeapInfoForGpu(GpuStates* gpuStates, const ShmemStates* sta
         gpuStates->heapEndAddr = heapBase + states->memoryStates->staticHeapSize;
         gpuStates->heapObj = states->memoryStates->staticHeapObj.gpu;
         gpuStates->vmmChunkSizeShift = 0;  // No chunking
-        
+
         MORI_SHMEM_TRACE(
-            "Static heap configured for GPU: base=0x{:x}, end=0x{:x}, size={} bytes, heapObj=0x{:x}",
+            "Static heap configured for GPU: base=0x{:x}, end=0x{:x}, size={} bytes, "
+            "heapObj=0x{:x}",
             gpuStates->heapBaseAddr, gpuStates->heapEndAddr,
             gpuStates->heapEndAddr - gpuStates->heapBaseAddr,
             reinterpret_cast<uintptr_t>(gpuStates->heapObj));
@@ -445,10 +443,9 @@ static void CopyGpuStatesToDevice(const GpuStates* gpuStates) {
   MORI_SHMEM_TRACE("globalGpuStates device address: 0x{:x}",
                    reinterpret_cast<uintptr_t>(globalGpuStatesAddr));
 
-  HIP_RUNTIME_CHECK(
-      hipMemcpy(globalGpuStatesAddr, gpuStates, sizeof(GpuStates), hipMemcpyDefault));
+  HIP_RUNTIME_CHECK(hipMemcpy(globalGpuStatesAddr, gpuStates, sizeof(GpuStates), hipMemcpyDefault));
 
-  MORI_SHMEM_TRACE("Successfully copied GpuStates to device (rank={}, worldSize={})", 
+  MORI_SHMEM_TRACE("Successfully copied GpuStates to device (rank={}, worldSize={})",
                    gpuStates->rank, gpuStates->worldSize);
 }
 
@@ -479,14 +476,14 @@ void GpuStateInit() {
 // Determine and configure shmem mode from environment variable
 static ShmemMode ConfigureShmemMode() {
   const char* modeEnv = std::getenv("MORI_SHMEM_MODE");
-  
+
   if (!modeEnv) {
     MORI_SHMEM_INFO("MORI_SHMEM_MODE not set, defaulting to static heap mode");
     return ShmemMode::StaticHeap;
   }
 
   std::string modeStr(modeEnv);
-  
+
   if (modeStr == "isolation" || modeStr == "ISOLATION") {
     MORI_SHMEM_INFO("Shmem mode: Isolation");
     return ShmemMode::Isolation;
@@ -509,9 +506,9 @@ static void InitializeBootStates(ShmemStates* states, application::BootstrapNetw
   states->bootStates->bootNet->Initialize();
   states->bootStates->rank = states->bootStates->bootNet->GetLocalRank();
   states->bootStates->worldSize = states->bootStates->bootNet->GetWorldSize();
-  
-  MORI_SHMEM_TRACE("Bootstrap initialized: rank={}, worldSize={}", 
-                   states->bootStates->rank, states->bootStates->worldSize);
+
+  MORI_SHMEM_TRACE("Bootstrap initialized: rank={}, worldSize={}", states->bootStates->rank,
+                   states->bootStates->worldSize);
 }
 
 /* ---------------------------------------------------------------------------------------------- */

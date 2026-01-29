@@ -77,10 +77,10 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SD
     const void* dest, const void* source, size_t bytes, int pe, int qpId) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::SymmMemObj* heapObj = globalGpuStates->heapObj;
-  
+
   uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
   size_t offset = destAddr - globalGpuStates->heapBaseAddr;
-  
+
   uint8_t* srcPtr = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(source));
   uint8_t* dstPtr = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[pe] + offset);
 
@@ -98,10 +98,10 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::SDMA
     const void* dest, const void* source, size_t bytes, int pe, int qpId) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::SymmMemObj* heapObj = globalGpuStates->heapObj;
-  
+
   uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
   size_t offset = destAddr - globalGpuStates->heapBaseAddr;
-  
+
   uint8_t* srcPtr = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(source));
   uint8_t* dstPtr = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[pe] + offset);
 

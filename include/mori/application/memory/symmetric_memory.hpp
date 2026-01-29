@@ -31,23 +31,23 @@
 
 #include "mori/application/bootstrap/bootstrap.hpp"
 #include "mori/application/context/context.hpp"
-#include "mori/application/transport/transport.hpp"
-#include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/memory/va_manager.hpp"
+#include "mori/application/transport/sdma/anvil.hpp"
+#include "mori/application/transport/transport.hpp"
 
 namespace mori {
 namespace application {
 
 // Heap type for memory allocation
 enum class HeapType {
-  Normal,    // Normal cached memory
-  Uncached   // Uncached memory
+  Normal,   // Normal cached memory
+  Uncached  // Uncached memory
 };
 
 struct VMMChunkKey {
-  uint32_t key;           // RDMA lkey or rkey
-  uintptr_t next_addr;    // Address of next chunk boundary (for calculating chunk_size)
-  
+  uint32_t key;         // RDMA lkey or rkey
+  uintptr_t next_addr;  // Address of next chunk boundary (for calculating chunk_size)
+
   VMMChunkKey() : key(0), next_addr(0) {}
   VMMChunkKey(uint32_t k, uintptr_t addr) : key(k), next_addr(addr) {}
 };
@@ -59,22 +59,22 @@ struct SymmMemObj {
   // For Rdma
   uint32_t lkey{0};
   uint32_t* peerRkeys{nullptr};
-  
+
   // For VMM allocations: chunk key information (nvshmem-style)
   // vmmLkeyInfo[i] contains lkey and next_addr for chunk i
   // vmmRkeyInfo[i * worldSize + pe] contains rkey and next_addr for chunk i, PE pe
   VMMChunkKey* vmmLkeyInfo{nullptr};
   VMMChunkKey* vmmRkeyInfo{nullptr};
-  size_t vmmNumChunks{0};       // Total number of chunks in VMM heap
+  size_t vmmNumChunks{0};  // Total number of chunks in VMM heap
   int worldSize{0};
   // For IPC
   hipIpcMemHandle_t* ipcMemHandles{nullptr};  // should only placed on cpu
 
-  //For Sdma
+  // For Sdma
   anvil::SdmaQueueDeviceHandle** deviceHandles_d = nullptr;  // should only placed on GPU
-  HSAuint64* signalPtrs = nullptr; // should only placed on GPU
-  uint32_t sdmaNumQueue = 8; // number of sdma queue
-  HSAuint64* expectSignalsPtr = nullptr; // should only placed on GPU
+  HSAuint64* signalPtrs = nullptr;                           // should only placed on GPU
+  uint32_t sdmaNumQueue = 8;                                 // number of sdma queue
+  HSAuint64* expectSignalsPtr = nullptr;                     // should only placed on GPU
 
   __device__ __host__ RdmaMemoryRegion GetRdmaMemoryRegion(int pe) const {
     RdmaMemoryRegion mr;
@@ -84,7 +84,6 @@ struct SymmMemObj {
     mr.length = size;
     return mr;
   }
-
 
   // Get pointers
   inline __device__ __host__ void* Get() const { return localPtr; }
@@ -134,12 +133,14 @@ class SymmMemManager {
   void DeregisterStaticHeapSubRegion(void* localPtr);
 
   // VMM Heap Operations
-  bool InitializeVMMHeap(size_t virtualSize, size_t chunkSize = 0, HeapType heapType = HeapType::Uncached);
+  bool InitializeVMMHeap(size_t virtualSize, size_t chunkSize = 0,
+                         HeapType heapType = HeapType::Uncached);
   void FinalizeVMMHeap();
   bool IsVMMSupported() const;
   SymmMemObjPtr VMMAllocChunk(size_t size, HeapType heapType = HeapType::Uncached);
   void VMMFreeChunk(void* localPtr);
-  SymmMemObjPtr VMMRegisterSymmMemObj(void* localPtr, size_t size, size_t startChunk, size_t numChunks);
+  SymmMemObjPtr VMMRegisterSymmMemObj(void* localPtr, size_t size, size_t startChunk,
+                                      size_t numChunks);
   void VMMDeregisterSymmMemObj(void* localPtr);
   SymmMemObjPtr GetVMMHeapObj() const { return vmmHeapObj; }
   size_t GetVMMChunkSize() const { return vmmChunkSize; }
@@ -163,26 +164,31 @@ class SymmMemManager {
     int shareableHandle;  // File descriptor for POSIX systems (shared by P2P and RDMA/dmabuf)
     size_t size;          // Chunk size (always equals granularity/vmmChunkSize)
     bool isAllocated;
-    int refCount;         // Reference count: how many allocations are using this chunk
+    int refCount;  // Reference count: how many allocations are using this chunk
 
     // RDMA registration info (per-chunk, for RDMA transport)
-    uint32_t lkey;                        // Local key for RDMA access
-    std::vector<uint32_t> peerRkeys;      // Remote keys from all PEs
-    bool rdmaRegistered;                  // Whether this chunk is RDMA registered
+    uint32_t lkey;                    // Local key for RDMA access
+    std::vector<uint32_t> peerRkeys;  // Remote keys from all PEs
+    bool rdmaRegistered;              // Whether this chunk is RDMA registered
 
     // P2P mapping tracking: which peers have already mapped this chunk
-    std::set<int> mappedPeers;            // Set of peer ranks that have imported and mapped this chunk
-    
+    std::set<int> mappedPeers;  // Set of peer ranks that have imported and mapped this chunk
+
     // P2P imported handles tracking: handles imported from other PEs need to be released
     std::map<int, hipMemGenericAllocationHandle_t> importedHandles;  // pe -> imported handle
 
     VMMChunkInfo()
-        : handle(0), shareableHandle(-1), size(0),
-          isAllocated(false), refCount(0), lkey(0), rdmaRegistered(false) {}
+        : handle(0),
+          shareableHandle(-1),
+          size(0),
+          isAllocated(false),
+          refCount(0),
+          lkey(0),
+          rdmaRegistered(false) {}
   };
-  
+
   bool vmmInitialized{false};
-  void* vmmVirtualBasePtr{nullptr}; 
+  void* vmmVirtualBasePtr{nullptr};
   size_t vmmVirtualSize{0};
   size_t vmmChunkSize{0};
   size_t vmmMinChunkSize{0};
@@ -193,7 +199,7 @@ class SymmMemManager {
   SymmMemObjPtr vmmHeapObj{nullptr, nullptr};
   std::vector<void*> vmmPeerBasePtrs;
   size_t vmmPerPeerSize{0};
-  
+
   // VA Manager (used by both VMM and Static heap)
   std::unique_ptr<HeapVAManager> heapVAManager;
 
@@ -207,13 +213,14 @@ class SymmMemManager {
 
   // Helper Functions - VMMAllocChunk
   uintptr_t AllocateVirtualAddress(size_t size);
-  bool VerifyVAConsistency(uintptr_t allocAddr, size_t size, size_t offset, int rank, int worldSize);
+  bool VerifyVAConsistency(uintptr_t allocAddr, size_t size, size_t offset, int rank,
+                           int worldSize);
   void CleanupAllocatedChunks(size_t startChunk, size_t numToClean);
   hipMemAllocationProp ConfigureAllocationProp(HeapType heapType, int deviceId);
-  bool AllocateSingleChunk(VMMChunkInfo& chunk, size_t chunkIdx, void* chunkPtr,
-                           size_t chunkSize, const hipMemAllocationProp& allocProp, int rank, int currentDev);
-  void ImportPeerChunk(VMMChunkInfo& chunk, size_t chunkIdx, void* peerChunkPtr,
-                      size_t chunkSize, int handleValue, int pe, int rank, int currentDev);
+  bool AllocateSingleChunk(VMMChunkInfo& chunk, size_t chunkIdx, void* chunkPtr, size_t chunkSize,
+                           const hipMemAllocationProp& allocProp, int rank, int currentDev);
+  void ImportPeerChunk(VMMChunkInfo& chunk, size_t chunkIdx, void* peerChunkPtr, size_t chunkSize,
+                       int handleValue, int pe, int rank, int currentDev);
   bool RegisterP2PPeerMemory(const std::vector<int>& localShareableHandles, size_t startChunk,
                              size_t chunksNeeded, int rank, int worldSize, int currentDev);
   void RegisterRdmaChunks(size_t startChunk, size_t chunksNeeded, int rank, int worldSize);

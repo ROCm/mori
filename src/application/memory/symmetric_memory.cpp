@@ -21,18 +21,19 @@
 // SOFTWARE.
 #include "mori/application/memory/symmetric_memory.hpp"
 
+#include <fcntl.h>
+
+#include <cerrno>
 #include <map>
 #include <vector>
-#include <fcntl.h>
-#include <cerrno>
 
 #include "hip/hip_runtime.h"
 #include "mori/application/bootstrap/local_bootstrap.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
-#include "mori/shmem/internal.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/core/core.hpp"
+#include "mori/shmem/internal.hpp"
 #include "mori/utils/hip_compat.hpp"
 #include "mori/utils/mori_log.hpp"
 
@@ -295,7 +296,8 @@ void SymmMemManager::VMMDeregisterSymmMemObj(void* localPtr) {
   // Note: vmmLkeyInfo and vmmRkeyInfo are NOT freed here - they point to shared vmmHeapObj arrays
   free(memObjPtr.cpu);
   HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerPtrs));
-  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerRkeys));  // nullptr for VMM allocations (safe to free)
+  HIP_RUNTIME_CHECK(
+      hipFree(memObjPtr.gpu->peerRkeys));  // nullptr for VMM allocations (safe to free)
   HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu));
 
   memObjPool.erase(localPtr);
@@ -341,13 +343,14 @@ size_t SymmMemManager::DetermineVMMChunkSize(size_t userChunkSize, HeapType heap
 
   hipMemAllocationProp allocProp = {};
 #if HIP_VERSION >= 70000000  // ROCm 7.0+
-  allocProp.type = (heapType == HeapType::Normal) ? hipMemAllocationTypePinned 
-                                                   : hipMemAllocationTypeUncached;
+  allocProp.type =
+      (heapType == HeapType::Normal) ? hipMemAllocationTypePinned : hipMemAllocationTypeUncached;
 #else
   allocProp.type = hipMemAllocationTypePinned;
   if (heapType == HeapType::Uncached) {
-    MORI_APP_WARN("Uncached heap type requested but ROCm version < 7.0 does not support "
-                  "hipMemAllocationTypeUncached, falling back to Pinned memory");
+    MORI_APP_WARN(
+        "Uncached heap type requested but ROCm version < 7.0 does not support "
+        "hipMemAllocationTypeUncached, falling back to Pinned memory");
   }
 #endif
   allocProp.location.type = hipMemLocationTypeDevice;
@@ -359,7 +362,7 @@ size_t SymmMemManager::DetermineVMMChunkSize(size_t userChunkSize, HeapType heap
                                                      hipMemAllocationGranularityRecommended);
   if (result == hipSuccess && granularity > 0) {
     size_t chunkSize = std::max(granularity, shmem::DEFAULT_VMM_MIN_CHUNK_SIZE);
-    
+
     // Get minimum granularity for vmmMinChunkSize
     size_t minGranularity = 0;
     if (hipMemGetAllocationGranularity(&minGranularity, &allocProp,
@@ -389,10 +392,10 @@ size_t SymmMemManager::DetermineVMMChunkSize(size_t userChunkSize, HeapType heap
 size_t SymmMemManager::CalculateTotalVirtualSize(size_t perPeerSize, int worldSize) {
   int myPe = bootNet.GetLocalRank();
   std::vector<TransportType> transportTypes = context.GetTransportTypes();
-  
+
   vmmPerPeerSize = perPeerSize;
   size_t p2pPeCount = 0;
-  
+
   for (int pe = 0; pe < worldSize; ++pe) {
     if (transportTypes[pe] == TransportType::P2P && myPe != pe) {
       p2pPeCount++;
@@ -401,7 +404,7 @@ size_t SymmMemManager::CalculateTotalVirtualSize(size_t perPeerSize, int worldSi
 
   // Only allocate virtual space for P2P accessible PEs
   size_t totalSize = vmmPerPeerSize * (p2pPeCount + 1);
-  
+
   MORI_APP_TRACE("VMM Heap: world={} p2pPeers={} totalVA={}", worldSize, p2pPeCount, totalSize);
   return totalSize;
 }
@@ -410,20 +413,20 @@ size_t SymmMemManager::CalculateTotalVirtualSize(size_t perPeerSize, int worldSi
 bool SymmMemManager::ReserveVirtualAddressSpace(size_t totalSize, size_t chunkSize) {
   hipError_t result = hipMemAddressReserve(&vmmVirtualBasePtr, totalSize, chunkSize, nullptr, 0);
   if (result != hipSuccess) {
-    MORI_APP_ERROR("VMM Init failed: hipMemAddressReserve size={} align={} err={}",
-                   totalSize, chunkSize, result);
+    MORI_APP_ERROR("VMM Init failed: hipMemAddressReserve size={} align={} err={}", totalSize,
+                   chunkSize, result);
     return false;
   }
 
   // Verify alignment
   if (reinterpret_cast<uintptr_t>(vmmVirtualBasePtr) % chunkSize != 0) {
-    MORI_APP_WARN("VMM Init: vmmVirtualBasePtr {:p} is NOT aligned to chunkSize={}", 
+    MORI_APP_WARN("VMM Init: vmmVirtualBasePtr {:p} is NOT aligned to chunkSize={}",
                   vmmVirtualBasePtr, chunkSize);
   }
 
   int myPe = bootNet.GetLocalRank();
-  MORI_APP_TRACE("VMM Init: rank={} vmmVirtualBasePtr={:p} (aligned to {} bytes)", 
-                 myPe, vmmVirtualBasePtr, chunkSize);
+  MORI_APP_TRACE("VMM Init: rank={} vmmVirtualBasePtr={:p} (aligned to {} bytes)", myPe,
+                 vmmVirtualBasePtr, chunkSize);
   return true;
 }
 
@@ -431,7 +434,7 @@ bool SymmMemManager::ReserveVirtualAddressSpace(size_t totalSize, size_t chunkSi
 void SymmMemManager::SetupPeerBasePointers(int worldSize, int myPe) {
   std::vector<TransportType> transportTypes = context.GetTransportTypes();
   vmmPeerBasePtrs.resize(worldSize);
-  
+
   size_t virtualOffset = 0;
   for (int i = 0; i < worldSize; ++i) {
     int pe = (myPe + i) % worldSize;
@@ -449,7 +452,7 @@ void SymmMemManager::SetupPeerBasePointers(int worldSize, int myPe) {
 // Step 5: Initialize chunk tracking structures
 void SymmMemManager::InitializeChunkTracking() {
   vmmChunks.resize(vmmMaxChunks);
-  
+
   int worldSize = bootNet.GetWorldSize();
   for (size_t i = 0; i < vmmMaxChunks; ++i) {
     vmmChunks[i].peerRkeys.resize(worldSize, 0);
@@ -477,27 +480,28 @@ SymmMemObjPtr SymmMemManager::CreateVMMHeapObject(size_t virtualSize, int worldS
 
   // Initialize VMMChunkKey arrays (nvshmem-style: key + next_addr per chunk)
   uintptr_t heapBase = reinterpret_cast<uintptr_t>(vmmVirtualBasePtr);
-  
+
   cpuHeapObj->vmmLkeyInfo = static_cast<VMMChunkKey*>(calloc(vmmMaxChunks, sizeof(VMMChunkKey)));
-  cpuHeapObj->vmmRkeyInfo = static_cast<VMMChunkKey*>(calloc(worldSize * vmmMaxChunks, sizeof(VMMChunkKey)));
-  
+  cpuHeapObj->vmmRkeyInfo =
+      static_cast<VMMChunkKey*>(calloc(worldSize * vmmMaxChunks, sizeof(VMMChunkKey)));
+
   // Initialize VMMChunkKey arrays with next_addr values
   for (size_t i = 0; i < vmmMaxChunks; ++i) {
     uintptr_t chunkEnd = heapBase + (i + 1) * vmmChunkSize;
     uintptr_t heapEnd = heapBase + virtualSize;
     cpuHeapObj->vmmLkeyInfo[i].next_addr = (chunkEnd < heapEnd) ? chunkEnd : heapEnd;
     cpuHeapObj->vmmLkeyInfo[i].key = 0;  // Will be set when chunk is allocated
-    
+
     // Initialize rkey info for all PEs
     for (int pe = 0; pe < worldSize; ++pe) {
       cpuHeapObj->vmmRkeyInfo[i * worldSize + pe].next_addr = cpuHeapObj->vmmLkeyInfo[i].next_addr;
       cpuHeapObj->vmmRkeyInfo[i * worldSize + pe].key = 0;  // Will be set when chunk is allocated
     }
   }
-  
+
   cpuHeapObj->vmmNumChunks = vmmMaxChunks;
   cpuHeapObj->worldSize = worldSize;
-  
+
   // Keep lkey and peerRkeys as nullptr for VMM heap to distinguish from static heap
   cpuHeapObj->lkey = 0;
   cpuHeapObj->peerRkeys = nullptr;
@@ -515,14 +519,16 @@ SymmMemObjPtr SymmMemManager::CreateVMMHeapObject(size_t virtualSize, int worldS
   HIP_RUNTIME_CHECK(hipMalloc(&gpuHeapObj->vmmLkeyInfo, sizeof(VMMChunkKey) * vmmMaxChunks));
   HIP_RUNTIME_CHECK(hipMemcpy(gpuHeapObj->vmmLkeyInfo, cpuHeapObj->vmmLkeyInfo,
                               sizeof(VMMChunkKey) * vmmMaxChunks, hipMemcpyHostToDevice));
-  
-  HIP_RUNTIME_CHECK(hipMalloc(&gpuHeapObj->vmmRkeyInfo, sizeof(VMMChunkKey) * worldSize * vmmMaxChunks));
+
+  HIP_RUNTIME_CHECK(
+      hipMalloc(&gpuHeapObj->vmmRkeyInfo, sizeof(VMMChunkKey) * worldSize * vmmMaxChunks));
   HIP_RUNTIME_CHECK(hipMemcpy(gpuHeapObj->vmmRkeyInfo, cpuHeapObj->vmmRkeyInfo,
-                              sizeof(VMMChunkKey) * worldSize * vmmMaxChunks, hipMemcpyHostToDevice));
-  
+                              sizeof(VMMChunkKey) * worldSize * vmmMaxChunks,
+                              hipMemcpyHostToDevice));
+
   gpuHeapObj->vmmNumChunks = vmmMaxChunks;
   gpuHeapObj->worldSize = worldSize;
-  
+
   // Set lkey and peerRkeys to 0/nullptr for VMM heap
   gpuHeapObj->lkey = 0;
   gpuHeapObj->peerRkeys = nullptr;
@@ -550,8 +556,8 @@ bool SymmMemManager::InitializeVMMHeap(size_t virtualSize, size_t chunkSize, Hea
   vmmVirtualSize = virtualSize;
   vmmMaxChunks = virtualSize / chunkSize;
 
-  MORI_APP_TRACE("VMM Heap Init: vSize={} chunkSize={} maxChunks={} world={}",
-                 vmmVirtualSize, vmmChunkSize, vmmMaxChunks, worldSize);
+  MORI_APP_TRACE("VMM Heap Init: vSize={} chunkSize={} maxChunks={} world={}", vmmVirtualSize,
+                 vmmChunkSize, vmmMaxChunks, worldSize);
 
   // Step 2: Calculate total virtual address space size
   size_t totalVirtualSize = CalculateTotalVirtualSize(virtualSize, worldSize);
@@ -604,21 +610,21 @@ void SymmMemManager::FinalizeVMMHeap() {
   int worldSize = bootNet.GetWorldSize();
   for (int pe = 0; pe < worldSize; ++pe) {
     if (pe == rank) continue;  // Skip self
-    
+
     // Only process P2P accessible PEs
     if (context.GetTransportType(pe) == TransportType::P2P && vmmPeerBasePtrs[pe] != nullptr) {
       for (size_t i = 0; i < vmmMaxChunks; ++i) {
         if (vmmChunks[i].mappedPeers.count(pe) > 0) {
           void* peerChunkPtr =
               static_cast<void*>(static_cast<char*>(vmmPeerBasePtrs[pe]) + i * vmmChunkSize);
-          
+
           hipError_t result = hipMemUnmap(peerChunkPtr, vmmChunkSize);
           if (result != hipSuccess) {
-            MORI_APP_WARN("FinalizeVMMHeap: Failed to unmap peer chunk {} from PE {}, err={}",
-                          i, pe, result);
+            MORI_APP_WARN("FinalizeVMMHeap: Failed to unmap peer chunk {} from PE {}, err={}", i,
+                          pe, result);
           } else {
-            MORI_APP_TRACE("FinalizeVMMHeap: Unmapped chunk {} from PE {} at {:p}",
-                           i, pe, peerChunkPtr);
+            MORI_APP_TRACE("FinalizeVMMHeap: Unmapped chunk {} from PE {} at {:p}", i, pe,
+                           peerChunkPtr);
           }
         }
       }
@@ -630,15 +636,15 @@ void SymmMemManager::FinalizeVMMHeap() {
     if (vmmChunks[i].isAllocated) {
       void* chunkPtr =
           static_cast<void*>(static_cast<char*>(vmmPeerBasePtrs[rank]) + i * vmmChunkSize);
-      
+
       // Close shareable file descriptor to prevent FD leak (shared by P2P and RDMA)
       if (vmmChunks[i].shareableHandle != -1) {
         close(vmmChunks[i].shareableHandle);
-        MORI_APP_TRACE("FinalizeVMMHeap: Closed FD {} for chunk {} (P2P & RDMA)", 
+        MORI_APP_TRACE("FinalizeVMMHeap: Closed FD {} for chunk {} (P2P & RDMA)",
                        vmmChunks[i].shareableHandle, i);
         vmmChunks[i].shareableHandle = -1;
       }
-      
+
       // Release all imported handles from P2P peers
       for (auto& pair : vmmChunks[i].importedHandles) {
         HIP_RUNTIME_CHECK(hipMemRelease(pair.second));
@@ -646,7 +652,7 @@ void SymmMemManager::FinalizeVMMHeap() {
                        pair.first, i);
       }
       vmmChunks[i].importedHandles.clear();
-      
+
       // All chunks use granularity size (vmmChunkSize)
       HIP_RUNTIME_CHECK(hipMemUnmap(chunkPtr, vmmChunkSize));
       HIP_RUNTIME_CHECK(hipMemRelease(vmmChunks[i].handle));
@@ -680,7 +686,7 @@ void SymmMemManager::FinalizeVMMHeap() {
       free(vmmHeapObj.cpu);
       vmmHeapObj.cpu = nullptr;
     }
-    
+
     // Free GPU-side memory with synchronization
     if (vmmHeapObj.gpu) {
       hipError_t err;
@@ -698,7 +704,7 @@ void SymmMemManager::FinalizeVMMHeap() {
       }
       vmmHeapObj.gpu = nullptr;
     }
-    
+
     vmmHeapObj = SymmMemObjPtr{nullptr, nullptr};
   }
 
@@ -723,10 +729,10 @@ void SymmMemManager::FinalizeVMMHeap() {
 // Step 1: Allocate virtual address from VA manager
 uintptr_t SymmMemManager::AllocateVirtualAddress(size_t size) {
   uintptr_t allocAddr = heapVAManager->Allocate(size, 256);
-  
+
   if (allocAddr == 0) {
     MORI_APP_ERROR("VA allocation failed for size {} bytes", size);
-    
+
     // Log VA manager stats for debugging
     size_t totalBlocks, freeBlocks, allocatedBlocks, totalFreeSpace, largestFreeBlock;
     heapVAManager->GetStats(totalBlocks, freeBlocks, allocatedBlocks, totalFreeSpace,
@@ -734,22 +740,22 @@ uintptr_t SymmMemManager::AllocateVirtualAddress(size_t size) {
     MORI_APP_ERROR("VA stats: total={} free={} alloc={} freeSpace={} largest={}", totalBlocks,
                    freeBlocks, allocatedBlocks, totalFreeSpace, largestFreeBlock);
   }
-  
+
   return allocAddr;
 }
 
 // Step 2: Verify VA allocation consistency across all PEs
-bool SymmMemManager::VerifyVAConsistency(uintptr_t allocAddr, size_t size, 
-                                         size_t offset, int rank, int worldSize) {
+bool SymmMemManager::VerifyVAConsistency(uintptr_t allocAddr, size_t size, size_t offset, int rank,
+                                         int worldSize) {
   struct VAInfo {
     size_t offset;
     size_t size;
   };
   VAInfo myVAInfo = {offset, size};
   std::vector<VAInfo> allVAInfo(worldSize);
-  
+
   bootNet.Allgather(&myVAInfo, allVAInfo.data(), sizeof(VAInfo));
-  
+
   bool vaConsistent = true;
   for (int pe = 0; pe < worldSize; ++pe) {
     if (allVAInfo[pe].offset != offset || allVAInfo[pe].size != size) {
@@ -760,15 +766,15 @@ bool SymmMemManager::VerifyVAConsistency(uintptr_t allocAddr, size_t size,
       vaConsistent = false;
     }
   }
-  
+
   if (!vaConsistent) {
     MORI_APP_ERROR("VMMAlloc: rank={} aborting due to inconsistent offset/size", rank);
     heapVAManager->Free(allocAddr);
     return false;
   }
-  
-  MORI_APP_TRACE("VMMAlloc: rank={} verified all {} PEs have matching offset=0x{:x} size={}", 
-                 rank, worldSize, offset, size);
+
+  MORI_APP_TRACE("VMMAlloc: rank={} verified all {} PEs have matching offset=0x{:x} size={}", rank,
+                 worldSize, offset, size);
   return true;
 }
 
@@ -795,14 +801,15 @@ void SymmMemManager::CleanupAllocatedChunks(size_t startChunk, size_t numToClean
 hipMemAllocationProp SymmMemManager::ConfigureAllocationProp(HeapType heapType, int deviceId) {
   hipMemAllocationProp allocProp = {};
 #if HIP_VERSION >= 70000000  // ROCm 7.0+
-  allocProp.type = (heapType == HeapType::Normal) ? hipMemAllocationTypePinned 
-                                                   : hipMemAllocationTypeUncached;
+  allocProp.type =
+      (heapType == HeapType::Normal) ? hipMemAllocationTypePinned : hipMemAllocationTypeUncached;
 #else
   // ROCm < 7.0: hipMemAllocationTypeUncached not supported, fallback to Pinned
   allocProp.type = hipMemAllocationTypePinned;
   if (heapType == HeapType::Uncached) {
-    MORI_APP_WARN("Uncached heap type requested but ROCm version < 7.0 does not support "
-                  "hipMemAllocationTypeUncached, falling back to Pinned memory");
+    MORI_APP_WARN(
+        "Uncached heap type requested but ROCm version < 7.0 does not support "
+        "hipMemAllocationTypeUncached, falling back to Pinned memory");
   }
 #endif
   allocProp.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
@@ -816,20 +823,20 @@ bool SymmMemManager::AllocateSingleChunk(VMMChunkInfo& chunk, size_t chunkIdx, v
                                          size_t chunkSize, const hipMemAllocationProp& allocProp,
                                          int rank, int currentDev) {
   hipError_t result;
-  
+
   // Create physical memory handle
   result = hipMemCreate(&chunk.handle, chunkSize, &allocProp, 0);
   if (result != hipSuccess) {
-    MORI_APP_WARN("VMMAlloc failed: hipMemCreate chunk={} size={} dev={} err={}",
-                  chunkIdx, chunkSize, currentDev, result);
+    MORI_APP_WARN("VMMAlloc failed: hipMemCreate chunk={} size={} dev={} err={}", chunkIdx,
+                  chunkSize, currentDev, result);
     return false;
   }
 
   // Map physical memory to local virtual address
   result = hipMemMap(chunkPtr, chunkSize, 0, chunk.handle, 0);
   if (result != hipSuccess) {
-    MORI_APP_WARN("VMMAlloc failed: hipMemMap chunk={} addr={:p} size={} err={}",
-                  chunkIdx, chunkPtr, chunkSize, result);
+    MORI_APP_WARN("VMMAlloc failed: hipMemMap chunk={} addr={:p} size={} err={}", chunkIdx,
+                  chunkPtr, chunkSize, result);
     HIP_RUNTIME_CHECK(hipMemRelease(chunk.handle));
     return false;
   }
@@ -842,8 +849,8 @@ bool SymmMemManager::AllocateSingleChunk(VMMChunkInfo& chunk, size_t chunkIdx, v
 
   result = hipMemSetAccess(chunkPtr, chunkSize, &accessDesc, 1);
   if (result != hipSuccess) {
-    MORI_APP_WARN("VMMAlloc failed: hipMemSetAccess chunk={} addr={:p} err={}",
-                  chunkIdx, chunkPtr, result);
+    MORI_APP_WARN("VMMAlloc failed: hipMemSetAccess chunk={} addr={:p} err={}", chunkIdx, chunkPtr,
+                  result);
     HIP_RUNTIME_CHECK(hipMemUnmap(chunkPtr, chunkSize));
     HIP_RUNTIME_CHECK(hipMemRelease(chunk.handle));
     return false;
@@ -858,8 +865,8 @@ bool SymmMemManager::AllocateSingleChunk(VMMChunkInfo& chunk, size_t chunkIdx, v
     chunk.shareableHandle = -1;
   }
 
-  MORI_APP_TRACE("VMMAlloc: rank={} created chunk={} size={} fd={} (shared for P2P & RDMA)",
-                 rank, chunkIdx, chunkSize, chunk.shareableHandle);
+  MORI_APP_TRACE("VMMAlloc: rank={} created chunk={} size={} fd={} (shared for P2P & RDMA)", rank,
+                 chunkIdx, chunkSize, chunk.shareableHandle);
 
   chunk.isAllocated = true;
   chunk.refCount = 1;
@@ -872,14 +879,14 @@ void SymmMemManager::ImportPeerChunk(VMMChunkInfo& chunk, size_t chunkIdx, void*
                                      size_t chunkSize, int handleValue, int pe, int rank,
                                      int currentDev) {
   hipError_t result;
-  
+
   // Import the shareable handle from the target PE
   hipMemGenericAllocationHandle_t importedHandle;
   result = hipMemImportFromShareableHandleCompat(&importedHandle, handleValue,
-                                                  hipMemHandleTypePosixFileDescriptor);
+                                                 hipMemHandleTypePosixFileDescriptor);
   if (result != hipSuccess) {
-    MORI_APP_WARN("Failed to import shareable handle from PE {}, chunk {}, hipError: {}",
-                  pe, chunkIdx, result);
+    MORI_APP_WARN("Failed to import shareable handle from PE {}, chunk {}, hipError: {}", pe,
+                  chunkIdx, result);
     return;
   }
 
@@ -911,10 +918,10 @@ void SymmMemManager::ImportPeerChunk(VMMChunkInfo& chunk, size_t chunkIdx, void*
 
 // Step 6: Register P2P peer memory mapping (exchange FDs and map peer chunks)
 bool SymmMemManager::RegisterP2PPeerMemory(const std::vector<int>& localShareableHandles,
-                                           size_t startChunk, size_t chunksNeeded,
-                                           int rank, int worldSize, int currentDev) {
+                                           size_t startChunk, size_t chunksNeeded, int rank,
+                                           int worldSize, int currentDev) {
   MORI_APP_TRACE("VMMAlloc: rank={} registering P2P peer memory", rank);
-  
+
   // Find all P2P peers
   std::vector<int> p2pPeers;
   for (int pe = 0; pe < worldSize; ++pe) {
@@ -957,30 +964,31 @@ bool SymmMemManager::RegisterP2PPeerMemory(const std::vector<int>& localShareabl
   };
   ChunkInfo myChunkInfo = {startChunk, chunksNeeded};
   std::vector<ChunkInfo> allChunkInfo(worldSize);
-  
+
   bootNet.Allgather(&myChunkInfo, allChunkInfo.data(), sizeof(ChunkInfo));
-  
+
   bool chunkConsistent = true;
   for (int i = 0; i < p2pWorldSize; ++i) {
     int globalRank = sortedP2pPeers[i];
-    if (allChunkInfo[globalRank].startChunk != startChunk || 
+    if (allChunkInfo[globalRank].startChunk != startChunk ||
         allChunkInfo[globalRank].chunksNeeded != chunksNeeded) {
       MORI_APP_ERROR(
-          "VMMAlloc: rank={} chunk mismatch! Self=[{},+{}), peer_idx={} global_rank={} has=[{},+{})",
-          rank, startChunk, chunksNeeded, i, globalRank,
-          allChunkInfo[globalRank].startChunk, allChunkInfo[globalRank].chunksNeeded);
+          "VMMAlloc: rank={} chunk mismatch! Self=[{},+{}), peer_idx={} global_rank={} "
+          "has=[{},+{})",
+          rank, startChunk, chunksNeeded, i, globalRank, allChunkInfo[globalRank].startChunk,
+          allChunkInfo[globalRank].chunksNeeded);
       chunkConsistent = false;
     }
   }
-  
+
   if (!chunkConsistent) {
     MORI_APP_ERROR("VMMAlloc: rank={} aborting due to inconsistent chunk allocation", rank);
     localBootstrap.Finalize();
     return false;
   }
-  
-  MORI_APP_TRACE("VMMAlloc: rank={} verified all {} P2P peers have matching chunks=[{},+{})",
-                 rank, p2pWorldSize - 1, startChunk, chunksNeeded);
+
+  MORI_APP_TRACE("VMMAlloc: rank={} verified all {} P2P peers have matching chunks=[{},+{})", rank,
+                 p2pWorldSize - 1, startChunk, chunksNeeded);
 
   // Prepare local FDs for exchange
   std::vector<int> localFdsForExchange;
@@ -993,7 +1001,8 @@ bool SymmMemManager::RegisterP2PPeerMemory(const std::vector<int>& localShareabl
   bool exchangeSuccess = localBootstrap.ExchangeFileDescriptors(localFdsForExchange, p2pFds);
 
   if (!exchangeSuccess) {
-    MORI_APP_ERROR("VMMAlloc: rank={} FD exchange failed! P2P requires same physical machine", rank);
+    MORI_APP_ERROR("VMMAlloc: rank={} FD exchange failed! P2P requires same physical machine",
+                   rank);
     localBootstrap.Finalize();
     return false;
   }
@@ -1018,8 +1027,8 @@ bool SymmMemManager::RegisterP2PPeerMemory(const std::vector<int>& localShareabl
 
       // Skip if this peer chunk has already been mapped
       if (chunkIdx < vmmMaxChunks && vmmChunks[chunkIdx].mappedPeers.count(pe) > 0) {
-        MORI_APP_TRACE("VMMAlloc: rank={} chunk={} already mapped from PE={}, skip",
-                       rank, chunkIdx, pe);
+        MORI_APP_TRACE("VMMAlloc: rank={} chunk={} already mapped from PE={}, skip", rank, chunkIdx,
+                       pe);
         continue;
       }
 
@@ -1030,32 +1039,33 @@ bool SymmMemManager::RegisterP2PPeerMemory(const std::vector<int>& localShareabl
       }
 
       if (handleValue == -1) {
-        MORI_APP_WARN("RANK {} skipping invalid shareable handle from PE {}, chunk {}",
-                      rank, pe, i);
+        MORI_APP_WARN("RANK {} skipping invalid shareable handle from PE {}, chunk {}", rank, pe,
+                      i);
         continue;
       }
 
       // Calculate target address in peer's virtual space
-      void* peerChunkPtr = static_cast<void*>(
-          static_cast<char*>(vmmPeerBasePtrs[pe]) + chunkIdx * vmmChunkSize);
+      void* peerChunkPtr =
+          static_cast<void*>(static_cast<char*>(vmmPeerBasePtrs[pe]) + chunkIdx * vmmChunkSize);
 
       // Import and map peer chunk
-      ImportPeerChunk(vmmChunks[chunkIdx], chunkIdx, peerChunkPtr, vmmChunkSize,
-                      handleValue, pe, rank, currentDev);
+      ImportPeerChunk(vmmChunks[chunkIdx], chunkIdx, peerChunkPtr, vmmChunkSize, handleValue, pe,
+                      rank, currentDev);
     }
   }
 
   // Clean up LocalBootstrapNetwork
   localBootstrap.Finalize();
   MORI_APP_TRACE("VMMAlloc: rank={} LocalBootstrap finalized", rank);
-  MORI_APP_TRACE("VMMAlloc: rank={} P2P peer memory registration done, chunks={}", rank, chunksNeeded);
-  
+  MORI_APP_TRACE("VMMAlloc: rank={} P2P peer memory registration done, chunks={}", rank,
+                 chunksNeeded);
+
   return true;
 }
 
 // Step 7: Register RDMA memory regions for all chunks
-void SymmMemManager::RegisterRdmaChunks(size_t startChunk, size_t chunksNeeded,
-                                        int rank, int worldSize) {
+void SymmMemManager::RegisterRdmaChunks(size_t startChunk, size_t chunksNeeded, int rank,
+                                        int worldSize) {
   RdmaDeviceContext* rdmaDeviceContext = context.GetRdmaDeviceContext();
   if (!rdmaDeviceContext) {
     return;
@@ -1072,19 +1082,19 @@ void SymmMemManager::RegisterRdmaChunks(size_t startChunk, size_t chunksNeeded,
     // Skip if this chunk already has RDMA registration (for reused chunks)
     if (vmmChunks[chunkIdx].rdmaRegistered) {
       localChunkRkeys[i] = vmmChunks[chunkIdx].peerRkeys[rank];
-      MORI_APP_TRACE("VMMAlloc: rank={} chunk={} RDMA reuse lkey={}",
-                     rank, chunkIdx, vmmChunks[chunkIdx].lkey);
+      MORI_APP_TRACE("VMMAlloc: rank={} chunk={} RDMA reuse lkey={}", rank, chunkIdx,
+                     vmmChunks[chunkIdx].lkey);
       continue;
     }
 
-    void* chunkPtr = static_cast<void*>(
-        static_cast<char*>(vmmPeerBasePtrs[rank]) + chunkIdx * vmmChunkSize);
+    void* chunkPtr =
+        static_cast<void*>(static_cast<char*>(vmmPeerBasePtrs[rank]) + chunkIdx * vmmChunkSize);
 
     // Register this chunk for RDMA access using dmabuf
     int dmabufFd = vmmChunks[chunkIdx].shareableHandle;
     if (dmabufFd < 0) {
-      MORI_APP_ERROR("VMMAlloc: rank={} chunk={} fd not exported, cannot register RDMA",
-                     rank, chunkIdx);
+      MORI_APP_ERROR("VMMAlloc: rank={} chunk={} fd not exported, cannot register RDMA", rank,
+                     chunkIdx);
       continue;
     }
 
@@ -1100,8 +1110,8 @@ void SymmMemManager::RegisterRdmaChunks(size_t startChunk, size_t chunksNeeded,
     vmmHeapObj.cpu->vmmLkeyInfo[chunkIdx].key = mr.lkey;
     vmmHeapObj.cpu->vmmRkeyInfo[chunkIdx * worldSize + rank].key = mr.rkey;
 
-    MORI_APP_TRACE("VMMAlloc: rank={} RDMA chunk={} addr={:p} fd={} lkey={} rkey={}",
-                   rank, chunkIdx, chunkPtr, dmabufFd, mr.lkey, mr.rkey);
+    MORI_APP_TRACE("VMMAlloc: rank={} RDMA chunk={} addr={:p} fd={} lkey={} rkey={}", rank,
+                   chunkIdx, chunkPtr, dmabufFd, mr.lkey, mr.rkey);
   }
 
   // Exchange rkeys via bootstrap network
@@ -1128,16 +1138,14 @@ void SymmMemManager::RegisterRdmaChunks(size_t startChunk, size_t chunksNeeded,
   // Synchronize updated VMMChunkKey to GPU for these chunks
   size_t keysOffset = startChunk * worldSize * sizeof(VMMChunkKey);
   size_t keysSize = chunksNeeded * worldSize * sizeof(VMMChunkKey);
-  HIP_RUNTIME_CHECK(hipMemcpy(
-      reinterpret_cast<char*>(vmmHeapObj.gpu->vmmRkeyInfo) + keysOffset,
-      vmmHeapObj.cpu->vmmRkeyInfo + startChunk * worldSize,
-      keysSize, hipMemcpyHostToDevice));
+  HIP_RUNTIME_CHECK(hipMemcpy(reinterpret_cast<char*>(vmmHeapObj.gpu->vmmRkeyInfo) + keysOffset,
+                              vmmHeapObj.cpu->vmmRkeyInfo + startChunk * worldSize, keysSize,
+                              hipMemcpyHostToDevice));
 
   // Synchronize lkey info to GPU
-  HIP_RUNTIME_CHECK(hipMemcpy(
-      vmmHeapObj.gpu->vmmLkeyInfo + startChunk,
-      vmmHeapObj.cpu->vmmLkeyInfo + startChunk,
-      chunksNeeded * sizeof(VMMChunkKey), hipMemcpyHostToDevice));
+  HIP_RUNTIME_CHECK(hipMemcpy(vmmHeapObj.gpu->vmmLkeyInfo + startChunk,
+                              vmmHeapObj.cpu->vmmLkeyInfo + startChunk,
+                              chunksNeeded * sizeof(VMMChunkKey), hipMemcpyHostToDevice));
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -1229,8 +1237,8 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, HeapType heapType) {
       void* localChunkPtr =
           static_cast<void*>(static_cast<char*>(vmmPeerBasePtrs[rank]) + chunkIdx * vmmChunkSize);
 
-      bool success = AllocateSingleChunk(vmmChunks[chunkIdx], chunkIdx, localChunkPtr,
-                                         vmmChunkSize, allocProp, rank, currentDev);
+      bool success = AllocateSingleChunk(vmmChunks[chunkIdx], chunkIdx, localChunkPtr, vmmChunkSize,
+                                         allocProp, rank, currentDev);
       if (!success) {
         CleanupAllocatedChunks(startChunk, i);
         heapVAManager->Free(allocAddr);
@@ -1241,8 +1249,8 @@ SymmMemObjPtr SymmMemManager::VMMAllocChunk(size_t size, HeapType heapType) {
     }
 
     // Step 6: Register P2P peer memory mapping
-    if (!RegisterP2PPeerMemory(localShareableHandles, startChunk, chunksNeeded,
-                               rank, worldSize, currentDev)) {
+    if (!RegisterP2PPeerMemory(localShareableHandles, startChunk, chunksNeeded, rank, worldSize,
+                               currentDev)) {
       return SymmMemObjPtr();
     }
 
@@ -1286,18 +1294,18 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
   }
 
   size_t allocSize = it->second.cpu->size;
-  
+
   // Calculate chunk range correctly
   size_t offset = ptrAddr - baseAddr;
   size_t startChunk = offset / vmmChunkSize;
   size_t endOffset = offset + allocSize;
   size_t endChunk = (endOffset + vmmChunkSize - 1) / vmmChunkSize;
   size_t chunksToFree = endChunk - startChunk;
-  
+
   size_t chunkIdx = startChunk;
-  
-  MORI_APP_TRACE("VMMFreeChunk: RANK {} freeing ptr={:p} size={} chunks=[{},{})", rank, 
-                 localPtr, allocSize, startChunk, endChunk);
+
+  MORI_APP_TRACE("VMMFreeChunk: RANK {} freeing ptr={:p} size={} chunks=[{},{})", rank, localPtr,
+                 allocSize, startChunk, endChunk);
 
   // Verify free consistency across all PEs (symmetric memory requirement)
   // Note: ShmemFree has already synchronized all PEs before calling this function
@@ -1307,24 +1315,27 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
   };
   FreeInfo myFreeInfo = {offset, allocSize};
   std::vector<FreeInfo> allFreeInfo(worldSize);
-  
+
   bootNet.Allgather(&myFreeInfo, allFreeInfo.data(), sizeof(FreeInfo));
-  
+
   bool freeConsistent = true;
   for (int pe = 0; pe < worldSize; ++pe) {
     if (allFreeInfo[pe].offset != offset || allFreeInfo[pe].size != allocSize) {
       MORI_APP_ERROR(
-          "VMMFree: rank={} symmetric memory violated! Self: offset=0x{:x} size={}, PE {}: offset=0x{:x} size={}",
+          "VMMFree: rank={} symmetric memory violated! Self: offset=0x{:x} size={}, PE {}: "
+          "offset=0x{:x} size={}",
           rank, offset, allocSize, pe, allFreeInfo[pe].offset, allFreeInfo[pe].size);
       freeConsistent = false;
     }
   }
-  
+
   if (!freeConsistent) {
-    MORI_APP_ERROR("VMMFree: rank={} detected inconsistent free, but continuing (may cause future issues)", rank);
+    MORI_APP_ERROR(
+        "VMMFree: rank={} detected inconsistent free, but continuing (may cause future issues)",
+        rank);
     // Don't abort here - just log the error and continue to avoid resource leaks
   } else {
-    MORI_APP_TRACE("VMMFree: rank={} verified all {} PEs freeing matching offset=0x{:x} size={}", 
+    MORI_APP_TRACE("VMMFree: rank={} verified all {} PEs freeing matching offset=0x{:x} size={}",
                    rank, worldSize, offset, allocSize);
   }
 
@@ -1360,10 +1371,11 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
             if (handleIt != vmmChunks[idx].importedHandles.end()) {
               HIP_RUNTIME_CHECK(hipMemRelease(handleIt->second));
               vmmChunks[idx].importedHandles.erase(handleIt);
-              MORI_APP_TRACE("VMMFreeChunk: RANK {} released imported handle from PE {} for chunk {}",
-                             rank, pe, idx);
+              MORI_APP_TRACE(
+                  "VMMFreeChunk: RANK {} released imported handle from PE {} for chunk {}", rank,
+                  pe, idx);
             }
-            
+
             // Successfully unmapped, remove from mappedPeers
             vmmChunks[idx].mappedPeers.erase(pe);
           }
@@ -1378,10 +1390,10 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
     size_t idx = chunkIdx + i;
     if (idx < vmmMaxChunks && vmmChunks[idx].isAllocated) {
       vmmChunks[idx].refCount--;
-      
+
       MORI_APP_TRACE("VMMFreeChunk: RANK {} decrement chunk {} refCount to {}", rank, idx,
                      vmmChunks[idx].refCount);
-      
+
       // Only release physical resources when refCount reaches 0
       if (vmmChunks[idx].refCount == 0) {
         void* chunkPtr =
@@ -1393,13 +1405,13 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
           vmmChunks[idx].rdmaRegistered = false;
           vmmChunks[idx].lkey = 0;
           std::fill(vmmChunks[idx].peerRkeys.begin(), vmmChunks[idx].peerRkeys.end(), 0);
-          
+
           // Clear vmmHeapObj's VMMChunkKey arrays for this chunk (keep next_addr, clear key)
           vmmHeapObj.cpu->vmmLkeyInfo[idx].key = 0;
           for (int pe = 0; pe < worldSize; ++pe) {
             vmmHeapObj.cpu->vmmRkeyInfo[idx * worldSize + pe].key = 0;
           }
-          
+
           MORI_APP_TRACE("VMMFreeChunk: RANK {} deregistered RDMA for chunk {} at {:p}", rank, idx,
                          chunkPtr);
         }
@@ -1418,12 +1430,14 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
         vmmChunks[idx].shareableHandle = -1;
         vmmChunks[idx].mappedPeers.clear();
         vmmChunks[idx].importedHandles.clear();
-        
+
         MORI_APP_TRACE("VMMFreeChunk: RANK {} fully released chunk {} (physical resources freed)",
                        rank, idx);
       } else {
-        MORI_APP_TRACE("VMMFreeChunk: RANK {} chunk {} still in use (refCount={}), physical resources retained",
-                       rank, idx, vmmChunks[idx].refCount);
+        MORI_APP_TRACE(
+            "VMMFreeChunk: RANK {} chunk {} still in use (refCount={}), physical resources "
+            "retained",
+            rank, idx, vmmChunks[idx].refCount);
       }
     }
   }
@@ -1435,22 +1449,20 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
       // This chunk was fully freed (refCount reached 0), sync cleared keys to GPU
       size_t keysOffset = idx * worldSize * sizeof(VMMChunkKey);
       size_t keysSize = worldSize * sizeof(VMMChunkKey);
-      HIP_RUNTIME_CHECK(hipMemcpy(
-          reinterpret_cast<char*>(vmmHeapObj.gpu->vmmRkeyInfo) + keysOffset,
-          vmmHeapObj.cpu->vmmRkeyInfo + idx * worldSize,
-          keysSize, hipMemcpyHostToDevice));
-      
-      HIP_RUNTIME_CHECK(hipMemcpy(
-          vmmHeapObj.gpu->vmmLkeyInfo + idx,
-          vmmHeapObj.cpu->vmmLkeyInfo + idx,
-          sizeof(VMMChunkKey), hipMemcpyHostToDevice));
-      
+      HIP_RUNTIME_CHECK(hipMemcpy(reinterpret_cast<char*>(vmmHeapObj.gpu->vmmRkeyInfo) + keysOffset,
+                                  vmmHeapObj.cpu->vmmRkeyInfo + idx * worldSize, keysSize,
+                                  hipMemcpyHostToDevice));
+
+      HIP_RUNTIME_CHECK(hipMemcpy(vmmHeapObj.gpu->vmmLkeyInfo + idx,
+                                  vmmHeapObj.cpu->vmmLkeyInfo + idx, sizeof(VMMChunkKey),
+                                  hipMemcpyHostToDevice));
+
       MORI_APP_TRACE("VMMFreeChunk: RANK {} synced cleared keys to GPU for chunk {}", rank, idx);
     }
   }
 
   VMMDeregisterSymmMemObj(localPtr);
-  
+
   // Note: ShmemFree will synchronize all PEs after this function returns
   MORI_APP_TRACE("VMMFreeChunk: rank={} free complete", rank);
 }
@@ -1478,24 +1490,24 @@ SymmMemObjPtr SymmMemManager::VMMRegisterSymmMemObj(void* localPtr, size_t size,
     cpuMemObj->peerPtrs[pe] = vmmHeapObj.cpu->peerPtrs[pe] + localOffset;
   }
   MORI_APP_TRACE("VMMRegister: localPtr={:p} size={} offset={}", localPtr, size, localOffset);
-  
+
   // VMM doesn't need IPC handles - access is managed through hipMemSetAccess and shareable handles
   cpuMemObj->ipcMemHandles =
       static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
 
-  // For VMM allocations: directly point to vmmHeapObj's VMMChunkKey arrays (shared across all VMM objects)
-  // This allows accessing keys for all chunks in the heap
+  // For VMM allocations: directly point to vmmHeapObj's VMMChunkKey arrays (shared across all VMM
+  // objects) This allows accessing keys for all chunks in the heap
   cpuMemObj->vmmLkeyInfo = vmmHeapObj.cpu->vmmLkeyInfo;
   cpuMemObj->vmmRkeyInfo = vmmHeapObj.cpu->vmmRkeyInfo;
   cpuMemObj->vmmNumChunks = vmmHeapObj.cpu->vmmNumChunks;
   cpuMemObj->worldSize = worldSize;
-  
+
   // Keep lkey and peerRkeys as nullptr/0 for VMM allocations to distinguish from static heap
   cpuMemObj->lkey = 0;
   cpuMemObj->peerRkeys = nullptr;
 
-  MORI_APP_TRACE("VMMRegister: startChunk={} numChunks={} chunkSize={} spans [{}, {})",
-                 startChunk, numChunks, vmmChunkSize, startChunk, startChunk + numChunks);
+  MORI_APP_TRACE("VMMRegister: startChunk={} numChunks={} chunkSize={} spans [{}, {})", startChunk,
+                 numChunks, vmmChunkSize, startChunk, startChunk + numChunks);
   SymmMemObj* gpuMemObj;
   HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj, sizeof(SymmMemObj)));
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj, cpuMemObj, sizeof(SymmMemObj), hipMemcpyHostToDevice));
@@ -1513,7 +1525,6 @@ SymmMemObjPtr SymmMemManager::VMMRegisterSymmMemObj(void* localPtr, size_t size,
   MORI_APP_TRACE("VMMRegister: rank={} done addr={:p} size={}", rank, localPtr, size);
   return memObjPool.at(localPtr);
 }
-
 
 }  // namespace application
 }  // namespace mori

@@ -43,9 +43,8 @@ __global__ void ConcurrentPutSignalThreadKernelAdd(int myPe, const SymmMemObjPtr
 
   if (myPe == sendPe) {
     // Test onlyOneSignal=true with AMO_ADD: only leader thread signals
-    ShmemPutMemNbiSignalThread<true>(dataObj, threadOffset, dataObj, threadOffset,
-                                     sizeof(uint32_t), signalObj, 0, 1, atomicType::AMO_ADD,
-                                     recvPe, 0);
+    ShmemPutMemNbiSignalThread<true>(dataObj, threadOffset, dataObj, threadOffset, sizeof(uint32_t),
+                                     signalObj, 0, 1, atomicType::AMO_ADD, recvPe, 0);
     __threadfence_system();
 
     if (blockIdx.x == 0) {
@@ -63,7 +62,8 @@ __global__ void ConcurrentPutSignalThreadKernelAdd(int myPe, const SymmMemObjPtr
     __syncthreads();
 
     // Verify data
-    uint32_t receivedData = atomicAdd(reinterpret_cast<uint32_t*>(dataObj->localPtr) + globalTid, 0);
+    uint32_t receivedData =
+        atomicAdd(reinterpret_cast<uint32_t*>(dataObj->localPtr) + globalTid, 0);
     if (receivedData != sendPe) {
       printf("PE %d, thread %d: Data mismatch! Expected %d, got %d\n", myPe, globalTid, sendPe,
              receivedData);
@@ -73,7 +73,7 @@ __global__ void ConcurrentPutSignalThreadKernelAdd(int myPe, const SymmMemObjPtr
 
 // New API: Using pure addresses with AMO_ADD
 __global__ void ConcurrentPutSignalThreadKernelAdd_PureAddr(int myPe, uint32_t* dataBuff,
-                                                             uint64_t* signalBuff) {
+                                                            uint64_t* signalBuff) {
   constexpr int sendPe = 0;
   constexpr int recvPe = 1;
 
@@ -124,9 +124,9 @@ __global__ void ConcurrentPutSignalThreadKernelSet(int myPe, const SymmMemObjPtr
   if (myPe == sendPe) {
     // Test onlyOneSignal=true with AMO_SET: each warp sets its own signal slot
     // Use warp ID as offset to avoid overwriting other warps' signals
-    ShmemPutMemNbiSignalThread<true>(dataObj, threadOffset, dataObj, threadOffset,
-                                     sizeof(uint32_t), signalObj, globalWarpId * sizeof(uint64_t), 
-                                     MAGIC_VALUE, atomicType::AMO_SET, recvPe, 0);
+    ShmemPutMemNbiSignalThread<true>(dataObj, threadOffset, dataObj, threadOffset, sizeof(uint32_t),
+                                     signalObj, globalWarpId * sizeof(uint64_t), MAGIC_VALUE,
+                                     atomicType::AMO_SET, recvPe, 0);
     __threadfence_system();
 
     if (blockIdx.x == 0) {
@@ -151,7 +151,8 @@ __global__ void ConcurrentPutSignalThreadKernelSet(int myPe, const SymmMemObjPtr
     __syncthreads();
 
     // Verify data
-    uint32_t receivedData = atomicAdd(reinterpret_cast<uint32_t*>(dataObj->localPtr) + globalTid, 0);
+    uint32_t receivedData =
+        atomicAdd(reinterpret_cast<uint32_t*>(dataObj->localPtr) + globalTid, 0);
     if (receivedData != sendPe) {
       printf("PE %d, thread %d: Data mismatch! Expected %d, got %d\n", myPe, globalTid, sendPe,
              receivedData);
@@ -161,7 +162,7 @@ __global__ void ConcurrentPutSignalThreadKernelSet(int myPe, const SymmMemObjPtr
 
 // New API: Using pure addresses with AMO_SET
 __global__ void ConcurrentPutSignalThreadKernelSet_PureAddr(int myPe, uint32_t* dataBuff,
-                                                             uint64_t* signalBuff) {
+                                                            uint64_t* signalBuff) {
   constexpr int sendPe = 0;
   constexpr int recvPe = 1;
   constexpr uint64_t MAGIC_VALUE = 0xDEADBEEF;
@@ -175,7 +176,7 @@ __global__ void ConcurrentPutSignalThreadKernelSet_PureAddr(int myPe, uint32_t* 
 
     // Test onlyOneSignal=true with AMO_SET: each warp sets its own signal slot
     // Use warp ID as index to avoid overwriting other warps' signals
-    ShmemPutMemNbiSignalThread<true>(dest, src, sizeof(uint32_t), signalBuff + globalWarpId, 
+    ShmemPutMemNbiSignalThread<true>(dest, src, sizeof(uint32_t), signalBuff + globalWarpId,
                                      MAGIC_VALUE, atomicType::AMO_SET, recvPe, 0);
     __threadfence_system();
 
@@ -210,8 +211,8 @@ __global__ void ConcurrentPutSignalThreadKernelSet_PureAddr(int myPe, uint32_t* 
 
 // Legacy API: Large size transfer (14KB per thread)
 __global__ void ConcurrentPutSignalThreadKernelLargeSize(int myPe, const SymmMemObjPtr dataObj,
-                                                          const SymmMemObjPtr signalObj,
-                                                          size_t sizePerThread) {
+                                                         const SymmMemObjPtr signalObj,
+                                                         size_t sizePerThread) {
   constexpr int sendPe = 0;
   constexpr int recvPe = 1;
 
@@ -220,9 +221,8 @@ __global__ void ConcurrentPutSignalThreadKernelLargeSize(int myPe, const SymmMem
 
   if (myPe == sendPe) {
     // Each thread transfers a large chunk (14KB) with signal
-    ShmemPutMemNbiSignalThread<true>(dataObj, threadOffset, dataObj, threadOffset,
-                                     sizePerThread, signalObj, 0, 1, atomicType::AMO_ADD,
-                                     recvPe, 0);
+    ShmemPutMemNbiSignalThread<true>(dataObj, threadOffset, dataObj, threadOffset, sizePerThread,
+                                     signalObj, 0, 1, atomicType::AMO_ADD, recvPe, 0);
     __threadfence_system();
 
     if (blockIdx.x == 0) {
@@ -243,21 +243,21 @@ __global__ void ConcurrentPutSignalThreadKernelLargeSize(int myPe, const SymmMem
     uint32_t* dataPtr = reinterpret_cast<uint32_t*>(dataObj->localPtr);
     size_t offset = globalTid * sizePerThread / sizeof(uint32_t);
     size_t numElements = sizePerThread / sizeof(uint32_t);
-    
+
     uint32_t firstValue = atomicAdd(&dataPtr[offset], 0);
     uint32_t lastValue = atomicAdd(&dataPtr[offset + numElements - 1], 0);
-    
+
     if (firstValue != sendPe || lastValue != sendPe) {
-      printf("PE %d, thread %d: Data mismatch! First: %d, Last: %d (expected: %d)\n", 
-             myPe, globalTid, firstValue, lastValue, sendPe);
+      printf("PE %d, thread %d: Data mismatch! First: %d, Last: %d (expected: %d)\n", myPe,
+             globalTid, firstValue, lastValue, sendPe);
     }
   }
 }
 
 // Legacy API: Very large size transfer (5MB per thread - tests cross-VMM-chunk scenario)
 __global__ void ConcurrentPutSignalThreadKernelVeryLargeSize(int myPe, const SymmMemObjPtr dataObj,
-                                                              const SymmMemObjPtr signalObj,
-                                                              size_t sizePerThread) {
+                                                             const SymmMemObjPtr signalObj,
+                                                             size_t sizePerThread) {
   constexpr int sendPe = 0;
   constexpr int recvPe = 1;
 
@@ -266,9 +266,8 @@ __global__ void ConcurrentPutSignalThreadKernelVeryLargeSize(int myPe, const Sym
 
   if (myPe == sendPe) {
     // Each thread transfers 5MB chunk with signal (crosses VMM chunk boundaries)
-    ShmemPutMemNbiSignalThread<true>(dataObj, threadOffset, dataObj, threadOffset,
-                                     sizePerThread, signalObj, 0, 1, atomicType::AMO_ADD,
-                                     recvPe, 0);
+    ShmemPutMemNbiSignalThread<true>(dataObj, threadOffset, dataObj, threadOffset, sizePerThread,
+                                     signalObj, 0, 1, atomicType::AMO_ADD, recvPe, 0);
     __threadfence_system();
 
     if (blockIdx.x == 0) {
@@ -289,23 +288,23 @@ __global__ void ConcurrentPutSignalThreadKernelVeryLargeSize(int myPe, const Sym
     uint32_t* dataPtr = reinterpret_cast<uint32_t*>(dataObj->localPtr);
     size_t offset = globalTid * sizePerThread / sizeof(uint32_t);
     size_t numElements = sizePerThread / sizeof(uint32_t);
-    
+
     // Check first, middle, and last values
     uint32_t firstValue = atomicAdd(&dataPtr[offset], 0);
     uint32_t midValue = atomicAdd(&dataPtr[offset + numElements / 2], 0);
     uint32_t lastValue = atomicAdd(&dataPtr[offset + numElements - 1], 0);
-    
+
     if (firstValue != sendPe || midValue != sendPe || lastValue != sendPe) {
-      printf("PE %d, thread %d: Data mismatch! First: %d, Mid: %d, Last: %d (expected: %d)\n", 
-             myPe, globalTid, firstValue, midValue, lastValue, sendPe);
+      printf("PE %d, thread %d: Data mismatch! First: %d, Mid: %d, Last: %d (expected: %d)\n", myPe,
+             globalTid, firstValue, midValue, lastValue, sendPe);
     }
   }
 }
 
 // Pure Address API: Very large size transfer (5MB per thread - tests cross-VMM-chunk scenario)
 __global__ void ConcurrentPutSignalThreadKernelVeryLargeSize_PureAddr(int myPe, uint8_t* dataBuff,
-                                                                       uint64_t* signalBuff,
-                                                                       size_t sizePerThread) {
+                                                                      uint64_t* signalBuff,
+                                                                      size_t sizePerThread) {
   constexpr int sendPe = 0;
   constexpr int recvPe = 1;
 
@@ -317,8 +316,8 @@ __global__ void ConcurrentPutSignalThreadKernelVeryLargeSize_PureAddr(int myPe, 
     uint8_t* dest = dataBuff + threadOffset;
 
     // Each thread transfers 5MB chunk with signal (crosses VMM chunk boundaries)
-    ShmemPutMemNbiSignalThread<true>(dest, src, sizePerThread, signalBuff, 1,
-                                     atomicType::AMO_ADD, recvPe, 0);
+    ShmemPutMemNbiSignalThread<true>(dest, src, sizePerThread, signalBuff, 1, atomicType::AMO_ADD,
+                                     recvPe, 0);
     __threadfence_system();
 
     if (blockIdx.x == 0) {
@@ -338,15 +337,15 @@ __global__ void ConcurrentPutSignalThreadKernelVeryLargeSize_PureAddr(int myPe, 
     uint32_t* dataPtr = reinterpret_cast<uint32_t*>(dataBuff);
     size_t offset = globalTid * sizePerThread / sizeof(uint32_t);
     size_t numElements = sizePerThread / sizeof(uint32_t);
-    
+
     // Check first, middle, and last values
     uint32_t firstValue = atomicAdd(&dataPtr[offset], 0);
     uint32_t midValue = atomicAdd(&dataPtr[offset + numElements / 2], 0);
     uint32_t lastValue = atomicAdd(&dataPtr[offset + numElements - 1], 0);
-    
+
     if (firstValue != sendPe || midValue != sendPe || lastValue != sendPe) {
-      printf("PE %d, thread %d: Data mismatch! First: %d, Mid: %d, Last: %d (expected: %d)\n", 
-             myPe, globalTid, firstValue, midValue, lastValue, sendPe);
+      printf("PE %d, thread %d: Data mismatch! First: %d, Mid: %d, Last: %d (expected: %d)\n", myPe,
+             globalTid, firstValue, midValue, lastValue, sendPe);
     }
   }
 }
@@ -358,16 +357,17 @@ void ConcurrentPutSignalThread() {
   // Set GPU device based on local rank
   MPI_Comm localComm;
   MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &localComm);
-  
+
   int localRank;
   MPI_Comm_rank(localComm, &localRank);
-  
+
   int deviceCount;
   HIP_RUNTIME_CHECK(hipGetDeviceCount(&deviceCount));
   int deviceId = localRank % deviceCount;
   HIP_RUNTIME_CHECK(hipSetDevice(deviceId));
-  
-  printf("Local rank %d setting GPU device %d (total %d devices)\n", localRank, deviceId, deviceCount);
+
+  printf("Local rank %d setting GPU device %d (total %d devices)\n", localRank, deviceId,
+         deviceCount);
 
   status = ShmemMpiInit(MPI_COMM_WORLD);
   assert(!status);
@@ -425,7 +425,7 @@ void ConcurrentPutSignalThread() {
   // Verify Test 1
   std::vector<uint32_t> hostData1(numEle);
   HIP_RUNTIME_CHECK(hipMemcpy(hostData1.data(), dataBuff1, buffSize, hipMemcpyDeviceToHost));
-  
+
   if (myPe == 1) {
     bool success = true;
     for (int i = 0; i < numEle; i++) {
@@ -434,11 +434,13 @@ void ConcurrentPutSignalThread() {
         break;
       }
     }
-    
+
     uint64_t signalValue;
-    HIP_RUNTIME_CHECK(hipMemcpy(&signalValue, signalBuff1, sizeof(uint64_t), hipMemcpyDeviceToHost));
-    uint64_t expectedSignals = (threadNum * blockNum + warpSize - 1) / warpSize;  // One signal per warp
-    printf("✓ Legacy API AMO_ADD test PASSED! Signal counter: %lu (expected: %lu), Data: %s\n", 
+    HIP_RUNTIME_CHECK(
+        hipMemcpy(&signalValue, signalBuff1, sizeof(uint64_t), hipMemcpyDeviceToHost));
+    uint64_t expectedSignals =
+        (threadNum * blockNum + warpSize - 1) / warpSize;  // One signal per warp
+    printf("✓ Legacy API AMO_ADD test PASSED! Signal counter: %lu (expected: %lu), Data: %s\n",
            signalValue, expectedSignals, success ? "OK" : "FAILED");
   }
 
@@ -477,7 +479,7 @@ void ConcurrentPutSignalThread() {
     // Verify Test 2
     std::vector<uint32_t> hostData2(numEle);
     HIP_RUNTIME_CHECK(hipMemcpy(hostData2.data(), dataBuff2, buffSize, hipMemcpyDeviceToHost));
-    
+
     if (myPe == 1) {
       bool success = true;
       for (int i = 0; i < numEle; i++) {
@@ -486,12 +488,14 @@ void ConcurrentPutSignalThread() {
           break;
         }
       }
-      
+
       uint64_t signalValue;
-      HIP_RUNTIME_CHECK(hipMemcpy(&signalValue, signalBuff2, sizeof(uint64_t), hipMemcpyDeviceToHost));
+      HIP_RUNTIME_CHECK(
+          hipMemcpy(&signalValue, signalBuff2, sizeof(uint64_t), hipMemcpyDeviceToHost));
       uint64_t expectedSignals = (threadNum * blockNum + warpSize - 1) / warpSize;
-      printf("✓ Pure Address API AMO_ADD test PASSED! Signal counter: %lu (expected: %lu), Data: %s\n", 
-             signalValue, expectedSignals, success ? "OK" : "FAILED");
+      printf(
+          "✓ Pure Address API AMO_ADD test PASSED! Signal counter: %lu (expected: %lu), Data: %s\n",
+          signalValue, expectedSignals, success ? "OK" : "FAILED");
     }
 
     // Cleanup Test 2
@@ -524,8 +528,8 @@ void ConcurrentPutSignalThread() {
   MPI_Barrier(MPI_COMM_WORLD);
 
   if (myPe == 1) {
-    printf("Running legacy API test with AMO_SET (%d warps, %d signals)...\n", 
-           totalWarps, totalWarps);
+    printf("Running legacy API test with AMO_SET (%d warps, %d signals)...\n", totalWarps,
+           totalWarps);
   }
   ConcurrentPutSignalThreadKernelSet<<<blockNum, threadNum>>>(myPe, dataBuffObj3, signalBuffObj3);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
@@ -534,7 +538,7 @@ void ConcurrentPutSignalThread() {
   // Verify Test 3
   std::vector<uint32_t> hostData3(numEle);
   HIP_RUNTIME_CHECK(hipMemcpy(hostData3.data(), dataBuff3, buffSize, hipMemcpyDeviceToHost));
-  
+
   bool dataSuccess = true;
   if (myPe == 1) {
     for (int i = 0; i < numEle; i++) {
@@ -543,11 +547,11 @@ void ConcurrentPutSignalThread() {
         break;
       }
     }
-    
+
     // PE 1: Verify signal values (PE 1 is the receiver)
     std::vector<uint64_t> signalValues(totalWarps);
-    HIP_RUNTIME_CHECK(hipMemcpy(signalValues.data(), signalBuff3, 
-                                totalWarps * sizeof(uint64_t), hipMemcpyDeviceToHost));
+    HIP_RUNTIME_CHECK(hipMemcpy(signalValues.data(), signalBuff3, totalWarps * sizeof(uint64_t),
+                                hipMemcpyDeviceToHost));
     int validSignals = 0;
     for (int i = 0; i < totalWarps; i++) {
       if (signalValues[i] == 0xDEADBEEF) {
@@ -556,7 +560,7 @@ void ConcurrentPutSignalThread() {
         printf("Warning: Signal[%d] = 0x%lx (expected 0xDEADBEEF)\n", i, signalValues[i]);
       }
     }
-    printf("✓ Legacy API AMO_SET test PASSED! Data: %s, Valid signals: %d/%d\n", 
+    printf("✓ Legacy API AMO_SET test PASSED! Data: %s, Valid signals: %d/%d\n",
            dataSuccess ? "OK" : "FAILED", validSignals, totalWarps);
   }
 
@@ -587,8 +591,8 @@ void ConcurrentPutSignalThread() {
     MPI_Barrier(MPI_COMM_WORLD);
 
     if (myPe == 1) {
-      printf("Running pure address API test with AMO_SET (%d warps, %d signals)...\n", 
-             totalWarps, totalWarps);
+      printf("Running pure address API test with AMO_SET (%d warps, %d signals)...\n", totalWarps,
+             totalWarps);
     }
     ConcurrentPutSignalThreadKernelSet_PureAddr<<<blockNum, threadNum>>>(
         myPe, reinterpret_cast<uint32_t*>(dataBuff4), reinterpret_cast<uint64_t*>(signalBuff4));
@@ -598,7 +602,7 @@ void ConcurrentPutSignalThread() {
     // Verify Test 4
     std::vector<uint32_t> hostData4(numEle);
     HIP_RUNTIME_CHECK(hipMemcpy(hostData4.data(), dataBuff4, buffSize, hipMemcpyDeviceToHost));
-    
+
     dataSuccess = true;
     if (myPe == 1) {
       for (int i = 0; i < numEle; i++) {
@@ -607,11 +611,11 @@ void ConcurrentPutSignalThread() {
           break;
         }
       }
-      
+
       // PE 1: Verify signal values (PE 1 is the receiver)
       std::vector<uint64_t> signalValues(totalWarps);
-      HIP_RUNTIME_CHECK(hipMemcpy(signalValues.data(), signalBuff4, 
-                                  totalWarps * sizeof(uint64_t), hipMemcpyDeviceToHost));
+      HIP_RUNTIME_CHECK(hipMemcpy(signalValues.data(), signalBuff4, totalWarps * sizeof(uint64_t),
+                                  hipMemcpyDeviceToHost));
       int validSignals = 0;
       for (int i = 0; i < totalWarps; i++) {
         if (signalValues[i] == 0xDEADBEEF) {
@@ -620,7 +624,7 @@ void ConcurrentPutSignalThread() {
           printf("Warning: Signal[%d] = 0x%lx (expected 0xDEADBEEF)\n", i, signalValues[i]);
         }
       }
-      printf("✓ Pure Address API AMO_SET test PASSED! Data: %s, Valid signals: %d/%d\n", 
+      printf("✓ Pure Address API AMO_SET test PASSED! Data: %s, Valid signals: %d/%d\n",
              dataSuccess ? "OK" : "FAILED", validSignals, totalWarps);
     }
 
@@ -636,11 +640,11 @@ void ConcurrentPutSignalThread() {
 
   constexpr size_t sizePerThread = 14 * 1024;  // 14KB per thread
   size_t totalSize = threadNum * blockNum * sizePerThread;
-  
+
   void* dataBuff5 = ShmemMalloc(totalSize);
   // Initialize with myPe value
-  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(dataBuff5), myPe, 
-                                  totalSize / sizeof(uint32_t)));
+  HIP_RUNTIME_CHECK(
+      hipMemsetD32(reinterpret_cast<uint32_t*>(dataBuff5), myPe, totalSize / sizeof(uint32_t)));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
   SymmMemObjPtr dataBuffObj5 = ShmemQueryMemObjPtr(dataBuff5);
@@ -656,11 +660,11 @@ void ConcurrentPutSignalThread() {
   MPI_Barrier(MPI_COMM_WORLD);
 
   if (myPe == 1) {
-    printf("Running large size test: %d threads × %zu bytes = %.2f MB total\n", 
+    printf("Running large size test: %d threads × %zu bytes = %.2f MB total\n",
            threadNum * blockNum, sizePerThread, totalSize / (1024.0 * 1024.0));
   }
-  ConcurrentPutSignalThreadKernelLargeSize<<<blockNum, threadNum>>>(
-      myPe, dataBuffObj5, signalBuffObj5, sizePerThread);
+  ConcurrentPutSignalThreadKernelLargeSize<<<blockNum, threadNum>>>(myPe, dataBuffObj5,
+                                                                    signalBuffObj5, sizePerThread);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
 
@@ -668,10 +672,9 @@ void ConcurrentPutSignalThread() {
   if (myPe == 1) {
     size_t sampleSize = 1024 / sizeof(uint32_t);  // Check first 1KB
     std::vector<uint32_t> hostDataSample(sampleSize);
-    
+
     // Check first 1KB
-    HIP_RUNTIME_CHECK(hipMemcpy(hostDataSample.data(), dataBuff5, 
-                                 1024, hipMemcpyDeviceToHost));
+    HIP_RUNTIME_CHECK(hipMemcpy(hostDataSample.data(), dataBuff5, 1024, hipMemcpyDeviceToHost));
     bool firstOk = true;
     for (size_t i = 0; i < sampleSize; i++) {
       if (hostDataSample[i] != 0) {
@@ -679,11 +682,11 @@ void ConcurrentPutSignalThread() {
         break;
       }
     }
-    
+
     // Check last 1KB
-    HIP_RUNTIME_CHECK(hipMemcpy(hostDataSample.data(), 
-                                 reinterpret_cast<uint8_t*>(dataBuff5) + totalSize - 1024, 
-                                 1024, hipMemcpyDeviceToHost));
+    HIP_RUNTIME_CHECK(hipMemcpy(hostDataSample.data(),
+                                reinterpret_cast<uint8_t*>(dataBuff5) + totalSize - 1024, 1024,
+                                hipMemcpyDeviceToHost));
     bool lastOk = true;
     for (size_t i = 0; i < sampleSize; i++) {
       if (hostDataSample[i] != 0) {
@@ -691,15 +694,16 @@ void ConcurrentPutSignalThread() {
         break;
       }
     }
-    
+
     uint64_t signalValue;
-    HIP_RUNTIME_CHECK(hipMemcpy(&signalValue, signalBuff5, sizeof(uint64_t), hipMemcpyDeviceToHost));
+    HIP_RUNTIME_CHECK(
+        hipMemcpy(&signalValue, signalBuff5, sizeof(uint64_t), hipMemcpyDeviceToHost));
     uint64_t expectedSignals = (threadNum * blockNum + warpSize - 1) / warpSize;
-    
-    printf("✓ Large Size test PASSED! Signal counter: %lu (expected: %lu)\n", 
-           signalValue, expectedSignals);
-    printf("  Data verification: First 1KB: %s, Last 1KB: %s\n", 
-           firstOk ? "OK" : "FAILED", lastOk ? "OK" : "FAILED");
+
+    printf("✓ Large Size test PASSED! Signal counter: %lu (expected: %lu)\n", signalValue,
+           expectedSignals);
+    printf("  Data verification: First 1KB: %s, Last 1KB: %s\n", firstOk ? "OK" : "FAILED",
+           lastOk ? "OK" : "FAILED");
   }
 
   // Cleanup Test 5
@@ -714,9 +718,9 @@ void ConcurrentPutSignalThread() {
 
   // Check if we should skip large transfer tests in P2P mode
   const char* disableP2P = std::getenv("MORI_DISABLE_P2P");
-  bool isP2PMode = !(disableP2P != nullptr && 
+  bool isP2PMode = !(disableP2P != nullptr &&
                      (std::string(disableP2P) == "ON" || std::string(disableP2P) == "1"));
-  
+
   if (isP2PMode) {
     if (myPe == 1) {
       printf("⊘ SKIPPED (P2P mode with large data transfer)\n");
@@ -727,11 +731,12 @@ void ConcurrentPutSignalThread() {
     }
   } else {
     constexpr size_t sizePerThreadLarge = 5 * 1024 * 1024;  // 5MB per thread
-    size_t totalSizeLarge = threadNum * blockNum * sizePerThreadLarge;  // ~1.88GB total (384 threads × 5MB)
-  
+    size_t totalSizeLarge =
+        threadNum * blockNum * sizePerThreadLarge;  // ~1.88GB total (384 threads × 5MB)
+
     void* dataBuff6 = ShmemMalloc(totalSizeLarge);
-    HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(dataBuff6), myPe, 
-                                    totalSizeLarge / sizeof(uint32_t)));
+    HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(dataBuff6), myPe,
+                                   totalSizeLarge / sizeof(uint32_t)));
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
     SymmMemObjPtr dataBuffObj6 = ShmemQueryMemObjPtr(dataBuff6);
@@ -747,8 +752,8 @@ void ConcurrentPutSignalThread() {
     MPI_Barrier(MPI_COMM_WORLD);
 
     if (myPe == 1) {
-      printf("Running very large size test: %d threads × %d MB = %.2f GB total\n", 
-             threadNum * blockNum, (int)(sizePerThreadLarge / (1024 * 1024)), 
+      printf("Running very large size test: %d threads × %d MB = %.2f GB total\n",
+             threadNum * blockNum, (int)(sizePerThreadLarge / (1024 * 1024)),
              totalSizeLarge / (1024.0 * 1024.0 * 1024.0));
     }
     ConcurrentPutSignalThreadKernelVeryLargeSize<<<blockNum, threadNum>>>(
@@ -760,10 +765,9 @@ void ConcurrentPutSignalThread() {
     if (myPe == 1) {
       size_t sampleSize = 1024 / sizeof(uint32_t);
       std::vector<uint32_t> hostDataSample(sampleSize);
-      
+
       // Check first 1KB
-      HIP_RUNTIME_CHECK(hipMemcpy(hostDataSample.data(), dataBuff6, 
-                                   1024, hipMemcpyDeviceToHost));
+      HIP_RUNTIME_CHECK(hipMemcpy(hostDataSample.data(), dataBuff6, 1024, hipMemcpyDeviceToHost));
       bool firstOk = true;
       for (size_t i = 0; i < sampleSize; i++) {
         if (hostDataSample[i] != 0) {
@@ -771,11 +775,11 @@ void ConcurrentPutSignalThread() {
           break;
         }
       }
-      
+
       // Check middle 1KB
-      HIP_RUNTIME_CHECK(hipMemcpy(hostDataSample.data(), 
-                                   reinterpret_cast<uint8_t*>(dataBuff6) + totalSizeLarge / 2, 
-                                   1024, hipMemcpyDeviceToHost));
+      HIP_RUNTIME_CHECK(hipMemcpy(hostDataSample.data(),
+                                  reinterpret_cast<uint8_t*>(dataBuff6) + totalSizeLarge / 2, 1024,
+                                  hipMemcpyDeviceToHost));
       bool midOk = true;
       for (size_t i = 0; i < sampleSize; i++) {
         if (hostDataSample[i] != 0) {
@@ -783,11 +787,11 @@ void ConcurrentPutSignalThread() {
           break;
         }
       }
-      
+
       // Check last 1KB
-      HIP_RUNTIME_CHECK(hipMemcpy(hostDataSample.data(), 
-                                   reinterpret_cast<uint8_t*>(dataBuff6) + totalSizeLarge - 1024, 
-                                   1024, hipMemcpyDeviceToHost));
+      HIP_RUNTIME_CHECK(hipMemcpy(hostDataSample.data(),
+                                  reinterpret_cast<uint8_t*>(dataBuff6) + totalSizeLarge - 1024,
+                                  1024, hipMemcpyDeviceToHost));
       bool lastOk = true;
       for (size_t i = 0; i < sampleSize; i++) {
         if (hostDataSample[i] != 0) {
@@ -795,14 +799,17 @@ void ConcurrentPutSignalThread() {
           break;
         }
       }
-      
+
       uint64_t signalValue;
-      HIP_RUNTIME_CHECK(hipMemcpy(&signalValue, signalBuff6, sizeof(uint64_t), hipMemcpyDeviceToHost));
+      HIP_RUNTIME_CHECK(
+          hipMemcpy(&signalValue, signalBuff6, sizeof(uint64_t), hipMemcpyDeviceToHost));
       uint64_t expectedSignals = (threadNum * blockNum + warpSize - 1) / warpSize;
-      
-      printf("✓ Very Large Size (5MB/thread, %.2f GB total) test PASSED! Signal counter: %lu (expected: %lu)\n", 
-             totalSizeLarge / (1024.0 * 1024.0 * 1024.0), signalValue, expectedSignals);
-      printf("  Data verification: First 1KB: %s, Middle 1KB: %s, Last 1KB: %s\n", 
+
+      printf(
+          "✓ Very Large Size (5MB/thread, %.2f GB total) test PASSED! Signal counter: %lu "
+          "(expected: %lu)\n",
+          totalSizeLarge / (1024.0 * 1024.0 * 1024.0), signalValue, expectedSignals);
+      printf("  Data verification: First 1KB: %s, Middle 1KB: %s, Last 1KB: %s\n",
              firstOk ? "OK" : "FAILED", midOk ? "OK" : "FAILED", lastOk ? "OK" : "FAILED");
     }
 
@@ -831,11 +838,12 @@ void ConcurrentPutSignalThread() {
     }
   } else {
     constexpr size_t sizePerThreadLarge = 5 * 1024 * 1024;  // 5MB per thread
-    size_t totalSizeLarge = threadNum * blockNum * sizePerThreadLarge;  // ~1.88GB total (384 threads × 5MB)
-    
+    size_t totalSizeLarge =
+        threadNum * blockNum * sizePerThreadLarge;  // ~1.88GB total (384 threads × 5MB)
+
     void* dataBuff7 = ShmemMalloc(totalSizeLarge);
-    HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(dataBuff7), myPe, 
-                                    totalSizeLarge / sizeof(uint32_t)));
+    HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(dataBuff7), myPe,
+                                   totalSizeLarge / sizeof(uint32_t)));
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
     void* signalBuff7 = ShmemMalloc(sizeof(uint64_t));
@@ -845,7 +853,7 @@ void ConcurrentPutSignalThread() {
     MPI_Barrier(MPI_COMM_WORLD);
 
     if (myPe == 1) {
-      printf("Running pure address very large size test: %d threads × %d MB = %.2f GB total\n", 
+      printf("Running pure address very large size test: %d threads × %d MB = %.2f GB total\n",
              threadNum * blockNum, (int)(sizePerThreadLarge / (1024 * 1024)),
              totalSizeLarge / (1024.0 * 1024.0 * 1024.0));
     }
@@ -859,10 +867,9 @@ void ConcurrentPutSignalThread() {
     if (myPe == 1) {
       size_t sampleSize = 1024 / sizeof(uint32_t);
       std::vector<uint32_t> hostDataSample(sampleSize);
-      
+
       // Check first 1KB
-      HIP_RUNTIME_CHECK(hipMemcpy(hostDataSample.data(), dataBuff7, 
-                                   1024, hipMemcpyDeviceToHost));
+      HIP_RUNTIME_CHECK(hipMemcpy(hostDataSample.data(), dataBuff7, 1024, hipMemcpyDeviceToHost));
       bool firstOk = true;
       for (size_t i = 0; i < sampleSize; i++) {
         if (hostDataSample[i] != 0) {
@@ -870,11 +877,11 @@ void ConcurrentPutSignalThread() {
           break;
         }
       }
-      
+
       // Check middle 1KB
-      HIP_RUNTIME_CHECK(hipMemcpy(hostDataSample.data(), 
-                                   reinterpret_cast<uint8_t*>(dataBuff7) + totalSizeLarge / 2, 
-                                   1024, hipMemcpyDeviceToHost));
+      HIP_RUNTIME_CHECK(hipMemcpy(hostDataSample.data(),
+                                  reinterpret_cast<uint8_t*>(dataBuff7) + totalSizeLarge / 2, 1024,
+                                  hipMemcpyDeviceToHost));
       bool midOk = true;
       for (size_t i = 0; i < sampleSize; i++) {
         if (hostDataSample[i] != 0) {
@@ -882,11 +889,11 @@ void ConcurrentPutSignalThread() {
           break;
         }
       }
-      
+
       // Check last 1KB
-      HIP_RUNTIME_CHECK(hipMemcpy(hostDataSample.data(), 
-                                   reinterpret_cast<uint8_t*>(dataBuff7) + totalSizeLarge - 1024, 
-                                   1024, hipMemcpyDeviceToHost));
+      HIP_RUNTIME_CHECK(hipMemcpy(hostDataSample.data(),
+                                  reinterpret_cast<uint8_t*>(dataBuff7) + totalSizeLarge - 1024,
+                                  1024, hipMemcpyDeviceToHost));
       bool lastOk = true;
       for (size_t i = 0; i < sampleSize; i++) {
         if (hostDataSample[i] != 0) {
@@ -894,14 +901,17 @@ void ConcurrentPutSignalThread() {
           break;
         }
       }
-      
+
       uint64_t signalValue;
-      HIP_RUNTIME_CHECK(hipMemcpy(&signalValue, signalBuff7, sizeof(uint64_t), hipMemcpyDeviceToHost));
+      HIP_RUNTIME_CHECK(
+          hipMemcpy(&signalValue, signalBuff7, sizeof(uint64_t), hipMemcpyDeviceToHost));
       uint64_t expectedSignals = (threadNum * blockNum + warpSize - 1) / warpSize;
-      
-      printf("✓ Pure Address Very Large Size (5MB/thread, %.2f GB total) test PASSED! Signal counter: %lu (expected: %lu)\n", 
-             totalSizeLarge / (1024.0 * 1024.0 * 1024.0), signalValue, expectedSignals);
-      printf("  Data verification: First 1KB: %s, Middle 1KB: %s, Last 1KB: %s\n", 
+
+      printf(
+          "✓ Pure Address Very Large Size (5MB/thread, %.2f GB total) test PASSED! Signal counter: "
+          "%lu (expected: %lu)\n",
+          totalSizeLarge / (1024.0 * 1024.0 * 1024.0), signalValue, expectedSignals);
+      printf("  Data verification: First 1KB: %s, Middle 1KB: %s, Last 1KB: %s\n",
              firstOk ? "OK" : "FAILED", midOk ? "OK" : "FAILED", lastOk ? "OK" : "FAILED");
     }
 

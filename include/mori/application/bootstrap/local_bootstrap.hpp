@@ -21,8 +21,8 @@
 // SOFTWARE.
 #pragma once
 
-#include <vector>
 #include <string>
+#include <vector>
 
 #include "mori/application/bootstrap/base_bootstrap.hpp"
 
@@ -31,13 +31,13 @@ namespace application {
 
 /**
  * @brief Bootstrap network for local process communication using Unix domain sockets
- * 
+ *
  * This implementation uses Unix domain sockets with SCM_RIGHTS for proper
  * file descriptor passing between processes on the same host.
- * 
+ *
  * IMPORTANT: This only works for processes on the same host. For cross-host
  * communication, use MpiBootstrapNetwork or TorchBootstrapNetwork.
- * 
+ *
  * Use cases:
  * - VMM shareable handle (file descriptor) exchange
  * - Any scenario requiring proper FD passing (cannot use MPI/network for FDs)
@@ -50,8 +50,8 @@ class LocalBootstrapNetwork : public BootstrapNetwork {
    * @param worldSize Total number of processes
    * @param socketBasePath Base path for Unix domain sockets (default: /tmp/mori_local_bootstrap_)
    */
-  LocalBootstrapNetwork(int rank, int worldSize, 
-                       const std::string& socketBasePath = "/tmp/mori_local_bootstrap_");
+  LocalBootstrapNetwork(int rank, int worldSize,
+                        const std::string& socketBasePath = "/tmp/mori_local_bootstrap_");
   ~LocalBootstrapNetwork();
 
   void Initialize() override;
@@ -63,24 +63,24 @@ class LocalBootstrapNetwork : public BootstrapNetwork {
    * For FD exchange, use ExchangeFileDescriptors() instead.
    */
   void Allgather(void* sendbuf, void* recvbuf, size_t sendcount) override;
-  
+
   /**
    * @brief AllToAll for regular data (not file descriptors)
    */
   void AllToAll(void* sendbuf, void* recvbuf, size_t sendcount) override;
-  
+
   void Barrier() override;
 
   /**
    * @brief Exchange file descriptors between all processes
-   * 
+   *
    * This is the core functionality of LocalBootstrapNetwork.
    * Uses Unix domain socket + SCM_RIGHTS for proper FD passing.
-   * 
+   *
    * @param localFds Vector of local file descriptors to send
    * @param allFds Output 2D vector to store all FDs [pe][fd_index]
    * @return true on success, false on failure
-   * 
+   *
    * Example:
    *   std::vector<int> myFds = {fd1, fd2, fd3};
    *   std::vector<std::vector<int>> allFds;
