@@ -80,7 +80,8 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
   hipMemcpy(dB, hB, size_B, hipMemcpyHostToDevice);
   hipMemcpy(dC, hC, size_C, hipMemcpyHostToDevice);
   
-  float total_ms = 0;
+  float total_c = 0;
+  float total_g = 0;
   // 测量                                                                                                                                                                                                              
   hipEvent_t start_g, stop_g;                                                                                                                                                                                              
   hipEventCreate(&start_g);                                                                                                                                                                                              
@@ -138,19 +139,26 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
   for(int i=0;i<10;i++){
     hipEventRecord(start_c,stream_ccl);
     OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream_ccl>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
+    hipEventRecord(start_g, gstream);
     hipblasGemmEx(handle, HIPBLAS_OP_N, HIPBLAS_OP_N,m, n, k,&alpha,dA, HIPBLAS_R_16F, m,dB, HIPBLAS_R_16F, k,&beta,dC, HIPBLAS_R_16F, m,HIPBLAS_COMPUTE_32F,  // 计算精度为FP32
                      HIPBLAS_GEMM_DEFAULT);
-    hipStreamSynchronize(gstream);
+    hipEventRecord(stop_g, gstream);
     hipEventRecord(stop_c,stream_ccl);
     hipStreamSynchronize(stream_ccl);
-    
+    hipStreamSynchronize(gstream);
 
-    float ms;                                                                                                                                                                                                        
-    hipEventElapsedTime(&ms, start_c, stop_c);                                                                                                                                                                           
-    total_ms += ms;   
+    float msc;                                                                                                                                                                                                        
+    hipEventElapsedTime(&msc, start_c, stop_c);                                                                                                                                                                           
+    total_c += msc;
+
+    float msg;                                                                                                                                                                                                        
+    hipEventElapsedTime(&msg, start_g, stop_g);                                                                                                                                                                           
+    total_g += msg;    
+
   }
   if(myPe == 0){
-    printf("============ avg time :%0.9f ============= \n", total_ms/10.0);
+    printf("============ avg coll time :%0.9f ============= \n", total_c/10.0);
+    printf("============ avg gemm time :%0.9f ============= \n", total_g/10.0);
   }
 
   return total_ms;
