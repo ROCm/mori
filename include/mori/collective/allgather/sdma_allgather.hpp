@@ -82,9 +82,13 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
   
   float total_ms = 0;
   // 测量                                                                                                                                                                                                              
-  hipEvent_t start, stop;                                                                                                                                                                                              
-  hipEventCreate(&start);                                                                                                                                                                                              
-  hipEventCreate(&stop);   
+  hipEvent_t start_g, stop_g;                                                                                                                                                                                              
+  hipEventCreate(&start_g);                                                                                                                                                                                              
+  hipEventCreate(&stop_g);   
+
+  hipEvent_t start_c, stop_c;                                                                                                                                                                                              
+  hipEventCreate(&start_c);                                                                                                                                                                                              
+  hipEventCreate(&stop_c);   
 
   int myPe =  shmem::ShmemMyPe();
   int npes =  shmem::ShmemNPes();
@@ -132,17 +136,17 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
   MPI_Barrier(MPI_COMM_WORLD);
   //double start = MPI_Wtime();
   for(int i=0;i<10;i++){
-    hipEventRecord(start,stream_ccl);
+    hipEventRecord(start_c,stream_ccl);
     OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream_ccl>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
-    //hipblasGemmEx(handle, HIPBLAS_OP_N, HIPBLAS_OP_N,m, n, k,&alpha,dA, HIPBLAS_R_16F, m,dB, HIPBLAS_R_16F, k,&beta,dC, HIPBLAS_R_16F, m,HIPBLAS_COMPUTE_32F,  // 计算精度为FP32
-    //                 HIPBLAS_GEMM_DEFAULT);
-    //hipStreamSynchronize(gstream);
-    hipEventRecord(stop,stream_ccl);
+    hipblasGemmEx(handle, HIPBLAS_OP_N, HIPBLAS_OP_N,m, n, k,&alpha,dA, HIPBLAS_R_16F, m,dB, HIPBLAS_R_16F, k,&beta,dC, HIPBLAS_R_16F, m,HIPBLAS_COMPUTE_32F,  // 计算精度为FP32
+                     HIPBLAS_GEMM_DEFAULT);
+    hipStreamSynchronize(gstream);
+    hipEventRecord(stop_c,stream_ccl);
     hipStreamSynchronize(stream_ccl);
     
 
     float ms;                                                                                                                                                                                                        
-    hipEventElapsedTime(&ms, start, stop);                                                                                                                                                                           
+    hipEventElapsedTime(&ms, start_c, stop_c);                                                                                                                                                                           
     total_ms += ms;   
   }
   if(myPe == 0){
