@@ -97,6 +97,12 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
   hipEventCreate(&stop); 
 
 
+  hipEvent_t start_s, mid, stop_s;                                                                                                                                                                                              
+  hipEventCreate(&start_s);                                                                                                                                                                                              
+  hipEventCreate(&stop_s);
+  hipEventCreate(&mid); 
+
+
   int myPe =  shmem::ShmemMyPe();
   int npes =  shmem::ShmemNPes();
   size_t dtype_size = sizeof(T);
@@ -133,6 +139,44 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
                     HIPBLAS_GEMM_DEFAULT);                                                                                                                                                                              
   }                                                                                                                                                                                                                    
   hipStreamSynchronize(gstream);
+
+  float tg = 0;
+  float tc = 0;
+  float tt = 0;
+  hipblasHandle_t handle_d;
+  hipblasCreate(&handle_d); 
+  for(int i=0;i<10;i++){
+    hipEventRecord(start_s);
+    hipblasGemmEx(handle_d,
+                HIPBLAS_OP_N, HIPBLAS_OP_N,
+                m, n, k,
+                &alpha,
+                dA, HIPBLAS_R_16F, m,
+                dB, HIPBLAS_R_16F, k,
+                &beta,                                                                                                                                                                                              
+                dC, HIPBLAS_R_16F, m,                                                                                                                                                                               
+                HIPBLAS_COMPUTE_32F,  // 计算精度为FP32                                                                                                                                                                   
+                HIPBLAS_GEMM_DEFAULT);
+    hipEventRecord(mid);  
+    OneShotAllGatherSdmaKernel<T><<<1, 512>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
+    hipEventRecord(stop_s);
+    hipDeviceSynchronize();
+
+    float mssc;
+    float mssg;
+    float msst;                                                                                                                                                                                                        
+    hipEventElapsedTime(&mssg, start_s, mid);
+    hipEventElapsedTime(&mssc, mid,  stop_s);
+    hipEventElapsedTime(&msst, start_s, stop_s);
+    tg += mssg;
+    tc += mssc;
+    tt += msst; 
+  }
+  if(myPe == 0){
+    printf("============ avg sequential gemm time  :%0.9f    ms============= \n", tg/10.0);
+    printf("============ avg sequential coll time  :%0.9f    ms============= \n", tc/10.0);
+    printf("============ avg sequential total time :%0.9f    ms============= \n", tt/10.0);
+  }
 
   MPI_Barrier(MPI_COMM_WORLD);  
   hipStreamSynchronize(stream_ccl); //warm up
