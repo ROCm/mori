@@ -30,14 +30,14 @@
 
 namespace mori {
 namespace collective {
-
+#if 0
 // Implementation of ShmemDeleter::operator()
 void ShmemDeleter::operator()(void* ptr) const {
     if (ptr) {
         shmem::ShmemFree(ptr);
     }
 }
-
+#endif
 // Constructor implementation - delegating version
 template <typename T>
 All2allSdma<T>::All2allSdma(int myPe, int npes, size_t transit_buffer_size)

@@ -21,8 +21,8 @@
 // SOFTWARE.
 
 #include "mori/collective/allgather/oneshot_allgather_sdma_class.hpp"
-#include "mori/collective/allgather/oneshot_allgather_sdma_kernel.hpp"
-#include "mori/collective/allgather/oneshot_allgather_sdma_async_kernel.hpp"
+#include "mori/collective/allgather/oneshot_sdma_kernel.hpp"
+#include "mori/collective/allgather/oneshot_sdma_async_kernel.hpp"
 #include "mori/shmem/shmem.hpp"
 #include <stdexcept>
 #include <cstring>
@@ -30,14 +30,14 @@
 
 namespace mori {
 namespace collective {
-
+#if 0
 // Implementation of ShmemDeleter::operator()
 void ShmemDeleter::operator()(void* ptr) const {
     if (ptr) {
         shmem::ShmemFree(ptr);
     }
 }
-
+#endif
 // Constructor implementation - delegating version
 template <typename T>
 AllgatherSdma<T>::AllgatherSdma(int myPe, int npes, size_t transit_buffer_size)
@@ -148,7 +148,7 @@ bool AllgatherSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
     try {
         // Step 1: Copy input data to input transit buffer
         printf("PE %d: Starting async AllGATHER (PUT phase)\n", myPe_);
-        copy_input_to_transit(input, total_count * npes_, stream);
+        copy_input_to_transit(input, total_count, stream);
 
         // Step 2: Reset flags
         resetFlags();
@@ -164,7 +164,7 @@ bool AllgatherSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
         printf("  Grid size: %d, Block size: %d\n", grid_size, block_size);
 
         // Launch the kernel - this runs asynchronously
-        OneShotAllgatherSdmaAsyncPutKernel<T><<<1, 64, 0, stream>>>(
+        OneShotAllGatherSdmaAsyncPutKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
             input_transit_buffer_obj_,
             output_transit_buffer_obj_,
@@ -200,7 +200,7 @@ double AllgatherSdma<T>::wait_async(hipStream_t stream) {
         // Use provided stream or the one from start_async
         hipStream_t wait_stream = (stream != nullptr) ? stream : async_stream_;
 
-        OneShotAllgatherSdmaAsyncWaitKernel<<<1, 64>>>(myPe_, npes_, output_transit_buffer_obj_, flagsObj_);
+        OneShotAllGatherSdmaAsyncWaitKernel<<<1, 64>>>(myPe_, npes_, output_transit_buffer_obj_, flagsObj_);
 
         // Step 1: Synchronize to ensure PUT kernel is completed
         printf("PE %d: Synchronizing to ensure PUT kernel completion\n", myPe_);
@@ -413,7 +413,7 @@ double AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hip
     hipError_t sync_err = hipSuccess;
     try {
         // Step 1: Copy input data to input transit buffer
-        copy_input_to_transit(input, total_count * npes_, stream);
+        copy_input_to_transit(input, total_count, stream);
 
         // Step 2: Reset flags
         resetFlags();
@@ -424,7 +424,7 @@ double AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hip
         if (grid_size < 1) grid_size = 1;
         if (grid_size > 65535) grid_size = 65535;
 
-        OneShotAllgatherSdmaKernel<T><<<1, 64, 0, stream>>>(
+        OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
             input_transit_buffer_obj_,
             output_transit_buffer_obj_,

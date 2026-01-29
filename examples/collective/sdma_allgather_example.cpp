@@ -1,3 +1,4 @@
+root@sdma-test:~/fizhang/mori# cat examples/collective/sdma_allgather_example.cpp
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 //
 // MIT License
@@ -54,44 +55,33 @@ using namespace mori::collective;
  *
  * Each PE sends different data to different target PEs, facilitating route correctness verification
  * Format: value = (source_pe + 1) * 1000 + dest_pe
+ * This creates unique but consistent data for each PE
  *
  * For 2 PEs case:
- * PE 0 sends: to PE 0: 1000, to PE 1: 1001
- * PE 1 sends: to PE 0: 2000, to PE 1: 2001
+ * PE 0 data: 1000, 1000, 1000, ...
+ * PE 1 data: 2000, 2000, 2000, ...
  */
-void initializeAllgatherTestData(uint32_t* hostData, int myPe, int npes,
-                               size_t elemsPerPe, size_t totalElems) {
-    // Clear data
-    std::fill(hostData, hostData + totalElems, 0);
+void initializeAllgatherTestData(uint32_t* hostData, int myPe, size_t elemsPerPe) {
+    // Generate unique value for this PE
+    uint32_t value = static_cast<uint32_t>((myPe + 1) * 1000);
 
-    // Each PE prepares different data for each target PE
-    for (int destPe = 0; destPe < npes; destPe++) {
-        // Generate unique value: identifies source PE and target PE
-        uint32_t value = static_cast<uint32_t>((myPe + 1) * 1000 + destPe);
-
-        // Fill entire data block
-        for (size_t i = 0; i < elemsPerPe; i++) {
-            size_t idx = destPe * elemsPerPe + i;
-            hostData[idx] = value;
-        }
-    }
+    // Fill entire data block with same value
+    std::fill(hostData, hostData + elemsPerPe, value);
 }
 
 /**
  * @brief Verify Allgather results
  *
- * @param resultData Result data pointer
+ * @param resultData Result data pointer (contains all chunks)
  * @param myPe Current PE ID
  * @param npes Total number of PEs
  * @param elemsPerPe Number of elements per PE
- * @param totalElems Total number of elements
  * @param verbose Whether to output detailed error information
  * @return true Verification passed
  * @return false Verification failed
  */
 bool verifyAllgatherResult(const uint32_t* resultData, int myPe, int npes,
-                         size_t elemsPerPe, size_t totalElems,
-                         bool verbose = true) {
+                         size_t elemsPerPe, bool verbose = true) {
     bool all_correct = true;
     int error_count = 0;
     const int max_errors_to_show = 5;
@@ -100,15 +90,16 @@ bool verifyAllgatherResult(const uint32_t* resultData, int myPe, int npes,
         printf("\nPE %d: Verifying Allgather results...\n", myPe);
     }
 
-    // Verify each data block
+    // Verify each PE's data chunk
     for (int sourcePe = 0; sourcePe < npes; sourcePe++) {
-        // Data that should be received from source PE sourcePe
-        uint32_t expected_value = static_cast<uint32_t>((sourcePe + 1) * 1000 + myPe);
+        // Data that should be received from source PE
+        // Each PE sends the same data to everyone
+        uint32_t expected_value = static_cast<uint32_t>((sourcePe + 1) * 1000 + 000);
 
         bool chunk_correct = true;
         int errors_in_chunk = 0;
 
-        // Check first few elements
+        // Check first few elements of this chunk
         size_t check_count = std::min(elemsPerPe, (size_t)4);
         for (size_t i = 0; i < check_count; i++) {
             size_t idx = sourcePe * elemsPerPe + i;
@@ -124,9 +115,13 @@ bool verifyAllgatherResult(const uint32_t* resultData, int myPe, int npes,
                            sourcePe, i, expected_value, actual_value);
 
                     // Try to decode received value
-                    int got_source = actual_value / 1000 - 1;
-                    int got_dest = actual_value % 1000;
-                    printf("    Decoded as: source=PE%d, dest=PE%d\n", got_source, got_dest);
+                    if (actual_value >= 1000) {
+                        int got_source = actual_value / 1000 - 1;
+                        int remainder = actual_value % 1000;
+                        printf("    Decoded as: source=PE%d, remainder=%d\n", got_source, remainder);
+                    } else {
+                        printf("    Value too small to decode\n");
+                    }
                 }
             }
         }
@@ -163,7 +158,7 @@ bool verifyAllgatherResult(const uint32_t* resultData, int myPe, int npes,
     if (verbose) {
         if (all_correct) {
             printf("PE %d: Allgather verification PASSED! All %zu elements correct.\n",
-                   myPe, totalElems);
+                   myPe, elemsPerPe * npes);
         } else {
             printf("PE %d: Allgather verification FAILED!\n", myPe);
             if (error_count > max_errors_to_show) {
@@ -179,21 +174,39 @@ bool verifyAllgatherResult(const uint32_t* resultData, int myPe, int npes,
  * @brief Print data pattern information
  */
 void printDataPatternInfo(int myPe, int npes) {
-    printf("\nPE %d: Data Pattern Explanation:\n", myPe);
-    printf("  Format: value = (source_pe + 1) * 1000 + dest_pe\n");
-    printf("  Example values:\n");
+    printf("\nPE %d: Allgather Data Pattern Explanation:\n", myPe);
+    printf("  Each PE sends the same data to all other PEs\n");
+    printf("  Format: value = (source_pe + 1) * 1000 + 000\n");
+    printf("  Example data values:\n");
 
     for (int src = 0; src < npes; src++) {
-        for (int dst = 0; dst < npes; dst++) {
-            uint32_t value = static_cast<uint32_t>((src + 1) * 1000 + dst);
-            printf("    PE%d -> PE%d: %u\n", src, dst, value);
-        }
+        uint32_t value = static_cast<uint32_t>((src + 1) * 1000 + 000);
+        printf("    PE %d data: %u (sent to all PEs)\n", src, value);
     }
 
-    printf("\n  After Allgather, PE %d should receive:\n", myPe);
+    printf("\n  After Allgather, every PE will have:\n");
     for (int src = 0; src < npes; src++) {
-        uint32_t expected = static_cast<uint32_t>((src + 1) * 1000 + myPe);
+        uint32_t expected = static_cast<uint32_t>((src + 1) * 1000 + 000);
         printf("    From PE %d: %u\n", src, expected);
+    }
+    printf("  All PEs will have identical output buffers\n");
+}
+
+/**
+ * @brief Display input data for debugging
+ */
+void displayInputData(const uint32_t* hostData, int myPe, size_t elemsPerPe) {
+    printf("\nPE %d: My Input Data (first 4 elements):\n", myPe);
+    for (size_t i = 0; i < 4 && i < elemsPerPe; i++) {
+        printf("  [%zu] = %u\n", i, hostData[i]);
+    }
+
+    // Decode the value
+    if (elemsPerPe > 0) {
+        uint32_t value = hostData[0];
+        int src_pe = value / 1000 - 1;
+        int remainder = value % 1000;
+        printf("  Decoded: PE %d data, remainder=%d\n", src_pe, remainder);
     }
 }
 
@@ -217,38 +230,31 @@ void testOneShotSdmaAllgather() {
 
   // Allocate device memory
   uint32_t* outPutBuff = nullptr;
-  CHECK_HIP(hipMalloc(&outPutBuff, totalBytes));
+  CHECK_HIP(hipMalloc(&outPutBuff, totalBytes));  // Output: receives all chunks
 
+  // For allgather, input buffer only needs to hold this PE's data
   uint32_t* inPutBuff = nullptr;
-  CHECK_HIP(hipMalloc(&inPutBuff, totalBytes));
+  CHECK_HIP(hipMalloc(&inPutBuff, bytesPerPe));  // Input: only local chunk
 
-  // Initialize test data: enhanced pattern, each PE sends different data to different target PEs
-  std::vector<uint32_t> hostData(elemsPerPe * npes, 0);
+  // Initialize test data: each PE has its own unique data
+  std::vector<uint32_t> hostData(elemsPerPe);
 
-  printf("PE %d: Initializing test data with enhanced pattern...\n", myPe);
-  initializeAllgatherTestData(hostData.data(), myPe, npes, elemsPerPe, elemsPerPe * npes);
+  printf("PE %d: Initializing my data...\n", myPe);
+  initializeAllgatherTestData(hostData.data(), myPe, elemsPerPe);
 
   // Print data pattern information (only on PE 0)
   if (myPe == 0) {
     printDataPatternInfo(myPe, npes);
   }
 
-  // Verify input data
-  printf("\nPE %d: Verifying input data pattern...\n", myPe);
-  for (int destPe = 0; destPe < npes; destPe++) {
-    uint32_t expected = static_cast<uint32_t>((myPe + 1) * 1000 + destPe);
-    uint32_t actual = hostData[destPe * elemsPerPe];  // First element of each block
+  // Display input data for debugging
+  displayInputData(hostData.data(), myPe, elemsPerPe);
 
-    if (actual == expected) {
-      printf("  Sending to PE %d: %u (correct)\n", destPe, actual);
-    } else {
-      printf("  ERROR: To PE %d: expected %u, got %u\n", destPe, expected, actual);
-    }
-  }
-
-  // Copy initialized data to device
-  CHECK_HIP(hipMemcpy(inPutBuff, hostData.data(), totalBytes, hipMemcpyHostToDevice));
+  // Copy my data to device
+  CHECK_HIP(hipMemcpy(inPutBuff, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
   CHECK_HIP(hipDeviceSynchronize());
+
+  printf("PE %d: My data copied to device successfully\n", myPe);
 
   hipStream_t stream;
   CHECK_HIP(hipStreamCreate(&stream));
@@ -256,18 +262,18 @@ void testOneShotSdmaAllgather() {
 
   if (myPe == 0) {
     printf("\n=== Starting Allgather Operation ===\n");
-    printf("Data size: %.2f MB per PE, %.2f MB total\n",
+    printf("Data size: %.2f MB per PE (input), %.2f MB total (output)\n",
            bytesPerPe / (1024.0 * 1024.0), totalBytes / (1024.0 * 1024.0));
-    printf("Using enhanced verification pattern\n\n");
+    printf("Each PE sends its unique data to all other PEs\n\n");
   }
   MPI_Barrier(MPI_COMM_WORLD);
 
   // Create AllgatherSdma object
   std::unique_ptr<AllgatherSdma<uint32_t>> allgather_obj;
 
-  // Allocate sufficiently large buffers
-  size_t input_buffer_size = totalBytes;  // Need to accommodate data layout for all PEs
-  size_t output_buffer_size = totalBytes; // Need to accommodate results for all PEs
+  // Allocate buffers - important: input buffer is smaller for allgather!
+  size_t input_buffer_size = bytesPerPe;       // Input: only local chunk
+  size_t output_buffer_size = totalBytes;      // Output: all chunks
 
   printf("PE %d: Creating AllgatherSdma...\n", myPe);
   allgather_obj = std::make_unique<AllgatherSdma<uint32_t>>(
@@ -278,12 +284,16 @@ void testOneShotSdmaAllgather() {
   // Execute Allgather operation
   printf("PE %d: Executing Allgather...\n", myPe);
   double execution_time = -1.0;
-  bool use_async = 0;  // Set to 1 for async mode, 0 for sync mode
+  bool use_async = 1;  // Set to 1 for async mode, 0 for sync mode
 
   if (use_async == 0) {
     // Synchronous mode (original logic)
     for (int i = 0; i < 10; i++) {
       execution_time = (*allgather_obj)(inPutBuff, outPutBuff, elemsPerPe, stream);
+      if (execution_time < 0) {
+        fprintf(stderr, "PE %d: Iteration %d failed\n", myPe, i);
+        break;
+      }
     }
   } else {
     // Asynchronous mode
@@ -348,9 +358,16 @@ void testOneShotSdmaAllgather() {
   CHECK_HIP(hipMemcpy(resultData.data(), outPutBuff, totalBytes, hipMemcpyDeviceToHost));
   CHECK_HIP(hipDeviceSynchronize());
 
+  // Display allgather results
+  printf("\nPE %d: Allgather Result Pattern:\n", myPe);
+  for (int pe = 0; pe < npes; pe++) {
+    uint32_t* chunkData = resultData.data() + pe * elemsPerPe;
+    printf("  Chunk from PE %d: [%u, %u, %u, %u, ...]\n",
+           pe, chunkData[0], chunkData[1], chunkData[2], chunkData[3]);
+  }
+
   // Verify Allgather results
-  bool success = verifyAllgatherResult(resultData.data(), myPe, npes,
-                                     elemsPerPe, elemsPerPe * npes, true);
+  bool success = verifyAllgatherResult(resultData.data(), myPe, npes, elemsPerPe, true);
 
   MPI_Barrier(MPI_COMM_WORLD);
 
@@ -413,3 +430,4 @@ int main(int argc, char* argv[]) {
   testOneShotSdmaAllgather();
   return 0;
 }
+root@sdma-test:~/fizhang/mori#

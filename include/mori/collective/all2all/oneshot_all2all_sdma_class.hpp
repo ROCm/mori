@@ -1,3 +1,25 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 #ifndef ONESHOT_ALL2ALL_SDMA_CLASS_HPP
 #define ONESHOT_ALL2ALL_SDMA_CLASS_HPP
 
@@ -9,13 +31,18 @@
 
 // Include necessary headers
 #include "mori/application/application.hpp"
+#include "mori/shmem/shmem.hpp"
 
 namespace mori {
 namespace collective {
 
-// 在头文件中完整定义ShmemDeleter
+// Complete inline definition of ShmemDeleter in header
 struct ShmemDeleter {
-    void operator()(void* ptr) const;
+    void operator()(void* ptr) const {
+        if (ptr) {
+            shmem::ShmemFree(ptr);
+        }
+    }
 };
 
 template <typename T>
@@ -24,17 +51,17 @@ private:
     int myPe_;
     int npes_;
     size_t dtype_size_;
-    
+
     // Flag memory
     application::SymmMemObjPtr flagsObj_;
     std::unique_ptr<uint64_t[], ShmemDeleter> flags_;
-    
+
     // Input transit buffer
     void* input_transit_buffer_;
     size_t input_transit_buffer_size_;
     application::SymmMemObjPtr input_transit_buffer_obj_;
     std::unique_ptr<void, ShmemDeleter> input_transit_buffer_ptr_;
-    
+
     // Output transit buffer
     void* output_transit_buffer_;
     size_t output_transit_buffer_size_;
@@ -55,13 +82,13 @@ private:
     All2allSdma& operator=(const All2allSdma&) = delete;
 
     // Internal methods
-    bool ensure_buffer_size(void*& buffer, 
+    bool ensure_buffer_size(void*& buffer,
                            std::unique_ptr<void, ShmemDeleter>& buffer_ptr,
                            size_t& current_size,
                            application::SymmMemObjPtr& buffer_obj,
                            size_t required_size,
                            const char* buffer_name);
-    
+
     void copy_input_to_transit(T* input, size_t total_count, hipStream_t stream);
     void copy_output_to_user(T* output, size_t total_count, hipStream_t stream);
 
@@ -73,7 +100,7 @@ public:
      * @param transit_buffer_size Transit buffer size in bytes (default 512MB), half for input and half for output
      */
     All2allSdma(int myPe, int npes, size_t transit_buffer_size = 512 * 1024 * 1024);
-    
+
     /**
      * @brief Constructor, specifying input and output transit buffer sizes separately
      * @param myPe Current PE ID
@@ -131,32 +158,32 @@ public:
      * @brief Gets flag symmetric memory object
      */
     application::SymmMemObjPtr getFlagsObj() const { return flagsObj_; }
-    
+
     /**
      * @brief Gets input transit buffer pointer
      */
     void* getInputTransitBuffer() const { return input_transit_buffer_; }
-    
+
     /**
      * @brief Gets input transit buffer size in bytes
      */
     size_t getInputTransitBufferSize() const { return input_transit_buffer_size_; }
-    
+
     /**
      * @brief Gets input transit buffer symmetric memory object
      */
     application::SymmMemObjPtr getInputTransitBufferObj() const { return input_transit_buffer_obj_; }
-    
+
     /**
      * @brief Gets output transit buffer pointer
      */
     void* getOutputTransitBuffer() const { return output_transit_buffer_; }
-    
+
     /**
      * @brief Gets output transit buffer size in bytes
      */
     size_t getOutputTransitBufferSize() const { return output_transit_buffer_size_; }
-    
+
     /**
      * @brief Gets output transit buffer symmetric memory object
      */
@@ -172,3 +199,4 @@ public:
 } // namespace mori
 
 #endif // ONESHOT_ALL2ALL_SDMA_CLASS_HPP
+root@sdma-test:~/fizhang/mori#
