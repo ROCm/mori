@@ -78,7 +78,8 @@ __device__ __forceinline__ bool UseCombineInternalFp8(const EpDispatchCombineCon
   if constexpr (!std::is_same_v<T, hip_bfloat16>) return false;
   const bool isV1 = (config.kernelType == KernelType::InterNodeV1) ||
                     (config.kernelType == KernelType::InterNodeV1LL);
-  return isV1 && (config.scaleDim > 0) && (config.scaleTypeSize == sizeof(float));
+  return config.enableInternalFp8Quant && isV1 && (config.scaleDim > 0) &&
+         (config.scaleTypeSize == sizeof(float));
 #else
   (void)config;
   return false;

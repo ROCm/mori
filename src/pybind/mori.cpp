@@ -340,7 +340,7 @@ void RegisterMoriOps(py::module_& m) {
 
   pybind11::class_<mori::moe::EpDispatchCombineConfig>(m, "EpDispatchCombineConfig")
       .def(pybind11::init<int, int, int, int, int, int, int, int, int, int, int, bool,
-                          mori::moe::KernelType, int, int, int>(),
+                          mori::moe::KernelType, int, int, int, bool>(),
            py::arg("rank") = 0, py::arg("world_size") = 0, py::arg("hidden_dim") = 0,
            py::arg("scale_dim") = 0, py::arg("scale_type_size") = 0,
            py::arg("max_token_type_size") = 0, py::arg("max_num_inp_token_per_rank") = 0,
@@ -348,7 +348,8 @@ void RegisterMoriOps(py::module_& m) {
            py::arg("warp_num_per_block") = 0, py::arg("block_num") = 0,
            py::arg("use_external_inp_buf") = true,
            py::arg("kernel_type") = mori::moe::KernelType::IntraNode, py::arg("gpu_per_node") = 8,
-           py::arg("rdma_block_num") = 0, py::arg("num_qp_per_pe") = 1)
+           py::arg("rdma_block_num") = 0, py::arg("num_qp_per_pe") = 1,
+           py::arg("enable_internal_fp8_quant") = true)
       .def_readwrite("rank", &mori::moe::EpDispatchCombineConfig::rank)
       .def_readwrite("world_size", &mori::moe::EpDispatchCombineConfig::worldSize)
       .def_readwrite("hidden_dim", &mori::moe::EpDispatchCombineConfig::hiddenDim)
@@ -365,7 +366,9 @@ void RegisterMoriOps(py::module_& m) {
       .def_readwrite("kernel_type", &mori::moe::EpDispatchCombineConfig::kernelType)
       .def_readwrite("gpu_per_node", &mori::moe::EpDispatchCombineConfig::gpuPerNode)
       .def_readwrite("rdma_block_num", &mori::moe::EpDispatchCombineConfig::rdmaBlockNum)
-      .def_readwrite("num_qp_per_pe", &mori::moe::EpDispatchCombineConfig::numQpPerPe);
+      .def_readwrite("num_qp_per_pe", &mori::moe::EpDispatchCombineConfig::numQpPerPe)
+      .def_readwrite("enable_internal_fp8_quant",
+                     &mori::moe::EpDispatchCombineConfig::enableInternalFp8Quant);
 
   DeclareEpDispatchCombineHandle(m);
 

@@ -50,6 +50,7 @@ class EpDispatchCombineConfig:
     gpu_per_node: int = 8
     rdma_block_num: int = 0
     num_qp_per_pe: int = 1
+    enable_internal_fp8_quant: bool = True
 
 
 def _cpp_dispatch_combine_factory(entity_name):
@@ -79,6 +80,7 @@ class EpDispatchCombineOp:
                 gpu_per_node=config.gpu_per_node,
                 rdma_block_num=config.rdma_block_num,
                 num_qp_per_pe=config.num_qp_per_pe,
+                enable_internal_fp8_quant=config.enable_internal_fp8_quant,
             )
         )
 
