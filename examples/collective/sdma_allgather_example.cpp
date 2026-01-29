@@ -1,4 +1,3 @@
-root@sdma-test:~/fizhang/mori# cat examples/collective/sdma_allgather_example.cpp
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 //
 // MIT License
