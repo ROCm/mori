@@ -418,106 +418,60 @@ void RegisterMoriIo(pybind11::module_& m) {
 }
 
 void RegisterMoriCcl(pybind11::module_& m) {
-  m.def("shmem_mpi_init",
-    []() -> int {
-      return mori::shmem::ShmemMpiInit(MPI_COMM_WORLD);
-    },
-    "Initialize SHMEM with MPI"
-  );
+    m.def("all2all_sdma",
+        [](int my_pe, int npes,
+           py::array_t<uint32_t> input_array,
+           py::array_t<uint32_t> output_array,
+           size_t count,
+           py::object stream_obj) -> double {
 
-  m.def("shmem_my_pe",
-    []() -> int {
-      return mori::shmem::ShmemMyPe();
-    },
-    "Get SHMEM PE rank"
-  );
+            // 检查数组维度
+            if (input_array.ndim() != 1) {
+                throw std::runtime_error("Input array must be 1-dimensional");
+            }
+            if (output_array.ndim() != 1) {
+                throw std::runtime_error("Output array must be 1-dimensional");
+            }
 
-  m.def("shmem_n_pes",
-    []() -> int {
-      return mori::shmem::ShmemNPes();
-    },
-    "Get number of SHMEM PEs"
-  );
+            // 检查数组大小
+            py::buffer_info input_info = input_array.request();
+            py::buffer_info output_info = output_array.request();
 
-  // 在现有的绑定后添加
+            if (static_cast<size_t>(input_info.size) != count) {
+                throw std::runtime_error("Input size doesn't match count parameter");
+            }
+            if (static_cast<size_t>(output_info.size) != count * npes) {
+                throw std::runtime_error("Output size doesn't match total elements");
+            }
 
-  
-  m.def("shmem_malloc",
-    [](size_t size) -> uintptr_t {
-      void* ptr = mori::shmem::ShmemMalloc(size);
-      return reinterpret_cast<uintptr_t>(ptr);
-    },
-    py::arg("size"),
-    "Allocate symmetric memory"
-  );
-  
-  m.def("shmem_free",
-    [](uintptr_t ptr) {
-      mori::shmem::ShmemFree(reinterpret_cast<void*>(ptr));
-    },
-    py::arg("ptr"),
-    "Free symmetric memory"
-  );
-    
-  // float32
-  m.def("all2all_sdma", 
-    [](uintptr_t input_ptr, uintptr_t output_ptr, size_t count, uintptr_t stream) {
-      return mori::collective::All2all_sdma<float>(
-          reinterpret_cast<float*>(input_ptr),
-          reinterpret_cast<float*>(output_ptr),
-          count,
-          reinterpret_cast<hipStream_t>(stream));
-    }, 
-    py::arg("input_ptr"), 
-    py::arg("output_ptr"), 
-    py::arg("count"), 
-    py::arg("stream") = 0,
-    "All2All SDMA operation for float32"
-  );
-  
-  // 正确的绑定代码（4个参数，使用uint32_t）
-  m.def("all2all_sdma_uint32", 
-    [](uintptr_t input_ptr, uintptr_t output_ptr, size_t count, uintptr_t stream) -> double {
-    printf("[PYBIND_SIMPLE] all2all_sdma_uint32 called\n");
-    printf("[PYBIND_SIMPLE] input=%p, output=%p, count=%zu, stream=%p\n",
-           reinterpret_cast<void*>(input_ptr),
-           reinterpret_cast<void*>(output_ptr),
-           count,
-           reinterpret_cast<void*>(stream));
-    
-    try {
-      // 直接调用C++函数
-      return mori::collective::All2all_sdma<uint32_t>(
-          reinterpret_cast<uint32_t*>(input_ptr),
-          reinterpret_cast<uint32_t*>(output_ptr),
-          count,
-          reinterpret_cast<hipStream_t>(stream));
-    } catch (const std::exception& e) {
-      printf("[PYBIND_ERROR] Exception: %s\n", e.what());
-      return -999.0;
-    }
-  }, 
-  py::arg("input_ptr"), 
-  py::arg("output_ptr"), 
-  py::arg("count"), 
-  py::arg("stream") = 0,
-  "All2All SDMA for uint32"
-  );
+            // 获取数据指针
+            uint32_t* input_ptr = static_cast<uint32_t*>(input_info.ptr);
+            uint32_t* output_ptr = static_cast<uint32_t*>(output_info.ptr);
 
-  // int32_t版本（如果需要）
-  m.def("all2all_sdma_int32", 
-    [](uintptr_t input_ptr, uintptr_t output_ptr, size_t count, uintptr_t stream) -> double {
-    return mori::collective::All2all_sdma<int32_t>(
-        reinterpret_cast<int32_t*>(input_ptr),
-        reinterpret_cast<int32_t*>(output_ptr),
-        count,
-        reinterpret_cast<hipStream_t>(stream));
-  }, 
-  py::arg("input_ptr"), 
-  py::arg("output_ptr"), 
-  py::arg("count"), 
-  py::arg("stream") = 0,
-  "All2All SDMA for int32"
+            // 处理HIP流参数（stream_obj可以是None）
+            hipStream_t stream = nullptr;
+
+            // 如果提供了stream对象，可以尝试转换
+            // 注意：这里需要根据你的实际需求处理stream转换
+            if (!stream_obj.is_none()) {
+                // 这里需要根据你的stream对象类型进行转换
+                // 例如，如果是Python的HIP stream对象
+                // stream = py::cast<hipStream_t>(stream_obj);
+            }
+
+            // 调用C++函数 - 现在传递4个参数
+            return mori::collective::All2all_sdma<uint32_t>(
+                input_ptr, output_ptr, count, stream);
+        },
+        // 参数说明，stream参数设为可选
+        py::arg("my_pe"),
+        py::arg("npes"),
+        py::arg("input"),
+        py::arg("output"),
+        py::arg("count"),
+        py::arg("stream") = py::none(),
+        // 函数文档
+        "Execute All2All SDMA operation"
   );
 
 
