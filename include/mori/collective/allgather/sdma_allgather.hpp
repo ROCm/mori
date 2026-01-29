@@ -36,7 +36,7 @@ namespace collective {
 
 template <typename T>
 double AllGather_sdma(T* input, T* output, size_t total_count,
-                                          hipStream_t stream_ccl) {
+                                          hipStream_t stream_ccl, int myPe) {
   int m = 8192, n = 8192, k = 8192;
 
   // 设置标量参数
@@ -141,13 +141,11 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
     float ms;                                                                                                                                                                                                        
     hipEventElapsedTime(&ms, start, stop);                                                                                                                                                                           
     total_ms += ms;   
-
+  }
+  if(myPe == 0){
+    printf("============ avg time :%0.9f ============= \n", total_ms/10.0);
   }
 
-  //double end = ;
-
-   
-  //shmem::ShmemFree(flags);
   return total_ms;
 }
 }

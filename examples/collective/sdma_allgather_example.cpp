@@ -132,7 +132,7 @@ void testOneShotSdmaAllGather() {
  // if(1)
   double local_duration = 0;
  //for(int i = 0; i<20; i++){
-   local_duration = AllGather_sdma<uint32_t>(inPutBuff, outPutBuff, elemsPerPe, stream_ccl);
+   local_duration = AllGather_sdma<uint32_t>(inPutBuff, outPutBuff, elemsPerPe, stream_ccl, myPe);
 //}  //OneShotAllGatharSdmaKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
 
 //  else{
