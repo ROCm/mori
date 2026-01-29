@@ -37,7 +37,8 @@ namespace collective {
 template <typename T>
 double AllGather_sdma(T* input, T* output, size_t total_count,
                                           hipStream_t stream_ccl) {
-  int m = 8192, n = 8192, k = 8192;
+  //int m = 8192, n = 8192, k = 8192;
+  int m = 16384, n = 16384, k = 16384;
 
   // 设置标量参数
   float alpha = 1.0f;
@@ -153,7 +154,7 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
   ///hipblasHandle_t handle_d;
   //hipblasCreate(&handle_d);
   hipStreamSynchronize(gstream); 
-  for(int i=0;i<10;i++){
+  for(int i=0;i<50;i++){
     hipEventRecord(start_s, gstream);
     hipblasGemmEx(handle,
                 HIPBLAS_OP_N, HIPBLAS_OP_N,
@@ -180,7 +181,7 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
 
   hipDeviceSynchronize();
   MPI_Barrier(MPI_COMM_WORLD);
-  for(int i=0; i<10; i++){
+  for(int i=0; i<50; i++){
     hipEventRecord(mid_2,stream_ccl); 
     OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream_ccl>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
     hipEventRecord(stop_s,stream_ccl);
@@ -200,7 +201,7 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
   hipDeviceSynchronize();
   MPI_Barrier(MPI_COMM_WORLD);
   //double start = MPI_Wtime();
-  for(int i=0;i<10;i++){
+  for(int i=0;i<50;i++){
 
     hipEventRecord(start);
     hipEventRecord(start_c,stream_ccl);
