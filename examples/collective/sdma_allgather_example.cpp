@@ -118,8 +118,8 @@ void testOneShotSdmaAllGather() {
   const int blockSize = 256;
   const int numBlocks = 1;
   bool use_async = 1;
-  hipStream_t stream;
-  HIP_RUNTIME_CHECK(hipStreamCreate(&stream));
+  hipStream_t stream_ccl;
+  HIP_RUNTIME_CHECK(hipStreamCreate(&stream_ccl));
 
   MPI_Barrier(MPI_COMM_WORLD);
   if (myPe == 0) {
@@ -132,7 +132,7 @@ void testOneShotSdmaAllGather() {
  // if(1)
   double local_duration = 0;
  for(int i = 0; i<20; i++){
-   local_duration = AllGather_sdma<uint32_t>(inPutBuff, outPutBuff, elemsPerPe, stream);
+   local_duration = AllGather_sdma<uint32_t>(inPutBuff, outPutBuff, elemsPerPe, stream_ccl);
 }  //OneShotAllGatharSdmaKernel<uint32_t><<<numBlocks, blockSize>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsBuffObj, elemsPerPe);
 
 //  else{
