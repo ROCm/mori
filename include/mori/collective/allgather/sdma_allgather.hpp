@@ -165,9 +165,8 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
                 dC, HIPBLAS_R_16F, m,                                                                                                                                                                               
                 HIPBLAS_COMPUTE_32F,  // 计算精度为FP32                                                                                                                                                                   
                 HIPBLAS_GEMM_DEFAULT);
-    hipEventRecord(mid_1);
+    hipEventRecord(mid_1, gstream);
     hipStreamSynchronize(gstream);
-
     //float mssc;
     float mssg;
     //float msst;                                                                                                                                                                                                        
