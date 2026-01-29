@@ -55,7 +55,7 @@ class EpDispatchCombineTestCase:
             data_type=dtype,
             rank=self.rank,
             world_size=self.world_size,
-            hidden_dim=7168,
+            hidden_dim=128,  # 7168,
             scale_dim=32,
             scale_type_size=4,
             max_num_inp_token_per_rank=(max_tokens + 63) // 64 * 64,
@@ -208,15 +208,24 @@ class EpDispatchCombineTestCase:
         # some functions such as randn and cat are not implemented for fp8
         all_rank_input = []
         for r in range(self.world_size):
-            all_rank_input.append(
-                torch.randn(
-                    num_token[r],
-                    self.config.hidden_dim,
-                    dtype=torch.float32,
-                    generator=self.rng,
-                    device=self.device,
-                ).to(self.config.data_type)
+            data_fp32 = torch.randn(
+                num_token[r],
+                self.config.hidden_dim,
+                dtype=torch.float32,
+                generator=self.rng,
+                device=self.device,
             )
+            if self.config.data_type is torch.float4_e2m1fn_x2:
+                data = torch.empty(
+                    (num_token[r], self.config.hidden_dim),
+                    dtype=torch.float4_e2m1fn_x2,
+                    device=self.device,
+                )
+                mori.ops.cast(data_fp32, data)
+                torch.cuda.synchronize()
+            else:
+                data = data_fp32.to(self.config.data_type)
+            all_rank_input.append(data)
 
         return (
             num_token,
@@ -319,9 +328,15 @@ class EpDispatchCombineTestCase:
         for i, src_token_id in enumerate(src_token_pos):
             src_pe = src_token_id // max_num_token_to_send_per_rank
             src_tok_id = src_token_id % max_num_token_to_send_per_rank
-            is_pass = torch.equal(
-                dispatch_output[i], all_rank_input[src_pe][src_tok_id]
-            )
+            if self.config.data_type is torch.float4_e2m1fn_x2:
+                is_pass = torch.equal(
+                    dispatch_output[i].view(torch.uint8),
+                    all_rank_input[src_pe][src_tok_id].view(torch.uint8),
+                )
+            else:
+                is_pass = torch.equal(
+                    dispatch_output[i], all_rank_input[src_pe][src_tok_id]
+                )
             if not is_pass:
                 print(
                     f"rank {self.rank} token {i} assert {is_pass} expected { all_rank_input[src_pe][src_tok_id]} got {dispatch_output[i]}"

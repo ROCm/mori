@@ -1269,6 +1269,8 @@ template __global__ void EpDispatchInterNodeV1Kernel<__hip_fp8_e4m3>(
     EpDispatchCombineArgs<__hip_fp8_e4m3> args);
 #endif
 template __global__ void EpDispatchInterNodeV1Kernel<float>(EpDispatchCombineArgs<float> args);
+template __global__ void EpDispatchInterNodeV1Kernel<mori_fp4x2_e2m1>(
+    EpDispatchCombineArgs<mori_fp4x2_e2m1> args);
 
 template __global__ void EpDispatchInterNodeV1KernelLowLatency<hip_bfloat16>(
     EpDispatchCombineArgs<hip_bfloat16> args);
@@ -1282,6 +1284,8 @@ template __global__ void EpDispatchInterNodeV1KernelLowLatency<__hip_fp8_e4m3>(
 #endif
 template __global__ void EpDispatchInterNodeV1KernelLowLatency<float>(
     EpDispatchCombineArgs<float> args);
+template __global__ void EpDispatchInterNodeV1KernelLowLatency<mori_fp4x2_e2m1>(
+    EpDispatchCombineArgs<mori_fp4x2_e2m1> args);
 
 template __global__ void EpCombineInterNodeV1Kernel<hip_bfloat16>(
     EpDispatchCombineArgs<hip_bfloat16> args);
@@ -1294,6 +1298,8 @@ template __global__ void EpCombineInterNodeV1Kernel<__hip_fp8_e4m3>(
     EpDispatchCombineArgs<__hip_fp8_e4m3> args);
 #endif
 template __global__ void EpCombineInterNodeV1Kernel<float>(EpDispatchCombineArgs<float> args);
+template __global__ void EpCombineInterNodeV1Kernel<mori_fp4x2_e2m1>(
+    EpDispatchCombineArgs<mori_fp4x2_e2m1> args);
 
 template __global__ void EpCombineInterNodeV1KernelLowLatency<hip_bfloat16>(
     EpDispatchCombineArgs<hip_bfloat16> args);
@@ -1307,6 +1313,8 @@ template __global__ void EpCombineInterNodeV1KernelLowLatency<__hip_fp8_e4m3>(
 #endif
 template __global__ void EpCombineInterNodeV1KernelLowLatency<float>(
     EpDispatchCombineArgs<float> args);
+template __global__ void EpCombineInterNodeV1KernelLowLatency<mori_fp4x2_e2m1>(
+    EpDispatchCombineArgs<mori_fp4x2_e2m1> args);
 
 template __global__ void EpCombineAll<hip_bfloat16>(EpDispatchCombineArgs<hip_bfloat16> args);
 #ifdef MORI_FP8_TYPE_FNUZ_ENABLED
@@ -1317,6 +1325,7 @@ template __global__ void EpCombineAll<__hip_fp8_e4m3_fnuz>(
 template __global__ void EpCombineAll<__hip_fp8_e4m3>(EpDispatchCombineArgs<__hip_fp8_e4m3> args);
 #endif
 template __global__ void EpCombineAll<float>(EpDispatchCombineArgs<float> args);
+template __global__ void EpCombineAll<mori_fp4x2_e2m1>(EpDispatchCombineArgs<mori_fp4x2_e2m1> args);
 
 template __global__ void EpDispatchCopyToStaging<hip_bfloat16>(
     EpDispatchCombineArgs<hip_bfloat16> args);
@@ -1329,6 +1338,8 @@ template __global__ void EpDispatchCopyToStaging<__hip_fp8_e4m3>(
     EpDispatchCombineArgs<__hip_fp8_e4m3> args);
 #endif
 template __global__ void EpDispatchCopyToStaging<float>(EpDispatchCombineArgs<float> args);
+template __global__ void EpDispatchCopyToStaging<mori_fp4x2_e2m1>(
+    EpDispatchCombineArgs<mori_fp4x2_e2m1> args);
 
 }  // namespace moe
 }  // namespace mori

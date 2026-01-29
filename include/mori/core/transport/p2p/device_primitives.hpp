@@ -22,10 +22,10 @@
 #pragma once
 
 #include <hip/hip_bfloat16.h>
-#include <hip/hip_fp4.h>
 #include <hip/hip_fp8.h>
 
 #include "mori/core/utils.hpp"
+#include "mori/utils/data_types.hpp"
 namespace mori {
 namespace core {
 
@@ -63,43 +63,33 @@ struct VecTypeSelector<16> {
 };
 
 template <typename T, int VecSize>
-struct VecTypeSelector {
+struct VecTypeAdaptor {
   using type = void;
 };
 
 template <>
-struct VecTypeSelector<float, 1> {
+struct VecTypeAdaptor<float, 1> {
   using dataType = float;
 };
 
 template <>
-struct VecTypeSelector<float, 2> {
+struct VecTypeAdaptor<float, 2> {
   using dataType = float2;
 };
 
 template <>
-struct VecTypeSelector<float, 4> {
+struct VecTypeAdaptor<float, 4> {
   using dataType = float4;
 };
 
 template <>
-struct VecTypeSelector<__hip_fp4_e2m1, 2> {
-  using dataType = __hip_fp4x2_e2m1;
+struct VecTypeAdaptor<mori_fp4_e2m1, 2> {
+  using dataType = mori_fp4x2_e2m1;
 };
 
 template <>
-struct VecTypeSelector<__hip_fp4_e2m1, 4> {
-  using dataType = __hip_fp4x4_e2m1;
-};
-
-template <>
-struct VecTypeSelector<__hip_fp4_e2m1, 8> {
-  using dataType = __hip_fp4x4_e2m1[2];
-};
-
-template <>
-struct VecTypeSelector<__hip_fp4_e2m1, 16> {
-  using dataType = __hip_fp4x4_e2m1[4];
+struct VecTypeAdaptor<mori_fp4_e2m1, 4> {
+  using dataType = mori_fp4x4_e2m1;
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -683,16 +673,19 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
   WarpAccumImpl<T, VecBytes, AccumNum>(dest, srcs, srcScales, offset, nelems);
 
   // remaining size
+
+  using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
+
   offset += laneId;
   while (offset < nelems) {
-    float accumValFp32 = 0;
+    AccumFp32Type accumValFp32 = AccumFp32Type{0};
 #pragma unroll AccumNum
     for (int i = 0; i < AccumNum; ++i) {
       const T* srcPtr = srcs[i];
       if (srcPtr == nullptr) continue;
 
       float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
-      accumValFp32 += float(srcPtr[offset]) * srcScale;
+      accumValFp32 += AccumFp32Type(srcPtr[offset]) * srcScale;
     }
     dest[offset] = T(accumValFp32);
     offset += warpSize;

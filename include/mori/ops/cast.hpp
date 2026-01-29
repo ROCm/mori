@@ -21,5 +21,11 @@
 // SOFTWARE.
 #pragma once
 
-#include "mori/ops/cast.hpp"
-#include "mori/ops/dispatch_combine/dispatch_combine.hpp"
+#include <hip/hip_runtime.h>
+
+namespace mori {
+
+template <typename SrcT, typename DstT>
+void LaunchCast(SrcT* src, DstT* dst, size_t nelems, hipStream_t stream);
+
+}
