@@ -178,22 +178,26 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
     //tt += msst; 
   }
 
+  hipDeviceSynchronize();
+  MPI_Barrier(MPI_COMM_WORLD);
+  for(int i=0; i<10; i++){
+    hipEventRecord(mid_2,stream_ccl); 
+    OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream_ccl>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
+    hipEventRecord(stop_s,stream_ccl);
+    hipStreamSynchronize(stream_ccl);
 
-  //    hipEventRecord(mid_2); 
-  //  OneShotAllGatherSdmaKernel<T><<<1, 512>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
-  //  hipEventRecord(stop_s);
-  //  hipDeviceSynchronize();
-
-
+    float mssc;
+    hipEventElapsedTime(&mssc, mid_2,  stop_s);
+    tc += mssc;
+  }
 
   if(myPe == 0){
     printf("============ avg sequential gemm time  :%0.9f    ms============= \n", tg/10.0);
-    //printf("============ avg sequential coll time  :%0.9f    ms============= \n", tc/10.0);
+    printf("============ avg sequential coll time  :%0.9f    ms============= \n", tc/10.0);
     //printf("============ avg sequential total time :%0.9f    ms============= \n", tt/10.0);
   }
 
-
-
+  hipDeviceSynchronize();
   MPI_Barrier(MPI_COMM_WORLD);
   //double start = MPI_Wtime();
   for(int i=0;i<10;i++){
