@@ -897,7 +897,7 @@ def sweep_bench_dispatch_combine(
         kernel_type,
         num_qp,
         torch.bfloat16,
-        # torch.float8_e4m3fnuz,
+        # torch.float8_e4m3fn,
     )
     test_case.setup()
 
@@ -971,8 +971,9 @@ def test_dispatch_combine(
             max_tokens,
             kernel_type,
             num_qp,
-            torch.bfloat16,
-            # torch.float8_e4m3fnuz,
+            # torch.bfloat16,
+            # torch.float8_e4m3fn,
+            torch.float4_e2m1fn_x2,
         )
         test_case.setup()
         if cmd == "test":

@@ -22,16 +22,21 @@
 #pragma once
 
 #include <hip/hip_bfloat16.h>
+#include <hip/hip_fp4.h>
 #include <hip/hip_fp8.h>
 
 #include "mori/core/utils.hpp"
 namespace mori {
 namespace core {
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                        Type Definitions                                        */
+/* ---------------------------------------------------------------------------------------------- */
 template <int VecBytes>
 struct VecTypeSelector {
   using type = void;
 };
+
 template <>
 struct VecTypeSelector<1> {
   using dataType = uint8_t;
@@ -57,6 +62,49 @@ struct VecTypeSelector<16> {
   using dataType = ulong2;
 };
 
+template <typename T, int VecSize>
+struct VecTypeSelector {
+  using type = void;
+};
+
+template <>
+struct VecTypeSelector<float, 1> {
+  using dataType = float;
+};
+
+template <>
+struct VecTypeSelector<float, 2> {
+  using dataType = float2;
+};
+
+template <>
+struct VecTypeSelector<float, 4> {
+  using dataType = float4;
+};
+
+template <>
+struct VecTypeSelector<__hip_fp4_e2m1, 2> {
+  using dataType = __hip_fp4x2_e2m1;
+};
+
+template <>
+struct VecTypeSelector<__hip_fp4_e2m1, 4> {
+  using dataType = __hip_fp4x4_e2m1;
+};
+
+template <>
+struct VecTypeSelector<__hip_fp4_e2m1, 8> {
+  using dataType = __hip_fp4x4_e2m1[2];
+};
+
+template <>
+struct VecTypeSelector<__hip_fp4_e2m1, 16> {
+  using dataType = __hip_fp4x4_e2m1[4];
+};
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                           Load/Store                                           */
+/* ---------------------------------------------------------------------------------------------- */
 #define USE_BUILDIN_LD 1
 #define USE_BUILDIN_ST 1
 
@@ -189,22 +237,48 @@ __device__ __forceinline__ void store<16>(void* addr,
 }
 #endif
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                              Cast                                              */
+/* ---------------------------------------------------------------------------------------------- */
+// template <typename SrcT, typename DstT, int VecBytes>
+// inline __device__ void ThreadCast(DstT* dst, SrcT* src, size_t nelems) {
+//   static_assert((VecBytes <= 16) && (VecBytes >= 4) && IsPowerOf2(VecBytes));
+//   constexpr int srcVecSize = VecBytes / sizeof(SrcT);
+//   constexpr int dstVecSize = VecBytes / sizeof(DstT);
+//   constexpr int vecSize = std::min(VecBytes / sizeof(SrcT), VecBytes / sizeof(DstT));
+//   int offset = 0;
+
+//   using DataType = typename VecTypeSelector<VecBytes>::dataType;
+//   while ((offset + vecSize) <= nelems) {
+//     DataType vec = reinterpret_cast<DataType*>(src + offset)[0];
+//     for (int v = 0; v < vecSize; v++) {
+//       DstTreinterpret_cast<SrcT*>(&vec)[v].operator
+//     }
+//     reinterpret_cast<uint4*>(dst + offset)[0] = reinterpret_cast<DataType*>(src + offset)[0];
+//     offset += vecSize;
+//   }
+
+//   while (offset < nelems) {
+//     dst[offset] = src[offset];
+//     offset += 1;
+//   }
+// }
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                              Copy                                              */
+/* ---------------------------------------------------------------------------------------------- */
 template <typename T>
 inline __device__ void ThreadCopy(T* dst, T* src, size_t nelems) {
-  constexpr int VecBytes = 16;
-  using DataType = typename VecTypeSelector<VecBytes>::dataType;
-  constexpr int vecSize = VecBytes / sizeof(T);
+  constexpr int vecSize = 16 / sizeof(T);
   int offset = 0;
 
   while ((offset + vecSize) <= nelems) {
     reinterpret_cast<uint4*>(dst + offset)[0] = reinterpret_cast<uint4*>(src + offset)[0];
-    // store<VecBytes>(dst + offset, reinterpret_cast<DataType*>(src + offset)[0]);
     offset += vecSize;
   }
 
   while (offset < nelems) {
     dst[offset] = src[offset];
-    // store<sizeof(T)>(dst + offset, src[offset]);
     offset += 1;
   }
 }
@@ -252,24 +326,6 @@ inline __device__ void WarpCopy(T* __restrict__ dst, const T* __restrict__ src, 
   }
 }
 
-// template <typename T>
-// inline __device__ void WarpCopy(T* dst, T* src, size_t nelems) {
-//   constexpr int vecSize = 16 / sizeof(T);
-//   int laneId = threadIdx.x & (warpSize - 1);
-//   int offset = laneId * vecSize;
-
-//   while ((offset + vecSize) <= nelems) {
-//     reinterpret_cast<uint4*>(dst + offset)[0] = reinterpret_cast<uint4*>(src + offset)[0];
-//     offset += warpSize * vecSize;
-//   }
-
-//   offset = offset - laneId * vecSize + laneId;
-//   while (offset < nelems) {
-//     dst[offset] = src[offset];
-//     offset += warpSize;
-//   }
-// }
-
 template <typename T, int N>
 inline __device__ void WarpCopy(T* dst, T* src) {
   constexpr int vecSize = 16 / sizeof(T);
@@ -285,6 +341,9 @@ inline __device__ void WarpCopy(T* dst, T* src) {
   }
 }
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                             Reduce                                             */
+/* ---------------------------------------------------------------------------------------------- */
 template <typename T>
 inline __device__ T WarpReduceSum(T val) {
   int laneId = threadIdx.x & (warpSize - 1);
@@ -294,6 +353,9 @@ inline __device__ T WarpReduceSum(T val) {
   return val;
 }
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                             Prefix                                             */
+/* ---------------------------------------------------------------------------------------------- */
 template <typename T>
 inline __device__ T WarpPrefixSum(T val, size_t laneNum) {
   assert(laneNum <= warpSize);
