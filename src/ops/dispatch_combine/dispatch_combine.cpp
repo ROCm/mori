@@ -333,6 +333,10 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
 
         size_t sharedMemSize =
             actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
+        if ((kernelType == KernelType::InterNodeV1) || (kernelType == KernelType::InterNodeV1LL)) {
+          sharedMemSize = actualWarpNumPerBlock * config.numExpertPerToken *
+                          (sizeof(DataT**) + sizeof(float**) + sizeof(float**));
+        }
         if (kernelType == KernelType::InterNode) {
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);

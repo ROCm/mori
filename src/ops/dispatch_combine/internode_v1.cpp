@@ -22,6 +22,8 @@
 
 #include "src/ops/dispatch_combine/internode_v1.hpp"
 
+#include <type_traits>
+
 #include "mori/core/core.hpp"
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 #include "mori/shmem/shmem.hpp"
@@ -68,6 +70,21 @@ namespace moe {
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId))
 
 namespace v1 {
+
+template <typename T>
+__device__ __forceinline__ bool UseCombineInternalFp8(const EpDispatchCombineConfig& config) {
+#if (defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ == 1) || \
+    (defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1)
+  if constexpr (!std::is_same_v<T, hip_bfloat16>) return false;
+  const bool isV1 = (config.kernelType == KernelType::InterNodeV1) ||
+                    (config.kernelType == KernelType::InterNodeV1LL);
+  return isV1 && (config.scaleDim > 0) && (config.scaleTypeSize == sizeof(float));
+#else
+  (void)config;
+  return false;
+#endif
+}
+
 template <typename T>
 inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, int tokenId,
                                               int expId, int destPe, int& localPeTokenCounter) {
@@ -668,13 +685,34 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   MORI_TRACE_SPAN(profiler, Slot::CombineSync);
 
+  const bool useInternalFp8 = UseCombineInternalFp8<T>(config);
+
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   int tokenPerBlock = core::CeilDiv(totalRecvTokenNum, blockNum);
   int startTokenIdx = blockId * tokenPerBlock;
   int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, totalRecvTokenNum);
   for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
-    core::WarpCopy(args.shmemCombineInpTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim,
-                   args.inpTokenBuf + tokenId * config.hiddenDim, config.hiddenDim);
+    if (useInternalFp8) {
+#if (defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ == 1) || \
+    (defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1)
+      core::CombineInternalFp8T* dstTok =
+          args.shmemCombineInpTokMemObj->template GetAs<core::CombineInternalFp8T*>() +
+          tokenId * config.hiddenDim;
+      float* dstScales = reinterpret_cast<float*>(
+          args.shmemInpScalesMemObj->template GetAs<uint8_t*>() + tokenId * scaleBytes);
+      core::WarpQuantizeToFp8Blockwise<core::CombineInternalFp8T, T>(
+          dstTok, dstScales, args.inpTokenBuf + tokenId * config.hiddenDim, config.hiddenDim,
+          config.scaleDim);
+#else
+      core::WarpCopy(
+          args.shmemCombineInpTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim,
+          args.inpTokenBuf + tokenId * config.hiddenDim, config.hiddenDim);
+#endif
+    } else {
+      core::WarpCopy(
+          args.shmemCombineInpTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim,
+          args.inpTokenBuf + tokenId * config.hiddenDim, config.hiddenDim);
+    }
   }
   if (args.weightsBuf) {
     for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
@@ -714,6 +752,8 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   MORI_TRACE_SPAN(profiler, Slot::CombineIntraNode);
 
+  const bool useInternalFp8 = UseCombineInternalFp8<T>(config);
+
   int blockOffset = config.rdmaBlockNum;
   int xgmiBlockNum = blockNum - config.rdmaBlockNum;
 
@@ -721,6 +761,8 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
+  float** srcScalesPtr = reinterpret_cast<float**>(sharedMem) +
+                         2 * warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
   uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>() +
                         (nNodes + myNode) * config.MaxNumTokensToRecvPerRank() * combXferBytes;
 
@@ -732,19 +774,47 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
     if (laneId < config.numExpertPerToken) {
       srcPtrs[laneId] = nullptr;
       srcWeightsPtr[laneId] = nullptr;
+      srcScalesPtr[laneId] = nullptr;
       index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + laneId];
       index_t destPe = destTokId / config.MaxNumTokensToRecv();
       index_t destNode = destPe / config.gpuPerNode;
       if (destNode == myNode) {
         index_t destLocalTokId = destTokId - destPe * config.MaxNumTokensToRecv();
-        srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
-                          destLocalTokId * config.hiddenDim;
+        if (useInternalFp8) {
+#if (defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ == 1) || \
+    (defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1)
+          srcPtrs[laneId] = reinterpret_cast<T*>(
+              args.shmemCombineInpTokMemObj->template GetAs<core::CombineInternalFp8T*>(destPe) +
+              destLocalTokId * config.hiddenDim);
+          srcScalesPtr[laneId] =
+              reinterpret_cast<float*>(args.shmemInpScalesMemObj->template GetAs<uint8_t*>(destPe) +
+                                       destLocalTokId * scaleBytes);
+#else
+          srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+                            destLocalTokId * config.hiddenDim;
+#endif
+        } else {
+          srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+                            destLocalTokId * config.hiddenDim;
+        }
         srcWeightsPtr[laneId] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                                 destLocalTokId * config.numExpertPerToken;
       }
     }
-    core::WarpAccum<T, 4>(reinterpret_cast<T*>(stagingPtr + tokenId * combXferBytes), srcPtrs,
-                          nullptr, config.numExpertPerToken, config.hiddenDim);
+    if (useInternalFp8) {
+#if (defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ == 1) || \
+    (defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1)
+      const core::CombineInternalFp8T* const* srcFp8Ptrs =
+          reinterpret_cast<const core::CombineInternalFp8T* const*>(srcPtrs);
+      const float* const* srcScalePtrs = reinterpret_cast<const float* const*>(srcScalesPtr);
+      core::WarpAccumFp8DequantFull<T, core::CombineInternalFp8T>(
+          reinterpret_cast<T*>(stagingPtr + tokenId * combXferBytes), srcFp8Ptrs, srcScalePtrs,
+          config.numExpertPerToken, config.hiddenDim, config.scaleDim);
+#endif
+    } else {
+      core::WarpAccum<T, 4>(reinterpret_cast<T*>(stagingPtr + tokenId * combXferBytes), srcPtrs,
+                            nullptr, config.numExpertPerToken, config.hiddenDim);
+    }
     if (args.weightsBuf) {
       core::WarpAccum<float, 4>(
           reinterpret_cast<float*>(stagingPtr + tokenId * combXferBytes + hiddenBytes),
@@ -758,6 +828,8 @@ inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   MORI_TRACE_SPAN(profiler, Slot::CombineIntraNodeLL);
 
+  const bool useInternalFp8 = UseCombineInternalFp8<T>(config);
+
   if (args.curRankNumToken == 0) return;
 
   // Distribute tokens evenly to all blocks
@@ -769,6 +841,8 @@ inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
+  float** srcScalesPtr = reinterpret_cast<float**>(sharedMem) +
+                         2 * warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
   uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>() +
                         (nNodes + myNode) * config.MaxNumTokensToRecvPerRank() * combXferBytes;
 
@@ -786,20 +860,49 @@ inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
     if (laneId < config.numExpertPerToken) {
       srcPtrs[laneId] = nullptr;
       srcWeightsPtr[laneId] = nullptr;
+      srcScalesPtr[laneId] = nullptr;
       index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + laneId];
       index_t destPe = destTokId / config.MaxNumTokensToRecv();
       index_t destNode = destPe / config.gpuPerNode;
       if (destNode == myNode) {
         index_t destLocalTokId = destTokId - destPe * config.MaxNumTokensToRecv();
-        srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
-                          destLocalTokId * config.hiddenDim + hiddenDimOffset;
+        if (useInternalFp8) {
+#if (defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ == 1) || \
+    (defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1)
+          srcPtrs[laneId] = reinterpret_cast<T*>(
+              args.shmemCombineInpTokMemObj->template GetAs<core::CombineInternalFp8T*>(destPe) +
+              destLocalTokId * config.hiddenDim + hiddenDimOffset);
+          srcScalesPtr[laneId] =
+              reinterpret_cast<float*>(args.shmemInpScalesMemObj->template GetAs<uint8_t*>(destPe) +
+                                       destLocalTokId * scaleBytes);
+#else
+          srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+                            destLocalTokId * config.hiddenDim + hiddenDimOffset;
+#endif
+        } else {
+          srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+                            destLocalTokId * config.hiddenDim + hiddenDimOffset;
+        }
         srcWeightsPtr[laneId] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                                 destLocalTokId * config.numExpertPerToken;
       }
     }
-    core::WarpAccum<T, 4>(
-        reinterpret_cast<T*>(stagingPtr + tokenId * combXferBytes) + hiddenDimOffset, srcPtrs,
-        nullptr, config.numExpertPerToken, hiddenDimSize);
+    if (useInternalFp8) {
+#if (defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ == 1) || \
+    (defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1)
+      const core::CombineInternalFp8T* const* srcFp8Ptrs =
+          reinterpret_cast<const core::CombineInternalFp8T* const*>(srcPtrs);
+      const float* const* srcScalePtrs = reinterpret_cast<const float* const*>(srcScalesPtr);
+      core::WarpAccumFp8DequantSegment<T, core::CombineInternalFp8T>(
+          reinterpret_cast<T*>(stagingPtr + tokenId * combXferBytes) + hiddenDimOffset, srcFp8Ptrs,
+          srcScalePtrs, config.numExpertPerToken, hiddenDimOffset, hiddenDimSize, config.hiddenDim,
+          config.scaleDim);
+#endif
+    } else {
+      core::WarpAccum<T, 4>(
+          reinterpret_cast<T*>(stagingPtr + tokenId * combXferBytes) + hiddenDimOffset, srcPtrs,
+          nullptr, config.numExpertPerToken, hiddenDimSize);
+    }
     if (args.weightsBuf && (inTokenPartId == warpsPerToken - 1)) {
       core::WarpAccum<float, 4>(
           reinterpret_cast<float*>(stagingPtr + tokenId * combXferBytes + hiddenBytes),
@@ -813,6 +916,8 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   MORI_TRACE_SPAN(profiler, Slot::CombineInterNode);
 
+  const bool useInternalFp8 = UseCombineInternalFp8<T>(config);
+
   constexpr int numRecvBlock = 8;
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
 
@@ -823,6 +928,8 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
+  float** srcScalesPtr = reinterpret_cast<float**>(sharedMem) +
+                         2 * warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
   uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
 
   int totalBids = 0;
@@ -879,14 +986,31 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
               if (laneId < config.numExpertPerToken) {
                 srcPtrs[laneId] = nullptr;
                 srcWeightsPtr[laneId] = nullptr;
+                srcScalesPtr[laneId] = nullptr;
                 index_t destTokId =
                     args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId];
                 index_t destPe = destTokId / config.MaxNumTokensToRecv();
                 index_t destNode = destPe / config.gpuPerNode;
                 if (destNode == myNode) {
                   index_t destLocalTokId = destTokId - destPe * config.MaxNumTokensToRecv();
-                  srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
-                                    destLocalTokId * config.hiddenDim;
+                  if (useInternalFp8) {
+#if (defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ == 1) || \
+    (defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1)
+                    srcPtrs[laneId] = reinterpret_cast<T*>(
+                        args.shmemCombineInpTokMemObj->template GetAs<core::CombineInternalFp8T*>(
+                            destPe) +
+                        destLocalTokId * config.hiddenDim);
+                    srcScalesPtr[laneId] = reinterpret_cast<float*>(
+                        args.shmemInpScalesMemObj->template GetAs<uint8_t*>(destPe) +
+                        destLocalTokId * scaleBytes);
+#else
+                    srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+                                      destLocalTokId * config.hiddenDim;
+#endif
+                  } else {
+                    srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+                                      destLocalTokId * config.hiddenDim;
+                  }
                   srcWeightsPtr[laneId] =
                       args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                       destLocalTokId * config.numExpertPerToken;
@@ -894,8 +1018,21 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
                 args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId] = 0;
               }
 
-              core::WarpAccum<T, 4>(reinterpret_cast<T*>(stagingPtr + tokIdx * combXferBytes),
-                                    srcPtrs, nullptr, config.numExpertPerToken, config.hiddenDim);
+              if (useInternalFp8) {
+#if (defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ == 1) || \
+    (defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1)
+                const core::CombineInternalFp8T* const* srcFp8Ptrs =
+                    reinterpret_cast<const core::CombineInternalFp8T* const*>(srcPtrs);
+                const float* const* srcScalePtrs =
+                    reinterpret_cast<const float* const*>(srcScalesPtr);
+                core::WarpAccumFp8DequantFull<T, core::CombineInternalFp8T>(
+                    reinterpret_cast<T*>(stagingPtr + tokIdx * combXferBytes), srcFp8Ptrs,
+                    srcScalePtrs, config.numExpertPerToken, config.hiddenDim, config.scaleDim);
+#endif
+              } else {
+                core::WarpAccum<T, 4>(reinterpret_cast<T*>(stagingPtr + tokIdx * combXferBytes),
+                                      srcPtrs, nullptr, config.numExpertPerToken, config.hiddenDim);
+              }
 
               if (args.weightsBuf) {
                 core::WarpAccum<float, 4>(
@@ -982,6 +1119,8 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   MORI_TRACE_SPAN(profiler, Slot::CombineInterNodeLL);
 
+  const bool useInternalFp8 = UseCombineInternalFp8<T>(config);
+
   constexpr int numRecvBlock = 8;
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
 
@@ -992,6 +1131,8 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
+  float** srcScalesPtr = reinterpret_cast<float**>(sharedMem) +
+                         2 * warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
   uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
 
   int rdmaWarpNum = config.rdmaBlockNum * warpNum;
@@ -1023,21 +1164,51 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
         if (laneId < config.numExpertPerToken) {
           srcPtrs[laneId] = nullptr;
           srcWeightsPtr[laneId] = nullptr;
+          srcScalesPtr[laneId] = nullptr;
           index_t destTokId =
               args.interNodeDispDestTokIdMap[globalTokenId * config.numExpertPerToken + laneId];
           index_t destPe = destTokId / config.MaxNumTokensToRecv();
           index_t destNode = destPe / config.gpuPerNode;
           if (destNode == myNode) {
             index_t destLocalTokId = destTokId - destPe * config.MaxNumTokensToRecv();
-            srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
-                              destLocalTokId * config.hiddenDim + hiddenDimOffset;
+            if (useInternalFp8) {
+#if (defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ == 1) || \
+    (defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1)
+              srcPtrs[laneId] = reinterpret_cast<T*>(
+                  args.shmemCombineInpTokMemObj->template GetAs<core::CombineInternalFp8T*>(
+                      destPe) +
+                  destLocalTokId * config.hiddenDim + hiddenDimOffset);
+              srcScalesPtr[laneId] = reinterpret_cast<float*>(
+                  args.shmemInpScalesMemObj->template GetAs<uint8_t*>(destPe) +
+                  destLocalTokId * scaleBytes);
+#else
+              srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+                                destLocalTokId * config.hiddenDim + hiddenDimOffset;
+#endif
+            } else {
+              srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+                                destLocalTokId * config.hiddenDim + hiddenDimOffset;
+            }
             srcWeightsPtr[laneId] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                                     destLocalTokId * config.numExpertPerToken;
           }
         }
-        core::WarpAccum<T, 4>(
-            reinterpret_cast<T*>(stagingPtr + globalTokenId * combXferBytes) + hiddenDimOffset,
-            srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
+        if (useInternalFp8) {
+#if (defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ == 1) || \
+    (defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1)
+          const core::CombineInternalFp8T* const* srcFp8Ptrs =
+              reinterpret_cast<const core::CombineInternalFp8T* const*>(srcPtrs);
+          const float* const* srcScalePtrs = reinterpret_cast<const float* const*>(srcScalesPtr);
+          core::WarpAccumFp8DequantSegment<T, core::CombineInternalFp8T>(
+              reinterpret_cast<T*>(stagingPtr + globalTokenId * combXferBytes) + hiddenDimOffset,
+              srcFp8Ptrs, srcScalePtrs, config.numExpertPerToken, hiddenDimOffset, hiddenDimSize,
+              config.hiddenDim, config.scaleDim);
+#endif
+        } else {
+          core::WarpAccum<T, 4>(
+              reinterpret_cast<T*>(stagingPtr + globalTokenId * combXferBytes) + hiddenDimOffset,
+              srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
+        }
         if (args.weightsBuf && (inTokenPartId == 0)) {
           core::WarpAccum<float, 4>(
               reinterpret_cast<float*>(stagingPtr + globalTokenId * combXferBytes + hiddenBytes),

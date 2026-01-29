@@ -665,5 +665,101 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
 #undef WARP_ACCUM_CASE
 }
 
+#if defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ == 1
+using CombineInternalFp8T = __hip_fp8_e4m3_fnuz;
+static constexpr float kCombineInternalFp8MaxFinite = 240.0f;
+#elif defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1
+using CombineInternalFp8T = __hip_fp8_e4m3;
+static constexpr float kCombineInternalFp8MaxFinite = 448.0f;
+#else
+static constexpr float kCombineInternalFp8MaxFinite = 0.0f;
+#endif
+
+__device__ __forceinline__ float WarpReduceMaxF32(float val) {
+  for (int delta = (warpSize >> 1); delta > 0; delta >>= 1) {
+    val = fmaxf(val, __shfl_down(val, delta));
+  }
+  return val;
+}
+
+template <typename Fp8T, typename InT>
+__device__ __forceinline__ void WarpQuantizeToFp8Blockwise(Fp8T* __restrict__ dstToken,
+                                                           float* __restrict__ dstScales,
+                                                           const InT* __restrict__ srcToken,
+                                                           int hiddenDim, int scaleDim) {
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const int blockElems = (hiddenDim + scaleDim - 1) / scaleDim;
+
+  for (int sb = 0; sb < scaleDim; ++sb) {
+    const int start = sb * blockElems;
+    const int end = std::min(start + blockElems, hiddenDim);
+
+    float localMaxAbs = 0.0f;
+    for (int idx = start + laneId; idx < end; idx += warpSize) {
+      localMaxAbs = fmaxf(localMaxAbs, fabsf(static_cast<float>(srcToken[idx])));
+    }
+    float maxAbs = WarpReduceMaxF32(localMaxAbs);
+    maxAbs = __shfl(maxAbs, 0);
+
+    const float fp8Max = kCombineInternalFp8MaxFinite;
+    const float scale = (maxAbs == 0.0f) ? 1.0f : (maxAbs / fp8Max);
+    if (laneId == 0) dstScales[sb] = scale;
+    const float invScale = 1.0f / scale;
+
+    for (int idx = start + laneId; idx < end; idx += warpSize) {
+      dstToken[idx] = Fp8T(static_cast<float>(srcToken[idx]) * invScale);
+    }
+  }
+}
+
+template <typename OutT, typename Fp8T>
+__device__ __forceinline__ void WarpAccumFp8DequantFull(OutT* __restrict__ dstToken,
+                                                        const Fp8T* const* __restrict__ srcs,
+                                                        const float* const* __restrict__ srcScales,
+                                                        int accumNum, int hiddenDim, int scaleDim) {
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const int blockElems = (hiddenDim + scaleDim - 1) / scaleDim;
+
+  float blockScales[warpSize];
+  for (int sb = 0; sb < scaleDim; ++sb) {
+    for (int i = 0; i < accumNum; ++i) {
+      blockScales[i] = (srcs[i] != nullptr && srcScales[i] != nullptr) ? srcScales[i][sb] : 0.0f;
+    }
+
+    const int start = sb * blockElems;
+    const int end = std::min(start + blockElems, hiddenDim);
+    for (int idx = start + laneId; idx < end; idx += warpSize) {
+      float acc = 0.0f;
+      for (int i = 0; i < accumNum; ++i) {
+        if (srcs[i] != nullptr) {
+          acc += static_cast<float>(srcs[i][idx]) * blockScales[i];
+        }
+      }
+      dstToken[idx] = OutT(acc);
+    }
+  }
+}
+
+template <typename OutT, typename Fp8T>
+__device__ __forceinline__ void WarpAccumFp8DequantSegment(
+    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int accumNum, int hiddenDimOffset,
+    int hiddenDimSize, int hiddenDim, int scaleDim) {
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const int blockElems = (hiddenDim + scaleDim - 1) / scaleDim;
+
+  for (int idx = laneId; idx < hiddenDimSize; idx += warpSize) {
+    const int globalIdx = hiddenDimOffset + idx;
+    const int sb = globalIdx / blockElems;
+    float acc = 0.0f;
+    for (int i = 0; i < accumNum; ++i) {
+      if (srcs[i] != nullptr && srcScales[i] != nullptr) {
+        acc += static_cast<float>(srcs[i][idx]) * srcScales[i][sb];
+      }
+    }
+    dstToken[idx] = OutT(acc);
+  }
+}
+
 }  // namespace core
 }  // namespace mori

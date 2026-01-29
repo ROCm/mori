@@ -369,7 +369,7 @@ class EpDispatchCombineTestCase:
                 all_rank_input[self.rank][i].to(torch.float32) * final_unique_pes
             ).to(self.config.data_type)
 
-            ok = torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
+            ok = torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-1)
             if not ok:
                 print(
                     self.rank,
