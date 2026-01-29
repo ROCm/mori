@@ -38,6 +38,10 @@ template <typename T>
 double AllGather_sdma(T* input, T* output, size_t total_count,
                                           hipStream_t stream_ccl) {
   int m = 8192, n = 8192, k = 8192;
+
+  // 设置标量参数
+  float alpha = 1.0f;
+  float beta = 0.0f;
   // 创建hipBLAS句柄和stream
   hipblasHandle_t handle;
   hipblasCreate(&handle);
@@ -77,7 +81,11 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
   hipMemcpy(dC, hC, size_C, hipMemcpyHostToDevice);
   
   float total_ms = 0;
-  
+  // 测量                                                                                                                                                                                                              
+  hipEvent_t start, stop;                                                                                                                                                                                              
+  hipEventCreate(&start);                                                                                                                                                                                              
+  hipEventCreate(&stop);   
+
   int myPe =  shmem::ShmemMyPe();
   int npes =  shmem::ShmemNPes();
   size_t dtype_size = sizeof(T);
