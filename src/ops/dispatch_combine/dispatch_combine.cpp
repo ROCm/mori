@@ -79,21 +79,10 @@ mori::application::SymmMemObjPtr ShmemMallocAndReturnMemObjPtr(size_t size, unsi
 void EpDispatchCombineHandle::InitializeShmemBuf() {
   size_t maxTokenSize = static_cast<ssize_t>(config.MaxNumTokensToRecv()) * config.hiddenDim *
                         config.maxTokenTypeSize;
-
-  size_t xferBytes = config.hiddenDim * config.maxTokenTypeSize +
-                     (sizeof(float) + sizeof(index_t)) * config.numExpertPerToken +
-                     config.scaleDim * config.scaleTypeSize + sizeof(index_t);
-  size_t maxDispatchStagingSize = config.MaxNumTokensToRecv() * xferBytes;
-
-  size_t hiddenBytes = config.hiddenDim * config.maxTokenTypeSize;
-  size_t weightBytes = config.numExpertPerToken * sizeof(float);
-  size_t scaleBytes = config.scaleDim * config.scaleTypeSize;
-  size_t combXferBytes = hiddenBytes + weightBytes + scaleBytes + sizeof(index_t);
-  int nNodes = config.worldSize / config.gpuPerNode;
-  size_t maxCombineStagingSize = 2 * nNodes * config.maxNumInpTokenPerRank * combXferBytes;
-
-  size_t maxStagingTokSize = std::max(maxDispatchStagingSize, maxCombineStagingSize);
-
+  size_t maxStagingTokSize = static_cast<ssize_t>(config.MaxNumTokensToRecv()) *
+                             (config.hiddenDim * config.maxTokenTypeSize +
+                              (sizeof(float) + sizeof(index_t)) * config.numExpertPerToken +
+                              config.scaleDim * config.scaleTypeSize);
   shmemDispatchInpTokMemObj =
       ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
   shmemCombineInpTokMemObj =
@@ -113,10 +102,6 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
     size_t maxScaleSize = config.MaxNumTokensToRecv() * config.scaleDim * config.scaleTypeSize;
     shmemInpScalesMemObj = ShmemMallocAndReturnMemObjPtr(maxScaleSize, hipDeviceMallocUncached);
     shmemOutScalesMemObj = ShmemMallocAndReturnMemObjPtr(maxScaleSize, hipDeviceMallocUncached);
-    size_t maxCombineOutScaleSize =
-        static_cast<size_t>(config.maxNumInpTokenPerRank) * config.scaleDim * config.scaleTypeSize;
-    shmemCombineOutScalesMemObj =
-        ShmemMallocAndReturnMemObjPtr(maxCombineOutScaleSize, hipDeviceMallocUncached);
   }
 
   size_t maxIndicesSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(index_t);
@@ -145,7 +130,6 @@ void EpDispatchCombineHandle::FinalizeShmemBuf() {
   ShmemFree(shmemCombineOutWeightsMemObj->localPtr);
   if (shmemInpScalesMemObj.IsValid()) ShmemFree(shmemInpScalesMemObj->localPtr);
   if (shmemOutScalesMemObj.IsValid()) ShmemFree(shmemOutScalesMemObj->localPtr);
-  if (shmemCombineOutScalesMemObj.IsValid()) ShmemFree(shmemCombineOutScalesMemObj->localPtr);
   ShmemFree(shmemInpIndicesMemObj->localPtr);
   ShmemFree(shmemOutIndicesMemObj->localPtr);
 #ifdef ENABLE_PROFILER
@@ -210,8 +194,8 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipMalloc(&dispDestTokIdMap, maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispDestTokIdMap, 0, maxNumOutToken * sizeof(index_t)));
 
-  size_t maxNumInterNodeToken =
-      config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerToken;
+  size_t maxNumInterNodeToken = config.worldSize / config.gpuPerNode *
+                                config.maxNumInpTokenPerRank * config.numExpertPerToken;
   HIP_RUNTIME_CHECK(hipMalloc(&interNodeDispDestTokIdMap, maxNumInterNodeToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(
       hipMemset(interNodeDispDestTokIdMap, 0, maxNumInterNodeToken * sizeof(index_t)));
@@ -347,8 +331,12 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
         using ArgsT = std::decay_t<decltype(args)>;
         using DataT = typename ArgsT::data_type;
 
-        size_t sharedMemSize = actualWarpNumPerBlock * config.numExpertPerToken *
-                               (sizeof(DataT*) + sizeof(float*) + sizeof(uint8_t*));
+        size_t sharedMemSize =
+            actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
+        if ((kernelType == KernelType::InterNodeV1) || (kernelType == KernelType::InterNodeV1LL)) {
+          sharedMemSize = actualWarpNumPerBlock * config.numExpertPerToken *
+                          (sizeof(DataT**) + sizeof(float**) + sizeof(float**));
+        }
         if (kernelType == KernelType::InterNode) {
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
