@@ -97,10 +97,11 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
   hipEventCreate(&stop); 
 
 
-  hipEvent_t start_s, mid, stop_s;                                                                                                                                                                                              
+  hipEvent_t start_s, mid_1, mid_2, stop_s;                                                                                                                                                                                              
   hipEventCreate(&start_s);                                                                                                                                                                                              
   hipEventCreate(&stop_s);
-  hipEventCreate(&mid); 
+  hipEventCreate(&mid_1);
+  hipEventCreate(&mid_2); 
 
 
   int myPe =  shmem::ShmemMyPe();
@@ -157,7 +158,9 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
                 dC, HIPBLAS_R_16F, m,                                                                                                                                                                               
                 HIPBLAS_COMPUTE_32F,  // 计算精度为FP32                                                                                                                                                                   
                 HIPBLAS_GEMM_DEFAULT);
-    hipEventRecord(mid);  
+    hipEventRecord(mid_1);
+    MPI_Barrier(MPI_COMM_WORLD); 
+    hipEventRecord(mid_2); 
     OneShotAllGatherSdmaKernel<T><<<1, 512>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
     hipEventRecord(stop_s);
     hipDeviceSynchronize();
@@ -165,8 +168,8 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
     float mssc;
     float mssg;
     float msst;                                                                                                                                                                                                        
-    hipEventElapsedTime(&mssg, start_s, mid);
-    hipEventElapsedTime(&mssc, mid,  stop_s);
+    hipEventElapsedTime(&mssg, start_s, mid_1);
+    hipEventElapsedTime(&mssc, mid_2,  stop_s);
     hipEventElapsedTime(&msst, start_s, stop_s);
     tg += mssg;
     tc += mssc;
