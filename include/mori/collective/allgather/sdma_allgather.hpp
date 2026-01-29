@@ -82,6 +82,7 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
   
   float total_c = 0;
   float total_g = 0;
+  float total = 0;
   // 测量                                                                                                                                                                                                              
   hipEvent_t start_g, stop_g;                                                                                                                                                                                              
   hipEventCreate(&start_g);                                                                                                                                                                                              
@@ -90,6 +91,11 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
   hipEvent_t start_c, stop_c;                                                                                                                                                                                              
   hipEventCreate(&start_c);                                                                                                                                                                                              
   hipEventCreate(&stop_c);   
+
+  hipEvent_t start, stop;                                                                                                                                                                                              
+  hipEventCreate(&start);                                                                                                                                                                                              
+  hipEventCreate(&stop); 
+
 
   int myPe =  shmem::ShmemMyPe();
   int npes =  shmem::ShmemNPes();
@@ -137,6 +143,8 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
   MPI_Barrier(MPI_COMM_WORLD);
   //double start = MPI_Wtime();
   for(int i=0;i<10;i++){
+
+    hipEventRecord(start);
     hipEventRecord(start_c,stream_ccl);
     OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream_ccl>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
     hipEventRecord(start_g, gstream);
@@ -144,8 +152,11 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
                      HIPBLAS_GEMM_DEFAULT);
     hipEventRecord(stop_g, gstream);
     hipEventRecord(stop_c,stream_ccl);
+    hipEventRecord(stop);
     hipStreamSynchronize(stream_ccl);
     hipStreamSynchronize(gstream);
+    hipDeviceSynchronize();
+
 
     float msc;                                                                                                                                                                                                        
     hipEventElapsedTime(&msc, start_c, stop_c);                                                                                                                                                                           
@@ -153,8 +164,11 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
 
     float msg;                                                                                                                                                                                                        
     hipEventElapsedTime(&msg, start_g, stop_g);                                                                                                                                                                           
-    total_g += msg;    
+    total_g += msg; 
 
+    float mst;
+    hipEventElapsedTime(&mst, start, stop);                                                                                                                                                                           
+    total += mst;
   }
 
 
@@ -163,8 +177,9 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
     global_bandwidth /= (1024.0 * 1024.0 * 1024.0);
 
     printf("============ avg coll time :%0.9f ============= \n", total_c/10.0);
-    printf("============ avg coll bw  :%0.9f GB/s ============= \n", global_bandwidth);
+    printf("============ avg coll bw  :%0.9f GB/s ============= \n", global_bandwidth*1000.0);
     printf("============ avg gemm time :%0.9f ============= \n", total_g/10.0);
+    printf("============ avg ttotal time :%0.9f ============= \n", total/10.0);
   }
 
   return total_c;
