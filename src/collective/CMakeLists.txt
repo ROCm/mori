@@ -4,6 +4,7 @@ find_package(MPI REQUIRED)
 set(COLLECTIVE_SOURCES
     core/topology_detector.cpp
     core/allreduce_manager.cpp
+	core/oneshot_all2all_sdma_class.cpp
     inter_node/executors/ring_1d_executor.cpp
     inter_node/executors/one_shot_executor.cpp
     # Note: intra_node_executor is header-only template class
