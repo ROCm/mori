@@ -141,6 +141,12 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
   }                                                                                                                                                                                                                    
   hipStreamSynchronize(gstream);
 
+  MPI_Barrier(MPI_COMM_WORLD);  
+  hipStreamSynchronize(stream_ccl); //warm up
+  for(int i =0 ; i<10;i++)
+    OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream_ccl>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);                                                                                                                                                                                                                  
+  hipStreamSynchronize(stream_ccl);  
+
   float tg = 0;
   float tc = 0;
   float tt = 0;
@@ -181,11 +187,7 @@ double AllGather_sdma(T* input, T* output, size_t total_count,
     printf("============ avg sequential total time :%0.9f    ms============= \n", tt/10.0);
   }
 
-  MPI_Barrier(MPI_COMM_WORLD);  
-  hipStreamSynchronize(stream_ccl); //warm up
-  for(int i =0 ; i<10;i++)
-    OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream_ccl>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);                                                                                                                                                                                                                  
-  hipStreamSynchronize(stream_ccl);  
+
 
   MPI_Barrier(MPI_COMM_WORLD);
   //double start = MPI_Wtime();
