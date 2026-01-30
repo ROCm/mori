@@ -425,8 +425,10 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
   const int elemsPerWarp = warpSize * vecSize;
   const size_t numIters = (nelems - offset) / elemsPerWarp;
   const size_t laneOffset = laneId * vecSize;
+
+  using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
   for (size_t iter = 0; iter < numIters; ++iter) {
-    float accumValFp32[vecSize] = {0};
+    AccumFp32Type accumValFp32[vecSize] = {AccumFp32Type{0}};
 #pragma unroll
     for (int i = 0; i < accumNum; ++i) {
       if (srcs[i] == nullptr) continue;
@@ -434,7 +436,7 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
       float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
 #pragma unroll
       for (int j = 0; j < vecSize; ++j) {
-        accumValFp32[j] += float(reinterpret_cast<const T*>(&srcVal)[j]) * srcScale;
+        accumValFp32[j] += AccumFp32Type(reinterpret_cast<const T*>(&srcVal)[j]) * srcScale;
       }
     }
 
@@ -454,13 +456,13 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
   // remaining size
   offset += laneId;
   while (offset < nelems) {
-    float accumValFp32 = 0;
+    AccumFp32Type accumValFp32 = AccumFp32Type{0};
     for (int i = 0; i < accumNum; ++i) {
       const T* srcPtr = srcs[i];
       if (srcPtr == nullptr) continue;
 
       float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
-      accumValFp32 += float(srcPtr[offset]) * srcScale;
+      accumValFp32 += AccumFp32Type(srcPtr[offset]) * srcScale;
     }
     dest[offset] = T(accumValFp32);
     offset += warpSize;
@@ -485,8 +487,9 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
   const int laneId = threadIdx.x & (warpSize - 1);
   const size_t laneOffset = laneId * vecSize;
 
+  using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
   for (size_t iter = 0; iter < numIters; iter++) {
-    float accumValFp32[Unroll][vecSize] = {0};
+    AccumFp32Type accumValFp32[Unroll][vecSize] = {0};
 
 #pragma unroll AccumNum
     for (int i = 0; i < AccumNum; ++i) {
@@ -499,7 +502,7 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
         float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
 #pragma unroll vecSize
         for (int j = 0; j < vecSize; ++j) {
-          accumValFp32[u][j] += float(reinterpret_cast<const T*>(&srcVals)[j]) * srcScale;
+          accumValFp32[u][j] += AccumFp32Type(reinterpret_cast<const T*>(&srcVals)[j]) * srcScale;
         }
       }
     }
@@ -542,8 +545,9 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
     cached_srcs[i] = srcs[i];
   }
 
+  using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
   for (size_t iter = 0; iter < numIters; ++iter) {
-    float accumValFp32[vecSize] = {0};
+    AccumFp32Type accumValFp32[vecSize] = {AccumFp32Type{0}};
 
     DataType srcVals[AccumNum];
 #pragma unroll AccumNum
@@ -557,7 +561,7 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
       if (cached_srcs[i] != nullptr) {
 #pragma unroll vecSize
         for (int j = 0; j < vecSize; ++j) {
-          accumValFp32[j] += float(reinterpret_cast<const T*>(srcVals + i)[j]) * scales[i];
+          accumValFp32[j] += AccumFp32Type(reinterpret_cast<const T*>(srcVals + i)[j]) * scales[i];
         }
       }
     }
