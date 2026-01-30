@@ -26,6 +26,7 @@
 #include <cassert>
 
 #include "mori/collective/all2all/sdma_all2all.hpp"
+#include "mori/collective/allgather/sdma_allgather.hpp"
 
 namespace mori {
 namespace collective {

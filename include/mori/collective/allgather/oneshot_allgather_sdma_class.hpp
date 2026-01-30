@@ -32,19 +32,10 @@
 // Include necessary headers
 #include "mori/application/application.hpp"
 #include "mori/shmem/shmem.hpp"
+#include "mori/collective/collective_pub.hpp"
 
 namespace mori {
 namespace collective {
-
-// Complete definition of ShmemDeleter in header
-struct ShmemDeleter {
-    void operator()(void* ptr) const {
-        if (ptr) {
-            shmem::ShmemFree(ptr);
-        }
-    }
-};
-
 template <typename T>
 class AllgatherSdma {
 private:

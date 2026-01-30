@@ -227,9 +227,9 @@ double All2allSdma<T>::wait_async(hipStream_t stream) {
 
         // Final synchronization
         if (wait_stream != nullptr) {
-            hipStreamSynchronize(wait_stream);
+            （void)hipStreamSynchronize(wait_stream);
         } else {
-            hipDeviceSynchronize();
+            （void)hipDeviceSynchronize();
         }
 
         // Calculate total execution time

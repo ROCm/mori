@@ -29,7 +29,7 @@ namespace mori {
 namespace collective {
 
 template <typename T>
-double AllGather_sdma(T* input, T* output, size_t total_count,
+double Allgather_sdma(T* input, T* output, size_t total_count,
                                           hipStream_t stream) {
   int myPe =  shmem::ShmemMyPe();
   int npes =  shmem::ShmemNPes();
