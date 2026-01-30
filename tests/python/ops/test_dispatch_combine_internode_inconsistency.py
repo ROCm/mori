@@ -28,6 +28,7 @@ import torch.distributed as dist
 
 os.environ["MORI_SHMEM_HEAP_SIZE"] = "6G"
 
+
 class EpDispatchCombineTestCase:
     def __init__(self, config):
         self.config = config
@@ -98,7 +99,7 @@ class EpDispatchCombineTestCase:
             for r in range(self.config.world_size)
         ]
         if self.config.scale_type_size == 1:
-            all_rank_scales = [t.to(torch.float8_e4m3fnuz) for t in all_rank_scales]
+            all_rank_scales = [t.to(torch.bfloat16) for t in all_rank_scales]
 
         # gen input & output
         # some functions such as randn and cat are not implemented for fp8
@@ -208,7 +209,7 @@ def _test_dispatch_combine(
 
 # TODO: create a sub process group so that we can test worlds size < 8
 @pytest.mark.parametrize("world_size", (8,))
-@pytest.mark.parametrize("data_type", (torch.float8_e4m3fnuz,))
+@pytest.mark.parametrize("data_type", (torch.bfloat16,))
 @pytest.mark.parametrize("hidden_dim", (7168,))
 @pytest.mark.parametrize("scale_dim", (56,))
 @pytest.mark.parametrize("scale_type_size", (4,))
