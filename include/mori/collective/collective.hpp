@@ -23,3 +23,5 @@
 #pragma once
 
 #include "mori/collective/all2all/sdma_all2all.hpp"
+#include "mori/collective/all2all/oneshot_all2all_sdma_class.hpp"
+#include "mori/collective/all2all/oneshot_all2all_sdma_async_kernel.hpp"

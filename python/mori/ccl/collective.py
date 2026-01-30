@@ -19,33 +19,52 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-from mori import cpp as mori_cpp
-import torch
-import ctypes
 
-class All2allSdma: 
-    def __init__(self, my_pe: int, npes: int):
+import numpy as np
+import torch
+from mori import cpp as mori_cpp
+from mori import shmem as mori_shme
+from typing import Optional
+
+
+def _cpp_all2all_factory(entity_name: str):
+    """Factory function to get C++ entities from mori_cpp module"""
+    return getattr(mori_cpp, entity_name)
+
+
+class All2allSdma:
+    """Python wrapper for All2allSdma C++ class"""
+
+    def __init__(self, my_pe: int, npes: int, 
+                 input_buffer_size: Optional[int] = None,
+                 output_buffer_size: Optional[int] = None,
+                 transit_buffer_size: Optional[int] = None):
+        """Initialize All2allSdma"""
         self.my_pe = my_pe
         self.npes = npes
-    
-    def __call__(self, 
-                 input_data: np.ndarray, 
-                 output_data: np.ndarray,
-                 count: int) -> float:
-        """        
+        handle_class = _cpp_all2all_factory("All2allSdmaHandle")
+        
+        if input_buffer_size is not None and output_buffer_size is not None:
+            self._handle = handle_class(my_pe, npes, input_buffer_size, output_buffer_size)
+        elif transit_buffer_size is not None:
+            self._handle = handle_class(my_pe, npes, transit_buffer_size)
+        else:
+            self._handle = handle_class(my_pe, npes, 512 * 1024 * 1024)
+
+    def __call__(self, input_data, output_data, count: int, stream=None) -> float:
+        """Execute All2All SDMA operation.
+        
         Args:
-            input_data: 输入数据 (uint32 numpy数组)
-            output_data: 输出数据 (uint32 numpy数组) 
-            count: 每个PE的元素数量
+            input_data: Input CUDA tensor (torch.int32, 1D, GPU memory)
+            output_data: Output CUDA tensor (torch.int32, 1D, GPU memory)
+            count: Number of elements per PE
+            stream: Optional HIP stream
             
         Returns:
-            执行时间(秒)
+            Execution time in seconds
         """
-        # 直接调用C++函数
-        return mori_cpp.all2all_sdma(
-            self.my_pe,
-            self.npes,
-            input_data,
-            output_data,
-            count
-        )
+        return self._handle(input_data, output_data, count, stream)
+
+    def reset_flags(self):
+        """Reset synchronization flags"""
+        self._handle.reset_flags()

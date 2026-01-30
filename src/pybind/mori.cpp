@@ -419,6 +419,65 @@ void RegisterMoriIo(pybind11::module_& m) {
 }
 
 void RegisterMoriCcl(pybind11::module_& m) {
+    // Bind All2allSdma class (uint32_t version)
+    py::class_<mori::collective::All2allSdma<uint32_t>>(m, "All2allSdmaHandle")
+        .def(py::init<int, int, size_t, size_t>(),
+             py::arg("my_pe"),
+             py::arg("npes"),
+             py::arg("input_buffer_size"),
+             py::arg("output_buffer_size"),
+             "Initialize All2allSdma with PE ID, number of PEs, and buffer sizes")
+        .def(py::init<int, int, size_t>(),
+             py::arg("my_pe"),
+             py::arg("npes"),
+             py::arg("transit_buffer_size") = 512 * 1024 * 1024,
+             "Initialize All2allSdma with PE ID, number of PEs, and transit buffer size (default 512MB)")
+        .def("__call__",
+            [](mori::collective::All2allSdma<uint32_t>& self,
+               const torch::Tensor& input_tensor,
+               const torch::Tensor& output_tensor,
+               size_t count,
+               py::object stream_obj) -> double {
+
+                if (input_tensor.dim() != 1) {
+                    throw std::runtime_error("Input tensor must be 1-dimensional");
+                }
+                if (output_tensor.dim() != 1) {
+                    throw std::runtime_error("Output tensor must be 1-dimensional");
+                }
+                if (!input_tensor.is_cuda()) {
+                    throw std::runtime_error("Input tensor must be CUDA tensor");
+                }
+                if (!output_tensor.is_cuda()) {
+                    throw std::runtime_error("Output tensor must be CUDA tensor");
+                }
+                if (input_tensor.scalar_type() != torch::kInt32) {
+                    throw std::runtime_error("Input tensor must be int32");
+                }
+                if (output_tensor.scalar_type() != torch::kInt32) {
+                    throw std::runtime_error("Output tensor must be int32");
+                }
+
+                uint32_t* input_ptr = input_tensor.data_ptr<uint32_t>();
+                uint32_t* output_ptr = output_tensor.data_ptr<uint32_t>();
+
+                hipStream_t stream = nullptr;
+                if (!stream_obj.is_none()) {
+                    // TODO: Convert stream_obj to hipStream_t
+                }
+
+                return self(input_ptr, output_ptr, count, stream);
+            },
+            py::arg("input"),
+            py::arg("output"),
+            py::arg("count"),
+            py::arg("stream") = py::none(),
+            "Execute All2all SDMA operation with PyTorch CUDA tensors")
+        .def("reset_flags",
+            &mori::collective::All2allSdma<uint32_t>::resetFlags,
+            "Reset synchronization flags");
+
+    // Keep old function-based interface for backward compatibility (optional)
     m.def("all2all_sdma",
         [](int my_pe, int npes,
            py::array_t<uint32_t> input_array,
@@ -426,7 +485,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
            size_t count,
            py::object stream_obj) -> double {
 
-            // 检查数组维度
+            // Validate arrays
             if (input_array.ndim() != 1) {
                 throw std::runtime_error("Input array must be 1-dimensional");
             }
@@ -434,37 +493,25 @@ void RegisterMoriCcl(pybind11::module_& m) {
                 throw std::runtime_error("Output array must be 1-dimensional");
             }
 
-            // 检查数组大小
+            // Get buffer info
             py::buffer_info input_info = input_array.request();
             py::buffer_info output_info = output_array.request();
 
-            if (static_cast<size_t>(input_info.size) != count) {
-                throw std::runtime_error("Input size doesn't match count parameter");
-            }
-            if (static_cast<size_t>(output_info.size) != count * npes) {
-                throw std::runtime_error("Output size doesn't match total elements");
-            }
-
-            // 获取数据指针
+            // Get data pointers
             uint32_t* input_ptr = static_cast<uint32_t*>(input_info.ptr);
             uint32_t* output_ptr = static_cast<uint32_t*>(output_info.ptr);
 
-            // 处理HIP流参数（stream_obj可以是None）
+            // Handle HIP stream parameter
             hipStream_t stream = nullptr;
-
-            // 如果提供了stream对象，可以尝试转换
-            // 注意：这里需要根据你的实际需求处理stream转换
             if (!stream_obj.is_none()) {
-                // 这里需要根据你的stream对象类型进行转换
-                // 例如，如果是Python的HIP stream对象
-                // stream = py::cast<hipStream_t>(stream_obj);
+                // TODO: Convert Python stream object to hipStream_t if needed
             }
 
-            // 调用C++函数 - 现在传递4个参数
+            // Call C++ function
             return mori::collective::All2all_sdma<uint32_t>(
                 input_ptr, output_ptr, count, stream);
         },
-        // 参数说明，stream参数设为可选
+        // Parameter documentation
         py::arg("my_pe"),
         py::arg("npes"),
         py::arg("input"),
