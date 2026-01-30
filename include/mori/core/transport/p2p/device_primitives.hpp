@@ -24,7 +24,17 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
 
+#include <cstdint>
+
 #include "mori/core/utils.hpp"
+
+#ifndef HIP_FP8_CVT_FAST_PATH
+#if defined(__AMDGCN__)
+#define HIP_FP8_CVT_FAST_PATH 1
+#else
+#define HIP_FP8_CVT_FAST_PATH 0
+#endif
+#endif
 namespace mori {
 namespace core {
 
@@ -682,6 +692,60 @@ __device__ __forceinline__ float WarpReduceMaxF32(float val) {
   return val;
 }
 
+__device__ __forceinline__ uint32_t WarpReduceMaxU32(uint32_t val) {
+  for (int delta = (warpSize >> 1); delta > 0; delta >>= 1) {
+    const int other = __shfl_down(static_cast<int>(val), delta);
+    const int cur = static_cast<int>(val);
+    val = static_cast<uint32_t>((cur > other) ? cur : other);
+  }
+  return val;
+}
+
+template <typename Fp8T>
+__device__ __forceinline__ float2 CvtFp8x2ToFloat2(__hip_fp8x2_storage_t v) {
+#if HIP_FP8_CVT_FAST_PATH
+  auto f2 = __builtin_amdgcn_cvt_pk_f32_fp8(static_cast<uint32_t>(static_cast<uint16_t>(v)), false);
+  return float2{f2[0], f2[1]};
+#else
+  Fp8T lo;
+  lo.__x = static_cast<__hip_fp8_storage_t>(static_cast<uint16_t>(v) & 0xFF);
+  Fp8T hi;
+  hi.__x = static_cast<__hip_fp8_storage_t>(static_cast<uint16_t>(v) >> 8);
+  return float2{static_cast<float>(lo), static_cast<float>(hi)};
+#endif
+}
+
+template <typename Fp8T>
+__device__ __forceinline__ __hip_fp8x2_storage_t CvtFloat2ToFp8x2(float2 v) {
+#if HIP_FP8_CVT_FAST_PATH
+  if constexpr ((Fp8T::__default_interpret == __HIP_E4M3_FNUZ) ||
+                (Fp8T::__default_interpret == __HIP_E4M3)) {
+    const float fp8Max = kCombineInternalFp8MaxFinite;
+    v.x = __builtin_amdgcn_fmed3f(v.x, fp8Max, -fp8Max);
+    v.y = __builtin_amdgcn_fmed3f(v.y, fp8Max, -fp8Max);
+    uint32_t packed = __builtin_amdgcn_cvt_pk_fp8_f32(v.x, v.y, 0, false);
+    return static_cast<__hip_fp8x2_storage_t>(packed & 0xFFFF);
+  }
+#endif
+  return __hip_cvt_float2_to_fp8x2(v, Fp8T::__default_saturation, Fp8T::__default_interpret);
+}
+
+template <typename OutT>
+__device__ __forceinline__ void StoreOutPair(OutT* __restrict__ dst, int idx, float2 v) {
+  if constexpr (sizeof(OutT) == 2) {
+    union {
+      uint32_t u32;
+      OutT out[2];
+    } tmp;
+    tmp.out[0] = OutT(v.x);
+    tmp.out[1] = OutT(v.y);
+    store<4>(dst + idx, tmp.u32);
+  } else {
+    dst[idx] = OutT(v.x);
+    dst[idx + 1] = OutT(v.y);
+  }
+}
+
 template <typename Fp8T, typename InT>
 __device__ __forceinline__ void WarpQuantizeToFp8Blockwise(Fp8T* __restrict__ dstToken,
                                                            float* __restrict__ dstScales,
@@ -690,24 +754,232 @@ __device__ __forceinline__ void WarpQuantizeToFp8Blockwise(Fp8T* __restrict__ ds
   const int laneId = threadIdx.x & (warpSize - 1);
   const int blockElems = (hiddenDim + scaleDim - 1) / scaleDim;
 
+  const bool blockAligned2 = ((blockElems & 1) == 0);
+  constexpr float fp8Max = kCombineInternalFp8MaxFinite;
+  const float invFp8Max = 1.0f / fp8Max;
+
+  auto* dstBytes = reinterpret_cast<__hip_fp8_storage_t*>(dstToken);
+
+  constexpr int kMaxCachedVec2Iters = 4;
+  constexpr int kMaxCachedElems = warpSize * 2 * kMaxCachedVec2Iters;
+  const bool srcAligned4 = ((reinterpret_cast<uintptr_t>(srcToken) & 0x3) == 0);
+  const bool canCacheVec2 = blockAligned2 && srcAligned4 && (blockElems <= kMaxCachedElems) &&
+                            std::is_same_v<InT, hip_bfloat16>;
+
+  auto bf16_abs_bits = [](uint16_t bits) -> uint16_t {
+    // Match fmaxf(fabsf(x), ...) semantics for NaNs: ignore NaN payloads.
+    bits = static_cast<uint16_t>(bits & 0x7FFF);
+    const uint16_t exp = static_cast<uint16_t>(bits & 0x7F80);
+    const uint16_t mant = static_cast<uint16_t>(bits & 0x007F);
+    if ((exp == 0x7F80) && (mant != 0)) return 0;
+    return bits;
+  };
+
   for (int sb = 0; sb < scaleDim; ++sb) {
     const int start = sb * blockElems;
     const int end = std::min(start + blockElems, hiddenDim);
 
-    float localMaxAbs = 0.0f;
-    for (int idx = start + laneId; idx < end; idx += warpSize) {
-      localMaxAbs = fmaxf(localMaxAbs, fabsf(static_cast<float>(srcToken[idx])));
+    float maxAbs = 0.0f;
+    if (canCacheVec2) {
+      uint32_t cachedPairs[kMaxCachedVec2Iters];
+      int iters = 0;
+
+      uint32_t localMaxBits = 0;
+      const int base = start + (laneId << 1);
+      int idx = base;
+      for (; (idx + 1) < end; idx += (warpSize << 1)) {
+        const uint32_t packed = load<4>(srcToken + idx);
+        cachedPairs[iters] = packed;
+        iters++;
+
+        const uint16_t lo = bf16_abs_bits(static_cast<uint16_t>(packed & 0xFFFF));
+        const uint16_t hi = bf16_abs_bits(static_cast<uint16_t>(packed >> 16));
+        const uint32_t pairMax = static_cast<uint32_t>((lo > hi) ? lo : hi);
+        localMaxBits = (localMaxBits > pairMax) ? localMaxBits : pairMax;
+      }
+
+      uint16_t tailBits = 0;
+      bool hasTail = false;
+      if (idx < end) {
+        tailBits = reinterpret_cast<const hip_bfloat16*>(srcToken)[idx].data;
+        const uint32_t tailAbs = static_cast<uint32_t>(bf16_abs_bits(tailBits));
+        localMaxBits = (localMaxBits > tailAbs) ? localMaxBits : tailAbs;
+        hasTail = true;
+      }
+
+      uint32_t maxBits = WarpReduceMaxU32(localMaxBits);
+      maxBits = static_cast<uint32_t>(__shfl(static_cast<int>(maxBits), 0));
+      hip_bfloat16 bf;
+      bf.data = static_cast<__hip_uint16_t>(maxBits);
+      maxAbs = static_cast<float>(bf);
+
+      const float scale = (maxAbs == 0.0f) ? 1.0f : (maxAbs * invFp8Max);
+      if (laneId == 0) dstScales[sb] = scale;
+      const float invScale = (maxAbs == 0.0f) ? 1.0f : (fp8Max / maxAbs);
+
+      for (int i = 0, storeIdx = base; i < iters; ++i, storeIdx += (warpSize << 1)) {
+        const uint32_t packed = cachedPairs[i];
+        hip_bfloat16 lo;
+        lo.data = static_cast<__hip_uint16_t>(packed & 0xFFFF);
+        hip_bfloat16 hi;
+        hi.data = static_cast<__hip_uint16_t>(packed >> 16);
+        float2 v;
+        v.x = static_cast<float>(lo) * invScale;
+        v.y = static_cast<float>(hi) * invScale;
+        __hip_fp8x2_storage_t fp8 = CvtFloat2ToFp8x2<Fp8T>(v);
+        store<2>(dstBytes + storeIdx, static_cast<uint16_t>(fp8));
+      }
+
+      if (hasTail) {
+        hip_bfloat16 tail;
+        tail.data = static_cast<__hip_uint16_t>(tailBits);
+        dstToken[idx] = Fp8T(static_cast<float>(tail) * invScale);
+      }
+    } else {
+      float localMaxAbs = 0.0f;
+      if constexpr (std::is_same_v<InT, hip_bfloat16>) {
+        uint32_t localMaxBits = 0;
+        if (blockAligned2) {
+          int idx = start + (laneId << 1);
+          for (; (idx + 1) < end; idx += (warpSize << 1)) {
+            const __hip_uint16_t b0 = reinterpret_cast<const hip_bfloat16*>(srcToken)[idx].data;
+            const __hip_uint16_t b1 = reinterpret_cast<const hip_bfloat16*>(srcToken)[idx + 1].data;
+            const uint16_t abs0 = bf16_abs_bits(static_cast<uint16_t>(b0));
+            const uint16_t abs1 = bf16_abs_bits(static_cast<uint16_t>(b1));
+            const uint32_t pairMax = static_cast<uint32_t>((abs0 > abs1) ? abs0 : abs1);
+            localMaxBits = (localMaxBits > pairMax) ? localMaxBits : pairMax;
+          }
+          if (idx < end) {
+            const __hip_uint16_t b0 = reinterpret_cast<const hip_bfloat16*>(srcToken)[idx].data;
+            const uint32_t abs0 = static_cast<uint32_t>(bf16_abs_bits(b0));
+            localMaxBits = (localMaxBits > abs0) ? localMaxBits : abs0;
+          }
+        } else {
+          for (int idx = start + laneId; idx < end; idx += warpSize) {
+            const __hip_uint16_t b0 = reinterpret_cast<const hip_bfloat16*>(srcToken)[idx].data;
+            const uint32_t abs0 = static_cast<uint32_t>(bf16_abs_bits(b0));
+            localMaxBits = (localMaxBits > abs0) ? localMaxBits : abs0;
+          }
+        }
+        uint32_t maxBits = WarpReduceMaxU32(localMaxBits);
+        maxBits = static_cast<uint32_t>(__shfl(static_cast<int>(maxBits), 0));
+        hip_bfloat16 bf;
+        bf.data = static_cast<__hip_uint16_t>(maxBits);
+        maxAbs = static_cast<float>(bf);
+      } else {
+        if (blockAligned2) {
+          int idx = start + (laneId << 1);
+          for (; (idx + 1) < end; idx += (warpSize << 1)) {
+            const float v0 = static_cast<float>(srcToken[idx]);
+            const float v1 = static_cast<float>(srcToken[idx + 1]);
+            localMaxAbs = fmaxf(localMaxAbs, fabsf(v0));
+            localMaxAbs = fmaxf(localMaxAbs, fabsf(v1));
+          }
+          if (idx < end) {
+            const float v0 = static_cast<float>(srcToken[idx]);
+            localMaxAbs = fmaxf(localMaxAbs, fabsf(v0));
+          }
+        } else {
+          for (int idx = start + laneId; idx < end; idx += warpSize) {
+            localMaxAbs = fmaxf(localMaxAbs, fabsf(static_cast<float>(srcToken[idx])));
+          }
+        }
+        maxAbs = WarpReduceMaxF32(localMaxAbs);
+        maxAbs = __shfl(maxAbs, 0);
+      }
+
+      const float scale = (maxAbs == 0.0f) ? 1.0f : (maxAbs * invFp8Max);
+      if (laneId == 0) dstScales[sb] = scale;
+      const float invScale = (maxAbs == 0.0f) ? 1.0f : (fp8Max / maxAbs);
+
+      if (blockAligned2) {
+        int idx = start + (laneId << 1);
+        for (; (idx + 1) < end; idx += (warpSize << 1)) {
+          float2 v;
+          v.x = static_cast<float>(srcToken[idx]) * invScale;
+          v.y = static_cast<float>(srcToken[idx + 1]) * invScale;
+          __hip_fp8x2_storage_t packed = CvtFloat2ToFp8x2<Fp8T>(v);
+          store<2>(dstBytes + idx, static_cast<uint16_t>(packed));
+        }
+        if (idx < end) {
+          dstToken[idx] = Fp8T(static_cast<float>(srcToken[idx]) * invScale);
+        }
+      } else {
+        for (int idx = start + laneId; idx < end; idx += warpSize) {
+          dstToken[idx] = Fp8T(static_cast<float>(srcToken[idx]) * invScale);
+        }
+      }
     }
-    float maxAbs = WarpReduceMaxF32(localMaxAbs);
-    maxAbs = __shfl(maxAbs, 0);
+  }
+}
 
-    const float fp8Max = kCombineInternalFp8MaxFinite;
-    const float scale = (maxAbs == 0.0f) ? 1.0f : (maxAbs / fp8Max);
-    if (laneId == 0) dstScales[sb] = scale;
-    const float invScale = 1.0f / scale;
+template <typename OutT, typename Fp8T, int AccumNum>
+__device__ __forceinline__ void WarpAccumFp8DequantFullImpl(
+    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int hiddenDim, int scaleDim) {
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const int blockElems = (hiddenDim + scaleDim - 1) / scaleDim;
 
-    for (int idx = start + laneId; idx < end; idx += warpSize) {
-      dstToken[idx] = Fp8T(static_cast<float>(srcToken[idx]) * invScale);
+  const Fp8T* cachedSrcs[AccumNum];
+  const float* cachedScalePtrs[AccumNum];
+  const __hip_fp8_storage_t* cachedSrcBytes[AccumNum];
+#pragma unroll AccumNum
+  for (int i = 0; i < AccumNum; ++i) {
+    cachedSrcs[i] = srcs[i];
+    cachedScalePtrs[i] =
+        (cachedSrcs[i] != nullptr && srcScales[i] != nullptr) ? srcScales[i] : nullptr;
+    cachedSrcBytes[i] = (cachedSrcs[i] != nullptr)
+                            ? reinterpret_cast<const __hip_fp8_storage_t*>(cachedSrcs[i])
+                            : nullptr;
+  }
+
+  const bool useVec2 =
+      ((blockElems & 1) == 0) && ((reinterpret_cast<uintptr_t>(dstToken) & 0x3) == 0);
+  for (int sb = 0; sb < scaleDim; ++sb) {
+    const int start = sb * blockElems;
+    const int end = std::min(start + blockElems, hiddenDim);
+
+    float sbScales[AccumNum];
+#pragma unroll AccumNum
+    for (int i = 0; i < AccumNum; ++i) {
+      sbScales[i] = cachedScalePtrs[i] != nullptr ? cachedScalePtrs[i][sb] : 1.0f;
+    }
+
+    if (useVec2) {
+      int idx = start + (laneId << 1);
+      for (; (idx + 1) < end; idx += (warpSize << 1)) {
+        float2 acc2{0.0f, 0.0f};
+#pragma unroll AccumNum
+        for (int i = 0; i < AccumNum; ++i) {
+          if (cachedSrcs[i] == nullptr) continue;
+          __hip_fp8x2_storage_t packed =
+              static_cast<__hip_fp8x2_storage_t>(load<2>(cachedSrcBytes[i] + idx));
+          float2 v = CvtFp8x2ToFloat2<Fp8T>(packed);
+          const float s = sbScales[i];
+          acc2.x = fmaf(v.x, s, acc2.x);
+          acc2.y = fmaf(v.y, s, acc2.y);
+        }
+        StoreOutPair(dstToken, idx, acc2);
+      }
+      if (idx < end) {
+        float acc = 0.0f;
+#pragma unroll AccumNum
+        for (int i = 0; i < AccumNum; ++i) {
+          if (cachedSrcs[i] == nullptr) continue;
+          acc += static_cast<float>(cachedSrcs[i][idx]) * sbScales[i];
+        }
+        dstToken[idx] = OutT(acc);
+      }
+    } else {
+      for (int idx = start + laneId; idx < end; idx += warpSize) {
+        float acc = 0.0f;
+#pragma unroll AccumNum
+        for (int i = 0; i < AccumNum; ++i) {
+          if (cachedSrcs[i] == nullptr) continue;
+          acc += static_cast<float>(cachedSrcs[i][idx]) * sbScales[i];
+        }
+        dstToken[idx] = OutT(acc);
+      }
     }
   }
 }
@@ -717,25 +989,142 @@ __device__ __forceinline__ void WarpAccumFp8DequantFull(OutT* __restrict__ dstTo
                                                         const Fp8T* const* __restrict__ srcs,
                                                         const float* const* __restrict__ srcScales,
                                                         int accumNum, int hiddenDim, int scaleDim) {
+  switch (accumNum) {
+    case 1:
+      WarpAccumFp8DequantFullImpl<OutT, Fp8T, 1>(dstToken, srcs, srcScales, hiddenDim, scaleDim);
+      break;
+    case 2:
+      WarpAccumFp8DequantFullImpl<OutT, Fp8T, 2>(dstToken, srcs, srcScales, hiddenDim, scaleDim);
+      break;
+    case 4:
+      WarpAccumFp8DequantFullImpl<OutT, Fp8T, 4>(dstToken, srcs, srcScales, hiddenDim, scaleDim);
+      break;
+    case 6:
+      WarpAccumFp8DequantFullImpl<OutT, Fp8T, 6>(dstToken, srcs, srcScales, hiddenDim, scaleDim);
+      break;
+    case 8:
+      WarpAccumFp8DequantFullImpl<OutT, Fp8T, 8>(dstToken, srcs, srcScales, hiddenDim, scaleDim);
+      break;
+    case 10:
+      WarpAccumFp8DequantFullImpl<OutT, Fp8T, 10>(dstToken, srcs, srcScales, hiddenDim, scaleDim);
+      break;
+    default: {
+      const int laneId = threadIdx.x & (warpSize - 1);
+      const int blockElems = (hiddenDim + scaleDim - 1) / scaleDim;
+      for (int sb = 0; sb < scaleDim; ++sb) {
+        const int start = sb * blockElems;
+        const int end = std::min(start + blockElems, hiddenDim);
+        for (int idx = start + laneId; idx < end; idx += warpSize) {
+          float acc = 0.0f;
+          for (int i = 0; i < accumNum; ++i) {
+            if (srcs[i] != nullptr && srcScales[i] != nullptr) {
+              acc += static_cast<float>(srcs[i][idx]) * srcScales[i][sb];
+            }
+          }
+          dstToken[idx] = OutT(acc);
+        }
+      }
+      break;
+    }
+  }
+}
+
+template <typename OutT, typename Fp8T, int AccumNum>
+__device__ __forceinline__ void WarpAccumFp8DequantSegmentImpl(
+    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int hiddenDimOffset, int hiddenDimSize,
+    int hiddenDim, int scaleDim) {
   const int laneId = threadIdx.x & (warpSize - 1);
   const int blockElems = (hiddenDim + scaleDim - 1) / scaleDim;
 
-  float blockScales[warpSize];
-  for (int sb = 0; sb < scaleDim; ++sb) {
-    for (int i = 0; i < accumNum; ++i) {
-      blockScales[i] = (srcs[i] != nullptr && srcScales[i] != nullptr) ? srcScales[i][sb] : 0.0f;
+  const Fp8T* cachedSrcs[AccumNum];
+  const float* cachedScalePtrs[AccumNum];
+  const __hip_fp8_storage_t* cachedSrcBytes[AccumNum];
+#pragma unroll AccumNum
+  for (int i = 0; i < AccumNum; ++i) {
+    cachedSrcs[i] = srcs[i];
+    cachedScalePtrs[i] =
+        (cachedSrcs[i] != nullptr && srcScales[i] != nullptr) ? srcScales[i] : nullptr;
+    cachedSrcBytes[i] = (cachedSrcs[i] != nullptr)
+                            ? reinterpret_cast<const __hip_fp8_storage_t*>(cachedSrcs[i])
+                            : nullptr;
+  }
+
+  const bool blockAligned2 = ((blockElems & 1) == 0);
+  const bool offsetAligned2 = ((hiddenDimOffset & 1) == 0);
+  const bool useVec2 =
+      blockAligned2 && offsetAligned2 && ((reinterpret_cast<uintptr_t>(dstToken) & 0x3) == 0);
+
+  const int globalStart = hiddenDimOffset;
+  const int globalEnd = hiddenDimOffset + hiddenDimSize;
+  const int sbStart = globalStart / blockElems;
+  const int sbEnd = (globalEnd - 1) / blockElems;
+
+  for (int sb = sbStart; sb <= sbEnd; ++sb) {
+    const int blockStart = sb * blockElems;
+    const int blockEnd = std::min(blockStart + blockElems, hiddenDim);
+    int segStart = (globalStart > blockStart) ? globalStart : blockStart;
+    int segEnd = (globalEnd < blockEnd) ? globalEnd : blockEnd;
+
+    int localStart = segStart - hiddenDimOffset;
+    int localEnd = segEnd - hiddenDimOffset;
+    if (localStart >= localEnd) continue;
+
+    float sbScales[AccumNum];
+#pragma unroll AccumNum
+    for (int i = 0; i < AccumNum; ++i) {
+      sbScales[i] = cachedScalePtrs[i] != nullptr ? cachedScalePtrs[i][sb] : 1.0f;
     }
 
-    const int start = sb * blockElems;
-    const int end = std::min(start + blockElems, hiddenDim);
-    for (int idx = start + laneId; idx < end; idx += warpSize) {
-      float acc = 0.0f;
-      for (int i = 0; i < accumNum; ++i) {
-        if (srcs[i] != nullptr) {
-          acc += static_cast<float>(srcs[i][idx]) * blockScales[i];
+    if (useVec2) {
+      if ((localStart & 1) != 0) {
+        if (laneId == 0) {
+          float acc = 0.0f;
+#pragma unroll AccumNum
+          for (int i = 0; i < AccumNum; ++i) {
+            if (cachedSrcs[i] == nullptr) continue;
+            acc += static_cast<float>(cachedSrcs[i][localStart]) * sbScales[i];
+          }
+          dstToken[localStart] = OutT(acc);
         }
+        localStart += 1;
       }
-      dstToken[idx] = OutT(acc);
+
+      int idx = localStart + (laneId << 1);
+      for (; (idx + 1) < localEnd; idx += (warpSize << 1)) {
+        float2 acc2{0.0f, 0.0f};
+#pragma unroll AccumNum
+        for (int i = 0; i < AccumNum; ++i) {
+          if (cachedSrcs[i] == nullptr) continue;
+          __hip_fp8x2_storage_t packed =
+              static_cast<__hip_fp8x2_storage_t>(load<2>(cachedSrcBytes[i] + idx));
+          float2 v = CvtFp8x2ToFloat2<Fp8T>(packed);
+          const float s = sbScales[i];
+          acc2.x = fmaf(v.x, s, acc2.x);
+          acc2.y = fmaf(v.y, s, acc2.y);
+        }
+        StoreOutPair(dstToken, idx, acc2);
+      }
+
+      if (idx < localEnd) {
+        float acc = 0.0f;
+#pragma unroll AccumNum
+        for (int i = 0; i < AccumNum; ++i) {
+          if (cachedSrcs[i] == nullptr) continue;
+          acc += static_cast<float>(cachedSrcs[i][idx]) * sbScales[i];
+        }
+        dstToken[idx] = OutT(acc);
+      }
+    } else {
+      for (int idx = localStart + laneId; idx < localEnd; idx += warpSize) {
+        float acc = 0.0f;
+#pragma unroll AccumNum
+        for (int i = 0; i < AccumNum; ++i) {
+          if (cachedSrcs[i] == nullptr) continue;
+          acc += static_cast<float>(cachedSrcs[i][idx]) * sbScales[i];
+        }
+        dstToken[idx] = OutT(acc);
+      }
     }
   }
 }
@@ -745,19 +1134,47 @@ __device__ __forceinline__ void WarpAccumFp8DequantSegment(
     OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
     const float* const* __restrict__ srcScales, int accumNum, int hiddenDimOffset,
     int hiddenDimSize, int hiddenDim, int scaleDim) {
-  const int laneId = threadIdx.x & (warpSize - 1);
-  const int blockElems = (hiddenDim + scaleDim - 1) / scaleDim;
-
-  for (int idx = laneId; idx < hiddenDimSize; idx += warpSize) {
-    const int globalIdx = hiddenDimOffset + idx;
-    const int sb = globalIdx / blockElems;
-    float acc = 0.0f;
-    for (int i = 0; i < accumNum; ++i) {
-      if (srcs[i] != nullptr && srcScales[i] != nullptr) {
-        acc += static_cast<float>(srcs[i][idx]) * srcScales[i][sb];
+  switch (accumNum) {
+    case 1:
+      WarpAccumFp8DequantSegmentImpl<OutT, Fp8T, 1>(dstToken, srcs, srcScales, hiddenDimOffset,
+                                                    hiddenDimSize, hiddenDim, scaleDim);
+      break;
+    case 2:
+      WarpAccumFp8DequantSegmentImpl<OutT, Fp8T, 2>(dstToken, srcs, srcScales, hiddenDimOffset,
+                                                    hiddenDimSize, hiddenDim, scaleDim);
+      break;
+    case 4:
+      WarpAccumFp8DequantSegmentImpl<OutT, Fp8T, 4>(dstToken, srcs, srcScales, hiddenDimOffset,
+                                                    hiddenDimSize, hiddenDim, scaleDim);
+      break;
+    case 6:
+      WarpAccumFp8DequantSegmentImpl<OutT, Fp8T, 6>(dstToken, srcs, srcScales, hiddenDimOffset,
+                                                    hiddenDimSize, hiddenDim, scaleDim);
+      break;
+    case 8:
+      WarpAccumFp8DequantSegmentImpl<OutT, Fp8T, 8>(dstToken, srcs, srcScales, hiddenDimOffset,
+                                                    hiddenDimSize, hiddenDim, scaleDim);
+      break;
+    case 10:
+      WarpAccumFp8DequantSegmentImpl<OutT, Fp8T, 10>(dstToken, srcs, srcScales, hiddenDimOffset,
+                                                     hiddenDimSize, hiddenDim, scaleDim);
+      break;
+    default: {
+      const int laneId = threadIdx.x & (warpSize - 1);
+      const int blockElems = (hiddenDim + scaleDim - 1) / scaleDim;
+      for (int idx = laneId; idx < hiddenDimSize; idx += warpSize) {
+        const int globalIdx = hiddenDimOffset + idx;
+        const int sb = globalIdx / blockElems;
+        float acc = 0.0f;
+        for (int i = 0; i < accumNum; ++i) {
+          if (srcs[i] != nullptr && srcScales[i] != nullptr) {
+            acc += static_cast<float>(srcs[i][idx]) * srcScales[i][sb];
+          }
+        }
+        dstToken[idx] = OutT(acc);
       }
+      break;
     }
-    dstToken[idx] = OutT(acc);
   }
 }
 
