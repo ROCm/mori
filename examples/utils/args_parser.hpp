@@ -113,6 +113,7 @@ class BenchmarkConfig {
 
   bool isBidirectional() const { return bidirectional; }
   bool isReportMsgrate() const { return report_msgrate; }
+  bool getUseVMM() const { return use_vmm; }
 
   Datatype getDatatype() const { return datatype; }
   ReduceOp getReduceOp() const { return reduce_op; }
@@ -135,6 +136,7 @@ class BenchmarkConfig {
 
   bool bidirectional = false;
   bool report_msgrate = false;
+  bool use_vmm = false;
 
   Datatype datatype = {MORI_UINT64, sizeof(uint64_t), "uint64_t"};
   ReduceOp reduce_op = {MORI_SUM, "sum"};

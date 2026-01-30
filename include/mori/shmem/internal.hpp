@@ -35,12 +35,13 @@ namespace shmem {
 // Shmem operation mode
 enum class ShmemMode {
   Isolation,   // Original mode: each allocation gets its own SymmMemObj
-  StaticHeap,   // single static heap with unified memory space
-  VMHeap   // TODO: implement virtual memory heap
+  StaticHeap,  // single static heap with unified memory space
+  VMHeap       // TODO: implement virtual memory heap
 };
 
-// Configuration for static symmetric heap
-constexpr size_t DEFAULT_SYMMETRIC_HEAP_SIZE = 2ULL * 1024 * 1024 * 1024;  // 2GB default
+constexpr size_t DEFAULT_STATIC_SYMMETRIC_HEAP_SIZE = 2ULL * 1024 * 1024 * 1024;  // 2GB default
+constexpr size_t DEFAULT_VMM_SYMMETRIC_HEAP_SIZE = 8ULL * 1024 * 1024 * 1024;     // 8GB default
+constexpr size_t DEFAULT_VMM_MIN_CHUNK_SIZE = 64ULL * 1024 * 1024;                // 64MB default
 
 struct BootStates {
   int rank{0};
@@ -60,11 +61,23 @@ struct MemoryStates {
   application::RdmaMemoryRegionManager* mrMgr{nullptr};
 
   // Static heap mode fields (only used when mode == StaticHeap)
+  std::mutex heapLock;  // Lock for thread-safe allocation
+  application::HeapType heapType{
+      application::HeapType::Uncached};  // Type of heap memory (default: uncached)
+
+  // Static heap
   void* staticHeapBasePtr{nullptr};          // Base address of the static symmetric heap
   size_t staticHeapSize{0};                  // Total size of the static heap
   size_t staticHeapUsed{0};                  // Currently used bytes
   application::SymmMemObjPtr staticHeapObj;  // SymmMemObj for the entire heap
-  std::mutex heapLock;                       // Lock for thread-safe allocation
+
+  // VMM-based dynamic heap
+  bool useVMMHeap{false};                 // Whether to use VMM-based heap
+  bool vmmHeapInitialized{false};         // VMM heap initialization status
+  void* vmmHeapBaseAddr{nullptr};         // Base address of VMM heap
+  size_t vmmHeapVirtualSize{0};           // Total virtual address space size
+  size_t vmmHeapChunkSize{0};             // Size of each chunk
+  application::SymmMemObjPtr vmmHeapObj;  // SymmMemObj for the entire heap
 };
 
 enum ShmemStatesStatus {
@@ -103,6 +116,9 @@ struct GpuStates {
   application::RdmaEndpoint* rdmaEndpoints{nullptr};
   uint32_t* endpointLock{nullptr};
 
+  // Heap information (supports both static and VMM modes)
+  bool useVMMHeap{false};                     // Whether using VMM-based heap
+  uint8_t vmmChunkSizeShift{0};               // log2(chunkSize) for VMM heap, 0 for static heap
   uintptr_t heapBaseAddr{0};                  // Base address of symmetric heap
   uintptr_t heapEndAddr{0};                   // End address of symmetric heap (base + size)
   application::SymmMemObj* heapObj{nullptr};  // Pointer to the heap's SymmMemObj on device
@@ -124,34 +140,6 @@ struct RemoteAddrInfo {
   __device__ RemoteAddrInfo() : raddr(0), rkey(0), valid(false) {}
   __device__ RemoteAddrInfo(uintptr_t r, uintptr_t k) : raddr(r), rkey(k), valid(true) {}
 };
-
-inline __device__ RemoteAddrInfo ShmemAddrToRemoteAddr(const void* localAddr, int pe) {
-  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  uintptr_t localAddrInt = reinterpret_cast<uintptr_t>(localAddr);
-
-  if (globalGpuStates->heapObj == nullptr) {
-    assert(false);
-    return RemoteAddrInfo();
-  }
-
-  // Check if address is in symmetric heap
-  if (localAddrInt < globalGpuStates->heapBaseAddr ||
-      localAddrInt >= globalGpuStates->heapEndAddr) {
-    assert(false);
-    return RemoteAddrInfo();
-  }
-
-  // Calculate offset within the symmetric heap
-  size_t offset = reinterpret_cast<const char*>(localAddr) -
-                  reinterpret_cast<const char*>(globalGpuStates->heapBaseAddr);
-
-  // Get remote address using the heap's SymmMemObj
-  application::SymmMemObj* heapObj = globalGpuStates->heapObj;
-  uintptr_t raddr = heapObj->peerPtrs[pe] + offset;
-  uintptr_t rkey = heapObj->peerRkeys[pe];
-
-  return RemoteAddrInfo(raddr, rkey);
-}
 
 class ShmemStatesSingleton {
  public:

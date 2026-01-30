@@ -89,14 +89,14 @@ inline __device__ T ShmemAtomicTypeFetchWarpKernel(const void* dest, void* val, 
 template <application::TransportType TsptType>
 inline __device__ void ShmemPutMemNbiThreadKernel(const application::SymmMemObjPtr dest,
                                                   size_t destOffset,
-                                                  const application::RdmaMemoryRegion& source,
+                                                  const application::SymmMemObjPtr source,
                                                   size_t sourceOffset, size_t bytes, int pe,
                                                   int qpId = 0);
 
 template <application::TransportType TsptType>
 inline __device__ void ShmemPutMemNbiWarpKernel(const application::SymmMemObjPtr dest,
                                                 size_t destOffset,
-                                                const application::RdmaMemoryRegion& source,
+                                                const application::SymmMemObjPtr source,
                                                 size_t sourceOffset, size_t bytes, int pe,
                                                 int qpId = 0);
 
@@ -113,14 +113,14 @@ inline __device__ void ShmemPutSizeImmNbiWarpKernel(const application::SymmMemOb
 template <application::TransportType TsptType, bool onlyOneSignal = true>
 inline __device__ void ShmemPutMemNbiSignalThreadKernel(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId = 0);
 
 template <application::TransportType TsptType, bool onlyOneSignal = true>
 inline __device__ void ShmemPutMemNbiSignalWarpKernel(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId = 0);
 
