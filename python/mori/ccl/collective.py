@@ -68,3 +68,45 @@ class All2allSdma:
     def reset_flags(self):
         """Reset synchronization flags"""
         self._handle.reset_flags()
+
+def _cpp_allgather_factory(entity_name: str):
+    """Factory function to get C++ entities from mori_cpp module"""
+    return getattr(mori_cpp, entity_name)
+
+
+class AllgatherSdma:
+    """Python wrapper for AllgatherSdma C++ class"""
+
+    def __init__(self, my_pe: int, npes: int, 
+                 input_buffer_size: Optional[int] = None,
+                 output_buffer_size: Optional[int] = None,
+                 transit_buffer_size: Optional[int] = None):
+        """Initialize AllgatherSdma"""
+        self.my_pe = my_pe
+        self.npes = npes
+        handle_class = _cpp_allgather_factory("AllgatherSdmaHandle")
+        
+        if input_buffer_size is not None and output_buffer_size is not None:
+            self._handle = handle_class(my_pe, npes, input_buffer_size, output_buffer_size)
+        elif transit_buffer_size is not None:
+            self._handle = handle_class(my_pe, npes, transit_buffer_size)
+        else:
+            self._handle = handle_class(my_pe, npes, 512 * 1024 * 1024)
+
+    def __call__(self, input_data, output_data, count: int, stream=None) -> float:
+        """Execute AllGATHER SDMA operation.
+        
+        Args:
+            input_data: Input CUDA tensor (torch.int32, 1D, GPU memory)
+            output_data: Output CUDA tensor (torch.int32, 1D, GPU memory)
+            count: Number of elements per PE
+            stream: Optional HIP stream
+            
+        Returns:
+            Execution time in seconds
+        """
+        return self._handle(input_data, output_data, count, stream)
+
+    def reset_flags(self):
+        """Reset synchronization flags"""
+        self._handle.reset_flags()

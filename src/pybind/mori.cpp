@@ -522,7 +522,108 @@ void RegisterMoriCcl(pybind11::module_& m) {
         "Execute All2All SDMA operation"
   );
 
+    // Bind AllgatherSdma class (uint32_t version)
+    py::class_<mori::collective::AllgatherSdma<uint32_t>>(m, "AllgatherSdmaHandle")
+        .def(py::init<int, int, size_t, size_t>(),
+             py::arg("my_pe"),
+             py::arg("npes"),
+             py::arg("input_buffer_size"),
+             py::arg("output_buffer_size"),
+             "Initialize AllgatherSdma with PE ID, number of PEs, and buffer sizes")
+        .def(py::init<int, int, size_t>(),
+             py::arg("my_pe"),
+             py::arg("npes"),
+             py::arg("transit_buffer_size") = 512 * 1024 * 1024,
+             "Initialize AllgatherSdma with PE ID, number of PEs, and transit buffer size (default 512MB)")
+        .def("__call__",
+            [](mori::collective::AllgatherSdma<uint32_t>& self,
+               const torch::Tensor& input_tensor,
+               const torch::Tensor& output_tensor,
+               size_t count,
+               py::object stream_obj) -> double {
 
+                if (input_tensor.dim() != 1) {
+                    throw std::runtime_error("Input tensor must be 1-dimensional");
+                }
+                if (output_tensor.dim() != 1) {
+                    throw std::runtime_error("Output tensor must be 1-dimensional");
+                }
+                if (!input_tensor.is_cuda()) {
+                    throw std::runtime_error("Input tensor must be CUDA tensor");
+                }
+                if (!output_tensor.is_cuda()) {
+                    throw std::runtime_error("Output tensor must be CUDA tensor");
+                }
+                if (input_tensor.scalar_type() != torch::kInt32) {
+                    throw std::runtime_error("Input tensor must be int32");
+                }
+                if (output_tensor.scalar_type() != torch::kInt32) {
+                    throw std::runtime_error("Output tensor must be int32");
+                }
+
+                uint32_t* input_ptr = input_tensor.data_ptr<uint32_t>();
+                uint32_t* output_ptr = output_tensor.data_ptr<uint32_t>();
+
+                hipStream_t stream = nullptr;
+                if (!stream_obj.is_none()) {
+                    // TODO: Convert stream_obj to hipStream_t
+                }
+
+                return self(input_ptr, output_ptr, count, stream);
+            },
+            py::arg("input"),
+            py::arg("output"),
+            py::arg("count"),
+            py::arg("stream") = py::none(),
+            "Execute Allgather SDMA operation with PyTorch CUDA tensors")
+        .def("reset_flags",
+            &mori::collective::AllgatherSdma<uint32_t>::resetFlags,
+            "Reset synchronization flags");
+
+    // Keep old function-based interface for backward compatibility (optional)
+    m.def("allgather_sdma",
+        [](int my_pe, int npes,
+           py::array_t<uint32_t> input_array,
+           py::array_t<uint32_t> output_array,
+           size_t count,
+           py::object stream_obj) -> double {
+
+            // Validate arrays
+            if (input_array.ndim() != 1) {
+                throw std::runtime_error("Input array must be 1-dimensional");
+            }
+            if (output_array.ndim() != 1) {
+                throw std::runtime_error("Output array must be 1-dimensional");
+            }
+
+            // Get buffer info
+            py::buffer_info input_info = input_array.request();
+            py::buffer_info output_info = output_array.request();
+
+            // Get data pointers
+            uint32_t* input_ptr = static_cast<uint32_t*>(input_info.ptr);
+            uint32_t* output_ptr = static_cast<uint32_t*>(output_info.ptr);
+
+            // Handle HIP stream parameter
+            hipStream_t stream = nullptr;
+            if (!stream_obj.is_none()) {
+                // TODO: Convert Python stream object to hipStream_t if needed
+            }
+
+            // Call C++ function
+            return mori::collective::Allgather_sdma<uint32_t>(
+                input_ptr, output_ptr, count, stream);
+        },
+        // Parameter documentation
+        py::arg("my_pe"),
+        py::arg("npes"),
+        py::arg("input"),
+        py::arg("output"),
+        py::arg("count"),
+        py::arg("stream") = py::none(),
+        // 函数文档
+        "Execute Allgather SDMA operation"
+  );
 
 }
 }  // namespace mori
