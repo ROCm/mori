@@ -23,5 +23,4 @@
 from .collective import All2allSdma
 from .collective import AllgatherSdma
 
-__all__ = ['All2allSdma']
-__all__ = ['AllgatherSdma']
+__all__ = ['All2allSdma', 'AllgatherSdma']

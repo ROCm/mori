@@ -65,6 +65,43 @@ class All2allSdma:
         """
         return self._handle(input_data, output_data, count, stream)
 
+    def start_async(self, input_data, output_data, count: int, stream=None) -> bool:
+        """Start asynchronous All2All SDMA operation (PUT phase).
+        
+        Args:
+            input_data: Input CUDA tensor (torch.int32, 1D, GPU memory)
+            output_data: Output CUDA tensor (torch.int32, 1D, GPU memory)
+            count: Number of elements per PE
+            stream: Optional HIP stream
+            
+        Returns:
+            True if operation started successfully, False otherwise
+        """
+        return self._handle.start_async(input_data, output_data, count, stream)
+
+    def wait_async(self, stream=None) -> float:
+        """Wait for asynchronous All2All SDMA operation to complete (WAIT phase).
+        
+        Args:
+            stream: Optional HIP stream
+            
+        Returns:
+            Execution time in seconds, -1.0 if failed
+        """
+        return self._handle.wait_async(stream)
+
+    def is_async_in_progress(self) -> bool:
+        """Check if async operation is in progress.
+        
+        Returns:
+            True if async operation is active
+        """
+        return self._handle.is_async_in_progress()
+
+    def cancel_async(self):
+        """Cancel ongoing async operation"""
+        self._handle.cancel_async()
+
     def reset_flags(self):
         """Reset synchronization flags"""
         self._handle.reset_flags()
@@ -106,6 +143,43 @@ class AllgatherSdma:
             Execution time in seconds
         """
         return self._handle(input_data, output_data, count, stream)
+
+    def start_async(self, input_data, output_data, count: int, stream=None) -> bool:
+        """Start asynchronous AllGATHER SDMA operation (PUT phase).
+        
+        Args:
+            input_data: Input CUDA tensor (torch.int32, 1D, GPU memory)
+            output_data: Output CUDA tensor (torch.int32, 1D, GPU memory)
+            count: Number of elements per PE
+            stream: Optional HIP stream
+            
+        Returns:
+            True if operation started successfully, False otherwise
+        """
+        return self._handle.start_async(input_data, output_data, count, stream)
+
+    def wait_async(self, stream=None) -> float:
+        """Wait for asynchronous AllGATHER SDMA operation to complete (WAIT phase).
+        
+        Args:
+            stream: Optional HIP stream
+            
+        Returns:
+            Execution time in seconds, -1.0 if failed
+        """
+        return self._handle.wait_async(stream)
+
+    def is_async_in_progress(self) -> bool:
+        """Check if async operation is in progress.
+        
+        Returns:
+            True if async operation is active
+        """
+        return self._handle.is_async_in_progress()
+
+    def cancel_async(self):
+        """Cancel ongoing async operation"""
+        self._handle.cancel_async()
 
     def reset_flags(self):
         """Reset synchronization flags"""
