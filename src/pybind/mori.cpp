@@ -28,7 +28,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/python.h>
-
+#include <pybind11/numpy.h>
+#include <pybind11/stl.h>
 #include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
@@ -418,109 +419,372 @@ void RegisterMoriIo(pybind11::module_& m) {
 }
 
 void RegisterMoriCcl(pybind11::module_& m) {
-  m.def("shmem_mpi_init",
-    []() -> int {
-      return mori::shmem::ShmemMpiInit(MPI_COMM_WORLD);
-    },
-    "Initialize SHMEM with MPI"
+    // Bind All2allSdma class (uint32_t version)
+    py::class_<mori::collective::All2allSdma<uint32_t>>(m, "All2allSdmaHandle")
+        .def(py::init<int, int, size_t, size_t>(),
+             py::arg("my_pe"),
+             py::arg("npes"),
+             py::arg("input_buffer_size"),
+             py::arg("output_buffer_size"),
+             "Initialize All2allSdma with PE ID, number of PEs, and buffer sizes")
+        .def(py::init<int, int, size_t>(),
+             py::arg("my_pe"),
+             py::arg("npes"),
+             py::arg("transit_buffer_size") = 512 * 1024 * 1024,
+             "Initialize All2allSdma with PE ID, number of PEs, and transit buffer size (default 512MB)")
+        .def("__call__",
+            [](mori::collective::All2allSdma<uint32_t>& self,
+               const torch::Tensor& input_tensor,
+               const torch::Tensor& output_tensor,
+               size_t count,
+               py::object stream_obj) -> double {
+
+                if (input_tensor.dim() != 1) {
+                    throw std::runtime_error("Input tensor must be 1-dimensional");
+                }
+                if (output_tensor.dim() != 1) {
+                    throw std::runtime_error("Output tensor must be 1-dimensional");
+                }
+                if (!input_tensor.is_cuda()) {
+                    throw std::runtime_error("Input tensor must be CUDA tensor");
+                }
+                if (!output_tensor.is_cuda()) {
+                    throw std::runtime_error("Output tensor must be CUDA tensor");
+                }
+                // C++ class uses uint32_t template
+                // Accept uint32 or int32 (same memory layout)
+                uint32_t* input_ptr = nullptr;
+                uint32_t* output_ptr = nullptr;
+                
+                if (input_tensor.scalar_type() == torch::kUInt32) {
+                    input_ptr = input_tensor.data_ptr<uint32_t>();
+                } else if (input_tensor.scalar_type() == torch::kInt32) {
+                    input_ptr = reinterpret_cast<uint32_t*>(input_tensor.data_ptr<int32_t>());
+                } else {
+                    throw std::runtime_error("Input tensor must be uint32 or int32");
+                }
+                
+                if (output_tensor.scalar_type() == torch::kUInt32) {
+                    output_ptr = output_tensor.data_ptr<uint32_t>();
+                } else if (output_tensor.scalar_type() == torch::kInt32) {
+                    output_ptr = reinterpret_cast<uint32_t*>(output_tensor.data_ptr<int32_t>());
+                } else {
+                    throw std::runtime_error("Output tensor must be uint32 or int32");
+                }
+
+                hipStream_t stream = nullptr;
+                if (!stream_obj.is_none()) {
+                    // TODO: Convert stream_obj to hipStream_t
+                }
+
+                return self(input_ptr, output_ptr, count, stream);
+            },
+            py::arg("input"),
+            py::arg("output"),
+            py::arg("count"),
+            py::arg("stream") = py::none(),
+            "Execute All2all SDMA operation with PyTorch CUDA tensors")
+        .def("start_async",
+            [](mori::collective::All2allSdma<uint32_t>& self,
+               const torch::Tensor& input_tensor,
+               const torch::Tensor& output_tensor,
+               size_t count,
+               py::object stream_obj) -> bool {
+
+                if (input_tensor.dim() != 1) {
+                    throw std::runtime_error("Input tensor must be 1-dimensional");
+                }
+                if (output_tensor.dim() != 1) {
+                    throw std::runtime_error("Output tensor must be 1-dimensional");
+                }
+                if (!input_tensor.is_cuda()) {
+                    throw std::runtime_error("Input tensor must be CUDA tensor");
+                }
+                if (!output_tensor.is_cuda()) {
+                    throw std::runtime_error("Output tensor must be CUDA tensor");
+                }
+                // C++ class uses uint32_t template
+                // Accept uint32 or int32 (same memory layout)
+                uint32_t* input_ptr = nullptr;
+                uint32_t* output_ptr = nullptr;
+                
+                if (input_tensor.scalar_type() == torch::kUInt32) {
+                    input_ptr = input_tensor.data_ptr<uint32_t>();
+                } else if (input_tensor.scalar_type() == torch::kInt32) {
+                    input_ptr = reinterpret_cast<uint32_t*>(input_tensor.data_ptr<int32_t>());
+                } else {
+                    throw std::runtime_error("Input tensor must be uint32 or int32");
+                }
+                
+                if (output_tensor.scalar_type() == torch::kUInt32) {
+                    output_ptr = output_tensor.data_ptr<uint32_t>();
+                } else if (output_tensor.scalar_type() == torch::kInt32) {
+                    output_ptr = reinterpret_cast<uint32_t*>(output_tensor.data_ptr<int32_t>());
+                } else {
+                    throw std::runtime_error("Output tensor must be uint32 or int32");
+                }
+
+                hipStream_t stream = nullptr;
+                if (!stream_obj.is_none()) {
+                    // TODO: Convert stream_obj to hipStream_t
+                }
+
+                return self.start_async(input_ptr, output_ptr, count, stream);
+            },
+            py::arg("input"),
+            py::arg("output"),
+            py::arg("count"),
+            py::arg("stream") = py::none(),
+            "Start asynchronous All2all SDMA operation (PUT phase)")
+        .def("wait_async",
+            [](mori::collective::All2allSdma<uint32_t>& self,
+               py::object stream_obj) -> double {
+
+                hipStream_t stream = nullptr;
+                if (!stream_obj.is_none()) {
+                    // TODO: Convert stream_obj to hipStream_t
+                }
+
+                return self.wait_async(stream);
+            },
+            py::arg("stream") = py::none(),
+            "Wait for asynchronous All2all SDMA operation to complete (WAIT phase)")
+        .def("is_async_in_progress",
+            &mori::collective::All2allSdma<uint32_t>::is_async_in_progress,
+            "Check if async operation is in progress")
+        .def("cancel_async",
+            &mori::collective::All2allSdma<uint32_t>::cancel_async,
+            "Cancel ongoing async operation")
+        .def("reset_flags",
+            &mori::collective::All2allSdma<uint32_t>::resetFlags,
+            "Reset synchronization flags");
+
+    // Keep old function-based interface for backward compatibility (optional)
+    m.def("all2all_sdma",
+        [](int my_pe, int npes,
+           py::array_t<uint32_t> input_array,
+           py::array_t<uint32_t> output_array,
+           size_t count,
+           py::object stream_obj) -> double {
+
+            // Validate arrays
+            if (input_array.ndim() != 1) {
+                throw std::runtime_error("Input array must be 1-dimensional");
+            }
+            if (output_array.ndim() != 1) {
+                throw std::runtime_error("Output array must be 1-dimensional");
+            }
+
+            // Get buffer info
+            py::buffer_info input_info = input_array.request();
+            py::buffer_info output_info = output_array.request();
+
+            // Get data pointers
+            uint32_t* input_ptr = static_cast<uint32_t*>(input_info.ptr);
+            uint32_t* output_ptr = static_cast<uint32_t*>(output_info.ptr);
+
+            // Handle HIP stream parameter
+            hipStream_t stream = nullptr;
+            if (!stream_obj.is_none()) {
+                // TODO: Convert Python stream object to hipStream_t if needed
+            }
+
+            // Call C++ function
+            return mori::collective::All2all_sdma<uint32_t>(
+                input_ptr, output_ptr, count, stream);
+        },
+        // Parameter documentation
+        py::arg("my_pe"),
+        py::arg("npes"),
+        py::arg("input"),
+        py::arg("output"),
+        py::arg("count"),
+        py::arg("stream") = py::none(),
+        // 函数文档
+        "Execute All2All SDMA operation"
   );
 
-  m.def("shmem_my_pe",
-    []() -> int {
-      return mori::shmem::ShmemMyPe();
-    },
-    "Get SHMEM PE rank"
-  );
+    // Bind AllgatherSdma class (uint32_t version)
+    py::class_<mori::collective::AllgatherSdma<uint32_t>>(m, "AllgatherSdmaHandle")
+        .def(py::init<int, int, size_t, size_t>(),
+             py::arg("my_pe"),
+             py::arg("npes"),
+             py::arg("input_buffer_size"),
+             py::arg("output_buffer_size"),
+             "Initialize AllgatherSdma with PE ID, number of PEs, and buffer sizes")
+        .def(py::init<int, int, size_t>(),
+             py::arg("my_pe"),
+             py::arg("npes"),
+             py::arg("transit_buffer_size") = 512 * 1024 * 1024,
+             "Initialize AllgatherSdma with PE ID, number of PEs, and transit buffer size (default 512MB)")
+        .def("__call__",
+            [](mori::collective::AllgatherSdma<uint32_t>& self,
+               const torch::Tensor& input_tensor,
+               const torch::Tensor& output_tensor,
+               size_t count,
+               py::object stream_obj) -> double {
 
-  m.def("shmem_n_pes",
-    []() -> int {
-      return mori::shmem::ShmemNPes();
-    },
-    "Get number of SHMEM PEs"
-  );
+                if (input_tensor.dim() != 1) {
+                    throw std::runtime_error("Input tensor must be 1-dimensional");
+                }
+                if (output_tensor.dim() != 1) {
+                    throw std::runtime_error("Output tensor must be 1-dimensional");
+                }
+                if (!input_tensor.is_cuda()) {
+                    throw std::runtime_error("Input tensor must be CUDA tensor");
+                }
+                if (!output_tensor.is_cuda()) {
+                    throw std::runtime_error("Output tensor must be CUDA tensor");
+                }
+                // C++ class uses uint32_t template
+                // Accept uint32 or int32 (same memory layout)
+                uint32_t* input_ptr = nullptr;
+                uint32_t* output_ptr = nullptr;
+                
+                if (input_tensor.scalar_type() == torch::kUInt32) {
+                    input_ptr = input_tensor.data_ptr<uint32_t>();
+                } else if (input_tensor.scalar_type() == torch::kInt32) {
+                    input_ptr = reinterpret_cast<uint32_t*>(input_tensor.data_ptr<int32_t>());
+                } else {
+                    throw std::runtime_error("Input tensor must be uint32 or int32");
+                }
+                
+                if (output_tensor.scalar_type() == torch::kUInt32) {
+                    output_ptr = output_tensor.data_ptr<uint32_t>();
+                } else if (output_tensor.scalar_type() == torch::kInt32) {
+                    output_ptr = reinterpret_cast<uint32_t*>(output_tensor.data_ptr<int32_t>());
+                } else {
+                    throw std::runtime_error("Output tensor must be uint32 or int32");
+                }
 
-  // 在现有的绑定后添加
+                hipStream_t stream = nullptr;
+                if (!stream_obj.is_none()) {
+                    // TODO: Convert stream_obj to hipStream_t
+                }
 
-  
-  m.def("shmem_malloc",
-    [](size_t size) -> uintptr_t {
-      void* ptr = mori::shmem::ShmemMalloc(size);
-      return reinterpret_cast<uintptr_t>(ptr);
-    },
-    py::arg("size"),
-    "Allocate symmetric memory"
-  );
-  
-  m.def("shmem_free",
-    [](uintptr_t ptr) {
-      mori::shmem::ShmemFree(reinterpret_cast<void*>(ptr));
-    },
-    py::arg("ptr"),
-    "Free symmetric memory"
-  );
-    
-  // float32
-  m.def("all2all_sdma", 
-    [](uintptr_t input_ptr, uintptr_t output_ptr, size_t count, uintptr_t stream) {
-      return mori::collective::All2all_sdma<float>(
-          reinterpret_cast<float*>(input_ptr),
-          reinterpret_cast<float*>(output_ptr),
-          count,
-          reinterpret_cast<hipStream_t>(stream));
-    }, 
-    py::arg("input_ptr"), 
-    py::arg("output_ptr"), 
-    py::arg("count"), 
-    py::arg("stream") = 0,
-    "All2All SDMA operation for float32"
-  );
-  
-  // 正确的绑定代码（4个参数，使用uint32_t）
-  m.def("all2all_sdma_uint32", 
-    [](uintptr_t input_ptr, uintptr_t output_ptr, size_t count, uintptr_t stream) -> double {
-    printf("[PYBIND_SIMPLE] all2all_sdma_uint32 called\n");
-    printf("[PYBIND_SIMPLE] input=%p, output=%p, count=%zu, stream=%p\n",
-           reinterpret_cast<void*>(input_ptr),
-           reinterpret_cast<void*>(output_ptr),
-           count,
-           reinterpret_cast<void*>(stream));
-    
-    try {
-      // 直接调用C++函数
-      return mori::collective::All2all_sdma<uint32_t>(
-          reinterpret_cast<uint32_t*>(input_ptr),
-          reinterpret_cast<uint32_t*>(output_ptr),
-          count,
-          reinterpret_cast<hipStream_t>(stream));
-    } catch (const std::exception& e) {
-      printf("[PYBIND_ERROR] Exception: %s\n", e.what());
-      return -999.0;
-    }
-  }, 
-  py::arg("input_ptr"), 
-  py::arg("output_ptr"), 
-  py::arg("count"), 
-  py::arg("stream") = 0,
-  "All2All SDMA for uint32"
-  );
+                return self(input_ptr, output_ptr, count, stream);
+            },
+            py::arg("input"),
+            py::arg("output"),
+            py::arg("count"),
+            py::arg("stream") = py::none(),
+            "Execute Allgather SDMA operation with PyTorch CUDA tensors")
+        .def("start_async",
+            [](mori::collective::AllgatherSdma<uint32_t>& self,
+               const torch::Tensor& input_tensor,
+               const torch::Tensor& output_tensor,
+               size_t count,
+               py::object stream_obj) -> bool {
 
-  // int32_t版本（如果需要）
-  m.def("all2all_sdma_int32", 
-    [](uintptr_t input_ptr, uintptr_t output_ptr, size_t count, uintptr_t stream) -> double {
-    return mori::collective::All2all_sdma<int32_t>(
-        reinterpret_cast<int32_t*>(input_ptr),
-        reinterpret_cast<int32_t*>(output_ptr),
-        count,
-        reinterpret_cast<hipStream_t>(stream));
-  }, 
-  py::arg("input_ptr"), 
-  py::arg("output_ptr"), 
-  py::arg("count"), 
-  py::arg("stream") = 0,
-  "All2All SDMA for int32"
+                if (input_tensor.dim() != 1) {
+                    throw std::runtime_error("Input tensor must be 1-dimensional");
+                }
+                if (output_tensor.dim() != 1) {
+                    throw std::runtime_error("Output tensor must be 1-dimensional");
+                }
+                if (!input_tensor.is_cuda()) {
+                    throw std::runtime_error("Input tensor must be CUDA tensor");
+                }
+                if (!output_tensor.is_cuda()) {
+                    throw std::runtime_error("Output tensor must be CUDA tensor");
+                }
+                // C++ class uses uint32_t template
+                // Accept uint32 or int32 (same memory layout)
+                uint32_t* input_ptr = nullptr;
+                uint32_t* output_ptr = nullptr;
+                
+                if (input_tensor.scalar_type() == torch::kUInt32) {
+                    input_ptr = input_tensor.data_ptr<uint32_t>();
+                } else if (input_tensor.scalar_type() == torch::kInt32) {
+                    input_ptr = reinterpret_cast<uint32_t*>(input_tensor.data_ptr<int32_t>());
+                } else {
+                    throw std::runtime_error("Input tensor must be uint32 or int32");
+                }
+                
+                if (output_tensor.scalar_type() == torch::kUInt32) {
+                    output_ptr = output_tensor.data_ptr<uint32_t>();
+                } else if (output_tensor.scalar_type() == torch::kInt32) {
+                    output_ptr = reinterpret_cast<uint32_t*>(output_tensor.data_ptr<int32_t>());
+                } else {
+                    throw std::runtime_error("Output tensor must be uint32 or int32");
+                }
+
+                hipStream_t stream = nullptr;
+                if (!stream_obj.is_none()) {
+                    // TODO: Convert stream_obj to hipStream_t
+                }
+
+                return self.start_async(input_ptr, output_ptr, count, stream);
+            },
+            py::arg("input"),
+            py::arg("output"),
+            py::arg("count"),
+            py::arg("stream") = py::none(),
+            "Start asynchronous Allgather SDMA operation (PUT phase)")
+        .def("wait_async",
+            [](mori::collective::AllgatherSdma<uint32_t>& self,
+               py::object stream_obj) -> double {
+
+                hipStream_t stream = nullptr;
+                if (!stream_obj.is_none()) {
+                    // TODO: Convert stream_obj to hipStream_t
+                }
+
+                return self.wait_async(stream);
+            },
+            py::arg("stream") = py::none(),
+            "Wait for asynchronous Allgather SDMA operation to complete (WAIT phase)")
+        .def("is_async_in_progress",
+            &mori::collective::AllgatherSdma<uint32_t>::is_async_in_progress,
+            "Check if async operation is in progress")
+        .def("cancel_async",
+            &mori::collective::AllgatherSdma<uint32_t>::cancel_async,
+            "Cancel ongoing async operation")
+        .def("reset_flags",
+            &mori::collective::AllgatherSdma<uint32_t>::resetFlags,
+            "Reset synchronization flags");
+
+    // Keep old function-based interface for backward compatibility (optional)
+    m.def("allgather_sdma",
+        [](py::array_t<uint32_t> input_array,
+           py::array_t<uint32_t> output_array,
+           size_t count,
+           py::object stream_obj) -> double {
+
+            // Validate arrays
+            if (input_array.ndim() != 1) {
+                throw std::runtime_error("Input array must be 1-dimensional");
+            }
+            if (output_array.ndim() != 1) {
+                throw std::runtime_error("Output array must be 1-dimensional");
+            }
+
+            // Get buffer info
+            py::buffer_info input_info = input_array.request();
+            py::buffer_info output_info = output_array.request();
+
+            // Get data pointers
+            uint32_t* input_ptr = static_cast<uint32_t*>(input_info.ptr);
+            uint32_t* output_ptr = static_cast<uint32_t*>(output_info.ptr);
+
+            // Handle HIP stream parameter
+            hipStream_t stream = nullptr;
+            if (!stream_obj.is_none()) {
+                // TODO: Convert Python stream object to hipStream_t if needed
+            }
+
+            // Call C++ function
+            return mori::collective::Allgather_sdma<uint32_t>(
+                input_ptr, output_ptr, count, stream);
+        },
+        // Parameter documentation
+        py::arg("input"),
+        py::arg("output"),
+        py::arg("count"),
+        py::arg("stream") = py::none(),
+        // 函数文档
+        "Execute Allgather SDMA operation"
   );
-
-
 
 }
 }  // namespace mori

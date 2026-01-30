@@ -21,10 +21,17 @@
 // SOFTWARE.
 
 #pragma once
+namespace mori {
+namespace collective {
 
-#include "mori/collective/all2all/sdma_all2all.hpp"
-#include "mori/collective/all2all/oneshot_all2all_sdma_class.hpp"
-#include "mori/collective/all2all/oneshot_all2all_sdma_async_kernel.hpp"
-#include "mori/collective/allgather/sdma_allgather.hpp"
-#include "mori/collective/allgather/oneshot_allgather_sdma_class.hpp"
-#include "mori/collective/allgather/oneshot_sdma_async_kernel.hpp"
+// Complete inline definition of ShmemDeleter in header
+struct ShmemDeleter {
+    void operator()(void* ptr) const {
+        if (ptr) {
+            shmem::ShmemFree(ptr);
+        }
+    }
+};
+
+}
+}

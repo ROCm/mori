@@ -54,7 +54,7 @@ double All2all_sdma(T* input, T* output, size_t total_count, hipStream_t stream)
  
   double start = MPI_Wtime();
   OneShotAll2allSdmaKernel<T><<<1, 512>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
-  hipDeviceSynchronize();
+  (void)hipDeviceSynchronize();
   double end = MPI_Wtime();
   printf("========local consume time:%.9f======== \n", end-start);
  

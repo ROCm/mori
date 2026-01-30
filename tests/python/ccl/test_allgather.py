@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-All2All SDMA Test using torch.distributed and multiprocessing
+Allgather SDMA Test using torch.distributed and multiprocessing
 """
 
 import os
@@ -8,11 +8,11 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import mori.shmem as shmem
-from mori.ccl import All2allSdma
+from mori.ccl import AllgatherSdma
 from tests.python.utils import TorchDistContext, get_free_port
 
 
-def _test_all2all(rank, world_size, port, elems, iterations, warmup):
+def _test_allgather(rank, world_size, port, elems, iterations, warmup):
     """Worker function for each process"""
     
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
@@ -25,51 +25,58 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
         assert npes == world_size, f"npes mismatch: {npes} != {world_size}"
         
         # Match C++ naming and logic
-        elems_per_pe = elems  # Elements each PE sends to each target PE (like C++ elemsPerPe)
-        bytes_per_pe = elems_per_pe * 4  # Bytes per PE chunk (like C++ bytesPerPe)
-        total_bytes = bytes_per_pe * npes  # Total bytes per PE: all chunks combined (like C++ totalBytes)
+        elems_per_pe = elems  # Elements each PE contributes (like C++ elemsPerPe)
+        bytes_per_pe = elems_per_pe * 4  # Bytes per PE contribution (like C++ bytesPerPe)
+        total_bytes = bytes_per_pe * npes  # Total bytes after gathering from all PEs (like C++ totalBytes)
         
         if rank == 0:
             print(f"\n{'='*60}")
-            print(f"All2All SDMA Test")
+            print(f"Allgather SDMA Test")
             print(f"World size: {world_size}")
             print(f"Elements per PE: {elems_per_pe:,}")
-            print(f"Data size: {total_bytes / (1024**2):.2f} MB per PE, {total_bytes * npes / (1024**2):.2f} MB total")
+            print(f"Data size: {bytes_per_pe / (1024**2):.2f} MB per PE (input), {total_bytes / (1024**2):.2f} MB total (output)")
             print(f"Iterations: {iterations}" + (f" (warmup: {warmup})" if warmup > 0 else ""))
             print(f"{'='*60}\n")
         
         print(f"PE {rank}/{world_size}: SHMEM initialized, myPe={my_pe}, npes={npes}")
 
-        # Create All2all object with sufficient buffer size
-        all2all = All2allSdma(my_pe, npes, 
-                             input_buffer_size=total_bytes,
-                             output_buffer_size=total_bytes)
-        print(f"PE {rank}: Created All2allSdma object")
+        # Create Allgather object with sufficient buffer size
+        allgather = AllgatherSdma(my_pe, npes, 
+                                  input_buffer_size=bytes_per_pe,
+                                  output_buffer_size=total_bytes)
+        print(f"PE {rank}: Created AllgatherSdma object")
 
         # Allocate GPU memory
-        # Note: Using torch.uint32 to match C++ All2allSdma<uint32_t>
+        # Note: Using torch.uint32 to match C++ AllgatherSdma<uint32_t>
         device = torch.device(f"cuda:{rank}")
-        input_tensor = torch.zeros(elems_per_pe * npes, dtype=torch.uint32, device=device)
+        input_tensor = torch.zeros(elems_per_pe, dtype=torch.uint32, device=device)
         output_tensor = torch.zeros(elems_per_pe * npes, dtype=torch.uint32, device=device)
         
-        # Prepare data: PE i sends value (i+1)*1000 + j to PE j
-        input_data_cpu = np.zeros(elems_per_pe * npes, dtype=np.uint32)
-        for dest_pe in range(npes):
-            value = (my_pe + 1) * 1000 + dest_pe
-            input_data_cpu[dest_pe * elems_per_pe : (dest_pe + 1) * elems_per_pe] = value
+        # Prepare data: Each PE has unique value = (myPe + 1) * 1000
+        value = (my_pe + 1) * 1000
+        input_data_cpu = np.full(elems_per_pe, value, dtype=np.uint32)
         
         # Copy to GPU
         input_tensor.copy_(torch.from_numpy(input_data_cpu))
 
         if rank == 0:
-            print(f"PE {rank}: Prepared input data with pattern: (src_pe+1)*1000 + dest_pe")
-            print(f"  Sending to PE 0: {input_tensor[0].item()} (expected: {(my_pe+1)*1000 + 0})")
-            print(f"  Sending to PE 1: {input_tensor[elems_per_pe].item()} (expected: {(my_pe+1)*1000 + 1})")
+            print(f"\n=== Data Pattern ===")
+            print(f"Each PE contributes unique data:")
+            for pe in range(npes):
+                pe_value = (pe + 1) * 1000
+                print(f"  PE {pe} contributes: {pe_value}")
+            print(f"\nAfter Allgather, all PEs should have:")
+            for pe in range(npes):
+                pe_value = (pe + 1) * 1000
+                print(f"  Chunk {pe} (from PE {pe}): {pe_value}")
+            print()
+
+        print(f"PE {rank}: Prepared input data with value: {value}")
 
         torch.cuda.synchronize()
         dist.barrier()
 
-        # Execute All2All multiple times
+        # Execute Allgather multiple times
         exec_times = []
         total_iters = warmup + iterations
         use_async = True  # Use async mode to match C++ test
@@ -77,7 +84,7 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
         if not use_async:
             # Synchronous mode (single SDMA queue)
             for iter_idx in range(total_iters):
-                exec_time = all2all(input_tensor, output_tensor, elems_per_pe)
+                exec_time = allgather(input_tensor, output_tensor, elems_per_pe)
                 
                 if iter_idx >= warmup:
                     exec_times.append(exec_time)
@@ -98,13 +105,13 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
                 dist.barrier()
                 
                 # Start async operation
-                started = all2all.start_async(input_tensor, output_tensor, elems_per_pe)
+                started = allgather.start_async(input_tensor, output_tensor, elems_per_pe)
                 if not started:
                     print(f"PE {rank}: Failed to start async operation")
                     break
                 
                 # Wait for completion
-                exec_time = all2all.wait_async()
+                exec_time = allgather.wait_async()
                 
                 if exec_time < 0:
                     print(f"PE {rank}: Async operation failed")
@@ -138,7 +145,7 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
         success = True
         for src_pe in range(npes):
             chunk = output_data_cpu[src_pe * elems_per_pe : (src_pe + 1) * elems_per_pe]
-            expected_value = (src_pe + 1) * 1000 + my_pe
+            expected_value = (src_pe + 1) * 1000
             
             if not np.all(chunk == expected_value):
                 print(f"PE {rank}: Chunk from PE {src_pe} verification FAILED!")
@@ -146,11 +153,13 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
                 print(f"  Got first 10 values: {chunk[:10]}")
                 print(f"  Got unique values: {np.unique(chunk)}")
                 success = False
-            elif rank == 0:
+            else:
                 print(f"PE {rank}: Chunk from PE {src_pe} verified (all values = {expected_value})")
 
         torch.cuda.synchronize()
         dist.barrier()
+        
+        # Gather global statistics
         min_time_tensor = torch.tensor([min_time], dtype=torch.float64)
         max_time_tensor = torch.tensor([max_time], dtype=torch.float64)
         avg_time_tensor = torch.tensor([avg_time], dtype=torch.float64)
@@ -167,7 +176,7 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
         passed_count = success_tensor.item()
 
         if rank == 0:
-            global_bandwidth = total_bytes / global_max / (1024.0 * 1024.0 * 1024.0)
+            global_bandwidth = total_bytes / global_avg / (1024.0 * 1024.0 * 1024.0)
             
             print(f"\n=== Performance Statistics ===")
             print(f"Min time: {global_min:.6f}s")
@@ -185,20 +194,20 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
         # Proper cleanup order to avoid race conditions
         torch.cuda.synchronize()  # 1. Ensure all GPU operations complete
         dist.barrier()             # 2. Synchronize all processes
-        del all2all               # 3. Delete object (releases SHMEM buffers)
+        del allgather             # 3. Delete object (releases SHMEM buffers)
         dist.barrier()             # 4. Wait for all processes to finish cleanup
         shmem.shmem_finalize()    # 5. Finalize SHMEM (closes SDMA/HSA resources)
         
         if not success:
-            raise AssertionError(f"PE {rank}: All2All verification failed")
+            raise AssertionError(f"PE {rank}: Allgather verification failed")
 
 
-def test_all2all(elems=67108864, world_size=8, iterations=10, warmup=1):
-    """Run All2All SDMA test"""
+def test_allgather(elems=67108864, world_size=8, iterations=10, warmup=1):
+    """Run Allgather SDMA test"""
     os.environ.setdefault('MORI_ENABLE_SDMA', '1')
     port = get_free_port()
     torch.multiprocessing.spawn(
-        _test_all2all,
+        _test_allgather,
         args=(world_size, port, elems, iterations, warmup),
         nprocs=world_size,
         join=True,
@@ -209,7 +218,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="Test All2All SDMA (similar to C++ example)",
+        description="Test Allgather SDMA (similar to C++ example)",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--elems", type=int, default=67108864, help="Elements per PE")
@@ -220,11 +229,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
     os.environ['MORI_ENABLE_SDMA'] = str(args.enable_sdma)
     
-    print(f"All2All SDMA Test")
+    print(f"Allgather SDMA Test")
     print(f"  Elements per PE: {args.elems:,}")
     print(f"  World size: {args.world_size}")
     print(f"  Iterations: {args.iterations}")
     print(f"  Warmup: {args.warmup}")
     print("-" * 60)
     
-    test_all2all(args.elems, args.world_size, args.iterations, args.warmup)
+    test_allgather(args.elems, args.world_size, args.iterations, args.warmup)

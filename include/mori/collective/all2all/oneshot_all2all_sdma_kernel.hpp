@@ -101,16 +101,20 @@ __global__ void OneShotAll2allSdmaKernel(int myPe, int npes,
 #if 1
 template <typename T>
 __global__ void OneShotAll2allSdmaKernel(int myPe, int npes,
-                                         const application::SymmMemObjPtr srcMemObj,
-                                         const application::SymmMemObjPtr dstMemObj,
+                                         const application::SymmMemObjPtr inputTransitMemObj,  // Changed to input transit buffer
+                                         const application::SymmMemObjPtr outputTransitMemObj, // Output transit buffer
                                          const application::SymmMemObjPtr flagsMemObj,
                                          size_t elementCount) {
     if (elementCount == 0 || npes <= 0) {
         return;
     }
 
-    T* __restrict__ src = reinterpret_cast<T*>(srcMemObj->localPtr);
-    T* __restrict__ dst = reinterpret_cast<T*>(dstMemObj->localPtr);
+    // Get input transit buffer pointer (contains only current PE's data)
+    T* __restrict__ myInputData = reinterpret_cast<T*>(inputTransitMemObj->localPtr);
+    
+    // Get output transit buffer pointer (will receive data from all PEs)
+    T* __restrict__ allOutputData = reinterpret_cast<T*>(outputTransitMemObj->localPtr);
+    
     uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
     int flag_val = 1;
 
@@ -120,13 +124,16 @@ __global__ void OneShotAll2allSdmaKernel(int myPe, int npes,
     const size_t bytesPerElement = sizeof(T);
     const size_t bytesPerPeer = elementCount * bytesPerElement;
 
-    if (threadLinearId < npes * dstMemObj->sdmaNumQueue) {
-        int qId = threadLinearId % dstMemObj->sdmaNumQueue;
-        int targetPe = threadLinearId / dstMemObj->sdmaNumQueue;
+    // Key modification: each thread is responsible for sending its own data to other PEs
+    if (threadLinearId < npes * outputTransitMemObj->sdmaNumQueue) {
+        int qId = threadLinearId % outputTransitMemObj->sdmaNumQueue;
+        int targetPe = threadLinearId / outputTransitMemObj->sdmaNumQueue;
         
+        // Calculate bytes to send
         const size_t sendBytes_rand = bytesPerPeer / 8;
-        size_t srcByteOffset = targetPe * bytesPerPeer + qId * sendBytes_rand;
-        size_t destByteOffset = myPe * bytesPerPeer + qId * sendBytes_rand;
+        size_t srcByteOffset = targetPe * bytesPerPeer + qId * sendBytes_rand;  // Read from input transit buffer
+        size_t destByteOffset = myPe * bytesPerPeer + qId * sendBytes_rand;  // Write to targetPe's position in output transit buffer
+        //printf("myPe:%u, threadLinearId:%u, srcByteOffset:0x%x, destByteOffset:0x%x\n", myPe, threadLinearId, srcByteOffset, destByteOffset);        
         size_t sendBytes = 0;
 
         if (qId == 7) {
@@ -134,16 +141,22 @@ __global__ void OneShotAll2allSdmaKernel(int myPe, int npes,
         } else {
             sendBytes = sendBytes_rand;
         }
-        shmem::ShmemPutMemNbiThread(dstMemObj, destByteOffset, srcMemObj, srcByteOffset, sendBytes, targetPe, qId);
+        
+        // Send my data to target PE
+        shmem::ShmemPutMemNbiThread(outputTransitMemObj, destByteOffset, 
+                                   inputTransitMemObj, srcByteOffset, 
+                                   sendBytes, targetPe, qId);
     }
 
+    // Synchronization and flag setting
     if (threadLinearId < npes) {
         int targetPe = threadLinearId;
-        shmem::ShmemQuietThread(targetPe, dstMemObj);
+        shmem::ShmemQuietThread(targetPe, outputTransitMemObj);
         shmem::ShmemAtomicSizeNonFetchThread(flagsMemObj, 
                                              static_cast<size_t>(myPe) * sizeof(uint64_t),
-                                             &flag_val, 8, core::atomicType::AMO_ADD,targetPe);        
+                                             &flag_val, 8, core::atomicType::AMO_ADD, targetPe);        
     }
+    
     __syncthreads();
     for (int sender = 0; sender < npes; ++sender) {
         if (sender == myPe) {
@@ -155,13 +168,24 @@ __global__ void OneShotAll2allSdmaKernel(int myPe, int npes,
             while (core::AtomicLoadRelaxed(flags + sender) == 0) {
                 ++spinCount;
                 if (spinCount > 10000000) {
-                    printf("PE %d: Timeout waiting for data from peer %d\n", myPe, sender);
+                    printf("Kernel[PE %d]: Timeout waiting for data from peer %d\n", myPe, sender);
                     break;
                 }
             }
         }
         __syncthreads();
     }
+    #if 0
+    // Debug information: check data in output transit buffer
+    if (threadLinearId == 0) {
+        printf("Kernel[PE %d]: Checking output data...\n", myPe);
+        for (int pe = 0; pe < npes; pe++) {
+            T* peData = allOutputData + pe * elementCount;
+            printf("  Data from PE %d (first 2 values): %u %u\n", 
+                   pe, static_cast<uint32_t>(peData[0]), static_cast<uint32_t>(peData[1]));
+        }
+    }
+    #endif
 }
 #endif
 }  // namespace collective
