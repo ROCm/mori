@@ -30,6 +30,7 @@
 #include "mori/core/profiler/kernel_profiler.hpp"
 #include "mori/profiler/profiler.hpp"
 #endif
+#include "src/ops/dispatch_combine/common.hpp"
 
 namespace mori {
 namespace moe {
@@ -37,36 +38,6 @@ namespace moe {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                   EpDispatchInterNodeV1Kernel                                  */
 /* ---------------------------------------------------------------------------------------------- */
-#define DEF_COMMON_VARS                                                                          \
-  const EpDispatchCombineConfig& config = args.config;                                           \
-  int thdId = threadIdx.x;                                                                       \
-  int thdNum = blockDim.x;                                                                       \
-  int laneId = threadIdx.x & (warpSize - 1);                                                     \
-  int warpId = thdId / warpSize;                                                                 \
-  int warpNum = blockDim.x / warpSize;                                                           \
-  int blockNum = gridDim.x;                                                                      \
-  int blockId = blockIdx.x;                                                                      \
-  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;                                       \
-  int globalThdNum = gridDim.x * blockDim.x;                                                     \
-  int globalWarpId = blockIdx.x * warpNum + warpId;                                              \
-  int globalWarpNum = gridDim.x * warpNum;                                                       \
-  int nullTokenId = config.worldSize * config.MaxNumTokensToRecv();                              \
-  int myPe = config.rank;                                                                        \
-  int npes = config.worldSize;                                                                   \
-  int myNode = myPe / config.gpuPerNode;                                                         \
-  int nNodes = npes / config.gpuPerNode;                                                         \
-  int numExpertPerToken = config.numExpertPerToken;                                              \
-  assert(numExpertPerToken < warpSize);                                                          \
-  size_t hiddenBytes = config.hiddenDim * sizeof(T);                                             \
-  size_t indexBytes = config.numExpertPerToken * sizeof(index_t);                                \
-  size_t weightBytes = config.numExpertPerToken * sizeof(float);                                 \
-  size_t srcTokenIdBytes = sizeof(index_t);                                                      \
-  size_t scaleBytes = (args.config.scaleDim == 0) ? 0 : config.scaleDim * config.scaleTypeSize;  \
-  size_t xferBytes = hiddenBytes + indexBytes + weightBytes + srcTokenIdBytes + scaleBytes;      \
-  size_t combXferBytes = (args.weightsBuf == nullptr) ? hiddenBytes : hiddenBytes + weightBytes; \
-  IF_ENABLE_PROFILER(                                                                            \
-      INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId))
-
 namespace v1 {
 template <typename T>
 inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, int tokenId,
