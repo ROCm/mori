@@ -45,6 +45,27 @@
 /* ---------------------------------------------------------------------------------------------- */
 namespace {
 
+/**
+ * @brief Convert PyTorch CUDA Stream object to HIP stream handle
+ * @param stream_obj Python object representing torch.cuda.Stream (or None)
+ * @return hipStream_t handle, or nullptr if stream_obj is None
+ */
+hipStream_t convert_torch_stream_to_hip(py::object stream_obj) {
+    if (stream_obj.is_none()) {
+        return nullptr;
+    }
+    
+    // Get the cuda_stream attribute from torch.cuda.Stream object
+    // This attribute contains the integer pointer value of the stream
+    try {
+        uintptr_t stream_ptr = stream_obj.attr("cuda_stream").cast<uintptr_t>();
+        return reinterpret_cast<hipStream_t>(stream_ptr);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(
+            std::string("Failed to convert torch.cuda.Stream to hipStream_t: ") + e.what());
+    }
+}
+
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, torch::Tensor,
            torch::Tensor>
 LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
@@ -472,10 +493,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
                     throw std::runtime_error("Output tensor must be uint32 or int32");
                 }
 
-                hipStream_t stream = nullptr;
-                if (!stream_obj.is_none()) {
-                    // TODO: Convert stream_obj to hipStream_t
-                }
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj);
 
                 return self(input_ptr, output_ptr, count, stream);
             },
@@ -524,10 +542,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
                     throw std::runtime_error("Output tensor must be uint32 or int32");
                 }
 
-                hipStream_t stream = nullptr;
-                if (!stream_obj.is_none()) {
-                    // TODO: Convert stream_obj to hipStream_t
-                }
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj);
 
                 return self.start_async(input_ptr, output_ptr, count, stream);
             },
@@ -540,10 +555,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
             [](mori::collective::All2allSdma<uint32_t>& self,
                py::object stream_obj) -> double {
 
-                hipStream_t stream = nullptr;
-                if (!stream_obj.is_none()) {
-                    // TODO: Convert stream_obj to hipStream_t
-                }
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj);
 
                 return self.wait_async(stream);
             },
@@ -657,10 +669,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
                     throw std::runtime_error("Output tensor must be uint32 or int32");
                 }
 
-                hipStream_t stream = nullptr;
-                if (!stream_obj.is_none()) {
-                    // TODO: Convert stream_obj to hipStream_t
-                }
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj);
 
                 return self(input_ptr, output_ptr, count, stream);
             },
@@ -709,10 +718,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
                     throw std::runtime_error("Output tensor must be uint32 or int32");
                 }
 
-                hipStream_t stream = nullptr;
-                if (!stream_obj.is_none()) {
-                    // TODO: Convert stream_obj to hipStream_t
-                }
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj);
 
                 return self.start_async(input_ptr, output_ptr, count, stream);
             },
@@ -725,10 +731,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
             [](mori::collective::AllgatherSdma<uint32_t>& self,
                py::object stream_obj) -> double {
 
-                hipStream_t stream = nullptr;
-                if (!stream_obj.is_none()) {
-                    // TODO: Convert stream_obj to hipStream_t
-                }
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj);
 
                 return self.wait_async(stream);
             },

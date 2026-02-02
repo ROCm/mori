@@ -12,7 +12,7 @@ from mori.ccl import AllgatherSdma
 from tests.python.utils import TorchDistContext, get_free_port
 
 
-def _test_allgather(rank, world_size, port, elems, iterations, warmup):
+def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custom_stream):
     """Worker function for each process"""
     
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
@@ -36,6 +36,7 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
             print(f"Elements per PE: {elems_per_pe:,}")
             print(f"Data size: {bytes_per_pe / (1024**2):.2f} MB per PE (input), {total_bytes / (1024**2):.2f} MB total (output)")
             print(f"Iterations: {iterations}" + (f" (warmup: {warmup})" if warmup > 0 else ""))
+            print(f"Custom Stream: {'Yes' if use_custom_stream else 'No (default stream)'}")
             print(f"{'='*60}\n")
         
         print(f"PE {rank}/{world_size}: SHMEM initialized, myPe={my_pe}, npes={npes}")
@@ -73,6 +74,16 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
 
         print(f"PE {rank}: Prepared input data with value: {value}")
 
+        # Create CUDA stream for allgather operations (if requested)
+        if use_custom_stream:
+            stream = torch.cuda.Stream(device=device)
+            if rank == 0:
+                print(f"PE {rank}: Created custom CUDA stream for allgather operations")
+        else:
+            stream = None  # Use default stream
+            if rank == 0:
+                print(f"PE {rank}: Using default CUDA stream (None)")
+
         torch.cuda.synchronize()
         dist.barrier()
 
@@ -84,7 +95,7 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
         if not use_async:
             # Synchronous mode (single SDMA queue)
             for iter_idx in range(total_iters):
-                exec_time = allgather(input_tensor, output_tensor, elems_per_pe)
+                exec_time = allgather(input_tensor, output_tensor, elems_per_pe, stream)
                 
                 if iter_idx >= warmup:
                     exec_times.append(exec_time)
@@ -105,13 +116,13 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
                 dist.barrier()
                 
                 # Start async operation
-                started = allgather.start_async(input_tensor, output_tensor, elems_per_pe)
+                started = allgather.start_async(input_tensor, output_tensor, elems_per_pe, stream)
                 if not started:
                     print(f"PE {rank}: Failed to start async operation")
                     break
                 
-                # Wait for completion
-                exec_time = allgather.wait_async()
+                # Wait for completion (using the same stream)
+                exec_time = allgather.wait_async(stream)
                 
                 if exec_time < 0:
                     print(f"PE {rank}: Async operation failed")
@@ -124,6 +135,11 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
                         print(f"PE {rank}: First measurement iteration: {exec_time:.6f}s")
                 
                 dist.barrier()
+        
+        # Synchronize stream before verification
+        if use_custom_stream:
+            stream.synchronize()
+        torch.cuda.synchronize()
 
         # Calculate statistics from post-warmup iterations
         if len(exec_times) > 0:
@@ -202,13 +218,13 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
             raise AssertionError(f"PE {rank}: Allgather verification failed")
 
 
-def test_allgather(elems=67108864, world_size=8, iterations=10, warmup=1):
+def test_allgather(elems=67108864, world_size=8, iterations=10, warmup=1, use_custom_stream=False):
     """Run Allgather SDMA test"""
     os.environ.setdefault('MORI_ENABLE_SDMA', '1')
     port = get_free_port()
     torch.multiprocessing.spawn(
         _test_allgather,
-        args=(world_size, port, elems, iterations, warmup),
+        args=(world_size, port, elems, iterations, warmup, use_custom_stream),
         nprocs=world_size,
         join=True,
     )
@@ -226,6 +242,7 @@ if __name__ == "__main__":
     parser.add_argument("--iterations", type=int, default=10, help="Number of iterations")
     parser.add_argument("--warmup", type=int, default=1, help="Warmup iterations")
     parser.add_argument("--enable-sdma", type=int, default=1, choices=[0, 1], help="Enable SDMA")
+    parser.add_argument("--use-custom-stream", action="store_true", help="Use custom CUDA stream instead of default stream")
     args = parser.parse_args()
     os.environ['MORI_ENABLE_SDMA'] = str(args.enable_sdma)
     
@@ -234,6 +251,7 @@ if __name__ == "__main__":
     print(f"  World size: {args.world_size}")
     print(f"  Iterations: {args.iterations}")
     print(f"  Warmup: {args.warmup}")
+    print(f"  Custom Stream: {args.use_custom_stream}")
     print("-" * 60)
     
-    test_allgather(args.elems, args.world_size, args.iterations, args.warmup)
+    test_allgather(args.elems, args.world_size, args.iterations, args.warmup, args.use_custom_stream)

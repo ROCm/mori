@@ -200,7 +200,7 @@ double All2allSdma<T>::wait_async(hipStream_t stream) {
         // Use provided stream or the one from start_async
         hipStream_t wait_stream = (stream != nullptr) ? stream : async_stream_;
 
-        OneShotAll2allSdmaAsyncWaitKernel<<<1, 64>>>(myPe_, npes_, output_transit_buffer_obj_, flagsObj_);
+        OneShotAll2allSdmaAsyncWaitKernel<<<1, 512, 0, wait_stream>>>(myPe_, npes_, output_transit_buffer_obj_, flagsObj_);
 
         // Step 1: Synchronize to ensure PUT kernel is completed
         printf("PE %d: Synchronizing to ensure PUT kernel completion\n", myPe_);

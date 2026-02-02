@@ -54,8 +54,21 @@ double Allgather_sdma(T* input, T* output, size_t total_count,
   assert(flagsObj.IsValid());
 
   double start = MPI_Wtime();
-  OneShotAllGatherSdmaKernel<T><<<1, 512>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
-  hipDeviceSynchronize();
+  OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
+  
+  // Synchronize GPU to ensure kernel completion
+  hipError_t sync_err;
+  if (stream != nullptr) {
+    sync_err = hipStreamSynchronize(stream);
+  } else {
+    sync_err = hipDeviceSynchronize();
+  }
+  
+  if (sync_err != hipSuccess) {
+    fprintf(stderr, "PE %d: Failed to synchronize: %s\n", myPe, hipGetErrorString(sync_err));
+    return -1.0;
+  }
+  
   double end = MPI_Wtime();
 
    
