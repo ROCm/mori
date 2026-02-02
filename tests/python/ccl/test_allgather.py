@@ -4,7 +4,6 @@ Allgather SDMA Test using torch.distributed and multiprocessing
 """
 
 import os
-import time
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -95,9 +94,16 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
         
         if not use_async:
             # Synchronous mode (single SDMA queue)
+            # Create CUDA events for timing
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            
             for iter_idx in range(total_iters):
-                # Record start time
-                start_time = time.time()
+                # Record start event on the appropriate stream
+                if use_custom_stream:
+                    start_event.record(stream)
+                else:
+                    start_event.record()
                 
                 # Execute allgather (returns bool)
                 success = allgather(input_tensor, output_tensor, elems_per_pe, stream)
@@ -106,14 +112,17 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
                     print(f"PE {rank}: Allgather operation failed at iteration {iter_idx}")
                     break
                 
-                # Synchronize to ensure completion
+                # Record end event
                 if use_custom_stream:
-                    stream.synchronize()
+                    end_event.record(stream)
                 else:
-                    torch.cuda.synchronize()
+                    end_event.record()
                 
-                # Record end time
-                exec_time = time.time() - start_time
+                # Wait for the end event to complete
+                end_event.synchronize()
+                
+                # Calculate elapsed time in seconds (elapsed_time returns milliseconds)
+                exec_time = start_event.elapsed_time(end_event) / 1000.0
                 
                 if iter_idx >= warmup:
                     exec_times.append(exec_time)
