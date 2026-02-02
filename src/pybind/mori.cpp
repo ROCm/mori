@@ -634,7 +634,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
                const torch::Tensor& input_tensor,
                const torch::Tensor& output_tensor,
                size_t count,
-               py::object stream_obj) -> double {
+               py::object stream_obj) -> bool {
 
                 if (input_tensor.dim() != 1) {
                     throw std::runtime_error("Input tensor must be 1-dimensional");
@@ -677,7 +677,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
             py::arg("output"),
             py::arg("count"),
             py::arg("stream") = py::none(),
-            "Execute Allgather SDMA operation with PyTorch CUDA tensors")
+            "Execute Allgather SDMA operation (returns bool), synchronization must be done by caller")
         .def("start_async",
             [](mori::collective::AllgatherSdma<uint32_t>& self,
                const torch::Tensor& input_tensor,

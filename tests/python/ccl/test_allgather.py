@@ -4,6 +4,7 @@ Allgather SDMA Test using torch.distributed and multiprocessing
 """
 
 import os
+import time
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -95,7 +96,24 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
         if not use_async:
             # Synchronous mode (single SDMA queue)
             for iter_idx in range(total_iters):
-                exec_time = allgather(input_tensor, output_tensor, elems_per_pe, stream)
+                # Record start time
+                start_time = time.time()
+                
+                # Execute allgather (returns bool)
+                success = allgather(input_tensor, output_tensor, elems_per_pe, stream)
+                
+                if not success:
+                    print(f"PE {rank}: Allgather operation failed at iteration {iter_idx}")
+                    break
+                
+                # Synchronize to ensure completion
+                if use_custom_stream:
+                    stream.synchronize()
+                else:
+                    torch.cuda.synchronize()
+                
+                # Record end time
+                exec_time = time.time() - start_time
                 
                 if iter_idx >= warmup:
                     exec_times.append(exec_time)

@@ -130,7 +130,7 @@ class AllgatherSdma:
         else:
             self._handle = handle_class(my_pe, npes, 512 * 1024 * 1024)
 
-    def __call__(self, input_data, output_data, count: int, stream=None) -> float:
+    def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
         """Execute AllGATHER SDMA operation.
         
         Args:
@@ -140,7 +140,10 @@ class AllgatherSdma:
             stream: Optional HIP stream
             
         Returns:
-            Execution time in seconds
+            True if successful, False if failed
+            
+        Note:
+            Caller must handle synchronization (stream.synchronize() or torch.cuda.synchronize())
         """
         return self._handle(input_data, output_data, count, stream)
 

@@ -398,19 +398,18 @@ void AllgatherSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
 }
 
 // operator() implementation (modified to check async status)
+// Returns true on success, false on failure
+// Synchronization must be done by caller (Python layer)
 template <typename T>
-double AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
+bool AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
     // Check if async operation is in progress
     if (async_in_progress_) {
         printf("PE %d: Cannot execute sync operation while async is in progress\n", myPe_);
         printf("  Call cancel_async() first or wait for async to complete\n");
-        return -1.0;
+        return false;
     }
 
-    // Execute Allgather operation
-    double start = MPI_Wtime();
-
-    hipError_t sync_err = hipSuccess;
+    hipError_t err = hipSuccess;
     try {
         // Step 1: Copy input data to input transit buffer
         copy_input_to_transit(input, total_count, stream);
@@ -430,51 +429,23 @@ double AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hip
             output_transit_buffer_obj_,
             flagsObj_, total_count);
 
-        sync_err = hipGetLastError();
-        if (sync_err != hipSuccess) {
+        err = hipGetLastError();
+        if (err != hipSuccess) {
             fprintf(stderr, "PE %d: Kernel launch failed: %s\n",
-                    myPe_, hipGetErrorString(sync_err));
-            throw std::runtime_error("Kernel launch failed");
-        }
-
-        // Synchronize GPU to ensure kernel completion
-        if (stream != nullptr) {
-            sync_err = hipStreamSynchronize(stream);
-        } else {
-            sync_err = hipDeviceSynchronize();
-        }
-
-        if (sync_err != hipSuccess) {
-            fprintf(stderr, "PE %d: Failed to synchronize: %s\n",
-                    myPe_, hipGetErrorString(sync_err));
-            throw std::runtime_error("Synchronization failed");
+                    myPe_, hipGetErrorString(err));
+            return false;
         }
 
         // Step 4: Copy from output transit buffer to user output buffer
+        // Note: Synchronization is handled by Python layer
         copy_output_to_user(output, total_count, stream);
-
-        // Final synchronization
-        if (stream != nullptr) {
-            sync_err = hipStreamSynchronize(stream);
-        } else {
-            sync_err = hipDeviceSynchronize();
-        }
-
-        if (sync_err != hipSuccess) {
-            fprintf(stderr, "PE %d: Final synchronization failed: %s\n",
-                    myPe_, hipGetErrorString(sync_err));
-            throw std::runtime_error("Final synchronization failed");
-        }
 
     } catch (const std::exception& e) {
         fprintf(stderr, "PE %d: Allgather operation failed: %s\n", myPe_, e.what());
-        return -1.0;
+        return false;
     }
 
-    double end = MPI_Wtime();
-    double duration = end - start;
-
-    return duration;
+    return true;
 }
 
 // resetFlags implementation (unchanged)
