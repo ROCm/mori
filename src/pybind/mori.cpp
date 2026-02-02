@@ -28,6 +28,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/python.h>
+#include <torch/extension.h>
 
 #include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
@@ -70,7 +71,7 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
                           nullptr, weightPtr, scalePtr, topkIds.data_ptr<mori::moe::index_t>(),
                           input.size(0));
   handle.LaunchDispatch((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
-                        at::cuda::getCurrentHIPStream());
+                        at::cuda::getCurrentHIPStream(), /*enableStandardMoeOutput=*/false);
 
   torch::Tensor out =
       torch::from_blob(handle.shmemDispatchOutTokMemObj->Get(),
@@ -110,7 +111,7 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
 std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
     mori::moe::EpDispatchCombineHandle& handle, int kernelType, const torch::Tensor& input,
     const std::optional<torch::Tensor>& weights, const torch::Tensor& topkIds, int blockNum,
-    int warpPerBlock) {
+    int warpPerBlock, int useExternalInpBuf = -1) {
   assert(input.is_contiguous() && topkIds.is_contiguous());
 
   float* weightsPtr = nullptr;
@@ -123,7 +124,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
                           nullptr, weightsPtr, topkIds.data_ptr<mori::moe::index_t>(),
                           handle.curRankNumToken);
   handle.LaunchCombine((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
-                       at::cuda::getCurrentHIPStream());
+                       at::cuda::getCurrentHIPStream(), /*enableStandardMoeInput=*/false,
+                       useExternalInpBuf);
 
   auto options = torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA);
   torch::Tensor out =
@@ -141,6 +143,111 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
   return {out, outWeights};
 }
 
+// Standard MoE 3D output: packedRecvX/Count/SrcInfo/LayoutRange
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> LaunchDispatchForStandardMoE(
+    mori::moe::EpDispatchCombineHandle& handle, int kernelType, const torch::Tensor& input,
+    const std::optional<torch::Tensor>& weights, const std::optional<torch::Tensor>& scales,
+    const torch::Tensor& topkIds, int blockNum = -1, int warpPerBlock = -1) {
+  assert(input.is_contiguous() && topkIds.is_contiguous());
+
+  float* weightPtr = nullptr;
+  if (weights.has_value()) {
+    assert(weights->is_contiguous() && weights->element_size() == sizeof(float));
+    weightPtr = weights->data_ptr<float>();
+  }
+
+  uint8_t* scalePtr = nullptr;
+  if (scales.has_value() && (handle.config.scaleDim > 0)) {
+    assert(scales->is_contiguous() && scales->element_size() == handle.config.scaleTypeSize);
+    scalePtr = reinterpret_cast<uint8_t*>(scales->data_ptr());
+  }
+
+  handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
+                          nullptr, weightPtr, scalePtr, topkIds.data_ptr<mori::moe::index_t>(),
+                          input.size(0));
+
+  const int64_t numLocalExperts = handle.config.numExpertPerRank;
+  const int64_t maxTokensPerExpert =
+      static_cast<int64_t>(handle.config.worldSize) * handle.config.maxNumInpTokenPerRank;
+  const int64_t hidden = input.size(1);
+
+  torch::Tensor packedRecvX =
+      torch::empty({numLocalExperts, maxTokensPerExpert, hidden}, input.options());
+  auto packedRecvSrcInfo = torch::empty({numLocalExperts, maxTokensPerExpert},
+                                        torch::dtype(torch::kInt32).device(torch::kCUDA));
+  auto packedRecvLayoutRange = torch::empty({numLocalExperts, handle.config.worldSize},
+                                            torch::dtype(torch::kInt64).device(torch::kCUDA));
+
+  handle.SetStandardMoeOutputBuffers(packedRecvX.data_ptr(), handle.standardPackedRecvCount,
+                                     packedRecvSrcInfo.data_ptr<int>(),
+                                     packedRecvLayoutRange.data_ptr<int64_t>());
+
+  handle.LaunchDispatch((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
+                        at::cuda::getCurrentHIPStream(), /*enableStandardMoeOutput=*/true);
+
+  torch::Tensor packedRecvCount =
+      torch::from_blob(handle.standardPackedRecvCount, {numLocalExperts},
+                       torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+
+  handle.ClearStandardMoeOutputBuffers();
+
+  return {packedRecvX, packedRecvCount, packedRecvSrcInfo, packedRecvLayoutRange};
+}
+
+// Standard MoE combine: takes expert output in packed format and combines back
+std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombineForStandardMoE(
+    mori::moe::EpDispatchCombineHandle& handle, int kernelType,
+    const torch::Tensor& expertOutput,  // [numLocalExperts, maxTokensPerExpert, hidden]
+    const std::optional<torch::Tensor>& weights,
+    const torch::Tensor& topkIds,
+    int blockNum = -1, int warpPerBlock = -1) {
+  assert(expertOutput.is_contiguous() && topkIds.is_contiguous());
+
+  float* weightsPtr = nullptr;
+  if (weights.has_value() && weights->numel() > 0) {
+    assert(weights->is_contiguous() && weights->element_size() == sizeof(float));
+    weightsPtr = weights->data_ptr<float>();
+  }
+
+  // Prepare inference with expert output as input
+  handle.PrepareInference(mori::ScalarTypeToHipDataType(expertOutput.scalar_type()),
+                          nullptr,  // inpTokenBuf not used for standard moe combine
+                          nullptr,  // outTokenBuf
+                          weightsPtr,
+                          topkIds.data_ptr<mori::moe::index_t>(),
+                          handle.curRankNumToken);
+
+  // Set standard MoE input buffers (reusing output buffer fields)
+  handle.SetStandardMoeOutputBuffers(
+      expertOutput.data_ptr(),
+      handle.standardPackedRecvCount,
+      handle.standardPackedRecvSrcInfo,
+      handle.standardPackedRecvLayoutRange);
+
+  // Launch combine with enableStandardMoeInput=true
+  handle.LaunchCombine((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
+                       at::cuda::getCurrentHIPStream(), /*enableStandardMoeInput=*/true);
+
+  // Get output tensor from shmem buffer
+  auto options = torch::TensorOptions().dtype(expertOutput.scalar_type()).device(torch::kCUDA);
+  torch::Tensor out =
+      torch::from_blob(handle.shmemCombineOutTokMemObj->Get(),
+                       {handle.config.maxNumInpTokenPerRank, handle.config.hiddenDim}, options);
+
+  std::optional<torch::Tensor> outWeights{std::nullopt};
+  // TODO: do not support weights for standard MoE now
+  // if (weightsPtr) {
+  //   outWeights =
+  //       torch::from_blob(handle.shmemCombineOutWeightsMemObj->Get(),
+  //                        {handle.config.maxNumInpTokenPerRank, handle.config.numExpertPerToken},
+  //                        torch::TensorOptions().dtype(weights->scalar_type()).device(torch::kCUDA));
+  // }
+
+  handle.ClearStandardMoeOutputBuffers();
+
+  return {out, outWeights};
+}
+
 void LaunchReset(mori::moe::EpDispatchCombineHandle& handle) {
   handle.LaunchReset(at::cuda::getCurrentHIPStream());
 }
@@ -154,6 +261,300 @@ torch::Tensor GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle& handle) 
                        {*handle.totalRecvTokenNum}, options);
   return tensor;
 }
+
+#if 0
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> ConvertDispatchOutput(
+    mori::moe::EpDispatchCombineHandle& handle, const torch::Tensor& dispatchOutX,
+    const torch::Tensor& dispatchOutTopkIdx,
+    int blockNum = -1, int warpPerBlock = -1) {
+  TORCH_CHECK(dispatchOutX.is_cuda() && dispatchOutTopkIdx.is_cuda(),
+              "dispatchOutX/dispatchOutTopkIdx must be CUDA tensors");
+  TORCH_CHECK(dispatchOutX.dim() == 2 && dispatchOutTopkIdx.dim() == 2,
+              "dispatchOutX/dispatchOutTopkIdx must be 2D");
+  TORCH_CHECK(dispatchOutX.size(0) == dispatchOutTopkIdx.size(0),
+              "dispatchOutX and dispatchOutTopkIdx must have the same first dimension");
+
+  using torch::indexing::Slice;
+
+  const int64_t numLocalExperts = handle.config.numExpertPerRank;
+  const int64_t maxTokensPerExpert =
+      static_cast<int64_t>(handle.config.worldSize) * handle.config.maxNumInpTokenPerRank;
+  const int64_t hidden = dispatchOutX.size(1);
+  auto totalTokensTensor = torch::from_blob(
+      handle.totalRecvTokenNum, {1},
+      torch::TensorOptions()
+          .dtype(mori::GetTorchDataType<mori::moe::index_t>())
+          .device(torch::kCUDA));
+  const int64_t totalTokens = totalTokensTensor.item<int64_t>();
+  TORCH_CHECK(totalTokens >= 0, "totalRecvTokenNum must be non-negative");
+  TORCH_CHECK(totalTokens <= dispatchOutX.size(0), "totalRecvTokenNum exceeds dispatchOutX size");
+
+  auto options = dispatchOutX.options();
+  auto countOptions =
+      torch::TensorOptions().dtype(torch::kInt32).device(dispatchOutX.device());
+  auto layoutOptions =
+      torch::TensorOptions().dtype(torch::kInt64).device(dispatchOutX.device());
+
+  torch::Tensor packedRecvX =
+      torch::zeros({numLocalExperts, maxTokensPerExpert, hidden}, options);
+  torch::Tensor packedRecvCount = torch::zeros({numLocalExperts}, countOptions);
+  torch::Tensor packedRecvSrcInfo =
+      torch::zeros({numLocalExperts, maxTokensPerExpert}, countOptions);
+  torch::Tensor packedRecvLayoutRange =
+      torch::zeros({numLocalExperts, handle.config.worldSize}, layoutOptions);
+
+  TORCH_CHECK(totalTokens <= dispatchOutX.size(0),
+              "totalTokens exceeds dispatchOutX size");
+  TORCH_CHECK(totalTokens <= dispatchOutTopkIdx.size(0),
+              "totalTokens exceeds dispatchOutTopkIdx size");
+  torch::Tensor slicedX = dispatchOutX.index({Slice(0, totalTokens)});
+  torch::Tensor slicedTopkIdx = dispatchOutTopkIdx.index({Slice(0, totalTokens)});
+  torch::Tensor slicedSrcTokenPos = GetDispatchSrcTokenId(handle);
+  TORCH_CHECK(slicedSrcTokenPos.size(0) == totalTokens,
+              "dispatch src token pos size mismatch");
+  const int64_t maxNumTokenPerRank = handle.config.maxNumInpTokenPerRank;
+  auto slicedSrcRank = slicedSrcTokenPos.to(torch::kInt64).div(maxNumTokenPerRank, "floor");
+
+  for (int64_t localExpert = 0; localExpert < numLocalExperts; ++localExpert) {
+    const int64_t globalExpertId = handle.config.rank * numLocalExperts + localExpert;
+    auto mask = slicedTopkIdx.eq(globalExpertId).any(1);
+    auto indices = torch::nonzero(mask).squeeze(1);
+    const int64_t count = indices.size(0);
+    TORCH_CHECK(count <= maxTokensPerExpert,
+                "Token count for local expert exceeds maxTokensPerExpert");
+    auto countTensor = torch::full({}, count, packedRecvCount.options());
+    packedRecvCount.index_put_({localExpert}, countTensor);
+    if (count == 0) {
+      continue;
+    }
+
+    auto expertSrcRank = slicedSrcRank.index_select(0, indices);
+    auto expertSrcInfo = slicedSrcTokenPos.index_select(0, indices)
+                             .remainder(maxNumTokenPerRank);
+
+    int64_t writeOffset = 0;
+    for (int64_t srcRank = 0; srcRank < handle.config.worldSize; ++srcRank) {
+      auto rankMask = expertSrcRank.eq(srcRank);
+      auto rankPositions = torch::nonzero(rankMask).squeeze(1);
+      const int64_t rankCount = rankPositions.size(0);
+      const int64_t beginIdx = writeOffset;
+      const int64_t packedRange =
+          (static_cast<int64_t>(beginIdx) << 32) | (static_cast<int64_t>(rankCount) & 0xffffffff);
+      packedRecvLayoutRange.index_put_({localExpert, srcRank},
+                                      torch::full({}, packedRange, layoutOptions));
+      if (rankCount > 0) {
+        auto selectedIdx = indices.index_select(0, rankPositions);
+        auto selectedX = slicedX.index_select(0, selectedIdx);
+        auto selectedSrcInfo = expertSrcInfo.index_select(0, rankPositions);
+        packedRecvX.index({localExpert, Slice(writeOffset, writeOffset + rankCount)})
+            .copy_(selectedX);
+        packedRecvSrcInfo.index({localExpert, Slice(writeOffset, writeOffset + rankCount)})
+            .copy_(selectedSrcInfo);
+        writeOffset += rankCount;
+      }
+    }
+    TORCH_CHECK(writeOffset == count, "Packed token count mismatch for local expert");
+  }
+
+  return {packedRecvX, packedRecvCount, packedRecvSrcInfo, packedRecvLayoutRange};
+}
+
+torch::Tensor ConvertCombineInput(mori::moe::EpDispatchCombineHandle& handle,
+                                  const torch::Tensor& packedRecvX,
+                                  const torch::Tensor& topkIdx,
+                                  const std::optional<torch::Tensor>& topkWeights,
+                                  const torch::Tensor& packedRecvSrcInfo,
+                                  const torch::Tensor& packedRecvLayoutRange) {
+  TORCH_CHECK(packedRecvX.is_cuda(), "packedRecvX must be a CUDA tensor");
+  TORCH_CHECK(topkIdx.is_cuda(), "topkIdx must be a CUDA tensor");
+  TORCH_CHECK(packedRecvSrcInfo.is_cuda(), "packedRecvSrcInfo must be a CUDA tensor");
+  TORCH_CHECK(packedRecvLayoutRange.is_cuda(), "packedRecvLayoutRange must be a CUDA tensor");
+  TORCH_CHECK(packedRecvX.dim() == 3, "packedRecvX must be 3D");
+  TORCH_CHECK(topkIdx.dim() == 2, "topkIdx must be 2D");
+  TORCH_CHECK(packedRecvSrcInfo.dim() == 2, "packedRecvSrcInfo must be 2D");
+  TORCH_CHECK(packedRecvLayoutRange.dim() == 2, "packedRecvLayoutRange must be 2D");
+  if (topkWeights.has_value()) {
+    TORCH_CHECK(topkWeights->is_cuda(), "topkWeights must be a CUDA tensor");
+    TORCH_CHECK(topkWeights->dim() == 2, "topkWeights must be 2D");
+    TORCH_CHECK(topkIdx.size(0) == topkWeights->size(0),
+                "topkIdx and topkWeights must have the same first dimension");
+    TORCH_CHECK(topkIdx.size(1) == topkWeights->size(1),
+                "topkIdx and topkWeights must have the same second dimension");
+  }
+
+  using torch::indexing::Slice;
+
+  const int64_t numLocalExperts = handle.config.numExpertPerRank;
+  const int64_t numRanks = handle.config.worldSize;
+  const int64_t maxTokensPerExpert =
+      static_cast<int64_t>(handle.config.worldSize) * handle.config.maxNumInpTokenPerRank;
+  const int64_t hidden = packedRecvX.size(2);
+  TORCH_CHECK(packedRecvX.size(0) == numLocalExperts,
+              "packedRecvX local expert dimension mismatch");
+  TORCH_CHECK(packedRecvX.size(1) == maxTokensPerExpert,
+              "packedRecvX token dimension mismatch");
+  TORCH_CHECK(packedRecvSrcInfo.size(0) == numLocalExperts,
+              "packedRecvSrcInfo local expert dimension mismatch");
+  TORCH_CHECK(packedRecvSrcInfo.size(1) == maxTokensPerExpert,
+              "packedRecvSrcInfo token dimension mismatch");
+  TORCH_CHECK(packedRecvLayoutRange.size(0) == numLocalExperts,
+              "packedRecvLayoutRange local expert dimension mismatch");
+  TORCH_CHECK(packedRecvLayoutRange.size(1) == numRanks,
+              "packedRecvLayoutRange rank dimension mismatch");
+
+  torch::Tensor dispatchSrcTokenPos = GetDispatchSrcTokenId(handle);
+  const int64_t totalTokens = dispatchSrcTokenPos.size(0);
+  TORCH_CHECK(totalTokens >= 0, "totalTokens must be non-negative");
+  TORCH_CHECK(topkIdx.size(0) >= totalTokens,
+              "topkIdx has fewer rows than totalTokens");
+  if (topkWeights.has_value()) {
+    TORCH_CHECK(topkWeights->size(0) >= totalTokens,
+                "topkWeights has fewer rows than totalTokens");
+  }
+
+  auto options = packedRecvX.options();
+  auto accOptions = options.dtype(torch::kFloat32);
+  torch::Tensor combineInputAcc = torch::zeros({totalTokens, hidden}, accOptions);
+
+  torch::Tensor slicedTopkIdx = topkIdx.index({Slice(0, totalTokens)});
+  auto mapOptions =
+      torch::TensorOptions().dtype(torch::kInt64).device(packedRecvX.device());
+  const int64_t maxSrcTokens =
+      static_cast<int64_t>(handle.config.worldSize) * handle.config.maxNumInpTokenPerRank;
+  torch::Tensor srcToDispatch = torch::full({maxSrcTokens}, -1, mapOptions);
+  torch::Tensor dispatchIdx1d = torch::arange(totalTokens, mapOptions);
+  srcToDispatch.index_put_({dispatchSrcTokenPos.to(torch::kInt64)}, dispatchIdx1d);
+
+  for (int64_t localExpert = 0; localExpert < numLocalExperts; ++localExpert) {
+    const int64_t globalExpertId = handle.config.rank * numLocalExperts + localExpert;
+    std::optional<torch::Tensor> expertWeights{std::nullopt};
+    if (topkWeights.has_value()) {
+      auto expertMask = slicedTopkIdx.eq(globalExpertId);
+      expertWeights =
+          (topkWeights.value().index({Slice(0, totalTokens)}) *
+           expertMask.to(topkWeights->scalar_type()))
+              .sum(1);
+    }
+
+    for (int64_t srcRank = 0; srcRank < numRanks; ++srcRank) {
+      const int64_t packedRange =
+          packedRecvLayoutRange.index({localExpert, srcRank}).item<int64_t>();
+      const int64_t beginIdx = packedRange >> 32;
+      const int64_t count = packedRange & 0xffffffff;
+      if (count <= 0) {
+        continue;
+      }
+
+      torch::Tensor slotRange =
+          torch::arange(beginIdx, beginIdx + count, mapOptions);
+      torch::Tensor srcInfo =
+          packedRecvSrcInfo.index({localExpert, slotRange}).to(torch::kInt64);
+      torch::Tensor srcTokenPos = srcInfo + srcRank * handle.config.maxNumInpTokenPerRank;
+      torch::Tensor dispatchIdx = srcToDispatch.index_select(0, srcTokenPos);
+      torch::Tensor valid = dispatchIdx.ge(0);
+      if (valid.any().item<bool>() == false) {
+        continue;
+      }
+      torch::Tensor tokenIdx = torch::nonzero(valid).squeeze(1);
+      torch::Tensor flatDispatchIdx = dispatchIdx.masked_select(valid);
+
+      torch::Tensor tokens = packedRecvX.index({localExpert, slotRange}).to(torch::kFloat32);
+      torch::Tensor selectedTokens = tokens.index_select(0, tokenIdx);
+      if (expertWeights.has_value()) {
+        torch::Tensor weights = expertWeights->index_select(0, flatDispatchIdx).unsqueeze(1);
+        weights = weights.to(torch::kFloat32);
+        combineInputAcc.index_put_(
+            {flatDispatchIdx},
+            combineInputAcc.index({flatDispatchIdx}) + selectedTokens * weights);
+      } else {
+        combineInputAcc.index_put_({flatDispatchIdx},
+                                  combineInputAcc.index({flatDispatchIdx}) + selectedTokens);
+      }
+    }
+  }
+
+  return combineInputAcc.to(options.dtype());
+}
+#else
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> ConvertDispatchOutput(
+    mori::moe::EpDispatchCombineHandle& handle, const torch::Tensor& dispatchOutX,
+    const torch::Tensor& dispatchOutTopkIdx,
+    int blockNum = -1, int warpPerBlock = -1) {
+  TORCH_CHECK(dispatchOutX.is_cuda(), "dispatchOutX must be a CUDA tensor");
+  TORCH_CHECK(dispatchOutTopkIdx.is_cuda(), "dispatchOutTopkIdx must be a CUDA tensor");
+  TORCH_CHECK(dispatchOutX.dim() == 2, "dispatchOutX must be 2D");
+  TORCH_CHECK(dispatchOutTopkIdx.dim() == 2, "dispatchOutTopkIdx must be 2D");
+  TORCH_CHECK(dispatchOutX.size(0) == dispatchOutTopkIdx.size(0),
+              "dispatchOutX and dispatchOutTopkIdx must have the same first dimension");
+
+  const int64_t numLocalExperts = handle.config.numExpertPerRank;
+  const int64_t maxTokensPerExpert =
+      static_cast<int64_t>(handle.config.worldSize) * handle.config.maxNumInpTokenPerRank;
+  const int64_t hidden = dispatchOutX.size(1);
+
+  torch::Tensor packedRecvX =
+      torch::empty({numLocalExperts, maxTokensPerExpert, hidden}, dispatchOutX.options());
+  auto packedRecvSrcInfo =
+      torch::empty({numLocalExperts, handle.config.worldSize * handle.config.maxNumInpTokenPerRank},
+                   torch::dtype(torch::kInt32).device(torch::kCUDA));
+  auto packedRecvLayoutRange = torch::empty({numLocalExperts, handle.config.worldSize},
+                                            torch::dtype(torch::kInt64).device(torch::kCUDA));
+
+  handle.LaunchConvertDispatchOutputKernel(dispatchOutX.data_ptr(), dispatchOutTopkIdx.data_ptr(),
+                                           packedRecvX.data_ptr(), handle.standardPackedRecvCount,
+                                           packedRecvSrcInfo.data_ptr<int>(),
+                                           packedRecvLayoutRange.data_ptr<int64_t>(), blockNum,
+                                           warpPerBlock, at::cuda::getCurrentHIPStream());
+
+  torch::Tensor packedRecvCount =
+      torch::from_blob(handle.standardPackedRecvCount, {numLocalExperts},
+                       torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+
+  return {packedRecvX, packedRecvCount, packedRecvSrcInfo, packedRecvLayoutRange};
+}
+
+torch::Tensor ConvertCombineInput(mori::moe::EpDispatchCombineHandle& handle,
+                                  const torch::Tensor& packedRecvX,
+                                  const torch::Tensor& packedRecvSrcInfo,
+                                  const torch::Tensor& packedRecvLayoutRange,
+                                  int blockNum = -1, int warpPerBlock = -1) {
+  TORCH_CHECK(packedRecvX.is_cuda() && packedRecvSrcInfo.is_cuda() &&
+                  packedRecvLayoutRange.is_cuda(),
+              "packedRecvX/packedRecvSrcInfo/packedRecvLayoutRange must be CUDA tensors");
+  TORCH_CHECK(packedRecvX.dim() == 3 && packedRecvSrcInfo.dim() == 2 &&
+                  packedRecvLayoutRange.dim() == 2,
+              "packedRecvX must be 3D; others must be 2D");
+
+  const int64_t numLocalExperts = handle.config.numExpertPerRank;
+  const int64_t numRanks = handle.config.worldSize;
+  const int64_t maxTokensPerExpert =
+      static_cast<int64_t>(handle.config.worldSize) * handle.config.maxNumInpTokenPerRank;
+  const int64_t hidden = packedRecvX.size(2);
+  TORCH_CHECK(packedRecvX.size(0) == numLocalExperts &&
+                  packedRecvSrcInfo.size(0) == numLocalExperts &&
+                  packedRecvLayoutRange.size(0) == numLocalExperts,
+              "local expert dimension mismatch");
+  TORCH_CHECK(packedRecvX.size(1) == maxTokensPerExpert &&
+                  packedRecvSrcInfo.size(1) == maxTokensPerExpert &&
+                  packedRecvLayoutRange.size(1) == numRanks,
+              "token/rank dimension mismatch");
+
+  // totalTokens comes from handle.totalRecvTokenNum inside the kernel
+
+  auto options = packedRecvX.options();
+  // torch::Tensor combineInput = torch::empty({handle.config.MaxNumTokensToRecv(), hidden}, options);
+  torch::Tensor combineInput =
+      torch::from_blob(handle.shmemCombineInpTokMemObj->Get(),
+                       {handle.config.MaxNumTokensToRecv(), hidden}, options);
+
+  handle.LaunchConvertCombineInputKernel(
+      packedRecvX.data_ptr(), packedRecvSrcInfo.data_ptr(), packedRecvLayoutRange.data_ptr(),
+      combineInput.data_ptr(), handle.shmemCombineInpTokMemObj, blockNum, warpPerBlock,
+      at::cuda::getCurrentHIPStream());
+
+  return combineInput;
+}
+#endif
 
 torch::Tensor GetDispatchSenderTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
   auto options = torch::TensorOptions()
@@ -211,6 +612,18 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
 
   funcName = std::string("launch_combine");
   m.def(funcName.c_str(), &LaunchCombine);
+
+  funcName = std::string("launch_dispatch_standard_moe");
+  m.def(funcName.c_str(), &LaunchDispatchForStandardMoE);
+
+  funcName = std::string("launch_combine_standard_moe");
+  m.def(funcName.c_str(), &LaunchCombineForStandardMoE);
+
+  funcName = std::string("convert_dispatch_output");
+  m.def(funcName.c_str(), &ConvertDispatchOutput);
+
+  funcName = std::string("convert_combine_input");
+  m.def(funcName.c_str(), &ConvertCombineInput);
 
   funcName = std::string("launch_reset");
   m.def(funcName.c_str(), &LaunchReset);
@@ -366,6 +779,9 @@ void RegisterMoriOps(py::module_& m) {
       .def_readwrite("gpu_per_node", &mori::moe::EpDispatchCombineConfig::gpuPerNode)
       .def_readwrite("rdma_block_num", &mori::moe::EpDispatchCombineConfig::rdmaBlockNum)
       .def_readwrite("num_qp_per_pe", &mori::moe::EpDispatchCombineConfig::numQpPerPe);
+
+  m.attr("topk_idx_t") = py::reinterpret_borrow<py::object>(
+      (PyObject*)torch::getTHPDtype(c10::CppTypeToScalarType<mori::moe::index_t>::value));
 
   DeclareEpDispatchCombineHandle(m);
 

@@ -22,6 +22,7 @@
 from mori import cpp as mori_cpp
 
 from dataclasses import dataclass
+from typing import Optional
 import torch
 import torch.distributed as dist
 
@@ -84,7 +85,19 @@ class EpDispatchCombineOp:
 
         self._dispatch_func = _cpp_dispatch_combine_factory("launch_dispatch")
         self._combine_func = _cpp_dispatch_combine_factory("launch_combine")
+        self._dispatch_standard_moe_func = _cpp_dispatch_combine_factory(
+            "launch_dispatch_standard_moe"
+        )
+        self._combine_standard_moe_func = _cpp_dispatch_combine_factory(
+            "launch_combine_standard_moe"
+        )
         self._reset_func = _cpp_dispatch_combine_factory("launch_reset")
+        self._convert_dispatch_output_func = _cpp_dispatch_combine_factory(
+            "convert_dispatch_output"
+        )
+        self._convert_combine_input_func = _cpp_dispatch_combine_factory(
+            "convert_combine_input"
+        )
         self._get_dispatch_src_token_pos_func = _cpp_dispatch_combine_factory(
             "get_dispatch_src_token_pos"
         )
@@ -131,9 +144,53 @@ class EpDispatchCombineOp:
         indices: torch.Tensor,
         block_num: int = -1,
         warp_per_block: int = -1,
+        use_external_inp_buf: int = -1,
         call_reset: bool = False,
     ):
         output = self._combine_func(
+            self._handle,
+            self.config.kernel_type.value,
+            input,
+            weights,
+            indices,
+            block_num,
+            warp_per_block,
+            use_external_inp_buf,
+        )
+        if call_reset:
+            self._reset_func(self._handle)
+        return output
+
+    def dispatch_standard_moe(
+        self,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        indices: torch.Tensor,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        return self._dispatch_standard_moe_func(
+            self._handle,
+            self.config.kernel_type.value,
+            input,
+            weights,
+            scales,
+            indices,
+            block_num,
+            warp_per_block,
+        )
+
+    def combine_standard_moe(
+        self,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+        call_reset: bool = False,
+    ):
+        output = self._combine_standard_moe_func(
             self._handle,
             self.config.kernel_type.value,
             input,
@@ -145,6 +202,38 @@ class EpDispatchCombineOp:
         if call_reset:
             self._reset_func(self._handle)
         return output
+
+    def convert_dispatch_output(
+        self,
+        dispatch_out_x: torch.Tensor,
+        dispatch_out_topk_idx: torch.Tensor,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        return self._convert_dispatch_output_func(
+            self._handle,
+            dispatch_out_x,
+            dispatch_out_topk_idx,
+            block_num,
+            warp_per_block,
+        )
+
+    def convert_combine_input(
+        self,
+        packed_recv_x: torch.Tensor,
+        packed_recv_src_info: torch.Tensor,
+        packed_recv_layout_range: torch.Tensor,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        return self._convert_combine_input_func(
+            self._handle,
+            packed_recv_x,
+            packed_recv_src_info,
+            packed_recv_layout_range,
+            block_num,
+            warp_per_block,
+        )
 
     def reset(self):
         self._reset_func(self._handle)

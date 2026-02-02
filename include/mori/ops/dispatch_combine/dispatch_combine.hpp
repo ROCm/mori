@@ -25,6 +25,7 @@
 #include <hip/hip_fp8.h>
 #include <hip/library_types.h>
 
+#include <cstdint>
 #include <sstream>
 #include <variant>
 
@@ -77,7 +78,8 @@ inline size_t GetHipDataTypeSize(hipDataType dtype) {
 
 using index_t = int32_t;
 
-#define MAX_EXPERTS_PER_TOKEN (8)
+
+#define MAX_EXPERTS_PER_TOKEN (9)
 struct EpDispatchCombineConfig {
   int rank{0};
   int worldSize{0};
@@ -139,15 +141,44 @@ class EpDispatchCombineHandle {
     // printf("handle inputType %s\n", HipDataTypeToString(inputType));
   }
 
+  void SetStandardMoeOutputBuffers(void* packedRecvX, int* packedRecvCount,
+                                   int* packedRecvSrcInfo, int64_t* packedRecvLayoutRange) {
+    enableStandardMoeOutput = true;
+    standardPackedRecvX = packedRecvX;
+    // standardPackedRecvCount = packedRecvCount;
+    standardPackedRecvSrcInfo = packedRecvSrcInfo;
+    standardPackedRecvLayoutRange = packedRecvLayoutRange;
+  }
+
+  void ClearStandardMoeOutputBuffers() {
+    enableStandardMoeOutput = false;
+    standardPackedRecvX = nullptr;
+    // standardPackedRecvCount = nullptr;
+    standardPackedRecvSrcInfo = nullptr;
+    standardPackedRecvLayoutRange = nullptr;
+  }
+
   // When blockNum and warpPerBlock <= 0, kernel will use default values in config
   void LaunchIntraNodeDispatch(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
   void LaunchInterNodeDispatch(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
   void LaunchIntraNodeCombine(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
   void LaunchInterNodeCombine(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
 
-  void LaunchDispatch(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
-  void LaunchCombine(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
+  void LaunchDispatch(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0,
+                      bool enableStandardMoeOutput = false);
+  void LaunchCombine(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0,
+                     bool enableStandardMoeInput = false, int useExternalInpBuf = -1);
   void LaunchReset(hipStream_t = 0);
+
+  void LaunchConvertDispatchOutputKernel(const void* dispatchOutX, const void* dispatchOutTopkIdx,
+                                         void* packedRecvX,
+                                         int* packedRecvCount, int* packedRecvSrcInfo,
+                                         int64_t* packedRecvLayoutRange, int blockNum = -1,
+                                         int warpPerBlock = -1, hipStream_t = 0);
+  void LaunchConvertCombineInputKernel(const void* packedRecvX, const void* packedRecvSrcInfo,
+                                       const void* packedRecvLayoutRange, void* combineInput,
+                                       mori::application::SymmMemObjPtr shmemCombineInpTokMemObj,
+                                       int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
 
   index_t GetCurRankNumToken() const { return curRankNumToken; }
 
@@ -213,6 +244,17 @@ class EpDispatchCombineHandle {
   // Map dispatch staging buffer index to output buffer index, saved at dispatch recv phase and used
   // at combine send phase
   index_t* dispReceiverIdxMap{nullptr};
+
+  // Map dispatch token to expert slot index (size: MaxNumTokensToRecv * numExpertPerToken), saved
+  // at ConvertDispatchOutput and used at ConvertCombineInput
+  uint64_t* dispTokToEpSlotMap{nullptr};
+
+  // Standard MoE output buffers (set per-dispatch when enabled).
+  bool enableStandardMoeOutput{false};
+  void* standardPackedRecvX{nullptr};
+  int* standardPackedRecvCount{nullptr};
+  int* standardPackedRecvSrcInfo{nullptr};
+  int64_t* standardPackedRecvLayoutRange{nullptr};
 
   // Map staging buffer index to dispatch input token index, saved at dispatch init phase and used
   // at dispatch send phase
@@ -306,6 +348,13 @@ struct EpDispatchCombineArgs {
 #ifdef ENABLE_PROFILER
   mori::core::profiler::ProfilerConfig profilerConfig;
 #endif
+
+  bool enableStandardMoeOutput{false};
+  void* standardPackedRecvX{nullptr};
+  int* standardPackedRecvCount{nullptr};
+  int* standardPackedRecvSrcInfo{nullptr};
+  int64_t* standardPackedRecvLayoutRange{nullptr};
+  uint64_t* dispTokToEpSlotMap{nullptr};
 };
 
 using EpDispatchCombineArgsVariant =
@@ -369,6 +418,14 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.interNodeDispSendMap = handle.interNodeDispSendMap;
 #ifdef ENABLE_PROFILER
   args.profilerConfig = handle.profilerConfig;
+#endif
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+  args.enableStandardMoeOutput = handle.enableStandardMoeOutput;
+  args.standardPackedRecvX = handle.standardPackedRecvX;
+  args.standardPackedRecvCount = handle.standardPackedRecvCount;
+  args.standardPackedRecvSrcInfo = handle.standardPackedRecvSrcInfo;
+  args.standardPackedRecvLayoutRange = handle.standardPackedRecvLayoutRange;
+  args.dispTokToEpSlotMap = handle.dispTokToEpSlotMap;
 #endif
   return args;
 }

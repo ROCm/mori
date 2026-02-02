@@ -24,6 +24,7 @@
 #include "mori/core/core.hpp"
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 #include "mori/shmem/shmem.hpp"
+#include "src/ops/dispatch_combine/convert.hpp"
 
 namespace mori {
 namespace moe {
@@ -69,7 +70,7 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpDispatchIntraNodeKernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
-template <typename T>
+template <typename T, bool EnableStdMoE = false>
 __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
 
@@ -188,12 +189,18 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
     }
   }
+
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+  if constexpr (EnableStdMoE) {
+    InvokeConvertDispatchOutput<T>(args, myPe);
+  }
+#endif
 }
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpCombineIntraNodeKernel                                    */
 /* ---------------------------------------------------------------------------------------------- */
-template <typename T, bool UseP2PRead = true>
+template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false>
 __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
   int thdId = threadIdx.x;
@@ -219,14 +226,20 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   const size_t weightBytes =
       (args.weightsBuf == nullptr) ? 0 : config.numExpertPerToken * sizeof(float);
   const size_t combXferBytes = hiddenBytes + weightBytes;
+
+  // If EnableStdMoE, call ConvertCombineInputDevice first to convert standard MoE format
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+  if constexpr (EnableStdMoE) {
+    InvokeConvertCombineInput<T, UseP2PRead>(args, myPe);
+  }
+#else
   if constexpr (UseP2PRead) {
     if (args.config.useExternalInpBuffer) {
       for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
         core::WarpCopy(args.shmemCombineInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
-                       args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
+                      args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
       }
     }
-
     if (args.weightsBuf) {
       for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
         core::WarpCopy(
@@ -243,14 +256,15 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
           args.shmemCombineInpTokMemObj->template GetAs<uint8_t*>(destPe) +
           (myPe * config.MaxNumTokensToRecvPerRank() + destLocalTokId) * combXferBytes;
       core::WarpCopy(reinterpret_cast<T*>(destStagingPtr),
-                     args.inpTokenBuf + tokenIdx * config.hiddenDim, config.hiddenDim);
+                    args.inpTokenBuf + tokenIdx * config.hiddenDim, config.hiddenDim);
       if (args.weightsBuf) {
         core::WarpCopy(reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
-                       args.weightsBuf + tokenIdx * config.numExpertPerToken,
-                       config.numExpertPerToken);
+                      args.weightsBuf + tokenIdx * config.numExpertPerToken,
+                      config.numExpertPerToken);
       }
     }
   }
+#endif
 
   // Make sure copy on all GPUs are finished
   CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
