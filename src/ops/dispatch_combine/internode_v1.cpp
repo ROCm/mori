@@ -699,11 +699,12 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
       core::CombineInternalFp8T* dstTok =
           args.shmemCombineInpTokMemObj->template GetAs<core::CombineInternalFp8T*>() +
           tokenId * config.hiddenDim;
-      float* dstScales = reinterpret_cast<float*>(
-          args.shmemInpScalesMemObj->template GetAs<uint8_t*>() + tokenId * scaleBytes);
+      float* dstScales =
+          args.shmemInpScalesMemObj->template GetAs<float*>() + tokenId * config.scaleDim;
+      const T* srcTok = args.inpTokenBuf + tokenId * config.hiddenDim;
+
       core::WarpQuantizeToFp8Blockwise<core::CombineInternalFp8T, T>(
-          dstTok, dstScales, args.inpTokenBuf + tokenId * config.hiddenDim, config.hiddenDim,
-          config.scaleDim);
+          dstTok, dstScales, srcTok, config.hiddenDim, config.scaleDim);
 #else
       core::WarpCopy(
           args.shmemCombineInpTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim,
@@ -787,9 +788,10 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
           srcPtrs[laneId] = reinterpret_cast<T*>(
               args.shmemCombineInpTokMemObj->template GetAs<core::CombineInternalFp8T*>(destPe) +
               destLocalTokId * config.hiddenDim);
-          srcScalesPtr[laneId] =
-              reinterpret_cast<float*>(args.shmemInpScalesMemObj->template GetAs<uint8_t*>(destPe) +
-                                       destLocalTokId * scaleBytes);
+          float* tokScales = args.shmemInpScalesMemObj->template GetAs<float*>(destPe) +
+                             destLocalTokId * config.scaleDim;
+          // Negative scale[0] marks tokens that used scaling.
+          if (tokScales[0] < 0.0f) srcScalesPtr[laneId] = tokScales;
 #else
           srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
                             destLocalTokId * config.hiddenDim;
@@ -873,9 +875,10 @@ inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
           srcPtrs[laneId] = reinterpret_cast<T*>(
               args.shmemCombineInpTokMemObj->template GetAs<core::CombineInternalFp8T*>(destPe) +
               destLocalTokId * config.hiddenDim + hiddenDimOffset);
-          srcScalesPtr[laneId] =
-              reinterpret_cast<float*>(args.shmemInpScalesMemObj->template GetAs<uint8_t*>(destPe) +
-                                       destLocalTokId * scaleBytes);
+          float* tokScales = args.shmemInpScalesMemObj->template GetAs<float*>(destPe) +
+                             destLocalTokId * config.scaleDim;
+          // Negative scale[0] marks tokens that used scaling.
+          if (tokScales[0] < 0.0f) srcScalesPtr[laneId] = tokScales;
 #else
           srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
                             destLocalTokId * config.hiddenDim + hiddenDimOffset;
@@ -1001,9 +1004,10 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
                         args.shmemCombineInpTokMemObj->template GetAs<core::CombineInternalFp8T*>(
                             destPe) +
                         destLocalTokId * config.hiddenDim);
-                    srcScalesPtr[laneId] = reinterpret_cast<float*>(
-                        args.shmemInpScalesMemObj->template GetAs<uint8_t*>(destPe) +
-                        destLocalTokId * scaleBytes);
+                    float* tokScales = args.shmemInpScalesMemObj->template GetAs<float*>(destPe) +
+                                       destLocalTokId * config.scaleDim;
+                    // Negative scale[0] marks tokens that used scaling.
+                    if (tokScales[0] < 0.0f) srcScalesPtr[laneId] = tokScales;
 #else
                     srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
                                       destLocalTokId * config.hiddenDim;
@@ -1179,9 +1183,10 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
                   args.shmemCombineInpTokMemObj->template GetAs<core::CombineInternalFp8T*>(
                       destPe) +
                   destLocalTokId * config.hiddenDim + hiddenDimOffset);
-              srcScalesPtr[laneId] = reinterpret_cast<float*>(
-                  args.shmemInpScalesMemObj->template GetAs<uint8_t*>(destPe) +
-                  destLocalTokId * scaleBytes);
+              float* tokScales = args.shmemInpScalesMemObj->template GetAs<float*>(destPe) +
+                                 destLocalTokId * config.scaleDim;
+              // Negative scale[0] marks tokens that used scaling.
+              if (tokScales[0] < 0.0f) srcScalesPtr[laneId] = tokScales;
 #else
               srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
                                 destLocalTokId * config.hiddenDim + hiddenDimOffset;

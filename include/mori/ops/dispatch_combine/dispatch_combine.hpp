@@ -123,6 +123,7 @@ class EpDispatchCombineHandle {
     this->inpTokenBuf = input;
     this->outTokenBuf = output;
     this->weightsBuf = weights;
+    this->scalesBuf = nullptr;
     this->tokenIndices = tokenIndices;
     this->curRankNumToken = numToken;
     // printf("handle inputType %s\n", HipDataTypeToString(inputType));
