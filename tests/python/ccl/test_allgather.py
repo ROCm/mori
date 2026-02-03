@@ -117,6 +117,8 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
         exec_times = []
         gemm_times = []
         overlap_times = []  # Total time for concurrent execution
+        sequential_allgather_times = []  # Sequential allgather times (for accurate comparison)
+        sequential_gemm_times = []  # Sequential gemm times (for accurate comparison)
         total_iters = warmup + iterations
         use_async = False  # Use async mode to match C++ test
         
@@ -133,6 +135,74 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
                 # Create events for measuring total overlap time (from start to both complete)
                 overlap_start = torch.cuda.Event(enable_timing=True)
                 overlap_end = torch.cuda.Event(enable_timing=True)
+            
+            # Step 1: Sequential baseline tests (if testing overlap)
+            if use_custom_stream and test_gemm_overlap and HAS_AITER and stream_gemm is not None:
+                if rank == 0:
+                    print(f"\n{'='*60}")
+                    print(f"Step 1: Sequential Baseline Tests")
+                    print(f"{'='*60}")
+                
+                # Test 1a: Sequential AllGather only
+                if rank == 0:
+                    print(f"\nTesting AllGather sequentially (baseline)...")
+                
+                for iter_idx in range(total_iters):
+                    torch.cuda.synchronize()
+                    
+                    if use_custom_stream:
+                        allgather_start.record(stream)
+                        with torch.cuda.stream(stream):
+                            success = allgather(input_tensor, output_tensor, elems_per_pe)
+                        allgather_end.record(stream)
+                        stream.synchronize()
+                    else:
+                        allgather_start.record()
+                        success = allgather(input_tensor, output_tensor, elems_per_pe)
+                        allgather_end.record()
+                        torch.cuda.synchronize()
+                    
+                    allgather_time = allgather_start.elapsed_time(allgather_end) / 1000.0
+                    
+                    if iter_idx >= warmup:
+                        sequential_allgather_times.append(allgather_time)
+                    elif rank == 0:
+                        print(f"  Warmup {iter_idx + 1}/{warmup}: {allgather_time:.6f}s")
+                    
+                    if not success:
+                        print(f"PE {rank}: AllGather failed at sequential test iteration {iter_idx}")
+                        break
+                
+                # Test 1b: Sequential GEMM only
+                if rank == 0:
+                    print(f"\nTesting GEMM sequentially (baseline)...")
+                
+                for iter_idx in range(total_iters):
+                    torch.cuda.synchronize()
+                    
+                    gemm_start.record(stream_gemm)
+                    with torch.cuda.stream(stream_gemm):
+                        _ = aiter.gemm_a8w8_CK(A_q, B_q, A_scale, B_scale, bias, torch.bfloat16)
+                    gemm_end.record(stream_gemm)
+                    stream_gemm.synchronize()
+                    
+                    gemm_time = gemm_start.elapsed_time(gemm_end) / 1000.0
+                    
+                    if iter_idx >= warmup:
+                        sequential_gemm_times.append(gemm_time)
+                    elif rank == 0:
+                        print(f"  Warmup {iter_idx + 1}/{warmup}: {gemm_time:.6f}s")
+                
+                if rank == 0:
+                    seq_allgather_avg = np.mean(sequential_allgather_times) if len(sequential_allgather_times) > 0 else 0
+                    seq_gemm_avg = np.mean(sequential_gemm_times) if len(sequential_gemm_times) > 0 else 0
+                    print(f"\nSequential Baseline Results:")
+                    print(f"  AllGather avg: {seq_allgather_avg:.6f}s")
+                    print(f"  GEMM avg: {seq_gemm_avg:.6f}s")
+                    print(f"  Total sequential: {seq_allgather_avg + seq_gemm_avg:.6f}s")
+                    print(f"\n{'='*60}")
+                    print(f"Step 2: Concurrent Overlap Tests")
+                    print(f"{'='*60}\n")
             
             for iter_idx in range(total_iters):
                 success = True  # Initialize success flag
@@ -294,6 +364,21 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
         else:
             overlap_avg_time = overlap_min_time = overlap_max_time = 0.0
         
+        # Calculate sequential baseline statistics if available
+        if len(sequential_allgather_times) > 0:
+            seq_allgather_avg = np.mean(sequential_allgather_times)
+            seq_allgather_min = np.min(sequential_allgather_times)
+            seq_allgather_max = np.max(sequential_allgather_times)
+        else:
+            seq_allgather_avg = seq_allgather_min = seq_allgather_max = 0.0
+        
+        if len(sequential_gemm_times) > 0:
+            seq_gemm_avg = np.mean(sequential_gemm_times)
+            seq_gemm_min = np.min(sequential_gemm_times)
+            seq_gemm_max = np.max(sequential_gemm_times)
+        else:
+            seq_gemm_avg = seq_gemm_min = seq_gemm_max = 0.0
+        
         if rank == 0:
             print(f"\n{'='*60}")
             print(f"PE {rank} Local Performance Statistics")
@@ -304,10 +389,14 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
             print(f"  Avg time: {avg_time:.6f}s")
             
             if len(gemm_times) > 0:
-                print(f"\nGEMM Times (concurrent on separate stream):")
-                print(f"  Min time: {gemm_min_time:.6f}s")
-                print(f"  Max time: {gemm_max_time:.6f}s")
-                print(f"  Avg time: {gemm_avg_time:.6f}s")
+                print(f"\nSequential Baseline (no overlap):")
+                print(f"  AllGather avg: {seq_allgather_avg:.6f}s")
+                print(f"  GEMM avg: {seq_gemm_avg:.6f}s")
+                print(f"  Sequential total: {seq_allgather_avg + seq_gemm_avg:.6f}s")
+                
+                print(f"\nConcurrent Execution Times (during overlap test):")
+                print(f"  AllGather avg: {avg_time:.6f}s")
+                print(f"  GEMM avg: {gemm_avg_time:.6f}s")
                 
                 print(f"\nTotal Overlap Time (both operations):")
                 print(f"  Min time: {overlap_min_time:.6f}s")
@@ -324,12 +413,14 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
                 print(f"  Measurement overhead: {measurement_overhead:.6f}s ({measurement_overhead_pct:.2f}%)")
                 
                 print(f"\nOverlap Efficiency Analysis:")
-                # Sequential time would be the sum of both operations
-                sequential_time = avg_time + gemm_avg_time
+                # Use sequential baseline times for accurate comparison
+                sequential_time = seq_allgather_avg + seq_gemm_avg
                 speedup = sequential_time / overlap_avg_time if overlap_avg_time > 0 else 0
                 efficiency = (theoretical_overlap / overlap_avg_time * 100) if overlap_avg_time > 0 else 0
-                print(f"  Sequential time (sum): {sequential_time:.6f}s")
-                print(f"  Concurrent time (measured): {overlap_avg_time:.6f}s")
+                time_saved = sequential_time - overlap_avg_time
+                print(f"  Sequential baseline time: {sequential_time:.6f}s")
+                print(f"  Concurrent overlap time: {overlap_avg_time:.6f}s")
+                print(f"  Time saved: {time_saved:.6f}s")
                 print(f"  Speedup: {speedup:.2f}x")
                 print(f"  Concurrency efficiency: {efficiency:.2f}%")
             print(f"{'='*60}")
@@ -397,6 +488,21 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
             overlap_global_min = overlap_min_tensor.item()
             overlap_global_max = overlap_max_tensor.item()
             overlap_global_avg = overlap_avg_tensor.item() / npes
+        
+        # Gather sequential baseline global statistics if available
+        if len(sequential_allgather_times) > 0:
+            seq_allgather_avg_tensor = torch.tensor([seq_allgather_avg], dtype=torch.float64)
+            dist.all_reduce(seq_allgather_avg_tensor, op=dist.ReduceOp.SUM)
+            seq_allgather_global_avg = seq_allgather_avg_tensor.item() / npes
+        else:
+            seq_allgather_global_avg = 0.0
+        
+        if len(sequential_gemm_times) > 0:
+            seq_gemm_avg_tensor = torch.tensor([seq_gemm_avg], dtype=torch.float64)
+            dist.all_reduce(seq_gemm_avg_tensor, op=dist.ReduceOp.SUM)
+            seq_gemm_global_avg = seq_gemm_avg_tensor.item() / npes
+        else:
+            seq_gemm_global_avg = 0.0
 
         if rank == 0:
             global_bandwidth = total_bytes / global_avg / (1024.0 * 1024.0 * 1024.0)
@@ -412,10 +518,14 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
             print(f"  Total data: {total_bytes / (1024.0 * 1024.0 * 1024.0):.3f} GB")
             
             if len(gemm_times) > 0:
-                print(f"\nGEMM Performance (concurrent on separate stream):")
-                print(f"  Min time: {gemm_global_min:.6f}s")
-                print(f"  Max time: {gemm_global_max:.6f}s")
-                print(f"  Avg time: {gemm_global_avg:.6f}s")
+                print(f"\nSequential Baseline (no overlap):")
+                print(f"  AllGather avg: {seq_allgather_global_avg:.6f}s")
+                print(f"  GEMM avg: {seq_gemm_global_avg:.6f}s")
+                print(f"  Sequential total: {seq_allgather_global_avg + seq_gemm_global_avg:.6f}s")
+                
+                print(f"\nConcurrent Execution Times (during overlap test):")
+                print(f"  AllGather avg: {global_avg:.6f}s")
+                print(f"  GEMM avg: {gemm_global_avg:.6f}s")
                 
             if len(overlap_times) > 0:
                 print(f"\nTotal Overlap Time (AllGather + GEMM concurrent):")
@@ -431,13 +541,14 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
                 print(f"  Measurement overhead: {measurement_overhead:.6f}s ({measurement_overhead_pct:.2f}%)")
                 
                 print(f"\nConcurrency Analysis:")
-                sequential_time = global_avg + gemm_global_avg
+                # Use sequential baseline times for accurate comparison
+                sequential_time = seq_allgather_global_avg + seq_gemm_global_avg
                 speedup = sequential_time / overlap_global_avg if overlap_global_avg > 0 else 0
                 time_saved = sequential_time - overlap_global_avg
                 saved_percentage = (time_saved / sequential_time * 100) if sequential_time > 0 else 0
                 overlap_efficiency = (ideal_overlap / overlap_global_avg * 100) if overlap_global_avg > 0 else 0
                 
-                print(f"  Sequential execution time: {sequential_time:.6f}s")
+                print(f"  Sequential baseline time: {sequential_time:.6f}s")
                 print(f"  Concurrent execution time: {overlap_global_avg:.6f}s")
                 print(f"  Time saved: {time_saved:.6f}s ({saved_percentage:.2f}%)")
                 print(f"  Speedup: {speedup:.2f}x")
