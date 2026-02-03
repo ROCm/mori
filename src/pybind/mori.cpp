@@ -53,13 +53,13 @@ namespace {
  */
 hipStream_t convert_torch_stream_to_hip(py::object stream_obj, int device_index = -1) {
     if (stream_obj.is_none()) {
-        // Get current CUDA stream for the device
+        // Get current HIP stream for the device
         // This allows using torch.cuda.stream() context manager
         if (device_index < 0) {
             device_index = at::cuda::current_device();
         }
-        auto current_stream = at::cuda::getCurrentCUDAStream(device_index);
-        return reinterpret_cast<hipStream_t>(current_stream.stream());
+        auto current_stream = at::cuda::getCurrentHIPStream(device_index);
+        return current_stream.stream();
     }
     
     // Get the cuda_stream attribute from torch.cuda.Stream object
