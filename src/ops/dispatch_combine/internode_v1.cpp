@@ -723,30 +723,6 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
           args.weightsBuf + tokenId * config.numExpertPerToken, config.numExpertPerToken);
     }
   }
-
-  uint64_t barrierFlag = 0;
-  int finishedWarp = 0;
-  if (laneId == 0) {
-    finishedWarp = atomicAdd(args.combineGridBarrier, 1);
-    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
-  }
-  finishedWarp = __shfl(finishedWarp, 0);
-  barrierFlag = __shfl(barrierFlag, 0);
-  if ((finishedWarp + 1) == (blockNum * warpNum)) {
-    if (laneId < config.gpuPerNode) {
-      int destPe = myNode * config.gpuPerNode + laneId;
-      core::AtomicStoreRelaxedSystem(
-          args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>(destPe) + args.config.rank,
-          barrierFlag);
-    }
-    if (laneId == 0) args.combineGridBarrier[0] = 0;
-  }
-  uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
-  if (laneId < config.gpuPerNode) {
-    int destPe = myNode * config.gpuPerNode + laneId;
-    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe) != barrierFlag) {
-    }
-  }
 }
 
 template <typename T>
@@ -1352,8 +1328,6 @@ inline __device__ void CombineAll(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
-
-  v1::CombineSync(args);
   if (blockId < config.rdmaBlockNum) {
     v1::CombineInterNode(args);
   } else {
@@ -1423,12 +1397,35 @@ __global__ void EpCombineAll(EpDispatchCombineArgs<T> args) {
 template <typename T>
 __global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
-
-  v1::CombineSync(args);
   if (blockId < config.rdmaBlockNum) {
     v1::CombineInterNodeLL(args);
   } else {
     v1::CombineIntraNodeLL(args);
+  }
+}
+
+template <typename T>
+__global__ void EpCombineSync(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  v1::CombineSync(args);
+}
+
+template <typename T>
+__global__ void EpCombineSyncBarrier(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  uint64_t barrierFlag = 0;
+  if (laneId == 0) {
+    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
+  }
+  barrierFlag = __shfl(barrierFlag, 0);
+  uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
+  if (laneId < config.gpuPerNode) {
+    int destPe = myNode * config.gpuPerNode + laneId;
+    core::AtomicStoreRelaxedSystem(
+        args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>(destPe) + args.config.rank,
+        barrierFlag);
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe) != barrierFlag) {
+    }
   }
 }
 
@@ -1484,6 +1481,28 @@ template __global__ void EpCombineInterNodeV1KernelLowLatency<__hip_fp8_e4m3>(
 #endif
 template __global__ void EpCombineInterNodeV1KernelLowLatency<float>(
     EpDispatchCombineArgs<float> args);
+
+template __global__ void EpCombineSync<hip_bfloat16>(EpDispatchCombineArgs<hip_bfloat16> args);
+#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
+template __global__ void EpCombineSync<__hip_fp8_e4m3_fnuz>(
+    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
+#endif
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+template __global__ void EpCombineSync<__hip_fp8_e4m3>(EpDispatchCombineArgs<__hip_fp8_e4m3> args);
+#endif
+template __global__ void EpCombineSync<float>(EpDispatchCombineArgs<float> args);
+
+template __global__ void EpCombineSyncBarrier<hip_bfloat16>(
+    EpDispatchCombineArgs<hip_bfloat16> args);
+#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
+template __global__ void EpCombineSyncBarrier<__hip_fp8_e4m3_fnuz>(
+    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
+#endif
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+template __global__ void EpCombineSyncBarrier<__hip_fp8_e4m3>(
+    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
+#endif
+template __global__ void EpCombineSyncBarrier<float>(EpDispatchCombineArgs<float> args);
 
 template __global__ void EpCombineAll<hip_bfloat16>(EpDispatchCombineArgs<hip_bfloat16> args);
 #ifdef MORI_FP8_TYPE_FNUZ_ENABLED
