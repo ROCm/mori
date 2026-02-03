@@ -161,13 +161,13 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
                     allgather_end.record(stream)
                     gemm_end.record(stream_gemm)
                     
-                    # Wait for both operations to complete
-                    allgather_end.synchronize()
-                    gemm_end.synchronize()
+                    # Wait for both operations to complete using stream.synchronize()
+                    stream.synchronize()
+                    stream_gemm.synchronize()
                     
                     # Record overall end time on default stream (after both complete)
                     overlap_end.record()
-                    overlap_end.synchronize()
+                    torch.cuda.synchronize()
                     
                     # Calculate elapsed times
                     allgather_time = allgather_start.elapsed_time(allgather_end) / 1000.0
@@ -179,6 +179,7 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
                     theoretical_overlap = max(allgather_time, gemm_time)
                     
                     if iter_idx >= warmup:
+                        print(f"allgather time={allgather_time: .6f}    GEMM time={gemm_time:.6f}s")
                         exec_times.append(allgather_time)
                         gemm_times.append(gemm_time)
                         overlap_times.append(overlap_time)
@@ -203,7 +204,12 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
                     else:
                         allgather_end.record()
                     
-                    allgather_end.synchronize()
+                    # Synchronize using stream.synchronize() instead of event.synchronize()
+                    if use_custom_stream:
+                        stream.synchronize()
+                    else:
+                        torch.cuda.synchronize()
+                    
                     allgather_time = allgather_start.elapsed_time(allgather_end) / 1000.0
                     
                     if iter_idx >= warmup:

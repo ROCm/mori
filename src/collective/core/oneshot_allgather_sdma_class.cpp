@@ -438,7 +438,7 @@ bool AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
 
         // Step 4: Copy from output transit buffer to user output buffer
         // Note: Synchronization is handled by Python layer
-        copy_output_to_user(output, total_count, stream);
+    //    copy_output_to_user(output, total_count, stream);
 
     //} catch (const std::exception& e) {
     //    fprintf(stderr, "PE %d: Allgather operation failed: %s\n", myPe_, e.what());
