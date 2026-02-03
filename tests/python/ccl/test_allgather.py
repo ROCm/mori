@@ -108,7 +108,7 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
         # Execute Allgather multiple times
         exec_times = []
         total_iters = warmup + iterations
-        use_async = True  # Use async mode to match C++ test
+        use_async = False  # Use async mode to match C++ test
         
         if not use_async:
             # Synchronous mode (single SDMA queue)
