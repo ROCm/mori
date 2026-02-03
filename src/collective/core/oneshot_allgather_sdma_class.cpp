@@ -409,19 +409,19 @@ bool AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
         return false;
     }
 
-    hipError_t err = hipSuccess;
-    try {
+    //hipError_t err = hipSuccess;
+    //try {
         // Step 1: Copy input data to input transit buffer
-        copy_input_to_transit(input, total_count, stream);
+    //    copy_input_to_transit(input, total_count, stream);
 
         // Step 2: Reset flags
-        resetFlags();
+    //    resetFlags();
 
         // Step 3: Execute Allgather kernel
-        int block_size = 256;
-        int grid_size = (total_count * npes_ + block_size - 1) / block_size;
-        if (grid_size < 1) grid_size = 1;
-        if (grid_size > 65535) grid_size = 65535;
+    //    int block_size = 256;
+    //    int grid_size = (total_count * npes_ + block_size - 1) / block_size;
+    //    if (grid_size < 1) grid_size = 1;
+    //    if (grid_size > 65535) grid_size = 65535;
 
         OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
@@ -429,21 +429,21 @@ bool AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
             output_transit_buffer_obj_,
             flagsObj_, total_count);
 
-        err = hipGetLastError();
-        if (err != hipSuccess) {
-            fprintf(stderr, "PE %d: Kernel launch failed: %s\n",
-                    myPe_, hipGetErrorString(err));
-            return false;
-        }
+    //    err = hipGetLastError();
+    //    if (err != hipSuccess) {
+    //        fprintf(stderr, "PE %d: Kernel launch failed: %s\n",
+    //                myPe_, hipGetErrorString(err));
+    //        return false;
+    //    }
 
         // Step 4: Copy from output transit buffer to user output buffer
         // Note: Synchronization is handled by Python layer
         copy_output_to_user(output, total_count, stream);
 
-    } catch (const std::exception& e) {
-        fprintf(stderr, "PE %d: Allgather operation failed: %s\n", myPe_, e.what());
-        return false;
-    }
+    //} catch (const std::exception& e) {
+    //    fprintf(stderr, "PE %d: Allgather operation failed: %s\n", myPe_, e.what());
+    //    return false;
+    //}
 
     return true;
 }

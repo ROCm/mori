@@ -13,7 +13,6 @@ from tests.python.utils import TorchDistContext, get_free_port
 
 try:
     import aiter
-    from aiter.ops.dtypes import dtypes
     HAS_AITER = True
 except ImportError:
     HAS_AITER = False
@@ -60,15 +59,6 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
         device = torch.device(f"cuda:{rank}")
         input_tensor = torch.zeros(elems_per_pe, dtype=torch.uint32, device=device)
         output_tensor = torch.zeros(elems_per_pe * npes, dtype=torch.uint32, device=device)
-
-        matrix_size=8192
-        A = torch.randn(matrix_size, matrix_size, device=device, dtype=torch.bfloat16)
-        B = torch.randn(matrix_size, matrix_size, device=device, dtype=torch.bfloat16)
-
-        # 量化输入数据
-        A_q, A_scale = aiter.pertoken_quant(A, quant_dtype=dtypes.fp8)
-        B_q, B_scale = aiter.pertoken_quant(B, quant_dtype=dtypes.fp8)
-        bias = None
         
         # Prepare data: Each PE has unique value = (myPe + 1) * 1000
         value = (my_pe + 1) * 1000
@@ -165,7 +155,7 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
                     
                     # Launch gemm on separate stream (concurrent execution)
                     with torch.cuda.stream(stream_gemm):
-                        _ = aiter.gemm_a8w8_CK(A_q, B_q, A_scale, B_scale, bias, dtypes.bf16)
+                        _ = aiter.gemm_a8w8_CK(A_q, B_q, A_scale, B_scale, bias, torch.bfloat16)
                     
                     # Record individual end events
                     allgather_end.record(stream)
