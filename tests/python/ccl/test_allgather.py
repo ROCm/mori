@@ -180,6 +180,7 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
                     
                     if iter_idx >= warmup:
                         print(f"allgather time={allgather_time: .6f}    GEMM time={gemm_time:.6f}s")
+                        if(allgather_time > 0.01): continue
                         exec_times.append(allgather_time)
                         gemm_times.append(gemm_time)
                         overlap_times.append(overlap_time)
