@@ -138,14 +138,19 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   // recv phase as a workaround at the cost of extra latency, we should still investigate the reason
   if ((blockId % blocksPerPe) == 0) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
-      int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
-      if (laneId == 0) shmem::ShmemQuietThread(destPe, qpId);
-      shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
-          args.recvTokenNumMemObj, (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
-          static_cast<uint64_t>(tokenNum + 1), core::AMO_ADD, destPe, qpId);
+      if (laneId == 0) {
+        shmem::ShmemQuietThread(destPe, qpId);
+        int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
+        // TODO(ditian12): send atomic op right after quiet lead to hang issue, need to investigate
+        // shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
+        //     args.recvTokenNumMemObj, (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
+        //     static_cast<uint64_t>(tokenNum + 1), core::AMO_ADD, destPe, qpId);
+        shmem::ShmemPutUint64ImmNbiThread(args.recvTokenNumMemObj,
+                                          (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
+                                          static_cast<uint64_t>(tokenNum + 1), destPe, qpId);
+      }
     }
   }
-
   // Polling recv token number signal
   uint64_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint64_t*>();
   uint64_t recvTokenNum = 0;
@@ -170,17 +175,14 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
     core::WarpCopy<uint8_t, 4>(
         args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>() + destTokId * hiddenBytes,
         stagingPtr + tokenId * xferBytes, hiddenBytes);
-    // if (laneId < config.numExpertPerToken) {
-    //   index_t id =
-    //       reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes)[laneId];
-    //   index_t pe = id / config.numExpertPerRank;
-    //   if (!((pe >= 0) && (pe < config.worldSize))) {
-    //     printf("myPe %d destPe %d get topk id %d %d %lu %d\n", myPe, destPe, id, pe,
-    //     recvTokenNum,
-    //            destTokId);
-    //     assert((pe >= 0) && (pe < config.worldSize));
-    //   }
-    // }
+    if (laneId < config.numExpertPerToken) {
+      index_t id =
+          reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes)[laneId];
+      index_t pe = id / config.numExpertPerRank;
+      if (!((pe >= 0) && (pe < config.worldSize))) {
+        assert((pe >= 0) && (pe < config.worldSize));
+      }
+    }
     core::WarpCopy<uint8_t, 4>(
         args.shmemOutIndicesMemObj->template GetAs<uint8_t*>() + destTokId * indexBytes,
         stagingPtr + tokenId * xferBytes + hiddenBytes, indexBytes);
@@ -277,18 +279,25 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
 
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
-      int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
-      if (laneId == 0) shmem::ShmemQuietThread(destPe, qpId);
-      shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
-          args.crossDeviceBarrierMemObj, myPe * sizeof(uint64_t), 1, core::AMO_ADD, destPe, qpId);
+      if (laneId == 0) {
+        shmem::ShmemQuietThread(destPe, qpId);
+        // TODO(ditian12): send atomic op right after quiet lead to hang issue, need to investigate
+        // shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
+        // args.crossDeviceBarrierMemObj, myPe * sizeof(uint64_t), 1, core::AMO_ADD, destPe, qpId);
+        uint64_t flag = args.crossDeviceBarrierFlag[0];
+        shmem::ShmemPutUint64ImmNbiThread(args.crossDeviceBarrierMemObj,
+                                          (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
+                                          flag, destPe, qpId);
+      }
     }
   }
 
   for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-    uint32_t barrierFlag = args.crossDeviceBarrierFlag[0];
-    shmem::ShmemUint64WaitUntilEquals(
-        args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>() + destPe,
-        barrierFlag * config.numQpPerPe);
+    uint64_t barrierFlag = args.crossDeviceBarrierFlag[0];
+    for (int i = 0; i < config.numQpPerPe; i++)
+      shmem::ShmemUint64WaitUntilEquals(args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>() +
+                                            destPe * config.numQpPerPe + i,
+                                        barrierFlag);
   }
 
   extern __shared__ char sharedMem[];
