@@ -165,6 +165,7 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
                     allgather_time = allgather_start.elapsed_time(allgather_end) / 1000.0
                     
                     if iter_idx >= warmup:
+                        print(f"================allgather time:{allgather_time:.6f}s=======")
                         sequential_allgather_times.append(allgather_time)
                     elif rank == 0:
                         print(f"  Warmup {iter_idx + 1}/{warmup}: {allgather_time:.6f}s")
@@ -189,16 +190,27 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
                     gemm_time = gemm_start.elapsed_time(gemm_end) / 1000.0
                     
                     if iter_idx >= warmup:
+                        print(f"================gemm time:{gemm_time:.6f}s=======")
                         sequential_gemm_times.append(gemm_time)
                     elif rank == 0:
                         print(f"  Warmup {iter_idx + 1}/{warmup}: {gemm_time:.6f}s")
                 
                 if rank == 0:
                     seq_allgather_avg = np.mean(sequential_allgather_times) if len(sequential_allgather_times) > 0 else 0
+                    seq_allgather_min = np.min(sequential_allgather_times) if len(sequential_allgather_times) > 0 else 0
+                    seq_allgather_max = np.max(sequential_allgather_times) if len(sequential_allgather_times) > 0 else 0
                     seq_gemm_avg = np.mean(sequential_gemm_times) if len(sequential_gemm_times) > 0 else 0
+                    seq_gemm_min = np.min(sequential_gemm_times) if len(sequential_gemm_times) > 0 else 0
+                    seq_gemm_max = np.max(sequential_gemm_times) if len(sequential_gemm_times) > 0 else 0
                     print(f"\nSequential Baseline Results:")
-                    print(f"  AllGather avg: {seq_allgather_avg:.6f}s")
-                    print(f"  GEMM avg: {seq_gemm_avg:.6f}s")
+                    print(f"  AllGather:")
+                    print(f"    Min: {seq_allgather_min:.6f}s")
+                    print(f"    Avg: {seq_allgather_avg:.6f}s")
+                    print(f"    Max: {seq_allgather_max:.6f}s")
+                    print(f"  GEMM:")
+                    print(f"    Min: {seq_gemm_min:.6f}s")
+                    print(f"    Avg: {seq_gemm_avg:.6f}s")
+                    print(f"    Max: {seq_gemm_max:.6f}s")
                     print(f"  Total sequential: {seq_allgather_avg + seq_gemm_avg:.6f}s")
                     print(f"\n{'='*60}")
                     print(f"Step 2: Concurrent Overlap Tests")
@@ -390,8 +402,14 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
             
             if len(gemm_times) > 0:
                 print(f"\nSequential Baseline (no overlap):")
-                print(f"  AllGather avg: {seq_allgather_avg:.6f}s")
-                print(f"  GEMM avg: {seq_gemm_avg:.6f}s")
+                print(f"  AllGather:")
+                print(f"    Min: {seq_allgather_min:.6f}s")
+                print(f"    Avg: {seq_allgather_avg:.6f}s")
+                print(f"    Max: {seq_allgather_max:.6f}s")
+                print(f"  GEMM:")
+                print(f"    Min: {seq_gemm_min:.6f}s")
+                print(f"    Avg: {seq_gemm_avg:.6f}s")
+                print(f"    Max: {seq_gemm_max:.6f}s")
                 print(f"  Sequential total: {seq_allgather_avg + seq_gemm_avg:.6f}s")
                 
                 print(f"\nConcurrent Execution Times (during overlap test):")
@@ -491,18 +509,34 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
         
         # Gather sequential baseline global statistics if available
         if len(sequential_allgather_times) > 0:
+            seq_allgather_min_tensor = torch.tensor([seq_allgather_min], dtype=torch.float64)
+            seq_allgather_max_tensor = torch.tensor([seq_allgather_max], dtype=torch.float64)
             seq_allgather_avg_tensor = torch.tensor([seq_allgather_avg], dtype=torch.float64)
+            
+            dist.all_reduce(seq_allgather_min_tensor, op=dist.ReduceOp.MIN)
+            dist.all_reduce(seq_allgather_max_tensor, op=dist.ReduceOp.MAX)
             dist.all_reduce(seq_allgather_avg_tensor, op=dist.ReduceOp.SUM)
+            
+            seq_allgather_global_min = seq_allgather_min_tensor.item()
+            seq_allgather_global_max = seq_allgather_max_tensor.item()
             seq_allgather_global_avg = seq_allgather_avg_tensor.item() / npes
         else:
-            seq_allgather_global_avg = 0.0
+            seq_allgather_global_min = seq_allgather_global_max = seq_allgather_global_avg = 0.0
         
         if len(sequential_gemm_times) > 0:
+            seq_gemm_min_tensor = torch.tensor([seq_gemm_min], dtype=torch.float64)
+            seq_gemm_max_tensor = torch.tensor([seq_gemm_max], dtype=torch.float64)
             seq_gemm_avg_tensor = torch.tensor([seq_gemm_avg], dtype=torch.float64)
+            
+            dist.all_reduce(seq_gemm_min_tensor, op=dist.ReduceOp.MIN)
+            dist.all_reduce(seq_gemm_max_tensor, op=dist.ReduceOp.MAX)
             dist.all_reduce(seq_gemm_avg_tensor, op=dist.ReduceOp.SUM)
+            
+            seq_gemm_global_min = seq_gemm_min_tensor.item()
+            seq_gemm_global_max = seq_gemm_max_tensor.item()
             seq_gemm_global_avg = seq_gemm_avg_tensor.item() / npes
         else:
-            seq_gemm_global_avg = 0.0
+            seq_gemm_global_min = seq_gemm_global_max = seq_gemm_global_avg = 0.0
 
         if rank == 0:
             global_bandwidth = total_bytes / global_avg / (1024.0 * 1024.0 * 1024.0)
@@ -519,8 +553,14 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
             
             if len(gemm_times) > 0:
                 print(f"\nSequential Baseline (no overlap):")
-                print(f"  AllGather avg: {seq_allgather_global_avg:.6f}s")
-                print(f"  GEMM avg: {seq_gemm_global_avg:.6f}s")
+                print(f"  AllGather:")
+                print(f"    Min: {seq_allgather_global_min:.6f}s")
+                print(f"    Avg: {seq_allgather_global_avg:.6f}s")
+                print(f"    Max: {seq_allgather_global_max:.6f}s")
+                print(f"  GEMM:")
+                print(f"    Min: {seq_gemm_global_min:.6f}s")
+                print(f"    Avg: {seq_gemm_global_avg:.6f}s")
+                print(f"    Max: {seq_gemm_global_max:.6f}s")
                 print(f"  Sequential total: {seq_allgather_global_avg + seq_gemm_global_avg:.6f}s")
                 
                 print(f"\nConcurrent Execution Times (during overlap test):")
@@ -599,8 +639,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--elems", type=int, default=67108864, help="Elements per PE")
     parser.add_argument("--world-size", type=int, default=8, help="Number of processes")
-    parser.add_argument("--iterations", type=int, default=10, help="Number of iterations")
-    parser.add_argument("--warmup", type=int, default=1, help="Warmup iterations")
+    parser.add_argument("--iterations", type=int, default=50, help="Number of iterations")
+    parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations")
     parser.add_argument("--enable-sdma", type=int, default=1, choices=[0, 1], help="Enable SDMA")
     parser.add_argument("--use-custom-stream", action="store_true", help="Use custom CUDA stream instead of default stream")
     parser.add_argument("--test-gemm-overlap", action="store_true", help="Test GEMM and AllGather overlap on different streams")
