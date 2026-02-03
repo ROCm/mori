@@ -544,6 +544,14 @@ class EpDispatchCombineTestCase:
             all_rank_scales,
         ) = test_data
 
+        # max_rdma = 128 if max_num_token >= 128 else 64
+        max_rdma = 64  # 256-32
+        op.config.rdma_block_num = min(max(max_num_token, 16), max_rdma)
+        block_num = op.config.rdma_block_num + 32
+        # op.config.rdma_block_num = 32
+        # block_num = 64
+        print(f"rdma {op.config.rdma_block_num} total {block_num}")
+
         for i in range(3):
             (
                 dispatch_output,
@@ -556,8 +564,7 @@ class EpDispatchCombineTestCase:
                 all_rank_weights[self.rank],
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
-                block_num=self.config.block_num,
-                # warp_per_block=16,
+                block_num=block_num,
             )
             torch.cuda.synchronize()
             total_recv_num_token = dispatch_recv_num_token[0].item()
@@ -566,8 +573,7 @@ class EpDispatchCombineTestCase:
                 dispatch_weights,
                 # None,
                 all_rank_indices[self.rank],
-                block_num=self.config.block_num,
-                # warp_per_block=16,
+                block_num=block_num,
             )
             torch.cuda.synchronize()
 
@@ -598,16 +604,14 @@ class EpDispatchCombineTestCase:
                 all_rank_weights[self.rank],
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
-                block_num=self.config.block_num,
-                # warp_per_block=16,
+                block_num=block_num,
             )
             events[2 * i + 1].record()
             combine_output, _ = op.combine(
                 dispatch_output,
                 dispatch_weights,
                 all_rank_indices[self.rank],
-                block_num=self.config.block_num,
-                # warp_per_block=16,
+                block_num=block_num,
             )
             events[2 * i + 2].record()
         torch.cuda.synchronize()
@@ -906,8 +910,10 @@ def sweep_bench_dispatch_combine(
 
     disp_lat_min_list = []
     disp_lat_max_list = []
+    disp_lat_avg_list = []
     comb_lat_min_list = []
     comb_lat_max_list = []
+    comb_lat_avg_list = []
     for max_token in max_token_list:
         if max_token == 0:
             max_token = 1
@@ -919,33 +925,37 @@ def sweep_bench_dispatch_combine(
         comb_lat_min_list.append(comb_lat[0])
         disp_lat_max_list.append(disp_lat[1])
         comb_lat_max_list.append(comb_lat[1])
+        disp_lat_avg_list.append(disp_lat[2])
+        comb_lat_avg_list.append(comb_lat[2])
 
     if local_rank == 0:
         import matplotlib.pyplot as plt
 
         plt.figure()
-        # plt.plot(max_token_list, disp_lat_min_list, label='Dispatch Min')
-        # plt.plot(max_token_list, comb_lat_min_list, label='Combine Min')
-        # plt.plot(max_token_list, disp_lat_max_list, label='Dispatch Max')
-        # plt.plot(max_token_list, comb_lat_max_list, label='Combine Max')
-        plt.plot(
-            max_token_list,
-            [max - min for max, min in zip(disp_lat_max_list, disp_lat_min_list)],
-            label="Dispatch Max-Min",
-        )
-        plt.plot(
-            max_token_list,
-            [max - min for max, min in zip(comb_lat_max_list, comb_lat_min_list)],
-            label="Combine Max-Min",
-        )
+        plt.plot(max_token_list, disp_lat_min_list, label="Dispatch Min")
+        plt.plot(max_token_list, comb_lat_min_list, label="Combine Min")
+        plt.plot(max_token_list, disp_lat_max_list, label="Dispatch Max")
+        plt.plot(max_token_list, comb_lat_max_list, label="Combine Max")
+        plt.plot(max_token_list, disp_lat_avg_list, label="Dispatch Avg")
+        plt.plot(max_token_list, comb_lat_avg_list, label="Combine Avg")
+        # plt.plot(
+        #     max_token_list,
+        #     [max - min for max, min in zip(disp_lat_max_list, disp_lat_min_list)],
+        #     label="Dispatch Max-Min",
+        # )
+        # plt.plot(
+        #     max_token_list,
+        #     [max - min for max, min in zip(comb_lat_max_list, comb_lat_min_list)],
+        #     label="Combine Max-Min",
+        # )
         plt.xticks([i * 16 for i in range(max_tokens // 16)])
-        plt.title("Dispatch / Combine Max-Min Latency (us)")
+        plt.title("Dispatch / Combine Latency (us)")
         plt.xlabel("# of Tokens")
         plt.ylabel("Latency (us)")
         plt.grid(True)
         plt.legend()
         plt.tight_layout()
-        plt.savefig("dispatch_combine_perf_maxmin.png", dpi=300, bbox_inches="tight")
+        plt.savefig("dispatch_combine_perf.png", dpi=300, bbox_inches="tight")
         test_case.cleanup()
 
 
