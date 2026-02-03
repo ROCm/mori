@@ -48,11 +48,18 @@ namespace {
 /**
  * @brief Convert PyTorch CUDA Stream object to HIP stream handle
  * @param stream_obj Python object representing torch.cuda.Stream (or None)
- * @return hipStream_t handle, or nullptr if stream_obj is None
+ * @param device_index CUDA device index (for getting current stream when stream_obj is None)
+ * @return hipStream_t handle, uses current stream if stream_obj is None
  */
-hipStream_t convert_torch_stream_to_hip(py::object stream_obj) {
+hipStream_t convert_torch_stream_to_hip(py::object stream_obj, int device_index = -1) {
     if (stream_obj.is_none()) {
-        return nullptr;
+        // Get current CUDA stream for the device
+        // This allows using torch.cuda.stream() context manager
+        if (device_index < 0) {
+            device_index = at::cuda::current_device();
+        }
+        auto current_stream = at::cuda::getCurrentCUDAStream(device_index);
+        return reinterpret_cast<hipStream_t>(current_stream.stream());
     }
     
     // Get the cuda_stream attribute from torch.cuda.Stream object
@@ -493,7 +500,10 @@ void RegisterMoriCcl(pybind11::module_& m) {
                     throw std::runtime_error("Output tensor must be uint32 or int32");
                 }
 
-                hipStream_t stream = convert_torch_stream_to_hip(stream_obj);
+                // Get device index from input tensor and convert stream
+                // If stream_obj is None, this will use the current CUDA stream (supports torch.cuda.stream() context)
+                int device_index = input_tensor.device().index();
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj, device_index);
 
                 return self(input_ptr, output_ptr, count, stream);
             },
@@ -542,7 +552,10 @@ void RegisterMoriCcl(pybind11::module_& m) {
                     throw std::runtime_error("Output tensor must be uint32 or int32");
                 }
 
-                hipStream_t stream = convert_torch_stream_to_hip(stream_obj);
+                // Get device index from input tensor and convert stream
+                // If stream_obj is None, this will use the current CUDA stream (supports torch.cuda.stream() context)
+                int device_index = input_tensor.device().index();
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj, device_index);
 
                 return self.start_async(input_ptr, output_ptr, count, stream);
             },
@@ -555,6 +568,8 @@ void RegisterMoriCcl(pybind11::module_& m) {
             [](mori::collective::All2allSdma<uint32_t>& self,
                py::object stream_obj) -> double {
 
+                // Convert stream, using current CUDA stream if None
+                // This supports torch.cuda.stream() context manager
                 hipStream_t stream = convert_torch_stream_to_hip(stream_obj);
 
                 return self.wait_async(stream);
@@ -669,7 +684,10 @@ void RegisterMoriCcl(pybind11::module_& m) {
                     throw std::runtime_error("Output tensor must be uint32 or int32");
                 }
 
-                hipStream_t stream = convert_torch_stream_to_hip(stream_obj);
+                // Get device index from input tensor and convert stream
+                // If stream_obj is None, this will use the current CUDA stream (supports torch.cuda.stream() context)
+                int device_index = input_tensor.device().index();
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj, device_index);
 
                 return self(input_ptr, output_ptr, count, stream);
             },
@@ -718,7 +736,10 @@ void RegisterMoriCcl(pybind11::module_& m) {
                     throw std::runtime_error("Output tensor must be uint32 or int32");
                 }
 
-                hipStream_t stream = convert_torch_stream_to_hip(stream_obj);
+                // Get device index from input tensor and convert stream
+                // If stream_obj is None, this will use the current CUDA stream (supports torch.cuda.stream() context)
+                int device_index = input_tensor.device().index();
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj, device_index);
 
                 return self.start_async(input_ptr, output_ptr, count, stream);
             },
@@ -731,6 +752,8 @@ void RegisterMoriCcl(pybind11::module_& m) {
             [](mori::collective::AllgatherSdma<uint32_t>& self,
                py::object stream_obj) -> double {
 
+                // Convert stream, using current CUDA stream if None
+                // This supports torch.cuda.stream() context manager
                 hipStream_t stream = convert_torch_stream_to_hip(stream_obj);
 
                 return self.wait_async(stream);

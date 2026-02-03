@@ -94,7 +94,6 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
         # Create CUDA stream for allgather operations (if requested)
         if use_custom_stream:
             stream = torch.cuda.Stream(device=device)
-            stream_gemm = torch.cuda.Stream(device=device)
             if rank == 0:
                 print(f"PE {rank}: Created custom CUDA stream for allgather operations")
         else:
@@ -123,10 +122,13 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
                 else:
                     start_event.record()
                 
-                # Execute allgather (returns bool)
-                success = allgather(input_tensor, output_tensor, elems_per_pe, stream)
-                with torch.cuda.stream(stream_gemm):
-                    _ = aiter.gemm_a8w8_CK(A_q, B_q, A_scale, B_scale, bias, dtypes.bf16)
+                # Execute allgather using context manager style (returns bool)
+                if use_custom_stream:
+                    with torch.cuda.stream(stream):
+                        success = allgather(input_tensor, output_tensor, elems_per_pe)
+                else:
+                    # Use default stream (no context manager needed)
+                    success = allgather(input_tensor, output_tensor, elems_per_pe)
                 
                 if not success:
                     print(f"PE {rank}: Allgather operation failed at iteration {iter_idx}")
@@ -162,14 +164,23 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
                 
                 dist.barrier()
                 
-                # Start async operation
-                started = allgather.start_async(input_tensor, output_tensor, elems_per_pe, stream)
+                # Start async operation using context manager style
+                if use_custom_stream:
+                    with torch.cuda.stream(stream):
+                        started = allgather.start_async(input_tensor, output_tensor, elems_per_pe)
+                else:
+                    started = allgather.start_async(input_tensor, output_tensor, elems_per_pe)
+                
                 if not started:
                     print(f"PE {rank}: Failed to start async operation")
                     break
                 
                 # Wait for completion (using the same stream)
-                exec_time = allgather.wait_async(stream)
+                if use_custom_stream:
+                    with torch.cuda.stream(stream):
+                        exec_time = allgather.wait_async()
+                else:
+                    exec_time = allgather.wait_async()
                 
                 if exec_time < 0:
                     print(f"PE {rank}: Async operation failed")
