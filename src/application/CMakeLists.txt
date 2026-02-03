@@ -22,6 +22,7 @@ add_library(
   bootstrap/mpi_bootstrap.cpp
   bootstrap/torch_bootstrap.cpp
   bootstrap/socket_bootstrap.cpp
+  bootstrap/local_bootstrap.cpp
   transport/rdma/rdma.cpp
   transport/rdma/providers/mlx5/mlx5.cpp
   transport/rdma/providers/bnxt/bnxt.cpp
@@ -30,6 +31,7 @@ add_library(
   transport/tcp/tcp.cpp
   transport/sdma/anvil.cpp
   memory/symmetric_memory.cpp
+  memory/va_manager.cpp
   memory/memory_region.cpp
   context/context.cpp
   topology/gpu.cpp
