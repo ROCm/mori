@@ -94,6 +94,7 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
         # Create CUDA stream for allgather operations (if requested)
         if use_custom_stream:
             stream = torch.cuda.Stream(device=device)
+            stream_gemm = torch.cuda.Stream(device=device)
             if rank == 0:
                 print(f"PE {rank}: Created custom CUDA stream for allgather operations")
         else:
@@ -126,6 +127,8 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
                 if use_custom_stream:
                     with torch.cuda.stream(stream):
                         success = allgather(input_tensor, output_tensor, elems_per_pe)
+                    with torch.cuda.stream(stream_gemm):
+                        _ = aiter.gemm_a8w8_CK(A_q, B_q, A_scale, B_scale, bias, dtypes.bf16)
                 else:
                     # Use default stream (no context manager needed)
                     success = allgather(input_tensor, output_tensor, elems_per_pe)
