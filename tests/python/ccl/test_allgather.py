@@ -12,6 +12,14 @@ from mori.ccl import AllgatherSdma
 from tests.python.utils import TorchDistContext, get_free_port
 
 
+import aiter
+from aiter import dtypes
+from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import checkAllclose, perftest, benchmark
+from aiter import hipb_mm, hipb_create_extension
+from aiter.jit.utils.chip_info import get_gfx, get_cu_num
+
+
 def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custom_stream):
     """Worker function for each process"""
     
@@ -52,6 +60,15 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
         device = torch.device(f"cuda:{rank}")
         input_tensor = torch.zeros(elems_per_pe, dtype=torch.uint32, device=device)
         output_tensor = torch.zeros(elems_per_pe * npes, dtype=torch.uint32, device=device)
+
+        matrix_size=8192
+        A = torch.randn(matrix_size, matrix_size, device=device, dtype=torch.bfloat16)
+        B = torch.randn(matrix_size, matrix_size, device=device, dtype=torch.bfloat16)
+
+        # 量化输入数据
+        A_q, A_scale = aiter.pertoken_quant(A, quant_dtype=dtypes.fp8)
+        B_q, B_scale = aiter.pertoken_quant(B, quant_dtype=dtypes.fp8)
+        bias = None
         
         # Prepare data: Each PE has unique value = (myPe + 1) * 1000
         value = (my_pe + 1) * 1000
@@ -77,6 +94,7 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
         # Create CUDA stream for allgather operations (if requested)
         if use_custom_stream:
             stream = torch.cuda.Stream(device=device)
+            stream_gemm = torch.cuda.Stream(device=device)
             if rank == 0:
                 print(f"PE {rank}: Created custom CUDA stream for allgather operations")
         else:
@@ -107,6 +125,8 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
                 
                 # Execute allgather (returns bool)
                 success = allgather(input_tensor, output_tensor, elems_per_pe, stream)
+                with torch.cuda.stream(stream_gemm):
+                    _ = aiter.gemm_a8w8_CK(A_q, B_q, A_scale, B_scale, bias, dtypes.bf16)
                 
                 if not success:
                     print(f"PE {rank}: Allgather operation failed at iteration {iter_idx}")
