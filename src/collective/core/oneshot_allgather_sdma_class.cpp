@@ -151,7 +151,7 @@ bool AllgatherSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
         copy_input_to_transit(input, total_count, stream);
 
         // Step 2: Reset flags
-        resetFlags();
+        //resetFlags();
 
         // Step 3: Execute Allgather kernel (PUT operation)
         printf("PE %d: Launching async PUT kernel...\n", myPe_);
@@ -269,7 +269,7 @@ void AllgatherSdma<T>::cancel_async() {
         async_start_time_ = 0.0;
 
         // Reset flags
-        resetFlags();
+        //resetFlags();
     }
 }
 

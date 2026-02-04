@@ -151,7 +151,7 @@ bool All2allSdma<T>::start_async(T* input, T* output, size_t total_count, hipStr
         copy_input_to_transit(input, total_count * npes_, stream);
 
         // Step 2: Reset flags
-        resetFlags();
+        //resetFlags();
 
         // Step 3: Execute All2All kernel (PUT operation)
         printf("PE %d: Launching async PUT kernel...\n", myPe_);
@@ -269,7 +269,7 @@ void All2allSdma<T>::cancel_async() {
         async_start_time_ = 0.0;
 
         // Reset flags
-        resetFlags();
+        //resetFlags();
     }
 }
 
@@ -416,7 +416,7 @@ double All2allSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
         copy_input_to_transit(input, total_count * npes_, stream);
 
         // Step 2: Reset flags
-        resetFlags();
+        //resetFlags();
 
         // Step 3: Execute All2All kernel
         int block_size = 256;
