@@ -49,6 +49,9 @@ target_link_libraries(atomic_nonfetch_thread mori_shmem hip::host hip::device)
 add_executable(atomic_fetch_thread shmem/atomic_fetch_thread.cpp)
 target_link_libraries(atomic_fetch_thread mori_shmem hip::host hip::device)
 
+add_executable(test_p2p_direct_access shmem/test_p2p_direct_access.cpp)
+target_link_libraries(test_p2p_direct_access mori_shmem hip::host hip::device)
+
 add_executable(context application/context.cpp)
 target_link_libraries(context mori_application hip::host hip::device)
 
