@@ -143,24 +143,21 @@ __global__ void ShmemPutThreadKernel(int myPe, int npes, const SymmMemObjPtr mem
   if (globalTid >= numElements) return;
 
   int targetPe = (myPe + 1) % npes;
-  int sourcePe = (myPe - 1 + npes) % npes;
-  size_t threadOffset = globalTid * sizeof(T);
+  
+  // Separate send and receive regions to avoid data race in ring pattern
+  // Send region: [0, numElements)
+  // Recv region: [numElements, 2*numElements)
+  size_t sendOffset = globalTid * sizeof(T);
+  size_t recvOffset = (numElements + globalTid) * sizeof(T);
 
-  // Each PE writes its rank to the next PE's buffer
+  // Each PE writes its rank to the next PE's receive buffer
   if (myPe != targetPe) {  // Skip if only one PE
-    ShmemPutMemNbiThread(memObj, threadOffset, memObj, threadOffset, sizeof(T), targetPe, 1);
+    ShmemPutMemNbiThread(memObj, recvOffset, memObj, sendOffset, sizeof(T), targetPe, 1);
     ShmemFenceThread();
 
     if (blockIdx.x == 0 && threadIdx.x == 0) {
       ShmemQuietThread(targetPe);
     }
-  }
-  
-  // Receiver side: wait for data to arrive by polling
-  T* localBuff = reinterpret_cast<T*>(memObj->localPtr);
-  T expected = static_cast<T>(sourcePe);
-  while (atomicAdd(&localBuff[globalTid], 0) != expected) {
-    // Busy wait for data
   }
 }
 
@@ -172,25 +169,21 @@ __global__ void ShmemPutThreadKernel_PureAddr(int myPe, int npes, T* localBuff, 
   if (globalTid >= numElements) return;
 
   int targetPe = (myPe + 1) % npes;
-  int sourcePe = (myPe - 1 + npes) % npes;
 
-  // Each PE writes its rank to the next PE's buffer
+  // Separate send and receive regions to avoid data race in ring pattern
+  // Send region: [0, numElements)
+  // Recv region: [numElements, 2*numElements)
+  T* src = localBuff + globalTid;              // Read from send region
+  T* dest = localBuff + numElements + globalTid;  // Write to recv region
+
+  // Each PE writes its rank to the next PE's receive buffer
   if (myPe != targetPe) {  // Skip if only one PE
-    T* src = localBuff + globalTid;
-    T* dest = localBuff + globalTid;
-
     ShmemPutMemNbiThread(dest, src, sizeof(T), targetPe, 1);
     __threadfence_system();
 
     if (blockIdx.x == 0 && threadIdx.x == 0) {
       ShmemQuietThread(targetPe);
     }
-  }
-  
-  // Receiver side: wait for data to arrive by polling
-  T expected = static_cast<T>(sourcePe);
-  while (atomicAdd(&localBuff[globalTid], 0) != expected) {
-    // Busy wait for data
   }
 }
 
@@ -246,9 +239,12 @@ void testDirectP2PAccess() {
   // Allocate buffers
   constexpr int numElements = 256;
   size_t buffSize = numElements * sizeof(uint64_t);
+  
+  // For ring transfer tests (Test 4 & 5), allocate 2x size for send + recv regions
+  size_t ringBuffSize = 2 * numElements * sizeof(uint32_t);
 
-  void* atomicBuff = ShmemExtMallocWithFlags(buffSize, hipDeviceMallocUncached);
-  void* srcBuff = ShmemExtMallocWithFlags(buffSize, hipDeviceMallocUncached);
+  void* atomicBuff = ShmemExtMallocWithFlags(ringBuffSize, hipDeviceMallocUncached);
+  void* srcBuff = ShmemExtMallocWithFlags(ringBuffSize, hipDeviceMallocUncached);
   void* dstBuff = ShmemExtMallocWithFlags(buffSize, hipDeviceMallocUncached);
 
   SymmMemObjPtr atomicBuffObj = ShmemQueryMemObjPtr(atomicBuff);
@@ -387,20 +383,26 @@ void testDirectP2PAccess() {
     printf("\n========== Test 4: Shmem Put Thread (Legacy API) ==========\n");
   }
 
-  // Initialize buffer with myPe value
+  // Initialize send region [0, numElements) with myPe value
+  // Recv region [numElements, 2*numElements) will be written by remote PE
   HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(atomicBuff), myPe, numElements));
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(atomicBuff) + numElements, 0xFF, numElements));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
 
-  // Each PE writes to next PE using shmem put (includes receiver polling)
+  // Each PE writes to next PE using shmem put
   ShmemPutThreadKernel<uint32_t><<<gridSize, blockSize>>>(myPe, npes, atomicBuffObj, numElements);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-  // Note: No MPI_Barrier needed here as kernel includes receiver-side polling
+  
+  // SHMEM barrier ensures all put operations have completed and data has arrived at receivers
+  // This is critical: ShmemQuiet only ensures send-side completion, not receive-side arrival
+  ShmemBarrierAll();
 
-  // Verify results
+  // Verify results from receive region [numElements, 2*numElements)
   uint32_t putResult[numElements];
   HIP_RUNTIME_CHECK(
-      hipMemcpy(putResult, atomicBuff, buffSize, hipMemcpyDeviceToHost));
+      hipMemcpy(putResult, reinterpret_cast<uint32_t*>(atomicBuff) + numElements, 
+                numElements * sizeof(uint32_t), hipMemcpyDeviceToHost));
 
   int prevPe2 = (myPe - 1 + npes) % npes;
   bool putSuccess = true;
@@ -438,21 +440,27 @@ void testDirectP2PAccess() {
       printf("⊘ SKIPPED (MORI_SHMEM_MODE=ISOLATION)\n");
     }
   } else {
-    // Initialize buffer with myPe value
+    // Initialize send region [0, numElements) with myPe value
+    // Recv region [numElements, 2*numElements) will be written by remote PE
     HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(srcBuff), myPe, numElements));
+    HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(srcBuff) + numElements, 0xFF, numElements));
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
 
-    // Each PE writes to next PE using shmem put (pure address API, includes receiver polling)
+    // Each PE writes to next PE using shmem put (pure address API)
     ShmemPutThreadKernel_PureAddr<uint32_t><<<gridSize, blockSize>>>(
         myPe, npes, reinterpret_cast<uint32_t*>(srcBuff), numElements);
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    // Note: No MPI_Barrier needed here as kernel includes receiver-side polling
+    
+    // SHMEM barrier ensures all put operations have completed and data has arrived at receivers
+    // This is critical: ShmemQuiet only ensures send-side completion, not receive-side arrival
+    ShmemBarrierAll();
 
-    // Verify results
+    // Verify results from receive region [numElements, 2*numElements)
     uint32_t putResult2[numElements];
     HIP_RUNTIME_CHECK(
-        hipMemcpy(putResult2, srcBuff, buffSize, hipMemcpyDeviceToHost));
+        hipMemcpy(putResult2, reinterpret_cast<uint32_t*>(srcBuff) + numElements,
+                  numElements * sizeof(uint32_t), hipMemcpyDeviceToHost));
 
     bool putSuccess2 = true;
     for (int i = 0; i < numElements; i++) {
