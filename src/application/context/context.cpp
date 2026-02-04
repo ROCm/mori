@@ -33,9 +33,9 @@
 #include <string>
 #include <vector>
 
+#include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/utils/mori_log.hpp"
-#include "mori/application/transport/sdma/anvil.hpp"
 
 namespace mori {
 namespace application {
@@ -81,6 +81,16 @@ std::string GetLocalIP() {
 }
 
 std::string Context::HostName() const { return hostnames[LocalRank()]; }
+
+bool Context::CanUseP2P(int destRank) const {
+  if (destRank == LocalRank()) {
+    return false;  // Cannot use P2P with self
+  }
+  // Check if on the same node by comparing hostnames
+  // Note: IsP2PDisabled only affects transport type selection (peerPtrs),
+  // but we still maintain P2P data path in p2pPeerPtrs
+  return HostName() == hostnames[destRank];
+}
 
 void Context::CollectHostNames() {
   char hostname[HOST_NAME_MAX];
@@ -163,8 +173,8 @@ void Context::InitializePossibleTransports() {
     HIP_RUNTIME_CHECK(hipGetDevice(&deviceId));
     topo.reset(new TopoSystem());
     std::string nicName = topo->MatchGpuAndNic(deviceId);
-    MORI_APP_TRACE("rank {} rankInNode {} matched nic {} for gpu {}", LocalRank(),
-                   rankInNode, nicName, deviceId);
+    MORI_APP_TRACE("rank {} rankInNode {} matched nic {} for gpu {}", LocalRank(), rankInNode,
+                   nicName, deviceId);
     for (int i = 0; i < activeDevicePortList.size(); i++) {
       auto& dp = activeDevicePortList[i];
       if (dp.first->Name() != nicName) continue;
@@ -191,7 +201,7 @@ void Context::InitializePossibleTransports() {
   this->numQpPerPe = numQpPerPe;
   // Initialize transport
   int peerRankInNode = -1;
-  if(!IsP2PDisabled() && IsSDMAEnabled()) anvil::anvil.init();
+  if (!IsP2PDisabled() && IsSDMAEnabled()) anvil::anvil.init();
 
   for (int i = 0; i < WorldSize(); i++) {
     // Check P2P availability
@@ -204,13 +214,13 @@ void Context::InitializePossibleTransports() {
         bool canAccessPeer = true;
 
         if ((i == LocalRank()) || canAccessPeer) {
-          if(IsSDMAEnabled() && (i != LocalRank()) ){
+          if (IsSDMAEnabled() && (i != LocalRank())) {
             transportTypes.push_back(TransportType::SDMA);
 
-	    anvil::EnablePeerAccess(LocalRank()%8, i%8);
+            anvil::EnablePeerAccess(LocalRank() % 8, i % 8);
             // Better performance if allocating all 8 queues
-            anvil::anvil.connect(LocalRank()%8, i%8, 8);
-          }else{
+            anvil::anvil.connect(LocalRank() % 8, i % 8, 8);
+          } else {
             transportTypes.push_back(TransportType::P2P);
           }
           for (int qp = 0; qp < numQpPerPe; qp++) {

@@ -55,6 +55,7 @@ struct VMMChunkKey {
 struct SymmMemObj {
   void* localPtr{nullptr};
   uintptr_t* peerPtrs{nullptr};
+  uintptr_t* p2pPeerPtrs{nullptr};
   size_t size{0};
   // For Rdma
   uint32_t lkey{0};

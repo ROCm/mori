@@ -103,26 +103,44 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   cpuMemObj->localPtr = localPtr;
   cpuMemObj->size = size;
 
-  // Exchange pointers
+  // Exchange pointers (RDMA virtual addresses)
   cpuMemObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
   bootNet.Allgather(&localPtr, cpuMemObj->peerPtrs, sizeof(uintptr_t));
   // cpuMemObj->peerPtrs[rank] = reinterpret_cast<uintptr_t>(cpuMemObj->localPtr);
 
-  // P2P context: exchange ipc mem handles
+  // P2P context: exchange ipc mem handles and open them for all same-node peers
+  // p2pPeerPtrs layout:
+  //   - [rank]: local pointer (self)
+  //   - [same-node peers]: P2P pointers from hipIpcOpenMemHandle
+  //   - [different-node peers]: 0
+  cpuMemObj->p2pPeerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
+  cpuMemObj->p2pPeerPtrs[rank] = reinterpret_cast<uintptr_t>(localPtr);  // Set self pointer
+  
   hipIpcMemHandle_t handle;
   HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&handle, localPtr));
   cpuMemObj->ipcMemHandles =
       static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
   bootNet.Allgather(&handle, cpuMemObj->ipcMemHandles, sizeof(hipIpcMemHandle_t));
+  
+  // Open IPC handles for all same-node peers to establish P2P data path
+  // This happens regardless of transport type selection
   for (int i = 0; i < worldSize; i++) {
-    if ((context.GetTransportType(i) != TransportType::P2P) &&
-        (context.GetTransportType(i) != TransportType::SDMA))
-      continue;
-    if (i == rank) continue;
+    if (!context.CanUseP2P(i)) continue;
 
-    HIP_RUNTIME_CHECK(hipIpcOpenMemHandle(reinterpret_cast<void**>(&cpuMemObj->peerPtrs[i]),
+    HIP_RUNTIME_CHECK(hipIpcOpenMemHandle(reinterpret_cast<void**>(&cpuMemObj->p2pPeerPtrs[i]),
                                           cpuMemObj->ipcMemHandles[i],
                                           hipIpcMemLazyEnablePeerAccess));
+  }
+  
+  // Update peerPtrs based on transport type:
+  // - For RDMA transport: keep remote VA (already allgathered) in peerPtrs
+  // - For P2P/SDMA transport: use P2P pointer from hipIpcOpenMemHandle
+  // Note: p2pPeerPtrs always contains P2P pointers when available
+  for (int i = 0; i < worldSize; i++) {
+    if (i == rank) continue;
+    if (context.GetTransportType(i) != TransportType::RDMA) {
+      cpuMemObj->peerPtrs[i] = cpuMemObj->p2pPeerPtrs[i];
+    }
   }
 
   // Rdma context: set lkey and exchange rkeys
@@ -143,6 +161,10 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
 
   HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->peerPtrs, sizeof(uintptr_t) * worldSize));
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerPtrs, cpuMemObj->peerPtrs,
+                              sizeof(uintptr_t) * worldSize, hipMemcpyHostToDevice));
+
+  HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->p2pPeerPtrs, sizeof(uintptr_t) * worldSize));
+  HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->p2pPeerPtrs, cpuMemObj->p2pPeerPtrs,
                               sizeof(uintptr_t) * worldSize, hipMemcpyHostToDevice));
 
   HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->peerRkeys, sizeof(uint32_t) * worldSize));
@@ -194,11 +216,24 @@ void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
   if (rdmaDeviceContext) rdmaDeviceContext->DeregisterRdmaMemoryRegion(localPtr);
 
   SymmMemObjPtr memObjPtr = memObjPool.at(localPtr);
+  
+  // Close IPC handles for peers that had P2P connection
+  int rank = bootNet.GetLocalRank();
+  int worldSize = bootNet.GetWorldSize();
+  for (int i = 0; i < worldSize; i++) {
+    if (!context.CanUseP2P(i)) continue;
+    if (memObjPtr.cpu->p2pPeerPtrs && memObjPtr.cpu->p2pPeerPtrs[i] != 0) {
+      HIP_RUNTIME_CHECK(hipIpcCloseMemHandle(reinterpret_cast<void*>(memObjPtr.cpu->p2pPeerPtrs[i])));
+    }
+  }
+  
   free(memObjPtr.cpu->peerPtrs);
+  free(memObjPtr.cpu->p2pPeerPtrs);
   free(memObjPtr.cpu->peerRkeys);
   free(memObjPtr.cpu->ipcMemHandles);
   free(memObjPtr.cpu);
   HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerPtrs));
+  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->p2pPeerPtrs));
   HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerRkeys));
   HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu));
 
@@ -224,6 +259,11 @@ SymmMemObjPtr SymmMemManager::RegisterStaticHeapSubRegion(void* localPtr, size_t
     cpuMemObj->peerPtrs[i] = heapObj->cpu->peerPtrs[i] + offset;
   }
 
+  cpuMemObj->p2pPeerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
+  for (int i = 0; i < worldSize; i++) {
+    cpuMemObj->p2pPeerPtrs[i] = heapObj->cpu->p2pPeerPtrs[i] + offset;
+  }
+
   cpuMemObj->ipcMemHandles =
       static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
   memcpy(cpuMemObj->ipcMemHandles, heapObj->cpu->ipcMemHandles,
@@ -240,6 +280,10 @@ SymmMemObjPtr SymmMemManager::RegisterStaticHeapSubRegion(void* localPtr, size_t
 
   HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->peerPtrs, sizeof(uintptr_t) * worldSize));
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerPtrs, cpuMemObj->peerPtrs,
+                              sizeof(uintptr_t) * worldSize, hipMemcpyHostToDevice));
+
+  HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->p2pPeerPtrs, sizeof(uintptr_t) * worldSize));
+  HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->p2pPeerPtrs, cpuMemObj->p2pPeerPtrs,
                               sizeof(uintptr_t) * worldSize, hipMemcpyHostToDevice));
 
   HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->peerRkeys, sizeof(uint32_t) * worldSize));
@@ -271,13 +315,15 @@ void SymmMemManager::DeregisterStaticHeapSubRegion(void* localPtr) {
   if (memObjPool.find(localPtr) == memObjPool.end()) return;
 
   // No need to deregister RDMA memory region - this is a sub-region of the static heap
-
+  // No need to close IPC handles - they are owned by the heap object
   SymmMemObjPtr memObjPtr = memObjPool.at(localPtr);
   free(memObjPtr.cpu->peerPtrs);
+  free(memObjPtr.cpu->p2pPeerPtrs);
   free(memObjPtr.cpu->peerRkeys);
   free(memObjPtr.cpu->ipcMemHandles);
   free(memObjPtr.cpu);
   HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerPtrs));
+  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->p2pPeerPtrs));
   HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerRkeys));
   HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu));
 
@@ -291,11 +337,13 @@ void SymmMemManager::VMMDeregisterSymmMemObj(void* localPtr) {
 
   SymmMemObjPtr memObjPtr = memObjPool.at(localPtr);
   free(memObjPtr.cpu->peerPtrs);
+  free(memObjPtr.cpu->p2pPeerPtrs);
   free(memObjPtr.cpu->peerRkeys);  // nullptr for VMM allocations (safe to free)
   free(memObjPtr.cpu->ipcMemHandles);
   // Note: vmmLkeyInfo and vmmRkeyInfo are NOT freed here - they point to shared vmmHeapObj arrays
   free(memObjPtr.cpu);
   HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerPtrs));
+  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->p2pPeerPtrs));
   HIP_RUNTIME_CHECK(
       hipFree(memObjPtr.gpu->peerRkeys));  // nullptr for VMM allocations (safe to free)
   HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu));
@@ -390,19 +438,17 @@ size_t SymmMemManager::DetermineVMMChunkSize(size_t userChunkSize, HeapType heap
 
 // Step 2: Calculate total virtual address space size
 size_t SymmMemManager::CalculateTotalVirtualSize(size_t perPeerSize, int worldSize) {
-  int myPe = bootNet.GetLocalRank();
-  std::vector<TransportType> transportTypes = context.GetTransportTypes();
-
   vmmPerPeerSize = perPeerSize;
   size_t p2pPeCount = 0;
 
   for (int pe = 0; pe < worldSize; ++pe) {
-    if (transportTypes[pe] == TransportType::P2P && myPe != pe) {
+    if (context.CanUseP2P(pe)) {
       p2pPeCount++;
     }
   }
 
-  // Only allocate virtual space for P2P accessible PEs
+  // Allocate virtual space for self and all same-node peers (P2P capable)
+  // This is independent of transport type selection
   size_t totalSize = vmmPerPeerSize * (p2pPeCount + 1);
 
   MORI_APP_TRACE("VMM Heap: world={} p2pPeers={} totalVA={}", worldSize, p2pPeCount, totalSize);
@@ -432,14 +478,16 @@ bool SymmMemManager::ReserveVirtualAddressSpace(size_t totalSize, size_t chunkSi
 
 // Step 4: Setup peer base pointers for each PE
 void SymmMemManager::SetupPeerBasePointers(int worldSize, int myPe) {
-  std::vector<TransportType> transportTypes = context.GetTransportTypes();
   vmmPeerBasePtrs.resize(worldSize);
 
   size_t virtualOffset = 0;
   for (int i = 0; i < worldSize; ++i) {
     int pe = (myPe + i) % worldSize;
 
-    if (pe == myPe || transportTypes[pe] == TransportType::P2P) {
+    // Allocate virtual address space for self and same-node peers (P2P capable)
+    // Note: This is independent of transport type - we maintain P2P pointers
+    // even when using RDMA transport
+    if (pe == myPe || context.CanUseP2P(pe)) {
       vmmPeerBasePtrs[pe] =
           static_cast<void*>(static_cast<char*>(vmmVirtualBasePtr) + virtualOffset);
       virtualOffset += vmmPerPeerSize;
@@ -468,9 +516,16 @@ SymmMemObjPtr SymmMemManager::CreateVMMHeapObject(size_t virtualSize, int worldS
   // Exchange virtual base pointers among all PEs
   cpuHeapObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
   bootNet.Allgather(&vmmVirtualBasePtr, cpuHeapObj->peerPtrs, sizeof(uintptr_t));
+  
+  // Setup P2P peer pointers (vmmPeerBasePtrs) and update peerPtrs for non-RDMA transports
+  cpuHeapObj->p2pPeerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
   for (int pe = 0; pe < worldSize; ++pe) {
     if (vmmPeerBasePtrs[pe] != nullptr) {
-      cpuHeapObj->peerPtrs[pe] = reinterpret_cast<uintptr_t>(vmmPeerBasePtrs[pe]);
+      cpuHeapObj->p2pPeerPtrs[pe] = reinterpret_cast<uintptr_t>(vmmPeerBasePtrs[pe]);
+      // For P2P transports, use local vmmPeerBasePtrs; for RDMA, keep remote VA
+      if (context.GetTransportType(pe) != TransportType::RDMA) {
+        cpuHeapObj->peerPtrs[pe] = cpuHeapObj->p2pPeerPtrs[pe];
+      }
     }
   }
 
@@ -513,6 +568,10 @@ SymmMemObjPtr SymmMemManager::CreateVMMHeapObject(size_t virtualSize, int worldS
 
   HIP_RUNTIME_CHECK(hipMalloc(&gpuHeapObj->peerPtrs, sizeof(uintptr_t) * worldSize));
   HIP_RUNTIME_CHECK(hipMemcpy(gpuHeapObj->peerPtrs, cpuHeapObj->peerPtrs,
+                              sizeof(uintptr_t) * worldSize, hipMemcpyHostToDevice));
+
+  HIP_RUNTIME_CHECK(hipMalloc(&gpuHeapObj->p2pPeerPtrs, sizeof(uintptr_t) * worldSize));
+  HIP_RUNTIME_CHECK(hipMemcpy(gpuHeapObj->p2pPeerPtrs, cpuHeapObj->p2pPeerPtrs,
                               sizeof(uintptr_t) * worldSize, hipMemcpyHostToDevice));
 
   // Allocate and copy VMM-specific RDMA key info to GPU
@@ -611,8 +670,8 @@ void SymmMemManager::FinalizeVMMHeap() {
   for (int pe = 0; pe < worldSize; ++pe) {
     if (pe == rank) continue;  // Skip self
 
-    // Only process P2P accessible PEs
-    if (context.GetTransportType(pe) == TransportType::P2P && vmmPeerBasePtrs[pe] != nullptr) {
+    // Only process same-node peers that have P2P mappings
+    if (context.CanUseP2P(pe) && vmmPeerBasePtrs[pe] != nullptr) {
       for (size_t i = 0; i < vmmMaxChunks; ++i) {
         if (vmmChunks[i].mappedPeers.count(pe) > 0) {
           void* peerChunkPtr =
@@ -680,6 +739,7 @@ void SymmMemManager::FinalizeVMMHeap() {
     // Free CPU-side memory first
     if (vmmHeapObj.cpu) {
       free(vmmHeapObj.cpu->peerPtrs);
+      free(vmmHeapObj.cpu->p2pPeerPtrs);
       free(vmmHeapObj.cpu->vmmRkeyInfo);
       free(vmmHeapObj.cpu->vmmLkeyInfo);
       free(vmmHeapObj.cpu->ipcMemHandles);
@@ -692,6 +752,9 @@ void SymmMemManager::FinalizeVMMHeap() {
       hipError_t err;
       if ((err = hipFree(vmmHeapObj.gpu->peerPtrs)) != hipSuccess) {
         MORI_APP_WARN("FinalizeVMMHeap: Failed to free GPU peerPtrs: {}", err);
+      }
+      if ((err = hipFree(vmmHeapObj.gpu->p2pPeerPtrs)) != hipSuccess) {
+        MORI_APP_WARN("FinalizeVMMHeap: Failed to free GPU p2pPeerPtrs: {}", err);
       }
       if ((err = hipFree(vmmHeapObj.gpu->vmmRkeyInfo)) != hipSuccess) {
         MORI_APP_WARN("FinalizeVMMHeap: Failed to free GPU vmmRkeyInfo: {}", err);
@@ -922,10 +985,12 @@ bool SymmMemManager::RegisterP2PPeerMemory(const std::vector<int>& localShareabl
                                            int worldSize, int currentDev) {
   MORI_APP_TRACE("VMMAlloc: rank={} registering P2P peer memory", rank);
 
-  // Find all P2P peers
+  // Find all same-node peers that can use P2P
+  // Note: This is independent of transport type - we maintain P2P memory mapping
+  // even when using RDMA transport
   std::vector<int> p2pPeers;
   for (int pe = 0; pe < worldSize; ++pe) {
-    if (pe != rank && context.GetTransportType(pe) == TransportType::P2P) {
+    if (context.CanUseP2P(pe)) {
       p2pPeers.push_back(pe);
     }
   }
@@ -1347,11 +1412,11 @@ void SymmMemManager::VMMFreeChunk(void* localPtr) {
                    allocSize);
   }
 
-  // Step 1: First unmap from peer virtual address spaces for P2P accessible PEs
+  // Step 1: First unmap from peer virtual address spaces for same-node peers
   for (int pe = 0; pe < worldSize; ++pe) {
     if (pe == rank) continue;  // Skip self
 
-    if (context.GetTransportType(pe) == TransportType::P2P && vmmPeerBasePtrs[pe] != nullptr) {
+    if (context.CanUseP2P(pe) && vmmPeerBasePtrs[pe] != nullptr) {
       for (size_t i = 0; i < chunksToFree; ++i) {
         size_t idx = chunkIdx + i;
 
@@ -1482,12 +1547,14 @@ SymmMemObjPtr SymmMemManager::VMMRegisterSymmMemObj(void* localPtr, size_t size,
 
   // Calculate peer pointers based on VMM per-PE virtual address spaces
   cpuMemObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
+  cpuMemObj->p2pPeerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
 
   uintptr_t localOffset =
       reinterpret_cast<uintptr_t>(localPtr) - reinterpret_cast<uintptr_t>(vmmVirtualBasePtr);
   // Set peer pointers to corresponding addresses in each PE's virtual address space
   for (int pe = 0; pe < worldSize; ++pe) {
     cpuMemObj->peerPtrs[pe] = vmmHeapObj.cpu->peerPtrs[pe] + localOffset;
+    cpuMemObj->p2pPeerPtrs[pe] = vmmHeapObj.cpu->p2pPeerPtrs[pe] + localOffset;
   }
   MORI_APP_TRACE("VMMRegister: localPtr={:p} size={} offset={}", localPtr, size, localOffset);
 
@@ -1514,6 +1581,10 @@ SymmMemObjPtr SymmMemManager::VMMRegisterSymmMemObj(void* localPtr, size_t size,
 
   HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->peerPtrs, sizeof(uintptr_t) * worldSize));
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerPtrs, cpuMemObj->peerPtrs,
+                              sizeof(uintptr_t) * worldSize, hipMemcpyHostToDevice));
+
+  HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->p2pPeerPtrs, sizeof(uintptr_t) * worldSize));
+  HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->p2pPeerPtrs, cpuMemObj->p2pPeerPtrs,
                               sizeof(uintptr_t) * worldSize, hipMemcpyHostToDevice));
 
   // For VMM allocations: point to vmmHeapObj's GPU VMMChunkKey arrays (not allocating new memory)

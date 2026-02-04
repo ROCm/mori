@@ -49,6 +49,9 @@ class Context {
   RdmaDeviceContext* GetRdmaDeviceContext() const { return rdmaDeviceContext.get(); }
   bool RdmaTransportEnabled() const { return GetRdmaDeviceContext() != nullptr; }
 
+  // Check if P2P connection is possible with a peer (same node)
+  bool CanUseP2P(int destRank) const;
+
   const std::vector<RdmaEndpoint>& GetRdmaEndpoints() const { return rdmaEps; }
 
  private:
