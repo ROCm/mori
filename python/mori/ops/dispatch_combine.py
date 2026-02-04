@@ -20,7 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 from mori import cpp as mori_cpp
-
+import os
 from dataclasses import dataclass
 import torch
 import torch.distributed as dist
@@ -104,6 +104,30 @@ class EpDispatchCombineOp:
     def get_registered_combine_input_buffer(self, dtype: torch.dtype):
         return self._get_registered_combine_input_buffer(self._handle, dtype)
 
+    def get_launch_config(self, is_dispatch, block_num, rdma_block_num, warp_per_block):
+        launch_config_mode = os.environ.get("MORI_EP_LAUNCH_CONFIG_MODE", "MANUAL")
+        if launch_config_mode == "MANUAL":
+            block_num = block_num if block_num > 0 else self.config.block_num
+            rdma_block_num = (
+                rdma_block_num if rdma_block_num > 0 else self.config.rdma_block_num
+            )
+            warp_per_block = (
+                warp_per_block if warp_per_block > 0 else self.config.warp_num_per_block
+            )
+        elif launch_config_mode == "AUTO":
+            if self.config.kernel_type.value in (
+                EpDispatchCombineKernelType.InterNodeV1.value,
+                EpDispatchCombineKernelType.InterNodeV1LL.value,
+            ):
+                block_num, rdma_block_num, warp_per_block = 96, 64, 8
+            else:
+                block_num, rdma_block_num, warp_per_block = 128, 0, 16
+        else:
+            raise ValueError(
+                f"invalid MORI_EP_LAUNCH_CONFIG_MODE, must be ['MANUAL', 'AUTO'], got '{launch_config_mode}'"
+            )
+        return block_num, rdma_block_num, warp_per_block
+
     def dispatch(
         self,
         input: torch.Tensor,
@@ -111,8 +135,15 @@ class EpDispatchCombineOp:
         scales: torch.Tensor,
         indices: torch.Tensor,
         block_num: int = -1,
+        rdma_block_num: int = -1,
         warp_per_block: int = -1,
     ):
+        block_num, rdma_block_num, warp_per_block = self.get_launch_config(
+            is_dispatch=True,
+            block_num=block_num,
+            rdma_block_num=rdma_block_num,
+            warp_per_block=warp_per_block,
+        )
         return self._dispatch_func(
             self._handle,
             self.config.kernel_type.value,
@@ -121,6 +152,7 @@ class EpDispatchCombineOp:
             scales,
             indices,
             block_num,
+            rdma_block_num,
             warp_per_block,
         )
 
@@ -130,9 +162,16 @@ class EpDispatchCombineOp:
         weights: torch.Tensor,
         indices: torch.Tensor,
         block_num: int = -1,
+        rdma_block_num: int = -1,
         warp_per_block: int = -1,
         call_reset: bool = False,
     ):
+        block_num, rdma_block_num, warp_per_block = self.get_launch_config(
+            is_dispatch=False,
+            block_num=block_num,
+            rdma_block_num=rdma_block_num,
+            warp_per_block=warp_per_block,
+        )
         output = self._combine_func(
             self._handle,
             self.config.kernel_type.value,
@@ -140,6 +179,7 @@ class EpDispatchCombineOp:
             weights,
             indices,
             block_num,
+            rdma_block_num,
             warp_per_block,
         )
         if call_reset:

@@ -265,29 +265,30 @@ void EpDispatchCombineHandle::FinalizeBarrier() {
   ShmemFree(interNodeChunkFlagMemObj->localPtr);
 }
 
-void EpDispatchCombineHandle::LaunchIntraNodeDispatch(int blockNum, int warpPerBlock,
-                                                      hipStream_t stream) {
-  LaunchDispatch(KernelType::IntraNode, blockNum, warpPerBlock, stream);
+void EpDispatchCombineHandle::LaunchIntraNodeDispatch(int blockNum, int rdmaBlockNum,
+                                                      int warpPerBlock, hipStream_t stream) {
+  LaunchDispatch(KernelType::IntraNode, blockNum, rdmaBlockNum, warpPerBlock, stream);
 }
 
-void EpDispatchCombineHandle::LaunchInterNodeDispatch(int blockNum, int warpPerBlock,
-                                                      hipStream_t stream) {
-  LaunchDispatch(KernelType::InterNode, blockNum, warpPerBlock, stream);
+void EpDispatchCombineHandle::LaunchInterNodeDispatch(int blockNum, int rdmaBlockNum,
+                                                      int warpPerBlock, hipStream_t stream) {
+  LaunchDispatch(KernelType::InterNode, blockNum, rdmaBlockNum, warpPerBlock, stream);
 }
 
-void EpDispatchCombineHandle::LaunchIntraNodeCombine(int blockNum, int warpPerBlock,
-                                                     hipStream_t stream) {
-  LaunchCombine(KernelType::IntraNode, blockNum, warpPerBlock, stream);
+void EpDispatchCombineHandle::LaunchIntraNodeCombine(int blockNum, int rdmaBlockNum,
+                                                     int warpPerBlock, hipStream_t stream) {
+  LaunchCombine(KernelType::IntraNode, blockNum, rdmaBlockNum, warpPerBlock, stream);
 }
 
-void EpDispatchCombineHandle::LaunchInterNodeCombine(int blockNum, int warpPerBlock,
-                                                     hipStream_t stream) {
-  LaunchCombine(KernelType::InterNode, blockNum, warpPerBlock, stream);
+void EpDispatchCombineHandle::LaunchInterNodeCombine(int blockNum, int rdmaBlockNum,
+                                                     int warpPerBlock, hipStream_t stream) {
+  LaunchCombine(KernelType::InterNode, blockNum, rdmaBlockNum, warpPerBlock, stream);
 }
 
-void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum, int warpPerBlock,
-                                             hipStream_t stream) {
+void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum, int rdmaBlockNum,
+                                             int warpPerBlock, hipStream_t stream) {
   size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
+  size_t actualRdmaBlockNum = (rdmaBlockNum <= 0) ? config.rdmaBlockNum : rdmaBlockNum;
   dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
   dim3 block(warpSize * actualWarpNumPerBlock);
 
@@ -295,7 +296,7 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
       (config.worldSize * actualWarpNumPerBlock + config.numExpertPerRank * actualWarpNumPerBlock +
        config.numExpertPerRank) *
       sizeof(index_t);
-  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this, actualRdmaBlockNum);
   std::visit(
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;
@@ -319,13 +320,14 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
       argsVariant);
 }
 
-void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum, int warpPerBlock,
-                                            hipStream_t stream) {
+void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum, int rdmaBlockNum,
+                                            int warpPerBlock, hipStream_t stream) {
   size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
+  size_t actualRdmaBlockNum = (rdmaBlockNum <= 0) ? config.rdmaBlockNum : rdmaBlockNum;
   dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
   dim3 block(warpSize * actualWarpNumPerBlock);
 
-  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this, actualRdmaBlockNum);
   std::visit(
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;

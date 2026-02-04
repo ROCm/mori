@@ -544,14 +544,6 @@ class EpDispatchCombineTestCase:
             all_rank_scales,
         ) = test_data
 
-        # max_rdma = 128 if max_num_token >= 128 else 64
-        max_rdma = 64  # 256-32
-        op.config.rdma_block_num = min(max(max_num_token, 16), max_rdma)
-        block_num = op.config.rdma_block_num + 32
-        # op.config.rdma_block_num = 32
-        # block_num = 64
-        print(f"rdma {op.config.rdma_block_num} total {block_num}")
-
         for i in range(3):
             (
                 dispatch_output,
@@ -564,7 +556,6 @@ class EpDispatchCombineTestCase:
                 all_rank_weights[self.rank],
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
-                block_num=block_num,
             )
             torch.cuda.synchronize()
             total_recv_num_token = dispatch_recv_num_token[0].item()
@@ -573,7 +564,6 @@ class EpDispatchCombineTestCase:
                 dispatch_weights,
                 # None,
                 all_rank_indices[self.rank],
-                block_num=block_num,
             )
             torch.cuda.synchronize()
 
@@ -604,14 +594,12 @@ class EpDispatchCombineTestCase:
                 all_rank_weights[self.rank],
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
-                block_num=block_num,
             )
             events[2 * i + 1].record()
             combine_output, _ = op.combine(
                 dispatch_output,
                 dispatch_weights,
                 all_rank_indices[self.rank],
-                block_num=block_num,
             )
             events[2 * i + 2].record()
         torch.cuda.synchronize()
@@ -882,6 +870,7 @@ def sweep_bench_dispatch_combine(
     local_rank,
     num_node,
     gpu_per_node,
+    dtype,
     max_tokens,
     kernel_type,
     num_qp,
@@ -894,14 +883,7 @@ def sweep_bench_dispatch_combine(
     if sweep_token_interval <= 0:
         raise ValueError(f"sweep_token_interval must >= 1, got {sweep_token_interval}")
     test_case = EpDispatchCombineTestCase(
-        global_rank,
-        gpu_per_node,
-        world_size,
-        max_tokens,
-        kernel_type,
-        num_qp,
-        torch.bfloat16,
-        # torch.float8_e4m3fnuz,
+        global_rank, gpu_per_node, world_size, max_tokens, kernel_type, num_qp, dtype
     )
     test_case.setup()
 
@@ -963,6 +945,7 @@ def test_dispatch_combine(
     local_rank,
     num_node,
     gpu_per_node,
+    dtype,
     max_tokens,
     kernel_type,
     num_qp,
@@ -981,8 +964,7 @@ def test_dispatch_combine(
             max_tokens,
             kernel_type,
             num_qp,
-            torch.bfloat16,
-            # torch.float8_e4m3fnuz,
+            dtype,
         )
         test_case.setup()
         if cmd == "test":
@@ -1008,6 +990,12 @@ def test_dispatch_combine(
         raise ValueError(f"unsupported command: {cmd}")
 
 
+_DATA_TYPE_MAP = {
+    "bf16": torch.bfloat16,
+    "fp8_e4m3_fnuz": torch.float8_e4m3fnuz,
+    "fp8_e4m3": torch.float8_e4m3fn,
+}
+
 parser = argparse.ArgumentParser(description="dispatch/combine internode test")
 parser.add_argument(
     "--cmd",
@@ -1015,6 +1003,13 @@ parser.add_argument(
     default="test",
     choices=["test", "bench", "stress", "sweep_bench", "profile"],
     help="Available subcommands: test, bench, stress, sweep_bench",
+)
+parser.add_argument(
+    "--dtype",
+    type=str,
+    default="bf16",
+    choices=["bf16", "fp8_e4m3_fnuz", "fp8_e4m3"],
+    help="Data type of dispatch / combine",
 )
 parser.add_argument(
     "--max-tokens",
@@ -1054,6 +1049,7 @@ if __name__ == "__main__":
         args=(
             num_node,
             gpu_per_node,
+            _DATA_TYPE_MAP[args_cli.dtype],
             args_cli.max_tokens,
             args_cli.kernel_type,
             args_cli.num_qp,

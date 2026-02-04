@@ -140,13 +140,19 @@ class EpDispatchCombineHandle {
   }
 
   // When blockNum and warpPerBlock <= 0, kernel will use default values in config
-  void LaunchIntraNodeDispatch(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
-  void LaunchInterNodeDispatch(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
-  void LaunchIntraNodeCombine(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
-  void LaunchInterNodeCombine(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
+  void LaunchIntraNodeDispatch(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+                               hipStream_t = 0);
+  void LaunchInterNodeDispatch(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+                               hipStream_t = 0);
+  void LaunchIntraNodeCombine(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+                              hipStream_t = 0);
+  void LaunchInterNodeCombine(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+                              hipStream_t = 0);
 
-  void LaunchDispatch(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
-  void LaunchCombine(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
+  void LaunchDispatch(KernelType, int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+                      hipStream_t = 0);
+  void LaunchCombine(KernelType, int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+                     hipStream_t = 0);
   void LaunchReset(hipStream_t = 0);
 
   index_t GetCurRankNumToken() const { return curRankNumToken; }
@@ -260,6 +266,7 @@ template <typename T>
 struct EpDispatchCombineArgs {
   using data_type = T;
   EpDispatchCombineConfig config;
+  int rdmaBlockNum{-1};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
   T* inpTokenBuf{nullptr};
@@ -321,9 +328,11 @@ using EpDispatchCombineArgsVariant =
                  >;
 
 template <typename T>
-EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle& handle) {
+EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle& handle,
+                                                  int rdmaBlockNum) {
   EpDispatchCombineArgs<T> args;
   args.config = handle.config;
+  args.rdmaBlockNum = rdmaBlockNum;
   args.curRankNumToken = handle.curRankNumToken;
   args.tokenIndices = handle.tokenIndices;
   args.inpTokenBuf = reinterpret_cast<T*>(handle.inpTokenBuf);
@@ -374,19 +383,19 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
 }
 
 inline EpDispatchCombineArgsVariant GetEpDispatchCombineArgsByInputType(
-    const EpDispatchCombineHandle& handle) {
+    const EpDispatchCombineHandle& handle, int rdmaBlockNum) {
   switch (handle.inputType) {
     case HIP_R_32F:
-      return GetEpDispatchCombineArgs<float>(handle);
+      return GetEpDispatchCombineArgs<float>(handle, rdmaBlockNum);
     case HIP_R_16BF:
-      return GetEpDispatchCombineArgs<hip_bfloat16>(handle);
+      return GetEpDispatchCombineArgs<hip_bfloat16>(handle, rdmaBlockNum);
 #ifdef MORI_FP8_TYPE_OCP_ENABLED
     case HIP_R_8F_E4M3:
-      return GetEpDispatchCombineArgs<__hip_fp8_e4m3>(handle);
+      return GetEpDispatchCombineArgs<__hip_fp8_e4m3>(handle, rdmaBlockNum);
 #endif
 #ifdef MORI_FP8_TYPE_FNUZ_ENABLED
     case HIP_R_8F_E4M3_FNUZ:
-      return GetEpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>(handle);
+      return GetEpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>(handle, rdmaBlockNum);
 #endif
     default:
       std::ostringstream oss;
