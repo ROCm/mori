@@ -11,3 +11,5 @@ lib*
 __pycache__
 
 .vscode
+*.log
+*.core
