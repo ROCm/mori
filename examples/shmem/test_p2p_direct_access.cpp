@@ -143,6 +143,7 @@ __global__ void ShmemPutThreadKernel(int myPe, int npes, const SymmMemObjPtr mem
   if (globalTid >= numElements) return;
 
   int targetPe = (myPe + 1) % npes;
+  int sourcePe = (myPe - 1 + npes) % npes;
   size_t threadOffset = globalTid * sizeof(T);
 
   // Each PE writes its rank to the next PE's buffer
@@ -154,9 +155,16 @@ __global__ void ShmemPutThreadKernel(int myPe, int npes, const SymmMemObjPtr mem
       ShmemQuietThread(targetPe);
     }
   }
+  
+  // Receiver side: wait for data to arrive by polling
+  T* localBuff = reinterpret_cast<T*>(memObj->localPtr);
+  T expected = static_cast<T>(sourcePe);
+  while (atomicAdd(&localBuff[globalTid], 0) != expected) {
+    // Busy wait for data
+  }
 }
 
-// Test 4: Shmem Put Thread (Pure Address API)
+// Test 5: Shmem Put Thread (Pure Address API)
 template <typename T>
 __global__ void ShmemPutThreadKernel_PureAddr(int myPe, int npes, T* localBuff, int numElements) {
   int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -164,6 +172,7 @@ __global__ void ShmemPutThreadKernel_PureAddr(int myPe, int npes, T* localBuff, 
   if (globalTid >= numElements) return;
 
   int targetPe = (myPe + 1) % npes;
+  int sourcePe = (myPe - 1 + npes) % npes;
 
   // Each PE writes its rank to the next PE's buffer
   if (myPe != targetPe) {  // Skip if only one PE
@@ -176,6 +185,12 @@ __global__ void ShmemPutThreadKernel_PureAddr(int myPe, int npes, T* localBuff, 
     if (blockIdx.x == 0 && threadIdx.x == 0) {
       ShmemQuietThread(targetPe);
     }
+  }
+  
+  // Receiver side: wait for data to arrive by polling
+  T expected = static_cast<T>(sourcePe);
+  while (atomicAdd(&localBuff[globalTid], 0) != expected) {
+    // Busy wait for data
   }
 }
 
@@ -377,10 +392,10 @@ void testDirectP2PAccess() {
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
 
-  // Each PE writes to next PE using shmem put
+  // Each PE writes to next PE using shmem put (includes receiver polling)
   ShmemPutThreadKernel<uint32_t><<<gridSize, blockSize>>>(myPe, npes, atomicBuffObj, numElements);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-  MPI_Barrier(MPI_COMM_WORLD);
+  // Note: No MPI_Barrier needed here as kernel includes receiver-side polling
 
   // Verify results
   uint32_t putResult[numElements];
@@ -428,11 +443,11 @@ void testDirectP2PAccess() {
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
 
-    // Each PE writes to next PE using shmem put (pure address API)
+    // Each PE writes to next PE using shmem put (pure address API, includes receiver polling)
     ShmemPutThreadKernel_PureAddr<uint32_t><<<gridSize, blockSize>>>(
         myPe, npes, reinterpret_cast<uint32_t*>(srcBuff), numElements);
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
+    // Note: No MPI_Barrier needed here as kernel includes receiver-side polling
 
     // Verify results
     uint32_t putResult2[numElements];
