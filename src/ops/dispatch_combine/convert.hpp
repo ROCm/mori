@@ -168,7 +168,7 @@ __device__ inline void InvokeConvertDispatchOutput(const EpDispatchCombineArgs<T
 }
 
 // Helper to invoke ConvertCombineInputDevice from EpDispatchCombineArgs
-template <typename T, bool UseP2PRead>
+template <typename T, bool UseP2PRead = true>
 __device__ inline void InvokeConvertCombineInput(const EpDispatchCombineArgs<T>& args, int myPe) {
   ConvertCombineInputArgs convArgs{};
   convArgs.config = args.config;
@@ -374,9 +374,7 @@ __device__ inline void ConvertDispatchOutputDevice(ConvertDispatchOutputArgs arg
 }
 #endif
 
-__global__ void ConvertDispatchOutputKernel(ConvertDispatchOutputArgs args) {
-  ConvertDispatchOutputDevice(args);
-}
+__global__ void ConvertDispatchOutputKernel(ConvertDispatchOutputArgs args);
 
 #if LOW_LATENCY_MODE == 1
 // Block-per-token implementation: each block processes one token,

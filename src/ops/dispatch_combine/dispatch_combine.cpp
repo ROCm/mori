@@ -407,9 +407,11 @@ void EpDispatchCombineHandle::LaunchDispatchForStandardMoE(KernelType kernelType
 
         if (kernelType == KernelType::InterNodeV1LL) {
           EpDispatchCopyToStaging<<<this->multiProcessorCount, block, 0, stream>>>(args);
-          EpDispatchInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
+          EpDispatchInterNodeV1KernelLowLatency<DataT, /*EnableStdMoE=*/true>
+              <<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
-          EpDispatchIntraNodeKernel<DataT, true><<<grid, block, sharedMemSize, stream>>>(args);
+          EpDispatchIntraNodeKernel<DataT, /*EnableStdMoE=*/true>
+              <<<grid, block, sharedMemSize, stream>>>(args);
         } else {
           assert(false &&
                  "LaunchDispatchForStandardMoE only supports IntraNode/InterNodeV1LL kernel type");
@@ -433,7 +435,8 @@ void EpDispatchCombineHandle::LaunchCombineForStandardMoE(KernelType kernelType,
         size_t sharedMemSize =
             actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
         if (kernelType == KernelType::InterNodeV1LL) {
-          EpCombineInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
+          EpCombineInterNodeV1KernelLowLatency<DataT, /*EnableStdMoE=*/true>
+              <<<grid, block, sharedMemSize, stream>>>(args);
           EpCombineAll<<<this->multiProcessorCount, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           // Standard MoE mode: convert packed expert output to shmem format first
@@ -444,6 +447,10 @@ void EpDispatchCombineHandle::LaunchCombineForStandardMoE(KernelType kernelType,
         }
       },
       argsVariant);
+}
+
+__global__ void ConvertDispatchOutputKernel(ConvertDispatchOutputArgs args) {
+  ConvertDispatchOutputDevice(args);
 }
 
 void EpDispatchCombineHandle::LaunchConvertDispatchOutputKernel(const void* dispatchOutX,
