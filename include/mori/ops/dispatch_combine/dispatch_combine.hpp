@@ -97,6 +97,7 @@ struct EpDispatchCombineConfig {
   int gpuPerNode{8};
   int rdmaBlockNum{1};
   int numQpPerPe{1};
+  bool enableInternalFp8Quant{true};
 
   inline __host__ __device__ int MaxNumTokensToSendPerRank() const { return maxNumInpTokenPerRank; }
 
@@ -122,6 +123,7 @@ class EpDispatchCombineHandle {
     this->inpTokenBuf = input;
     this->outTokenBuf = output;
     this->weightsBuf = weights;
+    this->scalesBuf = nullptr;
     this->tokenIndices = tokenIndices;
     this->curRankNumToken = numToken;
     // printf("handle inputType %s\n", HipDataTypeToString(inputType));

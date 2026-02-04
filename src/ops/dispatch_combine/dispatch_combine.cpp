@@ -333,15 +333,23 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
 
         size_t sharedMemSize =
             actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
+        if ((kernelType == KernelType::InterNodeV1) || (kernelType == KernelType::InterNodeV1LL)) {
+          sharedMemSize = actualWarpNumPerBlock * config.numExpertPerToken *
+                          (sizeof(DataT**) + sizeof(float**) + sizeof(float**));
+        }
         if (kernelType == KernelType::InterNode) {
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeV1) {
           assert(config.useExternalInpBuffer);
+          EpCombineSync<<<this->multiProcessorCount, block, 0, stream>>>(args);
+          EpCombineSyncBarrier<<<1, warpSize, 0, stream>>>(args);
           EpCombineInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
           EpCombineAll<<<this->multiProcessorCount, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeV1LL) {
           assert(config.useExternalInpBuffer);
+          EpCombineSync<<<this->multiProcessorCount, block, 0, stream>>>(args);
+          EpCombineSyncBarrier<<<1, warpSize, 0, stream>>>(args);
           EpCombineInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
           EpCombineAll<<<this->multiProcessorCount, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {

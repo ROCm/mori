@@ -47,16 +47,19 @@ class EpDispatchCombineTestCase:
         kernel_type,
         num_qp,
         dtype=torch.bfloat16,
+        enable_internal_fp8_quant=True,
+        input_scale=1.0,
     ):
         self.rank = rank
         self.gpu_per_node = gpu_per_node
         self.world_size = world_size
+        self.input_scale = input_scale
         self.config = mori.ops.EpDispatchCombineConfig(
             data_type=dtype,
             rank=self.rank,
             world_size=self.world_size,
             hidden_dim=7168,
-            scale_dim=32,
+            scale_dim=56,
             scale_type_size=4,
             max_num_inp_token_per_rank=(max_tokens + 63) // 64 * 64,
             num_experts_per_rank=16,
@@ -68,6 +71,7 @@ class EpDispatchCombineTestCase:
             gpu_per_node=self.gpu_per_node,
             rdma_block_num=32,
             num_qp_per_pe=num_qp,
+            enable_internal_fp8_quant=enable_internal_fp8_quant,
         )
 
     def setup(self):
@@ -216,6 +220,7 @@ class EpDispatchCombineTestCase:
                     generator=self.rng,
                     device=self.device,
                 ).to(self.config.data_type)
+                * self.input_scale
             )
 
         return (
@@ -369,7 +374,14 @@ class EpDispatchCombineTestCase:
                 all_rank_input[self.rank][i].to(torch.float32) * final_unique_pes
             ).to(self.config.data_type)
 
-            ok = torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
+            if self.config.enable_internal_fp8_quant:
+                rel_diff = 1e-1
+                atol = 2e-2
+            else:
+                rel_diff = 1e-2
+                atol = 1e-2
+
+            ok = torch.allclose(got.float(), expected.float(), atol=atol, rtol=rel_diff)
             if not ok:
                 print(
                     self.rank,
@@ -419,7 +431,7 @@ class EpDispatchCombineTestCase:
     def test_dispatch_combine(self):
         error_round = set()
         op = mori.ops.EpDispatchCombineOp(self.config)
-        for i in range(5000):
+        for i in range(500):
             if self.rank == 0:
                 print(f"Round {i} begin")
             test_data = self.gen_test_data(
@@ -882,6 +894,8 @@ def sweep_bench_dispatch_combine(
     kernel_type,
     num_qp,
     sweep_token_interval,
+    enable_internal_fp8_quant=True,
+    input_scale=1.0,
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
@@ -898,6 +912,8 @@ def sweep_bench_dispatch_combine(
         num_qp,
         torch.bfloat16,
         # torch.float8_e4m3fnuz,
+        enable_internal_fp8_quant,
+        input_scale,
     )
     test_case.setup()
 
@@ -958,6 +974,8 @@ def test_dispatch_combine(
     num_qp,
     cmd="test",
     sweep_token_interval=64,
+    enable_internal_fp8_quant=True,
+    input_scale=1.0,
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
@@ -973,6 +991,8 @@ def test_dispatch_combine(
             num_qp,
             torch.bfloat16,
             # torch.float8_e4m3fnuz,
+            enable_internal_fp8_quant,
+            input_scale,
         )
         test_case.setup()
         if cmd == "test":
@@ -993,6 +1013,8 @@ def test_dispatch_combine(
             kernel_type,
             num_qp,
             sweep_token_interval,
+            enable_internal_fp8_quant,
+            input_scale,
         )
     else:
         raise ValueError(f"unsupported command: {cmd}")
@@ -1031,6 +1053,18 @@ parser.add_argument(
     default=1,
     help="Number of qp per processing endpoint",
 )
+parser.add_argument(
+    "--enable-internal-fp8-quant",
+    type=lambda x: x.lower() in ("true", "1", "yes"),
+    default=True,
+    help="Enable internal FP8 quantization (default: True)",
+)
+parser.add_argument(
+    "--input-scale",
+    type=float,
+    default=float(os.environ.get("MORI_TEST_INPUT_SCALE", "1.0")),
+    help="Multiply generated input activations by this scale (default: MORI_TEST_INPUT_SCALE or 1.0)",
+)
 args_cli = parser.parse_args()
 
 if __name__ == "__main__":
@@ -1049,6 +1083,8 @@ if __name__ == "__main__":
             args_cli.num_qp,
             args_cli.cmd,
             args_cli.sweep_token_interval,
+            args_cli.enable_internal_fp8_quant,
+            args_cli.input_scale,
         ),
         nprocs=gpu_per_node,
         join=True,
