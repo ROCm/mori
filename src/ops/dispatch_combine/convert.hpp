@@ -29,6 +29,8 @@
 #include "mori/core/core.hpp"
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 
+#define LOW_LATENCY_MODE 1
+
 // Profiling macros for timestamp recording
 // #define ENABLE_PROFILE 1  // Enable profiling
 // #define PROFILE_DISPATCH 1  // Profile ConvertDispatchOutputDevice
@@ -184,7 +186,7 @@ __device__ inline void InvokeConvertCombineInput(const EpDispatchCombineArgs<T>&
   ConvertCombineInputDevice<T, UseP2PRead>(convArgs);
 }
 
-#if 1
+#if LOW_LATENCY_MODE == 1
 // IsStandalone: true if launched as a standalone kernel, false if called from within another kernel
 template <bool IsStandalone = true>
 __device__ inline void ConvertDispatchOutputDevice(ConvertDispatchOutputArgs args) {
@@ -226,7 +228,6 @@ __device__ inline void ConvertDispatchOutputDevice(ConvertDispatchOutputArgs arg
   const int64_t totalTokens = static_cast<int64_t>(args.totalRecvTokenNum[0]);
   for (int i = globalWarpId; i < totalTokens * topk; i += globalWarpNum) {
     auto tokenIdx = i / topk;
-    // const index_t expertId = topkIdx[i];
     const index_t expertId = __ldg(topkIdx + i);
     const auto localExpert = expertId - config.rank * config.numExpertPerRank;
     if (localExpert < 0 || localExpert >= config.numExpertPerRank) {
@@ -244,8 +245,6 @@ __device__ inline void ConvertDispatchOutputDevice(ConvertDispatchOutputArgs arg
     uint32_t idx = 0;
     if (laneId == 0) {
       idx = atomicAdd(packedRecvCount + localExpert, 1u);
-      // idx = __hip_atomic_fetch_add(packedRecvCount + localExpert, 1u, __ATOMIC_RELAXED,
-      //                              __HIP_MEMORY_SCOPE_AGENT);
     }
     idx = __shfl(idx, 0);
 
@@ -309,8 +308,6 @@ __device__ inline void ConvertDispatchOutputDevice(ConvertDispatchOutputArgs arg
 
   const int64_t totalTokens = static_cast<int64_t>(args.totalRecvTokenNum[0]);
 
-  // Block assignment: divide blocks evenly among local experts
-  // Each group of blocks handles one local expert
   const int blocksPerExpert = gridDim.x / numExperts;
   const int localExpertId = blockIdx.x / blocksPerExpert;
 
@@ -324,13 +321,10 @@ __device__ inline void ConvertDispatchOutputDevice(ConvertDispatchOutputArgs arg
   // Global expert ID that this block group is responsible for
   const index_t targetExpertId = static_cast<index_t>(config.rank * numExperts + localExpertId);
 
-  // Warp ID within this expert's block group
   const int groupWarpId = blockInGroup * warpNum + warpId;
   const int groupWarpNum = blocksPerExpert * warpNum;
 
-  // Each warp processes tokens (rows of topkIdx) in strided fashion
   for (int64_t tokenIdx = groupWarpId; tokenIdx < totalTokens; tokenIdx += groupWarpNum) {
-    // First topk threads read topkIdx for this token in parallel
     index_t myExpertId = laneId < topk ? topkIdx[tokenIdx * topk + laneId] : 0;
     if (laneId < topk) {
       // Check if this is a non-local expert and set -1 (only first group handles)
@@ -342,7 +336,6 @@ __device__ inline void ConvertDispatchOutputDevice(ConvertDispatchOutputArgs arg
       }
     }
 
-    // Check if this lane's expert matches our target, use ballot to determine if copy needed
     const bool isMatch = laneId < topk && (myExpertId == targetExpertId);
     const uint64_t matchMask = __ballot(isMatch);
     if (matchMask == 0) {
@@ -351,7 +344,6 @@ __device__ inline void ConvertDispatchOutputDevice(ConvertDispatchOutputArgs arg
 
     PROFILE_DISPATCH_RECORD(ts, tsCount, kTsMax, laneId);
 
-    // This token goes to our target expert, do the copy
     uint32_t idx = 0;
     if (laneId == 0) {
       idx = atomicAdd(packedRecvCount + localExpertId, 1u);
@@ -360,12 +352,10 @@ __device__ inline void ConvertDispatchOutputDevice(ConvertDispatchOutputArgs arg
 
     const uint64_t linearIndex = static_cast<uint64_t>(localExpertId) * maxTokensPerExpert + idx;
 
-    // Set dispTokToEpSlotMap for the matching lane(s)
     if (isMatch) {
       dispTokToEpSlotMap[tokenIdx * topk + laneId] = linearIndex;
     }
 
-    // Set packedRecvSrcInfo (only lane 0)
     if (laneId == 0) {
       packedRecvSrcInfo[linearIndex] = dispatchSrcTokenPos[tokenIdx];
     }
@@ -388,51 +378,7 @@ __global__ void ConvertDispatchOutputKernel(ConvertDispatchOutputArgs args) {
   ConvertDispatchOutputDevice(args);
 }
 
-#if 0
-template <typename T>
-__global__ void ConvertCombineInputKernel(ConvertCombineInputArgs args) {
-  const EpDispatchCombineConfig& config = args.config;
-  const int thdId = threadIdx.x;
-  const int warpId = thdId / warpSize;
-  const int laneId = thdId & (warpSize - 1);
-  const int warpNum = blockDim.x / warpSize;
-
-  const int globalWarpId = blockIdx.x * warpNum + warpId;
-  const int globalWarpNum = gridDim.x * warpNum;
-
-  constexpr int kTsMax = 8;
-  PROFILE_COMBINE_DECL(kTsMax);
-  PROFILE_COMBINE_RECORD(ts, tsCount, kTsMax, laneId);
-
-  const int topk = config.numExpertPerToken;
-  const int64_t hiddenDim = config.hiddenDim;
-
-  auto* dispTokToEpSlotMap = args.dispTokToEpSlotMap;
-  const auto* packedRecvX = reinterpret_cast<const T*>(args.packedRecvX);
-  auto* combineInput = reinterpret_cast<T*>(args.combineInput);
-  const auto* topkWeights = reinterpret_cast<const float*>(args.topkWeights);
-
-  T* srcPtrs[MAX_EXPERTS_PER_TOKEN];
-
-  const int64_t totalTokens = static_cast<int64_t>(args.totalRecvTokenNum[0]);
-
-  for (int64_t tokenIdx = globalWarpId; tokenIdx < totalTokens; tokenIdx += globalWarpNum) {
-    for (int k = 0; k < topk; ++k) {
-      const uint64_t slot = dispTokToEpSlotMap[tokenIdx * topk + k];
-      srcPtrs[k] = (slot == static_cast<uint64_t>(-1))
-                       ? nullptr
-                       : const_cast<T*>(packedRecvX + slot * hiddenDim);
-    }
-    PROFILE_COMBINE_RECORD(ts, tsCount, kTsMax, laneId);
-    const float* weightRow = topkWeights ? (topkWeights + tokenIdx * topk) : nullptr;
-    core::WarpAccum<T, 4>(combineInput + tokenIdx * hiddenDim, srcPtrs, weightRow, topk, hiddenDim);
-    PROFILE_COMBINE_RECORD(ts, tsCount, kTsMax, laneId);
-  }
-
-  PROFILE_COMBINE_PRINT(config.rank == 0 && blockIdx.x == 0 && warpId == 0 && laneId == 0,
-                        "ConvertCombineInputKernel", ts, tsCount);
-}
-#else
+#if LOW_LATENCY_MODE == 1
 // Block-per-token implementation: each block processes one token,
 // each thread reduces one vector element across all top-k experts
 template <typename T, bool UseP2PRead>
@@ -527,23 +473,21 @@ __device__ inline void ConvertCombineInputDevice(ConvertCombineInputArgs& args) 
   PROFILE_COMBINE_PRINT(config.rank == 0 && blockIdx.x == 0 && warpId == 0 && laneId == 0,
                         "ConvertCombineInputDevice", ts, tsCount);
 }
-
-template <typename T, bool UseP2PRead = true>
-__global__ void ConvertCombineInputKernel(ConvertCombineInputArgs args) {
-  ConvertCombineInputDevice<T, UseP2PRead>(args);
-}
-#endif
-
-#if 0
-template <typename T>
-__global__ void ConvertCombineInputKernel(ConvertCombineInputArgs args) {
+#else
+template <typename T, bool UseP2PRead>
+__device__ inline void ConvertCombineInputDevice(ConvertCombineInputArgs& args) {
   const EpDispatchCombineConfig& config = args.config;
   const int thdId = threadIdx.x;
   const int warpId = thdId / warpSize;
+  const int laneId = thdId & (warpSize - 1);
   const int warpNum = blockDim.x / warpSize;
 
   const int globalWarpId = blockIdx.x * warpNum + warpId;
   const int globalWarpNum = gridDim.x * warpNum;
+
+  constexpr int kTsMax = 8;
+  PROFILE_COMBINE_DECL(kTsMax);
+  PROFILE_COMBINE_RECORD(ts, tsCount, kTsMax, laneId);
 
   const int topk = config.numExpertPerToken;
   const int64_t hiddenDim = config.hiddenDim;
@@ -553,67 +497,50 @@ __global__ void ConvertCombineInputKernel(ConvertCombineInputArgs args) {
   auto* combineInput = reinterpret_cast<T*>(args.combineInput);
   const auto* topkWeights = reinterpret_cast<const float*>(args.topkWeights);
 
+  // clear packedRecvCount
+  if (thdId < config.numExpertPerRank) {
+    args.packedRecvCount[thdId] = 0;
+  }
+
   T* srcPtrs[MAX_EXPERTS_PER_TOKEN];
-
   const int64_t totalTokens = static_cast<int64_t>(args.totalRecvTokenNum[0]);
-  if (totalTokens == 0) return;
 
-  // Even distribution of warps among tokens:
-  // - First numTokensWithExtraWarp tokens get (baseWarpsPerToken + 1) warps each
-  // - Remaining tokens get baseWarpsPerToken warps each
-  const int64_t baseWarpsPerToken = std::max(int64_t{1}, globalWarpNum / totalTokens);
-  const int64_t numTokensWithExtraWarp =
-      (globalWarpNum >= totalTokens) ? (globalWarpNum % totalTokens) : 0;
-  const int64_t largeGroupSize = baseWarpsPerToken + 1;
-  const int64_t cutoff = numTokensWithExtraWarp * largeGroupSize;
-
-  // When warps >= tokens: total work = globalWarpNum (each warp does one piece)
-  // When warps < tokens: total work = totalTokens (each warp handles multiple tokens)
-  const int64_t totalWorkItems = std::max(static_cast<int64_t>(globalWarpNum), totalTokens);
-
-  for (int64_t i = globalWarpId; i < totalWorkItems; i += globalWarpNum) {
-    int64_t tokenIdx, inTokenPartId, warpsForThisToken;
-
-    if (globalWarpNum >= totalTokens) {
-      // Map work item to (token, part) with even distribution
-      if (i < cutoff) {
-        tokenIdx = i / largeGroupSize;
-        inTokenPartId = i % largeGroupSize;
-        warpsForThisToken = largeGroupSize;
-      } else {
-        tokenIdx = numTokensWithExtraWarp + (i - cutoff) / baseWarpsPerToken;
-        inTokenPartId = (i - cutoff) % baseWarpsPerToken;
-        warpsForThisToken = baseWarpsPerToken;
-      }
-    } else {
-      // Each warp handles entire token(s), no hiddenDim splitting
-      tokenIdx = i;
-      inTokenPartId = 0;
-      warpsForThisToken = 1;
-    }
-
-    if (tokenIdx >= totalTokens) continue;
-
-    const int64_t hiddenDimPerWarp = (hiddenDim + warpsForThisToken - 1) / warpsForThisToken;
-    const int64_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
-    const int64_t hiddenDimSize =
-        std::max(int64_t{0}, std::min(hiddenDim - hiddenDimOffset, hiddenDimPerWarp));
-
-    if (hiddenDimSize == 0) continue;
-
+  for (int64_t tokenIdx = globalWarpId; tokenIdx < totalTokens; tokenIdx += globalWarpNum) {
     for (int k = 0; k < topk; ++k) {
       const uint64_t slot = dispTokToEpSlotMap[tokenIdx * topk + k];
       srcPtrs[k] = (slot == static_cast<uint64_t>(-1))
                        ? nullptr
-                       : const_cast<T*>(packedRecvX + slot * hiddenDim + hiddenDimOffset);
+                       : const_cast<T*>(packedRecvX + slot * hiddenDim);
     }
 
+    T* out;
+    if constexpr (UseP2PRead) {
+      out = args.shmemCombineInpTokMemObj->template GetAs<T*>() + tokenIdx * hiddenDim;
+    } else {
+      index_t destTokId =
+          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(config.rank)[tokenIdx];
+      index_t destPe = destTokId / config.MaxNumTokensToRecvPerRank();
+      index_t destLocalTokId = destTokId - destPe * config.MaxNumTokensToRecvPerRank();
+      out = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+            (config.rank * config.MaxNumTokensToRecvPerRank() + destLocalTokId) * hiddenDim;
+    }
+
+    PROFILE_COMBINE_RECORD(ts, tsCount, kTsMax, laneId);
     const float* weightRow = topkWeights ? (topkWeights + tokenIdx * topk) : nullptr;
-    core::WarpAccum<T, 4>(combineInput + tokenIdx * hiddenDim + hiddenDimOffset, srcPtrs,
-                          weightRow, topk, hiddenDimSize);
+    // core::WarpAccum<T, 4>(combineInput + tokenIdx * hiddenDim, srcPtrs, weightRow, topk, hiddenDim);
+    core::WarpAccum<T, 4>(out, srcPtrs, weightRow, topk, hiddenDim);
+    PROFILE_COMBINE_RECORD(ts, tsCount, kTsMax, laneId);
   }
+
+  PROFILE_COMBINE_PRINT(config.rank == 0 && blockIdx.x == 0 && warpId == 0 && laneId == 0,
+                        "ConvertCombineInputDevice", ts, tsCount);
 }
 #endif
+
+template <typename T, bool UseP2PRead = true>
+__global__ void ConvertCombineInputKernel(ConvertCombineInputArgs args) {
+  ConvertCombineInputDevice<T, UseP2PRead>(args);
+}
 
 }  // namespace moe
 }  // namespace mori
