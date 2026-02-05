@@ -116,8 +116,8 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   MORI_TRACE_SPAN(profiler, Slot::DispatchIntra);
 
-  int blockOffset = config.rdmaBlockNum;
-  int xgmiBlockNum = blockNum - config.rdmaBlockNum;
+  int blockOffset = args.rdmaBlockNum;
+  int xgmiBlockNum = blockNum - args.rdmaBlockNum;
   int tokenPerBlock = (args.curRankNumToken + xgmiBlockNum - 1) / xgmiBlockNum;
   int startTokenIdx = (blockId - blockOffset) * tokenPerBlock;
   int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, args.curRankNumToken);
@@ -161,7 +161,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
 
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
   int totalChunkNum = core::CeilDiv(args.curRankNumToken, warpSize);
-  int blockChunkNum = core::CeilDiv(totalChunkNum, config.rdmaBlockNum);
+  int blockChunkNum = core::CeilDiv(totalChunkNum, args.rdmaBlockNum);
 
   int startTokenIdx = blockChunkNum * blockId * warpSize;
   int endTokenIdx = std::min(startTokenIdx + blockChunkNum * warpSize, args.curRankNumToken);
@@ -267,7 +267,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
   int finishedWarp = 0;
   if (laneId == 0) finishedWarp = atomicAdd(args.interNodeBlocksBarrier, 1);
   finishedWarp = __shfl(finishedWarp, 0);
-  if ((finishedWarp + 1) == (config.rdmaBlockNum * warpNum)) {
+  if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
     if (laneId < nNodes) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
       index_t numTokenSignal =
@@ -288,7 +288,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
   // Then send to other nodes
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
   int totalChunkNum = core::CeilDiv(args.curRankNumToken, warpSize);
-  int blockChunkNum = core::CeilDiv(totalChunkNum, config.rdmaBlockNum);
+  int blockChunkNum = core::CeilDiv(totalChunkNum, args.rdmaBlockNum);
   int chunkStartTokenIdx = blockChunkNum * blockId * warpSize;
   int chunkEndTokenIdx =
       std::min(chunkStartTokenIdx + blockChunkNum * warpSize, args.curRankNumToken);
@@ -336,7 +336,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
   int finishedWarp = 0;
   if (laneId == 0) finishedWarp = atomicAdd(&args.interNodeBlocksBarrier[1], 1);
   finishedWarp = __shfl(finishedWarp, 0);
-  if ((finishedWarp + 1) == (config.rdmaBlockNum * warpNum)) {
+  if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
     if (laneId < nNodes) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
       index_t numTokenSignal =
@@ -365,7 +365,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
   int totalChunkNum = 0;
 
   for (int bid = blockId; bid < numRecvBlock * maxChunkNum * (nNodes - 1);
-       bid += config.rdmaBlockNum) {
+       bid += args.rdmaBlockNum) {
     int k = bid / (numRecvBlock * (nNodes - 1));
     int i = (bid / numRecvBlock) % (nNodes - 1);
 
@@ -465,7 +465,7 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
   // expert -> token -> node
   for (int i = globalWarpId;
        i < config.maxNumInpTokenPerRank * config.numExpertPerToken * (nNodes - 1);
-       i += config.rdmaBlockNum * warpNum) {
+       i += args.rdmaBlockNum * warpNum) {
     int expertId = i % config.numExpertPerToken;
     int tokenId = i / config.numExpertPerToken % config.maxNumInpTokenPerRank;
     int nodeId = i / config.numExpertPerToken / config.maxNumInpTokenPerRank;
@@ -597,7 +597,7 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 __global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
-  if (blockId < config.rdmaBlockNum) {
+  if (blockId < args.rdmaBlockNum) {
     v1::DispatchInterNodeSend<T, true>(args);
     v1::DispatchInterNodeRecv(args);
   } else {
@@ -650,7 +650,7 @@ __global__ void EpDispatchCopyToStaging(EpDispatchCombineArgs<T> args) {
 template <typename T, bool EnableStdMoE>
 __global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
-  if (blockId < config.rdmaBlockNum) {
+  if (blockId < args.rdmaBlockNum) {
     v1::DispatchInterNodeLLSend<T>(args);
     v1::DispatchInterNodeLLRecv(args);
   } else {
@@ -725,8 +725,8 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   MORI_TRACE_SPAN(profiler, Slot::CombineIntraNode);
 
-  int blockOffset = config.rdmaBlockNum;
-  int xgmiBlockNum = blockNum - config.rdmaBlockNum;
+  int blockOffset = args.rdmaBlockNum;
+  int xgmiBlockNum = blockNum - args.rdmaBlockNum;
 
   extern __shared__ char sharedMem[];
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
@@ -772,8 +772,8 @@ inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
   if (args.curRankNumToken == 0) return;
 
   // Distribute tokens evenly to all blocks
-  int blockOffset = config.rdmaBlockNum;
-  int xgmiBlockNum = blockNum - config.rdmaBlockNum;
+  int blockOffset = args.rdmaBlockNum;
+  int xgmiBlockNum = blockNum - args.rdmaBlockNum;
   int xgmiWarpNum = xgmiBlockNum * warpNum;
 
   extern __shared__ char sharedMem[];
@@ -838,7 +838,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
 
   int totalBids = 0;
   for (int bid = blockId; bid < numRecvBlock * maxChunkNum * (nNodes - 1);
-       bid += config.rdmaBlockNum) {
+       bid += args.rdmaBlockNum) {
     totalBids++;
   }
 
@@ -852,7 +852,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
            ((currentBatchSize == 32) ? 0xFFFFFFFF : ((1u << currentBatchSize) - 1))) {
       int bidIdx = 0;
       for (int bid = blockId; bid < numRecvBlock * maxChunkNum * (nNodes - 1);
-           bid += config.rdmaBlockNum) {
+           bid += args.rdmaBlockNum) {
         if (bidIdx < batchStart) {
           bidIdx++;
           continue;
@@ -962,7 +962,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   finishedWarp = __shfl(finishedWarp, 0);
   barrierFlag = __shfl(barrierFlag, 0);
 
-  if ((finishedWarp + 1) == (config.rdmaBlockNum * warpNum)) {
+  if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
     if (laneId < nNodes) {
       core::AtomicStoreSeqCstSystem(
           args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});
@@ -1005,7 +1005,7 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
   uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
 
-  int rdmaWarpNum = config.rdmaBlockNum * warpNum;
+  int rdmaWarpNum = args.rdmaBlockNum * warpNum;
   for (int n = 0; n < (nNodes - 1); n++) {
     int node = (myNode + n + 1) % nNodes;
     uint64_t nodeCount = nodeRecvTokenNum[node];
@@ -1094,7 +1094,7 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
   finishedWarp = __shfl(finishedWarp, 0);
   barrierFlag = __shfl(barrierFlag, 0);
 
-  if ((finishedWarp + 1) == (config.rdmaBlockNum * warpNum)) {
+  if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
     if (laneId < nNodes) {
       core::AtomicStoreSeqCstSystem(
           args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});
@@ -1188,7 +1188,7 @@ __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
 
   v1::CombineSync(args);
-  if (blockId < config.rdmaBlockNum) {
+  if (blockId < args.rdmaBlockNum) {
     v1::CombineInterNode(args);
   } else {
     v1::CombineIntraNode(args);
@@ -1266,7 +1266,7 @@ __global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> ar
 #endif
 
   v1::CombineSync(args);
-  if (blockId < config.rdmaBlockNum) {
+  if (blockId < args.rdmaBlockNum) {
     v1::CombineInterNodeLL(args);
   } else {
     v1::CombineIntraNodeLL(args);

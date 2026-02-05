@@ -161,14 +161,19 @@ class EpDispatchCombineHandle {
 #endif
 
   // When blockNum and warpPerBlock <= 0, kernel will use default values in config
-  void LaunchIntraNodeDispatch(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
-  void LaunchInterNodeDispatch(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
-  void LaunchIntraNodeCombine(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
-  void LaunchInterNodeCombine(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
+  void LaunchIntraNodeDispatch(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+                               hipStream_t = 0);
+  void LaunchInterNodeDispatch(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+                               hipStream_t = 0);
+  void LaunchIntraNodeCombine(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+                              hipStream_t = 0);
+  void LaunchInterNodeCombine(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+                              hipStream_t = 0);
 
-  void LaunchDispatch(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
-  void LaunchCombine(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0,
-                     int useExternalInpBuf = -1);
+  void LaunchDispatch(KernelType, int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+                      hipStream_t = 0);
+  void LaunchCombine(KernelType, int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+                     hipStream_t = 0, int useExternalInpBuf = -1);
 
 #ifdef ENABLE_STANDARD_MOE_ADAPT
   void LaunchDispatchForStandardMoE(KernelType, int blockNum = -1, int warpPerBlock = -1,
@@ -187,72 +192,72 @@ class EpDispatchCombineHandle {
                                        int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
 #endif
 
-  void LaunchReset(hipStream_t = 0);
+void LaunchReset(hipStream_t = 0);
 
-  index_t GetCurRankNumToken() const { return curRankNumToken; }
+index_t GetCurRankNumToken() const { return curRankNumToken; }
 
- private:
-  void InitializeShmemBuf();
-  void FinalizeShmemBuf();
+private:
+void InitializeShmemBuf();
+void FinalizeShmemBuf();
 
-  void InitializeTokenNumSignalBuf();
-  void FinalizeTokenNumSignalBuf();
+void InitializeTokenNumSignalBuf();
+void FinalizeTokenNumSignalBuf();
 
-  void InitializeOrderMapBuf();
-  void FinalizeOrderMapBuf();
+void InitializeOrderMapBuf();
+void FinalizeOrderMapBuf();
 
-  void InitializeBarrier();
-  void FinalizeBarrier();
+void InitializeBarrier();
+void FinalizeBarrier();
 
- public:
-  // Number of tokens on this rank and size of scale data type, updated at each round of inference
-  index_t curRankNumToken{0};
-  index_t multiProcessorCount{0};
+public:
+// Number of tokens on this rank and size of scale data type, updated at each round of inference
+index_t curRankNumToken{0};
+index_t multiProcessorCount{0};
 
- public:
-  // Config
-  EpDispatchCombineConfig config;
-  // Routed expert indices for tokens
-  index_t* tokenIndices{nullptr};
+public:
+// Config
+EpDispatchCombineConfig config;
+// Routed expert indices for tokens
+index_t* tokenIndices{nullptr};
 
-  // Kernel input/output buffer
-  void* inpTokenBuf{nullptr};
-  void* outTokenBuf{nullptr};
-  hipDataType inputType;
-  float* weightsBuf{nullptr};
-  uint8_t* scalesBuf{nullptr};
+// Kernel input/output buffer
+void* inpTokenBuf{nullptr};
+void* outTokenBuf{nullptr};
+hipDataType inputType;
+float* weightsBuf{nullptr};
+uint8_t* scalesBuf{nullptr};
 
-  // Registered buffers for tokens, shmemOutTokMemObj will be returned to user as output
-  mori::application::SymmMemObjPtr shmemDispatchInpTokMemObj;
-  mori::application::SymmMemObjPtr shmemCombineInpTokMemObj;
-  mori::application::SymmMemObjPtr shmemDispatchOutTokMemObj;
-  mori::application::SymmMemObjPtr shmemCombineOutTokMemObj;
-  mori::application::SymmMemObjPtr shmemStagingTokMemObj;
+// Registered buffers for tokens, shmemOutTokMemObj will be returned to user as output
+mori::application::SymmMemObjPtr shmemDispatchInpTokMemObj;
+mori::application::SymmMemObjPtr shmemCombineInpTokMemObj;
+mori::application::SymmMemObjPtr shmemDispatchOutTokMemObj;
+mori::application::SymmMemObjPtr shmemCombineOutTokMemObj;
+mori::application::SymmMemObjPtr shmemStagingTokMemObj;
 
-  // Registered buffer used for weights, indices and scales
-  mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
-  mori::application::SymmMemObjPtr shmemDispatchOutWeightsMemObj;
-  mori::application::SymmMemObjPtr shmemCombineOutWeightsMemObj;
-  mori::application::SymmMemObjPtr shmemInpScalesMemObj;
-  mori::application::SymmMemObjPtr shmemOutScalesMemObj;
-  mori::application::SymmMemObjPtr shmemInpIndicesMemObj;
-  mori::application::SymmMemObjPtr shmemOutIndicesMemObj;
+// Registered buffer used for weights, indices and scales
+mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
+mori::application::SymmMemObjPtr shmemDispatchOutWeightsMemObj;
+mori::application::SymmMemObjPtr shmemCombineOutWeightsMemObj;
+mori::application::SymmMemObjPtr shmemInpScalesMemObj;
+mori::application::SymmMemObjPtr shmemOutScalesMemObj;
+mori::application::SymmMemObjPtr shmemInpIndicesMemObj;
+mori::application::SymmMemObjPtr shmemOutIndicesMemObj;
 
-  // Record number of tokens that will be received from other PE
-  mori::application::SymmMemObjPtr recvTokenNumMemObj;
-  mori::application::SymmMemObjPtr sendTokenNumMemObj;
-  mori::application::SymmMemObjPtr sendAtomicSignalMemObj;
+// Record number of tokens that will be received from other PE
+mori::application::SymmMemObjPtr recvTokenNumMemObj;
+mori::application::SymmMemObjPtr sendTokenNumMemObj;
+mori::application::SymmMemObjPtr sendAtomicSignalMemObj;
 
-  // Barrier for intra-grid synchronization
-  uint32_t* dispatchGridBarrier{nullptr};
-  uint32_t* combineGridBarrier{nullptr};
+// Barrier for intra-grid synchronization
+uint32_t* dispatchGridBarrier{nullptr};
+uint32_t* combineGridBarrier{nullptr};
 
-  // Map dispatch input token index to staging buffer index, saved at dispatch send phase and used
-  // at combine recv phase
-  index_t* dispSenderIdxMap{nullptr};
-  // Map dispatch staging buffer index to output buffer index, saved at dispatch recv phase and used
-  // at combine send phase
-  index_t* dispReceiverIdxMap{nullptr};
+// Map dispatch input token index to staging buffer index, saved at dispatch send phase and used
+// at combine recv phase
+index_t* dispSenderIdxMap{nullptr};
+// Map dispatch staging buffer index to output buffer index, saved at dispatch recv phase and used
+// at combine send phase
+index_t* dispReceiverIdxMap{nullptr};
 
 #ifdef ENABLE_STANDARD_MOE_ADAPT
   // Map dispatch token to expert slot index (size: MaxNumTokensToRecv * numExpertPerToken), saved
@@ -313,6 +318,7 @@ template <typename T>
 struct EpDispatchCombineArgs {
   using data_type = T;
   EpDispatchCombineConfig config;
+  int rdmaBlockNum{-1};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
   T* inpTokenBuf{nullptr};
@@ -383,9 +389,11 @@ using EpDispatchCombineArgsVariant =
                  >;
 
 template <typename T>
-EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle& handle) {
+EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle& handle,
+                                                  int rdmaBlockNum) {
   EpDispatchCombineArgs<T> args;
   args.config = handle.config;
+  args.rdmaBlockNum = rdmaBlockNum;
   args.curRankNumToken = handle.curRankNumToken;
   args.tokenIndices = handle.tokenIndices;
   args.inpTokenBuf = reinterpret_cast<T*>(handle.inpTokenBuf);
@@ -444,19 +452,19 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
 }
 
 inline EpDispatchCombineArgsVariant GetEpDispatchCombineArgsByInputType(
-    const EpDispatchCombineHandle& handle) {
+    const EpDispatchCombineHandle& handle, int rdmaBlockNum) {
   switch (handle.inputType) {
     case HIP_R_32F:
-      return GetEpDispatchCombineArgs<float>(handle);
+      return GetEpDispatchCombineArgs<float>(handle, rdmaBlockNum);
     case HIP_R_16BF:
-      return GetEpDispatchCombineArgs<hip_bfloat16>(handle);
+      return GetEpDispatchCombineArgs<hip_bfloat16>(handle, rdmaBlockNum);
 #ifdef MORI_FP8_TYPE_OCP_ENABLED
     case HIP_R_8F_E4M3:
-      return GetEpDispatchCombineArgs<__hip_fp8_e4m3>(handle);
+      return GetEpDispatchCombineArgs<__hip_fp8_e4m3>(handle, rdmaBlockNum);
 #endif
 #ifdef MORI_FP8_TYPE_FNUZ_ENABLED
     case HIP_R_8F_E4M3_FNUZ:
-      return GetEpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>(handle);
+      return GetEpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>(handle, rdmaBlockNum);
 #endif
     default:
       std::ostringstream oss;

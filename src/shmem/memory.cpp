@@ -22,12 +22,124 @@
 #include <mpi.h>
 
 #include "mori/application/memory/symmetric_memory.hpp"
+#include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"
 #include "mori/utils/mori_log.hpp"
-#include "mori/shmem/internal.hpp"
 
 namespace mori {
 namespace shmem {
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                    Memory Allocation Helpers                                  */
+/* ---------------------------------------------------------------------------------------------- */
+
+// Allocate memory in static heap mode (with VA manager for reuse)
+static void* AllocateStaticHeap(ShmemStates* states, size_t size) {
+  // Align to 256 bytes for better performance
+  constexpr size_t ALIGNMENT = 256;
+
+  // Use VA manager to allocate address (thread-safe, handles reuse)
+  uintptr_t allocAddr =
+      states->memoryStates->symmMemMgr->GetHeapVAManager()->Allocate(size, ALIGNMENT);
+
+  if (allocAddr == 0) {
+    MORI_SHMEM_ERROR(
+        "Out of static heap memory! Requested: {} bytes. Hint: Increase via MORI_SHMEM_HEAP_SIZE "
+        "(default: 2GB)",
+        size);
+    return nullptr;
+  }
+
+  void* ptr = reinterpret_cast<void*>(allocAddr);
+
+  // Register the allocated region as a sub-region of the static heap
+  states->memoryStates->symmMemMgr->RegisterStaticHeapSubRegion(
+      ptr, size, &states->memoryStates->staticHeapObj);
+
+  uintptr_t baseAddr = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
+  MORI_SHMEM_TRACE("Allocated {} bytes at ptr={:#x} (offset={}, aligned to 256={})", size,
+                   allocAddr, allocAddr - baseAddr, (allocAddr % 256 == 0 ? "yes" : "no"));
+
+  return ptr;
+}
+
+// Allocate memory in VMM heap mode
+static void* AllocateVMMHeap(ShmemStates* states, size_t size) {
+  application::SymmMemObjPtr obj =
+      states->memoryStates->symmMemMgr->VMMAllocChunk(size, states->memoryStates->heapType);
+
+  if (obj.IsValid()) {
+    MORI_SHMEM_TRACE("Allocated {} bytes in VMM heap mode", size);
+    return obj.cpu->localPtr;
+  }
+
+  MORI_SHMEM_ERROR(
+      "Failed to allocate {} bytes in VMM heap. Hint: Increase via MORI_SHMEM_HEAP_SIZE (default: "
+      "8GB) or MORI_SHMEM_VMM_CHUNK_SIZE (default: 64MB)",
+      size);
+  return nullptr;
+}
+
+// Allocate memory in isolation mode
+static void* AllocateIsolation(ShmemStates* states, size_t size) {
+  application::SymmMemObjPtr obj = states->memoryStates->symmMemMgr->Malloc(size);
+
+  if (obj.IsValid()) {
+    MORI_SHMEM_TRACE("Allocated {} bytes in isolation mode", size);
+    return obj.cpu->localPtr;
+  }
+
+  MORI_SHMEM_ERROR("Failed to allocate {} bytes in isolation mode", size);
+  return nullptr;
+}
+
+// Allocate memory with flags in isolation mode
+static void* AllocateIsolationWithFlags(ShmemStates* states, size_t size, unsigned int flags) {
+  application::SymmMemObjPtr obj =
+      states->memoryStates->symmMemMgr->ExtMallocWithFlags(size, flags);
+
+  if (obj.IsValid()) {
+    MORI_SHMEM_TRACE("Allocated {} bytes with flags {} in isolation mode", size, flags);
+    return obj.cpu->localPtr;
+  }
+
+  MORI_SHMEM_ERROR("Failed to allocate {} bytes with flags {} in isolation mode", size, flags);
+  return nullptr;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                    Memory Deallocation Helpers                                */
+/* ---------------------------------------------------------------------------------------------- */
+
+// Free memory in static heap mode
+static void FreeStaticHeap(ShmemStates* states, void* localPtr) {
+  // Deregister static heap sub-region from SymmMemObj pool
+  states->memoryStates->symmMemMgr->DeregisterStaticHeapSubRegion(localPtr);
+
+  // Free the VA address in VA manager (enables reuse)
+  uintptr_t addr = reinterpret_cast<uintptr_t>(localPtr);
+  if (states->memoryStates->symmMemMgr->GetHeapVAManager()->Free(addr)) {
+    MORI_SHMEM_TRACE("Static heap freed memory at {} (VA reclaimed for reuse)", localPtr);
+  } else {
+    MORI_SHMEM_ERROR("Failed to free VA address {} in static heap", localPtr);
+  }
+}
+
+// Free memory in VMM heap mode
+static void FreeVMMHeap(ShmemStates* states, void* localPtr) {
+  states->memoryStates->symmMemMgr->VMMFreeChunk(localPtr);
+  MORI_SHMEM_TRACE("VMM heap freed memory at {}", localPtr);
+}
+
+// Free memory in isolation mode
+static void FreeIsolation(ShmemStates* states, void* localPtr) {
+  states->memoryStates->symmMemMgr->Free(localPtr);
+  MORI_SHMEM_TRACE("Isolation mode freed memory at {}", localPtr);
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                    Public Memory Allocation APIs                              */
+/* ---------------------------------------------------------------------------------------------- */
 
 void* ShmemMalloc(size_t size) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
@@ -37,70 +149,20 @@ void* ShmemMalloc(size_t size) {
     return nullptr;
   }
 
-  // Use different allocation strategies based on mode
-  if (states->mode == ShmemMode::StaticHeap) {
-    // Static heap mode: bump allocator from pre-allocated heap
-    // Align to 256 bytes for better performance
-    constexpr size_t ALIGNMENT = 256;
-    size = (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+  // Dispatch to appropriate allocator based on mode
+  switch (states->mode) {
+    case ShmemMode::StaticHeap:
+      return AllocateStaticHeap(states, size);
 
-    void* ptr;
-    
-    {
-      std::lock_guard<std::mutex> lock(states->memoryStates->heapLock);
+    case ShmemMode::VMHeap:
+      return AllocateVMMHeap(states, size);
 
-      // Check if we have enough space
-      if (states->memoryStates->staticHeapUsed + size > states->memoryStates->staticHeapSize) {
-        MORI_SHMEM_ERROR("Out of symmetric heap memory! Requested: {} bytes, Available: {} bytes", size,
-                         states->memoryStates->staticHeapSize - states->memoryStates->staticHeapUsed);
-        return nullptr;
-      }
+    case ShmemMode::Isolation:
+      return AllocateIsolation(states, size);
 
-      // Allocate from the bump pointer
-      uintptr_t baseAddr = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
-      ptr = reinterpret_cast<void*>(baseAddr + states->memoryStates->staticHeapUsed);
-      states->memoryStates->staticHeapUsed += size;
-    }
-
-    // CRITICAL: Synchronize staticHeapUsed across all ranks
-    application::BootstrapNetwork& bootNet = *states->bootStates->bootNet;
-    int rank = bootNet.GetLocalRank();
-    int worldSize = bootNet.GetWorldSize();
-    
-    size_t myHeapUsed = states->memoryStates->staticHeapUsed;
-    size_t* allHeapUsed = static_cast<size_t*>(malloc(worldSize * sizeof(size_t)));
-    bootNet.Allgather(&myHeapUsed, allHeapUsed, sizeof(size_t));
-    
-    // Verify all ranks have consistent staticHeapUsed
-    for (int i = 0; i < worldSize; i++) {
-      if (allHeapUsed[i] != myHeapUsed) {
-        MORI_SHMEM_ERROR("Rank {} staticHeapUsed mismatch! My: {}, Rank {}: {}",
-                         rank, myHeapUsed, i, allHeapUsed[i]);
-        free(allHeapUsed);
-        return nullptr;
-      }
-    }
-    free(allHeapUsed);
-
-    states->memoryStates->symmMemMgr->HeapRegisterSymmMemObj(ptr, size,
-                                                             &states->memoryStates->staticHeapObj);
-    
-    uintptr_t baseAddr = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
-    uintptr_t ptrValue = reinterpret_cast<uintptr_t>(ptr);
-    MORI_SHMEM_TRACE("Allocated {} bytes at ptr={:#x} (offset={}, aligned to 256={}) (total used: {} / {})", 
-                     size, ptrValue, ptrValue - baseAddr, 
-                     (ptrValue % 256 == 0 ? "yes" : "no"),
-                     states->memoryStates->staticHeapUsed, states->memoryStates->staticHeapSize);
-
-    return ptr;
-  } else {
-    // Isolation mode: each allocation gets its own SymmMemObj
-    application::SymmMemObjPtr obj = states->memoryStates->symmMemMgr->Malloc(size);
-    MORI_SHMEM_TRACE("Allocated shared memory of size {} in isolation mode", size);
-    if (obj.IsValid()) {
-      return obj.cpu->localPtr;
-    }
-    return nullptr;
+    default:
+      MORI_SHMEM_ERROR("Unknown ShmemMode: {}", static_cast<int>(states->mode));
+      return nullptr;
   }
 }
 
@@ -131,20 +193,23 @@ void* ShmemExtMallocWithFlags(size_t size, unsigned int flags) {
     return nullptr;
   }
 
-  // Use different allocation strategies based on mode
-  if (states->mode == ShmemMode::StaticHeap) {
-    // In static heap mode, flags are ignored - use the same allocator as ShmemMalloc
-    MORI_SHMEM_TRACE("Allocated shared memory of size {} with flags {} (flags ignored in static heap mode)", size, flags);
-    return ShmemMalloc(size);
-  } else {
-    // Isolation mode: use ExtMallocWithFlags directly
-    application::SymmMemObjPtr obj =
-        states->memoryStates->symmMemMgr->ExtMallocWithFlags(size, flags);
-    MORI_SHMEM_TRACE("Allocated shared memory of size {} with flags {} in isolation mode", size, flags);
-    if (obj.IsValid()) {
-      return obj.cpu->localPtr;
-    }
-    return nullptr;
+  // Dispatch to appropriate allocator based on mode
+  switch (states->mode) {
+    case ShmemMode::StaticHeap:
+      // Flags are ignored in static heap mode
+      return AllocateStaticHeap(states, size);
+
+    case ShmemMode::VMHeap:
+      // Flags are ignored in VMM heap mode
+      return AllocateVMMHeap(states, size);
+
+    case ShmemMode::Isolation:
+      // Isolation mode: flags are respected
+      return AllocateIsolationWithFlags(states, size, flags);
+
+    default:
+      MORI_SHMEM_ERROR("Unknown ShmemMode: {}", static_cast<int>(states->mode));
+      return nullptr;
   }
 }
 
@@ -156,16 +221,29 @@ void ShmemFree(void* localPtr) {
     return;
   }
 
-  // Use different deallocation strategies based on mode
-  if (states->mode == ShmemMode::StaticHeap) {
-    // Static heap mode: just deregister from the pool (no actual free)
-    // TODO: Implement a proper free list allocator for better memory reuse
-    states->memoryStates->symmMemMgr->HeapDeregisterSymmMemObj(localPtr);
-  } else {
-    // Isolation mode: free the memory and deregister
-    states->memoryStates->symmMemMgr->Free(localPtr);
+  // Dispatch to appropriate deallocator based on mode
+  switch (states->mode) {
+    case ShmemMode::StaticHeap:
+      FreeStaticHeap(states, localPtr);
+      break;
+
+    case ShmemMode::VMHeap:
+      FreeVMMHeap(states, localPtr);
+      break;
+
+    case ShmemMode::Isolation:
+      FreeIsolation(states, localPtr);
+      break;
+
+    default:
+      MORI_SHMEM_ERROR("Unknown ShmemMode: {}", static_cast<int>(states->mode));
+      break;
   }
 }
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                    Memory Query and Management APIs                           */
+/* ---------------------------------------------------------------------------------------------- */
 
 application::SymmMemObjPtr ShmemQueryMemObjPtr(void* localPtr) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
@@ -177,6 +255,10 @@ application::SymmMemObjPtr ShmemQueryMemObjPtr(void* localPtr) {
 
   return states->memoryStates->symmMemMgr->Get(localPtr);
 }
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                    Buffer Registration APIs                                   */
+/* ---------------------------------------------------------------------------------------------- */
 
 int ShmemBufferRegister(void* ptr, size_t size) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
@@ -192,41 +274,46 @@ int ShmemBufferDeregister(void* ptr, size_t size) {
   return 0;
 }
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                    P2P Pointer Conversion                                     */
+/* ---------------------------------------------------------------------------------------------- */
+
 uint64_t ShmemPtrP2p(const uint64_t destPtr, const int myPe, int destPe) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
   states->CheckStatusValid();
 
-  // If same PE, return the pointer directly
+  // Same PE: return pointer directly
   if (myPe == destPe) {
     return destPtr;
   }
 
+  // Validate destination PE
   if (destPe < 0 || destPe >= static_cast<int>(states->bootStates->worldSize)) {
     MORI_SHMEM_ERROR("Invalid destPe: {}", destPe);
     return 0;
   }
 
-  application::TransportType transportType = states->rdmaStates->commContext->GetTransportType(destPe);
+  // Check transport type (only P2P transport needs address translation)
+  application::TransportType transportType =
+      states->rdmaStates->commContext->GetTransportType(destPe);
   if (transportType == application::TransportType::RDMA) {
-    return 0;
+    return 0;  // RDMA doesn't use P2P pointers
   }
 
+  // Validate pointer is within symmetric heap bounds
   uintptr_t localAddrInt = static_cast<uintptr_t>(destPtr);
-
-  // Check if the pointer is within the symmetric heap
   uintptr_t heapBaseAddr = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
   uintptr_t heapEndAddr = heapBaseAddr + states->memoryStates->staticHeapSize;
 
   if (localAddrInt < heapBaseAddr || localAddrInt >= heapEndAddr) {
-    MORI_SHMEM_ERROR("Pointer 0x{:x} is not in symmetric heap [0x{:x}, 0x{:x})", 
-                     localAddrInt, heapBaseAddr, heapEndAddr);
+    MORI_SHMEM_ERROR("Pointer 0x{:x} is not in symmetric heap [0x{:x}, 0x{:x})", localAddrInt,
+                     heapBaseAddr, heapEndAddr);
     return 0;
   }
 
-  // Calculate offset from heap base
+  // Calculate offset and get peer address
   size_t offset = localAddrInt - heapBaseAddr;
 
-  // Get the symmetric memory object for the heap
   application::SymmMemObjPtr heapObj = states->memoryStates->staticHeapObj;
   if (heapObj->Get() == nullptr) {
     MORI_SHMEM_ERROR("Failed to get heap symmetric memory object");
@@ -234,9 +321,11 @@ uint64_t ShmemPtrP2p(const uint64_t destPtr, const int myPe, int destPe) {
   }
 
   uint64_t peerBaseAddr = heapObj->peerPtrs[destPe];
-
-  // Return the remote P2P address
   uint64_t remoteAddr = peerBaseAddr + offset;
+
+  MORI_SHMEM_TRACE("P2P pointer conversion: local=0x{:x} -> remote=0x{:x} (PE {} -> {})", destPtr,
+                   remoteAddr, myPe, destPe);
+
   return remoteAddr;
 }
 
