@@ -110,6 +110,10 @@ __global__ void OneShotAllGatherSdmaAsyncWaitKernel(int myPe, int npes,
     }
     __syncthreads();
   }
+
+  if (threadLinearId < npes) {
+    flags[threadLinearId] = 0;
+  }
 }
 }  // namespace collective
 }  // namespace mori

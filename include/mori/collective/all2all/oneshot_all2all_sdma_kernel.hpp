@@ -114,6 +114,11 @@ __global__ void OneShotAll2allSdmaKernel(int myPe, int npes,
         }
         __syncthreads();
     }
+
+    if (threadLinearId < npes) {
+        flags[threadLinearId] = 0;
+    }
+
     #if 0
     // Debug information: check data in output transit buffer
     if (threadLinearId == 0) {

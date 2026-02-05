@@ -77,12 +77,6 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes,
   if(warpId < npes && laneId == 0){
     int remotePe =warpId;
     shmem::ShmemQuietThread(remotePe, dstMemObj);
-    #if 1
-    if (threadLinearId < npes) {
-      //flags[threadLinearId] = 0;
-    }
-    __syncthreads();
-    #endif
     shmem::ShmemAtomicSizeNonFetchThread(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8, core::atomicType::AMO_ADD, remotePe);
   }
   __syncthreads();
@@ -103,6 +97,10 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes,
       }
     }
     __syncthreads();
+  }
+
+  if (threadLinearId < npes) {
+    flags[threadLinearId] = 0;
   }
 }
 }  // namespace collective
