@@ -166,6 +166,7 @@ bool AllgatherSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
         // Launch the kernel - this runs asynchronously
         OneShotAllGatherSdmaAsyncPutKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
+            input,
             input_transit_buffer_obj_,
             output_transit_buffer_obj_,
             flagsObj_, total_count);
@@ -425,6 +426,7 @@ bool AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
 
         OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
+            input,
             input_transit_buffer_obj_,
             output_transit_buffer_obj_,
             flagsObj_, total_count);

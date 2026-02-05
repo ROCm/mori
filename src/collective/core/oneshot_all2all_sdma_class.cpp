@@ -166,6 +166,7 @@ bool All2allSdma<T>::start_async(T* input, T* output, size_t total_count, hipStr
         // Launch the kernel - this runs asynchronously
         OneShotAll2allSdmaAsyncPutKernel<T><<<1, 64, 0, stream>>>(
             myPe_, npes_,
+            input,
             input_transit_buffer_obj_,
             output_transit_buffer_obj_,
             flagsObj_, total_count);
@@ -426,6 +427,7 @@ double All2allSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
 
         OneShotAll2allSdmaKernel<T><<<1, 64, 0, stream>>>(
             myPe_, npes_,
+            input,
             input_transit_buffer_obj_,
             output_transit_buffer_obj_,
             flagsObj_, total_count);

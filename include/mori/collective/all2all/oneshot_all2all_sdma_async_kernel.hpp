@@ -33,6 +33,7 @@ namespace collective {
 // Every GPU reads the full buffer from all peers, accumulates locally, and writes the result.
 template <typename T>
 __global__ void OneShotAll2allSdmaAsyncPutKernel(int myPe, int npes,
+                                       T* input,
                                        const application::SymmMemObjPtr srcMemObj,
                                        const application::SymmMemObjPtr dstMemObj,
                                        const application::SymmMemObjPtr flagsMemObj,
@@ -41,8 +42,8 @@ __global__ void OneShotAll2allSdmaAsyncPutKernel(int myPe, int npes,
     return;
   }
 
-  T* __restrict__ src = reinterpret_cast<T*>(srcMemObj->localPtr);
-  T* __restrict__ dst = reinterpret_cast<T*>(dstMemObj->localPtr);
+  T* __restrict__ inputData = input;
+  T* __restrict__ stageData = reinterpret_cast<T*>(dstMemObj->localPtr);
   uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
 
   const size_t threadLinearId =
@@ -70,7 +71,13 @@ __global__ void OneShotAll2allSdmaAsyncPutKernel(int myPe, int npes,
     else
       sendBytes = sendBytes_rand;
 
-    shmem::ShmemPutMemNbiThread(dstMemObj, destByteOffset, srcMemObj, srcByteOffset, sendBytes, targetPe, qId);
+    application::SymmMemObjPtr dest = dstMemObj;
+    uint8_t* srcPtr = reinterpret_cast<uint8_t *>(inputData) + srcByteOffset;
+    uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[targetPe] + destByteOffset);
+    anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + targetPe*dest->sdmaNumQueue;
+    HSAuint64* signals = dest->signalPtrs + targetPe*dest->sdmaNumQueue;
+    HSAuint64* expectedSignals = dest->expectSignalsPtr + targetPe*dest->sdmaNumQueue;
+    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals, dest->sdmaNumQueue, qId);   
   }
 }
 

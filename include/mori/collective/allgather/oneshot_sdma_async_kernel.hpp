@@ -25,12 +25,14 @@
 #include <cstddef>
 
 #include "mori/shmem/shmem.hpp"
+#include "mori/core/transport/rdma/device_primitives.hpp"
 
 namespace mori {
 namespace collective {
 
 template <typename T>
 __global__ void OneShotAllGatherSdmaAsyncPutKernel(int myPe, int npes,
+		                               T* input,
                                        const application::SymmMemObjPtr srcMemObj,
                                        const application::SymmMemObjPtr dstMemObj,
                                        const application::SymmMemObjPtr flagsMemObj,
@@ -39,7 +41,7 @@ __global__ void OneShotAllGatherSdmaAsyncPutKernel(int myPe, int npes,
     return;
   }
 
-  T* __restrict__ src = reinterpret_cast<T*>(srcMemObj->localPtr);
+  T* __restrict__ inputData = input;
   T* __restrict__ dst = reinterpret_cast<T*>(dstMemObj->localPtr);
   uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
 
@@ -66,7 +68,14 @@ __global__ void OneShotAllGatherSdmaAsyncPutKernel(int myPe, int npes,
     if( qId == 7) sendBytes = bytesPerPeer - 7*sendBytes_rand;
     else sendBytes = sendBytes_rand;
 
-    shmem::ShmemPutMemNbiThread(dstMemObj, destByteOffset, srcMemObj, srcByteOffset, sendBytes, remotePe, qId);
+    if (laneId == 0) printf(" new no copy !!!!!!!!!!!!!!!!!!!\n");
+    application::SymmMemObjPtr dest = dstMemObj;
+    uint8_t* srcPtr = reinterpret_cast<uint8_t *>(inputData) + srcByteOffset;
+    uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + destByteOffset;
+    anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + remotePe*dest->sdmaNumQueue;
+    HSAuint64* signals = dest->signalPtrs + remotePe*dest->sdmaNumQueue;
+    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe*dest->sdmaNumQueue;
+    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals, dest->sdmaNumQueue, qId);
   }
 }
 

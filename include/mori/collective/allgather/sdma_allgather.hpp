@@ -54,7 +54,7 @@ double Allgather_sdma(T* input, T* output, size_t total_count,
   assert(flagsObj.IsValid());
 
   double start = MPI_Wtime();
-  OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
+  OneShotAllGatherSdmaKernel<T><<<1, 512>>>(myPe, npes, input, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
   
   // Synchronize GPU to ensure kernel completion
   hipError_t sync_err;

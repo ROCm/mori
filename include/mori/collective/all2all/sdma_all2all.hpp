@@ -53,7 +53,7 @@ double All2all_sdma(T* input, T* output, size_t total_count, hipStream_t stream)
   assert(flagsObj.IsValid());
  
   double start = MPI_Wtime();
-  OneShotAll2allSdmaKernel<T><<<1, 512, 0, stream>>>(myPe, npes, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
+  //OneShotAll2allSdmaKernel<T><<<1, 512>>>(myPe, npes, input, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
   
   // Synchronize GPU to ensure kernel completion
   hipError_t sync_err;
