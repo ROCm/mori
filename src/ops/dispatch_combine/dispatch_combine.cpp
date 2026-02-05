@@ -389,6 +389,7 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
       argsVariant);
 }
 
+#ifdef ENABLE_STANDARD_MOE_ADAPT
 void EpDispatchCombineHandle::LaunchDispatchForStandardMoE(KernelType kernelType, int blockNum,
                                                            int warpPerBlock, hipStream_t stream) {
   size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
@@ -448,7 +449,9 @@ void EpDispatchCombineHandle::LaunchCombineForStandardMoE(KernelType kernelType,
       },
       argsVariant);
 }
+#endif  // ENABLE_STANDARD_MOE_ADAPT
 
+#ifdef ENABLE_STANDARD_MOE_ADAPT
 __global__ void ConvertDispatchOutputKernel(ConvertDispatchOutputArgs args) {
   ConvertDispatchOutputDevice(args);
 }
@@ -525,6 +528,7 @@ void EpDispatchCombineHandle::LaunchConvertCombineInputKernel(
       break;
   }
 }
+#endif  // ENABLE_STANDARD_MOE_ADAPT
 
 // no need for a separate reset kernel now
 void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) {}

@@ -142,6 +142,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
   return {out, outWeights};
 }
 
+#ifdef ENABLE_STANDARD_MOE_ADAPT
 // Standard MoE 3D output: packedRecvX/Count/SrcInfo/LayoutRange
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> LaunchDispatchForStandardMoE(
     mori::moe::EpDispatchCombineHandle& handle, int kernelType, const torch::Tensor& input,
@@ -174,12 +175,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> LaunchDis
       torch::empty({numLocalExperts, maxTokensPerExpert, hidden}, input.options());
   auto packedRecvSrcInfo = torch::empty({numLocalExperts, maxTokensPerExpert},
                                         torch::dtype(torch::kInt32).device(torch::kCUDA));
-  auto packedRecvLayoutRange = torch::empty({numLocalExperts, handle.config.worldSize},
-                                            torch::dtype(torch::kInt64).device(torch::kCUDA));
+  // Not sorted by src token blocks, so layout range is unused (return empty tensor).
+  auto packedRecvLayoutRange = torch::empty({0}, torch::dtype(torch::kInt64).device(torch::kCUDA));
 
   handle.SetStandardMoeOutputBuffers(packedRecvX.data_ptr(), handle.standardPackedRecvCount,
-                                     packedRecvSrcInfo.data_ptr<int>(),
-                                     packedRecvLayoutRange.data_ptr<int64_t>());
+                                     packedRecvSrcInfo.data_ptr<int>(), nullptr);
 
   handle.LaunchDispatchForStandardMoE((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
                                       at::cuda::getCurrentHIPStream());
@@ -188,7 +188,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> LaunchDis
       torch::from_blob(handle.standardPackedRecvCount, {numLocalExperts},
                        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
 
-  handle.ClearStandardMoeOutputBuffers();
+  // handle.ClearStandardMoeOutputBuffers();
 
   return {packedRecvX, packedRecvCount, packedRecvSrcInfo, packedRecvLayoutRange};
 }
@@ -242,7 +242,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombineForStandard
   //                        torch::TensorOptions().dtype(weights->scalar_type()).device(torch::kCUDA));
   // }
 
-  handle.ClearStandardMoeOutputBuffers();
+  // handle.ClearStandardMoeOutputBuffers();
 
   return {out, outWeights};
 }
@@ -268,13 +268,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> ConvertDi
   auto packedRecvSrcInfo =
       torch::empty({numLocalExperts, handle.config.worldSize * handle.config.maxNumInpTokenPerRank},
                    torch::dtype(torch::kInt32).device(torch::kCUDA));
-  auto packedRecvLayoutRange = torch::empty({numLocalExperts, handle.config.worldSize},
-                                            torch::dtype(torch::kInt64).device(torch::kCUDA));
+  // Not sorted by src token blocks, so layout range is unused.
+  auto packedRecvLayoutRange = torch::empty({0}, torch::dtype(torch::kInt64).device(torch::kCUDA));
 
   handle.LaunchConvertDispatchOutputKernel(dispatchOutX.data_ptr(), dispatchOutTopkIdx.data_ptr(),
                                            packedRecvX.data_ptr(), handle.standardPackedRecvCount,
-                                           packedRecvSrcInfo.data_ptr<int>(),
-                                           packedRecvLayoutRange.data_ptr<int64_t>(), blockNum,
+                                           packedRecvSrcInfo.data_ptr<int>(), nullptr, blockNum,
                                            warpPerBlock, at::cuda::getCurrentHIPStream());
 
   torch::Tensor packedRecvCount =
@@ -287,44 +286,39 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> ConvertDi
 torch::Tensor ConvertCombineInput(mori::moe::EpDispatchCombineHandle& handle,
                                   const torch::Tensor& packedRecvX,
                                   const torch::Tensor& packedRecvSrcInfo,
-                                  const torch::Tensor& packedRecvLayoutRange,
-                                  int blockNum = -1, int warpPerBlock = -1) {
-  TORCH_CHECK(packedRecvX.is_cuda() && packedRecvSrcInfo.is_cuda() &&
-                  packedRecvLayoutRange.is_cuda(),
-              "packedRecvX/packedRecvSrcInfo/packedRecvLayoutRange must be CUDA tensors");
-  TORCH_CHECK(packedRecvX.dim() == 3 && packedRecvSrcInfo.dim() == 2 &&
-                  packedRecvLayoutRange.dim() == 2,
-              "packedRecvX must be 3D; others must be 2D");
+                                  const torch::Tensor& packedRecvLayoutRange, int blockNum = -1,
+                                  int warpPerBlock = -1) {
+  TORCH_CHECK(packedRecvX.is_cuda() && packedRecvSrcInfo.is_cuda(),
+              "packedRecvX/packedRecvSrcInfo must be CUDA tensors");
+  TORCH_CHECK(packedRecvX.dim() == 3 && packedRecvSrcInfo.dim() == 2,
+              "packedRecvX must be 3D; packedRecvSrcInfo must be 2D");
 
   const int64_t numLocalExperts = handle.config.numExpertPerRank;
-  const int64_t numRanks = handle.config.worldSize;
   const int64_t maxTokensPerExpert =
       static_cast<int64_t>(handle.config.worldSize) * handle.config.maxNumInpTokenPerRank;
   const int64_t hidden = packedRecvX.size(2);
-  TORCH_CHECK(packedRecvX.size(0) == numLocalExperts &&
-                  packedRecvSrcInfo.size(0) == numLocalExperts &&
-                  packedRecvLayoutRange.size(0) == numLocalExperts,
-              "local expert dimension mismatch");
-  TORCH_CHECK(packedRecvX.size(1) == maxTokensPerExpert &&
-                  packedRecvSrcInfo.size(1) == maxTokensPerExpert &&
-                  packedRecvLayoutRange.size(1) == numRanks,
-              "token/rank dimension mismatch");
-
-  // totalTokens comes from handle.totalRecvTokenNum inside the kernel
+  TORCH_CHECK(
+      packedRecvX.size(0) == numLocalExperts && packedRecvSrcInfo.size(0) == numLocalExperts,
+      "local expert dimension mismatch");
+  TORCH_CHECK(
+      packedRecvX.size(1) == maxTokensPerExpert && packedRecvSrcInfo.size(1) == maxTokensPerExpert,
+      "token dimension mismatch");
 
   auto options = packedRecvX.options();
-  // torch::Tensor combineInput = torch::empty({handle.config.MaxNumTokensToRecv(), hidden}, options);
+  // torch::Tensor combineInput = torch::empty({handle.config.MaxNumTokensToRecv(), hidden},
+  // options);
   torch::Tensor combineInput =
       torch::from_blob(handle.shmemCombineInpTokMemObj->Get(),
                        {handle.config.MaxNumTokensToRecv(), hidden}, options);
 
+  // Note: packedRecvLayoutRange is not used in current implementation (passed as nullptr)
   handle.LaunchConvertCombineInputKernel(
-      packedRecvX.data_ptr(), packedRecvSrcInfo.data_ptr(), packedRecvLayoutRange.data_ptr(),
-      combineInput.data_ptr(), handle.shmemCombineInpTokMemObj, blockNum, warpPerBlock,
-      at::cuda::getCurrentHIPStream());
+      packedRecvX.data_ptr(), packedRecvSrcInfo.data_ptr(), nullptr, combineInput.data_ptr(),
+      handle.shmemCombineInpTokMemObj, blockNum, warpPerBlock, at::cuda::getCurrentHIPStream());
 
   return combineInput;
 }
+#endif  // ENABLE_STANDARD_MOE_ADAPT
 
 void LaunchReset(mori::moe::EpDispatchCombineHandle& handle) {
   handle.LaunchReset(at::cuda::getCurrentHIPStream());
@@ -397,17 +391,21 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   funcName = std::string("launch_combine");
   m.def(funcName.c_str(), &LaunchCombine);
 
+#ifdef ENABLE_STANDARD_MOE_ADAPT
   funcName = std::string("launch_dispatch_standard_moe");
   m.def(funcName.c_str(), &LaunchDispatchForStandardMoE);
 
   funcName = std::string("launch_combine_standard_moe");
   m.def(funcName.c_str(), &LaunchCombineForStandardMoE);
+#endif
 
+#ifdef ENABLE_STANDARD_MOE_ADAPT
   funcName = std::string("convert_dispatch_output");
   m.def(funcName.c_str(), &ConvertDispatchOutput);
 
   funcName = std::string("convert_combine_input");
   m.def(funcName.c_str(), &ConvertCombineInput);
+#endif
 
   funcName = std::string("launch_reset");
   m.def(funcName.c_str(), &LaunchReset);

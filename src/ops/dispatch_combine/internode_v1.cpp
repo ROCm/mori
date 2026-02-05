@@ -1276,93 +1276,61 @@ __global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> ar
 /* ---------------------------------------------------------------------------------------------- */
 /*                                     Template Specialization                                    */
 /* ---------------------------------------------------------------------------------------------- */
-template __global__ void EpDispatchInterNodeV1Kernel<hip_bfloat16>(
-    EpDispatchCombineArgs<hip_bfloat16> args);
-#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-template __global__ void EpDispatchInterNodeV1Kernel<__hip_fp8_e4m3_fnuz>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
-#endif
-#ifdef MORI_FP8_TYPE_OCP_ENABLED
-template __global__ void EpDispatchInterNodeV1Kernel<__hip_fp8_e4m3>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
-#endif
-template __global__ void EpDispatchInterNodeV1Kernel<float>(EpDispatchCombineArgs<float> args);
 
-template __global__ void EpDispatchInterNodeV1KernelLowLatency<hip_bfloat16, false>(
-    EpDispatchCombineArgs<hip_bfloat16> args);
-template __global__ void EpDispatchInterNodeV1KernelLowLatency<hip_bfloat16, true>(
-    EpDispatchCombineArgs<hip_bfloat16> args);
+// Helper macros for conditional FP8 compilation
 #ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-template __global__ void EpDispatchInterNodeV1KernelLowLatency<__hip_fp8_e4m3_fnuz, false>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
-template __global__ void EpDispatchInterNodeV1KernelLowLatency<__hip_fp8_e4m3_fnuz, true>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
+#define MORI_FP8_FNUZ(...) __VA_ARGS__
+#else
+#define MORI_FP8_FNUZ(...)
 #endif
-#ifdef MORI_FP8_TYPE_OCP_ENABLED
-template __global__ void EpDispatchInterNodeV1KernelLowLatency<__hip_fp8_e4m3, false>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
-template __global__ void EpDispatchInterNodeV1KernelLowLatency<__hip_fp8_e4m3, true>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
-#endif
-template __global__ void EpDispatchInterNodeV1KernelLowLatency<float, false>(
-    EpDispatchCombineArgs<float> args);
-template __global__ void EpDispatchInterNodeV1KernelLowLatency<float, true>(
-    EpDispatchCombineArgs<float> args);
 
-template __global__ void EpCombineInterNodeV1Kernel<hip_bfloat16>(
-    EpDispatchCombineArgs<hip_bfloat16> args);
-#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-template __global__ void EpCombineInterNodeV1Kernel<__hip_fp8_e4m3_fnuz>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
-#endif
 #ifdef MORI_FP8_TYPE_OCP_ENABLED
-template __global__ void EpCombineInterNodeV1Kernel<__hip_fp8_e4m3>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
+#define MORI_FP8_OCP(...) __VA_ARGS__
+#else
+#define MORI_FP8_OCP(...)
 #endif
-template __global__ void EpCombineInterNodeV1Kernel<float>(EpDispatchCombineArgs<float> args);
 
-template __global__ void EpCombineInterNodeV1KernelLowLatency<hip_bfloat16, false>(
-    EpDispatchCombineArgs<hip_bfloat16> args);
-template __global__ void EpCombineInterNodeV1KernelLowLatency<hip_bfloat16, true>(
-    EpDispatchCombineArgs<hip_bfloat16> args);
-#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-template __global__ void EpCombineInterNodeV1KernelLowLatency<__hip_fp8_e4m3_fnuz, false>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
-template __global__ void EpCombineInterNodeV1KernelLowLatency<__hip_fp8_e4m3_fnuz, true>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
-#endif
-#ifdef MORI_FP8_TYPE_OCP_ENABLED
-template __global__ void EpCombineInterNodeV1KernelLowLatency<__hip_fp8_e4m3, false>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
-template __global__ void EpCombineInterNodeV1KernelLowLatency<__hip_fp8_e4m3, true>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
-#endif
-template __global__ void EpCombineInterNodeV1KernelLowLatency<float, false>(
-    EpDispatchCombineArgs<float> args);
-template __global__ void EpCombineInterNodeV1KernelLowLatency<float, true>(
-    EpDispatchCombineArgs<float> args);
+// Macro to instantiate a kernel for all data types
+#define INSTANTIATE_KERNEL(KernelName)                                                             \
+  template __global__ void KernelName<hip_bfloat16>(EpDispatchCombineArgs<hip_bfloat16> args);     \
+  MORI_FP8_FNUZ(template __global__ void KernelName<__hip_fp8_e4m3_fnuz>(                          \
+      EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)                                           \
+  MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3>(                                \
+      EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                                                \
+  template __global__ void KernelName<float>(EpDispatchCombineArgs<float> args);
 
-template __global__ void EpCombineAll<hip_bfloat16>(EpDispatchCombineArgs<hip_bfloat16> args);
-#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-template __global__ void EpCombineAll<__hip_fp8_e4m3_fnuz>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
-#endif
-#ifdef MORI_FP8_TYPE_OCP_ENABLED
-template __global__ void EpCombineAll<__hip_fp8_e4m3>(EpDispatchCombineArgs<__hip_fp8_e4m3> args);
-#endif
-template __global__ void EpCombineAll<float>(EpDispatchCombineArgs<float> args);
+// Macro to instantiate a kernel with EnableStdMoE parameter for all data types
+#define INSTANTIATE_LL_KERNEL(KernelName, StdMoE)                                              \
+  template __global__ void KernelName<hip_bfloat16, StdMoE>(                                       \
+      EpDispatchCombineArgs<hip_bfloat16> args);                                                   \
+  MORI_FP8_FNUZ(template __global__ void KernelName<__hip_fp8_e4m3_fnuz, StdMoE>(                  \
+      EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)                                           \
+  MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3, StdMoE>(                        \
+      EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                                                \
+  template __global__ void KernelName<float, StdMoE>(EpDispatchCombineArgs<float> args);
 
-template __global__ void EpDispatchCopyToStaging<hip_bfloat16>(
-    EpDispatchCombineArgs<hip_bfloat16> args);
-#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-template __global__ void EpDispatchCopyToStaging<__hip_fp8_e4m3_fnuz>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
+// Combined macro for kernels with EnableStdMoE template parameter
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+#define INSTANTIATE_LL_KERNEL_WITH_STDMOE(KernelName)                                                 \
+  INSTANTIATE_LL_KERNEL(KernelName, false)                                                     \
+  INSTANTIATE_LL_KERNEL(KernelName, true)
+#else
+#define INSTANTIATE_LL_KERNEL_WITH_STDMOE(KernelName)                                                 \
+  INSTANTIATE_LL_KERNEL(KernelName, false)
 #endif
-#ifdef MORI_FP8_TYPE_OCP_ENABLED
-template __global__ void EpDispatchCopyToStaging<__hip_fp8_e4m3>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
-#endif
-template __global__ void EpDispatchCopyToStaging<float>(EpDispatchCombineArgs<float> args);
+
+INSTANTIATE_KERNEL(EpDispatchInterNodeV1Kernel)
+INSTANTIATE_KERNEL(EpCombineInterNodeV1Kernel)
+INSTANTIATE_KERNEL(EpCombineAll)
+INSTANTIATE_KERNEL(EpDispatchCopyToStaging)
+INSTANTIATE_LL_KERNEL_WITH_STDMOE(EpDispatchInterNodeV1KernelLowLatency)
+INSTANTIATE_LL_KERNEL_WITH_STDMOE(EpCombineInterNodeV1KernelLowLatency)
+
+#undef MORI_FP8_FNUZ
+#undef MORI_FP8_OCP
+#undef INSTANTIATE_KERNEL
+#undef INSTANTIATE_LL_KERNEL
+#undef INSTANTIATE_LL_KERNEL_WITH_STDMOE
 
 }  // namespace moe
 }  // namespace mori
