@@ -79,7 +79,7 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes,
     shmem::ShmemQuietThread(remotePe, dstMemObj);
     #if 1
     if (threadLinearId < npes) {
-      flags[threadLinearId] = 0;
+      //flags[threadLinearId] = 0;
     }
     __syncthreads();
     #endif

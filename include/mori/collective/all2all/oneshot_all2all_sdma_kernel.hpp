@@ -88,7 +88,7 @@ __global__ void OneShotAll2allSdmaKernel(int myPe, int npes,
         int targetPe = threadLinearId;
         shmem::ShmemQuietThread(targetPe, outputTransitMemObj);
         if (threadLinearId < npes) {
-          flags[threadLinearId] = 0;
+          //flags[threadLinearId] = 0;
         }
         __syncthreads();
         shmem::ShmemAtomicSizeNonFetchThread(flagsMemObj, 
