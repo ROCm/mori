@@ -247,14 +247,31 @@ class EpDispatchCombineOp:
         scales: torch.Tensor,
         indices: torch.Tensor,
         block_num: int = -1,
+        rdma_block_num: int = -1,
         warp_per_block: int = -1,
     ):
-        """DeepEP compatibility: dispatch + convert in one launch."""
+        """DeepEP compatibility: dispatch + convert in one launch.
+
+        Args:
+            input: Input token tensor.
+            weights: Token weights for each expert.
+            scales: Quantization scales (optional).
+            indices: Top-k expert indices.
+            block_num: Override config.block_num if > 0.
+            rdma_block_num: Override config.rdma_block_num if > 0 (unused in current impl).
+            warp_per_block: Override config.warp_num_per_block if > 0.
+        """
         if self._dispatch_standard_moe_func is None:
             raise RuntimeError(
                 "dispatch_standard_moe is not available. "
                 "Rebuild with ENABLE_STANDARD_MOE_ADAPT=ON."
             )
+        block_num, rdma_block_num, warp_per_block = self.get_launch_config(
+            is_dispatch=True,
+            block_num=block_num,
+            rdma_block_num=rdma_block_num,
+            warp_per_block=warp_per_block,
+        )
         return self._dispatch_standard_moe_func(
             self._handle,
             self.config.kernel_type.value,
@@ -272,15 +289,32 @@ class EpDispatchCombineOp:
         weights: torch.Tensor,
         indices: torch.Tensor,
         block_num: int = -1,
+        rdma_block_num: int = -1,
         warp_per_block: int = -1,
         call_reset: bool = False,
     ):
-        """DeepEP compatibility: combine with standard MoE inputs (no extra convert)."""
+        """DeepEP compatibility: combine with standard MoE inputs (no extra convert).
+
+        Args:
+            input: Expert output tensor.
+            weights: Token weights for weighted combination.
+            indices: Top-k expert indices.
+            block_num: Override config.block_num if > 0.
+            rdma_block_num: Override config.rdma_block_num if > 0 (unused in current impl).
+            warp_per_block: Override config.warp_num_per_block if > 0.
+            call_reset: Whether to call reset after combine.
+        """
         if self._combine_standard_moe_func is None:
             raise RuntimeError(
                 "combine_standard_moe is not available. "
                 "Rebuild with ENABLE_STANDARD_MOE_ADAPT=ON."
             )
+        block_num, rdma_block_num, warp_per_block = self.get_launch_config(
+            is_dispatch=False,
+            block_num=block_num,
+            rdma_block_num=rdma_block_num,
+            warp_per_block=warp_per_block,
+        )
         output = self._combine_standard_moe_func(
             self._handle,
             self.config.kernel_type.value,

@@ -292,13 +292,15 @@ void EpDispatchCombineHandle::LaunchInterNodeDispatch(int blockNum, int rdmaBloc
 }
 
 void EpDispatchCombineHandle::LaunchIntraNodeCombine(int blockNum, int rdmaBlockNum,
-                                                     int warpPerBlock, hipStream_t stream) {
-  LaunchCombine(KernelType::IntraNode, blockNum, rdmaBlockNum, warpPerBlock, stream);
+                                                     int warpPerBlock, int useExternalInpBuf,
+                                                     hipStream_t stream) {
+  LaunchCombine(KernelType::IntraNode, blockNum, rdmaBlockNum, warpPerBlock, useExternalInpBuf, stream);
 }
 
 void EpDispatchCombineHandle::LaunchInterNodeCombine(int blockNum, int rdmaBlockNum,
-                                                     int warpPerBlock, hipStream_t stream) {
-  LaunchCombine(KernelType::InterNode, blockNum, rdmaBlockNum, warpPerBlock, stream);
+                                                     int warpPerBlock, int useExternalInpBuf,
+                                                     hipStream_t stream) {
+  LaunchCombine(KernelType::InterNode, blockNum, rdmaBlockNum, warpPerBlock, useExternalInpBuf, stream);
 }
 
 void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum, int rdmaBlockNum,
