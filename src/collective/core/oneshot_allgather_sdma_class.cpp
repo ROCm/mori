@@ -148,7 +148,7 @@ bool AllgatherSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
     try {
         // Step 1: Copy input data to input transit buffer
         printf("PE %d: Starting async AllGATHER (PUT phase)\n", myPe_);
-        copy_input_to_transit(input, total_count, stream);
+        //copy_input_to_transit(input, total_count, stream);
 
         // Step 2: Reset flags
         //resetFlags();

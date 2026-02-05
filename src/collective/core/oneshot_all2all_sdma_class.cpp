@@ -148,7 +148,7 @@ bool All2allSdma<T>::start_async(T* input, T* output, size_t total_count, hipStr
     try {
         // Step 1: Copy input data to input transit buffer
         printf("PE %d: Starting async All2All (PUT phase)\n", myPe_);
-        copy_input_to_transit(input, total_count * npes_, stream);
+        //copy_input_to_transit(input, total_count * npes_, stream);
 
         // Step 2: Reset flags
         //resetFlags();
@@ -414,7 +414,7 @@ double All2allSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
     hipError_t sync_err = hipSuccess;
     try {
         // Step 1: Copy input data to input transit buffer
-        copy_input_to_transit(input, total_count * npes_, stream);
+        //copy_input_to_transit(input, total_count * npes_, stream);
 
         // Step 2: Reset flags
         //resetFlags();
