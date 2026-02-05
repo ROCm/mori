@@ -694,22 +694,22 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
   int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, totalRecvTokenNum);
   for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
     if (useInternalFp8) {
-#if (defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ == 1) || \
-    (defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1)
-      core::CombineInternalFp8T* dstTok =
-          args.shmemCombineInpTokMemObj->template GetAs<core::CombineInternalFp8T*>() +
-          tokenId * config.hiddenDim;
-      float* dstScales =
-          args.shmemInpScalesMemObj->template GetAs<float*>() + tokenId * config.scaleDim;
-      const T* srcTok = args.inpTokenBuf + tokenId * config.hiddenDim;
+      // #if (defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ == 1) || \
+//     (defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1)
+      //       core::CombineInternalFp8T* dstTok =
+      //           args.shmemCombineInpTokMemObj->template GetAs<core::CombineInternalFp8T*>() +
+      //           tokenId * config.hiddenDim;
+      //       float* dstScales =
+      //           args.shmemInpScalesMemObj->template GetAs<float*>() + tokenId * config.scaleDim;
+      //       const T* srcTok = args.inpTokenBuf + tokenId * config.hiddenDim;
 
-      core::WarpQuantizeToFp8Blockwise<core::CombineInternalFp8T, T>(
-          dstTok, dstScales, srcTok, config.hiddenDim, config.scaleDim);
-#else
+      //       core::WarpQuantizeToFp8Blockwise<core::CombineInternalFp8T, T>(
+      //           dstTok, dstScales, srcTok, config.hiddenDim, config.scaleDim);
+      // #else
       core::WarpCopy(
           args.shmemCombineInpTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim,
           args.inpTokenBuf + tokenId * config.hiddenDim, config.hiddenDim);
-#endif
+      // #endif
     } else {
       core::WarpCopy(
           args.shmemCombineInpTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim,
@@ -873,10 +873,11 @@ inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
       const core::CombineInternalFp8T* const* srcFp8Ptrs =
           reinterpret_cast<const core::CombineInternalFp8T* const*>(srcPtrs);
       const float* const* srcScalePtrs = reinterpret_cast<const float* const*>(srcScalesPtr);
-      core::WarpAccumFp8DequantSegment<T, core::CombineInternalFp8T>(
-          reinterpret_cast<T*>(stagingPtr + tokenId * combXferBytes) + hiddenDimOffset, srcFp8Ptrs,
-          srcScalePtrs, config.numExpertPerToken, hiddenDimOffset, hiddenDimSize, config.hiddenDim,
-          config.scaleDim);
+      core::WarpAccumFp8DequantSegment<core::CombineInternalFp8T, core::CombineInternalFp8T>(
+          reinterpret_cast<core::CombineInternalFp8T*>(stagingPtr + tokenId * combXferBytes) +
+              hiddenDimOffset,
+          srcFp8Ptrs, srcScalePtrs, config.numExpertPerToken, hiddenDimOffset, hiddenDimSize,
+          config.hiddenDim, config.scaleDim);
 #endif
     } else {
       core::WarpAccum<T, 4>(
@@ -1181,8 +1182,10 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
           const core::CombineInternalFp8T* const* srcFp8Ptrs =
               reinterpret_cast<const core::CombineInternalFp8T* const*>(srcPtrs);
           const float* const* srcScalePtrs = reinterpret_cast<const float* const*>(srcScalesPtr);
-          core::WarpAccumFp8DequantSegment<T, core::CombineInternalFp8T>(
-              reinterpret_cast<T*>(stagingPtr + globalTokenId * combXferBytes) + hiddenDimOffset,
+          core::WarpAccumFp8DequantSegment<core::CombineInternalFp8T, core::CombineInternalFp8T>(
+              reinterpret_cast<core::CombineInternalFp8T*>(stagingPtr +
+                                                           globalTokenId * combXferBytes) +
+                  hiddenDimOffset,
               srcFp8Ptrs, srcScalePtrs, config.numExpertPerToken, hiddenDimOffset, hiddenDimSize,
               config.hiddenDim, config.scaleDim);
 #endif
@@ -1218,7 +1221,7 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
                 combXferBytes,
             args.shmemStagingTokMemObj,
             (node * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * combXferBytes,
-            thisChunkTokenNum * combXferBytes, proxyPe, qpId);
+            thisChunkTokenNum * combXferBytes / 2, proxyPe, qpId);
       }
     }
   }

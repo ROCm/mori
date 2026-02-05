@@ -65,11 +65,11 @@ class EpDispatchCombineTestCase:
             num_experts_per_rank=16,
             num_experts_per_token=8,
             warp_num_per_block=8,
-            block_num=64,
+            block_num=96,
             max_token_type_size=2,
             kernel_type=kernel_type_map[kernel_type],
             gpu_per_node=self.gpu_per_node,
-            rdma_block_num=32,
+            rdma_block_num=64,
             num_qp_per_pe=num_qp,
             enable_internal_fp8_quant=enable_internal_fp8_quant,
         )
@@ -220,7 +220,7 @@ class EpDispatchCombineTestCase:
                     generator=self.rng,
                     device=self.device,
                 ).to(self.config.data_type)
-                * self.input_scale
+                # * self.input_scale
             )
 
         return (
@@ -990,7 +990,7 @@ def test_dispatch_combine(
             kernel_type,
             num_qp,
             torch.bfloat16,
-            # torch.float8_e4m3fnuz,
+            # torch.float8_e4m3fn,
             enable_internal_fp8_quant,
             input_scale,
         )
