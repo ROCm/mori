@@ -357,7 +357,7 @@ void EpDispatchCombineHandle::LaunchDispatchRecv(KernelType kernelType, int bloc
       (config.worldSize * actualWarpNumPerBlock + config.numExpertPerRank * actualWarpNumPerBlock +
        config.numExpertPerRank) *
       sizeof(index_t);
-  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this, 0);
   std::visit(
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;
@@ -373,7 +373,8 @@ void EpDispatchCombineHandle::LaunchDispatchRecv(KernelType kernelType, int bloc
       argsVariant);
 }
 void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum, int rdmaBlockNum,
-                                            int warpPerBlock, int useExternalInpBuf,hipStream_t stream) {
+                                            int warpPerBlock, int useExternalInpBuf,
+                                            hipStream_t stream) {
   // Determine actual values: use parameter if >= 0, otherwise use config
   const size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
   const size_t actualRdmaBlockNum = (rdmaBlockNum <= 0) ? config.rdmaBlockNum : rdmaBlockNum;
@@ -418,6 +419,7 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
             EpCombineIntraNodeKernel<DataT, /*UseP2PRead=*/true>
                 <<<grid, block, sharedMemSize, stream>>>(args);
           }
+#endif  // ENABLE_STANDARD_MOE_ADAPT
         } else if (kernelType == KernelType::AsyncLL) {
           assert(config.useExternalInpBuffer);
           EpCombineLowLatencyAsyncSend<<<grid, block, sharedMemSize, stream>>>(args);
@@ -439,7 +441,7 @@ void EpDispatchCombineHandle::LaunchCombineRecv(KernelType kernelType, int block
       (config.worldSize * actualWarpNumPerBlock + config.numExpertPerRank * actualWarpNumPerBlock +
        config.numExpertPerRank) *
       sizeof(index_t);
-  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this, 0);
   std::visit(
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;

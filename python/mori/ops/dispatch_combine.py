@@ -22,7 +22,6 @@
 from mori import cpp as mori_cpp
 import os
 from dataclasses import dataclass
-from typing import Optional
 import torch
 import torch.distributed as dist
 
@@ -221,6 +220,12 @@ class EpDispatchCombineOp:
         block_num: int = -1,
         warp_per_block: int = -1,
     ):
+        block_num, _, warp_per_block = self.get_launch_config(
+            is_dispatch=False,
+            block_num=block_num,
+            rdma_block_num=-1,
+            warp_per_block=warp_per_block,
+        )
         return self._dispatch_recv_func(
             self._handle,
             self.config.kernel_type.value,
@@ -272,6 +277,40 @@ class EpDispatchCombineOp:
         if call_reset:
             self._reset_func(self._handle)
         return output
+
+    def combine_send(
+        self,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        return self.combine(
+            input,
+            weights,
+            indices,
+            block_num,
+            warp_per_block,
+        )
+
+    def combine_recv(
+        self,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        block_num, _, warp_per_block = self.get_launch_config(
+            is_dispatch=False,
+            block_num=block_num,
+            rdma_block_num=-1,
+            warp_per_block=warp_per_block,
+        )
+        return self._combine_recv_func(
+            self._handle,
+            self.config.kernel_type.value,
+            block_num,
+            warp_per_block,
+        )
 
     def dispatch_standard_moe(
         self,
@@ -418,18 +457,6 @@ class EpDispatchCombineOp:
             packed_recv_x,
             packed_recv_src_info,
             packed_recv_layout_range,
-            block_num,
-            warp_per_block,
-        )
-
-    def combine_recv(
-        self,
-        block_num: int = -1,
-        warp_per_block: int = -1,
-    ):
-        return self._combine_recv_func(
-            self._handle,
-            self.config.kernel_type.value,
             block_num,
             warp_per_block,
         )
