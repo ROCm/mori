@@ -280,6 +280,7 @@ class EpDispatchCombineOp:
             scales,
             indices,
             block_num,
+            rdma_block_num,
             warp_per_block,
         )
 
@@ -322,6 +323,7 @@ class EpDispatchCombineOp:
             weights,
             indices,
             block_num,
+            rdma_block_num,
             warp_per_block,
         )
         if call_reset:

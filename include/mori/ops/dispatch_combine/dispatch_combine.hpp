@@ -176,10 +176,10 @@ class EpDispatchCombineHandle {
                      int useExternalInpBuf = -1, hipStream_t = 0);
 
 #ifdef ENABLE_STANDARD_MOE_ADAPT
-  void LaunchDispatchForStandardMoE(KernelType, int blockNum = -1, int warpPerBlock = -1,
-                                    hipStream_t = 0);
-  void LaunchCombineForStandardMoE(KernelType, int blockNum = -1, int warpPerBlock = -1,
-                                   hipStream_t = 0);
+  void LaunchDispatchForStandardMoE(KernelType, int blockNum = -1, int rdmaBlockNum = -1,
+                                    int warpPerBlock = -1, hipStream_t = 0);
+  void LaunchCombineForStandardMoE(KernelType, int blockNum = -1, int rdmaBlockNum = -1,
+                                   int warpPerBlock = -1, hipStream_t = 0);
 
   void LaunchConvertDispatchOutputKernel(const void* dispatchOutX, const void* dispatchOutTopkIdx,
                                          void* packedRecvX,

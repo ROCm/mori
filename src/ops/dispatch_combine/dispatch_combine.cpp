@@ -395,8 +395,10 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
 
 #ifdef ENABLE_STANDARD_MOE_ADAPT
 void EpDispatchCombineHandle::LaunchDispatchForStandardMoE(KernelType kernelType, int blockNum,
-                                                           int warpPerBlock, hipStream_t stream) {
+                                                           int rdmaBlockNum, int warpPerBlock,
+                                                           hipStream_t stream) {
   size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
+  size_t actualRdmaBlockNum = (rdmaBlockNum <= 0) ? config.rdmaBlockNum : rdmaBlockNum;
   dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
   dim3 block(warpSize * actualWarpNumPerBlock);
 
@@ -404,7 +406,7 @@ void EpDispatchCombineHandle::LaunchDispatchForStandardMoE(KernelType kernelType
       (config.worldSize * actualWarpNumPerBlock + config.numExpertPerRank * actualWarpNumPerBlock +
        config.numExpertPerRank) *
       sizeof(index_t);
-  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this, actualRdmaBlockNum);
   std::visit(
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;
@@ -426,7 +428,8 @@ void EpDispatchCombineHandle::LaunchDispatchForStandardMoE(KernelType kernelType
 }
 
 void EpDispatchCombineHandle::LaunchCombineForStandardMoE(KernelType kernelType, int blockNum,
-                                                          int warpPerBlock, hipStream_t stream) {
+                                                          int rdmaBlockNum, int warpPerBlock,
+                                                          hipStream_t stream) {
   size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
   size_t actualRdmaBlockNum = (rdmaBlockNum <= 0) ? config.rdmaBlockNum : rdmaBlockNum;
   dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);

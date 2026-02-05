@@ -147,7 +147,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> LaunchDispatchForStandardMoE(
     mori::moe::EpDispatchCombineHandle& handle, int kernelType, const torch::Tensor& input,
     const std::optional<torch::Tensor>& weights, const std::optional<torch::Tensor>& scales,
-    const torch::Tensor& topkIds, int blockNum = -1, int warpPerBlock = -1) {
+    const torch::Tensor& topkIds, int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1) {
   assert(input.is_contiguous() && topkIds.is_contiguous());
 
   float* weightPtr = nullptr;
@@ -181,8 +181,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> LaunchDis
   handle.SetStandardMoeOutputBuffers(packedRecvX.data_ptr(), handle.standardPackedRecvCount,
                                      packedRecvSrcInfo.data_ptr<int>(), nullptr);
 
-  handle.LaunchDispatchForStandardMoE((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
-                                      at::cuda::getCurrentHIPStream());
+  handle.LaunchDispatchForStandardMoE((mori::moe::KernelType)kernelType, blockNum, rdmaBlockNum,
+                                      warpPerBlock, at::cuda::getCurrentHIPStream());
 
   torch::Tensor packedRecvCount =
       torch::from_blob(handle.standardPackedRecvCount, {numLocalExperts},
@@ -199,7 +199,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombineForStandard
     const torch::Tensor& expertOutput,  // [numLocalExperts, maxTokensPerExpert, hidden]
     const std::optional<torch::Tensor>& weights,
     const torch::Tensor& topkIds,
-    int blockNum = -1, int warpPerBlock = -1) {
+    int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1) {
   assert(expertOutput.is_contiguous() && topkIds.is_contiguous());
 
   float* weightsPtr = nullptr;
@@ -224,8 +224,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombineForStandard
       handle.standardPackedRecvLayoutRange);
 
   // Launch combine for standard MoE
-  handle.LaunchCombineForStandardMoE((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
-                                     at::cuda::getCurrentHIPStream());
+  handle.LaunchCombineForStandardMoE((mori::moe::KernelType)kernelType, blockNum, rdmaBlockNum,
+                                     warpPerBlock, at::cuda::getCurrentHIPStream());
 
   // Get output tensor from shmem buffer
   auto options = torch::TensorOptions().dtype(expertOutput.scalar_type()).device(torch::kCUDA);
