@@ -25,6 +25,7 @@ option(USE_ROCM "Whether to use rocm" ON)
 option(USE_BNXT "Whether to use BNXT NIC" OFF)
 option(USE_IONIC "Whether to use IONIC" OFF)
 option(USE_TORCH "Whether to use torch" OFF)
+option(USE_MPI "Whether to use torch" OFF)
 option(BUILD_EXAMPLES "Whether to build examples" ON)
 option(BUILD_APPLICATION "Whether to build application library" ON)
 option(BUILD_SHMEM "Whether to build shmem library" ON)
@@ -49,6 +50,10 @@ endif()
 message(STATUS "USE_BNXT = ${USE_BNXT}")
 if(USE_BNXT)
   add_compile_definitions(ENABLE_BNXT)
+endif()
+
+if(USE_MPI)
+  add_compile_definitions(MORI_ENABLE_MPI)
 endif()
 
 find_library(

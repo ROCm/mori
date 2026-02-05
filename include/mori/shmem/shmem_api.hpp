@@ -21,7 +21,9 @@
 // SOFTWARE.
 #pragma once
 
+#ifdef MORI_ENABLE_MPI
 #include <mpi.h>
+#endif
 
 #include <array>
 #include <cstddef>
@@ -51,8 +53,10 @@ constexpr unsigned int MORI_SHMEM_INIT_WITH_UNIQUEID = 1;
 
 // TODO: provide unified initialize / finalize APIs
 int ShmemInit(application::BootstrapNetwork* bootNet);
+#ifdef MORI_ENABLE_MPI
 int ShmemInit();  // Default initialization using MPI_COMM_WORLD
 int ShmemMpiInit(MPI_Comm);
+#endif
 int ShmemTorchProcessGroupInit(const std::string& groupName);
 
 // UniqueId-based initialization APIs (nvshmem/rocshmem compatible)
@@ -92,8 +96,10 @@ void* ShmemMallocAlign(size_t alignment, size_t size);
 void* ShmemExtMallocWithFlags(size_t size, unsigned int flags);
 void ShmemFree(void*);
 
+#ifdef __HIP_DEVICE_COMPILE__
 // Note: temporary API for testing
 application::SymmMemObjPtr ShmemQueryMemObjPtr(void*);
+#endif // __HIP_DEVICE_COMPILE__
 
 int ShmemBufferRegister(void* ptr, size_t size);
 int ShmemBufferDeregister(void* ptr, size_t size);

@@ -1,4 +1,6 @@
-find_package(MPI REQUIRED)
+if (USE_MPI)
+  find_package(MPI REQUIRED)
+endif()
 
 option(BUILD_SHMEM_DEVICE_WRAPPER "Build SHMEM device API wrapper" OFF)
 
@@ -14,11 +16,18 @@ target_link_libraries(
   mori_shmem
   mori_application
   mori_logging
-  MPI::MPI_CXX
   ibverbs
   hip::host
   hip::device
   mlx5)
+
+if(USE_MPI)
+  target_link_libraries(
+    mori_shmem
+    mori_application
+    mori_logging
+    MPI::MPI_CXX)
+endif()
 
 # Use code object version 5 for compatibility with Triton
 target_compile_options(mori_shmem PUBLIC "-fgpu-rdc" "-mcode-object-version=5")

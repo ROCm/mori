@@ -21,7 +21,9 @@
 // SOFTWARE.
 #pragma once
 
+#ifdef __HIP_DEVICE_COMPILE__
 #include "mori/application/transport/p2p/p2p.hpp"
+#endif // __HIP_DEVICE_COMPILE__
 #include "mori/application/transport/rdma/rdma.hpp"
 
 namespace mori {
