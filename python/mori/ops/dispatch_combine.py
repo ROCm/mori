@@ -152,7 +152,7 @@ class EpDispatchCombineOp:
             ):
                 block_num, rdma_block_num, warp_per_block = 96, 64, 8
             else:
-                block_num, rdma_block_num, warp_per_block = 128, 0, 16
+                block_num, rdma_block_num, warp_per_block = 80, 0, 16
         else:
             raise ValueError(
                 f"invalid MORI_EP_LAUNCH_CONFIG_MODE, must be ['MANUAL', 'AUTO'], got '{launch_config_mode}'"
