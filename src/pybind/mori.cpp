@@ -124,7 +124,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
                           nullptr, weightsPtr, topkIds.data_ptr<mori::moe::index_t>(),
                           handle.curRankNumToken);
   handle.LaunchCombine((mori::moe::KernelType)kernelType, blockNum, rdmaBlockNum, warpPerBlock,
-                       at::cuda::getCurrentHIPStream(), useExternalInpBuf);
+                       useExternalInpBuf, at::cuda::getCurrentHIPStream());
 
   auto options = torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA);
   torch::Tensor out =

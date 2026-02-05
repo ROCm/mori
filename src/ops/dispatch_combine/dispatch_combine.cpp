@@ -337,16 +337,17 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
 }
 
 void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum, int rdmaBlockNum,
-                                            int warpPerBlock, hipStream_t stream) {
-  size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
+                                            int warpPerBlock, int useExternalInpBuf,
+                                            hipStream_t stream) {
+  // Determine actual values: use parameter if >= 0, otherwise use config
+  const size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
+  const size_t actualRdmaBlockNum = (rdmaBlockNum <= 0) ? config.rdmaBlockNum : rdmaBlockNum;
+  const bool actualUseExternalInpBuffer =
+      (useExternalInpBuf >= 0) ? static_cast<bool>(useExternalInpBuf) : config.useExternalInpBuffer;
   dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
   dim3 block(warpSize * actualWarpNumPerBlock);
 
-  // Determine useExternalInpBuffer: use parameter if >= 0, otherwise use config
-  const bool actualUseExternalInpBuffer =
-      (useExternalInpBuf >= 0) ? static_cast<bool>(useExternalInpBuf) : config.useExternalInpBuffer;
-
-  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this, actualRdmaBlockNum);
   std::visit(
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;
