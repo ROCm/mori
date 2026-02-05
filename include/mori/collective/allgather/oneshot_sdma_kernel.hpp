@@ -64,7 +64,6 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes,
     size_t srcByteOffset = 0;
     size_t sendBytes = bytesPerPeer;
     #if 1
-    if (laneId == 0) printf(" new no copy !!!!!!!!!!!!!!!!!!!\n");
     application::SymmMemObjPtr dest = dstMemObj;
     uint8_t* srcPtr = reinterpret_cast<uint8_t *>(inputData) + srcByteOffset;
     uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + destByteOffset;
