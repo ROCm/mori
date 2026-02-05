@@ -132,32 +132,36 @@ class EpDispatchCombineOp:
             "convert_combine_input", allow_missing=True
         )
 
-    def get_registered_combine_input_buffer(self, dtype: torch.dtype):
-        return self._get_registered_combine_input_buffer(self._handle, dtype)
-
-    def get_launch_config(self, is_dispatch, block_num, rdma_block_num, warp_per_block):
-        launch_config_mode = os.environ.get("MORI_EP_LAUNCH_CONFIG_MODE", "MANUAL")
-        if launch_config_mode == "MANUAL":
-            block_num = block_num if block_num > 0 else self.config.block_num
-            rdma_block_num = (
-                rdma_block_num if rdma_block_num > 0 else self.config.rdma_block_num
-            )
-            warp_per_block = (
-                warp_per_block if warp_per_block > 0 else self.config.warp_num_per_block
-            )
-        elif launch_config_mode == "AUTO":
+        self.launch_config_mode = os.environ.get("MORI_EP_LAUNCH_CONFIG_MODE", "MANUAL")
+        if self.launch_config_mode == "AUTO":
             if self.config.kernel_type.value in (
                 EpDispatchCombineKernelType.InterNodeV1.value,
                 EpDispatchCombineKernelType.InterNodeV1LL.value,
             ):
-                block_num, rdma_block_num, warp_per_block = 96, 64, 8
+                (
+                    self.auto_block_num,
+                    self.auto_rdma_block_num,
+                    self.auto_warp_per_block,
+                ) = (96, 64, 8)
             else:
-                block_num, rdma_block_num, warp_per_block = 80, 0, 16
+                (
+                    self.auto_block_num,
+                    self.auto_rdma_block_num,
+                    self.auto_warp_per_block,
+                ) = (80, 0, 16)
+        elif self.launch_config_mode == "MANUAL":
+            self.auto_block_num, self.auto_rdma_block_num, self.auto_warp_per_block = (
+                None,
+                None,
+                None,
+            )
         else:
             raise ValueError(
-                f"invalid MORI_EP_LAUNCH_CONFIG_MODE, must be ['MANUAL', 'AUTO'], got '{launch_config_mode}'"
+                f"invalid MORI_EP_LAUNCH_CONFIG_MODE, must be ['MANUAL', 'AUTO'], got '{self.launch_config_mode}'"
             )
-        return block_num, rdma_block_num, warp_per_block
+
+    def get_registered_combine_input_buffer(self, dtype: torch.dtype):
+        return self._get_registered_combine_input_buffer(self._handle, dtype)
 
     def dispatch(
         self,
@@ -179,12 +183,6 @@ class EpDispatchCombineOp:
             block_num: Override config.block_num if > 0.
             warp_per_block: Override config.warp_num_per_block if > 0.
         """
-        block_num, rdma_block_num, warp_per_block = self.get_launch_config(
-            is_dispatch=True,
-            block_num=block_num,
-            rdma_block_num=rdma_block_num,
-            warp_per_block=warp_per_block,
-        )
         return self._dispatch_func(
             self._handle,
             self.config.kernel_type.value,
@@ -192,9 +190,9 @@ class EpDispatchCombineOp:
             weights,
             scales,
             indices,
-            block_num,
-            rdma_block_num,
-            warp_per_block,
+            self.auto_block_num if self.auto_block_num else block_num,
+            self.auto_rdma_block_num if self.auto_rdma_block_num else rdma_block_num,
+            self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
         )
 
     def dispatch_send(
@@ -211,8 +209,8 @@ class EpDispatchCombineOp:
             weights,
             scales,
             indices,
-            block_num,
-            warp_per_block,
+            self.auto_block_num if self.auto_block_num else block_num,
+            self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
         )
 
     def dispatch_recv(
@@ -220,17 +218,11 @@ class EpDispatchCombineOp:
         block_num: int = -1,
         warp_per_block: int = -1,
     ):
-        block_num, _, warp_per_block = self.get_launch_config(
-            is_dispatch=False,
-            block_num=block_num,
-            rdma_block_num=-1,
-            warp_per_block=warp_per_block,
-        )
         return self._dispatch_recv_func(
             self._handle,
             self.config.kernel_type.value,
-            block_num,
-            warp_per_block,
+            self.auto_block_num if self.auto_block_num else block_num,
+            self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
         )
 
     def combine(
@@ -257,21 +249,15 @@ class EpDispatchCombineOp:
                 1 = use external input buffer (non-zero-copy).
             call_reset: Whether to call reset after combine.
         """
-        block_num, rdma_block_num, warp_per_block = self.get_launch_config(
-            is_dispatch=False,
-            block_num=block_num,
-            rdma_block_num=rdma_block_num,
-            warp_per_block=warp_per_block,
-        )
         output = self._combine_func(
             self._handle,
             self.config.kernel_type.value,
             input,
             weights,
             indices,
-            block_num,
-            rdma_block_num,
-            warp_per_block,
+            self.auto_block_num if self.auto_block_num else block_num,
+            self.auto_rdma_block_num if self.auto_rdma_block_num else rdma_block_num,
+            self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
             use_external_inp_buf,
         )
         if call_reset:
@@ -290,8 +276,8 @@ class EpDispatchCombineOp:
             input,
             weights,
             indices,
-            block_num,
-            warp_per_block,
+            self.auto_block_num if self.auto_block_num else block_num,
+            self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
         )
 
     def combine_recv(
@@ -299,17 +285,11 @@ class EpDispatchCombineOp:
         block_num: int = -1,
         warp_per_block: int = -1,
     ):
-        block_num, _, warp_per_block = self.get_launch_config(
-            is_dispatch=False,
-            block_num=block_num,
-            rdma_block_num=-1,
-            warp_per_block=warp_per_block,
-        )
         return self._combine_recv_func(
             self._handle,
             self.config.kernel_type.value,
-            block_num,
-            warp_per_block,
+            self.auto_block_num if self.auto_block_num else block_num,
+            self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
         )
 
     def dispatch_standard_moe(
