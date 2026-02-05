@@ -22,6 +22,7 @@
 from mori import cpp as mori_cpp
 import os
 from dataclasses import dataclass
+from typing import Optional
 import torch
 import torch.distributed as dist
 
@@ -52,7 +53,21 @@ class EpDispatchCombineConfig:
     num_qp_per_pe: int = 1
 
 
-def _cpp_dispatch_combine_factory(entity_name):
+def _cpp_dispatch_combine_factory(entity_name, allow_missing=False):
+    """Get a C++ binding by name from the mori_cpp module.
+
+    Args:
+        entity_name: Name of the C++ binding (function or class) to retrieve.
+        allow_missing: If True, return None when binding doesn't exist
+            (e.g., when compiled without ENABLE_STANDARD_MOE_ADAPT).
+            If False, raise AttributeError when binding is missing.
+
+    Returns:
+        The C++ binding if found, or None if allow_missing=True and not found.
+    """
+    if allow_missing:
+        # Return None instead of raising AttributeError for optional bindings
+        return getattr(mori_cpp, entity_name, None)
     return getattr(mori_cpp, entity_name)
 
 
@@ -84,7 +99,6 @@ class EpDispatchCombineOp:
 
         self._dispatch_func = _cpp_dispatch_combine_factory("launch_dispatch")
         self._combine_func = _cpp_dispatch_combine_factory("launch_combine")
-        self._reset_func = _cpp_dispatch_combine_factory("launch_reset")
         self._get_dispatch_src_token_pos_func = _cpp_dispatch_combine_factory(
             "get_dispatch_src_token_pos"
         )
@@ -99,6 +113,21 @@ class EpDispatchCombineOp:
         )
         self._get_registered_combine_input_buffer = _cpp_dispatch_combine_factory(
             "get_registered_combine_input_buffer"
+        )
+
+        # Standard MoE functions only available when ENABLE_STANDARD_MOE_ADAPT=ON
+        self._dispatch_standard_moe_func = _cpp_dispatch_combine_factory(
+            "launch_dispatch_standard_moe", allow_missing=True
+        )
+        self._combine_standard_moe_func = _cpp_dispatch_combine_factory(
+            "launch_combine_standard_moe", allow_missing=True
+        )
+        self._reset_func = _cpp_dispatch_combine_factory("launch_reset")
+        self._convert_dispatch_output_func = _cpp_dispatch_combine_factory(
+            "convert_dispatch_output", allow_missing=True
+        )
+        self._convert_combine_input_func = _cpp_dispatch_combine_factory(
+            "convert_combine_input", allow_missing=True
         )
 
     def get_registered_combine_input_buffer(self, dtype: torch.dtype):
@@ -138,6 +167,16 @@ class EpDispatchCombineOp:
         rdma_block_num: int = -1,
         warp_per_block: int = -1,
     ):
+        """Dispatch tokens to experts based on top-k indices.
+
+        Args:
+            input: Input token tensor.
+            weights: Token weights for each expert.
+            scales: Quantization scales (optional).
+            indices: Top-k expert indices.
+            block_num: Override config.block_num if > 0.
+            warp_per_block: Override config.warp_num_per_block if > 0.
+        """
         block_num, rdma_block_num, warp_per_block = self.get_launch_config(
             is_dispatch=True,
             block_num=block_num,
@@ -164,8 +203,22 @@ class EpDispatchCombineOp:
         block_num: int = -1,
         rdma_block_num: int = -1,
         warp_per_block: int = -1,
+        use_external_inp_buf: int = -1,
         call_reset: bool = False,
     ):
+        """Combine tokens from experts back to original positions.
+
+        Args:
+            input: Expert output tensor.
+            weights: Token weights for weighted combination.
+            indices: Top-k expert indices.
+            block_num: Override config.block_num if > 0.
+            warp_per_block: Override config.warp_num_per_block if > 0.
+            use_external_inp_buf: Override config.use_external_inp_buf if >= 0.
+                0 = use zero-copy (registered combine input buffer),
+                1 = use external input buffer (non-zero-copy).
+            call_reset: Whether to call reset after combine.
+        """
         block_num, rdma_block_num, warp_per_block = self.get_launch_config(
             is_dispatch=False,
             block_num=block_num,
@@ -181,10 +234,160 @@ class EpDispatchCombineOp:
             block_num,
             rdma_block_num,
             warp_per_block,
+            use_external_inp_buf,
         )
         if call_reset:
             self._reset_func(self._handle)
         return output
+
+    def dispatch_standard_moe(
+        self,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        indices: torch.Tensor,
+        block_num: int = -1,
+        rdma_block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        """DeepEP compatibility: dispatch + convert in one launch.
+
+        Args:
+            input: Input token tensor.
+            weights: Token weights for each expert.
+            scales: Quantization scales (optional).
+            indices: Top-k expert indices.
+            block_num: Override config.block_num if > 0.
+            rdma_block_num: Override config.rdma_block_num if > 0 (unused in current impl).
+            warp_per_block: Override config.warp_num_per_block if > 0.
+        """
+        if self._dispatch_standard_moe_func is None:
+            raise RuntimeError(
+                "dispatch_standard_moe is not available. "
+                "Rebuild with ENABLE_STANDARD_MOE_ADAPT=ON."
+            )
+        block_num, rdma_block_num, warp_per_block = self.get_launch_config(
+            is_dispatch=True,
+            block_num=block_num,
+            rdma_block_num=rdma_block_num,
+            warp_per_block=warp_per_block,
+        )
+        return self._dispatch_standard_moe_func(
+            self._handle,
+            self.config.kernel_type.value,
+            input,
+            weights,
+            scales,
+            indices,
+            block_num,
+            rdma_block_num,
+            warp_per_block,
+        )
+
+    def combine_standard_moe(
+        self,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        block_num: int = -1,
+        rdma_block_num: int = -1,
+        warp_per_block: int = -1,
+        call_reset: bool = False,
+    ):
+        """DeepEP compatibility: combine with standard MoE inputs (no extra convert).
+
+        Args:
+            input: Expert output tensor.
+            weights: Token weights for weighted combination.
+            indices: Top-k expert indices.
+            block_num: Override config.block_num if > 0.
+            rdma_block_num: Override config.rdma_block_num if > 0 (unused in current impl).
+            warp_per_block: Override config.warp_num_per_block if > 0.
+            call_reset: Whether to call reset after combine.
+        """
+        if self._combine_standard_moe_func is None:
+            raise RuntimeError(
+                "combine_standard_moe is not available. "
+                "Rebuild with ENABLE_STANDARD_MOE_ADAPT=ON."
+            )
+        block_num, rdma_block_num, warp_per_block = self.get_launch_config(
+            is_dispatch=False,
+            block_num=block_num,
+            rdma_block_num=rdma_block_num,
+            warp_per_block=warp_per_block,
+        )
+        output = self._combine_standard_moe_func(
+            self._handle,
+            self.config.kernel_type.value,
+            input,
+            weights,
+            indices,
+            block_num,
+            rdma_block_num,
+            warp_per_block,
+        )
+        if call_reset:
+            self._reset_func(self._handle)
+        return output
+
+    def convert_dispatch_output(
+        self,
+        dispatch_out_x: torch.Tensor,
+        dispatch_out_topk_idx: torch.Tensor,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        """Convert dispatch outputs to standard MoE 3D layout (DeepEP-compatible).
+
+        Args:
+            dispatch_out_x: 2D dispatch output tokens (from dispatch).
+            dispatch_out_topk_idx: 2D top-k indices aligned with dispatch_out_x.
+            block_num: Override config.block_num if > 0.
+            warp_per_block: Override config.warp_num_per_block if > 0.
+        """
+        if self._convert_dispatch_output_func is None:
+            raise RuntimeError(
+                "convert_dispatch_output is not available. "
+                "Rebuild with ENABLE_STANDARD_MOE_ADAPT=ON."
+            )
+        return self._convert_dispatch_output_func(
+            self._handle,
+            dispatch_out_x,
+            dispatch_out_topk_idx,
+            block_num,
+            warp_per_block,
+        )
+
+    def convert_combine_input(
+        self,
+        packed_recv_x: torch.Tensor,
+        packed_recv_src_info: torch.Tensor,
+        packed_recv_layout_range: torch.Tensor,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        """Prepare standard MoE combine inputs (DeepEP-compatible).
+
+        Args:
+            packed_recv_x: 3D packed receive tensor from MoE.
+            packed_recv_src_info: Source token info aligned with packed_recv_x.
+            packed_recv_layout_range: Layout ranges aligned with packed_recv_x (unused in kernel).
+            block_num: Override config.block_num if > 0.
+            warp_per_block: Override config.warp_num_per_block if > 0.
+        """
+        if self._convert_combine_input_func is None:
+            raise RuntimeError(
+                "convert_combine_input is not available. "
+                "Rebuild with ENABLE_STANDARD_MOE_ADAPT=ON."
+            )
+        return self._convert_combine_input_func(
+            self._handle,
+            packed_recv_x,
+            packed_recv_src_info,
+            packed_recv_layout_range,
+            block_num,
+            warp_per_block,
+        )
 
     def reset(self):
         self._reset_func(self._handle)
