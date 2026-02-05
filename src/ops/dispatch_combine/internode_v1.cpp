@@ -1291,32 +1291,31 @@ __global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> ar
 #endif
 
 // Macro to instantiate a kernel for all data types
-#define INSTANTIATE_KERNEL(KernelName)                                                             \
-  template __global__ void KernelName<hip_bfloat16>(EpDispatchCombineArgs<hip_bfloat16> args);     \
-  MORI_FP8_FNUZ(template __global__ void KernelName<__hip_fp8_e4m3_fnuz>(                          \
-      EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)                                           \
-  MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3>(                                \
-      EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                                                \
+#define INSTANTIATE_KERNEL(KernelName)                                                         \
+  template __global__ void KernelName<hip_bfloat16>(EpDispatchCombineArgs<hip_bfloat16> args); \
+  MORI_FP8_FNUZ(template __global__ void KernelName<__hip_fp8_e4m3_fnuz>(                      \
+                    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)                         \
+  MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3>(                            \
+                   EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                               \
   template __global__ void KernelName<float>(EpDispatchCombineArgs<float> args);
 
 // Macro to instantiate a kernel with EnableStdMoE parameter for all data types
-#define INSTANTIATE_LL_KERNEL(KernelName, StdMoE)                                              \
-  template __global__ void KernelName<hip_bfloat16, StdMoE>(                                       \
-      EpDispatchCombineArgs<hip_bfloat16> args);                                                   \
-  MORI_FP8_FNUZ(template __global__ void KernelName<__hip_fp8_e4m3_fnuz, StdMoE>(                  \
-      EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)                                           \
-  MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3, StdMoE>(                        \
-      EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                                                \
+#define INSTANTIATE_LL_KERNEL(KernelName, StdMoE)                                 \
+  template __global__ void KernelName<hip_bfloat16, StdMoE>(                      \
+      EpDispatchCombineArgs<hip_bfloat16> args);                                  \
+  MORI_FP8_FNUZ(template __global__ void KernelName<__hip_fp8_e4m3_fnuz, StdMoE>( \
+                    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)            \
+  MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3, StdMoE>(       \
+                   EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                  \
   template __global__ void KernelName<float, StdMoE>(EpDispatchCombineArgs<float> args);
 
 // Combined macro for kernels with EnableStdMoE template parameter
 #ifdef ENABLE_STANDARD_MOE_ADAPT
-#define INSTANTIATE_LL_KERNEL_WITH_STDMOE(KernelName)                                                 \
-  INSTANTIATE_LL_KERNEL(KernelName, false)                                                     \
+#define INSTANTIATE_LL_KERNEL_WITH_STDMOE(KernelName) \
+  INSTANTIATE_LL_KERNEL(KernelName, false)            \
   INSTANTIATE_LL_KERNEL(KernelName, true)
 #else
-#define INSTANTIATE_LL_KERNEL_WITH_STDMOE(KernelName)                                                 \
-  INSTANTIATE_LL_KERNEL(KernelName, false)
+#define INSTANTIATE_LL_KERNEL_WITH_STDMOE(KernelName) INSTANTIATE_LL_KERNEL(KernelName, false)
 #endif
 
 INSTANTIATE_KERNEL(EpDispatchInterNodeV1Kernel)

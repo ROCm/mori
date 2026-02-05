@@ -27,8 +27,8 @@
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <torch/python.h>
 #include <torch/extension.h>
+#include <torch/python.h>
 
 #include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
@@ -197,9 +197,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> LaunchDis
 std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombineForStandardMoE(
     mori::moe::EpDispatchCombineHandle& handle, int kernelType,
     const torch::Tensor& expertOutput,  // [numLocalExperts, maxTokensPerExpert, hidden]
-    const std::optional<torch::Tensor>& weights,
-    const torch::Tensor& topkIds,
-    int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1) {
+    const std::optional<torch::Tensor>& weights, const torch::Tensor& topkIds, int blockNum = -1,
+    int rdmaBlockNum = -1, int warpPerBlock = -1) {
   assert(expertOutput.is_contiguous() && topkIds.is_contiguous());
 
   float* weightsPtr = nullptr;
@@ -212,16 +211,13 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombineForStandard
   handle.PrepareInference(mori::ScalarTypeToHipDataType(expertOutput.scalar_type()),
                           nullptr,  // inpTokenBuf not used for standard moe combine
                           nullptr,  // outTokenBuf
-                          weightsPtr,
-                          topkIds.data_ptr<mori::moe::index_t>(),
+                          weightsPtr, topkIds.data_ptr<mori::moe::index_t>(),
                           handle.curRankNumToken);
 
   // Set standard MoE input buffers (reusing output buffer fields)
-  handle.SetStandardMoeOutputBuffers(
-      expertOutput.data_ptr(),
-      handle.standardPackedRecvCount,
-      handle.standardPackedRecvSrcInfo,
-      handle.standardPackedRecvLayoutRange);
+  handle.SetStandardMoeOutputBuffers(expertOutput.data_ptr(), handle.standardPackedRecvCount,
+                                     handle.standardPackedRecvSrcInfo,
+                                     handle.standardPackedRecvLayoutRange);
 
   // Launch combine for standard MoE
   handle.LaunchCombineForStandardMoE((mori::moe::KernelType)kernelType, blockNum, rdmaBlockNum,
@@ -249,8 +245,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombineForStandard
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> ConvertDispatchOutput(
     mori::moe::EpDispatchCombineHandle& handle, const torch::Tensor& dispatchOutX,
-    const torch::Tensor& dispatchOutTopkIdx,
-    int blockNum = -1, int warpPerBlock = -1) {
+    const torch::Tensor& dispatchOutTopkIdx, int blockNum = -1, int warpPerBlock = -1) {
   TORCH_CHECK(dispatchOutX.is_cuda(), "dispatchOutX must be a CUDA tensor");
   TORCH_CHECK(dispatchOutTopkIdx.is_cuda(), "dispatchOutTopkIdx must be a CUDA tensor");
   TORCH_CHECK(dispatchOutX.dim() == 2, "dispatchOutX must be 2D");

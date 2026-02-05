@@ -78,7 +78,6 @@ inline size_t GetHipDataTypeSize(hipDataType dtype) {
 
 using index_t = int32_t;
 
-
 #define MAX_EXPERTS_PER_TOKEN (9)
 struct EpDispatchCombineConfig {
   int rank{0};
@@ -142,8 +141,8 @@ class EpDispatchCombineHandle {
   }
 
 #ifdef ENABLE_STANDARD_MOE_ADAPT
-  void SetStandardMoeOutputBuffers(void* packedRecvX, int* packedRecvCount,
-                                   int* packedRecvSrcInfo, int64_t* packedRecvLayoutRange) {
+  void SetStandardMoeOutputBuffers(void* packedRecvX, int* packedRecvCount, int* packedRecvSrcInfo,
+                                   int64_t* packedRecvLayoutRange) {
     enableStandardMoeOutput = true;
     standardPackedRecvX = packedRecvX;
     // standardPackedRecvCount = packedRecvCount;
@@ -182,82 +181,81 @@ class EpDispatchCombineHandle {
                                    int warpPerBlock = -1, hipStream_t = 0);
 
   void LaunchConvertDispatchOutputKernel(const void* dispatchOutX, const void* dispatchOutTopkIdx,
-                                         void* packedRecvX,
-                                         int* packedRecvCount, int* packedRecvSrcInfo,
-                                         int64_t* packedRecvLayoutRange, int blockNum = -1,
-                                         int warpPerBlock = -1, hipStream_t = 0);
+                                         void* packedRecvX, int* packedRecvCount,
+                                         int* packedRecvSrcInfo, int64_t* packedRecvLayoutRange,
+                                         int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
   void LaunchConvertCombineInputKernel(const void* packedRecvX, const void* packedRecvSrcInfo,
                                        const void* packedRecvLayoutRange, void* combineInput,
                                        mori::application::SymmMemObjPtr shmemCombineInpTokMemObj,
                                        int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
 #endif
 
-void LaunchReset(hipStream_t = 0);
+  void LaunchReset(hipStream_t = 0);
 
-index_t GetCurRankNumToken() const { return curRankNumToken; }
+  index_t GetCurRankNumToken() const { return curRankNumToken; }
 
-private:
-void InitializeShmemBuf();
-void FinalizeShmemBuf();
+ private:
+  void InitializeShmemBuf();
+  void FinalizeShmemBuf();
 
-void InitializeTokenNumSignalBuf();
-void FinalizeTokenNumSignalBuf();
+  void InitializeTokenNumSignalBuf();
+  void FinalizeTokenNumSignalBuf();
 
-void InitializeOrderMapBuf();
-void FinalizeOrderMapBuf();
+  void InitializeOrderMapBuf();
+  void FinalizeOrderMapBuf();
 
-void InitializeBarrier();
-void FinalizeBarrier();
+  void InitializeBarrier();
+  void FinalizeBarrier();
 
-public:
-// Number of tokens on this rank and size of scale data type, updated at each round of inference
-index_t curRankNumToken{0};
-index_t multiProcessorCount{0};
+ public:
+  // Number of tokens on this rank and size of scale data type, updated at each round of inference
+  index_t curRankNumToken{0};
+  index_t multiProcessorCount{0};
 
-public:
-// Config
-EpDispatchCombineConfig config;
-// Routed expert indices for tokens
-index_t* tokenIndices{nullptr};
+ public:
+  // Config
+  EpDispatchCombineConfig config;
+  // Routed expert indices for tokens
+  index_t* tokenIndices{nullptr};
 
-// Kernel input/output buffer
-void* inpTokenBuf{nullptr};
-void* outTokenBuf{nullptr};
-hipDataType inputType;
-float* weightsBuf{nullptr};
-uint8_t* scalesBuf{nullptr};
+  // Kernel input/output buffer
+  void* inpTokenBuf{nullptr};
+  void* outTokenBuf{nullptr};
+  hipDataType inputType;
+  float* weightsBuf{nullptr};
+  uint8_t* scalesBuf{nullptr};
 
-// Registered buffers for tokens, shmemOutTokMemObj will be returned to user as output
-mori::application::SymmMemObjPtr shmemDispatchInpTokMemObj;
-mori::application::SymmMemObjPtr shmemCombineInpTokMemObj;
-mori::application::SymmMemObjPtr shmemDispatchOutTokMemObj;
-mori::application::SymmMemObjPtr shmemCombineOutTokMemObj;
-mori::application::SymmMemObjPtr shmemStagingTokMemObj;
+  // Registered buffers for tokens, shmemOutTokMemObj will be returned to user as output
+  mori::application::SymmMemObjPtr shmemDispatchInpTokMemObj;
+  mori::application::SymmMemObjPtr shmemCombineInpTokMemObj;
+  mori::application::SymmMemObjPtr shmemDispatchOutTokMemObj;
+  mori::application::SymmMemObjPtr shmemCombineOutTokMemObj;
+  mori::application::SymmMemObjPtr shmemStagingTokMemObj;
 
-// Registered buffer used for weights, indices and scales
-mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
-mori::application::SymmMemObjPtr shmemDispatchOutWeightsMemObj;
-mori::application::SymmMemObjPtr shmemCombineOutWeightsMemObj;
-mori::application::SymmMemObjPtr shmemInpScalesMemObj;
-mori::application::SymmMemObjPtr shmemOutScalesMemObj;
-mori::application::SymmMemObjPtr shmemInpIndicesMemObj;
-mori::application::SymmMemObjPtr shmemOutIndicesMemObj;
+  // Registered buffer used for weights, indices and scales
+  mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemDispatchOutWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemCombineOutWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemInpScalesMemObj;
+  mori::application::SymmMemObjPtr shmemOutScalesMemObj;
+  mori::application::SymmMemObjPtr shmemInpIndicesMemObj;
+  mori::application::SymmMemObjPtr shmemOutIndicesMemObj;
 
-// Record number of tokens that will be received from other PE
-mori::application::SymmMemObjPtr recvTokenNumMemObj;
-mori::application::SymmMemObjPtr sendTokenNumMemObj;
-mori::application::SymmMemObjPtr sendAtomicSignalMemObj;
+  // Record number of tokens that will be received from other PE
+  mori::application::SymmMemObjPtr recvTokenNumMemObj;
+  mori::application::SymmMemObjPtr sendTokenNumMemObj;
+  mori::application::SymmMemObjPtr sendAtomicSignalMemObj;
 
-// Barrier for intra-grid synchronization
-uint32_t* dispatchGridBarrier{nullptr};
-uint32_t* combineGridBarrier{nullptr};
+  // Barrier for intra-grid synchronization
+  uint32_t* dispatchGridBarrier{nullptr};
+  uint32_t* combineGridBarrier{nullptr};
 
-// Map dispatch input token index to staging buffer index, saved at dispatch send phase and used
-// at combine recv phase
-index_t* dispSenderIdxMap{nullptr};
-// Map dispatch staging buffer index to output buffer index, saved at dispatch recv phase and used
-// at combine send phase
-index_t* dispReceiverIdxMap{nullptr};
+  // Map dispatch input token index to staging buffer index, saved at dispatch send phase and used
+  // at combine recv phase
+  index_t* dispSenderIdxMap{nullptr};
+  // Map dispatch staging buffer index to output buffer index, saved at dispatch recv phase and used
+  // at combine send phase
+  index_t* dispReceiverIdxMap{nullptr};
 
 #ifdef ENABLE_STANDARD_MOE_ADAPT
   // Map dispatch token to expert slot index (size: MaxNumTokensToRecv * numExpertPerToken), saved

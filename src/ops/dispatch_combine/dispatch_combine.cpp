@@ -294,13 +294,15 @@ void EpDispatchCombineHandle::LaunchInterNodeDispatch(int blockNum, int rdmaBloc
 void EpDispatchCombineHandle::LaunchIntraNodeCombine(int blockNum, int rdmaBlockNum,
                                                      int warpPerBlock, int useExternalInpBuf,
                                                      hipStream_t stream) {
-  LaunchCombine(KernelType::IntraNode, blockNum, rdmaBlockNum, warpPerBlock, useExternalInpBuf, stream);
+  LaunchCombine(KernelType::IntraNode, blockNum, rdmaBlockNum, warpPerBlock, useExternalInpBuf,
+                stream);
 }
 
 void EpDispatchCombineHandle::LaunchInterNodeCombine(int blockNum, int rdmaBlockNum,
                                                      int warpPerBlock, int useExternalInpBuf,
                                                      hipStream_t stream) {
-  LaunchCombine(KernelType::InterNode, blockNum, rdmaBlockNum, warpPerBlock, useExternalInpBuf, stream);
+  LaunchCombine(KernelType::InterNode, blockNum, rdmaBlockNum, warpPerBlock, useExternalInpBuf,
+                stream);
 }
 
 void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum, int rdmaBlockNum,
@@ -452,7 +454,8 @@ void EpDispatchCombineHandle::LaunchCombineForStandardMoE(KernelType kernelType,
           EpCombineIntraNodeKernel<DataT, /*UseP2PRead=*/true, /*EnableStdMoE=*/true>
               <<<grid, block, sharedMemSize, stream>>>(args);
         } else {
-          assert(false && "LaunchCombineForStandardMoE only supports IntraNode/InterNodeV1LL kernel type");
+          assert(false &&
+                 "LaunchCombineForStandardMoE only supports IntraNode/InterNodeV1LL kernel type");
         }
       },
       argsVariant);
@@ -464,14 +467,10 @@ __global__ void ConvertDispatchOutputKernel(ConvertDispatchOutputArgs args) {
   ConvertDispatchOutputDevice(args);
 }
 
-void EpDispatchCombineHandle::LaunchConvertDispatchOutputKernel(const void* dispatchOutX,
-                                                                const void* dispatchOutTopkIdx,
-                                                                void* packedRecvX,
-                                                                int* packedRecvCount,
-                                                                int* packedRecvSrcInfo,
-                                                                int64_t* packedRecvLayoutRange,
-                                                                int blockNum, int warpPerBlock,
-                                                                hipStream_t stream) {
+void EpDispatchCombineHandle::LaunchConvertDispatchOutputKernel(
+    const void* dispatchOutX, const void* dispatchOutTopkIdx, void* packedRecvX,
+    int* packedRecvCount, int* packedRecvSrcInfo, int64_t* packedRecvLayoutRange, int blockNum,
+    int warpPerBlock, hipStream_t stream) {
   size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
   dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
   dim3 block(warpSize * actualWarpNumPerBlock);
