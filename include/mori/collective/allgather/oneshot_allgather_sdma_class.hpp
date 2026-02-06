@@ -150,7 +150,7 @@ public:
      * @param total_count Number of data elements per PE
      * @param stream HIP stream
      * @return true if successful, false if failed
-     * @note Synchronization must be handled by the caller (Python layer)
+     * @note Synchronization must be handled by the caller
      */
     bool operator()(T* input, T* output, size_t total_count, hipStream_t stream = nullptr);
 

@@ -286,13 +286,67 @@ void testOneShotSdmaAllgather() {
   bool use_async = 1;  // Set to 1 for async mode, 0 for sync mode
 
   if (use_async == 0) {
-    // Synchronous mode (original logic)
-    for (int i = 0; i < 10; i++) {
-      execution_time = (*allgather_obj)(inPutBuff, outPutBuff, elemsPerPe, stream);
-      if (execution_time < 0) {
+    // Synchronous mode - measure time and synchronize
+    printf("PE %d: Using SYNC mode (operator() with timing)\n", myPe);
+    
+    std::vector<double> exec_times;
+    const int num_iterations = 10;
+    const int warmup_iterations = 1;
+    
+    for (int i = 0; i < num_iterations + warmup_iterations; i++) {
+      MPI_Barrier(MPI_COMM_WORLD);
+      
+      // Measure execution time
+      double start_time = MPI_Wtime();
+      
+      // Execute Allgather operation
+      bool success = (*allgather_obj)(inPutBuff, outPutBuff, elemsPerPe, stream);
+      
+      if (!success) {
         fprintf(stderr, "PE %d: Iteration %d failed\n", myPe, i);
         break;
       }
+      
+      // Synchronize to ensure operation completes
+      CHECK_HIP(hipStreamSynchronize(stream));
+      
+      double end_time = MPI_Wtime();
+      double iter_time = end_time - start_time;
+      
+      if (i >= warmup_iterations) {
+        exec_times.push_back(iter_time);
+        if (myPe == 0) {
+          printf("PE %d: Iteration %d completed in %.6f seconds\n", myPe, i - warmup_iterations + 1, iter_time);
+        }
+      } else if (myPe == 0) {
+        printf("PE %d: Warmup iteration %d: %.6f seconds\n", myPe, i + 1, iter_time);
+      }
+      
+      MPI_Barrier(MPI_COMM_WORLD);
+    }
+    
+    // Calculate statistics
+    if (!exec_times.empty()) {
+      double sum_time = 0.0;
+      double min_time = exec_times[0];
+      double max_time = exec_times[0];
+      
+      for (double t : exec_times) {
+        sum_time += t;
+        if (t < min_time) min_time = t;
+        if (t > max_time) max_time = t;
+      }
+      
+      execution_time = sum_time / exec_times.size();  // Average time
+      
+      if (myPe == 0) {
+        printf("\nPE %d: Sync mode statistics (from %zu iterations):\n", myPe, exec_times.size());
+        printf("  Min time: %.6f seconds\n", min_time);
+        printf("  Max time: %.6f seconds\n", max_time);
+        printf("  Avg time: %.6f seconds\n", execution_time);
+      }
+    } else {
+      execution_time = -1.0;
     }
   } else {
     // Asynchronous mode

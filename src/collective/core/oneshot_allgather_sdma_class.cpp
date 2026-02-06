@@ -381,16 +381,13 @@ void AllgatherSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
     }
 
     // Copy from output transit buffer to user output buffer
+    // Note: Synchronization is handled by caller (Python layer or wait_async)
+    // Do NOT synchronize here to avoid blocking and double synchronization
     hipError_t err = hipSuccess;
     if (stream != nullptr) {
         err = hipMemcpyAsync(output, output_transit_buffer_, output_bytes,
                            hipMemcpyDeviceToDevice, stream);
-        // Immediately synchronize to ensure copy completes
-        hipError_t sync_err = hipStreamSynchronize(stream);
-        if (sync_err != hipSuccess) {
-            fprintf(stderr, "PE %d: Stream synchronization failed: %s\n",
-                    myPe_, hipGetErrorString(sync_err));
-        }
+        // Do NOT synchronize here - let caller handle synchronization
     } else {
         err = hipMemcpy(output, output_transit_buffer_, output_bytes,
                        hipMemcpyDeviceToDevice);
@@ -405,7 +402,7 @@ void AllgatherSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
 
 // operator() implementation (modified to check async status)
 // Returns true on success, false on failure
-// Synchronization must be done by caller (Python layer)
+// Synchronization must be done by caller
 template <typename T>
 bool AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
     // Check if async operation is in progress
@@ -415,20 +412,8 @@ bool AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
         return false;
     }
 
-    //hipError_t err = hipSuccess;
-    //try {
-        // Step 1: Copy input data to input transit buffer
-    //    copy_input_to_transit(input, total_count, stream);
-
-        // Step 2: Reset flags
-    //    resetFlags();
-
-        // Step 3: Execute Allgather kernel
-    //    int block_size = 256;
-    //    int grid_size = (total_count * npes_ + block_size - 1) / block_size;
-    //    if (grid_size < 1) grid_size = 1;
-    //    if (grid_size > 65535) grid_size = 65535;
-
+    try {
+        // Step 1: Execute Allgather kernel
         OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
             input,
@@ -436,23 +421,23 @@ bool AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
             output_transit_buffer_obj_,
             flagsObj_, total_count);
 
-    //    err = hipGetLastError();
-    //    if (err != hipSuccess) {
-    //        fprintf(stderr, "PE %d: Kernel launch failed: %s\n",
-    //                myPe_, hipGetErrorString(err));
-    //        return false;
-    //    }
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess) {
+            fprintf(stderr, "PE %d: Kernel launch failed: %s\n",
+                    myPe_, hipGetErrorString(err));
+            return false;
+        }
 
-        // Step 4: Copy from output transit buffer to user output buffer (if enabled)
-        // Note: Synchronization is handled by Python layer
+        // Step 2: Copy from output transit buffer to user output buffer (if enabled)
+        // Note: Synchronization is handled by caller
         if (copy_output_to_user_) {
             copy_output_to_user(output, total_count, stream);
         }
 
-    //} catch (const std::exception& e) {
-    //    fprintf(stderr, "PE %d: Allgather operation failed: %s\n", myPe_, e.what());
-    //    return false;
-    //}
+    } catch (const std::exception& e) {
+        fprintf(stderr, "PE %d: Allgather operation failed: %s\n", myPe_, e.what());
+        return false;
+    }
 
     return true;
 }
