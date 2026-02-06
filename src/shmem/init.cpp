@@ -32,6 +32,7 @@
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"
+#include "mori/shmem/shmem_device_api.hpp"
 #include "mori/utils/mori_log.hpp"
 
 namespace mori {
@@ -810,6 +811,16 @@ void ShmemBarrierAll() {
   MORI_SHMEM_TRACE("PE {} entering barrier", states->bootStates->rank);
   states->bootStates->bootNet->Barrier();
   MORI_SHMEM_TRACE("PE {} exiting barrier", states->bootStates->rank);
+}
+
+__global__ static void ShmemBarrierAllBlockKernel() { ShmemBarrierAllBlock(); }
+
+void ShmemBarrierOnStream(hipStream_t stream) {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
+
+  MORI_SHMEM_TRACE("PE {} launching device barrier on stream", states->bootStates->rank);
+  ShmemBarrierAllBlockKernel<<<1, 1, 0, stream>>>();
 }
 
 /* ---------------------------------------------------------------------------------------------- */

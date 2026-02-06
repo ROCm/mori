@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "hip/hip_runtime.h"
 #include "mori/application/application.hpp"
 
 namespace mori {
@@ -69,6 +70,7 @@ int ShmemMyPe();
 int ShmemNPes();
 
 void ShmemBarrierAll();
+void ShmemBarrierOnStream(hipStream_t stream);
 
 enum ShmemTeamType {
   INVALID = -1,

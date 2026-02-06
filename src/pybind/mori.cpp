@@ -286,6 +286,7 @@ int64_t ShmemInitAttr(unsigned int flags, int32_t rank, int32_t nranks,
 }
 
 void ShmemBarrierAll() { mori::shmem::ShmemBarrierAll(); }
+void ShmemBarrierOnStream(hipStream_t stream) { mori::shmem::ShmemBarrierOnStream(stream); }
 
 // Symmetric memory APIs
 uintptr_t ShmemMalloc(size_t size) {
@@ -403,6 +404,11 @@ void RegisterMoriShmem(py::module_& m) {
 
   // Collective operations
   m.def("shmem_barrier_all", &ShmemBarrierAll, "Global barrier synchronization");
+
+  m.def(
+      "shmem_barrier_on_stream",
+      [](int64_t stream) { ShmemBarrierOnStream(reinterpret_cast<hipStream_t>(stream)); },
+      py::arg("stream"), "Launch device barrier on a HIP stream");
 
   // Symmetric memory management
   m.def("shmem_malloc", &ShmemMalloc, py::arg("size"),

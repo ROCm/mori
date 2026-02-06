@@ -120,6 +120,29 @@ def shmem_barrier_all():
     return mori_cpp.shmem_barrier_all()
 
 
+def shmem_barrier_on_stream(stream=None):
+    """Launch a device-side barrier on a HIP stream.
+
+    This enqueues a GPU kernel that performs cross-PE barrier synchronization
+    directly on the device, without blocking the host. All PEs must call this
+    on the same logical stream ordering.
+
+    Args:
+        stream: HIP stream to launch the barrier kernel on.
+            - None or 0: use the default (null) stream.
+            - int: raw hipStream_t pointer value.
+            - torch.cuda.Stream: a PyTorch CUDA/HIP stream object.
+    """
+    if stream is None:
+        stream_ptr = 0
+    elif isinstance(stream, int):
+        stream_ptr = stream
+    else:
+        # torch.cuda.Stream / torch.hip.Stream
+        stream_ptr = stream.cuda_stream
+    return mori_cpp.shmem_barrier_on_stream(stream_ptr)
+
+
 # Symmetric memory management
 def shmem_malloc(size: int) -> int:
     """Allocate symmetric memory.

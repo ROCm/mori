@@ -616,14 +616,25 @@ void ConcurrentPutThread() {
   Test4_MixedMallocFree(myPe);
   Test5_FragmentationReuse(myPe);
 
+  // Test 6: Device barrier via direct kernel launch
   constexpr int barrierThreadNum = 128;
   testShmemBarrierAllBlock<<<1, barrierThreadNum>>>();
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
   if (myPe == 0) {
-    // Assume success if we reach here
-    printf("\n--- Test 6: ✓ ShmemBarrierAllBlock test successfully\n");
+    printf("\n--- Test 6: ✓ ShmemBarrierAllBlock device kernel test passed\n");
   }
+
+  // Test 7: Device barrier via host API ShmemBarrierOnStream
+  hipStream_t stream;
+  HIP_RUNTIME_CHECK(hipStreamCreate(&stream));
+  ShmemBarrierOnStream(stream);
+  HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
+  MPI_Barrier(MPI_COMM_WORLD);
+  if (myPe == 0) {
+    printf("\n--- Test 7: ✓ ShmemBarrierOnStream test passed\n");
+  }
+  HIP_RUNTIME_CHECK(hipStreamDestroy(stream));
 
   if (myPe == 0) {
     printf("\n=================================================================\n");
@@ -636,6 +647,7 @@ void ConcurrentPutThread() {
     printf("  - Test 4: Mixed malloc/free with reference counting\n");
     printf("  - Test 5: Fragmentation and VA reuse\n");
     printf("  - Test 6: ShmemBarrierAllBlock device barrier\n");
+    printf("  - Test 7: ShmemBarrierOnStream host API barrier\n");
     printf("=================================================================\n");
   }
 
