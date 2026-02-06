@@ -600,18 +600,25 @@ void RegisterMoriCcl(pybind11::module_& m) {
                 // Determine device index
                 int device_index = 0;
                 if (!device_obj.is_none()) {
-                    if (py::isinstance<torch::Tensor>(device_obj)) {
-                        // If a tensor is provided, use its device
+                    // Check if it's a PyTorch tensor using Python isinstance
+                    py::object torch_module = py::module_::import("torch");
+                    py::object tensor_class = torch_module.attr("Tensor");
+                    bool is_tensor = py::isinstance(device_obj, tensor_class);
+                    
+                    if (is_tensor) {
+                        // It's a tensor, cast and get device
                         torch::Tensor tensor = device_obj.cast<torch::Tensor>();
                         if (tensor.is_cuda()) {
                             device_index = tensor.device().index();
+                        } else {
+                            throw std::runtime_error("device tensor must be a CUDA tensor");
                         }
                     } else {
                         // Try to cast as int
                         try {
                             device_index = device_obj.cast<int>();
-                        } catch (...) {
-                            throw std::runtime_error("device must be an int or a CUDA tensor");
+                        } catch (const py::cast_error&) {
+                            throw std::runtime_error("device must be an int, a CUDA tensor, or None");
                         }
                     }
                 } else {
