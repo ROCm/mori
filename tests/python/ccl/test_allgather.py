@@ -88,21 +88,37 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
         use_async = True  # Use async mode to match C++ test
         
         if not use_async:
-            # Synchronous mode (single SDMA queue)
+            # Synchronous mode (single SDMA queue) - add timing
+            # Create CUDA events for timing
+            allgather_start = torch.cuda.Event(enable_timing=True)
+            allgather_end = torch.cuda.Event(enable_timing=True)
+            
             for iter_idx in range(total_iters):
+                # Record start time
+                allgather_start.record(stream)
+                
                 with torch.cuda.stream(stream):
                     success = allgather(input_tensor, output_tensor, elems_per_pe)
+                
+                # Record end time
+                allgather_end.record(stream)
+                
+                # Synchronize to ensure all operations complete
                 stream.synchronize()
                 
                 if not success:
                     print(f"PE {rank}: Allgather operation failed at iteration {iter_idx}")
                     break
                 
+                # Calculate execution time
+                allgather_time = allgather_start.elapsed_time(allgather_end) / 1000.0  # Convert ms to seconds
+                
                 if iter_idx >= warmup:
-                    # Note: synchronous mode doesn't return exec_time, would need timing
-                    pass
+                    exec_times.append(allgather_time)
+                    if rank == 0 and len(exec_times) == 1:
+                        print(f"PE {rank}: First measurement iteration: {allgather_time:.6f}s")
                 elif rank == 0:
-                    print(f"Warmup iteration {iter_idx + 1}/{warmup}")
+                    print(f"Warmup iteration {iter_idx + 1}/{warmup}: {allgather_time:.6f}s")
         else:
             # Asynchronous mode (multiple SDMA queues, matches C++ test)
             if rank == 0:
