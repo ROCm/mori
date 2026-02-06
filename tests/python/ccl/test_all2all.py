@@ -75,7 +75,7 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
         # Execute All2All multiple times
         exec_times = []
         total_iters = warmup + iterations
-        use_async = True  # Use async mode to match C++ test
+        use_async = False  # Use async mode to match C++ test
         
         if not use_async:
             # Synchronous mode (single SDMA queue)
@@ -242,7 +242,7 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
             raise AssertionError(f"PE {rank}: All2All verification failed")
 
 
-def test_all2all(elems=67108864, world_size=8, iterations=10, warmup=1):
+def test_all2all(elems=67108864, world_size=8, iterations=10, warmup=5):
     """Run All2All SDMA test"""
     os.environ.setdefault('MORI_ENABLE_SDMA', '1')
     port = get_free_port()

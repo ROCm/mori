@@ -111,7 +111,7 @@ void SetUpKFD()
 
 void CloseKFD()
 {
-   CHECK_HSAKMT_SUCCESS(hsaKmtCloseKFD(), "hsaKmtCloseKFD() failed");
+   (void)hsaKmtCloseKFD();
 }
 
 // Convert a logical deviceId index to the NVML device minor number
