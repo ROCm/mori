@@ -146,18 +146,29 @@ class AllgatherSdma:
     def __init__(self, my_pe: int, npes: int, 
                  input_buffer_size: Optional[int] = None,
                  output_buffer_size: Optional[int] = None,
-                 transit_buffer_size: Optional[int] = None):
-        """Initialize AllgatherSdma"""
+                 transit_buffer_size: Optional[int] = None,
+                 copy_output_to_user: bool = True):
+        """Initialize AllgatherSdma
+        
+        Args:
+            my_pe: Current PE ID
+            npes: Total number of PEs
+            input_buffer_size: Input transit buffer size in bytes
+            output_buffer_size: Output transit buffer size in bytes
+            transit_buffer_size: Transit buffer size in bytes (split equally for input and output)
+            copy_output_to_user: If True, copy output_transit_buffer to user output buffer (default True).
+                                If False, user should directly use output_transit_buffer via get_output_transit_buffer()
+        """
         self.my_pe = my_pe
         self.npes = npes
         handle_class = _cpp_allgather_factory("AllgatherSdmaHandle")
         
         if input_buffer_size is not None and output_buffer_size is not None:
-            self._handle = handle_class(my_pe, npes, input_buffer_size, output_buffer_size)
+            self._handle = handle_class(my_pe, npes, input_buffer_size, output_buffer_size, copy_output_to_user)
         elif transit_buffer_size is not None:
-            self._handle = handle_class(my_pe, npes, transit_buffer_size)
+            self._handle = handle_class(my_pe, npes, transit_buffer_size, copy_output_to_user)
         else:
-            self._handle = handle_class(my_pe, npes, 512 * 1024 * 1024)
+            self._handle = handle_class(my_pe, npes, 512 * 1024 * 1024, copy_output_to_user)
 
     def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
         """Execute AllGATHER SDMA operation.
@@ -216,3 +227,21 @@ class AllgatherSdma:
     def reset_flags(self):
         """Reset synchronization flags"""
         self._handle.reset_flags()
+
+    def get_output_transit_buffer(self, device=None):
+        """Get output transit buffer as a PyTorch tensor.
+        
+        Args:
+            device: Optional device specification. Can be:
+                - An int: device index (e.g., 0, 1)
+                - A CUDA tensor: uses the device of that tensor
+                - None: uses the current CUDA device
+        
+        Returns:
+            torch.Tensor: Output transit buffer as a CUDA tensor (uint32, 1D)
+            
+        Note:
+            The tensor is a view of the internal buffer. Do not modify the buffer
+            while an async operation is in progress.
+        """
+        return self._handle.get_output_transit_buffer(device)

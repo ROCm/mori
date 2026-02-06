@@ -67,6 +67,10 @@ private:
     hipStream_t async_stream_;                 // Saved stream for async operation
     double async_start_time_;                  // Start time for async operation
     // ============================================================
+    
+    // Copy mode flag: if true, copy output_transit_buffer to user output buffer
+    // if false, user should directly use output_transit_buffer
+    bool copy_output_to_user_;
 
     // Disable copy constructor and assignment operator
     AllgatherSdma(const AllgatherSdma&) = delete;
@@ -89,8 +93,9 @@ public:
      * @param myPe Current PE ID
      * @param npes Total number of PEs
      * @param transit_buffer_size Transit buffer size in bytes (default 512MB), half for input and half for output
+     * @param copy_output_to_user If true, copy output_transit_buffer to user output buffer (default true)
      */
-    AllgatherSdma(int myPe, int npes, size_t transit_buffer_size = 512 * 1024 * 1024);
+    AllgatherSdma(int myPe, int npes, size_t transit_buffer_size = 512 * 1024 * 1024, bool copy_output_to_user = true);
 
     /**
      * @brief Constructor, specifying input and output transit buffer sizes separately
@@ -98,8 +103,9 @@ public:
      * @param npes Total number of PEs
      * @param input_buffer_size Input transit buffer size in bytes
      * @param output_buffer_size Output transit buffer size in bytes
+     * @param copy_output_to_user If true, copy output_transit_buffer to user output buffer (default true)
      */
-    AllgatherSdma(int myPe, int npes, size_t input_buffer_size, size_t output_buffer_size);
+    AllgatherSdma(int myPe, int npes, size_t input_buffer_size, size_t output_buffer_size, bool copy_output_to_user = true);
 
     /**
      * @brief Destructor, cleans up resources

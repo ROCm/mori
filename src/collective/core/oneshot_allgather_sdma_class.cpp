@@ -40,14 +40,14 @@ void ShmemDeleter::operator()(void* ptr) const {
 #endif
 // Constructor implementation - delegating version
 template <typename T>
-AllgatherSdma<T>::AllgatherSdma(int myPe, int npes, size_t transit_buffer_size)
-    : AllgatherSdma(myPe, npes, transit_buffer_size / 2, transit_buffer_size / 2) {
+AllgatherSdma<T>::AllgatherSdma(int myPe, int npes, size_t transit_buffer_size, bool copy_output_to_user)
+    : AllgatherSdma(myPe, npes, transit_buffer_size / 2, transit_buffer_size / 2, copy_output_to_user) {
     // Delegated to another constructor
 }
 
 // Main constructor implementation
 template <typename T>
-AllgatherSdma<T>::AllgatherSdma(int myPe, int npes, size_t input_buffer_size, size_t output_buffer_size)
+AllgatherSdma<T>::AllgatherSdma(int myPe, int npes, size_t input_buffer_size, size_t output_buffer_size, bool copy_output_to_user)
     : myPe_(myPe),
       npes_(npes),
       dtype_size_(sizeof(T)),
@@ -63,7 +63,8 @@ AllgatherSdma<T>::AllgatherSdma(int myPe, int npes, size_t input_buffer_size, si
       async_output_(nullptr),
       async_total_count_(0),
       async_stream_(nullptr),
-      async_start_time_(0.0) {
+      async_start_time_(0.0),
+      copy_output_to_user_(copy_output_to_user) {
 
     // 1. Allocate and initialize flags memory
     size_t flagsSize = npes_ * sizeof(uint64_t);
@@ -222,9 +223,13 @@ double AllgatherSdma<T>::wait_async(hipStream_t stream) {
             }
         }
 
-        // Step 2: Copy from output transit buffer to user output buffer
-        printf("PE %d: Copying results to user output buffer\n", myPe_);
-        copy_output_to_user(async_output_, async_total_count_, wait_stream);
+        // Step 2: Copy from output transit buffer to user output buffer (if enabled)
+        if (copy_output_to_user_) {
+            printf("PE %d: Copying results to user output buffer\n", myPe_);
+            copy_output_to_user(async_output_, async_total_count_, wait_stream);
+        } else {
+            printf("PE %d: Skipping copy to user output buffer (using output_transit_buffer directly)\n", myPe_);
+        }
 
         // Final synchronization
         if (wait_stream != nullptr) {
@@ -438,9 +443,11 @@ bool AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
     //        return false;
     //    }
 
-        // Step 4: Copy from output transit buffer to user output buffer
+        // Step 4: Copy from output transit buffer to user output buffer (if enabled)
         // Note: Synchronization is handled by Python layer
-    //    copy_output_to_user(output, total_count, stream);
+        if (copy_output_to_user_) {
+            copy_output_to_user(output, total_count, stream);
+        }
 
     //} catch (const std::exception& e) {
     //    fprintf(stderr, "PE %d: Allgather operation failed: %s\n", myPe_, e.what());
