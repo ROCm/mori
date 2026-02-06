@@ -584,7 +584,53 @@ void RegisterMoriCcl(pybind11::module_& m) {
             "Cancel ongoing async operation")
         .def("reset_flags",
             &mori::collective::All2allSdma<uint32_t>::resetFlags,
-            "Reset synchronization flags");
+            "Reset synchronization flags")
+        .def("get_output_transit_buffer",
+            [](mori::collective::All2allSdma<uint32_t>& self, py::object device_obj) -> torch::Tensor {
+                void* buffer_ptr = self.getOutputTransitBuffer();
+                size_t buffer_size = self.getOutputTransitBufferSize();
+                
+                if (buffer_ptr == nullptr) {
+                    throw std::runtime_error("Output transit buffer is null");
+                }
+                
+                // Convert buffer size from bytes to number of uint32_t elements
+                size_t num_elements = buffer_size / sizeof(uint32_t);
+                
+                // Determine device index
+                int device_index = 0;
+                if (!device_obj.is_none()) {
+                    if (py::isinstance<torch::Tensor>(device_obj)) {
+                        // If a tensor is provided, use its device
+                        torch::Tensor tensor = device_obj.cast<torch::Tensor>();
+                        if (tensor.is_cuda()) {
+                            device_index = tensor.device().index();
+                        }
+                    } else {
+                        // Try to cast as int
+                        try {
+                            device_index = device_obj.cast<int>();
+                        } catch (...) {
+                            throw std::runtime_error("device must be an int or a CUDA tensor");
+                        }
+                    }
+                } else {
+                    // Default to current device
+                    device_index = at::cuda::current_device();
+                }
+                
+                // Create a tensor from the buffer
+                // Note: The buffer is on GPU (CUDA), so we use torch::kCUDA device
+                torch::Tensor tensor = torch::from_blob(
+                    buffer_ptr,
+                    {static_cast<int64_t>(num_elements)},
+                    torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCUDA, device_index)
+                );
+                
+                return tensor;
+            },
+            py::arg("device") = py::none(),
+            "Get output transit buffer as a PyTorch tensor. device can be an int (device index) or a CUDA tensor (to use its device), or None (to use current device)");
 
     // Keep old function-based interface for backward compatibility (optional)
     m.def("all2all_sdma",

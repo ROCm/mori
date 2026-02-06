@@ -135,6 +135,15 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
         # Verify results
         output_data_cpu = output_tensor.cpu().numpy()
         
+        # Get output transit buffer and verify
+        # Pass the output_tensor to ensure the buffer is on the correct device
+        output_transit_buffer = all2all.get_output_transit_buffer(device=output_tensor)
+        output_transit_buffer_cpu = output_transit_buffer.cpu().numpy()
+        
+        if rank == 0:
+            print(f"\nPE {rank}: Output transit buffer size: {output_transit_buffer.size(0)} elements")
+            print(f"PE {rank}: Output transit buffer first 10 values: {output_transit_buffer_cpu[:10]}")
+        
         success = True
         for src_pe in range(npes):
             chunk = output_data_cpu[src_pe * elems_per_pe : (src_pe + 1) * elems_per_pe]
@@ -148,6 +157,24 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
                 success = False
             elif rank == 0:
                 print(f"PE {rank}: Chunk from PE {src_pe} verified (all values = {expected_value})")
+        
+        # Verify output transit buffer contains the same data as output_tensor
+        # The output transit buffer should contain the same data as output_tensor
+        # (at least the first total_bytes / sizeof(uint32_t) elements)
+        expected_elements = total_bytes // 4
+        if output_transit_buffer_cpu.size >= expected_elements:
+            transit_chunk = output_transit_buffer_cpu[:expected_elements]
+            if np.array_equal(transit_chunk, output_data_cpu):
+                if rank == 0:
+                    print(f"PE {rank}: Output transit buffer matches output_tensor ✓")
+            else:
+                print(f"PE {rank}: Output transit buffer does NOT match output_tensor!")
+                print(f"  First 10 values in transit buffer: {transit_chunk[:10]}")
+                print(f"  First 10 values in output_tensor: {output_data_cpu[:10]}")
+                success = False
+        else:
+            if rank == 0:
+                print(f"PE {rank}: Output transit buffer size ({output_transit_buffer_cpu.size}) is smaller than expected ({expected_elements})")
 
         torch.cuda.synchronize()
         dist.barrier()

@@ -106,6 +106,24 @@ class All2allSdma:
         """Reset synchronization flags"""
         self._handle.reset_flags()
 
+    def get_output_transit_buffer(self, device=None):
+        """Get output transit buffer as a PyTorch tensor.
+        
+        Args:
+            device: Optional device specification. Can be:
+                - An int: device index (e.g., 0, 1)
+                - A CUDA tensor: uses the device of that tensor
+                - None: uses the current CUDA device
+        
+        Returns:
+            torch.Tensor: Output transit buffer as a CUDA tensor (uint32, 1D)
+            
+        Note:
+            The tensor is a view of the internal buffer. Do not modify the buffer
+            while an async operation is in progress.
+        """
+        return self._handle.get_output_transit_buffer(device)
+
 def _cpp_allgather_factory(entity_name: str):
     """Factory function to get C++ entities from mori_cpp module"""
     return getattr(mori_cpp, entity_name)
