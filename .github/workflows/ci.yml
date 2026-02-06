@@ -6,6 +6,7 @@ jobs:
   build:
     name: mori build
     runs-on: label-1
+    timeout-minutes: 10
     steps:
       - name: clone source code
         run: |
@@ -27,7 +28,11 @@ jobs:
           #pip install --target /apps/mori-ci/packages -r requirements-build.txt
           pip install -r requirements-build.txt
           #git submodule update --init --recursive
+          #it indicates the use of a mellanox NIC by default, it has been verified on MI300X/MI355X.
           #pip3 install . --no-build-isolation
+          #The string "BNXT" indicates the use of a Thor 2 NIC, it has been verified on MI300X/MI355X.
+          #USE_BNXT=ON pip3 install . --no-build-isolation 
+          #The string "IONIC" indicates the use of a Thor 2 NIC, it has been verified on MI300X/MI355X.
           USE_IONIC=ON pip3 install . --no-build-isolation
           # --target /apps/mori-ci/python-packages
           scp -P 2233 -r /root/actions-runner/_work/mori/mori/mori root@smci355-ccs-aus-n08-33:/root/actions-runner/_work/mori/mori/
@@ -35,6 +40,7 @@ jobs:
     name: mori test
     needs: build
     runs-on: label-1
+    timeout-minutes: 10
     steps:
         #- uses: actions/checkout@v4
         #- name: Set up Python
