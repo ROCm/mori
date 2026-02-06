@@ -41,10 +41,13 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
         print(f"PE {rank}/{world_size}: SHMEM initialized, myPe={my_pe}, npes={npes}")
 
         # Create All2all object with sufficient buffer size
+        # Use copy_output_to_user=False to test direct use of output_transit_buffer
+        copy_output_to_user = True  # Set to False to use output_transit_buffer directly
         all2all = All2allSdma(my_pe, npes, 
                              input_buffer_size=total_bytes,
-                             output_buffer_size=total_bytes)
-        print(f"PE {rank}: Created All2allSdma object")
+                             output_buffer_size=total_bytes,
+                             copy_output_to_user=copy_output_to_user)
+        print(f"PE {rank}: Created All2allSdma object (copy_output_to_user={copy_output_to_user})")
 
         # Allocate GPU memory
         # Note: Using torch.uint32 to match C++ All2allSdma<uint32_t>
@@ -132,9 +135,6 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
             print(f"  Max time: {max_time:.6f}s")
             print(f"  Avg time: {avg_time:.6f}s")
 
-        # Verify results
-        output_data_cpu = output_tensor.cpu().numpy()
-        
         # Get output transit buffer and verify
         # Pass the output_tensor to ensure the buffer is on the correct device
         output_transit_buffer = all2all.get_output_transit_buffer(device=output_tensor)
@@ -144,37 +144,59 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
             print(f"\nPE {rank}: Output transit buffer size: {output_transit_buffer.size(0)} elements")
             print(f"PE {rank}: Output transit buffer first 10 values: {output_transit_buffer_cpu[:10]}")
         
+        # Verify results based on copy_output_to_user mode
         success = True
-        for src_pe in range(npes):
-            chunk = output_data_cpu[src_pe * elems_per_pe : (src_pe + 1) * elems_per_pe]
-            expected_value = (src_pe + 1) * 1000 + my_pe
-            
-            if not np.all(chunk == expected_value):
-                print(f"PE {rank}: Chunk from PE {src_pe} verification FAILED!")
-                print(f"  Expected all values = {expected_value}")
-                print(f"  Got first 10 values: {chunk[:10]}")
-                print(f"  Got unique values: {np.unique(chunk)}")
-                success = False
-            elif rank == 0:
-                print(f"PE {rank}: Chunk from PE {src_pe} verified (all values = {expected_value})")
-        
-        # Verify output transit buffer contains the same data as output_tensor
-        # The output transit buffer should contain the same data as output_tensor
-        # (at least the first total_bytes / sizeof(uint32_t) elements)
         expected_elements = total_bytes // 4
-        if output_transit_buffer_cpu.size >= expected_elements:
-            transit_chunk = output_transit_buffer_cpu[:expected_elements]
-            if np.array_equal(transit_chunk, output_data_cpu):
-                if rank == 0:
-                    print(f"PE {rank}: Output transit buffer matches output_tensor ✓")
-            else:
-                print(f"PE {rank}: Output transit buffer does NOT match output_tensor!")
-                print(f"  First 10 values in transit buffer: {transit_chunk[:10]}")
-                print(f"  First 10 values in output_tensor: {output_data_cpu[:10]}")
-                success = False
+        
+        if copy_output_to_user:
+            # In COPY mode: verify output_tensor and output_transit_buffer match
+            output_data_cpu = output_tensor.cpu().numpy()
+            
+            for src_pe in range(npes):
+                chunk = output_data_cpu[src_pe * elems_per_pe : (src_pe + 1) * elems_per_pe]
+                expected_value = (src_pe + 1) * 1000 + my_pe
+                
+                if not np.all(chunk == expected_value):
+                    print(f"PE {rank}: Chunk from PE {src_pe} verification FAILED!")
+                    print(f"  Expected all values = {expected_value}")
+                    print(f"  Got first 10 values: {chunk[:10]}")
+                    print(f"  Got unique values: {np.unique(chunk)}")
+                    success = False
+                elif rank == 0:
+                    print(f"PE {rank}: Chunk from PE {src_pe} verified (all values = {expected_value})")
+            
+            # Verify output transit buffer contains the same data as output_tensor
+            if output_transit_buffer_cpu.size >= expected_elements:
+                transit_chunk = output_transit_buffer_cpu[:expected_elements]
+                if np.array_equal(transit_chunk, output_data_cpu):
+                    if rank == 0:
+                        print(f"PE {rank}: Output transit buffer matches output_tensor ✓")
+                else:
+                    print(f"PE {rank}: Output transit buffer does NOT match output_tensor!")
+                    print(f"  First 10 values in transit buffer: {transit_chunk[:10]}")
+                    print(f"  First 10 values in output_tensor: {output_data_cpu[:10]}")
+                    success = False
         else:
+            # In non-COPY mode: verify output_transit_buffer directly (output_tensor may not be filled)
             if rank == 0:
-                print(f"PE {rank}: Output transit buffer size ({output_transit_buffer_cpu.size}) is smaller than expected ({expected_elements})")
+                print(f"PE {rank}: Verifying output_transit_buffer directly (copy_output_to_user=False)")
+            
+            if output_transit_buffer_cpu.size >= expected_elements:
+                transit_chunk = output_transit_buffer_cpu[:expected_elements]
+                for src_pe in range(npes):
+                    transit_buffer_chunk = transit_chunk[src_pe * elems_per_pe : (src_pe + 1) * elems_per_pe]
+                    expected_value = (src_pe + 1) * 1000 + my_pe
+                    if np.all(transit_buffer_chunk == expected_value):
+                        if rank == 0:
+                            print(f"  PE {rank}: Transit buffer chunk from PE {src_pe}: ✓ (all values = {expected_value})")
+                    else:
+                        print(f"PE {rank}: Transit buffer chunk from PE {src_pe}: ✗ FAILED!")
+                        print(f"    Expected: {expected_value}, Got unique values: {np.unique(transit_buffer_chunk)}")
+                        success = False
+            else:
+                if rank == 0:
+                    print(f"PE {rank}: Output transit buffer size ({output_transit_buffer_cpu.size}) is smaller than expected ({expected_elements})")
+                success = False
 
         torch.cuda.synchronize()
         dist.barrier()

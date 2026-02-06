@@ -449,17 +449,19 @@ void RegisterMoriIo(pybind11::module_& m) {
 void RegisterMoriCcl(pybind11::module_& m) {
     // Bind All2allSdma class (uint32_t version)
     py::class_<mori::collective::All2allSdma<uint32_t>>(m, "All2allSdmaHandle")
-        .def(py::init<int, int, size_t, size_t>(),
+        .def(py::init<int, int, size_t, size_t, bool>(),
              py::arg("my_pe"),
              py::arg("npes"),
              py::arg("input_buffer_size"),
              py::arg("output_buffer_size"),
-             "Initialize All2allSdma with PE ID, number of PEs, and buffer sizes")
-        .def(py::init<int, int, size_t>(),
+             py::arg("copy_output_to_user") = true,
+             "Initialize All2allSdma with PE ID, number of PEs, buffer sizes, and copy mode")
+        .def(py::init<int, int, size_t, bool>(),
              py::arg("my_pe"),
              py::arg("npes"),
              py::arg("transit_buffer_size") = 512 * 1024 * 1024,
-             "Initialize All2allSdma with PE ID, number of PEs, and transit buffer size (default 512MB)")
+             py::arg("copy_output_to_user") = true,
+             "Initialize All2allSdma with PE ID, number of PEs, transit buffer size (default 512MB), and copy mode")
         .def("__call__",
             [](mori::collective::All2allSdma<uint32_t>& self,
                const torch::Tensor& input_tensor,

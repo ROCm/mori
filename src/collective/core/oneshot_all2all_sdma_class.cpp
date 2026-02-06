@@ -40,14 +40,14 @@ void ShmemDeleter::operator()(void* ptr) const {
 #endif
 // Constructor implementation - delegating version
 template <typename T>
-All2allSdma<T>::All2allSdma(int myPe, int npes, size_t transit_buffer_size)
-    : All2allSdma(myPe, npes, transit_buffer_size / 2, transit_buffer_size / 2) {
+All2allSdma<T>::All2allSdma(int myPe, int npes, size_t transit_buffer_size, bool copy_output_to_user)
+    : All2allSdma(myPe, npes, transit_buffer_size / 2, transit_buffer_size / 2, copy_output_to_user) {
     // Delegated to another constructor
 }
 
 // Main constructor implementation
 template <typename T>
-All2allSdma<T>::All2allSdma(int myPe, int npes, size_t input_buffer_size, size_t output_buffer_size)
+All2allSdma<T>::All2allSdma(int myPe, int npes, size_t input_buffer_size, size_t output_buffer_size, bool copy_output_to_user)
     : myPe_(myPe),
       npes_(npes),
       dtype_size_(sizeof(T)),
@@ -63,7 +63,8 @@ All2allSdma<T>::All2allSdma(int myPe, int npes, size_t input_buffer_size, size_t
       async_output_(nullptr),
       async_total_count_(0),
       async_stream_(nullptr),
-      async_start_time_(0.0) {
+      async_start_time_(0.0),
+      copy_output_to_user_(copy_output_to_user) {
 
     // 1. Allocate and initialize flags memory
     size_t flagsSize = npes_ * sizeof(uint64_t);
@@ -222,9 +223,13 @@ double All2allSdma<T>::wait_async(hipStream_t stream) {
             }
         }
 
-        // Step 2: Copy from output transit buffer to user output buffer
-        printf("PE %d: Copying results to user output buffer\n", myPe_);
-        copy_output_to_user(async_output_, async_total_count_, wait_stream);
+        // Step 2: Copy from output transit buffer to user output buffer (if enabled)
+        if (copy_output_to_user_) {
+            printf("PE %d: Copying results to user output buffer\n", myPe_);
+            copy_output_to_user(async_output_, async_total_count_, wait_stream);
+        } else {
+            printf("PE %d: Skipping copy to user output buffer (using output_transit_buffer directly)\n", myPe_);
+        }
 
         // Final synchronization
         if (wait_stream != nullptr) {
@@ -452,8 +457,10 @@ double All2allSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
             throw std::runtime_error("Synchronization failed");
         }
 
-        // Step 4: Copy from output transit buffer to user output buffer
-        copy_output_to_user(output, total_count, stream);
+        // Step 4: Copy from output transit buffer to user output buffer (if enabled)
+        if (copy_output_to_user_) {
+            copy_output_to_user(output, total_count, stream);
+        }
 
         // Final synchronization
         if (stream != nullptr) {
