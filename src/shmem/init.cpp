@@ -434,6 +434,92 @@ static void ConfigureHeapInfoForGpu(GpuStates* gpuStates, const ShmemStates* sta
   }
 }
 
+// Allocate internal synchronization memory for device barriers
+static void AllocateInternalSync(GpuStates* gpuStates, const ShmemStates* states) {
+  constexpr size_t MORI_INTERNAL_SYNC_SIZE = 128 * sizeof(uint64_t);
+  constexpr size_t ALIGNMENT = 256;
+  void* syncPtr = nullptr;
+
+  switch (states->mode) {
+    case ShmemMode::StaticHeap: {
+      uintptr_t allocAddr =
+          states->memoryStates->symmMemMgr->GetHeapVAManager()->Allocate(MORI_INTERNAL_SYNC_SIZE,
+                                                                         ALIGNMENT);
+      if (allocAddr == 0) {
+        MORI_SHMEM_ERROR("Out of static heap memory for internal sync buffer!");
+      } else {
+        syncPtr = reinterpret_cast<void*>(allocAddr);
+        states->memoryStates->symmMemMgr->RegisterStaticHeapSubRegion(
+            syncPtr, MORI_INTERNAL_SYNC_SIZE, &states->memoryStates->staticHeapObj);
+      }
+      break;
+    }
+
+    case ShmemMode::VMHeap: {
+      application::SymmMemObjPtr syncObj = states->memoryStates->symmMemMgr->VMMAllocChunk(
+          MORI_INTERNAL_SYNC_SIZE, states->memoryStates->heapType);
+      if (syncObj.IsValid()) {
+        syncPtr = syncObj.cpu->localPtr;
+      } else {
+        MORI_SHMEM_ERROR("Failed to allocate internal sync buffer from VMM heap!");
+      }
+      break;
+    }
+
+    case ShmemMode::Isolation: {
+      application::SymmMemObjPtr syncObj =
+          states->memoryStates->symmMemMgr->Malloc(MORI_INTERNAL_SYNC_SIZE);
+      if (syncObj.IsValid()) {
+        syncPtr = syncObj.cpu->localPtr;
+      } else {
+        MORI_SHMEM_ERROR("Failed to allocate internal sync buffer in isolation mode!");
+      }
+      break;
+    }
+
+    default:
+      MORI_SHMEM_ERROR("Unknown ShmemMode for internal sync allocation: {}",
+                       static_cast<int>(states->mode));
+      break;
+  }
+
+  if (syncPtr != nullptr) {
+    gpuStates->internalSyncPtr = reinterpret_cast<uint64_t*>(syncPtr);
+    HIP_RUNTIME_CHECK(hipMemset(gpuStates->internalSyncPtr, 0, MORI_INTERNAL_SYNC_SIZE));
+    MORI_SHMEM_TRACE("Internal sync pointer allocated at 0x{:x} (mode={})",
+                     reinterpret_cast<uintptr_t>(gpuStates->internalSyncPtr),
+                     static_cast<int>(states->mode));
+  }
+}
+
+// Free internal synchronization memory
+static void FinalizeInternalSync(const ShmemStates* states) {
+  if (globalGpuStates.internalSyncPtr == nullptr) {
+    return;
+  }
+
+  void* syncPtr = reinterpret_cast<void*>(globalGpuStates.internalSyncPtr);
+  switch (states->mode) {
+    case ShmemMode::StaticHeap: {
+      states->memoryStates->symmMemMgr->DeregisterStaticHeapSubRegion(syncPtr);
+      states->memoryStates->symmMemMgr->GetHeapVAManager()->Free(
+          reinterpret_cast<uintptr_t>(syncPtr));
+      break;
+    }
+    case ShmemMode::VMHeap: {
+      states->memoryStates->symmMemMgr->VMMFreeChunk(syncPtr);
+      break;
+    }
+    case ShmemMode::Isolation: {
+      states->memoryStates->symmMemMgr->Free(syncPtr);
+      break;
+    }
+    default:
+      break;
+  }
+  MORI_SHMEM_TRACE("Internal sync memory freed (mode={})", static_cast<int>(states->mode));
+}
+
 // Copy GpuStates structure to device constant memory
 static void CopyGpuStatesToDevice(const GpuStates* gpuStates) {
   GpuStates* globalGpuStatesAddr = nullptr;
@@ -466,35 +552,7 @@ void GpuStateInit() {
   ConfigureHeapInfoForGpu(&gpuStates, states);
 
   // Allocate internal synchronization memory for device barriers
-  if (states->mode != ShmemMode::Isolation) {
-    constexpr size_t MORI_INTERNAL_SYNC_SIZE = 128 * sizeof(uint64_t);
-    std::lock_guard<std::mutex> lock(states->memoryStates->heapLock);
-
-    if (states->memoryStates->useVMMHeap && states->memoryStates->vmmHeapInitialized) {
-      uintptr_t heapBase = reinterpret_cast<uintptr_t>(states->memoryStates->vmmHeapBaseAddr);
-      // TODO: allocate from VMM heap for internal sync
-      MORI_SHMEM_WARN("Device barrier sync not yet supported in VMM heap mode");
-    } else {
-      uintptr_t heapBase = reinterpret_cast<uintptr_t>(states->memoryStates->staticHeapBasePtr);
-      if (states->memoryStates->staticHeapUsed + MORI_INTERNAL_SYNC_SIZE >
-          states->memoryStates->staticHeapSize) {
-        MORI_SHMEM_ERROR(
-            "Out of symmetric heap memory for internal sync! Requested: {} bytes, Available: {} "
-            "bytes",
-            MORI_INTERNAL_SYNC_SIZE,
-            states->memoryStates->staticHeapSize - states->memoryStates->staticHeapUsed);
-      } else {
-        void* ptr = reinterpret_cast<void*>(heapBase + states->memoryStates->staticHeapUsed);
-        states->memoryStates->staticHeapUsed += MORI_INTERNAL_SYNC_SIZE;
-        states->memoryStates->symmMemMgr->RegisterStaticHeapSubRegion(
-            ptr, MORI_INTERNAL_SYNC_SIZE, &states->memoryStates->staticHeapObj);
-        gpuStates.internalSyncPtr = reinterpret_cast<uint64_t*>(ptr);
-        HIP_RUNTIME_CHECK(hipMemset(gpuStates.internalSyncPtr, 0, MORI_INTERNAL_SYNC_SIZE));
-        MORI_SHMEM_TRACE("Internal sync pointer allocated at 0x{:x}",
-                         reinterpret_cast<uintptr_t>(gpuStates.internalSyncPtr));
-      }
-    }
-  }
+  AllocateInternalSync(&gpuStates, states);
 
   // Copy complete state to device
   CopyGpuStatesToDevice(&gpuStates);
@@ -654,10 +712,7 @@ int ShmemFinalize() {
   FinalizeGpuStates();
 
   // Clean up internal sync memory
-  if (globalGpuStates.internalSyncPtr != nullptr) {
-    states->memoryStates->symmMemMgr->DeregisterStaticHeapSubRegion(
-        globalGpuStates.internalSyncPtr);
-  }
+  FinalizeInternalSync(states);
 
   FinalizeHeap(states);
   FinalizeAllStates(states);
