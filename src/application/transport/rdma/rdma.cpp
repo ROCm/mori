@@ -272,8 +272,13 @@ RdmaDeviceContext::RdmaDeviceContext(RdmaDevice* device, ibv_pd* inPd) : device(
 }
 
 RdmaDeviceContext::~RdmaDeviceContext() {
-  ibv_dealloc_pd(pd);
+  for (auto& it : mrPool) {
+    ibv_dereg_mr(it.second);
+  }
+  mrPool.clear();
+
   if (srq != nullptr) ibv_destroy_srq(srq);
+  ibv_dealloc_pd(pd);
 }
 
 RdmaDevice* RdmaDeviceContext::GetRdmaDevice() { return device; }
@@ -283,9 +288,39 @@ ibv_context* RdmaDeviceContext::GetIbvContext() { return GetRdmaDevice()->defaul
 application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegion(void* ptr, size_t size,
                                                                           int accessFlag) {
   ibv_mr* mr = ibv_reg_mr(pd, ptr, size, accessFlag);
+  if (!mr) {
+    MORI_APP_ERROR(
+        "RegisterRdmaMemoryRegion failed! addr:{}, size:{}, accessFlag:{}, errno:{} ({})", ptr,
+        size, accessFlag, errno, strerror(errno));
+    std::abort();
+  }
   MORI_APP_TRACE("RegisterRdmaMemoryRegion, addr:{}, size:{}, lkey:{}, rkey:{}\n", ptr, size,
                  mr->lkey, mr->rkey);
-  assert(mr);
+  mrPool.insert({ptr, mr});
+  application::RdmaMemoryRegion handle;
+  handle.addr = reinterpret_cast<uintptr_t>(ptr);
+  handle.lkey = mr->lkey;
+  handle.rkey = mr->rkey;
+  handle.length = mr->length;
+  return handle;
+}
+
+application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(void* ptr,
+                                                                                size_t size,
+                                                                                int dmabuf_fd,
+                                                                                int accessFlag) {
+  ibv_mr* mr =
+      ibv_reg_dmabuf_mr(pd, 0, size, reinterpret_cast<uint64_t>(ptr), dmabuf_fd, accessFlag);
+  if (!mr) {
+    MORI_APP_ERROR(
+        "RegisterRdmaMemoryRegionDmabuf failed! addr:{}, size:{}, dmabuf_fd:{}, accessFlag:{}, "
+        "errno:{} ({})",
+        ptr, size, dmabuf_fd, accessFlag, errno, strerror(errno));
+    std::abort();
+  }
+  MORI_APP_TRACE(
+      "RegisterRdmaMemoryRegionDmabuf, addr:{}, size:{}, dmabuf_fd:{}, lkey:{}, rkey:{}\n", ptr,
+      size, dmabuf_fd, mr->lkey, mr->rkey);
   mrPool.insert({ptr, mr});
   application::RdmaMemoryRegion handle;
   handle.addr = reinterpret_cast<uintptr_t>(ptr);
@@ -437,7 +472,7 @@ RdmaContext::RdmaContext(RdmaBackendType backendType) : backendType(backendType)
 
 RdmaContext::~RdmaContext() {
   if (deviceList) ibv_free_device_list(deviceList);
-  for (RdmaDevice* device : rdmaDeviceList) free(device);
+  for (RdmaDevice* device : rdmaDeviceList) delete device;
 }
 
 const RdmaDeviceList& RdmaContext::GetRdmaDeviceList() const { return rdmaDeviceList; }
@@ -449,6 +484,8 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
   ibv_device_attr_ex device_attr_ex;
   int status = ibv_query_device_ex(context, NULL, &device_attr_ex);
   assert(!status);
+  ibv_close_device(context);
+
   // device_attr_ex.orig_attr.vendor_id = 0x14E4;
   if (backendType == RdmaBackendType::IBVerbs) {
     return new IBVerbsDevice(inDevice);

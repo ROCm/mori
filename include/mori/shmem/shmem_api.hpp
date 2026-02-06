@@ -22,9 +22,10 @@
 #pragma once
 
 #include <mpi.h>
+
 #include <array>
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 
 #include "mori/application/application.hpp"
 
@@ -38,10 +39,10 @@ namespace shmem {
 using mori_shmem_uniqueid_t = std::array<uint8_t, MORI_SHMEM_UNIQUE_ID_BYTES>;
 
 struct mori_shmem_init_attr_t {
-    int32_t rank;
-    int32_t nranks;
-    mori_shmem_uniqueid_t uid;
-    void* mpi_comm;  // Optional MPI_Comm pointer
+  int32_t rank;
+  int32_t nranks;
+  mori_shmem_uniqueid_t uid;
+  void* mpi_comm;  // Optional MPI_Comm pointer
 };
 
 // Initialization flags
@@ -50,12 +51,14 @@ constexpr unsigned int MORI_SHMEM_INIT_WITH_UNIQUEID = 1;
 
 // TODO: provide unified initialize / finalize APIs
 int ShmemInit(application::BootstrapNetwork* bootNet);
+int ShmemInit();  // Default initialization using MPI_COMM_WORLD
 int ShmemMpiInit(MPI_Comm);
 int ShmemTorchProcessGroupInit(const std::string& groupName);
 
 // UniqueId-based initialization APIs (nvshmem/rocshmem compatible)
 int ShmemGetUniqueId(mori_shmem_uniqueid_t* uid);
-int ShmemSetAttrUniqueIdArgs(int rank, int nranks, mori_shmem_uniqueid_t* uid, mori_shmem_init_attr_t* attr);
+int ShmemSetAttrUniqueIdArgs(int rank, int nranks, mori_shmem_uniqueid_t* uid,
+                             mori_shmem_init_attr_t* attr);
 int ShmemInitAttr(unsigned int flags, mori_shmem_init_attr_t* attr);
 
 int ShmemFinalize();

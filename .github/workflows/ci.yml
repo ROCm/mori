@@ -2,8 +2,6 @@ name: mori
 on:
   push:
   workflow_dispatch:
-  schedule:
-    - cron: '30 5 * * *'
 jobs:
   build:
     name: mori build
@@ -19,13 +17,13 @@ jobs:
           cmake --version
           echo "0. PATH: $PATH"
           cmake --version
-          #rm -rf mori 
+          #rm -rf mori
           #git clone https://github.com/ROCm/mori.git
           cd mori
           ls
           rm -rf build
           #git config --global --add safe.directory /home/fizhang/actions-runner/_work/mori/mori/mori
-          git checkout main
+          git checkout ci-new
           git pull
           #pip install --target /apps/mori-ci/packages -r requirements-build.txt
           pip install -r requirements-build.txt
@@ -74,7 +72,6 @@ jobs:
 
           echo "4. mori-ibgda test case: dist_write"
           mpiexec --allow-run-as-root -x MORI_GLOBAL_LOG_LEVEL=TRACE -np 2 ./build/examples/dist_write -c 4 -t 256 -q 4
-         
           echo "1. mori-shmem test case: test_api.py"
           pytest ./tests/python/shmem/test_api.py
 
@@ -95,22 +92,13 @@ jobs:
 
           echo "3. mori-ep test case: bench"
           GLOO_SOCKET_IFNAME=enp81s0f1 torchrun --nnodes=1 --node_rank=0 --nproc_per_node=1 --master_addr="smci355-ccs-aus-n08-29" --master_port=2222 examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096
-          
+
           echo "4. mori-ep test case: inter bench"
           #export MORI_RDMA_DEVICES=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_6,ionic_7
-          #ssh -p 2233 root@smci355-ccs-aus-n08-33 "hostname"   
+          #ssh -p 2233 root@smci355-ccs-aus-n08-33 "hostname"
           ssh -p 2233 root@smci355-ccs-aus-n08-33 "GLOO_SOCKET_IFNAME=enp81s0f1 /opt/venv/bin/torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr='smci355-ccs-aus-n08-33' --master_port=1234 /root/actions-runner/_work/mori/mori/mori/examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096 &" &
           GLOO_SOCKET_IFNAME=enp81s0f1 torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 --master_addr="smci355-ccs-aus-n08-33" --master_port=1234 examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096
           sleep 1
           echo "5. mori-ep test case: inter stress"
           ssh -p 2233 root@smci355-ccs-aus-n08-33 "GLOO_SOCKET_IFNAME=enp81s0f1 /opt/venv/bin/torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr='smci355-ccs-aus-n08-33' --master_port=1234 /root/actions-runner/_work/mori/mori/mori/examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd stress --kernel-type v1 --num-qp 2 --max-tokens 128 &" &
           GLOO_SOCKET_IFNAME=enp81s0f1 torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 --master_addr="smci355-ccs-aus-n08-33" --master_port=1234 examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd stress --kernel-type v1 --num-qp 2 --max-tokens 128
-
-      - name: ❌ Notify on failure
-        if: failure()
-        run: |
-          echo "::error::[ALERT] MORI CI TEST FAILED!"
-          echo "Workflow: ${{ github.workflow }}"
-          echo "Repository: ${{ github.repository }}"
-          echo "Branch: ${{ github.ref_name }}"
-          echo "Run URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"          

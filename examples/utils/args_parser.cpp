@@ -146,6 +146,7 @@ void BenchmarkConfig::readArgs(int argc, char** argv) {
   int c;
   static struct option long_opts[] = {{"bidir", no_argument, 0, 0},
                                       {"report_msgrate", no_argument, 0, 0},
+                                      {"use_vmm", no_argument, 0, 0},
                                       {"dir", required_argument, 0, 0},
                                       {"issue", required_argument, 0, 0},
                                       {"help", no_argument, 0, 'h'},
@@ -187,6 +188,7 @@ void BenchmarkConfig::readArgs(int argc, char** argv) {
             "xor>, compare_swap> \n"
             "--bidir: run bidirectional test \n"
             "--msgrate: report message rate (MMPs)\n"
+            "--use_vmm: use VMM (Virtual Memory Management) for buffer allocation \n"
             "--dir: <read, write> (whether to run put or get operations) \n"
             "--issue: <on_stream, host> (applicable in some host pt-to-pt tests) \n");
         exit(0);
@@ -196,6 +198,8 @@ void BenchmarkConfig::readArgs(int argc, char** argv) {
           bidirectional = true;
         else if (!strcmp(name, "report_msgrate"))
           report_msgrate = true;
+        else if (!strcmp(name, "use_vmm"))
+          use_vmm = true;
         else if (!strcmp(name, "dir"))
           dir = (!strcmp(optarg, "read") ? DirectionConfig{READ, "read"}
                                          : DirectionConfig{WRITE, "write"});
@@ -277,10 +281,10 @@ void BenchmarkConfig::readArgs(int argc, char** argv) {
       "warmup iterations: %zu, number of ctas: %zu, threads per cta: %zu "
       "stride: %zu, datatype: %s, reduce_op: %s, threadgroup_scope: %s, "
       "atomic_op: %s, dir: %s, report_msgrate: %d, bidirectional: %d, "
-      "putget_issue: %s\n",
+      "use_vmm: %d, putget_issue: %s\n",
       min_size, max_size, num_qp, step_factor, iters, warmup_iters, num_blocks, threads_per_block,
       stride, datatype.name.c_str(), reduce_op.name.c_str(), threadgroup_scope.name.c_str(),
-      test_amo.name.c_str(), dir.name.c_str(), report_msgrate, bidirectional,
+      test_amo.name.c_str(), dir.name.c_str(), report_msgrate, bidirectional, use_vmm,
       putget_issue.name.c_str());
   printf(
       "Note: Above is full list of options, any given test will use only a "
