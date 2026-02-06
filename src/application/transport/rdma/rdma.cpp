@@ -34,7 +34,6 @@
 
 #include "infiniband/verbs.h"
 #include "mori/application/transport/rdma/providers/bnxt/bnxt.hpp"
-#include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 #include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"

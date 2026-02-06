@@ -28,7 +28,6 @@
 #include "mori/application/topology/topology.hpp"
 #include "mori/application/utils/udma_barrier.h"
 #include "mori/core/core.hpp"
-#include "mori/application/topology/topology.hpp"
 
 using namespace mori;
 using namespace mori::application;
@@ -432,7 +431,7 @@ int GetGpuidByNicName(std::string nic_name) {
       auto* gpuPci = pciSys->Node(gpu->busId);
       auto* nicPci = pciSys->Node(nic->busId);
 #if 0
-      if (!path) {     
+      if (!path) {
         printf("gpu %s nic %s no direct link\n", gpu->busId.String().c_str(),
                nic->busId.String().c_str());
       } else {

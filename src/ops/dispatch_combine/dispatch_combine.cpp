@@ -438,9 +438,7 @@ void EpDispatchCombineHandle::LaunchCombineRecv(KernelType kernelType, int block
   dim3 block(warpSize * actualWarpNumPerBlock);
 
   size_t sharedMemSize =
-      (config.worldSize * actualWarpNumPerBlock + config.numExpertPerRank * actualWarpNumPerBlock +
-       config.numExpertPerRank) *
-      sizeof(index_t);
+      actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
   auto argsVariant = GetEpDispatchCombineArgsByInputType(*this, 0);
   std::visit(
       [&](auto&& args) {
