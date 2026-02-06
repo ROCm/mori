@@ -148,7 +148,7 @@ class EpDispatchCombineOp:
                     self.auto_block_num,
                     self.auto_rdma_block_num,
                     self.auto_warp_per_block,
-                ) = (80, 0, 16)
+                ) = (128, 0, 16)
         elif self.launch_config_mode == "MANUAL":
             self.auto_block_num, self.auto_rdma_block_num, self.auto_warp_per_block = (
                 None,
