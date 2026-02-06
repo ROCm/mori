@@ -106,8 +106,6 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
   return {out, outWeights, outScales, outIndices, totalRecvTokenNum};
 }
 
-// TODO: translate data type
-// template <typename T>
 std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
     mori::moe::EpDispatchCombineHandle& handle, int kernelType, const torch::Tensor& input,
     const std::optional<torch::Tensor>& weights, const torch::Tensor& topkIds, int blockNum = -1,
@@ -315,6 +313,18 @@ torch::Tensor ConvertCombineInput(mori::moe::EpDispatchCombineHandle& handle,
 }
 #endif  // ENABLE_STANDARD_MOE_ADAPT
 
+void LaunchDispatchRecv(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
+                        int blockNum = -1, int warpPerBlock = -1) {
+  handle.LaunchDispatchRecv((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
+                            at::cuda::getCurrentHIPStream());
+}
+
+void LaunchCombineRecv(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
+                       int blockNum = -1, int warpPerBlock = -1) {
+  handle.LaunchCombineRecv((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
+                           at::cuda::getCurrentHIPStream());
+}
+
 void LaunchReset(mori::moe::EpDispatchCombineHandle& handle) {
   handle.LaunchReset(at::cuda::getCurrentHIPStream());
 }
@@ -401,6 +411,12 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   funcName = std::string("convert_combine_input");
   m.def(funcName.c_str(), &ConvertCombineInput);
 #endif
+
+  funcName = std::string("launch_dispatch_recv");
+  m.def(funcName.c_str(), &LaunchDispatchRecv);
+
+  funcName = std::string("launch_combine_recv");
+  m.def(funcName.c_str(), &LaunchCombineRecv);
 
   funcName = std::string("launch_reset");
   m.def(funcName.c_str(), &LaunchReset);
@@ -524,6 +540,7 @@ void RegisterMoriOps(py::module_& m) {
       .value("InterNode", mori::moe::KernelType::InterNode)
       .value("InterNodeV1", mori::moe::KernelType::InterNodeV1)
       .value("InterNodeV1LL", mori::moe::KernelType::InterNodeV1LL)
+      .value("AsyncLL", mori::moe::KernelType::AsyncLL)
       .export_values();
 
   mori::pybind::RegisterAllProfilerSlots(m);

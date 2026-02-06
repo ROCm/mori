@@ -37,12 +37,7 @@
 namespace mori {
 namespace moe {
 
-enum KernelType {
-  IntraNode = 0,
-  InterNode = 1,
-  InterNodeV1 = 2,
-  InterNodeV1LL = 3,
-};
+enum KernelType { IntraNode = 0, InterNode = 1, InterNodeV1 = 2, InterNodeV1LL = 3, AsyncLL = 4 };
 
 inline const char* HipDataTypeToString(hipDataType dtype) {
   switch (dtype) {
@@ -190,6 +185,8 @@ class EpDispatchCombineHandle {
                                        int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
 #endif
 
+  void LaunchDispatchRecv(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
+  void LaunchCombineRecv(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
   void LaunchReset(hipStream_t = 0);
 
   index_t GetCurRankNumToken() const { return curRankNumToken; }
