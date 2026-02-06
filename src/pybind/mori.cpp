@@ -688,16 +688,18 @@ void RegisterMoriCcl(pybind11::module_& m) {
 
     // Bind AllgatherSdma class (uint32_t version)
     py::class_<mori::collective::AllgatherSdma<uint32_t>>(m, "AllgatherSdmaHandle")
-        .def(py::init<int, int, size_t, size_t>(),
+        .def(py::init<int, int, size_t, size_t, bool>(),
              py::arg("my_pe"),
              py::arg("npes"),
              py::arg("input_buffer_size"),
              py::arg("output_buffer_size"),
+             py::arg("copy_output_to_user") = true,
              "Initialize AllgatherSdma with PE ID, number of PEs, and buffer sizes")
-        .def(py::init<int, int, size_t>(),
+        .def(py::init<int, int, size_t, bool>(),
              py::arg("my_pe"),
              py::arg("npes"),
              py::arg("transit_buffer_size") = 512 * 1024 * 1024,
+             py::arg("copy_output_to_user") = true,
              "Initialize AllgatherSdma with PE ID, number of PEs, and transit buffer size (default 512MB)")
         .def("__call__",
             [](mori::collective::AllgatherSdma<uint32_t>& self,

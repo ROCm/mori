@@ -76,6 +76,9 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
 
         print(f"PE {rank}: Prepared input data with value: {value}")
 
+        # Create CUDA stream for allgather operations (similar to test_allgather_overlap.py)
+        stream = torch.cuda.Stream(device=device)
+        
         torch.cuda.synchronize()
         dist.barrier()
 
@@ -87,12 +90,19 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
         if not use_async:
             # Synchronous mode (single SDMA queue)
             for iter_idx in range(total_iters):
-                exec_time = allgather(input_tensor, output_tensor, elems_per_pe)
+                with torch.cuda.stream(stream):
+                    success = allgather(input_tensor, output_tensor, elems_per_pe)
+                stream.synchronize()
+                
+                if not success:
+                    print(f"PE {rank}: Allgather operation failed at iteration {iter_idx}")
+                    break
                 
                 if iter_idx >= warmup:
-                    exec_times.append(exec_time)
+                    # Note: synchronous mode doesn't return exec_time, would need timing
+                    pass
                 elif rank == 0:
-                    print(f"Warmup iteration {iter_idx + 1}/{warmup}: {exec_time:.6f}s")
+                    print(f"Warmup iteration {iter_idx + 1}/{warmup}")
         else:
             # Asynchronous mode (multiple SDMA queues, matches C++ test)
             if rank == 0:
@@ -107,18 +117,23 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
                 
                 dist.barrier()
                 
-                # Start async operation
-                started = allgather.start_async(input_tensor, output_tensor, elems_per_pe)
+                # Start async operation using context manager style (like test_allgather_overlap.py)
+                with torch.cuda.stream(stream):
+                    started = allgather.start_async(input_tensor, output_tensor, elems_per_pe)
                 if not started:
                     print(f"PE {rank}: Failed to start async operation")
                     break
                 
-                # Wait for completion
-                exec_time = allgather.wait_async()
+                # Wait for completion (using the same stream)
+                with torch.cuda.stream(stream):
+                    exec_time = allgather.wait_async()
                 
                 if exec_time < 0:
                     print(f"PE {rank}: Async operation failed")
                     break
+                
+                # Synchronize stream to ensure completion (like test_allgather_overlap.py)
+                stream.synchronize()
                 
                 # Collect times after warmup
                 if iter_idx >= warmup:
@@ -205,6 +220,8 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
                     print(f"PE {rank}: Output transit buffer size ({output_transit_buffer_cpu.size}) is smaller than expected ({expected_elements})")
                 success = False
 
+        # Synchronize stream before verification (like test_allgather_overlap.py)
+        stream.synchronize()
         torch.cuda.synchronize()
         dist.barrier()
         
