@@ -30,10 +30,8 @@ if [[ ${full} -eq 1 ]]; then
   rm -rf *
   cmake -DUSE_ROCM=ON -DCMAKE_BUILD_TYPE=Release \
       -DBUILD_EXAMPLES=OFF -DWARP_ACCUM_UNROLL=1 -DUSE_BNXT=OFF \
-      -DGPU_TARGETS=gfx942 \
+      -DGPU_TARGETS=gfx942 -DFORCE_CODE_OBJECT_VERSION_5=OFF \
       .. 
-
-   
 fi
 
 make VERBOSE=1 -j 2>&1 | tee ../yyybuild.log

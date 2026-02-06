@@ -166,7 +166,6 @@ struct RdmaEndpoint {
 
   // Atomic internal buffer (ibuf) - independent MR for atomic operations
   core::IbufHandle atomicIbuf;
-#ifdef __HIP_DEVICE_COMPILE__
   __device__ __host__ core::ProviderType GetProviderType() {
     if (vendorId == RdmaDeviceVendorId::Mellanox) {
       return core::ProviderType::MLX5;
@@ -180,7 +179,6 @@ struct RdmaEndpoint {
     }
     return core::ProviderType::Unknown;
   }
-#endif // __HIP_DEVICE_COMPILE__
 };
 
 class RdmaDevice;

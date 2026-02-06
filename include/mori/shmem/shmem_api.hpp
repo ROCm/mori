@@ -29,7 +29,9 @@
 #include <cstddef>
 #include <cstdint>
 
+#ifndef MORI_DISABLE_APP_INCLUDE
 #include "mori/application/application.hpp"
+#endif
 
 namespace mori {
 namespace shmem {
@@ -52,7 +54,10 @@ constexpr unsigned int MORI_SHMEM_INIT_WITH_MPI_COMM = 0;
 constexpr unsigned int MORI_SHMEM_INIT_WITH_UNIQUEID = 1;
 
 // TODO: provide unified initialize / finalize APIs
+#ifndef MORI_DISABLE_APP_INCLUDE
 int ShmemInit(application::BootstrapNetwork* bootNet);
+#endif
+
 #ifdef MORI_ENABLE_MPI
 int ShmemInit();  // Default initialization using MPI_COMM_WORLD
 int ShmemMpiInit(MPI_Comm);
@@ -96,10 +101,10 @@ void* ShmemMallocAlign(size_t alignment, size_t size);
 void* ShmemExtMallocWithFlags(size_t size, unsigned int flags);
 void ShmemFree(void*);
 
-#ifdef __HIP_DEVICE_COMPILE__
+#ifndef MORI_DISABLE_APP_INCLUDE
 // Note: temporary API for testing
 application::SymmMemObjPtr ShmemQueryMemObjPtr(void*);
-#endif // __HIP_DEVICE_COMPILE__
+#endif
 
 int ShmemBufferRegister(void* ptr, size_t size);
 int ShmemBufferDeregister(void* ptr, size_t size);
