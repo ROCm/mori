@@ -27,6 +27,7 @@
 #include <hip/hip_runtime_api.h>
 
 #include "mori/core/core.hpp"
+#include "mori/core/transport/p2p/device_primitives.hpp"
 #include "mori/shmem/shmem.hpp"
 #include "mori/utils/hip_helper.hpp"
 #include "mori/utils/mori_log.hpp"
@@ -91,6 +92,17 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   shmemCombineOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
   shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
 
+#if (defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ == 1) || \
+    (defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1)
+  if (config.enableInternalFp8Quant) {
+    size_t maxFp8TokSize =
+        static_cast<ssize_t>(config.MaxNumTokensToRecv()) *
+        (static_cast<size_t>(config.hiddenDim) * sizeof(core::CombineInternalFp8T) +
+         static_cast<size_t>(config.numExpertPerToken) * sizeof(float));
+    shmemFp8SendTokMemObj = ShmemMallocAndReturnMemObjPtr(maxFp8TokSize, hipDeviceMallocUncached);
+  }
+#endif
+
   size_t maxWeightSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(float);
   shmemInpWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
   shmemDispatchOutWeightsMemObj =
@@ -125,6 +137,7 @@ void EpDispatchCombineHandle::FinalizeShmemBuf() {
   ShmemFree(shmemDispatchOutTokMemObj->localPtr);
   ShmemFree(shmemCombineOutTokMemObj->localPtr);
   ShmemFree(shmemStagingTokMemObj->localPtr);
+  if (shmemFp8SendTokMemObj.IsValid()) ShmemFree(shmemFp8SendTokMemObj->localPtr);
   ShmemFree(shmemInpWeightsMemObj->localPtr);
   ShmemFree(shmemDispatchOutWeightsMemObj->localPtr);
   ShmemFree(shmemCombineOutWeightsMemObj->localPtr);
@@ -333,10 +346,6 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
 
         size_t sharedMemSize =
             actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
-        if ((kernelType == KernelType::InterNodeV1) || (kernelType == KernelType::InterNodeV1LL)) {
-          sharedMemSize = actualWarpNumPerBlock * config.numExpertPerToken *
-                          (sizeof(DataT**) + sizeof(float**) + sizeof(float**));
-        }
         if (kernelType == KernelType::InterNode) {
           assert(config.useExternalInpBuffer);
           EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
