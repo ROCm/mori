@@ -437,13 +437,13 @@ void EpDispatchCombineHandle::LaunchCombineRecv(KernelType kernelType, int block
   dim3 grid(actualBlockNum);
   dim3 block(warpSize * actualWarpNumPerBlock);
 
-  size_t sharedMemSize =
-      actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
   auto argsVariant = GetEpDispatchCombineArgsByInputType(*this, 0);
   std::visit(
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;
         using DataT = typename ArgsT::data_type;
+        size_t sharedMemSize =
+            actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
         if (kernelType == KernelType::AsyncLL) {
           assert(config.useExternalInpBuffer);
           assert((actualBlockNum % config.worldSize) == 0);
