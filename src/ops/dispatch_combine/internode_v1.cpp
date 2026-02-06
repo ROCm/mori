@@ -873,8 +873,8 @@ inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
       const core::CombineInternalFp8T* const* srcFp8Ptrs =
           reinterpret_cast<const core::CombineInternalFp8T* const*>(srcPtrs);
       const float* const* srcScalePtrs = reinterpret_cast<const float* const*>(srcScalesPtr);
-      core::WarpAccumFp8DequantSegment<core::CombineInternalFp8T, core::CombineInternalFp8T>(
-          reinterpret_cast<core::CombineInternalFp8T*>(stagingPtr + tokenId * combXferBytes) +
+      core::WarpAccumFp8DequantSegment<T, core::CombineInternalFp8T>(
+          reinterpret_cast<T*>(stagingPtr + tokenId * combXferBytes) +
               hiddenDimOffset,
           srcFp8Ptrs, srcScalePtrs, config.numExpertPerToken, hiddenDimOffset, hiddenDimSize,
           config.hiddenDim, config.scaleDim);
