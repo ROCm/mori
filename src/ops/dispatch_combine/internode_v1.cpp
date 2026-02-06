@@ -1026,11 +1026,14 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
   uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
 #if (defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ == 1) || \
     (defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1)
-  const size_t fp8HiddenBytes =
-      static_cast<size_t>(config.hiddenDim) * sizeof(core::CombineInternalFp8T);
-  const size_t fp8CombXferBytes =
-      (args.weightsBuf == nullptr) ? fp8HiddenBytes : fp8HiddenBytes + weightBytes;
-  uint8_t* fp8SendBuf = args.shmemFp8SendTokMemObj->template GetAs<uint8_t*>();
+  size_t fp8HiddenBytes = 0;
+  size_t fp8CombXferBytes = 0;
+  uint8_t* fp8SendBuf = nullptr;
+  if (useInternalFp8) {
+    fp8HiddenBytes = static_cast<size_t>(config.hiddenDim) * sizeof(core::CombineInternalFp8T);
+    fp8CombXferBytes = (args.weightsBuf == nullptr) ? fp8HiddenBytes : fp8HiddenBytes + weightBytes;
+    fp8SendBuf = args.shmemFp8SendTokMemObj->template GetAs<uint8_t*>();
+  }
 #endif
 
   int rdmaWarpNum = config.rdmaBlockNum * warpNum;
