@@ -1,52 +1,63 @@
 # MORI-IO Benchmark
 
+## Table of Contents
+
+- [Benchmark Commands](#benchmark-commands)
+- [Benchmark Arguments](#benchmark-arguments)
+- [Results: Thor2 RDMA Read](#results-thor2-rdma-read)
+- [Results: Thor2 RDMA Write](#results-thor2-rdma-write)
+  - [Message Size Sweep](#message-size-sweep)
+  - [Batch Size Sweep](#batch-size-sweep)
+- [Results: CX7 RDMA (Batch Size = 1)](#results-cx7-rdma-batch-size--1)
+  - [Write](#write)
+  - [Read](#read)
+
 ## Benchmark Commands
-```
+
+```bash
 cd /path/to/mori
 export PYTHONPATH=/path/to/mori:$PYTHONPATH
-export GLOO_SOCKET_IFNAME=ens14np0 # set to your nic interface
+export GLOO_SOCKET_IFNAME=ens14np0  # Set to your NIC interface
 
-# Benchmark performance, run the following command on two nodes
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.194.129.65" --master_port=1234 tests/python/io/benchmark.py --host="10.194.129.65"
+# Run on two nodes (replace node_rank and master_addr)
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
+    --master_addr="10.194.129.65" --master_port=1234 \
+    tests/python/io/benchmark.py --host="10.194.129.65"
 ```
 
-Arguments:
-- **buffer-size:** message size per transfer
-- **all**: sweep from 8B to 1MB message size
-- **sweep-start-size**: starting message size when using --all sweep
-- **sweep-max-size**: maximum message size when using --all sweep
-- **all-batch**: sweep batch size from 1 to 32768
-- **transfer-batch-size**: # of consecutive transfers
-- **enable-batch-transfer**: whether to enable batch transfer
-- **enable-sess**: whether to enable session transfer, session transfer has lower latency
-- **num-initiator-dev**: # of initiator devices
-- **num-target-dev**: # of target devices
-- **num-qp-per-transfer**: # of queue pair used
-- **poll_cq_mode**: mode of polling cqe, ['polling', 'event']
+## Benchmark Arguments
 
-## Results
+| Argument | Description |
+|----------|-------------|
+| `--buffer-size` | Message size per transfer (bytes) |
+| `--all` | Sweep message size from 8B to 1MB |
+| `--sweep-start-size` | Starting message size when using `--all` sweep |
+| `--sweep-max-size` | Maximum message size when using `--all` sweep |
+| `--all-batch` | Sweep batch size from 1 to 32768 |
+| `--transfer-batch-size` | Number of consecutive transfers |
+| `--enable-batch-transfer` | Enable batch transfer mode |
+| `--enable-sess` | Enable session transfer (lower latency) |
+| `--num-initiator-dev` | Number of initiator devices |
+| `--num-target-dev` | Number of target devices |
+| `--num-qp-per-transfer` | Number of queue pairs used |
+| `--op-type` | Operation type: `read` or `write` |
+| `--poll_cq_mode` | CQ polling mode: `polling` or `event` |
+| `--num-worker-threads` | Number of worker threads |
+| `--log-level` | Log level (e.g., `info`) |
 
-### Thor2 Result (RDMA read)
-Command:
-```
-torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 --master_addr="10.235.192.57" --master_port=1234 tests/python/io/benchmark.py --host="10.235.192.60" --all --enable-sess --enable-batch-transfer --num-qp-per-transfer 2 --num-target-dev 8 --num-initiator-dev 8
+## Results: Thor2 RDMA Read
+
+**Config:** 8 initiator + 8 target devices, session enabled, batch transfer, 2 QPs per transfer
+
+```bash
+torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 \
+    --master_addr="10.235.192.57" --master_port=1234 \
+    tests/python/io/benchmark.py --host="10.235.192.60" \
+    --all --enable-sess --enable-batch-transfer \
+    --num-qp-per-transfer 2 --num-target-dev 8 --num-initiator-dev 8
 ```
 
-Output:
 ```
-MORI-IO Benchmark Configurations:
-  host: 10.235.192.57
-  port: 38553
-  node_rank: 0
-  role: EngineRole.INITIATOR
-  role_rank: 4
-  num_initiator_dev: 8
-  num_target_dev: 8
-  buffer_size: 1048576 B
-  transfer_batch_size: 256
-  enable_batch_transfer: True
-  enable_sess: True
-  num_qp_per_transfer: 2
 +--------------------------------------------------------------------------------------------+
 |                                      Initiator Rank 7                                      |
 +-------------+----------------+---------------+---------------+--------------+--------------+
@@ -73,10 +84,21 @@ MORI-IO Benchmark Configurations:
 +-------------+----------------+---------------+---------------+--------------+--------------+
 ```
 
-### Thor2 Result (RDMA Write) at 9.12
-#### Performance of sweeping message size
-```
-numactl --cpunodebind=0 --membind=0 --physcpubind=0-47,96-143 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.235.192.60" --master_port=1234 tests/python/io/benchmark.py --host="10.235.192.60" --enable-batch-transfer --enable-sess --buffer-size 1024 --transfer-batch-size 128 --num-initiator-dev 1 --num-target-dev 1 --num-qp-per-transfer 4 --all --num-worker-threads 1 --log-level info --op-type write --poll_cq_mode polling
+## Results: Thor2 RDMA Write
+
+### Message Size Sweep
+
+**Config:** 1 initiator + 1 target device, session enabled, batch transfer (128), 4 QPs, polling mode
+
+```bash
+numactl --cpunodebind=0 --membind=0 --physcpubind=0-47,96-143 \
+    torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
+    --master_addr="10.235.192.60" --master_port=1234 \
+    tests/python/io/benchmark.py --host="10.235.192.60" \
+    --enable-batch-transfer --enable-sess --buffer-size 1024 \
+    --transfer-batch-size 128 --num-initiator-dev 1 --num-target-dev 1 \
+    --num-qp-per-transfer 4 --all --num-worker-threads 1 \
+    --log-level info --op-type write --poll_cq_mode polling
 ```
 
 ```
@@ -106,10 +128,19 @@ numactl --cpunodebind=0 --membind=0 --physcpubind=0-47,96-143 torchrun --nnodes=
 +-------------+-----------+----------------+---------------+---------------+--------------+--------------+
 ```
 
-#### Performance of sweeping batch size
-```
-numactl --cpunodebind=0 --membind=0 --physcpubind=0-47,96-143 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.235.192.60" --master_port=1234 tests/python/io/benchmark.py --host="10.235.192.60" --enable-batch-transfer --enable-sess --buffer-size 1024 --transfer-batch-size 128 --num-initiator-dev 1 --num-target-dev 1 --num-qp-per-transfer 16 --all-batch --num-worker-threads 1 --log-level info --op-type write --poll_cq_mode pol
-ling
+### Batch Size Sweep
+
+**Config:** 1 initiator + 1 target device, 1024B messages, session enabled, 16 QPs, polling mode
+
+```bash
+numactl --cpunodebind=0 --membind=0 --physcpubind=0-47,96-143 \
+    torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
+    --master_addr="10.235.192.60" --master_port=1234 \
+    tests/python/io/benchmark.py --host="10.235.192.60" \
+    --enable-batch-transfer --enable-sess --buffer-size 1024 \
+    --transfer-batch-size 128 --num-initiator-dev 1 --num-target-dev 1 \
+    --num-qp-per-transfer 16 --all-batch --num-worker-threads 1 \
+    --log-level info --op-type write --poll_cq_mode polling
 ```
 
 ```
@@ -137,12 +168,19 @@ ling
 +-------------+-----------+----------------+---------------+---------------+--------------+--------------+
 ```
 
-### CX7 Result at 10.16
+## Results: CX7 RDMA (Batch Size = 1)
 
-#### Performance of sweeping message (batch size = 1)
-Command:
-```
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.194.132.29" --master_port=1234 tests/python/io/benchmark.py --host="10.194.132.29"  --transfer-batch-size 1 --all --sweep-start-size=1024 --sweep-max-size=67108864 --op-type write --enable-sess --enable-batch-transfer
+### Write
+
+**Config:** 1 initiator + 1 target device, single transfer, session enabled, message sweep 1KB-64MB
+
+```bash
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
+    --master_addr="10.194.132.29" --master_port=1234 \
+    tests/python/io/benchmark.py --host="10.194.132.29" \
+    --transfer-batch-size 1 --all --sweep-start-size=1024 \
+    --sweep-max-size=67108864 --op-type write \
+    --enable-sess --enable-batch-transfer
 ```
 
 ```
@@ -171,8 +209,17 @@ torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.194.132.2
 +-------------+-----------+----------------+---------------+---------------+--------------+--------------+
 ```
 
-```
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.194.132.29" --master_port=1234 tests/python/io/benchmark.py --host="10.194.132.29"  --transfer-batch-size 1 --all --sweep-start-size=1024 --sweep-max-size=67108864 --op-type read --enable-sess --enable-batch-transfer
+### Read
+
+**Config:** Same as write, but with `--op-type read`
+
+```bash
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
+    --master_addr="10.194.132.29" --master_port=1234 \
+    tests/python/io/benchmark.py --host="10.194.132.29" \
+    --transfer-batch-size 1 --all --sweep-start-size=1024 \
+    --sweep-max-size=67108864 --op-type read \
+    --enable-sess --enable-batch-transfer
 ```
 
 ```

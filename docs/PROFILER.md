@@ -2,6 +2,17 @@
 
 MORI-VIZ is a high-performance, low-overhead kernel profiler designed to trace GPU execution at the warp level. It allows developers to instrument C++ kernel code with minimal impact on performance and visualize the execution timelines using [Perfetto](https://ui.perfetto.dev/).
 
+## Table of Contents
+
+- [Overview](#overview)
+- [Instrumentation](#instrumentation)
+  - [1. Include Headers](#1-include-headers)
+  - [2. Define Profiler Context](#2-define-profiler-context)
+  - [3. Add Trace Points](#3-add-trace-points)
+- [Build & Code Generation](#build--code-generation)
+- [Python Analysis](#python-analysis)
+- [Best Practices](#best-practices)
+
 ## Overview
 
 The profiler works by logging events (Begin/End/Instant) into a per-warp circular buffer in GPU global memory. These events are then copied to the host, parsed, and converted into the Chrome Trace Event format for visualization.
@@ -153,9 +164,9 @@ if hasattr(mori.cpp, "get_debug_time_buf"):
 
 The first option is recommended as it automatically discovers all profiler slots from your build.
 
-### Device-side elapsed time meauerment
+### Device-side Elapsed Time Measurement
 
-MORI-VIZ use `wall_clock64` to measure device-side elapsed time. The `gpu_freq_ghz` parameter can be used to set hardware frequency for `wall_clock64`, by default mori query it through `hipDeviceGetAttribute(&rate, hipDeviceAttributeWallClockRate, device)` API. to override it:
+MORI-VIZ uses `wall_clock64` to measure device-side elapsed time. The `gpu_freq_ghz` parameter can be used to set the hardware frequency for `wall_clock64`. By default, MORI queries it through the `hipDeviceGetAttribute(&rate, hipDeviceAttributeWallClockRate, device)` API. To override it:
 
 Pass the value to `export_to_perfetto`:
    ```python
@@ -172,9 +183,9 @@ Pass the value to `export_to_perfetto`:
 
 -   **Minimize Scope**: Keep profiled regions granular but not too small (overhead vs visibility).
 -   **Conditional Compilation**: The `ENABLE_PROFILER` macro controls whether profiling code is compiled. In production builds, this is typically disabled to ensure zero overhead.
--   **Buffer Limits**: Each warp can store up to 16384 events in a circular buffer. The system supports up to 512 warps per rank by default. If profiling long-running kernels or multiple iterations, clear the buffer between runs to avoid data overlap:
+-   **Buffer Limits**: Each warp can store up to 16384 events in a circular buffer. The system supports up to 4096 warps per rank by default. If profiling long-running kernels or multiple iterations, clear the buffer between runs to avoid data overlap:
     ```python
-    trace_buffer = mori.cpp.get_debug_time_buf(handle)
+    trace_buffer = mori.cpp.get_debug_time_buf(op._handle)
     trace_buffer.zero_()  # Clear before next profiled iteration
 
     # Also clear the offset buffer if needed
