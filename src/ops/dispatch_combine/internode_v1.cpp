@@ -1076,15 +1076,6 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
                                     destLocalTokId * config.numExpertPerToken;
           }
         }
-        core::WarpAccum<T, 4>(
-            reinterpret_cast<T*>(stagingPtr + globalTokenId * combXferBytes) + hiddenDimOffset,
-            srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
-        if (args.weightsBuf && (inTokenPartId == 0)) {
-          core::WarpAccum<float, 4>(
-              reinterpret_cast<float*>(stagingPtr + globalTokenId * combXferBytes + hiddenBytes),
-              srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
-        }
-
 #if (defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ == 1) || \
     (defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1)
         if (useInternalFp8) {
@@ -1094,20 +1085,36 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
                                fp8CombXferBytes;
           core::CombineInternalFp8T* dstPtr =
               reinterpret_cast<core::CombineInternalFp8T*>(fp8Rec) + hiddenDimOffset;
-          const hip_bfloat16* srcPtr =
-              reinterpret_cast<const hip_bfloat16*>(stagingPtr + globalTokenId * combXferBytes) +
-              hiddenDimOffset;
-          // ~ 5us
-          core::WarpCastBf16ToFp8NoScaleAuto<core::CombineInternalFp8T>(dstPtr, srcPtr,
-                                                                        hiddenDimSize);
+          const hip_bfloat16* const* srcBf16Ptrs =
+              reinterpret_cast<const hip_bfloat16* const*>(srcPtrs);
+          {
+            MORI_TRACE_SPAN(profiler, Slot::CombineInterNodeLL_Accum);
+            core::WarpAccumBf16ToFp8NoScaleAuto<core::CombineInternalFp8T>(
+                dstPtr, srcBf16Ptrs, config.numExpertPerToken, hiddenDimSize);
+            if (args.weightsBuf && (inTokenPartId == 0)) {
+              core::WarpAccum<float, 4>(
+                  reinterpret_cast<float*>(stagingPtr + globalTokenId * combXferBytes +
+                                           hiddenBytes),
+                  srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
+              const float* srcW = reinterpret_cast<const float*>(
+                  stagingPtr + globalTokenId * combXferBytes + hiddenBytes);
+              core::WarpCopyWeightsToFp8Buffer(srcW, fp8Rec, fp8HiddenBytes,
+                                               config.numExpertPerToken);
+            }
+          }
+        } else
+#endif
+        {
+          MORI_TRACE_SPAN(profiler, Slot::CombineInterNodeLL_Accum);
+          core::WarpAccum<T, 4>(
+              reinterpret_cast<T*>(stagingPtr + globalTokenId * combXferBytes) + hiddenDimOffset,
+              srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
           if (args.weightsBuf && (inTokenPartId == 0)) {
-            const float* srcW = reinterpret_cast<const float*>(
-                stagingPtr + globalTokenId * combXferBytes + hiddenBytes);
-            core::WarpCopyWeightsToFp8Buffer(srcW, fp8Rec, fp8HiddenBytes,
-                                             config.numExpertPerToken);
+            core::WarpAccum<float, 4>(
+                reinterpret_cast<float*>(stagingPtr + globalTokenId * combXferBytes + hiddenBytes),
+                srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
           }
         }
-#endif
       }
 
       index_t finished = 0;
@@ -1133,19 +1140,25 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
           const size_t srcOffset = (static_cast<size_t>(node) * config.MaxNumTokensToRecvPerRank() +
                                     static_cast<size_t>(startTokenIdx)) *
                                    fp8CombXferBytes;
-          shmem::ShmemPutTypeNbiWarp<uint8_t>(args.shmemStagingTokMemObj, dstOffset,
-                                              args.shmemFp8SendTokMemObj, srcOffset,
-                                              thisChunkTokenNum * fp8CombXferBytes, proxyPe, qpId);
+          {
+            MORI_TRACE_SPAN(profiler, Slot::CombineInterNodeLL_RdmaPut);
+            shmem::ShmemPutTypeNbiWarp<uint8_t>(
+                args.shmemStagingTokMemObj, dstOffset, args.shmemFp8SendTokMemObj, srcOffset,
+                thisChunkTokenNum * fp8CombXferBytes, proxyPe, qpId);
+          }
         } else
 #endif
         {
-          shmem::ShmemPutTypeNbiWarp<uint8_t>(
-              args.shmemStagingTokMemObj,
-              ((myNode + nNodes) * config.MaxNumTokensToRecvPerRank() + startTokenIdx) *
-                  combXferBytes,
-              args.shmemStagingTokMemObj,
-              (node * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * combXferBytes,
-              thisChunkTokenNum * combXferBytes, proxyPe, qpId);
+          {
+            MORI_TRACE_SPAN(profiler, Slot::CombineInterNodeLL_RdmaPut);
+            shmem::ShmemPutTypeNbiWarp<uint8_t>(
+                args.shmemStagingTokMemObj,
+                ((myNode + nNodes) * config.MaxNumTokensToRecvPerRank() + startTokenIdx) *
+                    combXferBytes,
+                args.shmemStagingTokMemObj,
+                (node * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * combXferBytes,
+                thisChunkTokenNum * combXferBytes, proxyPe, qpId);
+          }
         }
       }
     }
@@ -1327,6 +1340,7 @@ __global__ void EpCombineAll(EpDispatchCombineArgs<T> args) {
 #if (defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ == 1) || \
     (defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1)
     if (useInternalFp8) {
+      MORI_TRACE_SPAN(profiler, Slot::EpCombineAll_Fp8Mixed);
       T* outTok = args.shmemCombineOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim +
                   hiddenDimOffset;
 
@@ -1341,6 +1355,7 @@ __global__ void EpCombineAll(EpDispatchCombineArgs<T> args) {
     } else
 #endif
     {
+      MORI_TRACE_SPAN(profiler, Slot::EpCombineAll_Bf16);
       core::WarpAccum<T, 4>(args.shmemCombineOutTokMemObj->template GetAs<T*>() +
                                 tokenId * config.hiddenDim + hiddenDimOffset,
                             reinterpret_cast<T* const*>(srcPtrs), nullptr, nNodes, hiddenDimSize);

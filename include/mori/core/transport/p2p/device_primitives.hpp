@@ -1180,6 +1180,227 @@ __device__ __forceinline__ void WarpCastBf16ToFp8NoScaleAuto(
   }
 }
 
+namespace detail {
+
+template <typename Fp8T, int VecBytes, int AccumNum>
+__device__ __forceinline__ void WarpAccumBf16ToFp8NoScaleVec(
+    Fp8T* __restrict__ dest, const hip_bfloat16* const* __restrict__ srcs, size_t nelems) {
+  constexpr int vecElems = VecBytes / sizeof(hip_bfloat16);
+  const int laneId = threadIdx.x & (warpSize - 1);
+  auto* dstBytes = reinterpret_cast<__hip_fp8_storage_t*>(dest);
+
+  const int elemsPerWarp = warpSize * vecElems;
+  const int vecEnd = (nelems / elemsPerWarp) * elemsPerWarp;
+
+  for (int idx = laneId * vecElems; idx < vecEnd; idx += elemsPerWarp) {
+    if constexpr (VecBytes == 4) {
+      float2 sum01{0.0f, 0.0f};
+#pragma unroll AccumNum
+      for (int i = 0; i < AccumNum; ++i) {
+        const hip_bfloat16* srcPtr = srcs[i];
+        if (srcPtr == nullptr) continue;
+        const uint32_t packed = static_cast<uint32_t>(load<4>(srcPtr + idx));
+        sum01.x += Bf16BitsToF32(static_cast<uint16_t>(packed & 0xFFFF));
+        sum01.y += Bf16BitsToF32(static_cast<uint16_t>((packed >> 16) & 0xFFFF));
+      }
+      const __hip_fp8x2_storage_t fp8 = CvtFloat2ToFp8x2<Fp8T>(sum01);
+      store<2>(dstBytes + idx, static_cast<uint16_t>(fp8));
+    } else if constexpr (VecBytes == 8) {
+      float2 sum01{0.0f, 0.0f};
+      float2 sum23{0.0f, 0.0f};
+#pragma unroll AccumNum
+      for (int i = 0; i < AccumNum; ++i) {
+        const hip_bfloat16* srcPtr = srcs[i];
+        if (srcPtr == nullptr) continue;
+        const uint64_t packed = static_cast<uint64_t>(load<8>(srcPtr + idx));
+        sum01.x += Bf16BitsToF32(static_cast<uint16_t>(packed & 0xFFFF));
+        sum01.y += Bf16BitsToF32(static_cast<uint16_t>((packed >> 16) & 0xFFFF));
+        sum23.x += Bf16BitsToF32(static_cast<uint16_t>((packed >> 32) & 0xFFFF));
+        sum23.y += Bf16BitsToF32(static_cast<uint16_t>((packed >> 48) & 0xFFFF));
+      }
+      const __hip_fp8x2_storage_t fp8_01 = CvtFloat2ToFp8x2<Fp8T>(sum01);
+      const __hip_fp8x2_storage_t fp8_23 = CvtFloat2ToFp8x2<Fp8T>(sum23);
+      const uint32_t packedFp8 = static_cast<uint32_t>(static_cast<uint16_t>(fp8_01)) |
+                                 (static_cast<uint32_t>(static_cast<uint16_t>(fp8_23)) << 16);
+      store<4>(dstBytes + idx, packedFp8);
+    } else {
+      static_assert(VecBytes == 16, "VecBytes must be 4, 8, or 16");
+      float2 sum01{0.0f, 0.0f};
+      float2 sum23{0.0f, 0.0f};
+      float2 sum45{0.0f, 0.0f};
+      float2 sum67{0.0f, 0.0f};
+#pragma unroll AccumNum
+      for (int i = 0; i < AccumNum; ++i) {
+        const hip_bfloat16* srcPtr = srcs[i];
+        if (srcPtr == nullptr) continue;
+        const ulong2 packed = load<16>(srcPtr + idx);
+        const uint64_t p0 = packed.x;
+        const uint64_t p1 = packed.y;
+        sum01.x += Bf16BitsToF32(static_cast<uint16_t>(p0 & 0xFFFF));
+        sum01.y += Bf16BitsToF32(static_cast<uint16_t>((p0 >> 16) & 0xFFFF));
+        sum23.x += Bf16BitsToF32(static_cast<uint16_t>((p0 >> 32) & 0xFFFF));
+        sum23.y += Bf16BitsToF32(static_cast<uint16_t>((p0 >> 48) & 0xFFFF));
+        sum45.x += Bf16BitsToF32(static_cast<uint16_t>(p1 & 0xFFFF));
+        sum45.y += Bf16BitsToF32(static_cast<uint16_t>((p1 >> 16) & 0xFFFF));
+        sum67.x += Bf16BitsToF32(static_cast<uint16_t>((p1 >> 32) & 0xFFFF));
+        sum67.y += Bf16BitsToF32(static_cast<uint16_t>((p1 >> 48) & 0xFFFF));
+      }
+      const __hip_fp8x2_storage_t fp8_01 = CvtFloat2ToFp8x2<Fp8T>(sum01);
+      const __hip_fp8x2_storage_t fp8_23 = CvtFloat2ToFp8x2<Fp8T>(sum23);
+      const __hip_fp8x2_storage_t fp8_45 = CvtFloat2ToFp8x2<Fp8T>(sum45);
+      const __hip_fp8x2_storage_t fp8_67 = CvtFloat2ToFp8x2<Fp8T>(sum67);
+      const uint64_t packedFp8 = static_cast<uint64_t>(static_cast<uint16_t>(fp8_01)) |
+                                 (static_cast<uint64_t>(static_cast<uint16_t>(fp8_23)) << 16) |
+                                 (static_cast<uint64_t>(static_cast<uint16_t>(fp8_45)) << 32) |
+                                 (static_cast<uint64_t>(static_cast<uint16_t>(fp8_67)) << 48);
+      store<8>(dstBytes + idx, packedFp8);
+    }
+  }
+
+  for (int idx = vecEnd + laneId; idx < static_cast<int>(nelems); idx += warpSize) {
+    float sum = 0.0f;
+#pragma unroll AccumNum
+    for (int i = 0; i < AccumNum; ++i) {
+      const hip_bfloat16* srcPtr = srcs[i];
+      if (srcPtr == nullptr) continue;
+      sum += static_cast<float>(srcPtr[idx]);
+    }
+    dest[idx] = Fp8T(sum);
+  }
+}
+
+template <typename Fp8T, int VecBytes>
+__device__ __forceinline__ void WarpAccumBf16ToFp8NoScaleVecDynamic(
+    Fp8T* __restrict__ dest, const hip_bfloat16* const* __restrict__ srcs, size_t accumNum,
+    size_t nelems) {
+  constexpr int vecElems = VecBytes / sizeof(hip_bfloat16);
+  const int laneId = threadIdx.x & (warpSize - 1);
+  auto* dstBytes = reinterpret_cast<__hip_fp8_storage_t*>(dest);
+
+  const int elemsPerWarp = warpSize * vecElems;
+  const int vecEnd = (nelems / elemsPerWarp) * elemsPerWarp;
+
+  for (int idx = laneId * vecElems; idx < vecEnd; idx += elemsPerWarp) {
+    if constexpr (VecBytes == 4) {
+      float2 sum01{0.0f, 0.0f};
+      for (size_t i = 0; i < accumNum; ++i) {
+        const hip_bfloat16* srcPtr = srcs[i];
+        if (srcPtr == nullptr) continue;
+        const uint32_t packed = static_cast<uint32_t>(load<4>(srcPtr + idx));
+        sum01.x += Bf16BitsToF32(static_cast<uint16_t>(packed & 0xFFFF));
+        sum01.y += Bf16BitsToF32(static_cast<uint16_t>((packed >> 16) & 0xFFFF));
+      }
+      const __hip_fp8x2_storage_t fp8 = CvtFloat2ToFp8x2<Fp8T>(sum01);
+      store<2>(dstBytes + idx, static_cast<uint16_t>(fp8));
+    } else if constexpr (VecBytes == 8) {
+      float2 sum01{0.0f, 0.0f};
+      float2 sum23{0.0f, 0.0f};
+      for (size_t i = 0; i < accumNum; ++i) {
+        const hip_bfloat16* srcPtr = srcs[i];
+        if (srcPtr == nullptr) continue;
+        const uint64_t packed = static_cast<uint64_t>(load<8>(srcPtr + idx));
+        sum01.x += Bf16BitsToF32(static_cast<uint16_t>(packed & 0xFFFF));
+        sum01.y += Bf16BitsToF32(static_cast<uint16_t>((packed >> 16) & 0xFFFF));
+        sum23.x += Bf16BitsToF32(static_cast<uint16_t>((packed >> 32) & 0xFFFF));
+        sum23.y += Bf16BitsToF32(static_cast<uint16_t>((packed >> 48) & 0xFFFF));
+      }
+      const __hip_fp8x2_storage_t fp8_01 = CvtFloat2ToFp8x2<Fp8T>(sum01);
+      const __hip_fp8x2_storage_t fp8_23 = CvtFloat2ToFp8x2<Fp8T>(sum23);
+      const uint32_t packedFp8 = static_cast<uint32_t>(static_cast<uint16_t>(fp8_01)) |
+                                 (static_cast<uint32_t>(static_cast<uint16_t>(fp8_23)) << 16);
+      store<4>(dstBytes + idx, packedFp8);
+    } else {
+      static_assert(VecBytes == 16, "VecBytes must be 4, 8, or 16");
+      float2 sum01{0.0f, 0.0f};
+      float2 sum23{0.0f, 0.0f};
+      float2 sum45{0.0f, 0.0f};
+      float2 sum67{0.0f, 0.0f};
+      for (size_t i = 0; i < accumNum; ++i) {
+        const hip_bfloat16* srcPtr = srcs[i];
+        if (srcPtr == nullptr) continue;
+        const ulong2 packed = load<16>(srcPtr + idx);
+        const uint64_t p0 = packed.x;
+        const uint64_t p1 = packed.y;
+        sum01.x += Bf16BitsToF32(static_cast<uint16_t>(p0 & 0xFFFF));
+        sum01.y += Bf16BitsToF32(static_cast<uint16_t>((p0 >> 16) & 0xFFFF));
+        sum23.x += Bf16BitsToF32(static_cast<uint16_t>((p0 >> 32) & 0xFFFF));
+        sum23.y += Bf16BitsToF32(static_cast<uint16_t>((p0 >> 48) & 0xFFFF));
+        sum45.x += Bf16BitsToF32(static_cast<uint16_t>(p1 & 0xFFFF));
+        sum45.y += Bf16BitsToF32(static_cast<uint16_t>((p1 >> 16) & 0xFFFF));
+        sum67.x += Bf16BitsToF32(static_cast<uint16_t>((p1 >> 32) & 0xFFFF));
+        sum67.y += Bf16BitsToF32(static_cast<uint16_t>((p1 >> 48) & 0xFFFF));
+      }
+      const __hip_fp8x2_storage_t fp8_01 = CvtFloat2ToFp8x2<Fp8T>(sum01);
+      const __hip_fp8x2_storage_t fp8_23 = CvtFloat2ToFp8x2<Fp8T>(sum23);
+      const __hip_fp8x2_storage_t fp8_45 = CvtFloat2ToFp8x2<Fp8T>(sum45);
+      const __hip_fp8x2_storage_t fp8_67 = CvtFloat2ToFp8x2<Fp8T>(sum67);
+      const uint64_t packedFp8 = static_cast<uint64_t>(static_cast<uint16_t>(fp8_01)) |
+                                 (static_cast<uint64_t>(static_cast<uint16_t>(fp8_23)) << 16) |
+                                 (static_cast<uint64_t>(static_cast<uint16_t>(fp8_45)) << 32) |
+                                 (static_cast<uint64_t>(static_cast<uint16_t>(fp8_67)) << 48);
+      store<8>(dstBytes + idx, packedFp8);
+    }
+  }
+
+  for (int idx = vecEnd + laneId; idx < static_cast<int>(nelems); idx += warpSize) {
+    float sum = 0.0f;
+    for (size_t i = 0; i < accumNum; ++i) {
+      const hip_bfloat16* srcPtr = srcs[i];
+      if (srcPtr == nullptr) continue;
+      sum += static_cast<float>(srcPtr[idx]);
+    }
+    dest[idx] = Fp8T(sum);
+  }
+}
+
+}  // namespace detail
+
+template <typename Fp8T, int VecBytes>
+__device__ __forceinline__ void WarpAccumBf16ToFp8NoScale(
+    Fp8T* __restrict__ dest, const hip_bfloat16* const* __restrict__ srcs, size_t accumNum,
+    size_t nelems) {
+#define WARP_ACCUM_FP8_CASE(AccumNum)                                                   \
+  case AccumNum:                                                                        \
+    detail::WarpAccumBf16ToFp8NoScaleVec<Fp8T, VecBytes, AccumNum>(dest, srcs, nelems); \
+    break;
+
+  switch (accumNum) {
+    WARP_ACCUM_FP8_CASE(1)
+    WARP_ACCUM_FP8_CASE(2)
+    WARP_ACCUM_FP8_CASE(4)
+    WARP_ACCUM_FP8_CASE(6)
+    WARP_ACCUM_FP8_CASE(8)
+    WARP_ACCUM_FP8_CASE(10)
+    default:
+      detail::WarpAccumBf16ToFp8NoScaleVecDynamic<Fp8T, VecBytes>(dest, srcs, accumNum, nelems);
+      break;
+  }
+
+#undef WARP_ACCUM_FP8_CASE
+}
+
+template <typename Fp8T>
+__device__ __forceinline__ void WarpAccumBf16ToFp8NoScaleAuto(
+    Fp8T* __restrict__ dest, const hip_bfloat16* const* __restrict__ srcs, size_t accumNum,
+    size_t nelems) {
+  const hip_bfloat16* alignPtr = nullptr;
+  for (size_t i = 0; i < accumNum; ++i) {
+    if (srcs[i] != nullptr) {
+      alignPtr = srcs[i];
+      break;
+    }
+  }
+  const uintptr_t srcPtr = reinterpret_cast<uintptr_t>(alignPtr);
+  const uintptr_t dstPtr = reinterpret_cast<uintptr_t>(dest);
+  if (alignPtr && ((srcPtr & 15u) == 0u) && ((dstPtr & 15u) == 0u)) {
+    WarpAccumBf16ToFp8NoScale<Fp8T, 16>(dest, srcs, accumNum, nelems);
+  } else if (alignPtr && ((srcPtr & 7u) == 0u) && ((dstPtr & 7u) == 0u)) {
+    WarpAccumBf16ToFp8NoScale<Fp8T, 8>(dest, srcs, accumNum, nelems);
+  } else {
+    WarpAccumBf16ToFp8NoScale<Fp8T, 4>(dest, srcs, accumNum, nelems);
+  }
+}
+
 template <typename OutT, typename Fp8T>
 __device__ __forceinline__ void WarpAccumBf16Fp8Mixed(OutT* __restrict__ outTok,
                                                       const hip_bfloat16* __restrict__ localTok,
