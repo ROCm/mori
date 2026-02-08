@@ -1044,9 +1044,8 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
     if (nodeCount == 0) continue;
 
     // int warpsPerToken = (rdmaWarpNum + nodeCount - 1) / nodeCount;
-    // NOTE: Using a fixed value of 4 for warpsPerToken instead of the dynamic formula above is
-    // an intentional tuning choice.
-    int warpsPerToken = 4;
+    // NOTE: Keep a small fixed value to reduce overhead; use fewer warps for FP8 path.
+    int warpsPerToken = useInternalFp8 ? 2 : 4;
     int hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
 
     for (int i = globalWarpId; i < (nodeCount * warpsPerToken); i += rdmaWarpNum) {
