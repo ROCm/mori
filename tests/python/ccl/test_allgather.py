@@ -284,7 +284,7 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
             raise AssertionError(f"PE {rank}: Allgather verification failed")
 
 
-def test_allgather(elems=67108864, world_size=8, iterations=10, warmup=1):
+def test_allgather(elems=67108864, world_size=8, iterations=10, warmup=10):
     """Run Allgather SDMA test"""
     os.environ.setdefault('MORI_ENABLE_SDMA', '1')
     port = get_free_port()
@@ -306,7 +306,7 @@ if __name__ == "__main__":
     parser.add_argument("--elems", type=int, default=67108864, help="Elements per PE")
     parser.add_argument("--world-size", type=int, default=8, help="Number of processes")
     parser.add_argument("--iterations", type=int, default=10, help="Number of iterations")
-    parser.add_argument("--warmup", type=int, default=1, help="Warmup iterations")
+    parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations")
     parser.add_argument("--enable-sdma", type=int, default=1, choices=[0, 1], help="Enable SDMA")
     args = parser.parse_args()
     os.environ['MORI_ENABLE_SDMA'] = str(args.enable_sdma)
