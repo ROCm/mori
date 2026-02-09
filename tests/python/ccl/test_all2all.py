@@ -69,6 +69,9 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
             print(f"  Sending to PE 0: {input_tensor[0].item()} (expected: {(my_pe+1)*1000 + 0})")
             print(f"  Sending to PE 1: {input_tensor[elems_per_pe].item()} (expected: {(my_pe+1)*1000 + 1})")
 
+        # Create CUDA stream for all2all operations (similar to test_allgather.py)
+        stream = torch.cuda.Stream(device=device)
+        
         torch.cuda.synchronize()
         dist.barrier()
 
@@ -78,14 +81,37 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
         use_async = False  # Use async mode to match C++ test
         
         if not use_async:
-            # Synchronous mode (single SDMA queue)
+            # Synchronous mode (single SDMA queue) - add timing and stream
+            # Create CUDA events for timing
+            all2all_start = torch.cuda.Event(enable_timing=True)
+            all2all_end = torch.cuda.Event(enable_timing=True)
+            
             for iter_idx in range(total_iters):
-                exec_time = all2all(input_tensor, output_tensor, elems_per_pe)
+                # Record start time
+                all2all_start.record(stream)
+                
+                with torch.cuda.stream(stream):
+                    success = all2all(input_tensor, output_tensor, elems_per_pe, stream)
+                
+                # Record end time
+                all2all_end.record(stream)
+                
+                # Synchronize to ensure all operations complete
+                stream.synchronize()
+                
+                if not success:
+                    print(f"PE {rank}: All2All operation failed at iteration {iter_idx}")
+                    break
+                
+                # Calculate execution time
+                all2all_time = all2all_start.elapsed_time(all2all_end) / 1000.0  # Convert ms to seconds
                 
                 if iter_idx >= warmup:
-                    exec_times.append(exec_time)
+                    exec_times.append(all2all_time)
+                    if rank == 0 and len(exec_times) == 1:
+                        print(f"PE {rank}: First measurement iteration: {all2all_time:.6f}s")
                 elif rank == 0:
-                    print(f"Warmup iteration {iter_idx + 1}/{warmup}: {exec_time:.6f}s")
+                    print(f"Warmup iteration {iter_idx + 1}/{warmup}: {all2all_time:.6f}s")
         else:
             # Asynchronous mode (multiple SDMA queues, matches C++ test)
             if rank == 0:
@@ -100,18 +126,23 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
                 
                 dist.barrier()
                 
-                # Start async operation
-                started = all2all.start_async(input_tensor, output_tensor, elems_per_pe)
+                # Start async operation using context manager style (like test_allgather.py)
+                with torch.cuda.stream(stream):
+                    started = all2all.start_async(input_tensor, output_tensor, elems_per_pe, stream)
                 if not started:
                     print(f"PE {rank}: Failed to start async operation")
                     break
                 
-                # Wait for completion
-                exec_time = all2all.wait_async()
+                # Wait for completion (using the same stream)
+                with torch.cuda.stream(stream):
+                    exec_time = all2all.wait_async(stream)
                 
                 if exec_time < 0:
                     print(f"PE {rank}: Async operation failed")
                     break
+                
+                # Synchronize stream to ensure completion (like test_allgather.py)
+                stream.synchronize()
                 
                 # Collect times after warmup
                 if iter_idx >= warmup:
@@ -198,6 +229,8 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
                     print(f"PE {rank}: Output transit buffer size ({output_transit_buffer_cpu.size}) is smaller than expected ({expected_elements})")
                 success = False
 
+        # Synchronize stream before verification (like test_allgather.py)
+        stream.synchronize()
         torch.cuda.synchronize()
         dist.barrier()
         min_time_tensor = torch.tensor([min_time], dtype=torch.float64)
@@ -242,7 +275,7 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
             raise AssertionError(f"PE {rank}: All2All verification failed")
 
 
-def test_all2all(elems=67108864, world_size=8, iterations=10, warmup=5):
+def test_all2all(elems=67108864, world_size=8, iterations=10, warmup=10):
     """Run All2All SDMA test"""
     os.environ.setdefault('MORI_ENABLE_SDMA', '1')
     port = get_free_port()
@@ -264,7 +297,7 @@ if __name__ == "__main__":
     parser.add_argument("--elems", type=int, default=67108864, help="Elements per PE")
     parser.add_argument("--world-size", type=int, default=8, help="Number of processes")
     parser.add_argument("--iterations", type=int, default=10, help="Number of iterations")
-    parser.add_argument("--warmup", type=int, default=1, help="Warmup iterations")
+    parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations")
     parser.add_argument("--enable-sdma", type=int, default=1, choices=[0, 1], help="Enable SDMA")
     args = parser.parse_args()
     os.environ['MORI_ENABLE_SDMA'] = str(args.enable_sdma)
