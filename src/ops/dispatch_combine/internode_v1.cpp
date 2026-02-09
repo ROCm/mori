@@ -27,11 +27,13 @@
 #include "mori/core/core.hpp"
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 #include "mori/shmem/shmem.hpp"
+#include "src/ops/dispatch_combine/convert.hpp"
 #ifdef ENABLE_PROFILER
 #include "mori/core/profiler/constants.hpp"
 #include "mori/core/profiler/kernel_profiler.hpp"
 #include "mori/profiler/profiler.hpp"
 #endif
+#include "src/ops/dispatch_combine/common.hpp"
 
 namespace mori {
 namespace moe {
@@ -39,36 +41,6 @@ namespace moe {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                   EpDispatchInterNodeV1Kernel                                  */
 /* ---------------------------------------------------------------------------------------------- */
-#define DEF_COMMON_VARS                                                                          \
-  const EpDispatchCombineConfig& config = args.config;                                           \
-  int thdId = threadIdx.x;                                                                       \
-  int thdNum = blockDim.x;                                                                       \
-  int laneId = threadIdx.x & (warpSize - 1);                                                     \
-  int warpId = thdId / warpSize;                                                                 \
-  int warpNum = blockDim.x / warpSize;                                                           \
-  int blockNum = gridDim.x;                                                                      \
-  int blockId = blockIdx.x;                                                                      \
-  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;                                       \
-  int globalThdNum = gridDim.x * blockDim.x;                                                     \
-  int globalWarpId = blockIdx.x * warpNum + warpId;                                              \
-  int globalWarpNum = gridDim.x * warpNum;                                                       \
-  int nullTokenId = config.worldSize * config.MaxNumTokensToRecv();                              \
-  int myPe = config.rank;                                                                        \
-  int npes = config.worldSize;                                                                   \
-  int myNode = myPe / config.gpuPerNode;                                                         \
-  int nNodes = npes / config.gpuPerNode;                                                         \
-  int numExpertPerToken = config.numExpertPerToken;                                              \
-  assert(numExpertPerToken < warpSize);                                                          \
-  size_t hiddenBytes = config.hiddenDim * sizeof(T);                                             \
-  size_t indexBytes = config.numExpertPerToken * sizeof(index_t);                                \
-  size_t weightBytes = config.numExpertPerToken * sizeof(float);                                 \
-  size_t srcTokenIdBytes = sizeof(index_t);                                                      \
-  size_t scaleBytes = (args.config.scaleDim == 0) ? 0 : config.scaleDim * config.scaleTypeSize;  \
-  size_t xferBytes = hiddenBytes + indexBytes + weightBytes + srcTokenIdBytes + scaleBytes;      \
-  size_t combXferBytes = (args.weightsBuf == nullptr) ? hiddenBytes : hiddenBytes + weightBytes; \
-  IF_ENABLE_PROFILER(                                                                            \
-      INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId))
-
 namespace v1 {
 
 template <typename T>
@@ -133,8 +105,8 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   MORI_TRACE_SPAN(profiler, Slot::DispatchIntra);
 
-  int blockOffset = config.rdmaBlockNum;
-  int xgmiBlockNum = blockNum - config.rdmaBlockNum;
+  int blockOffset = args.rdmaBlockNum;
+  int xgmiBlockNum = blockNum - args.rdmaBlockNum;
   int tokenPerBlock = (args.curRankNumToken + xgmiBlockNum - 1) / xgmiBlockNum;
   int startTokenIdx = (blockId - blockOffset) * tokenPerBlock;
   int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, args.curRankNumToken);
@@ -178,7 +150,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
 
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
   int totalChunkNum = core::CeilDiv(args.curRankNumToken, warpSize);
-  int blockChunkNum = core::CeilDiv(totalChunkNum, config.rdmaBlockNum);
+  int blockChunkNum = core::CeilDiv(totalChunkNum, args.rdmaBlockNum);
 
   int startTokenIdx = blockChunkNum * blockId * warpSize;
   int endTokenIdx = std::min(startTokenIdx + blockChunkNum * warpSize, args.curRankNumToken);
@@ -284,7 +256,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
   int finishedWarp = 0;
   if (laneId == 0) finishedWarp = atomicAdd(args.interNodeBlocksBarrier, 1);
   finishedWarp = __shfl(finishedWarp, 0);
-  if ((finishedWarp + 1) == (config.rdmaBlockNum * warpNum)) {
+  if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
     if (laneId < nNodes) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
       index_t numTokenSignal =
@@ -305,7 +277,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
   // Then send to other nodes
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
   int totalChunkNum = core::CeilDiv(args.curRankNumToken, warpSize);
-  int blockChunkNum = core::CeilDiv(totalChunkNum, config.rdmaBlockNum);
+  int blockChunkNum = core::CeilDiv(totalChunkNum, args.rdmaBlockNum);
   int chunkStartTokenIdx = blockChunkNum * blockId * warpSize;
   int chunkEndTokenIdx =
       std::min(chunkStartTokenIdx + blockChunkNum * warpSize, args.curRankNumToken);
@@ -353,7 +325,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
   int finishedWarp = 0;
   if (laneId == 0) finishedWarp = atomicAdd(&args.interNodeBlocksBarrier[1], 1);
   finishedWarp = __shfl(finishedWarp, 0);
-  if ((finishedWarp + 1) == (config.rdmaBlockNum * warpNum)) {
+  if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
     if (laneId < nNodes) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
       index_t numTokenSignal =
@@ -382,7 +354,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
   int totalChunkNum = 0;
 
   for (int bid = blockId; bid < numRecvBlock * maxChunkNum * (nNodes - 1);
-       bid += config.rdmaBlockNum) {
+       bid += args.rdmaBlockNum) {
     int k = bid / (numRecvBlock * (nNodes - 1));
     int i = (bid / numRecvBlock) % (nNodes - 1);
 
@@ -482,7 +454,7 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
   // expert -> token -> node
   for (int i = globalWarpId;
        i < config.maxNumInpTokenPerRank * config.numExpertPerToken * (nNodes - 1);
-       i += config.rdmaBlockNum * warpNum) {
+       i += args.rdmaBlockNum * warpNum) {
     int expertId = i % config.numExpertPerToken;
     int tokenId = i / config.numExpertPerToken % config.maxNumInpTokenPerRank;
     int nodeId = i / config.numExpertPerToken / config.maxNumInpTokenPerRank;
@@ -614,7 +586,7 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 __global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
-  if (blockId < config.rdmaBlockNum) {
+  if (blockId < args.rdmaBlockNum) {
     v1::DispatchInterNodeSend<T, true>(args);
     v1::DispatchInterNodeRecv(args);
   } else {
@@ -664,16 +636,22 @@ __global__ void EpDispatchCopyToStaging(EpDispatchCombineArgs<T> args) {
   }
 }
 
-template <typename T>
+template <typename T, bool EnableStdMoE>
 __global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
-  if (blockId < config.rdmaBlockNum) {
+  if (blockId < args.rdmaBlockNum) {
     v1::DispatchInterNodeLLSend<T>(args);
     v1::DispatchInterNodeLLRecv(args);
   } else {
     v1::DispatchIntraNode(args);
   }
   v1::DispatchSync(args);
+
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+  if constexpr (EnableStdMoE) {
+    InvokeConvertDispatchOutput<T>(args, myPe);
+  }
+#endif
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -690,10 +668,14 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
   int tokenPerBlock = core::CeilDiv(totalRecvTokenNum, blockNum);
   int startTokenIdx = blockId * tokenPerBlock;
   int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, totalRecvTokenNum);
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+
+#else
   for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
     core::WarpCopy(args.shmemCombineInpTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim,
                    args.inpTokenBuf + tokenId * config.hiddenDim, config.hiddenDim);
   }
+#endif
   if (args.weightsBuf) {
     for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
       core::WarpCopy(
@@ -708,8 +690,8 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   MORI_TRACE_SPAN(profiler, Slot::CombineIntraNode);
 
-  int blockOffset = config.rdmaBlockNum;
-  int xgmiBlockNum = blockNum - config.rdmaBlockNum;
+  int blockOffset = args.rdmaBlockNum;
+  int xgmiBlockNum = blockNum - args.rdmaBlockNum;
 
   extern __shared__ char sharedMem[];
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
@@ -755,8 +737,8 @@ inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
   if (args.curRankNumToken == 0) return;
 
   // Distribute tokens evenly to all blocks
-  int blockOffset = config.rdmaBlockNum;
-  int xgmiBlockNum = blockNum - config.rdmaBlockNum;
+  int blockOffset = args.rdmaBlockNum;
+  int xgmiBlockNum = blockNum - args.rdmaBlockNum;
   int xgmiWarpNum = xgmiBlockNum * warpNum;
 
   extern __shared__ char sharedMem[];
@@ -825,7 +807,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
 
   int totalBids = 0;
   for (int bid = blockId; bid < numRecvBlock * maxChunkNum * (nNodes - 1);
-       bid += config.rdmaBlockNum) {
+       bid += args.rdmaBlockNum) {
     totalBids++;
   }
 
@@ -839,7 +821,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
            ((currentBatchSize == 32) ? 0xFFFFFFFF : ((1u << currentBatchSize) - 1))) {
       int bidIdx = 0;
       for (int bid = blockId; bid < numRecvBlock * maxChunkNum * (nNodes - 1);
-           bid += config.rdmaBlockNum) {
+           bid += args.rdmaBlockNum) {
         if (bidIdx < batchStart) {
           bidIdx++;
           continue;
@@ -980,7 +962,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   finishedWarp = __shfl(finishedWarp, 0);
   barrierFlag = __shfl(barrierFlag, 0);
 
-  if ((finishedWarp + 1) == (config.rdmaBlockNum * warpNum)) {
+  if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
     if (laneId < nNodes) {
       core::AtomicStoreSeqCstSystem(
           args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});
@@ -1036,7 +1018,7 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
   }
 #endif
 
-  int rdmaWarpNum = config.rdmaBlockNum * warpNum;
+  int rdmaWarpNum = args.rdmaBlockNum * warpNum;
   for (int n = 0; n < (nNodes - 1); n++) {
     int node = (myNode + n + 1) % nNodes;
     uint64_t nodeCount = nodeRecvTokenNum[node];
@@ -1177,7 +1159,7 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
   finishedWarp = __shfl(finishedWarp, 0);
   barrierFlag = __shfl(barrierFlag, 0);
 
-  if ((finishedWarp + 1) == (config.rdmaBlockNum * warpNum)) {
+  if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
     if (laneId < nNodes) {
       core::AtomicStoreSeqCstSystem(
           args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});
@@ -1269,7 +1251,7 @@ inline __device__ void CombineAll(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
-  if (blockId < config.rdmaBlockNum) {
+  if (blockId < args.rdmaBlockNum) {
     v1::CombineInterNode(args);
   } else {
     v1::CombineIntraNode(args);
@@ -1368,10 +1350,16 @@ __global__ void EpCombineAll(EpDispatchCombineArgs<T> args) {
   }
 }
 
-template <typename T>
+template <typename T, bool EnableStdMoE>
 __global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
-  if (blockId < config.rdmaBlockNum) {
+  // If EnableStdMoE, call ConvertCombineInputDevice first to convert standard MoE format
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+  if constexpr (EnableStdMoE) {
+    InvokeConvertCombineInput<T>(args, myPe);
+  }
+#endif
+  if (blockId < args.rdmaBlockNum) {
     v1::CombineInterNodeLL(args);
   } else {
     v1::CombineIntraNodeLL(args);
@@ -1406,99 +1394,62 @@ __global__ void EpCombineSyncBarrier(EpDispatchCombineArgs<T> args) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                     Template Specialization                                    */
 /* ---------------------------------------------------------------------------------------------- */
-template __global__ void EpDispatchInterNodeV1Kernel<hip_bfloat16>(
-    EpDispatchCombineArgs<hip_bfloat16> args);
-#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-template __global__ void EpDispatchInterNodeV1Kernel<__hip_fp8_e4m3_fnuz>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
-#endif
-#ifdef MORI_FP8_TYPE_OCP_ENABLED
-template __global__ void EpDispatchInterNodeV1Kernel<__hip_fp8_e4m3>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
-#endif
-template __global__ void EpDispatchInterNodeV1Kernel<float>(EpDispatchCombineArgs<float> args);
 
-template __global__ void EpDispatchInterNodeV1KernelLowLatency<hip_bfloat16>(
-    EpDispatchCombineArgs<hip_bfloat16> args);
+// Helper macros for conditional FP8 compilation
 #ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-template __global__ void EpDispatchInterNodeV1KernelLowLatency<__hip_fp8_e4m3_fnuz>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
+#define MORI_FP8_FNUZ(...) __VA_ARGS__
+#else
+#define MORI_FP8_FNUZ(...)
 #endif
-#ifdef MORI_FP8_TYPE_OCP_ENABLED
-template __global__ void EpDispatchInterNodeV1KernelLowLatency<__hip_fp8_e4m3>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
-#endif
-template __global__ void EpDispatchInterNodeV1KernelLowLatency<float>(
-    EpDispatchCombineArgs<float> args);
 
-template __global__ void EpCombineInterNodeV1Kernel<hip_bfloat16>(
-    EpDispatchCombineArgs<hip_bfloat16> args);
-#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-template __global__ void EpCombineInterNodeV1Kernel<__hip_fp8_e4m3_fnuz>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
-#endif
 #ifdef MORI_FP8_TYPE_OCP_ENABLED
-template __global__ void EpCombineInterNodeV1Kernel<__hip_fp8_e4m3>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
+#define MORI_FP8_OCP(...) __VA_ARGS__
+#else
+#define MORI_FP8_OCP(...)
 #endif
-template __global__ void EpCombineInterNodeV1Kernel<float>(EpDispatchCombineArgs<float> args);
 
-template __global__ void EpCombineInterNodeV1KernelLowLatency<hip_bfloat16>(
-    EpDispatchCombineArgs<hip_bfloat16> args);
-#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-template __global__ void EpCombineInterNodeV1KernelLowLatency<__hip_fp8_e4m3_fnuz>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
-#endif
-#ifdef MORI_FP8_TYPE_OCP_ENABLED
-template __global__ void EpCombineInterNodeV1KernelLowLatency<__hip_fp8_e4m3>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
-#endif
-template __global__ void EpCombineInterNodeV1KernelLowLatency<float>(
-    EpDispatchCombineArgs<float> args);
+// Macro to instantiate a kernel for all data types
+#define INSTANTIATE_KERNEL(KernelName)                                                         \
+  template __global__ void KernelName<hip_bfloat16>(EpDispatchCombineArgs<hip_bfloat16> args); \
+  MORI_FP8_FNUZ(template __global__ void KernelName<__hip_fp8_e4m3_fnuz>(                      \
+                    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)                         \
+  MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3>(                            \
+                   EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                               \
+  template __global__ void KernelName<float>(EpDispatchCombineArgs<float> args);
 
-template __global__ void EpCombineSync<hip_bfloat16>(EpDispatchCombineArgs<hip_bfloat16> args);
-#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-template __global__ void EpCombineSync<__hip_fp8_e4m3_fnuz>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
-#endif
-#ifdef MORI_FP8_TYPE_OCP_ENABLED
-template __global__ void EpCombineSync<__hip_fp8_e4m3>(EpDispatchCombineArgs<__hip_fp8_e4m3> args);
-#endif
-template __global__ void EpCombineSync<float>(EpDispatchCombineArgs<float> args);
+// Macro to instantiate a kernel with EnableStdMoE parameter for all data types
+#define INSTANTIATE_LL_KERNEL(KernelName, StdMoE)                                 \
+  template __global__ void KernelName<hip_bfloat16, StdMoE>(                      \
+      EpDispatchCombineArgs<hip_bfloat16> args);                                  \
+  MORI_FP8_FNUZ(template __global__ void KernelName<__hip_fp8_e4m3_fnuz, StdMoE>( \
+                    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)            \
+  MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3, StdMoE>(       \
+                   EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                  \
+  template __global__ void KernelName<float, StdMoE>(EpDispatchCombineArgs<float> args);
 
-template __global__ void EpCombineSyncBarrier<hip_bfloat16>(
-    EpDispatchCombineArgs<hip_bfloat16> args);
-#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-template __global__ void EpCombineSyncBarrier<__hip_fp8_e4m3_fnuz>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
+// Combined macro for kernels with EnableStdMoE template parameter
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+#define INSTANTIATE_LL_KERNEL_WITH_STDMOE(KernelName) \
+  INSTANTIATE_LL_KERNEL(KernelName, false)            \
+  INSTANTIATE_LL_KERNEL(KernelName, true)
+#else
+#define INSTANTIATE_LL_KERNEL_WITH_STDMOE(KernelName) INSTANTIATE_LL_KERNEL(KernelName, false)
 #endif
-#ifdef MORI_FP8_TYPE_OCP_ENABLED
-template __global__ void EpCombineSyncBarrier<__hip_fp8_e4m3>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
-#endif
-template __global__ void EpCombineSyncBarrier<float>(EpDispatchCombineArgs<float> args);
 
-template __global__ void EpCombineAll<hip_bfloat16>(EpDispatchCombineArgs<hip_bfloat16> args);
-#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-template __global__ void EpCombineAll<__hip_fp8_e4m3_fnuz>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
-#endif
-#ifdef MORI_FP8_TYPE_OCP_ENABLED
-template __global__ void EpCombineAll<__hip_fp8_e4m3>(EpDispatchCombineArgs<__hip_fp8_e4m3> args);
-#endif
-template __global__ void EpCombineAll<float>(EpDispatchCombineArgs<float> args);
+INSTANTIATE_KERNEL(EpCombineSync)
+INSTANTIATE_KERNEL(EpCombineSyncBarrier)
+INSTANTIATE_KERNEL(EpDispatchInterNodeV1Kernel)
+INSTANTIATE_KERNEL(EpCombineInterNodeV1Kernel)
+INSTANTIATE_KERNEL(EpCombineAll)
+INSTANTIATE_KERNEL(EpDispatchCopyToStaging)
+INSTANTIATE_LL_KERNEL_WITH_STDMOE(EpDispatchInterNodeV1KernelLowLatency)
+INSTANTIATE_LL_KERNEL_WITH_STDMOE(EpCombineInterNodeV1KernelLowLatency)
 
-template __global__ void EpDispatchCopyToStaging<hip_bfloat16>(
-    EpDispatchCombineArgs<hip_bfloat16> args);
-#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-template __global__ void EpDispatchCopyToStaging<__hip_fp8_e4m3_fnuz>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);
-#endif
-#ifdef MORI_FP8_TYPE_OCP_ENABLED
-template __global__ void EpDispatchCopyToStaging<__hip_fp8_e4m3>(
-    EpDispatchCombineArgs<__hip_fp8_e4m3> args);
-#endif
-template __global__ void EpDispatchCopyToStaging<float>(EpDispatchCombineArgs<float> args);
+#undef MORI_FP8_FNUZ
+#undef MORI_FP8_OCP
+#undef INSTANTIATE_KERNEL
+#undef INSTANTIATE_LL_KERNEL
+#undef INSTANTIATE_LL_KERNEL_WITH_STDMOE
 
 }  // namespace moe
 }  // namespace mori
