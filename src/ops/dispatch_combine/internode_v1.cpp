@@ -630,7 +630,7 @@ __global__ void EpDispatchCopyToStaging(EpDispatchCombineArgs<T> args) {
   if (args.curRankNumToken == 0) return;
 
   index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
-  index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
+  index_t hiddenDimPerWarp = ((config.hiddenDim + warpsPerToken - 1) / warpsPerToken + 15) & ~15;
 
   // First copy to staging buffer
   for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
@@ -767,7 +767,7 @@ inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
                         (nNodes + myNode) * config.MaxNumTokensToRecvPerRank() * combXferBytes;
 
   index_t warpsPerToken = (xgmiWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
-  index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
+  index_t hiddenDimPerWarp = ((config.hiddenDim + warpsPerToken - 1) / warpsPerToken + 15) & ~15;
 
   for (int i = globalWarpId - blockOffset * warpNum; i < (args.curRankNumToken * warpsPerToken);
        i += xgmiWarpNum) {
@@ -1046,7 +1046,7 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
     // int warpsPerToken = (rdmaWarpNum + nodeCount - 1) / nodeCount;
     // NOTE: Keep a small fixed value to reduce overhead; use fewer warps for FP8 path.
     int warpsPerToken = useInternalFp8 ? 2 : 4;
-    int hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
+    int hiddenDimPerWarp = ((config.hiddenDim + warpsPerToken - 1) / warpsPerToken + 15) & ~15;
 
     for (int i = globalWarpId; i < (nodeCount * warpsPerToken); i += rdmaWarpNum) {
       int tokenId = i / warpsPerToken;
@@ -1225,7 +1225,7 @@ inline __device__ void CombineAll(EpDispatchCombineArgs<T>& args) {
                         nNodes * config.MaxNumTokensToRecvPerRank() * combXferBytes;
 
   index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
-  index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
+  index_t hiddenDimPerWarp = ((config.hiddenDim + warpsPerToken - 1) / warpsPerToken + 15) & ~15;
 
   for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
     index_t tokenId = i / warpsPerToken;
@@ -1307,7 +1307,7 @@ __global__ void EpCombineAll(EpDispatchCombineArgs<T> args) {
 #endif
 
   index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
-  index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
+  index_t hiddenDimPerWarp = ((config.hiddenDim + warpsPerToken - 1) / warpsPerToken + 15) & ~15;
 
   for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
     index_t tokenId = i / warpsPerToken;

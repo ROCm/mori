@@ -1407,48 +1407,104 @@ __device__ __forceinline__ void WarpAccumBf16Fp8Mixed(OutT* __restrict__ outTok,
                                                       const uint8_t* const* __restrict__ fp8Ptrs,
                                                       int nNodes, int myNode, int hiddenDimSize) {
   const int laneId = threadIdx.x & (warpSize - 1);
-  const int vecEnd4 = (hiddenDimSize / 4) * 4;
-  for (int idx = laneId * 4; idx < vecEnd4; idx += warpSize * 4) {
-    float2 sum01 = float2{0.0f, 0.0f};
-    float2 sum23 = float2{0.0f, 0.0f};
-    if (localTok != nullptr) {
-      const uint64_t packed8 = load<8>(localTok + idx);
-      sum01.x = Bf16BitsToF32(static_cast<uint16_t>(packed8 & 0xFFFF));
-      sum01.y = Bf16BitsToF32(static_cast<uint16_t>((packed8 >> 16) & 0xFFFF));
-      sum23.x = Bf16BitsToF32(static_cast<uint16_t>((packed8 >> 32) & 0xFFFF));
-      sum23.y = Bf16BitsToF32(static_cast<uint16_t>((packed8 >> 48) & 0xFFFF));
-    }
 
-    for (int n = 0; n < nNodes; n++) {
-      if (n == myNode) continue;
-      const uint8_t* fp8TokBytes = fp8Ptrs[n];
-      if (fp8TokBytes == nullptr) continue;
-      const uint32_t packed4 = static_cast<uint32_t>(load<4>(fp8TokBytes + idx));
-      const __hip_fp8x2_storage_t p01 =
-          static_cast<__hip_fp8x2_storage_t>(static_cast<uint16_t>(packed4 & 0xFFFF));
-      const __hip_fp8x2_storage_t p23 =
-          static_cast<__hip_fp8x2_storage_t>(static_cast<uint16_t>(packed4 >> 16));
-      const float2 v01 = CvtFp8x2ToFloat2<Fp8T>(p01);
-      const float2 v23 = CvtFp8x2ToFloat2<Fp8T>(p23);
-      sum01.x += v01.x;
-      sum01.y += v01.y;
-      sum23.x += v23.x;
-      sum23.y += v23.y;
+  // Use 8-element path when hiddenDimSize is large enough for good lane utilization
+  if (hiddenDimSize >= warpSize * 8) {
+    const int vecEnd8 = (hiddenDimSize / 8) * 8;
+    for (int idx = laneId * 8; idx < vecEnd8; idx += warpSize * 8) {
+      float2 sum01{0.0f, 0.0f}, sum23{0.0f, 0.0f}, sum45{0.0f, 0.0f}, sum67{0.0f, 0.0f};
+      if (localTok != nullptr) {
+        const ulong2 packed16 = load<16>(localTok + idx);
+        const uint64_t p0 = packed16.x, p1 = packed16.y;
+        sum01.x = Bf16BitsToF32(static_cast<uint16_t>(p0 & 0xFFFF));
+        sum01.y = Bf16BitsToF32(static_cast<uint16_t>((p0 >> 16) & 0xFFFF));
+        sum23.x = Bf16BitsToF32(static_cast<uint16_t>((p0 >> 32) & 0xFFFF));
+        sum23.y = Bf16BitsToF32(static_cast<uint16_t>((p0 >> 48) & 0xFFFF));
+        sum45.x = Bf16BitsToF32(static_cast<uint16_t>(p1 & 0xFFFF));
+        sum45.y = Bf16BitsToF32(static_cast<uint16_t>((p1 >> 16) & 0xFFFF));
+        sum67.x = Bf16BitsToF32(static_cast<uint16_t>((p1 >> 32) & 0xFFFF));
+        sum67.y = Bf16BitsToF32(static_cast<uint16_t>((p1 >> 48) & 0xFFFF));
+      }
+      for (int n = 0; n < nNodes; n++) {
+        if (n == myNode) continue;
+        const uint8_t* fp8TokBytes = fp8Ptrs[n];
+        if (fp8TokBytes == nullptr) continue;
+        const uint64_t packed8 = static_cast<uint64_t>(load<8>(fp8TokBytes + idx));
+        const float2 v01 = CvtFp8x2ToFloat2<Fp8T>(
+            static_cast<__hip_fp8x2_storage_t>(static_cast<uint16_t>(packed8 & 0xFFFF)));
+        const float2 v23 = CvtFp8x2ToFloat2<Fp8T>(
+            static_cast<__hip_fp8x2_storage_t>(static_cast<uint16_t>((packed8 >> 16) & 0xFFFF)));
+        const float2 v45 = CvtFp8x2ToFloat2<Fp8T>(
+            static_cast<__hip_fp8x2_storage_t>(static_cast<uint16_t>((packed8 >> 32) & 0xFFFF)));
+        const float2 v67 = CvtFp8x2ToFloat2<Fp8T>(
+            static_cast<__hip_fp8x2_storage_t>(static_cast<uint16_t>((packed8 >> 48) & 0xFFFF)));
+        sum01.x += v01.x;
+        sum01.y += v01.y;
+        sum23.x += v23.x;
+        sum23.y += v23.y;
+        sum45.x += v45.x;
+        sum45.y += v45.y;
+        sum67.x += v67.x;
+        sum67.y += v67.y;
+      }
+      StoreOutPair<OutT>(outTok, idx, sum01);
+      StoreOutPair<OutT>(outTok, idx + 2, sum23);
+      StoreOutPair<OutT>(outTok, idx + 4, sum45);
+      StoreOutPair<OutT>(outTok, idx + 6, sum67);
     }
-    StoreOutPair<OutT>(outTok, idx, sum01);
-    StoreOutPair<OutT>(outTok, idx + 2, sum23);
-  }
-  for (int idx = vecEnd4 + laneId; idx < hiddenDimSize; idx += warpSize) {
-    float sum = 0.0f;
-    if (localTok != nullptr) sum += static_cast<float>(localTok[idx]);
-    for (int n = 0; n < nNodes; n++) {
-      if (n == myNode) continue;
-      const uint8_t* fp8TokBytes = fp8Ptrs[n];
-      if (fp8TokBytes == nullptr) continue;
-      const auto* fp8Tok = reinterpret_cast<const Fp8T*>(fp8TokBytes);
-      sum += static_cast<float>(fp8Tok[idx]);
+    for (int idx = vecEnd8 + laneId; idx < hiddenDimSize; idx += warpSize) {
+      float sum = 0.0f;
+      if (localTok != nullptr) sum += static_cast<float>(localTok[idx]);
+      for (int n = 0; n < nNodes; n++) {
+        if (n == myNode) continue;
+        const uint8_t* fp8TokBytes = fp8Ptrs[n];
+        if (fp8TokBytes == nullptr) continue;
+        sum += static_cast<float>(reinterpret_cast<const Fp8T*>(fp8TokBytes)[idx]);
+      }
+      outTok[idx] = OutT(sum);
     }
-    outTok[idx] = OutT(sum);
+  } else {
+    const int vecEnd4 = (hiddenDimSize / 4) * 4;
+    for (int idx = laneId * 4; idx < vecEnd4; idx += warpSize * 4) {
+      float2 sum01 = float2{0.0f, 0.0f};
+      float2 sum23 = float2{0.0f, 0.0f};
+      if (localTok != nullptr) {
+        const uint64_t packed8 = load<8>(localTok + idx);
+        sum01.x = Bf16BitsToF32(static_cast<uint16_t>(packed8 & 0xFFFF));
+        sum01.y = Bf16BitsToF32(static_cast<uint16_t>((packed8 >> 16) & 0xFFFF));
+        sum23.x = Bf16BitsToF32(static_cast<uint16_t>((packed8 >> 32) & 0xFFFF));
+        sum23.y = Bf16BitsToF32(static_cast<uint16_t>((packed8 >> 48) & 0xFFFF));
+      }
+      for (int n = 0; n < nNodes; n++) {
+        if (n == myNode) continue;
+        const uint8_t* fp8TokBytes = fp8Ptrs[n];
+        if (fp8TokBytes == nullptr) continue;
+        const uint32_t packed4 = static_cast<uint32_t>(load<4>(fp8TokBytes + idx));
+        const __hip_fp8x2_storage_t p01 =
+            static_cast<__hip_fp8x2_storage_t>(static_cast<uint16_t>(packed4 & 0xFFFF));
+        const __hip_fp8x2_storage_t p23 =
+            static_cast<__hip_fp8x2_storage_t>(static_cast<uint16_t>(packed4 >> 16));
+        const float2 v01 = CvtFp8x2ToFloat2<Fp8T>(p01);
+        const float2 v23 = CvtFp8x2ToFloat2<Fp8T>(p23);
+        sum01.x += v01.x;
+        sum01.y += v01.y;
+        sum23.x += v23.x;
+        sum23.y += v23.y;
+      }
+      StoreOutPair<OutT>(outTok, idx, sum01);
+      StoreOutPair<OutT>(outTok, idx + 2, sum23);
+    }
+    for (int idx = vecEnd4 + laneId; idx < hiddenDimSize; idx += warpSize) {
+      float sum = 0.0f;
+      if (localTok != nullptr) sum += static_cast<float>(localTok[idx]);
+      for (int n = 0; n < nNodes; n++) {
+        if (n == myNode) continue;
+        const uint8_t* fp8TokBytes = fp8Ptrs[n];
+        if (fp8TokBytes == nullptr) continue;
+        sum += static_cast<float>(reinterpret_cast<const Fp8T*>(fp8TokBytes)[idx]);
+      }
+      outTok[idx] = OutT(sum);
+    }
   }
 }
 
