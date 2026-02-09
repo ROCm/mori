@@ -550,7 +550,8 @@ class EpDispatchCombineTestCase:
             all_rank_scales,
         ) = test_data
 
-        for i in range(3):
+        warmup_rounds = 3
+        for i in range(warmup_rounds):
             (
                 dispatch_output,
                 dispatch_weights,
@@ -564,12 +565,14 @@ class EpDispatchCombineTestCase:
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
             )
+            if i == warmup_rounds - 1:
+                # Read totalRecvTokenNum after dispatch but before combine resets it
+                torch.cuda.synchronize()
+                total_recv_num_token = dispatch_recv_num_token[0].item()
             combine_output, combine_output_weight = self.run_combine(
                 op, dispatch_output, None, all_rank_indices[self.rank]
             )
             torch.cuda.synchronize()
-
-        total_recv_num_token = dispatch_recv_num_token[0]
         total_rdma_recv_num_token = (
             self.config.max_num_inp_token_per_rank * self.config.world_size // 8
         )
