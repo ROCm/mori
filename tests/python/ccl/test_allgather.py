@@ -98,7 +98,7 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
                 allgather_start.record(stream)
                 
                 with torch.cuda.stream(stream):
-                    success = allgather(input_tensor, output_tensor, elems_per_pe)
+                    success = allgather(input_tensor, output_tensor, elems_per_pe, stream)
                 
                 # Record end time
                 allgather_end.record(stream)
@@ -135,14 +135,14 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup):
                 
                 # Start async operation using context manager style (like test_allgather_overlap.py)
                 with torch.cuda.stream(stream):
-                    started = allgather.start_async(input_tensor, output_tensor, elems_per_pe)
+                    started = allgather.start_async(input_tensor, output_tensor, elems_per_pe, stream)
                 if not started:
                     print(f"PE {rank}: Failed to start async operation")
                     break
                 
                 # Wait for completion (using the same stream)
                 with torch.cuda.stream(stream):
-                    exec_time = allgather.wait_async()
+                    exec_time = allgather.wait_async(stream)
                 
                 if exec_time < 0:
                     print(f"PE {rank}: Async operation failed")
