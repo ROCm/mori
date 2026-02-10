@@ -25,8 +25,19 @@
 #include <hip/hip_fp8.h>
 
 #include "mori/core/utils.hpp"
+#include "mori/utils/data_types.hpp"
 namespace mori {
 namespace core {
+
+#if defined(MORI_FP8_TYPE_OCP_ENABLED)
+using CombineInternalFp8 = __hip_fp8_e4m3;
+using CombineInternalFp8x4 = __hip_fp8x4_e4m3;
+#elif defined(MORI_FP8_TYPE_FNUZ_ENABLED)
+using CombineInternalFp8 = __hip_fp8_e4m3_fnuz;
+using CombineInternalFp8x4 = __hip_fp8x4_e4m3_fnuz;
+#else
+using CombineInternalFp8 = uint8_t;
+#endif
 
 template <int VecBytes>
 struct VecTypeSelector {
@@ -663,6 +674,110 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
   }
 
 #undef WARP_ACCUM_CASE
+}
+
+template <typename T>
+__forceinline__ __device__ void WarpCastBf16ToCombineInternalFp8(
+    CombineInternalFp8* __restrict__ dst, const T* __restrict__ src, int hiddenDim, int laneId) {
+#if defined(MORI_FP8_TYPE_OCP_ENABLED) || defined(MORI_FP8_TYPE_FNUZ_ENABLED)
+
+  if constexpr (std::is_same_v<T, hip_bfloat16>) {
+    using Fp8T = CombineInternalFp8;
+    using Fp8x4T = CombineInternalFp8x4;
+    using Bf16x2T = __hip_bfloat162;
+    constexpr int kVec = 4;
+
+    const int vecEnd = (hiddenDim / kVec) * kVec;
+    for (int j = laneId * kVec; j < vecEnd; j += warpSize * kVec) {
+      const Bf16x2T low = *reinterpret_cast<const Bf16x2T*>(src + j);
+      const Bf16x2T high = *reinterpret_cast<const Bf16x2T*>(src + j + 2);
+      const Fp8x4T packed(high, low);
+      *reinterpret_cast<__hip_fp8x4_storage_t*>(dst + j) = packed.__x;
+    }
+
+    for (int j = vecEnd + laneId; j < hiddenDim; j += warpSize) {
+      dst[j] = Fp8T(src[j]);
+    }
+  }
+#else
+  (void)dst;
+  (void)src;
+  (void)hiddenDim;
+  (void)laneId;
+#endif
+}
+
+template <typename T>
+__forceinline__ __device__ void SumCombineInternalFp8AcrossNodesToBf16(
+    T* __restrict__ out, const CombineInternalFp8* const* __restrict__ srcPtrs, int nNodes,
+    int laneId, int hiddenDimSize) {
+#if defined(MORI_FP8_TYPE_OCP_ENABLED) || defined(MORI_FP8_TYPE_FNUZ_ENABLED)
+  if constexpr (std::is_same_v<T, hip_bfloat16>) {
+    using Fp8T = CombineInternalFp8;
+    using Fp8x4T = CombineInternalFp8x4;
+    constexpr int kVec = 4;
+    const int vecEnd = (hiddenDimSize / kVec) * kVec;
+
+    const Fp8T* src0 = (0 < nNodes) ? srcPtrs[0] : nullptr;
+    const Fp8T* src1 = (1 < nNodes) ? srcPtrs[1] : nullptr;
+
+    for (int j = laneId * kVec; j < vecEnd; j += warpSize * kVec) {
+      float4 sum4 = {0.0f, 0.0f, 0.0f, 0.0f};
+      if (nNodes == 2) {
+        if (src0 != nullptr) {
+          Fp8x4T v;
+          v.__x = *reinterpret_cast<const __hip_fp8x4_storage_t*>(src0 + j);
+          const float4 f = static_cast<float4>(v);
+          sum4.x += f.x;
+          sum4.y += f.y;
+          sum4.z += f.z;
+          sum4.w += f.w;
+        }
+        if (src1 != nullptr) {
+          Fp8x4T v;
+          v.__x = *reinterpret_cast<const __hip_fp8x4_storage_t*>(src1 + j);
+          const float4 f = static_cast<float4>(v);
+          sum4.x += f.x;
+          sum4.y += f.y;
+          sum4.z += f.z;
+          sum4.w += f.w;
+        }
+      } else {
+        for (int n = 0; n < nNodes; n++) {
+          const Fp8T* src = srcPtrs[n];
+          if (src == nullptr) continue;
+          Fp8x4T v;
+          v.__x = *reinterpret_cast<const __hip_fp8x4_storage_t*>(src + j);
+          const float4 f = static_cast<float4>(v);
+          sum4.x += f.x;
+          sum4.y += f.y;
+          sum4.z += f.z;
+          sum4.w += f.w;
+        }
+      }
+      out[j + 0] = T(sum4.x);
+      out[j + 1] = T(sum4.y);
+      out[j + 2] = T(sum4.z);
+      out[j + 3] = T(sum4.w);
+    }
+
+    for (int j = vecEnd + laneId; j < hiddenDimSize; j += warpSize) {
+      float sum = 0.0f;
+      for (int n = 0; n < nNodes; n++) {
+        const Fp8T* src = srcPtrs[n];
+        if (src == nullptr) continue;
+        sum += float(src[j]);
+      }
+      out[j] = T(sum);
+    }
+  }
+#else
+  (void)out;
+  (void)srcPtrs;
+  (void)nNodes;
+  (void)laneId;
+  (void)hiddenDimSize;
+#endif
 }
 
 }  // namespace core

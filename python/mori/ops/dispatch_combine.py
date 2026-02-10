@@ -31,6 +31,29 @@ class EpDispatchCombineKernelType(mori_cpp.EpDispatchCombineKernelType):
         return self.name
 
 
+class EpDispatchCombineQuantType(mori_cpp.EpDispatchCombineQuantType):
+    def __str__(self):
+        return self.name
+
+
+_QUANT_TYPE_MAP = {
+    "none": EpDispatchCombineQuantType.None_,
+    "fp8_direct_cast": EpDispatchCombineQuantType.Fp8DirectCast,
+}
+
+
+def _normalize_quant_type(quant_type):
+    if isinstance(quant_type, EpDispatchCombineQuantType):
+        return quant_type
+    if isinstance(quant_type, str):
+        key = quant_type.strip().lower()
+        if key in _QUANT_TYPE_MAP:
+            return _QUANT_TYPE_MAP[key]
+    raise ValueError(
+        f"invalid quant_type '{quant_type}', expected one of {list(_QUANT_TYPE_MAP.keys())}"
+    )
+
+
 @dataclass
 class EpDispatchCombineConfig:
     data_type: torch.dtype
@@ -50,6 +73,7 @@ class EpDispatchCombineConfig:
     gpu_per_node: int = 8
     rdma_block_num: int = 0
     num_qp_per_pe: int = 1
+    quant_type: str = "none"
 
 
 def _cpp_dispatch_combine_factory(entity_name, allow_missing=False):
@@ -75,26 +99,27 @@ class EpDispatchCombineOp:
         self.config = config
 
         handle_class = _cpp_dispatch_combine_factory("EpDispatchCombineHandle")
-        self._handle = handle_class(
-            mori_cpp.EpDispatchCombineConfig(
-                rank=config.rank,
-                world_size=config.world_size,
-                hidden_dim=config.hidden_dim,
-                scale_dim=config.scale_dim,
-                scale_type_size=config.scale_type_size,
-                max_token_type_size=config.max_token_type_size,
-                max_num_inp_token_per_rank=config.max_num_inp_token_per_rank,
-                num_experts_per_rank=config.num_experts_per_rank,
-                num_experts_per_token=config.num_experts_per_token,
-                warp_num_per_block=config.warp_num_per_block,
-                block_num=config.block_num,
-                use_external_inp_buf=config.use_external_inp_buf,
-                kernel_type=config.kernel_type,
-                gpu_per_node=config.gpu_per_node,
-                rdma_block_num=config.rdma_block_num,
-                num_qp_per_pe=config.num_qp_per_pe,
-            )
+        cpp_config = mori_cpp.EpDispatchCombineConfig(
+            rank=config.rank,
+            world_size=config.world_size,
+            hidden_dim=config.hidden_dim,
+            scale_dim=config.scale_dim,
+            scale_type_size=config.scale_type_size,
+            max_token_type_size=config.max_token_type_size,
+            max_num_inp_token_per_rank=config.max_num_inp_token_per_rank,
+            num_experts_per_rank=config.num_experts_per_rank,
+            num_experts_per_token=config.num_experts_per_token,
+            warp_num_per_block=config.warp_num_per_block,
+            block_num=config.block_num,
+            use_external_inp_buf=config.use_external_inp_buf,
+            kernel_type=config.kernel_type,
+            gpu_per_node=config.gpu_per_node,
+            rdma_block_num=config.rdma_block_num,
+            num_qp_per_pe=config.num_qp_per_pe,
+            quant_type=_normalize_quant_type(config.quant_type),
         )
+
+        self._handle = handle_class(cpp_config)
 
         self._dispatch_func = _cpp_dispatch_combine_factory("launch_dispatch")
         self._dispatch_recv_func = _cpp_dispatch_combine_factory("launch_dispatch_recv")

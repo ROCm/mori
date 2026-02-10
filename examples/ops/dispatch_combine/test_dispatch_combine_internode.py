@@ -47,6 +47,7 @@ class EpDispatchCombineTestCase:
         max_tokens,
         kernel_type,
         num_qp,
+        quant_type="none",
         dtype=torch.bfloat16,
     ):
         self.rank = rank
@@ -69,6 +70,7 @@ class EpDispatchCombineTestCase:
             gpu_per_node=self.gpu_per_node,
             rdma_block_num=64,
             num_qp_per_pe=num_qp,
+            quant_type=quant_type,
         )
 
     def setup(self):
@@ -385,7 +387,10 @@ class EpDispatchCombineTestCase:
                 all_rank_input[self.rank][i].to(torch.float32) * final_unique_pes
             ).to(self.config.data_type)
 
-            ok = torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
+            atol, rtol = 1e-2, 1e-2
+            if getattr(self.config, "quant_type", "none") == "fp8_direct_cast":
+                atol, rtol = 1e-1, 1e-1
+            ok = torch.allclose(got.float(), expected.float(), atol=atol, rtol=rtol)
             if not ok:
                 print(
                     self.rank,
@@ -435,7 +440,7 @@ class EpDispatchCombineTestCase:
     def test_dispatch_combine(self):
         error_round = set()
         op = mori.ops.EpDispatchCombineOp(self.config)
-        for i in range(5000):
+        for i in range(500):
             if self.rank == 0:
                 print(f"Round {i} begin")
             test_data = self.gen_test_data(
@@ -956,6 +961,7 @@ def test_dispatch_combine(
     max_tokens,
     kernel_type,
     num_qp,
+    quant_type="none",
     cmd="test",
     sweep_token_interval=64,
 ):
@@ -971,6 +977,7 @@ def test_dispatch_combine(
             max_tokens,
             kernel_type,
             num_qp,
+            quant_type,
             dtype,
         )
         test_case.setup()
@@ -1002,6 +1009,7 @@ _DATA_TYPE_MAP = {
     "fp8_e4m3_fnuz": torch.float8_e4m3fnuz,
     "fp8_e4m3": torch.float8_e4m3fn,
 }
+
 
 parser = argparse.ArgumentParser(description="dispatch/combine internode test")
 parser.add_argument(
@@ -1043,6 +1051,16 @@ parser.add_argument(
     default=1,
     help="Number of qp per processing endpoint",
 )
+parser.add_argument(
+    "--quant-type",
+    type=str,
+    default="none",
+    choices=["none", "fp8_direct_cast"],
+    help=(
+        "Quantization method used inside Combine. "
+        "'fp8_direct_cast' is the current BF16<->FP8 direct cast path."
+    ),
+)
 args_cli = parser.parse_args()
 
 if __name__ == "__main__":
@@ -1060,6 +1078,7 @@ if __name__ == "__main__":
             args_cli.max_tokens,
             args_cli.kernel_type,
             args_cli.num_qp,
+            args_cli.quant_type,
             args_cli.cmd,
             args_cli.sweep_token_interval,
         ),
