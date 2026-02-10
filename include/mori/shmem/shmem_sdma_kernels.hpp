@@ -71,6 +71,20 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::SDMA
                     dest->sdmaNumQueue);
 }
 
+template <>
+inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::SDMA>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  // TODO: add SDMA block-level PutMemNbi
+  (void)dest;
+  (void)destOffset;
+  (void)source;
+  (void)sourceOffset;
+  (void)bytes;
+  (void)pe;
+  (void)qpId;
+}
+
 // Pure address-based PutMemNbi versions
 template <>
 inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SDMA>(
@@ -112,6 +126,17 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::SDMA
 
   core::SdmaPutWarp(srcPtr, dstPtr, bytes, devicehandles, signals, expectedSignals,
                     heapObj->sdmaNumQueue);
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::SDMA>(
+    const void* dest, const void* source, size_t bytes, int pe, int qpId) {
+  // TODO: add SDMA block-level PutMemNbi
+  (void)dest;
+  (void)source;
+  (void)bytes;
+  (void)pe;
+  (void)qpId;
 }
 
 template <>

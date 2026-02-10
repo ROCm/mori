@@ -40,6 +40,10 @@ inline __device__ void ShmemPutMemNbiWarpKernel(const void* dest, const void* so
                                                 int pe, int qpId = 0);
 
 template <application::TransportType TsptType>
+inline __device__ void ShmemPutMemNbiBlockKernel(const void* dest, const void* source, size_t bytes,
+                                                 int pe, int qpId = 0);
+
+template <application::TransportType TsptType>
 inline __device__ void ShmemPutSizeImmNbiThreadKernel(const void* dest, void* val, size_t bytes,
                                                       int pe, int qpId = 0);
 
@@ -99,6 +103,13 @@ inline __device__ void ShmemPutMemNbiWarpKernel(const application::SymmMemObjPtr
                                                 const application::SymmMemObjPtr source,
                                                 size_t sourceOffset, size_t bytes, int pe,
                                                 int qpId = 0);
+
+template <application::TransportType TsptType>
+inline __device__ void ShmemPutMemNbiBlockKernel(const application::SymmMemObjPtr dest,
+                                                 size_t destOffset,
+                                                 const application::SymmMemObjPtr source,
+                                                 size_t sourceOffset, size_t bytes, int pe,
+                                                 int qpId = 0);
 
 template <application::TransportType TsptType>
 inline __device__ void ShmemPutSizeImmNbiThreadKernel(const application::SymmMemObjPtr dest,

@@ -176,6 +176,7 @@ inline __device__ uint64_t ShmemPtrP2p(const application::SymmMemObjPtr& memObjP
 
 DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Block)
 
 #define DEFINE_SHMEM_PUT_TYPE_NBI_API_TEMPLATE(Scope)                                      \
   template <typename T>                                                                    \
@@ -190,6 +191,7 @@ DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Warp)
 
 DEFINE_SHMEM_PUT_TYPE_NBI_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_API_TEMPLATE(Block)
 
 #define DEFINE_SHMEM_PUT_TYPE_NBI_API(TypeName, T, Scope)                                   \
   inline __device__ void ShmemPut##TypeName##Nbi##Scope(                                    \
@@ -222,6 +224,18 @@ DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Int64, int64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Float, float, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Double, double, Warp)
+
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint8, uint8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Int8, int8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Schar, signed char, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint16, uint16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Int16, int16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint32, uint32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Int32, int32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint64, uint64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Int64, int64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Float, float, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Double, double, Block)
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                       PutNbi Inline APIs                                       */
@@ -492,6 +506,7 @@ DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Ulong, unsigned long, Warp)
 
 DEFINE_SHMEM_PUT_MEM_NBI_ADDR_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_MEM_NBI_ADDR_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_MEM_NBI_ADDR_API_TEMPLATE(Block)
 
 #define DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API_TEMPLATE(Scope)                                       \
   template <typename T>                                                                          \
@@ -502,6 +517,7 @@ DEFINE_SHMEM_PUT_MEM_NBI_ADDR_API_TEMPLATE(Warp)
 
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API_TEMPLATE(Block)
 
 #define DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(TypeName, T, Scope)                                   \
   inline __device__ void ShmemPut##TypeName##Nbi##Scope(T* dest, const T* source, size_t nelems, \
@@ -532,6 +548,18 @@ DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int64, int64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Float, float, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Double, double, Warp)
+
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint8, uint8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int8, int8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Schar, signed char, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint16, uint16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int16, int16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint32, uint32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int32, int32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint64, uint64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int64, int64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Float, float, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Double, double, Block)
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                       PutNbi Inline APIs                                       */

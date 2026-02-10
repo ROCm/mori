@@ -87,6 +87,66 @@ __device__ __attribute__((visibility("default"))) void mori_shmem_put_double_nbi
 }
 
 // ============================================================================
+// PutNbi APIs - Warp Scope (Address-based only)
+// ============================================================================
+__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_warp(void* dest,
+                                                                                const void* source,
+                                                                                size_t bytes, int pe,
+                                                                                int qpId) {
+  mori::shmem::ShmemPutMemNbiWarp(dest, source, bytes, pe, qpId);
+}
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_uint32_nbi_warp(
+    uint32_t* dest, const uint32_t* source, size_t nelems, int pe, int qpId) {
+  mori::shmem::ShmemPutUint32NbiWarp(dest, source, nelems, pe, qpId);
+}
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_uint64_nbi_warp(
+    uint64_t* dest, const uint64_t* source, size_t nelems, int pe, int qpId) {
+  mori::shmem::ShmemPutUint64NbiWarp(dest, source, nelems, pe, qpId);
+}
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_float_nbi_warp(
+    float* dest, const float* source, size_t nelems, int pe, int qpId) {
+  mori::shmem::ShmemPutFloatNbiWarp(dest, source, nelems, pe, qpId);
+}
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_double_nbi_warp(
+    double* dest, const double* source, size_t nelems, int pe, int qpId) {
+  mori::shmem::ShmemPutDoubleNbiWarp(dest, source, nelems, pe, qpId);
+}
+
+// ============================================================================
+// PutNbi APIs - Block Scope (Address-based only)
+// ============================================================================
+__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_block(void* dest,
+                                                                                 const void* source,
+                                                                                 size_t bytes, int pe,
+                                                                                 int qpId) {
+  mori::shmem::ShmemPutMemNbiBlock(dest, source, bytes, pe, qpId);
+}
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_uint32_nbi_block(
+    uint32_t* dest, const uint32_t* source, size_t nelems, int pe, int qpId) {
+  mori::shmem::ShmemPutUint32NbiBlock(dest, source, nelems, pe, qpId);
+}
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_uint64_nbi_block(
+    uint64_t* dest, const uint64_t* source, size_t nelems, int pe, int qpId) {
+  mori::shmem::ShmemPutUint64NbiBlock(dest, source, nelems, pe, qpId);
+}
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_float_nbi_block(
+    float* dest, const float* source, size_t nelems, int pe, int qpId) {
+  mori::shmem::ShmemPutFloatNbiBlock(dest, source, nelems, pe, qpId);
+}
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_double_nbi_block(
+    double* dest, const double* source, size_t nelems, int pe, int qpId) {
+  mori::shmem::ShmemPutDoubleNbiBlock(dest, source, nelems, pe, qpId);
+}
+
+// ============================================================================
 // PutNbi with Signal APIs
 // ============================================================================
 __device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_signal_thread(

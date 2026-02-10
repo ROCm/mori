@@ -621,11 +621,32 @@ inline __device__ void ShmemPutMemNbiWarpKernelImpl(const application::SymmMemOb
   }
 }
 
+template <core::ProviderType PrvdType>
+inline __device__ void ShmemPutMemNbiBlockKernelImpl(const application::SymmMemObjPtr dest,
+                                                     size_t destOffset,
+                                                     const application::SymmMemObjPtr source,
+                                                     size_t sourceOffset, size_t bytes, int pe,
+                                                     int qpId) {
+  int threadId = core::FlatBlockThreadId();
+  if (threadId == 0) {
+    ShmemPutMemNbiThreadKernelImpl<PrvdType>(dest, destOffset, source, sourceOffset, bytes, pe,
+                                             qpId);
+  }
+}
+
 template <>
 inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::RDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
   DISPATCH_PROVIDER_TYPE_COMPILE_TIME(ShmemPutMemNbiWarpKernelImpl, dest, destOffset, source,
+                                      sourceOffset, bytes, pe, qpId);
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::RDMA>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  DISPATCH_PROVIDER_TYPE_COMPILE_TIME(ShmemPutMemNbiBlockKernelImpl, dest, destOffset, source,
                                       sourceOffset, bytes, pe, qpId);
 }
 
@@ -1725,10 +1746,25 @@ inline __device__ void ShmemPutMemNbiWarpKernelAddrImpl(const void* dest, const 
   }
 }
 
+template <core::ProviderType PrvdType>
+inline __device__ void ShmemPutMemNbiBlockKernelAddrImpl(const void* dest, const void* source,
+                                                         size_t bytes, int pe, int qpId) {
+  if (core::FlatBlockThreadId() == 0) {
+    ShmemPutMemNbiThreadKernelAddrImpl<PrvdType>(dest, source, bytes, pe, qpId);
+  }
+}
+
 template <>
 inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::RDMA>(
     const void* dest, const void* source, size_t bytes, int pe, int qpId) {
   DISPATCH_PROVIDER_TYPE_COMPILE_TIME(ShmemPutMemNbiWarpKernelAddrImpl, dest, source, bytes, pe,
+                                      qpId);
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::RDMA>(
+    const void* dest, const void* source, size_t bytes, int pe, int qpId) {
+  DISPATCH_PROVIDER_TYPE_COMPILE_TIME(ShmemPutMemNbiBlockKernelAddrImpl, dest, source, bytes, pe,
                                       qpId);
 }
 

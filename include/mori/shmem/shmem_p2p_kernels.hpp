@@ -58,6 +58,16 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::P2P>
 }
 
 template <>
+inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::P2P>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  uint8_t* srcPtr =
+      reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);
+  uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
+  core::BlockCopy<uint8_t>(destPtr, srcPtr, bytes);
+}
+
+template <>
 inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::P2P>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe,
     int qpId) {
@@ -503,6 +513,19 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::P2P>
   uint8_t* srcPtr = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(source));
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(globalGpuStates->heapObj->peerPtrs[pe] + offset);
   core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::P2P>(
+    const void* dest, const void* source, size_t bytes, int pe, int qpId) {
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+
+  uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
+  size_t offset = destAddr - globalGpuStates->heapBaseAddr;
+
+  uint8_t* srcPtr = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(source));
+  uint8_t* destPtr = reinterpret_cast<uint8_t*>(globalGpuStates->heapObj->peerPtrs[pe] + offset);
+  core::BlockCopy<uint8_t>(destPtr, srcPtr, bytes);
 }
 
 // New pure address-based PutSizeImmNbi for P2P transport

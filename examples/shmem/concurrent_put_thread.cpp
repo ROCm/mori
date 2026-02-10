@@ -46,7 +46,9 @@ using namespace mori::application;
 // Forward declarations
 void Test0_DirectGPUAccess(int myPe);
 void Test1_LegacyAPI(int myPe);
+void Test1_LegacyAPI_Block(int myPe);
 void Test2_PureAddressAPI(int myPe);
+void Test2_PureAddressAPI_Block(int myPe);
 void Test3_LargeMultiChunk(int myPe);
 void Test4_MixedMallocFree(int myPe);
 void Test5_FragmentationReuse(int myPe);
@@ -66,6 +68,31 @@ __global__ void ConcurrentPutThreadKernel(int myPe, const SymmMemObjPtr memObj) 
   if (myPe == sendPe) {
     ShmemPutMemNbiThread(memObj, threadOffset, memObj, threadOffset, sizeof(uint32_t), recvPe, 1);
     ShmemFenceThread();
+  } else {
+    while (atomicAdd(reinterpret_cast<uint32_t*>(memObj->localPtr) + globalTid, 0) != sendPe) {
+    }
+  }
+}
+
+// Legacy API: Using SymmMemObjPtr + offset (Block scope)
+__global__ void ConcurrentPutBlockKernel(int myPe, const SymmMemObjPtr memObj, size_t numElements) {
+  constexpr int sendPe = 0;
+  constexpr int recvPe = 1;
+
+  int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (globalTid >= static_cast<int>(numElements)) {
+    return;
+  }
+
+  size_t blockElemOffset = static_cast<size_t>(blockIdx.x) * blockDim.x;
+  size_t blockByteOffset = blockElemOffset * sizeof(uint32_t);
+  size_t blockBytes = static_cast<size_t>(blockDim.x) * sizeof(uint32_t);
+
+  if (myPe == sendPe) {
+    ShmemPutMemNbiBlock(memObj, blockByteOffset, memObj, blockByteOffset, blockBytes, recvPe, 1);
+    if (threadIdx.x == 0) {
+      ShmemFenceThread();
+    }
   } else {
     while (atomicAdd(reinterpret_cast<uint32_t*>(memObj->localPtr) + globalTid, 0) != sendPe) {
     }
@@ -105,6 +132,36 @@ __global__ void ConcurrentPutThreadKernel_PureAddr(int myPe, uint32_t* localBuff
     if (globalTid == 0) {
       printf("rank %d addr %lu\n", myPe,
              ShmemPtrP2p(reinterpret_cast<uint64_t>(localBuff), myPe, recvPe));
+    }
+  }
+}
+
+// New API: Using pure addresses (Block scope)
+__global__ void ConcurrentPutBlockKernel_PureAddr(int myPe, uint32_t* localBuff,
+                                                  size_t numElements) {
+  constexpr int sendPe = 0;
+  constexpr int recvPe = 1;
+
+  int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (globalTid >= static_cast<int>(numElements)) {
+    return;
+  }
+
+  size_t blockElemOffset = static_cast<size_t>(blockIdx.x) * blockDim.x;
+  size_t blockBytes = static_cast<size_t>(blockDim.x) * sizeof(uint32_t);
+  uint32_t* src = localBuff + blockElemOffset;
+  uint32_t* dest = localBuff + blockElemOffset;
+
+  if (myPe == sendPe) {
+    ShmemPutMemNbiBlock(dest, src, blockBytes, recvPe, 1);
+    if (threadIdx.x == 0) {
+      __threadfence_system();
+      if (blockIdx.x == 0) {
+        ShmemQuietThread();
+      }
+    }
+  } else {
+    while (atomicAdd(localBuff + globalTid, 0) != sendPe) {
     }
   }
 }
@@ -293,6 +350,56 @@ void Test1_LegacyAPI(int myPe) {
   ShmemFree(buff);
 }
 
+void Test1_LegacyAPI_Block(int myPe) {
+  if (myPe == 0) {
+    printf("\n--- Test 1B: Legacy API Block Scope ---\n");
+  }
+
+  constexpr int threadNum = 128;
+  constexpr int blockNum = 3;
+  int numEle = threadNum * blockNum;
+  int buffSize = numEle * sizeof(uint32_t);
+
+  void* buff = ShmemMalloc(buffSize);
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff), myPe, numEle));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  SymmMemObjPtr buffObj = ShmemQueryMemObjPtr(buff);
+  assert(buffObj.IsValid());
+
+  if (myPe == 0) {
+    printf("Running legacy block API test...\n");
+  }
+
+  MPI_Barrier(MPI_COMM_WORLD);
+  ConcurrentPutBlockKernel<<<blockNum, threadNum>>>(myPe, buffObj, numEle);
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  std::vector<uint32_t> hostBuff(numEle);
+  HIP_RUNTIME_CHECK(hipMemcpy(hostBuff.data(), buff, buffSize, hipMemcpyDeviceToHost));
+
+  if (myPe == 1) {
+    bool success = true;
+    for (int i = 0; i < numEle; i++) {
+      if (hostBuff[i] != 0) {
+        printf("Error at index %d: expected 0, got %u\n", i, hostBuff[i]);
+        success = false;
+        break;
+      }
+    }
+    if (!success) {
+      printf("✗ Legacy block API test FAILED!\n");
+    }
+  }
+
+  if (myPe == 0) {
+    printf("✓ Legacy block API test PASSED! All %d elements verified.\n", numEle);
+  }
+
+  ShmemFree(buff);
+}
+
 void Test2_PureAddressAPI(int myPe) {
   if (myPe == 0) {
     printf("\n--- Test 2: Pure Address API ---\n");
@@ -348,6 +455,66 @@ void Test2_PureAddressAPI(int myPe) {
 
   if (myPe == 0) {
     printf("✓ Pure address API test PASSED! All %d elements verified.\n", numEle);
+  }
+
+  ShmemFree(buff);
+}
+
+void Test2_PureAddressAPI_Block(int myPe) {
+  if (myPe == 0) {
+    printf("\n--- Test 2B: Pure Address API Block Scope ---\n");
+  }
+
+  const char* shmemMode = std::getenv("MORI_SHMEM_MODE");
+  bool skipPureAddress = (shmemMode != nullptr && std::string(shmemMode) == "ISOLATION");
+
+  if (skipPureAddress) {
+    if (myPe == 0) {
+      printf(
+          "⊘ SKIPPED (MORI_SHMEM_MODE=ISOLATION - pure address API not supported in isolation "
+          "mode)\n");
+    }
+    return;
+  }
+
+  constexpr int threadNum = 128;
+  constexpr int blockNum = 3;
+  int numEle = threadNum * blockNum;
+  int buffSize = numEle * sizeof(uint32_t);
+
+  void* buff = ShmemMalloc(buffSize);
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff), myPe, numEle));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  if (myPe == 0) {
+    printf("Running pure address block API test...\n");
+  }
+
+  MPI_Barrier(MPI_COMM_WORLD);
+  ConcurrentPutBlockKernel_PureAddr<<<blockNum, threadNum>>>(
+      myPe, reinterpret_cast<uint32_t*>(buff), numEle);
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  std::vector<uint32_t> hostBuff(numEle);
+  HIP_RUNTIME_CHECK(hipMemcpy(hostBuff.data(), buff, buffSize, hipMemcpyDeviceToHost));
+
+  if (myPe == 1) {
+    bool success = true;
+    for (int i = 0; i < numEle; i++) {
+      if (hostBuff[i] != 0) {
+        printf("Error at index %d: expected 0, got %u\n", i, hostBuff[i]);
+        success = false;
+        break;
+      }
+    }
+    if (!success) {
+      printf("✗ Pure address block API test FAILED!\n");
+    }
+  }
+
+  if (myPe == 0) {
+    printf("✓ Pure address block API test PASSED! All %d elements verified.\n", numEle);
   }
 
   ShmemFree(buff);
@@ -611,7 +778,9 @@ void ConcurrentPutThread() {
 
   Test0_DirectGPUAccess(myPe);
   Test1_LegacyAPI(myPe);
+  Test1_LegacyAPI_Block(myPe);
   Test2_PureAddressAPI(myPe);
+  Test2_PureAddressAPI_Block(myPe);
   Test3_LargeMultiChunk(myPe);
   Test4_MixedMallocFree(myPe);
   Test5_FragmentationReuse(myPe);
@@ -642,7 +811,9 @@ void ConcurrentPutThread() {
     printf("Summary:\n");
     printf("  - Test 0: Direct GPU-to-GPU access\n");
     printf("  - Test 1: Legacy API with small data\n");
+    printf("  - Test 1B: Legacy API block scope\n");
     printf("  - Test 2: Pure address API with small data\n");
+    printf("  - Test 2B: Pure address API block scope\n");
     printf("  - Test 3: Large multi-chunk allocation (>200MB)\n");
     printf("  - Test 4: Mixed malloc/free with reference counting\n");
     printf("  - Test 5: Fragmentation and VA reuse\n");
