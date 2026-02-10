@@ -308,6 +308,7 @@ DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int64, int64_t, Warp)
 
 DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Block)
 
 // PutNbi with Signal - Typed version
 #define DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API_TEMPLATE(Scope)                                      \
@@ -325,6 +326,7 @@ DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Warp)
 
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API_TEMPLATE(Block)
 
 // PutNbi with Signal - Concrete typed versions
 #define DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(TypeName, T, Scope)                                  \
@@ -362,6 +364,18 @@ DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int64, int64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Float, float, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Double, double, Warp)
+
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint8, uint8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int8, int8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Schar, signed char, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint16, uint16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int16, int16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint32, uint32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int32, int32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint64, uint64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int64, int64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Float, float, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Double, double, Block)
 
 #define SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Scope)                                         \
   inline __device__ void ShmemAtomicSizeNonFetch##Scope(                                       \
@@ -623,6 +637,7 @@ DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Int64, int64_t, Warp)
 
 DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_ADDR_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_ADDR_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_ADDR_API_TEMPLATE(Block)
 
 #define DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API_TEMPLATE(Scope)                            \
   template <typename T, bool onlyOneSignal = true>                                           \
@@ -635,6 +650,7 @@ DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_ADDR_API_TEMPLATE(Warp)
 
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API_TEMPLATE(Block)
 
 #define DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(TypeName, T, Scope)                             \
   template <bool onlyOneSignal = true>                                                            \
@@ -668,6 +684,18 @@ DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int64, int64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Float, float, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Double, double, Warp)
+
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint8, uint8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int8, int8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Schar, signed char, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint16, uint16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int16, int16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint32, uint32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int32, int32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint64, uint64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int64, int64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Float, float, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Double, double, Block)
 
 #define SHMEM_ATOMIC_SIZE_NONFETCH_ADDR_API_TEMPLATE(Scope)                                        \
   inline __device__ void ShmemAtomicSizeNonFetch##Scope(                                           \
@@ -951,7 +979,6 @@ inline __device__ void ShmemBarrierAllBlock() {
   ShmemQuietThread();
   ShmemInternalBarrierBlock();
 }
-
 
 }  // namespace shmem
 }  // namespace mori

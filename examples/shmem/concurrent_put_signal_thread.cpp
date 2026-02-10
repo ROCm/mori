@@ -110,6 +110,92 @@ __global__ void ConcurrentPutSignalThreadKernelAdd_PureAddr(int myPe, uint32_t* 
   }
 }
 
+// Legacy API: Using SymmMemObjPtr + offset (Block scope) with AMO_ADD
+__global__ void ConcurrentPutSignalBlockKernelAdd(int myPe, const SymmMemObjPtr dataObj,
+                                                  const SymmMemObjPtr signalObj,
+                                                  size_t numElements) {
+  constexpr int sendPe = 0;
+  constexpr int recvPe = 1;
+
+  int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (globalTid >= static_cast<int>(numElements)) {
+    return;
+  }
+
+  size_t blockElemOffset = static_cast<size_t>(blockIdx.x) * blockDim.x;
+  size_t blockByteOffset = blockElemOffset * sizeof(uint32_t);
+  size_t blockBytes = static_cast<size_t>(blockDim.x) * sizeof(uint32_t);
+
+  if (myPe == sendPe) {
+    // One signal per block with AMO_ADD
+    ShmemPutMemNbiSignalBlock<true>(dataObj, blockByteOffset, dataObj, blockByteOffset, blockBytes,
+                                    signalObj, 0, 1, atomicType::AMO_ADD, recvPe, 0);
+    __threadfence_system();
+
+    if (blockIdx.x == 0) {
+      ShmemQuietThread();
+    }
+  } else {
+    if (threadIdx.x == 0) {
+      uint64_t* signalPtr = reinterpret_cast<uint64_t*>(signalObj->localPtr);
+      uint64_t expectedSignals = gridDim.x;  // One signal per block
+      while (atomicAdd(signalPtr, 0) != expectedSignals) {
+        // Busy wait for all signals
+      }
+    }
+    __syncthreads();
+
+    uint32_t receivedData =
+        atomicAdd(reinterpret_cast<uint32_t*>(dataObj->localPtr) + globalTid, 0);
+    if (receivedData != sendPe) {
+      printf("PE %d, thread %d: Data mismatch! Expected %d, got %d\n", myPe, globalTid, sendPe,
+             receivedData);
+    }
+  }
+}
+
+// New API: Using pure addresses (Block scope) with AMO_ADD
+__global__ void ConcurrentPutSignalBlockKernelAdd_PureAddr(int myPe, uint32_t* dataBuff,
+                                                           uint64_t* signalBuff,
+                                                           size_t numElements) {
+  constexpr int sendPe = 0;
+  constexpr int recvPe = 1;
+
+  int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (globalTid >= static_cast<int>(numElements)) {
+    return;
+  }
+
+  size_t blockElemOffset = static_cast<size_t>(blockIdx.x) * blockDim.x;
+  size_t blockBytes = static_cast<size_t>(blockDim.x) * sizeof(uint32_t);
+  uint32_t* src = dataBuff + blockElemOffset;
+  uint32_t* dest = dataBuff + blockElemOffset;
+
+  if (myPe == sendPe) {
+    ShmemPutMemNbiSignalBlock<true>(dest, src, blockBytes, signalBuff, 1, atomicType::AMO_ADD,
+                                    recvPe, 0);
+    __threadfence_system();
+
+    if (blockIdx.x == 0) {
+      ShmemQuietThread();
+    }
+  } else {
+    if (threadIdx.x == 0) {
+      uint64_t expectedSignals = gridDim.x;  // One signal per block
+      while (atomicAdd(signalBuff, 0) != expectedSignals) {
+        // Busy wait for all signals
+      }
+    }
+    __syncthreads();
+
+    uint32_t receivedData = atomicAdd(dataBuff + globalTid, 0);
+    if (receivedData != sendPe) {
+      printf("PE %d, thread %d: Data mismatch! Expected %d, got %d\n", myPe, globalTid, sendPe,
+             receivedData);
+    }
+  }
+}
+
 // Legacy API: Using SymmMemObjPtr + offset with AMO_SET
 __global__ void ConcurrentPutSignalThreadKernelSet(int myPe, const SymmMemObjPtr dataObj,
                                                    const SymmMemObjPtr signalObj) {
@@ -209,6 +295,106 @@ __global__ void ConcurrentPutSignalThreadKernelSet_PureAddr(int myPe, uint32_t* 
   }
 }
 
+// Legacy API: Using SymmMemObjPtr + offset (Block scope) with AMO_SET
+__global__ void ConcurrentPutSignalBlockKernelSet(int myPe, const SymmMemObjPtr dataObj,
+                                                  const SymmMemObjPtr signalObj,
+                                                  size_t numElements) {
+  constexpr int sendPe = 0;
+  constexpr int recvPe = 1;
+  constexpr uint64_t MAGIC_VALUE = 0xDEADBEEF;
+
+  int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (globalTid >= static_cast<int>(numElements)) {
+    return;
+  }
+
+  size_t blockElemOffset = static_cast<size_t>(blockIdx.x) * blockDim.x;
+  size_t blockByteOffset = blockElemOffset * sizeof(uint32_t);
+  size_t blockBytes = static_cast<size_t>(blockDim.x) * sizeof(uint32_t);
+  size_t signalOffset = static_cast<size_t>(blockIdx.x) * sizeof(uint64_t);
+
+  if (myPe == sendPe) {
+    ShmemPutMemNbiSignalBlock<true>(dataObj, blockByteOffset, dataObj, blockByteOffset, blockBytes,
+                                    signalObj, signalOffset, MAGIC_VALUE, atomicType::AMO_SET,
+                                    recvPe, 0);
+    __threadfence_system();
+
+    if (blockIdx.x == 0) {
+      ShmemQuietThread();
+    }
+  } else {
+    if (threadIdx.x == 0) {
+      uint64_t* signalPtr = reinterpret_cast<uint64_t*>(signalObj->localPtr);
+      bool allReceived = false;
+      while (!allReceived) {
+        allReceived = true;
+        for (int blockId = 0; blockId < gridDim.x; blockId++) {
+          if (atomicAdd(&signalPtr[blockId], 0) != MAGIC_VALUE) {
+            allReceived = false;
+            break;
+          }
+        }
+      }
+    }
+    __syncthreads();
+
+    uint32_t receivedData =
+        atomicAdd(reinterpret_cast<uint32_t*>(dataObj->localPtr) + globalTid, 0);
+    if (receivedData != sendPe) {
+      printf("PE %d, thread %d: Data mismatch! Expected %d, got %d\n", myPe, globalTid, sendPe,
+             receivedData);
+    }
+  }
+}
+
+// New API: Using pure addresses (Block scope) with AMO_SET
+__global__ void ConcurrentPutSignalBlockKernelSet_PureAddr(int myPe, uint32_t* dataBuff,
+                                                           uint64_t* signalBuff,
+                                                           size_t numElements) {
+  constexpr int sendPe = 0;
+  constexpr int recvPe = 1;
+  constexpr uint64_t MAGIC_VALUE = 0xDEADBEEF;
+
+  int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (globalTid >= static_cast<int>(numElements)) {
+    return;
+  }
+
+  size_t blockElemOffset = static_cast<size_t>(blockIdx.x) * blockDim.x;
+  size_t blockBytes = static_cast<size_t>(blockDim.x) * sizeof(uint32_t);
+  uint32_t* src = dataBuff + blockElemOffset;
+  uint32_t* dest = dataBuff + blockElemOffset;
+
+  if (myPe == sendPe) {
+    ShmemPutMemNbiSignalBlock<true>(dest, src, blockBytes, signalBuff + blockIdx.x, MAGIC_VALUE,
+                                    atomicType::AMO_SET, recvPe, 0);
+    __threadfence_system();
+
+    if (blockIdx.x == 0) {
+      ShmemQuietThread();
+    }
+  } else {
+    if (threadIdx.x == 0) {
+      bool allReceived = false;
+      while (!allReceived) {
+        allReceived = true;
+        for (int blockId = 0; blockId < gridDim.x; blockId++) {
+          if (atomicAdd(&signalBuff[blockId], 0) != MAGIC_VALUE) {
+            allReceived = false;
+            break;
+          }
+        }
+      }
+    }
+    __syncthreads();
+
+    uint32_t receivedData = atomicAdd(dataBuff + globalTid, 0);
+    if (receivedData != sendPe) {
+      printf("PE %d, thread %d: Data mismatch! Expected %d, got %d\n", myPe, globalTid, sendPe,
+             receivedData);
+    }
+  }
+}
 // Legacy API: Large size transfer (14KB per thread)
 __global__ void ConcurrentPutSignalThreadKernelLargeSize(int myPe, const SymmMemObjPtr dataObj,
                                                          const SymmMemObjPtr signalObj,
@@ -503,6 +689,113 @@ void ConcurrentPutSignalThread() {
     ShmemFree(signalBuff2);
   }
 
+  // ===== Test 2B: Legacy API Block Scope with AMO_ADD =====
+  if (myPe == 1) {
+    printf("\n--- Test 2B: Legacy API Block Scope with AMO_ADD Signal ---\n");
+  }
+
+  void* dataBuff2b = ShmemMalloc(buffSize);
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(dataBuff2b), myPe, numEle));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  SymmMemObjPtr dataBuffObj2b = ShmemQueryMemObjPtr(dataBuff2b);
+  assert(dataBuffObj2b.IsValid());
+
+  void* signalBuff2b = ShmemMalloc(sizeof(uint64_t));
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(signalBuff2b), 0, 2));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  SymmMemObjPtr signalBuffObj2b = ShmemQueryMemObjPtr(signalBuff2b);
+  assert(signalBuffObj2b.IsValid());
+
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  if (myPe == 1) {
+    printf("Running legacy block API test with AMO_ADD...\n");
+  }
+  ConcurrentPutSignalBlockKernelAdd<<<blockNum, threadNum>>>(myPe, dataBuffObj2b, signalBuffObj2b,
+                                                             numEle);
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  std::vector<uint32_t> hostData2b(numEle);
+  HIP_RUNTIME_CHECK(hipMemcpy(hostData2b.data(), dataBuff2b, buffSize, hipMemcpyDeviceToHost));
+
+  if (myPe == 1) {
+    bool success = true;
+    for (int i = 0; i < numEle; i++) {
+      if (hostData2b[i] != 0) {
+        success = false;
+        break;
+      }
+    }
+
+    uint64_t signalValue;
+    HIP_RUNTIME_CHECK(
+        hipMemcpy(&signalValue, signalBuff2b, sizeof(uint64_t), hipMemcpyDeviceToHost));
+    uint64_t expectedSignals = blockNum;  // One signal per block
+    printf("✓ Legacy Block AMO_ADD test PASSED! Signal counter: %lu (expected: %lu), Data: %s\n",
+           signalValue, expectedSignals, success ? "OK" : "FAILED");
+  }
+
+  ShmemFree(dataBuff2b);
+  ShmemFree(signalBuff2b);
+
+  // ===== Test 2C: Pure Address API Block Scope with AMO_ADD =====
+  if (myPe == 1) {
+    printf("\n--- Test 2C: Pure Address API Block Scope with AMO_ADD Signal ---\n");
+  }
+
+  if (skipPureAddress) {
+    if (myPe == 1) {
+      printf("⊘ SKIPPED (MORI_SHMEM_MODE=ISOLATION)\n");
+    }
+  } else {
+    void* dataBuff2c = ShmemMalloc(buffSize);
+    HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(dataBuff2c), myPe, numEle));
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+    void* signalBuff2c = ShmemMalloc(sizeof(uint64_t));
+    HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(signalBuff2c), 0, 2));
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if (myPe == 1) {
+      printf("Running pure address block API test with AMO_ADD...\n");
+    }
+    ConcurrentPutSignalBlockKernelAdd_PureAddr<<<blockNum, threadNum>>>(
+        myPe, reinterpret_cast<uint32_t*>(dataBuff2c), reinterpret_cast<uint64_t*>(signalBuff2c),
+        numEle);
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    std::vector<uint32_t> hostData2c(numEle);
+    HIP_RUNTIME_CHECK(hipMemcpy(hostData2c.data(), dataBuff2c, buffSize, hipMemcpyDeviceToHost));
+
+    if (myPe == 1) {
+      bool success = true;
+      for (int i = 0; i < numEle; i++) {
+        if (hostData2c[i] != 0) {
+          success = false;
+          break;
+        }
+      }
+
+      uint64_t signalValue;
+      HIP_RUNTIME_CHECK(
+          hipMemcpy(&signalValue, signalBuff2c, sizeof(uint64_t), hipMemcpyDeviceToHost));
+      uint64_t expectedSignals = blockNum;
+      printf(
+          "✓ Pure Address Block AMO_ADD test PASSED! Signal counter: %lu (expected: %lu), Data: "
+          "%s\n",
+          signalValue, expectedSignals, success ? "OK" : "FAILED");
+    }
+
+    ShmemFree(dataBuff2c);
+    ShmemFree(signalBuff2c);
+  }
+
   // ===== Test 3: Legacy API with AMO_SET =====
   if (myPe == 1) {
     printf("\n--- Test 3: Legacy API with AMO_SET Signal ---\n");
@@ -568,6 +861,66 @@ void ConcurrentPutSignalThread() {
   ShmemFree(dataBuff3);
   ShmemFree(signalBuff3);
 
+  // ===== Test 3B: Legacy API Block Scope with AMO_SET =====
+  if (myPe == 1) {
+    printf("\n--- Test 3B: Legacy API Block Scope with AMO_SET Signal ---\n");
+    printf("  Each block sets its own signal slot\n");
+  }
+
+  void* dataBuff3b = ShmemMalloc(buffSize);
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(dataBuff3b), myPe, numEle));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  SymmMemObjPtr dataBuffObj3b = ShmemQueryMemObjPtr(dataBuff3b);
+  assert(dataBuffObj3b.IsValid());
+
+  void* signalBuff3b = ShmemMalloc(blockNum * sizeof(uint64_t));
+  HIP_RUNTIME_CHECK(hipMemset(signalBuff3b, 0, blockNum * sizeof(uint64_t)));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  SymmMemObjPtr signalBuffObj3b = ShmemQueryMemObjPtr(signalBuff3b);
+  assert(signalBuffObj3b.IsValid());
+
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  if (myPe == 1) {
+    printf("Running legacy block API test with AMO_SET (%d blocks)...\n", blockNum);
+  }
+  ConcurrentPutSignalBlockKernelSet<<<blockNum, threadNum>>>(myPe, dataBuffObj3b, signalBuffObj3b,
+                                                             numEle);
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  std::vector<uint32_t> hostData3b(numEle);
+  HIP_RUNTIME_CHECK(hipMemcpy(hostData3b.data(), dataBuff3b, buffSize, hipMemcpyDeviceToHost));
+
+  dataSuccess = true;
+  if (myPe == 1) {
+    for (int i = 0; i < numEle; i++) {
+      if (hostData3b[i] != 0) {
+        dataSuccess = false;
+        break;
+      }
+    }
+
+    std::vector<uint64_t> signalValues(blockNum);
+    HIP_RUNTIME_CHECK(hipMemcpy(signalValues.data(), signalBuff3b, blockNum * sizeof(uint64_t),
+                                hipMemcpyDeviceToHost));
+    int validSignals = 0;
+    for (int i = 0; i < blockNum; i++) {
+      if (signalValues[i] == 0xDEADBEEF) {
+        validSignals++;
+      } else {
+        printf("Warning: Signal[%d] = 0x%lx (expected 0xDEADBEEF)\n", i, signalValues[i]);
+      }
+    }
+    printf("✓ Legacy Block AMO_SET test PASSED! Data: %s, Valid signals: %d/%d\n",
+           dataSuccess ? "OK" : "FAILED", validSignals, blockNum);
+  }
+
+  ShmemFree(dataBuff3b);
+  ShmemFree(signalBuff3b);
+
   // ===== Test 4: Pure Address API with AMO_SET =====
   if (myPe == 1) {
     printf("\n--- Test 4: Pure Address API with AMO_SET Signal ---\n");
@@ -631,6 +984,67 @@ void ConcurrentPutSignalThread() {
     // Finalize
     ShmemFree(dataBuff4);
     ShmemFree(signalBuff4);
+  }
+
+  // ===== Test 4B: Pure Address API Block Scope with AMO_SET =====
+  if (myPe == 1) {
+    printf("\n--- Test 4B: Pure Address API Block Scope with AMO_SET Signal ---\n");
+    printf("  Each block sets its own signal slot\n");
+  }
+
+  if (skipPureAddress) {
+    if (myPe == 1) {
+      printf("⊘ SKIPPED (MORI_SHMEM_MODE=ISOLATION)\n");
+    }
+  } else {
+    void* dataBuff4b = ShmemMalloc(buffSize);
+    HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(dataBuff4b), myPe, numEle));
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+    void* signalBuff4b = ShmemMalloc(blockNum * sizeof(uint64_t));
+    HIP_RUNTIME_CHECK(hipMemset(signalBuff4b, 0, blockNum * sizeof(uint64_t)));
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if (myPe == 1) {
+      printf("Running pure address block API test with AMO_SET (%d blocks)...\n", blockNum);
+    }
+    ConcurrentPutSignalBlockKernelSet_PureAddr<<<blockNum, threadNum>>>(
+        myPe, reinterpret_cast<uint32_t*>(dataBuff4b), reinterpret_cast<uint64_t*>(signalBuff4b),
+        numEle);
+    HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    std::vector<uint32_t> hostData4b(numEle);
+    HIP_RUNTIME_CHECK(hipMemcpy(hostData4b.data(), dataBuff4b, buffSize, hipMemcpyDeviceToHost));
+
+    dataSuccess = true;
+    if (myPe == 1) {
+      for (int i = 0; i < numEle; i++) {
+        if (hostData4b[i] != 0) {
+          dataSuccess = false;
+          break;
+        }
+      }
+
+      std::vector<uint64_t> signalValues(blockNum);
+      HIP_RUNTIME_CHECK(hipMemcpy(signalValues.data(), signalBuff4b, blockNum * sizeof(uint64_t),
+                                  hipMemcpyDeviceToHost));
+      int validSignals = 0;
+      for (int i = 0; i < blockNum; i++) {
+        if (signalValues[i] == 0xDEADBEEF) {
+          validSignals++;
+        } else {
+          printf("Warning: Signal[%d] = 0x%lx (expected 0xDEADBEEF)\n", i, signalValues[i]);
+        }
+      }
+      printf("✓ Pure Address Block AMO_SET test PASSED! Data: %s, Valid signals: %d/%d\n",
+             dataSuccess ? "OK" : "FAILED", validSignals, blockNum);
+    }
+
+    ShmemFree(dataBuff4b);
+    ShmemFree(signalBuff4b);
   }
 
   // ===== Test 5: Legacy API with Large Size (14KB per thread) =====

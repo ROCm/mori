@@ -1111,6 +1111,19 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernelImpl(
   }
 }
 
+template <core::ProviderType PrvdType, bool onlyOneSignal = true>
+inline __device__ void ShmemPutMemNbiSignalBlockKernelImpl(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  if (core::FlatBlockThreadId() == 0) {
+    ShmemPutMemNbiSignalThreadKernelImpl<PrvdType, onlyOneSignal>(
+        dest, destOffset, source, sourceOffset, bytes, signalDest, signalDestOffset, signalValue,
+        signalOp, pe, qpId);
+  }
+}
+
 template <>
 inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::RDMA, true>(
     const application::SymmMemObjPtr dest, size_t destOffset,
@@ -1129,6 +1142,28 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
     core::atomicType signalOp, int pe, int qpId) {
   DISPATCH_PROVIDER_TYPE_COMPILE_TIME_WITH_BOOL(ShmemPutMemNbiSignalWarpKernelImpl, false, dest,
+                                                destOffset, source, sourceOffset, bytes, signalDest,
+                                                signalDestOffset, signalValue, signalOp, pe, qpId);
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::RDMA, true>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  DISPATCH_PROVIDER_TYPE_COMPILE_TIME_WITH_BOOL(ShmemPutMemNbiSignalBlockKernelImpl, true, dest,
+                                                destOffset, source, sourceOffset, bytes, signalDest,
+                                                signalDestOffset, signalValue, signalOp, pe, qpId);
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::RDMA, false>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  DISPATCH_PROVIDER_TYPE_COMPILE_TIME_WITH_BOOL(ShmemPutMemNbiSignalBlockKernelImpl, false, dest,
                                                 destOffset, source, sourceOffset, bytes, signalDest,
                                                 signalDestOffset, signalValue, signalOp, pe, qpId);
 }
@@ -2199,6 +2234,18 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernelAddrImpl(const void* dest, 
   }
 }
 
+template <core::ProviderType PrvdType, bool onlyOneSignal = true>
+inline __device__ void ShmemPutMemNbiSignalBlockKernelAddrImpl(const void* dest, const void* source,
+                                                               size_t bytes, const void* signalDest,
+                                                               uint64_t signalValue,
+                                                               core::atomicType signalOp, int pe,
+                                                               int qpId) {
+  if (core::FlatBlockThreadId() == 0) {
+    ShmemPutMemNbiSignalThreadKernelAddrImpl<PrvdType, onlyOneSignal>(
+        dest, source, bytes, signalDest, signalValue, signalOp, pe, qpId);
+  }
+}
+
 template <>
 inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::RDMA, true>(
     const void* dest, const void* source, size_t bytes, const void* signalDest,
@@ -2215,6 +2262,24 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType
   DISPATCH_PROVIDER_TYPE_COMPILE_TIME_WITH_BOOL(ShmemPutMemNbiSignalWarpKernelAddrImpl, false, dest,
                                                 source, bytes, signalDest, signalValue, signalOp,
                                                 pe, qpId);
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::RDMA, true>(
+    const void* dest, const void* source, size_t bytes, const void* signalDest,
+    uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
+  DISPATCH_PROVIDER_TYPE_COMPILE_TIME_WITH_BOOL(ShmemPutMemNbiSignalBlockKernelAddrImpl, true, dest,
+                                                source, bytes, signalDest, signalValue, signalOp,
+                                                pe, qpId);
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::RDMA, false>(
+    const void* dest, const void* source, size_t bytes, const void* signalDest,
+    uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
+  DISPATCH_PROVIDER_TYPE_COMPILE_TIME_WITH_BOOL(ShmemPutMemNbiSignalBlockKernelAddrImpl, false,
+                                                dest, source, bytes, signalDest, signalValue,
+                                                signalOp, pe, qpId);
 }
 
 // New pure address-based Atomic operations for RDMA

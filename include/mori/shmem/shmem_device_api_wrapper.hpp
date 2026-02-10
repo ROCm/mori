@@ -44,7 +44,6 @@ __device__ __attribute__((visibility("default"))) void mori_shmem_fence_thread_p
 __device__ __attribute__((visibility("default"))) void mori_shmem_fence_thread_pe_qp(int pe,
                                                                                      int qpId);
 
-
 // ============================================================================
 // PutNbi APIs - Thread Scope (Address-based only)
 // ============================================================================
@@ -103,6 +102,14 @@ __device__ __attribute__((visibility("default"))) void mori_shmem_put_double_nbi
 // PutNbi with Signal APIs - Thread Scope
 // ============================================================================
 __device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_signal_thread(
+    void* dest, const void* source, size_t bytes, void* signalDest, uint64_t signalValue,
+    atomicType signalOp, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_signal_warp(
+    void* dest, const void* source, size_t bytes, void* signalDest, uint64_t signalValue,
+    atomicType signalOp, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_signal_block(
     void* dest, const void* source, size_t bytes, void* signalDest, uint64_t signalValue,
     atomicType signalOp, int pe, int qpId);
 
@@ -239,7 +246,7 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_n_pes();
 __device__ __attribute__((visibility("default"))) uint64_t
 mori_shmem_ptr_p2p(const uint64_t destPtr, const int myPe, int destPe);
 
-__device__ __attribute__((visibility("default"))) uint64_t 
-mori_shmem_ptr(const uint64_t destPtr, int destPe);
+__device__ __attribute__((visibility("default"))) uint64_t mori_shmem_ptr(const uint64_t destPtr,
+                                                                          int destPe);
 
 }  // extern "C"

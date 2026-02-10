@@ -65,6 +65,13 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernel(const void* dest, const vo
                                                       core::atomicType signalOp, int pe,
                                                       int qpId = 0);
 
+template <application::TransportType TsptType, bool onlyOneSignal = true>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel(const void* dest, const void* source,
+                                                       size_t bytes, const void* signalDest,
+                                                       uint64_t signalValue,
+                                                       core::atomicType signalOp, int pe,
+                                                       int qpId = 0);
+
 template <application::TransportType TsptType>
 inline __device__ void ShmemAtomicSizeNonFetchThreadKernel(const void* dest, void* val,
                                                            size_t bytes, core::atomicType amoType,
@@ -130,6 +137,13 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernel(
 
 template <application::TransportType TsptType, bool onlyOneSignal = true>
 inline __device__ void ShmemPutMemNbiSignalWarpKernel(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId = 0);
+
+template <application::TransportType TsptType, bool onlyOneSignal = true>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
     const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,

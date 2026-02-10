@@ -28,7 +28,7 @@ namespace mori {
 namespace shmem {
 extern __constant__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
 }
-}
+}  // namespace mori
 
 extern "C" {
 __device__ __attribute__((visibility("default"))) void mori_shmem_quiet_thread() {
@@ -39,7 +39,8 @@ __device__ __attribute__((visibility("default"))) void mori_shmem_quiet_thread_p
   mori::shmem::ShmemQuietThread(pe);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_quiet_thread_pe_qp(int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_quiet_thread_pe_qp(int pe,
+                                                                                     int qpId) {
   mori::shmem::ShmemQuietThread(pe, qpId);
 }
 
@@ -51,18 +52,16 @@ __device__ __attribute__((visibility("default"))) void mori_shmem_fence_thread_p
   mori::shmem::ShmemFenceThread(pe);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_fence_thread_pe_qp(int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_fence_thread_pe_qp(int pe,
+                                                                                     int qpId) {
   mori::shmem::ShmemFenceThread(pe, qpId);
 }
-
 
 // ============================================================================
 // PutNbi APIs - Address-based only
 // ============================================================================
-__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_thread(void* dest,
-                                                                               const void* source,
-                                                                               size_t bytes, int pe,
-                                                                               int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_thread(
+    void* dest, const void* source, size_t bytes, int pe, int qpId) {
   mori::shmem::ShmemPutMemNbiThread(dest, source, bytes, pe, qpId);
 }
 
@@ -89,10 +88,8 @@ __device__ __attribute__((visibility("default"))) void mori_shmem_put_double_nbi
 // ============================================================================
 // PutNbi APIs - Warp Scope (Address-based only)
 // ============================================================================
-__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_warp(void* dest,
-                                                                                const void* source,
-                                                                                size_t bytes, int pe,
-                                                                                int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_warp(
+    void* dest, const void* source, size_t bytes, int pe, int qpId) {
   mori::shmem::ShmemPutMemNbiWarp(dest, source, bytes, pe, qpId);
 }
 
@@ -119,10 +116,8 @@ __device__ __attribute__((visibility("default"))) void mori_shmem_put_double_nbi
 // ============================================================================
 // PutNbi APIs - Block Scope (Address-based only)
 // ============================================================================
-__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_block(void* dest,
-                                                                                 const void* source,
-                                                                                 size_t bytes, int pe,
-                                                                                 int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_block(
+    void* dest, const void* source, size_t bytes, int pe, int qpId) {
   mori::shmem::ShmemPutMemNbiBlock(dest, source, bytes, pe, qpId);
 }
 
@@ -152,7 +147,22 @@ __device__ __attribute__((visibility("default"))) void mori_shmem_put_double_nbi
 __device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_signal_thread(
     void* dest, const void* source, size_t bytes, void* signalDest, uint64_t signalValue,
     atomicType signalOp, int pe, int qpId) {
-  mori::shmem::ShmemPutMemNbiSignalThread<true>(dest, source, bytes, signalDest, signalValue, signalOp, pe, qpId);
+  mori::shmem::ShmemPutMemNbiSignalThread<true>(dest, source, bytes, signalDest, signalValue,
+                                                signalOp, pe, qpId);
+}
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_signal_warp(
+    void* dest, const void* source, size_t bytes, void* signalDest, uint64_t signalValue,
+    atomicType signalOp, int pe, int qpId) {
+  mori::shmem::ShmemPutMemNbiSignalWarp<true>(dest, source, bytes, signalDest, signalValue,
+                                              signalOp, pe, qpId);
+}
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_signal_block(
+    void* dest, const void* source, size_t bytes, void* signalDest, uint64_t signalValue,
+    atomicType signalOp, int pe, int qpId) {
+  mori::shmem::ShmemPutMemNbiSignalBlock<true>(dest, source, bytes, signalDest, signalValue,
+                                               signalOp, pe, qpId);
 }
 
 // ============================================================================
@@ -163,67 +173,92 @@ __device__ __attribute__((visibility("default"))) void mori_shmem_put_size_imm_n
   mori::shmem::ShmemPutSizeImmNbiThread(dest, val, bytes, pe, qpId);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_int_p(int* dest, int val, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_int_p(int* dest, int val, int pe,
+                                                                        int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<int>(dest, val, pe, qpId);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_long_p(long* dest, long val, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_long_p(long* dest, long val,
+                                                                         int pe, int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<long>(dest, val, pe, qpId);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_longlong_p(long long* dest, long long val, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_longlong_p(long long* dest,
+                                                                             long long val, int pe,
+                                                                             int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<long long>(dest, val, pe, qpId);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_float_p(float* dest, float val, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_float_p(float* dest, float val,
+                                                                          int pe, int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<float>(dest, val, pe, qpId);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_double_p(double* dest, double val, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_double_p(double* dest, double val,
+                                                                           int pe, int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<double>(dest, val, pe, qpId);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_char_p(char* dest, char val, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_char_p(char* dest, char val,
+                                                                         int pe, int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<char>(dest, val, pe, qpId);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_short_p(short* dest, short val, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_short_p(short* dest, short val,
+                                                                          int pe, int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<short>(dest, val, pe, qpId);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_uint_p(unsigned int* dest, unsigned int val, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_uint_p(unsigned int* dest,
+                                                                         unsigned int val, int pe,
+                                                                         int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<unsigned int>(dest, val, pe, qpId);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_ulong_p(unsigned long* dest, unsigned long val, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_ulong_p(unsigned long* dest,
+                                                                          unsigned long val, int pe,
+                                                                          int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<unsigned long>(dest, val, pe, qpId);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_ulonglong_p(unsigned long long* dest, unsigned long long val, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_ulonglong_p(
+    unsigned long long* dest, unsigned long long val, int pe, int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<unsigned long long>(dest, val, pe, qpId);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_uchar_p(unsigned char* dest, unsigned char val, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_uchar_p(unsigned char* dest,
+                                                                          unsigned char val, int pe,
+                                                                          int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<unsigned char>(dest, val, pe, qpId);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_ushort_p(unsigned short* dest, unsigned short val, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_ushort_p(unsigned short* dest,
+                                                                           unsigned short val,
+                                                                           int pe, int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<unsigned short>(dest, val, pe, qpId);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_int32_p(int32_t* dest, int32_t val, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_int32_p(int32_t* dest,
+                                                                          int32_t val, int pe,
+                                                                          int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<int32_t>(dest, val, pe, qpId);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_int64_p(int64_t* dest, int64_t val, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_int64_p(int64_t* dest,
+                                                                          int64_t val, int pe,
+                                                                          int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<int64_t>(dest, val, pe, qpId);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_uint32_p(uint32_t* dest, uint32_t val, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_uint32_p(uint32_t* dest,
+                                                                           uint32_t val, int pe,
+                                                                           int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<uint32_t>(dest, val, pe, qpId);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_uint64_p(uint64_t* dest, uint64_t val, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_uint64_p(uint64_t* dest,
+                                                                           uint64_t val, int pe,
+                                                                           int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<uint64_t>(dest, val, pe, qpId);
 }
 
@@ -323,8 +358,8 @@ mori_shmem_int32_wait_until_greater_than(int32_t* addr, int32_t val) {
   return mori::shmem::ShmemInt32WaitUntilGreaterThan(addr, val);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_int32_wait_until_equals(int32_t* addr,
-                                                                                     int32_t val) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_int32_wait_until_equals(
+    int32_t* addr, int32_t val) {
   mori::shmem::ShmemInt32WaitUntilEquals(addr, val);
 }
 
@@ -333,8 +368,8 @@ mori_shmem_int64_wait_until_greater_than(int64_t* addr, int64_t val) {
   return mori::shmem::ShmemInt64WaitUntilGreaterThan(addr, val);
 }
 
-__device__ __attribute__((visibility("default"))) void mori_shmem_int64_wait_until_equals(int64_t* addr,
-                                                                                     int64_t val) {
+__device__ __attribute__((visibility("default"))) void mori_shmem_int64_wait_until_equals(
+    int64_t* addr, int64_t val) {
   mori::shmem::ShmemInt64WaitUntilEquals(addr, val);
 }
 
@@ -349,13 +384,13 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_n_pes() {
   return mori::shmem::ShmemNPes();
 }
 
-__device__ __attribute__((visibility("default"))) uint64_t mori_shmem_ptr_p2p(const uint64_t destPtr,
-  const int myPe, int destPe) {
+__device__ __attribute__((visibility("default"))) uint64_t
+mori_shmem_ptr_p2p(const uint64_t destPtr, const int myPe, int destPe) {
   return mori::shmem::ShmemPtrP2p(destPtr, myPe, destPe);
 }
 
-__device__ __attribute__((visibility("default"))) uint64_t 
-mori_shmem_ptr(const uint64_t destPtr, int destPe) {
+__device__ __attribute__((visibility("default"))) uint64_t mori_shmem_ptr(const uint64_t destPtr,
+                                                                          int destPe) {
   int myPe = mori::shmem::ShmemMyPe();
   return mori::shmem::ShmemPtrP2p(destPtr, myPe, destPe);
 }

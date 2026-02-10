@@ -129,6 +129,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportTy
   core::ThreadCopy<uint8_t>(destPtr, srcPtr, bytes);
 
   // Execute signal operation (only once for onlyOneSignal=true)
+  __threadfence_system();
   uint64_t activemask = core::GetActiveLaneMask();
   uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
   uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
@@ -162,6 +163,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportTy
   core::ThreadCopy<uint8_t>(destPtr, srcPtr, bytes);
 
   // Execute signal operation (every thread signals for onlyOneSignal=false)
+  __threadfence_system();
   uint64_t* signalPtr = reinterpret_cast<uint64_t*>(signalDest->peerPtrs[pe] + signalDestOffset);
   if (signalOp == core::atomicType::AMO_SET || signalOp == core::atomicType::AMO_SIGNAL_SET) {
     core::AtomicStoreSeqCstSystem(signalPtr, signalValue);
@@ -187,6 +189,7 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
 
+  __threadfence_system();
   // Execute signal operation (only lane 0 for onlyOneSignal=true)
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {
@@ -216,6 +219,7 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType
   uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
   core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
 
+  __threadfence_system();
   // Execute signal operation (lane 0 only, but signals once per active lane)
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {
@@ -228,6 +232,64 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType
     } else if (signalOp == core::atomicType::AMO_ADD ||
                signalOp == core::atomicType::AMO_SIGNAL_ADD) {
       core::AtomicAddSeqCstSystem(signalPtr, signalValue * num_active_lanes);
+    } else {
+      assert(false && "Unsupported signal operation");
+    }
+  }
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::P2P, true>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  if (bytes == 0) return;
+
+  // Execute put operation (block-wide)
+  uint8_t* srcPtr =
+      reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);
+  uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
+  core::BlockCopy<uint8_t>(destPtr, srcPtr, bytes);
+
+  __threadfence_system();
+  __syncthreads();
+  if (core::FlatBlockThreadId() == 0) {
+    uint64_t* signalPtr = reinterpret_cast<uint64_t*>(signalDest->peerPtrs[pe] + signalDestOffset);
+    if (signalOp == core::atomicType::AMO_SET || signalOp == core::atomicType::AMO_SIGNAL_SET) {
+      core::AtomicStoreSeqCstSystem(signalPtr, signalValue);
+    } else if (signalOp == core::atomicType::AMO_ADD ||
+               signalOp == core::atomicType::AMO_SIGNAL_ADD) {
+      core::AtomicAddSeqCstSystem(signalPtr, signalValue);
+    } else {
+      assert(false && "Unsupported signal operation");
+    }
+  }
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::P2P, false>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  if (bytes == 0) return;
+
+  // Execute put operation (block-wide)
+  uint8_t* srcPtr =
+      reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);
+  uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
+  core::BlockCopy<uint8_t>(destPtr, srcPtr, bytes);
+
+  __threadfence_system();
+  __syncthreads();
+  if (core::FlatBlockThreadId() == 0) {
+    uint64_t* signalPtr = reinterpret_cast<uint64_t*>(signalDest->peerPtrs[pe] + signalDestOffset);
+    if (signalOp == core::atomicType::AMO_SET || signalOp == core::atomicType::AMO_SIGNAL_SET) {
+      core::AtomicStoreSeqCstSystem(signalPtr, signalValue);
+    } else if (signalOp == core::atomicType::AMO_ADD ||
+               signalOp == core::atomicType::AMO_SIGNAL_ADD) {
+      core::AtomicAddSeqCstSystem(signalPtr, signalValue * core::FlatBlockSize());
     } else {
       assert(false && "Unsupported signal operation");
     }
@@ -592,6 +654,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportTy
   core::ThreadCopy<uint8_t>(destPtr, srcPtr, bytes);
 
   // Execute signal operation (only once for onlyOneSignal=true)
+  __threadfence_system();
   uint64_t activemask = core::GetActiveLaneMask();
   uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
   uint8_t my_logical_lane_id = core::GetActiveLaneNum(activemask);
@@ -631,6 +694,7 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportTy
   core::ThreadCopy<uint8_t>(destPtr, srcPtr, bytes);
 
   // Execute signal operation (every thread signals for onlyOneSignal=false)
+  __threadfence_system();
   uint64_t* signalPtr =
       reinterpret_cast<uint64_t*>(globalGpuStates->heapObj->peerPtrs[pe] + signalDestOffset);
   if (signalOp == core::atomicType::AMO_SET || signalOp == core::atomicType::AMO_SIGNAL_SET) {
@@ -662,6 +726,8 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType
       reinterpret_cast<uint8_t*>(globalGpuStates->heapObj->peerPtrs[pe] + destOffset);
   core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
 
+  __threadfence_system();
+  __syncwarp();
   // Execute signal operation (only lane 0 for onlyOneSignal=true)
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {
@@ -697,6 +763,8 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType
       reinterpret_cast<uint8_t*>(globalGpuStates->heapObj->peerPtrs[pe] + destOffset);
   core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
 
+  __threadfence_system();
+  __syncwarp();
   // Execute signal operation (all lanes signal for onlyOneSignal=false)
   uint64_t* signalPtr =
       reinterpret_cast<uint64_t*>(globalGpuStates->heapObj->peerPtrs[pe] + signalDestOffset);
@@ -707,6 +775,76 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType
     core::AtomicAddSeqCstSystem(signalPtr, signalValue);
   } else {
     assert(false && "Unsupported signal operation");
+  }
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::P2P, true>(
+    const void* dest, const void* source, size_t bytes, const void* signalDest,
+    uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
+  if (bytes == 0) return;
+
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+
+  uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
+  size_t destOffset = destAddr - globalGpuStates->heapBaseAddr;
+  uintptr_t signalDestAddr = reinterpret_cast<uintptr_t>(signalDest);
+  size_t signalDestOffset = signalDestAddr - globalGpuStates->heapBaseAddr;
+
+  // Execute put operation (block-wide)
+  uint8_t* srcPtr = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(source));
+  uint8_t* destPtr =
+      reinterpret_cast<uint8_t*>(globalGpuStates->heapObj->peerPtrs[pe] + destOffset);
+  core::BlockCopy<uint8_t>(destPtr, srcPtr, bytes);
+
+  __threadfence_system();
+  __syncthreads();
+  if (core::FlatBlockThreadId() == 0) {
+    uint64_t* signalPtr =
+        reinterpret_cast<uint64_t*>(globalGpuStates->heapObj->peerPtrs[pe] + signalDestOffset);
+    if (signalOp == core::atomicType::AMO_SET || signalOp == core::atomicType::AMO_SIGNAL_SET) {
+      core::AtomicStoreSeqCstSystem(signalPtr, signalValue);
+    } else if (signalOp == core::atomicType::AMO_ADD ||
+               signalOp == core::atomicType::AMO_SIGNAL_ADD) {
+      core::AtomicAddSeqCstSystem(signalPtr, signalValue);
+    } else {
+      assert(false && "Unsupported signal operation");
+    }
+  }
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::P2P, false>(
+    const void* dest, const void* source, size_t bytes, const void* signalDest,
+    uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
+  if (bytes == 0) return;
+
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+
+  uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
+  size_t destOffset = destAddr - globalGpuStates->heapBaseAddr;
+  uintptr_t signalDestAddr = reinterpret_cast<uintptr_t>(signalDest);
+  size_t signalDestOffset = signalDestAddr - globalGpuStates->heapBaseAddr;
+
+  // Execute put operation (block-wide)
+  uint8_t* srcPtr = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(source));
+  uint8_t* destPtr =
+      reinterpret_cast<uint8_t*>(globalGpuStates->heapObj->peerPtrs[pe] + destOffset);
+  core::BlockCopy<uint8_t>(destPtr, srcPtr, bytes);
+
+  __threadfence_system();
+  __syncthreads();
+  if (core::FlatBlockThreadId() == 0) {
+    uint64_t* signalPtr =
+        reinterpret_cast<uint64_t*>(globalGpuStates->heapObj->peerPtrs[pe] + signalDestOffset);
+    if (signalOp == core::atomicType::AMO_SET || signalOp == core::atomicType::AMO_SIGNAL_SET) {
+      core::AtomicStoreSeqCstSystem(signalPtr, signalValue);
+    } else if (signalOp == core::atomicType::AMO_ADD ||
+               signalOp == core::atomicType::AMO_SIGNAL_ADD) {
+      core::AtomicAddSeqCstSystem(signalPtr, signalValue * core::FlatBlockSize());
+    } else {
+      assert(false && "Unsupported signal operation");
+    }
   }
 }
 
