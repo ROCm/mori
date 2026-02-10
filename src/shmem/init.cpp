@@ -779,10 +779,11 @@ int ShmemModuleInit(void* hipModule) {
 
   hipError_t err = hipModuleGetGlobal(reinterpret_cast<hipDeviceptr_t*>(&moduleGlobalGpuStatesAddr),
                                       nullptr, module, "_ZN4mori5shmem15globalGpuStatesE");
-
+ 
   if (err != hipSuccess) {
-    MORI_SHMEM_WARN("Failed to get globalGpuStates symbol from module: {} (error code: {})",
-                    hipGetErrorString(err), err);
+    (void)hipGetLastError();
+    MORI_SHMEM_TRACE("Module does not contain globalGpuStates symbol ({}), skipping init",
+                     hipGetErrorString(err));
     return -1;
   }
 

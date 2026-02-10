@@ -26,7 +26,7 @@
 
 namespace mori {
 namespace shmem {
-extern __constant__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
+extern __device__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
 }
 }  // namespace mori
 
