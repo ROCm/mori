@@ -44,6 +44,9 @@ __device__ __attribute__((visibility("default"))) void mori_shmem_fence_thread_p
 __device__ __attribute__((visibility("default"))) void mori_shmem_fence_thread_pe_qp(int pe,
                                                                                      int qpId);
 
+__device__ __attribute__((visibility("default"))) void mori_shmem_barrier_all_thread();
+__device__ __attribute__((visibility("default"))) void mori_shmem_barrier_all_block();
+
 // ============================================================================
 // PutNbi APIs - Thread Scope (Address-based only)
 // ============================================================================

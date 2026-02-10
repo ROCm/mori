@@ -57,6 +57,14 @@ __device__ __attribute__((visibility("default"))) void mori_shmem_fence_thread_p
   mori::shmem::ShmemFenceThread(pe, qpId);
 }
 
+__device__ __attribute__((visibility("default"))) void mori_shmem_barrier_all_thread() {
+  mori::shmem::ShmemBarrierAllThread();
+}
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_barrier_all_block() {
+  mori::shmem::ShmemBarrierAllBlock();
+}
+
 // ============================================================================
 // PutNbi APIs - Address-based only
 // ============================================================================
