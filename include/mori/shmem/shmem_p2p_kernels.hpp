@@ -727,7 +727,6 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType
   core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
 
   __threadfence_system();
-  __syncwarp();
   // Execute signal operation (only lane 0 for onlyOneSignal=true)
   int laneId = threadIdx.x & (warpSize - 1);
   if (laneId == 0) {
@@ -764,7 +763,6 @@ inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType
   core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
 
   __threadfence_system();
-  __syncwarp();
   // Execute signal operation (all lanes signal for onlyOneSignal=false)
   uint64_t* signalPtr =
       reinterpret_cast<uint64_t*>(globalGpuStates->heapObj->peerPtrs[pe] + signalDestOffset);
