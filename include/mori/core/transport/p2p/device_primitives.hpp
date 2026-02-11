@@ -92,7 +92,6 @@ struct VecTypeAdaptor<float, 4> {
   using dataType = float4;
 };
 
-#ifdef MORI_FP4_TYPE_OCP_ENABLED
 template <>
 struct VecTypeAdaptor<mori_fp4_e2m1, 2> {
   using dataType = mori_fp4x2_e2m1;
@@ -102,7 +101,6 @@ template <>
 struct VecTypeAdaptor<mori_fp4_e2m1, 4> {
   using dataType = mori_fp4x4_e2m1;
 };
-#endif
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           Load/Store                                           */
@@ -411,11 +409,7 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
   const size_t numIters = (nelems - offset) / elemsPerWarp;
   const size_t laneOffset = laneId * vecSize;
 
-#ifdef MORI_FP4_TYPE_OCP_ENABLED
   using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
-#else
-  using AccumFp32Type = float;
-#endif
 
   for (size_t iter = 0; iter < numIters; ++iter) {
     AccumFp32Type accumValFp32[vecSize] = {AccumFp32Type{0}};
@@ -477,11 +471,7 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
   const int laneId = threadIdx.x & (warpSize - 1);
   const size_t laneOffset = laneId * vecSize;
 
-#ifdef MORI_FP4_TYPE_OCP_ENABLED
   using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
-#else
-  using AccumFp32Type = float;
-#endif
 
   for (size_t iter = 0; iter < numIters; iter++) {
     AccumFp32Type accumValFp32[Unroll][vecSize] = {0};
@@ -540,11 +530,7 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
     cached_srcs[i] = srcs[i];
   }
 
-#ifdef MORI_FP4_TYPE_OCP_ENABLED
   using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
-#else
-  using AccumFp32Type = float;
-#endif
 
   for (size_t iter = 0; iter < numIters; ++iter) {
     AccumFp32Type accumValFp32[vecSize] = {AccumFp32Type{0}};
@@ -678,11 +664,7 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
 
   // remaining size
 
-#ifdef MORI_FP4_TYPE_OCP_ENABLED
   using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
-#else
-  using AccumFp32Type = float;
-#endif
 
   offset += laneId;
   while (offset < nelems) {

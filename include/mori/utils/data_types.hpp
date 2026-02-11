@@ -24,6 +24,8 @@
 #include <hip/hip_ext_ocp.h>
 #include <hip/hip_fp8.h>
 
+#include <hip/amd_detail/amd_hip_ocp_host.hpp>
+
 namespace mori {
 
 #if defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ == 1
@@ -34,10 +36,6 @@ namespace mori {
 #define MORI_FP8_TYPE_OCP_ENABLED
 #endif
 
-// TODO: fp4 only supported on gfx950 to leverage hardware instructions, add support on other archs
-// by software encoding
-#if defined(HIP_ENABLE_GFX950_OCP_BUILTINS) && HIP_ENABLE_GFX950_OCP_BUILTINS == 1
-#define MORI_FP4_TYPE_OCP_ENABLED
 /* ---------------------------------------------------------------------------------------------- */
 /*                                               FP4                                              */
 /* ---------------------------------------------------------------------------------------------- */
@@ -64,8 +62,12 @@ __device__ static mori_fp4_storage bfloat16_to_fp4_e2m1(const __hip_bfloat16 x) 
     uint32_t ui32;
     mori_fp4_storage fp4[4];
   } u{0};
+#if defined(HIP_ENABLE_GFX950_OCP_BUILTINS) && HIP_ENABLE_GFX950_OCP_BUILTINS == 1
   u.ui32 =
       __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(u.ui32, __hip_bfloat162{x, 0}, 1.0f /* scale */, 0);
+#else
+  u.ui32 = fcbx::from_float<__amd_bf16_storage_t, fcbx::Encoding::E2M1, true>(x, 0 /* scale */);
+#endif
   return u.fp4[0];
 }
 
@@ -74,7 +76,13 @@ __device__ static mori_fp4x2_storage bfloat162_to_fp4x2_e2m1(const __hip_bfloat1
     uint32_t ui32;
     mori_fp4x2_storage fp4x2[4];
   } u{0};
+#if defined(HIP_ENABLE_GFX950_OCP_BUILTINS) && HIP_ENABLE_GFX950_OCP_BUILTINS == 1
   u.ui32 = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(u.ui32, x, 1.0f /* scale */, 0);
+#else
+  u.ui32 |= fcbx::from_float<__amd_bf16_storage_t, fcbx::Encoding::E2M1, true>(x.y, 0 /*scale*/);
+  u.ui32 <<= 4;
+  u.ui32 |= fcbx::from_float<__amd_bf16_storage_t, fcbx::Encoding::E2M1, true>(x.x, 0 /*scale*/);
+#endif
   return u.fp4x2[0];
 }
 
@@ -83,7 +91,11 @@ __device__ static mori_fp4_storage float_to_fp4_e2m1(const float x) {
     uint32_t ui32;
     mori_fp4_storage fp4[4];
   } u{0};
+#if defined(HIP_ENABLE_GFX950_OCP_BUILTINS) && HIP_ENABLE_GFX950_OCP_BUILTINS == 1
   u.ui32 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(u.ui32, x, 0.0f, 1.0f /* scale */, 0);
+#else
+  u.ui32 = fcbx::from_float<float, fcbx::Encoding::E2M1, true>(x, 0 /*scale*/);
+#endif
   return u.fp4[0];
 }
 
@@ -92,7 +104,13 @@ __device__ static mori_fp4x2_storage float2_to_fp4x2_e2m1(const float2 x) {
     uint32_t ui32;
     mori_fp4x2_storage fp4x2[4];
   } u{0};
+#if defined(HIP_ENABLE_GFX950_OCP_BUILTINS) && HIP_ENABLE_GFX950_OCP_BUILTINS == 1
   u.ui32 = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(u.ui32, x.x, x.y, 1.0f /* scale */, 0);
+#else
+  u.ui32 |= fcbx::from_float<float, fcbx::Encoding::E2M1, true>(x.y, 0 /*scale*/);
+  u.ui32 <<= 4;
+  u.ui32 |= fcbx::from_float<float, fcbx::Encoding::E2M1, true>(x.x, 0 /*scale*/);
+#endif
   return u.fp4x2[0];
 }
 
@@ -108,15 +126,28 @@ struct mori_fp4_e2m1 {
 
   __device__ operator __hip_bfloat16() const {
     union {
-      __bf16 __attribute__((vector_size(4))) raw;
       __hip_bfloat16 bf162[2];
+      __amd_bf16x2_storage_t bf16x2;
     } u{0};
-    u.raw = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(x, 1.0f /* scale */, 0);
+#if defined(HIP_ENABLE_GFX950_OCP_BUILTINS) && HIP_ENABLE_GFX950_OCP_BUILTINS == 1
+    u.bf16x2 = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(x, 1.0f /* scale */, 0);
+#else
+    using namespace fcbx;
+    u.bf16x2 =
+        __amd_bf16x2_storage_t{to_float<__amd_bf16_storage_t, Encoding::E2M1, true>(x & 0xFu, 0),
+                               to_float<__amd_bf16_storage_t, Encoding::E2M1, true>(x >> 4, 0)};
+#endif
     return u.bf162[0];
   }
 
   __device__ operator float() const {
+#if defined(HIP_ENABLE_GFX950_OCP_BUILTINS) && HIP_ENABLE_GFX950_OCP_BUILTINS == 1
     auto ret = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(x, 1.0f /* scale */, 0);
+#else
+    using namespace fcbx;
+    __amd_floatx2_storage_t ret{to_float<float, Encoding::E2M1, true>(x & 0xFu, 0),
+                                to_float<float, Encoding::E2M1, true>(x >> 4, 0)};
+#endif
     return ret[0];
   }
 };
@@ -136,12 +167,25 @@ struct mori_fp4x2_e2m1 {
       __bf16 __attribute__((vector_size(4))) raw;
       __hip_bfloat162 bf162;
     } u{0};
+#if defined(HIP_ENABLE_GFX950_OCP_BUILTINS) && HIP_ENABLE_GFX950_OCP_BUILTINS == 1
     u.raw = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(x, 1.0f /* scale */, 0);
+#else
+    using namespace fcbx;
+    u.bf162 =
+        __amd_bf16x2_storage_t{to_float<__amd_bf16_storage_t, Encoding::E2M1, true>(x & 0xFu, 0),
+                               to_float<__amd_bf16_storage_t, Encoding::E2M1, true>(x >> 4, 0)};
+#endif
     return u.bf162;
   }
 
   __device__ operator float2() const {
+#if defined(HIP_ENABLE_GFX950_OCP_BUILTINS) && HIP_ENABLE_GFX950_OCP_BUILTINS == 1
     auto fp32x2 = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(x, 1.0f /* scale */, 0);
+#else
+    using namespace fcbx;
+    auto fp32x2 = __amd_floatx2_storage_t{to_float<float, Encoding::E2M1, true>(x & 0xFu, 0),
+                                          to_float<float, Encoding::E2M1, true>(x >> 4, 0)};
+#endif
     return float2(fp32x2[0], fp32x2[1]);
   }
 };
@@ -159,11 +203,20 @@ struct mori_fp4x4_e2m1 {
       : x(float2_to_fp4x2_e2m1(float2(f.z, f.w)) << 8 | float2_to_fp4x2_e2m1(float2(f.x, f.y))) {}
 
   __device__ operator float4() const {
+#if defined(HIP_ENABLE_GFX950_OCP_BUILTINS) && HIP_ENABLE_GFX950_OCP_BUILTINS == 1
     auto fp32x2_1 = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(x & 0xFFu, 1.0f /* scale */, 0);
     auto fp32x2_2 = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(x >> 8, 1.0f /* scale */, 0);
+#else
+    using namespace fcbx;
+    auto fp32x2_1 =
+        __amd_floatx2_storage_t{to_float<float, Encoding::E2M1, true>(x & 0xFu, 0),
+                                to_float<float, Encoding::E2M1, true>((x >> 4) & 0xFu, 0)};
+    auto fp32x2_2 =
+        __amd_floatx2_storage_t{to_float<float, Encoding::E2M1, true>((x >> 8) & 0xFu, 0),
+                                to_float<float, Encoding::E2M1, true>(x >> 12, 0)};
+#endif
     return float4(fp32x2_1[0], fp32x2_1[1], fp32x2_2[0], fp32x2_2[1]);
   }
 };
-#endif
 
 }  // namespace mori

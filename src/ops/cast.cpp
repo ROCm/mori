@@ -35,7 +35,6 @@ using namespace mori::core;
 template <typename SrcT, typename DstT>
 __global__ void CastKernel(SrcT* src, DstT* dst, size_t nelems);
 
-#ifdef MORI_FP4_TYPE_OCP_ENABLED
 template <>
 __global__ void CastKernel(float* src, mori::mori_fp4_e2m1* dst, size_t nelems) {
   int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
@@ -58,7 +57,6 @@ __global__ void CastKernel(float* src, mori::mori_fp4_e2m1* dst, size_t nelems) 
                        reinterpret_cast<DstStoreType*>(&dstVec)[0]);
   }
 }
-#endif
 
 }  // namespace
 
@@ -69,8 +67,6 @@ void LaunchCast(SrcT* src, DstT* dst, size_t nelems, hipStream_t stream) {
   CastKernel<<<1, 1, 0, stream>>>(src, dst, nelems);
 }
 
-#ifdef MORI_FP4_TYPE_OCP_ENABLED
 template void LaunchCast<float, mori::mori_fp4_e2m1>(float* src, mori::mori_fp4_e2m1* dst,
                                                      size_t nelems, hipStream_t stream);
-#endif
 }  // namespace mori
