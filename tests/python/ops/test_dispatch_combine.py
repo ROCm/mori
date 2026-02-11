@@ -177,8 +177,11 @@ class EpDispatchCombineTestCase:
                 all_rank_input[self.config.rank][i].to(torch.float32) * unique_pes
             ).to(self.config.data_type)
 
+            atol, rtol = 1e-2, 1e-2
+            if getattr(self.config, "quant_type", "none") == "fp8_direct_cast":
+                atol, rtol = 1e-1, 1e-1
             result_match = torch.allclose(
-                got.float(), expected.float(), atol=1e-2, rtol=1e-2
+                got.float(), expected.float(), atol=atol, rtol=rtol
             )
             if not result_match:
                 print(f"Rank[{self.config.rank}] result mismatch for token {i}:")
@@ -285,6 +288,7 @@ def _test_dispatch_combine(
     num_experts_per_rank,
     num_experts_per_token,
     use_external_inp_buf,
+    quant_type="none",
 ):
     config = mori.ops.EpDispatchCombineConfig(
         data_type=data_type,
@@ -300,6 +304,7 @@ def _test_dispatch_combine(
         block_num=40,
         warp_num_per_block=8,
         use_external_inp_buf=use_external_inp_buf,
+        quant_type=quant_type,
     )
     op = mori.ops.EpDispatchCombineOp(config)
     test_case = EpDispatchCombineTestCase(config)
@@ -336,6 +341,7 @@ def _test_dispatch_combine(
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
 @pytest.mark.parametrize("num_experts_per_token", (8,))
 @pytest.mark.parametrize("use_external_inp_buf", (True, False))
+@pytest.mark.parametrize("quant_type", ("none", "fp8_direct_cast"))
 def test_dispatch_combine(
     torch_dist_process_manager,
     world_size,
@@ -347,7 +353,12 @@ def test_dispatch_combine(
     num_experts_per_rank,
     num_experts_per_token,
     use_external_inp_buf,
+    quant_type,
 ):
+    # fp8_direct_cast is not supported in zero-copy mode (use_external_inp_buf=False)
+    if quant_type == "fp8_direct_cast" and not use_external_inp_buf:
+        pytest.skip("fp8_direct_cast is not supported in zero-copy mode")
+
     for i in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (
@@ -362,6 +373,7 @@ def test_dispatch_combine(
                     num_experts_per_rank,
                     num_experts_per_token,
                     use_external_inp_buf,
+                    quant_type,
                 ],
             )
         )

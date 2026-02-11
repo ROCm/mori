@@ -652,9 +652,7 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
   int tokenPerBlock = core::CeilDiv(totalRecvTokenNum, blockNum);
   int startTokenIdx = blockId * tokenPerBlock;
   int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, totalRecvTokenNum);
-#ifdef ENABLE_STANDARD_MOE_ADAPT
-
-#else
+#ifndef ENABLE_STANDARD_MOE_ADAPT
   for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
     if (args.config.quantType == QuantType::Fp8DirectCast) {
       using Fp8T = core::CombineInternalFp8;
@@ -1215,7 +1213,7 @@ __forceinline__ __device__ void EpCombineAllInternalFp8(EpDispatchCombineArgs<T>
 
     T* out = args.shmemCombineOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim +
              hiddenDimOffset;
-    core::SumCombineInternalFp8AcrossNodesToBf16(out, reinterpret_cast<const Fp8T* const*>(srcPtrs),
+    core::WarpAccumCombineInternalFp8ToBf16(out, reinterpret_cast<const Fp8T* const*>(srcPtrs),
                                                  nNodes, laneId, hiddenDimSize);
 
     if (args.weightsBuf && (inTokenPartId == warpsPerToken - 1)) {

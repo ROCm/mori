@@ -359,6 +359,7 @@ def _bench_dispatch_combine(
     num_experts_per_token,
     cmd="bench",
     zero_copy=1,
+    quant_type="none",
 ):
     config = mori.ops.EpDispatchCombineConfig(
         data_type=data_type,
@@ -375,6 +376,7 @@ def _bench_dispatch_combine(
         block_num=80,
         use_external_inp_buf=not zero_copy,  # zero-copy mode requires use_external_inp_buf=False
         gpu_per_node=8,
+        quant_type=quant_type,
     )
     benchmark = EpDispatchCombineBenchmark(config)
 
@@ -499,7 +501,9 @@ def _bench_dispatch_combine(
             raise ValueError(f"Unknown command: {cmd}")
 
 
-def bench_dispatch_combine(max_num_inp_token_per_rank, dtype, cmd="bench", zero_copy=1):
+def bench_dispatch_combine(
+    max_num_inp_token_per_rank, dtype, cmd="bench", zero_copy=1, quant_type="none"
+):
     world_size = 8
     port = get_free_port()
     torch.multiprocessing.spawn(
@@ -516,6 +520,7 @@ def bench_dispatch_combine(max_num_inp_token_per_rank, dtype, cmd="bench", zero_
             8,  # num_experts_per_token
             cmd,
             zero_copy,
+            quant_type,
         ),
         nprocs=world_size,
         join=True,
@@ -559,10 +564,21 @@ if __name__ == "__main__":
         choices=[0, 1],
         help="Enable zero-copy mode: 1 (default, enabled) or 0 (disabled). When enabled, sets use_external_inp_buf=False",
     )
+    parser.add_argument(
+        "--quant-type",
+        type=str,
+        default="none",
+        choices=["none", "fp8_direct_cast"],
+        help=(
+            "Quantization method used inside Combine. "
+            "'fp8_direct_cast' is the BF16<->FP8 direct cast path."
+        ),
+    )
     args = parser.parse_args()
 
     print(
-        f"Running {args.cmd} with max_tokens_per_rank: {args.max_tokens}, dtype: {args.dtype}, zero_copy: {'true' if args.zero_copy else 'false'}"
+        f"Running {args.cmd} with max_tokens_per_rank: {args.max_tokens}, dtype: {args.dtype}, "
+        f"zero_copy: {'true' if args.zero_copy else 'false'}, quant_type: {args.quant_type}"
     )
     print("-" * 60)
     bench_dispatch_combine(
@@ -570,4 +586,5 @@ if __name__ == "__main__":
         dtype=_DATA_TYPE_MAP[args.dtype],
         cmd=args.cmd,
         zero_copy=args.zero_copy,
+        quant_type=args.quant_type,
     )

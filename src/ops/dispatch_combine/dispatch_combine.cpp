@@ -412,15 +412,24 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
         } else if (kernelType == KernelType::IntraNode) {
 #ifdef ENABLE_STANDARD_MOE_ADAPT
           // When used with convert, P2P read provides better performance
-          EpCombineIntraNodeKernel<DataT, /*UseP2PRead=*/true, /*EnableStdMoE=*/false>
+          EpCombineIntraNodeKernel<DataT, DataT, /*UseP2PRead=*/true, /*EnableStdMoE=*/false>
               <<<grid, block, sharedMemSize, stream>>>(args);
 #else
           if (actualUseExternalInpBuffer) {
             // P2P write does not support zero-copy and provides better bandwidth and lower latency
-            EpCombineIntraNodeKernel<DataT, /*UseP2PRead=*/false>
-                <<<grid, block, sharedMemSize, stream>>>(args);
+            constexpr bool useFp8Combine =
+                std::is_same_v<DataT, hip_bfloat16>;
+            if (useFp8Combine && config.quantType == QuantType::Fp8DirectCast) {
+              EpCombineIntraNodeKernel<DataT, core::CombineInternalFp8, /*UseP2PRead=*/false>
+                  <<<grid, block, sharedMemSize, stream>>>(args);
+            } else {
+              EpCombineIntraNodeKernel<DataT, DataT, /*UseP2PRead=*/false>
+                  <<<grid, block, sharedMemSize, stream>>>(args);
+            }
           } else {  // zero-copy mode (requires P2P read)
-            EpCombineIntraNodeKernel<DataT, /*UseP2PRead=*/true>
+            assert(config.quantType != QuantType::Fp8DirectCast &&
+                   "Fp8DirectCast is not supported in zero-copy mode");
+            EpCombineIntraNodeKernel<DataT, DataT, /*UseP2PRead=*/true>
                 <<<grid, block, sharedMemSize, stream>>>(args);
           }
 #endif  // ENABLE_STANDARD_MOE_ADAPT
@@ -510,12 +519,14 @@ void EpDispatchCombineHandle::LaunchCombineForStandardMoE(KernelType kernelType,
         size_t sharedMemSize =
             actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
         if (kernelType == KernelType::InterNodeV1LL) {
+          EpCombineSync<<<this->multiProcessorCount, block, 0, stream>>>(args);
+          EpCombineSyncBarrier<<<1, warpSize, 0, stream>>>(args);
           EpCombineInterNodeV1KernelLowLatency<DataT, /*EnableStdMoE=*/true>
               <<<grid, block, sharedMemSize, stream>>>(args);
           EpCombineAll<<<this->multiProcessorCount, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           // Standard MoE mode: convert packed expert output to shmem format first
-          EpCombineIntraNodeKernel<DataT, /*UseP2PRead=*/true, /*EnableStdMoE=*/true>
+          EpCombineIntraNodeKernel<DataT, DataT, /*UseP2PRead=*/true, /*EnableStdMoE=*/true>
               <<<grid, block, sharedMemSize, stream>>>(args);
         } else {
           assert(false &&

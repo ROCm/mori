@@ -29,9 +29,11 @@ import torch.distributed as dist
 os.environ["MORI_SHMEM_HEAP_SIZE"] = "6G"
 
 class EpDispatchCombineTestCase:
-    def __init__(self, rank, world_size, dtype=torch.bfloat16):
+    def __init__(self, rank, world_size, dtype=torch.bfloat16, quant_type="none"):
         self.rank = rank
         self.world_size = world_size
+        # fp8_direct_cast requires use_external_inp_buf=True (not zero-copy)
+        use_external_inp_buf = (quant_type == "fp8_direct_cast")
         self.config = mori.ops.EpDispatchCombineConfig(
             data_type=dtype,
             rank=self.rank,
@@ -46,7 +48,8 @@ class EpDispatchCombineTestCase:
             max_num_inp_token_per_rank=4096,
             num_experts_per_rank=32,
             num_experts_per_token=8,
-            use_external_inp_buf=False,
+            use_external_inp_buf=use_external_inp_buf,
+            quant_type=quant_type,
         )
 
     def setup(self):
@@ -274,7 +277,10 @@ class EpDispatchCombineTestCase:
             # ).to(self.config.data_type)
             got, expected = combine_output[i], input[i].to(torch.bfloat16) * unique_pes
 
-            assert torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
+            atol, rtol = 1e-2, 1e-2
+            if self.config.quant_type == "fp8_direct_cast":
+                atol, rtol = 1e-1, 1e-1
+            assert torch.allclose(got.float(), expected.float(), atol=atol, rtol=rtol)
 
             got_weight, expected_weight = (
                 combine_output_weight[i],
@@ -309,16 +315,31 @@ class EpDispatchCombineTestCase:
         del op
 
 
-def test_dispatch_combine(rank, world_size):
+def test_dispatch_combine(rank, world_size, quant_type="none"):
     # test_case = EpDispatchCombineTestCase(rank, world_size, torch.float8_e4m3fnuz)
-    test_case = EpDispatchCombineTestCase(rank, world_size, torch.bfloat16)
+    test_case = EpDispatchCombineTestCase(rank, world_size, torch.bfloat16, quant_type)
     test_case.setup()
     test_case.test_dispatch_combine()
     test_case.cleanup()
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--quant-type",
+        type=str,
+        default="none",
+        choices=["none", "fp8_direct_cast"],
+        help="Quantization method used inside Combine.",
+    )
+    args = parser.parse_args()
+
     world_size = 8
     torch.multiprocessing.spawn(
-        test_dispatch_combine, args=(world_size,), nprocs=world_size, join=True
+        test_dispatch_combine,
+        args=(world_size, args.quant_type),
+        nprocs=world_size,
+        join=True,
     )

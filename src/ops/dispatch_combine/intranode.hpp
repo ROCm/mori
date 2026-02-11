@@ -21,6 +21,8 @@
 // SOFTWARE.
 #pragma once
 
+#include <type_traits>
+
 #include "mori/core/core.hpp"
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 #include "mori/shmem/shmem.hpp"
@@ -200,7 +202,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpCombineIntraNodeKernel                                    */
 /* ---------------------------------------------------------------------------------------------- */
-template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false>
+template <typename T, typename TokT = T, bool UseP2PRead = true, bool EnableStdMoE = false>
 __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
   int thdId = threadIdx.x;
@@ -222,7 +224,8 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   size_t maxNumTokensToSend = config.MaxNumTokensToSend();
   // Copy input to shmem registered buffer so that other GPUs can access directly
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
-  const size_t hiddenBytes = config.hiddenDim * sizeof(T);
+  // When TokT != T (e.g. fp8 combine), staging layout uses TokT-sized tokens
+  const size_t hiddenBytes = config.hiddenDim * sizeof(TokT);
   const size_t weightBytes =
       (args.weightsBuf == nullptr) ? 0 : config.numExpertPerToken * sizeof(float);
   const size_t combXferBytes = hiddenBytes + weightBytes;
@@ -236,8 +239,16 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   if constexpr (UseP2PRead) {
     if (args.config.useExternalInpBuffer) {
       for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
-        core::WarpCopy(args.shmemCombineInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
-                       args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
+        if constexpr (!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>) {
+          // bf16 -> fp8 conversion
+          core::WarpCastBf16ToCombineInternalFp8<T>(
+              args.shmemCombineInpTokMemObj->template GetAs<TokT*>() + i * config.hiddenDim,
+              args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim, laneId);
+        } else {
+          core::WarpCopy(
+              args.shmemCombineInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
+              args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
+        }
       }
     }
     if (args.weightsBuf) {
@@ -255,8 +266,15 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       uint8_t* destStagingPtr =
           args.shmemCombineInpTokMemObj->template GetAs<uint8_t*>(destPe) +
           (myPe * config.MaxNumTokensToRecvPerRank() + destLocalTokId) * combXferBytes;
-      core::WarpCopy(reinterpret_cast<T*>(destStagingPtr),
-                     args.inpTokenBuf + tokenIdx * config.hiddenDim, config.hiddenDim);
+      if constexpr (!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>) {
+        // bf16 -> fp8 conversion
+        core::WarpCastBf16ToCombineInternalFp8<T>(
+            reinterpret_cast<TokT*>(destStagingPtr),
+            args.inpTokenBuf + tokenIdx * config.hiddenDim, config.hiddenDim, laneId);
+      } else {
+        core::WarpCopy(reinterpret_cast<T*>(destStagingPtr),
+                       args.inpTokenBuf + tokenIdx * config.hiddenDim, config.hiddenDim);
+      }
       if (args.weightsBuf) {
         core::WarpCopy(reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
                        args.weightsBuf + tokenIdx * config.numExpertPerToken,
@@ -272,7 +290,7 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   if (args.curRankNumToken == 0) return;
 
   extern __shared__ char sharedMem[];
-  T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
+  TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
 
@@ -295,15 +313,15 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       if (destPe < config.worldSize) {
         if constexpr (UseP2PRead) {
           index_t destLocalTokId = destTokId - destPe * maxNumTokensToSend;
-          srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+          srcPtrs[j] = args.shmemCombineInpTokMemObj->template GetAs<TokT*>(destPe) +
                        destLocalTokId * config.hiddenDim + hiddenDimOffset;
           srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                              destLocalTokId * config.numExpertPerToken;
         } else {
           srcPtrs[j] =
-              reinterpret_cast<T*>(args.shmemCombineInpTokMemObj->template GetAs<uint8_t*>(myPe) +
-                                   (destPe * config.MaxNumTokensToRecvPerRank() + tokenId) *
-                                       combXferBytes) +
+              reinterpret_cast<TokT*>(
+                  args.shmemCombineInpTokMemObj->template GetAs<uint8_t*>(myPe) +
+                  (destPe * config.MaxNumTokensToRecvPerRank() + tokenId) * combXferBytes) +
               hiddenDimOffset;
           srcWeightsPtr[j] = reinterpret_cast<float*>(
               args.shmemCombineInpTokMemObj->template GetAs<uint8_t*>(myPe) +
@@ -315,9 +333,16 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
         srcWeightsPtr[j] = nullptr;
       }
     }
-    core::WarpAccum<T, 4>(args.shmemCombineOutTokMemObj->template GetAs<T*>() +
-                              tokenId * config.hiddenDim + hiddenDimOffset,
-                          srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
+    T* outPtr = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
+                tokenId * config.hiddenDim + hiddenDimOffset;
+    if constexpr (!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>) {
+      // accumulate fp8 sources in float, output bf16
+      core::WarpAccumCombineInternalFp8ToBf16(
+          outPtr, reinterpret_cast<const TokT* const*>(srcPtrs),
+          config.numExpertPerToken, laneId, hiddenDimSize);
+    } else {
+      core::WarpAccum<T, 4>(outPtr, srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
+    }
 
     if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
       core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +

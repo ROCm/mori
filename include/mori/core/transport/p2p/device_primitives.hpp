@@ -796,11 +796,11 @@ __forceinline__ __device__ void WarpCastBf16ToCombineInternalFp8(
       }
     }
   }
+  // Note: when T != hip_bfloat16, this function is a no-op.
+  // Callers should guard with if constexpr or ensure T is hip_bfloat16.
 #else
-  (void)dst;
-  (void)src;
-  (void)hiddenDim;
-  (void)laneId;
+  static_assert(!sizeof(T*), "WarpCastBf16ToCombineInternalFp8 requires FP8 type support "
+                              "(MORI_FP8_TYPE_OCP_ENABLED or MORI_FP8_TYPE_FNUZ_ENABLED)");
 #endif
 }
 
@@ -810,12 +810,12 @@ using CombineInternalFp8T = CombineInternalFp8;
 using CombineInternalFp8x4T = CombineInternalFp8x4;
 
 template <int NNodes>
-__forceinline__ __device__ void SumCombineInternalFp8AcrossNodesToBf16Fixed(
+__forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16Fixed(
     hip_bfloat16* __restrict__ out, const CombineInternalFp8T* const* __restrict__ srcPtrs,
     int laneId, int hiddenDimSize);
 
 template <>
-__forceinline__ __device__ void SumCombineInternalFp8AcrossNodesToBf16Fixed<2>(
+__forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16Fixed<2>(
     hip_bfloat16* __restrict__ out, const CombineInternalFp8T* const* __restrict__ srcPtrs,
     int laneId, int hiddenDimSize) {
   using Fp8T = CombineInternalFp8T;
@@ -945,7 +945,7 @@ __forceinline__ __device__ void SumCombineInternalFp8AcrossNodesToBf16Fixed<2>(
   }
 }
 
-__forceinline__ __device__ void SumCombineInternalFp8AcrossNodesToBf16Dynamic(
+__forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16Dynamic(
     hip_bfloat16* __restrict__ out, const CombineInternalFp8T* const* __restrict__ srcPtrs,
     int nNodes, int laneId, int hiddenDimSize) {
   using Fp8T = CombineInternalFp8T;
@@ -1001,29 +1001,28 @@ __forceinline__ __device__ void SumCombineInternalFp8AcrossNodesToBf16Dynamic(
 #endif
 
 template <typename T>
-__forceinline__ __device__ void SumCombineInternalFp8AcrossNodesToBf16(
+__forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16(
     T* __restrict__ out, const CombineInternalFp8* const* __restrict__ srcPtrs, int nNodes,
     int laneId, int hiddenDimSize) {
 #if defined(MORI_FP8_TYPE_OCP_ENABLED) || defined(MORI_FP8_TYPE_FNUZ_ENABLED)
   if constexpr (std::is_same_v<T, hip_bfloat16>) {
     if (nNodes == 2) {
-      detail::SumCombineInternalFp8AcrossNodesToBf16Fixed<2>(
+      detail::WarpAccumCombineInternalFp8ToBf16Fixed<2>(
           reinterpret_cast<hip_bfloat16*>(out),
           reinterpret_cast<const detail::CombineInternalFp8T* const*>(srcPtrs), laneId,
           hiddenDimSize);
     } else {
-      detail::SumCombineInternalFp8AcrossNodesToBf16Dynamic(
+      detail::WarpAccumCombineInternalFp8ToBf16Dynamic(
           reinterpret_cast<hip_bfloat16*>(out),
           reinterpret_cast<const detail::CombineInternalFp8T* const*>(srcPtrs), nNodes, laneId,
           hiddenDimSize);
     }
   }
+  // Note: when T != hip_bfloat16, this function is a no-op.
+  // Callers should guard with if constexpr or ensure T is hip_bfloat16.
 #else
-  (void)out;
-  (void)srcPtrs;
-  (void)nNodes;
-  (void)laneId;
-  (void)hiddenDimSize;
+  static_assert(!sizeof(T*), "WarpAccumCombineInternalFp8ToBf16 requires FP8 type support "
+                              "(MORI_FP8_TYPE_OCP_ENABLED or MORI_FP8_TYPE_FNUZ_ENABLED)");
 #endif
 }
 
