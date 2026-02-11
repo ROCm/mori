@@ -676,30 +676,6 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
           args.weightsBuf + tokenId * config.numExpertPerToken, config.numExpertPerToken);
     }
   }
-
-  uint64_t barrierFlag = 0;
-  int finishedWarp = 0;
-  if (laneId == 0) {
-    finishedWarp = atomicAdd(args.combineGridBarrier, 1);
-    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
-  }
-  finishedWarp = __shfl(finishedWarp, 0);
-  barrierFlag = __shfl(barrierFlag, 0);
-  if ((finishedWarp + 1) == (blockNum * warpNum)) {
-    if (laneId < config.gpuPerNode) {
-      int destPe = myNode * config.gpuPerNode + laneId;
-      core::AtomicStoreRelaxedSystem(
-          args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>(destPe) + args.config.rank,
-          barrierFlag);
-    }
-    if (laneId == 0) args.combineGridBarrier[0] = 0;
-  }
-  uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
-  if (laneId < config.gpuPerNode) {
-    int destPe = myNode * config.gpuPerNode + laneId;
-    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe) != barrierFlag) {
-    }
-  }
 }
 
 namespace combine_impl {
@@ -1183,7 +1159,6 @@ template <typename T>
 __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
 
-  v1::CombineSync(args);
   if (blockId < args.rdmaBlockNum) {
     v1::CombineInterNode(args);
   } else {
@@ -1337,11 +1312,35 @@ __global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> ar
   }
 #endif
 
-  v1::CombineSync(args);
   if (blockId < args.rdmaBlockNum) {
     v1::CombineInterNodeLL(args);
   } else {
     v1::CombineIntraNodeLL(args);
+  }
+}
+
+template <typename T>
+__global__ void EpCombineSync(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  v1::CombineSync(args);
+}
+
+template <typename T>
+__global__ void EpCombineSyncBarrier(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  uint64_t barrierFlag = 0;
+  if (laneId == 0) {
+    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
+  }
+  barrierFlag = __shfl(barrierFlag, 0);
+  uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
+  if (laneId < config.gpuPerNode) {
+    int destPe = myNode * config.gpuPerNode + laneId;
+    core::AtomicStoreRelaxedSystem(
+        args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>(destPe) + args.config.rank,
+        barrierFlag);
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe) != barrierFlag) {
+    }
   }
 }
 
@@ -1390,6 +1389,8 @@ __global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> ar
 #define INSTANTIATE_LL_KERNEL_WITH_STDMOE(KernelName) INSTANTIATE_LL_KERNEL(KernelName, false)
 #endif
 
+INSTANTIATE_KERNEL(EpCombineSync)
+INSTANTIATE_KERNEL(EpCombineSyncBarrier)
 INSTANTIATE_KERNEL(EpDispatchInterNodeV1Kernel)
 INSTANTIATE_KERNEL(EpCombineInterNodeV1Kernel)
 INSTANTIATE_KERNEL(EpCombineAll)

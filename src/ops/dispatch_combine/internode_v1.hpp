@@ -44,6 +44,12 @@ template <typename T, bool EnableStdMoE = false>
 __global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args);
 
 template <typename T>
+__global__ void EpCombineSync(EpDispatchCombineArgs<T> args);
+
+template <typename T>
+__global__ void EpCombineSyncBarrier(EpDispatchCombineArgs<T> args);
+
+template <typename T>
 __global__ void EpCombineAll(EpDispatchCombineArgs<T> args);
 
 }  // namespace moe
