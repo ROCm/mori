@@ -25,8 +25,19 @@
 #include <hip/hip_fp8.h>
 
 #include "mori/core/utils.hpp"
+#include "mori/utils/data_types.hpp"
 namespace mori {
 namespace core {
+
+#if defined(MORI_FP8_TYPE_OCP_ENABLED)
+using CombineInternalFp8 = __hip_fp8_e4m3;
+using CombineInternalFp8x4 = __hip_fp8x4_e4m3;
+#elif defined(MORI_FP8_TYPE_FNUZ_ENABLED)
+using CombineInternalFp8 = __hip_fp8_e4m3_fnuz;
+using CombineInternalFp8x4 = __hip_fp8x4_e4m3_fnuz;
+#else
+using CombineInternalFp8 = uint8_t;
+#endif
 
 template <int VecBytes>
 struct VecTypeSelector {
@@ -663,6 +674,323 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
   }
 
 #undef WARP_ACCUM_CASE
+}
+
+template <typename T>
+__forceinline__ __device__ void WarpCastBf16ToCombineInternalFp8(
+    CombineInternalFp8* __restrict__ dst, const T* __restrict__ src, int hiddenDim, int laneId) {
+#if defined(MORI_FP8_TYPE_OCP_ENABLED) || defined(MORI_FP8_TYPE_FNUZ_ENABLED)
+
+  if constexpr (std::is_same_v<T, hip_bfloat16>) {
+    using Fp8T = CombineInternalFp8;
+    using Fp8x4T = CombineInternalFp8x4;
+    constexpr int kVec8 = 8;
+    constexpr int kVec4 = 4;
+
+    const uintptr_t srcAddr = reinterpret_cast<uintptr_t>(src);
+    const uintptr_t dstAddr = reinterpret_cast<uintptr_t>(dst);
+    const bool canVec8 = ((srcAddr & 0x7) == 0) && ((dstAddr & 0x7) == 0);
+    const bool canVec4 = ((srcAddr & 0x3) == 0) && ((dstAddr & 0x3) == 0);
+
+    const int vecEnd8 = (hiddenDim / kVec8) * kVec8;
+    const int vecEnd4 = (hiddenDim / kVec4) * kVec4;
+
+    if (canVec8) {
+      const auto* __restrict__ srcAligned =
+          static_cast<const hip_bfloat16*>(__builtin_assume_aligned(src, 8));
+      auto* __restrict__ dstAligned =
+          static_cast<CombineInternalFp8*>(__builtin_assume_aligned(dst, 8));
+
+#pragma unroll 4
+      for (int j = laneId * kVec8; j < vecEnd8; j += warpSize * kVec8) {
+        union {
+          ulong2 u64x2;
+          uint32_t u32[4];
+        } in;
+        in.u64x2 = load<16>(srcAligned + j);
+
+        const __hip_bfloat162_raw bf01{static_cast<unsigned short>(in.u32[0]),
+                                       static_cast<unsigned short>(in.u32[0] >> 16)};
+        const __hip_bfloat162_raw bf23{static_cast<unsigned short>(in.u32[1]),
+                                       static_cast<unsigned short>(in.u32[1] >> 16)};
+        const __hip_bfloat162_raw bf45{static_cast<unsigned short>(in.u32[2]),
+                                       static_cast<unsigned short>(in.u32[2] >> 16)};
+        const __hip_bfloat162_raw bf67{static_cast<unsigned short>(in.u32[3]),
+                                       static_cast<unsigned short>(in.u32[3] >> 16)};
+
+        const __hip_fp8x2_storage_t fp01 = __hip_cvt_bfloat16raw2_to_fp8x2(
+            bf01, Fp8x4T::__default_saturation, Fp8x4T::__default_interpret);
+        const __hip_fp8x2_storage_t fp23 = __hip_cvt_bfloat16raw2_to_fp8x2(
+            bf23, Fp8x4T::__default_saturation, Fp8x4T::__default_interpret);
+        const __hip_fp8x2_storage_t fp45 = __hip_cvt_bfloat16raw2_to_fp8x2(
+            bf45, Fp8x4T::__default_saturation, Fp8x4T::__default_interpret);
+        const __hip_fp8x2_storage_t fp67 = __hip_cvt_bfloat16raw2_to_fp8x2(
+            bf67, Fp8x4T::__default_saturation, Fp8x4T::__default_interpret);
+
+        const uint32_t packed0 = static_cast<uint32_t>(fp01) | (static_cast<uint32_t>(fp23) << 16);
+        const uint32_t packed1 = static_cast<uint32_t>(fp45) | (static_cast<uint32_t>(fp67) << 16);
+        const uint64_t packed01 =
+            static_cast<uint64_t>(packed0) | (static_cast<uint64_t>(packed1) << 32);
+
+        store<8>(dstAligned + j, packed01);
+      }
+
+#pragma unroll 2
+      for (int j = vecEnd8 + laneId * kVec4; j < vecEnd4; j += warpSize * kVec4) {
+        const __hip_bfloat162 low = *reinterpret_cast<const __hip_bfloat162*>(srcAligned + j);
+        const __hip_bfloat162 high = *reinterpret_cast<const __hip_bfloat162*>(srcAligned + j + 2);
+        const Fp8x4T packed(high, low);
+        *reinterpret_cast<__hip_fp8x4_storage_t*>(dstAligned + j) = packed.__x;
+      }
+    } else if (canVec4) {
+#pragma unroll 2
+      for (int j = laneId * kVec4; j < vecEnd4; j += warpSize * kVec4) {
+        const __hip_bfloat162 low = *reinterpret_cast<const __hip_bfloat162*>(src + j);
+        const __hip_bfloat162 high = *reinterpret_cast<const __hip_bfloat162*>(src + j + 2);
+        const Fp8x4T packed(high, low);
+        *reinterpret_cast<__hip_fp8x4_storage_t*>(dst + j) = packed.__x;
+      }
+    }
+
+    if (canVec8 || canVec4) {
+      for (int j = vecEnd4 + laneId; j < hiddenDim; j += warpSize) {
+        dst[j] = Fp8T(src[j]);
+      }
+    } else {
+      for (int j = laneId; j < hiddenDim; j += warpSize) {
+        dst[j] = Fp8T(src[j]);
+      }
+    }
+  }
+#else
+  (void)dst;
+  (void)src;
+  (void)hiddenDim;
+  (void)laneId;
+#endif
+}
+
+#if defined(MORI_FP8_TYPE_OCP_ENABLED) || defined(MORI_FP8_TYPE_FNUZ_ENABLED)
+namespace detail {
+using CombineInternalFp8T = CombineInternalFp8;
+using CombineInternalFp8x4T = CombineInternalFp8x4;
+
+template <int NNodes>
+__forceinline__ __device__ void SumCombineInternalFp8AcrossNodesToBf16Fixed(
+    hip_bfloat16* __restrict__ out, const CombineInternalFp8T* const* __restrict__ srcPtrs,
+    int laneId, int hiddenDimSize);
+
+template <>
+__forceinline__ __device__ void SumCombineInternalFp8AcrossNodesToBf16Fixed<2>(
+    hip_bfloat16* __restrict__ out, const CombineInternalFp8T* const* __restrict__ srcPtrs,
+    int laneId, int hiddenDimSize) {
+  using Fp8T = CombineInternalFp8T;
+  using Fp8x4T = CombineInternalFp8x4T;
+  constexpr int kVec8 = 8;
+  constexpr int kVec4 = 4;
+
+  const Fp8T* src0 = srcPtrs[0];
+  const Fp8T* src1 = srcPtrs[1];
+
+  const uintptr_t outAddr = reinterpret_cast<uintptr_t>(out);
+  const uintptr_t src0Addr = reinterpret_cast<uintptr_t>(src0);
+  const uintptr_t src1Addr = reinterpret_cast<uintptr_t>(src1);
+
+  const bool canVec8 = ((outAddr & 0x7) == 0) && ((src0 == nullptr) || ((src0Addr & 0x7) == 0)) &&
+                       ((src1 == nullptr) || ((src1Addr & 0x7) == 0));
+  const bool canVec4 = ((src0 == nullptr) || ((src0Addr & 0x3) == 0)) &&
+                       ((src1 == nullptr) || ((src1Addr & 0x3) == 0));
+
+  const int vecEnd8 = (hiddenDimSize / kVec8) * kVec8;
+  const int vecEnd4 = (hiddenDimSize / kVec4) * kVec4;
+
+  if (canVec8) {
+    auto* __restrict__ outAligned = static_cast<hip_bfloat16*>(__builtin_assume_aligned(out, 8));
+
+#pragma unroll 4
+    for (int j = laneId * kVec8; j < vecEnd8; j += warpSize * kVec8) {
+      float4 sumLo = {0.0f, 0.0f, 0.0f, 0.0f};
+      float4 sumHi = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+      for (int n = 0; n < 2; n++) {
+        const Fp8T* src = srcPtrs[n];
+        if (src == nullptr) continue;
+        const auto* srcAligned = static_cast<const Fp8T*>(__builtin_assume_aligned(src, 8));
+        const uint64_t a = load<8>(srcAligned + j);
+        Fp8x4T v0;
+        v0.__x = static_cast<__hip_fp8x4_storage_t>(a);
+        const float4 f0 = static_cast<float4>(v0);
+        Fp8x4T v1;
+        v1.__x = static_cast<__hip_fp8x4_storage_t>(a >> 32);
+        const float4 f1 = static_cast<float4>(v1);
+        sumLo.x += f0.x;
+        sumLo.y += f0.y;
+        sumLo.z += f0.z;
+        sumLo.w += f0.w;
+        sumHi.x += f1.x;
+        sumHi.y += f1.y;
+        sumHi.z += f1.z;
+        sumHi.w += f1.w;
+      }
+
+      const __hip_bfloat162 bf01 = __float22bfloat162_rn(float2{sumLo.x, sumLo.y});
+      const __hip_bfloat162 bf23 = __float22bfloat162_rn(float2{sumLo.z, sumLo.w});
+      const __hip_bfloat162 bf45 = __float22bfloat162_rn(float2{sumHi.x, sumHi.y});
+      const __hip_bfloat162 bf67 = __float22bfloat162_rn(float2{sumHi.z, sumHi.w});
+
+      const __hip_bfloat162_raw bf01r = static_cast<__hip_bfloat162_raw>(bf01);
+      const __hip_bfloat162_raw bf23r = static_cast<__hip_bfloat162_raw>(bf23);
+      const __hip_bfloat162_raw bf45r = static_cast<__hip_bfloat162_raw>(bf45);
+      const __hip_bfloat162_raw bf67r = static_cast<__hip_bfloat162_raw>(bf67);
+
+      const uint32_t u01 = static_cast<uint32_t>(bf01r.x) | (static_cast<uint32_t>(bf01r.y) << 16);
+      const uint32_t u23 = static_cast<uint32_t>(bf23r.x) | (static_cast<uint32_t>(bf23r.y) << 16);
+      const uint32_t u45 = static_cast<uint32_t>(bf45r.x) | (static_cast<uint32_t>(bf45r.y) << 16);
+      const uint32_t u67 = static_cast<uint32_t>(bf67r.x) | (static_cast<uint32_t>(bf67r.y) << 16);
+
+      const ulong2 packedOut{(static_cast<uint64_t>(u01) | (static_cast<uint64_t>(u23) << 32)),
+                             (static_cast<uint64_t>(u45) | (static_cast<uint64_t>(u67) << 32))};
+      store<16>(outAligned + j, packedOut);
+    }
+
+    if (vecEnd8 < vecEnd4) {
+#pragma unroll 2
+      for (int j = vecEnd8 + laneId * kVec4; j < vecEnd4; j += warpSize * kVec4) {
+        float4 sum4 = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int n = 0; n < 2; n++) {
+          const Fp8T* src = srcPtrs[n];
+          if (src == nullptr) continue;
+          Fp8x4T v;
+          v.__x = *reinterpret_cast<const __hip_fp8x4_storage_t*>(src + j);
+          const float4 f = static_cast<float4>(v);
+          sum4.x += f.x;
+          sum4.y += f.y;
+          sum4.z += f.z;
+          sum4.w += f.w;
+        }
+        out[j + 0] = hip_bfloat16(sum4.x);
+        out[j + 1] = hip_bfloat16(sum4.y);
+        out[j + 2] = hip_bfloat16(sum4.z);
+        out[j + 3] = hip_bfloat16(sum4.w);
+      }
+    }
+  } else if (canVec4) {
+#pragma unroll 2
+    for (int j = laneId * kVec4; j < vecEnd4; j += warpSize * kVec4) {
+      float4 sum4 = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+      for (int n = 0; n < 2; n++) {
+        const Fp8T* src = srcPtrs[n];
+        if (src == nullptr) continue;
+        Fp8x4T v;
+        v.__x = *reinterpret_cast<const __hip_fp8x4_storage_t*>(src + j);
+        const float4 f = static_cast<float4>(v);
+        sum4.x += f.x;
+        sum4.y += f.y;
+        sum4.z += f.z;
+        sum4.w += f.w;
+      }
+      out[j + 0] = hip_bfloat16(sum4.x);
+      out[j + 1] = hip_bfloat16(sum4.y);
+      out[j + 2] = hip_bfloat16(sum4.z);
+      out[j + 3] = hip_bfloat16(sum4.w);
+    }
+  }
+
+  const int scalarStart = (canVec8 || canVec4) ? vecEnd4 : 0;
+  for (int j = scalarStart + laneId; j < hiddenDimSize; j += warpSize) {
+    float sum = 0.0f;
+#pragma unroll
+    for (int n = 0; n < 2; n++) {
+      const Fp8T* src = srcPtrs[n];
+      if (src == nullptr) continue;
+      sum += float(src[j]);
+    }
+    out[j] = hip_bfloat16(sum);
+  }
+}
+
+__forceinline__ __device__ void SumCombineInternalFp8AcrossNodesToBf16Dynamic(
+    hip_bfloat16* __restrict__ out, const CombineInternalFp8T* const* __restrict__ srcPtrs,
+    int nNodes, int laneId, int hiddenDimSize) {
+  using Fp8T = CombineInternalFp8T;
+  using Fp8x4T = CombineInternalFp8x4T;
+
+  constexpr int kVec4 = 4;
+  const int vecEnd = (hiddenDimSize / kVec4) * kVec4;
+
+  bool canVec4 = true;
+#pragma unroll 4
+  for (int n = 0; n < nNodes; n++) {
+    const Fp8T* src = srcPtrs[n];
+    if (src == nullptr) continue;
+    canVec4 &= ((reinterpret_cast<uintptr_t>(src) & 0x3) == 0);
+  }
+
+  if (canVec4) {
+    for (int j = laneId * kVec4; j < vecEnd; j += warpSize * kVec4) {
+      float4 sum4 = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll 4
+      for (int n = 0; n < nNodes; n++) {
+        const Fp8T* src = srcPtrs[n];
+        if (src == nullptr) continue;
+        Fp8x4T v;
+        v.__x = *reinterpret_cast<const __hip_fp8x4_storage_t*>(src + j);
+        const float4 f = static_cast<float4>(v);
+        sum4.x += f.x;
+        sum4.y += f.y;
+        sum4.z += f.z;
+        sum4.w += f.w;
+      }
+      out[j + 0] = hip_bfloat16(sum4.x);
+      out[j + 1] = hip_bfloat16(sum4.y);
+      out[j + 2] = hip_bfloat16(sum4.z);
+      out[j + 3] = hip_bfloat16(sum4.w);
+    }
+  }
+
+  const int scalarStart = canVec4 ? vecEnd : 0;
+  for (int j = scalarStart + laneId; j < hiddenDimSize; j += warpSize) {
+    float sum = 0.0f;
+#pragma unroll 4
+    for (int n = 0; n < nNodes; n++) {
+      const Fp8T* src = srcPtrs[n];
+      if (src == nullptr) continue;
+      sum += float(src[j]);
+    }
+    out[j] = hip_bfloat16(sum);
+  }
+}
+
+}  // namespace detail
+#endif
+
+template <typename T>
+__forceinline__ __device__ void SumCombineInternalFp8AcrossNodesToBf16(
+    T* __restrict__ out, const CombineInternalFp8* const* __restrict__ srcPtrs, int nNodes,
+    int laneId, int hiddenDimSize) {
+#if defined(MORI_FP8_TYPE_OCP_ENABLED) || defined(MORI_FP8_TYPE_FNUZ_ENABLED)
+  if constexpr (std::is_same_v<T, hip_bfloat16>) {
+    if (nNodes == 2) {
+      detail::SumCombineInternalFp8AcrossNodesToBf16Fixed<2>(
+          reinterpret_cast<hip_bfloat16*>(out),
+          reinterpret_cast<const detail::CombineInternalFp8T* const*>(srcPtrs), laneId,
+          hiddenDimSize);
+    } else {
+      detail::SumCombineInternalFp8AcrossNodesToBf16Dynamic(
+          reinterpret_cast<hip_bfloat16*>(out),
+          reinterpret_cast<const detail::CombineInternalFp8T* const*>(srcPtrs), nNodes, laneId,
+          hiddenDimSize);
+    }
+  }
+#else
+  (void)out;
+  (void)srcPtrs;
+  (void)nNodes;
+  (void)laneId;
+  (void)hiddenDimSize;
+#endif
 }
 
 }  // namespace core

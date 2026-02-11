@@ -38,6 +38,7 @@ namespace mori {
 namespace moe {
 
 enum KernelType { IntraNode = 0, InterNode = 1, InterNodeV1 = 2, InterNodeV1LL = 3, AsyncLL = 4 };
+enum class QuantType { None = 0, Fp8DirectCast = 1 };
 
 inline const char* HipDataTypeToString(hipDataType dtype) {
   switch (dtype) {
@@ -93,6 +94,7 @@ struct EpDispatchCombineConfig {
   int gpuPerNode{8};
   int rdmaBlockNum{1};
   int numQpPerPe{1};
+  QuantType quantType{QuantType::None};
 
   inline __host__ __device__ int MaxNumTokensToSendPerRank() const { return maxNumInpTokenPerRank; }
 
