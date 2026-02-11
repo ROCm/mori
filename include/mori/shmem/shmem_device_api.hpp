@@ -116,12 +116,6 @@ inline __device__ uint64_t ShmemPtrP2p(const uint64_t destPtr, const int myPe, i
   }
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-
-  application::TransportType transportType = globalGpuStates->transportTypes[destPe];
-  if (transportType == application::TransportType::RDMA) {
-    return 0;
-  }
-
   uintptr_t localAddrInt = static_cast<uintptr_t>(destPtr);
 
   if (localAddrInt < globalGpuStates->heapBaseAddr ||
@@ -133,9 +127,38 @@ inline __device__ uint64_t ShmemPtrP2p(const uint64_t destPtr, const int myPe, i
   size_t offset = localAddrInt - globalGpuStates->heapBaseAddr;
 
   application::SymmMemObj* heapObj = globalGpuStates->heapObj;
-  uint64_t raddr = heapObj->peerPtrs[destPe] + offset;
+  // Use p2pPeerPtrs directly - returns 0 for non-P2P peers
+  uint64_t raddr = heapObj->p2pPeerPtrs[destPe] + offset;
 
   return raddr;
+}
+
+// Overload that gets myPe from globalGpuStates
+inline __device__ uint64_t ShmemPtrP2p(const uint64_t destPtr, int destPe) {
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  return ShmemPtrP2p(destPtr, globalGpuStates->rank, destPe);
+}
+
+// Overload that takes SymmMemObjPtr with offset (consistent with other shmem APIs)
+inline __device__ uint64_t ShmemPtrP2p(const application::SymmMemObjPtr& memObjPtr, size_t offset,
+                                       const int myPe, int destPe) {
+  // If same PE, return local pointer + offset
+  if (myPe == destPe) {
+    return reinterpret_cast<uintptr_t>(memObjPtr->localPtr) + offset;
+  }
+
+  // Use p2pPeerPtrs directly - returns 0 for non-P2P peers
+  // operator-> automatically returns gpu pointer in device code
+  uint64_t raddr = memObjPtr->p2pPeerPtrs[destPe] + offset;
+
+  return raddr;
+}
+
+// Overload that takes SymmMemObjPtr with offset and gets myPe from globalGpuStates
+inline __device__ uint64_t ShmemPtrP2p(const application::SymmMemObjPtr& memObjPtr, size_t offset,
+                                       int destPe) {
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  return ShmemPtrP2p(memObjPtr, offset, globalGpuStates->rank, destPe);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
