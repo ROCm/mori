@@ -383,6 +383,10 @@ using EpDispatchCombineArgsVariant =
                  ,
                  EpDispatchCombineArgs<__hip_fp8_e4m3>
 #endif
+#ifdef MORI_FP4_TYPE_OCP_ENABLED
+                 ,
+                 EpDispatchCombineArgs<mori_fp4x2_e2m1>
+#endif
                  >;
 
 template <typename T>
@@ -462,6 +466,10 @@ inline EpDispatchCombineArgsVariant GetEpDispatchCombineArgsByInputType(
 #ifdef MORI_FP8_TYPE_FNUZ_ENABLED
     case HIP_R_8F_E4M3_FNUZ:
       return GetEpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>(handle, rdmaBlockNum);
+#endif
+#ifdef MORI_FP4_TYPE_OCP_ENABLED
+    case HIP_R_4F_E2M1:
+      return GetEpDispatchCombineArgs<mori_fp4x2_e2m1>(handle, rdmaBlockNum);
 #endif
     default:
       std::ostringstream oss;

@@ -39,6 +39,7 @@
 #include "mori/ops/ops.hpp"
 #include "mori/pybind/profiler_registry.hpp"
 #include "mori/shmem/shmem.hpp"
+#include "mori/utils/data_types.hpp"
 #include "mori/utils/hip_helper.hpp"
 #include "src/pybind/torch_utils.hpp"
 
@@ -445,6 +446,15 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
 #endif
 }
 
+void Cast(const torch::Tensor& input, const torch::Tensor& output) {
+  assert(false && "Not implemented yet");
+  assert(input.is_contiguous() && output.is_contiguous());
+
+  // LaunchCast(static_cast<float*>(input.data_ptr()),
+  //            static_cast<mori::mori_fp4_e2m1*>(output.data_ptr()), input.numel(),
+  //            at::cuda::getCurrentHIPStream());
+}
+
 }  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -587,6 +597,8 @@ void RegisterMoriOps(py::module_& m) {
 
   m.def("get_cur_device_wall_clock_freq_mhz", &GetCurDeviceWallClockFreqMhz,
         "Returns clock frequency of current device's wall clock");
+
+  m.def("cast", &Cast, "cast a tensor from type A to type B");
 }
 
 void RegisterMoriShmem(py::module_& m) {

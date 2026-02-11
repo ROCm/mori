@@ -39,10 +39,14 @@ using CombineInternalFp8x4 = __hip_fp8x4_e4m3_fnuz;
 using CombineInternalFp8 = uint8_t;
 #endif
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                        Type Definitions                                        */
+/* ---------------------------------------------------------------------------------------------- */
 template <int VecBytes>
 struct VecTypeSelector {
   using type = void;
 };
+
 template <>
 struct VecTypeSelector<1> {
   using dataType = uint8_t;
@@ -68,6 +72,41 @@ struct VecTypeSelector<16> {
   using dataType = ulong2;
 };
 
+template <typename T, int VecSize>
+struct VecTypeAdaptor {
+  using type = void;
+};
+
+template <>
+struct VecTypeAdaptor<float, 1> {
+  using dataType = float;
+};
+
+template <>
+struct VecTypeAdaptor<float, 2> {
+  using dataType = float2;
+};
+
+template <>
+struct VecTypeAdaptor<float, 4> {
+  using dataType = float4;
+};
+
+#ifdef MORI_FP4_TYPE_OCP_ENABLED
+template <>
+struct VecTypeAdaptor<mori_fp4_e2m1, 2> {
+  using dataType = mori_fp4x2_e2m1;
+};
+
+template <>
+struct VecTypeAdaptor<mori_fp4_e2m1, 4> {
+  using dataType = mori_fp4x4_e2m1;
+};
+#endif
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                           Load/Store                                           */
+/* ---------------------------------------------------------------------------------------------- */
 #define USE_BUILDIN_LD 1
 #define USE_BUILDIN_ST 1
 
@@ -200,22 +239,21 @@ __device__ __forceinline__ void store<16>(void* addr,
 }
 #endif
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                              Copy                                              */
+/* ---------------------------------------------------------------------------------------------- */
 template <typename T>
 inline __device__ void ThreadCopy(T* dst, T* src, size_t nelems) {
-  constexpr int VecBytes = 16;
-  using DataType = typename VecTypeSelector<VecBytes>::dataType;
-  constexpr int vecSize = VecBytes / sizeof(T);
+  constexpr int vecSize = 16 / sizeof(T);
   int offset = 0;
 
   while ((offset + vecSize) <= nelems) {
     reinterpret_cast<uint4*>(dst + offset)[0] = reinterpret_cast<uint4*>(src + offset)[0];
-    // store<VecBytes>(dst + offset, reinterpret_cast<DataType*>(src + offset)[0]);
     offset += vecSize;
   }
 
   while (offset < nelems) {
     dst[offset] = src[offset];
-    // store<sizeof(T)>(dst + offset, src[offset]);
     offset += 1;
   }
 }
@@ -263,24 +301,6 @@ inline __device__ void WarpCopy(T* __restrict__ dst, const T* __restrict__ src, 
   }
 }
 
-// template <typename T>
-// inline __device__ void WarpCopy(T* dst, T* src, size_t nelems) {
-//   constexpr int vecSize = 16 / sizeof(T);
-//   int laneId = threadIdx.x & (warpSize - 1);
-//   int offset = laneId * vecSize;
-
-//   while ((offset + vecSize) <= nelems) {
-//     reinterpret_cast<uint4*>(dst + offset)[0] = reinterpret_cast<uint4*>(src + offset)[0];
-//     offset += warpSize * vecSize;
-//   }
-
-//   offset = offset - laneId * vecSize + laneId;
-//   while (offset < nelems) {
-//     dst[offset] = src[offset];
-//     offset += warpSize;
-//   }
-// }
-
 template <typename T, int N>
 inline __device__ void WarpCopy(T* dst, T* src) {
   constexpr int vecSize = 16 / sizeof(T);
@@ -296,6 +316,9 @@ inline __device__ void WarpCopy(T* dst, T* src) {
   }
 }
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                             Reduce                                             */
+/* ---------------------------------------------------------------------------------------------- */
 template <typename T>
 inline __device__ T WarpReduceSum(T val) {
   int laneId = threadIdx.x & (warpSize - 1);
@@ -305,6 +328,9 @@ inline __device__ T WarpReduceSum(T val) {
   return val;
 }
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                                             Prefix                                             */
+/* ---------------------------------------------------------------------------------------------- */
 template <typename T>
 inline __device__ T WarpPrefixSum(T val, size_t laneNum) {
   assert(laneNum <= warpSize);
@@ -384,8 +410,15 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
   const int elemsPerWarp = warpSize * vecSize;
   const size_t numIters = (nelems - offset) / elemsPerWarp;
   const size_t laneOffset = laneId * vecSize;
+
+#ifdef MORI_FP4_TYPE_OCP_ENABLED
+  using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
+#else
+  using AccumFp32Type = float;
+#endif
+
   for (size_t iter = 0; iter < numIters; ++iter) {
-    float accumValFp32[vecSize] = {0};
+    AccumFp32Type accumValFp32[vecSize] = {AccumFp32Type{0}};
 #pragma unroll
     for (int i = 0; i < accumNum; ++i) {
       if (srcs[i] == nullptr) continue;
@@ -393,7 +426,7 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
       float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
 #pragma unroll
       for (int j = 0; j < vecSize; ++j) {
-        accumValFp32[j] += float(reinterpret_cast<const T*>(&srcVal)[j]) * srcScale;
+        accumValFp32[j] += AccumFp32Type(reinterpret_cast<const T*>(&srcVal)[j]) * srcScale;
       }
     }
 
@@ -413,13 +446,13 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
   // remaining size
   offset += laneId;
   while (offset < nelems) {
-    float accumValFp32 = 0;
+    AccumFp32Type accumValFp32 = AccumFp32Type{0};
     for (int i = 0; i < accumNum; ++i) {
       const T* srcPtr = srcs[i];
       if (srcPtr == nullptr) continue;
 
       float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
-      accumValFp32 += float(srcPtr[offset]) * srcScale;
+      accumValFp32 += AccumFp32Type(srcPtr[offset]) * srcScale;
     }
     dest[offset] = T(accumValFp32);
     offset += warpSize;
@@ -444,8 +477,14 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
   const int laneId = threadIdx.x & (warpSize - 1);
   const size_t laneOffset = laneId * vecSize;
 
+#ifdef MORI_FP4_TYPE_OCP_ENABLED
+  using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
+#else
+  using AccumFp32Type = float;
+#endif
+
   for (size_t iter = 0; iter < numIters; iter++) {
-    float accumValFp32[Unroll][vecSize] = {0};
+    AccumFp32Type accumValFp32[Unroll][vecSize] = {0};
 
 #pragma unroll AccumNum
     for (int i = 0; i < AccumNum; ++i) {
@@ -458,7 +497,7 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
         float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
 #pragma unroll vecSize
         for (int j = 0; j < vecSize; ++j) {
-          accumValFp32[u][j] += float(reinterpret_cast<const T*>(&srcVals)[j]) * srcScale;
+          accumValFp32[u][j] += AccumFp32Type(reinterpret_cast<const T*>(&srcVals)[j]) * srcScale;
         }
       }
     }
@@ -501,8 +540,14 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
     cached_srcs[i] = srcs[i];
   }
 
+#ifdef MORI_FP4_TYPE_OCP_ENABLED
+  using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
+#else
+  using AccumFp32Type = float;
+#endif
+
   for (size_t iter = 0; iter < numIters; ++iter) {
-    float accumValFp32[vecSize] = {0};
+    AccumFp32Type accumValFp32[vecSize] = {AccumFp32Type{0}};
 
     DataType srcVals[AccumNum];
 #pragma unroll AccumNum
@@ -516,7 +561,7 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
       if (cached_srcs[i] != nullptr) {
 #pragma unroll vecSize
         for (int j = 0; j < vecSize; ++j) {
-          accumValFp32[j] += float(reinterpret_cast<const T*>(srcVals + i)[j]) * scales[i];
+          accumValFp32[j] += AccumFp32Type(reinterpret_cast<const T*>(srcVals + i)[j]) * scales[i];
         }
       }
     }
@@ -632,16 +677,23 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
   WarpAccumImpl<T, VecBytes, AccumNum>(dest, srcs, srcScales, offset, nelems);
 
   // remaining size
+
+#ifdef MORI_FP4_TYPE_OCP_ENABLED
+  using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
+#else
+  using AccumFp32Type = float;
+#endif
+
   offset += laneId;
   while (offset < nelems) {
-    float accumValFp32 = 0;
+    AccumFp32Type accumValFp32 = AccumFp32Type{0};
 #pragma unroll AccumNum
     for (int i = 0; i < AccumNum; ++i) {
       const T* srcPtr = srcs[i];
       if (srcPtr == nullptr) continue;
 
       float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
-      accumValFp32 += float(srcPtr[offset]) * srcScale;
+      accumValFp32 += AccumFp32Type(srcPtr[offset]) * srcScale;
     }
     dest[offset] = T(accumValFp32);
     offset += warpSize;

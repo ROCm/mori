@@ -359,6 +359,10 @@ template __global__ void EpDispatchLowLatencyAsyncSend<__hip_fp8_e4m3_fnuz>(
 template __global__ void EpDispatchLowLatencyAsyncSend<__hip_fp8_e4m3>(
     EpDispatchCombineArgs<__hip_fp8_e4m3> args);
 #endif
+#ifdef MORI_FP4_TYPE_OCP_ENABLED
+template __global__ void EpDispatchLowLatencyAsyncSend<mori_fp4x2_e2m1>(
+    EpDispatchCombineArgs<mori_fp4x2_e2m1> args);
+#endif
 template __global__ void EpDispatchLowLatencyAsyncSend<float>(EpDispatchCombineArgs<float> args);
 
 template __global__ void EpDispatchLowLatencyAsyncRecv<hip_bfloat16>(
@@ -370,6 +374,10 @@ template __global__ void EpDispatchLowLatencyAsyncRecv<__hip_fp8_e4m3_fnuz>(
 #ifdef MORI_FP8_TYPE_OCP_ENABLED
 template __global__ void EpDispatchLowLatencyAsyncRecv<__hip_fp8_e4m3>(
     EpDispatchCombineArgs<__hip_fp8_e4m3> args);
+#endif
+#ifdef MORI_FP4_TYPE_OCP_ENABLED
+template __global__ void EpDispatchLowLatencyAsyncRecv<mori_fp4x2_e2m1>(
+    EpDispatchCombineArgs<mori_fp4x2_e2m1> args);
 #endif
 template __global__ void EpDispatchLowLatencyAsyncRecv<float>(EpDispatchCombineArgs<float> args);
 
@@ -383,6 +391,10 @@ template __global__ void EpCombineLowLatencyAsyncSend<__hip_fp8_e4m3_fnuz>(
 template __global__ void EpCombineLowLatencyAsyncSend<__hip_fp8_e4m3>(
     EpDispatchCombineArgs<__hip_fp8_e4m3> args);
 #endif
+#ifdef MORI_FP4_TYPE_OCP_ENABLED
+template __global__ void EpCombineLowLatencyAsyncSend<mori_fp4x2_e2m1>(
+    EpDispatchCombineArgs<mori_fp4x2_e2m1> args);
+#endif
 template __global__ void EpCombineLowLatencyAsyncSend<float>(EpDispatchCombineArgs<float> args);
 
 template __global__ void EpCombineLowLatencyAsyncRecv<hip_bfloat16>(
@@ -394,6 +406,10 @@ template __global__ void EpCombineLowLatencyAsyncRecv<__hip_fp8_e4m3_fnuz>(
 #ifdef MORI_FP8_TYPE_OCP_ENABLED
 template __global__ void EpCombineLowLatencyAsyncRecv<__hip_fp8_e4m3>(
     EpDispatchCombineArgs<__hip_fp8_e4m3> args);
+#endif
+#ifdef MORI_FP4_TYPE_OCP_ENABLED
+template __global__ void EpCombineLowLatencyAsyncRecv<mori_fp4x2_e2m1>(
+    EpDispatchCombineArgs<mori_fp4x2_e2m1> args);
 #endif
 template __global__ void EpCombineLowLatencyAsyncRecv<float>(EpDispatchCombineArgs<float> args);
 
