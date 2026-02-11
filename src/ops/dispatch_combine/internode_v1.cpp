@@ -1368,6 +1368,8 @@ __global__ void EpCombineSyncBarrier(EpDispatchCombineArgs<T> args) {
                     EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)                         \
   MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3>(                            \
                    EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                               \
+  template __global__ void KernelName<mori_fp4x2_e2m1>(                                        \
+      EpDispatchCombineArgs<mori_fp4x2_e2m1> args);                                            \
   template __global__ void KernelName<float>(EpDispatchCombineArgs<float> args);
 
 // Macro to instantiate a kernel with EnableStdMoE parameter for all data types
@@ -1378,6 +1380,8 @@ __global__ void EpCombineSyncBarrier(EpDispatchCombineArgs<T> args) {
                     EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)            \
   MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3, StdMoE>(       \
                    EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                  \
+  template __global__ void KernelName<mori_fp4x2_e2m1, StdMoE>(                   \
+      EpDispatchCombineArgs<mori_fp4x2_e2m1> args);                               \
   template __global__ void KernelName<float, StdMoE>(EpDispatchCombineArgs<float> args);
 
 // Combined macro for kernels with EnableStdMoE template parameter

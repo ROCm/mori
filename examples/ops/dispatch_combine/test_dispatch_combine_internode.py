@@ -49,6 +49,7 @@ class EpDispatchCombineTestCase:
         num_qp,
         quant_type="none",
         dtype=torch.bfloat16,
+        hidden_dim=7168,
     ):
         self.rank = rank
         self.gpu_per_node = gpu_per_node
@@ -57,7 +58,9 @@ class EpDispatchCombineTestCase:
             data_type=dtype,
             rank=self.rank,
             world_size=self.world_size,
-            hidden_dim=7168,
+            hidden_dim=(
+                hidden_dim // 2 if dtype is torch.float4_e2m1fn_x2 else hidden_dim
+            ),
             scale_dim=32,
             scale_type_size=4,
             max_num_inp_token_per_rank=(max_tokens + 63) // 64 * 64,
@@ -211,15 +214,26 @@ class EpDispatchCombineTestCase:
         # some functions such as randn and cat are not implemented for fp8
         all_rank_input = []
         for r in range(self.world_size):
-            all_rank_input.append(
-                torch.randn(
-                    num_token[r],
-                    self.config.hidden_dim,
-                    dtype=torch.float32,
+            data_fp32 = torch.randn(
+                num_token[r],
+                self.config.hidden_dim,
+                dtype=torch.float32,
+                generator=self.rng,
+                device=self.device,
+            )
+            if self.config.data_type is torch.float4_e2m1fn_x2:
+                data = torch.randint(
+                    0,
+                    256,
+                    (num_token[r], self.config.hidden_dim),
+                    dtype=torch.uint8,
                     generator=self.rng,
                     device=self.device,
-                ).to(self.config.data_type)
-            )
+                )
+                data = data.view(torch.float4_e2m1fn_x2)
+            else:
+                data = data_fp32.to(self.config.data_type)
+            all_rank_input.append(data)
 
         return (
             num_token,
@@ -337,12 +351,18 @@ class EpDispatchCombineTestCase:
         for i, src_token_id in enumerate(src_token_pos):
             src_pe = src_token_id // max_num_token_to_send_per_rank
             src_tok_id = src_token_id % max_num_token_to_send_per_rank
-            is_pass = torch.equal(
-                dispatch_output[i], all_rank_input[src_pe][src_tok_id]
-            )
+            if self.config.data_type is torch.float4_e2m1fn_x2:
+                is_pass = torch.equal(
+                    dispatch_output[i].view(torch.uint8),
+                    all_rank_input[src_pe][src_tok_id].view(torch.uint8),
+                )
+            else:
+                is_pass = torch.equal(
+                    dispatch_output[i], all_rank_input[src_pe][src_tok_id]
+                )
             if not is_pass:
                 print(
-                    f"rank {self.rank} token {i} assert {is_pass} expected { all_rank_input[src_pe][src_tok_id]} got {dispatch_output[i]}"
+                    f"rank {self.rank} token {i} assert {is_pass} expected {all_rank_input[src_pe][src_tok_id].view(torch.uint8)} got {dispatch_output[i].view(torch.uint8)}"
                 )
                 assert False
                 # error_round.add(round)
@@ -367,6 +387,8 @@ class EpDispatchCombineTestCase:
 
         torch.cuda.synchronize()
         for i in range(all_rank_num_token[self.rank]):
+            if self.config.data_type is torch.float4_e2m1fn_x2:
+                continue
             pes = [
                 (idx // self.config.num_experts_per_rank)
                 for idx in all_rank_indices[self.rank][i].cpu().tolist()
@@ -932,16 +954,7 @@ def sweep_bench_dispatch_combine(
         plt.plot(max_token_list, comb_lat_max_list, label="Combine Max")
         plt.plot(max_token_list, disp_lat_avg_list, label="Dispatch Avg")
         plt.plot(max_token_list, comb_lat_avg_list, label="Combine Avg")
-        # plt.plot(
-        #     max_token_list,
-        #     [max - min for max, min in zip(disp_lat_max_list, disp_lat_min_list)],
-        #     label="Dispatch Max-Min",
-        # )
-        # plt.plot(
-        #     max_token_list,
-        #     [max - min for max, min in zip(comb_lat_max_list, comb_lat_min_list)],
-        #     label="Combine Max-Min",
-        # )
+
         plt.xticks([i * 16 for i in range(max_tokens // 16)])
         plt.title("Dispatch / Combine Latency (us)")
         plt.xlabel("# of Tokens")
@@ -1008,6 +1021,7 @@ _DATA_TYPE_MAP = {
     "bf16": torch.bfloat16,
     "fp8_e4m3_fnuz": torch.float8_e4m3fnuz,
     "fp8_e4m3": torch.float8_e4m3fn,
+    "fp4": torch.float4_e2m1fn_x2,
 }
 
 
@@ -1023,7 +1037,7 @@ parser.add_argument(
     "--dtype",
     type=str,
     default="bf16",
-    choices=["bf16", "fp8_e4m3_fnuz", "fp8_e4m3"],
+    choices=["bf16", "fp8_e4m3_fnuz", "fp8_e4m3", "fp4"],
     help="Data type of dispatch / combine",
 )
 parser.add_argument(

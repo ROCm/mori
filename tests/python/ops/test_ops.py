@@ -19,11 +19,27 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-from .dispatch_combine import (
-    EpDispatchCombineKernelType,
-    EpDispatchCombineConfig,
-    EpDispatchCombineOp,
-)
-from .ops import (
-    cast,
-)
+import torch
+import pytest
+import mori
+
+from tests.python.utils import fp4_x2_to_fp32
+
+
+@pytest.mark.parametrize("nelems", (32,))
+@pytest.mark.parametrize("input_type", (torch.float,))
+@pytest.mark.parametrize("output_type", (torch.float4_e2m1fn_x2,))
+def test_cast(
+    nelems,
+    input_type,
+    output_type,
+):
+    device = torch.device("cuda", 0)
+    inp = torch.randn((nelems,), dtype=input_type, device=device)
+    out = torch.empty((nelems // 2,), dtype=output_type, device=device)
+    print(inp, out)
+    mori.ops.cast(inp, out)
+    torch.cuda.synchronize()
+    print(inp, out)
+    print(fp4_x2_to_fp32(out))
+    print(out.view(dtype=torch.uint8))
