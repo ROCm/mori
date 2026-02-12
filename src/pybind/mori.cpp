@@ -922,5 +922,164 @@ void RegisterMoriCcl(pybind11::module_& m) {
         "Execute Allgather SDMA operation"
   );
 
+    // =========================================================================
+    // Bind AllreduceSdma class (uint32_t version)
+    // =========================================================================
+    py::class_<mori::collective::AllreduceSdma<uint32_t>>(m, "AllreduceSdmaHandle")
+        .def(py::init<int, int, size_t, size_t, bool>(),
+             py::arg("my_pe"),
+             py::arg("npes"),
+             py::arg("input_buffer_size"),
+             py::arg("output_buffer_size"),
+             py::arg("copy_output_to_user") = true,
+             "Initialize AllreduceSdma with PE ID, number of PEs, and buffer sizes")
+        .def(py::init<int, int, size_t, bool>(),
+             py::arg("my_pe"),
+             py::arg("npes"),
+             py::arg("transit_buffer_size") = 512 * 1024 * 1024,
+             py::arg("copy_output_to_user") = true,
+             "Initialize AllreduceSdma with PE ID, number of PEs, and transit buffer size (default 512MB)")
+        .def("__call__",
+            [](mori::collective::AllreduceSdma<uint32_t>& self,
+               const torch::Tensor& input_tensor,
+               const torch::Tensor& output_tensor,
+               size_t count,
+               py::object stream_obj) -> bool {
+
+                if (input_tensor.dim() != 1) {
+                    throw std::runtime_error("Input tensor must be 1-dimensional");
+                }
+                if (output_tensor.dim() != 1) {
+                    throw std::runtime_error("Output tensor must be 1-dimensional");
+                }
+                if (!input_tensor.is_cuda()) {
+                    throw std::runtime_error("Input tensor must be CUDA tensor");
+                }
+                if (!output_tensor.is_cuda()) {
+                    throw std::runtime_error("Output tensor must be CUDA tensor");
+                }
+                // C++ class uses uint32_t template
+                // Accept uint32 or int32 (same memory layout)
+                uint32_t* input_ptr = nullptr;
+                uint32_t* output_ptr = nullptr;
+
+                if (input_tensor.scalar_type() == torch::kUInt32) {
+                    input_ptr = input_tensor.data_ptr<uint32_t>();
+                } else if (input_tensor.scalar_type() == torch::kInt32) {
+                    input_ptr = reinterpret_cast<uint32_t*>(input_tensor.data_ptr<int32_t>());
+                } else {
+                    throw std::runtime_error("Input tensor must be uint32 or int32");
+                }
+
+                if (output_tensor.scalar_type() == torch::kUInt32) {
+                    output_ptr = output_tensor.data_ptr<uint32_t>();
+                } else if (output_tensor.scalar_type() == torch::kInt32) {
+                    output_ptr = reinterpret_cast<uint32_t*>(output_tensor.data_ptr<int32_t>());
+                } else {
+                    throw std::runtime_error("Output tensor must be uint32 or int32");
+                }
+
+                // Get device index from input tensor and convert stream
+                int device_index = input_tensor.device().index();
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj, device_index);
+
+                return self(input_ptr, output_ptr, count, stream);
+            },
+            py::arg("input"),
+            py::arg("output"),
+            py::arg("count"),
+            py::arg("stream") = py::none(),
+            "Execute AllReduce SDMA operation (returns bool), synchronization must be done by caller")
+        .def("reset_flags",
+            &mori::collective::AllreduceSdma<uint32_t>::resetFlags,
+            "Reset synchronization flags")
+        .def("get_output_transit_buffer",
+            [](mori::collective::AllreduceSdma<uint32_t>& self, py::object device_obj) -> torch::Tensor {
+                void* buffer_ptr = self.getOutputTransitBuffer();
+                size_t buffer_size = self.getOutputTransitBufferSize();
+
+                if (buffer_ptr == nullptr) {
+                    throw std::runtime_error("Output transit buffer is null");
+                }
+
+                // Convert buffer size from bytes to number of uint32_t elements
+                size_t num_elements = buffer_size / sizeof(uint32_t);
+
+                // Determine device index
+                int device_index = 0;
+                if (!device_obj.is_none()) {
+                    py::object torch_module = py::module_::import("torch");
+                    py::object tensor_class = torch_module.attr("Tensor");
+                    bool is_tensor = py::isinstance(device_obj, tensor_class);
+
+                    if (is_tensor) {
+                        torch::Tensor tensor = device_obj.cast<torch::Tensor>();
+                        if (tensor.is_cuda()) {
+                            device_index = tensor.device().index();
+                        } else {
+                            throw std::runtime_error("device tensor must be a CUDA tensor");
+                        }
+                    } else {
+                        try {
+                            device_index = device_obj.cast<int>();
+                        } catch (const py::cast_error&) {
+                            throw std::runtime_error("device must be an int, a CUDA tensor, or None");
+                        }
+                    }
+                } else {
+                    device_index = at::cuda::current_device();
+                }
+
+                torch::Tensor tensor = torch::from_blob(
+                    buffer_ptr,
+                    {static_cast<int64_t>(num_elements)},
+                    torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCUDA, device_index)
+                );
+
+                return tensor;
+            },
+            py::arg("device") = py::none(),
+            "Get output transit buffer as a PyTorch tensor");
+
+    // Keep old function-based interface for backward compatibility (optional)
+    m.def("allreduce_sdma",
+        [](py::array_t<uint32_t> input_array,
+           py::array_t<uint32_t> output_array,
+           size_t count,
+           py::object stream_obj) -> double {
+
+            // Validate arrays
+            if (input_array.ndim() != 1) {
+                throw std::runtime_error("Input array must be 1-dimensional");
+            }
+            if (output_array.ndim() != 1) {
+                throw std::runtime_error("Output array must be 1-dimensional");
+            }
+
+            // Get buffer info
+            py::buffer_info input_info = input_array.request();
+            py::buffer_info output_info = output_array.request();
+
+            // Get data pointers
+            uint32_t* input_ptr = static_cast<uint32_t*>(input_info.ptr);
+            uint32_t* output_ptr = static_cast<uint32_t*>(output_info.ptr);
+
+            // Handle HIP stream parameter
+            hipStream_t stream = nullptr;
+            if (!stream_obj.is_none()) {
+                // TODO: Convert Python stream object to hipStream_t if needed
+            }
+
+            // Call C++ function
+            return mori::collective::Allreduce_sdma<uint32_t>(
+                input_ptr, output_ptr, count, stream);
+        },
+        py::arg("input"),
+        py::arg("output"),
+        py::arg("count"),
+        py::arg("stream") = py::none(),
+        "Execute AllReduce SDMA operation"
+    );
+
 }
 }  // namespace mori

@@ -28,3 +28,5 @@
 #include "mori/collective/allgather/sdma_allgather.hpp"
 #include "mori/collective/allgather/oneshot_allgather_sdma_class.hpp"
 #include "mori/collective/allgather/oneshot_sdma_async_kernel.hpp"
+#include "mori/collective/allreduce/sdma_allreduce.hpp"
+#include "mori/collective/allreduce/twoshot_allreduce_sdma_class.hpp"

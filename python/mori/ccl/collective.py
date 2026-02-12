@@ -245,3 +245,89 @@ class AllgatherSdma:
             while an async operation is in progress.
         """
         return self._handle.get_output_transit_buffer(device)
+
+
+def _cpp_allreduce_factory(entity_name: str):
+    """Factory function to get C++ entities from mori_cpp module"""
+    return getattr(mori_cpp, entity_name)
+
+
+class AllreduceSdma:
+    """Python wrapper for AllreduceSdma C++ class.
+    
+    Performs a three-phase AllReduce using SDMA:
+      Phase 1: Gather — scatter each rank's input shards to all peers via SDMA
+      Phase 2: Local reduce — sum all gathered copies of each shard
+      Phase 3: AllGather — broadcast reduced shards to all peers via SDMA
+    
+    After the operation, every rank holds the same reduced result (elementwise sum
+    of all ranks' inputs) in the output buffer.
+    """
+
+    def __init__(self, my_pe: int, npes: int,
+                 input_buffer_size: Optional[int] = None,
+                 output_buffer_size: Optional[int] = None,
+                 transit_buffer_size: Optional[int] = None,
+                 copy_output_to_user: bool = True):
+        """Initialize AllreduceSdma
+        
+        Args:
+            my_pe: Current PE ID
+            npes: Total number of PEs
+            input_buffer_size: Input transit buffer size in bytes
+            output_buffer_size: Output transit buffer size in bytes (must hold npes * padded_shard_size elements)
+            transit_buffer_size: Transit buffer size in bytes (split equally for input and output)
+            copy_output_to_user: If True, copy output_transit_buffer to user output buffer (default True).
+                                If False, user should directly use output_transit_buffer via get_output_transit_buffer()
+        """
+        self.my_pe = my_pe
+        self.npes = npes
+        handle_class = _cpp_allreduce_factory("AllreduceSdmaHandle")
+
+        if input_buffer_size is not None and output_buffer_size is not None:
+            self._handle = handle_class(my_pe, npes, input_buffer_size, output_buffer_size, copy_output_to_user)
+        elif transit_buffer_size is not None:
+            self._handle = handle_class(my_pe, npes, transit_buffer_size, copy_output_to_user)
+        else:
+            self._handle = handle_class(my_pe, npes, 512 * 1024 * 1024, copy_output_to_user)
+
+    def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
+        """Execute AllReduce SDMA operation.
+        
+        Args:
+            input_data: Input CUDA tensor (torch.int32 or torch.uint32, 1D, GPU memory).
+                       Contains `count` elements on this rank.
+            output_data: Output CUDA tensor (torch.int32 or torch.uint32, 1D, GPU memory).
+                        Will contain `count` elements — the element-wise sum across all ranks.
+            count: Number of elements per PE
+            stream: Optional HIP stream
+            
+        Returns:
+            True if successful, False if failed
+            
+        Note:
+            Caller must handle synchronization (stream.synchronize() or torch.cuda.synchronize())
+        """
+        return self._handle(input_data, output_data, count, stream)
+
+    def reset_flags(self):
+        """Reset synchronization flags"""
+        self._handle.reset_flags()
+
+    def get_output_transit_buffer(self, device=None):
+        """Get output transit buffer as a PyTorch tensor.
+        
+        Args:
+            device: Optional device specification. Can be:
+                - An int: device index (e.g., 0, 1)
+                - A CUDA tensor: uses the device of that tensor
+                - None: uses the current CUDA device
+        
+        Returns:
+            torch.Tensor: Output transit buffer as a CUDA tensor (uint32, 1D)
+            
+        Note:
+            The tensor is a view of the internal buffer. Do not modify the buffer
+            while an operation is in progress.
+        """
+        return self._handle.get_output_transit_buffer(device)
