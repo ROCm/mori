@@ -27,6 +27,12 @@ import torch
 import torch.distributed as dist
 
 os.environ["MORI_SHMEM_HEAP_SIZE"] = "4G"
+
+
+def _is_fp4x2_dtype(dtype):
+    return dtype is torch.float4_e2m1fn_x2
+
+
 class EpDispatchCombineTestCase:
     def __init__(self, config):
         self.config = config
@@ -103,15 +109,25 @@ class EpDispatchCombineTestCase:
         # some functions such as randn and cat are not implemented for fp8
         all_rank_input = []
         for r in range(self.config.world_size):
-            all_rank_input.append(
-                torch.randn(
-                    num_token[r],
-                    self.config.hidden_dim,
-                    dtype=torch.float32,
+            input_fp32 = torch.randn(
+                num_token[r],
+                self.config.hidden_dim,
+                dtype=torch.float32,
+                generator=self.rng,
+                device=self.device,
+            )
+            if _is_fp4x2_dtype(self.config.data_type):
+                fp4_bytes = torch.randint(
+                    0,
+                    256,
+                    (num_token[r], self.config.hidden_dim),
+                    dtype=torch.uint8,
                     generator=self.rng,
                     device=self.device,
-                ).to(self.config.data_type)
-            )
+                )
+                all_rank_input.append(fp4_bytes.view(torch.float4_e2m1fn_x2))
+            else:
+                all_rank_input.append(input_fp32.to(self.config.data_type))
 
         return (
             num_token,
@@ -144,7 +160,13 @@ class EpDispatchCombineTestCase:
         for i, pos in enumerate(src_token_pos):
             src_rank = int(pos) // self.config.max_num_inp_token_per_rank
             src_id = int(pos) % self.config.max_num_inp_token_per_rank
-            assert torch.equal(all_rank_input[src_rank][src_id], dispatch_output[i])
+            if _is_fp4x2_dtype(self.config.data_type):
+                assert torch.equal(
+                    all_rank_input[src_rank][src_id].view(torch.uint8),
+                    dispatch_output[i].view(torch.uint8),
+                )
+            else:
+                assert torch.equal(all_rank_input[src_rank][src_id], dispatch_output[i])
             if dispatch_weights is not None:
                 assert torch.equal(
                     all_rank_weights[src_rank][src_id], dispatch_weights[i]
@@ -165,6 +187,9 @@ class EpDispatchCombineTestCase:
         all_rank_indices = test_data[1]
         all_rank_input = test_data[2]
         all_rank_weights = test_data[3]
+
+        if _is_fp4x2_dtype(self.config.data_type):
+            return
 
         for i in range(all_rank_num_token[self.config.rank]):
             pes = [
@@ -294,7 +319,7 @@ def _test_dispatch_combine(
         data_type=data_type,
         rank=rank,
         world_size=world_size,
-        hidden_dim=hidden_dim,
+        hidden_dim=hidden_dim // 2 if _is_fp4x2_dtype(data_type) else hidden_dim,
         scale_dim=scale_dim,
         scale_type_size=scale_type_size,
         max_num_inp_token_per_rank=max_num_inp_token_per_rank,
@@ -332,6 +357,13 @@ def _test_dispatch_combine(
                 reason="Skip float8_e4m3fn, it is not supported",
             ),
         ),
+        pytest.param(
+            torch.float4_e2m1fn_x2,
+            marks=pytest.mark.skipif(
+                not data_type_supported(torch.float4_e2m1fn_x2),
+                reason="Skip float4_e2m1fn_x2, it is not supported",
+            ),
+        ),
     ),
 )
 @pytest.mark.parametrize("hidden_dim", (7168, 4096))
@@ -358,6 +390,8 @@ def test_dispatch_combine(
     # fp8_direct_cast is not supported in zero-copy mode (use_external_inp_buf=False)
     if quant_type == "fp8_direct_cast" and not use_external_inp_buf:
         pytest.skip("fp8_direct_cast is not supported in zero-copy mode")
+    if quant_type == "fp8_direct_cast" and _is_fp4x2_dtype(data_type):
+        pytest.skip("fp8_direct_cast is not supported for fp4 data type")
 
     for i in range(world_size):
         torch_dist_process_manager.task_queue.put(

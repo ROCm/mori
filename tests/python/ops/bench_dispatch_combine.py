@@ -361,6 +361,9 @@ def _bench_dispatch_combine(
     zero_copy=1,
     quant_type="none",
 ):
+    if quant_type == "fp8_direct_cast" and data_type is not torch.bfloat16:
+        raise ValueError("fp8_direct_cast is only supported for bfloat16 data type")
+
     config = mori.ops.EpDispatchCombineConfig(
         data_type=data_type,
         rank=rank,
@@ -378,11 +381,10 @@ def _bench_dispatch_combine(
         gpu_per_node=8,
         quant_type=quant_type,
     )
-    benchmark = EpDispatchCombineBenchmark(config)
-
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         mori.shmem.shmem_torch_process_group_init("default")
         op = mori.ops.EpDispatchCombineOp(config)
+        benchmark = EpDispatchCombineBenchmark(config)
 
         # High bandwidth configuration
         if max_num_inp_token_per_rank > 1024:
@@ -502,7 +504,12 @@ def _bench_dispatch_combine(
 
 
 def bench_dispatch_combine(
-    max_num_inp_token_per_rank, dtype, cmd="bench", zero_copy=1, quant_type="none"
+    max_num_inp_token_per_rank,
+    dtype,
+    hidden_dim=7168,
+    cmd="bench",
+    zero_copy=1,
+    quant_type="none",
 ):
     world_size = 8
     port = get_free_port()
@@ -513,7 +520,7 @@ def bench_dispatch_combine(
             port,
             max_num_inp_token_per_rank,
             dtype,
-            7168,  # hidden_dim
+            hidden_dim,
             0,  # scale_dim
             0,  # scale_type_size
             32,  # num_experts_per_rank
@@ -531,6 +538,7 @@ _DATA_TYPE_MAP = {
     "bf16": torch.bfloat16,
     "fp8_e4m3_fnuz": torch.float8_e4m3fnuz,
     "fp8_e4m3": torch.float8_e4m3fn,
+    "fp4": torch.float4_e2m1fn_x2,
 }
 
 if __name__ == "__main__":
@@ -547,7 +555,7 @@ if __name__ == "__main__":
         "--dtype",
         type=str,
         default="bf16",
-        choices=["bf16", "fp8_e4m3_fnuz", "fp8_e4m3"],
+        choices=["bf16", "fp8_e4m3_fnuz", "fp8_e4m3", "fp4"],
         help="Data type of dispatch / combine",
     )
     parser.add_argument(
@@ -581,9 +589,13 @@ if __name__ == "__main__":
         f"zero_copy: {'true' if args.zero_copy else 'false'}, quant_type: {args.quant_type}"
     )
     print("-" * 60)
+    hidden_dim = 7168
+    if _DATA_TYPE_MAP[args.dtype] is torch.float4_e2m1fn_x2:
+        hidden_dim = hidden_dim // 2
     bench_dispatch_combine(
         max_num_inp_token_per_rank=args.max_tokens,
         dtype=_DATA_TYPE_MAP[args.dtype],
+        hidden_dim=hidden_dim,
         cmd=args.cmd,
         zero_copy=args.zero_copy,
         quant_type=args.quant_type,
