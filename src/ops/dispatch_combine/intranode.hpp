@@ -202,8 +202,12 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpCombineIntraNodeKernel                                    */
 /* ---------------------------------------------------------------------------------------------- */
-template <typename T, typename TokT = T, bool UseP2PRead = true, bool EnableStdMoE = false>
+template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
+          bool UseFp8DirectCast = false>
 __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
+  using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
+  static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
+                "Fp8 direct cast combine currently only supports bf16 input");
   const EpDispatchCombineConfig& config = args.config;
   int thdId = threadIdx.x;
   int thdNum = blockDim.x;
