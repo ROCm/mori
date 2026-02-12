@@ -139,12 +139,15 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   }
   attr.ah_attr.sl = sl.value_or(0);
 
-  std::optional<uint8_t> tc = ReadIoTrafficClassEnv();
-  if (!tc.has_value()) {
-    tc = ReadRdmaTrafficClassEnv();
-  }
-  if (tc.has_value()) {
-    attr.ah_attr.grh.traffic_class = tc.value();
+  bool disableIoTc = ReadIoTrafficClassDisableEnv();
+  if (!disableIoTc) {
+    std::optional<uint8_t> tc = ReadIoTrafficClassEnv();
+    if (!tc.has_value()) {
+      tc = ReadRdmaTrafficClassEnv();
+    }
+    if (tc.has_value()) {
+      attr.ah_attr.grh.traffic_class = tc.value();
+    }
   }
   MORI_APP_INFO("ibverbs attr.ah_attr.sl:{} attr.ah_attr.grh.traffic_class:{}", attr.ah_attr.sl,
                 attr.ah_attr.grh.traffic_class);

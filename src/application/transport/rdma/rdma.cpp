@@ -268,6 +268,11 @@ std::optional<uint8_t> ReadIoServiceLevelEnv() { return ReadUint8FromEnvVar("MOR
 
 std::optional<uint8_t> ReadIoTrafficClassEnv() { return ReadUint8FromEnvVar("MORI_IO_TC"); }
 
+bool ReadIoTrafficClassDisableEnv() {
+  std::optional<uint8_t> disable = ReadUint8FromEnvVar("MORI_IO_TC_DISABLE");
+  return disable.has_value() && disable.value() == 1;
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        RdmaDeviceContext                                       */
 /* ---------------------------------------------------------------------------------------------- */
