@@ -22,6 +22,10 @@
 #pragma once
 
 #include "mori/application/bootstrap/base_bootstrap.hpp"
+#ifdef ENABLE_MPI
 #include "mori/application/bootstrap/mpi_bootstrap.hpp"
+#endif
+#ifdef ENABLE_TORCH
 #include "mori/application/bootstrap/torch_bootstrap.hpp"
+#endif
 #include "mori/application/bootstrap/socket_bootstrap.hpp"

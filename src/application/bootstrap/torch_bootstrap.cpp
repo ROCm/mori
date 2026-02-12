@@ -21,8 +21,6 @@
 // SOFTWARE.
 #include "mori/application/bootstrap/torch_bootstrap.hpp"
 
-#include <mpi.h>
-
 #include <cassert>
 #include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
