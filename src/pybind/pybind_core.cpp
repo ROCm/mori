@@ -19,11 +19,9 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#pragma once
+#include "src/pybind/mori_core.hpp"
 
-#include "mori/shmem/shmem_api.hpp"
-#include "mori/shmem/shmem_device_api.hpp"
-#include "mori/shmem/shmem_device_kernels.hpp"
-#include "mori/shmem/shmem_ibgda_kernels.hpp"
-#include "mori/shmem/shmem_p2p_kernels.hpp"
-#include "mori/shmem/shmem_sdma_kernels.hpp"
+PYBIND11_MODULE(libmori_core_pybinds, m) {
+  mori::RegisterMoriShmem(m);
+  mori::RegisterMoriIo(m);
+}

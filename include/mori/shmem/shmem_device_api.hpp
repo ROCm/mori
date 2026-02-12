@@ -22,7 +22,6 @@
 #pragma once
 
 #include <assert.h>
-#include <mpi.h>
 
 #include "mori/application/application.hpp"
 #include "mori/core/core.hpp"

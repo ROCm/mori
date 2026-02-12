@@ -21,9 +21,9 @@
 // SOFTWARE.
 #pragma once
 
-#include "mori/shmem/shmem_api.hpp"
-#include "mori/shmem/shmem_device_api.hpp"
-#include "mori/shmem/shmem_device_kernels.hpp"
-#include "mori/shmem/shmem_ibgda_kernels.hpp"
-#include "mori/shmem/shmem_p2p_kernels.hpp"
-#include "mori/shmem/shmem_sdma_kernels.hpp"
+#include <pybind11/pybind11.h>
+
+namespace mori {
+void RegisterMoriShmem(pybind11::module_& m);
+void RegisterMoriIo(pybind11::module_& m);
+}  // namespace mori
