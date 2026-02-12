@@ -809,31 +809,28 @@ namespace detail {
 using CombineInternalFp8T = CombineInternalFp8;
 using CombineInternalFp8x4T = CombineInternalFp8x4;
 
-template <int NNodes>
+template <int AccumNum>
 __forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16Fixed(
     hip_bfloat16* __restrict__ out, const CombineInternalFp8T* const* __restrict__ srcPtrs,
-    int laneId, int hiddenDimSize);
-
-template <>
-__forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16Fixed<2>(
-    hip_bfloat16* __restrict__ out, const CombineInternalFp8T* const* __restrict__ srcPtrs,
     int laneId, int hiddenDimSize) {
+  static_assert(AccumNum > 0, "AccumNum must be positive");
+
   using Fp8T = CombineInternalFp8T;
   using Fp8x4T = CombineInternalFp8x4T;
   constexpr int kVec8 = 8;
   constexpr int kVec4 = 4;
 
-  const Fp8T* src0 = srcPtrs[0];
-  const Fp8T* src1 = srcPtrs[1];
-
   const uintptr_t outAddr = reinterpret_cast<uintptr_t>(out);
-  const uintptr_t src0Addr = reinterpret_cast<uintptr_t>(src0);
-  const uintptr_t src1Addr = reinterpret_cast<uintptr_t>(src1);
-
-  const bool canVec8 = ((outAddr & 0x7) == 0) && ((src0 == nullptr) || ((src0Addr & 0x7) == 0)) &&
-                       ((src1 == nullptr) || ((src1Addr & 0x7) == 0));
-  const bool canVec4 = ((src0 == nullptr) || ((src0Addr & 0x3) == 0)) &&
-                       ((src1 == nullptr) || ((src1Addr & 0x3) == 0));
+  bool canVec8 = ((outAddr & 0x7) == 0);
+  bool canVec4 = true;
+#pragma unroll
+  for (int n = 0; n < AccumNum; n++) {
+    const Fp8T* src = srcPtrs[n];
+    if (src == nullptr) continue;
+    const uintptr_t srcAddr = reinterpret_cast<uintptr_t>(src);
+    canVec8 &= ((srcAddr & 0x7) == 0);
+    canVec4 &= ((srcAddr & 0x3) == 0);
+  }
 
   const int vecEnd8 = (hiddenDimSize / kVec8) * kVec8;
   const int vecEnd4 = (hiddenDimSize / kVec4) * kVec4;
@@ -846,7 +843,7 @@ __forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16Fixed<2>(
       float4 sumLo = {0.0f, 0.0f, 0.0f, 0.0f};
       float4 sumHi = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-      for (int n = 0; n < 2; n++) {
+      for (int n = 0; n < AccumNum; n++) {
         const Fp8T* src = srcPtrs[n];
         if (src == nullptr) continue;
         const auto* srcAligned = static_cast<const Fp8T*>(__builtin_assume_aligned(src, 8));
@@ -892,7 +889,7 @@ __forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16Fixed<2>(
       for (int j = vecEnd8 + laneId * kVec4; j < vecEnd4; j += warpSize * kVec4) {
         float4 sum4 = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-        for (int n = 0; n < 2; n++) {
+        for (int n = 0; n < AccumNum; n++) {
           const Fp8T* src = srcPtrs[n];
           if (src == nullptr) continue;
           Fp8x4T v;
@@ -914,7 +911,7 @@ __forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16Fixed<2>(
     for (int j = laneId * kVec4; j < vecEnd4; j += warpSize * kVec4) {
       float4 sum4 = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-      for (int n = 0; n < 2; n++) {
+      for (int n = 0; n < AccumNum; n++) {
         const Fp8T* src = srcPtrs[n];
         if (src == nullptr) continue;
         Fp8x4T v;
@@ -936,7 +933,7 @@ __forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16Fixed<2>(
   for (int j = scalarStart + laneId; j < hiddenDimSize; j += warpSize) {
     float sum = 0.0f;
 #pragma unroll
-    for (int n = 0; n < 2; n++) {
+    for (int n = 0; n < AccumNum; n++) {
       const Fp8T* src = srcPtrs[n];
       if (src == nullptr) continue;
       sum += float(src[j]);
@@ -947,7 +944,7 @@ __forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16Fixed<2>(
 
 __forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16Dynamic(
     hip_bfloat16* __restrict__ out, const CombineInternalFp8T* const* __restrict__ srcPtrs,
-    int nNodes, int laneId, int hiddenDimSize) {
+    int accumNum, int laneId, int hiddenDimSize) {
   using Fp8T = CombineInternalFp8T;
   using Fp8x4T = CombineInternalFp8x4T;
 
@@ -956,7 +953,7 @@ __forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16Dynamic(
 
   bool canVec4 = true;
 #pragma unroll 4
-  for (int n = 0; n < nNodes; n++) {
+  for (int n = 0; n < accumNum; n++) {
     const Fp8T* src = srcPtrs[n];
     if (src == nullptr) continue;
     canVec4 &= ((reinterpret_cast<uintptr_t>(src) & 0x3) == 0);
@@ -966,7 +963,7 @@ __forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16Dynamic(
     for (int j = laneId * kVec4; j < vecEnd; j += warpSize * kVec4) {
       float4 sum4 = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll 4
-      for (int n = 0; n < nNodes; n++) {
+      for (int n = 0; n < accumNum; n++) {
         const Fp8T* src = srcPtrs[n];
         if (src == nullptr) continue;
         Fp8x4T v;
@@ -988,7 +985,7 @@ __forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16Dynamic(
   for (int j = scalarStart + laneId; j < hiddenDimSize; j += warpSize) {
     float sum = 0.0f;
 #pragma unroll 4
-    for (int n = 0; n < nNodes; n++) {
+    for (int n = 0; n < accumNum; n++) {
       const Fp8T* src = srcPtrs[n];
       if (src == nullptr) continue;
       sum += float(src[j]);
@@ -1002,20 +999,29 @@ __forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16Dynamic(
 
 template <typename T>
 __forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16(
-    T* __restrict__ out, const CombineInternalFp8* const* __restrict__ srcPtrs, int nNodes,
+    T* __restrict__ out, const CombineInternalFp8* const* __restrict__ srcPtrs, int accumNum,
     int laneId, int hiddenDimSize) {
 #if defined(MORI_FP8_TYPE_OCP_ENABLED) || defined(MORI_FP8_TYPE_FNUZ_ENABLED)
   if constexpr (std::is_same_v<T, hip_bfloat16>) {
-    if (nNodes == 2) {
-      detail::WarpAccumCombineInternalFp8ToBf16Fixed<2>(
-          reinterpret_cast<hip_bfloat16*>(out),
-          reinterpret_cast<const detail::CombineInternalFp8T* const*>(srcPtrs), laneId,
-          hiddenDimSize);
-    } else {
-      detail::WarpAccumCombineInternalFp8ToBf16Dynamic(
-          reinterpret_cast<hip_bfloat16*>(out),
-          reinterpret_cast<const detail::CombineInternalFp8T* const*>(srcPtrs), nNodes, laneId,
-          hiddenDimSize);
+    switch (accumNum) {
+      case 2:
+        detail::WarpAccumCombineInternalFp8ToBf16Fixed<2>(
+            reinterpret_cast<hip_bfloat16*>(out),
+            reinterpret_cast<const detail::CombineInternalFp8T* const*>(srcPtrs), laneId,
+            hiddenDimSize);
+        break;
+      case 8:
+        detail::WarpAccumCombineInternalFp8ToBf16Fixed<8>(
+            reinterpret_cast<hip_bfloat16*>(out),
+            reinterpret_cast<const detail::CombineInternalFp8T* const*>(srcPtrs), laneId,
+            hiddenDimSize);
+        break;
+      default:
+        detail::WarpAccumCombineInternalFp8ToBf16Dynamic(
+            reinterpret_cast<hip_bfloat16*>(out),
+            reinterpret_cast<const detail::CombineInternalFp8T* const*>(srcPtrs), accumNum, laneId,
+            hiddenDimSize);
+        break;
     }
   }
   // Note: when T != hip_bfloat16, this function is a no-op.
