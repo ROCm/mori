@@ -19,11 +19,13 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#pragma once
 
-#include "mori/application/bootstrap/base_bootstrap.hpp"
-#include "mori/application/bootstrap/mpi_bootstrap.hpp"
-#ifdef MORI_ENABLE_TORCH
-#include "mori/application/bootstrap/torch_bootstrap.hpp"
-#endif
-#include "mori/application/bootstrap/socket_bootstrap.hpp"
+// Entry point for the framework-agnostic mori core pybind module.
+// No Torch dependency -- shmem and IO bindings only.
+
+#include "src/pybind/mori_core.hpp"
+
+PYBIND11_MODULE(libmori_core_pybinds, m) {
+  mori::RegisterMoriCoreShmem(m);
+  mori::RegisterMoriCoreIo(m);
+}

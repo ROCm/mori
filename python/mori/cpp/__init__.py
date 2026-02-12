@@ -24,11 +24,32 @@ import sys
 import importlib.util
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
-lib_path = os.path.abspath(os.path.join(cur_dir, "../libmori_pybinds.so"))
+mori_lib_dir = os.path.abspath(os.path.join(cur_dir, ".."))
 
-spec = importlib.util.spec_from_file_location("libmori_pybinds", lib_path)
+_torch_lib = os.path.join(mori_lib_dir, "libmori_pybinds.so")
+_core_lib = os.path.join(mori_lib_dir, "libmori_core_pybinds.so")
+
+if os.path.exists(_torch_lib):
+    # Torch-enabled build: must initialize libtorch before loading
+    import torch  # noqa: F401
+    lib_path = _torch_lib
+    lib_name = "libmori_pybinds"
+elif os.path.exists(_core_lib):
+    # Core-only build: no Torch dependency
+    lib_path = _core_lib
+    lib_name = "libmori_core_pybinds"
+else:
+    raise ImportError(
+        f"Cannot find mori pybind library. Looked for:\n"
+        f"  {_torch_lib}\n"
+        f"  {_core_lib}\n"
+    )
+
+spec = importlib.util.spec_from_file_location(lib_name, lib_path)
 module = importlib.util.module_from_spec(spec)
-sys.modules["libmori_pybinds"] = module
+sys.modules[lib_name] = module
 spec.loader.exec_module(module)
 
-from libmori_pybinds import *
+from importlib import import_module
+_m = import_module(lib_name)
+globals().update({k: getattr(_m, k) for k in dir(_m) if not k.startswith('_')})

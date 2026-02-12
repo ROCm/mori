@@ -639,9 +639,11 @@ int ShmemMpiInit(MPI_Comm mpiComm) {
 
 int ShmemInit() { return ShmemMpiInit(MPI_COMM_WORLD); }
 
+#ifdef MORI_ENABLE_TORCH
 int ShmemTorchProcessGroupInit(const std::string& groupName) {
   return ShmemInit(new application::TorchBootstrapNetwork(groupName));
 }
+#endif
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      Query APIs                                               */

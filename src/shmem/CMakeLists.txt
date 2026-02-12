@@ -8,17 +8,23 @@ else()
   add_library(mori_shmem init.cpp memory.cpp)
 endif()
 
+set_target_properties(mori_shmem PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(mori_shmem PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(mori_shmem PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(
   mori_shmem
-  mori_application
+  mori_application_core
   mori_logging
   MPI::MPI_CXX
   ibverbs
   hip::host
   hip::device
   mlx5)
+
+# Link torch bootstrap only when Torch is enabled
+if(MORI_ENABLE_TORCH)
+  target_link_libraries(mori_shmem mori_application_torch)
+endif()
 
 # Use code object version 5 for compatibility with Triton
 target_compile_options(mori_shmem PUBLIC "-fgpu-rdc" "-mcode-object-version=5")

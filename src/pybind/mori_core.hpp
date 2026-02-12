@@ -21,9 +21,10 @@
 // SOFTWARE.
 #pragma once
 
-#include "mori/application/bootstrap/base_bootstrap.hpp"
-#include "mori/application/bootstrap/mpi_bootstrap.hpp"
-#ifdef MORI_ENABLE_TORCH
-#include "mori/application/bootstrap/torch_bootstrap.hpp"
-#endif
-#include "mori/application/bootstrap/socket_bootstrap.hpp"
+#include <pybind11/pybind11.h>
+
+namespace mori {
+// Framework-agnostic bindings (no Torch dependency)
+void RegisterMoriCoreShmem(pybind11::module_& m);
+void RegisterMoriCoreIo(pybind11::module_& m);
+}  // namespace mori
