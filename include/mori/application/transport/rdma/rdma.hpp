@@ -190,6 +190,8 @@ class RdmaDevice;
 
 std::optional<uint8_t> ReadRdmaServiceLevelEnv();
 std::optional<uint8_t> ReadRdmaTrafficClassEnv();
+std::optional<uint8_t> ReadIoServiceLevelEnv();
+std::optional<uint8_t> ReadIoTrafficClassEnv();
 
 /* -------------------------------------------------------------------------- */
 /*                              RdmaDeviceContext                             */

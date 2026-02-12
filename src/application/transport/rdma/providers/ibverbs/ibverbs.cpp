@@ -133,8 +133,16 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   attr.min_rnr_timer = 12;
   attr.ah_attr.src_path_bits = 0;
   attr.ah_attr.port_num = local.portId;
-  attr.ah_attr.sl = ReadRdmaServiceLevelEnv().value_or(0);
-  std::optional<uint8_t> tc = ReadRdmaTrafficClassEnv();
+  std::optional<uint8_t> sl = ReadIoServiceLevelEnv();
+  if (!sl.has_value()) {
+    sl = ReadRdmaServiceLevelEnv();
+  }
+  attr.ah_attr.sl = sl.value_or(0);
+
+  std::optional<uint8_t> tc = ReadIoTrafficClassEnv();
+  if (!tc.has_value()) {
+    tc = ReadRdmaTrafficClassEnv();
+  }
   if (tc.has_value()) {
     attr.ah_attr.grh.traffic_class = tc.value();
   }

@@ -264,6 +264,10 @@ std::optional<uint8_t> ReadRdmaServiceLevelEnv() { return ReadUint8FromEnvVar("M
 
 std::optional<uint8_t> ReadRdmaTrafficClassEnv() { return ReadUint8FromEnvVar("MORI_RDMA_TC"); }
 
+std::optional<uint8_t> ReadIoServiceLevelEnv() { return ReadUint8FromEnvVar("MORI_IO_SL"); }
+
+std::optional<uint8_t> ReadIoTrafficClassEnv() { return ReadUint8FromEnvVar("MORI_IO_TC"); }
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        RdmaDeviceContext                                       */
 /* ---------------------------------------------------------------------------------------------- */
