@@ -30,7 +30,7 @@
 #include <pybind11/stl.h>
 
 #include "mori/io/io.hpp"
-#include "mori/shmem/shmem_api.hpp"
+#include "mori/shmem/shmem_host_api.hpp"
 
 namespace py = pybind11;
 

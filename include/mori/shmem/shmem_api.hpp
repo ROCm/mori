@@ -19,35 +19,25 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+
+// Full shmem API -- includes host-only APIs plus HIP/MPI-dependent APIs.
+// Must be compiled with hipcc (or a HIP-aware compiler).
+
 #pragma once
 
 #include <mpi.h>
 
-#include <array>
-#include <cstddef>
-#include <cstdint>
+#include <string>
 
 #include "mori/application/application.hpp"
+#include "mori/shmem/shmem_host_api.hpp"
 
 namespace mori {
 namespace shmem {
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                         Initialization                                         */
+/*               Additional initialization APIs (require MPI / application / Torch)               */
 /* ---------------------------------------------------------------------------------------------- */
-#define MORI_SHMEM_UNIQUE_ID_BYTES 128
-using mori_shmem_uniqueid_t = std::array<uint8_t, MORI_SHMEM_UNIQUE_ID_BYTES>;
-
-struct mori_shmem_init_attr_t {
-  int32_t rank;
-  int32_t nranks;
-  mori_shmem_uniqueid_t uid;
-  void* mpi_comm;  // Optional MPI_Comm pointer
-};
-
-// Initialization flags
-constexpr unsigned int MORI_SHMEM_INIT_WITH_MPI_COMM = 0;
-constexpr unsigned int MORI_SHMEM_INIT_WITH_UNIQUEID = 1;
 
 // TODO: provide unified initialize / finalize APIs
 int ShmemInit(application::BootstrapNetwork* bootNet);
@@ -57,21 +47,6 @@ int ShmemMpiInit(MPI_Comm);
 int ShmemTorchProcessGroupInit(const std::string& groupName);
 #endif
 
-// UniqueId-based initialization APIs (nvshmem/rocshmem compatible)
-int ShmemGetUniqueId(mori_shmem_uniqueid_t* uid);
-int ShmemSetAttrUniqueIdArgs(int rank, int nranks, mori_shmem_uniqueid_t* uid,
-                             mori_shmem_init_attr_t* attr);
-int ShmemInitAttr(unsigned int flags, mori_shmem_init_attr_t* attr);
-
-int ShmemFinalize();
-
-int ShmemModuleInit(void* hipModule);
-
-int ShmemMyPe();
-int ShmemNPes();
-
-void ShmemBarrierAll();
-
 enum ShmemTeamType {
   INVALID = -1,
   WORLD = 0,
@@ -79,28 +54,16 @@ enum ShmemTeamType {
   TEAM_NODE = 2,
 };
 
-int ShmemNumQpPerPe();
-
 // TODO: finish team pe api
 // int ShmemTeamMyPe(ShmemTeamType);
 // int ShmemTeamNPes(ShmemTeamType);
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                        Symmetric Memory                                        */
+/*                     APIs that depend on application types (require hipcc)                       */
 /* ---------------------------------------------------------------------------------------------- */
-
-void* ShmemMalloc(size_t size);
-void* ShmemMallocAlign(size_t alignment, size_t size);
-void* ShmemExtMallocWithFlags(size_t size, unsigned int flags);
-void ShmemFree(void*);
 
 // Note: temporary API for testing
 application::SymmMemObjPtr ShmemQueryMemObjPtr(void*);
-
-int ShmemBufferRegister(void* ptr, size_t size);
-int ShmemBufferDeregister(void* ptr, size_t size);
-
-uint64_t ShmemPtrP2p(const uint64_t destPtr, const int myPe, int destPe);
 
 }  // namespace shmem
 }  // namespace mori
