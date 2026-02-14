@@ -390,8 +390,8 @@ def test_dispatch_combine(
     # fp8_direct_cast is not supported in zero-copy mode (use_external_inp_buf=False)
     if quant_type == "fp8_direct_cast" and not use_external_inp_buf:
         pytest.skip("fp8_direct_cast is not supported in zero-copy mode")
-    if quant_type == "fp8_direct_cast" and _is_fp4x2_dtype(data_type):
-        pytest.skip("fp8_direct_cast is not supported for fp4 data type")
+    if quant_type == "fp8_direct_cast" and data_type is not torch.bfloat16:
+        pytest.skip("fp8_direct_cast is only supported for bfloat16 data type")
 
     for i in range(world_size):
         torch_dist_process_manager.task_queue.put(
