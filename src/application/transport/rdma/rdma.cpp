@@ -271,6 +271,7 @@ std::optional<uint8_t> ReadIoTrafficClassEnv() { return ReadUint8FromEnvVar("MOR
 bool ReadIoTrafficClassDisableEnv() {
   std::optional<uint8_t> disable = ReadUint8FromEnvVar("MORI_IO_TC_DISABLE");
   return disable.has_value() && disable.value() == 1;
+}
 
 bool ReadIbEnableRelaxedOrderingEnv() {
   std::optional<uint8_t> enable = ReadUint8FromEnvVar("MORI_IB_ENABLE_RELAXED_ORDERING");
