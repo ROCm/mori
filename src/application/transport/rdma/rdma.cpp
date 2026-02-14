@@ -271,6 +271,19 @@ std::optional<uint8_t> ReadIoTrafficClassEnv() { return ReadUint8FromEnvVar("MOR
 bool ReadIoTrafficClassDisableEnv() {
   std::optional<uint8_t> disable = ReadUint8FromEnvVar("MORI_IO_TC_DISABLE");
   return disable.has_value() && disable.value() == 1;
+
+bool ReadIbEnableRelaxedOrderingEnv() {
+  std::optional<uint8_t> enable = ReadUint8FromEnvVar("MORI_IB_ENABLE_RELAXED_ORDERING");
+  return enable.has_value() && enable.value() == 1;
+}
+
+int MaybeAddRelaxedOrderingFlag(int accessFlag) {
+#ifdef IBV_ACCESS_RELAXED_ORDERING
+  if (ReadIbEnableRelaxedOrderingEnv()) {
+    return accessFlag | IBV_ACCESS_RELAXED_ORDERING;
+  }
+#endif
+  return accessFlag;
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -296,11 +309,12 @@ ibv_context* RdmaDeviceContext::GetIbvContext() { return GetRdmaDevice()->defaul
 
 application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegion(void* ptr, size_t size,
                                                                           int accessFlag) {
-  ibv_mr* mr = ibv_reg_mr(pd, ptr, size, accessFlag);
+  int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
+  ibv_mr* mr = ibv_reg_mr(pd, ptr, size, effectiveAccessFlag);
   if (!mr) {
     MORI_APP_ERROR(
         "RegisterRdmaMemoryRegion failed! addr:{}, size:{}, accessFlag:{}, errno:{} ({})", ptr,
-        size, accessFlag, errno, strerror(errno));
+        size, effectiveAccessFlag, errno, strerror(errno));
     std::abort();
   }
   MORI_APP_TRACE("RegisterRdmaMemoryRegion, addr:{}, size:{}, lkey:{}, rkey:{}\n", ptr, size,
@@ -318,13 +332,15 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(
                                                                                 size_t size,
                                                                                 int dmabuf_fd,
                                                                                 int accessFlag) {
+  int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
   ibv_mr* mr =
-      ibv_reg_dmabuf_mr(pd, 0, size, reinterpret_cast<uint64_t>(ptr), dmabuf_fd, accessFlag);
+      ibv_reg_dmabuf_mr(pd, 0, size, reinterpret_cast<uint64_t>(ptr), dmabuf_fd,
+                        effectiveAccessFlag);
   if (!mr) {
     MORI_APP_ERROR(
         "RegisterRdmaMemoryRegionDmabuf failed! addr:{}, size:{}, dmabuf_fd:{}, accessFlag:{}, "
         "errno:{} ({})",
-        ptr, size, dmabuf_fd, accessFlag, errno, strerror(errno));
+        ptr, size, dmabuf_fd, effectiveAccessFlag, errno, strerror(errno));
     std::abort();
   }
   MORI_APP_TRACE(

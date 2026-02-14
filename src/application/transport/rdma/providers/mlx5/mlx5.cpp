@@ -237,9 +237,11 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   }
 
   // Register atomic ibuf as independent memory region
+  int atomicIbufAccessFlag =
+      MaybeAddRelaxedOrderingFlag(IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                                  IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
   atomicIbufMr = ibv_reg_mr(device_context->GetIbvPd(), atomicIbufAddr, atomicIbufSize,
-                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-                                IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+                            atomicIbufAccessFlag);
   assert(atomicIbufMr);
 
   MORI_APP_TRACE(

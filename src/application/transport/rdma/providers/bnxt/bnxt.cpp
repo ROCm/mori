@@ -286,9 +286,10 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   }
 
   // Register atomic ibuf as independent memory region
-  atomicIbufMr = ibv_reg_mr(pd, atomicIbufAddr, atomicIbufSize,
-                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-                                IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+  int atomicIbufAccessFlag =
+      MaybeAddRelaxedOrderingFlag(IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                                  IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+  atomicIbufMr = ibv_reg_mr(pd, atomicIbufAddr, atomicIbufSize, atomicIbufAccessFlag);
   assert(atomicIbufMr);
 
   MORI_APP_TRACE(
