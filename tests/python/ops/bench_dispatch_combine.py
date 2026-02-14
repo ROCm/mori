@@ -359,7 +359,15 @@ def _bench_dispatch_combine(
     num_experts_per_token,
     cmd="bench",
     zero_copy=1,
+    quant_type="none",
+    dispatch_block_num_arg=None,
+    dispatch_warp_per_block_arg=None,
+    combine_block_num_arg=None,
+    combine_warp_per_block_arg=None,
 ):
+    if quant_type == "fp8_direct_cast" and data_type is not torch.bfloat16:
+        raise ValueError("fp8_direct_cast is only supported for bfloat16 data type")
+
     config = mori.ops.EpDispatchCombineConfig(
         data_type=data_type,
         rank=rank,
@@ -375,12 +383,12 @@ def _bench_dispatch_combine(
         block_num=80,
         use_external_inp_buf=not zero_copy,  # zero-copy mode requires use_external_inp_buf=False
         gpu_per_node=8,
+        quant_type=quant_type,
     )
-    benchmark = EpDispatchCombineBenchmark(config)
-
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         mori.shmem.shmem_torch_process_group_init("default")
         op = mori.ops.EpDispatchCombineOp(config)
+        benchmark = EpDispatchCombineBenchmark(config)
 
         # High bandwidth configuration
         if max_num_inp_token_per_rank > 1024:
@@ -401,6 +409,16 @@ def _bench_dispatch_combine(
             else:
                 combine_block_num = 64
                 combine_warp_per_block = 16
+
+        if cmd != "tuning":
+            if dispatch_block_num_arg is not None:
+                dispatch_block_num = dispatch_block_num_arg
+            if dispatch_warp_per_block_arg is not None:
+                dispatch_warp_per_block = dispatch_warp_per_block_arg
+            if combine_block_num_arg is not None:
+                combine_block_num = combine_block_num_arg
+            if combine_warp_per_block_arg is not None:
+                combine_warp_per_block = combine_warp_per_block_arg
 
         if cmd == "bench":
             if rank == 0:
@@ -441,14 +459,45 @@ def _bench_dispatch_combine(
             # )
 
         elif cmd == "tuning":
+            if rank == 0 and any(
+                x is not None
+                for x in (
+                    dispatch_block_num_arg,
+                    dispatch_warp_per_block_arg,
+                    combine_block_num_arg,
+                    combine_warp_per_block_arg,
+                )
+            ):
+                print(
+                    "Warning: dispatch/combine block/warp arguments are ignored when --cmd tuning"
+                )
             # Test different block_num and warp_per_block combinations
-            block_num_list = []
-            # Option 1: Multiples of 8 (excluding powers of 2)
-            block_num_list += [48, 56, 72, 80]
-            # Option 2: Powers of 2 only
-            block_num_list += [16, 32, 64]
-            # Option 3: Other values
-            block_num_list += [78]
+            sm_count = torch.cuda.get_device_properties(rank).multi_processor_count
+            # Sweep up to current GPU SM count.
+            max_block_num = sm_count
+            block_num_set = set()
+
+            # Option 1: Multiples of 8.
+            block_num_set.update(range(32, max_block_num + 1, 8))
+
+            # Option 2: Powers of 2.
+            pow2 = 32
+            while pow2 <= max_block_num:
+                block_num_set.add(pow2)
+                pow2 <<= 1
+
+            # Option 3: A few nearby non-aligned values around SM count.
+            # for delta in (-8, -4, -2, -1, 0, 1, 2, 4, 8):
+            #     block_num = sm_count + delta
+            #     if 32 <= block_num <= max_block_num:
+            #         block_num_set.add(block_num)
+
+            block_num_list = sorted(block_num_set)
+            if rank == 0:
+                print(
+                    f"Tuning block_num in [32, {max_block_num}] "
+                    f"(SM count={sm_count}), candidates={block_num_list}"
+                )
 
             # warp_per_block_list = list(range(2, 17))
             warp_per_block_list = [2, 4, 5, 6, 8, 10, 12, 14, 15, 16]
@@ -499,7 +548,18 @@ def _bench_dispatch_combine(
             raise ValueError(f"Unknown command: {cmd}")
 
 
-def bench_dispatch_combine(max_num_inp_token_per_rank, dtype, cmd="bench", zero_copy=1):
+def bench_dispatch_combine(
+    max_num_inp_token_per_rank,
+    dtype,
+    hidden_dim=7168,
+    cmd="bench",
+    zero_copy=1,
+    quant_type="none",
+    dispatch_block_num=None,
+    dispatch_warp_per_block=None,
+    combine_block_num=None,
+    combine_warp_per_block=None,
+):
     world_size = 8
     port = get_free_port()
     torch.multiprocessing.spawn(
@@ -509,13 +569,18 @@ def bench_dispatch_combine(max_num_inp_token_per_rank, dtype, cmd="bench", zero_
             port,
             max_num_inp_token_per_rank,
             dtype,
-            7168,  # hidden_dim
+            hidden_dim,
             0,  # scale_dim
             0,  # scale_type_size
             32,  # num_experts_per_rank
             8,  # num_experts_per_token
             cmd,
             zero_copy,
+            quant_type,
+            dispatch_block_num,
+            dispatch_warp_per_block,
+            combine_block_num,
+            combine_warp_per_block,
         ),
         nprocs=world_size,
         join=True,
@@ -526,6 +591,7 @@ _DATA_TYPE_MAP = {
     "bf16": torch.bfloat16,
     "fp8_e4m3_fnuz": torch.float8_e4m3fnuz,
     "fp8_e4m3": torch.float8_e4m3fn,
+    "fp4": torch.float4_e2m1fn_x2,
 }
 
 if __name__ == "__main__":
@@ -542,7 +608,7 @@ if __name__ == "__main__":
         "--dtype",
         type=str,
         default="bf16",
-        choices=["bf16", "fp8_e4m3_fnuz", "fp8_e4m3"],
+        choices=["bf16", "fp8_e4m3_fnuz", "fp8_e4m3", "fp4"],
         help="Data type of dispatch / combine",
     )
     parser.add_argument(
@@ -559,15 +625,63 @@ if __name__ == "__main__":
         choices=[0, 1],
         help="Enable zero-copy mode: 1 (default, enabled) or 0 (disabled). When enabled, sets use_external_inp_buf=False",
     )
+    parser.add_argument(
+        "--quant-type",
+        type=str,
+        default="none",
+        choices=["none", "fp8_direct_cast"],
+        help=(
+            "Quantization method used inside Combine. "
+            "'fp8_direct_cast' is the BF16<->FP8 direct cast path."
+        ),
+    )
+    parser.add_argument(
+        "--dispatch-block-num",
+        type=int,
+        default=None,
+        help="Override dispatch block_num for bench/stress. Ignored when --cmd tuning.",
+    )
+    parser.add_argument(
+        "--dispatch-warp-per-block",
+        type=int,
+        default=None,
+        help="Override dispatch warp_per_block for bench/stress. Ignored when --cmd tuning.",
+    )
+    parser.add_argument(
+        "--combine-block-num",
+        type=int,
+        default=None,
+        help="Override combine block_num for bench/stress. Ignored when --cmd tuning.",
+    )
+    parser.add_argument(
+        "--combine-warp-per-block",
+        type=int,
+        default=None,
+        help="Override combine warp_per_block for bench/stress. Ignored when --cmd tuning.",
+    )
     args = parser.parse_args()
 
     print(
-        f"Running {args.cmd} with max_tokens_per_rank: {args.max_tokens}, dtype: {args.dtype}, zero_copy: {'true' if args.zero_copy else 'false'}"
+        f"Running {args.cmd} with max_tokens_per_rank: {args.max_tokens}, dtype: {args.dtype}, "
+        f"zero_copy: {'true' if args.zero_copy else 'false'}, quant_type: {args.quant_type}, "
+        f"dispatch_block_num: {args.dispatch_block_num}, "
+        f"dispatch_warp_per_block: {args.dispatch_warp_per_block}, "
+        f"combine_block_num: {args.combine_block_num}, "
+        f"combine_warp_per_block: {args.combine_warp_per_block}"
     )
     print("-" * 60)
+    hidden_dim = 7168
+    if _DATA_TYPE_MAP[args.dtype] is torch.float4_e2m1fn_x2:
+        hidden_dim = hidden_dim // 2
     bench_dispatch_combine(
         max_num_inp_token_per_rank=args.max_tokens,
         dtype=_DATA_TYPE_MAP[args.dtype],
+        hidden_dim=hidden_dim,
         cmd=args.cmd,
         zero_copy=args.zero_copy,
+        quant_type=args.quant_type,
+        dispatch_block_num=args.dispatch_block_num,
+        dispatch_warp_per_block=args.dispatch_warp_per_block,
+        combine_block_num=args.combine_block_num,
+        combine_warp_per_block=args.combine_warp_per_block,
     )
