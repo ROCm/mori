@@ -397,10 +397,10 @@ mori_shmem_ptr_p2p(const uint64_t destPtr, const int myPe, int destPe) {
   return mori::shmem::ShmemPtrP2p(destPtr, myPe, destPe);
 }
 
-__device__ __attribute__((visibility("default"))) uint64_t mori_shmem_ptr(const uint64_t destPtr,
-                                                                          int destPe) {
+__device__ __attribute__((visibility("default"))) uint64_t
+mori_shmem_ptr(uint64_t dest, int destPe) {
   int myPe = mori::shmem::ShmemMyPe();
-  return mori::shmem::ShmemPtrP2p(destPtr, myPe, destPe);
+  return mori::shmem::ShmemPtrP2p(dest, myPe, destPe);
 }
 
 }  // extern "C"

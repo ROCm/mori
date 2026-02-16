@@ -249,7 +249,7 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_n_pes();
 __device__ __attribute__((visibility("default"))) uint64_t
 mori_shmem_ptr_p2p(const uint64_t destPtr, const int myPe, int destPe);
 
-__device__ __attribute__((visibility("default"))) uint64_t mori_shmem_ptr(const uint64_t destPtr,
-                                                                          int destPe);
+__device__ __attribute__((visibility("default"))) uint64_t
+mori_shmem_ptr(uint64_t dest, int destPe);
 
 }  // extern "C"

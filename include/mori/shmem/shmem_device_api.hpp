@@ -121,7 +121,6 @@ inline __device__ uint64_t ShmemPtrP2p(const uint64_t destPtr, const int myPe, i
 
   if (localAddrInt < globalGpuStates->heapBaseAddr ||
       localAddrInt >= globalGpuStates->heapEndAddr) {
-    assert(false && "dest addr not in symmetric heap");
     return 0;
   }
 
