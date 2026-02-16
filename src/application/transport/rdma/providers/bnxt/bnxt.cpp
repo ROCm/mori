@@ -25,6 +25,8 @@
 #include <infiniband/verbs.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -75,8 +77,8 @@ namespace application {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          BnxtCqContainer */
 /* ---------------------------------------------------------------------------------------------- */
-BnxtCqContainer::BnxtCqContainer(ibv_context* context, const RdmaEndpointConfig& config)
-    : config(config) {
+BnxtCqContainer::BnxtCqContainer(ibv_context* context, const RdmaEndpointConfig& config, BnxtDeviceContext* device_context)
+    : config(config), device_context(device_context) {
   struct bnxt_re_dv_cq_init_attr cq_attr;
   struct bnxt_re_dv_umem_reg_attr umem_attr;
 
@@ -124,8 +126,13 @@ BnxtCqContainer::~BnxtCqContainer() {
   if (cqUmemAddr) HIP_RUNTIME_CHECK(hipFree(cqUmemAddr));
   if (cqDbrUmemAddr) HIP_RUNTIME_CHECK(hipFree(cqDbrUmemAddr));
   if (cqUmem) bnxt_re_dv_umem_dereg(cqUmem);
-  if (cqUar) {
-    HIP_RUNTIME_CHECK(hipHostUnregister(cqUar));
+  // Note: cqUar is shared with qpUar. Since CQ is destroyed after QP,
+  // this is the correct place to unregister the shared UAR.
+  // Use TryUnregisterUar to avoid double-unregister when multiple endpoints share the same UAR
+  if (cqUar && config.onGpu && device_context) {
+    if (device_context->TryUnregisterUar(cqUar)) {
+      HIP_RUNTIME_CHECK(hipHostUnregister(cqUar));
+    }
   }
   if (cq) bnxt_re_dv_destroy_cq(cq);
 }
@@ -339,11 +346,8 @@ void BnxtQpContainer::DestroyQueuePair() {
       free(qpDbrUmemAddr);
     }
   }
-  if (qpUar) {
-    if (config.onGpu) {
-      HIP_RUNTIME_CHECK(hipHostUnregister(qpUar));
-    }
-  }
+  // Note: qpUar is shared with cqUar and will be unregistered in CQ destructor
+  // Do not call hipHostUnregister here to avoid double unregister
 #ifndef USE_BNXT_DEFAULT_DBR
   if (dbrAttr) {
     int ret = bnxt_re_dv_free_db_region(context, dbrAttr);
@@ -431,16 +435,31 @@ void BnxtQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
 
   int status = bnxt_re_dv_modify_qp(qp, &attr, attr_mask, 0, 0);
   assert(!status);
-  // Use qpId to select UDP sport value from the shared configuration (round-robin)
-  uint16_t selected_udp_sport = GetDeviceContext()->GetUdpSport(qpId);
-  MORI_APP_TRACE("QP {} using UDP sport {} (qpId={}, index={})", qpn, selected_udp_sport, qpId,
-                 qpId % RDMA_UDP_SPORT_ARRAY_SIZE);
-  status = bnxt_re_dv_modify_qp_udp_sport(qp, selected_udp_sport);
-  if (status) {
-    MORI_APP_WARN("Failed to set UDP sport {} for QP {}: error code {}", selected_udp_sport, qpn,
-                  status);
+  
+  // Check environment variable to decide whether to set UDP sport
+  const char* enable_udp_sport = std::getenv("MORI_BNXT_ENABLE_UDP_SPORT");
+  bool should_set_udp_sport = false;
+  if (enable_udp_sport != nullptr) {
+    std::string val(enable_udp_sport);
+    // Convert to lowercase for case-insensitive comparison
+    std::transform(val.begin(), val.end(), val.begin(), ::tolower);
+    should_set_udp_sport = (val == "1" || val == "true" || val == "on");
   }
-  MORI_APP_TRACE("bnxt_re_dv_modify_qp_udp_sport is done, return {}", status);
+  
+  if (should_set_udp_sport) {
+    // Use qpId to select UDP sport value from the shared configuration (round-robin)
+    uint16_t selected_udp_sport = GetDeviceContext()->GetUdpSport(qpId);
+    MORI_APP_TRACE("QP {} using UDP sport {} (qpId={}, index={})", qpn, selected_udp_sport, qpId,
+                   qpId % RDMA_UDP_SPORT_ARRAY_SIZE);
+    status = bnxt_re_dv_modify_qp_udp_sport(qp, selected_udp_sport);
+    if (status) {
+      MORI_APP_WARN("Failed to set UDP sport {} for QP {}: error code {}", selected_udp_sport, qpn,
+                     status);
+    }
+    MORI_APP_TRACE("bnxt_re_dv_modify_qp_udp_sport is done, return {}", status);
+  } else {
+    MORI_APP_TRACE("UDP sport configuration disabled via MORI_BNXT_ENABLE_UDP_SPORT for QP {}", qpn);
+  }
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -469,10 +488,31 @@ BnxtDeviceContext::~BnxtDeviceContext() {
   cqPool.clear();
 }
 
+bool BnxtDeviceContext::TryRegisterUar(void* uar_addr) {
+  std::lock_guard<std::mutex> lock(uarMutex);
+  if (registeredUars.find(uar_addr) != registeredUars.end()) {
+    // Already registered
+    return false;
+  }
+  registeredUars.insert(uar_addr);
+  return true;
+}
+
+bool BnxtDeviceContext::TryUnregisterUar(void* uar_addr) {
+  std::lock_guard<std::mutex> lock(uarMutex);
+  auto it = registeredUars.find(uar_addr);
+  if (it == registeredUars.end()) {
+    // Not registered or already unregistered
+    return false;
+  }
+  registeredUars.erase(it);
+  return true;
+}
+
 RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& config) {
   ibv_context* context = GetIbvContext();
 
-  BnxtCqContainer* cq = new BnxtCqContainer(context, config);
+  BnxtCqContainer* cq = new BnxtCqContainer(context, config, this);
 
   BnxtQpContainer* qp = new BnxtQpContainer(context, config, cq->cq, pd, this);
 
@@ -506,9 +546,11 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
 #endif
   void* uar_dev = uar_host;
   if (config.onGpu) {
-    constexpr uint32_t flag = hipHostRegisterPortable | hipHostRegisterMapped;
-
-    HIP_RUNTIME_CHECK(hipHostRegister(uar_host, getpagesize(), flag));
+    // Only register if not already registered (important for shared UAR in USE_BNXT_DEFAULT_DBR mode)
+    if (TryRegisterUar(uar_host)) {
+      constexpr uint32_t flag = hipHostRegisterPortable | hipHostRegisterMapped;
+      HIP_RUNTIME_CHECK(hipHostRegister(uar_host, getpagesize(), flag));
+    }
     HIP_RUNTIME_CHECK(hipHostGetDevicePointer(&uar_dev, uar_host, 0));
   }
   qp->qpUar = cq->cqUar = uar_host;
