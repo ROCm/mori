@@ -340,40 +340,35 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       }
     }
 
-    int validAccumCount = config.numExpertPerToken;
-    {
-      int isValid = 0;
-      TokT* myTokPtr = nullptr;
-      float* myWtPtr = nullptr;
-      if (laneId < config.numExpertPerToken) {
-        myTokPtr = srcPtrs[laneId];
-        myWtPtr = srcWeightsPtr[laneId];
-        isValid = (myTokPtr != nullptr) ? 1 : 0;
-      }
-      unsigned long long validMask = __ballot(isValid);
-      validAccumCount = __popcll(validMask);
-      if (validAccumCount < config.numExpertPerToken && isValid) {
-        int myPos = __popcll(validMask & ((1ULL << laneId) - 1));
-        srcPtrs[myPos] = myTokPtr;
-        srcWeightsPtr[myPos] = myWtPtr;
-      }
-    }
-
     T* outPtr = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
                 tokenId * config.hiddenDim + hiddenDimOffset;
     if constexpr (!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>) {
-      // accumulate fp8 sources in float, output bf16
+      int validAccumCount = config.numExpertPerToken;
+      {
+        int isValid = 0;
+        TokT* myTokPtr = nullptr;
+        if (laneId < config.numExpertPerToken) {
+          myTokPtr = srcPtrs[laneId];
+          isValid = (myTokPtr != nullptr) ? 1 : 0;
+        }
+        unsigned long long validMask = __ballot(isValid);
+        validAccumCount = __popcll(validMask);
+        if (validAccumCount < config.numExpertPerToken && isValid) {
+          int myPos = __popcll(validMask & ((1ULL << laneId) - 1));
+          srcPtrs[myPos] = myTokPtr;
+        }
+      }
       core::WarpAccumCombineInternalFp8ToBf16(
           outPtr, reinterpret_cast<const TokT* const*>(srcPtrs),
           validAccumCount, laneId, hiddenDimSize);
     } else {
-      core::WarpAccum<T, 4>(outPtr, srcPtrs, nullptr, validAccumCount, hiddenDimSize);
+      core::WarpAccum<T, 4>(outPtr, srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
     }
 
     if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
       core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
                                     tokenId * config.numExpertPerToken,
-                                srcWeightsPtr, nullptr, validAccumCount,
+                                srcWeightsPtr, nullptr, config.numExpertPerToken,
                                 config.numExpertPerToken);
     }
   }

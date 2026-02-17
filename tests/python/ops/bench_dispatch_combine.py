@@ -528,16 +528,6 @@ def _bench_dispatch_combine(
             sm_count = torch.cuda.get_device_properties(rank).multi_processor_count
 
             # Dispatch and Combine must be tuned SEPARATELY:
-            #
-            # - Dispatch kernel: only warp 0 of block 0 spin-waits at the
-            #   grid barrier; all other warps exit after atomicAdd.  So
-            #   block_num can safely exceed SM count (over-subscription).
-            #
-            # - Combine kernel: CrossDeviceBarrierIntraNodeKernel uses
-            #   __syncthreads() after a grid barrier, which requires ALL
-            #   blocks to be co-resident.  block_num MUST NOT exceed the
-            #   GPU's max concurrent blocks, or the kernel DEADLOCKS.
-            #   Safe upper bound: sm_count (1 block per CU is always OK).
 
             # --- Dispatch candidates (can over-subscribe) ---
             max_disp_block_num = max(sm_count * 4, 320)
