@@ -1010,6 +1010,12 @@ __forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16(
             reinterpret_cast<const detail::CombineInternalFp8T* const*>(srcPtrs), laneId,
             hiddenDimSize);
         break;
+      case 4:
+        detail::WarpAccumCombineInternalFp8ToBf16Fixed<4>(
+            reinterpret_cast<hip_bfloat16*>(out),
+            reinterpret_cast<const detail::CombineInternalFp8T* const*>(srcPtrs), laneId,
+            hiddenDimSize);
+        break;
       case 8:
         detail::WarpAccumCombineInternalFp8ToBf16Fixed<8>(
             reinterpret_cast<hip_bfloat16*>(out),

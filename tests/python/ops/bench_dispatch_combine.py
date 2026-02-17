@@ -424,28 +424,44 @@ def _bench_dispatch_combine(
                 combine_block_num = 64
                 combine_warp_per_block = 16
 
-        # EP4 override: anchor on EP8 FP4 known-optimal configs and
-        # adjust.  EP4 combine saturates at P2P BW (~78.5 GB/s for FP4),
-        # so combine uses a moderate block count with wpb=15.
+        # EP4 override: tuned optimal configs for FP4 dispatch + BF16/FP8 combine.
         if world_size <= 4:
             if max_num_inp_token_per_rank > 1024:
-                dispatch_block_num = 256
-                dispatch_warp_per_block = 16
+                dispatch_block_num = 768
+                dispatch_warp_per_block = 8
                 if config.use_external_inp_buf == False:
                     combine_block_num = 72
                     combine_warp_per_block = 4
                 else:
+                    combine_block_num = 256
+                    combine_warp_per_block = 14
+            elif max_num_inp_token_per_rank > 128:
+                dispatch_block_num = 768
+                dispatch_warp_per_block = 8
+                if config.use_external_inp_buf == False:
                     combine_block_num = 72
-                    combine_warp_per_block = 15
+                    combine_warp_per_block = 4
+                else:
+                    combine_block_num = 256
+                    combine_warp_per_block = 14
+            elif max_num_inp_token_per_rank > 64:
+                dispatch_block_num = 216
+                dispatch_warp_per_block = 6
+                if config.use_external_inp_buf == False:
+                    combine_block_num = 72
+                    combine_warp_per_block = 4
+                else:
+                    combine_block_num = 224
+                    combine_warp_per_block = 8
             else:
-                dispatch_block_num = 225
-                dispatch_warp_per_block = 5
+                dispatch_block_num = 223
+                dispatch_warp_per_block = 6
                 if config.use_external_inp_buf == False:
                     combine_block_num = 72
                     combine_warp_per_block = 4
                 else:
-                    combine_block_num = 72
-                    combine_warp_per_block = 15
+                    combine_block_num = 224
+                    combine_warp_per_block = 4
 
         if cmd != "tuning":
             if dispatch_block_num_arg is not None:

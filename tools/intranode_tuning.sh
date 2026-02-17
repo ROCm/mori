@@ -32,6 +32,8 @@ CMD=tuning
 DTYPE=fp4
 COMBINE_DTYPE=bf16
 COMBINE_QUANT_TYPE=fp8_direct_cast
+GPUS=""
+SHMEM_MODE=""
 
 # ---- Parse args to extract values for log naming ----
 EXTRA_ARGS=()
@@ -44,9 +46,21 @@ while [[ $# -gt 0 ]]; do
         --dtype)            DTYPE="$2";             shift 2 ;;
         --combine-dtype)    COMBINE_DTYPE="$2";     shift 2 ;;
         --combine-quant-type) COMBINE_QUANT_TYPE="$2"; shift 2 ;;
+        --gpus)             GPUS="$2";              shift 2 ;;
+        --shmem-mode)       SHMEM_MODE="$2";        shift 2 ;;
         *)                  EXTRA_ARGS+=("$1");     shift ;;
     esac
 done
+
+# ---- GPU visibility ----
+if [[ -n "$GPUS" ]]; then
+    export HIP_VISIBLE_DEVICES="$GPUS"
+fi
+
+# ---- Shared memory mode ----
+if [[ -n "$SHMEM_MODE" ]]; then
+    export MORI_SHMEM_MODE="$SHMEM_MODE"
+fi
 
 # ---- Build log filename ----
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
@@ -62,7 +76,12 @@ if [[ -n "$COMBINE_QUANT_TYPE" && "$COMBINE_QUANT_TYPE" != "none" ]]; then
     DTYPE_TAG="${DTYPE_TAG}_${COMBINE_QUANT_TYPE}"
 fi
 
-LOG_FILE="${LOG_DIR}/ep${WORLD_SIZE}_${DTYPE_TAG}_${MAX_TOKENS}tok_${ZC_TAG}_${CMD}_${TIMESTAMP}.log"
+SHMEM_TAG=""
+if [[ -n "$SHMEM_MODE" ]]; then
+    SHMEM_TAG="_${SHMEM_MODE}"
+fi
+
+LOG_FILE="${LOG_DIR}/ep${WORLD_SIZE}_${DTYPE_TAG}_${MAX_TOKENS}tok_${ZC_TAG}${SHMEM_TAG}_${CMD}_${TIMESTAMP}.log"
 
 # ---- Build python command ----
 PY_ARGS=(
@@ -93,6 +112,8 @@ echo "  cmd:                 $CMD"
 echo "  dtype:               $DTYPE"
 echo "  combine_dtype:       ${COMBINE_DTYPE:-same as dtype}"
 echo "  combine_quant_type:  ${COMBINE_QUANT_TYPE:-none}"
+echo "  gpus:                ${GPUS:-all}"
+echo "  shmem_mode:          ${SHMEM_MODE:-default}"
 echo "  log:                 $LOG_FILE"
 echo "  extra args:          ${EXTRA_ARGS[*]+"${EXTRA_ARGS[*]}"}"
 echo "============================================================"

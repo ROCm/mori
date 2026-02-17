@@ -46,11 +46,12 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
   int warpNum = blockDim.x / warpSize;
   int globalWarpNum = gridDim.x * warpNum;
 
-  if (laneId == 0) atomicAdd(args.combineGridBarrier, 1);
+  __syncthreads();
+  if (thdId == 0) atomicAdd(args.combineGridBarrier, 1);
 
   if (globalThdId < args.config.worldSize) {
     // Set remote flag after all copies are done
-    shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
+    shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, gridDim.x);
     args.combineGridBarrier[0] = 0;
 
     __threadfence_system();
@@ -154,13 +155,14 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
                      args.inpTokenBuf + srcTokOffset, config.hiddenDim);
     }
   }
-  if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
+  __syncthreads();
+  if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
   // Send token num & token to expert mapping to other ranks
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       // Wait until all tokens are sent
-      shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
+      shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, gridDim.x);
       args.dispatchGridBarrier[0] = 0;
 
       // Add 1 so that when token number == 0, receiver side still know the signal is sent
@@ -337,21 +339,41 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
         srcWeightsPtr[j] = nullptr;
       }
     }
+
+    int validAccumCount = config.numExpertPerToken;
+    {
+      int isValid = 0;
+      TokT* myTokPtr = nullptr;
+      float* myWtPtr = nullptr;
+      if (laneId < config.numExpertPerToken) {
+        myTokPtr = srcPtrs[laneId];
+        myWtPtr = srcWeightsPtr[laneId];
+        isValid = (myTokPtr != nullptr) ? 1 : 0;
+      }
+      unsigned long long validMask = __ballot(isValid);
+      validAccumCount = __popcll(validMask);
+      if (validAccumCount < config.numExpertPerToken && isValid) {
+        int myPos = __popcll(validMask & ((1ULL << laneId) - 1));
+        srcPtrs[myPos] = myTokPtr;
+        srcWeightsPtr[myPos] = myWtPtr;
+      }
+    }
+
     T* outPtr = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
                 tokenId * config.hiddenDim + hiddenDimOffset;
     if constexpr (!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>) {
       // accumulate fp8 sources in float, output bf16
       core::WarpAccumCombineInternalFp8ToBf16(
           outPtr, reinterpret_cast<const TokT* const*>(srcPtrs),
-          config.numExpertPerToken, laneId, hiddenDimSize);
+          validAccumCount, laneId, hiddenDimSize);
     } else {
-      core::WarpAccum<T, 4>(outPtr, srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
+      core::WarpAccum<T, 4>(outPtr, srcPtrs, nullptr, validAccumCount, hiddenDimSize);
     }
 
     if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
       core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
                                     tokenId * config.numExpertPerToken,
-                                srcWeightsPtr, nullptr, config.numExpertPerToken,
+                                srcWeightsPtr, nullptr, validAccumCount,
                                 config.numExpertPerToken);
     }
   }
