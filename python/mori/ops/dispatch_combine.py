@@ -185,8 +185,12 @@ class EpDispatchCombineOp:
                 f"invalid MORI_EP_LAUNCH_CONFIG_MODE, must be ['MANUAL', 'AUTO'], got '{self.launch_config_mode}'"
             )
 
-    def get_registered_combine_input_buffer(self, dtype: torch.dtype):
-        return self._get_registered_combine_input_buffer(self._handle, dtype)
+    def get_registered_combine_input_buffer(
+        self, dtype: torch.dtype, hidden_dim: int = -1
+    ):
+        return self._get_registered_combine_input_buffer(
+            self._handle, dtype, hidden_dim
+        )
 
     def dispatch(
         self,
