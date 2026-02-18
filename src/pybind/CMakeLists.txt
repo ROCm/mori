@@ -39,7 +39,8 @@ target_include_directories(
     mori_core_pybinds
     mori_ops
     mori_io
-    hip::host)
+    hip::host
+    hip::device)
 
 if(ENABLE_PROFILER)
   target_sources(mori_pybinds PRIVATE ${PROFILER_OUTPUT_PYBIND})
@@ -55,11 +56,8 @@ if(ENABLE_TORCH)
           ${TORCH_INCLUDE_DIRS})
   target_link_libraries(
     mori_pybinds
-    mori_core_pybinds
     mori_ops
-    mori_io
-    hip::host
-    hip::device)
+    mori_io)
 
   target_link_directories(mori_pybinds PUBLIC ${TORCH_INSTALL_PREFIX}/lib)
   target_link_libraries(mori_pybinds ${TORCH_LIBRARIES} torch_python)
