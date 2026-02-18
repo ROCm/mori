@@ -19,8 +19,9 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "src/pybind/mori.hpp"
+#include "src/pybind/mori_core.hpp"
 
-PYBIND11_MODULE(libmori_pybinds, m) {
-  mori::RegisterMoriOps(m);
+PYBIND11_MODULE(libmori_core_pybinds, m) {
+  mori::RegisterMoriShmem(m);
+  mori::RegisterMoriIo(m);
 }

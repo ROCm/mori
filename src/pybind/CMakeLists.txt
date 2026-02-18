@@ -31,27 +31,38 @@ set(PYTHON_LIBRARIES ${Python_LIBRARIES})
 message(STATUS "Python include dirs: ${PYTHON_INCLUDE_DIRS}")
 message(STATUS "Python libraries: ${PYTHON_LIBRARIES}")
 
-add_library(mori_pybinds SHARED mori.cpp pybind.cpp)
+add_library(mori_core_pybinds SHARED mori_core.cpp pybind_core.cpp)
+
+target_include_directories(
+    mori_core_pybinds PUBLIC ${PYTHON_INCLUDE_DIRS} ${CMAKE_BINARY_DIR}/generated/include)
+  target_link_libraries(
+    mori_core_pybinds
+    mori_ops
+    mori_io
+    hip::host)
 
 if(ENABLE_PROFILER)
   target_sources(mori_pybinds PRIVATE ${PROFILER_OUTPUT_PYBIND})
   add_dependencies(mori_pybinds generate_profiler_bindings)
 endif()
 
-target_include_directories(
-  mori_pybinds PUBLIC ${PYTHON_INCLUDE_DIRS} ${CMAKE_BINARY_DIR}/generated/include)
-target_link_libraries(
-  mori_pybinds
-  mori_ops
-  mori_io
-  hip::host
-  hip::device)
-
 if(ENABLE_TORCH)
+  add_library(mori_pybinds SHARED mori.cpp pybind.cpp)
+
   target_include_directories(
-    mori_pybinds PUBLIC ${TORCH_INCLUDE_DIRS})
+    mori_pybinds PUBLIC ${PYTHON_INCLUDE_DIRS} 
+          ${CMAKE_BINARY_DIR}/generated/include
+          ${TORCH_INCLUDE_DIRS})
+  target_link_libraries(
+    mori_pybinds
+    mori_core_pybinds
+    mori_ops
+    mori_io
+    hip::host
+    hip::device)
+
   target_link_directories(mori_pybinds PUBLIC ${TORCH_INSTALL_PREFIX}/lib)
-  target_link_libraries(${TORCH_LIBRARIES} torch_python)
+  target_link_libraries(mori_pybinds ${TORCH_LIBRARIES} torch_python)
   # For python packages to find dependent libraries
   set_target_properties(
     mori_pybinds
