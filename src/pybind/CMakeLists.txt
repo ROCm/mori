@@ -1,4 +1,6 @@
-find_package(Torch REQUIRED)
+if (ENABLE_TORCH)
+  find_package(Torch REQUIRED)
+endif()
 
 # You can set PYTHON_EXECUTABLE via command line: -DPYTHON_EXECUTABLE=/path/to/python
 if(NOT DEFINED PYTHON_EXECUTABLE)
@@ -29,29 +31,56 @@ set(PYTHON_LIBRARIES ${Python_LIBRARIES})
 message(STATUS "Python include dirs: ${PYTHON_INCLUDE_DIRS}")
 message(STATUS "Python libraries: ${PYTHON_LIBRARIES}")
 
-add_library(mori_pybinds SHARED mori.cpp pybind.cpp)
-
-if(ENABLE_PROFILER)
-  target_sources(mori_pybinds PRIVATE ${PROFILER_OUTPUT_PYBIND})
-  add_dependencies(mori_pybinds generate_profiler_bindings)
+# Find pybind11 include directory (needed for core pybinds without Torch)
+execute_process(
+  COMMAND ${PYTHON_EXECUTABLE} -c "import pybind11; print(pybind11.get_include())"
+  OUTPUT_VARIABLE PYBIND11_INCLUDE_DIR
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+  RESULT_VARIABLE PYBIND11_FIND_RESULT
+)
+if(NOT PYBIND11_FIND_RESULT EQUAL 0)
+message(FATAL_ERROR "pybind11 package not found; cannot build core pybinds. "
+      "Please install pybind11 into the Python environment at ${PYTHON_EXECUTABLE}.")
 endif()
+message(STATUS "pybind11 include dir: ${PYBIND11_INCLUDE_DIR}")
+
+add_library(mori_core_pybinds SHARED mori_core.cpp pybind_core.cpp)
 
 target_include_directories(
-  mori_pybinds PUBLIC ${PYTHON_INCLUDE_DIRS} ${TORCH_INCLUDE_DIRS}
-                      ${CMAKE_BINARY_DIR}/generated/include)
-target_link_directories(mori_pybinds PUBLIC ${TORCH_INSTALL_PREFIX}/lib)
-target_link_libraries(
-  mori_pybinds
-  mori_ops
-  mori_io
-  ${TORCH_LIBRARIES}
-  torch_python
-  hip::host
-  hip::device)
+    mori_core_pybinds PUBLIC 
+    ${PYTHON_INCLUDE_DIRS} ${PYBIND11_INCLUDE_DIR} 
+    ${CMAKE_BINARY_DIR}/generated/include)
+  target_link_libraries(
+    mori_core_pybinds
+    mori_ops
+    mori_io
+    hip::host
+    hip::device)
 
-# For python packages to find dependent libraries
-set_target_properties(
-  mori_pybinds
-  PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/../torch/lib"
+if(ENABLE_TORCH)
+  add_library(mori_pybinds SHARED mori.cpp pybind.cpp)
+
+  target_include_directories(
+    mori_pybinds PUBLIC ${PYTHON_INCLUDE_DIRS} 
+          ${CMAKE_BINARY_DIR}/generated/include
+          ${TORCH_INCLUDE_DIRS})
+  target_link_libraries(
+    mori_pybinds
+    mori_ops
+    mori_io)
+
+  if(ENABLE_PROFILER)
+    target_sources(mori_pybinds PRIVATE ${PROFILER_OUTPUT_PYBIND})
+    add_dependencies(mori_pybinds generate_profiler_bindings)
+  endif()
+
+  target_link_directories(mori_pybinds PUBLIC ${TORCH_INSTALL_PREFIX}/lib)
+  target_link_libraries(mori_pybinds ${TORCH_LIBRARIES} torch_python)
+  # For python packages to find dependent libraries
+  set_target_properties(
+    mori_pybinds
+    PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/../torch/lib"
              INSTALL_RPATH "$ORIGIN;$ORIGIN/../torch/lib"
              BUILD_WITH_INSTALL_RPATH TRUE)
+endif()
