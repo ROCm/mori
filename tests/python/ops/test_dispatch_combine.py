@@ -127,7 +127,7 @@ class EpDispatchCombineTestCase:
                     generator=self.rng,
                     device=self.device,
                 )
-                all_rank_input.append(fp4_bytes.view(TORCH_FLOAT4_E2M1FN_X2))
+                all_rank_input.append(fp4_bytes.view(torch.float4_e2m1fn_x2))
             else:
                 all_rank_input.append(input_fp32.to(self.config.data_type))
 

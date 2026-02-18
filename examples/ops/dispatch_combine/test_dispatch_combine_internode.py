@@ -29,11 +29,6 @@ import time
 from tqdm import tqdm
 
 os.environ["MORI_SHMEM_HEAP_SIZE"] = "6G"
-TORCH_FLOAT4_E2M1FN_X2 = getattr(torch, "float4_e2m1fn_x2", None)
-
-
-def _is_fp4x2_dtype(dtype):
-    return TORCH_FLOAT4_E2M1FN_X2 is not None and dtype is TORCH_FLOAT4_E2M1FN_X2
 
 kernel_type_map = {
     "v0": mori.ops.EpDispatchCombineKernelType.InterNode,
@@ -63,7 +58,9 @@ class EpDispatchCombineTestCase:
             data_type=dtype,
             rank=self.rank,
             world_size=self.world_size,
-            hidden_dim=(hidden_dim // 2 if _is_fp4x2_dtype(dtype) else hidden_dim),
+            hidden_dim=(
+                hidden_dim // 2 if dtype is torch.float4_e2m1fn_x2 else hidden_dim
+            ),
             scale_dim=32,
             scale_type_size=4,
             max_num_inp_token_per_rank=(max_tokens + 63) // 64 * 64,
@@ -224,7 +221,7 @@ class EpDispatchCombineTestCase:
                 generator=self.rng,
                 device=self.device,
             )
-            if _is_fp4x2_dtype(self.config.data_type):
+            if self.config.data_type is torch.float4_e2m1fn_x2:
                 data = torch.randint(
                     0,
                     256,
@@ -233,7 +230,7 @@ class EpDispatchCombineTestCase:
                     generator=self.rng,
                     device=self.device,
                 )
-                data = data.view(TORCH_FLOAT4_E2M1FN_X2)
+                data = data.view(torch.float4_e2m1fn_x2)
             else:
                 data = data_fp32.to(self.config.data_type)
             all_rank_input.append(data)
@@ -354,7 +351,7 @@ class EpDispatchCombineTestCase:
         for i, src_token_id in enumerate(src_token_pos):
             src_pe = src_token_id // max_num_token_to_send_per_rank
             src_tok_id = src_token_id % max_num_token_to_send_per_rank
-            if _is_fp4x2_dtype(self.config.data_type):
+            if self.config.data_type is torch.float4_e2m1fn_x2:
                 is_pass = torch.equal(
                     dispatch_output[i].view(torch.uint8),
                     all_rank_input[src_pe][src_tok_id].view(torch.uint8),
@@ -390,7 +387,7 @@ class EpDispatchCombineTestCase:
 
         torch.cuda.synchronize()
         for i in range(all_rank_num_token[self.rank]):
-            if _is_fp4x2_dtype(self.config.data_type):
+            if self.config.data_type is torch.float4_e2m1fn_x2:
                 continue
             pes = [
                 (idx // self.config.num_experts_per_rank)
@@ -1024,9 +1021,8 @@ _DATA_TYPE_MAP = {
     "bf16": torch.bfloat16,
     "fp8_e4m3_fnuz": torch.float8_e4m3fnuz,
     "fp8_e4m3": torch.float8_e4m3fn,
+    "fp4": torch.float4_e2m1fn_x2,
 }
-if TORCH_FLOAT4_E2M1FN_X2 is not None:
-    _DATA_TYPE_MAP["fp4"] = TORCH_FLOAT4_E2M1FN_X2
 
 
 parser = argparse.ArgumentParser(description="dispatch/combine internode test")
@@ -1087,8 +1083,6 @@ if __name__ == "__main__":
     num_node = int(os.environ["WORLD_SIZE"])
 
     world_size = num_node * gpu_per_node
-    if args_cli.dtype == "fp4" and TORCH_FLOAT4_E2M1FN_X2 is None:
-        raise RuntimeError("torch.float4_e2m1fn_x2 is not available in this torch build")
     torch.multiprocessing.spawn(
         test_dispatch_combine,
         args=(

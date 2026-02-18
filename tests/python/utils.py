@@ -27,8 +27,6 @@ from multiprocessing import Queue
 import mori
 import traceback
 
-TORCH_FLOAT4_E2M1FN_X2 = getattr(torch, "float4_e2m1fn_x2", None)
-
 
 str_to_dtype = {
     "float32": torch.float32,
@@ -70,7 +68,7 @@ def data_type_supported(dtype):
         return arch_int == 94
     if dtype is torch.float8_e4m3fn:
         return arch_int >= 95
-    if TORCH_FLOAT4_E2M1FN_X2 is not None and dtype is TORCH_FLOAT4_E2M1FN_X2:
+    if dtype is torch.float4_e2m1fn_x2:
         return arch_int >= 95
     return True
 
