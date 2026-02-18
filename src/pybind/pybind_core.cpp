@@ -19,13 +19,9 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#pragma once
+#include "src/pybind/mori_core.hpp"
 
-#include "mori/application/bootstrap/base_bootstrap.hpp"
-#ifdef ENABLE_MPI
-#include "mori/application/bootstrap/mpi_bootstrap.hpp"
-#endif
-#ifdef ENABLE_TORCH
-#include "mori/application/bootstrap/torch_bootstrap.hpp"
-#endif
-#include "mori/application/bootstrap/socket_bootstrap.hpp"
+PYBIND11_MODULE(libmori_core_pybinds, m) {
+  mori::RegisterMoriShmem(m);
+  mori::RegisterMoriIo(m);
+}
