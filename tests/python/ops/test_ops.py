@@ -25,10 +25,23 @@ import mori
 
 from tests.python.utils import fp4_x2_to_fp32
 
+TORCH_FLOAT4_E2M1FN_X2 = getattr(torch, "float4_e2m1fn_x2", None)
+
 
 @pytest.mark.parametrize("nelems", (32,))
 @pytest.mark.parametrize("input_type", (torch.float,))
-@pytest.mark.parametrize("output_type", (torch.float4_e2m1fn_x2,))
+@pytest.mark.parametrize(
+    "output_type",
+    (
+        pytest.param(
+            TORCH_FLOAT4_E2M1FN_X2,
+            marks=pytest.mark.skipif(
+                TORCH_FLOAT4_E2M1FN_X2 is None,
+                reason="Skip float4_e2m1fn_x2, it is not available in this torch build",
+            ),
+        ),
+    ),
+)
 def test_cast(
     nelems,
     input_type,

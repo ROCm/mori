@@ -21,10 +21,14 @@
 // SOFTWARE.
 #pragma once
 
-#include <hip/hip_ext_ocp.h>
 #include <hip/hip_fp8.h>
 
+#if defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1 && \
+    __has_include(<hip/hip_ext_ocp.h>) && __has_include(<hip/amd_detail/amd_hip_ocp_host.hpp>)
+#include <hip/hip_ext_ocp.h>
 #include <hip/amd_detail/amd_hip_ocp_host.hpp>
+#define MORI_FP8_TYPE_OCP_ENABLED
+#endif
 
 namespace mori {
 
@@ -32,10 +36,7 @@ namespace mori {
 #define MORI_FP8_TYPE_FNUZ_ENABLED
 #endif
 
-#if defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1
-#define MORI_FP8_TYPE_OCP_ENABLED
-#endif
-
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
 /* ---------------------------------------------------------------------------------------------- */
 /*                                               FP4                                              */
 /* ---------------------------------------------------------------------------------------------- */
@@ -218,5 +219,12 @@ struct mori_fp4x4_e2m1 {
     return float4(fp32x2_1[0], fp32x2_1[1], fp32x2_2[0], fp32x2_2[1]);
   }
 };
+#endif
+
+#ifndef MORI_FP8_TYPE_OCP_ENABLED
+struct mori_fp4_e2m1;
+struct mori_fp4x2_e2m1;
+struct mori_fp4x4_e2m1;
+#endif
 
 }  // namespace mori

@@ -27,6 +27,13 @@ import torch.distributed as dist
 import os
 
 os.environ["MORI_SHMEM_HEAP_SIZE"] = "6G"
+TORCH_FLOAT4_E2M1FN_X2 = getattr(torch, "float4_e2m1fn_x2", None)
+
+
+def _is_fp4x2_dtype(dtype):
+    return TORCH_FLOAT4_E2M1FN_X2 is not None and dtype is TORCH_FLOAT4_E2M1FN_X2
+
+
 class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
     def __init__(self, config):
         super().__init__(config)
@@ -744,8 +751,9 @@ _DATA_TYPE_MAP = {
     "bf16": torch.bfloat16,
     "fp8_e4m3_fnuz": torch.float8_e4m3fnuz,
     "fp8_e4m3": torch.float8_e4m3fn,
-    "fp4": torch.float4_e2m1fn_x2,
 }
+if TORCH_FLOAT4_E2M1FN_X2 is not None:
+    _DATA_TYPE_MAP["fp4"] = TORCH_FLOAT4_E2M1FN_X2
 
 if __name__ == "__main__":
     import argparse
@@ -849,12 +857,17 @@ if __name__ == "__main__":
     # Resolve combine dtype: default to same as dispatch
     combine_dtype_str = args.combine_dtype if args.combine_dtype else args.dtype
 
+    if args.dtype == "fp4" and TORCH_FLOAT4_E2M1FN_X2 is None:
+        raise RuntimeError("torch.float4_e2m1fn_x2 is not available in this torch build")
+    if combine_dtype_str == "fp4" and TORCH_FLOAT4_E2M1FN_X2 is None:
+        raise RuntimeError("torch.float4_e2m1fn_x2 is not available in this torch build")
+
     dispatch_dtype = _DATA_TYPE_MAP[args.dtype]
     combine_dtype = _DATA_TYPE_MAP[combine_dtype_str]
 
     base_hidden_dim = 7168
-    dispatch_hidden_dim = base_hidden_dim // 2 if dispatch_dtype is torch.float4_e2m1fn_x2 else base_hidden_dim
-    combine_hidden_dim = base_hidden_dim // 2 if combine_dtype is torch.float4_e2m1fn_x2 else base_hidden_dim
+    dispatch_hidden_dim = base_hidden_dim // 2 if _is_fp4x2_dtype(dispatch_dtype) else base_hidden_dim
+    combine_hidden_dim = base_hidden_dim // 2 if _is_fp4x2_dtype(combine_dtype) else base_hidden_dim
 
     print(
         f"Running {args.cmd} with max_tokens_per_rank: {args.max_tokens}, "

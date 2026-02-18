@@ -27,10 +27,11 @@ import torch
 import torch.distributed as dist
 
 os.environ["MORI_SHMEM_HEAP_SIZE"] = "6G"
+TORCH_FLOAT4_E2M1FN_X2 = getattr(torch, "float4_e2m1fn_x2", None)
 
 
 def _is_fp4x2_dtype(dtype):
-    return dtype is torch.float4_e2m1fn_x2
+    return TORCH_FLOAT4_E2M1FN_X2 is not None and dtype is TORCH_FLOAT4_E2M1FN_X2
 
 
 class EpDispatchCombineTestCase:
@@ -195,7 +196,7 @@ class EpDispatchCombineTestCase:
                 generator=self.rng,
                 device=self.device,
             )
-            input = input_bytes.view(torch.float4_e2m1fn_x2)
+            input = input_bytes.view(TORCH_FLOAT4_E2M1FN_X2)
         else:
             input = input_fp32.to(self.config.data_type)
 
@@ -371,10 +372,14 @@ if __name__ == "__main__":
 
     _DATA_TYPE_MAP = {
         "bf16": torch.bfloat16,
-        "fp4": torch.float4_e2m1fn_x2,
     }
-    if args.quant_type == "fp8_direct_cast" and _DATA_TYPE_MAP[args.dtype] is torch.float4_e2m1fn_x2:
-        raise ValueError("fp8_direct_cast is not supported for fp4 data type")
+    if TORCH_FLOAT4_E2M1FN_X2 is not None:
+        _DATA_TYPE_MAP["fp4"] = TORCH_FLOAT4_E2M1FN_X2
+
+    if args.dtype == "fp4" and TORCH_FLOAT4_E2M1FN_X2 is None:
+        raise RuntimeError("torch.float4_e2m1fn_x2 is not available in this torch build")
+    if args.quant_type == "fp8_direct_cast" and _DATA_TYPE_MAP[args.dtype] is not torch.bfloat16:
+        raise ValueError("fp8_direct_cast is only supported for bfloat16 data type")
 
     world_size = 8
     torch.multiprocessing.spawn(

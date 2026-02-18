@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <cstring>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
 #include <hip/library_types.h>
@@ -61,11 +62,21 @@ inline hipDataType ScalarTypeToHipDataType(at::ScalarType scalarType) {
       return HIP_R_8F_E4M3;
     case at::kFloat8_e4m3fnuz:
       return HIP_R_8F_E4M3_FNUZ;
-    case at::kFloat4_e2m1fn_x2:
-      return HIP_R_4F_E2M1;
     default:
-      throw std::runtime_error("Unsupported scalar type");
+      break;
   }
+
+#if defined(HIP_R_4F_E2M1) && defined(HIP_FP8_TYPE_OCP) && HIP_FP8_TYPE_OCP == 1 && \
+    __has_include(<hip/hip_ext_ocp.h>) && __has_include(<hip/amd_detail/amd_hip_ocp_host.hpp>)
+  // Keep FP4 support on platforms where both torch scalar and HIP enum exist,
+  // without hard-referencing torch's float4 enum at compile time.
+  const char* scalarTypeName = c10::toString(scalarType);
+  if (scalarTypeName != nullptr && std::strcmp(scalarTypeName, "Float4_e2m1fn_x2") == 0) {
+    return HIP_R_4F_E2M1;
+  }
+#endif
+
+  throw std::runtime_error("Unsupported scalar type");
 }
 
 }  // namespace mori

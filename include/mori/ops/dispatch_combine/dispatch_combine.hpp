@@ -376,8 +376,11 @@ struct EpDispatchCombineArgs {
 };
 
 using EpDispatchCombineArgsVariant =
-    std::variant<EpDispatchCombineArgs<float>, EpDispatchCombineArgs<hip_bfloat16>,
+    std::variant<EpDispatchCombineArgs<float>, EpDispatchCombineArgs<hip_bfloat16>
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+                 ,
                  EpDispatchCombineArgs<mori_fp4x2_e2m1>
+#endif
 #ifdef MORI_FP8_TYPE_FNUZ_ENABLED
                  ,
                  EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>
@@ -466,8 +469,10 @@ inline EpDispatchCombineArgsVariant GetEpDispatchCombineArgsByInputType(
     case HIP_R_8F_E4M3_FNUZ:
       return GetEpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>(handle, rdmaBlockNum);
 #endif
+#if defined(MORI_FP8_TYPE_OCP_ENABLED) && defined(HIP_R_4F_E2M1)
     case HIP_R_4F_E2M1:
       return GetEpDispatchCombineArgs<mori_fp4x2_e2m1>(handle, rdmaBlockNum);
+#endif
     default:
       std::ostringstream oss;
       oss << "Unsupported inputType " << HipDataTypeToString(handle.inputType)
