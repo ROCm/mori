@@ -19,8 +19,6 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include <mpi.h>
-
 #include "mori/application/memory/symmetric_memory.hpp"
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"

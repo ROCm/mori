@@ -1,4 +1,6 @@
-find_package(Torch REQUIRED)
+if (ENABLE_TORCH)
+  find_package(Torch REQUIRED)
+endif()
 
 # You can set PYTHON_EXECUTABLE via command line: -DPYTHON_EXECUTABLE=/path/to/python
 if(NOT DEFINED PYTHON_EXECUTABLE)
@@ -37,21 +39,23 @@ if(ENABLE_PROFILER)
 endif()
 
 target_include_directories(
-  mori_pybinds PUBLIC ${PYTHON_INCLUDE_DIRS} ${TORCH_INCLUDE_DIRS}
-                      ${CMAKE_BINARY_DIR}/generated/include)
-target_link_directories(mori_pybinds PUBLIC ${TORCH_INSTALL_PREFIX}/lib)
+  mori_pybinds PUBLIC ${PYTHON_INCLUDE_DIRS} ${CMAKE_BINARY_DIR}/generated/include)
 target_link_libraries(
   mori_pybinds
   mori_ops
   mori_io
-  ${TORCH_LIBRARIES}
-  torch_python
   hip::host
   hip::device)
 
-# For python packages to find dependent libraries
-set_target_properties(
-  mori_pybinds
-  PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/../torch/lib"
+if(ENABLE_TORCH)
+  target_include_directories(
+    mori_pybinds PUBLIC ${TORCH_INCLUDE_DIRS})
+  target_link_directories(mori_pybinds PUBLIC ${TORCH_INSTALL_PREFIX}/lib)
+  target_link_libraries(${TORCH_LIBRARIES} torch_python)
+  # For python packages to find dependent libraries
+  set_target_properties(
+    mori_pybinds
+    PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/../torch/lib"
              INSTALL_RPATH "$ORIGIN;$ORIGIN/../torch/lib"
              BUILD_WITH_INSTALL_RPATH TRUE)
+endif()

@@ -19,8 +19,9 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#ifdef ENABLE_MPI
 #include <mpi.h>
-
+#endif
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -633,16 +634,17 @@ int ShmemFinalize() {
 /*                                      Other Initialization APIs                                */
 /* ---------------------------------------------------------------------------------------------- */
 
+#ifdef ENABLE_MPI
 int ShmemMpiInit(MPI_Comm mpiComm) {
   return ShmemInit(new application::MpiBootstrapNetwork(mpiComm));
 }
-
 int ShmemInit() { return ShmemMpiInit(MPI_COMM_WORLD); }
-
+#endif
+#ifdef ENABLE_TORCH
 int ShmemTorchProcessGroupInit(const std::string& groupName) {
   return ShmemInit(new application::TorchBootstrapNetwork(groupName));
 }
-
+#endif
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      Query APIs                                               */
 /* ---------------------------------------------------------------------------------------------- */
@@ -795,7 +797,7 @@ int ShmemInitAttr(unsigned int flags, mori_shmem_init_attr_t* attr) {
     MORI_SHMEM_ERROR("Invalid arguments");
     return -1;
   }
-
+#ifdef ENABLE_MPI
   // MPI-based initialization
   if (flags == MORI_SHMEM_INIT_WITH_MPI_COMM) {
     if (attr->mpi_comm == nullptr) {
@@ -805,7 +807,7 @@ int ShmemInitAttr(unsigned int flags, mori_shmem_init_attr_t* attr) {
     int result = ShmemMpiInit(*reinterpret_cast<MPI_Comm*>(attr->mpi_comm));
     return (result == 0) ? 0 : -1;
   }
-
+#endif // ENABLE_MPI
   // UniqueId-based initialization
   if (flags == MORI_SHMEM_INIT_WITH_UNIQUEID) {
     // Validate rank parameters

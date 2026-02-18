@@ -21,7 +21,9 @@
 // SOFTWARE.
 #pragma once
 
+#ifdef ENABLE_MPI
 #include <mpi.h>
+#endif
 
 #include <array>
 #include <cstddef>
@@ -51,10 +53,13 @@ constexpr unsigned int MORI_SHMEM_INIT_WITH_UNIQUEID = 1;
 
 // TODO: provide unified initialize / finalize APIs
 int ShmemInit(application::BootstrapNetwork* bootNet);
+#ifdef ENABLE_MPI
 int ShmemInit();  // Default initialization using MPI_COMM_WORLD
 int ShmemMpiInit(MPI_Comm);
+#endif // ENABLE_MPI
+#ifdef ENABLE_TORCH
 int ShmemTorchProcessGroupInit(const std::string& groupName);
-
+#endif // ENABLE_TORCH
 // UniqueId-based initialization APIs (nvshmem/rocshmem compatible)
 int ShmemGetUniqueId(mori_shmem_uniqueid_t* uid);
 int ShmemSetAttrUniqueIdArgs(int rank, int nranks, mori_shmem_uniqueid_t* uid,
