@@ -363,7 +363,7 @@ def test_main(
         kernel_type=kernel_type,
         gpu_per_node=num_ranks // num_nodes,
         rdma_block_num=rdma_block_num,
-        num_qp_per_pe=4 if multi_node else 0,
+        num_qp_per_pe=4 if multi_node else 1,
     )
     op = mori.ops.EpDispatchCombineOp(config)
 
