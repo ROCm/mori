@@ -91,7 +91,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
 
         if not self.config.use_external_inp_buf:
             combine_input = op.get_registered_combine_input_buffer(
-                self.config.data_type
+                self.config.data_type, hidden_dim=dispatch_output.size(1)
             )
             combine_input[:total_recv_num_token, :].copy_(
                 dispatch_output[:total_recv_num_token, :]
@@ -370,14 +370,11 @@ def _bench_dispatch_combine(
     combine_warp_per_block_arg=None,
     combine_data_type=None,
     combine_hidden_dim=None,
-    combine_quant_type=None,
 ):
     if combine_data_type is None:
         combine_data_type = data_type
     if combine_hidden_dim is None:
         combine_hidden_dim = hidden_dim
-    if combine_quant_type is None:
-        combine_quant_type = quant_type
 
     if quant_type == "fp8_direct_cast" and data_type is not torch.bfloat16:
         raise ValueError("fp8_direct_cast is only supported for bfloat16 data type")
@@ -601,15 +598,14 @@ def _bench_dispatch_combine(
                         best_disp_config = (block_num, warp_per_block)
 
             # --- Phase 2: Tune Combine (fix dispatch at best found) ---
-            # If combine uses a different dtype, create a separate op.
+            # NOTE: Dispatch and combine should share the same op instance in real usage.
+            # The op now accepts different runtime input dtype/hidden_dim between dispatch/combine,
+            # so actual usage can still use one op; separate combine op here is only for tuning.
             use_separate_combine_op = (
                 combine_data_type != data_type
                 or combine_hidden_dim != hidden_dim
-                or combine_quant_type != quant_type
             )
             if use_separate_combine_op:
-                if combine_quant_type == "fp8_direct_cast" and combine_data_type is not torch.bfloat16:
-                    raise ValueError("fp8_direct_cast combine requires combine_dtype=bf16")
                 comb_config = mori.ops.EpDispatchCombineConfig(
                     data_type=combine_data_type,
                     rank=rank,
@@ -625,7 +621,7 @@ def _bench_dispatch_combine(
                     block_num=80,
                     use_external_inp_buf=not zero_copy,
                     gpu_per_node=world_size,
-                    quant_type=combine_quant_type,
+                    quant_type=quant_type,
                 )
                 comb_op = mori.ops.EpDispatchCombineOp(comb_config)
                 comb_benchmark = EpDispatchCombineBenchmark(comb_config)
@@ -641,7 +637,7 @@ def _bench_dispatch_combine(
                 print(f"\n{'#'*60}")
                 dtype_info = ""
                 if use_separate_combine_op:
-                    dtype_info = f", combine_dtype={combine_data_type}, combine_quant={combine_quant_type}"
+                    dtype_info = f", combine_dtype={combine_data_type}"
                 print(
                     f"Phase 2: Tuning COMBINE (dispatch fixed at "
                     f"block_num={best_disp_config[0]}, wpb={best_disp_config[1]}"
@@ -683,7 +679,7 @@ def _bench_dispatch_combine(
                     f"at block_num={best_disp_config[0]}, warp_per_block={best_disp_config[1]}"
                 )
                 print(
-                    f"Best Combine   ({comb_dtype_str}, quant={combine_quant_type}): {best_comb_bw:.2f} GB/s, "
+                    f"Best Combine   ({comb_dtype_str}, quant={quant_type}): {best_comb_bw:.2f} GB/s, "
                     f"latency={best_comb_latency} us "
                     f"at block_num={best_comb_config[0]}, warp_per_block={best_comb_config[1]}"
                 )
@@ -711,14 +707,11 @@ def bench_dispatch_combine(
     num_experts_per_token=8,
     combine_data_type=None,
     combine_hidden_dim=None,
-    combine_quant_type=None,
 ):
     if combine_data_type is None:
         combine_data_type = dtype
     if combine_hidden_dim is None:
         combine_hidden_dim = hidden_dim
-    if combine_quant_type is None:
-        combine_quant_type = quant_type
     port = get_free_port()
     torch.multiprocessing.spawn(
         _bench_dispatch_combine,
@@ -741,7 +734,6 @@ def bench_dispatch_combine(
             combine_warp_per_block,
             combine_data_type,
             combine_hidden_dim,
-            combine_quant_type,
         ),
         nprocs=world_size,
         join=True,
@@ -846,24 +838,16 @@ if __name__ == "__main__":
         help=(
             "Data type for combine phase (tuning only). "
             "When set, Phase 2 creates a separate op with this dtype. "
-            "Example: --dtype fp4 --combine-dtype bf16 --combine-quant-type fp8_direct_cast"
+            "Example: --dtype fp4 --combine-dtype bf16"
         ),
-    )
-    parser.add_argument(
-        "--combine-quant-type",
-        type=str,
-        default=None,
-        choices=["none", "fp8_direct_cast"],
-        help="Quantization type for combine phase (tuning only). Defaults to --quant-type.",
     )
     args = parser.parse_args()
 
     if args.num_experts_per_rank is None:
         args.num_experts_per_rank = 256 // args.world_size
 
-    # Resolve combine dtype/quant: default to same as dispatch
+    # Resolve combine dtype: default to same as dispatch
     combine_dtype_str = args.combine_dtype if args.combine_dtype else args.dtype
-    combine_quant_type = args.combine_quant_type if args.combine_quant_type else args.quant_type
 
     dispatch_dtype = _DATA_TYPE_MAP[args.dtype]
     combine_dtype = _DATA_TYPE_MAP[combine_dtype_str]
@@ -879,7 +863,7 @@ if __name__ == "__main__":
         f"num_experts_per_rank: {args.num_experts_per_rank}, "
         f"num_experts_per_token: {args.num_experts_per_token}, "
         f"zero_copy: {'true' if args.zero_copy else 'false'}, "
-        f"quant_type: {args.quant_type}, combine_quant_type: {combine_quant_type}, "
+        f"quant_type: {args.quant_type}, "
         f"dispatch_block_num: {args.dispatch_block_num}, "
         f"dispatch_warp_per_block: {args.dispatch_warp_per_block}, "
         f"combine_block_num: {args.combine_block_num}, "
@@ -902,5 +886,4 @@ if __name__ == "__main__":
         num_experts_per_token=args.num_experts_per_token,
         combine_data_type=combine_dtype,
         combine_hidden_dim=combine_hidden_dim,
-        combine_quant_type=combine_quant_type,
     )

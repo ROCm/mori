@@ -28,9 +28,11 @@ import torch.distributed as dist
 
 os.environ["MORI_SHMEM_HEAP_SIZE"] = "4G"
 
+TORCH_FLOAT4_E2M1FN_X2 = getattr(torch, "float4_e2m1fn_x2", None)
+
 
 def _is_fp4x2_dtype(dtype):
-    return dtype is torch.float4_e2m1fn_x2
+    return TORCH_FLOAT4_E2M1FN_X2 is not None and dtype is TORCH_FLOAT4_E2M1FN_X2
 
 
 class EpDispatchCombineTestCase:
@@ -339,9 +341,8 @@ def _test_dispatch_combine(
 
 # TODO: create a sub process group so that we can test worlds size < 8
 @pytest.mark.parametrize("world_size", (8,))
-@pytest.mark.parametrize(
-    "data_type",
-    (
+@pytest.mark.parametrize("data_type", (
+    [
         torch.bfloat16,
         pytest.param(
             torch.float8_e4m3fnuz,
@@ -357,15 +358,21 @@ def _test_dispatch_combine(
                 reason="Skip float8_e4m3fn, it is not supported",
             ),
         ),
-        pytest.param(
-            torch.float4_e2m1fn_x2,
-            marks=pytest.mark.skipif(
-                not data_type_supported(torch.float4_e2m1fn_x2),
-                reason="Skip float4_e2m1fn_x2, it is not supported",
-            ),
-        ),
-    ),
-)
+    ]
+    + (
+        [
+            pytest.param(
+                TORCH_FLOAT4_E2M1FN_X2,
+                marks=pytest.mark.skipif(
+                    not data_type_supported(TORCH_FLOAT4_E2M1FN_X2),
+                    reason="Skip float4_e2m1fn_x2, it is not supported",
+                ),
+            )
+        ]
+        if TORCH_FLOAT4_E2M1FN_X2 is not None
+        else []
+    )
+))
 @pytest.mark.parametrize("hidden_dim", (7168, 4096))
 @pytest.mark.parametrize("scale_dim", (0, 32))
 @pytest.mark.parametrize("scale_type_size", (1, 4))

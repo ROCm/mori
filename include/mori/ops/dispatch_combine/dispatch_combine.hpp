@@ -158,33 +158,35 @@ class EpDispatchCombineHandle {
 
   // When blockNum and warpPerBlock <= 0, kernel will use default values in config
   void LaunchIntraNodeDispatch(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
-                               hipStream_t = 0);
+                               hipStream_t = 0, int hiddenDim = -1);
   void LaunchInterNodeDispatch(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
-                               hipStream_t = 0);
+                               hipStream_t = 0, int hiddenDim = -1);
   void LaunchIntraNodeCombine(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
-                              int useExternalInpBuf = -1, hipStream_t = 0);
+                              int useExternalInpBuf = -1, hipStream_t = 0, int hiddenDim = -1);
   void LaunchInterNodeCombine(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
-                              int useExternalInpBuf = -1, hipStream_t = 0);
+                              int useExternalInpBuf = -1, hipStream_t = 0, int hiddenDim = -1);
 
   void LaunchDispatch(KernelType, int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
-                      hipStream_t = 0);
+                      hipStream_t = 0, int hiddenDim = -1);
   void LaunchCombine(KernelType, int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
-                     int useExternalInpBuf = -1, hipStream_t = 0);
+                     int useExternalInpBuf = -1, hipStream_t = 0, int hiddenDim = -1);
 
 #ifdef ENABLE_STANDARD_MOE_ADAPT
   void LaunchDispatchForStandardMoE(KernelType, int blockNum = -1, int rdmaBlockNum = -1,
-                                    int warpPerBlock = -1, hipStream_t = 0);
+                                    int warpPerBlock = -1, hipStream_t = 0, int hiddenDim = -1);
   void LaunchCombineForStandardMoE(KernelType, int blockNum = -1, int rdmaBlockNum = -1,
-                                   int warpPerBlock = -1, hipStream_t = 0);
+                                   int warpPerBlock = -1, hipStream_t = 0, int hiddenDim = -1);
 
   void LaunchConvertDispatchOutputKernel(const void* dispatchOutX, const void* dispatchOutTopkIdx,
                                          void* packedRecvX, int* packedRecvCount,
                                          int* packedRecvSrcInfo, int64_t* packedRecvLayoutRange,
-                                         int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
+                                         int blockNum = -1, int warpPerBlock = -1,
+                                         hipStream_t = 0, int hiddenDim = -1);
   void LaunchConvertCombineInputKernel(const void* packedRecvX, const void* packedRecvSrcInfo,
                                        const void* packedRecvLayoutRange, void* combineInput,
                                        mori::application::SymmMemObjPtr shmemCombineInpTokMemObj,
-                                       int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
+                                       int blockNum = -1, int warpPerBlock = -1,
+                                       hipStream_t = 0, int hiddenDim = -1);
 #endif
 
   void LaunchDispatchRecv(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);

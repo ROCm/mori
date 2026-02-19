@@ -10,7 +10,7 @@ set -euo pipefail
 #   bash tools/intranode_tuning.sh --max-tokens 4096           # high-BW mode
 #   bash tools/intranode_tuning.sh --dtype bf16                # BF16 only
 #   bash tools/intranode_tuning.sh --dtype fp4 --combine-dtype bf16 \
-#        --combine-quant-type fp8_direct_cast                  # mixed FP4+FP8
+#        --quant-type fp8_direct_cast                          # mixed FP4+FP8
 #   bash tools/intranode_tuning.sh --zero-copy 0               # P2P write mode
 #
 # All arguments are forwarded to bench_dispatch_combine.py.
@@ -31,7 +31,7 @@ ZERO_COPY=0
 CMD=tuning
 DTYPE=fp4
 COMBINE_DTYPE=bf16
-COMBINE_QUANT_TYPE=fp8_direct_cast
+QUANT_TYPE=fp8_direct_cast
 GPUS=""
 SHMEM_MODE=""
 
@@ -45,7 +45,7 @@ while [[ $# -gt 0 ]]; do
         --cmd)              CMD="$2";               shift 2 ;;
         --dtype)            DTYPE="$2";             shift 2 ;;
         --combine-dtype)    COMBINE_DTYPE="$2";     shift 2 ;;
-        --combine-quant-type) COMBINE_QUANT_TYPE="$2"; shift 2 ;;
+        --quant-type)       QUANT_TYPE="$2";        shift 2 ;;
         --gpus)             GPUS="$2";              shift 2 ;;
         --shmem-mode)       SHMEM_MODE="$2";        shift 2 ;;
         *)                  EXTRA_ARGS+=("$1");     shift ;;
@@ -72,8 +72,8 @@ else
     DTYPE_TAG="${DTYPE}"
 fi
 
-if [[ -n "$COMBINE_QUANT_TYPE" && "$COMBINE_QUANT_TYPE" != "none" ]]; then
-    DTYPE_TAG="${DTYPE_TAG}_${COMBINE_QUANT_TYPE}"
+if [[ -n "$QUANT_TYPE" && "$QUANT_TYPE" != "none" ]]; then
+    DTYPE_TAG="${DTYPE_TAG}_${QUANT_TYPE}"
 fi
 
 SHMEM_TAG=""
@@ -90,13 +90,11 @@ PY_ARGS=(
     --zero-copy  "$ZERO_COPY"
     --cmd        "$CMD"
     --dtype      "$DTYPE"
+    --quant-type "$QUANT_TYPE"
 )
 
 if [[ -n "$COMBINE_DTYPE" ]]; then
     PY_ARGS+=(--combine-dtype "$COMBINE_DTYPE")
-fi
-if [[ -n "$COMBINE_QUANT_TYPE" ]]; then
-    PY_ARGS+=(--combine-quant-type "$COMBINE_QUANT_TYPE")
 fi
 
 PY_ARGS+=("${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}")
@@ -111,7 +109,7 @@ echo "  zero_copy:           $ZERO_COPY"
 echo "  cmd:                 $CMD"
 echo "  dtype:               $DTYPE"
 echo "  combine_dtype:       ${COMBINE_DTYPE:-same as dtype}"
-echo "  combine_quant_type:  ${COMBINE_QUANT_TYPE:-none}"
+echo "  quant_type:          ${QUANT_TYPE:-none}"
 echo "  gpus:                ${GPUS:-all}"
 echo "  shmem_mode:          ${SHMEM_MODE:-default}"
 echo "  log:                 $LOG_FILE"

@@ -342,8 +342,9 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 
     T* outPtr = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
                 tokenId * config.hiddenDim + hiddenDimOffset;
-    if constexpr (!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>) {
-      int validAccumCount = config.numExpertPerToken;
+
+    int validAccumCount = config.numExpertPerToken;
+    if (config.worldSize <= 4) {
       {
         int isValid = 0;
         TokT* myTokPtr = nullptr;
@@ -358,11 +359,14 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
           srcPtrs[myPos] = myTokPtr;
         }
       }
+    }
+    
+    if constexpr (!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>) {
       core::WarpAccumCombineInternalFp8ToBf16(
           outPtr, reinterpret_cast<const TokT* const*>(srcPtrs),
           validAccumCount, laneId, hiddenDimSize);
     } else {
-      core::WarpAccum<T, 4>(outPtr, srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
+      core::WarpAccum<T, 4>(outPtr, srcPtrs, nullptr, validAccumCount, hiddenDimSize);
     }
 
     if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
