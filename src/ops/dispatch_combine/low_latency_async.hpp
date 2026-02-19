@@ -34,10 +34,10 @@ __global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args);
 template <typename T>
 __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args);
 
-template <typename T>
+template <typename T, bool UseFp8DirectCast = false>
 __global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args);
 
-template <typename T>
+template <typename T, bool UseFp8DirectCast = false>
 __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args);
 
 }  // namespace moe
