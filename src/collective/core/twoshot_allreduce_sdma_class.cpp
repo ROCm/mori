@@ -300,7 +300,6 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
     async_start_time_ = MPI_Wtime();
 
     try {
-        // Ensure output transit buffer is large enough for the allgather phase
         size_t required_output_size = total_count * npes_ * dtype_size_;
         if (!ensure_buffer_size(output_transit_buffer_, output_transit_buffer_ptr_,
                                 output_transit_buffer_size_, output_transit_buffer_obj_,
@@ -309,19 +308,6 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
             return false;
         }
 
-        printf("PE %d: Starting async AllReduce (AllGather PUT phase)\n", myPe_);
-        printf("PE %d: Launching async PUT kernel...\n", myPe_);
-
-        int block_size = 256;
-        int grid_size = static_cast<int>(
-            std::min(static_cast<size_t>((total_count * npes_ + block_size - 1) / block_size),
-                     static_cast<size_t>(65535)));
-        if (grid_size < 1) grid_size = 1;
-
-        printf("  Grid size: %d, Block size: %d\n", grid_size, block_size);
-
-        // PUT kernel: sends each PE's full input to every remote PE's
-        // output_transit_buffer at offset myPe * elementCount
         TwoShotAllReduceSdmaAsyncPutKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
             input,
@@ -331,16 +317,15 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
 
         hipError_t kernel_err = hipGetLastError();
         if (kernel_err != hipSuccess) {
-            printf("PE %d: Async kernel launch failed: %s\n",
-                   myPe_, hipGetErrorString(kernel_err));
+            fprintf(stderr, "PE %d: Async PUT kernel launch failed: %s\n",
+                    myPe_, hipGetErrorString(kernel_err));
             throw std::runtime_error("Kernel launch failed");
         }
 
-        printf("PE %d: Async PUT operation started successfully\n", myPe_);
         return true;
 
     } catch (const std::exception& e) {
-        printf("PE %d: Failed to start async operation: %s\n", myPe_, e.what());
+        fprintf(stderr, "PE %d: Failed to start async operation: %s\n", myPe_, e.what());
         async_in_progress_ = false;
         return false;
     }
@@ -354,78 +339,45 @@ double AllreduceSdma<T>::wait_async(hipStream_t stream) {
     }
 
     try {
-        printf("PE %d: Waiting for async AllReduce completion (WAIT phase)\n", myPe_);
-
         hipStream_t wait_stream = (stream != nullptr) ? stream : async_stream_;
 
-        // Step 1: Launch wait kernel — waits for all SDMA transfers to complete
+        // All three steps are launched on the same stream — the GPU guarantees
+        // sequential execution, so no intermediate hipStreamSynchronize is needed.
+
+        // Step 1: Wait kernel — spins until all SDMA PUT transfers complete
         TwoShotAllReduceSdmaAsyncWaitKernel<<<1, 64, 0, wait_stream>>>(
             myPe_, npes_, output_transit_buffer_obj_, flagsObj_);
 
-        // Synchronize to ensure all data has arrived
-        printf("PE %d: Synchronizing to ensure AllGather completion\n", myPe_);
+        // Step 2: Local reduce — sum all npes chunks element-wise (64 CUs)
+        T* gathered = static_cast<T*>(output_transit_buffer_);
+
+        AllReduceLocalSumKernel<T><<<64, 256, 0, wait_stream>>>(
+            gathered, async_total_count_, npes_);
+
+        // Step 3: Copy reduced result to user output buffer (if enabled)
+        if (copy_output_to_user_) {
+            copy_output_to_user(async_output_, async_total_count_, wait_stream);
+        }
+
+        // Single synchronization at the end
         if (wait_stream != nullptr) {
             hipError_t err = hipStreamSynchronize(wait_stream);
             if (err != hipSuccess) {
-                printf("PE %d: Stream synchronization failed: %s\n",
-                       myPe_, hipGetErrorString(err));
+                fprintf(stderr, "PE %d: Stream synchronization failed: %s\n",
+                        myPe_, hipGetErrorString(err));
                 throw std::runtime_error("Stream synchronization failed");
             }
         } else {
             hipError_t err = hipDeviceSynchronize();
             if (err != hipSuccess) {
-                printf("PE %d: Device synchronization failed: %s\n",
-                       myPe_, hipGetErrorString(err));
+                fprintf(stderr, "PE %d: Device synchronization failed: %s\n",
+                        myPe_, hipGetErrorString(err));
                 throw std::runtime_error("Device synchronization failed");
             }
         }
 
-        // Step 2: Local reduce — sum all npes chunks in output_transit_buffer
-        printf("PE %d: Performing local reduce (summing %d chunks)\n", myPe_, npes_);
-
-        T* gathered = static_cast<T*>(output_transit_buffer_);
-        int reduce_block_size = 256;
-        int reduce_grid_size = static_cast<int>(
-            std::min(static_cast<size_t>((async_total_count_ + reduce_block_size - 1) / reduce_block_size),
-                     static_cast<size_t>(65535)));
-        if (reduce_grid_size < 1) reduce_grid_size = 1;
-
-        AllReduceLocalSumKernel<T><<<reduce_grid_size, reduce_block_size, 0, wait_stream>>>(
-            gathered, async_total_count_, npes_);
-
-        hipError_t reduce_err = hipGetLastError();
-        if (reduce_err != hipSuccess) {
-            printf("PE %d: Reduce kernel launch failed: %s\n",
-                   myPe_, hipGetErrorString(reduce_err));
-            throw std::runtime_error("Reduce kernel launch failed");
-        }
-
-        // Synchronize to ensure reduce completes
-        if (wait_stream != nullptr) {
-            (void)hipStreamSynchronize(wait_stream);
-        } else {
-            (void)hipDeviceSynchronize();
-        }
-
-        // Step 3: Copy reduced result to user output buffer (if enabled)
-        if (copy_output_to_user_) {
-            printf("PE %d: Copying reduced results to user output buffer\n", myPe_);
-            copy_output_to_user(async_output_, async_total_count_, wait_stream);
-        } else {
-            printf("PE %d: Skipping copy to user output buffer (using output_transit_buffer directly)\n", myPe_);
-        }
-
-        // Final synchronization
-        if (wait_stream != nullptr) {
-            (void)hipStreamSynchronize(wait_stream);
-        } else {
-            (void)hipDeviceSynchronize();
-        }
-
         double end_time = MPI_Wtime();
         double duration = end_time - async_start_time_;
-
-        printf("PE %d: Async AllReduce completed in %.6f seconds\n", myPe_, duration);
 
         async_in_progress_ = false;
         async_input_ = nullptr;
@@ -437,7 +389,7 @@ double AllreduceSdma<T>::wait_async(hipStream_t stream) {
         return duration;
 
     } catch (const std::exception& e) {
-        printf("PE %d: Async wait failed: %s\n", myPe_, e.what());
+        fprintf(stderr, "PE %d: Async wait failed: %s\n", myPe_, e.what());
         cancel_async();
         return -1.0;
     }
