@@ -22,7 +22,6 @@
 
 #include "mori/collective/allreduce/twoshot_allreduce_sdma_class.hpp"
 #include "mori/collective/allreduce/twoshot_sdma_kernel.hpp"
-#include "mori/collective/allgather/oneshot_sdma_async_kernel.hpp"
 #include "mori/collective/allreduce/twoshot_sdma_async_kernel.hpp"
 #include "mori/shmem/shmem.hpp"
 #include <stdexcept>
@@ -321,9 +320,9 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
 
         printf("  Grid size: %d, Block size: %d\n", grid_size, block_size);
 
-        // Reuse the allgather async PUT kernel: sends each PE's full input
-        // to every remote PE's output_transit_buffer at offset myPe * elementCount
-        OneShotAllGatherSdmaAsyncPutKernel<T><<<1, 512, 0, stream>>>(
+        // PUT kernel: sends each PE's full input to every remote PE's
+        // output_transit_buffer at offset myPe * elementCount
+        TwoShotAllReduceSdmaAsyncPutKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
             input,
             input_transit_buffer_obj_,
@@ -359,8 +358,8 @@ double AllreduceSdma<T>::wait_async(hipStream_t stream) {
 
         hipStream_t wait_stream = (stream != nullptr) ? stream : async_stream_;
 
-        // Step 1: Launch wait kernel — same as allgather, waits for all SDMA transfers
-        OneShotAllGatherSdmaAsyncWaitKernel<<<1, 64, 0, wait_stream>>>(
+        // Step 1: Launch wait kernel — waits for all SDMA transfers to complete
+        TwoShotAllReduceSdmaAsyncWaitKernel<<<1, 64, 0, wait_stream>>>(
             myPe_, npes_, output_transit_buffer_obj_, flagsObj_);
 
         // Synchronize to ensure all data has arrived
