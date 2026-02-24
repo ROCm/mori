@@ -50,21 +50,18 @@ __global__ void TwoShotAllReduceSdmaKernel(int myPe, int npes,
   // --- Uniform, pack_size-aligned shard size --------------------------------
   const size_t elementCountPerRank =
       ((elementCount / npes + pack_size - 1) / pack_size) * pack_size;
-  const size_t packedPerRank = elementCountPerRank / pack_size;  // exact
-
-  // Number of valid input elements in the last shard (may be < elementCountPerRank).
-  const size_t lastShardActualSize =
-      (elementCount > static_cast<size_t>(npes - 1) * elementCountPerRank)
-      ? (elementCount - static_cast<size_t>(npes - 1) * elementCountPerRank)
-      : 0;
+  const size_t packedPerRank = elementCountPerRank / pack_size;
 
   if (elementCountPerRank == 0) {
     return;
   }
 
+  const size_t totalPacked = static_cast<size_t>(npes) * packedPerRank;
+  const size_t start = static_cast<size_t>(myPe) * packedPerRank;
+  const size_t end = (myPe == npes - 1) ? totalPacked : start + packedPerRank;
+
   // --- Common variables -----------------------------------------------------
-  T* __restrict__ inputData = input;
-  T* __restrict__ gathered  = reinterpret_cast<T*>(dstMemObj->localPtr);
+  P* __restrict__ result = reinterpret_cast<P*>(dstMemObj->localPtr);
   uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
   int flag_val = 1;
 
@@ -77,100 +74,35 @@ __global__ void TwoShotAllReduceSdmaKernel(int myPe, int npes,
   const int laneId = threadIdx.x % warpSize;
 
   // =========================================================================
-  // Phase 1: Gather via SDMA
+  // Phase 1: Reduce-Scatter (ref: cross_device_reduce_2stage stage 1)
   //
-  // Each warp sends shard_{remotePe} of this rank's input to remotePe.
-  // All shards are elementCountPerRank elements except that the LAST shard
-  // has only lastShardActualSize valid input elements — we send only the
-  // valid portion to avoid reading past the input buffer.
+  // Each rank owns partition [start, end). At each global index idx in that
+  // range, reduce across all ranks by reading from srcMemObj->peerPtrs[pe]
+  // (no SDMA — direct cross-device loads). Write to myDst[idx - start].
   // =========================================================================
-  if (warpId < npes && laneId == 0) {
-    int remotePe = warpId;
+  P* __restrict__ myDst = result + start;
 
-    // Only the last shard may have fewer valid elements.
-    size_t sendCount = (remotePe == npes - 1) ? lastShardActualSize : elementCountPerRank;
-
-    application::SymmMemObjPtr dest = dstMemObj;
-
-    uint8_t* srcPtr = reinterpret_cast<uint8_t*>(inputData)
-                      + static_cast<size_t>(remotePe) * elementCountPerRank * bytesPerElement;
-    uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe])
-                      + static_cast<size_t>(myPe) * elementCountPerRank * bytesPerElement;
-    size_t sendBytes = sendCount * bytesPerElement;
-
-    anvil::SdmaQueueDeviceHandle** devicehandles =
-        dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
-    HSAuint64* signals         = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
-    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
-    core::SdmaPutThread(srcPtr, dstPtr, sendBytes,
-                        devicehandles, signals, expectedSignals,
-                        dest->sdmaNumQueue, 0);
-  }
-
-  // --- Notify remote PEs that our data is in place --------------------------
-  if (warpId < npes && laneId == 0) {
-    int remotePe = warpId;
-    shmem::ShmemQuietThread(remotePe, dstMemObj);
-    shmem::ShmemAtomicSizeNonFetchThread(
-        flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t),
-        &flag_val, 8, core::atomicType::AMO_ADD, remotePe);
-  }
-  __syncthreads();
-
-  // --- Wait for all peers to finish writing into our dst buffer -------------
-  for (int sender = 0; sender < npes; ++sender) {
-    if (sender == myPe) {
-      continue;
-    }
-    if (threadLinearId == 0) {
-      int spinCount = 0;
-      while (core::AtomicLoadRelaxed(flags + sender) == 0) {
-        ++spinCount;
-        if (spinCount > 10000000) {
-          printf("PE %d: Timeout waiting for data from peer %d\n", myPe, sender);
-          break;
-        }
-      }
-    }
-    __syncthreads();
-  }
-
-  if (threadLinearId < static_cast<size_t>(npes)) {
-    flags[threadLinearId] = 0;
-  }
-  __syncthreads();
-
-  // =========================================================================
-  // Phase 2: Local reduce (sum) over the npes gathered copies of our shard.
-  //
-  // elementCountPerRank is a multiple of pack_size, so every PE's slot
-  // starts at a pack_size-aligned boundary and no scalar tail is needed.
-  // =========================================================================
-  P* __restrict__ packedGathered = reinterpret_cast<P*>(gathered);
-  P* __restrict__ myDst = packedGathered + static_cast<size_t>(myPe) * packedPerRank;
-
-  for (size_t idx = threadLinearId; idx < packedPerRank; idx += threadsPerGrid) {
-    A add_reg = upcast_v<typename P::type, pack_size>(
-        *(packedGathered + 0 * packedPerRank + idx));
+  for (size_t idx = start + threadLinearId; idx < end; idx += threadsPerGrid) {
+    const P* p0 = reinterpret_cast<const P*>(srcMemObj->peerPtrs[0]);
+    A add_reg = upcast_v<typename P::type, pack_size>(p0[idx]);
     for (int pe = 1; pe < npes; ++pe) {
-      P tmp = *(packedGathered + static_cast<size_t>(pe) * packedPerRank + idx);
-      packed_assign_add(add_reg, upcast_v<typename P::type, pack_size>(tmp));
+      const P* pp = reinterpret_cast<const P*>(srcMemObj->peerPtrs[pe]);
+      packed_assign_add(add_reg, upcast_v<typename P::type, pack_size>(pp[idx]));
     }
-    myDst[idx] = downcast_v<typename P::type, pack_size>(add_reg);
+    myDst[idx - start] = downcast_v<typename P::type, pack_size>(add_reg);
   }
 
-  // Ensure all Phase 2 reduce writes are globally visible before SDMA reads.
   __threadfence();
   __syncthreads();
 
   // =========================================================================
-  // Phase 3: AllGather via SDMA  (output → dstMemObj / gathered)
+  // Phase 2: AllGather via SDMA  (output → dstMemObj / result)
   //
   // Each rank sends its reduced shard (elementCountPerRank elements) to
   // every rank.  Source and destination use the same uniform stride
   // (elementCountPerRank), so they coincide — no overlap concern.
   // =========================================================================
-  uint8_t* agSrcPtr = reinterpret_cast<uint8_t*>(gathered)
+  uint8_t* agSrcPtr = reinterpret_cast<uint8_t*>(result)
                       + static_cast<size_t>(myPe) * elementCountPerRank * bytesPerElement;
   size_t   agSendBytes = elementCountPerRank * bytesPerElement;
 

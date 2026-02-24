@@ -232,13 +232,13 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
 template <typename T>
 bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
     try {
-        // Step 1: Execute TwoShotAllReduceSdma kernel
-        // The kernel uses:
-        //   - input: user input data (elementCount elements)
-        //   - input_transit_buffer_obj_ as srcMemObj (not directly used for data in current kernel,
-        //     but needed as a parameter)
-        //   - output_transit_buffer_obj_ as dstMemObj (intermediate gather + reduce + allgather buffer)
-        //   - flagsObj_ for synchronization flags
+        // Step 1: Copy user input to input transit buffer (symmetric memory)
+        // Phase 1 reduce-scatter reads from srcMemObj->peerPtrs[pe].
+        copy_input_to_transit(input, total_count, stream);
+
+        // Step 2: Execute TwoShotAllReduceSdma kernel
+        // Phase 1: Reduce-scatter (no SDMA, direct reads from srcMemObj)
+        // Phase 2: AllGather via SDMA
         TwoShotAllReduceSdmaKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
             input,
@@ -253,7 +253,7 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
             return false;
         }
 
-        // Step 2: Copy from output transit buffer to user output buffer (if enabled)
+        // Step 3: Copy from output transit buffer to user output buffer (if enabled)
         // The result in dstMemObj is laid out with elementCountPerRank-stride shards;
         // the first total_count elements form the complete allreduce result.
         if (copy_output_to_user_) {
