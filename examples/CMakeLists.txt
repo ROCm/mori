@@ -63,6 +63,8 @@ add_executable(allgather_sdma collective/sdma_allgather_example.cpp)
 target_link_libraries(allgather_sdma mori_collective mori_shmem hip::host hip::device)
 add_executable(all2all_sdma collective/sdma_all2all_example.cpp)
 target_link_libraries(all2all_sdma mori_collective mori_shmem hip::host hip::device)
+add_executable(allreduce_sdma collective/sdma_allreduce_example.cpp)
+target_link_libraries(allreduce_sdma mori_collective mori_shmem hip::host hip::device)
 
 add_executable(concurrent_put_thread shmem/concurrent_put_thread.cpp)
 target_link_libraries(concurrent_put_thread mori_shmem hip::host hip::device)

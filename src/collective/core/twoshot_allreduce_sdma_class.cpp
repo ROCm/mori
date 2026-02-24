@@ -22,10 +22,13 @@
 
 #include "mori/collective/allreduce/twoshot_allreduce_sdma_class.hpp"
 #include "mori/collective/allreduce/twoshot_sdma_kernel.hpp"
+#include "mori/collective/allgather/oneshot_sdma_async_kernel.hpp"
+#include "mori/collective/allreduce/twoshot_sdma_async_kernel.hpp"
 #include "mori/shmem/shmem.hpp"
 #include <stdexcept>
 #include <cstring>
 #include <cstdio>
+#include <algorithm>
 
 namespace mori {
 namespace collective {
@@ -50,6 +53,12 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size, si
       output_transit_buffer_(nullptr),
       output_transit_buffer_size_(output_buffer_size),
       output_transit_buffer_ptr_(nullptr, ShmemDeleter()),
+      async_in_progress_(false),
+      async_input_(nullptr),
+      async_output_(nullptr),
+      async_total_count_(0),
+      async_stream_(nullptr),
+      async_start_time_(0.0),
       copy_output_to_user_(copy_output_to_user) {
 
     // 1. Allocate and initialize flags memory
@@ -103,7 +112,9 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size, si
 // Destructor
 template <typename T>
 AllreduceSdma<T>::~AllreduceSdma() {
-    // Memory is automatically managed by unique_ptr, ShmemDeleter will auto-free during destruction
+    if (async_in_progress_) {
+        cancel_async();
+    }
     if (flags_) {
         printf("AllreduceSdma destroyed: PE %d\n", myPe_);
     }
@@ -231,6 +242,11 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
 // Synchronization must be done by caller
 template <typename T>
 bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
+    if (async_in_progress_) {
+        printf("PE %d: Cannot execute sync operation while async is in progress\n", myPe_);
+        return false;
+    }
+
     try {
         // Step 1: Execute TwoShotAllReduceSdma kernel
         // The kernel uses:
@@ -267,6 +283,181 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
 
     return true;
 }
+
+// ================ Async API Implementations ================
+
+template <typename T>
+bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipStream_t stream) {
+    bool expected = false;
+    if (!async_in_progress_.compare_exchange_strong(expected, true)) {
+        printf("PE %d: Another async operation is already in progress\n", myPe_);
+        return false;
+    }
+
+    async_input_ = input;
+    async_output_ = output;
+    async_total_count_ = total_count;
+    async_stream_ = stream;
+    async_start_time_ = MPI_Wtime();
+
+    try {
+        // Ensure output transit buffer is large enough for the allgather phase
+        size_t required_output_size = total_count * npes_ * dtype_size_;
+        if (!ensure_buffer_size(output_transit_buffer_, output_transit_buffer_ptr_,
+                                output_transit_buffer_size_, output_transit_buffer_obj_,
+                                required_output_size, "output transit buffer")) {
+            async_in_progress_ = false;
+            return false;
+        }
+
+        printf("PE %d: Starting async AllReduce (AllGather PUT phase)\n", myPe_);
+        printf("PE %d: Launching async PUT kernel...\n", myPe_);
+
+        int block_size = 256;
+        int grid_size = static_cast<int>(
+            std::min(static_cast<size_t>((total_count * npes_ + block_size - 1) / block_size),
+                     static_cast<size_t>(65535)));
+        if (grid_size < 1) grid_size = 1;
+
+        printf("  Grid size: %d, Block size: %d\n", grid_size, block_size);
+
+        // Reuse the allgather async PUT kernel: sends each PE's full input
+        // to every remote PE's output_transit_buffer at offset myPe * elementCount
+        OneShotAllGatherSdmaAsyncPutKernel<T><<<1, 512, 0, stream>>>(
+            myPe_, npes_,
+            input,
+            input_transit_buffer_obj_,
+            output_transit_buffer_obj_,
+            flagsObj_, total_count);
+
+        hipError_t kernel_err = hipGetLastError();
+        if (kernel_err != hipSuccess) {
+            printf("PE %d: Async kernel launch failed: %s\n",
+                   myPe_, hipGetErrorString(kernel_err));
+            throw std::runtime_error("Kernel launch failed");
+        }
+
+        printf("PE %d: Async PUT operation started successfully\n", myPe_);
+        return true;
+
+    } catch (const std::exception& e) {
+        printf("PE %d: Failed to start async operation: %s\n", myPe_, e.what());
+        async_in_progress_ = false;
+        return false;
+    }
+}
+
+template <typename T>
+double AllreduceSdma<T>::wait_async(hipStream_t stream) {
+    if (!async_in_progress_) {
+        printf("PE %d: No async operation in progress\n", myPe_);
+        return -1.0;
+    }
+
+    try {
+        printf("PE %d: Waiting for async AllReduce completion (WAIT phase)\n", myPe_);
+
+        hipStream_t wait_stream = (stream != nullptr) ? stream : async_stream_;
+
+        // Step 1: Launch wait kernel — same as allgather, waits for all SDMA transfers
+        OneShotAllGatherSdmaAsyncWaitKernel<<<1, 64, 0, wait_stream>>>(
+            myPe_, npes_, output_transit_buffer_obj_, flagsObj_);
+
+        // Synchronize to ensure all data has arrived
+        printf("PE %d: Synchronizing to ensure AllGather completion\n", myPe_);
+        if (wait_stream != nullptr) {
+            hipError_t err = hipStreamSynchronize(wait_stream);
+            if (err != hipSuccess) {
+                printf("PE %d: Stream synchronization failed: %s\n",
+                       myPe_, hipGetErrorString(err));
+                throw std::runtime_error("Stream synchronization failed");
+            }
+        } else {
+            hipError_t err = hipDeviceSynchronize();
+            if (err != hipSuccess) {
+                printf("PE %d: Device synchronization failed: %s\n",
+                       myPe_, hipGetErrorString(err));
+                throw std::runtime_error("Device synchronization failed");
+            }
+        }
+
+        // Step 2: Local reduce — sum all npes chunks in output_transit_buffer
+        printf("PE %d: Performing local reduce (summing %d chunks)\n", myPe_, npes_);
+
+        T* gathered = static_cast<T*>(output_transit_buffer_);
+        int reduce_block_size = 256;
+        int reduce_grid_size = static_cast<int>(
+            std::min(static_cast<size_t>((async_total_count_ + reduce_block_size - 1) / reduce_block_size),
+                     static_cast<size_t>(65535)));
+        if (reduce_grid_size < 1) reduce_grid_size = 1;
+
+        AllReduceLocalSumKernel<T><<<reduce_grid_size, reduce_block_size, 0, wait_stream>>>(
+            gathered, async_total_count_, npes_);
+
+        hipError_t reduce_err = hipGetLastError();
+        if (reduce_err != hipSuccess) {
+            printf("PE %d: Reduce kernel launch failed: %s\n",
+                   myPe_, hipGetErrorString(reduce_err));
+            throw std::runtime_error("Reduce kernel launch failed");
+        }
+
+        // Synchronize to ensure reduce completes
+        if (wait_stream != nullptr) {
+            (void)hipStreamSynchronize(wait_stream);
+        } else {
+            (void)hipDeviceSynchronize();
+        }
+
+        // Step 3: Copy reduced result to user output buffer (if enabled)
+        if (copy_output_to_user_) {
+            printf("PE %d: Copying reduced results to user output buffer\n", myPe_);
+            copy_output_to_user(async_output_, async_total_count_, wait_stream);
+        } else {
+            printf("PE %d: Skipping copy to user output buffer (using output_transit_buffer directly)\n", myPe_);
+        }
+
+        // Final synchronization
+        if (wait_stream != nullptr) {
+            (void)hipStreamSynchronize(wait_stream);
+        } else {
+            (void)hipDeviceSynchronize();
+        }
+
+        double end_time = MPI_Wtime();
+        double duration = end_time - async_start_time_;
+
+        printf("PE %d: Async AllReduce completed in %.6f seconds\n", myPe_, duration);
+
+        async_in_progress_ = false;
+        async_input_ = nullptr;
+        async_output_ = nullptr;
+        async_total_count_ = 0;
+        async_stream_ = nullptr;
+        async_start_time_ = 0.0;
+
+        return duration;
+
+    } catch (const std::exception& e) {
+        printf("PE %d: Async wait failed: %s\n", myPe_, e.what());
+        cancel_async();
+        return -1.0;
+    }
+}
+
+template <typename T>
+void AllreduceSdma<T>::cancel_async() {
+    if (async_in_progress_) {
+        printf("PE %d: Cancelling async operation\n", myPe_);
+        async_in_progress_ = false;
+        async_input_ = nullptr;
+        async_output_ = nullptr;
+        async_total_count_ = 0;
+        async_stream_ = nullptr;
+        async_start_time_ = 0.0;
+    }
+}
+
+// ================ END: Async API Implementations ================
 
 // resetFlags implementation
 template <typename T>

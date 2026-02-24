@@ -60,6 +60,14 @@ private:
     application::SymmMemObjPtr output_transit_buffer_obj_;
     std::unique_ptr<void, ShmemDeleter> output_transit_buffer_ptr_;
 
+    // Async state variables
+    std::atomic<bool> async_in_progress_;
+    T* async_input_;
+    T* async_output_;
+    size_t async_total_count_;
+    hipStream_t async_stream_;
+    double async_start_time_;
+
     // Copy mode flag: if true, copy output_transit_buffer to user output buffer
     // if false, user should directly use output_transit_buffer
     bool copy_output_to_user_;
@@ -114,6 +122,35 @@ public:
      * @note Synchronization must be handled by the caller
      */
     bool operator()(T* input, T* output, size_t total_count, hipStream_t stream = nullptr);
+
+    /**
+     * @brief Start asynchronous AllReduce operation (AllGather PUT phase)
+     * @param input Input data pointer
+     * @param output Output data pointer
+     * @param total_count Number of data elements per PE
+     * @param stream HIP stream
+     * @return true if successful, false otherwise
+     */
+    bool start_async(T* input, T* output, size_t total_count, hipStream_t stream = nullptr);
+
+    /**
+     * @brief Wait for asynchronous AllReduce operation to complete
+     *        (WAIT phase + local reduce + optional copy)
+     * @param stream HIP stream (optional, can be different from start_async stream)
+     * @return Execution time in seconds, -1.0 if failed
+     */
+    double wait_async(hipStream_t stream = nullptr);
+
+    /**
+     * @brief Check if async operation is in progress
+     * @return true if async operation is active
+     */
+    bool is_async_in_progress() const { return async_in_progress_; }
+
+    /**
+     * @brief Cancel ongoing async operation
+     */
+    void cancel_async();
 
     /**
      * @brief Gets flag symmetric memory object
