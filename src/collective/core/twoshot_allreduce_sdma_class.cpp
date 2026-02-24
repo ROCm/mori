@@ -348,10 +348,20 @@ double AllreduceSdma<T>::wait_async(hipStream_t stream) {
         TwoShotAllReduceSdmaAsyncWaitKernel<<<1, 64, 0, wait_stream>>>(
             myPe_, npes_, output_transit_buffer_obj_, flagsObj_);
 
-        // Step 2: Local reduce — sum all npes chunks element-wise (64 CUs)
+        // Step 2: Local reduce — sum all npes chunks element-wise
+        // Needs many blocks to saturate HBM bandwidth (unlike the wait kernel
+        // which only monitors npes flags and uses <<<1,64>>>)
         T* gathered = static_cast<T*>(output_transit_buffer_);
+        int reduce_block_size = 256;
+        int reduce_grid_size = static_cast<int>(
+            std::min(static_cast<size_t>((async_total_count_ + reduce_block_size - 1) / reduce_block_size),
+                     static_cast<size_t>(65535)));
+        if (reduce_grid_size < 1) reduce_grid_size = 1;
 
-        AllReduceLocalSumKernel<T><<<64, 256, 0, wait_stream>>>(
+        printf("PE %d: Reduce kernel grid=%d, block=%d, threads=%d\n",
+               myPe_, reduce_grid_size, reduce_block_size, reduce_grid_size * reduce_block_size);
+
+        AllReduceLocalSumKernel<T><<<reduce_grid_size, reduce_block_size, 0, wait_stream>>>(
             gathered, async_total_count_, npes_);
 
         // Step 3: Copy reduced result to user output buffer (if enabled)
