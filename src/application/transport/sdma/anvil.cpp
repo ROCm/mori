@@ -164,8 +164,8 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
    memFlags.ui32.ExecuteAccess = 1;
    memFlags.ui32.Uncached = 1;
    
-   std::cout << "Allocating SDMA Queue Buffer for device: " << localNodeId << std::endl <<
-   std::flush;
+   //std::cout << "Allocating SDMA Queue Buffer for device: " << localNodeId << std::endl <<
+   //std::flush;
 
 
    CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(localNodeId, SDMA_QUEUE_SIZE, memFlags, &queueBuffer_), "Failed");

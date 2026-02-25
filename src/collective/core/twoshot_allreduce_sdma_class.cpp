@@ -358,9 +358,6 @@ double AllreduceSdma<T>::wait_async(hipStream_t stream) {
                      static_cast<size_t>(65535)));
         if (reduce_grid_size < 1) reduce_grid_size = 1;
 
-        printf("PE %d: Reduce kernel grid=%d, block=%d, threads=%d\n",
-               myPe_, reduce_grid_size, reduce_block_size, reduce_grid_size * reduce_block_size);
-
         AllReduceLocalSumKernel<T><<<reduce_grid_size, reduce_block_size, 0, wait_stream>>>(
             gathered, async_total_count_, npes_);
 
