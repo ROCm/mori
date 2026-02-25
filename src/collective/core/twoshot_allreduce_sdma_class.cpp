@@ -247,28 +247,47 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
     }
 
     try {
-        // Step 1: Execute TwoShotAllReduceSdma kernel
-        // The kernel uses:
-        //   - input: user input data (elementCount elements)
-        //   - input_transit_buffer_obj_ as srcMemObj (not directly used for data in current kernel,
-        //     but needed as a parameter)
-        //   - output_transit_buffer_obj_ as dstMemObj (intermediate gather + reduce + allgather buffer)
-        //   - flagsObj_ for synchronization flags
-        TwoShotAllReduceSdmaKernel<T><<<1, 512, 0, stream>>>(
+        // Step 1: Copy user input to input transit buffer (symmetric memory)
+        // ReduceScatterKernel reads from srcMemObj->peerPtrs[pe].
+        copy_input_to_transit(input, total_count, stream);
+
+        // Step 2: ReduceScatter — each rank reduces its partition via direct reads
+        constexpr int pack_size = packed_t<T>::P::size;
+        constexpr int kMaxBlocks = 80;
+        int threads = 512;
+        int packedSize = static_cast<int>(total_count) / pack_size;
+        int threadsPerRank = threads / npes_;
+        int partSize = packedSize / npes_;
+        int blocks = std::min(kMaxBlocks, (partSize + threadsPerRank - 1) / threadsPerRank);
+        if (blocks < 1) blocks = 1;
+
+        ReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(
             myPe_, npes_,
-            input,
             input_transit_buffer_obj_,
             output_transit_buffer_obj_,
-            flagsObj_, total_count);
+            total_count);
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess) {
-            fprintf(stderr, "PE %d: AllReduce kernel launch failed: %s\n",
+            fprintf(stderr, "PE %d: ReduceScatter kernel launch failed: %s\n",
                     myPe_, hipGetErrorString(err));
             return false;
         }
 
-        // Step 2: Copy from output transit buffer to user output buffer (if enabled)
+        // Step 3: AllGather via SDMA — broadcast reduced shards to all ranks
+        AllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
+            myPe_, npes_,
+            output_transit_buffer_obj_,
+            flagsObj_, total_count);
+
+        err = hipGetLastError();
+        if (err != hipSuccess) {
+            fprintf(stderr, "PE %d: AllGather kernel launch failed: %s\n",
+                    myPe_, hipGetErrorString(err));
+            return false;
+        }
+
+        // Step 4: Copy from output transit buffer to user output buffer (if enabled)
         // The result in dstMemObj is laid out with elementCountPerRank-stride shards;
         // the first total_count elements form the complete allreduce result.
         if (copy_output_to_user_) {
@@ -416,6 +435,18 @@ void AllreduceSdma<T>::cancel_async() {
 }
 
 // ================ END: Async API Implementations ================
+
+// allreduce_inplace implementation
+template <typename T>
+bool AllreduceSdma<T>::allreduce_inplace(T* data, size_t total_count, hipStream_t stream) {
+    // Temporarily force copy-back regardless of copy_output_to_user_ setting,
+    // since inplace semantics require the result to be written back to data.
+    bool saved = copy_output_to_user_;
+    copy_output_to_user_ = true;
+    bool ok = (*this)(data, data, total_count, stream);
+    copy_output_to_user_ = saved;
+    return ok;
+}
 
 // resetFlags implementation
 template <typename T>

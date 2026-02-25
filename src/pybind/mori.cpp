@@ -990,6 +990,37 @@ void RegisterMoriCcl(pybind11::module_& m) {
             py::arg("count"),
             py::arg("stream") = py::none(),
             "Execute AllReduce SDMA operation (returns bool), synchronization must be done by caller")
+        .def("allreduce_inplace",
+            [](mori::collective::AllreduceSdma<uint32_t>& self,
+               const torch::Tensor& tensor,
+               size_t count,
+               py::object stream_obj) -> bool {
+
+                if (tensor.dim() != 1) {
+                    throw std::runtime_error("Tensor must be 1-dimensional");
+                }
+                if (!tensor.is_cuda()) {
+                    throw std::runtime_error("Tensor must be CUDA tensor");
+                }
+
+                uint32_t* ptr = nullptr;
+                if (tensor.scalar_type() == torch::kUInt32) {
+                    ptr = tensor.data_ptr<uint32_t>();
+                } else if (tensor.scalar_type() == torch::kInt32) {
+                    ptr = reinterpret_cast<uint32_t*>(tensor.data_ptr<int32_t>());
+                } else {
+                    throw std::runtime_error("Tensor must be uint32 or int32");
+                }
+
+                int device_index = tensor.device().index();
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj, device_index);
+
+                return self.allreduce_inplace(ptr, count, stream);
+            },
+            py::arg("data"),
+            py::arg("count"),
+            py::arg("stream") = py::none(),
+            "Execute in-place AllReduce SDMA operation (result overwrites input)")
         .def("reset_flags",
             &mori::collective::AllreduceSdma<uint32_t>::resetFlags,
             "Reset synchronization flags")

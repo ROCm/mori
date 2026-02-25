@@ -67,9 +67,20 @@ double Allreduce_sdma(T* input, T* output, size_t total_count,
   assert(transitObj.IsValid());
   assert(flagsObj.IsValid());
 
+  constexpr int pack_size = packed_t<T>::P::size;
+  constexpr int kMaxBlocks = 80;
+  int threads = 512;
+  int packedSize = static_cast<int>(total_count) / pack_size;
+  int threadsPerRank = threads / npes;
+  int partSize = packedSize / npes;
+  int blocks = std::min(kMaxBlocks, (partSize + threadsPerRank - 1) / threadsPerRank);
+  if (blocks < 1) blocks = 1;
+
   double start = MPI_Wtime();
-  TwoShotAllReduceSdmaKernel<T><<<1, 512, 0, stream>>>(
-      myPe, npes, input, inPutBuffObj, transitObj, flagsObj, total_count);
+  ReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(
+      myPe, npes, inPutBuffObj, transitObj, total_count);
+  AllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
+      myPe, npes, transitObj, flagsObj, total_count);
 
   // Synchronize GPU to ensure kernel completion
   hipError_t sync_err;
