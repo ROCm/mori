@@ -292,7 +292,7 @@ class AllreduceSdma:
             self._handle = handle_class(my_pe, npes, 512 * 1024 * 1024, copy_output_to_user)
 
     def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
-        """Execute AllReduce SDMA operation.
+        """Execute out-of-place AllReduce SDMA operation.
         
         Args:
             input_data: Input CUDA tensor (torch.int32 or torch.uint32, 1D, GPU memory).
@@ -309,6 +309,24 @@ class AllreduceSdma:
             Caller must handle synchronization (stream.synchronize() or torch.cuda.synchronize())
         """
         return self._handle(input_data, output_data, count, stream)
+
+    def allreduce_inplace(self, data, count: int, stream=None) -> bool:
+        """Execute in-place AllReduce SDMA operation (result overwrites input).
+        
+        Args:
+            data: Input/output CUDA tensor (torch.int32 or torch.uint32, 1D, GPU memory).
+                  Contains `count` elements on this rank. After the operation, holds the
+                  element-wise sum across all ranks.
+            count: Number of elements per PE
+            stream: Optional HIP stream
+            
+        Returns:
+            True if successful, False if failed
+            
+        Note:
+            Caller must handle synchronization (stream.synchronize() or torch.cuda.synchronize())
+        """
+        return self._handle.allreduce_inplace(data, count, stream)
 
     def reset_flags(self):
         """Reset synchronization flags"""

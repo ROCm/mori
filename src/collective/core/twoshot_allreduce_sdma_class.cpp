@@ -287,6 +287,18 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
     return true;
 }
 
+// allreduce_inplace implementation
+template <typename T>
+bool AllreduceSdma<T>::allreduce_inplace(T* data, size_t total_count, hipStream_t stream) {
+    // Temporarily force copy-back regardless of copy_output_to_user_ setting,
+    // since inplace semantics require the result to be written back to data.
+    bool saved = copy_output_to_user_;
+    copy_output_to_user_ = true;
+    bool ok = (*this)(data, data, total_count, stream);
+    copy_output_to_user_ = saved;
+    return ok;
+}
+
 // resetFlags implementation
 template <typename T>
 void AllreduceSdma<T>::resetFlags() {

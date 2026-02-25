@@ -116,6 +116,16 @@ public:
     bool operator()(T* input, T* output, size_t total_count, hipStream_t stream = nullptr);
 
     /**
+     * @brief Executes in-place AllReduce SDMA operation (result overwrites input)
+     * @param data Input/output data pointer (elementCount elements on each rank)
+     * @param total_count Number of data elements per PE
+     * @param stream HIP stream
+     * @return true if successful, false if failed
+     * @note Synchronization must be handled by the caller
+     */
+    bool allreduce_inplace(T* data, size_t total_count, hipStream_t stream = nullptr);
+
+    /**
      * @brief Gets flag symmetric memory object
      */
     application::SymmMemObjPtr getFlagsObj() const { return flagsObj_; }
