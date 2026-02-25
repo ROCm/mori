@@ -328,6 +328,38 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
             return false;
         }
 
+        size_t required_input_size = total_count * dtype_size_;
+        if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
+                                input_transit_buffer_size_, input_transit_buffer_obj_,
+                                required_input_size, "input transit buffer")) {
+            async_in_progress_ = false;
+            return false;
+        }
+
+        // ---- P2P path: ReduceScatter via direct P2P reads ----
+        // Step 1: Copy user input to input transit buffer (symmetric memory)
+        copy_input_to_transit(input, total_count, stream);
+
+        // Step 2: P2P ReduceScatter — each PE reads all PEs' data via peerPtrs
+        //         and reduces its own shard. Result in output_transit_buffer slot myPe.
+        constexpr int pack_size = packed_t<T>::P::size;
+        int packedPerRank = static_cast<int>(elementCountPerRank / pack_size);
+        int reduce_threads = 512;
+        int reduce_blocks = std::min(80, (packedPerRank + reduce_threads - 1) / reduce_threads);
+        if (reduce_blocks < 1) reduce_blocks = 1;
+
+        ReduceScatterP2pKernel<T><<<reduce_blocks, reduce_threads, 0, stream>>>(
+            myPe_, npes_,
+            input_transit_buffer_obj_,
+            output_transit_buffer_obj_,
+            total_count);
+
+        // Step 3: AllGather PUT — send my reduced shard to all PEs via SDMA
+        AllGatherReducedSdmaPutKernel<T><<<1, 512, 0, stream>>>(
+            myPe_, npes_, output_transit_buffer_obj_, elementCountPerRank);
+
+#if 0
+        // ---- SDMA path (kept for comparison): ReduceScatter via SDMA PUT ----
         // Phase 1: Scatter PUT — send shard_j of my input to PE j
         ReduceScatterSdmaPutKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_, input, output_transit_buffer_obj_, elementCountPerRank);
@@ -337,19 +369,19 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
             myPe_, npes_, output_transit_buffer_obj_, flagsObj_);
 
         // Phase 2: Local reduce — sum npes copies of my shard, write to slot myPe
-        // Grid size proportional to data size (elementCountPerRank, not full elementCount)
-        int reduce_block_size = 256;
-        int reduce_grid_size = static_cast<int>(
-            std::min(static_cast<size_t>((elementCountPerRank + reduce_block_size - 1) / reduce_block_size),
+        int sdma_reduce_block_size = 256;
+        int sdma_reduce_grid_size = static_cast<int>(
+            std::min(static_cast<size_t>((elementCountPerRank + sdma_reduce_block_size - 1) / sdma_reduce_block_size),
                      static_cast<size_t>(65535)));
-        if (reduce_grid_size < 1) reduce_grid_size = 1;
+        if (sdma_reduce_grid_size < 1) sdma_reduce_grid_size = 1;
 
-        ReduceScatterLocalReduceKernel<T><<<reduce_grid_size, reduce_block_size, 0, stream>>>(
+        ReduceScatterLocalReduceKernel<T><<<sdma_reduce_grid_size, sdma_reduce_block_size, 0, stream>>>(
             static_cast<T*>(output_transit_buffer_), elementCountPerRank, myPe_, npes_);
 
         // Phase 3: AllGather PUT — send my reduced shard to all PEs
         AllGatherReducedSdmaPutKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_, output_transit_buffer_obj_, elementCountPerRank);
+#endif
 
         hipError_t kernel_err = hipGetLastError();
         if (kernel_err != hipSuccess) {
