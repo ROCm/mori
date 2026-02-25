@@ -341,7 +341,7 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
           EpDispatchCopyToStaging<<<this->multiProcessorCount, block, 0, stream>>>(args);
           EpDispatchInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeV1LL) {
-          EpDispatchCopyToStaging<<<this->multiProcessorCount, this->maxThreads, 0, stream>>>(args);
+          EpDispatchCopyToStaging<<<this->multiProcessorCount, block, 0, stream>>>(args);
           EpDispatchInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
