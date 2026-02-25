@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 
+#include <algorithm>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
@@ -61,7 +62,7 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
   InitializeBarrier();
 
   this->multiProcessorCount = GetCurDeviceMultiProcessorCount();
-  this->maxThreads = GetCurDeviceMaxThreads();
+  this->maxThreads = std::min(GetCurDeviceMaxThreads(), 1024);
   MORI_OPS_INFO("Device capability: multiProcessorCount=%d, maxThreads=%d",
                 static_cast<int>(this->multiProcessorCount), static_cast<int>(this->maxThreads));
 }
