@@ -32,22 +32,18 @@
 namespace mori {
 namespace collective {
 template <typename T>
-__global__ void TwoShotAllReduceSdmaKernel(int myPe, int npes,
-		                               T* input,
-                                       const application::SymmMemObjPtr srcMemObj,
-                                       const application::SymmMemObjPtr dstMemObj,
-                                       const application::SymmMemObjPtr flagsMemObj,
-                                       size_t elementCount) {
+__global__ void ReduceScatterKernel(int myPe, int npes,
+                                    const application::SymmMemObjPtr srcMemObj,
+                                    const application::SymmMemObjPtr dstMemObj,
+                                    size_t elementCount) {
   if (elementCount == 0 || npes <= 0) {
     return;
   }
 
-  // --- Packed-type declarations ---------------------------------------------
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
   constexpr int pack_size = P::size;
 
-  // --- Uniform, pack_size-aligned shard size --------------------------------
   const size_t elementCountPerRank =
       ((elementCount / npes + pack_size - 1) / pack_size) * pack_size;
   const size_t packedPerRank = elementCountPerRank / pack_size;
@@ -60,27 +56,12 @@ __global__ void TwoShotAllReduceSdmaKernel(int myPe, int npes,
   const size_t start = static_cast<size_t>(myPe) * packedPerRank;
   const size_t end = (myPe == npes - 1) ? totalPacked : start + packedPerRank;
 
-  // --- Common variables -----------------------------------------------------
   P* __restrict__ result = reinterpret_cast<P*>(dstMemObj->localPtr);
-  uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
-  int flag_val = 1;
+  P* __restrict__ myDst = result + start;
 
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
   const size_t threadsPerGrid = static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
-  const size_t bytesPerElement = sizeof(T);
-
-  int warpId     = threadLinearId / warpSize;
-  const int laneId = threadIdx.x % warpSize;
-
-  // =========================================================================
-  // Phase 1: Reduce-Scatter (ref: cross_device_reduce_2stage stage 1)
-  //
-  // Each rank owns partition [start, end). At each global index idx in that
-  // range, reduce across all ranks by reading from srcMemObj->peerPtrs[pe]
-  // (no SDMA — direct cross-device loads). Write to myDst[idx - start].
-  // =========================================================================
-  P* __restrict__ myDst = result + start;
 
   for (size_t idx = start + threadLinearId; idx < end; idx += threadsPerGrid) {
     const P* p0 = reinterpret_cast<const P*>(srcMemObj->peerPtrs[0]);
@@ -91,20 +72,46 @@ __global__ void TwoShotAllReduceSdmaKernel(int myPe, int npes,
     }
     myDst[idx - start] = downcast_v<typename P::type, pack_size>(add_reg);
   }
+}
 
-  __threadfence();
-  __syncthreads();
+// ============================================================================
+// Kernel 2: AllGather via SDMA
+//
+// Each rank sends its reduced shard (at dstMemObj->localPtr + myPe * stride)
+// to every rank via SDMA put, then waits for all peers to finish.
+// ============================================================================
+template <typename T>
+__global__ void AllGatherSdmaKernel(int myPe, int npes,
+                                    const application::SymmMemObjPtr dstMemObj,
+                                    const application::SymmMemObjPtr flagsMemObj,
+                                    size_t elementCount) {
+  if (elementCount == 0 || npes <= 0) {
+    return;
+  }
 
-  // =========================================================================
-  // Phase 2: AllGather via SDMA  (output → dstMemObj / result)
-  //
-  // Each rank sends its reduced shard (elementCountPerRank elements) to
-  // every rank.  Source and destination use the same uniform stride
-  // (elementCountPerRank), so they coincide — no overlap concern.
-  // =========================================================================
-  uint8_t* agSrcPtr = reinterpret_cast<uint8_t*>(result)
+  using P = typename packed_t<T>::P;
+  constexpr int pack_size = P::size;
+
+  const size_t elementCountPerRank =
+      ((elementCount / npes + pack_size - 1) / pack_size) * pack_size;
+
+  if (elementCountPerRank == 0) {
+    return;
+  }
+
+  const size_t bytesPerElement = sizeof(T);
+  uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
+  int flag_val = 1;
+
+  const size_t threadLinearId =
+      static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
+  int warpId = threadLinearId / warpSize;
+  const int laneId = threadIdx.x % warpSize;
+
+  // --- SDMA put: send my reduced shard to every rank -------------------------
+  uint8_t* agSrcPtr = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
                       + static_cast<size_t>(myPe) * elementCountPerRank * bytesPerElement;
-  size_t   agSendBytes = elementCountPerRank * bytesPerElement;
+  size_t agSendBytes = elementCountPerRank * bytesPerElement;
 
   if (warpId < npes && laneId == 0) {
     int remotePe = warpId;
@@ -122,7 +129,7 @@ __global__ void TwoShotAllReduceSdmaKernel(int myPe, int npes,
                         dest->sdmaNumQueue, 0);
   }
 
-  // --- Notify remote PEs that our AllGather data is in place ----------------
+  // --- Notify remote PEs that our data is in place ---------------------------
   if (warpId < npes && laneId == 0) {
     int remotePe = warpId;
     shmem::ShmemQuietThread(remotePe, dstMemObj);
@@ -132,7 +139,7 @@ __global__ void TwoShotAllReduceSdmaKernel(int myPe, int npes,
   }
   __syncthreads();
 
-  // --- Wait for all peers to finish AllGather into our dstMemObj buffer -----
+  // --- Wait for all peers to finish AllGather --------------------------------
   for (int sender = 0; sender < npes; ++sender) {
     if (sender == myPe) {
       continue;
@@ -142,7 +149,7 @@ __global__ void TwoShotAllReduceSdmaKernel(int myPe, int npes,
       while (core::AtomicLoadRelaxed(flags + sender) == 0) {
         ++spinCount;
         if (spinCount > 10000000) {
-          printf("PE %d: Phase 3 timeout waiting for peer %d\n", myPe, sender);
+          printf("PE %d: AllGather timeout waiting for peer %d\n", myPe, sender);
           break;
         }
       }

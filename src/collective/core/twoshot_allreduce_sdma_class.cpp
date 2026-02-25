@@ -233,27 +233,46 @@ template <typename T>
 bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
     try {
         // Step 1: Copy user input to input transit buffer (symmetric memory)
-        // Phase 1 reduce-scatter reads from srcMemObj->peerPtrs[pe].
+        // ReduceScatterKernel reads from srcMemObj->peerPtrs[pe].
         copy_input_to_transit(input, total_count, stream);
 
-        // Step 2: Execute TwoShotAllReduceSdma kernel
-        // Phase 1: Reduce-scatter (no SDMA, direct reads from srcMemObj)
-        // Phase 2: AllGather via SDMA
-        TwoShotAllReduceSdmaKernel<T><<<1, 512, 0, stream>>>(
+        // Step 2: ReduceScatter — each rank reduces its partition via direct reads
+        constexpr int pack_size = packed_t<T>::P::size;
+        constexpr int kMaxBlocks = 80;
+        int threads = 512;
+        int packedSize = static_cast<int>(total_count) / pack_size;
+        int threadsPerRank = threads / npes_;
+        int partSize = packedSize / npes_;
+        int blocks = std::min(kMaxBlocks, (partSize + threadsPerRank - 1) / threadsPerRank);
+        if (blocks < 1) blocks = 1;
+
+        ReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(
             myPe_, npes_,
-            input,
             input_transit_buffer_obj_,
             output_transit_buffer_obj_,
-            flagsObj_, total_count);
+            total_count);
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess) {
-            fprintf(stderr, "PE %d: AllReduce kernel launch failed: %s\n",
+            fprintf(stderr, "PE %d: ReduceScatter kernel launch failed: %s\n",
                     myPe_, hipGetErrorString(err));
             return false;
         }
 
-        // Step 3: Copy from output transit buffer to user output buffer (if enabled)
+        // Step 3: AllGather via SDMA — broadcast reduced shards to all ranks
+        AllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
+            myPe_, npes_,
+            output_transit_buffer_obj_,
+            flagsObj_, total_count);
+
+        err = hipGetLastError();
+        if (err != hipSuccess) {
+            fprintf(stderr, "PE %d: AllGather kernel launch failed: %s\n",
+                    myPe_, hipGetErrorString(err));
+            return false;
+        }
+
+        // Step 4: Copy from output transit buffer to user output buffer (if enabled)
         // The result in dstMemObj is laid out with elementCountPerRank-stride shards;
         // the first total_count elements form the complete allreduce result.
         if (copy_output_to_user_) {
