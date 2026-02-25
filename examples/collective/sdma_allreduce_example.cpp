@@ -298,9 +298,12 @@ void testAllreduceSdma() {
         printf("Max avg time across PEs: %.6f seconds\n", global_max_time);
         printf("Avg time across PEs:     %.6f seconds\n", global_avg_time);
 
-        double global_bandwidth = bytesPerPe / global_avg_time / (1024.0 * 1024.0 * 1024.0);
-        printf("Bandwidth: %.2f GB/s\n", global_bandwidth);
-        printf("Data size per PE: %.3f GB\n", bytesPerPe / (1024.0 * 1024.0 * 1024.0));
+        double bus_bandwidth = totalBytes / global_avg_time / (1024.0 * 1024.0 * 1024.0);
+        double algo_bandwidth = bytesPerPe / global_avg_time / (1024.0 * 1024.0 * 1024.0);
+        printf("Bus  bandwidth: %.2f GB/s (total data: %.3f GB)\n",
+               bus_bandwidth, totalBytes / (1024.0 * 1024.0 * 1024.0));
+        printf("Algo bandwidth: %.2f GB/s (data per PE: %.3f GB)\n",
+               algo_bandwidth, bytesPerPe / (1024.0 * 1024.0 * 1024.0));
 
         printf("\n=== Global Verification Results ===\n");
         printf("PEs passed: %d/%d\n", global_success_sum, npes);
