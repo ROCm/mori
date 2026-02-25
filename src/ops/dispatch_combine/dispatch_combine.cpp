@@ -61,6 +61,9 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
   InitializeBarrier();
 
   this->multiProcessorCount = GetCurDeviceMultiProcessorCount();
+  this->maxThreads = GetCurDeviceMaxThreads();
+  MORI_OPS_INFO("Device capability: multiProcessorCount=%d, maxThreads=%d",
+                static_cast<int>(this->multiProcessorCount), static_cast<int>(this->maxThreads));
 }
 
 EpDispatchCombineHandle::~EpDispatchCombineHandle() {
@@ -337,7 +340,7 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
           EpDispatchCopyToStaging<<<this->multiProcessorCount, block, 0, stream>>>(args);
           EpDispatchInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeV1LL) {
-          EpDispatchCopyToStaging<<<this->multiProcessorCount, block, 0, stream>>>(args);
+          EpDispatchCopyToStaging<<<this->multiProcessorCount, this->maxThreads, 0, stream>>>(args);
           EpDispatchInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
