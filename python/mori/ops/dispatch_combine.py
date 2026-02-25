@@ -159,15 +159,18 @@ class EpDispatchCombineOp:
 
         self.launch_config_mode = os.environ.get("MORI_EP_LAUNCH_CONFIG_MODE", "MANUAL")
         if self.launch_config_mode == "AUTO":
-            if self.config.kernel_type.value in (
-                EpDispatchCombineKernelType.InterNodeV1.value,
-                EpDispatchCombineKernelType.InterNodeV1LL.value,
-            ):
+            if self.config.kernel_type.value == EpDispatchCombineKernelType.InterNodeV1.value:
                 (
                     self.auto_block_num,
                     self.auto_rdma_block_num,
                     self.auto_warp_per_block,
                 ) = (96, 64, 8)
+            elif self.config.kernel_type.value == EpDispatchCombineKernelType.InterNodeV1LL.value:
+                (
+                    self.auto_block_num,
+                    self.auto_rdma_block_num,
+                    self.auto_warp_per_block,
+                ) = (256, 128, 8)
             else:
                 (
                     self.auto_block_num,
