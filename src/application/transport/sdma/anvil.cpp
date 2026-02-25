@@ -261,8 +261,8 @@ void AnvilLib::init()
 bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels)
 {
    uint32_t engineId = getSdmaEngineId(srcDeviceId, dstDeviceId); // + 1) * 2;
-   std::cout << "Connect from " << srcDeviceId << " to " << dstDeviceId << " with " << numChannels
-             << " channels using engine " << engineId << std::endl;
+   //std::cout << "Connect from " << srcDeviceId << " to " << dstDeviceId << " with " << numChannels
+   //          << " channels using engine " << engineId << std::endl;
    for (int c = 0; c < numChannels; ++c)
    {
       sdma_channels_[dstDeviceId].emplace_back(

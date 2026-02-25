@@ -30,59 +30,57 @@
 namespace mori {
 namespace collective {
 
-// PUT kernel for TwoShot AllReduce async: sends each PE's full input to every
-// remote PE's output_transit_buffer at offset myPe * elementCount.
-// Same SDMA logic as the allgather async PUT kernel.
+// ============================================================
+// Phase 1: Reduce-Scatter SDMA PUT kernel
+//
+// Each PE sends shard_j of its input to PE j's output buffer
+// at slot myPe. Uses multi-queue SDMA for bandwidth.
+//
+// After all PEs complete, PE j's output buffer has:
+//   slot 0: PE 0's shard_j
+//   slot 1: PE 1's shard_j
+//   ...
+//   slot npes-1: PE (npes-1)'s shard_j
+// ============================================================
 template <typename T>
-__global__ void TwoShotAllReduceSdmaAsyncPutKernel(int myPe, int npes,
-                                       T* input,
-                                       const application::SymmMemObjPtr srcMemObj,
-                                       const application::SymmMemObjPtr dstMemObj,
-                                       const application::SymmMemObjPtr flagsMemObj,
-                                       size_t elementCount) {
-  if (elementCount == 0 || npes <= 0) {
-    return;
-  }
-
-  T* __restrict__ inputData = input;
-  T* __restrict__ dst = reinterpret_cast<T*>(dstMemObj->localPtr);
-  uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
+__global__ void ReduceScatterSdmaPutKernel(int myPe, int npes,
+                                           T* input,
+                                           const application::SymmMemObjPtr dstMemObj,
+                                           size_t elementCountPerRank) {
+  const size_t bytesPerElement = sizeof(T);
+  const size_t bytesPerPeer = elementCountPerRank * bytesPerElement;
 
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
-  const size_t threadsPerGrid = static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
-  const size_t stride = threadsPerGrid > 0 ? threadsPerGrid : 1;
 
-  const size_t bytesPerElement = sizeof(T);
-  const size_t bytesPerPeer = elementCount * bytesPerElement;
-  const size_t elemsPerPeer = elementCount;
-
-  int warpId = threadLinearId / warpSize;
-  const int laneId = threadIdx.x % warpSize;
-
-  if(threadLinearId < npes * dstMemObj->sdmaNumQueue){
+  if (threadLinearId < npes * dstMemObj->sdmaNumQueue) {
     int qId = threadLinearId % dstMemObj->sdmaNumQueue;
     int remotePe = threadLinearId / dstMemObj->sdmaNumQueue;
-    const size_t sendBytes_rand = bytesPerPeer/8;
-    size_t destByteOffset = myPe*bytesPerPeer + qId*sendBytes_rand;
-    size_t srcByteOffset = qId*sendBytes_rand;
-    size_t sendBytes = 0;
 
-    if( qId == 7) sendBytes = bytesPerPeer - 7*sendBytes_rand;
-    else sendBytes = sendBytes_rand;
+    const size_t sendBytesBase = bytesPerPeer / 8;
+    size_t sendBytes = (qId == 7) ? (bytesPerPeer - 7 * sendBytesBase) : sendBytesBase;
+
+    // Source: shard for remotePe in my input, split by queue
+    size_t srcByteOffset = remotePe * bytesPerPeer + qId * sendBytesBase;
+    // Destination: remotePe's output buffer, slot myPe, split by queue
+    size_t destByteOffset = myPe * bytesPerPeer + qId * sendBytesBase;
 
     application::SymmMemObjPtr dest = dstMemObj;
-    uint8_t* srcPtr = reinterpret_cast<uint8_t *>(inputData) + srcByteOffset;
+    uint8_t* srcPtr = reinterpret_cast<uint8_t*>(input) + srcByteOffset;
     uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + destByteOffset;
-    anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + remotePe*dest->sdmaNumQueue;
-    HSAuint64* signals = dest->signalPtrs + remotePe*dest->sdmaNumQueue;
-    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe*dest->sdmaNumQueue;
+
+    anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
+    HSAuint64* signals = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
+    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
     core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals, dest->sdmaNumQueue, qId);
   }
 }
 
-// Wait kernel for TwoShot AllReduce async: waits for all SDMA PUT transfers to complete.
-// Same logic as OneShotAllGatherSdmaAsyncWaitKernel but named for allreduce context.
+// ============================================================
+// Wait kernel: signals remote PEs, waits for all SDMA transfers
+// to complete, and resets flags. Reused for both scatter-wait
+// and allgather-wait phases.
+// ============================================================
 __global__ void TwoShotAllReduceSdmaAsyncWaitKernel(int myPe, int npes,
                                         const application::SymmMemObjPtr dstMemObj,
                                         const application::SymmMemObjPtr flagsMemObj) {
@@ -91,7 +89,7 @@ __global__ void TwoShotAllReduceSdmaAsyncWaitKernel(int myPe, int npes,
 
   const size_t threadLinearId = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
 
-  if(threadLinearId < npes){
+  if (threadLinearId < npes) {
     int remotePe = threadLinearId;
     shmem::ShmemQuietThread(remotePe, dstMemObj);
     shmem::ShmemAtomicSizeNonFetchThread(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8, core::atomicType::AMO_ADD, remotePe);
@@ -121,22 +119,68 @@ __global__ void TwoShotAllReduceSdmaAsyncWaitKernel(int myPe, int npes,
   }
 }
 
-// Local reduce kernel: sum npes chunks element-wise in the gathered buffer.
-// Layout: [PE0_data(elementCount) | PE1_data(elementCount) | ... | PE(npes-1)_data]
-// Result: gathered[0 : elementCount] = sum of all chunks
+// ============================================================
+// Phase 2: Local reduce kernel for reduce-scatter
+//
+// After scatter, PE j has npes copies of shard_j in its output
+// buffer. Sum them element-wise and write the result to slot myPe.
+// Grid size should be proportional to elementCountPerRank.
+// ============================================================
 template <typename T>
-__global__ void AllReduceLocalSumKernel(T* gathered, size_t elementCount, int npes) {
+__global__ void ReduceScatterLocalReduceKernel(T* gathered, size_t elementCountPerRank,
+                                               int myPe, int npes) {
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
   const size_t threadsPerGrid =
       static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
 
-  for (size_t i = threadLinearId; i < elementCount; i += threadsPerGrid) {
+  T* myDst = gathered + static_cast<size_t>(myPe) * elementCountPerRank;
+
+  for (size_t i = threadLinearId; i < elementCountPerRank; i += threadsPerGrid) {
     T sum = gathered[i];
     for (int pe = 1; pe < npes; pe++) {
-      sum += gathered[static_cast<size_t>(pe) * elementCount + i];
+      sum += gathered[static_cast<size_t>(pe) * elementCountPerRank + i];
     }
-    gathered[i] = sum;
+    myDst[i] = sum;
+  }
+}
+
+// ============================================================
+// Phase 3: AllGather SDMA PUT kernel for reduced shards
+//
+// Each PE sends its reduced shard (at slot myPe in the output
+// buffer) to every remote PE's output buffer at the same slot.
+// Uses multi-queue SDMA for bandwidth.
+// ============================================================
+template <typename T>
+__global__ void AllGatherReducedSdmaPutKernel(int myPe, int npes,
+                                              const application::SymmMemObjPtr dstMemObj,
+                                              size_t elementCountPerRank) {
+  const size_t bytesPerElement = sizeof(T);
+  const size_t bytesPerPeer = elementCountPerRank * bytesPerElement;
+
+  const size_t threadLinearId =
+      static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
+
+  if (threadLinearId < npes * dstMemObj->sdmaNumQueue) {
+    int qId = threadLinearId % dstMemObj->sdmaNumQueue;
+    int remotePe = threadLinearId / dstMemObj->sdmaNumQueue;
+
+    const size_t sendBytesBase = bytesPerPeer / 8;
+    size_t sendBytes = (qId == 7) ? (bytesPerPeer - 7 * sendBytesBase) : sendBytesBase;
+
+    // Both source and destination are at slot myPe, split by queue
+    size_t byteOffset = myPe * bytesPerPeer + qId * sendBytesBase;
+
+    application::SymmMemObjPtr dest = dstMemObj;
+    T* gathered = reinterpret_cast<T*>(dstMemObj->localPtr);
+    uint8_t* srcPtr = reinterpret_cast<uint8_t*>(gathered) + byteOffset;
+    uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + byteOffset;
+
+    anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
+    HSAuint64* signals = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
+    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
+    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals, dest->sdmaNumQueue, qId);
   }
 }
 

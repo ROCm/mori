@@ -319,7 +319,8 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
     async_start_time_ = MPI_Wtime();
 
     try {
-        size_t required_output_size = total_count * npes_ * dtype_size_;
+        size_t elementCountPerRank = total_count / npes_;
+        size_t required_output_size = elementCountPerRank * npes_ * dtype_size_;
         if (!ensure_buffer_size(output_transit_buffer_, output_transit_buffer_ptr_,
                                 output_transit_buffer_size_, output_transit_buffer_obj_,
                                 required_output_size, "output transit buffer")) {
@@ -327,16 +328,32 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
             return false;
         }
 
-        TwoShotAllReduceSdmaAsyncPutKernel<T><<<1, 512, 0, stream>>>(
-            myPe_, npes_,
-            input,
-            input_transit_buffer_obj_,
-            output_transit_buffer_obj_,
-            flagsObj_, total_count);
+        // Phase 1: Scatter PUT — send shard_j of my input to PE j
+        ReduceScatterSdmaPutKernel<T><<<1, 512, 0, stream>>>(
+            myPe_, npes_, input, output_transit_buffer_obj_, elementCountPerRank);
+
+        // Phase 1b: Scatter WAIT — wait for all shards to arrive
+        TwoShotAllReduceSdmaAsyncWaitKernel<<<1, 64, 0, stream>>>(
+            myPe_, npes_, output_transit_buffer_obj_, flagsObj_);
+
+        // Phase 2: Local reduce — sum npes copies of my shard, write to slot myPe
+        // Grid size proportional to data size (elementCountPerRank, not full elementCount)
+        int reduce_block_size = 256;
+        int reduce_grid_size = static_cast<int>(
+            std::min(static_cast<size_t>((elementCountPerRank + reduce_block_size - 1) / reduce_block_size),
+                     static_cast<size_t>(65535)));
+        if (reduce_grid_size < 1) reduce_grid_size = 1;
+
+        ReduceScatterLocalReduceKernel<T><<<reduce_grid_size, reduce_block_size, 0, stream>>>(
+            static_cast<T*>(output_transit_buffer_), elementCountPerRank, myPe_, npes_);
+
+        // Phase 3: AllGather PUT — send my reduced shard to all PEs
+        AllGatherReducedSdmaPutKernel<T><<<1, 512, 0, stream>>>(
+            myPe_, npes_, output_transit_buffer_obj_, elementCountPerRank);
 
         hipError_t kernel_err = hipGetLastError();
         if (kernel_err != hipSuccess) {
-            fprintf(stderr, "PE %d: Async PUT kernel launch failed: %s\n",
+            fprintf(stderr, "PE %d: Async kernel launch failed: %s\n",
                     myPe_, hipGetErrorString(kernel_err));
             throw std::runtime_error("Kernel launch failed");
         }
@@ -360,27 +377,11 @@ double AllreduceSdma<T>::wait_async(hipStream_t stream) {
     try {
         hipStream_t wait_stream = (stream != nullptr) ? stream : async_stream_;
 
-        // All three steps are launched on the same stream — the GPU guarantees
-        // sequential execution, so no intermediate hipStreamSynchronize is needed.
-
-        // Step 1: Wait kernel — spins until all SDMA PUT transfers complete
+        // Wait for AllGather SDMA transfers to complete
         TwoShotAllReduceSdmaAsyncWaitKernel<<<1, 64, 0, wait_stream>>>(
             myPe_, npes_, output_transit_buffer_obj_, flagsObj_);
 
-        // Step 2: Local reduce — sum all npes chunks element-wise
-        // Needs many blocks to saturate HBM bandwidth (unlike the wait kernel
-        // which only monitors npes flags and uses <<<1,64>>>)
-        T* gathered = static_cast<T*>(output_transit_buffer_);
-        int reduce_block_size = 256;
-        int reduce_grid_size = static_cast<int>(
-            std::min(static_cast<size_t>((async_total_count_ + reduce_block_size - 1) / reduce_block_size),
-                     static_cast<size_t>(65535)));
-        if (reduce_grid_size < 1) reduce_grid_size = 1;
-
-        AllReduceLocalSumKernel<T><<<reduce_grid_size, reduce_block_size, 0, wait_stream>>>(
-            gathered, async_total_count_, npes_);
-
-        // Step 3: Copy reduced result to user output buffer (if enabled)
+        // Copy complete allreduce result to user output buffer (if enabled)
         if (copy_output_to_user_) {
             copy_output_to_user(async_output_, async_total_count_, wait_stream);
         }
