@@ -23,6 +23,7 @@
 
 #include <ATen/hip/HIPContext.h>
 #include <hip/hip_bfloat16.h>
+#include <hip/hip_fp16.h>
 #include <hip/hip_fp8.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
@@ -1071,6 +1072,270 @@ void RegisterMoriCcl(pybind11::module_& m) {
             },
             py::arg("device") = py::none(),
             "Get output transit buffer as a PyTorch tensor");
+
+    // =========================================================================
+    // Bind AllreduceSdma class (half / fp16 version)
+    // =========================================================================
+    py::class_<mori::collective::AllreduceSdma<half>>(m, "AllreduceSdmaHandleFp16")
+        .def(py::init<int, int, size_t, size_t, bool>(),
+             py::arg("my_pe"),
+             py::arg("npes"),
+             py::arg("input_buffer_size"),
+             py::arg("output_buffer_size"),
+             py::arg("copy_output_to_user") = true,
+             "Initialize AllreduceSdma (fp16) with PE ID, number of PEs, and buffer sizes")
+        .def(py::init<int, int, size_t, bool>(),
+             py::arg("my_pe"),
+             py::arg("npes"),
+             py::arg("transit_buffer_size") = 512 * 1024 * 1024,
+             py::arg("copy_output_to_user") = true,
+             "Initialize AllreduceSdma (fp16) with PE ID, number of PEs, and transit buffer size")
+        .def("__call__",
+            [](mori::collective::AllreduceSdma<half>& self,
+               const torch::Tensor& input_tensor,
+               const torch::Tensor& output_tensor,
+               size_t count,
+               py::object stream_obj) -> bool {
+
+                if (input_tensor.dim() != 1) {
+                    throw std::runtime_error("Input tensor must be 1-dimensional");
+                }
+                if (output_tensor.dim() != 1) {
+                    throw std::runtime_error("Output tensor must be 1-dimensional");
+                }
+                if (!input_tensor.is_cuda()) {
+                    throw std::runtime_error("Input tensor must be CUDA tensor");
+                }
+                if (!output_tensor.is_cuda()) {
+                    throw std::runtime_error("Output tensor must be CUDA tensor");
+                }
+                if (input_tensor.scalar_type() != torch::kFloat16) {
+                    throw std::runtime_error("Input tensor must be float16");
+                }
+                if (output_tensor.scalar_type() != torch::kFloat16) {
+                    throw std::runtime_error("Output tensor must be float16");
+                }
+
+                half* input_ptr = reinterpret_cast<half*>(input_tensor.data_ptr<at::Half>());
+                half* output_ptr = reinterpret_cast<half*>(output_tensor.data_ptr<at::Half>());
+
+                int device_index = input_tensor.device().index();
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj, device_index);
+
+                return self(input_ptr, output_ptr, count, stream);
+            },
+            py::arg("input"),
+            py::arg("output"),
+            py::arg("count"),
+            py::arg("stream") = py::none(),
+            "Execute AllReduce SDMA operation (fp16)")
+        .def("allreduce_inplace",
+            [](mori::collective::AllreduceSdma<half>& self,
+               const torch::Tensor& tensor,
+               size_t count,
+               py::object stream_obj) -> bool {
+
+                if (tensor.dim() != 1) {
+                    throw std::runtime_error("Tensor must be 1-dimensional");
+                }
+                if (!tensor.is_cuda()) {
+                    throw std::runtime_error("Tensor must be CUDA tensor");
+                }
+                if (tensor.scalar_type() != torch::kFloat16) {
+                    throw std::runtime_error("Tensor must be float16");
+                }
+
+                half* ptr = reinterpret_cast<half*>(tensor.data_ptr<at::Half>());
+
+                int device_index = tensor.device().index();
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj, device_index);
+
+                return self.allreduce_inplace(ptr, count, stream);
+            },
+            py::arg("data"),
+            py::arg("count"),
+            py::arg("stream") = py::none(),
+            "Execute in-place AllReduce SDMA operation (fp16)")
+        .def("reset_flags",
+            &mori::collective::AllreduceSdma<half>::resetFlags,
+            "Reset synchronization flags")
+        .def("get_output_transit_buffer",
+            [](mori::collective::AllreduceSdma<half>& self, py::object device_obj) -> torch::Tensor {
+                void* buffer_ptr = self.getOutputTransitBuffer();
+                size_t buffer_size = self.getOutputTransitBufferSize();
+
+                if (buffer_ptr == nullptr) {
+                    throw std::runtime_error("Output transit buffer is null");
+                }
+
+                size_t num_elements = buffer_size / sizeof(half);
+
+                int device_index = 0;
+                if (!device_obj.is_none()) {
+                    py::object torch_module = py::module_::import("torch");
+                    py::object tensor_class = torch_module.attr("Tensor");
+                    bool is_tensor = py::isinstance(device_obj, tensor_class);
+
+                    if (is_tensor) {
+                        torch::Tensor tensor = device_obj.cast<torch::Tensor>();
+                        if (tensor.is_cuda()) {
+                            device_index = tensor.device().index();
+                        } else {
+                            throw std::runtime_error("device tensor must be a CUDA tensor");
+                        }
+                    } else {
+                        try {
+                            device_index = device_obj.cast<int>();
+                        } catch (const py::cast_error&) {
+                            throw std::runtime_error("device must be an int, a CUDA tensor, or None");
+                        }
+                    }
+                } else {
+                    device_index = at::cuda::current_device();
+                }
+
+                torch::Tensor tensor = torch::from_blob(
+                    buffer_ptr,
+                    {static_cast<int64_t>(num_elements)},
+                    torch::TensorOptions().dtype(torch::kFloat16).device(torch::kCUDA, device_index)
+                );
+
+                return tensor;
+            },
+            py::arg("device") = py::none(),
+            "Get output transit buffer as a PyTorch tensor (fp16)");
+
+    // =========================================================================
+    // Bind AllreduceSdma class (__hip_bfloat16 / bf16 version)
+    // =========================================================================
+    py::class_<mori::collective::AllreduceSdma<__hip_bfloat16>>(m, "AllreduceSdmaHandleBf16")
+        .def(py::init<int, int, size_t, size_t, bool>(),
+             py::arg("my_pe"),
+             py::arg("npes"),
+             py::arg("input_buffer_size"),
+             py::arg("output_buffer_size"),
+             py::arg("copy_output_to_user") = true,
+             "Initialize AllreduceSdma (bf16) with PE ID, number of PEs, and buffer sizes")
+        .def(py::init<int, int, size_t, bool>(),
+             py::arg("my_pe"),
+             py::arg("npes"),
+             py::arg("transit_buffer_size") = 512 * 1024 * 1024,
+             py::arg("copy_output_to_user") = true,
+             "Initialize AllreduceSdma (bf16) with PE ID, number of PEs, and transit buffer size")
+        .def("__call__",
+            [](mori::collective::AllreduceSdma<__hip_bfloat16>& self,
+               const torch::Tensor& input_tensor,
+               const torch::Tensor& output_tensor,
+               size_t count,
+               py::object stream_obj) -> bool {
+
+                if (input_tensor.dim() != 1) {
+                    throw std::runtime_error("Input tensor must be 1-dimensional");
+                }
+                if (output_tensor.dim() != 1) {
+                    throw std::runtime_error("Output tensor must be 1-dimensional");
+                }
+                if (!input_tensor.is_cuda()) {
+                    throw std::runtime_error("Input tensor must be CUDA tensor");
+                }
+                if (!output_tensor.is_cuda()) {
+                    throw std::runtime_error("Output tensor must be CUDA tensor");
+                }
+                if (input_tensor.scalar_type() != torch::kBFloat16) {
+                    throw std::runtime_error("Input tensor must be bfloat16");
+                }
+                if (output_tensor.scalar_type() != torch::kBFloat16) {
+                    throw std::runtime_error("Output tensor must be bfloat16");
+                }
+
+                __hip_bfloat16* input_ptr = reinterpret_cast<__hip_bfloat16*>(input_tensor.data_ptr<at::BFloat16>());
+                __hip_bfloat16* output_ptr = reinterpret_cast<__hip_bfloat16*>(output_tensor.data_ptr<at::BFloat16>());
+
+                int device_index = input_tensor.device().index();
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj, device_index);
+
+                return self(input_ptr, output_ptr, count, stream);
+            },
+            py::arg("input"),
+            py::arg("output"),
+            py::arg("count"),
+            py::arg("stream") = py::none(),
+            "Execute AllReduce SDMA operation (bf16)")
+        .def("allreduce_inplace",
+            [](mori::collective::AllreduceSdma<__hip_bfloat16>& self,
+               const torch::Tensor& tensor,
+               size_t count,
+               py::object stream_obj) -> bool {
+
+                if (tensor.dim() != 1) {
+                    throw std::runtime_error("Tensor must be 1-dimensional");
+                }
+                if (!tensor.is_cuda()) {
+                    throw std::runtime_error("Tensor must be CUDA tensor");
+                }
+                if (tensor.scalar_type() != torch::kBFloat16) {
+                    throw std::runtime_error("Tensor must be bfloat16");
+                }
+
+                __hip_bfloat16* ptr = reinterpret_cast<__hip_bfloat16*>(tensor.data_ptr<at::BFloat16>());
+
+                int device_index = tensor.device().index();
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj, device_index);
+
+                return self.allreduce_inplace(ptr, count, stream);
+            },
+            py::arg("data"),
+            py::arg("count"),
+            py::arg("stream") = py::none(),
+            "Execute in-place AllReduce SDMA operation (bf16)")
+        .def("reset_flags",
+            &mori::collective::AllreduceSdma<__hip_bfloat16>::resetFlags,
+            "Reset synchronization flags")
+        .def("get_output_transit_buffer",
+            [](mori::collective::AllreduceSdma<__hip_bfloat16>& self, py::object device_obj) -> torch::Tensor {
+                void* buffer_ptr = self.getOutputTransitBuffer();
+                size_t buffer_size = self.getOutputTransitBufferSize();
+
+                if (buffer_ptr == nullptr) {
+                    throw std::runtime_error("Output transit buffer is null");
+                }
+
+                size_t num_elements = buffer_size / sizeof(__hip_bfloat16);
+
+                int device_index = 0;
+                if (!device_obj.is_none()) {
+                    py::object torch_module = py::module_::import("torch");
+                    py::object tensor_class = torch_module.attr("Tensor");
+                    bool is_tensor = py::isinstance(device_obj, tensor_class);
+
+                    if (is_tensor) {
+                        torch::Tensor tensor = device_obj.cast<torch::Tensor>();
+                        if (tensor.is_cuda()) {
+                            device_index = tensor.device().index();
+                        } else {
+                            throw std::runtime_error("device tensor must be a CUDA tensor");
+                        }
+                    } else {
+                        try {
+                            device_index = device_obj.cast<int>();
+                        } catch (const py::cast_error&) {
+                            throw std::runtime_error("device must be an int, a CUDA tensor, or None");
+                        }
+                    }
+                } else {
+                    device_index = at::cuda::current_device();
+                }
+
+                torch::Tensor tensor = torch::from_blob(
+                    buffer_ptr,
+                    {static_cast<int64_t>(num_elements)},
+                    torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA, device_index)
+                );
+
+                return tensor;
+            },
+            py::arg("device") = py::none(),
+            "Get output transit buffer as a PyTorch tensor (bf16)");
 
     // Keep old function-based interface for backward compatibility (optional)
     m.def("allreduce_sdma",

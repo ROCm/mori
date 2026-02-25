@@ -255,20 +255,30 @@ def _cpp_allreduce_factory(entity_name: str):
 class AllreduceSdma:
     """Python wrapper for AllreduceSdma C++ class.
     
-    Performs a three-phase AllReduce using SDMA:
-      Phase 1: Gather — scatter each rank's input shards to all peers via SDMA
-      Phase 2: Local reduce — sum all gathered copies of each shard
-      Phase 3: AllGather — broadcast reduced shards to all peers via SDMA
+    Performs AllReduce in two stages:
+      Stage 1: ReduceScatter — each rank reduces its shard across all peers
+      Stage 2: AllGather — broadcast reduced shards to all peers via SDMA
     
     After the operation, every rank holds the same reduced result (elementwise sum
     of all ranks' inputs) in the output buffer.
+    
+    Supported dtypes: torch.uint32, torch.int32, torch.float16, torch.bfloat16
     """
+
+    _HANDLE_MAP = {
+        torch.uint32: "AllreduceSdmaHandle",
+        torch.int32: "AllreduceSdmaHandle",
+        torch.float32: "AllreduceSdmaHandle",
+        torch.float16: "AllreduceSdmaHandleFp16",
+        torch.bfloat16: "AllreduceSdmaHandleBf16",
+    }
 
     def __init__(self, my_pe: int, npes: int,
                  input_buffer_size: Optional[int] = None,
                  output_buffer_size: Optional[int] = None,
                  transit_buffer_size: Optional[int] = None,
-                 copy_output_to_user: bool = True):
+                 copy_output_to_user: bool = True,
+                 dtype: torch.dtype = torch.uint32):
         """Initialize AllreduceSdma
         
         Args:
@@ -279,10 +289,19 @@ class AllreduceSdma:
             transit_buffer_size: Transit buffer size in bytes (split equally for input and output)
             copy_output_to_user: If True, copy output_transit_buffer to user output buffer (default True).
                                 If False, user should directly use output_transit_buffer via get_output_transit_buffer()
+            dtype: Data type for the allreduce operation (default torch.uint32).
+                   Supported: torch.uint32, torch.int32, torch.float16, torch.bfloat16
         """
         self.my_pe = my_pe
         self.npes = npes
-        handle_class = _cpp_allreduce_factory("AllreduceSdmaHandle")
+        self.dtype = dtype
+
+        handle_name = self._HANDLE_MAP.get(dtype)
+        if handle_name is None:
+            raise ValueError(
+                f"Unsupported dtype {dtype}. Supported: {list(self._HANDLE_MAP.keys())}"
+            )
+        handle_class = _cpp_allreduce_factory(handle_name)
 
         if input_buffer_size is not None and output_buffer_size is not None:
             self._handle = handle_class(my_pe, npes, input_buffer_size, output_buffer_size, copy_output_to_user)

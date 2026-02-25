@@ -23,6 +23,8 @@
 #include "mori/collective/allreduce/twoshot_allreduce_sdma_class.hpp"
 #include "mori/collective/allreduce/twoshot_sdma_kernel.hpp"
 #include "mori/shmem/shmem.hpp"
+#include <hip/hip_fp16.h>
+#include <hip/hip_bfloat16.h>
 #include <stdexcept>
 #include <cstring>
 #include <cstdio>
@@ -315,6 +317,8 @@ template class AllreduceSdma<int32_t>;
 template class AllreduceSdma<int64_t>;
 template class AllreduceSdma<float>;
 template class AllreduceSdma<double>;
+template class AllreduceSdma<half>;
+template class AllreduceSdma<__hip_bfloat16>;
 
 } // namespace collective
 } // namespace mori

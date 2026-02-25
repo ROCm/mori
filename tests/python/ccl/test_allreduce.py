@@ -15,19 +15,32 @@ from mori.ccl import AllreduceSdma
 from tests.python.utils import TorchDistContext, get_free_port
 
 
-def _verify_allreduce_result(data_cpu, elems, my_pe, npes, label=""):
+def _verify_allreduce_result(data_cpu, elems, my_pe, npes, label="", dtype=torch.uint32):
     """Verify allreduce result: each element should equal sum of (pe+1)*1000 across all PEs."""
     expected_value = sum((pe + 1) * 1000 for pe in range(npes))
     first_n = min(elems, len(data_cpu))
     chunk = data_cpu[:first_n]
-    if np.all(chunk == expected_value):
-        return True
+
+    if dtype in (torch.float16, torch.bfloat16):
+        expected_arr = np.full(first_n, expected_value, dtype=np.float32)
+        chunk_f = chunk.astype(np.float32)
+        if np.allclose(chunk_f, expected_arr, rtol=1e-2, atol=1.0):
+            return True
+        else:
+            mismatches = np.where(~np.isclose(chunk_f, expected_arr, rtol=1e-2, atol=1.0))[0]
+            print(f"  PE {my_pe} [{label}]: FAILED! Expected ~{expected_value}, "
+                  f"got {len(mismatches)} mismatches in first {first_n} elements. "
+                  f"First mismatch at idx {mismatches[0]}: {chunk[mismatches[0]]}")
+            return False
     else:
-        mismatches = np.where(chunk != expected_value)[0]
-        print(f"  PE {my_pe} [{label}]: FAILED! Expected {expected_value}, "
-              f"got {len(mismatches)} mismatches in first {first_n} elements. "
-              f"First mismatch at idx {mismatches[0]}: {chunk[mismatches[0]]}")
-        return False
+        if np.all(chunk == expected_value):
+            return True
+        else:
+            mismatches = np.where(chunk != expected_value)[0]
+            print(f"  PE {my_pe} [{label}]: FAILED! Expected {expected_value}, "
+                  f"got {len(mismatches)} mismatches in first {first_n} elements. "
+                  f"First mismatch at idx {mismatches[0]}: {chunk[mismatches[0]]}")
+            return False
 
 
 def _run_benchmark(allreduce_fn, iterations, warmup, stream, rank):
@@ -93,7 +106,7 @@ def _print_stats(exec_times, data_bytes, npes, rank, label):
     return avg_time
 
 
-def _test_allreduce(rank, world_size, port, elems, iterations, warmup):
+def _test_allreduce(rank, world_size, port, elems, iterations, warmup, dtype=torch.uint32):
     """Worker function for each process."""
 
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
@@ -105,14 +118,14 @@ def _test_allreduce(rank, world_size, port, elems, iterations, warmup):
         assert my_pe == rank
         assert npes == world_size
 
-        data_bytes = elems * 4  # uint32 = 4 bytes
-        # output transit buffer needs npes * elementCountPerRank elements.
-        # Over-allocate: npes * (elems / npes + 16) * 4
-        output_buf_size = npes * (elems // npes + 64) * 4
+        elem_size = torch.tensor([], dtype=dtype).element_size()
+        data_bytes = elems * elem_size
+        output_buf_size = npes * (elems // npes + 64) * elem_size
+        dtype_name = str(dtype).split('.')[-1]
 
         if rank == 0:
             print(f"\n{'=' * 70}")
-            print(f"AllReduce SDMA Test")
+            print(f"AllReduce SDMA Test (dtype={dtype_name})")
             print(f"  World size      : {world_size}")
             print(f"  Elements per PE : {elems:,}")
             print(f"  Data size       : {data_bytes / (1024 ** 2):.2f} MB per rank")
@@ -122,23 +135,26 @@ def _test_allreduce(rank, world_size, port, elems, iterations, warmup):
         device = torch.device(f"cuda:{rank}")
         stream = torch.cuda.Stream(device=device)
 
+        fill_value = (my_pe + 1) * 1000
+
         # ==================================================================
         # Test 1: Out-of-place with copy_output_to_user=False
         #         Read result from output_transit_buffer
         # ==================================================================
         if rank == 0:
-            print(f"\n>>> Test 1: Out-of-place (copy_output_to_user=False)")
+            print(f"\n>>> Test 1: Out-of-place (copy_output_to_user=False, {dtype_name})")
 
         ar_nocp = AllreduceSdma(
             my_pe, npes,
             input_buffer_size=data_bytes,
             output_buffer_size=output_buf_size,
             copy_output_to_user=False,
+            dtype=dtype,
         )
 
-        input_tensor = torch.full((elems,), (my_pe + 1) * 1000,
-                                  dtype=torch.uint32, device=device)
-        output_tensor = torch.zeros(elems, dtype=torch.uint32, device=device)
+        input_tensor = torch.full((elems,), fill_value,
+                                  dtype=dtype, device=device)
+        output_tensor = torch.zeros(elems, dtype=dtype, device=device)
 
         torch.cuda.synchronize()
         dist.barrier()
@@ -148,16 +164,16 @@ def _test_allreduce(rank, world_size, port, elems, iterations, warmup):
             iterations, warmup, stream, rank,
         )
 
-        # Verify from transit buffer (output_tensor should NOT be filled)
         transit_buf = ar_nocp.get_output_transit_buffer(device=input_tensor)
         transit_cpu = transit_buf.cpu().numpy()
 
         nocp_ok = _verify_allreduce_result(transit_cpu, elems, my_pe, npes,
-                                           "out-of-place/transit")
+                                           f"out-of-place/transit/{dtype_name}",
+                                           dtype=dtype)
 
-        # output_tensor should remain zeros since copy_output_to_user=False
         out_cpu = output_tensor.cpu().numpy()
-        if np.all(out_cpu == 0):
+        zero_check = np.all(out_cpu == 0) if dtype in (torch.uint32, torch.int32) else np.allclose(out_cpu, 0)
+        if zero_check:
             if rank == 0:
                 print(f"  PE {rank}: output_tensor correctly untouched (all zeros)")
         else:
@@ -165,25 +181,25 @@ def _test_allreduce(rank, world_size, port, elems, iterations, warmup):
                 print(f"  PE {rank}: WARNING — output_tensor was modified despite copy_output_to_user=False")
 
         dist.barrier()
-        _print_stats(times_nocp, data_bytes, npes, rank, "Out-of-place (transit buf)")
+        _print_stats(times_nocp, data_bytes, npes, rank,
+                     f"Out-of-place (transit buf, {dtype_name})")
 
         # ==================================================================
         # Test 2: allreduce_inplace
         # ==================================================================
         if rank == 0:
-            print(f"\n>>> Test 2: In-place (allreduce_inplace)")
+            print(f"\n>>> Test 2: In-place (allreduce_inplace, {dtype_name})")
 
         ar_inp = AllreduceSdma(
             my_pe, npes,
             input_buffer_size=data_bytes,
             output_buffer_size=output_buf_size,
-            copy_output_to_user=False,  # inplace should still work
+            copy_output_to_user=False,
+            dtype=dtype,
         )
 
-        # Prepare fresh input each iteration for correctness check;
-        # for bandwidth test we just re-run (data gets overwritten with the same sum).
-        inplace_tensor = torch.full((elems,), (my_pe + 1) * 1000,
-                                    dtype=torch.uint32, device=device)
+        inplace_tensor = torch.full((elems,), fill_value,
+                                    dtype=dtype, device=device)
 
         torch.cuda.synchronize()
         dist.barrier()
@@ -193,16 +209,16 @@ def _test_allreduce(rank, world_size, port, elems, iterations, warmup):
             iterations, warmup, stream, rank,
         )
 
-        # Verify inplace result
         inp_cpu = inplace_tensor.cpu().numpy()
-        inp_ok = _verify_allreduce_result(inp_cpu, elems, my_pe, npes, "inplace")
+        inp_ok = _verify_allreduce_result(inp_cpu, elems, my_pe, npes,
+                                          f"inplace/{dtype_name}", dtype=dtype)
 
         if rank == 0 and inp_ok:
             expected = sum((pe + 1) * 1000 for pe in range(npes))
-            print(f"  PE {rank}: inplace result verified (all values = {expected})")
+            print(f"  PE {rank}: inplace result verified (all values ~ {expected})")
 
         dist.barrier()
-        _print_stats(times_inp, data_bytes, npes, rank, "In-place")
+        _print_stats(times_inp, data_bytes, npes, rank, f"In-place ({dtype_name})")
 
         # ==================================================================
         # Final summary
@@ -214,11 +230,11 @@ def _test_allreduce(rank, world_size, port, elems, iterations, warmup):
         if rank == 0:
             passed = ok_tensor.item()
             print(f"\n{'=' * 70}")
-            print(f"PEs passed: {passed}/{npes}")
+            print(f"PEs passed ({dtype_name}): {passed}/{npes}")
             if passed == npes:
-                print(f"=== All Tests PASSED ===")
+                print(f"=== All Tests PASSED ({dtype_name}) ===")
             else:
-                print(f"=== SOME Tests FAILED ===")
+                print(f"=== SOME Tests FAILED ({dtype_name}) ===")
             print(f"{'=' * 70}\n")
 
         # Cleanup
@@ -229,16 +245,27 @@ def _test_allreduce(rank, world_size, port, elems, iterations, warmup):
         shmem.shmem_finalize()
 
         if not all_ok:
-            raise AssertionError(f"PE {rank}: AllReduce verification failed")
+            raise AssertionError(f"PE {rank}: AllReduce verification failed ({dtype_name})")
 
 
-def test_allreduce(elems=67108864, world_size=8, iterations=10, warmup=10):
+_DTYPE_MAP = {
+    "uint32": torch.uint32,
+    "int32": torch.int32,
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+}
+
+
+def test_allreduce(elems=67108864, world_size=8, iterations=10, warmup=10,
+                   dtype=torch.uint32):
     """Run AllReduce SDMA test."""
     os.environ.setdefault('MORI_ENABLE_SDMA', '1')
     port = get_free_port()
     torch.multiprocessing.spawn(
         _test_allreduce,
-        args=(world_size, port, elems, iterations, warmup),
+        args=(world_size, port, elems, iterations, warmup, dtype),
         nprocs=world_size,
         join=True,
     )
@@ -256,14 +283,21 @@ if __name__ == "__main__":
     parser.add_argument("--iterations", type=int, default=10, help="Measurement iterations")
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations")
     parser.add_argument("--enable-sdma", type=int, default=1, choices=[0, 1], help="Enable SDMA")
+    parser.add_argument("--dtype", type=str, default="uint32",
+                        choices=list(_DTYPE_MAP.keys()),
+                        help="Data type (uint32, fp16, bf16)")
     args = parser.parse_args()
     os.environ['MORI_ENABLE_SDMA'] = str(args.enable_sdma)
+
+    dtype = _DTYPE_MAP[args.dtype]
+    dtype_name = str(dtype).split('.')[-1]
 
     print(f"AllReduce SDMA Test")
     print(f"  Elements per PE : {args.elems:,}")
     print(f"  World size      : {args.world_size}")
     print(f"  Iterations      : {args.iterations}")
     print(f"  Warmup          : {args.warmup}")
+    print(f"  Dtype           : {dtype_name}")
     print("-" * 60)
 
-    test_allreduce(args.elems, args.world_size, args.iterations, args.warmup)
+    test_allreduce(args.elems, args.world_size, args.iterations, args.warmup, dtype)
