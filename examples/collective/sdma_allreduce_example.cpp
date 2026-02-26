@@ -151,7 +151,7 @@ void testAllreduceSdma() {
 
     printf("PE %d of %d started\n", myPe, npes);
 
-    const int elemsPerPe = 8 * 1024 * 1024;  // 64M elements
+    const int elemsPerPe = 64 * 1024 * 1024;  // 64M elements
     const size_t bytesPerPe = elemsPerPe * sizeof(uint32_t);
     const size_t totalBytes = bytesPerPe * npes;  // for allgather intermediate
 
