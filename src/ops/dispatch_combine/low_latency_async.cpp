@@ -61,15 +61,9 @@ __global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
       condition = destPe == (args.tokenIndices[srcTokId * config.numExpertPerToken + laneId] /
                              config.numExpertPerRank);
     }
-    if (__any(condition)) {
+    if (__any(condition) || !core::IsRankActive(args.activeRanks, destPe)) {
       // Indicate that this token is already sent to the destination PE by setting an overflow
-      // token index
-      if (laneId == 0)
-        args.dispDestTokIdMap[i] = config.worldSize * config.MaxNumTokensToSendPerRank();
-      continue;
-    }
-
-    if (!core::IsRankActive(args.activeRanks, destPe)) {
+      // token index, or the destination PE is inactive
       if (laneId == 0)
         args.dispDestTokIdMap[i] = config.worldSize * config.MaxNumTokensToSendPerRank();
       continue;
