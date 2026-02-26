@@ -22,6 +22,7 @@
 #pragma once
 
 #include <cstddef>
+#include <ostream>
 
 #include "mori/io/common.hpp"
 #include "mori/io/enum.hpp"
@@ -112,6 +113,48 @@ struct FabricBackendConfig : public BackendConfig {
 
 inline std::ostream& operator<<(std::ostream& os, const FabricBackendConfig& c) {
   return os << "numStreams[" << c.numStreams << "] numEvents[" << c.numEvents << "]";
+}
+
+struct TcpBackendConfig : public BackendConfig {
+  TcpBackendConfig() : BackendConfig(BackendType::TCP) {}
+  TcpBackendConfig(int numIoThreads_, int sockSndbufBytes_, int sockRcvbufBytes_, int opTimeoutMs_,
+                   bool enableKeepalive_, int keepaliveIdleSec_, int keepaliveIntvlSec_,
+                   int keepaliveCnt_, bool enableCtrlNodelay_, bool enableDataNodelay_)
+      : BackendConfig(BackendType::TCP),
+        numIoThreads(numIoThreads_),
+        sockSndbufBytes(sockSndbufBytes_),
+        sockRcvbufBytes(sockRcvbufBytes_),
+        opTimeoutMs(opTimeoutMs_),
+        enableKeepalive(enableKeepalive_),
+        keepaliveIdleSec(keepaliveIdleSec_),
+        keepaliveIntvlSec(keepaliveIntvlSec_),
+        keepaliveCnt(keepaliveCnt_),
+        enableCtrlNodelay(enableCtrlNodelay_),
+        enableDataNodelay(enableDataNodelay_) {}
+
+  int numIoThreads{1};
+
+  int sockSndbufBytes{4 * 1024 * 1024};
+  int sockRcvbufBytes{4 * 1024 * 1024};
+
+  int opTimeoutMs{30 * 1000};
+
+  bool enableKeepalive{true};
+  int keepaliveIdleSec{30};
+  int keepaliveIntvlSec{10};
+  int keepaliveCnt{3};
+
+  bool enableCtrlNodelay{true};
+  bool enableDataNodelay{false};
+};
+
+inline std::ostream& operator<<(std::ostream& os, const TcpBackendConfig& c) {
+  return os << "numIoThreads[" << c.numIoThreads << "] sockSndbufBytes[" << c.sockSndbufBytes
+            << "] sockRcvbufBytes[" << c.sockRcvbufBytes << "] opTimeoutMs[" << c.opTimeoutMs
+            << "] enableKeepalive[" << c.enableKeepalive << "] keepaliveIdleSec["
+            << c.keepaliveIdleSec << "] keepaliveIntvlSec[" << c.keepaliveIntvlSec
+            << "] keepaliveCnt[" << c.keepaliveCnt << "] enableCtrlNodelay["
+            << c.enableCtrlNodelay << "] enableDataNodelay[" << c.enableDataNodelay << "]";
 }
 
 /* ---------------------------------------------------------------------------------------------- */
