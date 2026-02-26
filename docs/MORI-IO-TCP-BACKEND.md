@@ -127,6 +127,15 @@ Ordering:
 
 Receiver keeps op state keyed by `op_id` so ctrl/data can be processed independently.
 
+#### Cross-channel reordering (CTRL vs DATA)
+Because **CTRL** and **DATA** are separate TCP connections, the receiver may observe **DATA arriving before the corresponding CTRL request** (no global ordering across connections).
+
+To preserve RDMA-like op semantics without adding an extra RTT handshake, the TCP backend must:
+- Buffer such early DATA frames by `(peer_key, op_id)` into pinned host memory.
+- Finalize the write once the CTRL request arrives (or fail/cleanup on disconnect/timeout).
+
+For GPU destinations this maps naturally to the existing pinned-staging path; for CPU destinations this fallback path may add an extra copy only in the reordering case.
+
 ---
 
 ## 4. API Semantics
@@ -178,4 +187,3 @@ Receiver keeps op state keyed by `op_id` so ctrl/data can be processed independe
 - Adaptive multi-connection striping per peer to improve throughput on high-BDP networks.
 - Full `MSG_ZEROCOPY` completion accounting + buffer lifetime tracking (currently best-effort).
 - Optional TLS / auth for multi-tenant environments.
-
