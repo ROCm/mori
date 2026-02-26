@@ -179,16 +179,11 @@ void AllreduceSdma<T>::copy_input_to_transit(T* input, size_t total_count, hipSt
     }
 
     // Copy from user input buffer to input transit buffer
+    // No explicit sync needed — same-stream operations are ordered by the GPU
     hipError_t err = hipSuccess;
     if (stream != nullptr) {
         err = hipMemcpyAsync(input_transit_buffer_, input, input_bytes,
                            hipMemcpyDeviceToDevice, stream);
-        // Immediately synchronize to ensure copy completes
-        hipError_t sync_err = hipStreamSynchronize(stream);
-        if (sync_err != hipSuccess) {
-            fprintf(stderr, "PE %d: Stream synchronization failed: %s\n",
-                    myPe_, hipGetErrorString(sync_err));
-        }
     } else {
         err = hipMemcpy(input_transit_buffer_, input, input_bytes,
                        hipMemcpyDeviceToDevice);
@@ -328,60 +323,53 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
             return false;
         }
 
-        size_t required_input_size = total_count * dtype_size_;
-        if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
-                                input_transit_buffer_size_, input_transit_buffer_obj_,
-                                required_input_size, "input transit buffer")) {
-            async_in_progress_ = false;
-            return false;
+        size_t total_bytes = total_count * dtype_size_;
+        const size_t P2P_SDMA_THRESHOLD = 64 * 1024 * 1024;  // 64MB
+
+        if (total_bytes <= P2P_SDMA_THRESHOLD) {
+            // ---- P2P path: better for data <= 64MB ----
+            size_t required_input_size = total_bytes;
+            if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
+                                    input_transit_buffer_size_, input_transit_buffer_obj_,
+                                    required_input_size, "input transit buffer")) {
+                async_in_progress_ = false;
+                return false;
+            }
+
+            copy_input_to_transit(input, total_count, stream);
+
+            constexpr int pack_size = packed_t<T>::P::size;
+            int packedPerRank = static_cast<int>(elementCountPerRank / pack_size);
+            int reduce_threads = 512;
+            int reduce_blocks = std::min(80, (packedPerRank + reduce_threads - 1) / reduce_threads);
+            if (reduce_blocks < 1) reduce_blocks = 1;
+
+            ReduceScatterP2pKernel<T><<<reduce_blocks, reduce_threads, 0, stream>>>(
+                myPe_, npes_,
+                input_transit_buffer_obj_,
+                output_transit_buffer_obj_,
+                total_count);
+        } else {
+            // ---- SDMA path: better for data > 64MB ----
+            ReduceScatterSdmaPutKernel<T><<<1, 512, 0, stream>>>(
+                myPe_, npes_, input, output_transit_buffer_obj_, elementCountPerRank);
+
+            TwoShotAllReduceSdmaAsyncWaitKernel<<<1, 64, 0, stream>>>(
+                myPe_, npes_, output_transit_buffer_obj_, flagsObj_);
+
+            int sdma_reduce_block_size = 256;
+            int sdma_reduce_grid_size = static_cast<int>(
+                std::min(static_cast<size_t>((elementCountPerRank + sdma_reduce_block_size - 1) / sdma_reduce_block_size),
+                         static_cast<size_t>(65535)));
+            if (sdma_reduce_grid_size < 1) sdma_reduce_grid_size = 1;
+
+            ReduceScatterLocalReduceKernel<T><<<sdma_reduce_grid_size, sdma_reduce_block_size, 0, stream>>>(
+                static_cast<T*>(output_transit_buffer_), elementCountPerRank, myPe_, npes_);
         }
 
-        // ---- P2P path: ReduceScatter via direct P2P reads ----
-        // Step 1: Copy user input to input transit buffer (symmetric memory)
-        copy_input_to_transit(input, total_count, stream);
-
-        // Step 2: P2P ReduceScatter — each PE reads all PEs' data via peerPtrs
-        //         and reduces its own shard. Result in output_transit_buffer slot myPe.
-        constexpr int pack_size = packed_t<T>::P::size;
-        int packedPerRank = static_cast<int>(elementCountPerRank / pack_size);
-        int reduce_threads = 512;
-        int reduce_blocks = std::min(80, (packedPerRank + reduce_threads - 1) / reduce_threads);
-        if (reduce_blocks < 1) reduce_blocks = 1;
-
-        ReduceScatterP2pKernel<T><<<reduce_blocks, reduce_threads, 0, stream>>>(
-            myPe_, npes_,
-            input_transit_buffer_obj_,
-            output_transit_buffer_obj_,
-            total_count);
-
-        // Step 3: AllGather PUT — send my reduced shard to all PEs via SDMA
+        // AllGather PUT — shared by both paths
         AllGatherReducedSdmaPutKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_, output_transit_buffer_obj_, elementCountPerRank);
-
-#if 0
-        // ---- SDMA path (kept for comparison): ReduceScatter via SDMA PUT ----
-        // Phase 1: Scatter PUT — send shard_j of my input to PE j
-        ReduceScatterSdmaPutKernel<T><<<1, 512, 0, stream>>>(
-            myPe_, npes_, input, output_transit_buffer_obj_, elementCountPerRank);
-
-        // Phase 1b: Scatter WAIT — wait for all shards to arrive
-        TwoShotAllReduceSdmaAsyncWaitKernel<<<1, 64, 0, stream>>>(
-            myPe_, npes_, output_transit_buffer_obj_, flagsObj_);
-
-        // Phase 2: Local reduce — sum npes copies of my shard, write to slot myPe
-        int sdma_reduce_block_size = 256;
-        int sdma_reduce_grid_size = static_cast<int>(
-            std::min(static_cast<size_t>((elementCountPerRank + sdma_reduce_block_size - 1) / sdma_reduce_block_size),
-                     static_cast<size_t>(65535)));
-        if (sdma_reduce_grid_size < 1) sdma_reduce_grid_size = 1;
-
-        ReduceScatterLocalReduceKernel<T><<<sdma_reduce_grid_size, sdma_reduce_block_size, 0, stream>>>(
-            static_cast<T*>(output_transit_buffer_), elementCountPerRank, myPe_, npes_);
-
-        // Phase 3: AllGather PUT — send my reduced shard to all PEs
-        AllGatherReducedSdmaPutKernel<T><<<1, 512, 0, stream>>>(
-            myPe_, npes_, output_transit_buffer_obj_, elementCountPerRank);
-#endif
 
         hipError_t kernel_err = hipGetLastError();
         if (kernel_err != hipSuccess) {
