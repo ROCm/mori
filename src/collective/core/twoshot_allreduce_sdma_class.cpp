@@ -341,7 +341,7 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
             constexpr int pack_size = packed_t<T>::P::size;
             int packedPerRank = static_cast<int>(elementCountPerRank / pack_size);
             int reduce_threads = 512;
-            int reduce_blocks = std::min(80, (packedPerRank + reduce_threads - 1) / reduce_threads);
+            int reduce_blocks = std::min(128, (packedPerRank + reduce_threads - 1) / reduce_threads);
             if (reduce_blocks < 1) reduce_blocks = 1;
 
             ReduceScatterP2pKernel<T><<<reduce_blocks, reduce_threads, 0, stream>>>(
