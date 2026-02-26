@@ -5,6 +5,7 @@ add_library(
   rdma/backend_impl.cpp
   rdma/executor.cpp
   rdma/common.cpp
+  tcp/backend_impl.cpp
   xgmi/backend_impl.cpp
   xgmi/hip_resource_pool.cpp)
 

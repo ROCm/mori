@@ -27,6 +27,7 @@
 
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/backend_impl.hpp"
+#include "src/io/tcp/backend_impl.hpp"
 #include "src/io/xgmi/backend_impl.hpp"
 
 namespace mori {
@@ -132,6 +133,26 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
                                                  static_cast<const XgmiBackendConfig&>(beConfig));
     backends.insert({type, std::move(backend)});
     InvalidateRouteCache();
+  } else if (type == BackendType::TCP) {
+    assert(backends.find(type) == backends.end());
+    auto backend = std::make_unique<TcpBackend>(desc.key, config,
+                                                static_cast<const TcpBackendConfig&>(beConfig));
+
+    if (config.port == 0) {
+      auto bound_port_opt = backend->GetListenPort();
+      if (!bound_port_opt.has_value() || bound_port_opt.value() == 0) {
+        MORI_IO_ERROR("IOEngine key {} failed to retrieve bound port after TCP backend init",
+                      desc.key);
+        assert(false && "Failed to retrieve bound port after TCP backend init");
+      } else {
+        uint16_t bound_port = bound_port_opt.value();
+        desc.port = bound_port;
+        this->config.port = bound_port;
+        MORI_IO_INFO("IOEngine key {} bound ephemeral port {}", desc.key, bound_port);
+      }
+    }
+
+    backends.insert({type, std::move(backend)});
   } else {
     assert(false && "not implemented");
   }
