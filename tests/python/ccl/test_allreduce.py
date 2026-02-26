@@ -15,6 +15,13 @@ from mori.ccl import AllreduceSdma
 from tests.python.utils import TorchDistContext, get_free_port
 
 
+def _to_numpy(tensor):
+    """Convert a CPU tensor to numpy, handling dtypes that don't support .numpy() directly."""
+    if tensor.dtype in (torch.bfloat16, torch.float16):
+        return tensor.float().numpy()
+    return tensor.numpy()
+
+
 def _verify_allreduce_result(data_cpu, elems, my_pe, npes, label="", dtype=torch.uint32):
     """Verify allreduce result: each element should equal sum of (pe+1)*1000 across all PEs."""
     expected_value = sum((pe + 1) * 1000 for pe in range(npes))
@@ -165,14 +172,14 @@ def _test_allreduce(rank, world_size, port, elems, iterations, warmup, dtype=tor
         )
 
         transit_buf = ar_nocp.get_output_transit_buffer(device=input_tensor)
-        transit_cpu = transit_buf.cpu().numpy()
+        transit_cpu = _to_numpy(transit_buf.cpu())
 
         nocp_ok = _verify_allreduce_result(transit_cpu, elems, my_pe, npes,
                                            f"out-of-place/transit/{dtype_name}",
                                            dtype=dtype)
 
-        out_cpu = output_tensor.cpu().numpy()
-        zero_check = np.all(out_cpu == 0) if dtype in (torch.uint32, torch.int32) else np.allclose(out_cpu, 0)
+        out_cpu = _to_numpy(output_tensor.cpu())
+        zero_check = np.allclose(out_cpu, 0) if dtype not in (torch.uint32, torch.int32) else np.all(out_cpu == 0)
         if zero_check:
             if rank == 0:
                 print(f"  PE {rank}: output_tensor correctly untouched (all zeros)")
@@ -210,7 +217,7 @@ def _test_allreduce(rank, world_size, port, elems, iterations, warmup, dtype=tor
         ar_inp.allreduce_inplace(inplace_tensor, elems, stream)
         stream.synchronize()
 
-        inp_cpu = inplace_tensor.cpu().numpy()
+        inp_cpu = _to_numpy(inplace_tensor.cpu())
         inp_ok = _verify_allreduce_result(inp_cpu, elems, my_pe, npes,
                                           f"inplace/{dtype_name}", dtype=dtype)
 
