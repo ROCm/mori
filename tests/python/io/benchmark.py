@@ -45,14 +45,14 @@ def parse_args():
     parser.add_argument(
         "--backend",
         type=str,
-        choices=["rdma", "xgmi"],
+        choices=["rdma", "xgmi", "tcp"],
         default="rdma",
-        help="Backend type: 'rdma' for cross-node, 'xgmi' for intra-node GPU-to-GPU (default: rdma)",
+        help="Backend type: 'rdma' for cross-node, 'tcp' for cross-node fallback, 'xgmi' for intra-node GPU-to-GPU (default: rdma)",
     )
     parser.add_argument(
         "--host",
         type=str,
-        help="Host IP for mori io engine OOB communication (RDMA only)",
+        help="Host IP for mori io engine OOB communication (RDMA/TCP only)",
     )
     parser.add_argument(
         "--src-gpu",
@@ -89,6 +89,14 @@ def parse_args():
         choices=["read", "write"],
         default="read",
         help="Type of ops, choices [read, write], default to 'read'",
+    )
+    # Backward-compatible alias for existing scripts.
+    parser.add_argument(
+        "--op",
+        dest="op_type",
+        type=str,
+        choices=["read", "write"],
+        help="Alias for --op-type",
     )
     parser.add_argument(
         "--buffer-size",
@@ -403,13 +411,16 @@ class MoriIoBenchmark:
             port=self.port,
         )
         self.engine = IOEngine(key=f"{self.role.name}-{self.role_rank}", config=config)
-        config = RdmaBackendConfig(
-            qp_per_transfer=self.num_qp_per_transfer,
-            post_batch_size=-1,
-            num_worker_threads=self.num_worker_threads,
-            poll_cq_mode=self.poll_cq_mode,
-        )
-        self.engine.create_backend(BackendType.RDMA, config)
+        if self.backend_type == "tcp":
+            self.engine.create_backend(BackendType.TCP)
+        else:
+            config = RdmaBackendConfig(
+                qp_per_transfer=self.num_qp_per_transfer,
+                post_batch_size=-1,
+                num_worker_threads=self.num_worker_threads,
+                poll_cq_mode=self.poll_cq_mode,
+            )
+            self.engine.create_backend(BackendType.RDMA, config)
 
         self.engine_desc = self.engine.get_engine_desc()
         engine_desc_bytes = self.engine_desc.pack()
@@ -494,7 +505,7 @@ class MoriIoBenchmark:
     def run_single_once(self, buffer_size, transfer_batch_size):
         assert buffer_size <= self.buffer_size
         if (
-            self.backend_type == "rdma"
+            self.backend_type in ("rdma", "tcp")
             or (self.backend_type == "xgmi" and self.xgmi_multiprocess)
         ) and self.role is EngineRole.TARGET:
             return 0
@@ -546,7 +557,7 @@ class MoriIoBenchmark:
     def run_batch_once(self, buffer_size, transfer_batch_size):
         assert buffer_size <= self.buffer_size
         if (
-            self.backend_type == "rdma"
+            self.backend_type in ("rdma", "tcp")
             or (self.backend_type == "xgmi" and self.xgmi_multiprocess)
         ) and self.role is EngineRole.TARGET:
             return 0
@@ -606,7 +617,7 @@ class MoriIoBenchmark:
             latency.append(duration)
 
         if self.role is EngineRole.TARGET and (
-            self.backend_type == "rdma"
+            self.backend_type in ("rdma", "tcp")
             or (self.backend_type == "xgmi" and self.xgmi_multiprocess)
         ):
             return 0, 0, 0, 0, 0
@@ -627,6 +638,8 @@ class MoriIoBenchmark:
                 return f"XGMI Multiprocess Benchmark: Rank {self.role_rank} ({self.role.name})"
             else:
                 return f"XGMI Benchmark: GPU{self.src_gpu} -> GPU{self.dst_gpu}"
+        elif self.backend_type == "tcp":
+            return f"TCP Benchmark: Initiator Rank {self.role_rank}"
         else:
             return f"RDMA Benchmark: Initiator Rank {self.role_rank}"
 
@@ -650,7 +663,7 @@ class MoriIoBenchmark:
             cur_size = self.sweep_start_size
             max_size = self.sweep_max_size
             while cur_size <= max_size:
-                if self.backend_type == "rdma" or (
+                if self.backend_type in ("rdma", "tcp") or (
                     self.backend_type == "xgmi" and self.xgmi_multiprocess
                 ):
                     dist.barrier()
@@ -675,7 +688,7 @@ class MoriIoBenchmark:
             cur_transfer_batch_size = 1
             max_transfer_batch_size = 32768
             while cur_transfer_batch_size <= max_transfer_batch_size:
-                if self.backend_type == "rdma" or (
+                if self.backend_type in ("rdma", "tcp") or (
                     self.backend_type == "xgmi" and self.xgmi_multiprocess
                 ):
                     dist.barrier()
@@ -826,7 +839,7 @@ def benchmark_engine(local_rank, node_rank, args):
         sweep_batch=args.all_batch,
         sweep_start_size=args.sweep_start_size,
         sweep_max_size=args.sweep_max_size,
-        backend_type="rdma",
+        backend_type=args.backend,
         host=args.host,
         port=get_free_port(),
         node_rank=node_rank,
