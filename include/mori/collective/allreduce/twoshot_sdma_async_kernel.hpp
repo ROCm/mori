@@ -196,33 +196,54 @@ __global__ void ReduceScatterP2pKernel(int myPe, int npes,
     peers[pe] = reinterpret_cast<const P*>(srcMemObj->peerPtrs[pe]);
   }
 
-  // Main loop: process UNROLL elements per iteration
-  // Elements are strided by threadsPerGrid so adjacent threads coalesce
+  // Main loop: explicit double-buffer pipeline
+  //
+  // buf[cur]  holds data loaded from the CURRENT PE (ready for compute)
+  // buf[next] receives data loaded from the NEXT PE (prefetch, overlaps with compute)
+  //
+  // Timeline per iteration:
+  //   1. Issue loads for PE k+1 into buf[next]  (P2P loads, non-blocking)
+  //   2. Accumulate PE k's data from buf[cur]   (ALU, overlaps with step 1)
+  //   3. Swap cur/next
+  //
   size_t i = threadLinearId;
   for (; i + (UNROLL - 1) * threadsPerGrid < packedPerRank;
        i += threadsPerGrid * UNROLL) {
     A acc[UNROLL];
+    P buf[2][UNROLL];
+    int cur = 0;
 
-    // Initialize accumulators from PE 0 — UNROLL independent loads
+    // Prefetch PE 0's data
     #pragma unroll
     for (int u = 0; u < UNROLL; u++) {
-      acc[u] = upcast_v<typename P::type, pack_size>(
-          peers[0][myStart + i + u * threadsPerGrid]);
+      buf[0][u] = peers[0][myStart + i + u * threadsPerGrid];
     }
 
-    // For each remaining PE: issue UNROLL loads first, then accumulate
-    // The loads are independent and the hardware can pipeline them
-    // while previous accumulations are still executing
-    for (int pe = 1; pe < npes; pe++) {
-      P vals[UNROLL];
-      #pragma unroll
-      for (int u = 0; u < UNROLL; u++) {
-        vals[u] = peers[pe][myStart + i + u * threadsPerGrid];
+    for (int pe = 0; pe < npes; pe++) {
+      int next = 1 - cur;
+
+      // Step 1: prefetch NEXT PE's data (independent of current compute)
+      if (pe + 1 < npes) {
+        #pragma unroll
+        for (int u = 0; u < UNROLL; u++) {
+          buf[next][u] = peers[pe + 1][myStart + i + u * threadsPerGrid];
+        }
       }
-      #pragma unroll
-      for (int u = 0; u < UNROLL; u++) {
-        packed_assign_add(acc[u], upcast_v<typename P::type, pack_size>(vals[u]));
+
+      // Step 2: accumulate CURRENT PE's data (overlaps with step 1 loads)
+      if (pe == 0) {
+        #pragma unroll
+        for (int u = 0; u < UNROLL; u++) {
+          acc[u] = upcast_v<typename P::type, pack_size>(buf[cur][u]);
+        }
+      } else {
+        #pragma unroll
+        for (int u = 0; u < UNROLL; u++) {
+          packed_assign_add(acc[u], upcast_v<typename P::type, pack_size>(buf[cur][u]));
+        }
       }
+
+      cur = next;
     }
 
     // Write results
@@ -233,7 +254,7 @@ __global__ void ReduceScatterP2pKernel(int myPe, int npes,
     }
   }
 
-  // Remainder elements (no unrolling)
+  // Remainder elements (no pipeline)
   for (; i < packedPerRank; i += threadsPerGrid) {
     size_t globalIdx = myStart + i;
     A acc = upcast_v<typename P::type, pack_size>(peers[0][globalIdx]);
