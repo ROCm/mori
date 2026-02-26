@@ -204,10 +204,11 @@ def _test_allreduce(rank, world_size, port, elems, iterations, warmup, dtype=tor
         torch.cuda.synchronize()
         dist.barrier()
 
-        times_inp = _run_benchmark(
-            lambda: ar_inp.allreduce_inplace(inplace_tensor, elems, stream),
-            iterations, warmup, stream, rank,
-        )
+        # Correctness: single-shot verification
+        inplace_tensor.fill_(fill_value)
+        stream.synchronize()
+        ar_inp.allreduce_inplace(inplace_tensor, elems, stream)
+        stream.synchronize()
 
         inp_cpu = inplace_tensor.cpu().numpy()
         inp_ok = _verify_allreduce_result(inp_cpu, elems, my_pe, npes,
@@ -216,6 +217,18 @@ def _test_allreduce(rank, world_size, port, elems, iterations, warmup, dtype=tor
         if rank == 0 and inp_ok:
             expected = sum((pe + 1) * 1000 for pe in range(npes))
             print(f"  PE {rank}: inplace result verified (all values ~ {expected})")
+
+        dist.barrier()
+
+        # Benchmark: refill tensor before each iteration to avoid exponential growth
+        def _inplace_with_refill():
+            inplace_tensor.fill_(fill_value)
+            return ar_inp.allreduce_inplace(inplace_tensor, elems, stream)
+
+        times_inp = _run_benchmark(
+            _inplace_with_refill,
+            iterations, warmup, stream, rank,
+        )
 
         dist.barrier()
         _print_stats(times_inp, data_bytes, npes, rank, f"In-place ({dtype_name})")

@@ -69,9 +69,9 @@ double Allreduce_sdma(T* input, T* output, size_t total_count,
   if (barrierMem == nullptr) {
     return -1;
   }
-  memset(barrierMem, 0, barrierSize);
   application::SymmMemObjPtr barrierObj =
       shmem::ShmemSymmetricRegister(barrierMem, barrierSize);
+  hipMemset(barrierMem, 0, barrierSize);
 
   assert(inPutBuffObj.IsValid());
   assert(transitObj.IsValid());

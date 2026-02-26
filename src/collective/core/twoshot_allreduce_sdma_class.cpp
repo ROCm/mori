@@ -68,17 +68,22 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size, si
         throw std::runtime_error("Failed to get valid flags memory object");
     }
 
-    // 1b. Allocate and zero-init RSBarrierSignal for start_sync
+    // 1b. Allocate RSBarrierSignal for start_sync
     size_t barrierSize = sizeof(RSBarrierSignal);
     void* barrierMem = shmem::ShmemMalloc(barrierSize);
     if (barrierMem == nullptr) {
         throw std::runtime_error("Failed to allocate barrier signal memory");
     }
     barrierSignalPtr_.reset(barrierMem);
-    memset(barrierMem, 0, barrierSize);
     barrierSignalObj_ = shmem::ShmemSymmetricRegister(barrierMem, barrierSize);
     if (!barrierSignalObj_.IsValid()) {
         throw std::runtime_error("Failed to register barrier signal memory");
+    }
+    // Zero-init AFTER registration — ShmemSymmetricRegister is a collective
+    // that may modify the memory during IPC handle exchange.
+    hipError_t memset_err = hipMemset(barrierMem, 0, barrierSize);
+    if (memset_err != hipSuccess) {
+        throw std::runtime_error("Failed to zero-init barrier signal memory");
     }
 
     // 2. Allocate input transit buffer (srcMemObj)
