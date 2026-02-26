@@ -44,9 +44,13 @@ private:
     int npes_;
     size_t dtype_size_;
 
-    // Flag memory
+    // AllGather flag memory
     application::SymmMemObjPtr flagsObj_;
     std::unique_ptr<uint64_t[], ShmemDeleter> flags_;
+
+    // Barrier signal for ReduceScatter start_sync (system-scope atomic barrier)
+    application::SymmMemObjPtr barrierSignalObj_;
+    std::unique_ptr<void, ShmemDeleter> barrierSignalPtr_;
 
     // Input transit buffer (srcMemObj — registered wrapper around user input)
     void* input_transit_buffer_;

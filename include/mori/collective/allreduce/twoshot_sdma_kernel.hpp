@@ -31,10 +31,29 @@
 
 namespace mori {
 namespace collective {
+
+constexpr int kRSMaxBlocks = 80;
+
+// Barrier signal for ReduceScatterKernel, allocated in symmetric memory.
+// Layout mirrors Signal in kernel_impl.cuh for the start_sync pattern.
+struct alignas(128) RSBarrierSignal {
+  uint32_t sync[kRSMaxBlocks][8];
+  alignas(128) uint32_t flag[kRSMaxBlocks];
+};
+
+// ============================================================================
+// Kernel 1: ReduceScatter with built-in cross-rank barrier
+//
+// Before reading peerPtrs, every block executes a start_sync barrier
+// (system-scope atomic store + device-scope atomic load) identical to
+// cross_device_reduce_2stage in kernel_impl.cuh.
+// This replaces the previous hipStreamSynchronize — no host blocking needed.
+// ============================================================================
 template <typename T>
 __global__ void ReduceScatterKernel(int myPe, int npes,
                                     const application::SymmMemObjPtr srcMemObj,
                                     const application::SymmMemObjPtr dstMemObj,
+                                    const application::SymmMemObjPtr barrierObj,
                                     size_t elementCount) {
   if (elementCount == 0 || npes <= 0) {
     return;
@@ -51,6 +70,33 @@ __global__ void ReduceScatterKernel(int myPe, int npes,
   if (elementCountPerRank == 0) {
     return;
   }
+
+  // --- start_sync barrier (same as kernel_impl.cuh) --------------------------
+  {
+    RSBarrierSignal* self_sg =
+        reinterpret_cast<RSBarrierSignal*>(barrierObj->localPtr);
+    uint32_t next_flag = self_sg->flag[blockIdx.x] + 1;
+
+    if (threadIdx.x < static_cast<unsigned>(npes)) {
+      RSBarrierSignal* remote_sg =
+          reinterpret_cast<RSBarrierSignal*>(barrierObj->peerPtrs[threadIdx.x]);
+
+      __scoped_atomic_store_n(
+          &remote_sg->sync[blockIdx.x][myPe],
+          next_flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+
+      while (__scoped_atomic_load_n(
+                 &self_sg->sync[blockIdx.x][threadIdx.x],
+                 __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE) < next_flag)
+        ;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+      self_sg->flag[blockIdx.x] = next_flag;
+    }
+  }
+  // --- barrier done ----------------------------------------------------------
 
   const size_t totalPacked = static_cast<size_t>(npes) * packedPerRank;
   const size_t start = static_cast<size_t>(myPe) * packedPerRank;

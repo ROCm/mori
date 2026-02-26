@@ -46,6 +46,7 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size, si
       npes_(npes),
       dtype_size_(sizeof(T)),
       flags_(nullptr, ShmemDeleter()),
+      barrierSignalPtr_(nullptr, ShmemDeleter()),
       input_transit_buffer_(nullptr),
       input_transit_buffer_size_(input_buffer_size),
       input_transit_buffer_ptr_(nullptr, ShmemDeleter()),
@@ -54,7 +55,7 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size, si
       output_transit_buffer_ptr_(nullptr, ShmemDeleter()),
       copy_output_to_user_(copy_output_to_user) {
 
-    // 1. Allocate and initialize flags memory
+    // 1a. Allocate and initialize AllGather flags memory
     size_t flagsSize = npes_ * sizeof(uint64_t);
     void* flags = shmem::ShmemMalloc(flagsSize);
     if (flags == nullptr) {
@@ -67,6 +68,19 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size, si
         throw std::runtime_error("Failed to get valid flags memory object");
     }
 
+    // 1b. Allocate and zero-init RSBarrierSignal for start_sync
+    size_t barrierSize = sizeof(RSBarrierSignal);
+    void* barrierMem = shmem::ShmemMalloc(barrierSize);
+    if (barrierMem == nullptr) {
+        throw std::runtime_error("Failed to allocate barrier signal memory");
+    }
+    barrierSignalPtr_.reset(barrierMem);
+    memset(barrierMem, 0, barrierSize);
+    barrierSignalObj_ = shmem::ShmemSymmetricRegister(barrierMem, barrierSize);
+    if (!barrierSignalObj_.IsValid()) {
+        throw std::runtime_error("Failed to register barrier signal memory");
+    }
+
     // 2. Allocate input transit buffer (srcMemObj)
     input_transit_buffer_ = shmem::ShmemMalloc(input_transit_buffer_size_);
     if (input_transit_buffer_ == nullptr) {
@@ -74,20 +88,18 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size, si
     }
     input_transit_buffer_ptr_.reset(input_transit_buffer_);
 
-    // Register input transit buffer
     input_transit_buffer_obj_ = shmem::ShmemSymmetricRegister(input_transit_buffer_, input_transit_buffer_size_);
     if (!input_transit_buffer_obj_.IsValid()) {
         throw std::runtime_error("Failed to register input transit buffer");
     }
 
-    // 3. Allocate output transit buffer (dstMemObj — used for gather, reduce, and allgather)
+    // 3. Allocate output transit buffer (dstMemObj)
     output_transit_buffer_ = shmem::ShmemMalloc(output_transit_buffer_size_);
     if (output_transit_buffer_ == nullptr) {
         throw std::runtime_error("Failed to allocate output transit buffer");
     }
     output_transit_buffer_ptr_.reset(output_transit_buffer_);
 
-    // Register output transit buffer
     output_transit_buffer_obj_ = shmem::ShmemSymmetricRegister(output_transit_buffer_, output_transit_buffer_size_);
     if (!output_transit_buffer_obj_.IsValid()) {
         throw std::runtime_error("Failed to register output transit buffer");
@@ -96,6 +108,7 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size, si
     // 4. Print initialization information
     printf("AllreduceSdma initialized: PE %d of %d\n", myPe_, npes_);
     printf("  Flags allocated: %zu bytes at %p\n", flagsSize, flags_.get());
+    printf("  Barrier signal: %zu bytes at %p\n", barrierSize, barrierMem);
     printf("  Input transit buffer: %.2f MB at %p\n",
            input_transit_buffer_size_ / (1024.0 * 1024.0), input_transit_buffer_);
     printf("  Output transit buffer: %.2f MB at %p\n",
@@ -170,17 +183,13 @@ void AllreduceSdma<T>::copy_input_to_transit(T* input, size_t total_count, hipSt
         throw std::runtime_error("Input transit buffer is null");
     }
 
-    // Copy from user input buffer to input transit buffer
+    // Async D2D copy — no host sync needed; the start_sync barrier inside
+    // ReduceScatterKernel (launched on the same stream) will ensure all PEs'
+    // copies are visible before any cross-device reads.
     hipError_t err = hipSuccess;
     if (stream != nullptr) {
         err = hipMemcpyAsync(input_transit_buffer_, input, input_bytes,
                            hipMemcpyDeviceToDevice, stream);
-        // Immediately synchronize to ensure copy completes
-        hipError_t sync_err = hipStreamSynchronize(stream);
-        if (sync_err != hipSuccess) {
-            fprintf(stderr, "PE %d: Stream synchronization failed: %s\n",
-                    myPe_, hipGetErrorString(sync_err));
-        }
     } else {
         err = hipMemcpy(input_transit_buffer_, input, input_bytes,
                        hipMemcpyDeviceToDevice);
@@ -252,6 +261,7 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
             myPe_, npes_,
             input_transit_buffer_obj_,
             output_transit_buffer_obj_,
+            barrierSignalObj_,
             total_count);
 
         hipError_t err = hipGetLastError();
