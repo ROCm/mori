@@ -48,18 +48,6 @@ inline int GetCurDeviceMaxThreads() {
   return GetMaxThreads(device);
 }
 
-inline int GetMaxThreads(int device) {
-  hipDeviceProp_t prop;
-  HIP_RUNTIME_CHECK(hipGetDeviceProperties(&prop, device));
-  return prop.maxThreadsPerMultiProcessor;
-}
-
-inline int GetCurDeviceMaxThreads() {
-  int device = 0;
-  HIP_RUNTIME_CHECK(hipGetDevice(&device));
-  return GetMaxThreads(device);
-}
-
 inline int GetDeviceWallClockFreqKHz(int device) {
   int rate;
   HIP_RUNTIME_CHECK(hipDeviceGetAttribute(&rate, hipDeviceAttributeWallClockRate, device));
