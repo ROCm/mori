@@ -35,6 +35,7 @@ from mori.cpp import (
     MemoryLocationType,
     PollCqMode,
     RdmaBackendConfig,
+    TcpBackendConfig,
     XgmiBackendConfig,
     FabricBackendConfig,
     fabric_alloc,
