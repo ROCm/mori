@@ -20,8 +20,12 @@ Run the following command on each node and replace node_rank to its actual rank.
 export GLOO_SOCKET_IFNAME=ens14np0
 export MORI_RDMA_DEVICES=^mlx5_0,mlx5_1  # Optional: use `^` prefix to exclude specified devices
 
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.194.129.65" --master_port=1234 examples/ops/dispatch_combine/test_dispatch_combine_internode.py --bench
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.194.132.29" --master_port=1234 examples/ops/dispatch_combine/test_dispatch_combine_internode.py --max-tokens 128 --cmd bench 
 ```
+
+
+GLOO_SOCKET_IFNAME=enp81s0f1 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.235.192.87" --master_port=1234 examples/ops/dispatch_combine/test_dispatch_combine_internode.py --max-tokens 128 --cmd bench
+GLOO_SOCKET_IFNAME=enp81s0f1 torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 --master_addr="10.235.192.87" --master_port=1234 examples/ops/dispatch_combine/test_dispatch_combine_internode.py --max-tokens 128 --cmd bench  
 
 The output of this scripit includes total number of tokens received, total number of RDMA tokens received and total bandwidth(include XGMI and RDMA). To calculate RDMA bandwidth, multiply the total bandwidth with (total # of RDMA tokens / total # of tokens);
 

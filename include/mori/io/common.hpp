@@ -21,7 +21,10 @@
 // SOFTWARE.
 #pragma once
 
+#include <array>
+#include <functional>
 #include <msgpack.hpp>
+#include <mutex>
 
 #include "mori/application/transport/p2p/p2p.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
@@ -82,6 +85,8 @@ struct EngineDesc {
 
 using MemoryUniqueId = uint32_t;
 
+constexpr size_t kIpcHandleSize = 64;
+
 struct MemoryDesc {
   EngineKey engineKey;
   MemoryUniqueId id{0};
@@ -89,13 +94,14 @@ struct MemoryDesc {
   uintptr_t data{0};
   size_t size{0};
   MemoryLocationType loc;
+  std::array<char, kIpcHandleSize> ipcHandle{};
 
   constexpr bool operator==(const MemoryDesc& rhs) const noexcept {
     return (engineKey == rhs.engineKey) && (id == rhs.id) && (deviceId == rhs.deviceId) &&
            (data == rhs.data) && (size == rhs.size) && (loc == rhs.loc);
   }
 
-  MSGPACK_DEFINE(engineKey, id, deviceId, data, size, loc);
+  MSGPACK_DEFINE(engineKey, id, deviceId, data, size, loc, ipcHandle);
 };
 
 using TransferUniqueId = uint64_t;
@@ -105,27 +111,50 @@ struct TransferStatus {
   TransferStatus() = default;
   ~TransferStatus() = default;
 
-  StatusCode Code() { return code.load(std::memory_order_relaxed); }
-  uint32_t CodeUint32() { return static_cast<uint32_t>(code.load(std::memory_order_relaxed)); }
+  StatusCode Code() { return code.load(std::memory_order_acquire); }
+  uint32_t CodeUint32() { return static_cast<uint32_t>(code.load(std::memory_order_acquire)); }
 
-  std::string Message() { return msg; }
+  std::string Message() {
+    std::lock_guard<std::mutex> lock(msgMu);
+    return msg;
+  }
+
+  void Update(enum StatusCode val, const std::string& message) {
+    std::lock_guard<std::mutex> lock(msgMu);
+    StatusCode current = code.load(std::memory_order_relaxed);
+    if (current > StatusCode::ERR_BEGIN) return;
+
+    msg = message;
+    code.store(val, std::memory_order_release);
+  }
 
   bool Init() { return Code() == StatusCode::INIT; }
   bool InProgress() { return Code() == StatusCode::IN_PROGRESS; }
   bool Succeeded() { return Code() == StatusCode::SUCCESS; }
   bool Failed() { return Code() > StatusCode::ERR_BEGIN; }
 
-  void SetCode(enum StatusCode val) { code.store(val, std::memory_order_relaxed); }
-  void SetMessage(const std::string& val) { msg = val; }
+  void SetCode(enum StatusCode val) { code.store(val, std::memory_order_release); }
+  void SetMessage(const std::string& val) {
+    std::lock_guard<std::mutex> lock(msgMu);
+    msg = val;
+  }
 
   void Wait() {
+    if (waitCallback) {
+      waitCallback();
+      return;
+    }
     while (InProgress()) {
     }
   }
 
+  void SetWaitCallback(std::function<void()> cb) { waitCallback = std::move(cb); }
+
  private:
   std::atomic<StatusCode> code{StatusCode::INIT};
+  mutable std::mutex msgMu;
   std::string msg;
+  std::function<void()> waitCallback;
 };
 
 // Session cache helpers
@@ -153,6 +182,10 @@ struct SessionCacheKeyHash {
 };
 
 using SizeVec = std::vector<size_t>;
+using MemDescVec = std::vector<MemoryDesc>;
+using BatchSizeVec = std::vector<SizeVec>;
+using TransferUniqueIdVec = std::vector<TransferUniqueId>;
+using TransferStatusPtrVec = std::vector<TransferStatus*>;
 
 }  // namespace io
 }  // namespace mori

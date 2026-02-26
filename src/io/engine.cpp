@@ -24,6 +24,7 @@
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/tcp/backend_impl.hpp"
+#include "src/io/xgmi/backend_impl.hpp"
 
 namespace mori {
 namespace io {
@@ -89,8 +90,7 @@ IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
   desc.hostname = std::string(hostname);
   desc.host = config.host;
   desc.port = config.port;
-  MORI_IO_INFO("Create engine key {} hostname {} host {}, port {}", key, hostname, config.host,
-               config.port);
+  MORI_IO_INFO("Create engine key {} hostname {}", key, hostname);
 }
 
 IOEngine::~IOEngine() {}
@@ -98,14 +98,37 @@ IOEngine::~IOEngine() {}
 void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
   if (type == BackendType::RDMA) {
     assert(backends.find(type) == backends.end());
-    backends.insert({type, std::make_unique<RdmaBackend>(
-                               desc.key, config, static_cast<const RdmaBackendConfig&>(beConfig))});
+    auto backend = std::make_unique<RdmaBackend>(desc.key, config,
+                                                 static_cast<const RdmaBackendConfig&>(beConfig));
+
+    if (config.port == 0) {
+      auto bound_port_opt = backend->GetListenPort();
+      if (!bound_port_opt.has_value() || bound_port_opt.value() == 0) {
+        MORI_IO_ERROR("IOEngine key {} failed to retrieve bound port after RDMA backend init",
+                      desc.key);
+        assert(false && "Failed to retrieve bound port after RDMA backend init");
+      } else {
+        uint16_t bound_port = bound_port_opt.value();
+        desc.port = bound_port;
+        this->config.port = bound_port;
+        MORI_IO_INFO("IOEngine key {} bound ephemeral port {}", desc.key, bound_port);
+      }
+    }
+
+    backends.insert({type, std::move(backend)});
   } else if (type == BackendType::TCP) {
     assert(backends.find(type) == backends.end());
-    backends.insert({type, std::make_unique<TcpBackend>(
-                               desc.key, config, static_cast<const TcpBackendConfig&>(beConfig))});
-  } else
+    auto backend = std::make_unique<TcpBackend>(desc.key, config,
+                                                static_cast<const TcpBackendConfig&>(beConfig));
+    backends.insert({type, std::move(backend)});
+  } else if (type == BackendType::XGMI) {
+    assert(backends.find(type) == backends.end());
+    auto backend = std::make_unique<XgmiBackend>(desc.key, config,
+                                                 static_cast<const XgmiBackendConfig&>(beConfig));
+    backends.insert({type, std::move(backend)});
+  } else {
     assert(false && "not implemented");
+  }
   MORI_IO_INFO("Create backend type {}", static_cast<uint32_t>(type));
 }
 
@@ -115,7 +138,8 @@ void IOEngine::RegisterRemoteEngine(const EngineDesc& remote) {
   for (auto& it : backends) {
     it.second->RegisterRemoteEngine(remote);
   }
-  MORI_IO_INFO("Register remote engine {}", remote.key.c_str());
+  MORI_IO_INFO("Register remote engine {} hostname {}", remote.key.c_str(),
+               remote.hostname.c_str());
 }
 
 void IOEngine::DeregisterRemoteEngine(const EngineDesc& remote) {
@@ -162,6 +186,17 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
   if (backends.empty()) {
     return nullptr;
   }
+
+  auto xgmiIt = backends.find(BackendType::XGMI);
+  if (xgmiIt != backends.end() && xgmiIt->second->CanHandle(local, remote)) {
+    return xgmiIt->second.get();
+  }
+
+  auto rdmaIt = backends.find(BackendType::RDMA);
+  if (rdmaIt != backends.end()) {
+    return rdmaIt->second.get();
+  }
+
   return backends.begin()->second.get();
 }
 
@@ -169,8 +204,8 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
   backend = SelectBackend(local, remote);                                     \
   if (backend == nullptr) {                                                   \
     if (status != nullptr) {                                                  \
-      status->SetCode(StatusCode::ERR_BAD_STATE);                             \
-      status->SetMessage("No available backend found, create backend first"); \
+      status->Update(StatusCode::ERR_BAD_STATE,                               \
+                     "No available backend found, create backend first");     \
     }                                                                         \
     MORI_IO_ERROR("No available backend found, please create backend first"); \
     return;                                                                   \
@@ -199,28 +234,53 @@ void IOEngine::Write(const MemoryDesc& localSrc, size_t localOffset, const Memor
   }
 }
 
-void IOEngine::BatchRead(const MemoryDesc& localDest, const SizeVec& localOffsets,
-                         const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
-                         const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
+void IOEngine::BatchRead(const MemDescVec& localDest, const BatchSizeVec& localOffsets,
+                         const MemDescVec& remoteSrc, const BatchSizeVec& remoteOffsets,
+                         const BatchSizeVec& sizes, TransferStatusPtrVec& status,
+                         TransferUniqueIdVec& ids) {
   MORI_IO_FUNCTION_TIMER;
-  Backend* backend = nullptr;
-  SELECT_BACKEND_AND_RETURN_IF_NONE(localDest, remoteSrc, status, backend);
-  backend->BatchRead(localDest, localOffsets, remoteSrc, remoteOffsets, sizes, status, id);
-  if (status->Failed()) {
-    MORI_IO_ERROR("Engine batch read error {} message {}", status->CodeUint32(), status->Message());
+  size_t batchSize = localDest.size();
+  assert(batchSize == remoteSrc.size());
+  assert(batchSize == localOffsets.size());
+  assert(batchSize == remoteOffsets.size());
+  assert(batchSize == sizes.size());
+  assert(batchSize == status.size());
+  assert(batchSize == ids.size());
+
+  for (size_t i = 0; i < batchSize; i++) {
+    Backend* backend = nullptr;
+    SELECT_BACKEND_AND_RETURN_IF_NONE(localDest[i], remoteSrc[i], status[i], backend);
+    backend->BatchRead(localDest[i], localOffsets[i], remoteSrc[i], remoteOffsets[i], sizes[i],
+                       status[i], ids[i]);
+    if (status[i]->Failed()) {
+      MORI_IO_ERROR("Engine batch read error {} message {}", status[i]->CodeUint32(),
+                    status[i]->Message());
+    }
   }
 }
 
-void IOEngine::BatchWrite(const MemoryDesc& localSrc, const SizeVec& localOffsets,
-                          const MemoryDesc& remoteDest, const SizeVec& remoteOffsets,
-                          const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
+void IOEngine::BatchWrite(const MemDescVec& localSrc, const BatchSizeVec& localOffsets,
+                          const MemDescVec& remoteDest, const BatchSizeVec& remoteOffsets,
+                          const BatchSizeVec& sizes, TransferStatusPtrVec& status,
+                          TransferUniqueIdVec& ids) {
   MORI_IO_FUNCTION_TIMER;
-  Backend* backend = nullptr;
-  SELECT_BACKEND_AND_RETURN_IF_NONE(localSrc, remoteDest, status, backend);
-  backend->BatchWrite(localSrc, localOffsets, remoteDest, remoteOffsets, sizes, status, id);
-  if (status->Failed()) {
-    MORI_IO_ERROR("Engine batch write error {} message {}", status->CodeUint32(),
-                  status->Message());
+  size_t batchSize = localSrc.size();
+  assert(batchSize == remoteDest.size());
+  assert(batchSize == localOffsets.size());
+  assert(batchSize == remoteOffsets.size());
+  assert(batchSize == sizes.size());
+  assert(batchSize == status.size());
+  assert(batchSize == ids.size());
+
+  for (size_t i = 0; i < batchSize; i++) {
+    Backend* backend = nullptr;
+    SELECT_BACKEND_AND_RETURN_IF_NONE(localSrc[i], remoteDest[i], status[i], backend);
+    backend->BatchWrite(localSrc[i], localOffsets[i], remoteDest[i], remoteOffsets[i], sizes[i],
+                        status[i], ids[i]);
+    if (status[i]->Failed()) {
+      MORI_IO_ERROR("Engine batch write error {} message {}", status[i]->CodeUint32(),
+                    status[i]->Message());
+    }
   }
 }
 
@@ -246,14 +306,6 @@ bool IOEngine::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
     if (popped) return true;
   }
   return false;
-}
-
-std::string IOEngine::GetTcpMetricsJson() {
-  auto it = backends.find(BackendType::TCP);
-  if (it == backends.end()) return std::string();
-  auto* tcp = dynamic_cast<TcpBackend*>(it->second.get());
-  if (!tcp) return std::string();
-  return tcp->GetMetricsJson();
 }
 
 }  // namespace io

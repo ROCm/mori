@@ -224,16 +224,7 @@ void BackendServer::WorkerLoop(WorkerContext* wctx) {
   int workerEpollFd = wctx->epollFd;
   int listenFd = wctx->listenCtx->GetListenFd();
   while (running.load()) {
-    auto t0 = std::chrono::steady_clock::now();
     int n = epoll_wait(workerEpollFd, events.data(), kMaxEvents, 500);
-    auto t1 = std::chrono::steady_clock::now();
-    if (config.enableMetrics) {
-      metrics.workerLoops.fetch_add(1, std::memory_order_relaxed);
-      metrics.epollWaitCalls.fetch_add(1, std::memory_order_relaxed);
-      metrics.epollWaitTotalNs.fetch_add(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count(),
-          std::memory_order_relaxed);
-    }
     if (n == -1) {
       if (errno == EINTR) continue;
       MORI_IO_ERROR("TcpBackend: epoll_wait failed: {}", strerror(errno));
@@ -301,7 +292,6 @@ void BackendServer::HandleReadable(Connection* conn) {
   while (true) {
     // Phase 1: read header incrementally
     if (conn->recvState == Connection::RecvState::PARSING_HEADER) {
-      auto hStart = config.enableMetrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
       int r =
           ep.RecvSomeExact(reinterpret_cast<char*>(&conn->pendingHeader) + conn->headerBytesRead,
                            kHeaderSize - conn->headerBytesRead);
@@ -309,23 +299,8 @@ void BackendServer::HandleReadable(Connection* conn) {
         conn->headerBytesRead += static_cast<size_t>(r);
         if (conn->headerBytesRead < kHeaderSize) {
           // Need more data later
-          if (config.enableMetrics) {
-            auto hEnd = std::chrono::steady_clock::now();
-            metrics.headerRecvCount.fetch_add(1, std::memory_order_relaxed);
-            metrics.headerRecvNs.fetch_add(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(hEnd - hStart).count(),
-                std::memory_order_relaxed);
-          }
           needRearm = true;
           break;
-        }
-        // Full header acquired
-        if (config.enableMetrics) {
-          auto hEnd = std::chrono::steady_clock::now();
-          metrics.headerRecvCount.fetch_add(1, std::memory_order_relaxed);
-          metrics.headerRecvNs.fetch_add(
-              std::chrono::duration_cast<std::chrono::nanoseconds>(hEnd - hStart).count(),
-              std::memory_order_relaxed);
         }
         auto& header = conn->pendingHeader;
         if (header.opcode == 0 && header.id == 0 && header.mem_id == 0 && header.size == 0) {
@@ -372,28 +347,13 @@ void BackendServer::HandleReadable(Connection* conn) {
       size_t need = conn->expectedPayloadSize - conn->payloadBytesRead;
       if (opt == WRITE_REQ || opt == READ_RESP) {
         if (need > 0) {
-          auto pStart = config.enableMetrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
           int r = ep.RecvSomeExact(conn->inboundPayload.data + conn->payloadBytesRead, need);
           if (r > 0) {
             conn->payloadBytesRead += static_cast<size_t>(r);
             need = conn->expectedPayloadSize - conn->payloadBytesRead;
             if (need > 0) {
-              if (config.enableMetrics) {
-                auto pEnd = std::chrono::steady_clock::now();
-                metrics.payloadRecvCount.fetch_add(1, std::memory_order_relaxed);
-                metrics.payloadRecvNs.fetch_add(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(pEnd - pStart).count(),
-                    std::memory_order_relaxed);
-              }
               needRearm = true;  // need more data later
               break;             // exit loop now
-            }
-            if (config.enableMetrics) {
-              auto pEnd = std::chrono::steady_clock::now();
-              metrics.payloadRecvCount.fetch_add(1, std::memory_order_relaxed);
-              metrics.payloadRecvNs.fetch_add(
-                  std::chrono::duration_cast<std::chrono::nanoseconds>(pEnd - pStart).count(),
-                  std::memory_order_relaxed);
             }
           } else if (r == 0) {
             // Peer closed mid-payload
@@ -401,13 +361,6 @@ void BackendServer::HandleReadable(Connection* conn) {
             CloseConnection(conn, StatusCode::ERR_BAD_STATE, "peer closed mid-payload");
             return;
           } else if (r == -EAGAIN) {
-            if (config.enableMetrics) {
-              auto pEnd = std::chrono::steady_clock::now();
-              metrics.payloadRecvCount.fetch_add(1, std::memory_order_relaxed);
-              metrics.payloadRecvNs.fetch_add(
-                  std::chrono::duration_cast<std::chrono::nanoseconds>(pEnd - pStart).count(),
-                  std::memory_order_relaxed);
-            }
             needRearm = true;
             break;
           } else {  // real error
@@ -420,7 +373,7 @@ void BackendServer::HandleReadable(Connection* conn) {
       }
 
       // If we reach here, payload (if any) is complete. Execute operation.
-      auto opStart = config.enableMetrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
       switch (opt) {
         case READ_REQ: {
           // Perform memory read and send back (READ_RESP opcode =2)
@@ -581,13 +534,7 @@ void BackendServer::HandleReadable(Connection* conn) {
           return;
         }
       }
-      if (config.enableMetrics) {
-        auto opEnd = std::chrono::steady_clock::now();
-        metrics.opExecCount.fetch_add(1, std::memory_order_relaxed);
-        metrics.opExecNs.fetch_add(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(opEnd - opStart).count(),
-            std::memory_order_relaxed);
-      }
+
       // Reset for next message
       conn->pendingHeader = TcpMessageHeader{};
       conn->headerBytesRead = 0;
@@ -631,7 +578,6 @@ void BackendServer::HandleWritable(Connection* conn) {
     } else if (op.opType == WRITE_REQ) {
       bool localIsGpu = (op.localDest.loc == MemoryLocationType::GPU);
       if (localIsGpu) {
-        auto gpuStart = config.enableMetrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (!op.stagingBuffer.data) {
           op.stagingBuffer = bufferPool.Acquire(op.size);
           if (!op.stagingBuffer.data) {
@@ -653,13 +599,6 @@ void BackendServer::HandleWritable(Connection* conn) {
           conn->activeSendOp.reset();
           return;
         }
-        if (config.enableMetrics) {
-          auto gpuEnd = std::chrono::steady_clock::now();
-          metrics.gpuStagingCopies.fetch_add(1, std::memory_order_relaxed);
-          metrics.gpuStagingCopyNs.fetch_add(
-              std::chrono::duration_cast<std::chrono::nanoseconds>(gpuEnd - gpuStart).count(),
-              std::memory_order_relaxed);
-        }
         conn->payloadPtr = op.stagingBuffer.data;
       } else {
         conn->payloadPtr = reinterpret_cast<const char*>(op.localDest.data + op.localOffset);
@@ -674,28 +613,13 @@ void BackendServer::HandleWritable(Connection* conn) {
 
   // 1. Send header (partial allowed)
   while (conn->headerBytesSent < sizeof(TcpMessageHeader)) {
-    auto hsStart = config.enableMetrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     size_t remaining = sizeof(TcpMessageHeader) - conn->headerBytesSent;
     ssize_t n = ::send(conn->handle.fd, conn->outgoingHeader + conn->headerBytesSent, remaining, 0);
     if (n > 0) {
       conn->headerBytesSent += static_cast<size_t>(n);
-      if (config.enableMetrics) {
-        auto hsEnd = std::chrono::steady_clock::now();
-        metrics.headerSendCount.fetch_add(1, std::memory_order_relaxed);
-        metrics.headerSendNs.fetch_add(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(hsEnd - hsStart).count(),
-            std::memory_order_relaxed);
-      }
       continue;  // try to finish header
     }
     if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      if (config.enableMetrics) {
-        auto hsEnd = std::chrono::steady_clock::now();
-        metrics.headerSendCount.fetch_add(1, std::memory_order_relaxed);
-        metrics.headerSendNs.fetch_add(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(hsEnd - hsStart).count(),
-            std::memory_order_relaxed);
-      }
       needRearm = true;
       break;
     }
@@ -716,28 +640,13 @@ void BackendServer::HandleWritable(Connection* conn) {
   // 2. Send payload if WRITE_REQ
   if (aop.opType == WRITE_REQ && conn->payloadBytesSent < conn->payloadBytesTotal) {
     while (conn->payloadBytesSent < conn->payloadBytesTotal) {
-      auto psStart = config.enableMetrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
       size_t remaining = conn->payloadBytesTotal - conn->payloadBytesSent;
       ssize_t n = ::send(conn->handle.fd, conn->payloadPtr + conn->payloadBytesSent, remaining, 0);
       if (n > 0) {
         conn->payloadBytesSent += static_cast<size_t>(n);
-        if (config.enableMetrics) {
-          auto psEnd = std::chrono::steady_clock::now();
-          metrics.payloadSendCount.fetch_add(1, std::memory_order_relaxed);
-          metrics.payloadSendNs.fetch_add(
-              std::chrono::duration_cast<std::chrono::nanoseconds>(psEnd - psStart).count(),
-              std::memory_order_relaxed);
-        }
         continue;
       }
       if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        if (config.enableMetrics) {
-          auto psEnd = std::chrono::steady_clock::now();
-          metrics.payloadSendCount.fetch_add(1, std::memory_order_relaxed);
-          metrics.payloadSendNs.fetch_add(
-              std::chrono::duration_cast<std::chrono::nanoseconds>(psEnd - psStart).count(),
-              std::memory_order_relaxed);
-        }
         needRearm = true;
         break;
       }
@@ -910,7 +819,7 @@ void BackendServer::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& l
                                    const SizeVec& sizes, TransferStatus* status,
                                    TransferUniqueId id, bool isRead) {
   // Basic validation
-  auto schedStart = config.enableMetrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
   if (sizes.empty()) {
     status->SetCode(StatusCode::SUCCESS);
     return;
@@ -983,13 +892,6 @@ void BackendServer::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& l
     connIdx++;
     c->SubmitTransfer(std::move(op));
   }
-  if (config.enableMetrics) {
-    auto schedEnd = std::chrono::steady_clock::now();
-    metrics.batchScheduleCount.fetch_add(1, std::memory_order_relaxed);
-    metrics.batchScheduleNs.fetch_add(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(schedEnd - schedStart).count(),
-        std::memory_order_relaxed);
-  }
 }
 
 TcpBackend::TcpBackend(EngineKey k, const IOEngineConfig& engineCfg,
@@ -1012,7 +914,7 @@ void TcpBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   server->DeregisterRemoteEngine(rdesc);
 }
 
-void TcpBackend::RegisterMemory(const MemoryDesc& desc) { server->RegisterMemory(desc); }
+void TcpBackend::RegisterMemory(MemoryDesc& desc) { server->RegisterMemory(desc); }
 
 void TcpBackend::DeregisterMemory(const MemoryDesc& desc) { server->DeregisterMemory(desc); }
 
@@ -1057,65 +959,5 @@ void TcpBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeVe
   backend->BatchReadWrite(local, localOffsets, remote, remoteOffsets, sizes, status, id, isRead);
 }
 
-}  // namespace io
-}  // namespace mori
-
-// ---- Metrics snapshot & reset implementations ----
-
-namespace mori {
-namespace io {
-BackendServer::TcpMetricsSnapshot BackendServer::GetMetricsSnapshot() const {
-  TcpMetricsSnapshot s;
-  if (!config.enableMetrics) return s;  // all zeros if disabled
-  s.workerLoops = metrics.workerLoops.load(std::memory_order_relaxed);
-  s.epollWaitCalls = metrics.epollWaitCalls.load(std::memory_order_relaxed);
-  s.epollWaitTotalNs = metrics.epollWaitTotalNs.load(std::memory_order_relaxed);
-  s.headerRecvCount = metrics.headerRecvCount.load(std::memory_order_relaxed);
-  s.headerRecvNs = metrics.headerRecvNs.load(std::memory_order_relaxed);
-  s.payloadRecvCount = metrics.payloadRecvCount.load(std::memory_order_relaxed);
-  s.payloadRecvNs = metrics.payloadRecvNs.load(std::memory_order_relaxed);
-  s.opExecCount = metrics.opExecCount.load(std::memory_order_relaxed);
-  s.opExecNs = metrics.opExecNs.load(std::memory_order_relaxed);
-  s.gpuStagingCopies = metrics.gpuStagingCopies.load(std::memory_order_relaxed);
-  s.gpuStagingCopyNs = metrics.gpuStagingCopyNs.load(std::memory_order_relaxed);
-  s.headerSendCount = metrics.headerSendCount.load(std::memory_order_relaxed);
-  s.headerSendNs = metrics.headerSendNs.load(std::memory_order_relaxed);
-  s.payloadSendCount = metrics.payloadSendCount.load(std::memory_order_relaxed);
-  s.payloadSendNs = metrics.payloadSendNs.load(std::memory_order_relaxed);
-  s.batchScheduleCount = metrics.batchScheduleCount.load(std::memory_order_relaxed);
-  s.batchScheduleNs = metrics.batchScheduleNs.load(std::memory_order_relaxed);
-  return s;
-}
-
-void BackendServer::ResetMetrics() {
-  if (!config.enableMetrics) return;
-  metrics.Reset();
-}
-
-std::string BackendServer::GetMetricsJson() const {
-  auto s = GetMetricsSnapshot();
-  // Manual JSON assembly (no escaping needed; numeric only)
-  std::ostringstream oss;
-  oss << '{'
-      << "\"workerLoops\":" << s.workerLoops << ','
-      << "\"epollWaitCalls\":" << s.epollWaitCalls << ','
-      << "\"epollWaitTotalNs\":" << s.epollWaitTotalNs << ','
-      << "\"headerRecvCount\":" << s.headerRecvCount << ','
-      << "\"headerRecvNs\":" << s.headerRecvNs << ','
-      << "\"payloadRecvCount\":" << s.payloadRecvCount << ','
-      << "\"payloadRecvNs\":" << s.payloadRecvNs << ','
-      << "\"opExecCount\":" << s.opExecCount << ','
-      << "\"opExecNs\":" << s.opExecNs << ','
-      << "\"gpuStagingCopies\":" << s.gpuStagingCopies << ','
-      << "\"gpuStagingCopyNs\":" << s.gpuStagingCopyNs << ','
-      << "\"headerSendCount\":" << s.headerSendCount << ','
-      << "\"headerSendNs\":" << s.headerSendNs << ','
-      << "\"payloadSendCount\":" << s.payloadSendCount << ','
-      << "\"payloadSendNs\":" << s.payloadSendNs << ','
-      << "\"batchScheduleCount\":" << s.batchScheduleCount << ','
-      << "\"batchScheduleNs\":" << s.batchScheduleNs
-      << '}';
-  return oss.str();
-}
 }  // namespace io
 }  // namespace mori

@@ -29,8 +29,9 @@
 
 #include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
-#include "src/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
-#include "src/application/transport/rdma/providers/mlx5/mlx5_prm.hpp"
+#include "mori/utils/mori_log.hpp"
+#include "mori/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
+#include "mori/application/transport/rdma/providers/mlx5/mlx5_prm.hpp"
 
 namespace mori {
 namespace application {
@@ -61,6 +62,9 @@ HcaCapability QueryHcaCap(ibv_context* context) {
   uint32_t logBfRegSize =
       DEVX_GET(query_hca_cap_out, cmd_cap_out, capability.cmd_hca_cap.log_bf_reg_size);
   hca_cap.dbrRegSize = 1LLU << logBfRegSize;
+
+  MORI_APP_TRACE("MLX5 HCA capabilities: portType={}, dbrRegSize={}", hca_cap.portType,
+                 hca_cap.dbrRegSize);
 
   return hca_cap;
 }
@@ -134,6 +138,9 @@ Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig&
   assert(cq);
 
   cqn = DEVX_GET(create_cq_out, cmd_out, cqn);
+
+  MORI_APP_TRACE("MLX5 CQ created: cqn={}, cqeNum={}, cqSize={}, cqUmemAddr=0x{:x}, uar_page_id={}",
+                 cqn, cqeNum, cqSize, reinterpret_cast<uintptr_t>(cqUmemAddr), uar->page_id);
 }
 
 Mlx5CqContainer::~Mlx5CqContainer() {
@@ -147,8 +154,8 @@ Mlx5CqContainer::~Mlx5CqContainer() {
 /*                                         Mlx5QpContainer                                        */
 /* ---------------------------------------------------------------------------------------------- */
 Mlx5QpContainer::Mlx5QpContainer(ibv_context* context, const RdmaEndpointConfig& config,
-                                 uint32_t cqn, uint32_t pdn)
-    : context(context), config(config) {
+                                 uint32_t cqn, uint32_t pdn, Mlx5DeviceContext* device_context)
+    : context(context), config(config), device_context(device_context) {
   ComputeQueueAttrs(config);
   CreateQueuePair(cqn, pdn);
 }
@@ -167,7 +174,7 @@ void Mlx5QpContainer::ComputeQueueAttrs(const RdmaEndpointConfig& config) {
   // Send queue attributes
   sqAttrs.offset = rqAttrs.wqSize;
   sqAttrs.wqeSize = GetMlx5SqWqeSize();
-  sqAttrs.wqSize = RoundUpPowOfTwo(sqAttrs.wqeSize * config.maxMsgsNum);
+  sqAttrs.wqSize = RoundUpPowOfTwo(sqAttrs.wqeSize * maxMsgsNum);
   sqAttrs.wqeNum = ceil(sqAttrs.wqSize / MLX5_SEND_WQE_BB);
   sqAttrs.wqeShift = MLX5_SEND_WQE_SHIFT;
 
@@ -175,9 +182,11 @@ void Mlx5QpContainer::ComputeQueueAttrs(const RdmaEndpointConfig& config) {
   qpTotalSize = RoundUpPowOfTwo(rqAttrs.wqSize + sqAttrs.wqSize);
   qpTotalSize = (qpTotalSize + config.alignment - 1) / config.alignment * config.alignment;
 
-#if DEBUG == 1
-  std::cout << "rq[ " << rqAttrs << "] sq[ " << sqAttrs << "]" << std::endl;
-#endif
+  MORI_APP_TRACE(
+      "MLX5 Queue attributes computed - RQ: wqeSize={}, wqSize={}, wqeNum={}, offset={} | SQ: "
+      "wqeSize={}, wqSize={}, wqeNum={}, offset={} | Total: {}",
+      rqAttrs.wqeSize, rqAttrs.wqSize, rqAttrs.wqeNum, rqAttrs.offset, sqAttrs.wqeSize,
+      sqAttrs.wqSize, sqAttrs.wqeNum, sqAttrs.offset, qpTotalSize);
 }
 
 void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
@@ -216,13 +225,37 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   qpDbrUmem = mlx5dv_devx_umem_reg(context, qpDbrUmemAddr, 8, IBV_ACCESS_LOCAL_WRITE);
   assert(qpDbrUmem);
 
+  // Allocate and register atomic internal buffer (ibuf)
+  atomicIbufSize = (RoundUpPowOfTwo(config.atomicIbufSlots) + 1) * ATOMIC_IBUF_SLOT_SIZE;
+  if (config.onGpu) {
+    HIP_RUNTIME_CHECK(hipMalloc(&atomicIbufAddr, atomicIbufSize));
+    HIP_RUNTIME_CHECK(hipMemset(atomicIbufAddr, 0, atomicIbufSize));
+  } else {
+    status = posix_memalign(&atomicIbufAddr, config.alignment, atomicIbufSize);
+    memset(atomicIbufAddr, 0, atomicIbufSize);
+    assert(!status);
+  }
+
+  // Register atomic ibuf as independent memory region
+  int atomicIbufAccessFlag =
+      MaybeAddRelaxedOrderingFlag(IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                                  IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+  atomicIbufMr = ibv_reg_mr(device_context->GetIbvPd(), atomicIbufAddr, atomicIbufSize,
+                            atomicIbufAccessFlag);
+  assert(atomicIbufMr);
+
+  MORI_APP_TRACE(
+      "MLX5 Atomic ibuf allocated: addr=0x{:x}, slots={}, size={}, lkey=0x{:x}, rkey=0x{:x}",
+      reinterpret_cast<uintptr_t>(atomicIbufAddr), RoundUpPowOfTwo(config.atomicIbufSlots),
+      atomicIbufSize, atomicIbufMr->lkey, atomicIbufMr->rkey);
+
   // Allocate user access region
   qpUar = mlx5dv_devx_alloc_uar(context, MLX5DV_UAR_ALLOC_TYPE_NC);
   assert(qpUar);
   assert(qpUar->page_id != 0);
 
   if (config.onGpu) {
-    uint32_t flag = hipHostRegisterPortable | hipHostRegisterMapped | hipHostRegisterIoMemory;
+    uint32_t flag = hipHostRegisterPortable | hipHostRegisterMapped;
     HIP_RUNTIME_CHECK(hipHostRegister(qpUar->reg_addr, QueryHcaCap(context).dbrRegSize, flag));
     HIP_RUNTIME_CHECK(hipHostGetDevicePointer(&qpUarPtr, qpUar->reg_addr, 0));
   } else {
@@ -263,18 +296,52 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   assert(qp);
 
   qpn = DEVX_GET(create_qp_out, cmd_out, qpn);
+
+  MORI_APP_TRACE(
+      "MLX5 QP created: qpn={}, qpTotalSize={}, sqWqeNum={}, rqWqeNum={}, sqAddr=0x{:x}, "
+      "rqAddr=0x{:x}",
+      qpn, qpTotalSize, sqAttrs.wqeNum, rqAttrs.wqeNum, reinterpret_cast<uintptr_t>(GetSqAddress()),
+      reinterpret_cast<uintptr_t>(GetRqAddress()));
 }
 
 void Mlx5QpContainer::DestroyQueuePair() {
-  if (qpUmemAddr) HIP_RUNTIME_CHECK(hipFree(qpUmemAddr));
-  if (qpDbrUmemAddr) HIP_RUNTIME_CHECK(hipFree(qpDbrUmemAddr));
+  if (atomicIbufMr) {
+    ibv_dereg_mr(atomicIbufMr);
+    atomicIbufMr = nullptr;
+  }
+  if (atomicIbufAddr) {
+    if (config.onGpu) {
+      HIP_RUNTIME_CHECK(hipFree(atomicIbufAddr));
+    } else {
+      free(atomicIbufAddr);
+    }
+    atomicIbufAddr = nullptr;
+  }
+
+  if (qpUmem) mlx5dv_devx_umem_dereg(qpUmem);
+  if (qpUmemAddr) {
+    if (config.onGpu) {
+      HIP_RUNTIME_CHECK(hipFree(qpUmemAddr));
+    } else {
+      free(qpUmemAddr);
+    }
+  }
   if (qpDbrUmem) mlx5dv_devx_umem_dereg(qpDbrUmem);
+  if (qpDbrUmemAddr) {
+    if (config.onGpu) {
+      HIP_RUNTIME_CHECK(hipFree(qpDbrUmemAddr));
+    } else {
+      free(qpDbrUmemAddr);
+    }
+  }
   if (qpUar) {
-    hipPointerAttribute_t attr;
-    HIP_RUNTIME_CHECK(hipPointerGetAttributes(&attr, qpUar->reg_addr));
-    // Multiple qp may share the same uar address, only unregister once
-    if ((attr.type == hipMemoryTypeHost) && (attr.hostPointer != nullptr)) {
-      HIP_RUNTIME_CHECK(hipHostUnregister(qpUar->reg_addr));
+    if (config.onGpu) {
+      hipPointerAttribute_t attr;
+      HIP_RUNTIME_CHECK(hipPointerGetAttributes(&attr, qpUar->reg_addr));
+      // Multiple qp may share the same uar address, only unregister once
+      if ((attr.type == hipMemoryTypeHost) && (attr.hostPointer != nullptr)) {
+        HIP_RUNTIME_CHECK(hipHostUnregister(qpUar->reg_addr));
+      }
     }
     mlx5dv_devx_free_uar(qpUar);
   }
@@ -311,8 +378,9 @@ void Mlx5QpContainer::ModifyRst2Init() {
   assert(!status);
 }
 
-void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
-                                     const ibv_port_attr& portAttr) {
+void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
+                                     const RdmaEndpointHandle& remote_handle,
+                                     const ibv_port_attr& portAttr, uint32_t qpId) {
   uint8_t init2rtr_cmd_in[DEVX_ST_SZ_BYTES(init2rtr_qp_in)] = {
       0,
   };
@@ -342,8 +410,12 @@ void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle,
     memcpy(DEVX_ADDR_OF(qpc, qpc, primary_address_path.rmac_47_32), remote_handle.eth.mac,
            sizeof(remote_handle.eth.mac));
     DEVX_SET(qpc, qpc, primary_address_path.hop_limit, 64);
-    DEVX_SET(qpc, qpc, primary_address_path.src_addr_index, config.gidIdx);
-    DEVX_SET(qpc, qpc, primary_address_path.udp_sport, 0xC000);
+    DEVX_SET(qpc, qpc, primary_address_path.src_addr_index, local_handle.eth.gidIdx);
+    // Use shared UDP sport configuration with qpId-based selection
+    uint16_t selected_udp_sport = device_context->GetUdpSport(qpId);
+    DEVX_SET(qpc, qpc, primary_address_path.udp_sport, selected_udp_sport | 0xC000);
+    MORI_APP_TRACE("MLX5 QP {} using UDP sport {} (qpId={}, index={})", qpn, selected_udp_sport,
+                   qpId, qpId % RDMA_UDP_SPORT_ARRAY_SIZE);
   } else if (portAttr.link_layer == IBV_LINK_LAYER_INFINIBAND) {
     DEVX_SET(qpc, qpc, primary_address_path.rlid, remote_handle.ib.lid);
   } else {
@@ -400,21 +472,30 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   ibv_context* context = GetIbvContext();
 
   Mlx5CqContainer* cq = new Mlx5CqContainer(context, config);
-  Mlx5QpContainer* qp = new Mlx5QpContainer(context, config, cq->cqn, pdn);
+  Mlx5QpContainer* qp = new Mlx5QpContainer(context, config, cq->cqn, pdn, this);
+  const ibv_device_attr_ex* deviceAttr = GetRdmaDevice()->GetDeviceAttr();
 
   RdmaEndpoint endpoint;
   endpoint.handle.psn = 0;
   endpoint.handle.portId = config.portId;
+  endpoint.handle.maxSge = config.maxMsgSge;
 
+  const ibv_port_attr* portAttr = GetRdmaDevice()->GetPortAttr(config.portId);
+  assert(portAttr);
   HcaCapability hca_cap = QueryHcaCap(context);
 
   endpoint.handle.qpn = qp->qpn;
   if (hca_cap.IsEthernet()) {
+    GidSelectionResult gidSelection =
+        AutoSelectGidIndex(context, config.portId, portAttr, config.gidIdx);
+    assert(gidSelection.gidIdx >= 0 && gidSelection.valid);
+    int gidIdx = gidSelection.gidIdx;
+
     uint32_t out[DEVX_ST_SZ_DW(query_roce_address_out)] = {};
     uint32_t in[DEVX_ST_SZ_DW(query_roce_address_in)] = {};
 
     DEVX_SET(query_roce_address_in, in, opcode, MLX5_CMD_OP_QUERY_ROCE_ADDRESS);
-    DEVX_SET(query_roce_address_in, in, roce_address_index, config.gidIdx);
+    DEVX_SET(query_roce_address_in, in, roce_address_index, gidIdx);
     DEVX_SET(query_roce_address_in, in, vhca_port_num, config.portId);
 
     int status = mlx5dv_devx_general_cmd(context, in, sizeof(in), out, sizeof(out));
@@ -427,6 +508,7 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
     memcpy(endpoint.handle.eth.mac,
            DEVX_ADDR_OF(query_roce_address_out, out, roce_address.source_mac_47_32),
            sizeof(endpoint.handle.eth.mac));
+    endpoint.handle.eth.gidIdx = gidIdx;
   } else if (hca_cap.IsInfiniBand()) {
     auto mapPtr = GetRdmaDevice()->GetPortAttrMap();
     auto it = mapPtr->find(config.portId);
@@ -455,23 +537,42 @@ RdmaEndpoint Mlx5DeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
   endpoint.cqHandle.cqeSize = GetMlx5CqeSize();
   endpoint.cqHandle.dbrRecAddr = cq->cqDbrUmemAddr;
 
+  // Set atomic internal buffer information
+  endpoint.atomicIbuf.addr = reinterpret_cast<uintptr_t>(qp->atomicIbufAddr);
+  endpoint.atomicIbuf.lkey = qp->atomicIbufMr->lkey;
+  endpoint.atomicIbuf.rkey = qp->atomicIbufMr->rkey;
+  endpoint.atomicIbuf.nslots = RoundUpPowOfTwo(config.atomicIbufSlots);
+
   cqPool.insert({cq->cqn, std::move(std::unique_ptr<Mlx5CqContainer>(cq))});
   qpPool.insert({qp->qpn, std::move(std::unique_ptr<Mlx5QpContainer>(qp))});
+
+  MORI_APP_TRACE(
+      "MLX5 endpoint created: qpn={}, cqn={}, portId={}, gidIdx={}, atomicIbuf addr=0x{:x}, "
+      "nslots={}",
+      qp->qpn, cq->cqn, config.portId, endpoint.handle.eth.gidIdx, endpoint.atomicIbuf.addr,
+      endpoint.atomicIbuf.nslots);
 
   return endpoint;
 }
 
 void Mlx5DeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
-                                        const RdmaEndpointHandle& remote) {
+                                        const RdmaEndpointHandle& remote, uint32_t qpId) {
   uint32_t local_qpn = local.qpn;
   assert(qpPool.find(local_qpn) != qpPool.end());
   Mlx5QpContainer* qp = qpPool.at(local_qpn).get();
+
+  MORI_APP_TRACE("MLX5 connecting endpoint: local_qpn={}, remote_qpn={}, qpId={}", local_qpn,
+                 remote.qpn, qpId);
+
   RdmaDevice* rdmaDevice = GetRdmaDevice();
   const ibv_device_attr_ex* deviceAttr = rdmaDevice->GetDeviceAttr();
   const ibv_port_attr& portAttr = *(rdmaDevice->GetPortAttrMap()->find(local.portId)->second);
   qp->ModifyRst2Init();
-  qp->ModifyInit2Rtr(remote, portAttr);
+  qp->ModifyInit2Rtr(local, remote, portAttr, qpId);
   qp->ModifyRtr2Rts(local);
+
+  MORI_APP_TRACE("MLX5 endpoint connected successfully: local_qpn={}, remote_qpn={}", local_qpn,
+                 remote.qpn);
 }
 
 /* ---------------------------------------------------------------------------------------------- */

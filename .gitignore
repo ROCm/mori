@@ -12,3 +12,7 @@ __pycache__
 
 .vscode
 .idea
+.codex
+.claude
+*.log
+*.core

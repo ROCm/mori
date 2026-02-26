@@ -1,5 +1,11 @@
 find_package(MPI REQUIRED)
-
+find_package(hsa-runtime64 REQUIRED)
+find_package(hsakmt REQUIRED)
+#find_library(IONIC_LIBRARY 
+#  NAMES ionic 
+#  HINTS /lib/x86_64-linux-gnu
+#  REQUIRED
+#)
 execute_process(
   COMMAND python -c "import torch; print(torch.utils.cmake_prefix_path)"
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -15,12 +21,17 @@ add_library(
   mori_application SHARED
   bootstrap/mpi_bootstrap.cpp
   bootstrap/torch_bootstrap.cpp
+  bootstrap/socket_bootstrap.cpp
+  bootstrap/local_bootstrap.cpp
   transport/rdma/rdma.cpp
   transport/rdma/providers/mlx5/mlx5.cpp
   transport/rdma/providers/bnxt/bnxt.cpp
+  transport/rdma/providers/ionic/ionic.cpp
   transport/rdma/providers/ibverbs/ibverbs.cpp
   transport/tcp/tcp.cpp
+  transport/sdma/anvil.cpp
   memory/symmetric_memory.cpp
+  memory/va_manager.cpp
   memory/memory_region.cpp
   context/context.cpp
   topology/gpu.cpp
@@ -39,10 +50,18 @@ target_link_libraries(
   hip::device
   mlx5
   rocm_smi64
-  pci)
+  pci
+  mori_logging
+  hsa-runtime64
+  hsakmt::hsakmt)
+#  ${IONIC_LIBRARY})
 
 if(USE_BNXT)
   target_link_libraries(mori_application ${BNXT_RE_LIB})
+endif()
+
+if(USE_IONIC)
+	target_link_libraries(mori_application ${IONIC_LIB})
 endif()
 
 target_include_directories(mori_application PUBLIC ${TORCH_INCLUDE_DIRS})

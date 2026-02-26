@@ -1,6 +1,6 @@
-// Copyright © Advanced Micro Devices, Inc. All rights reserved.
-//
 // MIT License
+//
+// Copyright (c) 2024 Advanced Micro Devices, Inc. All rights reserved.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -19,27 +19,26 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+
 #pragma once
 
-namespace mori {
-namespace core {
+#include "hip/hip_runtime.h"
+#include "hip/hip_version.h"
 
-class GpuLock {
- public:
-  __device__ GpuLock(uint32_t* lockMem) : lock(lockMem) {}
-  __device__ ~GpuLock() = default;
-
-  __device__ void Lock() {
-    while (!atomicCAS(lock, 0, 1)) {
-    }
-    __threadfence_system();
-  }
-
-  __device__ void Unlock() { atomicCAS(lock, 1, 0); }
-
- private:
-  uint32_t* lock{nullptr};
-};
-
-}  // namespace core
-}  // namespace mori
+/**
+ * @brief Compatibility wrapper for hipMemImportFromShareableHandle
+ *
+ * ROCm 7.0.x expects (void*)&fd, 7.1.0+ changed to expect (void*)(uintptr_t)fd
+ */
+inline hipError_t hipMemImportFromShareableHandleCompat(hipMemGenericAllocationHandle_t* handle,
+                                                        int fd,
+                                                        hipMemAllocationHandleType handleType) {
+#if HIP_VERSION >= 70100000
+  // ROCm 7.1.0+: FD value as pointer
+  return hipMemImportFromShareableHandle(
+      handle, reinterpret_cast<void*>(static_cast<uintptr_t>(fd)), handleType);
+#else
+  // ROCm 7.0.x or older: Pointer to FD
+  return hipMemImportFromShareableHandle(handle, (void*)&fd, handleType);
+#endif
+}

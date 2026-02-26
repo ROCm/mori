@@ -30,5 +30,6 @@ from mori.cpp import (
     PollCqMode,
     RdmaBackendConfig,
     TcpBackendConfig,
+    XgmiBackendConfig,
     set_log_level,
 )

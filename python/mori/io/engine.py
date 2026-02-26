@@ -91,6 +91,8 @@ class IOEngine:
                 config = mori_cpp.RdmaBackendConfig()
             elif type is mori_cpp.BackendType.TCP:
                 config = mori_cpp.TcpBackendConfig()
+            elif type is mori_cpp.BackendType.XGMI:
+                config = mori_cpp.XgmiBackendConfig()
             else:
                 raise NotImplementedError("backend not implemented yet")
         return self._engine.CreateBackend(type, config)
@@ -104,19 +106,22 @@ class IOEngine:
     def deregister_remote_engine(self, engine_desc: mori_cpp.EngineDesc):
         return self._engine.DeregisterRemoteEngine(engine_desc)
 
+    def register_memory(
+        self, ptr: int, size: int, device_id: int, mem_loc: mori_cpp.MemoryLocationType
+    ):
+        data = ctypes.pythonapi.PyCapsule_New(ctypes.c_void_p(ptr), None, None)
+        return self._engine.RegisterMemory(data, size, device_id, mem_loc)
+
     def register_torch_tensor(self, tensor: torch.Tensor):
         if not tensor.is_contiguous():
             raise RuntimeError("input tensor must be contiguous")
 
-        data = ctypes.pythonapi.PyCapsule_New(
-            ctypes.c_void_p(tensor.data_ptr()), None, None
-        )
         total_bytes = tensor.nelement() * tensor.element_size()
         device_id = tensor.device.index
         if device_id is None:
             device_id = -1
         mem_loc = TORCH_DEVICE_TYPE_MAP[tensor.device.type]
-        return self._engine.RegisterMemory(data, total_bytes, device_id, mem_loc)
+        return self.register_memory(tensor.data_ptr(), total_bytes, device_id, mem_loc)
 
     def deregister_memory(self, mem_desc: mori_cpp.MemoryDesc):
         return self._engine.DeregisterMemory(mem_desc)
@@ -162,7 +167,7 @@ class IOEngine:
         sizes,
         transfer_uid,
     ):
-        transfer_status = mori_cpp.TransferStatus()
+        transfer_status = [mori_cpp.TransferStatus() for _ in range(len(sizes))]
         func(
             local_dest_mem_desc,
             local_offsets,

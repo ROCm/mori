@@ -109,9 +109,11 @@ class BenchmarkConfig {
   size_t getStepFactor() const { return step_factor; }
   size_t getMaxSizeLog() const { return max_size_log; }
   size_t getStride() const { return stride; }
+  size_t getNumQp() const { return num_qp; }
 
   bool isBidirectional() const { return bidirectional; }
   bool isReportMsgrate() const { return report_msgrate; }
+  bool getUseVMM() const { return use_vmm; }
 
   Datatype getDatatype() const { return datatype; }
   ReduceOp getReduceOp() const { return reduce_op; }
@@ -130,9 +132,11 @@ class BenchmarkConfig {
   size_t step_factor = 2;
   size_t max_size_log = 1;
   size_t stride = 1;
+  size_t num_qp = 1;
 
   bool bidirectional = false;
   bool report_msgrate = false;
+  bool use_vmm = false;
 
   Datatype datatype = {MORI_UINT64, sizeof(uint64_t), "uint64_t"};
   ReduceOp reduce_op = {MORI_SUM, "sum"};

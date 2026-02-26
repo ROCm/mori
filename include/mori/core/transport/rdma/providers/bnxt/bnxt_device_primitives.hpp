@@ -493,21 +493,13 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
   uint32_t opcode = BNXT_RE_WR_OPCD_ATOMIC_FA;
   uint64_t data = val_1 ? *static_cast<uint64_t*>(val_1) : 0;
   uint64_t cmp = val_2 ? *static_cast<uint64_t*>(val_2) : 0;
+  // MORI_PRINTF("BNXT atomic values: data=0x%lx, cmp=0x%lx\n", data, cmp);
 
   switch (amo_op) {
     case AMO_FETCH_INC:
     case AMO_INC: {
       opcode = BNXT_RE_WR_OPCD_ATOMIC_FA;
       data = 1;
-      break;
-    }
-    // TODO: dont have opmod, is set will work?
-    case AMO_SIGNAL:
-    case AMO_SIGNAL_SET:
-    case AMO_SWAP:
-    case AMO_SET: {
-      opcode = BNXT_RE_WR_OPCD_ATOMIC_CS;
-      cmp = 0;
       break;
     }
     case AMO_FETCH_ADD:
@@ -526,7 +518,7 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
       break;
     }
     default: {
-      printf("Error: unsupported atomic type (%d)\n", amo_op);
+      MORI_PRINTF("Error: unsupported atomic type (%d)\n", amo_op);
       assert(0);
     }
   }
@@ -544,7 +536,7 @@ inline __device__ uint64_t BnxtPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t cu
 
   sge.pa = (uint64_t)laddr;
   sge.lkey = lkey & 0xffffffff;
-  sge.length = bytes;
+  sge.length = 8;
 
   char* base = reinterpret_cast<char*>(queueBuffAddr) + slotIdx * BNXT_RE_SLOT_SIZE;
   ThreadCopy<char>(base + 0 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&hdr), sizeof(hdr));
@@ -662,38 +654,68 @@ inline __device__ void UpdateDbrAndRingDbRecv<ProviderType::BNXT>(void* dbrRecAd
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Completion Queue                                        */
 /* ---------------------------------------------------------------------------------------------- */
+inline __device__ int PollSingleCqe(volatile char* cqe, uint32_t consIdx, uint32_t* wqeIdx) {
+  // Extract completion index using HIP atomic load
+  const uint32_t con_indx = __hip_atomic_load(
+      reinterpret_cast<uint32_t*>(const_cast<char*>(cqe) + offsetof(bnxt_re_req_cqe, con_indx)),
+      __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+
+  if (wqeIdx) {
+    *wqeIdx = con_indx & 0xFFFF;
+  }
+
+  // Check completion status using HIP atomic load
+  volatile char* flgSrc = cqe + sizeof(struct bnxt_re_req_cqe);
+  const uint32_t flg_val = __hip_atomic_load(reinterpret_cast<uint32_t*>(const_cast<char*>(flgSrc)),
+                                             __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+  const uint8_t status = (flg_val >> BNXT_RE_BCQE_STATUS_SHIFT) & BNXT_RE_BCQE_STATUS_MASK;
+
+  if (status == BNXT_RE_REQ_ST_OK) {
+    return BNXT_RE_REQ_ST_OK;
+  }
+
+  return status;
+}
+
 template <>
 inline __device__ int PollCqOnce<ProviderType::BNXT>(void* cqeAddr, uint32_t cqeNum,
                                                      uint32_t consIdx, uint32_t* wqeIdx) {
-  uint32_t cqeIdx = consIdx % cqeNum;
+  // Fast path for single CQE (most common case) - eliminate all branching
+  if (cqeNum == 1) {
+    return PollSingleCqe(static_cast<volatile char*>(cqeAddr), consIdx, wqeIdx);
+  }
 
+  // Slower path for multiple CQEs
+  const uint32_t cqeIdx = consIdx % cqeNum;
   volatile char* cqe = static_cast<volatile char*>(cqeAddr) + 2 * BNXT_RE_SLOT_SIZE * cqeIdx;
   volatile char* flgSrc = cqe + sizeof(struct bnxt_re_req_cqe);
-  uint32_t phase = BNXT_RE_QUEUE_START_PHASE ^ ((consIdx / cqeNum) & 0x1);
-  uint32_t flg_val = *reinterpret_cast<volatile uint32_t*>(flgSrc);
-  uint32_t con_indx =
-      *reinterpret_cast<volatile uint32_t*>(cqe + offsetof(bnxt_re_req_cqe, con_indx));
-  // printf("GPU  flg_val = 0x%08X (%u), phase = 0x%08X (%u) consIdx %u, cqeNum %u\n",
-  //        flg_val & BNXT_RE_BCQE_PH_MASK, flg_val & BNXT_RE_BCQE_PH_MASK, phase, phase, consIdx,
-  //        cqeNum);
-  if (((flg_val)&BNXT_RE_BCQE_PH_MASK) == (phase)) {
-    uint8_t status = (flg_val >> BNXT_RE_BCQE_STATUS_SHIFT) & BNXT_RE_BCQE_STATUS_MASK;
+  const uint32_t flg_val = *reinterpret_cast<volatile uint32_t*>(flgSrc);
+  const uint32_t expected_phase = BNXT_RE_QUEUE_START_PHASE ^ ((consIdx / cqeNum) & 0x1);
 
-    if (status != BNXT_RE_REQ_ST_OK) {
-      printf("CQ Error (%u)\n", status);
-      return status;
-    }
-    if (wqeIdx) {
-      *wqeIdx = con_indx & 0xFFFF;
-    }
-    return 0;
+  if ((flg_val & BNXT_RE_BCQE_PH_MASK) != expected_phase) {
+    return -1;  // CQE not ready yet
   }
-  return -1;
+
+  // Extract completion index and check status
+  const uint32_t con_indx =
+      *reinterpret_cast<volatile uint32_t*>(cqe + offsetof(bnxt_re_req_cqe, con_indx));
+
+  if (wqeIdx) {
+    *wqeIdx = con_indx & 0xFFFF;
+  }
+
+  const uint8_t status = (flg_val >> BNXT_RE_BCQE_STATUS_SHIFT) & BNXT_RE_BCQE_STATUS_MASK;
+
+  if (__builtin_expect(status == BNXT_RE_REQ_ST_OK, 1)) {
+    return BNXT_RE_REQ_ST_OK;
+  }
+
+  return status;
 }
 
 template <>
 inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx) {
-  uint32_t curConsIdx = atomicAdd(consIdx, 1);
+  const uint32_t curConsIdx = atomicAdd(consIdx, 1);
   int opcode = -1;
   do {
     opcode = PollCqOnce<ProviderType::BNXT>(cqAddr, cqeNum, curConsIdx, nullptr);
@@ -701,54 +723,64 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
     asm volatile("" ::: "memory");
   } while (opcode < 0);
 
+  // Handle error cases
   if (opcode != BNXT_RE_REQ_ST_OK) {
     auto error = BnxtHandleErrorCqe(opcode);
-    printf("(%s:%d) CQE error: %s\n", __FILE__, __LINE__, IbvWcStatusString(error));
+    MORI_PRINTF("[BNXT PollCq] CQE error: %s (opcode: %d) at %s:%d\n", IbvWcStatusString(error), opcode,
+           __FILE__, __LINE__);
     return opcode;
   }
-  return opcode;
+
+  return BNXT_RE_REQ_ST_OK;
 }
 
 template <>
 inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx,
-                                                 uint16_t* wqeCounter) {
-  uint32_t curConsIdx = *consIdx;
+                                                 uint32_t* wqeCounter) {
+  const uint32_t curConsIdx = *consIdx;
   int opcode = -1;
   uint32_t wqeIdx;
   do {
     opcode = PollCqOnce<ProviderType::BNXT>(cqAddr, cqeNum, curConsIdx, &wqeIdx);
     asm volatile("" ::: "memory");
   } while (opcode < 0);
-
+  // Truncate to 16 bits
+  *wqeCounter = wqeIdx & 0xFFFF;
   if (opcode != BNXT_RE_REQ_ST_OK) {
     auto error = BnxtHandleErrorCqe(opcode);
-    printf("(%s:%d) CQE error: %s\n", __FILE__, __LINE__, IbvWcStatusString(error));
+    MORI_PRINTF("[BNXT PollCq] CQE error: %s (opcode: %d), wqeCounter: %u at %s:%d\n",
+           IbvWcStatusString(error), opcode, *wqeCounter, __FILE__, __LINE__);
     return opcode;
   }
-  *wqeCounter = (uint16_t)(wqeIdx & 0xFFFF);
-  return opcode;
+
+  return BNXT_RE_REQ_ST_OK;
 }
 
 template <>
-inline __device__ void UpdateCqDbrRecord<ProviderType::BNXT>(void* dbrRecAddr, uint32_t cons_idx,
-                                                             uint32_t cqeNum) {
-  uint8_t flags = ((cons_idx + 1) / cqeNum) & (1UL << BNXT_RE_FLAG_EPOCH_HEAD_SHIFT);
+inline __device__ int PollCq<ProviderType::BNXT>(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
+                                                 void* cqAddr, uint32_t cqeNum, uint32_t* consIdx, uint16_t* wqeCounter)
+{
+  return 0;
+}
+
+template <>
+inline __device__ void UpdateCqDbrRecord<ProviderType::BNXT>(CompletionQueueHandle& cq, uint32_t consIdx) {
+  uint8_t flags = ((consIdx + 1) / cq.cqeNum) & (1UL << BNXT_RE_FLAG_EPOCH_HEAD_SHIFT);
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
-  // uint64_t dbrVal = bnxt_re_init_db_hdr(((cons_idx + 1) | epoch), 0, flags, BNXT_RE_QUE_TYPE_CQ);
+  // uint64_t dbrVal = bnxt_re_init_db_hdr(((consIdx + 1) | epoch), 0, flags, BNXT_RE_QUE_TYPE_CQ);
   uint64_t dbrVal =
-      bnxt_re_init_db_hdr((((cons_idx + 1) % cqeNum) | epoch), 0, flags, BNXT_RE_QUE_TYPE_CQ);
-  core::AtomicStoreSeqCstSystem(reinterpret_cast<uint64_t*>(dbrRecAddr), dbrVal);
+      bnxt_re_init_db_hdr((((consIdx + 1) % cq.cqeNum) | epoch), 0, flags, BNXT_RE_QUE_TYPE_CQ);
+  core::AtomicStoreSeqCstSystem(reinterpret_cast<uint64_t*>(cq.dbrRecAddr), dbrVal);
 }
 
 template <>
-inline __device__ int PollCqAndUpdateDbr<ProviderType::BNXT>(void* cqAddr, uint32_t cqeSize,
-                                                             uint32_t cqeNum, uint32_t* consIdx,
-                                                             void* dbrRecAddr, uint32_t* lockVar) {
+inline __device__ int PollCqAndUpdateDbr<ProviderType::BNXT>(CompletionQueueHandle& cq, uint32_t* consIdx,
+                                                             uint32_t* lockVar) {
   AcquireLock(lockVar);
 
-  int opcode = PollCq<ProviderType::BNXT>(cqAddr, cqeNum, consIdx);
+  int opcode = PollCq<ProviderType::BNXT>(cq.cqAddr, cq.cqeNum, consIdx);
   if (opcode >= 0) {
-    UpdateCqDbrRecord<ProviderType::BNXT>(dbrRecAddr, *consIdx, cqeNum);
+    UpdateCqDbrRecord<ProviderType::BNXT>(cq, *consIdx);
   }
 
   ReleaseLock(lockVar);

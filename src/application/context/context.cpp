@@ -21,12 +21,21 @@
 // SOFTWARE.
 #include "mori/application/context/context.hpp"
 
+#include <arpa/inet.h>
 #include <hip/hip_runtime.h>
+#include <ifaddrs.h>
+#include <netdb.h>
+#include <string.h>
 #include <unistd.h>
 
+#include <cstdlib>
+#include <iostream>
+#include <string>
 #include <vector>
 
 #include "mori/application/utils/check.hpp"
+#include "mori/utils/mori_log.hpp"
+#include "mori/application/transport/sdma/anvil.hpp"
 
 namespace mori {
 namespace application {
@@ -38,23 +47,75 @@ Context::Context(BootstrapNetwork& bootNet) : bootNet(bootNet) {
 
 Context::~Context() {}
 
+std::string GetLocalIP() {
+  struct ifaddrs *ifaddr, *ifa;
+  char host[NI_MAXHOST];
+  std::string localIP = "127.0.0.1";
+
+  if (getifaddrs(&ifaddr) == -1) {
+    perror("getifaddrs");
+    return localIP;
+  }
+
+  for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+    if (ifa->ifa_addr == NULL) continue;
+
+    if (ifa->ifa_addr->sa_family == AF_INET) {
+      int s = getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in), host, NI_MAXHOST, NULL, 0,
+                          NI_NUMERICHOST);
+      if (s != 0) {
+        continue;
+      }
+
+      if (strcmp(host, "127.0.0.1") == 0) {
+        continue;
+      }
+
+      localIP = host;
+      break;
+    }
+  }
+
+  freeifaddrs(ifaddr);
+  return localIP;
+}
+
 std::string Context::HostName() const { return hostnames[LocalRank()]; }
 
 void Context::CollectHostNames() {
   char hostname[HOST_NAME_MAX];
   gethostname(hostname, HOST_NAME_MAX);
 
-  // char globalHostNames[HOST_NAME_MAX * WorldSize()];
-  std::vector<char> globalHostNames(HOST_NAME_MAX * WorldSize());
-  bootNet.Allgather(hostname, globalHostNames.data(), HOST_NAME_MAX);
+  std::string localIP = GetLocalIP();
+  std::string hostIdentifier = std::string(hostname) + ":" + localIP;
+
+  constexpr int IDENTIFIER_MAX = HOST_NAME_MAX + INET_ADDRSTRLEN;
+  std::vector<char> globalIdentifiers(IDENTIFIER_MAX * WorldSize());
+  // Create a non-const buffer for Allgather
+  char localBuffer[IDENTIFIER_MAX];
+  strncpy(localBuffer, hostIdentifier.c_str(), IDENTIFIER_MAX - 1);
+  localBuffer[IDENTIFIER_MAX - 1] = '\0';
+  bootNet.Allgather(localBuffer, globalIdentifiers.data(), IDENTIFIER_MAX);
 
   for (int i = 0; i < WorldSize(); i++) {
-    hostnames.push_back(&globalHostNames.data()[i * HOST_NAME_MAX]);
+    hostnames.push_back(&globalIdentifiers.data()[i * IDENTIFIER_MAX]);
+  }
+
+  if (LocalRank() == 0) {
+    MORI_APP_TRACE("Collected hostnames:");
+    for (int i = 0; i < hostnames.size(); i++) {
+      MORI_APP_TRACE("  rank {}: {}", i, hostnames[i]);
+    }
   }
 }
 
 bool IsP2PDisabled() {
   const char* varName = "MORI_DISABLE_P2P";
+  return getenv(varName) != nullptr;
+}
+
+bool IsSDMAEnabled() {
+  const char* varName = "MORI_ENABLE_SDMA";
   return getenv(varName) != nullptr;
 }
 
@@ -71,16 +132,16 @@ void Context::InitializePossibleTransports() {
   ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(devices);
 
   if (rankInNode == 0) {
-    std::cout << "rank " << LocalRank() << " RDMA devices: ";
+    std::string rdma_devices;
     if (activeDevicePortList.empty()) {
-      std::cout << "None" << std::endl;
+      rdma_devices = "None";
     } else {
       for (size_t i = 0; i < activeDevicePortList.size(); ++i) {
-        if (i > 0) std::cout << ", ";
-        std::cout << activeDevicePortList[i].first->Name();
+        if (i > 0) rdma_devices += ", ";
+        rdma_devices += activeDevicePortList[i].first->Name();
       }
-      std::cout << std::endl;
     }
+    MORI_APP_INFO("rank {} RDMA devices: {}", LocalRank(), rdma_devices);
   }
 
   // Match gpu and nic
@@ -102,7 +163,8 @@ void Context::InitializePossibleTransports() {
     HIP_RUNTIME_CHECK(hipGetDevice(&deviceId));
     topo.reset(new TopoSystem());
     std::string nicName = topo->MatchGpuAndNic(deviceId);
-
+    MORI_APP_TRACE("rank {} rankInNode {} matched nic {} for gpu {}", LocalRank(),
+                   rankInNode, nicName, deviceId);
     for (int i = 0; i < activeDevicePortList.size(); i++) {
       auto& dp = activeDevicePortList[i];
       if (dp.first->Name() != nicName) continue;
@@ -115,15 +177,22 @@ void Context::InitializePossibleTransports() {
   }
 
   if (device == nullptr) {
-    std::cout << "rank " << LocalRank() << " rankInNode " << rankInNode << " select no device"
-              << std::endl;
+    MORI_APP_INFO("rank {} rankInNode {} select no device", LocalRank(), rankInNode);
   } else {
-    std::cout << "rank " << LocalRank() << " rankInNode " << rankInNode << " select device "
-              << "[" << devicePortId << "] " << device->Name() << std::endl;
+    MORI_APP_INFO("rank {} rankInNode {} select device [{}] {}", LocalRank(), rankInNode,
+                  devicePortId, device->Name());
   }
 
+  int numQpPerPe = 4;
+  const char* envNumQp = std::getenv("MORI_NUM_QP_PER_PE");
+  if (envNumQp != nullptr) {
+    numQpPerPe = std::max(1, std::atoi(envNumQp));  // ensure at least 1 QP
+  }
+  this->numQpPerPe = numQpPerPe;
   // Initialize transport
   int peerRankInNode = -1;
+  if(!IsP2PDisabled() && IsSDMAEnabled()) anvil::anvil.init();
+
   for (int i = 0; i < WorldSize(); i++) {
     // Check P2P availability
     if (!IsP2PDisabled()) {
@@ -135,45 +204,79 @@ void Context::InitializePossibleTransports() {
         bool canAccessPeer = true;
 
         if ((i == LocalRank()) || canAccessPeer) {
-          transportTypes.push_back(TransportType::P2P);
-          rdmaEps.push_back({});
+          if(IsSDMAEnabled() && (i != LocalRank()) ){
+            transportTypes.push_back(TransportType::SDMA);
+
+	    anvil::EnablePeerAccess(LocalRank()%8, i%8);
+            // Better performance if allocating all 8 queues
+            anvil::anvil.connect(LocalRank()%8, i%8, 8);
+          }else{
+            transportTypes.push_back(TransportType::P2P);
+          }
+          for (int qp = 0; qp < numQpPerPe; qp++) {
+            rdmaEps.push_back({});
+          }
           continue;
         }
       }
     } else {
       if (i == LocalRank()) {
         transportTypes.push_back(TransportType::P2P);
-        rdmaEps.push_back({});
+        for (int qp = 0; qp < numQpPerPe; qp++) {
+          rdmaEps.push_back({});
+        }
         continue;
       }
     }
 
     if (rdmaDeviceContext.get() == nullptr) assert(false && "no rdma device found");
-
+    // Create multiple QPs for this peer
     application::RdmaEndpointConfig config;
     config.portId = portId;
-    config.gidIdx = 3;
+    config.gidIdx = -1;
+    const char* envGidIdx = std::getenv("MORI_IB_GID_INDEX");
+    if (envGidIdx != nullptr) {
+      config.gidIdx = std::atoi(envGidIdx);
+    }
     config.maxMsgsNum = 4096;
+#ifdef ENABLE_BNXT
+    config.maxCqeNum = 1;
+#else
     config.maxCqeNum = 4096;
+#endif
     config.alignment = 4096;
     config.onGpu = true;
-    RdmaEndpoint ep = rdmaDeviceContext->CreateRdmaEndpoint(config);
-    rdmaEps.push_back(ep);
+    for (int qp = 0; qp < numQpPerPe; qp++) {
+      RdmaEndpoint ep = rdmaDeviceContext->CreateRdmaEndpoint(config);
+      rdmaEps.push_back(ep);
+    }
     transportTypes.push_back(TransportType::RDMA);
   }
 
   // All2All rdma eps
-  // Exchange endpoint handles
-  std::vector<RdmaEndpointHandle> localToPeerEpHandles(WorldSize());
-  std::vector<RdmaEndpointHandle> peerToLocalEpHandles(WorldSize());
-  for (int i = 0; i < WorldSize(); i++) localToPeerEpHandles[i] = rdmaEps[i].handle;
+  // Exchange endpoint handles (now with multiple QPs per peer)
+  int totalEps = WorldSize() * numQpPerPe;
+  std::vector<RdmaEndpointHandle> localToPeerEpHandles(totalEps);
+  std::vector<RdmaEndpointHandle> peerToLocalEpHandles(totalEps);
+
+  // Fill local endpoint handles
+  for (int i = 0; i < rdmaEps.size(); i++) {
+    localToPeerEpHandles[i] = rdmaEps[i].handle;
+  }
+
   bootNet.AllToAll(localToPeerEpHandles.data(), peerToLocalEpHandles.data(),
-                   sizeof(RdmaEndpointHandle));
+                   sizeof(RdmaEndpointHandle) * numQpPerPe);
 
   // Connect RDMA endpoints
-  for (int i = 0; i < WorldSize(); i++) {
-    if (transportTypes[i] != TransportType::RDMA) continue;
-    rdmaDeviceContext->ConnectEndpoint(localToPeerEpHandles[i], peerToLocalEpHandles[i]);
+  for (int peer = 0; peer < WorldSize(); peer++) {
+    if (transportTypes[peer] != TransportType::RDMA) {
+      continue;
+    }
+    for (int qp = 0; qp < numQpPerPe; qp++) {
+      int epIndex = peer * numQpPerPe + qp;
+      rdmaDeviceContext->ConnectEndpoint(localToPeerEpHandles[epIndex],
+                                         peerToLocalEpHandles[epIndex], qp);
+    }
   }
 }
 

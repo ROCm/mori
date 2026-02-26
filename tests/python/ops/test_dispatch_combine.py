@@ -19,11 +19,20 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import os
 import pytest
 import mori
-from tests.python.utils import TorchDistProcessManager
+from tests.python.utils import TorchDistProcessManager, data_type_supported
 import torch
 import torch.distributed as dist
+
+os.environ["MORI_SHMEM_HEAP_SIZE"] = "4G"
+
+TORCH_FLOAT4_E2M1FN_X2 = getattr(torch, "float4_e2m1fn_x2", None)
+
+
+def _is_fp4x2_dtype(dtype):
+    return TORCH_FLOAT4_E2M1FN_X2 is not None and dtype is TORCH_FLOAT4_E2M1FN_X2
 
 
 class EpDispatchCombineTestCase:
@@ -102,15 +111,25 @@ class EpDispatchCombineTestCase:
         # some functions such as randn and cat are not implemented for fp8
         all_rank_input = []
         for r in range(self.config.world_size):
-            all_rank_input.append(
-                torch.randn(
-                    num_token[r],
-                    self.config.hidden_dim,
-                    dtype=torch.float32,
+            input_fp32 = torch.randn(
+                num_token[r],
+                self.config.hidden_dim,
+                dtype=torch.float32,
+                generator=self.rng,
+                device=self.device,
+            )
+            if _is_fp4x2_dtype(self.config.data_type):
+                fp4_bytes = torch.randint(
+                    0,
+                    256,
+                    (num_token[r], self.config.hidden_dim),
+                    dtype=torch.uint8,
                     generator=self.rng,
                     device=self.device,
-                ).to(self.config.data_type)
-            )
+                )
+                all_rank_input.append(fp4_bytes.view(torch.float4_e2m1fn_x2))
+            else:
+                all_rank_input.append(input_fp32.to(self.config.data_type))
 
         return (
             num_token,
@@ -143,7 +162,13 @@ class EpDispatchCombineTestCase:
         for i, pos in enumerate(src_token_pos):
             src_rank = int(pos) // self.config.max_num_inp_token_per_rank
             src_id = int(pos) % self.config.max_num_inp_token_per_rank
-            assert torch.equal(all_rank_input[src_rank][src_id], dispatch_output[i])
+            if _is_fp4x2_dtype(self.config.data_type):
+                assert torch.equal(
+                    all_rank_input[src_rank][src_id].view(torch.uint8),
+                    dispatch_output[i].view(torch.uint8),
+                )
+            else:
+                assert torch.equal(all_rank_input[src_rank][src_id], dispatch_output[i])
             if dispatch_weights is not None:
                 assert torch.equal(
                     all_rank_weights[src_rank][src_id], dispatch_weights[i]
@@ -165,6 +190,9 @@ class EpDispatchCombineTestCase:
         all_rank_input = test_data[2]
         all_rank_weights = test_data[3]
 
+        if _is_fp4x2_dtype(self.config.data_type):
+            return
+
         for i in range(all_rank_num_token[self.config.rank]):
             pes = [
                 (idx // self.config.num_experts_per_rank)
@@ -176,18 +204,25 @@ class EpDispatchCombineTestCase:
                 all_rank_input[self.config.rank][i].to(torch.float32) * unique_pes
             ).to(self.config.data_type)
 
+            atol, rtol = 1e-2, 1e-2
+            if getattr(self.config, "quant_type", "none") == "fp8_direct_cast":
+                atol, rtol = 1e-1, 1e-1
             result_match = torch.allclose(
-                got.float(), expected.float(), atol=1e-2, rtol=1e-2
+                got.float(), expected.float(), atol=atol, rtol=rtol
             )
-            if not result_match and self.config.rank == 0:
-                print(f"Result mismatch for token {i}:")
+            if not result_match:
+                print(f"Rank[{self.config.rank}] result mismatch for token {i}:")
                 print(
-                    f"  indices[{i}]: {all_rank_indices[self.config.rank][i].cpu().tolist()}"
+                    f"Rank[{self.config.rank}]   indices[{i}]: {all_rank_indices[self.config.rank][i].cpu().tolist()}"
                 )
-                print(f"  pes: {pes}")
-                print(f"  unique_pes: {unique_pes}")
-                print(f"  got: {got}")
-                print(f"  expected : {expected}")
+                print(f"Rank[{self.config.rank}]   pes: {pes}")
+                print(f"Rank[{self.config.rank}]   unique_pes: {unique_pes}")
+                print(f"Rank[{self.config.rank}]   got: {got}")
+                print(f"Rank[{self.config.rank}]   expected : {expected}")
+                print(
+                    f"Rank[{self.config.rank}]   input : {all_rank_input[self.config.rank][i].to(torch.float32)}"
+                )
+            assert result_match
 
             if combine_output_weight is not None:
                 got_weight, expected_weight = (
@@ -197,17 +232,18 @@ class EpDispatchCombineTestCase:
                 weight_match = torch.allclose(
                     got_weight, expected_weight, atol=1e-5, rtol=1e-5
                 )
-                if not weight_match and self.config.rank == 0:
-                    print(f"Weight mismatch for token {i}:")
+                if not weight_match:
+                    print(f"Rank[{self.config.rank}] Weight mismatch for token {i}:")
                     print(
-                        f"  indices[{i}]: {all_rank_indices[self.config.rank][i].cpu().tolist()}"
+                        f"Rank[{self.config.rank}]   indices[{i}]: {all_rank_indices[self.config.rank][i].cpu().tolist()}"
                     )
-                    print(f"  pes: {pes}")
-                    print(f"  unique_pes: {unique_pes}")
-                    print(f"  got_weight: {got_weight}")
+                    print(f"Rank[{self.config.rank}]   pes: {pes}")
+                    print(f"Rank[{self.config.rank}]   unique_pes: {unique_pes}")
+                    print(f"Rank[{self.config.rank}]   got_weight: {got_weight}")
                     print(
-                        f"  expected_weight (weights[{i}] * {unique_pes}): {expected_weight}"
+                        f"Rank[{self.config.rank}]   expected_weight (weights[{i}] * {unique_pes}): {expected_weight}"
                     )
+                assert weight_match
 
     def run_test_once(self, op, test_data):
         (
@@ -240,6 +276,14 @@ class EpDispatchCombineTestCase:
             dispatch_recv_num_token,
         )
 
+        total_recv_num_token = dispatch_recv_num_token[0].item()
+        if not self.config.use_external_inp_buf:
+            combine_input = op.get_registered_combine_input_buffer(
+                self.config.data_type
+            )
+            combine_input[:total_recv_num_token, :].copy_(
+                dispatch_output[:total_recv_num_token, :]
+            )
         combine_output, combine_output_weight = op.combine(
             dispatch_output, dispatch_weights, dispatch_indices, call_reset=False
         )
@@ -270,12 +314,14 @@ def _test_dispatch_combine(
     max_num_inp_token_per_rank,
     num_experts_per_rank,
     num_experts_per_token,
+    use_external_inp_buf,
+    quant_type="none",
 ):
     config = mori.ops.EpDispatchCombineConfig(
         data_type=data_type,
         rank=rank,
         world_size=world_size,
-        hidden_dim=hidden_dim,
+        hidden_dim=hidden_dim // 2 if _is_fp4x2_dtype(data_type) else hidden_dim,
         scale_dim=scale_dim,
         scale_type_size=scale_type_size,
         max_num_inp_token_per_rank=max_num_inp_token_per_rank,
@@ -284,6 +330,8 @@ def _test_dispatch_combine(
         max_token_type_size=4,
         block_num=40,
         warp_num_per_block=8,
+        use_external_inp_buf=use_external_inp_buf,
+        quant_type=quant_type,
     )
     op = mori.ops.EpDispatchCombineOp(config)
     test_case = EpDispatchCombineTestCase(config)
@@ -293,13 +341,46 @@ def _test_dispatch_combine(
 
 # TODO: create a sub process group so that we can test worlds size < 8
 @pytest.mark.parametrize("world_size", (8,))
-@pytest.mark.parametrize("data_type", (torch.float8_e4m3fnuz, torch.bfloat16))
+@pytest.mark.parametrize("data_type", (
+    [
+        torch.bfloat16,
+        pytest.param(
+            torch.float8_e4m3fnuz,
+            marks=pytest.mark.skipif(
+                not data_type_supported(torch.float8_e4m3fnuz),
+                reason="Skip float8_e4m3fnuz, it is not supported",
+            ),
+        ),
+        pytest.param(
+            torch.float8_e4m3fn,
+            marks=pytest.mark.skipif(
+                not data_type_supported(torch.float8_e4m3fn),
+                reason="Skip float8_e4m3fn, it is not supported",
+            ),
+        ),
+    ]
+    + (
+        [
+            pytest.param(
+                TORCH_FLOAT4_E2M1FN_X2,
+                marks=pytest.mark.skipif(
+                    not data_type_supported(TORCH_FLOAT4_E2M1FN_X2),
+                    reason="Skip float4_e2m1fn_x2, it is not supported",
+                ),
+            )
+        ]
+        if TORCH_FLOAT4_E2M1FN_X2 is not None
+        else []
+    )
+))
 @pytest.mark.parametrize("hidden_dim", (7168, 4096))
 @pytest.mark.parametrize("scale_dim", (0, 32))
 @pytest.mark.parametrize("scale_type_size", (1, 4))
 @pytest.mark.parametrize("max_num_inp_token_per_rank", (1, 128))
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
 @pytest.mark.parametrize("num_experts_per_token", (8,))
+@pytest.mark.parametrize("use_external_inp_buf", (True, False))
+@pytest.mark.parametrize("quant_type", ("none", "fp8_direct_cast"))
 def test_dispatch_combine(
     torch_dist_process_manager,
     world_size,
@@ -310,7 +391,15 @@ def test_dispatch_combine(
     max_num_inp_token_per_rank,
     num_experts_per_rank,
     num_experts_per_token,
+    use_external_inp_buf,
+    quant_type,
 ):
+    # fp8_direct_cast is not supported in zero-copy mode (use_external_inp_buf=False)
+    if quant_type == "fp8_direct_cast" and not use_external_inp_buf:
+        pytest.skip("fp8_direct_cast is not supported in zero-copy mode")
+    if quant_type == "fp8_direct_cast" and data_type is not torch.bfloat16:
+        pytest.skip("fp8_direct_cast is only supported for bfloat16 data type")
+
     for i in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (
@@ -324,6 +413,8 @@ def test_dispatch_combine(
                     max_num_inp_token_per_rank,
                     num_experts_per_rank,
                     num_experts_per_token,
+                    use_external_inp_buf,
+                    quant_type,
                 ],
             )
         )

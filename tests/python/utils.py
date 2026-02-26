@@ -61,6 +61,18 @@ def get_free_port():
         return s.getsockname()[1]
 
 
+def data_type_supported(dtype):
+    arch = torch.cuda.get_device_capability(0)
+    arch_int = int("".join(map(str, arch)))
+    if dtype is torch.float8_e4m3fnuz:
+        return arch_int == 94
+    if dtype is torch.float8_e4m3fn:
+        return arch_int >= 95
+    if dtype is torch.float4_e2m1fn_x2:
+        return arch_int >= 95
+    return True
+
+
 class TorchDistContext:
     def __init__(
         self,

@@ -43,6 +43,7 @@ class Context {
 
   TransportType GetTransportType(int destRank) const { return transportTypes[destRank]; }
   std::vector<TransportType> GetTransportTypes() const { return transportTypes; }
+  int GetNumQpPerPe() const { return numQpPerPe; }
 
   RdmaContext* GetRdmaContext() const { return rdmaContext.get(); }
   RdmaDeviceContext* GetRdmaDeviceContext() const { return rdmaDeviceContext.get(); }
@@ -57,6 +58,7 @@ class Context {
  private:
   BootstrapNetwork& bootNet;
   int rankInNode{-1};
+  int numQpPerPe{4};
   std::vector<std::string> hostnames;
   std::vector<TransportType> transportTypes;
 

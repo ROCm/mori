@@ -249,7 +249,8 @@ class EpDispatchCombineTestCase {
         index_t srcPe = srcTokId / config.maxNumInpTokenPerRank;
         index_t localSrcTokId = srcTokId - srcPe * config.maxNumInpTokenPerRank;
 
-        T* localTokBuf = handle.shmemOutTokMemObj->template GetAs<T*>() + i * config.hiddenDim;
+        T* localTokBuf =
+            handle.shmemDispatchOutTokMemObj->template GetAs<T*>() + i * config.hiddenDim;
         T* srcTokBuf = reinterpret_cast<T*>(globalInpTokBufCpu) + srcPe * inpTokEleNum +
                        localSrcTokId * config.hiddenDim;
 
@@ -291,7 +292,8 @@ class EpDispatchCombineTestCase {
         index_t srcTokDispatchId = peSortToTokenIdxMapsVec[srcPe][peSortedId];
         index_t srcTokId = srcTokDispatchId / config.numExpertPerToken;
 
-        T* localTokBuf = handle.shmemOutTokMemObj->template GetAs<T*>() + i * config.hiddenDim;
+        T* localTokBuf =
+            handle.shmemDispatchOutTokMemObj->template GetAs<T*>() + i * config.hiddenDim;
 
         T* srcTokBuf = reinterpret_cast<T*>(globalInpTokBufCpu) + srcPe * inpTokEleNum +
                        srcTokId * config.hiddenDim;
@@ -348,7 +350,7 @@ class EpDispatchCombineTestCase {
         float expected =
             float(T(float(reinterpret_cast<T*>(inpTokBufCpu)[tokenOffset + j]) * weightSum));
         // float got = float(handle.outTokenBuf[tokenOffset + j]);
-        float got = float(handle.shmemOutTokMemObj->template GetAs<T*>()[tokenOffset + j]);
+        float got = float(handle.shmemCombineOutTokMemObj->template GetAs<T*>()[tokenOffset + j]);
         assert(weightSum != 0);
         if (abs(got - expected) > runConfig.atol) {
           std::cout << "Wrong result at pos " << j << ": mype " << config.rank << " tokenId " << i
@@ -374,7 +376,6 @@ class EpDispatchCombineTestCase {
   void RunAccuracyTest() {
     for (int i = 0; i < runConfig.repeat; i++) {
       InitializeHandle();
-      handle.LaunchReset();
 
       handle.LaunchDispatch(runConfig.kernelType);
 
@@ -400,13 +401,12 @@ class EpDispatchCombineTestCase {
 
     for (int i = 0; i < runConfig.warmup; i++) {
       InitializeHandle();
-      handle.LaunchReset(stream);
       SystemBarrier();
 
-      handle.LaunchDispatch(runConfig.kernelType, -1, -1, stream);
+      handle.LaunchDispatch(runConfig.kernelType, -1, -1, -1, stream);
       CopyDispatchOutAsCombineInp();
       SystemBarrier();
-      handle.LaunchCombine(runConfig.kernelType, -1, -1, stream);
+      handle.LaunchCombine(runConfig.kernelType, -1, -1, -1, -1, stream);
       if (handle.config.rank == 0) std::cout << "Warmup Done" << std::endl;
     }
 
@@ -417,11 +417,10 @@ class EpDispatchCombineTestCase {
     int dispatchTotalRecvTokenNum = 0;
     for (int i = 0; i < runConfig.repeat; i++) {
       InitializeHandle();
-      handle.LaunchReset(stream);
       SystemBarrier();
 
       HIP_RUNTIME_CHECK(hipEventRecord(events[0]));
-      handle.LaunchDispatch(runConfig.kernelType, -1, -1, stream);
+      handle.LaunchDispatch(runConfig.kernelType, -1, -1, -1, stream);
       HIP_RUNTIME_CHECK(hipEventRecord(events[1]));
 
       HIP_RUNTIME_CHECK(hipMemcpy(&dispatchTotalRecvTokenNum, handle.totalRecvTokenNum, sizeof(int),
@@ -430,7 +429,7 @@ class EpDispatchCombineTestCase {
       SystemBarrier();
 
       HIP_RUNTIME_CHECK(hipEventRecord(events[2]));
-      handle.LaunchCombine(runConfig.kernelType, -1, -1, stream);
+      handle.LaunchCombine(runConfig.kernelType, -1, -1, -1, -1, stream);
       HIP_RUNTIME_CHECK(hipEventRecord(events[3]));
 
       float dispatch, combine;
@@ -471,7 +470,7 @@ class EpDispatchCombineTestCase {
     // HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, outTokBuf,
     //                             config.MaxNumTokensToRecvPerRank() * config.hiddenDim *
     //                             sizeof(T), hipMemcpyDeviceToDevice));
-    HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, handle.shmemOutTokMemObj->template GetAs<T*>(),
+    HIP_RUNTIME_CHECK(hipMemcpy(inpTokBuf, handle.shmemDispatchOutTokMemObj->template GetAs<T*>(),
                                 config.MaxNumTokensToRecvPerRank() * config.hiddenDim * sizeof(T),
                                 hipMemcpyDeviceToDevice));
     HIP_RUNTIME_CHECK(

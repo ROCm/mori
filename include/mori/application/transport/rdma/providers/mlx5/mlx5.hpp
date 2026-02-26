@@ -23,7 +23,7 @@
 
 #include "infiniband/mlx5dv.h"
 #include "mori/application/transport/rdma/rdma.hpp"
-#include "src/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
+#include "mori/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
 
 namespace mori {
 namespace application {
@@ -74,18 +74,24 @@ class Mlx5CqContainer {
   mlx5dv_devx_obj* cq{nullptr};
 };
 
+class Mlx5DeviceContext;  // Forward declaration
+
 class Mlx5QpContainer {
  public:
   Mlx5QpContainer(ibv_context* context, const RdmaEndpointConfig& config, uint32_t cqn,
-                  uint32_t pdn);
+                  uint32_t pdn, Mlx5DeviceContext* device_context);
   ~Mlx5QpContainer();
 
   void ModifyRst2Init();
-  void ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr);
+  void ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
+                      const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr,
+                      uint32_t qpId = 0);
   void ModifyRtr2Rts(const RdmaEndpointHandle& local_handle);
 
   void* GetSqAddress();
   void* GetRqAddress();
+
+  Mlx5DeviceContext* GetDeviceContext() { return device_context; }
 
  private:
   void ComputeQueueAttrs(const RdmaEndpointConfig& config);
@@ -94,6 +100,7 @@ class Mlx5QpContainer {
 
  public:
   ibv_context* context;
+  Mlx5DeviceContext* device_context;
 
  public:
   RdmaEndpointConfig config;
@@ -110,6 +117,11 @@ class Mlx5QpContainer {
   mlx5dv_devx_uar* qpUar{nullptr};
   void* qpUarPtr{nullptr};
   mlx5dv_devx_obj* qp{nullptr};
+
+  // Atomic internal buffer fields
+  void* atomicIbufAddr{nullptr};
+  size_t atomicIbufSize{0};
+  ibv_mr* atomicIbufMr{nullptr};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -121,8 +133,8 @@ class Mlx5DeviceContext : public RdmaDeviceContext {
   ~Mlx5DeviceContext() override;
 
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) override;
-  virtual void ConnectEndpoint(const RdmaEndpointHandle& local,
-                               const RdmaEndpointHandle& remote) override;
+  virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote,
+                               uint32_t qpId = 0) override;
 
  private:
   uint32_t pdn;

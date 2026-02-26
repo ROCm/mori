@@ -24,6 +24,7 @@
 #include <infiniband/verbs.h>
 
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -47,9 +48,9 @@ namespace io {
 class RdmaManager {
  public:
   RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* ctx);
-  ~RdmaManager() = default;
+  ~RdmaManager();
 
-  application::RdmaEndpointConfig GetRdmaEndpointConfig(int portId);
+  application::RdmaEndpointConfig GetRdmaEndpointConfig(int devId);
 
   // Topology APIs
   std::vector<std::pair<int, int>> Search(TopoKey);
@@ -96,6 +97,7 @@ class RdmaManager {
   std::unordered_map<uint32_t, EpPair> epsMap;
 
   std::unique_ptr<application::TopoSystem> topo{nullptr};
+  std::atomic<uint32_t> roundRobinCounter{0};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -131,13 +133,13 @@ class NotifManager {
 
   // Notification context
  private:
-  struct DeviceNotifContext {
-    ibv_srq* srq;
+  struct QpNotifContext {
     application::RdmaMemoryRegion mr;
+    void* buf;
   };
 
-  uint32_t maxNotifNum{8192};
-  std::unordered_map<int, DeviceNotifContext> notifCtx;
+  uint32_t notifPerQp{1024};
+  std::unordered_map<uint32_t, QpNotifContext> qpNotifCtx;
   std::unordered_map<EngineKey, std::unordered_map<TransferUniqueId, int>> notifPool;
 
   std::unordered_map<TransferStatus*, int> localNotif;
@@ -152,6 +154,11 @@ class ControlPlaneServer {
                      NotifManager*);
   ~ControlPlaneServer();
 
+  std::optional<uint16_t> GetListenPort() const {
+    if (!ctx) return std::nullopt;
+    return static_cast<uint16_t>(ctx->GetPort());
+  }
+
   // Remote engine meta management
   void RegisterRemoteEngine(const EngineDesc&);
   void DeregisterRemoteEngine(const EngineDesc&);
@@ -160,7 +167,7 @@ class ControlPlaneServer {
   void BuildRdmaConn(EngineKey, TopoKeyPair);
 
   // MemoryRegion management
-  void RegisterMemory(const MemoryDesc&);
+  void RegisterMemory(MemoryDesc&);
   void DeregisterMemory(const MemoryDesc&);
   application::RdmaMemoryRegion AskRemoteMemoryRegion(EngineKey, int rdevId, MemoryUniqueId);
 
@@ -227,9 +234,14 @@ class RdmaBackend : public Backend {
   RdmaBackend(EngineKey, const IOEngineConfig&, const RdmaBackendConfig&);
   ~RdmaBackend();
 
+  std::optional<uint16_t> GetListenPort() const {
+    if (!server) return std::nullopt;
+    return server->GetListenPort();
+  }
+
   void RegisterRemoteEngine(const EngineDesc&);
   void DeregisterRemoteEngine(const EngineDesc&);
-  void RegisterMemory(const MemoryDesc& desc);
+  void RegisterMemory(MemoryDesc& desc);
   void DeregisterMemory(const MemoryDesc& desc);
   void ReadWrite(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
                  size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id,

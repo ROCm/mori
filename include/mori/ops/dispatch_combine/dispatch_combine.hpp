@@ -25,18 +25,20 @@
 #include <hip/hip_fp8.h>
 #include <hip/library_types.h>
 
+#include <cstdint>
 #include <sstream>
 #include <variant>
 
 #include "mori/application/application.hpp"
+#include "mori/core/profiler/constants.hpp"
+#include "mori/core/profiler/kernel_profiler.hpp"
+#include "mori/utils/data_types.hpp"
 
 namespace mori {
 namespace moe {
 
-enum KernelType {
-  IntraNode = 0,
-  InterNode = 1,
-};
+enum KernelType { IntraNode = 0, InterNode = 1, InterNodeV1 = 2, InterNodeV1LL = 3, AsyncLL = 4 };
+enum class QuantType { None = 0, Fp8DirectCast = 1 };
 
 inline const char* HipDataTypeToString(hipDataType dtype) {
   switch (dtype) {
@@ -46,6 +48,8 @@ inline const char* HipDataTypeToString(hipDataType dtype) {
       return "HIP_R_32F";
     case HIP_R_16BF:
       return "HIP_R_16BF";
+    case HIP_R_8F_E4M3:
+      return "HIP_R_8F_E4M3";
     case HIP_R_8F_E4M3_FNUZ:
       return "HIP_R_8F_E4M3_FNUZ";
     default:
@@ -59,6 +63,8 @@ inline size_t GetHipDataTypeSize(hipDataType dtype) {
       return sizeof(float);
     case HIP_R_16BF:
       return sizeof(hip_bfloat16);
+    case HIP_R_8F_E4M3:
+      return sizeof(__hip_fp8_e4m3);
     case HIP_R_8F_E4M3_FNUZ:
       return sizeof(__hip_fp8_e4m3_fnuz);
     default:
@@ -68,7 +74,7 @@ inline size_t GetHipDataTypeSize(hipDataType dtype) {
 
 using index_t = int32_t;
 
-#define MAX_EXPERTS_PER_TOKEN (8)
+#define MAX_EXPERTS_PER_TOKEN (9)
 struct EpDispatchCombineConfig {
   int rank{0};
   int worldSize{0};
@@ -84,6 +90,11 @@ struct EpDispatchCombineConfig {
   // If true, use external buffer which incurs extra copy overhead; otherwise, the kernel assumes
   // the provided buffer is shmemInpTokMemObj
   bool useExternalInpBuffer{true};
+  KernelType kernelType{KernelType::IntraNode};
+  int gpuPerNode{8};
+  int rdmaBlockNum{1};
+  int numQpPerPe{1};
+  QuantType quantType{QuantType::None};
 
   inline __host__ __device__ int MaxNumTokensToSendPerRank() const { return maxNumInpTokenPerRank; }
 
@@ -126,14 +137,60 @@ class EpDispatchCombineHandle {
     // printf("handle inputType %s\n", HipDataTypeToString(inputType));
   }
 
-  // When blockNum and warpPerBlock <= 0, kernel will use default values in config
-  void LaunchIntraNodeDispatch(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
-  void LaunchInterNodeDispatch(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
-  void LaunchIntraNodeCombine(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
-  void LaunchInterNodeCombine(int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+  void SetStandardMoeOutputBuffers(void* packedRecvX, int* packedRecvCount, int* packedRecvSrcInfo,
+                                   int64_t* packedRecvLayoutRange) {
+    enableStandardMoeOutput = true;
+    standardPackedRecvX = packedRecvX;
+    // standardPackedRecvCount = packedRecvCount;
+    standardPackedRecvSrcInfo = packedRecvSrcInfo;
+    standardPackedRecvLayoutRange = packedRecvLayoutRange;
+  }
 
-  void LaunchDispatch(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
-  void LaunchCombine(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
+  void ClearStandardMoeOutputBuffers() {
+    enableStandardMoeOutput = false;
+    standardPackedRecvX = nullptr;
+    // standardPackedRecvCount = nullptr;
+    standardPackedRecvSrcInfo = nullptr;
+    standardPackedRecvLayoutRange = nullptr;
+  }
+#endif
+
+  // When blockNum and warpPerBlock <= 0, kernel will use default values in config
+  void LaunchIntraNodeDispatch(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+                               hipStream_t = 0, int hiddenDim = -1);
+  void LaunchInterNodeDispatch(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+                               hipStream_t = 0, int hiddenDim = -1);
+  void LaunchIntraNodeCombine(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+                              int useExternalInpBuf = -1, hipStream_t = 0, int hiddenDim = -1);
+  void LaunchInterNodeCombine(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+                              int useExternalInpBuf = -1, hipStream_t = 0, int hiddenDim = -1);
+
+  void LaunchDispatch(KernelType, int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+                      hipStream_t = 0, int hiddenDim = -1);
+  void LaunchCombine(KernelType, int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+                     int useExternalInpBuf = -1, hipStream_t = 0, int hiddenDim = -1);
+
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+  void LaunchDispatchForStandardMoE(KernelType, int blockNum = -1, int rdmaBlockNum = -1,
+                                    int warpPerBlock = -1, hipStream_t = 0, int hiddenDim = -1);
+  void LaunchCombineForStandardMoE(KernelType, int blockNum = -1, int rdmaBlockNum = -1,
+                                   int warpPerBlock = -1, hipStream_t = 0, int hiddenDim = -1);
+
+  void LaunchConvertDispatchOutputKernel(const void* dispatchOutX, const void* dispatchOutTopkIdx,
+                                         void* packedRecvX, int* packedRecvCount,
+                                         int* packedRecvSrcInfo, int64_t* packedRecvLayoutRange,
+                                         int blockNum = -1, int warpPerBlock = -1,
+                                         hipStream_t = 0, int hiddenDim = -1);
+  void LaunchConvertCombineInputKernel(const void* packedRecvX, const void* packedRecvSrcInfo,
+                                       const void* packedRecvLayoutRange, void* combineInput,
+                                       mori::application::SymmMemObjPtr shmemCombineInpTokMemObj,
+                                       int blockNum = -1, int warpPerBlock = -1,
+                                       hipStream_t = 0, int hiddenDim = -1);
+#endif
+
+  void LaunchDispatchRecv(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
+  void LaunchCombineRecv(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
   void LaunchReset(hipStream_t = 0);
 
   index_t GetCurRankNumToken() const { return curRankNumToken; }
@@ -154,6 +211,8 @@ class EpDispatchCombineHandle {
  public:
   // Number of tokens on this rank and size of scale data type, updated at each round of inference
   index_t curRankNumToken{0};
+  index_t multiProcessorCount{0};
+  index_t maxThreads{0};
 
  public:
   // Config
@@ -169,13 +228,16 @@ class EpDispatchCombineHandle {
   uint8_t* scalesBuf{nullptr};
 
   // Registered buffers for tokens, shmemOutTokMemObj will be returned to user as output
-  mori::application::SymmMemObjPtr shmemInpTokMemObj;
-  mori::application::SymmMemObjPtr shmemOutTokMemObj;
+  mori::application::SymmMemObjPtr shmemDispatchInpTokMemObj;
+  mori::application::SymmMemObjPtr shmemCombineInpTokMemObj;
+  mori::application::SymmMemObjPtr shmemDispatchOutTokMemObj;
+  mori::application::SymmMemObjPtr shmemCombineOutTokMemObj;
   mori::application::SymmMemObjPtr shmemStagingTokMemObj;
 
   // Registered buffer used for weights, indices and scales
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
-  mori::application::SymmMemObjPtr shmemOutWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemDispatchOutWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemCombineOutWeightsMemObj;
   mori::application::SymmMemObjPtr shmemInpScalesMemObj;
   mori::application::SymmMemObjPtr shmemOutScalesMemObj;
   mori::application::SymmMemObjPtr shmemInpIndicesMemObj;
@@ -184,6 +246,7 @@ class EpDispatchCombineHandle {
   // Record number of tokens that will be received from other PE
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
   mori::application::SymmMemObjPtr sendTokenNumMemObj;
+  mori::application::SymmMemObjPtr sendAtomicSignalMemObj;
 
   // Barrier for intra-grid synchronization
   uint32_t* dispatchGridBarrier{nullptr};
@@ -195,6 +258,19 @@ class EpDispatchCombineHandle {
   // Map dispatch staging buffer index to output buffer index, saved at dispatch recv phase and used
   // at combine send phase
   index_t* dispReceiverIdxMap{nullptr};
+
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+  // Map dispatch token to expert slot index (size: MaxNumTokensToRecv * numExpertPerToken), saved
+  // at ConvertDispatchOutput and used at ConvertCombineInput
+  uint64_t* dispTokToEpSlotMap{nullptr};
+
+  // Standard MoE output buffers (set per-dispatch when enabled).
+  bool enableStandardMoeOutput{false};
+  void* standardPackedRecvX{nullptr};
+  int* standardPackedRecvCount{nullptr};
+  int* standardPackedRecvSrcInfo{nullptr};
+  int64_t* standardPackedRecvLayoutRange{nullptr};
+#endif
 
   // Map staging buffer index to dispatch input token index, saved at dispatch init phase and used
   // at dispatch send phase
@@ -214,30 +290,56 @@ class EpDispatchCombineHandle {
   index_t* dispDestTokIdMap{nullptr};
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
-  uint32_t crossDeviceBarrierFlag{1};
+  uint64_t* crossDeviceBarrierFlag{nullptr};
+
+  // Inter-node v1 kernel parameters
+  // Signal the completion of inter-node token transfer
+  mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
+  // Signal the number of tokens transferred from other nodes
+  mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;
+  // Count the number of tokens sent to other nodes
+  index_t* destNodeTokenCounter{nullptr};
+  // Counter that is used to sort the ordering of inter-node token chunk transfer
+  index_t* blockFlagCounter{nullptr};
+  // Barrier blocks that do inter node rdma transfer
+  uint32_t* interNodeBlocksBarrier{nullptr};
+  // Map dispatch token idx for inter-node tokens
+  index_t* interNodeDispDestTokIdMap{nullptr};
+  // Barrier rdma block group
+  index_t* interNodeChunkFlagCombine{nullptr};
+  // Map dispatched rdma token chunk index
+  index_t* interNodeDispSendMap{nullptr};
+#ifdef ENABLE_PROFILER
+  mori::core::profiler::ProfilerConfig profilerConfig;
+#endif
 };
 
 template <typename T>
 struct EpDispatchCombineArgs {
   using data_type = T;
   EpDispatchCombineConfig config;
+  int rdmaBlockNum{-1};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
   T* inpTokenBuf{nullptr};
   T* outTokenBuf{nullptr};
   float* weightsBuf{nullptr};
   uint8_t* scalesBuf{nullptr};
-  mori::application::SymmMemObjPtr shmemInpTokMemObj;
-  mori::application::SymmMemObjPtr shmemOutTokMemObj;
+  mori::application::SymmMemObjPtr shmemDispatchInpTokMemObj;
+  mori::application::SymmMemObjPtr shmemCombineInpTokMemObj;
+  mori::application::SymmMemObjPtr shmemDispatchOutTokMemObj;
+  mori::application::SymmMemObjPtr shmemCombineOutTokMemObj;
   mori::application::SymmMemObjPtr shmemStagingTokMemObj;
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
-  mori::application::SymmMemObjPtr shmemOutWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemDispatchOutWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemCombineOutWeightsMemObj;
   mori::application::SymmMemObjPtr shmemInpScalesMemObj;
   mori::application::SymmMemObjPtr shmemOutScalesMemObj;
   mori::application::SymmMemObjPtr shmemInpIndicesMemObj;
   mori::application::SymmMemObjPtr shmemOutIndicesMemObj;
   mori::application::SymmMemObjPtr recvTokenNumMemObj;
   mori::application::SymmMemObjPtr sendTokenNumMemObj;
+  mori::application::SymmMemObjPtr sendAtomicSignalMemObj;
   uint32_t* dispatchGridBarrier{nullptr};
   uint32_t* combineGridBarrier{nullptr};
   index_t* destPeTokenCounter{nullptr};
@@ -251,17 +353,48 @@ struct EpDispatchCombineArgs {
   index_t* dispDestTokIdMap{nullptr};
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
-  uint32_t crossDeviceBarrierFlag{1};
+  uint64_t* crossDeviceBarrierFlag{nullptr};
+  mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
+  index_t* destNodeTokenCounter{nullptr};
+  mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;
+  index_t* blockFlagCounter{nullptr};
+  uint32_t* interNodeBlocksBarrier{nullptr};
+  index_t* interNodeDispDestTokIdMap{nullptr};
+  index_t* interNodeChunkFlagCombine{nullptr};
+  index_t* interNodeDispSendMap{nullptr};
+#ifdef ENABLE_PROFILER
+  mori::core::profiler::ProfilerConfig profilerConfig;
+#endif
+
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+  bool enableStandardMoeOutput{false};
+  void* standardPackedRecvX{nullptr};
+  int* standardPackedRecvCount{nullptr};
+  int* standardPackedRecvSrcInfo{nullptr};
+  int64_t* standardPackedRecvLayoutRange{nullptr};
+  uint64_t* dispTokToEpSlotMap{nullptr};
+#endif
 };
 
 using EpDispatchCombineArgsVariant =
     std::variant<EpDispatchCombineArgs<float>, EpDispatchCombineArgs<hip_bfloat16>,
-                 EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> >;
+                 EpDispatchCombineArgs<mori_fp4x2_e2m1>
+#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
+                 ,
+                 EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>
+#endif
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+                 ,
+                 EpDispatchCombineArgs<__hip_fp8_e4m3>
+#endif
+                 >;
 
 template <typename T>
-EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle& handle) {
+EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle& handle,
+                                                  int rdmaBlockNum) {
   EpDispatchCombineArgs<T> args;
   args.config = handle.config;
+  args.rdmaBlockNum = rdmaBlockNum;
   args.curRankNumToken = handle.curRankNumToken;
   args.tokenIndices = handle.tokenIndices;
   args.inpTokenBuf = reinterpret_cast<T*>(handle.inpTokenBuf);
@@ -270,17 +403,21 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.scalesBuf = handle.scalesBuf;
   args.destPeTokenCounter = handle.destPeTokenCounter;
   args.localPeTokenCounter = handle.localPeTokenCounter;
-  args.shmemInpTokMemObj = handle.shmemInpTokMemObj;
-  args.shmemOutTokMemObj = handle.shmemOutTokMemObj;
+  args.shmemDispatchInpTokMemObj = handle.shmemDispatchInpTokMemObj;
+  args.shmemCombineInpTokMemObj = handle.shmemCombineInpTokMemObj;
+  args.shmemDispatchOutTokMemObj = handle.shmemDispatchOutTokMemObj;
+  args.shmemCombineOutTokMemObj = handle.shmemCombineOutTokMemObj;
   args.shmemStagingTokMemObj = handle.shmemStagingTokMemObj;
   args.shmemInpWeightsMemObj = handle.shmemInpWeightsMemObj;
-  args.shmemOutWeightsMemObj = handle.shmemOutWeightsMemObj;
+  args.shmemDispatchOutWeightsMemObj = handle.shmemDispatchOutWeightsMemObj;
+  args.shmemCombineOutWeightsMemObj = handle.shmemCombineOutWeightsMemObj;
   args.shmemInpScalesMemObj = handle.shmemInpScalesMemObj;
   args.shmemOutScalesMemObj = handle.shmemOutScalesMemObj;
   args.shmemInpIndicesMemObj = handle.shmemInpIndicesMemObj;
   args.shmemOutIndicesMemObj = handle.shmemOutIndicesMemObj;
   args.recvTokenNumMemObj = handle.recvTokenNumMemObj;
   args.sendTokenNumMemObj = handle.sendTokenNumMemObj;
+  args.sendAtomicSignalMemObj = handle.sendAtomicSignalMemObj;
   args.dispatchGridBarrier = handle.dispatchGridBarrier;
   args.combineGridBarrier = handle.combineGridBarrier;
   args.dispReceiverIdxMap = handle.dispReceiverIdxMap;
@@ -293,18 +430,45 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.totalRecvTokenNum = handle.totalRecvTokenNum;
   args.crossDeviceBarrierMemObj = handle.crossDeviceBarrierMemObj;
   args.crossDeviceBarrierFlag = handle.crossDeviceBarrierFlag;
+  args.interNodeChunkFlagMemObj = handle.interNodeChunkFlagMemObj;
+  args.destNodeTokenCounter = handle.destNodeTokenCounter;
+  args.nodeRecvTokenNumMemObj = handle.nodeRecvTokenNumMemObj;
+  args.blockFlagCounter = handle.blockFlagCounter;
+  args.interNodeBlocksBarrier = handle.interNodeBlocksBarrier;
+  args.interNodeDispDestTokIdMap = handle.interNodeDispDestTokIdMap;
+  args.interNodeChunkFlagCombine = handle.interNodeChunkFlagCombine;
+  args.interNodeDispSendMap = handle.interNodeDispSendMap;
+#ifdef ENABLE_PROFILER
+  args.profilerConfig = handle.profilerConfig;
+#endif
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+  args.enableStandardMoeOutput = handle.enableStandardMoeOutput;
+  args.standardPackedRecvX = handle.standardPackedRecvX;
+  args.standardPackedRecvCount = handle.standardPackedRecvCount;
+  args.standardPackedRecvSrcInfo = handle.standardPackedRecvSrcInfo;
+  args.standardPackedRecvLayoutRange = handle.standardPackedRecvLayoutRange;
+  args.dispTokToEpSlotMap = handle.dispTokToEpSlotMap;
+#endif
   return args;
 }
 
 inline EpDispatchCombineArgsVariant GetEpDispatchCombineArgsByInputType(
-    const EpDispatchCombineHandle& handle) {
+    const EpDispatchCombineHandle& handle, int rdmaBlockNum) {
   switch (handle.inputType) {
     case HIP_R_32F:
-      return GetEpDispatchCombineArgs<float>(handle);
+      return GetEpDispatchCombineArgs<float>(handle, rdmaBlockNum);
     case HIP_R_16BF:
-      return GetEpDispatchCombineArgs<hip_bfloat16>(handle);
+      return GetEpDispatchCombineArgs<hip_bfloat16>(handle, rdmaBlockNum);
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+    case HIP_R_8F_E4M3:
+      return GetEpDispatchCombineArgs<__hip_fp8_e4m3>(handle, rdmaBlockNum);
+#endif
+#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
     case HIP_R_8F_E4M3_FNUZ:
-      return GetEpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>(handle);
+      return GetEpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>(handle, rdmaBlockNum);
+#endif
+    case HIP_R_4F_E2M1:
+      return GetEpDispatchCombineArgs<mori_fp4x2_e2m1>(handle, rdmaBlockNum);
     default:
       std::ostringstream oss;
       oss << "Unsupported inputType " << HipDataTypeToString(handle.inputType)

@@ -39,6 +39,9 @@ namespace mori {
 namespace application {
 
 #ifdef ENABLE_BNXT
+// BNXT UDP sport configuration constants
+static constexpr uint32_t BNXT_UDP_SPORT_ARRAY_SIZE = 4;
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Device Attributes                                       */
 /* ---------------------------------------------------------------------------------------------- */
@@ -73,26 +76,33 @@ class BnxtCqContainer {
   ibv_cq* cq{nullptr};
 };
 
+class BnxtDeviceContext;  // Forward declaration
+
 class BnxtQpContainer {
  public:
-  BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig& config, ibv_cq* cq, ibv_pd* pd);
+  BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig& config, ibv_cq* cq, ibv_pd* pd,
+                  BnxtDeviceContext* device_context);
   ~BnxtQpContainer();
 
   void ModifyRst2Init();
-  void ModifyInit2Rtr(const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr,
+  void ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
+                      const RdmaEndpointHandle& remote_handle, const ibv_port_attr& portAttr,
                       const ibv_device_attr_ex& deviceAttr);
   void ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
-                     const RdmaEndpointHandle& remote_handle);
+                     const RdmaEndpointHandle& remote_handle, uint32_t qpId = 0);
 
   void* GetSqAddress();
   void* GetMsntblAddress();
   void* GetRqAddress();
+
+  BnxtDeviceContext* GetDeviceContext() { return device_context; }
 
  private:
   void DestroyQueuePair();
 
  public:
   ibv_context* context;
+  BnxtDeviceContext* device_context;
 
  public:
   RdmaEndpointConfig config;
@@ -110,6 +120,13 @@ class BnxtQpContainer {
   void* qpUar{nullptr};
   void* qpUarPtr{nullptr};
   ibv_qp* qp{nullptr};
+
+  // Atomic internal buffer fields
+  void* atomicIbufAddr{nullptr};
+  size_t atomicIbufSize{0};
+  ibv_mr* atomicIbufMr{nullptr};
+
+  struct bnxt_re_dv_db_region_attr* dbrAttr{nullptr};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -121,8 +138,8 @@ class BnxtDeviceContext : public RdmaDeviceContext {
   ~BnxtDeviceContext();
 
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) override;
-  virtual void ConnectEndpoint(const RdmaEndpointHandle& local,
-                               const RdmaEndpointHandle& remote) override;
+  virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote,
+                               uint32_t qpId = 0) override;
 
  private:
   uint32_t pdn;
@@ -141,19 +158,3 @@ class BnxtDevice : public RdmaDevice {
 #endif  // ENABLE_BNXT
 }  // namespace application
 }  // namespace mori
-
-namespace std {
-#ifdef ENABLE_BNXT
-static std::ostream& operator<<(std::ostream& s, const bnxt_re_dv_qp_mem_info& m) {
-  std::stringstream ss;
-  ss << "qp_handle: 0x" << std::hex << m.qp_handle << std::dec << "  sq_va: 0x" << std::hex
-     << m.sq_va << std::dec << "  sq_len: " << m.sq_len << "  sq_slots: " << m.sq_slots
-     << "  sq_wqe_sz: " << m.sq_wqe_sz << "  sq_psn_sz: " << m.sq_psn_sz
-     << "  sq_npsn: " << m.sq_npsn << "  rq_va: 0x" << std::hex << m.rq_va << std::dec
-     << "  rq_len: " << m.rq_len << "  rq_slots: " << m.rq_slots << "  rq_wqe_sz: " << m.rq_wqe_sz
-     << "  comp_mask: 0x" << std::hex << m.comp_mask << std::dec;
-  s << ss.str();
-  return s;
-}
-#endif  // ENABLE_BNXT
-}  // namespace std

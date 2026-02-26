@@ -56,8 +56,7 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion mr) {
     int opcode =
         PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum, &epSend.cqHandle.consIdx);
     __threadfence_system();
-    UpdateCqDbrRecord<P>(epSend.cqHandle.dbrRecAddr, epSend.cqHandle.consIdx,
-                         epSend.cqHandle.cqeNum);
+    UpdateCqDbrRecord<P>(epSend.cqHandle, epSend.cqHandle.consIdx);
     // printf("round %d snd_opcode %d\n", i, opcode);
 
     raddr += i;
@@ -95,6 +94,11 @@ __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMe
         SendThreadKernel<ProviderType::BNXT>(epSend, mrRecv);
         break;
 #endif
+#ifdef ENABLE_IONIC
+      case ProviderType::PSD:
+        SendThreadKernel<ProviderType::PSD>(epSend, mrRecv);
+        break;
+#endif
       default:
         // unsupported provider
         break;
@@ -125,7 +129,7 @@ void LocalRdmaOps() {
   // 2 Create an endpoint
   RdmaEndpointConfig config;
   config.portId = devicePort.second;
-  config.gidIdx = 3;
+  // config.gidIdx = 3;
   config.maxMsgsNum = 1024;
   config.maxCqeNum = 1024;
   config.alignment = 4096;

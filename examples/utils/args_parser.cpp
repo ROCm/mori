@@ -146,6 +146,7 @@ void BenchmarkConfig::readArgs(int argc, char** argv) {
   int c;
   static struct option long_opts[] = {{"bidir", no_argument, 0, 0},
                                       {"report_msgrate", no_argument, 0, 0},
+                                      {"use_vmm", no_argument, 0, 0},
                                       {"dir", required_argument, 0, 0},
                                       {"issue", required_argument, 0, 0},
                                       {"help", no_argument, 0, 'h'},
@@ -161,10 +162,11 @@ void BenchmarkConfig::readArgs(int argc, char** argv) {
                                       {"scope", required_argument, 0, 's'},
                                       {"atomic_op", required_argument, 0, 'a'},
                                       {"stride", required_argument, 0, 'i'},
+                                      {"num_qp", required_argument, 0, 'q'},
                                       {0, 0, 0, 0}};
 
   int opt_idx = 0;
-  while ((c = getopt_long(argc, argv, "hb:e:f:n:w:c:t:d:o:s:a:i:", long_opts, &opt_idx)) != -1) {
+  while ((c = getopt_long(argc, argv, "hb:e:f:n:w:c:t:d:o:s:a:i:q:", long_opts, &opt_idx)) != -1) {
     switch (c) {
       case 'h':
         printf(
@@ -186,6 +188,7 @@ void BenchmarkConfig::readArgs(int argc, char** argv) {
             "xor>, compare_swap> \n"
             "--bidir: run bidirectional test \n"
             "--msgrate: report message rate (MMPs)\n"
+            "--use_vmm: use VMM (Virtual Memory Management) for buffer allocation \n"
             "--dir: <read, write> (whether to run put or get operations) \n"
             "--issue: <on_stream, host> (applicable in some host pt-to-pt tests) \n");
         exit(0);
@@ -195,6 +198,8 @@ void BenchmarkConfig::readArgs(int argc, char** argv) {
           bidirectional = true;
         else if (!strcmp(name, "report_msgrate"))
           report_msgrate = true;
+        else if (!strcmp(name, "use_vmm"))
+          use_vmm = true;
         else if (!strcmp(name, "dir"))
           dir = (!strcmp(optarg, "read") ? DirectionConfig{READ, "read"}
                                          : DirectionConfig{WRITE, "write"});
@@ -244,6 +249,9 @@ void BenchmarkConfig::readArgs(int argc, char** argv) {
       case 'a':
         atomicOpParse(optarg);
         break;
+      case 'q':
+        atolScaled(optarg, &num_qp);
+        break;
       case '?':
         if (optopt == 'c') {
           fprintf(stderr, "Option -%c requires an argument.\n", optopt);
@@ -269,14 +277,14 @@ void BenchmarkConfig::readArgs(int argc, char** argv) {
 
   printf("Runtime options after parsing command line arguments \n");
   printf(
-      "min_size: %zu, max_size: %zu, step_factor: %zu, iterations: %zu, "
+      "min_size: %zu, max_size: %zu, num_qp: %zu, step_factor: %zu, iterations: %zu, "
       "warmup iterations: %zu, number of ctas: %zu, threads per cta: %zu "
       "stride: %zu, datatype: %s, reduce_op: %s, threadgroup_scope: %s, "
       "atomic_op: %s, dir: %s, report_msgrate: %d, bidirectional: %d, "
-      "putget_issue: %s\n",
-      min_size, max_size, step_factor, iters, warmup_iters, num_blocks, threads_per_block, stride,
-      datatype.name.c_str(), reduce_op.name.c_str(), threadgroup_scope.name.c_str(),
-      test_amo.name.c_str(), dir.name.c_str(), report_msgrate, bidirectional,
+      "use_vmm: %d, putget_issue: %s\n",
+      min_size, max_size, num_qp, step_factor, iters, warmup_iters, num_blocks, threads_per_block,
+      stride, datatype.name.c_str(), reduce_op.name.c_str(), threadgroup_scope.name.c_str(),
+      test_amo.name.c_str(), dir.name.c_str(), report_msgrate, bidirectional, use_vmm,
       putget_issue.name.c_str());
   printf(
       "Note: Above is full list of options, any given test will use only a "

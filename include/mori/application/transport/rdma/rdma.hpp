@@ -25,6 +25,7 @@
 
 #include <cassert>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -51,6 +52,7 @@ enum class RdmaDeviceVendorId : uint32_t {
   Unknown = 0,
   Mellanox = 0x02c9,
   Broadcom = 0x14E4,
+  Pensando = 0x1dd8,
 };
 
 template <typename T>
@@ -67,12 +69,18 @@ RdmaDeviceVendorId ToRdmaDeviceVendorId(T v) {
 #define PAGESIZE uint32_t(sysconf(_SC_PAGE_SIZE))
 // #define OUTSTANDING_TABLE_SIZE (65536)
 
+// UDP sport configuration constants for multi-provider support
+static constexpr uint32_t RDMA_UDP_SPORT_ARRAY_SIZE = 4;
+
+// Atomic internal buffer configuration
+static constexpr size_t ATOMIC_IBUF_SLOT_SIZE = 8;  // Each atomic ibuf slot is 8 bytes
+
 /* -------------------------------------------------------------------------- */
 /*                             Rdma Data Structure                            */
 /* -------------------------------------------------------------------------- */
 struct RdmaEndpointConfig {
   uint32_t portId{1};
-  uint32_t gidIdx{3};  // TODO: auto detect?
+  int32_t gidIdx{-1};  // -1 means auto detect
   uint32_t maxMsgsNum{128};
   uint32_t maxCqeNum{128};
   uint32_t maxMsgSge{1};
@@ -80,7 +88,19 @@ struct RdmaEndpointConfig {
   bool onGpu{false};
   bool withCompChannel{false};
   bool enableSrq{false};
+  uint32_t atomicIbufSlots{512};  // Number of atomic internal buffer slots, each slot is 8B
 };
+
+struct GidSelectionResult {
+  int32_t gidIdx{-1};
+  union ibv_gid gid = {};
+  ibv_gid_type gidType{IBV_GID_TYPE_IB};
+  bool fromUser{false};
+  bool valid{false};
+};
+
+GidSelectionResult AutoSelectGidIndex(ibv_context* context, uint32_t portId,
+                                      const ibv_port_attr* portAttr, int32_t configuredGidIdx = -1);
 
 struct InfiniBandEndpointHandle {
   uint32_t lid{0};
@@ -92,10 +112,11 @@ struct InfiniBandEndpointHandle {
 struct EthernetEndpointHandle {
   uint8_t gid[16];
   uint8_t mac[ETHERNET_LL_SIZE];
+  int32_t gidIdx{-1};
 
   constexpr bool operator==(const EthernetEndpointHandle& rhs) const noexcept {
     return std::equal(std::begin(gid), std::end(gid), std::begin(rhs.gid)) &&
-           std::equal(std::begin(mac), std::end(mac), std::begin(rhs.mac));
+           std::equal(std::begin(mac), std::end(mac), std::begin(rhs.mac)) && gidIdx == rhs.gidIdx;
   }
 };
 
@@ -104,6 +125,7 @@ struct RdmaEndpointHandle {
   uint32_t psn{0};
   uint32_t qpn{0};
   uint32_t portId{0};
+  uint32_t maxSge{1};
   InfiniBandEndpointHandle ib;
   EthernetEndpointHandle eth;
 
@@ -125,6 +147,13 @@ struct WorkQueueAttrs {
   uint32_t offset{0};
 };
 
+struct RdmaMemoryRegion {
+  uintptr_t addr{0};
+  uint32_t lkey{0};
+  uint32_t rkey{0};
+  size_t length{0};
+};
+
 struct RdmaEndpoint {
   RdmaDeviceVendorId vendorId{RdmaDeviceVendorId::Unknown};
   RdmaEndpointHandle handle;
@@ -135,11 +164,16 @@ struct RdmaEndpoint {
   core::CompletionQueueHandle cqHandle;
   core::IBVerbsHandle ibvHandle;
 
+  // Atomic internal buffer (ibuf) - independent MR for atomic operations
+  core::IbufHandle atomicIbuf;
+
   __device__ __host__ core::ProviderType GetProviderType() {
     if (vendorId == RdmaDeviceVendorId::Mellanox) {
       return core::ProviderType::MLX5;
     } else if (vendorId == RdmaDeviceVendorId::Broadcom) {
       return core::ProviderType::BNXT;
+    } else if (vendorId == RdmaDeviceVendorId::Pensando) {
+      return core::ProviderType::PSD;
     } else {
       printf("unknown vendorId %d", vendorId);
       assert(false);
@@ -150,12 +184,18 @@ struct RdmaEndpoint {
 
 class RdmaDevice;
 
-struct RdmaMemoryRegion {
-  uintptr_t addr{0};
-  uint32_t lkey{0};
-  uint32_t rkey{0};
-  size_t length{0};
-};
+/* -------------------------------------------------------------------------- */
+/*                             Rdma Configurations                            */
+/* -------------------------------------------------------------------------- */
+
+std::optional<uint8_t> ReadRdmaServiceLevelEnv();
+std::optional<uint8_t> ReadRdmaTrafficClassEnv();
+std::optional<uint8_t> ReadIoServiceLevelEnv();
+std::optional<uint8_t> ReadIoTrafficClassEnv();
+bool ReadIoTrafficClassDisableEnv();
+
+bool ReadIbEnableRelaxedOrderingEnv();
+int MaybeAddRelaxedOrderingFlag(int accessFlag);
 
 /* -------------------------------------------------------------------------- */
 /*                              RdmaDeviceContext                             */
@@ -167,16 +207,20 @@ class RdmaDeviceContext {
 
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegion(void* ptr, size_t size,
                                                     int accessFlag = MR_DEFAULT_ACCESS_FLAG);
+  virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabuf(void* ptr, size_t size, int dmabuf_fd,
+                                                          int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual void DeregisterRdmaMemoryRegion(void* ptr);
 
   // TODO: query gid entry by ibv_query_gid_table
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) {
     assert(false && "not implemented");
+    return RdmaEndpoint();
   }
-  void ConnectEndpoint(const RdmaEndpoint& local, const RdmaEndpoint& remote) {
-    ConnectEndpoint(local.handle, remote.handle);
+  void ConnectEndpoint(const RdmaEndpoint& local, const RdmaEndpoint& remote, uint32_t qpId = 0) {
+    ConnectEndpoint(local.handle, remote.handle, qpId);
   }
-  virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote) {
+  virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote,
+                               uint32_t qpId = 0) {
     assert(false && "not implemented");
   }
 
@@ -184,11 +228,20 @@ class RdmaDeviceContext {
 
   RdmaDevice* GetRdmaDevice();
   ibv_context* GetIbvContext();
+  ibv_pd* GetIbvPd() { return pd; }
   ibv_srq* GetIbvSrq() { return srq; }
+
+  uint16_t GetUdpSport(uint32_t qpId) const;
 
  protected:
   ibv_pd* pd{nullptr};
   ibv_srq* srq{nullptr};
+  uint16_t qp_counter{0};
+  // Shared UDP sport configuration for all RDMA providers
+  uint16_t udp_sport_setting[RDMA_UDP_SPORT_ARRAY_SIZE];
+
+  // Initialize UDP sport configuration from environment variables
+  void InitializeUdpSportConfiguration();
 
  private:
   RdmaDevice* device;
@@ -273,6 +326,7 @@ static std::ostream& operator<<(std::ostream& s,
   for (int i = 0; i < sizeof(handle.mac); i++) {
     ss << int(handle.mac[i]);
   }
+  ss << ", gidIdx: " << std::dec << handle.gidIdx;
   s << ss.str();
   return s;
 }
