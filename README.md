@@ -2,9 +2,11 @@
 
 ## News
 
-- **[2025/12]** Added Ionic (Pollara) NIC support with multi-QP, FP8_E4M3FN, collapsed CQE, dual-UXDMA pipeline, and dynamic NIC selection ([#119](https://github.com/ROCm/mori/pull/119))
-- **[2025/09]** Added Broadcom BNXT (Thor2) IBGDA support with unified IBGDA interface across BNXT and MLX5 devices ([#64](https://github.com/ROCm/mori/pull/64))
-- **[2025/09]** EP-V1 dispatch & combine kernel optimization with up to 1.88x dispatch and 1.46x combine speedup ([#128](https://github.com/ROCm/mori/pull/128))
+- **[2026/02]** 🔥 MORI powers AMD's WideEP and PD disaggregation in SemiAnalysis InferenceX v2 benchmark ([PR](https://github.com/SemiAnalysisAI/InferenceX/pull/348), [InferenceX](https://inferencex.semianalysis.com/), [blog](https://newsletter.semianalysis.com/p/inferencex-v2-nvidia-blackwell-vs)).
+- **[2026/01]** 🔥 MORI-EP and MORI-IO integrated into SGLang and vLLM for MoE Expert Parallelism and PD Disaggregation on AMD GPUs ([sglang & MORI-EP](https://github.com/sgl-project/sglang/pull/14797), [sglang & MORI-IO](https://github.com/sgl-project/sglang/pull/14626), [vllm & MORI-EP](https://github.com/vllm-project/vllm/pull/28664), [vllm & MORI-IO](https://github.com/vllm-project/vllm/pull/29304)).
+- **[2025/12]** MORI adds support for AMD's AINIC (Pollara) with SOTA performance ([AINIC & MORI-EP](https://github.com/ROCm/mori/pull/119), [AINIC & MORI-IO](https://github.com/ROCm/mori/pull/113)).
+- **[2025/09]** MORI-EP now seamlessly scales to 64 GPUs with SOTA performance ([multiple optimizations](https://github.com/ROCm/mori/pull/128), [multi-QP support](https://github.com/ROCm/mori/pull/108), [low-latency kernel](https://github.com/ROCm/mori/pull/105)).
+- **[2025/09]** MORI adds Broadcom BNXT (Thor2) IBGDA support ([PR](https://github.com/ROCm/mori/pull/64)).
 
 ## Introduction
 
@@ -52,11 +54,11 @@ Benchmark result on DeepSeek V3 model configurations:
   </tr>
   <tr>
     <td>EP16-V1</td>
-    <td>208 GB/s</td><td>63 GB/s</td><td>161 GB/s</td><td>49 GB/s</td>
+    <td>171 GB/s</td><td>52 GB/s</td><td>219 GB/s</td><td>67 GB/s</td>
   </tr>
   <tr>
     <td>EP32-V1</td>
-    <td>103 GB/s</td><td>57 GB/s</td><td>91 GB/s</td><td>50 GB/s</td>
+    <td>103 GB/s*</td><td>57 GB/s*</td><td>91 GB/s*</td><td>50 GB/s*</td>
   </tr>
   <tr>
     <td rowspan="3">MI355X + AINIC</td>
@@ -93,11 +95,11 @@ Benchmark result on DeepSeek V3 model configurations:
   </tr>
   <tr>
     <td>EP16-V1-LL</td>
-    <td>115 us</td><td>63 GB/s</td><td>141 us</td><td>110 GB/s</td>
+    <td>76 us</td><td>96 GB/s</td><td>122 us</td><td>121 GB/s</td>
   </tr>
   <tr>
     <td>EP32-V1-LL</td>
-    <td>157 us</td><td>48 GB/s</td><td>280 us</td><td>55 GB/s</td>
+    <td>157 us*</td><td>48 GB/s*</td><td>280 us*</td><td>55 GB/s*</td>
   </tr>
   <tr>
     <td rowspan="3">MI355X + AINIC</td>
@@ -114,7 +116,7 @@ Benchmark result on DeepSeek V3 model configurations:
   </tr>
 </table>
 
-**NOTE**: We show best performance values measured from multiple test rounds to eliminate fluctuations.
+\* Stale data from previous kernel version; updated numbers pending re-benchmarking.
 
 ### MORI-IO
 
