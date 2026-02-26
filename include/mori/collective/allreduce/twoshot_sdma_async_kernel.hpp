@@ -156,12 +156,11 @@ __global__ void ReduceScatterLocalReduceKernel(T* gathered, size_t elementCountP
 // Requires: user data has been copied to input_transit_buffer (srcMemObj)
 // Result: reduced shard written to dstMemObj->localPtr at slot myPe
 //
-// Pipeline optimization: each thread processes UNROLL elements per
-// iteration. For each PE, all UNROLL loads are issued first (independent,
-// can be in-flight simultaneously), then accumulated. This overlaps
-// P2P loads with local computation across PEs and across elements.
+// Minimal register usage to maximize occupancy (wavefront count).
+// For P2P high-latency reads, the GPU's wavefront scheduler hides
+// latency better than explicit pipelining with high register pressure.
 // ============================================================
-template <typename T, int UNROLL = 4>
+template <typename T>
 __global__ void ReduceScatterP2pKernel(int myPe, int npes,
                                        const application::SymmMemObjPtr srcMemObj,
                                        const application::SymmMemObjPtr dstMemObj,
@@ -191,77 +190,15 @@ __global__ void ReduceScatterP2pKernel(int myPe, int npes,
       static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
   const size_t myStart = static_cast<size_t>(myPe) * packedPerRank;
 
-  const P* peers[8];
-  for (int pe = 0; pe < npes && pe < 8; pe++) {
-    peers[pe] = reinterpret_cast<const P*>(srcMemObj->peerPtrs[pe]);
-  }
-
-  // Main loop: explicit double-buffer pipeline
-  //
-  // buf[cur]  holds data loaded from the CURRENT PE (ready for compute)
-  // buf[next] receives data loaded from the NEXT PE (prefetch, overlaps with compute)
-  //
-  // Timeline per iteration:
-  //   1. Issue loads for PE k+1 into buf[next]  (P2P loads, non-blocking)
-  //   2. Accumulate PE k's data from buf[cur]   (ALU, overlaps with step 1)
-  //   3. Swap cur/next
-  //
-  size_t i = threadLinearId;
-  for (; i + (UNROLL - 1) * threadsPerGrid < packedPerRank;
-       i += threadsPerGrid * UNROLL) {
-    A acc[UNROLL];
-    P buf[2][UNROLL];
-    int cur = 0;
-
-    // Prefetch PE 0's data
-    #pragma unroll
-    for (int u = 0; u < UNROLL; u++) {
-      buf[0][u] = peers[0][myStart + i + u * threadsPerGrid];
+  for (size_t idx = threadLinearId; idx < packedPerRank; idx += threadsPerGrid) {
+    size_t globalIdx = myStart + idx;
+    const P* p0 = reinterpret_cast<const P*>(srcMemObj->peerPtrs[0]);
+    A add_reg = upcast_v<typename P::type, pack_size>(p0[globalIdx]);
+    for (int pe = 1; pe < npes; ++pe) {
+      const P* pp = reinterpret_cast<const P*>(srcMemObj->peerPtrs[pe]);
+      packed_assign_add(add_reg, upcast_v<typename P::type, pack_size>(pp[globalIdx]));
     }
-
-    for (int pe = 0; pe < npes; pe++) {
-      int next = 1 - cur;
-
-      // Step 1: prefetch NEXT PE's data (independent of current compute)
-      if (pe + 1 < npes) {
-        #pragma unroll
-        for (int u = 0; u < UNROLL; u++) {
-          buf[next][u] = peers[pe + 1][myStart + i + u * threadsPerGrid];
-        }
-      }
-
-      // Step 2: accumulate CURRENT PE's data (overlaps with step 1 loads)
-      if (pe == 0) {
-        #pragma unroll
-        for (int u = 0; u < UNROLL; u++) {
-          acc[u] = upcast_v<typename P::type, pack_size>(buf[cur][u]);
-        }
-      } else {
-        #pragma unroll
-        for (int u = 0; u < UNROLL; u++) {
-          packed_assign_add(acc[u], upcast_v<typename P::type, pack_size>(buf[cur][u]));
-        }
-      }
-
-      cur = next;
-    }
-
-    // Write results
-    #pragma unroll
-    for (int u = 0; u < UNROLL; u++) {
-      myDst[i + u * threadsPerGrid] =
-          downcast_v<typename P::type, pack_size>(acc[u]);
-    }
-  }
-
-  // Remainder elements (no pipeline)
-  for (; i < packedPerRank; i += threadsPerGrid) {
-    size_t globalIdx = myStart + i;
-    A acc = upcast_v<typename P::type, pack_size>(peers[0][globalIdx]);
-    for (int pe = 1; pe < npes; pe++) {
-      packed_assign_add(acc, upcast_v<typename P::type, pack_size>(peers[pe][globalIdx]));
-    }
-    myDst[i] = downcast_v<typename P::type, pack_size>(acc);
+    myDst[idx] = downcast_v<typename P::type, pack_size>(add_reg);
   }
 }
 
