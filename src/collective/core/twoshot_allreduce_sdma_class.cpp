@@ -32,297 +32,139 @@
 namespace mori {
 namespace collective {
 
-// Constructor implementation - delegating version
+// ---------------------------------------------------------------------------
+// Delegating constructor
+// ---------------------------------------------------------------------------
 template <typename T>
 AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t transit_buffer_size,
-                                bool copy_output_to_user, bool use_graph_mode)
-    : AllreduceSdma(myPe, npes, transit_buffer_size / 2, transit_buffer_size / 2,
-                    copy_output_to_user, use_graph_mode) {
+                                bool copy_output_to_user, bool /*use_graph_mode*/)
+    : AllreduceSdma(myPe, npes, 0, transit_buffer_size,
+                    copy_output_to_user, false) {
 }
 
-// Main constructor implementation
+// ---------------------------------------------------------------------------
+// Main constructor
+// ---------------------------------------------------------------------------
 template <typename T>
-AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size,
-                                size_t output_buffer_size, bool copy_output_to_user,
-                                bool use_graph_mode)
+AllreduceSdma<T>::AllreduceSdma(int myPe, int npes,
+                                size_t /*input_buffer_size*/,
+                                size_t output_buffer_size,
+                                bool copy_output_to_user,
+                                bool /*use_graph_mode*/)
     : myPe_(myPe),
       npes_(npes),
       dtype_size_(sizeof(T)),
+      max_blocks_(getDeviceMaxBlocks()),
       flags_(nullptr, ShmemDeleter()),
-      barrierSignalPtr_(nullptr, ShmemDeleter()),
-      input_transit_buffer_(nullptr),
-      input_transit_buffer_size_(input_buffer_size),
-      input_transit_buffer_ptr_(nullptr, ShmemDeleter()),
+      barrierPtr_(nullptr),
+      barrierMem_(nullptr, ShmemDeleter()),
       output_transit_buffer_(nullptr),
       output_transit_buffer_size_(output_buffer_size),
       output_transit_buffer_ptr_(nullptr, ShmemDeleter()),
-      copy_output_to_user_(copy_output_to_user),
-      use_graph_mode_(use_graph_mode) {
+      copy_output_to_user_(copy_output_to_user) {
 
-    // 1a. Allocate and initialize AllGather flags memory
+    // 1. Allocate SDMA completion flags
     size_t flagsSize = npes_ * sizeof(uint64_t);
     void* flags = shmem::ShmemMalloc(flagsSize);
-    if (flags == nullptr) {
-        throw std::runtime_error("Failed to allocate flags memory");
-    }
+    if (!flags) throw std::runtime_error("Failed to allocate flags memory");
     flags_.reset(static_cast<uint64_t*>(flags));
     memset(flags_.get(), 0, flagsSize);
     flagsObj_ = shmem::ShmemQueryMemObjPtr(flags_.get());
-    if (!flagsObj_.IsValid()) {
+    if (!flagsObj_.IsValid())
         throw std::runtime_error("Failed to get valid flags memory object");
-    }
 
-    // 1b. Allocate RSBarrierSignal for start_sync
-    size_t barrierSize = sizeof(RSBarrierSignal);
-    void* barrierMem = shmem::ShmemMalloc(barrierSize);
-    if (barrierMem == nullptr) {
-        throw std::runtime_error("Failed to allocate barrier signal memory");
-    }
-    barrierSignalPtr_.reset(barrierMem);
-    barrierSignalObj_ = shmem::ShmemSymmetricRegister(barrierMem, barrierSize);
-    if (!barrierSignalObj_.IsValid()) {
-        throw std::runtime_error("Failed to register barrier signal memory");
-    }
-    // Zero-init AFTER registration — ShmemSymmetricRegister is a collective
-    // that may modify the memory during IPC handle exchange.
-    hipError_t memset_err = hipMemset(barrierMem, 0, barrierSize);
-    if (memset_err != hipSuccess) {
-        throw std::runtime_error("Failed to zero-init barrier signal memory");
-    }
+    // 2. Allocate CrossPeBarrier (device-scope broadcast flag, ~128 bytes)
+    size_t barrierSize = sizeof(CrossPeBarrier);
+    void* bMem = shmem::ShmemMalloc(barrierSize);
+    if (!bMem) throw std::runtime_error("Failed to allocate barrier memory");
+    barrierMem_.reset(bMem);
+    barrierPtr_ = reinterpret_cast<CrossPeBarrier*>(bMem);
+    hipError_t me = hipMemset(bMem, 0, barrierSize);
+    if (me != hipSuccess)
+        throw std::runtime_error("Failed to zero-init barrier memory");
 
-    // 2. Allocate input transit buffer (srcMemObj) — skipped in graph mode
-    //    (graph mode registers user input directly on first call)
-    if (!use_graph_mode_) {
-        input_transit_buffer_ = shmem::ShmemMalloc(input_transit_buffer_size_);
-        if (input_transit_buffer_ == nullptr) {
-            throw std::runtime_error("Failed to allocate input transit buffer");
-        }
-        input_transit_buffer_ptr_.reset(input_transit_buffer_);
-
-        input_transit_buffer_obj_ = shmem::ShmemSymmetricRegister(input_transit_buffer_, input_transit_buffer_size_);
-        if (!input_transit_buffer_obj_.IsValid()) {
-            throw std::runtime_error("Failed to register input transit buffer");
-        }
-    }
-
-    // 3. Allocate output transit buffer (dstMemObj)
+    // 3. Allocate output transit buffer (gather + reduce + allgather)
     output_transit_buffer_ = shmem::ShmemMalloc(output_transit_buffer_size_);
-    if (output_transit_buffer_ == nullptr) {
+    if (!output_transit_buffer_)
         throw std::runtime_error("Failed to allocate output transit buffer");
-    }
     output_transit_buffer_ptr_.reset(output_transit_buffer_);
 
-    output_transit_buffer_obj_ = shmem::ShmemSymmetricRegister(output_transit_buffer_, output_transit_buffer_size_);
-    if (!output_transit_buffer_obj_.IsValid()) {
+    output_transit_buffer_obj_ =
+        shmem::ShmemSymmetricRegister(output_transit_buffer_,
+                                      output_transit_buffer_size_);
+    if (!output_transit_buffer_obj_.IsValid())
         throw std::runtime_error("Failed to register output transit buffer");
-    }
 
-    // 4. Print initialization information
-    printf("AllreduceSdma initialized: PE %d of %d, mode=%s\n",
-           myPe_, npes_, use_graph_mode_ ? "graph" : "eager");
-    printf("  Flags allocated: %zu bytes at %p\n", flagsSize, flags_.get());
-    printf("  Barrier signal: %zu bytes at %p\n", barrierSize, barrierMem);
-    if (!use_graph_mode_) {
-        printf("  Input transit buffer: %.2f MB at %p\n",
-               input_transit_buffer_size_ / (1024.0 * 1024.0), input_transit_buffer_);
-    } else {
-        printf("  Input transit buffer: (deferred — graph mode, registered on first call)\n");
-    }
+    printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n",
+           myPe_, npes_, max_blocks_);
+    printf("  Flags: %zu bytes at %p\n", flagsSize, flags_.get());
+    printf("  Barrier: %zu bytes at %p\n", barrierSize, bMem);
     printf("  Output transit buffer: %.2f MB at %p\n",
-           output_transit_buffer_size_ / (1024.0 * 1024.0), output_transit_buffer_);
+           output_transit_buffer_size_ / (1024.0 * 1024.0),
+           output_transit_buffer_);
 }
 
-// Destructor
+// ---------------------------------------------------------------------------
 template <typename T>
 AllreduceSdma<T>::~AllreduceSdma() {
-    // Memory is automatically managed by unique_ptr, ShmemDeleter will auto-free during destruction
     if (flags_) {
         printf("AllreduceSdma destroyed: PE %d\n", myPe_);
     }
 }
 
-// ensure_buffer_size implementation
+// ---------------------------------------------------------------------------
 template <typename T>
-bool AllreduceSdma<T>::ensure_buffer_size(void*& buffer,
-                                         std::unique_ptr<void, ShmemDeleter>& buffer_ptr,
-                                         size_t& current_size,
-                                         application::SymmMemObjPtr& buffer_obj,
-                                         size_t required_size,
-                                         const char* buffer_name) {
-    if (required_size <= current_size) {
-        return true;
-    }
-
-    // If buffer is not large enough, reallocate
-    printf("PE %d: %s too small: required %.2f MB, current %.2f MB\n",
-           myPe_, buffer_name,
-           required_size / (1024.0 * 1024.0),
-           current_size / (1024.0 * 1024.0));
-
-    // First release the old one
-    buffer_ptr.reset();
-
-    // Allocate new one
-    current_size = required_size;
-    buffer = shmem::ShmemMalloc(current_size);
-    if (buffer == nullptr) {
-        fprintf(stderr, "PE %d: Failed to reallocate %s of size %.2f MB\n",
-                myPe_, buffer_name, current_size / (1024.0 * 1024.0));
-        return false;
-    }
-    buffer_ptr.reset(buffer);
-
-    // Re-register
-    buffer_obj = shmem::ShmemSymmetricRegister(buffer, current_size);
-    if (!buffer_obj.IsValid()) {
-        fprintf(stderr, "PE %d: Failed to re-register %s\n", myPe_, buffer_name);
-        return false;
-    }
-
-    printf("PE %d: %s reallocated to %.2f MB\n",
-           myPe_, buffer_name, current_size / (1024.0 * 1024.0));
-    return true;
-}
-
-// copy_input_to_transit implementation
-template <typename T>
-void AllreduceSdma<T>::copy_input_to_transit(T* input, size_t total_count, hipStream_t stream) {
-    size_t input_bytes = total_count * dtype_size_;
-
-    // Verify pointer validity
-    if (input == nullptr) {
-        fprintf(stderr, "PE %d: Input pointer is null\n", myPe_);
-        throw std::runtime_error("Input pointer is null");
-    }
-
-    if (input_transit_buffer_ == nullptr) {
-        fprintf(stderr, "PE %d: Input transit buffer is null\n", myPe_);
-        throw std::runtime_error("Input transit buffer is null");
-    }
-
-    // Async D2D copy — no host sync needed; the start_sync barrier inside
-    // ReduceScatterKernel (launched on the same stream) will ensure all PEs'
-    // copies are visible before any cross-device reads.
-    hipError_t err = hipSuccess;
-    if (stream != nullptr) {
-        err = hipMemcpyAsync(input_transit_buffer_, input, input_bytes,
-                           hipMemcpyDeviceToDevice, stream);
-    } else {
-        err = hipMemcpy(input_transit_buffer_, input, input_bytes,
-                       hipMemcpyDeviceToDevice);
-    }
-
-    if (err != hipSuccess) {
-        fprintf(stderr, "PE %d: Failed to copy input to transit buffer: %s\n",
-                myPe_, hipGetErrorString(err));
-        throw std::runtime_error("Input copy failed");
-    }
-}
-
-// copy_output_to_user implementation
-// For AllReduce: output is total_count elements (same size as input, NOT npes * total_count)
-template <typename T>
-void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStream_t stream) {
-    size_t output_bytes = total_count * dtype_size_;
-
-    // Verify pointer validity
-    if (output == nullptr) {
-        fprintf(stderr, "PE %d: Output pointer is null\n", myPe_);
-        throw std::runtime_error("Output pointer is null");
-    }
-
-    if (output_transit_buffer_ == nullptr) {
-        fprintf(stderr, "PE %d: Output transit buffer is null\n", myPe_);
+void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count,
+                                            hipStream_t stream) {
+    size_t bytes = total_count * dtype_size_;
+    if (!output)  throw std::runtime_error("Output pointer is null");
+    if (!output_transit_buffer_)
         throw std::runtime_error("Output transit buffer is null");
-    }
 
-    // Copy from output transit buffer to user output buffer
-    // Only the first total_count elements are valid result data
-    hipError_t err = hipSuccess;
-    if (stream != nullptr) {
-        err = hipMemcpyAsync(output, output_transit_buffer_, output_bytes,
-                           hipMemcpyDeviceToDevice, stream);
-    } else {
-        err = hipMemcpy(output, output_transit_buffer_, output_bytes,
-                       hipMemcpyDeviceToDevice);
-    }
-
+    hipError_t err = stream
+        ? hipMemcpyAsync(output, output_transit_buffer_, bytes,
+                         hipMemcpyDeviceToDevice, stream)
+        : hipMemcpy(output, output_transit_buffer_, bytes,
+                    hipMemcpyDeviceToDevice);
     if (err != hipSuccess) {
-        fprintf(stderr, "PE %d: Failed to copy from transit buffer to output: %s\n",
+        fprintf(stderr, "PE %d: copy_output_to_user failed: %s\n",
                 myPe_, hipGetErrorString(err));
         throw std::runtime_error("Output copy failed");
     }
 }
 
-// ensure_graph_input_registered: register user input as symmetric memory, with
-// multi-address caching.  Returns true if registration succeeded (or was cached).
-// On success, the caller can obtain the SymmMemObjPtr from graph_input_cache_[ptr].
+// ---------------------------------------------------------------------------
+// operator()
+// ---------------------------------------------------------------------------
 template <typename T>
-bool AllreduceSdma<T>::ensure_graph_input_registered(T* input, size_t input_bytes) {
-    void* ptr = reinterpret_cast<void*>(input);
-    auto it = graph_input_cache_.find(ptr);
-    if (it != graph_input_cache_.end() && input_bytes <= it->second.size) {
-        return true;
-    }
-
-    auto obj = shmem::ShmemSymmetricRegister(ptr, input_bytes);
-    if (!obj.IsValid()) {
-        fprintf(stderr, "PE %d: Failed to register graph input (%p, %zu bytes)\n",
-                myPe_, ptr, input_bytes);
-        return false;
-    }
-    graph_input_cache_[ptr] = {input_bytes, obj};
-
-    printf("PE %d: Graph input registered: %p, %.2f MB (cache size: %zu)\n",
-           myPe_, ptr, input_bytes / (1024.0 * 1024.0), graph_input_cache_.size());
-    return true;
-}
-
-// operator() implementation
-// Returns true on success, false on failure
-// Synchronization must be done by caller
-template <typename T>
-bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
+bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count,
+                                  hipStream_t stream) {
     try {
-        const size_t input_bytes = total_count * dtype_size_;
-        application::SymmMemObjPtr src_obj;
-
-        // Step 1: Prepare source symmetric memory
-        if (use_graph_mode_) {
-            if (!ensure_graph_input_registered(input, input_bytes)) {
-                return false;
-            }
-            src_obj = graph_input_cache_[reinterpret_cast<void*>(input)].obj;
-        } else {
-            copy_input_to_transit(input, total_count, stream);
-            src_obj = input_transit_buffer_obj_;
-        }
-
-        // Step 2: ReduceScatter — each rank reduces its partition via direct reads
+        // Step 1: SdmaReduceScatter — SDMA scatter + local reduce
         constexpr int pack_size = packed_t<T>::P::size;
-        constexpr int kMaxBlocks = 80;
         int threads = 512;
-        int packedSize = static_cast<int>(total_count) / pack_size;
-        int threadsPerRank = threads / npes_;
-        int partSize = packedSize / npes_;
-        int blocks = std::min(kMaxBlocks, (partSize + threadsPerRank - 1) / threadsPerRank);
+        int packedPerRank = static_cast<int>(
+            ((total_count / npes_ + pack_size - 1) / pack_size));
+        int blocks = std::min(max_blocks_,
+                              (packedPerRank + threads - 1) / threads);
         if (blocks < 1) blocks = 1;
 
-        ReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(
+        SdmaReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(
             myPe_, npes_,
-            src_obj,
+            input,
             output_transit_buffer_obj_,
-            barrierSignalObj_,
+            flagsObj_,
+            barrierPtr_,
             total_count);
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess) {
-            fprintf(stderr, "PE %d: ReduceScatter kernel launch failed: %s\n",
+            fprintf(stderr, "PE %d: SdmaReduceScatter launch failed: %s\n",
                     myPe_, hipGetErrorString(err));
             return false;
         }
 
-        // Step 3: AllGather via SDMA — broadcast reduced shards to all ranks
+        // Step 2: AllGather via SDMA
         AllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
             output_transit_buffer_obj_,
@@ -330,38 +172,27 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
 
         err = hipGetLastError();
         if (err != hipSuccess) {
-            fprintf(stderr, "PE %d: AllGather kernel launch failed: %s\n",
+            fprintf(stderr, "PE %d: AllGather launch failed: %s\n",
                     myPe_, hipGetErrorString(err));
             return false;
         }
 
-        // Step 4: Copy output to user buffer
-        // Graph mode always skips this (user reads output_transit_buffer directly).
-        // Eager mode respects copy_output_to_user_ flag.
-        if (!use_graph_mode_ && copy_output_to_user_) {
+        // Step 3: Copy result to user buffer
+        if (copy_output_to_user_) {
             copy_output_to_user(output, total_count, stream);
         }
 
     } catch (const std::exception& e) {
-        fprintf(stderr, "PE %d: AllReduce operation failed: %s\n", myPe_, e.what());
+        fprintf(stderr, "PE %d: AllReduce failed: %s\n", myPe_, e.what());
         return false;
     }
-
     return true;
 }
 
-// allreduce_inplace implementation
+// ---------------------------------------------------------------------------
 template <typename T>
-bool AllreduceSdma<T>::allreduce_inplace(T* data, size_t total_count, hipStream_t stream) {
-    if (use_graph_mode_) {
-        // Graph mode: operator() skips copy_output, so we run it then manually copy back.
-        bool ok = (*this)(data, data, total_count, stream);
-        if (ok) {
-            copy_output_to_user(data, total_count, stream);
-        }
-        return ok;
-    }
-    // Eager mode: temporarily force copy-back regardless of copy_output_to_user_ setting.
+bool AllreduceSdma<T>::allreduce_inplace(T* data, size_t total_count,
+                                          hipStream_t stream) {
     bool saved = copy_output_to_user_;
     copy_output_to_user_ = true;
     bool ok = (*this)(data, data, total_count, stream);
@@ -369,16 +200,17 @@ bool AllreduceSdma<T>::allreduce_inplace(T* data, size_t total_count, hipStream_
     return ok;
 }
 
-// resetFlags implementation
+// ---------------------------------------------------------------------------
 template <typename T>
 void AllreduceSdma<T>::resetFlags() {
     if (flags_) {
-        size_t flagsSize = npes_ * sizeof(uint64_t);
-        memset(flags_.get(), 0, flagsSize);
+        memset(flags_.get(), 0, npes_ * sizeof(uint64_t));
     }
 }
 
-// Explicit instantiation of common types
+// ---------------------------------------------------------------------------
+// Explicit instantiations
+// ---------------------------------------------------------------------------
 template class AllreduceSdma<uint32_t>;
 template class AllreduceSdma<uint64_t>;
 template class AllreduceSdma<int32_t>;

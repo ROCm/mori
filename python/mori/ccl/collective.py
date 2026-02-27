@@ -299,17 +299,13 @@ class AllreduceSdma:
                                 If False, user should directly use output_transit_buffer via get_output_transit_buffer()
             dtype: Data type for the allreduce operation (default torch.uint32).
                    Supported: torch.uint32, torch.int32, torch.float16, torch.bfloat16
-            mode: "eager" (default) or "graph". Graph mode registers user input directly
-                  and always skips copy_output_to_user for higher performance.
+            mode: Kept for backward compatibility — ignored.  SDMA transport
+                  reads the user input directly; no eager/graph distinction.
         """
         self.my_pe = my_pe
         self.npes = npes
         self.dtype = dtype
         self.mode = mode
-
-        if mode not in ("eager", "graph"):
-            raise ValueError(f"mode must be 'eager' or 'graph', got '{mode}'")
-        use_graph_mode = (mode == "graph")
 
         handle_name = self._HANDLE_MAP.get(dtype)
         if handle_name is None:
@@ -320,13 +316,13 @@ class AllreduceSdma:
 
         if input_buffer_size is not None and output_buffer_size is not None:
             self._handle = handle_class(my_pe, npes, input_buffer_size, output_buffer_size,
-                                        copy_output_to_user, use_graph_mode)
+                                        copy_output_to_user)
         elif transit_buffer_size is not None:
             self._handle = handle_class(my_pe, npes, transit_buffer_size,
-                                        copy_output_to_user, use_graph_mode)
+                                        copy_output_to_user)
         else:
             self._handle = handle_class(my_pe, npes, 512 * 1024 * 1024,
-                                        copy_output_to_user, use_graph_mode)
+                                        copy_output_to_user)
 
     def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
         """Execute out-of-place AllReduce SDMA operation.
