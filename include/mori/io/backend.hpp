@@ -85,7 +85,8 @@ struct TcpBackendConfig : public BackendConfig {
   TcpBackendConfig() : BackendConfig(BackendType::TCP) {}
   TcpBackendConfig(int numIoThreads_, int sockSndbufBytes_, int sockRcvbufBytes_, int opTimeoutMs_,
                    bool enableKeepalive_, int keepaliveIdleSec_, int keepaliveIntvlSec_,
-                   int keepaliveCnt_, bool enableCtrlNodelay_, bool enableDataNodelay_)
+                   int keepaliveCnt_, bool enableCtrlNodelay_, bool enableDataNodelay_,
+                   int numDataConns_, int stripingThresholdBytes_)
       : BackendConfig(BackendType::TCP),
         numIoThreads(numIoThreads_),
         sockSndbufBytes(sockSndbufBytes_),
@@ -96,7 +97,9 @@ struct TcpBackendConfig : public BackendConfig {
         keepaliveIntvlSec(keepaliveIntvlSec_),
         keepaliveCnt(keepaliveCnt_),
         enableCtrlNodelay(enableCtrlNodelay_),
-        enableDataNodelay(enableDataNodelay_) {}
+        enableDataNodelay(enableDataNodelay_),
+        numDataConns(numDataConns_),
+        stripingThresholdBytes(stripingThresholdBytes_) {}
 
   int numIoThreads{1};
 
@@ -112,6 +115,12 @@ struct TcpBackendConfig : public BackendConfig {
 
   bool enableCtrlNodelay{true};
   bool enableDataNodelay{false};
+
+  // Number of parallel DATA TCP connections per peer (iperf-like multi-stream striping).
+  // Effective only when peer has >= numDataConns established and transfer is contiguous.
+  int numDataConns{4};
+  // Stripe large contiguous transfers; keep small transfers on a single stream for latency.
+  int stripingThresholdBytes{256 * 1024};
 };
 
 inline std::ostream& operator<<(std::ostream& os, const TcpBackendConfig& c) {
@@ -120,7 +129,9 @@ inline std::ostream& operator<<(std::ostream& os, const TcpBackendConfig& c) {
             << "] enableKeepalive[" << c.enableKeepalive << "] keepaliveIdleSec["
             << c.keepaliveIdleSec << "] keepaliveIntvlSec[" << c.keepaliveIntvlSec
             << "] keepaliveCnt[" << c.keepaliveCnt << "] enableCtrlNodelay["
-            << c.enableCtrlNodelay << "] enableDataNodelay[" << c.enableDataNodelay << "]";
+            << c.enableCtrlNodelay << "] enableDataNodelay[" << c.enableDataNodelay
+            << "] numDataConns[" << c.numDataConns << "] stripingThresholdBytes["
+            << c.stripingThresholdBytes << "]";
 }
 
 /* ---------------------------------------------------------------------------------------------- */

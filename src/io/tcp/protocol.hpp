@@ -36,7 +36,7 @@ namespace tcp {
 
 constexpr uint32_t kCtrlMagic = 0x4D544330;  // "MTC0"
 constexpr uint32_t kDataMagic = 0x4D544430;  // "MTD0"
-constexpr uint16_t kProtoVersion = 1;
+constexpr uint16_t kProtoVersion = 2;
 
 enum class Channel : uint8_t { CTRL = 1, DATA = 2 };
 
@@ -198,33 +198,36 @@ inline std::vector<uint8_t> BuildCompletion(uint64_t opId, uint32_t statusCode,
 }
 
 inline std::vector<uint8_t> BuildWriteReq(uint64_t opId, uint32_t remoteMemId, uint64_t remoteOff,
-                                          uint64_t size) {
+                                          uint64_t size, uint8_t lanesTotal = 1) {
   std::vector<uint8_t> body;
-  body.reserve(8 + 4 + 8 + 8);
+  body.reserve(8 + 4 + 8 + 8 + 1);
   AppendU64BE(body, opId);
   AppendU32BE(body, remoteMemId);
   AppendU64BE(body, remoteOff);
   AppendU64BE(body, size);
+  AppendU8(body, lanesTotal);
   return BuildCtrlFrame(CtrlMsgType::WRITE_REQ, body);
 }
 
 inline std::vector<uint8_t> BuildReadReq(uint64_t opId, uint32_t srcMemId, uint64_t srcOff,
-                                         uint64_t size) {
+                                         uint64_t size, uint8_t lanesTotal = 1) {
   std::vector<uint8_t> body;
-  body.reserve(8 + 4 + 8 + 8);
+  body.reserve(8 + 4 + 8 + 8 + 1);
   AppendU64BE(body, opId);
   AppendU32BE(body, srcMemId);
   AppendU64BE(body, srcOff);
   AppendU64BE(body, size);
+  AppendU8(body, lanesTotal);
   return BuildCtrlFrame(CtrlMsgType::READ_REQ, body);
 }
 
 inline std::vector<uint8_t> BuildBatchWriteReq(uint64_t opId, uint32_t remoteMemId,
                                                const std::vector<uint64_t>& remoteOffs,
-                                               const std::vector<uint64_t>& sizes) {
+                                               const std::vector<uint64_t>& sizes,
+                                               uint8_t lanesTotal = 1) {
   std::vector<uint8_t> body;
   const uint32_t n = static_cast<uint32_t>(sizes.size());
-  body.reserve(8 + 4 + 4 + n * (8 + 8));
+  body.reserve(8 + 4 + 4 + n * (8 + 8) + 1);
   AppendU64BE(body, opId);
   AppendU32BE(body, remoteMemId);
   AppendU32BE(body, n);
@@ -232,15 +235,17 @@ inline std::vector<uint8_t> BuildBatchWriteReq(uint64_t opId, uint32_t remoteMem
     AppendU64BE(body, remoteOffs[i]);
     AppendU64BE(body, sizes[i]);
   }
+  AppendU8(body, lanesTotal);
   return BuildCtrlFrame(CtrlMsgType::BATCH_WRITE_REQ, body);
 }
 
 inline std::vector<uint8_t> BuildBatchReadReq(uint64_t opId, uint32_t srcMemId,
                                               const std::vector<uint64_t>& srcOffs,
-                                              const std::vector<uint64_t>& sizes) {
+                                              const std::vector<uint64_t>& sizes,
+                                              uint8_t lanesTotal = 1) {
   std::vector<uint8_t> body;
   const uint32_t n = static_cast<uint32_t>(sizes.size());
-  body.reserve(8 + 4 + 4 + n * (8 + 8));
+  body.reserve(8 + 4 + 4 + n * (8 + 8) + 1);
   AppendU64BE(body, opId);
   AppendU32BE(body, srcMemId);
   AppendU32BE(body, n);
@@ -248,6 +253,7 @@ inline std::vector<uint8_t> BuildBatchReadReq(uint64_t opId, uint32_t srcMemId,
     AppendU64BE(body, srcOffs[i]);
     AppendU64BE(body, sizes[i]);
   }
+  AppendU8(body, lanesTotal);
   return BuildCtrlFrame(CtrlMsgType::BATCH_READ_REQ, body);
 }
 
@@ -265,4 +271,3 @@ inline std::vector<uint8_t> BuildDataHeader(uint64_t opId, uint64_t payloadLen, 
 }  // namespace tcp
 }  // namespace io
 }  // namespace mori
-
