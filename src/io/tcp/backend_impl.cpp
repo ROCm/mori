@@ -778,6 +778,8 @@ class TcpTransport {
 	      return;
 	    }
 	    link.dataFds.push_back(c->fd);
+	    MORI_IO_TRACE("TCP: peer {} DATA conn up {}/{}", c->peerKey.c_str(), link.dataFds.size(),
+	                  want);
 	  }
 
 	  void MaybeDispatchQueuedOps(const EngineKey& peerKey) {
@@ -1038,6 +1040,8 @@ class TcpTransport {
       lanesTotal = static_cast<uint8_t>(std::min<size_t>(static_cast<size_t>(wantLanes), dataFds.size()));
     }
     st->lanesTotal = lanesTotal;
+    MORI_IO_TRACE("TCP: op {} totalBytes={} dataConns={} lanesTotal={}", st->id, totalBytes,
+                  dataFds.size(), static_cast<uint32_t>(lanesTotal));
 
     if (st->isRead && st->local.loc == MemoryLocationType::GPU) {
       // Allocate a single pinned staging buffer for all lanes and do one H2D copy at the end.
