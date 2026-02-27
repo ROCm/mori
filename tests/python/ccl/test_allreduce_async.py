@@ -67,6 +67,9 @@ def _test_allreduce_async(rank, world_size, port, elems, iterations, warmup):
         exec_times = []
         total_iters = warmup + iterations
 
+        ev_start = torch.cuda.Event(enable_timing=True)
+        ev_end = torch.cuda.Event(enable_timing=True)
+
         if rank == 0:
             print(f"\nUsing ASYNC mode (start_async + wait_async)")
             if warmup > 0:
@@ -79,8 +82,12 @@ def _test_allreduce_async(rank, world_size, port, elems, iterations, warmup):
 
             dist.barrier()
 
+            ev_start.record(stream)
             allreduce.start_async(input_tensor, output_tensor, elems, stream)
-            exec_time = allreduce.wait_async(stream)
+            allreduce.wait_async(stream)
+            ev_end.record(stream)
+            torch.cuda.synchronize()
+            exec_time = ev_start.elapsed_time(ev_end) / 1000.0
 
             if iter_idx >= warmup:
                 exec_times.append(exec_time)
