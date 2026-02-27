@@ -22,8 +22,6 @@
 #pragma once
 
 #include <assert.h>
-#include <mpi.h>
-
 #include <type_traits>
 
 #include "mori/application/application.hpp"
