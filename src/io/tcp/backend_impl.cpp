@@ -222,6 +222,53 @@ struct Segment {
   uint64_t len{0};
 };
 
+constexpr uint8_t kLaneBits = 3;  // up to 8 lanes
+constexpr uint64_t kLaneMask = (1ULL << kLaneBits) - 1ULL;
+
+inline uint64_t ToWireOpId(uint64_t userOpId, uint8_t lane) { return (userOpId << kLaneBits) | lane; }
+
+inline uint64_t ToUserOpId(uint64_t wireOpId) { return wireOpId >> kLaneBits; }
+
+struct LaneSpan {
+  uint64_t off{0};
+  uint64_t len{0};
+};
+
+inline LaneSpan ComputeLaneSpan(uint64_t total, uint8_t lanesTotal, uint8_t lane) {
+  if (lanesTotal <= 1) return LaneSpan{0, total};
+  const uint64_t base = total / lanesTotal;
+  const uint64_t rem = total % lanesTotal;
+  const uint64_t off = static_cast<uint64_t>(lane) * base + std::min<uint64_t>(lane, rem);
+  const uint64_t len = base + (lane < rem ? 1 : 0);
+  return LaneSpan{off, len};
+}
+
+inline uint8_t LanesAllMask(uint8_t lanesTotal) {
+  if (lanesTotal >= (1U << kLaneBits)) return 0xFF;
+  return static_cast<uint8_t>((1U << lanesTotal) - 1U);
+}
+
+inline std::vector<Segment> SliceSegments(const std::vector<Segment>& segs, uint64_t start,
+                                          uint64_t len) {
+  std::vector<Segment> out;
+  if (len == 0) return out;
+  uint64_t skip = start;
+  uint64_t remaining = len;
+  for (const auto& s : segs) {
+    if (remaining == 0) break;
+    if (skip >= s.len) {
+      skip -= s.len;
+      continue;
+    }
+    const uint64_t segOff = s.off + skip;
+    const uint64_t take = std::min<uint64_t>(s.len - skip, remaining);
+    out.push_back({segOff, take});
+    remaining -= take;
+    skip = 0;
+  }
+  return out;
+}
+
 inline bool IsSingleContiguousSpan(const std::vector<Segment>& segs, uint64_t* outOff,
                                    uint64_t* outLen) {
   if (!outOff || !outLen) return false;
@@ -263,10 +310,13 @@ struct OutboundOpState {
   uint64_t expectedRxBytes{0};
   uint64_t rxBytes{0};
   bool completionReceived{false};
-  StatusCode completionCode{StatusCode::INIT};
+  uint8_t lanesTotal{1};
+  uint8_t lanesDoneMask{0};
+  StatusCode completionCode{StatusCode::SUCCESS};
   std::string completionMsg;
 
   bool gpuCopyPending{false};
+  std::shared_ptr<PinnedBuf> pinned;
 
   Clock::time_point startTs{Clock::now()};
 };
@@ -279,17 +329,30 @@ struct InboundWriteState {
   std::vector<Segment> dstSegs;
 
   bool discard{false};
+  uint8_t lanesTotal{1};
+  uint8_t lanesDoneMask{0};
+  std::shared_ptr<PinnedBuf> pinned;
 };
 
-struct EarlyWriteState {
+struct EarlyWriteLaneState {
   uint64_t payloadLen{0};
   std::shared_ptr<PinnedBuf> pinned;
   bool complete{false};
 };
 
+struct EarlyWriteState {
+  std::unordered_map<uint8_t, EarlyWriteLaneState> lanes;
+};
+
+enum class DataRxKind : uint8_t { NONE = 0, INBOUND_WRITE = 1, OUTBOUND_READ = 2, EARLY_WRITE = 3 };
+
 struct ActiveDataRx {
   bool active{false};
   TransferUniqueId id{0};
+  uint8_t lane{0};
+  uint64_t laneOff{0};
+  uint64_t laneLen{0};
+  DataRxKind kind{DataRxKind::NONE};
   uint64_t remaining{0};
 
   bool discard{false};
@@ -356,9 +419,18 @@ struct Connection {
 
 struct PeerLinks {
   int ctrlFd{-1};
-  int dataFd{-1};
+  std::vector<int> dataFds;
+  int ctrlPending{0};
+  int dataPending{0};
+  size_t rr{0};
   bool CtrlUp() const { return ctrlFd >= 0; }
-  bool DataUp() const { return dataFd >= 0; }
+  bool DataUp() const { return !dataFds.empty(); }
+  int PickDataFd() {
+    if (dataFds.empty()) return -1;
+    int fd = dataFds[rr % dataFds.size()];
+    rr = (rr + 1) % dataFds.size();
+    return fd;
+  }
 };
 
 }  // namespace
@@ -538,10 +610,10 @@ class TcpTransport {
     localSegs.reserve(n);
     remoteSegs.reserve(n);
 
-    uint64_t total = 0;
-    for (size_t i = 0; i < n; ++i) {
-      const size_t lo = localOffsets[i];
-      const size_t ro = remoteOffsets[i];
+	    uint64_t total = 0;
+	    for (size_t i = 0; i < n; ++i) {
+	      const size_t lo = localOffsets[i];
+	      const size_t ro = remoteOffsets[i];
       const size_t sz = sizes[i];
       if (sz == 0) continue;
       if ((lo + sz) > local.size || (ro + sz) > remote.size) {
@@ -549,12 +621,41 @@ class TcpTransport {
         return;
       }
       localSegs.push_back({static_cast<uint64_t>(lo), static_cast<uint64_t>(sz)});
-      remoteSegs.push_back({static_cast<uint64_t>(ro), static_cast<uint64_t>(sz)});
-      total += static_cast<uint64_t>(sz);
-    }
+	      remoteSegs.push_back({static_cast<uint64_t>(ro), static_cast<uint64_t>(sz)});
+	      total += static_cast<uint64_t>(sz);
+	    }
 
-    auto op = std::make_unique<OutboundOpState>();
-    op->peer = remote.engineKey;
+	    // Coalesce adjacent segments when both local and remote are contiguous in lockstep.
+	    // This is critical for TCP performance (reduces iov/copy fan-out), and preserves semantics.
+	    if (localSegs.size() > 1) {
+	      std::vector<Segment> newLocal;
+	      std::vector<Segment> newRemote;
+	      newLocal.reserve(localSegs.size());
+	      newRemote.reserve(remoteSegs.size());
+	      Segment curL = localSegs[0];
+	      Segment curR = remoteSegs[0];
+	      for (size_t i = 1; i < localSegs.size(); ++i) {
+	        const Segment& l = localSegs[i];
+	        const Segment& r = remoteSegs[i];
+	        if ((curL.off + curL.len == l.off) && (curR.off + curR.len == r.off) && (curL.len == curR.len) &&
+	            (l.len == r.len)) {
+	          curL.len += l.len;
+	          curR.len += r.len;
+	        } else {
+	          newLocal.push_back(curL);
+	          newRemote.push_back(curR);
+	          curL = l;
+	          curR = r;
+	        }
+	      }
+	      newLocal.push_back(curL);
+	      newRemote.push_back(curR);
+	      localSegs = std::move(newLocal);
+	      remoteSegs = std::move(newRemote);
+	    }
+
+	    auto op = std::make_unique<OutboundOpState>();
+	    op->peer = remote.engineKey;
     op->id = id;
     op->isRead = isRead;
     op->status = status;
@@ -607,14 +708,24 @@ class TcpTransport {
 
   bool PreferOutgoingFor(const EngineKey& peerKey) const { return myEngKey < peerKey; }
 
-  void AssignConnToPeer(Connection* c) {
-    assert(c && c->helloReceived);
-    PeerLinks& link = peers[c->peerKey];
-    const bool preferOutgoing = PreferOutgoingFor(c->peerKey);
+	  void AssignConnToPeer(Connection* c) {
+	    assert(c && c->helloReceived);
+	    PeerLinks& link = peers[c->peerKey];
+	    const bool preferOutgoing = PreferOutgoingFor(c->peerKey);
+	    const bool wasOutgoing = c->isOutgoing;
+	    const tcp::Channel ch = c->ch;
 
-    auto replace_if_needed = [&](int& slotFd) {
-      if (slotFd < 0) {
-        slotFd = c->fd;
+	    if (wasOutgoing) {
+	      if (ch == tcp::Channel::CTRL) {
+	        if (link.ctrlPending > 0) link.ctrlPending--;
+	      } else {
+	        if (link.dataPending > 0) link.dataPending--;
+	      }
+	    }
+
+	    auto replace_if_needed = [&](int& slotFd) {
+	      if (slotFd < 0) {
+	        slotFd = c->fd;
         return;
       }
       // Collision: choose deterministically by key + direction so both sides keep the same TCP conn.
@@ -638,26 +749,49 @@ class TcpTransport {
         CloseConnInternal(c);
         conns.erase(newFd);
       }
-    };
+	    };
 
-    if (c->ch == tcp::Channel::CTRL) {
-      replace_if_needed(link.ctrlFd);
-    } else {
-      replace_if_needed(link.dataFd);
-    }
-  }
+	    if (ch == tcp::Channel::CTRL) {
+	      replace_if_needed(link.ctrlFd);
+	      return;
+	    }
 
-  void MaybeDispatchQueuedOps(const EngineKey& peerKey) {
-    auto it = peers.find(peerKey);
-    if (it == peers.end()) return;
-    if (!it->second.CtrlUp() || !it->second.DataUp()) return;
-    Connection* ctrl = conns[it->second.ctrlFd].get();
-    Connection* data = conns[it->second.dataFd].get();
-    if (!ctrl || !data) return;
-    if (!ctrl->helloReceived || !data->helloReceived) return;
+	    // DATA channel: keep up to numDataConns connections, choosing deterministically by key+direction
+	    // so both sides converge to the same physical set.
+	    const bool keepPreferred = (preferOutgoing && c->isOutgoing) || (!preferOutgoing && !c->isOutgoing);
+	    if (!keepPreferred) {
+	      MORI_IO_TRACE("TCP: peer {} dropping non-preferred DATA fd {} outgoing={}", c->peerKey,
+	                    c->fd, c->isOutgoing);
+	      const int fd = c->fd;
+	      CloseConnInternal(c);
+	      conns.erase(fd);
+	      return;
+	    }
 
-    auto qit = waitingOps.find(peerKey);
-    if (qit == waitingOps.end()) return;
+	    const size_t want = static_cast<size_t>(std::max(1, config.numDataConns));
+	    if (link.dataFds.size() >= want) {
+	      MORI_IO_TRACE("TCP: peer {} dropping extra DATA fd {} (have {} want {})", c->peerKey, c->fd,
+	                    link.dataFds.size(), want);
+	      const int fd = c->fd;
+	      CloseConnInternal(c);
+	      conns.erase(fd);
+	      return;
+	    }
+	    link.dataFds.push_back(c->fd);
+	  }
+
+	  void MaybeDispatchQueuedOps(const EngineKey& peerKey) {
+	    auto it = peers.find(peerKey);
+	    if (it == peers.end()) return;
+	    if (!it->second.CtrlUp() || !it->second.DataUp()) return;
+	    Connection* ctrl = conns[it->second.ctrlFd].get();
+	    if (!ctrl || !ctrl->helloReceived) return;
+	    int dataFd = it->second.dataFds.empty() ? -1 : it->second.dataFds[0];
+	    Connection* data = (dataFd >= 0) ? conns[dataFd].get() : nullptr;
+	    if (!data || !data->helloReceived) return;
+
+	    auto qit = waitingOps.find(peerKey);
+	    if (qit == waitingOps.end()) return;
 
     auto ops = std::move(qit->second);
     waitingOps.erase(qit);
@@ -667,11 +801,15 @@ class TcpTransport {
     }
   }
 
-  void EnsurePeerChannels(const EngineKey& peerKey) {
-    PeerLinks& link = peers[peerKey];
-    if (!link.CtrlUp()) ConnectChannel(peerKey, tcp::Channel::CTRL);
-    if (!link.DataUp()) ConnectChannel(peerKey, tcp::Channel::DATA);
-  }
+	  void EnsurePeerChannels(const EngineKey& peerKey) {
+	    PeerLinks& link = peers[peerKey];
+	    if (!link.CtrlUp() && link.ctrlPending == 0) ConnectChannel(peerKey, tcp::Channel::CTRL);
+
+	    const int want = std::max(1, config.numDataConns);
+	    while (static_cast<int>(link.dataFds.size()) + link.dataPending < want) {
+	      ConnectChannel(peerKey, tcp::Channel::DATA);
+	    }
+	  }
 
   void ConnectChannel(const EngineKey& peerKey, tcp::Channel ch) {
     EngineDesc desc;
@@ -738,14 +876,23 @@ class TcpTransport {
       ConfigureDataSocket(fd, config);
     }
 
-    const bool wantWrite = connecting || !conn->sendq.empty();
-    AddEpoll(fd, true, wantWrite);
-    conns[fd] = std::move(conn);
+	    const bool wantWrite = connecting || !conn->sendq.empty();
+	    AddEpoll(fd, true, wantWrite);
+	    conns[fd] = std::move(conn);
 
-    if (!connecting) {
-      QueueHello(fd);
-      ModEpoll(fd, true, true);
-    }
+	    // Track pending outgoing connections so we don't over-connect when many ops are submitted
+	    // before handshake completes.
+	    PeerLinks& link = peers[peerKey];
+	    if (ch == tcp::Channel::CTRL) {
+	      link.ctrlPending++;
+	    } else {
+	      link.dataPending++;
+	    }
+
+	    if (!connecting) {
+	      QueueHello(fd);
+	      ModEpoll(fd, true, true);
+	    }
   }
 
   void QueueHello(int fd) {
@@ -821,8 +968,14 @@ class TcpTransport {
     if (it == peers.end()) return false;
     if (!it->second.CtrlUp() || !it->second.DataUp()) return false;
     Connection* ctrl = conns[it->second.ctrlFd].get();
-    Connection* data = conns[it->second.dataFd].get();
-    return ctrl && data && ctrl->helloReceived && data->helloReceived;
+    if (!ctrl || !ctrl->helloReceived) return false;
+    for (int fd : it->second.dataFds) {
+      auto cit = conns.find(fd);
+      if (cit == conns.end()) continue;
+      Connection* data = cit->second.get();
+      if (data && data->helloReceived) return true;
+    }
+    return false;
   }
 
   void DispatchOp(std::unique_ptr<OutboundOpState> op) {
@@ -837,8 +990,21 @@ class TcpTransport {
       return;
     }
     Connection* ctrl = conns[it->second.ctrlFd].get();
-    Connection* data = conns[it->second.dataFd].get();
-    if (!ctrl || !data) {
+    if (!ctrl) {
+      op->status->Update(StatusCode::ERR_BAD_STATE, "TCP: peer ctrl connection missing");
+      return;
+    }
+
+    std::vector<int> dataFds;
+    dataFds.reserve(it->second.dataFds.size());
+    for (int fd : it->second.dataFds) {
+      auto dit = conns.find(fd);
+      if (dit == conns.end()) continue;
+      Connection* c = dit->second.get();
+      if (c && c->helloReceived) dataFds.push_back(fd);
+    }
+
+    if (dataFds.empty()) {
       op->status->Update(StatusCode::ERR_BAD_STATE, "TCP: peer connection missing");
       return;
     }
@@ -860,15 +1026,38 @@ class TcpTransport {
     MORI_IO_TRACE("TCP: dispatch op id={} peer={} isRead={} segs={}", st->id, peerKey.c_str(),
                   st->isRead, st->localSegs.size());
 
+    const uint64_t totalBytes = SumLens(st->localSegs);
+    int wantLanes = std::max(1, config.numDataConns);
+    wantLanes = std::min<int>(wantLanes, (1U << kLaneBits));
+    uint8_t lanesTotal = 1;
+    const bool canStripe = (wantLanes > 1) && (config.stripingThresholdBytes > 0) &&
+                           (totalBytes >= static_cast<uint64_t>(config.stripingThresholdBytes)) &&
+                           (st->localSegs.size() == 1) && (st->remoteSegs.size() == 1) &&
+                           (dataFds.size() >= 2);
+    if (canStripe) {
+      lanesTotal = static_cast<uint8_t>(std::min<size_t>(static_cast<size_t>(wantLanes), dataFds.size()));
+    }
+    st->lanesTotal = lanesTotal;
+
+    if (st->isRead && st->local.loc == MemoryLocationType::GPU) {
+      // Allocate a single pinned staging buffer for all lanes and do one H2D copy at the end.
+      st->pinned = staging.Acquire(static_cast<size_t>(totalBytes));
+      if (!st->pinned) {
+        st->status->Update(StatusCode::ERR_BAD_STATE, "TCP: failed to allocate pinned staging (read)");
+        pendingOutbound.erase(opId);
+        return;
+      }
+    }
+
     // CTRL request
     std::vector<uint8_t> ctrlFrame;
     if (st->localSegs.size() == 1) {
       if (st->isRead) {
-        ctrlFrame =
-            tcp::BuildReadReq(st->id, st->remote.id, st->remoteSegs[0].off, st->remoteSegs[0].len);
+        ctrlFrame = tcp::BuildReadReq(st->id, st->remote.id, st->remoteSegs[0].off,
+                                      st->remoteSegs[0].len, lanesTotal);
       } else {
-        ctrlFrame =
-            tcp::BuildWriteReq(st->id, st->remote.id, st->remoteSegs[0].off, st->remoteSegs[0].len);
+        ctrlFrame = tcp::BuildWriteReq(st->id, st->remote.id, st->remoteSegs[0].off,
+                                       st->remoteSegs[0].len, lanesTotal);
       }
     } else {
       std::vector<uint64_t> roffs;
@@ -880,9 +1069,9 @@ class TcpTransport {
         szs.push_back(s.len);
       }
       if (st->isRead) {
-        ctrlFrame = tcp::BuildBatchReadReq(st->id, st->remote.id, roffs, szs);
+        ctrlFrame = tcp::BuildBatchReadReq(st->id, st->remote.id, roffs, szs, lanesTotal);
       } else {
-        ctrlFrame = tcp::BuildBatchWriteReq(st->id, st->remote.id, roffs, szs);
+        ctrlFrame = tcp::BuildBatchWriteReq(st->id, st->remote.id, roffs, szs, lanesTotal);
       }
     }
 
@@ -890,11 +1079,10 @@ class TcpTransport {
 
     // DATA payload (writes only)
     if (!st->isRead) {
-      QueueDataSendForWrite(data, *st);
+      QueueDataSendForWrite(peerKey, dataFds, *st);
     }
 
     UpdateWriteInterest(ctrl->fd);
-    UpdateWriteInterest(data->fd);
   }
 
   void QueueSend(int fd, std::vector<uint8_t> bytes, std::function<void()> onDone = nullptr) {
@@ -909,25 +1097,72 @@ class TcpTransport {
     c->sendq.push_back(std::move(item));
   }
 
-  void QueueDataSendForWrite(Connection* data, OutboundOpState& st) {
+  void QueueDataSendForWrite(const EngineKey& peerKey, const std::vector<int>& dataFds,
+                             OutboundOpState& st) {
+    if (dataFds.empty()) return;
     const uint64_t total = SumLens(st.localSegs);
-    auto hdr = tcp::BuildDataHeader(st.id, total, 0);
+    const uint8_t lanesTotal = std::max<uint8_t>(1, st.lanesTotal);
 
-    if (st.local.loc == MemoryLocationType::GPU) {
-      QueueGpuToNetSend(data, st.local, st.localSegs, std::move(hdr), /*onDone*/ nullptr);
+    // Unstriped path (can handle iov fan-out).
+    if (lanesTotal == 1) {
+      auto hdr = tcp::BuildDataHeader(ToWireOpId(st.id, 0), total, 0);
+      const int fd = dataFds[0];
+      Connection* data = conns[fd].get();
+      if (!data) return;
+
+      if (st.local.loc == MemoryLocationType::GPU) {
+        QueueGpuToNetSend(data, st.local, st.localSegs, std::move(hdr), /*onDone*/ nullptr);
+        UpdateWriteInterest(fd);
+        return;
+      }
+
+      SendItem item;
+      item.header = std::move(hdr);
+      item.iov.reserve(1 + st.localSegs.size());
+      item.iov.push_back({item.header.data(), item.header.size()});
+
+      uint8_t* base = reinterpret_cast<uint8_t*>(st.local.data);
+      for (const auto& s : st.localSegs) {
+        item.iov.push_back({base + s.off, static_cast<size_t>(s.len)});
+      }
+      data->sendq.push_back(std::move(item));
+      UpdateWriteInterest(fd);
       return;
     }
 
-    SendItem item;
-    item.header = std::move(hdr);
-    item.iov.reserve(1 + st.localSegs.size());
-    item.iov.push_back({item.header.data(), item.header.size()});
-
-    uint8_t* base = reinterpret_cast<uint8_t*>(st.local.data);
-    for (const auto& s : st.localSegs) {
-      item.iov.push_back({base + s.off, static_cast<size_t>(s.len)});
+    // Striped path: requires a single contiguous span.
+    if (st.localSegs.size() != 1) {
+      MORI_IO_WARN("TCP: striping requested but localSegs.size={} (expected 1), fallback to 1 lane",
+                   st.localSegs.size());
+      st.lanesTotal = 1;
+      QueueDataSendForWrite(peerKey, dataFds, st);
+      return;
     }
-    data->sendq.push_back(std::move(item));
+
+    const uint8_t useLanes = std::min<uint8_t>(lanesTotal, static_cast<uint8_t>(dataFds.size()));
+
+    if (st.local.loc == MemoryLocationType::GPU) {
+      QueueGpuToNetSendStriped(peerKey, dataFds, st.id, useLanes, st.local, st.localSegs);
+      return;
+    }
+
+    uint8_t* base = reinterpret_cast<uint8_t*>(st.local.data) + st.localSegs[0].off;
+    for (uint8_t lane = 0; lane < useLanes; ++lane) {
+      const LaneSpan span = ComputeLaneSpan(total, useLanes, lane);
+      const int fd = dataFds[lane % dataFds.size()];
+      Connection* data = conns[fd].get();
+      if (!data) continue;
+
+      SendItem item;
+      item.header = tcp::BuildDataHeader(ToWireOpId(st.id, lane), span.len, 0);
+      item.iov.resize(2);
+      item.iov[0].iov_base = item.header.data();
+      item.iov[0].iov_len = item.header.size();
+      item.iov[1].iov_base = base + span.off;
+      item.iov[1].iov_len = static_cast<size_t>(span.len);
+      data->sendq.push_back(std::move(item));
+      UpdateWriteInterest(fd);
+    }
   }
 
   void QueueGpuToNetSend(Connection* data, const MemoryDesc& src, const std::vector<Segment>& srcSegs,
@@ -978,6 +1213,127 @@ class TcpTransport {
                           item.onDone = std::move(onDone);
                           c->sendq.push_back(std::move(item));
                           UpdateWriteInterest(dataFd);
+                        }});
+  }
+
+  void QueueGpuToNetSendStriped(const EngineKey& peerKey, const std::vector<int>& dataFds,
+                                uint64_t userOpId, uint8_t lanesTotal, const MemoryDesc& src,
+                                const std::vector<Segment>& srcSegs) {
+    (void)peerKey;
+    if (dataFds.empty()) return;
+    const uint64_t total = SumLens(srcSegs);
+    auto pinned = staging.Acquire(static_cast<size_t>(total));
+    if (!pinned) {
+      MORI_IO_ERROR("TCP: failed to allocate pinned staging for GPU send");
+      return;
+    }
+
+    hipStream_t stream = streamPool.GetNextStream(src.deviceId);
+    hipEvent_t ev = eventPool.GetEvent(src.deviceId);
+    if (stream == nullptr || ev == nullptr) {
+      MORI_IO_ERROR("TCP: failed to get HIP stream/event for GPU send");
+      if (ev) eventPool.PutEvent(ev, src.deviceId);
+      return;
+    }
+
+    HIP_RUNTIME_CHECK(hipSetDevice(src.deviceId));
+    uint8_t* dst = reinterpret_cast<uint8_t*>(pinned->ptr);
+    uint64_t spanOff = 0;
+    uint64_t spanLen = 0;
+    if (IsSingleContiguousSpan(srcSegs, &spanOff, &spanLen) && spanLen == total) {
+      hipDeviceptr_t gpuPtr = reinterpret_cast<hipDeviceptr_t>(src.data + spanOff);
+      HIP_RUNTIME_CHECK(hipMemcpyDtoHAsync(dst, gpuPtr, static_cast<size_t>(total), stream));
+    } else {
+      uint64_t off = 0;
+      for (const auto& s : srcSegs) {
+        hipDeviceptr_t gpuPtr = reinterpret_cast<hipDeviceptr_t>(src.data + s.off);
+        HIP_RUNTIME_CHECK(hipMemcpyDtoHAsync(dst + off, gpuPtr, static_cast<size_t>(s.len), stream));
+        off += s.len;
+      }
+    }
+    HIP_RUNTIME_CHECK(hipEventRecord(ev, stream));
+
+    gpuTasks.push_back({src.deviceId, ev,
+                        [this, dataFds, pinned, userOpId, lanesTotal, total]() mutable {
+                          for (uint8_t lane = 0; lane < lanesTotal; ++lane) {
+                            const LaneSpan span = ComputeLaneSpan(total, lanesTotal, lane);
+                            const int fd = dataFds[lane % dataFds.size()];
+                            Connection* c = conns[fd].get();
+                            if (!c || c->fd < 0) continue;
+                            SendItem item;
+                            item.header = tcp::BuildDataHeader(ToWireOpId(userOpId, lane), span.len, 0);
+                            item.iov.resize(2);
+                            item.iov[0].iov_base = item.header.data();
+                            item.iov[0].iov_len = item.header.size();
+                            item.iov[1].iov_base =
+                                static_cast<uint8_t*>(pinned->ptr) + static_cast<size_t>(span.off);
+                            item.iov[1].iov_len = static_cast<size_t>(span.len);
+                            item.keepalive = pinned;
+                            c->sendq.push_back(std::move(item));
+                            UpdateWriteInterest(fd);
+                          }
+                        }});
+  }
+
+  void QueueGpuToNetSendStripedWithOnDone(const EngineKey& peerKey, const std::vector<int>& dataFds,
+                                         uint64_t userOpId, uint8_t lanesTotal, const MemoryDesc& src,
+                                         const std::vector<Segment>& srcSegs,
+                                         std::function<void()> onLaneDone) {
+    (void)peerKey;
+    if (dataFds.empty()) return;
+    const uint64_t total = SumLens(srcSegs);
+    auto pinned = staging.Acquire(static_cast<size_t>(total));
+    if (!pinned) {
+      MORI_IO_ERROR("TCP: failed to allocate pinned staging for GPU send (striped)");
+      return;
+    }
+
+    hipStream_t stream = streamPool.GetNextStream(src.deviceId);
+    hipEvent_t ev = eventPool.GetEvent(src.deviceId);
+    if (stream == nullptr || ev == nullptr) {
+      MORI_IO_ERROR("TCP: failed to get HIP stream/event for GPU send (striped)");
+      if (ev) eventPool.PutEvent(ev, src.deviceId);
+      return;
+    }
+
+    HIP_RUNTIME_CHECK(hipSetDevice(src.deviceId));
+    uint8_t* dst = reinterpret_cast<uint8_t*>(pinned->ptr);
+    uint64_t spanOff = 0;
+    uint64_t spanLen = 0;
+    if (IsSingleContiguousSpan(srcSegs, &spanOff, &spanLen) && spanLen == total) {
+      hipDeviceptr_t gpuPtr = reinterpret_cast<hipDeviceptr_t>(src.data + spanOff);
+      HIP_RUNTIME_CHECK(hipMemcpyDtoHAsync(dst, gpuPtr, static_cast<size_t>(total), stream));
+    } else {
+      uint64_t off = 0;
+      for (const auto& s : srcSegs) {
+        hipDeviceptr_t gpuPtr = reinterpret_cast<hipDeviceptr_t>(src.data + s.off);
+        HIP_RUNTIME_CHECK(hipMemcpyDtoHAsync(dst + off, gpuPtr, static_cast<size_t>(s.len), stream));
+        off += s.len;
+      }
+    }
+    HIP_RUNTIME_CHECK(hipEventRecord(ev, stream));
+
+    gpuTasks.push_back({src.deviceId, ev, [this, dataFds, pinned, userOpId, lanesTotal, total,
+                                          onLaneDone = std::move(onLaneDone)]() mutable {
+                          for (uint8_t lane = 0; lane < lanesTotal; ++lane) {
+                            const LaneSpan span = ComputeLaneSpan(total, lanesTotal, lane);
+                            const int fd = dataFds[lane % dataFds.size()];
+                            Connection* c = conns[fd].get();
+                            if (!c || c->fd < 0) continue;
+                            SendItem item;
+                            item.header =
+                                tcp::BuildDataHeader(ToWireOpId(userOpId, lane), span.len, 0);
+                            item.iov.resize(2);
+                            item.iov[0].iov_base = item.header.data();
+                            item.iov[0].iov_len = item.header.size();
+                            item.iov[1].iov_base =
+                                static_cast<uint8_t*>(pinned->ptr) + static_cast<size_t>(span.off);
+                            item.iov[1].iov_len = static_cast<size_t>(span.len);
+                            item.keepalive = pinned;
+                            item.onDone = onLaneDone;
+                            c->sendq.push_back(std::move(item));
+                            UpdateWriteInterest(fd);
+                          }
                         }});
   }
 
@@ -1077,43 +1433,42 @@ class TcpTransport {
 
   void ClosePeerByFd(int fd) {
     MORI_IO_TRACE("TCP: close fd={}", fd);
-    // Find which peer+channel this fd belongs to, close both channels and fail pending ops.
+    // Find which peer+channel this fd belongs to, close all channels and fail pending ops.
     EngineKey peer{};
     for (auto& kv : peers) {
-      if (kv.second.ctrlFd == fd || kv.second.dataFd == fd) {
+      if (kv.second.ctrlFd == fd) {
         peer = kv.first;
         break;
       }
+      for (int dfd : kv.second.dataFds) {
+        if (dfd == fd) {
+          peer = kv.first;
+          break;
+        }
+      }
+      if (!peer.empty()) break;
     }
 
-    Connection* c = conns[fd].get();
-    if (c) {
-      CloseConnInternal(c);
-      conns.erase(fd);
-    }
+    auto close_fd = [&](int toClose) {
+      if (toClose < 0) return;
+      auto it = conns.find(toClose);
+      if (it == conns.end()) return;
+      CloseConnInternal(it->second.get());
+      conns.erase(it);
+    };
 
     if (!peer.empty()) {
-      PeerLinks& link = peers[peer];
-      if (link.ctrlFd >= 0) {
-        Connection* cc = conns[link.ctrlFd].get();
-        if (cc) {
-          CloseConnInternal(cc);
-          conns.erase(link.ctrlFd);
-        }
-        link.ctrlFd = -1;
-      }
-      if (link.dataFd >= 0) {
-        Connection* dc = conns[link.dataFd].get();
-        if (dc) {
-          CloseConnInternal(dc);
-          conns.erase(link.dataFd);
-        }
-        link.dataFd = -1;
-      }
+      auto link = peers[peer];
+      close_fd(link.ctrlFd);
+      for (int dfd : link.dataFds) close_fd(dfd);
       peers.erase(peer);
 
       FailPendingOpsForPeer(peer, "TCP: connection lost");
+      return;
     }
+
+    // Unknown fd: close just this connection.
+    close_fd(fd);
   }
 
   void FailPendingOpsForPeer(const EngineKey& peer, const std::string& msg) {
@@ -1274,98 +1629,174 @@ class TcpTransport {
     auto it = peers.find(peer);
     if (it == peers.end()) return nullptr;
     if (!it->second.DataUp()) return nullptr;
-    return conns[it->second.dataFd].get();
+    const int fd = it->second.dataFds.empty() ? -1 : it->second.dataFds[0];
+    if (fd < 0) return nullptr;
+    return conns[fd].get();
   }
 
-  void FinalizeBufferedWrite(const EngineKey& peer, TransferUniqueId opId, InboundWriteState ws,
-                             uint64_t payloadLen, const std::shared_ptr<PinnedBuf>& pinned) {
+  static uint8_t ClampLanesTotal(uint8_t lanesTotal) {
+    if (lanesTotal == 0) return 1;
+    const uint8_t max = static_cast<uint8_t>(1U << kLaneBits);
+    return std::min<uint8_t>(lanesTotal, max);
+  }
+
+  void MaybeFinalizeInboundWrite(const EngineKey& peer, TransferUniqueId opId) {
+    auto iwPeerIt = inboundWrites.find(peer);
+    if (iwPeerIt == inboundWrites.end()) return;
+    auto wsIt = iwPeerIt->second.find(opId);
+    if (wsIt == iwPeerIt->second.end()) return;
+
+    InboundWriteState& ws = wsIt->second;
+    ws.lanesTotal = ClampLanesTotal(ws.lanesTotal);
+    const uint8_t allMask = LanesAllMask(ws.lanesTotal);
+    if ((ws.lanesDoneMask & allMask) != allMask) return;
+
     auto ctrl = PeerCtrl(peer);
-    if (!ctrl) return;
+    if (!ctrl) {
+      // Peer is gone; drop state.
+      iwPeerIt->second.erase(wsIt);
+      if (iwPeerIt->second.empty()) inboundWrites.erase(iwPeerIt);
+      return;
+    }
 
     if (ws.discard) {
-      QueueSend(ctrl->fd, tcp::BuildCompletion(opId, static_cast<uint32_t>(StatusCode::ERR_INVALID_ARGS),
-                                               "TCP: write discarded"));
+      QueueSend(ctrl->fd,
+                tcp::BuildCompletion(opId, static_cast<uint32_t>(StatusCode::ERR_INVALID_ARGS),
+                                     "TCP: write discarded"));
       UpdateWriteInterest(ctrl->fd);
       RecordInboundStatus(peer, opId, StatusCode::ERR_INVALID_ARGS, "TCP: write discarded");
-      return;
-    }
-    if (!pinned) {
-      QueueSend(ctrl->fd, tcp::BuildCompletion(opId, static_cast<uint32_t>(StatusCode::ERR_BAD_STATE),
-                                               "TCP: missing pinned staging (early write)"));
-      UpdateWriteInterest(ctrl->fd);
-      RecordInboundStatus(peer, opId, StatusCode::ERR_BAD_STATE, "TCP: missing pinned staging");
-      return;
-    }
-
-    const uint64_t expected = SumLens(ws.dstSegs);
-    if (expected != payloadLen) {
-      QueueSend(ctrl->fd, tcp::BuildCompletion(opId, static_cast<uint32_t>(StatusCode::ERR_BAD_STATE),
-                                               "TCP: early payload length mismatch"));
-      UpdateWriteInterest(ctrl->fd);
-      RecordInboundStatus(peer, opId, StatusCode::ERR_BAD_STATE, "TCP: early payload length mismatch");
-      return;
-    }
-
-    if (ws.dst.loc == MemoryLocationType::GPU) {
-      hipStream_t stream = streamPool.GetNextStream(ws.dst.deviceId);
-      hipEvent_t ev = eventPool.GetEvent(ws.dst.deviceId);
-      if (stream == nullptr || ev == nullptr) {
-        QueueSend(ctrl->fd, tcp::BuildCompletion(opId, static_cast<uint32_t>(StatusCode::ERR_BAD_STATE),
-                                                 "TCP: failed to get HIP stream/event"));
+    } else if (ws.dst.loc == MemoryLocationType::GPU) {
+      if (!ws.pinned) {
+        QueueSend(ctrl->fd,
+                  tcp::BuildCompletion(opId, static_cast<uint32_t>(StatusCode::ERR_BAD_STATE),
+                                       "TCP: missing pinned staging (write)"));
         UpdateWriteInterest(ctrl->fd);
-        RecordInboundStatus(peer, opId, StatusCode::ERR_BAD_STATE, "TCP: failed to get HIP stream/event");
-        if (ev) eventPool.PutEvent(ev, ws.dst.deviceId);
-        return;
-      }
-
-      HIP_RUNTIME_CHECK(hipSetDevice(ws.dst.deviceId));
-      uint8_t* src = reinterpret_cast<uint8_t*>(pinned->ptr);
-      const uint64_t total = payloadLen;
-      uint64_t spanOff = 0;
-      uint64_t spanLen = 0;
-      if (IsSingleContiguousSpan(ws.dstSegs, &spanOff, &spanLen) && spanLen == total) {
-        void* gpuPtr = reinterpret_cast<void*>(ws.dst.data + spanOff);
-        HIP_RUNTIME_CHECK(hipMemcpyHtoDAsync(gpuPtr, src, static_cast<size_t>(total), stream));
+        RecordInboundStatus(peer, opId, StatusCode::ERR_BAD_STATE, "TCP: missing pinned staging");
       } else {
-        uint64_t off = 0;
-        for (const auto& s : ws.dstSegs) {
-          void* gpuPtr = reinterpret_cast<void*>(ws.dst.data + s.off);
-          HIP_RUNTIME_CHECK(hipMemcpyHtoDAsync(gpuPtr, src + off, static_cast<size_t>(s.len), stream));
-          off += s.len;
+        hipStream_t stream = streamPool.GetNextStream(ws.dst.deviceId);
+        hipEvent_t ev = eventPool.GetEvent(ws.dst.deviceId);
+        if (stream == nullptr || ev == nullptr) {
+          QueueSend(ctrl->fd,
+                    tcp::BuildCompletion(opId, static_cast<uint32_t>(StatusCode::ERR_BAD_STATE),
+                                         "TCP: failed to get HIP stream/event"));
+          UpdateWriteInterest(ctrl->fd);
+          RecordInboundStatus(peer, opId, StatusCode::ERR_BAD_STATE,
+                              "TCP: failed to get HIP stream/event");
+          if (ev) eventPool.PutEvent(ev, ws.dst.deviceId);
+        } else {
+          HIP_RUNTIME_CHECK(hipSetDevice(ws.dst.deviceId));
+          uint8_t* src = reinterpret_cast<uint8_t*>(ws.pinned->ptr);
+          const uint64_t total = SumLens(ws.dstSegs);
+          uint64_t spanOff = 0;
+          uint64_t spanLen = 0;
+          if (IsSingleContiguousSpan(ws.dstSegs, &spanOff, &spanLen) && spanLen == total) {
+            void* gpuPtr = reinterpret_cast<void*>(ws.dst.data + spanOff);
+            HIP_RUNTIME_CHECK(hipMemcpyHtoDAsync(gpuPtr, src, static_cast<size_t>(total), stream));
+          } else {
+            uint64_t off = 0;
+            for (const auto& s : ws.dstSegs) {
+              void* gpuPtr = reinterpret_cast<void*>(ws.dst.data + s.off);
+              HIP_RUNTIME_CHECK(
+                  hipMemcpyHtoDAsync(gpuPtr, src + off, static_cast<size_t>(s.len), stream));
+              off += s.len;
+            }
+          }
+          HIP_RUNTIME_CHECK(hipEventRecord(ev, stream));
+
+          auto pinned = ws.pinned;
+          const int ctrlFd = ctrl->fd;
+          const int deviceId = ws.dst.deviceId;
+          gpuTasks.push_back({deviceId, ev, [this, peer, opId, ctrlFd, pinned]() {
+                                QueueSend(ctrlFd,
+                                          tcp::BuildCompletion(opId,
+                                                               static_cast<uint32_t>(StatusCode::SUCCESS),
+                                                               ""));
+                                UpdateWriteInterest(ctrlFd);
+                                RecordInboundStatus(peer, opId, StatusCode::SUCCESS, "");
+                              }});
         }
       }
-      HIP_RUNTIME_CHECK(hipEventRecord(ev, stream));
-
-      gpuTasks.push_back({ws.dst.deviceId, ev, [this, peer, opId, ctrlFd = ctrl->fd, pinned]() {
-                            QueueSend(ctrlFd,
-                                      tcp::BuildCompletion(opId,
-                                                           static_cast<uint32_t>(StatusCode::SUCCESS),
-                                                           ""));
-                            UpdateWriteInterest(ctrlFd);
-                            RecordInboundStatus(peer, opId, StatusCode::SUCCESS, "");
-                          }});
-      return;
-    }
-
-    // CPU destination.
-    uint8_t* src = reinterpret_cast<uint8_t*>(pinned->ptr);
-    uint8_t* dstBase = reinterpret_cast<uint8_t*>(ws.dst.data);
-    const uint64_t total = payloadLen;
-    uint64_t spanOff = 0;
-    uint64_t spanLen = 0;
-    if (IsSingleContiguousSpan(ws.dstSegs, &spanOff, &spanLen) && spanLen == total) {
-      std::memcpy(dstBase + spanOff, src, static_cast<size_t>(total));
     } else {
-      uint64_t off = 0;
-      for (const auto& s : ws.dstSegs) {
-        std::memcpy(dstBase + s.off, src + off, static_cast<size_t>(s.len));
-        off += s.len;
-      }
+      QueueSend(ctrl->fd,
+                tcp::BuildCompletion(opId, static_cast<uint32_t>(StatusCode::SUCCESS), ""));
+      UpdateWriteInterest(ctrl->fd);
+      RecordInboundStatus(peer, opId, StatusCode::SUCCESS, "");
     }
 
-    QueueSend(ctrl->fd, tcp::BuildCompletion(opId, static_cast<uint32_t>(StatusCode::SUCCESS), ""));
-    UpdateWriteInterest(ctrl->fd);
-    RecordInboundStatus(peer, opId, StatusCode::SUCCESS, "");
+    // Cleanup state.
+    iwPeerIt->second.erase(wsIt);
+    if (iwPeerIt->second.empty()) inboundWrites.erase(iwPeerIt);
+    auto ewPeerIt = earlyWrites.find(peer);
+    if (ewPeerIt != earlyWrites.end()) {
+      ewPeerIt->second.erase(opId);
+      if (ewPeerIt->second.empty()) earlyWrites.erase(ewPeerIt);
+    }
+  }
+
+  void TryConsumeEarlyWriteLanes(const EngineKey& peer, TransferUniqueId opId) {
+    auto iwPeerIt = inboundWrites.find(peer);
+    if (iwPeerIt == inboundWrites.end()) return;
+    auto wsIt = iwPeerIt->second.find(opId);
+    if (wsIt == iwPeerIt->second.end()) return;
+    InboundWriteState& ws = wsIt->second;
+    ws.lanesTotal = ClampLanesTotal(ws.lanesTotal);
+
+    auto ewPeerIt = earlyWrites.find(peer);
+    if (ewPeerIt == earlyWrites.end()) return;
+    auto ewIt = ewPeerIt->second.find(opId);
+    if (ewIt == ewPeerIt->second.end()) return;
+
+    EarlyWriteState& early = ewIt->second;
+    const uint64_t total = SumLens(ws.dstSegs);
+    uint8_t* dstBase = reinterpret_cast<uint8_t*>(ws.dst.data);
+
+    for (auto it = early.lanes.begin(); it != early.lanes.end();) {
+      const uint8_t lane = it->first;
+      EarlyWriteLaneState& laneState = it->second;
+      if (!laneState.complete) {
+        ++it;
+        continue;
+      }
+
+      if (lane >= ws.lanesTotal) {
+        ws.discard = true;
+      }
+      const LaneSpan span = ComputeLaneSpan(total, ws.lanesTotal, lane);
+      if (span.len != laneState.payloadLen) {
+        ws.discard = true;
+      }
+
+      if (!ws.discard && laneState.pinned) {
+        uint8_t* src = reinterpret_cast<uint8_t*>(laneState.pinned->ptr);
+        if (ws.dst.loc == MemoryLocationType::GPU) {
+          if (!ws.pinned) {
+            ws.pinned = staging.Acquire(static_cast<size_t>(total));
+            if (!ws.pinned) ws.discard = true;
+          }
+          if (!ws.discard && ws.pinned) {
+            std::memcpy(reinterpret_cast<uint8_t*>(ws.pinned->ptr) + span.off, src,
+                        static_cast<size_t>(span.len));
+          }
+        } else {
+          const auto segs = SliceSegments(ws.dstSegs, span.off, span.len);
+          uint64_t copied = 0;
+          for (const auto& s : segs) {
+            std::memcpy(dstBase + s.off, src + copied, static_cast<size_t>(s.len));
+            copied += s.len;
+          }
+        }
+      }
+
+      if (lane < 8) ws.lanesDoneMask |= static_cast<uint8_t>(1U << lane);
+      it = early.lanes.erase(it);
+    }
+
+    if (early.lanes.empty()) {
+      ewPeerIt->second.erase(ewIt);
+      if (ewPeerIt->second.empty()) earlyWrites.erase(ewPeerIt);
+    }
+
+    MaybeFinalizeInboundWrite(peer, opId);
   }
 
   void HandleWriteReq(const EngineKey& peer, const uint8_t* body, size_t len) {
@@ -1380,10 +1811,17 @@ class TcpTransport {
       return;
     }
 
+    uint8_t lanesTotal = 1;
+    if (off < len) {
+      lanesTotal = body[off];
+    }
+    lanesTotal = ClampLanesTotal(lanesTotal);
+
     auto memOpt = LookupLocalMem(memId);
     InboundWriteState ws;
     ws.peer = peer;
     ws.id = opId;
+    ws.lanesTotal = lanesTotal;
     ws.discard = true;
 
     if (memOpt.has_value()) {
@@ -1394,25 +1832,14 @@ class TcpTransport {
       }
     }
 
-    auto ewPeerIt = earlyWrites.find(peer);
-    if (ewPeerIt != earlyWrites.end()) {
-      auto ewIt = ewPeerIt->second.find(opId);
-      if (ewIt != ewPeerIt->second.end()) {
-        EarlyWriteState early = std::move(ewIt->second);
-        ewPeerIt->second.erase(ewIt);
-        if (ewPeerIt->second.empty()) earlyWrites.erase(ewPeerIt);
-
-        if (early.complete) {
-          FinalizeBufferedWrite(peer, opId, std::move(ws), early.payloadLen, early.pinned);
-          return;
-        }
-        // Data is still in flight; keep the write state so data RX can finalize it.
-        inboundWrites[peer][opId] = std::move(ws);
-        return;
-      }
+    if (!ws.discard && ws.dst.loc == MemoryLocationType::GPU) {
+      const uint64_t total = SumLens(ws.dstSegs);
+      ws.pinned = staging.Acquire(static_cast<size_t>(total));
+      if (!ws.pinned) ws.discard = true;
     }
 
     inboundWrites[peer][opId] = std::move(ws);
+    TryConsumeEarlyWriteLanes(peer, opId);
   }
 
   void HandleBatchWriteReq(const EngineKey& peer, const uint8_t* body, size_t len) {
@@ -1432,40 +1859,36 @@ class TcpTransport {
     ws.id = opId;
     ws.discard = true;
 
-    if (memOpt.has_value()) {
-      ws.dst = memOpt.value();
-      ws.dstSegs.reserve(n);
-      bool ok = true;
-      for (uint32_t i = 0; i < n; ++i) {
-        uint64_t ro = 0, sz = 0;
-        if (!tcp::ReadU64BE(body, len, &off, &ro) || !tcp::ReadU64BE(body, len, &off, &sz)) {
-          ok = false;
-          break;
-        }
-        if (ro + sz > ws.dst.size) ok = false;
-        if (sz > 0) ws.dstSegs.push_back({ro, sz});
+    const bool haveMem = memOpt.has_value();
+    if (haveMem) ws.dst = memOpt.value();
+
+    ws.dstSegs.reserve(n);
+    bool ok = true;
+    for (uint32_t i = 0; i < n; ++i) {
+      uint64_t ro = 0, sz = 0;
+      if (!tcp::ReadU64BE(body, len, &off, &ro) || !tcp::ReadU64BE(body, len, &off, &sz)) {
+        ok = false;
+        break;
       }
-      if (ok) ws.discard = false;
+      if (haveMem && (ro + sz > ws.dst.size)) ok = false;
+      if (haveMem && sz > 0) ws.dstSegs.push_back({ro, sz});
     }
 
-    auto ewPeerIt = earlyWrites.find(peer);
-    if (ewPeerIt != earlyWrites.end()) {
-      auto ewIt = ewPeerIt->second.find(opId);
-      if (ewIt != ewPeerIt->second.end()) {
-        EarlyWriteState early = std::move(ewIt->second);
-        ewPeerIt->second.erase(ewIt);
-        if (ewPeerIt->second.empty()) earlyWrites.erase(ewPeerIt);
+    // `lanesTotal` is appended by the sender; tolerate older senders.
+    uint8_t lanesTotal = 1;
+    if (off < len) lanesTotal = body[off];
+    ws.lanesTotal = ClampLanesTotal(lanesTotal);
 
-        if (early.complete) {
-          FinalizeBufferedWrite(peer, opId, std::move(ws), early.payloadLen, early.pinned);
-          return;
-        }
-        inboundWrites[peer][opId] = std::move(ws);
-        return;
-      }
+    if (haveMem && ok) ws.discard = false;
+
+    if (!ws.discard && ws.dst.loc == MemoryLocationType::GPU) {
+      const uint64_t total = SumLens(ws.dstSegs);
+      ws.pinned = staging.Acquire(static_cast<size_t>(total));
+      if (!ws.pinned) ws.discard = true;
     }
 
     inboundWrites[peer][opId] = std::move(ws);
+    TryConsumeEarlyWriteLanes(peer, opId);
   }
 
   void HandleReadReq(const EngineKey& peer, const uint8_t* body, size_t len) {
@@ -1479,6 +1902,9 @@ class TcpTransport {
       MORI_IO_WARN("TCP: malformed READ_REQ");
       return;
     }
+    uint8_t lanesTotal = 1;
+    if (off < len) lanesTotal = body[off];
+    lanesTotal = ClampLanesTotal(lanesTotal);
 
     auto memOpt = LookupLocalMem(memId);
     if (!memOpt.has_value() || (srcOff + size > memOpt->size)) {
@@ -1495,7 +1921,7 @@ class TcpTransport {
 
     MemoryDesc src = memOpt.value();
     std::vector<Segment> segs = {{srcOff, size}};
-    QueueDataSendForRead(peer, opId, src, segs);
+    QueueDataSendForRead(peer, opId, src, segs, lanesTotal);
   }
 
   void HandleBatchReadReq(const EngineKey& peer, const uint8_t* body, size_t len) {
@@ -1535,6 +1961,9 @@ class TcpTransport {
       if (ro + sz > src.size) ok = false;
       if (sz > 0) segs.push_back({ro, sz});
     }
+    uint8_t lanesTotal = 1;
+    if (off < len) lanesTotal = body[off];
+    lanesTotal = ClampLanesTotal(lanesTotal);
     if (!ok) {
       auto ctrl = PeerCtrl(peer);
       if (ctrl) {
@@ -1547,39 +1976,110 @@ class TcpTransport {
       return;
     }
 
-    QueueDataSendForRead(peer, opId, src, segs);
+    QueueDataSendForRead(peer, opId, src, segs, lanesTotal);
   }
 
   void QueueDataSendForRead(const EngineKey& peer, uint64_t opId, const MemoryDesc& src,
-                            const std::vector<Segment>& srcSegs) {
-    Connection* data = PeerData(peer);
+                            const std::vector<Segment>& srcSegs, uint8_t lanesTotal) {
     Connection* ctrl = PeerCtrl(peer);
-    if (!data || !ctrl) return;
+    if (!ctrl) return;
 
     const uint64_t total = SumLens(srcSegs);
-    auto hdr = tcp::BuildDataHeader(opId, total, 0);
-    auto onDone = [this, peer, opId, ctrlFd = ctrl->fd]() {
-      QueueSend(ctrlFd, tcp::BuildCompletion(opId, static_cast<uint32_t>(StatusCode::SUCCESS), ""));
-      UpdateWriteInterest(ctrlFd);
-      RecordInboundStatus(peer, opId, StatusCode::SUCCESS, "");
+    lanesTotal = ClampLanesTotal(lanesTotal);
+
+    // Build list of active data fds.
+    std::vector<int> dataFds;
+    auto pit = peers.find(peer);
+    if (pit != peers.end()) {
+      for (int fd : pit->second.dataFds) {
+        auto dit = conns.find(fd);
+        if (dit == conns.end()) continue;
+        if (dit->second && dit->second->helloReceived) dataFds.push_back(fd);
+      }
+    }
+    if (dataFds.empty()) return;
+    lanesTotal = std::min<uint8_t>(lanesTotal, static_cast<uint8_t>(dataFds.size()));
+
+    struct DoneState {
+      EngineKey peer;
+      uint64_t opId{0};
+      int ctrlFd{-1};
+      int remaining{0};
+    };
+    auto done = std::make_shared<DoneState>();
+    done->peer = peer;
+    done->opId = opId;
+    done->ctrlFd = ctrl->fd;
+    done->remaining = lanesTotal;
+    auto laneDone = [this, done]() mutable {
+      done->remaining--;
+      if (done->remaining > 0) return;
+      QueueSend(done->ctrlFd,
+                tcp::BuildCompletion(done->opId, static_cast<uint32_t>(StatusCode::SUCCESS), ""));
+      UpdateWriteInterest(done->ctrlFd);
+      RecordInboundStatus(done->peer, done->opId, StatusCode::SUCCESS, "");
     };
 
-    if (src.loc == MemoryLocationType::GPU) {
-      QueueGpuToNetSend(data, src, srcSegs, std::move(hdr), std::move(onDone));
+    // Unstriped path.
+    if (lanesTotal == 1) {
+      const int fd = dataFds[0];
+      Connection* data = conns[fd].get();
+      if (!data) return;
+      auto hdr = tcp::BuildDataHeader(ToWireOpId(opId, 0), total, 0);
+      if (src.loc == MemoryLocationType::GPU) {
+        QueueGpuToNetSend(data, src, srcSegs, std::move(hdr), std::move(laneDone));
+        UpdateWriteInterest(fd);
+        return;
+      }
+
+      SendItem item;
+      item.header = std::move(hdr);
+      item.iov.reserve(1 + srcSegs.size());
+      item.iov.push_back({item.header.data(), item.header.size()});
+      uint8_t* base = reinterpret_cast<uint8_t*>(src.data);
+      for (const auto& s : srcSegs) {
+        item.iov.push_back({base + s.off, static_cast<size_t>(s.len)});
+      }
+      item.onDone = std::move(laneDone);
+      data->sendq.push_back(std::move(item));
+      UpdateWriteInterest(fd);
       return;
     }
 
-    SendItem item;
-    item.header = std::move(hdr);
-    item.iov.reserve(1 + srcSegs.size());
-    item.iov.push_back({item.header.data(), item.header.size()});
-    uint8_t* base = reinterpret_cast<uint8_t*>(src.data);
-    for (const auto& s : srcSegs) {
-      item.iov.push_back({base + s.off, static_cast<size_t>(s.len)});
+    // Striped path: requires a single contiguous span.
+    if (srcSegs.size() != 1) {
+      MORI_IO_WARN("TCP: peer {} READ striping requested but srcSegs.size={} (expected 1), fallback to 1 lane",
+                   peer.c_str(), srcSegs.size());
+      QueueDataSendForRead(peer, opId, src, srcSegs, /*lanesTotal=*/1);
+      return;
     }
-    item.onDone = std::move(onDone);
-    data->sendq.push_back(std::move(item));
-    UpdateWriteInterest(data->fd);
+
+    if (src.loc == MemoryLocationType::GPU) {
+      // Stage once, then stripe sends from pinned buffer.
+      const uint8_t useLanes =
+          std::min<uint8_t>(lanesTotal, static_cast<uint8_t>(dataFds.size()));
+      QueueGpuToNetSendStripedWithOnDone(peer, dataFds, opId, useLanes, src, srcSegs, std::move(laneDone));
+      return;
+    }
+
+    const uint8_t useLanes = std::min<uint8_t>(lanesTotal, static_cast<uint8_t>(dataFds.size()));
+    uint8_t* base = reinterpret_cast<uint8_t*>(src.data) + srcSegs[0].off;
+    for (uint8_t lane = 0; lane < useLanes; ++lane) {
+      const LaneSpan span = ComputeLaneSpan(total, useLanes, lane);
+      const int fd = dataFds[lane % dataFds.size()];
+      Connection* data = conns[fd].get();
+      if (!data) continue;
+      SendItem item;
+      item.header = tcp::BuildDataHeader(ToWireOpId(opId, lane), span.len, 0);
+      item.iov.resize(2);
+      item.iov[0].iov_base = item.header.data();
+      item.iov[0].iov_len = item.header.size();
+      item.iov[1].iov_base = base + span.off;
+      item.iov[1].iov_len = static_cast<size_t>(span.len);
+      item.onDone = laneDone;
+      data->sendq.push_back(std::move(item));
+      UpdateWriteInterest(fd);
+    }
   }
 
   void HandleCompletion(const EngineKey& peer, const uint8_t* body, size_t len) {
@@ -1618,6 +2118,9 @@ class TcpTransport {
   void MaybeCompleteOutbound(OutboundOpState& st) {
     if (!st.completionReceived) return;
     if (st.isRead) {
+      const uint8_t allMask =
+          st.lanesTotal >= (1U << kLaneBits) ? 0xFF : static_cast<uint8_t>((1U << st.lanesTotal) - 1U);
+      if (st.lanesDoneMask != allMask) return;
       if (st.rxBytes != st.expectedRxBytes) return;
       if (st.gpuCopyPending) return;
     }
@@ -1788,40 +2291,56 @@ class TcpTransport {
     }
   }
 
-  void BeginDataRx(Connection* c, TransferUniqueId opId, uint64_t payloadLen) {
+  void BeginDataRx(Connection* c, uint64_t wireOpId, uint64_t payloadLen) {
     c->rx = ActiveDataRx{};
     c->rx.active = true;
-    c->rx.id = opId;
+
+    const uint8_t lane = static_cast<uint8_t>(wireOpId & kLaneMask);
+    const TransferUniqueId userOpId = static_cast<TransferUniqueId>(ToUserOpId(wireOpId));
+
+    c->rx.id = userOpId;
+    c->rx.lane = lane;
+    c->rx.laneLen = payloadLen;
     c->rx.remaining = payloadLen;
 
-    // 1) inbound write: peer->me, stored by peer key.
-    auto iwIt = inboundWrites.find(c->peerKey);
-    if (iwIt != inboundWrites.end()) {
-      auto it = iwIt->second.find(opId);
-      if (it != iwIt->second.end()) {
-        InboundWriteState& ws = it->second;
-        if (!ws.discard) {
-          const uint64_t expected = SumLens(ws.dstSegs);
-          if (expected != payloadLen) {
-            MORI_IO_WARN("TCP: inbound write op {} payloadLen mismatch expected={} got={}", opId,
-                         expected, payloadLen);
-            ws.discard = true;
-          }
+    // 1) inbound write: peer -> me.
+    auto iwPeerIt = inboundWrites.find(c->peerKey);
+    if (iwPeerIt != inboundWrites.end()) {
+      auto wsIt = iwPeerIt->second.find(userOpId);
+      if (wsIt != iwPeerIt->second.end()) {
+        InboundWriteState& ws = wsIt->second;
+        ws.lanesTotal = ClampLanesTotal(ws.lanesTotal);
+        c->rx.kind = DataRxKind::INBOUND_WRITE;
+
+        const uint64_t total = SumLens(ws.dstSegs);
+        if (lane >= ws.lanesTotal) ws.discard = true;
+        const LaneSpan span = ComputeLaneSpan(total, ws.lanesTotal, lane);
+        c->rx.laneOff = span.off;
+        c->rx.laneLen = payloadLen;
+
+        if (!ws.discard && span.len != payloadLen) {
+          MORI_IO_WARN("TCP: inbound write op {} lane {} payloadLen mismatch expected={} got={}",
+                       userOpId, static_cast<uint32_t>(lane), span.len, payloadLen);
+          ws.discard = true;
         }
+
         c->rx.discard = ws.discard;
-        if (!ws.discard) {
+        if (!c->rx.discard) {
           if (ws.dst.loc == MemoryLocationType::GPU) {
-            c->rx.toGpu = true;
-            c->rx.gpuDevice = ws.dst.deviceId;
-            c->rx.gpuBase = reinterpret_cast<void*>(ws.dst.data);
-            c->rx.segs = ws.dstSegs;
-            const uint64_t total = SumLens(ws.dstSegs);
-            c->rx.pinned = staging.Acquire(static_cast<size_t>(total));
-            c->rx.pinnedWriteOff = 0;
+            if (!ws.pinned) {
+              ws.pinned = staging.Acquire(static_cast<size_t>(total));
+              if (!ws.pinned) ws.discard = true;
+            }
+            c->rx.discard = ws.discard;
+            if (!c->rx.discard) {
+              c->rx.toGpu = true;
+              c->rx.pinned = ws.pinned;
+              c->rx.pinnedWriteOff = span.off;
+            }
           } else {
             c->rx.toGpu = false;
             c->rx.base = reinterpret_cast<void*>(ws.dst.data);
-            c->rx.segs = ws.dstSegs;
+            c->rx.segs = SliceSegments(ws.dstSegs, span.off, span.len);
             c->rx.segIdx = 0;
             c->rx.segOff = 0;
           }
@@ -1830,52 +2349,73 @@ class TcpTransport {
       }
     }
 
-    // 2) outbound read response: peer->me for my pending outbound read.
-    auto obIt = pendingOutbound.find(opId);
+    // 2) outbound read response: peer -> me for pending outbound read.
+    auto obIt = pendingOutbound.find(userOpId);
     if (obIt != pendingOutbound.end()) {
       OutboundOpState& st = *obIt->second;
       if (!st.isRead) {
+        c->rx.kind = DataRxKind::OUTBOUND_READ;
         c->rx.discard = true;
         return;
       }
-      if (payloadLen != st.expectedRxBytes) {
-        MORI_IO_ERROR("TCP: outbound read op {} payloadLen mismatch expected={} got={}", opId,
-                      st.expectedRxBytes, payloadLen);
+
+      st.lanesTotal = ClampLanesTotal(st.lanesTotal);
+      if (lane >= st.lanesTotal) {
+        c->rx.kind = DataRxKind::OUTBOUND_READ;
+        c->rx.discard = true;
+        return;
+      }
+
+      const LaneSpan span = ComputeLaneSpan(st.expectedRxBytes, st.lanesTotal, lane);
+      c->rx.kind = DataRxKind::OUTBOUND_READ;
+      c->rx.laneOff = span.off;
+      if (span.len != payloadLen) {
+        MORI_IO_ERROR("TCP: outbound read op {} lane {} payloadLen mismatch expected={} got={}",
+                      userOpId, static_cast<uint32_t>(lane), span.len, payloadLen);
         st.status->Update(StatusCode::ERR_BAD_STATE, "TCP: read payload length mismatch");
         pendingOutbound.erase(obIt);
         c->rx.discard = true;
         return;
       }
+
       c->rx.discard = false;
       if (st.local.loc == MemoryLocationType::GPU) {
+        if (!st.pinned) {
+          st.pinned = staging.Acquire(static_cast<size_t>(st.expectedRxBytes));
+          if (!st.pinned) {
+            st.status->Update(StatusCode::ERR_BAD_STATE, "TCP: failed to allocate pinned staging (read)");
+            pendingOutbound.erase(obIt);
+            c->rx.discard = true;
+            return;
+          }
+        }
         c->rx.toGpu = true;
-        c->rx.gpuDevice = st.local.deviceId;
-        c->rx.gpuBase = reinterpret_cast<void*>(st.local.data);
-        c->rx.segs = st.localSegs;
-        c->rx.pinned = staging.Acquire(static_cast<size_t>(payloadLen));
-        c->rx.pinnedWriteOff = 0;
+        c->rx.pinned = st.pinned;
+        c->rx.pinnedWriteOff = span.off;
       } else {
         c->rx.toGpu = false;
         c->rx.base = reinterpret_cast<void*>(st.local.data);
-        c->rx.segs = st.localSegs;
+        c->rx.segs = SliceSegments(st.localSegs, span.off, span.len);
         c->rx.segIdx = 0;
         c->rx.segOff = 0;
       }
       return;
     }
 
-    // Control+data are on separate TCP connections; data may arrive before its CTRL write request.
-    // Buffer it in pinned host memory, and finalize once CTRL arrives.
+    // 3) early-arrived write payload (data before CTRL write request).
+    c->rx.kind = DataRxKind::EARLY_WRITE;
     if (payloadLen > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
-      MORI_IO_WARN("TCP: data payloadLen too large for op {} from peer {}, discarding", opId,
+      MORI_IO_WARN("TCP: data payloadLen too large for op {} from peer {}, discarding", userOpId,
                    c->peerKey.c_str());
       c->rx.discard = true;
       return;
     }
+
     auto& perPeer = earlyWrites[c->peerKey];
-    if (perPeer.find(opId) != perPeer.end()) {
-      MORI_IO_WARN("TCP: duplicate early data for op {} from peer {}, discarding", opId,
-                   c->peerKey.c_str());
+    EarlyWriteState& early = perPeer[userOpId];
+    if (early.lanes.find(lane) != early.lanes.end()) {
+      MORI_IO_WARN("TCP: duplicate early data for op {} lane {} from peer {}, discarding", userOpId,
+                   static_cast<uint32_t>(lane), c->peerKey.c_str());
       c->rx.discard = true;
       return;
     }
@@ -1884,12 +2424,12 @@ class TcpTransport {
     auto pinned = staging.Acquire(alloc);
     if (!pinned) {
       MORI_IO_WARN("TCP: failed to allocate pinned buffer for early data op {} from peer {}, discarding",
-                   opId, c->peerKey.c_str());
+                   userOpId, c->peerKey.c_str());
       c->rx.discard = true;
       return;
     }
 
-    perPeer.emplace(opId, EarlyWriteState{payloadLen, pinned, false});
+    early.lanes.emplace(lane, EarlyWriteLaneState{payloadLen, pinned, false});
     c->rx.discard = false;
     c->rx.toGpu = true;  // receive into pinned
     c->rx.pinned = pinned;
@@ -1899,125 +2439,59 @@ class TcpTransport {
   void FinishDataRx(Connection* c) {
     const TransferUniqueId opId = c->rx.id;
     const EngineKey peer = c->peerKey;
+    const uint8_t lane = c->rx.lane;
+    const uint64_t laneLen = c->rx.laneLen;
+    const DataRxKind kind = c->rx.kind;
 
-    // Case A: inbound write complete -> copy to GPU if needed, then send completion.
-    auto iwIt = inboundWrites.find(peer);
-	    if (iwIt != inboundWrites.end()) {
-	      auto it = iwIt->second.find(opId);
-	      if (it != iwIt->second.end()) {
-	        InboundWriteState ws = std::move(it->second);
-	        iwIt->second.erase(it);
-	        auto ewPeerIt = earlyWrites.find(peer);
-	        if (ewPeerIt != earlyWrites.end()) {
-	          ewPeerIt->second.erase(opId);
-	          if (ewPeerIt->second.empty()) earlyWrites.erase(ewPeerIt);
-	        }
+    c->rx = ActiveDataRx{};
 
-	        if (ws.discard) {
-	          auto ctrl = PeerCtrl(peer);
-	          if (ctrl) {
-            QueueSend(ctrl->fd, tcp::BuildCompletion(opId, static_cast<uint32_t>(StatusCode::ERR_INVALID_ARGS),
-                                                     "TCP: write discarded"));
-            UpdateWriteInterest(ctrl->fd);
-          }
-          RecordInboundStatus(peer, opId, StatusCode::ERR_INVALID_ARGS, "TCP: write discarded");
-          c->rx = ActiveDataRx{};
-          return;
-        }
-
-        auto ctrl = PeerCtrl(peer);
-        if (!ctrl) {
-          c->rx = ActiveDataRx{};
-          return;
-        }
-
-        if (ws.dst.loc == MemoryLocationType::GPU) {
-          hipStream_t stream = streamPool.GetNextStream(ws.dst.deviceId);
-          hipEvent_t ev = eventPool.GetEvent(ws.dst.deviceId);
-          if (stream == nullptr || ev == nullptr || !c->rx.pinned) {
-            QueueSend(ctrl->fd, tcp::BuildCompletion(opId, static_cast<uint32_t>(StatusCode::ERR_BAD_STATE),
-                                                     "TCP: GPU staging missing"));
-            UpdateWriteInterest(ctrl->fd);
-            RecordInboundStatus(peer, opId, StatusCode::ERR_BAD_STATE, "TCP: GPU staging missing");
-            c->rx = ActiveDataRx{};
-            return;
-          }
-
-          HIP_RUNTIME_CHECK(hipSetDevice(ws.dst.deviceId));
-          uint8_t* src = reinterpret_cast<uint8_t*>(c->rx.pinned->ptr);
-          const uint64_t total = SumLens(ws.dstSegs);
-          uint64_t spanOff = 0;
-          uint64_t spanLen = 0;
-          if (IsSingleContiguousSpan(ws.dstSegs, &spanOff, &spanLen) && spanLen == total) {
-            void* gpuPtr = reinterpret_cast<void*>(ws.dst.data + spanOff);
-            HIP_RUNTIME_CHECK(hipMemcpyHtoDAsync(gpuPtr, src, static_cast<size_t>(total), stream));
-          } else {
-            uint64_t off = 0;
-            for (const auto& s : ws.dstSegs) {
-              void* gpuPtr = reinterpret_cast<void*>(ws.dst.data + s.off);
-              HIP_RUNTIME_CHECK(
-                  hipMemcpyHtoDAsync(gpuPtr, src + off, static_cast<size_t>(s.len), stream));
-              off += s.len;
-            }
-          }
-          HIP_RUNTIME_CHECK(hipEventRecord(ev, stream));
-
-          auto pinned = c->rx.pinned;
-          c->rx = ActiveDataRx{};
-
-          gpuTasks.push_back({ws.dst.deviceId, ev, [this, peer, opId, ctrlFd = ctrl->fd, pinned]() {
-                                QueueSend(ctrlFd,
-                                          tcp::BuildCompletion(opId,
-                                                               static_cast<uint32_t>(StatusCode::SUCCESS),
-                                                               ""));
-                                UpdateWriteInterest(ctrlFd);
-                                RecordInboundStatus(peer, opId, StatusCode::SUCCESS, "");
-                              }});
-          return;
-	        }
-
-	        if (c->rx.pinned) {
-	          uint8_t* src = reinterpret_cast<uint8_t*>(c->rx.pinned->ptr);
-	          uint8_t* dstBase = reinterpret_cast<uint8_t*>(ws.dst.data);
-	          const uint64_t total = SumLens(ws.dstSegs);
-	          uint64_t spanOff = 0;
-	          uint64_t spanLen = 0;
-	          if (IsSingleContiguousSpan(ws.dstSegs, &spanOff, &spanLen) && spanLen == total) {
-	            std::memcpy(dstBase + spanOff, src, static_cast<size_t>(total));
-	          } else {
-	            uint64_t off = 0;
-	            for (const auto& s : ws.dstSegs) {
-	              std::memcpy(dstBase + s.off, src + off, static_cast<size_t>(s.len));
-	              off += s.len;
-	            }
-	          }
-	        }
-
-	        QueueSend(ctrl->fd, tcp::BuildCompletion(opId, static_cast<uint32_t>(StatusCode::SUCCESS), ""));
-	        UpdateWriteInterest(ctrl->fd);
-	        RecordInboundStatus(peer, opId, StatusCode::SUCCESS, "");
-	        c->rx = ActiveDataRx{};
-	        return;
-      }
+    if (kind == DataRxKind::INBOUND_WRITE) {
+      auto iwPeerIt = inboundWrites.find(peer);
+      if (iwPeerIt == inboundWrites.end()) return;
+      auto wsIt = iwPeerIt->second.find(opId);
+      if (wsIt == iwPeerIt->second.end()) return;
+      InboundWriteState& ws = wsIt->second;
+      ws.lanesTotal = ClampLanesTotal(ws.lanesTotal);
+      if (lane < 8) ws.lanesDoneMask |= static_cast<uint8_t>(1U << lane);
+      MaybeFinalizeInboundWrite(peer, opId);
+      return;
     }
 
-    // Case B: outbound read response received -> copy to GPU if needed and update status.
-    auto obIt = pendingOutbound.find(opId);
-	    if (obIt != pendingOutbound.end()) {
-	      OutboundOpState& st = *obIt->second;
-	      st.rxBytes = st.expectedRxBytes;
-	      if (st.local.loc == MemoryLocationType::GPU) {
+    if (kind == DataRxKind::OUTBOUND_READ) {
+      auto obIt = pendingOutbound.find(opId);
+      if (obIt == pendingOutbound.end()) return;
+      OutboundOpState& st = *obIt->second;
+      st.lanesTotal = ClampLanesTotal(st.lanesTotal);
+      const uint8_t bit = static_cast<uint8_t>(1U << lane);
+      if ((st.lanesDoneMask & bit) == 0) {
+        st.lanesDoneMask |= bit;
+        st.rxBytes += laneLen;
+      }
+
+      if (st.local.loc == MemoryLocationType::GPU) {
+        const uint8_t allMask = LanesAllMask(st.lanesTotal);
+        if ((st.lanesDoneMask & allMask) != allMask) {
+          MaybeCompleteOutbound(st);
+          return;
+        }
+        if (st.gpuCopyPending) return;
+        if (!st.pinned) {
+          st.status->Update(StatusCode::ERR_BAD_STATE, "TCP: missing pinned staging (read)");
+          pendingOutbound.erase(obIt);
+          return;
+        }
+
         hipStream_t stream = streamPool.GetNextStream(st.local.deviceId);
         hipEvent_t ev = eventPool.GetEvent(st.local.deviceId);
-        if (stream == nullptr || ev == nullptr || !c->rx.pinned) {
-          st.status->Update(StatusCode::ERR_BAD_STATE, "TCP: GPU staging missing (read)");
+        if (stream == nullptr || ev == nullptr) {
+          st.status->Update(StatusCode::ERR_BAD_STATE, "TCP: failed to get HIP stream/event (read)");
           pendingOutbound.erase(obIt);
-          c->rx = ActiveDataRx{};
+          if (ev) eventPool.PutEvent(ev, st.local.deviceId);
           return;
         }
 
         HIP_RUNTIME_CHECK(hipSetDevice(st.local.deviceId));
-        uint8_t* src = reinterpret_cast<uint8_t*>(c->rx.pinned->ptr);
+        uint8_t* src = reinterpret_cast<uint8_t*>(st.pinned->ptr);
         st.gpuCopyPending = true;
         const uint64_t total = st.expectedRxBytes;
         uint64_t spanOff = 0;
@@ -2029,16 +2503,13 @@ class TcpTransport {
           uint64_t off = 0;
           for (const auto& s : st.localSegs) {
             void* gpuPtr = reinterpret_cast<void*>(st.local.data + s.off);
-            HIP_RUNTIME_CHECK(
-                hipMemcpyHtoDAsync(gpuPtr, src + off, static_cast<size_t>(s.len), stream));
+            HIP_RUNTIME_CHECK(hipMemcpyHtoDAsync(gpuPtr, src + off, static_cast<size_t>(s.len), stream));
             off += s.len;
           }
         }
         HIP_RUNTIME_CHECK(hipEventRecord(ev, stream));
 
-        auto pinned = c->rx.pinned;
-        c->rx = ActiveDataRx{};
-
+        auto pinned = st.pinned;
         gpuTasks.push_back({st.local.deviceId, ev, [this, opId, pinned]() {
                               auto it = pendingOutbound.find(opId);
                               if (it == pendingOutbound.end()) return;
@@ -2048,25 +2519,23 @@ class TcpTransport {
         return;
       }
 
-      c->rx = ActiveDataRx{};
-	      MaybeCompleteOutbound(st);
-	      return;
-	    }
+      MaybeCompleteOutbound(st);
+      return;
+    }
 
-	    // Case C: early-arrived write payload (data before CTRL). Mark it complete and finalize once
-	    // the corresponding CTRL write request arrives.
-	    auto ewPeerIt = earlyWrites.find(peer);
-	    if (ewPeerIt != earlyWrites.end()) {
-	      auto ewIt = ewPeerIt->second.find(opId);
-	      if (ewIt != ewPeerIt->second.end()) {
-	        ewIt->second.complete = true;
-	        c->rx = ActiveDataRx{};
-	        return;
-	      }
-	    }
-
-	    c->rx = ActiveDataRx{};
-	  }
+    if (kind == DataRxKind::EARLY_WRITE) {
+      auto ewPeerIt = earlyWrites.find(peer);
+      if (ewPeerIt == earlyWrites.end()) return;
+      auto ewIt = ewPeerIt->second.find(opId);
+      if (ewIt == ewPeerIt->second.end()) return;
+      auto laneIt = ewIt->second.lanes.find(lane);
+      if (laneIt != ewIt->second.lanes.end()) {
+        laneIt->second.complete = true;
+      }
+      TryConsumeEarlyWriteLanes(peer, opId);
+      return;
+    }
+  }
 
   void HandleReadable(Connection* c) {
     if (!c->helloReceived) {
