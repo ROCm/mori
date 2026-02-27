@@ -79,29 +79,8 @@ def _test_allreduce_async(rank, world_size, port, elems, iterations, warmup):
 
             dist.barrier()
 
-            try:
-                with torch.cuda.stream(stream):
-                    started = allreduce.start_async(input_tensor, output_tensor, elems, stream)
-            except Exception as e:
-                print(f"PE {rank}: Failed to start async operation: {e}")
-                break
-
-            if not started:
-                print(f"PE {rank}: start_async returned False")
-                break
-
-            try:
-                with torch.cuda.stream(stream):
-                    exec_time = allreduce.wait_async(stream)
-            except Exception as e:
-                print(f"PE {rank}: wait_async failed: {e}")
-                break
-
-            if exec_time < 0:
-                print(f"PE {rank}: Async operation failed")
-                break
-
-            stream.synchronize()
+            allreduce.start_async(input_tensor, output_tensor, elems, stream)
+            exec_time = allreduce.wait_async(stream)
 
             if iter_idx >= warmup:
                 exec_times.append(exec_time)
