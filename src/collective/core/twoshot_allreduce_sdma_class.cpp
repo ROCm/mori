@@ -34,14 +34,17 @@ namespace collective {
 
 // Constructor implementation - delegating version
 template <typename T>
-AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t transit_buffer_size, bool copy_output_to_user)
-    : AllreduceSdma(myPe, npes, transit_buffer_size / 2, transit_buffer_size / 2, copy_output_to_user) {
-    // Delegated to another constructor
+AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t transit_buffer_size,
+                                bool copy_output_to_user, bool use_graph_mode)
+    : AllreduceSdma(myPe, npes, transit_buffer_size / 2, transit_buffer_size / 2,
+                    copy_output_to_user, use_graph_mode) {
 }
 
 // Main constructor implementation
 template <typename T>
-AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size, size_t output_buffer_size, bool copy_output_to_user)
+AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size,
+                                size_t output_buffer_size, bool copy_output_to_user,
+                                bool use_graph_mode)
     : myPe_(myPe),
       npes_(npes),
       dtype_size_(sizeof(T)),
@@ -53,7 +56,8 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size, si
       output_transit_buffer_(nullptr),
       output_transit_buffer_size_(output_buffer_size),
       output_transit_buffer_ptr_(nullptr, ShmemDeleter()),
-      copy_output_to_user_(copy_output_to_user) {
+      copy_output_to_user_(copy_output_to_user),
+      use_graph_mode_(use_graph_mode) {
 
     // 1a. Allocate and initialize AllGather flags memory
     size_t flagsSize = npes_ * sizeof(uint64_t);
@@ -86,16 +90,19 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size, si
         throw std::runtime_error("Failed to zero-init barrier signal memory");
     }
 
-    // 2. Allocate input transit buffer (srcMemObj)
-    input_transit_buffer_ = shmem::ShmemMalloc(input_transit_buffer_size_);
-    if (input_transit_buffer_ == nullptr) {
-        throw std::runtime_error("Failed to allocate input transit buffer");
-    }
-    input_transit_buffer_ptr_.reset(input_transit_buffer_);
+    // 2. Allocate input transit buffer (srcMemObj) — skipped in graph mode
+    //    (graph mode registers user input directly on first call)
+    if (!use_graph_mode_) {
+        input_transit_buffer_ = shmem::ShmemMalloc(input_transit_buffer_size_);
+        if (input_transit_buffer_ == nullptr) {
+            throw std::runtime_error("Failed to allocate input transit buffer");
+        }
+        input_transit_buffer_ptr_.reset(input_transit_buffer_);
 
-    input_transit_buffer_obj_ = shmem::ShmemSymmetricRegister(input_transit_buffer_, input_transit_buffer_size_);
-    if (!input_transit_buffer_obj_.IsValid()) {
-        throw std::runtime_error("Failed to register input transit buffer");
+        input_transit_buffer_obj_ = shmem::ShmemSymmetricRegister(input_transit_buffer_, input_transit_buffer_size_);
+        if (!input_transit_buffer_obj_.IsValid()) {
+            throw std::runtime_error("Failed to register input transit buffer");
+        }
     }
 
     // 3. Allocate output transit buffer (dstMemObj)
@@ -111,11 +118,16 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size, si
     }
 
     // 4. Print initialization information
-    printf("AllreduceSdma initialized: PE %d of %d\n", myPe_, npes_);
+    printf("AllreduceSdma initialized: PE %d of %d, mode=%s\n",
+           myPe_, npes_, use_graph_mode_ ? "graph" : "eager");
     printf("  Flags allocated: %zu bytes at %p\n", flagsSize, flags_.get());
     printf("  Barrier signal: %zu bytes at %p\n", barrierSize, barrierMem);
-    printf("  Input transit buffer: %.2f MB at %p\n",
-           input_transit_buffer_size_ / (1024.0 * 1024.0), input_transit_buffer_);
+    if (!use_graph_mode_) {
+        printf("  Input transit buffer: %.2f MB at %p\n",
+               input_transit_buffer_size_ / (1024.0 * 1024.0), input_transit_buffer_);
+    } else {
+        printf("  Input transit buffer: (deferred — graph mode, registered on first call)\n");
+    }
     printf("  Output transit buffer: %.2f MB at %p\n",
            output_transit_buffer_size_ / (1024.0 * 1024.0), output_transit_buffer_);
 }
@@ -242,15 +254,49 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
     }
 }
 
+// ensure_graph_input_registered: register user input as symmetric memory, with
+// multi-address caching.  Returns true if registration succeeded (or was cached).
+// On success, the caller can obtain the SymmMemObjPtr from graph_input_cache_[ptr].
+template <typename T>
+bool AllreduceSdma<T>::ensure_graph_input_registered(T* input, size_t input_bytes) {
+    void* ptr = reinterpret_cast<void*>(input);
+    auto it = graph_input_cache_.find(ptr);
+    if (it != graph_input_cache_.end() && input_bytes <= it->second.size) {
+        return true;
+    }
+
+    auto obj = shmem::ShmemSymmetricRegister(ptr, input_bytes);
+    if (!obj.IsValid()) {
+        fprintf(stderr, "PE %d: Failed to register graph input (%p, %zu bytes)\n",
+                myPe_, ptr, input_bytes);
+        return false;
+    }
+    graph_input_cache_[ptr] = {input_bytes, obj};
+
+    printf("PE %d: Graph input registered: %p, %.2f MB (cache size: %zu)\n",
+           myPe_, ptr, input_bytes / (1024.0 * 1024.0), graph_input_cache_.size());
+    return true;
+}
+
 // operator() implementation
 // Returns true on success, false on failure
 // Synchronization must be done by caller
 template <typename T>
 bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
     try {
-        // Step 1: Copy user input to input transit buffer (symmetric memory)
-        // ReduceScatterKernel reads from srcMemObj->peerPtrs[pe].
-        copy_input_to_transit(input, total_count, stream);
+        const size_t input_bytes = total_count * dtype_size_;
+        application::SymmMemObjPtr src_obj;
+
+        // Step 1: Prepare source symmetric memory
+        if (use_graph_mode_) {
+            if (!ensure_graph_input_registered(input, input_bytes)) {
+                return false;
+            }
+            src_obj = graph_input_cache_[reinterpret_cast<void*>(input)].obj;
+        } else {
+            copy_input_to_transit(input, total_count, stream);
+            src_obj = input_transit_buffer_obj_;
+        }
 
         // Step 2: ReduceScatter — each rank reduces its partition via direct reads
         constexpr int pack_size = packed_t<T>::P::size;
@@ -264,7 +310,7 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
 
         ReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(
             myPe_, npes_,
-            input_transit_buffer_obj_,
+            src_obj,
             output_transit_buffer_obj_,
             barrierSignalObj_,
             total_count);
@@ -289,10 +335,10 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
             return false;
         }
 
-        // Step 4: Copy from output transit buffer to user output buffer (if enabled)
-        // The result in dstMemObj is laid out with elementCountPerRank-stride shards;
-        // the first total_count elements form the complete allreduce result.
-        if (copy_output_to_user_) {
+        // Step 4: Copy output to user buffer
+        // Graph mode always skips this (user reads output_transit_buffer directly).
+        // Eager mode respects copy_output_to_user_ flag.
+        if (!use_graph_mode_ && copy_output_to_user_) {
             copy_output_to_user(output, total_count, stream);
         }
 
@@ -307,8 +353,15 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
 // allreduce_inplace implementation
 template <typename T>
 bool AllreduceSdma<T>::allreduce_inplace(T* data, size_t total_count, hipStream_t stream) {
-    // Temporarily force copy-back regardless of copy_output_to_user_ setting,
-    // since inplace semantics require the result to be written back to data.
+    if (use_graph_mode_) {
+        // Graph mode: operator() skips copy_output, so we run it then manually copy back.
+        bool ok = (*this)(data, data, total_count, stream);
+        if (ok) {
+            copy_output_to_user(data, total_count, stream);
+        }
+        return ok;
+    }
+    // Eager mode: temporarily force copy-back regardless of copy_output_to_user_ setting.
     bool saved = copy_output_to_user_;
     copy_output_to_user_ = true;
     bool ok = (*this)(data, data, total_count, stream);

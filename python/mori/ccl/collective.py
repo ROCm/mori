@@ -263,6 +263,13 @@ class AllreduceSdma:
     of all ranks' inputs) in the output buffer.
     
     Supported dtypes: torch.uint32, torch.int32, torch.float16, torch.bfloat16
+    
+    Modes:
+      - "eager": copies user input to a pre-registered transit buffer each call.
+      - "graph": registers the user input pointer directly (cached on first call).
+                 Skips copy_input_to_transit and copy_output_to_user.
+                 User should pre-allocate a fixed-address input tensor and
+                 read results from get_output_transit_buffer().
     """
 
     _HANDLE_MAP = {
@@ -278,7 +285,8 @@ class AllreduceSdma:
                  output_buffer_size: Optional[int] = None,
                  transit_buffer_size: Optional[int] = None,
                  copy_output_to_user: bool = True,
-                 dtype: torch.dtype = torch.uint32):
+                 dtype: torch.dtype = torch.uint32,
+                 mode: str = "eager"):
         """Initialize AllreduceSdma
         
         Args:
@@ -291,10 +299,17 @@ class AllreduceSdma:
                                 If False, user should directly use output_transit_buffer via get_output_transit_buffer()
             dtype: Data type for the allreduce operation (default torch.uint32).
                    Supported: torch.uint32, torch.int32, torch.float16, torch.bfloat16
+            mode: "eager" (default) or "graph". Graph mode registers user input directly
+                  and always skips copy_output_to_user for higher performance.
         """
         self.my_pe = my_pe
         self.npes = npes
         self.dtype = dtype
+        self.mode = mode
+
+        if mode not in ("eager", "graph"):
+            raise ValueError(f"mode must be 'eager' or 'graph', got '{mode}'")
+        use_graph_mode = (mode == "graph")
 
         handle_name = self._HANDLE_MAP.get(dtype)
         if handle_name is None:
@@ -304,11 +319,14 @@ class AllreduceSdma:
         handle_class = _cpp_allreduce_factory(handle_name)
 
         if input_buffer_size is not None and output_buffer_size is not None:
-            self._handle = handle_class(my_pe, npes, input_buffer_size, output_buffer_size, copy_output_to_user)
+            self._handle = handle_class(my_pe, npes, input_buffer_size, output_buffer_size,
+                                        copy_output_to_user, use_graph_mode)
         elif transit_buffer_size is not None:
-            self._handle = handle_class(my_pe, npes, transit_buffer_size, copy_output_to_user)
+            self._handle = handle_class(my_pe, npes, transit_buffer_size,
+                                        copy_output_to_user, use_graph_mode)
         else:
-            self._handle = handle_class(my_pe, npes, 512 * 1024 * 1024, copy_output_to_user)
+            self._handle = handle_class(my_pe, npes, 512 * 1024 * 1024,
+                                        copy_output_to_user, use_graph_mode)
 
     def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
         """Execute out-of-place AllReduce SDMA operation.

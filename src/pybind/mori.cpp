@@ -927,18 +927,20 @@ void RegisterMoriCcl(pybind11::module_& m) {
     // Bind AllreduceSdma class (uint32_t version)
     // =========================================================================
     py::class_<mori::collective::AllreduceSdma<uint32_t>>(m, "AllreduceSdmaHandle")
-        .def(py::init<int, int, size_t, size_t, bool>(),
+        .def(py::init<int, int, size_t, size_t, bool, bool>(),
              py::arg("my_pe"),
              py::arg("npes"),
              py::arg("input_buffer_size"),
              py::arg("output_buffer_size"),
              py::arg("copy_output_to_user") = true,
+             py::arg("use_graph_mode") = false,
              "Initialize AllreduceSdma with PE ID, number of PEs, and buffer sizes")
-        .def(py::init<int, int, size_t, bool>(),
+        .def(py::init<int, int, size_t, bool, bool>(),
              py::arg("my_pe"),
              py::arg("npes"),
              py::arg("transit_buffer_size") = 512 * 1024 * 1024,
              py::arg("copy_output_to_user") = true,
+             py::arg("use_graph_mode") = false,
              "Initialize AllreduceSdma with PE ID, number of PEs, and transit buffer size (default 512MB)")
         .def("__call__",
             [](mori::collective::AllreduceSdma<uint32_t>& self,
@@ -1077,18 +1079,20 @@ void RegisterMoriCcl(pybind11::module_& m) {
     // Bind AllreduceSdma class (half / fp16 version)
     // =========================================================================
     py::class_<mori::collective::AllreduceSdma<half>>(m, "AllreduceSdmaHandleFp16")
-        .def(py::init<int, int, size_t, size_t, bool>(),
+        .def(py::init<int, int, size_t, size_t, bool, bool>(),
              py::arg("my_pe"),
              py::arg("npes"),
              py::arg("input_buffer_size"),
              py::arg("output_buffer_size"),
              py::arg("copy_output_to_user") = true,
+             py::arg("use_graph_mode") = false,
              "Initialize AllreduceSdma (fp16) with PE ID, number of PEs, and buffer sizes")
-        .def(py::init<int, int, size_t, bool>(),
+        .def(py::init<int, int, size_t, bool, bool>(),
              py::arg("my_pe"),
              py::arg("npes"),
              py::arg("transit_buffer_size") = 512 * 1024 * 1024,
              py::arg("copy_output_to_user") = true,
+             py::arg("use_graph_mode") = false,
              "Initialize AllreduceSdma (fp16) with PE ID, number of PEs, and transit buffer size")
         .def("__call__",
             [](mori::collective::AllreduceSdma<half>& self,
@@ -1209,18 +1213,20 @@ void RegisterMoriCcl(pybind11::module_& m) {
     // Bind AllreduceSdma class (__hip_bfloat16 / bf16 version)
     // =========================================================================
     py::class_<mori::collective::AllreduceSdma<__hip_bfloat16>>(m, "AllreduceSdmaHandleBf16")
-        .def(py::init<int, int, size_t, size_t, bool>(),
+        .def(py::init<int, int, size_t, size_t, bool, bool>(),
              py::arg("my_pe"),
              py::arg("npes"),
              py::arg("input_buffer_size"),
              py::arg("output_buffer_size"),
              py::arg("copy_output_to_user") = true,
+             py::arg("use_graph_mode") = false,
              "Initialize AllreduceSdma (bf16) with PE ID, number of PEs, and buffer sizes")
-        .def(py::init<int, int, size_t, bool>(),
+        .def(py::init<int, int, size_t, bool, bool>(),
              py::arg("my_pe"),
              py::arg("npes"),
              py::arg("transit_buffer_size") = 512 * 1024 * 1024,
              py::arg("copy_output_to_user") = true,
+             py::arg("use_graph_mode") = false,
              "Initialize AllreduceSdma (bf16) with PE ID, number of PEs, and transit buffer size")
         .def("__call__",
             [](mori::collective::AllreduceSdma<__hip_bfloat16>& self,

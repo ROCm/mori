@@ -28,6 +28,7 @@
 #include <memory>
 #include <cstdint>
 #include <atomic>
+#include <unordered_map>
 
 // Include necessary headers
 #include "mori/application/application.hpp"
@@ -68,6 +69,16 @@ private:
     // if false, user should directly use output_transit_buffer
     bool copy_output_to_user_;
 
+    // Graph mode: register user input directly instead of copy_input_to_transit.
+    // In graph mode, copy_output_to_user is always skipped (user reads output_transit_buffer).
+    bool use_graph_mode_;
+
+    struct GraphInputEntry {
+        size_t size;
+        application::SymmMemObjPtr obj;
+    };
+    std::unordered_map<void*, GraphInputEntry> graph_input_cache_;
+
     // Disable copy constructor and assignment operator
     AllreduceSdma(const AllreduceSdma&) = delete;
     AllreduceSdma& operator=(const AllreduceSdma&) = delete;
@@ -80,6 +91,7 @@ private:
                            size_t required_size,
                            const char* buffer_name);
 
+    bool ensure_graph_input_registered(T* input, size_t input_bytes);
     void copy_input_to_transit(T* input, size_t total_count, hipStream_t stream);
     void copy_output_to_user(T* output, size_t total_count, hipStream_t stream);
 
@@ -90,8 +102,12 @@ public:
      * @param npes Total number of PEs
      * @param transit_buffer_size Transit buffer size in bytes (default 512MB), half for input and half for output
      * @param copy_output_to_user If true, copy output_transit_buffer to user output buffer (default true)
+     * @param use_graph_mode If true, register user input directly (skip copy_input_to_transit)
+     *        and always skip copy_output_to_user. User should pre-allocate a fixed-address
+     *        input and read results from getOutputTransitBuffer().
      */
-    AllreduceSdma(int myPe, int npes, size_t transit_buffer_size = 512 * 1024 * 1024, bool copy_output_to_user = true);
+    AllreduceSdma(int myPe, int npes, size_t transit_buffer_size = 512 * 1024 * 1024,
+                  bool copy_output_to_user = true, bool use_graph_mode = false);
 
     /**
      * @brief Constructor, specifying input and output transit buffer sizes separately
@@ -100,8 +116,10 @@ public:
      * @param input_buffer_size Input transit buffer size in bytes
      * @param output_buffer_size Output transit buffer size in bytes
      * @param copy_output_to_user If true, copy output_transit_buffer to user output buffer (default true)
+     * @param use_graph_mode If true, register user input directly (skip copy_input_to_transit)
      */
-    AllreduceSdma(int myPe, int npes, size_t input_buffer_size, size_t output_buffer_size, bool copy_output_to_user = true);
+    AllreduceSdma(int myPe, int npes, size_t input_buffer_size, size_t output_buffer_size,
+                  bool copy_output_to_user = true, bool use_graph_mode = false);
 
     /**
      * @brief Destructor, cleans up resources
@@ -163,6 +181,11 @@ public:
      * @brief Gets output transit buffer symmetric memory object
      */
     application::SymmMemObjPtr getOutputTransitBufferObj() const { return output_transit_buffer_obj_; }
+
+    /**
+     * @brief Returns true if graph mode is enabled
+     */
+    bool isGraphMode() const { return use_graph_mode_; }
 
     /**
      * @brief Resets flags (sets to 0)
