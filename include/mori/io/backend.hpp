@@ -103,8 +103,8 @@ struct TcpBackendConfig : public BackendConfig {
 
   int numIoThreads{1};
 
-  int sockSndbufBytes{4 * 1024 * 1024};
-  int sockRcvbufBytes{4 * 1024 * 1024};
+  int sockSndbufBytes{32 * 1024 * 1024};
+  int sockRcvbufBytes{32 * 1024 * 1024};
 
   int opTimeoutMs{30 * 1000};
 
@@ -114,13 +114,13 @@ struct TcpBackendConfig : public BackendConfig {
   int keepaliveCnt{3};
 
   bool enableCtrlNodelay{true};
-  bool enableDataNodelay{false};
+  bool enableDataNodelay{true};
 
   // Number of parallel DATA TCP connections per peer (iperf-like multi-stream striping).
   // Effective only when peer has >= numDataConns established and transfer is contiguous.
   int numDataConns{4};
   // Stripe large contiguous transfers; keep small transfers on a single stream for latency.
-  int stripingThresholdBytes{256 * 1024};
+  int stripingThresholdBytes{64 * 1024};
 };
 
 inline std::ostream& operator<<(std::ostream& os, const TcpBackendConfig& c) {
@@ -128,10 +128,9 @@ inline std::ostream& operator<<(std::ostream& os, const TcpBackendConfig& c) {
             << "] sockRcvbufBytes[" << c.sockRcvbufBytes << "] opTimeoutMs[" << c.opTimeoutMs
             << "] enableKeepalive[" << c.enableKeepalive << "] keepaliveIdleSec["
             << c.keepaliveIdleSec << "] keepaliveIntvlSec[" << c.keepaliveIntvlSec
-            << "] keepaliveCnt[" << c.keepaliveCnt << "] enableCtrlNodelay["
-            << c.enableCtrlNodelay << "] enableDataNodelay[" << c.enableDataNodelay
-            << "] numDataConns[" << c.numDataConns << "] stripingThresholdBytes["
-            << c.stripingThresholdBytes << "]";
+            << "] keepaliveCnt[" << c.keepaliveCnt << "] enableCtrlNodelay[" << c.enableCtrlNodelay
+            << "] enableDataNodelay[" << c.enableDataNodelay << "] numDataConns[" << c.numDataConns
+            << "] stripingThresholdBytes[" << c.stripingThresholdBytes << "]";
 }
 
 /* ---------------------------------------------------------------------------------------------- */
