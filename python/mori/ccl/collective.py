@@ -328,6 +328,39 @@ class AllreduceSdma:
         """
         return self._handle.allreduce_inplace(data, count, stream)
 
+    def start_async(self, input_data, output_data, count: int, stream=None) -> bool:
+        """Start asynchronous AllReduce SDMA operation.
+
+        Args:
+            input_data: Input CUDA tensor (torch.int32 or torch.uint32, 1D)
+            output_data: Output CUDA tensor (torch.int32 or torch.uint32, 1D)
+            count: Number of elements per PE
+            stream: Optional HIP stream
+
+        Returns:
+            True if operation started successfully, False otherwise
+        """
+        return self._handle.start_async(input_data, output_data, count, stream)
+
+    def wait_async(self, stream=None) -> float:
+        """Wait for asynchronous AllReduce SDMA operation to complete.
+
+        Args:
+            stream: Optional HIP stream
+
+        Returns:
+            Execution time in seconds, -1.0 if failed
+        """
+        return self._handle.wait_async(stream)
+
+    def is_async_in_progress(self) -> bool:
+        """Check if async operation is in progress."""
+        return self._handle.is_async_in_progress()
+
+    def cancel_async(self):
+        """Cancel ongoing async operation."""
+        self._handle.cancel_async()
+
     def reset_flags(self):
         """Reset synchronization flags"""
         self._handle.reset_flags()

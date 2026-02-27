@@ -1021,6 +1021,65 @@ void RegisterMoriCcl(pybind11::module_& m) {
             py::arg("count"),
             py::arg("stream") = py::none(),
             "Execute in-place AllReduce SDMA operation (result overwrites input)")
+        .def("start_async",
+            [](mori::collective::AllreduceSdma<uint32_t>& self,
+               const torch::Tensor& input_tensor,
+               const torch::Tensor& output_tensor,
+               size_t count,
+               py::object stream_obj) -> bool {
+
+                if (input_tensor.dim() != 1 || output_tensor.dim() != 1) {
+                    throw std::runtime_error("Tensors must be 1-dimensional");
+                }
+                if (!input_tensor.is_cuda() || !output_tensor.is_cuda()) {
+                    throw std::runtime_error("Tensors must be CUDA tensors");
+                }
+
+                uint32_t* input_ptr = nullptr;
+                uint32_t* output_ptr = nullptr;
+
+                if (input_tensor.scalar_type() == torch::kUInt32) {
+                    input_ptr = input_tensor.data_ptr<uint32_t>();
+                } else if (input_tensor.scalar_type() == torch::kInt32) {
+                    input_ptr = reinterpret_cast<uint32_t*>(input_tensor.data_ptr<int32_t>());
+                } else {
+                    throw std::runtime_error("Input tensor must be uint32 or int32");
+                }
+
+                if (output_tensor.scalar_type() == torch::kUInt32) {
+                    output_ptr = output_tensor.data_ptr<uint32_t>();
+                } else if (output_tensor.scalar_type() == torch::kInt32) {
+                    output_ptr = reinterpret_cast<uint32_t*>(output_tensor.data_ptr<int32_t>());
+                } else {
+                    throw std::runtime_error("Output tensor must be uint32 or int32");
+                }
+
+                int device_index = input_tensor.device().index();
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj, device_index);
+
+                return self.start_async(input_ptr, output_ptr, count, stream);
+            },
+            py::arg("input"),
+            py::arg("output"),
+            py::arg("count"),
+            py::arg("stream") = py::none(),
+            "Start asynchronous AllReduce SDMA operation (ReduceScatter + AllGather PUT phase)")
+        .def("wait_async",
+            [](mori::collective::AllreduceSdma<uint32_t>& self,
+               py::object stream_obj) -> double {
+
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj);
+
+                return self.wait_async(stream);
+            },
+            py::arg("stream") = py::none(),
+            "Wait for asynchronous AllReduce SDMA operation to complete")
+        .def("is_async_in_progress",
+            &mori::collective::AllreduceSdma<uint32_t>::is_async_in_progress,
+            "Check if async operation is in progress")
+        .def("cancel_async",
+            &mori::collective::AllreduceSdma<uint32_t>::cancel_async,
+            "Cancel ongoing async operation")
         .def("reset_flags",
             &mori::collective::AllreduceSdma<uint32_t>::resetFlags,
             "Reset synchronization flags")
