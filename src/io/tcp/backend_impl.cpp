@@ -19,7 +19,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+
 #include "src/io/tcp/backend_impl.hpp"
 
 #include "src/io/tcp/transport.hpp"
@@ -51,7 +51,7 @@ TcpBackend::TcpBackend(EngineKey k, const IOEngineConfig& engCfg, const TcpBacke
     : myEngKey(std::move(k)), config(cfg) {
   transport = std::make_unique<TcpTransport>(myEngKey, engCfg, cfg);
   transport->Start();
-  MORI_IO_INFO("TcpBackend created key={}", myEngKey.c_str());
+  MORI_IO_INFO("TcpBackend created key={}", myEngKey);
 }
 
 TcpBackend::~TcpBackend() { transport->Shutdown(); }
@@ -61,35 +61,27 @@ std::optional<uint16_t> TcpBackend::GetListenPort() const { return transport->Ge
 void TcpBackend::RegisterRemoteEngine(const EngineDesc& desc) {
   transport->RegisterRemoteEngine(desc);
 }
-
 void TcpBackend::DeregisterRemoteEngine(const EngineDesc& desc) {
   transport->DeregisterRemoteEngine(desc);
 }
-
 void TcpBackend::RegisterMemory(MemoryDesc& desc) { transport->RegisterMemory(desc); }
-
 void TcpBackend::DeregisterMemory(const MemoryDesc& desc) { transport->DeregisterMemory(desc); }
 
-void TcpBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
-                           const MemoryDesc& remoteSrc, size_t remoteOffset, size_t size,
-                           TransferStatus* status, TransferUniqueId id, bool isRead) {
+void TcpBackend::ReadWrite(const MemoryDesc& ld, size_t lo, const MemoryDesc& rs, size_t ro,
+                           size_t sz, TransferStatus* st, TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
-  transport->SubmitReadWrite(localDest, localOffset, remoteSrc, remoteOffset, size, status, id,
-                             isRead);
+  transport->SubmitReadWrite(ld, lo, rs, ro, sz, st, id, isRead);
 }
 
-void TcpBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& localOffsets,
-                                const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
-                                const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
-                                bool isRead) {
+void TcpBackend::BatchReadWrite(const MemoryDesc& ld, const SizeVec& lo, const MemoryDesc& rs,
+                                const SizeVec& ro, const SizeVec& sz, TransferStatus* st,
+                                TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
-  transport->SubmitBatchReadWrite(localDest, localOffsets, remoteSrc, remoteOffsets, sizes, status,
-                                  id, isRead);
+  transport->SubmitBatchReadWrite(ld, lo, rs, ro, sz, st, id, isRead);
 }
 
 BackendSession* TcpBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote) {
-  auto* sess = new TcpBackendSession(config, local, remote, transport.get());
-  return sess;
+  return new TcpBackendSession(config, local, remote, transport.get());
 }
 
 bool TcpBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
