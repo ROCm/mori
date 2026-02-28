@@ -184,16 +184,11 @@ def allreduce_put_signal_kernel(
             )
             shmem_quiet()
 
-    # Phase 2: all blocks wait for all signals (including self)
+    # Phase 2: wait for all signals (all are on local HBM)
     for i in tl.static_range(MAX_PES):
         if i < npes:
-            if i == mype:
-                # Wait for local self-copy signal
-                while tl.atomic_add(signal_ptr + mype, 0, sem='acquire') < CHUNKS_PER_PE:
-                    pass
-            else:
-                shmem_uint64_wait_until_equals(
-                    signal_ptr + i, tl.cast(CHUNKS_PER_PE, tl.uint64))
+            shmem_uint64_wait_until_equals(
+                signal_ptr + i, tl.cast(CHUNKS_PER_PE, tl.uint64))
 
     # Phase 3: multi-block accumulate across all TOTAL_BLOCKS blocks
     total_blocks = MAX_PES * CHUNKS_PER_PE
