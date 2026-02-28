@@ -74,8 +74,8 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
   if (scales.has_value() && (handle.config.scaleDim > 0)) {
     TORCH_CHECK(scales->is_contiguous(), "dispatch scales must be contiguous");
     TORCH_CHECK(scales->element_size() == handle.config.scaleTypeSize,
-                "dispatch scales element size mismatch, expected ",
-                handle.config.scaleTypeSize, ", got ", scales->element_size());
+                "dispatch scales element size mismatch, expected ", handle.config.scaleTypeSize,
+                ", got ", scales->element_size());
     scalePtr = reinterpret_cast<uint8_t*>(scales->data_ptr());
   }
 
@@ -85,10 +85,9 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
   handle.LaunchDispatch((mori::moe::KernelType)kernelType, blockNum, rdmaBlockNum, warpPerBlock,
                         at::cuda::getCurrentHIPStream(), hiddenDim);
 
-  torch::Tensor out =
-      torch::from_blob(handle.shmemDispatchOutTokMemObj->Get(),
-                       {handle.config.MaxNumTokensToRecv(), hiddenDim},
-                       torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA));
+  torch::Tensor out = torch::from_blob(
+      handle.shmemDispatchOutTokMemObj->Get(), {handle.config.MaxNumTokensToRecv(), hiddenDim},
+      torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA));
 
   torch::Tensor outWeights = torch::from_blob(
       handle.shmemDispatchOutWeightsMemObj->Get(),
@@ -142,9 +141,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
                        useExternalInpBuf, at::cuda::getCurrentHIPStream(), hiddenDim);
 
   auto options = torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA);
-  torch::Tensor out =
-      torch::from_blob(handle.shmemCombineOutTokMemObj->Get(),
-                       {handle.config.maxNumInpTokenPerRank, hiddenDim}, options);
+  torch::Tensor out = torch::from_blob(handle.shmemCombineOutTokMemObj->Get(),
+                                       {handle.config.maxNumInpTokenPerRank, hiddenDim}, options);
 
   std::optional<torch::Tensor> outWeights{std::nullopt};
   if (weightsPtr) {
@@ -259,9 +257,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombineForStandard
 
   // Get output tensor from shmem buffer
   auto options = torch::TensorOptions().dtype(expertOutput.scalar_type()).device(torch::kCUDA);
-  torch::Tensor out =
-      torch::from_blob(handle.shmemCombineOutTokMemObj->Get(),
-                       {handle.config.maxNumInpTokenPerRank, hiddenDim}, options);
+  torch::Tensor out = torch::from_blob(handle.shmemCombineOutTokMemObj->Get(),
+                                       {handle.config.maxNumInpTokenPerRank, hiddenDim}, options);
 
   std::optional<torch::Tensor> outWeights{std::nullopt};
   // TODO: do not support weights for standard MoE now
@@ -347,10 +344,10 @@ torch::Tensor ConvertCombineInput(mori::moe::EpDispatchCombineHandle& handle,
                        {handle.config.MaxNumTokensToRecv(), hidden}, options);
 
   // Note: packedRecvLayoutRange is not used in current implementation (passed as nullptr)
-  handle.LaunchConvertCombineInputKernel(
-      packedRecvX.data_ptr(), packedRecvSrcInfo.data_ptr(), nullptr, combineInput.data_ptr(),
-      handle.shmemCombineInpTokMemObj, blockNum, warpPerBlock, at::cuda::getCurrentHIPStream(),
-      hidden);
+  handle.LaunchConvertCombineInputKernel(packedRecvX.data_ptr(), packedRecvSrcInfo.data_ptr(),
+                                         nullptr, combineInput.data_ptr(),
+                                         handle.shmemCombineInpTokMemObj, blockNum, warpPerBlock,
+                                         at::cuda::getCurrentHIPStream(), hidden);
 
   return combineInput;
 }
@@ -407,10 +404,9 @@ torch::Tensor GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle
   TORCH_CHECK(actualHiddenDim > 0, "registered combine input hidden dim must be > 0");
   TORCH_CHECK(actualHiddenDim <= handle.config.hiddenDim, "requested hidden dim ", actualHiddenDim,
               " exceeds config.hidden_dim ", handle.config.hiddenDim);
-  torch::Tensor out =
-      torch::from_blob(handle.shmemCombineInpTokMemObj->Get(),
-                       {handle.config.MaxNumTokensToRecv(), actualHiddenDim},
-                       torch::TensorOptions().dtype(scalarType).device(torch::kCUDA));
+  torch::Tensor out = torch::from_blob(
+      handle.shmemCombineInpTokMemObj->Get(), {handle.config.MaxNumTokensToRecv(), actualHiddenDim},
+      torch::TensorOptions().dtype(scalarType).device(torch::kCUDA));
   return out;
 }
 
@@ -782,6 +778,7 @@ void RegisterMoriIo(pybind11::module_& m) {
 
   py::class_<mori::io::EngineDesc>(m, "EngineDesc")
       .def_readonly("key", &mori::io::EngineDesc::key)
+      .def_readonly("node_id", &mori::io::EngineDesc::nodeId)
       .def_readonly("hostname", &mori::io::EngineDesc::hostname)
       .def_readonly("host", &mori::io::EngineDesc::host)
       .def_readonly("port", &mori::io::EngineDesc::port)

@@ -106,6 +106,7 @@ def test_engine_desc():
     engine.create_backend(BackendType.RDMA)
 
     desc = engine.get_engine_desc()
+    assert desc.node_id != ""
 
     packed_desc = desc.pack()
     unpacked_desc = EngineDesc.unpack(packed_desc)
@@ -122,10 +123,22 @@ def test_engine_desc_port_zero_auto_bind():
 
     desc = engine.get_engine_desc()
     assert desc.port > 0
+    assert desc.node_id != ""
 
     packed_desc = desc.pack()
     unpacked_desc = EngineDesc.unpack(packed_desc)
     assert desc == unpacked_desc
+
+
+def test_engine_desc_node_id_env_override(monkeypatch):
+    monkeypatch.setenv("MORI_IO_NODE_ID", "node-id-test")
+    config = IOEngineConfig(
+        host="127.0.0.1",
+        port=get_free_port(),
+    )
+    engine = IOEngine(key="engine_node_id", config=config)
+    desc = engine.get_engine_desc()
+    assert desc.node_id == "node-id-test"
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 1, reason="requires GPU")
