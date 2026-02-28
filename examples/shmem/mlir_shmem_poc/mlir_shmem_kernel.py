@@ -102,7 +102,6 @@ def _find_mori_shmem_bc() -> str:
       2. $MORI_HOME/lib/
       3. <mori_repo>/lib/          (output of tools/build_shmem_bitcode.sh)
       4. <mori_repo>/build/lib/
-      5. <triton-dist>/python/triton_dist/tools/compile/  (legacy fallback)
     """
     candidates = []
     if os.environ.get("MORI_SHMEM_BC"):
@@ -115,11 +114,6 @@ def _find_mori_shmem_bc() -> str:
     mori_root = os.path.abspath(os.path.join(script_dir, "../../.."))
     candidates.append(os.path.join(mori_root, "lib", "libmori_shmem_device.bc"))
     candidates.append(os.path.join(mori_root, "build", "lib",
-                                   "libmori_shmem_device.bc"))
-
-    # Legacy: triton-dist workspace
-    ws = os.path.abspath(os.path.join(mori_root, "../.."))
-    candidates.append(os.path.join(ws, "python/triton_dist/tools/compile",
                                    "libmori_shmem_device.bc"))
 
     for p in candidates:
