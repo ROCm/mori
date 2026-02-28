@@ -146,7 +146,7 @@ def export_to_perfetto(
     sanitize_orphans=True,
 ):
     if not gpu_freq_ghz:
-        gpu_freq_ghz = mori_cpp.get_cur_device_wall_clock_freq_mhz() / 1e6
+        gpu_freq_ghz = mori_cpp.get_cur_device_wall_clock_freq_khz() / 1e6
 
     if slot_map is None:
         slot_map = _discover_all_slots()

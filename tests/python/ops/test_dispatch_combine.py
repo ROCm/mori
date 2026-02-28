@@ -339,40 +339,174 @@ def _test_dispatch_combine(
     test_case.run_test_once(op, test_data)
 
 
+def _test_dispatch_combine_elastic(
+    rank,
+    world_size,
+    data_type,
+    hidden_dim,
+    max_num_inp_token_per_rank,
+    num_experts_per_rank,
+    num_experts_per_token,
+    use_external_inp_buf,
+    timeout_us,
+):
+    config = mori.ops.EpDispatchCombineConfig(
+        data_type=data_type,
+        rank=rank,
+        world_size=world_size,
+        hidden_dim=hidden_dim // 2 if _is_fp4x2_dtype(data_type) else hidden_dim,
+        scale_dim=0,
+        scale_type_size=4,
+        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+        num_experts_per_rank=num_experts_per_rank,
+        num_experts_per_token=num_experts_per_token,
+        max_token_type_size=4,
+        block_num=40,
+        warp_num_per_block=8,
+        use_external_inp_buf=use_external_inp_buf,
+    )
+    op = mori.ops.EpDispatchCombineOp(config)
+    test_case = EpDispatchCombineTestCase(config)
+    test_data = test_case.gen_test_data(use_max_token_num=True)
+
+    (
+        all_rank_num_token,
+        all_rank_indices,
+        all_rank_input,
+        all_rank_weights,
+        _all_rank_scales,
+    ) = test_data
+
+    inactive_rank = world_size - 1
+    # Initialize all ranks as active. The C++ timeout mechanism will set
+    # active_ranks[inactive_rank] to 0 when it detects unresponsiveness!
+    active_ranks = torch.ones((world_size,), dtype=torch.int32, device=test_case.device)
+
+    test_case.sync()
+
+    # Force every token to route to one expert on every rank (K == world_size),
+    # so masking out a rank changes the expected combine result.
+    per_rank_expert0 = (
+        torch.arange(world_size, device=test_case.device, dtype=torch.int32)
+        * num_experts_per_rank
+    )
+    indices_template = per_rank_expert0.view(1, world_size)
+    for r in range(world_size):
+        all_rank_indices[r] = indices_template.expand(
+            all_rank_num_token[r].item(), -1
+        ).contiguous()
+
+    is_active = rank != inactive_rank
+
+    if is_active:
+        (
+            dispatch_output,
+            dispatch_weights,
+            _dispatch_scales,
+            dispatch_indices,
+            dispatch_recv_num_token,
+        ) = op.dispatch(
+            all_rank_input[rank],
+            all_rank_weights[rank],
+            None,
+            all_rank_indices[rank],
+            active_ranks=active_ranks,
+            timeout_us=timeout_us,
+        )
+    else:
+        # Inactive rank does not call dispatch, simulating complete unresponsiveness.
+        pass
+
+    test_case.sync()
+
+    if is_active:
+        # Check that the timeout successfully marked the unresponsive rank as inactive directly in the tensor
+        assert int(active_ranks[inactive_rank].item()) == 0
+
+        # Validate we never receive tokens from the inactive source rank.
+        src_token_pos = op.get_dispatch_src_token_pos()
+        for pos in src_token_pos:
+            src_rank = int(pos) // max_num_inp_token_per_rank
+            assert src_rank != inactive_rank
+        assert int(dispatch_recv_num_token[0].item()) == int(src_token_pos.numel())
+
+        total_recv_num_token = int(dispatch_recv_num_token[0].item())
+        combine_input = dispatch_output
+        if not use_external_inp_buf:
+            combine_input = op.get_registered_combine_input_buffer(config.data_type)
+            combine_input[:total_recv_num_token, :].copy_(
+                dispatch_output[:total_recv_num_token, :]
+            )
+
+    test_case.sync()
+
+    if is_active:
+        combine_output, combine_output_weight = op.combine(
+            combine_input,
+            dispatch_weights,
+            dispatch_indices,
+            call_reset=False,
+            active_ranks=active_ranks,
+            timeout_us=timeout_us,
+        )
+
+    test_case.sync()
+
+    expected_unique_pes = world_size - 1
+    if not is_active or _is_fp4x2_dtype(config.data_type):
+        return None
+
+    for i in range(all_rank_num_token[rank]):
+        got, expected = combine_output[i], (
+            all_rank_input[rank][i].to(torch.float32) * expected_unique_pes
+        ).to(config.data_type)
+        assert torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
+
+        if combine_output_weight is not None:
+            got_weight, expected_weight = (
+                combine_output_weight[i],
+                all_rank_weights[rank][i] * expected_unique_pes,
+            )
+            assert torch.allclose(got_weight, expected_weight, atol=1e-5, rtol=1e-5)
+
+
 # TODO: create a sub process group so that we can test worlds size < 8
 @pytest.mark.parametrize("world_size", (8,))
-@pytest.mark.parametrize("data_type", (
-    [
-        torch.bfloat16,
-        pytest.param(
-            torch.float8_e4m3fnuz,
-            marks=pytest.mark.skipif(
-                not data_type_supported(torch.float8_e4m3fnuz),
-                reason="Skip float8_e4m3fnuz, it is not supported",
-            ),
-        ),
-        pytest.param(
-            torch.float8_e4m3fn,
-            marks=pytest.mark.skipif(
-                not data_type_supported(torch.float8_e4m3fn),
-                reason="Skip float8_e4m3fn, it is not supported",
-            ),
-        ),
-    ]
-    + (
+@pytest.mark.parametrize(
+    "data_type",
+    (
         [
+            torch.bfloat16,
             pytest.param(
-                TORCH_FLOAT4_E2M1FN_X2,
+                torch.float8_e4m3fnuz,
                 marks=pytest.mark.skipif(
-                    not data_type_supported(TORCH_FLOAT4_E2M1FN_X2),
-                    reason="Skip float4_e2m1fn_x2, it is not supported",
+                    not data_type_supported(torch.float8_e4m3fnuz),
+                    reason="Skip float8_e4m3fnuz, it is not supported",
                 ),
-            )
+            ),
+            pytest.param(
+                torch.float8_e4m3fn,
+                marks=pytest.mark.skipif(
+                    not data_type_supported(torch.float8_e4m3fn),
+                    reason="Skip float8_e4m3fn, it is not supported",
+                ),
+            ),
         ]
-        if TORCH_FLOAT4_E2M1FN_X2 is not None
-        else []
-    )
-))
+        + (
+            [
+                pytest.param(
+                    TORCH_FLOAT4_E2M1FN_X2,
+                    marks=pytest.mark.skipif(
+                        not data_type_supported(TORCH_FLOAT4_E2M1FN_X2),
+                        reason="Skip float4_e2m1fn_x2, it is not supported",
+                    ),
+                )
+            ]
+            if TORCH_FLOAT4_E2M1FN_X2 is not None
+            else []
+        )
+    ),
+)
 @pytest.mark.parametrize("hidden_dim", (7168, 4096))
 @pytest.mark.parametrize("scale_dim", (0, 32))
 @pytest.mark.parametrize("scale_type_size", (1, 4))
@@ -415,6 +549,54 @@ def test_dispatch_combine(
                     num_experts_per_token,
                     use_external_inp_buf,
                     quant_type,
+                ],
+            )
+        )
+
+    results = []
+    for i in range(world_size):
+        (
+            rank,
+            result,
+        ) = torch_dist_process_manager.result_queue.get()
+        results.append(result)
+
+    for result in results:
+        if result is not None:
+            pytest.assume(False, result)
+
+
+@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("data_type", (torch.bfloat16,))
+@pytest.mark.parametrize("hidden_dim", (4096,))
+@pytest.mark.parametrize("max_num_inp_token_per_rank", (16,))
+@pytest.mark.parametrize("num_experts_per_rank", (32,))
+@pytest.mark.parametrize("num_experts_per_token", (8,))
+@pytest.mark.parametrize("use_external_inp_buf", (True, False))
+def test_dispatch_combine_elastic_ep(
+    torch_dist_process_manager,
+    world_size,
+    data_type,
+    hidden_dim,
+    max_num_inp_token_per_rank,
+    num_experts_per_rank,
+    num_experts_per_token,
+    use_external_inp_buf,
+):
+    timeout_us = 500_000
+    for i in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (
+                _test_dispatch_combine_elastic,
+                [
+                    world_size,
+                    data_type,
+                    hidden_dim,
+                    max_num_inp_token_per_rank,
+                    num_experts_per_rank,
+                    num_experts_per_token,
+                    use_external_inp_buf,
+                    timeout_us,
                 ],
             )
         )

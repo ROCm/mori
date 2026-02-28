@@ -799,8 +799,9 @@ __forceinline__ __device__ void WarpCastBf16ToCombineInternalFp8(
   // Note: when T != hip_bfloat16, this function is a no-op.
   // Callers should guard with if constexpr or ensure T is hip_bfloat16.
 #else
-  static_assert(!sizeof(T*), "WarpCastBf16ToCombineInternalFp8 requires FP8 type support "
-                              "(MORI_FP8_TYPE_OCP_ENABLED or MORI_FP8_TYPE_FNUZ_ENABLED)");
+  static_assert(!sizeof(T*),
+                "WarpCastBf16ToCombineInternalFp8 requires FP8 type support "
+                "(MORI_FP8_TYPE_OCP_ENABLED or MORI_FP8_TYPE_FNUZ_ENABLED)");
 #endif
 }
 
@@ -1033,9 +1034,75 @@ __forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16(
   // Note: when T != hip_bfloat16, this function is a no-op.
   // Callers should guard with if constexpr or ensure T is hip_bfloat16.
 #else
-  static_assert(!sizeof(T*), "WarpAccumCombineInternalFp8ToBf16 requires FP8 type support "
-                              "(MORI_FP8_TYPE_OCP_ENABLED or MORI_FP8_TYPE_FNUZ_ENABLED)");
+  static_assert(!sizeof(T*),
+                "WarpAccumCombineInternalFp8ToBf16 requires FP8 type support "
+                "(MORI_FP8_TYPE_OCP_ENABLED or MORI_FP8_TYPE_FNUZ_ENABLED)");
 #endif
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                      Elastic EP Utilities                                      */
+/* ---------------------------------------------------------------------------------------------- */
+inline __device__ bool IsRankActive(const int32_t* activeRanks, int rank) {
+  if (activeRanks == nullptr) return true;
+  return AtomicLoadRelaxedSystem(const_cast<int32_t*>(activeRanks) + rank) != 0;
+}
+
+inline __device__ void MarkRankInactive(int32_t* activeRanks, int rank) {
+  if (activeRanks == nullptr) return;
+  AtomicStoreRelaxedSystem(activeRanks + rank, int32_t{0});
+}
+
+inline __device__ void MarkRanksInactive(int32_t* activeRanks, int startRank, int count) {
+  if (activeRanks == nullptr) return;
+  for (int i = 0; i < count; ++i) {
+    AtomicStoreRelaxedSystem(activeRanks + startRank + i, int32_t{0});
+  }
+}
+
+template <typename T>
+inline __device__ T WaitUntilGreaterThanOrTimeoutSystem(T* addr, T val, int64_t timeoutTicks,
+                                                        int32_t* activeRanks, int watchedRank) {
+  if (timeoutTicks < 0) {
+    T got;
+    do {
+      got = AtomicLoadRelaxedSystem(addr);
+    } while (got <= val);
+    return got;
+  }
+
+  const unsigned long long start = wall_clock64();
+  while (true) {
+    T got = AtomicLoadRelaxedSystem(addr);
+    if (got > val) return got;
+    if (!IsRankActive(activeRanks, watchedRank)) return got;
+    const unsigned long long now = wall_clock64();
+    if (now - start > static_cast<unsigned long long>(timeoutTicks)) {
+      MarkRankInactive(activeRanks, watchedRank);
+      return got;
+    }
+  }
+}
+
+template <typename T>
+inline __device__ bool WaitUntilEqualsOrTimeoutSystem(T* addr, T val, int64_t timeoutTicks,
+                                                      int32_t* activeRanks, int watchedRank) {
+  if (timeoutTicks < 0) {
+    while (AtomicLoadRelaxedSystem(addr) != val) {
+    }
+    return true;
+  }
+
+  const unsigned long long start = wall_clock64();
+  while (true) {
+    if (AtomicLoadRelaxedSystem(addr) == val) return true;
+    if (!IsRankActive(activeRanks, watchedRank)) return false;
+    const unsigned long long now = wall_clock64();
+    if (now - start > static_cast<unsigned long long>(timeoutTicks)) {
+      MarkRankInactive(activeRanks, watchedRank);
+      return false;
+    }
+  }
 }
 
 }  // namespace core

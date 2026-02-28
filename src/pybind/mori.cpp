@@ -48,12 +48,45 @@
 /* ---------------------------------------------------------------------------------------------- */
 namespace {
 
+void MaybeUpdateElasticState(mori::moe::EpDispatchCombineHandle& handle,
+                             const std::optional<torch::Tensor>& activeRanks,
+                             const std::optional<int64_t>& timeoutUs) {
+  int32_t* activeRanksPtr = handle.activeRanks;
+  int64_t timeoutTicks = handle.timeoutTicks;
+
+  if (activeRanks.has_value()) {
+    TORCH_CHECK(activeRanks->is_cuda(), "active_ranks must be a CUDA tensor");
+    TORCH_CHECK(activeRanks->is_contiguous(), "active_ranks must be contiguous");
+    TORCH_CHECK(activeRanks->dim() == 1, "active_ranks must be a 1D tensor");
+    TORCH_CHECK(activeRanks->scalar_type() == torch::kInt32, "active_ranks must be int32");
+    TORCH_CHECK(activeRanks->numel() == handle.config.worldSize, "active_ranks must have shape (",
+                handle.config.worldSize, ")");
+    activeRanksPtr = activeRanks->data_ptr<int32_t>();
+  }
+
+  if (timeoutUs.has_value()) {
+    if (timeoutUs.value() < 0) {
+      timeoutTicks = -1;
+    } else {
+      timeoutTicks = static_cast<int64_t>(handle.wallClockRateKHz) * timeoutUs.value() / 1000;
+    }
+  }
+
+  if (activeRanks.has_value() || timeoutUs.has_value()) {
+    handle.SetElasticState(activeRanksPtr, timeoutTicks);
+  }
+}
+
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, torch::Tensor,
            torch::Tensor>
 LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
                const torch::Tensor& input, const std::optional<torch::Tensor>& weights,
                const std::optional<torch::Tensor>& scales, const torch::Tensor& topkIds,
-               int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1) {
+               int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+               const std::optional<torch::Tensor>& activeRanks = std::nullopt,
+               const std::optional<int64_t>& timeoutUs = std::nullopt) {
+  MaybeUpdateElasticState(handle, activeRanks, timeoutUs);
+
   TORCH_CHECK(input.is_contiguous(), "dispatch input must be contiguous");
   TORCH_CHECK(topkIds.is_contiguous(), "dispatch topkIds must be contiguous");
   const int hiddenDim = static_cast<int>(input.size(1));
@@ -120,7 +153,11 @@ LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
 std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
     mori::moe::EpDispatchCombineHandle& handle, int kernelType, const torch::Tensor& input,
     const std::optional<torch::Tensor>& weights, const torch::Tensor& topkIds, int blockNum = -1,
-    int rdmaBlockNum = -1, int warpPerBlock = -1, int useExternalInpBuf = -1) {
+    int rdmaBlockNum = -1, int warpPerBlock = -1, int useExternalInpBuf = -1,
+    const std::optional<torch::Tensor>& activeRanks = std::nullopt,
+    const std::optional<int64_t>& timeoutUs = std::nullopt) {
+  MaybeUpdateElasticState(handle, activeRanks, timeoutUs);
+
   TORCH_CHECK(input.is_contiguous(), "combine input must be contiguous");
   TORCH_CHECK(topkIds.is_contiguous(), "combine topkIds must be contiguous");
   const int hiddenDim = static_cast<int>(input.size(1));
@@ -354,13 +391,19 @@ torch::Tensor ConvertCombineInput(mori::moe::EpDispatchCombineHandle& handle,
 #endif  // ENABLE_STANDARD_MOE_ADAPT
 
 void LaunchDispatchRecv(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
-                        int blockNum = -1, int warpPerBlock = -1) {
+                        int blockNum = -1, int warpPerBlock = -1,
+                        const std::optional<torch::Tensor>& activeRanks = std::nullopt,
+                        const std::optional<int64_t>& timeoutUs = std::nullopt) {
+  MaybeUpdateElasticState(handle, activeRanks, timeoutUs);
   handle.LaunchDispatchRecv((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
                             at::cuda::getCurrentHIPStream());
 }
 
 void LaunchCombineRecv(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
-                       int blockNum = -1, int warpPerBlock = -1) {
+                       int blockNum = -1, int warpPerBlock = -1,
+                       const std::optional<torch::Tensor>& activeRanks = std::nullopt,
+                       const std::optional<int64_t>& timeoutUs = std::nullopt) {
+  MaybeUpdateElasticState(handle, activeRanks, timeoutUs);
   handle.LaunchCombineRecv((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
                            at::cuda::getCurrentHIPStream());
 }
@@ -426,7 +469,7 @@ torch::Tensor GetDebugTimeOffset(mori::moe::EpDispatchCombineHandle& handle) {
 }
 #endif
 
-int GetCurDeviceWallClockFreqMhz() { return mori::GetCurDeviceWallClockFreqMhz(); }
+int GetCurDeviceWallClockFreqKHz() { return mori::GetCurDeviceWallClockFreqKHz(); }
 
 void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   std::string className = std::string("EpDispatchCombineHandle");
@@ -640,8 +683,8 @@ void RegisterMoriOps(py::module_& m) {
 
   DeclareEpDispatchCombineHandle(m);
 
-  m.def("get_cur_device_wall_clock_freq_mhz", &GetCurDeviceWallClockFreqMhz,
-        "Returns clock frequency of current device's wall clock");
+  m.def("get_cur_device_wall_clock_freq_khz", &GetCurDeviceWallClockFreqKHz,
+        "Returns clock frequency of current device's wall clock in KHz");
 
   m.def("cast", &Cast, "cast a tensor from type A to type B");
 }

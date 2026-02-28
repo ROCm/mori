@@ -48,16 +48,16 @@ inline int GetCurDeviceMaxThreads() {
   return GetMaxThreads(device);
 }
 
-inline int GetDeviceWallClockFreqMhz(int device) {
+inline int GetDeviceWallClockFreqKHz(int device) {
   int rate;
   HIP_RUNTIME_CHECK(hipDeviceGetAttribute(&rate, hipDeviceAttributeWallClockRate, device));
   return rate;
 }
 
-inline int GetCurDeviceWallClockFreqMhz() {
+inline int GetCurDeviceWallClockFreqKHz() {
   int device = 0;
   HIP_RUNTIME_CHECK(hipGetDevice(&device));
-  return GetDeviceWallClockFreqMhz(device);
+  return GetDeviceWallClockFreqKHz(device);
 }
 
 }  // namespace mori

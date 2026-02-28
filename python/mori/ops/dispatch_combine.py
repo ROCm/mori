@@ -204,6 +204,8 @@ class EpDispatchCombineOp:
         block_num: int = -1,
         rdma_block_num: int = -1,
         warp_per_block: int = -1,
+        active_ranks=None,
+        timeout_us=None,
     ):
         """Dispatch tokens to experts based on top-k indices.
 
@@ -225,6 +227,8 @@ class EpDispatchCombineOp:
             self.auto_block_num if self.auto_block_num else block_num,
             self.auto_rdma_block_num if self.auto_rdma_block_num else rdma_block_num,
             self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
+            active_ranks,
+            timeout_us,
         )
 
     def dispatch_send(
@@ -235,6 +239,8 @@ class EpDispatchCombineOp:
         indices: torch.Tensor,
         block_num: int = -1,
         warp_per_block: int = -1,
+        active_ranks=None,
+        timeout_us=None,
     ):
         return self.dispatch(
             input,
@@ -243,18 +249,24 @@ class EpDispatchCombineOp:
             indices,
             self.auto_block_num if self.auto_block_num else block_num,
             self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
+            active_ranks=active_ranks,
+            timeout_us=timeout_us,
         )
 
     def dispatch_recv(
         self,
         block_num: int = -1,
         warp_per_block: int = -1,
+        active_ranks=None,
+        timeout_us=None,
     ):
         return self._dispatch_recv_func(
             self._handle,
             self.config.kernel_type.value,
             self.auto_block_num if self.auto_block_num else block_num,
             self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
+            active_ranks,
+            timeout_us,
         )
 
     def combine(
@@ -267,6 +279,8 @@ class EpDispatchCombineOp:
         warp_per_block: int = -1,
         use_external_inp_buf: int = -1,
         call_reset: bool = False,
+        active_ranks=None,
+        timeout_us=None,
     ):
         """Combine tokens from experts back to original positions.
 
@@ -291,6 +305,8 @@ class EpDispatchCombineOp:
             self.auto_rdma_block_num if self.auto_rdma_block_num else rdma_block_num,
             self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
             use_external_inp_buf,
+            active_ranks,
+            timeout_us,
         )
         if call_reset:
             self._reset_func(self._handle)
@@ -303,6 +319,8 @@ class EpDispatchCombineOp:
         indices: torch.Tensor,
         block_num: int = -1,
         warp_per_block: int = -1,
+        active_ranks=None,
+        timeout_us=None,
     ):
         return self.combine(
             input,
@@ -310,18 +328,24 @@ class EpDispatchCombineOp:
             indices,
             self.auto_block_num if self.auto_block_num else block_num,
             self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
+            active_ranks=active_ranks,
+            timeout_us=timeout_us,
         )
 
     def combine_recv(
         self,
         block_num: int = -1,
         warp_per_block: int = -1,
+        active_ranks=None,
+        timeout_us=None,
     ):
         return self._combine_recv_func(
             self._handle,
             self.config.kernel_type.value,
             self.auto_block_num if self.auto_block_num else block_num,
             self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
+            active_ranks,
+            timeout_us,
         )
 
     def dispatch_standard_moe(

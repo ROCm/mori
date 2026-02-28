@@ -21,11 +21,12 @@
 // SOFTWARE.
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 
-#include <algorithm>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
+
+#include <algorithm>
 
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem.hpp"
@@ -65,6 +66,7 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
   this->maxThreads = std::min(GetCurDeviceMaxThreads(), 1024);
   MORI_OPS_INFO("Device capability: multiProcessorCount=%d, maxThreads=%d",
                 static_cast<int>(this->multiProcessorCount), static_cast<int>(this->maxThreads));
+  this->wallClockRateKHz = GetCurDeviceWallClockFreqKHz();
 }
 
 EpDispatchCombineHandle::~EpDispatchCombineHandle() {
