@@ -13,122 +13,84 @@ Usage:
 import os
 import sys
 import time
+import re
+import tempfile
+import subprocess
 
 import torch
 import torch.distributed as dist
 import triton
 import triton.language as tl
 from triton.language import core
-from triton.language.core import builtin, tensor
 from triton import knobs
-from typing import List
-import builtins
 
 
 # ===================================================================
-# 1. extern_call helpers (from triton.language.core)
-# ===================================================================
-def _dispatch(func, lib_name, lib_path, args, arg_type_symbol_dict,
-              is_pure, _semantic):
-    arg_types, arg_list = [], []
-    for arg in args:
-        if isinstance(arg, tensor):
-            arg_types.append(arg.dtype)
-            arg_list.append(arg.handle)
-        else:
-            arg_types.append(type(arg))
-            arg_list.append(arg)
-    arg_types = tuple(arg_types)
-    symbol = arg_type_symbol_dict[arg_types][0]
-    ret_types = arg_type_symbol_dict[arg_types][1]
-    if not isinstance(ret_types, (List, tuple)):
-        ret_types = [ret_types]
-    call = func(lib_name, lib_path, symbol, arg_list,
-                [rt.to_ir(_semantic.builder) for rt in ret_types], is_pure)
-    if len(ret_types) == 0:
-        return tensor(call, core.void)
-    if len(ret_types) == 1:
-        return tensor(call.get_result(0), ret_types[0])
-    return tuple(tensor(call.get_result(i), ty) for i, ty in enumerate(ret_types))
-
-
-@builtin
-def extern_call(lib_name, lib_path, args, arg_type_symbol_dict,
-                is_pure, _semantic=None):
-    dispatch_args = args.copy()
-    for i in builtins.range(len(dispatch_args)):
-        dispatch_args[i] = _semantic.to_tensor(dispatch_args[i])
-    func = _semantic.builder.create_extern_call
-    return _dispatch(func, lib_name, lib_path, dispatch_args,
-                     arg_type_symbol_dict, is_pure, _semantic)
-
-
-# ===================================================================
-# 2. Mori shmem device function declarations
+# 1. Mori shmem device function declarations
 # ===================================================================
 SIGNAL_SET = tl.constexpr(9)
 
 @core.extern
 def shmem_my_pe(_semantic=None):
-    return extern_call("libmori_shmem_device", "", [],
-                       {(): ("mori_shmem_my_pe", (tl.int32))},
-                       is_pure=False, _semantic=_semantic)
+    return core.extern_elementwise("libmori_shmem_device", "", [],
+                                   {(): ("mori_shmem_my_pe", tl.int32)},
+                                   is_pure=False, _semantic=_semantic)
 
 @core.extern
 def shmem_n_pes(_semantic=None):
-    return extern_call("libmori_shmem_device", "", [],
-                       {(): ("mori_shmem_n_pes", (tl.int32))},
-                       is_pure=True, _semantic=_semantic)
+    return core.extern_elementwise("libmori_shmem_device", "", [],
+                                   {(): ("mori_shmem_n_pes", tl.int32)},
+                                   is_pure=True, _semantic=_semantic)
 
 @core.extern
 def shmem_ptr_p2p(dest_ptr, my_pe, dest_pe, _semantic=None):
-    return extern_call(
+    return core.extern_elementwise(
         "libmori_shmem_device", "",
         [tl.cast(dest_ptr, tl.uint64, _semantic=_semantic),
          tl.cast(my_pe, tl.int32, _semantic=_semantic),
          tl.cast(dest_pe, tl.int32, _semantic=_semantic)],
-        {(tl.uint64, tl.int32, tl.int32): ("mori_shmem_ptr_p2p", (tl.uint64,))},
+        {(tl.uint64, tl.int32, tl.int32): ("mori_shmem_ptr_p2p", tl.uint64)},
         is_pure=False, _semantic=_semantic)
 
 @core.extern
 def shmem_putmem_nbi_signal_block(dest, source, nbytes, sig_addr, sig_val,
                                   sig_op, pe, qp_id, _semantic=None):
-    return extern_call(
+    return core.extern_elementwise(
         "libmori_shmem_device", "",
-        [tl.cast(dest, tl.pointer_type(tl.void), _semantic=_semantic),
-         tl.cast(source, tl.pointer_type(tl.void), _semantic=_semantic),
+        [tl.cast(dest, tl.uint64, _semantic=_semantic),
+         tl.cast(source, tl.uint64, _semantic=_semantic),
          tl.cast(nbytes, tl.uint64, _semantic=_semantic),
-         tl.cast(sig_addr, tl.pointer_type(tl.void), _semantic=_semantic),
+         tl.cast(sig_addr, tl.uint64, _semantic=_semantic),
          tl.cast(sig_val, tl.uint64, _semantic=_semantic),
          tl.cast(sig_op, tl.int32, _semantic=_semantic),
          tl.cast(pe, tl.int32, _semantic=_semantic),
          tl.cast(qp_id, tl.int32, _semantic=_semantic)],
-        {(tl.pointer_type(tl.void), tl.pointer_type(tl.void), tl.uint64,
-          tl.pointer_type(tl.void), tl.uint64, tl.int32, tl.int32, tl.int32):
-         ("mori_shmem_putmem_nbi_signal_block", ())},
+        {(tl.uint64, tl.uint64, tl.uint64, tl.uint64, tl.uint64,
+          tl.int32, tl.int32, tl.int32):
+         ("mori_shmem_putmem_nbi_signal_block", tl.int32)},
         is_pure=False, _semantic=_semantic)
 
 @core.extern
 def shmem_uint64_wait_until_equals(addr, val, _semantic=None):
-    return extern_call(
+    return core.extern_elementwise(
         "libmori_shmem_device", "",
-        [tl.cast(addr, tl.pointer_type(tl.uint64), _semantic=_semantic),
+        [tl.cast(addr, tl.uint64, _semantic=_semantic),
          tl.cast(val, tl.uint64, _semantic=_semantic)],
-        {(tl.pointer_type(tl.uint64), tl.uint64):
-         ("mori_shmem_uint64_wait_until_equals", ())},
+        {(tl.uint64, tl.uint64):
+         ("mori_shmem_uint64_wait_until_equals", tl.int32)},
         is_pure=False, _semantic=_semantic)
 
 @core.extern
 def shmem_quiet(_semantic=None):
-    return extern_call("libmori_shmem_device", "", [],
-                       {(): ("mori_shmem_quiet_thread", ())},
-                       is_pure=False, _semantic=_semantic)
+    return core.extern_elementwise("libmori_shmem_device", "", [],
+                                   {(): ("mori_shmem_quiet_thread", tl.int32)},
+                                   is_pure=False, _semantic=_semantic)
 
 @core.extern
 def shmem_barrier_all_block(_semantic=None):
-    return extern_call("libmori_shmem_device", "", [],
-                       {(): ("mori_shmem_barrier_all_block", ())},
-                       is_pure=False, _semantic=_semantic)
+    return core.extern_elementwise("libmori_shmem_device", "", [],
+                                   {(): ("mori_shmem_barrier_all_block", tl.int32)},
+                                   is_pure=False, _semantic=_semantic)
 
 
 # ===================================================================
@@ -209,10 +171,10 @@ def allreduce_put_signal_kernel(
                 m = o < N
                 tl.store(recv_ptr + mype * N + o,
                          tl.load(input_ptr + o, mask=m), mask=m)
+            # Self-copy done: signal so other blocks know our data is ready
+            sig_addr = signal_ptr + mype
+            tl.atomic_add(sig_addr, 1, sem='release')
         else:
-            # Put this chunk to target_pe's recv_buf[mype] at chunk_offset
-            # Use SIGNAL_ADD so all chunks from all blocks to the same PE
-            # accumulate into one signal. When signal == CHUNKS_PER_PE, all done.
             shmem_putmem_nbi_signal_block(
                 recv_ptr + mype * N + chunk_offset,
                 input_ptr + chunk_offset,
@@ -225,13 +187,16 @@ def allreduce_put_signal_kernel(
             )
             shmem_quiet()
 
-    # Phase 2: all blocks wait for all signals
-    # Each PE has CHUNKS_PER_PE blocks sending to it, each adding 1.
-    # Signal from PE i is complete when signal_buf[i] == CHUNKS_PER_PE.
+    # Phase 2: all blocks wait for all signals (including self)
     for i in tl.static_range(MAX_PES):
-        if i < npes and i != mype:
-            shmem_uint64_wait_until_equals(
-                signal_ptr + i, tl.cast(CHUNKS_PER_PE, tl.uint64))
+        if i < npes:
+            if i == mype:
+                # Wait for local self-copy signal
+                while tl.atomic_add(signal_ptr + mype, 0, sem='acquire') < CHUNKS_PER_PE:
+                    pass
+            else:
+                shmem_uint64_wait_until_equals(
+                    signal_ptr + i, tl.cast(CHUNKS_PER_PE, tl.uint64))
 
     # Phase 3: multi-block accumulate across all TOTAL_BLOCKS blocks
     total_blocks = MAX_PES * CHUNKS_PER_PE
@@ -277,8 +242,29 @@ def _install_shmem_hook():
     knobs.runtime.jit_post_compile_hook = hook
 
 
+def _strip_lifetime_intrinsics(bc_path):
+    """Strip llvm.lifetime intrinsics to avoid LLVM version mismatches."""
+    rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
+    llvm_dis = os.path.join(rocm, "llvm", "bin", "llvm-dis")
+    llvm_link = os.path.join(rocm, "llvm", "bin", "llvm-link")
+    pid = os.getpid()
+    ll_path = os.path.join(tempfile.gettempdir(), f'shmem_device_ar_{pid}.ll')
+    clean_ll = os.path.join(tempfile.gettempdir(), f'shmem_device_ar_clean_{pid}.ll')
+    clean_bc = os.path.join(tempfile.gettempdir(), f'shmem_device_ar_clean_{pid}.bc')
+    subprocess.check_call([llvm_dis, bc_path, '-o', ll_path])
+    with open(ll_path) as f:
+        text = f.read()
+    text = re.sub(r'^\s*call void @llvm\.lifetime\.[^\n]*\n', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^declare void @llvm\.lifetime\.[^\n]*\n', '', text, flags=re.MULTILINE)
+    with open(clean_ll, 'w') as f:
+        f.write(text)
+    subprocess.check_call([llvm_link, clean_ll, '-o', clean_bc])
+    return clean_bc
+
+
 def _get_extern_libs():
-    return {"mori_shmem": _find_mori_shmem_bc()}
+    bc = _find_mori_shmem_bc()
+    return {"mori_shmem": _strip_lifetime_intrinsics(bc)}
 
 
 # ===================================================================
