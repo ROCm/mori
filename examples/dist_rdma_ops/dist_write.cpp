@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include <hip/hip_runtime.h>
 #include <mpi.h>
+#include <unistd.h>
 
 #include "args_parser.hpp"
 #include "mori/application/application.hpp"
@@ -430,7 +431,7 @@ int GetGpuidByNicName(std::string nic_name) {
       auto* gpuPci = pciSys->Node(gpu->busId);
       auto* nicPci = pciSys->Node(nic->busId);
 #if 0
-      if (!path) {     
+      if (!path) {
         printf("gpu %s nic %s no direct link\n", gpu->busId.String().c_str(),
                nic->busId.String().c_str());
       } else {
@@ -536,18 +537,97 @@ void distRdmaOps(int argc, char* argv[]) {
 
   // 4 Register buffer and block sync memory
   void* buffer;
+  hipMemGenericAllocationHandle_t vmmHandle;  // VMM handle (only used if useVMM is true)
+  int vmmDmabufFd = -1;                       // dmabuf file descriptor for VMM memory
   size_t totalSize = maxSize * blocks * threads;
   assert(totalSize <= 0x1000000000ULL && "Error: totalSize cannot exceed 64GB!");
-  HIP_RUNTIME_CHECK(hipMalloc(&buffer, totalSize));
-  HIP_RUNTIME_CHECK(hipMemset(buffer, local_rank, totalSize));
+
+  bool useVMM = args.getUseVMM();
+  size_t bufferSize = totalSize;  // Actual allocated size (may differ from totalSize for VMM)
+  size_t vmmChunkSize = 0;        // VMM chunk size for cleanup
+
+  // Exchange GPU IDs across all ranks for VMM cross-GPU access
+  std::vector<int> all_gpu_ids(world_size);
+  bootNet.Allgather(&gpu_id, all_gpu_ids.data(), sizeof(int));
+
+  if (useVMM) {
+    // Use VMM-based allocation
+    std::cout << "Local rank " << local_rank
+              << " using VMM allocation for buffer (size=" << totalSize << " bytes)" << std::endl;
+
+    // Determine chunk size (align to 64MB for VMM)
+    constexpr size_t DEFAULT_VMM_CHUNK_SIZE = 64 * 1024 * 1024;  // 64MB
+    vmmChunkSize = DEFAULT_VMM_CHUNK_SIZE;
+
+    // Round up totalSize to multiple of chunkSize
+    bufferSize = ((totalSize + vmmChunkSize - 1) / vmmChunkSize) * vmmChunkSize;
+
+    // Reserve virtual address space
+    HIP_RUNTIME_CHECK(hipMemAddressReserve(&buffer, bufferSize, vmmChunkSize, nullptr, 0));
+
+    // Create physical memory handle
+    hipMemAllocationProp allocProp = {};
+    allocProp.type = hipMemAllocationTypePinned;
+    allocProp.location.type = hipMemLocationTypeDevice;
+    allocProp.location.id = gpu_id;
+    allocProp.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
+
+    HIP_RUNTIME_CHECK(hipMemCreate(&vmmHandle, bufferSize, &allocProp, 0));
+
+    // Map physical memory to virtual address
+    HIP_RUNTIME_CHECK(hipMemMap(buffer, bufferSize, 0, vmmHandle, 0));
+
+    // Set access permissions for ALL GPUs to enable RDMA cross-GPU access
+    std::vector<hipMemAccessDesc> accessDescs(world_size);
+    for (int i = 0; i < world_size; ++i) {
+      accessDescs[i].location.type = hipMemLocationTypeDevice;
+      accessDescs[i].location.id = all_gpu_ids[i];
+      accessDescs[i].flags = hipMemAccessFlagsProtReadWrite;
+    }
+    HIP_RUNTIME_CHECK(hipMemSetAccess(buffer, bufferSize, accessDescs.data(), world_size));
+
+    std::cout << "Local rank " << local_rank << " VMM buffer: set access for " << world_size
+              << " GPUs [";
+    for (int i = 0; i < world_size; ++i) {
+      std::cout << all_gpu_ids[i];
+      if (i < world_size - 1) std::cout << ", ";
+    }
+    std::cout << "]" << std::endl;
+
+    // Export VMM handle as dmabuf fd for RDMA registration
+    HIP_RUNTIME_CHECK(hipMemExportToShareableHandle(&vmmDmabufFd, vmmHandle,
+                                                    hipMemHandleTypePosixFileDescriptor, 0));
+
+    std::cout << "Local rank " << local_rank << " VMM dmabuf fd: " << vmmDmabufFd << std::endl;
+
+    // Initialize buffer
+    HIP_RUNTIME_CHECK(hipMemset(buffer, local_rank, totalSize));
+
+    std::cout << "Local rank " << local_rank << " VMM buffer allocated at " << buffer
+              << " (requested=" << totalSize << " aligned=" << bufferSize << ")" << std::endl;
+  } else {
+    // Use standard hipMalloc
+    std::cout << "Local rank " << local_rank << " using hipMalloc for buffer (size=" << totalSize
+              << " bytes)" << std::endl;
+    HIP_RUNTIME_CHECK(hipMalloc(&buffer, totalSize));
+    HIP_RUNTIME_CHECK(hipMemset(buffer, local_rank, totalSize));
+  }
+
   uint32_t* blockSync;
   HIP_RUNTIME_CHECK(hipMalloc(&blockSync, (warmupIters + iters + 1) * sizeof(uint32_t)));
   HIP_RUNTIME_CHECK(hipMemset(blockSync, 0, (warmupIters + iters + 1) * sizeof(uint32_t)));
 
-  // assert(!posix_memalign(&buffer_1, 4096, allreduce_size));
-  // memset(buffer_1, 1, allreduce_size);
-  RdmaMemoryRegion mr_handle =
-      device_context->RegisterRdmaMemoryRegion(buffer, totalSize, MR_ACCESS_FLAG);
+  RdmaMemoryRegion mr_handle;
+  if (useVMM && vmmDmabufFd >= 0) {
+    // Use dmabuf registration for VMM memory
+    mr_handle = device_context->RegisterRdmaMemoryRegionDmabuf(buffer, bufferSize, vmmDmabufFd,
+                                                               MR_ACCESS_FLAG);
+    std::cout << "Local rank " << local_rank
+              << " registered VMM buffer via dmabuf (fd=" << vmmDmabufFd << ")" << std::endl;
+  } else {
+    // Use standard registration for hipMalloc memory
+    mr_handle = device_context->RegisterRdmaMemoryRegion(buffer, bufferSize, MR_ACCESS_FLAG);
+  }
   std::vector<RdmaMemoryRegion> global_mr_handles(world_size);
   bootNet.Allgather(&mr_handle, global_mr_handles.data(), sizeof(mr_handle));
   global_mr_handles[local_rank] = mr_handle;
@@ -683,7 +763,24 @@ void distRdmaOps(int argc, char* argv[]) {
   }
 
   bootNet.Finalize();
-  HIP_RUNTIME_CHECK(hipFree(buffer));
+
+  // Cleanup buffer
+  if (useVMM) {
+    // Close dmabuf fd if it was opened
+    if (vmmDmabufFd >= 0) {
+      close(vmmDmabufFd);
+    }
+
+    // VMM cleanup using the saved bufferSize
+    HIP_RUNTIME_CHECK(hipMemUnmap(buffer, bufferSize));
+    HIP_RUNTIME_CHECK(hipMemRelease(vmmHandle));
+    HIP_RUNTIME_CHECK(hipMemAddressFree(buffer, bufferSize));
+
+  } else {
+    // Standard hipFree
+    HIP_RUNTIME_CHECK(hipFree(buffer));
+  }
+
   HIP_RUNTIME_CHECK(hipFree(devEndpoints));
   HIP_RUNTIME_CHECK(hipHostFree(bwTable));
   HIP_RUNTIME_CHECK(hipHostFree(sizeTable));

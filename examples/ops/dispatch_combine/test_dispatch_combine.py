@@ -28,15 +28,23 @@ import torch.distributed as dist
 
 os.environ["MORI_SHMEM_HEAP_SIZE"] = "6G"
 
+
+def _is_fp4x2_dtype(dtype):
+    return dtype is torch.float4_e2m1fn_x2
+
+
 class EpDispatchCombineTestCase:
-    def __init__(self, rank, world_size, dtype=torch.bfloat16):
+    def __init__(self, rank, world_size, dtype=torch.bfloat16, quant_type="none", hidden_dim=7168):
         self.rank = rank
         self.world_size = world_size
+        # fp8_direct_cast requires use_external_inp_buf=True (not zero-copy)
+        use_external_inp_buf = (quant_type == "fp8_direct_cast")
+        cfg_hidden_dim = hidden_dim // 2 if _is_fp4x2_dtype(dtype) else hidden_dim
         self.config = mori.ops.EpDispatchCombineConfig(
             data_type=dtype,
             rank=self.rank,
             world_size=self.world_size,
-            hidden_dim=7168,
+            hidden_dim=cfg_hidden_dim,
             # scale_dim=32,
             scale_dim=0,
             scale_type_size=torch.tensor(
@@ -46,7 +54,8 @@ class EpDispatchCombineTestCase:
             max_num_inp_token_per_rank=4096,
             num_experts_per_rank=32,
             num_experts_per_token=8,
-            use_external_inp_buf=False,
+            use_external_inp_buf=use_external_inp_buf,
+            quant_type=quant_type,
         )
 
     def setup(self):
@@ -177,10 +186,22 @@ class EpDispatchCombineTestCase:
             generator=self.rng,
             device=self.device,
         )
+        if _is_fp4x2_dtype(self.config.data_type):
+            input_bytes = torch.randint(
+                0,
+                256,
+                (num_tokens, self.config.hidden_dim),
+                dtype=torch.uint8,
+                generator=self.rng,
+                device=self.device,
+            )
+            input = input_bytes.view(torch.float4_e2m1fn_x2)
+        else:
+            input = input_fp32.to(self.config.data_type)
+
         input_list = self._allgather_with_token_num_padding(
-            input_fp32, self.config.max_num_inp_token_per_rank
+            input, self.config.max_num_inp_token_per_rank
         )
-        input_list = [tensor.to(self.config.data_type) for tensor in input_list]
 
         return (
             num_tokens,
@@ -189,7 +210,7 @@ class EpDispatchCombineTestCase:
             # None,
             # scales_fp32,
             scales_fp32.to(torch.float8_e4m3fnuz),
-            input_fp32.to(self.config.data_type),
+            input,
             indices_list,
             weights_list,
             # None,
@@ -233,7 +254,13 @@ class EpDispatchCombineTestCase:
         for i, pos in enumerate(src_token_pos):
             src_rank = int(pos) // self.config.max_num_inp_token_per_rank
             src_id = int(pos) % self.config.max_num_inp_token_per_rank
-            assert torch.equal(input_list[src_rank][src_id], dispatch_output[i])
+            if _is_fp4x2_dtype(self.config.data_type):
+                assert torch.equal(
+                    input_list[src_rank][src_id].view(torch.uint8),
+                    dispatch_output[i].view(torch.uint8),
+                )
+            else:
+                assert torch.equal(input_list[src_rank][src_id], dispatch_output[i])
             assert torch.equal(weights_list[src_rank][src_id], dispatch_weights[i])
             if scales_list is not None and self.config.scale_dim != 0:
                 assert torch.equal(scales_list[src_rank][src_id], dispatch_scales[i])
@@ -263,6 +290,8 @@ class EpDispatchCombineTestCase:
         torch.cuda.synchronize()
 
         for i in range(num_tokens):
+            # if _is_fp4x2_dtype(self.config.data_type):
+            #     continue
             pes = [
                 (idx // self.config.num_experts_per_rank)
                 for idx in indices[i].cpu().tolist()
@@ -274,7 +303,10 @@ class EpDispatchCombineTestCase:
             # ).to(self.config.data_type)
             got, expected = combine_output[i], input[i].to(torch.bfloat16) * unique_pes
 
-            assert torch.allclose(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
+            atol, rtol = 1e-2, 1e-2
+            if self.config.quant_type == "fp8_direct_cast":
+                atol, rtol = 1e-1, 1e-1
+            assert torch.allclose(got.float(), expected.float(), atol=atol, rtol=rtol)
 
             got_weight, expected_weight = (
                 combine_output_weight[i],
@@ -309,16 +341,45 @@ class EpDispatchCombineTestCase:
         del op
 
 
-def test_dispatch_combine(rank, world_size):
+def test_dispatch_combine(rank, world_size, dtype, quant_type="none"):
     # test_case = EpDispatchCombineTestCase(rank, world_size, torch.float8_e4m3fnuz)
-    test_case = EpDispatchCombineTestCase(rank, world_size, torch.bfloat16)
+    test_case = EpDispatchCombineTestCase(rank, world_size, dtype, quant_type)
     test_case.setup()
     test_case.test_dispatch_combine()
     test_case.cleanup()
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="bf16",
+        choices=["bf16", "fp4"],
+        help="Data type of dispatch / combine",
+    )
+    parser.add_argument(
+        "--quant-type",
+        type=str,
+        default="none",
+        choices=["none", "fp8_direct_cast"],
+        help="Quantization method used inside Combine.",
+    )
+    args = parser.parse_args()
+
+    _DATA_TYPE_MAP = {
+        "bf16": torch.bfloat16,
+        "fp4": torch.float4_e2m1fn_x2,
+    }
+    if args.quant_type == "fp8_direct_cast" and _DATA_TYPE_MAP[args.dtype] is torch.float4_e2m1fn_x2:
+        raise ValueError("fp8_direct_cast is not supported for fp4 data type")
+
     world_size = 8
     torch.multiprocessing.spawn(
-        test_dispatch_combine, args=(world_size,), nprocs=world_size, join=True
+        test_dispatch_combine,
+        args=(world_size, _DATA_TYPE_MAP[args.dtype], args.quant_type),
+        nprocs=world_size,
+        join=True,
     )

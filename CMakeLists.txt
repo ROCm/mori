@@ -29,7 +29,9 @@ option(BUILD_OPS "Whether to build mori operation kernels" ON)
 option(BUILD_IO "Whether to build mori io library" ON)
 option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
 option(BUILD_TESTS "Whether to build mori CPP tests" ON)
+option(ENABLE_PROFILER "Enable kernel profiling" OFF)
 option(ENABLE_DEBUG_PRINTF "Enable debug printf in device kernels" OFF)
+option(ENABLE_STANDARD_MOE_ADAPT "Enable standard moe adapt" OFF)
 
 set(CMAKE_LIBRARY_PATH "/usr/local/lib;${CMAKE_LIBRARY_PATH}")
 find_library(BNXT_RE_LIB NAMES bnxt_re)
@@ -47,27 +49,37 @@ if(USE_BNXT)
   add_compile_definitions(ENABLE_BNXT)
 endif()
 
-find_library(IONIC_LIB
+find_library(
+  IONIC_LIB
   NAMES ionic
-  HINTS /lib/x86_64-linux-gnu
-)
+  HINTS /lib/x86_64-linux-gnu)
 if(IONIC_LIB)
-	message(STATUS "Found ionic library at: ${IONIC_LIB}")
+  message(STATUS "Found ionic library at: ${IONIC_LIB}")
 else()
   message(
-	  STATUS "Could NOT find ionic library. IONIC features will be disabled.")
+    STATUS "Could NOT find ionic library. IONIC features will be disabled.")
   set(USE_IONIC
       OFF
       CACHE BOOL "Enable IONIC features if ionic library is found" FORCE)
 endif()
 message(STATUS "USE_IONIC = ${USE_IONIC}")
 if(USE_IONIC)
-	add_compile_definitions(ENABLE_IONIC)
+  add_compile_definitions(ENABLE_IONIC)
+endif()
+
+message(STATUS "ENABLE_PROFILER = ${ENABLE_PROFILER}")
+if(ENABLE_PROFILER)
+  add_compile_definitions(ENABLE_PROFILER)
 endif()
 
 message(STATUS "ENABLE_DEBUG_PRINTF = ${ENABLE_DEBUG_PRINTF}")
 if(ENABLE_DEBUG_PRINTF)
   add_compile_definitions(MORI_ENABLE_DEBUG_PRINTF)
+endif()
+
+message(STATUS "ENABLE_STANDARD_MOE_ADAPT = ${ENABLE_STANDARD_MOE_ADAPT}")
+if(ENABLE_STANDARD_MOE_ADAPT)
+  add_compile_definitions(ENABLE_STANDARD_MOE_ADAPT)
 endif()
 
 if(NOT DEFINED WARP_ACCUM_UNROLL)
@@ -115,6 +127,57 @@ endif()
 add_library(mori_logging INTERFACE)
 target_include_directories(mori_logging INTERFACE include
                                                   3rdparty/spdlog/include)
+
+if(ENABLE_PROFILER)
+  find_package(
+    Python3
+    COMPONENTS Interpreter
+    REQUIRED)
+
+  set(PROFILER_GEN_SCRIPT
+      ${CMAKE_SOURCE_DIR}/tools/generate_profiler_bindings.py)
+  set(PROFILER_OUTPUT_INCLUDE
+      ${CMAKE_BINARY_DIR}/generated/include/mori/profiler)
+  set(PROFILER_OUTPUT_PYBIND
+      ${CMAKE_BINARY_DIR}/generated/src/pybind/profiler_bindings_generated.cpp)
+
+  file(GLOB_RECURSE KERNEL_SOURCES ${CMAKE_SOURCE_DIR}/src/ops/*.cpp)
+
+  message(STATUS "Generating profiler bindings at configure time...")
+  execute_process(
+    COMMAND
+      ${Python3_EXECUTABLE} ${PROFILER_GEN_SCRIPT} ${CMAKE_SOURCE_DIR}
+      ${CMAKE_SOURCE_DIR}/src ${PROFILER_OUTPUT_INCLUDE}
+      ${PROFILER_OUTPUT_PYBIND}
+    RESULT_VARIABLE PROFILER_GEN_RESULT
+    OUTPUT_VARIABLE PROFILER_GEN_OUTPUT
+    ERROR_VARIABLE PROFILER_GEN_ERROR)
+
+  if(NOT PROFILER_GEN_RESULT EQUAL 0)
+    message(
+      FATAL_ERROR
+        "Failed to generate profiler bindings:\nSTDOUT:\n${PROFILER_GEN_OUTPUT}\nSTDERR:\n${PROFILER_GEN_ERROR}"
+    )
+  endif()
+
+  add_custom_command(
+    OUTPUT ${PROFILER_OUTPUT_PYBIND}
+    COMMAND
+      ${Python3_EXECUTABLE} ${PROFILER_GEN_SCRIPT} ${CMAKE_SOURCE_DIR}
+      ${CMAKE_SOURCE_DIR}/src ${PROFILER_OUTPUT_INCLUDE}
+      ${PROFILER_OUTPUT_PYBIND}
+    DEPENDS ${KERNEL_SOURCES} ${PROFILER_GEN_SCRIPT}
+    COMMENT "Regenerating profiler bindings..."
+    VERBATIM)
+
+  add_custom_target(generate_profiler_bindings
+                    DEPENDS ${PROFILER_OUTPUT_PYBIND})
+
+  add_library(mori_profiler_interface INTERFACE)
+  target_include_directories(mori_profiler_interface
+                             INTERFACE ${CMAKE_BINARY_DIR}/generated/include)
+  add_dependencies(mori_profiler_interface generate_profiler_bindings)
+endif()
 
 if(BUILD_EXAMPLES)
   set(BUILD_APPLICATION ON)

@@ -34,14 +34,20 @@ __global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args);
 template <typename T>
 __global__ void EpDispatchCopyToStaging(EpDispatchCombineArgs<T> args);
 
-template <typename T>
+template <typename T, bool EnableStdMoE = false>
 __global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args);
 
 template <typename T>
 __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args);
 
-template <typename T>
+template <typename T, bool EnableStdMoE = false>
 __global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args);
+
+template <typename T>
+__global__ void EpCombineSync(EpDispatchCombineArgs<T> args);
+
+template <typename T>
+__global__ void EpCombineSyncBarrier(EpDispatchCombineArgs<T> args);
 
 template <typename T>
 __global__ void EpCombineAll(EpDispatchCombineArgs<T> args);
