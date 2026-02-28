@@ -178,6 +178,16 @@ bool IOEngine::SupportsXgmiBackendByP2P() const {
 }
 
 void IOEngine::EnsureXgmiBackendCreatedIfSupported() {
+  bool isAutoXgmiDisabled = false;
+  const char* disableAutoXgmi = std::getenv("MORI_DISABLE_AUTO_XGMI");
+  if (disableAutoXgmi != nullptr) {
+    isAutoXgmiDisabled = disableAutoXgmi[0] != '\0' && disableAutoXgmi[0] != '0';
+    if (isAutoXgmiDisabled) {
+      MORI_IO_INFO("Auto XGMI creation is disabled by MORI_DISABLE_AUTO_XGMI");
+      return;
+    }
+  }
+
   if (backends.find(BackendType::XGMI) != backends.end()) {
     return;
   }

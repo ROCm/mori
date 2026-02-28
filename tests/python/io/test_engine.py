@@ -20,7 +20,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import pytest
+import os
 import time
+from contextlib import contextmanager
 from tests.python.utils import get_free_port
 import torch
 from mori.io import (
@@ -58,8 +60,9 @@ def create_connected_engine_pair(
         num_worker_threads=num_worker_threads,
         enable_notification=enable_notification,
     )
-    initiator.create_backend(BackendType.RDMA, config)
-    target.create_backend(BackendType.RDMA, config)
+    with temporary_env("MORI_DISABLE_AUTO_XGMI", "1"):
+        initiator.create_backend(BackendType.RDMA, config)
+        target.create_backend(BackendType.RDMA, config)
 
     initiator_desc = initiator.get_engine_desc()
     target_desc = target.get_engine_desc()
@@ -68,6 +71,19 @@ def create_connected_engine_pair(
     target.register_remote_engine(initiator_desc)
 
     return initiator, target
+
+
+@contextmanager
+def temporary_env(env_name: str, value: str):
+    old_value = os.environ.get(env_name)
+    os.environ[env_name] = value
+    try:
+        yield
+    finally:
+        if old_value is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = old_value
 
 
 @pytest.fixture(scope="module")
@@ -155,6 +171,23 @@ def test_rdmabackend_auto_creates_xgmi_backend_for_gpu_mem():
 
     # XGMI backend registration should fill IPC handle bytes for GPU memory.
     assert any(b != 0 for b in mem_desc.ipc_handle)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 1, reason="requires GPU")
+def test_rdmabackend_auto_xgmi_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("MORI_DISABLE_AUTO_XGMI", "1")
+    config = IOEngineConfig(
+        host="127.0.0.1",
+        port=get_free_port(),
+    )
+    engine = IOEngine(key="auto_xgmi_disabled_engine", config=config)
+    engine.create_backend(BackendType.RDMA)
+
+    tensor = torch.ones((1024,), device=torch.device("cuda", 0), dtype=torch.float32)
+    mem_desc = engine.register_torch_tensor(tensor)
+
+    # Without auto-created XGMI backend, ipc_handle should keep default zero values.
+    assert all(b == 0 for b in mem_desc.ipc_handle)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
