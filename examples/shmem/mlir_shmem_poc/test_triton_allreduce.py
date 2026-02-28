@@ -66,12 +66,13 @@ def extern_call(lib_name, lib_path, args, arg_type_symbol_dict,
 # ===================================================================
 # 2. Mori shmem device function declarations
 # ===================================================================
+SIGNAL_SET = tl.constexpr(9)
+
 @core.extern
 def shmem_my_pe(_semantic=None):
     return extern_call("libmori_shmem_device", "", [],
                        {(): ("mori_shmem_my_pe", (tl.int32))},
                        is_pure=False, _semantic=_semantic)
-
 
 @core.extern
 def shmem_n_pes(_semantic=None):
@@ -79,14 +80,63 @@ def shmem_n_pes(_semantic=None):
                        {(): ("mori_shmem_n_pes", (tl.int32))},
                        is_pure=True, _semantic=_semantic)
 
+@core.extern
+def shmem_ptr_p2p(dest_ptr, my_pe, dest_pe, _semantic=None):
+    return extern_call(
+        "libmori_shmem_device", "",
+        [tl.cast(dest_ptr, tl.uint64, _semantic=_semantic),
+         tl.cast(my_pe, tl.int32, _semantic=_semantic),
+         tl.cast(dest_pe, tl.int32, _semantic=_semantic)],
+        {(tl.uint64, tl.int32, tl.int32): ("mori_shmem_ptr_p2p", (tl.uint64,))},
+        is_pure=False, _semantic=_semantic)
+
+@core.extern
+def shmem_putmem_nbi_signal_block(dest, source, nbytes, sig_addr, sig_val,
+                                  sig_op, pe, qp_id, _semantic=None):
+    return extern_call(
+        "libmori_shmem_device", "",
+        [tl.cast(dest, tl.pointer_type(tl.void), _semantic=_semantic),
+         tl.cast(source, tl.pointer_type(tl.void), _semantic=_semantic),
+         tl.cast(nbytes, tl.uint64, _semantic=_semantic),
+         tl.cast(sig_addr, tl.pointer_type(tl.void), _semantic=_semantic),
+         tl.cast(sig_val, tl.uint64, _semantic=_semantic),
+         tl.cast(sig_op, tl.int32, _semantic=_semantic),
+         tl.cast(pe, tl.int32, _semantic=_semantic),
+         tl.cast(qp_id, tl.int32, _semantic=_semantic)],
+        {(tl.pointer_type(tl.void), tl.pointer_type(tl.void), tl.uint64,
+          tl.pointer_type(tl.void), tl.uint64, tl.int32, tl.int32, tl.int32):
+         ("mori_shmem_putmem_nbi_signal_block", ())},
+        is_pure=False, _semantic=_semantic)
+
+@core.extern
+def shmem_uint64_wait_until_equals(addr, val, _semantic=None):
+    return extern_call(
+        "libmori_shmem_device", "",
+        [tl.cast(addr, tl.pointer_type(tl.uint64), _semantic=_semantic),
+         tl.cast(val, tl.uint64, _semantic=_semantic)],
+        {(tl.pointer_type(tl.uint64), tl.uint64):
+         ("mori_shmem_uint64_wait_until_equals", ())},
+        is_pure=False, _semantic=_semantic)
+
+@core.extern
+def shmem_quiet(_semantic=None):
+    return extern_call("libmori_shmem_device", "", [],
+                       {(): ("mori_shmem_quiet_thread", ())},
+                       is_pure=False, _semantic=_semantic)
+
+@core.extern
+def shmem_barrier_all_block(_semantic=None):
+    return extern_call("libmori_shmem_device", "", [],
+                       {(): ("mori_shmem_barrier_all_block", ())},
+                       is_pure=False, _semantic=_semantic)
+
 
 # ===================================================================
-# 3. Allreduce kernel (with autotune)
+# 3a. Kernel A: device-side shmem_ptr_p2p allreduce
+#     Each block calls shmem_ptr_p2p() in the kernel to get remote ptrs.
 # ===================================================================
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_SIZE": 1024}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_SIZE": 2048}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_SIZE": 4096}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_SIZE": 4096}, num_warps=16, num_stages=1),
         triton.Config({"BLOCK_SIZE": 8192}, num_warps=16, num_stages=1),
@@ -95,27 +145,104 @@ def shmem_n_pes(_semantic=None):
     key=["N", "npes"],
 )
 @triton.jit
-def allreduce_sum_kernel(
-    pe_ptrs,
-    result_ptr,
+def allreduce_p2p_kernel(
+    data_ptr,       # symmetric bf16 buffer (same vaddr on all PEs)
+    result_ptr,     # output bf16
     npes,
     N,
     BLOCK_SIZE: tl.constexpr,
     MAX_PES: tl.constexpr,
 ):
+    """Allreduce via device-side shmem_ptr_p2p: each block resolves remote
+    pointers on the fly using mori bitcode, then P2P loads + accumulates."""
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < N
 
+    mype = shmem_my_pe()
+    data_ptr_int = data_ptr.to(tl.uint64, bitcast=True)
+
     acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     for i in tl.static_range(MAX_PES):
         if i < npes:
-            ptr_int = tl.load(pe_ptrs + i)
-            ptr = ptr_int.to(tl.pointer_type(tl.bfloat16), bitcast=True)
-            data = tl.load(ptr + offs, mask=mask, other=0.0)
+            if i == mype:
+                data = tl.load(data_ptr + offs, mask=mask, other=0.0)
+            else:
+                remote_int = shmem_ptr_p2p(data_ptr_int, mype, i)
+                remote_ptr = remote_int.to(tl.pointer_type(tl.bfloat16), bitcast=True)
+                data = tl.load(remote_ptr + offs, mask=mask, other=0.0)
             acc += data.to(tl.float32)
 
     tl.store(result_ptr + offs, acc.to(tl.bfloat16), mask=mask)
+
+
+SIGNAL_ADD = tl.constexpr(10)
+
+
+# ===================================================================
+# 3b. Kernel B: multi-block all-to-all put+signal allreduce
+#     grid=(TOTAL_BLOCKS,) where TOTAL_BLOCKS = npes * CHUNKS_PER_PE.
+#     Multiple blocks put chunks in parallel, all wait signals, all accumulate.
+# ===================================================================
+@triton.jit
+def allreduce_put_signal_kernel(
+    input_ptr,      # symmetric bf16: each PE's input (read-only)
+    recv_ptr,       # symmetric bf16: recv buffer (npes * N), each PE has its own
+    output_ptr,     # bf16: output
+    signal_ptr,     # symmetric int64: signal_buf[i] = "data from PE i arrived"
+    mype: int, npes: int, N: int,
+    CHUNK_SIZE: tl.constexpr, MAX_PES: tl.constexpr, CHUNKS_PER_PE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    bid = tl.program_id(0)
+    target_pe = bid // CHUNKS_PER_PE       # which PE this block targets
+    chunk_id = bid % CHUNKS_PER_PE         # which chunk within that PE's data
+
+    chunk_offset = chunk_id * CHUNK_SIZE   # byte-element offset within data
+    chunk_bytes = CHUNK_SIZE * 2           # bf16 = 2 bytes
+
+    # Phase 1: each block puts one chunk to one PE (or self-copies)
+    if target_pe < npes:
+        if target_pe == mype:
+            for off in range(0, CHUNK_SIZE, BLOCK_SIZE):
+                o = chunk_offset + off + tl.arange(0, BLOCK_SIZE)
+                m = o < N
+                tl.store(recv_ptr + mype * N + o,
+                         tl.load(input_ptr + o, mask=m), mask=m)
+        else:
+            # Put this chunk to target_pe's recv_buf[mype] at chunk_offset
+            # Use SIGNAL_ADD so all chunks from all blocks to the same PE
+            # accumulate into one signal. When signal == CHUNKS_PER_PE, all done.
+            shmem_putmem_nbi_signal_block(
+                recv_ptr + mype * N + chunk_offset,
+                input_ptr + chunk_offset,
+                tl.cast(chunk_bytes, tl.uint64),
+                signal_ptr + mype,
+                tl.full([], 1, tl.uint64),
+                SIGNAL_ADD,
+                target_pe,
+                0,
+            )
+            shmem_quiet()
+
+    # Phase 2: all blocks wait for all signals
+    # Each PE has CHUNKS_PER_PE blocks sending to it, each adding 1.
+    # Signal from PE i is complete when signal_buf[i] == CHUNKS_PER_PE.
+    for i in tl.static_range(MAX_PES):
+        if i < npes and i != mype:
+            shmem_uint64_wait_until_equals(
+                signal_ptr + i, tl.cast(CHUNKS_PER_PE, tl.uint64))
+
+    # Phase 3: multi-block accumulate across all TOTAL_BLOCKS blocks
+    total_blocks = MAX_PES * CHUNKS_PER_PE
+    for base in range(bid * BLOCK_SIZE, N, total_blocks * BLOCK_SIZE):
+        offs = base + tl.arange(0, BLOCK_SIZE)
+        mask = offs < N
+        acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+        for pe in tl.static_range(MAX_PES):
+            if pe < npes:
+                acc += tl.load(recv_ptr + pe * N + offs, mask=mask, other=0.0).to(tl.float32)
+        tl.store(output_ptr + offs, acc.to(tl.bfloat16), mask=mask)
 
 
 # ===================================================================
@@ -197,7 +324,24 @@ def build_p2p_ptrs(data_buf, mype, npes):
 
 
 # ===================================================================
-# 7. Test
+# 7. Benchmark helper
+# ===================================================================
+def bench(label, fn, warmup=20, iters=200):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    s = torch.cuda.Event(enable_timing=True)
+    e = torch.cuda.Event(enable_timing=True)
+    s.record()
+    for _ in range(iters):
+        fn()
+    e.record()
+    torch.cuda.synchronize()
+    return s.elapsed_time(e) / iters * 1000  # us
+
+
+# ===================================================================
+# 8. Test
 # ===================================================================
 def test_allreduce(mype, npes, extern_libs):
     import mori.shmem as ms
@@ -205,90 +349,119 @@ def test_allreduce(mype, npes, extern_libs):
 
     M, K = 64, 7168
     N = M * K
+    nbytes = N * 2
     MAX_PES = 8
+    BS = 8192
 
-    print(f"\n[PE {mype}] === Triton allreduce sum (bf16, {M}x{K}, N={N}) ===")
+    print(f"\n[PE {mype}] === Triton allreduce (bf16, {M}x{K}) ===")
 
     torch.manual_seed(42 + mype)
     local_data = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
 
+    # Symmetric buffers
     symm_buf = mori_shmem_create_tensor((N,), torch.bfloat16)
     symm_buf.copy_(local_data.view(-1))
+    result_a = torch.empty(N, dtype=torch.bfloat16, device="cuda")
+
     torch.cuda.synchronize()
 
-    result = torch.empty(N, dtype=torch.bfloat16, device="cuda")
-
+    # Reference
     local_cpu = local_data.cpu()
     all_data_cpu = [torch.empty_like(local_cpu) for _ in range(npes)]
     dist.all_gather(all_data_cpu, local_cpu)
     expected = torch.stack(all_data_cpu).to(torch.float32).sum(dim=0).to(torch.bfloat16).view(-1).cuda()
 
-    pe_ptrs = build_p2p_ptrs(symm_buf, mype, npes)
     ms.shmem_barrier_all()
 
-    def launch():
-        allreduce_sum_kernel[(triton.cdiv(N, allreduce_sum_kernel.best_config.kwargs.get("BLOCK_SIZE", 4096)),)](
-            pe_ptrs, result, npes, N,
-            MAX_PES=MAX_PES,
-            extern_libs=extern_libs,
-        )
-
-    # First launch triggers autotune
-    allreduce_sum_kernel[(triton.cdiv(N, 1024),)](
-        pe_ptrs, result, npes, N,
-        MAX_PES=MAX_PES,
-        extern_libs=extern_libs,
-    )
+    # ── Kernel A: device-side shmem_ptr_p2p ──
+    print(f"[PE {mype}] --- Kernel A: device-side shmem_ptr_p2p ---")
+    grid_a = (triton.cdiv(N, 1024),)  # trigger autotune
+    allreduce_p2p_kernel[grid_a](
+        symm_buf, result_a, npes, N, MAX_PES=MAX_PES,
+        extern_libs=extern_libs)
     torch.cuda.synchronize()
 
-    # Print best config
-    best = allreduce_sum_kernel.best_config
-    print(f"[PE {mype}] autotune best: BLOCK_SIZE={best.kwargs['BLOCK_SIZE']}, "
-          f"num_warps={best.num_warps}, num_stages={best.num_stages}")
-
-    # Re-launch with best config for verification
-    best_bs = best.kwargs["BLOCK_SIZE"]
-    grid = (triton.cdiv(N, best_bs),)
-    allreduce_sum_kernel[grid](
-        pe_ptrs, result, npes, N,
-        MAX_PES=MAX_PES,
-        extern_libs=extern_libs,
-    )
+    best_a = allreduce_p2p_kernel.best_config
+    grid_a = (triton.cdiv(N, best_a.kwargs["BLOCK_SIZE"]),)
+    allreduce_p2p_kernel[grid_a](
+        symm_buf, result_a, npes, N, MAX_PES=MAX_PES,
+        extern_libs=extern_libs)
     torch.cuda.synchronize()
 
-    max_err = (result.float() - expected.float()).abs().max().item()
-    mean_err = (result.float() - expected.float()).abs().mean().item()
-    print(f"[PE {mype}] max_err={max_err:.6f}, mean_err={mean_err:.6f}")
-    torch.testing.assert_close(result.view(M, K), expected.view(M, K), atol=1e-1, rtol=1e-1)
-    print(f"[PE {mype}] [Triton] allreduce  PASS")
+    err_a = (result_a.float() - expected.float()).abs().max().item()
+    print(f"[PE {mype}] A max_err={err_a:.6f}")
+    torch.testing.assert_close(result_a.view(M, K), expected.view(M, K), atol=1e-1, rtol=1e-1)
+    print(f"[PE {mype}] A PASS (BLOCK_SIZE={best_a.kwargs['BLOCK_SIZE']}, warps={best_a.num_warps})")
 
-    # Benchmark
+    us_a = bench("A", lambda: allreduce_p2p_kernel[grid_a](
+        symm_buf, result_a, npes, N, MAX_PES=MAX_PES, extern_libs=extern_libs))
+    bw_a = N * 2 * npes / (us_a * 1e-6) / 1e9
+    print(f"[PE {mype}] A: {us_a:.1f} us, {bw_a:.1f} GB/s")
+
+    # ── Kernel B: all-to-all put+signal ──
+    # Detect transport: if shmem_ptr_p2p returns 0 for any peer → RDMA path
+    is_rdma = False
+    for pe in range(npes):
+        if pe != mype:
+            if ms.shmem_ptr_p2p(symm_buf.data_ptr(), mype, pe) == 0:
+                is_rdma = True
+                break
+
+    # P2P: multi-chunk per PE (8 blocks per PE = 64 total)
+    # RDMA/IBGDA: 1 block per PE (avoid QP contention)
+    CPP = 1 if is_rdma else 8
+    NW = 16
+    transport_name = "RDMA/IBGDA" if is_rdma else "P2P"
+    print(f"\n[PE {mype}] --- Kernel B: put+signal ({transport_name}, chunks_per_pe={CPP}) ---")
     ms.shmem_barrier_all()
-    torch.cuda.synchronize()
-    warmup, iters = 10, 50
-    for _ in range(warmup):
-        allreduce_sum_kernel[grid](
-            pe_ptrs, result, npes, N, MAX_PES=MAX_PES,
-            extern_libs=extern_libs,
-        )
+
+    recv_b = mori_shmem_create_tensor((npes * N,), torch.bfloat16)
+    output_b = torch.empty(N, dtype=torch.bfloat16, device="cuda")
+    signal_b = mori_shmem_create_tensor((npes,), torch.int64)
+
+    CHUNK_SZ = triton.cdiv(N, CPP)
+    CHUNK_SZ = triton.cdiv(CHUNK_SZ, BS) * BS
+    TOTAL_BLOCKS = MAX_PES * CPP
+
+    recv_b.zero_(); signal_b.zero_()
+    torch.cuda.synchronize(); ms.shmem_barrier_all()
+
+    allreduce_put_signal_kernel[(TOTAL_BLOCKS,)](
+        symm_buf, recv_b, output_b, signal_b,
+        mype, npes, N,
+        CHUNK_SIZE=CHUNK_SZ, MAX_PES=MAX_PES,
+        CHUNKS_PER_PE=CPP, BLOCK_SIZE=BS,
+        extern_libs=extern_libs, num_warps=NW)
     torch.cuda.synchronize()
 
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
-    for _ in range(iters):
-        allreduce_sum_kernel[grid](
-            pe_ptrs, result, npes, N, MAX_PES=MAX_PES,
-            extern_libs=extern_libs,
-        )
-    end_event.record()
+    err_b = (output_b.float() - expected.float()).abs().max().item()
+    print(f"[PE {mype}] B max_err={err_b:.6f} (grid={TOTAL_BLOCKS}, {transport_name})")
+    torch.testing.assert_close(output_b.view(M, K), expected.view(M, K), atol=1e-1, rtol=1e-1)
+    print(f"[PE {mype}] B PASS")
+
+    # Timed run
+    ms.shmem_barrier_all()
+    signal_b.zero_(); torch.cuda.synchronize(); ms.shmem_barrier_all()
+
+    s_b = torch.cuda.Event(enable_timing=True)
+    e_b = torch.cuda.Event(enable_timing=True)
+    s_b.record()
+    allreduce_put_signal_kernel[(TOTAL_BLOCKS,)](
+        symm_buf, recv_b, output_b, signal_b,
+        mype, npes, N,
+        CHUNK_SIZE=CHUNK_SZ, MAX_PES=MAX_PES,
+        CHUNKS_PER_PE=CPP, BLOCK_SIZE=BS,
+        extern_libs=extern_libs, num_warps=NW)
+    e_b.record()
     torch.cuda.synchronize()
-    elapsed_ms = start_event.elapsed_time(end_event)
-    us = elapsed_ms / iters * 1000
-    nbytes = N * 2 * npes
-    bw_gb = nbytes / (us * 1e-6) / 1e9
-    print(f"[PE {mype}] avg {us:.1f} us/iter, {bw_gb:.1f} GB/s "
-          f"({N * 2 / 1024:.0f} KB x {npes} PEs)")
+    us_b = s_b.elapsed_time(e_b) * 1000
+    print(f"[PE {mype}] B: {us_b:.1f} us")
+
+    # Summary
+    if mype == 0:
+        print(f"\n[PE 0] Summary ({npes} PEs, {M}x{K} bf16 = {nbytes//1024} KB):")
+        print(f"  Kernel A (shmem_ptr_p2p):      {us_a:.1f} us, {bw_a:.1f} GB/s")
+        print(f"  Kernel B (put+signal, 1 kern): {us_b:.1f} us")
 
 
 # ===================================================================
@@ -303,8 +476,8 @@ def main():
         test_allreduce(mype, npes, extern_libs)
         if mype == 0:
             print(f"\n{'=' * 60}")
-            print(f"  Allreduce PASSED on {npes} PEs")
-            print(f"  (Triton + mori shmem P2P)")
+            print(f"  All allreduce tests PASSED on {npes} PEs")
+            print(f"  (Triton + mori shmem device API)")
             print(f"{'=' * 60}")
     except Exception:
         import traceback
