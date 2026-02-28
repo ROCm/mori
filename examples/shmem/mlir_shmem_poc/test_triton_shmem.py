@@ -13,9 +13,6 @@ Usage:
 
 import os
 import sys
-import re
-import tempfile
-import subprocess
 
 import torch
 import torch.distributed as dist
@@ -123,29 +120,8 @@ def _install_shmem_hook():
     knobs.runtime.jit_post_compile_hook = hook
 
 
-def _strip_lifetime_intrinsics(bc_path):
-    """Strip llvm.lifetime intrinsics to avoid LLVM version mismatches."""
-    rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
-    llvm_dis = os.path.join(rocm, "llvm", "bin", "llvm-dis")
-    llvm_link = os.path.join(rocm, "llvm", "bin", "llvm-link")
-    pid = os.getpid()
-    ll_path = os.path.join(tempfile.gettempdir(), f'shmem_device_{pid}.ll')
-    clean_ll = os.path.join(tempfile.gettempdir(), f'shmem_device_clean_{pid}.ll')
-    clean_bc = os.path.join(tempfile.gettempdir(), f'shmem_device_clean_{pid}.bc')
-    subprocess.check_call([llvm_dis, bc_path, '-o', ll_path])
-    with open(ll_path) as f:
-        text = f.read()
-    text = re.sub(r'^\s*call void @llvm\.lifetime\.[^\n]*\n', '', text, flags=re.MULTILINE)
-    text = re.sub(r'^declare void @llvm\.lifetime\.[^\n]*\n', '', text, flags=re.MULTILINE)
-    with open(clean_ll, 'w') as f:
-        f.write(text)
-    subprocess.check_call([llvm_link, clean_ll, '-o', clean_bc])
-    return clean_bc
-
-
 def _get_extern_libs():
-    bc = _find_mori_shmem_bc()
-    return {"mori_shmem": _strip_lifetime_intrinsics(bc)}
+    return {"mori_shmem": _find_mori_shmem_bc()}
 
 
 # ===================================================================

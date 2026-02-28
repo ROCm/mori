@@ -73,7 +73,12 @@ trap "rm -rf $TEMP_DIR" EXIT
 echo "[mori] Linking BC files (wrapper + init + memory) ..."
 ${ROCM_PATH}/lib/llvm/bin/llvm-link \
     "$WRAPPER_BC" "$INIT_BC" "$MEMORY_BC" \
-    -o "$TEMP_DIR/libmori_shmem_device.bc"
+    -o "$TEMP_DIR/linked.bc"
+
+echo "[mori] Stripping llvm.lifetime intrinsics (Triton LLVM compat) ..."
+${ROCM_PATH}/lib/llvm/bin/opt -S "$TEMP_DIR/linked.bc" -o "$TEMP_DIR/linked.ll"
+sed -i '/call void @llvm\.lifetime\./d; /declare void @llvm\.lifetime\./d' "$TEMP_DIR/linked.ll"
+${ROCM_PATH}/lib/llvm/bin/opt "$TEMP_DIR/linked.ll" -o "$TEMP_DIR/libmori_shmem_device.bc"
 
 # ---------------------------------------------------------------------------
 # Verify globalGpuStates symbol
