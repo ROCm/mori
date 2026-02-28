@@ -21,6 +21,8 @@
 // SOFTWARE.
 #include "mori/io/engine.hpp"
 
+#include <hip/hip_runtime.h>
+
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/xgmi/backend_impl.hpp"
@@ -95,8 +97,13 @@ IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
 IOEngine::~IOEngine() {}
 
 void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
+  if (backends.find(type) != backends.end()) {
+    MORI_IO_WARN("Backend type {} already exists, skip duplicate creation",
+                 static_cast<uint32_t>(type));
+    return;
+  }
+
   if (type == BackendType::RDMA) {
-    assert(backends.find(type) == backends.end());
     auto backend = std::make_unique<RdmaBackend>(desc.key, config,
                                                  static_cast<const RdmaBackendConfig&>(beConfig));
 
@@ -115,8 +122,8 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
     }
 
     backends.insert({type, std::move(backend)});
+    EnsureXgmiBackendCreatedIfSupported();
   } else if (type == BackendType::XGMI) {
-    assert(backends.find(type) == backends.end());
     auto backend = std::make_unique<XgmiBackend>(desc.key, config,
                                                  static_cast<const XgmiBackendConfig&>(beConfig));
     backends.insert({type, std::move(backend)});
@@ -124,6 +131,66 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
     assert(false && "not implemented");
   }
   MORI_IO_INFO("Create backend type {}", static_cast<uint32_t>(type));
+}
+
+bool IOEngine::SupportsXgmiBackendByP2P() const {
+  int numDevices = 0;
+  hipError_t err = hipGetDeviceCount(&numDevices);
+  if (err != hipSuccess) {
+    MORI_IO_WARN("XGMI probe skipped: hipGetDeviceCount failed: {}", hipGetErrorString(err));
+    return false;
+  }
+
+  if (numDevices <= 0) {
+    MORI_IO_INFO("XGMI probe skipped: no GPU device found");
+    return false;
+  }
+
+  if (numDevices == 1) {
+    MORI_IO_INFO("XGMI probe succeeded with single GPU device");
+    return true;
+  }
+
+  for (int src = 0; src < numDevices; ++src) {
+    for (int dst = 0; dst < numDevices; ++dst) {
+      if (src == dst) continue;
+      int canAccess = 0;
+      err = hipDeviceCanAccessPeer(&canAccess, src, dst);
+      if (err != hipSuccess) {
+        MORI_IO_WARN("XGMI probe cannot query P2P from device {} to {}: {}", src, dst,
+                     hipGetErrorString(err));
+        continue;
+      }
+      if (canAccess != 0) {
+        MORI_IO_INFO("XGMI probe succeeded: P2P is available between GPU {} and {}", src, dst);
+        return true;
+      }
+    }
+  }
+
+  MORI_IO_INFO("XGMI probe skipped: no GPU peer access found");
+  return false;
+}
+
+void IOEngine::EnsureXgmiBackendCreatedIfSupported() {
+  if (backends.find(BackendType::XGMI) != backends.end()) {
+    return;
+  }
+
+  if (!SupportsXgmiBackendByP2P()) {
+    return;
+  }
+
+  try {
+    XgmiBackendConfig xgmiConfig{};
+    auto backend = std::make_unique<XgmiBackend>(desc.key, config, xgmiConfig);
+    backends.insert({BackendType::XGMI, std::move(backend)});
+    MORI_IO_INFO("Auto-created XGMI backend after RDMA initialization");
+  } catch (const std::exception& e) {
+    MORI_IO_WARN("Auto-create XGMI backend failed: {}", e.what());
+  } catch (...) {
+    MORI_IO_WARN("Auto-create XGMI backend failed due to unknown error");
+  }
 }
 
 void IOEngine::RemoveBackend(BackendType type) { backends.erase(type); }
@@ -182,7 +249,9 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
   }
 
   auto xgmiIt = backends.find(BackendType::XGMI);
-  if (xgmiIt != backends.end() && xgmiIt->second->CanHandle(local, remote)) {
+  bool isIntraNodeCapable = xgmiIt != backends.end() && xgmiIt->second->CanHandle(local, remote);
+  // For intra-node GPU transfers, prefer XGMI when it can handle this pair.
+  if (isIntraNodeCapable) {
     return xgmiIt->second.get();
   }
 

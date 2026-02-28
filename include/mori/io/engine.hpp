@@ -107,6 +107,8 @@ class IOEngine {
 
  private:
   Backend* SelectBackend(const MemoryDesc& local, const MemoryDesc& remote);
+  bool SupportsXgmiBackendByP2P() const;
+  void EnsureXgmiBackendCreatedIfSupported();
 
  public:
   IOEngineConfig config;

@@ -128,6 +128,46 @@ def test_engine_desc_port_zero_auto_bind():
     assert desc == unpacked_desc
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 1, reason="requires GPU")
+def test_rdmabackend_auto_creates_xgmi_backend_for_gpu_mem():
+    config = IOEngineConfig(
+        host="127.0.0.1",
+        port=get_free_port(),
+    )
+    engine = IOEngine(key="auto_xgmi_engine", config=config)
+    engine.create_backend(BackendType.RDMA)
+
+    tensor = torch.ones((1024,), device=torch.device("cuda", 0), dtype=torch.float32)
+    mem_desc = engine.register_torch_tensor(tensor)
+
+    # XGMI backend registration should fill IPC handle bytes for GPU memory.
+    assert any(b != 0 for b in mem_desc.ipc_handle)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_intra_node_prefers_xgmi_after_rdma_creation():
+    config = IOEngineConfig(
+        host="127.0.0.1",
+        port=get_free_port(),
+    )
+    engine = IOEngine(key="auto_xgmi_route_engine", config=config)
+    engine.create_backend(BackendType.RDMA)
+
+    src = torch.arange(0, 4096, dtype=torch.float32, device=torch.device("cuda", 0))
+    dst = torch.zeros_like(src, device=torch.device("cuda", 1))
+    src_mem = engine.register_torch_tensor(src)
+    dst_mem = engine.register_torch_tensor(dst)
+
+    transfer_uid = engine.allocate_transfer_uid()
+    status = engine.write(
+        src_mem, 0, dst_mem, 0, src.numel() * src.element_size(), transfer_uid
+    )
+    status.Wait()
+
+    assert status.Succeeded()
+    assert torch.equal(src.cpu(), dst.cpu())
+
+
 def test_mem_desc():
     config = IOEngineConfig(
         host="127.0.0.1",
