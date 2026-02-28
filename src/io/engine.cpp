@@ -21,6 +21,10 @@
 // SOFTWARE.
 #include "mori/io/engine.hpp"
 
+#include <hip/hip_runtime.h>
+
+#include <cstdlib>
+
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/xgmi/backend_impl.hpp"
@@ -86,17 +90,23 @@ IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
   desc.key = key;
   char hostname[HOST_NAME_MAX];
   gethostname(hostname, HOST_NAME_MAX);
+  desc.nodeId = ResolveNodeId(hostname);
   desc.hostname = std::string(hostname);
   desc.host = config.host;
   desc.port = config.port;
-  MORI_IO_INFO("Create engine key {} hostname {}", key, hostname);
+  MORI_IO_INFO("Create engine key {} node_id {} hostname {}", key, desc.nodeId, hostname);
 }
 
 IOEngine::~IOEngine() {}
 
 void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
+  if (backends.find(type) != backends.end()) {
+    MORI_IO_WARN("Backend type {} already exists, skip duplicate creation",
+                 static_cast<uint32_t>(type));
+    return;
+  }
+
   if (type == BackendType::RDMA) {
-    assert(backends.find(type) == backends.end());
     auto backend = std::make_unique<RdmaBackend>(desc.key, config,
                                                  static_cast<const RdmaBackendConfig&>(beConfig));
 
@@ -115,31 +125,109 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
     }
 
     backends.insert({type, std::move(backend)});
+    InvalidateRouteCache();
+    EnsureXgmiBackendCreatedIfSupported();
   } else if (type == BackendType::XGMI) {
-    assert(backends.find(type) == backends.end());
     auto backend = std::make_unique<XgmiBackend>(desc.key, config,
                                                  static_cast<const XgmiBackendConfig&>(beConfig));
     backends.insert({type, std::move(backend)});
+    InvalidateRouteCache();
   } else {
     assert(false && "not implemented");
   }
   MORI_IO_INFO("Create backend type {}", static_cast<uint32_t>(type));
 }
 
-void IOEngine::RemoveBackend(BackendType type) { backends.erase(type); }
+bool IOEngine::SupportsXgmiBackendByP2P() const {
+  int numDevices = 0;
+  hipError_t err = hipGetDeviceCount(&numDevices);
+  if (err != hipSuccess) {
+    MORI_IO_WARN("XGMI probe skipped: hipGetDeviceCount failed: {}", hipGetErrorString(err));
+    return false;
+  }
+
+  if (numDevices <= 0) {
+    MORI_IO_INFO("XGMI probe skipped: no GPU device found");
+    return false;
+  }
+
+  if (numDevices == 1) {
+    MORI_IO_INFO("XGMI probe succeeded with single GPU device");
+    return true;
+  }
+
+  for (int src = 0; src < numDevices; ++src) {
+    for (int dst = 0; dst < numDevices; ++dst) {
+      if (src == dst) continue;
+      int canAccess = 0;
+      err = hipDeviceCanAccessPeer(&canAccess, src, dst);
+      if (err != hipSuccess) {
+        MORI_IO_WARN("XGMI probe cannot query P2P from device {} to {}: {}", src, dst,
+                     hipGetErrorString(err));
+        continue;
+      }
+      if (canAccess != 0) {
+        MORI_IO_INFO("XGMI probe succeeded: P2P is available between GPU {} and {}", src, dst);
+        return true;
+      }
+    }
+  }
+
+  MORI_IO_INFO("XGMI probe skipped: no GPU peer access found");
+  return false;
+}
+
+void IOEngine::EnsureXgmiBackendCreatedIfSupported() {
+  bool isAutoXgmiDisabled = false;
+  const char* disableAutoXgmi = std::getenv("MORI_DISABLE_AUTO_XGMI");
+  if (disableAutoXgmi != nullptr) {
+    isAutoXgmiDisabled = disableAutoXgmi[0] != '\0' && disableAutoXgmi[0] != '0';
+    if (isAutoXgmiDisabled) {
+      MORI_IO_INFO("Auto XGMI creation is disabled by MORI_DISABLE_AUTO_XGMI");
+      return;
+    }
+  }
+
+  if (backends.find(BackendType::XGMI) != backends.end()) {
+    return;
+  }
+
+  if (!SupportsXgmiBackendByP2P()) {
+    return;
+  }
+
+  try {
+    XgmiBackendConfig xgmiConfig{};
+    auto backend = std::make_unique<XgmiBackend>(desc.key, config, xgmiConfig);
+    backends.insert({BackendType::XGMI, std::move(backend)});
+    InvalidateRouteCache();
+    MORI_IO_INFO("Auto-created XGMI backend after RDMA initialization");
+  } catch (const std::exception& e) {
+    MORI_IO_WARN("Auto-create XGMI backend failed: {}", e.what());
+  } catch (...) {
+    MORI_IO_WARN("Auto-create XGMI backend failed due to unknown error");
+  }
+}
+
+void IOEngine::RemoveBackend(BackendType type) {
+  backends.erase(type);
+  InvalidateRouteCache();
+}
 
 void IOEngine::RegisterRemoteEngine(const EngineDesc& remote) {
   for (auto& it : backends) {
     it.second->RegisterRemoteEngine(remote);
   }
-  MORI_IO_INFO("Register remote engine {} hostname {}", remote.key.c_str(),
-               remote.hostname.c_str());
+  InvalidateRouteCache();
+  MORI_IO_INFO("Register remote engine {} node_id {} hostname {}", remote.key.c_str(),
+               remote.nodeId.c_str(), remote.hostname.c_str());
 }
 
 void IOEngine::DeregisterRemoteEngine(const EngineDesc& remote) {
   for (auto& it : backends) {
     it.second->DeregisterRemoteEngine(remote);
   }
+  InvalidateRouteCache();
   MORI_IO_INFO("Deregister remote engine {}", remote.key.c_str());
 }
 
@@ -181,17 +269,62 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
     return nullptr;
   }
 
+  RouteCacheKey routeKey{remote.engineKey, local.loc, remote.loc, local.deviceId, remote.deviceId};
+
+  if (auto cachedType = QueryRouteCache(routeKey); cachedType.has_value()) {
+    auto cachedBackend = backends.find(cachedType.value());
+    if (cachedBackend != backends.end()) {
+      if (cachedType.value() != BackendType::XGMI ||
+          cachedBackend->second->CanHandle(local, remote)) {
+        return cachedBackend->second.get();
+      }
+    }
+  }
+
   auto xgmiIt = backends.find(BackendType::XGMI);
-  if (xgmiIt != backends.end() && xgmiIt->second->CanHandle(local, remote)) {
+  bool isIntraNodeCapable = xgmiIt != backends.end() && xgmiIt->second->CanHandle(local, remote);
+  // For intra-node GPU transfers, prefer XGMI when it can handle this pair.
+  if (isIntraNodeCapable) {
+    UpdateRouteCache(routeKey, BackendType::XGMI);
     return xgmiIt->second.get();
   }
 
   auto rdmaIt = backends.find(BackendType::RDMA);
   if (rdmaIt != backends.end()) {
+    UpdateRouteCache(routeKey, BackendType::RDMA);
     return rdmaIt->second.get();
   }
 
+  BackendType fallbackType = backends.begin()->first;
+  UpdateRouteCache(routeKey, fallbackType);
   return backends.begin()->second.get();
+}
+
+void IOEngine::InvalidateRouteCache() {
+  std::unique_lock<std::shared_mutex> lock(routeCacheMu);
+  routeCache.clear();
+}
+
+void IOEngine::UpdateRouteCache(const RouteCacheKey& key, BackendType backendType) {
+  std::unique_lock<std::shared_mutex> lock(routeCacheMu);
+  routeCache[key] = backendType;
+}
+
+std::optional<BackendType> IOEngine::QueryRouteCache(const RouteCacheKey& key) const {
+  std::shared_lock<std::shared_mutex> lock(routeCacheMu);
+  auto it = routeCache.find(key);
+  if (it == routeCache.end()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
+
+std::string IOEngine::ResolveNodeId(const std::string& hostname) const {
+  const char* nodeIdEnv = std::getenv("MORI_IO_NODE_ID");
+  if (nodeIdEnv != nullptr && nodeIdEnv[0] != '\0') {
+    return std::string(nodeIdEnv);
+  }
+  return hostname;
 }
 
 #define SELECT_BACKEND_AND_RETURN_IF_NONE(local, remote, status, backend)     \
