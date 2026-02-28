@@ -19,6 +19,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+
 #pragma once
 
 #include <memory>
@@ -34,22 +35,18 @@ namespace io {
 
 class TcpTransport;
 
-/* ---------------------------------------------------------------------------------------------- */
-/*                                       TcpBackendSession                                        */
-/* ---------------------------------------------------------------------------------------------- */
 class TcpBackendSession : public BackendSession {
  public:
   TcpBackendSession() = default;
-  TcpBackendSession(const TcpBackendConfig& config, const MemoryDesc& local, const MemoryDesc& remote,
-                    TcpTransport* transport);
+  TcpBackendSession(const TcpBackendConfig& config, const MemoryDesc& local,
+                    const MemoryDesc& remote, TcpTransport* transport);
   ~TcpBackendSession() override = default;
 
   void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
                  TransferUniqueId id, bool isRead) override;
-
-  void BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets, const SizeVec& sizes,
-                      TransferStatus* status, TransferUniqueId id, bool isRead) override;
-
+  void BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                      const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
+                      bool isRead) override;
   bool Alive() const override;
 
  private:
@@ -59,9 +56,6 @@ class TcpBackendSession : public BackendSession {
   TcpTransport* transport{nullptr};
 };
 
-/* ---------------------------------------------------------------------------------------------- */
-/*                                           TcpBackend                                           */
-/* ---------------------------------------------------------------------------------------------- */
 class TcpBackend : public Backend {
  public:
   TcpBackend(EngineKey, const IOEngineConfig&, const TcpBackendConfig&);
@@ -71,21 +65,20 @@ class TcpBackend : public Backend {
 
   void RegisterRemoteEngine(const EngineDesc&) override;
   void DeregisterRemoteEngine(const EngineDesc&) override;
-
   void RegisterMemory(MemoryDesc& desc) override;
   void DeregisterMemory(const MemoryDesc& desc) override;
 
   void ReadWrite(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
                  size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id,
                  bool isRead) override;
-
   void BatchReadWrite(const MemoryDesc& localDest, const SizeVec& localOffsets,
-                      const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets, const SizeVec& sizes,
-                      TransferStatus* status, TransferUniqueId id, bool isRead) override;
+                      const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
+                      const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
+                      bool isRead) override;
 
   BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote) override;
-
-  bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status) override;
+  bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
+                                TransferStatus* status) override;
 
  private:
   EngineKey myEngKey;

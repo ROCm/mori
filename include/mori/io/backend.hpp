@@ -83,12 +83,11 @@ inline std::ostream& operator<<(std::ostream& os, const XgmiBackendConfig& c) {
 
 struct TcpBackendConfig : public BackendConfig {
   TcpBackendConfig() : BackendConfig(BackendType::TCP) {}
-  TcpBackendConfig(int numIoThreads_, int sockSndbufBytes_, int sockRcvbufBytes_, int opTimeoutMs_,
+  TcpBackendConfig(int sockSndbufBytes_, int sockRcvbufBytes_, int opTimeoutMs_,
                    bool enableKeepalive_, int keepaliveIdleSec_, int keepaliveIntvlSec_,
-                   int keepaliveCnt_, bool enableCtrlNodelay_, bool enableDataNodelay_,
-                   int numDataConns_, int stripingThresholdBytes_)
+                   int keepaliveCnt_, bool enableCtrlNodelay_, int numDataConns_,
+                   int stripingThresholdBytes_)
       : BackendConfig(BackendType::TCP),
-        numIoThreads(numIoThreads_),
         sockSndbufBytes(sockSndbufBytes_),
         sockRcvbufBytes(sockRcvbufBytes_),
         opTimeoutMs(opTimeoutMs_),
@@ -97,11 +96,8 @@ struct TcpBackendConfig : public BackendConfig {
         keepaliveIntvlSec(keepaliveIntvlSec_),
         keepaliveCnt(keepaliveCnt_),
         enableCtrlNodelay(enableCtrlNodelay_),
-        enableDataNodelay(enableDataNodelay_),
         numDataConns(numDataConns_),
         stripingThresholdBytes(stripingThresholdBytes_) {}
-
-  int numIoThreads{1};
 
   int sockSndbufBytes{32 * 1024 * 1024};
   int sockRcvbufBytes{32 * 1024 * 1024};
@@ -114,7 +110,6 @@ struct TcpBackendConfig : public BackendConfig {
   int keepaliveCnt{3};
 
   bool enableCtrlNodelay{true};
-  bool enableDataNodelay{true};
 
   // Number of parallel DATA TCP connections per peer (iperf-like multi-stream striping).
   // Effective only when peer has >= numDataConns established and transfer is contiguous.
@@ -124,12 +119,11 @@ struct TcpBackendConfig : public BackendConfig {
 };
 
 inline std::ostream& operator<<(std::ostream& os, const TcpBackendConfig& c) {
-  return os << "numIoThreads[" << c.numIoThreads << "] sockSndbufBytes[" << c.sockSndbufBytes
-            << "] sockRcvbufBytes[" << c.sockRcvbufBytes << "] opTimeoutMs[" << c.opTimeoutMs
-            << "] enableKeepalive[" << c.enableKeepalive << "] keepaliveIdleSec["
-            << c.keepaliveIdleSec << "] keepaliveIntvlSec[" << c.keepaliveIntvlSec
-            << "] keepaliveCnt[" << c.keepaliveCnt << "] enableCtrlNodelay[" << c.enableCtrlNodelay
-            << "] enableDataNodelay[" << c.enableDataNodelay << "] numDataConns[" << c.numDataConns
+  return os << "sockSndbufBytes[" << c.sockSndbufBytes << "] sockRcvbufBytes[" << c.sockRcvbufBytes
+            << "] opTimeoutMs[" << c.opTimeoutMs << "] enableKeepalive[" << c.enableKeepalive
+            << "] keepaliveIdleSec[" << c.keepaliveIdleSec << "] keepaliveIntvlSec["
+            << c.keepaliveIntvlSec << "] keepaliveCnt[" << c.keepaliveCnt << "] enableCtrlNodelay["
+            << c.enableCtrlNodelay << "] numDataConns[" << c.numDataConns
             << "] stripingThresholdBytes[" << c.stripingThresholdBytes << "]";
 }
 

@@ -90,14 +90,6 @@ def parse_args():
         default="read",
         help="Type of ops, choices [read, write], default to 'read'",
     )
-    # Backward-compatible alias for existing scripts.
-    parser.add_argument(
-        "--op",
-        dest="op_type",
-        type=str,
-        choices=["read", "write"],
-        help="Alias for --op-type",
-    )
     parser.add_argument(
         "--buffer-size",
         type=int,

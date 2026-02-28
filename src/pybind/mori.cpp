@@ -759,14 +759,13 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readwrite("num_events", &mori::io::XgmiBackendConfig::numEvents);
 
   py::class_<mori::io::TcpBackendConfig, mori::io::BackendConfig>(m, "TcpBackendConfig")
-      .def(py::init<int, int, int, int, bool, int, int, int, bool, bool, int, int>(),
-           py::arg("num_io_threads") = 1, py::arg("sock_sndbuf_bytes") = 4 * 1024 * 1024,
+      .def(py::init<int, int, int, bool, int, int, int, bool, int, int>(),
+           py::arg("sock_sndbuf_bytes") = 4 * 1024 * 1024,
            py::arg("sock_rcvbuf_bytes") = 4 * 1024 * 1024, py::arg("op_timeout_ms") = 30 * 1000,
            py::arg("enable_keepalive") = true, py::arg("keepalive_idle_sec") = 30,
            py::arg("keepalive_intvl_sec") = 10, py::arg("keepalive_cnt") = 3,
-           py::arg("enable_ctrl_nodelay") = true, py::arg("enable_data_nodelay") = false,
-           py::arg("num_data_conns") = 4, py::arg("striping_threshold_bytes") = 256 * 1024)
-      .def_readwrite("num_io_threads", &mori::io::TcpBackendConfig::numIoThreads)
+           py::arg("enable_ctrl_nodelay") = true, py::arg("num_data_conns") = 4,
+           py::arg("striping_threshold_bytes") = 256 * 1024)
       .def_readwrite("sock_sndbuf_bytes", &mori::io::TcpBackendConfig::sockSndbufBytes)
       .def_readwrite("sock_rcvbuf_bytes", &mori::io::TcpBackendConfig::sockRcvbufBytes)
       .def_readwrite("op_timeout_ms", &mori::io::TcpBackendConfig::opTimeoutMs)
@@ -775,9 +774,9 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readwrite("keepalive_intvl_sec", &mori::io::TcpBackendConfig::keepaliveIntvlSec)
       .def_readwrite("keepalive_cnt", &mori::io::TcpBackendConfig::keepaliveCnt)
       .def_readwrite("enable_ctrl_nodelay", &mori::io::TcpBackendConfig::enableCtrlNodelay)
-      .def_readwrite("enable_data_nodelay", &mori::io::TcpBackendConfig::enableDataNodelay)
       .def_readwrite("num_data_conns", &mori::io::TcpBackendConfig::numDataConns)
-      .def_readwrite("striping_threshold_bytes", &mori::io::TcpBackendConfig::stripingThresholdBytes);
+      .def_readwrite("striping_threshold_bytes",
+                     &mori::io::TcpBackendConfig::stripingThresholdBytes);
 
   py::class_<mori::io::IOEngineConfig>(m, "IOEngineConfig")
       .def(py::init<std::string, uint16_t>(), py::arg("host") = "", py::arg("port") = 0)
