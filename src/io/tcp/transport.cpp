@@ -1673,7 +1673,7 @@ void TcpTransport::TryConsumeEarlyWriteLanes(const EngineKey& peer, TransferUniq
 void TcpTransport::MaybeCompleteOutbound(OutboundOpState& st) {
   if (!st.completionReceived) return;
   if (st.isRead) {
-    uint8_t allMask = LanesAllMask(st.lanesTotal);
+    uint16_t allMask = LanesAllMask(st.lanesTotal);
     if (st.lanesDoneMask != allMask || st.rxBytes != st.expectedRxBytes || st.gpuCopyPending)
       return;
   }
@@ -1746,7 +1746,7 @@ void TcpTransport::HandleWorkerRecvDone(const WorkerEvent& ev) {
   }
 
   if (st.local.loc == MemoryLocationType::GPU) {
-    uint8_t allMask = LanesAllMask(st.lanesTotal);
+    uint16_t allMask = LanesAllMask(st.lanesTotal);
     if ((st.lanesDoneMask & allMask) != allMask) {
       MaybeCompleteOutbound(st);
       return;
