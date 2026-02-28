@@ -113,7 +113,7 @@ struct TcpBackendConfig : public BackendConfig {
 
   // Number of parallel DATA TCP connections per peer (iperf-like multi-stream striping).
   // Effective only when peer has >= numDataConns established and transfer is contiguous.
-  int numDataConns{4};
+  int numDataConns{8};
   // Stripe large contiguous transfers; keep small transfers on a single stream for latency.
   int stripingThresholdBytes{64 * 1024};
 };

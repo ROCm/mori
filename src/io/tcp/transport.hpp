@@ -323,7 +323,7 @@ struct Segment {
   uint64_t len{0};
 };
 
-constexpr uint8_t kLaneBits = 3;
+constexpr uint8_t kLaneBits = 4;
 constexpr uint64_t kLaneMask = (1ULL << kLaneBits) - 1ULL;
 
 inline uint64_t ToWireOpId(uint64_t userOpId, uint8_t lane) {
@@ -342,8 +342,8 @@ inline LaneSpan ComputeLaneSpan(uint64_t total, uint8_t lanes, uint8_t lane) {
   return {uint64_t(lane) * base + std::min<uint64_t>(lane, rem), base + (lane < rem ? 1 : 0)};
 }
 
-inline uint8_t LanesAllMask(uint8_t n) {
-  return (n >= (1U << kLaneBits)) ? 0xFF : uint8_t((1U << n) - 1);
+inline uint16_t LanesAllMask(uint8_t n) {
+  return (n >= (1U << kLaneBits)) ? 0xFFFF : uint16_t((1U << n) - 1);
 }
 inline uint8_t ClampLanesTotal(uint8_t n) {
   return n == 0 ? 1 : std::min<uint8_t>(n, 1U << kLaneBits);
@@ -473,7 +473,8 @@ struct OutboundOpState {
   std::vector<Segment> localSegs, remoteSegs;
   uint64_t expectedRxBytes{0}, rxBytes{0};
   bool completionReceived{false}, gpuCopyPending{false};
-  uint8_t lanesTotal{1}, lanesDoneMask{0};
+  uint8_t lanesTotal{1};
+  uint16_t lanesDoneMask{0};
   StatusCode completionCode{StatusCode::SUCCESS};
   std::string completionMsg;
   std::shared_ptr<PinnedBuf> pinned;
@@ -486,7 +487,8 @@ struct InboundWriteState {
   MemoryDesc dst{};
   std::vector<Segment> dstSegs;
   bool discard{false};
-  uint8_t lanesTotal{1}, lanesDoneMask{0};
+  uint8_t lanesTotal{1};
+  uint16_t lanesDoneMask{0};
   std::shared_ptr<PinnedBuf> pinned;
 };
 

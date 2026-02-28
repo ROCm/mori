@@ -153,6 +153,7 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
     }
 
     backends.insert({type, std::move(backend)});
+    InvalidateRouteCache();
   } else {
     assert(false && "not implemented");
   }
