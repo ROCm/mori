@@ -228,11 +228,12 @@ __global__ void SdmaReduceScatterKernel(
       if (sender == myPe) continue;
       if (threadIdx.x == 0) {
         int spin = 0;
+        bool warned = false;
         while (core::AtomicLoadRelaxed(flags + sender) == 0) {
-          if (++spin > 100000000) {
+          if (++spin > 100000000 && !warned) {
             printf("PE %d: SdmaScatter timeout waiting for peer %d\n",
                    myPe, sender);
-            break;
+            warned = true;
           }
         }
       }
@@ -262,7 +263,17 @@ __global__ void SdmaReduceScatterKernel(
     __syncthreads();
   }
 
-  // === Phase 3: Local reduce (all blocks, HBM only) =========================
+  // === Phase 2.5: CU copy of slot[myPe] — L2 coherence fix =================
+  // SDMA scatter writes bypass L2 and land in HBM directly.  However, the
+  // previous reduce wrote slot[myPe] via CU stores, which left a dirty L2
+  // line holding the *old reduce result*.  When the CU reduce below reads
+  // slot[myPe], it hits L2 and sees stale data instead of the fresh scatter
+  // data in HBM.  Overwriting slot[myPe] with the current input via CU
+  // stores forces L2 to match.  Other slots are only *read* (never written
+  // by the reduce), so their L2 entries remain correct.
+  //
+  // Uses the same tid/stride as the reduce, so each thread fixes exactly the
+  // elements it will read — no inter-block barrier required.
   P* __restrict__ buf = reinterpret_cast<P*>(dstMemObj->localPtr);
   P* __restrict__ myDst = buf + static_cast<size_t>(myPe) * packedPerRank;
 
@@ -272,6 +283,16 @@ __global__ void SdmaReduceScatterKernel(
   const size_t stride =
       static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
 
+  {
+    const P* __restrict__ inputSlot =
+        reinterpret_cast<const P*>(input)
+        + static_cast<size_t>(myPe) * packedPerRank;
+    for (size_t k = tid; k < packedPerRank; k += stride) {
+      myDst[k] = inputSlot[k];
+    }
+  }
+
+  // === Phase 3: Local reduce (all blocks) ==================================
   for (size_t k = tid; k < packedPerRank; k += stride) {
     A acc = upcast_v<typename P::type, pack_size>(buf[k]);
     for (int pe = 1; pe < npes; ++pe) {
@@ -281,6 +302,37 @@ __global__ void SdmaReduceScatterKernel(
               buf[static_cast<size_t>(pe) * packedPerRank + k]));
     }
     myDst[k] = downcast_v<typename P::type, pack_size>(acc);
+  }
+
+  // Flush dirty L2 lines to HBM so the SDMA-based AllGather reads fresh data.
+  // CU stores land in L2 (write-back); SDMA reads bypass L2 and hit HBM.
+  // buffer_wbl2 (CDNA3 / MI300, gfx94x) writes back ALL dirty L2 lines.
+  // On CDNA2 (MI200, gfx90a) the host launches L2FlushKernel instead.
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    asm volatile("buffer_wbl2" ::: "memory");
+  }
+#endif
+}
+
+// ============================================================================
+// L2FlushKernel — force dirty L2 lines to HBM via capacity eviction
+//
+// On MI200 (gfx90a) there is no buffer_wbl2.  Writing >= L2-size bytes to a
+// scratch buffer fills every L2 set, evicting all prior dirty lines
+// (including the reduce result) to HBM.
+// ============================================================================
+__global__ void L2FlushKernel(char* __restrict__ buf, size_t bytes) {
+  const size_t tid =
+      static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x)
+      + threadIdx.x;
+  const size_t stride =
+      static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
+  const size_t count = bytes / sizeof(uint64_t);
+  uint64_t* __restrict__ dst = reinterpret_cast<uint64_t*>(buf);
+  for (size_t i = tid; i < count; i += stride) {
+    dst[i] = 0;
   }
 }
 
@@ -356,11 +408,12 @@ __global__ void AllGatherSdmaKernel(int myPe, int npes,
     }
     if (threadLinearId == 0) {
       int spinCount = 0;
+      bool warned = false;
       while (core::AtomicLoadRelaxed(flags + sender) == 0) {
         ++spinCount;
-        if (spinCount > 10000000) {
+        if (spinCount > 10000000 && !warned) {
           printf("PE %d: AllGather timeout waiting for peer %d\n", myPe, sender);
-          break;
+          warned = true;
         }
       }
     }

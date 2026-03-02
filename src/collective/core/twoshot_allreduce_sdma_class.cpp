@@ -28,6 +28,7 @@
 #include <stdexcept>
 #include <cstring>
 #include <cstdio>
+#include <string>
 
 namespace mori {
 namespace collective {
@@ -61,7 +62,9 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes,
       output_transit_buffer_(nullptr),
       output_transit_buffer_size_(output_buffer_size),
       output_transit_buffer_ptr_(nullptr, ShmemDeleter()),
-      copy_output_to_user_(copy_output_to_user) {
+      copy_output_to_user_(copy_output_to_user),
+      l2_flush_buffer_(nullptr),
+      l2_flush_size_(0) {
 
     // 1. Allocate SDMA completion flags
     size_t flagsSize = npes_ * sizeof(uint64_t);
@@ -95,6 +98,34 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes,
     if (!output_transit_buffer_obj_.IsValid())
         throw std::runtime_error("Failed to register output transit buffer");
 
+    // 4. Allocate L2 flush buffer for MI200 (gfx90a) where buffer_wbl2 is
+    //    unavailable.  On MI300 (gfx94x), buffer_wbl2 inside the kernel
+    //    handles L2→HBM write-back, so no flush buffer is needed.
+    {
+        int dev = 0;
+        hipGetDevice(&dev);
+        hipDeviceProp_t prop;
+        hipGetDeviceProperties(&prop, dev);
+        std::string arch(prop.gcnArchName);
+
+        bool is_cdna3 = (arch.find("gfx940") != std::string::npos ||
+                         arch.find("gfx941") != std::string::npos ||
+                         arch.find("gfx942") != std::string::npos);
+
+        if (!is_cdna3 && prop.l2CacheSize > 0 &&
+            output_transit_buffer_size_ < static_cast<size_t>(prop.l2CacheSize)) {
+            l2_flush_size_ = static_cast<size_t>(prop.l2CacheSize);
+            hipError_t he = hipMalloc(&l2_flush_buffer_, l2_flush_size_);
+            if (he != hipSuccess || !l2_flush_buffer_) {
+                fprintf(stderr, "PE %d: WARNING — failed to allocate L2 flush "
+                        "buffer (%s). Small-buffer correctness may suffer.\n",
+                        myPe_, hipGetErrorString(he));
+                l2_flush_buffer_ = nullptr;
+                l2_flush_size_ = 0;
+            }
+        }
+    }
+
     printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n",
            myPe_, npes_, max_blocks_);
     printf("  Flags: %zu bytes at %p\n", flagsSize, flags_.get());
@@ -102,11 +133,18 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes,
     printf("  Output transit buffer: %.2f MB at %p\n",
            output_transit_buffer_size_ / (1024.0 * 1024.0),
            output_transit_buffer_);
+    if (l2_flush_buffer_)
+        printf("  L2 flush buffer: %.2f MB at %p\n",
+               l2_flush_size_ / (1024.0 * 1024.0), l2_flush_buffer_);
 }
 
 // ---------------------------------------------------------------------------
 template <typename T>
 AllreduceSdma<T>::~AllreduceSdma() {
+    if (l2_flush_buffer_) {
+        hipFree(l2_flush_buffer_);
+        l2_flush_buffer_ = nullptr;
+    }
     if (flags_) {
         printf("AllreduceSdma destroyed: PE %d\n", myPe_);
     }
@@ -162,6 +200,18 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count,
             fprintf(stderr, "PE %d: SdmaReduceScatter launch failed: %s\n",
                     myPe_, hipGetErrorString(err));
             return false;
+        }
+
+        // Step 1.5: L2 flush — MI200 fallback (no buffer_wbl2).
+        // Write >= L2-size bytes to evict dirty reduce-result lines to HBM.
+        if (l2_flush_buffer_ && l2_flush_size_ > 0) {
+            L2FlushKernel<<<blocks, threads, 0, stream>>>(
+                reinterpret_cast<char*>(l2_flush_buffer_), l2_flush_size_);
+            err = hipGetLastError();
+            if (err != hipSuccess) {
+                fprintf(stderr, "PE %d: L2FlushKernel launch failed: %s\n",
+                        myPe_, hipGetErrorString(err));
+            }
         }
 
         // Step 2: AllGather via SDMA
