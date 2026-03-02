@@ -24,6 +24,7 @@
 #include <fcntl.h>
 
 #include <cerrno>
+#include <cstring>
 #include <map>
 #include <vector>
 
@@ -397,14 +398,30 @@ size_t SymmMemManager::DetermineVMMChunkSize(size_t userChunkSize, HeapType heap
   }
 
   hipMemAllocationProp allocProp = {};
-#if HIP_VERSION >= 70000000  // ROCm 7.0+
+  // hipMemAllocationTypeUncached: available when HIP_VERSION > 70051831.
+  // For HIP_VERSION == 70051831, use raw value 0x40000000 (symbol may be missing),
+  // and exclude the buggy build 7c9236b16 at runtime.
+#if HIP_VERSION > 70051831
   allocProp.type =
       (heapType == HeapType::Normal) ? hipMemAllocationTypePinned : hipMemAllocationTypeUncached;
+#elif HIP_VERSION == 70051831
+  if (heapType == HeapType::Uncached &&
+      strcmp(HIP_VERSION_GITHASH, "7c9236b16") != 0) {
+    allocProp.type = static_cast<hipMemAllocationType>(0x40000000);  // hipMemAllocationTypeUncached
+  } else {
+    allocProp.type = hipMemAllocationTypePinned;
+    if (heapType == HeapType::Uncached) {
+      MORI_APP_WARN(
+          "Uncached heap type requested but ROCm build {} has a known issue with "
+          "hipMemAllocationTypeUncached, falling back to Pinned memory",
+          HIP_VERSION_GITHASH);
+    }
+  }
 #else
   allocProp.type = hipMemAllocationTypePinned;
   if (heapType == HeapType::Uncached) {
     MORI_APP_WARN(
-        "Uncached heap type requested but ROCm version < 7.0 does not support "
+        "Uncached heap type requested but ROCm version does not support "
         "hipMemAllocationTypeUncached, falling back to Pinned memory");
   }
 #endif
@@ -870,15 +887,27 @@ void SymmMemManager::CleanupAllocatedChunks(size_t startChunk, size_t numToClean
 // Step 3: Configure HIP allocation properties based on heap type
 hipMemAllocationProp SymmMemManager::ConfigureAllocationProp(HeapType heapType, int deviceId) {
   hipMemAllocationProp allocProp = {};
-#if HIP_VERSION >= 70000000  // ROCm 7.0+
+#if HIP_VERSION > 70051831
   allocProp.type =
       (heapType == HeapType::Normal) ? hipMemAllocationTypePinned : hipMemAllocationTypeUncached;
+#elif HIP_VERSION == 70051831
+  if (heapType == HeapType::Uncached &&
+      strcmp(HIP_VERSION_GITHASH, "7c9236b16") != 0) {
+    allocProp.type = static_cast<hipMemAllocationType>(0x40000000);
+  } else {
+    allocProp.type = hipMemAllocationTypePinned;
+    if (heapType == HeapType::Uncached) {
+      MORI_APP_WARN(
+          "Uncached heap type requested but ROCm build {} has a known issue with "
+          "hipMemAllocationTypeUncached, falling back to Pinned memory",
+          HIP_VERSION_GITHASH);
+    }
+  }
 #else
-  // ROCm < 7.0: hipMemAllocationTypeUncached not supported, fallback to Pinned
   allocProp.type = hipMemAllocationTypePinned;
   if (heapType == HeapType::Uncached) {
     MORI_APP_WARN(
-        "Uncached heap type requested but ROCm version < 7.0 does not support "
+        "Uncached heap type requested but ROCm version does not support "
         "hipMemAllocationTypeUncached, falling back to Pinned memory");
   }
 #endif

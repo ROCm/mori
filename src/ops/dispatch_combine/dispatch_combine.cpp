@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 
+#include <algorithm>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
@@ -30,9 +31,11 @@
 #include "mori/shmem/shmem.hpp"
 #include "mori/utils/hip_helper.hpp"
 #include "mori/utils/mori_log.hpp"
+#include "src/ops/dispatch_combine/convert.hpp"
 #include "src/ops/dispatch_combine/internode.hpp"
 #include "src/ops/dispatch_combine/internode_v1.hpp"
 #include "src/ops/dispatch_combine/intranode.hpp"
+#include "src/ops/dispatch_combine/low_latency_async.hpp"
 
 namespace mori {
 namespace moe {
@@ -59,6 +62,9 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
   InitializeBarrier();
 
   this->multiProcessorCount = GetCurDeviceMultiProcessorCount();
+  this->maxThreads = std::min(GetCurDeviceMaxThreads(), 1024);
+  MORI_OPS_INFO("Device capability: multiProcessorCount=%d, maxThreads=%d",
+                static_cast<int>(this->multiProcessorCount), static_cast<int>(this->maxThreads));
 }
 
 EpDispatchCombineHandle::~EpDispatchCombineHandle() {
@@ -139,7 +145,8 @@ void EpDispatchCombineHandle::FinalizeShmemBuf() {
 }
 
 void EpDispatchCombineHandle::InitializeTokenNumSignalBuf() {
-  size_t tokenNumSignalSize = config.worldSize * sizeof(index_t) * 2;
+  // NOTE: config.numQpPerPe is for async kernel's multi-qp optimization
+  size_t tokenNumSignalSize = config.worldSize * sizeof(index_t) * 2 * config.numQpPerPe;
   recvTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
   sendTokenNumMemObj = ShmemMallocAndReturnMemObjPtr(tokenNumSignalSize, hipDeviceMallocUncached);
   // The extra *2 is for the laddr.
@@ -209,6 +216,17 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
       config.worldSize / config.gpuPerNode * config.maxNumInpTokenPerRank * sizeof(index_t);
   HIP_RUNTIME_CHECK(hipMalloc(&interNodeDispSendMap, interNodeDispSendMapSize));
   HIP_RUNTIME_CHECK(hipMemset(interNodeDispSendMap, 0, interNodeDispSendMapSize));
+
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+  const size_t maxDispatchTokens = static_cast<size_t>(config.MaxNumTokensToRecv());
+  const size_t mapSize = maxDispatchTokens * config.numExpertPerToken * sizeof(uint64_t);
+  HIP_RUNTIME_CHECK(hipMalloc(&dispTokToEpSlotMap, mapSize));
+  HIP_RUNTIME_CHECK(hipMemset(dispTokToEpSlotMap, 0, mapSize));
+
+  // Allocate standard MoE output buffers
+  HIP_RUNTIME_CHECK(hipMalloc(&standardPackedRecvCount, config.numExpertPerRank * sizeof(int)));
+  HIP_RUNTIME_CHECK(hipMemset(standardPackedRecvCount, 0, config.numExpertPerRank * sizeof(int)));
+#endif
 }
 
 void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
@@ -225,6 +243,10 @@ void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipFree(interNodeDispDestTokIdMap));
   HIP_RUNTIME_CHECK(hipFree(blockFlagCounter));
   HIP_RUNTIME_CHECK(hipFree(interNodeDispSendMap));
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+  HIP_RUNTIME_CHECK(hipFree(dispTokToEpSlotMap));
+  HIP_RUNTIME_CHECK(hipFree(standardPackedRecvCount));
+#endif
 }
 
 void EpDispatchCombineHandle::InitializeBarrier() {
@@ -235,7 +257,8 @@ void EpDispatchCombineHandle::InitializeBarrier() {
   HIP_RUNTIME_CHECK(hipMemset(combineGridBarrier, 0, barrierSize));
   HIP_RUNTIME_CHECK(hipMalloc(&crossDeviceBarrierFlag, sizeof(uint64_t)));
   crossDeviceBarrierFlag[0] = ((config.kernelType == KernelType::InterNodeV1) ||
-                               (config.kernelType == KernelType::InterNodeV1LL))
+                               (config.kernelType == KernelType::InterNodeV1LL) ||
+                               (config.kernelType == KernelType::AsyncLL))
                                   ? 0
                                   : 1;
   // HIP_RUNTIME_CHECK(hipMemset(crossDeviceBarrierFlag, 1, 1));
@@ -265,29 +288,38 @@ void EpDispatchCombineHandle::FinalizeBarrier() {
   ShmemFree(interNodeChunkFlagMemObj->localPtr);
 }
 
-void EpDispatchCombineHandle::LaunchIntraNodeDispatch(int blockNum, int warpPerBlock,
-                                                      hipStream_t stream) {
-  LaunchDispatch(KernelType::IntraNode, blockNum, warpPerBlock, stream);
+void EpDispatchCombineHandle::LaunchIntraNodeDispatch(int blockNum, int rdmaBlockNum,
+                                                      int warpPerBlock, hipStream_t stream,
+                                                      int hiddenDim) {
+  LaunchDispatch(KernelType::IntraNode, blockNum, rdmaBlockNum, warpPerBlock, stream, hiddenDim);
 }
 
-void EpDispatchCombineHandle::LaunchInterNodeDispatch(int blockNum, int warpPerBlock,
-                                                      hipStream_t stream) {
-  LaunchDispatch(KernelType::InterNode, blockNum, warpPerBlock, stream);
+void EpDispatchCombineHandle::LaunchInterNodeDispatch(int blockNum, int rdmaBlockNum,
+                                                      int warpPerBlock, hipStream_t stream,
+                                                      int hiddenDim) {
+  LaunchDispatch(KernelType::InterNode, blockNum, rdmaBlockNum, warpPerBlock, stream, hiddenDim);
 }
 
-void EpDispatchCombineHandle::LaunchIntraNodeCombine(int blockNum, int warpPerBlock,
-                                                     hipStream_t stream) {
-  LaunchCombine(KernelType::IntraNode, blockNum, warpPerBlock, stream);
+void EpDispatchCombineHandle::LaunchIntraNodeCombine(int blockNum, int rdmaBlockNum,
+                                                     int warpPerBlock, int useExternalInpBuf,
+                                                     hipStream_t stream, int hiddenDim) {
+  LaunchCombine(KernelType::IntraNode, blockNum, rdmaBlockNum, warpPerBlock, useExternalInpBuf,
+                stream, hiddenDim);
 }
 
-void EpDispatchCombineHandle::LaunchInterNodeCombine(int blockNum, int warpPerBlock,
-                                                     hipStream_t stream) {
-  LaunchCombine(KernelType::InterNode, blockNum, warpPerBlock, stream);
+void EpDispatchCombineHandle::LaunchInterNodeCombine(int blockNum, int rdmaBlockNum,
+                                                     int warpPerBlock, int useExternalInpBuf,
+                                                     hipStream_t stream, int hiddenDim) {
+  LaunchCombine(KernelType::InterNode, blockNum, rdmaBlockNum, warpPerBlock, useExternalInpBuf,
+                stream, hiddenDim);
 }
 
-void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum, int warpPerBlock,
-                                             hipStream_t stream) {
+void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum, int rdmaBlockNum,
+                                             int warpPerBlock, hipStream_t stream, int hiddenDim) {
+  const int actualHiddenDim = (hiddenDim > 0) ? hiddenDim : config.hiddenDim;
+  assert(actualHiddenDim > 0 && actualHiddenDim <= config.hiddenDim);
   size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
+  size_t actualRdmaBlockNum = (rdmaBlockNum <= 0) ? config.rdmaBlockNum : rdmaBlockNum;
   dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
   dim3 block(warpSize * actualWarpNumPerBlock);
 
@@ -295,11 +327,12 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
       (config.worldSize * actualWarpNumPerBlock + config.numExpertPerRank * actualWarpNumPerBlock +
        config.numExpertPerRank) *
       sizeof(index_t);
-  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this, actualRdmaBlockNum);
   std::visit(
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;
         using DataT = typename ArgsT::data_type;
+        args.config.hiddenDim = actualHiddenDim;
 
         if (kernelType == KernelType::InterNode) {
           assert(config.useExternalInpBuffer);
@@ -312,6 +345,9 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
           EpDispatchInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
+        } else if (kernelType == KernelType::AsyncLL) {
+          assert(config.useExternalInpBuffer);
+          EpDispatchLowLatencyAsyncSend<<<grid, block, sharedMemSize, stream>>>(args);
         } else {
           assert(false);
         }
@@ -319,38 +355,125 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
       argsVariant);
 }
 
-void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum, int warpPerBlock,
-                                            hipStream_t stream) {
+void EpDispatchCombineHandle::LaunchDispatchRecv(KernelType kernelType, int blockNum,
+                                                 int warpPerBlock, hipStream_t stream) {
   size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
+  size_t actualBlockNum = (blockNum <= 0) ? config.blockNum : blockNum;
+  dim3 grid(actualBlockNum);
+  dim3 block(warpSize * actualWarpNumPerBlock);
+
+  size_t sharedMemSize =
+      (config.worldSize * actualWarpNumPerBlock + config.numExpertPerRank * actualWarpNumPerBlock +
+       config.numExpertPerRank) *
+      sizeof(index_t);
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this, 0);
+  std::visit(
+      [&](auto&& args) {
+        using ArgsT = std::decay_t<decltype(args)>;
+        using DataT = typename ArgsT::data_type;
+        if (kernelType == KernelType::AsyncLL) {
+          assert(config.useExternalInpBuffer);
+          assert((actualBlockNum % config.worldSize) == 0);
+          EpDispatchLowLatencyAsyncRecv<<<grid, block, sharedMemSize, stream>>>(args);
+        } else {
+          assert(false);
+        }
+      },
+      argsVariant);
+}
+// Force emission of this kernel specialization to avoid runtime missing-symbol
+// for bf16->fp8 direct-cast combine on some HIP toolchain configurations.
+template __global__ void
+EpCombineIntraNodeKernel<hip_bfloat16, /*UseP2PRead=*/false, /*EnableStdMoE=*/false,
+                         /*UseFp8DirectCast=*/true>(EpDispatchCombineArgs<hip_bfloat16> args);
+
+void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum, int rdmaBlockNum,
+                                            int warpPerBlock, int useExternalInpBuf,
+                                            hipStream_t stream, int hiddenDim) {
+  const int actualHiddenDim = (hiddenDim > 0) ? hiddenDim : config.hiddenDim;
+  assert(actualHiddenDim > 0 && actualHiddenDim <= config.hiddenDim);
+  // Determine actual values: use parameter if >= 0, otherwise use config
+  const size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
+  const size_t actualRdmaBlockNum = (rdmaBlockNum <= 0) ? config.rdmaBlockNum : rdmaBlockNum;
+  const bool actualUseExternalInpBuffer =
+      (useExternalInpBuf >= 0) ? static_cast<bool>(useExternalInpBuf) : config.useExternalInpBuffer;
   dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
   dim3 block(warpSize * actualWarpNumPerBlock);
 
-  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this);
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this, actualRdmaBlockNum);
   std::visit(
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;
         using DataT = typename ArgsT::data_type;
 
+        // Override args.config.useExternalInpBuffer with the actual value
+        args.config.useExternalInpBuffer = actualUseExternalInpBuffer;
+        args.config.hiddenDim = actualHiddenDim;
+
         size_t sharedMemSize =
             actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
         if (kernelType == KernelType::InterNode) {
-          assert(config.useExternalInpBuffer);
+          assert(actualUseExternalInpBuffer);
           EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeV1) {
-          assert(config.useExternalInpBuffer);
+          assert(actualUseExternalInpBuffer);
+          EpCombineSync<<<this->multiProcessorCount, block, 0, stream>>>(args);
+          EpCombineSyncBarrier<<<1, warpSize, 0, stream>>>(args);
           EpCombineInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
           EpCombineAll<<<this->multiProcessorCount, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::InterNodeV1LL) {
-          assert(config.useExternalInpBuffer);
+          assert(actualUseExternalInpBuffer);
+          EpCombineSync<<<this->multiProcessorCount, block, 0, stream>>>(args);
+          EpCombineSyncBarrier<<<1, warpSize, 0, stream>>>(args);
           EpCombineInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
           EpCombineAll<<<this->multiProcessorCount, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::IntraNode) {
-          if (config.useExternalInpBuffer) {
-            // UseP2PRead=false: does not support zero-copy and provides better bandwidth and lower
-            // latency
-            EpCombineIntraNodeKernel<DataT, false><<<grid, block, sharedMemSize, stream>>>(args);
-          } else {  // zero-copy mode (requires UseP2PRead=true)
-            EpCombineIntraNodeKernel<DataT, true><<<grid, block, sharedMemSize, stream>>>(args);
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+          // When used with convert, P2P read provides better performance
+          EpCombineIntraNodeKernel<DataT, /*UseP2PRead=*/true, /*EnableStdMoE=*/false>
+              <<<grid, block, sharedMemSize, stream>>>(args);
+#else
+          if (actualUseExternalInpBuffer) {
+            // P2P write does not support zero-copy and provides better bandwidth and lower latency
+            if constexpr (std::is_same_v<DataT, hip_bfloat16>) {
+              const bool useFp8DirectCast = (config.quantType == QuantType::Fp8DirectCast);
+              if (useFp8DirectCast) {
+                EpCombineIntraNodeKernel<hip_bfloat16, /*UseP2PRead=*/false,
+                                         /*EnableStdMoE=*/false, /*UseFp8DirectCast=*/true>
+                    <<<grid, block, sharedMemSize, stream>>>(args);
+              } else {
+                EpCombineIntraNodeKernel<DataT, /*UseP2PRead=*/false>
+                    <<<grid, block, sharedMemSize, stream>>>(args);
+              }
+            } else {
+              EpCombineIntraNodeKernel<DataT, /*UseP2PRead=*/false>
+                  <<<grid, block, sharedMemSize, stream>>>(args);
+            }
+          } else {  // zero-copy mode (requires P2P read)
+            assert(config.quantType != QuantType::Fp8DirectCast &&
+                   "Fp8DirectCast is not supported in zero-copy mode");
+            EpCombineIntraNodeKernel<DataT, /*UseP2PRead=*/true>
+                <<<grid, block, sharedMemSize, stream>>>(args);
+          }
+#endif  // ENABLE_STANDARD_MOE_ADAPT
+        } else if (kernelType == KernelType::AsyncLL) {
+          assert(config.useExternalInpBuffer);
+          if constexpr (std::is_same_v<DataT, hip_bfloat16>) {
+            const bool useFp8DirectCast = (config.quantType == QuantType::Fp8DirectCast);
+            if (useFp8DirectCast) {
+#if defined(MORI_FP8_TYPE_OCP_ENABLED) || defined(MORI_FP8_TYPE_FNUZ_ENABLED)
+              EpCombineLowLatencyAsyncSend<hip_bfloat16, /*UseFp8DirectCast=*/true>
+                  <<<grid, block, sharedMemSize, stream>>>(args);
+#else
+              assert(false && "Fp8DirectCast requires FP8 type support in this build");
+#endif
+            } else {
+              EpCombineLowLatencyAsyncSend<<<grid, block, sharedMemSize, stream>>>(args);
+            }
+          } else {
+            assert(config.quantType != QuantType::Fp8DirectCast &&
+                   "Fp8DirectCast combine only supports bf16 input for AsyncLL");
+            EpCombineLowLatencyAsyncSend<<<grid, block, sharedMemSize, stream>>>(args);
           }
         } else {
           assert(false);
@@ -358,6 +481,203 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
       },
       argsVariant);
 }
+
+void EpDispatchCombineHandle::LaunchCombineRecv(KernelType kernelType, int blockNum,
+                                                int warpPerBlock, hipStream_t stream) {
+  size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
+  size_t actualBlockNum = (blockNum <= 0) ? config.blockNum : blockNum;
+  dim3 grid(actualBlockNum);
+  dim3 block(warpSize * actualWarpNumPerBlock);
+
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this, 0);
+  std::visit(
+      [&](auto&& args) {
+        using ArgsT = std::decay_t<decltype(args)>;
+        using DataT = typename ArgsT::data_type;
+        size_t sharedMemSize =
+            actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
+        if (kernelType == KernelType::AsyncLL) {
+          assert(config.useExternalInpBuffer);
+          assert((actualBlockNum % config.worldSize) == 0);
+          if constexpr (std::is_same_v<DataT, hip_bfloat16>) {
+            const bool useFp8DirectCast = (config.quantType == QuantType::Fp8DirectCast);
+            if (useFp8DirectCast) {
+#if defined(MORI_FP8_TYPE_OCP_ENABLED) || defined(MORI_FP8_TYPE_FNUZ_ENABLED)
+              EpCombineLowLatencyAsyncRecv<hip_bfloat16, /*UseFp8DirectCast=*/true>
+                  <<<grid, block, sharedMemSize, stream>>>(args);
+#else
+              assert(false && "Fp8DirectCast requires FP8 type support in this build");
+#endif
+            } else {
+              EpCombineLowLatencyAsyncRecv<<<grid, block, sharedMemSize, stream>>>(args);
+            }
+          } else {
+            assert(config.quantType != QuantType::Fp8DirectCast &&
+                   "Fp8DirectCast combine only supports bf16 input for AsyncLL");
+            EpCombineLowLatencyAsyncRecv<<<grid, block, sharedMemSize, stream>>>(args);
+          }
+        } else {
+          assert(false);
+        }
+      },
+      argsVariant);
+}
+
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+void EpDispatchCombineHandle::LaunchDispatchForStandardMoE(KernelType kernelType, int blockNum,
+                                                           int rdmaBlockNum, int warpPerBlock,
+                                                           hipStream_t stream, int hiddenDim) {
+  const int actualHiddenDim = (hiddenDim > 0) ? hiddenDim : config.hiddenDim;
+  assert(actualHiddenDim > 0 && actualHiddenDim <= config.hiddenDim);
+  size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
+  size_t actualRdmaBlockNum = (rdmaBlockNum <= 0) ? config.rdmaBlockNum : rdmaBlockNum;
+  dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
+  dim3 block(warpSize * actualWarpNumPerBlock);
+
+  size_t sharedMemSize =
+      (config.worldSize * actualWarpNumPerBlock + config.numExpertPerRank * actualWarpNumPerBlock +
+       config.numExpertPerRank) *
+      sizeof(index_t);
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this, actualRdmaBlockNum);
+  std::visit(
+      [&](auto&& args) {
+        using ArgsT = std::decay_t<decltype(args)>;
+        using DataT = typename ArgsT::data_type;
+        args.config.hiddenDim = actualHiddenDim;
+
+        if (kernelType == KernelType::InterNodeV1LL) {
+          EpDispatchCopyToStaging<<<this->multiProcessorCount, block, 0, stream>>>(args);
+          EpDispatchInterNodeV1KernelLowLatency<DataT, /*EnableStdMoE=*/true>
+              <<<grid, block, sharedMemSize, stream>>>(args);
+        } else if (kernelType == KernelType::IntraNode) {
+          EpDispatchIntraNodeKernel<DataT, /*EnableStdMoE=*/true>
+              <<<grid, block, sharedMemSize, stream>>>(args);
+        } else {
+          assert(false &&
+                 "LaunchDispatchForStandardMoE only supports IntraNode/InterNodeV1LL kernel type");
+        }
+      },
+      argsVariant);
+}
+
+void EpDispatchCombineHandle::LaunchCombineForStandardMoE(KernelType kernelType, int blockNum,
+                                                          int rdmaBlockNum, int warpPerBlock,
+                                                          hipStream_t stream, int hiddenDim) {
+  const int actualHiddenDim = (hiddenDim > 0) ? hiddenDim : config.hiddenDim;
+  assert(actualHiddenDim > 0 && actualHiddenDim <= config.hiddenDim);
+  size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
+  size_t actualRdmaBlockNum = (rdmaBlockNum <= 0) ? config.rdmaBlockNum : rdmaBlockNum;
+  dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
+  dim3 block(warpSize * actualWarpNumPerBlock);
+
+  auto argsVariant = GetEpDispatchCombineArgsByInputType(*this, actualRdmaBlockNum);
+  std::visit(
+      [&](auto&& args) {
+        using ArgsT = std::decay_t<decltype(args)>;
+        using DataT = typename ArgsT::data_type;
+        args.config.hiddenDim = actualHiddenDim;
+
+        size_t sharedMemSize =
+            actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
+        if (kernelType == KernelType::InterNodeV1LL) {
+          EpCombineSync<<<this->multiProcessorCount, block, 0, stream>>>(args);
+          EpCombineSyncBarrier<<<1, warpSize, 0, stream>>>(args);
+          EpCombineInterNodeV1KernelLowLatency<DataT, /*EnableStdMoE=*/true>
+              <<<grid, block, sharedMemSize, stream>>>(args);
+          EpCombineAll<<<this->multiProcessorCount, block, sharedMemSize, stream>>>(args);
+        } else if (kernelType == KernelType::IntraNode) {
+          // Standard MoE mode: convert packed expert output to shmem format first
+          EpCombineIntraNodeKernel<DataT, /*UseP2PRead=*/true, /*EnableStdMoE=*/true>
+              <<<grid, block, sharedMemSize, stream>>>(args);
+        } else {
+          assert(false &&
+                 "LaunchCombineForStandardMoE only supports IntraNode/InterNodeV1LL kernel type");
+        }
+      },
+      argsVariant);
+}
+#endif  // ENABLE_STANDARD_MOE_ADAPT
+
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+__global__ void ConvertDispatchOutputKernel(ConvertDispatchOutputArgs args) {
+  ConvertDispatchOutputDevice(args);
+}
+
+void EpDispatchCombineHandle::LaunchConvertDispatchOutputKernel(
+    const void* dispatchOutX, const void* dispatchOutTopkIdx, void* packedRecvX,
+    int* packedRecvCount, int* packedRecvSrcInfo, int64_t* packedRecvLayoutRange, int blockNum,
+    int warpPerBlock, hipStream_t stream, int hiddenDim) {
+  const int actualHiddenDim = (hiddenDim > 0) ? hiddenDim : config.hiddenDim;
+  assert(actualHiddenDim > 0 && actualHiddenDim <= config.hiddenDim);
+  size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
+  dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
+  dim3 block(warpSize * actualWarpNumPerBlock);
+
+  ConvertDispatchOutputArgs args{};
+  args.config = config;
+  args.config.hiddenDim = actualHiddenDim;
+  args.dispatchOutX = dispatchOutX;
+  args.dispatchOutTopkIdx = dispatchOutTopkIdx;
+  args.dispatchSrcTokenPos = dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>();
+  args.totalRecvTokenNum = totalRecvTokenNum;
+  args.packedRecvX = packedRecvX;
+  args.packedRecvCount = packedRecvCount;
+  args.packedRecvSrcInfo = packedRecvSrcInfo;
+  args.packedRecvLayoutRange = packedRecvLayoutRange;
+  args.dispTokToEpSlotMap = dispTokToEpSlotMap;
+  args.dispatchGridBarrier = dispatchGridBarrier;
+
+  ConvertDispatchOutputKernel<<<grid, block, 0, stream>>>(args);
+}
+
+void EpDispatchCombineHandle::LaunchConvertCombineInputKernel(
+    const void* packedRecvX, const void* packedRecvSrcInfo, const void* packedRecvLayoutRange,
+    void* combineInput, mori::application::SymmMemObjPtr shmemCombineInpTokMemObj, int blockNum,
+    int warpPerBlock, hipStream_t stream, int hiddenDim) {
+  const int actualHiddenDim = (hiddenDim > 0) ? hiddenDim : config.hiddenDim;
+  assert(actualHiddenDim > 0 && actualHiddenDim <= config.hiddenDim);
+  size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
+  dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
+  dim3 block(warpSize * actualWarpNumPerBlock);
+
+  ConvertCombineInputArgs args{};
+  args.config = config;
+  args.config.hiddenDim = actualHiddenDim;
+  args.packedRecvX = packedRecvX;
+  args.topkIdx = shmemOutIndicesMemObj->Get();
+  args.topkWeights = shmemDispatchOutWeightsMemObj->Get();
+  args.packedRecvSrcInfo = packedRecvSrcInfo;
+  args.packedRecvLayoutRange = packedRecvLayoutRange;
+  args.totalRecvTokenNum = totalRecvTokenNum;
+  args.combineInput = combineInput;
+  args.shmemCombineInpTokMemObj = shmemCombineInpTokMemObj;
+  args.dispTokIdToSrcTokIdMemObj = dispTokIdToSrcTokIdMemObj;
+  args.dispTokToEpSlotMap = dispTokToEpSlotMap;
+  args.packedRecvCount = standardPackedRecvCount;
+
+  switch (inputType) {
+    case HIP_R_32F:
+      ConvertCombineInputKernel<float><<<grid, block, 0, stream>>>(args);
+      break;
+    case HIP_R_16BF:
+      ConvertCombineInputKernel<hip_bfloat16><<<grid, block, 0, stream>>>(args);
+      break;
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+    case HIP_R_8F_E4M3:
+      ConvertCombineInputKernel<__hip_fp8_e4m3><<<grid, block, 0, stream>>>(args);
+      break;
+#endif
+#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
+    case HIP_R_8F_E4M3_FNUZ:
+      ConvertCombineInputKernel<__hip_fp8_e4m3_fnuz><<<grid, block, 0, stream>>>(args);
+      break;
+#endif
+    default:
+      assert(false);
+      break;
+  }
+}
+#endif  // ENABLE_STANDARD_MOE_ADAPT
 
 // no need for a separate reset kernel now
 void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) {}

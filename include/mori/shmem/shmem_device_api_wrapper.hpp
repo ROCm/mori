@@ -102,6 +102,42 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_put_double_nbi_
     double* dest, const double* source, size_t nelems, int pe, int qpId);
 
 // ============================================================================
+// PutNbi APIs - Warp Scope (Address-based only)
+// ============================================================================
+__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_warp(
+    void* dest, const void* source, size_t bytes, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_uint32_nbi_warp(
+    uint32_t* dest, const uint32_t* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_uint64_nbi_warp(
+    uint64_t* dest, const uint64_t* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_float_nbi_warp(
+    float* dest, const float* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_double_nbi_warp(
+    double* dest, const double* source, size_t nelems, int pe, int qpId);
+
+// ============================================================================
+// PutNbi APIs - Block Scope (Address-based only)
+// ============================================================================
+__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_block(
+    void* dest, const void* source, size_t bytes, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_uint32_nbi_block(
+    uint32_t* dest, const uint32_t* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_uint64_nbi_block(
+    uint64_t* dest, const uint64_t* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_float_nbi_block(
+    float* dest, const float* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_double_nbi_block(
+    double* dest, const double* source, size_t nelems, int pe, int qpId);
+
+// ============================================================================
 // PutNbi with Signal APIs - Thread Scope
 // ============================================================================
 __device__ __attribute__((visibility("default"))) int mori_shmem_putmem_nbi_signal_thread(
@@ -113,6 +149,14 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_putmem_nbi_sign
     atomicType signalOp, int pe, int qpId);
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_putmem_nbi_signal_block(
+    void* dest, const void* source, size_t bytes, void* signalDest, uint64_t signalValue,
+    atomicType signalOp, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_signal_warp(
+    void* dest, const void* source, size_t bytes, void* signalDest, uint64_t signalValue,
+    atomicType signalOp, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_signal_block(
     void* dest, const void* source, size_t bytes, void* signalDest, uint64_t signalValue,
     atomicType signalOp, int pe, int qpId);
 

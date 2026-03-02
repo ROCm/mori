@@ -1,14 +1,24 @@
-# MORI
+<h1 align="center">MORI</h1>
+
+## News
+
+- **[2026/02]** 🔥 MORI powers AMD's WideEP and PD disaggregation in SemiAnalysis InferenceX v2 benchmark ([PR](https://github.com/SemiAnalysisAI/InferenceX/pull/348), [InferenceX](https://inferencex.semianalysis.com/), [blog](https://newsletter.semianalysis.com/p/inferencex-v2-nvidia-blackwell-vs)).
+- **[2026/01]** 🔥 MORI-EP and MORI-IO integrated into SGLang and vLLM for MoE Expert Parallelism and PD Disaggregation on AMD GPUs ([sglang & MORI-EP](https://github.com/sgl-project/sglang/pull/14797), [sglang & MORI-IO](https://github.com/sgl-project/sglang/pull/14626), [vllm & MORI-EP](https://github.com/vllm-project/vllm/pull/28664), [vllm & MORI-IO](https://github.com/vllm-project/vllm/pull/29304)).
+- **[2025/12]** MORI adds support for AMD's AINIC (Pollara) with SOTA performance ([AINIC & MORI-EP](https://github.com/ROCm/mori/pull/119), [AINIC & MORI-IO](https://github.com/ROCm/mori/pull/113)).
+- **[2025/09]** MORI-EP now seamlessly scales to 64 GPUs with SOTA performance ([multiple optimizations](https://github.com/ROCm/mori/pull/128), [multi-QP support](https://github.com/ROCm/mori/pull/108), [low-latency kernel](https://github.com/ROCm/mori/pull/105)).
+- **[2025/09]** MORI adds Broadcom BNXT (Thor2) IBGDA support ([PR](https://github.com/ROCm/mori/pull/64)).
+
+## Introduction
 
 <img src="docs/mori_arch_20250819_v0.png">
 
 **MORI** (**Mo**dular **R**DMA **I**nterface) is a **bottom-up, modular, and composable framework** for building high-performance communication applications with a strong focus on **RDMA + GPU integration**. Inspired by the role of MLIR in compiler infrastructure, MORI provides reusable and extensible building blocks that make it **easier for developers to adopt advanced techniques** such as IBGDA (Infiniband GPUDirect Async) and GDS (GPUDirect Storage).
 
-To help developers get started quickly, MORI also includes a suite of optimized libraries—**MORI-EP** (MoE dispatch & combine kernels), **MORI-IO** (p2p communication for KVCache transfer), and **MORI-CCL** (collective communication)—that deliver out-of-the-box performance.
+To help developers get started quickly, MORI also includes a suite of optimized libraries—**MORI-EP** (MoE dispatch & combine kernels), **MORI-IO** (p2p communication for KVCache transfer), and **MORI-CCL** (collective communication)—that deliver out-of-the-box performance, with support for AMD `Pensando DSC`, Broadcom `Thor2`, and NVIDIA Mellanox `ConnectX-7` NICs.
 
 Feature summary:
 - Applications
-    - MORI-EP: intra and inter-node dispatch/combine kernels with SOTA performance
+    - MORI-EP: intra and inter-node dispatch/combine kernels with SOTA performance.
     - MORI-IO: point-to-point communication library with ultra-low overhead
     - MORI-CCL: lightweight and flexible collective communication library designed for highly customized use cases such as latency-sensitive or resource-constrained environment
 - Framework
@@ -20,10 +30,6 @@ Feature summary:
 
 ## Benchmarks
 
-Configurations:
-- Hardware: 8 x MI300X per node, with 8 single-port CX7 400Gb/s RDMA NICs
-- Software: ROCm 6.4.0
-
 ### MORI-EP
 
 Benchmark result on DeepSeek V3 model configurations:
@@ -32,27 +38,85 @@ Benchmark result on DeepSeek V3 model configurations:
 
 4096 tokens per batch, 7168 hidden, top-8 experts, FP8 dispatching and BF16 combining
 
-| **Kernels**| **# CUs**| **Dispatch XGMI** |**Dispatch RDMA** |**Combine XGMI**|**Combine RDMA** |
-|------------|----------|-------------------|------------------|----------------|-----------------|
-|EP8         | 80       | 307 GB/s          | x                | 330 GB/s       | x               |
-|EP16-V0     | 32       | 75 GB/s           | 23 GB/s          | 76 GB/s        | 23 GB/s          |
-|EP16-V0     | 80       | 79 GB/s           | 24 GB/s          | 82 GB/s        | 25 GB/s          | 
-|EP16-V1     | 32       | 185 GB/s          | 57 GB/s          | 172 GB/s       | 52 GB/s          |
-|EP16-V1     | 80       | 208 GB/s          | 63 GB/s          | 161 GB/s       | 49 GB/s          |
-|EP32-V1-LL  | 32       | 103 GB/s          | 57 GB/s          | 91 GB/s        | 50 GB/s          |
+<table>
+  <tr>
+    <th>Hardware</th>
+    <th>Kernels</th>
+    <th>Dispatch XGMI</th>
+    <th>Dispatch RDMA</th>
+    <th>Combine XGMI</th>
+    <th>Combine RDMA</th>
+  </tr>
+  <tr>
+    <td rowspan="3">MI300X + CX7</td>
+    <td>EP8</td>
+    <td>307 GB/s</td><td>x</td><td>330 GB/s</td><td>x</td>
+  </tr>
+  <tr>
+    <td>EP16-V1</td>
+    <td>171 GB/s</td><td>52 GB/s</td><td>219 GB/s</td><td>67 GB/s</td>
+  </tr>
+  <tr>
+    <td>EP32-V1</td>
+    <td>103 GB/s*</td><td>57 GB/s*</td><td>91 GB/s*</td><td>50 GB/s*</td>
+  </tr>
+  <tr>
+    <td rowspan="3">MI355X + AINIC</td>
+    <td>EP8</td>
+    <td>345 GB/s</td><td>x</td><td>420 GB/s</td><td>x</td>
+  </tr>
+  <tr>
+    <td>EP16-V1</td>
+    <td>179 GB/s</td><td>54 GB/s</td><td>234 GB/s</td><td>71 GB/s</td>
+  </tr>
+  <tr>
+    <td>EP32-V1</td>
+    <td>85 GB/s</td><td>46 GB/s</td><td>110 GB/s</td><td>61 GB/s</td>
+  </tr>
+</table>
 
 **Latency Performance**
 
 128 tokens per batch, 7168 hidden, top-8 experts, FP8 dispatching and BF16 combining
 
-| **Kernels**| **# CUs**| **Dispatch Latency** |**Dispatch BW** |**Combine Latency**|**Combine BW** |
-|------------|----------|----------------------|----------------|-------------------|---------------|
-|EP8         | 64       | 35 us                | 134 GB/s       | 47 us             | 204 GB/s      |
-|EP16-V0     | 32       | 226 us               | 33 GB/s        | 296 us            | 49GB/s        |
-|EP16-V1     | 32       | 115 us               | 63 GB/s        | 141 us            | 110GB/s       |
-|EP32-V1-LL  | 32       | 157 us               | 48 GB/s        | 280 us            | 55GB/s        |
+<table>
+  <tr>
+    <th>Hardware</th>
+    <th>Kernels</th>
+    <th>Dispatch Latency</th>
+    <th>Dispatch BW</th>
+    <th>Combine Latency</th>
+    <th>Combine BW</th>
+  </tr>
+  <tr>
+    <td rowspan="3">MI300X + CX7</td>
+    <td>EP8</td>
+    <td>35 us</td><td>134 GB/s</td><td>47 us</td><td>204 GB/s</td>
+  </tr>
+  <tr>
+    <td>EP16-V1-LL</td>
+    <td>76 us</td><td>96 GB/s</td><td>122 us</td><td>121 GB/s</td>
+  </tr>
+  <tr>
+    <td>EP32-V1-LL</td>
+    <td>157 us*</td><td>48 GB/s*</td><td>280 us*</td><td>55 GB/s*</td>
+  </tr>
+  <tr>
+    <td rowspan="3">MI355X + AINIC</td>
+    <td>EP8</td>
+    <td>31 us</td><td>142 GB/s</td><td>36 us</td><td>276 GB/s</td>
+  </tr>
+  <tr>
+    <td>EP16-V1-LL</td>
+    <td>84 us</td><td>87 GB/s</td><td>108 us</td><td>139 GB/s</td>
+  </tr>
+  <tr>
+    <td>EP32-V1-LL</td>
+    <td>152 us</td><td>45 GB/s</td><td>187 us</td><td>76 GB/s</td>
+  </tr>
+</table>
 
-**NOTE**: We show best performance values measured from multiple test rounds to eliminate fluctuations.
+\* Stale data from previous kernel version; updated numbers pending re-benchmarking.
 
 ### MORI-IO
 
@@ -93,6 +157,29 @@ Benchmark result on the following configurations:
 ```
 
 - Session is a specific technique used in MORI-IO to reduce overhead
+
+## Hardware Support Matrix
+
+**GPU**
+
+| | **MORI-EP** | **MORI-IO** | **MORI-SHMEM** |
+|---|:---:|:---:|:---:|
+| MI308X | ✅ | ✅ | ✅ |
+| MI300X | ✅ | ✅ | ✅ |
+| MI325X | ✅ | ✅ | ✅ |
+| MI355X | ✅ | ✅ | ✅ |
+| MI450X | 🚧 | 🚧 | 🚧 |
+
+**NIC**
+
+| | **MORI-EP** | **MORI-IO** | **MORI-SHMEM** |
+|---|:---:|:---:|:---:|
+| Pollara | ✅ | ✅ | ✅ |
+| CX7 | ✅ | ✅ | ✅ |
+| Thor2 | ✅ | ✅ | ✅ |
+| Volcano | 🚧 | 🚧 | 🚧 |
+
+✅ Supported &emsp; 🚧 Under Development
 
 ## Installation
 
