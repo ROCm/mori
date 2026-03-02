@@ -608,10 +608,10 @@ class EpDispatchCombineTestCase:
         )
 
         if hasattr(mori.cpp, "get_debug_time_buf"):
-            my_times = mori.cpp.get_debug_time_buf(op._handle)
+            my_times = op.get_debug_time_buf()
             my_times.zero_()
             if hasattr(mori.cpp, "get_debug_time_offset"):
-                my_offsets = mori.cpp.get_debug_time_offset(op._handle)
+                my_offsets = op.get_debug_time_offset()
                 my_offsets.zero_()
 
         torch.cuda.synchronize()

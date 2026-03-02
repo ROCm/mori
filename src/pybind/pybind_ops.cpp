@@ -21,487 +21,244 @@
 // SOFTWARE.
 #include "src/pybind/mori.hpp"
 
-#include <ATen/hip/HIPContext.h>
-#include <hip/hip_bfloat16.h>
-#include <hip/hip_fp8.h>
-#include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <torch/extension.h>
-#include <torch/python.h>
+#include <hip/hip_runtime.h>
 
-#include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
-#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
-
-#include "mori/application/application.hpp"
-#include "mori/core/profiler/constants.hpp"
-#include "mori/io/io.hpp"
 #include "mori/ops/ops.hpp"
 #include "mori/pybind/profiler_registry.hpp"
-#include "mori/shmem/shmem.hpp"
-#include "mori/utils/data_types.hpp"
 #include "mori/utils/hip_helper.hpp"
-#include "src/pybind/torch_utils.hpp"
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Ops APIs                                            */
 /* ---------------------------------------------------------------------------------------------- */
 namespace {
 
-std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, torch::Tensor,
-           torch::Tensor>
-LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
-               const torch::Tensor& input, const std::optional<torch::Tensor>& weights,
-               const std::optional<torch::Tensor>& scales, const torch::Tensor& topkIds,
-               int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1) {
-  TORCH_CHECK(input.is_contiguous(), "dispatch input must be contiguous");
-  TORCH_CHECK(topkIds.is_contiguous(), "dispatch topkIds must be contiguous");
-  const int hiddenDim = static_cast<int>(input.size(1));
-  TORCH_CHECK(hiddenDim > 0, "dispatch input hidden dim must be > 0");
-  TORCH_CHECK(hiddenDim <= handle.config.hiddenDim, "dispatch input hidden dim ", hiddenDim,
-              " exceeds config.hidden_dim ", handle.config.hiddenDim);
+namespace py = pybind11;
 
-  float* weightPtr = nullptr;
-  if (weights.has_value()) {
-    TORCH_CHECK(weights->is_contiguous(), "dispatch weights must be contiguous");
-    TORCH_CHECK(weights->element_size() == sizeof(float),
-                "dispatch weights must have element size ", sizeof(float), ", got ",
-                weights->element_size());
-    weightPtr = weights->data_ptr<float>();
+hipDataType IntToHipDataType(int dtype) {
+  switch (dtype) {
+    case 0: return HIP_R_32F;
+    case 1: return HIP_R_16BF;
+    case 2: return HIP_R_8F_E4M3;
+    case 3: return HIP_R_8F_E4M3_FNUZ;
+    case 5: return HIP_R_4F_E2M1;
+    default: throw std::runtime_error("Unsupported dtype int: " + std::to_string(dtype));
   }
-
-  uint8_t* scalePtr = nullptr;
-  if (scales.has_value() && (handle.config.scaleDim > 0)) {
-    TORCH_CHECK(scales->is_contiguous(), "dispatch scales must be contiguous");
-    TORCH_CHECK(scales->element_size() == handle.config.scaleTypeSize,
-                "dispatch scales element size mismatch, expected ", handle.config.scaleTypeSize,
-                ", got ", scales->element_size());
-    scalePtr = reinterpret_cast<uint8_t*>(scales->data_ptr());
-  }
-
-  handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
-                          nullptr, weightPtr, scalePtr, topkIds.data_ptr<mori::moe::index_t>(),
-                          input.size(0));
-  handle.LaunchDispatch((mori::moe::KernelType)kernelType, blockNum, rdmaBlockNum, warpPerBlock,
-                        at::cuda::getCurrentHIPStream(), hiddenDim);
-
-  torch::Tensor out = torch::from_blob(
-      handle.shmemDispatchOutTokMemObj->Get(), {handle.config.MaxNumTokensToRecv(), hiddenDim},
-      torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA));
-
-  torch::Tensor outWeights = torch::from_blob(
-      handle.shmemDispatchOutWeightsMemObj->Get(),
-      {handle.config.MaxNumTokensToRecv(), handle.config.numExpertPerToken},
-      torch::TensorOptions().dtype(mori::GetTorchDataType<float>()).device(torch::kCUDA));
-
-  std::optional<torch::Tensor> outScales{std::nullopt};
-  if (scales.has_value() && (handle.config.scaleDim > 0)) {
-    outScales =
-        torch::from_blob(handle.shmemOutScalesMemObj->Get(),
-                         {handle.config.MaxNumTokensToRecv(), handle.config.scaleDim},
-                         torch::TensorOptions().dtype(scales->scalar_type()).device(torch::kCUDA));
-  }
-
-  torch::Tensor outIndices =
-      torch::from_blob(handle.shmemOutIndicesMemObj->Get(),
-                       {handle.config.MaxNumTokensToRecv(), handle.config.numExpertPerToken},
-                       torch::TensorOptions()
-                           .dtype(mori::GetTorchDataType<mori::moe::index_t>())
-                           .device(torch::kCUDA));
-
-  torch::Tensor totalRecvTokenNum =
-      torch::from_blob(handle.totalRecvTokenNum, {1},
-                       torch::TensorOptions()
-                           .dtype(mori::GetTorchDataType<mori::moe::index_t>())
-                           .device(torch::kCUDA));
-  return {out, outWeights, outScales, outIndices, totalRecvTokenNum};
 }
 
-std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombine(
-    mori::moe::EpDispatchCombineHandle& handle, int kernelType, const torch::Tensor& input,
-    const std::optional<torch::Tensor>& weights, const torch::Tensor& topkIds, int blockNum = -1,
-    int rdmaBlockNum = -1, int warpPerBlock = -1, int useExternalInpBuf = -1) {
-  TORCH_CHECK(input.is_contiguous(), "combine input must be contiguous");
-  TORCH_CHECK(topkIds.is_contiguous(), "combine topkIds must be contiguous");
-  const int hiddenDim = static_cast<int>(input.size(1));
-  TORCH_CHECK(hiddenDim > 0, "combine input hidden dim must be > 0");
-  TORCH_CHECK(hiddenDim <= handle.config.hiddenDim, "combine input hidden dim ", hiddenDim,
-              " exceeds config.hidden_dim ", handle.config.hiddenDim);
+py::tuple LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
+                         int64_t input_ptr, int input_dtype, int64_t num_tokens,
+                         int64_t hidden_dim, int64_t weight_ptr, int64_t scale_ptr,
+                         int64_t topkIds_ptr, int64_t stream, int blockNum = -1,
+                         int rdmaBlockNum = -1, int warpPerBlock = -1) {
+  handle.PrepareInference(
+      IntToHipDataType(input_dtype), reinterpret_cast<void*>(input_ptr), nullptr,
+      weight_ptr ? reinterpret_cast<float*>(weight_ptr) : nullptr,
+      scale_ptr ? reinterpret_cast<uint8_t*>(scale_ptr) : nullptr,
+      reinterpret_cast<mori::moe::index_t*>(topkIds_ptr), num_tokens);
 
-  float* weightsPtr = nullptr;
-  if (weights.has_value() && weights->size(0) != 0) {
-    TORCH_CHECK(weights->is_contiguous(), "combine weights must be contiguous");
-    weightsPtr = weights->data_ptr<float>();
-  }
+  handle.LaunchDispatch(static_cast<mori::moe::KernelType>(kernelType), blockNum, rdmaBlockNum,
+                        warpPerBlock, reinterpret_cast<hipStream_t>(stream),
+                        static_cast<int>(hidden_dim));
 
-  handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
-                          nullptr, weightsPtr, topkIds.data_ptr<mori::moe::index_t>(),
-                          handle.curRankNumToken);
-  handle.LaunchCombine((mori::moe::KernelType)kernelType, blockNum, rdmaBlockNum, warpPerBlock,
-                       useExternalInpBuf, at::cuda::getCurrentHIPStream(), hiddenDim);
+  int64_t out_ptr = reinterpret_cast<int64_t>(handle.shmemDispatchOutTokMemObj->Get());
+  int64_t outW_ptr = reinterpret_cast<int64_t>(handle.shmemDispatchOutWeightsMemObj->Get());
+  int64_t outS_ptr = (scale_ptr && handle.config.scaleDim > 0)
+                         ? reinterpret_cast<int64_t>(handle.shmemOutScalesMemObj->Get())
+                         : 0;
+  int64_t outI_ptr = reinterpret_cast<int64_t>(handle.shmemOutIndicesMemObj->Get());
+  int64_t total_ptr = reinterpret_cast<int64_t>(handle.totalRecvTokenNum);
 
-  auto options = torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCUDA);
-  torch::Tensor out = torch::from_blob(handle.shmemCombineOutTokMemObj->Get(),
-                                       {handle.config.maxNumInpTokenPerRank, hiddenDim}, options);
+  return py::make_tuple(out_ptr, outW_ptr, outS_ptr, outI_ptr, total_ptr);
+}
 
-  std::optional<torch::Tensor> outWeights{std::nullopt};
-  if (weightsPtr) {
-    outWeights =
-        torch::from_blob(handle.shmemCombineOutWeightsMemObj->Get(),
-                         {handle.config.maxNumInpTokenPerRank, handle.config.numExpertPerToken},
-                         torch::TensorOptions().dtype(weights->scalar_type()).device(torch::kCUDA));
-  }
+py::tuple LaunchCombine(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
+                        int64_t input_ptr, int input_dtype, int64_t hidden_dim,
+                        int64_t weight_ptr, int64_t topkIds_ptr, int64_t stream,
+                        int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
+                        int useExternalInpBuf = -1) {
+  handle.PrepareInference(
+      IntToHipDataType(input_dtype), reinterpret_cast<void*>(input_ptr), nullptr,
+      weight_ptr ? reinterpret_cast<float*>(weight_ptr) : nullptr,
+      reinterpret_cast<mori::moe::index_t*>(topkIds_ptr), handle.curRankNumToken);
 
-  return {out, outWeights};
+  handle.LaunchCombine(static_cast<mori::moe::KernelType>(kernelType), blockNum, rdmaBlockNum,
+                       warpPerBlock, useExternalInpBuf, reinterpret_cast<hipStream_t>(stream),
+                       static_cast<int>(hidden_dim));
+
+  int64_t out_ptr = reinterpret_cast<int64_t>(handle.shmemCombineOutTokMemObj->Get());
+  int64_t outW_ptr =
+      weight_ptr ? reinterpret_cast<int64_t>(handle.shmemCombineOutWeightsMemObj->Get()) : 0;
+
+  return py::make_tuple(out_ptr, outW_ptr);
 }
 
 #ifdef ENABLE_STANDARD_MOE_ADAPT
-// Standard MoE 3D output: packedRecvX/Count/SrcInfo/LayoutRange
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> LaunchDispatchForStandardMoE(
-    mori::moe::EpDispatchCombineHandle& handle, int kernelType, const torch::Tensor& input,
-    const std::optional<torch::Tensor>& weights, const std::optional<torch::Tensor>& scales,
-    const torch::Tensor& topkIds, int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1) {
-  TORCH_CHECK(input.is_contiguous(), "dispatch_standard_moe input must be contiguous");
-  TORCH_CHECK(topkIds.is_contiguous(), "dispatch_standard_moe topkIds must be contiguous");
-  const int hiddenDim = static_cast<int>(input.size(1));
-  TORCH_CHECK(hiddenDim > 0, "dispatch_standard_moe input hidden dim must be > 0");
-  TORCH_CHECK(hiddenDim <= handle.config.hiddenDim, "dispatch_standard_moe input hidden dim ",
-              hiddenDim, " exceeds config.hidden_dim ", handle.config.hiddenDim);
+int64_t LaunchDispatchForStandardMoE(
+    mori::moe::EpDispatchCombineHandle& handle, int kernelType, int64_t input_ptr, int input_dtype,
+    int64_t num_tokens, int64_t hidden_dim, int64_t weight_ptr, int64_t scale_ptr,
+    int64_t topkIds_ptr, int64_t stream, int blockNum, int rdmaBlockNum, int warpPerBlock,
+    int64_t packedRecvX_ptr, int64_t packedRecvSrcInfo_ptr) {
+  handle.PrepareInference(
+      IntToHipDataType(input_dtype), reinterpret_cast<void*>(input_ptr), nullptr,
+      weight_ptr ? reinterpret_cast<float*>(weight_ptr) : nullptr,
+      scale_ptr ? reinterpret_cast<uint8_t*>(scale_ptr) : nullptr,
+      reinterpret_cast<mori::moe::index_t*>(topkIds_ptr), num_tokens);
 
-  float* weightPtr = nullptr;
-  if (weights.has_value()) {
-    TORCH_CHECK(weights->is_contiguous(), "dispatch_standard_moe weights must be contiguous");
-    TORCH_CHECK(weights->element_size() == sizeof(float),
-                "dispatch_standard_moe weights must have element size ", sizeof(float), ", got ",
-                weights->element_size());
-    weightPtr = weights->data_ptr<float>();
-  }
+  handle.SetStandardMoeOutputBuffers(reinterpret_cast<void*>(packedRecvX_ptr),
+                                     handle.standardPackedRecvCount,
+                                     reinterpret_cast<int*>(packedRecvSrcInfo_ptr), nullptr);
 
-  uint8_t* scalePtr = nullptr;
-  if (scales.has_value() && (handle.config.scaleDim > 0)) {
-    TORCH_CHECK(scales->is_contiguous(), "dispatch_standard_moe scales must be contiguous");
-    TORCH_CHECK(scales->element_size() == handle.config.scaleTypeSize,
-                "dispatch_standard_moe scales element size mismatch, expected ",
-                handle.config.scaleTypeSize, ", got ", scales->element_size());
-    scalePtr = reinterpret_cast<uint8_t*>(scales->data_ptr());
-  }
+  handle.LaunchDispatchForStandardMoE(static_cast<mori::moe::KernelType>(kernelType), blockNum,
+                                      rdmaBlockNum, warpPerBlock,
+                                      reinterpret_cast<hipStream_t>(stream),
+                                      static_cast<int>(hidden_dim));
 
-  handle.PrepareInference(mori::ScalarTypeToHipDataType(input.scalar_type()), input.data_ptr(),
-                          nullptr, weightPtr, scalePtr, topkIds.data_ptr<mori::moe::index_t>(),
-                          input.size(0));
-
-  const int64_t numLocalExperts = handle.config.numExpertPerRank;
-  const int64_t maxTokensPerExpert =
-      static_cast<int64_t>(handle.config.worldSize) * handle.config.maxNumInpTokenPerRank;
-  const int64_t hidden = input.size(1);
-
-  torch::Tensor packedRecvX =
-      torch::empty({numLocalExperts, maxTokensPerExpert, hidden}, input.options());
-  auto packedRecvSrcInfo = torch::empty({numLocalExperts, maxTokensPerExpert},
-                                        torch::dtype(torch::kInt32).device(torch::kCUDA));
-  // Not sorted by src token blocks, so layout range is unused (return empty tensor).
-  auto packedRecvLayoutRange = torch::empty({0}, torch::dtype(torch::kInt64).device(torch::kCUDA));
-
-  handle.SetStandardMoeOutputBuffers(packedRecvX.data_ptr(), handle.standardPackedRecvCount,
-                                     packedRecvSrcInfo.data_ptr<int>(), nullptr);
-
-  handle.LaunchDispatchForStandardMoE((mori::moe::KernelType)kernelType, blockNum, rdmaBlockNum,
-                                      warpPerBlock, at::cuda::getCurrentHIPStream(), hiddenDim);
-
-  torch::Tensor packedRecvCount =
-      torch::from_blob(handle.standardPackedRecvCount, {numLocalExperts},
-                       torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-
-  // handle.ClearStandardMoeOutputBuffers();
-
-  return {packedRecvX, packedRecvCount, packedRecvSrcInfo, packedRecvLayoutRange};
+  return reinterpret_cast<int64_t>(handle.standardPackedRecvCount);
 }
 
-// Standard MoE combine: takes expert output in packed format and combines back
-std::tuple<torch::Tensor, std::optional<torch::Tensor>> LaunchCombineForStandardMoE(
-    mori::moe::EpDispatchCombineHandle& handle, int kernelType,
-    const torch::Tensor& expertOutput,  // [numLocalExperts, maxTokensPerExpert, hidden]
-    const std::optional<torch::Tensor>& weights, const torch::Tensor& topkIds, int blockNum = -1,
-    int rdmaBlockNum = -1, int warpPerBlock = -1) {
-  TORCH_CHECK(expertOutput.is_contiguous(), "combine_standard_moe expertOutput must be contiguous");
-  TORCH_CHECK(topkIds.is_contiguous(), "combine_standard_moe topkIds must be contiguous");
-  const int hiddenDim = static_cast<int>(expertOutput.size(2));
-  TORCH_CHECK(hiddenDim > 0, "combine_standard_moe input hidden dim must be > 0");
-  TORCH_CHECK(hiddenDim <= handle.config.hiddenDim, "combine_standard_moe input hidden dim ",
-              hiddenDim, " exceeds config.hidden_dim ", handle.config.hiddenDim);
+py::tuple LaunchCombineForStandardMoE(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
+                                      int64_t expertOutput_ptr, int expertOutput_dtype,
+                                      int64_t hidden_dim, int64_t weight_ptr, int64_t topkIds_ptr,
+                                      int64_t stream, int blockNum, int rdmaBlockNum,
+                                      int warpPerBlock) {
+  handle.PrepareInference(
+      IntToHipDataType(expertOutput_dtype), nullptr, nullptr,
+      weight_ptr ? reinterpret_cast<float*>(weight_ptr) : nullptr,
+      reinterpret_cast<mori::moe::index_t*>(topkIds_ptr), handle.curRankNumToken);
 
-  float* weightsPtr = nullptr;
-  if (weights.has_value() && weights->numel() > 0) {
-    TORCH_CHECK(weights->is_contiguous(), "combine_standard_moe weights must be contiguous");
-    TORCH_CHECK(weights->element_size() == sizeof(float),
-                "combine_standard_moe weights must have element size ", sizeof(float), ", got ",
-                weights->element_size());
-    weightsPtr = weights->data_ptr<float>();
-  }
-
-  // Prepare inference with expert output as input
-  handle.PrepareInference(mori::ScalarTypeToHipDataType(expertOutput.scalar_type()),
-                          nullptr,  // inpTokenBuf not used for standard moe combine
-                          nullptr,  // outTokenBuf
-                          weightsPtr, topkIds.data_ptr<mori::moe::index_t>(),
-                          handle.curRankNumToken);
-
-  // Set standard MoE input buffers (reusing output buffer fields)
-  handle.SetStandardMoeOutputBuffers(expertOutput.data_ptr(), handle.standardPackedRecvCount,
+  handle.SetStandardMoeOutputBuffers(reinterpret_cast<void*>(expertOutput_ptr),
+                                     handle.standardPackedRecvCount,
                                      handle.standardPackedRecvSrcInfo,
                                      handle.standardPackedRecvLayoutRange);
 
-  // Launch combine for standard MoE
-  handle.LaunchCombineForStandardMoE((mori::moe::KernelType)kernelType, blockNum, rdmaBlockNum,
-                                     warpPerBlock, at::cuda::getCurrentHIPStream(), hiddenDim);
+  handle.LaunchCombineForStandardMoE(static_cast<mori::moe::KernelType>(kernelType), blockNum,
+                                     rdmaBlockNum, warpPerBlock,
+                                     reinterpret_cast<hipStream_t>(stream),
+                                     static_cast<int>(hidden_dim));
 
-  // Get output tensor from shmem buffer
-  auto options = torch::TensorOptions().dtype(expertOutput.scalar_type()).device(torch::kCUDA);
-  torch::Tensor out = torch::from_blob(handle.shmemCombineOutTokMemObj->Get(),
-                                       {handle.config.maxNumInpTokenPerRank, hiddenDim}, options);
-
-  std::optional<torch::Tensor> outWeights{std::nullopt};
-  // TODO: do not support weights for standard MoE now
-  // if (weightsPtr) {
-  //   outWeights =
-  //       torch::from_blob(handle.shmemCombineOutWeightsMemObj->Get(),
-  //                        {handle.config.maxNumInpTokenPerRank, handle.config.numExpertPerToken},
-  //                        torch::TensorOptions().dtype(weights->scalar_type()).device(torch::kCUDA));
-  // }
-
-  // handle.ClearStandardMoeOutputBuffers();
-
-  return {out, outWeights};
+  int64_t out_ptr = reinterpret_cast<int64_t>(handle.shmemCombineOutTokMemObj->Get());
+  return py::make_tuple(out_ptr, static_cast<int64_t>(0));
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> ConvertDispatchOutput(
-    mori::moe::EpDispatchCombineHandle& handle, const torch::Tensor& dispatchOutX,
-    const torch::Tensor& dispatchOutTopkIdx, int blockNum = -1, int warpPerBlock = -1) {
-  TORCH_CHECK(dispatchOutX.is_cuda(), "dispatchOutX must be a CUDA tensor");
-  TORCH_CHECK(dispatchOutTopkIdx.is_cuda(), "dispatchOutTopkIdx must be a CUDA tensor");
-  TORCH_CHECK(dispatchOutX.dim() == 2, "dispatchOutX must be 2D");
-  TORCH_CHECK(dispatchOutTopkIdx.dim() == 2, "dispatchOutTopkIdx must be 2D");
-  TORCH_CHECK(dispatchOutX.size(0) == dispatchOutTopkIdx.size(0),
-              "dispatchOutX and dispatchOutTopkIdx must have the same first dimension");
+int64_t ConvertDispatchOutput(mori::moe::EpDispatchCombineHandle& handle,
+                              int64_t dispatchOutX_ptr, int64_t dispatchOutTopkIdx_ptr,
+                              int64_t hidden_dim, int64_t stream, int blockNum, int warpPerBlock,
+                              int64_t packedRecvX_ptr, int64_t packedRecvSrcInfo_ptr) {
+  handle.LaunchConvertDispatchOutputKernel(
+      reinterpret_cast<void*>(dispatchOutX_ptr),
+      reinterpret_cast<void*>(dispatchOutTopkIdx_ptr), reinterpret_cast<void*>(packedRecvX_ptr),
+      handle.standardPackedRecvCount, reinterpret_cast<int*>(packedRecvSrcInfo_ptr), nullptr,
+      blockNum, warpPerBlock, reinterpret_cast<hipStream_t>(stream),
+      static_cast<int>(hidden_dim));
 
-  const int64_t numLocalExperts = handle.config.numExpertPerRank;
-  const int64_t maxTokensPerExpert =
-      static_cast<int64_t>(handle.config.worldSize) * handle.config.maxNumInpTokenPerRank;
-  const int64_t hidden = dispatchOutX.size(1);
-  TORCH_CHECK(hidden > 0, "dispatchOutX hidden dim must be > 0");
-  TORCH_CHECK(hidden <= handle.config.hiddenDim, "dispatchOutX hidden dim ", hidden,
-              " exceeds config.hidden_dim ", handle.config.hiddenDim);
-
-  torch::Tensor packedRecvX =
-      torch::empty({numLocalExperts, maxTokensPerExpert, hidden}, dispatchOutX.options());
-  auto packedRecvSrcInfo =
-      torch::empty({numLocalExperts, handle.config.worldSize * handle.config.maxNumInpTokenPerRank},
-                   torch::dtype(torch::kInt32).device(torch::kCUDA));
-  // Not sorted by src token blocks, so layout range is unused.
-  auto packedRecvLayoutRange = torch::empty({0}, torch::dtype(torch::kInt64).device(torch::kCUDA));
-
-  handle.LaunchConvertDispatchOutputKernel(dispatchOutX.data_ptr(), dispatchOutTopkIdx.data_ptr(),
-                                           packedRecvX.data_ptr(), handle.standardPackedRecvCount,
-                                           packedRecvSrcInfo.data_ptr<int>(), nullptr, blockNum,
-                                           warpPerBlock, at::cuda::getCurrentHIPStream(), hidden);
-
-  torch::Tensor packedRecvCount =
-      torch::from_blob(handle.standardPackedRecvCount, {numLocalExperts},
-                       torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-
-  return {packedRecvX, packedRecvCount, packedRecvSrcInfo, packedRecvLayoutRange};
+  return reinterpret_cast<int64_t>(handle.standardPackedRecvCount);
 }
 
-torch::Tensor ConvertCombineInput(mori::moe::EpDispatchCombineHandle& handle,
-                                  const torch::Tensor& packedRecvX,
-                                  const torch::Tensor& packedRecvSrcInfo,
-                                  const torch::Tensor& packedRecvLayoutRange, int blockNum = -1,
-                                  int warpPerBlock = -1) {
-  TORCH_CHECK(packedRecvX.is_cuda() && packedRecvSrcInfo.is_cuda(),
-              "packedRecvX/packedRecvSrcInfo must be CUDA tensors");
-  TORCH_CHECK(packedRecvX.dim() == 3 && packedRecvSrcInfo.dim() == 2,
-              "packedRecvX must be 3D; packedRecvSrcInfo must be 2D");
+int64_t ConvertCombineInput(mori::moe::EpDispatchCombineHandle& handle, int64_t packedRecvX_ptr,
+                            int64_t packedRecvSrcInfo_ptr, int64_t hidden_dim, int64_t stream,
+                            int blockNum, int warpPerBlock) {
+  void* combineInput_ptr = handle.shmemCombineInpTokMemObj->Get();
 
-  const int64_t numLocalExperts = handle.config.numExpertPerRank;
-  const int64_t maxTokensPerExpert =
-      static_cast<int64_t>(handle.config.worldSize) * handle.config.maxNumInpTokenPerRank;
-  const int64_t hidden = packedRecvX.size(2);
-  TORCH_CHECK(hidden > 0, "packedRecvX hidden dim must be > 0");
-  TORCH_CHECK(hidden <= handle.config.hiddenDim, "packedRecvX hidden dim ", hidden,
-              " exceeds config.hidden_dim ", handle.config.hiddenDim);
-  TORCH_CHECK(
-      packedRecvX.size(0) == numLocalExperts && packedRecvSrcInfo.size(0) == numLocalExperts,
-      "local expert dimension mismatch");
-  TORCH_CHECK(
-      packedRecvX.size(1) == maxTokensPerExpert && packedRecvSrcInfo.size(1) == maxTokensPerExpert,
-      "token dimension mismatch");
+  handle.LaunchConvertCombineInputKernel(
+      reinterpret_cast<void*>(packedRecvX_ptr), reinterpret_cast<void*>(packedRecvSrcInfo_ptr),
+      nullptr, combineInput_ptr, handle.shmemCombineInpTokMemObj, blockNum, warpPerBlock,
+      reinterpret_cast<hipStream_t>(stream), static_cast<int>(hidden_dim));
 
-  auto options = packedRecvX.options();
-  // torch::Tensor combineInput = torch::empty({handle.config.MaxNumTokensToRecv(), hidden},
-  // options);
-  torch::Tensor combineInput =
-      torch::from_blob(handle.shmemCombineInpTokMemObj->Get(),
-                       {handle.config.MaxNumTokensToRecv(), hidden}, options);
-
-  // Note: packedRecvLayoutRange is not used in current implementation (passed as nullptr)
-  handle.LaunchConvertCombineInputKernel(packedRecvX.data_ptr(), packedRecvSrcInfo.data_ptr(),
-                                         nullptr, combineInput.data_ptr(),
-                                         handle.shmemCombineInpTokMemObj, blockNum, warpPerBlock,
-                                         at::cuda::getCurrentHIPStream(), hidden);
-
-  return combineInput;
+  return reinterpret_cast<int64_t>(combineInput_ptr);
 }
 #endif  // ENABLE_STANDARD_MOE_ADAPT
 
-void LaunchDispatchRecv(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
+void LaunchDispatchRecv(mori::moe::EpDispatchCombineHandle& handle, int kernelType, int64_t stream,
                         int blockNum = -1, int warpPerBlock = -1) {
-  handle.LaunchDispatchRecv((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
-                            at::cuda::getCurrentHIPStream());
+  handle.LaunchDispatchRecv(static_cast<mori::moe::KernelType>(kernelType), blockNum, warpPerBlock,
+                            reinterpret_cast<hipStream_t>(stream));
 }
 
-void LaunchCombineRecv(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
+void LaunchCombineRecv(mori::moe::EpDispatchCombineHandle& handle, int kernelType, int64_t stream,
                        int blockNum = -1, int warpPerBlock = -1) {
-  handle.LaunchCombineRecv((mori::moe::KernelType)kernelType, blockNum, warpPerBlock,
-                           at::cuda::getCurrentHIPStream());
+  handle.LaunchCombineRecv(static_cast<mori::moe::KernelType>(kernelType), blockNum, warpPerBlock,
+                           reinterpret_cast<hipStream_t>(stream));
 }
 
-void LaunchReset(mori::moe::EpDispatchCombineHandle& handle) {
-  handle.LaunchReset(at::cuda::getCurrentHIPStream());
+void LaunchReset(mori::moe::EpDispatchCombineHandle& handle, int64_t stream) {
+  handle.LaunchReset(reinterpret_cast<hipStream_t>(stream));
 }
 
-torch::Tensor GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle& handle) {
-  auto options = torch::TensorOptions()
-                     .dtype(mori::GetTorchDataType<mori::moe::index_t>())
-                     .device(torch::kCUDA);
-  torch::Tensor tensor =
-      torch::from_blob(handle.dispTokIdToSrcTokIdMemObj->template GetAs<mori::moe::index_t*>(),
-                       {*handle.totalRecvTokenNum}, options);
-  return tensor;
+py::tuple GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle& handle) {
+  return py::make_tuple(
+      reinterpret_cast<int64_t>(
+          handle.dispTokIdToSrcTokIdMemObj->template GetAs<mori::moe::index_t*>()),
+      static_cast<int64_t>(*handle.totalRecvTokenNum));
 }
 
-torch::Tensor GetDispatchSenderTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
-  auto options = torch::TensorOptions()
-                     .dtype(mori::GetTorchDataType<mori::moe::index_t>())
-                     .device(torch::kCUDA);
-  torch::Tensor tensor = torch::from_blob(
-      handle.dispSenderIdxMap, {handle.curRankNumToken * handle.config.numExpertPerToken}, options);
-  return tensor;
+py::tuple GetDispatchSenderTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
+  return py::make_tuple(
+      reinterpret_cast<int64_t>(handle.dispSenderIdxMap),
+      static_cast<int64_t>(handle.curRankNumToken * handle.config.numExpertPerToken));
 }
 
-torch::Tensor GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
-  auto options = torch::TensorOptions()
-                     .dtype(mori::GetTorchDataType<mori::moe::index_t>())
-                     .device(torch::kCUDA);
-  torch::Tensor tensor =
-      torch::from_blob(handle.dispReceiverIdxMap, {*handle.localPeTokenCounter}, options);
-  return tensor;
+py::tuple GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
+  return py::make_tuple(reinterpret_cast<int64_t>(handle.dispReceiverIdxMap),
+                        static_cast<int64_t>(*handle.localPeTokenCounter));
 }
 
-torch::Tensor GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle& handle,
-                                              at::ScalarType scalarType, int hiddenDim = -1) {
-  const int actualHiddenDim =
-      (hiddenDim > 0) ? hiddenDim : static_cast<int>(handle.config.hiddenDim);
-  TORCH_CHECK(actualHiddenDim > 0, "registered combine input hidden dim must be > 0");
-  TORCH_CHECK(actualHiddenDim <= handle.config.hiddenDim, "requested hidden dim ", actualHiddenDim,
-              " exceeds config.hidden_dim ", handle.config.hiddenDim);
-  torch::Tensor out = torch::from_blob(
-      handle.shmemCombineInpTokMemObj->Get(), {handle.config.MaxNumTokensToRecv(), actualHiddenDim},
-      torch::TensorOptions().dtype(scalarType).device(torch::kCUDA));
-  return out;
+py::tuple GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle& handle,
+                                          int hidden_dim = -1) {
+  const int actual = (hidden_dim > 0) ? hidden_dim : static_cast<int>(handle.config.hiddenDim);
+  return py::make_tuple(reinterpret_cast<int64_t>(handle.shmemCombineInpTokMemObj->Get()),
+                        static_cast<int64_t>(handle.config.MaxNumTokensToRecv()),
+                        static_cast<int64_t>(actual));
 }
 
 #ifdef ENABLE_PROFILER
-torch::Tensor GetDebugTimeBuf(mori::moe::EpDispatchCombineHandle& handle) {
-  auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
-  torch::Tensor tensor =
-      torch::from_blob(handle.profilerConfig.debugTimeBuf, {MAX_DEBUG_TIME_SLOTS}, options);
-  return tensor;
+py::tuple GetDebugTimeBuf(mori::moe::EpDispatchCombineHandle& handle) {
+  return py::make_tuple(reinterpret_cast<int64_t>(handle.profilerConfig.debugTimeBuf),
+                        static_cast<int64_t>(MAX_DEBUG_TIME_SLOTS));
 }
 
-torch::Tensor GetDebugTimeOffset(mori::moe::EpDispatchCombineHandle& handle) {
-  auto options = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
-  torch::Tensor tensor =
-      torch::from_blob(handle.profilerConfig.debugTimeOffset, {PROFILER_WARPS_PER_RANK}, options);
-  return tensor;
+py::tuple GetDebugTimeOffset(mori::moe::EpDispatchCombineHandle& handle) {
+  return py::make_tuple(reinterpret_cast<int64_t>(handle.profilerConfig.debugTimeOffset),
+                        static_cast<int64_t>(PROFILER_WARPS_PER_RANK));
 }
 #endif
 
 int GetCurDeviceWallClockFreqMhz() { return mori::GetCurDeviceWallClockFreqMhz(); }
 
 void DeclareEpDispatchCombineHandle(pybind11::module& m) {
-  std::string className = std::string("EpDispatchCombineHandle");
-  pybind11::class_<mori::moe::EpDispatchCombineHandle>(m, className.c_str())
+  pybind11::class_<mori::moe::EpDispatchCombineHandle>(m, "EpDispatchCombineHandle")
       .def(pybind11::init<mori::moe::EpDispatchCombineConfig>(),
            py::arg("config") = mori::moe::EpDispatchCombineConfig{});
 
-  std::string funcName = std::string("launch_dispatch");
-  m.def(funcName.c_str(), &LaunchDispatch);
-
-  funcName = std::string("launch_combine");
-  m.def(funcName.c_str(), &LaunchCombine);
+  m.def("launch_dispatch", &LaunchDispatch);
+  m.def("launch_combine", &LaunchCombine);
 
 #ifdef ENABLE_STANDARD_MOE_ADAPT
-  funcName = std::string("launch_dispatch_standard_moe");
-  m.def(funcName.c_str(), &LaunchDispatchForStandardMoE);
-
-  funcName = std::string("launch_combine_standard_moe");
-  m.def(funcName.c_str(), &LaunchCombineForStandardMoE);
+  m.def("launch_dispatch_standard_moe", &LaunchDispatchForStandardMoE);
+  m.def("launch_combine_standard_moe", &LaunchCombineForStandardMoE);
+  m.def("convert_dispatch_output", &ConvertDispatchOutput);
+  m.def("convert_combine_input", &ConvertCombineInput);
 #endif
 
-#ifdef ENABLE_STANDARD_MOE_ADAPT
-  funcName = std::string("convert_dispatch_output");
-  m.def(funcName.c_str(), &ConvertDispatchOutput);
+  m.def("launch_dispatch_recv", &LaunchDispatchRecv);
+  m.def("launch_combine_recv", &LaunchCombineRecv);
+  m.def("launch_reset", &LaunchReset);
 
-  funcName = std::string("convert_combine_input");
-  m.def(funcName.c_str(), &ConvertCombineInput);
-#endif
-
-  funcName = std::string("launch_dispatch_recv");
-  m.def(funcName.c_str(), &LaunchDispatchRecv);
-
-  funcName = std::string("launch_combine_recv");
-  m.def(funcName.c_str(), &LaunchCombineRecv);
-
-  funcName = std::string("launch_reset");
-  m.def(funcName.c_str(), &LaunchReset);
-
-  funcName = std::string("get_cur_rank_num_token");
-  m.def(funcName.c_str(), &mori::moe::EpDispatchCombineHandle::GetCurRankNumToken);
-
-  funcName = std::string("get_dispatch_src_token_pos");
-  m.def(funcName.c_str(), &GetDispatchSrcTokenId);
-
-  funcName = std::string("get_dispatch_sender_token_idx_map");
-  m.def(funcName.c_str(), &GetDispatchSenderTokenIdxMap);
-
-  funcName = std::string("get_dispatch_receiver_token_idx_map");
-  m.def(funcName.c_str(), &GetDispatchReceiverTokenIdxMap);
-
-  funcName = std::string("get_registered_combine_input_buffer");
-  m.def(funcName.c_str(), &GetRegisteredCombineInputBuffer, py::arg("handle"),
-        py::arg("scalar_type"), py::arg("hidden_dim") = -1);
+  m.def("get_cur_rank_num_token", &mori::moe::EpDispatchCombineHandle::GetCurRankNumToken);
+  m.def("get_dispatch_src_token_pos", &GetDispatchSrcTokenId);
+  m.def("get_dispatch_sender_token_idx_map", &GetDispatchSenderTokenIdxMap);
+  m.def("get_dispatch_receiver_token_idx_map", &GetDispatchReceiverTokenIdxMap);
+  m.def("get_registered_combine_input_buffer", &GetRegisteredCombineInputBuffer, py::arg("handle"),
+        py::arg("hidden_dim") = -1);
 
 #ifdef ENABLE_PROFILER
-  funcName = std::string("get_debug_time_buf");
-  m.def(funcName.c_str(), &GetDebugTimeBuf);
-
-  funcName = std::string("get_debug_time_offset");
-  m.def(funcName.c_str(), &GetDebugTimeOffset);
+  m.def("get_debug_time_buf", &GetDebugTimeBuf);
+  m.def("get_debug_time_offset", &GetDebugTimeOffset);
 #endif
-}
-
-void Cast(const torch::Tensor& input, const torch::Tensor& output) {
-  TORCH_CHECK(false, "cast is not implemented yet");
-  TORCH_CHECK(input.is_contiguous() && output.is_contiguous(),
-              "cast input/output must be contiguous");
-
-  // LaunchCast(static_cast<float*>(input.data_ptr()),
-  //            static_cast<mori::mori_fp4_e2m1*>(output.data_ptr()), input.numel(),
-  //            at::cuda::getCurrentHIPStream());
 }
 
 }  // namespace
-
 
 namespace mori {
 void RegisterMoriOps(py::module_& m) {
@@ -550,16 +307,10 @@ void RegisterMoriOps(py::module_& m) {
       .def_readwrite("num_qp_per_pe", &mori::moe::EpDispatchCombineConfig::numQpPerPe)
       .def_readwrite("quant_type", &mori::moe::EpDispatchCombineConfig::quantType);
 
-  m.attr("topk_idx_t") = py::reinterpret_borrow<py::object>(
-      (PyObject*)torch::getTHPDtype(c10::CppTypeToScalarType<mori::moe::index_t>::value));
-
   DeclareEpDispatchCombineHandle(m);
 
   m.def("get_cur_device_wall_clock_freq_mhz", &GetCurDeviceWallClockFreqMhz,
         "Returns clock frequency of current device's wall clock");
-
-  m.def("cast", &Cast, "cast a tensor from type A to type B");
 }
-
 
 }  // namespace mori

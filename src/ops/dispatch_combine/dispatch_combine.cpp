@@ -543,18 +543,21 @@ void EpDispatchCombineHandle::LaunchDispatchForStandardMoE(KernelType kernelType
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;
         using DataT = typename ArgsT::data_type;
-        args.config.hiddenDim = actualHiddenDim;
-
-        if (kernelType == KernelType::InterNodeV1LL) {
-          EpDispatchCopyToStaging<<<this->multiProcessorCount, block, 0, stream>>>(args);
-          EpDispatchInterNodeV1KernelLowLatency<DataT, /*EnableStdMoE=*/true>
-              <<<grid, block, sharedMemSize, stream>>>(args);
-        } else if (kernelType == KernelType::IntraNode) {
-          EpDispatchIntraNodeKernel<DataT, /*EnableStdMoE=*/true>
-              <<<grid, block, sharedMemSize, stream>>>(args);
+        if constexpr (std::is_same_v<DataT, mori_fp4x2_e2m1>) {
+          assert(false && "fp4x2 is not supported for standard MoE dispatch");
         } else {
-          assert(false &&
-                 "LaunchDispatchForStandardMoE only supports IntraNode/InterNodeV1LL kernel type");
+          args.config.hiddenDim = actualHiddenDim;
+          if (kernelType == KernelType::InterNodeV1LL) {
+            EpDispatchCopyToStaging<<<this->multiProcessorCount, block, 0, stream>>>(args);
+            EpDispatchInterNodeV1KernelLowLatency<DataT, /*EnableStdMoE=*/true>
+                <<<grid, block, sharedMemSize, stream>>>(args);
+          } else if (kernelType == KernelType::IntraNode) {
+            EpDispatchIntraNodeKernel<DataT, /*EnableStdMoE=*/true>
+                <<<grid, block, sharedMemSize, stream>>>(args);
+          } else {
+            assert(false &&
+                   "LaunchDispatchForStandardMoE only supports IntraNode/InterNodeV1LL kernel type");
+          }
         }
       },
       argsVariant);
@@ -575,23 +578,25 @@ void EpDispatchCombineHandle::LaunchCombineForStandardMoE(KernelType kernelType,
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;
         using DataT = typename ArgsT::data_type;
-        args.config.hiddenDim = actualHiddenDim;
-
-        size_t sharedMemSize =
-            actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
-        if (kernelType == KernelType::InterNodeV1LL) {
-          EpCombineSync<<<this->multiProcessorCount, block, 0, stream>>>(args);
-          EpCombineSyncBarrier<<<1, warpSize, 0, stream>>>(args);
-          EpCombineInterNodeV1KernelLowLatency<DataT, /*EnableStdMoE=*/true>
-              <<<grid, block, sharedMemSize, stream>>>(args);
-          EpCombineAll<<<this->multiProcessorCount, block, sharedMemSize, stream>>>(args);
-        } else if (kernelType == KernelType::IntraNode) {
-          // Standard MoE mode: convert packed expert output to shmem format first
-          EpCombineIntraNodeKernel<DataT, /*UseP2PRead=*/true, /*EnableStdMoE=*/true>
-              <<<grid, block, sharedMemSize, stream>>>(args);
+        if constexpr (std::is_same_v<DataT, mori_fp4x2_e2m1>) {
+          assert(false && "fp4x2 is not supported for standard MoE combine");
         } else {
-          assert(false &&
-                 "LaunchCombineForStandardMoE only supports IntraNode/InterNodeV1LL kernel type");
+          args.config.hiddenDim = actualHiddenDim;
+          size_t sharedMemSize =
+              actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
+          if (kernelType == KernelType::InterNodeV1LL) {
+            EpCombineSync<<<this->multiProcessorCount, block, 0, stream>>>(args);
+            EpCombineSyncBarrier<<<1, warpSize, 0, stream>>>(args);
+            EpCombineInterNodeV1KernelLowLatency<DataT, /*EnableStdMoE=*/true>
+                <<<grid, block, sharedMemSize, stream>>>(args);
+            EpCombineAll<<<this->multiProcessorCount, block, sharedMemSize, stream>>>(args);
+          } else if (kernelType == KernelType::IntraNode) {
+            EpCombineIntraNodeKernel<DataT, /*UseP2PRead=*/true, /*EnableStdMoE=*/true>
+                <<<grid, block, sharedMemSize, stream>>>(args);
+          } else {
+            assert(false &&
+                   "LaunchCombineForStandardMoE only supports IntraNode/InterNodeV1LL kernel type");
+          }
         }
       },
       argsVariant);

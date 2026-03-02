@@ -834,11 +834,10 @@ if __name__ == "__main__":
         "--combine-dtype",
         type=str,
         default=None,
-        choices=["bf16", "fp8_e4m3_fnuz", "fp8_e4m3", "fp4"],
+        choices=["bf16", "fp8_e4m3_fnuz", "fp8_e4m3"],
         help=(
             "Data type for combine phase (tuning only). "
             "When set, Phase 2 creates a separate op with this dtype. "
-            "Example: --dtype fp4 --combine-dtype bf16"
         ),
     )
     args = parser.parse_args()

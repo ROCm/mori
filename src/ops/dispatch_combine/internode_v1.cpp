@@ -1382,11 +1382,22 @@ __global__ void EpCombineSyncBarrier(EpDispatchCombineArgs<T> args) {
       EpDispatchCombineArgs<mori_fp4x2_e2m1> args);                               \
   template __global__ void KernelName<float, StdMoE>(EpDispatchCombineArgs<float> args);
 
+// Same as above but without fp4x2 (its packed layout is incompatible with
+// the scalar static_cast<float> in the standard MoE conversion kernels).
+#define INSTANTIATE_LL_KERNEL_NO_FP4(KernelName, StdMoE)                          \
+  template __global__ void KernelName<hip_bfloat16, StdMoE>(                      \
+      EpDispatchCombineArgs<hip_bfloat16> args);                                  \
+  MORI_FP8_FNUZ(template __global__ void KernelName<__hip_fp8_e4m3_fnuz, StdMoE>( \
+                    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)            \
+  MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3, StdMoE>(       \
+                   EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                  \
+  template __global__ void KernelName<float, StdMoE>(EpDispatchCombineArgs<float> args);
+
 // Combined macro for kernels with EnableStdMoE template parameter
 #ifdef ENABLE_STANDARD_MOE_ADAPT
 #define INSTANTIATE_LL_KERNEL_WITH_STDMOE(KernelName) \
   INSTANTIATE_LL_KERNEL(KernelName, false)            \
-  INSTANTIATE_LL_KERNEL(KernelName, true)
+  INSTANTIATE_LL_KERNEL_NO_FP4(KernelName, true)
 #else
 #define INSTANTIATE_LL_KERNEL_WITH_STDMOE(KernelName) INSTANTIATE_LL_KERNEL(KernelName, false)
 #endif

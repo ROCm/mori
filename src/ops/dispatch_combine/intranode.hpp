@@ -236,17 +236,14 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       (args.weightsBuf == nullptr) ? 0 : config.numExpertPerToken * sizeof(float);
   const size_t combXferBytes = hiddenBytes + weightBytes;
 
-  // If EnableStdMoE, call ConvertCombineInputDevice first to convert standard MoE format
-#ifdef ENABLE_STANDARD_MOE_ADAPT
   if constexpr (EnableStdMoE) {
+#ifdef ENABLE_STANDARD_MOE_ADAPT
     InvokeConvertCombineInput<T, UseP2PRead>(args, myPe);
-  }
-#else
-  if constexpr (UseP2PRead) {
+#endif
+  } else if constexpr (UseP2PRead) {
     if (args.config.useExternalInpBuffer) {
       for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
         if constexpr (!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>) {
-          // bf16 -> fp8 conversion
           core::WarpCastBf16ToCombineInternalFp8<T>(
               args.shmemCombineInpTokMemObj->template GetAs<TokT*>() + i * config.hiddenDim,
               args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim, laneId);
@@ -273,7 +270,6 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
           args.shmemCombineInpTokMemObj->template GetAs<uint8_t*>(destPe) +
           (myPe * config.MaxNumTokensToRecvPerRank() + destLocalTokId) * combXferBytes;
       if constexpr (!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>) {
-        // bf16 -> fp8 conversion
         core::WarpCastBf16ToCombineInternalFp8<T>(
             reinterpret_cast<TokT*>(destStagingPtr),
             args.inpTokenBuf + tokenIdx * config.hiddenDim, config.hiddenDim, laneId);
@@ -288,7 +284,6 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
       }
     }
   }
-#endif
 
   // Make sure copy on all GPUs are finished
   CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);

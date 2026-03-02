@@ -20,10 +20,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 from mori import cpp as mori_cpp
+from mori.tensor_utils import from_gpu_ptr, dtype_to_int
 import os
 from dataclasses import dataclass
 import torch
 import torch.distributed as dist
+
+TOPK_IDX_DTYPE = torch.int32
 
 
 class EpDispatchCombineKernelType(mori_cpp.EpDispatchCombineKernelType):
@@ -54,6 +57,19 @@ def _normalize_quant_type(quant_type):
     )
 
 
+def _current_stream():
+    return torch.cuda.current_stream().cuda_stream
+
+
+def _opt_ptr(t):
+    """Extract data_ptr from an optional tensor, returning 0 for None/empty."""
+    if t is None:
+        return 0
+    if isinstance(t, torch.Tensor) and t.numel() == 0:
+        return 0
+    return t.data_ptr()
+
+
 @dataclass
 class EpDispatchCombineConfig:
     data_type: torch.dtype
@@ -75,6 +91,10 @@ class EpDispatchCombineConfig:
     num_qp_per_pe: int = 1
     quant_type: str = "none"
 
+    @property
+    def max_num_tokens_to_recv(self):
+        return self.world_size * self.max_num_inp_token_per_rank
+
 
 def _cpp_dispatch_combine_factory(entity_name, allow_missing=False):
     """Get a C++ binding by name from the mori_cpp module.
@@ -89,7 +109,6 @@ def _cpp_dispatch_combine_factory(entity_name, allow_missing=False):
         The C++ binding if found, or None if allow_missing=True and not found.
     """
     if allow_missing:
-        # Return None instead of raising AttributeError for optional bindings
         return getattr(mori_cpp, entity_name, None)
     return getattr(mori_cpp, entity_name)
 
@@ -142,7 +161,6 @@ class EpDispatchCombineOp:
             "get_registered_combine_input_buffer"
         )
 
-        # Standard MoE functions only available when ENABLE_STANDARD_MOE_ADAPT=ON
         self._dispatch_standard_moe_func = _cpp_dispatch_combine_factory(
             "launch_dispatch_standard_moe", allow_missing=True
         )
@@ -188,12 +206,20 @@ class EpDispatchCombineOp:
                 f"invalid MORI_EP_LAUNCH_CONFIG_MODE, must be ['MANUAL', 'AUTO'], got '{self.launch_config_mode}'"
             )
 
+    def get_launch_config(self, is_dispatch=True, block_num=-1, rdma_block_num=-1, warp_per_block=-1):
+        return (
+            self.auto_block_num if self.auto_block_num else block_num,
+            self.auto_rdma_block_num if self.auto_rdma_block_num else rdma_block_num,
+            self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
+        )
+
     def get_registered_combine_input_buffer(
         self, dtype: torch.dtype, hidden_dim: int = -1
     ):
-        return self._get_registered_combine_input_buffer(
-            self._handle, dtype, hidden_dim
+        ptr, shape0, shape1 = self._get_registered_combine_input_buffer(
+            self._handle, hidden_dim
         )
+        return from_gpu_ptr(ptr, (shape0, shape1), dtype)
 
     def dispatch(
         self,
@@ -215,17 +241,42 @@ class EpDispatchCombineOp:
             block_num: Override config.block_num if > 0.
             warp_per_block: Override config.warp_num_per_block if > 0.
         """
-        return self._dispatch_func(
+        hidden_dim = input.size(1)
+        scale_ptr = _opt_ptr(scales)
+        has_scales = scale_ptr != 0 and self.config.scale_dim > 0
+
+        out_ptr, outW_ptr, outS_ptr, outI_ptr, total_ptr = self._dispatch_func(
             self._handle,
             self.config.kernel_type.value,
-            input,
-            weights,
-            scales,
-            indices,
+            input.data_ptr(),
+            dtype_to_int(input.dtype),
+            input.size(0),
+            hidden_dim,
+            _opt_ptr(weights),
+            scale_ptr,
+            indices.data_ptr(),
+            _current_stream(),
             self.auto_block_num if self.auto_block_num else block_num,
             self.auto_rdma_block_num if self.auto_rdma_block_num else rdma_block_num,
             self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
         )
+
+        max_recv = self.config.max_num_tokens_to_recv
+        out = from_gpu_ptr(out_ptr, (max_recv, hidden_dim), input.dtype)
+        out_weights = from_gpu_ptr(
+            outW_ptr, (max_recv, self.config.num_experts_per_token), torch.float32
+        )
+        out_scales = None
+        if has_scales and outS_ptr:
+            out_scales = from_gpu_ptr(
+                outS_ptr, (max_recv, self.config.scale_dim), scales.dtype
+            )
+        out_indices = from_gpu_ptr(
+            outI_ptr, (max_recv, self.config.num_experts_per_token), TOPK_IDX_DTYPE
+        )
+        total_recv = from_gpu_ptr(total_ptr, (1,), TOPK_IDX_DTYPE)
+
+        return (out, out_weights, out_scales, out_indices, total_recv)
 
     def dispatch_send(
         self,
@@ -253,6 +304,7 @@ class EpDispatchCombineOp:
         return self._dispatch_recv_func(
             self._handle,
             self.config.kernel_type.value,
+            _current_stream(),
             self.auto_block_num if self.auto_block_num else block_num,
             self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
         )
@@ -281,20 +333,40 @@ class EpDispatchCombineOp:
                 1 = use external input buffer (non-zero-copy).
             call_reset: Whether to call reset after combine.
         """
-        output = self._combine_func(
+        hidden_dim = input.size(1)
+        weight_ptr = _opt_ptr(weights)
+
+        out_ptr, outW_ptr = self._combine_func(
             self._handle,
             self.config.kernel_type.value,
-            input,
-            weights,
-            indices,
+            input.data_ptr(),
+            dtype_to_int(input.dtype),
+            hidden_dim,
+            weight_ptr,
+            indices.data_ptr(),
+            _current_stream(),
             self.auto_block_num if self.auto_block_num else block_num,
             self.auto_rdma_block_num if self.auto_rdma_block_num else rdma_block_num,
             self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
             use_external_inp_buf,
         )
+
+        out = from_gpu_ptr(
+            out_ptr,
+            (self.config.max_num_inp_token_per_rank, hidden_dim),
+            input.dtype,
+        )
+        out_weights = None
+        if weight_ptr and outW_ptr:
+            out_weights = from_gpu_ptr(
+                outW_ptr,
+                (self.config.max_num_inp_token_per_rank, self.config.num_experts_per_token),
+                weights.dtype,
+            )
+
         if call_reset:
-            self._reset_func(self._handle)
-        return output
+            self._reset_func(self._handle, _current_stream())
+        return (out, out_weights)
 
     def combine_send(
         self,
@@ -320,6 +392,7 @@ class EpDispatchCombineOp:
         return self._combine_recv_func(
             self._handle,
             self.config.kernel_type.value,
+            _current_stream(),
             self.auto_block_num if self.auto_block_num else block_num,
             self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
         )
@@ -356,17 +429,44 @@ class EpDispatchCombineOp:
             rdma_block_num=rdma_block_num,
             warp_per_block=warp_per_block,
         )
-        return self._dispatch_standard_moe_func(
+
+        hidden_dim = input.size(1)
+        num_local_experts = self.config.num_experts_per_rank
+        max_tokens_per_expert = self.config.world_size * self.config.max_num_inp_token_per_rank
+
+        packed_recv_x = torch.empty(
+            (num_local_experts, max_tokens_per_expert, hidden_dim),
+            dtype=input.dtype, device=input.device,
+        )
+        packed_recv_src_info = torch.empty(
+            (num_local_experts, max_tokens_per_expert),
+            dtype=torch.int32, device=input.device,
+        )
+        packed_recv_layout_range = torch.empty(0, dtype=torch.int64, device=input.device)
+
+        packed_recv_count_ptr = self._dispatch_standard_moe_func(
             self._handle,
             self.config.kernel_type.value,
-            input,
-            weights,
-            scales,
-            indices,
+            input.data_ptr(),
+            dtype_to_int(input.dtype),
+            input.size(0),
+            hidden_dim,
+            _opt_ptr(weights),
+            _opt_ptr(scales),
+            indices.data_ptr(),
+            _current_stream(),
             block_num,
             rdma_block_num,
             warp_per_block,
+            packed_recv_x.data_ptr(),
+            packed_recv_src_info.data_ptr(),
         )
+
+        packed_recv_count = from_gpu_ptr(
+            packed_recv_count_ptr, (num_local_experts,), torch.int32
+        )
+
+        return (packed_recv_x, packed_recv_count, packed_recv_src_info, packed_recv_layout_range)
 
     def combine_standard_moe(
         self,
@@ -400,19 +500,32 @@ class EpDispatchCombineOp:
             rdma_block_num=rdma_block_num,
             warp_per_block=warp_per_block,
         )
-        output = self._combine_standard_moe_func(
+
+        hidden_dim = input.size(2)
+        out_ptr, outW_ptr = self._combine_standard_moe_func(
             self._handle,
             self.config.kernel_type.value,
-            input,
-            weights,
-            indices,
+            input.data_ptr(),
+            dtype_to_int(input.dtype),
+            hidden_dim,
+            _opt_ptr(weights),
+            indices.data_ptr(),
+            _current_stream(),
             block_num,
             rdma_block_num,
             warp_per_block,
         )
+
+        out = from_gpu_ptr(
+            out_ptr,
+            (self.config.max_num_inp_token_per_rank, hidden_dim),
+            input.dtype,
+        )
+        out_weights = None
+
         if call_reset:
-            self._reset_func(self._handle)
-        return output
+            self._reset_func(self._handle, _current_stream())
+        return (out, out_weights)
 
     def convert_dispatch_output(
         self,
@@ -434,13 +547,38 @@ class EpDispatchCombineOp:
                 "convert_dispatch_output is not available. "
                 "Rebuild with ENABLE_STANDARD_MOE_ADAPT=ON."
             )
-        return self._convert_dispatch_output_func(
+
+        hidden_dim = dispatch_out_x.size(1)
+        num_local_experts = self.config.num_experts_per_rank
+        max_tokens_per_expert = self.config.world_size * self.config.max_num_inp_token_per_rank
+
+        packed_recv_x = torch.empty(
+            (num_local_experts, max_tokens_per_expert, hidden_dim),
+            dtype=dispatch_out_x.dtype, device=dispatch_out_x.device,
+        )
+        packed_recv_src_info = torch.empty(
+            (num_local_experts, max_tokens_per_expert),
+            dtype=torch.int32, device=dispatch_out_x.device,
+        )
+        packed_recv_layout_range = torch.empty(0, dtype=torch.int64, device=dispatch_out_x.device)
+
+        packed_recv_count_ptr = self._convert_dispatch_output_func(
             self._handle,
-            dispatch_out_x,
-            dispatch_out_topk_idx,
+            dispatch_out_x.data_ptr(),
+            dispatch_out_topk_idx.data_ptr(),
+            hidden_dim,
+            _current_stream(),
             block_num,
             warp_per_block,
+            packed_recv_x.data_ptr(),
+            packed_recv_src_info.data_ptr(),
         )
+
+        packed_recv_count = from_gpu_ptr(
+            packed_recv_count_ptr, (num_local_experts,), torch.int32
+        )
+
+        return (packed_recv_x, packed_recv_count, packed_recv_src_info, packed_recv_layout_range)
 
     def convert_combine_input(
         self,
@@ -464,17 +602,23 @@ class EpDispatchCombineOp:
                 "convert_combine_input is not available. "
                 "Rebuild with ENABLE_STANDARD_MOE_ADAPT=ON."
             )
-        return self._convert_combine_input_func(
+
+        hidden_dim = packed_recv_x.size(2)
+        combine_input_ptr = self._convert_combine_input_func(
             self._handle,
-            packed_recv_x,
-            packed_recv_src_info,
-            packed_recv_layout_range,
+            packed_recv_x.data_ptr(),
+            packed_recv_src_info.data_ptr(),
+            hidden_dim,
+            _current_stream(),
             block_num,
             warp_per_block,
         )
 
+        max_recv = self.config.max_num_tokens_to_recv
+        return from_gpu_ptr(combine_input_ptr, (max_recv, hidden_dim), packed_recv_x.dtype)
+
     def reset(self):
-        self._reset_func(self._handle)
+        self._reset_func(self._handle, _current_stream())
 
     def _allgather_with_token_num_padding(self, input, max_token_num):
         shape = list(input.shape)
@@ -516,14 +660,14 @@ class EpDispatchCombineOp:
             EpDispatchCombineKernelType.InterNodeV1LL.value,
             EpDispatchCombineKernelType.AsyncLL.value,
         ):
-            return self._get_dispatch_src_token_pos_func(self._handle)
+            ptr, size = self._get_dispatch_src_token_pos_func(self._handle)
+            return from_gpu_ptr(ptr, (size,), TOPK_IDX_DTYPE)
 
-        dispatch_sender_token_id_map = self._get_dispatch_sender_token_idx_map_func(
-            self._handle
-        )
-        dispatch_receiver_token_id_map = self._get_dispatch_receiver_token_idx_map_func(
-            self._handle
-        )
+        ptr, size = self._get_dispatch_sender_token_idx_map_func(self._handle)
+        dispatch_sender_token_id_map = from_gpu_ptr(ptr, (size,), TOPK_IDX_DTYPE)
+
+        ptr, size = self._get_dispatch_receiver_token_idx_map_func(self._handle)
+        dispatch_receiver_token_id_map = from_gpu_ptr(ptr, (size,), TOPK_IDX_DTYPE)
 
         max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank
         all_rank_sender_map = self._allgather_with_token_num_padding(
@@ -566,3 +710,13 @@ class EpDispatchCombineOp:
             src_token_pos.append(src_pe * max_num_token_to_send_per_rank + src_tok_id)
 
         return torch.tensor(src_token_pos, dtype=torch.int)
+
+    def get_debug_time_buf(self):
+        """Get the debug time buffer as a torch.Tensor (int64)."""
+        ptr, size = mori_cpp.get_debug_time_buf(self._handle)
+        return from_gpu_ptr(ptr, (size,), torch.int64)
+
+    def get_debug_time_offset(self):
+        """Get the debug time offset buffer as a torch.Tensor (int32)."""
+        ptr, size = mori_cpp.get_debug_time_offset(self._handle)
+        return from_gpu_ptr(ptr, (size,), torch.int32)

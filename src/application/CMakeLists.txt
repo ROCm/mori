@@ -44,6 +44,7 @@ target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(
   mori_application
+  PUBLIC
   MPI::MPI_CXX
   ibverbs
   hip::host
@@ -57,12 +58,12 @@ target_link_libraries(
 #  ${IONIC_LIBRARY})
 
 if(USE_BNXT)
-  target_link_libraries(mori_application ${BNXT_RE_LIB})
+  target_link_libraries(mori_application PUBLIC ${BNXT_RE_LIB})
 endif()
 
 if(USE_IONIC)
-	target_link_libraries(mori_application ${IONIC_LIB})
+	target_link_libraries(mori_application PUBLIC ${IONIC_LIB})
 endif()
 
-target_include_directories(mori_application PUBLIC ${TORCH_INCLUDE_DIRS})
-target_link_libraries(mori_application c10 torch torch_cpu c10_hip torch_hip)
+target_include_directories(mori_application PRIVATE ${TORCH_INCLUDE_DIRS})
+target_link_libraries(mori_application PRIVATE c10 torch torch_cpu c10_hip torch_hip)
