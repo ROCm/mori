@@ -299,6 +299,65 @@ inline __device__ void WarpCopy(T* __restrict__ dst, const T* __restrict__ src, 
   }
 }
 
+template <typename T, int VecBytes, int Unroll>
+inline __device__ void BlockCopyImpl(T* __restrict__ dst, const T* __restrict__ src, size_t& offset,
+                                     size_t nelems) {
+  static_assert((VecBytes <= 16) && (VecBytes >= 1) && IsPowerOf2(VecBytes));
+  constexpr int vecSize = VecBytes / sizeof(T);
+  if constexpr (vecSize <= 0) return;
+
+  const int threadId = FlatBlockThreadId();
+  const int blockSize = FlatBlockSize();
+  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+
+  const size_t elemsPerBlock = static_cast<size_t>(Unroll) * blockSize * vecSize;
+  const size_t numIters = (nelems - offset) / elemsPerBlock;
+  for (size_t iter = 0; iter < numIters; iter++) {
+    DataType vec[Unroll];
+#pragma unroll Unroll
+    for (int u = 0; u < Unroll; u++) {
+      vec[u] = load<VecBytes>(src + offset + (threadId + u * blockSize) * vecSize);
+    }
+
+#pragma unroll Unroll
+    for (int u = 0; u < Unroll; u++) {
+      store<VecBytes>(dst + offset + (threadId + u * blockSize) * vecSize, vec[u]);
+    }
+
+    offset += elemsPerBlock;
+  }
+}
+
+template <typename T, int VecBytes, int Unroll = 1>
+inline __device__ void BlockCopyVec(T* __restrict__ dst, const T* __restrict__ src, size_t& offset,
+                                    size_t nelems) {
+  if constexpr ((VecBytes % sizeof(T)) == 0) {
+    BlockCopyImpl<T, VecBytes, Unroll>(dst, src, offset, nelems);
+    if constexpr (Unroll > 1) {
+      BlockCopyImpl<T, VecBytes, 1>(dst, src, offset, nelems);
+    }
+  }
+}
+
+template <typename T, int Unroll = 1>
+inline __device__ void BlockCopy(T* __restrict__ dst, const T* __restrict__ src, size_t nelems) {
+  const int threadId = FlatBlockThreadId();
+  const int blockSize = FlatBlockSize();
+
+  size_t offset = 0;
+  BlockCopyVec<T, 16, Unroll>(dst, src, offset, nelems);
+  BlockCopyVec<T, 8, Unroll>(dst, src, offset, nelems);
+  BlockCopyVec<T, 4, Unroll>(dst, src, offset, nelems);
+  BlockCopyVec<T, 2, Unroll>(dst, src, offset, nelems);
+  BlockCopyVec<T, 1, Unroll>(dst, src, offset, nelems);
+
+  offset += threadId;
+  while (offset < nelems) {
+    dst[offset] = src[offset];
+    offset += blockSize;
+  }
+}
+
 template <typename T, int N>
 inline __device__ void WarpCopy(T* dst, T* src) {
   constexpr int vecSize = 16 / sizeof(T);

@@ -32,6 +32,7 @@
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"
+#include "mori/shmem/shmem_device_api.hpp"
 #include "mori/utils/mori_log.hpp"
 
 namespace mori {
@@ -434,6 +435,92 @@ static void ConfigureHeapInfoForGpu(GpuStates* gpuStates, const ShmemStates* sta
   }
 }
 
+// Allocate internal synchronization memory for device barriers
+static void AllocateInternalSync(GpuStates* gpuStates, const ShmemStates* states) {
+  constexpr size_t MORI_INTERNAL_SYNC_SIZE = 128 * sizeof(uint64_t);
+  constexpr size_t ALIGNMENT = 256;
+  void* syncPtr = nullptr;
+
+  switch (states->mode) {
+    case ShmemMode::StaticHeap: {
+      uintptr_t allocAddr =
+          states->memoryStates->symmMemMgr->GetHeapVAManager()->Allocate(MORI_INTERNAL_SYNC_SIZE,
+                                                                         ALIGNMENT);
+      if (allocAddr == 0) {
+        MORI_SHMEM_ERROR("Out of static heap memory for internal sync buffer!");
+      } else {
+        syncPtr = reinterpret_cast<void*>(allocAddr);
+        states->memoryStates->symmMemMgr->RegisterStaticHeapSubRegion(
+            syncPtr, MORI_INTERNAL_SYNC_SIZE, &states->memoryStates->staticHeapObj);
+      }
+      break;
+    }
+
+    case ShmemMode::VMHeap: {
+      application::SymmMemObjPtr syncObj = states->memoryStates->symmMemMgr->VMMAllocChunk(
+          MORI_INTERNAL_SYNC_SIZE, states->memoryStates->heapType);
+      if (syncObj.IsValid()) {
+        syncPtr = syncObj.cpu->localPtr;
+      } else {
+        MORI_SHMEM_ERROR("Failed to allocate internal sync buffer from VMM heap!");
+      }
+      break;
+    }
+
+    case ShmemMode::Isolation: {
+      application::SymmMemObjPtr syncObj =
+          states->memoryStates->symmMemMgr->Malloc(MORI_INTERNAL_SYNC_SIZE);
+      if (syncObj.IsValid()) {
+        syncPtr = syncObj.cpu->localPtr;
+      } else {
+        MORI_SHMEM_ERROR("Failed to allocate internal sync buffer in isolation mode!");
+      }
+      break;
+    }
+
+    default:
+      MORI_SHMEM_ERROR("Unknown ShmemMode for internal sync allocation: {}",
+                       static_cast<int>(states->mode));
+      break;
+  }
+
+  if (syncPtr != nullptr) {
+    gpuStates->internalSyncPtr = reinterpret_cast<uint64_t*>(syncPtr);
+    HIP_RUNTIME_CHECK(hipMemset(gpuStates->internalSyncPtr, 0, MORI_INTERNAL_SYNC_SIZE));
+    MORI_SHMEM_TRACE("Internal sync pointer allocated at 0x{:x} (mode={})",
+                     reinterpret_cast<uintptr_t>(gpuStates->internalSyncPtr),
+                     static_cast<int>(states->mode));
+  }
+}
+
+// Free internal synchronization memory
+static void FinalizeInternalSync(const ShmemStates* states) {
+  if (globalGpuStates.internalSyncPtr == nullptr) {
+    return;
+  }
+
+  void* syncPtr = reinterpret_cast<void*>(globalGpuStates.internalSyncPtr);
+  switch (states->mode) {
+    case ShmemMode::StaticHeap: {
+      states->memoryStates->symmMemMgr->DeregisterStaticHeapSubRegion(syncPtr);
+      states->memoryStates->symmMemMgr->GetHeapVAManager()->Free(
+          reinterpret_cast<uintptr_t>(syncPtr));
+      break;
+    }
+    case ShmemMode::VMHeap: {
+      states->memoryStates->symmMemMgr->VMMFreeChunk(syncPtr);
+      break;
+    }
+    case ShmemMode::Isolation: {
+      states->memoryStates->symmMemMgr->Free(syncPtr);
+      break;
+    }
+    default:
+      break;
+  }
+  MORI_SHMEM_TRACE("Internal sync memory freed (mode={})", static_cast<int>(states->mode));
+}
+
 // Copy GpuStates structure to device constant memory
 static void CopyGpuStatesToDevice(const GpuStates* gpuStates) {
   GpuStates* globalGpuStatesAddr = nullptr;
@@ -464,6 +551,9 @@ void GpuStateInit() {
 
   // Configure heap information for GPU access
   ConfigureHeapInfoForGpu(&gpuStates, states);
+
+  // Allocate internal synchronization memory for device barriers
+  AllocateInternalSync(&gpuStates, states);
 
   // Copy complete state to device
   CopyGpuStatesToDevice(&gpuStates);
@@ -621,6 +711,10 @@ int ShmemFinalize() {
 
   // Clean up in reverse order of initialization
   FinalizeGpuStates();
+
+  // Clean up internal sync memory
+  FinalizeInternalSync(states);
+
   FinalizeHeap(states);
   FinalizeAllStates(states);
 
@@ -685,10 +779,11 @@ int ShmemModuleInit(void* hipModule) {
 
   hipError_t err = hipModuleGetGlobal(reinterpret_cast<hipDeviceptr_t*>(&moduleGlobalGpuStatesAddr),
                                       nullptr, module, "_ZN4mori5shmem15globalGpuStatesE");
-
+ 
   if (err != hipSuccess) {
-    MORI_SHMEM_WARN("Failed to get globalGpuStates symbol from module: {} (error code: {})",
-                    hipGetErrorString(err), err);
+    (void)hipGetLastError();
+    MORI_SHMEM_TRACE("Module does not contain globalGpuStates symbol ({}), skipping init",
+                     hipGetErrorString(err));
     return -1;
   }
 
@@ -717,6 +812,16 @@ void ShmemBarrierAll() {
   MORI_SHMEM_TRACE("PE {} entering barrier", states->bootStates->rank);
   states->bootStates->bootNet->Barrier();
   MORI_SHMEM_TRACE("PE {} exiting barrier", states->bootStates->rank);
+}
+
+__global__ static void ShmemBarrierAllBlockKernel() { ShmemBarrierAllBlock(); }
+
+void ShmemBarrierOnStream(hipStream_t stream) {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
+
+  MORI_SHMEM_TRACE("PE {} launching device barrier on stream", states->bootStates->rank);
+  ShmemBarrierAllBlockKernel<<<1, 1, 0, stream>>>();
 }
 
 /* ---------------------------------------------------------------------------------------------- */

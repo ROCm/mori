@@ -277,7 +277,10 @@ XgmiBackend::~XgmiBackend() {
   std::unique_lock<std::shared_mutex> lock(ipcMutex);
   for (auto& entry : remoteIpcHandles) {
     if (entry.second.remappedAddr != nullptr) {
-      hipIpcCloseMemHandle(entry.second.remappedAddr);
+      hipError_t closeErr = hipIpcCloseMemHandle(entry.second.remappedAddr);
+      if (closeErr != hipSuccess) {
+        MORI_IO_WARN("XGMI: Failed to close IPC mem handle: {}", hipGetErrorString(closeErr));
+      }
     }
   }
   remoteIpcHandles.clear();
@@ -317,7 +320,10 @@ void XgmiBackend::InitializeP2PAccess() {
       if (canAccess) {
         hipError_t enableErr = hipDeviceEnablePeerAccess(j, 0);
         if (enableErr == hipErrorPeerAccessAlreadyEnabled) {
-          hipGetLastError();
+          hipError_t clearErr = hipGetLastError();
+          if (clearErr != hipSuccess) {
+            MORI_IO_WARN("XGMI: Failed to clear peer access error: {}", hipGetErrorString(clearErr));
+          }
           p2pMatrix[i][j] = true;
           MORI_IO_TRACE("XGMI: P2P access already enabled from device {} to {}", i, j);
         } else if (enableErr != hipSuccess) {
@@ -409,7 +415,10 @@ void* XgmiBackend::GetRemappedAddress(const MemoryDesc& desc, int localDeviceId)
   void* remappedAddr = nullptr;
   err = hipIpcOpenMemHandle(&remappedAddr, handle, hipIpcMemLazyEnablePeerAccess);
   if (err != hipSuccess) {
-    hipGetLastError();
+    hipError_t clearErr = hipGetLastError();
+    if (clearErr != hipSuccess) {
+      MORI_IO_WARN("XGMI: Failed to clear IPC open error: {}", hipGetErrorString(clearErr));
+    }
     if (IsP2PAccessible(localDeviceId, desc.deviceId)) {
       MORI_IO_TRACE("XGMI: IPC failed, using direct P2P pointer for id={}", desc.id);
       return reinterpret_cast<void*>(desc.data);

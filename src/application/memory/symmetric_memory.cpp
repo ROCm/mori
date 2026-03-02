@@ -224,7 +224,14 @@ void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
   for (int i = 0; i < worldSize; i++) {
     if (!context.CanUseP2P(i)) continue;
     if (memObjPtr.cpu->p2pPeerPtrs && memObjPtr.cpu->p2pPeerPtrs[i] != 0) {
-      HIP_RUNTIME_CHECK(hipIpcCloseMemHandle(reinterpret_cast<void*>(memObjPtr.cpu->p2pPeerPtrs[i])));
+      void* peerPtr = reinterpret_cast<void*>(memObjPtr.cpu->p2pPeerPtrs[i]);
+      hipError_t closeErr = hipIpcCloseMemHandle(peerPtr);
+      if (closeErr != hipSuccess) {
+        MORI_APP_WARN("hipIpcCloseMemHandle failed for peer {} ptr {:p}: {}", i, peerPtr,
+                      hipGetErrorString(closeErr));
+      } else {
+        memObjPtr.cpu->p2pPeerPtrs[i] = 0;
+      }
     }
   }
   

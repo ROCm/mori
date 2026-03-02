@@ -102,6 +102,7 @@ inline __device__ void ShmemFenceThread(int pe, int qpId) {
   ShmemQuietThread(pe, qpId);
   __threadfence_system();
 }
+
 inline __device__ void ShmemQuietThread(int pe, const application::SymmMemObjPtr dest) {
   ShmemQuietThreadKernel<application::TransportType::SDMA>(pe, dest);
 }
@@ -120,7 +121,6 @@ inline __device__ uint64_t ShmemPtrP2p(const uint64_t destPtr, const int myPe, i
 
   if (localAddrInt < globalGpuStates->heapBaseAddr ||
       localAddrInt >= globalGpuStates->heapEndAddr) {
-    assert(false && "dest addr not in symmetric heap");
     return 0;
   }
 
@@ -175,6 +175,7 @@ inline __device__ uint64_t ShmemPtrP2p(const application::SymmMemObjPtr& memObjP
 
 DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Block)
 
 #define DEFINE_SHMEM_PUT_TYPE_NBI_API_TEMPLATE(Scope)                                      \
   template <typename T>                                                                    \
@@ -189,6 +190,7 @@ DEFINE_SHMEM_PUT_MEM_NBI_API_TEMPLATE(Warp)
 
 DEFINE_SHMEM_PUT_TYPE_NBI_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_API_TEMPLATE(Block)
 
 #define DEFINE_SHMEM_PUT_TYPE_NBI_API(TypeName, T, Scope)                                   \
   inline __device__ void ShmemPut##TypeName##Nbi##Scope(                                    \
@@ -221,6 +223,18 @@ DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Int64, int64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Float, float, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Double, double, Warp)
+
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint8, uint8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Int8, int8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Schar, signed char, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint16, uint16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Int16, int16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint32, uint32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Int32, int32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Uint64, uint64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Int64, int64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Float, float, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_API(Double, double, Block)
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                       PutNbi Inline APIs                                       */
@@ -293,6 +307,7 @@ DEFINE_SHMEM_PUT_TYPE_IMM_NBI_API(Int64, int64_t, Warp)
 
 DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Block)
 
 // PutNbi with Signal - Typed version
 #define DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API_TEMPLATE(Scope)                                      \
@@ -310,6 +325,7 @@ DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_API_TEMPLATE(Warp)
 
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API_TEMPLATE(Block)
 
 // PutNbi with Signal - Concrete typed versions
 #define DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(TypeName, T, Scope)                                  \
@@ -347,6 +363,18 @@ DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int64, int64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Float, float, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Double, double, Warp)
+
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint8, uint8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int8, int8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Schar, signed char, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint16, uint16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int16, int16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint32, uint32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int32, int32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Uint64, uint64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Int64, int64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Float, float, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_API(Double, double, Block)
 
 #define SHMEM_ATOMIC_SIZE_NONFETCH_API_TEMPLATE(Scope)                                         \
   inline __device__ void ShmemAtomicSizeNonFetch##Scope(                                       \
@@ -491,6 +519,7 @@ DEFINE_SHMEM_ATOMIC_TYPE_FETCH_ADD_API(Ulong, unsigned long, Warp)
 
 DEFINE_SHMEM_PUT_MEM_NBI_ADDR_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_MEM_NBI_ADDR_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_MEM_NBI_ADDR_API_TEMPLATE(Block)
 
 #define DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API_TEMPLATE(Scope)                                       \
   template <typename T>                                                                          \
@@ -501,6 +530,7 @@ DEFINE_SHMEM_PUT_MEM_NBI_ADDR_API_TEMPLATE(Warp)
 
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API_TEMPLATE(Block)
 
 #define DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(TypeName, T, Scope)                                   \
   inline __device__ void ShmemPut##TypeName##Nbi##Scope(T* dest, const T* source, size_t nelems, \
@@ -531,6 +561,18 @@ DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int64, int64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Float, float, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Double, double, Warp)
+
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint8, uint8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int8, int8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Schar, signed char, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint16, uint16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int16, int16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint32, uint32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int32, int32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Uint64, uint64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Int64, int64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Float, float, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_ADDR_API(Double, double, Block)
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                       PutNbi Inline APIs                                       */
@@ -594,6 +636,7 @@ DEFINE_SHMEM_PUT_TYPE_IMM_NBI_ADDR_API(Int64, int64_t, Warp)
 
 DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_ADDR_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_ADDR_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_ADDR_API_TEMPLATE(Block)
 
 #define DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API_TEMPLATE(Scope)                            \
   template <typename T, bool onlyOneSignal = true>                                           \
@@ -606,6 +649,7 @@ DEFINE_SHMEM_PUT_MEM_NBI_SIGNAL_ADDR_API_TEMPLATE(Warp)
 
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API_TEMPLATE(Thread)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API_TEMPLATE(Block)
 
 #define DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(TypeName, T, Scope)                             \
   template <bool onlyOneSignal = true>                                                            \
@@ -639,6 +683,18 @@ DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint64, uint64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int64, int64_t, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Float, float, Warp)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Double, double, Warp)
+
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint8, uint8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int8, int8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Schar, signed char, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint16, uint16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int16, int16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint32, uint32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int32, int32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Uint64, uint64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Int64, int64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Float, float, Block)
+DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Double, double, Block)
 
 #define SHMEM_ATOMIC_SIZE_NONFETCH_ADDR_API_TEMPLATE(Scope)                                        \
   inline __device__ void ShmemAtomicSizeNonFetch##Scope(                                           \
@@ -824,6 +880,103 @@ inline __device__ int ShmemMyPe() {
 inline __device__ int ShmemNPes() {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   return globalGpuStates->worldSize;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                       Device Barrier APIs                                      */
+/* ---------------------------------------------------------------------------------------------- */
+inline __device__ void ShmemInternalBarrierThread() {
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  uint64_t* pSync = globalGpuStates->internalSyncPtr;
+  int pe = globalGpuStates->rank;
+  constexpr int coordinatorPe = 0;
+  int n_pes = globalGpuStates->worldSize;
+
+  // Use uint64_t for flag value and sync operations
+  constexpr uint64_t syncValue = 1;
+
+  if (pe == coordinatorPe) {
+    // Wait for all non-leader PEs to signal arrival
+    for (int i = 1; i < n_pes; i++) {
+      ShmemUint64WaitUntilEquals(&pSync[i], syncValue);
+      pSync[i] = 0;
+    }
+    __threadfence_system();
+
+    // Notify all other PEs that barrier is complete
+    for (int i = 1, j = coordinatorPe + 1; i < n_pes; ++i, ++j) {
+      pSync[0] = syncValue;
+      ShmemPutUint64ImmNbiThread(&pSync[0], syncValue, j, 0);
+      __threadfence_system();
+    }
+    pSync[0] = 0;
+  } else {
+    // Non-leader PEs signal arrival to leader
+    size_t pe_offset = (pe - coordinatorPe);
+    pSync[pe_offset] = syncValue;
+    ShmemPutUint64ImmNbiThread(&pSync[pe_offset], syncValue, coordinatorPe, 0);
+    __threadfence_system();
+
+    // Wait for leader to signal completion
+    ShmemUint64WaitUntilEquals(&pSync[0], syncValue);
+    pSync[0] = 0;
+    pSync[pe_offset] = 0;
+    __threadfence_system();
+  }
+}
+
+inline __device__ void ShmemInternalBarrierBlock() {
+  if (threadIdx.x == 0) {
+    // Thread 0 performs the inter-PE barrier
+    GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+    uint64_t* pSync = globalGpuStates->internalSyncPtr;
+    int pe = globalGpuStates->rank;
+    constexpr int coordinatorPe = 0;
+    int n_pes = globalGpuStates->worldSize;
+
+    constexpr uint64_t syncValue = 1;
+
+    if (pe == coordinatorPe) {
+      for (int i = 1; i < n_pes; i++) {
+        ShmemUint64WaitUntilEquals(&pSync[i], syncValue);
+        pSync[i] = 0;
+      }
+      __threadfence_system();
+
+      // Notify all other PEs that barrier is complete
+      for (int i = 1, j = coordinatorPe + 1; i < n_pes; ++i, ++j) {
+        pSync[0] = syncValue;
+        ShmemPutUint64ImmNbiThread(&pSync[0], syncValue, j, 0);
+        __threadfence_system();
+      }
+      pSync[0] = 0;
+    } else {
+      // Non-leader PEs: signal arrival to leader
+      size_t pe_offset = (pe - coordinatorPe);
+      pSync[pe_offset] = syncValue;
+      ShmemPutUint64ImmNbiThread(&pSync[pe_offset], syncValue, coordinatorPe, 0);
+      __threadfence_system();
+
+      // Wait for leader to signal completion
+      ShmemUint64WaitUntilEquals(&pSync[0], syncValue);
+      pSync[0] = 0;
+      pSync[pe_offset] = 0;
+      __threadfence_system();
+    }
+  }
+
+  // All threads in the block wait here until thread 0 completes the inter-PE barrier
+  __syncthreads();
+}
+
+inline __device__ void ShmemBarrierAllThread() {
+  ShmemQuietThread();
+  ShmemInternalBarrierThread();
+}
+
+inline __device__ void ShmemBarrierAllBlock() {
+  ShmemQuietThread();
+  ShmemInternalBarrierBlock();
 }
 
 }  // namespace shmem

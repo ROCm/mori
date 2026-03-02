@@ -78,6 +78,26 @@ def _test_shmem_barrier(rank, world_size, port):
         shmem.shmem_finalize()
 
 
+def _test_shmem_barrier_on_stream(rank, world_size, port):
+    """Test device barrier on a HIP stream"""
+    with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
+        shmem.shmem_torch_process_group_init("default")
+
+        # Test with a PyTorch stream
+        stream = torch.cuda.Stream()
+        shmem.shmem_barrier_on_stream(stream)
+        stream.synchronize()
+
+        # Test with default (null) stream
+        shmem.shmem_barrier_on_stream()
+        torch.cuda.synchronize()
+
+        # Host barrier to confirm all PEs completed
+        shmem.shmem_barrier_all()
+
+        shmem.shmem_finalize()
+
+
 def _test_buffer_register(rank, world_size, port):
     """Test buffer registration with PyTorch tensors"""
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
@@ -238,6 +258,17 @@ def test_shmem_barrier(world_size):
     """Test barrier synchronization"""
     torch.multiprocessing.spawn(
         _test_shmem_barrier,
+        args=(world_size, get_free_port()),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("world_size", (2, 4, 8))
+def test_shmem_barrier_on_stream(world_size):
+    """Test device barrier on stream"""
+    torch.multiprocessing.spawn(
+        _test_shmem_barrier_on_stream,
         args=(world_size, get_free_port()),
         nprocs=world_size,
         join=True,

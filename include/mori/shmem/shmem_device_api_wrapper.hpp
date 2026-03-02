@@ -44,6 +44,8 @@ __device__ __attribute__((visibility("default"))) void mori_shmem_fence_thread_p
 __device__ __attribute__((visibility("default"))) void mori_shmem_fence_thread_pe_qp(int pe,
                                                                                      int qpId);
 
+__device__ __attribute__((visibility("default"))) void mori_shmem_barrier_all_thread();
+__device__ __attribute__((visibility("default"))) void mori_shmem_barrier_all_block();
 
 // ============================================================================
 // PutNbi APIs - Thread Scope (Address-based only)
@@ -64,9 +66,53 @@ __device__ __attribute__((visibility("default"))) void mori_shmem_put_double_nbi
     double* dest, const double* source, size_t nelems, int pe, int qpId);
 
 // ============================================================================
+// PutNbi APIs - Warp Scope (Address-based only)
+// ============================================================================
+__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_warp(
+    void* dest, const void* source, size_t bytes, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_uint32_nbi_warp(
+    uint32_t* dest, const uint32_t* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_uint64_nbi_warp(
+    uint64_t* dest, const uint64_t* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_float_nbi_warp(
+    float* dest, const float* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_double_nbi_warp(
+    double* dest, const double* source, size_t nelems, int pe, int qpId);
+
+// ============================================================================
+// PutNbi APIs - Block Scope (Address-based only)
+// ============================================================================
+__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_block(
+    void* dest, const void* source, size_t bytes, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_uint32_nbi_block(
+    uint32_t* dest, const uint32_t* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_uint64_nbi_block(
+    uint64_t* dest, const uint64_t* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_float_nbi_block(
+    float* dest, const float* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_put_double_nbi_block(
+    double* dest, const double* source, size_t nelems, int pe, int qpId);
+
+// ============================================================================
 // PutNbi with Signal APIs - Thread Scope
 // ============================================================================
 __device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_signal_thread(
+    void* dest, const void* source, size_t bytes, void* signalDest, uint64_t signalValue,
+    atomicType signalOp, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_signal_warp(
+    void* dest, const void* source, size_t bytes, void* signalDest, uint64_t signalValue,
+    atomicType signalOp, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) void mori_shmem_putmem_nbi_signal_block(
     void* dest, const void* source, size_t bytes, void* signalDest, uint64_t signalValue,
     atomicType signalOp, int pe, int qpId);
 
@@ -203,7 +249,7 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_n_pes();
 __device__ __attribute__((visibility("default"))) uint64_t
 mori_shmem_ptr_p2p(const uint64_t destPtr, const int myPe, int destPe);
 
-__device__ __attribute__((visibility("default"))) uint64_t 
-mori_shmem_ptr(const uint64_t destPtr, int destPe);
+__device__ __attribute__((visibility("default"))) uint64_t
+mori_shmem_ptr(uint64_t dest, int destPe);
 
 }  // extern "C"
