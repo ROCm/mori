@@ -66,12 +66,6 @@ private:
 
     bool copy_output_to_user_;
 
-    // L2 flush buffer — used on MI200 (gfx90a) where buffer_wbl2 is absent.
-    // Writing >= L2-size bytes between ReduceScatter and AllGather evicts
-    // all dirty lines to HBM so SDMA reads see the reduce result.
-    void* l2_flush_buffer_;
-    size_t l2_flush_size_;
-
     AllreduceSdma(const AllreduceSdma&) = delete;
     AllreduceSdma& operator=(const AllreduceSdma&) = delete;
 

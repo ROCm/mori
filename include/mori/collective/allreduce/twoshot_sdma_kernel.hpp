@@ -301,33 +301,12 @@ __global__ void SdmaReduceScatterKernel(
   // Flush dirty L2 lines to HBM so the SDMA-based AllGather reads fresh data.
   // CU stores land in L2 (write-back); SDMA reads bypass L2 and hit HBM.
   // buffer_wbl2 (CDNA3 / MI300, gfx94x) writes back ALL dirty L2 lines.
-  // On CDNA2 (MI200, gfx90a) the host launches L2FlushKernel instead.
 #if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
   __syncthreads();
   if (threadIdx.x == 0) {
     asm volatile("buffer_wbl2" ::: "memory");
   }
 #endif
-}
-
-// ============================================================================
-// L2FlushKernel — force dirty L2 lines to HBM via capacity eviction
-//
-// On MI200 (gfx90a) there is no buffer_wbl2.  Writing >= L2-size bytes to a
-// scratch buffer fills every L2 set, evicting all prior dirty lines
-// (including the reduce result) to HBM.
-// ============================================================================
-__global__ void L2FlushKernel(char* __restrict__ buf, size_t bytes) {
-  const size_t tid =
-      static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x)
-      + threadIdx.x;
-  const size_t stride =
-      static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
-  const size_t count = bytes / sizeof(uint64_t);
-  uint64_t* __restrict__ dst = reinterpret_cast<uint64_t*>(buf);
-  for (size_t i = tid; i < count; i += stride) {
-    dst[i] = 0;
-  }
 }
 
 // ============================================================================
