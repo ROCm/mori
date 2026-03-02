@@ -2,14 +2,17 @@
 """
 AllReduce SDMA Test using torch.distributed and multiprocessing.
 
-Tests two modes:
-  1. Out-of-place (copy_output_to_user=False, read from transit buffer)
-  2. In-place     (allreduce_inplace)
+Tests four modes:
+  1. SDMA out-of-place (copy_output_to_user=False, read from transit buffer)
+  2. SDMA in-place     (allreduce_inplace)
+  3. RCCL out-of-place (torch.distributed.all_reduce, copy + reduce)
+  4. RCCL in-place     (torch.distributed.all_reduce, refill + reduce)
 
 Verifies correctness and measures bandwidth for each.
 """
 
 import os
+import time
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -115,6 +118,16 @@ def _print_stats(exec_times, data_bytes, npes, rank, label):
     return avg_time
 
 
+# RCCL/NCCL doesn't support uint32; map to int32 for the baseline benchmark.
+_RCCL_DTYPE_MAP = {
+    torch.uint32: torch.int32,
+    torch.int32: torch.int32,
+    torch.float16: torch.float16,
+    torch.bfloat16: torch.bfloat16,
+    torch.float32: torch.float32,
+}
+
+
 # ---------------------------------------------------------------------------
 #  Individual test helpers
 # ---------------------------------------------------------------------------
@@ -212,6 +225,116 @@ def _test_inplace(rank, my_pe, npes, elems, data_bytes, output_buf_size,
     return ok
 
 
+def _rccl_verify(cpu_data, elems, npes, rccl_dtype, rank, label):
+    """Check RCCL allreduce result."""
+    expected_value = sum((pe + 1) * 1000 for pe in range(npes))
+    first_n = min(elems, len(cpu_data))
+    if rccl_dtype in (torch.float16, torch.bfloat16):
+        ok = np.allclose(cpu_data[:first_n].astype(np.float32),
+                         expected_value, rtol=1e-2, atol=1.0)
+    else:
+        ok = np.all(cpu_data[:first_n] == expected_value)
+    if rank == 0:
+        print(f"  PE {rank}: RCCL {label} correctness {'PASSED' if ok else 'FAILED'}")
+    return ok
+
+
+def _test_rccl_outplace(rank, my_pe, npes, elems, data_bytes,
+                        fill_value, dtype, dtype_name, device, stream,
+                        iterations, warmup):
+    """Test 3: RCCL out-of-place — allreduce into a separate output tensor."""
+    rccl_dtype = _RCCL_DTYPE_MAP.get(dtype, torch.float32)
+    rccl_dtype_name = str(rccl_dtype).split('.')[-1]
+    if rank == 0:
+        print(f"\n>>> Test 3: RCCL out-of-place (torch.distributed, "
+              f"{dtype_name}→{rccl_dtype_name})")
+
+    rccl_fill = float(fill_value) if rccl_dtype in (torch.float16, torch.bfloat16) else fill_value
+
+    input_tensor = torch.full((elems,), rccl_fill, dtype=rccl_dtype, device=device)
+    output_tensor = torch.zeros(elems, dtype=rccl_dtype, device=device)
+
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    # Correctness check
+    output_tensor.copy_(input_tensor)
+    dist.all_reduce(output_tensor, op=dist.ReduceOp.SUM)
+    torch.cuda.synchronize()
+    ok = _rccl_verify(_to_numpy(output_tensor.cpu()), elems, npes,
+                      rccl_dtype, rank, "outplace")
+
+    dist.barrier()
+
+    # Benchmark — dist.all_reduce runs on RCCL's internal stream, so use
+    # torch.cuda.synchronize() (all-stream barrier) + wall-clock timing.
+    exec_times = []
+    for i in range(warmup + iterations):
+        output_tensor.copy_(input_tensor)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        dist.all_reduce(output_tensor, op=dist.ReduceOp.SUM)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+
+        if i >= warmup:
+            exec_times.append(elapsed)
+        elif rank == 0:
+            print(f"  Warmup {i + 1}/{warmup}: {elapsed * 1000:.3f} ms")
+
+    dist.barrier()
+    _print_stats(exec_times, data_bytes, npes, rank,
+                 f"RCCL out-of-place ({rccl_dtype_name})")
+    return ok
+
+
+def _test_rccl_inplace(rank, my_pe, npes, elems, data_bytes,
+                       fill_value, dtype, dtype_name, device, stream,
+                       iterations, warmup):
+    """Test 4: RCCL in-place — allreduce directly on the tensor."""
+    rccl_dtype = _RCCL_DTYPE_MAP.get(dtype, torch.float32)
+    rccl_dtype_name = str(rccl_dtype).split('.')[-1]
+    if rank == 0:
+        print(f"\n>>> Test 4: RCCL in-place (torch.distributed, "
+              f"{dtype_name}→{rccl_dtype_name})")
+
+    rccl_fill = float(fill_value) if rccl_dtype in (torch.float16, torch.bfloat16) else fill_value
+
+    inplace_tensor = torch.full((elems,), rccl_fill, dtype=rccl_dtype, device=device)
+
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    # Correctness check
+    inplace_tensor.fill_(rccl_fill)
+    dist.all_reduce(inplace_tensor, op=dist.ReduceOp.SUM)
+    torch.cuda.synchronize()
+    ok = _rccl_verify(_to_numpy(inplace_tensor.cpu()), elems, npes,
+                      rccl_dtype, rank, "inplace")
+
+    dist.barrier()
+
+    # Benchmark — same wall-clock approach as outplace.
+    exec_times = []
+    for i in range(warmup + iterations):
+        inplace_tensor.fill_(rccl_fill)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        dist.all_reduce(inplace_tensor, op=dist.ReduceOp.SUM)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+
+        if i >= warmup:
+            exec_times.append(elapsed)
+        elif rank == 0:
+            print(f"  Warmup {i + 1}/{warmup}: {elapsed * 1000:.3f} ms")
+
+    dist.barrier()
+    _print_stats(exec_times, data_bytes, npes, rank,
+                 f"RCCL in-place ({rccl_dtype_name})")
+    return ok
+
+
 # ---------------------------------------------------------------------------
 #  Main worker
 # ---------------------------------------------------------------------------
@@ -254,8 +377,14 @@ def _test_allreduce(rank, world_size, port, elems, iterations, warmup,
                             output_buf_size, fill_value, dtype,
                             dtype_name, device, stream,
                             iterations, warmup)
+        ok3 = _test_rccl_outplace(rank, my_pe, npes, elems, data_bytes,
+                                  fill_value, dtype, dtype_name, device,
+                                  stream, iterations, warmup)
+        ok4 = _test_rccl_inplace(rank, my_pe, npes, elems, data_bytes,
+                                 fill_value, dtype, dtype_name, device,
+                                 stream, iterations, warmup)
 
-        all_ok = ok1 and ok2
+        all_ok = ok1 and ok2 and ok3 and ok4
 
         # --- Final summary ---
         ok_tensor = torch.tensor([1 if all_ok else 0], dtype=torch.int32)
