@@ -21,6 +21,8 @@
 // SOFTWARE.
 #pragma once
 
+#include <ostream>
+
 #include "mori/io/common.hpp"
 #include "mori/io/enum.hpp"
 
@@ -77,6 +79,52 @@ struct XgmiBackendConfig : public BackendConfig {
 
 inline std::ostream& operator<<(std::ostream& os, const XgmiBackendConfig& c) {
   return os << "numStreams[" << c.numStreams << "] numEvents[" << c.numEvents << "]";
+}
+
+struct TcpBackendConfig : public BackendConfig {
+  TcpBackendConfig() : BackendConfig(BackendType::TCP) {}
+  TcpBackendConfig(int sockSndbufBytes_, int sockRcvbufBytes_, int opTimeoutMs_,
+                   bool enableKeepalive_, int keepaliveIdleSec_, int keepaliveIntvlSec_,
+                   int keepaliveCnt_, bool enableCtrlNodelay_, int numDataConns_,
+                   int stripingThresholdBytes_)
+      : BackendConfig(BackendType::TCP),
+        sockSndbufBytes(sockSndbufBytes_),
+        sockRcvbufBytes(sockRcvbufBytes_),
+        opTimeoutMs(opTimeoutMs_),
+        enableKeepalive(enableKeepalive_),
+        keepaliveIdleSec(keepaliveIdleSec_),
+        keepaliveIntvlSec(keepaliveIntvlSec_),
+        keepaliveCnt(keepaliveCnt_),
+        enableCtrlNodelay(enableCtrlNodelay_),
+        numDataConns(numDataConns_),
+        stripingThresholdBytes(stripingThresholdBytes_) {}
+
+  int sockSndbufBytes{32 * 1024 * 1024};
+  int sockRcvbufBytes{32 * 1024 * 1024};
+
+  int opTimeoutMs{30 * 1000};
+
+  bool enableKeepalive{true};
+  int keepaliveIdleSec{30};
+  int keepaliveIntvlSec{10};
+  int keepaliveCnt{3};
+
+  bool enableCtrlNodelay{true};
+
+  // Number of parallel DATA TCP connections per peer (iperf-like multi-stream striping).
+  // Effective only when peer has >= numDataConns established and transfer is contiguous.
+  int numDataConns{8};
+  // Stripe large contiguous transfers; keep small transfers on a single stream for latency.
+  int stripingThresholdBytes{64 * 1024};
+};
+
+inline std::ostream& operator<<(std::ostream& os, const TcpBackendConfig& c) {
+  return os << "sockSndbufBytes[" << c.sockSndbufBytes << "] sockRcvbufBytes[" << c.sockRcvbufBytes
+            << "] opTimeoutMs[" << c.opTimeoutMs << "] enableKeepalive[" << c.enableKeepalive
+            << "] keepaliveIdleSec[" << c.keepaliveIdleSec << "] keepaliveIntvlSec["
+            << c.keepaliveIntvlSec << "] keepaliveCnt[" << c.keepaliveCnt << "] enableCtrlNodelay["
+            << c.enableCtrlNodelay << "] numDataConns[" << c.numDataConns
+            << "] stripingThresholdBytes[" << c.stripingThresholdBytes << "]";
 }
 
 /* ---------------------------------------------------------------------------------------------- */

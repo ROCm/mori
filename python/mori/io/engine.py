@@ -91,6 +91,8 @@ class IOEngine:
                 config = mori_cpp.RdmaBackendConfig()
             elif type is mori_cpp.BackendType.XGMI:
                 config = mori_cpp.XgmiBackendConfig()
+            elif type is mori_cpp.BackendType.TCP:
+                config = mori_cpp.TcpBackendConfig()
             else:
                 raise NotImplementedError("backend not implemented yet")
         return self._engine.CreateBackend(type, config)
