@@ -21,10 +21,6 @@
 // SOFTWARE.
 #pragma once
 
-#ifndef SPDLOG_HEADER_ONLY
-#define SPDLOG_HEADER_ONLY
-#endif
-
 #include <chrono>
 #include <string>
 #include <memory>

@@ -124,9 +124,15 @@ else()
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -expt-relaxed-constexpr")
 endif()
 
+set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
+set(SPDLOG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(SPDLOG_BUILD_BENCH OFF CACHE BOOL "" FORCE)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+add_subdirectory(3rdparty/spdlog)
+
 add_library(mori_logging INTERFACE)
 target_include_directories(mori_logging INTERFACE include)
-target_include_directories(mori_logging SYSTEM INTERFACE 3rdparty/spdlog/include)
+target_link_libraries(mori_logging INTERFACE spdlog::spdlog)
 
 if(ENABLE_PROFILER)
   find_package(

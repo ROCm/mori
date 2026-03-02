@@ -38,7 +38,31 @@ def _get_torch_cmake_prefix_path() -> str:
 _supported_arch_list = ["gfx942", "gfx950"]
 
 
+def _detect_local_gpu_arch() -> str | None:
+    """Auto-detect the GPU architecture on the current machine."""
+    rocm_path = os.environ.get("ROCM_PATH", "/opt/rocm")
+    enumerator = os.path.join(rocm_path, "bin", "rocm_agent_enumerator")
+    if os.path.isfile(enumerator):
+        try:
+            out = subprocess.check_output([enumerator], text=True)
+            for line in out.strip().split("\n"):
+                line = line.strip()
+                if line.startswith("gfx") and line != "gfx000" and line in _supported_arch_list:
+                    return line
+        except subprocess.CalledProcessError:
+            pass
+    return None
+
+
 def _get_gpu_archs() -> str:
+    mori_gpu_archs = os.environ.get("MORI_GPU_ARCHS", None)
+    if mori_gpu_archs:
+        return mori_gpu_archs
+
+    local_arch = _detect_local_gpu_arch()
+    if local_arch:
+        return local_arch
+
     archs = os.environ.get("PYTORCH_ROCM_ARCH", None)
     if not archs:
         import torch
@@ -48,10 +72,6 @@ def _get_gpu_archs() -> str:
     gpu_archs = os.environ.get("GPU_ARCHS", None)
     if gpu_archs:
         archs = gpu_archs
-
-    mori_gpu_archs = os.environ.get("MORI_GPU_ARCHS", None)
-    if mori_gpu_archs:
-        archs = mori_gpu_archs
 
     arch_list = archs.replace(" ", ";").split(";")
 
@@ -92,26 +112,39 @@ class CMakeBuild(build_ext):
         enable_debug_printf = os.environ.get("ENABLE_DEBUG_PRINTF", "OFF")
         enable_standard_moe_adapt = os.environ.get("ENABLE_STANDARD_MOE_ADAPT", "OFF")
         gpu_archs = _get_gpu_archs()
-        subprocess.check_call(
-            [
-                "cmake",
-                "-DUSE_ROCM=ON",
-                f"-DCMAKE_BUILD_TYPE={build_type}",
-                f"-DWARP_ACCUM_UNROLL={unroll_value}",
-                f"-DUSE_BNXT={use_bnxt}",
-                f"-DBUILD_SHMEM_DEVICE_WRAPPER={build_shmem_device_wrapper}",
-                f"-DUSE_IONIC={use_ionic}",
-                f"-DENABLE_DEBUG_PRINTF={enable_debug_printf}",
-                f"-DENABLE_STANDARD_MOE_ADAPT={enable_standard_moe_adapt}",
-                f"-DGPU_TARGETS={gpu_archs}",
-                f"-DENABLE_PROFILER={enable_profiler}",
-                "-B",
-                str(build_dir),
-                "-S",
-                str(root_dir),
-                f"-DCMAKE_PREFIX_PATH={_get_torch_cmake_prefix_path()}",
-            ]
-        )
+        build_examples = os.environ.get("BUILD_EXAMPLES", "OFF")
+        build_tests = os.environ.get("BUILD_TESTS", "OFF")
+
+        cmake_args = [
+            "cmake",
+            "-DUSE_ROCM=ON",
+            f"-DCMAKE_BUILD_TYPE={build_type}",
+            f"-DWARP_ACCUM_UNROLL={unroll_value}",
+            f"-DUSE_BNXT={use_bnxt}",
+            f"-DBUILD_SHMEM_DEVICE_WRAPPER={build_shmem_device_wrapper}",
+            f"-DUSE_IONIC={use_ionic}",
+            f"-DENABLE_DEBUG_PRINTF={enable_debug_printf}",
+            f"-DENABLE_STANDARD_MOE_ADAPT={enable_standard_moe_adapt}",
+            f"-DGPU_TARGETS={gpu_archs}",
+            f"-DENABLE_PROFILER={enable_profiler}",
+            f"-DBUILD_EXAMPLES={build_examples}",
+            f"-DBUILD_TESTS={build_tests}",
+            "-B",
+            str(build_dir),
+            "-S",
+            str(root_dir),
+            f"-DCMAKE_PREFIX_PATH={_get_torch_cmake_prefix_path()}",
+        ]
+
+        if shutil.which("ninja"):
+            cmake_args.insert(1, "-G")
+            cmake_args.insert(2, "Ninja")
+
+        if shutil.which("ccache"):
+            cmake_args.append("-DCMAKE_C_COMPILER_LAUNCHER=ccache")
+            cmake_args.append("-DCMAKE_CXX_COMPILER_LAUNCHER=ccache")
+
+        subprocess.check_call(cmake_args)
         subprocess.check_call(
             ["cmake", "--build", ".", "-j", f"{os.cpu_count()}"], cwd=str(build_dir)
         )

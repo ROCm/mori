@@ -29,7 +29,7 @@ set(PYTHON_LIBRARIES ${Python_LIBRARIES})
 message(STATUS "Python include dirs: ${PYTHON_INCLUDE_DIRS}")
 message(STATUS "Python libraries: ${PYTHON_LIBRARIES}")
 
-add_library(mori_pybinds SHARED mori.cpp pybind.cpp)
+add_library(mori_pybinds SHARED pybind_ops.cpp pybind_shmem.cpp pybind_io.cpp pybind.cpp)
 
 if(ENABLE_PROFILER)
   target_sources(mori_pybinds PRIVATE ${PROFILER_OUTPUT_PYBIND})
