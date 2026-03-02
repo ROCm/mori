@@ -55,6 +55,7 @@ struct VMMChunkKey {
 struct SymmMemObj {
   void* localPtr{nullptr};
   uintptr_t* peerPtrs{nullptr};
+  uintptr_t* p2pPeerPtrs{nullptr};
   size_t size{0};
   // For Rdma
   uint32_t lkey{0};
@@ -88,7 +89,7 @@ struct SymmMemObj {
   // Get pointers
   inline __device__ __host__ void* Get() const { return localPtr; }
   inline __device__ __host__ void* Get(int pe) const {
-    return reinterpret_cast<void*>(peerPtrs[pe]);
+    return reinterpret_cast<void*>(p2pPeerPtrs[pe]);
   }
 
   template <typename T>
@@ -97,7 +98,7 @@ struct SymmMemObj {
   }
   template <typename T>
   inline __device__ __host__ T GetAs(int pe) const {
-    return reinterpret_cast<T>(peerPtrs[pe]);
+    return reinterpret_cast<T>(p2pPeerPtrs[pe]);
   }
 };
 

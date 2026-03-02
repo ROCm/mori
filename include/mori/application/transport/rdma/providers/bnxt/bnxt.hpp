@@ -35,6 +35,9 @@ extern "C" {
 
 #include "mori/application/transport/rdma/rdma.hpp"
 
+#include <mutex>
+#include <set>
+
 namespace mori {
 namespace application {
 
@@ -56,14 +59,17 @@ static size_t GetBnxtCqeSize() { return BNXT_RE_CQE_SIZE; }
 /*                                 Device Data Structure Container                                */
 /* ---------------------------------------------------------------------------------------------- */
 // TODO: refactor BnxtCqContainer so its structure is similar to BnxtQpContainer
+class BnxtDeviceContext;  // Forward declaration
+
 class BnxtCqContainer {
  public:
-  BnxtCqContainer(ibv_context* context, const RdmaEndpointConfig& config);
+  BnxtCqContainer(ibv_context* context, const RdmaEndpointConfig& config, BnxtDeviceContext* device_context);
   ~BnxtCqContainer();
 
  public:
   RdmaEndpointConfig config;
   uint32_t cqeNum;
+  BnxtDeviceContext* device_context;
 
  public:
   uint32_t cqn{0};
@@ -75,8 +81,6 @@ class BnxtCqContainer {
   void* cqUarPtr{nullptr};
   ibv_cq* cq{nullptr};
 };
-
-class BnxtDeviceContext;  // Forward declaration
 
 class BnxtQpContainer {
  public:
@@ -141,11 +145,19 @@ class BnxtDeviceContext : public RdmaDeviceContext {
   virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote,
                                uint32_t qpId = 0) override;
 
+  // UAR registration tracking (for shared UAR in USE_BNXT_DEFAULT_DBR mode)
+  bool TryRegisterUar(void* uar_addr);
+  bool TryUnregisterUar(void* uar_addr);
+
  private:
   uint32_t pdn;
 
   std::unordered_map<uint32_t, BnxtCqContainer*> cqPool;
   std::unordered_map<uint32_t, BnxtQpContainer*> qpPool;
+  
+  // Track registered UAR addresses to avoid double registration/unregistration
+  std::set<void*> registeredUars;
+  std::mutex uarMutex;
 };
 
 class BnxtDevice : public RdmaDevice {
