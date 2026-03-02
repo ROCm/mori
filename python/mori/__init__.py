@@ -23,4 +23,5 @@ from . import cpp
 from . import ops
 from . import shmem
 from . import io
+from . import ir
 from . import kernel_profiler
