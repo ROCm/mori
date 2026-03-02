@@ -1,9 +1,9 @@
-# Mori Shmem Kernel POC — Triton / MLIR / LLVM IR
+# Mori Shmem IR — Triton / MLIR / LLVM IR Examples
 
-Demonstrates using mori's shmem device API directly from custom GPU kernels,
+Demonstrates using mori's shmem device API via `mori.ir` integration layer,
 with three compilation paths:
 
-- **Path 1 (Triton):** Vanilla `@triton.jit` + `extern_libs` linking + `@core.extern` device function declarations
+- **Path 1 (Triton):** `from mori.ir import triton as mori_shmem_device` — ready-to-use device functions in `@triton.jit` kernels
 - **Path 2 (MLIR):** Programmatic IR construction with MLIR Python bindings (`llvm` + `rocdl` dialects)
 - **Path 3 (LLVM IR):** Direct LLVM IR text generation (zero extra dependencies beyond ROCm)
 
@@ -14,11 +14,11 @@ containing mori's `extern "C"` device function wrappers and the `globalGpuStates
 
 ```
 Path 1 (Triton):
-  @triton.jit kernel          Triton compiler
-    @core.extern decls  ──►  compile + link bc  ──►  GPU binary
-    extern_libs={bc}              ↑
-    shmem_module_init hook        │
-                       libmori_shmem_device.bc
+  from mori.ir import triton    Triton compiler
+    as mori_shmem_device  ──►  compile + link bc  ──►  GPU binary
+    extern_libs=                      ↑
+      get_extern_libs()               │
+    install_hook()         libmori_shmem_device.bc
 
 Path 2 (MLIR):
   Python (mlir.ir)       mlir-translate       llvm-link + clang
@@ -79,7 +79,7 @@ echo /tmp/mlir-build/tools/mlir/python_packages/mlir_core > $SITE/mlir-python.pt
 ### Basic tests (MLIR + LLVM IR paths)
 
 ```bash
-cd examples/shmem/mlir_shmem_poc
+cd examples/shmem/ir
 bash run.sh 2 gfx942
 ```
 
@@ -104,8 +104,8 @@ MORI_DISABLE_P2P=ON torchrun --nproc_per_node=8 test_triton_allreduce.py
 | File | Path | Kernels | What it tests |
 |------|------|---------|---------------|
 | `test_mlir_shmem.py` | MLIR + LLVM IR | `shmem_basic_kernel`, `shmem_put_kernel` | PE query, RDMA put ring |
-| `test_triton_shmem.py` | Triton | `shmem_basic_kernel`, `shmem_put_kernel` | PE query, RDMA put ring |
-| `test_triton_allreduce.py` | Triton | `allreduce_p2p_kernel`, `allreduce_put_signal_kernel` | Intra-node allreduce bf16 sum (64x7168) |
+| `test_triton_shmem.py` | Triton (`mori.ir.triton`) | `shmem_basic_kernel`, `shmem_put_kernel` | PE query, RDMA put ring |
+| `test_triton_allreduce.py` | Triton (`mori.ir.triton`) | `allreduce_p2p_kernel`, `allreduce_put_signal_kernel` | Intra-node allreduce bf16 sum (64x7168) |
 
 ### Allreduce kernels
 
@@ -139,7 +139,7 @@ Transport detection: host-side `shmem_ptr_p2p()` returns 0 for RDMA peers, non-z
 |------|-------------|
 | `mlir_shmem_kernel.py` | Kernel builder (MLIR API + LLVM IR text) and compile pipelines |
 | `test_mlir_shmem.py` | MLIR/LLVM IR path tests |
-| `test_triton_shmem.py` | Triton path basic tests (put/get) |
-| `test_triton_allreduce.py` | Triton allreduce: P2P read + put+signal kernels (auto-adapts P2P/IBGDA) |
+| `test_triton_shmem.py` | Triton path basic tests via `mori.ir.triton` (put/get) |
+| `test_triton_allreduce.py` | Triton allreduce via `mori.ir.triton`: P2P read + put+signal (auto-adapts P2P/IBGDA) |
 | `run.sh` | Convenience script for MLIR/LLVM IR tests |
 | `../../tools/build_shmem_bitcode.sh` | Builds `lib/libmori_shmem_device.bc` |

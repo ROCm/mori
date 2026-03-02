@@ -139,6 +139,16 @@ class CMakeBuild(build_ext):
         for src_path, dst_path in files_to_copy:
             shutil.copyfile(src_path, dst_path)
 
+        if build_shmem_device_wrapper.upper() == "ON":
+            bc_script = root_dir / "tools" / "build_shmem_bitcode.sh"
+            if bc_script.exists():
+                subprocess.check_call(["bash", str(bc_script)], cwd=str(root_dir))
+            bc_path = root_dir / "lib" / "libmori_shmem_device.bc"
+            if bc_path.exists():
+                ir_dir = root_dir / "python" / "mori" / "ir"
+                ir_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(bc_path, ir_dir / "libmori_shmem_device.bc")
+
 
 class CustomBuild(_build):
     def run(self) -> None:
@@ -163,6 +173,7 @@ setup(
     package_dir={"": "python"},
     package_data={
         "mori": ["libmori_pybinds.so", "libmori_io.so", "libmori_application.so", "libmori_shmem.a", "libmori_ops.a"],
+        "mori.ir": ["*.bc"],
     },
     cmdclass={
         "build_ext": CMakeBuild,
