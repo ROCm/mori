@@ -73,6 +73,14 @@ double Allreduce_sdma(T* input, T* output, size_t total_count,
       shmem::ShmemSymmetricRegister(barrierMem, barrierSize);
   hipMemset(barrierMem, 0, barrierSize);
 
+  // Local barrier token for AllGather generation signaling.
+  void* agBarrierMem = shmem::ShmemMalloc(sizeof(CrossPeBarrier));
+  if (agBarrierMem == nullptr) {
+    return -1;
+  }
+  hipMemset(agBarrierMem, 0, sizeof(CrossPeBarrier));
+  CrossPeBarrier* agBarrier = reinterpret_cast<CrossPeBarrier*>(agBarrierMem);
+
   assert(inPutBuffObj.IsValid());
   assert(transitObj.IsValid());
   assert(flagsObj.IsValid());
@@ -91,7 +99,7 @@ double Allreduce_sdma(T* input, T* output, size_t total_count,
   ReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(
       myPe, npes, inPutBuffObj, transitObj, barrierObj, total_count);
   AllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
-      myPe, npes, transitObj, flagsObj, total_count);
+      myPe, npes, transitObj, flagsObj, agBarrier, total_count);
 
   // Synchronize GPU to ensure kernel completion
   hipError_t sync_err;
@@ -117,6 +125,7 @@ double Allreduce_sdma(T* input, T* output, size_t total_count,
   }
 
   shmem::ShmemFree(barrierMem);
+  shmem::ShmemFree(agBarrierMem);
 
   return end - start;
 }

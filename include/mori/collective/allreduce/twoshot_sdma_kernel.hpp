@@ -185,7 +185,7 @@ __global__ void SdmaReduceScatterKernel(
     // Each warp handles one destination PE.
     uint64_t* __restrict__ flags =
         reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
-    int flag_val = 1;
+    uint64_t flag_val = static_cast<uint64_t>(s_next);
 
     const int warpId  = static_cast<int>(threadIdx.x) / warpSize;
     const int laneId  = static_cast<int>(threadIdx.x) % warpSize;
@@ -219,7 +219,7 @@ __global__ void SdmaReduceScatterKernel(
       shmem::ShmemAtomicSizeNonFetchThread(
           flagsMemObj,
           static_cast<size_t>(myPe) * sizeof(uint64_t),
-          &flag_val, 8, core::atomicType::AMO_ADD, destPe);
+          &flag_val, 8, core::atomicType::AMO_SET, destPe);
     }
     __syncthreads();
 
@@ -229,7 +229,7 @@ __global__ void SdmaReduceScatterKernel(
       if (threadIdx.x == 0) {
         int spin = 0;
         bool warned = false;
-        while (core::AtomicLoadRelaxed(flags + sender) == 0) {
+        while (core::AtomicLoadRelaxed(flags + sender) < flag_val) {
           if (++spin > 100000000 && !warned) {
             printf("PE %d: SdmaScatter timeout waiting for peer %d\n",
                    myPe, sender);
@@ -239,12 +239,6 @@ __global__ void SdmaReduceScatterKernel(
       }
       __syncthreads();
     }
-
-    // Reset flags for the AllGather phase that follows
-    if (threadIdx.x < static_cast<unsigned>(npes)) {
-      flags[threadIdx.x] = 0;
-    }
-    __syncthreads();
 
     // === Broadcast to all local blocks: scatter done =========================
     if (threadIdx.x == 0) {
@@ -346,6 +340,7 @@ template <typename T>
 __global__ void AllGatherSdmaKernel(int myPe, int npes,
                                     const application::SymmMemObjPtr dstMemObj,
                                     const application::SymmMemObjPtr flagsMemObj,
+                                    CrossPeBarrier* __restrict__ barrier,
                                     size_t elementCount) {
   if (elementCount == 0 || npes <= 0) {
     return;
@@ -363,7 +358,13 @@ __global__ void AllGatherSdmaKernel(int myPe, int npes,
 
   const size_t bytesPerElement = sizeof(T);
   uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
-  int flag_val = 1;
+  __shared__ uint64_t ag_token;
+  if (threadIdx.x == 0) {
+    ag_token = static_cast<uint64_t>(barrier->flag) + 1ULL;
+    barrier->flag = static_cast<uint32_t>(ag_token);
+  }
+  __syncthreads();
+  uint64_t flag_val = ag_token;
 
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
@@ -397,7 +398,7 @@ __global__ void AllGatherSdmaKernel(int myPe, int npes,
     shmem::ShmemQuietThread(remotePe, dstMemObj);
     shmem::ShmemAtomicSizeNonFetchThread(
         flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t),
-        &flag_val, 8, core::atomicType::AMO_ADD, remotePe);
+        &flag_val, 8, core::atomicType::AMO_SET, remotePe);
   }
   __syncthreads();
 
@@ -409,7 +410,7 @@ __global__ void AllGatherSdmaKernel(int myPe, int npes,
     if (threadLinearId == 0) {
       int spinCount = 0;
       bool warned = false;
-      while (core::AtomicLoadRelaxed(flags + sender) == 0) {
+      while (core::AtomicLoadRelaxed(flags + sender) < flag_val) {
         ++spinCount;
         if (spinCount > 10000000 && !warned) {
           printf("PE %d: AllGather timeout waiting for peer %d\n", myPe, sender);
@@ -420,11 +421,7 @@ __global__ void AllGatherSdmaKernel(int myPe, int npes,
     __syncthreads();
   }
 
-  // Reset flags for potential subsequent invocations.
-  if (threadLinearId < static_cast<size_t>(npes)) {
-    flags[threadLinearId] = 0;
-  }
-  __syncthreads();
+  // Flags are monotonic generation tokens (AMO_SET), so no reset is needed.
 }
 
 }  // namespace collective

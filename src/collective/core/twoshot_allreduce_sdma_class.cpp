@@ -218,7 +218,9 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count,
         AllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
             output_transit_buffer_obj_,
-            flagsObj_, total_count);
+            flagsObj_,
+            barrierPtr_,
+            total_count);
 
         err = hipGetLastError();
         if (err != hipSuccess) {
