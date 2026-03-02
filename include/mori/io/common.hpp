@@ -71,16 +71,17 @@ using BackendDescBlobMap = std::unordered_map<BackendType, DescBlob>;
 
 struct EngineDesc {
   EngineKey key;
+  std::string nodeId;
   std::string hostname;
   std::string host;
   int port;
 
   constexpr bool operator==(const EngineDesc& rhs) const noexcept {
-    return (key == rhs.key) && (hostname == rhs.hostname) && (host == rhs.host) &&
-           (port == rhs.port);
+    return (key == rhs.key) && (nodeId == rhs.nodeId) && (hostname == rhs.hostname) &&
+           (host == rhs.host) && (port == rhs.port);
   }
 
-  MSGPACK_DEFINE(key, hostname, host, port);
+  MSGPACK_DEFINE(key, nodeId, hostname, host, port);
 };
 
 using MemoryUniqueId = uint32_t;

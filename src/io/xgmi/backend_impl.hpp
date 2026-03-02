@@ -123,6 +123,7 @@ class XgmiBackend : public Backend {
 
  private:
   EngineKey myEngKey;
+  std::string myNodeId;
   std::string myHostname;
   XgmiBackendConfig config;
 

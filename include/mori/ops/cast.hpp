@@ -21,36 +21,11 @@
 // SOFTWARE.
 #pragma once
 
-#include "mori/core/core.hpp"
-#include "mori/ops/dispatch_combine/dispatch_combine.hpp"
-#include "mori/shmem/shmem.hpp"
+#include <hip/hip_runtime.h>
 
 namespace mori {
-namespace moe {
 
-template <typename T>
-__global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args);
+template <typename SrcT, typename DstT>
+void LaunchCast(SrcT* src, DstT* dst, size_t nelems, hipStream_t stream);
 
-template <typename T>
-__global__ void EpDispatchCopyToStaging(EpDispatchCombineArgs<T> args);
-
-template <typename T, bool EnableStdMoE = false>
-__global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args);
-
-template <typename T>
-__global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args);
-
-template <typename T, bool EnableStdMoE = false>
-__global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args);
-
-template <typename T>
-__global__ void EpCombineSync(EpDispatchCombineArgs<T> args);
-
-template <typename T>
-__global__ void EpCombineSyncBarrier(EpDispatchCombineArgs<T> args);
-
-template <typename T>
-__global__ void EpCombineAll(EpDispatchCombineArgs<T> args);
-
-}  // namespace moe
-}  // namespace mori
+}

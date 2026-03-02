@@ -19,31 +19,10 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-import os
-import sys
-import importlib.util
-import ctypes
+from mori import cpp as mori_cpp
 
-# PyTorch must be imported first to initialize its runtime
-# (libtorch, libc10, etc.) before loading mori's native extensions
-import torch  # noqa: F401
+import torch
 
-cur_dir = os.path.dirname(os.path.abspath(__file__))
-mori_lib_dir = os.path.abspath(os.path.join(cur_dir, ".."))
 
-# Pre-load dependent shared libraries
-# This is necessary because libmori_pybinds.so depends on libmori_application.so etc.
-_preload_libs = ["libmori_application.so", "libmori_io.so"]
-for _lib_name in _preload_libs:
-    _lib_full_path = os.path.join(mori_lib_dir, _lib_name)
-    if os.path.exists(_lib_full_path):
-        ctypes.CDLL(_lib_full_path, mode=ctypes.RTLD_GLOBAL)
-
-lib_path = os.path.abspath(os.path.join(cur_dir, "../libmori_pybinds.so"))
-
-spec = importlib.util.spec_from_file_location("libmori_pybinds", lib_path)
-module = importlib.util.module_from_spec(spec)
-sys.modules["libmori_pybinds"] = module
-spec.loader.exec_module(module)
-
-from libmori_pybinds import *
+def cast(input: torch.Tensor, output: torch.Tensor):
+    mori_cpp.cast(input, output)

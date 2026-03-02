@@ -24,6 +24,7 @@
 #include <limits.h>
 #include <unistd.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 
@@ -250,9 +251,16 @@ bool XgmiBackendSession::Alive() const { return true; }
 XgmiBackend::XgmiBackend(EngineKey k, const IOEngineConfig& engConfig,
                          const XgmiBackendConfig& beConfig)
     : myEngKey(k), config(beConfig) {
+  const char* nodeIdEnv = std::getenv("MORI_IO_NODE_ID");
+  if (nodeIdEnv != nullptr && nodeIdEnv[0] != '\0') {
+    myNodeId = std::string(nodeIdEnv);
+  }
   char hostname[HOST_NAME_MAX];
   gethostname(hostname, HOST_NAME_MAX);
   myHostname = std::string(hostname);
+  if (myNodeId.empty()) {
+    myNodeId = myHostname;
+  }
 
   streamPool = std::make_unique<StreamPool>(config.numStreams);
   eventPool = std::make_unique<EventPool>(config.numEvents);
@@ -261,8 +269,8 @@ XgmiBackend::XgmiBackend(EngineKey k, const IOEngineConfig& engConfig,
 
   std::stringstream ss;
   ss << config;
-  MORI_IO_INFO("XgmiBackend created with config: {} hostname: {}", ss.str().c_str(),
-               myHostname.c_str());
+  MORI_IO_INFO("XgmiBackend created with config: {} node_id: {} hostname: {}", ss.str().c_str(),
+               myNodeId.c_str(), myHostname.c_str());
 }
 
 XgmiBackend::~XgmiBackend() {
@@ -530,7 +538,11 @@ bool XgmiBackend::CanHandle(const MemoryDesc& local, const MemoryDesc& remote) c
   if (it == remoteEngines.end()) {
     return false;
   }
-  return it->second.hostname == myHostname;
+  const EngineDesc& remoteEngine = it->second;
+  if (!myNodeId.empty() && !remoteEngine.nodeId.empty()) {
+    return remoteEngine.nodeId == myNodeId;
+  }
+  return remoteEngine.hostname == myHostname;
 }
 
 }  // namespace io

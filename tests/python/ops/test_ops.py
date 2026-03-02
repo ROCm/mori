@@ -19,31 +19,27 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-import os
-import sys
-import importlib.util
-import ctypes
+import torch
+import pytest
+import mori
 
-# PyTorch must be imported first to initialize its runtime
-# (libtorch, libc10, etc.) before loading mori's native extensions
-import torch  # noqa: F401
+from tests.python.utils import fp4_x2_to_fp32
 
-cur_dir = os.path.dirname(os.path.abspath(__file__))
-mori_lib_dir = os.path.abspath(os.path.join(cur_dir, ".."))
 
-# Pre-load dependent shared libraries
-# This is necessary because libmori_pybinds.so depends on libmori_application.so etc.
-_preload_libs = ["libmori_application.so", "libmori_io.so"]
-for _lib_name in _preload_libs:
-    _lib_full_path = os.path.join(mori_lib_dir, _lib_name)
-    if os.path.exists(_lib_full_path):
-        ctypes.CDLL(_lib_full_path, mode=ctypes.RTLD_GLOBAL)
-
-lib_path = os.path.abspath(os.path.join(cur_dir, "../libmori_pybinds.so"))
-
-spec = importlib.util.spec_from_file_location("libmori_pybinds", lib_path)
-module = importlib.util.module_from_spec(spec)
-sys.modules["libmori_pybinds"] = module
-spec.loader.exec_module(module)
-
-from libmori_pybinds import *
+@pytest.mark.parametrize("nelems", (32,))
+@pytest.mark.parametrize("input_type", (torch.float,))
+@pytest.mark.parametrize("output_type", (torch.float4_e2m1fn_x2,))
+def test_cast(
+    nelems,
+    input_type,
+    output_type,
+):
+    device = torch.device("cuda", 0)
+    inp = torch.randn((nelems,), dtype=input_type, device=device)
+    out = torch.empty((nelems // 2,), dtype=output_type, device=device)
+    print(inp, out)
+    mori.ops.cast(inp, out)
+    torch.cuda.synchronize()
+    print(inp, out)
+    print(fp4_x2_to_fp32(out))
+    print(out.view(dtype=torch.uint8))

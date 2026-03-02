@@ -120,6 +120,13 @@ def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
     )[1:]
     return np.average(times), np.min(times), np.max(times)
 
+class empty_suppress:
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        pass
 
 class suppress_stdout_stderr:
 
@@ -334,33 +341,12 @@ def test_main(
         kernel_type = mori.ops.EpDispatchCombineKernelType.IntraNode
         block_num, warp_num_per_block = 64, 16
         dispatch_block_num, dispatch_warp_per_block = block_num, warp_num_per_block
-        combine_block_num, combine_warp_per_block = block_num, 4
+        combine_block_num, combine_warp_per_block = block_num, warp_num_per_block
         rdma_block_num = 0
 
     mori.shmem.shmem_torch_process_group_init("default")
 
-    zero_copy_config = mori.ops.EpDispatchCombineConfig(
-        data_type=torch.bfloat16,
-        rank=rank,
-        world_size=num_ranks,
-        hidden_dim=hidden,
-        scale_dim=0,
-        scale_type_size=0,
-        max_token_type_size=2,
-        max_num_inp_token_per_rank=num_tokens,
-        num_experts_per_rank=num_local_experts,
-        num_experts_per_token=num_topk,
-        warp_num_per_block=warp_num_per_block,
-        block_num=block_num,
-        use_external_inp_buf=False,
-        kernel_type=kernel_type,
-        gpu_per_node=num_ranks // num_nodes,
-        rdma_block_num=rdma_block_num,
-        num_qp_per_pe=4 if multi_node else 0,
-    )
-    zero_copy_op = mori.ops.EpDispatchCombineOp(zero_copy_config)
-
-    non_zero_copy_config = mori.ops.EpDispatchCombineConfig(
+    config = mori.ops.EpDispatchCombineConfig(
         data_type=torch.bfloat16,
         rank=rank,
         world_size=num_ranks,
@@ -377,9 +363,9 @@ def test_main(
         kernel_type=kernel_type,
         gpu_per_node=num_ranks // num_nodes,
         rdma_block_num=rdma_block_num,
-        num_qp_per_pe=4 if multi_node else 0,
+        num_qp_per_pe=4 if multi_node else 1,
     )
-    non_zero_copy_op = mori.ops.EpDispatchCombineOp(non_zero_copy_config)
+    op = mori.ops.EpDispatchCombineOp(config)
 
     # Check dispatch correctness
     do_check = True
@@ -387,8 +373,6 @@ def test_main(
         # multiple node does not support zero_copy
         if multi_node and zero_copy:
             continue
-        test_op = zero_copy_op if zero_copy else non_zero_copy_op
-        test_config = zero_copy_config if zero_copy else non_zero_copy_config
         hash_value, num_times = 0, 0
         if fused_moe_adaption:
             (
@@ -397,7 +381,7 @@ def test_main(
                 _,
                 packed_recv_topk_idx,
                 packed_recv_count,
-            ) = test_op.dispatch(
+            ) = op.dispatch(
                 x,
                 topk_weights,
                 None,
@@ -445,12 +429,12 @@ def test_main(
             ), f"{num_total_valid_tokens} != {(all_topk_idx // num_local_experts == rank).sum().item()}"
 
             # Check received data
-            src_token_pos = test_op.get_dispatch_src_token_pos()
+            src_token_pos = op.get_dispatch_src_token_pos()
 
             rank_token_counts = {}
             for i, pos in enumerate(src_token_pos[:num_total_valid_tokens]):
-                src_rank = int(pos) // test_config.max_num_inp_token_per_rank
-                src_id = int(pos) % test_config.max_num_inp_token_per_rank
+                src_rank = int(pos) // config.max_num_inp_token_per_rank
+                src_id = int(pos) % config.max_num_inp_token_per_rank
                 recv_token = global_recv_x[i]
 
                 # Check that token values are consistent (amin == amax for first hidden-128 dims)
@@ -495,17 +479,16 @@ def test_main(
 
         # Check combine correctness
         if zero_copy:
-            combine_input = test_op.get_registered_combine_input_buffer(
-                test_config.data_type
-            )
+            combine_input = op.get_registered_combine_input_buffer(config.data_type)
             combine_input[:, :].copy_(simulated_gemm_x)
         out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
-        combined_x, _ = test_op.combine(
+        combined_x, _ = op.combine(
             simulated_gemm_x,
             None,
             topk_idx,
             block_num=combine_block_num,
-            warp_per_block=combine_warp_per_block,
+            warp_per_block=4 if zero_copy and not multi_node else combine_warp_per_block,
+            use_external_inp_buf=not zero_copy,
         )
         torch.cuda.synchronize()
         if do_check:
@@ -519,17 +502,13 @@ def test_main(
 
     # noinspection PyShadowingNames
     def test_func(zero_copy: bool, use_fp8: bool):
-        bench_op = zero_copy_op if zero_copy else non_zero_copy_op
-        # multiple node does not support zero_copy
-        if multi_node:
-            bench_op = non_zero_copy_op
         (
             recv_x,
             recv_topk_weights,
             _,
             recv_topk_idx,
             recv_count,
-        ) = bench_op.dispatch(
+        ) = op.dispatch(
             x,
             topk_weights,
             None,
@@ -540,16 +519,15 @@ def test_main(
 
         simulated_gemm_x = recv_x.clone()
         if zero_copy:
-            combine_input = bench_op.get_registered_combine_input_buffer(
-                zero_copy_config.data_type
-            )
+            combine_input = op.get_registered_combine_input_buffer(config.data_type)
             combine_input[:, :].copy_(simulated_gemm_x)
-        combined_x, _ = bench_op.combine(
+        combined_x, _ = op.combine(
             simulated_gemm_x,
             None,
             topk_idx,
             block_num=combine_block_num,
-            warp_per_block=combine_warp_per_block,
+            warp_per_block=4 if zero_copy and not multi_node else combine_warp_per_block,
+            use_external_inp_buf=not zero_copy,
         )
 
     # Calculate bandwidth
@@ -576,25 +554,51 @@ def test_main(
 
     # Separate profiling
     group.barrier()
-    dispatch_t, combine_t = bench_kineto(
-        partial(
-            test_func,
-            zero_copy=True,
-            use_fp8=bench_use_fp8,
-        ),
-        kernel_names=(
-            ("EpDispatchInterNodeV1Kernel", "EpCombineInterNodeV1Kernel")
-            if multi_node
-            else ("EpDispatchIntraNodeKernel", "EpCombineIntraNodeKernel")
-        ),
-        barrier_comm_profiling=True,
-        suppress_kineto_output=True,
-    )
-    print(
-        f"[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | "
-        f"Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us",
-        flush=True,
-    )
+    if multi_node:
+        dispatch_t, combine_t, dispatch_copy_t, combine_all_t = bench_kineto(
+            partial(
+                test_func,
+                zero_copy=False,
+                use_fp8=bench_use_fp8,
+            ),
+            kernel_names=(
+                (
+                    "EpDispatchInterNodeV1Kernel",
+                    "EpCombineInterNodeV1Kernel",
+                    "EpDispatchCopyToStaging",
+                    "EpCombineAll",
+                )
+            ),
+            barrier_comm_profiling=True,
+            suppress_kineto_output=True,
+        )
+        print(f'[rank {rank}] EpDispatchCopyToStaging avg_t={dispatch_copy_t * 1e6:.2f} us | '
+                  f'EpCombineAll avg_t={combine_all_t * 1e6:.2f} us', flush=True)
+        dispatch_t += dispatch_copy_t
+        combine_t += combine_all_t
+        print(
+            f"[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | "
+            f"Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us",
+            flush=True,
+        )
+    else:
+        dispatch_t, combine_t = bench_kineto(
+            partial(
+                test_func,
+                zero_copy=True,
+                use_fp8=bench_use_fp8,
+            ),
+            kernel_names=(
+                ("EpDispatchIntraNodeKernel", "EpCombineIntraNodeKernel")
+            ),
+            barrier_comm_profiling=True,
+            suppress_kineto_output=True,
+        )
+        print(
+            f"[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | "
+            f"Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us",
+            flush=True,
+        )
 
     return hash_value
 
