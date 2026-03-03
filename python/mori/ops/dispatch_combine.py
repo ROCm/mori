@@ -157,6 +157,9 @@ class EpDispatchCombineOp:
         self.config = config
         _ensure_jit_kernels(config.kernel_type)
 
+        if dist.is_initialized():
+            dist.barrier()
+
         handle_class = _cpp_dispatch_combine_factory("EpDispatchCombineHandle")
         cpp_config = mori_cpp.EpDispatchCombineConfig(
             rank=config.rank,
