@@ -50,10 +50,14 @@ class EpDispatchCombineTestCase:
         quant_type="none",
         dtype=torch.bfloat16,
         hidden_dim=7168,
+        drop_rank=-1,
+        timeout_us=0,
     ):
         self.rank = rank
         self.gpu_per_node = gpu_per_node
         self.world_size = world_size
+        self.drop_rank = drop_rank
+        self.timeout_us = timeout_us
         self.config = mori.ops.EpDispatchCombineConfig(
             data_type=dtype,
             rank=self.rank,
@@ -99,6 +103,10 @@ class EpDispatchCombineTestCase:
 
         self.rng = torch.Generator(device=self.device)
         self.rng.manual_seed(999)
+
+        self.active_ranks = torch.ones(
+            (self.world_size,), dtype=torch.int32, device=self.device
+        )
 
     def cleanup(self):
         mori.shmem.shmem_finalize()
@@ -256,6 +264,9 @@ class EpDispatchCombineTestCase:
         )
 
         for src_rank, indices in enumerate(all_rank_indices):
+            if src_rank == self.drop_rank:
+                continue
+
             src_node = src_rank // self.config.gpu_per_node
 
             # Map expert IDs to rank IDs
@@ -292,20 +303,63 @@ class EpDispatchCombineTestCase:
             # print("Rank counts to other nodes:", rank_counts_remote_send)
         return rank_counts, rank_counts_remote_recv, rank_counts_remote_send
 
-    def run_dispatch(self, op, token, weights, scales, indices):
+    def run_dispatch(self, op, token, weights, scales, indices, is_active=True):
+        kwargs = {}
+        if self.timeout_us > 0:
+            kwargs["active_ranks"] = self.active_ranks
+            kwargs["timeout_us"] = self.timeout_us
+
+        if not is_active:
+            # Simulate dropout by not calling dispatch
+            return (
+                torch.empty(
+                    (0, self.config.hidden_dim),
+                    dtype=self.config.data_type,
+                    device=self.device,
+                ),
+                torch.empty(
+                    (0, op.config.num_experts_per_token),
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                torch.empty((0,), dtype=torch.float32, device=self.device),
+                torch.empty(
+                    (0, op.config.num_experts_per_token),
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                torch.zeros((1,), dtype=torch.int32, device=self.device),
+            )
+
         if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
             ret = op.dispatch_send(token, weights, scales, indices)
             op.dispatch_recv()
         else:
-            ret = op.dispatch(token, weights, scales, indices)
+            ret = op.dispatch(token, weights, scales, indices, **kwargs)
         return ret
 
-    def run_combine(self, op, token, weights, indices):
+    def run_combine(self, op, token, weights, indices, is_active=True):
+        kwargs = {}
+        if self.timeout_us > 0:
+            kwargs["active_ranks"] = self.active_ranks
+            kwargs["timeout_us"] = self.timeout_us
+
+        if not is_active:
+            # Simulate dropout by not calling combine
+            return (
+                torch.empty(
+                    (indices.shape[0], self.config.hidden_dim),
+                    dtype=self.config.data_type,
+                    device=self.device,
+                ),
+                None,
+            )
+
         if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
             ret = op.combine_send(token, weights, indices)
             op.combine_recv()
         else:
-            ret = op.combine(token, weights, indices)
+            ret = op.combine(token, weights, indices, **kwargs)
         return ret
 
     def run_test_once(self, op, test_data, error_round, round):
@@ -316,6 +370,8 @@ class EpDispatchCombineTestCase:
             all_rank_weights,
             all_rank_scales,
         ) = test_data
+
+        is_active = self.rank != self.drop_rank
 
         (
             dispatch_output,
@@ -329,8 +385,12 @@ class EpDispatchCombineTestCase:
             all_rank_weights[self.rank],
             all_rank_scales[self.rank],
             all_rank_indices[self.rank],
+            is_active=is_active,
         )
         torch.cuda.synchronize()
+
+        if not is_active:
+            return
 
         rank_counts, _, _ = self.count_token_num(all_rank_indices)
 
@@ -351,6 +411,9 @@ class EpDispatchCombineTestCase:
         for i, src_token_id in enumerate(src_token_pos):
             src_pe = src_token_id // max_num_token_to_send_per_rank
             src_tok_id = src_token_id % max_num_token_to_send_per_rank
+            assert (
+                src_pe != self.drop_rank
+            ), f"Should not receive tokens from dropped rank {self.drop_rank}"
             if self.config.data_type is torch.float4_e2m1fn_x2:
                 is_pass = torch.equal(
                     dispatch_output[i].view(torch.uint8),
@@ -393,11 +456,13 @@ class EpDispatchCombineTestCase:
                 (idx // self.config.num_experts_per_rank)
                 for idx in all_rank_indices[self.rank][i].cpu().tolist()
             ]
-            unique_pes = len(set(pes))
+
+            valid_pes = [p for p in pes if p != self.drop_rank]
+            unique_pes = len(set(valid_pes))
             unique_innode_pes = len(
                 [
                     pe
-                    for pe in set(pes)
+                    for pe in set(valid_pes)
                     if (pe // self.gpu_per_node == self.rank // self.gpu_per_node)
                 ]
             )
@@ -505,6 +570,7 @@ class EpDispatchCombineTestCase:
                 all_rank_weights,
                 all_rank_scales,
             ) = test_data_list[i % num_test_data]
+            is_active = self.rank != self.drop_rank
             (
                 dispatch_output,
                 dispatch_weights,
@@ -517,9 +583,14 @@ class EpDispatchCombineTestCase:
                 all_rank_weights[self.rank],
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
+                is_active=is_active,
             )
             combine_output, combine_output_weight = self.run_combine(
-                op, dispatch_output, None, all_rank_indices[self.rank]
+                op,
+                dispatch_output,
+                None,
+                all_rank_indices[self.rank],
+                is_active=is_active,
             )
             if i % sync_interval == 0:
                 torch.cuda.synchronize()
@@ -539,6 +610,7 @@ class EpDispatchCombineTestCase:
             all_rank_scales,
         ) = test_data
         g = torch.cuda.CUDAGraph()
+        is_active = self.rank != self.drop_rank
         with torch.cuda.graph(g):
             (
                 dispatch_output,
@@ -552,9 +624,14 @@ class EpDispatchCombineTestCase:
                 all_rank_weights[self.rank],
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
+                is_active=is_active,
             )
             combine_output, combine_output_weight = self.run_combine(
-                op, dispatch_output, None, all_rank_indices[self.rank]
+                op,
+                dispatch_output,
+                None,
+                all_rank_indices[self.rank],
+                is_active=is_active,
             )
         torch.cuda.synchronize()
 
@@ -577,7 +654,9 @@ class EpDispatchCombineTestCase:
             all_rank_scales,
         ) = test_data
 
+        is_active = self.rank != self.drop_rank
         warmup_rounds = 3
+        total_recv_num_token = 0
         for i in range(warmup_rounds):
             (
                 dispatch_output,
@@ -591,13 +670,19 @@ class EpDispatchCombineTestCase:
                 all_rank_weights[self.rank],
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
+                is_active=is_active,
             )
             if i == warmup_rounds - 1:
                 # Read totalRecvTokenNum after dispatch but before combine resets it
                 torch.cuda.synchronize()
-                total_recv_num_token = dispatch_recv_num_token[0].item()
+                if is_active:
+                    total_recv_num_token = dispatch_recv_num_token[0].item()
             combine_output, combine_output_weight = self.run_combine(
-                op, dispatch_output, None, all_rank_indices[self.rank]
+                op,
+                dispatch_output,
+                None,
+                all_rank_indices[self.rank],
+                is_active=is_active,
             )
             torch.cuda.synchronize()
         total_rdma_recv_num_token = (
@@ -630,10 +715,15 @@ class EpDispatchCombineTestCase:
                 all_rank_weights[self.rank],
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
+                is_active=is_active,
             )
             events[2 * i + 1].record()
             combine_output, combine_output_weight = self.run_combine(
-                op, dispatch_output, None, all_rank_indices[self.rank]
+                op,
+                dispatch_output,
+                None,
+                all_rank_indices[self.rank],
+                is_active=is_active,
             )
             events[2 * i + 2].record()
         torch.cuda.synchronize()
@@ -977,6 +1067,8 @@ def test_dispatch_combine(
     quant_type="none",
     cmd="test",
     sweep_token_interval=64,
+    drop_rank=-1,
+    timeout_us=0,
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
@@ -992,6 +1084,9 @@ def test_dispatch_combine(
             num_qp,
             quant_type,
             dtype,
+            hidden_dim=7168,
+            drop_rank=drop_rank,
+            timeout_us=timeout_us,
         )
         test_case.setup()
         if cmd == "test":
@@ -1075,6 +1170,18 @@ parser.add_argument(
         "'fp8_direct_cast' is the current BF16<->FP8 direct cast path."
     ),
 )
+parser.add_argument(
+    "--drop-rank",
+    type=int,
+    default=-1,
+    help="Rank ID to simulate dropout to test elastic EP mechanism",
+)
+parser.add_argument(
+    "--timeout-us",
+    type=int,
+    default=0,
+    help="Timeout in microseconds for elastic EP mechanism polling",
+)
 args_cli = parser.parse_args()
 
 if __name__ == "__main__":
@@ -1095,6 +1202,8 @@ if __name__ == "__main__":
             args_cli.quant_type,
             args_cli.cmd,
             args_cli.sweep_token_interval,
+            args_cli.drop_rank,
+            args_cli.timeout_us,
         ),
         nprocs=gpu_per_node,
         join=True,

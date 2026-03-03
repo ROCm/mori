@@ -114,6 +114,11 @@ class EpDispatchCombineHandle {
   EpDispatchCombineHandle(EpDispatchCombineConfig config);
   ~EpDispatchCombineHandle();
 
+  void SetElasticState(int32_t* activeRanks, int64_t timeoutTicks) {
+    this->activeRanks = activeRanks;
+    this->timeoutTicks = timeoutTicks;
+  }
+
   void PrepareInference(hipDataType inputType, void* input, void* output, float* weights,
                         index_t* tokenIndices, index_t numToken) {
     this->inputType = inputType;
@@ -180,13 +185,13 @@ class EpDispatchCombineHandle {
   void LaunchConvertDispatchOutputKernel(const void* dispatchOutX, const void* dispatchOutTopkIdx,
                                          void* packedRecvX, int* packedRecvCount,
                                          int* packedRecvSrcInfo, int64_t* packedRecvLayoutRange,
-                                         int blockNum = -1, int warpPerBlock = -1,
-                                         hipStream_t = 0, int hiddenDim = -1);
+                                         int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0,
+                                         int hiddenDim = -1);
   void LaunchConvertCombineInputKernel(const void* packedRecvX, const void* packedRecvSrcInfo,
                                        const void* packedRecvLayoutRange, void* combineInput,
                                        mori::application::SymmMemObjPtr shmemCombineInpTokMemObj,
-                                       int blockNum = -1, int warpPerBlock = -1,
-                                       hipStream_t = 0, int hiddenDim = -1);
+                                       int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0,
+                                       int hiddenDim = -1);
 #endif
 
   void LaunchDispatchRecv(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
@@ -213,6 +218,11 @@ class EpDispatchCombineHandle {
   index_t curRankNumToken{0};
   index_t multiProcessorCount{0};
   index_t maxThreads{0};
+  int wallClockRateKHz{0};
+
+  // Elastic EP state (optional; if null/negative, elastic EP is disabled)
+  int32_t* activeRanks{nullptr};
+  int64_t timeoutTicks{-1};
 
  public:
   // Config
@@ -325,6 +335,8 @@ struct EpDispatchCombineArgs {
   T* outTokenBuf{nullptr};
   float* weightsBuf{nullptr};
   uint8_t* scalesBuf{nullptr};
+  int32_t* activeRanks{nullptr};
+  int64_t timeoutTicks{-1};
   mori::application::SymmMemObjPtr shmemDispatchInpTokMemObj;
   mori::application::SymmMemObjPtr shmemCombineInpTokMemObj;
   mori::application::SymmMemObjPtr shmemDispatchOutTokMemObj;
@@ -401,6 +413,8 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.outTokenBuf = reinterpret_cast<T*>(handle.outTokenBuf);
   args.weightsBuf = handle.weightsBuf;
   args.scalesBuf = handle.scalesBuf;
+  args.activeRanks = handle.activeRanks;
+  args.timeoutTicks = handle.timeoutTicks;
   args.destPeTokenCounter = handle.destPeTokenCounter;
   args.localPeTokenCounter = handle.localPeTokenCounter;
   args.shmemDispatchInpTokMemObj = handle.shmemDispatchInpTokMemObj;
