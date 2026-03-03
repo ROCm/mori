@@ -321,6 +321,7 @@ if(BUILD_TESTS)
   add_subdirectory(tests/cpp)
 endif()
 
+<<<<<<< HEAD
 # ---------------------------------------------------------------------------
 # Install rules
 # ---------------------------------------------------------------------------
@@ -351,3 +352,5 @@ install(FILES
 if(TARGET spdlog)
   install(TARGETS spdlog ARCHIVE DESTINATION lib)
 endif()
+=======
+>>>>>>> e9a22f69 (umbp distriuted server: add server & client & heartbeat)
