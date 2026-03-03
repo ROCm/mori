@@ -36,6 +36,7 @@ option(ENABLE_PROFILER "Enable kernel profiling" OFF)
 option(ENABLE_DEBUG_PRINTF "Enable debug printf in device kernels" OFF)
 option(ENABLE_STANDARD_MOE_ADAPT "Enable standard moe adapt" OFF)
 
+option(ENABLE_XLA_FFI "Build XLA FFI custom call handlers for JAX" OFF)
 option(BUILD_SHMEM_DEVICE_WRAPPER "Build SHMEM device API wrapper" OFF)
 option(SAVE_TEMPS "Save intermediate compilation files" ON)
 
@@ -96,6 +97,11 @@ endif()
 message(STATUS "ENABLE_STANDARD_MOE_ADAPT = ${ENABLE_STANDARD_MOE_ADAPT}")
 if(ENABLE_STANDARD_MOE_ADAPT)
   add_compile_definitions(ENABLE_STANDARD_MOE_ADAPT)
+endif()
+
+message(STATUS "ENABLE_XLA_FFI = ${ENABLE_XLA_FFI}")
+if(ENABLE_XLA_FFI)
+  add_compile_definitions(ENABLE_XLA_FFI)
 endif()
 
 if(NOT DEFINED WARP_ACCUM_UNROLL)
@@ -221,6 +227,10 @@ endif()
 
 if(BUILD_PYBINDS)
   add_subdirectory(src/pybind)
+endif()
+
+if(ENABLE_XLA_FFI)
+  add_subdirectory(src/ffi)
 endif()
 
 if(BUILD_TESTS)
