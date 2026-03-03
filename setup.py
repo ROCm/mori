@@ -84,6 +84,99 @@ def _get_gpu_archs() -> str:
     return ";".join(valid_arch_list)
 
 
+def _detect_nic_type() -> dict:
+    """Auto-detect RDMA NIC type for IBGDA provider selection.
+
+    Detection priority:
+      1. Environment variable (USE_BNXT=ON or USE_IONIC=ON) — explicit override
+      2. /sys/class/infiniband/ — active RDMA devices registered with the kernel
+      3. lspci PCI vendor ID — hardware present but driver may not be loaded
+      4. User-space library (libbnxt_re.so / libionic.so) — fallback
+      5. Default: MLX5 (Mellanox ConnectX)
+    """
+    result = {"USE_BNXT": "OFF", "USE_IONIC": "OFF"}
+
+    # 1. Explicit environment variable
+    env_bnxt = os.environ.get("USE_BNXT", "").upper()
+    env_ionic = os.environ.get("USE_IONIC", "").upper()
+    if env_bnxt == "ON":
+        result["USE_BNXT"] = "ON"
+        return result
+    if env_ionic == "ON":
+        result["USE_IONIC"] = "ON"
+        return result
+    if env_bnxt or env_ionic:
+        return result
+
+    # 2. Active RDMA devices (most accurate — only shows devices with loaded drivers)
+    # Device name prefix directly maps to driver: bnxt_re_*, mlx5_*, ionic_rdma_*
+    ib_dir = "/sys/class/infiniband"
+    if os.path.isdir(ib_dir):
+        try:
+            devices = os.listdir(ib_dir)
+            bnxt_count = sum(1 for d in devices if d.startswith("bnxt_re"))
+            ionic_count = sum(1 for d in devices if d.startswith("ionic"))
+            mlx5_count = sum(1 for d in devices if d.startswith("mlx5"))
+
+            if bnxt_count > 0 and bnxt_count >= mlx5_count:
+                result["USE_BNXT"] = "ON"
+                print(f"[mori] Found {bnxt_count} BNXT RDMA device(s) in /sys/class/infiniband/")
+                return result
+            if ionic_count > 0 and ionic_count >= mlx5_count:
+                result["USE_IONIC"] = "ON"
+                print(f"[mori] Found {ionic_count} IONIC RDMA device(s) in /sys/class/infiniband/")
+                return result
+            if mlx5_count > 0:
+                print(f"[mori] Found {mlx5_count} MLX5 RDMA device(s) in /sys/class/infiniband/")
+                return result
+        except OSError:
+            pass
+
+    # 3. lspci hardware detection
+    _NIC_PCI_VENDORS = {
+        "14e4": "BNXT",   # Broadcom BCM576xx / BCM578xx
+        "1dd8": "IONIC",  # AMD/Pensando
+    }
+    try:
+        lspci_out = subprocess.check_output(
+            ["lspci", "-nn", "-d", "::0200"],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+        vendor_counts = {}
+        for line in lspci_out.strip().split("\n"):
+            for vid, nic in _NIC_PCI_VENDORS.items():
+                if vid in line:
+                    vendor_counts[nic] = vendor_counts.get(nic, 0) + 1
+
+        if vendor_counts:
+            dominant = max(vendor_counts, key=vendor_counts.get)
+            if dominant == "BNXT":
+                result["USE_BNXT"] = "ON"
+            elif dominant == "IONIC":
+                result["USE_IONIC"] = "ON"
+            print(f"[mori] lspci detected: {vendor_counts}")
+            return result
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+    # 4. Library file fallback
+    _LIB_SEARCH_PATHS = ["/usr/local/lib", "/usr/lib", "/usr/lib/x86_64-linux-gnu",
+                         "/lib/x86_64-linux-gnu"]
+    for d in _LIB_SEARCH_PATHS:
+        if os.path.exists(os.path.join(d, "libbnxt_re.so")):
+            result["USE_BNXT"] = "ON"
+            print(f"[mori] Found libbnxt_re.so in {d}")
+            return result
+    for d in _LIB_SEARCH_PATHS:
+        if os.path.exists(os.path.join(d, "libionic.so")):
+            result["USE_IONIC"] = "ON"
+            print(f"[mori] Found libionic.so in {d}")
+            return result
+
+    # 5. Default: MLX5
+    return result
+
+
 class CMakeBuild(build_ext):
     def run(self) -> None:
         try:
@@ -105,13 +198,18 @@ class CMakeBuild(build_ext):
 
         build_type = os.environ.get("CMAKE_BUILD_TYPE", "Release")
         unroll_value = os.environ.get("WARP_ACCUM_UNROLL", "1")
-        use_bnxt = os.environ.get("USE_BNXT", "OFF")
         build_shmem_device_wrapper = os.environ.get("BUILD_SHMEM_DEVICE_WRAPPER", "ON")
-        use_ionic = os.environ.get("USE_IONIC", "OFF")
         enable_profiler = os.environ.get("ENABLE_PROFILER", "OFF")
         enable_debug_printf = os.environ.get("ENABLE_DEBUG_PRINTF", "OFF")
+
+        nic = _detect_nic_type()
+        use_bnxt = nic["USE_BNXT"]
+        use_ionic = nic["USE_IONIC"]
+        nic_name = "BNXT" if use_bnxt == "ON" else ("IONIC" if use_ionic == "ON" else "MLX5")
+        print(f"[mori] NIC auto-detection: {nic_name} (USE_BNXT={use_bnxt}, USE_IONIC={use_ionic}, USE_MLX5={'ON' if nic_name == 'MLX5' else 'OFF'})")
         enable_standard_moe_adapt = os.environ.get("ENABLE_STANDARD_MOE_ADAPT", "OFF")
         gpu_archs = _get_gpu_archs()
+        print(f"[mori] GPU architecture: {gpu_archs}")
         build_examples = os.environ.get("BUILD_EXAMPLES", "OFF")
         build_tests = os.environ.get("BUILD_TESTS", "OFF")
 
