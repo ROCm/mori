@@ -21,6 +21,10 @@
 // SOFTWARE.
 #include <mpi.h>
 
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -846,27 +850,61 @@ int ShmemGetUniqueId(mori_shmem_uniqueid_t* uid) {
     const char* ifname = std::getenv("MORI_SOCKET_IFNAME");
     application::UniqueId socket_uid;
 
-    // Generate random port for UniqueId
     std::random_device rd;
     std::mt19937 gen(rd());
-    std::uniform_int_distribution<int> port_dis(25000, 35000);
-    int random_port = port_dis(gen);
+    std::uniform_int_distribution<int> port_dis(10000, 60000);
 
-    if (ifname) {
-      socket_uid =
-          application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface(ifname, random_port);
-      MORI_SHMEM_TRACE("Generated UniqueId with specified interface: {} (port {})", ifname,
-                       random_port);
-    } else {
-      socket_uid = application::SocketBootstrapNetwork::GenerateUniqueIdWithLocalAddr(random_port);
-      std::string localAddr = application::SocketBootstrapNetwork::GetLocalNonLoopbackAddress();
-      MORI_SHMEM_TRACE("Generated UniqueId with auto-detected interface: {} (port {})", localAddr,
-                       random_port);
+    constexpr int kMaxPortRetries = 20;
+    bool port_found = false;
+
+    for (int attempt = 0; attempt < kMaxPortRetries; attempt++) {
+      int random_port = port_dis(gen);
+
+      int probe_fd = socket(AF_INET, SOCK_STREAM, 0);
+      if (probe_fd < 0) continue;
+
+      int opt = 1;
+      setsockopt(probe_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+      struct sockaddr_in probe_addr{};
+      probe_addr.sin_family = AF_INET;
+      probe_addr.sin_port = htons(random_port);
+      probe_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+      if (bind(probe_fd, reinterpret_cast<struct sockaddr*>(&probe_addr),
+               sizeof(probe_addr)) == 0) {
+        close(probe_fd);
+
+        if (ifname) {
+          socket_uid = application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface(
+              ifname, random_port);
+          MORI_SHMEM_TRACE("Generated UniqueId with specified interface: {} (port {})", ifname,
+                           random_port);
+        } else {
+          socket_uid =
+              application::SocketBootstrapNetwork::GenerateUniqueIdWithLocalAddr(random_port);
+          std::string localAddr =
+              application::SocketBootstrapNetwork::GetLocalNonLoopbackAddress();
+          MORI_SHMEM_TRACE("Generated UniqueId with auto-detected interface: {} (port {})",
+                           localAddr, random_port);
+        }
+        port_found = true;
+        break;
+      }
+
+      close(probe_fd);
+      MORI_SHMEM_TRACE("Port {} in use, retrying ({}/{})", random_port, attempt + 1,
+                       kMaxPortRetries);
     }
+
+    if (!port_found) {
+      MORI_SHMEM_ERROR("Failed to find available port after {} attempts", kMaxPortRetries);
+      return -1;
+    }
+
     static_assert(sizeof(socket_uid) == sizeof(mori_shmem_uniqueid_t),
                   "UniqueId size mismatch between Socket Bootstrap and mori SHMEM");
 
-    // Copy to mori_shmem_uniqueid_t
     std::memcpy(uid->data(), &socket_uid, sizeof(socket_uid));
 
     return 0;

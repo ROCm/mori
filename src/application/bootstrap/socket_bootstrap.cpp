@@ -314,7 +314,6 @@ bool SocketBootstrapNetwork::FindNetworkInterface(SocketAddress& interface_addr)
   const char* ifname = std::getenv("MORI_SOCKET_IFNAME");
 
   if (ifname) {
-    // First try to find the specified interface
     for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
       if (ifa->ifa_addr == nullptr) continue;
       if (std::string(ifa->ifa_name) != ifname) continue;
@@ -322,14 +321,10 @@ bool SocketBootstrapNetwork::FindNetworkInterface(SocketAddress& interface_addr)
       if (ifa->ifa_addr->sa_family == AF_INET) {
         struct sockaddr_in* addr_in = (struct sockaddr_in*)ifa->ifa_addr;
 
-        // Skip loopback interface
-        if (ntohl(addr_in->sin_addr.s_addr) == INADDR_LOOPBACK) continue;
-
-        // Skip interfaces that are down
         if (!(ifa->ifa_flags & IFF_UP) || !(ifa->ifa_flags & IFF_RUNNING)) continue;
 
         memcpy(&interface_addr.sin, addr_in, sizeof(struct sockaddr_in));
-        interface_addr.sin.sin_port = 0;  // Let system choose port
+        interface_addr.sin.sin_port = 0;
         found = true;
         break;
       }
@@ -554,10 +549,12 @@ bool SocketBootstrapNetwork::ConnectSocket(Socket& sock, const SocketAddress& ad
 bool SocketBootstrapNetwork::AcceptSocket(Socket& listen_sock, Socket& client_sock) {
   if (listen_sock.state != SocketStateListening) return false;
 
-  socklen_t addr_len = sizeof(client_sock.addr);
-  client_sock.fd = accept(listen_sock.fd, &client_sock.addr.sa, &addr_len);
-
-  if (client_sock.fd == -1) {
+  socklen_t addr_len;
+  while (true) {
+    addr_len = sizeof(client_sock.addr);
+    client_sock.fd = accept(listen_sock.fd, &client_sock.addr.sa, &addr_len);
+    if (client_sock.fd >= 0) break;
+    if (errno == EINTR) continue;
     return false;
   }
 
@@ -584,9 +581,11 @@ bool SocketBootstrapNetwork::SendData(Socket& sock, const void* data, size_t siz
 
   while (bytes_sent < size) {
     ssize_t result = send(sock.fd, buffer + bytes_sent, size - bytes_sent, 0);
-    if (result <= 0) {
+    if (result < 0) {
+      if (errno == EINTR) continue;
       return false;
     }
+    if (result == 0) return false;
     bytes_sent += result;
   }
 
@@ -601,9 +600,11 @@ bool SocketBootstrapNetwork::ReceiveData(Socket& sock, void* data, size_t size) 
 
   while (bytes_received < size) {
     ssize_t result = recv(sock.fd, buffer + bytes_received, size - bytes_received, 0);
-    if (result <= 0) {
+    if (result < 0) {
+      if (errno == EINTR) continue;
       return false;
     }
+    if (result == 0) return false;
     bytes_received += result;
   }
 
@@ -611,35 +612,54 @@ bool SocketBootstrapNetwork::ReceiveData(Socket& sock, void* data, size_t size) 
 }
 
 bool SocketBootstrapNetwork::SetupCommunicationRing() {
-  // Initialize listening socket
   if (!InitializeSocket(listen_socket_)) {
+    MORI_APP_ERROR("Rank {}: failed to create listen socket (errno={})", localRank, errno);
     return false;
   }
 
   if (!ListenSocket(listen_socket_)) {
+    MORI_APP_ERROR("Rank {}: failed to bind/listen on socket (errno={})", localRank, errno);
     return false;
   }
 
-  // Exchange peer addresses using "phone home" protocol
   if (!PhoneHomeProtocol()) {
+    MORI_APP_ERROR("Rank {}: PhoneHomeProtocol failed", localRank);
     return false;
   }
 
   // Setup ring connections
   int next_rank = (localRank + 1) % worldSize;
-  int prev_rank = (localRank - 1 + worldSize) % worldSize;
 
-  // Connect to next rank in ring
-  if (!InitializeSocket(ring_send_socket_)) {
-    return false;
+  constexpr int kRingMaxRetries = 10;
+  constexpr int kRingRetryDelayMs = 100;
+
+  // Connect to next rank in ring (with retries)
+  bool ring_connected = false;
+  for (int retry = 0; retry < kRingMaxRetries; retry++) {
+    if (!InitializeSocket(ring_send_socket_)) {
+      return false;
+    }
+
+    if (ConnectSocket(ring_send_socket_, peer_addresses_[next_rank])) {
+      ring_connected = true;
+      break;
+    }
+
+    CloseSocket(ring_send_socket_);
+    std::this_thread::sleep_for(std::chrono::milliseconds(kRingRetryDelayMs));
   }
 
-  if (!ConnectSocket(ring_send_socket_, peer_addresses_[next_rank])) {
+  if (!ring_connected) {
+    MORI_APP_ERROR("Rank {} failed to connect to next rank {} for ring after {} retries",
+                   localRank, next_rank, kRingMaxRetries);
     return false;
   }
 
   // Accept connection from previous rank
   if (!AcceptSocket(listen_socket_, ring_recv_socket_)) {
+    int prev_rank = (localRank - 1 + worldSize) % worldSize;
+    MORI_APP_ERROR("Rank {}: failed to accept ring connection from rank {} (errno={})",
+                   localRank, prev_rank, errno);
     return false;
   }
 
@@ -660,10 +680,13 @@ bool SocketBootstrapNetwork::PhoneHomeProtocol() {
     ExtractAddressFromUniqueId(unique_id_, root_addr);
 
     if (!InitializeSocket(root_listen_socket, &root_addr)) {
+      MORI_APP_ERROR("Root: failed to create PhoneHome socket (errno={})", errno);
       return false;
     }
 
     if (!ListenSocket(root_listen_socket)) {
+      MORI_APP_ERROR("Root: failed to bind PhoneHome socket on {} (errno={})",
+                     AddressToString(root_addr), errno);
       return false;
     }
 
@@ -742,19 +765,35 @@ bool SocketBootstrapNetwork::PhoneHomeProtocol() {
     CloseSocket(root_listen_socket);
 
   } else {
-    // Non-root rank: connect once, send info, then receive addresses
+    // Non-root rank: connect to root with retries, send info, then receive addresses
     SocketAddress root_addr;
     ExtractAddressFromUniqueId(unique_id_, root_addr);
 
-    // Add small delay to ensure root is listening
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    constexpr int kConnectMaxRetries = 10;
+    constexpr int kConnectRetryDelayMs = 100;
 
     Socket sock;
-    if (!InitializeSocket(sock)) {
-      return false;
+    bool connected = false;
+    for (int retry = 0; retry < kConnectMaxRetries; retry++) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(kConnectRetryDelayMs));
+
+      if (!InitializeSocket(sock)) {
+        return false;
+      }
+
+      if (ConnectSocket(sock, root_addr)) {
+        connected = true;
+        break;
+      }
+
+      CloseSocket(sock);
+      MORI_APP_TRACE("Rank {} retrying connection to root ({}/{})", localRank, retry + 1,
+                     kConnectMaxRetries);
     }
 
-    if (!ConnectSocket(sock, root_addr)) {
+    if (!connected) {
+      MORI_APP_ERROR("Rank {} failed to connect to root after {} retries", localRank,
+                     kConnectMaxRetries);
       return false;
     }
 
