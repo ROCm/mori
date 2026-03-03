@@ -1,7 +1,7 @@
 cmake>=3.19
 setuptools>=65
 setuptools-scm>=8
+pybind11
+ninja
 prettytable
---extra-index-url https://download.pytorch.org/whl/rocm6.4
-torch
 pytest-assume
