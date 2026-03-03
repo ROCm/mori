@@ -34,10 +34,18 @@ __device__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
 
 
 class FileBaton:
-    """Simple file-based lock for multi-process build safety (same pattern as PyTorch/AITER)."""
+    """File-based lock for multi-process build safety.
 
-    def __init__(self, lock_path: str | Path):
+    When *wait_for* is provided, waiters that see the target file appear
+    will return immediately **without** acquiring the lock, setting
+    ``self.skipped = True``.  The caller should check this flag and skip
+    the build if it is set.
+    """
+
+    def __init__(self, lock_path: str | Path, wait_for: str | Path | None = None):
         self._lock_path = str(lock_path)
+        self._wait_for = str(wait_for) if wait_for else None
+        self.skipped = False
 
     def __enter__(self):
         while True:
@@ -46,9 +54,14 @@ class FileBaton:
                 os.close(fd)
                 return self
             except FileExistsError:
+                if self._wait_for and os.path.isfile(self._wait_for):
+                    self.skipped = True
+                    return self
                 time.sleep(0.5)
 
     def __exit__(self, *exc):
+        if self.skipped:
+            return
         try:
             os.remove(self._lock_path)
         except OSError:
@@ -259,8 +272,9 @@ def compile_genco(kernel_name: str) -> str | list[str]:
             return [str(p) for p in hsaco_paths]
 
         lock_path = cache_dir / f".{kernel_name}.lock"
-        with FileBaton(lock_path):
-            if all(p.is_file() for p in hsaco_paths):
+        last_hsaco = str(hsaco_paths[-1])
+        with FileBaton(lock_path, wait_for=last_hsaco) as baton:
+            if baton.skipped or all(p.is_file() for p in hsaco_paths):
                 return [str(p) for p in hsaco_paths]
 
             print(f"[mori-jit] Compiling {kernel_name} for {cfg.arch} (nic={nic}, "
@@ -293,8 +307,8 @@ def compile_genco(kernel_name: str) -> str | list[str]:
         return str(hsaco_path)
 
     lock_path = cache_dir / f".{kernel_name}.hsaco.lock"
-    with FileBaton(lock_path):
-        if hsaco_path.is_file():
+    with FileBaton(lock_path, wait_for=str(hsaco_path)) as baton:
+        if baton.skipped or hsaco_path.is_file():
             return str(hsaco_path)
 
         nic = detect_nic_type()
@@ -332,8 +346,8 @@ def ensure_bitcode() -> str:
         return str(bc_path)
 
     lock_path = cache_dir / f".{_BC_FILENAME}.lock"
-    with FileBaton(lock_path):
-        if bc_path.is_file():
+    with FileBaton(lock_path, wait_for=str(bc_path)) as baton:
+        if baton.skipped or bc_path.is_file():
             return str(bc_path)
         _build_bitcode(cfg, mori_root, bc_path)
 
