@@ -257,10 +257,6 @@ class CMakeBuild(build_ext):
         for src_path, dst_path in files_to_copy:
             shutil.copyfile(src_path, dst_path)
 
-        # Bitcode is no longer pre-built during install.
-        # It is JIT-compiled at runtime via mori.jit (ensure_bitcode)
-        # with the correct NIC type (MORI_DEVICE_NIC_BNXT/IONIC) and
-        # code object version (-mcode-object-version=5).
 
 
 class CustomBuild(_build):

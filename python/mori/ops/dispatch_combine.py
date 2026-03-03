@@ -113,11 +113,37 @@ def _cpp_dispatch_combine_factory(entity_name, allow_missing=False):
     return getattr(mori_cpp, entity_name)
 
 
-def _ensure_jit_kernels():
-    """Ensure dispatch/combine kernels are JIT-compiled and loaded into the C++ module."""
+_KERNEL_TYPE_TO_HIP = {
+    EpDispatchCombineKernelType.IntraNode: "ep_intranode",
+    EpDispatchCombineKernelType.InterNode: "ep_internode",
+    EpDispatchCombineKernelType.InterNodeV1: "ep_internode_v1",
+    EpDispatchCombineKernelType.InterNodeV1LL: "ep_internode_v1ll",
+    EpDispatchCombineKernelType.AsyncLL: "ep_async_ll",
+}
+
+
+_compiled_hsaco: dict[str, str] = {}
+
+
+def warmup_jit_kernels(kernel_type):
+    """Pre-compile kernels for a kernel_type. Call from main process before spawning workers."""
+    from mori.jit.core import compile_genco
+    hip_name = _KERNEL_TYPE_TO_HIP.get(kernel_type, "dispatch_combine_kernels")
+    if hip_name not in _compiled_hsaco:
+        _compiled_hsaco[hip_name] = compile_genco(hip_name)
+    return _compiled_hsaco[hip_name]
+
+
+def _ensure_jit_kernels(kernel_type):
+    """Ensure the required kernels for this kernel_type are JIT-compiled and loaded."""
     try:
         from mori.jit.core import compile_genco
-        hsaco = compile_genco("dispatch_combine_kernels")
+        hip_name = _KERNEL_TYPE_TO_HIP.get(kernel_type, "dispatch_combine_kernels")
+        if hip_name in _compiled_hsaco:
+            hsaco = _compiled_hsaco[hip_name]
+        else:
+            hsaco = compile_genco(hip_name)
+            _compiled_hsaco[hip_name] = hsaco
         load_fn = _cpp_dispatch_combine_factory("load_ops_kernels", allow_missing=True)
         if load_fn:
             load_fn(hsaco)
@@ -129,7 +155,7 @@ def _ensure_jit_kernels():
 class EpDispatchCombineOp:
     def __init__(self, config):
         self.config = config
-        _ensure_jit_kernels()
+        _ensure_jit_kernels(config.kernel_type)
 
         handle_class = _cpp_dispatch_combine_factory("EpDispatchCombineHandle")
         cpp_config = mori_cpp.EpDispatchCombineConfig(

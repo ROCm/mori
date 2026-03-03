@@ -213,7 +213,7 @@ def _hipcc_genco(
 _PARALLEL_KERNEL_GROUPS: dict[str, list[str]] = {
     # Parallel compilation disabled — multi-module loading causes issues
     # with multiprocessing workers (concurrent ShmemModuleInit).
-    # "dispatch_combine_kernels": ["dc_dispatch_kernels", "dc_combine_kernels"],
+    # "dispatch_combine_kernels": ["ep_dispatch_kernels", "ep_combine_kernels"],
 }
 
 
@@ -235,7 +235,7 @@ def compile_genco(kernel_name: str) -> str | list[str]:
     """JIT compile kernel .hip source(s) to .hsaco via --genco. Returns cached path(s).
 
     If the kernel has parallel sub-groups (e.g. dispatch_combine_kernels splits
-    into dc_dispatch_kernels + dc_combine_kernels), compiles them in parallel
+    into ep_dispatch_kernels + ep_combine_kernels), compiles them in parallel
     and returns a list of paths.
     """
     mori_root = get_mori_source_root()

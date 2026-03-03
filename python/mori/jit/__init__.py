@@ -18,25 +18,40 @@ __all__ = ["compile_genco", "ensure_bitcode", "precompile"]
 
 
 def precompile():
-    """Precompile all JIT kernels (bitcode + ops .hsaco) into the cache."""
+    """Precompile all JIT kernels (bitcode + ops .hsaco) into the cache.
+
+    Compiles all kernel groups in parallel using threads (each spawns hipcc).
+    """
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from mori.jit.config import detect_build_config, detect_nic_type
+
     cfg = detect_build_config()
     nic = detect_nic_type()
     print(f"[mori-jit] Precompiling all kernels (arch={cfg.arch}, nic={nic}) ...")
+    t0 = time.time()
 
-    try:
-        path = ensure_bitcode()
-        print(f"[mori-jit]   shmem bitcode: {path}")
-    except Exception as e:
-        print(f"[mori-jit]   shmem bitcode: SKIPPED ({e})")
+    all_kernels = ["ep_intranode", "ep_internode", "ep_internode_v1", "ep_internode_v1ll",
+                    "ep_async_ll", "cast_kernel"]
 
-    for name in ["dispatch_combine_kernels", "cast_kernel"]:
-        try:
-            path = compile_genco(name)
-            print(f"[mori-jit]   {name}: {path}")
-        except Exception as e:
-            print(f"[mori-jit]   {name}: SKIPPED ({e})")
+    def _compile_bc():
+        return "shmem bitcode", ensure_bitcode()
 
-    print("[mori-jit] Precompilation done.")
+    def _compile_genco(name):
+        return name, compile_genco(name)
+
+    with ThreadPoolExecutor(max_workers=len(all_kernels) + 1) as pool:
+        futures = [pool.submit(_compile_bc)]
+        for name in all_kernels:
+            futures.append(pool.submit(_compile_genco, name))
+
+        for future in as_completed(futures):
+            try:
+                label, path = future.result()
+                print(f"[mori-jit]   {label}: {path}")
+            except Exception as e:
+                print(f"[mori-jit]   SKIPPED ({e})")
+
+    print(f"[mori-jit] Precompilation done ({time.time()-t0:.1f}s).")
 
 
