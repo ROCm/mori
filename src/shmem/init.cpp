@@ -734,7 +734,14 @@ int ShmemMpiInit(MPI_Comm mpiComm) {
 int ShmemInit() { return ShmemMpiInit(MPI_COMM_WORLD); }
 
 int ShmemTorchProcessGroupInit(const std::string& groupName) {
+#ifdef MORI_HAS_TORCH
   return ShmemInit(new application::TorchBootstrapNetwork(groupName));
+#else
+  (void)groupName;
+  fprintf(stderr, "[mori] Error: Torch bootstrap not available (built without PyTorch).\n"
+                  "[mori] Use ShmemMpiInit() or rebuild with PyTorch installed.\n");
+  return -1;
+#endif
 }
 
 /* ---------------------------------------------------------------------------------------------- */

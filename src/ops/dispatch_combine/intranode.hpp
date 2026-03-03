@@ -74,7 +74,7 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
 /*                                    EpDispatchIntraNodeKernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T, bool EnableStdMoE = false>
-__global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
+__device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
 
   int thdId = threadIdx.x;
@@ -201,12 +201,17 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 #endif
 }
 
+template <typename T, bool EnableStdMoE = false>
+__global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
+  EpDispatchIntraNodeKernel_body<T, EnableStdMoE>(args);
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpCombineIntraNodeKernel                                    */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
           bool UseFp8DirectCast = false>
-__global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
+__device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
   static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
                 "Fp8 direct cast combine currently only supports bf16 input");
@@ -371,6 +376,12 @@ __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
                                 config.numExpertPerToken);
     }
   }
+}
+
+template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
+          bool UseFp8DirectCast = false>
+__global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
+  EpCombineIntraNodeKernel_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast>(args);
 }
 
 }  // namespace moe

@@ -226,6 +226,16 @@ py::tuple GetDebugTimeOffset(mori::moe::EpDispatchCombineHandle& handle) {
 
 int GetCurDeviceWallClockFreqMhz() { return mori::GetCurDeviceWallClockFreqMhz(); }
 
+void LoadOpsKernels(const pybind11::object& path_or_paths) {
+  if (pybind11::isinstance<pybind11::str>(path_or_paths)) {
+    mori::moe::LoadJitKernelModule(path_or_paths.cast<std::string>().c_str());
+  } else {
+    for (auto& p : path_or_paths) {
+      mori::moe::LoadJitKernelModule(p.cast<std::string>().c_str());
+    }
+  }
+}
+
 void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   pybind11::class_<mori::moe::EpDispatchCombineHandle>(m, "EpDispatchCombineHandle")
       .def(pybind11::init<mori::moe::EpDispatchCombineConfig>(),
@@ -311,6 +321,8 @@ void RegisterMoriOps(py::module_& m) {
 
   m.def("get_cur_device_wall_clock_freq_mhz", &GetCurDeviceWallClockFreqMhz,
         "Returns clock frequency of current device's wall clock");
+  m.def("load_ops_kernels", &LoadOpsKernels,
+        "Load JIT-compiled ops kernels from .hsaco file");
 }
 
 }  // namespace mori

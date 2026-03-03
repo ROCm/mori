@@ -9,6 +9,7 @@ lib*
 *.pyc
 .pytest_cache
 __pycache__
+python/mori/_version.py
 
 .vscode
 *.log

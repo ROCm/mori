@@ -536,8 +536,13 @@ __device__ inline void ConvertCombineInputDevice(ConvertCombineInputArgs& args) 
 #endif
 
 template <typename T, bool UseP2PRead = true>
-__global__ void ConvertCombineInputKernel(ConvertCombineInputArgs args) {
+__device__ void ConvertCombineInputKernel_body(ConvertCombineInputArgs args) {
   ConvertCombineInputDevice<T, UseP2PRead>(args);
+}
+
+template <typename T, bool UseP2PRead = true>
+__global__ void ConvertCombineInputKernel(ConvertCombineInputArgs args) {
+  ConvertCombineInputKernel_body<T, UseP2PRead>(args);
 }
 
 }  // namespace moe

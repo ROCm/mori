@@ -21,3 +21,8 @@ target_link_libraries(
   hip::device
   mori_logging)
 target_compile_definitions(mori_io PUBLIC MSGPACK_NO_BOOST)
+set_target_properties(
+  mori_io
+  PROPERTIES BUILD_RPATH "$ORIGIN"
+             INSTALL_RPATH "$ORIGIN"
+             BUILD_WITH_INSTALL_RPATH TRUE)

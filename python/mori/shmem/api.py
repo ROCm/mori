@@ -25,17 +25,45 @@ from mori import cpp as mori_cpp
 MORI_SHMEM_INIT_WITH_MPI_COMM = mori_cpp.MORI_SHMEM_INIT_WITH_MPI_COMM
 MORI_SHMEM_INIT_WITH_UNIQUEID = mori_cpp.MORI_SHMEM_INIT_WITH_UNIQUEID
 
-# Traditional initialization (requires PyTorch distributed)
 def shmem_torch_process_group_init(group_name: str):
-    """Initialize shmem from PyTorch process group.
-    
+    """Initialize shmem from PyTorch process group via socket bootstrap.
+
+    Extracts rank/world_size from the torch process group and broadcasts
+    UniqueId via the torch store, then initializes shmem with socket bootstrap.
+
     Args:
         group_name: Name of the PyTorch process group
-        
+
     Returns:
         Status code (0 for success)
     """
-    return mori_cpp.shmem_torch_process_group_init(group_name)
+    try:
+        import torch.distributed as dist
+    except ImportError:
+        raise RuntimeError(
+            "PyTorch not installed. Use shmem_init_attr() with UniqueId instead."
+        )
+
+    if not dist.is_initialized():
+        raise RuntimeError(
+            "torch.distributed not initialized. "
+            "Call torch.distributed.init_process_group() first, or use shmem_init_attr()."
+        )
+
+    group = dist.distributed_c10d._resolve_process_group(group_name)
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+
+    store_key = f"mori_shmem_uid_{group_name}"
+    if rank == 0:
+        uid = shmem_get_unique_id()
+        dist.broadcast_object_list([uid], src=0, group=group)
+    else:
+        uid_list = [None]
+        dist.broadcast_object_list(uid_list, src=0, group=group)
+        uid = uid_list[0]
+
+    return shmem_init_attr(MORI_SHMEM_INIT_WITH_UNIQUEID, rank, world_size, uid)
 
 
 # UniqueId-based initialization (nvshmem/rocshmem compatible)

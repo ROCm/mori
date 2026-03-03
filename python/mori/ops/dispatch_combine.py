@@ -113,9 +113,23 @@ def _cpp_dispatch_combine_factory(entity_name, allow_missing=False):
     return getattr(mori_cpp, entity_name)
 
 
+def _ensure_jit_kernels():
+    """Ensure dispatch/combine kernels are JIT-compiled and loaded into the C++ module."""
+    try:
+        from mori.jit.core import compile_genco
+        hsaco = compile_genco("dispatch_combine_kernels")
+        load_fn = _cpp_dispatch_combine_factory("load_ops_kernels", allow_missing=True)
+        if load_fn:
+            load_fn(hsaco)
+    except Exception as e:
+        import warnings
+        warnings.warn(f"[mori] JIT kernel compilation skipped: {e}")
+
+
 class EpDispatchCombineOp:
     def __init__(self, config):
         self.config = config
+        _ensure_jit_kernels()
 
         handle_class = _cpp_dispatch_combine_factory("EpDispatchCombineHandle")
         cpp_config = mori_cpp.EpDispatchCombineConfig(

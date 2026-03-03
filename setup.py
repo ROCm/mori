@@ -29,12 +29,6 @@ from setuptools.command.build import build as _build
 from setuptools.command.build_ext import build_ext
 
 
-def _get_torch_cmake_prefix_path() -> str:
-    import torch
-
-    return torch.utils.cmake_prefix_path
-
-
 _supported_arch_list = ["gfx942", "gfx950"]
 
 
@@ -55,6 +49,10 @@ def _detect_local_gpu_arch() -> str | None:
 
 
 def _get_gpu_archs() -> str:
+    """Determine GPU target architectures for compilation.
+
+    Priority: MORI_GPU_ARCHS > local GPU > PYTORCH_ROCM_ARCH / GPU_ARCHS > fat binary default.
+    """
     mori_gpu_archs = os.environ.get("MORI_GPU_ARCHS", None)
     if mori_gpu_archs:
         return mori_gpu_archs
@@ -64,24 +62,19 @@ def _get_gpu_archs() -> str:
         return local_arch
 
     archs = os.environ.get("PYTORCH_ROCM_ARCH", None)
-    if not archs:
-        import torch
-
-        archs = torch._C._cuda_getArchFlags()
 
     gpu_archs = os.environ.get("GPU_ARCHS", None)
     if gpu_archs:
         archs = gpu_archs
 
-    arch_list = archs.replace(" ", ";").split(";")
+    if archs:
+        arch_list = archs.replace(" ", ";").split(";")
+        valid_arch_list = list(set(_supported_arch_list) & set(arch_list))
+        if valid_arch_list:
+            return ";".join(valid_arch_list)
 
-    # filter out supported architectures
-    valid_arch_list = list(set(_supported_arch_list) & set(arch_list))
-    if len(valid_arch_list) == 0:
-        raise ValueError(
-            f"no supported archs found, supported {_supported_arch_list}, got {arch_list}"
-        )
-    return ";".join(valid_arch_list)
+    print(f"[mori] No GPU arch specified — building fat binary for {_supported_arch_list}")
+    return ";".join(_supported_arch_list)
 
 
 def _detect_nic_type() -> dict:
@@ -227,11 +220,11 @@ class CMakeBuild(build_ext):
             f"-DENABLE_PROFILER={enable_profiler}",
             f"-DBUILD_EXAMPLES={build_examples}",
             f"-DBUILD_TESTS={build_tests}",
+            "-DBUILD_TORCH_BOOTSTRAP=OFF",
             "-B",
             str(build_dir),
             "-S",
             str(root_dir),
-            f"-DCMAKE_PREFIX_PATH={_get_torch_cmake_prefix_path()}",
         ]
 
         if shutil.which("ninja"):
@@ -260,27 +253,14 @@ class CMakeBuild(build_ext):
                 build_dir / "src/io/libmori_io.so",
                 root_dir / "python/mori/libmori_io.so",
             ),
-            (
-                build_dir / "src/shmem/libmori_shmem.a",
-                root_dir / "python/mori/libmori_shmem.a",
-            ),
-            (
-                build_dir / "src/ops/libmori_ops.a",
-                root_dir / "python/mori/libmori_ops.a",
-            ),
         ]
         for src_path, dst_path in files_to_copy:
             shutil.copyfile(src_path, dst_path)
 
-        if build_shmem_device_wrapper.upper() == "ON":
-            bc_script = root_dir / "tools" / "build_shmem_bitcode.sh"
-            if bc_script.exists():
-                subprocess.check_call(["bash", str(bc_script)], cwd=str(root_dir))
-            bc_path = root_dir / "lib" / "libmori_shmem_device.bc"
-            if bc_path.exists():
-                ir_dir = root_dir / "python" / "mori" / "ir"
-                ir_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(bc_path, ir_dir / "libmori_shmem_device.bc")
+        # Bitcode is no longer pre-built during install.
+        # It is JIT-compiled at runtime via mori.jit (ensure_bitcode)
+        # with the correct NIC type (MORI_DEVICE_NIC_BNXT/IONIC) and
+        # code object version (-mcode-object-version=5).
 
 
 class CustomBuild(_build):
@@ -299,21 +279,23 @@ extensions = [
 ]
 
 setup(
-    name="mori",
-    use_scm_version=True,
-    description="Modular RDMA Interface",
     packages=find_packages(where="python"),
     package_dir={"": "python"},
     package_data={
-        "mori": ["libmori_pybinds.so", "libmori_io.so", "libmori_application.so", "libmori_shmem.a", "libmori_ops.a"],
+        "mori": [
+            "libmori_pybinds.so",
+            "libmori_io.so",
+            "libmori_application.so",
+        ],
         "mori.ir": ["*.bc"],
+    },
+    exclude_package_data={
+        "mori": ["*.a"],
     },
     cmdclass={
         "build_ext": CMakeBuild,
         "build": CustomBuild,
     },
-    setup_requires=["setuptools_scm"],
-    python_requires=">=3.10",
     ext_modules=extensions,
     include_package_data=True,
 )

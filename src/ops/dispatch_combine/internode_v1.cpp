@@ -568,7 +568,7 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
 }  // namespace v1
 
 template <typename T>
-__global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
+__device__ void EpDispatchInterNodeV1Kernel_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   if (blockId < args.rdmaBlockNum) {
     v1::DispatchInterNodeSend<T, true>(args);
@@ -580,7 +580,12 @@ __global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
 }
 
 template <typename T>
-__global__ void EpDispatchCopyToStaging(EpDispatchCombineArgs<T> args) {
+__global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
+  EpDispatchInterNodeV1Kernel_body<T>(args);
+}
+
+template <typename T>
+__device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   MORI_TRACE_SPAN(profiler, Slot::EpDispatchCopyToStaging);
   if (args.curRankNumToken == 0) return;
@@ -620,8 +625,13 @@ __global__ void EpDispatchCopyToStaging(EpDispatchCombineArgs<T> args) {
   }
 }
 
+template <typename T>
+__global__ void EpDispatchCopyToStaging(EpDispatchCombineArgs<T> args) {
+  EpDispatchCopyToStaging_body<T>(args);
+}
+
 template <typename T, bool EnableStdMoE>
-__global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
+__device__ void EpDispatchInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   if (blockId < args.rdmaBlockNum) {
     v1::DispatchInterNodeLLSend<T>(args);
@@ -636,6 +646,11 @@ __global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> a
     InvokeConvertDispatchOutput<T>(args, myPe);
   }
 #endif
+}
+
+template <typename T, bool EnableStdMoE>
+__global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
+  EpDispatchInterNodeV1KernelLowLatency_body<T, EnableStdMoE>(args);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -1154,7 +1169,7 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
 }  // namespace v1
 
 template <typename T>
-__global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
+__device__ void EpCombineInterNodeV1Kernel_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
 
   if (blockId < args.rdmaBlockNum) {
@@ -1162,6 +1177,11 @@ __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
   } else {
     v1::CombineIntraNode(args);
   }
+}
+
+template <typename T>
+__global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
+  EpCombineInterNodeV1Kernel_body<T>(args);
 }
 
 namespace combine_all_impl {
@@ -1279,7 +1299,7 @@ __forceinline__ __device__ void EpCombineAllGeneric(EpDispatchCombineArgs<T>& ar
 }  // namespace combine_all_impl
 
 template <typename T>
-__global__ void EpCombineAll(EpDispatchCombineArgs<T> args) {
+__device__ void EpCombineAll_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   MORI_TRACE_SPAN(profiler, Slot::EpCombineAll);
 
@@ -1299,8 +1319,13 @@ __global__ void EpCombineAll(EpDispatchCombineArgs<T> args) {
   combine_all_impl::EpCombineAllGeneric(args);
 }
 
+template <typename T>
+__global__ void EpCombineAll(EpDispatchCombineArgs<T> args) {
+  EpCombineAll_body<T>(args);
+}
+
 template <typename T, bool EnableStdMoE>
-__global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
+__device__ void EpCombineInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
 
   // If EnableStdMoE, call ConvertCombineInputDevice first to convert standard MoE format
@@ -1317,14 +1342,24 @@ __global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> ar
   }
 }
 
+template <typename T, bool EnableStdMoE>
+__global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
+  EpCombineInterNodeV1KernelLowLatency_body<T, EnableStdMoE>(args);
+}
+
 template <typename T>
-__global__ void EpCombineSync(EpDispatchCombineArgs<T> args) {
+__device__ void EpCombineSync_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   v1::CombineSync(args);
 }
 
 template <typename T>
-__global__ void EpCombineSyncBarrier(EpDispatchCombineArgs<T> args) {
+__global__ void EpCombineSync(EpDispatchCombineArgs<T> args) {
+  EpCombineSync_body<T>(args);
+}
+
+template <typename T>
+__device__ void EpCombineSyncBarrier_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   uint64_t barrierFlag = 0;
   if (laneId == 0) {
@@ -1342,10 +1377,16 @@ __global__ void EpCombineSyncBarrier(EpDispatchCombineArgs<T> args) {
   }
 }
 
+template <typename T>
+__global__ void EpCombineSyncBarrier(EpDispatchCombineArgs<T> args) {
+  EpCombineSyncBarrier_body<T>(args);
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                     Template Specialization                                    */
 /* ---------------------------------------------------------------------------------------------- */
 
+#ifndef MORI_JIT_GENCO
 // Helper macros for conditional FP8 compilation
 #ifdef MORI_FP8_TYPE_FNUZ_ENABLED
 #define MORI_FP8_FNUZ(...) __VA_ARGS__
@@ -1416,6 +1457,7 @@ INSTANTIATE_LL_KERNEL_WITH_STDMOE(EpCombineInterNodeV1KernelLowLatency)
 #undef INSTANTIATE_KERNEL
 #undef INSTANTIATE_LL_KERNEL
 #undef INSTANTIATE_LL_KERNEL_WITH_STDMOE
+#endif  // MORI_JIT_GENCO
 
 }  // namespace moe
 }  // namespace mori

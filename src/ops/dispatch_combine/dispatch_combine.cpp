@@ -22,6 +22,10 @@
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 
 #include <algorithm>
+#include <set>
+#include <string>
+#include <unordered_map>
+#include <vector>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
@@ -43,6 +47,104 @@ namespace moe {
 using namespace mori::application;
 using namespace mori::core;
 using namespace mori::shmem;
+
+// ---------------------------------------------------------------------------
+// JIT kernel module loader
+// ---------------------------------------------------------------------------
+class KernelModule {
+ public:
+  void load(const char* hsaco_path) {
+    std::string path(hsaco_path);
+    if (loaded_paths_.count(path)) return;
+
+    hipModule_t mod = nullptr;
+    hipError_t err = hipModuleLoad(&mod, hsaco_path);
+    if (err != hipSuccess) {
+      MORI_OPS_ERROR("Failed to load kernel module from %s: %d", hsaco_path, err);
+      return;
+    }
+    modules_.push_back(mod);
+    loaded_paths_.insert(path);
+    gpu_states_initialized_ = false;
+  }
+
+  void ensure_gpu_states() {
+    if (gpu_states_initialized_ || modules_.empty()) return;
+    for (auto mod : modules_) {
+      mori::shmem::ShmemModuleInit(static_cast<void*>(mod));
+    }
+    gpu_states_initialized_ = true;
+  }
+
+  bool is_loaded() const { return !modules_.empty(); }
+
+  hipFunction_t get(const std::string& name) {
+    auto it = funcs_.find(name);
+    if (it != funcs_.end()) return it->second;
+    for (auto mod : modules_) {
+      hipFunction_t func = nullptr;
+      hipError_t err = hipModuleGetFunction(&func, mod, name.c_str());
+      if (err == hipSuccess && func) {
+        funcs_[name] = func;
+        return func;
+      }
+      (void)hipGetLastError();
+    }
+    MORI_OPS_ERROR("Kernel function '%s' not found in any loaded module", name.c_str());
+    return nullptr;
+  }
+
+  ~KernelModule() {
+    for (auto mod : modules_) {
+      hipModuleUnload(mod);
+    }
+    modules_.clear();
+  }
+
+ private:
+  std::vector<hipModule_t> modules_;
+  std::set<std::string> loaded_paths_;
+  bool gpu_states_initialized_ = false;
+  std::unordered_map<std::string, hipFunction_t> funcs_;
+};
+
+static KernelModule s_jit_module;
+
+template <typename T> const char* type_suffix();
+template <> const char* type_suffix<hip_bfloat16>() { return "bf16"; }
+template <> const char* type_suffix<float>() { return "f32"; }
+template <> const char* type_suffix<mori_fp4x2_e2m1>() { return "fp4"; }
+#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
+template <> const char* type_suffix<__hip_fp8_e4m3_fnuz>() { return "fp8_fnuz"; }
+#endif
+#ifdef MORI_FP8_TYPE_OCP_ENABLED
+template <> const char* type_suffix<__hip_fp8_e4m3>() { return "fp8_ocp"; }
+#endif
+
+template <typename ArgsT>
+void jit_launch(const std::string& func_name, dim3 grid, dim3 block,
+                size_t shared_mem, hipStream_t stream, ArgsT& args) {
+  if (!s_jit_module.is_loaded()) {
+    MORI_OPS_ERROR("JIT kernel module not loaded. Call load_ops_kernels() first.");
+    assert(false && "JIT kernel module not loaded");
+    return;
+  }
+  s_jit_module.ensure_gpu_states();
+  hipFunction_t func = s_jit_module.get(func_name);
+  if (!func) {
+    MORI_OPS_ERROR("Kernel function '%s' not found", func_name.c_str());
+    assert(false && "Kernel function not found");
+    return;
+  }
+  void* params[] = {&args};
+  hipError_t err = hipModuleLaunchKernel(
+      func, grid.x, grid.y, grid.z, block.x, block.y, block.z,
+      shared_mem, stream, params, nullptr);
+  if (err != hipSuccess) {
+    MORI_OPS_ERROR("hipModuleLaunchKernel(%s) failed: %d", func_name.c_str(), err);
+    assert(false && "hipModuleLaunchKernel failed");
+  }
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                     EpDispatchCombineHandle                                    */
@@ -334,20 +436,21 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
         using DataT = typename ArgsT::data_type;
         args.config.hiddenDim = actualHiddenDim;
 
+        std::string sfx = type_suffix<DataT>();
         if (kernelType == KernelType::InterNode) {
           assert(config.useExternalInpBuffer);
-          EpDispatchInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
+          jit_launch("EpDispatchInterNodeKernel_" + sfx, grid, block, sharedMemSize, stream, args);
         } else if (kernelType == KernelType::InterNodeV1) {
-          EpDispatchCopyToStaging<<<this->multiProcessorCount, block, 0, stream>>>(args);
-          EpDispatchInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
+          jit_launch("EpDispatchCopyToStaging_" + sfx, dim3(this->multiProcessorCount), block, 0, stream, args);
+          jit_launch("EpDispatchInterNodeV1Kernel_" + sfx, grid, block, sharedMemSize, stream, args);
         } else if (kernelType == KernelType::InterNodeV1LL) {
-          EpDispatchCopyToStaging<<<this->multiProcessorCount, block, 0, stream>>>(args);
-          EpDispatchInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
+          jit_launch("EpDispatchCopyToStaging_" + sfx, dim3(this->multiProcessorCount), block, 0, stream, args);
+          jit_launch("EpDispatchInterNodeV1KernelLowLatency_" + sfx, grid, block, sharedMemSize, stream, args);
         } else if (kernelType == KernelType::IntraNode) {
-          EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
+          jit_launch("EpDispatchIntraNodeKernel_" + sfx, grid, block, sharedMemSize, stream, args);
         } else if (kernelType == KernelType::AsyncLL) {
           assert(config.useExternalInpBuffer);
-          EpDispatchLowLatencyAsyncSend<<<grid, block, sharedMemSize, stream>>>(args);
+          jit_launch("EpDispatchLowLatencyAsyncSend_" + sfx, grid, block, sharedMemSize, stream, args);
         } else {
           assert(false);
         }
@@ -371,21 +474,17 @@ void EpDispatchCombineHandle::LaunchDispatchRecv(KernelType kernelType, int bloc
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;
         using DataT = typename ArgsT::data_type;
+        std::string sfx = type_suffix<DataT>();
         if (kernelType == KernelType::AsyncLL) {
           assert(config.useExternalInpBuffer);
           assert((actualBlockNum % config.worldSize) == 0);
-          EpDispatchLowLatencyAsyncRecv<<<grid, block, sharedMemSize, stream>>>(args);
+          jit_launch("EpDispatchLowLatencyAsyncRecv_" + sfx, grid, block, sharedMemSize, stream, args);
         } else {
           assert(false);
         }
       },
       argsVariant);
 }
-// Force emission of this kernel specialization to avoid runtime missing-symbol
-// for bf16->fp8 direct-cast combine on some HIP toolchain configurations.
-template __global__ void
-EpCombineIntraNodeKernel<hip_bfloat16, /*UseP2PRead=*/false, /*EnableStdMoE=*/false,
-                         /*UseFp8DirectCast=*/true>(EpDispatchCombineArgs<hip_bfloat16> args);
 
 void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum, int rdmaBlockNum,
                                             int warpPerBlock, int useExternalInpBuf,
@@ -410,70 +509,62 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
         args.config.useExternalInpBuffer = actualUseExternalInpBuffer;
         args.config.hiddenDim = actualHiddenDim;
 
+        std::string sfx = type_suffix<DataT>();
         size_t sharedMemSize =
             actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
         if (kernelType == KernelType::InterNode) {
           assert(actualUseExternalInpBuffer);
-          EpCombineInterNodeKernel<<<grid, block, sharedMemSize, stream>>>(args);
+          jit_launch("EpCombineInterNodeKernel_" + sfx, grid, block, sharedMemSize, stream, args);
         } else if (kernelType == KernelType::InterNodeV1) {
           assert(actualUseExternalInpBuffer);
-          EpCombineSync<<<this->multiProcessorCount, block, 0, stream>>>(args);
-          EpCombineSyncBarrier<<<1, warpSize, 0, stream>>>(args);
-          EpCombineInterNodeV1Kernel<<<grid, block, sharedMemSize, stream>>>(args);
-          EpCombineAll<<<this->multiProcessorCount, block, sharedMemSize, stream>>>(args);
+          jit_launch("EpCombineSync_" + sfx, dim3(this->multiProcessorCount), block, 0, stream, args);
+          jit_launch("EpCombineSyncBarrier_" + sfx, dim3(1), dim3(warpSize), 0, stream, args);
+          jit_launch("EpCombineInterNodeV1Kernel_" + sfx, grid, block, sharedMemSize, stream, args);
+          jit_launch("EpCombineAll_" + sfx, dim3(this->multiProcessorCount), block, sharedMemSize, stream, args);
         } else if (kernelType == KernelType::InterNodeV1LL) {
           assert(actualUseExternalInpBuffer);
-          EpCombineSync<<<this->multiProcessorCount, block, 0, stream>>>(args);
-          EpCombineSyncBarrier<<<1, warpSize, 0, stream>>>(args);
-          EpCombineInterNodeV1KernelLowLatency<<<grid, block, sharedMemSize, stream>>>(args);
-          EpCombineAll<<<this->multiProcessorCount, block, sharedMemSize, stream>>>(args);
+          jit_launch("EpCombineSync_" + sfx, dim3(this->multiProcessorCount), block, 0, stream, args);
+          jit_launch("EpCombineSyncBarrier_" + sfx, dim3(1), dim3(warpSize), 0, stream, args);
+          jit_launch("EpCombineInterNodeV1KernelLowLatency_" + sfx, grid, block, sharedMemSize, stream, args);
+          jit_launch("EpCombineAll_" + sfx, dim3(this->multiProcessorCount), block, sharedMemSize, stream, args);
         } else if (kernelType == KernelType::IntraNode) {
 #ifdef ENABLE_STANDARD_MOE_ADAPT
-          // When used with convert, P2P read provides better performance
-          EpCombineIntraNodeKernel<DataT, /*UseP2PRead=*/true, /*EnableStdMoE=*/false>
-              <<<grid, block, sharedMemSize, stream>>>(args);
+          jit_launch("EpCombineIntraNodeKernel_" + sfx + "_p2p", grid, block, sharedMemSize, stream, args);
 #else
           if (actualUseExternalInpBuffer) {
-            // P2P write does not support zero-copy and provides better bandwidth and lower latency
             if constexpr (std::is_same_v<DataT, hip_bfloat16>) {
               const bool useFp8DirectCast = (config.quantType == QuantType::Fp8DirectCast);
               if (useFp8DirectCast) {
-                EpCombineIntraNodeKernel<hip_bfloat16, /*UseP2PRead=*/false,
-                                         /*EnableStdMoE=*/false, /*UseFp8DirectCast=*/true>
-                    <<<grid, block, sharedMemSize, stream>>>(args);
+                jit_launch(std::string("EpCombineIntraNodeKernel_bf16_nop2p_fp8cast"), grid, block, sharedMemSize, stream, args);
               } else {
-                EpCombineIntraNodeKernel<DataT, /*UseP2PRead=*/false>
-                    <<<grid, block, sharedMemSize, stream>>>(args);
+                jit_launch("EpCombineIntraNodeKernel_" + sfx + "_nop2p", grid, block, sharedMemSize, stream, args);
               }
             } else {
-              EpCombineIntraNodeKernel<DataT, /*UseP2PRead=*/false>
-                  <<<grid, block, sharedMemSize, stream>>>(args);
+              jit_launch("EpCombineIntraNodeKernel_" + sfx + "_nop2p", grid, block, sharedMemSize, stream, args);
             }
-          } else {  // zero-copy mode (requires P2P read)
+          } else {
             assert(config.quantType != QuantType::Fp8DirectCast &&
                    "Fp8DirectCast is not supported in zero-copy mode");
-            EpCombineIntraNodeKernel<DataT, /*UseP2PRead=*/true>
-                <<<grid, block, sharedMemSize, stream>>>(args);
+            jit_launch("EpCombineIntraNodeKernel_" + sfx + "_p2p", grid, block, sharedMemSize, stream, args);
           }
-#endif  // ENABLE_STANDARD_MOE_ADAPT
+#endif
         } else if (kernelType == KernelType::AsyncLL) {
           assert(config.useExternalInpBuffer);
           if constexpr (std::is_same_v<DataT, hip_bfloat16>) {
             const bool useFp8DirectCast = (config.quantType == QuantType::Fp8DirectCast);
             if (useFp8DirectCast) {
 #if defined(MORI_FP8_TYPE_OCP_ENABLED) || defined(MORI_FP8_TYPE_FNUZ_ENABLED)
-              EpCombineLowLatencyAsyncSend<hip_bfloat16, /*UseFp8DirectCast=*/true>
-                  <<<grid, block, sharedMemSize, stream>>>(args);
+              jit_launch(std::string("EpCombineLowLatencyAsyncSend_bf16_fp8cast"), grid, block, sharedMemSize, stream, args);
 #else
               assert(false && "Fp8DirectCast requires FP8 type support in this build");
 #endif
             } else {
-              EpCombineLowLatencyAsyncSend<<<grid, block, sharedMemSize, stream>>>(args);
+              jit_launch("EpCombineLowLatencyAsyncSend_" + sfx, grid, block, sharedMemSize, stream, args);
             }
           } else {
             assert(config.quantType != QuantType::Fp8DirectCast &&
                    "Fp8DirectCast combine only supports bf16 input for AsyncLL");
-            EpCombineLowLatencyAsyncSend<<<grid, block, sharedMemSize, stream>>>(args);
+            jit_launch("EpCombineLowLatencyAsyncSend_" + sfx, grid, block, sharedMemSize, stream, args);
           }
         } else {
           assert(false);
@@ -494,6 +585,7 @@ void EpDispatchCombineHandle::LaunchCombineRecv(KernelType kernelType, int block
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;
         using DataT = typename ArgsT::data_type;
+        std::string sfx = type_suffix<DataT>();
         size_t sharedMemSize =
             actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
         if (kernelType == KernelType::AsyncLL) {
@@ -503,18 +595,17 @@ void EpDispatchCombineHandle::LaunchCombineRecv(KernelType kernelType, int block
             const bool useFp8DirectCast = (config.quantType == QuantType::Fp8DirectCast);
             if (useFp8DirectCast) {
 #if defined(MORI_FP8_TYPE_OCP_ENABLED) || defined(MORI_FP8_TYPE_FNUZ_ENABLED)
-              EpCombineLowLatencyAsyncRecv<hip_bfloat16, /*UseFp8DirectCast=*/true>
-                  <<<grid, block, sharedMemSize, stream>>>(args);
+              jit_launch(std::string("EpCombineLowLatencyAsyncRecv_bf16_fp8cast"), grid, block, sharedMemSize, stream, args);
 #else
               assert(false && "Fp8DirectCast requires FP8 type support in this build");
 #endif
             } else {
-              EpCombineLowLatencyAsyncRecv<<<grid, block, sharedMemSize, stream>>>(args);
+              jit_launch("EpCombineLowLatencyAsyncRecv_" + sfx, grid, block, sharedMemSize, stream, args);
             }
           } else {
             assert(config.quantType != QuantType::Fp8DirectCast &&
                    "Fp8DirectCast combine only supports bf16 input for AsyncLL");
-            EpCombineLowLatencyAsyncRecv<<<grid, block, sharedMemSize, stream>>>(args);
+            jit_launch("EpCombineLowLatencyAsyncRecv_" + sfx, grid, block, sharedMemSize, stream, args);
           }
         } else {
           assert(false);
@@ -547,13 +638,12 @@ void EpDispatchCombineHandle::LaunchDispatchForStandardMoE(KernelType kernelType
           assert(false && "fp4x2 is not supported for standard MoE dispatch");
         } else {
           args.config.hiddenDim = actualHiddenDim;
+          std::string sfx = type_suffix<DataT>();
           if (kernelType == KernelType::InterNodeV1LL) {
-            EpDispatchCopyToStaging<<<this->multiProcessorCount, block, 0, stream>>>(args);
-            EpDispatchInterNodeV1KernelLowLatency<DataT, /*EnableStdMoE=*/true>
-                <<<grid, block, sharedMemSize, stream>>>(args);
+            jit_launch("EpDispatchCopyToStaging_" + sfx, dim3(this->multiProcessorCount), block, 0, stream, args);
+            jit_launch("EpDispatchInterNodeV1KernelLowLatency_" + sfx + "_stdmoe", grid, block, sharedMemSize, stream, args);
           } else if (kernelType == KernelType::IntraNode) {
-            EpDispatchIntraNodeKernel<DataT, /*EnableStdMoE=*/true>
-                <<<grid, block, sharedMemSize, stream>>>(args);
+            jit_launch("EpDispatchIntraNodeKernel_" + sfx + "_stdmoe", grid, block, sharedMemSize, stream, args);
           } else {
             assert(false &&
                    "LaunchDispatchForStandardMoE only supports IntraNode/InterNodeV1LL kernel type");
@@ -582,17 +672,16 @@ void EpDispatchCombineHandle::LaunchCombineForStandardMoE(KernelType kernelType,
           assert(false && "fp4x2 is not supported for standard MoE combine");
         } else {
           args.config.hiddenDim = actualHiddenDim;
+          std::string sfx = type_suffix<DataT>();
           size_t sharedMemSize =
               actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
           if (kernelType == KernelType::InterNodeV1LL) {
-            EpCombineSync<<<this->multiProcessorCount, block, 0, stream>>>(args);
-            EpCombineSyncBarrier<<<1, warpSize, 0, stream>>>(args);
-            EpCombineInterNodeV1KernelLowLatency<DataT, /*EnableStdMoE=*/true>
-                <<<grid, block, sharedMemSize, stream>>>(args);
-            EpCombineAll<<<this->multiProcessorCount, block, sharedMemSize, stream>>>(args);
+            jit_launch("EpCombineSync_" + sfx, dim3(this->multiProcessorCount), block, 0, stream, args);
+            jit_launch("EpCombineSyncBarrier_" + sfx, dim3(1), dim3(warpSize), 0, stream, args);
+            jit_launch("EpCombineInterNodeV1KernelLowLatency_" + sfx + "_stdmoe", grid, block, sharedMemSize, stream, args);
+            jit_launch("EpCombineAll_" + sfx, dim3(this->multiProcessorCount), block, sharedMemSize, stream, args);
           } else if (kernelType == KernelType::IntraNode) {
-            EpCombineIntraNodeKernel<DataT, /*UseP2PRead=*/true, /*EnableStdMoE=*/true>
-                <<<grid, block, sharedMemSize, stream>>>(args);
+            jit_launch("EpCombineIntraNodeKernel_" + sfx + "_p2p_stdmoe", grid, block, sharedMemSize, stream, args);
           } else {
             assert(false &&
                    "LaunchCombineForStandardMoE only supports IntraNode/InterNodeV1LL kernel type");
@@ -604,8 +693,12 @@ void EpDispatchCombineHandle::LaunchCombineForStandardMoE(KernelType kernelType,
 #endif  // ENABLE_STANDARD_MOE_ADAPT
 
 #ifdef ENABLE_STANDARD_MOE_ADAPT
-__global__ void ConvertDispatchOutputKernel(ConvertDispatchOutputArgs args) {
+__device__ void ConvertDispatchOutputKernel_body(ConvertDispatchOutputArgs args) {
   ConvertDispatchOutputDevice(args);
+}
+
+__global__ void ConvertDispatchOutputKernel(ConvertDispatchOutputArgs args) {
+  ConvertDispatchOutputKernel_body(args);
 }
 
 void EpDispatchCombineHandle::LaunchConvertDispatchOutputKernel(
@@ -632,7 +725,7 @@ void EpDispatchCombineHandle::LaunchConvertDispatchOutputKernel(
   args.dispTokToEpSlotMap = dispTokToEpSlotMap;
   args.dispatchGridBarrier = dispatchGridBarrier;
 
-  ConvertDispatchOutputKernel<<<grid, block, 0, stream>>>(args);
+  jit_launch(std::string("mori_ConvertDispatchOutputKernel"), grid, block, 0, stream, args);
 }
 
 void EpDispatchCombineHandle::LaunchConvertCombineInputKernel(
@@ -662,19 +755,19 @@ void EpDispatchCombineHandle::LaunchConvertCombineInputKernel(
 
   switch (inputType) {
     case HIP_R_32F:
-      ConvertCombineInputKernel<float><<<grid, block, 0, stream>>>(args);
+      jit_launch(std::string("ConvertCombineInputKernel_f32"), grid, block, 0, stream, args);
       break;
     case HIP_R_16BF:
-      ConvertCombineInputKernel<hip_bfloat16><<<grid, block, 0, stream>>>(args);
+      jit_launch(std::string("ConvertCombineInputKernel_bf16"), grid, block, 0, stream, args);
       break;
 #ifdef MORI_FP8_TYPE_OCP_ENABLED
     case HIP_R_8F_E4M3:
-      ConvertCombineInputKernel<__hip_fp8_e4m3><<<grid, block, 0, stream>>>(args);
+      jit_launch(std::string("ConvertCombineInputKernel_fp8_ocp"), grid, block, 0, stream, args);
       break;
 #endif
 #ifdef MORI_FP8_TYPE_FNUZ_ENABLED
     case HIP_R_8F_E4M3_FNUZ:
-      ConvertCombineInputKernel<__hip_fp8_e4m3_fnuz><<<grid, block, 0, stream>>>(args);
+      jit_launch(std::string("ConvertCombineInputKernel_fp8_fnuz"), grid, block, 0, stream, args);
       break;
 #endif
     default:
@@ -686,6 +779,10 @@ void EpDispatchCombineHandle::LaunchConvertCombineInputKernel(
 
 // no need for a separate reset kernel now
 void EpDispatchCombineHandle::LaunchReset(hipStream_t stream) {}
+
+void LoadJitKernelModule(const char* hsaco_path) {
+  s_jit_module.load(hsaco_path);
+}
 
 }  // namespace moe
 }  // namespace mori

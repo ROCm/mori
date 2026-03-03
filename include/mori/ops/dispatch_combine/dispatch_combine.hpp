@@ -477,6 +477,8 @@ inline EpDispatchCombineArgsVariant GetEpDispatchCombineArgsByInputType(
   }
 }
 
+void LoadJitKernelModule(const char* hsaco_path);
+
 }  // namespace moe
 }  // namespace mori
 

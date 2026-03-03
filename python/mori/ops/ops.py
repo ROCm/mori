@@ -19,10 +19,23 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-from mori import cpp as mori_cpp
-
 import torch
 
 
 def cast(input: torch.Tensor, output: torch.Tensor):
-    mori_cpp.cast(input, output)
+    """Cast input tensor to output tensor dtype using JIT-compiled kernel.
+
+    Currently supports: float32 -> fp4_e2m1.
+    """
+    from mori.ops.cast_jit import cast_float_to_fp4
+
+    assert input.is_cuda and output.is_cuda, "Both tensors must be on GPU"
+    assert input.is_contiguous() and output.is_contiguous(), "Tensors must be contiguous"
+
+    stream = torch.cuda.current_stream().cuda_stream
+    cast_float_to_fp4(
+        input.data_ptr(),
+        output.data_ptr(),
+        input.numel(),
+        stream,
+    )
