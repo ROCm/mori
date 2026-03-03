@@ -111,10 +111,52 @@ def find_mpi_include() -> str | None:
     return None
 
 
+_DRIVER_TO_NIC = {
+    "bnxt_re": "bnxt",
+    "bnxt_en": "bnxt",
+    "mlx5_core": "mlx5",
+    "mlx5_ib": "mlx5",
+    "ionic_rdma": "ionic",
+    "ionic": "ionic",
+}
+
+_NIC_PCI_VENDORS = {
+    "14e4": "bnxt",   # Broadcom BCM576xx / BCM578xx
+    "1dd8": "ionic",  # AMD/Pensando
+    "15b3": "mlx5",   # Mellanox/NVIDIA ConnectX
+}
+
+_LIB_SEARCH_PATHS = [
+    "/usr/local/lib", "/usr/lib", "/usr/lib/x86_64-linux-gnu",
+    "/lib/x86_64-linux-gnu",
+]
+
+
+def _classify_ib_device(dev_path: str) -> str | None:
+    """Identify the NIC type for a single /sys/class/infiniband/<dev> entry.
+
+    Reads the kernel driver symlink which works regardless of device naming
+    convention (bnxt_re_0, rdma0, etc.).
+    """
+    driver_link = os.path.join(dev_path, "device", "driver")
+    try:
+        driver_name = os.path.basename(os.readlink(driver_link))
+        return _DRIVER_TO_NIC.get(driver_name)
+    except OSError:
+        return None
+
+
 def detect_nic_type() -> str:
     """Detect the RDMA NIC type on the current machine.
 
-    Returns ``"bnxt"``, ``"ionic"``, or ``"mlx5"`` (default).
+    Detection priority:
+      1. Environment variable (USE_BNXT=ON or USE_IONIC=ON)
+      2. /sys/class/infiniband/ — device name prefix, then driver symlink
+      3. lspci PCI vendor ID
+      4. User-space library fallback (libbnxt_re.so / libionic.so)
+      5. Default: mlx5
+
+    Returns ``"bnxt"``, ``"ionic"``, or ``"mlx5"``.
     """
     env_bnxt = os.environ.get("USE_BNXT", "").upper()
     env_ionic = os.environ.get("USE_IONIC", "").upper()
@@ -127,15 +169,53 @@ def detect_nic_type() -> str:
     if os.path.isdir(ib_dir):
         try:
             devices = os.listdir(ib_dir)
-            bnxt_count = sum(1 for d in devices if d.startswith("bnxt_re"))
-            ionic_count = sum(1 for d in devices if d.startswith("ionic"))
-            mlx5_count = sum(1 for d in devices if d.startswith("mlx5"))
-            if bnxt_count > 0 and bnxt_count >= mlx5_count:
+            counts: dict[str, int] = {"bnxt": 0, "ionic": 0, "mlx5": 0}
+
+            for dev in devices:
+                if dev.startswith("bnxt_re"):
+                    counts["bnxt"] += 1
+                elif dev.startswith("ionic"):
+                    counts["ionic"] += 1
+                elif dev.startswith("mlx5"):
+                    counts["mlx5"] += 1
+                else:
+                    nic = _classify_ib_device(os.path.join(ib_dir, dev))
+                    if nic and nic in counts:
+                        counts[nic] += 1
+
+            if counts["bnxt"] > 0 and counts["bnxt"] >= counts["mlx5"]:
                 return "bnxt"
-            if ionic_count > 0 and ionic_count >= mlx5_count:
+            if counts["ionic"] > 0 and counts["ionic"] >= counts["mlx5"]:
                 return "ionic"
+            if counts["mlx5"] > 0:
+                return "mlx5"
         except OSError:
             pass
+
+    try:
+        lspci_out = subprocess.check_output(
+            ["lspci", "-nn", "-d", "::0200"],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+        vendor_counts: dict[str, int] = {}
+        for line in lspci_out.strip().split("\n"):
+            for vid, nic in _NIC_PCI_VENDORS.items():
+                if vid in line:
+                    vendor_counts[nic] = vendor_counts.get(nic, 0) + 1
+        if vendor_counts:
+            return max(vendor_counts, key=vendor_counts.get)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+    _NIC_LIBS = [
+        ("libbnxt_re.so", "bnxt"),
+        ("libionic.so", "ionic"),
+        ("libmlx5.so", "mlx5"),
+    ]
+    for lib_name, nic in _NIC_LIBS:
+        for d in _LIB_SEARCH_PATHS:
+            if os.path.exists(os.path.join(d, lib_name)):
+                return nic
 
     return "mlx5"
 

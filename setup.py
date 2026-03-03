@@ -102,25 +102,46 @@ def _detect_nic_type() -> dict:
         return result
 
     # 2. Active RDMA devices (most accurate — only shows devices with loaded drivers)
-    # Device name prefix directly maps to driver: bnxt_re_*, mlx5_*, ionic_rdma_*
+    # First try device name prefix (bnxt_re_*, mlx5_*, ionic_*), then fall back
+    # to reading the kernel driver symlink for generically-named devices (rdma0, etc.).
+    _driver_to_nic = {
+        "bnxt_re": "BNXT", "bnxt_en": "BNXT",
+        "mlx5_core": "MLX5", "mlx5_ib": "MLX5",
+        "ionic_rdma": "IONIC", "ionic": "IONIC",
+    }
     ib_dir = "/sys/class/infiniband"
     if os.path.isdir(ib_dir):
         try:
             devices = os.listdir(ib_dir)
-            bnxt_count = sum(1 for d in devices if d.startswith("bnxt_re"))
-            ionic_count = sum(1 for d in devices if d.startswith("ionic"))
-            mlx5_count = sum(1 for d in devices if d.startswith("mlx5"))
+            counts = {"BNXT": 0, "IONIC": 0, "MLX5": 0}
 
-            if bnxt_count > 0 and bnxt_count >= mlx5_count:
+            for dev in devices:
+                if dev.startswith("bnxt_re"):
+                    counts["BNXT"] += 1
+                elif dev.startswith("ionic"):
+                    counts["IONIC"] += 1
+                elif dev.startswith("mlx5"):
+                    counts["MLX5"] += 1
+                else:
+                    driver_link = os.path.join(ib_dir, dev, "device", "driver")
+                    try:
+                        driver_name = os.path.basename(os.readlink(driver_link))
+                        nic = _driver_to_nic.get(driver_name)
+                        if nic:
+                            counts[nic] += 1
+                    except OSError:
+                        pass
+
+            if counts["BNXT"] > 0 and counts["BNXT"] >= counts["MLX5"]:
                 result["USE_BNXT"] = "ON"
-                print(f"[mori] Found {bnxt_count} BNXT RDMA device(s) in /sys/class/infiniband/")
+                print(f"[mori] Found {counts['BNXT']} BNXT RDMA device(s) in /sys/class/infiniband/")
                 return result
-            if ionic_count > 0 and ionic_count >= mlx5_count:
+            if counts["IONIC"] > 0 and counts["IONIC"] >= counts["MLX5"]:
                 result["USE_IONIC"] = "ON"
-                print(f"[mori] Found {ionic_count} IONIC RDMA device(s) in /sys/class/infiniband/")
+                print(f"[mori] Found {counts['IONIC']} IONIC RDMA device(s) in /sys/class/infiniband/")
                 return result
-            if mlx5_count > 0:
-                print(f"[mori] Found {mlx5_count} MLX5 RDMA device(s) in /sys/class/infiniband/")
+            if counts["MLX5"] > 0:
+                print(f"[mori] Found {counts['MLX5']} MLX5 RDMA device(s) in /sys/class/infiniband/")
                 return result
         except OSError:
             pass
@@ -129,6 +150,7 @@ def _detect_nic_type() -> dict:
     _NIC_PCI_VENDORS = {
         "14e4": "BNXT",   # Broadcom BCM576xx / BCM578xx
         "1dd8": "IONIC",  # AMD/Pensando
+        "15b3": "MLX5",   # Mellanox/NVIDIA ConnectX
     }
     try:
         lspci_out = subprocess.check_output(
@@ -155,15 +177,20 @@ def _detect_nic_type() -> dict:
     # 4. Library file fallback
     _LIB_SEARCH_PATHS = ["/usr/local/lib", "/usr/lib", "/usr/lib/x86_64-linux-gnu",
                          "/lib/x86_64-linux-gnu"]
+    _NIC_LIBS = [
+        ("libbnxt_re.so", "USE_BNXT"),
+        ("libionic.so", "USE_IONIC"),
+    ]
+    for lib_name, flag in _NIC_LIBS:
+        for d in _LIB_SEARCH_PATHS:
+            if os.path.exists(os.path.join(d, lib_name)):
+                result[flag] = "ON"
+                print(f"[mori] Found {lib_name} in {d}")
+                return result
+
     for d in _LIB_SEARCH_PATHS:
-        if os.path.exists(os.path.join(d, "libbnxt_re.so")):
-            result["USE_BNXT"] = "ON"
-            print(f"[mori] Found libbnxt_re.so in {d}")
-            return result
-    for d in _LIB_SEARCH_PATHS:
-        if os.path.exists(os.path.join(d, "libionic.so")):
-            result["USE_IONIC"] = "ON"
-            print(f"[mori] Found libionic.so in {d}")
+        if os.path.exists(os.path.join(d, "libmlx5.so")):
+            print(f"[mori] Found libmlx5.so in {d}")
             return result
 
     # 5. Default: MLX5
