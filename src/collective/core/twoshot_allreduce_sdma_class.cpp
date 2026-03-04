@@ -307,54 +307,14 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
             return false;
         }
 
-        size_t total_bytes = total_count * dtype_size_;
-        const size_t P2P_SDMA_THRESHOLD = 64 * 1024 * 1024;  // 64MB
-
-        int async_blocks = std::min(64, max_blocks_);
-
-        #if 0
-        if (total_bytes <= P2P_SDMA_THRESHOLD) {
-            // ---- P2P path: better for data <= 64MB ----
-            size_t required_input_size = total_bytes;
-            if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
-                                    input_transit_buffer_size_, input_transit_buffer_obj_,
-                                    required_input_size, "input transit buffer")) {
-                async_in_progress_ = false;
-                return false;
-            }
-
-            copy_input_to_transit(input, total_count, stream);
-
-            ReduceScatterP2pKernel<T><<<async_blocks, 640, 0, stream>>>(
-                myPe_, npes_,
-                input_transit_buffer_obj_,
-                output_transit_buffer_obj_,
-                total_count);
-        } else {
-            // ---- SDMA path: better for data > 64MB ----
-            ReduceScatterSdmaPutKernel<T><<<1, 512, 0, stream>>>(
-                myPe_, npes_, input, output_transit_buffer_obj_, elementCountPerRank);
-
-            TwoShotAllReduceSdmaAsyncWaitKernel<<<1, 64, 0, stream>>>(
-                myPe_, npes_, output_transit_buffer_obj_, flagsObj_);
-
-            ReduceScatterLocalReduceKernel<T><<<async_blocks, 640, 0, stream>>>(
-                static_cast<T*>(output_transit_buffer_), input,
-                elementCountPerRank, myPe_, npes_);
-        }
-
-
-        #endif
-
-        // SdmaReduceScatterKernel: SDMA scatter + wait + local reduce in one kernel
-        // Use same block/thread config as operator() for consistency
+        // Fused kernel: scatter + wait + reduce + AllGather PUT — single launch
         constexpr int pack_size = packed_t<T>::P::size;
         int rs_threads = 512;
         int rs_packed = static_cast<int>((total_count / npes_ + pack_size - 1) / pack_size);
         int rs_blocks = std::min(max_blocks_, (rs_packed + rs_threads - 1) / rs_threads);
         if (rs_blocks < 1) rs_blocks = 1;
 
-        SdmaReduceScatterKernel<T><<<rs_blocks, rs_threads, 0, stream>>>(
+        ReduceScatterAllGatherFusedKernel<T><<<rs_blocks, rs_threads, 0, stream>>>(
             myPe_, npes_,
             input,
             output_transit_buffer_obj_,
@@ -362,9 +322,6 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
             barrierPtr_,
             total_count);
 
-        // AllGather PUT — send reduced shard to all PEs
-        AllGatherReducedSdmaPutKernel<T><<<1, 64, 0, stream>>>(
-            myPe_, npes_, output_transit_buffer_obj_, elementCountPerRank);
         hipError_t kernel_err = hipGetLastError();
         if (kernel_err != hipSuccess) {
             fprintf(stderr, "PE %d: Async kernel launch failed: %s\n",
