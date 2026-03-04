@@ -136,7 +136,8 @@ __device__ __forceinline__ __half reduce_add(__half a, __half b) { return __hadd
 #endif
 
 template <typename T>
-__global__ void ReduceScatterLocalReduceKernel(T* gathered, size_t elementCountPerRank,
+__global__ void ReduceScatterLocalReduceKernel(T* gathered, const T* input,
+                                               size_t elementCountPerRank,
                                                int myPe, int npes) {
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
@@ -145,6 +146,15 @@ __global__ void ReduceScatterLocalReduceKernel(T* gathered, size_t elementCountP
 
   T* myDst = gathered + static_cast<size_t>(myPe) * elementCountPerRank;
 
+  // L2 coherence fix: SDMA scatter bypasses L2, but the previous reduce left
+  // stale data in L2 for slot[myPe]. Overwrite slot[myPe] from the original
+  // input via CU stores to force L2 to match HBM for subsequent reads.
+  const T* inputSlot = input + static_cast<size_t>(myPe) * elementCountPerRank;
+  for (size_t i = threadLinearId; i < elementCountPerRank; i += threadsPerGrid) {
+    myDst[i] = inputSlot[i];
+  }
+
+  // Local reduce: sum all npes copies of my shard
   for (size_t i = threadLinearId; i < elementCountPerRank; i += threadsPerGrid) {
     T sum = gathered[i];
     for (int pe = 1; pe < npes; pe++) {
@@ -152,6 +162,15 @@ __global__ void ReduceScatterLocalReduceKernel(T* gathered, size_t elementCountP
     }
     myDst[i] = sum;
   }
+
+  // Flush L2 dirty lines to HBM so AllGather SDMA reads see fresh data.
+  // CU reduce writes land in L2 (write-back); SDMA reads bypass L2.
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    asm volatile("buffer_wbl2" ::: "memory");
+  }
+#endif
 }
 
 // ============================================================
@@ -205,6 +224,14 @@ __global__ void ReduceScatterP2pKernel(int myPe, int npes,
     }
     myDst[idx] = downcast_v<typename P::type, pack_size>(add_reg);
   }
+
+  // Flush L2 dirty lines to HBM so AllGather SDMA reads see fresh data.
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    asm volatile("buffer_wbl2" ::: "memory");
+  }
+#endif
 }
 
 // ============================================================

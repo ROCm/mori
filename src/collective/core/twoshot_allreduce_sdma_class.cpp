@@ -310,6 +310,8 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
         size_t total_bytes = total_count * dtype_size_;
         const size_t P2P_SDMA_THRESHOLD = 64 * 1024 * 1024;  // 64MB
 
+        int async_blocks = std::min(64, max_blocks_);
+
         if (total_bytes <= P2P_SDMA_THRESHOLD) {
             // ---- P2P path: better for data <= 64MB ----
             size_t required_input_size = total_bytes;
@@ -322,13 +324,7 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
 
             copy_input_to_transit(input, total_count, stream);
 
-            constexpr int pack_size = packed_t<T>::P::size;
-            int packedPerRank = static_cast<int>(elementCountPerRank / pack_size);
-            int reduce_threads = 512;
-            int reduce_blocks = std::min(80, (packedPerRank + reduce_threads - 1) / reduce_threads);
-            if (reduce_blocks < 1) reduce_blocks = 1;
-
-            ReduceScatterP2pKernel<T><<<reduce_blocks, reduce_threads, 0, stream>>>(
+            ReduceScatterP2pKernel<T><<<async_blocks, 640, 0, stream>>>(
                 myPe_, npes_,
                 input_transit_buffer_obj_,
                 output_transit_buffer_obj_,
@@ -341,18 +337,13 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
             TwoShotAllReduceSdmaAsyncWaitKernel<<<1, 64, 0, stream>>>(
                 myPe_, npes_, output_transit_buffer_obj_, flagsObj_);
 
-            int sdma_reduce_block_size = 256;
-            int sdma_reduce_grid_size = static_cast<int>(
-                std::min(static_cast<size_t>((elementCountPerRank + sdma_reduce_block_size - 1) / sdma_reduce_block_size),
-                         static_cast<size_t>(65535)));
-            if (sdma_reduce_grid_size < 1) sdma_reduce_grid_size = 1;
-
-            ReduceScatterLocalReduceKernel<T><<<sdma_reduce_grid_size, sdma_reduce_block_size, 0, stream>>>(
-                static_cast<T*>(output_transit_buffer_), elementCountPerRank, myPe_, npes_);
+            ReduceScatterLocalReduceKernel<T><<<async_blocks, 640, 0, stream>>>(
+                static_cast<T*>(output_transit_buffer_), input,
+                elementCountPerRank, myPe_, npes_);
         }
 
         // AllGather PUT — shared by both paths
-        AllGatherReducedSdmaPutKernel<T><<<1, 512, 0, stream>>>(
+        AllGatherReducedSdmaPutKernel<T><<<1, 64 0, stream>>>(
             myPe_, npes_, output_transit_buffer_obj_, elementCountPerRank);
 
         hipError_t kernel_err = hipGetLastError();
