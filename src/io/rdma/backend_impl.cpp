@@ -197,11 +197,13 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
   // enabled. MORI_IO_QP_MAX_RECV_WR can override this baseline when provided.
   epConfig.maxRecvWr = desiredRecvWr > 0 ? std::min(desiredRecvWr, maxQpWr) : 0;
   epConfig.maxCqeNum = std::min(desiredCqe, maxCqe);
-  if (epConfig.maxRecvWr > 0 && epConfig.maxCqeNum < epConfig.maxRecvWr) {
+  uint32_t minRequiredCqe = epConfig.maxMsgsNum + epConfig.maxRecvWr;
+  if (epConfig.maxCqeNum < minRequiredCqe) {
+    uint32_t newCqeNum = std::min(minRequiredCqe, maxCqe);
     MORI_IO_WARN(
-        "maxCqeNum ({}) is smaller than required maxRecvWr ({}); increasing maxCqeNum to {}",
-        epConfig.maxCqeNum, epConfig.maxRecvWr, epConfig.maxRecvWr);
-    epConfig.maxCqeNum = epConfig.maxRecvWr;
+        "maxCqeNum ({}) is smaller than SQ+RQ depth ({}+{}={}); increasing maxCqeNum to {}",
+        epConfig.maxCqeNum, epConfig.maxMsgsNum, epConfig.maxRecvWr, minRequiredCqe, newCqeNum);
+    epConfig.maxCqeNum = newCqeNum;
   }
   if (desiredMsgSge.has_value()) {
     epConfig.maxMsgSge = std::min(*desiredMsgSge, maxSge);
