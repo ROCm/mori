@@ -29,10 +29,26 @@ ClientRegistry::ClientRegistry(const ClientRegistryConfig& config) : config_(con
 
 ClientRegistry::~ClientRegistry() { StopReaper(); }
 
-void ClientRegistry::RegisterClient(const std::string& client_id, const std::string& node_address,
+bool ClientRegistry::RegisterClient(const std::string& client_id, const std::string& node_address,
                                     const std::map<TierType, TierCapacity>& tier_capacities) {
   std::unique_lock lock(mutex_);
   auto now = std::chrono::steady_clock::now();
+
+  auto it = clients_.find(client_id);
+  if (it != clients_.end()) {
+    const bool is_expired = (now - it->second.last_heartbeat > ExpiryDuration()) ||
+                            (it->second.status == ClientStatus::EXPIRED);
+
+    if (it->second.status == ClientStatus::ALIVE && !is_expired) {
+      spdlog::warn("[Registry] Rejecting re-registration for alive client: {}", client_id);
+      return false;
+    }
+
+    it->second.status = ClientStatus::EXPIRED;
+    // Expired client can re-register. Clean old ownership state before overwrite.
+    client_keys_.erase(client_id);
+    spdlog::info("[Registry] Re-registering expired client: {}", client_id);
+  }
 
   ClientRecord record;
   record.client_id = client_id;
@@ -46,6 +62,7 @@ void ClientRegistry::RegisterClient(const std::string& client_id, const std::str
   client_keys_[client_id];  // ensure entry exists (empty set)
 
   spdlog::info("[Registry] Registered client: {} at {}", client_id, node_address);
+  return true;
 }
 
 size_t ClientRegistry::UnregisterClient(const std::string& client_id) {

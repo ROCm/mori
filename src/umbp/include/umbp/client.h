@@ -21,6 +21,8 @@
 // SOFTWARE.
 #pragma once
 
+#include <grpcpp/support/status.h>
+
 #include <atomic>
 #include <condition_variable>
 #include <memory>
@@ -53,8 +55,8 @@ class UMBPClient {
 
   // --- Client lifecycle ---
   // Register with master. If auto_heartbeat, starts heartbeat thread.
-  void RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities);
-  void UnregisterSelf();
+  grpc::Status RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities);
+  grpc::Status UnregisterSelf();
 
   // --- Heartbeat ---
   void StartHeartbeat();

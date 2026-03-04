@@ -50,7 +50,12 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       caps[static_cast<TierType>(tc.tier())] = c;
     }
 
-    registry_.RegisterClient(request->client_id(), request->node_address(), caps);
+    const bool registered =
+        registry_.RegisterClient(request->client_id(), request->node_address(), caps);
+    if (!registered) {
+      return grpc::Status(grpc::StatusCode::ALREADY_EXISTS,
+                          "client is already alive and cannot be re-registered");
+    }
 
     // Recommend heartbeat at half the TTL
     auto interval_ms = static_cast<uint64_t>(config_.heartbeat_ttl.count() * 1000) / 2;

@@ -24,6 +24,8 @@
 #include <grpcpp/grpcpp.h>
 #include <spdlog/spdlog.h>
 
+#include <system_error>
+
 #include "umbp.grpc.pb.h"
 
 namespace mori::umbp {
@@ -48,7 +50,11 @@ UMBPClient::~UMBPClient() {
   }
 }
 
-void UMBPClient::RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities) {
+grpc::Status UMBPClient::RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities) {
+  if (registered_) {
+    return grpc::Status(grpc::StatusCode::ALREADY_EXISTS, "client is already registered");
+  }
+
   ::umbp::RegisterClientRequest req;
   req.set_client_id(config_.client_id);
   req.set_node_address(config_.node_address);
@@ -65,7 +71,7 @@ void UMBPClient::RegisterSelf(const std::map<TierType, TierCapacity>& tier_capac
 
   if (!status.ok()) {
     spdlog::error("[Client] RegisterClient failed: {}", status.error_message());
-    return;
+    return status;
   }
 
   heartbeat_interval_ms_ = resp.heartbeat_interval_ms();
@@ -81,9 +87,15 @@ void UMBPClient::RegisterSelf(const std::map<TierType, TierCapacity>& tier_capac
   if (config_.auto_heartbeat) {
     StartHeartbeat();
   }
+
+  return grpc::Status::OK;
 }
 
-void UMBPClient::UnregisterSelf() {
+grpc::Status UMBPClient::UnregisterSelf() {
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "client is not registered");
+  }
+
   StopHeartbeat();
 
   ::umbp::UnregisterClientRequest req;
@@ -99,26 +111,42 @@ void UMBPClient::UnregisterSelf() {
     spdlog::error("[Client] UnregisterClient failed: {}", status.error_message());
   }
   registered_ = false;
+  return status;
 }
 
 void UMBPClient::StartHeartbeat() {
+  if (!registered_) {
+    spdlog::warn("[Client] StartHeartbeat ignored: not registered");
+    return;
+  }
+
   if (heartbeat_running_) {
     return;
   }
+
   heartbeat_running_ = true;
-  heartbeat_thread_ = std::thread(&UMBPClient::HeartbeatLoop, this);
+  try {
+    heartbeat_thread_ = std::thread(&UMBPClient::HeartbeatLoop, this);
+  } catch (const std::system_error& e) {
+    heartbeat_running_ = false;
+    spdlog::error("[Client] Failed to start heartbeat thread: {}", e.what());
+    return;
+  }
+
   spdlog::info("[Client] Heartbeat thread started (interval={}ms)", heartbeat_interval_ms_);
 }
 
 void UMBPClient::StopHeartbeat() {
-  if (heartbeat_running_) {
-    heartbeat_running_ = false;
-    hb_cv_.notify_one();
-    if (heartbeat_thread_.joinable()) {
-      heartbeat_thread_.join();
-    }
-    spdlog::info("[Client] Heartbeat thread stopped");
+  if (!heartbeat_running_) {
+    return;
   }
+
+  heartbeat_running_ = false;
+  hb_cv_.notify_one();
+  if (heartbeat_thread_.joinable()) {
+    heartbeat_thread_.join();
+  }
+  spdlog::info("[Client] Heartbeat thread stopped");
 }
 
 void UMBPClient::HeartbeatLoop() {
