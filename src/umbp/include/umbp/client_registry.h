@@ -36,6 +36,8 @@
 
 namespace mori::umbp {
 
+class BlockIndex;
+
 struct ClientRegistryConfig {
   std::chrono::seconds heartbeat_ttl{10};
   std::chrono::seconds reaper_interval{5};
@@ -45,32 +47,35 @@ struct ClientRegistryConfig {
 class ClientRegistry {
  public:
   explicit ClientRegistry(const ClientRegistryConfig& config);
+  ClientRegistry(const ClientRegistryConfig& config, BlockIndex& index);
   ~ClientRegistry();
 
   ClientRegistry(const ClientRegistry&) = delete;
   ClientRegistry& operator=(const ClientRegistry&) = delete;
 
+  void SetBlockIndex(BlockIndex* index);
+
   // --- Client lifecycle ---
-  // Returns false when a live client with the same id already exists.
-  // Returns true for new registrations or re-registration of expired clients.
-  bool RegisterClient(const std::string& client_id, const std::string& node_address,
+  // Returns false when a live node with the same id already exists.
+  // Returns true for new registrations or re-registration of expired nodes.
+  bool RegisterClient(const std::string& node_id, const std::string& node_address,
                       const std::map<TierType, TierCapacity>& tier_capacities);
 
   // Gracefully unregister. Returns number of block keys cleaned up.
-  size_t UnregisterClient(const std::string& client_id);
+  size_t UnregisterClient(const std::string& node_id);
 
   // Process heartbeat. Updates last_heartbeat and tier capacities.
-  // Returns CLIENT_STATUS_UNKNOWN if client is not registered.
+  // Returns CLIENT_STATUS_UNKNOWN if node is not registered.
   // PA-3 fix: uses exclusive lock since it mutates record fields.
-  ClientStatus Heartbeat(const std::string& client_id,
+  ClientStatus Heartbeat(const std::string& node_id,
                          const std::map<TierType, TierCapacity>& tier_capacities);
 
-  // --- Ownership tracking stubs (for future BlockIndex integration) ---
-  void TrackKey(const std::string& client_id, const std::string& key);
-  void UntrackKey(const std::string& client_id, const std::string& key);
+  // --- Ownership tracking (called by BlockIndex) ---
+  void TrackKey(const std::string& node_id, const std::string& key);
+  void UntrackKey(const std::string& node_id, const std::string& key);
 
   // --- Queries ---
-  bool IsClientAlive(const std::string& client_id) const;
+  bool IsClientAlive(const std::string& node_id) const;
   size_t ClientCount() const;
 
   // Returns all clients with status == ALIVE. Used by Router for RoutePut.
@@ -82,6 +87,7 @@ class ClientRegistry {
 
  private:
   ClientRegistryConfig config_;
+  BlockIndex* index_ = nullptr;
 
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, ClientRecord> clients_;

@@ -30,13 +30,23 @@
 
 namespace mori::umbp {
 
+static Location ToLocation(const ::umbp::Location& proto_location) {
+  Location location;
+  location.node_id = proto_location.node_id();
+  location.location_id = proto_location.location_id();
+  location.size = proto_location.size();
+  location.tier = static_cast<TierType>(proto_location.tier());
+  return location;
+}
+
 // ---------------------------------------------------------------------------
 //  gRPC service implementation
 // ---------------------------------------------------------------------------
 class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Service {
  public:
-  UMBPMasterServiceImpl(ClientRegistry& registry, const ClientRegistryConfig& config)
-      : registry_(registry), config_(config) {}
+  UMBPMasterServiceImpl(ClientRegistry& registry, BlockIndex& index,
+                        const ClientRegistryConfig& config)
+      : registry_(registry), index_(index), config_(config) {}
 
   grpc::Status RegisterClient(grpc::ServerContext* /*context*/,
                               const ::umbp::RegisterClientRequest* request,
@@ -51,10 +61,10 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     }
 
     const bool registered =
-        registry_.RegisterClient(request->client_id(), request->node_address(), caps);
+        registry_.RegisterClient(request->node_id(), request->node_address(), caps);
     if (!registered) {
       return grpc::Status(grpc::StatusCode::ALREADY_EXISTS,
-                          "client is already alive and cannot be re-registered");
+                          "node is already alive and cannot be re-registered");
     }
 
     // Recommend heartbeat at half the TTL
@@ -67,7 +77,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   grpc::Status UnregisterClient(grpc::ServerContext* /*context*/,
                                 const ::umbp::UnregisterClientRequest* request,
                                 ::umbp::UnregisterClientResponse* response) override {
-    size_t removed = registry_.UnregisterClient(request->client_id());
+    size_t removed = registry_.UnregisterClient(request->node_id());
     response->set_keys_removed(static_cast<uint32_t>(removed));
     return grpc::Status::OK;
   }
@@ -82,17 +92,72 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       caps[static_cast<TierType>(tc.tier())] = c;
     }
 
-    ClientStatus status = registry_.Heartbeat(request->client_id(), caps);
+    ClientStatus status = registry_.Heartbeat(request->node_id(), caps);
     response->set_status(static_cast<::umbp::ClientStatus>(status));
 
-    spdlog::info("[Master] Heartbeat received: client_id={}, tiers={}, status={}",
-                 request->client_id(), request->tier_capacities_size(), ClientStatusName(status));
+    spdlog::info("[Master] Heartbeat received: node_id={}, tiers={}, status={}", request->node_id(),
+                 request->tier_capacities_size(), ClientStatusName(status));
 
+    return grpc::Status::OK;
+  }
+
+  grpc::Status Register(grpc::ServerContext* /*context*/, const ::umbp::RegisterRequest* request,
+                        ::umbp::RegisterResponse* /*response*/) override {
+    if (request->node_id().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id cannot be empty");
+    }
+    if (request->key().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "key cannot be empty");
+    }
+    if (!registry_.IsClientAlive(request->node_id())) {
+      return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "node is not registered/alive");
+    }
+
+    Location location = ToLocation(request->location());
+    if (location.node_id.empty()) {
+      location.node_id = request->node_id();
+    }
+    if (location.node_id != request->node_id()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "location.node_id must match request.node_id");
+    }
+
+    index_.Register(request->node_id(), request->key(), location);
+    spdlog::info("[Master] Register key: node_id={}, key={}, location_id={}, size={}, tier={}",
+                 request->node_id(), request->key(), location.location_id, location.size,
+                 TierTypeName(location.tier));
+    return grpc::Status::OK;
+  }
+
+  grpc::Status Unregister(grpc::ServerContext* /*context*/,
+                          const ::umbp::UnregisterRequest* request,
+                          ::umbp::UnregisterResponse* response) override {
+    if (request->node_id().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id cannot be empty");
+    }
+    if (request->key().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "key cannot be empty");
+    }
+
+    Location location = ToLocation(request->location());
+    if (location.node_id.empty()) {
+      location.node_id = request->node_id();
+    }
+    if (location.node_id != request->node_id()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "location.node_id must match request.node_id");
+    }
+
+    const bool removed = index_.Unregister(request->node_id(), request->key(), location);
+    response->set_removed(removed ? 1u : 0u);
+    spdlog::info("[Master] Unregister key: node_id={}, key={}, location_id={}, removed={}",
+                 request->node_id(), request->key(), location.location_id, response->removed());
     return grpc::Status::OK;
   }
 
  private:
   ClientRegistry& registry_;
+  BlockIndex& index_;
   ClientRegistryConfig config_;
 };
 
@@ -101,8 +166,12 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 // ---------------------------------------------------------------------------
 MasterServer::MasterServer(MasterServerConfig config)
     : config_(std::move(config)),
-      registry_(config_.registry_config),
-      service_(std::make_unique<UMBPMasterServiceImpl>(registry_, config_.registry_config)) {}
+      index_(),
+      registry_(config_.registry_config, index_),
+      service_(
+          std::make_unique<UMBPMasterServiceImpl>(registry_, index_, config_.registry_config)) {
+  index_.SetClientRegistry(&registry_);
+}
 
 MasterServer::~MasterServer() { Shutdown(); }
 

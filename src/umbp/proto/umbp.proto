@@ -30,7 +30,7 @@ enum ClientStatus {
 }
 
 message RegisterClientRequest {
-  string client_id                    = 1;
+  string node_id                    = 1;
   string node_address                 = 2;   // Network address (e.g. "10.0.1.5:8080")
   repeated TierCapacity tier_capacities = 3; // Capacity per tier (HBM, DRAM, SSD)
 }
@@ -39,14 +39,14 @@ message RegisterClientResponse {
 }
 
 message UnregisterClientRequest {
-  string client_id = 1;
+  string node_id = 1;
 }
 message UnregisterClientResponse {
   uint32 keys_removed = 1;
 }
 
 message HeartbeatRequest {
-  string client_id                    = 1;
+  string node_id                    = 1;
   repeated TierCapacity tier_capacities = 2; // Updated capacity per tier
 }
 message HeartbeatResponse {
@@ -54,7 +54,34 @@ message HeartbeatResponse {
 }
 
 // ============================================================
-//  Single unified service (heartbeat-only subset)
+//  Block index
+// ============================================================
+
+message Location {
+  string   node_id     = 1;
+  string   location_id = 2;
+  uint64   size        = 3;
+  TierType tier        = 4;
+}
+
+message RegisterRequest {
+  string   node_id   = 1;
+  string   key       = 2;
+  Location location  = 3;
+}
+message RegisterResponse {}
+
+message UnregisterRequest {
+  string   node_id   = 1;
+  string   key       = 2;
+  Location location  = 3;
+}
+message UnregisterResponse {
+  uint32 removed = 1;
+}
+
+// ============================================================
+//  Single unified service
 // ============================================================
 
 service UMBPMaster {
@@ -62,4 +89,8 @@ service UMBPMaster {
   rpc RegisterClient(RegisterClientRequest) returns (RegisterClientResponse);
   rpc UnregisterClient(UnregisterClientRequest) returns (UnregisterClientResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Block index
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Unregister(UnregisterRequest) returns (UnregisterResponse);
 }

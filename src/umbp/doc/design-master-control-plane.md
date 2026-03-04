@@ -75,7 +75,7 @@ nodes are clients.
 - **Stateless clients:** Clients do not cache routing decisions. Every get-route
   request goes to the master.
 - **Client-owned locations:** Every `Location` in the index is associated with
-  the `client_id` that registered it. When a client dies, the master can
+  the `node_id` that registered it. When a client dies, the master can
   efficiently purge all of its locations.
 - **Single service:** All RPCs are in one `UMBPMaster` service. Split into
   multiple services later if the proto gets unwieldy.
@@ -139,12 +139,12 @@ concurrency, shard the map into N buckets with per-shard locks.
 
 ### 3.4 Operations
 
-#### 3.4.1 Register(client_id, key, location)
+#### 3.4.1 Register(node_id, key, location)
 
 Adds a new replica location for a key. Idempotent.
 
 ```
-Register(client_id, key, location):
+Register(node_id, key, location):
     exclusive_lock(mutex_)
     entry& = entries_[key]          // creates BlockEntry if new
 
@@ -165,15 +165,15 @@ Register(client_id, key, location):
 
     // Track ownership (outside lock to avoid inversion)
     if registry_ != nullptr:
-        registry_->TrackKey(client_id, key)
+        registry_->TrackKey(node_id, key)
 ```
 
-#### 3.4.2 Unregister(client_id, key, location)
+#### 3.4.2 Unregister(node_id, key, location)
 
 Removes a specific replica of a block. Called by clients on eviction.
 
 ```
-Unregister(client_id, key, location):
+Unregister(node_id, key, location):
     exclusive_lock(mutex_)
     it = entries_.find(key)
     if it == end:
@@ -194,7 +194,7 @@ Unregister(client_id, key, location):
     if removed && registry_ != nullptr:
         remaining = count locations in entries_[key] with node_id matching client
         if remaining == 0:
-            registry_->UntrackKey(client_id, key)
+            registry_->UntrackKey(node_id, key)
 
     return removed
 ```
@@ -281,14 +281,14 @@ GetMetrics(key):
     return result
 ```
 
-#### 3.4.7 BatchRegister(client_id, entries[])
+#### 3.4.7 BatchRegister(node_id, entries[])
 
 Registers multiple (key, location) pairs in a single call. Acquires the
 exclusive lock **once** for the entire batch, avoiding per-item lock overhead.
 Each entry follows the same idempotency semantics as single Register.
 
 ```
-BatchRegister(client_id, entries):
+BatchRegister(node_id, entries):
     // entries is a list of {key, location}
 
     keys_to_track = []
@@ -314,18 +314,18 @@ BatchRegister(client_id, entries):
     // Track ownership (outside lock to avoid inversion)
     if registry_ != nullptr:
         for key in keys_to_track:
-            registry_->TrackKey(client_id, key)
+            registry_->TrackKey(node_id, key)
 
     return keys_to_track.size()   // number of new registrations
 ```
 
-#### 3.4.8 BatchUnregister(client_id, entries[])
+#### 3.4.8 BatchUnregister(node_id, entries[])
 
 Removes multiple (key, location) pairs in a single call. Acquires the
 exclusive lock **once** for the entire batch.
 
 ```
-BatchUnregister(client_id, entries):
+BatchUnregister(node_id, entries):
     // entries is a list of {key, location}
 
     removed_count = 0
@@ -349,14 +349,14 @@ BatchUnregister(client_id, entries):
             entries_.erase(it)
 
         // Check if client still has locations for this key
-        remaining = count locs with node_id matching client_id
+        remaining = count locs with node_id matching node_id
         if remaining == 0:
             keys_to_untrack.append(key)
     unlock
 
     if registry_ != nullptr:
         for key in keys_to_untrack:
-            registry_->UntrackKey(client_id, key)
+            registry_->UntrackKey(node_id, key)
 
     return removed_count
 ```
@@ -435,7 +435,7 @@ construction time.
 class RouteGetStrategy {
   virtual ~RouteGetStrategy() = default;
   virtual Location Select(const vector<Location>& locations,
-                          const string& client_id) = 0;
+                          const string& node_id) = 0;
 };
 ```
 
@@ -460,20 +460,20 @@ Developers implement one or both interfaces and inject them into the Router.
 The default `RouteGetStrategy`. Picks a replica uniformly at random.
 
 ```
-RouteGet(key, client_id):
+RouteGet(key, node_id):
     locations = index_.Lookup(key)
 
     if locations.empty():
         return std::nullopt
 
-    selected = get_strategy_->Select(locations, client_id)
+    selected = get_strategy_->Select(locations, node_id)
     index_.RecordAccess(key)    // bump last_accessed_at + access_count
     return selected
 ```
 
 ```
 // RandomRouteGetStrategy::Select
-Select(locations, client_id):
+Select(locations, node_id):
     if locations.size() == 1:
         return locations[0]          // fast path, no RNG needed
 
@@ -520,7 +520,7 @@ The default `RoutePutStrategy`. Fastest-tier-first, most-available-space.
    to avoid hotspots and balance memory pressure).
 
 ```
-RoutePut(key, client_id, block_size):
+RoutePut(key, node_id, block_size):
     alive_clients = registry_.GetAliveClients()
 
     if alive_clients.empty():
@@ -548,7 +548,7 @@ Select(alive_clients, block_size):
         // (spreads load, avoids filling any single node too fast)
         target = max(candidates, key=available_bytes)
 
-        return {node_id: target.client_id,
+        return {node_id: target.node_id,
                 node_address: target.node_address,
                 tier: tier}
 
@@ -565,7 +565,7 @@ which node to write to. The actual memory allocation happens on the target
 node when the client connects via MORI-IO. The target node mints an opaque
 `location_id` that encodes its internal addressing (segment, offset, GPU
 device, etc.) and returns it to the client. After the write succeeds, the
-client calls `Register(client_id, key, location)` with a `Location`
+client calls `Register(node_id, key, location)` with a `Location`
 containing this `location_id`.
 
 **Capacity tracking:** Clients report per-tier capacity on every heartbeat
@@ -585,10 +585,10 @@ to the Router at construction time. Example:
 class LocalityAwareGetStrategy : public RouteGetStrategy {
    public:
     Location Select(const std::vector<Location>& locations,
-                    const std::string& client_id) override {
+                    const std::string& node_id) override {
         // prefer replica on the same node as the requester
         for (const auto& loc : locations) {
-            if (loc.node_id == client_id) return loc;
+            if (loc.node_id == node_id) return loc;
         }
         // fallback: first in list
         return locations[0];
@@ -667,12 +667,12 @@ clients to dead nodes. We need:
 │                      ClientRegistry                           │
 │                                                               │
 │  ┌──────────────────────────────────────────────────────┐    │
-│  │ clients_: map<client_id, ClientRecord>               │    │
+│  │ clients_: map<node_id, ClientRecord>               │    │
 │  │           (protected by std::shared_mutex)            │    │
 │  │                                                       │    │
 │  │  ClientRecord:                                        │    │
 │  │  ┌─────────────────────────────────────────────────┐  │    │
-│  │  │ client_id      : string                         │  │    │
+│  │  │ node_id      : string                         │  │    │
 │  │  │ node_address   : string                         │  │    │
 │  │  │ status         : ALIVE | EXPIRED                │  │    │
 │  │  │ last_heartbeat : time_point                     │  │    │
@@ -686,7 +686,7 @@ clients to dead nodes. We need:
 │                                                               │
 │  Reverse index (for GC):                                      │
 │  ┌──────────────────────────────────────────────────────┐    │
-│  │ client_keys_: map<client_id, set<string>>            │    │
+│  │ client_keys_: map<node_id, set<string>>            │    │
 │  │              tracks which block keys each client owns │    │
 │  │              (protected by same mutex as clients_)    │    │
 │  └──────────────────────────────────────────────────────┘    │
@@ -710,29 +710,29 @@ registration and update them on every heartbeat.
 ### 5.4 How Client Registration Interacts with BlockIndex
 
 When a client calls `Register` to index a block, the master records
-`(client_id → key)` in `client_keys_`:
+`(node_id → key)` in `client_keys_`:
 
 ```
-  BlockIndex::Register(client_id, key, location)
+  BlockIndex::Register(node_id, key, location)
       │
       ├──► BlockIndex: entries_[key].push_back(location)
       │
-      └──► ClientRegistry: client_keys_[client_id].insert(key)
+      └──► ClientRegistry: client_keys_[node_id].insert(key)
 ```
 
 When a client dies (heartbeat expired + reaper runs):
 
 ```
-  Reaper detects client_id expired
+  Reaper detects node_id expired
       │
-      ├──► keys = client_keys_[client_id]
+      ├──► keys = client_keys_[node_id]
       │
       ├──► for each key in keys:
-      │        BlockIndex::UnregisterByNode(key, client_id)
+      │        BlockIndex::UnregisterByNode(key, node_id)
       │
-      ├──► client_keys_.erase(client_id)
+      ├──► client_keys_.erase(node_id)
       │
-      └──► clients_.erase(client_id)
+      └──► clients_.erase(node_id)
 ```
 
 ### 5.5 Reaper: Background Garbage Collection
@@ -744,14 +744,14 @@ and purges their data.
   Reaper thread (runs every reaper_interval):
       │
       │  write_lock(mutex_)
-      │  for each (client_id, record) in clients_:
+      │  for each (node_id, record) in clients_:
       │      if now() - record.last_heartbeat > heartbeat_ttl * max_missed:
-      │          keys = client_keys_[client_id]
+      │          keys = client_keys_[node_id]
       │          for each key in keys:
-      │              index_.UnregisterByNode(key, client_id)
-      │          client_keys_.erase(client_id)
-      │          clients_.erase(client_id)
-      │          LOG(WARNING) << "Reaped dead client: " << client_id
+      │              index_.UnregisterByNode(key, node_id)
+      │          client_keys_.erase(node_id)
+      │          clients_.erase(node_id)
+      │          LOG(WARNING) << "Reaped dead client: " << node_id
       │  unlock
 ```
 
@@ -766,7 +766,7 @@ The heartbeat is a lightweight unary gRPC call. The client sends it periodically
 ```
   Client                              Master
     │                                   │
-    │  Heartbeat(client_id,            │
+    │  Heartbeat(node_id,            │
     │    tier_capacities)              │
     │──────────────────────────────────►│
     │                                   │  record.last_heartbeat = now()
@@ -795,12 +795,12 @@ immediately removes the client and all its index entries.
 ```
   Client (shutting down)              Master
     │                                   │
-    │  UnregisterClient(client_id)     │
+    │  UnregisterClient(node_id)     │
     │──────────────────────────────────►│
-    │                                   │  keys = client_keys_[client_id]
+    │                                   │  keys = client_keys_[node_id]
     │                                   │  for each key: BlockIndex.UnregisterByNode(...)
-    │                                   │  client_keys_.erase(client_id)
-    │                                   │  clients_.erase(client_id)
+    │                                   │  client_keys_.erase(node_id)
+    │                                   │  clients_.erase(node_id)
     │                                   │
     │  UnregisterClientResponse(count)  │
     │◄──────────────────────────────────│
@@ -859,7 +859,7 @@ enum ClientStatus {
 }
 
 message RegisterClientRequest {
-  string client_id                    = 1;
+  string node_id                    = 1;
   string node_address                 = 2;   // Network address (e.g. "10.0.1.5:8080")
   repeated TierCapacity tier_capacities = 3; // Capacity per tier (HBM, DRAM, SSD)
 }
@@ -868,14 +868,14 @@ message RegisterClientResponse {
 }
 
 message UnregisterClientRequest {
-  string client_id = 1;
+  string node_id = 1;
 }
 message UnregisterClientResponse {
   uint32 keys_removed = 1;
 }
 
 message HeartbeatRequest {
-  string client_id                    = 1;
+  string node_id                    = 1;
   repeated TierCapacity tier_capacities = 2; // Updated capacity per tier
 }
 message HeartbeatResponse {
@@ -887,14 +887,14 @@ message HeartbeatResponse {
 // ============================================================
 
 message RegisterRequest {
-  string   client_id = 1;
+  string   node_id = 1;
   string   key       = 2;
   Location location  = 3;
 }
 message RegisterResponse {}
 
 message UnregisterRequest {
-  string   client_id = 1;
+  string   node_id = 1;
   string   key       = 2;
   Location location  = 3;
 }
@@ -909,7 +909,7 @@ message BlockEntry {
 }
 
 message BatchRegisterRequest {
-  string client_id           = 1;
+  string node_id           = 1;
   repeated BlockEntry entries = 2;
 }
 message BatchRegisterResponse {
@@ -917,7 +917,7 @@ message BatchRegisterResponse {
 }
 
 message BatchUnregisterRequest {
-  string client_id           = 1;
+  string node_id           = 1;
   repeated BlockEntry entries = 2;
 }
 message BatchUnregisterResponse {
@@ -937,7 +937,7 @@ message LookupResponse {
 
 message RouteGetRequest {
   string key       = 1;
-  string client_id = 2;   // Requesting node (for future locality hints)
+  string node_id = 2;   // Requesting node (for future locality hints)
 }
 message RouteGetResponse {
   bool     found  = 1;
@@ -949,7 +949,7 @@ message RouteGetResponse {
 // then calls Register to index the new block.
 message RoutePutRequest {
   string   key        = 1;   // Block key to store
-  string   client_id  = 2;   // Requesting client
+  string   node_id  = 2;   // Requesting client
   uint64   block_size = 3;   // Size of the block to write (bytes)
 }
 message RoutePutResponse {
@@ -986,16 +986,16 @@ service UMBPMaster {
 
 | RPC | Purpose | Request | Response |
 |-----|---------|---------|----------|
-| RegisterClient | Register a new client node | client_id + address + tier_capacities | heartbeat interval |
-| UnregisterClient | Graceful client shutdown + GC | client_id | keys removed count |
-| Heartbeat | Periodic liveness + capacity update | client_id + tier_capacities | status |
-| Register | Add a replica location | client_id + key + location | (empty) |
-| Unregister | Remove a specific replica | client_id + key + location | removed count |
-| BatchRegister | Add multiple replicas in one call | client_id + entries[] | registered count |
-| BatchUnregister | Remove multiple replicas in one call | client_id + entries[] | removed count |
+| RegisterClient | Register a new client node | node_id + address + tier_capacities | heartbeat interval |
+| UnregisterClient | Graceful client shutdown + GC | node_id | keys removed count |
+| Heartbeat | Periodic liveness + capacity update | node_id + tier_capacities | status |
+| Register | Add a replica location | node_id + key + location | (empty) |
+| Unregister | Remove a specific replica | node_id + key + location | removed count |
+| BatchRegister | Add multiple replicas in one call | node_id + entries[] | registered count |
+| BatchUnregister | Remove multiple replicas in one call | node_id + entries[] | removed count |
 | Lookup | Get all replicas for a key | key | list of locations |
-| RouteGet | Pick where to read a block | key + client_id | found + selected location |
-| RoutePut | Pick where to write a block | key + client_id + block_size | found + target node |
+| RouteGet | Pick where to read a block | key + node_id | found + selected location |
+| RoutePut | Pick where to write a block | key + node_id + block_size | found + target node |
 
 **Deferred RPCs** (add when needed):
 - `BatchLookup` / `BatchRouteGet` — batch variants for prefetch workflows
@@ -1051,7 +1051,7 @@ struct BlockMetrics {
 };
 
 struct ClientRecord {
-    std::string client_id;
+    std::string node_id;
     std::string node_address;
     ClientStatus status = ClientStatus::UNKNOWN;
     std::chrono::steady_clock::time_point last_heartbeat;
@@ -1097,24 +1097,24 @@ class ClientRegistry {
     ClientRegistry& operator=(const ClientRegistry&) = delete;
 
     // --- Client lifecycle ---
-    void RegisterClient(const std::string& client_id,
+    void RegisterClient(const std::string& node_id,
                         const std::string& node_address,
                         const std::map<TierType, TierCapacity>& tier_capacities);
 
     // Gracefully unregister. Returns number of block keys cleaned up.
-    size_t UnregisterClient(const std::string& client_id);
+    size_t UnregisterClient(const std::string& node_id);
 
     // Process heartbeat. Updates last_heartbeat and tier capacities.
     // Returns CLIENT_STATUS_UNKNOWN if client is not registered.
-    ClientStatus Heartbeat(const std::string& client_id,
+    ClientStatus Heartbeat(const std::string& node_id,
                            const std::map<TierType, TierCapacity>& tier_capacities);
 
     // --- Ownership tracking (called by BlockIndex) ---
-    void TrackKey(const std::string& client_id, const std::string& key);
-    void UntrackKey(const std::string& client_id, const std::string& key);
+    void TrackKey(const std::string& node_id, const std::string& key);
+    void UntrackKey(const std::string& node_id, const std::string& key);
 
     // --- Queries ---
-    bool IsClientAlive(const std::string& client_id) const;
+    bool IsClientAlive(const std::string& node_id) const;
     size_t ClientCount() const;
 
     // Returns all clients with status == ALIVE. Used by Router for RoutePut.
@@ -1179,11 +1179,11 @@ class BlockIndex {
     void SetClientRegistry(ClientRegistry* registry);
 
     // --- Mutators ---
-    void Register(const std::string& client_id,
+    void Register(const std::string& node_id,
                   const std::string& key,
                   const Location& location);
 
-    bool Unregister(const std::string& client_id,
+    bool Unregister(const std::string& node_id,
                     const std::string& key,
                     const Location& location);
 
@@ -1191,9 +1191,9 @@ class BlockIndex {
                             const std::string& node_id);
 
     // Batch variants — single lock acquisition for the entire batch.
-    size_t BatchRegister(const std::string& client_id,
+    size_t BatchRegister(const std::string& node_id,
                          const std::vector<std::pair<std::string, Location>>& entries);
-    size_t BatchUnregister(const std::string& client_id,
+    size_t BatchUnregister(const std::string& node_id,
                            const std::vector<std::pair<std::string, Location>>& entries);
 
     // Bump last_accessed_at and access_count. Called by Router on RouteGet.
@@ -1232,16 +1232,16 @@ class RouteGetStrategy {
     virtual ~RouteGetStrategy() = default;
 
     // Select one replica from the given non-empty locations list.
-    // |client_id| is the requesting client (for locality-aware strategies).
+    // |node_id| is the requesting client (for locality-aware strategies).
     virtual Location Select(const std::vector<Location>& locations,
-                            const std::string& client_id) = 0;
+                            const std::string& node_id) = 0;
 };
 
 // Default: uniform random selection among replicas.
 class RandomRouteGetStrategy : public RouteGetStrategy {
    public:
     Location Select(const std::vector<Location>& locations,
-                    const std::string& client_id) override;
+                    const std::string& node_id) override;
 };
 
 }  // namespace umbp
@@ -1261,7 +1261,7 @@ class RandomRouteGetStrategy : public RouteGetStrategy {
 namespace umbp {
 
 struct RoutePutResult {
-    std::string node_id;       // Target node's client_id
+    std::string node_id;       // Target node's node_id
     std::string node_address;  // Target node's network address
     TierType    tier;          // Tier selected by the strategy
 };
@@ -1322,12 +1322,12 @@ class Router {
     // RouteGet: pick an existing replica to read from.
     // Returns nullopt if the key is not in the index.
     std::optional<Location> RouteGet(const std::string& key,
-                                     const std::string& client_id);
+                                     const std::string& node_id);
 
     // RoutePut: pick a target node to write to.
     // Returns nullopt if no suitable node exists.
     std::optional<RoutePutResult> RoutePut(const std::string& key,
-                                           const std::string& client_id,
+                                           const std::string& node_id,
                                            uint64_t block_size);
 
    private:
@@ -1412,7 +1412,7 @@ namespace umbp {
 
 struct UMBPClientConfig {
     std::string master_address;
-    std::string client_id;
+    std::string node_id;
     std::string node_address;
     bool auto_heartbeat = true;
 };
@@ -1483,7 +1483,7 @@ class UMBPClient {
       │◄───────────────────────────────│
       │                                │
       │  [start heartbeat thread]      │
-      │  Heartbeat(client_id,          │  (every 5s)
+      │  Heartbeat(node_id,          │  (every 5s)
       │    tier_capacities=[           │
       │      {HBM, 80G, 32G},         │
       │      {DRAM, 512G, 200G}])     │
@@ -1499,14 +1499,14 @@ class UMBPClient {
 ```
   Client (Node A)                    Master
       │                                │
-      │  Register(client_id,          │
+      │  Register(node_id,          │
       │    key, location)              │
       │───────────────────────────────►│
       │                                │  validate client is known
       │                                │  write_lock(mutex_)
       │                                │  entries_[key].push_back(location)
       │                                │  unlock
-      │                                │  client_keys_[client_id].insert(key)
+      │                                │  client_keys_[node_id].insert(key)
       │                                │
       │  RegisterResponse (OK)        │
       │◄───────────────────────────────│
@@ -1517,7 +1517,7 @@ class UMBPClient {
 ```
   Client (Node A)                    Master
       │                                │
-      │  BatchRegister(client_id,     │
+      │  BatchRegister(node_id,     │
       │    entries=[                   │
       │      {keyA, locA},            │
       │      {keyB, locB},            │
@@ -1537,7 +1537,7 @@ class UMBPClient {
 ```
   Client (Node A)                    Master
       │                                │
-      │  BatchUnregister(client_id,   │
+      │  BatchUnregister(node_id,   │
       │    entries=[                   │
       │      {keyA, locA},            │
       │      {keyB, locB}])           │
@@ -1559,7 +1559,7 @@ class UMBPClient {
 ```
   Client (Node B)                    Master
       │                                │
-      │   RouteGet(key, client_id)     │
+      │   RouteGet(key, node_id)     │
       │───────────────────────────────►│
       │                                │  locations = index.Lookup(key)
       │                                │  if empty → return not_found
@@ -1579,7 +1579,7 @@ class UMBPClient {
 ```
   Client (Node B)                    Master
       │                                │
-      │   RoutePut(key, client_id,     │
+      │   RoutePut(key, node_id,     │
       │     block_size=4096)           │
       │───────────────────────────────►│
       │                                │  alive = registry.GetAliveClients()
@@ -1595,7 +1595,7 @@ class UMBPClient {
       │    Target node mints           │
       │    location_id internally.]    │
       │                                │
-      │   Register(client_id, key,     │
+      │   Register(node_id, key,     │
       │     Location{node_id,          │
       │       location_id, size, tier})│
       │───────────────────────────────►│
@@ -1634,13 +1634,13 @@ class UMBPClient {
       │  [shutting down]               │
       │  StopHeartbeat()               │
       │                                │
-      │  UnregisterClient(client_id)   │
+      │  UnregisterClient(node_id)   │
       │───────────────────────────────►│
-      │                                │  keys = client_keys_[client_id]
+      │                                │  keys = client_keys_[node_id]
       │                                │  for each key:
       │                                │      index.UnregisterByNode(key, id)
-      │                                │  erase client_keys_[client_id]
-      │                                │  erase clients_[client_id]
+      │                                │  erase client_keys_[node_id]
+      │                                │  erase clients_[node_id]
       │                                │
       │  UnregisterClientResponse(     │
       │    keys_removed=42)            │
@@ -1794,7 +1794,7 @@ umbp/
 
 **`client_registry_test.cpp`:**
 - RegisterClient, verify IsClientAlive returns true
-- RegisterClient same client_id twice — refreshes record
+- RegisterClient same node_id twice — refreshes record
 - Heartbeat updates last_heartbeat time
 - Heartbeat for unknown client returns CLIENT_STATUS_UNKNOWN
 - UnregisterClient removes client and its keys
@@ -1871,7 +1871,7 @@ behavior if translated literally.
 
 ### PA-1. `Unregister`: use-after-erase + data race on remaining-count check [HIGH]
 
-**Section:** 3.4.2 — `Unregister(client_id, key, location)`
+**Section:** 3.4.2 — `Unregister(node_id, key, location)`
 
 **Problem:** After `entries_.erase(it)` removes an empty key and the lock is released,
 the code accesses `entries_[key]` without the lock to count remaining locations. This is
@@ -1888,23 +1888,23 @@ locs.erase(remove(locs, location), locs.end())
 removed = (locs.size() < original_size)
 
 // Compute remaining BEFORE erase, UNDER lock
-remaining_for_client = count locs with node_id matching client_id
+remaining_for_client = count locs with node_id matching node_id
 
 if locs.empty():
     entries_.erase(it)
 unlock
 
 if removed && registry_ != nullptr && remaining_for_client == 0:
-    registry_->UntrackKey(client_id, key)
+    registry_->UntrackKey(node_id, key)
 ```
 
 ### PA-2. `BatchUnregister`: use-after-free on `locs` reference [HIGH]
 
-**Section:** 3.4.8 — `BatchUnregister(client_id, entries[])`
+**Section:** 3.4.8 — `BatchUnregister(node_id, entries[])`
 
 **Problem:** `locs` is a reference to `it->second.locations`. After `entries_.erase(it)`,
 that memory is freed. The subsequent `remaining = count locs with node_id matching
-client_id` reads a dangling reference — undefined behavior.
+node_id` reads a dangling reference — undefined behavior.
 
 **Fix:** Same pattern as PA-1: compute the remaining count before the erase. When
 `locs.empty()` after removal, remaining is trivially 0 — just push to `keys_to_untrack`
@@ -1913,7 +1913,7 @@ directly.
 ```
 if locs.size() < original_size:
     removed_count += 1
-    remaining = count locs with node_id matching client_id
+    remaining = count locs with node_id matching node_id
     if remaining == 0:
         keys_to_untrack.append(key)
 
@@ -1938,7 +1938,7 @@ atomic fields for the hot-path updates.
 
 **Section:** 5.5 — Reaper pseudocode
 
-**Problem:** The Reaper loop iterates over `clients_` and calls `clients_.erase(client_id)`
+**Problem:** The Reaper loop iterates over `clients_` and calls `clients_.erase(node_id)`
 inside the loop body. Erasing from `std::unordered_map` during range-based iteration
 invalidates iterators — undefined behavior.
 
@@ -1960,7 +1960,7 @@ Or collect expired client IDs into a separate list first, then erase in a second
 
 ### PA-5. Race between `Register` unlock and `TrackKey` [MEDIUM]
 
-**Section:** 3.4.1 — `Register(client_id, key, location)`
+**Section:** 3.4.1 — `Register(node_id, key, location)`
 
 **Problem:** After the BlockIndex lock is released but before `TrackKey` executes, a
 concurrent `Unregister` on the same (key, location) can remove the location, find

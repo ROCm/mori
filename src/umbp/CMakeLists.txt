@@ -107,8 +107,9 @@ add_custom_command(
 # Shared between master and client. Contains proto-generated code, types, and
 # client_registry.
 
-add_library(umbp_common STATIC ${UMBP_PROTO_SRCS} ${UMBP_GRPC_SRCS}
-                               src/types.cpp src/client_registry.cpp)
+add_library(
+  umbp_common STATIC ${UMBP_PROTO_SRCS} ${UMBP_GRPC_SRCS} src/types.cpp
+                     src/block_index.cpp src/client_registry.cpp)
 
 target_include_directories(
   umbp_common

@@ -23,6 +23,11 @@
 
 namespace mori::umbp {
 
+bool Location::operator==(const Location& other) const {
+  return node_id == other.node_id && location_id == other.location_id && size == other.size &&
+         tier == other.tier;
+}
+
 const char* TierTypeName(TierType t) {
   switch (t) {
     case TierType::HBM:
