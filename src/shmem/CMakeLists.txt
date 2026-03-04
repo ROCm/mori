@@ -22,6 +22,11 @@ target_link_libraries(
 target_compile_options(mori_shmem PRIVATE "-fgpu-rdc" "-mcode-object-version=5")
 target_link_options(mori_shmem PRIVATE "-fgpu-rdc" "-mcode-object-version=5")
 
+# Device NIC provider for IBGDA dispatch (single provider, detected at top level)
+if(MORI_DEVICE_NIC_DEFINE)
+  target_compile_definitions(mori_shmem PRIVATE ${MORI_DEVICE_NIC_DEFINE})
+endif()
+
 option(SAVE_TEMPS "Save intermediate compilation files" ON)
 if(SAVE_TEMPS)
   target_compile_options(mori_shmem PRIVATE "-save-temps=obj")
