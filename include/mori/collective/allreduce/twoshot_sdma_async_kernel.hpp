@@ -173,15 +173,13 @@ __global__ void AllGatherAsyncWaitKernel(int myPe, int npes,
     __syncthreads();
   }
 
-  // Invalidate L2 cache: SDMA AllGather writes bypass L2 and land in HBM.
-  // Without invalidation, subsequent CU reads (e.g. copy_output_to_user)
-  // would hit stale L2 entries from before the AllGather.
-#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+  // Ensure SDMA-written data is visible to subsequent CU reads.
+  // SDMA AllGather writes bypass L2/L1, so flush caches to force re-fetch.
+  __threadfence_system();
   if (threadIdx.x == 0) {
-    asm volatile("buffer_invl2" ::: "memory");
+    asm volatile("buffer_wbinvl1_vol" ::: "memory");
   }
   __syncthreads();
-#endif
 }
 
 // ============================================================
