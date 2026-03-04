@@ -51,7 +51,9 @@ class ClientRegistry {
   ClientRegistry& operator=(const ClientRegistry&) = delete;
 
   // --- Client lifecycle ---
-  void RegisterClient(const std::string& client_id, const std::string& node_address,
+  // Returns false when a live client with the same id already exists.
+  // Returns true for new registrations or re-registration of expired clients.
+  bool RegisterClient(const std::string& client_id, const std::string& node_address,
                       const std::map<TierType, TierCapacity>& tier_capacities);
 
   // Gracefully unregister. Returns number of block keys cleaned up.

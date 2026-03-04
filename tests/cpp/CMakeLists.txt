@@ -23,3 +23,7 @@ add_executable(test_topology application/test_topology.cpp)
 target_include_directories(test_topology PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(test_topology PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_topology mori_application mori_io)
+
+if(BUILD_UMBP)
+  add_subdirectory(umbp)
+endif()

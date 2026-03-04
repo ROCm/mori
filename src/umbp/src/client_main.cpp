@@ -54,7 +54,12 @@ int main(int argc, char** argv) {
   caps[mori::umbp::TierType::HBM] = {80ULL * 1024 * 1024 * 1024, 80ULL * 1024 * 1024 * 1024};
   caps[mori::umbp::TierType::DRAM] = {512ULL * 1024 * 1024 * 1024, 512ULL * 1024 * 1024 * 1024};
 
-  client.RegisterSelf(caps);
+  auto register_status = client.RegisterSelf(caps);
+  if (!register_status.ok()) {
+    spdlog::error("[Client] Register failed: code={}, message={}",
+                  static_cast<int>(register_status.error_code()), register_status.error_message());
+    return 1;
+  }
 
   std::signal(SIGINT, SignalHandler);
   std::signal(SIGTERM, SignalHandler);
@@ -64,7 +69,14 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::seconds(1));
   }
 
-  client.UnregisterSelf();
+  auto unregister_status = client.UnregisterSelf();
+  if (!unregister_status.ok()) {
+    spdlog::error("[Client] Unregister failed: code={}, message={}",
+                  static_cast<int>(unregister_status.error_code()),
+                  unregister_status.error_message());
+    return 1;
+  }
+
   spdlog::info("[Client] Exited cleanly");
   return 0;
 }
