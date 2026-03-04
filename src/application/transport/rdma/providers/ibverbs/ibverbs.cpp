@@ -79,13 +79,14 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
   assert(config.maxMsgSge <= GetRdmaDevice()->GetDeviceAttr()->orig_attr.max_sge);
   endpoint.ibvHandle.srq = config.enableSrq ? CreateRdmaSrqIfNx(config) : nullptr;
 
+  uint32_t maxRecvWr = config.maxRecvWr != 0 ? config.maxRecvWr : config.maxMsgsNum;
   ibv_qp_init_attr qpAttr = {.send_cq = endpoint.ibvHandle.cq,
                              .recv_cq = endpoint.ibvHandle.cq,
                              .srq = endpoint.ibvHandle.srq,
                              .cap =
                                  {
                                      .max_send_wr = config.maxMsgsNum,
-                                     .max_recv_wr = config.maxMsgsNum,
+                                     .max_recv_wr = maxRecvWr,
                                      .max_send_sge = config.maxMsgSge,
                                      .max_recv_sge = config.maxMsgSge,
                                  },

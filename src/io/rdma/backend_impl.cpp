@@ -167,6 +167,8 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
   epConfig.maxMsgsNum = config.maxSendWr > 0
                             ? std::min(static_cast<uint32_t>(config.maxSendWr), maxQpWr)
                             : std::min(8192u, maxQpWr);
+  // RQ must fit NotifManager's pre-posted recv WQEs (notifPerQp=1024) when notification is enabled
+  epConfig.maxRecvWr = config.enableNotification ? std::min(1024u, maxQpWr) : 0;
   epConfig.maxCqeNum = config.maxCqeNum > 0
                            ? std::min(static_cast<uint32_t>(config.maxCqeNum), maxCqe)
                            : std::min(16384u, maxCqe);
