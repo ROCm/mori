@@ -27,6 +27,7 @@
 #include <memory>
 #include <vector>
 #include <algorithm>
+#include <numeric>
 
 #include "mori/application/utils/check.hpp"
 #include "mori/collective/allreduce/twoshot_allreduce_sdma_class.hpp"
@@ -46,175 +47,203 @@ using namespace mori::collective;
         } \
     } while(0)
 
-void testAllreduceSdmaSync() {
-    int status;
+static uint32_t computeExpected(int npes) {
+    uint32_t sum = 0;
+    for (int pe = 0; pe < npes; pe++) sum += (pe + 1) * 1000;
+    return sum;
+}
 
+static bool verifyResult(const uint32_t* data, size_t elems, uint32_t expected, int myPe) {
+    for (size_t i = 0; i < elems; i++) {
+        if (data[i] != expected) {
+            printf("PE %d: FAILED at [%zu]: expected %u, got %u\n", myPe, i, expected, data[i]);
+            return false;
+        }
+    }
+    printf("PE %d: Verification PASSED (all %zu elements = %u)\n", myPe, elems, expected);
+    return true;
+}
+
+static void printStats(const std::vector<double>& times, size_t bytesPerPe, int npes, int myPe) {
+    double avg = 0, mn = times[0], mx = times[0];
+    for (double t : times) { avg += t; mn = std::min(mn, t); mx = std::max(mx, t); }
+    avg /= times.size();
+
+    double g_max = 0, g_min = 0, g_sum = 0;
+    MPI_Reduce(&avg, &g_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&avg, &g_min, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&avg, &g_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    if (myPe == 0) {
+        double g_avg = g_sum / npes;
+        double algo_bw = bytesPerPe / g_avg / (1024.0 * 1024.0 * 1024.0);
+        double bus_bw = algo_bw * 2.0 * (npes - 1) / npes;
+        printf("  Min time : %.3f ms\n", g_min * 1000);
+        printf("  Max time : %.3f ms\n", g_max * 1000);
+        printf("  Avg time : %.3f ms\n", g_avg * 1000);
+        printf("  Algo BW  : %.2f GB/s\n", algo_bw);
+        printf("  Bus BW   : %.2f GB/s\n", bus_bw);
+        printf("  Data size: %.2f MB per rank\n", bytesPerPe / (1024.0 * 1024.0));
+    }
+}
+
+// =========================================================================
+// Test 1: Out-of-place (copy_output_to_user=False, read from transit buffer)
+// =========================================================================
+static bool testOutplace(int myPe, int npes, int elemsPerPe, size_t bytesPerPe,
+                         size_t outputBufSize, uint32_t fillValue,
+                         hipStream_t stream, int iterations, int warmup) {
+    if (myPe == 0) printf("\n>>> Test 1: Out-of-place (copy_output_to_user=False)\n");
+
+    auto ar = std::make_unique<AllreduceSdma<uint32_t>>(
+        myPe, npes, bytesPerPe, outputBufSize, false);
+
+    uint32_t* inBuf = nullptr;
+    uint32_t* outBuf = nullptr;
+    CHECK_HIP(hipMalloc(&inBuf, bytesPerPe));
+    CHECK_HIP(hipMalloc(&outBuf, bytesPerPe));
+
+    std::vector<uint32_t> hostIn(elemsPerPe, fillValue);
+    CHECK_HIP(hipMemcpy(inBuf, hostIn.data(), bytesPerPe, hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemset(outBuf, 0, bytesPerPe));
+    CHECK_HIP(hipDeviceSynchronize());
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    std::vector<double> times;
+    for (int i = 0; i < warmup + iterations; i++) {
+        MPI_Barrier(MPI_COMM_WORLD);
+        double t0 = MPI_Wtime();
+        bool ok = (*ar)(inBuf, outBuf, elemsPerPe, stream);
+        CHECK_HIP(hipStreamSynchronize(stream));
+        double t1 = MPI_Wtime();
+        if (!ok) { fprintf(stderr, "PE %d: failed at iter %d\n", myPe, i); break; }
+        if (i >= warmup) times.push_back(t1 - t0);
+        else if (myPe == 0) printf("  Warmup %d/%d: %.3f ms\n", i + 1, warmup, (t1 - t0) * 1000);
+    }
+
+    // Verify from transit buffer (outBuf should remain zeros)
+    void* transitPtr = ar->getOutputTransitBuffer();
+    std::vector<uint32_t> transitData(elemsPerPe);
+    CHECK_HIP(hipMemcpy(transitData.data(), transitPtr, bytesPerPe, hipMemcpyDeviceToHost));
+    bool ok = verifyResult(transitData.data(), elemsPerPe, computeExpected(npes), myPe);
+
+    std::vector<uint32_t> outData(elemsPerPe);
+    CHECK_HIP(hipMemcpy(outData.data(), outBuf, bytesPerPe, hipMemcpyDeviceToHost));
+    bool allZero = std::all_of(outData.begin(), outData.end(), [](uint32_t v){ return v == 0; });
+    if (allZero && myPe == 0) printf("  PE %d: output_tensor correctly untouched (all zeros)\n", myPe);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (myPe == 0) printf("\n--- Out-of-place Performance ---\n");
+    if (!times.empty()) printStats(times, bytesPerPe, npes, myPe);
+
+    ar.reset();
+    CHECK_HIP(hipFree(inBuf));
+    CHECK_HIP(hipFree(outBuf));
+    return ok;
+}
+
+// =========================================================================
+// Test 2: In-place (allreduce_inplace)
+// =========================================================================
+static bool testInplace(int myPe, int npes, int elemsPerPe, size_t bytesPerPe,
+                        size_t outputBufSize, uint32_t fillValue,
+                        hipStream_t stream, int iterations, int warmup) {
+    if (myPe == 0) printf("\n>>> Test 2: In-place (allreduce_inplace)\n");
+
+    auto ar = std::make_unique<AllreduceSdma<uint32_t>>(
+        myPe, npes, bytesPerPe, outputBufSize, false);
+
+    uint32_t* buf = nullptr;
+    CHECK_HIP(hipMalloc(&buf, bytesPerPe));
+
+    std::vector<uint32_t> hostData(elemsPerPe, fillValue);
+    CHECK_HIP(hipMemcpy(buf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
+    CHECK_HIP(hipDeviceSynchronize());
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // Single-shot correctness check
+    ar->allreduce_inplace(buf, elemsPerPe, stream);
+    CHECK_HIP(hipStreamSynchronize(stream));
+
+    std::vector<uint32_t> result(elemsPerPe);
+    CHECK_HIP(hipMemcpy(result.data(), buf, bytesPerPe, hipMemcpyDeviceToHost));
+    bool ok = verifyResult(result.data(), elemsPerPe, computeExpected(npes), myPe);
+    if (ok && myPe == 0) printf("  PE %d: inplace result verified\n", myPe);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // Benchmark with refill each iteration
+    std::vector<double> times;
+    for (int i = 0; i < warmup + iterations; i++) {
+        CHECK_HIP(hipMemcpy(buf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
+        MPI_Barrier(MPI_COMM_WORLD);
+        double t0 = MPI_Wtime();
+        ar->allreduce_inplace(buf, elemsPerPe, stream);
+        CHECK_HIP(hipStreamSynchronize(stream));
+        double t1 = MPI_Wtime();
+        if (i >= warmup) times.push_back(t1 - t0);
+        else if (myPe == 0) printf("  Warmup %d/%d: %.3f ms\n", i + 1, warmup, (t1 - t0) * 1000);
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (myPe == 0) printf("\n--- In-place Performance ---\n");
+    if (!times.empty()) printStats(times, bytesPerPe, npes, myPe);
+
+    ar.reset();
+    CHECK_HIP(hipFree(buf));
+    return ok;
+}
+
+void testAllreduceSdmaSync() {
     MPI_Init(NULL, NULL);
-    status = ShmemMpiInit(MPI_COMM_WORLD);
+    int status = ShmemMpiInit(MPI_COMM_WORLD);
     assert(!status);
 
     int myPe = ShmemMyPe();
     int npes = ShmemNPes();
 
-    printf("PE %d of %d started\n", myPe, npes);
-
     const int elemsPerPe = 8 * 1024 * 1024;
     const size_t bytesPerPe = elemsPerPe * sizeof(uint32_t);
-    const size_t totalBytes = bytesPerPe * npes;
-
-    uint32_t* inPutBuff = nullptr;
-    CHECK_HIP(hipMalloc(&inPutBuff, bytesPerPe));
-
-    uint32_t* outPutBuff = nullptr;
-    CHECK_HIP(hipMalloc(&outPutBuff, bytesPerPe));
-
-    // Data init: each PE fills all elements with (myPe + 1)
-    std::vector<uint32_t> hostData(elemsPerPe);
-    uint32_t fillValue = static_cast<uint32_t>(myPe + 1);
-    std::fill(hostData.begin(), hostData.end(), fillValue);
+    const size_t outputBufSize = static_cast<size_t>(npes) * (elemsPerPe / npes + 64) * sizeof(uint32_t);
+    const uint32_t fillValue = static_cast<uint32_t>((myPe + 1) * 1000);
 
     if (myPe == 0) {
-        uint32_t expected = static_cast<uint32_t>(npes * (npes + 1) / 2);
-        printf("\n=== AllReduce Sync Test ===\n");
+        printf("\n======================================================================\n");
+        printf("AllReduce Sync Test\n");
+        printf("  World size      : %d\n", npes);
         printf("  Elements per PE : %d\n", elemsPerPe);
-        printf("  Data size       : %.2f MB per PE\n", bytesPerPe / (1024.0 * 1024.0));
-        printf("  Each PE fills   : (PE_id + 1)\n");
-        printf("  Expected result : %u\n\n", expected);
+        printf("  Data size       : %.2f MB per rank\n", bytesPerPe / (1024.0 * 1024.0));
+        printf("  Fill value      : (PE_id + 1) * 1000\n");
+        printf("  Expected result : %u\n", computeExpected(npes));
+        printf("======================================================================\n");
     }
-
     printf("PE %d: Input = all %u\n", myPe, fillValue);
-
-    CHECK_HIP(hipMemcpy(inPutBuff, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
-    CHECK_HIP(hipDeviceSynchronize());
 
     hipStream_t stream;
     CHECK_HIP(hipStreamCreate(&stream));
     MPI_Barrier(MPI_COMM_WORLD);
 
-    // Create AllreduceSdma object
-    std::unique_ptr<AllreduceSdma<uint32_t>> allreduce_obj;
-    allreduce_obj = std::make_unique<AllreduceSdma<uint32_t>>(
-        myPe, npes, bytesPerPe, totalBytes);
+    const int iterations = 10;
+    const int warmup = 10;
 
-    printf("PE %d: AllreduceSdma created\n", myPe);
+    bool ok1 = testOutplace(myPe, npes, elemsPerPe, bytesPerPe, outputBufSize,
+                            fillValue, stream, iterations, warmup);
+    bool ok2 = testInplace(myPe, npes, elemsPerPe, bytesPerPe, outputBufSize,
+                           fillValue, stream, iterations, warmup);
 
-    // Warmup + measurement using synchronous operator()
-    const int num_iterations = 10;
-    const int warmup_iterations = 10;
-    std::vector<double> exec_times;
-
-    if (myPe == 0) {
-        printf("\nUsing SYNC mode (operator())\n");
-        printf("Warmup: %d, Measurement: %d\n\n", warmup_iterations, num_iterations);
-    }
-
-    for (int i = 0; i < num_iterations + warmup_iterations; i++) {
-        MPI_Barrier(MPI_COMM_WORLD);
-
-        double start_time = MPI_Wtime();
-
-        bool success = (*allreduce_obj)(inPutBuff, outPutBuff, elemsPerPe, stream);
-
-        CHECK_HIP(hipStreamSynchronize(stream));
-
-        double end_time = MPI_Wtime();
-        double iter_time = end_time - start_time;
-
-        if (!success) {
-            fprintf(stderr, "PE %d: AllReduce failed at iteration %d\n", myPe, i);
-            break;
-        }
-
-        if (i >= warmup_iterations) {
-            exec_times.push_back(iter_time);
-            if (myPe == 0 && exec_times.size() == 1) {
-                printf("PE %d: First measurement: %.6f s\n", myPe, iter_time);
-            }
-        } else if (myPe == 0) {
-            printf("PE %d: Warmup %d: %.6f s\n", myPe, i + 1, iter_time);
-        }
-
-        MPI_Barrier(MPI_COMM_WORLD);
-    }
-
-    // Local statistics
-    double avg_time = 0.0, min_time = 0.0, max_time = 0.0;
-    if (!exec_times.empty()) {
-        double sum_time = 0.0;
-        min_time = exec_times[0];
-        max_time = exec_times[0];
-        for (double t : exec_times) {
-            sum_time += t;
-            if (t < min_time) min_time = t;
-            if (t > max_time) max_time = t;
-        }
-        avg_time = sum_time / exec_times.size();
-
-        if (myPe == 0) {
-            printf("\nPE %d local statistics (%zu iterations):\n", myPe, exec_times.size());
-            printf("  Min: %.6f s  Max: %.6f s  Avg: %.6f s\n", min_time, max_time, avg_time);
-        }
-    }
-
-    // Verify
-    std::vector<uint32_t> resultData(elemsPerPe);
-    CHECK_HIP(hipMemcpy(resultData.data(), outPutBuff, bytesPerPe, hipMemcpyDeviceToHost));
-    CHECK_HIP(hipDeviceSynchronize());
-
-    uint32_t expected_value = static_cast<uint32_t>(npes * (npes + 1) / 2);
-    bool success = true;
-    for (size_t i = 0; i < static_cast<size_t>(elemsPerPe); i++) {
-        if (resultData[i] != expected_value) {
-            printf("PE %d: FAILED at [%zu]: expected %u, got %u\n",
-                   myPe, i, expected_value, resultData[i]);
-            success = false;
-            break;
-        }
-    }
-    if (success) {
-        printf("PE %d: Verification PASSED (all %d elements = %u)\n",
-               myPe, elemsPerPe, expected_value);
-    }
-
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    // Global statistics
-    double global_max_time = 0.0, global_min_time = 0.0, global_sum_time = 0.0;
-    MPI_Reduce(&avg_time, &global_max_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&avg_time, &global_min_time, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&avg_time, &global_sum_time, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-
-    int local_ok = success ? 1 : 0;
-    int global_ok = 0;
-    MPI_Reduce(&local_ok, &global_ok, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+    bool allOk = ok1 && ok2;
+    int localOk = allOk ? 1 : 0, globalOk = 0;
+    MPI_Reduce(&localOk, &globalOk, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
 
     if (myPe == 0) {
-        double global_avg = global_sum_time / npes;
-        double algo_bw = bytesPerPe / global_avg / (1024.0 * 1024.0 * 1024.0);
-        double bus_bw = algo_bw * 2.0 * (npes - 1) / npes;
-
-        printf("\n=== Global Performance Statistics ===\n");
-        printf("Min avg time: %.6f s\n", global_min_time);
-        printf("Max avg time: %.6f s\n", global_max_time);
-        printf("Avg time:     %.6f s\n", global_avg);
-        printf("Algo bandwidth: %.2f GB/s (data: %.3f GB)\n",
-               algo_bw, bytesPerPe / (1024.0 * 1024.0 * 1024.0));
-        printf("Bus  bandwidth: %.2f GB/s (factor: 2*(N-1)/N = %.2f)\n",
-               bus_bw, 2.0 * (npes - 1) / npes);
-
-        printf("\nPEs passed: %d/%d\n", global_ok, npes);
-        if (global_ok == npes) {
-            printf("\n=== AllReduce Sync Test PASSED ===\n");
-        } else {
-            printf("\n=== AllReduce Sync Test FAILED ===\n");
-        }
+        printf("\n======================================================================\n");
+        printf("PEs passed: %d/%d\n", globalOk, npes);
+        if (globalOk == npes) printf("=== All Tests PASSED ===\n");
+        else                  printf("=== SOME Tests FAILED ===\n");
+        printf("======================================================================\n\n");
     }
 
-    allreduce_obj.reset();
-    CHECK_HIP(hipFree(outPutBuff));
-    CHECK_HIP(hipFree(inPutBuff));
     CHECK_HIP(hipStreamDestroy(stream));
-
     MPI_Barrier(MPI_COMM_WORLD);
     ShmemFinalize();
 }

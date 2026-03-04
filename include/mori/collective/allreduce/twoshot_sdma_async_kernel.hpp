@@ -78,46 +78,110 @@ __global__ void ReduceScatterSdmaPutKernel(int myPe, int npes,
 }
 
 // ============================================================
-// Wait kernel: signals remote PEs, waits for all SDMA transfers
-// to complete, and resets flags. Reused for both scatter-wait
-// and allgather-wait phases.
+// AllGather async PUT kernel
+//
+// Sends reduced shard + ShmemQuiet + AMO_SET notification.
+// Uses barrier->flag as generation counter (same as AllGatherSdmaKernel).
+// Paired with AllGatherAsyncWaitKernel below.
 // ============================================================
-__global__ void TwoShotAllReduceSdmaAsyncWaitKernel(int myPe, int npes,
+template <typename T>
+__global__ void AllGatherAsyncPutKernel(int myPe, int npes,
                                         const application::SymmMemObjPtr dstMemObj,
-                                        const application::SymmMemObjPtr flagsMemObj) {
-  int flag_val = 1;
-  uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
+                                        const application::SymmMemObjPtr flagsMemObj,
+                                        CrossPeBarrier* __restrict__ barrier,
+                                        size_t elementCount) {
+  if (elementCount == 0 || npes <= 0) return;
 
-  const size_t threadLinearId = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
+  using P = typename packed_t<T>::P;
+  constexpr int pack_size = P::size;
+  const size_t elementCountPerRank =
+      ((elementCount / npes + pack_size - 1) / pack_size) * pack_size;
+  if (elementCountPerRank == 0) return;
 
-  if (threadLinearId < npes) {
-    int remotePe = threadLinearId;
-    shmem::ShmemQuietThread(remotePe, dstMemObj);
-    shmem::ShmemAtomicSizeNonFetchThread(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8, core::atomicType::AMO_ADD, remotePe);
+  const size_t bytesPerElement = sizeof(T);
+
+  // Generation counter — matches AllGatherSdmaKernel's protocol
+  __shared__ uint64_t ag_token;
+  if (threadIdx.x == 0) {
+    ag_token = static_cast<uint64_t>(barrier->flag) + 1ULL;
+    barrier->flag = static_cast<uint32_t>(ag_token);
   }
   __syncthreads();
+  uint64_t flag_val = ag_token;
+
+  int warpId = static_cast<int>(threadIdx.x) / warpSize;
+  const int laneId = static_cast<int>(threadIdx.x) % warpSize;
+
+  // SDMA PUT: send my reduced shard to every rank
+  uint8_t* agSrcPtr = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
+                      + static_cast<size_t>(myPe) * elementCountPerRank * bytesPerElement;
+  size_t agSendBytes = elementCountPerRank * bytesPerElement;
+
+  if (warpId < npes && laneId == 0) {
+    int remotePe = warpId;
+    application::SymmMemObjPtr dest = dstMemObj;
+
+    uint8_t* agDstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe])
+                        + static_cast<size_t>(myPe) * elementCountPerRank * bytesPerElement;
+
+    anvil::SdmaQueueDeviceHandle** dh =
+        dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
+    HSAuint64* sig = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
+    HSAuint64* esig = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
+    core::SdmaPutThread(agSrcPtr, agDstPtr, agSendBytes,
+                        dh, sig, esig, dest->sdmaNumQueue, 0);
+  }
+
+  // Notify remote PEs
+  if (warpId < npes && laneId == 0) {
+    int remotePe = warpId;
+    shmem::ShmemQuietThread(remotePe, dstMemObj);
+    shmem::ShmemAtomicSizeNonFetchThread(
+        flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t),
+        &flag_val, 8, core::atomicType::AMO_SET, remotePe);
+  }
+}
+
+// ============================================================
+// AllGather async WAIT kernel
+//
+// Waits for all peers' AllGather PUT to complete.
+// Uses AMO_SET + generation counter (< flag_val comparison).
+// Paired with AllGatherAsyncPutKernel above.
+// ============================================================
+__global__ void AllGatherAsyncWaitKernel(int myPe, int npes,
+                                         const application::SymmMemObjPtr flagsMemObj,
+                                         CrossPeBarrier* __restrict__ barrier,
+                                         size_t elementCount) {
+  uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
+
+  // Read the generation token set by AllGatherAsyncPutKernel
+  uint64_t flag_val = static_cast<uint64_t>(barrier->flag);
 
   for (int sender = 0; sender < npes; ++sender) {
-    if (sender == myPe) {
-      continue;
-    }
-
-    if (threadLinearId == 0) {
-      int spinCount = 0;
-      while (core::AtomicLoadRelaxed(flags + sender) == 0) {
-        ++spinCount;
-        if (spinCount > 10000000) {
-          printf("PE %d: Timeout waiting for data from peer %d\n", myPe, sender);
-          break;
+    if (sender == myPe) continue;
+    if (threadIdx.x == 0) {
+      int spin = 0;
+      bool warned = false;
+      while (core::AtomicLoadRelaxed(flags + sender) < flag_val) {
+        if (++spin > 100000000 && !warned) {
+          printf("PE %d: AllGather wait timeout for peer %d\n", myPe, sender);
+          warned = true;
         }
       }
     }
     __syncthreads();
   }
 
-  if (threadLinearId < npes) {
-    flags[threadLinearId] = 0;
+  // Invalidate L2 cache: SDMA AllGather writes bypass L2 and land in HBM.
+  // Without invalidation, subsequent CU reads (e.g. copy_output_to_user)
+  // would hit stale L2 entries from before the AllGather.
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+  if (threadIdx.x == 0) {
+    asm volatile("buffer_invl2" ::: "memory");
   }
+  __syncthreads();
+#endif
 }
 
 // ============================================================

@@ -324,9 +324,14 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
             barrierPtr_,
             total_count);
 
-        // Step 2: AllGather PUT only — wait is done in wait_async
-        AllGatherReducedSdmaPutKernel<T><<<1, 64, 0, stream>>>(
-            myPe_, npes_, output_transit_buffer_obj_, elementCountPerRank);
+        // Step 2: AllGather PUT only — sends data, returns immediately
+        // The wait is deferred to wait_async so the user can run GEMM on CU
+        AllGatherAsyncPutKernel<T><<<1, 512, 0, stream>>>(
+            myPe_, npes_,
+            output_transit_buffer_obj_,
+            flagsObj_,
+            barrierPtr_,
+            total_count);
 
         hipError_t kernel_err = hipGetLastError();
         if (kernel_err != hipSuccess) {
@@ -354,9 +359,9 @@ double AllreduceSdma<T>::wait_async(hipStream_t stream) {
     try {
         hipStream_t wait_stream = (stream != nullptr) ? stream : async_stream_;
 
-        // Wait for AllGather SDMA transfers to complete
-        TwoShotAllReduceSdmaAsyncWaitKernel<<<1, 64, 0, wait_stream>>>(
-            myPe_, npes_, output_transit_buffer_obj_, flagsObj_);
+        // Wait for AllGather SDMA transfers to complete + invalidate L2
+        AllGatherAsyncWaitKernel<<<1, 64, 0, wait_stream>>>(
+            myPe_, npes_, flagsObj_, barrierPtr_, async_total_count_);
 
         // Copy result to user buffer (if enabled)
         if (copy_output_to_user_) {
