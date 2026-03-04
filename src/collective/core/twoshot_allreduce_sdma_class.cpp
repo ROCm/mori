@@ -325,7 +325,6 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
             total_count);
 
         // Step 2: AllGather PUT only — wait is done in wait_async
-        size_t elementCountPerRank = total_count / npes_;
         AllGatherReducedSdmaPutKernel<T><<<1, 64, 0, stream>>>(
             myPe_, npes_, output_transit_buffer_obj_, elementCountPerRank);
 
