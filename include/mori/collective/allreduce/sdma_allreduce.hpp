@@ -63,9 +63,28 @@ double Allreduce_sdma(T* input, T* output, size_t total_count,
   memset(flags, 0, flagsSize);
   application::SymmMemObjPtr flagsObj = shmem::ShmemQueryMemObjPtr(flags);
 
+  // Allocate and register barrier signal for start_sync
+  size_t barrierSize = sizeof(RSBarrierSignal);
+  void* barrierMem = shmem::ShmemMalloc(barrierSize);
+  if (barrierMem == nullptr) {
+    return -1;
+  }
+  application::SymmMemObjPtr barrierObj =
+      shmem::ShmemSymmetricRegister(barrierMem, barrierSize);
+  hipMemset(barrierMem, 0, barrierSize);
+
+  // Local barrier token for AllGather generation signaling.
+  void* agBarrierMem = shmem::ShmemMalloc(sizeof(CrossPeBarrier));
+  if (agBarrierMem == nullptr) {
+    return -1;
+  }
+  hipMemset(agBarrierMem, 0, sizeof(CrossPeBarrier));
+  CrossPeBarrier* agBarrier = reinterpret_cast<CrossPeBarrier*>(agBarrierMem);
+
   assert(inPutBuffObj.IsValid());
   assert(transitObj.IsValid());
   assert(flagsObj.IsValid());
+  assert(barrierObj.IsValid());
 
   constexpr int pack_size = packed_t<T>::P::size;
   constexpr int kMaxBlocks = 80;
@@ -78,9 +97,9 @@ double Allreduce_sdma(T* input, T* output, size_t total_count,
 
   double start = MPI_Wtime();
   ReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(
-      myPe, npes, inPutBuffObj, transitObj, total_count);
+      myPe, npes, inPutBuffObj, transitObj, barrierObj, total_count);
   AllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
-      myPe, npes, transitObj, flagsObj, total_count);
+      myPe, npes, transitObj, flagsObj, agBarrier, total_count);
 
   // Synchronize GPU to ensure kernel completion
   hipError_t sync_err;
@@ -104,6 +123,9 @@ double Allreduce_sdma(T* input, T* output, size_t total_count,
     fprintf(stderr, "PE %d: Failed to copy result: %s\n", myPe, hipGetErrorString(copy_err));
     return -1.0;
   }
+
+  shmem::ShmemFree(barrierMem);
+  shmem::ShmemFree(agBarrierMem);
 
   return end - start;
 }

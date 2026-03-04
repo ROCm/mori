@@ -27,9 +27,7 @@
 #include <mpi.h>
 #include <memory>
 #include <cstdint>
-#include <atomic>
 
-// Include necessary headers
 #include "mori/application/application.hpp"
 #include "mori/shmem/shmem.hpp"
 #include "mori/collective/collective_pub.hpp"
@@ -37,24 +35,30 @@
 namespace mori {
 namespace collective {
 
+struct CrossPeBarrier;
+
 template <typename T>
 class AllreduceSdma {
 private:
     int myPe_;
     int npes_;
     size_t dtype_size_;
+    int max_blocks_;
 
-    // Flag memory
+    // SDMA completion flags (shared by SdmaReduceScatter and AllGather phases;
+    // each phase resets flags before handing off to the next).
     application::SymmMemObjPtr flagsObj_;
     std::unique_ptr<uint64_t[], ShmemDeleter> flags_;
 
-    // Input transit buffer (srcMemObj — registered wrapper around user input)
-    void* input_transit_buffer_;
-    size_t input_transit_buffer_size_;
-    application::SymmMemObjPtr input_transit_buffer_obj_;
-    std::unique_ptr<void, ShmemDeleter> input_transit_buffer_ptr_;
+    // Device-scope barrier for block-0-to-all broadcast inside
+    // SdmaReduceScatterKernel (generation counter, ~128 bytes).
+    CrossPeBarrier* barrierPtr_;
+    std::unique_ptr<void, ShmemDeleter> barrierMem_;
 
-    // Output transit buffer (dstMemObj — intermediate gather/reduce/allgather buffer)
+    // Output transit buffer — serves as:
+    //   1. SDMA scatter destination (gather buffer, npes * chunkSize)
+    //   2. Local reduce output (myPe's slot)
+    //   3. AllGather source / final result
     void* output_transit_buffer_;
     size_t output_transit_buffer_size_;
     application::SymmMemObjPtr output_transit_buffer_obj_;
@@ -72,55 +76,29 @@ private:
     // if false, user should directly use output_transit_buffer
     bool copy_output_to_user_;
 
-    // Disable copy constructor and assignment operator
     AllreduceSdma(const AllreduceSdma&) = delete;
     AllreduceSdma& operator=(const AllreduceSdma&) = delete;
 
-    // Internal methods
-    bool ensure_buffer_size(void*& buffer,
-                           std::unique_ptr<void, ShmemDeleter>& buffer_ptr,
-                           size_t& current_size,
-                           application::SymmMemObjPtr& buffer_obj,
-                           size_t required_size,
-                           const char* buffer_name);
-
-    void copy_input_to_transit(T* input, size_t total_count, hipStream_t stream);
     void copy_output_to_user(T* output, size_t total_count, hipStream_t stream);
 
 public:
     /**
-     * @brief Constructor, initializes AllreduceSdma class
+     * @brief Constructor
      * @param myPe Current PE ID
      * @param npes Total number of PEs
-     * @param transit_buffer_size Transit buffer size in bytes (default 512MB), half for input and half for output
-     * @param copy_output_to_user If true, copy output_transit_buffer to user output buffer (default true)
+     * @param transit_buffer_size Output transit buffer size in bytes (default 512MB)
+     * @param copy_output_to_user If true, copy result to user output buffer
+     * @param use_graph_mode Kept for API compat — ignored (SDMA always reads
+     *        input directly, no IPC registration needed).
      */
-    AllreduceSdma(int myPe, int npes, size_t transit_buffer_size = 512 * 1024 * 1024, bool copy_output_to_user = true);
+    AllreduceSdma(int myPe, int npes, size_t transit_buffer_size = 512 * 1024 * 1024,
+                  bool copy_output_to_user = true, bool use_graph_mode = false);
 
-    /**
-     * @brief Constructor, specifying input and output transit buffer sizes separately
-     * @param myPe Current PE ID
-     * @param npes Total number of PEs
-     * @param input_buffer_size Input transit buffer size in bytes
-     * @param output_buffer_size Output transit buffer size in bytes
-     * @param copy_output_to_user If true, copy output_transit_buffer to user output buffer (default true)
-     */
-    AllreduceSdma(int myPe, int npes, size_t input_buffer_size, size_t output_buffer_size, bool copy_output_to_user = true);
+    AllreduceSdma(int myPe, int npes, size_t input_buffer_size, size_t output_buffer_size,
+                  bool copy_output_to_user = true, bool use_graph_mode = false);
 
-    /**
-     * @brief Destructor, cleans up resources
-     */
     ~AllreduceSdma();
 
-    /**
-     * @brief Executes synchronous AllReduce SDMA operation
-     * @param input Input data pointer (elementCount elements on each rank)
-     * @param output Output data pointer (elementCount elements — the reduced result)
-     * @param total_count Number of data elements per PE
-     * @param stream HIP stream
-     * @return true if successful, false if failed
-     * @note Synchronization must be handled by the caller
-     */
     bool operator()(T* input, T* output, size_t total_count, hipStream_t stream = nullptr);
 
     /**
@@ -162,44 +140,11 @@ public:
      */
     bool allreduce_inplace(T* data, size_t total_count, hipStream_t stream = nullptr);
 
-    /**
-     * @brief Gets flag symmetric memory object
-     */
     application::SymmMemObjPtr getFlagsObj() const { return flagsObj_; }
-
-    /**
-     * @brief Gets input transit buffer pointer
-     */
-    void* getInputTransitBuffer() const { return input_transit_buffer_; }
-
-    /**
-     * @brief Gets input transit buffer size in bytes
-     */
-    size_t getInputTransitBufferSize() const { return input_transit_buffer_size_; }
-
-    /**
-     * @brief Gets input transit buffer symmetric memory object
-     */
-    application::SymmMemObjPtr getInputTransitBufferObj() const { return input_transit_buffer_obj_; }
-
-    /**
-     * @brief Gets output transit buffer pointer
-     */
     void* getOutputTransitBuffer() const { return output_transit_buffer_; }
-
-    /**
-     * @brief Gets output transit buffer size in bytes
-     */
     size_t getOutputTransitBufferSize() const { return output_transit_buffer_size_; }
-
-    /**
-     * @brief Gets output transit buffer symmetric memory object
-     */
     application::SymmMemObjPtr getOutputTransitBufferObj() const { return output_transit_buffer_obj_; }
 
-    /**
-     * @brief Resets flags (sets to 0)
-     */
     void resetFlags();
 };
 
