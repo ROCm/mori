@@ -49,140 +49,135 @@ hipDataType IntToHipDataType(int dtype) {
   }
 }
 
-py::tuple LaunchDispatch(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
-                         int64_t input_ptr, int input_dtype, int64_t num_tokens,
-                         int64_t hidden_dim, int64_t weight_ptr, int64_t scale_ptr,
-                         int64_t topkIds_ptr, int64_t stream, int blockNum = -1,
-                         int rdmaBlockNum = -1, int warpPerBlock = -1) {
+void PrepareInference(mori::moe::EpDispatchCombineHandle& handle,
+                      int64_t input_ptr, int input_dtype, int64_t num_tokens,
+                      int64_t weight_ptr, int64_t scale_ptr, int64_t topkIds_ptr) {
   handle.PrepareInference(
       IntToHipDataType(input_dtype), reinterpret_cast<void*>(input_ptr), nullptr,
       weight_ptr ? reinterpret_cast<float*>(weight_ptr) : nullptr,
       scale_ptr ? reinterpret_cast<uint8_t*>(scale_ptr) : nullptr,
       reinterpret_cast<mori::moe::index_t*>(topkIds_ptr), num_tokens);
+}
 
-  handle.LaunchDispatch(static_cast<mori::moe::KernelType>(kernelType), blockNum, rdmaBlockNum,
-                        warpPerBlock, reinterpret_cast<hipStream_t>(stream),
-                        static_cast<int>(hidden_dim));
+int64_t BuildArgs(mori::moe::EpDispatchCombineHandle& handle, int rdmaBlockNum,
+                  int hiddenDim, int useExternalInpBuf) {
+  auto* args = new mori::moe::EpDispatchCombineArgsRaw(
+      mori::moe::GetEpDispatchCombineArgsRaw(handle, rdmaBlockNum));
+  if (hiddenDim > 0)
+    args->config.hiddenDim = hiddenDim;
+  if (useExternalInpBuf >= 0)
+    args->config.useExternalInpBuffer = static_cast<bool>(useExternalInpBuf);
+  return reinterpret_cast<int64_t>(args);
+}
 
+void FreeArgs(int64_t ptr) {
+  delete reinterpret_cast<mori::moe::EpDispatchCombineArgsRaw*>(ptr);
+}
+
+py::tuple GetDispatchOutputPtrs(mori::moe::EpDispatchCombineHandle& handle, bool has_scales) {
   int64_t out_ptr = reinterpret_cast<int64_t>(handle.shmemDispatchOutTokMemObj->Get());
   int64_t outW_ptr = reinterpret_cast<int64_t>(handle.shmemDispatchOutWeightsMemObj->Get());
-  int64_t outS_ptr = (scale_ptr && handle.config.scaleDim > 0)
+  int64_t outS_ptr = (has_scales && handle.config.scaleDim > 0)
                          ? reinterpret_cast<int64_t>(handle.shmemOutScalesMemObj->Get())
                          : 0;
   int64_t outI_ptr = reinterpret_cast<int64_t>(handle.shmemOutIndicesMemObj->Get());
   int64_t total_ptr = reinterpret_cast<int64_t>(handle.totalRecvTokenNum);
-
   return py::make_tuple(out_ptr, outW_ptr, outS_ptr, outI_ptr, total_ptr);
 }
 
-py::tuple LaunchCombine(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
-                        int64_t input_ptr, int input_dtype, int64_t hidden_dim,
-                        int64_t weight_ptr, int64_t topkIds_ptr, int64_t stream,
-                        int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
-                        int useExternalInpBuf = -1) {
-  handle.PrepareInference(
-      IntToHipDataType(input_dtype), reinterpret_cast<void*>(input_ptr), nullptr,
-      weight_ptr ? reinterpret_cast<float*>(weight_ptr) : nullptr,
-      reinterpret_cast<mori::moe::index_t*>(topkIds_ptr), handle.curRankNumToken);
-
-  handle.LaunchCombine(static_cast<mori::moe::KernelType>(kernelType), blockNum, rdmaBlockNum,
-                       warpPerBlock, useExternalInpBuf, reinterpret_cast<hipStream_t>(stream),
-                       static_cast<int>(hidden_dim));
-
+py::tuple GetCombineOutputPtrs(mori::moe::EpDispatchCombineHandle& handle, bool has_weights) {
   int64_t out_ptr = reinterpret_cast<int64_t>(handle.shmemCombineOutTokMemObj->Get());
-  int64_t outW_ptr =
-      weight_ptr ? reinterpret_cast<int64_t>(handle.shmemCombineOutWeightsMemObj->Get()) : 0;
-
+  int64_t outW_ptr = has_weights
+                         ? reinterpret_cast<int64_t>(handle.shmemCombineOutWeightsMemObj->Get())
+                         : 0;
   return py::make_tuple(out_ptr, outW_ptr);
 }
 
-#ifdef ENABLE_STANDARD_MOE_ADAPT
-int64_t LaunchDispatchForStandardMoE(
-    mori::moe::EpDispatchCombineHandle& handle, int kernelType, int64_t input_ptr, int input_dtype,
-    int64_t num_tokens, int64_t hidden_dim, int64_t weight_ptr, int64_t scale_ptr,
-    int64_t topkIds_ptr, int64_t stream, int blockNum, int rdmaBlockNum, int warpPerBlock,
-    int64_t packedRecvX_ptr, int64_t packedRecvSrcInfo_ptr) {
-  handle.PrepareInference(
-      IntToHipDataType(input_dtype), reinterpret_cast<void*>(input_ptr), nullptr,
-      weight_ptr ? reinterpret_cast<float*>(weight_ptr) : nullptr,
-      scale_ptr ? reinterpret_cast<uint8_t*>(scale_ptr) : nullptr,
-      reinterpret_cast<mori::moe::index_t*>(topkIds_ptr), num_tokens);
+py::dict GetHandleInfo(mori::moe::EpDispatchCombineHandle& handle) {
+  py::dict info;
+  info["multi_processor_count"] = static_cast<int>(handle.multiProcessorCount);
+  info["max_threads"] = static_cast<int>(handle.maxThreads);
+  info["world_size"] = handle.config.worldSize;
+  info["hidden_dim"] = handle.config.hiddenDim;
+  info["scale_dim"] = handle.config.scaleDim;
+  info["scale_type_size"] = handle.config.scaleTypeSize;
+  info["max_token_type_size"] = handle.config.maxTokenTypeSize;
+  info["max_num_inp_token_per_rank"] = handle.config.maxNumInpTokenPerRank;
+  info["num_expert_per_rank"] = handle.config.numExpertPerRank;
+  info["num_expert_per_token"] = handle.config.numExpertPerToken;
+  info["warp_num_per_block"] = handle.config.warpNumPerBlock;
+  info["block_num"] = handle.config.blockNum;
+  info["use_external_inp_buffer"] = handle.config.useExternalInpBuffer;
+  info["kernel_type"] = static_cast<int>(handle.config.kernelType);
+  info["gpu_per_node"] = handle.config.gpuPerNode;
+  info["rdma_block_num"] = handle.config.rdmaBlockNum;
+  info["quant_type"] = static_cast<int>(handle.config.quantType);
+  return info;
+}
 
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+void SetStandardMoeOutputBuffers(mori::moe::EpDispatchCombineHandle& handle,
+                                 int64_t packedRecvX_ptr, int64_t packedRecvSrcInfo_ptr) {
   handle.SetStandardMoeOutputBuffers(reinterpret_cast<void*>(packedRecvX_ptr),
                                      handle.standardPackedRecvCount,
                                      reinterpret_cast<int*>(packedRecvSrcInfo_ptr), nullptr);
+}
 
-  handle.LaunchDispatchForStandardMoE(static_cast<mori::moe::KernelType>(kernelType), blockNum,
-                                      rdmaBlockNum, warpPerBlock,
-                                      reinterpret_cast<hipStream_t>(stream),
-                                      static_cast<int>(hidden_dim));
+int64_t BuildConvertDispatchOutputArgs(
+    mori::moe::EpDispatchCombineHandle& handle,
+    int64_t dispatchOutX_ptr, int64_t dispatchOutTopkIdx_ptr,
+    int64_t packedRecvX_ptr, int64_t packedRecvSrcInfo_ptr,
+    int hiddenDim) {
+  auto* args = new mori::moe::ConvertDispatchOutputArgs{};
+  args->config = handle.config;
+  if (hiddenDim > 0) args->config.hiddenDim = hiddenDim;
+  args->dispatchOutX = reinterpret_cast<void*>(dispatchOutX_ptr);
+  args->dispatchOutTopkIdx = reinterpret_cast<void*>(dispatchOutTopkIdx_ptr);
+  args->dispatchSrcTokenPos =
+      handle.dispTokIdToSrcTokIdMemObj->template GetAs<mori::moe::index_t*>();
+  args->totalRecvTokenNum = handle.totalRecvTokenNum;
+  args->dispatchGridBarrier = handle.dispatchGridBarrier;
+  args->packedRecvX = reinterpret_cast<void*>(packedRecvX_ptr);
+  args->packedRecvCount = handle.standardPackedRecvCount;
+  args->packedRecvSrcInfo = reinterpret_cast<int*>(packedRecvSrcInfo_ptr);
+  args->packedRecvLayoutRange = nullptr;
+  args->dispTokToEpSlotMap = handle.dispTokToEpSlotMap;
+  return reinterpret_cast<int64_t>(args);
+}
 
+int64_t BuildConvertCombineInputArgs(
+    mori::moe::EpDispatchCombineHandle& handle,
+    int64_t packedRecvX_ptr, int64_t packedRecvSrcInfo_ptr,
+    int hiddenDim) {
+  auto* args = new mori::moe::ConvertCombineInputArgs{};
+  args->config = handle.config;
+  if (hiddenDim > 0) args->config.hiddenDim = hiddenDim;
+  args->packedRecvX = reinterpret_cast<void*>(packedRecvX_ptr);
+  args->topkIdx = handle.shmemOutIndicesMemObj->Get();
+  args->topkWeights = handle.shmemDispatchOutWeightsMemObj->Get();
+  args->packedRecvSrcInfo = reinterpret_cast<void*>(packedRecvSrcInfo_ptr);
+  args->packedRecvLayoutRange = nullptr;
+  args->totalRecvTokenNum = handle.totalRecvTokenNum;
+  args->combineInput = handle.shmemCombineInpTokMemObj->Get();
+  args->dispTokToEpSlotMap = handle.dispTokToEpSlotMap;
+  args->packedRecvCount = handle.standardPackedRecvCount;
+  args->shmemCombineInpTokMemObj = handle.shmemCombineInpTokMemObj;
+  args->dispTokIdToSrcTokIdMemObj = handle.dispTokIdToSrcTokIdMemObj;
+  return reinterpret_cast<int64_t>(args);
+}
+
+void FreeConvertArgs(int64_t ptr) {
+  ::operator delete(reinterpret_cast<void*>(ptr));
+}
+
+int64_t GetStandardMoePackedRecvCountPtr(mori::moe::EpDispatchCombineHandle& handle) {
   return reinterpret_cast<int64_t>(handle.standardPackedRecvCount);
 }
 
-py::tuple LaunchCombineForStandardMoE(mori::moe::EpDispatchCombineHandle& handle, int kernelType,
-                                      int64_t expertOutput_ptr, int expertOutput_dtype,
-                                      int64_t hidden_dim, int64_t weight_ptr, int64_t topkIds_ptr,
-                                      int64_t stream, int blockNum, int rdmaBlockNum,
-                                      int warpPerBlock) {
-  handle.PrepareInference(
-      IntToHipDataType(expertOutput_dtype), nullptr, nullptr,
-      weight_ptr ? reinterpret_cast<float*>(weight_ptr) : nullptr,
-      reinterpret_cast<mori::moe::index_t*>(topkIds_ptr), handle.curRankNumToken);
-
-  handle.SetStandardMoeOutputBuffers(reinterpret_cast<void*>(expertOutput_ptr),
-                                     handle.standardPackedRecvCount,
-                                     handle.standardPackedRecvSrcInfo,
-                                     handle.standardPackedRecvLayoutRange);
-
-  handle.LaunchCombineForStandardMoE(static_cast<mori::moe::KernelType>(kernelType), blockNum,
-                                     rdmaBlockNum, warpPerBlock,
-                                     reinterpret_cast<hipStream_t>(stream),
-                                     static_cast<int>(hidden_dim));
-
-  int64_t out_ptr = reinterpret_cast<int64_t>(handle.shmemCombineOutTokMemObj->Get());
-  return py::make_tuple(out_ptr, static_cast<int64_t>(0));
+int64_t GetCombineInputPtr(mori::moe::EpDispatchCombineHandle& handle) {
+  return reinterpret_cast<int64_t>(handle.shmemCombineInpTokMemObj->Get());
 }
-
-int64_t ConvertDispatchOutput(mori::moe::EpDispatchCombineHandle& handle,
-                              int64_t dispatchOutX_ptr, int64_t dispatchOutTopkIdx_ptr,
-                              int64_t hidden_dim, int64_t stream, int blockNum, int warpPerBlock,
-                              int64_t packedRecvX_ptr, int64_t packedRecvSrcInfo_ptr) {
-  handle.LaunchConvertDispatchOutputKernel(
-      reinterpret_cast<void*>(dispatchOutX_ptr),
-      reinterpret_cast<void*>(dispatchOutTopkIdx_ptr), reinterpret_cast<void*>(packedRecvX_ptr),
-      handle.standardPackedRecvCount, reinterpret_cast<int*>(packedRecvSrcInfo_ptr), nullptr,
-      blockNum, warpPerBlock, reinterpret_cast<hipStream_t>(stream),
-      static_cast<int>(hidden_dim));
-
-  return reinterpret_cast<int64_t>(handle.standardPackedRecvCount);
-}
-
-int64_t ConvertCombineInput(mori::moe::EpDispatchCombineHandle& handle, int64_t packedRecvX_ptr,
-                            int64_t packedRecvSrcInfo_ptr, int64_t hidden_dim, int64_t stream,
-                            int blockNum, int warpPerBlock) {
-  void* combineInput_ptr = handle.shmemCombineInpTokMemObj->Get();
-
-  handle.LaunchConvertCombineInputKernel(
-      reinterpret_cast<void*>(packedRecvX_ptr), reinterpret_cast<void*>(packedRecvSrcInfo_ptr),
-      nullptr, combineInput_ptr, handle.shmemCombineInpTokMemObj, blockNum, warpPerBlock,
-      reinterpret_cast<hipStream_t>(stream), static_cast<int>(hidden_dim));
-
-  return reinterpret_cast<int64_t>(combineInput_ptr);
-}
-#endif  // ENABLE_STANDARD_MOE_ADAPT
-
-void LaunchDispatchRecv(mori::moe::EpDispatchCombineHandle& handle, int kernelType, int64_t stream,
-                        int blockNum = -1, int warpPerBlock = -1) {
-  handle.LaunchDispatchRecv(static_cast<mori::moe::KernelType>(kernelType), blockNum, warpPerBlock,
-                            reinterpret_cast<hipStream_t>(stream));
-}
-
-void LaunchCombineRecv(mori::moe::EpDispatchCombineHandle& handle, int kernelType, int64_t stream,
-                       int blockNum = -1, int warpPerBlock = -1) {
-  handle.LaunchCombineRecv(static_cast<mori::moe::KernelType>(kernelType), blockNum, warpPerBlock,
-                           reinterpret_cast<hipStream_t>(stream));
-}
+#endif
 
 void LaunchReset(mori::moe::EpDispatchCombineHandle& handle, int64_t stream) {
   handle.LaunchReset(reinterpret_cast<hipStream_t>(stream));
@@ -228,33 +223,29 @@ py::tuple GetDebugTimeOffset(mori::moe::EpDispatchCombineHandle& handle) {
 
 int GetCurDeviceWallClockFreqMhz() { return mori::GetCurDeviceWallClockFreqMhz(); }
 
-void LoadOpsKernels(const pybind11::object& path_or_paths) {
-  if (pybind11::isinstance<pybind11::str>(path_or_paths)) {
-    mori::moe::LoadJitKernelModule(path_or_paths.cast<std::string>().c_str());
-  } else {
-    for (auto& p : path_or_paths) {
-      mori::moe::LoadJitKernelModule(p.cast<std::string>().c_str());
-    }
-  }
-}
-
 void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   pybind11::class_<mori::moe::EpDispatchCombineHandle>(m, "EpDispatchCombineHandle")
       .def(pybind11::init<mori::moe::EpDispatchCombineConfig>(),
            py::arg("config") = mori::moe::EpDispatchCombineConfig{});
 
-  m.def("launch_dispatch", &LaunchDispatch);
-  m.def("launch_combine", &LaunchCombine);
+  m.def("prepare_inference", &PrepareInference);
+  m.def("build_args", &BuildArgs,
+        py::arg("handle"), py::arg("rdma_block_num") = -1,
+        py::arg("hidden_dim") = -1, py::arg("use_external_inp_buf") = -1);
+  m.def("free_args", &FreeArgs);
+  m.def("get_dispatch_output_ptrs", &GetDispatchOutputPtrs);
+  m.def("get_combine_output_ptrs", &GetCombineOutputPtrs);
+  m.def("get_handle_info", &GetHandleInfo);
 
 #ifdef ENABLE_STANDARD_MOE_ADAPT
-  m.def("launch_dispatch_standard_moe", &LaunchDispatchForStandardMoE);
-  m.def("launch_combine_standard_moe", &LaunchCombineForStandardMoE);
-  m.def("convert_dispatch_output", &ConvertDispatchOutput);
-  m.def("convert_combine_input", &ConvertCombineInput);
+  m.def("set_standard_moe_output_buffers", &SetStandardMoeOutputBuffers);
+  m.def("build_convert_dispatch_output_args", &BuildConvertDispatchOutputArgs);
+  m.def("build_convert_combine_input_args", &BuildConvertCombineInputArgs);
+  m.def("free_convert_args", &FreeConvertArgs);
+  m.def("get_standard_moe_packed_recv_count_ptr", &GetStandardMoePackedRecvCountPtr);
+  m.def("get_combine_input_ptr", &GetCombineInputPtr);
 #endif
 
-  m.def("launch_dispatch_recv", &LaunchDispatchRecv);
-  m.def("launch_combine_recv", &LaunchCombineRecv);
   m.def("launch_reset", &LaunchReset);
 
   m.def("get_cur_rank_num_token", &mori::moe::EpDispatchCombineHandle::GetCurRankNumToken);
@@ -323,8 +314,6 @@ void RegisterMoriOps(py::module_& m) {
 
   m.def("get_cur_device_wall_clock_freq_mhz", &GetCurDeviceWallClockFreqMhz,
         "Returns clock frequency of current device's wall clock");
-  m.def("load_ops_kernels", &LoadOpsKernels,
-        "Load JIT-compiled ops kernels from .hsaco file");
 }
 
 }  // namespace mori

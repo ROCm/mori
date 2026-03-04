@@ -118,3 +118,40 @@ class HipFunction:
             c_void_p(0),
         )
         _check(err, f"hipModuleLaunchKernel({self._name})")
+
+    def launch_struct(
+        self,
+        grid: tuple[int, ...],
+        block: tuple[int, ...],
+        shared_mem: int,
+        stream: int,
+        struct_ptr: int,
+    ) -> None:
+        """Launch the kernel with a single struct argument passed by value.
+
+        ``struct_ptr`` is a host pointer to the argument struct.
+        hipModuleLaunchKernel reads the struct data from this address.
+        """
+        hip = _get_hip_lib()
+
+        # kernelParams[0] must be the address of the struct data.
+        # By storing struct_ptr in a c_void_p array, &params[0] == struct_ptr.
+        params = (c_void_p * 1)(c_void_p(struct_ptr))
+
+        gx = grid[0] if len(grid) > 0 else 1
+        gy = grid[1] if len(grid) > 1 else 1
+        gz = grid[2] if len(grid) > 2 else 1
+        bx = block[0] if len(block) > 0 else 1
+        by = block[1] if len(block) > 1 else 1
+        bz = block[2] if len(block) > 2 else 1
+
+        err = hip.hipModuleLaunchKernel(
+            self._func,
+            c_uint(gx), c_uint(gy), c_uint(gz),
+            c_uint(bx), c_uint(by), c_uint(bz),
+            c_uint(shared_mem),
+            c_void_p(stream),
+            ctypes.cast(params, POINTER(c_void_p)),
+            c_void_p(0),
+        )
+        _check(err, f"hipModuleLaunchKernel({self._name})")

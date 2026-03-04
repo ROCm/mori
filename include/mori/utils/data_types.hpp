@@ -21,7 +21,11 @@
 // SOFTWARE.
 #pragma once
 
+// hip_fp8.h pulls in amd_warp_functions.h on ROCm <=6.x which uses GPU
+// builtins unavailable in CXX mode.  Only include under hipcc.
+#if defined(__HIPCC__) || defined(__CUDACC__)
 #include <hip/hip_fp8.h>
+#endif
 
 #if __has_include(<hip/hip_ext_ocp.h>) && (defined(__HIPCC__) || defined(__CUDACC__))
 #include <hip/hip_ext_ocp.h>

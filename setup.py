@@ -197,6 +197,39 @@ def _detect_nic_type() -> dict:
     return result
 
 
+def _copy_jit_sources(root_dir: Path) -> None:
+    """Copy JIT-required source files into the package for wheel distribution.
+
+    This creates python/mori/_jit_sources/ with the same directory structure
+    as the repo root, so that get_mori_source_root() can use it as a drop-in
+    replacement when the original source tree is not available.
+    """
+    jit_dir = root_dir / "python" / "mori" / "_jit_sources"
+    if jit_dir.exists():
+        shutil.rmtree(jit_dir)
+
+    def _copytree(src, dst, **kw):
+        shutil.copytree(src, dst, dirs_exist_ok=True, **kw)
+
+    _copytree(root_dir / "include", jit_dir / "include")
+
+    _copytree(root_dir / "src" / "ops" / "kernels", jit_dir / "src" / "ops" / "kernels")
+    _copytree(root_dir / "src" / "ops" / "dispatch_combine",
+              jit_dir / "src" / "ops" / "dispatch_combine")
+
+    shmem_dst = jit_dir / "src" / "shmem"
+    shmem_dst.mkdir(parents=True, exist_ok=True)
+    for name in ["shmem_device_api_wrapper.cpp"]:
+        src_file = root_dir / "src" / "shmem" / name
+        if src_file.is_file():
+            shutil.copy2(src_file, shmem_dst / name)
+
+    for subdir in ["spdlog/include", "msgpack-c/include"]:
+        src = root_dir / "3rdparty" / subdir
+        if src.is_dir():
+            _copytree(src, jit_dir / "3rdparty" / subdir)
+
+
 class CMakeBuild(build_ext):
     def run(self) -> None:
         try:
@@ -284,6 +317,7 @@ class CMakeBuild(build_ext):
         for src_path, dst_path in files_to_copy:
             shutil.copyfile(src_path, dst_path)
 
+        _copy_jit_sources(root_dir)
 
 
 class CustomBuild(_build):
@@ -309,6 +343,14 @@ setup(
             "libmori_pybinds.so",
             "libmori_io.so",
             "libmori_application.so",
+            "_jit_sources/include/**/*.hpp",
+            "_jit_sources/include/**/*.h",
+            "_jit_sources/src/**/*.hip",
+            "_jit_sources/src/**/*.hpp",
+            "_jit_sources/src/**/*.cpp",
+            "_jit_sources/src/**/*.h",
+            "_jit_sources/3rdparty/**/*.h",
+            "_jit_sources/3rdparty/**/*.hpp",
         ],
         "mori.ir": ["*.bc"],
     },

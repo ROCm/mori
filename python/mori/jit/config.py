@@ -243,12 +243,20 @@ def detect_build_config() -> BuildConfig:
 
 
 def get_mori_source_root() -> Path | None:
-    """Locate the mori source tree root (for development/source installs).
+    """Locate the mori source tree root for JIT compilation.
 
-    Returns None when running from a wheel without source tree.
+    Search order:
+      1. Development / editable install: repo root (3 levels up from this file)
+      2. Wheel install: _jit_sources/ packaged inside the mori package
     """
     here = Path(__file__).resolve().parent          # python/mori/jit/
+
     candidate = here.parent.parent.parent           # <repo>/
     if (candidate / "include" / "mori").is_dir() and (candidate / "src" / "shmem").is_dir():
         return candidate
+
+    packaged = here.parent / "_jit_sources"         # mori/_jit_sources/
+    if (packaged / "include" / "mori").is_dir():
+        return packaged
+
     return None
