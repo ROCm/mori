@@ -396,17 +396,50 @@ class MoriIoBenchmark:
 
     def _validate_rdma(self):
         if self.role is EngineRole.INITIATOR:
-            int8_tensor = torch.empty(
+            recv_tensor = torch.empty(
                 self.buffer_size * self.transfer_batch_size,
                 device=self.device,
-                dtype=torch.int8,
+                dtype=torch.uint8,
             )
-            dist.recv(int8_tensor, src=self.num_initiator_dev + self.role_rank)
-            tensor = int8_tensor.view(torch.float8_e4m3fnuz)
-            assert torch.equal(self.tensor, tensor)
+            dist.recv(recv_tensor, src=self.num_initiator_dev + self.role_rank)
+            if self.batch_non_contiguous:
+                # Received data is packed (contiguous); compare to packed view of self.tensor
+                stride = self.buffer_size + 1
+                expected = torch.empty(
+                    self.buffer_size * self.transfer_batch_size,
+                    device=self.device,
+                    dtype=torch.uint8,
+                )
+                for i in range(self.transfer_batch_size):
+                    beg = i * stride
+                    end = beg + self.buffer_size
+                    expected[i * self.buffer_size : (i + 1) * self.buffer_size].copy_(
+                        self.tensor[beg:end].view(torch.uint8)
+                    )
+                assert torch.equal(recv_tensor, expected)
+            else:
+                expected = self.tensor.view(torch.uint8)
+                assert torch.equal(recv_tensor, expected)
         else:
-            int8_view = self.tensor.view(torch.uint8)
-            dist.send(int8_view, dst=self.role_rank)
+            # With batch_non_contiguous, tensor has (buffer_size+1)*transfer_batch_size
+            # elements; Gloo send size must match initiator recv (buffer_size*transfer_batch_size).
+            if self.batch_non_contiguous:
+                stride = self.buffer_size + 1
+                packed = torch.empty(
+                    self.buffer_size * self.transfer_batch_size,
+                    device=self.device,
+                    dtype=torch.uint8,
+                )
+                for i in range(self.transfer_batch_size):
+                    beg = i * stride
+                    end = beg + self.buffer_size
+                    packed[i * self.buffer_size : (i + 1) * self.buffer_size].copy_(
+                        self.tensor[beg:end].view(torch.uint8)
+                    )
+                dist.send(packed, dst=self.role_rank)
+            else:
+                int8_view = self.tensor.view(torch.uint8)
+                dist.send(int8_view, dst=self.role_rank)
 
     def _validate_xgmi(self):
         if self.xgmi_multiprocess:
@@ -820,6 +853,7 @@ class MoriIoBenchmark:
         ):
             self.initialize()
             self.run_once(self.buffer_size, self.transfer_batch_size)
+            dist.barrier()
             self.validate()
             self.run_once(self.buffer_size, self.transfer_batch_size)
             dist.barrier()
