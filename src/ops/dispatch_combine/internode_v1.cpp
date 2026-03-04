@@ -1400,6 +1400,12 @@ __global__ void EpCombineSyncBarrier(EpDispatchCombineArgs<T> args) {
 #define MORI_FP8_OCP(...)
 #endif
 
+#ifdef MORI_HAS_OCP_FP
+#define MORI_FP4_OCP(...) __VA_ARGS__
+#else
+#define MORI_FP4_OCP(...)
+#endif
+
 // Macro to instantiate a kernel for all data types
 #define INSTANTIATE_KERNEL(KernelName)                                                         \
   template __global__ void KernelName<hip_bfloat16>(EpDispatchCombineArgs<hip_bfloat16> args); \
@@ -1407,8 +1413,8 @@ __global__ void EpCombineSyncBarrier(EpDispatchCombineArgs<T> args) {
                     EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)                         \
   MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3>(                            \
                    EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                               \
-  template __global__ void KernelName<mori_fp4x2_e2m1>(                                        \
-      EpDispatchCombineArgs<mori_fp4x2_e2m1> args);                                            \
+  MORI_FP4_OCP(template __global__ void KernelName<mori_fp4x2_e2m1>(                           \
+      EpDispatchCombineArgs<mori_fp4x2_e2m1> args);)                                          \
   template __global__ void KernelName<float>(EpDispatchCombineArgs<float> args);
 
 // Macro to instantiate a kernel with EnableStdMoE parameter for all data types
@@ -1419,8 +1425,8 @@ __global__ void EpCombineSyncBarrier(EpDispatchCombineArgs<T> args) {
                     EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)            \
   MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3, StdMoE>(       \
                    EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                  \
-  template __global__ void KernelName<mori_fp4x2_e2m1, StdMoE>(                   \
-      EpDispatchCombineArgs<mori_fp4x2_e2m1> args);                               \
+  MORI_FP4_OCP(template __global__ void KernelName<mori_fp4x2_e2m1, StdMoE>(     \
+      EpDispatchCombineArgs<mori_fp4x2_e2m1> args);)                              \
   template __global__ void KernelName<float, StdMoE>(EpDispatchCombineArgs<float> args);
 
 // Same as above but without fp4x2 (its packed layout is incompatible with
@@ -1454,6 +1460,7 @@ INSTANTIATE_LL_KERNEL_WITH_STDMOE(EpCombineInterNodeV1KernelLowLatency)
 
 #undef MORI_FP8_FNUZ
 #undef MORI_FP8_OCP
+#undef MORI_FP4_OCP
 #undef INSTANTIATE_KERNEL
 #undef INSTANTIATE_LL_KERNEL
 #undef INSTANTIATE_LL_KERNEL_WITH_STDMOE

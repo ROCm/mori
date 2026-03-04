@@ -21,10 +21,14 @@
 // SOFTWARE.
 #pragma once
 
-#include "mori/core/transport/rdma/device_primitives.hpp"
-#include "mori/core/transport/rdma/host_primitives.hpp"
 #include "mori/core/transport/rdma/primitives.hpp"
+#include "mori/core/transport/rdma/host_primitives.hpp"
+
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#include "mori/core/transport/rdma/device_primitives.hpp"
 #include "mori/core/transport/rdma/providers/mlx5/mlx5_device_primitives.hpp"
-#include "mori/core/transport/rdma/providers/mlx5/mlx5_host_primitives.hpp"
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_device_primitives.hpp"
 #include "mori/core/transport/rdma/providers/ionic/ionic_device_primitives.hpp"
+#endif
+
+#include "mori/core/transport/rdma/providers/mlx5/mlx5_host_primitives.hpp"

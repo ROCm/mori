@@ -22,18 +22,19 @@
 #pragma once
 
 #ifdef ENABLE_BNXT
-extern "C" {
 #include <infiniband/bnxt_re_dv.h>
-#include <infiniband/bnxt_re_hsi.h>
-}  // ENABLE_BNXT
-#else
 extern "C" {
+#include <infiniband/bnxt_re_hsi.h>
+}
+#else
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_re_dv.h"
+extern "C" {
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_re_hsi.h"
 }
 #endif
 
 #include "mori/application/transport/rdma/rdma.hpp"
+#include "mori/core/transport/rdma/providers/bnxt/bnxt_defs.hpp"
 
 #include <mutex>
 #include <set>

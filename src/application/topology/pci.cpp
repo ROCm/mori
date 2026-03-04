@@ -28,6 +28,7 @@
 
 #include <cassert>
 #include <iomanip>
+#include <limits>
 #include <queue>
 #include <regex>
 #include <sstream>

@@ -92,6 +92,7 @@ struct VecTypeAdaptor<float, 4> {
   using dataType = float4;
 };
 
+#ifdef MORI_HAS_OCP_FP
 template <>
 struct VecTypeAdaptor<mori_fp4_e2m1, 2> {
   using dataType = mori_fp4x2_e2m1;
@@ -101,6 +102,7 @@ template <>
 struct VecTypeAdaptor<mori_fp4_e2m1, 4> {
   using dataType = mori_fp4x4_e2m1;
 };
+#endif // MORI_HAS_OCP_FP
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           Load/Store                                           */

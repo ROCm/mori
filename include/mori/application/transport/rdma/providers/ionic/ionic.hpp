@@ -21,7 +21,7 @@
 // SOFTWARE.
 #pragma once
 
-#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
 

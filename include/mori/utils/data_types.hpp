@@ -21,10 +21,13 @@
 // SOFTWARE.
 #pragma once
 
-#include <hip/hip_ext_ocp.h>
 #include <hip/hip_fp8.h>
 
+#if __has_include(<hip/hip_ext_ocp.h>) && (defined(__HIPCC__) || defined(__CUDACC__))
+#include <hip/hip_ext_ocp.h>
 #include <hip/amd_detail/amd_hip_ocp_host.hpp>
+#define MORI_HAS_OCP_FP 1
+#endif
 
 namespace mori {
 
@@ -57,6 +60,7 @@ typedef uint8_t mori_fp4_storage;
 typedef uint8_t mori_fp4x2_storage;
 typedef uint16_t mori_fp4x4_storage;
 
+#ifdef MORI_HAS_OCP_FP
 __device__ static mori_fp4_storage bfloat16_to_fp4_e2m1(const __hip_bfloat16 x) {
   union {
     uint32_t ui32;
@@ -113,15 +117,15 @@ __device__ static mori_fp4x2_storage float2_to_fp4x2_e2m1(const float2 x) {
 #endif
   return u.fp4x2[0];
 }
+#endif // MORI_HAS_OCP_FP
 
 struct mori_fp4_e2m1 {
   mori_fp4_storage x;
 
  public:
   __device__ mori_fp4_e2m1() = default;
-
+#ifdef MORI_HAS_OCP_FP
   __device__ explicit mori_fp4_e2m1(const __hip_bfloat16 f) : x(bfloat16_to_fp4_e2m1(f)) {}
-
   __device__ explicit mori_fp4_e2m1(const float f) : x(float_to_fp4_e2m1(f)) {}
 
   __device__ operator __hip_bfloat16() const {
@@ -150,6 +154,7 @@ struct mori_fp4_e2m1 {
 #endif
     return ret[0];
   }
+#endif // MORI_HAS_OCP_FP
 };
 
 struct mori_fp4x2_e2m1 {
@@ -157,9 +162,8 @@ struct mori_fp4x2_e2m1 {
 
  public:
   __device__ mori_fp4x2_e2m1() = default;
-
+#ifdef MORI_HAS_OCP_FP
   __device__ explicit mori_fp4x2_e2m1(const __hip_bfloat162 f) : x(bfloat162_to_fp4x2_e2m1(f)) {}
-
   __device__ explicit mori_fp4x2_e2m1(const float2 f) : x(float2_to_fp4x2_e2m1(f)) {}
 
   __device__ operator __hip_bfloat162() const {
@@ -188,6 +192,7 @@ struct mori_fp4x2_e2m1 {
 #endif
     return float2(fp32x2[0], fp32x2[1]);
   }
+#endif // MORI_HAS_OCP_FP
 };
 
 struct mori_fp4x4_e2m1 {
@@ -195,7 +200,7 @@ struct mori_fp4x4_e2m1 {
 
  public:
   __device__ mori_fp4x4_e2m1() = default;
-
+#ifdef MORI_HAS_OCP_FP
   __device__ explicit mori_fp4x4_e2m1(const __hip_bfloat162 low, const __hip_bfloat162 high)
       : x(bfloat162_to_fp4x2_e2m1(high) << 8 | bfloat162_to_fp4x2_e2m1(low)) {}
 
@@ -217,6 +222,7 @@ struct mori_fp4x4_e2m1 {
 #endif
     return float4(fp32x2_1[0], fp32x2_1[1], fp32x2_2[0], fp32x2_2[1]);
   }
+#endif // MORI_HAS_OCP_FP
 };
 
 }  // namespace mori

@@ -21,6 +21,8 @@
 // SOFTWARE.
 #pragma once
 
+#include "mori/hip_compat.hpp"
+
 #ifndef warpSize
 #if defined(__GFX8__) || defined(__GFX9__)
   #define warpSize 64
@@ -40,6 +42,8 @@
 
 namespace mori {
 namespace core {
+
+#if defined(__HIPCC__) || defined(__CUDACC__)
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                             Thread                                             */
@@ -198,6 +202,8 @@ __device__ T AtomicCompareExchangeSystem(T* address, T* compare, T val) {
   return *compare;
 }
 
+#endif // __HIPCC__ || __CUDACC__
+
 /* -------------------------------------------------------------------------- */
 /*                                    Match                                   */
 /* -------------------------------------------------------------------------- */
@@ -211,10 +217,11 @@ constexpr inline __device__ __host__ T IsPowerOf2(T x) {
   return (x > 0) && ((x & (x - 1)) == 0);
 }
 
+#if defined(__HIPCC__) || defined(__CUDACC__)
+
 /* -------------------------------------------------------------------------- */
 /*                                    Lock                                    */
 /* -------------------------------------------------------------------------- */
-// TODO: Whether to use GPU lock in lock.hpp
 __device__ inline void AcquireLock(uint32_t* lockVar) {
   while (atomicCAS(lockVar, 0, 1) != 0) {
   }
@@ -417,6 +424,8 @@ __device__ __forceinline__ void spin_lock_release_shared(uint32_t *lock, uint64_
 					   __HIP_MEMORY_SCOPE_AGENT);
   }
 }
+
+#endif // __HIPCC__ || __CUDACC__
 
 }  // namespace core
 }  // namespace mori

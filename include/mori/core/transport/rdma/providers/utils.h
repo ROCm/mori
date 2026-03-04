@@ -24,9 +24,13 @@
 #include <iostream>
 #include <string>
 
+#include "mori/hip_compat.hpp"
 #include "infiniband/mlx5dv.h"
-#include "mori/core/transport/rdma/device_primitives.hpp"
+#include "mori/core/transport/rdma/primitives.hpp"
 #include "mori/core/utils.hpp"
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#include "mori/core/transport/rdma/device_primitives.hpp"
+#endif
 
 #if defined(ENABLE_BNXT) || defined(MORI_DEVICE_NIC_BNXT)
 extern "C" {

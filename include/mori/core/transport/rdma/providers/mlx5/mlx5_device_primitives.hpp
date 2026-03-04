@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <cassert>
 #include <hip/hip_runtime.h>
 
 #include "infiniband/mlx5dv.h"

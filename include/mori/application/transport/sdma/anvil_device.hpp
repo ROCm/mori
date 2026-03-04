@@ -10,8 +10,13 @@
 #include <stdint.h> // Required for uint32_t
 #include <cassert>
 #include <hip/hip_ext.h>
-#include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
+
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#include <hip/hip_runtime.h>
+#else
+#include "mori/hip_compat.hpp"
+#endif
 
 #include "hsakmt/hsakmt.h"
 #include "hsakmt/hsakmttypes.h"
@@ -21,12 +26,13 @@
 namespace anvil
 {
 
-// TODO
 constexpr uint32_t SDMA_QUEUE_SIZE = 256 * 1024; // 256KB
 constexpr HSA_QUEUE_PRIORITY DEFAULT_PRIORITY = HSA_QUEUE_PRIORITY_NORMAL;
 constexpr unsigned int DEFAULT_QUEUE_PERCENTAGE = 100;
 constexpr int MAX_RETRIES = 1 << 30;
 constexpr bool BREAK_ON_RETRIES = true;
+
+#if defined(__HIPCC__) || defined(__CUDACC__)
 
 __device__ __forceinline__ SDMA_PKT_COPY_LINEAR CreateCopyPacket(void* srcBuf, void* dstBuf, long long int packetSize)
 {
@@ -96,8 +102,11 @@ __device__ __forceinline__ bool waitForSignal(HSAuint64* addr, uint64_t expected
    return false;
 }
 
+#endif // __HIPCC__ || __CUDACC__
+
 struct SdmaQueueDeviceHandle
 {
+#if defined(__HIPCC__) || defined(__CUDACC__)
    __device__ __forceinline__ uint64_t WrapIntoRing(uint64_t index)
    {
       const uint64_t queue_size_in_bytes = SDMA_QUEUE_SIZE;
@@ -241,6 +250,20 @@ struct SdmaQueueDeviceHandle
       __builtin_nontemporal_store(pendingWptr, committedWptr);
    }
 
+ private:
+   __device__ __forceinline__ bool nontemporal_compare_exchange(uint64_t* vaddr, uint64_t expected, uint64_t value)
+   {
+      uint64_t vdst;
+      unsigned __int128 vdata = ((unsigned __int128)expected << 64) | value;
+      __asm__ __volatile__("flat_atomic_cmpswap_x2 %0, %1, %2 sc0 nt;\n s_waitcnt vmcnt(0); \n\t"
+                           : "=v"(vdst)
+                           : "v"(vaddr), "v"(vdata));
+      return (vdst == expected);
+   }
+
+ public:
+#endif // __HIPCC__ || __CUDACC__
+
    // Queue resources
    uint32_t* queueBuf;
    HSAuint64* rptr;
@@ -252,21 +275,11 @@ struct SdmaQueueDeviceHandle
    uint64_t* committedWptr;
    // local variables
    uint64_t cachedHwReadIndex;
-
- private:
-   __device__ __forceinline__ bool nontemporal_compare_exchange(uint64_t* vaddr, uint64_t expected, uint64_t value)
-   {
-      uint64_t vdst;
-      unsigned __int128 vdata = ((unsigned __int128)expected << 64) | value;
-      __asm__ __volatile__("flat_atomic_cmpswap_x2 %0, %1, %2 sc0 nt;\n s_waitcnt vmcnt(0); \n\t"
-                           : "=v"(vdst)
-                           : "v"(vaddr), "v"(vdata));
-      return (vdst == expected);
-   }
 };
 
 struct SdmaQueueSingleProducerDeviceHandle : SdmaQueueDeviceHandle
 {
+#if defined(__HIPCC__) || defined(__CUDACC__)
    __device__ __forceinline__ void PadRingToEnd(uint64_t cur_index)
    {
       const uint64_t queue_size_in_bytes = SDMA_QUEUE_SIZE;
@@ -334,9 +347,12 @@ struct SdmaQueueSingleProducerDeviceHandle : SdmaQueueDeviceHandle
 
       *doorbell = (HSAuint64)pendingWptr;
    }
+#endif // __HIPCC__ || __CUDACC__
 };
 
 static_assert(sizeof(SdmaQueueSingleProducerDeviceHandle) == sizeof(SdmaQueueDeviceHandle));
+
+#if defined(__HIPCC__) || defined(__CUDACC__)
 
 __device__ __forceinline__ void put(SdmaQueueDeviceHandle& handle, void* dst, void* src, size_t size)
 {
@@ -367,5 +383,7 @@ __device__ __forceinline__ void putWithSignal(SdmaQueueDeviceHandle& handle, voi
    handle.placePacket(signal_packet, pendingWptr);
    handle.submitPacket(base, pendingWptr);
 }
+
+#endif // __HIPCC__ || __CUDACC__
 
 } // namespace anvil

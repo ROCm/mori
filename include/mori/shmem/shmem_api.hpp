@@ -27,7 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "hip/hip_runtime.h"
+#include "hip/hip_runtime_api.h"
 #include "mori/application/application.hpp"
 
 namespace mori {

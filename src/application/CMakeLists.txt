@@ -56,22 +56,24 @@ list(APPEND MORI_APP_SOURCES
   topology/pci.cpp
   topology/system.cpp)
 
+set_source_files_properties(${MORI_APP_SOURCES} PROPERTIES LANGUAGE CXX)
 add_library(mori_application SHARED ${MORI_APP_SOURCES})
 
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR})
+find_library(ROCM_SMI_LIB rocm_smi64 HINTS /opt/rocm/lib REQUIRED)
+find_library(HSA_RUNTIME_LIB hsa-runtime64 HINTS /opt/rocm/lib REQUIRED)
 target_link_libraries(
   mori_application
   PUBLIC
   MPI::MPI_CXX
   ibverbs
   hip::host
-  hip::device
   mlx5
-  rocm_smi64
+  ${ROCM_SMI_LIB}
   pci
   mori_logging
-  hsa-runtime64
+  ${HSA_RUNTIME_LIB}
   hsakmt::hsakmt)
 #  ${IONIC_LIBRARY})
 

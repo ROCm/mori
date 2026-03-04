@@ -29,6 +29,8 @@
 #include <sstream>
 #include <variant>
 
+#include "mori/hip_compat.hpp"
+
 #include "mori/application/application.hpp"
 #include "mori/core/profiler/constants.hpp"
 #include "mori/core/profiler/kernel_profiler.hpp"
@@ -467,8 +469,10 @@ inline EpDispatchCombineArgsVariant GetEpDispatchCombineArgsByInputType(
     case HIP_R_8F_E4M3_FNUZ:
       return GetEpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>(handle, rdmaBlockNum);
 #endif
+#ifdef MORI_HAS_OCP_FP
     case HIP_R_4F_E2M1:
       return GetEpDispatchCombineArgs<mori_fp4x2_e2m1>(handle, rdmaBlockNum);
+#endif
     default:
       std::ostringstream oss;
       oss << "Unsupported inputType " << HipDataTypeToString(handle.inputType)

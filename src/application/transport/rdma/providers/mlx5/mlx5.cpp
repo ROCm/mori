@@ -21,7 +21,7 @@
 // SOFTWARE.
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
 
-#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
 

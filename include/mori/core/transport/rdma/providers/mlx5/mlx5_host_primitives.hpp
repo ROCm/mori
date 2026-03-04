@@ -21,13 +21,14 @@
 // SOFTWARE.
 #pragma once
 
-#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 
 #include <atomic>
 
+#include "mori/hip_compat.hpp"
 #include "infiniband/mlx5dv.h"
 #include "mori/application/utils/udma_barrier.h"
-#include "mori/core/transport/rdma/device_primitives.hpp"
+#include "mori/core/transport/rdma/host_primitives.hpp"
 #include "mori/core/transport/rdma/providers/mlx5/mlx5_defs.hpp"
 #include "mori/core/transport/rdma/providers/utils.h"
 

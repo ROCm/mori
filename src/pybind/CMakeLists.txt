@@ -36,7 +36,10 @@ if(NOT _pybind11_result EQUAL 0)
 endif()
 message(STATUS "pybind11 include dir: ${PYBIND11_INCLUDE_DIR}")
 
-add_library(mori_pybinds SHARED mori.cpp pybind_ops.cpp pybind_shmem.cpp pybind_io.cpp)
+set(MORI_PYBIND_SOURCES mori.cpp pybind_ops.cpp pybind_shmem.cpp pybind_io.cpp)
+set_source_files_properties(${MORI_PYBIND_SOURCES} PROPERTIES LANGUAGE CXX)
+# HIP stub triggers the HIP linker for device code from static libs (mori_ops, mori_shmem)
+add_library(mori_pybinds SHARED ${MORI_PYBIND_SOURCES} device_link_stub.hip)
 
 if(ENABLE_PROFILER)
   target_sources(mori_pybinds PRIVATE ${PROFILER_OUTPUT_PYBIND})
@@ -47,12 +50,14 @@ target_include_directories(
   mori_pybinds PUBLIC ${PYTHON_INCLUDE_DIRS}
                       ${PYBIND11_INCLUDE_DIR}
                       ${CMAKE_BINARY_DIR}/generated/include)
+target_link_directories(mori_pybinds PRIVATE /opt/rocm/lib)
+target_compile_options(mori_pybinds PRIVATE "-fgpu-rdc" "-mcode-object-version=5")
+target_link_options(mori_pybinds PRIVATE "-fgpu-rdc" "-mcode-object-version=5")
 target_link_libraries(
   mori_pybinds
   mori_ops
   mori_io
-  hip::host
-  hip::device)
+  hip::host)
 
 # For python packages to find dependent libraries
 if(BUILD_TORCH_BOOTSTRAP)

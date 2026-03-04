@@ -28,7 +28,7 @@
 #include <map>
 #include <vector>
 
-#include "hip/hip_runtime.h"
+#include "hip/hip_runtime_api.h"
 #include "mori/application/bootstrap/local_bootstrap.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"

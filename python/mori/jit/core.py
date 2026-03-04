@@ -86,6 +86,7 @@ def _hipcc_device_bc(
         "-std=c++17",
         "-O2",
         "-D__HIP_PLATFORM_AMD__",
+        "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
         *_nic_defines(),
     ]
     for d in include_dirs:
@@ -214,6 +215,7 @@ def _hipcc_genco(
         "-std=c++17",
         "-O2",
         "-D__HIP_PLATFORM_AMD__",
+        "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
         *_nic_defines(),
     ]
     for d in include_dirs:

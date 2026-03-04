@@ -54,6 +54,12 @@ using namespace mori::moe;
 #define MORI_FP8_ANY(...)
 #endif
 
+#ifdef MORI_HAS_OCP_FP
+#define MORI_FP4(...) __VA_ARGS__
+#else
+#define MORI_FP4(...)
+#endif
+
 // ---------------------------------------------------------------------------
 // Wrapper macros
 // ---------------------------------------------------------------------------
@@ -66,7 +72,7 @@ using namespace mori::moe;
   WRAP(kernel, bf16, hip_bfloat16) \
   MORI_FP8_FNUZ(WRAP(kernel, fp8_fnuz, __hip_fp8_e4m3_fnuz)) \
   MORI_FP8_OCP(WRAP(kernel, fp8_ocp, __hip_fp8_e4m3)) \
-  WRAP(kernel, fp4, mori::mori_fp4x2_e2m1) \
+  MORI_FP4(WRAP(kernel, fp4, mori::mori_fp4x2_e2m1)) \
   WRAP(kernel, f32, float)
 
 #define WRAP_BOOL(kernel, suffix, T, B) \
@@ -78,7 +84,7 @@ using namespace mori::moe;
   WRAP_BOOL(kernel, bf16##bool_suffix, hip_bfloat16, B) \
   MORI_FP8_FNUZ(WRAP_BOOL(kernel, fp8_fnuz##bool_suffix, __hip_fp8_e4m3_fnuz, B)) \
   MORI_FP8_OCP(WRAP_BOOL(kernel, fp8_ocp##bool_suffix, __hip_fp8_e4m3, B)) \
-  WRAP_BOOL(kernel, fp4##bool_suffix, mori::mori_fp4x2_e2m1, B) \
+  MORI_FP4(WRAP_BOOL(kernel, fp4##bool_suffix, mori::mori_fp4x2_e2m1, B)) \
   WRAP_BOOL(kernel, f32##bool_suffix, float, B)
 
 #define WRAP_BOOL3(kernel, suffix, T, B1, B2, B3) \
@@ -90,5 +96,5 @@ using namespace mori::moe;
   WRAP_BOOL3(kernel, bf16##bool_suffix, hip_bfloat16, B1, B2, B3) \
   MORI_FP8_FNUZ(WRAP_BOOL3(kernel, fp8_fnuz##bool_suffix, __hip_fp8_e4m3_fnuz, B1, B2, B3)) \
   MORI_FP8_OCP(WRAP_BOOL3(kernel, fp8_ocp##bool_suffix, __hip_fp8_e4m3, B1, B2, B3)) \
-  WRAP_BOOL3(kernel, fp4##bool_suffix, mori::mori_fp4x2_e2m1, B1, B2, B3) \
+  MORI_FP4(WRAP_BOOL3(kernel, fp4##bool_suffix, mori::mori_fp4x2_e2m1, B1, B2, B3)) \
   WRAP_BOOL3(kernel, f32##bool_suffix, float, B1, B2, B3)

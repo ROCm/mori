@@ -26,6 +26,7 @@
 #include <mutex>
 #include <vector>
 
+#include "mori/hip_compat.hpp"
 #include "mori/application/application.hpp"
 #include "mori/application/bootstrap/bootstrap.hpp"
 

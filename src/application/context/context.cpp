@@ -22,7 +22,7 @@
 #include "mori/application/context/context.hpp"
 
 #include <arpa/inet.h>
-#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 #include <ifaddrs.h>
 #include <netdb.h>
 #include <string.h>

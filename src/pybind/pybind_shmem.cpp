@@ -23,7 +23,7 @@
 
 #include <pybind11/pybind11.h>
 
-#include "mori/shmem/shmem.hpp"
+#include "mori/shmem/shmem_api.hpp"
 
 namespace py = pybind11;
 

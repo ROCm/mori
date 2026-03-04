@@ -411,6 +411,12 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
 #define MORI_FP8_ANY(...)
 #endif
 
+#ifdef MORI_HAS_OCP_FP
+#define MORI_FP4_OCP(...) __VA_ARGS__
+#else
+#define MORI_FP4_OCP(...)
+#endif
+
 // Macro to instantiate async kernels for all data types
 #define INSTANTIATE_ASYNC_KERNEL(KernelName)                                                \
   template __global__ void KernelName<hip_bfloat16>(EpDispatchCombineArgs<hip_bfloat16>    \
@@ -419,8 +425,8 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
                     EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)                      \
   MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3>(                         \
                    EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                            \
-  template __global__ void KernelName<mori_fp4x2_e2m1>(EpDispatchCombineArgs<mori_fp4x2_e2m1> \
-                                                            args);                           \
+  MORI_FP4_OCP(template __global__ void KernelName<mori_fp4x2_e2m1>(                        \
+                   EpDispatchCombineArgs<mori_fp4x2_e2m1> args);)                           \
   template __global__ void KernelName<float>(EpDispatchCombineArgs<float> args);
 
 // Macro to instantiate async combine kernels (includes optional bf16->fp8 direct-cast path)
@@ -433,8 +439,8 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
                     EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)                      \
   MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3>(                         \
                    EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                            \
-  template __global__ void KernelName<mori_fp4x2_e2m1>(EpDispatchCombineArgs<mori_fp4x2_e2m1> \
-                                                            args);                           \
+  MORI_FP4_OCP(template __global__ void KernelName<mori_fp4x2_e2m1>(                        \
+                   EpDispatchCombineArgs<mori_fp4x2_e2m1> args);)                           \
   template __global__ void KernelName<float>(EpDispatchCombineArgs<float> args);
 
 INSTANTIATE_ASYNC_KERNEL(EpDispatchLowLatencyAsyncSend)
@@ -445,6 +451,7 @@ INSTANTIATE_ASYNC_COMBINE_KERNEL(EpCombineLowLatencyAsyncRecv)
 #undef MORI_FP8_FNUZ
 #undef MORI_FP8_OCP
 #undef MORI_FP8_ANY
+#undef MORI_FP4_OCP
 #undef INSTANTIATE_ASYNC_KERNEL
 #undef INSTANTIATE_ASYNC_COMBINE_KERNEL
 #endif  // MORI_JIT_GENCO
