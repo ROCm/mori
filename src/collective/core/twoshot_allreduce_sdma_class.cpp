@@ -312,6 +312,7 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
 
         int async_blocks = std::min(64, max_blocks_);
 
+        #if 0
         if (total_bytes <= P2P_SDMA_THRESHOLD) {
             // ---- P2P path: better for data <= 64MB ----
             size_t required_input_size = total_bytes;
@@ -342,10 +343,21 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
                 elementCountPerRank, myPe_, npes_);
         }
 
-        // AllGather PUT — shared by both paths
-        AllGatherReducedSdmaPutKernel<T><<<1, 64, stream>>>(
-            myPe_, npes_, output_transit_buffer_obj_, elementCountPerRank);
 
+        #endif
+
+        // SdmaReduceScatterKernel: SDMA scatter + wait + local reduce in one kernel
+        SdmaReduceScatterKernel<T><<<async_blocks, 640, 0, stream>>>(
+            myPe_, npes_,
+            input,
+            output_transit_buffer_obj_,
+            flagsObj_,
+            barrierPtr_,
+            total_count);
+
+        // AllGather PUT — send reduced shard to all PEs
+        AllGatherReducedSdmaPutKernel<T><<<1, 64, 0, stream>>>(
+            myPe_, npes_, output_transit_buffer_obj_, elementCountPerRank);
         hipError_t kernel_err = hipGetLastError();
         if (kernel_err != hipSuccess) {
             fprintf(stderr, "PE %d: Async kernel launch failed: %s\n",
