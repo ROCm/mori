@@ -1,3 +1,22 @@
+# Device link stub — needed by any executable that links mori_shmem (which has
+# -fgpu-rdc device code).  The .hip file triggers the HIP linker to resolve
+# cross-TU device symbols like globalGpuStates.
+set(DEVICE_LINK_STUB ${CMAKE_SOURCE_DIR}/src/pybind/device_link_stub.hip)
+set(EXAMPLE_RDC_FLAGS "-fgpu-rdc" "-mcode-object-version=5")
+
+# Helper: create an example executable that links mori_shmem (needs device link)
+function(add_shmem_example name)
+  cmake_parse_arguments(ARG "" "" "SOURCES;LIBS;INCLUDES" ${ARGN})
+  add_executable(${name} ${ARG_SOURCES} ${DEVICE_LINK_STUB})
+  target_link_libraries(${name} mori_shmem ${ARG_LIBS} hip::host hip::device)
+  target_compile_options(${name} PRIVATE ${EXAMPLE_RDC_FLAGS})
+  target_link_options(${name} PRIVATE ${EXAMPLE_RDC_FLAGS})
+  if(ARG_INCLUDES)
+    target_include_directories(${name} PRIVATE ${ARG_INCLUDES})
+  endif()
+endfunction()
+
+# --- SDMA examples ---
 add_executable(sdma_bw sdma/sdma_bw.cpp sdma/common.cpp sdma/utils.cpp sdma/sdma_bw_kernel.cpp utils/args_parser.cpp)
 target_include_directories(sdma_bw PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
 target_link_libraries(sdma_bw mori_application hip::host hip::device)
@@ -10,10 +29,12 @@ add_executable(sdma_latency sdma/sdma_latency.cpp sdma/common.cpp sdma/utils.cpp
 target_include_directories(sdma_latency PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
 target_link_libraries(sdma_latency mori_application hip::host hip::device)
 
+# --- Dist RDMA examples ---
 add_executable(dist_write dist_rdma_ops/dist_write.cpp utils/args_parser.cpp)
 target_include_directories(dist_write PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
 target_link_libraries(dist_write mori_application hip::host hip::device)
 
+# --- Local RDMA examples ---
 add_executable(send_recv_gpu local_rdma_ops/send_recv_gpu.cpp)
 target_link_libraries(send_recv_gpu mori_application hip::host hip::device)
 
@@ -26,53 +47,27 @@ target_link_libraries(write_inline_gpu mori_application hip::host hip::device)
 add_executable(atomic_gpu local_rdma_ops/atomic_gpu.cpp)
 target_link_libraries(atomic_gpu mori_application hip::host hip::device)
 
-add_executable(put_thread_allgather shmem/put_thread_allgather.cpp)
-target_link_libraries(put_thread_allgather mori_shmem hip::host hip::device)
+# --- Shmem examples (need device link for globalGpuStates) ---
+add_shmem_example(put_thread_allgather       SOURCES shmem/put_thread_allgather.cpp)
+add_shmem_example(concurrent_put_thread      SOURCES shmem/concurrent_put_thread.cpp)
+add_shmem_example(test_put_schar_nbi_thread  SOURCES shmem/test_put_schar_nbi_thread.cpp)
+add_shmem_example(concurrent_put_imm_thread  SOURCES shmem/concurrent_put_imm_thread.cpp)
+add_shmem_example(concurrent_put_signal_thread SOURCES shmem/concurrent_put_signal_thread.cpp)
+add_shmem_example(atomic_nonfetch_thread     SOURCES shmem/atomic_nonfetch_thread.cpp)
+add_shmem_example(atomic_fetch_thread        SOURCES shmem/atomic_fetch_thread.cpp)
+add_shmem_example(test_p2p_direct_access     SOURCES shmem/test_p2p_direct_access.cpp)
 
-add_executable(concurrent_put_thread shmem/concurrent_put_thread.cpp)
-target_link_libraries(concurrent_put_thread mori_shmem hip::host hip::device)
-
-add_executable(test_put_schar_nbi_thread shmem/test_put_schar_nbi_thread.cpp)
-target_link_libraries(test_put_schar_nbi_thread mori_shmem hip::host hip::device)
-
-add_executable(concurrent_put_imm_thread shmem/concurrent_put_imm_thread.cpp)
-target_link_libraries(concurrent_put_imm_thread mori_shmem hip::host
-                      hip::device)
-
-add_executable(concurrent_put_signal_thread shmem/concurrent_put_signal_thread.cpp)
-target_link_libraries(concurrent_put_signal_thread mori_shmem hip::host
-                      hip::device)
-
-add_executable(atomic_nonfetch_thread shmem/atomic_nonfetch_thread.cpp)
-target_link_libraries(atomic_nonfetch_thread mori_shmem hip::host hip::device)
-
-add_executable(atomic_fetch_thread shmem/atomic_fetch_thread.cpp)
-target_link_libraries(atomic_fetch_thread mori_shmem hip::host hip::device)
-
-add_executable(test_p2p_direct_access shmem/test_p2p_direct_access.cpp)
-target_link_libraries(test_p2p_direct_access mori_shmem hip::host hip::device)
-
+# --- Application examples ---
 add_executable(context application/context.cpp)
 target_link_libraries(context mori_application hip::host hip::device)
 
-add_executable(test_dispatch_combine_ops
-               ops/dispatch_combine/test_dispatch_combine.cpp)
-target_link_libraries(test_dispatch_combine_ops mori_application mori_shmem
-                      mori_ops hip::host hip::device)
-
+# --- Benchmarks ---
 add_executable(atomic_perf benchmarks/atomic_perf.cpp utils/args_parser.cpp)
-target_include_directories(atomic_perf
-                           PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
+target_include_directories(atomic_perf PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
 target_link_libraries(atomic_perf mori_application hip::host hip::device)
 
-add_executable(accum_perf benchmarks/accum_perf.cpp)
-target_link_libraries(accum_perf mori_application mori_shmem hip::host
-                      hip::device)
-
-add_executable(ibverbs_test application/ibverbs_test.cpp)
-target_link_libraries(ibverbs_test mori_application mori_shmem hip::host
-                      hip::device)
+add_shmem_example(accum_perf SOURCES benchmarks/accum_perf.cpp)
+add_shmem_example(ibverbs_test SOURCES application/ibverbs_test.cpp)
 
 add_executable(test_vmm_mpi_write utils/test_vmm_mpi_write.cpp)
 target_link_libraries(test_vmm_mpi_write mori_application hip::host hip::device)
-
