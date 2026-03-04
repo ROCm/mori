@@ -52,13 +52,14 @@ def _test_allreduce_async(rank, world_size, port, elems, iterations, warmup):
         )
         print(f"PE {rank}: Created AllreduceSdma object")
 
-        # Data init: each PE fills all elements with (myPe + 1)
-        input_tensor = torch.full((elems,), my_pe + 1,
+        # Data init: each PE fills all elements with (myPe + 1) * 1000
+        fill_value = (my_pe + 1) * 1000
+        input_tensor = torch.full((elems,), fill_value,
                                   dtype=torch.uint32, device=device)
         output_tensor = torch.zeros(elems, dtype=torch.uint32, device=device)
 
         if rank == 0:
-            print(f"PE {rank}: Input data = all {my_pe + 1}")
+            print(f"PE {rank}: Input data = all {fill_value}")
 
         torch.cuda.synchronize()
         dist.barrier()
@@ -110,12 +111,12 @@ def _test_allreduce_async(rank, world_size, port, elems, iterations, warmup):
             print(f"  Max time: {max_time:.6f}s")
             print(f"  Avg time: {avg_time:.6f}s")
 
-        # Verify: expected value = npes * (npes + 1) / 2
+        # Verify: expected value = sum((pe+1)*1000 for pe in range(npes))
         torch.cuda.synchronize()
         dist.barrier()
 
         output_cpu = output_tensor.cpu().numpy()
-        expected_value = npes * (npes + 1) // 2
+        expected_value = sum((pe + 1) * 1000 for pe in range(npes))
 
         success = True
         if np.all(output_cpu == expected_value):
