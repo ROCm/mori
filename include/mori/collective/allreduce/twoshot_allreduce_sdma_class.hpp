@@ -55,6 +55,12 @@ private:
     CrossPeBarrier* barrierPtr_;
     std::unique_ptr<void, ShmemDeleter> barrierMem_;
 
+    // Input transit buffer (symmetric memory for P2P reads)
+    void* input_transit_buffer_;
+    size_t input_transit_buffer_size_;
+    application::SymmMemObjPtr input_transit_buffer_obj_;
+    std::unique_ptr<void, ShmemDeleter> input_transit_buffer_ptr_;
+
     // Output transit buffer — serves as:
     //   1. SDMA scatter destination (gather buffer, npes * chunkSize)
     //   2. Local reduce output (myPe's slot)
@@ -79,6 +85,14 @@ private:
     AllreduceSdma(const AllreduceSdma&) = delete;
     AllreduceSdma& operator=(const AllreduceSdma&) = delete;
 
+    bool ensure_buffer_size(void*& buffer,
+                           std::unique_ptr<void, ShmemDeleter>& buffer_ptr,
+                           size_t& current_size,
+                           application::SymmMemObjPtr& buffer_obj,
+                           size_t required_size,
+                           const char* buffer_name);
+
+    void copy_input_to_transit(T* input, size_t total_count, hipStream_t stream);
     void copy_output_to_user(T* output, size_t total_count, hipStream_t stream);
 
 public:
