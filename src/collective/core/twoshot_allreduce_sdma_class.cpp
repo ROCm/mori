@@ -307,14 +307,16 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
             return false;
         }
 
-        // Fused kernel: scatter + wait + reduce (same as SdmaReduceScatterKernel)
         constexpr int pack_size = packed_t<T>::P::size;
         int rs_threads = 512;
         int rs_packed = static_cast<int>((total_count / npes_ + pack_size - 1) / pack_size);
         int rs_blocks = std::min(max_blocks_, (rs_packed + rs_threads - 1) / rs_threads);
         if (rs_blocks < 1) rs_blocks = 1;
 
-        ReduceScatterAllGatherFusedKernel<T><<<rs_blocks, rs_threads, 0, stream>>>(
+        // --- A/B test: uncomment ONE of the two below ---
+
+        // Option A: SdmaReduceScatterKernel (from sync operator())
+        SdmaReduceScatterKernel<T><<<rs_blocks, rs_threads, 0, stream>>>(
             myPe_, npes_,
             input,
             output_transit_buffer_obj_,
@@ -322,6 +324,14 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
             barrierPtr_,
             total_count);
 
+        // Option B: ReduceScatterAllGatherFusedKernel (fused async version)
+        //ReduceScatterAllGatherFusedKernel<T><<<rs_blocks, rs_threads, 0, stream>>>(
+        //    myPe_, npes_,
+        //    input,
+        //    output_transit_buffer_obj_,
+        //    flagsObj_,
+        //    barrierPtr_,
+        //    total_count);
         // AllGather PUT — send reduced shard to all PEs
         AllGatherReducedSdmaPutKernel<T><<<1, 64, 0, stream>>>(
             myPe_, npes_, output_transit_buffer_obj_, elementCountPerRank);
