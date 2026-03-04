@@ -16,7 +16,7 @@ from mori.ccl import AllreduceSdma
 from tests.python.utils import TorchDistContext, get_free_port
 
 
-def _test_allreduce_async(rank, world_size, port, elems, iterations, warmup):
+def _test_allreduce_async(rank, world_size, port, elems, iterations, warmup, copy_output=True):
     """Worker function for each process."""
 
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
@@ -39,6 +39,7 @@ def _test_allreduce_async(rank, world_size, port, elems, iterations, warmup):
             print(f"  Elements per PE : {elems:,}")
             print(f"  Data size       : {bytes_per_pe / (1024**2):.2f} MB per PE")
             print(f"  Iterations      : {iterations} (warmup: {warmup})")
+            print(f"  copy_output     : {copy_output}")
             print(f"{'='*60}\n")
 
         device = torch.device(f"cuda:{rank}")
@@ -48,7 +49,7 @@ def _test_allreduce_async(rank, world_size, port, elems, iterations, warmup):
             my_pe, npes,
             input_buffer_size=bytes_per_pe,
             output_buffer_size=output_buf_size,
-            copy_output_to_user=True,
+            copy_output_to_user=copy_output,
         )
         print(f"PE {rank}: Created AllreduceSdma object")
 
@@ -115,16 +116,24 @@ def _test_allreduce_async(rank, world_size, port, elems, iterations, warmup):
         torch.cuda.synchronize()
         dist.barrier()
 
-        output_cpu = output_tensor.cpu().numpy()
         expected_value = sum((pe + 1) * 1000 for pe in range(npes))
 
-        success = True
-        if np.all(output_cpu == expected_value):
-            print(f"PE {rank}: AllReduce verification PASSED! All {elems} elements = {expected_value}")
+        if copy_output:
+            verify_cpu = output_tensor.cpu().numpy()
+            verify_label = "output_tensor"
         else:
-            mismatches = np.where(output_cpu != expected_value)[0]
-            print(f"PE {rank}: AllReduce verification FAILED! "
-                  f"{len(mismatches)} mismatches, first at [{mismatches[0]}]={output_cpu[mismatches[0]]}, "
+            transit_buf = allreduce.get_output_transit_buffer(device=input_tensor)
+            verify_cpu = transit_buf.cpu().numpy()[:elems]
+            verify_label = "transit_buffer"
+
+        success = True
+        if np.all(verify_cpu == expected_value):
+            print(f"PE {rank}: AllReduce verification PASSED ({verify_label})! "
+                  f"All {elems} elements = {expected_value}")
+        else:
+            mismatches = np.where(verify_cpu != expected_value)[0]
+            print(f"PE {rank}: AllReduce verification FAILED ({verify_label})! "
+                  f"{len(mismatches)} mismatches, first at [{mismatches[0]}]={verify_cpu[mismatches[0]]}, "
                   f"expected {expected_value}")
             success = False
 
@@ -175,13 +184,13 @@ def _test_allreduce_async(rank, world_size, port, elems, iterations, warmup):
             raise AssertionError(f"PE {rank}: AllReduce verification failed")
 
 
-def test_allreduce_async(elems=67108864, world_size=8, iterations=10, warmup=10):
+def test_allreduce_async(elems=67108864, world_size=8, iterations=10, warmup=10, copy_output=True):
     """Run AllReduce Async SDMA test."""
     os.environ.setdefault('MORI_ENABLE_SDMA', '1')
     port = get_free_port()
     torch.multiprocessing.spawn(
         _test_allreduce_async,
-        args=(world_size, port, elems, iterations, warmup),
+        args=(world_size, port, elems, iterations, warmup, copy_output),
         nprocs=world_size,
         join=True,
     )
@@ -199,14 +208,17 @@ if __name__ == "__main__":
     parser.add_argument("--iterations", type=int, default=10, help="Measurement iterations")
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations")
     parser.add_argument("--enable-sdma", type=int, default=1, choices=[0, 1], help="Enable SDMA")
+    parser.add_argument("--no-copy", action="store_true", help="Disable copy_output_to_user (read from transit buffer)")
     args = parser.parse_args()
     os.environ['MORI_ENABLE_SDMA'] = str(args.enable_sdma)
+    copy_output = not args.no_copy
 
     print(f"AllReduce Async SDMA Test")
     print(f"  Elements per PE : {args.elems:,}")
     print(f"  World size      : {args.world_size}")
     print(f"  Iterations      : {args.iterations}")
     print(f"  Warmup          : {args.warmup}")
+    print(f"  copy_output     : {copy_output}")
     print("-" * 60)
 
-    test_allreduce_async(args.elems, args.world_size, args.iterations, args.warmup)
+    test_allreduce_async(args.elems, args.world_size, args.iterations, args.warmup, copy_output)
