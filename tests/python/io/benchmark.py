@@ -172,6 +172,24 @@ def parse_args():
         help="Determines how to process CQE, choices ['polling', event]",
     )
     parser.add_argument(
+        "--max-send-wr",
+        type=int,
+        default=0,
+        help="RDMA max send WRs per QP; 0 = use backend default (default: 0)",
+    )
+    parser.add_argument(
+        "--max-cqe-num",
+        type=int,
+        default=0,
+        help="RDMA max CQEs per CQ; 0 = use backend default (default: 0)",
+    )
+    parser.add_argument(
+        "--max-msg-sge",
+        type=int,
+        default=0,
+        help="RDMA max SGEs per send WR; 0 = use backend default (default: 0)",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="info",
@@ -211,6 +229,9 @@ class MoriIoBenchmark:
         num_qp_per_transfer: int = 1,
         num_worker_threads: int = 1,
         poll_cq_mode: str = "polling",
+        max_send_wr: int = 0,
+        max_cqe_num: int = 0,
+        max_msg_sge: int = 0,
         src_gpu: int = 0,
         dst_gpu: int = 1,
         num_streams: int = 64,
@@ -240,6 +261,9 @@ class MoriIoBenchmark:
         self.poll_cq_mode = (
             PollCqMode.POLLING if poll_cq_mode == "polling" else PollCqMode.EVENT
         )
+        self.max_send_wr = max_send_wr
+        self.max_cqe_num = max_cqe_num
+        self.max_msg_sge = max_msg_sge
 
         self.src_gpu = src_gpu
         self.dst_gpu = dst_gpu
@@ -324,6 +348,10 @@ class MoriIoBenchmark:
             print(f"  num_qp_per_transfer: {self.num_qp_per_transfer}")
             print(f"  num_worker_threads: {self.num_worker_threads}")
             print(f"  poll_cq_mode: {self.poll_cq_mode}")
+            if self.max_send_wr or self.max_cqe_num or self.max_msg_sge:
+                print(
+                    f"  max_send_wr: {self.max_send_wr}, max_cqe_num: {self.max_cqe_num}, max_msg_sge: {self.max_msg_sge}"
+                )
 
         print(f"  buffer_size: {self.buffer_size} B")
         print(f"  transfer_batch_size: {self.transfer_batch_size}")
@@ -409,6 +437,12 @@ class MoriIoBenchmark:
             num_worker_threads=self.num_worker_threads,
             poll_cq_mode=self.poll_cq_mode,
         )
+        if self.max_send_wr > 0:
+            config.max_send_wr = self.max_send_wr
+        if self.max_cqe_num > 0:
+            config.max_cqe_num = self.max_cqe_num
+        if self.max_msg_sge > 0:
+            config.max_msg_sge = self.max_msg_sge
         self.engine.create_backend(BackendType.RDMA, config)
 
         self.engine_desc = self.engine.get_engine_desc()
@@ -836,6 +870,9 @@ def benchmark_engine(local_rank, node_rank, args):
         num_qp_per_transfer=args.num_qp_per_transfer,
         num_worker_threads=args.num_worker_threads,
         poll_cq_mode=args.poll_cq_mode,
+        max_send_wr=args.max_send_wr,
+        max_cqe_num=args.max_cqe_num,
+        max_msg_sge=args.max_msg_sge,
     )
     bench.print_config()
     bench.run()

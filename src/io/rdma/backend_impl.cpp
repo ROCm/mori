@@ -162,14 +162,23 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
 
   uint32_t maxQpWr = static_cast<uint32_t>(deviceAttr->orig_attr.max_qp_wr);
   uint32_t maxCqe = static_cast<uint32_t>(deviceAttr->orig_attr.max_cqe);
+  uint32_t maxSge = static_cast<uint32_t>(deviceAttr->orig_attr.max_sge);
 
-  epConfig.maxMsgsNum = std::min(8192u, maxQpWr);
-  epConfig.maxCqeNum = std::min(16384u, maxCqe);
+  epConfig.maxMsgsNum = config.maxSendWr > 0
+                            ? std::min(static_cast<uint32_t>(config.maxSendWr), maxQpWr)
+                            : std::min(8192u, maxQpWr);
+  epConfig.maxCqeNum = config.maxCqeNum > 0
+                           ? std::min(static_cast<uint32_t>(config.maxCqeNum), maxCqe)
+                           : std::min(16384u, maxCqe);
+  if (config.maxMsgSge > 0) {
+    epConfig.maxMsgSge = std::min(static_cast<uint32_t>(config.maxMsgSge), maxSge);
+  } else {
 #ifdef ENABLE_IONIC
-  epConfig.maxMsgSge = std::min<uint32_t>(deviceAttr->orig_attr.max_sge, 2u);
+    epConfig.maxMsgSge = std::min(maxSge, 2u);
 #else
-  epConfig.maxMsgSge = std::min<uint32_t>(deviceAttr->orig_attr.max_sge, 4u);
+    epConfig.maxMsgSge = std::min(maxSge, 4u);
 #endif
+  }
   return epConfig;
 }
 

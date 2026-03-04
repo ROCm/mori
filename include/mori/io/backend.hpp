@@ -58,12 +58,17 @@ struct RdmaBackendConfig : public BackendConfig {
   int numWorkerThreads{1};
   PollCqMode pollCqMode{PollCqMode::POLLING};
   bool enableNotification{true};  // Enable/disable notification mechanism for transfer completion
+
+  int maxSendWr{0};
+  int maxCqeNum{0};
+  int maxMsgSge{0};
 };
 
 inline std::ostream& operator<<(std::ostream& os, const RdmaBackendConfig& c) {
   return os << "qpPerTransfer[" << c.qpPerTransfer << "] postBatchSize[" << c.postBatchSize
             << "] numWorkerThreads[" << c.numWorkerThreads << "] enableNotification["
-            << c.enableNotification << "]";
+            << c.enableNotification << "] maxSendWr[" << c.maxSendWr << "] maxCqeNum["
+            << c.maxCqeNum << "] maxMsgSge[" << c.maxMsgSge << "]";
 }
 
 struct XgmiBackendConfig : public BackendConfig {
