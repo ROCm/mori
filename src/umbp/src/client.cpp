@@ -35,6 +35,13 @@ static ::umbp::UMBPMaster::Stub* GetStub(void* ptr) {
   return static_cast<::umbp::UMBPMaster::Stub*>(ptr);
 }
 
+static void FillProtoLocation(const Location& location, ::umbp::Location* proto_location) {
+  proto_location->set_node_id(location.node_id);
+  proto_location->set_location_id(location.location_id);
+  proto_location->set_size(location.size);
+  proto_location->set_tier(static_cast<::umbp::TierType>(location.tier));
+}
+
 UMBPClient::UMBPClient(const UMBPClientConfig& config)
     : config_(config),
       stub_(nullptr, [](void* p) { delete static_cast<::umbp::UMBPMaster::Stub*>(p); }) {
@@ -52,11 +59,11 @@ UMBPClient::~UMBPClient() {
 
 grpc::Status UMBPClient::RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities) {
   if (registered_) {
-    return grpc::Status(grpc::StatusCode::ALREADY_EXISTS, "client is already registered");
+    return grpc::Status(grpc::StatusCode::ALREADY_EXISTS, "node is already registered");
   }
 
   ::umbp::RegisterClientRequest req;
-  req.set_client_id(config_.client_id);
+  req.set_node_id(config_.node_id);
   req.set_node_address(config_.node_address);
   for (const auto& [tier, cap] : tier_capacities) {
     auto* tc = req.add_tier_capacities();
@@ -93,13 +100,13 @@ grpc::Status UMBPClient::RegisterSelf(const std::map<TierType, TierCapacity>& ti
 
 grpc::Status UMBPClient::UnregisterSelf() {
   if (!registered_) {
-    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "client is not registered");
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "node is not registered");
   }
 
   StopHeartbeat();
 
   ::umbp::UnregisterClientRequest req;
-  req.set_client_id(config_.client_id);
+  req.set_node_id(config_.node_id);
 
   ::umbp::UnregisterClientResponse resp;
   grpc::ClientContext ctx;
@@ -112,6 +119,88 @@ grpc::Status UMBPClient::UnregisterSelf() {
   }
   registered_ = false;
   return status;
+}
+
+grpc::Status UMBPClient::Register(const std::string& key, const Location& location) {
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "node must be registered before block registration");
+  }
+
+  if (key.empty()) {
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "key cannot be empty");
+  }
+
+  Location normalized_location = location;
+  if (normalized_location.node_id.empty()) {
+    normalized_location.node_id = config_.node_id;
+  }
+  if (normalized_location.node_id != config_.node_id) {
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                        "location.node_id must match client node_id");
+  }
+
+  ::umbp::RegisterRequest req;
+  req.set_node_id(config_.node_id);
+  req.set_key(key);
+  FillProtoLocation(normalized_location, req.mutable_location());
+
+  ::umbp::RegisterResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->Register(&ctx, req, &resp);
+  if (!status.ok()) {
+    spdlog::error("[Client] Register(key={}) failed: {}", key, status.error_message());
+    return status;
+  }
+
+  spdlog::info("[Client] Registered key='{}' location='{}'", key, normalized_location.location_id);
+  return grpc::Status::OK;
+}
+
+grpc::Status UMBPClient::Unregister(const std::string& key, const Location& location,
+                                    uint32_t* removed) {
+  if (removed != nullptr) {
+    *removed = 0;
+  }
+
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "node must be registered before block unregistration");
+  }
+
+  if (key.empty()) {
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "key cannot be empty");
+  }
+
+  Location normalized_location = location;
+  if (normalized_location.node_id.empty()) {
+    normalized_location.node_id = config_.node_id;
+  }
+  if (normalized_location.node_id != config_.node_id) {
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                        "location.node_id must match client node_id");
+  }
+
+  ::umbp::UnregisterRequest req;
+  req.set_node_id(config_.node_id);
+  req.set_key(key);
+  FillProtoLocation(normalized_location, req.mutable_location());
+
+  ::umbp::UnregisterResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->Unregister(&ctx, req, &resp);
+  if (!status.ok()) {
+    spdlog::error("[Client] Unregister(key={}) failed: {}", key, status.error_message());
+    return status;
+  }
+
+  if (removed != nullptr) {
+    *removed = resp.removed();
+  }
+
+  spdlog::info("[Client] Unregistered key='{}' location='{}' (removed={})", key,
+               normalized_location.location_id, resp.removed());
+  return grpc::Status::OK;
 }
 
 void UMBPClient::StartHeartbeat() {
@@ -161,7 +250,7 @@ void UMBPClient::HeartbeatLoop() {
     }
 
     ::umbp::HeartbeatRequest req;
-    req.set_client_id(config_.client_id);
+    req.set_node_id(config_.node_id);
 
     {
       std::lock_guard lock(caps_mutex_);
@@ -173,7 +262,7 @@ void UMBPClient::HeartbeatLoop() {
       }
     }
 
-    spdlog::info("[Client] Heartbeat sending: client_id={}, tiers={}", config_.client_id,
+    spdlog::info("[Client] Heartbeat sending: node_id={}, tiers={}", config_.node_id,
                  req.tier_capacities_size());
 
     ::umbp::HeartbeatResponse resp;
@@ -181,11 +270,11 @@ void UMBPClient::HeartbeatLoop() {
     auto status = GetStub(stub_.get())->Heartbeat(&ctx, req, &resp);
 
     if (!status.ok()) {
-      spdlog::warn("[Client] Heartbeat failed: client_id={}, error={}", config_.client_id,
+      spdlog::warn("[Client] Heartbeat failed: node_id={}, error={}", config_.node_id,
                    status.error_message());
     } else {
       auto server_status = static_cast<ClientStatus>(resp.status());
-      spdlog::info("[Client] Heartbeat ack: client_id={}, status={}", config_.client_id,
+      spdlog::info("[Client] Heartbeat ack: node_id={}, status={}", config_.node_id,
                    ClientStatusName(server_status));
 
       if (resp.status() == ::umbp::CLIENT_STATUS_UNKNOWN) {

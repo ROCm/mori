@@ -23,76 +23,98 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+
+#include "umbp/block_index.h"
+
 namespace mori::umbp {
 
 ClientRegistry::ClientRegistry(const ClientRegistryConfig& config) : config_(config) {}
 
+ClientRegistry::ClientRegistry(const ClientRegistryConfig& config, BlockIndex& index)
+    : config_(config), index_(&index) {}
+
 ClientRegistry::~ClientRegistry() { StopReaper(); }
 
-bool ClientRegistry::RegisterClient(const std::string& client_id, const std::string& node_address,
+void ClientRegistry::SetBlockIndex(BlockIndex* index) {
+  std::unique_lock lock(mutex_);
+  index_ = index;
+}
+
+bool ClientRegistry::RegisterClient(const std::string& node_id, const std::string& node_address,
                                     const std::map<TierType, TierCapacity>& tier_capacities) {
   std::unique_lock lock(mutex_);
   auto now = std::chrono::steady_clock::now();
 
-  auto it = clients_.find(client_id);
+  auto it = clients_.find(node_id);
   if (it != clients_.end()) {
     const bool is_expired = (now - it->second.last_heartbeat > ExpiryDuration()) ||
                             (it->second.status == ClientStatus::EXPIRED);
 
     if (it->second.status == ClientStatus::ALIVE && !is_expired) {
-      spdlog::warn("[Registry] Rejecting re-registration for alive client: {}", client_id);
+      spdlog::warn("[Registry] Rejecting re-registration for alive node: {}", node_id);
       return false;
     }
 
     it->second.status = ClientStatus::EXPIRED;
     // Expired client can re-register. Clean old ownership state before overwrite.
-    client_keys_.erase(client_id);
-    spdlog::info("[Registry] Re-registering expired client: {}", client_id);
+    client_keys_.erase(node_id);
+    spdlog::info("[Registry] Re-registering expired node: {}", node_id);
   }
 
   ClientRecord record;
-  record.client_id = client_id;
+  record.node_id = node_id;
   record.node_address = node_address;
   record.status = ClientStatus::ALIVE;
   record.last_heartbeat = now;
   record.registered_at = now;
   record.tier_capacities = tier_capacities;
 
-  clients_[client_id] = std::move(record);
-  client_keys_[client_id];  // ensure entry exists (empty set)
+  clients_[node_id] = std::move(record);
+  client_keys_[node_id];  // ensure entry exists (empty set)
 
-  spdlog::info("[Registry] Registered client: {} at {}", client_id, node_address);
+  spdlog::info("[Registry] Registered node: {} at {}", node_id, node_address);
   return true;
 }
 
-size_t ClientRegistry::UnregisterClient(const std::string& client_id) {
-  std::unique_lock lock(mutex_);
-  auto it = clients_.find(client_id);
-  if (it == clients_.end()) {
-    return 0;
-  }
-
-  // Count tracked keys (will be used for BlockIndex cleanup later)
+size_t ClientRegistry::UnregisterClient(const std::string& node_id) {
   size_t keys_removed = 0;
-  auto keys_it = client_keys_.find(client_id);
-  if (keys_it != client_keys_.end()) {
-    keys_removed = keys_it->second.size();
-    // Future: iterate keys and call BlockIndex::UnregisterByNode for each
-    client_keys_.erase(keys_it);
+  std::vector<std::string> keys_to_cleanup;
+
+  {
+    std::unique_lock lock(mutex_);
+    auto it = clients_.find(node_id);
+    if (it == clients_.end()) {
+      return 0;
+    }
+
+    auto keys_it = client_keys_.find(node_id);
+    if (keys_it != client_keys_.end()) {
+      keys_removed = keys_it->second.size();
+      keys_to_cleanup.assign(keys_it->second.begin(), keys_it->second.end());
+      client_keys_.erase(keys_it);
+    }
+
+    clients_.erase(it);
   }
 
-  clients_.erase(it);
-  spdlog::info("[Registry] Unregistered client: {} (keys_removed={})", client_id, keys_removed);
+  if (index_ != nullptr) {
+    for (const auto& key : keys_to_cleanup) {
+      index_->UnregisterByNode(key, node_id);
+    }
+  }
+
+  spdlog::info("[Registry] Unregistered node: {} (keys_removed={})", node_id, keys_removed);
   return keys_removed;
 }
 
 // PA-3 fix: exclusive lock because we mutate last_heartbeat and tier_capacities
-ClientStatus ClientRegistry::Heartbeat(const std::string& client_id,
+ClientStatus ClientRegistry::Heartbeat(const std::string& node_id,
                                        const std::map<TierType, TierCapacity>& tier_capacities) {
   std::unique_lock lock(mutex_);
-  auto it = clients_.find(client_id);
+  auto it = clients_.find(node_id);
   if (it == clients_.end()) {
-    spdlog::warn("[Registry] Heartbeat from unknown client: {}", client_id);
+    spdlog::warn("[Registry] Heartbeat from unknown node: {}", node_id);
     return ClientStatus::UNKNOWN;
   }
 
@@ -103,17 +125,51 @@ ClientStatus ClientRegistry::Heartbeat(const std::string& client_id,
   return ClientStatus::ALIVE;
 }
 
-void ClientRegistry::TrackKey(const std::string& /*client_id*/, const std::string& /*key*/) {
-  // Stub: will be used when BlockIndex is integrated
+void ClientRegistry::TrackKey(const std::string& node_id, const std::string& key) {
+  std::unique_lock lock(mutex_);
+  if (clients_.find(node_id) == clients_.end()) {
+    return;
+  }
+
+  if (index_ != nullptr) {
+    const auto locations = index_->Lookup(key);
+    const bool owns_key =
+        std::any_of(locations.begin(), locations.end(),
+                    [&node_id](const Location& location) { return location.node_id == node_id; });
+    if (!owns_key) {
+      return;
+    }
+  }
+
+  client_keys_[node_id].insert(key);
 }
 
-void ClientRegistry::UntrackKey(const std::string& /*client_id*/, const std::string& /*key*/) {
-  // Stub: will be used when BlockIndex is integrated
+void ClientRegistry::UntrackKey(const std::string& node_id, const std::string& key) {
+  std::unique_lock lock(mutex_);
+  auto it = client_keys_.find(node_id);
+  if (it == client_keys_.end()) {
+    return;
+  }
+
+  if (index_ != nullptr) {
+    const auto locations = index_->Lookup(key);
+    const bool still_owns_key =
+        std::any_of(locations.begin(), locations.end(),
+                    [&node_id](const Location& location) { return location.node_id == node_id; });
+    if (still_owns_key) {
+      return;
+    }
+  }
+
+  it->second.erase(key);
+  if (it->second.empty()) {
+    client_keys_.erase(it);
+  }
 }
 
-bool ClientRegistry::IsClientAlive(const std::string& client_id) const {
+bool ClientRegistry::IsClientAlive(const std::string& node_id) const {
   std::shared_lock lock(mutex_);
-  auto it = clients_.find(client_id);
+  auto it = clients_.find(node_id);
   return it != clients_.end() && it->second.status == ClientStatus::ALIVE;
 }
 
@@ -169,20 +225,36 @@ void ClientRegistry::ReaperLoop() {
 void ClientRegistry::ReapExpiredClients() {
   auto now = std::chrono::steady_clock::now();
   auto expiry = ExpiryDuration();
+  std::vector<std::pair<std::string, std::vector<std::string>>> reap_cleanup;
 
-  std::unique_lock lock(mutex_);
-  auto it = clients_.begin();
-  while (it != clients_.end()) {
-    if (now - it->second.last_heartbeat > expiry) {
-      const std::string& dead_id = it->first;
-      spdlog::warn("[Reaper] Reaping expired client: {}", dead_id);
+  {
+    std::unique_lock lock(mutex_);
+    auto it = clients_.begin();
+    while (it != clients_.end()) {
+      if (now - it->second.last_heartbeat > expiry) {
+        const std::string dead_id = it->first;
+        spdlog::warn("[Reaper] Reaping expired client: {}", dead_id);
 
-      // Future: iterate client_keys_[dead_id] and call
-      // BlockIndex::UnregisterByNode for each key
-      client_keys_.erase(dead_id);
-      it = clients_.erase(it);  // returns next valid iterator
-    } else {
-      ++it;
+        std::vector<std::string> keys_to_cleanup;
+        auto keys_it = client_keys_.find(dead_id);
+        if (keys_it != client_keys_.end()) {
+          keys_to_cleanup.assign(keys_it->second.begin(), keys_it->second.end());
+          client_keys_.erase(keys_it);
+        }
+
+        reap_cleanup.emplace_back(dead_id, std::move(keys_to_cleanup));
+        it = clients_.erase(it);  // returns next valid iterator
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  if (index_ != nullptr) {
+    for (const auto& [dead_id, keys_to_cleanup] : reap_cleanup) {
+      for (const auto& key : keys_to_cleanup) {
+        index_->UnregisterByNode(key, dead_id);
+      }
     }
   }
 }

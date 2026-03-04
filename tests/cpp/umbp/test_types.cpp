@@ -51,9 +51,23 @@ TEST(TypesTest, TierCapacityDefaultInit) {
   EXPECT_EQ(cap.available_bytes, 0u);
 }
 
+TEST(TypesTest, LocationEquality) {
+  const Location a{"node-a", "loc-1", 4096, TierType::HBM};
+  const Location b{"node-a", "loc-1", 4096, TierType::HBM};
+  const Location c{"node-a", "loc-2", 4096, TierType::HBM};
+
+  EXPECT_TRUE(a == b);
+  EXPECT_FALSE(a == c);
+}
+
+TEST(TypesTest, BlockMetricsDefaultInit) {
+  BlockMetrics metrics;
+  EXPECT_EQ(metrics.access_count, 0u);
+}
+
 TEST(TypesTest, ClientRecordDefaultInit) {
   ClientRecord record;
-  EXPECT_TRUE(record.client_id.empty());
+  EXPECT_TRUE(record.node_id.empty());
   EXPECT_TRUE(record.node_address.empty());
   EXPECT_EQ(record.status, ClientStatus::UNKNOWN);
   EXPECT_TRUE(record.tier_capacities.empty());

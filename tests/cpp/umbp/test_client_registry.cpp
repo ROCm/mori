@@ -39,7 +39,7 @@ std::map<TierType, TierCapacity> MakeTierCapacities(uint64_t total_bytes,
 
 const ClientRecord* FindClient(const std::vector<ClientRecord>& clients, const std::string& id) {
   for (const auto& client : clients) {
-    if (client.client_id == id) {
+    if (client.node_id == id) {
       return &client;
     }
   }
@@ -64,10 +64,10 @@ bool WaitUntil(Predicate&& predicate, std::chrono::milliseconds timeout,
 TEST(ClientRegistryTest, RegisterSingle) {
   ClientRegistry registry(ClientRegistryConfig{});
 
-  EXPECT_TRUE(registry.RegisterClient("client-1", "127.0.0.1:8080", MakeTierCapacities(80, 64)));
+  EXPECT_TRUE(registry.RegisterClient("node-1", "127.0.0.1:8080", MakeTierCapacities(80, 64)));
 
   EXPECT_EQ(registry.ClientCount(), 1u);
-  EXPECT_TRUE(registry.IsClientAlive("client-1"));
+  EXPECT_TRUE(registry.IsClientAlive("node-1"));
 }
 
 TEST(ClientRegistryTest, RegisterMultiple) {
@@ -117,7 +117,7 @@ TEST(ClientRegistryTest, ReRegisterAliveRejected) {
   EXPECT_EQ(registry.ClientCount(), 1u);
   const auto clients = registry.GetAliveClients();
   ASSERT_EQ(clients.size(), 1u);
-  EXPECT_EQ(clients[0].client_id, "c1");
+  EXPECT_EQ(clients[0].node_id, "c1");
   EXPECT_EQ(clients[0].node_address, "a1");
   ASSERT_TRUE(clients[0].tier_capacities.count(TierType::HBM) > 0);
   EXPECT_EQ(clients[0].tier_capacities.at(TierType::HBM).available_bytes, 64u);
@@ -139,7 +139,7 @@ TEST(ClientRegistryTest, ReRegisterExpiredAllowed) {
   EXPECT_EQ(registry.ClientCount(), 1u);
   const auto clients = registry.GetAliveClients();
   ASSERT_EQ(clients.size(), 1u);
-  EXPECT_EQ(clients[0].client_id, "c1");
+  EXPECT_EQ(clients[0].node_id, "c1");
   EXPECT_EQ(clients[0].node_address, "a2");
   EXPECT_EQ(clients[0].status, ClientStatus::ALIVE);
   ASSERT_TRUE(clients[0].tier_capacities.count(TierType::HBM) > 0);

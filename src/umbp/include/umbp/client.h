@@ -40,7 +40,7 @@ namespace mori::umbp {
 
 struct UMBPClientConfig {
   std::string master_address;
-  std::string client_id;
+  std::string node_id;
   std::string node_address;
   bool auto_heartbeat = true;
 };
@@ -57,6 +57,14 @@ class UMBPClient {
   // Register with master. If auto_heartbeat, starts heartbeat thread.
   grpc::Status RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities);
   grpc::Status UnregisterSelf();
+
+  // --- Block index ---
+  // Register a block key owned by this node in the master index.
+  grpc::Status Register(const std::string& key, const Location& location);
+  // Unregister a block key location owned by this node.
+  // If removed is non-null, returns 1 when removed, otherwise 0.
+  grpc::Status Unregister(const std::string& key, const Location& location,
+                          uint32_t* removed = nullptr);
 
   // --- Heartbeat ---
   void StartHeartbeat();

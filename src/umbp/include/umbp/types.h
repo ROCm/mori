@@ -40,14 +40,29 @@ struct TierCapacity {
   uint64_t available_bytes = 0;
 };
 
+struct Location {
+  std::string node_id;
+  std::string location_id;  // Opaque handle from target node
+  uint64_t size = 0;
+  TierType tier = TierType::UNKNOWN;
+
+  bool operator==(const Location& other) const;
+};
+
 enum class ClientStatus : int {
   UNKNOWN = 0,
   ALIVE = 1,
   EXPIRED = 2,
 };
 
+struct BlockMetrics {
+  std::chrono::steady_clock::time_point created_at;
+  std::chrono::steady_clock::time_point last_accessed_at;
+  uint64_t access_count = 0;
+};
+
 struct ClientRecord {
-  std::string client_id;
+  std::string node_id;
   std::string node_address;
   ClientStatus status = ClientStatus::UNKNOWN;
   std::chrono::steady_clock::time_point last_heartbeat;

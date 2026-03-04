@@ -24,6 +24,7 @@
 #include <memory>
 #include <string>
 
+#include "umbp/block_index.h"
 #include "umbp/client_registry.h"
 
 namespace grpc_impl {
@@ -55,6 +56,7 @@ class MasterServer {
 
  private:
   MasterServerConfig config_;
+  BlockIndex index_;
   ClientRegistry registry_;
 
   std::unique_ptr<grpc_impl::Server> server_;
