@@ -347,7 +347,14 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
         #endif
 
         // SdmaReduceScatterKernel: SDMA scatter + wait + local reduce in one kernel
-        SdmaReduceScatterKernel<T><<<async_blocks, 640, 0, stream>>>(
+        // Use same block/thread config as operator() for consistency
+        constexpr int pack_size = packed_t<T>::P::size;
+        int rs_threads = 512;
+        int rs_packed = static_cast<int>((total_count / npes_ + pack_size - 1) / pack_size);
+        int rs_blocks = std::min(max_blocks_, (rs_packed + rs_threads - 1) / rs_threads);
+        if (rs_blocks < 1) rs_blocks = 1;
+
+        SdmaReduceScatterKernel<T><<<rs_blocks, rs_threads, 0, stream>>>(
             myPe_, npes_,
             input,
             output_transit_buffer_obj_,
