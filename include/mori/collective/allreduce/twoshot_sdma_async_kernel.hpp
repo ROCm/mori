@@ -432,35 +432,6 @@ __global__ void ReduceScatterAllGatherFusedKernel(
     asm volatile("buffer_wbl2" ::: "memory");
   }
 #endif
-  __syncthreads();
-
-  // =========================================================================
-  // Phase 4: AllGather SDMA PUT (block 0 only, multi-queue)
-  // =========================================================================
-  if (blockIdx.x == 0) {
-    const size_t bytesPerPeer = elementCountPerRank * bytesPerElement;
-
-    if (threadIdx.x < static_cast<unsigned>(npes * dstMemObj->sdmaNumQueue)) {
-      int qId = threadIdx.x % dstMemObj->sdmaNumQueue;
-      int remotePe = threadIdx.x / dstMemObj->sdmaNumQueue;
-
-      const size_t sendBytesBase = bytesPerPeer / 8;
-      size_t sendBytes = (qId == 7) ? (bytesPerPeer - 7 * sendBytesBase) : sendBytesBase;
-
-      size_t byteOffset = myPe * bytesPerPeer + qId * sendBytesBase;
-
-      application::SymmMemObjPtr dest = dstMemObj;
-      T* gathered = reinterpret_cast<T*>(dstMemObj->localPtr);
-      uint8_t* srcPtr = reinterpret_cast<uint8_t*>(gathered) + byteOffset;
-      uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + byteOffset;
-
-      anvil::SdmaQueueDeviceHandle** dh =
-          dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
-      HSAuint64* sig = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
-      HSAuint64* esig = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
-      core::SdmaPutThread(srcPtr, dstPtr, sendBytes, dh, sig, esig, dest->sdmaNumQueue, qId);
-    }
-  }
 }
 
 }  // namespace collective
