@@ -757,7 +757,10 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readwrite("post_batch_size", &mori::io::RdmaBackendConfig::postBatchSize)
       .def_readwrite("num_worker_threads", &mori::io::RdmaBackendConfig::numWorkerThreads)
       .def_readwrite("poll_cq_mode", &mori::io::RdmaBackendConfig::pollCqMode)
-      .def_readwrite("enable_notification", &mori::io::RdmaBackendConfig::enableNotification);
+      .def_readwrite("enable_notification", &mori::io::RdmaBackendConfig::enableNotification)
+      .def_readwrite("max_send_wr", &mori::io::RdmaBackendConfig::maxSendWr)
+      .def_readwrite("max_cqe_num", &mori::io::RdmaBackendConfig::maxCqeNum)
+      .def_readwrite("max_msg_sge", &mori::io::RdmaBackendConfig::maxMsgSge);
 
   py::class_<mori::io::XgmiBackendConfig, mori::io::BackendConfig>(m, "XgmiBackendConfig")
       .def(py::init<int, int>(), py::arg("num_streams") = 64, py::arg("num_events") = 64)
