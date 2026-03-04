@@ -128,6 +128,14 @@ __global__ void TwoShotAllReduceSdmaAsyncWaitKernel(int myPe, int npes,
 // Grid size should be proportional to elementCountPerRank.
 // ============================================================
 template <typename T>
+__device__ __forceinline__ T reduce_add(T a, T b) { return a + b; }
+
+#if defined(__HIP_PLATFORM_AMD__) || defined(__CUDA_ARCH__)
+template <>
+__device__ __forceinline__ __half reduce_add(__half a, __half b) { return __hadd(a, b); }
+#endif
+
+template <typename T>
 __global__ void ReduceScatterLocalReduceKernel(T* gathered, size_t elementCountPerRank,
                                                int myPe, int npes) {
   const size_t threadLinearId =
@@ -140,7 +148,7 @@ __global__ void ReduceScatterLocalReduceKernel(T* gathered, size_t elementCountP
   for (size_t i = threadLinearId; i < elementCountPerRank; i += threadsPerGrid) {
     T sum = gathered[i];
     for (int pe = 1; pe < npes; pe++) {
-      sum += gathered[static_cast<size_t>(pe) * elementCountPerRank + i];
+      sum = reduce_add(sum, gathered[static_cast<size_t>(pe) * elementCountPerRank + i]);
     }
     myDst[i] = sum;
   }
