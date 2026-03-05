@@ -49,29 +49,22 @@ hipDataType IntToHipDataType(int dtype) {
   }
 }
 
-void PrepareInference(mori::moe::EpDispatchCombineHandle& handle,
-                      int64_t input_ptr, int input_dtype, int64_t num_tokens,
-                      int64_t weight_ptr, int64_t scale_ptr, int64_t topkIds_ptr) {
+// Merged prepare + build in one call. 
+int64_t PrepareAndBuildArgs(mori::moe::EpDispatchCombineHandle& handle,
+                            int64_t input_ptr, int input_dtype, int64_t num_tokens,
+                            int64_t weight_ptr, int64_t scale_ptr, int64_t indices_ptr,
+                            int rdmaBlockNum, int hiddenDim, int useExternalInpBuf) {
   handle.PrepareInference(
       IntToHipDataType(input_dtype), reinterpret_cast<void*>(input_ptr), nullptr,
       weight_ptr ? reinterpret_cast<float*>(weight_ptr) : nullptr,
       scale_ptr ? reinterpret_cast<uint8_t*>(scale_ptr) : nullptr,
-      reinterpret_cast<mori::moe::index_t*>(topkIds_ptr), num_tokens);
-}
+      reinterpret_cast<mori::moe::index_t*>(indices_ptr), num_tokens);
 
-int64_t BuildArgs(mori::moe::EpDispatchCombineHandle& handle, int rdmaBlockNum,
-                  int hiddenDim, int useExternalInpBuf) {
-  auto* args = new mori::moe::EpDispatchCombineArgsRaw(
-      mori::moe::GetEpDispatchCombineArgsRaw(handle, rdmaBlockNum));
-  if (hiddenDim > 0)
-    args->config.hiddenDim = hiddenDim;
-  if (useExternalInpBuf >= 0)
-    args->config.useExternalInpBuffer = static_cast<bool>(useExternalInpBuf);
-  return reinterpret_cast<int64_t>(args);
-}
-
-void FreeArgs(int64_t ptr) {
-  delete reinterpret_cast<mori::moe::EpDispatchCombineArgsRaw*>(ptr);
+  thread_local mori::moe::EpDispatchCombineArgsRaw args;
+  args = mori::moe::GetEpDispatchCombineArgsRaw(handle, rdmaBlockNum);
+  if (hiddenDim > 0) args.config.hiddenDim = hiddenDim;
+  if (useExternalInpBuf >= 0) args.config.useExternalInpBuffer = static_cast<bool>(useExternalInpBuf);
+  return reinterpret_cast<int64_t>(&args);
 }
 
 py::tuple GetDispatchOutputPtrs(mori::moe::EpDispatchCombineHandle& handle, bool has_scales) {
@@ -228,14 +221,15 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
       .def(pybind11::init<mori::moe::EpDispatchCombineConfig>(),
            py::arg("config") = mori::moe::EpDispatchCombineConfig{});
 
-  m.def("prepare_inference", &PrepareInference);
-  m.def("build_args", &BuildArgs,
-        py::arg("handle"), py::arg("rdma_block_num") = -1,
-        py::arg("hidden_dim") = -1, py::arg("use_external_inp_buf") = -1);
-  m.def("free_args", &FreeArgs);
   m.def("get_dispatch_output_ptrs", &GetDispatchOutputPtrs);
   m.def("get_combine_output_ptrs", &GetCombineOutputPtrs);
   m.def("get_handle_info", &GetHandleInfo);
+  m.def("prepare_and_build_args", &PrepareAndBuildArgs,
+        py::arg("handle"),
+        py::arg("inp_ptr"), py::arg("dtype"), py::arg("num_tokens"),
+        py::arg("weight_ptr"), py::arg("scale_ptr"), py::arg("indices_ptr"),
+        py::arg("rdma_block_num") = -1, py::arg("hidden_dim") = -1,
+        py::arg("use_external_inp_buf") = -1);
 
 #ifdef ENABLE_STANDARD_MOE_ADAPT
   m.def("set_standard_moe_output_buffers", &SetStandardMoeOutputBuffers);
