@@ -121,13 +121,15 @@ _DRIVER_TO_NIC = {
 }
 
 _NIC_PCI_VENDORS = {
-    "14e4": "bnxt",   # Broadcom BCM576xx / BCM578xx
+    "14e4": "bnxt",  # Broadcom BCM576xx / BCM578xx
     "1dd8": "ionic",  # AMD/Pensando
-    "15b3": "mlx5",   # Mellanox/NVIDIA ConnectX
+    "15b3": "mlx5",  # Mellanox/NVIDIA ConnectX
 }
 
 _LIB_SEARCH_PATHS = [
-    "/usr/local/lib", "/usr/lib", "/usr/lib/x86_64-linux-gnu",
+    "/usr/local/lib",
+    "/usr/lib",
+    "/usr/lib/x86_64-linux-gnu",
     "/lib/x86_64-linux-gnu",
 ]
 
@@ -195,7 +197,8 @@ def detect_nic_type() -> str:
     try:
         lspci_out = subprocess.check_output(
             ["lspci", "-nn", "-d", "::0200"],
-            text=True, stderr=subprocess.DEVNULL,
+            text=True,
+            stderr=subprocess.DEVNULL,
         )
         vendor_counts: dict[str, int] = {}
         for line in lspci_out.strip().split("\n"):
@@ -249,13 +252,15 @@ def get_mori_source_root() -> Path | None:
       1. Development / editable install: repo root (3 levels up from this file)
       2. Wheel install: _jit_sources/ packaged inside the mori package
     """
-    here = Path(__file__).resolve().parent          # python/mori/jit/
+    here = Path(__file__).resolve().parent  # python/mori/jit/
 
-    candidate = here.parent.parent.parent           # <repo>/
-    if (candidate / "include" / "mori").is_dir() and (candidate / "src" / "shmem").is_dir():
+    candidate = here.parent.parent.parent  # <repo>/
+    if (candidate / "include" / "mori").is_dir() and (
+        candidate / "src" / "shmem"
+    ).is_dir():
         return candidate
 
-    packaged = here.parent / "_jit_sources"         # mori/_jit_sources/
+    packaged = here.parent / "_jit_sources"  # mori/_jit_sources/
     if (packaged / "include" / "mori").is_dir():
         return packaged
 

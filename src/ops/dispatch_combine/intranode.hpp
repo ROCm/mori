@@ -253,9 +253,8 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
               args.shmemCombineInpTokMemObj->template GetAs<TokT*>() + i * config.hiddenDim,
               args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim, laneId);
         } else {
-          core::WarpCopy(
-              args.shmemCombineInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
-              args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
+          core::WarpCopy(args.shmemCombineInpTokMemObj->template GetAs<T*>() + i * config.hiddenDim,
+                         args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
         }
       }
     }
@@ -275,9 +274,9 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
           args.shmemCombineInpTokMemObj->template GetAs<uint8_t*>(destPe) +
           (myPe * config.MaxNumTokensToRecvPerRank() + destLocalTokId) * combXferBytes;
       if constexpr (!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>) {
-        core::WarpCastBf16ToCombineInternalFp8<T>(
-            reinterpret_cast<TokT*>(destStagingPtr),
-            args.inpTokenBuf + tokenIdx * config.hiddenDim, config.hiddenDim, laneId);
+        core::WarpCastBf16ToCombineInternalFp8<T>(reinterpret_cast<TokT*>(destStagingPtr),
+                                                  args.inpTokenBuf + tokenIdx * config.hiddenDim,
+                                                  config.hiddenDim, laneId);
       } else {
         core::WarpCopy(reinterpret_cast<T*>(destStagingPtr),
                        args.inpTokenBuf + tokenIdx * config.hiddenDim, config.hiddenDim);
@@ -340,8 +339,8 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       }
     }
 
-    T* outPtr = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
-                tokenId * config.hiddenDim + hiddenDimOffset;
+    T* outPtr = args.shmemCombineOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim +
+                hiddenDimOffset;
 
     int validAccumCount = config.numExpertPerToken;
     if (config.worldSize <= 4) {
@@ -360,11 +359,10 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         }
       }
     }
-    
+
     if constexpr (!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>) {
-      core::WarpAccumCombineInternalFp8ToBf16(
-          outPtr, reinterpret_cast<const TokT* const*>(srcPtrs),
-          validAccumCount, laneId, hiddenDimSize);
+      core::WarpAccumCombineInternalFp8ToBf16(outPtr, reinterpret_cast<const TokT* const*>(srcPtrs),
+                                              validAccumCount, laneId, hiddenDimSize);
     } else {
       core::WarpAccum<T, 4>(outPtr, srcPtrs, nullptr, validAccumCount, hiddenDimSize);
     }

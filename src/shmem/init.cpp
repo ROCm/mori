@@ -19,9 +19,8 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include <mpi.h>
-
 #include <arpa/inet.h>
+#include <mpi.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -441,9 +440,8 @@ static void AllocateInternalSync(GpuStates* gpuStates, const ShmemStates* states
 
   switch (states->mode) {
     case ShmemMode::StaticHeap: {
-      uintptr_t allocAddr =
-          states->memoryStates->symmMemMgr->GetHeapVAManager()->Allocate(MORI_INTERNAL_SYNC_SIZE,
-                                                                         ALIGNMENT);
+      uintptr_t allocAddr = states->memoryStates->symmMemMgr->GetHeapVAManager()->Allocate(
+          MORI_INTERNAL_SYNC_SIZE, ALIGNMENT);
       if (allocAddr == 0) {
         MORI_SHMEM_ERROR("Out of static heap memory for internal sync buffer!");
       } else {
@@ -722,8 +720,9 @@ int ShmemTorchProcessGroupInit(const std::string& groupName) {
   return ShmemInit(new application::TorchBootstrapNetwork(groupName));
 #else
   (void)groupName;
-  fprintf(stderr, "[mori] Error: Torch bootstrap not available (built without PyTorch).\n"
-                  "[mori] Use ShmemMpiInit() or rebuild with PyTorch installed.\n");
+  fprintf(stderr,
+          "[mori] Error: Torch bootstrap not available (built without PyTorch).\n"
+          "[mori] Use ShmemMpiInit() or rebuild with PyTorch installed.\n");
   return -1;
 #endif
 }
@@ -766,8 +765,8 @@ int ShmemGetUniqueId(mori_shmem_uniqueid_t* uid) {
       probe_addr.sin_port = htons(random_port);
       probe_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-      if (bind(probe_fd, reinterpret_cast<struct sockaddr*>(&probe_addr),
-               sizeof(probe_addr)) == 0) {
+      if (bind(probe_fd, reinterpret_cast<struct sockaddr*>(&probe_addr), sizeof(probe_addr)) ==
+          0) {
         close(probe_fd);
 
         if (ifname) {
@@ -778,8 +777,7 @@ int ShmemGetUniqueId(mori_shmem_uniqueid_t* uid) {
         } else {
           socket_uid =
               application::SocketBootstrapNetwork::GenerateUniqueIdWithLocalAddr(random_port);
-          std::string localAddr =
-              application::SocketBootstrapNetwork::GetLocalNonLoopbackAddress();
+          std::string localAddr = application::SocketBootstrapNetwork::GetLocalNonLoopbackAddress();
           MORI_SHMEM_TRACE("Generated UniqueId with auto-detected interface: {} (port {})",
                            localAddr, random_port);
         }

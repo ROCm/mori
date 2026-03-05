@@ -34,11 +34,13 @@ def _is_fp4x2_dtype(dtype):
 
 
 class EpDispatchCombineTestCase:
-    def __init__(self, rank, world_size, dtype=torch.bfloat16, quant_type="none", hidden_dim=7168):
+    def __init__(
+        self, rank, world_size, dtype=torch.bfloat16, quant_type="none", hidden_dim=7168
+    ):
         self.rank = rank
         self.world_size = world_size
         # fp8_direct_cast requires use_external_inp_buf=True (not zero-copy)
-        use_external_inp_buf = (quant_type == "fp8_direct_cast")
+        use_external_inp_buf = quant_type == "fp8_direct_cast"
         cfg_hidden_dim = hidden_dim // 2 if _is_fp4x2_dtype(dtype) else hidden_dim
         self.config = mori.ops.EpDispatchCombineConfig(
             data_type=dtype,
@@ -305,7 +307,9 @@ class EpDispatchCombineTestCase:
 
         if _is_fp4x2_dtype(self.config.data_type):
             if self.config.rank == 0:
-                print("Combine Pass (fp4: dispatch verified, combine ran for state reset)")
+                print(
+                    "Combine Pass (fp4: dispatch verified, combine ran for state reset)"
+                )
             return
 
         for i in range(num_tokens):
@@ -387,7 +391,10 @@ if __name__ == "__main__":
         "bf16": torch.bfloat16,
         "fp4": torch.float4_e2m1fn_x2,
     }
-    if args.quant_type == "fp8_direct_cast" and _DATA_TYPE_MAP[args.dtype] is torch.float4_e2m1fn_x2:
+    if (
+        args.quant_type == "fp8_direct_cast"
+        and _DATA_TYPE_MAP[args.dtype] is torch.float4_e2m1fn_x2
+    ):
         raise ValueError("fp8_direct_cast is not supported for fp4 data type")
 
     world_size = 8

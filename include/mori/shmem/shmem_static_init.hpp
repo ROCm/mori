@@ -15,6 +15,7 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
+
 #include "mori/shmem/shmem.hpp"
 
 namespace mori {

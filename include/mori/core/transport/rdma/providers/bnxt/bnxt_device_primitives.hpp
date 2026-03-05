@@ -726,8 +726,8 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
   // Handle error cases
   if (opcode != BNXT_RE_REQ_ST_OK) {
     auto error = BnxtHandleErrorCqe(opcode);
-    MORI_PRINTF("[BNXT PollCq] CQE error: %s (opcode: %d) at %s:%d\n", IbvWcStatusString(error), opcode,
-           __FILE__, __LINE__);
+    MORI_PRINTF("[BNXT PollCq] CQE error: %s (opcode: %d) at %s:%d\n", IbvWcStatusString(error),
+                opcode, __FILE__, __LINE__);
     return opcode;
   }
 
@@ -749,7 +749,7 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
   if (opcode != BNXT_RE_REQ_ST_OK) {
     auto error = BnxtHandleErrorCqe(opcode);
     MORI_PRINTF("[BNXT PollCq] CQE error: %s (opcode: %d), wqeCounter: %u at %s:%d\n",
-           IbvWcStatusString(error), opcode, *wqeCounter, __FILE__, __LINE__);
+                IbvWcStatusString(error), opcode, *wqeCounter, __FILE__, __LINE__);
     return opcode;
   }
 
@@ -757,14 +757,16 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
 }
 
 template <>
-inline __device__ int PollCq<ProviderType::BNXT>(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
-                                                 void* cqAddr, uint32_t cqeNum, uint32_t* consIdx, uint16_t* wqeCounter)
-{
+inline __device__ int PollCq<ProviderType::BNXT>(WorkQueueHandle& wqHandle,
+                                                 CompletionQueueHandle& cqHandle, void* cqAddr,
+                                                 uint32_t cqeNum, uint32_t* consIdx,
+                                                 uint16_t* wqeCounter) {
   return 0;
 }
 
 template <>
-inline __device__ void UpdateCqDbrRecord<ProviderType::BNXT>(CompletionQueueHandle& cq, uint32_t consIdx) {
+inline __device__ void UpdateCqDbrRecord<ProviderType::BNXT>(CompletionQueueHandle& cq,
+                                                             uint32_t consIdx) {
   uint8_t flags = ((consIdx + 1) / cq.cqeNum) & (1UL << BNXT_RE_FLAG_EPOCH_HEAD_SHIFT);
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
   // uint64_t dbrVal = bnxt_re_init_db_hdr(((consIdx + 1) | epoch), 0, flags, BNXT_RE_QUE_TYPE_CQ);
@@ -774,8 +776,8 @@ inline __device__ void UpdateCqDbrRecord<ProviderType::BNXT>(CompletionQueueHand
 }
 
 template <>
-inline __device__ int PollCqAndUpdateDbr<ProviderType::BNXT>(CompletionQueueHandle& cq, uint32_t* consIdx,
-                                                             uint32_t* lockVar) {
+inline __device__ int PollCqAndUpdateDbr<ProviderType::BNXT>(CompletionQueueHandle& cq,
+                                                             uint32_t* consIdx, uint32_t* lockVar) {
   AcquireLock(lockVar);
 
   int opcode = PollCq<ProviderType::BNXT>(cq.cqAddr, cq.cqeNum, consIdx);

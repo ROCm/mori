@@ -8,8 +8,12 @@ from mori.jit.config import detect_build_config, detect_nic_type
 from mori.jit.core import compile_genco, ensure_bitcode
 
 ALL_KERNELS = [
-    "ep_intranode", "ep_internode", "ep_internode_v1",
-    "ep_internode_v1ll", "ep_async_ll", "cast_kernel",
+    "ep_intranode",
+    "ep_internode",
+    "ep_internode_v1",
+    "ep_internode_v1ll",
+    "ep_async_ll",
+    "cast_kernel",
 ]
 
 

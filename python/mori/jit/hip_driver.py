@@ -29,8 +29,7 @@ def _get_hip_lib() -> ctypes.CDLL:
             continue
 
     raise OSError(
-        "libamdhip64.so not found. Is ROCm installed? "
-        f"Searched: {candidates}"
+        f"libamdhip64.so not found. Is ROCm installed? Searched: {candidates}"
     )
 
 
@@ -54,7 +53,9 @@ class HipModule:
         if name not in self._functions:
             hip = _get_hip_lib()
             func = c_void_p()
-            err = hip.hipModuleGetFunction(byref(func), self._module, c_char_p(name.encode()))
+            err = hip.hipModuleGetFunction(
+                byref(func), self._module, c_char_p(name.encode())
+            )
             _check(err, f"hipModuleGetFunction({name})")
             self._functions[name] = HipFunction(func, name)
         return self._functions[name]
@@ -110,8 +111,12 @@ class HipFunction:
 
         err = hip.hipModuleLaunchKernel(
             self._func,
-            c_uint(gx), c_uint(gy), c_uint(gz),
-            c_uint(bx), c_uint(by), c_uint(bz),
+            c_uint(gx),
+            c_uint(gy),
+            c_uint(gz),
+            c_uint(bx),
+            c_uint(by),
+            c_uint(bz),
             c_uint(shared_mem),
             c_void_p(stream),
             ctypes.cast(arg_ptrs, POINTER(c_void_p)),
@@ -147,8 +152,12 @@ class HipFunction:
 
         err = hip.hipModuleLaunchKernel(
             self._func,
-            c_uint(gx), c_uint(gy), c_uint(gz),
-            c_uint(bx), c_uint(by), c_uint(bz),
+            c_uint(gx),
+            c_uint(gy),
+            c_uint(gz),
+            c_uint(bx),
+            c_uint(by),
+            c_uint(bz),
             c_uint(shared_mem),
             c_void_p(stream),
             ctypes.cast(params, POINTER(c_void_p)),

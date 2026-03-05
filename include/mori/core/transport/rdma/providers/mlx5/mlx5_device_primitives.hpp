@@ -21,8 +21,9 @@
 // SOFTWARE.
 #pragma once
 
-#include <cassert>
 #include <hip/hip_runtime.h>
+
+#include <cassert>
 
 #include "infiniband/mlx5dv.h"
 #include "mori/core/transport/rdma/device_primitives.hpp"
@@ -767,20 +768,22 @@ inline __device__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum, 
 }
 
 template <>
-inline __device__ int PollCq<ProviderType::MLX5>(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle, 
-	                                         void* cqAddr, uint32_t cqeNum, uint32_t* consIdx, uint16_t* wqeCounter)
-{
+inline __device__ int PollCq<ProviderType::MLX5>(WorkQueueHandle& wqHandle,
+                                                 CompletionQueueHandle& cqHandle, void* cqAddr,
+                                                 uint32_t cqeNum, uint32_t* consIdx,
+                                                 uint16_t* wqeCounter) {
   return 0;
 }
 
 template <>
-inline __device__ void UpdateCqDbrRecord<ProviderType::MLX5>(CompletionQueueHandle& cq, uint32_t consIdx) {
+inline __device__ void UpdateCqDbrRecord<ProviderType::MLX5>(CompletionQueueHandle& cq,
+                                                             uint32_t consIdx) {
   reinterpret_cast<uint32_t*>(cq.dbrRecAddr)[MLX5_CQ_SET_CI] = HTOBE32(consIdx & 0xffffff);
 }
 
 template <>
-inline __device__ int PollCqAndUpdateDbr<ProviderType::MLX5>(CompletionQueueHandle& cq, uint32_t* consIdx,
-                                                             uint32_t* lockVar) {
+inline __device__ int PollCqAndUpdateDbr<ProviderType::MLX5>(CompletionQueueHandle& cq,
+                                                             uint32_t* consIdx, uint32_t* lockVar) {
   AcquireLock(lockVar);
 
   int opcode = PollCq<ProviderType::MLX5>(cq.cqAddr, cq.cqeNum, consIdx);

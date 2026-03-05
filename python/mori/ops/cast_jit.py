@@ -45,7 +45,11 @@ def cast_float_to_fp4(
     blocks = max(1, nelems // elems_per_block)
 
     func.launch(
-        (blocks,), (threads,),
-        0, stream,
-        src_ptr, dst_ptr, nelems,
+        (blocks,),
+        (threads,),
+        0,
+        stream,
+        src_ptr,
+        dst_ptr,
+        nelems,
     )

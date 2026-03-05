@@ -27,17 +27,18 @@
 #include <cstdint>
 #include <sstream>
 
-#include "mori/hip_compat.hpp"
-
 #include "mori/application/application.hpp"
 #include "mori/core/profiler/constants.hpp"
 #include "mori/core/profiler/kernel_profiler.hpp"
+#include "mori/hip_compat.hpp"
 
 // data_types.hpp and hip_fp8.h contain device builtins on ROCm <=6.x;
 // the template args / variant that need them are also hipcc-only.
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #include <hip/hip_fp8.h>
+
 #include <variant>
+
 #include "mori/utils/data_types.hpp"
 #endif
 

@@ -25,12 +25,12 @@
 
 #include <atomic>
 
-#include "mori/hip_compat.hpp"
 #include "infiniband/mlx5dv.h"
 #include "mori/application/utils/udma_barrier.h"
 #include "mori/core/transport/rdma/host_primitives.hpp"
 #include "mori/core/transport/rdma/providers/mlx5/mlx5_defs.hpp"
 #include "mori/core/transport/rdma/providers/utils.h"
+#include "mori/hip_compat.hpp"
 
 namespace mori {
 namespace core {
@@ -200,7 +200,8 @@ inline __host__ int PollCq<ProviderType::MLX5>(void* cqAddr, uint32_t cqeNum, ui
 }
 
 template <>
-inline __host__ void UpdateCqDbrRecord<ProviderType::MLX5>(CompletionQueueHandle& cq, uint32_t consIdx) {
+inline __host__ void UpdateCqDbrRecord<ProviderType::MLX5>(CompletionQueueHandle& cq,
+                                                           uint32_t consIdx) {
   reinterpret_cast<uint32_t*>(cq.dbrRecAddr)[MLX5_CQ_SET_CI] = HTOBE32(consIdx & 0xffffff);
 }
 

@@ -12,8 +12,7 @@ using namespace mori;
 using namespace mori::core;
 
 #ifdef MORI_HAS_OCP_FP
-extern "C" __global__
-void mori_cast_float_to_fp4(float* src, mori_fp4_e2m1* dst, size_t nelems) {
+extern "C" __global__ void mori_cast_float_to_fp4(float* src, mori_fp4_e2m1* dst, size_t nelems) {
   int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
   int globalThdNum = gridDim.x * blockDim.x;
 
@@ -33,4 +32,4 @@ void mori_cast_float_to_fp4(float* src, mori_fp4_e2m1* dst, size_t nelems) {
                        reinterpret_cast<DstStoreType*>(&dstVec)[0]);
   }
 }
-#endif // MORI_HAS_OCP_FP
+#endif  // MORI_HAS_OCP_FP

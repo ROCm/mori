@@ -37,7 +37,6 @@
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem.hpp"
 
-
 using namespace mori::core;
 using namespace mori::shmem;
 using namespace mori::application;
@@ -45,7 +44,7 @@ using namespace mori::application;
 // Test 1: Direct atomic access via GetAs(pe)
 template <typename T>
 __global__ void DirectAtomicAccessKernel(int myPe, int npes, const SymmMemObjPtr memObj,
-                                        int* errorFlag) {
+                                         int* errorFlag) {
   int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
 
   // Each PE writes to the next PE in a ring pattern (intra-node only)
@@ -144,7 +143,7 @@ __global__ void ShmemPutThreadKernel(int myPe, int npes, const SymmMemObjPtr mem
   if (globalTid >= numElements) return;
 
   int targetPe = (myPe + 1) % npes;
-  
+
   // Separate send and receive regions to avoid data race in ring pattern
   // Send region: [0, numElements)
   // Recv region: [numElements, 2*numElements)
@@ -174,7 +173,7 @@ __global__ void ShmemPutThreadKernel_PureAddr(int myPe, int npes, T* localBuff, 
   // Separate send and receive regions to avoid data race in ring pattern
   // Send region: [0, numElements)
   // Recv region: [numElements, 2*numElements)
-  T* src = localBuff + globalTid;              // Read from send region
+  T* src = localBuff + globalTid;                 // Read from send region
   T* dest = localBuff + numElements + globalTid;  // Write to recv region
 
   // Each PE writes its rank to the next PE's receive buffer
@@ -240,7 +239,7 @@ void testDirectP2PAccess() {
   // Allocate buffers
   constexpr int numElements = 256;
   size_t buffSize = numElements * sizeof(uint64_t);
-  
+
   // For ring transfer tests (Test 4 & 5), allocate 2x size for send + recv regions
   size_t ringBuffSize = 2 * numElements * sizeof(uint32_t);
 
@@ -287,15 +286,14 @@ void testDirectP2PAccess() {
   // Each PE writes to next PE
   constexpr int blockSize = 256;
   constexpr int gridSize = 1;
-  DirectAtomicAccessKernel<uint64_t><<<gridSize, blockSize>>>(myPe, npes, atomicBuffObj,
-                                                               errorFlag_d);
+  DirectAtomicAccessKernel<uint64_t>
+      <<<gridSize, blockSize>>>(myPe, npes, atomicBuffObj, errorFlag_d);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
 
   // Verify results
   uint64_t resultData[numElements];
-  HIP_RUNTIME_CHECK(
-      hipMemcpy(resultData, atomicBuff, buffSize, hipMemcpyDeviceToHost));
+  HIP_RUNTIME_CHECK(hipMemcpy(resultData, atomicBuff, buffSize, hipMemcpyDeviceToHost));
 
   int errorCount = 0;
   HIP_RUNTIME_CHECK(hipMemcpy(&errorCount, errorFlag_d, sizeof(int), hipMemcpyDeviceToHost));
@@ -330,8 +328,7 @@ void testDirectP2PAccess() {
   for (int i = 0; i < numElements; i++) {
     srcData[i] = (static_cast<uint64_t>(myPe) << 32) | i;
   }
-  HIP_RUNTIME_CHECK(
-      hipMemcpy(srcBuff, srcData, buffSize, hipMemcpyHostToDevice));
+  HIP_RUNTIME_CHECK(hipMemcpy(srcBuff, srcData, buffSize, hipMemcpyHostToDevice));
 
   // Initialize dst buffer to zero
   HIP_RUNTIME_CHECK(hipMemset(dstBuff, 0, buffSize));
@@ -340,15 +337,14 @@ void testDirectP2PAccess() {
   MPI_Barrier(MPI_COMM_WORLD);
 
   // Copy data to next PE
-  DirectMemoryCopyKernel<uint64_t><<<gridSize, blockSize>>>(myPe, npes, srcBuffObj, dstBuffObj,
-                                                             numElements, errorFlag_d);
+  DirectMemoryCopyKernel<uint64_t>
+      <<<gridSize, blockSize>>>(myPe, npes, srcBuffObj, dstBuffObj, numElements, errorFlag_d);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
 
   // Verify results
   uint64_t dstData[numElements];
-  HIP_RUNTIME_CHECK(
-      hipMemcpy(dstData, dstBuff, buffSize, hipMemcpyDeviceToHost));
+  HIP_RUNTIME_CHECK(hipMemcpy(dstData, dstBuff, buffSize, hipMemcpyDeviceToHost));
   HIP_RUNTIME_CHECK(hipMemcpy(&errorCount, errorFlag_d, sizeof(int), hipMemcpyDeviceToHost));
 
   // Each PE should have received data from previous PE
@@ -387,23 +383,23 @@ void testDirectP2PAccess() {
   // Initialize send region [0, numElements) with myPe value
   // Recv region [numElements, 2*numElements) will be written by remote PE
   HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(atomicBuff), myPe, numElements));
-  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(atomicBuff) + numElements, 0xFF, numElements));
+  HIP_RUNTIME_CHECK(
+      hipMemsetD32(reinterpret_cast<uint32_t*>(atomicBuff) + numElements, 0xFF, numElements));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
 
   // Each PE writes to next PE using shmem put
   ShmemPutThreadKernel<uint32_t><<<gridSize, blockSize>>>(myPe, npes, atomicBuffObj, numElements);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-  
+
   // SHMEM barrier ensures all put operations have completed and data has arrived at receivers
   // This is critical: ShmemQuiet only ensures send-side completion, not receive-side arrival
   ShmemBarrierAll();
 
   // Verify results from receive region [numElements, 2*numElements)
   uint32_t putResult[numElements];
-  HIP_RUNTIME_CHECK(
-      hipMemcpy(putResult, reinterpret_cast<uint32_t*>(atomicBuff) + numElements, 
-                numElements * sizeof(uint32_t), hipMemcpyDeviceToHost));
+  HIP_RUNTIME_CHECK(hipMemcpy(putResult, reinterpret_cast<uint32_t*>(atomicBuff) + numElements,
+                              numElements * sizeof(uint32_t), hipMemcpyDeviceToHost));
 
   int prevPe2 = (myPe - 1 + npes) % npes;
   bool putSuccess = true;
@@ -444,24 +440,24 @@ void testDirectP2PAccess() {
     // Initialize send region [0, numElements) with myPe value
     // Recv region [numElements, 2*numElements) will be written by remote PE
     HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(srcBuff), myPe, numElements));
-    HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(srcBuff) + numElements, 0xFF, numElements));
+    HIP_RUNTIME_CHECK(
+        hipMemsetD32(reinterpret_cast<uint32_t*>(srcBuff) + numElements, 0xFF, numElements));
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
 
     // Each PE writes to next PE using shmem put (pure address API)
-    ShmemPutThreadKernel_PureAddr<uint32_t><<<gridSize, blockSize>>>(
-        myPe, npes, reinterpret_cast<uint32_t*>(srcBuff), numElements);
+    ShmemPutThreadKernel_PureAddr<uint32_t>
+        <<<gridSize, blockSize>>>(myPe, npes, reinterpret_cast<uint32_t*>(srcBuff), numElements);
     HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-    
+
     // SHMEM barrier ensures all put operations have completed and data has arrived at receivers
     // This is critical: ShmemQuiet only ensures send-side completion, not receive-side arrival
     ShmemBarrierAll();
 
     // Verify results from receive region [numElements, 2*numElements)
     uint32_t putResult2[numElements];
-    HIP_RUNTIME_CHECK(
-        hipMemcpy(putResult2, reinterpret_cast<uint32_t*>(srcBuff) + numElements,
-                  numElements * sizeof(uint32_t), hipMemcpyDeviceToHost));
+    HIP_RUNTIME_CHECK(hipMemcpy(putResult2, reinterpret_cast<uint32_t*>(srcBuff) + numElements,
+                                numElements * sizeof(uint32_t), hipMemcpyDeviceToHost));
 
     bool putSuccess2 = true;
     for (int i = 0; i < numElements; i++) {
@@ -474,8 +470,9 @@ void testDirectP2PAccess() {
     }
 
     if (putSuccess2) {
-      printf("PE %d: ✓ Shmem Put Thread (Pure Address API) test PASSED (received data from PE %d)\n",
-             myPe, prevPe2);
+      printf(
+          "PE %d: ✓ Shmem Put Thread (Pure Address API) test PASSED (received data from PE %d)\n",
+          myPe, prevPe2);
     }
 
     MPI_Barrier(MPI_COMM_WORLD);

@@ -19,15 +19,14 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "src/pybind/mori.hpp"
-
+#include <hip/hip_runtime_api.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <hip/hip_runtime_api.h>
 
 #include "mori/ops/ops.hpp"
 #include "mori/pybind/profiler_registry.hpp"
 #include "mori/utils/hip_helper.hpp"
+#include "src/pybind/mori.hpp"
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Ops APIs                                            */
@@ -38,32 +37,38 @@ namespace py = pybind11;
 
 hipDataType IntToHipDataType(int dtype) {
   switch (dtype) {
-    case 0: return HIP_R_32F;
-    case 1: return HIP_R_16BF;
-    case 2: return HIP_R_8F_E4M3;
-    case 3: return HIP_R_8F_E4M3_FNUZ;
+    case 0:
+      return HIP_R_32F;
+    case 1:
+      return HIP_R_16BF;
+    case 2:
+      return HIP_R_8F_E4M3;
+    case 3:
+      return HIP_R_8F_E4M3_FNUZ;
 #if __has_include(<hip/hip_ext_ocp.h>)
-    case 5: return HIP_R_4F_E2M1;
+    case 5:
+      return HIP_R_4F_E2M1;
 #endif
-    default: throw std::runtime_error("Unsupported dtype int: " + std::to_string(dtype));
+    default:
+      throw std::runtime_error("Unsupported dtype int: " + std::to_string(dtype));
   }
 }
 
-// Merged prepare + build in one call. 
-int64_t PrepareAndBuildArgs(mori::moe::EpDispatchCombineHandle& handle,
-                            int64_t input_ptr, int input_dtype, int64_t num_tokens,
-                            int64_t weight_ptr, int64_t scale_ptr, int64_t indices_ptr,
-                            int rdmaBlockNum, int hiddenDim, int useExternalInpBuf) {
-  handle.PrepareInference(
-      IntToHipDataType(input_dtype), reinterpret_cast<void*>(input_ptr), nullptr,
-      weight_ptr ? reinterpret_cast<float*>(weight_ptr) : nullptr,
-      scale_ptr ? reinterpret_cast<uint8_t*>(scale_ptr) : nullptr,
-      reinterpret_cast<mori::moe::index_t*>(indices_ptr), num_tokens);
+// Merged prepare + build in one call.
+int64_t PrepareAndBuildArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t input_ptr,
+                            int input_dtype, int64_t num_tokens, int64_t weight_ptr,
+                            int64_t scale_ptr, int64_t indices_ptr, int rdmaBlockNum, int hiddenDim,
+                            int useExternalInpBuf) {
+  handle.PrepareInference(IntToHipDataType(input_dtype), reinterpret_cast<void*>(input_ptr),
+                          nullptr, weight_ptr ? reinterpret_cast<float*>(weight_ptr) : nullptr,
+                          scale_ptr ? reinterpret_cast<uint8_t*>(scale_ptr) : nullptr,
+                          reinterpret_cast<mori::moe::index_t*>(indices_ptr), num_tokens);
 
   thread_local mori::moe::EpDispatchCombineArgsRaw args;
   args = mori::moe::GetEpDispatchCombineArgsRaw(handle, rdmaBlockNum);
   if (hiddenDim > 0) args.config.hiddenDim = hiddenDim;
-  if (useExternalInpBuf >= 0) args.config.useExternalInpBuffer = static_cast<bool>(useExternalInpBuf);
+  if (useExternalInpBuf >= 0)
+    args.config.useExternalInpBuffer = static_cast<bool>(useExternalInpBuf);
   return reinterpret_cast<int64_t>(&args);
 }
 
@@ -80,9 +85,8 @@ py::tuple GetDispatchOutputPtrs(mori::moe::EpDispatchCombineHandle& handle, bool
 
 py::tuple GetCombineOutputPtrs(mori::moe::EpDispatchCombineHandle& handle, bool has_weights) {
   int64_t out_ptr = reinterpret_cast<int64_t>(handle.shmemCombineOutTokMemObj->Get());
-  int64_t outW_ptr = has_weights
-                         ? reinterpret_cast<int64_t>(handle.shmemCombineOutWeightsMemObj->Get())
-                         : 0;
+  int64_t outW_ptr =
+      has_weights ? reinterpret_cast<int64_t>(handle.shmemCombineOutWeightsMemObj->Get()) : 0;
   return py::make_tuple(out_ptr, outW_ptr);
 }
 
@@ -116,11 +120,10 @@ void SetStandardMoeOutputBuffers(mori::moe::EpDispatchCombineHandle& handle,
                                      reinterpret_cast<int*>(packedRecvSrcInfo_ptr), nullptr);
 }
 
-int64_t BuildConvertDispatchOutputArgs(
-    mori::moe::EpDispatchCombineHandle& handle,
-    int64_t dispatchOutX_ptr, int64_t dispatchOutTopkIdx_ptr,
-    int64_t packedRecvX_ptr, int64_t packedRecvSrcInfo_ptr,
-    int hiddenDim) {
+int64_t BuildConvertDispatchOutputArgs(mori::moe::EpDispatchCombineHandle& handle,
+                                       int64_t dispatchOutX_ptr, int64_t dispatchOutTopkIdx_ptr,
+                                       int64_t packedRecvX_ptr, int64_t packedRecvSrcInfo_ptr,
+                                       int hiddenDim) {
   auto* args = new mori::moe::ConvertDispatchOutputArgs{};
   args->config = handle.config;
   if (hiddenDim > 0) args->config.hiddenDim = hiddenDim;
@@ -138,10 +141,9 @@ int64_t BuildConvertDispatchOutputArgs(
   return reinterpret_cast<int64_t>(args);
 }
 
-int64_t BuildConvertCombineInputArgs(
-    mori::moe::EpDispatchCombineHandle& handle,
-    int64_t packedRecvX_ptr, int64_t packedRecvSrcInfo_ptr,
-    int hiddenDim) {
+int64_t BuildConvertCombineInputArgs(mori::moe::EpDispatchCombineHandle& handle,
+                                     int64_t packedRecvX_ptr, int64_t packedRecvSrcInfo_ptr,
+                                     int hiddenDim) {
   auto* args = new mori::moe::ConvertCombineInputArgs{};
   args->config = handle.config;
   if (hiddenDim > 0) args->config.hiddenDim = hiddenDim;
@@ -159,9 +161,7 @@ int64_t BuildConvertCombineInputArgs(
   return reinterpret_cast<int64_t>(args);
 }
 
-void FreeConvertArgs(int64_t ptr) {
-  ::operator delete(reinterpret_cast<void*>(ptr));
-}
+void FreeConvertArgs(int64_t ptr) { ::operator delete(reinterpret_cast<void*>(ptr)); }
 
 int64_t GetStandardMoePackedRecvCountPtr(mori::moe::EpDispatchCombineHandle& handle) {
   return reinterpret_cast<int64_t>(handle.standardPackedRecvCount);
@@ -224,11 +224,9 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   m.def("get_dispatch_output_ptrs", &GetDispatchOutputPtrs);
   m.def("get_combine_output_ptrs", &GetCombineOutputPtrs);
   m.def("get_handle_info", &GetHandleInfo);
-  m.def("prepare_and_build_args", &PrepareAndBuildArgs,
-        py::arg("handle"),
-        py::arg("inp_ptr"), py::arg("dtype"), py::arg("num_tokens"),
-        py::arg("weight_ptr"), py::arg("scale_ptr"), py::arg("indices_ptr"),
-        py::arg("rdma_block_num") = -1, py::arg("hidden_dim") = -1,
+  m.def("prepare_and_build_args", &PrepareAndBuildArgs, py::arg("handle"), py::arg("inp_ptr"),
+        py::arg("dtype"), py::arg("num_tokens"), py::arg("weight_ptr"), py::arg("scale_ptr"),
+        py::arg("indices_ptr"), py::arg("rdma_block_num") = -1, py::arg("hidden_dim") = -1,
         py::arg("use_external_inp_buf") = -1);
 
 #ifdef ENABLE_STANDARD_MOE_ADAPT

@@ -15,8 +15,6 @@ namespace mori {
 namespace shmem {
 __device__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
 }
-}
+}  // namespace mori
 
-extern "C" __global__ void mori_shmem_barrier_all_block() {
-  mori::shmem::ShmemBarrierAllBlock();
-}
+extern "C" __global__ void mori_shmem_barrier_all_block() { mori::shmem::ShmemBarrierAllBlock(); }

@@ -29,13 +29,12 @@
 #include <unordered_map>
 #include <vector>
 
-#include "mori/hip_compat.hpp"
-
 #include "mori/application/bootstrap/bootstrap.hpp"
 #include "mori/application/context/context.hpp"
 #include "mori/application/memory/va_manager.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/transport/transport.hpp"
+#include "mori/hip_compat.hpp"
 
 namespace mori {
 namespace application {

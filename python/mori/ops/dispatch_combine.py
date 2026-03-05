@@ -142,6 +142,7 @@ _compiled_hsaco: dict[str, str] = {}
 def warmup_jit_kernels(kernel_type):
     """Pre-compile kernels for a kernel_type. Call from main process before spawning workers."""
     from mori.jit.core import compile_genco
+
     if kernel_type not in _KERNEL_TYPE_TO_HIP:
         raise ValueError(f"Unknown kernel_type: {kernel_type}")
     hip_name = _KERNEL_TYPE_TO_HIP[kernel_type]
@@ -154,6 +155,7 @@ def _ensure_jit_kernels(kernel_type):
     """Ensure the required kernels for this kernel_type are JIT-compiled."""
     try:
         from mori.jit.core import compile_genco
+
         if kernel_type not in _KERNEL_TYPE_TO_HIP:
             raise ValueError(f"Unknown kernel_type: {kernel_type}")
         hip_name = _KERNEL_TYPE_TO_HIP[kernel_type]
@@ -161,6 +163,7 @@ def _ensure_jit_kernels(kernel_type):
             _compiled_hsaco[hip_name] = compile_genco(hip_name)
     except Exception as e:
         import warnings
+
         warnings.warn(f"[mori] JIT kernel compilation skipped: {e}")
 
 
@@ -237,13 +240,19 @@ class EpDispatchCombineOp:
 
         self.launch_config_mode = os.environ.get("MORI_EP_LAUNCH_CONFIG_MODE", "MANUAL")
         if self.launch_config_mode == "AUTO":
-            if self.config.kernel_type.value == EpDispatchCombineKernelType.InterNodeV1.value:
+            if (
+                self.config.kernel_type.value
+                == EpDispatchCombineKernelType.InterNodeV1.value
+            ):
                 (
                     self.auto_block_num,
                     self.auto_rdma_block_num,
                     self.auto_warp_per_block,
                 ) = (96, 64, 8)
-            elif self.config.kernel_type.value == EpDispatchCombineKernelType.InterNodeV1LL.value:
+            elif (
+                self.config.kernel_type.value
+                == EpDispatchCombineKernelType.InterNodeV1LL.value
+            ):
                 (
                     self.auto_block_num,
                     self.auto_rdma_block_num,
@@ -291,7 +300,9 @@ class EpDispatchCombineOp:
 
     def _combine_shared_mem(self, warp_per_block):
         """Shared memory for combine kernels: warpPerBlock * numExpertPerToken * (sizeof(T**) + sizeof(float**))."""
-        return warp_per_block * self.config.num_experts_per_token * (_PTR_SIZE + _PTR_SIZE)
+        return (
+            warp_per_block * self.config.num_experts_per_token * (_PTR_SIZE + _PTR_SIZE)
+        )
 
     def _launch(self, func_name, grid, block, shared_mem, stream, args_ptr):
         func = self._get_func(func_name)
@@ -300,7 +311,9 @@ class EpDispatchCombineOp:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def get_launch_config(self, is_dispatch=True, block_num=-1, rdma_block_num=-1, warp_per_block=-1):
+    def get_launch_config(
+        self, is_dispatch=True, block_num=-1, rdma_block_num=-1, warp_per_block=-1
+    ):
         return (
             self.auto_block_num if self.auto_block_num else block_num,
             self.auto_rdma_block_num if self.auto_rdma_block_num else rdma_block_num,
@@ -335,9 +348,15 @@ class EpDispatchCombineOp:
         sfx = _DTYPE_SUFFIX[input.dtype]
 
         args_ptr = mori_cpp.prepare_and_build_args(
-            self._handle, input.data_ptr(), dtype_to_int(input.dtype),
-            input.size(0), _opt_ptr(weights), scale_ptr, indices.data_ptr(),
-            actual_rbn, hidden_dim,
+            self._handle,
+            input.data_ptr(),
+            dtype_to_int(input.dtype),
+            input.size(0),
+            _opt_ptr(weights),
+            scale_ptr,
+            indices.data_ptr(),
+            actual_rbn,
+            hidden_dim,
         )
 
         grid = (actual_bn,)
@@ -346,19 +365,58 @@ class EpDispatchCombineOp:
         kt = self.config.kernel_type.value
 
         if kt == EpDispatchCombineKernelType.InterNode.value:
-            self._launch(f"EpDispatchInterNodeKernel_{sfx}", grid, block, shared_mem, stream, args_ptr)
+            self._launch(
+                f"EpDispatchInterNodeKernel_{sfx}",
+                grid,
+                block,
+                shared_mem,
+                stream,
+                args_ptr,
+            )
         elif kt == EpDispatchCombineKernelType.InterNodeV1.value:
             mp = self._handle_info["multi_processor_count"]
-            self._launch(f"EpDispatchCopyToStaging_{sfx}", (mp,), block, 0, stream, args_ptr)
-            self._launch(f"EpDispatchInterNodeV1Kernel_{sfx}", grid, block, shared_mem, stream, args_ptr)
+            self._launch(
+                f"EpDispatchCopyToStaging_{sfx}", (mp,), block, 0, stream, args_ptr
+            )
+            self._launch(
+                f"EpDispatchInterNodeV1Kernel_{sfx}",
+                grid,
+                block,
+                shared_mem,
+                stream,
+                args_ptr,
+            )
         elif kt == EpDispatchCombineKernelType.InterNodeV1LL.value:
             mp = self._handle_info["multi_processor_count"]
-            self._launch(f"EpDispatchCopyToStaging_{sfx}", (mp,), block, 0, stream, args_ptr)
-            self._launch(f"EpDispatchInterNodeV1KernelLowLatency_{sfx}", grid, block, shared_mem, stream, args_ptr)
+            self._launch(
+                f"EpDispatchCopyToStaging_{sfx}", (mp,), block, 0, stream, args_ptr
+            )
+            self._launch(
+                f"EpDispatchInterNodeV1KernelLowLatency_{sfx}",
+                grid,
+                block,
+                shared_mem,
+                stream,
+                args_ptr,
+            )
         elif kt == EpDispatchCombineKernelType.IntraNode.value:
-            self._launch(f"EpDispatchIntraNodeKernel_{sfx}", grid, block, shared_mem, stream, args_ptr)
+            self._launch(
+                f"EpDispatchIntraNodeKernel_{sfx}",
+                grid,
+                block,
+                shared_mem,
+                stream,
+                args_ptr,
+            )
         elif kt == EpDispatchCombineKernelType.AsyncLL.value:
-            self._launch(f"EpDispatchLowLatencyAsyncSend_{sfx}", grid, block, shared_mem, stream, args_ptr)
+            self._launch(
+                f"EpDispatchLowLatencyAsyncSend_{sfx}",
+                grid,
+                block,
+                shared_mem,
+                stream,
+                args_ptr,
+            )
         else:
             raise ValueError(f"Unsupported dispatch kernel_type: {kt}")
 
@@ -411,15 +469,31 @@ class EpDispatchCombineOp:
         kt = self.config.kernel_type.value
 
         args_ptr = mori_cpp.prepare_and_build_args(
-            self._handle, 0, 0, 0, 0, 0, 0, 0,
+            self._handle,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
         )
         grid = (actual_bn,)
         block = (WARP_SIZE * actual_wpb,)
         shared_mem = self._dispatch_shared_mem(actual_wpb)
         if kt == EpDispatchCombineKernelType.AsyncLL.value:
-            self._launch(f"EpDispatchLowLatencyAsyncRecv_{sfx}", grid, block, shared_mem, stream, args_ptr)
+            self._launch(
+                f"EpDispatchLowLatencyAsyncRecv_{sfx}",
+                grid,
+                block,
+                shared_mem,
+                stream,
+                args_ptr,
+            )
         else:
-            raise ValueError(f"dispatch_recv only supports AsyncLL, got kernel_type={kt}")
+            raise ValueError(
+                f"dispatch_recv only supports AsyncLL, got kernel_type={kt}"
+            )
 
     def combine(
         self,
@@ -441,10 +515,16 @@ class EpDispatchCombineOp:
         sfx = _DTYPE_SUFFIX[input.dtype]
 
         args_ptr = mori_cpp.prepare_and_build_args(
-            self._handle, input.data_ptr(), dtype_to_int(input.dtype),
+            self._handle,
+            input.data_ptr(),
+            dtype_to_int(input.dtype),
             self._get_cur_rank_num_token(self._handle),
-            weight_ptr, 0, indices.data_ptr(),
-            actual_rbn, hidden_dim, use_external_inp_buf,
+            weight_ptr,
+            0,
+            indices.data_ptr(),
+            actual_rbn,
+            hidden_dim,
+            use_external_inp_buf,
         )
 
         grid = (actual_bn,)
@@ -452,51 +532,124 @@ class EpDispatchCombineOp:
         shared_mem = self._combine_shared_mem(actual_wpb)
         kt = self.config.kernel_type.value
         actual_use_ext = (
-            use_external_inp_buf if use_external_inp_buf >= 0
+            use_external_inp_buf
+            if use_external_inp_buf >= 0
             else int(self.config.use_external_inp_buf)
         )
 
         if kt == EpDispatchCombineKernelType.InterNode.value:
-            self._launch(f"EpCombineInterNodeKernel_{sfx}", grid, block, shared_mem, stream, args_ptr)
+            self._launch(
+                f"EpCombineInterNodeKernel_{sfx}",
+                grid,
+                block,
+                shared_mem,
+                stream,
+                args_ptr,
+            )
         elif kt == EpDispatchCombineKernelType.InterNodeV1.value:
             mp = self._handle_info["multi_processor_count"]
             self._launch(f"EpCombineSync_{sfx}", (mp,), block, 0, stream, args_ptr)
-            self._launch(f"EpCombineSyncBarrier_{sfx}", (1,), (WARP_SIZE,), 0, stream, args_ptr)
-            self._launch(f"EpCombineInterNodeV1Kernel_{sfx}", grid, block, shared_mem, stream, args_ptr)
-            self._launch(f"EpCombineAll_{sfx}", (mp,), block, shared_mem, stream, args_ptr)
+            self._launch(
+                f"EpCombineSyncBarrier_{sfx}", (1,), (WARP_SIZE,), 0, stream, args_ptr
+            )
+            self._launch(
+                f"EpCombineInterNodeV1Kernel_{sfx}",
+                grid,
+                block,
+                shared_mem,
+                stream,
+                args_ptr,
+            )
+            self._launch(
+                f"EpCombineAll_{sfx}", (mp,), block, shared_mem, stream, args_ptr
+            )
         elif kt == EpDispatchCombineKernelType.InterNodeV1LL.value:
             mp = self._handle_info["multi_processor_count"]
             self._launch(f"EpCombineSync_{sfx}", (mp,), block, 0, stream, args_ptr)
-            self._launch(f"EpCombineSyncBarrier_{sfx}", (1,), (WARP_SIZE,), 0, stream, args_ptr)
-            self._launch(f"EpCombineInterNodeV1KernelLowLatency_{sfx}", grid, block, shared_mem, stream, args_ptr)
-            self._launch(f"EpCombineAll_{sfx}", (mp,), block, shared_mem, stream, args_ptr)
+            self._launch(
+                f"EpCombineSyncBarrier_{sfx}", (1,), (WARP_SIZE,), 0, stream, args_ptr
+            )
+            self._launch(
+                f"EpCombineInterNodeV1KernelLowLatency_{sfx}",
+                grid,
+                block,
+                shared_mem,
+                stream,
+                args_ptr,
+            )
+            self._launch(
+                f"EpCombineAll_{sfx}", (mp,), block, shared_mem, stream, args_ptr
+            )
         elif kt == EpDispatchCombineKernelType.IntraNode.value:
             if actual_use_ext:
                 quant_type = _normalize_quant_type(self.config.quant_type)
-                if sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8DirectCast:
-                    self._launch("EpCombineIntraNodeKernel_bf16_nop2p_fp8cast", grid, block, shared_mem, stream, args_ptr)
+                if (
+                    sfx == "bf16"
+                    and quant_type == EpDispatchCombineQuantType.Fp8DirectCast
+                ):
+                    self._launch(
+                        "EpCombineIntraNodeKernel_bf16_nop2p_fp8cast",
+                        grid,
+                        block,
+                        shared_mem,
+                        stream,
+                        args_ptr,
+                    )
                 else:
-                    self._launch(f"EpCombineIntraNodeKernel_{sfx}_nop2p", grid, block, shared_mem, stream, args_ptr)
+                    self._launch(
+                        f"EpCombineIntraNodeKernel_{sfx}_nop2p",
+                        grid,
+                        block,
+                        shared_mem,
+                        stream,
+                        args_ptr,
+                    )
             else:
-                self._launch(f"EpCombineIntraNodeKernel_{sfx}_p2p", grid, block, shared_mem, stream, args_ptr)
+                self._launch(
+                    f"EpCombineIntraNodeKernel_{sfx}_p2p",
+                    grid,
+                    block,
+                    shared_mem,
+                    stream,
+                    args_ptr,
+                )
         elif kt == EpDispatchCombineKernelType.AsyncLL.value:
             quant_type = _normalize_quant_type(self.config.quant_type)
             if sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8DirectCast:
-                self._launch("EpCombineLowLatencyAsyncSend_bf16_fp8cast", grid, block, shared_mem, stream, args_ptr)
+                self._launch(
+                    "EpCombineLowLatencyAsyncSend_bf16_fp8cast",
+                    grid,
+                    block,
+                    shared_mem,
+                    stream,
+                    args_ptr,
+                )
             else:
-                self._launch(f"EpCombineLowLatencyAsyncSend_{sfx}", grid, block, shared_mem, stream, args_ptr)
+                self._launch(
+                    f"EpCombineLowLatencyAsyncSend_{sfx}",
+                    grid,
+                    block,
+                    shared_mem,
+                    stream,
+                    args_ptr,
+                )
         else:
             raise ValueError(f"Unsupported combine kernel_type: {kt}")
 
         out_ptr, outW_ptr = self._combine_out_ptrs
         out = from_gpu_ptr(
-            out_ptr, (self.config.max_num_inp_token_per_rank, hidden_dim), input.dtype,
+            out_ptr,
+            (self.config.max_num_inp_token_per_rank, hidden_dim),
+            input.dtype,
         )
         out_weights = None
         if weight_ptr and outW_ptr:
             out_weights = from_gpu_ptr(
                 outW_ptr,
-                (self.config.max_num_inp_token_per_rank, self.config.num_experts_per_token),
+                (
+                    self.config.max_num_inp_token_per_rank,
+                    self.config.num_experts_per_token,
+                ),
                 weights.dtype,
             )
 
@@ -533,7 +686,14 @@ class EpDispatchCombineOp:
         kt = self.config.kernel_type.value
 
         args_ptr = mori_cpp.prepare_and_build_args(
-            self._handle, 0, 0, 0, 0, 0, 0, 0,
+            self._handle,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
         )
         grid = (actual_bn,)
         block = (WARP_SIZE * actual_wpb,)
@@ -541,11 +701,27 @@ class EpDispatchCombineOp:
         if kt == EpDispatchCombineKernelType.AsyncLL.value:
             quant_type = _normalize_quant_type(self.config.quant_type)
             if sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8DirectCast:
-                self._launch("EpCombineLowLatencyAsyncRecv_bf16_fp8cast", grid, block, shared_mem, stream, args_ptr)
+                self._launch(
+                    "EpCombineLowLatencyAsyncRecv_bf16_fp8cast",
+                    grid,
+                    block,
+                    shared_mem,
+                    stream,
+                    args_ptr,
+                )
             else:
-                self._launch(f"EpCombineLowLatencyAsyncRecv_{sfx}", grid, block, shared_mem, stream, args_ptr)
+                self._launch(
+                    f"EpCombineLowLatencyAsyncRecv_{sfx}",
+                    grid,
+                    block,
+                    shared_mem,
+                    stream,
+                    args_ptr,
+                )
         else:
-            raise ValueError(f"combine_recv only supports AsyncLL, got kernel_type={kt}")
+            raise ValueError(
+                f"combine_recv only supports AsyncLL, got kernel_type={kt}"
+            )
 
     def dispatch_standard_moe(
         self,
@@ -557,7 +733,9 @@ class EpDispatchCombineOp:
         rdma_block_num: int = -1,
         warp_per_block: int = -1,
     ):
-        set_fn = _cpp_dispatch_combine_factory("set_standard_moe_output_buffers", allow_missing=True)
+        set_fn = _cpp_dispatch_combine_factory(
+            "set_standard_moe_output_buffers", allow_missing=True
+        )
         if set_fn is None:
             raise RuntimeError(
                 "dispatch_standard_moe is not available. "
@@ -572,7 +750,9 @@ class EpDispatchCombineOp:
 
         hidden_dim = input.size(1)
         num_local_experts = self.config.num_experts_per_rank
-        max_tokens_per_expert = self.config.world_size * self.config.max_num_inp_token_per_rank
+        max_tokens_per_expert = (
+            self.config.world_size * self.config.max_num_inp_token_per_rank
+        )
         actual_bn, actual_rbn, actual_wpb = self._resolve_launch_params(
             block_num, rdma_block_num, warp_per_block
         )
@@ -581,20 +761,30 @@ class EpDispatchCombineOp:
 
         packed_recv_x = torch.empty(
             (num_local_experts, max_tokens_per_expert, hidden_dim),
-            dtype=input.dtype, device=input.device,
+            dtype=input.dtype,
+            device=input.device,
         )
         packed_recv_src_info = torch.empty(
             (num_local_experts, max_tokens_per_expert),
-            dtype=torch.int32, device=input.device,
+            dtype=torch.int32,
+            device=input.device,
         )
-        packed_recv_layout_range = torch.empty(0, dtype=torch.int64, device=input.device)
+        packed_recv_layout_range = torch.empty(
+            0, dtype=torch.int64, device=input.device
+        )
 
         set_fn(self._handle, packed_recv_x.data_ptr(), packed_recv_src_info.data_ptr())
 
         args_ptr = mori_cpp.prepare_and_build_args(
-            self._handle, input.data_ptr(), dtype_to_int(input.dtype),
-            input.size(0), _opt_ptr(weights), _opt_ptr(scales), indices.data_ptr(),
-            actual_rbn, hidden_dim,
+            self._handle,
+            input.data_ptr(),
+            dtype_to_int(input.dtype),
+            input.size(0),
+            _opt_ptr(weights),
+            _opt_ptr(scales),
+            indices.data_ptr(),
+            actual_rbn,
+            hidden_dim,
         )
 
         grid = (actual_bn,)
@@ -604,21 +794,44 @@ class EpDispatchCombineOp:
 
         if kt == EpDispatchCombineKernelType.InterNodeV1LL.value:
             mp = self._handle_info["multi_processor_count"]
-            self._launch(f"EpDispatchCopyToStaging_{sfx}", (mp,), block, 0, stream, args_ptr)
-            self._launch(f"EpDispatchInterNodeV1KernelLowLatency_{sfx}_stdmoe", grid, block, shared_mem, stream, args_ptr)
+            self._launch(
+                f"EpDispatchCopyToStaging_{sfx}", (mp,), block, 0, stream, args_ptr
+            )
+            self._launch(
+                f"EpDispatchInterNodeV1KernelLowLatency_{sfx}_stdmoe",
+                grid,
+                block,
+                shared_mem,
+                stream,
+                args_ptr,
+            )
         elif kt == EpDispatchCombineKernelType.IntraNode.value:
-            self._launch(f"EpDispatchIntraNodeKernel_{sfx}_stdmoe", grid, block, shared_mem, stream, args_ptr)
+            self._launch(
+                f"EpDispatchIntraNodeKernel_{sfx}_stdmoe",
+                grid,
+                block,
+                shared_mem,
+                stream,
+                args_ptr,
+            )
         else:
             raise ValueError(
                 "dispatch_standard_moe only supports IntraNode/InterNodeV1LL"
             )
 
-        packed_recv_count_ptr = mori_cpp.get_standard_moe_packed_recv_count_ptr(self._handle)
+        packed_recv_count_ptr = mori_cpp.get_standard_moe_packed_recv_count_ptr(
+            self._handle
+        )
         packed_recv_count = from_gpu_ptr(
             packed_recv_count_ptr, (num_local_experts,), torch.int32
         )
 
-        return (packed_recv_x, packed_recv_count, packed_recv_src_info, packed_recv_layout_range)
+        return (
+            packed_recv_x,
+            packed_recv_count,
+            packed_recv_src_info,
+            packed_recv_layout_range,
+        )
 
     def combine_standard_moe(
         self,
@@ -630,7 +843,9 @@ class EpDispatchCombineOp:
         warp_per_block: int = -1,
         call_reset: bool = False,
     ):
-        set_fn = _cpp_dispatch_combine_factory("set_standard_moe_output_buffers", allow_missing=True)
+        set_fn = _cpp_dispatch_combine_factory(
+            "set_standard_moe_output_buffers", allow_missing=True
+        )
         if set_fn is None:
             raise RuntimeError(
                 "combine_standard_moe is not available. "
@@ -653,10 +868,15 @@ class EpDispatchCombineOp:
         set_fn(self._handle, input.data_ptr(), 0)
 
         args_ptr = mori_cpp.prepare_and_build_args(
-            self._handle, input.data_ptr(), dtype_to_int(input.dtype),
+            self._handle,
+            input.data_ptr(),
+            dtype_to_int(input.dtype),
             self._get_cur_rank_num_token(self._handle),
-            _opt_ptr(weights), 0, indices.data_ptr(),
-            actual_rbn, hidden_dim,
+            _opt_ptr(weights),
+            0,
+            indices.data_ptr(),
+            actual_rbn,
+            hidden_dim,
         )
 
         grid = (actual_bn,)
@@ -667,11 +887,29 @@ class EpDispatchCombineOp:
         if kt == EpDispatchCombineKernelType.InterNodeV1LL.value:
             mp = self._handle_info["multi_processor_count"]
             self._launch(f"EpCombineSync_{sfx}", (mp,), block, 0, stream, args_ptr)
-            self._launch(f"EpCombineSyncBarrier_{sfx}", (1,), (WARP_SIZE,), 0, stream, args_ptr)
-            self._launch(f"EpCombineInterNodeV1KernelLowLatency_{sfx}_stdmoe", grid, block, shared_mem, stream, args_ptr)
-            self._launch(f"EpCombineAll_{sfx}", (mp,), block, shared_mem, stream, args_ptr)
+            self._launch(
+                f"EpCombineSyncBarrier_{sfx}", (1,), (WARP_SIZE,), 0, stream, args_ptr
+            )
+            self._launch(
+                f"EpCombineInterNodeV1KernelLowLatency_{sfx}_stdmoe",
+                grid,
+                block,
+                shared_mem,
+                stream,
+                args_ptr,
+            )
+            self._launch(
+                f"EpCombineAll_{sfx}", (mp,), block, shared_mem, stream, args_ptr
+            )
         elif kt == EpDispatchCombineKernelType.IntraNode.value:
-            self._launch(f"EpCombineIntraNodeKernel_{sfx}_p2p_stdmoe", grid, block, shared_mem, stream, args_ptr)
+            self._launch(
+                f"EpCombineIntraNodeKernel_{sfx}_p2p_stdmoe",
+                grid,
+                block,
+                shared_mem,
+                stream,
+                args_ptr,
+            )
         else:
             raise ValueError(
                 "combine_standard_moe only supports IntraNode/InterNodeV1LL"
@@ -679,7 +917,9 @@ class EpDispatchCombineOp:
 
         out_ptr = self._combine_out_ptrs[0]
         out = from_gpu_ptr(
-            out_ptr, (self.config.max_num_inp_token_per_rank, hidden_dim), input.dtype,
+            out_ptr,
+            (self.config.max_num_inp_token_per_rank, hidden_dim),
+            input.dtype,
         )
         out_weights = None
 
@@ -705,7 +945,9 @@ class EpDispatchCombineOp:
 
         hidden_dim = dispatch_out_x.size(1)
         num_local_experts = self.config.num_experts_per_rank
-        max_tokens_per_expert = self.config.world_size * self.config.max_num_inp_token_per_rank
+        max_tokens_per_expert = (
+            self.config.world_size * self.config.max_num_inp_token_per_rank
+        )
         actual_bn, _, actual_wpb = self._resolve_launch_params(
             block_num, 0, warp_per_block
         )
@@ -713,13 +955,17 @@ class EpDispatchCombineOp:
 
         packed_recv_x = torch.empty(
             (num_local_experts, max_tokens_per_expert, hidden_dim),
-            dtype=dispatch_out_x.dtype, device=dispatch_out_x.device,
+            dtype=dispatch_out_x.dtype,
+            device=dispatch_out_x.device,
         )
         packed_recv_src_info = torch.empty(
             (num_local_experts, max_tokens_per_expert),
-            dtype=torch.int32, device=dispatch_out_x.device,
+            dtype=torch.int32,
+            device=dispatch_out_x.device,
         )
-        packed_recv_layout_range = torch.empty(0, dtype=torch.int64, device=dispatch_out_x.device)
+        packed_recv_layout_range = torch.empty(
+            0, dtype=torch.int64, device=dispatch_out_x.device
+        )
 
         args_ptr = build_fn(
             self._handle,
@@ -732,16 +978,25 @@ class EpDispatchCombineOp:
         try:
             grid = (actual_bn,)
             block = (WARP_SIZE * actual_wpb,)
-            self._launch("mori_ConvertDispatchOutputKernel", grid, block, 0, stream, args_ptr)
+            self._launch(
+                "mori_ConvertDispatchOutputKernel", grid, block, 0, stream, args_ptr
+            )
         finally:
             mori_cpp.free_convert_args(args_ptr)
 
-        packed_recv_count_ptr = mori_cpp.get_standard_moe_packed_recv_count_ptr(self._handle)
+        packed_recv_count_ptr = mori_cpp.get_standard_moe_packed_recv_count_ptr(
+            self._handle
+        )
         packed_recv_count = from_gpu_ptr(
             packed_recv_count_ptr, (num_local_experts,), torch.int32
         )
 
-        return (packed_recv_x, packed_recv_count, packed_recv_src_info, packed_recv_layout_range)
+        return (
+            packed_recv_x,
+            packed_recv_count,
+            packed_recv_src_info,
+            packed_recv_layout_range,
+        )
 
     def convert_combine_input(
         self,
@@ -776,13 +1031,17 @@ class EpDispatchCombineOp:
         try:
             grid = (actual_bn,)
             block = (WARP_SIZE * actual_wpb,)
-            self._launch(f"ConvertCombineInputKernel_{sfx}", grid, block, 0, stream, args_ptr)
+            self._launch(
+                f"ConvertCombineInputKernel_{sfx}", grid, block, 0, stream, args_ptr
+            )
         finally:
             mori_cpp.free_convert_args(args_ptr)
 
         max_recv = self.config.max_num_tokens_to_recv
         combine_input_ptr = mori_cpp.get_combine_input_ptr(self._handle)
-        return from_gpu_ptr(combine_input_ptr, (max_recv, hidden_dim), packed_recv_x.dtype)
+        return from_gpu_ptr(
+            combine_input_ptr, (max_recv, hidden_dim), packed_recv_x.dtype
+        )
 
     def reset(self):
         self._reset_func(self._handle, _current_stream())

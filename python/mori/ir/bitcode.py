@@ -23,7 +23,11 @@ def _find_jit_cached_bitcode() -> str | None:
     """Look for a previously JIT-compiled bitcode in the cache directory."""
     try:
         from mori.jit.cache import get_cache_root
-        from mori.jit.config import detect_build_config, detect_nic_type, get_mori_source_root
+        from mori.jit.config import (
+            detect_build_config,
+            detect_nic_type,
+            get_mori_source_root,
+        )
 
         cfg = detect_build_config()
         nic = detect_nic_type()
@@ -32,6 +36,7 @@ def _find_jit_cached_bitcode() -> str | None:
             return None
 
         from mori.jit.cache import get_cache_dir
+
         source_paths = [
             mori_root / "src" / "shmem" / "shmem_device_api_wrapper.cpp",
             mori_root / "include" / "mori" / "shmem",
@@ -81,6 +86,7 @@ def find_bitcode() -> str:
     if not jit_disabled:
         try:
             from mori.jit.core import ensure_bitcode
+
             _cached_path = ensure_bitcode()
             return _cached_path
         except Exception:

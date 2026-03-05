@@ -125,7 +125,8 @@ def _verify_bitcode(cfg: BuildConfig, bc_path: Path) -> None:
     """Verify that globalGpuStates symbol exists in the bitcode."""
     result = subprocess.run(
         [cfg.opt, "-S", str(bc_path), "-o", "-"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     if "_ZN4mori5shmem15globalGpuStatesE" not in result.stdout:
         raise RuntimeError(
@@ -178,7 +179,9 @@ def _build_bitcode(cfg: BuildConfig, mori_root: Path, output: Path) -> None:
         shim_src.write_text(_GLOBAL_GPU_STATES_SHIM)
 
         nic = detect_nic_type()
-        print(f"[mori-jit] Compiling shmem device bitcode for {cfg.arch} (nic={nic}) ...")
+        print(
+            f"[mori-jit] Compiling shmem device bitcode for {cfg.arch} (nic={nic}) ..."
+        )
 
         wrapper_bc = tmp_dir / "wrapper.bc"
         _hipcc_device_bc(cfg, wrapper_src, include_dirs, wrapper_bc)
@@ -196,6 +199,7 @@ def _build_bitcode(cfg: BuildConfig, mori_root: Path, output: Path) -> None:
 
         output.parent.mkdir(parents=True, exist_ok=True)
         import shutil
+
         shutil.copy2(stripped_bc, output)
 
     print(f"[mori-jit] Cached: {output}")
@@ -236,8 +240,11 @@ def _compile_one_genco(args: tuple) -> str:
     """Worker for parallel genco compilation."""
     kernel_name, arch, rocm_path, hipcc, include_dirs_str, output_path = args
     cfg_local = BuildConfig(
-        arch=arch, rocm_path=rocm_path, hipcc=hipcc,
-        llvm_link="", opt="",
+        arch=arch,
+        rocm_path=rocm_path,
+        hipcc=hipcc,
+        llvm_link="",
+        opt="",
     )
     mori_root = get_mori_source_root()
     source = mori_root / "src" / "ops" / "kernels" / f"{kernel_name}.hip"
@@ -266,7 +273,10 @@ def compile_genco(kernel_name: str) -> str | list[str]:
 
     sub_kernels = _PARALLEL_KERNEL_GROUPS.get(kernel_name)
     if sub_kernels:
-        source_paths = [mori_root / "src" / "ops" / "kernels", mori_root / "include" / "mori"]
+        source_paths = [
+            mori_root / "src" / "ops" / "kernels",
+            mori_root / "include" / "mori",
+        ]
         cache_dir = get_cache_dir(cfg.arch, source_paths, nic)
 
         hsaco_paths = [cache_dir / f"{k}.hsaco" for k in sub_kernels]
@@ -279,16 +289,26 @@ def compile_genco(kernel_name: str) -> str | list[str]:
             if baton.skipped or all(p.is_file() for p in hsaco_paths):
                 return [str(p) for p in hsaco_paths]
 
-            print(f"[mori-jit] Compiling {kernel_name} for {cfg.arch} (nic={nic}, "
-                  f"{len(sub_kernels)} files in parallel) ...")
+            print(
+                f"[mori-jit] Compiling {kernel_name} for {cfg.arch} (nic={nic}, "
+                f"{len(sub_kernels)} files in parallel) ..."
+            )
 
             include_strs = [str(d) for d in include_dirs]
             tasks = [
-                (k, cfg.arch, cfg.rocm_path, cfg.hipcc, include_strs, str(cache_dir / f"{k}.hsaco"))
+                (
+                    k,
+                    cfg.arch,
+                    cfg.rocm_path,
+                    cfg.hipcc,
+                    include_strs,
+                    str(cache_dir / f"{k}.hsaco"),
+                )
                 for k in sub_kernels
             ]
 
             from concurrent.futures import ProcessPoolExecutor
+
             with ProcessPoolExecutor(max_workers=len(sub_kernels)) as pool:
                 list(pool.map(_compile_one_genco, tasks))
 

@@ -19,11 +19,10 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "src/pybind/mori.hpp"
-
 #include <pybind11/pybind11.h>
 
 #include "mori/shmem/shmem_api.hpp"
+#include "src/pybind/mori.hpp"
 
 namespace py = pybind11;
 
@@ -113,7 +112,6 @@ int64_t ShmemNumQpPerPe() { return mori::shmem::ShmemNumQpPerPe(); }
 
 }  // namespace
 
-
 namespace mori {
 void RegisterMoriShmem(py::module_& m) {
   // Initialization flags
@@ -184,6 +182,5 @@ void RegisterMoriShmem(py::module_& m) {
   m.def("shmem_npes", &ShmemNPes);
   m.def("shmem_num_qp_per_pe", &ShmemNumQpPerPe);
 }
-
 
 }  // namespace mori

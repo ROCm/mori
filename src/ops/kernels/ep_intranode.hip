@@ -16,9 +16,9 @@ WRAP_BOOL3(EpCombineIntraNodeKernel, bf16_nop2p_fp8cast, hip_bfloat16, false, fa
 extern "C" __global__ void mori_ConvertDispatchOutputKernel(ConvertDispatchOutputArgs args) {
   ConvertDispatchOutputDevice(args);
 }
-#define WRAP_CONVERT_COMBINE(suffix, T) \
+#define WRAP_CONVERT_COMBINE(suffix, T)                                                         \
   extern "C" __global__ void ConvertCombineInputKernel_##suffix(ConvertCombineInputArgs args) { \
-    ConvertCombineInputDevice<T, true>(args); \
+    ConvertCombineInputDevice<T, true>(args);                                                   \
   }
 WRAP_CONVERT_COMBINE(f32, float)
 WRAP_CONVERT_COMBINE(bf16, hip_bfloat16)

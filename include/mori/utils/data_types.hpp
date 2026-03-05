@@ -29,6 +29,7 @@
 
 #if __has_include(<hip/hip_ext_ocp.h>) && (defined(__HIPCC__) || defined(__CUDACC__))
 #include <hip/hip_ext_ocp.h>
+
 #include <hip/amd_detail/amd_hip_ocp_host.hpp>
 #define MORI_HAS_OCP_FP 1
 #endif
@@ -121,7 +122,7 @@ __device__ static mori_fp4x2_storage float2_to_fp4x2_e2m1(const float2 x) {
 #endif
   return u.fp4x2[0];
 }
-#endif // MORI_HAS_OCP_FP
+#endif  // MORI_HAS_OCP_FP
 
 struct mori_fp4_e2m1 {
   mori_fp4_storage x;
@@ -158,7 +159,7 @@ struct mori_fp4_e2m1 {
 #endif
     return ret[0];
   }
-#endif // MORI_HAS_OCP_FP
+#endif  // MORI_HAS_OCP_FP
 };
 
 struct mori_fp4x2_e2m1 {
@@ -196,7 +197,7 @@ struct mori_fp4x2_e2m1 {
 #endif
     return float2(fp32x2[0], fp32x2[1]);
   }
-#endif // MORI_HAS_OCP_FP
+#endif  // MORI_HAS_OCP_FP
 };
 
 struct mori_fp4x4_e2m1 {
@@ -226,7 +227,7 @@ struct mori_fp4x4_e2m1 {
 #endif
     return float4(fp32x2_1[0], fp32x2_1[1], fp32x2_2[0], fp32x2_2[1]);
   }
-#endif // MORI_HAS_OCP_FP
+#endif  // MORI_HAS_OCP_FP
 };
 
 }  // namespace mori

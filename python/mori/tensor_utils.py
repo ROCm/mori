@@ -41,6 +41,7 @@ Dtype int mapping (matches C++ IntToHipDataType in pybind_ops.cpp):
     0 = float32, 1 = bfloat16, 2 = float8_e4m3fn,
     3 = float8_e4m3fnuz, 4 = int32
 """
+
 import ctypes
 import math
 
@@ -63,15 +64,23 @@ def _get_dl_gpu_device_type():
         return _DL_GPU_DEVICE_TYPE
     try:
         import torch
-        _DL_GPU_DEVICE_TYPE = kDLROCM if hasattr(torch.version, 'hip') and torch.version.hip else kDLCUDA
+
+        _DL_GPU_DEVICE_TYPE = (
+            kDLROCM if hasattr(torch.version, "hip") and torch.version.hip else kDLCUDA
+        )
     except ImportError:
         import os
+
         _DL_GPU_DEVICE_TYPE = kDLROCM if os.path.isdir("/opt/rocm") else kDLCUDA
     return _DL_GPU_DEVICE_TYPE
 
 
 class _DLDataType(ctypes.Structure):
-    _fields_ = [("code", ctypes.c_uint8), ("bits", ctypes.c_uint8), ("lanes", ctypes.c_uint16)]
+    _fields_ = [
+        ("code", ctypes.c_uint8),
+        ("bits", ctypes.c_uint8),
+        ("lanes", ctypes.c_uint16),
+    ]
 
 
 class _DLDevice(ctypes.Structure):
@@ -118,16 +127,17 @@ def _init_torch_dtype_map():
     if _TORCH_DTYPE_TO_INT is not None:
         return
     import torch
+
     _TORCH_DTYPE_TO_INT = {
         torch.float32: 0,
         torch.bfloat16: 1,
         torch.int32: 4,
     }
-    if hasattr(torch, 'float8_e4m3fn'):
+    if hasattr(torch, "float8_e4m3fn"):
         _TORCH_DTYPE_TO_INT[torch.float8_e4m3fn] = 2
-    if hasattr(torch, 'float8_e4m3fnuz'):
+    if hasattr(torch, "float8_e4m3fnuz"):
         _TORCH_DTYPE_TO_INT[torch.float8_e4m3fnuz] = 3
-    if hasattr(torch, 'float4_e2m1fn_x2'):
+    if hasattr(torch, "float4_e2m1fn_x2"):
         _TORCH_DTYPE_TO_INT[torch.float4_e2m1fn_x2] = 5
 
 
@@ -159,29 +169,43 @@ def _init_dtype_info():
     if _DTYPE_INFO is not None:
         return
     import torch
+
     _DTYPE_INFO = {
         #                   typestr  size  reinterpret     dl_code   dl_bits
-        torch.float32:     ('<f4',   4,    None,           kDLFloat, 32),
-        torch.float64:     ('<f8',   8,    None,           kDLFloat, 64),
-        torch.float16:     ('<f2',   2,    None,           kDLFloat, 16),
-        torch.int8:        ('<i1',   1,    None,           kDLInt,   8),
-        torch.int16:       ('<i2',   2,    None,           kDLInt,   16),
-        torch.int32:       ('<i4',   4,    None,           kDLInt,   32),
-        torch.int64:       ('<i8',   8,    None,           kDLInt,   64),
-        torch.uint8:       ('<u1',   1,    None,           kDLUInt,  8),
-        torch.bfloat16:    ('<u2',   2,    torch.bfloat16, kDLBfloat, 16),
+        torch.float32: ("<f4", 4, None, kDLFloat, 32),
+        torch.float64: ("<f8", 8, None, kDLFloat, 64),
+        torch.float16: ("<f2", 2, None, kDLFloat, 16),
+        torch.int8: ("<i1", 1, None, kDLInt, 8),
+        torch.int16: ("<i2", 2, None, kDLInt, 16),
+        torch.int32: ("<i4", 4, None, kDLInt, 32),
+        torch.int64: ("<i8", 8, None, kDLInt, 64),
+        torch.uint8: ("<u1", 1, None, kDLUInt, 8),
+        torch.bfloat16: ("<u2", 2, torch.bfloat16, kDLBfloat, 16),
     }
-    if hasattr(torch, 'float8_e4m3fnuz'):
-        _DTYPE_INFO[torch.float8_e4m3fnuz] = ('<u1', 1, torch.float8_e4m3fnuz, kDLUInt, 8)
-    if hasattr(torch, 'float8_e4m3fn'):
-        _DTYPE_INFO[torch.float8_e4m3fn] = ('<u1', 1, torch.float8_e4m3fn, kDLUInt, 8)
-    if hasattr(torch, 'float4_e2m1fn_x2'):
-        _DTYPE_INFO[torch.float4_e2m1fn_x2] = ('<u1', 1, torch.float4_e2m1fn_x2, kDLUInt, 8)
+    if hasattr(torch, "float8_e4m3fnuz"):
+        _DTYPE_INFO[torch.float8_e4m3fnuz] = (
+            "<u1",
+            1,
+            torch.float8_e4m3fnuz,
+            kDLUInt,
+            8,
+        )
+    if hasattr(torch, "float8_e4m3fn"):
+        _DTYPE_INFO[torch.float8_e4m3fn] = ("<u1", 1, torch.float8_e4m3fn, kDLUInt, 8)
+    if hasattr(torch, "float4_e2m1fn_x2"):
+        _DTYPE_INFO[torch.float4_e2m1fn_x2] = (
+            "<u1",
+            1,
+            torch.float4_e2m1fn_x2,
+            kDLUInt,
+            8,
+        )
 
 
 # ---------------------------------------------------------------------------
 # GpuTensorView — framework-agnostic GPU array wrapper
 # ---------------------------------------------------------------------------
+
 
 @_DL_DELETER
 def _dl_noop_deleter(_ptr):
@@ -216,10 +240,10 @@ class GpuTensorView:
         self._device_id = device_id
 
         self.__cuda_array_interface__ = {
-            'data': (ptr, False),
-            'shape': self._shape,
-            'typestr': typestr,
-            'version': 2,
+            "data": (ptr, False),
+            "shape": self._shape,
+            "typestr": typestr,
+            "version": 2,
         }
 
         self._dlpack_refs = None
@@ -267,7 +291,8 @@ def gpu_tensor_view(ptr, shape, dtype, device_id=0):
         raise ValueError(f"Unsupported dtype: {dtype}")
     typestr, _elem_size, _reinterpret, dl_code, dl_bits = info
     return GpuTensorView(
-        ptr, shape,
+        ptr,
+        shape,
         dl_dtype=(dl_code, dl_bits),
         typestr=typestr,
         device_id=device_id,
@@ -277,6 +302,7 @@ def gpu_tensor_view(ptr, shape, dtype, device_id=0):
 # ---------------------------------------------------------------------------
 # from_gpu_ptr — convenience wrapper returning framework-native tensors
 # ---------------------------------------------------------------------------
+
 
 def from_gpu_ptr(ptr, shape, dtype, framework="torch"):
     """
@@ -307,6 +333,7 @@ def _torch_from_ptr(ptr, shape, dtype):
     For cross-framework use (jax, etc.), use gpu_tensor_view() + from_dlpack().
     """
     import torch
+
     _init_dtype_info()
 
     info = _DTYPE_INFO.get(dtype)
@@ -319,19 +346,23 @@ def _torch_from_ptr(ptr, shape, dtype):
     if reinterpret_as is not None:
         total_elems = math.prod(shape)
         view = GpuTensorView(
-            ptr, (total_elems * elem_size,),
-            dl_dtype=(kDLUInt, 8), typestr='<u1',
+            ptr,
+            (total_elems * elem_size,),
+            dl_dtype=(kDLUInt, 8),
+            typestr="<u1",
             device_id=device_id,
         )
-        raw = torch.as_tensor(view, device=f'cuda:{device_id}')
+        raw = torch.as_tensor(view, device=f"cuda:{device_id}")
         return raw.view(reinterpret_as).reshape(shape)
 
     view = GpuTensorView(
-        ptr, shape,
-        dl_dtype=(dl_code, dl_bits), typestr=typestr,
+        ptr,
+        shape,
+        dl_dtype=(dl_code, dl_bits),
+        typestr=typestr,
         device_id=device_id,
     )
-    return torch.as_tensor(view, device=f'cuda:{device_id}')
+    return torch.as_tensor(view, device=f"cuda:{device_id}")
 
 
 def _jax_from_ptr(ptr, shape, dtype):
@@ -358,8 +389,10 @@ def _jax_from_ptr(ptr, shape, dtype):
     if reinterpret_as is not None:
         total_elems = math.prod(shape)
         view = GpuTensorView(
-            ptr, (total_elems * elem_size,),
-            dl_dtype=(kDLUInt, 8), typestr='<u1',
+            ptr,
+            (total_elems * elem_size,),
+            dl_dtype=(kDLUInt, 8),
+            typestr="<u1",
         )
         raw = jax.dlpack.from_dlpack(view)
         return raw.view(reinterpret_as).reshape(shape)

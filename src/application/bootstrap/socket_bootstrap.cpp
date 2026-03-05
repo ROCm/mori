@@ -650,16 +650,16 @@ bool SocketBootstrapNetwork::SetupCommunicationRing() {
   }
 
   if (!ring_connected) {
-    MORI_APP_ERROR("Rank {} failed to connect to next rank {} for ring after {} retries",
-                   localRank, next_rank, kRingMaxRetries);
+    MORI_APP_ERROR("Rank {} failed to connect to next rank {} for ring after {} retries", localRank,
+                   next_rank, kRingMaxRetries);
     return false;
   }
 
   // Accept connection from previous rank
   if (!AcceptSocket(listen_socket_, ring_recv_socket_)) {
     int prev_rank = (localRank - 1 + worldSize) % worldSize;
-    MORI_APP_ERROR("Rank {}: failed to accept ring connection from rank {} (errno={})",
-                   localRank, prev_rank, errno);
+    MORI_APP_ERROR("Rank {}: failed to accept ring connection from rank {} (errno={})", localRank,
+                   prev_rank, errno);
     return false;
   }
 

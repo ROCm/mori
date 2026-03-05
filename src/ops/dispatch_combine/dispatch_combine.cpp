@@ -21,8 +21,9 @@
 // SOFTWARE.
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 
-#include <algorithm>
 #include <hip/hip_runtime_api.h>
+
+#include <algorithm>
 
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem_api.hpp"

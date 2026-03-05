@@ -30,4 +30,5 @@ from . import kernel_profiler
 
 if os.environ.get("MORI_PRECOMPILE", "").lower() in ("1", "true", "on"):
     from .jit import precompile
+
     precompile()

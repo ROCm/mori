@@ -201,7 +201,7 @@ cd mori && pip install .
 ```
 
 That's it. No hipcc needed at install time — host code compiles with a standard
-C++ compiler (~15s). GPU kernels are JIT-compiled on first use and cached to
+C++ compiler. GPU kernels are JIT-compiled on first use and cached to
 `~/.mori/jit/`. If a GPU is detected during install, kernel precompilation
 starts automatically in the background.
 
