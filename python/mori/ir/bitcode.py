@@ -93,8 +93,8 @@ def find_bitcode() -> str:
 
     raise FileNotFoundError(
         f"{_BC_FILENAME} not found. Searched: {pre_built}\n"
-        "Build it with: bash tools/build_shmem_bitcode.sh\n"
-        "Or enable JIT compilation (unset MORI_DISABLE_JIT)."
+        "Enable JIT compilation (unset MORI_DISABLE_JIT) or run:\n"
+        "  MORI_PRECOMPILE=1 python -c 'import mori'"
     )
 
 

@@ -1,6 +1,6 @@
 find_package(MPI REQUIRED)
 
-set(MORI_SHMEM_SOURCES init.cpp memory.cpp)
+set(MORI_SHMEM_SOURCES init.cpp runtime.cpp memory.cpp)
 
 # All shmem source files are now pure CXX (device code moved to JIT)
 add_library(mori_shmem ${MORI_SHMEM_SOURCES})

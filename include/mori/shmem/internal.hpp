@@ -143,6 +143,11 @@ struct RemoteAddrInfo {
   __device__ RemoteAddrInfo(uintptr_t r, uintptr_t k) : raddr(r), rkey(k), valid(true) {}
 };
 
+// Internal functions shared between init.cpp and runtime.cpp
+void CopyGpuStatesToDevice(const GpuStates* gpuStates);
+void FinalizeRuntime();
+extern GpuStates s_hostGpuStatesCopy;
+
 class ShmemStatesSingleton {
  public:
   ShmemStatesSingleton(const ShmemStatesSingleton& obj) = delete;
