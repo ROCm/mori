@@ -247,6 +247,15 @@ class CMakeBuild(build_ext):
         build_lib.mkdir(parents=True, exist_ok=True)
 
         root_dir = Path(__file__).parent
+
+        if (root_dir / ".gitmodules").is_file():
+            try:
+                subprocess.check_call(
+                    ["git", "submodule", "update", "--init", "--recursive"],
+                    cwd=str(root_dir), stdout=subprocess.DEVNULL,
+                )
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                pass
         build_dir = root_dir / os.environ.get("MORI_PYBUILD_DIR", "build")
         build_dir.mkdir(parents=True, exist_ok=True)
 
