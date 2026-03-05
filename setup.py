@@ -40,15 +40,26 @@ _REQUIRED_SYSTEM_DEPS = [
 _REQUIRED_HEADERS = [
     (
         ["/usr/include/pci/pci.h", "/usr/include/x86_64-linux-gnu/pci/pci.h"],
-        "libpci-dev",
+        ("libpci-dev", "pciutils-devel"),
         "PCI library headers (needed for topology detection)",
     ),
     (
         ["/usr/include/infiniband/verbs.h"],
-        "libibverbs-dev",
+        ("libibverbs-dev", "rdma-core-devel"),
         "InfiniBand verbs headers (needed for RDMA transport)",
     ),
 ]
+
+
+def _detect_pkg_manager() -> str:
+    """Detect the system package manager."""
+    if shutil.which("apt-get"):
+        return "apt"
+    if shutil.which("dnf"):
+        return "dnf"
+    if shutil.which("yum"):
+        return "yum"
+    return "unknown"
 
 
 def _check_system_deps() -> None:
@@ -59,22 +70,39 @@ def _check_system_deps() -> None:
         if not shutil.which(binary):
             missing.append((pkg, desc))
 
-    for paths, pkg, desc in _REQUIRED_HEADERS:
+    for paths, pkgs, desc in _REQUIRED_HEADERS:
         if not any(os.path.isfile(p) for p in paths):
-            missing.append((pkg, desc))
+            missing.append((pkgs, desc))
 
     if not missing:
         return
 
-    lines = ["", "=" * 66, "[mori] Missing system dependencies:"]
-    for pkg, desc in missing:
-        lines.append(f"  - {pkg:20s}  {desc}")
+    pm = _detect_pkg_manager()
+    pkg_idx = 0 if pm == "apt" else 1
+
+    lines = ["", "=" * 70, "[mori] Missing system dependencies:"]
+    for pkgs, desc in missing:
+        pkg_name = pkgs[pkg_idx] if isinstance(pkgs, tuple) else pkgs
+        lines.append(f"  - {pkg_name:24s}  {desc}")
     lines.append("")
-    lines.append("  Install with:  sudo apt-get install " + " ".join(p for p, _ in missing))
-    lines.append("=" * 66)
+
+    pkg_names = [
+        (p[pkg_idx] if isinstance(p, tuple) else p) for p, _ in missing
+    ]
+    if pm == "apt":
+        lines.append("  Install (Ubuntu/Debian):")
+        lines.append(f"    sudo apt-get update && sudo apt-get install -y {' '.join(pkg_names)}")
+    elif pm in ("dnf", "yum"):
+        lines.append(f"  Install (RHEL/CentOS/Fedora):")
+        lines.append(f"    sudo {pm} install -y {' '.join(pkg_names)}")
+    else:
+        lines.append("  Install the equivalent packages for your distribution:")
+        lines.append(f"    Ubuntu/Debian: sudo apt-get install {' '.join(p[0] if isinstance(p, tuple) else p for p, _ in missing)}")
+        lines.append(f"    RHEL/Fedora:   sudo dnf install {' '.join(p[1] if isinstance(p, tuple) else p for p, _ in missing)}")
+    lines.append("=" * 70)
     print("\n".join(lines), file=sys.stderr)
     raise RuntimeError(
-        f"Missing system packages: {', '.join(p for p, _ in missing)}. "
+        f"Missing system packages: {', '.join(pkg_names)}. "
         "See messages above for install instructions."
     )
 

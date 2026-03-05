@@ -10,6 +10,5 @@ RUN apt-get update && \
     openmpi-bin \
     libopenmpi-dev \
     libpci-dev \
-    libibverbs-dev \
     libdw1 \
     locales
