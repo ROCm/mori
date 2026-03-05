@@ -32,6 +32,52 @@ from setuptools.command.build_ext import build_ext
 
 _supported_arch_list = ["gfx942", "gfx950"]
 
+_REQUIRED_SYSTEM_DEPS = [
+    ("mpicc", "libopenmpi-dev", "MPI compiler wrapper (needed by CMake)"),
+    ("mpirun", "openmpi-bin", "MPI runtime (needed at runtime)"),
+]
+
+_REQUIRED_HEADERS = [
+    (
+        ["/usr/include/pci/pci.h", "/usr/include/x86_64-linux-gnu/pci/pci.h"],
+        "libpci-dev",
+        "PCI library headers (needed for topology detection)",
+    ),
+    (
+        ["/usr/include/infiniband/verbs.h"],
+        "libibverbs-dev",
+        "InfiniBand verbs headers (needed for RDMA transport)",
+    ),
+]
+
+
+def _check_system_deps() -> None:
+    """Verify required system packages are installed; print install hints if not."""
+    missing = []
+
+    for binary, pkg, desc in _REQUIRED_SYSTEM_DEPS:
+        if not shutil.which(binary):
+            missing.append((pkg, desc))
+
+    for paths, pkg, desc in _REQUIRED_HEADERS:
+        if not any(os.path.isfile(p) for p in paths):
+            missing.append((pkg, desc))
+
+    if not missing:
+        return
+
+    lines = ["", "=" * 66, "[mori] Missing system dependencies:"]
+    for pkg, desc in missing:
+        lines.append(f"  - {pkg:20s}  {desc}")
+    lines.append("")
+    lines.append("  Install with:  sudo apt-get install " + " ".join(p for p, _ in missing))
+    lines.append("=" * 66)
+    print("\n".join(lines), file=sys.stderr)
+    raise RuntimeError(
+        f"Missing system packages: {', '.join(p for p, _ in missing)}. "
+        "See messages above for install instructions."
+    )
+
 
 def _detect_local_gpu_arch() -> str | None:
     """Auto-detect the GPU architecture on the current machine."""
@@ -259,8 +305,9 @@ class CMakeBuild(build_ext):
             subprocess.check_output(["cmake", "--version"])
         except OSError as exn:
             raise RuntimeError(
-                f"CMake must be installed to build the following extensions: {', '.join(e.name for e in self.extensions)}"
+                "CMake is required. Install via: pip install cmake  OR  sudo apt-get install cmake"
             ) from exn
+        _check_system_deps()
         for ext in self.extensions:
             self.build_extension(ext)
 
@@ -281,6 +328,23 @@ class CMakeBuild(build_ext):
                 pass
         build_dir = root_dir / os.environ.get("MORI_PYBUILD_DIR", "build")
         build_dir.mkdir(parents=True, exist_ok=True)
+
+        cmake_cache = build_dir / "CMakeCache.txt"
+        if cmake_cache.is_file():
+            cache_text = cmake_cache.read_text()
+            for line in cache_text.splitlines():
+                if "CMAKE_MAKE_PROGRAM" in line and "=" in line:
+                    cached_path = line.split("=", 1)[1]
+                    if cached_path and not os.path.isfile(cached_path):
+                        print(
+                            f"[mori] Stale CMake cache: {cached_path} no longer exists. "
+                            "Re-running CMake configure (compiled objects preserved)."
+                        )
+                        cmake_cache.unlink()
+                        cmake_files = build_dir / "CMakeFiles"
+                        if cmake_files.is_dir():
+                            shutil.rmtree(cmake_files)
+                    break
 
         build_type = os.environ.get("CMAKE_BUILD_TYPE", "Release")
         unroll_value = os.environ.get("WARP_ACCUM_UNROLL", "1")

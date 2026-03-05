@@ -222,7 +222,7 @@ python -c "import mori; print('OK')"
 cd /path/to/mori
 export PYTHONPATH=/path/to/mori:$PYTHONPATH
 
-# Test correctness (8 GPUs, ~26s)
+# Test correctness (8 GPUs)
 pytest tests/python/ops/test_dispatch_combine.py -q
 
 # Benchmark performance
