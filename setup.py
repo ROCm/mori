@@ -21,6 +21,7 @@
 # SOFTWARE.
 import os
 import subprocess
+import sys
 from pathlib import Path
 import shutil
 
@@ -318,6 +319,38 @@ class CMakeBuild(build_ext):
             shutil.copyfile(src_path, dst_path)
 
         _copy_jit_sources(root_dir)
+
+        if os.environ.get("MORI_SKIP_PRECOMPILE", "").lower() not in ("1", "true", "on"):
+            _try_precompile(root_dir)
+
+
+def _try_precompile(root_dir: Path) -> None:
+    """Precompile JIT kernels in the background if a GPU is detected.
+
+    Launches a detached subprocess that compiles all .hsaco kernels and shmem
+    bitcode into ~/.mori/jit/. The subprocess is fire-and-forget — pip install
+    returns immediately without waiting.
+
+    If the user starts using kernels before precompilation finishes, the JIT
+    framework handles the race safely via FileBaton file locks: the user process
+    either waits for the background compile to finish, or compiles the kernel
+    itself (the background process will skip already-compiled kernels).
+    """
+    if _detect_local_gpu_arch() is None:
+        print("[mori] No GPU detected — skipping kernel precompilation")
+        return
+    try:
+        env = os.environ.copy()
+        env["MORI_PRECOMPILE"] = "1"
+        env["PYTHONPATH"] = str(root_dir / "python") + os.pathsep + env.get("PYTHONPATH", "")
+        subprocess.Popen(
+            [sys.executable, "-c", "import mori"],
+            env=env, cwd=str(root_dir),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        print("[mori] Kernel precompilation started in background")
+    except Exception as e:
+        print(f"[mori] Precompilation skipped: {e}")
 
 
 class CustomBuild(_build):
