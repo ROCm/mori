@@ -49,7 +49,7 @@ __attribute__((weak)) void _barrierLauncher(hipStream_t stream) {
 
 __attribute__((weak)) void* _getGpuStatesAddr() {
   void* addr = nullptr;
-  hipGetSymbolAddress(&addr, HIP_SYMBOL(mori::shmem::globalGpuStates));
+  (void)hipGetSymbolAddress(&addr, HIP_SYMBOL(mori::shmem::globalGpuStates));
   return addr;
 }
 
