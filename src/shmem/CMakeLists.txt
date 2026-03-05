@@ -30,7 +30,7 @@ if(FORCE_CODE_OBJECT_VERSION_5)
   target_link_options(mori_shmem PUBLIC "-mcode-object-version=5")
 endif()
 
-if(NOT ENABLE_TORCH)
+if(ENABLE_XLA_FFI)
   # This seems to be required for compilation for JAX
   set_property(TARGET mori_shmem PROPERTY POSITION_INDEPENDENT_CODE ON)
 endif()
