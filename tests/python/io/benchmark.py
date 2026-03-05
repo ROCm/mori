@@ -130,6 +130,11 @@ def parse_args():
         help="Whether to enable batch APIs, default: False",
     )
     parser.add_argument(
+        "--batch-non-contiguous",
+        action="store_true",
+        help="Use strided offsets so each transfer is a separate WR (no merging). Use with --max-send-wr to stress SQ / reproduce ENOMEM on notify.",
+    )
+    parser.add_argument(
         "--enable-sess",
         action="store_true",
         help="Whether to use session, default: False",
@@ -172,6 +177,24 @@ def parse_args():
         help="Determines how to process CQE, choices ['polling', event]",
     )
     parser.add_argument(
+        "--max-send-wr",
+        type=int,
+        default=0,
+        help="RDMA max send WRs per QP; 0 = use backend default (default: 0)",
+    )
+    parser.add_argument(
+        "--max-cqe-num",
+        type=int,
+        default=0,
+        help="RDMA max CQEs per CQ; 0 = use backend default (default: 0)",
+    )
+    parser.add_argument(
+        "--max-msg-sge",
+        type=int,
+        default=0,
+        help="RDMA max SGEs per send WR; 0 = use backend default (default: 0)",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="info",
@@ -195,6 +218,7 @@ class MoriIoBenchmark:
         buffer_size: int,
         transfer_batch_size: int,
         enable_batch_transfer: bool = False,
+        batch_non_contiguous: bool = False,
         enable_sess: bool = False,
         iters: int = 128,
         sweep: bool = False,
@@ -211,6 +235,9 @@ class MoriIoBenchmark:
         num_qp_per_transfer: int = 1,
         num_worker_threads: int = 1,
         poll_cq_mode: str = "polling",
+        max_send_wr: int = 0,
+        max_cqe_num: int = 0,
+        max_msg_sge: int = 0,
         src_gpu: int = 0,
         dst_gpu: int = 1,
         num_streams: int = 64,
@@ -221,6 +248,7 @@ class MoriIoBenchmark:
         self.buffer_size = buffer_size
         self.transfer_batch_size = transfer_batch_size
         self.enable_batch_transfer = enable_batch_transfer
+        self.batch_non_contiguous = batch_non_contiguous
         self.enable_sess = enable_sess
         self.iters = iters
         self.sweep = sweep
@@ -240,6 +268,9 @@ class MoriIoBenchmark:
         self.poll_cq_mode = (
             PollCqMode.POLLING if poll_cq_mode == "polling" else PollCqMode.EVENT
         )
+        self.max_send_wr = max_send_wr
+        self.max_cqe_num = max_cqe_num
+        self.max_msg_sge = max_msg_sge
 
         self.src_gpu = src_gpu
         self.dst_gpu = dst_gpu
@@ -271,7 +302,13 @@ class MoriIoBenchmark:
             self.role = EngineRole.TARGET
 
         self.device = torch.device("cuda", self.role_rank)
-        self.tensor = torch.randn(self.buffer_size * self.transfer_batch_size).to(
+        # When batch_non_contiguous, use strided offsets so buffer must fit (buffer_size+1)*transfer_batch_size
+        total_elements = (
+            (self.buffer_size + 1) * self.transfer_batch_size
+            if self.batch_non_contiguous
+            else self.buffer_size * self.transfer_batch_size
+        )
+        self.tensor = torch.randn(total_elements).to(
             self.device, dtype=torch.float8_e4m3fnuz
         )
 
@@ -324,10 +361,15 @@ class MoriIoBenchmark:
             print(f"  num_qp_per_transfer: {self.num_qp_per_transfer}")
             print(f"  num_worker_threads: {self.num_worker_threads}")
             print(f"  poll_cq_mode: {self.poll_cq_mode}")
+            if self.max_send_wr or self.max_cqe_num or self.max_msg_sge:
+                print(
+                    f"  max_send_wr: {self.max_send_wr}, max_cqe_num: {self.max_cqe_num}, max_msg_sge: {self.max_msg_sge}"
+                )
 
         print(f"  buffer_size: {self.buffer_size} B")
         print(f"  transfer_batch_size: {self.transfer_batch_size}")
         print(f"  enable_batch_transfer: {self.enable_batch_transfer}")
+        print(f"  batch_non_contiguous: {self.batch_non_contiguous}")
         print(f"  enable_sess: {self.enable_sess}")
         print(f"  iters: {self.iters}")
         print()
@@ -354,17 +396,50 @@ class MoriIoBenchmark:
 
     def _validate_rdma(self):
         if self.role is EngineRole.INITIATOR:
-            int8_tensor = torch.empty(
+            recv_tensor = torch.empty(
                 self.buffer_size * self.transfer_batch_size,
                 device=self.device,
-                dtype=torch.int8,
+                dtype=torch.uint8,
             )
-            dist.recv(int8_tensor, src=self.num_initiator_dev + self.role_rank)
-            tensor = int8_tensor.view(torch.float8_e4m3fnuz)
-            assert torch.equal(self.tensor, tensor)
+            dist.recv(recv_tensor, src=self.num_initiator_dev + self.role_rank)
+            if self.batch_non_contiguous:
+                # Received data is packed (contiguous); compare to packed view of self.tensor
+                stride = self.buffer_size + 1
+                expected = torch.empty(
+                    self.buffer_size * self.transfer_batch_size,
+                    device=self.device,
+                    dtype=torch.uint8,
+                )
+                for i in range(self.transfer_batch_size):
+                    beg = i * stride
+                    end = beg + self.buffer_size
+                    expected[i * self.buffer_size : (i + 1) * self.buffer_size].copy_(
+                        self.tensor[beg:end].view(torch.uint8)
+                    )
+                assert torch.equal(recv_tensor, expected)
+            else:
+                expected = self.tensor.view(torch.uint8)
+                assert torch.equal(recv_tensor, expected)
         else:
-            int8_view = self.tensor.view(torch.uint8)
-            dist.send(int8_view, dst=self.role_rank)
+            # With batch_non_contiguous, tensor has (buffer_size+1)*transfer_batch_size
+            # elements; Gloo send size must match initiator recv (buffer_size*transfer_batch_size).
+            if self.batch_non_contiguous:
+                stride = self.buffer_size + 1
+                packed = torch.empty(
+                    self.buffer_size * self.transfer_batch_size,
+                    device=self.device,
+                    dtype=torch.uint8,
+                )
+                for i in range(self.transfer_batch_size):
+                    beg = i * stride
+                    end = beg + self.buffer_size
+                    packed[i * self.buffer_size : (i + 1) * self.buffer_size].copy_(
+                        self.tensor[beg:end].view(torch.uint8)
+                    )
+                dist.send(packed, dst=self.role_rank)
+            else:
+                int8_view = self.tensor.view(torch.uint8)
+                dist.send(int8_view, dst=self.role_rank)
 
     def _validate_xgmi(self):
         if self.xgmi_multiprocess:
@@ -409,6 +484,12 @@ class MoriIoBenchmark:
             num_worker_threads=self.num_worker_threads,
             poll_cq_mode=self.poll_cq_mode,
         )
+        if self.max_send_wr > 0:
+            config.max_send_wr = self.max_send_wr
+        if self.max_cqe_num > 0:
+            config.max_cqe_num = self.max_cqe_num
+        if self.max_msg_sge > 0:
+            config.max_msg_sge = self.max_msg_sge
         self.engine.create_backend(BackendType.RDMA, config)
 
         self.engine_desc = self.engine.get_engine_desc()
@@ -551,7 +632,12 @@ class MoriIoBenchmark:
         ) and self.role is EngineRole.TARGET:
             return 0
 
-        offsets = [(i * buffer_size) for i in range(transfer_batch_size)]
+        # Strided offsets prevent merging: each transfer becomes a separate WR (to stress SQ / reproduce notify ENOMEM)
+        if self.batch_non_contiguous:
+            stride = buffer_size + 1  # 1-element gap so remote/local are not contiguous
+            offsets = [i * stride for i in range(transfer_batch_size)]
+        else:
+            offsets = [i * buffer_size for i in range(transfer_batch_size)]
         sizes = [buffer_size for _ in range(transfer_batch_size)]
         transfer_uid = self.engine.allocate_transfer_uid()
 
@@ -767,6 +853,7 @@ class MoriIoBenchmark:
         ):
             self.initialize()
             self.run_once(self.buffer_size, self.transfer_batch_size)
+            dist.barrier()
             self.validate()
             self.run_once(self.buffer_size, self.transfer_batch_size)
             dist.barrier()
@@ -820,6 +907,7 @@ def benchmark_engine(local_rank, node_rank, args):
         buffer_size=max_buffer_size,
         transfer_batch_size=max_transfer_batch_size,
         enable_batch_transfer=args.enable_batch_transfer,
+        batch_non_contiguous=args.batch_non_contiguous,
         enable_sess=args.enable_sess,
         iters=args.iters,
         sweep=args.all,
@@ -836,6 +924,9 @@ def benchmark_engine(local_rank, node_rank, args):
         num_qp_per_transfer=args.num_qp_per_transfer,
         num_worker_threads=args.num_worker_threads,
         poll_cq_mode=args.poll_cq_mode,
+        max_send_wr=args.max_send_wr,
+        max_cqe_num=args.max_cqe_num,
+        max_msg_sge=args.max_msg_sge,
     )
     bench.print_config()
     bench.run()

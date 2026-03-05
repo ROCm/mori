@@ -32,6 +32,34 @@
 
 namespace mori {
 namespace io {
+namespace {
+
+// Keep caller-visible HIP current device unchanged across MORI internals.
+class ScopedHipDeviceGuard {
+ public:
+  ScopedHipDeviceGuard() {
+    hipError_t err = hipGetDevice(&originalDevice_);
+    if (err != hipSuccess) {
+      valid_ = false;
+      MORI_IO_WARN("XGMI: Failed to query current device for guard: {}", hipGetErrorString(err));
+    }
+  }
+
+  ~ScopedHipDeviceGuard() {
+    if (!valid_) return;
+    hipError_t err = hipSetDevice(originalDevice_);
+    if (err != hipSuccess) {
+      MORI_IO_WARN("XGMI: Failed to restore current device {}: {}", originalDevice_,
+                   hipGetErrorString(err));
+    }
+  }
+
+ private:
+  int originalDevice_{0};
+  bool valid_{true};
+};
+
+}  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        XgmiBackendSession                                      */
@@ -50,6 +78,7 @@ XgmiBackendSession::XgmiBackendSession(const XgmiBackendConfig& config, void* lo
 
 void XgmiBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
+  ScopedHipDeviceGuard deviceGuard;
   const int srcDevice = isRead ? remoteDevice : localDevice;
   const int dstDevice = isRead ? localDevice : remoteDevice;
 
@@ -118,6 +147,7 @@ void XgmiBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
 void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                         const SizeVec& sizes, TransferStatus* status,
                                         TransferUniqueId id, bool isRead) {
+  ScopedHipDeviceGuard deviceGuard;
   size_t batchSize = sizes.size();
   assert(batchSize == localOffsets.size());
   assert(batchSize == remoteOffsets.size());
@@ -296,6 +326,7 @@ void XgmiBackend::InitializeP2PAccess() {
   }
 
   p2pMatrix.resize(numDevices, std::vector<bool>(numDevices, false));
+  ScopedHipDeviceGuard deviceGuard;
 
   for (int i = 0; i < numDevices; ++i) {
     err = hipSetDevice(i);
@@ -322,7 +353,8 @@ void XgmiBackend::InitializeP2PAccess() {
         if (enableErr == hipErrorPeerAccessAlreadyEnabled) {
           hipError_t clearErr = hipGetLastError();
           if (clearErr != hipSuccess) {
-            MORI_IO_WARN("XGMI: Failed to clear peer access error: {}", hipGetErrorString(clearErr));
+            MORI_IO_WARN("XGMI: Failed to clear peer access error: {}",
+                         hipGetErrorString(clearErr));
           }
           p2pMatrix[i][j] = true;
           MORI_IO_TRACE("XGMI: P2P access already enabled from device {} to {}", i, j);
@@ -405,6 +437,7 @@ void* XgmiBackend::GetRemappedAddress(const MemoryDesc& desc, int localDeviceId)
   static_assert(sizeof(handle) == kIpcHandleSize, "IPC handle size mismatch");
   std::memcpy(&handle, desc.ipcHandle.data(), sizeof(handle));
 
+  ScopedHipDeviceGuard deviceGuard;
   hipError_t err = hipSetDevice(localDeviceId);
   if (err != hipSuccess) {
     MORI_IO_WARN("XGMI: Failed to set device {} for IPC open: {}", localDeviceId,

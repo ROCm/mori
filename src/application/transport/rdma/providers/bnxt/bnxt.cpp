@@ -77,7 +77,8 @@ namespace application {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          BnxtCqContainer */
 /* ---------------------------------------------------------------------------------------------- */
-BnxtCqContainer::BnxtCqContainer(ibv_context* context, const RdmaEndpointConfig& config, BnxtDeviceContext* device_context)
+BnxtCqContainer::BnxtCqContainer(ibv_context* context, const RdmaEndpointConfig& config,
+                                 BnxtDeviceContext* device_context)
     : config(config), device_context(device_context) {
   struct bnxt_re_dv_cq_init_attr cq_attr;
   struct bnxt_re_dv_umem_reg_attr umem_attr;
@@ -189,11 +190,13 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   int err;
 
   uint32_t maxMsgsNum = RoundUpPowOfTwoAlignUpTo256(config.maxMsgsNum);
+  uint32_t maxRecvWr =
+      config.maxRecvWr != 0 ? RoundUpPowOfTwoAlignUpTo256(config.maxRecvWr) : maxMsgsNum;
   memset(&ib_qp_attr, 0, sizeof(struct ibv_qp_init_attr));
   ib_qp_attr.send_cq = cq;
   ib_qp_attr.recv_cq = cq;
   ib_qp_attr.cap.max_send_wr = maxMsgsNum;
-  ib_qp_attr.cap.max_recv_wr = maxMsgsNum;
+  ib_qp_attr.cap.max_recv_wr = maxRecvWr;
   ib_qp_attr.cap.max_send_sge = 1;
   ib_qp_attr.cap.max_recv_sge = 1;
   ib_qp_attr.cap.max_inline_data = 16;
@@ -435,7 +438,7 @@ void BnxtQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
 
   int status = bnxt_re_dv_modify_qp(qp, &attr, attr_mask, 0, 0);
   assert(!status);
-  
+
   // Check environment variable to decide whether to set UDP sport
   const char* enable_udp_sport = std::getenv("MORI_BNXT_ENABLE_UDP_SPORT");
   bool should_set_udp_sport = false;
@@ -445,7 +448,7 @@ void BnxtQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
     std::transform(val.begin(), val.end(), val.begin(), ::tolower);
     should_set_udp_sport = (val == "1" || val == "true" || val == "on");
   }
-  
+
   if (should_set_udp_sport) {
     // Use qpId to select UDP sport value from the shared configuration (round-robin)
     uint16_t selected_udp_sport = GetDeviceContext()->GetUdpSport(qpId);
@@ -454,11 +457,12 @@ void BnxtQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
     status = bnxt_re_dv_modify_qp_udp_sport(qp, selected_udp_sport);
     if (status) {
       MORI_APP_WARN("Failed to set UDP sport {} for QP {}: error code {}", selected_udp_sport, qpn,
-                     status);
+                    status);
     }
     MORI_APP_TRACE("bnxt_re_dv_modify_qp_udp_sport is done, return {}", status);
   } else {
-    MORI_APP_TRACE("UDP sport configuration disabled via MORI_BNXT_ENABLE_UDP_SPORT for QP {}", qpn);
+    MORI_APP_TRACE("UDP sport configuration disabled via MORI_BNXT_ENABLE_UDP_SPORT for QP {}",
+                   qpn);
   }
 }
 
@@ -546,7 +550,8 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
 #endif
   void* uar_dev = uar_host;
   if (config.onGpu) {
-    // Only register if not already registered (important for shared UAR in USE_BNXT_DEFAULT_DBR mode)
+    // Only register if not already registered (important for shared UAR in USE_BNXT_DEFAULT_DBR
+    // mode)
     if (TryRegisterUar(uar_host)) {
       constexpr uint32_t flag = hipHostRegisterPortable | hipHostRegisterMapped;
       HIP_RUNTIME_CHECK(hipHostRegister(uar_host, getpagesize(), flag));
