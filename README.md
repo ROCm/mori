@@ -185,8 +185,19 @@ Benchmark result on the following configurations:
 
 ### Prerequisites
 
-- pytorch:rocm >= 6.4.0
-- Linux packages: see packages in dockerfile
+- ROCm >= 6.4 (hipcc needed at runtime for JIT kernel compilation, not at install time)
+- System packages: `libopenmpi-dev`, `openmpi-bin`, `libpci-dev` (see [Dockerfile.dev](docker/Dockerfile.dev))
+
+**IBGDA NIC support** (optional, for GPU-direct RDMA):
+
+| NIC | User library | Headers |
+|-----|-------------|---------|
+| AMD Pollara (AINIC) | `libionic.so` | — |
+| Mellanox ConnectX | `libmlx5.so` (typically pre-installed) | — |
+| Broadcom Thor2 | `libbnxt_re.so` | `bnxt_re_dv.h`, `bnxt_re_hsi.h` |
+
+NIC type is auto-detected at both build time (host library linking) and
+runtime (device kernel JIT). No manual configuration needed.
 
 Or build docker image with:
 ```bash
