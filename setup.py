@@ -339,6 +339,11 @@ def _try_precompile(root_dir: Path) -> None:
     if _detect_local_gpu_arch() is None:
         print("[mori] No GPU detected — skipping kernel precompilation")
         return
+    rocm_path = os.environ.get("ROCM_PATH", "/opt/rocm")
+    hipcc = os.path.join(rocm_path, "bin", "hipcc")
+    if not os.path.isfile(hipcc):
+        print(f"[mori] hipcc not found at {hipcc} — skipping kernel precompilation")
+        return
     try:
         env = os.environ.copy()
         env["MORI_PRECOMPILE"] = "1"
