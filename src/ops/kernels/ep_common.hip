@@ -12,6 +12,7 @@
 
 #include "mori/core/core.hpp"
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
+#define MORI_SHMEM_NO_STATIC_INIT
 #include "mori/shmem/shmem.hpp"
 
 #include "src/ops/dispatch_combine/common.hpp"

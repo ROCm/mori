@@ -1,16 +1,13 @@
-# Device link stub — needed by any executable that links mori_shmem (which has
-# -fgpu-rdc device code).  The .hip file triggers the HIP linker to resolve
-# cross-TU device symbols like globalGpuStates.
-set(DEVICE_LINK_STUB ${CMAKE_SOURCE_DIR}/src/pybind/device_link_stub.hip)
-set(EXAMPLE_RDC_FLAGS "-fgpu-rdc" "-mcode-object-version=5")
+# Shmem examples contain device code (__global__ kernels) and must be compiled
+# with hipcc. They define their own globalGpuStates. After ShmemInit, they
+# call ShmemModuleInit on the loaded JIT module to get GpuStates initialized.
 
-# Helper: create an example executable that links mori_shmem (needs device link)
+# Helper: create a shmem example (HIP compiled, links mori_shmem)
 function(add_shmem_example name)
   cmake_parse_arguments(ARG "" "" "SOURCES;LIBS;INCLUDES" ${ARGN})
-  add_executable(${name} ${ARG_SOURCES} ${DEVICE_LINK_STUB})
+  add_executable(${name} ${ARG_SOURCES})
+  set_source_files_properties(${ARG_SOURCES} PROPERTIES LANGUAGE HIP)
   target_link_libraries(${name} mori_shmem ${ARG_LIBS} hip::host hip::device)
-  target_compile_options(${name} PRIVATE ${EXAMPLE_RDC_FLAGS})
-  target_link_options(${name} PRIVATE ${EXAMPLE_RDC_FLAGS})
   if(MORI_DEVICE_NIC_DEFINE)
     target_compile_definitions(${name} PRIVATE ${MORI_DEVICE_NIC_DEFINE})
   endif()
@@ -50,7 +47,7 @@ target_link_libraries(write_inline_gpu mori_application hip::host hip::device)
 add_executable(atomic_gpu local_rdma_ops/atomic_gpu.cpp)
 target_link_libraries(atomic_gpu mori_application hip::host hip::device)
 
-# --- Shmem examples (need device link for globalGpuStates) ---
+# --- Shmem examples (HIP compiled, contain device kernels) ---
 add_shmem_example(put_thread_allgather       SOURCES shmem/put_thread_allgather.cpp)
 add_shmem_example(concurrent_put_thread      SOURCES shmem/concurrent_put_thread.cpp)
 add_shmem_example(test_put_schar_nbi_thread  SOURCES shmem/test_put_schar_nbi_thread.cpp)

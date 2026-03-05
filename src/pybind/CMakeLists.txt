@@ -37,9 +37,7 @@ endif()
 message(STATUS "pybind11 include dir: ${PYBIND11_INCLUDE_DIR}")
 
 set(MORI_PYBIND_SOURCES mori.cpp pybind_ops.cpp pybind_shmem.cpp pybind_io.cpp)
-set_source_files_properties(${MORI_PYBIND_SOURCES} PROPERTIES LANGUAGE CXX)
-# HIP stub triggers the HIP linker for device code from mori_shmem (compiled with -fgpu-rdc)
-add_library(mori_pybinds SHARED ${MORI_PYBIND_SOURCES} device_link_stub.hip)
+add_library(mori_pybinds SHARED ${MORI_PYBIND_SOURCES})
 
 if(ENABLE_PROFILER)
   target_sources(mori_pybinds PRIVATE ${PROFILER_OUTPUT_PYBIND})
@@ -51,8 +49,6 @@ target_include_directories(
                       ${PYBIND11_INCLUDE_DIR}
                       ${CMAKE_BINARY_DIR}/generated/include)
 target_link_directories(mori_pybinds PRIVATE /opt/rocm/lib)
-target_compile_options(mori_pybinds PRIVATE "-fgpu-rdc" "-mcode-object-version=5")
-target_link_options(mori_pybinds PRIVATE "-fgpu-rdc" "-mcode-object-version=5")
 target_link_libraries(
   mori_pybinds
   mori_ops

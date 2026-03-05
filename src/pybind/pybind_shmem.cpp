@@ -41,6 +41,10 @@ int64_t ShmemModuleInit(uint64_t hipModule) {
   return mori::shmem::ShmemModuleInit(reinterpret_cast<void*>(hipModule));
 }
 
+int64_t LoadShmemModule(const std::string& hsaco_path) {
+  return mori::shmem::LoadShmemModule(hsaco_path.c_str());
+}
+
 int64_t ShmemMyPe() { return mori::shmem::ShmemMyPe(); }
 
 int64_t ShmemNPes() { return mori::shmem::ShmemNPes(); }
@@ -133,6 +137,8 @@ void RegisterMoriShmem(py::module_& m) {
   //  Module-specific initialization (for Triton kernels)
   m.def("shmem_module_init", &ShmemModuleInit, py::arg("hip_module"),
         "Initialize globalGpuStates in a specific HIP module (for Triton kernels)");
+  m.def("load_shmem_module", &LoadShmemModule, py::arg("hsaco_path"),
+        "Load JIT-compiled shmem module (.hsaco) with globalGpuStates and barrier kernel");
 
   // Query APIs
   m.def("shmem_mype", &ShmemMyPe, "Get my PE (process element) ID");

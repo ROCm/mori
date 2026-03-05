@@ -25,6 +25,19 @@ from mori import cpp as mori_cpp
 MORI_SHMEM_INIT_WITH_MPI_COMM = mori_cpp.MORI_SHMEM_INIT_WITH_MPI_COMM
 MORI_SHMEM_INIT_WITH_UNIQUEID = mori_cpp.MORI_SHMEM_INIT_WITH_UNIQUEID
 
+_shmem_module_loaded = False
+
+
+def _ensure_shmem_module():
+    """JIT-compile and load the shmem device module before ShmemInit."""
+    global _shmem_module_loaded
+    if _shmem_module_loaded:
+        return
+    from mori.jit.core import compile_genco
+    hsaco = compile_genco("shmem_kernels")
+    mori_cpp.load_shmem_module(hsaco)
+    _shmem_module_loaded = True
+
 def shmem_torch_process_group_init(group_name: str):
     """Initialize shmem from PyTorch process group via socket bootstrap.
 
@@ -50,6 +63,8 @@ def shmem_torch_process_group_init(group_name: str):
             "Call torch.distributed.init_process_group() first, or use shmem_init_attr()."
         )
 
+    _ensure_shmem_module()
+
     group = dist.distributed_c10d._resolve_process_group(group_name)
     rank = dist.get_rank(group)
     world_size = dist.get_world_size(group)
@@ -64,6 +79,12 @@ def shmem_torch_process_group_init(group_name: str):
         uid = uid_list[0]
 
     return shmem_init_attr(MORI_SHMEM_INIT_WITH_UNIQUEID, rank, world_size, uid)
+
+
+def shmem_mpi_init():
+    """Initialize shmem using MPI_COMM_WORLD."""
+    _ensure_shmem_module()
+    return mori_cpp.shmem_mpi_init()
 
 
 # UniqueId-based initialization (nvshmem/rocshmem compatible)
@@ -92,6 +113,7 @@ def shmem_init_attr(flags: int, rank: int, nranks: int, unique_id: bytes):
     Returns:
         Status code (0 for success)
     """
+    _ensure_shmem_module()
     return mori_cpp.shmem_init_attr(flags, rank, nranks, unique_id)
 
 

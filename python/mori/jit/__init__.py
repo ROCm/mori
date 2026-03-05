@@ -31,8 +31,8 @@ def precompile():
     print(f"[mori-jit] Precompiling all kernels (arch={cfg.arch}, nic={nic}) ...")
     t0 = time.time()
 
-    all_kernels = ["ep_intranode", "ep_internode", "ep_internode_v1", "ep_internode_v1ll",
-                    "ep_async_ll", "cast_kernel"]
+    all_kernels = ["shmem_kernels", "ep_intranode", "ep_internode", "ep_internode_v1",
+                    "ep_internode_v1ll", "ep_async_ll", "cast_kernel"]
 
     def _compile_bc():
         return "shmem bitcode", ensure_bitcode()
