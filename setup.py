@@ -33,8 +33,8 @@ from setuptools.command.build_ext import build_ext
 _supported_arch_list = ["gfx942", "gfx950"]
 
 _REQUIRED_SYSTEM_DEPS = [
-    ("mpicc", "libopenmpi-dev", "MPI compiler wrapper (needed by CMake)"),
-    ("mpirun", "openmpi-bin", "MPI runtime (needed at runtime)"),
+    ("mpicc", ("libopenmpi-dev", "openmpi-devel"), "MPI compiler wrapper (needed by CMake)"),
+    ("mpirun", ("openmpi-bin", "openmpi"), "MPI runtime (needed at runtime)"),
 ]
 
 _REQUIRED_HEADERS = [
@@ -66,9 +66,9 @@ def _check_system_deps() -> None:
     """Verify required system packages are installed; print install hints if not."""
     missing = []
 
-    for binary, pkg, desc in _REQUIRED_SYSTEM_DEPS:
+    for binary, pkgs, desc in _REQUIRED_SYSTEM_DEPS:
         if not shutil.which(binary):
-            missing.append((pkg, desc))
+            missing.append((pkgs, desc))
 
     for paths, pkgs, desc in _REQUIRED_HEADERS:
         if not any(os.path.isfile(p) for p in paths):
