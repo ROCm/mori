@@ -30,8 +30,8 @@ for runtime JIT compilation.
 pip install .  (~18s, CXX compiler only)
   ├── CMake + clang++ → host .so (no device code in ops)
   │   ├── mori_ops        → CXX  (args construction, handle lifecycle)
-  │   ├── mori_shmem      → HIP  (init.cpp: __device__ globalGpuStates)
-  │   └── mori_pybinds    → CXX + device link stub (links shmem device code)
+  │   ├── mori_shmem      → CXX  (host-only: init, runtime, memory)
+  │   └── mori_pybinds    → CXX  (pybind11 bindings)
   └── Copy JIT sources → mori/_jit_sources/ (packaged in wheel)
 
 First run (JIT, one-time, needs hipcc at runtime)
@@ -57,8 +57,8 @@ site-packages/mori/
 │   ├── include/mori/**/*.hpp          # All C++ headers
 │   ├── src/ops/kernels/*.hip          # Kernel source files
 │   ├── src/ops/dispatch_combine/      # Kernel implementation headers
-│   ├── src/shmem/                     # shmem_device_api_wrapper.cpp
-│   └── 3rdparty/spdlog/include/      # Third-party headers
+│   ├── src/shmem/                     # shmem_device_api_wrapper.cpp only
+│   └── 3rdparty/{spdlog,msgpack-c}/include/  # Third-party headers
 ├── jit/                               # JIT compiler Python code
 │   ├── core.py                        # compile_genco(), ensure_bitcode()
 │   ├── config.py                      # get_mori_source_root(), detect_build_config()
@@ -90,13 +90,14 @@ The key design principle is **host code compiles with a standard C++ compiler
 | `pybind_ops.cpp` | `prepare_inference`, `build_args`/`free_args`, output pointer getters, `get_handle_info` |
 | `pybind_shmem.cpp` | `shmem_module_init`, shmem host API bindings |
 | All `application/*.cpp` | Bootstrap, RDMA transport, symmetric memory management |
+| `shmem/{init,runtime,memory}.cpp` | Shmem host-side initialization and memory management |
 
 These files use `shmem_api.hpp` (host-only) instead of `shmem.hpp` (which
 pulls in device kernels). `hip/hip_fp8.h` is guarded with `#ifdef __HIPCC__`
 in `data_types.hpp` and `dispatch_combine.hpp` to avoid ROCm 6.x
 incompatibilities.
 
-### What compiles as HIP (at JIT time or CMake for shmem)
+### What compiles as HIP (runtime JIT only)
 
 | File | Purpose | When |
 |------|---------|------|
@@ -106,8 +107,8 @@ incompatibilities.
 | `ep_internode_v1ll.hip` | InterNodeV1LL low-latency variant | Runtime JIT |
 | `ep_async_ll.hip` | AsyncLL send/recv | Runtime JIT |
 | `cast_kernel.hip` | Float→FP4 cast | Runtime JIT |
-| `init.cpp` (shmem) | `__device__ globalGpuStates`, barrier kernel | CMake build |
-| `memory.cpp` (shmem) | Device memory operations | CMake build |
+| `shmem_kernels.hip` | shmem barrier + `globalGpuStates` shim | Runtime JIT |
+| `shmem_device_api_wrapper.cpp` | shmem device bitcode (put/get/signal) | Runtime JIT (bitcode) |
 
 ### Template Args vs Raw Args
 
@@ -214,7 +215,7 @@ def my_kernel(...):
 my_kernel[(grid,)](..., extern_libs=get_extern_libs())
 ```
 
-- **`get_extern_libs()`** returns `{"libmori_shmem_device": find_bitcode()}`
+- **`get_extern_libs()`** returns `{"mori_shmem": find_bitcode()}`
 - **`install_hook()`** registers `shmem_module_init` as Triton's
   `jit_post_compile_hook` so that `globalGpuStates` is initialized in
   every compiled Triton module
@@ -340,8 +341,8 @@ for e in data:
 print(f'CXX: {len(cxx)} files | HIP: {len(hip)} files')
 print(f'HIP files: {sorted(hip)}')
 "
-# Expected: CXX ~31 | HIP ~4
-# HIP: device_link_stub.hip, init.cpp, memory.cpp, shmem_device_api_wrapper.cpp
+# Expected: CXX ~34 | HIP ~1
+# HIP: device_link_stub.hip (shmem device code is now JIT-compiled)
 ```
 
 ### 6. Dispatch/Combine Correctness
@@ -405,7 +406,7 @@ src/ops/kernels/
 ├── ep_internode_v1ll.hip         # InterNodeV1LL low-latency variant
 ├── ep_async_ll.hip               # AsyncLL send/recv
 ├── cast_kernel.hip               # Float→FP4 cast (Python-side launcher)
-└── dispatch_combine_kernels.hip  # All-in-one fallback (not used by default)
+└── shmem_kernels.hip             # shmem barrier kernel + globalGpuStates
 ```
 
 Each kernel is split into `__device__ _body` + `__global__` wrapper in the
