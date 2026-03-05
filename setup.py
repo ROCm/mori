@@ -477,15 +477,16 @@ def _try_precompile(root_dir: Path) -> None:
         print(f"[mori] hipcc not found at {hipcc} — skipping kernel precompilation")
         return
     try:
+        target_python = os.environ.get(
+            "MORI_PYTHON", shutil.which("python3") or shutil.which("python") or sys.executable
+        )
         env = os.environ.copy()
         env["MORI_PRECOMPILE"] = "1"
-        env["PYTHONPATH"] = (
-            str(root_dir / "python") + os.pathsep + env.get("PYTHONPATH", "")
-        )
+        env.pop("PYTHONPATH", None)
         subprocess.Popen(
-            [sys.executable, "-c", "import mori"],
+            [target_python, "-c",
+             "import time; time.sleep(3); import mori"],
             env=env,
-            cwd=str(root_dir),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
