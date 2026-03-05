@@ -45,30 +45,30 @@ message(FATAL_ERROR "pybind11 package not found; cannot build core pybinds. "
 endif()
 message(STATUS "pybind11 include dir: ${PYBIND11_INCLUDE_DIR}")
 
-add_library(mori_core_pybinds SHARED mori_core.cpp pybind_core.cpp)
-
-target_include_directories(
-    mori_core_pybinds PUBLIC 
-    ${PYTHON_INCLUDE_DIRS} ${PYBIND11_INCLUDE_DIR} 
-    ${CMAKE_BINARY_DIR}/generated/include)
-  target_link_libraries(
-    mori_core_pybinds
-    mori_ops
-    mori_io
-    hip::host
-    hip::device)
-
-if(ENABLE_TORCH)
-  add_library(mori_pybinds SHARED mori.cpp pybind.cpp)
+if(ENABLE_XLA_FFI)
+  add_library(mori_xla_ffi_pybinds SHARED 
+      mori_core.cpp pybind_core.cpp mori_xla_ffi_ops.cpp)
 
   target_include_directories(
-    mori_pybinds PUBLIC ${PYTHON_INCLUDE_DIRS} 
+    mori_xla_ffi_pybinds PUBLIC 
+    ${PYTHON_INCLUDE_DIRS} ${PYBIND11_INCLUDE_DIR} 
+    ${XLA_INCLUDE_DIR} ${CMAKE_BINARY_DIR}/generated/include)
+
+  target_link_libraries(
+      mori_xla_ffi_pybinds
+      mori_ops
+      mori_io
+      hip::host
+      hip::device)
+endif()
+
+if(ENABLE_TORCH)
+  add_library(mori_pybinds SHARED mori_core.cpp pybind_core.cpp mori.cpp pybind.cpp)
+
+  target_include_directories(
+    mori_pybinds PUBLIC ${PYTHON_INCLUDE_DIRS} ${PYBIND11_INCLUDE_DIR} 
           ${CMAKE_BINARY_DIR}/generated/include
           ${TORCH_INCLUDE_DIRS})
-  target_link_libraries(
-    mori_pybinds
-    mori_ops
-    mori_io)
 
   if(ENABLE_PROFILER)
     target_sources(mori_pybinds PRIVATE ${PROFILER_OUTPUT_PYBIND})
@@ -76,7 +76,14 @@ if(ENABLE_TORCH)
   endif()
 
   target_link_directories(mori_pybinds PUBLIC ${TORCH_INSTALL_PREFIX}/lib)
-  target_link_libraries(mori_pybinds ${TORCH_LIBRARIES} torch_python)
+  target_link_libraries(mori_pybinds 
+      ${TORCH_LIBRARIES} 
+      torch_python
+      mori_ops
+      mori_io
+      hip::host
+      hip::device)
+  
   # For python packages to find dependent libraries
   set_target_properties(
     mori_pybinds

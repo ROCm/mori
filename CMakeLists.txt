@@ -19,6 +19,8 @@ message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+set(XLA_INCLUDE_DIR "/tf/xla" CACHE PATH "XLA include directory for FFI custom calls")
+
 option(USE_ROCM "Whether to use rocm" ON)
 option(USE_BNXT "Whether to use BNXT NIC" OFF)
 option(USE_IONIC "Whether to use IONIC" OFF)
@@ -30,6 +32,8 @@ option(BUILD_OPS "Whether to build mori operation kernels" ON)
 option(BUILD_IO "Whether to build mori io library" ON)
 option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
 option(BUILD_TESTS "Whether to build mori CPP tests" ON)
+
+option(ENABLE_XLA_FFI "Whether to enable XLA FFI python bindings" OFF)
 option(ENABLE_TORCH "Whether to enable Torch bootstrap and python bindings" ON)
 option(ENABLE_MPI "Whether to enable MPI bootstrap" ON)
 option(ENABLE_PROFILER "Enable kernel profiling" OFF)

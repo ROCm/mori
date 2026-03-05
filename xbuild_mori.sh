@@ -29,19 +29,20 @@ if [[ ${full} -eq 1 ]]; then
 
   rm -rf *
   cmake -DUSE_ROCM=ON -DCMAKE_BUILD_TYPE=Release \
-      -DBUILD_EXAMPLES=ON -DWARP_ACCUM_UNROLL=1 -DUSE_BNXT=OFF \
+      -DBUILD_EXAMPLES=OFF -DWARP_ACCUM_UNROLL=1 -DUSE_BNXT=OFF \
       -DGPU_TARGETS=gfx942 -DSAVE_TEMPS=OFF \
-      -DFORCE_CODE_OBJECT_VERSION_5=OFF \
-      -DENABLE_MPI=ON -DENABLE_TORCH=ON -DENABLE_PROFILER=OFF\
+      -DFORCE_CODE_OBJECT_VERSION_5=OFF -DENABLE_XLA_FFI=ON \
+      -DENABLE_MPI=OFF -DENABLE_TORCH=OFF -DENABLE_PROFILER=OFF\
       ..
 fi
 
 make VERBOSE=1 -j 2>&1 | tee ../yyybuild.log
 
-cp src/pybind/*.so \
+rm -f $SCRIPT_DIR/python/mori/*.so $SCRIPT_DIR/python/mori/*.a
+cp -f src/pybind/*.so \
    src/application/*.so \
    src/io/*.so \
-   $SCRIPT_DIR/python/mori
+   $SCRIPT_DIR/python/mori 2>/dev/null
 
 popd
 
