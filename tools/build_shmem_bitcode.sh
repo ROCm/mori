@@ -23,23 +23,57 @@ ROCM_PATH=${ROCM_PATH:-/opt/rocm}
 OUTPUT_DIR=${1:-${MORI_DIR}/lib}
 
 # ---------------------------------------------------------------------------
-# Detect GPU architecture
+# Detect GPU architecture (consistent with setup.py _get_gpu_archs)
+# Priority: MORI_GPU_ARCHS > GPU_ARCHS > PYTORCH_ROCM_ARCH > hardware detection
 # ---------------------------------------------------------------------------
+SUPPORTED_ARCHS=("gfx942" "gfx950")
+
+is_supported_arch() {
+    local target="$1"
+    for supported in "${SUPPORTED_ARCHS[@]}"; do
+        if [ "$target" = "$supported" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 detect_gpu_arch() {
     local arch=""
+
+    # Hardware detection (equivalent to torch._C._cuda_getArchFlags())
     if [ -x "${ROCM_PATH}/bin/rocm_agent_enumerator" ]; then
         arch=$(${ROCM_PATH}/bin/rocm_agent_enumerator | grep -v "gfx000" | grep "gfx" | head -1)
     fi
     if [ -z "$arch" ] && command -v rocminfo &> /dev/null; then
         arch=$(rocminfo | grep -oP 'gfx\w+' | head -1)
     fi
-    if [ -z "$arch" ] && [ -n "$AMDGPU_TARGETS" ]; then
-        arch=$(echo "$AMDGPU_TARGETS" | tr ',' '\n' | grep "gfx" | head -1)
+
+    # PYTORCH_ROCM_ARCH overrides hardware detection
+    if [ -n "$PYTORCH_ROCM_ARCH" ]; then
+        arch=$(echo "$PYTORCH_ROCM_ARCH" | tr ' ;' '\n\n' | grep "gfx" | head -1)
     fi
+
+    # GPU_ARCHS overrides PYTORCH_ROCM_ARCH
+    if [ -n "$GPU_ARCHS" ]; then
+        arch=$(echo "$GPU_ARCHS" | tr ' ;' '\n\n' | grep "gfx" | head -1)
+    fi
+
+    # MORI_GPU_ARCHS has highest priority
+    if [ -n "$MORI_GPU_ARCHS" ]; then
+        arch=$(echo "$MORI_GPU_ARCHS" | tr ' ;' '\n\n' | grep "gfx" | head -1)
+    fi
+
     if [ -z "$arch" ]; then
         echo "Warning: Could not detect GPU architecture, defaulting to gfx942" >&2
         arch="gfx942"
     fi
+
+    if ! is_supported_arch "$arch"; then
+        echo "Warning: $arch is not in supported list (${SUPPORTED_ARCHS[*]}), defaulting to gfx942" >&2
+        arch="gfx942"
+    fi
+
     echo "$arch"
 }
 
