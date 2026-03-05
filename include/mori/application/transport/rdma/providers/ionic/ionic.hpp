@@ -26,6 +26,7 @@
 #include <hsa/hsa_ext_amd.h>
 
 #include "mori/application/transport/rdma/rdma.hpp"
+#include "mori/core/transport/rdma/providers/ionic/ionic_defs.hpp"
 #include "mori/core/transport/rdma/providers/ionic/ionic_dv.h"
 #include "mori/core/transport/rdma/providers/ionic/ionic_fw.h"
 
@@ -99,7 +100,6 @@ class IonicQpContainer {
 
  public:
   RdmaEndpointConfig config;
-  struct bnxt_re_dv_qp_mem_info qpMemInfo;
 
  public:
   size_t qpn{0};

@@ -127,6 +127,10 @@ try:
     _DTYPE_SUFFIX[torch.float8_e4m3fnuz] = "fp8_fnuz"
 except AttributeError:
     pass
+try:
+    _DTYPE_SUFFIX[torch.float4_e2m1fn_x2] = "fp4"
+except AttributeError:
+    pass
 
 # pointer size on device for shared memory calculation (sizeof(T**) and sizeof(float**))
 _PTR_SIZE = 8

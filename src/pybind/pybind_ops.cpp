@@ -42,7 +42,7 @@ hipDataType IntToHipDataType(int dtype) {
     case 1: return HIP_R_16BF;
     case 2: return HIP_R_8F_E4M3;
     case 3: return HIP_R_8F_E4M3_FNUZ;
-#ifdef MORI_HAS_OCP_FP
+#if __has_include(<hip/hip_ext_ocp.h>)
     case 5: return HIP_R_4F_E2M1;
 #endif
     default: throw std::runtime_error("Unsupported dtype int: " + std::to_string(dtype));
