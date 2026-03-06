@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "src/io/rdma/common.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <numeric>
 #include <thread>
@@ -30,17 +31,60 @@
 namespace mori {
 namespace io {
 
-static int GetMaxBackoffYields() {
+static int GetSqBackoffTimeoutUs() {
   static const int value = []() {
-    const char* env = std::getenv("MORI_IO_SQ_MAX_BACKOFF");
+    const char* env = std::getenv("MORI_IO_SQ_BACKOFF_TIMEOUT_US");
     if (env && env[0] != '\0') {
       int v = std::atoi(env);
       if (v > 0) return v;
     }
-    return 100000;
+    return 10000;
   }();
   return value;
 }
+// SQ depth is an admission counter only. It does not publish data dependencies
+// across threads, so relaxed atomics are sufficient for correctness.
+static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const char* opTag,
+                              std::string* errMsg) {
+  if (wrCount <= 0 || !ep.sqDepth) return true;
+  const int kBackoffTimeoutUs = GetSqBackoffTimeoutUs();
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::microseconds(kBackoffTimeoutUs);
+  int backoff = 0;
+  int cur = ep.sqDepth->load(std::memory_order_relaxed);
+  while (true) {
+    if (cur + wrCount > ep.maxSqDepth) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        MORI_IO_WARN(
+            "SQ full timeout ({}): ep={} depth={} requested={} max={} after {} us (backoff={})",
+            opTag, epId, cur, wrCount, ep.maxSqDepth, kBackoffTimeoutUs, backoff);
+        if (errMsg) {
+          *errMsg = "SQ full (" + std::string(opTag) + "): ep=" + std::to_string(epId) +
+                    " depth=" + std::to_string(cur) + " requested=" + std::to_string(wrCount) +
+                    " max=" + std::to_string(ep.maxSqDepth);
+        }
+        return false;
+      }
+      // Phased backoff: short polite yields, then tiny sleeps to reduce CPU burn.
+      if (backoff < 16) {
+        std::this_thread::yield();
+      } else {
+        std::this_thread::sleep_for(std::chrono::microseconds(2));
+      }
+      backoff++;
+      cur = ep.sqDepth->load(std::memory_order_relaxed);
+      continue;
+    }
+    if (ep.sqDepth->compare_exchange_weak(cur, cur + wrCount, std::memory_order_relaxed))
+      return true;
+  }
+}
+
+static void ReleaseSqDepth(const EpPair& ep, int wrCount) {
+  if (wrCount <= 0 || !ep.sqDepth) return;
+  ep.sqDepth->fetch_sub(wrCount, std::memory_order_relaxed);
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Rdma Utilities                                         */
 /* ---------------------------------------------------------------------------------------------- */
@@ -51,23 +95,10 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, Trans
   for (int i = 0; i < eps.size(); i++) {
     const application::RdmaEndpoint& ep = eps[i].local;
 
-    if (eps[i].sqDepth) {
-      const int kMaxBackoff = GetMaxBackoffYields();
-      int backoff = 0;
-      int cur = eps[i].sqDepth->load(std::memory_order_relaxed);
-      while (true) {
-        if (cur + 1 > eps[i].maxSqDepth) {
-          if (++backoff > kMaxBackoff) {
-            MORI_IO_WARN("SQ full timeout (notify): ep={} depth={} max={} after {} yields", i, cur,
-                         eps[i].maxSqDepth, kMaxBackoff);
-            return {StatusCode::ERR_RDMA_OP, "SQ full (notify): depth=" + std::to_string(cur) +
-                                                 " max=" + std::to_string(eps[i].maxSqDepth)};
-          }
-          std::this_thread::yield();
-          cur = eps[i].sqDepth->load(std::memory_order_relaxed);
-          continue;
-        }
-        if (eps[i].sqDepth->compare_exchange_weak(cur, cur + 1, std::memory_order_relaxed)) break;
+    {
+      std::string reserveErr;
+      if (!TryReserveSqDepth(eps[i], 1, i, "notify", &reserveErr)) {
+        return {StatusCode::ERR_RDMA_OP, reserveErr};
       }
     }
 
@@ -88,7 +119,7 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, Trans
     struct ibv_send_wr* bad_wr = nullptr;
     int ret = ibv_post_send(ep.ibvHandle.qp, &wr, &bad_wr);
     if (ret != 0) {
-      if (eps[i].sqDepth) eps[i].sqDepth->fetch_sub(1, std::memory_order_relaxed);
+      ReleaseSqDepth(eps[i], 1);
       return {StatusCode::ERR_RDMA_OP,
               "ibv_post_send (notify) failed with " + std::to_string(ret) + ": " + strerror(ret)};
     }
@@ -222,36 +253,18 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
   }
 
   // Atomically reserve SQ capacity for all EPs (all-or-nothing) with bounded backoff
-  const int kMaxBackoff = GetMaxBackoffYields();
   size_t reservedUpTo = 0;
   for (size_t i = 0; i < epNum; i++) {
     if (epWrCounts[i] == 0 || !eps[i].sqDepth) {
       reservedUpTo = i + 1;
       continue;
     }
-    int backoff = 0;
-    int cur = eps[i].sqDepth->load(std::memory_order_relaxed);
-    bool reserved = false;
-    while (!reserved) {
-      if (cur + epWrCounts[i] > eps[i].maxSqDepth) {
-        if (++backoff > kMaxBackoff) {
-          MORI_IO_WARN("SQ full timeout: ep={} depth={} requested={} max={} after {} yields", i,
-                       cur, epWrCounts[i], eps[i].maxSqDepth, kMaxBackoff);
-          for (size_t j = 0; j < reservedUpTo; j++) {
-            if (epWrCounts[j] > 0 && eps[j].sqDepth)
-              eps[j].sqDepth->fetch_sub(epWrCounts[j], std::memory_order_relaxed);
-          }
-          return {StatusCode::ERR_RDMA_OP, "SQ full: ep=" + std::to_string(i) +
-                                               " depth=" + std::to_string(cur) +
-                                               " requested=" + std::to_string(epWrCounts[i]) +
-                                               " max=" + std::to_string(eps[i].maxSqDepth)};
-        }
-        std::this_thread::yield();
-        cur = eps[i].sqDepth->load(std::memory_order_relaxed);
-        continue;
+    std::string reserveErr;
+    if (!TryReserveSqDepth(eps[i], epWrCounts[i], i, "batch", &reserveErr)) {
+      for (size_t j = 0; j < reservedUpTo; j++) {
+        ReleaseSqDepth(eps[j], epWrCounts[j]);
       }
-      reserved = eps[i].sqDepth->compare_exchange_weak(cur, cur + epWrCounts[i],
-                                                       std::memory_order_relaxed);
+      return {StatusCode::ERR_RDMA_OP, reserveErr};
     }
     reservedUpTo = i + 1;
   }
@@ -293,7 +306,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
         if (!eps[j].sqDepth || epWrCounts[j] == 0) continue;
         if (epSignaledPosted[j]) continue;
         int unposted = epWrCounts[j] - epActualWrPosted[j];
-        if (unposted > 0) eps[j].sqDepth->fetch_sub(unposted, std::memory_order_relaxed);
+        if (unposted > 0) ReleaseSqDepth(eps[j], unposted);
       }
       return {StatusCode::ERR_RDMA_OP,
               "ibv_post_send failed with " + std::to_string(ret) + ": " + strerror(ret)};

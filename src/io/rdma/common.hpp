@@ -109,6 +109,7 @@ struct EpPair {
   EngineKey remoteEngineKey;
   application::RdmaEndpoint local;
   application::RdmaEndpointHandle remote;
+  // Shared across EpPair copies that refer to the same QP.
   std::shared_ptr<std::atomic<int>> sqDepth;
   int maxSqDepth{0};
 };
