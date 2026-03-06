@@ -81,6 +81,31 @@ message UnregisterResponse {
 }
 
 // ============================================================
+//  Router
+// ============================================================
+
+message RouteGetRequest {
+  string key     = 1;
+  string node_id = 2;   // Requesting node (for future locality hints)
+}
+message RouteGetResponse {
+  bool     found  = 1;
+  Location source = 2;  // Selected replica to read from (if found)
+}
+
+message RoutePutRequest {
+  string key        = 1;
+  string node_id    = 2;   // Requesting client
+  uint64 block_size = 3;   // Size of the block to write (bytes)
+}
+message RoutePutResponse {
+  bool     found        = 1;
+  string   node_id      = 2;   // Target node ID
+  string   node_address = 3;   // Target node network address (for MORI-IO connection)
+  TierType tier         = 4;   // Tier selected by the strategy
+}
+
+// ============================================================
 //  Single unified service
 // ============================================================
 
@@ -93,4 +118,8 @@ service UMBPMaster {
   // Block index
   rpc Register(RegisterRequest) returns (RegisterResponse);
   rpc Unregister(UnregisterRequest) returns (UnregisterResponse);
+
+  // Router
+  rpc RouteGet(RouteGetRequest) returns (RouteGetResponse);
+  rpc RoutePut(RoutePutRequest) returns (RoutePutResponse);
 }

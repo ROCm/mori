@@ -136,8 +136,15 @@ add_custom_command(
 # client_registry.
 
 add_library(
-  umbp_common STATIC ${UMBP_PROTO_SRCS} ${UMBP_GRPC_SRCS} src/types.cpp
-                     src/block_index.cpp src/client_registry.cpp)
+  umbp_common STATIC
+  ${UMBP_PROTO_SRCS}
+  ${UMBP_GRPC_SRCS}
+  src/types.cpp
+  src/block_index.cpp
+  src/client_registry.cpp
+  src/route_get_strategy.cpp
+  src/route_put_strategy.cpp
+  src/router.cpp)
 
 target_include_directories(
   umbp_common

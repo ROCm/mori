@@ -27,9 +27,11 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
+#include "umbp/route_put_strategy.h"
 #include "umbp/types.h"
 
 namespace grpc_impl {
@@ -65,6 +67,16 @@ class UMBPClient {
   // If removed is non-null, returns 1 when removed, otherwise 0.
   grpc::Status Unregister(const std::string& key, const Location& location,
                           uint32_t* removed = nullptr);
+
+  // --- Router ---
+  /// Pick an existing replica to read from.
+  /// Returns the Location via @p out_location (if found).
+  grpc::Status RouteGet(const std::string& key, std::optional<Location>* out_location);
+
+  /// Pick a target node to write to.
+  /// After receiving the result, write via MORI-IO, then call Register().
+  grpc::Status RoutePut(const std::string& key, uint64_t block_size,
+                        std::optional<RoutePutResult>* out_result);
 
   // --- Heartbeat ---
   void StartHeartbeat();

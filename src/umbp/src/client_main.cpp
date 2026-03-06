@@ -79,64 +79,91 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  const std::string key = "demo-block-key";
-  mori::umbp::Location location;
-  location.node_id = node_id;
-  location.location_id = "demo-location-0";
-  location.size = 4ULL * 1024 * 1024;
-  location.tier = mori::umbp::TierType::HBM;
-
   constexpr auto kOperationInterval = std::chrono::seconds(3);
   uint64_t iteration = 0;
-  bool key_registered = false;
 
-  spdlog::info("[Client] Simulating block index Register/Unregister as '{}'. Press Ctrl+C to stop.",
+  spdlog::info("[Client] Starting RoutePut -> Register -> RouteGet demo as '{}'. Ctrl+C to stop.",
                node_id);
 
   while (IsRunning()) {
     ++iteration;
+    const std::string key = "demo-block-iter-" + std::to_string(iteration);
+
+    // ---- Step 1: RoutePut — ask master where to write ----
+    std::optional<mori::umbp::RoutePutResult> put_target;
+    auto route_put_status = client.RoutePut(key, 4ULL * 1024 * 1024, &put_target);
+    if (!route_put_status.ok()) {
+      spdlog::warn("[Client] Iteration {} RoutePut(key={}) RPC failed: {}", iteration, key,
+                   route_put_status.error_message());
+      if (!SleepInterruptible(kOperationInterval)) break;
+      continue;
+    }
+
+    if (!put_target.has_value()) {
+      spdlog::warn("[Client] Iteration {} RoutePut(key={}): no suitable target node", iteration,
+                   key);
+      if (!SleepInterruptible(kOperationInterval)) break;
+      continue;
+    }
+
+    spdlog::info(
+        "[Client] Iteration {} RoutePut(key={}): target_node={}, addr={}, tier={}", iteration, key,
+        put_target->node_id, put_target->node_address, mori::umbp::TierTypeName(put_target->tier));
+
+    // ---- Step 2: Simulate MORI-IO write (would be real RDMA in production) ----
+    std::string simulated_location_id = "sim-loc-" + std::to_string(iteration);
+    spdlog::info("[Client] Iteration {} Simulating MORI-IO write to {} -> location_id='{}'",
+                 iteration, put_target->node_id, simulated_location_id);
+
+    // ---- Step 3: Register — tell master where the block landed ----
+    mori::umbp::Location location;
+    location.node_id = put_target->node_id;
+    location.location_id = simulated_location_id;
+    location.size = 4ULL * 1024 * 1024;
+    location.tier = put_target->tier;
 
     auto register_status = client.Register(key, location);
     if (!register_status.ok()) {
-      spdlog::warn("[Client] Iteration {} Register(key={}) failed: code={}, message={}", iteration,
-                   key, static_cast<int>(register_status.error_code()),
+      spdlog::warn("[Client] Iteration {} Register(key={}) failed: {}", iteration, key,
                    register_status.error_message());
+      if (!SleepInterruptible(kOperationInterval)) break;
+      continue;
+    }
+    spdlog::info("[Client] Iteration {} Register(key={}) succeeded", iteration, key);
+
+    if (!SleepInterruptible(std::chrono::seconds(1))) break;
+
+    // ---- Step 4: RouteGet — ask master where to read the block back ----
+    std::optional<mori::umbp::Location> get_result;
+    auto route_get_status = client.RouteGet(key, &get_result);
+    if (!route_get_status.ok()) {
+      spdlog::warn("[Client] Iteration {} RouteGet(key={}) RPC failed: {}", iteration, key,
+                   route_get_status.error_message());
+      if (!SleepInterruptible(kOperationInterval)) break;
+      continue;
+    }
+
+    if (get_result.has_value()) {
+      spdlog::info(
+          "[Client] Iteration {} RouteGet(key={}): read from node={}, location={}, tier={}",
+          iteration, key, get_result->node_id, get_result->location_id,
+          mori::umbp::TierTypeName(get_result->tier));
     } else {
-      key_registered = true;
-      spdlog::info("[Client] Iteration {} Register(key={}) succeeded", iteration, key);
+      spdlog::warn("[Client] Iteration {} RouteGet(key={}): not found (unexpected)", iteration,
+                   key);
     }
 
-    if (!SleepInterruptible(kOperationInterval)) {
-      break;
-    }
-
-    if (key_registered) {
-      uint32_t removed = 0;
-      auto unregister_status = client.Unregister(key, location, &removed);
-      if (!unregister_status.ok()) {
-        spdlog::warn("[Client] Iteration {} Unregister(key={}) failed: code={}, message={}",
-                     iteration, key, static_cast<int>(unregister_status.error_code()),
-                     unregister_status.error_message());
-      } else {
-        key_registered = false;
-        spdlog::info("[Client] Iteration {} Unregister(key={}) succeeded (removed={})", iteration,
-                     key, removed);
-      }
-    }
-
-    if (!SleepInterruptible(kOperationInterval)) {
-      break;
-    }
-  }
-
-  if (client.IsRegistered() && key_registered) {
+    // ---- Step 5: Cleanup — unregister the block ----
     uint32_t removed = 0;
     auto unregister_status = client.Unregister(key, location, &removed);
     if (!unregister_status.ok()) {
-      spdlog::error("[Client] Final key unregister failed: code={}, message={}",
-                    static_cast<int>(unregister_status.error_code()),
-                    unregister_status.error_message());
+      spdlog::warn("[Client] Iteration {} Unregister(key={}) failed: {}", iteration, key,
+                   unregister_status.error_message());
+    } else {
+      spdlog::info("[Client] Iteration {} Unregister(key={}) removed={}", iteration, key, removed);
     }
+
+    if (!SleepInterruptible(kOperationInterval)) break;
   }
 
   if (client.IsRegistered()) {

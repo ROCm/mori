@@ -22,49 +22,44 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "umbp/block_index.h"
 #include "umbp/client_registry.h"
 #include "umbp/route_get_strategy.h"
 #include "umbp/route_put_strategy.h"
-#include "umbp/router.h"
-
-namespace grpc_impl {
-class Server;
-}
 
 namespace mori::umbp {
 
-struct MasterServerConfig {
-  std::string listen_address = "0.0.0.0:50051";
-  ClientRegistryConfig registry_config;
-
-  std::unique_ptr<RouteGetStrategy> get_strategy;
-  std::unique_ptr<RoutePutStrategy> put_strategy;
-};
-
-class MasterServer {
+class Router {
  public:
-  explicit MasterServer(MasterServerConfig config);
-  ~MasterServer();
+  /// Construct with injected strategy objects.
+  /// If either strategy is nullptr, a default is created:
+  ///   RouteGet  -> RandomRouteGetStrategy
+  ///   RoutePut  -> TierAwareMostAvailableStrategy
+  Router(BlockIndex& index, ClientRegistry& registry,
+         std::unique_ptr<RouteGetStrategy> get_strategy = nullptr,
+         std::unique_ptr<RoutePutStrategy> put_strategy = nullptr);
+  ~Router() = default;
 
-  MasterServer(const MasterServer&) = delete;
-  MasterServer& operator=(const MasterServer&) = delete;
+  Router(const Router&) = delete;
+  Router& operator=(const Router&) = delete;
 
-  void Run();
-  void Shutdown();
+  /// Pick an existing replica to read from.
+  /// Returns nullopt if the key is not in the index.
+  std::optional<Location> RouteGet(const std::string& key, const std::string& node_id);
+
+  /// Pick a target node to write to.
+  /// Returns nullopt if no suitable node exists.
+  std::optional<RoutePutResult> RoutePut(const std::string& key, const std::string& node_id,
+                                         uint64_t block_size);
 
  private:
-  MasterServerConfig config_;
-  BlockIndex index_;
-  ClientRegistry registry_;
-  Router router_;
-
-  std::unique_ptr<grpc_impl::Server> server_;
-
-  class UMBPMasterServiceImpl;
-  std::unique_ptr<UMBPMasterServiceImpl> service_;
+  BlockIndex& index_;
+  ClientRegistry& registry_;
+  std::unique_ptr<RouteGetStrategy> get_strategy_;
+  std::unique_ptr<RoutePutStrategy> put_strategy_;
 };
 
 }  // namespace mori::umbp

@@ -21,50 +21,41 @@
 // SOFTWARE.
 #pragma once
 
-#include <memory>
+#include <cstdint>
+#include <optional>
 #include <string>
+#include <vector>
 
-#include "umbp/block_index.h"
-#include "umbp/client_registry.h"
-#include "umbp/route_get_strategy.h"
-#include "umbp/route_put_strategy.h"
-#include "umbp/router.h"
-
-namespace grpc_impl {
-class Server;
-}
+#include "umbp/types.h"
 
 namespace mori::umbp {
 
-struct MasterServerConfig {
-  std::string listen_address = "0.0.0.0:50051";
-  ClientRegistryConfig registry_config;
-
-  std::unique_ptr<RouteGetStrategy> get_strategy;
-  std::unique_ptr<RoutePutStrategy> put_strategy;
+/// Result returned by RoutePutStrategy::Select.
+struct RoutePutResult {
+  std::string node_id;
+  std::string node_address;
+  TierType tier;
 };
 
-class MasterServer {
+/// Abstract interface for RoutePut node placement.
+/// Implement this to plug in a custom write-path placement strategy.
+class RoutePutStrategy {
  public:
-  explicit MasterServer(MasterServerConfig config);
-  ~MasterServer();
+  virtual ~RoutePutStrategy() = default;
 
-  MasterServer(const MasterServer&) = delete;
-  MasterServer& operator=(const MasterServer&) = delete;
+  /// Select a target node from @p alive_clients that can accommodate
+  /// @p block_size bytes. Tier selection is the strategy's responsibility.
+  /// @return nullopt if no suitable node exists.
+  virtual std::optional<RoutePutResult> Select(const std::vector<ClientRecord>& alive_clients,
+                                               uint64_t block_size) = 0;
+};
 
-  void Run();
-  void Shutdown();
-
- private:
-  MasterServerConfig config_;
-  BlockIndex index_;
-  ClientRegistry registry_;
-  Router router_;
-
-  std::unique_ptr<grpc_impl::Server> server_;
-
-  class UMBPMasterServiceImpl;
-  std::unique_ptr<UMBPMasterServiceImpl> service_;
+/// Default strategy: try tiers fastest-first (HBM -> DRAM -> SSD),
+/// pick the node with the most available space on the first tier that has capacity.
+class TierAwareMostAvailableStrategy : public RoutePutStrategy {
+ public:
+  std::optional<RoutePutResult> Select(const std::vector<ClientRecord>& alive_clients,
+                                       uint64_t block_size) override;
 };
 
 }  // namespace mori::umbp

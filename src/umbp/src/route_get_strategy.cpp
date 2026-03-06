@@ -19,52 +19,21 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#pragma once
-
-#include <memory>
-#include <string>
-
-#include "umbp/block_index.h"
-#include "umbp/client_registry.h"
 #include "umbp/route_get_strategy.h"
-#include "umbp/route_put_strategy.h"
-#include "umbp/router.h"
 
-namespace grpc_impl {
-class Server;
-}
+#include <random>
 
 namespace mori::umbp {
 
-struct MasterServerConfig {
-  std::string listen_address = "0.0.0.0:50051";
-  ClientRegistryConfig registry_config;
+Location RandomRouteGetStrategy::Select(const std::vector<Location>& locations,
+                                        const std::string& /*node_id*/) {
+  if (locations.size() == 1) {
+    return locations[0];
+  }
 
-  std::unique_ptr<RouteGetStrategy> get_strategy;
-  std::unique_ptr<RoutePutStrategy> put_strategy;
-};
-
-class MasterServer {
- public:
-  explicit MasterServer(MasterServerConfig config);
-  ~MasterServer();
-
-  MasterServer(const MasterServer&) = delete;
-  MasterServer& operator=(const MasterServer&) = delete;
-
-  void Run();
-  void Shutdown();
-
- private:
-  MasterServerConfig config_;
-  BlockIndex index_;
-  ClientRegistry registry_;
-  Router router_;
-
-  std::unique_ptr<grpc_impl::Server> server_;
-
-  class UMBPMasterServiceImpl;
-  std::unique_ptr<UMBPMasterServiceImpl> service_;
-};
+  thread_local std::mt19937 rng{std::random_device{}()};
+  std::uniform_int_distribution<size_t> dist(0, locations.size() - 1);
+  return locations[dist(rng)];
+}
 
 }  // namespace mori::umbp
