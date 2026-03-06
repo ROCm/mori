@@ -55,14 +55,18 @@ hipDataType IntToHipDataType(int dtype) {
 }
 
 // Merged prepare + build in one call.
+// When input_ptr == 0 (recv-only calls like dispatch_recv / combine_recv),
+// skip PrepareInference to preserve handle state from the prior send call.
 int64_t PrepareAndBuildArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t input_ptr,
                             int input_dtype, int64_t num_tokens, int64_t weight_ptr,
                             int64_t scale_ptr, int64_t indices_ptr, int rdmaBlockNum, int hiddenDim,
                             int useExternalInpBuf) {
-  handle.PrepareInference(IntToHipDataType(input_dtype), reinterpret_cast<void*>(input_ptr),
-                          nullptr, weight_ptr ? reinterpret_cast<float*>(weight_ptr) : nullptr,
-                          scale_ptr ? reinterpret_cast<uint8_t*>(scale_ptr) : nullptr,
-                          reinterpret_cast<mori::moe::index_t*>(indices_ptr), num_tokens);
+  if (input_ptr != 0) {
+    handle.PrepareInference(IntToHipDataType(input_dtype), reinterpret_cast<void*>(input_ptr),
+                            nullptr, weight_ptr ? reinterpret_cast<float*>(weight_ptr) : nullptr,
+                            scale_ptr ? reinterpret_cast<uint8_t*>(scale_ptr) : nullptr,
+                            reinterpret_cast<mori::moe::index_t*>(indices_ptr), num_tokens);
+  }
 
   thread_local mori::moe::EpDispatchCombineArgsRaw args;
   args = mori::moe::GetEpDispatchCombineArgsRaw(handle, rdmaBlockNum);
