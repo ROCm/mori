@@ -56,17 +56,17 @@ std::optional<RoutePutResult> Router::RoutePut(const std::string& key, const std
   auto alive_clients = registry_.GetAliveClients();
 
   if (alive_clients.empty()) {
-    spdlog::debug("[Router] RoutePut key='{}': no alive clients", key);
+    spdlog::debug("[Router] RoutePut key='{}' from={}: no alive clients", key, node_id);
     return std::nullopt;
   }
 
   auto result = put_strategy_->Select(alive_clients, block_size);
 
   if (result.has_value()) {
-    spdlog::debug("[Router] RoutePut key='{}': selected node={}, tier={}", key, result->node_id,
+    spdlog::debug("[Router] RoutePut key='{}' from={}: selected node={}, tier={}", key, node_id, result->node_id,
                   TierTypeName(result->tier));
   } else {
-    spdlog::debug("[Router] RoutePut key='{}': no node with sufficient capacity", key);
+    spdlog::debug("[Router] RoutePut key='{}' from={}: no node with sufficient capacity", key, node_id);
   }
 
   return result;
