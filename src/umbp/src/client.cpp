@@ -135,10 +135,6 @@ grpc::Status UMBPClient::Register(const std::string& key, const Location& locati
   if (normalized_location.node_id.empty()) {
     normalized_location.node_id = config_.node_id;
   }
-  if (normalized_location.node_id != config_.node_id) {
-    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
-                        "location.node_id must match client node_id");
-  }
 
   ::umbp::RegisterRequest req;
   req.set_node_id(config_.node_id);
@@ -175,10 +171,6 @@ grpc::Status UMBPClient::Unregister(const std::string& key, const Location& loca
   Location normalized_location = location;
   if (normalized_location.node_id.empty()) {
     normalized_location.node_id = config_.node_id;
-  }
-  if (normalized_location.node_id != config_.node_id) {
-    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
-                        "location.node_id must match client node_id");
   }
 
   ::umbp::UnregisterRequest req;
