@@ -21,7 +21,9 @@
 // SOFTWARE.
 #pragma once
 
+#include <atomic>
 #include <functional>
+#include <memory>
 
 #include "mori/io/common.hpp"
 #include "mori/io/enum.hpp"
@@ -107,6 +109,8 @@ struct EpPair {
   EngineKey remoteEngineKey;
   application::RdmaEndpoint local;
   application::RdmaEndpointHandle remote;
+  std::shared_ptr<std::atomic<int>> sqDepth;
+  int maxSqDepth{0};
 };
 
 using EpPairVec = std::vector<EpPair>;
@@ -136,9 +140,10 @@ struct CqCallbackMeta {
 };
 
 struct CqCallbackMessage {
-  CqCallbackMessage(CqCallbackMeta* m, int n) : meta(m), batchSize(n) {}
+  CqCallbackMessage(CqCallbackMeta* m, int n, int wr = 0) : meta(m), batchSize(n), wrCount(wr) {}
   CqCallbackMeta* meta{nullptr};
   int batchSize{0};
+  int wrCount{0};
 };
 
 struct RdmaOpRet {
