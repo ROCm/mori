@@ -234,7 +234,15 @@ void RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId, application::R
   std::unique_lock<std::shared_mutex> lock(mu);
   deviceCtxs[devId]->ConnectEndpoint(local.handle, remote);
   RemoteEngineMeta& meta = remotes[remoteKey];
-  EpPair ep{weight, devId, rdevId, remoteKey, local, remote};
+  auto epConfig = GetRdmaEndpointConfig(devId);
+  EpPair ep{weight,
+            devId,
+            rdevId,
+            remoteKey,
+            local,
+            remote,
+            std::make_shared<std::atomic<int>>(0),
+            static_cast<int>(epConfig.maxMsgsNum)};
   meta.rTable[topoKey].push_back(ep);
   epsMap.insert({ep.local.handle.qpn, ep});
 }
@@ -374,6 +382,7 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
         struct ibv_recv_wr* bad = nullptr;
         SYSCALL_RETURN_ZERO(ibv_post_recv(ep.local.ibvHandle.qp, &wr, &bad));
       } else if (wc[i].opcode == IBV_WC_SEND) {
+        if (ep.sqDepth) ep.sqDepth->fetch_sub(1, std::memory_order_relaxed);
         uint64_t id = wc[i].wr_id;
         if (wc[i].status != IBV_WC_SUCCESS) {
           MORI_IO_ERROR("NotifManager receive send cqe failed for wr_id {} status {}: {}", id,
@@ -381,6 +390,8 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
         }
       } else {
         CqCallbackMessage* msg = reinterpret_cast<CqCallbackMessage*>(wc[i].wr_id);
+        if (ep.sqDepth && msg->wrCount > 0)
+          ep.sqDepth->fetch_sub(msg->wrCount, std::memory_order_relaxed);
         uint32_t lastBatchSize = msg->meta->finishedBatchSize.fetch_add(msg->batchSize);
         TransferStatus* statusPtr = msg->meta->status;
         if (statusPtr != nullptr) {
@@ -393,7 +404,6 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
             MORI_IO_ERROR("NotifManager receive cqe failed for task {} code {} status {}",
                           msg->meta->id, static_cast<uint32_t>(wc[i].status),
                           ibv_wc_status_str(wc[i].status));
-            // set status to nullptr indicate that transfer failed
             msg->meta->status = nullptr;
           }
         }
