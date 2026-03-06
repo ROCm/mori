@@ -20,7 +20,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "src/pybind/mori.hpp"
+#include "src/pybind/mori_core.hpp"
 
 PYBIND11_MODULE(libmori_pybinds, m) {
+  mori::RegisterMoriShmem(m);
+  mori::RegisterMoriIo(m);
   mori::RegisterMoriOps(m);
 }

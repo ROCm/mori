@@ -47,7 +47,7 @@ message(STATUS "pybind11 include dir: ${PYBIND11_INCLUDE_DIR}")
 
 if(ENABLE_XLA_FFI)
   add_library(mori_xla_ffi_pybinds SHARED 
-      mori_core.cpp pybind_core.cpp 
+      mori_core.cpp  
       mori_xla_ffi_ops.cpp pybind_ffi.cpp)
 
   target_include_directories(
@@ -64,7 +64,7 @@ if(ENABLE_XLA_FFI)
 endif()
 
 if(ENABLE_TORCH)
-  add_library(mori_pybinds SHARED mori_core.cpp pybind_core.cpp mori.cpp pybind.cpp)
+  add_library(mori_pybinds SHARED mori_core.cpp mori.cpp pybind.cpp)
 
   target_include_directories(
     mori_pybinds PUBLIC ${PYTHON_INCLUDE_DIRS} ${PYBIND11_INCLUDE_DIR} 
