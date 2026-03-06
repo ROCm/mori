@@ -259,6 +259,16 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
   // accumulated since the last signaled WR on each EP.
   std::vector<int> epWrsSinceSignal(epNum, 0);
   std::vector<size_t> epMergedSinceSignal(epNum, 0);
+  std::vector<int> epReservedUnsignaled(epNum, 0);
+
+  auto rollbackUnsignaledReservations = [&]() {
+    for (size_t j = 0; j < epNum; ++j) {
+      if (epReservedUnsignaled[j] > 0) {
+        ReleaseSqDepth(eps[j], epReservedUnsignaled[j]);
+        epReservedUnsignaled[j] = 0;
+      }
+    }
+  };
 
   for (int i = 0; i < numPostBatch; i++) {
     int st = i * postBatchSize;
@@ -271,7 +281,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     // waiting for CQEs from earlier signaled WRs to drain depth.
     std::string reserveErr;
     if (!TryReserveSqDepth(eps[epId], batchWrNum, epId, "batch", &reserveErr)) {
-      for (size_t j = 0; j < epNum; j++) ReleaseSqDepth(eps[j], epWrsSinceSignal[j]);
+      rollbackUnsignaledReservations();
       return {StatusCode::ERR_RDMA_OP, reserveErr};
     }
 
@@ -285,6 +295,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
 
     epWrsSinceSignal[epId] += batchWrNum;
     epMergedSinceSignal[epId] += mergedReqSize;
+    epReservedUnsignaled[epId] += batchWrNum;
 
     bool isLastBatchForEp = ((i + epNum) >= numPostBatch);
     bool sqNearFull = eps[epId].sqDepth && (epWrsSinceSignal[epId] >= eps[epId].maxSqDepth);
@@ -302,13 +313,49 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     struct ibv_send_wr* badWr = nullptr;
     int ret = ibv_post_send(eps[epId].local.ibvHandle.qp, &mergedWrs[st].wr, &badWr);
     if (ret != 0) {
-      delete cbMsg;
-      for (size_t j = 0; j < epNum; j++) ReleaseSqDepth(eps[j], epWrsSinceSignal[j]);
-      return {StatusCode::ERR_RDMA_OP,
-              "ibv_post_send failed with " + std::to_string(ret) + ": " + strerror(ret)};
+      int postedCount = 0;
+      if (badWr != nullptr) {
+        struct ibv_send_wr* cur = &mergedWrs[st].wr;
+        while (cur != nullptr && cur != badWr && postedCount < batchWrNum) {
+          ++postedCount;
+          cur = cur->next;
+        }
+      }
+      postedCount = std::max(0, std::min(postedCount, batchWrNum));
+      const int unpostedCount = batchWrNum - postedCount;
+      if (unpostedCount > 0) {
+        ReleaseSqDepth(eps[epId], unpostedCount);
+        epWrsSinceSignal[epId] = std::max(0, epWrsSinceSignal[epId] - unpostedCount);
+        epReservedUnsignaled[epId] = std::max(0, epReservedUnsignaled[epId] - unpostedCount);
+
+        size_t mergedUnposted = 0;
+        for (int j = st + postedCount; j < end; ++j) {
+          mergedUnposted += mergedWrs[j].mergedRequests;
+        }
+        if (epMergedSinceSignal[epId] >= mergedUnposted) {
+          epMergedSinceSignal[epId] -= mergedUnposted;
+        } else {
+          epMergedSinceSignal[epId] = 0;
+        }
+      }
+
+      const bool lastWasPosted = (postedCount == batchWrNum);
+      if (needSignal && lastWasPosted) {
+        // Signaled WR was posted; CQ path owns the release for this EP.
+        epReservedUnsignaled[epId] = 0;
+      } else if (cbMsg != nullptr) {
+        delete cbMsg;
+      }
+
+      rollbackUnsignaledReservations();
+      return {StatusCode::ERR_RDMA_OP, "ibv_post_send failed with " + std::to_string(ret) + ": " +
+                                           strerror(ret) + " (posted " +
+                                           std::to_string(postedCount) + "/" +
+                                           std::to_string(batchWrNum) + " WRs)"};
     }
 
     if (needSignal) {
+      epReservedUnsignaled[epId] = 0;
       epWrsSinceSignal[epId] = 0;
       epMergedSinceSignal[epId] = 0;
     }

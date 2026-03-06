@@ -382,6 +382,7 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
         struct ibv_recv_wr* bad = nullptr;
         SYSCALL_RETURN_ZERO(ibv_post_recv(ep.local.ibvHandle.qp, &wr, &bad));
       } else if (wc[i].opcode == IBV_WC_SEND) {
+        // Notify path: one signaled SEND completion releases one SQ reservation.
         if (ep.sqDepth) ep.sqDepth->fetch_sub(1, std::memory_order_relaxed);
         uint64_t id = wc[i].wr_id;
         if (wc[i].status != IBV_WC_SUCCESS) {
@@ -390,6 +391,7 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
         }
       } else {
         CqCallbackMessage* msg = reinterpret_cast<CqCallbackMessage*>(wc[i].wr_id);
+        // Batch path: wrCount only accounts for WRs represented by this signaled completion.
         if (ep.sqDepth && msg->wrCount > 0)
           ep.sqDepth->fetch_sub(msg->wrCount, std::memory_order_relaxed);
         uint32_t lastBatchSize = msg->meta->finishedBatchSize.fetch_add(msg->batchSize);
