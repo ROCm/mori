@@ -47,6 +47,16 @@ static int GetSqBackoffTimeoutUs() {
 static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const char* opTag,
                               std::string* errMsg) {
   if (wrCount <= 0 || !ep.sqDepth) return true;
+  if (wrCount > ep.maxSqDepth) {
+    MORI_IO_WARN("SQ request exceeds capacity ({}): ep={} requested={} max={}", opTag, epId,
+                 wrCount, ep.maxSqDepth);
+    if (errMsg) {
+      *errMsg = "SQ request exceeds capacity (" + std::string(opTag) +
+                "): ep=" + std::to_string(epId) + " requested=" + std::to_string(wrCount) +
+                " max=" + std::to_string(ep.maxSqDepth);
+    }
+    return false;
+  }
   const int kBackoffTimeoutUs = GetSqBackoffTimeoutUs();
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::microseconds(kBackoffTimeoutUs);
@@ -242,36 +252,13 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
   size_t epBatchSize = (mergedWrCount + epNum - 1) / epNum;
 
   if (postBatchSize == -1) postBatchSize = epBatchSize;
+  if (eps[0].sqDepth && postBatchSize > eps[0].maxSqDepth) postBatchSize = eps[0].maxSqDepth;
   int numPostBatch = (mergedWrCount + postBatchSize - 1) / postBatchSize;
 
-  // Pre-compute per-EP ibv WR counts for SQ depth reservation
-  std::vector<int> epWrCounts(epNum, 0);
-  for (int i = 0; i < numPostBatch; i++) {
-    int st = i * postBatchSize;
-    int end = std::min(static_cast<size_t>(st) + postBatchSize, mergedWrCount);
-    epWrCounts[i % epNum] += (end - st);
-  }
-
-  // Atomically reserve SQ capacity for all EPs (all-or-nothing) with bounded backoff
-  size_t reservedUpTo = 0;
-  for (size_t i = 0; i < epNum; i++) {
-    if (epWrCounts[i] == 0 || !eps[i].sqDepth) {
-      reservedUpTo = i + 1;
-      continue;
-    }
-    std::string reserveErr;
-    if (!TryReserveSqDepth(eps[i], epWrCounts[i], i, "batch", &reserveErr)) {
-      for (size_t j = 0; j < reservedUpTo; j++) {
-        ReleaseSqDepth(eps[j], epWrCounts[j]);
-      }
-      return {StatusCode::ERR_RDMA_OP, reserveErr};
-    }
-    reservedUpTo = i + 1;
-  }
-
-  std::vector<size_t> epPostedCounts(epNum, 0);
-  std::vector<int> epActualWrPosted(epNum, 0);
-  std::vector<bool> epSignaledPosted(epNum, false);
+  // Per-EP state for adaptive signaling: track WRs and merged requests
+  // accumulated since the last signaled WR on each EP.
+  std::vector<int> epWrsSinceSignal(epNum, 0);
+  std::vector<size_t> epMergedSinceSignal(epNum, 0);
 
   for (int i = 0; i < numPostBatch; i++) {
     int st = i * postBatchSize;
@@ -279,6 +266,15 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     if (end - st == 0) break;
     int epId = i % epNum;
     int batchWrNum = end - st;
+
+    // Reserve SQ depth for this batch; blocks with backoff if the SQ is full,
+    // waiting for CQEs from earlier signaled WRs to drain depth.
+    std::string reserveErr;
+    if (!TryReserveSqDepth(eps[epId], batchWrNum, epId, "batch", &reserveErr)) {
+      for (size_t j = 0; j < epNum; j++) ReleaseSqDepth(eps[j], epWrsSinceSignal[j]);
+      return {StatusCode::ERR_RDMA_OP, reserveErr};
+    }
+
     size_t mergedReqSize = 0;
     for (int j = st; j < end; j++) {
       struct ibv_send_wr& wr = mergedWrs[j].wr;
@@ -287,32 +283,35 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
       mergedReqSize += mergedWrs[j].mergedRequests;
     }
 
-    struct ibv_send_wr& last = mergedWrs[end - 1].wr;
+    epWrsSinceSignal[epId] += batchWrNum;
+    epMergedSinceSignal[epId] += mergedReqSize;
 
-    epPostedCounts[epId] += mergedReqSize;
     bool isLastBatchForEp = ((i + epNum) >= numPostBatch);
+    bool sqNearFull = eps[epId].sqDepth && (epWrsSinceSignal[epId] >= eps[epId].maxSqDepth);
+    bool needSignal = isLastBatchForEp || sqNearFull;
+
+    struct ibv_send_wr& last = mergedWrs[end - 1].wr;
     CqCallbackMessage* cbMsg = nullptr;
-    if (isLastBatchForEp) {
-      int epTotalBatchSize = static_cast<int>(epPostedCounts[epId]);
-      cbMsg = new CqCallbackMessage(callbackMeta, epTotalBatchSize, epWrCounts[epId]);
+    if (needSignal) {
+      cbMsg = new CqCallbackMessage(callbackMeta, static_cast<int>(epMergedSinceSignal[epId]),
+                                    epWrsSinceSignal[epId]);
       last.wr_id = reinterpret_cast<uint64_t>(cbMsg);
       last.send_flags = IBV_SEND_SIGNALED;
     }
+
     struct ibv_send_wr* badWr = nullptr;
     int ret = ibv_post_send(eps[epId].local.ibvHandle.qp, &mergedWrs[st].wr, &badWr);
     if (ret != 0) {
       delete cbMsg;
-      for (size_t j = 0; j < epNum; j++) {
-        if (!eps[j].sqDepth || epWrCounts[j] == 0) continue;
-        if (epSignaledPosted[j]) continue;
-        int unposted = epWrCounts[j] - epActualWrPosted[j];
-        if (unposted > 0) ReleaseSqDepth(eps[j], unposted);
-      }
+      for (size_t j = 0; j < epNum; j++) ReleaseSqDepth(eps[j], epWrsSinceSignal[j]);
       return {StatusCode::ERR_RDMA_OP,
               "ibv_post_send failed with " + std::to_string(ret) + ": " + strerror(ret)};
     }
-    epActualWrPosted[epId] += batchWrNum;
-    if (isLastBatchForEp) epSignaledPosted[epId] = true;
+
+    if (needSignal) {
+      epWrsSinceSignal[epId] = 0;
+      epMergedSinceSignal[epId] = 0;
+    }
     MORI_IO_TRACE("ibv_post_send ep index {} batch index range [{}, {})", epId, st, end);
   }
   return {StatusCode::IN_PROGRESS, ""};
