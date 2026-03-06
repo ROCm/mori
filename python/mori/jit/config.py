@@ -133,6 +133,33 @@ _LIB_SEARCH_PATHS = [
     "/lib/x86_64-linux-gnu",
 ]
 
+_NIC_LIB_NAMES: dict[str, str] = {
+    "mlx5": "libmlx5.so",
+    "bnxt": "libbnxt_re.so",
+    "ionic": "libionic.so",
+}
+
+_BNXT_REQUIRED_HEADERS = ["infiniband/bnxt_re_dv.h", "infiniband/bnxt_re_hsi.h"]
+
+_HEADER_SEARCH_PATHS = [
+    "/usr/include",
+    "/usr/local/include",
+]
+
+
+def _has_nic_lib(nic: str) -> bool:
+    """Check whether the user-space RDMA library (and headers for bnxt) are installed."""
+    lib_name = _NIC_LIB_NAMES.get(nic)
+    if not lib_name:
+        return False
+    if not any(os.path.exists(os.path.join(d, lib_name)) for d in _LIB_SEARCH_PATHS):
+        return False
+    if nic == "bnxt":
+        for hdr in _BNXT_REQUIRED_HEADERS:
+            if not any(os.path.exists(os.path.join(d, hdr)) for d in _HEADER_SEARCH_PATHS):
+                return False
+    return True
+
 
 def _classify_ib_device(dev_path: str) -> str | None:
     """Identify the NIC type for a single /sys/class/infiniband/<dev> entry.
@@ -149,29 +176,26 @@ def _classify_ib_device(dev_path: str) -> str | None:
 
 
 def detect_nic_type() -> str:
-    """Detect the RDMA NIC type on the current machine.
+    """Detect the RDMA NIC type for device-side IBGDA dispatch.
 
     Detection priority:
-      1. Environment variable (USE_BNXT=ON or USE_IONIC=ON)
-      2. /sys/class/infiniband/ — device name prefix, then driver symlink
+      1. MORI_DEVICE_NIC env var (explicit override, same as CMake)
+      2. /sys/class/infiniband/ — pick NIC with most devices + verify library
       3. lspci PCI vendor ID
-      4. User-space library fallback (libbnxt_re.so / libionic.so)
+      4. User-space library fallback
       5. Default: mlx5
 
     Returns ``"bnxt"``, ``"ionic"``, or ``"mlx5"``.
     """
-    env_bnxt = os.environ.get("USE_BNXT", "").upper()
-    env_ionic = os.environ.get("USE_IONIC", "").upper()
-    if env_bnxt == "ON":
-        return "bnxt"
-    if env_ionic == "ON":
-        return "ionic"
+    env_device_nic = os.environ.get("MORI_DEVICE_NIC", "").lower()
+    if env_device_nic in ("bnxt", "ionic", "mlx5"):
+        return env_device_nic
 
     ib_dir = "/sys/class/infiniband"
     if os.path.isdir(ib_dir):
         try:
             devices = os.listdir(ib_dir)
-            counts: dict[str, int] = {"bnxt": 0, "ionic": 0, "mlx5": 0}
+            counts: dict[str, int] = {"mlx5": 0, "bnxt": 0, "ionic": 0}
 
             for dev in devices:
                 if dev.startswith("bnxt_re"):
@@ -185,12 +209,11 @@ def detect_nic_type() -> str:
                     if nic and nic in counts:
                         counts[nic] += 1
 
-            if counts["bnxt"] > 0 and counts["bnxt"] >= counts["mlx5"]:
-                return "bnxt"
-            if counts["ionic"] > 0 and counts["ionic"] >= counts["mlx5"]:
-                return "ionic"
-            if counts["mlx5"] > 0:
-                return "mlx5"
+            for nic, cnt in sorted(
+                counts.items(), key=lambda x: x[1], reverse=True
+            ):
+                if cnt > 0 and _has_nic_lib(nic):
+                    return nic
         except OSError:
             pass
 
@@ -206,19 +229,17 @@ def detect_nic_type() -> str:
                 if vid in line:
                     vendor_counts[nic] = vendor_counts.get(nic, 0) + 1
         if vendor_counts:
-            return max(vendor_counts, key=vendor_counts.get)
+            for nic, _ in sorted(
+                vendor_counts.items(), key=lambda x: x[1], reverse=True
+            ):
+                if _has_nic_lib(nic):
+                    return nic
     except (subprocess.CalledProcessError, FileNotFoundError):
         pass
 
-    _NIC_LIBS = [
-        ("libbnxt_re.so", "bnxt"),
-        ("libionic.so", "ionic"),
-        ("libmlx5.so", "mlx5"),
-    ]
-    for lib_name, nic in _NIC_LIBS:
-        for d in _LIB_SEARCH_PATHS:
-            if os.path.exists(os.path.join(d, lib_name)):
-                return nic
+    for nic, lib_name in _NIC_LIB_NAMES.items():
+        if any(os.path.exists(os.path.join(d, lib_name)) for d in _LIB_SEARCH_PATHS):
+            return nic
 
     return "mlx5"
 
