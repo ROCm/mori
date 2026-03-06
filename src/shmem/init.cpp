@@ -791,7 +791,11 @@ int ShmemGetUniqueId(mori_shmem_uniqueid_t* uid) {
     }
 
     if (!port_found) {
-      MORI_SHMEM_ERROR("Failed to find available port after {} attempts", kMaxPortRetries);
+      MORI_SHMEM_ERROR(
+          "Failed to find available port after {} attempts. "
+          "Try setting MORI_SOCKET_IFNAME=<interface> (e.g. eth0, eno1) "
+          "to specify the network interface.",
+          kMaxPortRetries);
       return -1;
     }
 
@@ -803,7 +807,11 @@ int ShmemGetUniqueId(mori_shmem_uniqueid_t* uid) {
     return 0;
 
   } catch (const std::exception& e) {
-    MORI_SHMEM_ERROR("ShmemGetUniqueId failed: {}", e.what());
+    MORI_SHMEM_ERROR(
+        "ShmemGetUniqueId failed: {}. "
+        "Try setting MORI_SOCKET_IFNAME=<interface> (e.g. eth0, eno1) "
+        "to specify the network interface for bootstrap communication.",
+        e.what());
     return -1;
   }
 }
@@ -878,7 +886,11 @@ int ShmemInitAttr(unsigned int flags, mori_shmem_init_attr_t* attr) {
       return 0;
 
     } catch (const std::exception& e) {
-      MORI_SHMEM_ERROR("UniqueId initialization failed: {}", e.what());
+      MORI_SHMEM_ERROR(
+          "UniqueId initialization failed: {}. "
+          "Try setting MORI_SOCKET_IFNAME=<interface> (e.g. eth0, eno1) "
+          "to specify the network interface for bootstrap communication.",
+          e.what());
       return -1;
     }
   }

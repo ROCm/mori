@@ -43,8 +43,10 @@ find_library(BNXT_RE_LIB NAMES bnxt_re)
 find_library(IONIC_LIB NAMES ionic HINTS /lib/x86_64-linux-gnu)
 find_library(MLX5_LIB NAMES mlx5)
 
-find_path(BNXT_RE_DV_INCLUDE NAMES infiniband/bnxt_re_dv.h)
-find_path(BNXT_RE_HSI_INCLUDE NAMES infiniband/bnxt_re_hsi.h)
+find_path(BNXT_RE_DV_INCLUDE NAMES infiniband/bnxt_re_dv.h
+  HINTS /usr/include /usr/local/include)
+find_path(BNXT_RE_HSI_INCLUDE NAMES infiniband/bnxt_re_hsi.h
+  HINTS /usr/include /usr/local/include)
 if(BNXT_RE_DV_INCLUDE AND BNXT_RE_HSI_INCLUDE)
   set(_bnxt_headers_found TRUE)
 else()
