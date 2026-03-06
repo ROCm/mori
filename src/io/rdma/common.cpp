@@ -257,12 +257,15 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
   }
 
   std::vector<size_t> epPostedCounts(epNum, 0);
+  std::vector<int> epActualWrPosted(epNum, 0);
+  std::vector<bool> epSignaledPosted(epNum, false);
 
   for (int i = 0; i < numPostBatch; i++) {
     int st = i * postBatchSize;
     int end = std::min(static_cast<size_t>(st) + postBatchSize, mergedWrCount);
     if (end - st == 0) break;
     int epId = i % epNum;
+    int batchWrNum = end - st;
     size_t mergedReqSize = 0;
     for (int j = st; j < end; j++) {
       struct ibv_send_wr& wr = mergedWrs[j].wr;
@@ -274,18 +277,29 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     struct ibv_send_wr& last = mergedWrs[end - 1].wr;
 
     epPostedCounts[epId] += mergedReqSize;
-    if ((i + epNum) >= numPostBatch) {
+    bool isLastBatchForEp = ((i + epNum) >= numPostBatch);
+    CqCallbackMessage* cbMsg = nullptr;
+    if (isLastBatchForEp) {
       int epTotalBatchSize = static_cast<int>(epPostedCounts[epId]);
-      last.wr_id = reinterpret_cast<uint64_t>(
-          new CqCallbackMessage(callbackMeta, epTotalBatchSize, epWrCounts[epId]));
+      cbMsg = new CqCallbackMessage(callbackMeta, epTotalBatchSize, epWrCounts[epId]);
+      last.wr_id = reinterpret_cast<uint64_t>(cbMsg);
       last.send_flags = IBV_SEND_SIGNALED;
     }
     struct ibv_send_wr* badWr = nullptr;
     int ret = ibv_post_send(eps[epId].local.ibvHandle.qp, &mergedWrs[st].wr, &badWr);
     if (ret != 0) {
+      delete cbMsg;
+      for (size_t j = 0; j < epNum; j++) {
+        if (!eps[j].sqDepth || epWrCounts[j] == 0) continue;
+        if (epSignaledPosted[j]) continue;
+        int unposted = epWrCounts[j] - epActualWrPosted[j];
+        if (unposted > 0) eps[j].sqDepth->fetch_sub(unposted, std::memory_order_relaxed);
+      }
       return {StatusCode::ERR_RDMA_OP,
               "ibv_post_send failed with " + std::to_string(ret) + ": " + strerror(ret)};
     }
+    epActualWrPosted[epId] += batchWrNum;
+    if (isLastBatchForEp) epSignaledPosted[epId] = true;
     MORI_IO_TRACE("ibv_post_send ep index {} batch index range [{}, {})", epId, st, end);
   }
   return {StatusCode::IN_PROGRESS, ""};
