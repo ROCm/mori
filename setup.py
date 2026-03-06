@@ -158,16 +158,6 @@ def _get_gpu_archs() -> str:
     return ";".join(_supported_arch_list)
 
 
-def _get_host_nic_env() -> dict:
-    """Pass through Host NIC env vars to CMake.
-
-    CMake handles the full auto-detection (find_library, sysfs, lspci).
-    setup.py only forwards explicit overrides; CMake validates them.
-    """
-    return {
-        "USE_BNXT": os.environ.get("USE_BNXT", "OFF").upper(),
-        "USE_IONIC": os.environ.get("USE_IONIC", "OFF").upper(),
-    }
 
 
 def _copy_jit_sources(root_dir: Path) -> None:
@@ -285,9 +275,6 @@ class CMakeBuild(build_ext):
         enable_profiler = os.environ.get("ENABLE_PROFILER", "OFF")
         enable_debug_printf = os.environ.get("ENABLE_DEBUG_PRINTF", "OFF")
 
-        nic_env = _get_host_nic_env()
-        use_bnxt = nic_env["USE_BNXT"]
-        use_ionic = nic_env["USE_IONIC"]
         enable_standard_moe_adapt = os.environ.get("ENABLE_STANDARD_MOE_ADAPT", "OFF")
         gpu_archs = _get_gpu_archs()
         print(f"[mori] GPU architecture: {gpu_archs}")
@@ -299,9 +286,7 @@ class CMakeBuild(build_ext):
             "-DUSE_ROCM=ON",
             f"-DCMAKE_BUILD_TYPE={build_type}",
             f"-DWARP_ACCUM_UNROLL={unroll_value}",
-            f"-DUSE_BNXT={use_bnxt}",
             f"-DBUILD_SHMEM_DEVICE_WRAPPER={build_shmem_device_wrapper}",
-            f"-DUSE_IONIC={use_ionic}",
             f"-DENABLE_DEBUG_PRINTF={enable_debug_printf}",
             f"-DENABLE_STANDARD_MOE_ADAPT={enable_standard_moe_adapt}",
             f"-DGPU_TARGETS={gpu_archs}",

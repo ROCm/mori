@@ -58,12 +58,22 @@ void SocketBootstrapNetwork::Initialize() {
 
   // Find local network interface
   if (!FindNetworkInterface(local_interface_)) {
-    throw std::runtime_error("Failed to find suitable network interface");
+    throw std::runtime_error(
+        "Failed to find suitable network interface. "
+        "Try setting MORI_SOCKET_IFNAME=<interface> (e.g. eth0, eno1) "
+        "to specify the network interface for bootstrap communication.");
   }
 
   // Setup communication infrastructure
   if (!SetupCommunicationRing()) {
-    throw std::runtime_error("Failed to setup communication ring");
+    const char* ifname = std::getenv("MORI_SOCKET_IFNAME");
+    std::string hint = ifname
+        ? std::string("Using interface from MORI_SOCKET_IFNAME=") + ifname +
+          ". Verify this interface has connectivity to all peers."
+        : "Try setting MORI_SOCKET_IFNAME=<interface> (e.g. eth0, eno1) "
+          "to specify the network interface for bootstrap communication.";
+    throw std::runtime_error(
+        "Failed to setup communication ring. " + hint);
   }
 
   initialized_ = true;
@@ -331,7 +341,13 @@ bool SocketBootstrapNetwork::FindNetworkInterface(SocketAddress& interface_addr)
     }
   }
 
-  // If specified interface not found or not specified, fall back to auto-detection
+  if (ifname && !found) {
+    fprintf(stderr,
+            "[mori] Warning: MORI_SOCKET_IFNAME=%s specified but interface not found or not up. "
+            "Falling back to auto-detection.\n",
+            ifname);
+  }
+
   if (!found) {
     for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
       if (ifa->ifa_addr == nullptr) continue;

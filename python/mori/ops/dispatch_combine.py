@@ -308,6 +308,12 @@ class EpDispatchCombineOp:
         func = self._get_func(func_name)
         func.launch_struct(grid, block, shared_mem, stream, args_ptr)
 
+    def _launch_multi(self, func_names, grids, blocks, shared_mems, stream, args_ptr):
+        from mori.jit.hip_driver import launch_multi
+
+        funcs = [self._get_func(name)._func for name in func_names]
+        launch_multi(funcs, grids, blocks, shared_mems, stream, args_ptr)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -375,29 +381,21 @@ class EpDispatchCombineOp:
             )
         elif kt == EpDispatchCombineKernelType.InterNodeV1.value:
             mp = self._handle_info["multi_processor_count"]
-            self._launch(
-                f"EpDispatchCopyToStaging_{sfx}", (mp,), block, 0, stream, args_ptr
-            )
-            self._launch(
-                f"EpDispatchInterNodeV1Kernel_{sfx}",
-                grid,
-                block,
-                shared_mem,
-                stream,
-                args_ptr,
+            self._launch_multi(
+                [f"EpDispatchCopyToStaging_{sfx}", f"EpDispatchInterNodeV1Kernel_{sfx}"],
+                [mp, actual_bn],
+                [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                [0, shared_mem],
+                stream, args_ptr,
             )
         elif kt == EpDispatchCombineKernelType.InterNodeV1LL.value:
             mp = self._handle_info["multi_processor_count"]
-            self._launch(
-                f"EpDispatchCopyToStaging_{sfx}", (mp,), block, 0, stream, args_ptr
-            )
-            self._launch(
-                f"EpDispatchInterNodeV1KernelLowLatency_{sfx}",
-                grid,
-                block,
-                shared_mem,
-                stream,
-                args_ptr,
+            self._launch_multi(
+                [f"EpDispatchCopyToStaging_{sfx}", f"EpDispatchInterNodeV1KernelLowLatency_{sfx}"],
+                [mp, actual_bn],
+                [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                [0, shared_mem],
+                stream, args_ptr,
             )
         elif kt == EpDispatchCombineKernelType.IntraNode.value:
             self._launch(
@@ -548,37 +546,25 @@ class EpDispatchCombineOp:
             )
         elif kt == EpDispatchCombineKernelType.InterNodeV1.value:
             mp = self._handle_info["multi_processor_count"]
-            self._launch(f"EpCombineSync_{sfx}", (mp,), block, 0, stream, args_ptr)
-            self._launch(
-                f"EpCombineSyncBarrier_{sfx}", (1,), (WARP_SIZE,), 0, stream, args_ptr
-            )
-            self._launch(
-                f"EpCombineInterNodeV1Kernel_{sfx}",
-                grid,
-                block,
-                shared_mem,
-                stream,
-                args_ptr,
-            )
-            self._launch(
-                f"EpCombineAll_{sfx}", (mp,), block, shared_mem, stream, args_ptr
+            bsz = WARP_SIZE * actual_wpb
+            self._launch_multi(
+                [f"EpCombineSync_{sfx}", f"EpCombineSyncBarrier_{sfx}",
+                 f"EpCombineInterNodeV1Kernel_{sfx}", f"EpCombineAll_{sfx}"],
+                [mp, 1, actual_bn, mp],
+                [bsz, WARP_SIZE, bsz, bsz],
+                [0, 0, shared_mem, shared_mem],
+                stream, args_ptr,
             )
         elif kt == EpDispatchCombineKernelType.InterNodeV1LL.value:
             mp = self._handle_info["multi_processor_count"]
-            self._launch(f"EpCombineSync_{sfx}", (mp,), block, 0, stream, args_ptr)
-            self._launch(
-                f"EpCombineSyncBarrier_{sfx}", (1,), (WARP_SIZE,), 0, stream, args_ptr
-            )
-            self._launch(
-                f"EpCombineInterNodeV1KernelLowLatency_{sfx}",
-                grid,
-                block,
-                shared_mem,
-                stream,
-                args_ptr,
-            )
-            self._launch(
-                f"EpCombineAll_{sfx}", (mp,), block, shared_mem, stream, args_ptr
+            bsz = WARP_SIZE * actual_wpb
+            self._launch_multi(
+                [f"EpCombineSync_{sfx}", f"EpCombineSyncBarrier_{sfx}",
+                 f"EpCombineInterNodeV1KernelLowLatency_{sfx}", f"EpCombineAll_{sfx}"],
+                [mp, 1, actual_bn, mp],
+                [bsz, WARP_SIZE, bsz, bsz],
+                [0, 0, shared_mem, shared_mem],
+                stream, args_ptr,
             )
         elif kt == EpDispatchCombineKernelType.IntraNode.value:
             if actual_use_ext:

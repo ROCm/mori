@@ -164,3 +164,36 @@ class HipFunction:
             c_void_p(0),
         )
         _check(err, f"hipModuleLaunchKernel({self._name})")
+
+
+def launch_multi(
+    funcs: list[c_void_p],
+    grids: list[int],
+    blocks: list[int],
+    shared_mems: list[int],
+    stream: int,
+    struct_ptr: int,
+) -> None:
+    """Launch multiple kernels with the same struct arg in a tight loop.
+
+    All kernels share the same stream and struct_ptr. Each entry uses a
+    1-D grid and 1-D block for simplicity (covers all dispatch/combine cases).
+    Minimises per-launch Python overhead by hoisting lib lookup, params
+    allocation, and ctypes constants out of the loop.
+    """
+    hip = _get_hip_lib()
+    params = (c_void_p * 1)(c_void_p(struct_ptr))
+    c_params = ctypes.cast(params, POINTER(c_void_p))
+    c_stream = c_void_p(stream)
+    c_null = c_void_p(0)
+    c_one = c_uint(1)
+    launch = hip.hipModuleLaunchKernel
+
+    for i in range(len(funcs)):
+        err = launch(
+            funcs[i], c_uint(grids[i]), c_one, c_one,
+            c_uint(blocks[i]), c_one, c_one,
+            c_uint(shared_mems[i]), c_stream, c_params, c_null,
+        )
+        if err != 0:
+            raise RuntimeError(f"HIP error {err}: hipModuleLaunchKernel (batch index {i})")
