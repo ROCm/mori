@@ -14,7 +14,8 @@ set_target_properties(
   mori_ops
   PROPERTIES BUILD_RPATH "$ORIGIN"
              INSTALL_RPATH "$ORIGIN"
-             BUILD_WITH_INSTALL_RPATH TRUE)
+             BUILD_WITH_INSTALL_RPATH TRUE
+             POSITION_INDEPENDENT_CODE ON)
 
 if(ENABLE_PROFILER)
   target_link_libraries(mori_ops PUBLIC mori_profiler_interface)

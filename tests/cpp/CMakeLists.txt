@@ -23,3 +23,10 @@ add_executable(test_topology application/test_topology.cpp)
 target_include_directories(test_topology PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(test_topology PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_topology mori_application mori_io)
+
+if(ENABLE_XLA_FFI)
+  add_executable(test_ffi_contract ffi/test_ffi_contract.cpp)
+  target_include_directories(test_ffi_contract
+    PUBLIC ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_ffi_contract mori_xla_ffi_ops mori_ops)
+endif()
