@@ -466,6 +466,14 @@ class CMakeBuild(build_ext):
                 root_dir / "python/mori/libmori_application.so",
             ),
             (
+                build_dir / "src/shmem/libmori_shmem.so",
+                root_dir / "python/mori/libmori_shmem.so",
+            ),
+            (
+                build_dir / "src/ops/libmori_ops.so",
+                root_dir / "python/mori/libmori_ops.so",
+            ),
+            (
                 build_dir / "src/io/libmori_io.so",
                 root_dir / "python/mori/libmori_io.so",
             ),
@@ -543,6 +551,8 @@ setup(
     package_data={
         "mori": [
             "libmori_pybinds.so",
+            "libmori_shmem.so",
+            "libmori_ops.so",
             "libmori_io.so",
             "libmori_application.so",
             "_jit_sources/include/**/*.hpp",
