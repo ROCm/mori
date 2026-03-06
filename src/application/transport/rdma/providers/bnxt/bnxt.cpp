@@ -21,7 +21,7 @@
 // SOFTWARE.
 #include "mori/application/transport/rdma/providers/bnxt/bnxt.hpp"
 
-#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 #include <infiniband/verbs.h>
 #include <unistd.h>
 

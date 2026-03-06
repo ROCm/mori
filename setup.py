@@ -21,6 +21,7 @@
 # SOFTWARE.
 import os
 import subprocess
+import sys
 from pathlib import Path
 import shutil
 
@@ -29,39 +30,336 @@ from setuptools.command.build import build as _build
 from setuptools.command.build_ext import build_ext
 
 
-def _get_torch_cmake_prefix_path() -> str:
-    import torch
-
-    return torch.utils.cmake_prefix_path
-
-
 _supported_arch_list = ["gfx942", "gfx950"]
+
+_REQUIRED_SYSTEM_DEPS = [
+    ("mpicc", ("libopenmpi-dev", "openmpi-devel"), "MPI compiler wrapper (needed by CMake)"),
+    ("mpirun", ("openmpi-bin", "openmpi"), "MPI runtime (needed at runtime)"),
+]
+
+_REQUIRED_HEADERS = [
+    (
+        ["/usr/include/pci/pci.h", "/usr/include/x86_64-linux-gnu/pci/pci.h"],
+        ("libpci-dev", "pciutils-devel"),
+        "PCI library headers (needed for topology detection)",
+    ),
+    (
+        ["/usr/include/infiniband/verbs.h"],
+        ("libibverbs-dev", "rdma-core-devel"),
+        "InfiniBand verbs headers (needed for RDMA transport)",
+    ),
+]
+
+
+def _detect_pkg_manager() -> str:
+    """Detect the system package manager."""
+    if shutil.which("apt-get"):
+        return "apt"
+    if shutil.which("dnf"):
+        return "dnf"
+    if shutil.which("yum"):
+        return "yum"
+    return "unknown"
+
+
+def _check_system_deps() -> None:
+    """Verify required system packages are installed; print install hints if not."""
+    missing = []
+
+    for binary, pkgs, desc in _REQUIRED_SYSTEM_DEPS:
+        if not shutil.which(binary):
+            missing.append((pkgs, desc))
+
+    for paths, pkgs, desc in _REQUIRED_HEADERS:
+        if not any(os.path.isfile(p) for p in paths):
+            missing.append((pkgs, desc))
+
+    if not missing:
+        return
+
+    pm = _detect_pkg_manager()
+    pkg_idx = 0 if pm == "apt" else 1
+
+    lines = ["", "=" * 70, "[mori] Missing system dependencies:"]
+    for pkgs, desc in missing:
+        pkg_name = pkgs[pkg_idx] if isinstance(pkgs, tuple) else pkgs
+        lines.append(f"  - {pkg_name:24s}  {desc}")
+    lines.append("")
+
+    pkg_names = [
+        (p[pkg_idx] if isinstance(p, tuple) else p) for p, _ in missing
+    ]
+    if pm == "apt":
+        lines.append("  Install (Ubuntu/Debian):")
+        lines.append(f"    sudo apt-get update && sudo apt-get install -y {' '.join(pkg_names)}")
+    elif pm in ("dnf", "yum"):
+        lines.append(f"  Install (RHEL/CentOS/Fedora):")
+        lines.append(f"    sudo {pm} install -y {' '.join(pkg_names)}")
+    else:
+        lines.append("  Install the equivalent packages for your distribution:")
+        lines.append(f"    Ubuntu/Debian: sudo apt-get install {' '.join(p[0] if isinstance(p, tuple) else p for p, _ in missing)}")
+        lines.append(f"    RHEL/Fedora:   sudo dnf install {' '.join(p[1] if isinstance(p, tuple) else p for p, _ in missing)}")
+    lines.append("=" * 70)
+    print("\n".join(lines), file=sys.stderr)
+    raise RuntimeError(
+        f"Missing system packages: {', '.join(pkg_names)}. "
+        "See messages above for install instructions."
+    )
+
+
+def _detect_local_gpu_arch() -> str | None:
+    """Auto-detect the GPU architecture on the current machine."""
+    rocm_path = os.environ.get("ROCM_PATH", "/opt/rocm")
+    enumerator = os.path.join(rocm_path, "bin", "rocm_agent_enumerator")
+    if os.path.isfile(enumerator):
+        try:
+            out = subprocess.check_output([enumerator], text=True)
+            for line in out.strip().split("\n"):
+                line = line.strip()
+                if (
+                    line.startswith("gfx")
+                    and line != "gfx000"
+                    and line in _supported_arch_list
+                ):
+                    return line
+        except subprocess.CalledProcessError:
+            pass
+    return None
 
 
 def _get_gpu_archs() -> str:
-    archs = os.environ.get("PYTORCH_ROCM_ARCH", None)
-    if not archs:
-        import torch
+    """Determine GPU target architectures for compilation.
 
-        archs = torch._C._cuda_getArchFlags()
+    Priority: MORI_GPU_ARCHS > local GPU > PYTORCH_ROCM_ARCH / GPU_ARCHS > fat binary default.
+    """
+    mori_gpu_archs = os.environ.get("MORI_GPU_ARCHS", None)
+    if mori_gpu_archs:
+        return mori_gpu_archs
+
+    local_arch = _detect_local_gpu_arch()
+    if local_arch:
+        return local_arch
+
+    archs = os.environ.get("PYTORCH_ROCM_ARCH", None)
 
     gpu_archs = os.environ.get("GPU_ARCHS", None)
     if gpu_archs:
         archs = gpu_archs
 
-    mori_gpu_archs = os.environ.get("MORI_GPU_ARCHS", None)
-    if mori_gpu_archs:
-        archs = mori_gpu_archs
+    if archs:
+        arch_list = archs.replace(" ", ";").split(";")
+        valid_arch_list = list(set(_supported_arch_list) & set(arch_list))
+        if valid_arch_list:
+            return ";".join(valid_arch_list)
 
-    arch_list = archs.replace(" ", ";").split(";")
+    print(
+        f"[mori] No GPU arch specified — building fat binary for {_supported_arch_list}"
+    )
+    return ";".join(_supported_arch_list)
 
-    # filter out supported architectures
-    valid_arch_list = list(set(_supported_arch_list) & set(arch_list))
-    if len(valid_arch_list) == 0:
-        raise ValueError(
-            f"no supported archs found, supported {_supported_arch_list}, got {arch_list}"
+
+def _detect_nic_type() -> dict:
+    """Auto-detect RDMA NIC type for IBGDA provider selection.
+
+    Detection priority:
+      1. Environment variable (USE_BNXT=ON or USE_IONIC=ON) — explicit override
+      2. /sys/class/infiniband/ — active RDMA devices registered with the kernel
+      3. lspci PCI vendor ID — hardware present but driver may not be loaded
+      4. User-space library (libbnxt_re.so / libionic.so) — fallback
+      5. Default: MLX5 (Mellanox ConnectX)
+    """
+    result = {"USE_BNXT": "OFF", "USE_IONIC": "OFF"}
+
+    # 1. Explicit environment variable
+    env_bnxt = os.environ.get("USE_BNXT", "").upper()
+    env_ionic = os.environ.get("USE_IONIC", "").upper()
+    if env_bnxt == "ON":
+        result["USE_BNXT"] = "ON"
+        return result
+    if env_ionic == "ON":
+        result["USE_IONIC"] = "ON"
+        return result
+    if env_bnxt or env_ionic:
+        return result
+
+    # 2. Active RDMA devices (most accurate — only shows devices with loaded drivers)
+    # First try device name prefix (bnxt_re_*, mlx5_*, ionic_*), then fall back
+    # to reading the kernel driver symlink for generically-named devices (rdma0, etc.).
+    _driver_to_nic = {
+        "bnxt_re": "BNXT",
+        "bnxt_en": "BNXT",
+        "mlx5_core": "MLX5",
+        "mlx5_ib": "MLX5",
+        "ionic_rdma": "IONIC",
+        "ionic": "IONIC",
+    }
+    ib_dir = "/sys/class/infiniband"
+    if os.path.isdir(ib_dir):
+        try:
+            devices = os.listdir(ib_dir)
+            counts = {"BNXT": 0, "IONIC": 0, "MLX5": 0}
+
+            for dev in devices:
+                if dev.startswith("bnxt_re"):
+                    counts["BNXT"] += 1
+                elif dev.startswith("ionic"):
+                    counts["IONIC"] += 1
+                elif dev.startswith("mlx5"):
+                    counts["MLX5"] += 1
+                else:
+                    driver_link = os.path.join(ib_dir, dev, "device", "driver")
+                    try:
+                        driver_name = os.path.basename(os.readlink(driver_link))
+                        nic = _driver_to_nic.get(driver_name)
+                        if nic:
+                            counts[nic] += 1
+                    except OSError:
+                        pass
+
+            if counts["BNXT"] > 0 and counts["BNXT"] >= counts["MLX5"]:
+                result["USE_BNXT"] = "ON"
+                print(
+                    f"[mori] Found {counts['BNXT']} BNXT RDMA device(s) in /sys/class/infiniband/"
+                )
+                return result
+            if counts["IONIC"] > 0 and counts["IONIC"] >= counts["MLX5"]:
+                result["USE_IONIC"] = "ON"
+                print(
+                    f"[mori] Found {counts['IONIC']} IONIC RDMA device(s) in /sys/class/infiniband/"
+                )
+                return result
+            if counts["MLX5"] > 0:
+                print(
+                    f"[mori] Found {counts['MLX5']} MLX5 RDMA device(s) in /sys/class/infiniband/"
+                )
+                return result
+        except OSError:
+            pass
+
+    # 3. lspci hardware detection
+    _NIC_PCI_VENDORS = {
+        "14e4": "BNXT",  # Broadcom BCM576xx / BCM578xx
+        "1dd8": "IONIC",  # AMD/Pensando
+        "15b3": "MLX5",  # Mellanox/NVIDIA ConnectX
+    }
+    try:
+        lspci_out = subprocess.check_output(
+            ["lspci", "-nn", "-d", "::0200"],
+            text=True,
+            stderr=subprocess.DEVNULL,
         )
-    return ";".join(valid_arch_list)
+        vendor_counts = {}
+        for line in lspci_out.strip().split("\n"):
+            for vid, nic in _NIC_PCI_VENDORS.items():
+                if vid in line:
+                    vendor_counts[nic] = vendor_counts.get(nic, 0) + 1
+
+        if vendor_counts:
+            dominant = max(vendor_counts, key=vendor_counts.get)
+            if dominant == "BNXT":
+                result["USE_BNXT"] = "ON"
+            elif dominant == "IONIC":
+                result["USE_IONIC"] = "ON"
+            print(f"[mori] lspci detected: {vendor_counts}")
+            return result
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+    # 4. Library file fallback
+    _LIB_SEARCH_PATHS = [
+        "/usr/local/lib",
+        "/usr/lib",
+        "/usr/lib/x86_64-linux-gnu",
+        "/lib/x86_64-linux-gnu",
+    ]
+    _NIC_LIBS = [
+        ("libbnxt_re.so", "USE_BNXT"),
+        ("libionic.so", "USE_IONIC"),
+    ]
+    for lib_name, flag in _NIC_LIBS:
+        for d in _LIB_SEARCH_PATHS:
+            if os.path.exists(os.path.join(d, lib_name)):
+                result[flag] = "ON"
+                print(f"[mori] Found {lib_name} in {d}")
+                return result
+
+    for d in _LIB_SEARCH_PATHS:
+        if os.path.exists(os.path.join(d, "libmlx5.so")):
+            print(f"[mori] Found libmlx5.so in {d}")
+            return result
+
+    # 5. Default: MLX5
+    return result
+
+
+def _copy_jit_sources(root_dir: Path) -> None:
+    """Copy JIT-required source files into the package for wheel distribution.
+
+    This creates python/mori/_jit_sources/ with the same directory structure
+    as the repo root, so that get_mori_source_root() can use it as a drop-in
+    replacement when the original source tree is not available.
+    """
+    jit_dir = root_dir / "python" / "mori" / "_jit_sources"
+    if jit_dir.exists():
+        shutil.rmtree(jit_dir)
+
+    def _copytree(src, dst, **kw):
+        shutil.copytree(src, dst, dirs_exist_ok=True, **kw)
+
+    _copytree(root_dir / "include", jit_dir / "include")
+
+    _copytree(root_dir / "src" / "ops" / "kernels", jit_dir / "src" / "ops" / "kernels")
+    _copytree(
+        root_dir / "src" / "ops" / "dispatch_combine",
+        jit_dir / "src" / "ops" / "dispatch_combine",
+    )
+
+    shmem_dst = jit_dir / "src" / "shmem"
+    shmem_dst.mkdir(parents=True, exist_ok=True)
+    for name in ["shmem_device_api_wrapper.cpp"]:
+        src_file = root_dir / "src" / "shmem" / name
+        if src_file.is_file():
+            shutil.copy2(src_file, shmem_dst / name)
+
+    for subdir in ["spdlog/include", "msgpack-c/include"]:
+        src = root_dir / "3rdparty" / subdir
+        if src.is_dir():
+            _copytree(src, jit_dir / "3rdparty" / subdir)
+
+
+_3RDPARTY_DIRS = ["3rdparty/spdlog", "3rdparty/msgpack-c"]
+
+
+def _ensure_3rdparty(root_dir: Path) -> None:
+    """Ensure 3rdparty submodule directories exist via git submodule update."""
+    missing = [d for d in _3RDPARTY_DIRS
+               if not (root_dir / d).is_dir() or not any((root_dir / d).iterdir())]
+    if not missing:
+        return
+
+    for d in missing:
+        (root_dir / d).mkdir(parents=True, exist_ok=True)
+
+    try:
+        subprocess.check_call(
+            ["git", "config", "--global", "--add", "safe.directory", str(root_dir)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.check_call(
+            ["git", "submodule", "update", "--init", "--recursive"],
+            cwd=str(root_dir),
+            stdout=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+    still_missing = [d for d in _3RDPARTY_DIRS if not any((root_dir / d).iterdir())]
+    if still_missing:
+        raise RuntimeError(
+            f"Missing 3rdparty dependencies: {still_missing}. "
+            "Run 'git submodule update --init --recursive' in the source directory."
+        )
 
 
 class CMakeBuild(build_ext):
@@ -70,8 +368,9 @@ class CMakeBuild(build_ext):
             subprocess.check_output(["cmake", "--version"])
         except OSError as exn:
             raise RuntimeError(
-                f"CMake must be installed to build the following extensions: {', '.join(e.name for e in self.extensions)}"
+                "CMake is required. Install via: pip install cmake  OR  sudo apt-get install cmake"
             ) from exn
+        _check_system_deps()
         for ext in self.extensions:
             self.build_extension(ext)
 
@@ -80,38 +379,79 @@ class CMakeBuild(build_ext):
         build_lib.mkdir(parents=True, exist_ok=True)
 
         root_dir = Path(__file__).parent
+
+        _ensure_3rdparty(root_dir)
         build_dir = root_dir / os.environ.get("MORI_PYBUILD_DIR", "build")
         build_dir.mkdir(parents=True, exist_ok=True)
 
+        cmake_cache = build_dir / "CMakeCache.txt"
+        if cmake_cache.is_file():
+            cache_text = cmake_cache.read_text()
+            for line in cache_text.splitlines():
+                if "CMAKE_MAKE_PROGRAM" in line and "=" in line:
+                    cached_path = line.split("=", 1)[1]
+                    if cached_path and not os.path.isfile(cached_path):
+                        print(
+                            f"[mori] Stale CMake cache: {cached_path} no longer exists. "
+                            "Re-running CMake configure (compiled objects preserved)."
+                        )
+                        cmake_cache.unlink()
+                        cmake_files = build_dir / "CMakeFiles"
+                        if cmake_files.is_dir():
+                            shutil.rmtree(cmake_files)
+                    break
+
         build_type = os.environ.get("CMAKE_BUILD_TYPE", "Release")
         unroll_value = os.environ.get("WARP_ACCUM_UNROLL", "1")
-        use_bnxt = os.environ.get("USE_BNXT", "OFF")
         build_shmem_device_wrapper = os.environ.get("BUILD_SHMEM_DEVICE_WRAPPER", "ON")
-        use_ionic = os.environ.get("USE_IONIC", "OFF")
         enable_profiler = os.environ.get("ENABLE_PROFILER", "OFF")
         enable_debug_printf = os.environ.get("ENABLE_DEBUG_PRINTF", "OFF")
+
+        nic = _detect_nic_type()
+        use_bnxt = nic["USE_BNXT"]
+        use_ionic = nic["USE_IONIC"]
+        nic_name = (
+            "BNXT" if use_bnxt == "ON" else ("IONIC" if use_ionic == "ON" else "MLX5")
+        )
+        print(
+            f"[mori] NIC auto-detection: {nic_name} (USE_BNXT={use_bnxt}, USE_IONIC={use_ionic}, USE_MLX5={'ON' if nic_name == 'MLX5' else 'OFF'})"
+        )
         enable_standard_moe_adapt = os.environ.get("ENABLE_STANDARD_MOE_ADAPT", "OFF")
         gpu_archs = _get_gpu_archs()
-        subprocess.check_call(
-            [
-                "cmake",
-                "-DUSE_ROCM=ON",
-                f"-DCMAKE_BUILD_TYPE={build_type}",
-                f"-DWARP_ACCUM_UNROLL={unroll_value}",
-                f"-DUSE_BNXT={use_bnxt}",
-                f"-DBUILD_SHMEM_DEVICE_WRAPPER={build_shmem_device_wrapper}",
-                f"-DUSE_IONIC={use_ionic}",
-                f"-DENABLE_DEBUG_PRINTF={enable_debug_printf}",
-                f"-DENABLE_STANDARD_MOE_ADAPT={enable_standard_moe_adapt}",
-                f"-DGPU_TARGETS={gpu_archs}",
-                f"-DENABLE_PROFILER={enable_profiler}",
-                "-B",
-                str(build_dir),
-                "-S",
-                str(root_dir),
-                f"-DCMAKE_PREFIX_PATH={_get_torch_cmake_prefix_path()}",
-            ]
-        )
+        print(f"[mori] GPU architecture: {gpu_archs}")
+        build_examples = os.environ.get("BUILD_EXAMPLES", "OFF")
+        build_tests = os.environ.get("BUILD_TESTS", "OFF")
+
+        cmake_args = [
+            "cmake",
+            "-DUSE_ROCM=ON",
+            f"-DCMAKE_BUILD_TYPE={build_type}",
+            f"-DWARP_ACCUM_UNROLL={unroll_value}",
+            f"-DUSE_BNXT={use_bnxt}",
+            f"-DBUILD_SHMEM_DEVICE_WRAPPER={build_shmem_device_wrapper}",
+            f"-DUSE_IONIC={use_ionic}",
+            f"-DENABLE_DEBUG_PRINTF={enable_debug_printf}",
+            f"-DENABLE_STANDARD_MOE_ADAPT={enable_standard_moe_adapt}",
+            f"-DGPU_TARGETS={gpu_archs}",
+            f"-DENABLE_PROFILER={enable_profiler}",
+            f"-DBUILD_EXAMPLES={build_examples}",
+            f"-DBUILD_TESTS={build_tests}",
+            "-DBUILD_TORCH_BOOTSTRAP=OFF",
+            "-B",
+            str(build_dir),
+            "-S",
+            str(root_dir),
+        ]
+
+        if shutil.which("ninja"):
+            cmake_args.insert(1, "-G")
+            cmake_args.insert(2, "Ninja")
+
+        if shutil.which("ccache"):
+            cmake_args.append("-DCMAKE_C_COMPILER_LAUNCHER=ccache")
+            cmake_args.append("-DCMAKE_CXX_COMPILER_LAUNCHER=ccache")
+
+        subprocess.check_call(cmake_args)
         subprocess.check_call(
             ["cmake", "--build", ".", "-j", f"{os.cpu_count()}"], cwd=str(build_dir)
         )
@@ -126,30 +466,68 @@ class CMakeBuild(build_ext):
                 root_dir / "python/mori/libmori_application.so",
             ),
             (
+                build_dir / "src/shmem/libmori_shmem.so",
+                root_dir / "python/mori/libmori_shmem.so",
+            ),
+            (
+                build_dir / "src/ops/libmori_ops.so",
+                root_dir / "python/mori/libmori_ops.so",
+            ),
+            (
                 build_dir / "src/io/libmori_io.so",
                 root_dir / "python/mori/libmori_io.so",
-            ),
-            (
-                build_dir / "src/shmem/libmori_shmem.a",
-                root_dir / "python/mori/libmori_shmem.a",
-            ),
-            (
-                build_dir / "src/ops/libmori_ops.a",
-                root_dir / "python/mori/libmori_ops.a",
             ),
         ]
         for src_path, dst_path in files_to_copy:
             shutil.copyfile(src_path, dst_path)
 
-        if build_shmem_device_wrapper.upper() == "ON":
-            bc_script = root_dir / "tools" / "build_shmem_bitcode.sh"
-            if bc_script.exists():
-                subprocess.check_call(["bash", str(bc_script)], cwd=str(root_dir))
-            bc_path = root_dir / "lib" / "libmori_shmem_device.bc"
-            if bc_path.exists():
-                ir_dir = root_dir / "python" / "mori" / "ir"
-                ir_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(bc_path, ir_dir / "libmori_shmem_device.bc")
+        _copy_jit_sources(root_dir)
+
+        if os.environ.get("MORI_SKIP_PRECOMPILE", "").lower() not in (
+            "1",
+            "true",
+            "on",
+        ):
+            _try_precompile(root_dir)
+
+
+def _try_precompile(root_dir: Path) -> None:
+    """Precompile JIT kernels in the background if a GPU is detected.
+
+    Launches a detached subprocess that compiles all .hsaco kernels and shmem
+    bitcode into ~/.mori/jit/. The subprocess is fire-and-forget — pip install
+    returns immediately without waiting.
+
+    If the user starts using kernels before precompilation finishes, the JIT
+    framework handles the race safely via FileBaton file locks: the user process
+    either waits for the background compile to finish, or compiles the kernel
+    itself (the background process will skip already-compiled kernels).
+    """
+    if _detect_local_gpu_arch() is None:
+        print("[mori] No GPU detected — skipping kernel precompilation")
+        return
+    rocm_path = os.environ.get("ROCM_PATH", "/opt/rocm")
+    hipcc = os.path.join(rocm_path, "bin", "hipcc")
+    if not os.path.isfile(hipcc):
+        print(f"[mori] hipcc not found at {hipcc} — skipping kernel precompilation")
+        return
+    try:
+        target_python = os.environ.get(
+            "MORI_PYTHON", shutil.which("python3") or shutil.which("python") or sys.executable
+        )
+        env = os.environ.copy()
+        env["MORI_PRECOMPILE"] = "1"
+        env.pop("PYTHONPATH", None)
+        subprocess.Popen(
+            [target_python, "-c",
+             "import time; time.sleep(3); import mori"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print("[mori] Kernel precompilation started in background")
+    except Exception as e:
+        print(f"[mori] Precompilation skipped: {e}")
 
 
 class CustomBuild(_build):
@@ -168,21 +546,33 @@ extensions = [
 ]
 
 setup(
-    name="mori",
-    use_scm_version=True,
-    description="Modular RDMA Interface",
     packages=find_packages(where="python"),
     package_dir={"": "python"},
     package_data={
-        "mori": ["libmori_pybinds.so", "libmori_io.so", "libmori_application.so", "libmori_shmem.a", "libmori_ops.a"],
+        "mori": [
+            "libmori_pybinds.so",
+            "libmori_shmem.so",
+            "libmori_ops.so",
+            "libmori_io.so",
+            "libmori_application.so",
+            "_jit_sources/include/**/*.hpp",
+            "_jit_sources/include/**/*.h",
+            "_jit_sources/src/**/*.hip",
+            "_jit_sources/src/**/*.hpp",
+            "_jit_sources/src/**/*.cpp",
+            "_jit_sources/src/**/*.h",
+            "_jit_sources/3rdparty/**/*.h",
+            "_jit_sources/3rdparty/**/*.hpp",
+        ],
         "mori.ir": ["*.bc"],
+    },
+    exclude_package_data={
+        "mori": ["*.a"],
     },
     cmdclass={
         "build_ext": CMakeBuild,
         "build": CustomBuild,
     },
-    setup_requires=["setuptools_scm"],
-    python_requires=">=3.10",
     ext_modules=extensions,
     include_package_data=True,
 )

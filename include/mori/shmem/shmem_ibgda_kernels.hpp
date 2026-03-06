@@ -32,11 +32,11 @@
 namespace mori {
 namespace shmem {
 
-#ifdef ENABLE_BNXT
+#ifdef MORI_DEVICE_NIC_BNXT
 #define DISPATCH_MLX5 0
 #define DISPATCH_BNXT 1
 #define DISPATCH_PSD 0
-#elif ENABLE_IONIC
+#elif defined(MORI_DEVICE_NIC_IONIC)
 #define DISPATCH_MLX5 0
 #define DISPATCH_BNXT 0
 #define DISPATCH_PSD 1

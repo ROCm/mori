@@ -22,7 +22,7 @@
 #include "mori/application/context/context.hpp"
 
 #include <arpa/inet.h>
-#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 #include <ifaddrs.h>
 #include <netdb.h>
 #include <string.h>
@@ -249,11 +249,8 @@ void Context::InitializePossibleTransports() {
       config.gidIdx = std::atoi(envGidIdx);
     }
     config.maxMsgsNum = 4096;
-#ifdef ENABLE_BNXT
-    config.maxCqeNum = 1;
-#else
-    config.maxCqeNum = 4096;
-#endif
+    uint32_t vid = rdmaDeviceContext->GetRdmaDevice()->GetDeviceAttr()->orig_attr.vendor_id;
+    config.maxCqeNum = (vid == static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)) ? 1 : 4096;
     config.alignment = 4096;
     config.onGpu = true;
     for (int qp = 0; qp < numQpPerPe; qp++) {

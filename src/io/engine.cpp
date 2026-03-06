@@ -21,7 +21,7 @@
 // SOFTWARE.
 #include "mori/io/engine.hpp"
 
-#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 
 #include <cstdlib>
 

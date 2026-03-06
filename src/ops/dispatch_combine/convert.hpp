@@ -21,10 +21,10 @@
 // SOFTWARE.
 #pragma once
 
+#include <hip/hip_fp16.h>
+
 #include <cstdint>
 #include <iterator>
-
-#include <hip/hip_fp16.h>
 
 #include "mori/core/core.hpp"
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
@@ -48,16 +48,15 @@
     }                                                  \
   } while (0)
 
-#define PROFILE_TS_PRINT(condition, label, ts, tsCount)            \
-  do {                                                             \
-    if (condition) {                                               \
-      printf("[%s] block=%d warp=%d", label,                       \
-             static_cast<int>(blockIdx.x), warpId);                \
-      for (int _i = 1; _i < (tsCount); ++_i) {                     \
-        printf(" t%d=%.3f", _i, ((ts)[_i] - (ts)[0]) / 100.0f);    \
-      }                                                            \
-      printf("\n");                                                \
-    }                                                              \
+#define PROFILE_TS_PRINT(condition, label, ts, tsCount)                             \
+  do {                                                                              \
+    if (condition) {                                                                \
+      printf("[%s] block=%d warp=%d", label, static_cast<int>(blockIdx.x), warpId); \
+      for (int _i = 1; _i < (tsCount); ++_i) {                                      \
+        printf(" t%d=%.3f", _i, ((ts)[_i] - (ts)[0]) / 100.0f);                     \
+      }                                                                             \
+      printf("\n");                                                                 \
+    }                                                                               \
   } while (0)
 
 #ifdef PROFILE_DISPATCH
@@ -65,9 +64,15 @@
 #define PROFILE_DISPATCH_RECORD PROFILE_TS_RECORD
 #define PROFILE_DISPATCH_PRINT PROFILE_TS_PRINT
 #else
-#define PROFILE_DISPATCH_DECL(kTsMax) do {} while(0)
-#define PROFILE_DISPATCH_RECORD(ts, tsCount, kTsMax, laneId) do {} while(0)
-#define PROFILE_DISPATCH_PRINT(condition, label, ts, tsCount) do {} while(0)
+#define PROFILE_DISPATCH_DECL(kTsMax) \
+  do {                                \
+  } while (0)
+#define PROFILE_DISPATCH_RECORD(ts, tsCount, kTsMax, laneId) \
+  do {                                                       \
+  } while (0)
+#define PROFILE_DISPATCH_PRINT(condition, label, ts, tsCount) \
+  do {                                                        \
+  } while (0)
 #endif
 
 #ifdef PROFILE_COMBINE
@@ -75,21 +80,45 @@
 #define PROFILE_COMBINE_RECORD PROFILE_TS_RECORD
 #define PROFILE_COMBINE_PRINT PROFILE_TS_PRINT
 #else
-#define PROFILE_COMBINE_DECL(kTsMax) do {} while(0)
-#define PROFILE_COMBINE_RECORD(ts, tsCount, kTsMax, laneId) do {} while(0)
-#define PROFILE_COMBINE_PRINT(condition, label, ts, tsCount) do {} while(0)
+#define PROFILE_COMBINE_DECL(kTsMax) \
+  do {                               \
+  } while (0)
+#define PROFILE_COMBINE_RECORD(ts, tsCount, kTsMax, laneId) \
+  do {                                                      \
+  } while (0)
+#define PROFILE_COMBINE_PRINT(condition, label, ts, tsCount) \
+  do {                                                       \
+  } while (0)
 #endif
 
 #else  // !ENABLE_PROFILE
-#define PROFILE_TS_DECL(kTsMax) do {} while(0)
-#define PROFILE_TS_RECORD(ts, tsCount, kTsMax, laneId) do {} while(0)
-#define PROFILE_TS_PRINT(condition, label, ts, tsCount) do {} while(0)
-#define PROFILE_DISPATCH_DECL(kTsMax) do {} while(0)
-#define PROFILE_DISPATCH_RECORD(ts, tsCount, kTsMax, laneId) do {} while(0)
-#define PROFILE_DISPATCH_PRINT(condition, label, ts, tsCount) do {} while(0)
-#define PROFILE_COMBINE_DECL(kTsMax) do {} while(0)
-#define PROFILE_COMBINE_RECORD(ts, tsCount, kTsMax, laneId) do {} while(0)
-#define PROFILE_COMBINE_PRINT(condition, label, ts, tsCount) do {} while(0)
+#define PROFILE_TS_DECL(kTsMax) \
+  do {                          \
+  } while (0)
+#define PROFILE_TS_RECORD(ts, tsCount, kTsMax, laneId) \
+  do {                                                 \
+  } while (0)
+#define PROFILE_TS_PRINT(condition, label, ts, tsCount) \
+  do {                                                  \
+  } while (0)
+#define PROFILE_DISPATCH_DECL(kTsMax) \
+  do {                                \
+  } while (0)
+#define PROFILE_DISPATCH_RECORD(ts, tsCount, kTsMax, laneId) \
+  do {                                                       \
+  } while (0)
+#define PROFILE_DISPATCH_PRINT(condition, label, ts, tsCount) \
+  do {                                                        \
+  } while (0)
+#define PROFILE_COMBINE_DECL(kTsMax) \
+  do {                               \
+  } while (0)
+#define PROFILE_COMBINE_RECORD(ts, tsCount, kTsMax, laneId) \
+  do {                                                      \
+  } while (0)
+#define PROFILE_COMBINE_PRINT(condition, label, ts, tsCount) \
+  do {                                                       \
+  } while (0)
 #endif
 
 namespace mori {
@@ -131,7 +160,8 @@ __device__ inline void GridBarrier(T* barrierPtr) {
   __syncthreads();
   if (threadIdx.x == 0) {
     __threadfence();
-    __hip_atomic_fetch_add(barrierPtr, static_cast<T>(1), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    __hip_atomic_fetch_add(barrierPtr, static_cast<T>(1), __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_AGENT);
   }
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -248,8 +278,7 @@ __device__ inline void ConvertDispatchOutputDevice(ConvertDispatchOutputArgs arg
     }
     idx = __shfl(idx, 0);
 
-    const uint64_t linearIndex =
-        static_cast<uint64_t>(localExpert) * maxTokensPerExpert + idx;
+    const uint64_t linearIndex = static_cast<uint64_t>(localExpert) * maxTokensPerExpert + idx;
     if (laneId == 0) {
       // packedRecvSrcInfo[linearIndex] = srcInfo;
       packedRecvSrcInfo[linearIndex] = dispatchSrcTokenPos[tokenIdx];
@@ -419,8 +448,7 @@ __device__ inline void ConvertCombineInputDevice(ConvertCombineInputArgs& args) 
     uint8_t* out;
     if constexpr (UseP2PRead) {
       out = args.shmemCombineInpTokMemObj->template GetAs<uint8_t*>() + tokenIdx * hiddenBytes;
-    }
-    else {
+    } else {
       index_t destTokId =
           args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(config.rank)[tokenIdx];
       index_t destPe = destTokId / config.MaxNumTokensToRecvPerRank();
@@ -525,7 +553,8 @@ __device__ inline void ConvertCombineInputDevice(ConvertCombineInputArgs& args) 
 
     PROFILE_COMBINE_RECORD(ts, tsCount, kTsMax, laneId);
     const float* weightRow = topkWeights ? (topkWeights + tokenIdx * topk) : nullptr;
-    // core::WarpAccum<T, 4>(combineInput + tokenIdx * hiddenDim, srcPtrs, weightRow, topk, hiddenDim);
+    // core::WarpAccum<T, 4>(combineInput + tokenIdx * hiddenDim, srcPtrs, weightRow, topk,
+    // hiddenDim);
     core::WarpAccum<T, 4>(out, srcPtrs, weightRow, topk, hiddenDim);
     PROFILE_COMBINE_RECORD(ts, tsCount, kTsMax, laneId);
   }
@@ -536,8 +565,13 @@ __device__ inline void ConvertCombineInputDevice(ConvertCombineInputArgs& args) 
 #endif
 
 template <typename T, bool UseP2PRead = true>
-__global__ void ConvertCombineInputKernel(ConvertCombineInputArgs args) {
+__device__ void ConvertCombineInputKernel_body(ConvertCombineInputArgs args) {
   ConvertCombineInputDevice<T, UseP2PRead>(args);
+}
+
+template <typename T, bool UseP2PRead = true>
+__global__ void ConvertCombineInputKernel(ConvertCombineInputArgs args) {
+  ConvertCombineInputKernel_body<T, UseP2PRead>(args);
 }
 
 }  // namespace moe

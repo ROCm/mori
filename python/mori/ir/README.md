@@ -131,18 +131,24 @@ Signal ops: `from mori.ir import SIGNAL_SET, SIGNAL_ADD`
 
 See `python/mori/ir/ops.py` for the complete list.
 
-## Building the Bitcode
+## Bitcode: JIT Compilation
 
+The bitcode is **automatically JIT-compiled** on first use — no manual build step
+required. `find_bitcode()` compiles `shmem_device_api_wrapper.cpp` with
+`hipcc --cuda-device-only` and caches the result to `~/.mori/jit/`.
+
+The NIC type (BNXT/IONIC/MLX5) and GPU architecture are auto-detected at runtime,
+ensuring the bitcode contains the correct IBGDA provider for the hardware.
+
+To precompile all kernels and bitcode ahead of time:
 ```bash
-# 1. Build mori with device wrapper
-BUILD_SHMEM_DEVICE_WRAPPER=ON pip install . --no-build-isolation
-
-# 2. Generate bitcode
-bash tools/build_shmem_bitcode.sh
-# Output: lib/libmori_shmem_device.bc
+MORI_PRECOMPILE=1 python -c "import mori"
 ```
 
-For BNXT NIC: `USE_BNXT=ON`, for AINIC: `USE_IONIC=ON`.
+To manually build bitcode from the command line (e.g. for CI or non-Python workflows):
+```bash
+bash tools/build_shmem_bitcode.sh [output_dir] [gpu_arch]
+```
 
 ## Examples
 

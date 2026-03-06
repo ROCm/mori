@@ -27,6 +27,8 @@ import torch.distributed as dist
 import os
 
 os.environ["MORI_SHMEM_HEAP_SIZE"] = "6G"
+
+
 class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
     def __init__(self, config):
         super().__init__(config)
@@ -203,8 +205,8 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         # (data is identical via all_gather)
         max_disp_algo_bw = 0
         max_comb_algo_bw = 0
-        min_disp_latency_us = float('inf')
-        min_comb_latency_us = float('inf')
+        min_disp_latency_us = float("inf")
+        min_comb_latency_us = float("inf")
         for i in range(iters):
             disp_algo_bw = sum(disp_bandwidth_GB_list[i]) / self.config.world_size
             comb_algo_bw = sum(comb_bandwidth_GB_list[i]) / self.config.world_size
@@ -222,7 +224,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 print(
                     f"Round {i} duration(us) {duration_us} "
                     f"bandwidth(GB/s) {disp_bandwidth_GB_list[i]}"
-                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw} / {algo_bw*ll_mode_scale:.2f}"
+                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw} / {algo_bw * ll_mode_scale:.2f}"
                 )
 
             print()
@@ -232,10 +234,15 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 print(
                     f"Round {i} duration(us) {duration_us} "
                     f"bandwidth(GB/s) {comb_bandwidth_GB_list[i]}"
-                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw} / {algo_bw*ll_mode_scale:.2f}"
+                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw} / {algo_bw * ll_mode_scale:.2f}"
                 )
 
-        return max_disp_algo_bw, max_comb_algo_bw, min_disp_latency_us, min_comb_latency_us
+        return (
+            max_disp_algo_bw,
+            max_comb_algo_bw,
+            min_disp_latency_us,
+            min_comb_latency_us,
+        )
 
     def stress_once(
         self,
@@ -472,11 +479,11 @@ def _bench_dispatch_combine(
 
         if cmd == "bench":
             if rank == 0:
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(
                     f"Benchmarking with dispatch_block_num={dispatch_block_num}, dispatch_warp_per_block={dispatch_warp_per_block} combine_block_num={combine_block_num}, combine_warp_per_block={combine_warp_per_block}"
                 )
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
             benchmark.run(
                 op,
                 dispatch_block_num=dispatch_block_num,
@@ -488,11 +495,11 @@ def _bench_dispatch_combine(
         elif cmd == "stress":
             # Stress test
             if rank == 0:
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(
                     f"Stress testing with dispatch_block_num={dispatch_block_num}, dispatch_warp_per_block={dispatch_warp_per_block} combine_block_num={combine_block_num}, combine_warp_per_block={combine_warp_per_block}"
                 )
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
             benchmark.stress(
                 op,
                 dispatch_block_num=dispatch_block_num,
@@ -565,24 +572,26 @@ def _bench_dispatch_combine(
 
             # --- Phase 1: Tune Dispatch (fix combine at safe default) ---
             best_disp_bw = 0
-            best_disp_latency = float('inf')
+            best_disp_latency = float("inf")
             best_disp_config = None
             comb_safe_block = min(sm_count, 72)
             comb_safe_wpb = 15
 
             if rank == 0:
-                print(f"\n{'#'*60}")
-                print(f"Phase 1: Tuning DISPATCH (combine fixed at block_num={comb_safe_block}, wpb={comb_safe_wpb})")
-                print(f"{'#'*60}")
+                print(f"\n{'#' * 60}")
+                print(
+                    f"Phase 1: Tuning DISPATCH (combine fixed at block_num={comb_safe_block}, wpb={comb_safe_wpb})"
+                )
+                print(f"{'#' * 60}")
 
             for block_num in disp_block_list:
                 for warp_per_block in warp_per_block_list:
                     if rank == 0:
-                        print(f"\n{'='*60}")
+                        print(f"\n{'=' * 60}")
                         print(
                             f"Dispatch: block_num={block_num}, warp_per_block={warp_per_block}"
                         )
-                        print(f"{'='*60}")
+                        print(f"{'=' * 60}")
 
                     disp_bw, _, disp_lat, _ = benchmark.run(
                         op,
@@ -602,8 +611,7 @@ def _bench_dispatch_combine(
             # The op now accepts different runtime input dtype/hidden_dim between dispatch/combine,
             # so actual usage can still use one op; separate combine op here is only for tuning.
             use_separate_combine_op = (
-                combine_data_type != data_type
-                or combine_hidden_dim != hidden_dim
+                combine_data_type != data_type or combine_hidden_dim != hidden_dim
             )
             if use_separate_combine_op:
                 comb_config = mori.ops.EpDispatchCombineConfig(
@@ -630,11 +638,11 @@ def _bench_dispatch_combine(
                 comb_benchmark = benchmark
 
             best_comb_bw = 0
-            best_comb_latency = float('inf')
+            best_comb_latency = float("inf")
             best_comb_config = None
 
             if rank == 0:
-                print(f"\n{'#'*60}")
+                print(f"\n{'#' * 60}")
                 dtype_info = ""
                 if use_separate_combine_op:
                     dtype_info = f", combine_dtype={combine_data_type}"
@@ -643,16 +651,16 @@ def _bench_dispatch_combine(
                     f"block_num={best_disp_config[0]}, wpb={best_disp_config[1]}"
                     f"{dtype_info})"
                 )
-                print(f"{'#'*60}")
+                print(f"{'#' * 60}")
 
             for block_num in comb_block_list:
                 for warp_per_block in warp_per_block_list:
                     if rank == 0:
-                        print(f"\n{'='*60}")
+                        print(f"\n{'=' * 60}")
                         print(
                             f"Combine: block_num={block_num}, warp_per_block={warp_per_block}"
                         )
-                        print(f"{'='*60}")
+                        print(f"{'=' * 60}")
 
                     _, comb_bw, _, comb_lat = comb_benchmark.run(
                         comb_op,
@@ -668,11 +676,11 @@ def _bench_dispatch_combine(
                         best_comb_config = (block_num, warp_per_block)
 
             if rank == 0:
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print("Performance Summary:")
-                print(f"{'='*60}")
-                disp_dtype_str = str(data_type).split('.')[-1]
-                comb_dtype_str = str(combine_data_type).split('.')[-1]
+                print(f"{'=' * 60}")
+                disp_dtype_str = str(data_type).split(".")[-1]
+                comb_dtype_str = str(combine_data_type).split(".")[-1]
                 print(
                     f"Best Dispatch  ({disp_dtype_str}): {best_disp_bw:.2f} GB/s, "
                     f"latency={best_disp_latency} us "
@@ -685,7 +693,7 @@ def _bench_dispatch_combine(
                 )
                 total_latency = best_disp_latency + best_comb_latency
                 print(f"Total Dispatch+Combine latency: {total_latency} us")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
         else:
             raise ValueError(f"Unknown command: {cmd}")
@@ -834,11 +842,10 @@ if __name__ == "__main__":
         "--combine-dtype",
         type=str,
         default=None,
-        choices=["bf16", "fp8_e4m3_fnuz", "fp8_e4m3", "fp4"],
+        choices=["bf16", "fp8_e4m3_fnuz", "fp8_e4m3"],
         help=(
             "Data type for combine phase (tuning only). "
             "When set, Phase 2 creates a separate op with this dtype. "
-            "Example: --dtype fp4 --combine-dtype bf16"
         ),
     )
     args = parser.parse_args()
@@ -853,8 +860,16 @@ if __name__ == "__main__":
     combine_dtype = _DATA_TYPE_MAP[combine_dtype_str]
 
     base_hidden_dim = 7168
-    dispatch_hidden_dim = base_hidden_dim // 2 if dispatch_dtype is torch.float4_e2m1fn_x2 else base_hidden_dim
-    combine_hidden_dim = base_hidden_dim // 2 if combine_dtype is torch.float4_e2m1fn_x2 else base_hidden_dim
+    dispatch_hidden_dim = (
+        base_hidden_dim // 2
+        if dispatch_dtype is torch.float4_e2m1fn_x2
+        else base_hidden_dim
+    )
+    combine_hidden_dim = (
+        base_hidden_dim // 2
+        if combine_dtype is torch.float4_e2m1fn_x2
+        else base_hidden_dim
+    )
 
     print(
         f"Running {args.cmd} with max_tokens_per_rank: {args.max_tokens}, "

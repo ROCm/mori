@@ -34,6 +34,7 @@
 #include "mori/application/memory/va_manager.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/transport/transport.hpp"
+#include "mori/hip_compat.hpp"
 
 namespace mori {
 namespace application {
@@ -108,10 +109,15 @@ struct SymmMemObjPtr {
 
   bool IsValid() { return (cpu != nullptr) && (gpu != nullptr); }
 
+#if defined(__HIPCC__) || defined(__CUDACC__)
   __host__ SymmMemObj* operator->() { return cpu; }
   __device__ SymmMemObj* operator->() { return gpu; }
   __host__ const SymmMemObj* operator->() const { return cpu; }
   __device__ const SymmMemObj* operator->() const { return gpu; }
+#else
+  SymmMemObj* operator->() { return cpu; }
+  const SymmMemObj* operator->() const { return cpu; }
+#endif
 };
 
 class SymmMemManager {

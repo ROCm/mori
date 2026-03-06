@@ -28,13 +28,14 @@
 
 #include <cassert>
 #include <iomanip>
+#include <iostream>
+#include <limits>
 #include <queue>
 #include <regex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
-#include <iostream>
 
 extern "C" {
 #include <pci/pci.h>
@@ -302,7 +303,8 @@ void TopoSystemPci::Load() {
         uint64_t dspBusId = PciBusId(dev->domain, i, 0, 0).packed;
         if (dsp2dev.find(dspBusId) != dsp2dev.end()) {
           struct pci_dev* lastDev = dsp2dev[dspBusId];
-          if (pci_read_byte(dev, PCI_PRIMARY_BUS) < pci_read_byte(lastDev, PCI_PRIMARY_BUS)) continue;
+          if (pci_read_byte(dev, PCI_PRIMARY_BUS) < pci_read_byte(lastDev, PCI_PRIMARY_BUS))
+            continue;
         }
         dsp2dev[dspBusId] = dev;
         assert(dev->bus == pci_read_byte(dev, PCI_PRIMARY_BUS));

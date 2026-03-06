@@ -33,39 +33,140 @@ option(ENABLE_PROFILER "Enable kernel profiling" OFF)
 option(ENABLE_DEBUG_PRINTF "Enable debug printf in device kernels" OFF)
 option(ENABLE_STANDARD_MOE_ADAPT "Enable standard moe adapt" OFF)
 
+# ---------------------------------------------------------------------------
+# Host NIC: link all available NIC libraries (can be multiple)
+# ---------------------------------------------------------------------------
 set(CMAKE_LIBRARY_PATH "/usr/local/lib;${CMAKE_LIBRARY_PATH}")
 find_library(BNXT_RE_LIB NAMES bnxt_re)
 if(BNXT_RE_LIB)
   message(STATUS "Found bnxt_re library at: ${BNXT_RE_LIB}")
+  set(USE_BNXT ON CACHE BOOL "Enable BNXT host features" FORCE)
 else()
-  message(
-    STATUS "Could NOT find bnxt_re library. BNXT features will be disabled.")
-  set(USE_BNXT
-      OFF
-      CACHE BOOL "Enable BNXT features if bnxt_re library is found" FORCE)
+  message(STATUS "Could NOT find bnxt_re library. BNXT host features disabled.")
+  set(USE_BNXT OFF CACHE BOOL "Enable BNXT host features" FORCE)
 endif()
-message(STATUS "USE_BNXT = ${USE_BNXT}")
 if(USE_BNXT)
   add_compile_definitions(ENABLE_BNXT)
 endif()
 
-find_library(
-  IONIC_LIB
-  NAMES ionic
-  HINTS /lib/x86_64-linux-gnu)
+find_library(IONIC_LIB NAMES ionic HINTS /lib/x86_64-linux-gnu)
 if(IONIC_LIB)
   message(STATUS "Found ionic library at: ${IONIC_LIB}")
+  set(USE_IONIC ON CACHE BOOL "Enable IONIC host features" FORCE)
 else()
-  message(
-    STATUS "Could NOT find ionic library. IONIC features will be disabled.")
-  set(USE_IONIC
-      OFF
-      CACHE BOOL "Enable IONIC features if ionic library is found" FORCE)
+  message(STATUS "Could NOT find ionic library. IONIC host features disabled.")
+  set(USE_IONIC OFF CACHE BOOL "Enable IONIC host features" FORCE)
 endif()
-message(STATUS "USE_IONIC = ${USE_IONIC}")
 if(USE_IONIC)
   add_compile_definitions(ENABLE_IONIC)
 endif()
+message(STATUS "Host NIC: USE_BNXT=${USE_BNXT}, USE_IONIC=${USE_IONIC}")
+
+# ---------------------------------------------------------------------------
+# Device NIC: detect exactly one provider for IBGDA dispatch in device code.
+# Same logic as Python JIT detect_nic_type(): env > sysfs > lspci > host libs.
+# Sets MORI_DEVICE_NIC_DEFINE to the compile definition for device targets.
+# ---------------------------------------------------------------------------
+function(detect_device_nic out_var)
+  # 1. Env override
+  if(DEFINED ENV{MORI_DEVICE_NIC})
+    string(TOLOWER "$ENV{MORI_DEVICE_NIC}" _nic)
+    message(STATUS "Device NIC: override from MORI_DEVICE_NIC=$ENV{MORI_DEVICE_NIC}")
+    set(${out_var} "${_nic}" PARENT_SCOPE)
+    return()
+  endif()
+
+  # 2. /sys/class/infiniband/ — device name prefix + driver symlink fallback
+  file(GLOB _ib_devices "/sys/class/infiniband/*")
+  set(_bnxt 0)
+  set(_ionic 0)
+  set(_mlx5 0)
+  foreach(_dev ${_ib_devices})
+    get_filename_component(_name ${_dev} NAME)
+    if(_name MATCHES "^bnxt_re")
+      math(EXPR _bnxt "${_bnxt} + 1")
+    elseif(_name MATCHES "^ionic")
+      math(EXPR _ionic "${_ionic} + 1")
+    elseif(_name MATCHES "^mlx5")
+      math(EXPR _mlx5 "${_mlx5} + 1")
+    else()
+      execute_process(
+        COMMAND readlink -f "${_dev}/device/driver"
+        OUTPUT_VARIABLE _drv OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET RESULT_VARIABLE _rc)
+      if(_rc EQUAL 0)
+        get_filename_component(_drv_name "${_drv}" NAME)
+        if(_drv_name MATCHES "^bnxt")
+          math(EXPR _bnxt "${_bnxt} + 1")
+        elseif(_drv_name MATCHES "^ionic")
+          math(EXPR _ionic "${_ionic} + 1")
+        elseif(_drv_name MATCHES "^mlx5")
+          math(EXPR _mlx5 "${_mlx5} + 1")
+        endif()
+      endif()
+    endif()
+  endforeach()
+  if(_bnxt GREATER 0 AND _bnxt GREATER_EQUAL _mlx5)
+    message(STATUS "Device NIC: sysfs (bnxt=${_bnxt}, ionic=${_ionic}, mlx5=${_mlx5})")
+    set(${out_var} "bnxt" PARENT_SCOPE)
+    return()
+  elseif(_ionic GREATER 0 AND _ionic GREATER_EQUAL _mlx5)
+    message(STATUS "Device NIC: sysfs (bnxt=${_bnxt}, ionic=${_ionic}, mlx5=${_mlx5})")
+    set(${out_var} "ionic" PARENT_SCOPE)
+    return()
+  elseif(_mlx5 GREATER 0)
+    message(STATUS "Device NIC: sysfs (bnxt=${_bnxt}, ionic=${_ionic}, mlx5=${_mlx5})")
+    set(${out_var} "mlx5" PARENT_SCOPE)
+    return()
+  endif()
+
+  # 3. lspci PCI vendor ID
+  execute_process(
+    COMMAND lspci -nn -d ::0200
+    OUTPUT_VARIABLE _lspci ERROR_QUIET RESULT_VARIABLE _rc)
+  if(_rc EQUAL 0 AND _lspci)
+    string(REGEX MATCHALL "14e4" _b "${_lspci}")
+    string(REGEX MATCHALL "1dd8" _i "${_lspci}")
+    string(REGEX MATCHALL "15b3" _m "${_lspci}")
+    list(LENGTH _b _bp)
+    list(LENGTH _i _ip)
+    list(LENGTH _m _mp)
+    if(_bp GREATER 0 AND _bp GREATER_EQUAL _mp)
+      message(STATUS "Device NIC: lspci (bnxt=${_bp}, ionic=${_ip}, mlx5=${_mp})")
+      set(${out_var} "bnxt" PARENT_SCOPE)
+      return()
+    elseif(_ip GREATER 0 AND _ip GREATER_EQUAL _mp)
+      message(STATUS "Device NIC: lspci (bnxt=${_bp}, ionic=${_ip}, mlx5=${_mp})")
+      set(${out_var} "ionic" PARENT_SCOPE)
+      return()
+    elseif(_mp GREATER 0)
+      message(STATUS "Device NIC: lspci (bnxt=${_bp}, ionic=${_ip}, mlx5=${_mp})")
+      set(${out_var} "mlx5" PARENT_SCOPE)
+      return()
+    endif()
+  endif()
+
+  # 4. Fallback to host library detection
+  if(USE_BNXT)
+    set(_nic "bnxt")
+  elseif(USE_IONIC)
+    set(_nic "ionic")
+  else()
+    set(_nic "mlx5")
+  endif()
+  message(STATUS "Device NIC: fallback from host libs")
+  set(${out_var} "${_nic}" PARENT_SCOPE)
+endfunction()
+
+detect_device_nic(_detected_device_nic)
+if(_detected_device_nic STREQUAL "bnxt")
+  set(MORI_DEVICE_NIC_DEFINE "MORI_DEVICE_NIC_BNXT" CACHE STRING "Device NIC provider" FORCE)
+elseif(_detected_device_nic STREQUAL "ionic")
+  set(MORI_DEVICE_NIC_DEFINE "MORI_DEVICE_NIC_IONIC" CACHE STRING "Device NIC provider" FORCE)
+else()
+  set(MORI_DEVICE_NIC_DEFINE "" CACHE STRING "Device NIC provider" FORCE)
+endif()
+message(STATUS "Device NIC: ${_detected_device_nic} (${MORI_DEVICE_NIC_DEFINE})")
 
 message(STATUS "ENABLE_PROFILER = ${ENABLE_PROFILER}")
 if(ENABLE_PROFILER)
@@ -91,8 +192,8 @@ add_definitions(-DHIP_ENABLE_WARP_SYNC_BUILTINS)
 if(USE_ROCM)
   list(APPEND CMAKE_PREFIX_PATH "/opt/rocm")
   project(mori LANGUAGES HIP CXX C)
-  # set(CMAKE_CXX_COMPILER /opt/rocm/bin/hipcc)
   find_package(hip REQUIRED)
+  link_directories(/opt/rocm/lib)
 
   if(DEFINED GPU_TARGETS)
     list(GET GPU_TARGETS 0 GPU_ARCH)
@@ -124,9 +225,15 @@ else()
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -expt-relaxed-constexpr")
 endif()
 
+set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
+set(SPDLOG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(SPDLOG_BUILD_BENCH OFF CACHE BOOL "" FORCE)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+add_subdirectory(3rdparty/spdlog)
+
 add_library(mori_logging INTERFACE)
 target_include_directories(mori_logging INTERFACE include)
-target_include_directories(mori_logging SYSTEM INTERFACE 3rdparty/spdlog/include)
+target_link_libraries(mori_logging INTERFACE spdlog::spdlog)
 
 if(ENABLE_PROFILER)
   find_package(

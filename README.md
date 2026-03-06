@@ -185,44 +185,85 @@ Benchmark result on the following configurations:
 
 ### Prerequisites
 
-- pytorch:rocm >= 6.4.0
-- Linux packages: see packages in dockerfile
+- ROCm >= 6.4 (hipcc needed at runtime for JIT kernel compilation, not at install time)
+- System packages: `libopenmpi-dev`, `openmpi-bin`, `libpci-dev` (see [Dockerfile.dev](docker/Dockerfile.dev))
 
 Or build docker image with:
-```
+```bash
 cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
 ```
 
-### Install with Python
-```
+**IBGDA NIC support** (optional, for GPU-direct RDMA — auto-detected, no manual configuration needed):
+
+| NIC | User library | Headers |
+|-----|-------------|---------|
+| AMD Pollara (AINIC) | `libionic.so` | — |
+| Mellanox ConnectX | `libmlx5.so` (typically pre-installed) | — |
+| Broadcom Thor2 | `libbnxt_re.so` | `bnxt_re_dv.h`, `bnxt_re_hsi.h` |
+
+> **Note**: IBGDA requires vendor-specific DV (Direct Verbs) libraries. Mellanox `libmlx5` is
+> typically pre-installed with the kernel OFED stack. For Thor2 and Pollara, install the
+> corresponding userspace library and headers from your NIC vendor.
+
+### Install
+
+```bash
 # NOTE: for venv build, add --no-build-isolation at the end
-cd mori && pip install -r requirements-build.txt && git submodule update --init --recursive && pip3 install .
+cd mori && pip install .
+```
+
+That's it. No hipcc needed at install time — host code compiles with a standard
+C++ compiler. GPU kernels are JIT-compiled on first use and cached to
+`~/.mori/jit/`. If a GPU is detected during install, kernel precompilation
+starts automatically in the background.
+
+To manually precompile all kernels (e.g. in a Docker image build):
+```bash
+MORI_PRECOMPILE=1 python -c "import mori"
+```
+
+### Verify installation
+
+```bash
+python -c "import mori; print('OK')"
 ```
 
 ### Test dispatch / combine
-```
+
+```bash
 cd /path/to/mori
 export PYTHONPATH=/path/to/mori:$PYTHONPATH
 
-# Test correctness
-pytest tests/python/ops/
+# Test correctness (8 GPUs)
+pytest tests/python/ops/test_dispatch_combine.py -q
 
 # Benchmark performance
-python3 tests/python/ops/bench_dispatch_combine.py
+python tests/python/ops/bench_dispatch_combine.py
 ```
 
 ### Test MORI-IO
-```
+
+```bash
 cd /path/to/mori
 export PYTHONPATH=/path/to/mori:$PYTHONPATH
 
 # Test correctness
 pytest tests/python/io/
 
-# Benchmark performance
-# Run the following command on two nodes
+# Benchmark performance (two nodes)
 export GLOO_SOCKET_IFNAME=ens14np0
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.194.129.65" --master_port=1234 tests/python/io/benchmark.py --host="10.194.129.65" --enable-batch-transfer --enable-sess --buffer-size 32768 --transfer-batch-size 128
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.194.129.65" --master_port=1234 \
+  tests/python/io/benchmark.py --host="10.194.129.65" --enable-batch-transfer --enable-sess --buffer-size 32768 --transfer-batch-size 128
+```
+
+### Test MORI-IR (Triton + shmem integration, [guide](python/mori/ir/README.md))
+
+```bash
+# Basic shmem put (2 GPUs)
+torchrun --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
+
+# Allreduce (8 GPUs)
+torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
 ```
 
 ## Contribution Guide

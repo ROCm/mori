@@ -33,6 +33,7 @@
 
 #include "infiniband/verbs.h"
 #include "mori/core/transport/rdma/rdma.hpp"
+#include "mori/hip_compat.hpp"
 // #include "mori/core/transport/rdma/primitives.hpp"
 
 namespace mori {
