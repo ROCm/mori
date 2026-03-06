@@ -118,10 +118,6 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     if (location.node_id.empty()) {
       location.node_id = request->node_id();
     }
-    if (location.node_id != request->node_id()) {
-      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
-                          "location.node_id must match request.node_id");
-    }
 
     index_.Register(request->node_id(), request->key(), location);
     spdlog::info("[Master] Register key: node_id={}, key={}, location_id={}, size={}, tier={}",
@@ -143,10 +139,6 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     Location location = ToLocation(request->location());
     if (location.node_id.empty()) {
       location.node_id = request->node_id();
-    }
-    if (location.node_id != request->node_id()) {
-      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
-                          "location.node_id must match request.node_id");
     }
 
     const bool removed = index_.Unregister(request->node_id(), request->key(), location);
