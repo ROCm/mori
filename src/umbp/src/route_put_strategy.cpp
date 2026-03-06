@@ -19,52 +19,41 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#pragma once
-
-#include <memory>
-#include <string>
-
-#include "umbp/block_index.h"
-#include "umbp/client_registry.h"
-#include "umbp/route_get_strategy.h"
 #include "umbp/route_put_strategy.h"
-#include "umbp/router.h"
 
-namespace grpc_impl {
-class Server;
-}
+#include <array>
 
 namespace mori::umbp {
 
-struct MasterServerConfig {
-  std::string listen_address = "0.0.0.0:50051";
-  ClientRegistryConfig registry_config;
+std::optional<RoutePutResult> TierAwareMostAvailableStrategy::Select(
+    const std::vector<ClientRecord>& alive_clients, uint64_t block_size) {
+  static constexpr std::array<TierType, 3> kTierOrder = {TierType::HBM, TierType::DRAM,
+                                                         TierType::SSD};
 
-  std::unique_ptr<RouteGetStrategy> get_strategy;
-  std::unique_ptr<RoutePutStrategy> put_strategy;
-};
+  for (TierType tier : kTierOrder) {
+    const ClientRecord* best = nullptr;
+    uint64_t best_available = 0;
 
-class MasterServer {
- public:
-  explicit MasterServer(MasterServerConfig config);
-  ~MasterServer();
+    for (const auto& client : alive_clients) {
+      auto it = client.tier_capacities.find(tier);
+      if (it == client.tier_capacities.end()) {
+        continue;
+      }
+      if (it->second.available_bytes < block_size) {
+        continue;
+      }
+      if (best == nullptr || it->second.available_bytes > best_available) {
+        best = &client;
+        best_available = it->second.available_bytes;
+      }
+    }
 
-  MasterServer(const MasterServer&) = delete;
-  MasterServer& operator=(const MasterServer&) = delete;
+    if (best != nullptr) {
+      return RoutePutResult{best->node_id, best->node_address, tier};
+    }
+  }
 
-  void Run();
-  void Shutdown();
-
- private:
-  MasterServerConfig config_;
-  BlockIndex index_;
-  ClientRegistry registry_;
-  Router router_;
-
-  std::unique_ptr<grpc_impl::Server> server_;
-
-  class UMBPMasterServiceImpl;
-  std::unique_ptr<UMBPMasterServiceImpl> service_;
-};
+  return std::nullopt;
+}
 
 }  // namespace mori::umbp

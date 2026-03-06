@@ -203,6 +203,80 @@ grpc::Status UMBPClient::Unregister(const std::string& key, const Location& loca
   return grpc::Status::OK;
 }
 
+grpc::Status UMBPClient::RouteGet(const std::string& key,
+                                  std::optional<Location>* out_location) {
+  if (out_location != nullptr) {
+    *out_location = std::nullopt;
+  }
+
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "node must be registered before RouteGet");
+  }
+
+  ::umbp::RouteGetRequest req;
+  req.set_key(key);
+  req.set_node_id(config_.node_id);
+
+  ::umbp::RouteGetResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->RouteGet(&ctx, req, &resp);
+
+  if (!status.ok()) {
+    spdlog::error("[Client] RouteGet(key={}) failed: {}", key, status.error_message());
+    return status;
+  }
+
+  if (resp.found() && out_location != nullptr) {
+    Location loc;
+    loc.node_id = resp.source().node_id();
+    loc.location_id = resp.source().location_id();
+    loc.size = resp.source().size();
+    loc.tier = static_cast<TierType>(resp.source().tier());
+    *out_location = loc;
+  }
+
+  spdlog::info("[Client] RouteGet key='{}': found={}", key, resp.found());
+  return grpc::Status::OK;
+}
+
+grpc::Status UMBPClient::RoutePut(const std::string& key, uint64_t block_size,
+                                  std::optional<RoutePutResult>* out_result) {
+  if (out_result != nullptr) {
+    *out_result = std::nullopt;
+  }
+
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "node must be registered before RoutePut");
+  }
+
+  ::umbp::RoutePutRequest req;
+  req.set_key(key);
+  req.set_node_id(config_.node_id);
+  req.set_block_size(block_size);
+
+  ::umbp::RoutePutResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->RoutePut(&ctx, req, &resp);
+
+  if (!status.ok()) {
+    spdlog::error("[Client] RoutePut(key={}) failed: {}", key, status.error_message());
+    return status;
+  }
+
+  if (resp.found() && out_result != nullptr) {
+    RoutePutResult result;
+    result.node_id = resp.node_id();
+    result.node_address = resp.node_address();
+    result.tier = static_cast<TierType>(resp.tier());
+    *out_result = result;
+  }
+
+  spdlog::info("[Client] RoutePut key='{}': found={}", key, resp.found());
+  return grpc::Status::OK;
+}
+
 void UMBPClient::StartHeartbeat() {
   if (!registered_) {
     spdlog::warn("[Client] StartHeartbeat ignored: not registered");

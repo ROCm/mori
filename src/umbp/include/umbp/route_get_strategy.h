@@ -21,50 +21,32 @@
 // SOFTWARE.
 #pragma once
 
-#include <memory>
 #include <string>
+#include <vector>
 
-#include "umbp/block_index.h"
-#include "umbp/client_registry.h"
-#include "umbp/route_get_strategy.h"
-#include "umbp/route_put_strategy.h"
-#include "umbp/router.h"
-
-namespace grpc_impl {
-class Server;
-}
+#include "umbp/types.h"
 
 namespace mori::umbp {
 
-struct MasterServerConfig {
-  std::string listen_address = "0.0.0.0:50051";
-  ClientRegistryConfig registry_config;
+/// Abstract interface for RouteGet replica selection.
+/// Implement this to plug in a custom read-path routing strategy.
+class RouteGetStrategy {
+ public:
+  virtual ~RouteGetStrategy() = default;
 
-  std::unique_ptr<RouteGetStrategy> get_strategy;
-  std::unique_ptr<RoutePutStrategy> put_strategy;
+  /// Select one replica from the given non-empty locations list.
+  /// @param locations  All known replicas for the requested key (non-empty).
+  /// @param node_id    The requesting client's node_id (for locality-aware strategies).
+  /// @return           The chosen Location to read from.
+  virtual Location Select(const std::vector<Location>& locations,
+                          const std::string& node_id) = 0;
 };
 
-class MasterServer {
+/// Default strategy: uniform random selection among replicas.
+/// Uses thread_local RNG — no contention under concurrent calls.
+class RandomRouteGetStrategy : public RouteGetStrategy {
  public:
-  explicit MasterServer(MasterServerConfig config);
-  ~MasterServer();
-
-  MasterServer(const MasterServer&) = delete;
-  MasterServer& operator=(const MasterServer&) = delete;
-
-  void Run();
-  void Shutdown();
-
- private:
-  MasterServerConfig config_;
-  BlockIndex index_;
-  ClientRegistry registry_;
-  Router router_;
-
-  std::unique_ptr<grpc_impl::Server> server_;
-
-  class UMBPMasterServiceImpl;
-  std::unique_ptr<UMBPMasterServiceImpl> service_;
+  Location Select(const std::vector<Location>& locations, const std::string& node_id) override;
 };
 
 }  // namespace mori::umbp

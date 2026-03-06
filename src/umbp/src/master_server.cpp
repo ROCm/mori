@@ -27,6 +27,7 @@
 #include <chrono>
 
 #include "umbp.grpc.pb.h"
+#include "umbp/router.h"
 
 namespace mori::umbp {
 
@@ -44,9 +45,9 @@ static Location ToLocation(const ::umbp::Location& proto_location) {
 // ---------------------------------------------------------------------------
 class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Service {
  public:
-  UMBPMasterServiceImpl(ClientRegistry& registry, BlockIndex& index,
+  UMBPMasterServiceImpl(ClientRegistry& registry, BlockIndex& index, Router& router,
                         const ClientRegistryConfig& config)
-      : registry_(registry), index_(index), config_(config) {}
+      : registry_(registry), index_(index), router_(router), config_(config) {}
 
   grpc::Status RegisterClient(grpc::ServerContext* /*context*/,
                               const ::umbp::RegisterClientRequest* request,
@@ -155,9 +156,56 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     return grpc::Status::OK;
   }
 
+  grpc::Status RouteGet(grpc::ServerContext* /*context*/, const ::umbp::RouteGetRequest* request,
+                        ::umbp::RouteGetResponse* response) override {
+    if (request->key().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "key cannot be empty");
+    }
+
+    auto result = router_.RouteGet(request->key(), request->node_id());
+    if (!result.has_value()) {
+      response->set_found(false);
+      return grpc::Status::OK;
+    }
+
+    response->set_found(true);
+    auto* source = response->mutable_source();
+    source->set_node_id(result->node_id);
+    source->set_location_id(result->location_id);
+    source->set_size(result->size);
+    source->set_tier(static_cast<::umbp::TierType>(result->tier));
+
+    spdlog::info("[Master] RouteGet key='{}': node={}, location={}", request->key(),
+                 result->node_id, result->location_id);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status RoutePut(grpc::ServerContext* /*context*/, const ::umbp::RoutePutRequest* request,
+                        ::umbp::RoutePutResponse* response) override {
+    if (request->key().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "key cannot be empty");
+    }
+
+    auto result = router_.RoutePut(request->key(), request->node_id(), request->block_size());
+    if (!result.has_value()) {
+      response->set_found(false);
+      return grpc::Status::OK;
+    }
+
+    response->set_found(true);
+    response->set_node_id(result->node_id);
+    response->set_node_address(result->node_address);
+    response->set_tier(static_cast<::umbp::TierType>(result->tier));
+
+    spdlog::info("[Master] RoutePut key='{}': target_node={}, tier={}", request->key(),
+                 result->node_id, TierTypeName(result->tier));
+    return grpc::Status::OK;
+  }
+
  private:
   ClientRegistry& registry_;
   BlockIndex& index_;
+  Router& router_;
   ClientRegistryConfig config_;
 };
 
@@ -168,8 +216,9 @@ MasterServer::MasterServer(MasterServerConfig config)
     : config_(std::move(config)),
       index_(),
       registry_(config_.registry_config, index_),
-      service_(
-          std::make_unique<UMBPMasterServiceImpl>(registry_, index_, config_.registry_config)) {
+      router_(index_, registry_, std::move(config_.get_strategy), std::move(config_.put_strategy)),
+      service_(std::make_unique<UMBPMasterServiceImpl>(registry_, index_, router_,
+                                                       config_.registry_config)) {
   index_.SetClientRegistry(&registry_);
 }
 
