@@ -172,54 +172,90 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> 
 
   int blocksPerPe = blockNum / npes;
   int destPe = blockId / blocksPerPe;
+  int localBlockId = blockId % blocksPerPe;
 
+  // Each warp independently computes prefix sum of recv token counts (npes < warpSize)
   uint64_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint64_t*>();
-  uint64_t recvTokenNum = 0;
-  if (laneId == 0) {
-    recvTokenNum = core::AtomicLoadRelaxed(recvTokenNums + destPe * config.numQpPerPe) - 1;
-    args.destPeTokenCounter[destPe] = 0;
+  int cnt = 0;
+  if (laneId < npes) {
+    cnt = static_cast<int>(core::AtomicLoadRelaxed(recvTokenNums + laneId * config.numQpPerPe) - 1);
+    if (laneId == destPe) args.destPeTokenCounter[destPe] = 0;
   }
-  recvTokenNum = __shfl(recvTokenNum, 0);
+  // Inclusive prefix sum via warp scan
+  int inclSum = cnt;
+  for (int d = 1; d < warpSize; d <<= 1) {
+    int n = __shfl_up(inclSum, d);
+    if (laneId >= d) inclSum += n;
+  }
+  // Extract values for this PE via __shfl
+  int destPeInclSum = __shfl(inclSum, destPe);
+  int destPePrevSum = (destPe > 0) ? __shfl(inclSum, destPe - 1) : 0;
+  int recvTokenNum = destPeInclSum - destPePrevSum;
+  index_t destTokIdBase = destPePrevSum;
+
+  // Write total recv token num
+  int totalRecv = __shfl(inclSum, npes - 1);
+  if (globalThdId == 0) {
+    args.totalRecvTokenNum[0] = totalRecv;
+  }
 
   uint8_t* stagingPtr = (destPe != myPe)
                             ? args.shmemDispatchInpTokMemObj->template GetAs<uint8_t*>()
                             : args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
   stagingPtr += (config.MaxNumTokensToSendPerRank() * destPe) * xferBytes;
 
-  for (int tokenId = (blockId % blocksPerPe) * warpNum + warpId; tokenId < recvTokenNum;
-       tokenId += blocksPerPe * warpNum) {
-    index_t destTokId = 0;
-    if (laneId == 0) destTokId = atomicAdd(args.totalRecvTokenNum, 1);
-    destTokId = __shfl(destTokId, 0);
-    core::WarpCopy<uint8_t, 4>(
-        args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>() + destTokId * hiddenBytes,
-        stagingPtr + tokenId * xferBytes, hiddenBytes);
-    if (laneId < config.numExpertPerToken) {
-      index_t id =
-          reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes)[laneId];
-      index_t pe = id / config.numExpertPerRank;
-      if (!((pe >= 0) && (pe < config.worldSize))) {
-        assert((pe >= 0) && (pe < config.worldSize));
+  uint8_t* outTokPtr = args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>();
+  uint8_t* outIndPtr = args.shmemOutIndicesMemObj->template GetAs<uint8_t*>();
+  uint8_t* outWgtPtr = args.shmemDispatchOutWeightsMemObj->template GetAs<uint8_t*>();
+  uint8_t* outSclPtr = args.shmemOutScalesMemObj->template GetAs<uint8_t*>();
+
+  // Multi-warp per token: same pattern as CombineRecvCopy
+  int localWarpNum = blocksPerPe * warpNum;
+  int localWarpId = localBlockId * warpNum + warpId;
+  int warpsPerToken = std::max(1, localWarpNum / std::max(1, recvTokenNum));
+  size_t hiddenBytesPerWarp = core::CeilDiv(hiddenBytes, static_cast<size_t>(warpsPerToken));
+
+  for (int i = localWarpId; i < recvTokenNum * warpsPerToken; i += localWarpNum) {
+    int tokenId = i / warpsPerToken;
+    int partId = i % warpsPerToken;
+    index_t destTokId = destTokIdBase + tokenId;
+
+    // Hidden data: each warp copies its slice
+    size_t offset = partId * hiddenBytesPerWarp;
+    size_t sz = std::min(hiddenBytesPerWarp, hiddenBytes - offset);
+    if (sz > 0) {
+      core::WarpCopy<uint8_t, 4>(outTokPtr + destTokId * hiddenBytes + offset,
+                                 stagingPtr + tokenId * xferBytes + offset, sz);
+    }
+
+    // Metadata: only first warp of each token group
+    if (partId == 0) {
+      if (laneId < config.numExpertPerToken) {
+        index_t id =
+            reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes)[laneId];
+        index_t pe = id / config.numExpertPerRank;
+        if (!((pe >= 0) && (pe < config.worldSize))) {
+          assert((pe >= 0) && (pe < config.worldSize));
+        }
       }
-    }
-    core::WarpCopy<uint8_t, 4>(
-        args.shmemOutIndicesMemObj->template GetAs<uint8_t*>() + destTokId * indexBytes,
-        stagingPtr + tokenId * xferBytes + hiddenBytes, indexBytes);
-    core::WarpCopy<uint8_t, 4>(
-        args.shmemDispatchOutWeightsMemObj->template GetAs<uint8_t*>() + destTokId * weightBytes,
-        stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes, weightBytes);
-    if (scaleBytes > 0) {
-      core::WarpCopy<uint8_t, 4>(
-          args.shmemOutScalesMemObj->template GetAs<uint8_t*>() + destTokId * scaleBytes,
-          stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes + weightBytes, scaleBytes);
-    }
-    if (laneId == 0) {
-      // A map used to recover token ordering at combine send phase
-      args.dispReceiverIdxMap[destTokId] = config.MaxNumTokensToSendPerRank() * destPe + tokenId;
-      // A map used for unit test correctness check
-      args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[destTokId] =
-          reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes +
-                                     weightBytes + scaleBytes)[0];
+      core::WarpCopy<uint8_t, 4>(outIndPtr + destTokId * indexBytes,
+                                 stagingPtr + tokenId * xferBytes + hiddenBytes, indexBytes);
+      core::WarpCopy<uint8_t, 4>(outWgtPtr + destTokId * weightBytes,
+                                 stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes,
+                                 weightBytes);
+      if (scaleBytes > 0) {
+        core::WarpCopy<uint8_t, 4>(
+            outSclPtr + destTokId * scaleBytes,
+            stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes + weightBytes, scaleBytes);
+      }
+      if (laneId == 0) {
+        // A map used to recover token ordering at combine send phase
+        args.dispReceiverIdxMap[destTokId] = config.MaxNumTokensToSendPerRank() * destPe + tokenId;
+        // A map used for unit test correctness check
+        args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[destTokId] =
+            reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes +
+                                       weightBytes + scaleBytes)[0];
+      }
     }
   }
 
