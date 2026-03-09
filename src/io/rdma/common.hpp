@@ -141,8 +141,9 @@ struct CqCallbackMeta {
 };
 
 struct CqCallbackMessage {
-  CqCallbackMessage(CqCallbackMeta* m, int n, int wr = 0) : meta(m), batchSize(n), wrCount(wr) {}
-  CqCallbackMeta* meta{nullptr};
+  CqCallbackMessage(std::shared_ptr<CqCallbackMeta> m, int n, int wr = 0)
+      : meta(std::move(m)), batchSize(n), wrCount(wr) {}
+  std::shared_ptr<CqCallbackMeta> meta{nullptr};
   int batchSize{0};
   int wrCount{0};
 };
@@ -163,14 +164,14 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
                              const SizeVec& localOffsets,
                              const application::RdmaMemoryRegion& remote,
                              const SizeVec& remoteOffsets, const SizeVec& sizes,
-                             CqCallbackMeta* callbackMeta, TransferUniqueId id, bool isRead,
-                             int postBatchSize = -1);
+                             std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id,
+                             bool isRead, int postBatchSize = -1);
 
 inline RdmaOpRet RdmaBatchRead(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                                const SizeVec& localOffsets,
                                const application::RdmaMemoryRegion& remote,
                                const SizeVec& remoteOffsets, const SizeVec& sizes,
-                               CqCallbackMeta* callbackMeta, TransferUniqueId id,
+                               std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id,
                                int postBatchSize = -1) {
   return RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, callbackMeta,
                             id, true /*isRead */, postBatchSize);
@@ -180,7 +181,7 @@ inline RdmaOpRet RdmaBatchWrite(const EpPairVec& eps, const application::RdmaMem
                                 const SizeVec& localOffsets,
                                 const application::RdmaMemoryRegion& remote,
                                 const SizeVec& remoteOffsets, const SizeVec& sizes,
-                                CqCallbackMeta* callbackMeta, TransferUniqueId id,
+                                std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id,
                                 int postBatchSize = -1) {
   return RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, callbackMeta,
                             id, false /*isRead */, postBatchSize);
@@ -188,23 +189,24 @@ inline RdmaOpRet RdmaBatchWrite(const EpPairVec& eps, const application::RdmaMem
 
 inline RdmaOpRet RdmaReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                                size_t localOffset, const application::RdmaMemoryRegion& remote,
-                               size_t remoteOffset, size_t size, CqCallbackMeta* callbackMeta,
-                               TransferUniqueId id, bool isRead) {
+                               size_t remoteOffset, size_t size,
+                               std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id,
+                               bool isRead) {
   return RdmaBatchReadWrite(eps, local, {localOffset}, remote, {remoteOffset}, {size}, callbackMeta,
                             id, isRead, 1);
 }
 
 inline RdmaOpRet RdmaRead(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                           size_t localOffset, const application::RdmaMemoryRegion& remote,
-                          size_t remoteOffset, size_t size, CqCallbackMeta* callbackMeta,
-                          TransferUniqueId id) {
+                          size_t remoteOffset, size_t size,
+                          std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id) {
   return RdmaReadWrite(eps, local, localOffset, remote, remoteOffset, size, callbackMeta, id, true);
 }
 
 inline RdmaOpRet RdmaWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                            size_t localOffset, const application::RdmaMemoryRegion& remote,
-                           size_t remoteOffset, size_t size, CqCallbackMeta* callbackMeta,
-                           TransferUniqueId id) {
+                           size_t remoteOffset, size_t size,
+                           std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id) {
   return RdmaReadWrite(eps, local, localOffset, remote, remoteOffset, size, callbackMeta, id,
                        false);
 }

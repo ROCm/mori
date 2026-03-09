@@ -417,9 +417,6 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
             statusPtr != nullptr ? statusPtr->CodeUint32()
                                  : static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
             msg->meta->totalBatchSize, lastBatchSize, msg->batchSize);
-        if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
-          delete msg->meta;
-        }
         delete msg;
       }
     }
@@ -687,7 +684,7 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
-  CqCallbackMeta* callbackMeta = new CqCallbackMeta(status, id, 1);
+  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, 1);
 
   RdmaOpRet ret =
       RdmaReadWrite(eps, local, localOffset, remote, remoteOffset, size, callbackMeta, id, isRead);
@@ -709,7 +706,7 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
                                         TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
-  CqCallbackMeta* callbackMeta = new CqCallbackMeta(status, id, sizes.size());
+  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, sizes.size());
   RdmaOpRet ret;
   if (executor) {
     ExecutorReq req{eps,          local, localOffsets,         remote, remoteOffsets, sizes,
