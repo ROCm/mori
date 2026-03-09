@@ -25,6 +25,7 @@
 #include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
+
 #include <type_traits>
 
 #include "mori/core/core.hpp"
@@ -140,7 +141,10 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   if ((blockId % blocksPerPe) == 0) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       if (laneId == 0) {
-        shmem::ShmemQuietThread(destPe, qpId);
+        // TODO: use different quiet func for SDMDA/RDMA and P2P
+        // shmem::ShmemQuietThread(destPe, qpId);
+        shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
+            destPe, args.shmemDispatchInpTokMemObj);
         int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
         // TODO(ditian12): send atomic op right after quiet lead to hang issue, need to investigate
         // shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
@@ -245,10 +249,9 @@ __global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
           reinterpret_cast<TokT*>(stagingPtr + stagingTokId * tokHiddenBytes),
           args.inpTokenBuf + tokenId * config.hiddenDim, config.hiddenDim, laneId);
     } else {
-      core::WarpCopy<uint8_t, 4>(stagingPtr + stagingTokId * tokHiddenBytes,
-                                 reinterpret_cast<uint8_t*>(args.inpTokenBuf) +
-                                     tokenId * tokHiddenBytes,
-                                 tokHiddenBytes);
+      core::WarpCopy<uint8_t, 4>(
+          stagingPtr + stagingTokId * tokHiddenBytes,
+          reinterpret_cast<uint8_t*>(args.inpTokenBuf) + tokenId * tokHiddenBytes, tokHiddenBytes);
     }
   }
   if (laneId == 0) {
@@ -335,9 +338,8 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
         index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
         index_t destPe = destTokId / config.MaxNumTokensToSendPerRank();
 
-        TokT* stagingPtr =
-            (destPe != myPe) ? args.shmemCombineInpTokMemObj->template GetAs<TokT*>()
-                             : args.shmemStagingTokMemObj->template GetAs<TokT*>();
+        TokT* stagingPtr = (destPe != myPe) ? args.shmemCombineInpTokMemObj->template GetAs<TokT*>()
+                                            : args.shmemStagingTokMemObj->template GetAs<TokT*>();
         if (destPe < npes) {
           srcPtrs[j] = stagingPtr + destTokId * config.hiddenDim + hiddenDimOffset;
         } else {
@@ -345,12 +347,12 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
         }
       }
 
-      T* outPtr = args.shmemCombineOutTokMemObj->template GetAs<T*>() +
-                  tokenId * config.hiddenDim + hiddenDimOffset;
+      T* outPtr = args.shmemCombineOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim +
+                  hiddenDimOffset;
       if constexpr (UseFp8DirectCast) {
-        core::WarpAccumCombineInternalFp8ToBf16(
-            outPtr, reinterpret_cast<const TokT* const*>(srcPtrs), config.numExpertPerToken, laneId,
-            hiddenDimSize);
+        core::WarpAccumCombineInternalFp8ToBf16(outPtr,
+                                                reinterpret_cast<const TokT* const*>(srcPtrs),
+                                                config.numExpertPerToken, laneId, hiddenDimSize);
       } else {
         core::WarpAccum<T, 4>(outPtr, srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
       }
@@ -391,29 +393,27 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
 #endif
 
 // Macro to instantiate async kernels for all data types
-#define INSTANTIATE_ASYNC_KERNEL(KernelName)                                                \
-  template __global__ void KernelName<hip_bfloat16>(EpDispatchCombineArgs<hip_bfloat16>    \
-                                                         args);                              \
-  MORI_FP8_FNUZ(template __global__ void KernelName<__hip_fp8_e4m3_fnuz>(                   \
-                    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)                      \
-  MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3>(                         \
-                   EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                            \
-  template __global__ void KernelName<mori_fp4x2_e2m1>(EpDispatchCombineArgs<mori_fp4x2_e2m1> \
-                                                            args);                           \
+#define INSTANTIATE_ASYNC_KERNEL(KernelName)                                                   \
+  template __global__ void KernelName<hip_bfloat16>(EpDispatchCombineArgs<hip_bfloat16> args); \
+  MORI_FP8_FNUZ(template __global__ void KernelName<__hip_fp8_e4m3_fnuz>(                      \
+                    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)                         \
+  MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3>(                            \
+                   EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                               \
+  template __global__ void KernelName<mori_fp4x2_e2m1>(                                        \
+      EpDispatchCombineArgs<mori_fp4x2_e2m1> args);                                            \
   template __global__ void KernelName<float>(EpDispatchCombineArgs<float> args);
 
 // Macro to instantiate async combine kernels (includes optional bf16->fp8 direct-cast path)
-#define INSTANTIATE_ASYNC_COMBINE_KERNEL(KernelName)                                        \
-  template __global__ void KernelName<hip_bfloat16>(EpDispatchCombineArgs<hip_bfloat16>    \
-                                                         args);                              \
-  MORI_FP8_ANY(template __global__ void KernelName<hip_bfloat16, true>(                     \
-                   EpDispatchCombineArgs<hip_bfloat16> args);)                              \
-  MORI_FP8_FNUZ(template __global__ void KernelName<__hip_fp8_e4m3_fnuz>(                   \
-                    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)                      \
-  MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3>(                         \
-                   EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                            \
-  template __global__ void KernelName<mori_fp4x2_e2m1>(EpDispatchCombineArgs<mori_fp4x2_e2m1> \
-                                                            args);                           \
+#define INSTANTIATE_ASYNC_COMBINE_KERNEL(KernelName)                                           \
+  template __global__ void KernelName<hip_bfloat16>(EpDispatchCombineArgs<hip_bfloat16> args); \
+  MORI_FP8_ANY(template __global__ void KernelName<hip_bfloat16, true>(                        \
+                   EpDispatchCombineArgs<hip_bfloat16> args);)                                 \
+  MORI_FP8_FNUZ(template __global__ void KernelName<__hip_fp8_e4m3_fnuz>(                      \
+                    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)                         \
+  MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3>(                            \
+                   EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                               \
+  template __global__ void KernelName<mori_fp4x2_e2m1>(                                        \
+      EpDispatchCombineArgs<mori_fp4x2_e2m1> args);                                            \
   template __global__ void KernelName<float>(EpDispatchCombineArgs<float> args);
 
 INSTANTIATE_ASYNC_KERNEL(EpDispatchLowLatencyAsyncSend)

@@ -52,7 +52,7 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SD
   HSAuint64* expectedSignals = dest->expectSignalsPtr + pe * dest->sdmaNumQueue;
 
   core::SdmaPutThread(srcPtr, dstPtr, bytes, devicehandles, signals, expectedSignals,
-                      dest->sdmaNumQueue);
+                      dest->sdmaNumQueue, qpId);
 }
 
 template <>
@@ -104,7 +104,7 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SD
   HSAuint64* expectedSignals = heapObj->expectSignalsPtr + pe * heapObj->sdmaNumQueue;
 
   core::SdmaPutThread(srcPtr, dstPtr, bytes, devicehandles, signals, expectedSignals,
-                      heapObj->sdmaNumQueue);
+                      heapObj->sdmaNumQueue, qpId);
 }
 
 template <>
@@ -142,20 +142,31 @@ inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::SDM
 template <>
 inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe,
-    int qpId) {}
+    int qpId) {
+  return ShmemPutSizeImmNbiThreadKernel<application::TransportType::P2P>(dest, destOffset, val,
+                                                                         bytes, pe, qpId);
+}
 template <>
 inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe,
-    int qpId) {}
+    int qpId) {
+  return ShmemPutSizeImmNbiWarpKernel<application::TransportType::P2P>(dest, destOffset, val, bytes,
+                                                                       pe, qpId);
+}
 
 // Pure address-based PutSizeImmNbi versions
 template <>
 inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::SDMA>(
-    const void* dest, void* val, size_t bytes, int pe, int qpId) {}
+    const void* dest, void* val, size_t bytes, int pe, int qpId) {
+  return ShmemPutSizeImmNbiThreadKernel<application::TransportType::P2P>(dest, val, bytes, pe,
+                                                                         qpId);
+}
 
 template <>
 inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::SDMA>(
-    const void* dest, void* val, size_t bytes, int pe, int qpId) {}
+    const void* dest, void* val, size_t bytes, int pe, int qpId) {
+  return ShmemPutSizeImmNbiWarpKernel<application::TransportType::P2P>(dest, val, bytes, pe, qpId);
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    PutMemNbi with Signal                                       */
