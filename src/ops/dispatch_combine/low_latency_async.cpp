@@ -109,9 +109,10 @@ template <typename T>
 __global__ void EpDispatchLowLatencyAsyncSendTransfer(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
-    for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
+    int numQp = (destPe / config.gpuPerNode == myNode) ? 1 : config.numQpPerPe;
+    for (int qpId = warpId; qpId < numQp; qpId += warpNum) {
       int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
-      int tokenChunkNum = core::CeilDiv(tokenNum, config.numQpPerPe);
+      int tokenChunkNum = core::CeilDiv(tokenNum, numQp);
       int thisChunkTokenNum = std::min(tokenChunkNum, tokenNum - qpId * tokenChunkNum);
       size_t remoteOffset =
           (config.MaxNumTokensToSendPerRank() * myPe + tokenChunkNum * qpId) * xferBytes;
@@ -142,12 +143,14 @@ __global__ void EpDispatchLowLatencyAsyncRecvTransfer(EpDispatchCombineArgs<T> a
   DEF_COMMON_VARS;
 
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
-    for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
+    int numQp = (destPe / config.gpuPerNode == myNode) ? 1 : config.numQpPerPe;
+    for (int qpId = warpId; qpId < numQp; qpId += warpNum) {
       if (laneId == 0) {
-        // TODO: use different quiet func for SDMDA/RDMA and P2P
-        // shmem::ShmemQuietThread(destPe, qpId);
-        shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
-            destPe, args.shmemDispatchInpTokMemObj);
+        if ((destPe / config.gpuPerNode) == myNode)
+          shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
+              destPe, args.shmemDispatchInpTokMemObj);
+        else
+          shmem::ShmemQuietThread(destPe, qpId);
         int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
         shmem::ShmemPutUint64ImmNbiThread(args.recvTokenNumMemObj,
                                           (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
@@ -159,7 +162,8 @@ __global__ void EpDispatchLowLatencyAsyncRecvTransfer(EpDispatchCombineArgs<T> a
   // Polling recv token number signal
   uint64_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint64_t*>();
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
-    if (laneId < config.numQpPerPe) {
+    int numQp = (destPe / config.gpuPerNode == myNode) ? 1 : config.numQpPerPe;
+    if (laneId < numQp) {
       shmem::ShmemUint64WaitUntilGreaterThan(recvTokenNums + destPe * config.numQpPerPe + laneId,
                                              0);
     }
@@ -313,7 +317,8 @@ __global__ void EpCombineLowLatencyAsyncSendTransfer(EpDispatchCombineArgs<T> ar
 
   uint64_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint64_t*>();
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
-    for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
+    int numQp = (destPe / config.gpuPerNode == myNode) ? 1 : config.numQpPerPe;
+    for (int qpId = warpId; qpId < numQp; qpId += warpNum) {
       int tokenNum = 0;
       if (laneId == 0) {
         tokenNum = recvTokenNums[destPe * config.numQpPerPe + qpId];
@@ -321,7 +326,7 @@ __global__ void EpCombineLowLatencyAsyncSendTransfer(EpDispatchCombineArgs<T> ar
                                        uint64_t{0});
       }
       tokenNum = __shfl(tokenNum, 0);
-      int tokenChunkNum = core::CeilDiv(tokenNum, config.numQpPerPe);
+      int tokenChunkNum = core::CeilDiv(tokenNum, numQp);
       int thisChunkTokenNum = std::min(tokenChunkNum, tokenNum - qpId * tokenChunkNum);
       size_t remoteOffset =
           (config.MaxNumTokensToSendPerRank() * myPe + tokenChunkNum * qpId) * tokHiddenBytes;
@@ -353,11 +358,14 @@ __global__ void EpCombineLowLatencyAsyncRecvTransfer(EpDispatchCombineArgs<T> ar
   (void)sizeof(TokT);
 
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
-    for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
+    int numQp = (destPe / config.gpuPerNode == myNode) ? 1 : config.numQpPerPe;
+    for (int qpId = warpId; qpId < numQp; qpId += warpNum) {
       if (laneId == 0) {
-        // shmem::ShmemQuietThread(destPe, qpId);
-        shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
-            destPe, args.shmemCombineInpTokMemObj);
+        if ((destPe / config.gpuPerNode) == myNode)
+          shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
+              destPe, args.shmemDispatchInpTokMemObj);
+        else
+          shmem::ShmemQuietThread(destPe, qpId);
         uint64_t flag = args.crossDeviceBarrierFlag[0];
         shmem::ShmemPutUint64ImmNbiThread(args.crossDeviceBarrierMemObj,
                                           (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
@@ -368,7 +376,8 @@ __global__ void EpCombineLowLatencyAsyncRecvTransfer(EpDispatchCombineArgs<T> ar
 
   for (int destPe = laneId; destPe < npes; destPe += warpSize) {
     uint64_t barrierFlag = args.crossDeviceBarrierFlag[0];
-    for (int i = 0; i < config.numQpPerPe; i++) {
+    int numQp = (destPe / config.gpuPerNode == myNode) ? 1 : config.numQpPerPe;
+    for (int i = 0; i < numQp; i++) {
       shmem::ShmemUint64WaitUntilEquals(args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>() +
                                             destPe * config.numQpPerPe + i,
                                         barrierFlag);

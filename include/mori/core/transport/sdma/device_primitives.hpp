@@ -58,6 +58,9 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
   HSAuint64* signal = signals + qId;
   auto packet_s = anvil::CreateAtomicIncPacket(signal);
   handle.template placePacket<SDMA_PKT_ATOMIC>(packet_s, pendingWptr, offset);
+
+  handle.submitPacket(startBase, pendingWptr);
+  expectedSignals[qId]++;
 }
 
 inline __device__ void SdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
