@@ -93,17 +93,17 @@ __global__ void ShmemAllReduceKernel(
     HSAuint64* sig = gatherObj->signalPtrs + destPe * gatherObj->sdmaNumQueue;
     HSAuint64* esig = gatherObj->expectSignalsPtr + destPe * gatherObj->sdmaNumQueue;
 
-    core::SdmaPutThread(srcPtr, dstPtr, chunkBytes, dh, sig, esig, gatherObj->sdmaNumQueue, 0);
+    mori::core::SdmaPutThread(srcPtr, dstPtr, chunkBytes, dh, sig, esig, gatherObj->sdmaNumQueue, 0);
   }
 
   if (blockIdx.x == 0 && warpId < npes && laneId == 0) {
     int destPe = warpId;
-    ShmemQuietThread(destPe, gatherObj);
+    shmem::ShmemQuietThread(destPe, gatherObj);
 
     uint64_t flag_val = 1;
-    ShmemAtomicSizeNonFetchThread(flagsObj,
+    shmem::ShmemAtomicSizeNonFetchThread(flagsObj,
         static_cast<size_t>(myPe) * sizeof(uint64_t),
-        &flag_val, 8, atomicType::AMO_ADD, destPe);
+        &flag_val, 8, mori::core::atomicType::AMO_ADD, destPe);
   }
 
   if (blockIdx.x == 0) {
@@ -111,7 +111,7 @@ __global__ void ShmemAllReduceKernel(
     for (int sender = 0; sender < npes; ++sender) {
       if (sender == myPe) continue;
       if (threadIdx.x == 0) {
-        while (AtomicLoadRelaxed(flags + sender) == 0) {}
+        while (mori::core::AtomicLoadRelaxed(flags + sender) == 0) {}
       }
       __syncthreads();
     }
@@ -163,17 +163,17 @@ __global__ void ShmemAllReduceKernel(
     HSAuint64* sig = gatherObj->signalPtrs + destPe * gatherObj->sdmaNumQueue;
     HSAuint64* esig = gatherObj->expectSignalsPtr + destPe * gatherObj->sdmaNumQueue;
 
-    core::SdmaPutThread(srcPtr, dstPtr, chunkBytes, dh, sig, esig, gatherObj->sdmaNumQueue, 0);
+    mori::core::SdmaPutThread(srcPtr, dstPtr, chunkBytes, dh, sig, esig, gatherObj->sdmaNumQueue, 0);
   }
 
   if (blockIdx.x == 0 && warpId < npes && laneId == 0) {
     int destPe = warpId;
-    ShmemQuietThread(destPe, gatherObj);
+    shmem::ShmemQuietThread(destPe, gatherObj);
 
     uint64_t flag_val = 1;
-    ShmemAtomicSizeNonFetchThread(flagsObj,
+    shmem::ShmemAtomicSizeNonFetchThread(flagsObj,
         static_cast<size_t>(myPe) * sizeof(uint64_t),
-        &flag_val, 8, atomicType::AMO_ADD, destPe);
+        &flag_val, 8, mori::core::atomicType::AMO_ADD, destPe);
   }
 
   // =========================================================================
@@ -184,7 +184,7 @@ __global__ void ShmemAllReduceKernel(
     for (int sender = 0; sender < npes; ++sender) {
       if (sender == myPe) continue;
       if (threadIdx.x == 0) {
-        while (AtomicLoadRelaxed(flags + sender) == 0) {}
+        while (mori::core::AtomicLoadRelaxed(flags + sender) == 0) {}
       }
       __syncthreads();
     }
