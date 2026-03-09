@@ -39,6 +39,7 @@
 
 #include "mori/application/utils/check.hpp"
 #include "mori/shmem/shmem.hpp"
+#include "mori/core/transport/rdma/device_primitives.hpp"
 
 using namespace mori::core;
 using namespace mori::application;
@@ -75,13 +76,23 @@ __global__ void ShmemAllReduceKernel(
 
   // =========================================================================
   // Phase 1: Scatter — block 0, each warp's lane 0 sends one shard
+  // Uses core::SdmaPutThread directly (ShmemPutMemNbiThread requires RDMA
+  // registration which may not be available on all machines).
   // =========================================================================
   if (blockIdx.x == 0 && warpId < npes && laneId == 0) {
     int destPe = warpId;
     size_t srcOffset = static_cast<size_t>(destPe) * chunkBytes;
     size_t dstOffset = static_cast<size_t>(myPe) * chunkBytes;
 
-    ShmemPutMemNbiThread(gatherObj, dstOffset, gatherObj, srcOffset, chunkBytes, destPe);
+    uint8_t* srcPtr = reinterpret_cast<uint8_t*>(gatherObj->localPtr) + srcOffset;
+    uint8_t* dstPtr = reinterpret_cast<uint8_t*>(gatherObj->peerPtrs[destPe]) + dstOffset;
+
+    anvil::SdmaQueueDeviceHandle** dh =
+        gatherObj->deviceHandles_d + destPe * gatherObj->sdmaNumQueue;
+    HSAuint64* sig = gatherObj->signalPtrs + destPe * gatherObj->sdmaNumQueue;
+    HSAuint64* esig = gatherObj->expectSignalsPtr + destPe * gatherObj->sdmaNumQueue;
+
+    core::SdmaPutThread(srcPtr, dstPtr, chunkBytes, dh, sig, esig, gatherObj->sdmaNumQueue, 0);
   }
 
   if (blockIdx.x == 0 && warpId < npes && laneId == 0) {
@@ -143,7 +154,15 @@ __global__ void ShmemAllReduceKernel(
     int destPe = warpId;
     size_t offset = static_cast<size_t>(myPe) * chunkBytes;
 
-    ShmemPutMemNbiThread(gatherObj, offset, gatherObj, offset, chunkBytes, destPe);
+    uint8_t* srcPtr = reinterpret_cast<uint8_t*>(gatherObj->localPtr) + offset;
+    uint8_t* dstPtr = reinterpret_cast<uint8_t*>(gatherObj->peerPtrs[destPe]) + offset;
+
+    anvil::SdmaQueueDeviceHandle** dh =
+        gatherObj->deviceHandles_d + destPe * gatherObj->sdmaNumQueue;
+    HSAuint64* sig = gatherObj->signalPtrs + destPe * gatherObj->sdmaNumQueue;
+    HSAuint64* esig = gatherObj->expectSignalsPtr + destPe * gatherObj->sdmaNumQueue;
+
+    core::SdmaPutThread(srcPtr, dstPtr, chunkBytes, dh, sig, esig, gatherObj->sdmaNumQueue, 0);
   }
 
   if (blockIdx.x == 0 && warpId < npes && laneId == 0) {
