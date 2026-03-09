@@ -112,10 +112,12 @@ __global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
           (config.MaxNumTokensToSendPerRank() * myPe + tokenChunkNum * qpId) * xferBytes;
       size_t localOffset =
           (config.MaxNumTokensToSendPerRank() * destPe + tokenChunkNum * qpId) * xferBytes;
-      if (destPe != myPe)
-        shmem::ShmemPutMemNbiWarp(args.shmemDispatchInpTokMemObj, remoteOffset,
-                                  args.shmemStagingTokMemObj, localOffset,
-                                  thisChunkTokenNum * xferBytes, destPe, qpId);
+
+      if ((destPe != myPe) && (laneId == 0)) {
+        shmem::ShmemPutMemNbiThread(args.shmemDispatchInpTokMemObj, remoteOffset,
+                                    args.shmemStagingTokMemObj, localOffset,
+                                    thisChunkTokenNum * xferBytes, destPe, qpId);
+      }
       // TODO(ditian12): index value is wrong if signal completion here, investigate the reason
       // shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
       //     args.recvTokenNumMemObj, (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
@@ -142,9 +144,9 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       if (laneId == 0) {
         // TODO: use different quiet func for SDMDA/RDMA and P2P
-        // shmem::ShmemQuietThread(destPe, qpId);
-        shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
-            destPe, args.shmemDispatchInpTokMemObj);
+        shmem::ShmemQuietThread(destPe, qpId);
+        // shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
+        //     destPe, args.shmemDispatchInpTokMemObj);
         int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
         // TODO(ditian12): send atomic op right after quiet lead to hang issue, need to investigate
         // shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
@@ -275,10 +277,10 @@ __global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
           (config.MaxNumTokensToSendPerRank() * myPe + tokenChunkNum * qpId) * tokHiddenBytes;
       size_t localOffset =
           (config.MaxNumTokensToSendPerRank() * destPe + tokenChunkNum * qpId) * tokHiddenBytes;
-      if (destPe != myPe)
-        shmem::ShmemPutMemNbiWarp(args.shmemCombineInpTokMemObj, remoteOffset,
-                                  args.shmemStagingTokMemObj, localOffset,
-                                  thisChunkTokenNum * tokHiddenBytes, destPe, qpId);
+      if ((destPe != myPe) && (laneId == 0))
+        shmem::ShmemPutMemNbiThread(args.shmemCombineInpTokMemObj, remoteOffset,
+                                    args.shmemStagingTokMemObj, localOffset,
+                                    thisChunkTokenNum * tokHiddenBytes, destPe, qpId);
       // if (laneId == 0)
       // shmem::ShmemQuietThread(destPe, qpId);
       // shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
