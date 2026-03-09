@@ -98,10 +98,10 @@ __global__ void ShmemAllReduceKernel(
 
   if (blockIdx.x == 0 && warpId < npes && laneId == 0) {
     int destPe = warpId;
-    shmem::ShmemQuietThread(destPe, gatherObj);
+    mori::shmem::ShmemQuietThread(destPe, gatherObj);
 
     uint64_t flag_val = 1;
-    shmem::ShmemAtomicSizeNonFetchThread(flagsObj,
+    mori::shmem::ShmemAtomicSizeNonFetchThread(flagsObj,
         static_cast<size_t>(myPe) * sizeof(uint64_t),
         &flag_val, 8, mori::core::atomicType::AMO_ADD, destPe);
   }
@@ -168,10 +168,10 @@ __global__ void ShmemAllReduceKernel(
 
   if (blockIdx.x == 0 && warpId < npes && laneId == 0) {
     int destPe = warpId;
-    shmem::ShmemQuietThread(destPe, gatherObj);
+    mori::shmem::ShmemQuietThread(destPe, gatherObj);
 
     uint64_t flag_val = 1;
-    shmem::ShmemAtomicSizeNonFetchThread(flagsObj,
+    mori::shmem::ShmemAtomicSizeNonFetchThread(flagsObj,
         static_cast<size_t>(myPe) * sizeof(uint64_t),
         &flag_val, 8, mori::core::atomicType::AMO_ADD, destPe);
   }
