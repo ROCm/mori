@@ -721,39 +721,26 @@ void RegisterMoriCcl(pybind11::module_& m) {
                 if (!output_tensor.is_cuda()) {
                     throw std::runtime_error("Output tensor must be CUDA tensor");
                 }
-                // C++ class uses uint32_t template
-                // Accept uint32 or int32 (same memory layout)
-                uint32_t* input_ptr = nullptr;
-                uint32_t* output_ptr = nullptr;
-                
-                if (input_tensor.scalar_type() == torch::kUInt32) {
-                    input_ptr = input_tensor.data_ptr<uint32_t>();
-                } else if (input_tensor.scalar_type() == torch::kInt32) {
-                    input_ptr = reinterpret_cast<uint32_t*>(input_tensor.data_ptr<int32_t>());
-                } else {
-                    throw std::runtime_error("Input tensor must be uint32 or int32");
-                }
-                
-                if (output_tensor.scalar_type() == torch::kUInt32) {
-                    output_ptr = output_tensor.data_ptr<uint32_t>();
-                } else if (output_tensor.scalar_type() == torch::kInt32) {
-                    output_ptr = reinterpret_cast<uint32_t*>(output_tensor.data_ptr<int32_t>());
-                } else {
-                    throw std::runtime_error("Output tensor must be uint32 or int32");
-                }
+                // AllGather is pure byte-copy (SDMA), no arithmetic on data.
+                // Accept any dtype — reinterpret as uint32_t* for the C++ API.
+                // count is in *elements* of the original dtype; convert to
+                // uint32-equivalent count so the kernel copies the right bytes.
+                size_t byte_count = count * input_tensor.element_size();
+                size_t u32_count = (byte_count + sizeof(uint32_t) - 1) / sizeof(uint32_t);
 
-                // Get device index from input tensor and convert stream
-                // If stream_obj is None, this will use the current CUDA stream (supports torch.cuda.stream() context)
+                uint32_t* input_ptr = reinterpret_cast<uint32_t*>(input_tensor.data_ptr());
+                uint32_t* output_ptr = reinterpret_cast<uint32_t*>(output_tensor.data_ptr());
+
                 int device_index = input_tensor.device().index();
                 hipStream_t stream = convert_torch_stream_to_hip(stream_obj, device_index);
 
-                return self(input_ptr, output_ptr, count, stream);
+                return self(input_ptr, output_ptr, u32_count, stream);
             },
             py::arg("input"),
             py::arg("output"),
             py::arg("count"),
             py::arg("stream") = py::none(),
-            "Execute Allgather SDMA operation (returns bool), synchronization must be done by caller")
+            "Execute Allgather SDMA operation (any dtype), synchronization must be done by caller")
         .def("start_async",
             [](mori::collective::AllgatherSdma<uint32_t>& self,
                const torch::Tensor& input_tensor,
@@ -773,33 +760,17 @@ void RegisterMoriCcl(pybind11::module_& m) {
                 if (!output_tensor.is_cuda()) {
                     throw std::runtime_error("Output tensor must be CUDA tensor");
                 }
-                // C++ class uses uint32_t template
-                // Accept uint32 or int32 (same memory layout)
-                uint32_t* input_ptr = nullptr;
-                uint32_t* output_ptr = nullptr;
-                
-                if (input_tensor.scalar_type() == torch::kUInt32) {
-                    input_ptr = input_tensor.data_ptr<uint32_t>();
-                } else if (input_tensor.scalar_type() == torch::kInt32) {
-                    input_ptr = reinterpret_cast<uint32_t*>(input_tensor.data_ptr<int32_t>());
-                } else {
-                    throw std::runtime_error("Input tensor must be uint32 or int32");
-                }
-                
-                if (output_tensor.scalar_type() == torch::kUInt32) {
-                    output_ptr = output_tensor.data_ptr<uint32_t>();
-                } else if (output_tensor.scalar_type() == torch::kInt32) {
-                    output_ptr = reinterpret_cast<uint32_t*>(output_tensor.data_ptr<int32_t>());
-                } else {
-                    throw std::runtime_error("Output tensor must be uint32 or int32");
-                }
 
-                // Get device index from input tensor and convert stream
-                // If stream_obj is None, this will use the current CUDA stream (supports torch.cuda.stream() context)
+                size_t byte_count = count * input_tensor.element_size();
+                size_t u32_count = (byte_count + sizeof(uint32_t) - 1) / sizeof(uint32_t);
+
+                uint32_t* input_ptr = reinterpret_cast<uint32_t*>(input_tensor.data_ptr());
+                uint32_t* output_ptr = reinterpret_cast<uint32_t*>(output_tensor.data_ptr());
+
                 int device_index = input_tensor.device().index();
                 hipStream_t stream = convert_torch_stream_to_hip(stream_obj, device_index);
 
-                return self.start_async(input_ptr, output_ptr, count, stream);
+                return self.start_async(input_ptr, output_ptr, u32_count, stream);
             },
             py::arg("input"),
             py::arg("output"),
@@ -828,35 +799,36 @@ void RegisterMoriCcl(pybind11::module_& m) {
             &mori::collective::AllgatherSdma<uint32_t>::resetFlags,
             "Reset synchronization flags")
         .def("get_output_transit_buffer",
-            [](mori::collective::AllgatherSdma<uint32_t>& self, py::object device_obj) -> torch::Tensor {
+            [](mori::collective::AllgatherSdma<uint32_t>& self,
+               py::object device_obj,
+               py::object dtype_obj) -> torch::Tensor {
                 void* buffer_ptr = self.getOutputTransitBuffer();
                 size_t buffer_size = self.getOutputTransitBufferSize();
-                
+
                 if (buffer_ptr == nullptr) {
                     throw std::runtime_error("Output transit buffer is null");
                 }
-                
-                // Convert buffer size from bytes to number of uint32_t elements
-                size_t num_elements = buffer_size / sizeof(uint32_t);
-                
-                // Determine device index
+
+                // Determine torch dtype (default uint32)
+                torch::Dtype torch_dtype = torch::kUInt32;
+                if (!dtype_obj.is_none()) {
+                    torch_dtype = py::cast<torch::Dtype>(dtype_obj);
+                }
+                size_t elem_size = torch::elementSize(torch_dtype);
+                size_t num_elements = buffer_size / elem_size;
+
                 int device_index = 0;
                 if (!device_obj.is_none()) {
-                    // Check if it's a PyTorch tensor using Python isinstance
                     py::object torch_module = py::module_::import("torch");
                     py::object tensor_class = torch_module.attr("Tensor");
-                    bool is_tensor = py::isinstance(device_obj, tensor_class);
-                    
-                    if (is_tensor) {
-                        // It's a tensor, cast and get device
-                        torch::Tensor tensor = device_obj.cast<torch::Tensor>();
-                        if (tensor.is_cuda()) {
-                            device_index = tensor.device().index();
+                    if (py::isinstance(device_obj, tensor_class)) {
+                        torch::Tensor t = device_obj.cast<torch::Tensor>();
+                        if (t.is_cuda()) {
+                            device_index = t.device().index();
                         } else {
                             throw std::runtime_error("device tensor must be a CUDA tensor");
                         }
                     } else {
-                        // Try to cast as int
                         try {
                             device_index = device_obj.cast<int>();
                         } catch (const py::cast_error&) {
@@ -864,22 +836,18 @@ void RegisterMoriCcl(pybind11::module_& m) {
                         }
                     }
                 } else {
-                    // Default to current device
                     device_index = at::cuda::current_device();
                 }
-                
-                // Create a tensor from the buffer
-                // Note: The buffer is on GPU (CUDA), so we use torch::kCUDA device
-                torch::Tensor tensor = torch::from_blob(
+
+                return torch::from_blob(
                     buffer_ptr,
                     {static_cast<int64_t>(num_elements)},
-                    torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCUDA, device_index)
+                    torch::TensorOptions().dtype(torch_dtype).device(torch::kCUDA, device_index)
                 );
-                
-                return tensor;
             },
             py::arg("device") = py::none(),
-            "Get output transit buffer as a PyTorch tensor");
+            py::arg("dtype") = py::none(),
+            "Get output transit buffer as a PyTorch tensor (specify dtype for non-uint32 types)");
 
     // Keep old function-based interface for backward compatibility (optional)
     m.def("allgather_sdma",

@@ -174,9 +174,9 @@ class AllgatherSdma:
         """Execute AllGATHER SDMA operation.
         
         Args:
-            input_data: Input CUDA tensor (torch.int32, 1D, GPU memory)
-            output_data: Output CUDA tensor (torch.int32, 1D, GPU memory)
-            count: Number of elements per PE
+            input_data: Input CUDA tensor (any dtype, 1D, GPU memory)
+            output_data: Output CUDA tensor (same dtype as input, 1D, GPU memory)
+            count: Number of elements per PE (in the original dtype)
             stream: Optional HIP stream
             
         Returns:
@@ -228,23 +228,18 @@ class AllgatherSdma:
         """Reset synchronization flags"""
         self._handle.reset_flags()
 
-    def get_output_transit_buffer(self, device=None):
+    def get_output_transit_buffer(self, device=None, dtype=None):
         """Get output transit buffer as a PyTorch tensor.
         
         Args:
-            device: Optional device specification. Can be:
-                - An int: device index (e.g., 0, 1)
-                - A CUDA tensor: uses the device of that tensor
-                - None: uses the current CUDA device
+            device: Optional device specification (int or CUDA tensor or None).
+            dtype: Optional torch.dtype for the returned tensor view.
+                   If None, defaults to torch.uint32 (raw bytes).
         
         Returns:
-            torch.Tensor: Output transit buffer as a CUDA tensor (uint32, 1D)
-            
-        Note:
-            The tensor is a view of the internal buffer. Do not modify the buffer
-            while an async operation is in progress.
+            torch.Tensor: Output transit buffer as a CUDA tensor (1D)
         """
-        return self._handle.get_output_transit_buffer(device)
+        return self._handle.get_output_transit_buffer(device, dtype)
 
 
 def _cpp_allreduce_factory(entity_name: str):
