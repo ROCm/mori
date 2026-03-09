@@ -177,7 +177,7 @@ __global__ void AllGatherAsyncWaitKernel(int myPe, int npes,
   // SDMA AllGather writes bypass L2/L1, so flush caches to force re-fetch.
   __threadfence_system();
   if (threadIdx.x == 0) {
-    asm volatile("buffer_wbinvl1_vol" ::: "memory");
+    //asm volatile("buffer_wbinvl1_vol" ::: "memory");
   }
   __syncthreads();
 }
