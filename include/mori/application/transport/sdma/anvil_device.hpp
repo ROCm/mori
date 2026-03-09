@@ -71,14 +71,14 @@ __device__ __forceinline__ SDMA_PKT_FENCE CreateFencePacket(HSAuint64* address, 
 __device__ __forceinline__ bool waitForSignal(HSAuint64* addr, uint64_t expected)
 {
    int retries = 0;
+
    while (true)
    {
-      uint64_t value = __hip_atomic_load(addr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+      uint64_t value = __hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       if (value == expected)
       {
          return true;
       }
-      __builtin_amdgcn_s_sleep(1);
       if constexpr (BREAK_ON_RETRIES)
       {
          if (retries++ == MAX_RETRIES)
@@ -110,31 +110,7 @@ struct SdmaQueueDeviceHandle
       __atomic_signal_fence(__ATOMIC_SEQ_CST);
       return (uptoIndex - cachedHwReadIndex) < queue_size_in_bytes;
    }
-   #if 0
-   __device__ __forceinline__ void PadRingToEnd(uint64_t cur_index)
-   {
-      const uint64_t queue_size_in_bytes = SDMA_QUEUE_SIZE;
-      uint64_t new_index = cur_index + (queue_size_in_bytes - WrapIntoRing(cur_index));
 
-      if (!CanWriteUpto(new_index))
-      {
-         return;
-      }
-
-      if (nontemporal_compare_exchange(cachedWptr, cur_index, new_index))
-      {
-         uint64_t index_in_dwords = WrapIntoRing(cur_index) / sizeof(uint32_t);
-         int nDwords = (new_index - cur_index) / sizeof(uint32_t);
-
-         for (int i = 0; i < nDwords; i++)
-         {
-            queueBuf[index_in_dwords + i] = (uint32_t)0;
-         }
-
-         submitPacket(cur_index, new_index);
-      }
-   }
-   #endif
    __device__ __forceinline__ uint64_t ReserveQueueSpace(const size_t size_in_bytes, uint64_t& offset)
    {
       const uint64_t queue_size_in_bytes = SDMA_QUEUE_SIZE;
@@ -160,12 +136,12 @@ struct SdmaQueueDeviceHandle
          {
             if (__hip_atomic_compare_exchange_strong(cachedWptr, &cur_index, new_index, __ATOMIC_RELAXED,
                                                      __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT))
-            // if (nontemporal_compare_exchange(cachedWptr, expected, new_index))
+            // Used to perform more consistent under contention, with updated submit function this seems less pronounced
+            // if (nontemporal_compare_exchange(cachedWptr, cur_index, new_index))
             {
                break;
             }
          }
-         __builtin_amdgcn_s_sleep(1);
          if constexpr (BREAK_ON_RETRIES)
          {
             if (retries++ == MAX_RETRIES)
@@ -192,7 +168,15 @@ struct SdmaQueueDeviceHandle
 
       for (int i = 0; i < numOffsetDwords; i++)
       {
-         __hip_atomic_store(queueBuf + base_index_in_dwords + i, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+         if (i == 0)
+         {
+            __hip_atomic_store(queueBuf + base_index_in_dwords + i, (((numOffsetDwords - 1) & 0xFFFF) << 16),
+                               __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+         }
+         else
+         {
+            __hip_atomic_store(queueBuf + base_index_in_dwords + i, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+         }
       }
       pendingWptr += offset;
       base_index_in_dwords = WrapIntoRing(pendingWptr) / sizeof(uint32_t);
@@ -216,7 +200,6 @@ struct SdmaQueueDeviceHandle
          {
             break;
          }
-         __builtin_amdgcn_s_sleep(1);
 
          if constexpr (BREAK_ON_RETRIES)
          {
@@ -246,7 +229,6 @@ struct SdmaQueueDeviceHandle
       // Ensure no re-ordering (not part of assembly)
       __atomic_signal_fence(__ATOMIC_SEQ_CST);
 
-      // TODO agent should be sufficient
       __hip_atomic_store(doorbell, pendingWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 
       // Ensure no re-ordering (not part of assembly)
@@ -254,13 +236,7 @@ struct SdmaQueueDeviceHandle
       __builtin_amdgcn_wave_barrier();
       __atomic_signal_fence(__ATOMIC_SEQ_CST);
       __hip_atomic_store(committedWptr, pendingWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-
-      // TODO why is this needed?
-      __builtin_amdgcn_s_waitcnt(0);
-      __builtin_amdgcn_wave_barrier();
-      __atomic_signal_fence(__ATOMIC_SEQ_CST);
    }
-
 
    // Queue resources
    uint32_t* queueBuf;
@@ -288,7 +264,6 @@ struct SdmaQueueDeviceHandle
 
 struct SdmaQueueSingleProducerDeviceHandle : SdmaQueueDeviceHandle
 {
-   #if 0
    __device__ __forceinline__ void PadRingToEnd(uint64_t cur_index)
    {
       const uint64_t queue_size_in_bytes = SDMA_QUEUE_SIZE;
@@ -312,81 +287,38 @@ struct SdmaQueueSingleProducerDeviceHandle : SdmaQueueDeviceHandle
 
       submitPacket(cur_index, new_index);
    }
-   #endif
-   __device__ __forceinline__ uint64_t ReserveQueueSpace(const size_t size_in_bytes, uint64_t& offset)
-   {
-      const uint64_t queue_size_in_bytes = SDMA_QUEUE_SIZE;
 
+   __device__ __forceinline__ uint64_t ReserveQueueSpace(const size_t size_in_bytes)
+   {
+      const uint32_t queue_size_in_bytes = SDMA_QUEUE_SIZE;
       uint64_t cur_index;
-      int retries = 0;
 
       while (true)
       {
-         cur_index = __hip_atomic_load(cachedWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-         offset = 0;
+         cur_index = *cachedWptr;
+         uint64_t new_index = cur_index + size_in_bytes;
 
          // Wraparound and Pad NOPs on remaining bytes
          if (WrapIntoRing(cur_index) + size_in_bytes > queue_size_in_bytes)
          {
-            // PadRingToEnd(cur_index);
-            offset = (queue_size_in_bytes - WrapIntoRing(cur_index));
-            // continue;
+            PadRingToEnd(cur_index);
+            continue;
          }
-         uint64_t new_index = cur_index + size_in_bytes + offset;
 
-         if (CanWriteUpto(new_index))
+         if (!CanWriteUpto(new_index))
          {
-            if (__hip_atomic_compare_exchange_strong(cachedWptr, &cur_index, new_index, __ATOMIC_RELAXED,
-                                                     __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT))
-            // if (nontemporal_compare_exchange(cachedWptr, expected, new_index))
-            {
-               break;
-            }
+            continue;
          }
-         __builtin_amdgcn_s_sleep(1);
-         if constexpr (BREAK_ON_RETRIES)
-         {
-            if (retries++ == MAX_RETRIES)
-            {
-               assert(false && "Retry limit exceed on reserve queue space");
-               break;
-            }
-         }
+
+         *cachedWptr = new_index;
+         break;
       }
       return cur_index;
    }
 
    __device__ __forceinline__ void submitPacket(uint64_t base, uint64_t pendingWptr)
    {
-      int retries = 0;
-      while (true)
-      {
-         uint64_t val = __hip_atomic_load(committedWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-         __atomic_signal_fence(__ATOMIC_SEQ_CST);
-         if (val == base)
-         {
-            break;
-         }
-         __builtin_amdgcn_s_sleep(1);
-
-         if constexpr (BREAK_ON_RETRIES)
-         {
-            if (retries++ == MAX_RETRIES)
-            {
-               assert(false && "submitPacket: Retry limit exceeded");
-               break;
-            }
-         }
-      }
-      __builtin_amdgcn_s_waitcnt(0);
-      // This is nop on gfx942
-      __builtin_amdgcn_wave_barrier();
-      // Ensure no re-ordering (not part of assembly)
-      __atomic_signal_fence(__ATOMIC_SEQ_CST);
-
-      // Write to the queue went to fine-grained memory
-      // Use release to flush before we update wptr
-      __hip_atomic_store(wptr, pendingWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      *wptr = (HSAuint64)pendingWptr;
 
       // Ensure all updates are visisble before ringing the doorbell
       // This assumes we write to uncached memory
@@ -397,19 +329,7 @@ struct SdmaQueueSingleProducerDeviceHandle : SdmaQueueDeviceHandle
       // Ensure no re-ordering (not part of assembly)
       __atomic_signal_fence(__ATOMIC_SEQ_CST);
 
-      // TODO agent should be sufficient
-      __hip_atomic_store(doorbell, pendingWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-
-      // Ensure no re-ordering (not part of assembly)
-      __builtin_amdgcn_s_waitcnt(0);
-      __builtin_amdgcn_wave_barrier();
-      __atomic_signal_fence(__ATOMIC_SEQ_CST);
-      __hip_atomic_store(committedWptr, pendingWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-
-      // TODO why is this needed?
-      __builtin_amdgcn_s_waitcnt(0);
-      __builtin_amdgcn_wave_barrier();
-      __atomic_signal_fence(__ATOMIC_SEQ_CST);
+      *doorbell = (HSAuint64)pendingWptr;
    }
 };
 
