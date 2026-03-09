@@ -355,14 +355,14 @@ class EpDispatchCombineOp:
 
         args_ptr = mori_cpp.prepare_and_build_args(
             self._handle,
-            input.data_ptr(),
-            dtype_to_int(input.dtype),
-            input.size(0),
-            _opt_ptr(weights),
-            scale_ptr,
-            indices.data_ptr(),
-            actual_rbn,
-            hidden_dim,
+            inp_ptr=input.data_ptr(),
+            dtype=dtype_to_int(input.dtype),
+            num_tokens=input.size(0),
+            weight_ptr=_opt_ptr(weights),
+            scale_ptr=scale_ptr,
+            indices_ptr=indices.data_ptr(),
+            rdma_block_num=actual_rbn,
+            hidden_dim=hidden_dim,
         )
 
         grid = (actual_bn,)
@@ -468,13 +468,13 @@ class EpDispatchCombineOp:
 
         args_ptr = mori_cpp.prepare_and_build_args(
             self._handle,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
+            inp_ptr=0,
+            dtype=0,
+            num_tokens=0,
+            weight_ptr=0,
+            scale_ptr=0,
+            indices_ptr=0,
+            rdma_block_num=0,
         )
         grid = (actual_bn,)
         block = (WARP_SIZE * actual_wpb,)
@@ -514,15 +514,15 @@ class EpDispatchCombineOp:
 
         args_ptr = mori_cpp.prepare_and_build_args(
             self._handle,
-            input.data_ptr(),
-            dtype_to_int(input.dtype),
-            self._get_cur_rank_num_token(self._handle),
-            weight_ptr,
-            0,
-            indices.data_ptr(),
-            actual_rbn,
-            hidden_dim,
-            use_external_inp_buf,
+            inp_ptr=input.data_ptr(),
+            dtype=dtype_to_int(input.dtype),
+            num_tokens=self._get_cur_rank_num_token(self._handle),
+            weight_ptr=weight_ptr,
+            scale_ptr=0,
+            indices_ptr=indices.data_ptr(),
+            rdma_block_num=actual_rbn,
+            hidden_dim=hidden_dim,
+            use_external_inp_buf=use_external_inp_buf,
         )
 
         grid = (actual_bn,)
@@ -673,13 +673,13 @@ class EpDispatchCombineOp:
 
         args_ptr = mori_cpp.prepare_and_build_args(
             self._handle,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
+            inp_ptr=0,
+            dtype=0,
+            num_tokens=0,
+            weight_ptr=0,
+            scale_ptr=0,
+            indices_ptr=0,
+            rdma_block_num=0,
         )
         grid = (actual_bn,)
         block = (WARP_SIZE * actual_wpb,)
@@ -763,14 +763,14 @@ class EpDispatchCombineOp:
 
         args_ptr = mori_cpp.prepare_and_build_args(
             self._handle,
-            input.data_ptr(),
-            dtype_to_int(input.dtype),
-            input.size(0),
-            _opt_ptr(weights),
-            _opt_ptr(scales),
-            indices.data_ptr(),
-            actual_rbn,
-            hidden_dim,
+            inp_ptr=input.data_ptr(),
+            dtype=dtype_to_int(input.dtype),
+            num_tokens=input.size(0),
+            weight_ptr=_opt_ptr(weights),
+            scale_ptr=_opt_ptr(scales),
+            indices_ptr=indices.data_ptr(),
+            rdma_block_num=actual_rbn,
+            hidden_dim=hidden_dim,
         )
 
         grid = (actual_bn,)
@@ -855,14 +855,14 @@ class EpDispatchCombineOp:
 
         args_ptr = mori_cpp.prepare_and_build_args(
             self._handle,
-            input.data_ptr(),
-            dtype_to_int(input.dtype),
-            self._get_cur_rank_num_token(self._handle),
-            _opt_ptr(weights),
-            0,
-            indices.data_ptr(),
-            actual_rbn,
-            hidden_dim,
+            inp_ptr=input.data_ptr(),
+            dtype=dtype_to_int(input.dtype),
+            num_tokens=self._get_cur_rank_num_token(self._handle),
+            weight_ptr=_opt_ptr(weights),
+            scale_ptr=0,
+            indices_ptr=indices.data_ptr(),
+            rdma_block_num=actual_rbn,
+            hidden_dim=hidden_dim,
         )
 
         grid = (actual_bn,)
