@@ -92,6 +92,7 @@ struct VecTypeAdaptor<float, 4> {
   using dataType = float4;
 };
 
+#ifdef MORI_HAS_OCP_FP
 template <>
 struct VecTypeAdaptor<mori_fp4_e2m1, 2> {
   using dataType = mori_fp4x2_e2m1;
@@ -101,6 +102,7 @@ template <>
 struct VecTypeAdaptor<mori_fp4_e2m1, 4> {
   using dataType = mori_fp4x4_e2m1;
 };
+#endif  // MORI_HAS_OCP_FP
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           Load/Store                                           */
@@ -296,6 +298,65 @@ inline __device__ void WarpCopy(T* __restrict__ dst, const T* __restrict__ src, 
   while (offset < nelems) {
     dst[offset] = src[offset];
     offset += warpSize;
+  }
+}
+
+template <typename T, int VecBytes, int Unroll>
+inline __device__ void BlockCopyImpl(T* __restrict__ dst, const T* __restrict__ src, size_t& offset,
+                                     size_t nelems) {
+  static_assert((VecBytes <= 16) && (VecBytes >= 1) && IsPowerOf2(VecBytes));
+  constexpr int vecSize = VecBytes / sizeof(T);
+  if constexpr (vecSize <= 0) return;
+
+  const int threadId = FlatBlockThreadId();
+  const int blockSize = FlatBlockSize();
+  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+
+  const size_t elemsPerBlock = static_cast<size_t>(Unroll) * blockSize * vecSize;
+  const size_t numIters = (nelems - offset) / elemsPerBlock;
+  for (size_t iter = 0; iter < numIters; iter++) {
+    DataType vec[Unroll];
+#pragma unroll Unroll
+    for (int u = 0; u < Unroll; u++) {
+      vec[u] = load<VecBytes>(src + offset + (threadId + u * blockSize) * vecSize);
+    }
+
+#pragma unroll Unroll
+    for (int u = 0; u < Unroll; u++) {
+      store<VecBytes>(dst + offset + (threadId + u * blockSize) * vecSize, vec[u]);
+    }
+
+    offset += elemsPerBlock;
+  }
+}
+
+template <typename T, int VecBytes, int Unroll = 1>
+inline __device__ void BlockCopyVec(T* __restrict__ dst, const T* __restrict__ src, size_t& offset,
+                                    size_t nelems) {
+  if constexpr ((VecBytes % sizeof(T)) == 0) {
+    BlockCopyImpl<T, VecBytes, Unroll>(dst, src, offset, nelems);
+    if constexpr (Unroll > 1) {
+      BlockCopyImpl<T, VecBytes, 1>(dst, src, offset, nelems);
+    }
+  }
+}
+
+template <typename T, int Unroll = 1>
+inline __device__ void BlockCopy(T* __restrict__ dst, const T* __restrict__ src, size_t nelems) {
+  const int threadId = FlatBlockThreadId();
+  const int blockSize = FlatBlockSize();
+
+  size_t offset = 0;
+  BlockCopyVec<T, 16, Unroll>(dst, src, offset, nelems);
+  BlockCopyVec<T, 8, Unroll>(dst, src, offset, nelems);
+  BlockCopyVec<T, 4, Unroll>(dst, src, offset, nelems);
+  BlockCopyVec<T, 2, Unroll>(dst, src, offset, nelems);
+  BlockCopyVec<T, 1, Unroll>(dst, src, offset, nelems);
+
+  offset += threadId;
+  while (offset < nelems) {
+    dst[offset] = src[offset];
+    offset += blockSize;
   }
 }
 
@@ -799,8 +860,9 @@ __forceinline__ __device__ void WarpCastBf16ToCombineInternalFp8(
   // Note: when T != hip_bfloat16, this function is a no-op.
   // Callers should guard with if constexpr or ensure T is hip_bfloat16.
 #else
-  static_assert(!sizeof(T*), "WarpCastBf16ToCombineInternalFp8 requires FP8 type support "
-                              "(MORI_FP8_TYPE_OCP_ENABLED or MORI_FP8_TYPE_FNUZ_ENABLED)");
+  static_assert(!sizeof(T*),
+                "WarpCastBf16ToCombineInternalFp8 requires FP8 type support "
+                "(MORI_FP8_TYPE_OCP_ENABLED or MORI_FP8_TYPE_FNUZ_ENABLED)");
 #endif
 }
 
@@ -1033,8 +1095,9 @@ __forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16(
   // Note: when T != hip_bfloat16, this function is a no-op.
   // Callers should guard with if constexpr or ensure T is hip_bfloat16.
 #else
-  static_assert(!sizeof(T*), "WarpAccumCombineInternalFp8ToBf16 requires FP8 type support "
-                              "(MORI_FP8_TYPE_OCP_ENABLED or MORI_FP8_TYPE_FNUZ_ENABLED)");
+  static_assert(!sizeof(T*),
+                "WarpAccumCombineInternalFp8ToBf16 requires FP8 type support "
+                "(MORI_FP8_TYPE_OCP_ENABLED or MORI_FP8_TYPE_FNUZ_ENABLED)");
 #endif
 }
 

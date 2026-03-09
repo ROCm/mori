@@ -25,25 +25,76 @@ from mori import cpp as mori_cpp
 MORI_SHMEM_INIT_WITH_MPI_COMM = mori_cpp.MORI_SHMEM_INIT_WITH_MPI_COMM
 MORI_SHMEM_INIT_WITH_UNIQUEID = mori_cpp.MORI_SHMEM_INIT_WITH_UNIQUEID
 
-# Traditional initialization (requires PyTorch distributed)
+_shmem_module_loaded = False
+
+
+def _ensure_shmem_module():
+    """JIT-compile and load the shmem device module before ShmemInit."""
+    global _shmem_module_loaded
+    if _shmem_module_loaded:
+        return
+    from mori.jit.core import compile_genco
+
+    hsaco = compile_genco("shmem_kernels")
+    mori_cpp.load_shmem_module(hsaco)
+    _shmem_module_loaded = True
+
+
 def shmem_torch_process_group_init(group_name: str):
-    """Initialize shmem from PyTorch process group.
-    
+    """Initialize shmem from PyTorch process group via socket bootstrap.
+
+    Extracts rank/world_size from the torch process group and broadcasts
+    UniqueId via the torch store, then initializes shmem with socket bootstrap.
+
     Args:
         group_name: Name of the PyTorch process group
-        
+
     Returns:
         Status code (0 for success)
     """
-    return mori_cpp.shmem_torch_process_group_init(group_name)
+    try:
+        import torch.distributed as dist
+    except ImportError:
+        raise RuntimeError(
+            "PyTorch not installed. Use shmem_init_attr() with UniqueId instead."
+        )
+
+    if not dist.is_initialized():
+        raise RuntimeError(
+            "torch.distributed not initialized. "
+            "Call torch.distributed.init_process_group() first, or use shmem_init_attr()."
+        )
+
+    _ensure_shmem_module()
+
+    group = dist.distributed_c10d._resolve_process_group(group_name)
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+
+    store_key = f"mori_shmem_uid_{group_name}"
+    if rank == 0:
+        uid = shmem_get_unique_id()
+        dist.broadcast_object_list([uid], src=0, group=group)
+    else:
+        uid_list = [None]
+        dist.broadcast_object_list(uid_list, src=0, group=group)
+        uid = uid_list[0]
+
+    return shmem_init_attr(MORI_SHMEM_INIT_WITH_UNIQUEID, rank, world_size, uid)
+
+
+def shmem_mpi_init():
+    """Initialize shmem using MPI_COMM_WORLD."""
+    _ensure_shmem_module()
+    return mori_cpp.shmem_mpi_init()
 
 
 # UniqueId-based initialization (nvshmem/rocshmem compatible)
 def shmem_get_unique_id() -> bytes:
     """Get a unique ID for shmem initialization.
-    
+
     This should be called by rank 0 and broadcast to all ranks.
-    
+
     Returns:
         Unique ID as bytes (128 bytes)
     """
@@ -52,24 +103,25 @@ def shmem_get_unique_id() -> bytes:
 
 def shmem_init_attr(flags: int, rank: int, nranks: int, unique_id: bytes):
     """Initialize shmem with attributes using unique ID.
-    
+
     This allows initialization without PyTorch distributed or MPI.
-    
+
     Args:
         flags: Initialization flags (use MORI_SHMEM_INIT_WITH_UNIQUEID)
         rank: My rank/PE ID
         nranks: Total number of ranks/PEs
         unique_id: Unique ID from shmem_get_unique_id()
-        
+
     Returns:
         Status code (0 for success)
     """
+    _ensure_shmem_module()
     return mori_cpp.shmem_init_attr(flags, rank, nranks, unique_id)
 
 
 def shmem_finalize():
     """Finalize shmem and cleanup resources.
-    
+
     Returns:
         Status code (0 for success)
     """
@@ -78,14 +130,14 @@ def shmem_finalize():
 
 def shmem_module_init(hip_module: int):
     """Initialize globalGpuStates in a specific HIP module.
-    
+
     This is used by Triton to initialize device symbols in dynamically
     compiled kernel modules. It copies the current GpuStates values
     to the module's globalGpuStates symbol.
-    
+
     Args:
         hip_module: HIP module handle (from Triton kernel compilation)
-        
+
     Returns:
         Status code (0 for success)
     """
@@ -95,7 +147,7 @@ def shmem_module_init(hip_module: int):
 # Query APIs
 def shmem_mype() -> int:
     """Get my PE (process element) ID.
-    
+
     Returns:
         My PE ID (0 to npes-1)
     """
@@ -104,7 +156,7 @@ def shmem_mype() -> int:
 
 def shmem_npes() -> int:
     """Get total number of PEs.
-    
+
     Returns:
         Total number of PEs
     """
@@ -114,22 +166,45 @@ def shmem_npes() -> int:
 # Collective operations
 def shmem_barrier_all():
     """Global barrier synchronization.
-    
+
     All PEs must call this function. It blocks until all PEs reach the barrier.
     """
     return mori_cpp.shmem_barrier_all()
 
 
+def shmem_barrier_on_stream(stream=None):
+    """Launch a device-side barrier on a HIP stream.
+
+    This enqueues a GPU kernel that performs cross-PE barrier synchronization
+    directly on the device, without blocking the host. All PEs must call this
+    on the same logical stream ordering.
+
+    Args:
+        stream: HIP stream to launch the barrier kernel on.
+            - None or 0: use the default (null) stream.
+            - int: raw hipStream_t pointer value.
+            - torch.cuda.Stream: a PyTorch CUDA/HIP stream object.
+    """
+    if stream is None:
+        stream_ptr = 0
+    elif isinstance(stream, int):
+        stream_ptr = stream
+    else:
+        # torch.cuda.Stream / torch.hip.Stream
+        stream_ptr = stream.cuda_stream
+    return mori_cpp.shmem_barrier_on_stream(stream_ptr)
+
+
 # Symmetric memory management
 def shmem_malloc(size: int) -> int:
     """Allocate symmetric memory.
-    
+
     This allocates memory that is symmetric across all PEs and can be
     accessed remotely via RDMA operations.
-    
+
     Args:
         size: Size in bytes to allocate
-        
+
     Returns:
         Address of allocated memory as int (use ctypes or data_ptr())
     """
@@ -138,11 +213,11 @@ def shmem_malloc(size: int) -> int:
 
 def shmem_malloc_align(alignment: int, size: int) -> int:
     """Allocate aligned symmetric memory.
-    
+
     Args:
         alignment: Alignment requirement in bytes (must be power of 2)
         size: Size in bytes to allocate
-        
+
     Returns:
         Address of allocated memory as int
     """
@@ -151,11 +226,11 @@ def shmem_malloc_align(alignment: int, size: int) -> int:
 
 def shmem_ext_malloc_with_flags(size: int, flags: int) -> int:
     """Allocate symmetric memory with specific flags.
-    
+
     Args:
         size: Size in bytes to allocate
         flags: Allocation flags
-        
+
     Returns:
         Address of allocated memory as int
     """
@@ -164,7 +239,7 @@ def shmem_ext_malloc_with_flags(size: int, flags: int) -> int:
 
 def shmem_free(ptr: int):
     """Free symmetric memory.
-    
+
     Args:
         ptr: Address of memory to free (as returned by shmem_malloc)
     """
@@ -174,14 +249,14 @@ def shmem_free(ptr: int):
 # Buffer registration
 def shmem_buffer_register(ptr: int, size: int) -> int:
     """Register an existing buffer for RDMA operations.
-    
+
     This allows using existing memory (e.g., PyTorch tensors) for
     RDMA operations without allocating new symmetric memory.
-    
+
     Args:
         ptr: Address of buffer to register
         size: Size of buffer in bytes
-        
+
     Returns:
         Status code (0 for success)
     """
@@ -190,11 +265,11 @@ def shmem_buffer_register(ptr: int, size: int) -> int:
 
 def shmem_buffer_deregister(ptr: int, size: int) -> int:
     """Deregister a buffer from RDMA.
-    
+
     Args:
         ptr: Address of buffer to deregister
         size: Size of buffer in bytes
-        
+
     Returns:
         Status code (0 for success)
     """
@@ -203,25 +278,26 @@ def shmem_buffer_deregister(ptr: int, size: int) -> int:
 
 def shmem_ptr_p2p(dest_ptr: int, my_pe: int, dest_pe: int) -> int:
     """Convert local symmetric memory pointer to remote P2P address.
-    
+
     This function translates a local symmetric memory pointer to the corresponding
     P2P (Peer-to-Peer) accessible address on a remote PE. This is useful for
     direct GPU-to-GPU memory access within a node.
-    
+
     Args:
         dest_ptr: Local symmetric memory pointer (as int/uint64)
         my_pe: My PE (process element) ID
         dest_pe: Target PE ID to get P2P address for
-        
+
     Returns:
         - Non-zero P2P address: If connection uses P2P transport (same node GPUs)
         - 0: If connection uses RDMA transport (different nodes) or if pointer is invalid
     """
     return mori_cpp.shmem_ptr_p2p(dest_ptr, my_pe, dest_pe)
 
+
 def shmem_num_qp_per_pe():
     """Get number of QPs per PE.
-    
+
     Returns:
         Number of QPs per PE
     """

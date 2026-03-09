@@ -1,0 +1,28 @@
+[build-system]
+requires = [
+    "setuptools>=61",
+    "setuptools_scm[toml]>=6.2",
+    "wheel",
+    "ninja",
+    "cmake",
+    "pybind11",
+]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+write_to = "python/mori/_version.py"
+write_to_template = "__version__ = '{version}'\n"
+fallback_version = "0.1.0"
+
+[project]
+name = "mori"
+dynamic = ["version"]
+description = "Modular RDMA Interface — GPU communication library for P2P, RDMA/IBGDA, and SDMA"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/ROCm/mori"
+Repository = "https://github.com/ROCm/mori"

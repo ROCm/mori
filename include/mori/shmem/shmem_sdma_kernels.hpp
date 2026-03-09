@@ -71,6 +71,20 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::SDMA
                     dest->sdmaNumQueue);
 }
 
+template <>
+inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::SDMA>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  // TODO: add SDMA block-level PutMemNbi
+  (void)dest;
+  (void)destOffset;
+  (void)source;
+  (void)sourceOffset;
+  (void)bytes;
+  (void)pe;
+  (void)qpId;
+}
+
 // Pure address-based PutMemNbi versions
 template <>
 inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SDMA>(
@@ -115,6 +129,17 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::SDMA
 }
 
 template <>
+inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::SDMA>(
+    const void* dest, const void* source, size_t bytes, int pe, int qpId) {
+  // TODO: add SDMA block-level PutMemNbi
+  (void)dest;
+  (void)source;
+  (void)bytes;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
 inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe,
     int qpId) {}
@@ -135,6 +160,216 @@ inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    PutMemNbi with Signal                                       */
 /* ---------------------------------------------------------------------------------------------- */
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::SDMA, true>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal
+  (void)dest;
+  (void)destOffset;
+  (void)source;
+  (void)sourceOffset;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalDestOffset;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::SDMA, false>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal
+  (void)dest;
+  (void)destOffset;
+  (void)source;
+  (void)sourceOffset;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalDestOffset;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::SDMA, true>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal
+  (void)dest;
+  (void)destOffset;
+  (void)source;
+  (void)sourceOffset;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalDestOffset;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::SDMA, false>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal
+  (void)dest;
+  (void)destOffset;
+  (void)source;
+  (void)sourceOffset;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalDestOffset;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::SDMA, true>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal
+  (void)dest;
+  (void)destOffset;
+  (void)source;
+  (void)sourceOffset;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalDestOffset;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::SDMA, false>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal
+  (void)dest;
+  (void)destOffset;
+  (void)source;
+  (void)sourceOffset;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalDestOffset;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::SDMA, true>(
+    const void* dest, const void* source, size_t bytes, const void* signalDest,
+    uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal (address-based)
+  (void)dest;
+  (void)source;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::SDMA, false>(
+    const void* dest, const void* source, size_t bytes, const void* signalDest,
+    uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal (address-based)
+  (void)dest;
+  (void)source;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::SDMA, true>(
+    const void* dest, const void* source, size_t bytes, const void* signalDest,
+    uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal (address-based)
+  (void)dest;
+  (void)source;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::SDMA, false>(
+    const void* dest, const void* source, size_t bytes, const void* signalDest,
+    uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal (address-based)
+  (void)dest;
+  (void)source;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::SDMA, true>(
+    const void* dest, const void* source, size_t bytes, const void* signalDest,
+    uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal (address-based)
+  (void)dest;
+  (void)source;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::SDMA, false>(
+    const void* dest, const void* source, size_t bytes, const void* signalDest,
+    uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal (address-based)
+  (void)dest;
+  (void)source;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
 
 template <>
 inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(

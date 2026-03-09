@@ -405,9 +405,12 @@ class EpDispatchCombineTestCase:
             if final_unique_pes == 0:
                 continue
 
-            got, expected = combine_output[i], (
-                all_rank_input[self.rank][i].to(torch.float32) * final_unique_pes
-            ).to(self.config.data_type)
+            got, expected = (
+                combine_output[i],
+                (all_rank_input[self.rank][i].to(torch.float32) * final_unique_pes).to(
+                    self.config.data_type
+                ),
+            )
 
             atol, rtol = 1e-2, 1e-2
             if getattr(self.config, "quant_type", "none") == "fp8_direct_cast":
@@ -608,10 +611,10 @@ class EpDispatchCombineTestCase:
         )
 
         if hasattr(mori.cpp, "get_debug_time_buf"):
-            my_times = mori.cpp.get_debug_time_buf(op._handle)
+            my_times = op.get_debug_time_buf()
             my_times.zero_()
             if hasattr(mori.cpp, "get_debug_time_offset"):
-                my_offsets = mori.cpp.get_debug_time_offset(op._handle)
+                my_offsets = op.get_debug_time_offset()
                 my_offsets.zero_()
 
         torch.cuda.synchronize()
@@ -706,9 +709,9 @@ class EpDispatchCombineTestCase:
             if self.rank == 0:
                 print(f"WarmUp Round {i} begin")
             self.run_test_once(op, test_data, error_round, i)
-        assert (
-            len(error_round) == 0
-        ), f"Warmup failed with errors in rounds: {error_round}"
+        assert len(error_round) == 0, (
+            f"Warmup failed with errors in rounds: {error_round}"
+        )
 
         (
             disp_duration,

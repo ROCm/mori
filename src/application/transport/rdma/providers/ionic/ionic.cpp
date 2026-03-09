@@ -22,7 +22,7 @@
 
 #include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
 
-#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 #include <infiniband/verbs.h>
 
 #include <iostream>
@@ -175,9 +175,10 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
                  reinterpret_cast<uintptr_t>(cq), reinterpret_cast<uintptr_t>(pd_uxdma),
                  reinterpret_cast<uintptr_t>(context), config.maxMsgsNum);
   wqeNum = config.maxMsgsNum;
+  uint32_t recvWrNum = config.maxRecvWr != 0 ? config.maxRecvWr : wqeNum;
   memset(&attr, 0, sizeof(struct ibv_qp_init_attr_ex));
   attr.cap.max_send_wr = wqeNum;
-  attr.cap.max_recv_wr = wqeNum;
+  attr.cap.max_recv_wr = recvWrNum;
   attr.cap.max_send_sge = 1;
   attr.cap.max_inline_data = MAX_INLINE_SIZE;
   attr.sq_sig_all = 0;

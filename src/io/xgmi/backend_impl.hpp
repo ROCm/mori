@@ -21,7 +21,7 @@
 // SOFTWARE.
 #pragma once
 
-#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 
 #include <memory>
 #include <mutex>
@@ -123,6 +123,7 @@ class XgmiBackend : public Backend {
 
  private:
   EngineKey myEngKey;
+  std::string myNodeId;
   std::string myHostname;
   XgmiBackendConfig config;
 

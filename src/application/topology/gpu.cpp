@@ -21,6 +21,8 @@
 // SOFTWARE.
 #include "mori/application/topology/gpu.hpp"
 
+#include <cstdio>
+
 #include "mori/application/utils/check.hpp"
 
 namespace mori {

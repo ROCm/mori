@@ -21,17 +21,17 @@
 // SOFTWARE.
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
 
-#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
 
 #include <iostream>
 
+#include "mori/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
+#include "mori/application/transport/rdma/providers/mlx5/mlx5_prm.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
 #include "mori/utils/mori_log.hpp"
-#include "mori/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
-#include "mori/application/transport/rdma/providers/mlx5/mlx5_prm.hpp"
 
 namespace mori {
 namespace application {
@@ -163,10 +163,12 @@ Mlx5QpContainer::Mlx5QpContainer(ibv_context* context, const RdmaEndpointConfig&
 Mlx5QpContainer::~Mlx5QpContainer() { DestroyQueuePair(); }
 
 void Mlx5QpContainer::ComputeQueueAttrs(const RdmaEndpointConfig& config) {
-  // Receive queue attributes//
+  // Receive queue attributes
   rqAttrs.wqeSize = GetMlx5RqWqeSize();
+  uint32_t rqMaxWr = config.maxRecvWr != 0 ? config.maxRecvWr : config.maxMsgsNum;
   uint32_t maxMsgsNum = RoundUpPowOfTwo(config.maxMsgsNum);
-  rqAttrs.wqSize = std::max(rqAttrs.wqeSize * maxMsgsNum, uint32_t(MLX5_SEND_WQE_BB));
+  uint32_t rqMaxWrRounded = RoundUpPowOfTwo(rqMaxWr);
+  rqAttrs.wqSize = std::max(rqAttrs.wqeSize * rqMaxWrRounded, uint32_t(MLX5_SEND_WQE_BB));
   rqAttrs.wqeNum = ceil(rqAttrs.wqSize / rqAttrs.wqeSize);
   rqAttrs.wqeShift = log2(rqAttrs.wqeSize - 1) + 1;
   rqAttrs.offset = 0;
@@ -240,8 +242,8 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   int atomicIbufAccessFlag =
       MaybeAddRelaxedOrderingFlag(IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                                   IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
-  atomicIbufMr = ibv_reg_mr(device_context->GetIbvPd(), atomicIbufAddr, atomicIbufSize,
-                            atomicIbufAccessFlag);
+  atomicIbufMr =
+      ibv_reg_mr(device_context->GetIbvPd(), atomicIbufAddr, atomicIbufSize, atomicIbufAccessFlag);
   assert(atomicIbufMr);
 
   MORI_APP_TRACE(

@@ -88,7 +88,10 @@ bool StreamPool::InitializeStreamsForDevice(int deviceId) {
       MORI_IO_ERROR("StreamPool: Failed to create stream for device {}: {}", deviceId,
                     hipGetErrorString(err));
       for (auto s : deviceStreams) {
-        hipStreamDestroy(s);
+        hipError_t destroyErr = hipStreamDestroy(s);
+        if (destroyErr != hipSuccess) {
+          MORI_IO_ERROR("StreamPool: Failed to destroy stream: {}", hipGetErrorString(destroyErr));
+        }
       }
       return false;
     }
@@ -117,7 +120,10 @@ EventPool::~EventPool() {
       hipEvent_t event = deviceEntry.second.front();
       deviceEntry.second.pop();
       if (event != nullptr) {
-        hipEventDestroy(event);
+        hipError_t destroyErr = hipEventDestroy(event);
+        if (destroyErr != hipSuccess) {
+          MORI_IO_ERROR("EventPool: Failed to destroy event: {}", hipGetErrorString(destroyErr));
+        }
       }
     }
   }
