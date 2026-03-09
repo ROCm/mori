@@ -66,8 +66,8 @@ void ConcurrentPutThread() {
   int npes = ShmemNPes();
   assert(npes == 2);
 
-  constexpr int threadNum = 128;
-  constexpr int blockNum = 3;
+  constexpr int threadNum = 1;
+  constexpr int blockNum = 1;
 
   // Allocate buffer
   int numEle = threadNum * blockNum;
