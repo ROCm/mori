@@ -752,8 +752,9 @@ _DATA_TYPE_MAP = {
     "bf16": torch.bfloat16,
     "fp8_e4m3_fnuz": torch.float8_e4m3fnuz,
     "fp8_e4m3": torch.float8_e4m3fn,
-    "fp4": torch.float4_e2m1fn_x2,
 }
+if hasattr(torch, "float4_e2m1fn_x2"):
+    _DATA_TYPE_MAP["fp4"] = torch.float4_e2m1fn_x2
 
 if __name__ == "__main__":
     import argparse
@@ -860,14 +861,15 @@ if __name__ == "__main__":
     combine_dtype = _DATA_TYPE_MAP[combine_dtype_str]
 
     base_hidden_dim = 7168
+    _fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
     dispatch_hidden_dim = (
         base_hidden_dim // 2
-        if dispatch_dtype is torch.float4_e2m1fn_x2
+        if _fp4_dtype is not None and dispatch_dtype is _fp4_dtype
         else base_hidden_dim
     )
     combine_hidden_dim = (
         base_hidden_dim // 2
-        if combine_dtype is torch.float4_e2m1fn_x2
+        if _fp4_dtype is not None and combine_dtype is _fp4_dtype
         else base_hidden_dim
     )
 

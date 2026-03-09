@@ -450,8 +450,8 @@ class EpDispatchCombineOp:
             weights,
             scales,
             indices,
-            self.auto_block_num if self.auto_block_num else block_num,
-            self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
+            block_num=self.auto_block_num if self.auto_block_num else block_num,
+            warp_per_block=self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
         )
 
     def dispatch_recv(
@@ -655,8 +655,8 @@ class EpDispatchCombineOp:
             input,
             weights,
             indices,
-            self.auto_block_num if self.auto_block_num else block_num,
-            self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
+            block_num=self.auto_block_num if self.auto_block_num else block_num,
+            warp_per_block=self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
         )
 
     def combine_recv(
