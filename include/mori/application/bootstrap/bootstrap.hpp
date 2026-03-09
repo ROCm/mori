@@ -22,7 +22,9 @@
 #pragma once
 
 #include "mori/application/bootstrap/base_bootstrap.hpp"
+#ifdef MORI_HAS_MPI
 #include "mori/application/bootstrap/mpi_bootstrap.hpp"
+#endif
 #ifdef MORI_HAS_TORCH
 #include "mori/application/bootstrap/torch_bootstrap.hpp"
 #endif

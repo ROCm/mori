@@ -313,7 +313,8 @@ void RegisterMoriOps(py::module_& m) {
       .def_readwrite("gpu_per_node", &mori::moe::EpDispatchCombineConfig::gpuPerNode)
       .def_readwrite("rdma_block_num", &mori::moe::EpDispatchCombineConfig::rdmaBlockNum)
       .def_readwrite("num_qp_per_pe", &mori::moe::EpDispatchCombineConfig::numQpPerPe)
-      .def_readwrite("quant_type", &mori::moe::EpDispatchCombineConfig::quantType);
+      .def_readwrite("quant_type", &mori::moe::EpDispatchCombineConfig::quantType)
+      .def("to_packed_array", &mori::moe::EpDispatchCombineConfig::ToPackedI32Array);
 
   DeclareEpDispatchCombineHandle(m);
 
