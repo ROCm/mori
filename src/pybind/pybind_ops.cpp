@@ -19,6 +19,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#include <cassert>
 #include <hip/hip_runtime_api.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -70,7 +71,15 @@ int64_t PrepareAndBuildArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t 
 
   thread_local mori::moe::EpDispatchCombineArgsRaw args;
   args = mori::moe::GetEpDispatchCombineArgsRaw(handle, rdmaBlockNum);
-  if (hiddenDim > 0) args.config.hiddenDim = hiddenDim;
+  // Runtime hidden_dim: dispatch/combine (send) calls pass hiddenDim from input tensor,
+  // recv calls leave it as -1 and reuse the value cached by the prior send call.
+  if (hiddenDim > 0) {
+    args.config.hiddenDim = hiddenDim;
+    handle.curHiddenDim = hiddenDim;
+  } else if (handle.curHiddenDim > 0) {
+    args.config.hiddenDim = handle.curHiddenDim;
+  }
+  assert(args.config.hiddenDim > 0 && args.config.hiddenDim <= handle.config.hiddenDim);
   if (useExternalInpBuf >= 0)
     args.config.useExternalInpBuffer = static_cast<bool>(useExternalInpBuf);
   return reinterpret_cast<int64_t>(&args);
