@@ -252,23 +252,23 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
   size_t epBatchSize = (mergedWrCount + epNum - 1) / epNum;
 
   if (postBatchSize == -1) postBatchSize = epBatchSize;
-  if (eps[0].sqDepth && postBatchSize > eps[0].maxSqDepth) postBatchSize = eps[0].maxSqDepth;
+  {
+    int minMaxSqDepth = std::numeric_limits<int>::max();
+    for (size_t epId = 0; epId < epNum; ++epId) {
+      if (eps[epId].sqDepth && eps[epId].maxSqDepth > 0) {
+        minMaxSqDepth = std::min(minMaxSqDepth, eps[epId].maxSqDepth);
+      }
+    }
+    if (minMaxSqDepth != std::numeric_limits<int>::max() && postBatchSize > minMaxSqDepth)
+      postBatchSize = minMaxSqDepth;
+  }
+  if (postBatchSize <= 0) postBatchSize = 1;
   int numPostBatch = (mergedWrCount + postBatchSize - 1) / postBatchSize;
 
   // Per-EP state for adaptive signaling: track WRs and merged requests
   // accumulated since the last signaled WR on each EP.
   std::vector<int> epWrsSinceSignal(epNum, 0);
   std::vector<size_t> epMergedSinceSignal(epNum, 0);
-  std::vector<int> epReservedUnsignaled(epNum, 0);
-
-  auto rollbackUnsignaledReservations = [&]() {
-    for (size_t j = 0; j < epNum; ++j) {
-      if (epReservedUnsignaled[j] > 0) {
-        ReleaseSqDepth(eps[j], epReservedUnsignaled[j]);
-        epReservedUnsignaled[j] = 0;
-      }
-    }
-  };
 
   for (int i = 0; i < numPostBatch; i++) {
     int st = i * postBatchSize;
@@ -281,7 +281,6 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     // waiting for CQEs from earlier signaled WRs to drain depth.
     std::string reserveErr;
     if (!TryReserveSqDepth(eps[epId], batchWrNum, epId, "batch", &reserveErr)) {
-      rollbackUnsignaledReservations();
       return {StatusCode::ERR_RDMA_OP, reserveErr};
     }
 
@@ -295,7 +294,6 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
 
     epWrsSinceSignal[epId] += batchWrNum;
     epMergedSinceSignal[epId] += mergedReqSize;
-    epReservedUnsignaled[epId] += batchWrNum;
 
     bool isLastBatchForEp = ((i + epNum) >= numPostBatch);
     bool sqNearFull = eps[epId].sqDepth && (epWrsSinceSignal[epId] >= eps[epId].maxSqDepth);
@@ -326,7 +324,6 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
       if (unpostedCount > 0) {
         ReleaseSqDepth(eps[epId], unpostedCount);
         epWrsSinceSignal[epId] = std::max(0, epWrsSinceSignal[epId] - unpostedCount);
-        epReservedUnsignaled[epId] = std::max(0, epReservedUnsignaled[epId] - unpostedCount);
 
         size_t mergedUnposted = 0;
         for (int j = st + postedCount; j < end; ++j) {
@@ -342,12 +339,17 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
       const bool lastWasPosted = (postedCount == batchWrNum);
       if (needSignal && lastWasPosted) {
         // Signaled WR was posted; CQ path owns the release for this EP.
-        epReservedUnsignaled[epId] = 0;
       } else if (cbMsg != nullptr) {
         delete cbMsg;
       }
 
-      rollbackUnsignaledReservations();
+      if (postedCount > 0 && (!needSignal || !lastWasPosted)) {
+        MORI_IO_WARN(
+            "ibv_post_send partially posted {} / {} WRs without a posted signaled tail; "
+            "keeping SQ reservations to avoid over-admission until endpoint recovery",
+            postedCount, batchWrNum);
+      }
+
       return {StatusCode::ERR_RDMA_OP, "ibv_post_send failed with " + std::to_string(ret) + ": " +
                                            strerror(ret) + " (posted " +
                                            std::to_string(postedCount) + "/" +
@@ -355,7 +357,6 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     }
 
     if (needSignal) {
-      epReservedUnsignaled[epId] = 0;
       epWrsSinceSignal[epId] = 0;
       epMergedSinceSignal[epId] = 0;
     }
