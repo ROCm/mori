@@ -693,7 +693,7 @@ class EpDispatchCombineTestCase:
             max_num_token=max_num_token, use_max_token_num=True
         )
 
-        repeat = 10
+        repeat = 50
         disp_duration_us_list = []
         disp_rdma_bandwidth_GB_list = []
         disp_bandwidth_GB_list = []
