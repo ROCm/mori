@@ -117,10 +117,12 @@ __global__ void EpDispatchLowLatencyAsyncSendTransfer(EpDispatchCombineArgs<T> a
           (config.MaxNumTokensToSendPerRank() * myPe + tokenChunkNum * qpId) * xferBytes;
       size_t localOffset =
           (config.MaxNumTokensToSendPerRank() * destPe + tokenChunkNum * qpId) * xferBytes;
-      if (destPe != myPe)
-        shmem::ShmemPutMemNbiWarp(args.shmemDispatchInpTokMemObj, remoteOffset,
-                                  args.shmemStagingTokMemObj, localOffset,
-                                  thisChunkTokenNum * xferBytes, destPe, qpId);
+
+      if ((destPe != myPe) && (laneId == 0)) {
+        shmem::ShmemPutMemNbiThread(args.shmemDispatchInpTokMemObj, remoteOffset,
+                                    args.shmemStagingTokMemObj, localOffset,
+                                    thisChunkTokenNum * xferBytes, destPe, qpId);
+      }
       // TODO(ditian12): index value is wrong if signal completion here, investigate the reason
       // shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
       //     args.recvTokenNumMemObj, (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
@@ -143,9 +145,9 @@ __global__ void EpDispatchLowLatencyAsyncRecvTransfer(EpDispatchCombineArgs<T> a
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       if (laneId == 0) {
         // TODO: use different quiet func for SDMDA/RDMA and P2P
-        shmem::ShmemQuietThread(destPe, qpId);
-        // shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
-        // destPe, args.shmemDispatchInpTokMemObj);
+        // shmem::ShmemQuietThread(destPe, qpId);
+        shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
+            destPe, args.shmemDispatchInpTokMemObj);
         int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
         shmem::ShmemPutUint64ImmNbiThread(args.recvTokenNumMemObj,
                                           (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
@@ -159,8 +161,7 @@ __global__ void EpDispatchLowLatencyAsyncRecvTransfer(EpDispatchCombineArgs<T> a
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     if (laneId < config.numQpPerPe) {
       shmem::ShmemUint64WaitUntilGreaterThan(recvTokenNums + destPe * config.numQpPerPe + laneId,
-                                             0) -
-          1;
+                                             0);
     }
   }
 }
@@ -326,10 +327,10 @@ __global__ void EpCombineLowLatencyAsyncSendTransfer(EpDispatchCombineArgs<T> ar
           (config.MaxNumTokensToSendPerRank() * myPe + tokenChunkNum * qpId) * tokHiddenBytes;
       size_t localOffset =
           (config.MaxNumTokensToSendPerRank() * destPe + tokenChunkNum * qpId) * tokHiddenBytes;
-      if (destPe != myPe)
-        shmem::ShmemPutMemNbiWarp(args.shmemCombineInpTokMemObj, remoteOffset,
-                                  args.shmemStagingTokMemObj, localOffset,
-                                  thisChunkTokenNum * tokHiddenBytes, destPe, qpId);
+      if ((destPe != myPe) && (laneId == 0))
+        shmem::ShmemPutMemNbiThread(args.shmemCombineInpTokMemObj, remoteOffset,
+                                    args.shmemStagingTokMemObj, localOffset,
+                                    thisChunkTokenNum * tokHiddenBytes, destPe, qpId);
       // if (laneId == 0)
       // shmem::ShmemQuietThread(destPe, qpId);
       // shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
@@ -354,7 +355,9 @@ __global__ void EpCombineLowLatencyAsyncRecvTransfer(EpDispatchCombineArgs<T> ar
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       if (laneId == 0) {
-        shmem::ShmemQuietThread(destPe, qpId);
+        // shmem::ShmemQuietThread(destPe, qpId);
+        shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
+            destPe, args.shmemCombineInpTokMemObj);
         uint64_t flag = args.crossDeviceBarrierFlag[0];
         shmem::ShmemPutUint64ImmNbiThread(args.crossDeviceBarrierMemObj,
                                           (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
