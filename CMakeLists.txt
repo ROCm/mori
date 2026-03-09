@@ -31,6 +31,7 @@ option(BUILD_SHMEM "Whether to build shmem library" ON)
 option(BUILD_OPS "Whether to build mori operation kernels" ON)
 option(BUILD_IO "Whether to build mori io library" ON)
 option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
+option(BUILD_XLA_FFI_OPS "Whether to build mori xla ffi python bindings" OFF)
 option(BUILD_UMBP "Whether to build UMBP (Unified Memory/Bandwidth Pool)" OFF)
 option(BUILD_TESTS "Whether to build mori CPP tests" ON)
 option(ENABLE_PROFILER "Enable kernel profiling" OFF)
@@ -162,6 +163,12 @@ if(DEFINED ENV{MORI_WITH_MPI})
         OFF
         CACHE BOOL "Enable MPI support" FORCE)
   endif()
+endif()
+
+if(BUILD_XLA_FFI_OPS)
+  add_compile_definitions(BUILD_XLA_FFI_OPS)
+  set(BUILD_OPS_DEVICE ON)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-literal-operator")
 endif()
 
 # ---------------------------------------------------------------------------

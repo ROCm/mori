@@ -60,6 +60,11 @@ if(BUILD_UMBP)
   target_compile_definitions(mori_pybinds PRIVATE MORI_BUILD_UMBP)
 endif()
 
+if(BUILD_XLA_FFI_OPS)
+  target_sources(mori_pybinds PRIVATE pybind_xla_ffi_ops.cpp)
+  target_include_directories(mori_pybinds PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/xla_ffi)
+endif()
+
 # For python packages to find dependent libraries
 if(BUILD_TORCH_BOOTSTRAP)
   set_target_properties(
@@ -74,3 +79,4 @@ else()
                INSTALL_RPATH "$ORIGIN"
                BUILD_WITH_INSTALL_RPATH TRUE)
 endif()
+

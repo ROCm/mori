@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <sstream>
+#include <vector>
 
 #include "mori/application/application.hpp"
 #include "mori/core/profiler/constants.hpp"
@@ -118,6 +119,10 @@ struct EpDispatchCombineConfig {
   inline __host__ __device__ int MaxNumTokensToRecv() const {
     return worldSize * MaxNumTokensToRecvPerRank();
   }
+
+  std::vector<int32_t> ToPackedI32Array() const;
+  static EpDispatchCombineConfig FromPackedI32Array(const int32_t* packed, size_t size);
+  
 };
 
 class EpDispatchCombineHandle {

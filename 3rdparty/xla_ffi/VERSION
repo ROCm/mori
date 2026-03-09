@@ -1,0 +1,7 @@
+Vendored from rocm-xla/rocm-jaxlib-v0.9.1 branch
+Commit: f404aed: Fix dynamic static comgr interface change 0.9.1 (#750) …
+
+Files:
+  xla/ffi/api/c_api.h   - C ABI structs (header-only, no external deps)
+  xla/ffi/api/api.h     - C++ handler macros (depends on c_api.h only)
+  xla/ffi/api/ffi.h     - C++ FFI implementation (depends on c_api.h + api.h)
