@@ -20,13 +20,20 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import os
+import importlib
 
-from . import cpp
-from . import ops
-from . import shmem
-from . import io
-from . import ir
-from . import kernel_profiler
+# All submodules are lazy-imported so that `import mori` (or any
+# subpackage like mori.jax) does not eagerly pull in heavy dependencies
+# such as torch. Submodules are loaded on first attribute access.
+_LAZY_MODULES = {"cpp", "ops", "shmem", "io", "ir", "kernel_profiler", "jax"}
+
+
+def __getattr__(name):
+    if name in _LAZY_MODULES:
+        mod = importlib.import_module(f".{name}", __name__)
+        globals()[name] = mod
+        return mod
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 if os.environ.get("MORI_PRECOMPILE", "").lower() in ("1", "true", "on"):
     from .jit import precompile

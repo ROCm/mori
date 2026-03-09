@@ -78,7 +78,11 @@ class EpDispatchCombineOp:
 
     @staticmethod
     def _ensure_kernels(kernel_type: int):
-        """JIT-compile and register .hsaco kernels for the given kernel_type."""
+        """JIT-compile and register .hsaco kernels for the given kernel_type.
+
+        Also initializes globalGpuStates in the loaded module so that shmem
+        device functions work correctly. Requires shmem to be initialized.
+        """
         from mori.jit.core import compile_genco
 
         if kernel_type not in _KERNEL_TYPE_TO_HIP:
@@ -86,6 +90,14 @@ class EpDispatchCombineOp:
         hip_name = _KERNEL_TYPE_TO_HIP[kernel_type]
         hsaco_path = compile_genco(hip_name)
         _ffi_registry.register_kernel_module(kernel_type, hsaco_path)
+        # globalGpuStates is now initialized automatically inside
+        # KernelManager::RegisterModule via ShmemModuleInit.
+        # If shmem was initialized after module registration, call
+        # shmem_module_init_for_kernel to re-initialize.
+        try:
+            _ffi_registry.shmem_module_init_for_kernel(kernel_type)
+        except Exception:
+            pass
 
     def close(self):
         if not self._closed:

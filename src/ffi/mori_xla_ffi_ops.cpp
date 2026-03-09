@@ -34,6 +34,7 @@
 #include <unordered_map>
 
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
+#include "mori/shmem/shmem.hpp"
 #include "src/ffi/mori_xla_ffi_handle_mgr.hpp"
 
 namespace ffi = xla::ffi;
@@ -61,6 +62,13 @@ class KernelManager {
                                " (" + hipGetErrorString(err) + ")");
     }
     modules_[kernel_type] = mod;
+  }
+
+  hipModule_t GetModule(int kernel_type) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = modules_.find(kernel_type);
+    if (it == modules_.end()) return nullptr;
+    return it->second;
   }
 
   hipFunction_t GetFunction(int kernel_type, const std::string& name) {
@@ -222,6 +230,7 @@ static ffi::Error MoriEpDispatchImpl(
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "Unsupported dispatch kernel_type");
     }
+
     return ffi::Error::Success();
   } catch (const std::exception& e) {
     return ffi::Error(ffi::ErrorCode::kInternal, std::string(e.what()));
@@ -329,6 +338,7 @@ static ffi::Error MoriEpCombineImpl(
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "Unsupported combine kernel_type");
     }
+
     return ffi::Error::Success();
   } catch (const std::exception& e) {
     return ffi::Error(ffi::ErrorCode::kInternal, std::string(e.what()));
@@ -474,9 +484,75 @@ void mori_ffi_register_kernel_module(int kernel_type, const char* hsaco_path) {
 }
 
 void mori_ffi_shmem_module_init_from_kernel(int kernel_type) {
-  // After registering a kernel module, initialize shmem globalGpuStates in it.
-  // This delegates to shmem's module init with the hipModule_t.
-  // NOTE: callers should use the Python shmem_module_init path for this.
+  hipModule_t mod = KernelManager::Instance().GetModule(kernel_type);
+  if (mod) {
+    mori::shmem::ShmemModuleInit(reinterpret_cast<void*>(mod));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shmem C API (torch-free, for JAX-only usage via ctypes)
+// ---------------------------------------------------------------------------
+
+int mori_ffi_shmem_get_unique_id(void* uid_out, int* uid_size) {
+  mori::shmem::mori_shmem_uniqueid_t uid;
+  mori::shmem::ShmemGetUniqueId(&uid);
+  std::memcpy(uid_out, uid.data(), uid.size());
+  *uid_size = static_cast<int>(uid.size());
+  return 0;
+}
+
+int64_t mori_ffi_shmem_init_attr(unsigned int flags, int rank, int nranks,
+                                  const void* uid_data, int uid_size) {
+  mori::shmem::mori_shmem_init_attr_t attr;
+  mori::shmem::mori_shmem_uniqueid_t uid;
+  std::memcpy(uid.data(), uid_data, uid_size);
+  mori::shmem::ShmemSetAttrUniqueIdArgs(rank, nranks, &uid, &attr);
+  return mori::shmem::ShmemInitAttr(flags, &attr);
+}
+
+int64_t mori_ffi_shmem_finalize() { return mori::shmem::ShmemFinalize(); }
+
+int64_t mori_ffi_shmem_module_init(uint64_t hip_module) {
+  return mori::shmem::ShmemModuleInit(reinterpret_cast<void*>(hip_module));
+}
+
+int64_t mori_ffi_load_shmem_module(const char* hsaco_path) {
+  return mori::shmem::LoadShmemModule(hsaco_path);
+}
+
+int mori_ffi_shmem_mype() { return mori::shmem::ShmemMyPe(); }
+int mori_ffi_shmem_npes() { return mori::shmem::ShmemNPes(); }
+void mori_ffi_shmem_barrier_all() { mori::shmem::ShmemBarrierAll(); }
+
+void mori_ffi_shmem_barrier_on_stream(int64_t stream) {
+  mori::shmem::ShmemBarrierOnStream(reinterpret_cast<hipStream_t>(stream));
+}
+
+uint64_t mori_ffi_shmem_malloc(uint64_t size) {
+  return reinterpret_cast<uint64_t>(mori::shmem::ShmemMalloc(size));
+}
+
+void mori_ffi_shmem_free(uint64_t ptr) {
+  mori::shmem::ShmemFree(reinterpret_cast<void*>(ptr));
+}
+
+int64_t mori_ffi_shmem_buffer_register(uint64_t ptr, uint64_t size) {
+  return mori::shmem::ShmemBufferRegister(reinterpret_cast<void*>(ptr), size);
+}
+
+int64_t mori_ffi_shmem_buffer_deregister(uint64_t ptr, uint64_t size) {
+  return mori::shmem::ShmemBufferDeregister(reinterpret_cast<void*>(ptr), size);
+}
+
+uint64_t mori_ffi_shmem_ptr_p2p(uint64_t dest_ptr, int my_pe, int dest_pe) {
+  return mori::shmem::ShmemPtrP2p(dest_ptr, my_pe, dest_pe);
+}
+
+int mori_ffi_shmem_num_qp_per_pe() { return mori::shmem::ShmemNumQpPerPe(); }
+
+unsigned int mori_ffi_shmem_init_flag_uniqueid() {
+  return mori::shmem::MORI_SHMEM_INIT_WITH_UNIQUEID;
 }
 
 }  // extern "C"

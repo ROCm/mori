@@ -174,3 +174,17 @@ def destroy_handle(handle_id: int) -> None:
     """Destroy an EpDispatchCombineHandle by its ID."""
     lib = _load_library()
     lib.mori_ffi_destroy_handle(handle_id)
+
+
+def shmem_module_init_for_kernel(kernel_type: int):
+    """Initialize globalGpuStates in a registered kernel module.
+
+    Must be called after both shmem_init and register_kernel_module.
+    This copies the shmem peer addresses and PE info into the kernel
+    module's device symbols so that shmem device functions work.
+
+    Args:
+        kernel_type: KernelType enum value matching a previously registered module
+    """
+    lib = _load_library()
+    lib.mori_ffi_shmem_module_init_from_kernel(kernel_type)
