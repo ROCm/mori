@@ -40,6 +40,7 @@
 #include "mori/application/utils/check.hpp"
 #include "mori/shmem/shmem.hpp"
 #include "mori/core/transport/rdma/device_primitives.hpp"
+#include "mori/core/transport/sdma/device_primitives.hpp"
 
 using namespace mori::core;
 using namespace mori::application;
