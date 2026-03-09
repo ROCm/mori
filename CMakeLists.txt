@@ -22,12 +22,14 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(USE_ROCM "Whether to use rocm" ON)
 option(USE_BNXT "Whether to use BNXT NIC" OFF)
 option(USE_IONIC "Whether to use IONIC" OFF)
+option(USE_MPI "Whether to use MPI bootstrap" ON)
 option(BUILD_EXAMPLES "Whether to build examples" ON)
 option(BUILD_APPLICATION "Whether to build application library" ON)
 option(BUILD_SHMEM "Whether to build shmem library" ON)
 option(BUILD_OPS "Whether to build mori operation kernels" ON)
 option(BUILD_IO "Whether to build mori io library" ON)
 option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
+option(BUILD_XLA_FFI_OPS "Whether to build mori xla ffi python bindings" OFF)
 option(BUILD_TESTS "Whether to build mori CPP tests" ON)
 option(ENABLE_PROFILER "Enable kernel profiling" OFF)
 option(ENABLE_DEBUG_PRINTF "Enable debug printf in device kernels" OFF)
@@ -109,6 +111,13 @@ if(USE_IONIC)
   add_compile_definitions(ENABLE_IONIC)
 endif()
 message(STATUS "Host NIC: USE_BNXT=${USE_BNXT}, USE_IONIC=${USE_IONIC}")
+
+if(BUILD_XLA_FFI_OPS)
+  add_compile_definitions(BUILD_XLA_FFI_OPS)
+  set(XLA_INCLUDE_DIR "/tf/xla" CACHE PATH "XLA include directory for FFI custom calls") 
+endif()
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-literal-operator")
 
 # ---------------------------------------------------------------------------
 # Device NIC: detect exactly one provider for IBGDA dispatch in device code.

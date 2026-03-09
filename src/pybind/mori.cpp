@@ -33,4 +33,7 @@ PYBIND11_MODULE(libmori_pybinds, m) {
   mori::RegisterMoriOps(m);
   mori::RegisterMoriShmem(m);
   mori::RegisterMoriIo(m);
+#ifdef BUILD_XLA_FFI_OPS
+  mori::RegisterXLAFFIOps(m);
+#endif
 }

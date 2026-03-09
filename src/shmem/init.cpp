@@ -719,12 +719,13 @@ int ShmemFinalize() {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      Other Initialization APIs                                */
 /* ---------------------------------------------------------------------------------------------- */
-
+#ifdef MORI_HAS_MPI
 int ShmemMpiInit(MPI_Comm mpiComm) {
   return ShmemInit(new application::MpiBootstrapNetwork(mpiComm));
 }
 
 int ShmemInit() { return ShmemMpiInit(MPI_COMM_WORLD); }
+#endif // MORI_HAS_MPI
 
 int ShmemTorchProcessGroupInit(const std::string& groupName) {
 #ifdef MORI_HAS_TORCH
@@ -857,7 +858,7 @@ int ShmemInitAttr(unsigned int flags, mori_shmem_init_attr_t* attr) {
     MORI_SHMEM_ERROR("Invalid arguments");
     return -1;
   }
-
+#ifdef MORI_HAS_MPI
   // MPI-based initialization
   if (flags == MORI_SHMEM_INIT_WITH_MPI_COMM) {
     if (attr->mpi_comm == nullptr) {
@@ -867,7 +868,7 @@ int ShmemInitAttr(unsigned int flags, mori_shmem_init_attr_t* attr) {
     int result = ShmemMpiInit(*reinterpret_cast<MPI_Comm*>(attr->mpi_comm));
     return (result == 0) ? 0 : -1;
   }
-
+#endif // MORI_HAS_MPI
   // UniqueId-based initialization
   if (flags == MORI_SHMEM_INIT_WITH_UNIQUEID) {
     // Validate rank parameters
