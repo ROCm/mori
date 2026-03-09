@@ -318,6 +318,7 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
                                              int warpPerBlock, hipStream_t stream, int hiddenDim) {
   const int actualHiddenDim = (hiddenDim > 0) ? hiddenDim : config.hiddenDim;
   assert(actualHiddenDim > 0 && actualHiddenDim <= config.hiddenDim);
+  this->curHiddenDim = actualHiddenDim;
   size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
   size_t actualRdmaBlockNum = (rdmaBlockNum <= 0) ? config.rdmaBlockNum : rdmaBlockNum;
   dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
@@ -357,6 +358,8 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
 
 void EpDispatchCombineHandle::LaunchDispatchRecv(KernelType kernelType, int blockNum,
                                                  int warpPerBlock, hipStream_t stream) {
+  const int actualHiddenDim = curHiddenDim;
+  assert(actualHiddenDim > 0 && actualHiddenDim <= config.hiddenDim);
   size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
   size_t actualBlockNum = (blockNum <= 0) ? config.blockNum : blockNum;
   dim3 grid(actualBlockNum);
@@ -371,6 +374,7 @@ void EpDispatchCombineHandle::LaunchDispatchRecv(KernelType kernelType, int bloc
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;
         using DataT = typename ArgsT::data_type;
+        args.config.hiddenDim = actualHiddenDim;
         if (kernelType == KernelType::AsyncLL) {
           assert(config.useExternalInpBuffer);
           assert((actualBlockNum % config.worldSize) == 0);
@@ -392,6 +396,7 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
                                             hipStream_t stream, int hiddenDim) {
   const int actualHiddenDim = (hiddenDim > 0) ? hiddenDim : config.hiddenDim;
   assert(actualHiddenDim > 0 && actualHiddenDim <= config.hiddenDim);
+  this->curHiddenDim = actualHiddenDim;
   // Determine actual values: use parameter if >= 0, otherwise use config
   const size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
   const size_t actualRdmaBlockNum = (rdmaBlockNum <= 0) ? config.rdmaBlockNum : rdmaBlockNum;
@@ -484,6 +489,8 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
 
 void EpDispatchCombineHandle::LaunchCombineRecv(KernelType kernelType, int blockNum,
                                                 int warpPerBlock, hipStream_t stream) {
+  const int actualHiddenDim = curHiddenDim;
+  assert(actualHiddenDim > 0 && actualHiddenDim <= config.hiddenDim);
   size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
   size_t actualBlockNum = (blockNum <= 0) ? config.blockNum : blockNum;
   dim3 grid(actualBlockNum);
@@ -494,6 +501,7 @@ void EpDispatchCombineHandle::LaunchCombineRecv(KernelType kernelType, int block
       [&](auto&& args) {
         using ArgsT = std::decay_t<decltype(args)>;
         using DataT = typename ArgsT::data_type;
+        args.config.hiddenDim = actualHiddenDim;
         size_t sharedMemSize =
             actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
         if (kernelType == KernelType::AsyncLL) {
@@ -529,6 +537,7 @@ void EpDispatchCombineHandle::LaunchDispatchForStandardMoE(KernelType kernelType
                                                            hipStream_t stream, int hiddenDim) {
   const int actualHiddenDim = (hiddenDim > 0) ? hiddenDim : config.hiddenDim;
   assert(actualHiddenDim > 0 && actualHiddenDim <= config.hiddenDim);
+  this->curHiddenDim = actualHiddenDim;
   size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
   size_t actualRdmaBlockNum = (rdmaBlockNum <= 0) ? config.rdmaBlockNum : rdmaBlockNum;
   dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);
@@ -565,6 +574,7 @@ void EpDispatchCombineHandle::LaunchCombineForStandardMoE(KernelType kernelType,
                                                           hipStream_t stream, int hiddenDim) {
   const int actualHiddenDim = (hiddenDim > 0) ? hiddenDim : config.hiddenDim;
   assert(actualHiddenDim > 0 && actualHiddenDim <= config.hiddenDim);
+  this->curHiddenDim = actualHiddenDim;
   size_t actualWarpNumPerBlock = (warpPerBlock <= 0) ? config.warpNumPerBlock : warpPerBlock;
   size_t actualRdmaBlockNum = (rdmaBlockNum <= 0) ? config.rdmaBlockNum : rdmaBlockNum;
   dim3 grid((blockNum <= 0) ? config.blockNum : blockNum);

@@ -209,8 +209,10 @@ class EpDispatchCombineHandle {
   void FinalizeBarrier();
 
  public:
-  // Number of tokens on this rank and size of scale data type, updated at each round of inference
+  // Updated at each round of inference
   index_t curRankNumToken{0};
+  int curHiddenDim{-1};
+
   index_t multiProcessorCount{0};
   index_t maxThreads{0};
 
