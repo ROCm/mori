@@ -117,13 +117,11 @@ class TestFFILifecycle(unittest.TestCase):
         self.assertTrue(os.path.isfile(hsaco))
         register_kernel_module(0, hsaco)
 
-    def test_handle_create_destroy(self):
-        from mori.jit.core import compile_genco
-        from mori.jax._ffi_registry import _load_library, register_kernel_module
+    def _init_shmem(self):
         from mori.jax.shmem import (
-            _ensure_shmem_module, shmem_get_unique_id,
-            shmem_init_attr, shmem_finalize,
+            _ensure_shmem_module, shmem_get_unique_id, shmem_init_attr,
         )
+        from mori.jax._ffi_registry import _load_library
 
         _ensure_shmem_module()
         lib = _load_library()
@@ -132,15 +130,100 @@ class TestFFILifecycle(unittest.TestCase):
         rc = shmem_init_attr(flag, 0, 1, uid)
         self.assertEqual(rc, 0)
 
+    def test_handle_create_destroy(self):
+        from mori.jit.core import compile_genco
+        from mori.jax._ffi_registry import _load_library, register_kernel_module
+        from mori.jax.shmem import shmem_finalize
+
+        self._init_shmem()
         try:
             hsaco = compile_genco("ep_intranode")
             register_kernel_module(0, hsaco)
 
+            lib = _load_library()
             handle_id = lib.mori_ffi_create_handle(
                 0, 1, 4096, 0, 0, 4, 128, 1, 2, 1, 1, 0, 1, 0, 1,
             )
             self.assertGreater(handle_id, 0)
             lib.mori_ffi_destroy_handle(handle_id)
+        finally:
+            shmem_finalize()
+
+    def test_shmem_malloc_dlpack_roundtrip(self):
+        """shmem-allocated memory can be wrapped as jax.Array via DLPack."""
+        import jax.numpy as jnp
+        from mori.jax.shmem import (
+            shmem_malloc, shmem_free, shmem_finalize,
+            shmem_ptr_to_jax, jax_data_ptr,
+        )
+
+        self._init_shmem()
+        try:
+            ptr = shmem_malloc(1024 * 2)
+            self.assertGreater(ptr, 0)
+
+            arr = shmem_ptr_to_jax(ptr, (32, 32), jnp.bfloat16)
+            self.assertEqual(arr.shape, (32, 32))
+            self.assertEqual(arr.dtype, jnp.bfloat16)
+
+            ptr_back = jax_data_ptr(arr)
+            self.assertEqual(ptr, ptr_back)
+
+            for dt, shape in [
+                (jnp.float32, (256,)),
+                (jnp.int32, (256,)),
+                (jnp.float16, (32, 16)),
+                (jnp.uint8, (2048,)),
+            ]:
+                with self.subTest(dtype=dt):
+                    a = shmem_ptr_to_jax(ptr, shape, dt)
+                    self.assertEqual(a.shape, shape)
+                    self.assertEqual(a.dtype, dt)
+
+            shmem_free(ptr)
+        finally:
+            shmem_finalize()
+
+    def test_kernel_launch_single_process(self):
+        """JIT-compiled shmem kernel can be launched on GPU via the JAX path.
+
+        Full torch-free chain: mori.jax.shmem (ctypes) → mori.jit (pure Python)
+        → HipModule (ctypes) → hipModuleLaunchKernel → GPU execution.
+        """
+        import ctypes as ct
+        from mori.jit.core import compile_genco
+        from mori.jit.hip_driver import HipModule
+        from mori.jax._ffi_registry import _load_library
+        from mori.jax.shmem import shmem_finalize
+
+        self._init_shmem()
+        try:
+            lib = _load_library()
+
+            hsaco = compile_genco("shmem_kernels")
+            mod = HipModule(hsaco)
+            lib.mori_ffi_shmem_module_init(mod._module.value)
+
+            func = mod.get_function("mori_shmem_barrier_all_block")
+            self.assertIsNotNone(func._func)
+
+            _hip = ct.CDLL("libamdhip64.so")
+            _hip.hipModuleLaunchKernel.restype = ct.c_int
+            _hip.hipModuleLaunchKernel.argtypes = [
+                ct.c_void_p,
+                ct.c_uint, ct.c_uint, ct.c_uint,
+                ct.c_uint, ct.c_uint, ct.c_uint,
+                ct.c_uint, ct.c_void_p, ct.c_void_p, ct.c_void_p,
+            ]
+
+            err = _hip.hipModuleLaunchKernel(
+                func._func, 1, 1, 1, 64, 1, 1, 0, None, None, None,
+            )
+            self.assertEqual(err, 0, f"hipModuleLaunchKernel failed: {err}")
+
+            _hip.hipDeviceSynchronize.restype = ct.c_int
+            err = _hip.hipDeviceSynchronize()
+            self.assertEqual(err, 0, f"hipDeviceSynchronize failed: {err}")
         finally:
             shmem_finalize()
 
