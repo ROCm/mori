@@ -253,6 +253,23 @@ def _compile_one_genco(args: tuple) -> str:
     return output_path
 
 
+def _update_latest_symlink(hsaco_path: Path) -> None:
+    """Maintain a latest/ directory with symlinks to the most recent .hsaco files.
+
+    Structure: <arch>_<nic>/latest/<kernel>.hsaco -> ../<hash>/<kernel>.hsaco
+    This allows C++ AutoLoad to find JIT-compiled kernels without knowing the hash.
+    """
+    try:
+        latest_dir = hsaco_path.parent.parent / "latest"
+        latest_dir.mkdir(exist_ok=True)
+        link = latest_dir / hsaco_path.name
+        target = os.path.relpath(hsaco_path, latest_dir)
+        link.unlink(missing_ok=True)
+        link.symlink_to(target)
+    except OSError:
+        pass
+
+
 def compile_genco(kernel_name: str) -> str | list[str]:
     """JIT compile kernel .hip source(s) to .hsaco via --genco. Returns cached path(s).
 
@@ -326,17 +343,20 @@ def compile_genco(kernel_name: str) -> str | list[str]:
     hsaco_path = cache_dir / f"{kernel_name}.hsaco"
 
     if hsaco_path.is_file():
+        _update_latest_symlink(hsaco_path)
         return str(hsaco_path)
 
     lock_path = cache_dir / f".{kernel_name}.hsaco.lock"
     with FileBaton(lock_path, wait_for=str(hsaco_path)) as baton:
         if baton.skipped or hsaco_path.is_file():
+            _update_latest_symlink(hsaco_path)
             return str(hsaco_path)
 
         nic = detect_nic_type()
         print(f"[mori-jit] Compiling {kernel_name} for {cfg.arch} (nic={nic}) ...")
         _hipcc_genco(cfg, source, include_dirs, hsaco_path)
         print(f"[mori-jit]   Cached: {hsaco_path}")
+        _update_latest_symlink(hsaco_path)
 
     return str(hsaco_path)
 

@@ -33,6 +33,7 @@ option(BUILD_TESTS "Whether to build mori CPP tests" ON)
 option(ENABLE_PROFILER "Enable kernel profiling" OFF)
 option(ENABLE_DEBUG_PRINTF "Enable debug printf in device kernels" OFF)
 option(ENABLE_STANDARD_MOE_ADAPT "Enable standard moe adapt" OFF)
+option(BUILD_OPS_DEVICE "AOT compile EP kernels to .hsaco(requires hipcc)" OFF)
 
 # ---------------------------------------------------------------------------
 # Host NIC: link all available NIC libraries (can be multiple). Only requires
@@ -316,8 +317,8 @@ else()
       ""
       CACHE STRING "Device NIC provider" FORCE)
 endif()
-message(
-  STATUS "Device NIC: ${_detected_device_nic} (${MORI_DEVICE_NIC_DEFINE})")
+set(MORI_DEVICE_NIC "${_detected_device_nic}" CACHE STRING "Detected device NIC type" FORCE)
+message(STATUS "Device NIC: ${_detected_device_nic} (${MORI_DEVICE_NIC_DEFINE})")
 
 message(STATUS "ENABLE_PROFILER = ${ENABLE_PROFILER}")
 if(ENABLE_PROFILER)
@@ -474,4 +475,29 @@ endif()
 
 if(BUILD_TESTS)
   add_subdirectory(tests/cpp)
+endif()
+
+# ---------------------------------------------------------------------------
+# Install rules
+# ---------------------------------------------------------------------------
+# Shared libraries
+if(BUILD_APPLICATION)
+  install(TARGETS mori_application LIBRARY DESTINATION lib)
+endif()
+if(BUILD_SHMEM)
+  install(TARGETS mori_shmem LIBRARY DESTINATION lib)
+endif()
+if(BUILD_OPS)
+  install(TARGETS mori_ops LIBRARY DESTINATION lib)
+endif()
+if(BUILD_IO)
+  install(TARGETS mori_io LIBRARY DESTINATION lib)
+endif()
+
+# Public headers
+install(DIRECTORY include/mori DESTINATION include)
+
+# Logging (spdlog is statically linked, but install the shared lib if built)
+if(TARGET spdlog)
+  install(TARGETS spdlog ARCHIVE DESTINATION lib)
 endif()
