@@ -78,11 +78,10 @@ __global__ void ShmemAllReduceKernel(
   // =========================================================================
   if (blockIdx.x == 0 && warpId < npes && laneId == 0) {
     int destPe = warpId;
-    RdmaMemoryRegion source = gatherObj->GetRdmaMemoryRegion(myPe);
     size_t srcOffset = static_cast<size_t>(destPe) * chunkBytes;
     size_t dstOffset = static_cast<size_t>(myPe) * chunkBytes;
 
-    ShmemPutMemNbiThread(gatherObj, dstOffset, source, srcOffset, chunkBytes, destPe);
+    ShmemPutMemNbiThread(gatherObj, dstOffset, gatherObj, srcOffset, chunkBytes, destPe);
   }
 
   if (blockIdx.x == 0 && warpId < npes && laneId == 0) {
