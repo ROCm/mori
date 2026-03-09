@@ -29,8 +29,14 @@ if(BUILD_TORCH_BOOTSTRAP)
   endif()
 endif()
 
+option(BUILD_MPI_BOOTSTRAP "Whether to build MPI bootstrap" ON)
+
+if(BUILD_MPI_BOOTSTRAP)
+  list(APPEND MORI_APP_SOURCES bootstrap/mpi_bootstrap.cpp)
+  add_compile_definitions(MORI_HAS_MPI)
+endif()
+
 set(MORI_APP_SOURCES
-  bootstrap/mpi_bootstrap.cpp
   bootstrap/socket_bootstrap.cpp
   bootstrap/local_bootstrap.cpp)
 
@@ -66,7 +72,6 @@ find_library(HSA_RUNTIME_LIB hsa-runtime64 HINTS /opt/rocm/lib REQUIRED)
 target_link_libraries(
   mori_application
   PUBLIC
-  MPI::MPI_CXX
   ibverbs
   hip::host
   mlx5
@@ -83,6 +88,10 @@ endif()
 
 if(USE_IONIC)
 	target_link_libraries(mori_application PUBLIC ${IONIC_LIB})
+endif()
+
+if(BUILD_MPI_BOOTSTRAP)
+  target_link_libraries(mori_application PUBLIC MPI::MPI_CXX)
 endif()
 
 if(BUILD_TORCH_BOOTSTRAP)

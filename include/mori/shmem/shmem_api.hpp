@@ -52,8 +52,10 @@ constexpr unsigned int MORI_SHMEM_INIT_WITH_UNIQUEID = 1;
 
 // TODO: provide unified initialize / finalize APIs
 int ShmemInit(application::BootstrapNetwork* bootNet);
+#ifdef MORI_HAS_MPI
 int ShmemInit();  // Default initialization using MPI_COMM_WORLD
 int ShmemMpiInit(MPI_Comm);
+#endif
 int ShmemTorchProcessGroupInit(const std::string& groupName);
 
 // UniqueId-based initialization APIs (nvshmem/rocshmem compatible)
