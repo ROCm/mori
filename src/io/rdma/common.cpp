@@ -21,8 +21,10 @@
 // SOFTWARE.
 #include "src/io/rdma/common.hpp"
 
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <numeric>
 #include <thread>
 
@@ -35,8 +37,14 @@ static int GetSqBackoffTimeoutUs() {
   static const int value = []() {
     const char* env = std::getenv("MORI_IO_SQ_BACKOFF_TIMEOUT_US");
     if (env && env[0] != '\0') {
-      int v = std::atoi(env);
-      if (v > 0) return v;
+      errno = 0;
+      char* end = nullptr;
+      long v = std::strtol(env, &end, 10);
+      if (end != env && *end == '\0' && errno == 0 && v > 0 &&
+          v <= std::numeric_limits<int>::max()) {
+        return static_cast<int>(v);
+      }
+      MORI_IO_WARN("Invalid MORI_IO_SQ_BACKOFF_TIMEOUT_US='{}', using default 10000", env);
     }
     return 10000;
   }();
@@ -145,25 +153,36 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
                              CqCallbackMeta* callbackMeta, TransferUniqueId id, bool isRead,
                              int postBatchSize) {
   MORI_IO_FUNCTION_TIMER;
+  bool callbackOwnedByCq = false;
+  auto cleanupCallbackMetaIfUnowned = [&]() {
+    if (!callbackOwnedByCq && callbackMeta != nullptr) {
+      delete callbackMeta;
+      callbackMeta = nullptr;
+    }
+  };
 
   if ((localOffsets.size() != remoteOffsets.size()) || (sizes.size() != remoteOffsets.size())) {
+    cleanupCallbackMetaIfUnowned();
     return {StatusCode::ERR_INVALID_ARGS,
             "lengths of local offsets, remote offsets or sizes mismatch"};
   }
 
   size_t batchSize = sizes.size();
   if (batchSize == 0) {
+    cleanupCallbackMetaIfUnowned();
     return {StatusCode::SUCCESS, ""};
   }
 
   for (size_t i = 0; i < batchSize; i++) {
     if (((localOffsets[i] + sizes[i]) > local.length) ||
         ((remoteOffsets[i] + sizes[i]) > remote.length)) {
+      cleanupCallbackMetaIfUnowned();
       return {StatusCode::ERR_INVALID_ARGS, "length out of range"};
     }
   }
 
   if (eps.empty()) {
+    cleanupCallbackMetaIfUnowned();
     return {StatusCode::ERR_INVALID_ARGS, "no endpoints"};
   }
 
@@ -281,6 +300,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     // waiting for CQEs from earlier signaled WRs to drain depth.
     std::string reserveErr;
     if (!TryReserveSqDepth(eps[epId], batchWrNum, epId, "batch", &reserveErr)) {
+      cleanupCallbackMetaIfUnowned();
       return {StatusCode::ERR_RDMA_OP, reserveErr};
     }
 
@@ -339,6 +359,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
       const bool lastWasPosted = (postedCount == batchWrNum);
       if (needSignal && lastWasPosted) {
         // Signaled WR was posted; CQ path owns the release for this EP.
+        callbackOwnedByCq = true;
       } else if (cbMsg != nullptr) {
         delete cbMsg;
       }
@@ -350,6 +371,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
             postedCount, batchWrNum);
       }
 
+      cleanupCallbackMetaIfUnowned();
       return {StatusCode::ERR_RDMA_OP, "ibv_post_send failed with " + std::to_string(ret) + ": " +
                                            strerror(ret) + " (posted " +
                                            std::to_string(postedCount) + "/" +
@@ -357,6 +379,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     }
 
     if (needSignal) {
+      callbackOwnedByCq = true;
       epWrsSinceSignal[epId] = 0;
       epMergedSinceSignal[epId] = 0;
     }
