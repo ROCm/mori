@@ -287,10 +287,23 @@ This copies the current GPU states to the `globalGpuStates` symbol in the dynami
 
 ## Environment Variables
 
-| Variable | Description |
-|----------|-------------|
-| `MORI_SHMEM_HEAP_SIZE` | Symmetric heap size (e.g., `"6G"`, `"2G"`, `"512M"`). Must be set before initialization. |
-| `MORI_RDMA_DEVICES` | RDMA NIC selection. Include: `mlx5_0,mlx5_1`. Exclude: `^mlx5_2,mlx5_3` |
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MORI_SHMEM_HEAP_SIZE` | Symmetric heap size (e.g., `"6G"`, `"2G"`, `"512M"`). Must be set before initialization. | Required |
+| `MORI_SHMEM_MODE` | Heap mode: `"static"`, `"vmm"`, or `"isolation"` | `"static"` |
+| `MORI_SHMEM_HEAP_TYPE` | Heap memory type: `"normal"` (cached) or `"uncached"` | `"uncached"` |
+| `MORI_SHMEM_VMM_CHUNK_SIZE` | VMM mode chunk size in bytes | Auto |
+| `MORI_SOCKET_IFNAME` | Network interface for shmem bootstrap TCP connections (e.g., `"lo"`, `"eth0"`) | Auto-detect |
+| `MORI_RDMA_DEVICES` | RDMA NIC selection. Include: `mlx5_0,mlx5_1`. Exclude: `^mlx5_2,mlx5_3` | All available |
+| `MORI_NUM_QP_PER_PE` | Number of RDMA queue pairs per PE | `1` |
+| `MORI_IB_GID_INDEX` | InfiniBand GID index for RDMA connections | Auto-detect |
+| `MORI_RDMA_SL` | RDMA service level | Auto |
+| `MORI_RDMA_TC` | RDMA traffic class | Auto |
+| `MORI_DISABLE_P2P` | Disable P2P (XGMI) transport, force RDMA | Not set |
+| `MORI_DISABLE_TOPO` | Disable topology detection | Not set |
+| `MORI_GLOBAL_LOG_LEVEL` | Global log verbosity: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | `INFO` |
+| `MORI_PRECOMPILE` | Precompile all JIT kernels on import | Not set |
+| `MORI_DISABLE_JIT` | Disable JIT compilation of device bitcode | Not set |
 
 ---
 

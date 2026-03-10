@@ -91,6 +91,35 @@ Allocate GPU memory accessible across all ranks:
 
 See the `Shmem Guide <MORI-SHMEM-GUIDE.md>`_ for full API reference.
 
+MORI-IR: Device Bitcode for GPU Kernels
+-----------------------------------------
+
+Use MORI shmem device functions inside Triton (or any LLVM-based) kernels:
+
+.. code-block:: python
+
+   from mori.ir import find_bitcode, MORI_DEVICE_FUNCTIONS
+   from mori.ir.triton import get_extern_libs, install_hook
+   import mori.ir.triton as mori_shmem_device
+
+   # Locate bitcode (auto JIT-compiled for current GPU + NIC)
+   bc_path = find_bitcode()
+
+   # Triton: install hook and use device functions in kernels
+   install_hook()
+
+   @triton.jit
+   def my_kernel(buf_ptr, BLOCK: tl.constexpr):
+       pe = mori_shmem_device.my_pe()
+       remote = mori_shmem_device.ptr_p2p(
+           buf_ptr.to(tl.uint64, bitcast=True), pe, (pe + 1) % mori_shmem_device.n_pes()
+       )
+       # ... read/write remote memory ...
+
+   my_kernel[(grid,)](buf, BLOCK=1024, extern_libs=get_extern_libs())
+
+See `MORI-IR Guide <MORI-IR-GUIDE.md>`_ for full device function table and non-Triton integration.
+
 Profiling with MORI-VIZ
 -------------------------
 
