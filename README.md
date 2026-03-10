@@ -16,7 +16,7 @@
 
 To help developers get started quickly, MORI also includes a suite of optimized libraries—**MORI-EP** (MoE dispatch & combine kernels), **MORI-IO** (p2p communication for KVCache transfer), and **MORI-CCL** (collective communication)—that deliver out-of-the-box performance, with support for AMD `Pensando DSC`, Broadcom `Thor2`, and NVIDIA Mellanox `ConnectX-7` NICs.
 
-Feature summary:
+## Features summary
 - Applications
     - MORI-EP: intra and inter-node dispatch/combine kernels with SOTA performance.
     - MORI-IO: point-to-point communication library with ultra-low overhead
@@ -24,19 +24,26 @@ Feature summary:
 - Framework
     - High-performance building blocks for IBGDA / P2P and more​
     - Modular & composable components for developing communication applications, such as transport management, topology detection and etc.
-    - Shmem-style APIs
-    - C++ level APIs
-    - Python level APIs
+    - Open-Shmem-style APIs
+    - C++ and Python level APIs
+
+## Documentation
+
+| **Topic** | **Description** | **Guide** |
+|---|---|---|
+| MORI-EP | Dispatch/combine API, kernel types, configuration, usage examples | [EP Guide](docs/MORI-EP-GUIDE.md) |
+| MORI-SHMEM | Symmetric memory APIs, initialization, memory management | [Shmem Guide](docs/MORI-SHMEM-GUIDE.md) |
+| MORI-IR | Device bitcode integration for Triton and other GPU kernel frameworks | [IR Guide](docs/MORI-IR-GUIDE.md) |
+| MORI-IO | P2P communication concepts, engine/backend/session design | [IO Guide](docs/MORI-IO-GUIDE.md) |
+| MORI-VIZ | Warp-level kernel profiler with Perfetto integration | [Profiler](docs/PROFILER.md) |
 
 ## Benchmarks
 
 ### MORI-EP
 
-Benchmark result on DeepSeek V3 model configurations:
+Benchmark on DeepSeek V3 model configurations:
 
-**Bandwidth Performance**
-
-4096 tokens per batch, 7168 hidden, top-8 experts, FP8 dispatching and BF16 combining
+**Bandwidth** (4096 tokens, 7168 hidden, top-8 experts, FP8 dispatch + BF16 combine)
 
 <table>
   <tr>
@@ -75,9 +82,7 @@ Benchmark result on DeepSeek V3 model configurations:
   </tr>
 </table>
 
-**Latency Performance**
-
-128 tokens per batch, 7168 hidden, top-8 experts, FP8 dispatching and BF16 combining
+**Latency** (128 tokens, 7168 hidden, top-8 experts, FP8 dispatch + BF16 combine)
 
 <table>
   <tr>
@@ -120,14 +125,9 @@ Benchmark result on DeepSeek V3 model configurations:
 
 ### MORI-IO
 
-**NOTE**: This is the preview version of MORI-IO Benchmark performance, we will soon merge MORI-IO into main branch
+**NOTE:** This is the preview version of MORI-IO benchmark performance.
 
-Benchmark result on the following configurations:
-- Operation: GPU direct RDMA READ
-- Mode: pairwise
-- Number of consecutive Transfer: 128
-- Number of GPUs: 1
-- Hardware: MI300X + Thor2
+GPU Direct RDMA READ, pairwise, 128 consecutive transfers, 1 GPU, MI300X + Thor2:
 
 ```
 +--------------------------------------------------------------------------------------------------------+
@@ -155,8 +155,6 @@ Benchmark result on the following configurations:
 |   1048576   |    128    |     134.22     |     48.44     |     48.32     |   2770.90    |   2777.76    |
 +-------------+-----------+----------------+---------------+---------------+--------------+--------------+
 ```
-
-- Session is a specific technique used in MORI-IO to reduce overhead
 
 ## Hardware Support Matrix
 
@@ -228,7 +226,9 @@ MORI_PRECOMPILE=1 python -c "import mori"
 python -c "import mori; print('OK')"
 ```
 
-### Test dispatch / combine
+## Testing
+
+### Test MORI-EP (dispatch / combine)
 
 ```bash
 cd /path/to/mori
@@ -247,7 +247,7 @@ python tests/python/ops/bench_dispatch_combine.py
 cd /path/to/mori
 export PYTHONPATH=/path/to/mori:$PYTHONPATH
 
-# Test correctness
+# Correctness tests
 pytest tests/python/io/
 
 # Benchmark performance (two nodes)
@@ -275,7 +275,6 @@ Welcome to MORI! We appreciate your interest in contributing. Whether you're fix
 MORI uses pre-commit hooks to maintain code quality. After cloning the repository:
 
 ```bash
-# Install and setup pre-commit
 pip install pre-commit
 cd /path/to/mori
 pre-commit install
