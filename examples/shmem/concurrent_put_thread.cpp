@@ -52,6 +52,12 @@ void Test2_PureAddressAPI_Block(int myPe);
 void Test3_LargeMultiChunk(int myPe);
 void Test4_MixedMallocFree(int myPe);
 void Test5_FragmentationReuse(int myPe);
+void Test8_BlockingLegacyAPI(int myPe);
+void Test9_BlockingPureAddressAPI(int myPe);
+void Test10_BlockingLegacyAPI_Block(int myPe);
+void Test11_BlockingPureAddressAPI_Block(int myPe);
+void Test12_BlockingWarpScope(int myPe);
+void Test13_BlockingBlockScope_MultiWarp(int myPe);
 
 // ============================================================================
 // GPU Kernels
@@ -160,6 +166,132 @@ __global__ void ConcurrentPutBlockKernel_PureAddr(int myPe, uint32_t* localBuff,
         ShmemQuietThread();
       }
     }
+  } else {
+    while (atomicAdd(localBuff + globalTid, 0) != sendPe) {
+    }
+  }
+}
+
+// Blocking PUT: Legacy API (Thread scope) — no separate quiet/fence needed
+__global__ void BlockingPutThreadKernel(int myPe, const SymmMemObjPtr memObj) {
+  constexpr int sendPe = 0;
+  constexpr int recvPe = 1;
+
+  int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
+  int threadOffset = globalTid * sizeof(uint32_t);
+
+  if (myPe == sendPe) {
+    ShmemPutMemThread(memObj, threadOffset, memObj, threadOffset, sizeof(uint32_t), recvPe, 1);
+  } else {
+    while (atomicAdd(reinterpret_cast<uint32_t*>(memObj->localPtr) + globalTid, 0) != sendPe) {
+    }
+  }
+}
+
+// Blocking PUT: Legacy API (Block scope)
+__global__ void BlockingPutBlockKernel(int myPe, const SymmMemObjPtr memObj, size_t numElements) {
+  constexpr int sendPe = 0;
+  constexpr int recvPe = 1;
+
+  int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (globalTid >= static_cast<int>(numElements)) {
+    return;
+  }
+
+  size_t blockElemOffset = static_cast<size_t>(blockIdx.x) * blockDim.x;
+  size_t blockByteOffset = blockElemOffset * sizeof(uint32_t);
+  size_t blockBytes = static_cast<size_t>(blockDim.x) * sizeof(uint32_t);
+
+  if (myPe == sendPe) {
+    ShmemPutMemBlock(memObj, blockByteOffset, memObj, blockByteOffset, blockBytes, recvPe, 1);
+  } else {
+    while (atomicAdd(reinterpret_cast<uint32_t*>(memObj->localPtr) + globalTid, 0) != sendPe) {
+    }
+  }
+}
+
+// Blocking PUT: Pure address API (Thread scope)
+__global__ void BlockingPutThreadKernel_PureAddr(int myPe, uint32_t* localBuff,
+                                                 size_t numElements) {
+  constexpr int sendPe = 0;
+  constexpr int recvPe = 1;
+
+  int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (globalTid >= numElements) {
+    return;
+  }
+
+  if (myPe == sendPe) {
+    uint32_t* src = localBuff + globalTid;
+    uint32_t* dest = localBuff + globalTid;
+    ShmemPutMemThread(dest, src, sizeof(uint32_t), recvPe, 1);
+  } else {
+    while (atomicAdd(localBuff + globalTid, 0) != sendPe) {
+    }
+  }
+}
+
+// Blocking PUT: Pure address API (Block scope)
+__global__ void BlockingPutBlockKernel_PureAddr(int myPe, uint32_t* localBuff,
+                                                size_t numElements) {
+  constexpr int sendPe = 0;
+  constexpr int recvPe = 1;
+
+  int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (globalTid >= static_cast<int>(numElements)) {
+    return;
+  }
+
+  size_t blockElemOffset = static_cast<size_t>(blockIdx.x) * blockDim.x;
+  size_t blockBytes = static_cast<size_t>(blockDim.x) * sizeof(uint32_t);
+  uint32_t* src = localBuff + blockElemOffset;
+  uint32_t* dest = localBuff + blockElemOffset;
+
+  if (myPe == sendPe) {
+    ShmemPutMemBlock(dest, src, blockBytes, recvPe, 1);
+  } else {
+    while (atomicAdd(localBuff + globalTid, 0) != sendPe) {
+    }
+  }
+}
+
+// Blocking PUT: Warp scope - each warp collectively puts one uint32_t
+__global__ void BlockingPutWarpKernel_PureAddr(int myPe, uint32_t* localBuff,
+                                               size_t numElements) {
+  constexpr int sendPe = 0;
+  constexpr int recvPe = 1;
+
+  int warpId = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+  int totalWarps = (gridDim.x * blockDim.x) / warpSize;
+
+  if (warpId >= numElements || warpId >= totalWarps) return;
+
+  if (myPe == sendPe) {
+    uint32_t* src = localBuff + warpId;
+    uint32_t* dest = localBuff + warpId;
+    ShmemPutMemWarp(dest, src, sizeof(uint32_t), recvPe, 1);
+  } else {
+    while (atomicAdd(localBuff + warpId, 0) != sendPe) {
+    }
+  }
+}
+
+// Blocking PUT: Block scope with 256 threads (4 warps) to test multi-warp sync
+__global__ void BlockingPutBlockKernel_MultiWarp(int myPe, uint32_t* localBuff,
+                                                 size_t numElements) {
+  constexpr int sendPe = 0;
+  constexpr int recvPe = 1;
+
+  int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (globalTid >= static_cast<int>(numElements)) return;
+
+  size_t blockElemOffset = static_cast<size_t>(blockIdx.x) * blockDim.x;
+  size_t blockBytes = static_cast<size_t>(blockDim.x) * sizeof(uint32_t);
+  uint32_t* src = localBuff + blockElemOffset;
+  uint32_t* dest = localBuff + blockElemOffset;
+
+  if (myPe == sendPe) {
+    ShmemPutMemBlock(dest, src, blockBytes, recvPe, 1);
   } else {
     while (atomicAdd(localBuff + globalTid, 0) != sendPe) {
     }
@@ -743,6 +875,346 @@ void Test5_FragmentationReuse(int myPe) {
   }
 }
 
+void Test8_BlockingLegacyAPI(int myPe) {
+  if (myPe == 0) {
+    printf("\n--- Test 8: Blocking PUT Legacy API (Thread scope) ---\n");
+  }
+
+  constexpr int threadNum = 128;
+  constexpr int blockNum = 3;
+  int numEle = threadNum * blockNum;
+  int buffSize = numEle * sizeof(uint32_t);
+
+  void* buff = ShmemMalloc(buffSize);
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff), myPe, numEle));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  SymmMemObjPtr buffObj = ShmemQueryMemObjPtr(buff);
+  assert(buffObj.IsValid());
+
+  if (myPe == 0) {
+    printf("Running blocking PUT legacy API test (thread scope)...\n");
+  }
+
+  MPI_Barrier(MPI_COMM_WORLD);
+  BlockingPutThreadKernel<<<blockNum, threadNum>>>(myPe, buffObj);
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  std::vector<uint32_t> hostBuff(numEle);
+  HIP_RUNTIME_CHECK(hipMemcpy(hostBuff.data(), buff, buffSize, hipMemcpyDeviceToHost));
+
+  if (myPe == 1) {
+    bool success = true;
+    for (int i = 0; i < numEle; i++) {
+      if (hostBuff[i] != 0) {
+        printf("Error at index %d: expected 0, got %u\n", i, hostBuff[i]);
+        success = false;
+        break;
+      }
+    }
+    if (!success) {
+      printf("✗ Blocking PUT legacy API test FAILED!\n");
+    }
+  }
+
+  if (myPe == 0) {
+    printf("✓ Blocking PUT legacy API test PASSED! All %d elements verified.\n", numEle);
+  }
+
+  ShmemFree(buff);
+}
+
+void Test9_BlockingPureAddressAPI(int myPe) {
+  if (myPe == 0) {
+    printf("\n--- Test 9: Blocking PUT Pure Address API (Thread scope) ---\n");
+  }
+
+  const char* shmemMode = std::getenv("MORI_SHMEM_MODE");
+  bool skipPureAddress = (shmemMode != nullptr && std::string(shmemMode) == "ISOLATION");
+
+  if (skipPureAddress) {
+    if (myPe == 0) {
+      printf(
+          "⊘ SKIPPED (MORI_SHMEM_MODE=ISOLATION - pure address API not supported in isolation "
+          "mode)\n");
+    }
+    return;
+  }
+
+  constexpr int threadNum = 128;
+  constexpr int blockNum = 3;
+  int numEle = threadNum * blockNum;
+  int buffSize = numEle * sizeof(uint32_t);
+
+  void* buff = ShmemMalloc(buffSize);
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff), myPe, numEle));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  if (myPe == 0) {
+    printf("Running blocking PUT pure address API test (thread scope)...\n");
+  }
+
+  MPI_Barrier(MPI_COMM_WORLD);
+  BlockingPutThreadKernel_PureAddr<<<blockNum, threadNum>>>(
+      myPe, reinterpret_cast<uint32_t*>(buff), numEle);
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  std::vector<uint32_t> hostBuff(numEle);
+  HIP_RUNTIME_CHECK(hipMemcpy(hostBuff.data(), buff, buffSize, hipMemcpyDeviceToHost));
+
+  if (myPe == 1) {
+    bool success = true;
+    for (int i = 0; i < numEle; i++) {
+      if (hostBuff[i] != 0) {
+        printf("Error at index %d: expected 0, got %u\n", i, hostBuff[i]);
+        success = false;
+        break;
+      }
+    }
+    if (!success) {
+      printf("✗ Blocking PUT pure address API test FAILED!\n");
+    }
+  }
+
+  if (myPe == 0) {
+    printf("✓ Blocking PUT pure address API test PASSED! All %d elements verified.\n", numEle);
+  }
+
+  ShmemFree(buff);
+}
+
+void Test10_BlockingLegacyAPI_Block(int myPe) {
+  if (myPe == 0) {
+    printf("\n--- Test 10: Blocking PUT Legacy API (Block scope) ---\n");
+  }
+
+  constexpr int threadNum = 128;
+  constexpr int blockNum = 3;
+  int numEle = threadNum * blockNum;
+  int buffSize = numEle * sizeof(uint32_t);
+
+  void* buff = ShmemMalloc(buffSize);
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff), myPe, numEle));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  SymmMemObjPtr buffObj = ShmemQueryMemObjPtr(buff);
+  assert(buffObj.IsValid());
+
+  if (myPe == 0) {
+    printf("Running blocking PUT legacy API test (block scope)...\n");
+  }
+
+  MPI_Barrier(MPI_COMM_WORLD);
+  BlockingPutBlockKernel<<<blockNum, threadNum>>>(myPe, buffObj, numEle);
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  std::vector<uint32_t> hostBuff(numEle);
+  HIP_RUNTIME_CHECK(hipMemcpy(hostBuff.data(), buff, buffSize, hipMemcpyDeviceToHost));
+
+  if (myPe == 1) {
+    bool success = true;
+    for (int i = 0; i < numEle; i++) {
+      if (hostBuff[i] != 0) {
+        printf("Error at index %d: expected 0, got %u\n", i, hostBuff[i]);
+        success = false;
+        break;
+      }
+    }
+    if (!success) {
+      printf("✗ Blocking PUT legacy block API test FAILED!\n");
+    }
+  }
+
+  if (myPe == 0) {
+    printf("✓ Blocking PUT legacy block API test PASSED! All %d elements verified.\n", numEle);
+  }
+
+  ShmemFree(buff);
+}
+
+void Test11_BlockingPureAddressAPI_Block(int myPe) {
+  if (myPe == 0) {
+    printf("\n--- Test 11: Blocking PUT Pure Address API (Block scope) ---\n");
+  }
+
+  const char* shmemMode = std::getenv("MORI_SHMEM_MODE");
+  bool skipPureAddress = (shmemMode != nullptr && std::string(shmemMode) == "ISOLATION");
+
+  if (skipPureAddress) {
+    if (myPe == 0) {
+      printf(
+          "⊘ SKIPPED (MORI_SHMEM_MODE=ISOLATION - pure address API not supported in isolation "
+          "mode)\n");
+    }
+    return;
+  }
+
+  constexpr int threadNum = 128;
+  constexpr int blockNum = 3;
+  int numEle = threadNum * blockNum;
+  int buffSize = numEle * sizeof(uint32_t);
+
+  void* buff = ShmemMalloc(buffSize);
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff), myPe, numEle));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  if (myPe == 0) {
+    printf("Running blocking PUT pure address API test (block scope)...\n");
+  }
+
+  MPI_Barrier(MPI_COMM_WORLD);
+  BlockingPutBlockKernel_PureAddr<<<blockNum, threadNum>>>(
+      myPe, reinterpret_cast<uint32_t*>(buff), numEle);
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  std::vector<uint32_t> hostBuff(numEle);
+  HIP_RUNTIME_CHECK(hipMemcpy(hostBuff.data(), buff, buffSize, hipMemcpyDeviceToHost));
+
+  if (myPe == 1) {
+    bool success = true;
+    for (int i = 0; i < numEle; i++) {
+      if (hostBuff[i] != 0) {
+        printf("Error at index %d: expected 0, got %u\n", i, hostBuff[i]);
+        success = false;
+        break;
+      }
+    }
+    if (!success) {
+      printf("✗ Blocking PUT pure address block API test FAILED!\n");
+    }
+  }
+
+  if (myPe == 0) {
+    printf("✓ Blocking PUT pure address block API test PASSED! All %d elements verified.\n",
+           numEle);
+  }
+
+  ShmemFree(buff);
+}
+
+void Test12_BlockingWarpScope(int myPe) {
+  if (myPe == 0) {
+    printf("\n--- Test 12: Blocking PUT Warp Scope ---\n");
+  }
+
+  const char* shmemMode = std::getenv("MORI_SHMEM_MODE");
+  bool skipPureAddress = (shmemMode != nullptr && std::string(shmemMode) == "ISOLATION");
+
+  if (skipPureAddress) {
+    if (myPe == 0) {
+      printf("⊘ SKIPPED (MORI_SHMEM_MODE=ISOLATION)\n");
+    }
+    return;
+  }
+
+  constexpr int threadNum = 256;
+  constexpr int blockNum = 2;
+  int totalWarps = (threadNum * blockNum) / warpSize;
+  int buffSize = totalWarps * sizeof(uint32_t);
+
+  void* buff = ShmemMalloc(buffSize);
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff), myPe, totalWarps));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  if (myPe == 0) {
+    printf("Running blocking PUT warp scope test (%d warps, warpSize=%d)...\n", totalWarps,
+           warpSize);
+  }
+
+  MPI_Barrier(MPI_COMM_WORLD);
+  BlockingPutWarpKernel_PureAddr<<<blockNum, threadNum>>>(
+      myPe, reinterpret_cast<uint32_t*>(buff), totalWarps);
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  std::vector<uint32_t> hostBuff(totalWarps);
+  HIP_RUNTIME_CHECK(hipMemcpy(hostBuff.data(), buff, buffSize, hipMemcpyDeviceToHost));
+
+  if (myPe == 1) {
+    bool success = true;
+    for (int i = 0; i < totalWarps; i++) {
+      if (hostBuff[i] != 0) {
+        printf("Error at warp %d: expected 0, got %u\n", i, hostBuff[i]);
+        success = false;
+        break;
+      }
+    }
+    if (!success) {
+      printf("✗ Blocking PUT warp scope test FAILED!\n");
+    }
+  }
+
+  if (myPe == 0) {
+    printf("✓ Blocking PUT warp scope test PASSED! All %d warps verified.\n", totalWarps);
+  }
+
+  ShmemFree(buff);
+}
+
+void Test13_BlockingBlockScope_MultiWarp(int myPe) {
+  if (myPe == 0) {
+    printf("\n--- Test 13: Blocking PUT Block Scope (256 threads = 4 warps per block) ---\n");
+  }
+
+  const char* shmemMode = std::getenv("MORI_SHMEM_MODE");
+  bool skipPureAddress = (shmemMode != nullptr && std::string(shmemMode) == "ISOLATION");
+
+  if (skipPureAddress) {
+    if (myPe == 0) {
+      printf("⊘ SKIPPED (MORI_SHMEM_MODE=ISOLATION)\n");
+    }
+    return;
+  }
+
+  constexpr int threadNum = 256;
+  constexpr int blockNum = 4;
+  int numEle = threadNum * blockNum;
+  int buffSize = numEle * sizeof(uint32_t);
+
+  void* buff = ShmemMalloc(buffSize);
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(buff), myPe, numEle));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  if (myPe == 0) {
+    printf("Running blocking PUT block scope test (%d blocks x %d threads = %d warps/block)...\n",
+           blockNum, threadNum, threadNum / warpSize);
+  }
+
+  MPI_Barrier(MPI_COMM_WORLD);
+  BlockingPutBlockKernel_MultiWarp<<<blockNum, threadNum>>>(
+      myPe, reinterpret_cast<uint32_t*>(buff), numEle);
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  std::vector<uint32_t> hostBuff(numEle);
+  HIP_RUNTIME_CHECK(hipMemcpy(hostBuff.data(), buff, buffSize, hipMemcpyDeviceToHost));
+
+  if (myPe == 1) {
+    bool success = true;
+    for (int i = 0; i < numEle; i++) {
+      if (hostBuff[i] != 0) {
+        printf("Error at index %d: expected 0, got %u\n", i, hostBuff[i]);
+        success = false;
+        break;
+      }
+    }
+    if (!success) {
+      printf("✗ Blocking PUT block scope multi-warp test FAILED!\n");
+    }
+  }
+
+  if (myPe == 0) {
+    printf("✓ Blocking PUT block scope multi-warp test PASSED! All %d elements verified.\n",
+           numEle);
+  }
+
+  ShmemFree(buff);
+}
+
 __global__ void testShmemBarrierAllBlock() { ShmemBarrierAllBlock(); }
 
 void ConcurrentPutThread() {
@@ -784,6 +1256,12 @@ void ConcurrentPutThread() {
   Test3_LargeMultiChunk(myPe);
   Test4_MixedMallocFree(myPe);
   Test5_FragmentationReuse(myPe);
+  Test8_BlockingLegacyAPI(myPe);
+  Test9_BlockingPureAddressAPI(myPe);
+  Test10_BlockingLegacyAPI_Block(myPe);
+  Test11_BlockingPureAddressAPI_Block(myPe);
+  Test12_BlockingWarpScope(myPe);
+  Test13_BlockingBlockScope_MultiWarp(myPe);
 
   // Test 6: Device barrier via direct kernel launch
   constexpr int barrierThreadNum = 128;
@@ -817,6 +1295,12 @@ void ConcurrentPutThread() {
     printf("  - Test 3: Large multi-chunk allocation (>200MB)\n");
     printf("  - Test 4: Mixed malloc/free with reference counting\n");
     printf("  - Test 5: Fragmentation and VA reuse\n");
+    printf("  - Test 8: Blocking PUT Legacy API (Thread scope)\n");
+    printf("  - Test 9: Blocking PUT Pure Address API (Thread scope)\n");
+    printf("  - Test 10: Blocking PUT Legacy API (Block scope)\n");
+    printf("  - Test 11: Blocking PUT Pure Address API (Block scope)\n");
+    printf("  - Test 12: Blocking PUT Warp Scope\n");
+    printf("  - Test 13: Blocking PUT Block Scope (multi-warp)\n");
     printf("  - Test 6: ShmemBarrierAllBlock device barrier\n");
     printf("  - Test 7: ShmemBarrierOnStream host API barrier\n");
     printf("=================================================================\n");

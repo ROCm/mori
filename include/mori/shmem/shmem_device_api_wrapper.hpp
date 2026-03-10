@@ -103,6 +103,60 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_put_double_nbi_
 
 
 // ============================================================================
+// Blocking PUT APIs - Thread Scope (Address-based only)
+// ============================================================================
+__device__ __attribute__((visibility("default"))) int mori_shmem_putmem_thread(
+    void* dest, const void* source, size_t bytes, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) int mori_shmem_put_uint32_thread(
+    uint32_t* dest, const uint32_t* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) int mori_shmem_put_uint64_thread(
+    uint64_t* dest, const uint64_t* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) int mori_shmem_put_float_thread(
+    float* dest, const float* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) int mori_shmem_put_double_thread(
+    double* dest, const double* source, size_t nelems, int pe, int qpId);
+
+// ============================================================================
+// Blocking PUT APIs - Warp Scope (Address-based only)
+// ============================================================================
+__device__ __attribute__((visibility("default"))) int mori_shmem_putmem_warp(
+    void* dest, const void* source, size_t bytes, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) int mori_shmem_put_uint32_warp(
+    uint32_t* dest, const uint32_t* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) int mori_shmem_put_uint64_warp(
+    uint64_t* dest, const uint64_t* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) int mori_shmem_put_float_warp(
+    float* dest, const float* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) int mori_shmem_put_double_warp(
+    double* dest, const double* source, size_t nelems, int pe, int qpId);
+
+// ============================================================================
+// Blocking PUT APIs - Block Scope (Address-based only)
+// ============================================================================
+__device__ __attribute__((visibility("default"))) int mori_shmem_putmem_block(
+    void* dest, const void* source, size_t bytes, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) int mori_shmem_put_uint32_block(
+    uint32_t* dest, const uint32_t* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) int mori_shmem_put_uint64_block(
+    uint64_t* dest, const uint64_t* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) int mori_shmem_put_float_block(
+    float* dest, const float* source, size_t nelems, int pe, int qpId);
+
+__device__ __attribute__((visibility("default"))) int mori_shmem_put_double_block(
+    double* dest, const double* source, size_t nelems, int pe, int qpId);
+
+// ============================================================================
 // GetNbi APIs - Thread Scope (Address-based only)
 // ============================================================================
 __device__ __attribute__((visibility("default"))) int mori_shmem_getmem_nbi_thread(

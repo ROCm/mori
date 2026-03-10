@@ -614,6 +614,174 @@ void Test5_BlockingPureAddressAPI(int myPe) {
   ShmemFree(localBuff);
 }
 
+// Blocking GET: Warp scope - each warp collectively gets one uint32_t
+__global__ void BlockingGetWarpKernel_PureAddr(int myPe, uint32_t* localBuff,
+                                               uint32_t* remoteBuff, size_t numWarps) {
+  constexpr int getPe = 0;
+  constexpr int remotePe = 1;
+
+  int warpId = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+  if (warpId >= numWarps) return;
+
+  if (myPe == getPe) {
+    uint32_t* dest = localBuff + warpId;
+    uint32_t* src = remoteBuff + warpId;
+    ShmemGetMemWarp(dest, src, sizeof(uint32_t), remotePe, 1);
+  }
+}
+
+// Blocking GET: Block scope with 256 threads (4 warps) to test multi-warp sync
+__global__ void BlockingGetBlockKernel_MultiWarp(int myPe, uint32_t* localBuff,
+                                                 uint32_t* remoteBuff, size_t numElements) {
+  constexpr int getPe = 0;
+  constexpr int remotePe = 1;
+
+  int globalTid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (globalTid >= static_cast<int>(numElements)) return;
+
+  size_t blockElemOffset = static_cast<size_t>(blockIdx.x) * blockDim.x;
+  size_t blockBytes = static_cast<size_t>(blockDim.x) * sizeof(uint32_t);
+  uint32_t* dest = localBuff + blockElemOffset;
+  uint32_t* src = remoteBuff + blockElemOffset;
+
+  if (myPe == getPe) {
+    ShmemGetMemBlock(dest, src, blockBytes, remotePe, 1);
+  }
+}
+
+void Test6_BlockingWarpScope(int myPe) {
+  if (myPe == 0) {
+    printf("\n--- Test 6: Blocking GET Warp Scope ---\n");
+  }
+
+  const char* shmemMode = std::getenv("MORI_SHMEM_MODE");
+  bool skipPureAddress = (shmemMode != nullptr && std::string(shmemMode) == "ISOLATION");
+
+  if (skipPureAddress) {
+    if (myPe == 0) {
+      printf("⊘ SKIPPED (MORI_SHMEM_MODE=ISOLATION)\n");
+    }
+    return;
+  }
+
+  constexpr int threadNum = 256;
+  constexpr int blockNum = 2;
+  int totalWarps = (threadNum * blockNum) / warpSize;
+  int buffSize = totalWarps * sizeof(uint32_t);
+
+  void* remoteBuff = ShmemMalloc(buffSize);
+  void* localBuff = ShmemMalloc(buffSize);
+
+  if (myPe == 1) {
+    HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(remoteBuff), 1, totalWarps));
+  } else {
+    HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(remoteBuff), 0, totalWarps));
+  }
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(localBuff), 0xDEAD, totalWarps));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  if (myPe == 0) {
+    printf("Running blocking GET warp scope test (%d warps, warpSize=%d)...\n", totalWarps,
+           warpSize);
+  }
+
+  MPI_Barrier(MPI_COMM_WORLD);
+  BlockingGetWarpKernel_PureAddr<<<blockNum, threadNum>>>(
+      myPe, reinterpret_cast<uint32_t*>(localBuff), reinterpret_cast<uint32_t*>(remoteBuff),
+      totalWarps);
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  if (myPe == 0) {
+    std::vector<uint32_t> hostBuff(totalWarps);
+    HIP_RUNTIME_CHECK(hipMemcpy(hostBuff.data(), localBuff, buffSize, hipMemcpyDeviceToHost));
+
+    bool success = true;
+    for (int i = 0; i < totalWarps; i++) {
+      if (hostBuff[i] != 1) {
+        printf("Error at warp %d: expected 1, got %u\n", i, hostBuff[i]);
+        success = false;
+        break;
+      }
+    }
+    if (success) {
+      printf("✓ Blocking GET warp scope test PASSED! All %d warps verified.\n", totalWarps);
+    } else {
+      printf("✗ Blocking GET warp scope test FAILED!\n");
+    }
+  }
+
+  ShmemFree(remoteBuff);
+  ShmemFree(localBuff);
+}
+
+void Test7_BlockingBlockScope_MultiWarp(int myPe) {
+  if (myPe == 0) {
+    printf("\n--- Test 7: Blocking GET Block Scope (256 threads = 4 warps per block) ---\n");
+  }
+
+  const char* shmemMode = std::getenv("MORI_SHMEM_MODE");
+  bool skipPureAddress = (shmemMode != nullptr && std::string(shmemMode) == "ISOLATION");
+
+  if (skipPureAddress) {
+    if (myPe == 0) {
+      printf("⊘ SKIPPED (MORI_SHMEM_MODE=ISOLATION)\n");
+    }
+    return;
+  }
+
+  constexpr int threadNum = 256;
+  constexpr int blockNum = 4;
+  int numEle = threadNum * blockNum;
+  int buffSize = numEle * sizeof(uint32_t);
+
+  void* remoteBuff = ShmemMalloc(buffSize);
+  void* localBuff = ShmemMalloc(buffSize);
+
+  if (myPe == 1) {
+    HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(remoteBuff), 1, numEle));
+  } else {
+    HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(remoteBuff), 0, numEle));
+  }
+  HIP_RUNTIME_CHECK(hipMemsetD32(reinterpret_cast<uint32_t*>(localBuff), 0xDEAD, numEle));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  if (myPe == 0) {
+    printf("Running blocking GET block scope test (%d blocks x %d threads = %d warps/block)...\n",
+           blockNum, threadNum, threadNum / warpSize);
+  }
+
+  MPI_Barrier(MPI_COMM_WORLD);
+  BlockingGetBlockKernel_MultiWarp<<<blockNum, threadNum>>>(
+      myPe, reinterpret_cast<uint32_t*>(localBuff), reinterpret_cast<uint32_t*>(remoteBuff),
+      numEle);
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  if (myPe == 0) {
+    std::vector<uint32_t> hostBuff(numEle);
+    HIP_RUNTIME_CHECK(hipMemcpy(hostBuff.data(), localBuff, buffSize, hipMemcpyDeviceToHost));
+
+    bool success = true;
+    for (int i = 0; i < numEle; i++) {
+      if (hostBuff[i] != 1) {
+        printf("Error at index %d: expected 1, got %u\n", i, hostBuff[i]);
+        success = false;
+        break;
+      }
+    }
+    if (success) {
+      printf("✓ Blocking GET block scope multi-warp test PASSED! All %d elements verified.\n",
+             numEle);
+    } else {
+      printf("✗ Blocking GET block scope multi-warp test FAILED!\n");
+    }
+  }
+
+  ShmemFree(remoteBuff);
+  ShmemFree(localBuff);
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -655,6 +823,8 @@ void ConcurrentGetThread() {
   Test3_LargeMultiChunk(myPe);
   Test4_BlockingLegacyAPI(myPe);
   Test5_BlockingPureAddressAPI(myPe);
+  Test6_BlockingWarpScope(myPe);
+  Test7_BlockingBlockScope_MultiWarp(myPe);
 
   if (myPe == 0) {
     printf("\n=================================================================\n");
@@ -667,6 +837,8 @@ void ConcurrentGetThread() {
     printf("  - Test 3:  Nbi GET Large Multi-Chunk (>200MB)\n");
     printf("  - Test 4:  Blocking GET Legacy API (Thread scope)\n");
     printf("  - Test 5:  Blocking GET Pure Address API (Thread scope)\n");
+    printf("  - Test 6:  Blocking GET Warp Scope\n");
+    printf("  - Test 7:  Blocking GET Block Scope (multi-warp)\n");
     printf("=================================================================\n");
   }
 
