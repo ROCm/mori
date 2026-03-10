@@ -25,6 +25,8 @@
 #include <hip/library_types.h>
 
 #include <cstdint>
+#include <string>
+#include <string_view>
 #include <sstream>
 
 #include "mori/application/application.hpp"
@@ -117,6 +119,10 @@ struct EpDispatchCombineConfig {
   inline __host__ __device__ int MaxNumTokensToRecv() const {
     return worldSize * MaxNumTokensToRecvPerRank();
   }
+
+  std::string ToPackedString() const;
+  static EpDispatchCombineConfig FromPackedString(std::string_view packed);
+  
 };
 
 class EpDispatchCombineHandle {

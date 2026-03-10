@@ -26,6 +26,7 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
+#include <memory>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -72,6 +73,16 @@ ExtType* FindExtension(InputType* in, PJRT_Extension_Type type) {
 /*                                          XLA Ops APIs                                          */
 /* ---------------------------------------------------------------------------------------------- */
 namespace {
+
+struct EpDispatchCombineState {
+  static TypeId id;
+
+  explicit EpDispatchCombineState(EpDispatchCombineConfig cfg) : handle(cfg) {}
+
+  EpDispatchCombineHandle handle;
+};
+
+TypeId EpDispatchCombineState::id = {};
 
 hipDataType FFIType2HipType(DataType dtype) {
 #define XX(A, B) case DataType::A: return B;
@@ -289,6 +300,33 @@ XLA_FFI_DEFINE_HANDLER(
         .Ret<BufferR1<S32>>()
 );
 
+ErrorOr<std::unique_ptr<EpDispatchCombineState>> MoriLaunchTestInstantiate(
+    std::string_view packed_config) {
+  auto cfg = EpDispatchCombineConfig::FromPackedString(packed_config);
+  return std::make_unique<EpDispatchCombineState>(cfg);
+}
+
+XLA_FFI_DEFINE_HANDLER(
+    MoriLaunchTestInstantiateHandler, MoriLaunchTestInstantiate,
+    Ffi::BindInstantiate().Attr<std::string_view>("ep_config"));
+
+Error MoriLaunchTestImpl(
+    hipStream_t stream, EpDispatchCombineState* state, 
+    std::string_view ep_config) {
+  std::string packed = state->handle.config.ToPackedString();
+  XPUT(
+      "MoriLaunchTestImpl stream=%p state.rank=%d ep_config=%s", stream,
+      state->handle.config.rank, packed.c_str());
+  return Error::Success();
+}
+
+XLA_FFI_DEFINE_HANDLER(
+    MoriLaunchTestHandler, MoriLaunchTestImpl,
+    Ffi::Bind()
+        .Ctx<PlatformStream<hipStream_t>>()
+        .Ctx<State<EpDispatchCombineState>>()
+        .Attr<std::string_view>("ep_config"));
+
 void JaxPluginSetup(py::capsule pyc_api) {
   if (std::string_view(pyc_api.name()) != "pjrt_c_api") {
     throw std::runtime_error(
@@ -303,7 +341,24 @@ void JaxPluginSetup(py::capsule pyc_api) {
     throw std::runtime_error("PJRT FFI and/or custom call extension is not available!");
   }
 
-  auto register_ffi = [&](std::string_view name, XLA_FFI_Handler *handler){
+  auto register_type_id = [&](std::string_view name, XLA_FFI_TypeId* type_id_ptr) {
+    PJRT_FFI_TypeID_Register_Args args {
+      .struct_size = sizeof(PJRT_FFI_TypeID_Register_Args),
+      .type_name = name.data(),
+      .type_name_size = name.length(),
+      .type_id = type_id_ptr->type_id,
+    };
+    auto *err = std::invoke(ffi_ext->type_id_register, &args);
+    if (err != nullptr) {
+      throw std::runtime_error("Unable to register type ID for " + 
+                std::string(name));
+    }
+    // Update the type id pointer if it was assigned by XLA
+    type_id_ptr->type_id = args.type_id;
+  };
+
+  auto register_ffi = [&](std::string_view name, XLA_FFI_Handler* handler_execute,
+                          XLA_FFI_Handler* handler_instantiate = nullptr) {
 #if 0
     PJRT_FFI_Register_Handler_Args args {
       .struct_size = sizeof(PJRT_FFI_Register_Handler_Args),
@@ -321,10 +376,10 @@ void JaxPluginSetup(py::capsule pyc_api) {
       .function_name = name.data(),
       .function_name_size = name.length(),
       .api_version = 1,
-      .handler_instantiate = nullptr,
+      .handler_instantiate = reinterpret_cast<void*>(handler_instantiate),
       .handler_prepare = nullptr,
       .handler_initialize = nullptr,
-      .handler_execute = reinterpret_cast<void*>(handler),
+      .handler_execute = reinterpret_cast<void*>(handler_execute),
     };
     auto *err = std::invoke(call_ext->custom_call, &args);
 #endif
@@ -332,12 +387,17 @@ void JaxPluginSetup(py::capsule pyc_api) {
       throw std::runtime_error("Unable to register FFI handler for " + 
                 std::string(name));
     }
+    // XPUT("Registered FFI handler for %s", name.data());
   }; // register_ffi
 
   register_ffi("launch_dispatch", MoriDispatchHandler);
   register_ffi("launch_combine", MoriCombineHandler);
   register_ffi("launch_reset", MoriResetHandler);
   register_ffi("get_dispatch_src_token_id", GetDispatchSrcTokenIdHandler);
+  register_ffi("launch_test", MoriLaunchTestHandler,
+               MoriLaunchTestInstantiateHandler);
+
+  register_type_id("EpDispatchCombineState", &EpDispatchCombineState::id);
 }
 
 }  // namespace
@@ -351,34 +411,6 @@ namespace mori {
 void RegisterXLAFFIOps(py::module_& m) {
 
 // #define OO(X) def(#X, &EpDispatchCombineConfig::X)
-//   pybind11::class_<EpDispatchCombineConfig>(m, "EpDispatchCombineConfig")
-//       .def(pybind11::init<int, int, int, int, int, int, int, int, int, int, int, bool,
-//                           mori::moe::KernelType, int, int, int>(),
-//            py::arg("rank") = 0, py::arg("world_size") = 0, py::arg("hidden_dim") = 0,
-//            py::arg("scale_dim") = 0, py::arg("scale_type_size") = 0,
-//            py::arg("max_token_type_size") = 0, py::arg("max_num_inp_token_per_rank") = 0,
-//            py::arg("num_experts_per_rank") = 0, py::arg("num_experts_per_token") = 0,
-//            py::arg("warp_num_per_block") = 0, py::arg("block_num") = 0,
-//            py::arg("use_external_inp_buf") = true,
-//            py::arg("kernel_type") = mori::moe::KernelType::IntraNode, py::arg("gpu_per_node") = 8,
-//            py::arg("rdma_block_num") = 0, py::arg("num_qp_per_pe") = 1)
-//       .def_readwrite("rank", &EpDispatchCombineConfig::rank)
-//       .def_readwrite("world_size", &EpDispatchCombineConfig::worldSize)
-//       .def_readwrite("hidden_dim", &EpDispatchCombineConfig::hiddenDim)
-//       .def_readwrite("scale_dim", &EpDispatchCombineConfig::scaleDim)
-//       .def_readwrite("scale_type_size", &EpDispatchCombineConfig::scaleTypeSize)
-//       .def_readwrite("max_token_type_size", &EpDispatchCombineConfig::maxTokenTypeSize)
-//       .def_readwrite("max_num_inp_token_per_rank",
-//                      &EpDispatchCombineConfig::maxNumInpTokenPerRank)
-//       .def_readwrite("num_experts_per_rank", &EpDispatchCombineConfig::numExpertPerRank)
-//       .def_readwrite("num_experts_per_token",
-//                      &EpDispatchCombineConfig::numExpertPerToken)
-//       .def_readwrite("warp_num_per_block", &EpDispatchCombineConfig::warpNumPerBlock)
-//       .def_readwrite("block_num", &EpDispatchCombineConfig::blockNum)
-//       .def_readwrite("kernel_type", &EpDispatchCombineConfig::kernelType)
-//       .def_readwrite("gpu_per_node", &EpDispatchCombineConfig::gpuPerNode)
-//       .def_readwrite("rdma_block_num", &EpDispatchCombineConfig::rdmaBlockNum)
-//       .def_readwrite("num_qp_per_pe", &EpDispatchCombineConfig::numQpPerPe)
 //       .OO(MaxNumTokensToSendPerRank)
 //       .OO(MaxNumTokensToSend)
 //       .OO(MaxNumTokensToRecvPerRank)

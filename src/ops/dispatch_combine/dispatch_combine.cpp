@@ -24,6 +24,9 @@
 #include <hip/hip_runtime_api.h>
 
 #include <algorithm>
+#include <sstream>
+#include <stdexcept>
+#include <string>
 
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem_api.hpp"
@@ -36,6 +39,65 @@ namespace moe {
 using namespace mori::application;
 using namespace mori::core;
 using namespace mori::shmem;
+
+static constexpr const char* EP_CONFIG_VERSION = "v1";
+
+std::string EpDispatchCombineConfig::ToPackedString() const {
+  std::ostringstream os;
+  os << EP_CONFIG_VERSION
+     << ' ' << rank
+     << ' ' << worldSize
+     << ' ' << hiddenDim
+     << ' ' << scaleDim
+     << ' ' << scaleTypeSize
+     << ' ' << maxTokenTypeSize
+     << ' ' << maxNumInpTokenPerRank
+     << ' ' << numExpertPerRank
+     << ' ' << numExpertPerToken
+     << ' ' << warpNumPerBlock
+     << ' ' << blockNum
+     << ' ' << static_cast<int>(useExternalInpBuffer)
+     << ' ' << static_cast<int>(kernelType)
+     << ' ' << gpuPerNode
+     << ' ' << rdmaBlockNum
+     << ' ' << numQpPerPe
+     << ' ' << static_cast<int>(quantType);
+  return os.str();
+}
+
+EpDispatchCombineConfig EpDispatchCombineConfig::FromPackedString(
+    std::string_view packed) {
+  std::istringstream is(std::string{packed});
+  std::string version;
+
+  EpDispatchCombineConfig cfg;
+  int use_external_inp_buf = 0;
+  int kernel_type = 0;
+  int quant_type = 0;
+
+  if (!(is >> version) || version != EP_CONFIG_VERSION) {
+    throw std::runtime_error("EpDispatchCombineConfig decode failed: "
+      "missing/unsupported version");
+  }
+
+  if (!(is >> cfg.rank >> cfg.worldSize >> cfg.hiddenDim >> cfg.scaleDim >>
+        cfg.scaleTypeSize >> cfg.maxTokenTypeSize >> cfg.maxNumInpTokenPerRank >>
+        cfg.numExpertPerRank >> cfg.numExpertPerToken >> cfg.warpNumPerBlock >>
+        cfg.blockNum >> use_external_inp_buf >> kernel_type >> cfg.gpuPerNode >>
+        cfg.rdmaBlockNum >> cfg.numQpPerPe >> quant_type)) {
+    throw std::runtime_error("EpDispatchCombineConfig decode failed: invalid payload");
+  }
+
+  std::string trailing;
+  if (is >> trailing) {
+    throw std::runtime_error("EpDispatchCombineConfig decode failed: trailing data");
+  }
+
+  cfg.useExternalInpBuffer = (use_external_inp_buf != 0);
+  cfg.kernelType = static_cast<KernelType>(kernel_type);
+  cfg.quantType = static_cast<QuantType>(quant_type);
+  return cfg;
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                     EpDispatchCombineHandle                                    */

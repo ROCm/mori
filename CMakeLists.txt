@@ -114,7 +114,7 @@ message(STATUS "Host NIC: USE_BNXT=${USE_BNXT}, USE_IONIC=${USE_IONIC}")
 
 if(BUILD_XLA_FFI_OPS)
   add_compile_definitions(BUILD_XLA_FFI_OPS)
-  set(XLA_INCLUDE_DIR "/tf/xla" CACHE PATH "XLA include directory for FFI custom calls") 
+  set(XLA_INCLUDE_DIR "/tf/xla2" CACHE PATH "XLA include directory for FFI custom calls") 
 endif()
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-literal-operator")
