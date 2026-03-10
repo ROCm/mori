@@ -104,6 +104,7 @@ __global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
   uint64_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint64_t*>();
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
+      if (laneId == 0) shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
       int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
       int tokenChunkNum = core::CeilDiv(tokenNum, config.numQpPerPe);
       int thisChunkTokenNum = std::min(tokenChunkNum, tokenNum - qpId * tokenChunkNum);
@@ -143,9 +144,9 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       if (laneId == 0) {
         // TODO: use different quiet func for SDMDA/RDMA and P2P
-        shmem::ShmemQuietThread(destPe, qpId);
-        // shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
-        //     destPe, args.shmemDispatchInpTokMemObj);
+        // shmem::ShmemQuietThread(destPe, qpId);
+        shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
+            destPe, args.shmemDispatchInpTokMemObj);
         int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
         // TODO(ditian12): send atomic op right after quiet lead to hang issue, need to investigate
         // shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
@@ -177,6 +178,7 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
        tokenId += blocksPerPe * warpNum) {
     index_t destTokId = 0;
     if (laneId == 0) destTokId = atomicAdd(args.totalRecvTokenNum, 1);
+    if ((laneId == 0) && (destTokId == 0)) printf("myPe %d tok 0 %d\n", myPe, destPe);
     destTokId = __shfl(destTokId, 0);
     core::WarpCopy<uint8_t, 4>(
         args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>() + destTokId * hiddenBytes,
@@ -299,7 +301,9 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       if (laneId == 0) {
-        shmem::ShmemQuietThread(destPe, qpId);
+        // shmem::ShmemQuietThread(destPe, qpId);
+        shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
+            destPe, args.shmemCombineInpTokMemObj);
         // TODO(ditian12): send atomic op right after quiet lead to hang issue, need to investigate
         // shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
         // args.crossDeviceBarrierMemObj, myPe * sizeof(uint64_t), 1, core::AMO_ADD, destPe, qpId);
