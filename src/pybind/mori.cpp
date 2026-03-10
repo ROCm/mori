@@ -1187,6 +1187,32 @@ void RegisterMoriCcl(pybind11::module_& m) {
             py::arg("count"),
             py::arg("stream") = py::none(),
             "Execute in-place AllReduce SDMA operation (fp16)")
+        .def("start_async",
+            [](mori::collective::AllreduceSdma<half>& self,
+               const torch::Tensor& input_tensor, const torch::Tensor& output_tensor,
+               size_t count, py::object stream_obj) -> bool {
+                if (input_tensor.dim() != 1 || output_tensor.dim() != 1)
+                    throw std::runtime_error("Tensors must be 1-dimensional");
+                if (!input_tensor.is_cuda() || !output_tensor.is_cuda())
+                    throw std::runtime_error("Tensors must be CUDA tensors");
+                if (input_tensor.scalar_type() != torch::kFloat16)
+                    throw std::runtime_error("Input tensor must be float16");
+                if (output_tensor.scalar_type() != torch::kFloat16)
+                    throw std::runtime_error("Output tensor must be float16");
+                half* in = reinterpret_cast<half*>(input_tensor.data_ptr<at::Half>());
+                half* out = reinterpret_cast<half*>(output_tensor.data_ptr<at::Half>());
+                int dev = input_tensor.device().index();
+                return self.start_async(in, out, count, convert_torch_stream_to_hip(stream_obj, dev));
+            },
+            py::arg("input"), py::arg("output"), py::arg("count"), py::arg("stream") = py::none(),
+            "Start asynchronous AllReduce (fp16)")
+        .def("wait_async",
+            [](mori::collective::AllreduceSdma<half>& self, py::object stream_obj) -> double {
+                return self.wait_async(convert_torch_stream_to_hip(stream_obj));
+            },
+            py::arg("stream") = py::none(), "Wait for async AllReduce (fp16)")
+        .def("is_async_in_progress", &mori::collective::AllreduceSdma<half>::is_async_in_progress)
+        .def("cancel_async", &mori::collective::AllreduceSdma<half>::cancel_async)
         .def("reset_flags",
             &mori::collective::AllreduceSdma<half>::resetFlags,
             "Reset synchronization flags")
@@ -1321,6 +1347,32 @@ void RegisterMoriCcl(pybind11::module_& m) {
             py::arg("count"),
             py::arg("stream") = py::none(),
             "Execute in-place AllReduce SDMA operation (bf16)")
+        .def("start_async",
+            [](mori::collective::AllreduceSdma<__hip_bfloat16>& self,
+               const torch::Tensor& input_tensor, const torch::Tensor& output_tensor,
+               size_t count, py::object stream_obj) -> bool {
+                if (input_tensor.dim() != 1 || output_tensor.dim() != 1)
+                    throw std::runtime_error("Tensors must be 1-dimensional");
+                if (!input_tensor.is_cuda() || !output_tensor.is_cuda())
+                    throw std::runtime_error("Tensors must be CUDA tensors");
+                if (input_tensor.scalar_type() != torch::kBFloat16)
+                    throw std::runtime_error("Input tensor must be bfloat16");
+                if (output_tensor.scalar_type() != torch::kBFloat16)
+                    throw std::runtime_error("Output tensor must be bfloat16");
+                auto* in = reinterpret_cast<__hip_bfloat16*>(input_tensor.data_ptr<at::BFloat16>());
+                auto* out = reinterpret_cast<__hip_bfloat16*>(output_tensor.data_ptr<at::BFloat16>());
+                int dev = input_tensor.device().index();
+                return self.start_async(in, out, count, convert_torch_stream_to_hip(stream_obj, dev));
+            },
+            py::arg("input"), py::arg("output"), py::arg("count"), py::arg("stream") = py::none(),
+            "Start asynchronous AllReduce (bf16)")
+        .def("wait_async",
+            [](mori::collective::AllreduceSdma<__hip_bfloat16>& self, py::object stream_obj) -> double {
+                return self.wait_async(convert_torch_stream_to_hip(stream_obj));
+            },
+            py::arg("stream") = py::none(), "Wait for async AllReduce (bf16)")
+        .def("is_async_in_progress", &mori::collective::AllreduceSdma<__hip_bfloat16>::is_async_in_progress)
+        .def("cancel_async", &mori::collective::AllreduceSdma<__hip_bfloat16>::cancel_async)
         .def("reset_flags",
             &mori::collective::AllreduceSdma<__hip_bfloat16>::resetFlags,
             "Reset synchronization flags")

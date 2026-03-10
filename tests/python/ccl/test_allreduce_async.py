@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """
 AllReduce Async SDMA Test using torch.distributed and multiprocessing.
-
-Uses the async API (start_async + wait_async) which internally performs:
-  - ReduceScatter (SDMA or P2P depending on data size)
-  - AllGather via SDMA
+Supports multiple data types (uint32, fp16, bf16) matching the sync test.
 """
 
 import os
@@ -16,25 +13,30 @@ from mori.ccl import AllreduceSdma
 from tests.python.utils import TorchDistContext, get_free_port
 
 
-def _test_allreduce_async(rank, world_size, port, elems, iterations, warmup, copy_output=True):
-    """Worker function for each process."""
+def _to_numpy(tensor):
+    if tensor.dtype in (torch.bfloat16, torch.float16):
+        return tensor.float().numpy()
+    return tensor.numpy()
 
+
+def _test_allreduce_async(rank, world_size, port, elems, iterations, warmup,
+                          copy_output=True, dtype=torch.uint32):
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         shmem.shmem_torch_process_group_init("default")
 
         my_pe = shmem.shmem_mype()
         npes = shmem.shmem_npes()
-
         assert my_pe == rank
         assert npes == world_size
 
-        bytes_per_pe = elems * 4  # uint32 = 4 bytes
-        total_bytes = bytes_per_pe * npes
-        output_buf_size = npes * (elems // npes + 64) * 4
+        elem_size = torch.tensor([], dtype=dtype).element_size()
+        bytes_per_pe = elems * elem_size
+        output_buf_size = npes * (elems // npes + 64) * elem_size
+        dtype_name = str(dtype).split('.')[-1]
 
         if rank == 0:
             print(f"\n{'='*60}")
-            print(f"AllReduce Async SDMA Test")
+            print(f"AllReduce Async SDMA Test (dtype={dtype_name})")
             print(f"  World size      : {world_size}")
             print(f"  Elements per PE : {elems:,}")
             print(f"  Data size       : {bytes_per_pe / (1024**2):.2f} MB per PE")
@@ -50,38 +52,23 @@ def _test_allreduce_async(rank, world_size, port, elems, iterations, warmup, cop
             input_buffer_size=bytes_per_pe,
             output_buffer_size=output_buf_size,
             copy_output_to_user=copy_output,
+            dtype=dtype,
         )
-        print(f"PE {rank}: Created AllreduceSdma object")
 
-        # Data init: each PE fills all elements with (myPe + 1) * 1000
         fill_value = (my_pe + 1) * 1000
-        input_tensor = torch.full((elems,), fill_value,
-                                  dtype=torch.uint32, device=device)
-        output_tensor = torch.zeros(elems, dtype=torch.uint32, device=device)
-
-        if rank == 0:
-            print(f"PE {rank}: Input data = all {fill_value}")
+        if dtype in (torch.float16, torch.bfloat16):
+            fill_value = float(fill_value)
+        input_tensor = torch.full((elems,), fill_value, dtype=dtype, device=device)
+        output_tensor = torch.zeros(elems, dtype=dtype, device=device)
 
         torch.cuda.synchronize()
         dist.barrier()
 
-        # Run warmup + measurement iterations using async API
         exec_times = []
-        total_iters = warmup + iterations
-
         ev_start = torch.cuda.Event(enable_timing=True)
         ev_end = torch.cuda.Event(enable_timing=True)
 
-        if rank == 0:
-            print(f"\nUsing ASYNC mode (start_async + wait_async)")
-            if warmup > 0:
-                print(f"Warmup iterations: {warmup}, Measurement iterations: {iterations}\n")
-
-        for iter_idx in range(total_iters):
-            if rank == 0 and (iter_idx == 0 or iter_idx == warmup):
-                stage = "Warmup" if iter_idx < warmup else "Measurement"
-                print(f"\n--- {stage} Iteration {iter_idx + 1} ---")
-
+        for iter_idx in range(warmup + iterations):
             dist.barrier()
 
             ev_start.record(stream)
@@ -94,11 +81,10 @@ def _test_allreduce_async(rank, world_size, port, elems, iterations, warmup, cop
             if iter_idx >= warmup:
                 exec_times.append(exec_time)
                 if rank == 0 and len(exec_times) == 1:
-                    print(f"PE {rank}: First measurement iteration: {exec_time:.6f}s")
+                    print(f"PE {rank}: First measurement: {exec_time*1000:.3f} ms")
 
             dist.barrier()
 
-        # Local statistics
         if len(exec_times) > 0:
             avg_time = np.mean(exec_times)
             min_time = np.min(exec_times)
@@ -106,38 +92,39 @@ def _test_allreduce_async(rank, world_size, port, elems, iterations, warmup, cop
         else:
             avg_time = min_time = max_time = 0.0
 
-        if rank == 0:
-            print(f"\nPE {rank} local statistics:")
-            print(f"  Min time: {min_time:.6f}s")
-            print(f"  Max time: {max_time:.6f}s")
-            print(f"  Avg time: {avg_time:.6f}s")
-
-        # Verify: expected value = sum((pe+1)*1000 for pe in range(npes))
+        # Verify
         torch.cuda.synchronize()
         dist.barrier()
 
         expected_value = sum((pe + 1) * 1000 for pe in range(npes))
 
         if copy_output:
-            verify_cpu = output_tensor.cpu().numpy()
-            verify_label = "output_tensor"
+            verify_tensor = output_tensor.cpu()
         else:
             transit_buf = allreduce.get_output_transit_buffer(device=input_tensor)
-            verify_cpu = transit_buf.cpu().numpy()[:elems]
-            verify_label = "transit_buffer"
+            verify_tensor = transit_buf.cpu()[:elems]
+
+        if dtype in (torch.float16, torch.bfloat16):
+            verify_cpu = verify_tensor.float().numpy()
+            match = np.allclose(verify_cpu, expected_value, rtol=1e-2, atol=1.0)
+        else:
+            verify_cpu = verify_tensor.numpy()
+            match = np.all(verify_cpu == expected_value)
 
         success = True
-        if np.all(verify_cpu == expected_value):
-            print(f"PE {rank}: AllReduce verification PASSED ({verify_label})! "
-                  f"All {elems} elements = {expected_value}")
+        src = "output_tensor" if copy_output else "transit_buffer"
+        if match:
+            print(f"PE {rank}: PASSED ({src}, {dtype_name}), all {elems} elements = {expected_value}")
         else:
-            mismatches = np.where(verify_cpu != expected_value)[0]
-            print(f"PE {rank}: AllReduce verification FAILED ({verify_label})! "
-                  f"{len(mismatches)} mismatches, first at [{mismatches[0]}]={verify_cpu[mismatches[0]]}, "
-                  f"expected {expected_value}")
+            if dtype in (torch.float16, torch.bfloat16):
+                bad = np.where(~np.isclose(verify_cpu, expected_value, rtol=1e-2, atol=1.0))[0]
+            else:
+                bad = np.where(verify_cpu != expected_value)[0]
+            print(f"PE {rank}: FAILED ({src}, {dtype_name}), {len(bad)} mismatches, "
+                  f"first [{bad[0]}]={verify_cpu[bad[0]]}, expected {expected_value}")
             success = False
 
-        # Global statistics
+        # Global stats
         torch.cuda.synchronize()
         dist.barrier()
 
@@ -151,29 +138,19 @@ def _test_allreduce_async(rank, world_size, port, elems, iterations, warmup, cop
         dist.all_reduce(avg_t, op=dist.ReduceOp.SUM)
         dist.all_reduce(ok_t, op=dist.ReduceOp.SUM)
 
-        g_min = min_t.item()
-        g_max = max_t.item()
-        g_avg = avg_t.item() / npes
-        passed = ok_t.item()
-
         if rank == 0:
+            g_avg = avg_t.item() / npes
             algo_bw = bytes_per_pe / g_avg / (1024.0**3) if g_avg > 0 else 0
             bus_bw = algo_bw * 2 * (npes - 1) / npes if npes > 1 else algo_bw
 
-            print(f"\n=== Performance Statistics ===")
-            print(f"Min time: {g_min:.6f}s")
-            print(f"Max time: {g_max:.6f}s")
-            print(f"Avg time: {g_avg:.6f}s")
-            print(f"Algo bandwidth: {algo_bw:.2f} GB/s (data size: {bytes_per_pe / (1024.0**3):.3f} GB)")
-            print(f"Bus  bandwidth: {bus_bw:.2f} GB/s (factor: 2*(N-1)/N = {2.0*(npes-1)/npes:.2f})")
-            print(f"\nPEs passed: {passed}/{npes}")
+            print(f"\n=== Performance ({dtype_name}) ===")
+            print(f"  Min: {min_t.item()*1000:.3f} ms  Max: {max_t.item()*1000:.3f} ms  Avg: {g_avg*1000:.3f} ms")
+            print(f"  Algo BW: {algo_bw:.2f} GB/s  Bus BW: {bus_bw:.2f} GB/s")
+            print(f"  Data: {bytes_per_pe/(1024**2):.2f} MB/rank")
+            passed = ok_t.item()
+            print(f"  PEs passed: {passed}/{npes}")
+            print(f"  {'=== PASSED ===' if passed == npes else '=== FAILED ==='}\n")
 
-            if passed == npes:
-                print(f"\n=== AllReduce Async Test PASSED ===\n")
-            else:
-                print(f"\n=== AllReduce Async Test FAILED ===\n")
-
-        # Cleanup
         torch.cuda.synchronize()
         dist.barrier()
         del allreduce
@@ -181,16 +158,23 @@ def _test_allreduce_async(rank, world_size, port, elems, iterations, warmup, cop
         shmem.shmem_finalize()
 
         if not success:
-            raise AssertionError(f"PE {rank}: AllReduce verification failed")
+            raise AssertionError(f"PE {rank}: AllReduce async verification failed ({dtype_name})")
 
 
-def test_allreduce_async(elems=67108864, world_size=8, iterations=10, warmup=10, copy_output=True):
-    """Run AllReduce Async SDMA test."""
+_DTYPE_MAP = {
+    "uint32": torch.uint32, "int32": torch.int32,
+    "fp16": torch.float16, "float16": torch.float16,
+    "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+}
+
+
+def test_allreduce_async(elems=67108864, world_size=8, iterations=10, warmup=10,
+                         copy_output=True, dtype=torch.uint32):
     os.environ.setdefault('MORI_ENABLE_SDMA', '1')
     port = get_free_port()
     torch.multiprocessing.spawn(
         _test_allreduce_async,
-        args=(world_size, port, elems, iterations, warmup, copy_output),
+        args=(world_size, port, elems, iterations, warmup, copy_output, dtype),
         nprocs=world_size,
         join=True,
     )
@@ -198,27 +182,27 @@ def test_allreduce_async(elems=67108864, world_size=8, iterations=10, warmup=10,
 
 if __name__ == "__main__":
     import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Test AllReduce Async SDMA",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument("--elems", type=int, default=67108864, help="Elements per PE")
-    parser.add_argument("--world-size", type=int, default=8, help="Number of processes")
-    parser.add_argument("--iterations", type=int, default=10, help="Measurement iterations")
-    parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations")
-    parser.add_argument("--enable-sdma", type=int, default=1, choices=[0, 1], help="Enable SDMA")
-    parser.add_argument("--no-copy", action="store_true", help="Disable copy_output_to_user (read from transit buffer)")
+    parser = argparse.ArgumentParser(description="Test AllReduce Async SDMA")
+    parser.add_argument("--elems", type=int, default=67108864)
+    parser.add_argument("--world-size", type=int, default=8)
+    parser.add_argument("--iterations", type=int, default=10)
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--enable-sdma", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--no-copy", action="store_true")
+    parser.add_argument("--dtype", type=str, default="uint32",
+                        choices=list(_DTYPE_MAP.keys()))
     args = parser.parse_args()
     os.environ['MORI_ENABLE_SDMA'] = str(args.enable_sdma)
+
+    dtype = _DTYPE_MAP[args.dtype]
+    dtype_name = str(dtype).split('.')[-1]
     copy_output = not args.no_copy
 
     print(f"AllReduce Async SDMA Test")
-    print(f"  Elements per PE : {args.elems:,}")
-    print(f"  World size      : {args.world_size}")
-    print(f"  Iterations      : {args.iterations}")
-    print(f"  Warmup          : {args.warmup}")
-    print(f"  copy_output     : {copy_output}")
+    print(f"  Elements: {args.elems:,}  World: {args.world_size}  "
+          f"Iters: {args.iterations}  Warmup: {args.warmup}  "
+          f"Dtype: {dtype_name}  Copy: {copy_output}")
     print("-" * 60)
 
-    test_allreduce_async(args.elems, args.world_size, args.iterations, args.warmup, copy_output)
+    test_allreduce_async(args.elems, args.world_size, args.iterations,
+                         args.warmup, copy_output, dtype)
