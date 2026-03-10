@@ -143,10 +143,13 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
         }
     }
 
-    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->signalPtrs, sizeof(HSAuint64) * dstDeviceIds.size()* numOfQueuesPerDevice));
-    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->signalPtrs, 0, sizeof(HSAuint64) * dstDeviceIds.size()* numOfQueuesPerDevice));
-    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->expectSignalsPtr, sizeof(HSAuint64) * dstDeviceIds.size()* numOfQueuesPerDevice));
-    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->expectSignalsPtr, 0, sizeof(HSAuint64) * dstDeviceIds.size()* numOfQueuesPerDevice));
+    size_t signalArraySize = sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice;
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->signalPtrs, signalArraySize));
+    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->signalPtrs, 0, signalArraySize));
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->expectSignalsPtr, signalArraySize));
+    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->expectSignalsPtr, 0, signalArraySize));
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->fencePtrs, signalArraySize));
+    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->fencePtrs, 0, signalArraySize));
 
   }
   memObjPool.insert({localPtr, SymmMemObjPtr{cpuMemObj, gpuMemObj}});
