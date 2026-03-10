@@ -21,13 +21,32 @@
 // SOFTWARE.
 #pragma once
 
-#include <pybind11/pybind11.h>
+#include <cstddef>
+#include <list>
+#include <optional>
+#include <shared_mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
-namespace mori {
-void RegisterMoriOps(pybind11::module_& m);
-void RegisterMoriShmem(pybind11::module_& m);
-void RegisterMoriIo(pybind11::module_& m);
-#ifdef MORI_BUILD_UMBP
-void RegisterMoriUmbp(pybind11::module_& m);
-#endif
-}  // namespace mori
+#include "umbp/common/storage_tier.h"
+
+class BlockIndexClient {
+ public:
+  // Key generation — compatible with SGLang SHA-256 hex string
+  static std::string HashKVBlock(const std::vector<int>& token_ids,
+                                 const std::string& prior_hash = "");
+
+  // Index operations
+  bool MayExist(const std::string& key) const;
+  std::optional<LocalLocation> Lookup(const std::string& key) const;
+  void Insert(const std::string& key, const LocalLocation& loc);
+  std::optional<LocalLocation> Remove(const std::string& key);
+  bool UpdateTier(const std::string& key, StorageTier new_tier);
+  size_t Count() const;
+  void Clear();
+
+ private:
+  mutable std::shared_mutex mu_;
+  std::unordered_map<std::string, LocalLocation> index_;
+};

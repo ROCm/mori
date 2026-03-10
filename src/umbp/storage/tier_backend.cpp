@@ -19,15 +19,12 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#pragma once
+#include "umbp/storage/tier_backend.h"
 
-#include <pybind11/pybind11.h>
+bool TierBackend::WriteFromPtr(const std::string& key, uintptr_t src_ptr, size_t size) {
+  return Write(key, reinterpret_cast<const void*>(src_ptr), size);
+}
 
-namespace mori {
-void RegisterMoriOps(pybind11::module_& m);
-void RegisterMoriShmem(pybind11::module_& m);
-void RegisterMoriIo(pybind11::module_& m);
-#ifdef MORI_BUILD_UMBP
-void RegisterMoriUmbp(pybind11::module_& m);
-#endif
-}  // namespace mori
+std::vector<char> TierBackend::Read(const std::string& key) { return {}; }
+
+std::string TierBackend::GetLRUKey() const { return ""; }
