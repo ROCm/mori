@@ -64,7 +64,8 @@ See the [MORI-EP Guide](docs/MORI-EP-GUIDE.md) for the full API reference and mo
 | MORI-EP | Dispatch/combine API, kernel types, configuration, usage examples | [EP Guide](docs/MORI-EP-GUIDE.md) |
 | MORI-EP Benchmark | Intra/inter-node benchmark commands and NIC selection | [EP Benchmark](docs/MORI-EP-BENCHMARK.md) |
 | MORI Shmem | Symmetric memory APIs, initialization, memory management | [Shmem Guide](docs/MORI-SHMEM-GUIDE.md) |
-| MORI-IO | P2P communication concepts, engine/backend/session design | [IO Introduction](docs/MORI-IO-INTRO.md) |
+| MORI-IR | Device bitcode integration for Triton and other GPU kernel frameworks | [IR Guide](docs/MORI-IR-GUIDE.md) |
+| MORI-IO | P2P communication concepts, engine/backend/session design | [IO Guide](docs/MORI-IO-GUIDE.md) |
 | MORI-IO Benchmark | IO benchmark commands and performance results | [IO Benchmark](docs/MORI-IO-BENCHMARK.md) |
 | MORI-VIZ | Warp-level kernel profiler with Perfetto integration | [Profiler](docs/PROFILER.md) |
 

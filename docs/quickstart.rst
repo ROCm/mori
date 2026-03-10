@@ -68,7 +68,7 @@ Transfer GPU memory between nodes via RDMA:
    status = engine.write(local_mem, 0, remote_mem, 0, size, uid)
    status.Wait()
 
-See `MORI-IO Introduction <MORI-IO-INTRO.md>`_ for architecture and full API.
+See `MORI-IO Guide <MORI-IO-GUIDE.md>`_ for architecture and full API.
 
 MORI Shmem: Symmetric Memory
 ------------------------------
@@ -113,5 +113,6 @@ Next Steps
 
 * `MORI-EP Guide <MORI-EP-GUIDE.md>`_ — Full EP API reference and examples
 * `Shmem Guide <MORI-SHMEM-GUIDE.md>`_ — Symmetric memory concepts and APIs
-* `MORI-IO Introduction <MORI-IO-INTRO.md>`_ — IO architecture and Python API
+* `MORI-IR Guide <MORI-IR-GUIDE.md>`_ — Device bitcode integration for Triton
+* `MORI-IO Guide <MORI-IO-GUIDE.md>`_ — IO architecture and Python API
 * `Profiler <PROFILER.md>`_ — Warp-level kernel profiler

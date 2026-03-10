@@ -187,4 +187,4 @@ RDMA-based P2P communication for KVCache transfer.
 - ``BackendType``: ``Unknown``, ``XGMI``, ``RDMA``, ``TCP``
 - ``StatusCode``: ``SUCCESS``, ``INIT``, ``IN_PROGRESS``, ``ERR_INVALID_ARGS``, ``ERR_NOT_FOUND``, ``ERR_RDMA_OP``, ``ERR_BAD_STATE``, ``ERR_GPU_OP``
 
-See `MORI-IO Introduction <../MORI-IO-INTRO.md>`_ for full API reference.
+See `MORI-IO Guide <../MORI-IO-GUIDE.md>`_ for full API reference.

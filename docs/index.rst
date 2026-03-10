@@ -16,7 +16,8 @@ MORI Documentation
 
    MORI-EP-GUIDE
    MORI-SHMEM-GUIDE
-   MORI-IO-INTRO
+   MORI-IR-GUIDE
+   MORI-IO-GUIDE
    PROFILER
 
 .. toctree::

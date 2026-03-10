@@ -77,11 +77,11 @@ export MORI_SHMEM_HEAP_SIZE=6G  # Must be set before shmem init
 
 ## 2. Initialization
 
-Shmem must be initialized exactly once per process. There are two methods:
+Shmem must be initialized exactly once per process. There are three methods:
 
 ### Method 1: PyTorch Process Group (Recommended)
 
-Use this when PyTorch distributed is already initialized:
+Use this when PyTorch distributed is already initialized. The process group must be registered with a name before calling `shmem_torch_process_group_init`:
 
 ```python
 import torch
@@ -89,7 +89,12 @@ import torch.distributed as dist
 import mori
 
 # Standard PyTorch distributed init
-dist.init_process_group(backend="cpu:gloo,cuda:nccl", rank=rank, world_size=world_size)
+torch.cuda.set_device(rank)
+dist.init_process_group(
+    backend="cpu:gloo,cuda:nccl",
+    rank=rank, world_size=world_size,
+    device_id=torch.device("cuda", rank),
+)
 
 # Register the process group with a name
 world_group = dist.group.WORLD
@@ -99,9 +104,11 @@ torch._C._distributed_c10d._register_process_group("default", world_group)
 mori.shmem.shmem_torch_process_group_init("default")
 ```
 
-### Method 2: Unique ID (Standalone)
+> **Note:** The `_register_process_group("default", ...)` step is required — `shmem_torch_process_group_init` looks up the group by name to extract rank/world_size and bootstrap the shmem connections.
 
-Use this when PyTorch distributed is not available (e.g., MPI-only environments, C++ applications):
+### Method 2: Unique ID (No PyTorch Distributed)
+
+Use this when PyTorch distributed is not available (e.g., standalone applications, custom launchers). Rank 0 generates a unique ID and broadcasts it to all ranks via any transport (file, MPI, TCP, etc.):
 
 ```python
 import mori
@@ -109,7 +116,7 @@ import mori
 # Rank 0 generates a unique ID
 if rank == 0:
     unique_id = mori.shmem.shmem_get_unique_id()  # Returns 128 bytes
-    # Broadcast unique_id to all ranks via your transport (MPI, TCP, file, etc.)
+    # Broadcast unique_id to all ranks via your transport
 
 # All ranks initialize with the same unique ID
 mori.shmem.shmem_init_attr(
@@ -119,6 +126,49 @@ mori.shmem.shmem_init_attr(
     unique_id,   # Shared unique ID (bytes)
 )
 ```
+
+Example using file-based broadcast (for single-node testing):
+
+```python
+import os, time
+
+uid_file = "/tmp/mori_unique_id"
+if rank == 0:
+    unique_id = mori.shmem.shmem_get_unique_id()
+    with open(uid_file, 'wb') as f:
+        f.write(unique_id)
+else:
+    while not os.path.exists(uid_file):
+        time.sleep(0.1)
+    with open(uid_file, 'rb') as f:
+        unique_id = f.read()
+
+mori.shmem.shmem_init_attr(
+    mori.shmem.MORI_SHMEM_INIT_WITH_UNIQUEID,
+    rank, world_size, unique_id,
+)
+```
+
+### Method 3: MPI Communicator (C++ / MPI environments)
+
+Use this in MPI-based applications. Pass `MORI_SHMEM_INIT_WITH_MPI_COMM` as the flag:
+
+```python
+mori.shmem.shmem_init_attr(
+    mori.shmem.MORI_SHMEM_INIT_WITH_MPI_COMM,
+    rank, world_size, mpi_comm,
+)
+```
+
+> **Note:** This is primarily used in C++ applications where an `MPI_Comm` handle is available. In Python, Method 1 or Method 2 are preferred.
+
+### Initialization Comparison
+
+| Method | When to use | Dependencies |
+|--------|-------------|--------------|
+| PyTorch Process Group | LLM inference/training frameworks (vLLM, SGLang, etc.) | `torch.distributed` |
+| Unique ID | Standalone apps, custom launchers, non-PyTorch environments | None (any broadcast mechanism) |
+| MPI Communicator | C++ MPI applications | MPI |
 
 ### Finalization
 
