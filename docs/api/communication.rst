@@ -188,3 +188,85 @@ RDMA-based P2P communication for KVCache transfer.
 - ``StatusCode``: ``SUCCESS``, ``INIT``, ``IN_PROGRESS``, ``ERR_INVALID_ARGS``, ``ERR_NOT_FOUND``, ``ERR_RDMA_OP``, ``ERR_BAD_STATE``, ``ERR_GPU_OP``
 
 See `MORI-IO Guide <../MORI-IO-GUIDE.md>`_ for full API reference.
+
+MORI-IR (Device Bitcode Integration)
+--------------------------------------
+
+Framework-agnostic device bitcode and ABI metadata for integrating MORI shmem
+into GPU kernel frameworks (Triton, FlyDSL, MLIR, custom HIP, etc.).
+
+**Imports:**
+
+.. code-block:: python
+
+   from mori.ir import (
+       find_bitcode,
+       get_bitcode_path,
+       MORI_DEVICE_FUNCTIONS,
+       SIGNAL_SET,
+       SIGNAL_ADD,
+   )
+
+   # Triton-specific (reference backend)
+   from mori.ir.triton import get_extern_libs, install_hook
+
+**Host-side API (framework-agnostic):**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
+
+   * - Function / Constant
+     - Description
+   * - ``find_bitcode()``
+     - Locate ``libmori_shmem_device.bc`` (auto JIT-compiled for current GPU + NIC)
+   * - ``MORI_DEVICE_FUNCTIONS``
+     - Dict of all device function ABI metadata (symbol, args, ret types)
+   * - ``SIGNAL_SET`` / ``SIGNAL_ADD``
+     - Signal operation constants for put-with-signal (values 9, 10)
+
+**Triton-specific API (reference backend):**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
+
+   * - Function
+     - Description
+   * - ``get_extern_libs()``
+     - Returns dict for Triton ``extern_libs`` parameter
+   * - ``install_hook()``
+     - Install Triton compilation hook for automatic bitcode linking
+
+**Key device functions** (available as ``extern "C"`` symbols in bitcode):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 30 40
+
+   * - Category
+     - Functions
+     - Description
+   * - Query
+     - ``my_pe()``, ``n_pes()``
+     - Get PE rank and total PE count
+   * - P2P
+     - ``ptr_p2p()``
+     - Translate pointers across PEs
+   * - Put
+     - ``putmem_nbi_{thread,warp,block}``
+     - Non-blocking put at thread/warp/block scope
+   * - Put + Signal
+     - ``putmem_nbi_signal_{thread,warp,block}``
+     - Put with signal notification
+   * - Atomics
+     - ``uint{32,64}_atomic_{add,fetch_add}_thread``
+     - Atomic operations on remote memory
+   * - Wait
+     - ``uint{32,64}_wait_until_{equals,greater_than}``
+     - Spin-wait on remote memory values
+   * - Sync
+     - ``quiet_thread()``, ``fence_thread()``, ``barrier_all_block()``
+     - Ordering and synchronization
+
+See `MORI-IR Guide <../MORI-IR-GUIDE.md>`_ for full device function table and integration examples.

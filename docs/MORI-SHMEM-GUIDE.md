@@ -301,4 +301,5 @@ This copies the current GPU states to the `globalGpuStates` symbol in the dynami
 | `python/mori/shmem/api.py` | Python shmem API |
 | `python/mori/shmem/__init__.py` | Public exports |
 | `include/mori/shmem/` | C++ shmem headers |
-| `src/pybind/mori.cpp` | Python bindings (shmem section) |
+| `src/pybind/pybind.cpp` | Python module entry point |
+| `src/pybind/mori.cpp` | Shmem binding registration (`RegisterMoriShmem`) |

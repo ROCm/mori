@@ -18,8 +18,7 @@ extensions = [
     'sphinx.ext.viewcode',
     'sphinx.ext.intersphinx',
     'sphinx.ext.mathjax',
-    'sphinx_rtd_theme',
-    'myst_parser',  # For Markdown support
+    'myst_parser',
 ]
 
 templates_path = ['_templates']

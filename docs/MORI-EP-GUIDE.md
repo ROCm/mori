@@ -414,7 +414,7 @@ import torch
 import torch.distributed as dist
 import mori
 
-os.environ["MORI_SHMEM_HEAP_SIZE"] = "6G"
+os.environ["MORI_SHMEM_HEAP_SIZE"] = "4G"
 
 def run_ep(rank, world_size):
     # Setup
@@ -471,7 +471,7 @@ def run_ep(rank, world_size):
     print(f"Rank {rank}: sent {num_tokens} tokens, received {total_recv}")
 
     # Simulate expert computation (identity for testing)
-    expert_output = dispatch_out[:total_recv].clone().to(torch.bfloat16)
+    expert_output = dispatch_out[:total_recv].to(torch.bfloat16)
 
     # Combine results back
     combine_out, combine_w = op.combine(
@@ -612,7 +612,8 @@ MORI-EP is integrated in several LLM inference frameworks:
 | `src/ops/dispatch_combine/dispatch_combine.cpp` | Core dispatch/combine implementation |
 | `src/ops/dispatch_combine/internode_v1.cpp` | InterNodeV1/V1LL kernels |
 | `src/ops/dispatch_combine/low_latency_async.cpp` | AsyncLL kernels |
-| `src/pybind/pybind.cpp` | Python bindings for all APIs |
+| `src/pybind/pybind.cpp` | Python module entry point |
+| `src/pybind/mori.cpp` | Ops/Shmem/IO binding registration |
 | `examples/ops/dispatch_combine/test_dispatch_combine.py` | Complete Python example |
 | `examples/ops/dispatch_combine/test_dispatch_combine_internode.py` | Inter-node example |
 | `tests/python/ops/test_dispatch_combine.py` | Correctness tests |

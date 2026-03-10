@@ -177,7 +177,8 @@ See `examples/io/example.py` for more complete examples including batch transfer
 |------|-------------|
 | `python/mori/io/__init__.py` | Public exports |
 | `python/mori/io/engine.py` | Python IOEngine and IOEngineSession classes |
-| `src/pybind/mori.cpp` | C++ Python bindings (IO section) |
+| `src/pybind/pybind.cpp` | Python module entry point |
+| `src/pybind/mori.cpp` | IO binding registration (`RegisterMoriIo`) |
 | `examples/io/example.py` | Complete usage examples (read, write, batch, session) |
 | `tests/python/io/test_engine.py` | Comprehensive test suite |
 | `tests/python/io/benchmark.py` | Performance benchmark |
