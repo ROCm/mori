@@ -46,10 +46,10 @@ Components
    * - **MORI-EP**
      - Intra and inter-node dispatch/combine kernels for MoE Expert Parallelism
    * - **MORI-IO**
-     - Point-to-point communication library for KVCache transfer via RDMA
+     - Point-to-point communication library for KVCache transfer via RDMA/XGMI
    * - **MORI-CCL**
-     - Lightweight collective communication for latency-sensitive environments
-   * - **MORI Shmem**
+     - Lightweight collective communication for latency-sensitive environments (coming soon)
+   * - **MORI-SHMEM**
      - OpenSHMEM-style symmetric memory APIs for GPU memory and RDMA
    * - **MORI-VIZ**
      - Warp-level kernel profiler with Perfetto integration

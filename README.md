@@ -12,7 +12,7 @@ To help developers get started quickly, MORI also includes a suite of optimized 
 |-----------|-------------|
 | **MORI-EP** | Intra and inter-node dispatch/combine kernels for MoE Expert Parallelism with SOTA performance |
 | **MORI-IO** | Point-to-point communication library with ultra-low overhead for KVCache transfer |
-| **MORI-CCL** | Lightweight collective communication library for latency-sensitive or resource-constrained environments |
+| **MORI-CCL** | Lightweight collective communication library for latency-sensitive or resource-constrained environments (coming soon) |
 | **MORI Shmem** | OpenSHMEM-style symmetric memory APIs for GPU memory management and RDMA |
 | **MORI-VIZ** | Warp-level kernel profiler with Perfetto integration |
 
