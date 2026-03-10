@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "mori/application/topology/system.hpp"
 
+#include <algorithm>
 #include <iomanip>
 #include <iostream>
 #include <limits>

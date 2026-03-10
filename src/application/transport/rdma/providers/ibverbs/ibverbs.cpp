@@ -79,13 +79,14 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
   assert(config.maxMsgSge <= GetRdmaDevice()->GetDeviceAttr()->orig_attr.max_sge);
   endpoint.ibvHandle.srq = config.enableSrq ? CreateRdmaSrqIfNx(config) : nullptr;
 
+  uint32_t maxRecvWr = config.maxRecvWr != 0 ? config.maxRecvWr : config.maxMsgsNum;
   ibv_qp_init_attr qpAttr = {.send_cq = endpoint.ibvHandle.cq,
                              .recv_cq = endpoint.ibvHandle.cq,
                              .srq = endpoint.ibvHandle.srq,
                              .cap =
                                  {
                                      .max_send_wr = config.maxMsgsNum,
-                                     .max_recv_wr = config.maxMsgsNum,
+                                     .max_recv_wr = maxRecvWr,
                                      .max_send_sge = config.maxMsgSge,
                                      .max_recv_sge = config.maxMsgSge,
                                  },
@@ -133,10 +134,21 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   attr.min_rnr_timer = 12;
   attr.ah_attr.src_path_bits = 0;
   attr.ah_attr.port_num = local.portId;
-  attr.ah_attr.sl = ReadRdmaServiceLevelEnv().value_or(0);
-  std::optional<uint8_t> tc = ReadRdmaTrafficClassEnv();
-  if (tc.has_value()) {
-    attr.ah_attr.grh.traffic_class = tc.value();
+  std::optional<uint8_t> sl = ReadIoServiceLevelEnv();
+  if (!sl.has_value()) {
+    sl = ReadRdmaServiceLevelEnv();
+  }
+  attr.ah_attr.sl = sl.value_or(0);
+
+  bool disableIoTc = ReadIoTrafficClassDisableEnv();
+  if (!disableIoTc) {
+    std::optional<uint8_t> tc = ReadIoTrafficClassEnv();
+    if (!tc.has_value()) {
+      tc = ReadRdmaTrafficClassEnv();
+    }
+    if (tc.has_value()) {
+      attr.ah_attr.grh.traffic_class = tc.value();
+    }
   }
   MORI_APP_INFO("ibverbs attr.ah_attr.sl:{} attr.ah_attr.grh.traffic_class:{}", attr.ah_attr.sl,
                 attr.ah_attr.grh.traffic_class);

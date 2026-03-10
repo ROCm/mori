@@ -22,7 +22,7 @@
 
 #include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
 
-#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 #include <infiniband/verbs.h>
 
 #include <iostream>
@@ -175,9 +175,10 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
                  reinterpret_cast<uintptr_t>(cq), reinterpret_cast<uintptr_t>(pd_uxdma),
                  reinterpret_cast<uintptr_t>(context), config.maxMsgsNum);
   wqeNum = config.maxMsgsNum;
+  uint32_t recvWrNum = config.maxRecvWr != 0 ? config.maxRecvWr : wqeNum;
   memset(&attr, 0, sizeof(struct ibv_qp_init_attr_ex));
   attr.cap.max_send_wr = wqeNum;
-  attr.cap.max_recv_wr = wqeNum;
+  attr.cap.max_recv_wr = recvWrNum;
   attr.cap.max_send_sge = 1;
   attr.cap.max_inline_data = MAX_INLINE_SIZE;
   attr.sq_sig_all = 0;
@@ -253,9 +254,10 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   }
 
   // Register atomic ibuf as independent memory region
-  atomicIbufMr = ibv_reg_mr(pd_uxdma, atomicIbufAddr, atomicIbufSize,
-                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-                                IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+  int atomicIbufAccessFlag =
+      MaybeAddRelaxedOrderingFlag(IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                                  IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+  atomicIbufMr = ibv_reg_mr(pd_uxdma, atomicIbufAddr, atomicIbufSize, atomicIbufAccessFlag);
   assert(atomicIbufMr);
 
   MORI_APP_TRACE(

@@ -24,6 +24,8 @@
 #include <sys/epoll.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <limits>
 #include <shared_mutex>
 
 #include "mori/io/logging.hpp"
@@ -162,14 +164,56 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
 
   uint32_t maxQpWr = static_cast<uint32_t>(deviceAttr->orig_attr.max_qp_wr);
   uint32_t maxCqe = static_cast<uint32_t>(deviceAttr->orig_attr.max_cqe);
+  uint32_t maxSge = static_cast<uint32_t>(deviceAttr->orig_attr.max_sge);
 
-  epConfig.maxMsgsNum = std::min(8192u, maxQpWr);
-  epConfig.maxCqeNum = std::min(16384u, maxCqe);
+  auto getEnvPositiveU32 = [](const char* name) -> std::optional<uint32_t> {
+    const char* v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return std::nullopt;
+    char* end = nullptr;
+    unsigned long parsed = std::strtoul(v, &end, 10);
+    if (end == v || *end != '\0' || parsed == 0 || parsed > std::numeric_limits<uint32_t>::max()) {
+      MORI_IO_WARN("Ignore invalid env {}={}", name, v);
+      return std::nullopt;
+    }
+    return static_cast<uint32_t>(parsed);
+  };
+
+  uint32_t desiredSendWr = config.maxSendWr > 0 ? static_cast<uint32_t>(config.maxSendWr) : 8192u;
+  uint32_t desiredRecvWr = config.enableNotification ? 1024u : 0u;
+  uint32_t desiredCqe = config.maxCqeNum > 0 ? static_cast<uint32_t>(config.maxCqeNum) : 16384u;
+  std::optional<uint32_t> desiredMsgSge =
+      config.maxMsgSge > 0 ? std::optional<uint32_t>(static_cast<uint32_t>(config.maxMsgSge))
+                           : std::nullopt;
+
+  if (auto v = getEnvPositiveU32("MORI_IO_QP_MAX_SEND_WR"); v.has_value()) desiredSendWr = *v;
+  if (auto v = getEnvPositiveU32("MORI_IO_QP_MAX_RECV_WR"); v.has_value()) desiredRecvWr = *v;
+  if (auto v = getEnvPositiveU32("MORI_IO_QP_MAX_CQE"); v.has_value()) desiredCqe = *v;
+  if (auto v = getEnvPositiveU32("MORI_IO_QP_MAX_MSG_SGE"); v.has_value()) desiredMsgSge = *v;
+  // Alias for convenience: keep both MORI_IO_QP_MAX_MSG_SGE and MORI_IO_QP_MAX_SGE.
+  if (auto v = getEnvPositiveU32("MORI_IO_QP_MAX_SGE"); v.has_value()) desiredMsgSge = *v;
+
+  epConfig.maxMsgsNum = std::min(desiredSendWr, maxQpWr);
+  // RQ must fit NotifManager's pre-posted recv WQEs (notifPerQp=1024) when notification is
+  // enabled. MORI_IO_QP_MAX_RECV_WR can override this baseline when provided.
+  epConfig.maxRecvWr = desiredRecvWr > 0 ? std::min(desiredRecvWr, maxQpWr) : 0;
+  epConfig.maxCqeNum = std::min(desiredCqe, maxCqe);
+  uint32_t minRequiredCqe = epConfig.maxMsgsNum + epConfig.maxRecvWr;
+  if (epConfig.maxCqeNum < minRequiredCqe) {
+    uint32_t newCqeNum = std::min(minRequiredCqe, maxCqe);
+    MORI_IO_WARN(
+        "maxCqeNum ({}) is smaller than SQ+RQ depth ({}+{}={}); increasing maxCqeNum to {}",
+        epConfig.maxCqeNum, epConfig.maxMsgsNum, epConfig.maxRecvWr, minRequiredCqe, newCqeNum);
+    epConfig.maxCqeNum = newCqeNum;
+  }
+  if (desiredMsgSge.has_value()) {
+    epConfig.maxMsgSge = std::min(*desiredMsgSge, maxSge);
+  } else {
 #ifdef ENABLE_IONIC
-  epConfig.maxMsgSge = std::min<uint32_t>(deviceAttr->orig_attr.max_sge, 2u);
+    epConfig.maxMsgSge = std::min(maxSge, 2u);
 #else
-  epConfig.maxMsgSge = std::min<uint32_t>(deviceAttr->orig_attr.max_sge, 4u);
+    epConfig.maxMsgSge = std::min(maxSge, 4u);
 #endif
+  }
   return epConfig;
 }
 

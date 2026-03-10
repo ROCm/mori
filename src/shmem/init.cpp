@@ -19,7 +19,10 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#include <arpa/inet.h>
 #include <mpi.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -27,7 +30,7 @@
 #include <memory>
 #include <random>
 
-#include "hip/hip_runtime.h"
+#include "hip/hip_runtime_api.h"
 #include "mori/application/application.hpp"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/shmem/internal.hpp"
@@ -36,11 +39,6 @@
 
 namespace mori {
 namespace shmem {
-
-/* ---------------------------------------------------------------------------------------------- */
-/*                                          Global Variables                                     */
-/* ---------------------------------------------------------------------------------------------- */
-__device__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          Helper Functions                                     */
@@ -434,20 +432,91 @@ static void ConfigureHeapInfoForGpu(GpuStates* gpuStates, const ShmemStates* sta
   }
 }
 
-// Copy GpuStates structure to device constant memory
-static void CopyGpuStatesToDevice(const GpuStates* gpuStates) {
-  GpuStates* globalGpuStatesAddr = nullptr;
-  HIP_RUNTIME_CHECK(hipGetSymbolAddress(reinterpret_cast<void**>(&globalGpuStatesAddr),
-                                        HIP_SYMBOL(globalGpuStates)));
+// Allocate internal synchronization memory for device barriers
+static void AllocateInternalSync(GpuStates* gpuStates, const ShmemStates* states) {
+  constexpr size_t MORI_INTERNAL_SYNC_SIZE = 128 * sizeof(uint64_t);
+  constexpr size_t ALIGNMENT = 256;
+  void* syncPtr = nullptr;
 
-  MORI_SHMEM_TRACE("globalGpuStates device address: 0x{:x}",
-                   reinterpret_cast<uintptr_t>(globalGpuStatesAddr));
+  switch (states->mode) {
+    case ShmemMode::StaticHeap: {
+      uintptr_t allocAddr = states->memoryStates->symmMemMgr->GetHeapVAManager()->Allocate(
+          MORI_INTERNAL_SYNC_SIZE, ALIGNMENT);
+      if (allocAddr == 0) {
+        MORI_SHMEM_ERROR("Out of static heap memory for internal sync buffer!");
+      } else {
+        syncPtr = reinterpret_cast<void*>(allocAddr);
+        states->memoryStates->symmMemMgr->RegisterStaticHeapSubRegion(
+            syncPtr, MORI_INTERNAL_SYNC_SIZE, &states->memoryStates->staticHeapObj);
+      }
+      break;
+    }
 
-  HIP_RUNTIME_CHECK(hipMemcpy(globalGpuStatesAddr, gpuStates, sizeof(GpuStates), hipMemcpyDefault));
+    case ShmemMode::VMHeap: {
+      application::SymmMemObjPtr syncObj = states->memoryStates->symmMemMgr->VMMAllocChunk(
+          MORI_INTERNAL_SYNC_SIZE, states->memoryStates->heapType);
+      if (syncObj.IsValid()) {
+        syncPtr = syncObj.cpu->localPtr;
+      } else {
+        MORI_SHMEM_ERROR("Failed to allocate internal sync buffer from VMM heap!");
+      }
+      break;
+    }
 
-  MORI_SHMEM_TRACE("Successfully copied GpuStates to device (rank={}, worldSize={})",
-                   gpuStates->rank, gpuStates->worldSize);
+    case ShmemMode::Isolation: {
+      application::SymmMemObjPtr syncObj =
+          states->memoryStates->symmMemMgr->Malloc(MORI_INTERNAL_SYNC_SIZE);
+      if (syncObj.IsValid()) {
+        syncPtr = syncObj.cpu->localPtr;
+      } else {
+        MORI_SHMEM_ERROR("Failed to allocate internal sync buffer in isolation mode!");
+      }
+      break;
+    }
+
+    default:
+      MORI_SHMEM_ERROR("Unknown ShmemMode for internal sync allocation: {}",
+                       static_cast<int>(states->mode));
+      break;
+  }
+
+  if (syncPtr != nullptr) {
+    gpuStates->internalSyncPtr = reinterpret_cast<uint64_t*>(syncPtr);
+    HIP_RUNTIME_CHECK(hipMemset(gpuStates->internalSyncPtr, 0, MORI_INTERNAL_SYNC_SIZE));
+    MORI_SHMEM_TRACE("Internal sync pointer allocated at 0x{:x} (mode={})",
+                     reinterpret_cast<uintptr_t>(gpuStates->internalSyncPtr),
+                     static_cast<int>(states->mode));
+  }
 }
+
+static void FinalizeInternalSync(const ShmemStates* states) {
+  if (s_hostGpuStatesCopy.internalSyncPtr == nullptr) {
+    return;
+  }
+
+  void* syncPtr = reinterpret_cast<void*>(s_hostGpuStatesCopy.internalSyncPtr);
+  switch (states->mode) {
+    case ShmemMode::StaticHeap: {
+      states->memoryStates->symmMemMgr->DeregisterStaticHeapSubRegion(syncPtr);
+      states->memoryStates->symmMemMgr->GetHeapVAManager()->Free(
+          reinterpret_cast<uintptr_t>(syncPtr));
+      break;
+    }
+    case ShmemMode::VMHeap: {
+      states->memoryStates->symmMemMgr->VMMFreeChunk(syncPtr);
+      break;
+    }
+    case ShmemMode::Isolation: {
+      states->memoryStates->symmMemMgr->Free(syncPtr);
+      break;
+    }
+    default:
+      break;
+  }
+  MORI_SHMEM_TRACE("Internal sync memory freed (mode={})", static_cast<int>(states->mode));
+}
+
+// CopyGpuStatesToDevice is in runtime.cpp
 
 void GpuStateInit() {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
@@ -464,6 +533,9 @@ void GpuStateInit() {
 
   // Configure heap information for GPU access
   ConfigureHeapInfoForGpu(&gpuStates, states);
+
+  // Allocate internal synchronization memory for device barriers
+  AllocateInternalSync(&gpuStates, states);
 
   // Copy complete state to device
   CopyGpuStatesToDevice(&gpuStates);
@@ -536,10 +608,10 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
 /*                                      Finalization Helpers                                     */
 /* ---------------------------------------------------------------------------------------------- */
 
-// Clean up GPU states and device memory
 static void FinalizeGpuStates() {
-  HIP_RUNTIME_CHECK(hipFree(globalGpuStates.transportTypes));
-  HIP_RUNTIME_CHECK(hipFree(globalGpuStates.rdmaEndpoints));
+  HIP_RUNTIME_CHECK(hipFree(s_hostGpuStatesCopy.transportTypes));
+  HIP_RUNTIME_CHECK(hipFree(s_hostGpuStatesCopy.rdmaEndpoints));
+  FinalizeRuntime();
   MORI_SHMEM_TRACE("GPU states finalized");
 }
 
@@ -621,6 +693,10 @@ int ShmemFinalize() {
 
   // Clean up in reverse order of initialization
   FinalizeGpuStates();
+
+  // Clean up internal sync memory
+  FinalizeInternalSync(states);
+
   FinalizeHeap(states);
   FinalizeAllStates(states);
 
@@ -640,84 +716,18 @@ int ShmemMpiInit(MPI_Comm mpiComm) {
 int ShmemInit() { return ShmemMpiInit(MPI_COMM_WORLD); }
 
 int ShmemTorchProcessGroupInit(const std::string& groupName) {
+#ifdef MORI_HAS_TORCH
   return ShmemInit(new application::TorchBootstrapNetwork(groupName));
+#else
+  (void)groupName;
+  fprintf(stderr,
+          "[mori] Error: Torch bootstrap not available (built without PyTorch).\n"
+          "[mori] Use ShmemMpiInit() or rebuild with PyTorch installed.\n");
+  return -1;
+#endif
 }
 
-/* ---------------------------------------------------------------------------------------------- */
-/*                                      Query APIs                                               */
-/* ---------------------------------------------------------------------------------------------- */
-
-int ShmemMyPe() {
-  ShmemStates* states = ShmemStatesSingleton::GetInstance();
-  return states->bootStates->rank;
-}
-
-int ShmemNPes() {
-  ShmemStates* states = ShmemStatesSingleton::GetInstance();
-  return states->bootStates->worldSize;
-}
-
-int ShmemNumQpPerPe() {
-  ShmemStates* states = ShmemStatesSingleton::GetInstance();
-  return states->rdmaStates->commContext->GetNumQpPerPe();
-}
-
-/* ---------------------------------------------------------------------------------------------- */
-/*                                      Module Initialization                                    */
-/* ---------------------------------------------------------------------------------------------- */
-
-int ShmemModuleInit(void* hipModule) {
-  ShmemStates* states = ShmemStatesSingleton::GetInstance();
-  states->CheckStatusValid();
-
-  GpuStates* hostGlobalGpuStatesAddr = nullptr;
-  HIP_RUNTIME_CHECK(hipGetSymbolAddress(reinterpret_cast<void**>(&hostGlobalGpuStatesAddr),
-                                        HIP_SYMBOL(globalGpuStates)));
-
-  // Read the current values from device
-  GpuStates gpuStates;
-  HIP_RUNTIME_CHECK(
-      hipMemcpy(&gpuStates, hostGlobalGpuStatesAddr, sizeof(GpuStates), hipMemcpyDeviceToHost));
-
-  // Get the symbol address from the specific module
-  hipModule_t module = static_cast<hipModule_t>(hipModule);
-  GpuStates* moduleGlobalGpuStatesAddr = nullptr;
-
-  hipError_t err = hipModuleGetGlobal(reinterpret_cast<hipDeviceptr_t*>(&moduleGlobalGpuStatesAddr),
-                                      nullptr, module, "_ZN4mori5shmem15globalGpuStatesE");
-
-  if (err != hipSuccess) {
-    MORI_SHMEM_WARN("Failed to get globalGpuStates symbol from module: {} (error code: {})",
-                    hipGetErrorString(err), err);
-    return -1;
-  }
-
-  MORI_SHMEM_TRACE("Module globalGpuStates address: 0x{:x} (host lib address: 0x{:x})",
-                   reinterpret_cast<uintptr_t>(moduleGlobalGpuStatesAddr),
-                   reinterpret_cast<uintptr_t>(hostGlobalGpuStatesAddr));
-
-  // Copy the GpuStates to the module's globalGpuStates
-  HIP_RUNTIME_CHECK(
-      hipMemcpy(moduleGlobalGpuStatesAddr, &gpuStates, sizeof(GpuStates), hipMemcpyHostToDevice));
-
-  MORI_SHMEM_TRACE("Successfully initialized globalGpuStates in module (rank={}, worldSize={})",
-                   gpuStates.rank, gpuStates.worldSize);
-
-  return 0;
-}
-
-/* ---------------------------------------------------------------------------------------------- */
-/*                                      Barrier API                                              */
-/* ---------------------------------------------------------------------------------------------- */
-
-void ShmemBarrierAll() {
-  ShmemStates* states = ShmemStatesSingleton::GetInstance();
-  states->CheckStatusValid();
-
-  MORI_SHMEM_TRACE("PE {} entering barrier", states->bootStates->rank);
-  states->bootStates->bootNet->Barrier();
-  MORI_SHMEM_TRACE("PE {} exiting barrier", states->bootStates->rank);
-}
+// Query APIs, Module Init, Barriers are in runtime.cpp
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      UniqueId-based Initialization                            */
@@ -734,33 +744,74 @@ int ShmemGetUniqueId(mori_shmem_uniqueid_t* uid) {
     const char* ifname = std::getenv("MORI_SOCKET_IFNAME");
     application::UniqueId socket_uid;
 
-    // Generate random port for UniqueId
     std::random_device rd;
     std::mt19937 gen(rd());
-    std::uniform_int_distribution<int> port_dis(25000, 35000);
-    int random_port = port_dis(gen);
+    std::uniform_int_distribution<int> port_dis(10000, 60000);
 
-    if (ifname) {
-      socket_uid =
-          application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface(ifname, random_port);
-      MORI_SHMEM_TRACE("Generated UniqueId with specified interface: {} (port {})", ifname,
-                       random_port);
-    } else {
-      socket_uid = application::SocketBootstrapNetwork::GenerateUniqueIdWithLocalAddr(random_port);
-      std::string localAddr = application::SocketBootstrapNetwork::GetLocalNonLoopbackAddress();
-      MORI_SHMEM_TRACE("Generated UniqueId with auto-detected interface: {} (port {})", localAddr,
-                       random_port);
+    constexpr int kMaxPortRetries = 20;
+    bool port_found = false;
+
+    for (int attempt = 0; attempt < kMaxPortRetries; attempt++) {
+      int random_port = port_dis(gen);
+
+      int probe_fd = socket(AF_INET, SOCK_STREAM, 0);
+      if (probe_fd < 0) continue;
+
+      int opt = 1;
+      setsockopt(probe_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+      struct sockaddr_in probe_addr{};
+      probe_addr.sin_family = AF_INET;
+      probe_addr.sin_port = htons(random_port);
+      probe_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+      if (bind(probe_fd, reinterpret_cast<struct sockaddr*>(&probe_addr), sizeof(probe_addr)) ==
+          0) {
+        close(probe_fd);
+
+        if (ifname) {
+          socket_uid = application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface(
+              ifname, random_port);
+          MORI_SHMEM_TRACE("Generated UniqueId with specified interface: {} (port {})", ifname,
+                           random_port);
+        } else {
+          socket_uid =
+              application::SocketBootstrapNetwork::GenerateUniqueIdWithLocalAddr(random_port);
+          std::string localAddr = application::SocketBootstrapNetwork::GetLocalNonLoopbackAddress();
+          MORI_SHMEM_TRACE("Generated UniqueId with auto-detected interface: {} (port {})",
+                           localAddr, random_port);
+        }
+        port_found = true;
+        break;
+      }
+
+      close(probe_fd);
+      MORI_SHMEM_TRACE("Port {} in use, retrying ({}/{})", random_port, attempt + 1,
+                       kMaxPortRetries);
     }
+
+    if (!port_found) {
+      MORI_SHMEM_ERROR(
+          "Failed to find available port after {} attempts. "
+          "Try setting MORI_SOCKET_IFNAME=<interface> (e.g. eth0, eno1) "
+          "to specify the network interface.",
+          kMaxPortRetries);
+      return -1;
+    }
+
     static_assert(sizeof(socket_uid) == sizeof(mori_shmem_uniqueid_t),
                   "UniqueId size mismatch between Socket Bootstrap and mori SHMEM");
 
-    // Copy to mori_shmem_uniqueid_t
     std::memcpy(uid->data(), &socket_uid, sizeof(socket_uid));
 
     return 0;
 
   } catch (const std::exception& e) {
-    MORI_SHMEM_ERROR("ShmemGetUniqueId failed: {}", e.what());
+    MORI_SHMEM_ERROR(
+        "ShmemGetUniqueId failed: {}. "
+        "Try setting MORI_SOCKET_IFNAME=<interface> (e.g. eth0, eno1) "
+        "to specify the network interface for bootstrap communication.",
+        e.what());
     return -1;
   }
 }
@@ -835,7 +886,11 @@ int ShmemInitAttr(unsigned int flags, mori_shmem_init_attr_t* attr) {
       return 0;
 
     } catch (const std::exception& e) {
-      MORI_SHMEM_ERROR("UniqueId initialization failed: {}", e.what());
+      MORI_SHMEM_ERROR(
+          "UniqueId initialization failed: {}. "
+          "Try setting MORI_SOCKET_IFNAME=<interface> (e.g. eth0, eno1) "
+          "to specify the network interface for bootstrap communication.",
+          e.what());
       return -1;
     }
   }

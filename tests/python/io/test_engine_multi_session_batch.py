@@ -36,7 +36,9 @@ single BatchRead / BatchWrite call and each completes successfully.
 """
 
 import pytest
+import os
 import torch
+from contextlib import contextmanager
 
 from tests.python.utils import get_free_port
 from mori.io import (
@@ -70,8 +72,9 @@ def create_connected_engine_pair(
         post_batch_size=post_batch_size,
         num_worker_threads=num_worker_threads,
     )
-    initiator.create_backend(BackendType.RDMA, be_cfg)
-    target.create_backend(BackendType.RDMA, be_cfg)
+    with temporary_env("MORI_DISABLE_AUTO_XGMI", "1"):
+        initiator.create_backend(BackendType.RDMA, be_cfg)
+        target.create_backend(BackendType.RDMA, be_cfg)
 
     initiator_desc = initiator.get_engine_desc()
     target_desc = target.get_engine_desc()
@@ -79,6 +82,19 @@ def create_connected_engine_pair(
     target.register_remote_engine(initiator_desc)
 
     return initiator, target
+
+
+@contextmanager
+def temporary_env(env_name: str, value: str):
+    old_value = os.environ.get(env_name)
+    os.environ[env_name] = value
+    try:
+        yield
+    finally:
+        if old_value is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = old_value
 
 
 @pytest.fixture(scope="module")

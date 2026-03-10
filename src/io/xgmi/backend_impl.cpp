@@ -24,6 +24,7 @@
 #include <limits.h>
 #include <unistd.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 
@@ -31,6 +32,34 @@
 
 namespace mori {
 namespace io {
+namespace {
+
+// Keep caller-visible HIP current device unchanged across MORI internals.
+class ScopedHipDeviceGuard {
+ public:
+  ScopedHipDeviceGuard() {
+    hipError_t err = hipGetDevice(&originalDevice_);
+    if (err != hipSuccess) {
+      valid_ = false;
+      MORI_IO_WARN("XGMI: Failed to query current device for guard: {}", hipGetErrorString(err));
+    }
+  }
+
+  ~ScopedHipDeviceGuard() {
+    if (!valid_) return;
+    hipError_t err = hipSetDevice(originalDevice_);
+    if (err != hipSuccess) {
+      MORI_IO_WARN("XGMI: Failed to restore current device {}: {}", originalDevice_,
+                   hipGetErrorString(err));
+    }
+  }
+
+ private:
+  int originalDevice_{0};
+  bool valid_{true};
+};
+
+}  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        XgmiBackendSession                                      */
@@ -49,6 +78,7 @@ XgmiBackendSession::XgmiBackendSession(const XgmiBackendConfig& config, void* lo
 
 void XgmiBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
+  ScopedHipDeviceGuard deviceGuard;
   const int srcDevice = isRead ? remoteDevice : localDevice;
   const int dstDevice = isRead ? localDevice : remoteDevice;
 
@@ -117,6 +147,7 @@ void XgmiBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
 void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                         const SizeVec& sizes, TransferStatus* status,
                                         TransferUniqueId id, bool isRead) {
+  ScopedHipDeviceGuard deviceGuard;
   size_t batchSize = sizes.size();
   assert(batchSize == localOffsets.size());
   assert(batchSize == remoteOffsets.size());
@@ -250,9 +281,16 @@ bool XgmiBackendSession::Alive() const { return true; }
 XgmiBackend::XgmiBackend(EngineKey k, const IOEngineConfig& engConfig,
                          const XgmiBackendConfig& beConfig)
     : myEngKey(k), config(beConfig) {
+  const char* nodeIdEnv = std::getenv("MORI_IO_NODE_ID");
+  if (nodeIdEnv != nullptr && nodeIdEnv[0] != '\0') {
+    myNodeId = std::string(nodeIdEnv);
+  }
   char hostname[HOST_NAME_MAX];
   gethostname(hostname, HOST_NAME_MAX);
   myHostname = std::string(hostname);
+  if (myNodeId.empty()) {
+    myNodeId = myHostname;
+  }
 
   streamPool = std::make_unique<StreamPool>(config.numStreams);
   eventPool = std::make_unique<EventPool>(config.numEvents);
@@ -261,15 +299,18 @@ XgmiBackend::XgmiBackend(EngineKey k, const IOEngineConfig& engConfig,
 
   std::stringstream ss;
   ss << config;
-  MORI_IO_INFO("XgmiBackend created with config: {} hostname: {}", ss.str().c_str(),
-               myHostname.c_str());
+  MORI_IO_INFO("XgmiBackend created with config: {} node_id: {} hostname: {}", ss.str().c_str(),
+               myNodeId.c_str(), myHostname.c_str());
 }
 
 XgmiBackend::~XgmiBackend() {
   std::unique_lock<std::shared_mutex> lock(ipcMutex);
   for (auto& entry : remoteIpcHandles) {
     if (entry.second.remappedAddr != nullptr) {
-      hipIpcCloseMemHandle(entry.second.remappedAddr);
+      hipError_t closeErr = hipIpcCloseMemHandle(entry.second.remappedAddr);
+      if (closeErr != hipSuccess) {
+        MORI_IO_WARN("XGMI: Failed to close IPC mem handle: {}", hipGetErrorString(closeErr));
+      }
     }
   }
   remoteIpcHandles.clear();
@@ -285,6 +326,7 @@ void XgmiBackend::InitializeP2PAccess() {
   }
 
   p2pMatrix.resize(numDevices, std::vector<bool>(numDevices, false));
+  ScopedHipDeviceGuard deviceGuard;
 
   for (int i = 0; i < numDevices; ++i) {
     err = hipSetDevice(i);
@@ -309,7 +351,11 @@ void XgmiBackend::InitializeP2PAccess() {
       if (canAccess) {
         hipError_t enableErr = hipDeviceEnablePeerAccess(j, 0);
         if (enableErr == hipErrorPeerAccessAlreadyEnabled) {
-          hipGetLastError();
+          hipError_t clearErr = hipGetLastError();
+          if (clearErr != hipSuccess) {
+            MORI_IO_WARN("XGMI: Failed to clear peer access error: {}",
+                         hipGetErrorString(clearErr));
+          }
           p2pMatrix[i][j] = true;
           MORI_IO_TRACE("XGMI: P2P access already enabled from device {} to {}", i, j);
         } else if (enableErr != hipSuccess) {
@@ -391,6 +437,7 @@ void* XgmiBackend::GetRemappedAddress(const MemoryDesc& desc, int localDeviceId)
   static_assert(sizeof(handle) == kIpcHandleSize, "IPC handle size mismatch");
   std::memcpy(&handle, desc.ipcHandle.data(), sizeof(handle));
 
+  ScopedHipDeviceGuard deviceGuard;
   hipError_t err = hipSetDevice(localDeviceId);
   if (err != hipSuccess) {
     MORI_IO_WARN("XGMI: Failed to set device {} for IPC open: {}", localDeviceId,
@@ -401,7 +448,10 @@ void* XgmiBackend::GetRemappedAddress(const MemoryDesc& desc, int localDeviceId)
   void* remappedAddr = nullptr;
   err = hipIpcOpenMemHandle(&remappedAddr, handle, hipIpcMemLazyEnablePeerAccess);
   if (err != hipSuccess) {
-    hipGetLastError();
+    hipError_t clearErr = hipGetLastError();
+    if (clearErr != hipSuccess) {
+      MORI_IO_WARN("XGMI: Failed to clear IPC open error: {}", hipGetErrorString(clearErr));
+    }
     if (IsP2PAccessible(localDeviceId, desc.deviceId)) {
       MORI_IO_TRACE("XGMI: IPC failed, using direct P2P pointer for id={}", desc.id);
       return reinterpret_cast<void*>(desc.data);
@@ -521,7 +571,11 @@ bool XgmiBackend::CanHandle(const MemoryDesc& local, const MemoryDesc& remote) c
   if (it == remoteEngines.end()) {
     return false;
   }
-  return it->second.hostname == myHostname;
+  const EngineDesc& remoteEngine = it->second;
+  if (!myNodeId.empty() && !remoteEngine.nodeId.empty()) {
+    return remoteEngine.nodeId == myNodeId;
+  }
+  return remoteEngine.hostname == myHostname;
 }
 
 }  // namespace io

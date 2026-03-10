@@ -21,4 +21,5 @@
 // SOFTWARE.
 #pragma once
 
+#include "mori/ops/cast.hpp"
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"

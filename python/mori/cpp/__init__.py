@@ -24,15 +24,14 @@ import sys
 import importlib.util
 import ctypes
 
-# PyTorch must be imported first to initialize its runtime
-# (libtorch, libc10, etc.) before loading mori's native extensions
-import torch  # noqa: F401
+try:
+    import torch  # noqa: F401
+except ImportError:
+    pass
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
 mori_lib_dir = os.path.abspath(os.path.join(cur_dir, ".."))
 
-# Pre-load dependent shared libraries
-# This is necessary because libmori_pybinds.so depends on libmori_application.so etc.
 _preload_libs = ["libmori_application.so", "libmori_io.so"]
 for _lib_name in _preload_libs:
     _lib_full_path = os.path.join(mori_lib_dir, _lib_name)

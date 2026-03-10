@@ -31,6 +31,8 @@
 #include "mori/core/profiler/kernel_profiler.hpp"
 #include "mori/profiler/profiler.hpp"
 #endif
+#include <type_traits>
+
 #include "src/ops/dispatch_combine/common.hpp"
 
 namespace mori {
@@ -566,7 +568,7 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
 }  // namespace v1
 
 template <typename T>
-__global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
+__device__ void EpDispatchInterNodeV1Kernel_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   if (blockId < args.rdmaBlockNum) {
     v1::DispatchInterNodeSend<T, true>(args);
@@ -578,7 +580,12 @@ __global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
 }
 
 template <typename T>
-__global__ void EpDispatchCopyToStaging(EpDispatchCombineArgs<T> args) {
+__global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
+  EpDispatchInterNodeV1Kernel_body<T>(args);
+}
+
+template <typename T>
+__device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   MORI_TRACE_SPAN(profiler, Slot::EpDispatchCopyToStaging);
   if (args.curRankNumToken == 0) return;
@@ -618,8 +625,13 @@ __global__ void EpDispatchCopyToStaging(EpDispatchCombineArgs<T> args) {
   }
 }
 
+template <typename T>
+__global__ void EpDispatchCopyToStaging(EpDispatchCombineArgs<T> args) {
+  EpDispatchCopyToStaging_body<T>(args);
+}
+
 template <typename T, bool EnableStdMoE>
-__global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
+__device__ void EpDispatchInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   if (blockId < args.rdmaBlockNum) {
     v1::DispatchInterNodeLLSend<T>(args);
@@ -636,6 +648,11 @@ __global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> a
 #endif
 }
 
+template <typename T, bool EnableStdMoE>
+__global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
+  EpDispatchInterNodeV1KernelLowLatency_body<T, EnableStdMoE>(args);
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                   EpCombineInterNodeV1Kernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
@@ -650,12 +667,19 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
   int tokenPerBlock = core::CeilDiv(totalRecvTokenNum, blockNum);
   int startTokenIdx = blockId * tokenPerBlock;
   int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, totalRecvTokenNum);
-#ifdef ENABLE_STANDARD_MOE_ADAPT
-
-#else
+#ifndef ENABLE_STANDARD_MOE_ADAPT
   for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
-    core::WarpCopy(args.shmemCombineInpTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim,
-                   args.inpTokenBuf + tokenId * config.hiddenDim, config.hiddenDim);
+    if (args.config.quantType == QuantType::Fp8DirectCast) {
+      using Fp8T = core::CombineInternalFp8;
+      Fp8T* dst = args.shmemCombineInpTokMemObj->template GetAs<Fp8T*>();
+      const T* src = args.inpTokenBuf;
+      const int base = tokenId * config.hiddenDim;
+      core::WarpCastBf16ToCombineInternalFp8<T>(dst + base, src + base, config.hiddenDim, laneId);
+    } else {
+      core::WarpCopy(
+          args.shmemCombineInpTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim,
+          args.inpTokenBuf + tokenId * config.hiddenDim, config.hiddenDim);
+    }
   }
 #endif
   if (args.weightsBuf) {
@@ -665,46 +689,25 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
           args.weightsBuf + tokenId * config.numExpertPerToken, config.numExpertPerToken);
     }
   }
-
-  uint64_t barrierFlag = 0;
-  int finishedWarp = 0;
-  if (laneId == 0) {
-    finishedWarp = atomicAdd(args.combineGridBarrier, 1);
-    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
-  }
-  finishedWarp = __shfl(finishedWarp, 0);
-  barrierFlag = __shfl(barrierFlag, 0);
-  if ((finishedWarp + 1) == (blockNum * warpNum)) {
-    if (laneId < config.gpuPerNode) {
-      int destPe = myNode * config.gpuPerNode + laneId;
-      core::AtomicStoreRelaxedSystem(
-          args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>(destPe) + args.config.rank,
-          barrierFlag);
-    }
-    if (laneId == 0) args.combineGridBarrier[0] = 0;
-  }
-  uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
-  if (laneId < config.gpuPerNode) {
-    int destPe = myNode * config.gpuPerNode + laneId;
-    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe) != barrierFlag) {
-    }
-  }
 }
 
-template <typename T>
-inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
+namespace combine_impl {
+
+template <typename TokT, typename T>
+__forceinline__ __device__ void CombineIntraNodeTyped(EpDispatchCombineArgs<T>& args,
+                                                      size_t tokHiddenBytes,
+                                                      size_t tokCombXferBytes) {
   DEF_COMMON_VARS;
-  MORI_TRACE_SPAN(profiler, Slot::CombineIntraNode);
 
   int blockOffset = args.rdmaBlockNum;
   int xgmiBlockNum = blockNum - args.rdmaBlockNum;
 
   extern __shared__ char sharedMem[];
-  T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
+  TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
   uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>() +
-                        (nNodes + myNode) * config.MaxNumTokensToRecvPerRank() * combXferBytes;
+                        (nNodes + myNode) * config.MaxNumTokensToRecvPerRank() * tokCombXferBytes;
 
   int tokenPerBlock = (args.curRankNumToken + xgmiBlockNum - 1) / xgmiBlockNum;
   int startTokenIdx = (blockId - blockOffset) * tokenPerBlock;
@@ -719,28 +722,27 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
       index_t destNode = destPe / config.gpuPerNode;
       if (destNode == myNode) {
         index_t destLocalTokId = destTokId - destPe * config.MaxNumTokensToRecv();
-        srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+        srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<TokT*>(destPe) +
                           destLocalTokId * config.hiddenDim;
         srcWeightsPtr[laneId] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                                 destLocalTokId * config.numExpertPerToken;
       }
     }
-    core::WarpAccum<T, 4>(reinterpret_cast<T*>(stagingPtr + tokenId * combXferBytes), srcPtrs,
-                          nullptr, config.numExpertPerToken, config.hiddenDim);
+    core::WarpAccum<TokT, 4>(reinterpret_cast<TokT*>(stagingPtr + tokenId * tokCombXferBytes),
+                             srcPtrs, nullptr, config.numExpertPerToken, config.hiddenDim);
     if (args.weightsBuf) {
       core::WarpAccum<float, 4>(
-          reinterpret_cast<float*>(stagingPtr + tokenId * combXferBytes + hiddenBytes),
+          reinterpret_cast<float*>(stagingPtr + tokenId * tokCombXferBytes + tokHiddenBytes),
           srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
     }
   }
 }
 
-template <typename T>
-inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
+template <typename TokT, typename T>
+__forceinline__ __device__ void CombineIntraNodeLLTyped(EpDispatchCombineArgs<T>& args,
+                                                        size_t tokHiddenBytes,
+                                                        size_t tokCombXferBytes) {
   DEF_COMMON_VARS;
-  MORI_TRACE_SPAN(profiler, Slot::CombineIntraNodeLL);
-
-  if (args.curRankNumToken == 0) return;
 
   // Distribute tokens evenly to all blocks
   int blockOffset = args.rdmaBlockNum;
@@ -748,11 +750,11 @@ inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
   int xgmiWarpNum = xgmiBlockNum * warpNum;
 
   extern __shared__ char sharedMem[];
-  T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
+  TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
   uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>() +
-                        (nNodes + myNode) * config.MaxNumTokensToRecvPerRank() * combXferBytes;
+                        (nNodes + myNode) * config.MaxNumTokensToRecvPerRank() * tokCombXferBytes;
 
   index_t warpsPerToken = (xgmiWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
   index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
@@ -773,27 +775,28 @@ inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
       index_t destNode = destPe / config.gpuPerNode;
       if (destNode == myNode) {
         index_t destLocalTokId = destTokId - destPe * config.MaxNumTokensToRecv();
-        srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+        srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<TokT*>(destPe) +
                           destLocalTokId * config.hiddenDim + hiddenDimOffset;
         srcWeightsPtr[laneId] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                                 destLocalTokId * config.numExpertPerToken;
       }
     }
-    core::WarpAccum<T, 4>(
-        reinterpret_cast<T*>(stagingPtr + tokenId * combXferBytes) + hiddenDimOffset, srcPtrs,
+    core::WarpAccum<TokT, 4>(
+        reinterpret_cast<TokT*>(stagingPtr + tokenId * tokCombXferBytes) + hiddenDimOffset, srcPtrs,
         nullptr, config.numExpertPerToken, hiddenDimSize);
     if (args.weightsBuf && (inTokenPartId == warpsPerToken - 1)) {
       core::WarpAccum<float, 4>(
-          reinterpret_cast<float*>(stagingPtr + tokenId * combXferBytes + hiddenBytes),
+          reinterpret_cast<float*>(stagingPtr + tokenId * tokCombXferBytes + tokHiddenBytes),
           srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
     }
   }
 }
 
-template <typename T>
-inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
+template <typename TokT, typename T>
+__forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& args,
+                                                      size_t tokHiddenBytes,
+                                                      size_t tokCombXferBytes) {
   DEF_COMMON_VARS;
-  MORI_TRACE_SPAN(profiler, Slot::CombineInterNode);
 
   constexpr int numRecvBlock = 8;
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
@@ -802,7 +805,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   index_t* nodeRecvTokenNum = args.nodeRecvTokenNumMemObj->template GetAs<index_t*>();
 
   extern __shared__ char sharedMem[];
-  T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
+  TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
   uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
@@ -867,7 +870,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
                 index_t destNode = destPe / config.gpuPerNode;
                 if (destNode == myNode) {
                   index_t destLocalTokId = destTokId - destPe * config.MaxNumTokensToRecv();
-                  srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+                  srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<TokT*>(destPe) +
                                     destLocalTokId * config.hiddenDim;
                   srcWeightsPtr[laneId] =
                       args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
@@ -876,12 +879,14 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
                 args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId] = 0;
               }
 
-              core::WarpAccum<T, 4>(reinterpret_cast<T*>(stagingPtr + tokIdx * combXferBytes),
-                                    srcPtrs, nullptr, config.numExpertPerToken, config.hiddenDim);
+              core::WarpAccum<TokT, 4>(
+                  reinterpret_cast<TokT*>(stagingPtr + tokIdx * tokCombXferBytes), srcPtrs, nullptr,
+                  config.numExpertPerToken, config.hiddenDim);
 
               if (args.weightsBuf) {
                 core::WarpAccum<float, 4>(
-                    reinterpret_cast<float*>(stagingPtr + tokIdx * combXferBytes + hiddenBytes),
+                    reinterpret_cast<float*>(stagingPtr + tokIdx * tokCombXferBytes +
+                                             tokHiddenBytes),
                     srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
               }
             }
@@ -904,10 +909,10 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
               shmem::ShmemPutTypeNbiWarp<uint8_t>(
                   args.shmemStagingTokMemObj,
                   ((myNode + nNodes) * config.MaxNumTokensToRecvPerRank() + startTokenIdx) *
-                      combXferBytes,
+                      tokCombXferBytes,
                   args.shmemStagingTokMemObj,
-                  (node * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * combXferBytes,
-                  thisChunkTokenNum * combXferBytes, proxyPe, qpId);
+                  (node * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * tokCombXferBytes,
+                  thisChunkTokenNum * tokCombXferBytes, proxyPe, qpId);
             }
           }
           processedMask |= (1u << relativeIdx);
@@ -959,10 +964,11 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   }
 }
 
-template <typename T>
-inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
+template <typename TokT, typename T>
+__forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>& args,
+                                                        size_t tokHiddenBytes,
+                                                        size_t tokCombXferBytes) {
   DEF_COMMON_VARS;
-  MORI_TRACE_SPAN(profiler, Slot::CombineInterNodeLL);
 
   constexpr int numRecvBlock = 8;
   int maxChunkNum = core::CeilDiv(config.maxNumInpTokenPerRank, warpSize);
@@ -971,7 +977,7 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
   uint64_t* nodeRecvTokenNum = args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>();
 
   extern __shared__ char sharedMem[];
-  T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
+  TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
   uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
@@ -1011,18 +1017,20 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
           index_t destNode = destPe / config.gpuPerNode;
           if (destNode == myNode) {
             index_t destLocalTokId = destTokId - destPe * config.MaxNumTokensToRecv();
-            srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<T*>(destPe) +
+            srcPtrs[laneId] = args.shmemCombineInpTokMemObj->template GetAs<TokT*>(destPe) +
                               destLocalTokId * config.hiddenDim + hiddenDimOffset;
             srcWeightsPtr[laneId] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                                     destLocalTokId * config.numExpertPerToken;
           }
         }
-        core::WarpAccum<T, 4>(
-            reinterpret_cast<T*>(stagingPtr + globalTokenId * combXferBytes) + hiddenDimOffset,
+        core::WarpAccum<TokT, 4>(
+            reinterpret_cast<TokT*>(stagingPtr + globalTokenId * tokCombXferBytes) +
+                hiddenDimOffset,
             srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
         if (args.weightsBuf && (inTokenPartId == 0)) {
           core::WarpAccum<float, 4>(
-              reinterpret_cast<float*>(stagingPtr + globalTokenId * combXferBytes + hiddenBytes),
+              reinterpret_cast<float*>(stagingPtr + globalTokenId * tokCombXferBytes +
+                                       tokHiddenBytes),
               srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
         }
       }
@@ -1044,10 +1052,10 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
         shmem::ShmemPutTypeNbiWarp<uint8_t>(
             args.shmemStagingTokMemObj,
             ((myNode + nNodes) * config.MaxNumTokensToRecvPerRank() + startTokenIdx) *
-                combXferBytes,
+                tokCombXferBytes,
             args.shmemStagingTokMemObj,
-            (node * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * combXferBytes,
-            thisChunkTokenNum * combXferBytes, proxyPe, qpId);
+            (node * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * tokCombXferBytes,
+            thisChunkTokenNum * tokCombXferBytes, proxyPe, qpId);
       }
     }
   }
@@ -1093,72 +1101,77 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
   }
 }
 
+}  // namespace combine_impl
+
 template <typename T>
-inline __device__ void CombineAll(EpDispatchCombineArgs<T>& args) {
+inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
-  MORI_TRACE_SPAN(profiler, Slot::CombineAll);
+  MORI_TRACE_SPAN(profiler, Slot::CombineIntraNode);
+  if (args.config.quantType == QuantType::Fp8DirectCast) {
+    using TokT = core::CombineInternalFp8;
+    const size_t tokHiddenBytes = config.hiddenDim * sizeof(TokT);
+    const size_t tokCombXferBytes =
+        (args.weightsBuf == nullptr) ? tokHiddenBytes : tokHiddenBytes + weightBytes;
+    combine_impl::CombineIntraNodeTyped<TokT>(args, tokHiddenBytes, tokCombXferBytes);
+    return;
+  }
+
+  combine_impl::CombineIntraNodeTyped<T>(args, hiddenBytes, combXferBytes);
+}
+
+template <typename T>
+inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
+  DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::CombineIntraNodeLL);
 
   if (args.curRankNumToken == 0) return;
-  // Wait all warps
-  if (laneId == 0) {
-    atomicAdd(&args.combineGridBarrier[1], 1);
-    shmem::ShmemUint32WaitUntilEquals(&args.combineGridBarrier[1], globalWarpNum);
+  if (args.config.quantType == QuantType::Fp8DirectCast) {
+    using TokT = core::CombineInternalFp8;
+    const size_t tokHiddenBytes = config.hiddenDim * sizeof(TokT);
+    const size_t tokCombXferBytes =
+        (args.weightsBuf == nullptr) ? tokHiddenBytes : tokHiddenBytes + weightBytes;
+    combine_impl::CombineIntraNodeLLTyped<TokT>(args, tokHiddenBytes, tokCombXferBytes);
+    return;
   }
+  combine_impl::CombineIntraNodeLLTyped<T>(args, hiddenBytes, combXferBytes);
+}
 
-  extern __shared__ char sharedMem[];
-  T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
-  float** srcWeightsPtrs = reinterpret_cast<float**>(sharedMem) +
-                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
-  uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>() +
-                        nNodes * config.MaxNumTokensToRecvPerRank() * combXferBytes;
+template <typename T>
+inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
+  DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::CombineInterNode);
 
-  index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
-  index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
-
-  for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
-    index_t tokenId = i / warpsPerToken;
-    index_t inTokenPartId = i % warpsPerToken;
-    index_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
-    index_t hiddenDimSize =
-        std::max(0, std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp));
-
-    int lanePe = -1, laneNode = -1;
-    if (laneId < config.numExpertPerToken) {
-      lanePe = (args.tokenIndices[tokenId * numExpertPerToken + laneId] / config.numExpertPerRank);
-      laneNode = lanePe / config.gpuPerNode;
-    }
-
-    if (laneId < nNodes) {
-      srcPtrs[laneId] = nullptr;
-      srcWeightsPtrs[laneId] = nullptr;
-    }
-
-    for (int n = 0; n < nNodes; n++) {
-      if (__any(laneNode == n) && (laneId == 0)) {
-        int mappedId = (n == myNode) ? tokenId : args.interNodeDispSendMap[nNodes * tokenId + n];
-        uint8_t* base =
-            stagingPtr + (n * config.MaxNumTokensToRecvPerRank() + mappedId) * combXferBytes;
-        srcPtrs[n] = reinterpret_cast<T*>(base) + hiddenDimOffset;
-        srcWeightsPtrs[n] = reinterpret_cast<float*>(base + hiddenBytes);
-      }
-    }
-    core::WarpAccum<T, 4>(args.shmemCombineOutTokMemObj->template GetAs<T*>() +
-                              tokenId * config.hiddenDim + hiddenDimOffset,
-                          srcPtrs, nullptr, nNodes, hiddenDimSize);
-    if (args.weightsBuf && (inTokenPartId == warpsPerToken - 1)) {
-      core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
-                                    tokenId * config.numExpertPerToken,
-                                srcWeightsPtrs, nullptr, nNodes, config.numExpertPerToken);
-    }
+  if (args.config.quantType == QuantType::Fp8DirectCast) {
+    using TokT = core::CombineInternalFp8;
+    const size_t tokHiddenBytes = config.hiddenDim * sizeof(TokT);
+    const size_t tokCombXferBytes =
+        (args.weightsBuf == nullptr) ? tokHiddenBytes : tokHiddenBytes + weightBytes;
+    combine_impl::CombineInterNodeTyped<TokT>(args, tokHiddenBytes, tokCombXferBytes);
+    return;
   }
+  combine_impl::CombineInterNodeTyped<T>(args, hiddenBytes, combXferBytes);
+}
+
+template <typename T>
+inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
+  DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::CombineInterNodeLL);
+  if (args.config.quantType == QuantType::Fp8DirectCast) {
+    using TokT = core::CombineInternalFp8;
+    const size_t tokHiddenBytes = config.hiddenDim * sizeof(TokT);
+    const size_t tokCombXferBytes =
+        (args.weightsBuf == nullptr) ? tokHiddenBytes : tokHiddenBytes + weightBytes;
+    combine_impl::CombineInterNodeLLTyped<TokT>(args, tokHiddenBytes, tokCombXferBytes);
+    return;
+  }
+  combine_impl::CombineInterNodeLLTyped<T>(args, hiddenBytes, combXferBytes);
 }
 }  // namespace v1
 
 template <typename T>
-__global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
+__device__ void EpCombineInterNodeV1Kernel_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
 
-  v1::CombineSync(args);
   if (blockId < args.rdmaBlockNum) {
     v1::CombineInterNode(args);
   } else {
@@ -1167,15 +1180,73 @@ __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
 }
 
 template <typename T>
-__global__ void EpCombineAll(EpDispatchCombineArgs<T> args) {
-  DEF_COMMON_VARS;
-  MORI_TRACE_SPAN(profiler, Slot::EpCombineAll);
+__global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
+  EpCombineInterNodeV1Kernel_body<T>(args);
+}
 
-  if (globalWarpId == 0) {
-    if (laneId == 0) args.totalRecvTokenNum[0] = 0;
-    if (laneId < nNodes) args.blockFlagCounter[laneId] = 0;
+namespace combine_all_impl {
+
+template <typename T>
+__forceinline__ __device__ void EpCombineAllInternalFp8(EpDispatchCombineArgs<T>& args,
+                                                        size_t fp8HiddenBytes,
+                                                        size_t fp8CombXferBytes) {
+  DEF_COMMON_VARS;
+  using Fp8T = core::CombineInternalFp8;
+
+  extern __shared__ char sharedMem[];
+  Fp8T** srcPtrs = reinterpret_cast<Fp8T**>(sharedMem) + warpId * config.numExpertPerToken;
+  float** srcWeightsPtrs = reinterpret_cast<float**>(sharedMem) +
+                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
+  uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>() +
+                        nNodes * config.MaxNumTokensToRecvPerRank() * fp8CombXferBytes;
+
+  index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
+  index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
+
+  for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
+    index_t tokenId = i / warpsPerToken;
+    index_t inTokenPartId = i % warpsPerToken;
+    index_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
+    index_t hiddenDimSize =
+        std::max(0, std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp));
+
+    int lanePe = -1, laneNode = -1;
+    if (laneId < config.numExpertPerToken) {
+      lanePe = (args.tokenIndices[tokenId * numExpertPerToken + laneId] / config.numExpertPerRank);
+      laneNode = lanePe / config.gpuPerNode;
+    }
+
+    if (laneId < nNodes) {
+      srcPtrs[laneId] = nullptr;
+      srcWeightsPtrs[laneId] = nullptr;
+    }
+
+    for (int n = 0; n < nNodes; n++) {
+      if (__any(laneNode == n) && (laneId == 0)) {
+        int mappedId = (n == myNode) ? tokenId : args.interNodeDispSendMap[nNodes * tokenId + n];
+        uint8_t* base =
+            stagingPtr + (n * config.MaxNumTokensToRecvPerRank() + mappedId) * fp8CombXferBytes;
+        srcPtrs[n] = reinterpret_cast<Fp8T*>(base) + hiddenDimOffset;
+        srcWeightsPtrs[n] = reinterpret_cast<float*>(base + fp8HiddenBytes);
+      }
+    }
+
+    T* out = args.shmemCombineOutTokMemObj->template GetAs<T*>() + tokenId * config.hiddenDim +
+             hiddenDimOffset;
+    core::WarpAccumCombineInternalFp8ToBf16(out, reinterpret_cast<const Fp8T* const*>(srcPtrs),
+                                            nNodes, laneId, hiddenDimSize);
+
+    if (args.weightsBuf && (inTokenPartId == warpsPerToken - 1)) {
+      core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
+                                    tokenId * config.numExpertPerToken,
+                                srcWeightsPtrs, nullptr, nNodes, config.numExpertPerToken);
+    }
   }
-  if (args.curRankNumToken == 0) return;
+}
+
+template <typename T>
+__forceinline__ __device__ void EpCombineAllGeneric(EpDispatchCombineArgs<T>& args) {
+  DEF_COMMON_VARS;
 
   extern __shared__ char sharedMem[];
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
@@ -1225,8 +1296,36 @@ __global__ void EpCombineAll(EpDispatchCombineArgs<T> args) {
   }
 }
 
+}  // namespace combine_all_impl
+
+template <typename T>
+__device__ void EpCombineAll_body(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  MORI_TRACE_SPAN(profiler, Slot::EpCombineAll);
+
+  if (globalWarpId == 0) {
+    if (laneId == 0) args.totalRecvTokenNum[0] = 0;
+    if (laneId < nNodes) args.blockFlagCounter[laneId] = 0;
+  }
+  if (args.curRankNumToken == 0) return;
+  if (args.config.quantType == QuantType::Fp8DirectCast) {
+    using Fp8T = core::CombineInternalFp8;
+    const size_t fp8HiddenBytes = config.hiddenDim * sizeof(Fp8T);
+    const size_t fp8CombXferBytes =
+        (args.weightsBuf == nullptr) ? fp8HiddenBytes : fp8HiddenBytes + weightBytes;
+    combine_all_impl::EpCombineAllInternalFp8(args, fp8HiddenBytes, fp8CombXferBytes);
+    return;
+  }
+  combine_all_impl::EpCombineAllGeneric(args);
+}
+
+template <typename T>
+__global__ void EpCombineAll(EpDispatchCombineArgs<T> args) {
+  EpCombineAll_body<T>(args);
+}
+
 template <typename T, bool EnableStdMoE>
-__global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
+__device__ void EpCombineInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
 
   // If EnableStdMoE, call ConvertCombineInputDevice first to convert standard MoE format
@@ -1236,7 +1335,6 @@ __global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> ar
   }
 #endif
 
-  v1::CombineSync(args);
   if (blockId < args.rdmaBlockNum) {
     v1::CombineInterNodeLL(args);
   } else {
@@ -1244,63 +1342,45 @@ __global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> ar
   }
 }
 
-/* ---------------------------------------------------------------------------------------------- */
-/*                                     Template Specialization                                    */
-/* ---------------------------------------------------------------------------------------------- */
+template <typename T, bool EnableStdMoE>
+__global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
+  EpCombineInterNodeV1KernelLowLatency_body<T, EnableStdMoE>(args);
+}
 
-// Helper macros for conditional FP8 compilation
-#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-#define MORI_FP8_FNUZ(...) __VA_ARGS__
-#else
-#define MORI_FP8_FNUZ(...)
-#endif
+template <typename T>
+__device__ void EpCombineSync_body(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  v1::CombineSync(args);
+}
 
-#ifdef MORI_FP8_TYPE_OCP_ENABLED
-#define MORI_FP8_OCP(...) __VA_ARGS__
-#else
-#define MORI_FP8_OCP(...)
-#endif
+template <typename T>
+__global__ void EpCombineSync(EpDispatchCombineArgs<T> args) {
+  EpCombineSync_body<T>(args);
+}
 
-// Macro to instantiate a kernel for all data types
-#define INSTANTIATE_KERNEL(KernelName)                                                         \
-  template __global__ void KernelName<hip_bfloat16>(EpDispatchCombineArgs<hip_bfloat16> args); \
-  MORI_FP8_FNUZ(template __global__ void KernelName<__hip_fp8_e4m3_fnuz>(                      \
-                    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)                         \
-  MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3>(                            \
-                   EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                               \
-  template __global__ void KernelName<float>(EpDispatchCombineArgs<float> args);
+template <typename T>
+__device__ void EpCombineSyncBarrier_body(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  uint64_t barrierFlag = 0;
+  if (laneId == 0) {
+    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
+  }
+  barrierFlag = __shfl(barrierFlag, 0);
+  uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
+  if (laneId < config.gpuPerNode) {
+    int destPe = myNode * config.gpuPerNode + laneId;
+    core::AtomicStoreRelaxedSystem(
+        args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>(destPe) + args.config.rank,
+        barrierFlag);
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe) != barrierFlag) {
+    }
+  }
+}
 
-// Macro to instantiate a kernel with EnableStdMoE parameter for all data types
-#define INSTANTIATE_LL_KERNEL(KernelName, StdMoE)                                 \
-  template __global__ void KernelName<hip_bfloat16, StdMoE>(                      \
-      EpDispatchCombineArgs<hip_bfloat16> args);                                  \
-  MORI_FP8_FNUZ(template __global__ void KernelName<__hip_fp8_e4m3_fnuz, StdMoE>( \
-                    EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz> args);)            \
-  MORI_FP8_OCP(template __global__ void KernelName<__hip_fp8_e4m3, StdMoE>(       \
-                   EpDispatchCombineArgs<__hip_fp8_e4m3> args);)                  \
-  template __global__ void KernelName<float, StdMoE>(EpDispatchCombineArgs<float> args);
-
-// Combined macro for kernels with EnableStdMoE template parameter
-#ifdef ENABLE_STANDARD_MOE_ADAPT
-#define INSTANTIATE_LL_KERNEL_WITH_STDMOE(KernelName) \
-  INSTANTIATE_LL_KERNEL(KernelName, false)            \
-  INSTANTIATE_LL_KERNEL(KernelName, true)
-#else
-#define INSTANTIATE_LL_KERNEL_WITH_STDMOE(KernelName) INSTANTIATE_LL_KERNEL(KernelName, false)
-#endif
-
-INSTANTIATE_KERNEL(EpDispatchInterNodeV1Kernel)
-INSTANTIATE_KERNEL(EpCombineInterNodeV1Kernel)
-INSTANTIATE_KERNEL(EpCombineAll)
-INSTANTIATE_KERNEL(EpDispatchCopyToStaging)
-INSTANTIATE_LL_KERNEL_WITH_STDMOE(EpDispatchInterNodeV1KernelLowLatency)
-INSTANTIATE_LL_KERNEL_WITH_STDMOE(EpCombineInterNodeV1KernelLowLatency)
-
-#undef MORI_FP8_FNUZ
-#undef MORI_FP8_OCP
-#undef INSTANTIATE_KERNEL
-#undef INSTANTIATE_LL_KERNEL
-#undef INSTANTIATE_LL_KERNEL_WITH_STDMOE
+template <typename T>
+__global__ void EpCombineSyncBarrier(EpDispatchCombineArgs<T> args) {
+  EpCombineSyncBarrier_body<T>(args);
+}
 
 }  // namespace moe
 }  // namespace mori

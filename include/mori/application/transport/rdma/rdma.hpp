@@ -33,6 +33,7 @@
 
 #include "infiniband/verbs.h"
 #include "mori/core/transport/rdma/rdma.hpp"
+#include "mori/hip_compat.hpp"
 // #include "mori/core/transport/rdma/primitives.hpp"
 
 namespace mori {
@@ -82,6 +83,8 @@ struct RdmaEndpointConfig {
   uint32_t portId{1};
   int32_t gidIdx{-1};  // -1 means auto detect
   uint32_t maxMsgsNum{128};
+  uint32_t maxRecvWr{0};  // 0 = use maxMsgsNum for RQ depth (allows SQ to be smaller when RQ must
+                          // be large, e.g. notification)
   uint32_t maxCqeNum{128};
   uint32_t maxMsgSge{1};
   uint32_t alignment{PAGESIZE};
@@ -175,7 +178,7 @@ struct RdmaEndpoint {
     } else if (vendorId == RdmaDeviceVendorId::Pensando) {
       return core::ProviderType::PSD;
     } else {
-      printf("unknown vendorId %d", vendorId);
+      printf("unknown vendorId %u", static_cast<uint32_t>(vendorId));
       assert(false);
     }
     return core::ProviderType::Unknown;
@@ -190,6 +193,12 @@ class RdmaDevice;
 
 std::optional<uint8_t> ReadRdmaServiceLevelEnv();
 std::optional<uint8_t> ReadRdmaTrafficClassEnv();
+std::optional<uint8_t> ReadIoServiceLevelEnv();
+std::optional<uint8_t> ReadIoTrafficClassEnv();
+bool ReadIoTrafficClassDisableEnv();
+
+bool ReadIbEnableRelaxedOrderingEnv();
+int MaybeAddRelaxedOrderingFlag(int accessFlag);
 
 /* -------------------------------------------------------------------------- */
 /*                              RdmaDeviceContext                             */

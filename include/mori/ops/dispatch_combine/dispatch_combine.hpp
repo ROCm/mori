@@ -22,22 +22,31 @@
 #pragma once
 
 #include <hip/hip_bfloat16.h>
-#include <hip/hip_fp8.h>
 #include <hip/library_types.h>
 
 #include <cstdint>
 #include <sstream>
-#include <variant>
 
 #include "mori/application/application.hpp"
 #include "mori/core/profiler/constants.hpp"
 #include "mori/core/profiler/kernel_profiler.hpp"
+#include "mori/hip_compat.hpp"
+
+// data_types.hpp and hip_fp8.h contain device builtins on ROCm <=6.x;
+// the template args / variant that need them are also hipcc-only.
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#include <hip/hip_fp8.h>
+
+#include <variant>
+
 #include "mori/utils/data_types.hpp"
+#endif
 
 namespace mori {
 namespace moe {
 
 enum KernelType { IntraNode = 0, InterNode = 1, InterNodeV1 = 2, InterNodeV1LL = 3, AsyncLL = 4 };
+enum class QuantType { None = 0, Fp8DirectCast = 1 };
 
 inline const char* HipDataTypeToString(hipDataType dtype) {
   switch (dtype) {
@@ -56,6 +65,7 @@ inline const char* HipDataTypeToString(hipDataType dtype) {
   }
 }
 
+#if defined(__HIPCC__) || defined(__CUDACC__)
 inline size_t GetHipDataTypeSize(hipDataType dtype) {
   switch (dtype) {
     case HIP_R_32F:
@@ -70,6 +80,7 @@ inline size_t GetHipDataTypeSize(hipDataType dtype) {
       throw std::runtime_error("Unknown hipDataType");
   }
 }
+#endif
 
 using index_t = int32_t;
 
@@ -93,6 +104,7 @@ struct EpDispatchCombineConfig {
   int gpuPerNode{8};
   int rdmaBlockNum{1};
   int numQpPerPe{1};
+  QuantType quantType{QuantType::None};
 
   inline __host__ __device__ int MaxNumTokensToSendPerRank() const { return maxNumInpTokenPerRank; }
 
@@ -154,39 +166,6 @@ class EpDispatchCombineHandle {
   }
 #endif
 
-  // When blockNum and warpPerBlock <= 0, kernel will use default values in config
-  void LaunchIntraNodeDispatch(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
-                               hipStream_t = 0);
-  void LaunchInterNodeDispatch(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
-                               hipStream_t = 0);
-  void LaunchIntraNodeCombine(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
-                              int useExternalInpBuf = -1, hipStream_t = 0);
-  void LaunchInterNodeCombine(int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
-                              int useExternalInpBuf = -1, hipStream_t = 0);
-
-  void LaunchDispatch(KernelType, int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
-                      hipStream_t = 0);
-  void LaunchCombine(KernelType, int blockNum = -1, int rdmaBlockNum = -1, int warpPerBlock = -1,
-                     int useExternalInpBuf = -1, hipStream_t = 0);
-
-#ifdef ENABLE_STANDARD_MOE_ADAPT
-  void LaunchDispatchForStandardMoE(KernelType, int blockNum = -1, int rdmaBlockNum = -1,
-                                    int warpPerBlock = -1, hipStream_t = 0);
-  void LaunchCombineForStandardMoE(KernelType, int blockNum = -1, int rdmaBlockNum = -1,
-                                   int warpPerBlock = -1, hipStream_t = 0);
-
-  void LaunchConvertDispatchOutputKernel(const void* dispatchOutX, const void* dispatchOutTopkIdx,
-                                         void* packedRecvX, int* packedRecvCount,
-                                         int* packedRecvSrcInfo, int64_t* packedRecvLayoutRange,
-                                         int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
-  void LaunchConvertCombineInputKernel(const void* packedRecvX, const void* packedRecvSrcInfo,
-                                       const void* packedRecvLayoutRange, void* combineInput,
-                                       mori::application::SymmMemObjPtr shmemCombineInpTokMemObj,
-                                       int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
-#endif
-
-  void LaunchDispatchRecv(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
-  void LaunchCombineRecv(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
   void LaunchReset(hipStream_t = 0);
 
   index_t GetCurRankNumToken() const { return curRankNumToken; }
@@ -205,9 +184,12 @@ class EpDispatchCombineHandle {
   void FinalizeBarrier();
 
  public:
-  // Number of tokens on this rank and size of scale data type, updated at each round of inference
+  // Updated at each round of inference
   index_t curRankNumToken{0};
+  int curHiddenDim{-1};
+
   index_t multiProcessorCount{0};
+  index_t maxThreads{0};
 
  public:
   // Config
@@ -309,6 +291,10 @@ class EpDispatchCombineHandle {
 #endif
 };
 
+// Template args struct and helpers require HIP types (hip_bfloat16, fp8, fp4).
+// Only available under hipcc; CXX code uses EpDispatchCombineArgsRaw instead.
+#if defined(__HIPCC__) || defined(__CUDACC__)
+
 template <typename T>
 struct EpDispatchCombineArgs {
   using data_type = T;
@@ -371,103 +357,108 @@ struct EpDispatchCombineArgs {
 #endif
 };
 
-using EpDispatchCombineArgsVariant =
-    std::variant<EpDispatchCombineArgs<float>, EpDispatchCombineArgs<hip_bfloat16>
-#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-                 ,
-                 EpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>
-#endif
-#ifdef MORI_FP8_TYPE_OCP_ENABLED
-                 ,
-                 EpDispatchCombineArgs<__hip_fp8_e4m3>
-#endif
-                 >;
+#endif  // __HIPCC__ || __CUDACC__  (template args)
 
-template <typename T>
-EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle& handle,
-                                                  int rdmaBlockNum) {
-  EpDispatchCombineArgs<T> args;
-  args.config = handle.config;
-  args.rdmaBlockNum = rdmaBlockNum;
-  args.curRankNumToken = handle.curRankNumToken;
-  args.tokenIndices = handle.tokenIndices;
-  args.inpTokenBuf = reinterpret_cast<T*>(handle.inpTokenBuf);
-  args.outTokenBuf = reinterpret_cast<T*>(handle.outTokenBuf);
-  args.weightsBuf = handle.weightsBuf;
-  args.scalesBuf = handle.scalesBuf;
-  args.destPeTokenCounter = handle.destPeTokenCounter;
-  args.localPeTokenCounter = handle.localPeTokenCounter;
-  args.shmemDispatchInpTokMemObj = handle.shmemDispatchInpTokMemObj;
-  args.shmemCombineInpTokMemObj = handle.shmemCombineInpTokMemObj;
-  args.shmemDispatchOutTokMemObj = handle.shmemDispatchOutTokMemObj;
-  args.shmemCombineOutTokMemObj = handle.shmemCombineOutTokMemObj;
-  args.shmemStagingTokMemObj = handle.shmemStagingTokMemObj;
-  args.shmemInpWeightsMemObj = handle.shmemInpWeightsMemObj;
-  args.shmemDispatchOutWeightsMemObj = handle.shmemDispatchOutWeightsMemObj;
-  args.shmemCombineOutWeightsMemObj = handle.shmemCombineOutWeightsMemObj;
-  args.shmemInpScalesMemObj = handle.shmemInpScalesMemObj;
-  args.shmemOutScalesMemObj = handle.shmemOutScalesMemObj;
-  args.shmemInpIndicesMemObj = handle.shmemInpIndicesMemObj;
-  args.shmemOutIndicesMemObj = handle.shmemOutIndicesMemObj;
-  args.recvTokenNumMemObj = handle.recvTokenNumMemObj;
-  args.sendTokenNumMemObj = handle.sendTokenNumMemObj;
-  args.sendAtomicSignalMemObj = handle.sendAtomicSignalMemObj;
-  args.dispatchGridBarrier = handle.dispatchGridBarrier;
-  args.combineGridBarrier = handle.combineGridBarrier;
-  args.dispReceiverIdxMap = handle.dispReceiverIdxMap;
-  args.dispSenderIdxMap = handle.dispSenderIdxMap;
-  args.destPeTokenIdxMap = handle.destPeTokenIdxMap;
-  args.srcPeTokenIdxMap = handle.srcPeTokenIdxMap;
-  args.dispTokOffsetMemObj = handle.dispTokOffsetMemObj;
-  args.dispTokIdToSrcTokIdMemObj = handle.dispTokIdToSrcTokIdMemObj;
-  args.dispDestTokIdMap = handle.dispDestTokIdMap;
-  args.totalRecvTokenNum = handle.totalRecvTokenNum;
-  args.crossDeviceBarrierMemObj = handle.crossDeviceBarrierMemObj;
-  args.crossDeviceBarrierFlag = handle.crossDeviceBarrierFlag;
-  args.interNodeChunkFlagMemObj = handle.interNodeChunkFlagMemObj;
-  args.destNodeTokenCounter = handle.destNodeTokenCounter;
-  args.nodeRecvTokenNumMemObj = handle.nodeRecvTokenNumMemObj;
-  args.blockFlagCounter = handle.blockFlagCounter;
-  args.interNodeBlocksBarrier = handle.interNodeBlocksBarrier;
-  args.interNodeDispDestTokIdMap = handle.interNodeDispDestTokIdMap;
-  args.interNodeChunkFlagCombine = handle.interNodeChunkFlagCombine;
-  args.interNodeDispSendMap = handle.interNodeDispSendMap;
+// Non-template args struct: identical binary layout to EpDispatchCombineArgs<T> (T* → void*).
+// Used by Python-side kernel launch where the type is erased.
+struct EpDispatchCombineArgsRaw {
+  EpDispatchCombineConfig config;
+  int rdmaBlockNum{-1};
+  index_t curRankNumToken{0};
+  index_t* tokenIndices{nullptr};
+  void* inpTokenBuf{nullptr};
+  void* outTokenBuf{nullptr};
+  float* weightsBuf{nullptr};
+  uint8_t* scalesBuf{nullptr};
+  mori::application::SymmMemObjPtr shmemDispatchInpTokMemObj;
+  mori::application::SymmMemObjPtr shmemCombineInpTokMemObj;
+  mori::application::SymmMemObjPtr shmemDispatchOutTokMemObj;
+  mori::application::SymmMemObjPtr shmemCombineOutTokMemObj;
+  mori::application::SymmMemObjPtr shmemStagingTokMemObj;
+  mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemDispatchOutWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemCombineOutWeightsMemObj;
+  mori::application::SymmMemObjPtr shmemInpScalesMemObj;
+  mori::application::SymmMemObjPtr shmemOutScalesMemObj;
+  mori::application::SymmMemObjPtr shmemInpIndicesMemObj;
+  mori::application::SymmMemObjPtr shmemOutIndicesMemObj;
+  mori::application::SymmMemObjPtr recvTokenNumMemObj;
+  mori::application::SymmMemObjPtr sendTokenNumMemObj;
+  mori::application::SymmMemObjPtr sendAtomicSignalMemObj;
+  uint32_t* dispatchGridBarrier{nullptr};
+  uint32_t* combineGridBarrier{nullptr};
+  index_t* destPeTokenCounter{nullptr};
+  index_t* localPeTokenCounter{nullptr};
+  index_t* dispReceiverIdxMap{nullptr};
+  index_t* dispSenderIdxMap{nullptr};
+  index_t* destPeTokenIdxMap{nullptr};
+  index_t* srcPeTokenIdxMap{nullptr};
+  mori::application::SymmMemObjPtr dispTokOffsetMemObj;
+  mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
+  index_t* dispDestTokIdMap{nullptr};
+  index_t* totalRecvTokenNum{nullptr};
+  mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
+  uint64_t* crossDeviceBarrierFlag{nullptr};
+  mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
+  index_t* destNodeTokenCounter{nullptr};
+  mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;
+  index_t* blockFlagCounter{nullptr};
+  uint32_t* interNodeBlocksBarrier{nullptr};
+  index_t* interNodeDispDestTokIdMap{nullptr};
+  index_t* interNodeChunkFlagCombine{nullptr};
+  index_t* interNodeDispSendMap{nullptr};
 #ifdef ENABLE_PROFILER
-  args.profilerConfig = handle.profilerConfig;
+  mori::core::profiler::ProfilerConfig profilerConfig;
 #endif
-#ifdef ENABLE_STANDARD_MOE_ADAPT
-  args.enableStandardMoeOutput = handle.enableStandardMoeOutput;
-  args.standardPackedRecvX = handle.standardPackedRecvX;
-  args.standardPackedRecvCount = handle.standardPackedRecvCount;
-  args.standardPackedRecvSrcInfo = handle.standardPackedRecvSrcInfo;
-  args.standardPackedRecvLayoutRange = handle.standardPackedRecvLayoutRange;
-  args.dispTokToEpSlotMap = handle.dispTokToEpSlotMap;
-#endif
-  return args;
-}
 
-inline EpDispatchCombineArgsVariant GetEpDispatchCombineArgsByInputType(
-    const EpDispatchCombineHandle& handle, int rdmaBlockNum) {
-  switch (handle.inputType) {
-    case HIP_R_32F:
-      return GetEpDispatchCombineArgs<float>(handle, rdmaBlockNum);
-    case HIP_R_16BF:
-      return GetEpDispatchCombineArgs<hip_bfloat16>(handle, rdmaBlockNum);
-#ifdef MORI_FP8_TYPE_OCP_ENABLED
-    case HIP_R_8F_E4M3:
-      return GetEpDispatchCombineArgs<__hip_fp8_e4m3>(handle, rdmaBlockNum);
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+  bool enableStandardMoeOutput{false};
+  void* standardPackedRecvX{nullptr};
+  int* standardPackedRecvCount{nullptr};
+  int* standardPackedRecvSrcInfo{nullptr};
+  int64_t* standardPackedRecvLayoutRange{nullptr};
+  uint64_t* dispTokToEpSlotMap{nullptr};
 #endif
-#ifdef MORI_FP8_TYPE_FNUZ_ENABLED
-    case HIP_R_8F_E4M3_FNUZ:
-      return GetEpDispatchCombineArgs<__hip_fp8_e4m3_fnuz>(handle, rdmaBlockNum);
+};
+
+#if defined(__HIPCC__) || defined(__CUDACC__)
+static_assert(sizeof(EpDispatchCombineArgsRaw) == sizeof(EpDispatchCombineArgs<hip_bfloat16>),
+              "EpDispatchCombineArgsRaw must have identical layout to EpDispatchCombineArgs<T>");
 #endif
-    default:
-      std::ostringstream oss;
-      oss << "Unsupported inputType " << HipDataTypeToString(handle.inputType)
-          << " in GetEpDispatchCombineArgsByInputType";
-      throw std::runtime_error(oss.str());
-  }
-}
+
+EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHandle& handle,
+                                                     int rdmaBlockNum);
+
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+struct ConvertDispatchOutputArgs {
+  EpDispatchCombineConfig config;
+  const void* dispatchOutX{nullptr};
+  const void* dispatchOutTopkIdx{nullptr};
+  const index_t* dispatchSrcTokenPos{nullptr};
+  const index_t* totalRecvTokenNum{nullptr};
+  uint32_t* dispatchGridBarrier{nullptr};
+  void* packedRecvX{nullptr};
+  int* packedRecvCount{nullptr};
+  int* packedRecvSrcInfo{nullptr};
+  int64_t* packedRecvLayoutRange{nullptr};
+  uint64_t* dispTokToEpSlotMap{nullptr};
+};
+
+struct ConvertCombineInputArgs {
+  EpDispatchCombineConfig config;
+  const void* packedRecvX{nullptr};
+  const void* topkIdx{nullptr};
+  const void* topkWeights{nullptr};
+  const void* packedRecvSrcInfo{nullptr};
+  const void* packedRecvLayoutRange{nullptr};
+  const index_t* totalRecvTokenNum{nullptr};
+  void* combineInput{nullptr};
+  uint64_t* dispTokToEpSlotMap{nullptr};
+  int* packedRecvCount{nullptr};
+  mori::application::SymmMemObjPtr shmemCombineInpTokMemObj;
+  mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
+};
+#endif
 
 }  // namespace moe
 }  // namespace mori

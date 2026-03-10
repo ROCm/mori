@@ -26,7 +26,9 @@
 #include <atomic>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "mori/application/transport/tcp/tcp.hpp"
@@ -106,7 +108,42 @@ class IOEngine {
   std::optional<IOEngineSession> CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
 
  private:
+  struct RouteCacheKey {
+    EngineKey remoteEngineKey;
+    MemoryLocationType localLoc;
+    MemoryLocationType remoteLoc;
+    int localDeviceId;
+    int remoteDeviceId;
+
+    bool operator==(const RouteCacheKey& rhs) const noexcept {
+      return remoteEngineKey == rhs.remoteEngineKey && localLoc == rhs.localLoc &&
+             remoteLoc == rhs.remoteLoc && localDeviceId == rhs.localDeviceId &&
+             remoteDeviceId == rhs.remoteDeviceId;
+    }
+  };
+
+  struct RouteCacheKeyHash {
+    std::size_t operator()(const RouteCacheKey& key) const noexcept {
+      std::size_t seed = 0;
+      auto hashCombine = [](std::size_t& s, std::size_t v) {
+        s ^= v + 0x9e3779b97f4a7c15ULL + (s << 6) + (s >> 2);
+      };
+      hashCombine(seed, std::hash<std::string>{}(key.remoteEngineKey));
+      hashCombine(seed, std::hash<int>{}(static_cast<int>(key.localLoc)));
+      hashCombine(seed, std::hash<int>{}(static_cast<int>(key.remoteLoc)));
+      hashCombine(seed, std::hash<int>{}(key.localDeviceId));
+      hashCombine(seed, std::hash<int>{}(key.remoteDeviceId));
+      return seed;
+    }
+  };
+
   Backend* SelectBackend(const MemoryDesc& local, const MemoryDesc& remote);
+  bool SupportsXgmiBackendByP2P() const;
+  void EnsureXgmiBackendCreatedIfSupported();
+  void InvalidateRouteCache();
+  void UpdateRouteCache(const RouteCacheKey& key, BackendType backendType);
+  std::optional<BackendType> QueryRouteCache(const RouteCacheKey& key) const;
+  std::string ResolveNodeId(const std::string& hostname) const;
 
  public:
   IOEngineConfig config;
@@ -117,6 +154,8 @@ class IOEngine {
   std::atomic<uint32_t> nextMemUid{0};
   std::unordered_map<MemoryUniqueId, MemoryDesc> memPool;
   std::unordered_map<BackendType, std::unique_ptr<Backend>> backends;
+  mutable std::shared_mutex routeCacheMu;
+  std::unordered_map<RouteCacheKey, BackendType, RouteCacheKeyHash> routeCache;
 };
 
 }  // namespace io

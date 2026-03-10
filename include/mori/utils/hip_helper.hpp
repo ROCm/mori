@@ -21,7 +21,7 @@
 // SOFTWARE.
 #pragma once
 
-#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 
 namespace mori {
 inline int GetMultiProcessorCount(int device) {
@@ -34,6 +34,18 @@ inline int GetCurDeviceMultiProcessorCount() {
   int device = 0;
   HIP_RUNTIME_CHECK(hipGetDevice(&device));
   return GetMultiProcessorCount(device);
+}
+
+inline int GetMaxThreads(int device) {
+  hipDeviceProp_t prop;
+  HIP_RUNTIME_CHECK(hipGetDeviceProperties(&prop, device));
+  return prop.maxThreadsPerMultiProcessor;
+}
+
+inline int GetCurDeviceMaxThreads() {
+  int device = 0;
+  HIP_RUNTIME_CHECK(hipGetDevice(&device));
+  return GetMaxThreads(device);
 }
 
 inline int GetDeviceWallClockFreqMhz(int device) {

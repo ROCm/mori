@@ -19,10 +19,13 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "src/pybind/mori.hpp"
+#pragma once
 
-PYBIND11_MODULE(libmori_pybinds, m) {
-  mori::RegisterMoriOps(m);
-  mori::RegisterMoriShmem(m);
-  mori::RegisterMoriIo(m);
+#include <hip/hip_runtime.h>
+
+namespace mori {
+
+template <typename SrcT, typename DstT>
+void LaunchCast(SrcT* src, DstT* dst, size_t nelems, hipStream_t stream);
+
 }

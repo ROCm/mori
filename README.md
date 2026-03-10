@@ -1,77 +1,43 @@
-# MORI
+<h1 align="center">MORI</h1>
+
+## News
+
+- **[2026/02]** 🔥 MORI powers AMD's WideEP and PD disaggregation in SemiAnalysis InferenceX v2 benchmark ([PR](https://github.com/SemiAnalysisAI/InferenceX/pull/348), [InferenceX](https://inferencex.semianalysis.com/), [blog](https://newsletter.semianalysis.com/p/inferencex-v2-nvidia-blackwell-vs)).
+- **[2026/01]** 🔥 MORI-EP and MORI-IO integrated into SGLang and vLLM for MoE Expert Parallelism and PD Disaggregation on AMD GPUs ([sglang & MORI-EP](https://github.com/sgl-project/sglang/pull/14797), [sglang & MORI-IO](https://github.com/sgl-project/sglang/pull/14626), [vllm & MORI-EP](https://github.com/vllm-project/vllm/pull/28664), [vllm & MORI-IO](https://github.com/vllm-project/vllm/pull/29304)).
+- **[2025/12]** MORI adds support for AMD's AINIC (Pollara) with SOTA performance ([AINIC & MORI-EP](https://github.com/ROCm/mori/pull/119), [AINIC & MORI-IO](https://github.com/ROCm/mori/pull/113)).
+- **[2025/09]** MORI-EP now seamlessly scales to 64 GPUs with SOTA performance ([multiple optimizations](https://github.com/ROCm/mori/pull/128), [multi-QP support](https://github.com/ROCm/mori/pull/108), [low-latency kernel](https://github.com/ROCm/mori/pull/105)).
+- **[2025/09]** MORI adds Broadcom BNXT (Thor2) IBGDA support ([PR](https://github.com/ROCm/mori/pull/64)).
+
+## Introduction
 
 <img src="docs/mori_arch_20250819_v0.png">
 
 **MORI** (**Mo**dular **R**DMA **I**nterface) is a **bottom-up, modular, and composable framework** for building high-performance communication applications with a strong focus on **RDMA + GPU integration**. Inspired by the role of MLIR in compiler infrastructure, MORI provides reusable and extensible building blocks that make it **easier for developers to adopt advanced techniques** such as IBGDA (Infiniband GPUDirect Async) and GDS (GPUDirect Storage).
 
-To help developers get started quickly, MORI also includes a suite of optimized libraries — **MORI-EP** (MoE dispatch & combine kernels), **MORI-IO** (P2P communication for KVCache transfer), and **MORI-CCL** (collective communication) — that deliver out-of-the-box performance.
+To help developers get started quickly, MORI also includes a suite of optimized libraries—**MORI-EP** (MoE dispatch & combine kernels), **MORI-IO** (p2p communication for KVCache transfer), and **MORI-CCL** (collective communication)—that deliver out-of-the-box performance, with support for AMD `Pensando DSC`, Broadcom `Thor2`, and NVIDIA Mellanox `ConnectX-7` NICs.
 
-## Features
-
-| Component | Description |
-|-----------|-------------|
-| **MORI-EP** | Intra and inter-node dispatch/combine kernels for MoE Expert Parallelism with SOTA performance |
-| **MORI-IO** | Point-to-point communication library with ultra-low overhead for KVCache transfer |
-| **MORI-CCL** | Lightweight collective communication library for latency-sensitive or resource-constrained environments (coming soon) |
-| **MORI Shmem** | OpenSHMEM-style symmetric memory APIs for GPU memory management and RDMA |
-| **MORI-VIZ** | Warp-level kernel profiler with Perfetto integration |
-
-**Framework building blocks:**
-- High-performance building blocks for IBGDA / P2P and more
-- Modular & composable components for transport management, topology detection, etc.
-- C++ and Python level APIs
-
-**Supported NICs:** AMD Pensando DSC, Broadcom Thor2, NVIDIA Mellanox ConnectX-7
-
-## Quick Start
-
-```python
-import os, torch, torch.distributed as dist
-import mori
-
-os.environ["MORI_SHMEM_HEAP_SIZE"] = "6G"
-
-# Initialize distributed + shmem
-dist.init_process_group(backend="cpu:gloo,cuda:nccl", rank=rank, world_size=world_size)
-world_group = dist.group.WORLD
-torch._C._distributed_c10d._register_process_group("default", world_group)
-mori.shmem.shmem_torch_process_group_init("default")
-
-# Configure MORI-EP (DeepSeek V3: 256 experts, top-8, 8 GPUs)
-config = mori.ops.EpDispatchCombineConfig(
-    data_type=torch.bfloat16, rank=rank, world_size=8,
-    hidden_dim=7168, scale_dim=0,
-    scale_type_size=torch.tensor([], dtype=torch.float8_e4m3fnuz).element_size(),
-    max_token_type_size=torch.tensor([], dtype=torch.float32).element_size(),
-    max_num_inp_token_per_rank=4096,
-    num_experts_per_rank=32, num_experts_per_token=8,
-)
-
-# Dispatch tokens to experts → run expert computation → combine results back
-op = mori.ops.EpDispatchCombineOp(config)
-dispatch_out, dispatch_w, dispatch_s, dispatch_idx, recv_count = \
-    op.dispatch(input_tokens, weights, scales, expert_indices)
-# ... expert computation on dispatch_out ...
-combine_out, combine_w = op.combine(expert_output, dispatch_w, expert_indices, call_reset=True)
-```
-
-See the [MORI-EP Guide](docs/MORI-EP-GUIDE.md) for the full API reference and more examples.
+## Features summary
+- Applications
+    - MORI-EP: intra and inter-node dispatch/combine kernels with SOTA performance.
+    - MORI-IO: point-to-point communication library with ultra-low overhead
+    - MORI-CCL: lightweight and flexible collective communication library designed for highly customized use cases such as latency-sensitive or resource-constrained environment
+- Framework
+    - High-performance building blocks for IBGDA / P2P and more​
+    - Modular & composable components for developing communication applications, such as transport management, topology detection and etc.
+    - Open-Shmem-style APIs
+    - C++ and Python level APIs
 
 ## Documentation
 
 | **Topic** | **Description** | **Guide** |
 |---|---|---|
 | MORI-EP | Dispatch/combine API, kernel types, configuration, usage examples | [EP Guide](docs/MORI-EP-GUIDE.md) |
-| MORI-EP Benchmark | Intra/inter-node benchmark commands and NIC selection | [EP Benchmark](docs/MORI-EP-BENCHMARK.md) |
-| MORI Shmem | Symmetric memory APIs, initialization, memory management | [Shmem Guide](docs/MORI-SHMEM-GUIDE.md) |
+| MORI-SHMEM | Symmetric memory APIs, initialization, memory management | [Shmem Guide](docs/MORI-SHMEM-GUIDE.md) |
 | MORI-IR | Device bitcode integration for Triton and other GPU kernel frameworks | [IR Guide](docs/MORI-IR-GUIDE.md) |
 | MORI-IO | P2P communication concepts, engine/backend/session design | [IO Guide](docs/MORI-IO-GUIDE.md) |
-| MORI-IO Benchmark | IO benchmark commands and performance results | [IO Benchmark](docs/MORI-IO-BENCHMARK.md) |
 | MORI-VIZ | Warp-level kernel profiler with Perfetto integration | [Profiler](docs/PROFILER.md) |
 
 ## Benchmarks
-
-**Hardware:** 8 x MI300X per node, 8 single-port CX7 400Gb/s RDMA NICs | **Software:** ROCm 6.4.0
 
 ### MORI-EP
 
@@ -79,25 +45,83 @@ Benchmark on DeepSeek V3 model configurations:
 
 **Bandwidth** (4096 tokens, 7168 hidden, top-8 experts, FP8 dispatch + BF16 combine)
 
-| **Kernels**| **# CUs**| **Dispatch XGMI** |**Dispatch RDMA** |**Combine XGMI**|**Combine RDMA** |
-|------------|----------|-------------------|------------------|----------------|-----------------|
-|EP8         | 80       | 307 GB/s          | x                | 330 GB/s       | x               |
-|EP16-V0     | 32       | 75 GB/s           | 23 GB/s          | 76 GB/s        | 23 GB/s          |
-|EP16-V0     | 80       | 79 GB/s           | 24 GB/s          | 82 GB/s        | 25 GB/s          |
-|EP16-V1     | 32       | 185 GB/s          | 57 GB/s          | 172 GB/s       | 52 GB/s          |
-|EP16-V1     | 80       | 208 GB/s          | 63 GB/s          | 161 GB/s       | 49 GB/s          |
-|EP32-V1-LL  | 32       | 103 GB/s          | 57 GB/s          | 91 GB/s        | 50 GB/s          |
+<table>
+  <tr>
+    <th>Hardware</th>
+    <th>Kernels</th>
+    <th>Dispatch XGMI</th>
+    <th>Dispatch RDMA</th>
+    <th>Combine XGMI</th>
+    <th>Combine RDMA</th>
+  </tr>
+  <tr>
+    <td rowspan="3">MI300X + CX7</td>
+    <td>EP8</td>
+    <td>307 GB/s</td><td>x</td><td>330 GB/s</td><td>x</td>
+  </tr>
+  <tr>
+    <td>EP16-V1</td>
+    <td>171 GB/s</td><td>52 GB/s</td><td>219 GB/s</td><td>67 GB/s</td>
+  </tr>
+  <tr>
+    <td>EP32-V1</td>
+    <td>103 GB/s*</td><td>57 GB/s*</td><td>91 GB/s*</td><td>50 GB/s*</td>
+  </tr>
+  <tr>
+    <td rowspan="3">MI355X + AINIC</td>
+    <td>EP8</td>
+    <td>345 GB/s</td><td>x</td><td>420 GB/s</td><td>x</td>
+  </tr>
+  <tr>
+    <td>EP16-V1</td>
+    <td>179 GB/s</td><td>54 GB/s</td><td>234 GB/s</td><td>71 GB/s</td>
+  </tr>
+  <tr>
+    <td>EP32-V1</td>
+    <td>85 GB/s</td><td>46 GB/s</td><td>110 GB/s</td><td>61 GB/s</td>
+  </tr>
+</table>
 
 **Latency** (128 tokens, 7168 hidden, top-8 experts, FP8 dispatch + BF16 combine)
 
-| **Kernels**| **# CUs**| **Dispatch Latency** |**Dispatch BW** |**Combine Latency**|**Combine BW** |
-|------------|----------|----------------------|----------------|-------------------|---------------|
-|EP8         | 64       | 35 us                | 134 GB/s       | 47 us             | 204 GB/s      |
-|EP16-V0     | 32       | 226 us               | 33 GB/s        | 296 us            | 49 GB/s       |
-|EP16-V1     | 32       | 115 us               | 63 GB/s        | 141 us            | 110 GB/s      |
-|EP32-V1-LL  | 32       | 157 us               | 48 GB/s        | 280 us            | 55 GB/s       |
+<table>
+  <tr>
+    <th>Hardware</th>
+    <th>Kernels</th>
+    <th>Dispatch Latency</th>
+    <th>Dispatch BW</th>
+    <th>Combine Latency</th>
+    <th>Combine BW</th>
+  </tr>
+  <tr>
+    <td rowspan="3">MI300X + CX7</td>
+    <td>EP8</td>
+    <td>35 us</td><td>134 GB/s</td><td>47 us</td><td>204 GB/s</td>
+  </tr>
+  <tr>
+    <td>EP16-V1-LL</td>
+    <td>76 us</td><td>96 GB/s</td><td>122 us</td><td>121 GB/s</td>
+  </tr>
+  <tr>
+    <td>EP32-V1-LL</td>
+    <td>157 us*</td><td>48 GB/s*</td><td>280 us*</td><td>55 GB/s*</td>
+  </tr>
+  <tr>
+    <td rowspan="3">MI355X + AINIC</td>
+    <td>EP8</td>
+    <td>31 us</td><td>142 GB/s</td><td>36 us</td><td>276 GB/s</td>
+  </tr>
+  <tr>
+    <td>EP16-V1-LL</td>
+    <td>84 us</td><td>87 GB/s</td><td>108 us</td><td>139 GB/s</td>
+  </tr>
+  <tr>
+    <td>EP32-V1-LL</td>
+    <td>152 us</td><td>45 GB/s</td><td>187 us</td><td>76 GB/s</td>
+  </tr>
+</table>
 
-**NOTE:** Best performance values from multiple test rounds to eliminate fluctuations.
+\* Stale data from previous kernel version; updated numbers pending re-benchmarking.
 
 ### MORI-IO
 
@@ -132,16 +156,28 @@ GPU Direct RDMA READ, pairwise, 128 consecutive transfers, 1 GPU, MI300X + Thor2
 +-------------+-----------+----------------+---------------+---------------+--------------+--------------+
 ```
 
-## Framework Integration
+## Hardware Support Matrix
 
-MORI-EP is integrated in several LLM inference and training frameworks:
+**GPU**
 
-| Framework | Usage |
-|-----------|-------|
-| [vLLM](https://github.com/vllm-project/vllm) | MoE expert parallelism dispatch/combine |
-| [SGLang](https://github.com/sgl-project/sglang) | MoE expert parallelism dispatch/combine |
-| [AITER](https://github.com/ROCm/aiter) | MoriAll2AllManager wrapping dispatch/combine for FusedMoE |
-| [ATOM](https://github.com/ROCm/ATOM) | Expert parallelism in FusedMoE layer |
+| | **MORI-EP** | **MORI-IO** | **MORI-SHMEM** |
+|---|:---:|:---:|:---:|
+| MI308X | ✅ | ✅ | ✅ |
+| MI300X | ✅ | ✅ | ✅ |
+| MI325X | ✅ | ✅ | ✅ |
+| MI355X | ✅ | ✅ | ✅ |
+| MI450X | 🚧 | 🚧 | 🚧 |
+
+**NIC**
+
+| | **MORI-EP** | **MORI-IO** | **MORI-SHMEM** |
+|---|:---:|:---:|:---:|
+| Pollara | ✅ | ✅ | ✅ |
+| CX7 | ✅ | ✅ | ✅ |
+| Thor2 | ✅ | ✅ | ✅ |
+| Volcano | 🚧 | 🚧 | 🚧 |
+
+✅ Supported &emsp; 🚧 Under Development
 
 ## Installation
 
@@ -154,6 +190,18 @@ Or build docker image with:
 ```bash
 cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
 ```
+
+**IBGDA NIC support** (optional, for GPU-direct RDMA — auto-detected, no manual configuration needed):
+
+| NIC | User library | Headers |
+|-----|-------------|---------|
+| AMD Pollara (AINIC) | `libionic.so` | — |
+| Mellanox ConnectX | `libmlx5.so` (typically pre-installed) | — |
+| Broadcom Thor2 | `libbnxt_re.so` | `bnxt_re_dv.h`, `bnxt_re_hsi.h` |
+
+> **Note**: IBGDA requires vendor-specific DV (Direct Verbs) libraries. Mellanox `libmlx5` is
+> typically pre-installed with the kernel OFED stack. For Thor2 and Pollara, install the
+> corresponding userspace library and headers from your NIC vendor.
 
 ### Install
 
@@ -180,20 +228,20 @@ python -c "import mori; print('OK')"
 
 ## Testing
 
-### MORI-EP (dispatch / combine)
+### Test MORI-EP (dispatch / combine)
 
 ```bash
 cd /path/to/mori
 export PYTHONPATH=/path/to/mori:$PYTHONPATH
 
-# Correctness tests
-pytest tests/python/ops/
+# Test correctness (8 GPUs)
+pytest tests/python/ops/test_dispatch_combine.py -q
 
 # Benchmark performance
-python3 tests/python/ops/bench_dispatch_combine.py
+python tests/python/ops/bench_dispatch_combine.py
 ```
 
-### MORI-IO
+### Test MORI-IO
 
 ```bash
 cd /path/to/mori
@@ -202,13 +250,20 @@ export PYTHONPATH=/path/to/mori:$PYTHONPATH
 # Correctness tests
 pytest tests/python/io/
 
-# Benchmark (run on each of two nodes)
+# Benchmark performance (two nodes)
 export GLOO_SOCKET_IFNAME=ens14np0
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-    --master_addr="10.194.129.65" --master_port=1234 \
-    tests/python/io/benchmark.py --host="10.194.129.65" \
-    --enable-batch-transfer --enable-sess \
-    --buffer-size 32768 --transfer-batch-size 128
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.194.129.65" --master_port=1234 \
+  tests/python/io/benchmark.py --host="10.194.129.65" --enable-batch-transfer --enable-sess --buffer-size 32768 --transfer-batch-size 128
+```
+
+### Test MORI-IR (Triton + shmem integration, [guide](python/mori/ir/README.md))
+
+```bash
+# Basic shmem put (2 GPUs)
+torchrun --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
+
+# Allreduce (8 GPUs)
+torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
 ```
 
 ## Contribution Guide

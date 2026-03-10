@@ -105,6 +105,9 @@ class MoriIoStress:
         stats_interval_sec: float,
         output_dir: str | None,
         log_every_n_iters: int,
+        max_send_wr: int = 0,
+        max_cqe_num: int = 0,
+        max_msg_sge: int = 0,
     ):
         # Roles and ranks
         self.host = host
@@ -131,6 +134,9 @@ class MoriIoStress:
         # RDMA config
         self.num_qp_per_transfer = num_qp_per_transfer
         self.num_worker_threads = num_worker_threads
+        self.max_send_wr = max_send_wr
+        self.max_cqe_num = max_cqe_num
+        self.max_msg_sge = max_msg_sge
 
         # Run control
         self.iters = iters
@@ -313,6 +319,10 @@ class MoriIoStress:
         print(f"  max_transfer_batch_size: {self.max_transfer_batch_size}")
         print(f"  num_qp_per_transfer: {self.num_qp_per_transfer}")
         print(f"  num_worker_threads: {self.num_worker_threads}")
+        if self.max_send_wr or self.max_cqe_num or self.max_msg_sge:
+            print(
+                f"  max_send_wr: {self.max_send_wr}, max_cqe_num: {self.max_cqe_num}, max_msg_sge: {self.max_msg_sge}"
+            )
         print(
             f"  iters: {self.iters}, duration_sec: {self.duration_sec}, warmup_iters: {self.warmup_iters}"
         )
@@ -333,6 +343,12 @@ class MoriIoStress:
             post_batch_size=-1,
             num_worker_threads=self.num_worker_threads,
         )
+        if self.max_send_wr > 0:
+            rdma_cfg.max_send_wr = self.max_send_wr
+        if self.max_cqe_num > 0:
+            rdma_cfg.max_cqe_num = self.max_cqe_num
+        if self.max_msg_sge > 0:
+            rdma_cfg.max_msg_sge = self.max_msg_sge
         self.engine.create_backend(BackendType.RDMA, rdma_cfg)
 
         # Exchange engine descriptors
@@ -635,6 +651,24 @@ def parse_args():
     p.add_argument("--num-qp-per-transfer", type=int, default=1)
     p.add_argument("--num-worker-threads", type=int, default=1)
     p.add_argument(
+        "--max-send-wr",
+        type=int,
+        default=0,
+        help="RDMA max send WRs per QP; 0 = use backend default (default: 0)",
+    )
+    p.add_argument(
+        "--max-cqe-num",
+        type=int,
+        default=0,
+        help="RDMA max CQEs per CQ; 0 = use backend default (default: 0)",
+    )
+    p.add_argument(
+        "--max-msg-sge",
+        type=int,
+        default=0,
+        help="RDMA max SGEs per send WR; 0 = use backend default (default: 0)",
+    )
+    p.add_argument(
         "--iters", type=int, default=0, help="Number of iterations to run; 0 to ignore"
     )
     p.add_argument(
@@ -723,6 +757,9 @@ def launch_stress(local_rank: int, node_rank: int, args):
         num_target_dev=args.num_target_dev,
         num_qp_per_transfer=args.num_qp_per_transfer,
         num_worker_threads=args.num_worker_threads,
+        max_send_wr=args.max_send_wr,
+        max_cqe_num=args.max_cqe_num,
+        max_msg_sge=args.max_msg_sge,
         iters=args.iters,
         duration_sec=args.duration_sec,
         warmup_iters=args.warmup_iters,

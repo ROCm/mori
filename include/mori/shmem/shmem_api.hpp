@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "hip/hip_runtime_api.h"
 #include "mori/application/application.hpp"
 
 namespace mori {
@@ -64,11 +65,20 @@ int ShmemInitAttr(unsigned int flags, mori_shmem_init_attr_t* attr);
 int ShmemFinalize();
 
 int ShmemModuleInit(void* hipModule);
+int LoadShmemModule(const char* hsaco_path);
+int CopyGpuStatesToSymbol(void* deviceSymbolAddr);
+
+using GpuStatesAddrProvider = void* (*)();
+void RegisterGpuStatesAddrProvider(GpuStatesAddrProvider provider);
+
+using BarrierLauncher = void (*)(hipStream_t);
+void RegisterBarrierLauncher(BarrierLauncher launcher);
 
 int ShmemMyPe();
 int ShmemNPes();
 
 void ShmemBarrierAll();
+void ShmemBarrierOnStream(hipStream_t stream);
 
 enum ShmemTeamType {
   INVALID = -1,

@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include "mori/hip_compat.hpp"
 #include "primitives.hpp"
 
 namespace mori {
