@@ -39,12 +39,20 @@ def shmem_put_kernel(symm_buf_ptr, value):
 
 
 @triton.jit
-def shmem_get_kernel(local_buf_ptr, remote_buf_ptr, nbytes):
+def shmem_get_nbi_kernel(local_buf_ptr, remote_buf_ptr, nbytes):
     mype = mori_shmem_device.my_pe()
     npes = mori_shmem_device.n_pes()
     src_pe = (mype + 1) % npes
     mori_shmem_device.getmem_nbi_thread(local_buf_ptr, remote_buf_ptr, nbytes, src_pe, 0)
     mori_shmem_device.quiet_thread()
+
+
+@triton.jit
+def shmem_get_blocking_kernel(local_buf_ptr, remote_buf_ptr, nbytes):
+    mype = mori_shmem_device.my_pe()
+    npes = mori_shmem_device.n_pes()
+    src_pe = (mype + 1) % npes
+    mori_shmem_device.getmem_thread(local_buf_ptr, remote_buf_ptr, nbytes, src_pe, 0)
 
 
 # ===================================================================
@@ -108,31 +116,54 @@ def test_put(mype, npes, extern_libs):
     print(f"[PE {mype}] [Triton] put    PASS")
 
 
-def test_get(mype, npes, extern_libs):
+def test_get_nbi(mype, npes, extern_libs):
     import mori.shmem as ms
     from mori.shmem import mori_shmem_create_tensor
 
-    print(f"\n[PE {mype}] === Triton: shmem_get_kernel ===")
-    # remote_buf: each PE fills with its own rank * 100 + 42
+    print(f"\n[PE {mype}] === Triton: shmem_get_nbi_kernel ===")
     remote_buf = mori_shmem_create_tensor((1,), torch.int32)
     remote_buf.fill_(mype * 100 + 42)
-    # local_buf: destination for GET, fill with sentinel
     local_buf = mori_shmem_create_tensor((1,), torch.int32)
     local_buf.fill_(-1)
     torch.cuda.synchronize()
     ms.shmem_barrier_all()
 
-    nbytes = 4  # sizeof(int32)
-    shmem_get_kernel[(1,)](local_buf, remote_buf, nbytes, extern_libs=extern_libs)
+    nbytes = 4
+    shmem_get_nbi_kernel[(1,)](local_buf, remote_buf, nbytes, extern_libs=extern_libs)
     torch.cuda.synchronize()
     ms.shmem_barrier_all()
 
     src_pe = (mype + 1) % npes
     exp = src_pe * 100 + 42
     got = local_buf.item()
-    print(f"[PE {mype}] local_buf={got}, expected={exp} (GET from PE {src_pe})")
+    print(f"[PE {mype}] local_buf={got}, expected={exp} (GET nbi from PE {src_pe})")
     assert got == exp, f"PE {mype}: expected {exp}, got {got}"
-    print(f"[PE {mype}] [Triton] get    PASS")
+    print(f"[PE {mype}] [Triton] get_nbi      PASS")
+
+
+def test_get_blocking(mype, npes, extern_libs):
+    import mori.shmem as ms
+    from mori.shmem import mori_shmem_create_tensor
+
+    print(f"\n[PE {mype}] === Triton: shmem_get_blocking_kernel ===")
+    remote_buf = mori_shmem_create_tensor((1,), torch.int32)
+    remote_buf.fill_(mype * 200 + 99)
+    local_buf = mori_shmem_create_tensor((1,), torch.int32)
+    local_buf.fill_(-1)
+    torch.cuda.synchronize()
+    ms.shmem_barrier_all()
+
+    nbytes = 4
+    shmem_get_blocking_kernel[(1,)](local_buf, remote_buf, nbytes, extern_libs=extern_libs)
+    torch.cuda.synchronize()
+    ms.shmem_barrier_all()
+
+    src_pe = (mype + 1) % npes
+    exp = src_pe * 200 + 99
+    got = local_buf.item()
+    print(f"[PE {mype}] local_buf={got}, expected={exp} (GET blocking from PE {src_pe})")
+    assert got == exp, f"PE {mype}: expected {exp}, got {got}"
+    print(f"[PE {mype}] [Triton] get_blocking  PASS")
 
 
 # ===================================================================
@@ -146,7 +177,8 @@ def main():
     try:
         test_basic(mype, npes, extern_libs)
         test_put(mype, npes, extern_libs)
-        test_get(mype, npes, extern_libs)
+        test_get_nbi(mype, npes, extern_libs)
+        test_get_blocking(mype, npes, extern_libs)
         if mype == 0:
             print(f"\n{'=' * 60}")
             print(f"  All tests PASSED on {npes} PEs (Triton + mori shmem)")
