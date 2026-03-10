@@ -1,0 +1,963 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MORI JIT Compilation Framework &mdash; MORI 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=01f34227"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#from-source">From Source</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#verification">Verification</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ep-dispatch-and-combine">MORI-EP: Dispatch and Combine</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-io-point-to-point-transfers">MORI-IO: Point-to-Point Transfers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-shmem-symmetric-memory">MORI Shmem: Symmetric Memory</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ir-device-bitcode-for-gpu-kernels">MORI-IR: Device Bitcode for GPU Kernels</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#profiling-with-mori-viz">Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">MORI-EP User Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#kernel-types">1. Kernel Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#configuration">2. Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineconfig">EpDispatchCombineConfig</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#operator-api">3. Operator API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineop">EpDispatchCombineOp</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch">dispatch()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine">combine()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#split-dispatch-combine-send-recv">Split dispatch/combine (send + recv)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reset">reset()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-dispatch-src-token-pos">get_dispatch_src_token_pos()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-registered-combine-input-buffer">get_registered_combine_input_buffer()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#standard-moe-compatibility-deepep">4. Standard MoE Compatibility (DeepEP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch-standard-moe">dispatch_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine-standard-moe">combine_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-dispatch-output">convert_dispatch_output()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-combine-input">convert_combine_input()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#initialization">5. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#launch-configuration">6. Launch Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#manual-mode-default">Manual Mode (Default)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#auto-mode">Auto Mode</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#complete-example">7. Complete Example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#environment-variables">8. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#benchmarking">9. Benchmarking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node">Intra-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node">Inter-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reference-performance-deepseek-v3-config">Reference Performance (DeepSeek V3 config)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#profiling-with-mori-viz">10. Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#framework-integration">11. Framework Integration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#build-options">Build Options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">MORI Shmem Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-memory">Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#processing-element-pe">Processing Element (PE)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-heap">Symmetric Heap</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization">2. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-3-mpi-communicator-c-mpi-environments">Method 3: MPI Communicator (C++ / MPI environments)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-comparison">Initialization Comparison</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#finalization">Finalization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#query-apis">3. Query APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#memory-management">4. Memory Management</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#allocating-symmetric-memory">Allocating Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#freeing-symmetric-memory">Freeing Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#registering-existing-buffers">Registering Existing Buffers</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#p2p-address-translation">5. P2P Address Translation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#synchronization">6. Synchronization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#hip-module-init-triton-integration">7. HIP Module Init (Triton Integration)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-flags">8. Initialization Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IR-GUIDE.html">MORI-IR Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#host-side-python-api">1. Host-Side Python API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-framework-agnostic"><code class="docutils literal notranslate"><span class="pre">mori.ir</span></code> (framework-agnostic)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-triton-triton-specific-reference-backend"><code class="docutils literal notranslate"><span class="pre">mori.ir.triton</span></code> (Triton-specific reference backend)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-bitcode">2. Device Bitcode</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-functions">3. Device Functions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#query">Query</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#point-to-point">Point-to-Point</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-thread-warp-block">PutNbi (Thread / Warp / Block)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-with-signal">PutNbi with Signal</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#immediate-put">Immediate Put</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#atomics">Atomics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#wait">Wait</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#synchronization">Synchronization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-triton">4. Integration Example: Triton</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-raw-bitcode-no-framework">5. Integration Example: Raw Bitcode (no framework)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#bitcode-jit-compilation">6. Bitcode JIT Compilation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#testing">8. Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#known-limitations">Known Limitations</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">MORI-IO Introduction</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#design-concepts">Design &amp; Concepts</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#workflow">Workflow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#python-api-quick-reference">Python API Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#example-basic-read-write">Example: Basic Read/Write</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#environment-configuration">Environment &amp; Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ (Visualizer)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#instrumentation">Instrumentation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#include-headers">1. Include Headers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#define-profiler-context">2. Define Profiler Context</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#add-trace-points">3. Add Trace Points</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#build-code-generation">Build &amp; Code Generation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#enabling-the-profiler">Enabling the Profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#code-generation">Code Generation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#python-analysis">Python Analysis</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#device-side-elapsed-time-measurement">Device-side Elapsed Time Measurement</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#viewing-the-trace">Viewing the Trace</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#best-practices">Best Practices</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">MORI-EP Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#intra-node">Intra-node</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#inter-node">Inter-node</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nic-selection">NIC Selection</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">MORI-IO Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-commands">Benchmark Commands</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-arguments">Benchmark Arguments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-read">Results: Thor2 RDMA Read</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-write">Results: Thor2 RDMA Write</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#message-size-sweep">Message Size Sweep</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#batch-size-sweep">Batch Size Sweep</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-cx7-rdma-batch-size-1">Results: CX7 RDMA (Batch Size = 1)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#write">Write</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#read">Read</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ep-expert-parallelism">MORI-EP (Expert Parallelism)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-shmem-symmetric-memory">MORI Shmem (Symmetric Memory)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-io-point-to-point-i-o">MORI-IO (Point-to-Point I/O)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ir-device-bitcode-integration">MORI-IR (Device Bitcode Integration)</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">MORI-VIZ Kernel Profiler</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#usage">Usage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#export-to-perfetto">export_to_perfetto</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#c-profiler-apis">C++ Profiler APIs</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">MORI JIT Compilation Framework</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/MORI_JIT_ARCHITECTURE.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="mori-jit-compilation-framework">
+<h1>MORI JIT Compilation Framework<a class="headerlink" href="#mori-jit-compilation-framework" title="Link to this heading"></a></h1>
+<p>MORI uses a <strong>host pre-compiled + device JIT</strong> architecture. Host C++ code
+(bootstrap, RDMA transport, pybind11) is compiled once during <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span></code>
+using a standard C++ compiler — <strong>hipcc is not required at install time</strong>.
+All GPU kernels — ops dispatch/combine and shmem device bitcode — are
+JIT-compiled on first use, targeting the exact GPU architecture and NIC type
+of the runtime machine. Compiled artifacts are cached to <code class="docutils literal notranslate"><span class="pre">~/.mori/jit/</span></code>.</p>
+<section id="quick-start">
+<h2>Quick Start<a class="headerlink" href="#quick-start" title="Link to this heading"></a></h2>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># 1. Install (compiles host code only, ~18s, no hipcc needed)</span>
+pip<span class="w"> </span>install<span class="w"> </span>.
+
+<span class="c1"># 2. (Optional) Pre-compile all device kernels (~22s parallel, needs hipcc)</span>
+<span class="nv">MORI_PRECOMPILE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import mori&quot;</span>
+
+<span class="c1"># 3. Run — kernels are JIT-compiled on first use if not pre-compiled</span>
+torchrun<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span>my_app.py
+</pre></div>
+</div>
+<p>Both <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">.</span></code> (wheel) and <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">-e</span> <span class="pre">.</span></code> (editable/development)
+are supported. The wheel bundles all <code class="docutils literal notranslate"><span class="pre">.hip</span></code> sources and C++ headers needed
+for runtime JIT compilation.</p>
+</section>
+<section id="architecture-overview">
+<h2>Architecture Overview<a class="headerlink" href="#architecture-overview" title="Link to this heading"></a></h2>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>pip install .  (~18s, CXX compiler only)
+  ├── CMake + clang++ → host .so (no device code in ops)
+  │   ├── mori_ops        → CXX  (args construction, handle lifecycle)
+  │   ├── mori_shmem      → CXX  (host-only: init, runtime, memory)
+  │   └── mori_pybinds    → CXX  (pybind11 bindings)
+  └── Copy JIT sources → mori/_jit_sources/ (packaged in wheel)
+
+First run (JIT, one-time, needs hipcc at runtime)
+  ├── detect GPU arch (rocm_agent_enumerator → gfx942)
+  ├── detect NIC type (/sys/class/infiniband/ → bnxt/mlx5/ionic)
+  ├── hipcc --genco → dispatch/combine kernels (.hsaco)
+  └── hipcc --cuda-device-only → shmem bitcode (.bc)
+
+Kernel launch (Python-driven)
+  ├── Python: select kernel name, compute grid/block/sharedMem
+  ├── C++ pybind: build typed args struct from handle state
+  └── Python ctypes: hipModuleLaunchKernel(func, grid, block, args_ptr)
+</pre></div>
+</div>
+</section>
+<section id="packaging-how-wheel-installs-support-jit">
+<h2>Packaging: How Wheel Installs Support JIT<a class="headerlink" href="#packaging-how-wheel-installs-support-jit" title="Link to this heading"></a></h2>
+<p>During <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">.</span></code>, the build copies JIT-required source files into
+<code class="docutils literal notranslate"><span class="pre">mori/_jit_sources/</span></code> inside the Python package:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>site-packages/mori/
+├── _jit_sources/                      # Bundled for runtime JIT
+│   ├── include/mori/**/*.hpp          # All C++ headers
+│   ├── src/ops/kernels/*.hip          # Kernel source files
+│   ├── src/ops/dispatch_combine/      # Kernel implementation headers
+│   ├── src/shmem/                     # shmem_device_api_wrapper.cpp only
+│   └── 3rdparty/{spdlog,msgpack-c}/include/  # Third-party headers
+├── jit/                               # JIT compiler Python code
+│   ├── core.py                        # compile_genco(), ensure_bitcode()
+│   ├── config.py                      # get_mori_source_root(), detect_build_config()
+│   ├── hip_driver.py                  # HipModule / HipFunction (ctypes)
+│   └── cache.py                       # Cache directory management
+├── ops/dispatch_combine.py            # Python-side kernel launch orchestration
+├── ir/bitcode.py                      # Triton bitcode locator
+├── libmori_pybinds.so                 # Host pybind11 module
+├── libmori_application.so             # Bootstrap + RDMA transport
+└── libmori_io.so                      # I/O module
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">get_mori_source_root()</span></code> locates the JIT source tree:</p>
+<ol class="arabic simple">
+<li><p><strong>Editable install</strong>: repo root (3 levels up from <code class="docutils literal notranslate"><span class="pre">mori/jit/config.py</span></code>)</p></li>
+<li><p><strong>Wheel install</strong>: <code class="docutils literal notranslate"><span class="pre">mori/_jit_sources/</span></code> inside the installed package</p></li>
+<li><p>Returns <code class="docutils literal notranslate"><span class="pre">None</span></code> if neither is found</p></li>
+</ol>
+</section>
+<section id="compilation-split-host-cxx-vs-device-jit">
+<h2>Compilation Split: Host CXX vs Device JIT<a class="headerlink" href="#compilation-split-host-cxx-vs-device-jit" title="Link to this heading"></a></h2>
+<p>The key design principle is <strong>host code compiles with a standard C++ compiler
+(clang/g++), device code is JIT-compiled with hipcc at runtime</strong>.</p>
+<section id="what-compiles-as-cxx-at-pip-install-time">
+<h3>What compiles as CXX (at <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span></code> time)<a class="headerlink" href="#what-compiles-as-cxx-at-pip-install-time" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>File</p></th>
+<th class="head"><p>Purpose</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dispatch_combine.cpp</span></code></p></td>
+<td><p>Handle lifecycle, shmem buffer init/finalize, <code class="docutils literal notranslate"><span class="pre">GetEpDispatchCombineArgsRaw()</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">pybind_ops.cpp</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">prepare_inference</span></code>, <code class="docutils literal notranslate"><span class="pre">build_args</span></code>/<code class="docutils literal notranslate"><span class="pre">free_args</span></code>, output pointer getters, <code class="docutils literal notranslate"><span class="pre">get_handle_info</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">pybind_shmem.cpp</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">shmem_module_init</span></code>, shmem host API bindings</p></td>
+</tr>
+<tr class="row-odd"><td><p>All <code class="docutils literal notranslate"><span class="pre">application/*.cpp</span></code></p></td>
+<td><p>Bootstrap, RDMA transport, symmetric memory management</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">shmem/{init,runtime,memory}.cpp</span></code></p></td>
+<td><p>Shmem host-side initialization and memory management</p></td>
+</tr>
+</tbody>
+</table>
+<p>These files use <code class="docutils literal notranslate"><span class="pre">shmem_api.hpp</span></code> (host-only) instead of <code class="docutils literal notranslate"><span class="pre">shmem.hpp</span></code> (which
+pulls in device kernels). <code class="docutils literal notranslate"><span class="pre">hip/hip_fp8.h</span></code> is guarded with <code class="docutils literal notranslate"><span class="pre">#ifdef</span> <span class="pre">__HIPCC__</span></code>
+in <code class="docutils literal notranslate"><span class="pre">data_types.hpp</span></code> and <code class="docutils literal notranslate"><span class="pre">dispatch_combine.hpp</span></code> to avoid ROCm 6.x
+incompatibilities.</p>
+</section>
+<section id="what-compiles-as-hip-runtime-jit-only">
+<h3>What compiles as HIP (runtime JIT only)<a class="headerlink" href="#what-compiles-as-hip-runtime-jit-only" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>File</p></th>
+<th class="head"><p>Purpose</p></th>
+<th class="head"><p>When</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ep_intranode.hip</span></code></p></td>
+<td><p>IntraNode dispatch/combine kernels</p></td>
+<td><p>Runtime JIT</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ep_internode.hip</span></code></p></td>
+<td><p>InterNode dispatch/combine</p></td>
+<td><p>Runtime JIT</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ep_internode_v1.hip</span></code></p></td>
+<td><p>InterNodeV1 dispatch/combine + sync</p></td>
+<td><p>Runtime JIT</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ep_internode_v1ll.hip</span></code></p></td>
+<td><p>InterNodeV1LL low-latency variant</p></td>
+<td><p>Runtime JIT</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ep_async_ll.hip</span></code></p></td>
+<td><p>AsyncLL send/recv</p></td>
+<td><p>Runtime JIT</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">cast_kernel.hip</span></code></p></td>
+<td><p>Float→FP4 cast</p></td>
+<td><p>Runtime JIT</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">shmem_kernels.hip</span></code></p></td>
+<td><p>shmem barrier + <code class="docutils literal notranslate"><span class="pre">globalGpuStates</span></code> shim</p></td>
+<td><p>Runtime JIT</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">shmem_device_api_wrapper.cpp</span></code></p></td>
+<td><p>shmem device bitcode (put/get/signal)</p></td>
+<td><p>Runtime JIT (bitcode)</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="template-args-vs-raw-args">
+<h3>Template Args vs Raw Args<a class="headerlink" href="#template-args-vs-raw-args" title="Link to this heading"></a></h3>
+<p>Kernel functions take <code class="docutils literal notranslate"><span class="pre">EpDispatchCombineArgs&lt;T&gt;</span></code> by value, where <code class="docutils literal notranslate"><span class="pre">T</span></code> is the
+data type (<code class="docutils literal notranslate"><span class="pre">hip_bfloat16</span></code>, <code class="docutils literal notranslate"><span class="pre">float</span></code>, etc.). Since <code class="docutils literal notranslate"><span class="pre">T</span></code> only affects pointer
+types (<code class="docutils literal notranslate"><span class="pre">T*</span></code> → 8 bytes regardless of <code class="docutils literal notranslate"><span class="pre">T</span></code>), an <code class="docutils literal notranslate"><span class="pre">EpDispatchCombineArgsRaw</span></code>
+struct with <code class="docutils literal notranslate"><span class="pre">void*</span></code> has identical binary layout:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>C++ pybind (CXX):  build_args(handle) → new EpDispatchCombineArgsRaw{...} → int64 ptr
+Python:            hipModuleLaunchKernel(func, grid, block, sharedMem, stream, ptr)
+C++ pybind:        free_args(ptr) → delete
+</pre></div>
+</div>
+<p>A <code class="docutils literal notranslate"><span class="pre">static_assert</span></code> (compiled only under hipcc) validates layout equivalence.
+The template <code class="docutils literal notranslate"><span class="pre">EpDispatchCombineArgs&lt;T&gt;</span></code> and <code class="docutils literal notranslate"><span class="pre">EpDispatchCombineArgsVariant</span></code>
+are likewise hipcc-only; CXX code uses <code class="docutils literal notranslate"><span class="pre">EpDispatchCombineArgsRaw</span></code> exclusively.</p>
+</section>
+</section>
+<section id="what-gets-jit-compiled">
+<h2>What Gets JIT-Compiled<a class="headerlink" href="#what-gets-jit-compiled" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Component</p></th>
+<th class="head"><p>Compiler</p></th>
+<th class="head"><p>Output</p></th>
+<th class="head"><p>Trigger</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Ops kernels</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">hipcc</span> <span class="pre">--genco</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">.hsaco</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">EpDispatchCombineOp.__init__()</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Cast kernel</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">hipcc</span> <span class="pre">--genco</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">.hsaco</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cast_jit._get_module()</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Shmem bitcode</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">hipcc</span> <span class="pre">--cuda-device-only</span></code> + <code class="docutils literal notranslate"><span class="pre">llvm-link</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">.bc</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">find_bitcode()</span></code> / Triton <code class="docutils literal notranslate"><span class="pre">get_extern_libs()</span></code></p></td>
+</tr>
+</tbody>
+</table>
+<p>Ops kernels are split by <code class="docutils literal notranslate"><span class="pre">kernel_type</span></code> — only the required group is compiled:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>KernelType</p></th>
+<th class="head"><p>File</p></th>
+<th class="head"><p>Compile Time</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>IntraNode</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ep_intranode.hip</span></code></p></td>
+<td><p>~9s</p></td>
+</tr>
+<tr class="row-odd"><td><p>InterNode</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ep_internode.hip</span></code></p></td>
+<td><p>~10s</p></td>
+</tr>
+<tr class="row-even"><td><p>InterNodeV1</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ep_internode_v1.hip</span></code></p></td>
+<td><p>~19s</p></td>
+</tr>
+<tr class="row-odd"><td><p>InterNodeV1LL</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ep_internode_v1ll.hip</span></code></p></td>
+<td><p>~22s</p></td>
+</tr>
+<tr class="row-even"><td><p>AsyncLL</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ep_async_ll.hip</span></code></p></td>
+<td><p>~7s</p></td>
+</tr>
+</tbody>
+</table>
+<p>Pre-compile all at once with <code class="docutils literal notranslate"><span class="pre">MORI_PRECOMPILE=1</span> <span class="pre">python</span> <span class="pre">-c</span> <span class="pre">&quot;import</span> <span class="pre">mori&quot;</span></code> (~22s
+with 7 parallel hipcc invocations + 1 bitcode build).</p>
+</section>
+<section id="kernel-launch-flow">
+<h2>Kernel Launch Flow<a class="headerlink" href="#kernel-launch-flow" title="Link to this heading"></a></h2>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>Python dispatch_combine.py
+  │
+  ├── mori_cpp.prepare_inference(handle, input_ptr, dtype, num_tokens, ...)
+  │     └── C++: handle.inputType = dtype; handle.inpTokenBuf = ptr; ...
+  │
+  ├── args_ptr = mori_cpp.build_args(handle, rdma_block_num, hidden_dim, ...)
+  │     └── C++: new EpDispatchCombineArgsRaw(GetArgsRaw(handle, ...))
+  │
+  ├── sfx = _DTYPE_SUFFIX[input.dtype]                   # &quot;bf16&quot;, &quot;f32&quot;, ...
+  ├── kernel_name = f&quot;EpDispatchIntraNodeKernel_{sfx}&quot;    # Python selects
+  ├── grid  = (block_num,)                                # Python computes
+  ├── block = (WARP_SIZE * warp_per_block,)
+  ├── shared_mem = dispatch_shared_mem(warp_per_block)
+  │
+  ├── func = hip_module.get_function(kernel_name)
+  ├── func.launch_struct(grid, block, shared_mem, stream, args_ptr)
+  │     └── ctypes: hipModuleLaunchKernel(func, gx,gy,gz, bx,by,bz, ...)
+  │
+  └── mori_cpp.free_args(args_ptr)
+        └── C++: delete ptr
+</pre></div>
+</div>
+<p>Dtype suffix mapping:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>PyTorch dtype</p></th>
+<th class="head"><p>Suffix</p></th>
+<th class="head"><p>Kernel example</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">torch.bfloat16</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">bf16</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">EpDispatchIntraNodeKernel_bf16</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">torch.float32</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">f32</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">EpCombineInterNodeKernel_f32</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">torch.float8_e4m3fn</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fp8_ocp</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">EpDispatchIntraNodeKernel_fp8_ocp</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">torch.float8_e4m3fnuz</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">fp8_fnuz</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">EpCombineIntraNodeKernel_fp8_fnuz_nop2p</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="hip-driver-api-python-ctypes">
+<h2>HIP Driver API (Python ctypes)<a class="headerlink" href="#hip-driver-api-python-ctypes" title="Link to this heading"></a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">mori.jit.hip_driver</span></code> provides a minimal ctypes wrapper around <code class="docutils literal notranslate"><span class="pre">libamdhip64.so</span></code>:</p>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">HipModule(hsaco_path)</span></code></strong> — calls <code class="docutils literal notranslate"><span class="pre">hipModuleLoad</span></code>, caches <code class="docutils literal notranslate"><span class="pre">hipFunction_t</span></code>
+handles by name. Destructor calls <code class="docutils literal notranslate"><span class="pre">hipModuleUnload</span></code>.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">HipFunction.launch(grid,</span> <span class="pre">block,</span> <span class="pre">shared_mem,</span> <span class="pre">stream,</span> <span class="pre">*args)</span></code></strong> — individual
+scalar/pointer arguments, packed as <code class="docutils literal notranslate"><span class="pre">void**</span></code> kernelParams.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">HipFunction.launch_struct(grid,</span> <span class="pre">block,</span> <span class="pre">shared_mem,</span> <span class="pre">stream,</span> <span class="pre">struct_ptr)</span></code></strong> —
+single struct argument passed by value. <code class="docutils literal notranslate"><span class="pre">struct_ptr</span></code> is a host pointer to the
+struct data; <code class="docutils literal notranslate"><span class="pre">hipModuleLaunchKernel</span></code> copies the struct into kernel argument
+buffer.</p></li>
+</ul>
+<p>After loading a <code class="docutils literal notranslate"><span class="pre">HipModule</span></code>, <code class="docutils literal notranslate"><span class="pre">shmem_module_init(module._module.value)</span></code> must
+be called to copy <code class="docutils literal notranslate"><span class="pre">globalGpuStates</span></code> into the JIT module before any kernel
+launch.</p>
+</section>
+<section id="triton-integration">
+<h2>Triton Integration<a class="headerlink" href="#triton-integration" title="Link to this heading"></a></h2>
+<p>Triton kernels use mori shmem via device bitcode linking:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.ir.triton.runtime</span><span class="w"> </span><span class="kn">import</span> <span class="n">get_extern_libs</span><span class="p">,</span> <span class="n">install_hook</span>
+
+<span class="n">install_hook</span><span class="p">()</span>  <span class="c1"># One-time: register shmem_module_init as post-compile hook</span>
+
+<span class="nd">@triton</span><span class="o">.</span><span class="n">jit</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">my_kernel</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="n">mori_shmem_put_nbi</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>  <span class="c1"># Calls into linked bitcode</span>
+
+<span class="n">my_kernel</span><span class="p">[(</span><span class="n">grid</span><span class="p">,)](</span><span class="o">...</span><span class="p">,</span> <span class="n">extern_libs</span><span class="o">=</span><span class="n">get_extern_libs</span><span class="p">())</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">get_extern_libs()</span></code></strong> returns <code class="docutils literal notranslate"><span class="pre">{&quot;mori_shmem&quot;:</span> <span class="pre">find_bitcode()}</span></code></p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">install_hook()</span></code></strong> registers <code class="docutils literal notranslate"><span class="pre">shmem_module_init</span></code> as Triton’s
+<code class="docutils literal notranslate"><span class="pre">jit_post_compile_hook</span></code> so that <code class="docutils literal notranslate"><span class="pre">globalGpuStates</span></code> is initialized in
+every compiled Triton module</p></li>
+</ul>
+<p>Bitcode search order in <code class="docutils literal notranslate"><span class="pre">find_bitcode()</span></code>:</p>
+<ol class="arabic simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">MORI_SHMEM_BC</span></code> environment variable</p></li>
+<li><p>JIT cache (<code class="docutils literal notranslate"><span class="pre">~/.mori/jit/&lt;arch&gt;_&lt;nic&gt;/&lt;hash&gt;/libmori_shmem_device.bc</span></code>)</p></li>
+<li><p>JIT compile via <code class="docutils literal notranslate"><span class="pre">ensure_bitcode()</span></code> (compiles <code class="docutils literal notranslate"><span class="pre">shmem_device_api_wrapper.cpp</span></code></p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">globalGpuStates.hip</span></code> shim → llvm-link → strip lifetime intrinsics)</p></li>
+</ul>
+</li>
+<li><p>Pre-built <code class="docutils literal notranslate"><span class="pre">.bc</span></code> next to <code class="docutils literal notranslate"><span class="pre">bitcode.py</span></code>, or in <code class="docutils literal notranslate"><span class="pre">lib/</span></code> / <code class="docutils literal notranslate"><span class="pre">build/lib/</span></code></p></li>
+</ol>
+</section>
+<section id="cache-structure">
+<h2>Cache Structure<a class="headerlink" href="#cache-structure" title="Link to this heading"></a></h2>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>~/.mori/jit/
+└── gfx942_bnxt/                          # &lt;gpu_arch&gt;_&lt;nic_type&gt;
+    ├── ab065555b30b/                     # content hash of source files
+    │   └── ep_intranode.hsaco
+    ├── afcfa60c20a2/
+    │   └── libmori_shmem_device.bc
+    ├── 575fe0455099/
+    │   └── cast_kernel.hsaco
+    └── ...
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>Cache key = <code class="docutils literal notranslate"><span class="pre">&lt;arch&gt;_&lt;nic&gt;/&lt;content_hash&gt;/</span></code></p></li>
+<li><p>Source file change → new hash → recompile</p></li>
+<li><p>Different GPU/NIC → separate directory</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">FileBaton</span></code> file lock prevents concurrent compilation conflicts</p></li>
+</ul>
+</section>
+<section id="environment-variables">
+<h2>Environment Variables<a class="headerlink" href="#environment-variables" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_PRECOMPILE=1</span></code></p></td>
+<td><p>off</p></td>
+<td><p>Pre-compile all kernels on <code class="docutils literal notranslate"><span class="pre">import</span> <span class="pre">mori</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_DISABLE_JIT=1</span></code></p></td>
+<td><p>off</p></td>
+<td><p>Disable bitcode JIT (error if no pre-built .bc)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_JIT_CACHE_DIR</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">~/.mori/jit/</span></code></p></td>
+<td><p>Custom cache directory</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_GPU_ARCHS</span></code></p></td>
+<td><p>auto-detect</p></td>
+<td><p>Override GPU architecture (e.g. <code class="docutils literal notranslate"><span class="pre">gfx942</span></code>)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_SHMEM_BC</span></code></p></td>
+<td><p>auto</p></td>
+<td><p>Explicit path to shmem bitcode</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">USE_BNXT=ON</span></code></p></td>
+<td><p>auto-detect</p></td>
+<td><p>Override NIC type to Broadcom BNXT</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">USE_IONIC=ON</span></code></p></td>
+<td><p>auto-detect</p></td>
+<td><p>Override NIC type to AMD/Pensando IONIC</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="testing">
+<h2>Testing<a class="headerlink" href="#testing" title="Link to this heading"></a></h2>
+<section id="docker-environment">
+<h3>Docker Environment<a class="headerlink" href="#docker-environment" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># ROCm 7.1 container (primary)</span>
+docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span>mori_jit_test<span class="w"> </span>bash
+<span class="nb">cd</span><span class="w"> </span>/workspace/mori
+
+<span class="c1"># ROCm 6.4 container (compatibility)</span>
+docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span>mori_jit_test_rocm64<span class="w"> </span>bash
+<span class="nb">cd</span><span class="w"> </span>/workspace/mori
+</pre></div>
+</div>
+</section>
+<section id="non-editable-install-wheel">
+<h3>1. Non-Editable Install (Wheel)<a class="headerlink" href="#non-editable-install-wheel" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Build and install as wheel (tests pip install . end-to-end)</span>
+rm<span class="w"> </span>-rf<span class="w"> </span>build
+pip<span class="w"> </span>install<span class="w"> </span>.<span class="w"> </span>--no-build-isolation
+
+<span class="c1"># Verify _jit_sources bundled in site-packages</span>
+python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;</span>
+<span class="s2">from mori.jit.config import get_mori_source_root</span>
+<span class="s2">root = get_mori_source_root()</span>
+<span class="s2">print(f&#39;Source root: {root}&#39;)</span>
+<span class="s2">assert root is not None, &#39;JIT source root not found&#39;</span>
+<span class="s2">assert (root / &#39;src/ops/kernels/ep_intranode.hip&#39;).is_file()</span>
+<span class="s2">print(&#39;OK: JIT sources are packaged&#39;)</span>
+<span class="s2">&quot;</span>
+</pre></div>
+</div>
+</section>
+<section id="editable-install-development">
+<h3>2. Editable Install (Development)<a class="headerlink" href="#editable-install-development" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>rm<span class="w"> </span>-rf<span class="w"> </span>build
+pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.<span class="w"> </span>--no-build-isolation
+<span class="nb">export</span><span class="w"> </span><span class="nv">PYTHONPATH</span><span class="o">=</span>/workspace/mori:<span class="nv">$PYTHONPATH</span>
+</pre></div>
+</div>
+</section>
+<section id="pre-compile-all-kernels">
+<h3>3. Pre-compile All Kernels<a class="headerlink" href="#pre-compile-all-kernels" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>rm<span class="w"> </span>-rf<span class="w"> </span>~/.mori/jit
+<span class="nv">MORI_PRECOMPILE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import mori&quot;</span>
+<span class="c1"># Expected: ~22s, 6 .hsaco files + 1 .bc + 1 cast_kernel.hsaco</span>
+</pre></div>
+</div>
+</section>
+<section id="verify-jit-configuration">
+<h3>4. Verify JIT Configuration<a class="headerlink" href="#verify-jit-configuration" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;</span>
+<span class="s2">from mori.jit.config import detect_build_config, detect_nic_type, get_mori_source_root</span>
+<span class="s2">cfg = detect_build_config()</span>
+<span class="s2">print(f&#39;GPU:    {cfg.arch}&#39;)</span>
+<span class="s2">print(f&#39;NIC:    {detect_nic_type()}&#39;)</span>
+<span class="s2">print(f&#39;Root:   {get_mori_source_root()}&#39;)</span>
+<span class="s2">print(f&#39;hipcc:  {cfg.hipcc}&#39;)</span>
+<span class="s2">&quot;</span>
+</pre></div>
+</div>
+</section>
+<section id="verify-compilation-separation">
+<h3>5. Verify Compilation Separation<a class="headerlink" href="#verify-compilation-separation" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Only works with editable install (build/ directory present)</span>
+python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;</span>
+<span class="s2">import json</span>
+<span class="s2">with open(&#39;build/compile_commands.json&#39;) as f:</span>
+<span class="s2">    data = json.load(f)</span>
+<span class="s2">cxx, hip = [], []</span>
+<span class="s2">for e in data:</span>
+<span class="s2">    fn = e[&#39;file&#39;].split(&#39;/&#39;)[-1]</span>
+<span class="s2">    fp = e[&#39;file&#39;]</span>
+<span class="s2">    if &#39;/3rdparty/&#39; in fp or &#39;/examples/&#39; in fp or &#39;/benchmarks/&#39; in fp:</span>
+<span class="s2">        continue</span>
+<span class="s2">    if any(x in e[&#39;command&#39;] for x in [&#39;-x hip&#39;, &#39;--offload-arch&#39;]):</span>
+<span class="s2">        hip.append(fn)</span>
+<span class="s2">    else:</span>
+<span class="s2">        cxx.append(fn)</span>
+<span class="s2">print(f&#39;CXX: {len(cxx)} files | HIP: {len(hip)} files&#39;)</span>
+<span class="s2">print(f&#39;HIP files: {sorted(hip)}&#39;)</span>
+<span class="s2">&quot;</span>
+<span class="c1"># Expected: CXX ~34 | HIP ~1</span>
+<span class="c1"># HIP: device_link_stub.hip (shmem device code is now JIT-compiled)</span>
+</pre></div>
+</div>
+</section>
+<section id="dispatch-combine-correctness">
+<h3>6. Dispatch/Combine Correctness<a class="headerlink" href="#dispatch-combine-correctness" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Single test (IntraNode, bf16, 8 GPUs, ~20s)</span>
+pytest<span class="w"> </span><span class="s1">&#39;tests/python/ops/test_dispatch_combine.py::test_dispatch_combine[none-True-8-32-1-1-0-7168-data_type0-8]&#39;</span><span class="w"> </span>-x<span class="w"> </span>-v
+
+<span class="c1"># Full suite (256 cases: 80 pass, 176 skip on gfx942, ~26s)</span>
+pytest<span class="w"> </span>tests/python/ops/test_dispatch_combine.py<span class="w"> </span>-q
+</pre></div>
+</div>
+</section>
+<section id="dispatch-combine-benchmark">
+<h3>7. Dispatch/Combine Benchmark<a class="headerlink" href="#dispatch-combine-benchmark" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>tests/python/ops/bench_dispatch_combine.py
+<span class="c1"># Expected: ~300 GB/s dispatch, ~330 GB/s combine</span>
+</pre></div>
+</div>
+</section>
+<section id="shmem-api">
+<h3>8. Shmem API<a class="headerlink" href="#shmem-api" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pytest<span class="w"> </span>tests/python/shmem/test_api.py<span class="w"> </span>-q
+<span class="c1"># Expected: 18 passed (~235s)</span>
+</pre></div>
+</div>
+</section>
+<section id="id1">
+<h3>9. Triton Integration<a class="headerlink" href="#id1" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Basic shmem put (2 GPUs)</span>
+torchrun<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">2</span><span class="w"> </span>examples/shmem/ir/test_triton_shmem.py
+
+<span class="c1"># Allreduce P2P (8 GPUs)</span>
+torchrun<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span>examples/shmem/ir/test_triton_allreduce.py
+
+<span class="c1"># Allreduce IBGDA/RDMA (8 GPUs, P2P disabled)</span>
+<span class="nv">MORI_DISABLE_P2P</span><span class="o">=</span>ON<span class="w"> </span>torchrun<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span>examples/shmem/ir/test_triton_allreduce.py
+</pre></div>
+</div>
+</section>
+<section id="full-clean-slate-test">
+<h3>10. Full Clean-Slate Test<a class="headerlink" href="#full-clean-slate-test" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>rm<span class="w"> </span>-rf<span class="w"> </span>build<span class="w"> </span>~/.mori/jit
+pip<span class="w"> </span>install<span class="w"> </span>.<span class="w"> </span>--no-build-isolation
+<span class="nb">cd</span><span class="w"> </span>/tmp<span class="w">  </span><span class="c1"># leave source tree to verify wheel is self-contained</span>
+<span class="nv">MORI_PRECOMPILE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import mori&quot;</span>
+<span class="nb">cd</span><span class="w"> </span>/path/to/mori
+<span class="nb">export</span><span class="w"> </span><span class="nv">PYTHONPATH</span><span class="o">=</span>/path/to/mori:<span class="nv">$PYTHONPATH</span>
+pytest<span class="w"> </span>tests/python/ops/test_dispatch_combine.py<span class="w"> </span>-q
+torchrun<span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">2</span><span class="w"> </span>examples/shmem/ir/test_triton_shmem.py
+</pre></div>
+</div>
+</section>
+</section>
+<section id="kernel-source-files">
+<h2>Kernel Source Files<a class="headerlink" href="#kernel-source-files" title="Link to this heading"></a></h2>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>src/ops/kernels/
+├── ep_common.hip                 # Shared includes, macros, globalGpuStates shim
+├── ep_intranode.hip              # IntraNode dispatch + combine + convert
+├── ep_internode.hip              # InterNode (legacy) dispatch + combine
+├── ep_internode_v1.hip           # InterNodeV1 dispatch + combine + sync
+├── ep_internode_v1ll.hip         # InterNodeV1LL low-latency variant
+├── ep_async_ll.hip               # AsyncLL send/recv
+├── cast_kernel.hip               # Float→FP4 cast (Python-side launcher)
+└── shmem_kernels.hip             # shmem barrier kernel + globalGpuStates
+</pre></div>
+</div>
+<p>Each kernel is split into <code class="docutils literal notranslate"><span class="pre">__device__</span> <span class="pre">_body</span></code> + <code class="docutils literal notranslate"><span class="pre">__global__</span></code> wrapper in the
+headers under <code class="docutils literal notranslate"><span class="pre">src/ops/dispatch_combine/</span></code>, enabling <code class="docutils literal notranslate"><span class="pre">extern</span> <span class="pre">&quot;C&quot;</span></code> JIT wrappers
+without duplicating code.</p>
+</section>
+<section id="adding-a-new-kernel">
+<h2>Adding a New Kernel<a class="headerlink" href="#adding-a-new-kernel" title="Link to this heading"></a></h2>
+<ol class="arabic simple">
+<li><p>Write the kernel with <code class="docutils literal notranslate"><span class="pre">__device__</span></code> body:</p></li>
+</ol>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="k">template</span><span class="w"> </span><span class="o">&lt;</span><span class="k">typename</span><span class="w"> </span><span class="nc">T</span><span class="o">&gt;</span>
+<span class="n">__device__</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">MyKernel_body</span><span class="p">(</span><span class="n">EpDispatchCombineArgs</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="n">args</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* impl */</span><span class="w"> </span><span class="p">}</span>
+
+<span class="k">template</span><span class="w"> </span><span class="o">&lt;</span><span class="k">typename</span><span class="w"> </span><span class="nc">T</span><span class="o">&gt;</span>
+<span class="n">__global__</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">MyKernel</span><span class="p">(</span><span class="n">EpDispatchCombineArgs</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="n">args</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">MyKernel_body</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="p">(</span><span class="n">args</span><span class="p">);</span><span class="w"> </span><span class="p">}</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="2">
+<li><p>Add <code class="docutils literal notranslate"><span class="pre">extern</span> <span class="pre">&quot;C&quot;</span></code> wrappers in a <code class="docutils literal notranslate"><span class="pre">.hip</span></code> file under <code class="docutils literal notranslate"><span class="pre">src/ops/kernels/</span></code>:</p></li>
+</ol>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;src/ops/kernels/ep_common.hip&quot;</span>
+<span class="n">MORI_DEFINE_GPU_STATES</span>
+<span class="n">WRAP_ALL_TYPES</span><span class="p">(</span><span class="n">MyKernel</span><span class="p">)</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="3">
+<li><p>Launch from Python:</p></li>
+</ol>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># In dispatch_combine.py or your own module:</span>
+<span class="n">args_ptr</span> <span class="o">=</span> <span class="n">mori_cpp</span><span class="o">.</span><span class="n">build_args</span><span class="p">(</span><span class="n">handle</span><span class="p">,</span> <span class="n">rdma_block_num</span><span class="o">=</span><span class="n">rbn</span><span class="p">,</span> <span class="n">hidden_dim</span><span class="o">=</span><span class="n">dim</span><span class="p">)</span>
+<span class="n">func</span> <span class="o">=</span> <span class="n">hip_module</span><span class="o">.</span><span class="n">get_function</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;MyKernel_</span><span class="si">{</span><span class="n">sfx</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="n">func</span><span class="o">.</span><span class="n">launch_struct</span><span class="p">(</span><span class="n">grid</span><span class="p">,</span> <span class="n">block</span><span class="p">,</span> <span class="n">shared_mem</span><span class="p">,</span> <span class="n">stream</span><span class="p">,</span> <span class="n">args_ptr</span><span class="p">)</span>
+<span class="n">mori_cpp</span><span class="o">.</span><span class="n">free_args</span><span class="p">(</span><span class="n">args_ptr</span><span class="p">)</span>
+</pre></div>
+</div>
+<ol class="arabic simple" start="4">
+<li><p>Register in <code class="docutils literal notranslate"><span class="pre">_KERNEL_TYPE_TO_HIP</span></code> if it belongs to a dispatch/combine mode,
+and in <code class="docutils literal notranslate"><span class="pre">precompile()</span></code> for pre-compilation support.</p></li>
+</ol>
+</section>
+<section id="host-device-nic-macro-separation">
+<h2>Host/Device NIC Macro Separation<a class="headerlink" href="#host-device-nic-macro-separation" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Macro</p></th>
+<th class="head"><p>Scope</p></th>
+<th class="head"><p>Set by</p></th>
+<th class="head"><p>Controls</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ENABLE_BNXT</span></code></p></td>
+<td><p>Host C++</p></td>
+<td><p>CMake <code class="docutils literal notranslate"><span class="pre">find_library</span></code></p></td>
+<td><p>Link <code class="docutils literal notranslate"><span class="pre">libbnxt_re.so</span></code>, compile <code class="docutils literal notranslate"><span class="pre">bnxt.cpp</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_DEVICE_NIC_BNXT</span></code></p></td>
+<td><p>Device JIT</p></td>
+<td><p>Python <code class="docutils literal notranslate"><span class="pre">detect_nic_type()</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">DISPATCH_BNXT=1</span></code> in IBGDA kernels</p></td>
+</tr>
+</tbody>
+</table>
+<p>A single host <code class="docutils literal notranslate"><span class="pre">.so</span></code> can be built on a CI machine with all NIC libraries
+available, while device kernels are JIT-compiled with the correct NIC branch
+for the actual runtime hardware.</p>
+</section>
+<section id="rocm-version-compatibility">
+<h2>ROCm Version Compatibility<a class="headerlink" href="#rocm-version-compatibility" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Feature</p></th>
+<th class="head"><p>ROCm 6.4</p></th>
+<th class="head"><p>ROCm 7.1</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Host CXX compilation</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">hip/hip_bfloat16.h</span></code> in CXX</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">hip/hip_fp8.h</span></code> in CXX</p></td>
+<td><p>No (guarded)</p></td>
+<td><p>Yes</p></td>
+</tr>
+<tr class="row-odd"><td><p>FP8 kernel JIT</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+</tr>
+<tr class="row-even"><td><p>FP4 kernel JIT</p></td>
+<td><p>No (<code class="docutils literal notranslate"><span class="pre">hip_ext_ocp.h</span></code> absent)</p></td>
+<td><p>Yes</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">.</span></code> (wheel)</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+</tr>
+</tbody>
+</table>
+<p><code class="docutils literal notranslate"><span class="pre">hip/hip_fp8.h</span></code> is guarded with <code class="docutils literal notranslate"><span class="pre">#ifdef</span> <span class="pre">__HIPCC__</span></code> in <code class="docutils literal notranslate"><span class="pre">data_types.hpp</span></code> and
+<code class="docutils literal notranslate"><span class="pre">dispatch_combine.hpp</span></code> because ROCm 6.x’s <code class="docutils literal notranslate"><span class="pre">amd_warp_functions.h</span></code> uses GPU
+builtins (<code class="docutils literal notranslate"><span class="pre">__builtin_amdgcn_*</span></code>) unavailable in CXX mode. This guard has no
+effect on JIT compilation (which always uses hipcc).</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

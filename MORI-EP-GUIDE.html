@@ -1,0 +1,1262 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MORI-EP User Guide &mdash; MORI 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=01f34227"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="MORI Shmem Guide" href="MORI-SHMEM-GUIDE.html" />
+    <link rel="prev" title="Quickstart" href="quickstart.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#from-source">From Source</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#verification">Verification</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ep-dispatch-and-combine">MORI-EP: Dispatch and Combine</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-io-point-to-point-transfers">MORI-IO: Point-to-Point Transfers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-shmem-symmetric-memory">MORI Shmem: Symmetric Memory</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ir-device-bitcode-for-gpu-kernels">MORI-IR: Device Bitcode for GPU Kernels</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#profiling-with-mori-viz">Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="current reference internal" href="#">MORI-EP User Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#kernel-types">1. Kernel Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#configuration">2. Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#epdispatchcombineconfig">EpDispatchCombineConfig</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#operator-api">3. Operator API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#epdispatchcombineop">EpDispatchCombineOp</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#dispatch">dispatch()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#combine">combine()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#split-dispatch-combine-send-recv">Split dispatch/combine (send + recv)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#reset">reset()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#get-dispatch-src-token-pos">get_dispatch_src_token_pos()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#get-registered-combine-input-buffer">get_registered_combine_input_buffer()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#standard-moe-compatibility-deepep">4. Standard MoE Compatibility (DeepEP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#dispatch-standard-moe">dispatch_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#combine-standard-moe">combine_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#convert-dispatch-output">convert_dispatch_output()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#convert-combine-input">convert_combine_input()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#initialization">5. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#launch-configuration">6. Launch Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#manual-mode-default">Manual Mode (Default)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#auto-mode">Auto Mode</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#complete-example">7. Complete Example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#environment-variables">8. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#benchmarking">9. Benchmarking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#intra-node">Intra-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#inter-node">Inter-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#reference-performance-deepseek-v3-config">Reference Performance (DeepSeek V3 config)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#profiling-with-mori-viz">10. Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#framework-integration">11. Framework Integration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#build-options">Build Options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">MORI Shmem Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-memory">Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#processing-element-pe">Processing Element (PE)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-heap">Symmetric Heap</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization">2. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-3-mpi-communicator-c-mpi-environments">Method 3: MPI Communicator (C++ / MPI environments)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-comparison">Initialization Comparison</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#finalization">Finalization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#query-apis">3. Query APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#memory-management">4. Memory Management</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#allocating-symmetric-memory">Allocating Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#freeing-symmetric-memory">Freeing Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#registering-existing-buffers">Registering Existing Buffers</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#p2p-address-translation">5. P2P Address Translation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#synchronization">6. Synchronization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#hip-module-init-triton-integration">7. HIP Module Init (Triton Integration)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-flags">8. Initialization Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IR-GUIDE.html">MORI-IR Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#host-side-python-api">1. Host-Side Python API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-framework-agnostic"><code class="docutils literal notranslate"><span class="pre">mori.ir</span></code> (framework-agnostic)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-triton-triton-specific-reference-backend"><code class="docutils literal notranslate"><span class="pre">mori.ir.triton</span></code> (Triton-specific reference backend)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-bitcode">2. Device Bitcode</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-functions">3. Device Functions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#query">Query</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#point-to-point">Point-to-Point</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-thread-warp-block">PutNbi (Thread / Warp / Block)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-with-signal">PutNbi with Signal</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#immediate-put">Immediate Put</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#atomics">Atomics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#wait">Wait</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#synchronization">Synchronization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-triton">4. Integration Example: Triton</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-raw-bitcode-no-framework">5. Integration Example: Raw Bitcode (no framework)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#bitcode-jit-compilation">6. Bitcode JIT Compilation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#testing">8. Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#known-limitations">Known Limitations</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">MORI-IO Introduction</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#design-concepts">Design &amp; Concepts</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#workflow">Workflow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#python-api-quick-reference">Python API Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#example-basic-read-write">Example: Basic Read/Write</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#environment-configuration">Environment &amp; Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ (Visualizer)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#instrumentation">Instrumentation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#include-headers">1. Include Headers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#define-profiler-context">2. Define Profiler Context</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#add-trace-points">3. Add Trace Points</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#build-code-generation">Build &amp; Code Generation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#enabling-the-profiler">Enabling the Profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#code-generation">Code Generation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#python-analysis">Python Analysis</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#device-side-elapsed-time-measurement">Device-side Elapsed Time Measurement</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#viewing-the-trace">Viewing the Trace</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#best-practices">Best Practices</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">MORI-EP Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#intra-node">Intra-node</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#inter-node">Inter-node</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nic-selection">NIC Selection</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">MORI-IO Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-commands">Benchmark Commands</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-arguments">Benchmark Arguments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-read">Results: Thor2 RDMA Read</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-write">Results: Thor2 RDMA Write</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#message-size-sweep">Message Size Sweep</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#batch-size-sweep">Batch Size Sweep</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-cx7-rdma-batch-size-1">Results: CX7 RDMA (Batch Size = 1)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#write">Write</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#read">Read</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ep-expert-parallelism">MORI-EP (Expert Parallelism)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-shmem-symmetric-memory">MORI Shmem (Symmetric Memory)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-io-point-to-point-i-o">MORI-IO (Point-to-Point I/O)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ir-device-bitcode-integration">MORI-IR (Device Bitcode Integration)</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">MORI-VIZ Kernel Profiler</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#usage">Usage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#export-to-perfetto">export_to_perfetto</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#c-profiler-apis">C++ Profiler APIs</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">MORI-EP User Guide</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/MORI-EP-GUIDE.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="mori-ep-user-guide">
+<h1>MORI-EP User Guide<a class="headerlink" href="#mori-ep-user-guide" title="Link to this heading"></a></h1>
+<p>MORI-EP provides high-performance MoE (Mixture of Experts) dispatch and combine kernels for Expert Parallelism. It supports both intra-node (XGMI) and inter-node (RDMA) communication, delivering state-of-the-art bandwidth for token routing in models like DeepSeek V3.</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#quick-reference"><span class="xref myst">Quick Reference</span></a></p></li>
+<li><p><a class="reference internal" href="#1-kernel-types"><span class="xref myst">1. Kernel Types</span></a></p></li>
+<li><p><a class="reference internal" href="#2-configuration"><span class="xref myst">2. Configuration</span></a></p></li>
+<li><p><a class="reference internal" href="#3-operator-api"><span class="xref myst">3. Operator API</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#dispatch"><span class="xref myst">dispatch()</span></a></p></li>
+<li><p><a class="reference internal" href="#combine"><span class="xref myst">combine()</span></a></p></li>
+<li><p><a class="reference internal" href="#split-dispatchcombine-send--recv"><span class="xref myst">Split dispatch/combine (send + recv)</span></a></p></li>
+<li><p><a class="reference internal" href="#reset"><span class="xref myst">reset()</span></a></p></li>
+<li><p><a class="reference internal" href="#get_dispatch_src_token_pos"><span class="xref myst">get_dispatch_src_token_pos()</span></a></p></li>
+<li><p><a class="reference internal" href="#get_registered_combine_input_buffer"><span class="xref myst">get_registered_combine_input_buffer()</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#4-standard-moe-compatibility-deepep"><span class="xref myst">4. Standard MoE Compatibility (DeepEP)</span></a></p></li>
+<li><p><a class="reference internal" href="#5-initialization"><span class="xref myst">5. Initialization</span></a></p></li>
+<li><p><a class="reference internal" href="#6-launch-configuration"><span class="xref myst">6. Launch Configuration</span></a></p></li>
+<li><p><a class="reference internal" href="#7-complete-example"><span class="xref myst">7. Complete Example</span></a></p></li>
+<li><p><a class="reference internal" href="#8-environment-variables"><span class="xref myst">8. Environment Variables</span></a></p></li>
+<li><p><a class="reference internal" href="#9-benchmarking"><span class="xref myst">9. Benchmarking</span></a></p></li>
+<li><p><a class="reference internal" href="#10-profiling-with-mori-viz"><span class="xref myst">10. Profiling with MORI-VIZ</span></a></p></li>
+<li><p><a class="reference internal" href="#11-framework-integration"><span class="xref myst">11. Framework Integration</span></a></p></li>
+<li><p><a class="reference internal" href="#build-options"><span class="xref myst">Build Options</span></a></p></li>
+<li><p><a class="reference internal" href="#source-files"><span class="xref myst">Source Files</span></a></p></li>
+</ul>
+</section>
+<section id="quick-reference">
+<h2>Quick Reference<a class="headerlink" href="#quick-reference" title="Link to this heading"></a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">mori</span>
+
+<span class="c1"># 1. Initialize shmem (required before any EP operations)</span>
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_torch_process_group_init</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">)</span>
+
+<span class="c1"># 2. Configure</span>
+<span class="n">config</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">EpDispatchCombineConfig</span><span class="p">(</span>
+    <span class="n">data_type</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>
+    <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">,</span>
+    <span class="n">world_size</span><span class="o">=</span><span class="n">world_size</span><span class="p">,</span>
+    <span class="n">hidden_dim</span><span class="o">=</span><span class="mi">7168</span><span class="p">,</span>
+    <span class="n">scale_dim</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+    <span class="n">scale_type_size</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float8_e4m3fnuz</span><span class="p">)</span><span class="o">.</span><span class="n">element_size</span><span class="p">(),</span>
+    <span class="n">max_token_type_size</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span><span class="o">.</span><span class="n">element_size</span><span class="p">(),</span>
+    <span class="n">max_num_inp_token_per_rank</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span>
+    <span class="n">num_experts_per_rank</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
+    <span class="n">num_experts_per_token</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+    <span class="n">kernel_type</span><span class="o">=</span><span class="n">mori</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">EpDispatchCombineKernelType</span><span class="o">.</span><span class="n">IntraNode</span><span class="p">,</span>
+<span class="p">)</span>
+
+<span class="c1"># 3. Create operator and run</span>
+<span class="n">op</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">EpDispatchCombineOp</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+<span class="n">dispatch_output</span><span class="p">,</span> <span class="n">dispatch_weights</span><span class="p">,</span> <span class="n">dispatch_scales</span><span class="p">,</span> <span class="n">dispatch_indices</span><span class="p">,</span> <span class="n">recv_num_token</span> <span class="o">=</span> \
+    <span class="n">op</span><span class="o">.</span><span class="n">dispatch</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">scales</span><span class="p">,</span> <span class="n">indices</span><span class="p">)</span>
+<span class="c1"># ... run expert computation on dispatched tokens ...</span>
+<span class="n">combine_output</span><span class="p">,</span> <span class="n">combine_weights</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">combine</span><span class="p">(</span><span class="n">expert_output</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">indices</span><span class="p">)</span>
+<span class="n">op</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+</pre></div>
+</div>
+<p><strong>Imports:</strong></p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>What</p></th>
+<th class="head"><p>Import</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Config</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">mori.ops</span> <span class="pre">import</span> <span class="pre">EpDispatchCombineConfig</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Operator</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">mori.ops</span> <span class="pre">import</span> <span class="pre">EpDispatchCombineOp</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Kernel types</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">mori.ops</span> <span class="pre">import</span> <span class="pre">EpDispatchCombineKernelType</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Shmem init</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">import</span> <span class="pre">mori.shmem</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<hr class="docutils" />
+<section id="kernel-types">
+<h2>1. Kernel Types<a class="headerlink" href="#kernel-types" title="Link to this heading"></a></h2>
+<p>MORI-EP provides five kernel types optimized for different network topologies and latency requirements:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Kernel Type</p></th>
+<th class="head"><p>Value</p></th>
+<th class="head"><p>Topology</p></th>
+<th class="head"><p>Transport</p></th>
+<th class="head"><p>Use Case</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">IntraNode</span></code></p></td>
+<td><p>0</p></td>
+<td><p>Single node</p></td>
+<td><p>XGMI (P2P)</p></td>
+<td><p>EP within a node (e.g., EP8 on 8-GPU node)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">InterNode</span></code></p></td>
+<td><p>1</p></td>
+<td><p>Multi-node</p></td>
+<td><p>XGMI + RDMA</p></td>
+<td><p>EP across nodes, baseline inter-node kernel</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">InterNodeV1</span></code></p></td>
+<td><p>2</p></td>
+<td><p>Multi-node</p></td>
+<td><p>XGMI + RDMA</p></td>
+<td><p>Optimized inter-node with higher bandwidth</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">InterNodeV1LL</span></code></p></td>
+<td><p>3</p></td>
+<td><p>Multi-node</p></td>
+<td><p>XGMI + RDMA</p></td>
+<td><p>Low-latency variant of InterNodeV1</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">AsyncLL</span></code></p></td>
+<td><p>4</p></td>
+<td><p>Multi-node</p></td>
+<td><p>XGMI + RDMA</p></td>
+<td><p>Async low-latency with pipelined transfers</p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>How to choose:</strong></p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>Is EP within a single node?
+├─ Yes → IntraNode
+└─ No (multi-node EP)
+   ├─ Throughput priority (large batches) → InterNodeV1
+   ├─ Latency priority (small batches)   → InterNodeV1LL or AsyncLL
+   └─ Baseline / debugging              → InterNode
+</pre></div>
+</div>
+<p><strong>Kernel naming in benchmarks:</strong></p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Benchmark Name</p></th>
+<th class="head"><p>Kernel Type</p></th>
+<th class="head"><p>World Size</p></th>
+<th class="head"><p>Notes</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>EP8</p></td>
+<td><p>IntraNode</p></td>
+<td><p>8</p></td>
+<td><p>Single node, 8 GPUs</p></td>
+</tr>
+<tr class="row-odd"><td><p>EP16-V0</p></td>
+<td><p>InterNode</p></td>
+<td><p>16</p></td>
+<td><p>2 nodes, baseline</p></td>
+</tr>
+<tr class="row-even"><td><p>EP16-V1</p></td>
+<td><p>InterNodeV1</p></td>
+<td><p>16</p></td>
+<td><p>2 nodes, optimized</p></td>
+</tr>
+<tr class="row-odd"><td><p>EP32-V1-LL</p></td>
+<td><p>InterNodeV1LL</p></td>
+<td><p>32</p></td>
+<td><p>4 nodes, low-latency</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<hr class="docutils" />
+<section id="configuration">
+<h2>2. Configuration<a class="headerlink" href="#configuration" title="Link to this heading"></a></h2>
+<section id="epdispatchcombineconfig">
+<h3>EpDispatchCombineConfig<a class="headerlink" href="#epdispatchcombineconfig" title="Link to this heading"></a></h3>
+<p>All configuration is specified through the <code class="docutils literal notranslate"><span class="pre">EpDispatchCombineConfig</span></code> dataclass:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">data_type</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch.dtype</span></code></p></td>
+<td><p><em>(required)</em></p></td>
+<td><p>Token data type (<code class="docutils literal notranslate"><span class="pre">torch.bfloat16</span></code>, <code class="docutils literal notranslate"><span class="pre">torch.float8_e4m3fnuz</span></code>, etc.)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">rank</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><em>(required)</em></p></td>
+<td><p>Current process rank</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">world_size</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><em>(required)</em></p></td>
+<td><p>Total number of EP ranks</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">hidden_dim</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><em>(required)</em></p></td>
+<td><p>Hidden dimension of token embeddings</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">scale_dim</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><em>(required)</em></p></td>
+<td><p>Scale dimension for quantization (0 if no quantization scales)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">scale_type_size</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><em>(required)</em></p></td>
+<td><p>Element size of scale data type in bytes</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">max_token_type_size</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><em>(required)</em></p></td>
+<td><p>Element size of the max token data type in bytes (typically <code class="docutils literal notranslate"><span class="pre">float32</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">max_num_inp_token_per_rank</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><em>(required)</em></p></td>
+<td><p>Maximum number of input tokens per rank</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">num_experts_per_rank</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><em>(required)</em></p></td>
+<td><p>Number of experts hosted on each rank</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">num_experts_per_token</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><em>(required)</em></p></td>
+<td><p>Top-K: number of experts selected per token</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">warp_num_per_block</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">8</span></code></p></td>
+<td><p>Warps per GPU thread block</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">block_num</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">80</span></code></p></td>
+<td><p>Number of GPU thread blocks</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">use_external_inp_buf</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">bool</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">True</span></code></p></td>
+<td><p>Use external input buffer for combine (vs. zero-copy registered buffer)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kernel_type</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">EpDispatchCombineKernelType</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">IntraNode</span></code></p></td>
+<td><p>Kernel type selection</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">gpu_per_node</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">8</span></code></p></td>
+<td><p>GPUs per node (for inter-node rank mapping)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">rdma_block_num</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>Thread blocks dedicated to RDMA transfers (inter-node only)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">num_qp_per_pe</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>RDMA queue pairs per PE</p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>DeepSeek V3 example</strong> (256 experts, top-8, 8 GPUs):</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">config</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">EpDispatchCombineConfig</span><span class="p">(</span>
+    <span class="n">data_type</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>
+    <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">,</span>
+    <span class="n">world_size</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+    <span class="n">hidden_dim</span><span class="o">=</span><span class="mi">7168</span><span class="p">,</span>           <span class="c1"># DeepSeek V3 hidden dim</span>
+    <span class="n">scale_dim</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>               <span class="c1"># No quantization scales</span>
+    <span class="n">scale_type_size</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float8_e4m3fnuz</span><span class="p">)</span><span class="o">.</span><span class="n">element_size</span><span class="p">(),</span>
+    <span class="n">max_token_type_size</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span><span class="o">.</span><span class="n">element_size</span><span class="p">(),</span>
+    <span class="n">max_num_inp_token_per_rank</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span>
+    <span class="n">num_experts_per_rank</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>   <span class="c1"># 256 experts / 8 GPUs</span>
+    <span class="n">num_experts_per_token</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>   <span class="c1"># Top-8 routing</span>
+    <span class="n">kernel_type</span><span class="o">=</span><span class="n">mori</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">EpDispatchCombineKernelType</span><span class="o">.</span><span class="n">IntraNode</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p><strong>Inter-node example</strong> (16 GPUs across 2 nodes):</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">config</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">EpDispatchCombineConfig</span><span class="p">(</span>
+    <span class="n">data_type</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>
+    <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">,</span>
+    <span class="n">world_size</span><span class="o">=</span><span class="mi">16</span><span class="p">,</span>
+    <span class="n">hidden_dim</span><span class="o">=</span><span class="mi">7168</span><span class="p">,</span>
+    <span class="n">scale_dim</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+    <span class="n">scale_type_size</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float8_e4m3fnuz</span><span class="p">)</span><span class="o">.</span><span class="n">element_size</span><span class="p">(),</span>
+    <span class="n">max_token_type_size</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span><span class="o">.</span><span class="n">element_size</span><span class="p">(),</span>
+    <span class="n">max_num_inp_token_per_rank</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span>
+    <span class="n">num_experts_per_rank</span><span class="o">=</span><span class="mi">16</span><span class="p">,</span>   <span class="c1"># 256 experts / 16 GPUs</span>
+    <span class="n">num_experts_per_token</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+    <span class="n">kernel_type</span><span class="o">=</span><span class="n">mori</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">EpDispatchCombineKernelType</span><span class="o">.</span><span class="n">InterNodeV1</span><span class="p">,</span>
+    <span class="n">gpu_per_node</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+    <span class="n">rdma_block_num</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>         <span class="c1"># Blocks dedicated to RDMA</span>
+    <span class="n">block_num</span><span class="o">=</span><span class="mi">96</span><span class="p">,</span>              <span class="c1"># Total blocks</span>
+    <span class="n">warp_num_per_block</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</section>
+</section>
+<hr class="docutils" />
+<section id="operator-api">
+<h2>3. Operator API<a class="headerlink" href="#operator-api" title="Link to this heading"></a></h2>
+<section id="epdispatchcombineop">
+<h3>EpDispatchCombineOp<a class="headerlink" href="#epdispatchcombineop" title="Link to this heading"></a></h3>
+<p>Create the operator with a config:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">op</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">EpDispatchCombineOp</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="dispatch">
+<h3>dispatch()<a class="headerlink" href="#dispatch" title="Link to this heading"></a></h3>
+<p>Route input tokens to their assigned expert ranks.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">dispatch_output</span><span class="p">,</span> <span class="n">dispatch_weights</span><span class="p">,</span> <span class="n">dispatch_scales</span><span class="p">,</span> <span class="n">dispatch_indices</span><span class="p">,</span> <span class="n">recv_num_token</span> <span class="o">=</span> \
+    <span class="n">op</span><span class="o">.</span><span class="n">dispatch</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">scales</span><span class="p">,</span> <span class="n">indices</span><span class="p">,</span>
+                <span class="n">block_num</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">rdma_block_num</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">warp_per_block</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+</pre></div>
+</div>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Parameter</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">input</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch.Tensor</span></code></p></td>
+<td><p>Input tokens <code class="docutils literal notranslate"><span class="pre">[num_tokens,</span> <span class="pre">hidden_dim]</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">weights</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch.Tensor</span></code></p></td>
+<td><p>Expert weights <code class="docutils literal notranslate"><span class="pre">[num_tokens,</span> <span class="pre">num_experts_per_token]</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">scales</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch.Tensor</span></code></p></td>
+<td><p>Quantization scales <code class="docutils literal notranslate"><span class="pre">[num_tokens,</span> <span class="pre">scale_dim]</span></code> (pass empty tensor if <code class="docutils literal notranslate"><span class="pre">scale_dim=0</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">indices</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch.Tensor</span></code></p></td>
+<td><p>Top-K expert indices <code class="docutils literal notranslate"><span class="pre">[num_tokens,</span> <span class="pre">num_experts_per_token]</span></code>, dtype <code class="docutils literal notranslate"><span class="pre">int32</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">block_num</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p>Override <code class="docutils literal notranslate"><span class="pre">config.block_num</span></code> if &gt; 0</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">rdma_block_num</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p>Override <code class="docutils literal notranslate"><span class="pre">config.rdma_block_num</span></code> if &gt; 0</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">warp_per_block</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p>Override <code class="docutils literal notranslate"><span class="pre">config.warp_num_per_block</span></code> if &gt; 0</p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> Tuple of 5 tensors:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">dispatch_output</span></code> — Received tokens for this rank’s experts <code class="docutils literal notranslate"><span class="pre">[recv_tokens,</span> <span class="pre">hidden_dim]</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">dispatch_weights</span></code> — Corresponding weights <code class="docutils literal notranslate"><span class="pre">[recv_tokens,</span> <span class="pre">num_experts_per_token]</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">dispatch_scales</span></code> — Corresponding scales <code class="docutils literal notranslate"><span class="pre">[recv_tokens,</span> <span class="pre">scale_dim]</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">dispatch_indices</span></code> — Corresponding expert indices <code class="docutils literal notranslate"><span class="pre">[recv_tokens,</span> <span class="pre">num_experts_per_token]</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">recv_num_token</span></code> — Number of tokens received (1-element tensor)</p></li>
+</ul>
+</section>
+<section id="combine">
+<h3>combine()<a class="headerlink" href="#combine" title="Link to this heading"></a></h3>
+<p>Collect expert outputs and route them back to their original ranks.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">combine_output</span><span class="p">,</span> <span class="n">combine_weights</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">combine</span><span class="p">(</span>
+    <span class="nb">input</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">indices</span><span class="p">,</span>
+    <span class="n">block_num</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">rdma_block_num</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">warp_per_block</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span>
+    <span class="n">use_external_inp_buf</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">call_reset</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</pre></div>
+</div>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Parameter</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">input</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch.Tensor</span></code></p></td>
+<td><p>Expert output tokens</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">weights</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch.Tensor</span></code></p></td>
+<td><p>Expert weights for weighted combination</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">indices</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch.Tensor</span></code></p></td>
+<td><p>Top-K expert indices (same as dispatch)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">use_external_inp_buf</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p>Override <code class="docutils literal notranslate"><span class="pre">config.use_external_inp_buf</span></code>: 0=zero-copy, 1=external buffer</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">call_reset</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">bool</span></code></p></td>
+<td><p>Call <code class="docutils literal notranslate"><span class="pre">reset()</span></code> automatically after combine</p></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> Tuple of 2 tensors:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">combine_output</span></code> — Reconstructed tokens at original positions <code class="docutils literal notranslate"><span class="pre">[num_tokens,</span> <span class="pre">hidden_dim]</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">combine_weights</span></code> — Reconstructed weights <code class="docutils literal notranslate"><span class="pre">[num_tokens,</span> <span class="pre">num_experts_per_token]</span></code></p></li>
+</ul>
+</section>
+<section id="split-dispatch-combine-send-recv">
+<h3>Split dispatch/combine (send + recv)<a class="headerlink" href="#split-dispatch-combine-send-recv" title="Link to this heading"></a></h3>
+<p>For overlapping communication with computation, dispatch and combine can be split into separate send and receive phases:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Dispatch: send phase returns the same 5 values as dispatch()</span>
+<span class="n">dispatch_output</span><span class="p">,</span> <span class="n">dispatch_weights</span><span class="p">,</span> <span class="n">dispatch_scales</span><span class="p">,</span> <span class="n">dispatch_indices</span><span class="p">,</span> <span class="n">recv_num_token</span> <span class="o">=</span> \
+    <span class="n">op</span><span class="o">.</span><span class="n">dispatch_send</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">scales</span><span class="p">,</span> <span class="n">indices</span><span class="p">)</span>
+<span class="c1"># Receive phase (completes the receive-side processing, returns None)</span>
+<span class="n">op</span><span class="o">.</span><span class="n">dispatch_recv</span><span class="p">()</span>
+
+<span class="c1"># Combine: send phase returns the same 2 values as combine()</span>
+<span class="n">combine_output</span><span class="p">,</span> <span class="n">combine_weights</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">combine_send</span><span class="p">(</span><span class="n">expert_output</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">indices</span><span class="p">)</span>
+<span class="c1"># Receive phase (completes the receive-side processing, returns None)</span>
+<span class="n">op</span><span class="o">.</span><span class="n">combine_recv</span><span class="p">()</span>
+</pre></div>
+</div>
+<blockquote>
+<div><p><strong>Note:</strong> <code class="docutils literal notranslate"><span class="pre">dispatch_send()</span></code> delegates to <code class="docutils literal notranslate"><span class="pre">dispatch()</span></code> internally. <code class="docutils literal notranslate"><span class="pre">dispatch_recv()</span></code> and <code class="docutils literal notranslate"><span class="pre">combine_recv()</span></code> perform receive-side processing and return <code class="docutils literal notranslate"><span class="pre">None</span></code>.</p>
+</div></blockquote>
+</section>
+<section id="reset">
+<h3>reset()<a class="headerlink" href="#reset" title="Link to this heading"></a></h3>
+<p>Reset internal state. Must be called between iterations (unless <code class="docutils literal notranslate"><span class="pre">call_reset=True</span></code> was passed to <code class="docutils literal notranslate"><span class="pre">combine()</span></code>).</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">op</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>
+</pre></div>
+</div>
+</section>
+<section id="get-dispatch-src-token-pos">
+<h3>get_dispatch_src_token_pos()<a class="headerlink" href="#get-dispatch-src-token-pos" title="Link to this heading"></a></h3>
+<p>Get the source position of each dispatched token (for correctness verification).</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="n">src_token_pos</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">get_dispatch_src_token_pos</span><span class="p">()</span>
+<span class="c1"># src_token_pos[i] = src_rank * max_num_inp_token_per_rank + src_token_id</span>
+</pre></div>
+</div>
+</section>
+<section id="get-registered-combine-input-buffer">
+<h3>get_registered_combine_input_buffer()<a class="headerlink" href="#get-registered-combine-input-buffer" title="Link to this heading"></a></h3>
+<p>Get the pre-registered combine input buffer for zero-copy mode (<code class="docutils literal notranslate"><span class="pre">use_external_inp_buf=False</span></code>).</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">combine_buf</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">get_registered_combine_input_buffer</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span>
+<span class="n">combine_buf</span><span class="p">[:</span><span class="n">recv_num_token</span><span class="p">,</span> <span class="p">:]</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">expert_output</span><span class="p">[:</span><span class="n">recv_num_token</span><span class="p">,</span> <span class="p">:])</span>
+</pre></div>
+</div>
+</section>
+</section>
+<hr class="docutils" />
+<section id="standard-moe-compatibility-deepep">
+<h2>4. Standard MoE Compatibility (DeepEP)<a class="headerlink" href="#standard-moe-compatibility-deepep" title="Link to this heading"></a></h2>
+<p>MORI-EP provides DeepEP-compatible APIs for frameworks that use standard 3D MoE tensor layouts. These require building with <code class="docutils literal notranslate"><span class="pre">ENABLE_STANDARD_MOE_ADAPT=ON</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">ENABLE_STANDARD_MOE_ADAPT</span><span class="o">=</span>ON<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.
+</pre></div>
+</div>
+<section id="dispatch-standard-moe">
+<h3>dispatch_standard_moe()<a class="headerlink" href="#dispatch-standard-moe" title="Link to this heading"></a></h3>
+<p>Combined dispatch + format conversion in a single launch:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">result</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">dispatch_standard_moe</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">scales</span><span class="p">,</span> <span class="n">indices</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="combine-standard-moe">
+<h3>combine_standard_moe()<a class="headerlink" href="#combine-standard-moe" title="Link to this heading"></a></h3>
+<p>Combined combine with standard MoE input format:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">output</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">combine_standard_moe</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">indices</span><span class="p">,</span> <span class="n">call_reset</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="convert-dispatch-output">
+<h3>convert_dispatch_output()<a class="headerlink" href="#convert-dispatch-output" title="Link to this heading"></a></h3>
+<p>Convert MORI’s 2D dispatch output to standard 3D MoE layout:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">packed_recv_x</span><span class="p">,</span> <span class="n">packed_recv_count</span><span class="p">,</span> <span class="n">packed_recv_src_info</span><span class="p">,</span> <span class="n">packed_recv_layout_range</span> <span class="o">=</span> \
+    <span class="n">op</span><span class="o">.</span><span class="n">convert_dispatch_output</span><span class="p">(</span><span class="n">dispatch_out_x</span><span class="p">,</span> <span class="n">dispatch_out_topk_idx</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="convert-combine-input">
+<h3>convert_combine_input()<a class="headerlink" href="#convert-combine-input" title="Link to this heading"></a></h3>
+<p>Prepare standard MoE inputs for MORI combine:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">converted</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">convert_combine_input</span><span class="p">(</span><span class="n">packed_recv_x</span><span class="p">,</span> <span class="n">packed_recv_src_info</span><span class="p">,</span> <span class="n">packed_recv_layout_range</span><span class="p">)</span>
+</pre></div>
+</div>
+<blockquote>
+<div><p><strong>Note:</strong> If these methods raise <code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code>, rebuild MORI with <code class="docutils literal notranslate"><span class="pre">ENABLE_STANDARD_MOE_ADAPT=ON</span></code>.</p>
+</div></blockquote>
+</section>
+</section>
+<hr class="docutils" />
+<section id="initialization">
+<h2>5. Initialization<a class="headerlink" href="#initialization" title="Link to this heading"></a></h2>
+<p>MORI-EP requires symmetric memory (shmem) initialization before creating any <code class="docutils literal notranslate"><span class="pre">EpDispatchCombineOp</span></code>. There are two initialization methods:</p>
+<section id="method-1-pytorch-process-group-recommended">
+<h3>Method 1: PyTorch Process Group (Recommended)<a class="headerlink" href="#method-1-pytorch-process-group-recommended" title="Link to this heading"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch.distributed</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dist</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">mori</span>
+
+<span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">&quot;MORI_SHMEM_HEAP_SIZE&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;6G&quot;</span>
+
+<span class="c1"># Initialize PyTorch distributed</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="n">rank</span><span class="p">)</span>
+<span class="n">dist</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span><span class="n">backend</span><span class="o">=</span><span class="s2">&quot;cpu:gloo,cuda:nccl&quot;</span><span class="p">,</span> <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span><span class="o">=</span><span class="n">world_size</span><span class="p">)</span>
+
+<span class="c1"># Register process group and initialize shmem</span>
+<span class="n">world_group</span> <span class="o">=</span> <span class="n">dist</span><span class="o">.</span><span class="n">group</span><span class="o">.</span><span class="n">WORLD</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_distributed_c10d</span><span class="o">.</span><span class="n">_register_process_group</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">,</span> <span class="n">world_group</span><span class="p">)</span>
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_torch_process_group_init</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">)</span>
+
+<span class="c1"># ... use MORI-EP ...</span>
+
+<span class="c1"># Cleanup</span>
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_finalize</span><span class="p">()</span>
+<span class="n">dist</span><span class="o">.</span><span class="n">destroy_process_group</span><span class="p">()</span>
+</pre></div>
+</div>
+</section>
+<section id="method-2-unique-id-no-pytorch-distributed">
+<h3>Method 2: Unique ID (No PyTorch Distributed)<a class="headerlink" href="#method-2-unique-id-no-pytorch-distributed" title="Link to this heading"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">mori</span>
+
+<span class="c1"># Rank 0 generates unique ID and broadcasts to all ranks</span>
+<span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+    <span class="n">unique_id</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_get_unique_id</span><span class="p">()</span>
+    <span class="c1"># broadcast unique_id to all ranks (e.g., via MPI, TCP, file)</span>
+
+<span class="c1"># All ranks initialize with the unique ID</span>
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_init_attr</span><span class="p">(</span>
+    <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">MORI_SHMEM_INIT_WITH_UNIQUEID</span><span class="p">,</span>
+    <span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span><span class="p">,</span> <span class="n">unique_id</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</section>
+</section>
+<hr class="docutils" />
+<section id="launch-configuration">
+<h2>6. Launch Configuration<a class="headerlink" href="#launch-configuration" title="Link to this heading"></a></h2>
+<section id="manual-mode-default">
+<h3>Manual Mode (Default)<a class="headerlink" href="#manual-mode-default" title="Link to this heading"></a></h3>
+<p>Launch parameters are taken from <code class="docutils literal notranslate"><span class="pre">EpDispatchCombineConfig</span></code> defaults or per-call overrides:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Use config defaults (block_num=80, warp_num_per_block=8)</span>
+<span class="n">op</span><span class="o">.</span><span class="n">dispatch</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">scales</span><span class="p">,</span> <span class="n">indices</span><span class="p">)</span>
+
+<span class="c1"># Override per call</span>
+<span class="n">op</span><span class="o">.</span><span class="n">dispatch</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">scales</span><span class="p">,</span> <span class="n">indices</span><span class="p">,</span> <span class="n">block_num</span><span class="o">=</span><span class="mi">128</span><span class="p">,</span> <span class="n">warp_per_block</span><span class="o">=</span><span class="mi">16</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="auto-mode">
+<h3>Auto Mode<a class="headerlink" href="#auto-mode" title="Link to this heading"></a></h3>
+<p>Set <code class="docutils literal notranslate"><span class="pre">MORI_EP_LAUNCH_CONFIG_MODE=AUTO</span></code> to use pre-tuned launch parameters:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MORI_EP_LAUNCH_CONFIG_MODE</span><span class="o">=</span>AUTO
+</pre></div>
+</div>
+<p>Auto mode selects parameters based on kernel type:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Kernel Type</p></th>
+<th class="head"><p>block_num</p></th>
+<th class="head"><p>rdma_block_num</p></th>
+<th class="head"><p>warp_per_block</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>InterNodeV1, InterNodeV1LL</p></td>
+<td><p>96</p></td>
+<td><p>64</p></td>
+<td><p>8</p></td>
+</tr>
+<tr class="row-odd"><td><p>IntraNode, InterNode, AsyncLL</p></td>
+<td><p>128</p></td>
+<td><p>0</p></td>
+<td><p>16</p></td>
+</tr>
+</tbody>
+</table>
+<p>When auto mode is active, per-call <code class="docutils literal notranslate"><span class="pre">block_num</span></code>/<code class="docutils literal notranslate"><span class="pre">rdma_block_num</span></code>/<code class="docutils literal notranslate"><span class="pre">warp_per_block</span></code> arguments are ignored.</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="complete-example">
+<h2>7. Complete Example<a class="headerlink" href="#complete-example" title="Link to this heading"></a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch.distributed</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dist</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">mori</span>
+
+<span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">&quot;MORI_SHMEM_HEAP_SIZE&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;4G&quot;</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">run_ep</span><span class="p">(</span><span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span><span class="p">):</span>
+    <span class="c1"># Setup</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="n">rank</span><span class="p">)</span>
+    <span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">&quot;cuda&quot;</span><span class="p">,</span> <span class="n">rank</span><span class="p">)</span>
+    <span class="n">dist</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span>
+        <span class="n">backend</span><span class="o">=</span><span class="s2">&quot;cpu:gloo,cuda:nccl&quot;</span><span class="p">,</span>
+        <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span><span class="o">=</span><span class="n">world_size</span><span class="p">,</span>
+        <span class="n">device_id</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">world_group</span> <span class="o">=</span> <span class="n">dist</span><span class="o">.</span><span class="n">group</span><span class="o">.</span><span class="n">WORLD</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_distributed_c10d</span><span class="o">.</span><span class="n">_register_process_group</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">,</span> <span class="n">world_group</span><span class="p">)</span>
+    <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_torch_process_group_init</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">)</span>
+
+    <span class="c1"># Configuration</span>
+    <span class="n">config</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">EpDispatchCombineConfig</span><span class="p">(</span>
+        <span class="n">data_type</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>
+        <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">,</span>
+        <span class="n">world_size</span><span class="o">=</span><span class="n">world_size</span><span class="p">,</span>
+        <span class="n">hidden_dim</span><span class="o">=</span><span class="mi">7168</span><span class="p">,</span>
+        <span class="n">scale_dim</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+        <span class="n">scale_type_size</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float8_e4m3fnuz</span><span class="p">)</span><span class="o">.</span><span class="n">element_size</span><span class="p">(),</span>
+        <span class="n">max_token_type_size</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span><span class="o">.</span><span class="n">element_size</span><span class="p">(),</span>
+        <span class="n">max_num_inp_token_per_rank</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span>
+        <span class="n">num_experts_per_rank</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
+        <span class="n">num_experts_per_token</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+        <span class="n">use_external_inp_buf</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">op</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">EpDispatchCombineOp</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+
+    <span class="c1"># Generate test data</span>
+    <span class="n">num_tokens</span> <span class="o">=</span> <span class="mi">128</span>
+    <span class="n">input_data</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">num_tokens</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">hidden_dim</span><span class="p">,</span>
+                             <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+    <span class="n">weights</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="n">num_tokens</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">num_experts_per_token</span><span class="p">,</span>
+                         <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+    <span class="n">scales</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">num_tokens</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float8_e4m3fnuz</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+
+    <span class="c1"># Random top-K expert selection</span>
+    <span class="n">indices</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">([</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">randperm</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">num_experts_per_rank</span> <span class="o">*</span> <span class="n">world_size</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+        <span class="p">[:</span><span class="n">config</span><span class="o">.</span><span class="n">num_experts_per_token</span><span class="p">]</span>
+        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_tokens</span><span class="p">)</span>
+    <span class="p">])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+
+    <span class="c1"># Dispatch tokens to experts</span>
+    <span class="n">dispatch_out</span><span class="p">,</span> <span class="n">dispatch_w</span><span class="p">,</span> <span class="n">dispatch_s</span><span class="p">,</span> <span class="n">dispatch_idx</span><span class="p">,</span> <span class="n">recv_count</span> <span class="o">=</span> \
+        <span class="n">op</span><span class="o">.</span><span class="n">dispatch</span><span class="p">(</span><span class="n">input_data</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">scales</span><span class="p">,</span> <span class="n">indices</span><span class="p">,</span>
+                    <span class="n">block_num</span><span class="o">=</span><span class="mi">80</span><span class="p">,</span> <span class="n">warp_per_block</span><span class="o">=</span><span class="mi">16</span><span class="p">)</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+
+    <span class="n">total_recv</span> <span class="o">=</span> <span class="n">recv_count</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Rank </span><span class="si">{</span><span class="n">rank</span><span class="si">}</span><span class="s2">: sent </span><span class="si">{</span><span class="n">num_tokens</span><span class="si">}</span><span class="s2"> tokens, received </span><span class="si">{</span><span class="n">total_recv</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="c1"># Simulate expert computation (identity for testing)</span>
+    <span class="n">expert_output</span> <span class="o">=</span> <span class="n">dispatch_out</span><span class="p">[:</span><span class="n">total_recv</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+
+    <span class="c1"># Combine results back</span>
+    <span class="n">combine_out</span><span class="p">,</span> <span class="n">combine_w</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">combine</span><span class="p">(</span>
+        <span class="n">expert_output</span><span class="p">,</span> <span class="n">dispatch_w</span><span class="p">,</span> <span class="n">indices</span><span class="p">,</span>
+        <span class="n">block_num</span><span class="o">=</span><span class="mi">80</span><span class="p">,</span> <span class="n">warp_per_block</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+        <span class="n">call_reset</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>  <span class="c1"># reset automatically</span>
+    <span class="p">)</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+
+    <span class="c1"># Cleanup</span>
+    <span class="k">del</span> <span class="n">op</span>
+    <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_finalize</span><span class="p">()</span>
+    <span class="n">dist</span><span class="o">.</span><span class="n">destroy_process_group</span><span class="p">()</span>
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+    <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">&quot;MASTER_ADDR&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;localhost&quot;</span>
+    <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">&quot;MASTER_PORT&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;12355&quot;</span>
+    <span class="n">world_size</span> <span class="o">=</span> <span class="mi">8</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">multiprocessing</span><span class="o">.</span><span class="n">spawn</span><span class="p">(</span><span class="n">run_ep</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">world_size</span><span class="p">,),</span> <span class="n">nprocs</span><span class="o">=</span><span class="n">world_size</span><span class="p">,</span> <span class="n">join</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<hr class="docutils" />
+<section id="environment-variables">
+<h2>8. Environment Variables<a class="headerlink" href="#environment-variables" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_SHMEM_HEAP_SIZE</span></code></p></td>
+<td><p>—</p></td>
+<td><p>Symmetric heap size (e.g., <code class="docutils literal notranslate"><span class="pre">&quot;6G&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;2G&quot;</span></code>). Must be set before shmem init.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_RDMA_DEVICES</span></code></p></td>
+<td><p>all available</p></td>
+<td><p>RDMA NIC selection. Include: <code class="docutils literal notranslate"><span class="pre">mlx5_0,mlx5_1</span></code>. Exclude: <code class="docutils literal notranslate"><span class="pre">^mlx5_2,mlx5_3</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_EP_LAUNCH_CONFIG_MODE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;MANUAL&quot;</span></code></p></td>
+<td><p>Launch config mode: <code class="docutils literal notranslate"><span class="pre">&quot;MANUAL&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;AUTO&quot;</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">GLOO_SOCKET_IFNAME</span></code></p></td>
+<td><p>—</p></td>
+<td><p>TCP interface for torch distributed (e.g., <code class="docutils literal notranslate"><span class="pre">ens14np0</span></code>)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MASTER_ADDR</span></code></p></td>
+<td><p>—</p></td>
+<td><p>Torch distributed master address</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MASTER_PORT</span></code></p></td>
+<td><p>—</p></td>
+<td><p>Torch distributed master port</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<hr class="docutils" />
+<section id="benchmarking">
+<h2>9. Benchmarking<a class="headerlink" href="#benchmarking" title="Link to this heading"></a></h2>
+<section id="intra-node">
+<h3>Intra-node<a class="headerlink" href="#intra-node" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>/path/to/mori
+python3<span class="w"> </span>tests/python/ops/bench_dispatch_combine.py
+</pre></div>
+</div>
+</section>
+<section id="inter-node">
+<h3>Inter-node<a class="headerlink" href="#inter-node" title="Link to this heading"></a></h3>
+<p>Run on each node (replace <code class="docutils literal notranslate"><span class="pre">node_rank</span></code> and <code class="docutils literal notranslate"><span class="pre">master_addr</span></code>):</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">GLOO_SOCKET_IFNAME</span><span class="o">=</span>ens14np0
+<span class="nb">export</span><span class="w"> </span><span class="nv">MORI_RDMA_DEVICES</span><span class="o">=</span>^mlx5_0,mlx5_1<span class="w">  </span><span class="c1"># Optional: exclude specific NICs</span>
+
+torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;10.194.129.65&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>examples/ops/dispatch_combine/test_dispatch_combine_internode.py<span class="w"> </span>--bench
+</pre></div>
+</div>
+<p>The benchmark output reports total tokens received, RDMA token count, and total bandwidth (XGMI + RDMA). To calculate RDMA-only bandwidth:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>RDMA BW = Total BW × (RDMA tokens / Total tokens)
+</pre></div>
+</div>
+</section>
+<section id="reference-performance-deepseek-v3-config">
+<h3>Reference Performance (DeepSeek V3 config)<a class="headerlink" href="#reference-performance-deepseek-v3-config" title="Link to this heading"></a></h3>
+<p>4096 tokens, 7168 hidden, top-8, FP8 dispatch + BF16 combine:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Kernel</p></th>
+<th class="head"><p>CUs</p></th>
+<th class="head"><p>Dispatch XGMI</p></th>
+<th class="head"><p>Dispatch RDMA</p></th>
+<th class="head"><p>Combine XGMI</p></th>
+<th class="head"><p>Combine RDMA</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>EP8 (IntraNode)</p></td>
+<td><p>80</p></td>
+<td><p>307 GB/s</p></td>
+<td><p>—</p></td>
+<td><p>330 GB/s</p></td>
+<td><p>—</p></td>
+</tr>
+<tr class="row-odd"><td><p>EP16-V1 (InterNodeV1)</p></td>
+<td><p>80</p></td>
+<td><p>208 GB/s</p></td>
+<td><p>63 GB/s</p></td>
+<td><p>161 GB/s</p></td>
+<td><p>49 GB/s</p></td>
+</tr>
+<tr class="row-even"><td><p>EP32-V1-LL (InterNodeV1LL)</p></td>
+<td><p>32</p></td>
+<td><p>103 GB/s</p></td>
+<td><p>57 GB/s</p></td>
+<td><p>91 GB/s</p></td>
+<td><p>50 GB/s</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<hr class="docutils" />
+<section id="profiling-with-mori-viz">
+<h2>10. Profiling with MORI-VIZ<a class="headerlink" href="#profiling-with-mori-viz" title="Link to this heading"></a></h2>
+<p>Build with profiling enabled:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">ENABLE_PROFILER</span><span class="o">=</span>ON<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.
+</pre></div>
+</div>
+<p>Capture and export a trace:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.kernel_profiler</span><span class="w"> </span><span class="kn">import</span> <span class="n">export_to_perfetto</span>
+
+<span class="c1"># Run dispatch/combine, then:</span>
+<span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="p">,</span> <span class="s2">&quot;get_debug_time_buf&quot;</span><span class="p">):</span>
+    <span class="n">trace_buffer</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="o">.</span><span class="n">get_debug_time_buf</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">_handle</span><span class="p">)</span>
+    <span class="n">export_to_perfetto</span><span class="p">(</span><span class="n">trace_buffer</span><span class="p">,</span> <span class="s2">&quot;ep_trace.json&quot;</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Visualize at <a class="reference external" href="https://ui.perfetto.dev/">ui.perfetto.dev</a>. See <a class="reference internal" href="PROFILER.html"><span class="std std-doc">PROFILER.md</span></a> for full profiler documentation.</p>
+</section>
+<hr class="docutils" />
+<section id="framework-integration">
+<h2>11. Framework Integration<a class="headerlink" href="#framework-integration" title="Link to this heading"></a></h2>
+<p>MORI-EP is integrated in several LLM inference frameworks:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Framework</p></th>
+<th class="head"><p>Integration Point</p></th>
+<th class="head"><p>Notes</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><a class="reference external" href="https://github.com/ROCm/aiter">AITER</a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">aiter/moe_op/mori_all2all.py</span></code></p></td>
+<td><p>MoriAll2AllManager wraps dispatch/combine for FusedMoE</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference external" href="https://github.com/ROCm/ATOM">ATOM</a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">atom/model_ops/fused_moe/moe.py</span></code></p></td>
+<td><p>Expert parallelism with FusedMoEParallelConfig</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference external" href="https://github.com/vllm-project/vllm">vLLM</a></p></td>
+<td><p>MoE expert parallelism</p></td>
+<td><p>Dispatch/combine for distributed MoE</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference external" href="https://github.com/sgl-project/sglang">SGLang</a></p></td>
+<td><p>MoE expert parallelism</p></td>
+<td><p>Dispatch/combine for distributed MoE</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<hr class="docutils" />
+<section id="build-options">
+<h2>Build Options<a class="headerlink" href="#build-options" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>CMake Option</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">BUILD_OPS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ON</span></code></p></td>
+<td><p>Build MORI-EP dispatch/combine kernels</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">BUILD_SHMEM</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ON</span></code></p></td>
+<td><p>Build symmetric memory library</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">BUILD_IO</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ON</span></code></p></td>
+<td><p>Build MORI-IO library</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">BUILD_PYBINDS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ON</span></code></p></td>
+<td><p>Build Python bindings</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ENABLE_PROFILER</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">OFF</span></code></p></td>
+<td><p>Enable MORI-VIZ kernel profiler</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ENABLE_STANDARD_MOE_ADAPT</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">OFF</span></code></p></td>
+<td><p>Enable DeepEP-compatible standard MoE APIs</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ENABLE_DEBUG_PRINTF</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">OFF</span></code></p></td>
+<td><p>Enable debug printf in device kernels</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">USE_ROCM</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ON</span></code></p></td>
+<td><p>Build for ROCm/HIP (vs. CUDA)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">USE_BNXT</span></code></p></td>
+<td><p>auto-detected</p></td>
+<td><p>Broadcom Thor2 NIC support (enabled automatically if <code class="docutils literal notranslate"><span class="pre">libbnxt_re.so</span></code> and headers are found)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">USE_IONIC</span></code></p></td>
+<td><p>auto-detected</p></td>
+<td><p>AMD Pollara (AINIC) NIC support (enabled automatically if <code class="docutils literal notranslate"><span class="pre">libionic.so</span></code> is found)</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<hr class="docutils" />
+<section id="source-files">
+<h2>Source Files<a class="headerlink" href="#source-files" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>File</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">python/mori/ops/dispatch_combine.py</span></code></p></td>
+<td><p>Python API: <code class="docutils literal notranslate"><span class="pre">EpDispatchCombineConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">EpDispatchCombineOp</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">python/mori/ops/__init__.py</span></code></p></td>
+<td><p>Public exports</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">python/mori/shmem/api.py</span></code></p></td>
+<td><p>Shmem Python API</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">include/mori/ops/dispatch_combine/dispatch_combine.hpp</span></code></p></td>
+<td><p>C++ header: config, handle, kernel args</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">src/ops/dispatch_combine/dispatch_combine.cpp</span></code></p></td>
+<td><p>Core dispatch/combine implementation</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">src/ops/dispatch_combine/internode_v1.cpp</span></code></p></td>
+<td><p>InterNodeV1/V1LL kernels</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">src/ops/dispatch_combine/low_latency_async.cpp</span></code></p></td>
+<td><p>AsyncLL kernels</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">src/pybind/pybind.cpp</span></code></p></td>
+<td><p>Python module entry point</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">src/pybind/mori.cpp</span></code></p></td>
+<td><p>Ops/Shmem/IO binding registration</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">examples/ops/dispatch_combine/test_dispatch_combine.py</span></code></p></td>
+<td><p>Complete Python example</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">examples/ops/dispatch_combine/test_dispatch_combine_internode.py</span></code></p></td>
+<td><p>Inter-node example</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tests/python/ops/test_dispatch_combine.py</span></code></p></td>
+<td><p>Correctness tests</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tests/python/ops/bench_dispatch_combine.py</span></code></p></td>
+<td><p>Performance benchmarks</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="quickstart.html" class="btn btn-neutral float-left" title="Quickstart" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="MORI-SHMEM-GUIDE.html" class="btn btn-neutral float-right" title="MORI Shmem Guide" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

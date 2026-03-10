@@ -1,0 +1,602 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MORI-IO Benchmark &mdash; MORI 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=01f34227"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Communication APIs" href="api/communication.html" />
+    <link rel="prev" title="MORI-EP Benchmark" href="MORI-EP-BENCHMARK.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#from-source">From Source</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#verification">Verification</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ep-dispatch-and-combine">MORI-EP: Dispatch and Combine</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-io-point-to-point-transfers">MORI-IO: Point-to-Point Transfers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-shmem-symmetric-memory">MORI Shmem: Symmetric Memory</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ir-device-bitcode-for-gpu-kernels">MORI-IR: Device Bitcode for GPU Kernels</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#profiling-with-mori-viz">Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">MORI-EP User Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#kernel-types">1. Kernel Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#configuration">2. Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineconfig">EpDispatchCombineConfig</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#operator-api">3. Operator API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineop">EpDispatchCombineOp</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch">dispatch()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine">combine()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#split-dispatch-combine-send-recv">Split dispatch/combine (send + recv)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reset">reset()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-dispatch-src-token-pos">get_dispatch_src_token_pos()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-registered-combine-input-buffer">get_registered_combine_input_buffer()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#standard-moe-compatibility-deepep">4. Standard MoE Compatibility (DeepEP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch-standard-moe">dispatch_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine-standard-moe">combine_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-dispatch-output">convert_dispatch_output()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-combine-input">convert_combine_input()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#initialization">5. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#launch-configuration">6. Launch Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#manual-mode-default">Manual Mode (Default)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#auto-mode">Auto Mode</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#complete-example">7. Complete Example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#environment-variables">8. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#benchmarking">9. Benchmarking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node">Intra-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node">Inter-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reference-performance-deepseek-v3-config">Reference Performance (DeepSeek V3 config)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#profiling-with-mori-viz">10. Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#framework-integration">11. Framework Integration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#build-options">Build Options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">MORI Shmem Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-memory">Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#processing-element-pe">Processing Element (PE)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-heap">Symmetric Heap</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization">2. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-3-mpi-communicator-c-mpi-environments">Method 3: MPI Communicator (C++ / MPI environments)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-comparison">Initialization Comparison</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#finalization">Finalization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#query-apis">3. Query APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#memory-management">4. Memory Management</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#allocating-symmetric-memory">Allocating Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#freeing-symmetric-memory">Freeing Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#registering-existing-buffers">Registering Existing Buffers</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#p2p-address-translation">5. P2P Address Translation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#synchronization">6. Synchronization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#hip-module-init-triton-integration">7. HIP Module Init (Triton Integration)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-flags">8. Initialization Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IR-GUIDE.html">MORI-IR Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#host-side-python-api">1. Host-Side Python API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-framework-agnostic"><code class="docutils literal notranslate"><span class="pre">mori.ir</span></code> (framework-agnostic)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-triton-triton-specific-reference-backend"><code class="docutils literal notranslate"><span class="pre">mori.ir.triton</span></code> (Triton-specific reference backend)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-bitcode">2. Device Bitcode</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-functions">3. Device Functions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#query">Query</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#point-to-point">Point-to-Point</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-thread-warp-block">PutNbi (Thread / Warp / Block)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-with-signal">PutNbi with Signal</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#immediate-put">Immediate Put</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#atomics">Atomics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#wait">Wait</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#synchronization">Synchronization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-triton">4. Integration Example: Triton</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-raw-bitcode-no-framework">5. Integration Example: Raw Bitcode (no framework)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#bitcode-jit-compilation">6. Bitcode JIT Compilation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#testing">8. Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#known-limitations">Known Limitations</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">MORI-IO Introduction</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#design-concepts">Design &amp; Concepts</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#workflow">Workflow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#python-api-quick-reference">Python API Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#example-basic-read-write">Example: Basic Read/Write</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#environment-configuration">Environment &amp; Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ (Visualizer)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#instrumentation">Instrumentation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#include-headers">1. Include Headers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#define-profiler-context">2. Define Profiler Context</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#add-trace-points">3. Add Trace Points</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#build-code-generation">Build &amp; Code Generation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#enabling-the-profiler">Enabling the Profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#code-generation">Code Generation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#python-analysis">Python Analysis</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#device-side-elapsed-time-measurement">Device-side Elapsed Time Measurement</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#viewing-the-trace">Viewing the Trace</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#best-practices">Best Practices</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">MORI-EP Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#intra-node">Intra-node</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#inter-node">Inter-node</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nic-selection">NIC Selection</a></li>
+</ul>
+</li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">MORI-IO Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#benchmark-commands">Benchmark Commands</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#benchmark-arguments">Benchmark Arguments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#results-thor2-rdma-read">Results: Thor2 RDMA Read</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#results-thor2-rdma-write">Results: Thor2 RDMA Write</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#message-size-sweep">Message Size Sweep</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#batch-size-sweep">Batch Size Sweep</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#results-cx7-rdma-batch-size-1">Results: CX7 RDMA (Batch Size = 1)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#write">Write</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#read">Read</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ep-expert-parallelism">MORI-EP (Expert Parallelism)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-shmem-symmetric-memory">MORI Shmem (Symmetric Memory)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-io-point-to-point-i-o">MORI-IO (Point-to-Point I/O)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ir-device-bitcode-integration">MORI-IR (Device Bitcode Integration)</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">MORI-VIZ Kernel Profiler</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#usage">Usage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#export-to-perfetto">export_to_perfetto</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#c-profiler-apis">C++ Profiler APIs</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">MORI-IO Benchmark</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/MORI-IO-BENCHMARK.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="mori-io-benchmark">
+<h1>MORI-IO Benchmark<a class="headerlink" href="#mori-io-benchmark" title="Link to this heading"></a></h1>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#benchmark-commands"><span class="xref myst">Benchmark Commands</span></a></p></li>
+<li><p><a class="reference internal" href="#benchmark-arguments"><span class="xref myst">Benchmark Arguments</span></a></p></li>
+<li><p><a class="reference internal" href="#results-thor2-rdma-read"><span class="xref myst">Results: Thor2 RDMA Read</span></a></p></li>
+<li><p><a class="reference internal" href="#results-thor2-rdma-write"><span class="xref myst">Results: Thor2 RDMA Write</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#message-size-sweep"><span class="xref myst">Message Size Sweep</span></a></p></li>
+<li><p><a class="reference internal" href="#batch-size-sweep"><span class="xref myst">Batch Size Sweep</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#results-cx7-rdma-batch-size--1"><span class="xref myst">Results: CX7 RDMA (Batch Size = 1)</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#write"><span class="xref myst">Write</span></a></p></li>
+<li><p><a class="reference internal" href="#read"><span class="xref myst">Read</span></a></p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="benchmark-commands">
+<h2>Benchmark Commands<a class="headerlink" href="#benchmark-commands" title="Link to this heading"></a></h2>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>/path/to/mori
+<span class="nb">export</span><span class="w"> </span><span class="nv">PYTHONPATH</span><span class="o">=</span>/path/to/mori:<span class="nv">$PYTHONPATH</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">GLOO_SOCKET_IFNAME</span><span class="o">=</span>ens14np0<span class="w">  </span><span class="c1"># Set to your NIC interface</span>
+
+<span class="c1"># Run on two nodes (replace node_rank and master_addr)</span>
+torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;10.194.129.65&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">&quot;10.194.129.65&quot;</span>
+</pre></div>
+</div>
+</section>
+<section id="benchmark-arguments">
+<h2>Benchmark Arguments<a class="headerlink" href="#benchmark-arguments" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Argument</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--buffer-size</span></code></p></td>
+<td><p>Message size per transfer (bytes)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--all</span></code></p></td>
+<td><p>Sweep message size from 8B to 1MB</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--sweep-start-size</span></code></p></td>
+<td><p>Starting message size when using <code class="docutils literal notranslate"><span class="pre">--all</span></code> sweep</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--sweep-max-size</span></code></p></td>
+<td><p>Maximum message size when using <code class="docutils literal notranslate"><span class="pre">--all</span></code> sweep</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--all-batch</span></code></p></td>
+<td><p>Sweep batch size from 1 to 32768</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--transfer-batch-size</span></code></p></td>
+<td><p>Number of consecutive transfers</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--enable-batch-transfer</span></code></p></td>
+<td><p>Enable batch transfer mode</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--enable-sess</span></code></p></td>
+<td><p>Enable session transfer (lower latency)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--num-initiator-dev</span></code></p></td>
+<td><p>Number of initiator devices</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--num-target-dev</span></code></p></td>
+<td><p>Number of target devices</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--num-qp-per-transfer</span></code></p></td>
+<td><p>Number of queue pairs used</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--op-type</span></code></p></td>
+<td><p>Operation type: <code class="docutils literal notranslate"><span class="pre">read</span></code> or <code class="docutils literal notranslate"><span class="pre">write</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--poll_cq_mode</span></code></p></td>
+<td><p>CQ polling mode: <code class="docutils literal notranslate"><span class="pre">polling</span></code> or <code class="docutils literal notranslate"><span class="pre">event</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--num-worker-threads</span></code></p></td>
+<td><p>Number of worker threads</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--log-level</span></code></p></td>
+<td><p>Log level (e.g., <code class="docutils literal notranslate"><span class="pre">info</span></code>)</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="results-thor2-rdma-read">
+<h2>Results: Thor2 RDMA Read<a class="headerlink" href="#results-thor2-rdma-read" title="Link to this heading"></a></h2>
+<p><strong>Config:</strong> 8 initiator + 8 target devices, session enabled, batch transfer, 2 QPs per transfer</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">1</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;10.235.192.57&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">&quot;10.235.192.60&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--all<span class="w"> </span>--enable-sess<span class="w"> </span>--enable-batch-transfer<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--num-qp-per-transfer<span class="w"> </span><span class="m">2</span><span class="w"> </span>--num-target-dev<span class="w"> </span><span class="m">8</span><span class="w"> </span>--num-initiator-dev<span class="w"> </span><span class="m">8</span>
+</pre></div>
+</div>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="o">+--------------------------------------------------------------------------------------------+</span>
+<span class="o">|</span>                                      <span class="n">Initiator</span> <span class="n">Rank</span> <span class="mi">7</span>                                      <span class="o">|</span>
+<span class="o">+-------------+----------------+---------------+---------------+--------------+--------------+</span>
+<span class="o">|</span> <span class="n">MsgSize</span> <span class="p">(</span><span class="n">B</span><span class="p">)</span> <span class="o">|</span> <span class="n">TotalSize</span> <span class="p">(</span><span class="n">MB</span><span class="p">)</span> <span class="o">|</span> <span class="n">Max</span> <span class="n">BW</span> <span class="p">(</span><span class="n">GB</span><span class="o">/</span><span class="n">s</span><span class="p">)</span> <span class="o">|</span> <span class="n">Avg</span> <span class="n">Bw</span> <span class="p">(</span><span class="n">GB</span><span class="o">/</span><span class="n">s</span><span class="p">)</span> <span class="o">|</span> <span class="n">Min</span> <span class="n">Lat</span> <span class="p">(</span><span class="n">us</span><span class="p">)</span> <span class="o">|</span> <span class="n">Avg</span> <span class="n">Lat</span> <span class="p">(</span><span class="n">us</span><span class="p">)</span> <span class="o">|</span>
+<span class="o">+-------------+----------------+---------------+---------------+--------------+--------------+</span>
+<span class="o">|</span>      <span class="mi">8</span>      <span class="o">|</span>      <span class="mf">0.00</span>      <span class="o">|</span>      <span class="mf">0.02</span>     <span class="o">|</span>      <span class="mf">0.02</span>     <span class="o">|</span>    <span class="mf">113.73</span>    <span class="o">|</span>    <span class="mf">120.65</span>    <span class="o">|</span>
+<span class="o">|</span>      <span class="mi">16</span>     <span class="o">|</span>      <span class="mf">0.00</span>      <span class="o">|</span>      <span class="mf">0.04</span>     <span class="o">|</span>      <span class="mf">0.03</span>     <span class="o">|</span>    <span class="mf">113.96</span>    <span class="o">|</span>    <span class="mf">118.57</span>    <span class="o">|</span>
+<span class="o">|</span>      <span class="mi">32</span>     <span class="o">|</span>      <span class="mf">0.01</span>      <span class="o">|</span>      <span class="mf">0.07</span>     <span class="o">|</span>      <span class="mf">0.07</span>     <span class="o">|</span>    <span class="mf">113.49</span>    <span class="o">|</span>    <span class="mf">118.69</span>    <span class="o">|</span>
+<span class="o">|</span>      <span class="mi">64</span>     <span class="o">|</span>      <span class="mf">0.02</span>      <span class="o">|</span>      <span class="mf">0.14</span>     <span class="o">|</span>      <span class="mf">0.14</span>     <span class="o">|</span>    <span class="mf">114.44</span>    <span class="o">|</span>    <span class="mf">118.73</span>    <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">128</span>     <span class="o">|</span>      <span class="mf">0.03</span>      <span class="o">|</span>      <span class="mf">0.29</span>     <span class="o">|</span>      <span class="mf">0.27</span>     <span class="o">|</span>    <span class="mf">114.68</span>    <span class="o">|</span>    <span class="mf">119.34</span>    <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">256</span>     <span class="o">|</span>      <span class="mf">0.07</span>      <span class="o">|</span>      <span class="mf">0.57</span>     <span class="o">|</span>      <span class="mf">0.55</span>     <span class="o">|</span>    <span class="mf">114.44</span>    <span class="o">|</span>    <span class="mf">118.67</span>    <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">512</span>     <span class="o">|</span>      <span class="mf">0.13</span>      <span class="o">|</span>      <span class="mf">1.15</span>     <span class="o">|</span>      <span class="mf">1.11</span>     <span class="o">|</span>    <span class="mf">113.49</span>    <span class="o">|</span>    <span class="mf">118.18</span>    <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>      <span class="mf">0.26</span>      <span class="o">|</span>      <span class="mf">2.30</span>     <span class="o">|</span>      <span class="mf">2.23</span>     <span class="o">|</span>    <span class="mf">114.20</span>    <span class="o">|</span>    <span class="mf">117.78</span>    <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">2048</span>    <span class="o">|</span>      <span class="mf">0.52</span>      <span class="o">|</span>      <span class="mf">4.47</span>     <span class="o">|</span>      <span class="mf">4.31</span>     <span class="o">|</span>    <span class="mf">117.30</span>    <span class="o">|</span>    <span class="mf">121.52</span>    <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">4096</span>    <span class="o">|</span>      <span class="mf">1.05</span>      <span class="o">|</span>      <span class="mf">8.31</span>     <span class="o">|</span>      <span class="mf">8.01</span>     <span class="o">|</span>    <span class="mf">126.12</span>    <span class="o">|</span>    <span class="mf">130.95</span>    <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">8192</span>    <span class="o">|</span>      <span class="mf">2.10</span>      <span class="o">|</span>     <span class="mf">14.19</span>     <span class="o">|</span>     <span class="mf">13.77</span>     <span class="o">|</span>    <span class="mf">147.82</span>    <span class="o">|</span>    <span class="mf">152.34</span>    <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">16384</span>    <span class="o">|</span>      <span class="mf">4.19</span>      <span class="o">|</span>     <span class="mf">22.16</span>     <span class="o">|</span>     <span class="mf">21.56</span>     <span class="o">|</span>    <span class="mf">189.30</span>    <span class="o">|</span>    <span class="mf">194.58</span>    <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">32768</span>    <span class="o">|</span>      <span class="mf">8.39</span>      <span class="o">|</span>     <span class="mf">30.44</span>     <span class="o">|</span>     <span class="mf">29.84</span>     <span class="o">|</span>    <span class="mf">275.61</span>    <span class="o">|</span>    <span class="mf">281.09</span>    <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">65536</span>    <span class="o">|</span>     <span class="mf">16.78</span>      <span class="o">|</span>     <span class="mf">37.51</span>     <span class="o">|</span>     <span class="mf">36.55</span>     <span class="o">|</span>    <span class="mf">447.27</span>    <span class="o">|</span>    <span class="mf">458.96</span>    <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">131072</span>   <span class="o">|</span>     <span class="mf">33.55</span>      <span class="o">|</span>     <span class="mf">42.93</span>     <span class="o">|</span>     <span class="mf">41.65</span>     <span class="o">|</span>    <span class="mf">781.54</span>    <span class="o">|</span>    <span class="mf">805.60</span>    <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">262144</span>   <span class="o">|</span>     <span class="mf">67.11</span>      <span class="o">|</span>     <span class="mf">45.66</span>     <span class="o">|</span>     <span class="mf">45.08</span>     <span class="o">|</span>   <span class="mf">1469.85</span>    <span class="o">|</span>   <span class="mf">1488.69</span>    <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">524288</span>   <span class="o">|</span>     <span class="mf">134.22</span>     <span class="o">|</span>     <span class="mf">46.99</span>     <span class="o">|</span>     <span class="mf">46.81</span>     <span class="o">|</span>   <span class="mf">2856.02</span>    <span class="o">|</span>   <span class="mf">2867.27</span>    <span class="o">|</span>
+<span class="o">|</span>   <span class="mi">1048576</span>   <span class="o">|</span>     <span class="mf">268.44</span>     <span class="o">|</span>     <span class="mf">47.88</span>     <span class="o">|</span>     <span class="mf">47.75</span>     <span class="o">|</span>   <span class="mf">5605.94</span>    <span class="o">|</span>   <span class="mf">5622.15</span>    <span class="o">|</span>
+<span class="o">+-------------+----------------+---------------+---------------+--------------+--------------+</span>
+</pre></div>
+</div>
+</section>
+<section id="results-thor2-rdma-write">
+<h2>Results: Thor2 RDMA Write<a class="headerlink" href="#results-thor2-rdma-write" title="Link to this heading"></a></h2>
+<section id="message-size-sweep">
+<h3>Message Size Sweep<a class="headerlink" href="#message-size-sweep" title="Link to this heading"></a></h3>
+<p><strong>Config:</strong> 1 initiator + 1 target device, session enabled, batch transfer (128), 4 QPs, polling mode</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>numactl<span class="w"> </span>--cpunodebind<span class="o">=</span><span class="m">0</span><span class="w"> </span>--membind<span class="o">=</span><span class="m">0</span><span class="w"> </span>--physcpubind<span class="o">=</span><span class="m">0</span>-47,96-143<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;10.235.192.60&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">&quot;10.235.192.60&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-batch-transfer<span class="w"> </span>--enable-sess<span class="w"> </span>--buffer-size<span class="w"> </span><span class="m">1024</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--transfer-batch-size<span class="w"> </span><span class="m">128</span><span class="w"> </span>--num-initiator-dev<span class="w"> </span><span class="m">1</span><span class="w"> </span>--num-target-dev<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--num-qp-per-transfer<span class="w"> </span><span class="m">4</span><span class="w"> </span>--all<span class="w"> </span>--num-worker-threads<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--log-level<span class="w"> </span>info<span class="w"> </span>--op-type<span class="w"> </span>write<span class="w"> </span>--poll_cq_mode<span class="w"> </span>polling
+</pre></div>
+</div>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="o">+--------------------------------------------------------------------------------------------------------+</span>
+<span class="o">|</span>                                            <span class="n">Initiator</span> <span class="n">Rank</span> <span class="mi">0</span>                                            <span class="o">|</span>
+<span class="o">+-------------+-----------+----------------+---------------+---------------+--------------+--------------+</span>
+<span class="o">|</span> <span class="n">MsgSize</span> <span class="p">(</span><span class="n">B</span><span class="p">)</span> <span class="o">|</span> <span class="n">BatchSize</span> <span class="o">|</span> <span class="n">TotalSize</span> <span class="p">(</span><span class="n">MB</span><span class="p">)</span> <span class="o">|</span> <span class="n">Max</span> <span class="n">BW</span> <span class="p">(</span><span class="n">GB</span><span class="o">/</span><span class="n">s</span><span class="p">)</span> <span class="o">|</span> <span class="n">Avg</span> <span class="n">Bw</span> <span class="p">(</span><span class="n">GB</span><span class="o">/</span><span class="n">s</span><span class="p">)</span> <span class="o">|</span> <span class="n">Min</span> <span class="n">Lat</span> <span class="p">(</span><span class="n">us</span><span class="p">)</span> <span class="o">|</span> <span class="n">Avg</span> <span class="n">Lat</span> <span class="p">(</span><span class="n">us</span><span class="p">)</span> <span class="o">|</span>
+<span class="o">+-------------+-----------+----------------+---------------+---------------+--------------+--------------+</span>
+<span class="o">|</span>      <span class="mi">8</span>      <span class="o">|</span>    <span class="mi">128</span>    <span class="o">|</span>      <span class="mf">0.00</span>      <span class="o">|</span>      <span class="mf">0.03</span>     <span class="o">|</span>      <span class="mf">0.03</span>     <span class="o">|</span>    <span class="mf">33.38</span>     <span class="o">|</span>    <span class="mf">36.33</span>     <span class="o">|</span>
+<span class="o">|</span>      <span class="mi">16</span>     <span class="o">|</span>    <span class="mi">128</span>    <span class="o">|</span>      <span class="mf">0.00</span>      <span class="o">|</span>      <span class="mf">0.06</span>     <span class="o">|</span>      <span class="mf">0.06</span>     <span class="o">|</span>    <span class="mf">34.09</span>     <span class="o">|</span>    <span class="mf">36.35</span>     <span class="o">|</span>
+<span class="o">|</span>      <span class="mi">32</span>     <span class="o">|</span>    <span class="mi">128</span>    <span class="o">|</span>      <span class="mf">0.00</span>      <span class="o">|</span>      <span class="mf">0.12</span>     <span class="o">|</span>      <span class="mf">0.11</span>     <span class="o">|</span>    <span class="mf">34.57</span>     <span class="o">|</span>    <span class="mf">36.33</span>     <span class="o">|</span>
+<span class="o">|</span>      <span class="mi">64</span>     <span class="o">|</span>    <span class="mi">128</span>    <span class="o">|</span>      <span class="mf">0.01</span>      <span class="o">|</span>      <span class="mf">0.24</span>     <span class="o">|</span>      <span class="mf">0.23</span>     <span class="o">|</span>    <span class="mf">33.62</span>     <span class="o">|</span>    <span class="mf">36.33</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">128</span>     <span class="o">|</span>    <span class="mi">128</span>    <span class="o">|</span>      <span class="mf">0.02</span>      <span class="o">|</span>      <span class="mf">0.49</span>     <span class="o">|</span>      <span class="mf">0.45</span>     <span class="o">|</span>    <span class="mf">33.62</span>     <span class="o">|</span>    <span class="mf">36.49</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">256</span>     <span class="o">|</span>    <span class="mi">128</span>    <span class="o">|</span>      <span class="mf">0.03</span>      <span class="o">|</span>      <span class="mf">0.94</span>     <span class="o">|</span>      <span class="mf">0.89</span>     <span class="o">|</span>    <span class="mf">34.81</span>     <span class="o">|</span>    <span class="mf">36.99</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">512</span>     <span class="o">|</span>    <span class="mi">128</span>    <span class="o">|</span>      <span class="mf">0.07</span>      <span class="o">|</span>      <span class="mf">1.86</span>     <span class="o">|</span>      <span class="mf">1.77</span>     <span class="o">|</span>    <span class="mf">35.29</span>     <span class="o">|</span>    <span class="mf">37.01</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>    <span class="mi">128</span>    <span class="o">|</span>      <span class="mf">0.13</span>      <span class="o">|</span>      <span class="mf">3.84</span>     <span class="o">|</span>      <span class="mf">3.53</span>     <span class="o">|</span>    <span class="mf">34.09</span>     <span class="o">|</span>    <span class="mf">37.09</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">2048</span>    <span class="o">|</span>    <span class="mi">128</span>    <span class="o">|</span>      <span class="mf">0.26</span>      <span class="o">|</span>      <span class="mf">7.33</span>     <span class="o">|</span>      <span class="mf">6.96</span>     <span class="o">|</span>    <span class="mf">35.76</span>     <span class="o">|</span>    <span class="mf">37.65</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">4096</span>    <span class="o">|</span>    <span class="mi">128</span>    <span class="o">|</span>      <span class="mf">0.52</span>      <span class="o">|</span>     <span class="mf">12.94</span>     <span class="o">|</span>     <span class="mf">12.46</span>     <span class="o">|</span>    <span class="mf">40.53</span>     <span class="o">|</span>    <span class="mf">42.09</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">8192</span>    <span class="o">|</span>    <span class="mi">128</span>    <span class="o">|</span>      <span class="mf">1.05</span>      <span class="o">|</span>     <span class="mf">20.75</span>     <span class="o">|</span>     <span class="mf">20.12</span>     <span class="o">|</span>    <span class="mf">50.54</span>     <span class="o">|</span>    <span class="mf">52.11</span>     <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">16384</span>    <span class="o">|</span>    <span class="mi">128</span>    <span class="o">|</span>      <span class="mf">2.10</span>      <span class="o">|</span>     <span class="mf">29.03</span>     <span class="o">|</span>     <span class="mf">28.33</span>     <span class="o">|</span>    <span class="mf">72.24</span>     <span class="o">|</span>    <span class="mf">74.02</span>     <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">32768</span>    <span class="o">|</span>    <span class="mi">128</span>    <span class="o">|</span>      <span class="mf">4.19</span>      <span class="o">|</span>     <span class="mf">36.50</span>     <span class="o">|</span>     <span class="mf">35.91</span>     <span class="o">|</span>    <span class="mf">114.92</span>    <span class="o">|</span>    <span class="mf">116.81</span>    <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">65536</span>    <span class="o">|</span>    <span class="mi">128</span>    <span class="o">|</span>      <span class="mf">8.39</span>      <span class="o">|</span>     <span class="mf">41.74</span>     <span class="o">|</span>     <span class="mf">41.39</span>     <span class="o">|</span>    <span class="mf">200.99</span>    <span class="o">|</span>    <span class="mf">202.70</span>    <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">131072</span>   <span class="o">|</span>    <span class="mi">128</span>    <span class="o">|</span>     <span class="mf">16.78</span>      <span class="o">|</span>     <span class="mf">45.14</span>     <span class="o">|</span>     <span class="mf">44.85</span>     <span class="o">|</span>    <span class="mf">371.69</span>    <span class="o">|</span>    <span class="mf">374.10</span>    <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">262144</span>   <span class="o">|</span>    <span class="mi">128</span>    <span class="o">|</span>     <span class="mf">33.55</span>      <span class="o">|</span>     <span class="mf">46.93</span>     <span class="o">|</span>     <span class="mf">46.76</span>     <span class="o">|</span>    <span class="mf">715.02</span>    <span class="o">|</span>    <span class="mf">717.56</span>    <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">524288</span>   <span class="o">|</span>    <span class="mi">128</span>    <span class="o">|</span>     <span class="mf">67.11</span>      <span class="o">|</span>     <span class="mf">47.94</span>     <span class="o">|</span>     <span class="mf">47.81</span>     <span class="o">|</span>   <span class="mf">1399.99</span>    <span class="o">|</span>   <span class="mf">1403.64</span>    <span class="o">|</span>
+<span class="o">|</span>   <span class="mi">1048576</span>   <span class="o">|</span>    <span class="mi">128</span>    <span class="o">|</span>     <span class="mf">134.22</span>     <span class="o">|</span>     <span class="mf">48.44</span>     <span class="o">|</span>     <span class="mf">48.32</span>     <span class="o">|</span>   <span class="mf">2770.90</span>    <span class="o">|</span>   <span class="mf">2777.76</span>    <span class="o">|</span>
+<span class="o">+-------------+-----------+----------------+---------------+---------------+--------------+--------------+</span>
+</pre></div>
+</div>
+</section>
+<section id="batch-size-sweep">
+<h3>Batch Size Sweep<a class="headerlink" href="#batch-size-sweep" title="Link to this heading"></a></h3>
+<p><strong>Config:</strong> 1 initiator + 1 target device, 1024B messages, session enabled, 16 QPs, polling mode</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>numactl<span class="w"> </span>--cpunodebind<span class="o">=</span><span class="m">0</span><span class="w"> </span>--membind<span class="o">=</span><span class="m">0</span><span class="w"> </span>--physcpubind<span class="o">=</span><span class="m">0</span>-47,96-143<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;10.235.192.60&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">&quot;10.235.192.60&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-batch-transfer<span class="w"> </span>--enable-sess<span class="w"> </span>--buffer-size<span class="w"> </span><span class="m">1024</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--transfer-batch-size<span class="w"> </span><span class="m">128</span><span class="w"> </span>--num-initiator-dev<span class="w"> </span><span class="m">1</span><span class="w"> </span>--num-target-dev<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--num-qp-per-transfer<span class="w"> </span><span class="m">16</span><span class="w"> </span>--all-batch<span class="w"> </span>--num-worker-threads<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--log-level<span class="w"> </span>info<span class="w"> </span>--op-type<span class="w"> </span>write<span class="w"> </span>--poll_cq_mode<span class="w"> </span>polling
+</pre></div>
+</div>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="o">+--------------------------------------------------------------------------------------------------------+</span>
+<span class="o">|</span>                                            <span class="n">Initiator</span> <span class="n">Rank</span> <span class="mi">0</span>                                            <span class="o">|</span>
+<span class="o">+-------------+-----------+----------------+---------------+---------------+--------------+--------------+</span>
+<span class="o">|</span> <span class="n">MsgSize</span> <span class="p">(</span><span class="n">B</span><span class="p">)</span> <span class="o">|</span> <span class="n">BatchSize</span> <span class="o">|</span> <span class="n">TotalSize</span> <span class="p">(</span><span class="n">MB</span><span class="p">)</span> <span class="o">|</span> <span class="n">Max</span> <span class="n">BW</span> <span class="p">(</span><span class="n">GB</span><span class="o">/</span><span class="n">s</span><span class="p">)</span> <span class="o">|</span> <span class="n">Avg</span> <span class="n">Bw</span> <span class="p">(</span><span class="n">GB</span><span class="o">/</span><span class="n">s</span><span class="p">)</span> <span class="o">|</span> <span class="n">Min</span> <span class="n">Lat</span> <span class="p">(</span><span class="n">us</span><span class="p">)</span> <span class="o">|</span> <span class="n">Avg</span> <span class="n">Lat</span> <span class="p">(</span><span class="n">us</span><span class="p">)</span> <span class="o">|</span>
+<span class="o">+-------------+-----------+----------------+---------------+---------------+--------------+--------------+</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.00</span>      <span class="o">|</span>      <span class="mf">0.10</span>     <span class="o">|</span>      <span class="mf">0.09</span>     <span class="o">|</span>    <span class="mf">10.25</span>     <span class="o">|</span>    <span class="mf">11.10</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>     <span class="mi">2</span>     <span class="o">|</span>      <span class="mf">0.00</span>      <span class="o">|</span>      <span class="mf">0.19</span>     <span class="o">|</span>      <span class="mf">0.18</span>     <span class="o">|</span>    <span class="mf">10.73</span>     <span class="o">|</span>    <span class="mf">11.33</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>     <span class="mi">4</span>     <span class="o">|</span>      <span class="mf">0.00</span>      <span class="o">|</span>      <span class="mf">0.34</span>     <span class="o">|</span>      <span class="mf">0.33</span>     <span class="o">|</span>    <span class="mf">12.16</span>     <span class="o">|</span>    <span class="mf">12.60</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>     <span class="mi">8</span>     <span class="o">|</span>      <span class="mf">0.01</span>      <span class="o">|</span>      <span class="mf">0.58</span>     <span class="o">|</span>      <span class="mf">0.54</span>     <span class="o">|</span>    <span class="mf">14.07</span>     <span class="o">|</span>    <span class="mf">15.07</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>     <span class="mi">16</span>    <span class="o">|</span>      <span class="mf">0.02</span>      <span class="o">|</span>      <span class="mf">0.83</span>     <span class="o">|</span>      <span class="mf">0.72</span>     <span class="o">|</span>    <span class="mf">19.79</span>     <span class="o">|</span>    <span class="mf">22.87</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>     <span class="mi">32</span>    <span class="o">|</span>      <span class="mf">0.03</span>      <span class="o">|</span>      <span class="mf">1.48</span>     <span class="o">|</span>      <span class="mf">1.30</span>     <span class="o">|</span>    <span class="mf">22.17</span>     <span class="o">|</span>    <span class="mf">25.19</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>     <span class="mi">64</span>    <span class="o">|</span>      <span class="mf">0.07</span>      <span class="o">|</span>      <span class="mf">2.45</span>     <span class="o">|</span>      <span class="mf">2.14</span>     <span class="o">|</span>    <span class="mf">26.70</span>     <span class="o">|</span>    <span class="mf">30.61</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>    <span class="mi">128</span>    <span class="o">|</span>      <span class="mf">0.13</span>      <span class="o">|</span>      <span class="mf">3.39</span>     <span class="o">|</span>      <span class="mf">3.06</span>     <span class="o">|</span>    <span class="mf">38.62</span>     <span class="o">|</span>    <span class="mf">42.87</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>    <span class="mi">256</span>    <span class="o">|</span>      <span class="mf">0.26</span>      <span class="o">|</span>      <span class="mf">4.43</span>     <span class="o">|</span>      <span class="mf">4.19</span>     <span class="o">|</span>    <span class="mf">59.13</span>     <span class="o">|</span>    <span class="mf">62.53</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>    <span class="mi">512</span>    <span class="o">|</span>      <span class="mf">0.52</span>      <span class="o">|</span>      <span class="mf">5.08</span>     <span class="o">|</span>      <span class="mf">4.84</span>     <span class="o">|</span>    <span class="mf">103.24</span>    <span class="o">|</span>    <span class="mf">108.37</span>    <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>    <span class="mi">1024</span>   <span class="o">|</span>      <span class="mf">1.05</span>      <span class="o">|</span>      <span class="mf">5.79</span>     <span class="o">|</span>      <span class="mf">5.43</span>     <span class="o">|</span>    <span class="mf">181.20</span>    <span class="o">|</span>    <span class="mf">192.99</span>    <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>    <span class="mi">2048</span>   <span class="o">|</span>      <span class="mf">2.10</span>      <span class="o">|</span>      <span class="mf">6.47</span>     <span class="o">|</span>      <span class="mf">6.24</span>     <span class="o">|</span>    <span class="mf">324.01</span>    <span class="o">|</span>    <span class="mf">336.00</span>    <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>    <span class="mi">4096</span>   <span class="o">|</span>      <span class="mf">4.19</span>      <span class="o">|</span>      <span class="mf">7.00</span>     <span class="o">|</span>      <span class="mf">6.85</span>     <span class="o">|</span>    <span class="mf">599.15</span>    <span class="o">|</span>    <span class="mf">611.94</span>    <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>    <span class="mi">8192</span>   <span class="o">|</span>      <span class="mf">8.39</span>      <span class="o">|</span>      <span class="mf">7.15</span>     <span class="o">|</span>      <span class="mf">6.76</span>     <span class="o">|</span>   <span class="mf">1173.02</span>    <span class="o">|</span>   <span class="mf">1241.83</span>    <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>   <span class="mi">16384</span>   <span class="o">|</span>     <span class="mf">16.78</span>      <span class="o">|</span>      <span class="mf">7.29</span>     <span class="o">|</span>      <span class="mf">7.02</span>     <span class="o">|</span>   <span class="mf">2301.69</span>    <span class="o">|</span>   <span class="mf">2390.62</span>    <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>   <span class="mi">32768</span>   <span class="o">|</span>     <span class="mf">33.55</span>      <span class="o">|</span>      <span class="mf">7.32</span>     <span class="o">|</span>      <span class="mf">7.27</span>     <span class="o">|</span>   <span class="mf">4585.50</span>    <span class="o">|</span>   <span class="mf">4617.83</span>    <span class="o">|</span>
+<span class="o">+-------------+-----------+----------------+---------------+---------------+--------------+--------------+</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="results-cx7-rdma-batch-size-1">
+<h2>Results: CX7 RDMA (Batch Size = 1)<a class="headerlink" href="#results-cx7-rdma-batch-size-1" title="Link to this heading"></a></h2>
+<section id="write">
+<h3>Write<a class="headerlink" href="#write" title="Link to this heading"></a></h3>
+<p><strong>Config:</strong> 1 initiator + 1 target device, single transfer, session enabled, message sweep 1KB-64MB</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;10.194.132.29&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">&quot;10.194.132.29&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--transfer-batch-size<span class="w"> </span><span class="m">1</span><span class="w"> </span>--all<span class="w"> </span>--sweep-start-size<span class="o">=</span><span class="m">1024</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--sweep-max-size<span class="o">=</span><span class="m">67108864</span><span class="w"> </span>--op-type<span class="w"> </span>write<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-sess<span class="w"> </span>--enable-batch-transfer
+</pre></div>
+</div>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="o">+--------------------------------------------------------------------------------------------------------+</span>
+<span class="o">|</span>                                            <span class="n">Initiator</span> <span class="n">Rank</span> <span class="mi">0</span>                                            <span class="o">|</span>
+<span class="o">+-------------+-----------+----------------+---------------+---------------+--------------+--------------+</span>
+<span class="o">|</span> <span class="n">MsgSize</span> <span class="p">(</span><span class="n">B</span><span class="p">)</span> <span class="o">|</span> <span class="n">BatchSize</span> <span class="o">|</span> <span class="n">TotalSize</span> <span class="p">(</span><span class="n">MB</span><span class="p">)</span> <span class="o">|</span> <span class="n">Max</span> <span class="n">BW</span> <span class="p">(</span><span class="n">GB</span><span class="o">/</span><span class="n">s</span><span class="p">)</span> <span class="o">|</span> <span class="n">Avg</span> <span class="n">Bw</span> <span class="p">(</span><span class="n">GB</span><span class="o">/</span><span class="n">s</span><span class="p">)</span> <span class="o">|</span> <span class="n">Min</span> <span class="n">Lat</span> <span class="p">(</span><span class="n">us</span><span class="p">)</span> <span class="o">|</span> <span class="n">Avg</span> <span class="n">Lat</span> <span class="p">(</span><span class="n">us</span><span class="p">)</span> <span class="o">|</span>
+<span class="o">+-------------+-----------+----------------+---------------+---------------+--------------+--------------+</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.00</span>      <span class="o">|</span>      <span class="mf">0.20</span>     <span class="o">|</span>      <span class="mf">0.17</span>     <span class="o">|</span>     <span class="mf">5.25</span>     <span class="o">|</span>     <span class="mf">5.87</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">2048</span>    <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.00</span>      <span class="o">|</span>      <span class="mf">0.37</span>     <span class="o">|</span>      <span class="mf">0.35</span>     <span class="o">|</span>     <span class="mf">5.48</span>     <span class="o">|</span>     <span class="mf">5.81</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">4096</span>    <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.00</span>      <span class="o">|</span>      <span class="mf">0.75</span>     <span class="o">|</span>      <span class="mf">0.70</span>     <span class="o">|</span>     <span class="mf">5.48</span>     <span class="o">|</span>     <span class="mf">5.88</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">8192</span>    <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.01</span>      <span class="o">|</span>      <span class="mf">1.49</span>     <span class="o">|</span>      <span class="mf">1.37</span>     <span class="o">|</span>     <span class="mf">5.48</span>     <span class="o">|</span>     <span class="mf">5.96</span>     <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">16384</span>    <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.02</span>      <span class="o">|</span>      <span class="mf">2.86</span>     <span class="o">|</span>      <span class="mf">2.68</span>     <span class="o">|</span>     <span class="mf">5.72</span>     <span class="o">|</span>     <span class="mf">6.11</span>     <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">32768</span>    <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.03</span>      <span class="o">|</span>      <span class="mf">5.29</span>     <span class="o">|</span>      <span class="mf">4.94</span>     <span class="o">|</span>     <span class="mf">6.20</span>     <span class="o">|</span>     <span class="mf">6.64</span>     <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">65536</span>    <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.07</span>      <span class="o">|</span>     <span class="mf">10.18</span>     <span class="o">|</span>      <span class="mf">9.11</span>     <span class="o">|</span>     <span class="mf">6.44</span>     <span class="o">|</span>     <span class="mf">7.20</span>     <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">131072</span>   <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.13</span>      <span class="o">|</span>     <span class="mf">16.17</span>     <span class="o">|</span>     <span class="mf">15.44</span>     <span class="o">|</span>     <span class="mf">8.11</span>     <span class="o">|</span>     <span class="mf">8.49</span>     <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">262144</span>   <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.26</span>      <span class="o">|</span>     <span class="mf">24.43</span>     <span class="o">|</span>     <span class="mf">23.77</span>     <span class="o">|</span>    <span class="mf">10.73</span>     <span class="o">|</span>    <span class="mf">11.03</span>     <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">524288</span>   <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.52</span>      <span class="o">|</span>     <span class="mf">32.82</span>     <span class="o">|</span>     <span class="mf">31.97</span>     <span class="o">|</span>    <span class="mf">15.97</span>     <span class="o">|</span>    <span class="mf">16.40</span>     <span class="o">|</span>
+<span class="o">|</span>   <span class="mi">1048576</span>   <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">1.05</span>      <span class="o">|</span>     <span class="mf">39.62</span>     <span class="o">|</span>     <span class="mf">38.91</span>     <span class="o">|</span>    <span class="mf">26.46</span>     <span class="o">|</span>    <span class="mf">26.95</span>     <span class="o">|</span>
+<span class="o">|</span>   <span class="mi">2097152</span>   <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">2.10</span>      <span class="o">|</span>     <span class="mf">43.98</span>     <span class="o">|</span>     <span class="mf">43.56</span>     <span class="o">|</span>    <span class="mf">47.68</span>     <span class="o">|</span>    <span class="mf">48.15</span>     <span class="o">|</span>
+<span class="o">|</span>   <span class="mi">4194304</span>   <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">4.19</span>      <span class="o">|</span>     <span class="mf">46.54</span>     <span class="o">|</span>     <span class="mf">46.37</span>     <span class="o">|</span>    <span class="mf">90.12</span>     <span class="o">|</span>    <span class="mf">90.44</span>     <span class="o">|</span>
+<span class="o">|</span>   <span class="mi">8388608</span>   <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">8.39</span>      <span class="o">|</span>     <span class="mf">48.00</span>     <span class="o">|</span>     <span class="mf">47.89</span>     <span class="o">|</span>    <span class="mf">174.76</span>    <span class="o">|</span>    <span class="mf">175.18</span>    <span class="o">|</span>
+<span class="o">|</span>   <span class="mi">16777216</span>  <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>     <span class="mf">16.78</span>      <span class="o">|</span>     <span class="mf">48.77</span>     <span class="o">|</span>     <span class="mf">48.71</span>     <span class="o">|</span>    <span class="mf">344.04</span>    <span class="o">|</span>    <span class="mf">344.46</span>    <span class="o">|</span>
+<span class="o">|</span>   <span class="mi">33554432</span>  <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>     <span class="mf">33.55</span>      <span class="o">|</span>     <span class="mf">49.17</span>     <span class="o">|</span>     <span class="mf">49.13</span>     <span class="o">|</span>    <span class="mf">682.35</span>    <span class="o">|</span>    <span class="mf">683.02</span>    <span class="o">|</span>
+<span class="o">|</span>   <span class="mi">67108864</span>  <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>     <span class="mf">67.11</span>      <span class="o">|</span>     <span class="mf">49.36</span>     <span class="o">|</span>     <span class="mf">49.34</span>     <span class="o">|</span>   <span class="mf">1359.46</span>    <span class="o">|</span>   <span class="mf">1360.09</span>    <span class="o">|</span>
+<span class="o">+-------------+-----------+----------------+---------------+---------------+--------------+--------------+</span>
+</pre></div>
+</div>
+</section>
+<section id="read">
+<h3>Read<a class="headerlink" href="#read" title="Link to this heading"></a></h3>
+<p><strong>Config:</strong> Same as write, but with <code class="docutils literal notranslate"><span class="pre">--op-type</span> <span class="pre">read</span></code></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;10.194.132.29&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>tests/python/io/benchmark.py<span class="w"> </span>--host<span class="o">=</span><span class="s2">&quot;10.194.132.29&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--transfer-batch-size<span class="w"> </span><span class="m">1</span><span class="w"> </span>--all<span class="w"> </span>--sweep-start-size<span class="o">=</span><span class="m">1024</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--sweep-max-size<span class="o">=</span><span class="m">67108864</span><span class="w"> </span>--op-type<span class="w"> </span><span class="nb">read</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-sess<span class="w"> </span>--enable-batch-transfer
+</pre></div>
+</div>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="o">+--------------------------------------------------------------------------------------------------------+</span>
+<span class="o">|</span>                                            <span class="n">Initiator</span> <span class="n">Rank</span> <span class="mi">0</span>                                            <span class="o">|</span>
+<span class="o">+-------------+-----------+----------------+---------------+---------------+--------------+--------------+</span>
+<span class="o">|</span> <span class="n">MsgSize</span> <span class="p">(</span><span class="n">B</span><span class="p">)</span> <span class="o">|</span> <span class="n">BatchSize</span> <span class="o">|</span> <span class="n">TotalSize</span> <span class="p">(</span><span class="n">MB</span><span class="p">)</span> <span class="o">|</span> <span class="n">Max</span> <span class="n">BW</span> <span class="p">(</span><span class="n">GB</span><span class="o">/</span><span class="n">s</span><span class="p">)</span> <span class="o">|</span> <span class="n">Avg</span> <span class="n">Bw</span> <span class="p">(</span><span class="n">GB</span><span class="o">/</span><span class="n">s</span><span class="p">)</span> <span class="o">|</span> <span class="n">Min</span> <span class="n">Lat</span> <span class="p">(</span><span class="n">us</span><span class="p">)</span> <span class="o">|</span> <span class="n">Avg</span> <span class="n">Lat</span> <span class="p">(</span><span class="n">us</span><span class="p">)</span> <span class="o">|</span>
+<span class="o">+-------------+-----------+----------------+---------------+---------------+--------------+--------------+</span>
+<span class="o">|</span>     <span class="mi">1024</span>    <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.00</span>      <span class="o">|</span>      <span class="mf">0.17</span>     <span class="o">|</span>      <span class="mf">0.15</span>     <span class="o">|</span>     <span class="mf">5.96</span>     <span class="o">|</span>     <span class="mf">6.74</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">2048</span>    <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.00</span>      <span class="o">|</span>      <span class="mf">0.34</span>     <span class="o">|</span>      <span class="mf">0.31</span>     <span class="o">|</span>     <span class="mf">5.96</span>     <span class="o">|</span>     <span class="mf">6.63</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">4096</span>    <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.00</span>      <span class="o">|</span>      <span class="mf">0.69</span>     <span class="o">|</span>      <span class="mf">0.63</span>     <span class="o">|</span>     <span class="mf">5.96</span>     <span class="o">|</span>     <span class="mf">6.49</span>     <span class="o">|</span>
+<span class="o">|</span>     <span class="mi">8192</span>    <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.01</span>      <span class="o">|</span>      <span class="mf">1.32</span>     <span class="o">|</span>      <span class="mf">1.23</span>     <span class="o">|</span>     <span class="mf">6.20</span>     <span class="o">|</span>     <span class="mf">6.66</span>     <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">16384</span>    <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.02</span>      <span class="o">|</span>      <span class="mf">2.55</span>     <span class="o">|</span>      <span class="mf">2.35</span>     <span class="o">|</span>     <span class="mf">6.44</span>     <span class="o">|</span>     <span class="mf">6.96</span>     <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">32768</span>    <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.03</span>      <span class="o">|</span>      <span class="mf">4.58</span>     <span class="o">|</span>      <span class="mf">4.40</span>     <span class="o">|</span>     <span class="mf">7.15</span>     <span class="o">|</span>     <span class="mf">7.44</span>     <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">65536</span>    <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.07</span>      <span class="o">|</span>      <span class="mf">8.33</span>     <span class="o">|</span>      <span class="mf">7.96</span>     <span class="o">|</span>     <span class="mf">7.87</span>     <span class="o">|</span>     <span class="mf">8.23</span>     <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">131072</span>   <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.13</span>      <span class="o">|</span>     <span class="mf">14.47</span>     <span class="o">|</span>     <span class="mf">13.57</span>     <span class="o">|</span>     <span class="mf">9.06</span>     <span class="o">|</span>     <span class="mf">9.66</span>     <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">262144</span>   <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.26</span>      <span class="o">|</span>     <span class="mf">21.56</span>     <span class="o">|</span>     <span class="mf">20.97</span>     <span class="o">|</span>    <span class="mf">12.16</span>     <span class="o">|</span>    <span class="mf">12.50</span>     <span class="o">|</span>
+<span class="o">|</span>    <span class="mi">524288</span>   <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">0.52</span>      <span class="o">|</span>     <span class="mf">29.32</span>     <span class="o">|</span>     <span class="mf">28.63</span>     <span class="o">|</span>    <span class="mf">17.88</span>     <span class="o">|</span>    <span class="mf">18.31</span>     <span class="o">|</span>
+<span class="o">|</span>   <span class="mi">1048576</span>   <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">1.05</span>      <span class="o">|</span>     <span class="mf">35.47</span>     <span class="o">|</span>     <span class="mf">34.95</span>     <span class="o">|</span>    <span class="mf">29.56</span>     <span class="o">|</span>    <span class="mf">30.00</span>     <span class="o">|</span>
+<span class="o">|</span>   <span class="mi">2097152</span>   <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">2.10</span>      <span class="o">|</span>     <span class="mf">39.62</span>     <span class="o">|</span>     <span class="mf">39.38</span>     <span class="o">|</span>    <span class="mf">52.93</span>     <span class="o">|</span>    <span class="mf">53.25</span>     <span class="o">|</span>
+<span class="o">|</span>   <span class="mi">4194304</span>   <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">4.19</span>      <span class="o">|</span>     <span class="mf">42.09</span>     <span class="o">|</span>     <span class="mf">41.95</span>     <span class="o">|</span>    <span class="mf">99.66</span>     <span class="o">|</span>    <span class="mf">99.99</span>     <span class="o">|</span>
+<span class="o">|</span>   <span class="mi">8388608</span>   <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>      <span class="mf">8.39</span>      <span class="o">|</span>     <span class="mf">43.49</span>     <span class="o">|</span>     <span class="mf">43.38</span>     <span class="o">|</span>    <span class="mf">192.88</span>    <span class="o">|</span>    <span class="mf">193.39</span>    <span class="o">|</span>
+<span class="o">|</span>   <span class="mi">16777216</span>  <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>     <span class="mf">16.78</span>      <span class="o">|</span>     <span class="mf">44.23</span>     <span class="o">|</span>     <span class="mf">44.17</span>     <span class="o">|</span>    <span class="mf">379.32</span>    <span class="o">|</span>    <span class="mf">379.83</span>    <span class="o">|</span>
+<span class="o">|</span>   <span class="mi">33554432</span>  <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>     <span class="mf">33.55</span>      <span class="o">|</span>     <span class="mf">44.59</span>     <span class="o">|</span>     <span class="mf">44.57</span>     <span class="o">|</span>    <span class="mf">752.45</span>    <span class="o">|</span>    <span class="mf">752.90</span>    <span class="o">|</span>
+<span class="o">|</span>   <span class="mi">67108864</span>  <span class="o">|</span>     <span class="mi">1</span>     <span class="o">|</span>     <span class="mf">67.11</span>      <span class="o">|</span>     <span class="mf">44.81</span>     <span class="o">|</span>     <span class="mf">44.78</span>     <span class="o">|</span>   <span class="mf">1497.51</span>    <span class="o">|</span>   <span class="mf">1498.58</span>    <span class="o">|</span>
+<span class="o">+-------------+-----------+----------------+---------------+---------------+--------------+--------------+</span>
+</pre></div>
+</div>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="MORI-EP-BENCHMARK.html" class="btn btn-neutral float-left" title="MORI-EP Benchmark" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="api/communication.html" class="btn btn-neutral float-right" title="Communication APIs" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

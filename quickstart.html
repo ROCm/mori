@@ -1,0 +1,447 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Quickstart &mdash; MORI 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=01f34227"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="MORI-EP User Guide" href="MORI-EP-GUIDE.html" />
+    <link rel="prev" title="Installation" href="installation.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#from-source">From Source</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#verification">Verification</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#mori-ep-dispatch-and-combine">MORI-EP: Dispatch and Combine</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#mori-io-point-to-point-transfers">MORI-IO: Point-to-Point Transfers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#mori-shmem-symmetric-memory">MORI Shmem: Symmetric Memory</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#mori-ir-device-bitcode-for-gpu-kernels">MORI-IR: Device Bitcode for GPU Kernels</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#profiling-with-mori-viz">Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#next-steps">Next Steps</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">MORI-EP User Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#kernel-types">1. Kernel Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#configuration">2. Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineconfig">EpDispatchCombineConfig</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#operator-api">3. Operator API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineop">EpDispatchCombineOp</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch">dispatch()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine">combine()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#split-dispatch-combine-send-recv">Split dispatch/combine (send + recv)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reset">reset()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-dispatch-src-token-pos">get_dispatch_src_token_pos()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-registered-combine-input-buffer">get_registered_combine_input_buffer()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#standard-moe-compatibility-deepep">4. Standard MoE Compatibility (DeepEP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch-standard-moe">dispatch_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine-standard-moe">combine_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-dispatch-output">convert_dispatch_output()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-combine-input">convert_combine_input()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#initialization">5. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#launch-configuration">6. Launch Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#manual-mode-default">Manual Mode (Default)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#auto-mode">Auto Mode</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#complete-example">7. Complete Example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#environment-variables">8. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#benchmarking">9. Benchmarking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node">Intra-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node">Inter-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reference-performance-deepseek-v3-config">Reference Performance (DeepSeek V3 config)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#profiling-with-mori-viz">10. Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#framework-integration">11. Framework Integration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#build-options">Build Options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">MORI Shmem Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-memory">Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#processing-element-pe">Processing Element (PE)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-heap">Symmetric Heap</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization">2. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-3-mpi-communicator-c-mpi-environments">Method 3: MPI Communicator (C++ / MPI environments)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-comparison">Initialization Comparison</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#finalization">Finalization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#query-apis">3. Query APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#memory-management">4. Memory Management</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#allocating-symmetric-memory">Allocating Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#freeing-symmetric-memory">Freeing Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#registering-existing-buffers">Registering Existing Buffers</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#p2p-address-translation">5. P2P Address Translation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#synchronization">6. Synchronization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#hip-module-init-triton-integration">7. HIP Module Init (Triton Integration)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-flags">8. Initialization Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IR-GUIDE.html">MORI-IR Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#host-side-python-api">1. Host-Side Python API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-framework-agnostic"><code class="docutils literal notranslate"><span class="pre">mori.ir</span></code> (framework-agnostic)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-triton-triton-specific-reference-backend"><code class="docutils literal notranslate"><span class="pre">mori.ir.triton</span></code> (Triton-specific reference backend)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-bitcode">2. Device Bitcode</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-functions">3. Device Functions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#query">Query</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#point-to-point">Point-to-Point</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-thread-warp-block">PutNbi (Thread / Warp / Block)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-with-signal">PutNbi with Signal</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#immediate-put">Immediate Put</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#atomics">Atomics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#wait">Wait</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#synchronization">Synchronization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-triton">4. Integration Example: Triton</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-raw-bitcode-no-framework">5. Integration Example: Raw Bitcode (no framework)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#bitcode-jit-compilation">6. Bitcode JIT Compilation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#testing">8. Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#known-limitations">Known Limitations</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">MORI-IO Introduction</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#design-concepts">Design &amp; Concepts</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#workflow">Workflow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#python-api-quick-reference">Python API Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#example-basic-read-write">Example: Basic Read/Write</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#environment-configuration">Environment &amp; Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ (Visualizer)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#instrumentation">Instrumentation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#include-headers">1. Include Headers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#define-profiler-context">2. Define Profiler Context</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#add-trace-points">3. Add Trace Points</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#build-code-generation">Build &amp; Code Generation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#enabling-the-profiler">Enabling the Profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#code-generation">Code Generation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#python-analysis">Python Analysis</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#device-side-elapsed-time-measurement">Device-side Elapsed Time Measurement</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#viewing-the-trace">Viewing the Trace</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#best-practices">Best Practices</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">MORI-EP Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#intra-node">Intra-node</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#inter-node">Inter-node</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nic-selection">NIC Selection</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">MORI-IO Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-commands">Benchmark Commands</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-arguments">Benchmark Arguments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-read">Results: Thor2 RDMA Read</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-write">Results: Thor2 RDMA Write</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#message-size-sweep">Message Size Sweep</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#batch-size-sweep">Batch Size Sweep</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-cx7-rdma-batch-size-1">Results: CX7 RDMA (Batch Size = 1)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#write">Write</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#read">Read</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ep-expert-parallelism">MORI-EP (Expert Parallelism)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-shmem-symmetric-memory">MORI Shmem (Symmetric Memory)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-io-point-to-point-i-o">MORI-IO (Point-to-Point I/O)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ir-device-bitcode-integration">MORI-IR (Device Bitcode Integration)</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">MORI-VIZ Kernel Profiler</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#usage">Usage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#export-to-perfetto">export_to_perfetto</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#c-profiler-apis">C++ Profiler APIs</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Quickstart</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/quickstart.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="quickstart">
+<h1>Quickstart<a class="headerlink" href="#quickstart" title="Link to this heading"></a></h1>
+<p>This guide will get you started with MORI’s core components.</p>
+<section id="mori-ep-dispatch-and-combine">
+<h2>MORI-EP: Dispatch and Combine<a class="headerlink" href="#mori-ep-dispatch-and-combine" title="Link to this heading"></a></h2>
+<p>Route tokens to MoE experts and combine results back:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span><span class="o">,</span><span class="w"> </span><span class="nn">torch</span><span class="o">,</span><span class="w"> </span><span class="nn">torch.distributed</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dist</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">mori</span>
+
+<span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">&quot;MORI_SHMEM_HEAP_SIZE&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;6G&quot;</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">run_ep</span><span class="p">(</span><span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span><span class="p">):</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="n">rank</span><span class="p">)</span>
+    <span class="n">dist</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span><span class="n">backend</span><span class="o">=</span><span class="s2">&quot;cpu:gloo,cuda:nccl&quot;</span><span class="p">,</span> <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span><span class="o">=</span><span class="n">world_size</span><span class="p">)</span>
+    <span class="n">world_group</span> <span class="o">=</span> <span class="n">dist</span><span class="o">.</span><span class="n">group</span><span class="o">.</span><span class="n">WORLD</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_distributed_c10d</span><span class="o">.</span><span class="n">_register_process_group</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">,</span> <span class="n">world_group</span><span class="p">)</span>
+    <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_torch_process_group_init</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">)</span>
+
+    <span class="n">config</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">EpDispatchCombineConfig</span><span class="p">(</span>
+        <span class="n">data_type</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span><span class="o">=</span><span class="n">world_size</span><span class="p">,</span>
+        <span class="n">hidden_dim</span><span class="o">=</span><span class="mi">7168</span><span class="p">,</span> <span class="n">scale_dim</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+        <span class="n">scale_type_size</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float8_e4m3fnuz</span><span class="p">)</span><span class="o">.</span><span class="n">element_size</span><span class="p">(),</span>
+        <span class="n">max_token_type_size</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span><span class="o">.</span><span class="n">element_size</span><span class="p">(),</span>
+        <span class="n">max_num_inp_token_per_rank</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span>
+        <span class="n">num_experts_per_rank</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span> <span class="n">num_experts_per_token</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">op</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">EpDispatchCombineOp</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+
+    <span class="c1"># Dispatch tokens to experts</span>
+    <span class="n">dispatch_out</span><span class="p">,</span> <span class="n">dispatch_w</span><span class="p">,</span> <span class="n">dispatch_s</span><span class="p">,</span> <span class="n">dispatch_idx</span><span class="p">,</span> <span class="n">recv_count</span> <span class="o">=</span> \
+        <span class="n">op</span><span class="o">.</span><span class="n">dispatch</span><span class="p">(</span><span class="n">input_tokens</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">scales</span><span class="p">,</span> <span class="n">expert_indices</span><span class="p">)</span>
+
+    <span class="c1"># ... run expert computation ...</span>
+
+    <span class="c1"># Combine results back</span>
+    <span class="n">combine_out</span><span class="p">,</span> <span class="n">combine_w</span> <span class="o">=</span> <span class="n">op</span><span class="o">.</span><span class="n">combine</span><span class="p">(</span><span class="n">expert_output</span><span class="p">,</span> <span class="n">dispatch_w</span><span class="p">,</span> <span class="n">expert_indices</span><span class="p">,</span> <span class="n">call_reset</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+    <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_finalize</span><span class="p">()</span>
+    <span class="n">dist</span><span class="o">.</span><span class="n">destroy_process_group</span><span class="p">()</span>
+</pre></div>
+</div>
+<p>See the <a class="reference external" href="MORI-EP-GUIDE.md">MORI-EP Guide</a> for the full API reference.</p>
+</section>
+<section id="mori-io-point-to-point-transfers">
+<h2>MORI-IO: Point-to-Point Transfers<a class="headerlink" href="#mori-io-point-to-point-transfers" title="Link to this heading"></a></h2>
+<p>Transfer GPU memory between nodes via RDMA:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.io</span><span class="w"> </span><span class="kn">import</span> <span class="n">IOEngine</span><span class="p">,</span> <span class="n">IOEngineConfig</span><span class="p">,</span> <span class="n">BackendType</span><span class="p">,</span> <span class="n">RdmaBackendConfig</span>
+
+<span class="n">config</span> <span class="o">=</span> <span class="n">IOEngineConfig</span><span class="p">(</span><span class="n">host</span><span class="o">=</span><span class="s2">&quot;10.0.0.1&quot;</span><span class="p">,</span> <span class="n">port</span><span class="o">=</span><span class="mi">8080</span><span class="p">)</span>
+<span class="n">engine</span> <span class="o">=</span> <span class="n">IOEngine</span><span class="p">(</span><span class="n">key</span><span class="o">=</span><span class="s2">&quot;node0&quot;</span><span class="p">,</span> <span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">)</span>
+<span class="n">engine</span><span class="o">.</span><span class="n">create_backend</span><span class="p">(</span><span class="n">BackendType</span><span class="o">.</span><span class="n">RDMA</span><span class="p">,</span> <span class="n">RdmaBackendConfig</span><span class="p">(</span><span class="n">qp_per_transfer</span><span class="o">=</span><span class="mi">1</span><span class="p">))</span>
+
+<span class="c1"># Register memory</span>
+<span class="n">mem_desc</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">register_torch_tensor</span><span class="p">(</span><span class="n">gpu_tensor</span><span class="p">)</span>
+
+<span class="c1"># Exchange engine descriptors between nodes, then transfer</span>
+<span class="n">uid</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">allocate_transfer_uid</span><span class="p">()</span>
+<span class="n">status</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">local_mem</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">remote_mem</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">uid</span><span class="p">)</span>
+<span class="n">status</span><span class="o">.</span><span class="n">Wait</span><span class="p">()</span>
+</pre></div>
+</div>
+<p>See <a class="reference external" href="MORI-IO-GUIDE.md">MORI-IO Guide</a> for architecture and full API.</p>
+</section>
+<section id="mori-shmem-symmetric-memory">
+<h2>MORI Shmem: Symmetric Memory<a class="headerlink" href="#mori-shmem-symmetric-memory" title="Link to this heading"></a></h2>
+<p>Allocate GPU memory accessible across all ranks:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">mori</span>
+
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_torch_process_group_init</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">)</span>
+
+<span class="n">my_pe</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_mype</span><span class="p">()</span>
+<span class="n">ptr</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_malloc</span><span class="p">(</span><span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span><span class="p">)</span>
+<span class="n">remote_ptr</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_ptr_p2p</span><span class="p">(</span><span class="n">ptr</span><span class="p">,</span> <span class="n">my_pe</span><span class="p">,</span> <span class="n">dest_pe</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_barrier_all</span><span class="p">()</span>
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_free</span><span class="p">(</span><span class="n">ptr</span><span class="p">)</span>
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_finalize</span><span class="p">()</span>
+</pre></div>
+</div>
+<p>See the <a class="reference external" href="MORI-SHMEM-GUIDE.md">Shmem Guide</a> for full API reference.</p>
+</section>
+<section id="mori-ir-device-bitcode-for-gpu-kernels">
+<h2>MORI-IR: Device Bitcode for GPU Kernels<a class="headerlink" href="#mori-ir-device-bitcode-for-gpu-kernels" title="Link to this heading"></a></h2>
+<p>Use MORI shmem device functions inside Triton (or any LLVM-based) kernels:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.ir</span><span class="w"> </span><span class="kn">import</span> <span class="n">find_bitcode</span><span class="p">,</span> <span class="n">MORI_DEVICE_FUNCTIONS</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mori.ir.triton</span><span class="w"> </span><span class="kn">import</span> <span class="n">get_extern_libs</span><span class="p">,</span> <span class="n">install_hook</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">mori.ir.triton</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">mori_shmem_device</span>
+
+<span class="c1"># Locate bitcode (auto JIT-compiled for current GPU + NIC)</span>
+<span class="n">bc_path</span> <span class="o">=</span> <span class="n">find_bitcode</span><span class="p">()</span>
+
+<span class="c1"># Triton: install hook and use device functions in kernels</span>
+<span class="n">install_hook</span><span class="p">()</span>
+
+<span class="nd">@triton</span><span class="o">.</span><span class="n">jit</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">my_kernel</span><span class="p">(</span><span class="n">buf_ptr</span><span class="p">,</span> <span class="n">BLOCK</span><span class="p">:</span> <span class="n">tl</span><span class="o">.</span><span class="n">constexpr</span><span class="p">):</span>
+    <span class="n">pe</span> <span class="o">=</span> <span class="n">mori_shmem_device</span><span class="o">.</span><span class="n">my_pe</span><span class="p">()</span>
+    <span class="n">remote</span> <span class="o">=</span> <span class="n">mori_shmem_device</span><span class="o">.</span><span class="n">ptr_p2p</span><span class="p">(</span>
+        <span class="n">buf_ptr</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">uint64</span><span class="p">,</span> <span class="n">bitcast</span><span class="o">=</span><span class="kc">True</span><span class="p">),</span> <span class="n">pe</span><span class="p">,</span> <span class="p">(</span><span class="n">pe</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">mori_shmem_device</span><span class="o">.</span><span class="n">n_pes</span><span class="p">()</span>
+    <span class="p">)</span>
+    <span class="c1"># ... read/write remote memory ...</span>
+
+<span class="n">my_kernel</span><span class="p">[(</span><span class="n">grid</span><span class="p">,)](</span><span class="n">buf</span><span class="p">,</span> <span class="n">BLOCK</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span> <span class="n">extern_libs</span><span class="o">=</span><span class="n">get_extern_libs</span><span class="p">())</span>
+</pre></div>
+</div>
+<p>See <a class="reference external" href="MORI-IR-GUIDE.md">MORI-IR Guide</a> for full device function table and non-Triton integration.</p>
+</section>
+<section id="profiling-with-mori-viz">
+<h2>Profiling with MORI-VIZ<a class="headerlink" href="#profiling-with-mori-viz" title="Link to this heading"></a></h2>
+<p>Capture warp-level kernel traces (build with <code class="docutils literal notranslate"><span class="pre">ENABLE_PROFILER=ON</span></code>):</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.kernel_profiler</span><span class="w"> </span><span class="kn">import</span> <span class="n">export_to_perfetto</span>
+
+<span class="c1"># After running dispatch/combine:</span>
+<span class="n">trace_buffer</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">cpp</span><span class="o">.</span><span class="n">get_debug_time_buf</span><span class="p">(</span><span class="n">op</span><span class="o">.</span><span class="n">_handle</span><span class="p">)</span>
+<span class="n">export_to_perfetto</span><span class="p">(</span><span class="n">trace_buffer</span><span class="p">,</span> <span class="s2">&quot;ep_trace.json&quot;</span><span class="p">)</span>
+
+<span class="c1"># Visualize at https://ui.perfetto.dev/</span>
+</pre></div>
+</div>
+<p>See <a class="reference external" href="PROFILER.md">Profiler docs</a> for details.</p>
+</section>
+<section id="next-steps">
+<h2>Next Steps<a class="headerlink" href="#next-steps" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><a class="reference external" href="MORI-EP-GUIDE.md">MORI-EP Guide</a> — Full EP API reference and examples</p></li>
+<li><p><a class="reference external" href="MORI-SHMEM-GUIDE.md">Shmem Guide</a> — Symmetric memory concepts and APIs</p></li>
+<li><p><a class="reference external" href="MORI-IR-GUIDE.md">MORI-IR Guide</a> — Device bitcode integration for Triton</p></li>
+<li><p><a class="reference external" href="MORI-IO-GUIDE.md">MORI-IO Guide</a> — IO architecture and Python API</p></li>
+<li><p><a class="reference external" href="PROFILER.md">Profiler</a> — Warp-level kernel profiler</p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="installation.html" class="btn btn-neutral float-left" title="Installation" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="MORI-EP-GUIDE.html" class="btn btn-neutral float-right" title="MORI-EP User Guide" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

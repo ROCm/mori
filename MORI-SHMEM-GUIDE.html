@@ -1,0 +1,737 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MORI Shmem Guide &mdash; MORI 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=01f34227"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="MORI-IR Guide" href="MORI-IR-GUIDE.html" />
+    <link rel="prev" title="MORI-EP User Guide" href="MORI-EP-GUIDE.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#from-source">From Source</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#verification">Verification</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ep-dispatch-and-combine">MORI-EP: Dispatch and Combine</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-io-point-to-point-transfers">MORI-IO: Point-to-Point Transfers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-shmem-symmetric-memory">MORI Shmem: Symmetric Memory</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ir-device-bitcode-for-gpu-kernels">MORI-IR: Device Bitcode for GPU Kernels</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#profiling-with-mori-viz">Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">MORI-EP User Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#kernel-types">1. Kernel Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#configuration">2. Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineconfig">EpDispatchCombineConfig</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#operator-api">3. Operator API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineop">EpDispatchCombineOp</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch">dispatch()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine">combine()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#split-dispatch-combine-send-recv">Split dispatch/combine (send + recv)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reset">reset()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-dispatch-src-token-pos">get_dispatch_src_token_pos()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-registered-combine-input-buffer">get_registered_combine_input_buffer()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#standard-moe-compatibility-deepep">4. Standard MoE Compatibility (DeepEP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch-standard-moe">dispatch_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine-standard-moe">combine_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-dispatch-output">convert_dispatch_output()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-combine-input">convert_combine_input()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#initialization">5. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#launch-configuration">6. Launch Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#manual-mode-default">Manual Mode (Default)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#auto-mode">Auto Mode</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#complete-example">7. Complete Example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#environment-variables">8. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#benchmarking">9. Benchmarking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node">Intra-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node">Inter-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reference-performance-deepseek-v3-config">Reference Performance (DeepSeek V3 config)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#profiling-with-mori-viz">10. Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#framework-integration">11. Framework Integration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#build-options">Build Options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">MORI Shmem Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#symmetric-memory">Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#processing-element-pe">Processing Element (PE)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#symmetric-heap">Symmetric Heap</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#initialization">2. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#method-3-mpi-communicator-c-mpi-environments">Method 3: MPI Communicator (C++ / MPI environments)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#initialization-comparison">Initialization Comparison</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#finalization">Finalization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#query-apis">3. Query APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#memory-management">4. Memory Management</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#allocating-symmetric-memory">Allocating Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#freeing-symmetric-memory">Freeing Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#registering-existing-buffers">Registering Existing Buffers</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#p2p-address-translation">5. P2P Address Translation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#synchronization">6. Synchronization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#hip-module-init-triton-integration">7. HIP Module Init (Triton Integration)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#initialization-flags">8. Initialization Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IR-GUIDE.html">MORI-IR Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#host-side-python-api">1. Host-Side Python API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-framework-agnostic"><code class="docutils literal notranslate"><span class="pre">mori.ir</span></code> (framework-agnostic)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-triton-triton-specific-reference-backend"><code class="docutils literal notranslate"><span class="pre">mori.ir.triton</span></code> (Triton-specific reference backend)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-bitcode">2. Device Bitcode</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-functions">3. Device Functions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#query">Query</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#point-to-point">Point-to-Point</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-thread-warp-block">PutNbi (Thread / Warp / Block)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-with-signal">PutNbi with Signal</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#immediate-put">Immediate Put</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#atomics">Atomics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#wait">Wait</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#synchronization">Synchronization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-triton">4. Integration Example: Triton</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-raw-bitcode-no-framework">5. Integration Example: Raw Bitcode (no framework)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#bitcode-jit-compilation">6. Bitcode JIT Compilation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#testing">8. Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#known-limitations">Known Limitations</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">MORI-IO Introduction</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#design-concepts">Design &amp; Concepts</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#workflow">Workflow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#python-api-quick-reference">Python API Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#example-basic-read-write">Example: Basic Read/Write</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#environment-configuration">Environment &amp; Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ (Visualizer)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#instrumentation">Instrumentation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#include-headers">1. Include Headers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#define-profiler-context">2. Define Profiler Context</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#add-trace-points">3. Add Trace Points</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#build-code-generation">Build &amp; Code Generation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#enabling-the-profiler">Enabling the Profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#code-generation">Code Generation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#python-analysis">Python Analysis</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#device-side-elapsed-time-measurement">Device-side Elapsed Time Measurement</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#viewing-the-trace">Viewing the Trace</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#best-practices">Best Practices</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">MORI-EP Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#intra-node">Intra-node</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#inter-node">Inter-node</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nic-selection">NIC Selection</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">MORI-IO Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-commands">Benchmark Commands</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-arguments">Benchmark Arguments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-read">Results: Thor2 RDMA Read</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-write">Results: Thor2 RDMA Write</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#message-size-sweep">Message Size Sweep</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#batch-size-sweep">Batch Size Sweep</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-cx7-rdma-batch-size-1">Results: CX7 RDMA (Batch Size = 1)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#write">Write</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#read">Read</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ep-expert-parallelism">MORI-EP (Expert Parallelism)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-shmem-symmetric-memory">MORI Shmem (Symmetric Memory)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-io-point-to-point-i-o">MORI-IO (Point-to-Point I/O)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ir-device-bitcode-integration">MORI-IR (Device Bitcode Integration)</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">MORI-VIZ Kernel Profiler</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#usage">Usage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#export-to-perfetto">export_to_perfetto</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#c-profiler-apis">C++ Profiler APIs</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">MORI Shmem Guide</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/MORI-SHMEM-GUIDE.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="mori-shmem-guide">
+<h1>MORI Shmem Guide<a class="headerlink" href="#mori-shmem-guide" title="Link to this heading"></a></h1>
+<p>MORI Shmem provides OpenSHMEM-style symmetric memory APIs for GPU memory management and RDMA communication. It is the foundation layer that MORI-EP and MORI-IO build upon — shmem must be initialized before using any other MORI component.</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#quick-reference"><span class="xref myst">Quick Reference</span></a></p></li>
+<li><p><a class="reference internal" href="#1-concepts"><span class="xref myst">1. Concepts</span></a></p></li>
+<li><p><a class="reference internal" href="#2-initialization"><span class="xref myst">2. Initialization</span></a></p></li>
+<li><p><a class="reference internal" href="#3-query-apis"><span class="xref myst">3. Query APIs</span></a></p></li>
+<li><p><a class="reference internal" href="#4-memory-management"><span class="xref myst">4. Memory Management</span></a></p></li>
+<li><p><a class="reference internal" href="#5-p2p-address-translation"><span class="xref myst">5. P2P Address Translation</span></a></p></li>
+<li><p><a class="reference internal" href="#6-synchronization"><span class="xref myst">6. Synchronization</span></a></p></li>
+<li><p><a class="reference internal" href="#7-hip-module-init-triton-integration"><span class="xref myst">7. HIP Module Init (Triton Integration)</span></a></p></li>
+<li><p><a class="reference internal" href="#8-initialization-flags"><span class="xref myst">8. Initialization Flags</span></a></p></li>
+<li><p><a class="reference internal" href="#environment-variables"><span class="xref myst">Environment Variables</span></a></p></li>
+<li><p><a class="reference internal" href="#source-files"><span class="xref myst">Source Files</span></a></p></li>
+</ul>
+</section>
+<section id="quick-reference">
+<h2>Quick Reference<a class="headerlink" href="#quick-reference" title="Link to this heading"></a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">mori</span>
+
+<span class="c1"># Initialize from PyTorch process group</span>
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_torch_process_group_init</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">)</span>
+
+<span class="c1"># Query</span>
+<span class="n">my_rank</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_mype</span><span class="p">()</span>
+<span class="n">num_ranks</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_npes</span><span class="p">()</span>
+
+<span class="c1"># Allocate symmetric memory</span>
+<span class="n">ptr</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_malloc</span><span class="p">(</span><span class="n">size_in_bytes</span><span class="p">)</span>
+
+<span class="c1"># Register existing buffer for RDMA</span>
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_buffer_register</span><span class="p">(</span><span class="n">tensor</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">(),</span> <span class="n">tensor</span><span class="o">.</span><span class="n">nbytes</span><span class="p">)</span>
+
+<span class="c1"># P2P address translation (intra-node)</span>
+<span class="n">remote_ptr</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_ptr_p2p</span><span class="p">(</span><span class="n">ptr</span><span class="p">,</span> <span class="n">my_pe</span><span class="p">,</span> <span class="n">dest_pe</span><span class="p">)</span>
+
+<span class="c1"># Synchronize</span>
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_barrier_all</span><span class="p">()</span>
+
+<span class="c1"># Cleanup</span>
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_free</span><span class="p">(</span><span class="n">ptr</span><span class="p">)</span>
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_finalize</span><span class="p">()</span>
+</pre></div>
+</div>
+<p><strong>Imports:</strong></p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>What</p></th>
+<th class="head"><p>Import</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>All shmem APIs</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">import</span> <span class="pre">mori.shmem</span></code> or <code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">mori</span> <span class="pre">import</span> <span class="pre">shmem</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Init flags</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">mori.shmem.MORI_SHMEM_INIT_WITH_MPI_COMM</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">mori.shmem.MORI_SHMEM_INIT_WITH_UNIQUEID</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<hr class="docutils" />
+<section id="concepts">
+<h2>1. Concepts<a class="headerlink" href="#concepts" title="Link to this heading"></a></h2>
+<section id="symmetric-memory">
+<h3>Symmetric Memory<a class="headerlink" href="#symmetric-memory" title="Link to this heading"></a></h3>
+<p>Symmetric memory is GPU memory that is allocated at the same virtual offset across all participating PEs (Processing Elements / ranks). This enables RDMA hardware to directly access remote GPU memory using simple address arithmetic — no address translation tables needed at runtime.</p>
+</section>
+<section id="processing-element-pe">
+<h3>Processing Element (PE)<a class="headerlink" href="#processing-element-pe" title="Link to this heading"></a></h3>
+<p>A PE is a participant in the symmetric memory domain. Each GPU rank maps to one PE. PEs are numbered 0 to N-1.</p>
+</section>
+<section id="symmetric-heap">
+<h3>Symmetric Heap<a class="headerlink" href="#symmetric-heap" title="Link to this heading"></a></h3>
+<p>The symmetric heap is a pre-allocated region of GPU memory from which <code class="docutils literal notranslate"><span class="pre">shmem_malloc</span></code> allocates. Its size is controlled by the <code class="docutils literal notranslate"><span class="pre">MORI_SHMEM_HEAP_SIZE</span></code> environment variable:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MORI_SHMEM_HEAP_SIZE</span><span class="o">=</span>6G<span class="w">  </span><span class="c1"># Must be set before shmem init</span>
+</pre></div>
+</div>
+</section>
+</section>
+<hr class="docutils" />
+<section id="initialization">
+<h2>2. Initialization<a class="headerlink" href="#initialization" title="Link to this heading"></a></h2>
+<p>Shmem must be initialized exactly once per process. There are three methods:</p>
+<section id="method-1-pytorch-process-group-recommended">
+<h3>Method 1: PyTorch Process Group (Recommended)<a class="headerlink" href="#method-1-pytorch-process-group-recommended" title="Link to this heading"></a></h3>
+<p>Use this when PyTorch distributed is already initialized. The process group must be registered with a name before calling <code class="docutils literal notranslate"><span class="pre">shmem_torch_process_group_init</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch.distributed</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dist</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">mori</span>
+
+<span class="c1"># Standard PyTorch distributed init</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="n">rank</span><span class="p">)</span>
+<span class="n">dist</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span>
+    <span class="n">backend</span><span class="o">=</span><span class="s2">&quot;cpu:gloo,cuda:nccl&quot;</span><span class="p">,</span>
+    <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span><span class="o">=</span><span class="n">world_size</span><span class="p">,</span>
+    <span class="n">device_id</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">&quot;cuda&quot;</span><span class="p">,</span> <span class="n">rank</span><span class="p">),</span>
+<span class="p">)</span>
+
+<span class="c1"># Register the process group with a name</span>
+<span class="n">world_group</span> <span class="o">=</span> <span class="n">dist</span><span class="o">.</span><span class="n">group</span><span class="o">.</span><span class="n">WORLD</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_distributed_c10d</span><span class="o">.</span><span class="n">_register_process_group</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">,</span> <span class="n">world_group</span><span class="p">)</span>
+
+<span class="c1"># Initialize shmem from the registered process group</span>
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_torch_process_group_init</span><span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">)</span>
+</pre></div>
+</div>
+<blockquote>
+<div><p><strong>Note:</strong> The <code class="docutils literal notranslate"><span class="pre">_register_process_group(&quot;default&quot;,</span> <span class="pre">...)</span></code> step is required — <code class="docutils literal notranslate"><span class="pre">shmem_torch_process_group_init</span></code> looks up the group by name to extract rank/world_size and bootstrap the shmem connections.</p>
+</div></blockquote>
+</section>
+<section id="method-2-unique-id-no-pytorch-distributed">
+<h3>Method 2: Unique ID (No PyTorch Distributed)<a class="headerlink" href="#method-2-unique-id-no-pytorch-distributed" title="Link to this heading"></a></h3>
+<p>Use this when PyTorch distributed is not available (e.g., standalone applications, custom launchers). Rank 0 generates a unique ID and broadcasts it to all ranks via any transport (file, MPI, TCP, etc.):</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">mori</span>
+
+<span class="c1"># Rank 0 generates a unique ID</span>
+<span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+    <span class="n">unique_id</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_get_unique_id</span><span class="p">()</span>  <span class="c1"># Returns 128 bytes</span>
+    <span class="c1"># Broadcast unique_id to all ranks via your transport</span>
+
+<span class="c1"># All ranks initialize with the same unique ID</span>
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_init_attr</span><span class="p">(</span>
+    <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">MORI_SHMEM_INIT_WITH_UNIQUEID</span><span class="p">,</span>
+    <span class="n">rank</span><span class="p">,</span>        <span class="c1"># My rank</span>
+    <span class="n">world_size</span><span class="p">,</span>  <span class="c1"># Total ranks</span>
+    <span class="n">unique_id</span><span class="p">,</span>   <span class="c1"># Shared unique ID (bytes)</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>Example using file-based broadcast (for single-node testing):</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">os</span><span class="o">,</span><span class="w"> </span><span class="nn">time</span>
+
+<span class="n">uid_file</span> <span class="o">=</span> <span class="s2">&quot;/tmp/mori_unique_id&quot;</span>
+<span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+    <span class="n">unique_id</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_get_unique_id</span><span class="p">()</span>
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">uid_file</span><span class="p">,</span> <span class="s1">&#39;wb&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+        <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">unique_id</span><span class="p">)</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="k">while</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="n">uid_file</span><span class="p">):</span>
+        <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mf">0.1</span><span class="p">)</span>
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">uid_file</span><span class="p">,</span> <span class="s1">&#39;rb&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+        <span class="n">unique_id</span> <span class="o">=</span> <span class="n">f</span><span class="o">.</span><span class="n">read</span><span class="p">()</span>
+
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_init_attr</span><span class="p">(</span>
+    <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">MORI_SHMEM_INIT_WITH_UNIQUEID</span><span class="p">,</span>
+    <span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span><span class="p">,</span> <span class="n">unique_id</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="method-3-mpi-communicator-c-mpi-environments">
+<h3>Method 3: MPI Communicator (C++ / MPI environments)<a class="headerlink" href="#method-3-mpi-communicator-c-mpi-environments" title="Link to this heading"></a></h3>
+<p>Use this in MPI-based applications. Pass <code class="docutils literal notranslate"><span class="pre">MORI_SHMEM_INIT_WITH_MPI_COMM</span></code> as the flag:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_init_attr</span><span class="p">(</span>
+    <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">MORI_SHMEM_INIT_WITH_MPI_COMM</span><span class="p">,</span>
+    <span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span><span class="p">,</span> <span class="n">mpi_comm</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<blockquote>
+<div><p><strong>Note:</strong> This is primarily used in C++ applications where an <code class="docutils literal notranslate"><span class="pre">MPI_Comm</span></code> handle is available. In Python, Method 1 or Method 2 are preferred.</p>
+</div></blockquote>
+</section>
+<section id="initialization-comparison">
+<h3>Initialization Comparison<a class="headerlink" href="#initialization-comparison" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Method</p></th>
+<th class="head"><p>When to use</p></th>
+<th class="head"><p>Dependencies</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>PyTorch Process Group</p></td>
+<td><p>LLM inference/training frameworks (vLLM, SGLang, etc.)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch.distributed</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Unique ID</p></td>
+<td><p>Standalone apps, custom launchers, non-PyTorch environments</p></td>
+<td><p>None (any broadcast mechanism)</p></td>
+</tr>
+<tr class="row-even"><td><p>MPI Communicator</p></td>
+<td><p>C++ MPI applications</p></td>
+<td><p>MPI</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="finalization">
+<h3>Finalization<a class="headerlink" href="#finalization" title="Link to this heading"></a></h3>
+<p>Always finalize shmem before process exit:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_finalize</span><span class="p">()</span>
+<span class="c1"># Then destroy PyTorch process group if applicable</span>
+<span class="n">dist</span><span class="o">.</span><span class="n">destroy_process_group</span><span class="p">()</span>
+</pre></div>
+</div>
+</section>
+</section>
+<hr class="docutils" />
+<section id="query-apis">
+<h2>3. Query APIs<a class="headerlink" href="#query-apis" title="Link to this heading"></a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Get my PE (rank) ID — 0 to npes-1</span>
+<span class="n">my_pe</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_mype</span><span class="p">()</span>
+
+<span class="c1"># Get total number of PEs</span>
+<span class="n">total_pes</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_npes</span><span class="p">()</span>
+
+<span class="c1"># Get number of RDMA queue pairs per PE</span>
+<span class="n">num_qp</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_num_qp_per_pe</span><span class="p">()</span>
+</pre></div>
+</div>
+</section>
+<hr class="docutils" />
+<section id="memory-management">
+<h2>4. Memory Management<a class="headerlink" href="#memory-management" title="Link to this heading"></a></h2>
+<section id="allocating-symmetric-memory">
+<h3>Allocating Symmetric Memory<a class="headerlink" href="#allocating-symmetric-memory" title="Link to this heading"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Basic allocation</span>
+<span class="n">ptr</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_malloc</span><span class="p">(</span><span class="n">size_in_bytes</span><span class="p">)</span>
+
+<span class="c1"># Aligned allocation (alignment must be power of 2)</span>
+<span class="n">ptr</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_malloc_align</span><span class="p">(</span><span class="n">alignment</span><span class="o">=</span><span class="mi">256</span><span class="p">,</span> <span class="n">size</span><span class="o">=</span><span class="n">size_in_bytes</span><span class="p">)</span>
+
+<span class="c1"># Allocation with flags</span>
+<span class="n">ptr</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_ext_malloc_with_flags</span><span class="p">(</span><span class="n">size_in_bytes</span><span class="p">,</span> <span class="n">flags</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>All allocation functions return an integer address (<code class="docutils literal notranslate"><span class="pre">int</span></code>). The allocated memory is symmetric — the same offset is reserved on every PE.</p>
+</section>
+<section id="freeing-symmetric-memory">
+<h3>Freeing Symmetric Memory<a class="headerlink" href="#freeing-symmetric-memory" title="Link to this heading"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_free</span><span class="p">(</span><span class="n">ptr</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="registering-existing-buffers">
+<h3>Registering Existing Buffers<a class="headerlink" href="#registering-existing-buffers" title="Link to this heading"></a></h3>
+<p>Register a PyTorch tensor or other existing GPU memory for RDMA operations without allocating new symmetric memory:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Register</span>
+<span class="n">tensor</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1024</span><span class="p">,</span> <span class="mi">7168</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">)</span>
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_buffer_register</span><span class="p">(</span><span class="n">tensor</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">(),</span> <span class="n">tensor</span><span class="o">.</span><span class="n">nbytes</span><span class="p">)</span>
+
+<span class="c1"># ... use tensor in MORI operations ...</span>
+
+<span class="c1"># Deregister when done</span>
+<span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_buffer_deregister</span><span class="p">(</span><span class="n">tensor</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">(),</span> <span class="n">tensor</span><span class="o">.</span><span class="n">nbytes</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Both functions return a status code (0 for success).</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="p2p-address-translation">
+<h2>5. P2P Address Translation<a class="headerlink" href="#p2p-address-translation" title="Link to this heading"></a></h2>
+<p>For intra-node GPU-to-GPU access, translate a local symmetric pointer to its P2P-accessible address on a remote PE:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">remote_ptr</span> <span class="o">=</span> <span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_ptr_p2p</span><span class="p">(</span><span class="n">local_ptr</span><span class="p">,</span> <span class="n">my_pe</span><span class="p">,</span> <span class="n">dest_pe</span><span class="p">)</span>
+</pre></div>
+</div>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Return Value</p></th>
+<th class="head"><p>Meaning</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Non-zero</p></td>
+<td><p>P2P address on <code class="docutils literal notranslate"><span class="pre">dest_pe</span></code> (same-node, XGMI-connected GPUs)</p></td>
+</tr>
+<tr class="row-odd"><td><p>0</p></td>
+<td><p>Connection uses RDMA transport (different nodes) or pointer is invalid</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<hr class="docutils" />
+<section id="synchronization">
+<h2>6. Synchronization<a class="headerlink" href="#synchronization" title="Link to this heading"></a></h2>
+<p>Global barrier — blocks until all PEs reach the barrier:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_barrier_all</span><span class="p">()</span>
+</pre></div>
+</div>
+</section>
+<hr class="docutils" />
+<section id="hip-module-init-triton-integration">
+<h2>7. HIP Module Init (Triton Integration)<a class="headerlink" href="#hip-module-init-triton-integration" title="Link to this heading"></a></h2>
+<p>When using Triton-compiled kernels that access shmem device symbols, initialize the HIP module:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">mori</span><span class="o">.</span><span class="n">shmem</span><span class="o">.</span><span class="n">shmem_module_init</span><span class="p">(</span><span class="n">hip_module_handle</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>This copies the current GPU states to the <code class="docutils literal notranslate"><span class="pre">globalGpuStates</span></code> symbol in the dynamically compiled Triton kernel module.</p>
+</section>
+<hr class="docutils" />
+<section id="initialization-flags">
+<h2>8. Initialization Flags<a class="headerlink" href="#initialization-flags" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Flag</p></th>
+<th class="head"><p>Value</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_SHMEM_INIT_WITH_MPI_COMM</span></code></p></td>
+<td><p>0</p></td>
+<td><p>Initialize using MPI communicator</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_SHMEM_INIT_WITH_UNIQUEID</span></code></p></td>
+<td><p>1</p></td>
+<td><p>Initialize using broadcast unique ID</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<hr class="docutils" />
+<section id="environment-variables">
+<h2>Environment Variables<a class="headerlink" href="#environment-variables" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Description</p></th>
+<th class="head"><p>Default</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_SHMEM_HEAP_SIZE</span></code></p></td>
+<td><p>Symmetric heap size (e.g., <code class="docutils literal notranslate"><span class="pre">&quot;6G&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;2G&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;512M&quot;</span></code>). Must be set before initialization.</p></td>
+<td><p>Required</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_SHMEM_MODE</span></code></p></td>
+<td><p>Heap mode: <code class="docutils literal notranslate"><span class="pre">&quot;static&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;vmm&quot;</span></code>, or <code class="docutils literal notranslate"><span class="pre">&quot;isolation&quot;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;static&quot;</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_SHMEM_HEAP_TYPE</span></code></p></td>
+<td><p>Heap memory type: <code class="docutils literal notranslate"><span class="pre">&quot;normal&quot;</span></code> (cached) or <code class="docutils literal notranslate"><span class="pre">&quot;uncached&quot;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;uncached&quot;</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_SHMEM_VMM_CHUNK_SIZE</span></code></p></td>
+<td><p>VMM mode chunk size in bytes</p></td>
+<td><p>Auto</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_SOCKET_IFNAME</span></code></p></td>
+<td><p>Network interface for shmem bootstrap TCP connections (e.g., <code class="docutils literal notranslate"><span class="pre">&quot;lo&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;eth0&quot;</span></code>)</p></td>
+<td><p>Auto-detect</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_RDMA_DEVICES</span></code></p></td>
+<td><p>RDMA NIC selection. Include: <code class="docutils literal notranslate"><span class="pre">mlx5_0,mlx5_1</span></code>. Exclude: <code class="docutils literal notranslate"><span class="pre">^mlx5_2,mlx5_3</span></code></p></td>
+<td><p>All available</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_NUM_QP_PER_PE</span></code></p></td>
+<td><p>Number of RDMA queue pairs per PE</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IB_GID_INDEX</span></code></p></td>
+<td><p>InfiniBand GID index for RDMA connections</p></td>
+<td><p>Auto-detect</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_RDMA_SL</span></code></p></td>
+<td><p>RDMA service level</p></td>
+<td><p>Auto</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_RDMA_TC</span></code></p></td>
+<td><p>RDMA traffic class</p></td>
+<td><p>Auto</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_DISABLE_P2P</span></code></p></td>
+<td><p>Disable P2P (XGMI) transport, force RDMA</p></td>
+<td><p>Not set</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_DISABLE_TOPO</span></code></p></td>
+<td><p>Disable topology detection</p></td>
+<td><p>Not set</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_GLOBAL_LOG_LEVEL</span></code></p></td>
+<td><p>Global log verbosity: <code class="docutils literal notranslate"><span class="pre">TRACE</span></code>, <code class="docutils literal notranslate"><span class="pre">DEBUG</span></code>, <code class="docutils literal notranslate"><span class="pre">INFO</span></code>, <code class="docutils literal notranslate"><span class="pre">WARN</span></code>, <code class="docutils literal notranslate"><span class="pre">ERROR</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">INFO</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_PRECOMPILE</span></code></p></td>
+<td><p>Precompile all JIT kernels on import</p></td>
+<td><p>Not set</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_DISABLE_JIT</span></code></p></td>
+<td><p>Disable JIT compilation of device bitcode</p></td>
+<td><p>Not set</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<hr class="docutils" />
+<section id="source-files">
+<h2>Source Files<a class="headerlink" href="#source-files" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>File</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">python/mori/shmem/api.py</span></code></p></td>
+<td><p>Python shmem API</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">python/mori/shmem/__init__.py</span></code></p></td>
+<td><p>Public exports</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">include/mori/shmem/</span></code></p></td>
+<td><p>C++ shmem headers</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">src/pybind/pybind.cpp</span></code></p></td>
+<td><p>Python module entry point</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">src/pybind/mori.cpp</span></code></p></td>
+<td><p>Shmem binding registration (<code class="docutils literal notranslate"><span class="pre">RegisterMoriShmem</span></code>)</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="MORI-EP-GUIDE.html" class="btn btn-neutral float-left" title="MORI-EP User Guide" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="MORI-IR-GUIDE.html" class="btn btn-neutral float-right" title="MORI-IR Guide" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
