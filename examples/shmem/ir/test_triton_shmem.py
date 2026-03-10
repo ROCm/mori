@@ -38,6 +38,15 @@ def shmem_put_kernel(symm_buf_ptr, value):
     mori_shmem_device.quiet_thread()
 
 
+@triton.jit
+def shmem_get_kernel(local_buf_ptr, remote_buf_ptr, nbytes):
+    mype = mori_shmem_device.my_pe()
+    npes = mori_shmem_device.n_pes()
+    src_pe = (mype + 1) % npes
+    mori_shmem_device.getmem_nbi_thread(local_buf_ptr, remote_buf_ptr, nbytes, src_pe, 0)
+    mori_shmem_device.quiet_thread()
+
+
 # ===================================================================
 # 2. Distributed setup
 # ===================================================================
@@ -99,6 +108,33 @@ def test_put(mype, npes, extern_libs):
     print(f"[PE {mype}] [Triton] put    PASS")
 
 
+def test_get(mype, npes, extern_libs):
+    import mori.shmem as ms
+    from mori.shmem import mori_shmem_create_tensor
+
+    print(f"\n[PE {mype}] === Triton: shmem_get_kernel ===")
+    # remote_buf: each PE fills with its own rank * 100 + 42
+    remote_buf = mori_shmem_create_tensor((1,), torch.int32)
+    remote_buf.fill_(mype * 100 + 42)
+    # local_buf: destination for GET, fill with sentinel
+    local_buf = mori_shmem_create_tensor((1,), torch.int32)
+    local_buf.fill_(-1)
+    torch.cuda.synchronize()
+    ms.shmem_barrier_all()
+
+    nbytes = 4  # sizeof(int32)
+    shmem_get_kernel[(1,)](local_buf, remote_buf, nbytes, extern_libs=extern_libs)
+    torch.cuda.synchronize()
+    ms.shmem_barrier_all()
+
+    src_pe = (mype + 1) % npes
+    exp = src_pe * 100 + 42
+    got = local_buf.item()
+    print(f"[PE {mype}] local_buf={got}, expected={exp} (GET from PE {src_pe})")
+    assert got == exp, f"PE {mype}: expected {exp}, got {got}"
+    print(f"[PE {mype}] [Triton] get    PASS")
+
+
 # ===================================================================
 # main
 # ===================================================================
@@ -110,6 +146,7 @@ def main():
     try:
         test_basic(mype, npes, extern_libs)
         test_put(mype, npes, extern_libs)
+        test_get(mype, npes, extern_libs)
         if mype == 0:
             print(f"\n{'=' * 60}")
             print(f"  All tests PASSED on {npes} PEs (Triton + mori shmem)")

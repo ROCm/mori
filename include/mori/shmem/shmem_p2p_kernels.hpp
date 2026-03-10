@@ -533,6 +533,39 @@ DEFINE_SHMEM_ATOMIC_TYPE_FETCH_WARP_KERNEL_P2P(Int32, int32_t)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_WARP_KERNEL_P2P(Int64, int64_t)
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                                    GetMemNbi (SymmMemObjPtr)                                   */
+/* ---------------------------------------------------------------------------------------------- */
+template <>
+inline __device__ void ShmemGetMemNbiThreadKernel<application::TransportType::P2P>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source->peerPtrs[pe] + sourceOffset);
+  uint8_t* destPtr =
+      reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(dest->localPtr) + destOffset);
+  core::ThreadCopy<uint8_t>(destPtr, srcPtr, bytes);
+}
+
+template <>
+inline __device__ void ShmemGetMemNbiWarpKernel<application::TransportType::P2P>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source->peerPtrs[pe] + sourceOffset);
+  uint8_t* destPtr =
+      reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(dest->localPtr) + destOffset);
+  core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
+}
+
+template <>
+inline __device__ void ShmemGetMemNbiBlockKernel<application::TransportType::P2P>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source->peerPtrs[pe] + sourceOffset);
+  uint8_t* destPtr =
+      reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(dest->localPtr) + destOffset);
+  core::BlockCopy<uint8_t>(destPtr, srcPtr, bytes);
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                            Pure Address-Based Point-to-Point (New)                             */
 /* ---------------------------------------------------------------------------------------------- */
 
@@ -1069,6 +1102,48 @@ DEFINE_SHMEM_ATOMIC_TYPE_FETCH_WARP_KERNEL_P2P_ADDR(Uint32, uint32_t)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_WARP_KERNEL_P2P_ADDR(Uint64, uint64_t)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_WARP_KERNEL_P2P_ADDR(Int32, int32_t)
 DEFINE_SHMEM_ATOMIC_TYPE_FETCH_WARP_KERNEL_P2P_ADDR(Int64, int64_t)
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                               GetMemNbi (Pure Address-Based)                                   */
+/* ---------------------------------------------------------------------------------------------- */
+template <>
+inline __device__ void ShmemGetMemNbiThreadKernel<application::TransportType::P2P>(
+    void* dest, const void* source, size_t bytes, int pe, int qpId) {
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+
+  uintptr_t srcAddr = reinterpret_cast<uintptr_t>(source);
+  size_t offset = srcAddr - globalGpuStates->heapBaseAddr;
+
+  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(globalGpuStates->heapObj->peerPtrs[pe] + offset);
+  uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest);
+  core::ThreadCopy<uint8_t>(destPtr, srcPtr, bytes);
+}
+
+template <>
+inline __device__ void ShmemGetMemNbiWarpKernel<application::TransportType::P2P>(
+    void* dest, const void* source, size_t bytes, int pe, int qpId) {
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+
+  uintptr_t srcAddr = reinterpret_cast<uintptr_t>(source);
+  size_t offset = srcAddr - globalGpuStates->heapBaseAddr;
+
+  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(globalGpuStates->heapObj->peerPtrs[pe] + offset);
+  uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest);
+  core::WarpCopy<uint8_t>(destPtr, srcPtr, bytes);
+}
+
+template <>
+inline __device__ void ShmemGetMemNbiBlockKernel<application::TransportType::P2P>(
+    void* dest, const void* source, size_t bytes, int pe, int qpId) {
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+
+  uintptr_t srcAddr = reinterpret_cast<uintptr_t>(source);
+  size_t offset = srcAddr - globalGpuStates->heapBaseAddr;
+
+  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(globalGpuStates->heapObj->peerPtrs[pe] + offset);
+  uint8_t* destPtr = reinterpret_cast<uint8_t*>(dest);
+  core::BlockCopy<uint8_t>(destPtr, srcPtr, bytes);
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Synchronization                                        */
