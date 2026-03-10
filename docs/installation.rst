@@ -25,23 +25,30 @@ From Source
    # See https://pytorch.org for ROCm installation instructions
 
    # Build and install MORI
-   python3 setup.py develop
+   pip install .
+   # For venv build: pip install . --no-build-isolation
+
+No hipcc is needed at install time — host code compiles with a standard C++
+compiler. GPU kernels are JIT-compiled on first use and cached to ``~/.mori/jit/``.
+
+To manually precompile all kernels (e.g. in a Docker image build):
+
+.. code-block:: bash
+
+   MORI_PRECOMPILE=1 python -c "import mori"
 
 Environment Variables
 ---------------------
 
-Required environment variables:
+Common environment variables:
 
 .. code-block:: bash
 
-   # ROCm installation path
-   export ROCM_PATH=/opt/rocm
+   # Symmetric heap size (required for shmem/EP)
+   export MORI_SHMEM_HEAP_SIZE=6G
 
-   # GPU architectures to compile for
-   export GPU_ARCHS="gfx90a;gfx942"
-
-   # Enable MORI features
-   export MORI_ENABLE_PROFILER=1
+   # Log verbosity
+   export MORI_GLOBAL_LOG_LEVEL=INFO  # TRACE, DEBUG, INFO
 
 Verification
 ------------

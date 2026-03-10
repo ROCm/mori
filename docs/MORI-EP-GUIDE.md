@@ -596,8 +596,8 @@ MORI-EP is integrated in several LLM inference frameworks:
 | `ENABLE_STANDARD_MOE_ADAPT` | `OFF` | Enable DeepEP-compatible standard MoE APIs |
 | `ENABLE_DEBUG_PRINTF` | `OFF` | Enable debug printf in device kernels |
 | `USE_ROCM` | `ON` | Build for ROCm/HIP (vs. CUDA) |
-| `USE_BNXT` | `OFF` | Enable Broadcom Thor2 NIC support |
-| `USE_IONIC` | `OFF` | Enable AMD Pensando DSC NIC support |
+| `USE_BNXT` | auto-detected | Broadcom Thor2 NIC support (enabled automatically if `libbnxt_re.so` and headers are found) |
+| `USE_IONIC` | auto-detected | AMD Pollara (AINIC) NIC support (enabled automatically if `libionic.so` is found) |
 
 ---
 
@@ -612,7 +612,7 @@ MORI-EP is integrated in several LLM inference frameworks:
 | `src/ops/dispatch_combine/dispatch_combine.cpp` | Core dispatch/combine implementation |
 | `src/ops/dispatch_combine/internode_v1.cpp` | InterNodeV1/V1LL kernels |
 | `src/ops/dispatch_combine/low_latency_async.cpp` | AsyncLL kernels |
-| `src/pybind/mori.cpp` | Python bindings for all APIs |
+| `src/pybind/pybind.cpp` | Python bindings for all APIs |
 | `examples/ops/dispatch_combine/test_dispatch_combine.py` | Complete Python example |
 | `examples/ops/dispatch_combine/test_dispatch_combine_internode.py` | Inter-node example |
 | `tests/python/ops/test_dispatch_combine.py` | Correctness tests |

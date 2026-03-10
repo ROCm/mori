@@ -146,23 +146,35 @@ MORI-EP is integrated in several LLM inference and training frameworks:
 
 ### Prerequisites
 
-- ROCm >= 6.4.0 with PyTorch
-- Linux packages: see `docker/Dockerfile.dev`
+- ROCm >= 6.4 (hipcc needed at runtime for JIT kernel compilation, not at install time)
+- System packages: `libopenmpi-dev`, `openmpi-bin`, `libpci-dev` (see [Dockerfile.dev](docker/Dockerfile.dev))
 
-Or build the Docker image:
-
+Or build docker image with:
 ```bash
 cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
 ```
 
-### Install with Python
+### Install
 
 ```bash
-cd mori
-pip install -r requirements-build.txt
-git submodule update --init --recursive
-pip install .
 # NOTE: for venv build, add --no-build-isolation at the end
+cd mori && pip install .
+```
+
+That's it. No hipcc needed at install time — host code compiles with a standard
+C++ compiler. GPU kernels are JIT-compiled on first use and cached to
+`~/.mori/jit/`. If a GPU is detected during install, kernel precompilation
+starts automatically in the background.
+
+To manually precompile all kernels (e.g. in a Docker image build):
+```bash
+MORI_PRECOMPILE=1 python -c "import mori"
+```
+
+### Verify installation
+
+```bash
+python -c "import mori; print('OK')"
 ```
 
 ## Testing
