@@ -200,6 +200,10 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
                                 sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
     HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->expectSignalsPtr, 0,
                                 sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->fencePtrs,
+                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
+    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->fencePtrs, 0,
+                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
   }
   SymmMemObjPtr result{cpuMemObj, gpuMemObj};
   if (!heap_begin) {
@@ -312,6 +316,7 @@ SymmMemObjPtr SymmMemManager::RegisterStaticHeapSubRegion(void* localPtr, size_t
       gpuMemObj->deviceHandles_d = heapObj->gpu->deviceHandles_d;
       gpuMemObj->signalPtrs = heapObj->gpu->signalPtrs;
       gpuMemObj->expectSignalsPtr = heapObj->gpu->expectSignalsPtr;
+      gpuMemObj->fencePtrs = heapObj->gpu->fencePtrs;
     }
   }
 

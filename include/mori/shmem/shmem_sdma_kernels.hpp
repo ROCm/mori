@@ -52,9 +52,10 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SD
 
   HSAuint64* signals = dest->signalPtrs + inNodePe * dest->sdmaNumQueue;
   HSAuint64* expectedSignals = dest->expectSignalsPtr + inNodePe * dest->sdmaNumQueue;
+  HSAuint64* fencePtrs = dest->fencePtrs + inNodePe * dest->sdmaNumQueue;
 
   core::SdmaPutThread(srcPtr, dstPtr, bytes, devicehandles, signals, expectedSignals,
-                      dest->sdmaNumQueue, qpId);
+                      dest->sdmaNumQueue, qpId, fencePtrs);
 }
 
 template <>
@@ -70,9 +71,10 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::SDMA
       dest->deviceHandles_d + inNodePe * dest->sdmaNumQueue;
   HSAuint64* signals = dest->signalPtrs + inNodePe * dest->sdmaNumQueue;
   HSAuint64* expectedSignal = dest->expectSignalsPtr + inNodePe * dest->sdmaNumQueue;
+  HSAuint64* fencePtrs = dest->fencePtrs + inNodePe * dest->sdmaNumQueue;
 
   core::SdmaPutWarp(srcPtr, dstPtr, bytes, devicehandles, signals, expectedSignal,
-                    dest->sdmaNumQueue);
+                    dest->sdmaNumQueue, fencePtrs);
 }
 
 template <>

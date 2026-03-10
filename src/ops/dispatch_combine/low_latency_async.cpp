@@ -117,6 +117,8 @@ __global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
         shmem::ShmemPutMemNbiThread(args.shmemDispatchInpTokMemObj, remoteOffset,
                                     args.shmemStagingTokMemObj, localOffset,
                                     thisChunkTokenNum * xferBytes, destPe, qpId);
+        shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
+            destPe, args.shmemDispatchInpTokMemObj);
       }
       // TODO(ditian12): index value is wrong if signal completion here, investigate the reason
       // shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
@@ -125,6 +127,13 @@ __global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
     }
   }
   if (globalThdId == 0) args.totalRecvTokenNum[0] = 0;
+  uint64_t st = wall_clock64();
+  while (1) {
+    uint64_t now = wall_clock64();
+    if ((now - st) >= 100000000) break;
+    asm volatile("buffer_wbl2" ::: "memory");
+    __threadfence_system();
+  }
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -148,17 +157,28 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
         shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
             destPe, args.shmemDispatchInpTokMemObj);
         int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
+        core::AtomicStoreRelaxedSystem(args.recvTokenNumMemObj->template GetAs<uint64_t*>(destPe) +
+                                           myPe * config.numQpPerPe + qpId,
+                                       static_cast<uint64_t>(tokenNum + 1));
         // TODO(ditian12): send atomic op right after quiet lead to hang issue, need to investigate
         // shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
         //     args.recvTokenNumMemObj, (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
         //     static_cast<uint64_t>(tokenNum + 1), core::AMO_ADD, destPe, qpId);
-        shmem::ShmemPutUint64ImmNbiThread(args.recvTokenNumMemObj,
-                                          (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
-                                          static_cast<uint64_t>(tokenNum + 1), destPe, qpId);
+        // shmem::ShmemPutUint64ImmNbiThread(args.recvTokenNumMemObj,
+        //                                   (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
+        //                                   static_cast<uint64_t>(tokenNum + 1), destPe, qpId);
       }
     }
   }
   // Polling recv token number signal
+
+  uint64_t st = wall_clock64();
+  while (1) {
+    uint64_t now = wall_clock64();
+    if ((now - st) >= 100000000) break;
+    asm volatile("buffer_wbl2" ::: "memory");
+    __threadfence_system();
+  }
   uint64_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint64_t*>();
   uint64_t recvTokenNum = 0;
   if (laneId < config.numQpPerPe) {
@@ -187,9 +207,9 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
       index_t id =
           reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes)[laneId];
       index_t pe = id / config.numExpertPerRank;
-      if (!((pe >= 0) && (pe < config.worldSize))) {
-        assert((pe >= 0) && (pe < config.worldSize));
-      }
+      // if (!((pe >= 0) && (pe < config.worldSize))) {
+      //   assert((pe >= 0) && (pe < config.worldSize));
+      // }
     }
     core::WarpCopy<uint8_t, 4>(
         args.shmemOutIndicesMemObj->template GetAs<uint8_t*>() + destTokId * indexBytes,
@@ -282,12 +302,17 @@ __global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
         shmem::ShmemPutMemNbiThread(args.shmemCombineInpTokMemObj, remoteOffset,
                                     args.shmemStagingTokMemObj, localOffset,
                                     thisChunkTokenNum * tokHiddenBytes, destPe, qpId);
-      // if (laneId == 0)
-      // shmem::ShmemQuietThread(destPe, qpId);
-      // shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
-      //     args.crossDeviceBarrierMemObj, myPe * sizeof(uint64_t), 1, core::AMO_ADD, destPe,
-      //     qpId);
+      shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
+          destPe, args.shmemCombineInpTokMemObj);
     }
+  }
+
+  uint64_t st = wall_clock64();
+  while (1) {
+    uint64_t now = wall_clock64();
+    if ((now - st) >= 200000000) break;
+    asm volatile("buffer_wbl2" ::: "memory");
+    __threadfence_system();
   }
 }
 
@@ -308,13 +333,23 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
         // shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
         // args.crossDeviceBarrierMemObj, myPe * sizeof(uint64_t), 1, core::AMO_ADD, destPe, qpId);
         uint64_t flag = args.crossDeviceBarrierFlag[0];
-        shmem::ShmemPutUint64ImmNbiThread(args.crossDeviceBarrierMemObj,
-                                          (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
-                                          flag, destPe, qpId);
+        core::AtomicStoreRelaxedSystem(
+            args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>(destPe) +
+                myPe * config.numQpPerPe + qpId,
+            flag);
+        // shmem::ShmemPutUint64ImmNbiThread(args.crossDeviceBarrierMemObj,
+        //                                   (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
+        //                                   flag, destPe, qpId);
       }
     }
   }
-
+  uint64_t st = wall_clock64();
+  while (1) {
+    uint64_t now = wall_clock64();
+    if ((now - st) >= 100000000) break;
+    asm volatile("buffer_wbl2" ::: "memory");
+    __threadfence_system();
+  }
   for (int destPe = laneId; destPe < npes; destPe += warpSize) {
     uint64_t barrierFlag = args.crossDeviceBarrierFlag[0];
     for (int i = 0; i < config.numQpPerPe; i++)
