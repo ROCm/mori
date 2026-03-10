@@ -55,16 +55,22 @@ std::shared_ptr<CqCallbackMeta> SubmissionLedger::ReleaseByCqe(uint64_t recordId
   return meta;
 }
 
-int SubmissionLedger::ReleaseAllByRecovery(std::atomic<int>* sqDepth) {
+int SubmissionLedger::ReleaseOrphanedByRecovery(std::atomic<int>* sqDepth) {
   std::lock_guard<std::mutex> lock(mu_);
   int total = 0;
-  for (auto& [id, rec] : records_) {
-    if (rec.state == SubmissionState::Posted || rec.state == SubmissionState::Orphaned) {
-      total += rec.postedWr;
+  // Only erase Orphaned records.  Posted records still have signaled WRs whose
+  // CQEs may arrive later; they must remain so ReleaseByCqe() can update the
+  // corresponding TransferStatus and release sqDepth normally.
+  auto it = records_.begin();
+  while (it != records_.end()) {
+    if (it->second.state == SubmissionState::Orphaned) {
+      total += it->second.postedWr;
+      it = records_.erase(it);
+    } else {
+      ++it;
     }
   }
   if (sqDepth && total > 0) sqDepth->fetch_sub(total, std::memory_order_relaxed);
-  records_.clear();
   return total;
 }
 

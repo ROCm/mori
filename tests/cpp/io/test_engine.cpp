@@ -215,13 +215,20 @@ void CaseSubmissionLedgerBasic() {
   SubmissionLedger ledger2;
   std::atomic<int> sqDepth2{12};
   auto meta2 = std::make_shared<CqCallbackMeta>(&status, 202, 16);
-  ledger2.Insert(4, true, meta2, 10);
+  uint64_t postedId = ledger2.Insert(4, true, meta2, 10);
   ledger2.InsertOrphaned(3, meta2, 6);
   Require(ledger2.HasOrphaned(), "expected orphaned record in ledger");
-  int recovered = ledger2.ReleaseAllByRecovery(&sqDepth2);
-  Require(recovered == 7, "unexpected recovered wr count");
-  Require(sqDepth2.load(std::memory_order_relaxed) == 5, "unexpected sq depth after recovery");
+  int recovered = ledger2.ReleaseOrphanedByRecovery(&sqDepth2);
+  // Only Orphaned record (3 WRs) should be released; Posted record (4 WRs) preserved.
+  Require(recovered == 3, "unexpected recovered wr count (should only release orphaned)");
+  Require(sqDepth2.load(std::memory_order_relaxed) == 9, "unexpected sq depth after recovery");
   Require(!ledger2.HasOrphaned(), "orphaned records should be drained");
+  // The Posted record should still be present and retrievable via ReleaseByCqe.
+  int postedBatch = 0;
+  auto postedMeta = ledger2.ReleaseByCqe(postedId, &sqDepth2, &postedBatch);
+  Require(postedMeta != nullptr, "posted record should survive recovery");
+  Require(postedBatch == 10, "posted record batch size mismatch");
+  Require(sqDepth2.load(std::memory_order_relaxed) == 5, "sq depth after posted CQE release");
 }
 
 void CaseRdmaTransferBasic() {

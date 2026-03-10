@@ -149,12 +149,8 @@ class SubmissionLedger {
   std::shared_ptr<CqCallbackMeta> ReleaseByCqe(uint64_t recordId, std::atomic<int>* sqDepth,
                                                int* outBatchSize);
 
-  // TODO: Wire up a recovery path that calls ReleaseAllByRecovery() and clears
-  // EpPair::degraded.  Currently degraded EPs stay blocked until process restart.
-
-  // Recovery path: clear all non-Released records, release accumulated sqDepth.
-  // Returns total WR count released.
-  int ReleaseAllByRecovery(std::atomic<int>* sqDepth);
+  // Recovery path: release only Orphaned records and keep Posted records.
+  int ReleaseOrphanedByRecovery(std::atomic<int>* sqDepth);
 
   bool HasOrphaned() const;
 
@@ -175,8 +171,6 @@ struct EpPair {
   std::shared_ptr<std::atomic<int>> sqDepth;
   int maxSqDepth{0};
   // Degraded flag — set on partial post without signaled tail.
-  // TODO: Implement recovery that resets degraded to false and calls
-  // ledger->ReleaseAllByRecovery() to drain orphaned sqDepth.
   std::shared_ptr<std::atomic<bool>> degraded;
   std::shared_ptr<SubmissionLedger> ledger;
 };

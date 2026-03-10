@@ -394,15 +394,16 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
       } else {
         // Batch path: wr_id carries a recordId from the SubmissionLedger.
         uint64_t recordId = wc[i].wr_id;
-        int batchSize = 0;
-        auto meta =
-            ep.ledger ? ep.ledger->ReleaseByCqe(recordId, ep.sqDepth.get(), &batchSize) : nullptr;
+        int mergedBatchSize = 0;
+        auto meta = ep.ledger
+                        ? ep.ledger->ReleaseByCqe(recordId, ep.sqDepth.get(), &mergedBatchSize)
+                        : nullptr;
         if (meta) {
-          uint32_t lastBatchSize = meta->finishedBatchSize.fetch_add(batchSize);
+          uint32_t lastBatchSize = meta->finishedBatchSize.fetch_add(mergedBatchSize);
           TransferStatus* statusPtr = meta->status;
           if (statusPtr != nullptr) {
             if (wc[i].status == IBV_WC_SUCCESS) {
-              if ((lastBatchSize + batchSize) == meta->totalBatchSize) {
+              if ((lastBatchSize + mergedBatchSize) == meta->totalBatchSize) {
                 statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
               }
             } else {
@@ -412,11 +413,11 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
                             ibv_wc_status_str(wc[i].status));
               meta->status = nullptr;
               if (ep.degraded && ep.degraded->load(std::memory_order_relaxed) && ep.ledger) {
-                const int recovered = ep.ledger->ReleaseAllByRecovery(ep.sqDepth.get());
+                const int orphanedReleased = ep.ledger->ReleaseOrphanedByRecovery(ep.sqDepth.get());
                 ep.degraded->store(false, std::memory_order_relaxed);
                 MORI_IO_WARN(
                     "NotifManager recovered degraded EP qpn {} by releasing {} orphaned WRs", qpn,
-                    recovered);
+                    orphanedReleased);
               }
             }
           }
@@ -426,7 +427,7 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
               meta->id,
               statusPtr != nullptr ? statusPtr->CodeUint32()
                                    : static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
-              meta->totalBatchSize, lastBatchSize, batchSize);
+              meta->totalBatchSize, lastBatchSize, mergedBatchSize);
         } else {
           MORI_IO_WARN(
               "NotifManager: no ledger record for wr_id {} (recordId {}); "

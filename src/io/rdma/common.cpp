@@ -75,6 +75,7 @@ static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const cha
       std::chrono::steady_clock::now() + std::chrono::microseconds(kBackoffTimeoutUs);
   int backoff = 0;
   int cur = ep.sqDepth->load(std::memory_order_relaxed);
+  if (cur < 0) cur = 0;  // defensive: clamp stale negative depth
   while (true) {
     // Re-check degraded state while waiting to avoid accepting new submissions
     // after another thread has marked this EP as degraded.
@@ -130,7 +131,7 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, Trans
 
   std::string reserveErr;
   int reserved = 0;
-  for (int i = 0; i < eps.size(); i++) {
+  for (size_t i = 0; i < eps.size(); i++) {
     if (!TryReserveSqDepth(eps[i], 1, i, "notify", &reserveErr)) {
       for (int j = 0; j < reserved; ++j) ReleaseSqDepth(eps[j], 1);
       return {StatusCode::ERR_RDMA_OP, reserveErr};
@@ -138,9 +139,9 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, Trans
     reserved++;
   }
 
-  for (int i = 0; i < eps.size(); i++) {
+  for (size_t i = 0; i < eps.size(); i++) {
     const application::RdmaEndpoint& ep = eps[i].local;
-    NotifMessage msg{id, i, static_cast<int>(eps.size())};
+    NotifMessage msg{id, static_cast<int>(i), static_cast<int>(eps.size())};
 
     struct ibv_sge sge{};
     sge.addr = reinterpret_cast<uintptr_t>(&msg);
@@ -403,6 +404,27 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
         }
       }
 
+      for (size_t otherEpId = 0; otherEpId < epNum; ++otherEpId) {
+        if (static_cast<int>(otherEpId) == epId) continue;
+        if (epWrsSinceSignal[otherEpId] <= 0) continue;
+        MORI_IO_WARN(
+            "ibv_post_send failed on ep {}: moving pending unsignaled WRs on ep {} "
+            "(wrCount={}, mergedReq={}) to orphaned and marking degraded",
+            epId, otherEpId, epWrsSinceSignal[otherEpId], epMergedSinceSignal[otherEpId]);
+        if (eps[otherEpId].degraded) {
+          eps[otherEpId].degraded->store(true, std::memory_order_relaxed);
+        }
+        if (eps[otherEpId].ledger) {
+          eps[otherEpId].ledger->InsertOrphaned(epWrsSinceSignal[otherEpId], callbackMeta,
+                                                static_cast<int>(epMergedSinceSignal[otherEpId]));
+        } else {
+          MORI_IO_WARN(
+              "EP {} has pending unsignaled WRs but no submission ledger; "
+              "sqDepth may remain stale until endpoint restart",
+              otherEpId);
+        }
+      }
+
       return {StatusCode::ERR_RDMA_OP, "ibv_post_send failed with " + std::to_string(ret) + ": " +
                                            strerror(ret) + " (posted " +
                                            std::to_string(postedCount) + "/" +
@@ -418,5 +440,5 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
   return {StatusCode::IN_PROGRESS, ""};
 }
 
-};  // namespace io
-};  // namespace mori
+}  // namespace io
+}  // namespace mori
