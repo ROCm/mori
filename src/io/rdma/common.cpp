@@ -21,22 +21,127 @@
 // SOFTWARE.
 #include "src/io/rdma/common.hpp"
 
+#include <cassert>
+#include <cerrno>
+#include <chrono>
+#include <cstdlib>
+#include <limits>
 #include <numeric>
+#include <thread>
 
 #include "mori/io/logging.hpp"
 
 namespace mori {
 namespace io {
+
+static int GetSqBackoffTimeoutUs() {
+  static const int value = []() {
+    const char* env = std::getenv("MORI_IO_SQ_BACKOFF_TIMEOUT_US");
+    if (env && env[0] != '\0') {
+      errno = 0;
+      char* end = nullptr;
+      long v = std::strtol(env, &end, 10);
+      if (end != env && *end == '\0' && errno == 0 && v > 0 &&
+          v <= std::numeric_limits<int>::max()) {
+        return static_cast<int>(v);
+      }
+      MORI_IO_WARN("Invalid MORI_IO_SQ_BACKOFF_TIMEOUT_US='{}', using default 10000", env);
+    }
+    return 10000;
+  }();
+  return value;
+}
+// SQ depth is an admission counter only. It does not publish data dependencies
+// across threads, so relaxed atomics are sufficient for correctness.
+static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const char* opTag,
+                              std::string* errMsg) {
+  if (wrCount <= 0 || !ep.sqDepth) return true;
+  if (ep.degraded && ep.degraded->load(std::memory_order_relaxed)) {
+    if (errMsg) *errMsg = "EP is degraded, rejecting new submissions";
+    return false;
+  }
+  if (wrCount > ep.maxSqDepth) {
+    MORI_IO_WARN("SQ request exceeds capacity ({}): ep={} requested={} max={}", opTag, epId,
+                 wrCount, ep.maxSqDepth);
+    if (errMsg) {
+      *errMsg = "SQ request exceeds capacity (" + std::string(opTag) +
+                "): ep=" + std::to_string(epId) + " requested=" + std::to_string(wrCount) +
+                " max=" + std::to_string(ep.maxSqDepth);
+    }
+    return false;
+  }
+  const int kBackoffTimeoutUs = GetSqBackoffTimeoutUs();
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::microseconds(kBackoffTimeoutUs);
+  int backoff = 0;
+  int cur = ep.sqDepth->load(std::memory_order_relaxed);
+  if (cur < 0) cur = 0;  // defensive: clamp stale negative depth
+  while (true) {
+    // Re-check degraded state while waiting to avoid accepting new submissions
+    // after another thread has marked this EP as degraded.
+    if (ep.degraded && ep.degraded->load(std::memory_order_relaxed)) {
+      if (errMsg) *errMsg = "EP is degraded, rejecting new submissions";
+      return false;
+    }
+    if (cur + wrCount > ep.maxSqDepth) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        MORI_IO_WARN(
+            "SQ full timeout ({}): ep={} depth={} requested={} max={} after {} us (backoff={})",
+            opTag, epId, cur, wrCount, ep.maxSqDepth, kBackoffTimeoutUs, backoff);
+        if (errMsg) {
+          *errMsg = "SQ full (" + std::string(opTag) + "): ep=" + std::to_string(epId) +
+                    " depth=" + std::to_string(cur) + " requested=" + std::to_string(wrCount) +
+                    " max=" + std::to_string(ep.maxSqDepth);
+        }
+        return false;
+      }
+      // Phased backoff: short polite yields, then tiny sleeps to reduce CPU burn.
+      if (backoff < 16) {
+        std::this_thread::yield();
+      } else {
+        std::this_thread::sleep_for(std::chrono::microseconds(2));
+      }
+      backoff++;
+      cur = ep.sqDepth->load(std::memory_order_relaxed);
+      continue;
+    }
+    if (ep.sqDepth->compare_exchange_weak(cur, cur + wrCount, std::memory_order_relaxed))
+      return true;
+    if (backoff < 16) {
+      std::this_thread::yield();
+    } else {
+      std::this_thread::sleep_for(std::chrono::microseconds(2));
+    }
+    backoff++;
+  }
+}
+
+static void ReleaseSqDepth(const EpPair& ep, int wrCount) {
+  if (wrCount <= 0 || !ep.sqDepth) return;
+  ep.sqDepth->fetch_sub(wrCount, std::memory_order_relaxed);
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Rdma Utilities                                         */
 /* ---------------------------------------------------------------------------------------------- */
 
 RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
+  (void)status;
 
-  for (int i = 0; i < eps.size(); i++) {
+  std::string reserveErr;
+  int reserved = 0;
+  for (size_t i = 0; i < eps.size(); i++) {
+    if (!TryReserveSqDepth(eps[i], 1, i, "notify", &reserveErr)) {
+      for (int j = 0; j < reserved; ++j) ReleaseSqDepth(eps[j], 1);
+      return {StatusCode::ERR_RDMA_OP, reserveErr};
+    }
+    reserved++;
+  }
+
+  for (size_t i = 0; i < eps.size(); i++) {
     const application::RdmaEndpoint& ep = eps[i].local;
-    NotifMessage msg{id, i, static_cast<int>(eps.size())};
+    NotifMessage msg{id, static_cast<int>(i), static_cast<int>(eps.size())};
 
     struct ibv_sge sge{};
     sge.addr = reinterpret_cast<uintptr_t>(&msg);
@@ -53,7 +158,10 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, Trans
     struct ibv_send_wr* bad_wr = nullptr;
     int ret = ibv_post_send(ep.ibvHandle.qp, &wr, &bad_wr);
     if (ret != 0) {
-      // TODO: set callback status here?
+      // WR i was reserved but failed to post if bad_wr points at this WR.
+      if (bad_wr == &wr) ReleaseSqDepth(eps[i], 1);
+      // Any remaining endpoints are reserved but not posted yet.
+      for (int j = i + 1; j < eps.size(); ++j) ReleaseSqDepth(eps[j], 1);
       return {StatusCode::ERR_RDMA_OP,
               "ibv_post_send (notify) failed with " + std::to_string(ret) + ": " + strerror(ret)};
     }
@@ -66,8 +174,8 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
                              const SizeVec& localOffsets,
                              const application::RdmaMemoryRegion& remote,
                              const SizeVec& remoteOffsets, const SizeVec& sizes,
-                             CqCallbackMeta* callbackMeta, TransferUniqueId id, bool isRead,
-                             int postBatchSize) {
+                             std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id,
+                             bool isRead, int postBatchSize) {
   MORI_IO_FUNCTION_TIMER;
 
   if ((localOffsets.size() != remoteOffsets.size()) || (sizes.size() != remoteOffsets.size())) {
@@ -175,16 +283,43 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
   size_t epNum = eps.size();
   size_t epBatchSize = (mergedWrCount + epNum - 1) / epNum;
 
-  if (postBatchSize == -1) postBatchSize = epBatchSize;
+  if (postBatchSize == -1) {
+    postBatchSize = (epBatchSize > static_cast<size_t>(std::numeric_limits<int>::max()))
+                        ? std::numeric_limits<int>::max()
+                        : static_cast<int>(epBatchSize);
+  }
+  {
+    int minMaxSqDepth = std::numeric_limits<int>::max();
+    for (size_t epId = 0; epId < epNum; ++epId) {
+      if (eps[epId].sqDepth && eps[epId].maxSqDepth > 0) {
+        minMaxSqDepth = std::min(minMaxSqDepth, eps[epId].maxSqDepth);
+      }
+    }
+    if (minMaxSqDepth != std::numeric_limits<int>::max() && postBatchSize > minMaxSqDepth)
+      postBatchSize = minMaxSqDepth;
+  }
+  if (postBatchSize <= 0) postBatchSize = 1;
   int numPostBatch = (mergedWrCount + postBatchSize - 1) / postBatchSize;
 
-  std::vector<size_t> epPostedCounts(epNum, 0);  // Actual posted requests count per endpoint
+  // Per-EP state for adaptive signaling: track WRs and merged requests
+  // accumulated since the last signaled WR on each EP.
+  std::vector<int> epWrsSinceSignal(epNum, 0);
+  std::vector<size_t> epMergedSinceSignal(epNum, 0);
 
   for (int i = 0; i < numPostBatch; i++) {
     int st = i * postBatchSize;
     int end = std::min(static_cast<size_t>(st) + postBatchSize, mergedWrCount);
     if (end - st == 0) break;
     int epId = i % epNum;
+    int batchWrNum = end - st;
+
+    // Reserve SQ depth for this batch; blocks with backoff if the SQ is full,
+    // waiting for CQEs from earlier signaled WRs to drain depth.
+    std::string reserveErr;
+    if (!TryReserveSqDepth(eps[epId], batchWrNum, epId, "batch", &reserveErr)) {
+      return {StatusCode::ERR_RDMA_OP, reserveErr};
+    }
+
     size_t mergedReqSize = 0;
     for (int j = st; j < end; j++) {
       struct ibv_send_wr& wr = mergedWrs[j].wr;
@@ -193,25 +328,117 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
       mergedReqSize += mergedWrs[j].mergedRequests;
     }
 
-    struct ibv_send_wr& last = mergedWrs[end - 1].wr;
+    epWrsSinceSignal[epId] += batchWrNum;
+    epMergedSinceSignal[epId] += mergedReqSize;
 
-    epPostedCounts[epId] += mergedReqSize;
-    if ((i + epNum) >= numPostBatch) {
-      int epTotalBatchSize = static_cast<int>(epPostedCounts[epId]);
-      last.wr_id =
-          reinterpret_cast<uint64_t>(new CqCallbackMessage(callbackMeta, epTotalBatchSize));
+    bool isLastBatchForEp = ((i + epNum) >= numPostBatch);
+    bool sqNearFull = eps[epId].sqDepth && (epWrsSinceSignal[epId] >= eps[epId].maxSqDepth);
+    bool needSignal = isLastBatchForEp || sqNearFull;
+
+    struct ibv_send_wr& last = mergedWrs[end - 1].wr;
+    uint64_t recordId = 0;
+    if (needSignal) {
+      if (!eps[epId].ledger) {
+        ReleaseSqDepth(eps[epId], batchWrNum);
+        return {StatusCode::ERR_RDMA_OP,
+                "submission ledger is not initialized for signaled WR tracking"};
+      }
+      recordId = eps[epId].ledger->Insert(epWrsSinceSignal[epId], true, callbackMeta,
+                                          static_cast<int>(epMergedSinceSignal[epId]));
+      last.wr_id = recordId;
       last.send_flags = IBV_SEND_SIGNALED;
     }
+
     struct ibv_send_wr* badWr = nullptr;
     int ret = ibv_post_send(eps[epId].local.ibvHandle.qp, &mergedWrs[st].wr, &badWr);
     if (ret != 0) {
-      return {StatusCode::ERR_RDMA_OP,
-              "ibv_post_send failed with " + std::to_string(ret) + ": " + strerror(ret)};
+      int postedCount = 0;
+      if (badWr != nullptr) {
+        struct ibv_send_wr* cur = &mergedWrs[st].wr;
+        while (cur != nullptr && cur != badWr && postedCount < batchWrNum) {
+          ++postedCount;
+          cur = cur->next;
+        }
+      }
+      postedCount = std::max(0, std::min(postedCount, batchWrNum));
+      const int unpostedCount = batchWrNum - postedCount;
+      if (unpostedCount > 0) {
+        ReleaseSqDepth(eps[epId], unpostedCount);
+        epWrsSinceSignal[epId] = std::max(0, epWrsSinceSignal[epId] - unpostedCount);
+
+        size_t mergedUnposted = 0;
+        for (int j = st + postedCount; j < end; ++j) {
+          mergedUnposted += mergedWrs[j].mergedRequests;
+        }
+        if (epMergedSinceSignal[epId] >= mergedUnposted) {
+          epMergedSinceSignal[epId] -= mergedUnposted;
+        } else {
+          epMergedSinceSignal[epId] = 0;
+        }
+      }
+
+      const bool lastWasPosted = (postedCount == batchWrNum);
+      if (needSignal && lastWasPosted) {
+        // Signaled WR was posted; CQ path (ledger->ReleaseByCqe) owns the release.
+        // The record inserted above remains in Posted state — nothing to do here.
+      } else if (needSignal) {
+        // Signaled WR itself was NOT posted; remove the record we just inserted
+        // and release whatever was actually posted (tracked via unpostedCount above).
+        int dummy = 0;
+        eps[epId].ledger->ReleaseByCqe(recordId, nullptr, &dummy);
+      }
+
+      if (postedCount > 0 && (!needSignal || !lastWasPosted)) {
+        MORI_IO_WARN(
+            "ibv_post_send partially posted {} / {} WRs without a posted signaled tail; "
+            "marking EP {} as degraded until recovery",
+            postedCount, batchWrNum, epId);
+        if (eps[epId].degraded) {
+          eps[epId].degraded->store(true, std::memory_order_relaxed);
+        }
+        // Ledger record for ALL orphaned posted WRs (including prior unsignaled batches
+        // on this EP): sqDepth held by ledger until recovery.
+        if (eps[epId].ledger) {
+          eps[epId].ledger->InsertOrphaned(epWrsSinceSignal[epId], callbackMeta,
+                                           static_cast<int>(epMergedSinceSignal[epId]));
+        }
+      }
+
+      for (size_t otherEpId = 0; otherEpId < epNum; ++otherEpId) {
+        if (static_cast<int>(otherEpId) == epId) continue;
+        if (epWrsSinceSignal[otherEpId] <= 0) continue;
+        MORI_IO_WARN(
+            "ibv_post_send failed on ep {}: moving pending unsignaled WRs on ep {} "
+            "(wrCount={}, mergedReq={}) to orphaned and marking degraded",
+            epId, otherEpId, epWrsSinceSignal[otherEpId], epMergedSinceSignal[otherEpId]);
+        if (eps[otherEpId].degraded) {
+          eps[otherEpId].degraded->store(true, std::memory_order_relaxed);
+        }
+        if (eps[otherEpId].ledger) {
+          eps[otherEpId].ledger->InsertOrphaned(epWrsSinceSignal[otherEpId], callbackMeta,
+                                                static_cast<int>(epMergedSinceSignal[otherEpId]));
+        } else {
+          MORI_IO_WARN(
+              "EP {} has pending unsignaled WRs but no submission ledger; "
+              "sqDepth may remain stale until endpoint restart",
+              otherEpId);
+        }
+      }
+
+      return {StatusCode::ERR_RDMA_OP, "ibv_post_send failed with " + std::to_string(ret) + ": " +
+                                           strerror(ret) + " (posted " +
+                                           std::to_string(postedCount) + "/" +
+                                           std::to_string(batchWrNum) + " WRs)"};
+    }
+
+    if (needSignal) {
+      epWrsSinceSignal[epId] = 0;
+      epMergedSinceSignal[epId] = 0;
     }
     MORI_IO_TRACE("ibv_post_send ep index {} batch index range [{}, {})", epId, st, end);
   }
   return {StatusCode::IN_PROGRESS, ""};
 }
 
-};  // namespace io
-};  // namespace mori
+}  // namespace io
+}  // namespace mori
