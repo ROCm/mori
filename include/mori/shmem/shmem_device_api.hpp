@@ -237,6 +237,92 @@ DEFINE_SHMEM_PUT_TYPE_NBI_API(Float, float, Block)
 DEFINE_SHMEM_PUT_TYPE_NBI_API(Double, double, Block)
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                                     Blocking PUT APIs                                          */
+/* ---------------------------------------------------------------------------------------------- */
+#define DEFINE_SHMEM_PUT_MEM_API_TEMPLATE(Scope)                                              \
+  inline __device__ void ShmemPutMem##Scope(                                                  \
+      const application::SymmMemObjPtr dest, size_t destOffset,                               \
+      const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe,     \
+      int qpId = 0) {                                                                         \
+    ShmemPutMemNbi##Scope(dest, destOffset, source, sourceOffset, bytes, pe, qpId);           \
+    ShmemQuietThread(pe, qpId);                                                               \
+  }
+
+DEFINE_SHMEM_PUT_MEM_API_TEMPLATE(Thread)
+DEFINE_SHMEM_PUT_MEM_API_TEMPLATE(Warp)
+
+inline __device__ void ShmemPutMemBlock(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe,
+    int qpId = 0) {
+  ShmemPutMemNbiBlock(dest, destOffset, source, sourceOffset, bytes, pe, qpId);
+  __syncthreads();
+  if (core::FlatBlockThreadId() == 0) {
+    ShmemQuietThread(pe, qpId);
+  }
+  __syncthreads();
+}
+
+#define DEFINE_SHMEM_PUT_TYPE_API_TEMPLATE(Scope)                                              \
+  template <typename T>                                                                        \
+  inline __device__ void ShmemPutType##Scope(                                                  \
+      const application::SymmMemObjPtr dest, size_t destElmOffset,                             \
+      const application::SymmMemObjPtr source, size_t srcElmOffset, size_t nelems, int pe,     \
+      int qpId = 0) {                                                                          \
+    constexpr size_t typeSize = sizeof(T);                                                     \
+    ShmemPutMem##Scope(dest, destElmOffset * typeSize, source, srcElmOffset * typeSize,        \
+                       nelems * typeSize, pe, qpId);                                           \
+  }
+
+DEFINE_SHMEM_PUT_TYPE_API_TEMPLATE(Thread)
+DEFINE_SHMEM_PUT_TYPE_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_TYPE_API_TEMPLATE(Block)
+
+#define DEFINE_SHMEM_PUT_TYPE_API(TypeName, T, Scope)                                          \
+  inline __device__ void ShmemPut##TypeName##Scope(                                            \
+      const application::SymmMemObjPtr dest, size_t destElmOffset,                             \
+      const application::SymmMemObjPtr source, size_t srcElmOffset, size_t nelems, int pe,     \
+      int qpId = 0) {                                                                          \
+    ShmemPutType##Scope<T>(dest, destElmOffset, source, srcElmOffset, nelems, pe, qpId);       \
+  }
+
+DEFINE_SHMEM_PUT_TYPE_API(Uint8, uint8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_API(Int8, int8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_API(Schar, signed char, Thread)
+DEFINE_SHMEM_PUT_TYPE_API(Uint16, uint16_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_API(Int16, int16_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_API(Float, float, Thread)
+DEFINE_SHMEM_PUT_TYPE_API(Double, double, Thread)
+
+DEFINE_SHMEM_PUT_TYPE_API(Uint8, uint8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_API(Int8, int8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_API(Schar, signed char, Warp)
+DEFINE_SHMEM_PUT_TYPE_API(Uint16, uint16_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_API(Int16, int16_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_API(Float, float, Warp)
+DEFINE_SHMEM_PUT_TYPE_API(Double, double, Warp)
+
+DEFINE_SHMEM_PUT_TYPE_API(Uint8, uint8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_API(Int8, int8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_API(Schar, signed char, Block)
+DEFINE_SHMEM_PUT_TYPE_API(Uint16, uint16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_API(Int16, int16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_API(Uint32, uint32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_API(Int32, int32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_API(Uint64, uint64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_API(Int64, int64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_API(Float, float, Block)
+DEFINE_SHMEM_PUT_TYPE_API(Double, double, Block)
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                         GetNbi APIs                                            */
 /* ---------------------------------------------------------------------------------------------- */
 #define DEFINE_SHMEM_GET_MEM_NBI_API_TEMPLATE(Scope)                                      \
@@ -325,7 +411,18 @@ DEFINE_SHMEM_GET_TYPE_NBI_API(Double, double, Block)
 
 DEFINE_SHMEM_GET_MEM_API_TEMPLATE(Thread)
 DEFINE_SHMEM_GET_MEM_API_TEMPLATE(Warp)
-DEFINE_SHMEM_GET_MEM_API_TEMPLATE(Block)
+
+inline __device__ void ShmemGetMemBlock(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe,
+    int qpId = 0) {
+  ShmemGetMemNbiBlock(dest, destOffset, source, sourceOffset, bytes, pe, qpId);
+  __syncthreads();
+  if (core::FlatBlockThreadId() == 0) {
+    ShmemQuietThread(pe, qpId);
+  }
+  __syncthreads();
+}
 
 #define DEFINE_SHMEM_GET_TYPE_API_TEMPLATE(Scope)                                              \
   template <typename T>                                                                        \
@@ -847,6 +944,82 @@ DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Float, float, Block)
 DEFINE_SHMEM_PUT_TYPE_NBI_SIGNAL_ADDR_API(Double, double, Block)
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                                Blocking PUT APIs (Address-Based)                               */
+/* ---------------------------------------------------------------------------------------------- */
+#define DEFINE_SHMEM_PUT_MEM_ADDR_API_TEMPLATE(Scope)                                          \
+  inline __device__ void ShmemPutMem##Scope(void* dest, const void* source, size_t bytes,      \
+                                            int pe, int qpId = 0) {                            \
+    ShmemPutMemNbi##Scope(dest, source, bytes, pe, qpId);                                      \
+    ShmemQuietThread(pe, qpId);                                                                \
+  }
+
+DEFINE_SHMEM_PUT_MEM_ADDR_API_TEMPLATE(Thread)
+DEFINE_SHMEM_PUT_MEM_ADDR_API_TEMPLATE(Warp)
+
+inline __device__ void ShmemPutMemBlock(void* dest, const void* source, size_t bytes,
+                                        int pe, int qpId = 0) {
+  ShmemPutMemNbiBlock(dest, source, bytes, pe, qpId);
+  __syncthreads();
+  if (core::FlatBlockThreadId() == 0) {
+    ShmemQuietThread(pe, qpId);
+  }
+  __syncthreads();
+}
+
+#define DEFINE_SHMEM_PUT_TYPE_ADDR_API_TEMPLATE(Scope)                                            \
+  template <typename T>                                                                           \
+  inline __device__ void ShmemPutType##Scope(T* dest, const T* source, size_t nelems, int pe,     \
+                                             int qpId = 0) {                                      \
+    ShmemPutMem##Scope(dest, source, nelems * sizeof(T), pe, qpId);                               \
+  }
+
+DEFINE_SHMEM_PUT_TYPE_ADDR_API_TEMPLATE(Thread)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API_TEMPLATE(Warp)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API_TEMPLATE(Block)
+
+#define DEFINE_SHMEM_PUT_TYPE_ADDR_API(TypeName, T, Scope)                                        \
+  inline __device__ void ShmemPut##TypeName##Scope(T* dest, const T* source, size_t nelems,       \
+                                                   int pe, int qpId = 0) {                        \
+    ShmemPutType##Scope<T>(dest, source, nelems, pe, qpId);                                       \
+  }
+
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Uint8, uint8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Int8, int8_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Schar, signed char, Thread)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Uint16, uint16_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Int16, int16_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Uint32, uint32_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Int32, int32_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Uint64, uint64_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Int64, int64_t, Thread)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Float, float, Thread)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Double, double, Thread)
+
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Uint8, uint8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Int8, int8_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Schar, signed char, Warp)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Uint16, uint16_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Int16, int16_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Uint32, uint32_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Int32, int32_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Uint64, uint64_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Int64, int64_t, Warp)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Float, float, Warp)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Double, double, Warp)
+
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Uint8, uint8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Int8, int8_t, Block)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Schar, signed char, Block)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Uint16, uint16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Int16, int16_t, Block)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Uint32, uint32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Int32, int32_t, Block)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Uint64, uint64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Int64, int64_t, Block)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Float, float, Block)
+DEFINE_SHMEM_PUT_TYPE_ADDR_API(Double, double, Block)
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                        GetNbi APIs (Address-Based)                             */
 /* ---------------------------------------------------------------------------------------------- */
 #define DEFINE_SHMEM_GET_MEM_NBI_ADDR_API_TEMPLATE(Scope)                                      \
@@ -924,7 +1097,16 @@ DEFINE_SHMEM_GET_TYPE_NBI_ADDR_API(Double, double, Block)
 
 DEFINE_SHMEM_GET_MEM_ADDR_API_TEMPLATE(Thread)
 DEFINE_SHMEM_GET_MEM_ADDR_API_TEMPLATE(Warp)
-DEFINE_SHMEM_GET_MEM_ADDR_API_TEMPLATE(Block)
+
+inline __device__ void ShmemGetMemBlock(void* dest, const void* source, size_t bytes,
+                                        int pe, int qpId = 0) {
+  ShmemGetMemNbiBlock(dest, source, bytes, pe, qpId);
+  __syncthreads();
+  if (core::FlatBlockThreadId() == 0) {
+    ShmemQuietThread(pe, qpId);
+  }
+  __syncthreads();
+}
 
 #define DEFINE_SHMEM_GET_TYPE_ADDR_API_TEMPLATE(Scope)                                            \
   template <typename T>                                                                           \

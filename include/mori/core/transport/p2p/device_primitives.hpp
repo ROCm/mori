@@ -110,35 +110,40 @@ struct VecTypeAdaptor<mori_fp4_e2m1, 4> {
 #define USE_BUILDIN_LD 1
 #define USE_BUILDIN_ST 1
 
+// Annotate pointers with global address space (1) so the compiler emits
+// global_load/global_store instead of slower flat_load/flat_store.
+// Reference: RCCL uses the same technique for its device primitives.
+#define MORI_GLOBAL __attribute__((address_space(1)))
+
 #if USE_BUILDIN_LD
 template <int VecBytes>
 __device__ __forceinline__ typename VecTypeSelector<VecBytes>::dataType load(const void* addr);
 
 template <>
 __device__ __forceinline__ typename VecTypeSelector<1>::dataType load<1>(const void* addr) {
-  return __builtin_nontemporal_load((uint8_t*)addr);
+  return __builtin_nontemporal_load((uint8_t MORI_GLOBAL*)addr);
 }
 
 template <>
 __device__ __forceinline__ typename VecTypeSelector<2>::dataType load<2>(const void* addr) {
-  return __builtin_nontemporal_load((uint16_t*)addr);
+  return __builtin_nontemporal_load((uint16_t MORI_GLOBAL*)addr);
 }
 
 template <>
 __device__ __forceinline__ typename VecTypeSelector<4>::dataType load<4>(const void* addr) {
-  return __builtin_nontemporal_load((uint32_t*)addr);
+  return __builtin_nontemporal_load((uint32_t MORI_GLOBAL*)addr);
 }
 
 template <>
 __device__ __forceinline__ typename VecTypeSelector<8>::dataType load<8>(const void* addr) {
-  return __builtin_nontemporal_load((uint64_t*)addr);
+  return __builtin_nontemporal_load((uint64_t MORI_GLOBAL*)addr);
 }
 
 template <>
 __device__ __forceinline__ typename VecTypeSelector<16>::dataType load<16>(const void* addr) {
   ulong2 result;
-  result.x = __builtin_nontemporal_load((uint64_t*)addr);
-  result.y = __builtin_nontemporal_load(((uint64_t*)addr) + 1);
+  result.x = __builtin_nontemporal_load((uint64_t MORI_GLOBAL*)addr);
+  result.y = __builtin_nontemporal_load(((uint64_t MORI_GLOBAL*)addr) + 1);
   return result;
 }
 #else
@@ -182,29 +187,29 @@ __device__ __forceinline__ void store(void* addr,
 
 template <>
 __device__ __forceinline__ void store<1>(void* addr, typename VecTypeSelector<1>::dataType value) {
-  __builtin_nontemporal_store(value, (uint8_t*)addr);
+  __builtin_nontemporal_store(value, (uint8_t MORI_GLOBAL*)addr);
 }
 
 template <>
 __device__ __forceinline__ void store<2>(void* addr, typename VecTypeSelector<2>::dataType value) {
-  __builtin_nontemporal_store(value, (uint16_t*)addr);
+  __builtin_nontemporal_store(value, (uint16_t MORI_GLOBAL*)addr);
 }
 
 template <>
 __device__ __forceinline__ void store<4>(void* addr, typename VecTypeSelector<4>::dataType value) {
-  __builtin_nontemporal_store(value, (uint32_t*)addr);
+  __builtin_nontemporal_store(value, (uint32_t MORI_GLOBAL*)addr);
 }
 
 template <>
 __device__ __forceinline__ void store<8>(void* addr, typename VecTypeSelector<8>::dataType value) {
-  __builtin_nontemporal_store(value, (uint64_t*)addr);
+  __builtin_nontemporal_store(value, (uint64_t MORI_GLOBAL*)addr);
 }
 
 template <>
 __device__ __forceinline__ void store<16>(void* addr,
                                           typename VecTypeSelector<16>::dataType value) {
-  __builtin_nontemporal_store(value.x, (uint64_t*)addr);
-  __builtin_nontemporal_store(value.y, ((uint64_t*)addr) + 1);
+  __builtin_nontemporal_store(value.x, (uint64_t MORI_GLOBAL*)addr);
+  __builtin_nontemporal_store(value.y, ((uint64_t MORI_GLOBAL*)addr) + 1);
 }
 #else
 template <int VecBytes>

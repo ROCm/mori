@@ -39,6 +39,23 @@ def shmem_put_kernel(symm_buf_ptr, value):
 
 
 @triton.jit
+def shmem_put_nbi_kernel(dest_buf_ptr, src_buf_ptr, nbytes):
+    mype = mori_shmem_device.my_pe()
+    npes = mori_shmem_device.n_pes()
+    dest_pe = (mype + 1) % npes
+    mori_shmem_device.putmem_nbi_thread(dest_buf_ptr, src_buf_ptr, nbytes, dest_pe, 0)
+    mori_shmem_device.quiet_thread()
+
+
+@triton.jit
+def shmem_put_blocking_kernel(dest_buf_ptr, src_buf_ptr, nbytes):
+    mype = mori_shmem_device.my_pe()
+    npes = mori_shmem_device.n_pes()
+    dest_pe = (mype + 1) % npes
+    mori_shmem_device.putmem_thread(dest_buf_ptr, src_buf_ptr, nbytes, dest_pe, 0)
+
+
+@triton.jit
 def shmem_get_nbi_kernel(local_buf_ptr, remote_buf_ptr, nbytes):
     mype = mori_shmem_device.my_pe()
     npes = mori_shmem_device.n_pes()
@@ -116,6 +133,56 @@ def test_put(mype, npes, extern_libs):
     print(f"[PE {mype}] [Triton] put    PASS")
 
 
+def test_put_nbi(mype, npes, extern_libs):
+    import mori.shmem as ms
+    from mori.shmem import mori_shmem_create_tensor
+
+    print(f"\n[PE {mype}] === Triton: shmem_put_nbi_kernel ===")
+    dest_buf = mori_shmem_create_tensor((1,), torch.int32)
+    dest_buf.fill_(-1)
+    src_buf = mori_shmem_create_tensor((1,), torch.int32)
+    src_buf.fill_(mype * 100 + 42)
+    torch.cuda.synchronize()
+    ms.shmem_barrier_all()
+
+    nbytes = 4
+    shmem_put_nbi_kernel[(1,)](dest_buf, src_buf, nbytes, extern_libs=extern_libs)
+    torch.cuda.synchronize()
+    ms.shmem_barrier_all()
+
+    src_pe = (mype - 1 + npes) % npes
+    exp = src_pe * 100 + 42
+    got = dest_buf.item()
+    print(f"[PE {mype}] dest_buf={got}, expected={exp} (PUT nbi from PE {src_pe})")
+    assert got == exp, f"PE {mype}: expected {exp}, got {got}"
+    print(f"[PE {mype}] [Triton] put_nbi      PASS")
+
+
+def test_put_blocking(mype, npes, extern_libs):
+    import mori.shmem as ms
+    from mori.shmem import mori_shmem_create_tensor
+
+    print(f"\n[PE {mype}] === Triton: shmem_put_blocking_kernel ===")
+    dest_buf = mori_shmem_create_tensor((1,), torch.int32)
+    dest_buf.fill_(-1)
+    src_buf = mori_shmem_create_tensor((1,), torch.int32)
+    src_buf.fill_(mype * 200 + 99)
+    torch.cuda.synchronize()
+    ms.shmem_barrier_all()
+
+    nbytes = 4
+    shmem_put_blocking_kernel[(1,)](dest_buf, src_buf, nbytes, extern_libs=extern_libs)
+    torch.cuda.synchronize()
+    ms.shmem_barrier_all()
+
+    src_pe = (mype - 1 + npes) % npes
+    exp = src_pe * 200 + 99
+    got = dest_buf.item()
+    print(f"[PE {mype}] dest_buf={got}, expected={exp} (PUT blocking from PE {src_pe})")
+    assert got == exp, f"PE {mype}: expected {exp}, got {got}"
+    print(f"[PE {mype}] [Triton] put_blocking  PASS")
+
+
 def test_get_nbi(mype, npes, extern_libs):
     import mori.shmem as ms
     from mori.shmem import mori_shmem_create_tensor
@@ -177,6 +244,8 @@ def main():
     try:
         test_basic(mype, npes, extern_libs)
         test_put(mype, npes, extern_libs)
+        test_put_nbi(mype, npes, extern_libs)
+        test_put_blocking(mype, npes, extern_libs)
         test_get_nbi(mype, npes, extern_libs)
         test_get_blocking(mype, npes, extern_libs)
         if mype == 0:
