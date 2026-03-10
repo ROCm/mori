@@ -1,104 +1,92 @@
-Profiler
-========
+MORI-VIZ Kernel Profiler
+========================
 
-MORI includes a built-in profiler for analyzing communication performance.
+MORI-VIZ is a warp-level GPU kernel profiler with Perfetto integration. It captures fine-grained timing data from dispatch/combine kernels.
 
-Starting the Profiler
-----------------------
+Requirements
+------------
+
+Build MORI with profiling enabled:
+
+.. code-block:: bash
+
+   ENABLE_PROFILER=ON pip install .
+
+Usage
+-----
+
+**Capture and export traces:**
 
 .. code-block:: python
 
    import mori
+   from mori.kernel_profiler import export_to_perfetto
 
-   # Start profiling
-   mori.profiler.start()
+   # Run dispatch/combine operations first, then:
+   if hasattr(mori.cpp, "get_debug_time_buf"):
+       trace_buffer = mori.cpp.get_debug_time_buf(op._handle)
+       export_to_perfetto(trace_buffer, "ep_trace.json")
 
-   # Your code here
-   mori.all_reduce(tensor)
+**Visualize:** Open the JSON file at `ui.perfetto.dev <https://ui.perfetto.dev/>`_.
 
-   # Stop profiling
-   mori.profiler.stop()
-
-Saving Results
---------------
+export_to_perfetto
+------------------
 
 .. code-block:: python
 
-   # Save as JSON
-   mori.profiler.save_results("profile.json")
+   export_to_perfetto(
+       trace_buffer,
+       filename="trace.json",
+       slot_map=None,
+       gpu_freq_ghz=None,
+       validate_pairs=True,
+       sanitize_orphans=True,
+   )
 
-   # Save as CSV
-   mori.profiler.save_results("profile.csv", format="csv")
+**Parameters:**
 
-Analyzing Results
+.. list-table::
+   :header-rows: 1
+   :widths: 25 15 60
+
+   * - Parameter
+     - Default
+     - Description
+   * - ``trace_buffer``
+     -
+     - Raw trace buffer from ``mori.cpp.get_debug_time_buf(handle)``
+   * - ``filename``
+     - ``"trace.json"``
+     - Output file path (Perfetto JSON format)
+   * - ``slot_map``
+     - ``None``
+     - Custom slot name mapping (uses built-in profiler slots if None)
+   * - ``gpu_freq_ghz``
+     - ``None``
+     - GPU clock frequency; auto-detected via ``get_cur_device_wall_clock_freq_mhz()`` if None
+   * - ``validate_pairs``
+     - ``True``
+     - Validate begin/end event pairs
+   * - ``sanitize_orphans``
+     - ``True``
+     - Remove unpaired events
+
+C++ Profiler APIs
 -----------------
 
-Profile data includes:
+Available via ``mori.cpp`` when built with ``ENABLE_PROFILER=ON``:
 
-* Operation name
-* Duration (microseconds)
-* Tensor size (bytes)
-* Bandwidth (GB/s)
-* Timestamp
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
 
-**Example output:**
+   * - Function
+     - Description
+   * - ``get_debug_time_buf(handle)``
+     - Get raw trace buffer from an EP handle
+   * - ``get_debug_time_offset(handle)``
+     - Get current write offset in the trace buffer
+   * - ``get_cur_device_wall_clock_freq_mhz()``
+     - Get GPU wall clock frequency in MHz
 
-.. code-block:: json
-
-   {
-     "operations": [
-       {
-         "name": "all_reduce",
-         "duration_us": 125.3,
-         "size_bytes": 4194304,
-         "bandwidth_gbps": 31.8,
-         "timestamp": 1234567890
-       }
-     ]
-   }
-
-Context Manager
----------------
-
-Use as a context manager for automatic start/stop:
-
-.. code-block:: python
-
-   with mori.profiler.profile():
-       mori.all_reduce(tensor)
-       mori.barrier()
-
-   # Results automatically saved
-
-Advanced Features
------------------
-
-**Filter by operation:**
-
-.. code-block:: python
-
-   mori.profiler.filter(operations=["all_reduce", "all_gather"])
-
-**Set output directory:**
-
-.. code-block:: python
-
-   mori.profiler.set_output_dir("/path/to/profiles")
-
-**Enable detailed logging:**
-
-.. code-block:: python
-
-   mori.profiler.set_log_level("DEBUG")
-
-Visualization
--------------
-
-MORI profiler output can be visualized with standard tools:
-
-.. code-block:: bash
-
-   # Convert to Chrome trace format
-   python -m mori.profiler.convert profile.json --format chrome
-
-   # View in chrome://tracing
+See `PROFILER.md <../PROFILER.md>`_ for full profiler documentation.

@@ -1,7 +1,7 @@
 MORI Documentation
 ==================
 
-**MORI** (Memory-Optimized ROCm Infrastructure) is AMD's high-performance communication library for distributed AI training and inference on ROCm platforms.
+**MORI** (**Mo**\dular **R**\DMA **I**\nterface) is a bottom-up, modular, and composable framework for building high-performance communication applications with a strong focus on RDMA + GPU integration.
 
 .. toctree::
    :maxdepth: 2
@@ -12,12 +12,19 @@ MORI Documentation
 
 .. toctree::
    :maxdepth: 2
-   :caption: Features
+   :caption: User Guides
 
+   MORI-EP-GUIDE
+   MORI-SHMEM-GUIDE
    MORI-IO-INTRO
-   MORI-IO-BENCHMARK
-   MORI-EP-BENCHMARK
    PROFILER
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Benchmarks
+
+   MORI-EP-BENCHMARK
+   MORI-IO-BENCHMARK
 
 .. toctree::
    :maxdepth: 2
@@ -26,51 +33,38 @@ MORI Documentation
    api/communication
    api/profiler
 
-Features
---------
-
-* **High-Performance I/O**: Optimized communication primitives for ROCm
-* **Distributed Training**: Efficient all-reduce, all-gather, and reduce-scatter operations
-* **Profiling Tools**: Built-in profiler for performance analysis
-* **ROCm Integration**: Native support for AMD Instinct GPUs
-
-Supported GPUs
---------------
+Components
+----------
 
 .. list-table::
    :header-rows: 1
-   :widths: 30 20 20 30
+   :widths: 20 80
 
-   * - GPU
-     - Architecture
-     - Memory
-     - Status
-   * - AMD Instinct MI300X
-     - CDNA 3 (gfx942)
-     - 192 GB HBM3
-     - ✅ Fully Supported
-   * - AMD Instinct MI250X
-     - CDNA 2 (gfx90a)
-     - 128 GB HBM2e
-     - ✅ Fully Supported
-   * - AMD Instinct MI300A
-     - CDNA 3 (gfx950)
-     - 128 GB HBM3
-     - 🧪 Experimental
+   * - Component
+     - Description
+   * - **MORI-EP**
+     - Intra and inter-node dispatch/combine kernels for MoE Expert Parallelism
+   * - **MORI-IO**
+     - Point-to-point communication library for KVCache transfer via RDMA
+   * - **MORI-CCL**
+     - Lightweight collective communication for latency-sensitive environments
+   * - **MORI Shmem**
+     - OpenSHMEM-style symmetric memory APIs for GPU memory and RDMA
+   * - **MORI-VIZ**
+     - Warp-level kernel profiler with Perfetto integration
+
+Supported Hardware
+------------------
+
+**GPUs:** MI308X, MI300X, MI325X, MI355X (MI450X under development)
+
+**NICs:** AMD Pollara (AINIC), Mellanox ConnectX-7, Broadcom Thor2 (Volcano under development)
 
 Quick Links
 -----------
 
 * **GitHub**: https://github.com/ROCm/mori
-* **ROCm Documentation**: https://rocm.docs.amd.com
 * **Issues**: https://github.com/ROCm/mori/issues
-
-Getting Help
-------------
-
-* **Documentation**: https://sunway513.github.io/mori/
-* **GitHub Issues**: https://github.com/ROCm/mori/issues
-* **ROCm Community**: https://github.com/ROCm/ROCm/discussions
 
 Indices and tables
 ==================
