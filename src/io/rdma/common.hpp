@@ -24,6 +24,8 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 
 #include "mori/io/common.hpp"
 #include "mori/io/enum.hpp"
@@ -102,28 +104,6 @@ struct hash<mori::io::MemoryKey> {
 namespace mori {
 namespace io {
 
-struct EpPair {
-  int weight;
-  int ldevId;
-  int rdevId;
-  EngineKey remoteEngineKey;
-  application::RdmaEndpoint local;
-  application::RdmaEndpointHandle remote;
-  // Shared across EpPair copies that refer to the same QP.
-  std::shared_ptr<std::atomic<int>> sqDepth;
-  int maxSqDepth{0};
-};
-
-using EpPairVec = std::vector<EpPair>;
-using RouteTable = std::unordered_map<TopoKeyPair, EpPairVec>;
-using MemoryTable = std::unordered_map<MemoryKey, application::RdmaMemoryRegion>;
-
-struct RemoteEngineMeta {
-  EngineKey key;
-  RouteTable rTable;
-  MemoryTable mTable;
-};
-
 struct NotifMessage {
   TransferUniqueId id{0};
   int qpIndex{-1};
@@ -140,12 +120,75 @@ struct CqCallbackMeta {
   std::atomic<uint32_t> finishedBatchSize{0};
 };
 
-struct CqCallbackMessage {
-  CqCallbackMessage(std::shared_ptr<CqCallbackMeta> m, int n, int wr = 0)
-      : meta(std::move(m)), batchSize(n), wrCount(wr) {}
-  std::shared_ptr<CqCallbackMeta> meta{nullptr};
+// SubmissionLedger: tracks per-EP WR submissions and enables precise sqDepth release.
+enum class SubmissionState : uint8_t {
+  Posted,    // submitted, awaiting CQE
+  Orphaned,  // partial post without signaled tail; awaits recovery
+};
+
+struct SubmissionRecord {
+  uint64_t recordId{0};
+  int postedWr{0};
+  bool hasSignaledTail{false};
+  SubmissionState state{SubmissionState::Posted};
+  std::shared_ptr<CqCallbackMeta> meta;
   int batchSize{0};
-  int wrCount{0};
+};
+
+class SubmissionLedger {
+ public:
+  // Allocate recordId, insert Posted record, return recordId.
+  uint64_t Insert(int postedWr, bool hasSignaledTail, std::shared_ptr<CqCallbackMeta> meta,
+                  int batchSize);
+
+  // Insert an Orphaned record (partial post, no signaled tail).
+  void InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMeta> meta, int batchSize);
+
+  // CQE path: find record by recordId, release sqDepth, return CqCallbackMeta.
+  // Returns nullptr if record not found.
+  std::shared_ptr<CqCallbackMeta> ReleaseByCqe(uint64_t recordId, std::atomic<int>* sqDepth,
+                                               int* outBatchSize);
+
+  // TODO: Wire up a recovery path that calls ReleaseAllByRecovery() and clears
+  // EpPair::degraded.  Currently degraded EPs stay blocked until process restart.
+
+  // Recovery path: clear all non-Released records, release accumulated sqDepth.
+  // Returns total WR count released.
+  int ReleaseAllByRecovery(std::atomic<int>* sqDepth);
+
+  bool HasOrphaned() const;
+
+ private:
+  mutable std::mutex mu_;
+  uint64_t nextId_{1};
+  std::unordered_map<uint64_t, SubmissionRecord> records_;
+};
+
+struct EpPair {
+  int weight;
+  int ldevId;
+  int rdevId;
+  EngineKey remoteEngineKey;
+  application::RdmaEndpoint local;
+  application::RdmaEndpointHandle remote;
+  // Shared across EpPair copies that refer to the same QP.
+  std::shared_ptr<std::atomic<int>> sqDepth;
+  int maxSqDepth{0};
+  // Degraded flag — set on partial post without signaled tail.
+  // TODO: Implement recovery that resets degraded to false and calls
+  // ledger->ReleaseAllByRecovery() to drain orphaned sqDepth.
+  std::shared_ptr<std::atomic<bool>> degraded;
+  std::shared_ptr<SubmissionLedger> ledger;
+};
+
+using EpPairVec = std::vector<EpPair>;
+using RouteTable = std::unordered_map<TopoKeyPair, EpPairVec>;
+using MemoryTable = std::unordered_map<MemoryKey, application::RdmaMemoryRegion>;
+
+struct RemoteEngineMeta {
+  EngineKey key;
+  RouteTable rTable;
+  MemoryTable mTable;
 };
 
 struct RdmaOpRet {

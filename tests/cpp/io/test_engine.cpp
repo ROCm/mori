@@ -25,12 +25,57 @@
 #include <sys/socket.h>
 
 #include <cassert>
+#include <memory>
 #include <vector>
 
 #include "mori/application/utils/check.hpp"
 #include "mori/io/io.hpp"
+#include "src/io/rdma/common.hpp"
 
 using namespace mori::io;
+
+void TestSubmissionLedger() {
+  {
+    SubmissionLedger ledger;
+    std::atomic<int> sqDepth{5};
+    TransferStatus status;
+    auto meta = std::make_shared<CqCallbackMeta>(&status, 101, 8);
+
+    const uint64_t id = ledger.Insert(3, true, meta, 8);
+    int batchSize = 0;
+    auto releasedMeta = ledger.ReleaseByCqe(id, &sqDepth, &batchSize);
+    assert(releasedMeta != nullptr);
+    assert(releasedMeta->id == 101);
+    assert(batchSize == 8);
+    assert(sqDepth.load(std::memory_order_relaxed) == 2);
+  }
+
+  {
+    SubmissionLedger ledger;
+    std::atomic<int> sqDepth{12};
+    TransferStatus status;
+    auto meta = std::make_shared<CqCallbackMeta>(&status, 202, 16);
+
+    ledger.Insert(4, true, meta, 10);
+    ledger.InsertOrphaned(3, meta, 6);
+    assert(ledger.HasOrphaned());
+
+    const int recovered = ledger.ReleaseAllByRecovery(&sqDepth);
+    assert(recovered == 7);
+    assert(sqDepth.load(std::memory_order_relaxed) == 5);
+    assert(!ledger.HasOrphaned());
+  }
+
+  {
+    SubmissionLedger ledger;
+    std::atomic<int> sqDepth{1};
+    int batchSize = -1;
+    auto missing = ledger.ReleaseByCqe(9999, &sqDepth, &batchSize);
+    assert(missing == nullptr);
+    assert(batchSize == -1);
+    assert(sqDepth.load(std::memory_order_relaxed) == 1);
+  }
+}
 
 int GetFreePort() {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -137,4 +182,7 @@ void TestMoriIOEngine() {
   target.DeregisterMemory(targetMem);
 }
 
-int main() { TestMoriIOEngine(); }
+int main() {
+  TestSubmissionLedger();
+  TestMoriIOEngine();
+}

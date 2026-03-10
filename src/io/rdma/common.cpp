@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "src/io/rdma/common.hpp"
 
+#include <cassert>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -55,6 +56,10 @@ static int GetSqBackoffTimeoutUs() {
 static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const char* opTag,
                               std::string* errMsg) {
   if (wrCount <= 0 || !ep.sqDepth) return true;
+  if (ep.degraded && ep.degraded->load(std::memory_order_relaxed)) {
+    if (errMsg) *errMsg = "EP is degraded, rejecting new submissions";
+    return false;
+  }
   if (wrCount > ep.maxSqDepth) {
     MORI_IO_WARN("SQ request exceeds capacity ({}): ep={} requested={} max={}", opTag, epId,
                  wrCount, ep.maxSqDepth);
@@ -71,6 +76,12 @@ static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const cha
   int backoff = 0;
   int cur = ep.sqDepth->load(std::memory_order_relaxed);
   while (true) {
+    // Re-check degraded state while waiting to avoid accepting new submissions
+    // after another thread has marked this EP as degraded.
+    if (ep.degraded && ep.degraded->load(std::memory_order_relaxed)) {
+      if (errMsg) *errMsg = "EP is degraded, rejecting new submissions";
+      return false;
+    }
     if (cur + wrCount > ep.maxSqDepth) {
       if (std::chrono::steady_clock::now() >= deadline) {
         MORI_IO_WARN(
@@ -271,7 +282,11 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
   size_t epNum = eps.size();
   size_t epBatchSize = (mergedWrCount + epNum - 1) / epNum;
 
-  if (postBatchSize == -1) postBatchSize = epBatchSize;
+  if (postBatchSize == -1) {
+    postBatchSize = (epBatchSize > static_cast<size_t>(std::numeric_limits<int>::max()))
+                        ? std::numeric_limits<int>::max()
+                        : static_cast<int>(epBatchSize);
+  }
   {
     int minMaxSqDepth = std::numeric_limits<int>::max();
     for (size_t epId = 0; epId < epNum; ++epId) {
@@ -320,11 +335,16 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     bool needSignal = isLastBatchForEp || sqNearFull;
 
     struct ibv_send_wr& last = mergedWrs[end - 1].wr;
-    CqCallbackMessage* cbMsg = nullptr;
+    uint64_t recordId = 0;
     if (needSignal) {
-      cbMsg = new CqCallbackMessage(callbackMeta, static_cast<int>(epMergedSinceSignal[epId]),
-                                    epWrsSinceSignal[epId]);
-      last.wr_id = reinterpret_cast<uint64_t>(cbMsg);
+      if (!eps[epId].ledger) {
+        ReleaseSqDepth(eps[epId], batchWrNum);
+        return {StatusCode::ERR_RDMA_OP,
+                "submission ledger is not initialized for signaled WR tracking"};
+      }
+      recordId = eps[epId].ledger->Insert(epWrsSinceSignal[epId], true, callbackMeta,
+                                          static_cast<int>(epMergedSinceSignal[epId]));
+      last.wr_id = recordId;
       last.send_flags = IBV_SEND_SIGNALED;
     }
 
@@ -358,16 +378,29 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
 
       const bool lastWasPosted = (postedCount == batchWrNum);
       if (needSignal && lastWasPosted) {
-        // Signaled WR was posted; CQ path owns the release for this EP.
-      } else if (cbMsg != nullptr) {
-        delete cbMsg;
+        // Signaled WR was posted; CQ path (ledger->ReleaseByCqe) owns the release.
+        // The record inserted above remains in Posted state — nothing to do here.
+      } else if (needSignal) {
+        // Signaled WR itself was NOT posted; remove the record we just inserted
+        // and release whatever was actually posted (tracked via unpostedCount above).
+        int dummy = 0;
+        eps[epId].ledger->ReleaseByCqe(recordId, nullptr, &dummy);
       }
 
       if (postedCount > 0 && (!needSignal || !lastWasPosted)) {
         MORI_IO_WARN(
             "ibv_post_send partially posted {} / {} WRs without a posted signaled tail; "
-            "keeping SQ reservations to avoid over-admission until endpoint recovery",
-            postedCount, batchWrNum);
+            "marking EP {} as degraded until recovery",
+            postedCount, batchWrNum, epId);
+        if (eps[epId].degraded) {
+          eps[epId].degraded->store(true, std::memory_order_relaxed);
+        }
+        // Ledger record for ALL orphaned posted WRs (including prior unsignaled batches
+        // on this EP): sqDepth held by ledger until recovery.
+        if (eps[epId].ledger) {
+          eps[epId].ledger->InsertOrphaned(epWrsSinceSignal[epId], callbackMeta,
+                                           static_cast<int>(epMergedSinceSignal[epId]));
+        }
       }
 
       return {StatusCode::ERR_RDMA_OP, "ibv_post_send failed with " + std::to_string(ret) + ": " +

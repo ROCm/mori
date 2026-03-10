@@ -242,7 +242,9 @@ void RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId, application::R
             local,
             remote,
             std::make_shared<std::atomic<int>>(0),
-            static_cast<int>(epConfig.maxMsgsNum)};
+            static_cast<int>(epConfig.maxMsgsNum),
+            std::make_shared<std::atomic<bool>>(false),
+            std::make_shared<SubmissionLedger>()};
   meta.rTable[topoKey].push_back(ep);
   epsMap.insert({ep.local.handle.qpn, ep});
 }
@@ -390,34 +392,47 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
                         wc[i].status, ibv_wc_status_str(wc[i].status));
         }
       } else {
-        CqCallbackMessage* msg = reinterpret_cast<CqCallbackMessage*>(wc[i].wr_id);
-        // Batch path: wrCount only accounts for WRs represented by this signaled completion.
-        if (ep.sqDepth && msg->wrCount > 0)
-          ep.sqDepth->fetch_sub(msg->wrCount, std::memory_order_relaxed);
-        uint32_t lastBatchSize = msg->meta->finishedBatchSize.fetch_add(msg->batchSize);
-        TransferStatus* statusPtr = msg->meta->status;
-        if (statusPtr != nullptr) {
-          if (wc[i].status == IBV_WC_SUCCESS) {
-            if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
-              statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
+        // Batch path: wr_id carries a recordId from the SubmissionLedger.
+        uint64_t recordId = wc[i].wr_id;
+        int batchSize = 0;
+        auto meta =
+            ep.ledger ? ep.ledger->ReleaseByCqe(recordId, ep.sqDepth.get(), &batchSize) : nullptr;
+        if (meta) {
+          uint32_t lastBatchSize = meta->finishedBatchSize.fetch_add(batchSize);
+          TransferStatus* statusPtr = meta->status;
+          if (statusPtr != nullptr) {
+            if (wc[i].status == IBV_WC_SUCCESS) {
+              if ((lastBatchSize + batchSize) == meta->totalBatchSize) {
+                statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
+              }
+            } else {
+              statusPtr->Update(StatusCode::ERR_RDMA_OP, ibv_wc_status_str(wc[i].status));
+              MORI_IO_ERROR("NotifManager receive cqe failed for task {} code {} status {}",
+                            meta->id, static_cast<uint32_t>(wc[i].status),
+                            ibv_wc_status_str(wc[i].status));
+              meta->status = nullptr;
+              if (ep.degraded && ep.degraded->load(std::memory_order_relaxed) && ep.ledger) {
+                const int recovered = ep.ledger->ReleaseAllByRecovery(ep.sqDepth.get());
+                ep.degraded->store(false, std::memory_order_relaxed);
+                MORI_IO_WARN(
+                    "NotifManager recovered degraded EP qpn {} by releasing {} orphaned WRs", qpn,
+                    recovered);
+              }
             }
-          } else {
-            statusPtr->Update(StatusCode::ERR_RDMA_OP, ibv_wc_status_str(wc[i].status));
-            MORI_IO_ERROR("NotifManager receive cqe failed for task {} code {} status {}",
-                          msg->meta->id, static_cast<uint32_t>(wc[i].status),
-                          ibv_wc_status_str(wc[i].status));
-            msg->meta->status = nullptr;
           }
+          MORI_IO_TRACE(
+              "NotifManager receive cqe for task {} code {} total batch size {} last batch size {} "
+              "cur batch size {}",
+              meta->id,
+              statusPtr != nullptr ? statusPtr->CodeUint32()
+                                   : static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
+              meta->totalBatchSize, lastBatchSize, batchSize);
+        } else {
+          MORI_IO_WARN(
+              "NotifManager: no ledger record for wr_id {} (recordId {}); "
+              "sqDepth may be stale",
+              wc[i].wr_id, recordId);
         }
-        MORI_IO_TRACE(
-            "NotifManager receive cqe for task {} code {} total batch size {} last batch size {} "
-            "cur "
-            "batch size {}",
-            msg->meta->id,
-            statusPtr != nullptr ? statusPtr->CodeUint32()
-                                 : static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
-            msg->meta->totalBatchSize, lastBatchSize, msg->batchSize);
-        delete msg;
       }
     }
   }
