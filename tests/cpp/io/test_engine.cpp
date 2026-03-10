@@ -21,16 +21,117 @@
 // SOFTWARE.
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <hip/hip_runtime_api.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
-#include <cassert>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "mori/application/utils/check.hpp"
 #include "mori/io/io.hpp"
+#include "src/io/rdma/common.hpp"
 
 using namespace mori::io;
+
+namespace {
+
+struct TestSkip : public std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+struct TestFailure : public std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+void Require(bool cond, const std::string& msg) {
+  if (!cond) throw TestFailure(msg);
+}
+
+class ScopedEnvVar {
+ public:
+  ScopedEnvVar(const char* name, const char* value) : key_(name) {
+    const char* old = std::getenv(name);
+    if (old != nullptr) {
+      hadOld_ = true;
+      oldValue_ = old;
+    }
+    setenv(name, value, 1);
+  }
+  ~ScopedEnvVar() {
+    if (hadOld_) {
+      setenv(key_.c_str(), oldValue_.c_str(), 1);
+    } else {
+      unsetenv(key_.c_str());
+    }
+  }
+
+ private:
+  std::string key_;
+  bool hadOld_{false};
+  std::string oldValue_;
+};
+
+struct RegisteredGpuMem {
+  IOEngine* owner{nullptr};
+  MemoryDesc desc{};
+  void* ptr{nullptr};
+
+  ~RegisteredGpuMem() {
+    if (owner != nullptr) owner->DeregisterMemory(desc);
+    if (ptr != nullptr) HIP_RUNTIME_CHECK(hipFree(ptr));
+  }
+};
+
+struct ConnectedEnginePair {
+  std::unique_ptr<IOEngine> initiator;
+  std::unique_ptr<IOEngine> target;
+
+  ConnectedEnginePair(std::unique_ptr<IOEngine>&& i, std::unique_ptr<IOEngine>&& t)
+      : initiator(std::move(i)), target(std::move(t)) {}
+};
+
+int GetGpuCount() {
+  int count = 0;
+  if (hipGetDeviceCount(&count) != hipSuccess) return 0;
+  return count;
+}
+
+bool WaitTransferDone(TransferStatus* status, int timeoutMs, std::string* err) {
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (!status->Init() && !status->InProgress()) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  if (err) {
+    *err = "transfer timeout, code=" + std::to_string(status->CodeUint32()) + ", msg='" +
+           status->Message() + "'";
+  }
+  return false;
+}
+
+bool WaitInboundStatusWithTimeout(IOEngine* engine, const EngineKey& remoteKey, TransferUniqueId id,
+                                  int timeoutMs, TransferStatus* out, std::string* err) {
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (engine->PopInboundTransferStatus(remoteKey, id, out)) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  if (err) {
+    *err = "inbound timeout for transfer_uid=" + std::to_string(id) +
+           ", code=" + std::to_string(out->CodeUint32()) + ", msg='" + out->Message() + "'";
+  }
+  return false;
+}
 
 int GetFreePort() {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -61,80 +162,203 @@ int GetFreePort() {
   return port;
 }
 
-void TestMoriIOEngine() {
-  SetLogLevel("trace");
+ConnectedEnginePair CreateConnectedRdmaPair(const std::string& prefix, bool enableNotification) {
+  IOEngineConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = GetFreePort();
+  Require(cfg.port > 0, "failed to allocate free tcp port for initiator");
+  auto initiator = std::make_unique<IOEngine>(prefix + "_initiator", cfg);
 
-  IOEngineConfig config;
-  config.host = "127.0.0.1";
-  config.port = GetFreePort();
-  IOEngine initiator("initiator", config);
+  cfg.port = GetFreePort();
+  Require(cfg.port > 0, "failed to allocate free tcp port for target");
+  auto target = std::make_unique<IOEngine>(prefix + "_target", cfg);
 
-  RdmaBackendConfig rdmaConfig{};
-  initiator.CreateBackend(BackendType::RDMA, rdmaConfig);
+  RdmaBackendConfig rdmaCfg{};
+  rdmaCfg.enableNotification = enableNotification;
+  initiator->CreateBackend(BackendType::RDMA, rdmaCfg);
+  target->CreateBackend(BackendType::RDMA, rdmaCfg);
 
-  int newPort = GetFreePort();
-  assert(newPort != config.port);
-  config.port = newPort;
-  IOEngine target("target", config);
-  target.CreateBackend(BackendType::RDMA, rdmaConfig);
+  EngineDesc initiatorDesc = initiator->GetEngineDesc();
+  EngineDesc targetDesc = target->GetEngineDesc();
+  initiator->RegisterRemoteEngine(targetDesc);
+  target->RegisterRemoteEngine(initiatorDesc);
 
-  EngineDesc initiatorEngineDesc = initiator.GetEngineDesc();
-  EngineDesc targetEngineDesc = target.GetEngineDesc();
-
-  initiator.RegisterRemoteEngine(targetEngineDesc);
-  target.RegisterRemoteEngine(initiatorEngineDesc);
-
-  void *initiatorBuf, *targetBuf;
-  size_t bufSize = 1024 * 1024 * 4;
-  HIP_RUNTIME_CHECK(hipMalloc(&initiatorBuf, bufSize));
-  HIP_RUNTIME_CHECK(hipMalloc(&targetBuf, bufSize));
-  HIP_RUNTIME_CHECK(hipMemset(targetBuf, 1, bufSize));
-
-  MemoryDesc initiatorMem =
-      initiator.RegisterMemory(initiatorBuf, bufSize, 0, MemoryLocationType::GPU);
-  MemoryDesc targetMem = target.RegisterMemory(targetBuf, bufSize, 0, MemoryLocationType::GPU);
-
-  int transferCnt = 64;
-
-  for (int i = 0; i < transferCnt; i++) {
-    TransferStatus initiatorStatus, targetStatus;
-    TransferUniqueId id = initiator.AllocateTransferUniqueId();
-    initiator.Read(initiatorMem, 0, targetMem, 0, bufSize, &initiatorStatus, id);
-    printf("read %d id %lu\n", i, id);
-    while (initiatorStatus.Code() == StatusCode::INIT) {
-    }
-    while (targetStatus.Code() == StatusCode::INIT) {
-      target.PopInboundTransferStatus(initiator.GetEngineDesc().key, id, &targetStatus);
-    }
-    printf("Status message initiator %s target %s read value %d\n",
-           initiatorStatus.Message().c_str(), targetStatus.Message().c_str(),
-           reinterpret_cast<uint8_t*>(initiatorBuf)[511]);
-  }
-
-  std::vector<TransferStatus> initiatorStatusVec(transferCnt);
-  std::vector<TransferStatus> targetStatusVec(transferCnt);
-  std::vector<TransferUniqueId> trsfIds(transferCnt);
-
-  for (int i = 0; i < transferCnt; i++) {
-    TransferUniqueId id = initiator.AllocateTransferUniqueId();
-    trsfIds[i] = id;
-    initiator.Read(initiatorMem, 0, targetMem, 0, bufSize, &initiatorStatusVec[i], id);
-  }
-
-  for (int i = 0; i < transferCnt; i++) {
-    while (initiatorStatusVec[i].Code() == StatusCode::INIT) {
-    }
-    while (targetStatusVec[i].Code() == StatusCode::INIT) {
-      target.PopInboundTransferStatus(initiator.GetEngineDesc().key, trsfIds[i],
-                                      &targetStatusVec[i]);
-    }
-    printf("Status message initiator %s target %s read value %d\n",
-           initiatorStatusVec[i].Message().c_str(), targetStatusVec[i].Message().c_str(),
-           reinterpret_cast<uint8_t*>(initiatorBuf)[511]);
-  }
-
-  initiator.DeregisterMemory(initiatorMem);
-  target.DeregisterMemory(targetMem);
+  return ConnectedEnginePair(std::move(initiator), std::move(target));
 }
 
-int main() { TestMoriIOEngine(); }
+RegisteredGpuMem RegisterGpuMemory(IOEngine* engine, size_t sizeBytes, int deviceId) {
+  HIP_RUNTIME_CHECK(hipSetDevice(deviceId));
+  void* ptr = nullptr;
+  HIP_RUNTIME_CHECK(hipMalloc(&ptr, sizeBytes));
+  HIP_RUNTIME_CHECK(hipMemset(ptr, 0, sizeBytes));
+
+  RegisteredGpuMem m;
+  m.owner = engine;
+  m.ptr = ptr;
+  m.desc = engine->RegisterMemory(ptr, sizeBytes, deviceId, MemoryLocationType::GPU);
+  return m;
+}
+
+void CaseSubmissionLedgerBasic() {
+  SubmissionLedger ledger;
+  std::atomic<int> sqDepth{5};
+  TransferStatus status;
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 101, 8);
+  const uint64_t id = ledger.Insert(3, true, meta, 8);
+  int batchSize = 0;
+  auto releasedMeta = ledger.ReleaseByCqe(id, &sqDepth, &batchSize);
+  Require(releasedMeta != nullptr, "ledger release meta should not be null");
+  Require(releasedMeta->id == 101, "unexpected transfer id from ledger release");
+  Require(batchSize == 8, "unexpected batch size from ledger release");
+  Require(sqDepth.load(std::memory_order_relaxed) == 2, "unexpected sq depth after release");
+
+  SubmissionLedger ledger2;
+  std::atomic<int> sqDepth2{12};
+  auto meta2 = std::make_shared<CqCallbackMeta>(&status, 202, 16);
+  uint64_t postedId = ledger2.Insert(4, true, meta2, 10);
+  ledger2.InsertOrphaned(3, meta2, 6);
+  Require(ledger2.HasOrphaned(), "expected orphaned record in ledger");
+  int recovered = ledger2.ReleaseOrphanedByRecovery(&sqDepth2);
+  // Only Orphaned record (3 WRs) should be released; Posted record (4 WRs) preserved.
+  Require(recovered == 3, "unexpected recovered wr count (should only release orphaned)");
+  Require(sqDepth2.load(std::memory_order_relaxed) == 9, "unexpected sq depth after recovery");
+  Require(!ledger2.HasOrphaned(), "orphaned records should be drained");
+  // The Posted record should still be present and retrievable via ReleaseByCqe.
+  int postedBatch = 0;
+  auto postedMeta = ledger2.ReleaseByCqe(postedId, &sqDepth2, &postedBatch);
+  Require(postedMeta != nullptr, "posted record should survive recovery");
+  Require(postedBatch == 10, "posted record batch size mismatch");
+  Require(sqDepth2.load(std::memory_order_relaxed) == 5, "sq depth after posted CQE release");
+}
+
+void CaseRdmaTransferBasic() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_basic", true);
+  auto src = RegisterGpuMemory(pair.initiator.get(), 1024 * 1024, 0);
+  auto dst = RegisterGpuMemory(pair.target.get(), 1024 * 1024, 0);
+
+  TransferStatus initStatus;
+  TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+  pair.initiator->Read(src.desc, 0, dst.desc, 0, 1024 * 1024, &initStatus, uid);
+
+  std::string err;
+  Require(WaitTransferDone(&initStatus, 3000, &err), "rdma initiator status timeout: " + err);
+  Require(initStatus.Succeeded(),
+          "rdma initiator status failed: code=" + std::to_string(initStatus.CodeUint32()) +
+              ", msg='" + initStatus.Message() + "'");
+
+  TransferStatus inbound;
+  Require(WaitInboundStatusWithTimeout(pair.target.get(), pair.initiator->GetEngineDesc().key, uid,
+                                       3000, &inbound, &err),
+          "rdma inbound status timeout: " + err);
+  Require(inbound.Succeeded(),
+          "rdma inbound status failed: code=" + std::to_string(inbound.CodeUint32()) + ", msg='" +
+              inbound.Message() + "'");
+}
+
+void CaseRdmaNotificationDisabledBehavior() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_no_notif", false);
+  auto src = RegisterGpuMemory(pair.initiator.get(), 64 * 1024, 0);
+  auto dst = RegisterGpuMemory(pair.target.get(), 64 * 1024, 0);
+
+  TransferStatus initStatus;
+  TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+  pair.initiator->Write(src.desc, 0, dst.desc, 0, 64 * 1024, &initStatus, uid);
+
+  std::string err;
+  Require(WaitTransferDone(&initStatus, 3000, &err),
+          "rdma(no_notif) initiator status timeout: " + err);
+  Require(initStatus.Succeeded(), "rdma(no_notif) initiator status failed: code=" +
+                                      std::to_string(initStatus.CodeUint32()) + ", msg='" +
+                                      initStatus.Message() + "'");
+
+  TransferStatus inbound;
+  bool popped = WaitInboundStatusWithTimeout(pair.target.get(), pair.initiator->GetEngineDesc().key,
+                                             uid, 200, &inbound, nullptr);
+  Require(!popped, "inbound notification should be unavailable when notification is disabled");
+}
+
+void CaseXgmiInboundNotificationIsUnsupported() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  IOEngineConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("xgmi_semantics_engine", cfg);
+  XgmiBackendConfig xgmiCfg{};
+  engine.CreateBackend(BackendType::XGMI, xgmiCfg);
+
+  auto src = RegisterGpuMemory(&engine, 64 * 1024, 0);
+  auto dst = RegisterGpuMemory(&engine, 64 * 1024, 0);
+
+  TransferStatus status;
+  TransferUniqueId uid = engine.AllocateTransferUniqueId();
+  engine.Write(src.desc, 0, dst.desc, 0, 64 * 1024, &status, uid);
+
+  status.Wait();
+  Require(status.Succeeded(), "xgmi transfer failed: code=" + std::to_string(status.CodeUint32()) +
+                                  ", msg='" + status.Message() + "'");
+
+  TransferStatus inbound;
+  bool popped = engine.PopInboundTransferStatus("dummy_remote", uid, &inbound);
+  Require(!popped, "xgmi pop inbound should return false");
+}
+
+struct TestCase {
+  const char* name;
+  std::function<void()> run;
+};
+
+}  // namespace
+
+int main() {
+  SetLogLevel("info");
+  std::vector<TestCase> cases = {
+      {"submission_ledger_basic", CaseSubmissionLedgerBasic},
+      {"rdma_transfer_basic", CaseRdmaTransferBasic},
+      {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
+      {"xgmi_inbound_notification_is_unsupported", CaseXgmiInboundNotificationIsUnsupported},
+  };
+
+  int passed = 0;
+  int failed = 0;
+  int skipped = 0;
+  auto allStart = std::chrono::steady_clock::now();
+
+  for (const auto& tc : cases) {
+    auto st = std::chrono::steady_clock::now();
+    try {
+      tc.run();
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - st)
+                    .count();
+      std::printf("[PASS] %s (%lld ms)\n", tc.name, static_cast<long long>(ms));
+      passed++;
+    } catch (const TestSkip& e) {
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - st)
+                    .count();
+      std::printf("[SKIP] %s (%lld ms): %s\n", tc.name, static_cast<long long>(ms), e.what());
+      skipped++;
+    } catch (const std::exception& e) {
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - st)
+                    .count();
+      std::printf("[FAIL] %s (%lld ms): %s\n", tc.name, static_cast<long long>(ms), e.what());
+      failed++;
+    }
+  }
+
+  auto allMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - allStart)
+                   .count();
+  std::printf("==== test_engine summary ====\n");
+  std::printf("total=%zu passed=%d failed=%d skipped=%d elapsed_ms=%lld\n", cases.size(), passed,
+              failed, skipped, static_cast<long long>(allMs));
+  return failed == 0 ? 0 : 1;
+}

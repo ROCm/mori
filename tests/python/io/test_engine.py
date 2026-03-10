@@ -263,6 +263,20 @@ def wait_inbound_status(engine, remote_engine_key, remote_transfer_uid):
             return target_side_status
 
 
+def wait_inbound_status_with_timeout(
+    engine, remote_engine_key, remote_transfer_uid, timeout_s=2.0
+):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        target_side_status = engine.pop_inbound_transfer_status(
+            remote_engine_key, remote_transfer_uid
+        )
+        if target_side_status:
+            return target_side_status
+        time.sleep(0.001)
+    return None
+
+
 def alloc_and_register_mem(engine_pair, shape):
     initiator, target = engine_pair
 
@@ -470,6 +484,108 @@ def test_notification_disabled():
         initiator.get_engine_desc().key, transfer_uid
     )
     assert inbound_status is None  # No notification received
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_multithread_batch_error_path_is_recoverable():
+    """Regression for callback meta ownership on error paths.
+
+    Repeatedly trigger failing multithread batch calls, then verify a valid
+    transfer still completes end-to-end with notification.
+    """
+
+    initiator, target = create_connected_engine_pair(
+        "regress_cbmeta",
+        qp_per_transfer=2,
+        post_batch_size=-1,
+        num_worker_threads=2,
+        enable_notification=True,
+    )
+
+    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target), (2, 64)
+    )
+
+    bad_offsets = [0, 64]
+    bad_sizes = [64, 65]  # out-of-range for the second element
+
+    # Run multiple failures to stress repeated cleanup/release behavior.
+    for _ in range(20):
+        transfer_uid = initiator.allocate_transfer_uid()
+        status = initiator.batch_read(
+            [initiator_mem],
+            [bad_offsets],
+            [target_mem],
+            [bad_offsets],
+            [bad_sizes],
+            [transfer_uid],
+        )[0]
+        wait_status(status)
+        assert status.Failed()
+        assert status.Code() == StatusCode.ERR_INVALID_ARGS
+
+    # Verify subsequent valid transfer still works.
+    transfer_uid = initiator.allocate_transfer_uid()
+    full_size = initiator_tensor.numel() * initiator_tensor.element_size()
+    status = initiator.write(initiator_mem, 0, target_mem, 0, full_size, transfer_uid)
+    wait_status(status)
+    assert status.Succeeded(), status.Message()
+
+    inbound = wait_inbound_status_with_timeout(
+        target, initiator.get_engine_desc().key, transfer_uid, timeout_s=3.0
+    )
+    assert (
+        inbound is not None
+    ), "Expected inbound notification after successful transfer"
+    assert inbound.Succeeded()
+    assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_successful_writes_always_have_inbound_notification_under_pressure():
+    """Regression for notify all-or-none behavior.
+
+    Under low SQ timeout and high-frequency writes, every successful write must
+    still produce a corresponding inbound completion notification.
+    """
+
+    with temporary_env("MORI_IO_SQ_BACKOFF_TIMEOUT_US", "100"):
+        initiator, target = create_connected_engine_pair(
+            "regress_notify",
+            qp_per_transfer=4,
+            post_batch_size=1,
+            num_worker_threads=1,
+            enable_notification=True,
+        )
+
+        initiator_tensor, target_tensor, initiator_mem, target_mem = (
+            alloc_and_register_mem((initiator, target), (1, 128))
+        )
+
+        initiator_key = initiator.get_engine_desc().key
+
+        for i in range(50):
+            transfer_uid = initiator.allocate_transfer_uid()
+            status = initiator.write(initiator_mem, 0, target_mem, 0, 128, transfer_uid)
+            wait_status(status)
+
+            if status.Succeeded():
+                inbound = wait_inbound_status_with_timeout(
+                    target, initiator_key, transfer_uid, timeout_s=2.0
+                )
+                assert (
+                    inbound is not None
+                ), f"Missing inbound notification for successful transfer {i}"
+                assert inbound.Succeeded()
+            else:
+                # Failed transfers may legitimately miss notification; they
+                # should not poison future successful transfers.
+                assert status.Code() in (
+                    StatusCode.ERR_RDMA_OP,
+                    StatusCode.ERR_BAD_STATE,
+                )
+
+        assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
 
 
 def test_no_backend():

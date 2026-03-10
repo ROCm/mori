@@ -234,7 +234,17 @@ void RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId, application::R
   std::unique_lock<std::shared_mutex> lock(mu);
   deviceCtxs[devId]->ConnectEndpoint(local.handle, remote);
   RemoteEngineMeta& meta = remotes[remoteKey];
-  EpPair ep{weight, devId, rdevId, remoteKey, local, remote};
+  auto epConfig = GetRdmaEndpointConfig(devId);
+  EpPair ep{weight,
+            devId,
+            rdevId,
+            remoteKey,
+            local,
+            remote,
+            std::make_shared<std::atomic<int>>(0),
+            static_cast<int>(epConfig.maxMsgsNum),
+            std::make_shared<std::atomic<bool>>(false),
+            std::make_shared<SubmissionLedger>()};
   meta.rTable[topoKey].push_back(ep);
   epsMap.insert({ep.local.handle.qpn, ep});
 }
@@ -374,41 +384,56 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
         struct ibv_recv_wr* bad = nullptr;
         SYSCALL_RETURN_ZERO(ibv_post_recv(ep.local.ibvHandle.qp, &wr, &bad));
       } else if (wc[i].opcode == IBV_WC_SEND) {
+        // Notify path: one signaled SEND completion releases one SQ reservation.
+        if (ep.sqDepth) ep.sqDepth->fetch_sub(1, std::memory_order_relaxed);
         uint64_t id = wc[i].wr_id;
         if (wc[i].status != IBV_WC_SUCCESS) {
           MORI_IO_ERROR("NotifManager receive send cqe failed for wr_id {} status {}: {}", id,
                         wc[i].status, ibv_wc_status_str(wc[i].status));
         }
       } else {
-        CqCallbackMessage* msg = reinterpret_cast<CqCallbackMessage*>(wc[i].wr_id);
-        uint32_t lastBatchSize = msg->meta->finishedBatchSize.fetch_add(msg->batchSize);
-        TransferStatus* statusPtr = msg->meta->status;
-        if (statusPtr != nullptr) {
-          if (wc[i].status == IBV_WC_SUCCESS) {
-            if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
-              statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
+        // Batch path: wr_id carries a recordId from the SubmissionLedger.
+        uint64_t recordId = wc[i].wr_id;
+        int mergedBatchSize = 0;
+        auto meta = ep.ledger
+                        ? ep.ledger->ReleaseByCqe(recordId, ep.sqDepth.get(), &mergedBatchSize)
+                        : nullptr;
+        if (meta) {
+          uint32_t lastBatchSize = meta->finishedBatchSize.fetch_add(mergedBatchSize);
+          TransferStatus* statusPtr = meta->status;
+          if (statusPtr != nullptr) {
+            if (wc[i].status == IBV_WC_SUCCESS) {
+              if ((lastBatchSize + mergedBatchSize) == meta->totalBatchSize) {
+                statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
+              }
+            } else {
+              statusPtr->Update(StatusCode::ERR_RDMA_OP, ibv_wc_status_str(wc[i].status));
+              MORI_IO_ERROR("NotifManager receive cqe failed for task {} code {} status {}",
+                            meta->id, static_cast<uint32_t>(wc[i].status),
+                            ibv_wc_status_str(wc[i].status));
+              meta->status = nullptr;
+              if (ep.degraded && ep.degraded->load(std::memory_order_relaxed) && ep.ledger) {
+                const int orphanedReleased = ep.ledger->ReleaseOrphanedByRecovery(ep.sqDepth.get());
+                ep.degraded->store(false, std::memory_order_relaxed);
+                MORI_IO_WARN(
+                    "NotifManager recovered degraded EP qpn {} by releasing {} orphaned WRs", qpn,
+                    orphanedReleased);
+              }
             }
-          } else {
-            statusPtr->Update(StatusCode::ERR_RDMA_OP, ibv_wc_status_str(wc[i].status));
-            MORI_IO_ERROR("NotifManager receive cqe failed for task {} code {} status {}",
-                          msg->meta->id, static_cast<uint32_t>(wc[i].status),
-                          ibv_wc_status_str(wc[i].status));
-            // set status to nullptr indicate that transfer failed
-            msg->meta->status = nullptr;
           }
+          MORI_IO_TRACE(
+              "NotifManager receive cqe for task {} code {} total batch size {} last batch size {} "
+              "cur batch size {}",
+              meta->id,
+              statusPtr != nullptr ? statusPtr->CodeUint32()
+                                   : static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
+              meta->totalBatchSize, lastBatchSize, mergedBatchSize);
+        } else {
+          MORI_IO_WARN(
+              "NotifManager: no ledger record for wr_id {} (recordId {}); "
+              "sqDepth may be stale",
+              wc[i].wr_id, recordId);
         }
-        MORI_IO_TRACE(
-            "NotifManager receive cqe for task {} code {} total batch size {} last batch size {} "
-            "cur "
-            "batch size {}",
-            msg->meta->id,
-            statusPtr != nullptr ? statusPtr->CodeUint32()
-                                 : static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
-            msg->meta->totalBatchSize, lastBatchSize, msg->batchSize);
-        if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
-          delete msg->meta;
-        }
-        delete msg;
       }
     }
   }
@@ -675,7 +700,7 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
-  CqCallbackMeta* callbackMeta = new CqCallbackMeta(status, id, 1);
+  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, 1);
 
   RdmaOpRet ret =
       RdmaReadWrite(eps, local, localOffset, remote, remoteOffset, size, callbackMeta, id, isRead);
@@ -697,7 +722,7 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
                                         TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
-  CqCallbackMeta* callbackMeta = new CqCallbackMeta(status, id, sizes.size());
+  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, sizes.size());
   RdmaOpRet ret;
   if (executor) {
     ExecutorReq req{eps,          local, localOffsets,         remote, remoteOffsets, sizes,
