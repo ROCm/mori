@@ -847,7 +847,31 @@ void RegisterMoriCcl(pybind11::module_& m) {
             },
             py::arg("device") = py::none(),
             py::arg("dtype") = py::none(),
-            "Get output transit buffer as a PyTorch tensor (specify dtype for non-uint32 types)");
+            "Get output transit buffer as a PyTorch tensor (specify dtype for non-uint32 types)")
+        .def("register_output_buffer",
+            [](mori::collective::AllgatherSdma<uint32_t>& self,
+               const torch::Tensor& tensor) {
+                if (!tensor.is_cuda()) {
+                    throw std::runtime_error("Tensor must be a CUDA tensor");
+                }
+                self.register_output_buffer(tensor.data_ptr(), tensor.nbytes());
+            },
+            py::arg("tensor"),
+            "Register a CUDA tensor as direct SDMA output target (collective)")
+        .def("deregister_output_buffer",
+            [](mori::collective::AllgatherSdma<uint32_t>& self,
+               const torch::Tensor& tensor) {
+                self.deregister_output_buffer(tensor.data_ptr());
+            },
+            py::arg("tensor"),
+            "Deregister a previously registered output buffer (collective)")
+        .def("is_output_registered",
+            [](mori::collective::AllgatherSdma<uint32_t>& self,
+               const torch::Tensor& tensor) -> bool {
+                return self.is_output_registered(tensor.data_ptr());
+            },
+            py::arg("tensor"),
+            "Check whether an output tensor is registered for direct SDMA writes");
 
     // Keep old function-based interface for backward compatibility (optional)
     m.def("allgather_sdma",

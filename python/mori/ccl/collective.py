@@ -241,6 +241,23 @@ class AllgatherSdma:
         """
         return self._handle.get_output_transit_buffer(device, dtype)
 
+    def register_output_buffer(self, tensor):
+        """Register a CUDA tensor as direct SDMA output target.
+
+        After registration, when allgather's output_tensor address matches,
+        SDMA writes directly into that address, skipping the internal
+        transit buffer.  Collective — all ranks must call simultaneously.
+        """
+        self._handle.register_output_buffer(tensor)
+
+    def deregister_output_buffer(self, tensor):
+        """Deregister a previously registered output buffer (collective)."""
+        self._handle.deregister_output_buffer(tensor)
+
+    def is_output_registered(self, tensor) -> bool:
+        """Check whether an output tensor is registered."""
+        return self._handle.is_output_registered(tensor)
+
 
 def _cpp_allreduce_factory(entity_name: str):
     """Factory function to get C++ entities from mori_cpp module"""

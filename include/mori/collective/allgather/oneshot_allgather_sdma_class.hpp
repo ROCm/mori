@@ -28,6 +28,7 @@
 #include <memory>
 #include <cstdint>
 #include <atomic>
+#include <unordered_map>
 
 // Include necessary headers
 #include "mori/application/application.hpp"
@@ -71,6 +72,11 @@ private:
     // Copy mode flag: if true, copy output_transit_buffer to user output buffer
     // if false, user should directly use output_transit_buffer
     bool copy_output_to_user_;
+
+    // Registered external output buffers (ptr address → SymmMemObjPtr).
+    // When the output address matches a registered entry, SDMA writes
+    // directly into that buffer, bypassing output_transit_buffer_.
+    std::unordered_map<uintptr_t, application::SymmMemObjPtr> registered_output_buffers_;
 
     // Disable copy constructor and assignment operator
     AllgatherSdma(const AllgatherSdma&) = delete;
@@ -142,6 +148,23 @@ public:
      */
     void cancel_async();
     // =======================================================
+
+    /**
+     * @brief Register an external VRAM buffer for direct SDMA writes.
+     *        Collective — all ranks must call simultaneously with matching size.
+     */
+    void register_output_buffer(void* ptr, size_t size);
+
+    /**
+     * @brief Deregister a previously registered output buffer.
+     *        Collective — all ranks must call simultaneously.
+     */
+    void deregister_output_buffer(void* ptr);
+
+    /**
+     * @brief Check whether an output pointer is registered.
+     */
+    bool is_output_registered(void* ptr) const;
 
     /**
      * @brief Executes synchronous AllGATHER SDMA operation

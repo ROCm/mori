@@ -117,15 +117,51 @@ AllgatherSdma<T>::AllgatherSdma(int myPe, int npes, size_t input_buffer_size, si
 // Destructor
 template <typename T>
 AllgatherSdma<T>::~AllgatherSdma() {
-    // Cancel any ongoing async operation
     if (async_in_progress_) {
         cancel_async();
     }
-
-    // Memory is automatically managed by unique_ptr, ShmemDeleter will auto-free during destruction
+    for (auto& [addr, obj] : registered_output_buffers_) {
+        shmem::ShmemSymmetricDeregister(reinterpret_cast<void*>(addr));
+    }
+    registered_output_buffers_.clear();
     if (flags_) {
         printf("AllgatherSdma destroyed: PE %d\n", myPe_);
     }
+}
+
+// ---------------------------------------------------------------------------
+// register / deregister / is_output_registered
+// ---------------------------------------------------------------------------
+template <typename T>
+void AllgatherSdma<T>::register_output_buffer(void* ptr, size_t size) {
+    uintptr_t key = reinterpret_cast<uintptr_t>(ptr);
+    if (registered_output_buffers_.count(key)) {
+        return;
+    }
+    auto obj = shmem::ShmemSymmetricRegister(ptr, size);
+    if (!obj.IsValid()) {
+        throw std::runtime_error("Failed to register external output buffer");
+    }
+    registered_output_buffers_[key] = obj;
+    printf("PE %d: Registered output buffer %p (%.2f MB)\n",
+           myPe_, ptr, size / (1024.0 * 1024.0));
+}
+
+template <typename T>
+void AllgatherSdma<T>::deregister_output_buffer(void* ptr) {
+    uintptr_t key = reinterpret_cast<uintptr_t>(ptr);
+    auto it = registered_output_buffers_.find(key);
+    if (it == registered_output_buffers_.end()) {
+        return;
+    }
+    shmem::ShmemSymmetricDeregister(ptr);
+    registered_output_buffers_.erase(it);
+    printf("PE %d: Deregistered output buffer %p\n", myPe_, ptr);
+}
+
+template <typename T>
+bool AllgatherSdma<T>::is_output_registered(void* ptr) const {
+    return registered_output_buffers_.count(reinterpret_cast<uintptr_t>(ptr)) > 0;
 }
 
 // ================ NEW: Async API Implementations ================
@@ -164,12 +200,16 @@ bool AllgatherSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
 
         printf("  Grid size: %d, Block size: %d\n", grid_size, block_size);
 
-        // Launch the kernel - this runs asynchronously
+        auto it = registered_output_buffers_.find(
+            reinterpret_cast<uintptr_t>(output));
+        auto& dst_obj = (it != registered_output_buffers_.end())
+                            ? it->second : output_transit_buffer_obj_;
+
         OneShotAllGatherSdmaAsyncPutKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
             input,
             input_transit_buffer_obj_,
-            output_transit_buffer_obj_,
+            dst_obj,
             flagsObj_, total_count);
 
         hipError_t kernel_err = hipGetLastError();
@@ -223,12 +263,14 @@ double AllgatherSdma<T>::wait_async(hipStream_t stream) {
             }
         }
 
-        // Step 2: Copy from output transit buffer to user output buffer (if enabled)
-        if (copy_output_to_user_) {
+        // Step 2: Copy from output transit buffer to user output buffer (if needed)
+        bool direct = registered_output_buffers_.count(
+            reinterpret_cast<uintptr_t>(async_output_)) > 0;
+        if (!direct && copy_output_to_user_) {
             printf("PE %d: Copying results to user output buffer\n", myPe_);
             copy_output_to_user(async_output_, async_total_count_, wait_stream);
         } else {
-            printf("PE %d: Skipping copy to user output buffer (using output_transit_buffer directly)\n", myPe_);
+            printf("PE %d: Skipping copy to user output buffer\n", myPe_);
         }
 
         // Final synchronization
@@ -413,12 +455,16 @@ bool AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
     }
 
     try {
-        // Step 1: Execute Allgather kernel
+        auto it = registered_output_buffers_.find(
+            reinterpret_cast<uintptr_t>(output));
+        bool direct = (it != registered_output_buffers_.end());
+        auto& dst_obj = direct ? it->second : output_transit_buffer_obj_;
+
         OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
             input,
             input_transit_buffer_obj_,
-            output_transit_buffer_obj_,
+            dst_obj,
             flagsObj_, total_count);
 
         hipError_t err = hipGetLastError();
@@ -428,9 +474,7 @@ bool AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
             return false;
         }
 
-        // Step 2: Copy from output transit buffer to user output buffer (if enabled)
-        // Note: Synchronization is handled by caller
-        if (copy_output_to_user_) {
+        if (!direct && copy_output_to_user_) {
             copy_output_to_user(output, total_count, stream);
         }
 
