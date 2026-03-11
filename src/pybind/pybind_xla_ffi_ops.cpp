@@ -301,22 +301,25 @@ XLA_FFI_DEFINE_HANDLER(
 );
 
 ErrorOr<std::unique_ptr<EpDispatchCombineState>> MoriLaunchTestInstantiate(
-    std::string_view packed_config) {
-  auto cfg = EpDispatchCombineConfig::FromPackedString(packed_config);
+    Span<const int32_t> ep_config) {
+  auto cfg = EpDispatchCombineConfig::FromPackedI32Array(
+      ep_config.begin(), ep_config.size());
   return std::make_unique<EpDispatchCombineState>(cfg);
 }
 
 XLA_FFI_DEFINE_HANDLER(
     MoriLaunchTestInstantiateHandler, MoriLaunchTestInstantiate,
-    Ffi::BindInstantiate().Attr<std::string_view>("ep_config"));
+    Ffi::BindInstantiate().Attr<Span<const int32_t>>("ep_config"));
 
 Error MoriLaunchTestImpl(
     hipStream_t stream, EpDispatchCombineState* state, 
-    std::string_view ep_config) {
-  std::string packed = state->handle.config.ToPackedString();
+    Span<const int32_t> ep_config) {
+  std::vector<int32_t> packed = state->handle.config.ToPackedI32Array();
   XPUT(
-      "MoriLaunchTestImpl stream=%p state.rank=%d ep_config=%s", stream,
-      state->handle.config.rank, packed.c_str());
+      "MoriLaunchTestImpl stream=%p state.rank=%d ep_config_i32_size=%d "
+      "state_config_size=%d",
+      stream, state->handle.config.rank, static_cast<int>(ep_config.size()),
+      static_cast<int>(packed.size()));
   return Error::Success();
 }
 
@@ -325,7 +328,7 @@ XLA_FFI_DEFINE_HANDLER(
     Ffi::Bind()
         .Ctx<PlatformStream<hipStream_t>>()
         .Ctx<State<EpDispatchCombineState>>()
-        .Attr<std::string_view>("ep_config"));
+        .Attr<Span<const int32_t>>("ep_config"));
 
 void JaxPluginSetup(py::capsule pyc_api) {
   if (std::string_view(pyc_api.name()) != "pjrt_c_api") {

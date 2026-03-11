@@ -69,7 +69,7 @@ def run_test(rank, world_size):
   )
 
   launch_test = jax.ffi.ffi_call("launch_test", (), has_side_effect=True)
-  launch_test(ep_config=cfg.to_packed_string())
+  launch_test(ep_config=np.asarray(cfg.to_packed_array(), dtype=np.int32))
   jax.block_until_ready(jnp.array(0))
   print(f"[rank {rank}] launch_test submitted", flush=True)
 

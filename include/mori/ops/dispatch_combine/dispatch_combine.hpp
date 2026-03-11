@@ -25,9 +25,8 @@
 #include <hip/library_types.h>
 
 #include <cstdint>
-#include <string>
-#include <string_view>
 #include <sstream>
+#include <vector>
 
 #include "mori/application/application.hpp"
 #include "mori/core/profiler/constants.hpp"
@@ -120,8 +119,9 @@ struct EpDispatchCombineConfig {
     return worldSize * MaxNumTokensToRecvPerRank();
   }
 
-  std::string ToPackedString() const;
-  static EpDispatchCombineConfig FromPackedString(std::string_view packed);
+  std::vector<int32_t> ToPackedI32Array() const;
+  static EpDispatchCombineConfig FromPackedI32Array(const int32_t* packed, size_t size);
+  static EpDispatchCombineConfig FromPackedI32Array(const std::vector<int32_t>& packed);
   
 };
 

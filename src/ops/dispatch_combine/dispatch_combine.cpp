@@ -24,9 +24,7 @@
 #include <hip/hip_runtime_api.h>
 
 #include <algorithm>
-#include <sstream>
 #include <stdexcept>
-#include <string>
 
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem_api.hpp"
@@ -40,63 +38,65 @@ using namespace mori::application;
 using namespace mori::core;
 using namespace mori::shmem;
 
-static constexpr const char* EP_CONFIG_VERSION = "v1";
+static constexpr int32_t EP_CONFIG_I32_VERSION = 1;
+static constexpr size_t EP_CONFIG_I32_SIZE = 18;
 
-std::string EpDispatchCombineConfig::ToPackedString() const {
-  std::ostringstream os;
-  os << EP_CONFIG_VERSION
-     << ' ' << rank
-     << ' ' << worldSize
-     << ' ' << hiddenDim
-     << ' ' << scaleDim
-     << ' ' << scaleTypeSize
-     << ' ' << maxTokenTypeSize
-     << ' ' << maxNumInpTokenPerRank
-     << ' ' << numExpertPerRank
-     << ' ' << numExpertPerToken
-     << ' ' << warpNumPerBlock
-     << ' ' << blockNum
-     << ' ' << static_cast<int>(useExternalInpBuffer)
-     << ' ' << static_cast<int>(kernelType)
-     << ' ' << gpuPerNode
-     << ' ' << rdmaBlockNum
-     << ' ' << numQpPerPe
-     << ' ' << static_cast<int>(quantType);
-  return os.str();
+std::vector<int32_t> EpDispatchCombineConfig::ToPackedI32Array() const {
+  return {
+      EP_CONFIG_I32_VERSION,
+      rank,
+      worldSize,
+      hiddenDim,
+      scaleDim,
+      scaleTypeSize,
+      maxTokenTypeSize,
+      maxNumInpTokenPerRank,
+      numExpertPerRank,
+      numExpertPerToken,
+      warpNumPerBlock,
+      blockNum,
+      static_cast<int32_t>(useExternalInpBuffer),
+      static_cast<int32_t>(kernelType),
+      gpuPerNode,
+      rdmaBlockNum,
+      numQpPerPe,
+      static_cast<int32_t>(quantType),
+  };
 }
 
-EpDispatchCombineConfig EpDispatchCombineConfig::FromPackedString(
-    std::string_view packed) {
-  std::istringstream is(std::string{packed});
-  std::string version;
+EpDispatchCombineConfig EpDispatchCombineConfig::FromPackedI32Array(
+    const int32_t* packed, size_t size) {
+  if (packed == nullptr || size != EP_CONFIG_I32_SIZE) {
+    throw std::runtime_error("EpDispatchCombineConfig i32 decode failed: invalid size");
+  }
+  if (packed[0] != EP_CONFIG_I32_VERSION) {
+    throw std::runtime_error("EpDispatchCombineConfig i32 decode failed: unsupported version");
+  }
 
   EpDispatchCombineConfig cfg;
-  int use_external_inp_buf = 0;
-  int kernel_type = 0;
-  int quant_type = 0;
-
-  if (!(is >> version) || version != EP_CONFIG_VERSION) {
-    throw std::runtime_error("EpDispatchCombineConfig decode failed: "
-      "missing/unsupported version");
-  }
-
-  if (!(is >> cfg.rank >> cfg.worldSize >> cfg.hiddenDim >> cfg.scaleDim >>
-        cfg.scaleTypeSize >> cfg.maxTokenTypeSize >> cfg.maxNumInpTokenPerRank >>
-        cfg.numExpertPerRank >> cfg.numExpertPerToken >> cfg.warpNumPerBlock >>
-        cfg.blockNum >> use_external_inp_buf >> kernel_type >> cfg.gpuPerNode >>
-        cfg.rdmaBlockNum >> cfg.numQpPerPe >> quant_type)) {
-    throw std::runtime_error("EpDispatchCombineConfig decode failed: invalid payload");
-  }
-
-  std::string trailing;
-  if (is >> trailing) {
-    throw std::runtime_error("EpDispatchCombineConfig decode failed: trailing data");
-  }
-
-  cfg.useExternalInpBuffer = (use_external_inp_buf != 0);
-  cfg.kernelType = static_cast<KernelType>(kernel_type);
-  cfg.quantType = static_cast<QuantType>(quant_type);
+  cfg.rank = packed[1];
+  cfg.worldSize = packed[2];
+  cfg.hiddenDim = packed[3];
+  cfg.scaleDim = packed[4];
+  cfg.scaleTypeSize = packed[5];
+  cfg.maxTokenTypeSize = packed[6];
+  cfg.maxNumInpTokenPerRank = packed[7];
+  cfg.numExpertPerRank = packed[8];
+  cfg.numExpertPerToken = packed[9];
+  cfg.warpNumPerBlock = packed[10];
+  cfg.blockNum = packed[11];
+  cfg.useExternalInpBuffer = (packed[12] != 0);
+  cfg.kernelType = static_cast<KernelType>(packed[13]);
+  cfg.gpuPerNode = packed[14];
+  cfg.rdmaBlockNum = packed[15];
+  cfg.numQpPerPe = packed[16];
+  cfg.quantType = static_cast<QuantType>(packed[17]);
   return cfg;
+}
+
+EpDispatchCombineConfig EpDispatchCombineConfig::FromPackedI32Array(
+    const std::vector<int32_t>& packed) {
+  return FromPackedI32Array(packed.data(), packed.size());
 }
 
 /* ---------------------------------------------------------------------------------------------- */
