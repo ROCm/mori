@@ -283,7 +283,7 @@ void testOneShotSdmaAllgather() {
   // Execute Allgather operation
   printf("PE %d: Executing Allgather...\n", myPe);
   double execution_time = -1.0;
-  bool use_async = 1;  // Set to 1 for async mode, 0 for sync mode
+  bool use_async = 0;  // Set to 1 for async mode, 0 for sync mode
 
   if (use_async == 0) {
     // Synchronous mode - measure time and synchronize
