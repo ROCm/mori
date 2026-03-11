@@ -73,10 +73,14 @@ private:
     // if false, user should directly use output_transit_buffer
     bool copy_output_to_user_;
 
-    // Registered external output buffers (ptr address → SymmMemObjPtr).
+    // Registered external output buffers (ptr address → {SymmMemObjPtr, size}).
     // When the output address matches a registered entry, SDMA writes
     // directly into that buffer, bypassing output_transit_buffer_.
-    std::unordered_map<uintptr_t, application::SymmMemObjPtr> registered_output_buffers_;
+    struct RegisteredBuf {
+        application::SymmMemObjPtr obj;
+        size_t size;
+    };
+    std::unordered_map<uintptr_t, RegisteredBuf> registered_output_buffers_;
 
     // Disable copy constructor and assignment operator
     AllgatherSdma(const AllgatherSdma&) = delete;

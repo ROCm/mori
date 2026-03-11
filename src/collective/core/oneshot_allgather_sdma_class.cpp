@@ -120,8 +120,8 @@ AllgatherSdma<T>::~AllgatherSdma() {
     if (async_in_progress_) {
         cancel_async();
     }
-    for (auto& [addr, obj] : registered_output_buffers_) {
-        shmem::ShmemSymmetricDeregister(reinterpret_cast<void*>(addr));
+    for (auto& [addr, entry] : registered_output_buffers_) {
+        shmem::ShmemSymmetricDeregister(reinterpret_cast<void*>(addr), entry.size);
     }
     registered_output_buffers_.clear();
     if (flags_) {
@@ -142,7 +142,7 @@ void AllgatherSdma<T>::register_output_buffer(void* ptr, size_t size) {
     if (!obj.IsValid()) {
         throw std::runtime_error("Failed to register external output buffer");
     }
-    registered_output_buffers_[key] = obj;
+    registered_output_buffers_[key] = {obj, size};
     printf("PE %d: Registered output buffer %p (%.2f MB)\n",
            myPe_, ptr, size / (1024.0 * 1024.0));
 }
@@ -154,7 +154,7 @@ void AllgatherSdma<T>::deregister_output_buffer(void* ptr) {
     if (it == registered_output_buffers_.end()) {
         return;
     }
-    shmem::ShmemSymmetricDeregister(ptr);
+    shmem::ShmemSymmetricDeregister(ptr, it->second.size);
     registered_output_buffers_.erase(it);
     printf("PE %d: Deregistered output buffer %p\n", myPe_, ptr);
 }
@@ -203,7 +203,7 @@ bool AllgatherSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
         auto it = registered_output_buffers_.find(
             reinterpret_cast<uintptr_t>(output));
         auto& dst_obj = (it != registered_output_buffers_.end())
-                            ? it->second : output_transit_buffer_obj_;
+                            ? it->second.obj : output_transit_buffer_obj_;
 
         OneShotAllGatherSdmaAsyncPutKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
@@ -458,7 +458,7 @@ bool AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
         auto it = registered_output_buffers_.find(
             reinterpret_cast<uintptr_t>(output));
         bool direct = (it != registered_output_buffers_.end());
-        auto& dst_obj = direct ? it->second : output_transit_buffer_obj_;
+        auto& dst_obj = direct ? it->second.obj : output_transit_buffer_obj_;
 
         OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
