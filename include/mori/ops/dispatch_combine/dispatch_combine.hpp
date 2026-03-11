@@ -121,7 +121,6 @@ struct EpDispatchCombineConfig {
 
   std::vector<int32_t> ToPackedI32Array() const;
   static EpDispatchCombineConfig FromPackedI32Array(const int32_t* packed, size_t size);
-  static EpDispatchCombineConfig FromPackedI32Array(const std::vector<int32_t>& packed);
   
 };
 

@@ -68,8 +68,9 @@ def run_test(rank, world_size):
       quant_type=mori.cpp.EpDispatchCombineQuantType.None_,
   )
 
-  launch_test = jax.ffi.ffi_call("launch_test", (), has_side_effect=True)
-  launch_test(ep_config=np.asarray(cfg.to_packed_array(), dtype=np.int32))
+  launch_test = jax.ffi.ffi_call("mori_ep", (), has_side_effect=True)
+  launch_test(ep_config=np.asarray(cfg.to_packed_array(), dtype=np.int32),
+              reset_op=True)
   jax.block_until_ready(jnp.array(0))
   print(f"[rank {rank}] launch_test submitted", flush=True)
 

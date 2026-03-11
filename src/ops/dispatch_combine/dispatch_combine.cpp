@@ -94,11 +94,6 @@ EpDispatchCombineConfig EpDispatchCombineConfig::FromPackedI32Array(
   return cfg;
 }
 
-EpDispatchCombineConfig EpDispatchCombineConfig::FromPackedI32Array(
-    const std::vector<int32_t>& packed) {
-  return FromPackedI32Array(packed.data(), packed.size());
-}
-
 /* ---------------------------------------------------------------------------------------------- */
 /*                                     EpDispatchCombineHandle                                    */
 /* ---------------------------------------------------------------------------------------------- */
