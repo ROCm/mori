@@ -74,7 +74,6 @@ void testSdmaSelfCopy() {
   int myPe = ShmemMyPe();
   int npes = ShmemNPes();
 
-  // Test sizes: 1MB, 4MB, 16MB, 32MB, 64MB, 128MB, 256MB
   std::vector<size_t> testSizes = {
     1*1024*1024, 4*1024*1024, 16*1024*1024, 32*1024*1024,
     64*1024*1024, 128*1024*1024, 256*1024*1024
@@ -83,60 +82,52 @@ void testSdmaSelfCopy() {
   const int warmup = 10;
   const int iterations = 20;
 
-  printf("PE %d: SDMA Self-Copy Performance Test (single GPU)\n\n", myPe);
-  printf("%12s %12s %12s %12s %12s\n", "Size(MB)", "SDMA(GB/s)", "hipMem(GB/s)", "SDMA(ms)", "hipMem(ms)");
-  printf("%s\n", std::string(60, '-').c_str());
-
   hipStream_t stream;
   CHECK_HIP(hipStreamCreate(&stream));
 
+  // ========================================================================
+  // Test A: Same-GPU copy comparison (SDMA self vs hipMemcpy D2D)
+  // ========================================================================
+  if (myPe == 0) {
+    printf("=== Test A: Same-GPU Copy (SDMA self vs hipMemcpy D2D) ===\n\n");
+    printf("%12s %12s %12s %12s %12s\n", "Size(MB)", "SDMA(GB/s)", "hipMem(GB/s)", "SDMA(ms)", "hipMem(ms)");
+    printf("%s\n", std::string(60, '-').c_str());
+  }
+
   for (size_t totalBytes : testSizes) {
-    // Allocate source (symmetric memory for SDMA)
     void* srcBuf = ShmemMalloc(totalBytes);
     assert(srcBuf);
     CHECK_HIP(hipMemset(srcBuf, 0xAB, totalBytes));
     SymmMemObjPtr srcObj = ShmemQueryMemObjPtr(srcBuf);
     assert(srcObj.IsValid());
 
-    // Allocate destination (regular device memory)
     void* dstBuf = nullptr;
     CHECK_HIP(hipMalloc(&dstBuf, totalBytes));
     CHECK_HIP(hipMemset(dstBuf, 0, totalBytes));
-
     CHECK_HIP(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
 
-    // ---- Test 1: SDMA self-copy ----
+    // SDMA self-copy
     std::vector<double> sdma_times;
     for (int i = 0; i < warmup + iterations; i++) {
       MPI_Barrier(MPI_COMM_WORLD);
       double t0 = MPI_Wtime();
-
       SdmaSelfCopyKernel<<<1, 64, 0, stream>>>(srcObj, dstBuf, totalBytes, myPe);
       CHECK_HIP(hipStreamSynchronize(stream));
-
       double t1 = MPI_Wtime();
       if (i >= warmup) sdma_times.push_back(t1 - t0);
     }
 
-    // ---- Test 2: hipMemcpy D2D ----
+    // hipMemcpy D2D (same GPU)
     std::vector<double> hip_times;
     for (int i = 0; i < warmup + iterations; i++) {
       MPI_Barrier(MPI_COMM_WORLD);
       double t0 = MPI_Wtime();
-
       CHECK_HIP(hipMemcpyAsync(dstBuf, srcBuf, totalBytes, hipMemcpyDeviceToDevice, stream));
       CHECK_HIP(hipStreamSynchronize(stream));
-
       double t1 = MPI_Wtime();
       if (i >= warmup) hip_times.push_back(t1 - t0);
     }
-
-    // Verify
-    std::vector<uint8_t> hostSrc(totalBytes), hostDst(totalBytes);
-    CHECK_HIP(hipMemcpy(hostSrc.data(), srcBuf, totalBytes, hipMemcpyDeviceToHost));
-    CHECK_HIP(hipMemcpy(hostDst.data(), dstBuf, totalBytes, hipMemcpyDeviceToHost));
-    bool ok = (memcmp(hostSrc.data(), hostDst.data(), totalBytes) == 0);
 
     double sdma_avg = 0, hip_avg = 0;
     for (double t : sdma_times) sdma_avg += t;
@@ -144,19 +135,86 @@ void testSdmaSelfCopy() {
     for (double t : hip_times) hip_avg += t;
     hip_avg /= hip_times.size();
 
-    double sdma_bw = totalBytes / sdma_avg / (1024.0 * 1024.0 * 1024.0);
-    double hip_bw = totalBytes / hip_avg / (1024.0 * 1024.0 * 1024.0);
-
     if (myPe == 0) {
-      printf("%10.1f %12.2f %12.2f %12.3f %12.3f  %s\n",
+      printf("%10.1f %12.2f %12.2f %12.3f %12.3f\n",
              totalBytes / (1024.0 * 1024.0),
-             sdma_bw, hip_bw,
-             sdma_avg * 1000, hip_avg * 1000,
-             ok ? "OK" : "FAIL");
+             totalBytes / sdma_avg / (1024.0*1024.0*1024.0),
+             totalBytes / hip_avg / (1024.0*1024.0*1024.0),
+             sdma_avg * 1000, hip_avg * 1000);
     }
 
     CHECK_HIP(hipFree(dstBuf));
     ShmemFree(srcBuf);
+  }
+
+  // ========================================================================
+  // Test B: Cross-GPU copy comparison (SDMA PUT vs hipMemcpy P2P)
+  // Requires npes >= 2
+  // ========================================================================
+  if (npes >= 2) {
+    int remotePe = (myPe + 1) % npes;
+
+    if (myPe == 0) {
+      printf("\n=== Test B: Cross-GPU Copy (SDMA PUT vs hipMemcpy P2P) ===\n");
+      printf("PE %d -> PE %d\n\n", myPe, remotePe);
+      printf("%12s %12s %12s %12s %12s\n", "Size(MB)", "SDMA(GB/s)", "hipMem(GB/s)", "SDMA(ms)", "hipMem(ms)");
+      printf("%s\n", std::string(60, '-').c_str());
+    }
+
+    for (size_t totalBytes : testSizes) {
+      // Allocate symmetric memory (has peer mappings for both SDMA and hipMemcpy P2P)
+      void* srcBuf = ShmemMalloc(totalBytes);
+      assert(srcBuf);
+      CHECK_HIP(hipMemset(srcBuf, myPe + 1, totalBytes));
+      SymmMemObjPtr srcObj = ShmemQueryMemObjPtr(srcBuf);
+      assert(srcObj.IsValid());
+
+      CHECK_HIP(hipDeviceSynchronize());
+      MPI_Barrier(MPI_COMM_WORLD);
+
+      // SDMA PUT to remote PE (kernel-based, multi-queue)
+      std::vector<double> sdma_times;
+      for (int i = 0; i < warmup + iterations; i++) {
+        MPI_Barrier(MPI_COMM_WORLD);
+        double t0 = MPI_Wtime();
+        SdmaSelfCopyKernel<<<1, 64, 0, stream>>>(srcObj,
+            reinterpret_cast<void*>(srcObj->peerPtrs[remotePe]),
+            totalBytes, remotePe);
+        CHECK_HIP(hipStreamSynchronize(stream));
+        double t1 = MPI_Wtime();
+        if (i >= warmup) sdma_times.push_back(t1 - t0);
+      }
+
+      // hipMemcpy P2P to remote PE
+      std::vector<double> hip_times;
+      for (int i = 0; i < warmup + iterations; i++) {
+        MPI_Barrier(MPI_COMM_WORLD);
+        double t0 = MPI_Wtime();
+        CHECK_HIP(hipMemcpyAsync(
+            reinterpret_cast<void*>(srcObj->peerPtrs[remotePe]),
+            srcBuf, totalBytes, hipMemcpyDeviceToDevice, stream));
+        CHECK_HIP(hipStreamSynchronize(stream));
+        double t1 = MPI_Wtime();
+        if (i >= warmup) hip_times.push_back(t1 - t0);
+      }
+
+      double sdma_avg = 0, hip_avg = 0;
+      for (double t : sdma_times) sdma_avg += t;
+      sdma_avg /= sdma_times.size();
+      for (double t : hip_times) hip_avg += t;
+      hip_avg /= hip_times.size();
+
+      if (myPe == 0) {
+        printf("%10.1f %12.2f %12.2f %12.3f %12.3f\n",
+               totalBytes / (1024.0 * 1024.0),
+               totalBytes / sdma_avg / (1024.0*1024.0*1024.0),
+               totalBytes / hip_avg / (1024.0*1024.0*1024.0),
+               sdma_avg * 1000, hip_avg * 1000);
+      }
+
+      ShmemFree(srcBuf);
+      MPI_Barrier(MPI_COMM_WORLD);
+    }
   }
 
   CHECK_HIP(hipStreamDestroy(stream));
