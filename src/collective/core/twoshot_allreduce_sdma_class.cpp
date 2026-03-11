@@ -359,9 +359,10 @@ double AllreduceSdma<T>::wait_async(hipStream_t stream) {
     try {
         hipStream_t wait_stream = (stream != nullptr) ? stream : async_stream_;
 
-        // Wait for AllGather SDMA transfers to complete + invalidate L2
+        // Wait for AllGather SDMA transfers to complete
+        // Remote PEs wrote to our local signalPtrs via SDMA ATOMIC
         AllGatherAsyncWaitKernel<<<1, 64, 0, wait_stream>>>(
-            myPe_, npes_, flagsObj_, barrierPtr_, async_total_count_);
+            myPe_, npes_, output_transit_buffer_obj_, barrierPtr_, async_total_count_);
 
         // Copy result to user buffer (if enabled)
         if (copy_output_to_user_) {

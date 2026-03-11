@@ -34,10 +34,13 @@ namespace core {
 /*                                           Post Tasks                                           */
 /* ---------------------------------------------------------------------------------------------- */
 
+// SdmaPutThread: COPY data + ATOMIC signal
+// If remoteSignal is provided, ATOMIC writes to remote PE's signal memory (direct notification).
+// Otherwise falls back to local signal (original behavior).
 inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_size,
                                 anvil::SdmaQueueDeviceHandle** deviceHandles,
                                 HSAuint64* signals, HSAuint64* expectedSignals, uint32_t queNum, uint32_t qId,
-                                HSAuint64* fencePtrs = nullptr)
+                                HSAuint64* remoteSignal = nullptr)
 {
    uint64_t base = 0;
    uint64_t pendingWptr = 0;
@@ -54,30 +57,26 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
    auto packet_d = anvil::CreateCopyPacket(srcPtr, dstPtr, copy_size);
    handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet_d, pendingWptr, offset);
 
-   // FENCE: ensure COPY data lands in destination memory before signaling
-   if (fencePtrs != nullptr) {
-      HSAuint64* fenceAddr = fencePtrs + qId;
-      base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_FENCE), offset);
-      pendingWptr = base;
-      auto packet_f = anvil::CreateFencePacket(fenceAddr, 1);
-      handle.template placePacket<SDMA_PKT_FENCE>(packet_f, pendingWptr, offset);
-   }
-
+   // ATOMIC: write to remote signal if provided, otherwise local signal
    base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), offset);
    pendingWptr = base;
-   HSAuint64* signal = signals + qId;
-   auto packet_s = anvil::CreateAtomicIncPacket(signal);
+   HSAuint64* signalAddr = (remoteSignal != nullptr) ? (remoteSignal + qId) : (signals + qId);
+   auto packet_s = anvil::CreateAtomicIncPacket(signalAddr);
    handle.template placePacket<SDMA_PKT_ATOMIC>(packet_s, pendingWptr, offset);
 
    handle.submitPacket(startBase, pendingWptr);
-   expectedSignals[qId]++;
+   if (remoteSignal != nullptr) {
+      // Remote signal: remote PE tracks expected count, not us
+   } else {
+      expectedSignals[qId]++;
+   }
 }
 
 
 inline __device__ void SdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
                                 anvil::SdmaQueueDeviceHandle** deviceHandles,
                                 HSAuint64* signals, HSAuint64* expectedSignals, uint32_t queNum,
-                                HSAuint64* fencePtrs = nullptr)
+                                HSAuint64* remoteSignal = nullptr)
 {
    uint64_t base = 0;
    uint64_t pendingWptr = 0;
@@ -106,23 +105,16 @@ inline __device__ void SdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
    srcPtr += perq_send_size;
    dstPtr += perq_send_size;
 
-   // FENCE: ensure COPY data lands in destination memory before signaling
-   if (fencePtrs != nullptr) {
-      HSAuint64* fenceAddr = fencePtrs + queueId;
-      base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_FENCE), offset);
-      pendingWptr = base;
-      auto packet_f = anvil::CreateFencePacket(fenceAddr, 1);
-      handle.template placePacket<SDMA_PKT_FENCE>(packet_f, pendingWptr, offset);
-   }
-
    base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), offset);
    pendingWptr = base;
-   HSAuint64* signal = signals + queueId;
-   auto packet_s = anvil::CreateAtomicIncPacket(signal);
+   HSAuint64* signalAddr = (remoteSignal != nullptr) ? (remoteSignal + queueId) : (signals + queueId);
+   auto packet_s = anvil::CreateAtomicIncPacket(signalAddr);
    handle.template placePacket<SDMA_PKT_ATOMIC>(packet_s, pendingWptr, offset);
 
    handle.submitPacket(startBase, pendingWptr);
-   expectedSignals[laneId]++;
+   if (remoteSignal == nullptr) {
+      expectedSignals[laneId]++;
+   }
 }
 
 
