@@ -28,7 +28,7 @@
 #include <memory>
 #include <cstdint>
 #include <atomic>
-#include <unordered_map>
+#include <map>
 
 // Include necessary headers
 #include "mori/application/application.hpp"
@@ -73,14 +73,17 @@ private:
     // if false, user should directly use output_transit_buffer
     bool copy_output_to_user_;
 
-    // Registered external output buffers (ptr address → {SymmMemObjPtr, size}).
-    // When the output address matches a registered entry, SDMA writes
-    // directly into that buffer, bypassing output_transit_buffer_.
+    // Registered output buffer pool regions.
+    // Key = base address.  Sorted map enables range lookup: given an
+    // arbitrary pointer, find the region that contains it in O(log N).
     struct RegisteredBuf {
-        application::SymmMemObjPtr obj;
-        size_t size;
+        application::SymmMemObjPtr obj;  // full IPC-mapped symm object
+        size_t size;                     // registration size in bytes
     };
-    std::unordered_map<uintptr_t, RegisteredBuf> registered_output_buffers_;
+    std::map<uintptr_t, RegisteredBuf> registered_output_buffers_;
+
+    // Range lookup helper: returns {SymmMemObjPtr, offset_from_base} or {invalid, 0}.
+    std::pair<application::SymmMemObjPtr, size_t> find_registered(void* ptr) const;
 
     // Disable copy constructor and assignment operator
     AllgatherSdma(const AllgatherSdma&) = delete;

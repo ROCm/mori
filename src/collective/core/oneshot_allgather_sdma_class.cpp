@@ -133,9 +133,24 @@ AllgatherSdma<T>::~AllgatherSdma() {
 // register / deregister / is_output_registered
 // ---------------------------------------------------------------------------
 template <typename T>
+std::pair<application::SymmMemObjPtr, size_t> AllgatherSdma<T>::find_registered(void* ptr) const {
+    uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+    auto it = registered_output_buffers_.upper_bound(addr);
+    if (it != registered_output_buffers_.begin()) {
+        --it;
+        uintptr_t base = it->first;
+        if (addr >= base && addr < base + it->second.size) {
+            size_t offset = addr - base;
+            return {it->second.obj, offset};
+        }
+    }
+    return {application::SymmMemObjPtr{}, 0};
+}
+
+template <typename T>
 void AllgatherSdma<T>::register_output_buffer(void* ptr, size_t size) {
     uintptr_t key = reinterpret_cast<uintptr_t>(ptr);
-    if (registered_output_buffers_.count(key)) {
+    if (find_registered(ptr).first.IsValid()) {
         return;
     }
     auto obj = shmem::ShmemSymmetricRegister(ptr, size);
@@ -161,7 +176,7 @@ void AllgatherSdma<T>::deregister_output_buffer(void* ptr) {
 
 template <typename T>
 bool AllgatherSdma<T>::is_output_registered(void* ptr) const {
-    return registered_output_buffers_.count(reinterpret_cast<uintptr_t>(ptr)) > 0;
+    return find_registered(ptr).first.IsValid();
 }
 
 // ================ NEW: Async API Implementations ================
@@ -200,10 +215,9 @@ bool AllgatherSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
 
         printf("  Grid size: %d, Block size: %d\n", grid_size, block_size);
 
-        auto it = registered_output_buffers_.find(
-            reinterpret_cast<uintptr_t>(output));
-        auto& dst_obj = (it != registered_output_buffers_.end())
-                            ? it->second.obj : output_transit_buffer_obj_;
+        auto [regObj, byteOffset] = find_registered(output);
+        bool direct = regObj.IsValid();
+        auto& dst_obj = direct ? regObj : output_transit_buffer_obj_;
 
         OneShotAllGatherSdmaAsyncPutKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
@@ -264,8 +278,7 @@ double AllgatherSdma<T>::wait_async(hipStream_t stream) {
         }
 
         // Step 2: Copy from output transit buffer to user output buffer (if needed)
-        bool direct = registered_output_buffers_.count(
-            reinterpret_cast<uintptr_t>(async_output_)) > 0;
+        bool direct = find_registered(async_output_).first.IsValid();
         if (!direct && copy_output_to_user_) {
             printf("PE %d: Copying results to user output buffer\n", myPe_);
             copy_output_to_user(async_output_, async_total_count_, wait_stream);
@@ -455,17 +468,13 @@ bool AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
     }
 
     try {
-        auto it = registered_output_buffers_.find(
-            reinterpret_cast<uintptr_t>(output));
-        bool direct = (it != registered_output_buffers_.end());
-        auto& dst_obj = direct ? it->second.obj : output_transit_buffer_obj_;
+        auto [regObj, byteOffset] = find_registered(output);
+        bool direct = regObj.IsValid();
+        auto& dst_obj = direct ? regObj : output_transit_buffer_obj_;
 
         OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
-            myPe_, npes_,
-            input,
-            input_transit_buffer_obj_,
-            dst_obj,
-            flagsObj_, total_count);
+            myPe_, npes_, input, input_transit_buffer_obj_,
+            dst_obj, flagsObj_, total_count, direct ? byteOffset : 0);
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess) {

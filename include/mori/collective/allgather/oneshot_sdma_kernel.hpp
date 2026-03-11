@@ -35,7 +35,8 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes,
                                        const application::SymmMemObjPtr srcMemObj,
                                        const application::SymmMemObjPtr dstMemObj,
                                        const application::SymmMemObjPtr flagsMemObj,
-                                       size_t elementCount) {
+                                       size_t elementCount,
+                                       size_t dstBaseOffset = 0) {
   if (elementCount == 0 || npes <= 0) {
     return;
   }
@@ -66,7 +67,7 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes,
     #if 1
     application::SymmMemObjPtr dest = dstMemObj;
     uint8_t* srcPtr = reinterpret_cast<uint8_t *>(inputData) + srcByteOffset;
-    uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + destByteOffset;
+    uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset + destByteOffset;
     anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + remotePe*dest->sdmaNumQueue;
     HSAuint64* signals = dest->signalPtrs + remotePe*dest->sdmaNumQueue;
     HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe*dest->sdmaNumQueue;
