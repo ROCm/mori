@@ -90,10 +90,10 @@ __global__ void ShmemAllReduceKernel(
 
     anvil::SdmaQueueDeviceHandle** dh =
         gatherObj->deviceHandles_d + destPe * gatherObj->sdmaNumQueue;
-    HSAuint64* sig = gatherObj->signalPtrs + destPe * gatherObj->sdmaNumQueue;
-    HSAuint64* esig = gatherObj->expectSignalsPtr + destPe * gatherObj->sdmaNumQueue;
+    HSAuint64* remoteSignal = gatherObj->peerSignalPtrs[destPe]
+                              + static_cast<size_t>(myPe) * gatherObj->sdmaNumQueue;
 
-    mori::core::SdmaPutThread(srcPtr, dstPtr, chunkBytes, dh, sig, esig, gatherObj->sdmaNumQueue, 0);
+    mori::core::SdmaPutThread(srcPtr, dstPtr, chunkBytes, dh, remoteSignal, gatherObj->sdmaNumQueue, 0);
   }
 
   if (blockIdx.x == 0 && warpId < npes && laneId == 0) {
@@ -160,10 +160,10 @@ __global__ void ShmemAllReduceKernel(
 
     anvil::SdmaQueueDeviceHandle** dh =
         gatherObj->deviceHandles_d + destPe * gatherObj->sdmaNumQueue;
-    HSAuint64* sig = gatherObj->signalPtrs + destPe * gatherObj->sdmaNumQueue;
-    HSAuint64* esig = gatherObj->expectSignalsPtr + destPe * gatherObj->sdmaNumQueue;
+    HSAuint64* remoteSignal = gatherObj->peerSignalPtrs[destPe]
+                              + static_cast<size_t>(myPe) * gatherObj->sdmaNumQueue;
 
-    mori::core::SdmaPutThread(srcPtr, dstPtr, chunkBytes, dh, sig, esig, gatherObj->sdmaNumQueue, 0);
+    mori::core::SdmaPutThread(srcPtr, dstPtr, chunkBytes, dh, remoteSignal, gatherObj->sdmaNumQueue, 0);
   }
 
   if (blockIdx.x == 0 && warpId < npes && laneId == 0) {

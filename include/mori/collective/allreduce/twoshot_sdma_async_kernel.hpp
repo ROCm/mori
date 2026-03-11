@@ -71,13 +71,10 @@ __global__ void ReduceScatterSdmaPutKernel(int myPe, int npes,
     uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + destByteOffset;
 
     anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
-    HSAuint64* signals = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
-    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
-
     HSAuint64* remoteSignal = dest->peerSignalPtrs[remotePe]
                               + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
 
-    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals, dest->sdmaNumQueue, qId, remoteSignal);
+    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, remoteSignal, dest->sdmaNumQueue, qId);
   }
 }
 
@@ -130,14 +127,11 @@ __global__ void AllGatherAsyncPutKernel(int myPe, int npes,
 
     anvil::SdmaQueueDeviceHandle** dh =
         dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
-    HSAuint64* sig = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
-    HSAuint64* esig = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
-
     HSAuint64* remoteSignal = dest->peerSignalPtrs[remotePe]
                               + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
 
     core::SdmaPutThread(agSrcPtr, agDstPtr, agSendBytes,
-                        dh, sig, esig, dest->sdmaNumQueue, 0, remoteSignal);
+                        dh, remoteSignal, dest->sdmaNumQueue, 0);
   }
   // No ShmemQuietThread + AMO notify needed — remote signal written by SDMA ATOMIC
 }
@@ -322,9 +316,9 @@ __global__ void AllGatherReducedSdmaPutKernel(int myPe, int npes,
     uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + byteOffset;
 
     anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
-    HSAuint64* signals = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
-    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
-    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals, dest->sdmaNumQueue, qId);
+    HSAuint64* remoteSignal = dest->peerSignalPtrs[remotePe]
+                              + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
+    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, remoteSignal, dest->sdmaNumQueue, qId);
   }
 }
 
@@ -391,16 +385,11 @@ __global__ void ReduceScatterAllGatherFusedKernel(
 
       anvil::SdmaQueueDeviceHandle** dh =
           dstMemObj->deviceHandles_d + destPe * dstMemObj->sdmaNumQueue;
-      HSAuint64* sig = dstMemObj->signalPtrs
-                       + destPe * dstMemObj->sdmaNumQueue;
-      HSAuint64* esig = dstMemObj->expectSignalsPtr
-                        + destPe * dstMemObj->sdmaNumQueue;
-
       HSAuint64* remoteSignal = dstMemObj->peerSignalPtrs[destPe]
                                 + static_cast<size_t>(myPe) * dstMemObj->sdmaNumQueue;
 
       core::SdmaPutThread(srcPtr, remoteDst, chunkBytes,
-                          dh, sig, esig, dstMemObj->sdmaNumQueue, 0, remoteSignal);
+                          dh, remoteSignal, dstMemObj->sdmaNumQueue, 0);
     }
     __syncthreads();
 

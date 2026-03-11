@@ -203,18 +203,13 @@ __global__ void SdmaReduceScatterKernel(
 
       anvil::SdmaQueueDeviceHandle** dh =
           dstMemObj->deviceHandles_d + destPe * dstMemObj->sdmaNumQueue;
-      HSAuint64* sig  = dstMemObj->signalPtrs
-                        + destPe * dstMemObj->sdmaNumQueue;
-      HSAuint64* esig = dstMemObj->expectSignalsPtr
-                        + destPe * dstMemObj->sdmaNumQueue;
-
       // Remote signal: ATOMIC writes directly to destPe's signal memory
       // at slot [myPe * numQueues + qId], so destPe can detect completion locally
       HSAuint64* remoteSignal = dstMemObj->peerSignalPtrs[destPe]
                                 + static_cast<size_t>(myPe) * dstMemObj->sdmaNumQueue;
 
       core::SdmaPutThread(srcPtr, remoteDst, chunkBytes,
-                          dh, sig, esig, dstMemObj->sdmaNumQueue, 0, remoteSignal);
+                          dh, remoteSignal, dstMemObj->sdmaNumQueue, 0);
     }
     __syncthreads();
 
@@ -363,15 +358,12 @@ __global__ void AllGatherSdmaKernel(int myPe, int npes,
 
     anvil::SdmaQueueDeviceHandle** devicehandles =
         dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
-    HSAuint64* signals         = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
-    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
-
     HSAuint64* remoteSignal = dest->peerSignalPtrs[remotePe]
                               + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
 
     core::SdmaPutThread(agSrcPtr, agDstPtr, agSendBytes,
-                        devicehandles, signals, expectedSignals,
-                        dest->sdmaNumQueue, 0, remoteSignal);
+                        devicehandles, remoteSignal,
+                        dest->sdmaNumQueue, 0);
   }
   __syncthreads();
 
