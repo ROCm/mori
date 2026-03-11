@@ -44,12 +44,8 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes,
 //  T* __restrict__ src = reinterpret_cast<T*>(srcMemObj->localPtr);
 //  T* __restrict__ dst = reinterpret_cast<T*>(dstMemObj->localPtr);
   uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
-  int flag_val = 1;
-
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
-//  const size_t threadsPerGrid = static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
-//  const size_t stride = threadsPerGrid > 0 ? threadsPerGrid : 1;
 
   const size_t bytesPerElement = sizeof(T);
   const size_t bytesPerPeer = elementCount * bytesPerElement;
@@ -80,14 +76,16 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes,
     if (threadLinearId == 0) {
       HSAuint64* mySignal = dstMemObj->signalPtrs
                             + static_cast<size_t>(sender) * dstMemObj->sdmaNumQueue;
+      HSAuint64 expected = dstMemObj->expectSignalsPtr[sender * dstMemObj->sdmaNumQueue] + 1;
       int spinCount = 0;
-      while (core::AtomicLoadRelaxed(mySignal) < flag_val) {
+      while (core::AtomicLoadRelaxed(mySignal) < expected) {
         ++spinCount;
         if (spinCount > 10000000) {
           printf("PE %d: Timeout waiting for data from peer %d\n", myPe, sender);
           break;
         }
       }
+      dstMemObj->expectSignalsPtr[sender * dstMemObj->sdmaNumQueue] = expected;
     }
     __syncthreads();
   }

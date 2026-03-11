@@ -83,7 +83,6 @@ __global__ void OneShotAll2allSdmaAsyncPutKernel(int myPe, int npes,
 
 __global__ void OneShotAll2allSdmaAsyncWaitKernel(int myPe, int npes,
                                         const application::SymmMemObjPtr dstMemObj) {
-  int flag_val = 1;
   const size_t threadLinearId = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
 
   for (int sender = 0; sender < npes; ++sender) {
@@ -91,14 +90,16 @@ __global__ void OneShotAll2allSdmaAsyncWaitKernel(int myPe, int npes,
     if (threadLinearId == 0) {
       HSAuint64* mySignal = dstMemObj->signalPtrs
                             + static_cast<size_t>(sender) * dstMemObj->sdmaNumQueue;
+      HSAuint64 expected = dstMemObj->expectSignalsPtr[sender * dstMemObj->sdmaNumQueue] + 1;
       int spinCount = 0;
-      while (core::AtomicLoadRelaxed(mySignal) < flag_val) {
+      while (core::AtomicLoadRelaxed(mySignal) < expected) {
         ++spinCount;
         if (spinCount > 10000000) {
           printf("PE %d: Timeout waiting for data from peer %d\n", myPe, sender);
           break;
         }
       }
+      dstMemObj->expectSignalsPtr[sender * dstMemObj->sdmaNumQueue] = expected;
     }
     __syncthreads();
   }

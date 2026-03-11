@@ -47,7 +47,7 @@ __global__ void OneShotAll2allSdmaKernel(int myPe, int npes,
     T* __restrict__ stageData = reinterpret_cast<T*>(outputTransitMemObj->localPtr);
     
     uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
-    int flag_val = 1;
+    //int flag_val = 1; // replaced by dynamic expected count
 
     const size_t threadLinearId =
         static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
@@ -89,14 +89,16 @@ __global__ void OneShotAll2allSdmaKernel(int myPe, int npes,
         if (threadLinearId == 0) {
             HSAuint64* mySignal = outputTransitMemObj->signalPtrs
                                   + static_cast<size_t>(sender) * outputTransitMemObj->sdmaNumQueue;
+            HSAuint64 expected = outputTransitMemObj->expectSignalsPtr[sender * outputTransitMemObj->sdmaNumQueue] + 1;
             int spinCount = 0;
-            while (core::AtomicLoadRelaxed(mySignal) < flag_val) {
+            while (core::AtomicLoadRelaxed(mySignal) < expected) {
                 ++spinCount;
                 if (spinCount > 10000000) {
                     printf("Kernel[PE %d]: Timeout waiting for data from peer %d\n", myPe, sender);
                     break;
                 }
             }
+            outputTransitMemObj->expectSignalsPtr[sender * outputTransitMemObj->sdmaNumQueue] = expected;
         }
         __syncthreads();
     }
