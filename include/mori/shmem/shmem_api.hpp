@@ -21,7 +21,9 @@
 // SOFTWARE.
 #pragma once
 
+#ifdef MORI_HAS_MPI
 #include <mpi.h>
+#endif
 
 #include <array>
 #include <cstddef>

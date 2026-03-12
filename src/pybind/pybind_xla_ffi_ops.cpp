@@ -27,12 +27,14 @@
 #include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
 #include "mori/ops/ops.hpp"
-#include "mori/pybind/profiler_registry.hpp"
 #include "mori/utils/hip_helper.hpp"
+#include "mori/ops/dispatch_combine/launch.hpp"
 #include "src/pybind/mori.hpp"
 
 #include "xla/ffi/api/c_api.h"
@@ -40,8 +42,7 @@
 
 namespace py = pybind11;
 
-#define XPUT(fmt, ...) printf(fmt "\n", ##__VA_ARGS__)
-#define unlikely(x) __builtin_expect(!!(x), 0)
+#define XPUT(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
 
 using namespace xla::ffi;
 using mori::moe::EpDispatchCombineConfig;
@@ -54,12 +55,30 @@ using mori::moe::index_t;
 /* ---------------------------------------------------------------------------------------------- */
 namespace {
 
+// Global cache: maps packed ep_config → shared handle.
+// All call sites with identical ep_config reuse the same EpDispatchCombineHandle.
+struct VecI32Hash {
+  size_t operator()(const std::vector<int32_t>& v) const noexcept {
+    size_t seed = v.size();
+    for (auto x : v) {
+      // boost::hash_combine style mixing
+      seed ^= std::hash<int32_t>{}(x) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    }
+    return seed;
+  }
+};
+
+static std::mutex g_handle_cache_mu;
+static std::unordered_map<std::vector<int32_t>,
+    std::shared_ptr<EpDispatchCombineHandle>, VecI32Hash> g_handle_cache;
+
 struct EpDispatchCombineState {
   static TypeId id;
 
-  explicit EpDispatchCombineState(EpDispatchCombineConfig cfg) : handle(cfg) {}
+  explicit EpDispatchCombineState(
+      std::shared_ptr<EpDispatchCombineHandle> h) : handle(std::move(h)) {}
 
-  EpDispatchCombineHandle handle;
+  std::shared_ptr<EpDispatchCombineHandle> handle;
 };
 
 TypeId EpDispatchCombineState::id = {};
@@ -85,7 +104,7 @@ void GpuCopy(void* dst, const void* src, size_t bytes, hipStream_t stream,
 template <class T, class Container>
 T GetArg(const Container& container, size_t index) {
   auto result = container.template get<T>(index);
-  if (unlikely(result.has_error())) {
+  if (XLA_FFI_PREDICT_FALSE(result.has_error())) {
     throw std::runtime_error(result.error().message());
   }
   return result.value();
@@ -94,7 +113,7 @@ T GetArg(const Container& container, size_t index) {
 template <class T, class Container>
 Result<T> GetRet(const Container& container, size_t index) {
   auto result = container.template get<T>(index);
-  if (unlikely(result.has_error())) {
+  if (XLA_FFI_PREDICT_FALSE(result.has_error())) {
     throw std::runtime_error(result.error().message());
   }
   return result.value();
@@ -103,8 +122,17 @@ Result<T> GetRet(const Container& container, size_t index) {
 template <class T, class Container>
 T GetAttr(const Container& container, std::string_view name) {
   auto result = container.template get<T>(name);
-  if (unlikely(result.has_error())) {
+  if (XLA_FFI_PREDICT_FALSE(result.has_error())) {
     throw std::runtime_error(result.error().message());
+  }
+  return result.value();
+}
+
+template <class T, class Container>
+T GetAttrOr(const Container& container, std::string_view name, T def) {
+  auto result = container.template get<T>(name);
+  if (XLA_FFI_PREDICT_FALSE(result.has_error())) {
+    return def;
   }
   return result.value();
 }
@@ -112,216 +140,170 @@ T GetAttr(const Container& container, std::string_view name) {
 Error MoriDispatchImpl(
     hipStream_t stream,
     EpDispatchCombineHandle *h,
-    Dictionary attrs, RemainingArgs args, RemainingRets rets
-    /*int32_t has_scales,
-    int32_t has_weights,
-    int32_t kernel_type,
-    int32_t block_num,
-    int32_t warp_per_block,
-    AnyBuffer input,
-    BufferR2<F32> weights,
-    AnyBuffer scales,
-    BufferR2<S32> topk_ids,
-    Result<AnyBuffer> out,
-    Result<BufferR2<F32>> out_weights,
-    Result<AnyBuffer> out_scales,
-    Result<BufferR2<S32>> out_indices,
-    Result<BufferR0<S32>> total_recv_token_num*/) {
+    Dictionary attrs, RemainingArgs args, RemainingRets rets) {
+
   auto input = GetArg<AnyBuffer>(args, 0);
-  auto weights = GetArg<BufferR2<F32>>(args, 1);
-  auto topk_ids = GetArg<BufferR2<S32>>(args, 2);
+  auto topk_ids = GetArg<BufferR2<S32>>(args, 1);
   auto out = GetRet<AnyBuffer>(rets, 0);
+  auto out_indices = GetRet<BufferR2<S32>>(rets, 1);
+  auto total_recv_token_num = GetRet<BufferR0<S32>>(rets, 2);
+
+  auto block_num = GetAttr<int32_t>(attrs, "block_num");
+  auto rdma_block_num = GetAttr<int32_t>(attrs, "rdma_block_num");
+  auto warp_per_block = GetAttr<int32_t>(attrs, "warp_per_block");
+  auto has_scales = GetAttr<int32_t>(attrs, "has_scales");
   
-  XPUT("MoriDispatchImpl handle: %d, kernel_type=%d input=%d weights=%d block_num=%d stream: %p",
-      h->config.rank, kernel_type, (int)input.size_bytes(), (int)weights.size_bytes(), block_num, stream);
+  const int hiddenDim = static_cast<int>(input.dimensions()[1]);
+  assert(hiddenDim > 0 && hiddenDim <= h->config.hiddenDim);
   
   assert(ByteWidth(topk_ids.element_type()) == sizeof(index_t) &&
          ByteWidth(out_indices->element_type()) == sizeof(index_t)); 
   
-  float *weightsPtr = has_weights ? weights.typed_data() : nullptr;
-
+  float *weightsPtr = nullptr;
+  if ((!has_scales && args.size() >= 3) || 
+       (has_scales && args.size() >= 4)) {
+    auto weights = GetArg<BufferR2<F32>>(args, 2);
+    weightsPtr = weights.typed_data();
+  }
+  
   uint8_t* scalesPtr = nullptr;
   if (has_scales && h->config.scaleDim > 0) {
+    auto scales = GetArg<AnyBuffer>(args, weightsPtr ? 3 : 2);
     assert(/*scales->is_contiguous() &&*/ 
       ByteWidth(scales.element_type()) == h->config.scaleTypeSize);
     scalesPtr = static_cast< uint8_t *>(scales.untyped_data());
   }
+  XPUT("MoriDispatch h: %p, input=%d hiddenDim=%d weights=%p scales=%p",
+    h, (int)input.size_bytes(), hiddenDim, weightsPtr, scalesPtr);
 
-  // NOTE: why output is set to NULL??
-  h->PrepareInference(FFIType2HipType(input.element_type()), 
-        input.untyped_data(), nullptr, weightsPtr, scalesPtr, 
-        topk_ids.typed_data(), input.dimensions()[0]);
+  mori::moe::LaunchDispatch(*h, input.untyped_data(), weightsPtr, 
+      scalesPtr, topk_ids.typed_data(), input.dimensions()[0], 
+      FFIType2HipType(input.element_type()), block_num, rdma_block_num,
+      warp_per_block, stream, hiddenDim);
 
+  GpuCopy(out->untyped_data(), h->shmemDispatchOutTokMemObj->Get(), 
+        out->size_bytes(), stream);
 
+  if (weightsPtr) {
+    auto out_weights = GetRet<BufferR2<F32>>(rets, 3);
+    GpuCopy(out_weights->untyped_data(), h->shmemDispatchOutWeightsMemObj->Get(), 
+        out_weights->size_bytes(), stream);
+  }
+  if (scalesPtr) {
+    auto out_scales = GetRet<AnyBuffer>(rets, weightsPtr ? 4 : 3);
+    GpuCopy(out_scales->untyped_data(), h->shmemOutScalesMemObj->Get(), 
+        out_scales->size_bytes(), stream);
+  }
 
-// #if 0 // NOTE: we do not use this anymore   
-//   h->LaunchDispatch(static_cast< KernelType >(kernel_type), block_num, 
-//                                                       warp_per_block, stream);
-// #endif
-//   GpuCopy(out->untyped_data(), h->shmemDispatchOutTokMemObj->Get(), 
-//         out->size_bytes(), stream);
+  GpuCopy(out_indices->untyped_data(), h->shmemOutIndicesMemObj->Get(), 
+        out_indices->size_bytes(), stream);
 
-//   if (weightsPtr) {
-//     GpuCopy(out_weights->untyped_data(), h->shmemDispatchOutWeightsMemObj->Get(), 
-//         out_weights->size_bytes(), stream);
-//   }
-//   if (scalesPtr) {
-//     GpuCopy(out_scales->untyped_data(), h->shmemOutScalesMemObj->Get(), 
-//         out_scales->size_bytes(), stream);
-//   }
+  GpuCopy(total_recv_token_num->untyped_data(), h->totalRecvTokenNum, 
+        sizeof(index_t), stream);
 
-//   GpuCopy(out_indices->untyped_data(), h->shmemOutIndicesMemObj->Get(), 
-//         out_indices->size_bytes(), stream);
-
-//   GpuCopy(total_recv_token_num->untyped_data(), h->totalRecvTokenNum, 
-//         sizeof(index_t), stream);
-
+  // HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
+  // XPUT("rank %d MoriDispatch done", h->config.rank);
   return Error::Success();
 }
-
-// if this does not work, we will have to send Handle fields via Ctx params..
-// XLA_FFI_DEFINE_HANDLER(
-//     MoriDispatchHandler, MoriDispatchImpl,
-//     // Explicit binding to ensure attrs/args order
-//     Ffi::Bind()
-//         .Ctx<PlatformStream<hipStream_t>>()
-//         .Attr<Pointer<EpDispatchCombineHandle>>("handle_ptr")
-//         .Attr<int32_t>("has_scales")
-//         .Attr<int32_t>("has_weights")
-//         .Attr<int32_t>("kernel_type")
-//         .Attr<int32_t>("block_num")
-//         .Attr<int32_t>("warp_per_block")
-//         .Arg<AnyBuffer>()          // input
-//         .Arg<BufferR2<F32>>()      // weights optional
-//         .Arg<AnyBuffer>()          // scales optional
-//         .Arg<BufferR2<S32>>()      // topk_ids 
-//         .Ret<AnyBuffer>()          // out
-//         .Ret<BufferR2<F32>>()      // out_weights optional
-//         .Ret<AnyBuffer>()          // out_scales optional
-//         .Ret<BufferR2<S32>>()      // out_indices 
-//         .Ret<BufferR0<S32>>()      // total_recv_token_num
-// );
 
 Error MoriCombineImpl(
     hipStream_t stream,
     EpDispatchCombineHandle *h,
-    Dictionary attrs, RemainingArgs args, RemainingRets rets
-    /*int32_t has_weights,
-    int32_t kernel_type,
-    int32_t block_num,
-    int32_t warp_per_block,
-    AnyBuffer input,
-    BufferR2<F32> weights,
-    BufferR2<S32> topk_ids,
-    Result<AnyBuffer> out,
-    Result<BufferR2<F32>> out_weights*/) {
+    Dictionary attrs, RemainingArgs args, RemainingRets rets) {
 
-      auto input = GetArg<AnyBuffer>(args, 0);
-      auto weights = GetArg<BufferR2<F32>>(args, 1);
-      auto topk_ids = GetArg<BufferR2<S32>>(args, 2);
-      auto out = GetRet<AnyBuffer>(rets, 0);
+  auto input = GetArg<AnyBuffer>(args, 0);
+  auto topk_ids = GetArg<BufferR2<S32>>(args, 1);
+  auto out = GetRet<AnyBuffer>(rets, 0);
+
+  auto block_num = GetAttr<int32_t>(attrs, "block_num");
+  auto rdma_block_num = GetAttr<int32_t>(attrs, "rdma_block_num");
+  auto warp_per_block = GetAttr<int32_t>(attrs, "warp_per_block");
+  const int hiddenDim = static_cast<int>(input.dimensions()[1]);
+  assert(hiddenDim > 0 && hiddenDim <= h->config.hiddenDim);
+  assert(ByteWidth(topk_ids.element_type()) == sizeof(index_t)); 
   
-//   XPUT("MoriCombineImpl handle: %d, kernel_type=%d input=%d weights=%d block_num=%d",
-//       h->config.rank, kernel_type, (int)input.size_bytes(), (int)weights.size_bytes(), block_num);
-  
-//   assert(ByteWidth(topk_ids.element_type()) == sizeof(index_t)); 
-  
-//   float *weightsPtr = has_weights ? weights.typed_data() : nullptr;
+  float *weightsPtr = nullptr;
+  if (args.size() > 2) {
+    auto weights = GetArg<BufferR2<F32>>(args, 2);
+    weightsPtr = weights.typed_data();
+  }
+  XPUT("MoriCombine h: %p, input=%d topk_ids=%d hiddenDim: %d weights=%p useExternalInpBuffer=%d",
+    h, (int)input.size_bytes(), (int)topk_ids.size_bytes(), hiddenDim, weightsPtr,
+    h->config.useExternalInpBuffer);
 
 //   // NOTE reading directly from GPU mem!!
 //   index_t total_recv_token_num = h->totalRecvTokenNum[0];
-
 //   // we need to copy data to shmemCombineInpTokMemObj directly
-//   if (!h->config.useExternalInpBuffer) {
-//     GpuCopy(h->shmemCombineInpTokMemObj->Get(), input.untyped_data(), 
-//         out_weights->size_bytes(), stream);
-//   }
-//   // NOTE: why output is set to NULL??
-//   h->PrepareInference(FFIType2HipType(input.element_type()), 
-//         input.untyped_data(), nullptr, weightsPtr, 
-//         topk_ids.typed_data(), h->curRankNumToken);
-// #if 0 // NOTE: we do not use this anymore   
-//   h->LaunchCombine(static_cast< KernelType >(kernel_type), block_num, 
-//                                                       warp_per_block, stream);
-// #endif
-//   GpuCopy(out->untyped_data(), h->shmemCombineOutTokMemObj->Get(), 
-//         out->size_bytes(), stream);
-//   // {handle.config.maxNumInpTokenPerRank, handle.config.hiddenDim},
+  if (!h->config.useExternalInpBuffer) {
+    // GpuCopy(h->shmemCombineInpTokMemObj->Get(), input.untyped_data(), 
+    //     out_weights->size_bytes(), // should this be input.size_bytes()?
+    //     stream);
+  }
+  mori::moe::LaunchCombine(*h, input.untyped_data(), weightsPtr,
+      topk_ids.typed_data(), //input.dimensions()[0], 
+      h->curRankNumToken,
+      FFIType2HipType(input.element_type()), block_num, rdma_block_num,
+      warp_per_block, h->config.useExternalInpBuffer ? 1 : 0, 
+      stream, hiddenDim);
 
-//   if (weightsPtr) {
-//     //{handle.config.maxNumInpTokenPerRank, handle.config.numExpertPerToken},
-//     GpuCopy(out_weights->untyped_data(), h->shmemCombineOutWeightsMemObj->Get(), 
-//         out_weights->size_bytes(), stream);
-//   }
+  GpuCopy(out->untyped_data(), h->shmemCombineOutTokMemObj->Get(), 
+        out->size_bytes(), stream);
+  // {handle.config.maxNumInpTokenPerRank, handle.config.hiddenDim},
+
+  if (weightsPtr) {
+    auto out_weights = GetRet<BufferR2<F32>>(rets, 1);
+    //{handle.config.maxNumInpTokenPerRank, handle.config.numExpertPerToken},
+    GpuCopy(out_weights->untyped_data(), h->shmemCombineOutWeightsMemObj->Get(), 
+        out_weights->size_bytes(), stream);
+  }
+  // HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
+  // XPUT("rank %d MoriCombine done", h->config.rank);
   return Error::Success();
 } 
-
-// if this does not work, we will have to send Handle fields via Ctx params..
-// XLA_FFI_DEFINE_HANDLER(
-//     MoriCombineHandler, MoriCombineImpl,
-//     Ffi::Bind()
-//         .Ctx<PlatformStream<hipStream_t>>()
-//         .Attr<Pointer<EpDispatchCombineHandle>>("handle_ptr")
-//         .Attr<int32_t>("has_weights")
-//         .Attr<int32_t>("kernel_type")
-//         .Attr<int32_t>("block_num")
-//         .Attr<int32_t>("warp_per_block")
-//         .Arg<AnyBuffer>()          // input
-//         .Arg<BufferR2<F32>>()      // weights optional
-//         .Arg<BufferR2<S32>>()      // topk_ids 
-//         .Ret<AnyBuffer>()          // out
-//         .Ret<BufferR2<F32>>()      // out_weights optional
-// );
 
 Error MoriResetImpl(hipStream_t stream, EpDispatchCombineHandle *h) {
   XPUT("MoriResetImpl stream: %p", stream);
   h->LaunchReset(stream);
   return Error::Success();
 }
- 
-// XLA_FFI_DEFINE_HANDLER(
-//     MoriResetHandler, MoriResetImpl,
-//     Ffi::Bind()
-//         .Ctx<PlatformStream<hipStream_t>>()
-//         .Attr<Pointer<EpDispatchCombineHandle>>("handle_ptr")
-// );
 
 Error GetDispatchSrcTokenId(hipStream_t stream, EpDispatchCombineHandle *h,
     RemainingRets rets) {
-  //XPUT("GetDispatchSrcTokenId stream: %p", stream);
-  
-  auto out = rets.get<BufferR1<S32>>(0);
-  if (out.has_error()) return out.error();
-  
+  // XPUT("GetDispatchSrcTokenId h: %p", h);
+  auto out = GetRet<BufferR1<S32>>(rets, 0);
   // NOTE here we read the whole buffer but the actual # of tokens received could be less
-  // we do nto want to read it since it requires explitic stream syncrhonize otherwise
-  GpuCopy(out.value()->untyped_data(), h->dispTokIdToSrcTokIdMemObj->Get(), 
-              out.value()->size_bytes(), stream);
+  // we do not want to read it since it requires explicit stream synchronization otherwise
+  GpuCopy(out->untyped_data(), h->dispTokIdToSrcTokIdMemObj->Get(), 
+              out->size_bytes(), stream);
   return Error::Success();
 } 
-
-// // if this does not work, we will have to send Handle fields via Ctx params..
-// XLA_FFI_DEFINE_HANDLER(
-//     GetDispatchSrcTokenIdHandler, GetDispatchSrcTokenIdJax,
-//     Ffi::Bind()
-//         .Ctx<PlatformStream<hipStream_t>>()
-//         .Attr<Pointer<EpDispatchCombineHandle>>("handle_ptr")
-//         // this buffer is actually not used by we need it in order to ensure
-//         // correct order of FFI calls
-//         .Arg<BufferR0<S32>>()
-//         .Ret<BufferR1<S32>>()
-// );
 
 ErrorOr<std::unique_ptr<EpDispatchCombineState>> EpDispatchCombineInstantiate(
     Dictionary attrs) {
 
   auto ep_config = attrs.get<Span<const int32_t>>("ep_config");
+
   if (ep_config.has_error()) {
     return ErrorOr<std::unique_ptr<EpDispatchCombineState>>(ep_config.error());
   }
-  auto cfg = EpDispatchCombineConfig::FromPackedI32Array(
-    ep_config->begin(), ep_config->size());
-  return std::make_unique<EpDispatchCombineState>(cfg);
+
+  // Use the packed config as cache key so all call sites with the same
+  // ep_config share a single EpDispatchCombineHandle.
+  std::vector<int32_t> key(ep_config->begin(), ep_config->end());
+
+  std::lock_guard<std::mutex> lock(g_handle_cache_mu);
+  auto& entry = g_handle_cache[key];
+  if (!entry) {
+    auto cfg = EpDispatchCombineConfig::FromPackedI32Array(
+        key.data(), key.size());
+    XPUT("EpDispatchCombineInstantiate: creating new handle for rank %d "
+         "(#attrs: %zu)", cfg.rank, attrs.size());
+    entry = std::make_shared<EpDispatchCombineHandle>(cfg);
+  } else {
+    XPUT("EpDispatchCombineInstantiate: reusing cached handle for rank %d "
+         "(#attrs: %zu)", entry->config.rank, attrs.size());
+  }
+  return std::make_unique<EpDispatchCombineState>(entry);
 }
 
 XLA_FFI_DEFINE_HANDLER(
@@ -333,20 +315,20 @@ Error EpDispatchCombineImpl(
     Dictionary attrs, 
     RemainingArgs args,
     RemainingRets rets) try {
-  XPUT(
-      "EpDispatchCombineImpl stream=%p rank=%d  attrs: %zu",
-      stream, state->handle.config.rank, attrs.size());
+  auto& h = *state->handle;
+  // XPUT("EpDispatchCombineImpl stream=%p rank=%d  attrs: %zu",
+  //     stream, h.config.rank, attrs.size());
   if (attrs.contains("dispatch_op")) {
-    return MoriDispatchImpl(stream, &state->handle, attrs, args, rets);
+    return MoriDispatchImpl(stream, &h, attrs, args, rets);
   }
   if (attrs.contains("combine_op")) {
-    return MoriCombineImpl(stream, &state->handle, attrs, args, rets);
+    return MoriCombineImpl(stream, &h, attrs, args, rets);
   }
   if (attrs.contains("reset_op")) {
-    return MoriResetImpl(stream, &state->handle);
+    return MoriResetImpl(stream, &h);
   }
   if (attrs.contains("get_src_token_id")) {
-    return GetDispatchSrcTokenId(stream, &state->handle, rets);
+    return GetDispatchSrcTokenId(stream, &h, rets);
   }
   return Error::Internal("Invalid operation type");
 } catch (const std::exception& e) {
@@ -371,20 +353,30 @@ XLA_FFI_DEFINE_HANDLER(
 namespace mori {
 
 void RegisterXLAFFIOps(py::module_& m) {
-// #define OO(X) def(#X, &EpDispatchCombineConfig::X)
-//       .OO(MaxNumTokensToSendPerRank)
-//       .OO(MaxNumTokensToSend)
-//       .OO(MaxNumTokensToRecvPerRank)
-//       .OO(MaxNumTokensToRecv);
-// #undef OO
-  m.def("mori_ep_type_id",
-        []() { return py::capsule(reinterpret_cast<void*>(&EpDispatchCombineState::id)); });
+  m.def("mori_ep_type_info", []() {
+    // In earlier versions of XLA:FFI, the `MakeTypeInfo` helper was not
+    // available. In latest XLF:FFI `TypeInfo` is an alias for C API struct.
+    static auto kStateTypeInfo = 
+#if XLA_FFI_API_MINOR >= 2
+          MakeTypeInfo<EpDispatchCombineState>();
+#else
+          TypeInfo<EpDispatchCombineState>();
+#endif
+    py::dict d;
+    d["type_id"] = py::capsule(reinterpret_cast<void*>(&EpDispatchCombineState::id));
+    d["type_info"] = py::capsule(reinterpret_cast<void*>(&kStateTypeInfo));
+    return d;
+  });
+
   m.def("mori_ep_handler", []() {
     py::dict d;
     d["instantiate"] =
         py::capsule(reinterpret_cast<void*>(EpDispatchCombineInstHandler));
     d["execute"] = py::capsule(reinterpret_cast<void*>(EpDispatchCombineHandler));
     return d;
+  });
+  m.def("preload_kernels", []() {
+    mori::moe::KernelRegistry::Instance().AutoLoad();
   });
 //   m.def("get_cur_rank_num_token", &EpDispatchCombineHandle::GetCurRankNumToken);
 }

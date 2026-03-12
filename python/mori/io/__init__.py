@@ -1,4 +1,4 @@
-# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+        # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
 # MIT License
 #
@@ -19,7 +19,13 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-from .engine import *
+
+try:
+  import torch  # noqa: F401
+  from .engine import *
+except ImportError:
+  pass
+
 from mori.cpp import (
     IOEngineConfig,
     StatusCode,

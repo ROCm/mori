@@ -1,39 +1,15 @@
 import jax
 import jax.numpy as jnp
 import mori
+
 from jax.sharding import PartitionSpec as P
 # from jax.experimental.pjit import pjit
-from jax._src.lib import _jax
 import numpy as np
 import argparse, os, time, functools
 import gc
-
-def get_distributed_client(): # -> _jax.DistributedRuntimeClient:
-  from jax._src.distributed import global_state
-  assert isinstance(global_state.client, _jax.DistributedRuntimeClient)
-  return global_state.client
-  
-def mori_shmem_init_attr(rank, world_size, sync_name="mori/unique_id", 
-            timeout_ms=5_000):
-  
-  client = get_distributed_client()
-  if rank == 0:
-    unique_id = mori.shmem.shmem_get_unique_id()
-    client.key_value_set_bytes(
-       sync_name, unique_id
-       #devs.key, pickle.dumps(nccl_id)
-    )
-  else:
-    unique_id = client.blocking_key_value_get_bytes(
-      sync_name, timeout_ms)
-  
-  #print(f"{rank} unique ID initattr {unique_id}", flush=True)
-  mori.shmem.shmem_init_attr(mori.shmem.MORI_SHMEM_INIT_WITH_UNIQUEID,
-                   rank, world_size, unique_id)
-  print(f"{rank} unique ID initattr OK", flush=True)
   
 def setup(rank, world_size):
-  return mori_shmem_init_attr(rank, world_size)
+  return mori.jax.shmem_init_attr(rank, world_size)
 
 def cleanup():
   jax.clear_caches() # this is needed since EpDispatchCombineState can be
@@ -42,12 +18,6 @@ def cleanup():
   mori.shmem.shmem_finalize()
   
 def run_test(rank, world_size):
-  try:
-    jax.ffi.register_ffi_target("mori_ep", mori.cpp.mori_ep_handler(), platform="ROCM")
-    jax.ffi.register_ffi_type_id("mori_ep", mori.cpp.mori_ep_type_id(), platform="ROCM")
-  except Exception:
-    # Already registered in this process.
-    pass
   print(f"[rank {rank}] devices = {jax.local_devices()}", flush=True)
 
   cfg = mori.cpp.EpDispatchCombineConfig(
@@ -70,9 +40,19 @@ def run_test(rank, world_size):
       quant_type=mori.cpp.EpDispatchCombineQuantType.None_,
   )
 
-  launch_test = jax.ffi.ffi_call("mori_ep", (), has_side_effect=True)
-  launch_test(ep_config=np.asarray(cfg.to_packed_array(), dtype=np.int32),
-              reset_op=True)
+  op = mori.jax.EpDispatchCombineOp(cfg)
+  
+  input = jnp.ones((1024, 4096), dtype=jnp.float32)
+  weights = jnp.ones((1024, 56), dtype=jnp.float32)
+  scales = jnp.ones((1024, 32), dtype=jnp.float8_e4m3fnuz)
+  indices = jnp.ones((1024, 56), dtype=jnp.int32)
+  op.dispatch(input, weights, scales, indices, 
+              block_num=80, rdma_block_num=16, warp_per_block=16)
+  
+  
+  # launch_test = jax.ffi.ffi_call("mori_ep", (), has_side_effect=True)
+  # launch_test(ep_config=np.asarray(cfg.to_packed_array(), dtype=np.int32),
+  #             reset_op=True)
   jax.block_until_ready(jnp.array(0))
   print(f"[rank {rank}] launch_test submitted", flush=True)
 

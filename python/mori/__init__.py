@@ -23,6 +23,7 @@ import os
 
 from . import cpp
 from . import ops
+from . import jax
 from . import shmem
 from . import io
 from . import ir
