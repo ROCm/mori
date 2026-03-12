@@ -170,11 +170,6 @@ Error MoriDispatchImpl(
     scalesPtr = static_cast< uint8_t *>(scales.untyped_data());
   }
 
-  // void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights,
-  //   void* scales, void* indices, int64_t num_tokens,
-  //   hipDataType dtype, int block_num, int rdma_block_num,
-  //   int warp_per_block, hipStream_t stream, int hidden_dim) {
-
   mori::moe::LaunchDispatch(*h, input.untyped_data(), weightsPtr, 
       scalesPtr, topk_ids.typed_data(), input.dimensions()[0], 
       FFIType2HipType(input.element_type()), block_num, rdma_block_num,

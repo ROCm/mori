@@ -314,7 +314,8 @@ void RegisterMoriOps(py::module_& m) {
       .def_readwrite("rdma_block_num", &mori::moe::EpDispatchCombineConfig::rdmaBlockNum)
       .def_readwrite("num_qp_per_pe", &mori::moe::EpDispatchCombineConfig::numQpPerPe)
       .def_readwrite("quant_type", &mori::moe::EpDispatchCombineConfig::quantType)
-      .def("to_packed_array", &mori::moe::EpDispatchCombineConfig::ToPackedI32Array);
+      .def("to_packed_array", &mori::moe::EpDispatchCombineConfig::ToPackedI32Array)
+      .def("max_num_tokens_to_recv", &mori::moe::EpDispatchCombineConfig::MaxNumTokensToRecv);
 
   DeclareEpDispatchCombineHandle(m);
 

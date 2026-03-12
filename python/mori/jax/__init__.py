@@ -23,6 +23,7 @@
 try:
   import jax  # noqa: F401
   from mori.cpp import mori_ep_handler, mori_ep_type_id
+  from .ops import *
   
   jax.ffi.register_ffi_target("mori_ep", mori_ep_handler(), platform="ROCM")
   jax.ffi.register_ffi_type_id("mori_ep", mori_ep_type_id(), platform="ROCM")
