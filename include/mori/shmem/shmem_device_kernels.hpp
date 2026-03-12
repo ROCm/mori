@@ -174,6 +174,47 @@ inline __device__ T ShmemAtomicTypeFetchWarpKernel(const application::SymmMemObj
                                                    int qpId = 0);
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                         Pure Address-Based GetNbi (New API)                                     */
+/* ---------------------------------------------------------------------------------------------- */
+
+template <application::TransportType TsptType>
+inline __device__ void ShmemGetMemNbiThreadKernel(void* dest, const void* source, size_t bytes,
+                                                  int pe, int qpId = 0);
+
+template <application::TransportType TsptType>
+inline __device__ void ShmemGetMemNbiWarpKernel(void* dest, const void* source, size_t bytes,
+                                                int pe, int qpId = 0);
+
+template <application::TransportType TsptType>
+inline __device__ void ShmemGetMemNbiBlockKernel(void* dest, const void* source, size_t bytes,
+                                                 int pe, int qpId = 0);
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                         SymmMemObjPtr-Based GetNbi                                              */
+/* ---------------------------------------------------------------------------------------------- */
+
+template <application::TransportType TsptType>
+inline __device__ void ShmemGetMemNbiThreadKernel(const application::SymmMemObjPtr dest,
+                                                  size_t destOffset,
+                                                  const application::SymmMemObjPtr source,
+                                                  size_t sourceOffset, size_t bytes, int pe,
+                                                  int qpId = 0);
+
+template <application::TransportType TsptType>
+inline __device__ void ShmemGetMemNbiWarpKernel(const application::SymmMemObjPtr dest,
+                                                size_t destOffset,
+                                                const application::SymmMemObjPtr source,
+                                                size_t sourceOffset, size_t bytes, int pe,
+                                                int qpId = 0);
+
+template <application::TransportType TsptType>
+inline __device__ void ShmemGetMemNbiBlockKernel(const application::SymmMemObjPtr dest,
+                                                 size_t destOffset,
+                                                 const application::SymmMemObjPtr source,
+                                                 size_t sourceOffset, size_t bytes, int pe,
+                                                 int qpId = 0);
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                         Synchronization                                        */
 /* ---------------------------------------------------------------------------------------------- */
 template <application::TransportType>
