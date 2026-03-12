@@ -22,35 +22,8 @@
 #include <cassert>
 #include <iostream>
 #include <thread>
-#include <vector>
 
 #include "umbp/block_index/block_index.h"
-
-void test_hash_kv_block() {
-  std::cout << "test_hash_kv_block... ";
-
-  // Basic hash generation
-  std::vector<int> tokens = {1, 2, 3, 4};
-  auto hash1 = BlockIndexClient::HashKVBlock(tokens);
-  assert(!hash1.empty());
-  assert(hash1.size() == 64);  // SHA-256 hex = 64 chars
-
-  // Same input → same hash
-  auto hash2 = BlockIndexClient::HashKVBlock(tokens);
-  assert(hash1 == hash2);
-
-  // Different tokens → different hash
-  std::vector<int> tokens2 = {5, 6, 7, 8};
-  auto hash3 = BlockIndexClient::HashKVBlock(tokens2);
-  assert(hash1 != hash3);
-
-  // With prior hash
-  auto hash4 = BlockIndexClient::HashKVBlock(tokens2, hash1);
-  assert(hash4 != hash3);  // Prior hash changes result
-  assert(hash4.size() == 64);
-
-  std::cout << "PASSED" << std::endl;
-}
 
 void test_insert_lookup() {
   std::cout << "test_insert_lookup... ";
@@ -160,7 +133,6 @@ void test_concurrent_access() {
 
 int main() {
   std::cout << "=== BlockIndex Tests ===" << std::endl;
-  test_hash_kv_block();
   test_insert_lookup();
   test_remove();
   test_update_tier();

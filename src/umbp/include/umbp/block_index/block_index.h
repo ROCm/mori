@@ -27,16 +27,11 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
-#include <vector>
 
 #include "umbp/common/storage_tier.h"
 
 class BlockIndexClient {
  public:
-  // Key generation — compatible with SGLang SHA-256 hex string
-  static std::string HashKVBlock(const std::vector<int>& token_ids,
-                                 const std::string& prior_hash = "");
-
   // Index operations
   bool MayExist(const std::string& key) const;
   std::optional<LocalLocation> Lookup(const std::string& key) const;

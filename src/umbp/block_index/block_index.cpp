@@ -21,56 +21,6 @@
 // SOFTWARE.
 #include "umbp/block_index/block_index.h"
 
-#include <openssl/evp.h>
-
-#include <cstdio>
-#include <iomanip>
-#include <mutex>
-#include <sstream>
-
-std::string BlockIndexClient::HashKVBlock(const std::vector<int>& token_ids,
-                                          const std::string& prior_hash) {
-  EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-  EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr);
-
-  // If prior_hash is provided, feed its raw bytes (hex-decoded)
-  if (!prior_hash.empty()) {
-    // Decode hex string to bytes (same as Python: bytes.fromhex(prior_hash))
-    std::vector<unsigned char> prior_bytes;
-    prior_bytes.reserve(prior_hash.size() / 2);
-    for (size_t i = 0; i + 1 < prior_hash.size(); i += 2) {
-      unsigned int byte_val;
-      std::sscanf(prior_hash.c_str() + i, "%2x", &byte_val);
-      prior_bytes.push_back(static_cast<unsigned char>(byte_val));
-    }
-    EVP_DigestUpdate(ctx, prior_bytes.data(), prior_bytes.size());
-  }
-
-  // Feed token IDs as 4-byte little-endian (same as Python: t.to_bytes(4, 'little'))
-  for (int token : token_ids) {
-    uint32_t val = static_cast<uint32_t>(token);
-    unsigned char buf[4];
-    buf[0] = val & 0xFF;
-    buf[1] = (val >> 8) & 0xFF;
-    buf[2] = (val >> 16) & 0xFF;
-    buf[3] = (val >> 24) & 0xFF;
-    EVP_DigestUpdate(ctx, buf, 4);
-  }
-
-  unsigned char hash[EVP_MAX_MD_SIZE];
-  unsigned int hash_len = 0;
-  EVP_DigestFinal_ex(ctx, hash, &hash_len);
-  EVP_MD_CTX_free(ctx);
-
-  // Convert to hex string
-  std::ostringstream oss;
-  oss << std::hex << std::setfill('0');
-  for (unsigned int i = 0; i < hash_len; ++i) {
-    oss << std::setw(2) << static_cast<int>(hash[i]);
-  }
-  return oss.str();
-}
-
 bool BlockIndexClient::MayExist(const std::string& key) const {
   std::shared_lock lock(mu_);
   return index_.count(key) > 0;
