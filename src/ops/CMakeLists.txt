@@ -46,15 +46,6 @@ if(BUILD_OPS_DEVICE)
     list(APPEND _extra_defs "-DENABLE_STANDARD_MOE_ADAPT")
   endif()
 
-  # MPI include dirs for hipcc genco (headers include mpi.h)
-  find_package(MPI QUIET)
-  set(_mpi_includes "")
-  if(MPI_CXX_INCLUDE_DIRS)
-    foreach(_d ${MPI_CXX_INCLUDE_DIRS})
-      list(APPEND _mpi_includes "-I${_d}")
-    endforeach()
-  endif()
-
   # Kernel sources
   set(_kernel_sources
     ep_intranode.hip

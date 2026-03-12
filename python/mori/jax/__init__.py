@@ -19,17 +19,12 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-import os
 
-from . import cpp
-from . import ops
-from . import jax
-from . import shmem
-from . import io
-from . import ir
-from . import kernel_profiler
-
-if os.environ.get("MORI_PRECOMPILE", "").lower() in ("1", "true", "on"):
-    from .jit import precompile
-
-    precompile()
+try:
+  import jax  # noqa: F401
+  from mori.cpp import mori_ep_handler, mori_ep_type_id
+  
+  jax.ffi.register_ffi_target("mori_ep", mori_ep_handler(), platform="ROCM")
+  jax.ffi.register_ffi_type_id("mori_ep", mori_ep_type_id(), platform="ROCM")
+except ImportError:
+  pass

@@ -1,4 +1,3 @@
-find_package(MPI REQUIRED)
 find_package(hsa-runtime64 REQUIRED)
 find_package(hsakmt REQUIRED)
 #find_library(IONIC_LIBRARY 
@@ -6,7 +5,6 @@ find_package(hsakmt REQUIRED)
 #  HINTS /lib/x86_64-linux-gnu
 #  REQUIRED
 #)
-option(BUILD_TORCH_BOOTSTRAP "Build Torch process group bootstrap (requires PyTorch)" ON)
 
 if(BUILD_TORCH_BOOTSTRAP)
   execute_process(
@@ -28,8 +26,6 @@ if(BUILD_TORCH_BOOTSTRAP)
     message(STATUS "Found LibTorch CMake Path: ${CMAKE_PREFIX_PATH}")
   endif()
 endif()
-
-option(BUILD_MPI_BOOTSTRAP "Whether to build MPI bootstrap" ON)
 
 if(BUILD_MPI_BOOTSTRAP)
   list(APPEND MORI_APP_SOURCES bootstrap/mpi_bootstrap.cpp)
