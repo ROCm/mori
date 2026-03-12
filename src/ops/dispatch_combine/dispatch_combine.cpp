@@ -21,11 +21,12 @@
 // SOFTWARE.
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 
-#include <algorithm>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
+
+#include <algorithm>
 
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem.hpp"
@@ -56,6 +57,7 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
     MORI_OPS_INFO("numQpPerPe %d larger than shmem numQpPerPe %d, set to %d", config.numQpPerPe,
                   shmemNumQpPerPe, shmemNumQpPerPe);
   }
+  this->enableSDMA = (getenv("MORI_ENABLE_SDMA") != nullptr);
   InitializeShmemBuf();
   InitializeTokenNumSignalBuf();
   InitializeOrderMapBuf();
@@ -348,7 +350,8 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::AsyncLL) {
           assert(config.useExternalInpBuffer);
-          EpDispatchLowLatencyAsyncSend<<<grid, block, sharedMemSize, stream>>>(args);
+          EpDispatchLowLatencyAsyncCopy<<<this->multiProcessorCount, block, 0, stream>>>(args);
+          EpDispatchLowLatencyAsyncDataTransfer<<<config.worldSize, block, 0, stream>>>(args);
         } else {
           assert(false);
         }
@@ -377,8 +380,8 @@ void EpDispatchCombineHandle::LaunchDispatchRecv(KernelType kernelType, int bloc
         args.config.hiddenDim = actualHiddenDim;
         if (kernelType == KernelType::AsyncLL) {
           assert(config.useExternalInpBuffer);
-          assert((actualBlockNum % config.worldSize) == 0);
-          EpDispatchLowLatencyAsyncRecv<<<grid, block, sharedMemSize, stream>>>(args);
+          EpDispatchLowLatencyAsyncRecvDataTransfer<<<config.worldSize, block, 0, stream>>>(args);
+          EpDispatchLowLatencyAsyncRecvCopy<<<this->multiProcessorCount, block, 0, stream>>>(args);
         } else {
           assert(false);
         }
@@ -467,18 +470,22 @@ void EpDispatchCombineHandle::LaunchCombine(KernelType kernelType, int blockNum,
             const bool useFp8DirectCast = (config.quantType == QuantType::Fp8DirectCast);
             if (useFp8DirectCast) {
 #if defined(MORI_FP8_TYPE_OCP_ENABLED) || defined(MORI_FP8_TYPE_FNUZ_ENABLED)
-              EpCombineLowLatencyAsyncSend<hip_bfloat16, /*UseFp8DirectCast=*/true>
-                  <<<grid, block, sharedMemSize, stream>>>(args);
+              EpCombineLowLatencyAsyncCopy<hip_bfloat16, /*UseFp8DirectCast=*/true>
+                  <<<this->multiProcessorCount, block, 0, stream>>>(args);
+              EpCombineLowLatencyAsyncDataTransfer<hip_bfloat16, /*UseFp8DirectCast=*/true>
+                  <<<config.worldSize, block, 0, stream>>>(args);
 #else
               assert(false && "Fp8DirectCast requires FP8 type support in this build");
 #endif
             } else {
-              EpCombineLowLatencyAsyncSend<<<grid, block, sharedMemSize, stream>>>(args);
+              EpCombineLowLatencyAsyncCopy<<<this->multiProcessorCount, block, 0, stream>>>(args);
+              EpCombineLowLatencyAsyncDataTransfer<<<config.worldSize, block, 0, stream>>>(args);
             }
           } else {
             assert(config.quantType != QuantType::Fp8DirectCast &&
                    "Fp8DirectCast combine only supports bf16 input for AsyncLL");
-            EpCombineLowLatencyAsyncSend<<<grid, block, sharedMemSize, stream>>>(args);
+            EpCombineLowLatencyAsyncCopy<<<this->multiProcessorCount, block, 0, stream>>>(args);
+            EpCombineLowLatencyAsyncDataTransfer<<<config.worldSize, block, 0, stream>>>(args);
           }
         } else {
           assert(false);
@@ -506,23 +513,29 @@ void EpDispatchCombineHandle::LaunchCombineRecv(KernelType kernelType, int block
             actualWarpNumPerBlock * config.numExpertPerToken * (sizeof(DataT**) + sizeof(float**));
         if (kernelType == KernelType::AsyncLL) {
           assert(config.useExternalInpBuffer);
-          assert((actualBlockNum % config.worldSize) == 0);
           if constexpr (std::is_same_v<DataT, hip_bfloat16>) {
             const bool useFp8DirectCast = (config.quantType == QuantType::Fp8DirectCast);
             if (useFp8DirectCast) {
 #if defined(MORI_FP8_TYPE_OCP_ENABLED) || defined(MORI_FP8_TYPE_FNUZ_ENABLED)
-              EpCombineLowLatencyAsyncRecv<hip_bfloat16, /*UseFp8DirectCast=*/true>
-                  <<<grid, block, sharedMemSize, stream>>>(args);
+              EpCombineLowLatencyAsyncRecvDataTransfer<hip_bfloat16, /*UseFp8DirectCast=*/true>
+                  <<<config.worldSize, block, 0, stream>>>(args);
+              EpCombineLowLatencyAsyncRecvCopy<hip_bfloat16, /*UseFp8DirectCast=*/true>
+                  <<<this->multiProcessorCount, block, sharedMemSize, stream>>>(args);
 #else
               assert(false && "Fp8DirectCast requires FP8 type support in this build");
 #endif
             } else {
-              EpCombineLowLatencyAsyncRecv<<<grid, block, sharedMemSize, stream>>>(args);
+              EpCombineLowLatencyAsyncRecvDataTransfer<<<config.worldSize, block, 0, stream>>>(
+                  args);
+              EpCombineLowLatencyAsyncRecvCopy<<<this->multiProcessorCount, block, sharedMemSize,
+                                                 stream>>>(args);
             }
           } else {
             assert(config.quantType != QuantType::Fp8DirectCast &&
                    "Fp8DirectCast combine only supports bf16 input for AsyncLL");
-            EpCombineLowLatencyAsyncRecv<<<grid, block, sharedMemSize, stream>>>(args);
+            EpCombineLowLatencyAsyncRecvDataTransfer<<<config.worldSize, block, 0, stream>>>(args);
+            EpCombineLowLatencyAsyncRecvCopy<<<this->multiProcessorCount, block, sharedMemSize,
+                                               stream>>>(args);
           }
         } else {
           assert(false);
