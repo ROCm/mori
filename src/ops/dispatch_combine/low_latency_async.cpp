@@ -114,11 +114,15 @@ __global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
           (config.MaxNumTokensToSendPerRank() * destPe + tokenChunkNum * qpId) * xferBytes;
 
       if ((destPe != myPe) && (laneId == 0)) {
-        shmem::ShmemPutMemNbiThread(args.shmemDispatchInpTokMemObj, remoteOffset,
-                                    args.shmemStagingTokMemObj, localOffset,
-                                    thisChunkTokenNum * xferBytes, destPe, qpId);
-        shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
-            destPe, args.shmemDispatchInpTokMemObj);
+        uintptr_t dstBase = args.shmemDispatchInpTokMemObj->peerPtrs[destPe];
+        uint8_t* srcBase = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
+        size_t xferSize = thisChunkTokenNum * xferBytes;
+
+        if (xferSize > 0) {
+          shmem::ShmemPutMemNbiThread(args.shmemDispatchInpTokMemObj, remoteOffset,
+                                      args.shmemStagingTokMemObj, localOffset,
+                                      xferSize, destPe, qpId);
+        }
       }
       // TODO(ditian12): index value is wrong if signal completion here, investigate the reason
       // shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
@@ -127,13 +131,6 @@ __global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
     }
   }
   if (globalThdId == 0) args.totalRecvTokenNum[0] = 0;
-  uint64_t st = wall_clock64();
-  while (1) {
-    uint64_t now = wall_clock64();
-    if ((now - st) >= 100000000) break;
-    asm volatile("buffer_wbl2" ::: "memory");
-    __threadfence_system();
-  }
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -172,13 +169,6 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   }
   // Polling recv token number signal
 
-  uint64_t st = wall_clock64();
-  while (1) {
-    uint64_t now = wall_clock64();
-    if ((now - st) >= 100000000) break;
-    asm volatile("buffer_wbl2" ::: "memory");
-    __threadfence_system();
-  }
   uint64_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint64_t*>();
   uint64_t recvTokenNum = 0;
   if (laneId < config.numQpPerPe) {
@@ -198,7 +188,7 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
        tokenId += blocksPerPe * warpNum) {
     index_t destTokId = 0;
     if (laneId == 0) destTokId = atomicAdd(args.totalRecvTokenNum, 1);
-    if ((laneId == 0) && (destTokId == 0)) printf("myPe %d tok 0 %d\n", myPe, destPe);
+    // if ((laneId == 0) && (destTokId == 0)) printf("myPe %d tok 0 %d\n", myPe, destPe);
     destTokId = __shfl(destTokId, 0);
     core::WarpCopy<uint8_t, 4>(
         args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>() + destTokId * hiddenBytes,
@@ -306,14 +296,6 @@ __global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
           destPe, args.shmemCombineInpTokMemObj);
     }
   }
-
-  uint64_t st = wall_clock64();
-  while (1) {
-    uint64_t now = wall_clock64();
-    if ((now - st) >= 200000000) break;
-    asm volatile("buffer_wbl2" ::: "memory");
-    __threadfence_system();
-  }
 }
 
 template <typename T, bool UseFp8DirectCast>
@@ -342,13 +324,6 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
         //                                   flag, destPe, qpId);
       }
     }
-  }
-  uint64_t st = wall_clock64();
-  while (1) {
-    uint64_t now = wall_clock64();
-    if ((now - st) >= 100000000) break;
-    asm volatile("buffer_wbl2" ::: "memory");
-    __threadfence_system();
   }
   for (int destPe = laneId; destPe < npes; destPe += warpSize) {
     uint64_t barrierFlag = args.crossDeviceBarrierFlag[0];
