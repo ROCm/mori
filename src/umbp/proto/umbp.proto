@@ -33,6 +33,9 @@ message RegisterClientRequest {
   string node_id                    = 1;
   string node_address                 = 2;   // Network address (e.g. "10.0.1.5:8080")
   repeated TierCapacity tier_capacities = 3; // Capacity per tier (HBM, DRAM, SSD)
+  string peer_address                 = 4;   // PeerService gRPC address
+  bytes  engine_desc                  = 5;   // packed EngineDesc
+  bytes  dram_memory_desc             = 6;   // packed MemoryDesc (RDMA-registered DRAM)
 }
 message RegisterClientResponse {
   uint64 heartbeat_interval_ms = 1;  // Recommended heartbeat interval
@@ -89,8 +92,11 @@ message RouteGetRequest {
   string node_id = 2;   // Requesting node (for future locality hints)
 }
 message RouteGetResponse {
-  bool     found  = 1;
-  Location source = 2;  // Selected replica to read from (if found)
+  bool     found            = 1;
+  Location source           = 2;   // Selected replica to read from (if found)
+  string   peer_address     = 3;   // source node's PeerService address
+  bytes    engine_desc      = 4;   // source node's packed EngineDesc
+  bytes    dram_memory_desc = 5;   // source node's packed MemoryDesc (DRAM)
 }
 
 message RoutePutRequest {
@@ -99,10 +105,14 @@ message RoutePutRequest {
   uint64 block_size = 3;   // Size of the block to write (bytes)
 }
 message RoutePutResponse {
-  bool     found        = 1;
-  string   node_id      = 2;   // Target node ID
-  string   node_address = 3;   // Target node network address (for MORI-IO connection)
-  TierType tier         = 4;   // Tier selected by the strategy
+  bool     found            = 1;
+  string   node_id          = 2;   // Target node ID
+  string   node_address     = 3;   // Target node network address (for MORI-IO connection)
+  TierType tier             = 4;   // Tier selected by the strategy
+  string   peer_address     = 5;   // target node's PeerService address
+  bytes    engine_desc      = 6;   // target node's packed EngineDesc
+  bytes    dram_memory_desc = 7;   // target node's packed MemoryDesc (DRAM)
+  uint64   allocated_offset = 8;   // Master-allocated offset (DRAM tier only)
 }
 
 // ============================================================

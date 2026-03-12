@@ -42,7 +42,7 @@ static void FillProtoLocation(const Location& location, ::umbp::Location* proto_
   proto_location->set_tier(static_cast<::umbp::TierType>(location.tier));
 }
 
-UMBPClient::UMBPClient(const UMBPClientConfig& config)
+MasterClient::MasterClient(const MasterClientConfig& config)
     : config_(config),
       stub_(nullptr, [](void* p) { delete static_cast<::umbp::UMBPMaster::Stub*>(p); }) {
   channel_ = grpc::CreateChannel(config.master_address, grpc::InsecureChannelCredentials());
@@ -50,14 +50,18 @@ UMBPClient::UMBPClient(const UMBPClientConfig& config)
   spdlog::info("[Client] Created, master={}", config.master_address);
 }
 
-UMBPClient::~UMBPClient() {
+MasterClient::~MasterClient() {
   StopHeartbeat();
   if (registered_) {
     UnregisterSelf();
   }
 }
 
-grpc::Status UMBPClient::RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities) {
+grpc::Status MasterClient::RegisterSelf(
+    const std::map<TierType, TierCapacity>& tier_capacities,
+    const std::string& peer_address,
+    const std::vector<uint8_t>& engine_desc_bytes,
+    const std::vector<uint8_t>& dram_memory_desc_bytes) {
   if (registered_) {
     return grpc::Status(grpc::StatusCode::ALREADY_EXISTS, "node is already registered");
   }
@@ -71,6 +75,10 @@ grpc::Status UMBPClient::RegisterSelf(const std::map<TierType, TierCapacity>& ti
     tc->set_total_capacity_bytes(cap.total_bytes);
     tc->set_available_capacity_bytes(cap.available_bytes);
   }
+
+  req.set_peer_address(peer_address);
+  req.set_engine_desc(engine_desc_bytes.data(), engine_desc_bytes.size());
+  req.set_dram_memory_desc(dram_memory_desc_bytes.data(), dram_memory_desc_bytes.size());
 
   ::umbp::RegisterClientResponse resp;
   grpc::ClientContext ctx;
@@ -98,7 +106,7 @@ grpc::Status UMBPClient::RegisterSelf(const std::map<TierType, TierCapacity>& ti
   return grpc::Status::OK;
 }
 
-grpc::Status UMBPClient::UnregisterSelf() {
+grpc::Status MasterClient::UnregisterSelf() {
   if (!registered_) {
     return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "node is not registered");
   }
@@ -121,7 +129,7 @@ grpc::Status UMBPClient::UnregisterSelf() {
   return status;
 }
 
-grpc::Status UMBPClient::Register(const std::string& key, const Location& location) {
+grpc::Status MasterClient::Register(const std::string& key, const Location& location) {
   if (!registered_) {
     return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
                         "node must be registered before block registration");
@@ -153,7 +161,7 @@ grpc::Status UMBPClient::Register(const std::string& key, const Location& locati
   return grpc::Status::OK;
 }
 
-grpc::Status UMBPClient::Unregister(const std::string& key, const Location& location,
+grpc::Status MasterClient::Unregister(const std::string& key, const Location& location,
                                     uint32_t* removed) {
   if (removed != nullptr) {
     *removed = 0;
@@ -195,10 +203,10 @@ grpc::Status UMBPClient::Unregister(const std::string& key, const Location& loca
   return grpc::Status::OK;
 }
 
-grpc::Status UMBPClient::RouteGet(const std::string& key,
-                                  std::optional<Location>* out_location) {
-  if (out_location != nullptr) {
-    *out_location = std::nullopt;
+grpc::Status MasterClient::RouteGet(const std::string& key,
+                                  std::optional<RouteGetResult>* out_result) {
+  if (out_result != nullptr) {
+    *out_result = std::nullopt;
   }
 
   if (!registered_) {
@@ -219,20 +227,25 @@ grpc::Status UMBPClient::RouteGet(const std::string& key,
     return status;
   }
 
-  if (resp.found() && out_location != nullptr) {
-    Location loc;
-    loc.node_id = resp.source().node_id();
-    loc.location_id = resp.source().location_id();
-    loc.size = resp.source().size();
-    loc.tier = static_cast<TierType>(resp.source().tier());
-    *out_location = loc;
+  if (resp.found() && out_result != nullptr) {
+    RouteGetResult result;
+    result.location.node_id = resp.source().node_id();
+    result.location.location_id = resp.source().location_id();
+    result.location.size = resp.source().size();
+    result.location.tier = static_cast<TierType>(resp.source().tier());
+    result.peer_address = resp.peer_address();
+    const auto& ed = resp.engine_desc();
+    result.engine_desc_bytes.assign(ed.begin(), ed.end());
+    const auto& md = resp.dram_memory_desc();
+    result.dram_memory_desc_bytes.assign(md.begin(), md.end());
+    *out_result = result;
   }
 
   spdlog::info("[Client] RouteGet key='{}': found={}", key, resp.found());
   return grpc::Status::OK;
 }
 
-grpc::Status UMBPClient::RoutePut(const std::string& key, uint64_t block_size,
+grpc::Status MasterClient::RoutePut(const std::string& key, uint64_t block_size,
                                   std::optional<RoutePutResult>* out_result) {
   if (out_result != nullptr) {
     *out_result = std::nullopt;
@@ -262,6 +275,12 @@ grpc::Status UMBPClient::RoutePut(const std::string& key, uint64_t block_size,
     result.node_id = resp.node_id();
     result.node_address = resp.node_address();
     result.tier = static_cast<TierType>(resp.tier());
+    result.peer_address = resp.peer_address();
+    const auto& ed = resp.engine_desc();
+    result.engine_desc_bytes.assign(ed.begin(), ed.end());
+    const auto& md = resp.dram_memory_desc();
+    result.dram_memory_desc_bytes.assign(md.begin(), md.end());
+    result.allocated_offset = resp.allocated_offset();
     *out_result = result;
   }
 
@@ -269,7 +288,7 @@ grpc::Status UMBPClient::RoutePut(const std::string& key, uint64_t block_size,
   return grpc::Status::OK;
 }
 
-void UMBPClient::StartHeartbeat() {
+void MasterClient::StartHeartbeat() {
   if (!registered_) {
     spdlog::warn("[Client] StartHeartbeat ignored: not registered");
     return;
@@ -281,7 +300,7 @@ void UMBPClient::StartHeartbeat() {
 
   heartbeat_running_ = true;
   try {
-    heartbeat_thread_ = std::thread(&UMBPClient::HeartbeatLoop, this);
+    heartbeat_thread_ = std::thread(&MasterClient::HeartbeatLoop, this);
   } catch (const std::system_error& e) {
     heartbeat_running_ = false;
     spdlog::error("[Client] Failed to start heartbeat thread: {}", e.what());
@@ -291,7 +310,7 @@ void UMBPClient::StartHeartbeat() {
   spdlog::info("[Client] Heartbeat thread started (interval={}ms)", heartbeat_interval_ms_);
 }
 
-void UMBPClient::StopHeartbeat() {
+void MasterClient::StopHeartbeat() {
   if (!heartbeat_running_) {
     return;
   }
@@ -304,7 +323,7 @@ void UMBPClient::StopHeartbeat() {
   spdlog::info("[Client] Heartbeat thread stopped");
 }
 
-void UMBPClient::HeartbeatLoop() {
+void MasterClient::HeartbeatLoop() {
   while (heartbeat_running_) {
     {
       std::unique_lock lock(hb_cv_mutex_);

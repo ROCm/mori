@@ -24,7 +24,9 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <shared_mutex>
 #include <string>
@@ -37,6 +39,19 @@
 namespace mori::umbp {
 
 class BlockIndex;
+
+struct AllocateResult {
+  std::string peer_address;
+  std::vector<uint8_t> engine_desc_bytes;
+  std::vector<uint8_t> dram_memory_desc_bytes;
+  uint64_t allocated_offset = 0;
+};
+
+struct ClientIOInfo {
+  std::string peer_address;
+  std::vector<uint8_t> engine_desc_bytes;
+  std::vector<uint8_t> dram_memory_desc_bytes;
+};
 
 struct ClientRegistryConfig {
   std::chrono::seconds heartbeat_ttl{10};
@@ -59,7 +74,10 @@ class ClientRegistry {
   // Returns false when a live node with the same id already exists.
   // Returns true for new registrations or re-registration of expired nodes.
   bool RegisterClient(const std::string& node_id, const std::string& node_address,
-                      const std::map<TierType, TierCapacity>& tier_capacities);
+                      const std::map<TierType, TierCapacity>& tier_capacities,
+                      const std::string& peer_address = "",
+                      const std::vector<uint8_t>& engine_desc_bytes = {},
+                      const std::vector<uint8_t>& dram_memory_desc_bytes = {});
 
   // Gracefully unregister. Returns number of block keys cleaned up.
   size_t UnregisterClient(const std::string& node_id);
@@ -73,6 +91,13 @@ class ClientRegistry {
   // --- Ownership tracking (called by BlockIndex) ---
   void TrackKey(const std::string& node_id, const std::string& key);
   void UntrackKey(const std::string& node_id, const std::string& key);
+
+  // --- PoolClient allocation ---
+  std::optional<AllocateResult> AllocateForPut(const std::string& node_id, TierType tier,
+                                               uint64_t size);
+  void DeallocateForUnregister(const std::string& node_id, TierType tier, uint64_t offset,
+                               uint64_t size);
+  std::optional<ClientIOInfo> GetClientIOInfo(const std::string& node_id) const;
 
   // --- Queries ---
   bool IsClientAlive(const std::string& node_id) const;

@@ -29,3 +29,32 @@ add_test(NAME umbp_route_put_strategy COMMAND test_umbp_route_put_strategy)
 add_executable(test_umbp_router test_router.cpp)
 target_link_libraries(test_umbp_router PRIVATE umbp_common gtest_main)
 add_test(NAME umbp_router COMMAND test_umbp_router)
+
+add_executable(test_umbp_pool_allocator test_pool_allocator.cpp)
+target_link_libraries(test_umbp_pool_allocator PRIVATE umbp_common gtest_main)
+add_test(NAME umbp_pool_allocator COMMAND test_umbp_pool_allocator)
+
+find_library(_TEST_PROTOBUF_LIB NAMES protobuf libprotobuf REQUIRED)
+if(TARGET gRPC::grpc++)
+  set(_TEST_GRPCPP_LIB gRPC::grpc++)
+elseif(TARGET grpc++)
+  set(_TEST_GRPCPP_LIB grpc++)
+else()
+  find_library(_TEST_GRPCPP_LIB NAMES grpc++ REQUIRED)
+endif()
+
+add_executable(test_umbp_peer_service test_peer_service.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_peer_service PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(test_umbp_peer_service PRIVATE umbp_common ${_TEST_PROTOBUF_LIB}
+                                                     ${_TEST_GRPCPP_LIB} gtest_main)
+add_test(NAME umbp_peer_service COMMAND test_umbp_peer_service)
+
+add_executable(test_umbp_pool_client test_pool_client.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_pool_client PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(test_umbp_pool_client PRIVATE umbp_common ${_TEST_PROTOBUF_LIB}
+                                                    ${_TEST_GRPCPP_LIB} gtest_main)
+add_test(NAME umbp_pool_client COMMAND test_umbp_pool_client)
