@@ -19,6 +19,15 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+
+/**
+ * @acknowledgements:
+ * - Original implementation by: Sidler, David
+ * - Source: https://github.com/AARInternal/shader_sdma
+ * 
+ * @note: This code is adapted/modified from the implementation by Sidler, David
+ */
+
 #pragma once
 
 #include <hip/hip_ext.h>

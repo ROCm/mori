@@ -42,6 +42,7 @@ template <>
 inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  if (bytes == 0) return;
   int inNodePe = pe % 8;
   uint8_t* srcPtr =
       reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);

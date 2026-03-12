@@ -105,8 +105,8 @@ struct VecTypeAdaptor<mori_fp4_e2m1, 4> {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           Load/Store                                           */
 /* ---------------------------------------------------------------------------------------------- */
-#define USE_BUILDIN_LD 0
-#define USE_BUILDIN_ST 0
+#define USE_BUILDIN_LD 1
+#define USE_BUILDIN_ST 1
 
 #if USE_BUILDIN_LD
 template <int VecBytes>
@@ -145,36 +145,30 @@ __device__ __forceinline__ typename VecTypeSelector<VecBytes>::dataType load(con
 
 template <>
 __device__ __forceinline__ typename VecTypeSelector<1>::dataType load<1>(const void* addr) {
-  // return *static_cast<const uint8_t*>(addr);
-  return core::AtomicLoadRelaxedSystem(static_cast<const uint8_t*>(addr));
+  return *static_cast<const uint8_t*>(addr);
 }
 
 template <>
 __device__ __forceinline__ typename VecTypeSelector<2>::dataType load<2>(const void* addr) {
-  // return *static_cast<const uint16_t*>(addr);
-  return core::AtomicLoadRelaxedSystem(static_cast<const uint16_t*>(addr));
+  return *static_cast<const uint16_t*>(addr);
 }
 
 template <>
 __device__ __forceinline__ typename VecTypeSelector<4>::dataType load<4>(const void* addr) {
-  // return *static_cast<const uint32_t*>(addr);
-  return core::AtomicLoadRelaxedSystem(static_cast<const uint32_t*>(addr));
+  return *static_cast<const uint32_t*>(addr);
 }
 
 template <>
 __device__ __forceinline__ typename VecTypeSelector<8>::dataType load<8>(const void* addr) {
-  // return *static_cast<const uint64_t*>(addr);
-  return core::AtomicLoadRelaxedSystem(static_cast<const uint64_t*>(addr));
+  return *static_cast<const uint64_t*>(addr);
 }
 
 template <>
 __device__ __forceinline__ typename VecTypeSelector<16>::dataType load<16>(const void* addr) {
   const uint64_t* ptr = static_cast<const uint64_t*>(addr);
   ulong2 result;
-  // result.x = ptr[0];
-  // result.y = ptr[1];
-  result.x = core::AtomicLoadRelaxedSystem(&ptr[0]);
-  result.y = core::AtomicLoadRelaxedSystem(&ptr[1]);
+  result.x = ptr[0];
+  result.y = ptr[1];
   return result;
 }
 #endif
@@ -217,35 +211,29 @@ __device__ __forceinline__ void store(void* addr,
 
 template <>
 __device__ __forceinline__ void store<1>(void* addr, typename VecTypeSelector<1>::dataType value) {
-  // *((uint8_t*)addr) = value;
-  core::AtomicStoreRelaxedSystem(static_cast<uint8_t*>(addr), value);
+  *((uint8_t*)addr) = value;
 }
 
 template <>
 __device__ __forceinline__ void store<2>(void* addr, typename VecTypeSelector<2>::dataType value) {
-  // *((uint16_t*)addr) = value;
-  core::AtomicStoreRelaxedSystem(static_cast<uint16_t*>(addr), value);
+  *((uint16_t*)addr) = value;
 }
 
 template <>
 __device__ __forceinline__ void store<4>(void* addr, typename VecTypeSelector<4>::dataType value) {
-  // *((uint32_t*)addr) = value;
-  core::AtomicStoreRelaxedSystem(static_cast<uint32_t*>(addr), value);
+  *((uint32_t*)addr) = value;
 }
 
 template <>
 __device__ __forceinline__ void store<8>(void* addr, typename VecTypeSelector<8>::dataType value) {
-  // *((uint64_t*)addr) = value;
-  core::AtomicStoreRelaxedSystem(static_cast<uint64_t*>(addr), value);
+  *((uint64_t*)addr) = value;
 }
 
 template <>
 __device__ __forceinline__ void store<16>(void* addr,
                                           typename VecTypeSelector<16>::dataType value) {
-  // *((uint64_t*)addr) = value.x;
-  // *(((uint64_t*)addr) + 1) = value.y;
-  core::AtomicStoreRelaxedSystem(&((uint64_t*)addr)[0], value.x);
-  core::AtomicStoreRelaxedSystem(&((uint64_t*)addr)[1], value.y);
+  *((uint64_t*)addr) = value.x;
+  *(((uint64_t*)addr) + 1) = value.y;
 }
 #endif
 

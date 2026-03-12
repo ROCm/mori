@@ -114,15 +114,9 @@ __global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
           (config.MaxNumTokensToSendPerRank() * destPe + tokenChunkNum * qpId) * xferBytes;
 
       if ((destPe != myPe) && (laneId == 0)) {
-        uintptr_t dstBase = args.shmemDispatchInpTokMemObj->peerPtrs[destPe];
-        uint8_t* srcBase = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
-        size_t xferSize = thisChunkTokenNum * xferBytes;
-
-        if (xferSize > 0) {
-          shmem::ShmemPutMemNbiThread(args.shmemDispatchInpTokMemObj, remoteOffset,
+        shmem::ShmemPutMemNbiThread(args.shmemDispatchInpTokMemObj, remoteOffset,
                                       args.shmemStagingTokMemObj, localOffset,
-                                      xferSize, destPe, qpId);
-        }
+                                      thisChunkTokenNum * xferBytes, destPe, qpId);
       }
       // TODO(ditian12): index value is wrong if signal completion here, investigate the reason
       // shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
@@ -188,7 +182,6 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
        tokenId += blocksPerPe * warpNum) {
     index_t destTokId = 0;
     if (laneId == 0) destTokId = atomicAdd(args.totalRecvTokenNum, 1);
-    // if ((laneId == 0) && (destTokId == 0)) printf("myPe %d tok 0 %d\n", myPe, destPe);
     destTokId = __shfl(destTokId, 0);
     core::WarpCopy<uint8_t, 4>(
         args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>() + destTokId * hiddenBytes,
@@ -197,9 +190,9 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
       index_t id =
           reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes)[laneId];
       index_t pe = id / config.numExpertPerRank;
-      // if (!((pe >= 0) && (pe < config.worldSize))) {
-      //   assert((pe >= 0) && (pe < config.worldSize));
-      // }
+      if (!((pe >= 0) && (pe < config.worldSize))) {
+        assert((pe >= 0) && (pe < config.worldSize));
+      }
     }
     core::WarpCopy<uint8_t, 4>(
         args.shmemOutIndicesMemObj->template GetAs<uint8_t*>() + destTokId * indexBytes,
@@ -277,7 +270,7 @@ __global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
       int tokenNum = 0;
       if (laneId == 0) {
         shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
-        tokenNum = recvTokenNums[destPe * config.numQpPerPe + qpId];
+        tokenNum = recvTokenNums[destPe * config.numQpPerPe + qpId]-1;
         core::AtomicStoreRelaxedSystem(&recvTokenNums[destPe * config.numQpPerPe + qpId],
                                        uint64_t{0});
       }
@@ -288,12 +281,10 @@ __global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
           (config.MaxNumTokensToSendPerRank() * myPe + tokenChunkNum * qpId) * tokHiddenBytes;
       size_t localOffset =
           (config.MaxNumTokensToSendPerRank() * destPe + tokenChunkNum * qpId) * tokHiddenBytes;
-      if ((destPe != myPe) && (laneId == 0))
+      if ((destPe != myPe) && (laneId == 0) && (thisChunkTokenNum > 0))
         shmem::ShmemPutMemNbiThread(args.shmemCombineInpTokMemObj, remoteOffset,
                                     args.shmemStagingTokMemObj, localOffset,
                                     thisChunkTokenNum * tokHiddenBytes, destPe, qpId);
-      shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
-          destPe, args.shmemCombineInpTokMemObj);
     }
   }
 }

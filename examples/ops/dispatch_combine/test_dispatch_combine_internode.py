@@ -63,8 +63,7 @@ class EpDispatchCombineTestCase:
             ),
             scale_dim=32,
             scale_type_size=4,
-            # max_num_inp_token_per_rank=(max_tokens + 63) // 64 * 64,
-            max_num_inp_token_per_rank=max_tokens,
+            max_num_inp_token_per_rank=(max_tokens + 63) // 64 * 64,
             num_experts_per_rank=16,
             num_experts_per_token=8,
             warp_num_per_block=8,
@@ -99,7 +98,7 @@ class EpDispatchCombineTestCase:
         print(f"I'm pe {mori.shmem.shmem_mype()} in {mori.shmem.shmem_npes()} pes")
 
         self.rng = torch.Generator(device=self.device)
-        self.rng.manual_seed(1)
+        self.rng.manual_seed(999)
 
     def cleanup(self):
         mori.shmem.shmem_finalize()
@@ -366,7 +365,7 @@ class EpDispatchCombineTestCase:
                     f"rank {self.rank} token {i} assert {is_pass} expected {all_rank_input[src_pe][src_tok_id].view(torch.uint8)} got {dispatch_output[i].view(torch.uint8)}"
                 )
                 assert False
-                error_round.add(round)
+                # error_round.add(round)
             if dispatch_weights is not None:
                 assert torch.equal(
                     dispatch_weights[i], all_rank_weights[src_pe][src_tok_id]

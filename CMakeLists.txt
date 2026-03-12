@@ -181,7 +181,8 @@ if(ENABLE_PROFILER)
 endif()
 
 if(BUILD_EXAMPLES)
-  # set(BUILD_APPLICATION ON) add_subdirectory(examples)
+  set(BUILD_APPLICATION ON)
+  add_subdirectory(examples)
 endif()
 
 if(BUILD_APPLICATION)
