@@ -364,6 +364,10 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
                                         barrierFlag);
   }
 
+  // Invalidate caches so CU reads fetch SDMA-written data from HBM
+  __builtin_amdgcn_s_waitcnt(0);
+  asm volatile("buffer_inv" ::: "memory");
+
   extern __shared__ char sharedMem[];
   TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
