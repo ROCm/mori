@@ -188,12 +188,11 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   }
   recvTokenNum = __shfl(recvTokenNum, 0);
 
-  // Invalidate GL1 (L1) and GL0 (L0) caches so CU reads fetch from L2/HBM.
-  // SDMA writes bypass L1/L0 and land in HBM. Without invalidation,
+  // Invalidate GPU caches so CU reads fetch fresh data from HBM.
+  // SDMA writes bypass caches and land in HBM directly. Without invalidation,
   // CU reads may hit stale (zero) cache entries from initialization.
   __builtin_amdgcn_s_waitcnt(0);
-  asm volatile("buffer_gl1_inv" ::: "memory");
-  asm volatile("buffer_gl0_inv" ::: "memory");
+  asm volatile("buffer_inv" ::: "memory");
 
   // Copy data
   uint8_t* stagingPtr = (destPe != myPe)
