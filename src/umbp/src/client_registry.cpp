@@ -42,7 +42,10 @@ void ClientRegistry::SetBlockIndex(BlockIndex* index) {
 }
 
 bool ClientRegistry::RegisterClient(const std::string& node_id, const std::string& node_address,
-                                    const std::map<TierType, TierCapacity>& tier_capacities) {
+                                    const std::map<TierType, TierCapacity>& tier_capacities,
+                                    const std::string& peer_address,
+                                    const std::vector<uint8_t>& engine_desc_bytes,
+                                    const std::vector<uint8_t>& dram_memory_desc_bytes) {
   std::unique_lock lock(mutex_);
   auto now = std::chrono::steady_clock::now();
 
@@ -69,6 +72,18 @@ bool ClientRegistry::RegisterClient(const std::string& node_id, const std::strin
   record.last_heartbeat = now;
   record.registered_at = now;
   record.tier_capacities = tier_capacities;
+  record.peer_address = peer_address;
+  record.engine_desc_bytes = engine_desc_bytes;
+  record.dram_memory_desc_bytes = dram_memory_desc_bytes;
+
+  for (const auto& [tier, cap] : tier_capacities) {
+    PoolAllocator alloc;
+    alloc.total_size = cap.total_bytes;
+    if (tier == TierType::DRAM || tier == TierType::HBM) {
+      alloc.offset_tracker = PoolAllocator::OffsetTracker{};
+    }
+    record.allocators[tier] = std::move(alloc);
+  }
 
   clients_[node_id] = std::move(record);
   client_keys_[node_id];  // ensure entry exists (empty set)
@@ -187,6 +202,62 @@ std::vector<ClientRecord> ClientRegistry::GetAliveClients() const {
     }
   }
   return result;
+}
+
+std::optional<AllocateResult> ClientRegistry::AllocateForPut(const std::string& node_id,
+                                                              TierType tier, uint64_t size) {
+  std::unique_lock lock(mutex_);
+  auto it = clients_.find(node_id);
+  if (it == clients_.end() || it->second.status != ClientStatus::ALIVE) {
+    return std::nullopt;
+  }
+
+  auto alloc_it = it->second.allocators.find(tier);
+  if (alloc_it == it->second.allocators.end()) {
+    return std::nullopt;
+  }
+
+  auto offset = alloc_it->second.Allocate(size);
+  if (!offset) {
+    return std::nullopt;
+  }
+
+  AllocateResult result;
+  result.peer_address = it->second.peer_address;
+  result.engine_desc_bytes = it->second.engine_desc_bytes;
+  result.dram_memory_desc_bytes = it->second.dram_memory_desc_bytes;
+  result.allocated_offset = *offset;
+  return result;
+}
+
+void ClientRegistry::DeallocateForUnregister(const std::string& node_id, TierType tier,
+                                             uint64_t offset, uint64_t size) {
+  std::unique_lock lock(mutex_);
+  auto it = clients_.find(node_id);
+  if (it == clients_.end()) {
+    return;
+  }
+
+  auto alloc_it = it->second.allocators.find(tier);
+  if (alloc_it == it->second.allocators.end()) {
+    return;
+  }
+
+  alloc_it->second.Deallocate(offset, size);
+}
+
+std::optional<ClientIOInfo> ClientRegistry::GetClientIOInfo(const std::string& node_id) const {
+  std::shared_lock lock(mutex_);
+  auto it = clients_.find(node_id);
+  if (it == clients_.end() || it->second.status != ClientStatus::ALIVE) {
+    return std::nullopt;
+  }
+
+  ClientIOInfo info;
+  info.peer_address = it->second.peer_address;
+  info.engine_desc_bytes = it->second.engine_desc_bytes;
+  info.dram_memory_desc_bytes = it->second.dram_memory_desc_bytes;
+  return info;
 }
 
 void ClientRegistry::StartReaper() {

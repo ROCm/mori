@@ -35,6 +35,11 @@ struct RoutePutResult {
   std::string node_id;
   std::string node_address;
   TierType tier;
+
+  std::string peer_address;
+  std::vector<uint8_t> engine_desc_bytes;
+  std::vector<uint8_t> dram_memory_desc_bytes;
+  uint64_t allocated_offset = 0;
 };
 
 /// Abstract interface for RoutePut node placement.

@@ -25,11 +25,13 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "umbp/route_put_strategy.h"
 #include "umbp/types.h"
@@ -40,24 +42,35 @@ class Channel;
 
 namespace mori::umbp {
 
-struct UMBPClientConfig {
+struct RouteGetResult {
+  Location location;
+  std::string peer_address;
+  std::vector<uint8_t> engine_desc_bytes;
+  std::vector<uint8_t> dram_memory_desc_bytes;
+};
+
+struct MasterClientConfig {
   std::string master_address;
   std::string node_id;
   std::string node_address;
   bool auto_heartbeat = true;
 };
 
-class UMBPClient {
+class MasterClient {
  public:
-  explicit UMBPClient(const UMBPClientConfig& config);
-  ~UMBPClient();
+  explicit MasterClient(const MasterClientConfig& config);
+  ~MasterClient();
 
-  UMBPClient(const UMBPClient&) = delete;
-  UMBPClient& operator=(const UMBPClient&) = delete;
+  MasterClient(const MasterClient&) = delete;
+  MasterClient& operator=(const MasterClient&) = delete;
 
   // --- Client lifecycle ---
   // Register with master. If auto_heartbeat, starts heartbeat thread.
-  grpc::Status RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities);
+  grpc::Status RegisterSelf(
+      const std::map<TierType, TierCapacity>& tier_capacities,
+      const std::string& peer_address = "",
+      const std::vector<uint8_t>& engine_desc_bytes = {},
+      const std::vector<uint8_t>& dram_memory_desc_bytes = {});
   grpc::Status UnregisterSelf();
 
   // --- Block index ---
@@ -71,7 +84,8 @@ class UMBPClient {
   // --- Router ---
   /// Pick an existing replica to read from.
   /// Returns the Location via @p out_location (if found).
-  grpc::Status RouteGet(const std::string& key, std::optional<Location>* out_location);
+  grpc::Status RouteGet(const std::string& key,
+                        std::optional<RouteGetResult>* out_result);
 
   /// Pick a target node to write to.
   /// After receiving the result, write via MORI-IO, then call Register().
@@ -85,7 +99,7 @@ class UMBPClient {
   bool IsRegistered() const { return registered_; }
 
  private:
-  UMBPClientConfig config_;
+  MasterClientConfig config_;
 
   std::shared_ptr<grpc_impl::Channel> channel_;
   // Use void* to avoid exposing generated stub type in header.

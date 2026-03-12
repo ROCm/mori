@@ -55,13 +55,13 @@ int main(int argc, char** argv) {
   if (argc > 2) node_id = argv[2];
   if (argc > 3) node_addr = argv[3];
 
-  mori::umbp::UMBPClientConfig config;
+  mori::umbp::MasterClientConfig config;
   config.master_address = master_addr;
   config.node_id = node_id;
   config.node_address = node_addr;
   config.auto_heartbeat = true;
 
-  mori::umbp::UMBPClient client(config);
+  mori::umbp::MasterClient client(config);
 
   // Report some example capacities
   std::map<mori::umbp::TierType, mori::umbp::TierCapacity> caps;
@@ -134,7 +134,7 @@ int main(int argc, char** argv) {
     if (!SleepInterruptible(std::chrono::seconds(1))) break;
 
     // ---- Step 4: RouteGet — ask master where to read the block back ----
-    std::optional<mori::umbp::Location> get_result;
+    std::optional<mori::umbp::RouteGetResult> get_result;
     auto route_get_status = client.RouteGet(key, &get_result);
     if (!route_get_status.ok()) {
       spdlog::warn("[Client] Iteration {} RouteGet(key={}) RPC failed: {}", iteration, key,
@@ -146,8 +146,8 @@ int main(int argc, char** argv) {
     if (get_result.has_value()) {
       spdlog::info(
           "[Client] Iteration {} RouteGet(key={}): read from node={}, location={}, tier={}",
-          iteration, key, get_result->node_id, get_result->location_id,
-          mori::umbp::TierTypeName(get_result->tier));
+          iteration, key, get_result->location.node_id, get_result->location.location_id,
+          mori::umbp::TierTypeName(get_result->location.tier));
     } else {
       spdlog::warn("[Client] Iteration {} RouteGet(key={}): not found (unexpected)", iteration,
                    key);

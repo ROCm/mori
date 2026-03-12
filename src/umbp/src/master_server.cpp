@@ -25,6 +25,9 @@
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <cstdint>
+#include <string>
+#include <vector>
 
 #include "umbp.grpc.pb.h"
 #include "umbp/router.h"
@@ -61,8 +64,16 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       caps[static_cast<TierType>(tc.tier())] = c;
     }
 
-    const bool registered =
-        registry_.RegisterClient(request->node_id(), request->node_address(), caps);
+    const auto& engine_desc_str = request->engine_desc();
+    std::vector<uint8_t> engine_desc_bytes(engine_desc_str.begin(), engine_desc_str.end());
+
+    const auto& dram_memory_desc_str = request->dram_memory_desc();
+    std::vector<uint8_t> dram_memory_desc_bytes(dram_memory_desc_str.begin(),
+                                                dram_memory_desc_str.end());
+
+    const bool registered = registry_.RegisterClient(
+        request->node_id(), request->node_address(), caps, request->peer_address(),
+        engine_desc_bytes, dram_memory_desc_bytes);
     if (!registered) {
       return grpc::Status(grpc::StatusCode::ALREADY_EXISTS,
                           "node is already alive and cannot be re-registered");
@@ -143,6 +154,19 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 
     const bool removed = index_.Unregister(request->node_id(), request->key(), location);
     response->set_removed(removed ? 1u : 0u);
+
+    if (removed && location.size > 0) {
+      uint64_t offset = 0;
+      if (!location.location_id.empty()) {
+        try {
+          offset = std::stoull(location.location_id);
+        } catch (...) {
+          // location_id is not a numeric offset (e.g. SSD file path); use 0
+        }
+      }
+      registry_.DeallocateForUnregister(location.node_id, location.tier, offset, location.size);
+    }
+
     spdlog::info("[Master] Unregister key: node_id={}, key={}, location_id={}, removed={}",
                  request->node_id(), request->key(), location.location_id, response->removed());
     return grpc::Status::OK;
@@ -167,6 +191,15 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     source->set_size(result->size);
     source->set_tier(static_cast<::umbp::TierType>(result->tier));
 
+    auto io_info = registry_.GetClientIOInfo(result->node_id);
+    if (io_info) {
+      response->set_peer_address(io_info->peer_address);
+      response->set_engine_desc(io_info->engine_desc_bytes.data(),
+                                io_info->engine_desc_bytes.size());
+      response->set_dram_memory_desc(io_info->dram_memory_desc_bytes.data(),
+                                     io_info->dram_memory_desc_bytes.size());
+    }
+
     spdlog::info("[Master] RouteGet key='{}': node={}, location={}", request->key(),
                  result->node_id, result->location_id);
     return grpc::Status::OK;
@@ -184,13 +217,27 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       return grpc::Status::OK;
     }
 
+    auto alloc_result =
+        registry_.AllocateForPut(result->node_id, result->tier, request->block_size());
+    if (!alloc_result) {
+      response->set_found(false);
+      return grpc::Status::OK;
+    }
+
     response->set_found(true);
     response->set_node_id(result->node_id);
     response->set_node_address(result->node_address);
     response->set_tier(static_cast<::umbp::TierType>(result->tier));
+    response->set_peer_address(alloc_result->peer_address);
+    response->set_engine_desc(alloc_result->engine_desc_bytes.data(),
+                              alloc_result->engine_desc_bytes.size());
+    response->set_dram_memory_desc(alloc_result->dram_memory_desc_bytes.data(),
+                                   alloc_result->dram_memory_desc_bytes.size());
+    response->set_allocated_offset(alloc_result->allocated_offset);
 
-    spdlog::info("[Master] RoutePut key='{}': target_node={}, tier={}", request->key(),
-                 result->node_id, TierTypeName(result->tier));
+    spdlog::info("[Master] RoutePut key='{}': target_node={}, tier={}, offset={}",
+                 request->key(), result->node_id, TierTypeName(result->tier),
+                 alloc_result->allocated_offset);
     return grpc::Status::OK;
   }
 

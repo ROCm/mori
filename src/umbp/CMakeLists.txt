@@ -112,6 +112,7 @@ endif()
 
 set(UMBP_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
 set(UMBP_PROTO_FILE "${UMBP_PROTO_DIR}/umbp.proto")
+set(UMBP_PEER_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_peer.proto")
 set(UMBP_PROTO_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/proto_gen")
 file(MAKE_DIRECTORY ${UMBP_PROTO_GEN_DIR})
 
@@ -119,6 +120,11 @@ set(UMBP_PROTO_SRCS "${UMBP_PROTO_GEN_DIR}/umbp.pb.cc")
 set(UMBP_PROTO_HDRS "${UMBP_PROTO_GEN_DIR}/umbp.pb.h")
 set(UMBP_GRPC_SRCS "${UMBP_PROTO_GEN_DIR}/umbp.grpc.pb.cc")
 set(UMBP_GRPC_HDRS "${UMBP_PROTO_GEN_DIR}/umbp.grpc.pb.h")
+
+set(UMBP_PEER_PROTO_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_peer.pb.cc")
+set(UMBP_PEER_PROTO_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_peer.pb.h")
+set(UMBP_PEER_GRPC_SRCS "${UMBP_PROTO_GEN_DIR}/umbp_peer.grpc.pb.cc")
+set(UMBP_PEER_GRPC_HDRS "${UMBP_PROTO_GEN_DIR}/umbp_peer.grpc.pb.h")
 
 add_custom_command(
   OUTPUT ${UMBP_PROTO_SRCS} ${UMBP_PROTO_HDRS} ${UMBP_GRPC_SRCS}
@@ -131,6 +137,17 @@ add_custom_command(
   COMMENT "Generating UMBP protobuf/gRPC C++ sources"
   VERBATIM)
 
+add_custom_command(
+  OUTPUT ${UMBP_PEER_PROTO_SRCS} ${UMBP_PEER_PROTO_HDRS}
+         ${UMBP_PEER_GRPC_SRCS} ${UMBP_PEER_GRPC_HDRS}
+  COMMAND
+    ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
+    --cpp_out=${UMBP_PROTO_GEN_DIR} --grpc_out=${UMBP_PROTO_GEN_DIR}
+    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN} ${UMBP_PEER_PROTO_FILE}
+  DEPENDS ${UMBP_PEER_PROTO_FILE}
+  COMMENT "Generating UMBP Peer protobuf/gRPC C++ sources"
+  VERBATIM)
+
 # ---------- Static library: umbp_common ---------------------------------------
 # Shared between master and client. Contains proto-generated code, types, and
 # client_registry.
@@ -139,12 +156,18 @@ add_library(
   umbp_common STATIC
   ${UMBP_PROTO_SRCS}
   ${UMBP_GRPC_SRCS}
+  ${UMBP_PEER_PROTO_SRCS}
+  ${UMBP_PEER_GRPC_SRCS}
   src/types.cpp
   src/block_index.cpp
   src/client_registry.cpp
   src/route_get_strategy.cpp
   src/route_put_strategy.cpp
-  src/router.cpp)
+  src/router.cpp
+  src/peer_service.cpp
+  src/pool_client.cpp
+  src/client.cpp
+  src/master_server.cpp)
 
 target_include_directories(
   umbp_common
@@ -153,15 +176,26 @@ target_include_directories(
          ${UMBP_PROTO_GEN_DIR} # umbp.pb.h, umbp.grpc.pb.h
          ${_PROTOBUF_INCLUDE_DIR})
 
-# Static libraries do not need to link grpc/protobuf themselves; link those on
-# final executables to keep link order deterministic.
-target_link_libraries(umbp_common PUBLIC mori_logging)
+# mori_io is needed for IOEngine RDMA data plane in PoolClient.
+# However, mori_io -> mori_application -> Torch propagates Torch's bundled
+# protobuf headers which conflict with the system protobuf used by protoc.
+# Work around: create a high-priority include directory that resolves to the
+# system protobuf, overriding Torch's version.
+set(_PROTOBUF_COMPAT_DIR "${CMAKE_CURRENT_BINARY_DIR}/protobuf_compat")
+if(NOT EXISTS "${_PROTOBUF_COMPAT_DIR}/google")
+  file(MAKE_DIRECTORY "${_PROTOBUF_COMPAT_DIR}")
+  file(CREATE_LINK "/usr/include/google" "${_PROTOBUF_COMPAT_DIR}/google"
+       SYMBOLIC)
+endif()
+target_include_directories(umbp_common BEFORE PUBLIC "${_PROTOBUF_COMPAT_DIR}")
+
+target_link_libraries(umbp_common PUBLIC mori_logging mori_io)
 
 target_compile_features(umbp_common PUBLIC cxx_std_17)
 
 # ---------- Master executable -------------------------------------------------
 
-add_executable(umbp_master src/master_server.cpp src/master_main.cpp)
+add_executable(umbp_master src/master_main.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   # Prevent lld/as-needed from discarding protobuf when symbols come from static
   # archives (libumbp_common.a -> generated *.pb.o).
@@ -172,10 +206,19 @@ target_link_libraries(umbp_master PRIVATE umbp_common ${_PROTOBUF_LIBS}
 
 # ---------- Client executable -------------------------------------------------
 
-add_executable(umbp_client src/client.cpp src/client_main.cpp)
+add_executable(umbp_client src/client_main.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   # Same linker retention rule as umbp_master.
   target_link_options(umbp_client PRIVATE -Wl,--no-as-needed)
 endif()
 target_link_libraries(umbp_client PRIVATE umbp_common ${_PROTOBUF_LIBS}
                                           ${_GRPCPP_LIB})
+
+# ---------- PoolClient demo executable ----------------------------------------
+
+add_executable(umbp_pool_client src/pool_client_main.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(umbp_pool_client PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(umbp_pool_client PRIVATE umbp_common ${_PROTOBUF_LIBS}
+                                               ${_GRPCPP_LIB})

@@ -25,6 +25,9 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <vector>
+
+#include "umbp/pool_allocator.h"
 
 namespace mori::umbp {
 
@@ -68,6 +71,11 @@ struct ClientRecord {
   std::chrono::steady_clock::time_point last_heartbeat;
   std::chrono::steady_clock::time_point registered_at;
   std::map<TierType, TierCapacity> tier_capacities;
+
+  std::string peer_address;
+  std::vector<uint8_t> engine_desc_bytes;
+  std::vector<uint8_t> dram_memory_desc_bytes;
+  std::map<TierType, PoolAllocator> allocators;
 };
 
 // Helpers for logging

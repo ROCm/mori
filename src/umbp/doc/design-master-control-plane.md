@@ -1410,17 +1410,17 @@ namespace umbp { class UMBPMaster; }
 
 namespace umbp {
 
-struct UMBPClientConfig {
+struct MasterClientConfig {
     std::string master_address;
     std::string node_id;
     std::string node_address;
     bool auto_heartbeat = true;
 };
 
-class UMBPClient {
+class MasterClient {
    public:
-    explicit UMBPClient(const UMBPClientConfig& config);
-    ~UMBPClient();
+    explicit MasterClient(const MasterClientConfig& config);
+    ~MasterClient();
 
     // --- Client lifecycle ---
     void RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities);
@@ -1446,7 +1446,7 @@ class UMBPClient {
     void StopHeartbeat();
 
    private:
-    UMBPClientConfig config_;
+    MasterClientConfig config_;
 
     std::shared_ptr<grpc::Channel> channel_;
     std::unique_ptr<UMBPMaster::Stub> stub_;
@@ -1735,7 +1735,7 @@ umbp/
 │   └── main.cpp                       # Master binary entry point
 ├── client/
 │   ├── include/umbp/
-│   │   └── client.h                   # UMBPClient wrapper
+│   │   └── client.h                   # MasterClient wrapper
 │   └── src/
 │       └── client.cpp
 ├── tests/
@@ -1828,7 +1828,7 @@ umbp/
 
 **`integration_test.cpp`:**
 1. Start `MasterServer` in a background thread
-2. Create `UMBPClient` connected to localhost
+2. Create `MasterClient` connected to localhost
 3. `RegisterSelf`
 4. Register several keys with locations
 5. Verify `Lookup` returns correct locations

@@ -1,0 +1,43 @@
+syntax = "proto3";
+package umbp;
+
+service UMBPPeer {
+  // IO Engine handshake (one-time per peer)
+  rpc GetPeerInfo(GetPeerInfoRequest) returns (GetPeerInfoResponse);
+
+  // SSD coordination
+  rpc CommitSsdWrite(CommitSsdWriteRequest) returns (CommitSsdWriteResponse);
+  rpc PrepareSsdRead(PrepareSsdReadRequest) returns (PrepareSsdReadResponse);
+}
+
+// --- Handshake ---
+message GetPeerInfoRequest {}
+message GetPeerInfoResponse {
+  bytes  engine_desc         = 1;  // packed EngineDesc
+  bytes  dram_memory_desc    = 2;  // packed MemoryDesc
+  uint64 ssd_capacity        = 3;
+  uint64 ssd_available       = 4;
+  uint64 staging_base_offset = 5;  // SSD staging base offset within DRAM buffer
+}
+
+// --- SSD Write: RDMA into staging → persist to SSD ---
+message CommitSsdWriteRequest {
+  string key              = 1;
+  uint64 staging_offset   = 2;  // offset within DRAM staging area
+  uint64 size             = 3;
+}
+message CommitSsdWriteResponse {
+  bool   success          = 1;
+  string ssd_location_id  = 2;  // opaque SSD handle (e.g. file path)
+}
+
+// --- SSD Read: load SSD → staging → caller RDMA reads ---
+message PrepareSsdReadRequest {
+  string key              = 1;
+  string ssd_location_id  = 2;
+  uint64 size             = 3;
+}
+message PrepareSsdReadResponse {
+  bool   success          = 1;
+  uint64 staging_offset   = 2;  // data loaded at this DRAM staging offset
+}
