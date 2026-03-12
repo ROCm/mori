@@ -590,6 +590,17 @@ static void InitializeBootStates(ShmemStates* states, application::BootstrapNetw
 int ShmemInit(application::BootstrapNetwork* bootNet) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
 
+  if (states->status == ShmemStatesStatus::Initialized) {
+    MORI_SHMEM_INFO("Shmem already initialized, skipping");
+    delete bootNet;
+    return 0;
+  }
+  if (states->status == ShmemStatesStatus::Finalized) {
+    MORI_SHMEM_ERROR("Shmem has been finalized, cannot re-initialize");
+    delete bootNet;
+    return -1;
+  }
+
   // Configure shmem mode
   states->mode = ConfigureShmemMode();
 
