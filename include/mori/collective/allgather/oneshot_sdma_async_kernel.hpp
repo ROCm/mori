@@ -81,8 +81,8 @@ __global__ void OneShotAllGatherSdmaAsyncPutKernel(int myPe, int npes,
 
 __global__ void OneShotAllGatherSdmaAsyncWaitKernel(int myPe, int npes,
                                         const application::SymmMemObjPtr dstMemObj,
-                                        const application::SymmMemObjPtr flagsMemObj) {
-  int flag_val = 1;
+                                        const application::SymmMemObjPtr flagsMemObj,
+                                        uint64_t flagVal = 1) {
   uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
 
   const size_t threadLinearId = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
@@ -90,7 +90,7 @@ __global__ void OneShotAllGatherSdmaAsyncWaitKernel(int myPe, int npes,
   if(threadLinearId < npes){
     int remotePe = threadLinearId;
     shmem::ShmemQuietThread(remotePe,dstMemObj);
-    shmem::ShmemAtomicSizeNonFetchThread(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8, core::atomicType::AMO_ADD,remotePe);
+    shmem::ShmemAtomicSizeNonFetchThread(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flagVal, 8, core::atomicType::AMO_SET,remotePe);
   }
   __syncthreads();
 
@@ -101,20 +101,19 @@ __global__ void OneShotAllGatherSdmaAsyncWaitKernel(int myPe, int npes,
 
     if (threadLinearId == 0) {
       int spinCount = 0;
-      while (core::AtomicLoadRelaxed(flags + sender) == 0) {
+      bool warned = false;
+      while (core::AtomicLoadRelaxed(flags + sender) < flagVal) {
         ++spinCount;
-        if (spinCount > 10000000) {
-          printf("PE %d: Timeout waiting for data from peer %d\n", myPe, sender);
-          break;
+        if (!warned && spinCount > 10000000) {
+          printf("PE %d: Slow wait for data from peer %d (still waiting)\n", myPe, sender);
+          warned = true;
         }
       }
     }
     __syncthreads();
   }
 
-  if (threadLinearId < npes) {
-    flags[threadLinearId] = 0;
-  }
+  // Monotonic generation flags; no reset needed.
 }
 }  // namespace collective
 }  // namespace mori

@@ -62,11 +62,14 @@ private:
 
     // ================ NEW: Async state variables ================
     std::atomic<bool> async_in_progress_;      // Flag indicating async operation is active
+    std::atomic<uint64_t> call_seq_;           // Monotonic generation token for flag synchronization
     T* async_input_;                           // Saved input pointer for async operation
     T* async_output_;                          // Saved output pointer for async operation
     size_t async_total_count_;                 // Saved element count for async operation
     hipStream_t async_stream_;                 // Saved stream for async operation
+    application::SymmMemObjPtr async_dst_obj_; // Destination symm object used by async PUT
     double async_start_time_;                  // Start time for async operation
+    uint64_t async_flag_token_;                // Generation token for current async op
     // ============================================================
     
     // Copy mode flag: if true, copy output_transit_buffer to user output buffer

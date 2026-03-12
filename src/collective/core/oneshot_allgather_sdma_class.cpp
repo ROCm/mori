@@ -59,11 +59,14 @@ AllgatherSdma<T>::AllgatherSdma(int myPe, int npes, size_t input_buffer_size, si
       output_transit_buffer_size_(output_buffer_size),
       output_transit_buffer_ptr_(nullptr, ShmemDeleter()),
       async_in_progress_(false),
+      call_seq_(0),
       async_input_(nullptr),
       async_output_(nullptr),
       async_total_count_(0),
       async_stream_(nullptr),
+      async_dst_obj_(),
       async_start_time_(0.0),
+      async_flag_token_(0),
       copy_output_to_user_(copy_output_to_user) {
 
     // 1. Allocate and initialize flags memory
@@ -196,6 +199,7 @@ bool AllgatherSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
     async_total_count_ = total_count;
     async_stream_ = stream;
     async_start_time_ = MPI_Wtime();
+    async_flag_token_ = call_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
 
     try {
         // Step 1: Copy input data to input transit buffer
@@ -218,13 +222,14 @@ bool AllgatherSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
         auto [regObj, byteOffset] = find_registered(output);
         bool direct = regObj.IsValid();
         auto& dst_obj = direct ? regObj : output_transit_buffer_obj_;
+        async_dst_obj_ = dst_obj;
 
         OneShotAllGatherSdmaAsyncPutKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
             input,
             input_transit_buffer_obj_,
             dst_obj,
-            flagsObj_, total_count);
+            flagsObj_, total_count, direct ? byteOffset : 0);
 
         hipError_t kernel_err = hipGetLastError();
         if (kernel_err != hipSuccess) {
@@ -239,6 +244,8 @@ bool AllgatherSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
     } catch (const std::exception& e) {
         printf("PE %d: Failed to start async operation: %s\n", myPe_, e.what());
         async_in_progress_ = false;
+        async_dst_obj_ = {};
+        async_flag_token_ = 0;
         return false;
     }
 }
@@ -256,7 +263,8 @@ double AllgatherSdma<T>::wait_async(hipStream_t stream) {
         // Use provided stream or the one from start_async
         hipStream_t wait_stream = (stream != nullptr) ? stream : async_stream_;
 
-        OneShotAllGatherSdmaAsyncWaitKernel<<<1, 64, 0, wait_stream>>>(myPe_, npes_, output_transit_buffer_obj_, flagsObj_);
+        OneShotAllGatherSdmaAsyncWaitKernel<<<1, 64, 0, wait_stream>>>(
+            myPe_, npes_, async_dst_obj_.IsValid() ? async_dst_obj_ : output_transit_buffer_obj_, flagsObj_, async_flag_token_);
 
         // Step 1: Synchronize to ensure PUT kernel is completed
         printf("PE %d: Synchronizing to ensure PUT kernel completion\n", myPe_);
@@ -305,7 +313,9 @@ double AllgatherSdma<T>::wait_async(hipStream_t stream) {
         async_output_ = nullptr;
         async_total_count_ = 0;
         async_stream_ = nullptr;
+        async_dst_obj_ = {};
         async_start_time_ = 0.0;
+        async_flag_token_ = 0;
 
         return duration;
 
@@ -327,7 +337,9 @@ void AllgatherSdma<T>::cancel_async() {
         async_output_ = nullptr;
         async_total_count_ = 0;
         async_stream_ = nullptr;
+        async_dst_obj_ = {};
         async_start_time_ = 0.0;
+        async_flag_token_ = 0;
 
         // Reset flags
         //resetFlags();
@@ -468,13 +480,14 @@ bool AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
     }
 
     try {
+        uint64_t flag_token = call_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
         auto [regObj, byteOffset] = find_registered(output);
         bool direct = regObj.IsValid();
         auto& dst_obj = direct ? regObj : output_transit_buffer_obj_;
 
         OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_, input, input_transit_buffer_obj_,
-            dst_obj, flagsObj_, total_count, direct ? byteOffset : 0);
+            dst_obj, flagsObj_, total_count, direct ? byteOffset : 0, flag_token);
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess) {
