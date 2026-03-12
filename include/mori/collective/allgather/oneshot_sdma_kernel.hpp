@@ -35,8 +35,7 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes,
                                        const application::SymmMemObjPtr srcMemObj,
                                        const application::SymmMemObjPtr dstMemObj,
                                        const application::SymmMemObjPtr flagsMemObj,
-                                       size_t elementCount,
-                                       T* userOutput = nullptr) {
+                                       size_t elementCount) {
   if (elementCount == 0 || npes <= 0) {
     return;
   }
@@ -47,7 +46,6 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes,
 
   const size_t bytesPerElement = sizeof(T);
   const size_t bytesPerPeer = elementCount * bytesPerElement;
-  const size_t totalBytes = bytesPerPeer * npes;
 
   // Multi-queue: each thread handles one SDMA queue for one remote PE
   if(threadLinearId < npes * dstMemObj->sdmaNumQueue){
@@ -83,36 +81,6 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes,
       }
     }
     dstMemObj->expectSignalsPtr[sender * dstMemObj->sdmaNumQueue] = expected;
-  }
-  __syncthreads();
-
-  // SDMA copy from transit buffer to user output (local GPU, self-to-self)
-  if (userOutput != nullptr && threadLinearId < dstMemObj->sdmaNumQueue) {
-    int qId = threadLinearId;
-    const size_t copyBytesBase = totalBytes / 8;
-    size_t copyOffset = qId * copyBytesBase;
-    size_t copyBytes = (qId == 7) ? (totalBytes - 7 * copyBytesBase) : copyBytesBase;
-
-    // Use myPe's SDMA queue for local copy (self-to-self)
-    anvil::SdmaQueueDeviceHandle** devicehandles = dstMemObj->deviceHandles_d + myPe * dstMemObj->sdmaNumQueue;
-    HSAuint64* localSignal = dstMemObj->signalPtrs
-                             + static_cast<size_t>(myPe) * dstMemObj->sdmaNumQueue;
-
-    uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr) + copyOffset;
-    uint8_t* dst = reinterpret_cast<uint8_t*>(userOutput) + copyOffset;
-
-    core::SdmaPutThread(src, dst, copyBytes, devicehandles, localSignal, dstMemObj->sdmaNumQueue, qId);
-  }
-
-  // Wait for local SDMA copy to complete
-  if (userOutput != nullptr && threadLinearId == 0) {
-    HSAuint64* localSignal = dstMemObj->signalPtrs
-                             + static_cast<size_t>(myPe) * dstMemObj->sdmaNumQueue;
-    for (uint32_t q = 0; q < dstMemObj->sdmaNumQueue; q++) {
-      HSAuint64 expected = dstMemObj->expectSignalsPtr[myPe * dstMemObj->sdmaNumQueue + q] + 1;
-      anvil::waitForSignal(localSignal + q, expected);
-      dstMemObj->expectSignalsPtr[myPe * dstMemObj->sdmaNumQueue + q] = expected;
-    }
   }
   __syncthreads();
 }

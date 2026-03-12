@@ -383,20 +383,22 @@ bool AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
     }
 
     try {
-        // Execute Allgather kernel with optional SDMA copy to user output
         OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
             input,
             input_transit_buffer_obj_,
             output_transit_buffer_obj_,
-            flagsObj_, total_count,
-            copy_output_to_user_ ? output : nullptr);
+            flagsObj_, total_count);
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess) {
             fprintf(stderr, "PE %d: Kernel launch failed: %s\n",
                     myPe_, hipGetErrorString(err));
             return false;
+        }
+
+        if (copy_output_to_user_) {
+            copy_output_to_user(output, total_count, stream);
         }
 
     } catch (const std::exception& e) {
