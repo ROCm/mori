@@ -188,6 +188,11 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   }
   recvTokenNum = __shfl(recvTokenNum, 0);
 
+  // Invalidate L1 cache: SDMA writes bypass L2/L1 and land in HBM directly.
+  // Without invalidation, CU reads may hit stale (zero) cache entries.
+  asm volatile("buffer_wbinvl1_vol" ::: "memory");
+  __threadfence_system();
+
   // Copy data
   uint8_t* stagingPtr = (destPe != myPe)
                             ? args.shmemDispatchInpTokMemObj->template GetAs<uint8_t*>()
