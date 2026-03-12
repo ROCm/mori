@@ -37,10 +37,6 @@
 
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
-#include "xla/pjrt/c/pjrt_c_api.h"
-#include "xla/pjrt/c/pjrt_c_api_ffi_extension.h"
-#include "xla/pjrt/c/pjrt_c_api_gpu_extension.h"
-// #include "xla/pjrt/c/pjrt_c_api_helpers.h"
 
 namespace py = pybind11;
 
@@ -52,22 +48,6 @@ using mori::moe::EpDispatchCombineConfig;
 using mori::moe::EpDispatchCombineHandle;
 using mori::moe::KernelType;
 using mori::moe::index_t;
-
-namespace pjrt {
-
-template <typename ExtType, typename InputType>
-ExtType* FindExtension(InputType* in, PJRT_Extension_Type type) {
-  PJRT_Extension_Base* ext = in->extension_start;
-  while (ext != nullptr) {
-    if (ext->type == type) {
-      return reinterpret_cast<ExtType*>(ext);
-    }
-    ext = ext->next;
-  }
-  // 'type' wasn't found in extension chain
-  return nullptr;
-}
-} // namespace pjrt
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          XLA Ops APIs                                          */
@@ -96,7 +76,6 @@ hipDataType FFIType2HipType(DataType dtype) {
   }
 #undef XX
 }
-
 
 void GpuCopy(void* dst, const void* src, size_t bytes, hipStream_t stream, 
         hipMemcpyKind copy_dir = hipMemcpyDeviceToDevice) {
@@ -153,25 +132,27 @@ Error MoriDispatchImpl(
   auto topk_ids = GetArg<BufferR2<S32>>(args, 2);
   auto out = GetRet<AnyBuffer>(rets, 0);
   
-//   XPUT("MoriDispatchImpl handle: %d, kernel_type=%d input=%d weights=%d block_num=%d stream: %p",
-//       h->config.rank, kernel_type, (int)input.size_bytes(), (int)weights.size_bytes(), block_num, stream);
+  XPUT("MoriDispatchImpl handle: %d, kernel_type=%d input=%d weights=%d block_num=%d stream: %p",
+      h->config.rank, kernel_type, (int)input.size_bytes(), (int)weights.size_bytes(), block_num, stream);
   
-//   assert(ByteWidth(topk_ids.element_type()) == sizeof(index_t) &&
-//          ByteWidth(out_indices->element_type()) == sizeof(index_t)); 
+  assert(ByteWidth(topk_ids.element_type()) == sizeof(index_t) &&
+         ByteWidth(out_indices->element_type()) == sizeof(index_t)); 
   
-//   float *weightsPtr = has_weights ? weights.typed_data() : nullptr;
+  float *weightsPtr = has_weights ? weights.typed_data() : nullptr;
 
-//   uint8_t* scalesPtr = nullptr;
-//   if (has_scales && h->config.scaleDim > 0) {
-//     assert(/*scales->is_contiguous() &&*/ 
-//       ByteWidth(scales.element_type()) == h->config.scaleTypeSize);
-//     scalesPtr = static_cast< uint8_t *>(scales.untyped_data());
-//   }
+  uint8_t* scalesPtr = nullptr;
+  if (has_scales && h->config.scaleDim > 0) {
+    assert(/*scales->is_contiguous() &&*/ 
+      ByteWidth(scales.element_type()) == h->config.scaleTypeSize);
+    scalesPtr = static_cast< uint8_t *>(scales.untyped_data());
+  }
 
-//   // NOTE: why output is set to NULL??
-//   h->PrepareInference(FFIType2HipType(input.element_type()), 
-//         input.untyped_data(), nullptr, weightsPtr, scalesPtr, 
-//         topk_ids.typed_data(), input.dimensions()[0]);
+  // NOTE: why output is set to NULL??
+  h->PrepareInference(FFIType2HipType(input.element_type()), 
+        input.untyped_data(), nullptr, weightsPtr, scalesPtr, 
+        topk_ids.typed_data(), input.dimensions()[0]);
+
+
 
 // #if 0 // NOTE: we do not use this anymore   
 //   h->LaunchDispatch(static_cast< KernelType >(kernel_type), block_num, 
@@ -351,7 +332,7 @@ Error EpDispatchCombineImpl(
     hipStream_t stream, EpDispatchCombineState* state, 
     Dictionary attrs, 
     RemainingArgs args,
-    RemainingRets rets) {
+    RemainingRets rets) try {
   XPUT(
       "EpDispatchCombineImpl stream=%p rank=%d  attrs: %zu",
       stream, state->handle.config.rank, attrs.size());
@@ -368,6 +349,8 @@ Error EpDispatchCombineImpl(
     return GetDispatchSrcTokenId(stream, &state->handle, rets);
   }
   return Error::Internal("Invalid operation type");
+} catch (const std::exception& e) {
+  return Error::Internal(e.what());
 }
 
 XLA_FFI_DEFINE_HANDLER(
@@ -378,75 +361,6 @@ XLA_FFI_DEFINE_HANDLER(
         .Attrs()
         .RemainingArgs()
         .RemainingRets());
-
-void JaxPluginSetup(py::capsule pyc_api) {
-  if (std::string_view(pyc_api.name()) != "pjrt_c_api") {
-    throw std::runtime_error(
-              "Argument to user_data_plugin was not a pjrt_c_api capsule.");
-  }
-  auto* c_api = pyc_api.get_pointer<PJRT_Api>();
-  const auto* ffi_ext = pjrt::FindExtension<PJRT_FFI_Extension>(
-      c_api, PJRT_Extension_Type::PJRT_Extension_Type_FFI);
-  const auto* call_ext = pjrt::FindExtension<PJRT_Gpu_Custom_Call>(
-            c_api, PJRT_Extension_Type::PJRT_Extension_Type_Gpu_Custom_Call);
-  if (call_ext == nullptr || ffi_ext == nullptr) {
-    throw std::runtime_error("PJRT FFI and/or custom call extension is not available!");
-  }
-
-  auto register_type_id = [&](std::string_view name, XLA_FFI_TypeId* type_id_ptr) {
-    PJRT_FFI_TypeID_Register_Args args {
-      .struct_size = sizeof(PJRT_FFI_TypeID_Register_Args),
-      .type_name = name.data(),
-      .type_name_size = name.length(),
-      .type_id = type_id_ptr->type_id,
-    };
-    auto *err = std::invoke(ffi_ext->type_id_register, &args);
-    if (err != nullptr) {
-      throw std::runtime_error("Unable to register type ID for " + 
-                std::string(name));
-    }
-    // Update the type id pointer if it was assigned by XLA
-    type_id_ptr->type_id = args.type_id;
-  };
-
-  auto register_ffi = [&](std::string_view name, XLA_FFI_Handler* handler_execute,
-                          XLA_FFI_Handler* handler_instantiate = nullptr) {
-#if 0
-    PJRT_FFI_Register_Handler_Args args {
-      .struct_size = sizeof(PJRT_FFI_Register_Handler_Args),
-      .target_name = name.data(),
-      .target_name_size = name.length(),
-      .handler = reinterpret_cast<void*>(handler),
-      .platform_name = "ROCM",
-      .platform_name_size = 4,
-      .traits = PJRT_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE,
-    };
-    auto *err = std::invoke(ffi_ext->register_handler, &args);
-#else
-    PJRT_Gpu_Register_Custom_Call_Args args {
-      .struct_size = PJRT_Gpu_Register_Custom_Call_Args_STRUCT_SIZE,
-      .function_name = name.data(),
-      .function_name_size = name.length(),
-      .api_version = 1,
-      .handler_instantiate = reinterpret_cast<void*>(handler_instantiate),
-      .handler_prepare = nullptr,
-      .handler_initialize = nullptr,
-      .handler_execute = reinterpret_cast<void*>(handler_execute),
-    };
-    auto *err = std::invoke(call_ext->custom_call, &args);
-#endif
-    if (err != nullptr) {
-      throw std::runtime_error("Unable to register FFI handler for " + 
-                std::string(name));
-    }
-    // XPUT("Registered FFI handler for %s", name.data());
-  }; // register_ffi
-
-  register_ffi("mori_ep", EpDispatchCombineHandler,
-    EpDispatchCombineInstHandler);
-
-  register_type_id("EpDispatchCombineState", &EpDispatchCombineState::id);
-}
 
 }  // namespace
 
@@ -463,7 +377,15 @@ void RegisterXLAFFIOps(py::module_& m) {
 //       .OO(MaxNumTokensToRecvPerRank)
 //       .OO(MaxNumTokensToRecv);
 // #undef OO
-  m.def("pjrt_plugin_setup", &JaxPluginSetup, py::arg("c_api"));
+  m.def("mori_ep_type_id",
+        []() { return py::capsule(reinterpret_cast<void*>(&EpDispatchCombineState::id)); });
+  m.def("mori_ep_handler", []() {
+    py::dict d;
+    d["instantiate"] =
+        py::capsule(reinterpret_cast<void*>(EpDispatchCombineInstHandler));
+    d["execute"] = py::capsule(reinterpret_cast<void*>(EpDispatchCombineHandler));
+    return d;
+  });
 //   m.def("get_cur_rank_num_token", &EpDispatchCombineHandle::GetCurRankNumToken);
 }
 

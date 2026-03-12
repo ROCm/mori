@@ -3,9 +3,6 @@ import jax.numpy as jnp
 import mori
 from jax.sharding import PartitionSpec as P
 # from jax.experimental.pjit import pjit
-from jax.experimental.shard_map import shard_map
-from jax.experimental import multihost_utils
-from jax._src import xla_bridge as xb
 from jax._src.lib import _jax
 import numpy as np
 import argparse, os, time, functools
@@ -45,7 +42,12 @@ def cleanup():
   mori.shmem.shmem_finalize()
   
 def run_test(rank, world_size):
-  xb.register_plugin_callbacks(mori.cpp.pjrt_plugin_setup)
+  try:
+    jax.ffi.register_ffi_target("mori_ep", mori.cpp.mori_ep_handler(), platform="ROCM")
+    jax.ffi.register_ffi_type_id("mori_ep", mori.cpp.mori_ep_type_id(), platform="ROCM")
+  except Exception:
+    # Already registered in this process.
+    pass
   print(f"[rank {rank}] devices = {jax.local_devices()}", flush=True)
 
   cfg = mori.cpp.EpDispatchCombineConfig(
