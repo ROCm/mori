@@ -293,6 +293,18 @@ std::vector<char> SSDTier::Read(const std::string& key) {
   return buf;
 }
 
+std::vector<std::string> SSDTier::GetLRUCandidates(size_t max_candidates) const {
+  if (max_candidates == 0) max_candidates = 1;
+  std::lock_guard<std::mutex> lock(mu_);
+  std::vector<std::string> result;
+  result.reserve(std::min(max_candidates, lru_list_.size()));
+  auto it = lru_list_.rbegin();
+  for (size_t i = 0; i < max_candidates && it != lru_list_.rend(); ++i, ++it) {
+    result.push_back(*it);
+  }
+  return result;
+}
+
 std::string SSDTier::GetLRUKey() const {
   std::lock_guard<std::mutex> lock(mu_);
   if (lru_list_.empty()) return "";

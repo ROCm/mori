@@ -43,6 +43,12 @@ class UMBPClient {
   std::vector<bool> BatchPutFromPtr(const std::vector<std::string>& keys,
                                     const std::vector<uintptr_t>& ptrs,
                                     const std::vector<size_t>& sizes);
+  // Depth-aware variant: depths[i] is the chain depth for keys[i].
+  // depth == -1 (or empty depths vector) means no metadata — falls back to plain LRU.
+  std::vector<bool> BatchPutFromPtrWithDepth(const std::vector<std::string>& keys,
+                                             const std::vector<uintptr_t>& ptrs,
+                                             const std::vector<size_t>& sizes,
+                                             const std::vector<int>& depths);
   std::vector<bool> BatchGetIntoPtr(const std::vector<std::string>& keys,
                                     const std::vector<uintptr_t>& ptrs,
                                     const std::vector<size_t>& sizes);

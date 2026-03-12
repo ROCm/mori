@@ -132,6 +132,33 @@ std::vector<bool> UMBPClient::BatchPutFromPtr(const std::vector<std::string>& ke
   return results;
 }
 
+std::vector<bool> UMBPClient::BatchPutFromPtrWithDepth(const std::vector<std::string>& keys,
+                                                       const std::vector<uintptr_t>& ptrs,
+                                                       const std::vector<size_t>& sizes,
+                                                       const std::vector<int>& depths) {
+  std::vector<bool> results(keys.size(), false);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    if (role_ == UMBPRole::SharedSSDFollower) {
+      results[i] = false;
+      continue;
+    }
+    if (index_.MayExist(keys[i])) {
+      results[i] = true;  // content-addressed dedup
+      continue;
+    }
+    int depth = (i < depths.size()) ? depths[i] : -1;
+    bool ok = storage_.WriteFromPtrWithDepth(keys[i], ptrs[i], sizes[i], depth);
+    if (!ok) continue;
+
+    index_.Insert(keys[i], {StorageTier::CPU_DRAM, 0, sizes[i]});
+    if (role_ == UMBPRole::SharedSSDLeader) {
+      storage_.CopyToSSD(keys[i]);
+    }
+    results[i] = true;
+  }
+  return results;
+}
+
 std::vector<bool> UMBPClient::BatchGetIntoPtr(const std::vector<std::string>& keys,
                                               const std::vector<uintptr_t>& ptrs,
                                               const std::vector<size_t>& sizes) {

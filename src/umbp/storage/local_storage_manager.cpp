@@ -21,10 +21,187 @@
 // SOFTWARE.
 #include "umbp/storage/local_storage_manager.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 #include "umbp/storage/dram_tier.h"
 #include "umbp/storage/ssd_tier.h"
+
+// ---------------------------------------------------------------------------
+// ExtractBaseHash
+//
+// Strips the SGLang-generated key suffix to recover the 64-hex-char SHA256
+// base hash.  Key formats (rightmost fields stripped first):
+//
+//   MHA, no PP:   {hash}_{tp_rank}_{k|v}       → strip _k/_v, strip _{digit}
+//   MHA, with PP: {hash}_{tp_rank}_{pp_rank}_{k|v} → strip _k/_v, strip _{digit}, strip _{digit}
+//   MLA, no PP:   {hash}__k                     → strip _k, strip trailing _
+//   MLA, with PP: {hash}_{pp_rank}_{k}           → strip _k, strip _{digit}
+//
+// The SHA256 base hash is always exactly 64 lower-case hex characters.
+// We use that invariant to anchor stripping: stop as soon as the remaining
+// string length equals 64 and the remaining characters are all hex.
+// ---------------------------------------------------------------------------
+static bool IsHexChar(char c) {
+  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+static bool IsAllHex(const std::string& s, size_t len) {
+  for (size_t i = 0; i < len; ++i) {
+    if (!IsHexChar(s[i])) return false;
+  }
+  return true;
+}
+
+std::string LocalStorageManager::ExtractBaseHash(const std::string& key) {
+  // Fast-path: already looks like a bare hash.
+  if (key.size() == 64 && IsAllHex(key, 64)) return key;
+
+  std::string s = key;
+
+  // Strip _k or _v suffix.
+  if (s.size() >= 2 && s[s.size() - 2] == '_' && (s.back() == 'k' || s.back() == 'v')) {
+    s.resize(s.size() - 2);
+  } else {
+    return key;  // Unrecognised format — return unchanged.
+  }
+
+  // Iteratively strip _{digit+} rank segments until the remainder is a 64-char
+  // hex string or no more strippable segments remain.
+  for (int pass = 0; pass < 2; ++pass) {
+    if (s.size() == 64 && IsAllHex(s, 64)) return s;
+
+    // Find the last '_' and check that everything after it is digits.
+    size_t pos = s.rfind('_');
+    if (pos == std::string::npos) break;
+
+    bool all_digits = true;
+    for (size_t i = pos + 1; i < s.size(); ++i) {
+      if (s[i] < '0' || s[i] > '9') {
+        all_digits = false;
+        break;
+      }
+    }
+
+    // Handle MLA no-PP double-underscore: after stripping _k we may have a
+    // trailing '_' with nothing after it (pos == s.size()-1).
+    if (pos == s.size() - 1) {
+      // Empty segment after last '_' — this is the double-underscore case.
+      s.resize(pos);
+      continue;
+    }
+
+    if (!all_digits) break;
+    s.resize(pos);
+  }
+
+  if (s.size() == 64 && IsAllHex(s, 64)) return s;
+
+  // Fallback: return original key — group will contain only this key (size 1),
+  // which is safe (single-key eviction).
+  return key;
+}
+
+// ---------------------------------------------------------------------------
+// Depth and group map helpers
+// ---------------------------------------------------------------------------
+
+void LocalStorageManager::RecordDepth(const std::string& key, int depth) {
+  std::unique_lock<std::shared_mutex> lock(depth_mu_);
+  depth_map_[key] = depth;
+}
+
+int LocalStorageManager::GetDepth(const std::string& key) const {
+  std::shared_lock<std::shared_mutex> lock(depth_mu_);
+  auto it = depth_map_.find(key);
+  return (it != depth_map_.end()) ? it->second : -1;
+}
+
+void LocalStorageManager::RemoveDepthAndGroup(const std::string& key) {
+  std::unique_lock<std::shared_mutex> lock(depth_mu_);
+  depth_map_.erase(key);
+
+  std::string base = ExtractBaseHash(key);
+  auto git = group_map_.find(base);
+  if (git != group_map_.end()) {
+    auto& vec = git->second;
+    vec.erase(std::remove(vec.begin(), vec.end(), key), vec.end());
+    if (vec.empty()) group_map_.erase(git);
+  }
+}
+
+void LocalStorageManager::RecordGroup(const std::string& key) {
+  std::unique_lock<std::shared_mutex> lock(depth_mu_);
+  std::string base = ExtractBaseHash(key);
+  auto& vec = group_map_[base];
+  // Only append if not already present (idempotent for re-puts).
+  if (std::find(vec.begin(), vec.end(), key) == vec.end()) {
+    vec.push_back(key);
+  }
+}
+
+std::vector<std::string> LocalStorageManager::GetGroup(const std::string& key) const {
+  std::shared_lock<std::shared_mutex> lock(depth_mu_);
+  std::string base = ExtractBaseHash(key);
+  auto it = group_map_.find(base);
+  if (it != group_map_.end() && !it->second.empty()) return it->second;
+  return {key};
+}
+
+// ---------------------------------------------------------------------------
+// SelectVictim
+//
+// "lru" policy: O(1) — return plain LRU tail key.
+// "prefix_aware_lru": scan up to eviction_candidate_window candidates from
+// the LRU tail, score by depth (higher depth = preferred victim, deeper suffix
+// block first).  Tie-break by LRU position (earlier in the candidate list =
+// older = preferred victim among equal-depth candidates).
+// Falls back to plain LRU when no depth metadata is available.
+// ---------------------------------------------------------------------------
+std::string LocalStorageManager::SelectVictim(TierBackend* tier) {
+  if (config_.eviction_policy != "prefix_aware_lru") {
+    return tier->GetLRUKey();
+  }
+
+  size_t window = config_.eviction_candidate_window;
+  if (window == 0) window = 1;
+
+  std::vector<std::string> candidates = tier->GetLRUCandidates(window);
+  if (candidates.empty()) return "";
+
+  // Score: (depth, position) where higher depth wins, lower position (older)
+  // wins ties.  depth == -1 is treated as 0 for scoring so metadata-free
+  // keys degrade to plain LRU ordering.
+  int best_depth = -2;  // sentinel below any real score
+  size_t best_pos = 0;
+  std::string best_key;
+
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    int d = GetDepth(candidates[i]);  // -1 if unknown
+    int score = (d >= 0) ? d : 0;
+    // Higher score wins; tie-break: smaller i (older LRU position) wins.
+    if (best_key.empty() || score > best_depth || (score == best_depth && i < best_pos)) {
+      best_depth = score;
+      best_pos = i;
+      best_key = candidates[i];
+    }
+  }
+
+  return best_key;
+}
+
+// ---------------------------------------------------------------------------
+// WriteFromPtrWithDepth
+// ---------------------------------------------------------------------------
+bool LocalStorageManager::WriteFromPtrWithDepth(const std::string& key, uintptr_t src, size_t size,
+                                                int depth, StorageTier tier) {
+  bool ok = WriteFromPtr(key, src, size, tier);
+  if (ok && depth >= 0) {
+    RecordDepth(key, depth);
+    RecordGroup(key);
+  }
+  return ok;
+}
 
 LocalStorageManager::LocalStorageManager(const UMBPConfig& config, BlockIndexClient* index)
     : config_(config), role_(config.ResolveRole()), index_(index) {
@@ -106,10 +283,21 @@ bool LocalStorageManager::DemoteLRUForSpace(TierBackend* tier) {
     return false;
   }
 
-  std::string victim = tier->GetLRUKey();
+  std::string victim = SelectVictim(tier);
   if (victim.empty()) return false;
 
-  return MoveKey(victim, tier, slower);
+  // Group-demote: move all keys sharing the same page together.
+  // depth/group metadata is preserved (key still exists in slower tier).
+  std::vector<std::string> group = GetGroup(victim);
+  bool any_moved = false;
+  for (const auto& k : group) {
+    if (tier->Exists(k)) {
+      if (MoveKey(k, tier, slower)) {
+        any_moved = true;
+      }
+    }
+  }
+  return any_moved;
 }
 
 bool LocalStorageManager::Write(const std::string& key, const void* data, size_t size,
@@ -124,14 +312,21 @@ bool LocalStorageManager::Write(const std::string& key, const void* data, size_t
   while (DemoteLRUForSpace(target)) {
     if (target->Write(key, data, size)) return true;
   }
-
-  // No slower tier or it's also full — last-resort eviction (data loss).
-  // The caller's new key still gets stored.
+  TierBackend* faster_than_target = NextFasterTier(target->tier_id());
   while (true) {
-    std::string victim = target->GetLRUKey();
+    std::string victim = SelectVictim(target);
     if (victim.empty()) return false;
-    target->Evict(victim);
-    if (index_) index_->Remove(victim);
+    std::vector<std::string> group = GetGroup(victim);
+    for (const auto& k : group) {
+      if (target->Exists(k)) {
+        bool only_on_target = !faster_than_target || !faster_than_target->Exists(k);
+        target->Evict(k);
+        if (only_on_target) {
+          if (index_) index_->Remove(k);
+          RemoveDepthAndGroup(k);
+        }
+      }
+    }
     if (target->Write(key, data, size)) return true;
   }
 }
@@ -163,10 +358,12 @@ bool LocalStorageManager::Evict(const std::string& key) {
   TierBackend* tier = FindTierHolding(key);
   if (!tier) {
     if (index_) index_->Remove(key);
+    RemoveDepthAndGroup(key);
     return false;
   }
   bool ok = tier->Evict(key);
   if (ok && index_) index_->Remove(key);
+  RemoveDepthAndGroup(key);
   return ok;
 }
 
@@ -206,10 +403,16 @@ bool LocalStorageManager::Promote(const std::string& key) {
       to->tier_id() == StorageTier::CPU_DRAM) {
     if (!to->Write(key, data.data(), data.size())) {
       while (true) {
-        std::string victim = to->GetLRUKey();
+        std::string victim = SelectVictim(to);
         if (victim.empty()) return false;
-        to->Evict(victim);
-        if (index_) index_->Remove(victim);
+        std::vector<std::string> group = GetGroup(victim);
+        for (const auto& k : group) {
+          if (to->Exists(k)) {
+            to->Evict(k);
+            if (index_) index_->Remove(k);
+            RemoveDepthAndGroup(k);
+          }
+        }
         if (to->Write(key, data.data(), data.size())) break;
       }
     }
@@ -254,19 +457,25 @@ bool LocalStorageManager::CopyToSSD(const std::string& key) {
   // SSD full — evict SSD LRU entries to make room.
   // If a victim is only on SSD (no DRAM copy), we must also update the index.
   while (true) {
-    std::string victim = ssd->GetLRUKey();
+    std::string victim = SelectVictim(ssd);
     if (victim.empty()) return false;
 
-    // Keep the index consistent: if the victim is only on SSD, evicting it
-    // is data loss and the index must be updated.
-    if (index_) {
-      auto loc = index_->Lookup(victim);
-      if (loc && (loc->tier == StorageTier::LOCAL_SSD || !dram->Exists(victim))) {
-        index_->Remove(victim);
+    std::vector<std::string> group = GetGroup(victim);
+    for (const auto& k : group) {
+      if (!ssd->Exists(k)) continue;
+      bool only_on_ssd = !dram->Exists(k);
+      // Keep the index consistent: if the victim is only on SSD, evicting it
+      // is data loss and the index must be updated.
+      if (index_) {
+        auto loc = index_->Lookup(k);
+        if (loc && (loc->tier == StorageTier::LOCAL_SSD || only_on_ssd)) {
+          index_->Remove(k);
+        }
       }
+      ssd->Evict(k);
+      // Only clear metadata if key is gone from all tiers (data loss).
+      if (only_on_ssd) RemoveDepthAndGroup(k);
     }
-
-    ssd->Evict(victim);
     if (ssd->Write(key, data.data(), data.size())) return true;
   }
 }
@@ -309,10 +518,16 @@ bool LocalStorageManager::InsertReadCacheNoWriteback(const std::string& key) {
   if (!dram->Write(key, data.data(), data.size())) {
     // Follower mode never writes back to SSD. Evict DRAM-only victims.
     while (true) {
-      std::string victim = dram->GetLRUKey();
+      std::string victim = SelectVictim(dram);
       if (victim.empty()) return false;
-      dram->Evict(victim);
-      if (index_) index_->Remove(victim);
+      std::vector<std::string> group = GetGroup(victim);
+      for (const auto& k : group) {
+        if (dram->Exists(k)) {
+          dram->Evict(k);
+          if (index_) index_->Remove(k);
+          RemoveDepthAndGroup(k);
+        }
+      }
       if (dram->Write(key, data.data(), data.size())) break;
     }
   }
@@ -334,4 +549,7 @@ void LocalStorageManager::Clear() {
     entry.backend->Clear();
   }
   if (index_) index_->Clear();
+  std::unique_lock<std::shared_mutex> lock(depth_mu_);
+  depth_map_.clear();
+  group_map_.clear();
 }

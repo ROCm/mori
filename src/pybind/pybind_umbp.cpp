@@ -50,7 +50,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("dram_low_watermark", &UMBPConfig::dram_low_watermark)
       .def_readwrite("role", &UMBPConfig::role)
       .def_readwrite("follower_mode", &UMBPConfig::follower_mode)
-      .def_readwrite("force_ssd_copy_on_write", &UMBPConfig::force_ssd_copy_on_write);
+      .def_readwrite("force_ssd_copy_on_write", &UMBPConfig::force_ssd_copy_on_write)
+      .def_readwrite("eviction_candidate_window", &UMBPConfig::eviction_candidate_window);
 
   py::class_<UMBPClient>(m, "UMBPClient")
       .def(py::init<const UMBPConfig&>(), py::arg("config") = UMBPConfig{})
@@ -60,6 +61,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("remove", &UMBPClient::Remove, py::arg("key"))
       .def("batch_put_from_ptr", &UMBPClient::BatchPutFromPtr, py::arg("keys"), py::arg("ptrs"),
            py::arg("sizes"))
+      .def("batch_put_from_ptr_with_depth", &UMBPClient::BatchPutFromPtrWithDepth, py::arg("keys"),
+           py::arg("ptrs"), py::arg("sizes"), py::arg("depths"))
       .def("batch_get_into_ptr", &UMBPClient::BatchGetIntoPtr, py::arg("keys"), py::arg("ptrs"),
            py::arg("sizes"))
       .def("batch_exists", &UMBPClient::BatchExists, py::arg("keys"))

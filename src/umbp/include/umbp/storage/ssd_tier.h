@@ -59,6 +59,7 @@ class SSDTier : public TierBackend {
   // Extended interface overrides
   std::vector<char> Read(const std::string& key) override;
   std::string GetLRUKey() const override;
+  std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
 
  private:
   std::string dir_;

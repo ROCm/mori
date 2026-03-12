@@ -28,3 +28,10 @@ bool TierBackend::WriteFromPtr(const std::string& key, uintptr_t src_ptr, size_t
 std::vector<char> TierBackend::Read(const std::string& key) { return {}; }
 
 std::string TierBackend::GetLRUKey() const { return ""; }
+
+std::vector<std::string> TierBackend::GetLRUCandidates(size_t max_candidates) const {
+  if (max_candidates == 0) max_candidates = 1;
+  std::string lru = GetLRUKey();
+  if (lru.empty()) return {};
+  return {lru};
+}

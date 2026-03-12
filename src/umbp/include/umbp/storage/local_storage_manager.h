@@ -22,7 +22,9 @@
 #pragma once
 
 #include <memory>
+#include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -42,6 +44,9 @@ class LocalStorageManager {
              StorageTier tier = StorageTier::CPU_DRAM);
   bool WriteFromPtr(const std::string& key, uintptr_t src, size_t size,
                     StorageTier tier = StorageTier::CPU_DRAM);
+  // depth == -1 means no metadata (degenerates to plain LRU eviction).
+  bool WriteFromPtrWithDepth(const std::string& key, uintptr_t src, size_t size, int depth,
+                             StorageTier tier = StorageTier::CPU_DRAM);
 
   bool ReadIntoPtr(const std::string& key, uintptr_t dst, size_t size);
   bool Exists(const std::string& key) const;
@@ -75,7 +80,38 @@ class LocalStorageManager {
   };
   std::vector<TierEntry> tiers_;
 
-  // Helpers
+  // -----------------------------------------------------------------------
+  // Depth and group metadata (protected by depth_mu_)
+  //
+  // LocalStorageManager has no class-level mutex; tier backends use their own
+  // internal locks.  depth_map_ and group_map_ are manager-owned state accessed
+  // from concurrent Put and eviction paths, so they require their own lock.
+  // -----------------------------------------------------------------------
+  mutable std::shared_mutex depth_mu_;
+  std::unordered_map<std::string, int> depth_map_;                       // key → chain depth
+  std::unordered_map<std::string, std::vector<std::string>> group_map_;  // base_hash → keys
+
+  // depth_map_ + group_map_ helpers (all acquire depth_mu_ internally)
+  void RecordDepth(const std::string& key, int depth);
+  int GetDepth(const std::string& key) const;  // returns -1 if unknown
+  void RemoveDepthAndGroup(const std::string& key);
+  void RecordGroup(const std::string& key);
+  std::vector<std::string> GetGroup(const std::string& key) const;
+
+  // Strip _k/_v and rank suffixes to recover the SHA256 base hash.
+  // Returns key unchanged if parsing fails (safe fallback).
+  static std::string ExtractBaseHash(const std::string& key);
+
+  // Select a victim from |tier| using the configured eviction policy.
+  // For "prefix_aware_lru": inspect up to eviction_candidate_window candidates,
+  // score by depth, pick the deepest (suffix block). Falls back to plain LRU
+  // if no metadata is available.
+  // Returns empty string if the tier is empty.
+  std::string SelectVictim(TierBackend* tier);
+
+  // -----------------------------------------------------------------------
+  // Existing helpers
+  // -----------------------------------------------------------------------
   TierBackend* FindTierHolding(const std::string& key);
   const TierBackend* FindTierHolding(const std::string& key) const;
   TierBackend* NextSlowerTier(StorageTier current);

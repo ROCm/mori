@@ -56,6 +56,7 @@ class DRAMTier : public TierBackend {
   // Extended interface overrides
   std::vector<char> Read(const std::string& key) override;
   std::string GetLRUKey() const override;
+  std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
 
   // DRAM-specific: zero-copy read returning internal pointer.
   // Only safe for in-process mmap'd memory. Caller must not hold

@@ -41,8 +41,11 @@ struct UMBPConfig {
   std::string ssd_storage_dir = "/tmp/umbp_ssd";
   size_t ssd_capacity_bytes = 32ULL * 1024 * 1024 * 1024;
 
-  // Policy (PoC: only "lru" is implemented; "fifo" reserved for future use)
+  // Policy: "lru" (default) or "prefix_aware_lru"
   std::string eviction_policy = "lru";
+  // Number of LRU-tail candidates inspected when eviction_policy == "prefix_aware_lru".
+  // Must be >= 1; values of 0 are treated as 1.
+  size_t eviction_candidate_window = 16;
   bool auto_promote_on_read = true;
   double dram_high_watermark = 0.9;
   double dram_low_watermark = 0.7;

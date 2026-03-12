@@ -71,6 +71,10 @@ class TierBackend {
   // Default returns "". Override in tiers with LRU tracking.
   virtual std::string GetLRUKey() const;
 
+  // Return up to |max_candidates| keys from the LRU tail (oldest first).
+  // Default delegates to GetLRUKey(); override in tiers with LRU tracking.
+  virtual std::vector<std::string> GetLRUCandidates(size_t max_candidates) const;
+
   // Which StorageTier does this backend represent?
   StorageTier tier_id() const { return tier_id_; }
 

@@ -21,6 +21,9 @@
 // SOFTWARE.
 #include "umbp/block_index/block_index.h"
 
+#include <mutex>
+#include <shared_mutex>
+
 bool BlockIndexClient::MayExist(const std::string& key) const {
   std::shared_lock lock(mu_);
   return index_.count(key) > 0;
