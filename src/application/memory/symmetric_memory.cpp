@@ -116,13 +116,13 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   //   - [different-node peers]: 0
   cpuMemObj->p2pPeerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
   cpuMemObj->p2pPeerPtrs[rank] = reinterpret_cast<uintptr_t>(localPtr);  // Set self pointer
-  
+
   hipIpcMemHandle_t handle;
   HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&handle, localPtr));
   cpuMemObj->ipcMemHandles =
       static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
   bootNet.Allgather(&handle, cpuMemObj->ipcMemHandles, sizeof(hipIpcMemHandle_t));
-  
+
   // Open IPC handles for all same-node peers to establish P2P data path
   // This happens regardless of transport type selection
   for (int i = 0; i < worldSize; i++) {
@@ -132,7 +132,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
                                           cpuMemObj->ipcMemHandles[i],
                                           hipIpcMemLazyEnablePeerAccess));
   }
-  
+
   // Update peerPtrs based on transport type:
   // - For RDMA transport: keep remote VA (already allgathered) in peerPtrs
   // - For P2P/SDMA transport: use P2P pointer from hipIpcOpenMemHandle
@@ -175,7 +175,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   std::vector<int> dstDeviceIds;
   for (int i = 0; i < worldSize; i++) {
     if (context.GetTransportType(i) != TransportType::SDMA) continue;
-    if (i == rank) continue;
+    // if (i == rank) continue;
     dstDeviceIds.push_back(i % 8);  // should be intra devices count
   }
   if (dstDeviceIds.size() != 0) {
@@ -200,6 +200,10 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
                                 sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
     HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->expectSignalsPtr, 0,
                                 sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->fencePtrs,
+                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
+    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->fencePtrs, 0,
+                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
   }
   SymmMemObjPtr result{cpuMemObj, gpuMemObj};
   if (!heap_begin) {
@@ -217,7 +221,7 @@ void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
   if (rdmaDeviceContext) rdmaDeviceContext->DeregisterRdmaMemoryRegion(localPtr);
 
   SymmMemObjPtr memObjPtr = memObjPool.at(localPtr);
-  
+
   // Close IPC handles for peers that had P2P connection
   int rank = bootNet.GetLocalRank();
   int worldSize = bootNet.GetWorldSize();
@@ -234,7 +238,7 @@ void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
       }
     }
   }
-  
+
   free(memObjPtr.cpu->peerPtrs);
   free(memObjPtr.cpu->p2pPeerPtrs);
   free(memObjPtr.cpu->peerRkeys);
@@ -312,6 +316,7 @@ SymmMemObjPtr SymmMemManager::RegisterStaticHeapSubRegion(void* localPtr, size_t
       gpuMemObj->deviceHandles_d = heapObj->gpu->deviceHandles_d;
       gpuMemObj->signalPtrs = heapObj->gpu->signalPtrs;
       gpuMemObj->expectSignalsPtr = heapObj->gpu->expectSignalsPtr;
+      gpuMemObj->fencePtrs = heapObj->gpu->fencePtrs;
     }
   }
 
@@ -405,8 +410,7 @@ size_t SymmMemManager::DetermineVMMChunkSize(size_t userChunkSize, HeapType heap
   allocProp.type =
       (heapType == HeapType::Normal) ? hipMemAllocationTypePinned : hipMemAllocationTypeUncached;
 #elif HIP_VERSION == 70051831
-  if (heapType == HeapType::Uncached &&
-      strcmp(HIP_VERSION_GITHASH, "7c9236b16") != 0) {
+  if (heapType == HeapType::Uncached && strcmp(HIP_VERSION_GITHASH, "7c9236b16") != 0) {
     allocProp.type = static_cast<hipMemAllocationType>(0x40000000);  // hipMemAllocationTypeUncached
   } else {
     allocProp.type = hipMemAllocationTypePinned;
@@ -540,7 +544,7 @@ SymmMemObjPtr SymmMemManager::CreateVMMHeapObject(size_t virtualSize, int worldS
   // Exchange virtual base pointers among all PEs
   cpuHeapObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
   bootNet.Allgather(&vmmVirtualBasePtr, cpuHeapObj->peerPtrs, sizeof(uintptr_t));
-  
+
   // Setup P2P peer pointers (vmmPeerBasePtrs) and update peerPtrs for non-RDMA transports
   cpuHeapObj->p2pPeerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
   for (int pe = 0; pe < worldSize; ++pe) {
@@ -891,8 +895,7 @@ hipMemAllocationProp SymmMemManager::ConfigureAllocationProp(HeapType heapType, 
   allocProp.type =
       (heapType == HeapType::Normal) ? hipMemAllocationTypePinned : hipMemAllocationTypeUncached;
 #elif HIP_VERSION == 70051831
-  if (heapType == HeapType::Uncached &&
-      strcmp(HIP_VERSION_GITHASH, "7c9236b16") != 0) {
+  if (heapType == HeapType::Uncached && strcmp(HIP_VERSION_GITHASH, "7c9236b16") != 0) {
     allocProp.type = static_cast<hipMemAllocationType>(0x40000000);
   } else {
     allocProp.type = hipMemAllocationTypePinned;

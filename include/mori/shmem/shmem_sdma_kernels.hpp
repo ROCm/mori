@@ -42,33 +42,40 @@ template <>
 inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  if (bytes == 0) return;
+  int inNodePe = pe % 8;
   uint8_t* srcPtr =
       reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);
   uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
 
-  anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + pe * dest->sdmaNumQueue;
+  anvil::SdmaQueueDeviceHandle** devicehandles =
+      dest->deviceHandles_d + inNodePe * dest->sdmaNumQueue;
 
-  HSAuint64* signals = dest->signalPtrs + pe * dest->sdmaNumQueue;
-  HSAuint64* expectedSignals = dest->expectSignalsPtr + pe * dest->sdmaNumQueue;
+  HSAuint64* signals = dest->signalPtrs + inNodePe * dest->sdmaNumQueue;
+  HSAuint64* expectedSignals = dest->expectSignalsPtr + inNodePe * dest->sdmaNumQueue;
+  HSAuint64* fencePtrs = dest->fencePtrs + inNodePe * dest->sdmaNumQueue;
 
   core::SdmaPutThread(srcPtr, dstPtr, bytes, devicehandles, signals, expectedSignals,
-                      dest->sdmaNumQueue);
+                      dest->sdmaNumQueue, qpId, fencePtrs);
 }
 
 template <>
 inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  int inNodePe = pe % 8;
   uint8_t* srcPtr =
       reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);
   uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
 
-  anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + pe * dest->sdmaNumQueue;
-  HSAuint64* signals = dest->signalPtrs + pe * dest->sdmaNumQueue;
-  HSAuint64* expectedSignal = dest->expectSignalsPtr + pe * dest->sdmaNumQueue;
+  anvil::SdmaQueueDeviceHandle** devicehandles =
+      dest->deviceHandles_d + inNodePe * dest->sdmaNumQueue;
+  HSAuint64* signals = dest->signalPtrs + inNodePe * dest->sdmaNumQueue;
+  HSAuint64* expectedSignal = dest->expectSignalsPtr + inNodePe * dest->sdmaNumQueue;
+  HSAuint64* fencePtrs = dest->fencePtrs + inNodePe * dest->sdmaNumQueue;
 
   core::SdmaPutWarp(srcPtr, dstPtr, bytes, devicehandles, signals, expectedSignal,
-                    dest->sdmaNumQueue);
+                    dest->sdmaNumQueue, fencePtrs);
 }
 
 template <>
@@ -89,6 +96,7 @@ inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::SDM
 template <>
 inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SDMA>(
     const void* dest, const void* source, size_t bytes, int pe, int qpId) {
+  int inNodePe = pe % 8;
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::SymmMemObj* heapObj = globalGpuStates->heapObj;
 
@@ -99,17 +107,18 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SD
   uint8_t* dstPtr = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[pe] + offset);
 
   anvil::SdmaQueueDeviceHandle** devicehandles =
-      heapObj->deviceHandles_d + pe * heapObj->sdmaNumQueue;
-  HSAuint64* signals = heapObj->signalPtrs + pe * heapObj->sdmaNumQueue;
-  HSAuint64* expectedSignals = heapObj->expectSignalsPtr + pe * heapObj->sdmaNumQueue;
+      heapObj->deviceHandles_d + inNodePe * heapObj->sdmaNumQueue;
+  HSAuint64* signals = heapObj->signalPtrs + inNodePe * heapObj->sdmaNumQueue;
+  HSAuint64* expectedSignals = heapObj->expectSignalsPtr + inNodePe * heapObj->sdmaNumQueue;
 
   core::SdmaPutThread(srcPtr, dstPtr, bytes, devicehandles, signals, expectedSignals,
-                      heapObj->sdmaNumQueue);
+                      heapObj->sdmaNumQueue, qpId);
 }
 
 template <>
 inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::SDMA>(
     const void* dest, const void* source, size_t bytes, int pe, int qpId) {
+  int inNodePe = pe % 8;
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::SymmMemObj* heapObj = globalGpuStates->heapObj;
 
@@ -120,9 +129,9 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::SDMA
   uint8_t* dstPtr = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[pe] + offset);
 
   anvil::SdmaQueueDeviceHandle** devicehandles =
-      heapObj->deviceHandles_d + pe * heapObj->sdmaNumQueue;
-  HSAuint64* signals = heapObj->signalPtrs + pe * heapObj->sdmaNumQueue;
-  HSAuint64* expectedSignals = heapObj->expectSignalsPtr + pe * heapObj->sdmaNumQueue;
+      heapObj->deviceHandles_d + inNodePe * heapObj->sdmaNumQueue;
+  HSAuint64* signals = heapObj->signalPtrs + inNodePe * heapObj->sdmaNumQueue;
+  HSAuint64* expectedSignals = heapObj->expectSignalsPtr + inNodePe * heapObj->sdmaNumQueue;
 
   core::SdmaPutWarp(srcPtr, dstPtr, bytes, devicehandles, signals, expectedSignals,
                     heapObj->sdmaNumQueue);
@@ -142,20 +151,31 @@ inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::SDM
 template <>
 inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe,
-    int qpId) {}
+    int qpId) {
+  return ShmemPutSizeImmNbiThreadKernel<application::TransportType::P2P>(dest, destOffset, val,
+                                                                         bytes, pe, qpId);
+}
 template <>
 inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe,
-    int qpId) {}
+    int qpId) {
+  return ShmemPutSizeImmNbiWarpKernel<application::TransportType::P2P>(dest, destOffset, val, bytes,
+                                                                       pe, qpId);
+}
 
 // Pure address-based PutSizeImmNbi versions
 template <>
 inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::SDMA>(
-    const void* dest, void* val, size_t bytes, int pe, int qpId) {}
+    const void* dest, void* val, size_t bytes, int pe, int qpId) {
+  return ShmemPutSizeImmNbiThreadKernel<application::TransportType::P2P>(dest, val, bytes, pe,
+                                                                         qpId);
+}
 
 template <>
 inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::SDMA>(
-    const void* dest, void* val, size_t bytes, int pe, int qpId) {}
+    const void* dest, void* val, size_t bytes, int pe, int qpId) {
+  return ShmemPutSizeImmNbiWarpKernel<application::TransportType::P2P>(dest, val, bytes, pe, qpId);
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    PutMemNbi with Signal                                       */
@@ -417,18 +437,22 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::SDMA>(
 
 template <application::TransportType>
 inline __device__ void ShmemQuietThreadKernel(int pe, const application::SymmMemObjPtr dest) {
-  anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + pe * dest->sdmaNumQueue;
-  HSAuint64* signals = dest->signalPtrs + pe * dest->sdmaNumQueue;
-  HSAuint64* expectedSignals = dest->expectSignalsPtr + pe * dest->sdmaNumQueue;
+  int inNodePe = pe % 8;
+  anvil::SdmaQueueDeviceHandle** devicehandles =
+      dest->deviceHandles_d + inNodePe * dest->sdmaNumQueue;
+  HSAuint64* signals = dest->signalPtrs + inNodePe * dest->sdmaNumQueue;
+  HSAuint64* expectedSignals = dest->expectSignalsPtr + inNodePe * dest->sdmaNumQueue;
 
   core::SdmaQueitThread(signals, expectedSignals, dest->sdmaNumQueue);
 }
 
 template <application::TransportType>
 inline __device__ void ShmemQuietWarpKernel(int pe, const application::SymmMemObjPtr dest) {
-  anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + pe * dest->sdmaNumQueue;
-  HSAuint64* signals = dest->signalPtrs + pe * dest->sdmaNumQueue;
-  HSAuint64* expectedSignals = dest->expectSignalsPtr + pe * dest->sdmaNumQueue;
+  int inNodePe = pe % 8;
+  anvil::SdmaQueueDeviceHandle** devicehandles =
+      dest->deviceHandles_d + inNodePe * dest->sdmaNumQueue;
+  HSAuint64* signals = dest->signalPtrs + inNodePe * dest->sdmaNumQueue;
+  HSAuint64* expectedSignals = dest->expectSignalsPtr + inNodePe * dest->sdmaNumQueue;
 
   core::SdmaQueitWarp(signals, expectedSignals, dest->sdmaNumQueue);
 }

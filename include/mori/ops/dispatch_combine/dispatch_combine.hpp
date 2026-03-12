@@ -180,13 +180,13 @@ class EpDispatchCombineHandle {
   void LaunchConvertDispatchOutputKernel(const void* dispatchOutX, const void* dispatchOutTopkIdx,
                                          void* packedRecvX, int* packedRecvCount,
                                          int* packedRecvSrcInfo, int64_t* packedRecvLayoutRange,
-                                         int blockNum = -1, int warpPerBlock = -1,
-                                         hipStream_t = 0, int hiddenDim = -1);
+                                         int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0,
+                                         int hiddenDim = -1);
   void LaunchConvertCombineInputKernel(const void* packedRecvX, const void* packedRecvSrcInfo,
                                        const void* packedRecvLayoutRange, void* combineInput,
                                        mori::application::SymmMemObjPtr shmemCombineInpTokMemObj,
-                                       int blockNum = -1, int warpPerBlock = -1,
-                                       hipStream_t = 0, int hiddenDim = -1);
+                                       int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0,
+                                       int hiddenDim = -1);
 #endif
 
   void LaunchDispatchRecv(KernelType, int blockNum = -1, int warpPerBlock = -1, hipStream_t = 0);
@@ -311,6 +311,8 @@ class EpDispatchCombineHandle {
   index_t* interNodeChunkFlagCombine{nullptr};
   // Map dispatched rdma token chunk index
   index_t* interNodeDispSendMap{nullptr};
+  // Whether SDMA transport is enabled (from MORI_ENABLE_SDMA env var)
+  bool enableSDMA{false};
 #ifdef ENABLE_PROFILER
   mori::core::profiler::ProfilerConfig profilerConfig;
 #endif
@@ -364,6 +366,7 @@ struct EpDispatchCombineArgs {
   index_t* interNodeDispDestTokIdMap{nullptr};
   index_t* interNodeChunkFlagCombine{nullptr};
   index_t* interNodeDispSendMap{nullptr};
+  bool enableSDMA{false};
 #ifdef ENABLE_PROFILER
   mori::core::profiler::ProfilerConfig profilerConfig;
 #endif
@@ -440,6 +443,7 @@ EpDispatchCombineArgs<T> GetEpDispatchCombineArgs(const EpDispatchCombineHandle&
   args.interNodeDispDestTokIdMap = handle.interNodeDispDestTokIdMap;
   args.interNodeChunkFlagCombine = handle.interNodeChunkFlagCombine;
   args.interNodeDispSendMap = handle.interNodeDispSendMap;
+  args.enableSDMA = handle.enableSDMA;
 #ifdef ENABLE_PROFILER
   args.profilerConfig = handle.profilerConfig;
 #endif

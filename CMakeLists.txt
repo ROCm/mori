@@ -126,7 +126,8 @@ endif()
 
 add_library(mori_logging INTERFACE)
 target_include_directories(mori_logging INTERFACE include)
-target_include_directories(mori_logging SYSTEM INTERFACE 3rdparty/spdlog/include)
+target_include_directories(mori_logging SYSTEM
+                           INTERFACE 3rdparty/spdlog/include)
 
 if(ENABLE_PROFILER)
   find_package(

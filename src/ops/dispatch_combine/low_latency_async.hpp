@@ -29,16 +29,28 @@ namespace mori {
 namespace moe {
 
 template <typename T>
-__global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args);
+__global__ void EpDispatchLowLatencyAsyncCopy(EpDispatchCombineArgs<T> args);
 
 template <typename T>
-__global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args);
+__global__ void EpDispatchLowLatencyAsyncDataTransfer(EpDispatchCombineArgs<T> args);
+
+template <typename T>
+__global__ void EpDispatchLowLatencyAsyncRecvDataTransfer(EpDispatchCombineArgs<T> args);
+
+template <typename T>
+__global__ void EpDispatchLowLatencyAsyncRecvCopy(EpDispatchCombineArgs<T> args);
 
 template <typename T, bool UseFp8DirectCast = false>
-__global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args);
+__global__ void EpCombineLowLatencyAsyncCopy(EpDispatchCombineArgs<T> args);
 
 template <typename T, bool UseFp8DirectCast = false>
-__global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args);
+__global__ void EpCombineLowLatencyAsyncDataTransfer(EpDispatchCombineArgs<T> args);
+
+template <typename T, bool UseFp8DirectCast = false>
+__global__ void EpCombineLowLatencyAsyncRecvDataTransfer(EpDispatchCombineArgs<T> args);
+
+template <typename T, bool UseFp8DirectCast = false>
+__global__ void EpCombineLowLatencyAsyncRecvCopy(EpDispatchCombineArgs<T> args);
 
 }  // namespace moe
 }  // namespace mori

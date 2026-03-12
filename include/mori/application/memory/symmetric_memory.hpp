@@ -76,6 +76,7 @@ struct SymmMemObj {
   HSAuint64* signalPtrs = nullptr;                           // should only placed on GPU
   uint32_t sdmaNumQueue = 8;                                 // number of sdma queue
   HSAuint64* expectSignalsPtr = nullptr;                     // should only placed on GPU
+  HSAuint64* fencePtrs = nullptr;  // FENCE completion addresses, should only placed on GPU
 
   __device__ __host__ RdmaMemoryRegion GetRdmaMemoryRegion(int pe) const {
     RdmaMemoryRegion mr;
