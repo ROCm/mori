@@ -46,15 +46,6 @@ if(BUILD_OPS_DEVICE)
     list(APPEND _extra_defs "-DENABLE_STANDARD_MOE_ADAPT")
   endif()
 
-  # MPI include dirs for hipcc genco (headers include mpi.h)
-  find_package(MPI QUIET)
-  set(_mpi_includes "")
-  if(MPI_CXX_INCLUDE_DIRS)
-    foreach(_d ${MPI_CXX_INCLUDE_DIRS})
-      list(APPEND _mpi_includes "-I${_d}")
-    endforeach()
-  endif()
-
   # Kernel sources
   set(_kernel_sources
     ep_intranode.hip
@@ -75,12 +66,14 @@ if(BUILD_OPS_DEVICE)
     set(_hsaco_output "${_hsaco_dir}/${_kname}.hsaco")
     set(_ksrc_path "${CMAKE_SOURCE_DIR}/src/ops/kernels/${_ksrc}")
 
+    #set(XFLAGS "-O0" "-g" "-ggdb")
+    set(XFLAGS "-O2")
     add_custom_command(
       OUTPUT ${_hsaco_output}
       COMMAND ${HIPCC_EXECUTABLE}
         --genco
         "--offload-arch=${GPU_TARGETS}"
-        -std=c++17 -O2
+        -std=c++17 ${XFLAGS}
         -D__HIP_PLATFORM_AMD__
         -DHIP_ENABLE_WARP_SYNC_BUILTINS
         ${_nic_defs}
