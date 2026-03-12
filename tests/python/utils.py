@@ -73,16 +73,6 @@ def data_type_supported(dtype):
     return True
 
 
-def fp4_x2_to_fp32(tensor):
-    """将 float4_e2m1fn_x2 打包张量转为 float32，用于测试中打印/比对。"""
-    if not hasattr(torch, "float4_e2m1fn_x2") or tensor.dtype != torch.float4_e2m1fn_x2:
-        return tensor
-    try:
-        return tensor.float()
-    except Exception:
-        return tensor
-
-
 class TorchDistContext:
     def __init__(
         self,
