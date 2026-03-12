@@ -147,24 +147,8 @@ bool AllgatherSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
     async_start_time_ = MPI_Wtime();
 
     try {
-        // Step 1: Copy input data to input transit buffer
-        printf("PE %d: Starting async AllGATHER (PUT phase)\n", myPe_);
-        //copy_input_to_transit(input, total_count, stream);
+        //printf("PE %d: Starting async AllGATHER (PUT phase)\n", myPe_);
 
-        // Step 2: Reset flags
-        //resetFlags();
-
-        // Step 3: Execute Allgather kernel (PUT operation)
-        printf("PE %d: Launching async PUT kernel...\n", myPe_);
-
-        int block_size = 256;
-        int grid_size = (total_count * npes_ + block_size - 1) / block_size;
-        if (grid_size < 1) grid_size = 1;
-        if (grid_size > 65535) grid_size = 65535;
-
-        printf("  Grid size: %d, Block size: %d\n", grid_size, block_size);
-
-        // Launch the kernel - this runs asynchronously
         OneShotAllGatherSdmaAsyncPutKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
             input,
@@ -174,12 +158,12 @@ bool AllgatherSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
 
         hipError_t kernel_err = hipGetLastError();
         if (kernel_err != hipSuccess) {
-            printf("PE %d: Async kernel launch failed: %s\n",
-                   myPe_, hipGetErrorString(kernel_err));
+            fprintf(stderr, "PE %d: Async kernel launch failed: %s\n",
+                    myPe_, hipGetErrorString(kernel_err));
             throw std::runtime_error("Kernel launch failed");
         }
 
-        printf("PE %d: Async PUT operation started successfully\n", myPe_);
+        //printf("PE %d: Async PUT operation started successfully\n", myPe_);
         return true;
 
     } catch (const std::exception& e) {
@@ -197,52 +181,38 @@ double AllgatherSdma<T>::wait_async(hipStream_t stream) {
     }
 
     try {
-        printf("PE %d: Waiting for async Allgather completion (WAIT phase)\n", myPe_);
+        //printf("PE %d: Waiting for async Allgather completion (WAIT phase)\n", myPe_);
 
-        // Use provided stream or the one from start_async
         hipStream_t wait_stream = (stream != nullptr) ? stream : async_stream_;
 
-        OneShotAllGatherSdmaAsyncWaitKernel<<<1, 64, 0, wait_stream>>>(myPe_, npes_, output_transit_buffer_obj_, flagsObj_);
+        // Wait kernel + copy are on the same stream — single sync at the end
+        OneShotAllGatherSdmaAsyncWaitKernel<<<1, 64, 0, wait_stream>>>(myPe_, npes_, output_transit_buffer_obj_);
 
-        // Step 1: Synchronize to ensure PUT kernel is completed
-        printf("PE %d: Synchronizing to ensure PUT kernel completion\n", myPe_);
+        if (copy_output_to_user_) {
+            copy_output_to_user(async_output_, async_total_count_, wait_stream);
+        }
 
+        // Single synchronization
         if (wait_stream != nullptr) {
             hipError_t err = hipStreamSynchronize(wait_stream);
             if (err != hipSuccess) {
-                printf("PE %d: Stream synchronization failed: %s\n",
-                      myPe_, hipGetErrorString(err));
+                fprintf(stderr, "PE %d: Stream synchronization failed: %s\n",
+                        myPe_, hipGetErrorString(err));
                 throw std::runtime_error("Stream synchronization failed");
             }
         } else {
             hipError_t err = hipDeviceSynchronize();
             if (err != hipSuccess) {
-                printf("PE %d: Device synchronization failed: %s\n",
-                      myPe_, hipGetErrorString(err));
+                fprintf(stderr, "PE %d: Device synchronization failed: %s\n",
+                        myPe_, hipGetErrorString(err));
                 throw std::runtime_error("Device synchronization failed");
             }
         }
 
-        // Step 2: Copy from output transit buffer to user output buffer (if enabled)
-        if (copy_output_to_user_) {
-            printf("PE %d: Copying results to user output buffer\n", myPe_);
-            copy_output_to_user(async_output_, async_total_count_, wait_stream);
-        } else {
-            printf("PE %d: Skipping copy to user output buffer (using output_transit_buffer directly)\n", myPe_);
-        }
-
-        // Final synchronization
-        if (wait_stream != nullptr) {
-            (void)hipStreamSynchronize(wait_stream);
-        } else {
-            (void)hipDeviceSynchronize();
-        }
-
-        // Calculate total execution time
         double end_time = MPI_Wtime();
         double duration = end_time - async_start_time_;
 
-        printf("PE %d: Async Allgather completed in %.6f seconds\n", myPe_, duration);
+        //printf("PE %d: Async Allgather completed in %.6f seconds\n", myPe_, duration);
 
         // Reset async state
         async_in_progress_ = false;
@@ -413,7 +383,6 @@ bool AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
     }
 
     try {
-        // Step 1: Execute Allgather kernel
         OneShotAllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
             input,
@@ -428,8 +397,6 @@ bool AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
             return false;
         }
 
-        // Step 2: Copy from output transit buffer to user output buffer (if enabled)
-        // Note: Synchronization is handled by caller
         if (copy_output_to_user_) {
             copy_output_to_user(output, total_count, stream);
         }

@@ -203,33 +203,27 @@ __global__ void SdmaReduceScatterKernel(
 
       anvil::SdmaQueueDeviceHandle** dh =
           dstMemObj->deviceHandles_d + destPe * dstMemObj->sdmaNumQueue;
-      HSAuint64* sig  = dstMemObj->signalPtrs
-                        + destPe * dstMemObj->sdmaNumQueue;
-      HSAuint64* esig = dstMemObj->expectSignalsPtr
-                        + destPe * dstMemObj->sdmaNumQueue;
+      // Remote signal: ATOMIC writes directly to destPe's signal memory
+      // at slot [myPe * numQueues + qId], so destPe can detect completion locally
+      HSAuint64* remoteSignal = dstMemObj->peerSignalPtrs[destPe]
+                                + static_cast<size_t>(myPe) * dstMemObj->sdmaNumQueue;
 
       core::SdmaPutThread(srcPtr, remoteDst, chunkBytes,
-                          dh, sig, esig, dstMemObj->sdmaNumQueue, 0);
-    }
-
-    // Notify remote PEs that our data has landed
-    if (warpId < npes && laneId == 0) {
-      int destPe = warpId;
-      shmem::ShmemQuietThread(destPe, dstMemObj);
-      shmem::ShmemAtomicSizeNonFetchThread(
-          flagsMemObj,
-          static_cast<size_t>(myPe) * sizeof(uint64_t),
-          &flag_val, 8, core::atomicType::AMO_SET, destPe);
+                          dh, remoteSignal, dstMemObj->sdmaNumQueue, 0);
     }
     __syncthreads();
 
     // === Phase 2: Wait for all peers' scatter ================================
+    // Each sender wrote to our local signalPtrs[sender * numQueues + qId] via remote signal.
+    // Wait for signal at queue 0 for each sender.
     for (int sender = 0; sender < npes; ++sender) {
       if (sender == myPe) continue;
       if (threadIdx.x == 0) {
+        HSAuint64* mySignal = dstMemObj->signalPtrs
+                              + static_cast<size_t>(sender) * dstMemObj->sdmaNumQueue;
         int spin = 0;
         bool warned = false;
-        while (core::AtomicLoadRelaxed(flags + sender) < flag_val) {
+        while (core::AtomicLoadRelaxed(mySignal) < flag_val) {
           if (++spin > 100000000 && !warned) {
             printf("PE %d: SdmaScatter timeout waiting for peer %d\n",
                    myPe, sender);
@@ -364,32 +358,25 @@ __global__ void AllGatherSdmaKernel(int myPe, int npes,
 
     anvil::SdmaQueueDeviceHandle** devicehandles =
         dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
-    HSAuint64* signals         = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
-    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
-    core::SdmaPutThread(agSrcPtr, agDstPtr, agSendBytes,
-                        devicehandles, signals, expectedSignals,
-                        dest->sdmaNumQueue, 0);
-  }
+    HSAuint64* remoteSignal = dest->peerSignalPtrs[remotePe]
+                              + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
 
-  // --- Notify remote PEs that our data is in place ---------------------------
-  if (warpId < npes && laneId == 0) {
-    int remotePe = warpId;
-    shmem::ShmemQuietThread(remotePe, dstMemObj);
-    shmem::ShmemAtomicSizeNonFetchThread(
-        flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t),
-        &flag_val, 8, core::atomicType::AMO_SET, remotePe);
+    core::SdmaPutThread(agSrcPtr, agDstPtr, agSendBytes,
+                        devicehandles, remoteSignal,
+                        dest->sdmaNumQueue, 0);
   }
   __syncthreads();
 
   // --- Wait for all peers to finish AllGather --------------------------------
+  // Remote PEs wrote to our local signalPtrs[sender * numQueues + 0]
   for (int sender = 0; sender < npes; ++sender) {
-    if (sender == myPe) {
-      continue;
-    }
+    if (sender == myPe) continue;
     if (threadLinearId == 0) {
+      HSAuint64* mySignal = dstMemObj->signalPtrs
+                            + static_cast<size_t>(sender) * dstMemObj->sdmaNumQueue;
       int spinCount = 0;
       bool warned = false;
-      while (core::AtomicLoadRelaxed(flags + sender) < flag_val) {
+      while (core::AtomicLoadRelaxed(mySignal) < flag_val) {
         ++spinCount;
         if (spinCount > 10000000 && !warned) {
           printf("PE %d: AllGather timeout waiting for peer %d\n", myPe, sender);

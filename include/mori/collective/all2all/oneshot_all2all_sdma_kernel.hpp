@@ -47,7 +47,7 @@ __global__ void OneShotAll2allSdmaKernel(int myPe, int npes,
     T* __restrict__ stageData = reinterpret_cast<T*>(outputTransitMemObj->localPtr);
     
     uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
-    int flag_val = 1;
+    //int flag_val = 1; // replaced by dynamic expected count
 
     const size_t threadLinearId =
         static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
@@ -78,45 +78,29 @@ __global__ void OneShotAll2allSdmaKernel(int myPe, int npes,
         uint8_t* srcPtr = reinterpret_cast<uint8_t *>(inputData) + srcByteOffset;
         uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[targetPe] + destByteOffset);
         anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + targetPe*dest->sdmaNumQueue;
-        HSAuint64* signals = dest->signalPtrs + targetPe*dest->sdmaNumQueue;
-        HSAuint64* expectedSignals = dest->expectSignalsPtr + targetPe*dest->sdmaNumQueue;
-        core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals, dest->sdmaNumQueue, qId);
+        HSAuint64* remoteSignal = dest->peerSignalPtrs[targetPe]
+                                  + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
+        core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, remoteSignal, dest->sdmaNumQueue, qId);
     }
 
-    // Synchronization and flag setting
-    if (threadLinearId < npes) {
-        int targetPe = threadLinearId;
-        shmem::ShmemQuietThread(targetPe, outputTransitMemObj);
-        if (threadLinearId < npes) {
-          //flags[threadLinearId] = 0;
-        }
-        __syncthreads();
-        shmem::ShmemAtomicSizeNonFetchThread(flagsMemObj, 
-                                             static_cast<size_t>(myPe) * sizeof(uint64_t),
-                                             &flag_val, 8, core::atomicType::AMO_ADD, targetPe);        
-    }
-    
     __syncthreads();
     for (int sender = 0; sender < npes; ++sender) {
-        if (sender == myPe) {
-            continue;
-        }
-
+        if (sender == myPe) continue;
         if (threadLinearId == 0) {
+            HSAuint64* mySignal = outputTransitMemObj->signalPtrs
+                                  + static_cast<size_t>(sender) * outputTransitMemObj->sdmaNumQueue;
+            HSAuint64 expected = outputTransitMemObj->expectSignalsPtr[sender * outputTransitMemObj->sdmaNumQueue] + 1;
             int spinCount = 0;
-            while (core::AtomicLoadRelaxed(flags + sender) == 0) {
+            while (core::AtomicLoadRelaxed(mySignal) < expected) {
                 ++spinCount;
                 if (spinCount > 10000000) {
                     printf("Kernel[PE %d]: Timeout waiting for data from peer %d\n", myPe, sender);
                     break;
                 }
             }
+            outputTransitMemObj->expectSignalsPtr[sender * outputTransitMemObj->sdmaNumQueue] = expected;
         }
         __syncthreads();
-    }
-
-    if (threadLinearId < npes) {
-        flags[threadLinearId] = 0;
     }
 
     #if 0
