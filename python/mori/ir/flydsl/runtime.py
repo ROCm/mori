@@ -44,6 +44,28 @@ def install_hook() -> None:
 
     def _hook(hip_module: int) -> None:
         import mori.shmem as ms
+
         ms.shmem_module_init(hip_module)
 
     sc._shmem_post_compile_hook = _hook
+
+
+def install_jit_hook() -> None:
+    """Install FlyDSL JIT module-load hook for mori shmem.
+
+    When called, registers a callback in libfly_jit_runtime.so so that
+    every GPU module loaded by flyc.jit automatically gets its
+    ``globalGpuStates`` initialized via ``shmem_module_init``.
+
+    Call once before any shmem kernel launch via ``flyc.jit``::
+
+        from mori.ir.flydsl.runtime import install_jit_hook
+        install_jit_hook()
+
+    Note: If using ``@flyc.jit`` with ``ExternFunction`` that declares
+    ``mori_shmem_*`` symbols, the hook is installed automatically.
+    This function provides an explicit entry point for manual control.
+    """
+    from flydsl.compiler.jit_executor import _ensure_shmem_hook
+
+    _ensure_shmem_hook()

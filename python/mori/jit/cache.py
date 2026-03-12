@@ -34,12 +34,21 @@ def _hash_tree(paths: list[Path]) -> str:
     return h.hexdigest()[:12]
 
 
-def get_cache_dir(arch: str, source_paths: list[Path], nic: str = "mlx5") -> Path:
+def get_cache_dir(
+    arch: str, source_paths: list[Path], nic: str = "mlx5", *, cov: int | None = None
+) -> Path:
     """Return the cache directory for a specific arch + NIC + content combo.
 
-    Structure: ``<cache_root>/<arch>_<nic>/<content_hash>/``
+    Structure: ``<cache_root>/<arch>_<nic>[_cov<N>]/<content_hash>/``
+
+    Args:
+        cov: AMDGPU code object version. When specified, the version is
+             included in the directory name to separate bitcode compiled
+             with different ABI versions (e.g. cov5 for Triton, cov6 for
+             FlyDSL).  ``None`` omits the suffix for backward compatibility.
     """
     content_hash = _hash_tree(source_paths)
-    d = get_cache_root() / f"{arch}_{nic}" / content_hash
+    dir_name = f"{arch}_{nic}" if cov is None else f"{arch}_{nic}_cov{cov}"
+    d = get_cache_root() / dir_name / content_hash
     d.mkdir(parents=True, exist_ok=True)
     return d

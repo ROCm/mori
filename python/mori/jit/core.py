@@ -73,6 +73,8 @@ def _hipcc_device_bc(
     source: Path,
     include_dirs: list[Path],
     output: Path,
+    *,
+    cov: int = 5,
 ) -> None:
     """Compile a single source file to device-only bitcode."""
     cmd = [
@@ -82,7 +84,7 @@ def _hipcc_device_bc(
         "-emit-llvm",
         f"--offload-arch={cfg.arch}",
         "-fgpu-rdc",
-        "-mcode-object-version=5",
+        f"-mcode-object-version={cov}",
         "-std=c++17",
         "-O2",
         "-D__HIP_PLATFORM_AMD__",
@@ -161,7 +163,9 @@ def _collect_include_dirs(mori_root: Path) -> list[Path]:
     return dirs
 
 
-def _build_bitcode(cfg: BuildConfig, mori_root: Path, output: Path) -> None:
+def _build_bitcode(
+    cfg: BuildConfig, mori_root: Path, output: Path, *, cov: int = 5
+) -> None:
     """Full bitcode build pipeline: compile → link → strip → verify."""
     include_dirs = _collect_include_dirs(mori_root)
     wrapper_src = mori_root / "src" / "shmem" / "shmem_device_api_wrapper.cpp"
@@ -180,14 +184,14 @@ def _build_bitcode(cfg: BuildConfig, mori_root: Path, output: Path) -> None:
 
         nic = detect_nic_type()
         print(
-            f"[mori-jit] Compiling shmem device bitcode for {cfg.arch} (nic={nic}) ..."
+            f"[mori-jit] Compiling shmem device bitcode for {cfg.arch} (nic={nic}, cov={cov}) ..."
         )
 
         wrapper_bc = tmp_dir / "wrapper.bc"
-        _hipcc_device_bc(cfg, wrapper_src, include_dirs, wrapper_bc)
+        _hipcc_device_bc(cfg, wrapper_src, include_dirs, wrapper_bc, cov=cov)
 
         shim_bc = tmp_dir / "shim.bc"
-        _hipcc_device_bc(cfg, shim_src, include_dirs, shim_bc)
+        _hipcc_device_bc(cfg, shim_src, include_dirs, shim_bc, cov=cov)
 
         linked_bc = tmp_dir / "linked.bc"
         _llvm_link(cfg, [wrapper_bc, shim_bc], linked_bc)
@@ -341,8 +345,11 @@ def compile_genco(kernel_name: str) -> str | list[str]:
     return str(hsaco_path)
 
 
-def ensure_bitcode() -> str:
+def ensure_bitcode(*, cov: int = 5) -> str:
     """Ensure the shmem device bitcode is compiled and cached. Returns the path.
+
+    Args:
+        cov: AMDGPU code object version (5 for Triton, 6 for FlyDSL).
 
     Thread/process safe: uses a file-based lock to prevent concurrent builds.
     """
@@ -361,7 +368,7 @@ def ensure_bitcode() -> str:
         mori_root / "include" / "mori" / "shmem",
         mori_root / "include" / "mori" / "core",
     ]
-    cache_dir = get_cache_dir(cfg.arch, source_paths, nic)
+    cache_dir = get_cache_dir(cfg.arch, source_paths, nic, cov=cov)
     bc_path = cache_dir / _BC_FILENAME
 
     if bc_path.is_file():
@@ -371,6 +378,6 @@ def ensure_bitcode() -> str:
     with FileBaton(lock_path, wait_for=str(bc_path)) as baton:
         if baton.skipped or bc_path.is_file():
             return str(bc_path)
-        _build_bitcode(cfg, mori_root, bc_path)
+        _build_bitcode(cfg, mori_root, bc_path, cov=cov)
 
     return str(bc_path)
