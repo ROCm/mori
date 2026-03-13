@@ -41,7 +41,8 @@ __global__ void packet_rate_kernel(void* srcBuf, void* dstBuf, size_t copy_size,
    {
       if (laneId == 0)
       {
-         base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR));
+         uint64_t offset = 0;
+         base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR), offset);
          pendingWptr = base;
          if (c == 0)
          {
@@ -50,7 +51,7 @@ __global__ void packet_rate_kernel(void* srcBuf, void* dstBuf, size_t copy_size,
 
          auto packet = anvil::CreateCopyPacket(srcPtr, dstPtr, copy_size);
 
-         handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet, pendingWptr);
+         handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet, pendingWptr, offset);
          srcPtr += copy_size;
          dstPtr += copy_size;
       }
@@ -58,11 +59,12 @@ __global__ void packet_rate_kernel(void* srcBuf, void* dstBuf, size_t copy_size,
 
    if (laneId == 0)
    {
-      base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC));
+      uint64_t offset = 0;
+      base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), offset);
 
       pendingWptr = base;
       auto packet = anvil::CreateAtomicIncPacket(signal);
-      handle.template placePacket<SDMA_PKT_ATOMIC>(packet, pendingWptr);
+      handle.template placePacket<SDMA_PKT_ATOMIC>(packet, pendingWptr, offset);
    }
 
    if (laneId == 0)
