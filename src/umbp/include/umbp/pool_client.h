@@ -9,7 +9,7 @@
 #include <vector>
 
 #include "mori/io/engine.hpp"
-#include "umbp/client.h"
+#include "umbp/master_client.h"
 #include "umbp/peer_service.h"
 #include "umbp/types.h"
 

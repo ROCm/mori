@@ -138,7 +138,7 @@ add_library(
   src/router.cpp
   src/peer_service.cpp
   src/pool_client.cpp
-  src/client.cpp
+  src/master_client.cpp
   src/master_server.cpp)
 
 target_include_directories(

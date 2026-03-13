@@ -24,7 +24,7 @@
 #include <csignal>
 #include <thread>
 
-#include "umbp/client.h"
+#include "umbp/master_client.h"
 
 static volatile std::sig_atomic_t g_running = 1;
 
