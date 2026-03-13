@@ -46,14 +46,14 @@ __global__ void ShmemPutQuietKernel(
 }
 
 // Test 3: Remote signal PUT (bypass ShmemQuiet, write directly to remote signal)
-// Uses dstObj for both addressing (peerPtrs, deviceHandles) and signal
 __global__ void RemoteSignalPutKernel(
+    const SymmMemObjPtr srcObj,
     const SymmMemObjPtr dstObj,
     int myPe, int destPe,
     size_t bytes) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
-  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(dstObj->localPtr);
+  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(srcObj->localPtr);
   uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dstObj->peerPtrs[destPe]);
 
   anvil::SdmaQueueDeviceHandle** dh = dstObj->deviceHandles_d + destPe * dstObj->sdmaNumQueue;
@@ -204,7 +204,7 @@ void runTests() {
     CHECK_HIP(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
 
-    RemoteSignalPutKernel<<<1, 1, 0, stream>>>(dstMemObj, myPe, remotePe, 4096);
+    RemoteSignalPutKernel<<<1, 1, 0, stream>>>(srcMemObj, dstMemObj, myPe, remotePe, 4096);
     CHECK_HIP(hipStreamSynchronize(stream));
     MPI_Barrier(MPI_COMM_WORLD);
 
@@ -230,7 +230,7 @@ void runTests() {
   {
     MPI_Barrier(MPI_COMM_WORLD);
 
-    RemoteSignalPutKernel<<<1, 1, 0, stream>>>(dstMemObj, myPe, remotePe, 0);
+    RemoteSignalPutKernel<<<1, 1, 0, stream>>>(srcMemObj, dstMemObj, myPe, remotePe, 0);
     CHECK_HIP(hipStreamSynchronize(stream));
     MPI_Barrier(MPI_COMM_WORLD);
 
