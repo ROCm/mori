@@ -4,8 +4,10 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "mori/io/engine.hpp"
@@ -45,8 +47,13 @@ class PoolClient {
   bool Init();
   void Shutdown();
 
-  bool Put(const std::string& key, const void* src, size_t size);
-  bool Get(const std::string& key, void* dst, size_t size);
+  bool RegisterMemory(void* ptr, size_t size);
+  void DeregisterMemory(void* ptr);
+
+  bool Put(const std::string& key, const void* src, size_t size,
+           bool zero_copy = true);
+  bool Get(const std::string& key, void* dst, size_t size,
+           bool zero_copy = true);
   bool Remove(const std::string& key);
 
   MasterClient& Master();
@@ -86,13 +93,26 @@ class PoolClient {
       const std::vector<uint8_t>& dram_memory_desc_bytes);
 
   bool RemoteDramWrite(PeerConnection& peer, const void* src, size_t size,
-                       uint64_t offset);
+                       uint64_t offset, bool zero_copy);
   bool RemoteDramRead(PeerConnection& peer, void* dst, size_t size,
-                      uint64_t offset);
+                      uint64_t offset, bool zero_copy);
   bool RemoteSsdWrite(PeerConnection& peer, const std::string& key,
-                      const void* src, size_t size);
+                      const void* src, size_t size, bool zero_copy);
   bool RemoteSsdRead(PeerConnection& peer, const std::string& key,
-                     const std::string& location_id, void* dst, size_t size);
+                     const std::string& location_id, void* dst, size_t size,
+                     bool zero_copy);
+
+  // Zero-copy registered memory regions
+  struct RegisteredRegion {
+    void* base;
+    size_t size;
+    mori::io::MemoryDesc mem_desc;
+  };
+  std::mutex registered_mem_mutex_;
+  std::vector<RegisteredRegion> registered_regions_;
+
+  std::optional<std::pair<mori::io::MemoryDesc, size_t>>
+  FindRegisteredMemory(const void* ptr, size_t size);
 
   std::mutex cache_mutex_;
   std::unordered_map<std::string, Location> location_cache_;
