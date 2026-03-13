@@ -38,6 +38,15 @@ __global__ void ShmemPutQuietKernel(
     size_t bytes) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
+  if (threadIdx.x == 0 && bytes > 0) {
+    printf("PE %d->%d: localPtr=%p peerPtrs[%d]=%p dh=%p sig=%p bytes=%zu\n",
+           myPe, destPe,
+           memObj->localPtr,
+           destPe, (void*)memObj->peerPtrs[destPe],
+           (void*)(memObj->deviceHandles_d + destPe * memObj->sdmaNumQueue),
+           (void*)(memObj->signalPtrs + destPe * memObj->sdmaNumQueue),
+           bytes);
+  }
   ShmemPutMemNbiThreadKernel<TransportType::SDMA>(memObj, 0, memObj, 0, bytes, destPe, 0);
   ShmemQuietThread(destPe, memObj);
 }
