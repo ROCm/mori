@@ -146,9 +146,6 @@ Error MoriDispatchImpl(
   auto warp_per_block = GetAttr<int32_t>(attrs, "warp_per_block");
   auto has_scales = GetAttr<int32_t>(attrs, "has_scales");
   
-  XPUT("MoriDispatch rank: %d, input=%d stream: %p",
-      h->config.rank, (int)input.size_bytes(), stream);
-
   const int hiddenDim = static_cast<int>(input.dimensions()[1]);
   assert(hiddenDim > 0 && hiddenDim <= h->config.hiddenDim);
   
@@ -169,6 +166,9 @@ Error MoriDispatchImpl(
       ByteWidth(scales.element_type()) == h->config.scaleTypeSize);
     scalesPtr = static_cast< uint8_t *>(scales.untyped_data());
   }
+  XPUT("MoriDispatch rank: %d, input=%d hiddenDim=%d weights=%p scales=%p",
+    h->config.rank, (int)input.size_bytes(), hiddenDim, 
+        weightsPtr, scalesPtr);
 
   mori::moe::LaunchDispatch(*h, input.untyped_data(), weightsPtr, 
       scalesPtr, topk_ids.typed_data(), input.dimensions()[0], 
@@ -192,6 +192,7 @@ Error MoriDispatchImpl(
   GpuCopy(out_indices->untyped_data(), h->shmemOutIndicesMemObj->Get(), 
         out_indices->size_bytes(), stream);
 
+  XPUT("ZZtotal_recv_token_num: %d", *h->totalRecvTokenNum);
   GpuCopy(total_recv_token_num->untyped_data(), h->totalRecvTokenNum, 
         sizeof(index_t), stream);
 
@@ -390,20 +391,30 @@ XLA_FFI_DEFINE_HANDLER(
 namespace mori {
 
 void RegisterXLAFFIOps(py::module_& m) {
-// #define OO(X) def(#X, &EpDispatchCombineConfig::X)
-//       .OO(MaxNumTokensToSendPerRank)
-//       .OO(MaxNumTokensToSend)
-//       .OO(MaxNumTokensToRecvPerRank)
-//       .OO(MaxNumTokensToRecv);
-// #undef OO
-  m.def("mori_ep_type_id",
-        []() { return py::capsule(reinterpret_cast<void*>(&EpDispatchCombineState::id)); });
+  m.def("mori_ep_type_info", []() {
+    // In earlier versions of XLA:FFI, the `MakeTypeInfo` helper was not
+    // available. In latest XLF:FFI `TypeInfo` is an alias for C API struct.
+    static auto kStateTypeInfo = 
+#if XLA_FFI_API_MINOR >= 2
+          MakeTypeInfo<EpDispatchCombineState>();
+#else
+          TypeInfo<EpDispatchCombineState>();
+#endif
+    py::dict d;
+    d["type_id"] = py::capsule(reinterpret_cast<void*>(&EpDispatchCombineState::id));
+    d["type_info"] = py::capsule(reinterpret_cast<void*>(&kStateTypeInfo));
+    return d;
+  });
+
   m.def("mori_ep_handler", []() {
     py::dict d;
     d["instantiate"] =
         py::capsule(reinterpret_cast<void*>(EpDispatchCombineInstHandler));
     d["execute"] = py::capsule(reinterpret_cast<void*>(EpDispatchCombineHandler));
     return d;
+  });
+  m.def("preload_kernels", []() {
+    mori::moe::KernelRegistry::Instance().AutoLoad();
   });
 //   m.def("get_cur_rank_num_token", &EpDispatchCombineHandle::GetCurRankNumToken);
 }

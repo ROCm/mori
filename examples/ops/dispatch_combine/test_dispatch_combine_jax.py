@@ -27,18 +27,18 @@ def init_distributed():
 
 class EpDispatchCombineTestCase:
     def __init__(self, rank, world_size, dtype=jnp.bfloat16):
+        self.dtype = dtype
         self.jax_scale_dtype = jnp.float8_e4m3fnuz
         self.rank = rank
         self.world_size = world_size
         
-        self.config = mori.ops.EpDispatchCombineConfig(
-            data_type=dtype,
+        self.config = mori.cpp.EpDispatchCombineConfig(
             rank=self.rank,
             world_size=self.world_size,
             hidden_dim=7168,
             #hidden_dim=434,
-            scale_dim=32,
-            #scale_dim=0,
+            # scale_dim=32,
+            scale_dim=0,
             scale_type_size=jnp.dtype(self.jax_scale_dtype).itemsize,
             max_token_type_size=jnp.dtype(jnp.float32).itemsize,
             max_num_inp_token_per_rank=4096,
@@ -46,37 +46,33 @@ class EpDispatchCombineTestCase:
             num_experts_per_rank=32,
             #num_experts_per_rank=5,
             num_experts_per_token=56, # must be < warp_size
+            warp_num_per_block=1,
+            block_num=1,
             use_external_inp_buf=True, # we need extra copy for external buf
-            kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode,
-            gpu_per_node=1,
+            kernel_type=mori.cpp.EpDispatchCombineKernelType.IntraNode,
+            gpu_per_node=8,
+            rdma_block_num=1,
+            num_qp_per_pe=1,
+            quant_type=mori.cpp.EpDispatchCombineQuantType.None_,
         )
         
     def setup(self):
         # self.rng.manual_seed(int(time.time()) + self.rank)
                 # simple rng keyed by time + rank to vary per rank
         # seed = int(time.time()) + self.rank
-        mori.ops.mori_shmem_init_attr(self.rank, self.world_size)
+        mori.jax.shmem_init_attr(self.rank, self.world_size)
         
         def set_seed():
           return jax.random.PRNGKey(777 + self.rank)
         self.rng = jax.jit(set_seed)()
 
     def cleanup(self):
+        jax.clear_caches() # this is needed since EpDispatchCombineState can be
+                           # destroyed later on
+        gc.collect()
         mori.shmem.shmem_finalize()
         
-    def allgather_padded_emu(self, inp: jnp.ndarray, max_token_num: int):
-        shape = list(inp.shape)
-        pad_len = max_token_num - shape[0]
-        if pad_len > 0:
-            pad_shape = [pad_len] + shape[1:]
-            padded = jnp.concatenate([inp, jnp.zeros(pad_shape, dtype=inp.dtype)], axis=0)
-        else:
-            padded = inp
-
-        tiled = jnp.tile(padded, (self.world_size, 1))
-        print(f"-- pad shape: {padded.shape} --> {tiled.shape}")
-        return tiled
-    
+  
     def gen_test_data(self, num_tokens):
         max_tokens = self.config.max_num_inp_token_per_rank
 
@@ -111,7 +107,7 @@ class EpDispatchCombineTestCase:
 
         # input: [num_tokens, hidden_dim] - this 
         input_fp32 = jax.random.normal(self.rng, (num_tokens, self.config.hidden_dim), dtype=jnp.float32)
-        input_list = all_gather(input_fp32).astype(self.config.data_type)
+        input_list = all_gather(input_fp32).astype(self.dtype)
         
         print(f"num_tokens {num_tokens}  hidden: {self.config.hidden_dim} indices: {indices.shape}/{indices.dtype}")
         print(f"weights: {weights.shape}/{weights.dtype}")
@@ -119,7 +115,7 @@ class EpDispatchCombineTestCase:
 
         return (indices, weights,
             scales_fp32.astype(self.jax_scale_dtype),
-            input_fp32.astype(self.config.data_type),
+            input_fp32.astype(self.dtype),
             indices_list,
             weights_list,
             scales_list,
@@ -131,36 +127,41 @@ class EpDispatchCombineTestCase:
 
         @jax.jit
         def ffi_calls(inputs, weights, scales, indices):
-            (dispatch_output, 
-            dispatch_weights, 
-            dispatch_scales, 
-            dispatch_indices, 
-            num) = op.dispatch(
+            pack = op.dispatch(
                 inputs, weights, scales, indices, 
-                block_num=80, warp_per_block=16,
-                has_scales=True, has_weights=True)
+                block_num=80, rdma_block_num=16, warp_per_block=16)
+            (dispatch_output, 
+            dispatch_indices, 
+            num,
+            dispatch_weights) = pack
+            dispatch_scales = None
             src_token_pos = op.get_dispatch_src_token_pos(num)
-        
+
             (combine_output, 
-            combine_weights) = op.combine(
-                dispatch_output.astype(self.config.data_type), 
-                dispatch_weights, indices,
-                has_weights=True,
-                block_num=80, warp_per_block=8,
-                call_reset=False)
+             combine_weights) = (None, None)
+            # (combine_output, 
+            # combine_weights) = op.combine(
+            #     dispatch_output.astype(self.dtype), 
+            #     dispatch_weights, indices,
+            #     has_weights=True,
+            #     block_num=80, warp_per_block=8,
+            #     call_reset=False)
             
             return (dispatch_output, 
-                    dispatch_weights, 
-                    dispatch_scales, 
                     dispatch_indices, 
-                    num), src_token_pos, combine_output, combine_weights
+                    num,
+                    dispatch_weights, 
+                    dispatch_scales), src_token_pos, combine_output, combine_weights
 
             
         (dispatch_output, 
-            dispatch_weights, 
-            dispatch_scales, 
             dispatch_indices, 
-            dispatch_recv_num_token), src_token_pos, combine_output, combine_weights = ffi_calls(inputs, weights, scales, indices)
+            dispatch_recv_num_token,
+            dispatch_weights, 
+            dispatch_scales), src_token_pos, combine_output, combine_weights = ffi_calls(inputs, weights, scales, indices)
+
+        print(f"src_token_pos: {src_token_pos} {src_token_pos.shape}")
+        print(f"dispatch_recv_num_token: {dispatch_recv_num_token}")
 
         # num_tokens = [1..max_num_inp_tokens_per_rank]
         # indices [num_tokes x num_experts_per_token]
@@ -202,6 +203,7 @@ class EpDispatchCombineTestCase:
           x = x & ~jnp.any(eq_adjacent & valid)
           return x
       
+        print(f"src_num_recv_token_pos size: {src_num_recv_token_pos.size} vs dispatch_recv_num_token {dispatch_recv_num_token}")
         assert src_num_recv_token_pos.size == int(dispatch_recv_num_token)
         
         # Validate dispatch outputs against gathered inputs
@@ -210,8 +212,8 @@ class EpDispatchCombineTestCase:
                     (scales_list, dispatch_scales if self.config.scale_dim != 0 else None),
                     (indices_list, dispatch_indices))
         assert res, f"{self.rank} validate_dispatch failed!"
+        
         # print(f"input_list {input_list.shape} ss {ss.shape} at {src_token_pos.shape} vs {vv.shape}")
-
         print(f"{self.rank} dispatch tokens ok", flush=True)
         
         @jax.jit
@@ -235,7 +237,7 @@ class EpDispatchCombineTestCase:
             pes_sorted = jnp.sort(pes, axis=-1)
             unique_pes = 1 + jnp.sum(pes_sorted[:, 1:] != pes_sorted[:, :-1], axis=-1)
             
-            Xinputs = inputs.astype(self.config.data_type) * unique_pes[:, None]
+            Xinputs = inputs.astype(self.dtype) * unique_pes[:, None]
             Xweights = weights * unique_pes[:, None]
 
             # Pad `inputs/weights/indices` up to `max_tokens` so the validation is shape-stable.
@@ -271,7 +273,7 @@ class EpDispatchCombineTestCase:
         # print(f"combine_output: {combine_output} / expected {expected_output}")
 
     def test_dispatch_combine(self):
-        op = mori.ops.EpDispatchCombineOp(self.config)
+        op = mori.jax.EpDispatchCombineOp(self.config)
         random.seed(333 + self.rank)
         max_tokens = self.config.max_num_inp_token_per_rank
         num_tokens = int(random.randint(1, max_tokens + 1))

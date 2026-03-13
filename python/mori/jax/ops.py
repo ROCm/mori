@@ -47,16 +47,11 @@ def shmem_init_attr(rank, world_size, sync_name="mori/unique_id",
   else:
     unique_id = client.blocking_key_value_get_bytes(
       sync_name, timeout_ms)
-  
-  #print(f"{rank} unique ID initattr {unique_id}", flush=True)
+
   shmem.shmem_init_attr(shmem.MORI_SHMEM_INIT_WITH_UNIQUEID,
                    rank, world_size, unique_id)
-  print(f"{rank} unique ID initattr OK", flush=True)
-  
-  
-# class EpDispatchCombineKernelType(cpp.EpDispatchCombineKernelType):
-#   def __str__(self):
-#     return self.name
+  # print(f"{rank} unique ID initattr OK", flush=True)
+  cpp.preload_kernels()
 
 class EpDispatchCombineOp:
   def __init__(self, config : cpp.EpDispatchCombineConfig):
@@ -111,8 +106,10 @@ class EpDispatchCombineOp:
     call_reset: bool = False,
   ):
     n_tokens = self.config.max_num_inp_token_per_rank
+    print(f"combine n_tokens {n_tokens}", flush=True)
+    
     output = jax.ffi.ffi_call(
-      "launch_combine", (
+      "mori_ep", (
         # out
         jax.ShapeDtypeStruct((n_tokens, self.config.hidden_dim), input.dtype),
         # out_weights
@@ -136,18 +133,19 @@ class EpDispatchCombineOp:
 
   def get_dispatch_src_token_pos(self, total_recv_token_num):
     if self.config.kernel_type.value in (
-      EpDispatchCombineKernelType.IntraNode.value,
-      EpDispatchCombineKernelType.InterNodeV1.value,
-      EpDispatchCombineKernelType.InterNodeV1LL.value,
+      cpp.EpDispatchCombineKernelType.IntraNode.value,
+      cpp.EpDispatchCombineKernelType.InterNodeV1.value,
+      cpp.EpDispatchCombineKernelType.InterNodeV1LL.value,
     ):
       # here we need to allocate enough space to accomodate handle->totalRecvTokenNum[0] items
-      n_tokens = self.config.MaxNumTokensToRecv()
+      n_tokens = self.config.max_num_inp_token_per_rank
       return jax.ffi.ffi_call(
-            "get_dispatch_src_token_id", (
+            "mori_ep", (
             jax.ShapeDtypeStruct((n_tokens,), jnp.int32)),
         )(
             total_recv_token_num, 
-            handle_ptr=np.int64(self.handle_.ptr()),
+            ep_config=np.asarray(self.config.to_packed_array(), dtype=np.int32),
+            get_src_token_id=True,
          )
   
     raise NotImplementedError

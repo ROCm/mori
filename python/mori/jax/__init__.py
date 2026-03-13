@@ -22,10 +22,14 @@
 
 try:
   import jax  # noqa: F401
-  from mori.cpp import mori_ep_handler, mori_ep_type_id
+  from mori.cpp import mori_ep_handler, mori_ep_type_info, preload_kernels
   from .ops import *
   
   jax.ffi.register_ffi_target("mori_ep", mori_ep_handler(), platform="ROCM")
-  jax.ffi.register_ffi_type_id("mori_ep", mori_ep_type_id(), platform="ROCM")
-except ImportError:
+  # note this used to work for jax-0.7.1
+  # jax.ffi.register_ffi_type_id("mori_ep", mori_ep_type_id(), platform="ROCM")
+  jax.ffi.register_ffi_type("mori_ep", mori_ep_type_info(), platform="ROCM")
+  
+except ImportError as e:
+  #print(f"Error importing mori.jax: {e}")
   pass

@@ -19,11 +19,16 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-from .dispatch_combine import (
+
+try:
+  import torch  # noqa: F401
+  from .dispatch_combine import (
     EpDispatchCombineKernelType,
     EpDispatchCombineConfig,
     EpDispatchCombineOp,
-)
-from .ops import (
+  )
+  from .ops import (
     cast,
-)
+  )
+except ImportError:
+    pass
