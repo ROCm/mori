@@ -159,7 +159,13 @@ void runTests() {
       CHECK_HIP(hipMemcpy(hostBuf.data(), buf, bytes, hipMemcpyDeviceToHost));
       uint8_t expected = static_cast<uint8_t>(senderPe + 1);
       for (size_t i = 0; i < bytes; i++) {
-        if (hostBuf[i] != expected) { ok = false; break; }
+        if (hostBuf[i] != expected) {
+          if (myPe == 0)
+            printf("    PE %d: mismatch at [%zu]: expected 0x%02x got 0x%02x (myPe+1=0x%02x)\n",
+                   myPe, i, expected, hostBuf[i], (uint8_t)(myPe + 1));
+          ok = false;
+          break;
+        }
       }
     }
 
