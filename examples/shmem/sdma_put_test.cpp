@@ -195,7 +195,35 @@ void runTests() {
   if (myPe == 0) printf("\n--- Zero-size PUT ---\n");
   runShmemTest("Zero-size PUT (0 bytes)", 0);
 
-  // --- Test 3: Remote signal PUT ---
+  // --- Test 3: Repeated PUTs (must run before remote signal tests which desync counters) ---
+  if (myPe == 0) printf("\n--- Repeated PUTs ---\n");
+  {
+    CHECK_HIP(hipMemset(srcBuf, myPe + 1, maxBuf));
+    CHECK_HIP(hipDeviceSynchronize());
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    const int repeatCount = 10;
+    for (int i = 0; i < repeatCount; i++) {
+      ShmemPutQuietKernel<<<1, 1, 0, stream>>>(srcMemObj, dstMemObj, myPe, remotePe, 4096);
+      CHECK_HIP(hipStreamSynchronize(stream));
+      MPI_Barrier(MPI_COMM_WORLD);
+    }
+
+    bool ok = true;
+    std::vector<uint8_t> hostBuf(4096);
+    CHECK_HIP(hipMemcpy(hostBuf.data(), dstBuf, 4096, hipMemcpyDeviceToHost));
+    uint8_t expected = static_cast<uint8_t>(senderPe + 1);
+    for (size_t i = 0; i < 4096; i++) {
+      if (hostBuf[i] != expected) { ok = false; break; }
+    }
+
+    int lok = ok ? 1 : 0, gok = 0;
+    MPI_Allreduce(&lok, &gok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    if (myPe == 0) report("Repeated PUT x10 (4KB)", gok == 1);
+    MPI_Barrier(MPI_COMM_WORLD);
+  }
+
+  // --- Test 4: Remote signal PUT ---
   // Note: Remote signal test uses dstMemObj for both src and dst (same buffer pattern).
   // Since dstBuf was never CU-written, L2 is clean for receiving.
   if (myPe == 0) printf("\n--- Remote signal PUT ---\n");
@@ -241,34 +269,6 @@ void runTests() {
     int lok = 1, gok = 0;
     MPI_Allreduce(&lok, &gok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     if (myPe == 0) report("Remote signal zero-size PUT", gok == 1);
-    MPI_Barrier(MPI_COMM_WORLD);
-  }
-
-  // --- Test 4: Repeated PUTs ---
-  if (myPe == 0) printf("\n--- Repeated PUTs ---\n");
-  {
-    CHECK_HIP(hipMemset(srcBuf, myPe + 1, maxBuf));
-    CHECK_HIP(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    const int repeatCount = 2;
-    for (int i = 0; i < repeatCount; i++) {
-      ShmemPutQuietKernel<<<1, 1, 0, stream>>>(srcMemObj, dstMemObj, myPe, remotePe, 4096);
-      CHECK_HIP(hipStreamSynchronize(stream));
-      MPI_Barrier(MPI_COMM_WORLD);
-    }
-
-    bool ok = true;
-    std::vector<uint8_t> hostBuf(4096);
-    CHECK_HIP(hipMemcpy(hostBuf.data(), dstBuf, 4096, hipMemcpyDeviceToHost));
-    uint8_t expected = static_cast<uint8_t>(senderPe + 1);
-    for (size_t i = 0; i < 4096; i++) {
-      if (hostBuf[i] != expected) { ok = false; break; }
-    }
-
-    int lok = ok ? 1 : 0, gok = 0;
-    MPI_Allreduce(&lok, &gok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-    if (myPe == 0) report("Repeated PUT x10 (4KB)", gok == 1);
     MPI_Barrier(MPI_COMM_WORLD);
   }
 
