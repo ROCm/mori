@@ -146,6 +146,17 @@ int main(int argc, char** argv) {
                node_id, is_provider ? "PROVIDER" : "CONSUMER", tier_info,
                io_host.empty() ? "(none)" : io_host, io_port, peer_port);
 
+  // Register a data buffer for zero-copy RDMA
+  constexpr size_t kDataBufSize = 4096;
+  auto data_buffer = std::make_unique<char[]>(kDataBufSize);
+  bool zero_copy_enabled = false;
+  if (io_port > 0) {
+    zero_copy_enabled = client.RegisterMemory(data_buffer.get(), kDataBufSize);
+    if (zero_copy_enabled) {
+      spdlog::info("[Demo] Zero-copy buffer registered ({} bytes)", kDataBufSize);
+    }
+  }
+
   if (!is_provider) {
     spdlog::info("[Demo] Consumer mode: waiting 3s for providers to register...");
     if (!SleepInterruptible(std::chrono::seconds(3))) { client.Shutdown(); return 0; }
@@ -159,21 +170,23 @@ int main(int argc, char** argv) {
     const std::string key = node_id + "-blk-" + std::to_string(iteration);
     const std::string data = "data-from-" + node_id + "-iter-" + std::to_string(iteration);
 
-    // Put
-    bool put_ok = client.Put(key, data.data(), data.size());
+    // Put (zero-copy when buffer is registered)
+    std::memcpy(data_buffer.get(), data.data(), data.size());
+    bool put_ok = client.Put(key, data_buffer.get(), data.size(), zero_copy_enabled);
     if (!put_ok) {
       spdlog::warn("[Demo] #{} Put({}) FAILED", iteration, key);
       ++fail;
       if (!SleepInterruptible(std::chrono::seconds(3))) break;
       continue;
     }
-    spdlog::info("[Demo] #{} Put({}, {} bytes) OK", iteration, key, data.size());
+    spdlog::info("[Demo] #{} Put({}, {} bytes) OK (zero_copy={})", iteration,
+                 key, data.size(), zero_copy_enabled);
 
     if (!SleepInterruptible(std::chrono::seconds(1))) break;
 
-    // Get
-    std::vector<char> buf(data.size());
-    bool get_ok = client.Get(key, buf.data(), buf.size());
+    // Get (zero-copy when buffer is registered)
+    std::memset(data_buffer.get(), 0, data.size());
+    bool get_ok = client.Get(key, data_buffer.get(), data.size(), zero_copy_enabled);
     if (!get_ok) {
       spdlog::warn("[Demo] #{} Get({}) FAILED", iteration, key);
       ++fail;
@@ -181,9 +194,10 @@ int main(int argc, char** argv) {
       continue;
     }
 
-    std::string got(buf.begin(), buf.end());
+    std::string got(data_buffer.get(), data_buffer.get() + data.size());
     if (got == data) {
-      spdlog::info("[Demo] #{} Get({}) OK - data verified", iteration, key);
+      spdlog::info("[Demo] #{} Get({}) OK - data verified (zero_copy={})",
+                   iteration, key, zero_copy_enabled);
       ++pass;
     } else {
       spdlog::error("[Demo] #{} Get({}) DATA MISMATCH: expected='{}' got='{}'",
@@ -201,6 +215,9 @@ int main(int argc, char** argv) {
     if (!SleepInterruptible(std::chrono::seconds(3))) break;
   }
 
+  if (zero_copy_enabled) {
+    client.DeregisterMemory(data_buffer.get());
+  }
   client.Shutdown();
   spdlog::info("[Demo] Finished. {} passed, {} failed out of {} iterations",
                pass, fail, iteration);

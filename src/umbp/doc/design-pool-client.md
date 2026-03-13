@@ -515,12 +515,7 @@ Get(key, dst, size):
 Local paths require no RDMA or PeerService — just memcpy or PosixFile I/O.
 The following sections detail the remote paths with full sequence diagrams.
 
-> **Zero-copy optimization (post-POC)**: The current design does a
-> `memcpy(staging, src, size)` before RDMA write because the caller's source pointer
-> may not be in RDMA-registered memory. If the caller can guarantee the pointer is
-> registered, the staging copy can be skipped. POC prioritizes simplicity and
-> correctness; a `PutFromRegisteredMemory` fast path can be added later.
-> Same applies to Get.
+> **Zero-copy mode**: Implemented. See Section 8.8.
 
 ### 8.3 Put — Remote DRAM (2 RPCs + 1 RDMA)
 
@@ -751,6 +746,65 @@ establishes the IO Engine connection:
 Since the Master carries `engine_desc` and `dram_memory_desc` in RoutePut/RouteGet
 responses, the common path (DRAM) does not require calling `PeerService::GetPeerInfo`.
 `GetPeerInfo` is available as a fallback or for SSD-specific information.
+
+---
+
+### 8.8 Zero-copy Mode
+
+The remote path uses a staging buffer by default (`memcpy` → RDMA), introducing an
+extra copy. Zero-copy mode allows callers to pre-register memory so RDMA operates
+directly on the registered buffer, skipping the staging copy.
+
+#### Interface
+
+```cpp
+bool RegisterMemory(void* ptr, size_t size);
+void DeregisterMemory(void* ptr);
+
+bool Put(const std::string& key, const void* src, size_t size, bool zero_copy = true);
+bool Get(const std::string& key, void* dst, size_t size, bool zero_copy = true);
+```
+
+#### Behavior
+
+| `zero_copy` | Pointer registered | Behavior |
+|-------------|-------------------|----------|
+| `true` | Yes | Direct RDMA from registered memory, no `staging_mutex_` |
+| `true` | No | Log warning, fallback to staging path |
+| `false` | Don't care | Always use staging path |
+
+Local paths (local DRAM/SSD) are unaffected — they operate on the pointer directly.
+
+#### Internal Implementation
+
+```cpp
+struct RegisteredRegion {
+    void* base;
+    size_t size;
+    mori::io::MemoryDesc mem_desc;
+};
+std::mutex registered_mem_mutex_;
+std::vector<RegisteredRegion> registered_regions_;
+
+std::optional<std::pair<mori::io::MemoryDesc, size_t>>
+FindRegisteredMemory(const void* ptr, size_t size);
+```
+
+`RegisterMemory` calls `IOEngine::RegisterMemory` and stores the result.
+`FindRegisteredMemory` checks if `ptr` falls within any registered region,
+supporting sub-range matching within a larger registered buffer.
+
+#### Concurrency Benefit
+
+The zero-copy path does not hold `staging_mutex_`, allowing multiple concurrent
+RDMA transfers without staging buffer serialization.
+
+#### Future: Shared Memory Registration
+
+Currently `RegisterMemory` is tied to the PoolClient's internal IOEngine. To share
+one registered buffer across multiple PoolClients (e.g., multi-TP-rank on the same
+host), add `ImportMemory(ptr, size, MemoryDesc)` that accepts an externally registered
+`MemoryDesc`. Minimal change required.
 
 ---
 

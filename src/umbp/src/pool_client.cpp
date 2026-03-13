@@ -131,6 +131,13 @@ void PoolClient::Shutdown() {
   }
 
   if (io_engine_) {
+    {
+      std::lock_guard<std::mutex> lock(registered_mem_mutex_);
+      for (auto& reg : registered_regions_) {
+        io_engine_->DeregisterMemory(reg.mem_desc);
+      }
+      registered_regions_.clear();
+    }
     if (staging_buffer_) {
       io_engine_->DeregisterMemory(staging_mem_);
     }
@@ -147,7 +154,45 @@ void PoolClient::Shutdown() {
   location_cache_.clear();
 }
 
-bool PoolClient::Put(const std::string& key, const void* src, size_t size) {
+bool PoolClient::RegisterMemory(void* ptr, size_t size) {
+  if (!io_engine_) {
+    spdlog::error("[PoolClient] RegisterMemory: IOEngine not available");
+    return false;
+  }
+  auto mem_desc = io_engine_->RegisterMemory(
+      ptr, size, -1, mori::io::MemoryLocationType::CPU);
+  std::lock_guard<std::mutex> lock(registered_mem_mutex_);
+  registered_regions_.push_back({ptr, size, mem_desc});
+  spdlog::info("[PoolClient] RegisterMemory: ptr={}, size={}", ptr, size);
+  return true;
+}
+
+void PoolClient::DeregisterMemory(void* ptr) {
+  std::lock_guard<std::mutex> lock(registered_mem_mutex_);
+  auto it = std::find_if(
+      registered_regions_.begin(), registered_regions_.end(),
+      [ptr](const RegisteredRegion& r) { return r.base == ptr; });
+  if (it != registered_regions_.end()) {
+    if (io_engine_) io_engine_->DeregisterMemory(it->mem_desc);
+    registered_regions_.erase(it);
+  }
+}
+
+std::optional<std::pair<mori::io::MemoryDesc, size_t>>
+PoolClient::FindRegisteredMemory(const void* ptr, size_t size) {
+  auto addr = reinterpret_cast<uintptr_t>(ptr);
+  std::lock_guard<std::mutex> lock(registered_mem_mutex_);
+  for (auto& reg : registered_regions_) {
+    auto base = reinterpret_cast<uintptr_t>(reg.base);
+    if (addr >= base && addr + size <= base + reg.size) {
+      return std::pair{reg.mem_desc, static_cast<size_t>(addr - base)};
+    }
+  }
+  return std::nullopt;
+}
+
+bool PoolClient::Put(const std::string& key, const void* src, size_t size,
+                     bool zero_copy) {
   if (!initialized_) {
     spdlog::error("[PoolClient] Not initialized");
     return false;
@@ -183,13 +228,13 @@ bool PoolClient::Put(const std::string& key, const void* src, size_t size) {
     auto& peer = GetOrConnectPeer(result->node_id, result->peer_address,
                                   result->engine_desc_bytes,
                                   result->dram_memory_desc_bytes);
-    ok = RemoteDramWrite(peer, src, size, result->allocated_offset);
+    ok = RemoteDramWrite(peer, src, size, result->allocated_offset, zero_copy);
     location.location_id = std::to_string(result->allocated_offset);
   } else if (!is_local && result->tier == TierType::SSD) {
     auto& peer = GetOrConnectPeer(result->node_id, result->peer_address,
                                   result->engine_desc_bytes,
                                   result->dram_memory_desc_bytes);
-    ok = RemoteSsdWrite(peer, key, src, size);
+    ok = RemoteSsdWrite(peer, key, src, size, zero_copy);
     location.location_id = key + ".bin";
   } else {
     spdlog::error("[PoolClient] Unsupported Put path: node={}, tier={}",
@@ -213,7 +258,8 @@ bool PoolClient::Put(const std::string& key, const void* src, size_t size) {
   return true;
 }
 
-bool PoolClient::Get(const std::string& key, void* dst, size_t size) {
+bool PoolClient::Get(const std::string& key, void* dst, size_t size,
+                     bool zero_copy) {
   if (!initialized_) {
     spdlog::error("[PoolClient] Not initialized");
     return false;
@@ -243,12 +289,12 @@ bool PoolClient::Get(const std::string& key, void* dst, size_t size) {
                                   result->engine_desc_bytes,
                                   result->dram_memory_desc_bytes);
     uint64_t offset = std::stoull(loc.location_id);
-    return RemoteDramRead(peer, dst, size, offset);
+    return RemoteDramRead(peer, dst, size, offset, zero_copy);
   } else if (!is_local && loc.tier == TierType::SSD) {
     auto& peer = GetOrConnectPeer(loc.node_id, result->peer_address,
                                   result->engine_desc_bytes,
                                   result->dram_memory_desc_bytes);
-    return RemoteSsdRead(peer, key, loc.location_id, dst, size);
+    return RemoteSsdRead(peer, key, loc.location_id, dst, size, zero_copy);
   } else {
     spdlog::error("[PoolClient] Unsupported Get path: node={}, tier={}",
                   loc.node_id, TierTypeName(loc.tier));
@@ -444,8 +490,28 @@ PoolClient::PeerConnection& PoolClient::GetOrConnectPeer(
 // ---------------------------------------------------------------------------
 
 bool PoolClient::RemoteDramWrite(PeerConnection& peer, const void* src,
-                                 size_t size, uint64_t offset) {
+                                 size_t size, uint64_t offset,
+                                 bool zero_copy) {
   if (!io_engine_) return false;
+
+  if (zero_copy) {
+    auto reg = FindRegisteredMemory(src, size);
+    if (reg) {
+      auto uid = io_engine_->AllocateTransferUniqueId();
+      mori::io::TransferStatus status;
+      io_engine_->Write(reg->first, reg->second, peer.dram_memory, offset,
+                        size, &status, uid);
+      status.Wait();
+      if (!status.Succeeded()) {
+        spdlog::error("[PoolClient] RemoteDramWrite (zero-copy) failed: {}",
+                      status.Message());
+        return false;
+      }
+      return true;
+    }
+    spdlog::warn("[PoolClient] zero_copy=true but pointer not registered, "
+                 "falling back to staging");
+  }
 
   std::lock_guard<std::mutex> lock(staging_mutex_);
   std::memcpy(staging_buffer_.get(), src, size);
@@ -463,8 +529,27 @@ bool PoolClient::RemoteDramWrite(PeerConnection& peer, const void* src,
 }
 
 bool PoolClient::RemoteDramRead(PeerConnection& peer, void* dst, size_t size,
-                                uint64_t offset) {
+                                uint64_t offset, bool zero_copy) {
   if (!io_engine_) return false;
+
+  if (zero_copy) {
+    auto reg = FindRegisteredMemory(dst, size);
+    if (reg) {
+      auto uid = io_engine_->AllocateTransferUniqueId();
+      mori::io::TransferStatus status;
+      io_engine_->Read(reg->first, reg->second, peer.dram_memory, offset, size,
+                       &status, uid);
+      status.Wait();
+      if (!status.Succeeded()) {
+        spdlog::error("[PoolClient] RemoteDramRead (zero-copy) failed: {}",
+                      status.Message());
+        return false;
+      }
+      return true;
+    }
+    spdlog::warn("[PoolClient] zero_copy=true but pointer not registered, "
+                 "falling back to staging");
+  }
 
   std::lock_guard<std::mutex> lock(staging_mutex_);
 
@@ -487,25 +572,50 @@ bool PoolClient::RemoteDramRead(PeerConnection& peer, void* dst, size_t size,
 // ---------------------------------------------------------------------------
 
 bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key,
-                                const void* src, size_t size) {
+                                const void* src, size_t size,
+                                bool zero_copy) {
   if (!io_engine_) return false;
 
   std::lock_guard<std::mutex> ssd_lock(peer.ssd_op_mutex);
 
   // Phase 1: RDMA write data into remote staging area
   {
-    std::lock_guard<std::mutex> lock(staging_mutex_);
-    std::memcpy(staging_buffer_.get(), src, size);
+    bool used_zero_copy = false;
+    if (zero_copy) {
+      auto reg = FindRegisteredMemory(src, size);
+      if (reg) {
+        auto uid = io_engine_->AllocateTransferUniqueId();
+        mori::io::TransferStatus status;
+        io_engine_->Write(reg->first, reg->second, peer.dram_memory,
+                          peer.staging_base_offset, size, &status, uid);
+        status.Wait();
+        if (!status.Succeeded()) {
+          spdlog::error(
+              "[PoolClient] RemoteSsdWrite RDMA phase (zero-copy) failed: {}",
+              status.Message());
+          return false;
+        }
+        used_zero_copy = true;
+      } else {
+        spdlog::warn("[PoolClient] zero_copy=true but pointer not registered, "
+                     "falling back to staging");
+      }
+    }
 
-    auto uid = io_engine_->AllocateTransferUniqueId();
-    mori::io::TransferStatus status;
-    io_engine_->Write(staging_mem_, 0, peer.dram_memory,
-                      peer.staging_base_offset, size, &status, uid);
-    status.Wait();
-    if (!status.Succeeded()) {
-      spdlog::error("[PoolClient] RemoteSsdWrite RDMA phase failed: {}",
-                    status.Message());
-      return false;
+    if (!used_zero_copy) {
+      std::lock_guard<std::mutex> lock(staging_mutex_);
+      std::memcpy(staging_buffer_.get(), src, size);
+
+      auto uid = io_engine_->AllocateTransferUniqueId();
+      mori::io::TransferStatus status;
+      io_engine_->Write(staging_mem_, 0, peer.dram_memory,
+                        peer.staging_base_offset, size, &status, uid);
+      status.Wait();
+      if (!status.Succeeded()) {
+        spdlog::error("[PoolClient] RemoteSsdWrite RDMA phase failed: {}",
+                      status.Message());
+        return false;
+      }
     }
   }
 
@@ -544,12 +654,12 @@ bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key,
 
 bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
                                const std::string& location_id, void* dst,
-                               size_t size) {
+                               size_t size, bool zero_copy) {
   if (!io_engine_) return false;
 
   std::lock_guard<std::mutex> ssd_lock(peer.ssd_op_mutex);
 
-  // Phase 1: Ask PeerService to load SSD data into staging
+  // Phase 1: Ask PeerService to load SSD data into staging (unaffected by zero_copy)
   if (!peer.peer_stub) {
     auto channel = grpc::CreateChannel(peer.peer_address,
                                        grpc::InsecureChannelCredentials());
@@ -579,6 +689,26 @@ bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
   }
 
   // Phase 2: RDMA read from remote staging area
+  if (zero_copy) {
+    auto reg = FindRegisteredMemory(dst, size);
+    if (reg) {
+      auto uid = io_engine_->AllocateTransferUniqueId();
+      mori::io::TransferStatus status;
+      io_engine_->Read(reg->first, reg->second, peer.dram_memory,
+                       resp.staging_offset(), size, &status, uid);
+      status.Wait();
+      if (!status.Succeeded()) {
+        spdlog::error(
+            "[PoolClient] RemoteSsdRead RDMA phase (zero-copy) failed: {}",
+            status.Message());
+        return false;
+      }
+      return true;
+    }
+    spdlog::warn("[PoolClient] zero_copy=true but pointer not registered, "
+                 "falling back to staging");
+  }
+
   {
     std::lock_guard<std::mutex> lock(staging_mutex_);
 
