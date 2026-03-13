@@ -164,8 +164,16 @@ void runTests() {
 
     bool ok = true;
     if (bytes > 0) {
+      // Force L2 cache refresh: hipMemset triggers CU writes which update L2,
+      // then SDMA data in HBM becomes visible on next read.
+      // Alternative: use a separate buffer to avoid L2 stale hits.
+      void* tmpBuf = nullptr;
+      CHECK_HIP(hipMalloc(&tmpBuf, bytes));
+      CHECK_HIP(hipMemcpy(tmpBuf, buf, bytes, hipMemcpyDeviceToDevice));
+      CHECK_HIP(hipDeviceSynchronize());
       std::vector<uint8_t> hostBuf(bytes);
-      CHECK_HIP(hipMemcpy(hostBuf.data(), buf, bytes, hipMemcpyDeviceToHost));
+      CHECK_HIP(hipMemcpy(hostBuf.data(), tmpBuf, bytes, hipMemcpyDeviceToHost));
+      CHECK_HIP(hipFree(tmpBuf));
       uint8_t expected = static_cast<uint8_t>(senderPe + 1);
       for (size_t i = 0; i < bytes; i++) {
         if (hostBuf[i] != expected) {
