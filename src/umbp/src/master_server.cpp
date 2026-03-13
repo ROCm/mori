@@ -217,27 +217,20 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       return grpc::Status::OK;
     }
 
-    auto alloc_result =
-        registry_.AllocateForPut(result->node_id, result->tier, request->block_size());
-    if (!alloc_result) {
-      response->set_found(false);
-      return grpc::Status::OK;
-    }
-
     response->set_found(true);
     response->set_node_id(result->node_id);
     response->set_node_address(result->node_address);
     response->set_tier(static_cast<::umbp::TierType>(result->tier));
-    response->set_peer_address(alloc_result->peer_address);
-    response->set_engine_desc(alloc_result->engine_desc_bytes.data(),
-                              alloc_result->engine_desc_bytes.size());
-    response->set_dram_memory_desc(alloc_result->dram_memory_desc_bytes.data(),
-                                   alloc_result->dram_memory_desc_bytes.size());
-    response->set_allocated_offset(alloc_result->allocated_offset);
+    response->set_peer_address(result->peer_address);
+    response->set_engine_desc(result->engine_desc_bytes.data(),
+                              result->engine_desc_bytes.size());
+    response->set_dram_memory_desc(result->dram_memory_desc_bytes.data(),
+                                   result->dram_memory_desc_bytes.size());
+    response->set_allocated_offset(result->allocated_offset);
 
     spdlog::info("[Master] RoutePut key='{}': target_node={}, tier={}, offset={}",
                  request->key(), result->node_id, TierTypeName(result->tier),
-                 alloc_result->allocated_offset);
+                 result->allocated_offset);
     return grpc::Status::OK;
   }
 

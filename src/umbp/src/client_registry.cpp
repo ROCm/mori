@@ -222,6 +222,8 @@ std::optional<AllocateResult> ClientRegistry::AllocateForPut(const std::string& 
     return std::nullopt;
   }
 
+  it->second.tier_capacities[tier].available_bytes = alloc_it->second.AvailableBytes();
+
   AllocateResult result;
   result.peer_address = it->second.peer_address;
   result.engine_desc_bytes = it->second.engine_desc_bytes;
@@ -244,6 +246,8 @@ void ClientRegistry::DeallocateForUnregister(const std::string& node_id, TierTyp
   }
 
   alloc_it->second.Deallocate(offset, size);
+
+  it->second.tier_capacities[tier].available_bytes = alloc_it->second.AvailableBytes();
 }
 
 std::optional<ClientIOInfo> ClientRegistry::GetClientIOInfo(const std::string& node_id) const {
