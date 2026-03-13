@@ -41,11 +41,11 @@ using namespace mori::core;
 using namespace mori::shmem;
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                                  EpDispatchLowLatencyAsyncSend                                 */
+/*                               EpDispatchLowLatencyAsyncSendCopy                                */
 /* ---------------------------------------------------------------------------------------------- */
 
 template <typename T>
-__device__ void EpDispatchLowLatencyAsyncSend_body(EpDispatchCombineArgs<T> args) {
+__device__ void EpDispatchLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
        i += globalWarpNum) {
@@ -99,12 +99,17 @@ __device__ void EpDispatchLowLatencyAsyncSend_body(EpDispatchCombineArgs<T> args
           srcTokId + config.rank * config.maxNumInpTokenPerRank;
     }
   }
-  if (laneId == 0) atomicAdd(args.dispatchGridBarrier, 1);
+}
 
-  uint64_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint64_t*>();
+/* ---------------------------------------------------------------------------------------------- */
+/*                             EpDispatchLowLatencyAsyncSendTransfer                              */
+/* ---------------------------------------------------------------------------------------------- */
+
+template <typename T>
+__device__ void EpDispatchLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
-      if (laneId == 0) shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, globalWarpNum);
       int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
       int tokenChunkNum = core::CeilDiv(tokenNum, config.numQpPerPe);
       int thisChunkTokenNum = std::min(tokenChunkNum, tokenNum - qpId * tokenChunkNum);
@@ -122,129 +127,156 @@ __device__ void EpDispatchLowLatencyAsyncSend_body(EpDispatchCombineArgs<T> args
       //     static_cast<uint64_t>(tokenNum + 1), core::AMO_ADD, destPe, qpId);
     }
   }
+
   if (globalThdId == 0) args.totalRecvTokenNum[0] = 0;
 }
 
-template <typename T>
-__global__ void EpDispatchLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
-  EpDispatchLowLatencyAsyncSend_body<T>(args);
-}
-
 /* ---------------------------------------------------------------------------------------------- */
-/*                                  EpDispatchLowLatencyAsyncRecv                                 */
+/*                             EpDispatchLowLatencyAsyncRecvTransfer                              */
 /* ---------------------------------------------------------------------------------------------- */
 
 template <typename T>
-__device__ void EpDispatchLowLatencyAsyncRecv_body(EpDispatchCombineArgs<T> args) {
+__device__ void EpDispatchLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
 
-  int blocksPerPe = blockNum / npes;
-  int destPe = blockId / blocksPerPe;
-
-  // TODO(ditian12): index value is wrong when signal completion at send phase, hence we signal at
-  // recv phase as a workaround at the cost of extra latency, we should still investigate the reason
-  if ((blockId % blocksPerPe) == 0) {
+  for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       if (laneId == 0) {
         shmem::ShmemQuietThread(destPe, qpId);
         int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
-        // TODO(ditian12): send atomic op right after quiet lead to hang issue, need to investigate
-        // shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
-        //     args.recvTokenNumMemObj, (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
-        //     static_cast<uint64_t>(tokenNum + 1), core::AMO_ADD, destPe, qpId);
         shmem::ShmemPutUint64ImmNbiThread(args.recvTokenNumMemObj,
                                           (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
                                           static_cast<uint64_t>(tokenNum + 1), destPe, qpId);
       }
     }
   }
+
   // Polling recv token number signal
   uint64_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint64_t*>();
-  uint64_t recvTokenNum = 0;
-  if (laneId < config.numQpPerPe) {
-    recvTokenNum = shmem::ShmemUint64WaitUntilGreaterThan(
-                       recvTokenNums + destPe * config.numQpPerPe + laneId, 0) -
-                   1;
+  for (int destPe = blockId; destPe < npes; destPe += blockNum) {
+    if (laneId < config.numQpPerPe) {
+      shmem::ShmemUint64WaitUntilGreaterThan(recvTokenNums + destPe * config.numQpPerPe + laneId,
+                                             0) -
+          1;
+    }
   }
-  recvTokenNum = __shfl(recvTokenNum, 0);
+}
 
-  // Copy data
+/* ---------------------------------------------------------------------------------------------- */
+/*                                EpDispatchLowLatencyAsyncRecvCopy                               */
+/* ---------------------------------------------------------------------------------------------- */
+
+template <typename T>
+__device__ void EpDispatchLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+
+  int blocksPerPe = blockNum / npes;
+  int destPe = blockId / blocksPerPe;
+  int localBlockId = blockId % blocksPerPe;
+
+  // Each warp independently computes prefix sum of recv token counts (npes < warpSize)
+  uint64_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint64_t*>();
+  int cnt = 0;
+  if (laneId < npes) {
+    cnt = static_cast<int>(core::AtomicLoadRelaxed(recvTokenNums + laneId * config.numQpPerPe) - 1);
+    if (laneId == destPe) args.destPeTokenCounter[destPe] = 0;
+  }
+  // Inclusive prefix sum via warp scan
+  int inclSum = cnt;
+  for (int d = 1; d < warpSize; d <<= 1) {
+    int n = __shfl_up(inclSum, d);
+    if (laneId >= d) inclSum += n;
+  }
+  // Extract values for this PE via __shfl
+  int destPeInclSum = __shfl(inclSum, destPe);
+  int destPePrevSum = (destPe > 0) ? __shfl(inclSum, destPe - 1) : 0;
+  int recvTokenNum = destPeInclSum - destPePrevSum;
+  index_t destTokIdBase = destPePrevSum;
+
+  // Write total recv token num
+  int totalRecv = __shfl(inclSum, npes - 1);
+  if (globalThdId == 0) {
+    args.totalRecvTokenNum[0] = totalRecv;
+  }
+
   uint8_t* stagingPtr = (destPe != myPe)
                             ? args.shmemDispatchInpTokMemObj->template GetAs<uint8_t*>()
                             : args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
   stagingPtr += (config.MaxNumTokensToSendPerRank() * destPe) * xferBytes;
 
-  for (int tokenId = (blockId % blocksPerPe) * warpNum + warpId; tokenId < recvTokenNum;
-       tokenId += blocksPerPe * warpNum) {
-    index_t destTokId = 0;
-    if (laneId == 0) destTokId = atomicAdd(args.totalRecvTokenNum, 1);
-    destTokId = __shfl(destTokId, 0);
-    core::WarpCopy<uint8_t, 4>(
-        args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>() + destTokId * hiddenBytes,
-        stagingPtr + tokenId * xferBytes, hiddenBytes);
-    if (laneId < config.numExpertPerToken) {
-      index_t id =
-          reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes)[laneId];
-      index_t pe = id / config.numExpertPerRank;
-      if (!((pe >= 0) && (pe < config.worldSize))) {
-        assert((pe >= 0) && (pe < config.worldSize));
+  uint8_t* outTokPtr = args.shmemDispatchOutTokMemObj->template GetAs<uint8_t*>();
+  uint8_t* outIndPtr = args.shmemOutIndicesMemObj->template GetAs<uint8_t*>();
+  uint8_t* outWgtPtr = args.shmemDispatchOutWeightsMemObj->template GetAs<uint8_t*>();
+  uint8_t* outSclPtr = args.shmemOutScalesMemObj->template GetAs<uint8_t*>();
+
+  // Multi-warp per token: same pattern as CombineRecvCopy
+  int localWarpNum = blocksPerPe * warpNum;
+  int localWarpId = localBlockId * warpNum + warpId;
+  int warpsPerToken = std::max(1, localWarpNum / std::max(1, recvTokenNum));
+  size_t hiddenBytesPerWarp = core::CeilDiv(hiddenBytes, static_cast<size_t>(warpsPerToken));
+
+  for (int i = localWarpId; i < recvTokenNum * warpsPerToken; i += localWarpNum) {
+    int tokenId = i / warpsPerToken;
+    int partId = i % warpsPerToken;
+    index_t destTokId = destTokIdBase + tokenId;
+
+    // Hidden data: each warp copies its slice
+    size_t offset = partId * hiddenBytesPerWarp;
+    size_t sz = std::min(hiddenBytesPerWarp, hiddenBytes - offset);
+    if (sz > 0) {
+      core::WarpCopy<uint8_t, 4>(outTokPtr + destTokId * hiddenBytes + offset,
+                                 stagingPtr + tokenId * xferBytes + offset, sz);
+    }
+
+    // Metadata: only first warp of each token group
+    if (partId == 0) {
+      if (laneId < config.numExpertPerToken) {
+        index_t id =
+            reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes)[laneId];
+        index_t pe = id / config.numExpertPerRank;
+        if (!((pe >= 0) && (pe < config.worldSize))) {
+          assert((pe >= 0) && (pe < config.worldSize));
+        }
+      }
+      core::WarpCopy<uint8_t, 4>(outIndPtr + destTokId * indexBytes,
+                                 stagingPtr + tokenId * xferBytes + hiddenBytes, indexBytes);
+      core::WarpCopy<uint8_t, 4>(outWgtPtr + destTokId * weightBytes,
+                                 stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes,
+                                 weightBytes);
+      if (scaleBytes > 0) {
+        core::WarpCopy<uint8_t, 4>(
+            outSclPtr + destTokId * scaleBytes,
+            stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes + weightBytes, scaleBytes);
+      }
+      if (laneId == 0) {
+        // A map used to recover token ordering at combine send phase
+        args.dispReceiverIdxMap[destTokId] = config.MaxNumTokensToSendPerRank() * destPe + tokenId;
+        // A map used for unit test correctness check
+        args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[destTokId] =
+            reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes +
+                                       weightBytes + scaleBytes)[0];
       }
     }
-    core::WarpCopy<uint8_t, 4>(
-        args.shmemOutIndicesMemObj->template GetAs<uint8_t*>() + destTokId * indexBytes,
-        stagingPtr + tokenId * xferBytes + hiddenBytes, indexBytes);
-    core::WarpCopy<uint8_t, 4>(
-        args.shmemDispatchOutWeightsMemObj->template GetAs<uint8_t*>() + destTokId * weightBytes,
-        stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes, weightBytes);
-    if (scaleBytes > 0) {
-      core::WarpCopy<uint8_t, 4>(
-          args.shmemOutScalesMemObj->template GetAs<uint8_t*>() + destTokId * scaleBytes,
-          stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes + weightBytes, scaleBytes);
-    }
-    if (laneId == 0) {
-      // A map used to recover token ordering at combine send phase
-      args.dispReceiverIdxMap[destTokId] = config.MaxNumTokensToSendPerRank() * destPe + tokenId;
-      // A map used for unit test correctness check
-      args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[destTokId] =
-          reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes +
-                                     weightBytes + scaleBytes)[0];
-    }
   }
 
-  uint32_t finishedWarpNum = 0;
-  if (laneId == 0) {
-    finishedWarpNum = atomicAdd(args.dispatchGridBarrier, 1);
-  }
-  finishedWarpNum = __shfl(finishedWarpNum, 0);
-
-  if ((finishedWarpNum == (2 * globalWarpNum - 1)) && (laneId < npes)) {
-    if (laneId < npes) {
-      args.destPeTokenCounter[laneId] = 0;
-    }
-    if (laneId == 0) {
-      args.dispatchGridBarrier[0] = 0;
-      atomicAdd(args.crossDeviceBarrierFlag, 1);
-    }
+  if (globalThdId == 0) {
+    atomicAdd(args.crossDeviceBarrierFlag, 1);
   }
 }
 
-template <typename T>
-__global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
-  EpDispatchLowLatencyAsyncRecv_body<T>(args);
-}
+/* ---------------------------------------------------------------------------------------------- */
+/*                                EpCombineLowLatencyAsyncSendCopy                                */
+/* ---------------------------------------------------------------------------------------------- */
 
-/* ---------------------------------------------------------------------------------------------- */
-/*                                  EpCombineLowLatencyAsyncRecv                                  */
-/* ---------------------------------------------------------------------------------------------- */
 template <typename T, bool UseFp8DirectCast>
-__device__ void EpCombineLowLatencyAsyncSend_body(EpDispatchCombineArgs<T> args) {
+__device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
   static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
                 "Fp8 direct cast combine currently only supports bf16 input");
   const size_t tokHiddenBytes = config.hiddenDim * sizeof(TokT);
 
-  // Copy token onto staing buffer for later IBGDA transfer
+  // Copy token onto staging buffer for later IBGDA transfer
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   uint8_t* stagingPtr = args.shmemStagingTokMemObj->template GetAs<uint8_t*>();
   for (int tokenId = globalWarpId; tokenId < totalRecvTokenNum; tokenId += globalWarpNum) {
@@ -261,16 +293,25 @@ __device__ void EpCombineLowLatencyAsyncSend_body(EpDispatchCombineArgs<T> args)
           reinterpret_cast<uint8_t*>(args.inpTokenBuf) + tokenId * tokHiddenBytes, tokHiddenBytes);
     }
   }
-  if (laneId == 0) {
-    atomicAdd(args.combineGridBarrier, 1);
-  }
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                              EpCombineLowLatencyAsyncSendTransfer                              */
+/* ---------------------------------------------------------------------------------------------- */
+
+template <typename T, bool UseFp8DirectCast>
+__device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
+  static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
+                "Fp8 direct cast combine currently only supports bf16 input");
+  const size_t tokHiddenBytes = config.hiddenDim * sizeof(TokT);
 
   uint64_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint64_t*>();
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       int tokenNum = 0;
       if (laneId == 0) {
-        shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, globalWarpNum);
         tokenNum = recvTokenNums[destPe * config.numQpPerPe + qpId];
         core::AtomicStoreRelaxedSystem(&recvTokenNums[destPe * config.numQpPerPe + qpId],
                                        uint64_t{0});
@@ -295,25 +336,22 @@ __device__ void EpCombineLowLatencyAsyncSend_body(EpDispatchCombineArgs<T> args)
   }
 }
 
-template <typename T, bool UseFp8DirectCast>
-__global__ void EpCombineLowLatencyAsyncSend(EpDispatchCombineArgs<T> args) {
-  EpCombineLowLatencyAsyncSend_body<T, UseFp8DirectCast>(args);
-}
+/* ---------------------------------------------------------------------------------------------- */
+/*                              EpCombineLowLatencyAsyncRecvTransfer                              */
+/* ---------------------------------------------------------------------------------------------- */
 
 template <typename T, bool UseFp8DirectCast>
-__device__ void EpCombineLowLatencyAsyncRecv_body(EpDispatchCombineArgs<T> args) {
+__device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
   static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
                 "Fp8 direct cast combine currently only supports bf16 input");
+  (void)sizeof(TokT);
 
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       if (laneId == 0) {
         shmem::ShmemQuietThread(destPe, qpId);
-        // TODO(ditian12): send atomic op right after quiet lead to hang issue, need to investigate
-        // shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(
-        // args.crossDeviceBarrierMemObj, myPe * sizeof(uint64_t), 1, core::AMO_ADD, destPe, qpId);
         uint64_t flag = args.crossDeviceBarrierFlag[0];
         shmem::ShmemPutUint64ImmNbiThread(args.crossDeviceBarrierMemObj,
                                           (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
@@ -324,16 +362,27 @@ __device__ void EpCombineLowLatencyAsyncRecv_body(EpDispatchCombineArgs<T> args)
 
   for (int destPe = laneId; destPe < npes; destPe += warpSize) {
     uint64_t barrierFlag = args.crossDeviceBarrierFlag[0];
-    for (int i = 0; i < config.numQpPerPe; i++)
+    for (int i = 0; i < config.numQpPerPe; i++) {
       shmem::ShmemUint64WaitUntilEquals(args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>() +
                                             destPe * config.numQpPerPe + i,
                                         barrierFlag);
+    }
   }
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                EpCombineLowLatencyAsyncRecvCopy                                */
+/* ---------------------------------------------------------------------------------------------- */
+
+template <typename T, bool UseFp8DirectCast>
+__device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
+  static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
+                "Fp8 direct cast combine currently only supports bf16 input");
 
   extern __shared__ char sharedMem[];
   TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
-  float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
-                          warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
 
   if (args.curRankNumToken != 0) {
     index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
@@ -370,21 +419,6 @@ __device__ void EpCombineLowLatencyAsyncRecv_body(EpDispatchCombineArgs<T> args)
       }
     }
   }
-
-  uint32_t finishedWarpNum = 0;
-  if (laneId == 0) finishedWarpNum = atomicAdd(args.combineGridBarrier, 1);
-  finishedWarpNum = __shfl(finishedWarpNum, 0);
-
-  if (finishedWarpNum == (2 * globalWarpNum - 1)) {
-    if (laneId == 0) {
-      args.combineGridBarrier[0] = 0;
-    }
-  }
-}
-
-template <typename T, bool UseFp8DirectCast>
-__global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
-  EpCombineLowLatencyAsyncRecv_body<T, UseFp8DirectCast>(args);
 }
 
 }  // namespace moe
