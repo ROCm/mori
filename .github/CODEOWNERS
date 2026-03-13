@@ -1,0 +1,8 @@
+# Mori ops API surface -- changes here affect both torch and XLA FFI shims.
+# Require review from the ops team when either shim or the shared handle is modified.
+/include/mori/ops/dispatch_combine/   @amd/mori-ops
+/src/pybind/pybind_ops.cpp            @amd/mori-ops
+/src/ffi/mori_xla_ffi_ops.cpp         @amd/mori-ops
+/src/ffi/mori_xla_ffi_handle_mgr.hpp  @amd/mori-ops
+/tests/python/test_shim_parity.py     @amd/mori-ops
+/tests/cpp/ffi/                        @amd/mori-ops

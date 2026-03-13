@@ -33,6 +33,7 @@ option(BUILD_TESTS "Whether to build mori CPP tests" ON)
 option(ENABLE_PROFILER "Enable kernel profiling" OFF)
 option(ENABLE_DEBUG_PRINTF "Enable debug printf in device kernels" OFF)
 option(ENABLE_STANDARD_MOE_ADAPT "Enable standard moe adapt" OFF)
+option(ENABLE_XLA_FFI "Build XLA FFI custom call handlers for JAX integration" OFF)
 
 # ---------------------------------------------------------------------------
 # Host NIC: link all available NIC libraries (can be multiple). Only requires
@@ -470,6 +471,11 @@ endif()
 
 if(BUILD_PYBINDS)
   add_subdirectory(src/pybind)
+endif()
+
+if(ENABLE_XLA_FFI)
+  message(STATUS "ENABLE_XLA_FFI = ON")
+  add_subdirectory(src/ffi)
 endif()
 
 if(BUILD_TESTS)

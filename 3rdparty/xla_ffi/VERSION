@@ -1,0 +1,7 @@
+Vendored from rocm-xla/rocm-jaxlib-v0.9.0 branch
+Commit: ca6c4f848f (PR #37629: [ROCm] Propagate register spill info for autotuner filtering)
+
+Files:
+  xla/ffi/api/c_api.h   - C ABI structs (header-only, no external deps)
+  xla/ffi/api/api.h     - C++ handler macros (depends on c_api.h only)
+  xla/ffi/api/ffi.h     - C++ FFI implementation (depends on c_api.h + api.h)
