@@ -33,7 +33,11 @@ from setuptools.command.build_ext import build_ext
 _supported_arch_list = ["gfx942", "gfx950"]
 
 _REQUIRED_SYSTEM_DEPS = [
-    ("mpicc", ("libopenmpi-dev", "openmpi-devel"), "MPI compiler wrapper (needed by CMake)"),
+    (
+        "mpicc",
+        ("libopenmpi-dev", "openmpi-devel"),
+        "MPI compiler wrapper (needed by CMake)",
+    ),
     ("mpirun", ("openmpi-bin", "openmpi"), "MPI runtime (needed at runtime)"),
 ]
 
@@ -86,19 +90,23 @@ def _check_system_deps() -> None:
         lines.append(f"  - {pkg_name:24s}  {desc}")
     lines.append("")
 
-    pkg_names = [
-        (p[pkg_idx] if isinstance(p, tuple) else p) for p, _ in missing
-    ]
+    pkg_names = [(p[pkg_idx] if isinstance(p, tuple) else p) for p, _ in missing]
     if pm == "apt":
         lines.append("  Install (Ubuntu/Debian):")
-        lines.append(f"    sudo apt-get update && sudo apt-get install -y {' '.join(pkg_names)}")
+        lines.append(
+            f"    sudo apt-get update && sudo apt-get install -y {' '.join(pkg_names)}"
+        )
     elif pm in ("dnf", "yum"):
-        lines.append(f"  Install (RHEL/CentOS/Fedora):")
+        lines.append("  Install (RHEL/CentOS/Fedora):")
         lines.append(f"    sudo {pm} install -y {' '.join(pkg_names)}")
     else:
         lines.append("  Install the equivalent packages for your distribution:")
-        lines.append(f"    Ubuntu/Debian: sudo apt-get install {' '.join(p[0] if isinstance(p, tuple) else p for p, _ in missing)}")
-        lines.append(f"    RHEL/Fedora:   sudo dnf install {' '.join(p[1] if isinstance(p, tuple) else p for p, _ in missing)}")
+        lines.append(
+            f"    Ubuntu/Debian: sudo apt-get install {' '.join(p[0] if isinstance(p, tuple) else p for p, _ in missing)}"
+        )
+        lines.append(
+            f"    RHEL/Fedora:   sudo dnf install {' '.join(p[1] if isinstance(p, tuple) else p for p, _ in missing)}"
+        )
     lines.append("=" * 70)
     print("\n".join(lines), file=sys.stderr)
     raise RuntimeError(
@@ -158,8 +166,6 @@ def _get_gpu_archs() -> str:
     return ";".join(_supported_arch_list)
 
 
-
-
 def _copy_jit_sources(root_dir: Path) -> None:
     """Copy JIT-required source files into the package for wheel distribution.
 
@@ -200,8 +206,11 @@ _3RDPARTY_DIRS = ["3rdparty/spdlog", "3rdparty/msgpack-c"]
 
 def _ensure_3rdparty(root_dir: Path) -> None:
     """Ensure 3rdparty submodule directories exist via git submodule update."""
-    missing = [d for d in _3RDPARTY_DIRS
-               if not (root_dir / d).is_dir() or not any((root_dir / d).iterdir())]
+    missing = [
+        d
+        for d in _3RDPARTY_DIRS
+        if not (root_dir / d).is_dir() or not any((root_dir / d).iterdir())
+    ]
     if not missing:
         return
 
@@ -280,6 +289,7 @@ class CMakeBuild(build_ext):
         print(f"[mori] GPU architecture: {gpu_archs}")
         build_examples = os.environ.get("BUILD_EXAMPLES", "OFF")
         build_tests = os.environ.get("BUILD_TESTS", "OFF")
+        build_umbp = os.environ.get("BUILD_UMBP", "OFF")
 
         cmake_args = [
             "cmake",
@@ -293,6 +303,7 @@ class CMakeBuild(build_ext):
             f"-DENABLE_PROFILER={enable_profiler}",
             f"-DBUILD_EXAMPLES={build_examples}",
             f"-DBUILD_TESTS={build_tests}",
+            f"-DBUILD_UMBP={build_umbp}",
             "-DBUILD_TORCH_BOOTSTRAP=OFF",
             "-B",
             str(build_dir),
@@ -338,6 +349,9 @@ class CMakeBuild(build_ext):
         for src_path, dst_path in files_to_copy:
             shutil.copyfile(src_path, dst_path)
 
+        # UMBP bindings are compiled into libmori_pybinds.so when BUILD_UMBP=ON
+        # (no separate .so to copy)
+
         _copy_jit_sources(root_dir)
 
         if os.environ.get("MORI_SKIP_PRECOMPILE", "").lower() not in (
@@ -370,14 +384,14 @@ def _try_precompile(root_dir: Path) -> None:
         return
     try:
         target_python = os.environ.get(
-            "MORI_PYTHON", shutil.which("python3") or shutil.which("python") or sys.executable
+            "MORI_PYTHON",
+            shutil.which("python3") or shutil.which("python") or sys.executable,
         )
         env = os.environ.copy()
         env["MORI_PRECOMPILE"] = "1"
         env.pop("PYTHONPATH", None)
         subprocess.Popen(
-            [target_python, "-c",
-             "import time; time.sleep(3); import mori"],
+            [target_python, "-c", "import time; time.sleep(3); import mori"],
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
