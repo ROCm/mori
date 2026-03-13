@@ -181,9 +181,14 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   if (dstDeviceIds.size() != 0) {
     int srcDeviceId = rank % 8;
     int numOfQueuesPerDevice = gpuMemObj->sdmaNumQueue;  // all sdma queues are inited
+    // Allocate based on worldSize (not dstDeviceIds.size()) because indexing uses pe * numQ
+    // where pe ranges 0..worldSize-1. Using dstDeviceIds.size() causes buffer overflow.
+    size_t numDevices = static_cast<size_t>(worldSize);
     HIP_RUNTIME_CHECK(hipMalloc(
         &gpuMemObj->deviceHandles_d,
-        dstDeviceIds.size() * numOfQueuesPerDevice * sizeof(anvil::SdmaQueueDeviceHandle*)));
+        numDevices * numOfQueuesPerDevice * sizeof(anvil::SdmaQueueDeviceHandle*)));
+    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->deviceHandles_d, 0,
+        numDevices * numOfQueuesPerDevice * sizeof(anvil::SdmaQueueDeviceHandle*)));
 
     for (auto& dstDeviceId : dstDeviceIds) {
       for (size_t q = 0; q < numOfQueuesPerDevice; q++) {
@@ -192,7 +197,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       }
     }
 
-    size_t signalArraySize = sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice;
+    size_t signalArraySize = sizeof(HSAuint64) * numDevices * numOfQueuesPerDevice;
     HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->signalPtrs, signalArraySize));
     HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->signalPtrs, 0, signalArraySize));
     HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->expectSignalsPtr, signalArraySize));
