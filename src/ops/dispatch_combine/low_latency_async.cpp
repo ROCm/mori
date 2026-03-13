@@ -188,24 +188,6 @@ __global__ void EpDispatchLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
   }
   recvTokenNum = __shfl(recvTokenNum, 0);
 
-  // Invalidate L1/L0 caches
-  __builtin_amdgcn_s_waitcnt(0);
-  asm volatile("buffer_inv" ::: "memory");
-
-  // L2 flush: read unrelated memory to evict stale L2 entries for shmemDispatchInpTokMemObj
-  {
-    size_t flushBytes = static_cast<size_t>(config.MaxNumTokensToSendPerRank()) *
-                        npes * xferBytes;
-    volatile uint8_t* flushSrc = reinterpret_cast<volatile uint8_t*>(
-        args.shmemDispatchOutTokMemObj->localPtr);
-    uint8_t dummy = 0;
-    for (size_t i = static_cast<size_t>(globalThdId) * 128; i < flushBytes;
-         i += static_cast<size_t>(globalThdNum) * 128) {
-      dummy += flushSrc[i];
-    }
-    if (dummy == 0xFF) asm volatile("" ::: "memory");
-  }
-
   // Copy data
   uint8_t* stagingPtr = (destPe != myPe)
                             ? args.shmemDispatchInpTokMemObj->template GetAs<uint8_t*>()
@@ -374,29 +356,6 @@ __global__ void EpCombineLowLatencyAsyncRecv(EpDispatchCombineArgs<T> args) {
       shmem::ShmemUint64WaitUntilEquals(args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>() +
                                             destPe * config.numQpPerPe + i,
                                         barrierFlag);
-  }
-
-  // Invalidate L1/L0 caches
-  __builtin_amdgcn_s_waitcnt(0);
-  asm volatile("buffer_inv" ::: "memory");
-
-  // L2 flush: read a large unrelated memory region to evict stale L2 entries
-  // for shmemCombineInpTokMemObj. The buffer is ~8MB for 128 tokens which fits
-  // entirely in L2 (~8MB). Reading shmemStagingTokMemObj (same size, different
-  // addresses) forces L2 to evict the old shmemCombineInpTokMemObj entries.
-  {
-    using TokFlush = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
-    size_t flushBytes = static_cast<size_t>(config.MaxNumTokensToSendPerRank()) *
-                        npes * config.hiddenDim * sizeof(TokFlush);
-    volatile uint8_t* flushSrc = reinterpret_cast<volatile uint8_t*>(
-        args.shmemDispatchOutTokMemObj->localPtr);
-    uint8_t dummy = 0;
-    for (size_t i = static_cast<size_t>(globalThdId) * 128; i < flushBytes;
-         i += static_cast<size_t>(globalThdNum) * 128) {
-      dummy += flushSrc[i];
-    }
-    // Prevent compiler from optimizing out the dummy reads
-    if (dummy == 0xFF) asm volatile("" ::: "memory");
   }
 
   extern __shared__ char sharedMem[];
