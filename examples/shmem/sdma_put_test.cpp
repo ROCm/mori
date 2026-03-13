@@ -61,17 +61,18 @@ __global__ void RemoteSignalPutKernel(
   // Manual SDMA PUT with remote signal
   if (bytes > 0) {
     anvil::SdmaQueueDeviceHandle handle = **(dh);
-    uint64_t base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR));
+    uint64_t offset = 0;
+    uint64_t base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR), offset);
     uint64_t pendingWptr = base;
     uint64_t startBase = base;
 
     auto pkt_copy = anvil::CreateCopyPacket(srcPtr, dstPtr, bytes);
-    handle.template placePacket<SDMA_PKT_COPY_LINEAR>(pkt_copy, pendingWptr);
+    handle.template placePacket<SDMA_PKT_COPY_LINEAR>(pkt_copy, pendingWptr, offset);
 
-    base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC));
+    base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), offset);
     pendingWptr = base;
     auto pkt_sig = anvil::CreateAtomicIncPacket(remoteSignal);
-    handle.template placePacket<SDMA_PKT_ATOMIC>(pkt_sig, pendingWptr);
+    handle.template placePacket<SDMA_PKT_ATOMIC>(pkt_sig, pendingWptr, offset);
 
     handle.submitPacket(startBase, pendingWptr);
   } else {

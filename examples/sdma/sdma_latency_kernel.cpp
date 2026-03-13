@@ -61,7 +61,8 @@ __global__ void multiQueueSDMATransfer(size_t iteration_id, void* srcBuf, void* 
             timestamp_breakdown->reserveQueueSpace_st[packetGlobalIndex] = wall_clock64();
          }
 
-         base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR));
+         uint64_t offset = 0;
+         base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR), offset);
 
          if constexpr (TIMESTAMPING_EN)
          {
@@ -80,7 +81,7 @@ __global__ void multiQueueSDMATransfer(size_t iteration_id, void* srcBuf, void* 
             timestamp_breakdown->entailPacket_st[packetGlobalIndex] = wall_clock64();
          }
 
-         handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet, pendingWptr);
+         handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet, pendingWptr, offset);
 
          if constexpr (TIMESTAMPING_EN)
          {
@@ -106,7 +107,8 @@ __global__ void multiQueueSDMATransfer(size_t iteration_id, void* srcBuf, void* 
          timestamp_breakdown->iterTimeStamps[warpGlobalIndex][PerIterationTimeStamps::RESERVE_SPACE_FENCE_START] =
              wall_clock64();
       }
-      base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC));
+      uint64_t offset = 0;
+      base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), offset);
       if constexpr (TIMESTAMPING_EN)
       {
          timestamp_breakdown->iterTimeStamps[warpGlobalIndex][PerIterationTimeStamps::RESERVE_SPACE_FENCE_END] =
@@ -123,7 +125,7 @@ __global__ void multiQueueSDMATransfer(size_t iteration_id, void* srcBuf, void* 
          timestamp_breakdown->iterTimeStamps[warpGlobalIndex][PerIterationTimeStamps::ENTAIL_FENCE_PACKET_START] =
              wall_clock64();
       }
-      handle.template placePacket<SDMA_PKT_ATOMIC>(packet, pendingWptr);
+      handle.template placePacket<SDMA_PKT_ATOMIC>(packet, pendingWptr, offset);
       if constexpr (TIMESTAMPING_EN)
       {
          long long int ts = wall_clock64();
