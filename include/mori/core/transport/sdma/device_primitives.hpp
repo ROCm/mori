@@ -38,6 +38,14 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
                                 anvil::SdmaQueueDeviceHandle** deviceHandles, 
                                 HSAuint64* signals, HSAuint64* expectedSignals, uint32_t queNum)
 {
+   if (copy_size == 0) {
+      for (int q = 0; q < queNum; q++) {
+         __hip_atomic_fetch_add(signals + q, 1ULL, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+         expectedSignals[q]++;
+      }
+      return;
+   }
+
    uint64_t base = 0;
    uint64_t pendingWptr = 0;
    uint64_t startBase = 0;
@@ -79,14 +87,20 @@ inline __device__ void SdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
                                 anvil::SdmaQueueDeviceHandle** deviceHandles, 
                                 HSAuint64* signals, HSAuint64* expectedSignals, uint32_t queNum)
 {
+   const int laneId = threadIdx.x % warpSize;
+
+   if(laneId >= queNum) return;
+
+   if (copy_size == 0) {
+      __hip_atomic_fetch_add(signals + laneId, 1ULL, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      expectedSignals[laneId]++;
+      return;
+   }
+
    uint64_t base = 0;
    uint64_t pendingWptr = 0;
    uint64_t startBase = 0;
    size_t perq_send_size =0;
-
-   const int laneId = threadIdx.x % warpSize;
-
-   if(laneId >= queNum) return;
    int queueId = laneId;
    const size_t rand_size = copy_size / queNum; // per queue rand data
 

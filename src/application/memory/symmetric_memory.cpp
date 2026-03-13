@@ -192,14 +192,35 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       }
     }
 
-    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->signalPtrs,
-                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
-    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->signalPtrs, 0,
-                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
-    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->expectSignalsPtr,
-                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
-    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->expectSignalsPtr, 0,
-                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
+    size_t signalArraySize = sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice;
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->signalPtrs, signalArraySize));
+    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->signalPtrs, 0, signalArraySize));
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->expectSignalsPtr, signalArraySize));
+    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->expectSignalsPtr, 0, signalArraySize));
+
+    // Exchange signal memory via IPC so each PE can write to remote PE's signalPtrs
+    hipIpcMemHandle_t signalHandle;
+    HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&signalHandle, gpuMemObj->signalPtrs));
+
+    auto* signalHandles = static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
+    bootNet.Allgather(&signalHandle, signalHandles, sizeof(hipIpcMemHandle_t));
+
+    auto* peerSignalPtrsHost = static_cast<HSAuint64**>(calloc(worldSize, sizeof(HSAuint64*)));
+    peerSignalPtrsHost[rank] = gpuMemObj->signalPtrs;
+    for (int i = 0; i < worldSize; i++) {
+      if (context.GetTransportType(i) != TransportType::SDMA) continue;
+      if (i == rank) continue;
+      void* mappedPtr = nullptr;
+      HIP_RUNTIME_CHECK(hipIpcOpenMemHandle(&mappedPtr, signalHandles[i],
+                                            hipIpcMemLazyEnablePeerAccess));
+      peerSignalPtrsHost[i] = reinterpret_cast<HSAuint64*>(mappedPtr);
+    }
+
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->peerSignalPtrs, sizeof(HSAuint64*) * worldSize));
+    HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerSignalPtrs, peerSignalPtrsHost,
+                                sizeof(HSAuint64*) * worldSize, hipMemcpyHostToDevice));
+    free(signalHandles);
+    free(peerSignalPtrsHost);
   }
   SymmMemObjPtr result{cpuMemObj, gpuMemObj};
   if (!heap_begin) {
@@ -312,6 +333,7 @@ SymmMemObjPtr SymmMemManager::RegisterStaticHeapSubRegion(void* localPtr, size_t
       gpuMemObj->deviceHandles_d = heapObj->gpu->deviceHandles_d;
       gpuMemObj->signalPtrs = heapObj->gpu->signalPtrs;
       gpuMemObj->expectSignalsPtr = heapObj->gpu->expectSignalsPtr;
+      gpuMemObj->peerSignalPtrs = heapObj->gpu->peerSignalPtrs;
     }
   }
 

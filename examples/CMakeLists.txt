@@ -56,6 +56,7 @@ add_shmem_example(concurrent_put_signal_thread SOURCES shmem/concurrent_put_sign
 add_shmem_example(atomic_nonfetch_thread     SOURCES shmem/atomic_nonfetch_thread.cpp)
 add_shmem_example(atomic_fetch_thread        SOURCES shmem/atomic_fetch_thread.cpp)
 add_shmem_example(test_p2p_direct_access     SOURCES shmem/test_p2p_direct_access.cpp)
+add_shmem_example(sdma_put_test              SOURCES shmem/sdma_put_test.cpp)
 
 # --- Application examples ---
 add_executable(context application/context.cpp)
