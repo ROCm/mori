@@ -53,23 +53,41 @@ std::optional<Location> Router::RouteGet(const std::string& key, const std::stri
 
 std::optional<RoutePutResult> Router::RoutePut(const std::string& key, const std::string& node_id,
                                                uint64_t block_size) {
-  auto alive_clients = registry_.GetAliveClients();
+  auto candidates = registry_.GetAliveClients();
 
-  if (alive_clients.empty()) {
+  if (candidates.empty()) {
     spdlog::debug("[Router] RoutePut key='{}' from={}: no alive clients", key, node_id);
     return std::nullopt;
   }
 
-  auto result = put_strategy_->Select(alive_clients, block_size);
+  for (;;) {
+    auto result = put_strategy_->Select(candidates, block_size);
+    if (!result) {
+      spdlog::debug("[Router] RoutePut key='{}' from={}: no node with sufficient capacity", key,
+                    node_id);
+      return std::nullopt;
+    }
 
-  if (result.has_value()) {
-    spdlog::debug("[Router] RoutePut key='{}' from={}: selected node={}, tier={}", key, node_id, result->node_id,
-                  TierTypeName(result->tier));
-  } else {
-    spdlog::debug("[Router] RoutePut key='{}' from={}: no node with sufficient capacity", key, node_id);
+    auto alloc = registry_.AllocateForPut(result->node_id, result->tier, block_size);
+    if (alloc) {
+      result->peer_address = std::move(alloc->peer_address);
+      result->engine_desc_bytes = std::move(alloc->engine_desc_bytes);
+      result->dram_memory_desc_bytes = std::move(alloc->dram_memory_desc_bytes);
+      result->allocated_offset = alloc->allocated_offset;
+      spdlog::debug("[Router] RoutePut key='{}' from={}: selected node={}, tier={}, offset={}",
+                    key, node_id, result->node_id, TierTypeName(result->tier),
+                    result->allocated_offset);
+      return result;
+    }
+
+    spdlog::debug("[Router] RoutePut key='{}': allocation failed on node={} tier={}, retrying",
+                  key, result->node_id, TierTypeName(result->tier));
+    for (auto& c : candidates) {
+      if (c.node_id == result->node_id) {
+        c.tier_capacities.erase(result->tier);
+      }
+    }
   }
-
-  return result;
 }
 
 }  // namespace mori::umbp

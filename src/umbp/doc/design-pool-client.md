@@ -286,21 +286,33 @@ struct RoutePutResult {
 };
 ```
 
-The `RoutePut` handler in `MasterServer` calls `PoolAllocator::Allocate` after the
-strategy selects a node, regardless of tier:
+`Router::RoutePut` combines strategy selection and allocation into a single call.
+It internally retries when allocation fails on the selected node:
 
 ```
-RoutePut handler:
-    result = router_.RoutePut(key, node_id, block_size)
-    auto& alloc = clients_[result.node_id].allocators[result.tier]
-    offset = alloc.Allocate(block_size)
-    if offset == nullopt:
-        // Allocation failed (capacity exhausted or fragmentation); try next candidate
-        ...
-    result.allocated_offset = offset.value()  // DRAM: real offset, SSD: 0
-    // Fill engine_desc, memory_desc, peer_address from ClientRecord
-    return result
+Router::RoutePut(key, node_id, block_size):
+    candidates = registry_.GetAliveClients()
+    loop:
+        result = strategy.Select(candidates, block_size)
+        if !result: return nullopt              // all candidates exhausted
+
+        alloc = registry_.AllocateForPut(result.node_id, result.tier, block_size)
+        if alloc:
+            // merge alloc info into result (peer_address, engine_desc, etc.)
+            return result
+
+        // allocation failed — remove this (node, tier) from candidates and retry
+        candidates[result.node_id].tier_capacities.erase(result.tier)
 ```
+
+The `MasterServer` RoutePut handler simply calls `router_.RoutePut()` and fills
+the response — no retry logic needed at the handler level.
+
+**Capacity consistency**: `AllocateForPut` and `DeallocateForUnregister` in
+`ClientRegistry` synchronize `tier_capacities[tier].available_bytes` with
+`PoolAllocator::AvailableBytes()` after every allocation/deallocation. This ensures
+the routing strategy always sees accurate remaining capacity, not stale heartbeat
+values.
 
 For SSD tier, `allocated_offset` is 0 (capacity-only mode) — SSD addressing is
 handled by PeerService using file paths.
@@ -849,28 +861,32 @@ concurrent gRPC handler threads.
 
 - **Problem**: The current `RoutePut` path only calls `GetAliveClients()` (read
   operation, shared lock). Adding `PoolAllocator::Allocate` makes it a write.
-- **Solution**: `RoutePut` in `MasterServer` executes in two steps:
+- **Solution**: `Router::RoutePut` executes in two steps internally:
   1. Shared lock to get alive clients (`GetAliveClients()`)
-  2. After strategy selects a node, **exclusive lock** to call
-     `allocators[tier].Allocate(block_size)`
+  2. After strategy selects a node, **exclusive lock** via
+     `registry_.AllocateForPut()` to call `allocators[tier].Allocate(block_size)`
+     and sync `tier_capacities`
+  3. If allocation fails, remove the failed (node, tier) from the local candidate
+     list and retry — all within `Router::RoutePut`
 
 Pseudocode:
 
 ```
-RoutePut handler:
-    alive_clients = registry_.GetAliveClients()    // shared lock
-    result = strategy.Select(alive_clients, block_size)
-    if !result: return not_found
+Router::RoutePut(key, node_id, block_size):
+    candidates = registry_.GetAliveClients()         // shared lock
+    loop:
+        result = strategy.Select(candidates, block_size)
+        if !result: return nullopt
 
-    write_lock(registry_.mutex_)                    // exclusive lock
-    auto& alloc = registry_.clients_[result.node_id].allocators[result.tier]
-    offset = alloc.Allocate(block_size)
-    write_unlock
-
-    if !offset: return not_found  // capacity exhausted or fragmentation
-    result.allocated_offset = offset.value()
+        alloc = registry_.AllocateForPut(...)        // exclusive lock
+        if alloc:
+            // merge alloc result into RoutePutResult, return
+        candidates[result.node_id].tier_capacities.erase(result.tier)  // retry
 ```
 
+- `AllocateForPut` and `DeallocateForUnregister` both update
+  `tier_capacities[tier].available_bytes` from `PoolAllocator::AvailableBytes()`,
+  keeping the routing strategy's capacity view accurate.
 - `Unregister` already runs under exclusive lock (existing design), so
   `Deallocate` is called within it directly.
 - `PoolAllocator` itself has no lock, avoiding nested-lock issues.

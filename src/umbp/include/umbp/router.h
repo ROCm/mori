@@ -50,7 +50,8 @@ class Router {
   /// Returns nullopt if the key is not in the index.
   std::optional<Location> RouteGet(const std::string& key, const std::string& node_id);
 
-  /// Pick a target node to write to.
+  /// Pick a target node and allocate capacity for a write.
+  /// Internally retries with different candidates if allocation fails.
   /// Returns nullopt if no suitable node exists.
   std::optional<RoutePutResult> RoutePut(const std::string& key, const std::string& node_id,
                                          uint64_t block_size);
