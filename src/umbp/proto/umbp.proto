@@ -1,0 +1,135 @@
+syntax = "proto3";
+package umbp;
+
+// ============================================================
+//  Core types
+// ============================================================
+
+enum TierType {
+  TIER_UNKNOWN = 0;
+  TIER_HBM     = 1;   // GPU High Bandwidth Memory
+  TIER_DRAM    = 2;   // CPU DRAM
+  TIER_SSD     = 3;   // NVMe SSD
+}
+
+// Per-tier capacity reported by a client node.
+message TierCapacity {
+  TierType tier                     = 1;
+  uint64   total_capacity_bytes     = 2;   // Total capacity on this tier
+  uint64   available_capacity_bytes = 3;   // Current free capacity on this tier
+}
+
+// ============================================================
+//  Client lifecycle
+// ============================================================
+
+enum ClientStatus {
+  CLIENT_STATUS_UNKNOWN = 0;
+  CLIENT_STATUS_ALIVE   = 1;
+  CLIENT_STATUS_EXPIRED = 2;
+}
+
+message RegisterClientRequest {
+  string node_id                    = 1;
+  string node_address                 = 2;   // Network address (e.g. "10.0.1.5:8080")
+  repeated TierCapacity tier_capacities = 3; // Capacity per tier (HBM, DRAM, SSD)
+  string peer_address                 = 4;   // PeerService gRPC address
+  bytes  engine_desc                  = 5;   // packed EngineDesc
+  bytes  dram_memory_desc             = 6;   // packed MemoryDesc (RDMA-registered DRAM)
+}
+message RegisterClientResponse {
+  uint64 heartbeat_interval_ms = 1;  // Recommended heartbeat interval
+}
+
+message UnregisterClientRequest {
+  string node_id = 1;
+}
+message UnregisterClientResponse {
+  uint32 keys_removed = 1;
+}
+
+message HeartbeatRequest {
+  string node_id                    = 1;
+  repeated TierCapacity tier_capacities = 2; // Updated capacity per tier
+}
+message HeartbeatResponse {
+  ClientStatus status = 1;
+}
+
+// ============================================================
+//  Block index
+// ============================================================
+
+message Location {
+  string   node_id     = 1;
+  string   location_id = 2;
+  uint64   size        = 3;
+  TierType tier        = 4;
+}
+
+message RegisterRequest {
+  string   node_id   = 1;
+  string   key       = 2;
+  Location location  = 3;
+}
+message RegisterResponse {}
+
+message UnregisterRequest {
+  string   node_id   = 1;
+  string   key       = 2;
+  Location location  = 3;
+}
+message UnregisterResponse {
+  uint32 removed = 1;
+}
+
+// ============================================================
+//  Router
+// ============================================================
+
+message RouteGetRequest {
+  string key     = 1;
+  string node_id = 2;   // Requesting node (for future locality hints)
+}
+message RouteGetResponse {
+  bool     found            = 1;
+  Location source           = 2;   // Selected replica to read from (if found)
+  string   peer_address     = 3;   // source node's PeerService address
+  bytes    engine_desc      = 4;   // source node's packed EngineDesc
+  bytes    dram_memory_desc = 5;   // source node's packed MemoryDesc (DRAM)
+}
+
+message RoutePutRequest {
+  string key        = 1;
+  string node_id    = 2;   // Requesting client
+  uint64 block_size = 3;   // Size of the block to write (bytes)
+}
+message RoutePutResponse {
+  bool     found            = 1;
+  string   node_id          = 2;   // Target node ID
+  string   node_address     = 3;   // Target node network address (for MORI-IO connection)
+  TierType tier             = 4;   // Tier selected by the strategy
+  string   peer_address     = 5;   // target node's PeerService address
+  bytes    engine_desc      = 6;   // target node's packed EngineDesc
+  bytes    dram_memory_desc = 7;   // target node's packed MemoryDesc (DRAM)
+  uint64   allocated_offset = 8;   // Master-allocated offset (DRAM tier only)
+}
+
+// ============================================================
+//  Single unified service
+// ============================================================
+
+service UMBPMaster {
+  // Client lifecycle
+  rpc RegisterClient(RegisterClientRequest) returns (RegisterClientResponse);
+  rpc UnregisterClient(UnregisterClientRequest) returns (UnregisterClientResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Block index
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Unregister(UnregisterRequest) returns (UnregisterResponse);
+
+  // Router
+  rpc RouteGet(RouteGetRequest) returns (RouteGetResponse);
+  rpc RoutePut(RoutePutRequest) returns (RoutePutResponse);
+}
