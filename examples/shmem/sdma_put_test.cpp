@@ -31,24 +31,18 @@ using namespace mori::shmem;
     } while(0)
 
 // Test 1 & 2 & 5: SDMA PUT + Quiet (local signal), supports zero-size
-// Calls SDMA-specific kernel directly (DISPATCH_TRANSPORT_TYPE doesn't handle SDMA)
+// Uses separate src (source data) and dst (destination on remote PE) buffers
+// to avoid L2 cache pollution on the receive side.
 __global__ void ShmemPutQuietKernel(
-    const SymmMemObjPtr memObj,
+    const SymmMemObjPtr srcObj,
+    const SymmMemObjPtr dstObj,
     int myPe, int destPe,
     size_t bytes) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
-  if (threadIdx.x == 0 && bytes > 0) {
-    printf("PE %d->%d: localPtr=%p peerPtrs[%d]=%p dh=%p sig=%p bytes=%zu\n",
-           myPe, destPe,
-           memObj->localPtr,
-           destPe, (void*)memObj->peerPtrs[destPe],
-           (void*)(memObj->deviceHandles_d + destPe * memObj->sdmaNumQueue),
-           (void*)(memObj->signalPtrs + destPe * memObj->sdmaNumQueue),
-           bytes);
-  }
-  ShmemPutMemNbiThreadKernel<TransportType::SDMA>(memObj, 0, memObj, 0, bytes, destPe, 0);
-  ShmemQuietThread(destPe, memObj);
+  // PUT: read from srcObj (local), write to dstObj (remote via peerPtrs)
+  ShmemPutMemNbiThreadKernel<TransportType::SDMA>(dstObj, 0, srcObj, 0, bytes, destPe, 0);
+  ShmemQuietThread(destPe, dstObj);
 }
 
 // Test 3: Remote signal PUT (bypass ShmemQuiet, write directly to remote signal)
@@ -136,10 +130,15 @@ void runTests() {
   int senderPe = (myPe - 1 + npes) % npes;
   const size_t maxBuf = 32 * 1024 * 1024;
 
-  void* buf = ShmemMalloc(maxBuf);
-  assert(buf);
-  SymmMemObjPtr memObj = ShmemQueryMemObjPtr(buf);
-  assert(memObj.IsValid());
+  // Two separate symmetric buffers:
+  // srcBuf: filled with myPe+1 pattern, used as source for sending
+  // dstBuf: never touched by CU (no L2 pollution), used as destination for receiving
+  void* srcBuf = ShmemMalloc(maxBuf);
+  void* dstBuf = ShmemMalloc(maxBuf);
+  assert(srcBuf && dstBuf);
+  SymmMemObjPtr srcMemObj = ShmemQueryMemObjPtr(srcBuf);
+  SymmMemObjPtr dstMemObj = ShmemQueryMemObjPtr(dstBuf);
+  assert(srcMemObj.IsValid() && dstMemObj.IsValid());
 
   hipStream_t stream;
   CHECK_HIP(hipStreamCreate(&stream));
@@ -148,32 +147,26 @@ void runTests() {
     printf("\n=== SDMA PUT Test Suite (sdma-batch) ===\n");
     printf("  PEs: %d, Testing PE %d -> PE %d\n", npes, myPe, remotePe);
     printf("  peerSignalPtrs: %s\n\n",
-           memObj->peerSignalPtrs ? "allocated" : "NULL");
+           dstMemObj->peerSignalPtrs ? "allocated" : "NULL");
   }
   MPI_Barrier(MPI_COMM_WORLD);
 
   // Helper: run shmem PUT + quiet test
+  // srcBuf: filled with myPe+1, used as source for sending
+  // dstBuf: never written by CU (avoid L2 pollution), used as receive target
   auto runShmemTest = [&](const char* name, size_t bytes) {
-    CHECK_HIP(hipMemset(buf, myPe + 1, maxBuf));
+    CHECK_HIP(hipMemset(srcBuf, myPe + 1, maxBuf));
     CHECK_HIP(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
 
-    ShmemPutQuietKernel<<<1, 1, 0, stream>>>(memObj, myPe, remotePe, bytes);
+    ShmemPutQuietKernel<<<1, 1, 0, stream>>>(srcMemObj, dstMemObj, myPe, remotePe, bytes);
     CHECK_HIP(hipStreamSynchronize(stream));
     MPI_Barrier(MPI_COMM_WORLD);
 
     bool ok = true;
     if (bytes > 0) {
-      // Force L2 cache refresh: hipMemset triggers CU writes which update L2,
-      // then SDMA data in HBM becomes visible on next read.
-      // Alternative: use a separate buffer to avoid L2 stale hits.
-      void* tmpBuf = nullptr;
-      CHECK_HIP(hipMalloc(&tmpBuf, bytes));
-      CHECK_HIP(hipMemcpy(tmpBuf, buf, bytes, hipMemcpyDeviceToDevice));
-      CHECK_HIP(hipDeviceSynchronize());
       std::vector<uint8_t> hostBuf(bytes);
-      CHECK_HIP(hipMemcpy(hostBuf.data(), tmpBuf, bytes, hipMemcpyDeviceToHost));
-      CHECK_HIP(hipFree(tmpBuf));
+      CHECK_HIP(hipMemcpy(hostBuf.data(), dstBuf, bytes, hipMemcpyDeviceToHost));
       uint8_t expected = static_cast<uint8_t>(senderPe + 1);
       for (size_t i = 0; i < bytes; i++) {
         if (hostBuf[i] != expected) {
@@ -203,25 +196,25 @@ void runTests() {
   runShmemTest("Zero-size PUT (0 bytes)", 0);
 
   // --- Test 3: Remote signal PUT ---
+  // Note: Remote signal test uses dstMemObj for both src and dst (same buffer pattern).
+  // Since dstBuf was never CU-written, L2 is clean for receiving.
   if (myPe == 0) printf("\n--- Remote signal PUT ---\n");
   {
-    CHECK_HIP(hipMemset(buf, myPe + 1, maxBuf));
+    CHECK_HIP(hipMemset(srcBuf, myPe + 1, maxBuf));
     CHECK_HIP(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
 
-    // Send 4KB using remote signal
-    RemoteSignalPutKernel<<<1, 1, 0, stream>>>(memObj, myPe, remotePe, 4096);
+    RemoteSignalPutKernel<<<1, 1, 0, stream>>>(dstMemObj, myPe, remotePe, 4096);
     CHECK_HIP(hipStreamSynchronize(stream));
     MPI_Barrier(MPI_COMM_WORLD);
 
-    // Wait for data from sender via remote signal
-    WaitRemoteSignalKernel<<<1, 1, 0, stream>>>(memObj, senderPe, 1);
+    WaitRemoteSignalKernel<<<1, 1, 0, stream>>>(dstMemObj, senderPe, 1);
     CHECK_HIP(hipStreamSynchronize(stream));
     MPI_Barrier(MPI_COMM_WORLD);
 
     bool ok = true;
     std::vector<uint8_t> hostBuf(4096);
-    CHECK_HIP(hipMemcpy(hostBuf.data(), buf, 4096, hipMemcpyDeviceToHost));
+    CHECK_HIP(hipMemcpy(hostBuf.data(), dstBuf, 4096, hipMemcpyDeviceToHost));
     uint8_t expected = static_cast<uint8_t>(senderPe + 1);
     for (size_t i = 0; i < 4096; i++) {
       if (hostBuf[i] != expected) { ok = false; break; }
@@ -237,11 +230,11 @@ void runTests() {
   {
     MPI_Barrier(MPI_COMM_WORLD);
 
-    RemoteSignalPutKernel<<<1, 1, 0, stream>>>(memObj, myPe, remotePe, 0);
+    RemoteSignalPutKernel<<<1, 1, 0, stream>>>(dstMemObj, myPe, remotePe, 0);
     CHECK_HIP(hipStreamSynchronize(stream));
     MPI_Barrier(MPI_COMM_WORLD);
 
-    WaitRemoteSignalKernel<<<1, 1, 0, stream>>>(memObj, senderPe, 2);
+    WaitRemoteSignalKernel<<<1, 1, 0, stream>>>(dstMemObj, senderPe, 2);
     CHECK_HIP(hipStreamSynchronize(stream));
     MPI_Barrier(MPI_COMM_WORLD);
 
