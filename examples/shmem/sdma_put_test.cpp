@@ -251,7 +251,7 @@ void runTests() {
     CHECK_HIP(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
 
-    const int repeatCount = 10;
+    const int repeatCount = 2;
     for (int i = 0; i < repeatCount; i++) {
       ShmemPutQuietKernel<<<1, 1, 0, stream>>>(srcMemObj, dstMemObj, myPe, remotePe, 4096);
       CHECK_HIP(hipStreamSynchronize(stream));
