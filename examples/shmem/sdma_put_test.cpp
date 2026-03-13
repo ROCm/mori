@@ -46,20 +46,20 @@ __global__ void ShmemPutQuietKernel(
 }
 
 // Test 3: Remote signal PUT (bypass ShmemQuiet, write directly to remote signal)
+// Uses dstObj for both addressing (peerPtrs, deviceHandles) and signal
 __global__ void RemoteSignalPutKernel(
-    const SymmMemObjPtr memObj,
+    const SymmMemObjPtr dstObj,
     int myPe, int destPe,
     size_t bytes) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
-  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(memObj->localPtr);
-  uint8_t* dstPtr = reinterpret_cast<uint8_t*>(memObj->peerPtrs[destPe]);
+  uint8_t* srcPtr = reinterpret_cast<uint8_t*>(dstObj->localPtr);
+  uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dstObj->peerPtrs[destPe]);
 
-  anvil::SdmaQueueDeviceHandle** dh = memObj->deviceHandles_d + destPe * memObj->sdmaNumQueue;
+  anvil::SdmaQueueDeviceHandle** dh = dstObj->deviceHandles_d + destPe * dstObj->sdmaNumQueue;
 
-  // Use remote signal: write to destPe's signalPtrs at slot [myPe * numQ + 0]
-  HSAuint64* remoteSignal = memObj->peerSignalPtrs[destPe]
-                            + static_cast<size_t>(myPe) * memObj->sdmaNumQueue;
+  HSAuint64* remoteSignal = dstObj->peerSignalPtrs[destPe]
+                            + static_cast<size_t>(myPe) * dstObj->sdmaNumQueue;
 
   // Manual SDMA PUT with remote signal
   if (bytes > 0) {
@@ -247,20 +247,20 @@ void runTests() {
   // --- Test 4: Repeated PUTs ---
   if (myPe == 0) printf("\n--- Repeated PUTs ---\n");
   {
-    CHECK_HIP(hipMemset(buf, myPe + 1, maxBuf));
+    CHECK_HIP(hipMemset(srcBuf, myPe + 1, maxBuf));
     CHECK_HIP(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
 
     const int repeatCount = 10;
     for (int i = 0; i < repeatCount; i++) {
-      ShmemPutQuietKernel<<<1, 1, 0, stream>>>(memObj, myPe, remotePe, 4096);
+      ShmemPutQuietKernel<<<1, 1, 0, stream>>>(srcMemObj, dstMemObj, myPe, remotePe, 4096);
       CHECK_HIP(hipStreamSynchronize(stream));
       MPI_Barrier(MPI_COMM_WORLD);
     }
 
     bool ok = true;
     std::vector<uint8_t> hostBuf(4096);
-    CHECK_HIP(hipMemcpy(hostBuf.data(), buf, 4096, hipMemcpyDeviceToHost));
+    CHECK_HIP(hipMemcpy(hostBuf.data(), dstBuf, 4096, hipMemcpyDeviceToHost));
     uint8_t expected = static_cast<uint8_t>(senderPe + 1);
     for (size_t i = 0; i < 4096; i++) {
       if (hostBuf[i] != expected) { ok = false; break; }
@@ -280,7 +280,8 @@ void runTests() {
   }
 
   CHECK_HIP(hipStreamDestroy(stream));
-  ShmemFree(buf);
+  ShmemFree(srcBuf);
+  ShmemFree(dstBuf);
   MPI_Barrier(MPI_COMM_WORLD);
   ShmemFinalize();
 }
