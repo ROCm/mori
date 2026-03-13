@@ -30,14 +30,15 @@ using namespace mori::shmem;
         } \
     } while(0)
 
-// Test 1 & 2 & 5: Shmem PUT + Quiet (local signal), supports zero-size
+// Test 1 & 2 & 5: SDMA PUT + Quiet (local signal), supports zero-size
+// Calls SDMA-specific kernel directly (DISPATCH_TRANSPORT_TYPE doesn't handle SDMA)
 __global__ void ShmemPutQuietKernel(
     const SymmMemObjPtr memObj,
     int myPe, int destPe,
     size_t bytes) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
-  ShmemPutMemNbiThread(memObj, 0, memObj, 0, bytes, destPe, 0);
+  ShmemPutMemNbiThreadKernel<TransportType::SDMA>(memObj, 0, memObj, 0, bytes, destPe, 0);
   ShmemQuietThread(destPe, memObj);
 }
 
