@@ -24,7 +24,7 @@
  * @acknowledgements:
  * - Original implementation by: Sidler, David
  * - Source: https://github.com/AARInternal/shader_sdma
- * 
+ *
  * @note: This code is adapted/modified from the implementation by Sidler, David
  */
 
@@ -135,4 +135,13 @@ inline void EnablePeerAccess(int const deviceId, int const peerDeviceId) {
               << " (" << hipGetErrorString(error) << ")\n";
   }
 }
+inline int GetSdmaNumChannels(int defaultVal = 2) {
+  const char* env = std::getenv("MORI_SDMA_NUM_CHANNELS");
+  if (env != nullptr) {
+    int val = std::atoi(env);
+    if (val >= 1) return val;
+  }
+  return defaultVal;
+}
+
 }  // namespace anvil

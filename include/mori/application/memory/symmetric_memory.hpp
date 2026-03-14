@@ -74,7 +74,7 @@ struct SymmMemObj {
   // For Sdma
   anvil::SdmaQueueDeviceHandle** deviceHandles_d = nullptr;  // should only placed on GPU
   HSAuint64* signalPtrs = nullptr;                           // should only placed on GPU
-  uint32_t sdmaNumQueue = 8;                                 // number of sdma queue
+  uint32_t sdmaNumQueue = 2;                                 // number of sdma queue
   HSAuint64* expectSignalsPtr = nullptr;                     // should only placed on GPU
   HSAuint64* fencePtrs = nullptr;  // FENCE completion addresses, should only placed on GPU
 

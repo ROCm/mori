@@ -176,7 +176,8 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
   memFlags.ui32.ExecuteAccess = 1;
   memFlags.ui32.Uncached = 1;
 
-  MORI_APP_INFO("Allocating SDMA Queue Buffer for device: {}", localNodeId);
+  MORI_APP_INFO("Allocating SDMA Queue Buffer for device: {} remote device: {} engineId: {}",
+                localDeviceId, remoteDeviceId, engineId);
 
   CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(localNodeId, SDMA_QUEUE_SIZE, memFlags, &queueBuffer_),
                        "Failed");
@@ -189,7 +190,9 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
   CHECK_HSAKMT_SUCCESS(hsaKmtCreateQueueExt(localNodeId, HSA_QUEUE_SDMA_BY_ENG_ID,
                                             DEFAULT_QUEUE_PERCENTAGE, DEFAULT_PRIORITY, engineId,
                                             queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &queue_),
-                       "Failed");
+                       fmt::format("hsaKmtCreateQueueExt failed: localDevice={}, remoteDevice={}, "
+                                   "localNodeId={}, engineId={}",
+                                   localDeviceId, remoteDeviceId, localNodeId, engineId));
 
   // Populate Device Handle
   // TODO uncached
