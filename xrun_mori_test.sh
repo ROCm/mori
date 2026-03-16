@@ -91,7 +91,6 @@ export XLA_FLAGS="--xla_gpu_enable_cublaslt=true \
            --xla_gpu_autotune_level=0 \
             --xla_gpu_enable_nccl_comm_splitting=false \
             --xla_gpu_collectives_use_persistent_cliques=true \
-           --xla_gpu_enable_triton_softmax_fusion=false \
            --xla_dump_to=$DUMP_DIR \
            --xla_gpu_enable_all_gather_combine_by_dim=false \
            --xla_gpu_enable_reduce_scatter_combine_by_dim=false \
