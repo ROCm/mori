@@ -258,16 +258,6 @@ std::optional<AllocateResult> ClientRegistry::AllocateForPut(const std::string& 
         for (auto& a : record.dram_allocators) total_avail += a.AvailableBytes();
         record.tier_capacities[tier].available_bytes = total_avail;
 
-        // #region agent log
-        auto& alloc = record.dram_allocators[i];
-        spdlog::warn("[DBG-f56c2e] AllocateForPut node={} tier={} buf={} offset={} size={} "
-                     "used={}/{} bump={} freelist_size={}",
-                     node_id, TierTypeName(tier), i, *offset, size,
-                     alloc.used_size, alloc.total_size,
-                     alloc.offset_tracker ? alloc.offset_tracker->bump : 0,
-                     alloc.offset_tracker ? alloc.offset_tracker->free_list.size() : 0);
-        // #endregion
-
         AllocateResult result;
         result.peer_address = record.peer_address;
         result.engine_desc_bytes = record.engine_desc_bytes;
@@ -318,15 +308,6 @@ void ClientRegistry::DeallocateForUnregister(const std::string& node_id, TierTyp
 
   if (tier == TierType::DRAM || tier == TierType::HBM) {
     if (buffer_index < record.dram_allocators.size()) {
-      // #region agent log
-      auto& alloc = record.dram_allocators[buffer_index];
-      spdlog::warn("[DBG-f56c2e] Deallocate node={} tier={} buf={} offset={} size={} "
-                   "used_before={}/{} bump={} freelist_before={}",
-                   node_id, TierTypeName(tier), buffer_index, offset, size,
-                   alloc.used_size, alloc.total_size,
-                   alloc.offset_tracker ? alloc.offset_tracker->bump : 0,
-                   alloc.offset_tracker ? alloc.offset_tracker->free_list.size() : 0);
-      // #endregion
       record.dram_allocators[buffer_index].Deallocate(offset, size);
       uint64_t total_avail = 0;
       for (auto& a : record.dram_allocators) total_avail += a.AvailableBytes();

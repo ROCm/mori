@@ -328,12 +328,6 @@ bool PoolClient::Put(const std::string& key, const void* src, size_t size,
   location.size = size;
   location.tier = result->tier;
 
-  // #region agent log
-  spdlog::warn("[DBG-f56c2e] Put key={} node={} tier={} buf={} offset={} is_local={} size={}",
-               key, result->node_id, TierTypeName(result->tier),
-               result->buffer_index, result->allocated_offset, is_local, size);
-  // #endregion
-
   if (is_local && result->tier == TierType::DRAM) {
     ok = PutLocalDram(result->buffer_index, src, size, result->allocated_offset);
     location.location_id = std::to_string(result->buffer_index) + ":" +
@@ -399,11 +393,6 @@ bool PoolClient::Get(const std::string& key, void* dst, size_t size,
 
   const auto& loc = result->location;
   bool is_local = (loc.node_id == config_.master_config.node_id);
-
-  // #region agent log
-  spdlog::warn("[DBG-f56c2e] Get key={} node={} tier={} location_id={} is_local={} size={}",
-               key, loc.node_id, TierTypeName(loc.tier), loc.location_id, is_local, size);
-  // #endregion
 
   if (is_local && loc.tier == TierType::DRAM) {
     auto parsed = ParseLocationId(loc.location_id);
