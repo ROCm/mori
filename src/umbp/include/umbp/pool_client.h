@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -68,7 +69,7 @@ class PoolClient {
 
  private:
   PoolClientConfig config_;
-  bool initialized_ = false;
+  std::atomic<bool> initialized_{false};
 
   std::unique_ptr<MasterClient> master_client_;
 

@@ -20,21 +20,22 @@ struct ParsedLocationId {
   uint64_t offset = 0;
 };
 
-ParsedLocationId ParseLocationId(const std::string& location_id) {
-  ParsedLocationId result;
+std::optional<ParsedLocationId> ParseLocationId(const std::string& location_id) {
   auto colon = location_id.find(':');
   if (colon == std::string::npos) {
-    spdlog::error("[PoolClient] Invalid location_id format (expected 'buffer_index:offset'): {}",
+    spdlog::error("[PoolClient] Invalid location_id format (expected 'index:value'): {}",
                   location_id);
-    return result;
+    return std::nullopt;
   }
   try {
+    ParsedLocationId result;
     result.buffer_index = static_cast<uint32_t>(std::stoul(location_id.substr(0, colon)));
     result.offset = std::stoull(location_id.substr(colon + 1));
+    return result;
   } catch (...) {
     spdlog::error("[PoolClient] Failed to parse location_id: {}", location_id);
+    return std::nullopt;
   }
-  return result;
 }
 
 struct ParsedSsdLocationId {
@@ -285,6 +286,24 @@ bool PoolClient::Put(const std::string& key, const void* src, size_t size,
     return false;
   }
 
+  // If key already exists, remove the old entry first to avoid resource leaks
+  {
+    Location old_loc;
+    bool has_old = false;
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex_);
+      auto it = location_cache_.find(key);
+      if (it != location_cache_.end()) {
+        old_loc = it->second;
+        has_old = true;
+        location_cache_.erase(it);
+      }
+    }
+    if (has_old) {
+      master_client_->Unregister(key, old_loc);
+    }
+  }
+
   std::optional<RoutePutResult> result;
   auto status = master_client_->RoutePut(key, size, &result);
   if (!status.ok()) {
@@ -337,7 +356,8 @@ bool PoolClient::Put(const std::string& key, const void* src, size_t size,
 
   status = master_client_->Register(key, location);
   if (!status.ok()) {
-    spdlog::error("[PoolClient] Register failed: {}", status.error_message());
+    spdlog::error("[PoolClient] Register failed: {}, attempting rollback", status.error_message());
+    master_client_->Unregister(key, location);
     return false;
   }
 
@@ -372,17 +392,19 @@ bool PoolClient::Get(const std::string& key, void* dst, size_t size,
 
   if (is_local && loc.tier == TierType::DRAM) {
     auto parsed = ParseLocationId(loc.location_id);
-    return GetLocalDram(parsed.buffer_index, dst, size, parsed.offset);
+    if (!parsed) return false;
+    return GetLocalDram(parsed->buffer_index, dst, size, parsed->offset);
   } else if (is_local && loc.tier == TierType::SSD) {
     auto parsed = ParseSsdLocationId(loc.location_id);
     return GetLocalSsd(parsed.filename, dst, size, parsed.store_index);
   } else if (!is_local && loc.tier == TierType::DRAM) {
     auto parsed = ParseLocationId(loc.location_id);
+    if (!parsed) return false;
     auto& peer = GetOrConnectPeer(loc.node_id, result->peer_address,
                                   result->engine_desc_bytes,
                                   result->dram_memory_desc_bytes,
-                                  parsed.buffer_index);
-    return RemoteDramRead(peer, parsed.buffer_index, dst, size, parsed.offset, zero_copy);
+                                  parsed->buffer_index);
+    return RemoteDramRead(peer, parsed->buffer_index, dst, size, parsed->offset, zero_copy);
   } else if (!is_local && loc.tier == TierType::SSD) {
     auto& peer = GetOrConnectPeer(loc.node_id, result->peer_address,
                                   result->engine_desc_bytes,
@@ -720,7 +742,10 @@ bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key,
                                 bool zero_copy, uint32_t store_index) {
   if (!io_engine_) return false;
   // SSD staging is split in half: write region = [0, size/2)
-  size_t max_ssd_staging = config_.staging_buffer_size / 2;
+  // Use min of local and remote staging size for bounds check
+  size_t effective_staging = peer.ssd_staging_size > 0
+      ? std::min(config_.staging_buffer_size, peer.ssd_staging_size) : config_.staging_buffer_size;
+  size_t max_ssd_staging = effective_staging / 2;
   if (!zero_copy && size > max_ssd_staging) {
     spdlog::error("[PoolClient] RemoteSsdWrite: size {} exceeds SSD staging write region {}",
                   size, max_ssd_staging);
@@ -816,7 +841,9 @@ bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
                                size_t size, bool zero_copy) {
   if (!io_engine_) return false;
   // SSD staging is split in half: read region = [size/2, size)
-  size_t max_ssd_staging = config_.staging_buffer_size / 2;
+  size_t effective_staging = peer.ssd_staging_size > 0
+      ? std::min(config_.staging_buffer_size, peer.ssd_staging_size) : config_.staging_buffer_size;
+  size_t max_ssd_staging = effective_staging / 2;
   if (!zero_copy && size > max_ssd_staging) {
     spdlog::error("[PoolClient] RemoteSsdRead: size {} exceeds SSD staging read region {}",
                   size, max_ssd_staging);

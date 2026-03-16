@@ -70,5 +70,7 @@ add_test(NAME umbp_pool_client_multi_ssd
   COMMAND sh -c "$<TARGET_FILE:test_umbp_pool_client> --gtest_filter=PoolClientMultiSsdTest.* 2>&1; exit 0")
 add_test(NAME umbp_pool_client_ssd_full
   COMMAND sh -c "$<TARGET_FILE:test_umbp_pool_client> --gtest_filter=PoolClientSsdFullTest.* 2>&1; exit 0")
+add_test(NAME umbp_pool_client_multi_dram
+  COMMAND sh -c "$<TARGET_FILE:test_umbp_pool_client> --gtest_filter=PoolClientMultiDramTest.* 2>&1; exit 0")
 add_test(NAME umbp_pool_client_lifecycle
   COMMAND sh -c "$<TARGET_FILE:test_umbp_pool_client> --gtest_filter=PoolClientLifecycleTest.* 2>&1; exit 0")

@@ -177,7 +177,10 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
         if (colon_pos != std::string::npos) {
           try {
             buffer_index = static_cast<uint32_t>(std::stoul(location.location_id.substr(0, colon_pos)));
-            offset = std::stoull(location.location_id.substr(colon_pos + 1));
+            // DRAM: second part is numeric offset; SSD: second part is filename (offset unused)
+            if (location.tier == TierType::DRAM || location.tier == TierType::HBM) {
+              offset = std::stoull(location.location_id.substr(colon_pos + 1));
+            }
           } catch (...) {}
         }
       }

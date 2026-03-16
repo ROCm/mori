@@ -478,5 +478,123 @@ TEST_F(PoolClientLifecycleTest, DoubleInitIdempotent) {
   client.Shutdown();
 }
 
+// ---------------------------------------------------------------------------
+// Multi-DRAM buffer test
+// ---------------------------------------------------------------------------
+class PoolClientMultiDramTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    node_id_ = "test-node-multi-dram";
+    port_ = AllocPort();
+    master_addr_ = "localhost:" + std::to_string(port_);
+
+    // Two small DRAM buffers (128 bytes each)
+    dram_buf_0_ = std::make_unique<char[]>(128);
+    dram_buf_1_ = std::make_unique<char[]>(128);
+    std::memset(dram_buf_0_.get(), 0, 128);
+    std::memset(dram_buf_1_.get(), 0, 128);
+
+    MasterServerConfig master_config;
+    master_config.listen_address = "0.0.0.0:" + std::to_string(port_);
+    master_config.registry_config.heartbeat_ttl = std::chrono::seconds(30);
+    master_config.put_strategy =
+        std::make_unique<LocalOnlyPutStrategy>(node_id_, TierType::DRAM);
+
+    master_ = std::make_unique<MasterServer>(std::move(master_config));
+    master_thread_ = std::thread([this] { master_->Run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    PoolClientConfig client_config;
+    client_config.master_config.master_address = master_addr_;
+    client_config.master_config.node_id = node_id_;
+    client_config.master_config.node_address = "localhost";
+    client_config.master_config.auto_heartbeat = false;
+    client_config.dram_buffers.push_back({dram_buf_0_.get(), 128});
+    client_config.dram_buffers.push_back({dram_buf_1_.get(), 128});
+    client_config.tier_capacities[TierType::DRAM] = {256, 256};
+
+    client_ = std::make_unique<PoolClient>(std::move(client_config));
+    ASSERT_TRUE(client_->Init());
+  }
+
+  void TearDown() override {
+    if (client_) {
+      client_->Shutdown();
+      client_.reset();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    if (master_) {
+      master_->Shutdown();
+    }
+    if (master_thread_.joinable()) {
+      master_thread_.join();
+    }
+    master_.reset();
+  }
+
+  std::string node_id_;
+  uint16_t port_;
+  std::string master_addr_;
+  std::unique_ptr<char[]> dram_buf_0_;
+  std::unique_ptr<char[]> dram_buf_1_;
+  std::unique_ptr<MasterServer> master_;
+  std::thread master_thread_;
+  std::unique_ptr<PoolClient> client_;
+};
+
+TEST_F(PoolClientMultiDramTest, PutGetAcrossBuffers) {
+  // Fill buffer 0 (128 bytes) then overflow to buffer 1
+  std::string data_a(64, 'A');
+  std::string data_b(64, 'B');
+  std::string data_c(64, 'C');
+
+  // First two Puts should go to buffer 0
+  ASSERT_TRUE(client_->Put("dram-multi-a", data_a.data(), data_a.size()));
+  ASSERT_TRUE(client_->Put("dram-multi-b", data_b.data(), data_b.size()));
+
+  // Buffer 0 is now full (128 bytes used). Third Put should go to buffer 1
+  ASSERT_TRUE(client_->Put("dram-multi-c", data_c.data(), data_c.size()));
+
+  // Verify all Get correctly
+  std::vector<char> dst(64, 0);
+
+  ASSERT_TRUE(client_->Get("dram-multi-a", dst.data(), dst.size()));
+  EXPECT_EQ(std::string(dst.begin(), dst.end()), data_a);
+
+  ASSERT_TRUE(client_->Get("dram-multi-b", dst.data(), dst.size()));
+  EXPECT_EQ(std::string(dst.begin(), dst.end()), data_b);
+
+  ASSERT_TRUE(client_->Get("dram-multi-c", dst.data(), dst.size()));
+  EXPECT_EQ(std::string(dst.begin(), dst.end()), data_c);
+
+  // Remove all and verify capacity recovered
+  ASSERT_TRUE(client_->Remove("dram-multi-a"));
+  ASSERT_TRUE(client_->Remove("dram-multi-b"));
+  ASSERT_TRUE(client_->Remove("dram-multi-c"));
+
+  // Should be able to Put again after removal
+  ASSERT_TRUE(client_->Put("dram-multi-d", data_a.data(), data_a.size()));
+  ASSERT_TRUE(client_->Get("dram-multi-d", dst.data(), dst.size()));
+  EXPECT_EQ(std::string(dst.begin(), dst.end()), data_a);
+  client_->Remove("dram-multi-d");
+}
+
+TEST_F(PoolClientMultiDramTest, AllBuffersFull) {
+  // Fill both buffers completely (128 + 128 = 256 bytes)
+  std::string big(128, 'X');
+  ASSERT_TRUE(client_->Put("fill-0", big.data(), big.size()));
+  ASSERT_TRUE(client_->Put("fill-1", big.data(), big.size()));
+
+  // Third Put should fail - no space
+  std::string small(1, 'Y');
+  EXPECT_FALSE(client_->Put("overflow", small.data(), small.size()));
+
+  // Remove one, now space available
+  ASSERT_TRUE(client_->Remove("fill-0"));
+  ASSERT_TRUE(client_->Put("reuse", small.data(), small.size()));
+  client_->Remove("reuse");
+  client_->Remove("fill-1");
+}
+
 }  // namespace
 }  // namespace mori::umbp

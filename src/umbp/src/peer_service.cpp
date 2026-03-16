@@ -54,6 +54,12 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       return grpc::Status::OK;
     }
 
+    if (request->staging_offset() + request->size() > ssd_staging_size_ / 2) {
+      spdlog::error("[PeerService] CommitSsdWrite: staging_offset + size exceeds write region");
+      response->set_success(false);
+      return grpc::Status::OK;
+    }
+
     const void* src = static_cast<const uint8_t*>(ssd_staging_base_) + request->staging_offset();
     std::string filename = target.dir + "/" + request->key() + ".bin";
 
@@ -89,6 +95,13 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
 
     // Read region occupies the second half of the staging buffer
     const uint64_t read_offset = ssd_staging_size_ / 2;
+
+    if (request->size() > ssd_staging_size_ / 2) {
+      spdlog::error("[PeerService] PrepareSsdRead: size {} exceeds read region {}", 
+                    request->size(), ssd_staging_size_ / 2);
+      response->set_success(false);
+      return grpc::Status::OK;
+    }
 
     // Parse store_index from ssd_location_id (format: "store_index:filename" or just "filename")
     const auto& loc_id = request->ssd_location_id();
@@ -176,6 +189,10 @@ void PeerServiceServer::Start(uint16_t port) {
   builder.RegisterService(service_.get());
   server_ = builder.BuildAndStart();
 
+  if (!server_) {
+    spdlog::error("[PeerService] Failed to start on {} (port may be in use)", address);
+    return;
+  }
   spdlog::info("[PeerService] Listening on {}", address);
 }
 

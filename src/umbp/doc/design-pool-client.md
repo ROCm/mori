@@ -35,6 +35,20 @@ cluster.
 - **Remote SSD**: Target is another node, tier=SSD. Two-phase transfer — RDMA write
   into remote DRAM staging area, then PeerService RPC to persist to SSD via PosixFile.
 
+**Multi-storage-unit support**: Each tier supports registering multiple independent
+storage units:
+
+- **DRAM**: Multiple independent DRAM buffers, each with its own `PoolAllocator`
+  (with `OffsetTracker`) and `MemoryDesc`. Configured via
+  `std::vector<ExportableDram> dram_buffers`. On `RoutePut`, the Master iterates the
+  node's DRAM allocator vector and selects the first buffer with sufficient space,
+  returning a `buffer_index` identifying the selected buffer.
+- **SSD**: Multiple independent SSD storage directories, each with its own
+  `PoolAllocator` (capacity-only). Configured via
+  `std::vector<ExportableSsd> ssd_stores`. On `RoutePut`, the Master iterates the
+  node's SSD allocator vector and selects the first store with sufficient capacity,
+  returning a `buffer_index` (i.e., `store_index`).
+
 ---
 
 ## 2. Architecture
@@ -120,9 +134,25 @@ struct PoolAllocator {
 };
 ```
 
-Each node has a `std::map<TierType, PoolAllocator>` in its `ClientRecord`. On
-`Unregister`, the Master calls `Deallocate` on the corresponding tier's allocator
-to reclaim capacity (and offset, for DRAM).
+Each node maintains **per-buffer/per-store allocator vectors** in its `ClientRecord`:
+
+```cpp
+std::vector<PoolAllocator> dram_allocators;  // one per DRAM buffer (with OffsetTracker)
+std::vector<PoolAllocator> ssd_allocators;   // one per SSD store (capacity-only)
+```
+
+- **DRAM**: `dram_allocators[i]` corresponds to the i-th DRAM buffer, each independently
+  managing offsets and capacity.
+- **SSD**: `ssd_allocators[i]` corresponds to the i-th SSD store directory, each
+  independently managing capacity.
+
+`RoutePut` iterates the allocator vector for the corresponding tier and selects the
+first allocator with sufficient space, returning that allocator's index as
+`buffer_index`.
+
+On `Unregister`, the Master extracts the `buffer_index` encoded in `location_id` to
+find the corresponding allocator and calls `Deallocate` to reclaim capacity (and
+offset, for DRAM).
 
 ### 3.2 PeerService for SSD Operations and IO Engine Handshake
 
@@ -164,13 +194,16 @@ Minimal additions to support PoolClient:
 
 ```protobuf
 message RegisterClientRequest {
-  string node_id                      = 1;
-  string node_address                 = 2;
+  string node_id                        = 1;
+  string node_address                   = 2;
   repeated TierCapacity tier_capacities = 3;
-  // --- NEW fields ---
-  string peer_address                 = 4;  // PeerService gRPC address
-  bytes  engine_desc                  = 5;  // packed EngineDesc (for IO Engine setup)
-  bytes  dram_memory_desc             = 6;  // packed MemoryDesc (RDMA-registered DRAM)
+  // --- Data-plane fields ---
+  string peer_address                   = 4;   // PeerService gRPC address
+  bytes  engine_desc                    = 5;   // packed EngineDesc
+  bytes  dram_memory_desc               = 6;   // DEPRECATED: single-buffer compat
+  repeated bytes  dram_memory_descs     = 10;  // per-buffer packed MemoryDesc
+  repeated uint64 dram_buffer_sizes     = 11;  // size of each DRAM buffer in bytes
+  repeated uint64 ssd_store_capacities  = 12;  // per-SSD-store capacity in bytes
 }
 
 message RoutePutResponse {
@@ -178,20 +211,21 @@ message RoutePutResponse {
   string   node_id          = 2;
   string   node_address     = 3;
   TierType tier             = 4;
-  // --- NEW fields ---
-  string   peer_address     = 5;  // target node's PeerService address
-  bytes    engine_desc      = 6;  // target node's packed EngineDesc
-  bytes    dram_memory_desc = 7;  // target node's packed MemoryDesc (DRAM)
-  uint64   allocated_offset = 8;  // Master-allocated offset (DRAM tier only)
+  // --- Data-plane fields ---
+  string   peer_address     = 5;   // target node's PeerService address
+  bytes    engine_desc      = 6;   // target node's packed EngineDesc
+  bytes    dram_memory_desc = 7;   // target node's packed MemoryDesc (selected buffer)
+  uint64   allocated_offset = 8;   // Master-allocated offset (DRAM tier only)
+  uint32   buffer_index     = 9;   // index of selected DRAM buffer / SSD store
 }
 
 message RouteGetResponse {
   bool     found            = 1;
   Location source           = 2;
-  // --- NEW fields ---
-  string   peer_address     = 3;  // source node's PeerService address
-  bytes    engine_desc      = 4;  // source node's packed EngineDesc
-  bytes    dram_memory_desc = 5;  // source node's packed MemoryDesc (DRAM)
+  // --- Data-plane fields ---
+  string   peer_address     = 3;   // source node's PeerService address
+  bytes    engine_desc      = 4;   // source node's packed EngineDesc
+  bytes    dram_memory_desc = 5;   // source node's packed MemoryDesc (DRAM)
 }
 ```
 
@@ -256,13 +290,16 @@ struct ClientRecord {
     std::chrono::steady_clock::time_point registered_at;
     std::map<TierType, TierCapacity> tier_capacities;
 
-    // --- NEW fields for PoolClient integration ---
+    // --- PoolClient integration fields ---
     std::string peer_address;                     // PeerService gRPC address
     std::vector<uint8_t> engine_desc_bytes;       // packed EngineDesc
-    std::vector<uint8_t> dram_memory_desc_bytes;  // packed MemoryDesc (DRAM)
-    std::map<TierType, PoolAllocator> allocators; // per-tier allocation
-    // DRAM: PoolAllocator with offset_tracker (offset + capacity)
-    // SSD:  PoolAllocator without offset_tracker (capacity only)
+
+    // Multi-DRAM-buffer support: each buffer has its own MemoryDesc + PoolAllocator
+    std::vector<std::vector<uint8_t>> dram_memory_desc_bytes_list;
+    std::vector<PoolAllocator> dram_allocators;   // per-buffer (with OffsetTracker)
+
+    // Multi-SSD-store support: each store has its own PoolAllocator
+    std::vector<PoolAllocator> ssd_allocators;    // per-store (capacity-only)
 };
 ```
 
@@ -278,11 +315,12 @@ struct RoutePutResult {
     std::string node_address;
     TierType tier;
 
-    // --- NEW ---
+    // --- Data-plane fields ---
     std::string peer_address;
     std::vector<uint8_t> engine_desc_bytes;
     std::vector<uint8_t> dram_memory_desc_bytes;
     uint64_t allocated_offset = 0;  // valid for DRAM tier only
+    uint32_t buffer_index = 0;      // index of selected DRAM buffer / SSD store
 };
 ```
 
@@ -297,8 +335,10 @@ Router::RoutePut(key, node_id, block_size):
         if !result: return nullopt              // all candidates exhausted
 
         alloc = registry_.AllocateForPut(result.node_id, result.tier, block_size)
+        // AllocateForPut internally iterates dram_allocators / ssd_allocators vector,
+        // selects the first allocator with sufficient space, returns {offset, buffer_index}
         if alloc:
-            // merge alloc info into result (peer_address, engine_desc, etc.)
+            // merge alloc info into result (peer_address, engine_desc, buffer_index, etc.)
             return result
 
         // allocation failed — remove this (node, tier) from candidates and retry
@@ -326,24 +366,31 @@ handled by PeerService using file paths.
 ```cpp
 namespace mori::umbp {
 
+struct ExportableDram {
+    void* buffer = nullptr;
+    size_t size = 0;
+};
+
+struct ExportableSsd {
+    std::string dir;
+    size_t capacity = 0;
+};
+
 struct PoolClientConfig {
     MasterClientConfig master_config;
 
     // MORI IO Engine
-    mori::io::IOEngineConfig io_config;
-    mori::io::BackendType backend_type = mori::io::BackendType::RDMA;
-    std::unique_ptr<mori::io::BackendConfig> backend_config;
+    std::string io_engine_host;
+    uint16_t io_engine_port = 0;
 
     // Local staging buffer for RDMA transfers
     size_t staging_buffer_size = 64ULL * 1024 * 1024;  // 64 MB
 
-    // Exportable DRAM buffer (optional; makes this node a storage provider)
-    void*  exportable_dram_buffer = nullptr;
-    size_t exportable_dram_buffer_size = 0;
+    // Exportable DRAM buffers (optional; supports multiple independent buffers)
+    std::vector<ExportableDram> dram_buffers;
 
-    // Exportable SSD storage (optional)
-    std::string exportable_ssd_dir;
-    size_t exportable_ssd_capacity = 0;
+    // Exportable SSD stores (optional; supports multiple independent store directories)
+    std::vector<ExportableSsd> ssd_stores;
 
     // Tier capacities to report to Master
     std::map<TierType, TierCapacity> tier_capacities;
@@ -482,17 +529,21 @@ tier may be DRAM or SSD. `PoolClient` dispatches based on
 ```
 Put(key, src, size):
     result = Master::RoutePut(key, size)
+    // result includes buffer_index (selected DRAM buffer / SSD store index)
     is_local = (result.node_id == config_.master_config.node_id)
 
     if is_local && tier == DRAM:
-        memcpy(local_dram + offset, src, size)       // direct local copy
+        memcpy(dram_buffers[buffer_index] + offset, src, size)
     elif is_local && tier == SSD:
-        PosixFile write {ssd_dir}/{key}.bin           // direct local file write
+        PosixFile write {ssd_stores[store_index].dir}/{key}.bin
     elif remote && tier == DRAM:
-        RDMA write → remote DRAM at offset            // see 8.3
+        RDMA write → remote DRAM buffer[buffer_index] at offset  // see 8.3
     elif remote && tier == SSD:
-        RDMA write → remote staging + CommitSsdWrite  // see 8.4
+        RDMA write → remote staging + CommitSsdWrite             // see 8.4
 
+    // location_id encoding:
+    //   DRAM: "buffer_index:offset" (e.g. "0:4096", "1:8192")
+    //   SSD:  "store_index:key.bin" (e.g. "0:block_001.bin", "1:block_002.bin")
     Master::Register(key, location)
     location_cache_[key] = location
 ```
@@ -500,16 +551,17 @@ Put(key, src, size):
 ```
 Get(key, dst, size):
     location = Master::RouteGet(key)  // or lookup from location_cache_
+    // parse buffer_index/store_index from location_id
     is_local = (location.node_id == config_.master_config.node_id)
 
     if is_local && tier == DRAM:
-        memcpy(dst, local_dram + offset, size)        // direct local copy
+        memcpy(dst, dram_buffers[buffer_index] + offset, size)
     elif is_local && tier == SSD:
-        PosixFile read {ssd_dir}/{key}.bin             // direct local file read
+        PosixFile read {ssd_stores[store_index].dir}/{filename}
     elif remote && tier == DRAM:
-        RDMA read ← remote DRAM at offset             // see 8.5
+        RDMA read ← remote DRAM buffer[buffer_index] at offset  // see 8.5
     elif remote && tier == SSD:
-        PrepareSsdRead + RDMA read ← remote staging   // see 8.6
+        PrepareSsdRead + RDMA read ← remote staging              // see 8.6
 ```
 
 Local paths require no RDMA or PeerService — just memcpy or PosixFile I/O.
@@ -853,28 +905,44 @@ SSD operations use standard POSIX file I/O:
 
 ### 9.2 DRAM Layout
 
-A node's DRAM buffer is logically split into two regions:
+Each node can register multiple independent DRAM buffers, each separately
+RDMA-registered with its own `MemoryDesc` and `PoolAllocator`. Additionally, the node
+has a separate SSD staging buffer that is fully isolated from the DRAM exportable
+buffers, preventing SSD staging traffic from conflicting with DRAM tier offset
+allocations.
 
 ```
-  ┌──────────────────────────────────────────────────────┐
-  │              RDMA-registered DRAM Buffer              │
-  │                                                      │
-  │  ┌────────────────────┐  ┌────────────────────────┐  │
-  │  │  Main region       │  │  SSD staging region    │  │
-  │  │  (Master-managed   │  │  (PeerService-managed  │  │
-  │  │   offset alloc)    │  │   for SSD read/write)  │  │
-  │  └────────────────────┘  └────────────────────────┘  │
-  └──────────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────────────────┐
+  │  DRAM buffer 0 (RDMA-registered)  → dram_allocators[0]     │
+  │  ┌──────────────────────────────────────────────────────┐  │
+  │  │  Master-managed offset allocation for DRAM tier      │  │
+  │  └──────────────────────────────────────────────────────┘  │
+  ├────────────────────────────────────────────────────────────┤
+  │  DRAM buffer 1 (RDMA-registered)  → dram_allocators[1]     │
+  │  ┌──────────────────────────────────────────────────────┐  │
+  │  │  Master-managed offset allocation for DRAM tier      │  │
+  │  └──────────────────────────────────────────────────────┘  │
+  ├────────────────────────────────────────────────────────────┤
+  │  ... (more buffers)                                        │
+  ├────────────────────────────────────────────────────────────┤
+  │  SSD staging buffer (RDMA-registered, separate allocation) │
+  │  ┌──────────────────────────────────────────────────────┐  │
+  │  │  PeerService-managed for SSD read/write staging      │  │
+  │  │  Fully isolated from DRAM exportable buffers         │  │
+  │  └──────────────────────────────────────────────────────┘  │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-- **Main region**: Allocations managed by the Master's `PoolAllocator` (DRAM mode). Used for
-  DRAM-tier block storage. Addresses are returned in `RoutePut`.
-- **SSD staging region**: Managed locally by PeerService (`ssd_mutex_`-protected
-  fixed buffer). Temporary staging area for SSD read/write operations. Fixed reusable
-  buffer — no allocation/deallocation needed.
+- **DRAM buffer N**: Managed by the Master's `dram_allocators[N]` (with `OffsetTracker`).
+  Each buffer has its own `MemoryDesc`. `RoutePut` returns `buffer_index` and
+  `allocated_offset`.
+- **SSD staging buffer**: Separately allocated buffer (`ssd_staging_buffer_`) with its
+  own `MemoryDesc` (`ssd_staging_mem_`). Managed locally by PeerService
+  (`ssd_mutex_`-protected), used as temporary staging for SSD read/write operations.
+  Fixed reusable buffer — not managed by Master's PoolAllocator.
 
-Both regions are part of the same RDMA-registered `MemoryDesc`, but at non-overlapping
-offset ranges.
+Each DRAM buffer and the SSD staging buffer have independent RDMA-registered
+`MemoryDesc` instances with non-overlapping offset spaces.
 
 ---
 
@@ -889,9 +957,10 @@ offset ranges.
 - `include/umbp/pool_allocator.h` — PoolAllocator header
 
 **Modified files:**
-- `proto/umbp.proto` — add `peer_address`, `engine_desc`, `dram_memory_desc`,
-  `allocated_offset` fields
-- `include/umbp/types.h` — extend `ClientRecord` with peer info + per-tier `PoolAllocator`
+- `proto/umbp.proto` — add `peer_address`, `engine_desc`, `dram_memory_descs` (repeated),
+  `dram_buffer_sizes`, `ssd_store_capacities`, `buffer_index`, `allocated_offset` fields
+- `include/umbp/types.h` — extend `ClientRecord` with peer info + per-buffer/store
+  `PoolAllocator` vectors
 - `include/umbp/client.h` — `MasterClient::RegisterSelf` gains peer/engine params
 - `src/client.cpp` — implement extended `RegisterSelf`, parse new response fields
 - `src/client_registry.cpp` — store new fields in `ClientRecord`
@@ -918,7 +987,8 @@ concurrent gRPC handler threads.
 - **Solution**: `Router::RoutePut` executes in two steps internally:
   1. Shared lock to get alive clients (`GetAliveClients()`)
   2. After strategy selects a node, **exclusive lock** via
-     `registry_.AllocateForPut()` to call `allocators[tier].Allocate(block_size)`
+     `registry_.AllocateForPut()` to iterate `dram_allocators` / `ssd_allocators`
+     vector, call `Allocate(block_size)` on the first allocator with space,
      and sync `tier_capacities`
   3. If allocation fails, remove the failed (node, tier) from the local candidate
      list and retry — all within `Router::RoutePut`
@@ -970,16 +1040,18 @@ calling `RegisterSelf`, not baked into the config.
 // Existing signature
 grpc::Status RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities);
 
-// New signature: adds data-plane info for PoolClient integration
+// New signature: adds data-plane info with multi-buffer/store support
 grpc::Status RegisterSelf(
     const std::map<TierType, TierCapacity>& tier_capacities,
-    const std::string& peer_address,                    // PeerService gRPC address
-    const std::vector<uint8_t>& engine_desc_bytes,      // packed EngineDesc
-    const std::vector<uint8_t>& dram_memory_desc_bytes  // packed MemoryDesc (DRAM)
+    const std::string& peer_address,                                   // PeerService gRPC address
+    const std::vector<uint8_t>& engine_desc_bytes,                     // packed EngineDesc
+    const std::vector<std::vector<uint8_t>>& dram_memory_desc_list,    // per-buffer packed MemoryDesc
+    const std::vector<uint64_t>& dram_buffer_sizes,                    // size of each DRAM buffer
+    const std::vector<uint64_t>& ssd_store_capacities                  // capacity of each SSD store
 );
 ```
 
-Implementation: populate `RegisterClientRequest` fields 4-6 with the new params.
+Implementation: populate `RegisterClientRequest` fields 4-5 and fields 10-12.
 
 ### 12.3 RoutePut Return Value
 
@@ -991,8 +1063,8 @@ grpc::Status RoutePut(const std::string& key, uint64_t block_size,
                       std::optional<RoutePutResult>* out_result);
 ```
 
-Implementation: parse `RoutePutResponse` fields 5-8 into `RoutePutResult`'s
-`peer_address`, `engine_desc_bytes`, `dram_memory_desc_bytes`, `allocated_offset`.
+Implementation: parse `RoutePutResponse` fields 5-9 into `RoutePutResult`'s
+`peer_address`, `engine_desc_bytes`, `dram_memory_desc_bytes`, `allocated_offset`, `buffer_index`.
 
 ### 12.4 RouteGet Return Value
 
@@ -1117,7 +1189,28 @@ Each path tests Put → Get → verify data → Remove → verify cleanup:
 - Multiple RoutePuts allocate non-overlapping offsets
 - Full node → RoutePut routes to a different node
 
-### 13.5 Edge Case & Error Tests
+### 13.5 Multi-DRAM Buffer Tests
+
+- Register 2 DRAM buffers (e.g., 32 MB each), Put data and verify `buffer_index` is
+  correctly assigned across 0 and 1
+- When the first buffer is full, RoutePut automatically selects the second buffer
+  with `buffer_index=1`
+- When both buffers are full, RoutePut returns `found=false` (when no SSD fallback)
+- After Unregister, the corresponding buffer's allocator capacity is correctly restored
+- `location_id` encoding includes correct `buffer_index` (e.g., `"0:4096"`, `"1:0"`)
+- Local DRAM Get correctly locates the right buffer via `buffer_index`
+
+### 13.6 Multi-SSD Store Tests
+
+- Register 2 SSD stores (e.g., `/mnt/nvme0/` and `/mnt/nvme1/`), Put data and verify
+  files are written to the correct directory
+- When the first store is full, RoutePut automatically selects the second store
+  with `buffer_index=1`
+- When both stores are full, RoutePut returns `found=false` (when no DRAM fallback)
+- `location_id` encoding includes correct `store_index` (e.g., `"0:key.bin"`, `"1:key.bin"`)
+- Local SSD Get correctly locates the right directory via `store_index`
+
+### 13.7 Edge Case & Error Tests
 
 - Put when all nodes have no available space → RoutePut returns `found=false` → Put returns false
 - RDMA transfer failure → Put returns false, allocated offset needs rollback (or GC cleanup)

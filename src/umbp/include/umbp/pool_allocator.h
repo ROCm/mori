@@ -56,6 +56,10 @@ struct PoolAllocator {
 
     void Deallocate(uint64_t offset, uint64_t size) {
         if (size == 0) return;
+        if (size > used_size) {
+            used_size = 0;
+            return;
+        }
         used_size -= size;
 
         if (!offset_tracker) return;

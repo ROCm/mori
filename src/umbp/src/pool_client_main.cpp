@@ -172,6 +172,10 @@ int main(int argc, char** argv) {
   std::signal(SIGINT, SignalHandler);
   std::signal(SIGTERM, SignalHandler);
 
+  // Capture info before move
+  size_t num_dram = config.dram_buffers.size();
+  size_t num_ssd = config.ssd_stores.size();
+
   mori::umbp::PoolClient client(std::move(config));
 
   if (!client.Init()) {
@@ -182,11 +186,11 @@ int main(int argc, char** argv) {
   std::string tier_info = "none";
   if (is_provider) {
     tier_info = "";
-    if (!config.dram_buffers.empty()) {
-      tier_info += "DRAM=" + std::to_string(config.dram_buffers.size()) + "bufs ";
+    if (num_dram > 0) {
+      tier_info += "DRAM=" + std::to_string(num_dram) + "bufs ";
     }
-    if (!config.ssd_stores.empty()) {
-      tier_info += "SSD=" + std::to_string(config.ssd_stores.size()) + "dirs ";
+    if (num_ssd > 0) {
+      tier_info += "SSD=" + std::to_string(num_ssd) + "dirs ";
     }
   }
   spdlog::info("[Demo] '{}' running as {} | {} | io={}:{} peer_port={}",
