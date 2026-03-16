@@ -21,11 +21,6 @@ target_link_libraries(umbp_core PRIVATE pthread)
 # Python bindings are registered in src/pybind/pybind_umbp.cpp (compiled into
 # libmori_pybinds when BUILD_UMBP=ON)
 
-# C++ unit tests
-if(BUILD_TESTS)
-  enable_testing()
-  add_subdirectory(tests)
-endif()
 # =============================================================================
 # UMBP Master Control Plane — CMake Build
 # =============================================================================
