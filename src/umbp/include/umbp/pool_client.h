@@ -118,6 +118,7 @@ class PoolClient {
   bool RemoteDramRead(PeerConnection& peer, uint32_t buffer_index,
                       void* dst, size_t size, uint64_t offset,
                       bool zero_copy);
+  bool EnsurePeerServiceConnection(PeerConnection& peer);
   bool RemoteSsdWrite(PeerConnection& peer, const std::string& key,
                       const void* src, size_t size, bool zero_copy,
                       uint32_t store_index = 0);

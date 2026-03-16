@@ -181,7 +181,7 @@ PeerServiceServer::PeerServiceServer(void* ssd_staging_base, size_t ssd_staging_
 
 PeerServiceServer::~PeerServiceServer() { Stop(); }
 
-void PeerServiceServer::Start(uint16_t port) {
+bool PeerServiceServer::Start(uint16_t port) {
   std::string address = "0.0.0.0:" + std::to_string(port);
 
   grpc::ServerBuilder builder;
@@ -191,9 +191,10 @@ void PeerServiceServer::Start(uint16_t port) {
 
   if (!server_) {
     spdlog::error("[PeerService] Failed to start on {} (port may be in use)", address);
-    return;
+    return false;
   }
   spdlog::info("[PeerService] Listening on {}", address);
+  return true;
 }
 
 void PeerServiceServer::Stop() {

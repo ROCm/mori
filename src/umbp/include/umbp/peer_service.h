@@ -24,7 +24,7 @@ class PeerServiceServer {
                     const std::vector<size_t>& ssd_capacities);
   ~PeerServiceServer();
 
-  void Start(uint16_t port);
+  bool Start(uint16_t port);
   void Stop();
 
  private:

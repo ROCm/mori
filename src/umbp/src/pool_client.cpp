@@ -151,15 +151,19 @@ bool PoolClient::Init() {
         ssd_staging_buffer_.get(), config_.staging_buffer_size,
         ssd_staging_mem_desc_bytes_,
         ssd_dirs, ssd_capacities);
-    peer_service_->Start(config_.peer_service_port);
-    spdlog::info("[PoolClient] PeerService started on port {}",
-                 config_.peer_service_port);
+    if (!peer_service_->Start(config_.peer_service_port)) {
+      spdlog::error("[PoolClient] PeerService failed to start on port {}",
+                    config_.peer_service_port);
+      peer_service_.reset();
+    } else {
+      spdlog::info("[PoolClient] PeerService started on port {}",
+                   config_.peer_service_port);
+    }
   }
 
+  // Only advertise peer_address if PeerService was actually started
   std::string peer_address;
-  if (config_.peer_service_port > 0) {
-    // Use io_engine_host for peer_address so remote nodes can reach PeerService.
-    // node_address may be "localhost" which is unreachable from other machines.
+  if (peer_service_) {
     std::string host = config_.io_engine_host.empty()
                            ? config_.master_config.node_address
                            : config_.io_engine_host;
@@ -324,6 +328,12 @@ bool PoolClient::Put(const std::string& key, const void* src, size_t size,
   location.size = size;
   location.tier = result->tier;
 
+  // #region agent log
+  spdlog::warn("[DBG-f56c2e] Put key={} node={} tier={} buf={} offset={} is_local={} size={}",
+               key, result->node_id, TierTypeName(result->tier),
+               result->buffer_index, result->allocated_offset, is_local, size);
+  // #endregion
+
   if (is_local && result->tier == TierType::DRAM) {
     ok = PutLocalDram(result->buffer_index, src, size, result->allocated_offset);
     location.location_id = std::to_string(result->buffer_index) + ":" +
@@ -389,6 +399,11 @@ bool PoolClient::Get(const std::string& key, void* dst, size_t size,
 
   const auto& loc = result->location;
   bool is_local = (loc.node_id == config_.master_config.node_id);
+
+  // #region agent log
+  spdlog::warn("[DBG-f56c2e] Get key={} node={} tier={} location_id={} is_local={} size={}",
+               key, loc.node_id, TierTypeName(loc.tier), loc.location_id, is_local, size);
+  // #endregion
 
   if (is_local && loc.tier == TierType::DRAM) {
     auto parsed = ParseLocationId(loc.location_id);
@@ -595,33 +610,8 @@ PoolClient::PeerConnection& PoolClient::GetOrConnectPeer(
     peer->dram_memories[buffer_index] = handle.get().as<mori::io::MemoryDesc>();
   }
 
-  if (!peer_address.empty()) {
-    auto channel =
-        grpc::CreateChannel(peer_address, grpc::InsecureChannelCredentials());
-    auto stub = ::umbp::UMBPPeer::NewStub(channel);
-
-    ::umbp::GetPeerInfoRequest req;
-    ::umbp::GetPeerInfoResponse resp;
-    grpc::ClientContext ctx;
-    auto grpc_status = stub->GetPeerInfo(&ctx, req, &resp);
-    if (grpc_status.ok()) {
-      if (!resp.ssd_staging_mem_desc().empty()) {
-        auto staging_handle = msgpack::unpack(
-            reinterpret_cast<const char*>(resp.ssd_staging_mem_desc().data()),
-            resp.ssd_staging_mem_desc().size());
-        peer->ssd_staging_mem = staging_handle.get().as<mori::io::MemoryDesc>();
-        peer->ssd_staging_size = resp.ssd_staging_size();
-      }
-      peer->peer_stub = std::unique_ptr<void, void (*)(void*)>(
-          stub.release(), +[](void* p) {
-            delete static_cast<::umbp::UMBPPeer::Stub*>(p);
-          });
-    } else {
-      spdlog::warn(
-          "[PoolClient] GetPeerInfo failed for node '{}': {}", node_id,
-          grpc_status.error_message());
-    }
-  }
+  // PeerService connection (stub + staging MemoryDesc) is lazy-initialized
+  // on first SSD operation. DRAM path doesn't need PeerService.
 
   auto* raw = peer.get();
   peers_.emplace(node_id, std::move(peer));
@@ -737,10 +727,46 @@ bool PoolClient::RemoteDramRead(PeerConnection& peer, uint32_t buffer_index,
 // Remote SSD path (RDMA + PeerService gRPC coordination)
 // ---------------------------------------------------------------------------
 
+bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
+  if (peer.peer_stub) return true;
+  if (peer.peer_address.empty()) {
+    spdlog::error("[PoolClient] No peer_address for PeerService connection");
+    return false;
+  }
+
+  auto channel = grpc::CreateChannel(peer.peer_address, grpc::InsecureChannelCredentials());
+  auto stub = ::umbp::UMBPPeer::NewStub(channel);
+
+  ::umbp::GetPeerInfoRequest req;
+  ::umbp::GetPeerInfoResponse resp;
+  grpc::ClientContext ctx;
+  auto status = stub->GetPeerInfo(&ctx, req, &resp);
+  if (!status.ok()) {
+    spdlog::error("[PoolClient] GetPeerInfo failed for '{}': {}",
+                  peer.peer_address, status.error_message());
+    return false;
+  }
+
+  if (!resp.ssd_staging_mem_desc().empty()) {
+    auto handle = msgpack::unpack(
+        reinterpret_cast<const char*>(resp.ssd_staging_mem_desc().data()),
+        resp.ssd_staging_mem_desc().size());
+    peer.ssd_staging_mem = handle.get().as<mori::io::MemoryDesc>();
+    peer.ssd_staging_size = resp.ssd_staging_size();
+  }
+
+  peer.peer_stub = std::unique_ptr<void, void (*)(void*)>(
+      stub.release(), +[](void* p) {
+        delete static_cast<::umbp::UMBPPeer::Stub*>(p);
+      });
+  return true;
+}
+
 bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key,
                                 const void* src, size_t size,
                                 bool zero_copy, uint32_t store_index) {
   if (!io_engine_) return false;
+  if (!EnsurePeerServiceConnection(peer)) return false;
   // SSD staging is split in half: write region = [0, size/2)
   // Use min of local and remote staging size for bounds check
   size_t effective_staging = peer.ssd_staging_size > 0
@@ -840,6 +866,7 @@ bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
                                const std::string& location_id, void* dst,
                                size_t size, bool zero_copy) {
   if (!io_engine_) return false;
+  if (!EnsurePeerServiceConnection(peer)) return false;
   // SSD staging is split in half: read region = [size/2, size)
   size_t effective_staging = peer.ssd_staging_size > 0
       ? std::min(config_.staging_buffer_size, peer.ssd_staging_size) : config_.staging_buffer_size;
