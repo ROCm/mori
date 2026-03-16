@@ -101,7 +101,7 @@ void KernelRegistry::LoadFromDirectory(const std::string& dir) {
   for (const auto& entry : fs::directory_iterator(dir)) {
     if (entry.path().extension() == ".hsaco") {
       LoadModule(entry.path().string());
-      MORI_OPS_INFO("Loaded kernel module: %s", entry.path().c_str());
+      MORI_OPS_INFO("Loaded kernel module: {}", entry.path().string());
     }
   }
   impl.loaded = true;
@@ -227,7 +227,7 @@ void KernelRegistry::AutoLoad(const std::string& base_dir) {
     // 1. Exact match: <arch>_<nic>
     auto exact = fs::path(base_dir) / arch_nic;
     if (fs::is_directory(exact)) {
-      MORI_OPS_INFO("AutoLoad: exact match %s", arch_nic.c_str());
+      MORI_OPS_INFO("AutoLoad: exact match {}", arch_nic);
       LoadFromDirectory(exact.string());
       return;
     }
@@ -237,8 +237,8 @@ void KernelRegistry::AutoLoad(const std::string& base_dir) {
       if (entry.is_directory()) {
         std::string name = entry.path().filename().string();
         if (name.find(arch + "_") == 0) {
-          MORI_OPS_INFO("AutoLoad: arch match %s (wanted %s)", name.c_str(),
-                        arch_nic.c_str());
+          MORI_OPS_INFO("AutoLoad: arch match {} (wanted {})", name,
+                        arch_nic);
           LoadFromDirectory(entry.path().string());
           return;
         }
@@ -276,7 +276,7 @@ void KernelRegistry::AutoLoad() {
   // 1. MORI_KERNEL_DIR env override
   const char* env_dir = std::getenv("MORI_KERNEL_DIR");
   if (env_dir && fs::is_directory(env_dir)) {
-    MORI_OPS_INFO("AutoLoad: using MORI_KERNEL_DIR=%s", env_dir);
+    MORI_OPS_INFO("AutoLoad: using MORI_KERNEL_DIR={}", env_dir);
     AutoLoad(std::string(env_dir));
     if (IsLoaded()) return;
   }
@@ -287,13 +287,13 @@ void KernelRegistry::AutoLoad() {
   if (!so_dir.empty()) {
     auto build_path = fs::path(so_dir) / ".." / "lib" / arch_nic;
     if (fs::is_directory(build_path)) {
-      MORI_OPS_INFO("AutoLoad: found build kernels at %s", build_path.c_str());
+      MORI_OPS_INFO("AutoLoad: found build kernels at {}", build_path.string());
       LoadFromDirectory(fs::canonical(build_path).string());
       return;
     }
     auto install_path = fs::path(so_dir) / arch_nic;
     if (fs::is_directory(install_path)) {
-      MORI_OPS_INFO("AutoLoad: found installed kernels at %s", install_path.c_str());
+      MORI_OPS_INFO("AutoLoad: found installed kernels at {}", install_path.string());
       LoadFromDirectory(install_path.string());
       return;
     }
@@ -304,7 +304,7 @@ void KernelRegistry::AutoLoad() {
   if (home) {
     auto jit_latest = fs::path(home) / ".mori" / "jit" / arch_nic / "latest";
     if (fs::is_directory(jit_latest)) {
-      MORI_OPS_INFO("AutoLoad: found JIT cache at %s", jit_latest.c_str());
+      MORI_OPS_INFO("AutoLoad: found JIT cache at {}", jit_latest.string());
       LoadFromDirectory(jit_latest.string());
       return;
     }
@@ -323,6 +323,8 @@ hipFunction_t KernelRegistry::GetFunction(const std::string& func_name) {
     hipFunction_t func;
     hipError_t err = hipModuleGetFunction(&func, mod, func_name.c_str());
     if (err == hipSuccess) {
+      // Clear any sticky error left by prior failed hipModuleGetFunction calls
+      (void)hipGetLastError();
       impl.func_cache[func_name] = func;
       return func;
     }
