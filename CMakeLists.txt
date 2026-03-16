@@ -232,6 +232,10 @@ set(SPDLOG_BUILD_BENCH
     CACHE BOOL "" FORCE)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 add_subdirectory(3rdparty/spdlog)
+# Rename spdlog/fmt namespaces to avoid symbol conflicts with ROCm's
+# librocroller.so which bundles its own spdlog. Without this, two spdlog
+# global registries coexist and cross-free causes heap corruption.
+target_compile_definitions(spdlog PUBLIC spdlog=mori_spdlog fmt=mori_fmt)
 
 add_library(mori_logging INTERFACE)
 target_include_directories(mori_logging INTERFACE include)

@@ -32,8 +32,16 @@ except ImportError:
 cur_dir = os.path.dirname(os.path.abspath(__file__))
 mori_lib_dir = os.path.abspath(os.path.join(cur_dir, ".."))
 
-_preload_libs = ["libmori_application.so", "libmori_io.so"]
+_preload_libs = ["libmori_application.so", "libmori_shmem.so", "libmori_io.so"]
 for _lib_name in _preload_libs:
+    # If already loaded (e.g. by libtorch_mori.so), reuse it to avoid
+    # double-loading and global state conflicts.
+    RTLD_NOLOAD = 0x4  # POSIX dlopen flag, not in ctypes constants
+    try:
+        ctypes.CDLL(_lib_name, mode=RTLD_NOLOAD | ctypes.RTLD_GLOBAL)
+        continue
+    except OSError:
+        pass
     _lib_full_path = os.path.join(mori_lib_dir, _lib_name)
     if os.path.exists(_lib_full_path):
         ctypes.CDLL(_lib_full_path, mode=ctypes.RTLD_GLOBAL)
