@@ -33,7 +33,8 @@ class LocalOnlyPutStrategy : public RoutePutStrategy {
       const std::vector<ClientRecord>& alive_clients,
       uint64_t block_size) override {
     for (const auto& c : alive_clients) {
-      if (c.node_id == local_node_id_) {
+      if (c.node_id == local_node_id_ &&
+          c.tier_capacities.count(tier_) > 0) {
         return RoutePutResult{c.node_id, c.node_address, tier_};
       }
     }
@@ -65,8 +66,8 @@ class PoolClientDramTest : public ::testing::Test {
     client_config.master_config.node_id = node_id_;
     client_config.master_config.node_address = "localhost";
     client_config.master_config.auto_heartbeat = false;
-    client_config.exportable_dram_buffer = dram_buffer_.data();
-    client_config.exportable_dram_buffer_size = dram_buffer_.size();
+    client_config.dram_buffers.push_back(
+        {dram_buffer_.data(), dram_buffer_.size()});
     client_config.tier_capacities[TierType::DRAM] = {
         dram_buffer_.size(), dram_buffer_.size()};
 
@@ -79,12 +80,14 @@ class PoolClientDramTest : public ::testing::Test {
       client_->Shutdown();
       client_.reset();
     }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
     if (master_) {
       master_->Shutdown();
     }
     if (master_thread_.joinable()) {
       master_thread_.join();
     }
+    master_.reset();
   }
 
   std::string node_id_;
@@ -151,8 +154,7 @@ class PoolClientSsdTest : public ::testing::Test {
     client_config.master_config.node_id = node_id_;
     client_config.master_config.node_address = "localhost";
     client_config.master_config.auto_heartbeat = false;
-    client_config.exportable_ssd_dir = ssd_dir_.string();
-    client_config.exportable_ssd_capacity = 10 * 1024 * 1024;
+    client_config.ssd_stores.push_back({ssd_dir_.string(), 10 * 1024 * 1024});
     client_config.tier_capacities[TierType::SSD] = {
         10ULL * 1024 * 1024, 10ULL * 1024 * 1024};
 
@@ -165,12 +167,14 @@ class PoolClientSsdTest : public ::testing::Test {
       client_->Shutdown();
       client_.reset();
     }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
     if (master_) {
       master_->Shutdown();
     }
     if (master_thread_.joinable()) {
       master_thread_.join();
     }
+    master_.reset();
     std::filesystem::remove_all(ssd_dir_);
   }
 
@@ -220,6 +224,198 @@ TEST_F(PoolClientSsdTest, RemoveNonexistentKey) {
   EXPECT_FALSE(client_->Remove("nonexistent-key"));
 }
 
+class PoolClientMultiSsdTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    node_id_ = "test-node-multi-ssd";
+    port_ = AllocPort();
+    master_addr_ = "localhost:" + std::to_string(port_);
+
+    std::string base = std::filesystem::temp_directory_path().string() +
+                       "/umbp_test_multi_ssd_" + std::to_string(getpid()) + "_" +
+                       std::to_string(port_);
+    ssd_dir_0_ = base + "_0";
+    ssd_dir_1_ = base + "_1";
+    std::filesystem::create_directories(ssd_dir_0_);
+    std::filesystem::create_directories(ssd_dir_1_);
+
+    MasterServerConfig master_config;
+    master_config.listen_address = "0.0.0.0:" + std::to_string(port_);
+    master_config.registry_config.heartbeat_ttl = std::chrono::seconds(30);
+    master_config.put_strategy =
+        std::make_unique<LocalOnlyPutStrategy>(node_id_, TierType::SSD);
+
+    master_ = std::make_unique<MasterServer>(std::move(master_config));
+    master_thread_ = std::thread([this] { master_->Run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    PoolClientConfig client_config;
+    client_config.master_config.master_address = master_addr_;
+    client_config.master_config.node_id = node_id_;
+    client_config.master_config.node_address = "localhost";
+    client_config.master_config.auto_heartbeat = false;
+    client_config.ssd_stores.push_back({ssd_dir_0_, 1024});
+    client_config.ssd_stores.push_back({ssd_dir_1_, 1024});
+    client_config.tier_capacities[TierType::SSD] = {2048, 2048};
+
+    client_ = std::make_unique<PoolClient>(std::move(client_config));
+    ASSERT_TRUE(client_->Init());
+  }
+
+  void TearDown() override {
+    if (client_) {
+      client_->Shutdown();
+      client_.reset();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    if (master_) {
+      master_->Shutdown();
+    }
+    if (master_thread_.joinable()) {
+      master_thread_.join();
+    }
+    master_.reset();
+    std::filesystem::remove_all(ssd_dir_0_);
+    std::filesystem::remove_all(ssd_dir_1_);
+  }
+
+  std::string node_id_;
+  uint16_t port_;
+  std::string master_addr_;
+  std::string ssd_dir_0_;
+  std::string ssd_dir_1_;
+  std::unique_ptr<MasterServer> master_;
+  std::thread master_thread_;
+  std::unique_ptr<PoolClient> client_;
+};
+
+TEST_F(PoolClientMultiSsdTest, DistributesAcrossStores) {
+  std::vector<std::string> keys;
+  for (int i = 0; i < 6; ++i) {
+    std::string key = "multi-ssd-" + std::to_string(i);
+    std::string data = "data-" + std::to_string(i) + "-payload";
+    std::vector<char> src(data.begin(), data.end());
+
+    ASSERT_TRUE(client_->Put(key, src.data(), src.size()))
+        << "Put failed for key=" << key;
+    keys.push_back(key);
+
+    std::vector<char> dst(src.size(), 0);
+    ASSERT_TRUE(client_->Get(key, dst.data(), dst.size()));
+    EXPECT_EQ(src, dst);
+  }
+
+  int files_in_0 = 0, files_in_1 = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(ssd_dir_0_)) {
+    if (entry.path().extension() == ".bin") ++files_in_0;
+  }
+  for (const auto& entry : std::filesystem::directory_iterator(ssd_dir_1_)) {
+    if (entry.path().extension() == ".bin") ++files_in_1;
+  }
+  EXPECT_EQ(files_in_0 + files_in_1, 6);
+
+  for (const auto& key : keys) {
+    ASSERT_TRUE(client_->Remove(key));
+  }
+}
+
+class PoolClientSsdFullTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    node_id_ = "test-node-ssd-full";
+    port_ = AllocPort();
+    master_addr_ = "localhost:" + std::to_string(port_);
+
+    std::string base = std::filesystem::temp_directory_path().string() +
+                       "/umbp_test_ssd_full_" + std::to_string(getpid()) + "_" +
+                       std::to_string(port_);
+    ssd_dir_0_ = base + "_0";
+    ssd_dir_1_ = base + "_1";
+    std::filesystem::create_directories(ssd_dir_0_);
+    std::filesystem::create_directories(ssd_dir_1_);
+
+    MasterServerConfig master_config;
+    master_config.listen_address = "0.0.0.0:" + std::to_string(port_);
+    master_config.registry_config.heartbeat_ttl = std::chrono::seconds(30);
+    master_config.put_strategy =
+        std::make_unique<LocalOnlyPutStrategy>(node_id_, TierType::SSD);
+
+    master_ = std::make_unique<MasterServer>(std::move(master_config));
+    master_thread_ = std::thread([this] { master_->Run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    PoolClientConfig client_config;
+    client_config.master_config.master_address = master_addr_;
+    client_config.master_config.node_id = node_id_;
+    client_config.master_config.node_address = "localhost";
+    client_config.master_config.auto_heartbeat = false;
+    client_config.ssd_stores.push_back({ssd_dir_0_, 100});
+    client_config.ssd_stores.push_back({ssd_dir_1_, 100});
+    client_config.tier_capacities[TierType::SSD] = {200, 200};
+
+    client_ = std::make_unique<PoolClient>(std::move(client_config));
+    ASSERT_TRUE(client_->Init());
+  }
+
+  void TearDown() override {
+    if (client_) {
+      client_->Shutdown();
+      client_.reset();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    if (master_) {
+      master_->Shutdown();
+    }
+    if (master_thread_.joinable()) {
+      master_thread_.join();
+    }
+    master_.reset();
+    std::filesystem::remove_all(ssd_dir_0_);
+    std::filesystem::remove_all(ssd_dir_1_);
+  }
+
+  std::string node_id_;
+  uint16_t port_;
+  std::string master_addr_;
+  std::string ssd_dir_0_;
+  std::string ssd_dir_1_;
+  std::unique_ptr<MasterServer> master_;
+  std::thread master_thread_;
+  std::unique_ptr<PoolClient> client_;
+};
+
+TEST_F(PoolClientSsdFullTest, OverflowToSecondStore) {
+  std::string data_80(80, 'A');
+  ASSERT_TRUE(client_->Put("fill-0", data_80.data(), data_80.size()));
+
+  std::string data_60(60, 'B');
+  ASSERT_TRUE(client_->Put("fill-1", data_60.data(), data_60.size()));
+
+  std::vector<char> dst(80, 0);
+  ASSERT_TRUE(client_->Get("fill-0", dst.data(), dst.size()));
+  EXPECT_EQ(std::string(dst.begin(), dst.end()), data_80);
+
+  dst.resize(60);
+  std::fill(dst.begin(), dst.end(), 0);
+  ASSERT_TRUE(client_->Get("fill-1", dst.data(), dst.size()));
+  EXPECT_EQ(std::string(dst.begin(), dst.end()), data_60);
+
+  ASSERT_TRUE(client_->Remove("fill-0"));
+  ASSERT_TRUE(client_->Remove("fill-1"));
+}
+
+TEST_F(PoolClientSsdFullTest, BothStoresFullReturnsFalse) {
+  std::string data_90(90, 'X');
+  ASSERT_TRUE(client_->Put("big-0", data_90.data(), data_90.size()));
+  ASSERT_TRUE(client_->Put("big-1", data_90.data(), data_90.size()));
+
+  std::string data_30(30, 'Y');
+  EXPECT_FALSE(client_->Put("too-much", data_30.data(), data_30.size()));
+
+  ASSERT_TRUE(client_->Remove("big-0"));
+  ASSERT_TRUE(client_->Remove("big-1"));
+}
+
 class PoolClientLifecycleTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -236,13 +432,13 @@ class PoolClientLifecycleTest : public ::testing::Test {
   }
 
   void TearDown() override {
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     if (master_) {
       master_->Shutdown();
     }
     if (master_thread_.joinable()) {
       master_thread_.join();
     }
+    master_.reset();
   }
 
   uint16_t port_;

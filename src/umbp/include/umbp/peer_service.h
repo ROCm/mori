@@ -10,13 +10,18 @@
 
 namespace mori::umbp {
 
+struct SsdStore {
+  std::string dir;
+  size_t capacity = 0;
+  size_t used = 0;
+};
+
 class PeerServiceServer {
  public:
   PeerServiceServer(void* ssd_staging_base, size_t ssd_staging_size,
-                    const std::vector<uint8_t>& engine_desc_bytes,
-                    const std::vector<uint8_t>& dram_memory_desc_bytes,
-                    const std::string& ssd_dir, size_t ssd_capacity,
-                    uint64_t staging_base_offset);
+                    const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
+                    const std::vector<std::string>& ssd_dirs,
+                    const std::vector<size_t>& ssd_capacities);
   ~PeerServiceServer();
 
   void Start(uint16_t port);
@@ -26,14 +31,10 @@ class PeerServiceServer {
   void* ssd_staging_base_;
   size_t ssd_staging_size_;
 
-  std::string ssd_dir_;
-  size_t ssd_capacity_;
-  size_t ssd_used_ = 0;
+  std::vector<SsdStore> ssd_stores_;
   std::mutex ssd_mutex_;
 
-  std::vector<uint8_t> engine_desc_bytes_;
-  std::vector<uint8_t> dram_memory_desc_bytes_;
-  uint64_t staging_base_offset_;
+  std::vector<uint8_t> ssd_staging_mem_desc_bytes_;
 
   std::unique_ptr<grpc::Server> server_;
 

@@ -70,7 +70,9 @@ class MasterClient {
       const std::map<TierType, TierCapacity>& tier_capacities,
       const std::string& peer_address = "",
       const std::vector<uint8_t>& engine_desc_bytes = {},
-      const std::vector<uint8_t>& dram_memory_desc_bytes = {});
+      const std::vector<std::vector<uint8_t>>& dram_memory_desc_bytes_list = {},
+      const std::vector<uint64_t>& dram_buffer_sizes = {},
+      const std::vector<uint64_t>& ssd_store_capacities = {});
   grpc::Status UnregisterSelf();
 
   // --- Block index ---

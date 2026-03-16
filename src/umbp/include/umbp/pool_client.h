@@ -17,6 +17,16 @@
 
 namespace mori::umbp {
 
+struct ExportableDram {
+  void* buffer = nullptr;
+  size_t size = 0;
+};
+
+struct ExportableSsd {
+  std::string dir;
+  size_t capacity = 0;
+};
+
 struct PoolClientConfig {
   MasterClientConfig master_config;
 
@@ -25,11 +35,8 @@ struct PoolClientConfig {
 
   size_t staging_buffer_size = 64ULL * 1024 * 1024;
 
-  void* exportable_dram_buffer = nullptr;
-  size_t exportable_dram_buffer_size = 0;
-
-  std::string exportable_ssd_dir;
-  size_t exportable_ssd_capacity = 0;
+  std::vector<ExportableDram> dram_buffers;
+  std::vector<ExportableSsd> ssd_stores;
 
   std::map<TierType, TierCapacity> tier_capacities;
 
@@ -70,19 +77,30 @@ class PoolClient {
   // IO Engine (data plane)
   std::unique_ptr<mori::io::IOEngine> io_engine_;
   mori::io::MemoryDesc staging_mem_{};
-  mori::io::MemoryDesc export_dram_mem_{};
+  std::vector<mori::io::MemoryDesc> export_dram_mems_;
   std::unique_ptr<char[]> staging_buffer_;
   std::mutex staging_mutex_;
+
+  // SSD staging buffer — separate from DRAM exportable buffers so that
+  // PeerService SSD staging traffic does not conflict with Master-managed
+  // DRAM tier offset allocations.
+  std::unique_ptr<char[]> ssd_staging_buffer_;
+  mori::io::MemoryDesc ssd_staging_mem_{};
+  std::vector<uint8_t> ssd_staging_mem_desc_bytes_;
 
   // Peer connections (lazy init, keyed by node_id)
   struct PeerConnection {
     std::string peer_address;
     mori::io::EngineDesc engine_desc;
-    mori::io::MemoryDesc dram_memory;
-    uint64_t staging_base_offset = 0;
+    std::vector<mori::io::MemoryDesc> dram_memories;
     bool engine_registered = false;
     std::unique_ptr<void, void (*)(void*)> peer_stub{nullptr, +[](void*) {}};
     std::mutex ssd_op_mutex;
+
+    // Dedicated SSD staging MemoryDesc, independent of dram_memories to avoid
+    // offset conflicts between DRAM tier allocations and SSD staging traffic.
+    mori::io::MemoryDesc ssd_staging_mem{};
+    size_t ssd_staging_size = 0;
   };
   std::mutex peers_mutex_;
   std::unordered_map<std::string, std::unique_ptr<PeerConnection>> peers_;
@@ -90,14 +108,18 @@ class PoolClient {
   PeerConnection& GetOrConnectPeer(
       const std::string& node_id, const std::string& peer_address,
       const std::vector<uint8_t>& engine_desc_bytes,
-      const std::vector<uint8_t>& dram_memory_desc_bytes);
+      const std::vector<uint8_t>& dram_memory_desc_bytes,
+      uint32_t buffer_index = 0);
 
-  bool RemoteDramWrite(PeerConnection& peer, const void* src, size_t size,
-                       uint64_t offset, bool zero_copy);
-  bool RemoteDramRead(PeerConnection& peer, void* dst, size_t size,
-                      uint64_t offset, bool zero_copy);
+  bool RemoteDramWrite(PeerConnection& peer, uint32_t buffer_index,
+                       const void* src, size_t size, uint64_t offset,
+                       bool zero_copy);
+  bool RemoteDramRead(PeerConnection& peer, uint32_t buffer_index,
+                      void* dst, size_t size, uint64_t offset,
+                      bool zero_copy);
   bool RemoteSsdWrite(PeerConnection& peer, const std::string& key,
-                      const void* src, size_t size, bool zero_copy);
+                      const void* src, size_t size, bool zero_copy,
+                      uint32_t store_index = 0);
   bool RemoteSsdRead(PeerConnection& peer, const std::string& key,
                      const std::string& location_id, void* dst, size_t size,
                      bool zero_copy);
@@ -117,11 +139,15 @@ class PoolClient {
   std::mutex cache_mutex_;
   std::unordered_map<std::string, Location> location_cache_;
 
-  bool PutLocalDram(const void* src, size_t size, uint64_t offset);
-  bool GetLocalDram(void* dst, size_t size, uint64_t offset);
+  bool PutLocalDram(uint32_t buffer_index, const void* src, size_t size,
+                    uint64_t offset);
+  bool GetLocalDram(uint32_t buffer_index, void* dst, size_t size,
+                    uint64_t offset);
 
-  bool PutLocalSsd(const std::string& key, const void* src, size_t size);
-  bool GetLocalSsd(const std::string& key, void* dst, size_t size);
+  bool PutLocalSsd(const std::string& key, const void* src, size_t size,
+                   uint32_t store_index = 0);
+  bool GetLocalSsd(const std::string& filename, void* dst, size_t size,
+                   uint32_t store_index = 0);
 };
 
 }  // namespace mori::umbp

@@ -45,6 +45,7 @@ struct AllocateResult {
   std::vector<uint8_t> engine_desc_bytes;
   std::vector<uint8_t> dram_memory_desc_bytes;
   uint64_t allocated_offset = 0;
+  uint32_t buffer_index = 0;
 };
 
 struct ClientIOInfo {
@@ -77,7 +78,9 @@ class ClientRegistry {
                       const std::map<TierType, TierCapacity>& tier_capacities,
                       const std::string& peer_address = "",
                       const std::vector<uint8_t>& engine_desc_bytes = {},
-                      const std::vector<uint8_t>& dram_memory_desc_bytes = {});
+                      const std::vector<std::vector<uint8_t>>& dram_memory_desc_bytes_list = {},
+                      const std::vector<uint64_t>& dram_buffer_sizes = {},
+                      const std::vector<uint64_t>& ssd_store_capacities = {});
 
   // Gracefully unregister. Returns number of block keys cleaned up.
   size_t UnregisterClient(const std::string& node_id);
@@ -95,9 +98,10 @@ class ClientRegistry {
   // --- PoolClient allocation ---
   std::optional<AllocateResult> AllocateForPut(const std::string& node_id, TierType tier,
                                                uint64_t size);
-  void DeallocateForUnregister(const std::string& node_id, TierType tier, uint64_t offset,
-                               uint64_t size);
-  std::optional<ClientIOInfo> GetClientIOInfo(const std::string& node_id) const;
+  void DeallocateForUnregister(const std::string& node_id, TierType tier,
+                               uint32_t buffer_index, uint64_t offset, uint64_t size);
+  std::optional<ClientIOInfo> GetClientIOInfo(const std::string& node_id,
+                                              uint32_t buffer_index = 0) const;
 
   // --- Queries ---
   bool IsClientAlive(const std::string& node_id) const;

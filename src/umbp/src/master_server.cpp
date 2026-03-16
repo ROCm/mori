@@ -67,13 +67,27 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     const auto& engine_desc_str = request->engine_desc();
     std::vector<uint8_t> engine_desc_bytes(engine_desc_str.begin(), engine_desc_str.end());
 
-    const auto& dram_memory_desc_str = request->dram_memory_desc();
-    std::vector<uint8_t> dram_memory_desc_bytes(dram_memory_desc_str.begin(),
-                                                dram_memory_desc_str.end());
+    // Multi-buffer: prefer repeated field, fall back to legacy single field
+    std::vector<std::vector<uint8_t>> dram_memory_desc_bytes_list;
+    if (request->dram_memory_descs_size() > 0) {
+      for (const auto& desc : request->dram_memory_descs()) {
+        dram_memory_desc_bytes_list.emplace_back(desc.begin(), desc.end());
+      }
+    } else if (!request->dram_memory_desc().empty()) {
+      const auto& legacy = request->dram_memory_desc();
+      dram_memory_desc_bytes_list.emplace_back(legacy.begin(), legacy.end());
+    }
+
+    std::vector<uint64_t> dram_buffer_sizes(
+        request->dram_buffer_sizes().begin(), request->dram_buffer_sizes().end());
+
+    std::vector<uint64_t> ssd_store_capacities(
+        request->ssd_store_capacities().begin(), request->ssd_store_capacities().end());
 
     const bool registered = registry_.RegisterClient(
         request->node_id(), request->node_address(), caps, request->peer_address(),
-        engine_desc_bytes, dram_memory_desc_bytes);
+        engine_desc_bytes, dram_memory_desc_bytes_list, dram_buffer_sizes,
+        ssd_store_capacities);
     if (!registered) {
       return grpc::Status(grpc::StatusCode::ALREADY_EXISTS,
                           "node is already alive and cannot be re-registered");
@@ -156,15 +170,19 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     response->set_removed(removed ? 1u : 0u);
 
     if (removed && location.size > 0) {
+      uint32_t buffer_index = 0;
       uint64_t offset = 0;
       if (!location.location_id.empty()) {
-        try {
-          offset = std::stoull(location.location_id);
-        } catch (...) {
-          // location_id is not a numeric offset (e.g. SSD file path); use 0
+        auto colon_pos = location.location_id.find(':');
+        if (colon_pos != std::string::npos) {
+          try {
+            buffer_index = static_cast<uint32_t>(std::stoul(location.location_id.substr(0, colon_pos)));
+            offset = std::stoull(location.location_id.substr(colon_pos + 1));
+          } catch (...) {}
         }
       }
-      registry_.DeallocateForUnregister(location.node_id, location.tier, offset, location.size);
+      registry_.DeallocateForUnregister(location.node_id, location.tier,
+                                        buffer_index, offset, location.size);
     }
 
     spdlog::info("[Master] Unregister key: node_id={}, key={}, location_id={}, removed={}",
@@ -191,7 +209,16 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     source->set_size(result->size);
     source->set_tier(static_cast<::umbp::TierType>(result->tier));
 
-    auto io_info = registry_.GetClientIOInfo(result->node_id);
+    // Parse buffer_index from location_id (format: "buffer_index:offset")
+    uint32_t buf_idx = 0;
+    auto colon = result->location_id.find(':');
+    if (colon != std::string::npos) {
+      try {
+        buf_idx = static_cast<uint32_t>(std::stoul(result->location_id.substr(0, colon)));
+      } catch (...) {}
+    }
+
+    auto io_info = registry_.GetClientIOInfo(result->node_id, buf_idx);
     if (io_info) {
       response->set_peer_address(io_info->peer_address);
       response->set_engine_desc(io_info->engine_desc_bytes.data(),
@@ -227,10 +254,11 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     response->set_dram_memory_desc(result->dram_memory_desc_bytes.data(),
                                    result->dram_memory_desc_bytes.size());
     response->set_allocated_offset(result->allocated_offset);
+    response->set_buffer_index(result->buffer_index);
 
-    spdlog::info("[Master] RoutePut key='{}': target_node={}, tier={}, offset={}",
+    spdlog::info("[Master] RoutePut key='{}': target_node={}, tier={}, buffer={}, offset={}",
                  request->key(), result->node_id, TierTypeName(result->tier),
-                 result->allocated_offset);
+                 result->buffer_index, result->allocated_offset);
     return grpc::Status::OK;
   }
 

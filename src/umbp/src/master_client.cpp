@@ -61,7 +61,9 @@ grpc::Status MasterClient::RegisterSelf(
     const std::map<TierType, TierCapacity>& tier_capacities,
     const std::string& peer_address,
     const std::vector<uint8_t>& engine_desc_bytes,
-    const std::vector<uint8_t>& dram_memory_desc_bytes) {
+    const std::vector<std::vector<uint8_t>>& dram_memory_desc_bytes_list,
+    const std::vector<uint64_t>& dram_buffer_sizes,
+    const std::vector<uint64_t>& ssd_store_capacities) {
   if (registered_) {
     return grpc::Status(grpc::StatusCode::ALREADY_EXISTS, "node is already registered");
   }
@@ -78,7 +80,23 @@ grpc::Status MasterClient::RegisterSelf(
 
   req.set_peer_address(peer_address);
   req.set_engine_desc(engine_desc_bytes.data(), engine_desc_bytes.size());
-  req.set_dram_memory_desc(dram_memory_desc_bytes.data(), dram_memory_desc_bytes.size());
+
+  // Multi-buffer: populate repeated fields
+  for (const auto& desc : dram_memory_desc_bytes_list) {
+    req.add_dram_memory_descs(desc.data(), desc.size());
+  }
+  for (uint64_t sz : dram_buffer_sizes) {
+    req.add_dram_buffer_sizes(sz);
+  }
+  for (uint64_t cap : ssd_store_capacities) {
+    req.add_ssd_store_capacities(cap);
+  }
+
+  // Backward compat: also set legacy single field if there's exactly one buffer
+  if (dram_memory_desc_bytes_list.size() == 1) {
+    req.set_dram_memory_desc(dram_memory_desc_bytes_list[0].data(),
+                             dram_memory_desc_bytes_list[0].size());
+  }
 
   ::umbp::RegisterClientResponse resp;
   grpc::ClientContext ctx;
@@ -97,7 +115,8 @@ grpc::Status MasterClient::RegisterSelf(
     current_capacities_ = tier_capacities;
   }
 
-  spdlog::info("[Client] Registered with master (heartbeat_interval={}ms)", heartbeat_interval_ms_);
+  spdlog::info("[Client] Registered with master (heartbeat_interval={}ms, dram_buffers={})",
+               heartbeat_interval_ms_, dram_memory_desc_bytes_list.size());
 
   if (config_.auto_heartbeat) {
     StartHeartbeat();
@@ -281,6 +300,7 @@ grpc::Status MasterClient::RoutePut(const std::string& key, uint64_t block_size,
     const auto& md = resp.dram_memory_desc();
     result.dram_memory_desc_bytes.assign(md.begin(), md.end());
     result.allocated_offset = resp.allocated_offset();
+    result.buffer_index = resp.buffer_index();
     *out_result = result;
   }
 

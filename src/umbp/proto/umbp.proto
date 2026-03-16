@@ -35,7 +35,10 @@ message RegisterClientRequest {
   repeated TierCapacity tier_capacities = 3; // Capacity per tier (HBM, DRAM, SSD)
   string peer_address                 = 4;   // PeerService gRPC address
   bytes  engine_desc                  = 5;   // packed EngineDesc
-  bytes  dram_memory_desc             = 6;   // packed MemoryDesc (RDMA-registered DRAM)
+  bytes  dram_memory_desc             = 6;   // DEPRECATED: single-buffer compat
+  repeated bytes  dram_memory_descs   = 10;  // per-buffer packed MemoryDesc
+  repeated uint64 dram_buffer_sizes   = 11;  // size of each DRAM buffer in bytes
+  repeated uint64 ssd_store_capacities = 12; // per-SSD-store capacity in bytes
 }
 message RegisterClientResponse {
   uint64 heartbeat_interval_ms = 1;  // Recommended heartbeat interval
@@ -111,8 +114,9 @@ message RoutePutResponse {
   TierType tier             = 4;   // Tier selected by the strategy
   string   peer_address     = 5;   // target node's PeerService address
   bytes    engine_desc      = 6;   // target node's packed EngineDesc
-  bytes    dram_memory_desc = 7;   // target node's packed MemoryDesc (DRAM)
+  bytes    dram_memory_desc = 7;   // target node's packed MemoryDesc (selected buffer)
   uint64   allocated_offset = 8;   // Master-allocated offset (DRAM tier only)
+  uint32   buffer_index     = 9;   // Index of the selected DRAM buffer
 }
 
 // ============================================================

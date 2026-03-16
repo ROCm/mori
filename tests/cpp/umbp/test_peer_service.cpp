@@ -17,7 +17,6 @@ namespace {
 
 constexpr size_t kStagingSize = 4096;
 constexpr size_t kSsdCapacity = 1 << 20;  // 1 MB
-constexpr uint64_t kStagingBaseOffset = 0;
 constexpr uint16_t kBasePort = 50200;
 
 static uint16_t AllocPort() {
@@ -36,14 +35,15 @@ class PeerServiceTest : public ::testing::Test {
                + "_" + std::to_string(AllocPort()));
     std::filesystem::create_directories(ssd_dir_);
 
-    engine_desc_ = {0x01, 0x02, 0x03, 0x04};
-    dram_memory_desc_ = {0xA0, 0xB0, 0xC0};
+    ssd_staging_mem_desc_ = {0xD0, 0xE0, 0xF0};
 
     port_ = AllocPort();
 
-    server_ = std::make_unique<PeerServiceServer>(staging_buffer_, kStagingSize, engine_desc_,
-                                                  dram_memory_desc_, ssd_dir_.string(),
-                                                  kSsdCapacity, kStagingBaseOffset);
+    server_ = std::make_unique<PeerServiceServer>(
+        staging_buffer_, kStagingSize,
+        ssd_staging_mem_desc_,
+        std::vector<std::string>{ssd_dir_.string()},
+        std::vector<size_t>{kSsdCapacity});
     server_->Start(port_);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
@@ -61,8 +61,7 @@ class PeerServiceTest : public ::testing::Test {
 
   void* staging_buffer_ = nullptr;
   std::filesystem::path ssd_dir_;
-  std::vector<uint8_t> engine_desc_;
-  std::vector<uint8_t> dram_memory_desc_;
+  std::vector<uint8_t> ssd_staging_mem_desc_;
   uint16_t port_ = 0;
   std::unique_ptr<PeerServiceServer> server_;
   std::unique_ptr<::umbp::UMBPPeer::Stub> stub_;
@@ -76,13 +75,11 @@ TEST_F(PeerServiceTest, GetPeerInfo) {
   auto status = stub_->GetPeerInfo(&context, request, &response);
   ASSERT_TRUE(status.ok()) << status.error_message();
 
-  EXPECT_EQ(response.engine_desc(),
-            std::string(engine_desc_.begin(), engine_desc_.end()));
-  EXPECT_EQ(response.dram_memory_desc(),
-            std::string(dram_memory_desc_.begin(), dram_memory_desc_.end()));
-  EXPECT_EQ(response.ssd_capacity(), kSsdCapacity);
-  EXPECT_EQ(response.ssd_available(), kSsdCapacity);
-  EXPECT_EQ(response.staging_base_offset(), kStagingBaseOffset);
+  // GetPeerInfo only returns SSD staging info (engine_desc and dram_memory_desc
+  // are provided by Master in RoutePut/RouteGet responses)
+  EXPECT_EQ(response.ssd_staging_mem_desc(),
+            std::string(ssd_staging_mem_desc_.begin(), ssd_staging_mem_desc_.end()));
+  EXPECT_EQ(response.ssd_staging_size(), kStagingSize);
 }
 
 TEST_F(PeerServiceTest, CommitSsdWriteSuccess) {
@@ -93,6 +90,7 @@ TEST_F(PeerServiceTest, CommitSsdWriteSuccess) {
   request.set_key("block_1");
   request.set_staging_offset(0);
   request.set_size(test_data.size());
+  request.set_store_index(0);
 
   ::umbp::CommitSsdWriteResponse response;
   grpc::ClientContext context;
@@ -103,6 +101,24 @@ TEST_F(PeerServiceTest, CommitSsdWriteSuccess) {
   EXPECT_EQ(response.ssd_location_id(), "block_1.bin");
 }
 
+TEST_F(PeerServiceTest, CommitSsdWriteStoreIndexOutOfRange) {
+  const std::string test_data = "oob test";
+  std::memcpy(staging_buffer_, test_data.data(), test_data.size());
+
+  ::umbp::CommitSsdWriteRequest request;
+  request.set_key("block_oob");
+  request.set_staging_offset(0);
+  request.set_size(test_data.size());
+  request.set_store_index(99);
+
+  ::umbp::CommitSsdWriteResponse response;
+  grpc::ClientContext context;
+
+  auto status = stub_->CommitSsdWrite(&context, request, &response);
+  ASSERT_TRUE(status.ok());
+  EXPECT_FALSE(response.success());
+}
+
 TEST_F(PeerServiceTest, CommitSsdWriteFileContents) {
   const std::string test_data = "verify file contents";
   std::memcpy(staging_buffer_, test_data.data(), test_data.size());
@@ -111,6 +127,7 @@ TEST_F(PeerServiceTest, CommitSsdWriteFileContents) {
   request.set_key("block_verify");
   request.set_staging_offset(0);
   request.set_size(test_data.size());
+  request.set_store_index(0);
 
   ::umbp::CommitSsdWriteResponse response;
   grpc::ClientContext context;
@@ -135,6 +152,7 @@ TEST_F(PeerServiceTest, PrepareSsdReadSuccess) {
     req.set_key("block_read");
     req.set_staging_offset(0);
     req.set_size(test_data.size());
+    req.set_store_index(0);
     ::umbp::CommitSsdWriteResponse resp;
     grpc::ClientContext ctx;
     auto s = stub_->CommitSsdWrite(&ctx, req, &resp);
@@ -147,17 +165,17 @@ TEST_F(PeerServiceTest, PrepareSsdReadSuccess) {
   {
     ::umbp::PrepareSsdReadRequest req;
     req.set_key("block_read");
-    req.set_ssd_location_id("block_read.bin");
+    req.set_ssd_location_id("0:block_read.bin");
     req.set_size(test_data.size());
     ::umbp::PrepareSsdReadResponse resp;
     grpc::ClientContext ctx;
     auto s = stub_->PrepareSsdRead(&ctx, req, &resp);
     ASSERT_TRUE(s.ok()) << s.error_message();
     ASSERT_TRUE(resp.success());
-    EXPECT_EQ(resp.staging_offset(), kStagingBaseOffset);
+    EXPECT_EQ(resp.staging_offset(), kStagingSize / 2);
   }
 
-  std::string loaded(static_cast<const char*>(staging_buffer_) + kStagingBaseOffset,
+  std::string loaded(static_cast<const char*>(staging_buffer_) + kStagingSize / 2,
                      test_data.size());
   EXPECT_EQ(loaded, test_data);
 }
@@ -178,8 +196,10 @@ TEST_F(PeerServiceTest, PrepareSsdReadNotFound) {
 
 TEST_F(PeerServiceTest, CommitSsdWriteOverCapacity) {
   auto server_small = std::make_unique<PeerServiceServer>(
-      staging_buffer_, kStagingSize, engine_desc_, dram_memory_desc_,
-      ssd_dir_.string(), 16, kStagingBaseOffset);
+      staging_buffer_, kStagingSize,
+      ssd_staging_mem_desc_,
+      std::vector<std::string>{ssd_dir_.string()},
+      std::vector<size_t>{16});
   uint16_t small_port = AllocPort();
   server_small->Start(small_port);
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -195,6 +215,7 @@ TEST_F(PeerServiceTest, CommitSsdWriteOverCapacity) {
   request.set_key("too_big");
   request.set_staging_offset(0);
   request.set_size(data.size());
+  request.set_store_index(0);
 
   ::umbp::CommitSsdWriteResponse response;
   grpc::ClientContext context;

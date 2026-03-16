@@ -74,6 +74,7 @@ std::optional<RoutePutResult> Router::RoutePut(const std::string& key, const std
       result->engine_desc_bytes = std::move(alloc->engine_desc_bytes);
       result->dram_memory_desc_bytes = std::move(alloc->dram_memory_desc_bytes);
       result->allocated_offset = alloc->allocated_offset;
+      result->buffer_index = alloc->buffer_index;
       spdlog::debug("[Router] RoutePut key='{}' from={}: selected node={}, tier={}, offset={}",
                     key, node_id, result->node_id, TierTypeName(result->tier),
                     result->allocated_offset);

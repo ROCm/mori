@@ -45,7 +45,9 @@ bool ClientRegistry::RegisterClient(const std::string& node_id, const std::strin
                                     const std::map<TierType, TierCapacity>& tier_capacities,
                                     const std::string& peer_address,
                                     const std::vector<uint8_t>& engine_desc_bytes,
-                                    const std::vector<uint8_t>& dram_memory_desc_bytes) {
+                                    const std::vector<std::vector<uint8_t>>& dram_memory_desc_bytes_list,
+                                    const std::vector<uint64_t>& dram_buffer_sizes,
+                                    const std::vector<uint64_t>& ssd_store_capacities) {
   std::unique_lock lock(mutex_);
   auto now = std::chrono::steady_clock::now();
 
@@ -60,7 +62,6 @@ bool ClientRegistry::RegisterClient(const std::string& node_id, const std::strin
     }
 
     it->second.status = ClientStatus::EXPIRED;
-    // Expired client can re-register. Clean old ownership state before overwrite.
     client_keys_.erase(node_id);
     spdlog::info("[Registry] Re-registering expired node: {}", node_id);
   }
@@ -74,21 +75,56 @@ bool ClientRegistry::RegisterClient(const std::string& node_id, const std::strin
   record.tier_capacities = tier_capacities;
   record.peer_address = peer_address;
   record.engine_desc_bytes = engine_desc_bytes;
-  record.dram_memory_desc_bytes = dram_memory_desc_bytes;
+  record.dram_memory_desc_bytes_list = dram_memory_desc_bytes_list;
 
-  for (const auto& [tier, cap] : tier_capacities) {
-    PoolAllocator alloc;
-    alloc.total_size = cap.total_bytes;
-    if (tier == TierType::DRAM || tier == TierType::HBM) {
+  // Per-buffer DRAM allocators
+  if (!dram_buffer_sizes.empty()) {
+    for (size_t i = 0; i < dram_buffer_sizes.size(); ++i) {
+      PoolAllocator alloc;
+      alloc.total_size = dram_buffer_sizes[i];
       alloc.offset_tracker = PoolAllocator::OffsetTracker{};
+      record.dram_allocators.push_back(std::move(alloc));
     }
-    record.allocators[tier] = std::move(alloc);
+  } else {
+    // Backward compat: single allocator from tier_capacities (DRAM or HBM)
+    for (auto check_tier : {TierType::HBM, TierType::DRAM}) {
+      auto cap_it = tier_capacities.find(check_tier);
+      if (cap_it != tier_capacities.end() && cap_it->second.total_bytes > 0) {
+        PoolAllocator alloc;
+        alloc.total_size = cap_it->second.total_bytes;
+        alloc.offset_tracker = PoolAllocator::OffsetTracker{};
+        record.dram_allocators.push_back(std::move(alloc));
+      }
+    }
+  }
+
+  // Per-store SSD allocators (capacity-only, no OffsetTracker)
+  if (!ssd_store_capacities.empty()) {
+    for (uint64_t cap : ssd_store_capacities) {
+      PoolAllocator alloc;
+      alloc.total_size = cap;
+      record.ssd_allocators.push_back(std::move(alloc));
+    }
+  } else {
+    // Backward compat: single allocator from tier_capacities
+    auto ssd_it = tier_capacities.find(TierType::SSD);
+    if (ssd_it != tier_capacities.end() && ssd_it->second.total_bytes > 0) {
+      PoolAllocator alloc;
+      alloc.total_size = ssd_it->second.total_bytes;
+      record.ssd_allocators.push_back(std::move(alloc));
+    }
   }
 
   clients_[node_id] = std::move(record);
-  client_keys_[node_id];  // ensure entry exists (empty set)
+  client_keys_[node_id];
 
-  spdlog::info("[Registry] Registered node: {} at {}", node_id, node_address);
+  spdlog::info("[Registry] Registered node: {} at {} (dram_buffers={}, ssd_stores={})",
+               node_id, node_address,
+               dram_buffer_sizes.empty() ? (tier_capacities.count(TierType::DRAM) ? 1u : 0u)
+                                         : static_cast<unsigned>(dram_buffer_sizes.size()),
+               static_cast<unsigned>(ssd_store_capacities.empty()
+                   ? (tier_capacities.count(TierType::SSD) ? 1u : 0u)
+                   : ssd_store_capacities.size()));
   return true;
 }
 
@@ -212,45 +248,83 @@ std::optional<AllocateResult> ClientRegistry::AllocateForPut(const std::string& 
     return std::nullopt;
   }
 
-  auto alloc_it = it->second.allocators.find(tier);
-  if (alloc_it == it->second.allocators.end()) {
+  auto& record = it->second;
+
+  if (tier == TierType::DRAM || tier == TierType::HBM) {
+    for (uint32_t i = 0; i < record.dram_allocators.size(); ++i) {
+      auto offset = record.dram_allocators[i].Allocate(size);
+      if (offset) {
+        uint64_t total_avail = 0;
+        for (auto& a : record.dram_allocators) total_avail += a.AvailableBytes();
+        record.tier_capacities[tier].available_bytes = total_avail;
+
+        AllocateResult result;
+        result.peer_address = record.peer_address;
+        result.engine_desc_bytes = record.engine_desc_bytes;
+        if (i < record.dram_memory_desc_bytes_list.size())
+          result.dram_memory_desc_bytes = record.dram_memory_desc_bytes_list[i];
+        result.allocated_offset = *offset;
+        result.buffer_index = i;
+        return result;
+      }
+    }
     return std::nullopt;
   }
 
-  auto offset = alloc_it->second.Allocate(size);
-  if (!offset) {
+  if (tier == TierType::SSD) {
+    for (uint32_t i = 0; i < record.ssd_allocators.size(); ++i) {
+      auto offset = record.ssd_allocators[i].Allocate(size);
+      if (offset) {
+        uint64_t total_avail = 0;
+        for (auto& a : record.ssd_allocators) total_avail += a.AvailableBytes();
+        record.tier_capacities[tier].available_bytes = total_avail;
+
+        AllocateResult result;
+        result.peer_address = record.peer_address;
+        result.engine_desc_bytes = record.engine_desc_bytes;
+        if (!record.dram_memory_desc_bytes_list.empty())
+          result.dram_memory_desc_bytes = record.dram_memory_desc_bytes_list[0];
+        result.allocated_offset = 0;
+        result.buffer_index = i;
+        return result;
+      }
+    }
     return std::nullopt;
   }
 
-  it->second.tier_capacities[tier].available_bytes = alloc_it->second.AvailableBytes();
-
-  AllocateResult result;
-  result.peer_address = it->second.peer_address;
-  result.engine_desc_bytes = it->second.engine_desc_bytes;
-  result.dram_memory_desc_bytes = it->second.dram_memory_desc_bytes;
-  result.allocated_offset = *offset;
-  return result;
+  return std::nullopt;
 }
 
 void ClientRegistry::DeallocateForUnregister(const std::string& node_id, TierType tier,
-                                             uint64_t offset, uint64_t size) {
+                                             uint32_t buffer_index, uint64_t offset,
+                                             uint64_t size) {
   std::unique_lock lock(mutex_);
   auto it = clients_.find(node_id);
   if (it == clients_.end()) {
     return;
   }
 
-  auto alloc_it = it->second.allocators.find(tier);
-  if (alloc_it == it->second.allocators.end()) {
-    return;
+  auto& record = it->second;
+
+  if (tier == TierType::DRAM || tier == TierType::HBM) {
+    if (buffer_index < record.dram_allocators.size()) {
+      record.dram_allocators[buffer_index].Deallocate(offset, size);
+      uint64_t total_avail = 0;
+      for (auto& a : record.dram_allocators) total_avail += a.AvailableBytes();
+      record.tier_capacities[tier].available_bytes = total_avail;
+    }
+  } else if (tier == TierType::SSD) {
+    if (buffer_index < record.ssd_allocators.size()) {
+      record.ssd_allocators[buffer_index].Deallocate(offset, size);
+      uint64_t total_avail = 0;
+      for (auto& a : record.ssd_allocators) total_avail += a.AvailableBytes();
+      record.tier_capacities[tier].available_bytes = total_avail;
+    }
   }
-
-  alloc_it->second.Deallocate(offset, size);
-
-  it->second.tier_capacities[tier].available_bytes = alloc_it->second.AvailableBytes();
 }
 
-std::optional<ClientIOInfo> ClientRegistry::GetClientIOInfo(const std::string& node_id) const {
+std::optional<ClientIOInfo> ClientRegistry::GetClientIOInfo(const std::string& node_id,
+                                                            uint32_t buffer_index) const {
   std::shared_lock lock(mutex_);
   auto it = clients_.find(node_id);
   if (it == clients_.end() || it->second.status != ClientStatus::ALIVE) {
@@ -260,7 +334,11 @@ std::optional<ClientIOInfo> ClientRegistry::GetClientIOInfo(const std::string& n
   ClientIOInfo info;
   info.peer_address = it->second.peer_address;
   info.engine_desc_bytes = it->second.engine_desc_bytes;
-  info.dram_memory_desc_bytes = it->second.dram_memory_desc_bytes;
+  if (buffer_index < it->second.dram_memory_desc_bytes_list.size()) {
+    info.dram_memory_desc_bytes = it->second.dram_memory_desc_bytes_list[buffer_index];
+  } else if (!it->second.dram_memory_desc_bytes_list.empty()) {
+    info.dram_memory_desc_bytes = it->second.dram_memory_desc_bytes_list[0];
+  }
   return info;
 }
 

@@ -40,6 +40,7 @@ struct RoutePutResult {
   std::vector<uint8_t> engine_desc_bytes;
   std::vector<uint8_t> dram_memory_desc_bytes;
   uint64_t allocated_offset = 0;
+  uint32_t buffer_index = 0;
 };
 
 /// Abstract interface for RoutePut node placement.

@@ -74,8 +74,10 @@ struct ClientRecord {
 
   std::string peer_address;
   std::vector<uint8_t> engine_desc_bytes;
-  std::vector<uint8_t> dram_memory_desc_bytes;
-  std::map<TierType, PoolAllocator> allocators;
+
+  std::vector<std::vector<uint8_t>> dram_memory_desc_bytes_list;
+  std::vector<PoolAllocator> dram_allocators;
+  std::vector<PoolAllocator> ssd_allocators;
 };
 
 // Helpers for logging

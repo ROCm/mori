@@ -14,6 +14,56 @@
 
 namespace mori::umbp {
 
+namespace {
+struct ParsedLocationId {
+  uint32_t buffer_index = 0;
+  uint64_t offset = 0;
+};
+
+ParsedLocationId ParseLocationId(const std::string& location_id) {
+  ParsedLocationId result;
+  auto colon = location_id.find(':');
+  if (colon == std::string::npos) {
+    spdlog::error("[PoolClient] Invalid location_id format (expected 'buffer_index:offset'): {}",
+                  location_id);
+    return result;
+  }
+  try {
+    result.buffer_index = static_cast<uint32_t>(std::stoul(location_id.substr(0, colon)));
+    result.offset = std::stoull(location_id.substr(colon + 1));
+  } catch (...) {
+    spdlog::error("[PoolClient] Failed to parse location_id: {}", location_id);
+  }
+  return result;
+}
+
+struct ParsedSsdLocationId {
+  uint32_t store_index = 0;
+  std::string filename;
+};
+
+ParsedSsdLocationId ParseSsdLocationId(const std::string& location_id) {
+  ParsedSsdLocationId result;
+  auto colon = location_id.find(':');
+  if (colon == std::string::npos) {
+    result.filename = location_id;
+    return result;
+  }
+  try {
+    result.store_index = static_cast<uint32_t>(std::stoul(location_id.substr(0, colon)));
+    result.filename = location_id.substr(colon + 1);
+  } catch (...) {
+    spdlog::error("[PoolClient] Failed to parse SSD location_id: {}", location_id);
+    result.filename = location_id;
+  }
+  return result;
+}
+
+bool IsValidMemoryDesc(const mori::io::MemoryDesc& desc) {
+  return desc.size > 0;
+}
+}  // namespace
+
 PoolClient::PoolClient(PoolClientConfig config) : config_(std::move(config)) {}
 
 PoolClient::~PoolClient() { Shutdown(); }
@@ -41,42 +91,65 @@ bool PoolClient::Init() {
         staging_buffer_.get(), config_.staging_buffer_size, -1,
         mori::io::MemoryLocationType::CPU);
 
-    if (config_.exportable_dram_buffer &&
-        config_.exportable_dram_buffer_size > 0) {
-      export_dram_mem_ = io_engine_->RegisterMemory(
-          config_.exportable_dram_buffer, config_.exportable_dram_buffer_size,
-          -1, mori::io::MemoryLocationType::CPU);
+    for (const auto& dram : config_.dram_buffers) {
+      if (dram.buffer && dram.size > 0) {
+        auto mem = io_engine_->RegisterMemory(
+            dram.buffer, dram.size, -1, mori::io::MemoryLocationType::CPU);
+        export_dram_mems_.push_back(mem);
+      }
     }
 
-    spdlog::info("[PoolClient] IOEngine initialized on {}:{}",
-                 config_.io_engine_host, config_.io_engine_port);
+    spdlog::info("[PoolClient] IOEngine initialized on {}:{} ({} DRAM buffers)",
+                 config_.io_engine_host, config_.io_engine_port,
+                 export_dram_mems_.size());
   }
 
-  // Pack EngineDesc and MemoryDesc for registration
+  // Pack EngineDesc and per-buffer MemoryDesc for registration
   std::vector<uint8_t> engine_desc_bytes;
-  std::vector<uint8_t> dram_memory_desc_bytes;
+  std::vector<std::vector<uint8_t>> dram_memory_desc_bytes_list;
+  std::vector<uint64_t> dram_buffer_sizes;
   if (io_engine_) {
     msgpack::sbuffer sbuf;
     msgpack::pack(sbuf, io_engine_->GetEngineDesc());
     engine_desc_bytes.assign(sbuf.data(), sbuf.data() + sbuf.size());
 
-    if (config_.exportable_dram_buffer) {
+    for (size_t i = 0; i < export_dram_mems_.size(); ++i) {
       msgpack::sbuffer mbuf;
-      msgpack::pack(mbuf, export_dram_mem_);
-      dram_memory_desc_bytes.assign(mbuf.data(), mbuf.data() + mbuf.size());
+      msgpack::pack(mbuf, export_dram_mems_[i]);
+      dram_memory_desc_bytes_list.emplace_back(mbuf.data(), mbuf.data() + mbuf.size());
+      dram_buffer_sizes.push_back(config_.dram_buffers[i].size);
+    }
+  }
+
+  // Allocate a dedicated SSD staging buffer, independent of DRAM exportable
+  // buffers, so that SSD staging RDMA traffic cannot conflict with
+  // Master-managed DRAM tier offset allocations.
+  std::vector<std::string> ssd_dirs;
+  std::vector<size_t> ssd_capacities;
+  for (const auto& store : config_.ssd_stores) {
+    ssd_dirs.push_back(store.dir);
+    ssd_capacities.push_back(store.capacity);
+  }
+
+  if (!config_.ssd_stores.empty()) {
+    ssd_staging_buffer_ = std::make_unique<char[]>(config_.staging_buffer_size);
+    std::memset(ssd_staging_buffer_.get(), 0, config_.staging_buffer_size);
+    if (io_engine_) {
+      ssd_staging_mem_ = io_engine_->RegisterMemory(
+          ssd_staging_buffer_.get(), config_.staging_buffer_size,
+          -1, mori::io::MemoryLocationType::CPU);
+      msgpack::sbuffer sbuf;
+      msgpack::pack(sbuf, ssd_staging_mem_);
+      ssd_staging_mem_desc_bytes_.assign(sbuf.data(), sbuf.data() + sbuf.size());
     }
   }
 
   // Start PeerService (for remote SSD coordination)
-  uint64_t staging_base_offset = 0;
-  if (config_.peer_service_port > 0 && !config_.exportable_ssd_dir.empty()) {
-    void* ssd_staging_base = config_.exportable_dram_buffer;
-    size_t ssd_staging_size = config_.exportable_dram_buffer_size;
-
+  if (config_.peer_service_port > 0 && !ssd_dirs.empty()) {
     peer_service_ = std::make_unique<PeerServiceServer>(
-        ssd_staging_base, ssd_staging_size, engine_desc_bytes,
-        dram_memory_desc_bytes, config_.exportable_ssd_dir,
-        config_.exportable_ssd_capacity, staging_base_offset);
+        ssd_staging_buffer_.get(), config_.staging_buffer_size,
+        ssd_staging_mem_desc_bytes_,
+        ssd_dirs, ssd_capacities);
     peer_service_->Start(config_.peer_service_port);
     spdlog::info("[PoolClient] PeerService started on port {}",
                  config_.peer_service_port);
@@ -84,13 +157,22 @@ bool PoolClient::Init() {
 
   std::string peer_address;
   if (config_.peer_service_port > 0) {
-    peer_address = config_.master_config.node_address + ":" +
-                   std::to_string(config_.peer_service_port);
+    // Use io_engine_host for peer_address so remote nodes can reach PeerService.
+    // node_address may be "localhost" which is unreachable from other machines.
+    std::string host = config_.io_engine_host.empty()
+                           ? config_.master_config.node_address
+                           : config_.io_engine_host;
+    peer_address = host + ":" + std::to_string(config_.peer_service_port);
+  }
+
+  std::vector<uint64_t> ssd_store_capacities;
+  for (const auto& store : config_.ssd_stores) {
+    ssd_store_capacities.push_back(store.capacity);
   }
 
   auto status = master_client_->RegisterSelf(
       config_.tier_capacities, peer_address, engine_desc_bytes,
-      dram_memory_desc_bytes);
+      dram_memory_desc_bytes_list, dram_buffer_sizes, ssd_store_capacities);
   if (!status.ok()) {
     spdlog::error("[PoolClient] RegisterSelf failed: {}",
                   status.error_message());
@@ -141,9 +223,14 @@ void PoolClient::Shutdown() {
     if (staging_buffer_) {
       io_engine_->DeregisterMemory(staging_mem_);
     }
-    if (config_.exportable_dram_buffer) {
-      io_engine_->DeregisterMemory(export_dram_mem_);
+    if (ssd_staging_buffer_) {
+      io_engine_->DeregisterMemory(ssd_staging_mem_);
+      ssd_staging_buffer_.reset();
     }
+    for (auto& mem : export_dram_mems_) {
+      io_engine_->DeregisterMemory(mem);
+    }
+    export_dram_mems_.clear();
     io_engine_.reset();
     staging_buffer_.reset();
   }
@@ -219,23 +306,27 @@ bool PoolClient::Put(const std::string& key, const void* src, size_t size,
   location.tier = result->tier;
 
   if (is_local && result->tier == TierType::DRAM) {
-    ok = PutLocalDram(src, size, result->allocated_offset);
-    location.location_id = std::to_string(result->allocated_offset);
+    ok = PutLocalDram(result->buffer_index, src, size, result->allocated_offset);
+    location.location_id = std::to_string(result->buffer_index) + ":" +
+                           std::to_string(result->allocated_offset);
   } else if (is_local && result->tier == TierType::SSD) {
-    ok = PutLocalSsd(key, src, size);
-    location.location_id = key + ".bin";
+    ok = PutLocalSsd(key, src, size, result->buffer_index);
+    location.location_id = std::to_string(result->buffer_index) + ":" + key + ".bin";
   } else if (!is_local && result->tier == TierType::DRAM) {
     auto& peer = GetOrConnectPeer(result->node_id, result->peer_address,
                                   result->engine_desc_bytes,
-                                  result->dram_memory_desc_bytes);
-    ok = RemoteDramWrite(peer, src, size, result->allocated_offset, zero_copy);
-    location.location_id = std::to_string(result->allocated_offset);
+                                  result->dram_memory_desc_bytes,
+                                  result->buffer_index);
+    ok = RemoteDramWrite(peer, result->buffer_index, src, size,
+                         result->allocated_offset, zero_copy);
+    location.location_id = std::to_string(result->buffer_index) + ":" +
+                           std::to_string(result->allocated_offset);
   } else if (!is_local && result->tier == TierType::SSD) {
     auto& peer = GetOrConnectPeer(result->node_id, result->peer_address,
                                   result->engine_desc_bytes,
                                   result->dram_memory_desc_bytes);
-    ok = RemoteSsdWrite(peer, key, src, size, zero_copy);
-    location.location_id = key + ".bin";
+    ok = RemoteSsdWrite(peer, key, src, size, zero_copy, result->buffer_index);
+    location.location_id = std::to_string(result->buffer_index) + ":" + key + ".bin";
   } else {
     spdlog::error("[PoolClient] Unsupported Put path: node={}, tier={}",
                   result->node_id, TierTypeName(result->tier));
@@ -280,21 +371,24 @@ bool PoolClient::Get(const std::string& key, void* dst, size_t size,
   bool is_local = (loc.node_id == config_.master_config.node_id);
 
   if (is_local && loc.tier == TierType::DRAM) {
-    uint64_t offset = std::stoull(loc.location_id);
-    return GetLocalDram(dst, size, offset);
+    auto parsed = ParseLocationId(loc.location_id);
+    return GetLocalDram(parsed.buffer_index, dst, size, parsed.offset);
   } else if (is_local && loc.tier == TierType::SSD) {
-    return GetLocalSsd(key, dst, size);
+    auto parsed = ParseSsdLocationId(loc.location_id);
+    return GetLocalSsd(parsed.filename, dst, size, parsed.store_index);
   } else if (!is_local && loc.tier == TierType::DRAM) {
+    auto parsed = ParseLocationId(loc.location_id);
     auto& peer = GetOrConnectPeer(loc.node_id, result->peer_address,
                                   result->engine_desc_bytes,
-                                  result->dram_memory_desc_bytes);
-    uint64_t offset = std::stoull(loc.location_id);
-    return RemoteDramRead(peer, dst, size, offset, zero_copy);
+                                  result->dram_memory_desc_bytes,
+                                  parsed.buffer_index);
+    return RemoteDramRead(peer, parsed.buffer_index, dst, size, parsed.offset, zero_copy);
   } else if (!is_local && loc.tier == TierType::SSD) {
     auto& peer = GetOrConnectPeer(loc.node_id, result->peer_address,
                                   result->engine_desc_bytes,
                                   result->dram_memory_desc_bytes);
-    return RemoteSsdRead(peer, key, loc.location_id, dst, size, zero_copy);
+    auto parsed_ssd = ParseSsdLocationId(loc.location_id);
+    return RemoteSsdRead(peer, key, parsed_ssd.filename, dst, size, zero_copy);
   } else {
     spdlog::error("[PoolClient] Unsupported Get path: node={}, tier={}",
                   loc.node_id, TierTypeName(loc.tier));
@@ -338,46 +432,59 @@ MasterClient& PoolClient::Master() { return *master_client_; }
 
 bool PoolClient::IsInitialized() const { return initialized_; }
 
-bool PoolClient::PutLocalDram(const void* src, size_t size, uint64_t offset) {
-  if (!config_.exportable_dram_buffer) {
-    spdlog::error("[PoolClient] No exportable DRAM buffer configured");
+bool PoolClient::PutLocalDram(uint32_t buffer_index, const void* src,
+                              size_t size, uint64_t offset) {
+  if (buffer_index >= config_.dram_buffers.size()) {
+    spdlog::error("[PoolClient] DRAM buffer_index {} out of range (have {})",
+                  buffer_index, config_.dram_buffers.size());
     return false;
   }
-  if (offset + size > config_.exportable_dram_buffer_size) {
-    spdlog::error("[PoolClient] DRAM write out of bounds: offset={} size={} total={}",
-                  offset, size, config_.exportable_dram_buffer_size);
+  auto& buf = config_.dram_buffers[buffer_index];
+  if (!buf.buffer) {
+    spdlog::error("[PoolClient] No exportable DRAM buffer at index {}", buffer_index);
     return false;
   }
-  std::memcpy(static_cast<char*>(config_.exportable_dram_buffer) + offset, src,
-              size);
+  if (offset + size > buf.size) {
+    spdlog::error("[PoolClient] DRAM write out of bounds: buf={} offset={} size={} total={}",
+                  buffer_index, offset, size, buf.size);
+    return false;
+  }
+  std::memcpy(static_cast<char*>(buf.buffer) + offset, src, size);
   return true;
 }
 
-bool PoolClient::GetLocalDram(void* dst, size_t size, uint64_t offset) {
-  if (!config_.exportable_dram_buffer) {
-    spdlog::error("[PoolClient] No exportable DRAM buffer configured");
+bool PoolClient::GetLocalDram(uint32_t buffer_index, void* dst, size_t size,
+                              uint64_t offset) {
+  if (buffer_index >= config_.dram_buffers.size()) {
+    spdlog::error("[PoolClient] DRAM buffer_index {} out of range (have {})",
+                  buffer_index, config_.dram_buffers.size());
     return false;
   }
-  if (offset + size > config_.exportable_dram_buffer_size) {
-    spdlog::error("[PoolClient] DRAM read out of bounds: offset={} size={} total={}",
-                  offset, size, config_.exportable_dram_buffer_size);
+  auto& buf = config_.dram_buffers[buffer_index];
+  if (!buf.buffer) {
+    spdlog::error("[PoolClient] No exportable DRAM buffer at index {}", buffer_index);
     return false;
   }
-  std::memcpy(dst,
-              static_cast<const char*>(config_.exportable_dram_buffer) + offset,
-              size);
+  if (offset + size > buf.size) {
+    spdlog::error("[PoolClient] DRAM read out of bounds: buf={} offset={} size={} total={}",
+                  buffer_index, offset, size, buf.size);
+    return false;
+  }
+  std::memcpy(dst, static_cast<const char*>(buf.buffer) + offset, size);
   return true;
 }
 
 bool PoolClient::PutLocalSsd(const std::string& key, const void* src,
-                             size_t size) {
-  if (config_.exportable_ssd_dir.empty()) {
-    spdlog::error("[PoolClient] No SSD directory configured");
+                             size_t size, uint32_t store_index) {
+  if (store_index >= config_.ssd_stores.size()) {
+    spdlog::error("[PoolClient] SSD store_index {} out of range (have {})",
+                  store_index, config_.ssd_stores.size());
     return false;
   }
 
-  std::filesystem::create_directories(config_.exportable_ssd_dir);
-  std::string path = config_.exportable_ssd_dir + "/" + key + ".bin";
+  const auto& ssd_dir = config_.ssd_stores[store_index].dir;
+  std::filesystem::create_directories(ssd_dir);
+  std::string path = ssd_dir + "/" + key + ".bin";
 
   int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd < 0) {
@@ -398,30 +505,26 @@ bool PoolClient::PutLocalSsd(const std::string& key, const void* src,
   return true;
 }
 
-bool PoolClient::GetLocalSsd(const std::string& key, void* dst, size_t size) {
-  if (config_.exportable_ssd_dir.empty()) {
-    spdlog::error("[PoolClient] No SSD directory configured");
+bool PoolClient::GetLocalSsd(const std::string& filename, void* dst, size_t size,
+                             uint32_t store_index) {
+  if (store_index >= config_.ssd_stores.size()) {
+    spdlog::error("[PoolClient] SSD store_index {} out of range (have {})",
+                  store_index, config_.ssd_stores.size());
     return false;
   }
 
-  std::string path = config_.exportable_ssd_dir + "/" + key + ".bin";
-
+  std::string path = config_.ssd_stores[store_index].dir + "/" + filename;
   int fd = ::open(path.c_str(), O_RDONLY);
-  if (fd < 0) {
-    spdlog::error("[PoolClient] Failed to open SSD file for read: {}", path);
-    return false;
-  }
-
-  ssize_t bytes_read = ::read(fd, dst, size);
-  if (bytes_read < 0 || static_cast<size_t>(bytes_read) != size) {
-    spdlog::error("[PoolClient] SSD read incomplete: {} of {} bytes",
-                  bytes_read, size);
+  if (fd >= 0) {
+    ssize_t bytes_read = ::read(fd, dst, size);
     ::close(fd);
-    return false;
+    if (bytes_read >= 0 && static_cast<size_t>(bytes_read) == size) {
+      return true;
+    }
   }
 
-  ::close(fd);
-  return true;
+  spdlog::error("[PoolClient] Failed to read SSD file: {}", path);
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -431,10 +534,22 @@ bool PoolClient::GetLocalSsd(const std::string& key, void* dst, size_t size) {
 PoolClient::PeerConnection& PoolClient::GetOrConnectPeer(
     const std::string& node_id, const std::string& peer_address,
     const std::vector<uint8_t>& engine_desc_bytes,
-    const std::vector<uint8_t>& dram_memory_desc_bytes) {
+    const std::vector<uint8_t>& dram_memory_desc_bytes,
+    uint32_t buffer_index) {
   std::lock_guard<std::mutex> lock(peers_mutex_);
   auto it = peers_.find(node_id);
-  if (it != peers_.end()) return *it->second;
+  if (it != peers_.end()) {
+    // Ensure dram_memories vector has the requested index populated
+    auto& peer = *it->second;
+    if (buffer_index >= peer.dram_memories.size() && !dram_memory_desc_bytes.empty()) {
+      peer.dram_memories.resize(buffer_index + 1);
+      auto handle = msgpack::unpack(
+          reinterpret_cast<const char*>(dram_memory_desc_bytes.data()),
+          dram_memory_desc_bytes.size());
+      peer.dram_memories[buffer_index] = handle.get().as<mori::io::MemoryDesc>();
+    }
+    return peer;
+  }
 
   auto peer = std::make_unique<PeerConnection>();
   peer->peer_address = peer_address;
@@ -451,13 +566,13 @@ PoolClient::PeerConnection& PoolClient::GetOrConnectPeer(
   }
 
   if (!dram_memory_desc_bytes.empty()) {
+    peer->dram_memories.resize(buffer_index + 1);
     auto handle = msgpack::unpack(
         reinterpret_cast<const char*>(dram_memory_desc_bytes.data()),
         dram_memory_desc_bytes.size());
-    peer->dram_memory = handle.get().as<mori::io::MemoryDesc>();
+    peer->dram_memories[buffer_index] = handle.get().as<mori::io::MemoryDesc>();
   }
 
-  // Fetch staging_base_offset from PeerService for SSD ops
   if (!peer_address.empty()) {
     auto channel =
         grpc::CreateChannel(peer_address, grpc::InsecureChannelCredentials());
@@ -468,7 +583,13 @@ PoolClient::PeerConnection& PoolClient::GetOrConnectPeer(
     grpc::ClientContext ctx;
     auto grpc_status = stub->GetPeerInfo(&ctx, req, &resp);
     if (grpc_status.ok()) {
-      peer->staging_base_offset = resp.staging_base_offset();
+      if (!resp.ssd_staging_mem_desc().empty()) {
+        auto staging_handle = msgpack::unpack(
+            reinterpret_cast<const char*>(resp.ssd_staging_mem_desc().data()),
+            resp.ssd_staging_mem_desc().size());
+        peer->ssd_staging_mem = staging_handle.get().as<mori::io::MemoryDesc>();
+        peer->ssd_staging_size = resp.ssd_staging_size();
+      }
       peer->peer_stub = std::unique_ptr<void, void (*)(void*)>(
           stub.release(), +[](void* p) {
             delete static_cast<::umbp::UMBPPeer::Stub*>(p);
@@ -489,17 +610,29 @@ PoolClient::PeerConnection& PoolClient::GetOrConnectPeer(
 // Remote DRAM path (pure RDMA)
 // ---------------------------------------------------------------------------
 
-bool PoolClient::RemoteDramWrite(PeerConnection& peer, const void* src,
-                                 size_t size, uint64_t offset,
+bool PoolClient::RemoteDramWrite(PeerConnection& peer, uint32_t buffer_index,
+                                 const void* src, size_t size, uint64_t offset,
                                  bool zero_copy) {
   if (!io_engine_) return false;
+  if (!zero_copy && size > config_.staging_buffer_size) {
+    spdlog::error("[PoolClient] RemoteDramWrite: size {} exceeds staging_buffer_size {}",
+                  size, config_.staging_buffer_size);
+    return false;
+  }
+  if (buffer_index >= peer.dram_memories.size() || !IsValidMemoryDesc(peer.dram_memories[buffer_index])) {
+    spdlog::error("[PoolClient] RemoteDramWrite: invalid buffer_index {} (size={}, valid={})",
+                  buffer_index, peer.dram_memories.size(),
+                  buffer_index < peer.dram_memories.size() ? IsValidMemoryDesc(peer.dram_memories[buffer_index]) : false);
+    return false;
+  }
+  auto& remote_mem = peer.dram_memories[buffer_index];
 
   if (zero_copy) {
     auto reg = FindRegisteredMemory(src, size);
     if (reg) {
       auto uid = io_engine_->AllocateTransferUniqueId();
       mori::io::TransferStatus status;
-      io_engine_->Write(reg->first, reg->second, peer.dram_memory, offset,
+      io_engine_->Write(reg->first, reg->second, remote_mem, offset,
                         size, &status, uid);
       status.Wait();
       if (!status.Succeeded()) {
@@ -518,8 +651,7 @@ bool PoolClient::RemoteDramWrite(PeerConnection& peer, const void* src,
 
   auto uid = io_engine_->AllocateTransferUniqueId();
   mori::io::TransferStatus status;
-  io_engine_->Write(staging_mem_, 0, peer.dram_memory, offset, size, &status,
-                    uid);
+  io_engine_->Write(staging_mem_, 0, remote_mem, offset, size, &status, uid);
   status.Wait();
   if (!status.Succeeded()) {
     spdlog::error("[PoolClient] RemoteDramWrite failed: {}", status.Message());
@@ -528,16 +660,29 @@ bool PoolClient::RemoteDramWrite(PeerConnection& peer, const void* src,
   return true;
 }
 
-bool PoolClient::RemoteDramRead(PeerConnection& peer, void* dst, size_t size,
-                                uint64_t offset, bool zero_copy) {
+bool PoolClient::RemoteDramRead(PeerConnection& peer, uint32_t buffer_index,
+                                void* dst, size_t size, uint64_t offset,
+                                bool zero_copy) {
   if (!io_engine_) return false;
+  if (!zero_copy && size > config_.staging_buffer_size) {
+    spdlog::error("[PoolClient] RemoteDramRead: size {} exceeds staging_buffer_size {}",
+                  size, config_.staging_buffer_size);
+    return false;
+  }
+  if (buffer_index >= peer.dram_memories.size() || !IsValidMemoryDesc(peer.dram_memories[buffer_index])) {
+    spdlog::error("[PoolClient] RemoteDramRead: invalid buffer_index {} (size={}, valid={})",
+                  buffer_index, peer.dram_memories.size(),
+                  buffer_index < peer.dram_memories.size() ? IsValidMemoryDesc(peer.dram_memories[buffer_index]) : false);
+    return false;
+  }
+  auto& remote_mem = peer.dram_memories[buffer_index];
 
   if (zero_copy) {
     auto reg = FindRegisteredMemory(dst, size);
     if (reg) {
       auto uid = io_engine_->AllocateTransferUniqueId();
       mori::io::TransferStatus status;
-      io_engine_->Read(reg->first, reg->second, peer.dram_memory, offset, size,
+      io_engine_->Read(reg->first, reg->second, remote_mem, offset, size,
                        &status, uid);
       status.Wait();
       if (!status.Succeeded()) {
@@ -555,8 +700,7 @@ bool PoolClient::RemoteDramRead(PeerConnection& peer, void* dst, size_t size,
 
   auto uid = io_engine_->AllocateTransferUniqueId();
   mori::io::TransferStatus status;
-  io_engine_->Read(staging_mem_, 0, peer.dram_memory, offset, size, &status,
-                   uid);
+  io_engine_->Read(staging_mem_, 0, remote_mem, offset, size, &status, uid);
   status.Wait();
   if (!status.Succeeded()) {
     spdlog::error("[PoolClient] RemoteDramRead failed: {}", status.Message());
@@ -573,12 +717,26 @@ bool PoolClient::RemoteDramRead(PeerConnection& peer, void* dst, size_t size,
 
 bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key,
                                 const void* src, size_t size,
-                                bool zero_copy) {
+                                bool zero_copy, uint32_t store_index) {
   if (!io_engine_) return false;
+  // SSD staging is split in half: write region = [0, size/2)
+  size_t max_ssd_staging = config_.staging_buffer_size / 2;
+  if (!zero_copy && size > max_ssd_staging) {
+    spdlog::error("[PoolClient] RemoteSsdWrite: size {} exceeds SSD staging write region {}",
+                  size, max_ssd_staging);
+    return false;
+  }
+  if (!IsValidMemoryDesc(peer.ssd_staging_mem)) {
+    spdlog::error("[PoolClient] RemoteSsdWrite: no SSD staging MemoryDesc");
+    return false;
+  }
+  auto& staging_remote_mem = peer.ssd_staging_mem;
+  // Write region: first half of the dedicated SSD staging buffer [0, size/2)
+  constexpr uint64_t write_offset = 0;
 
   std::lock_guard<std::mutex> ssd_lock(peer.ssd_op_mutex);
 
-  // Phase 1: RDMA write data into remote staging area
+  // Phase 1: RDMA write data into remote SSD staging write region
   {
     bool used_zero_copy = false;
     if (zero_copy) {
@@ -586,8 +744,8 @@ bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key,
       if (reg) {
         auto uid = io_engine_->AllocateTransferUniqueId();
         mori::io::TransferStatus status;
-        io_engine_->Write(reg->first, reg->second, peer.dram_memory,
-                          peer.staging_base_offset, size, &status, uid);
+        io_engine_->Write(reg->first, reg->second, staging_remote_mem,
+                          write_offset, size, &status, uid);
         status.Wait();
         if (!status.Succeeded()) {
           spdlog::error(
@@ -608,8 +766,8 @@ bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key,
 
       auto uid = io_engine_->AllocateTransferUniqueId();
       mori::io::TransferStatus status;
-      io_engine_->Write(staging_mem_, 0, peer.dram_memory,
-                        peer.staging_base_offset, size, &status, uid);
+      io_engine_->Write(staging_mem_, 0, staging_remote_mem,
+                        write_offset, size, &status, uid);
       status.Wait();
       if (!status.Succeeded()) {
         spdlog::error("[PoolClient] RemoteSsdWrite RDMA phase failed: {}",
@@ -632,8 +790,9 @@ bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key,
 
   ::umbp::CommitSsdWriteRequest req;
   req.set_key(key);
-  req.set_staging_offset(peer.staging_base_offset);
+  req.set_staging_offset(write_offset);
   req.set_size(size);
+  req.set_store_index(store_index);
 
   ::umbp::CommitSsdWriteResponse resp;
   grpc::ClientContext ctx;
@@ -656,6 +815,19 @@ bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
                                const std::string& location_id, void* dst,
                                size_t size, bool zero_copy) {
   if (!io_engine_) return false;
+  // SSD staging is split in half: read region = [size/2, size)
+  size_t max_ssd_staging = config_.staging_buffer_size / 2;
+  if (!zero_copy && size > max_ssd_staging) {
+    spdlog::error("[PoolClient] RemoteSsdRead: size {} exceeds SSD staging read region {}",
+                  size, max_ssd_staging);
+    return false;
+  }
+  if (!IsValidMemoryDesc(peer.ssd_staging_mem)) {
+    spdlog::error("[PoolClient] RemoteSsdRead: no SSD staging MemoryDesc");
+    return false;
+  }
+  // Read region: second half of the dedicated SSD staging buffer [size/2, size)
+  auto& staging_remote_mem = peer.ssd_staging_mem;
 
   std::lock_guard<std::mutex> ssd_lock(peer.ssd_op_mutex);
 
@@ -694,7 +866,7 @@ bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
     if (reg) {
       auto uid = io_engine_->AllocateTransferUniqueId();
       mori::io::TransferStatus status;
-      io_engine_->Read(reg->first, reg->second, peer.dram_memory,
+      io_engine_->Read(reg->first, reg->second, staging_remote_mem,
                        resp.staging_offset(), size, &status, uid);
       status.Wait();
       if (!status.Succeeded()) {
@@ -714,7 +886,7 @@ bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
 
     auto uid = io_engine_->AllocateTransferUniqueId();
     mori::io::TransferStatus status;
-    io_engine_->Read(staging_mem_, 0, peer.dram_memory, resp.staging_offset(),
+    io_engine_->Read(staging_mem_, 0, staging_remote_mem, resp.staging_offset(),
                      size, &status, uid);
     status.Wait();
     if (!status.Succeeded()) {

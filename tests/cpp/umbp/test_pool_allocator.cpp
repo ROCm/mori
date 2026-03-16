@@ -12,7 +12,7 @@ using mori::umbp::PoolAllocator;
 PoolAllocator MakeDramAllocator(uint64_t total) {
     PoolAllocator alloc;
     alloc.total_size = total;
-    alloc.offset_tracker.emplace();
+    alloc.offset_tracker = PoolAllocator::OffsetTracker{};
     return alloc;
 }
 
