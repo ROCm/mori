@@ -7,6 +7,7 @@ set(COLLECTIVE_SOURCES
 	core/oneshot_all2all_sdma_class.cpp
     core/oneshot_allgather_sdma_class.cpp
     core/twoshot_allreduce_sdma_class.cpp
+    core/reducescatter_sdma_class.cpp
     inter_node/executors/ring_1d_executor.cpp
     inter_node/executors/one_shot_executor.cpp
     # Note: intra_node_executor is header-only template class

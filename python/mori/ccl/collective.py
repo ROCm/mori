@@ -410,3 +410,61 @@ class AllreduceSdma:
             while an operation is in progress.
         """
         return self._handle.get_output_transit_buffer(device)
+
+
+def _cpp_reducescatter_factory(entity_name: str):
+    """Factory function to get C++ entities from mori_cpp module"""
+    return getattr(mori_cpp, entity_name)
+
+
+class ReduceScatterSdma:
+    """Python wrapper for ReduceScatterSdma C++ class.
+
+    Performs ReduceScatter via SDMA: each rank contributes total_count
+    elements; the result is total_count/npes reduced elements per rank.
+    """
+
+    def __init__(self, my_pe: int, npes: int,
+                 input_buffer_size: Optional[int] = None,
+                 output_buffer_size: Optional[int] = None,
+                 transit_buffer_size: Optional[int] = None,
+                 copy_output_to_user: bool = True):
+        self.my_pe = my_pe
+        self.npes = npes
+        handle_class = _cpp_reducescatter_factory("ReduceScatterSdmaHandle")
+
+        if input_buffer_size is not None and output_buffer_size is not None:
+            self._handle = handle_class(my_pe, npes, input_buffer_size, output_buffer_size, copy_output_to_user)
+        elif transit_buffer_size is not None:
+            self._handle = handle_class(my_pe, npes, transit_buffer_size, copy_output_to_user)
+        else:
+            self._handle = handle_class(my_pe, npes, 512 * 1024 * 1024, copy_output_to_user)
+
+    def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
+        """Execute ReduceScatter SDMA operation.
+
+        Args:
+            input_data: Input CUDA tensor (total_count elements per rank)
+            output_data: Output CUDA tensor (total_count/npes elements per rank)
+            count: Total number of input elements per PE
+            stream: Optional HIP stream
+        """
+        return self._handle(input_data, output_data, count, stream)
+
+    def start_async(self, input_data, output_data, count: int, stream=None) -> bool:
+        return self._handle.start_async(input_data, output_data, count, stream)
+
+    def wait_async(self, stream=None) -> float:
+        return self._handle.wait_async(stream)
+
+    def is_async_in_progress(self) -> bool:
+        return self._handle.is_async_in_progress()
+
+    def cancel_async(self):
+        self._handle.cancel_async()
+
+    def reset_flags(self):
+        self._handle.reset_flags()
+
+    def get_transit_buffer(self, device=None, dtype=None):
+        return self._handle.get_transit_buffer(device, dtype)

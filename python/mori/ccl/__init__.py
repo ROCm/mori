@@ -23,5 +23,6 @@
 from .collective import All2allSdma
 from .collective import AllgatherSdma
 from .collective import AllreduceSdma
+from .collective import ReduceScatterSdma
 
-__all__ = ['All2allSdma', 'AllgatherSdma', 'AllreduceSdma']
+__all__ = ['All2allSdma', 'AllgatherSdma', 'AllreduceSdma', 'ReduceScatterSdma']
