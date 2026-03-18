@@ -51,14 +51,6 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SD
       dest->deviceHandles_d + intraNodePe * dest->sdmaNumQueue;
   HSAuint64* signalAddr = dest->signalPtrs + intraNodePe * dest->sdmaNumQueue;
 
-  // printf("[SHMEM_SDMA] PutThread: pe=%d intraNodePe=%d qpId=%d sdmaNumQueue=%u "
-  //        "deviceHandles_d=%p devicehandles=%p handlePtr=%p "
-  //        "peerPtr=%p srcPtr=%p dstPtr=%p bytes=%zu\n",
-  //        pe, intraNodePe, qpId, dest->sdmaNumQueue,
-  //        (void*)dest->deviceHandles_d, (void*)devicehandles,
-  //        (void*)*(devicehandles + qpId),
-  //        (void*)dest->peerPtrs[pe], (void*)srcPtr, (void*)dstPtr, bytes);
-
   core::SdmaPutThread(srcPtr, dstPtr, bytes, devicehandles, signalAddr, dest->sdmaNumQueue, qpId);
   dest->expectSignalsPtr[intraNodePe * dest->sdmaNumQueue + qpId]++;
 }
