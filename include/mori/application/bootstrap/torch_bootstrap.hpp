@@ -22,6 +22,7 @@
 #pragma once
 
 #include "mori/application/bootstrap/base_bootstrap.hpp"
+#include <string>
 
 namespace mori {
 namespace application {
