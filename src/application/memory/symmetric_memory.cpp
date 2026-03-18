@@ -103,6 +103,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   SymmMemObj* cpuMemObj = new SymmMemObj();
   cpuMemObj->localPtr = localPtr;
   cpuMemObj->size = size;
+  cpuMemObj->sdmaNumQueue = anvil::GetSdmaNumChannels();
 
   // Exchange pointers (RDMA virtual addresses)
   cpuMemObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
@@ -184,16 +185,19 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
     // Allocate based on worldSize (not dstDeviceIds.size()) because indexing uses pe * numQ
     // where pe ranges 0..worldSize-1. Using dstDeviceIds.size() causes buffer overflow.
     size_t numDevices = static_cast<size_t>(worldSize);
-    HIP_RUNTIME_CHECK(hipMalloc(
-        &gpuMemObj->deviceHandles_d,
-        numDevices * numOfQueuesPerDevice * sizeof(anvil::SdmaQueueDeviceHandle*)));
-    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->deviceHandles_d, 0,
-        numDevices * numOfQueuesPerDevice * sizeof(anvil::SdmaQueueDeviceHandle*)));
+    HIP_RUNTIME_CHECK(
+        hipMalloc(&gpuMemObj->deviceHandles_d,
+                  numDevices * numOfQueuesPerDevice * sizeof(anvil::SdmaQueueDeviceHandle*)));
+    HIP_RUNTIME_CHECK(
+        hipMemset(gpuMemObj->deviceHandles_d, 0,
+                  numDevices * numOfQueuesPerDevice * sizeof(anvil::SdmaQueueDeviceHandle*)));
 
     for (auto& dstDeviceId : dstDeviceIds) {
       for (size_t q = 0; q < numOfQueuesPerDevice; q++) {
         auto* anvilHandle = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
-        HIP_RUNTIME_CHECK(hipMemcpy(&gpuMemObj->deviceHandles_d[dstDeviceId * numOfQueuesPerDevice + q], &anvilHandle, sizeof(anvilHandle), hipMemcpyHostToDevice));
+        HIP_RUNTIME_CHECK(
+            hipMemcpy(&gpuMemObj->deviceHandles_d[dstDeviceId * numOfQueuesPerDevice + q],
+                      &anvilHandle, sizeof(anvilHandle), hipMemcpyHostToDevice));
       }
     }
 
@@ -207,7 +211,8 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
     hipIpcMemHandle_t signalHandle;
     HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&signalHandle, gpuMemObj->signalPtrs));
 
-    auto* signalHandles = static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
+    auto* signalHandles =
+        static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
     bootNet.Allgather(&signalHandle, signalHandles, sizeof(hipIpcMemHandle_t));
 
     auto* peerSignalPtrsHost = static_cast<HSAuint64**>(calloc(worldSize, sizeof(HSAuint64*)));
@@ -216,8 +221,8 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       if (context.GetTransportType(i) != TransportType::SDMA) continue;
       if (i == rank) continue;
       void* mappedPtr = nullptr;
-      HIP_RUNTIME_CHECK(hipIpcOpenMemHandle(&mappedPtr, signalHandles[i],
-                                            hipIpcMemLazyEnablePeerAccess));
+      HIP_RUNTIME_CHECK(
+          hipIpcOpenMemHandle(&mappedPtr, signalHandles[i], hipIpcMemLazyEnablePeerAccess));
       peerSignalPtrsHost[i] = reinterpret_cast<HSAuint64*>(mappedPtr);
     }
 
@@ -562,6 +567,7 @@ SymmMemObjPtr SymmMemManager::CreateVMMHeapObject(size_t virtualSize, int worldS
   SymmMemObj* cpuHeapObj = new SymmMemObj();
   cpuHeapObj->localPtr = vmmVirtualBasePtr;
   cpuHeapObj->size = virtualSize;
+  cpuHeapObj->sdmaNumQueue = anvil::GetSdmaNumChannels();
 
   // Exchange virtual base pointers among all PEs
   cpuHeapObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
@@ -1605,6 +1611,7 @@ SymmMemObjPtr SymmMemManager::VMMRegisterSymmMemObj(void* localPtr, size_t size,
   SymmMemObj* cpuMemObj = new SymmMemObj();
   cpuMemObj->localPtr = localPtr;
   cpuMemObj->size = size;
+  cpuMemObj->sdmaNumQueue = anvil::GetSdmaNumChannels();
 
   // Calculate peer pointers based on VMM per-PE virtual address spaces
   cpuMemObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));

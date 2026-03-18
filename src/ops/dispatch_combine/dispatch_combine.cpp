@@ -27,6 +27,7 @@
 
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem_api.hpp"
+#include "mori/utils/env_utils.hpp"
 #include "mori/utils/hip_helper.hpp"
 #include "mori/utils/mori_log.hpp"
 
@@ -49,6 +50,9 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
     MORI_OPS_INFO("numQpPerPe %d larger than shmem numQpPerPe %d, set to %d", config.numQpPerPe,
                   shmemNumQpPerPe, shmemNumQpPerPe);
   }
+  config.enableSdma = env::IsEnvVarEnabled("MORI_ENABLE_SDMA");
+  MORI_OPS_INFO("EpDispatchCombine SDMA %s (currently only effective for AsyncLL kernel type)",
+                config.enableSdma ? "enabled" : "disabled");
   InitializeShmemBuf();
   InitializeTokenNumSignalBuf();
   InitializeOrderMapBuf();
@@ -56,7 +60,7 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
 
   this->multiProcessorCount = GetCurDeviceMultiProcessorCount();
   this->maxThreads = std::min(GetCurDeviceMaxThreads(), 1024);
-  MORI_OPS_INFO("Device capability: multiProcessorCount=%d, maxThreads=%d",
+  MORI_OPS_INFO("Device capability: multiProcessorCount={}, maxThreads={}",
                 static_cast<int>(this->multiProcessorCount), static_cast<int>(this->maxThreads));
 }
 

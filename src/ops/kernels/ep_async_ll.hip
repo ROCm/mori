@@ -3,8 +3,11 @@
 MORI_DEFINE_GPU_STATES
 
 WRAP_ALL_TYPES(EpDispatchLowLatencyAsyncSendCopy)
+WRAP_ALL_TYPES(EpDispatchLowLatencyAsyncSendCopySlotAssign)
+WRAP_ALL_TYPES(EpDispatchLowLatencyAsyncSendCopyMultiBlock)
 WRAP_ALL_TYPES(EpDispatchLowLatencyAsyncSendTransfer)
 WRAP_ALL_TYPES(EpDispatchLowLatencyAsyncRecvCopy)
+WRAP_ALL_TYPES(EpDispatchLowLatencyAsyncRecvCopyMultiBlock)
 WRAP_ALL_TYPES(EpDispatchLowLatencyAsyncRecvTransfer)
 
 WRAP_ALL_TYPES_BOOL(EpCombineLowLatencyAsyncSendCopy, , false)

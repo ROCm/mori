@@ -21,82 +21,16 @@
 // SOFTWARE.
 #pragma once
 
-#include <cctype>
-#include <cerrno>
-#include <cstdint>
-#include <cstdlib>
-#include <cstring>
-#include <limits>
-#include <optional>
-#include <string>
-
 #include "mori/io/logging.hpp"
+#include "mori/utils/env_utils.hpp"
 
 namespace mori {
 namespace io {
 namespace env {
 
-inline const char* Get(const char* name) { return std::getenv(name); }
-
-inline std::optional<std::string> GetString(const char* name) {
-  const char* value = Get(name);
-  if (value == nullptr || value[0] == '\0') return std::nullopt;
-  return std::string(value);
-}
-
-namespace detail {
-
-inline bool EqualsIgnoreCase(const char* lhs, const char* rhs) {
-  while (*lhs != '\0' && *rhs != '\0') {
-    if (std::tolower(static_cast<unsigned char>(*lhs)) !=
-        std::tolower(static_cast<unsigned char>(*rhs))) {
-      return false;
-    }
-    ++lhs;
-    ++rhs;
-  }
-  return *lhs == '\0' && *rhs == '\0';
-}
-
-inline std::optional<bool> ParseBool(const char* raw) {
-  if (std::strcmp(raw, "1") == 0 || EqualsIgnoreCase(raw, "true") || EqualsIgnoreCase(raw, "on") ||
-      EqualsIgnoreCase(raw, "yes")) {
-    return true;
-  }
-  if (std::strcmp(raw, "0") == 0 || EqualsIgnoreCase(raw, "false") ||
-      EqualsIgnoreCase(raw, "off") || EqualsIgnoreCase(raw, "no")) {
-    return false;
-  }
-  return std::nullopt;
-}
-
-inline std::optional<uint32_t> ParsePositiveU32(const char* raw) {
-  errno = 0;
-  char* end = nullptr;
-  unsigned long parsed = std::strtoul(raw, &end, 10);
-  if (end == raw || *end != '\0' || errno != 0 || parsed == 0 ||
-      parsed > std::numeric_limits<uint32_t>::max()) {
-    return std::nullopt;
-  }
-  return static_cast<uint32_t>(parsed);
-}
-
-inline std::optional<int> ParsePositiveInt(const char* raw) {
-  errno = 0;
-  char* end = nullptr;
-  long parsed = std::strtol(raw, &end, 10);
-  if (end == raw || *end != '\0' || errno != 0 || parsed <= 0 ||
-      parsed > std::numeric_limits<int>::max()) {
-    return std::nullopt;
-  }
-  return static_cast<int>(parsed);
-}
-
-}  // namespace detail
-
 template <typename Target, typename V>
 inline void Override(const char* name, Target& target, std::optional<V> (*parse)(const char*)) {
-  const char* raw = Get(name);
+  const char* raw = mori::env::Get(name);
   if (raw == nullptr || raw[0] == '\0') return;
   if (auto value = parse(raw); value.has_value()) {
     target = *value;

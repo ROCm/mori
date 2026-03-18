@@ -32,6 +32,12 @@ template <typename T>
 __global__ void EpDispatchLowLatencyAsyncSendCopy(EpDispatchCombineArgs<T> args);
 
 template <typename T>
+__global__ void EpDispatchLowLatencyAsyncSendCopySlotAssign(EpDispatchCombineArgs<T> args);
+
+template <typename T>
+__global__ void EpDispatchLowLatencyAsyncSendCopyMultiBlock(EpDispatchCombineArgs<T> args);
+
+template <typename T>
 __global__ void EpDispatchLowLatencyAsyncSendTransfer(EpDispatchCombineArgs<T> args);
 
 template <typename T>
@@ -39,6 +45,9 @@ __global__ void EpDispatchLowLatencyAsyncRecvTransfer(EpDispatchCombineArgs<T> a
 
 template <typename T>
 __global__ void EpDispatchLowLatencyAsyncRecvCopy(EpDispatchCombineArgs<T> args);
+
+template <typename T>
+__global__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock(EpDispatchCombineArgs<T> args);
 
 template <typename T, bool UseFp8DirectCast = false>
 __global__ void EpCombineLowLatencyAsyncSendCopy(EpDispatchCombineArgs<T> args);

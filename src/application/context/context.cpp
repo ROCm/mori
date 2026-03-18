@@ -35,6 +35,7 @@
 
 #include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/utils/check.hpp"
+#include "mori/utils/env_utils.hpp"
 #include "mori/utils/mori_log.hpp"
 
 namespace mori {
@@ -119,15 +120,9 @@ void Context::CollectHostNames() {
   }
 }
 
-bool IsP2PDisabled() {
-  const char* varName = "MORI_DISABLE_P2P";
-  return getenv(varName) != nullptr;
-}
+bool IsP2PDisabled() { return env::IsEnvVarEnabled("MORI_DISABLE_P2P"); }
 
-bool IsSDMAEnabled() {
-  const char* varName = "MORI_ENABLE_SDMA";
-  return getenv(varName) != nullptr;
-}
+bool IsSDMAEnabled() { return env::IsEnvVarEnabled("MORI_ENABLE_SDMA"); }
 
 void Context::InitializePossibleTransports() {
   // Find my rank in node
@@ -155,7 +150,7 @@ void Context::InitializePossibleTransports() {
   }
 
   // Match gpu and nic
-  const char* disableTopo = std::getenv("MORI_DISABLE_TOPO");
+  bool disableTopo = env::IsEnvVarEnabled("MORI_DISABLE_TOPO");
   int portId = -1;
   int devicePortId = -1;
   RdmaDevice* device = nullptr;
@@ -203,6 +198,9 @@ void Context::InitializePossibleTransports() {
   int peerRankInNode = -1;
   if (!IsP2PDisabled() && IsSDMAEnabled()) anvil::anvil.init();
 
+  int sdmaNumChannels = anvil::GetSdmaNumChannels();
+  MORI_APP_INFO("SDMA num channels per GPU pair: {}", sdmaNumChannels);
+
   for (int i = 0; i < WorldSize(); i++) {
     // Check P2P availability
     if (!IsP2PDisabled()) {
@@ -219,10 +217,10 @@ void Context::InitializePossibleTransports() {
               transportTypes.push_back(TransportType::SDMA);
               anvil::EnablePeerAccess(LocalRank() % 8, i % 8);
               // Better performance if allocating all 8 queues
-              anvil::anvil.connect(LocalRank() % 8, i % 8, 8);
+              anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
             } else {
               transportTypes.push_back(TransportType::SDMA);
-              anvil::anvil.connect(LocalRank() % 8, i % 8, 8);
+              anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
             }
           } else {
             transportTypes.push_back(TransportType::P2P);

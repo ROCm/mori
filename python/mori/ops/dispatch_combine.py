@@ -416,14 +416,16 @@ class EpDispatchCombineOp:
             )
         elif kt == EpDispatchCombineKernelType.AsyncLL.value:
             mp = self._handle_info["multi_processor_count"]
+            mb_block = WARP_SIZE * 16
             self._launch_multi(
                 [
-                    f"EpDispatchLowLatencyAsyncSendCopy_{sfx}",
+                    f"EpDispatchLowLatencyAsyncSendCopySlotAssign_{sfx}",
+                    f"EpDispatchLowLatencyAsyncSendCopyMultiBlock_{sfx}",
                     f"EpDispatchLowLatencyAsyncSendTransfer_{sfx}",
                 ],
-                [mp, self.config.world_size],
-                [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
-                [0, 0],
+                [mp, mp, self.config.world_size],
+                [mb_block, mb_block, WARP_SIZE * actual_wpb],
+                [0, 0, 0],
                 stream,
                 args_ptr,
             )
@@ -463,7 +465,9 @@ class EpDispatchCombineOp:
             scales,
             indices,
             block_num=self.auto_block_num if self.auto_block_num else block_num,
-            warp_per_block=self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
+            warp_per_block=(
+                self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block
+            ),
         )
 
     def dispatch_recv(
@@ -488,13 +492,14 @@ class EpDispatchCombineOp:
         )
         if kt == EpDispatchCombineKernelType.AsyncLL.value:
             mp = self._handle_info["multi_processor_count"]
+            mb_block = WARP_SIZE * 16
             self._launch_multi(
                 [
                     f"EpDispatchLowLatencyAsyncRecvTransfer_{sfx}",
-                    f"EpDispatchLowLatencyAsyncRecvCopy_{sfx}",
+                    f"EpDispatchLowLatencyAsyncRecvCopyMultiBlock_{sfx}",
                 ],
                 [self.config.world_size, mp],
-                [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                [WARP_SIZE * actual_wpb, mb_block],
                 [0, 0],
                 stream,
                 args_ptr,
@@ -684,7 +689,9 @@ class EpDispatchCombineOp:
             weights,
             indices,
             block_num=self.auto_block_num if self.auto_block_num else block_num,
-            warp_per_block=self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
+            warp_per_block=(
+                self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block
+            ),
         )
 
     def combine_recv(

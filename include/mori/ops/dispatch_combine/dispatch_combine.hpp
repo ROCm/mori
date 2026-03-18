@@ -105,6 +105,7 @@ struct EpDispatchCombineConfig {
   int rdmaBlockNum{1};
   int numQpPerPe{1};
   QuantType quantType{QuantType::None};
+  bool enableSdma{false};
 
   inline __host__ __device__ int MaxNumTokensToSendPerRank() const { return maxNumInpTokenPerRank; }
 
