@@ -350,7 +350,13 @@ void EpDispatchCombineHandle::LaunchDispatch(KernelType kernelType, int blockNum
           EpDispatchIntraNodeKernel<DataT><<<grid, block, sharedMemSize, stream>>>(args);
         } else if (kernelType == KernelType::AsyncLL) {
           assert(config.useExternalInpBuffer);
-          EpDispatchLowLatencyAsyncCopy<<<this->multiProcessorCount, block, 0, stream>>>(args);
+          dim3 mbBlock(warpSize * 16);
+          // Phase 1: lightweight slot assignment (one warp per token, atomic-based)
+          EpDispatchLowLatencyAsyncCopySlotAssign<<<this->multiProcessorCount, mbBlock, 0,
+                                                    stream>>>(args);
+          // Phase 2: multi-block cooperative data copy using pre-computed slots
+          EpDispatchLowLatencyAsyncCopyMultiBlock<<<this->multiProcessorCount, mbBlock, 0,
+                                                    stream>>>(args);
           EpDispatchLowLatencyAsyncDataTransfer<<<config.worldSize, block, 0, stream>>>(args);
         } else {
           assert(false);
@@ -380,8 +386,10 @@ void EpDispatchCombineHandle::LaunchDispatchRecv(KernelType kernelType, int bloc
         args.config.hiddenDim = actualHiddenDim;
         if (kernelType == KernelType::AsyncLL) {
           assert(config.useExternalInpBuffer);
+          dim3 mbBlock(warpSize * 16);
           EpDispatchLowLatencyAsyncRecvDataTransfer<<<config.worldSize, block, 0, stream>>>(args);
-          EpDispatchLowLatencyAsyncRecvCopy<<<this->multiProcessorCount, block, 0, stream>>>(args);
+          EpDispatchLowLatencyAsyncRecvCopyMultiBlock<<<this->multiProcessorCount, mbBlock, 0,
+                                                        stream>>>(args);
         } else {
           assert(false);
         }
