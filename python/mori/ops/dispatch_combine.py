@@ -416,6 +416,7 @@ class EpDispatchCombineOp:
             )
         elif kt == EpDispatchCombineKernelType.AsyncLL.value:
             mp = self._handle_info["multi_processor_count"]
+            mp_aligned = mp // self.config.world_size * self.config.world_size
             mb_block = WARP_SIZE * 16
             self._launch_multi(
                 [
@@ -423,7 +424,7 @@ class EpDispatchCombineOp:
                     f"EpDispatchLowLatencyAsyncSendCopyMultiBlock_{sfx}",
                     f"EpDispatchLowLatencyAsyncSendTransfer_{sfx}",
                 ],
-                [mp, mp, self.config.world_size],
+                [mp_aligned, mp_aligned, self.config.world_size],
                 [mb_block, mb_block, WARP_SIZE * actual_wpb],
                 [0, 0, 0],
                 stream,
@@ -492,13 +493,14 @@ class EpDispatchCombineOp:
         )
         if kt == EpDispatchCombineKernelType.AsyncLL.value:
             mp = self._handle_info["multi_processor_count"]
+            mp_aligned = mp // self.config.world_size * self.config.world_size
             mb_block = WARP_SIZE * 16
             self._launch_multi(
                 [
                     f"EpDispatchLowLatencyAsyncRecvTransfer_{sfx}",
                     f"EpDispatchLowLatencyAsyncRecvCopyMultiBlock_{sfx}",
                 ],
-                [self.config.world_size, mp],
+                [self.config.world_size, mp_aligned],
                 [WARP_SIZE * actual_wpb, mb_block],
                 [0, 0],
                 stream,
@@ -627,6 +629,7 @@ class EpDispatchCombineOp:
                 )
         elif kt == EpDispatchCombineKernelType.AsyncLL.value:
             mp = self._handle_info["multi_processor_count"]
+            mp_aligned = mp // self.config.world_size * self.config.world_size
             quant_type = _normalize_quant_type(self.config.quant_type)
             if sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8DirectCast:
                 self._launch_multi(
@@ -634,7 +637,7 @@ class EpDispatchCombineOp:
                         "EpCombineLowLatencyAsyncSendCopy_bf16_fp8cast",
                         "EpCombineLowLatencyAsyncSendTransfer_bf16_fp8cast",
                     ],
-                    [mp, self.config.world_size],
+                    [mp_aligned, self.config.world_size],
                     [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
                     [0, 0],
                     stream,
@@ -646,7 +649,7 @@ class EpDispatchCombineOp:
                         f"EpCombineLowLatencyAsyncSendCopy_{sfx}",
                         f"EpCombineLowLatencyAsyncSendTransfer_{sfx}",
                     ],
-                    [mp, self.config.world_size],
+                    [mp_aligned, self.config.world_size],
                     [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
                     [0, 0],
                     stream,
@@ -717,6 +720,7 @@ class EpDispatchCombineOp:
         shared_mem = self._combine_shared_mem(actual_wpb)
         if kt == EpDispatchCombineKernelType.AsyncLL.value:
             mp = self._handle_info["multi_processor_count"]
+            mp_aligned = mp // self.config.world_size * self.config.world_size
             quant_type = _normalize_quant_type(self.config.quant_type)
             if sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8DirectCast:
                 self._launch_multi(
@@ -724,7 +728,7 @@ class EpDispatchCombineOp:
                         "EpCombineLowLatencyAsyncRecvTransfer_bf16_fp8cast",
                         "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8cast",
                     ],
-                    [self.config.world_size, mp],
+                    [self.config.world_size, mp_aligned],
                     [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
                     [0, shared_mem],
                     stream,
@@ -736,7 +740,7 @@ class EpDispatchCombineOp:
                         f"EpCombineLowLatencyAsyncRecvTransfer_{sfx}",
                         f"EpCombineLowLatencyAsyncRecvCopy_{sfx}",
                     ],
-                    [self.config.world_size, mp],
+                    [self.config.world_size, mp_aligned],
                     [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
                     [0, shared_mem],
                     stream,
