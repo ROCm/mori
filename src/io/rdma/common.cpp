@@ -55,7 +55,7 @@ static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const cha
   }
   static const int kBackoffTimeoutUs = []() {
     int v = 10000;
-    env::Override("MORI_IO_SQ_BACKOFF_TIMEOUT_US", v, env::detail::ParsePositiveInt);
+    env::Override("MORI_IO_SQ_BACKOFF_TIMEOUT_US", v, mori::env::detail::ParsePositiveInt);
     return v;
   }();
   const auto deadline =

@@ -382,20 +382,28 @@ class EpDispatchCombineOp:
         elif kt == EpDispatchCombineKernelType.InterNodeV1.value:
             mp = self._handle_info["multi_processor_count"]
             self._launch_multi(
-                [f"EpDispatchCopyToStaging_{sfx}", f"EpDispatchInterNodeV1Kernel_{sfx}"],
+                [
+                    f"EpDispatchCopyToStaging_{sfx}",
+                    f"EpDispatchInterNodeV1Kernel_{sfx}",
+                ],
                 [mp, actual_bn],
                 [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
                 [0, shared_mem],
-                stream, args_ptr,
+                stream,
+                args_ptr,
             )
         elif kt == EpDispatchCombineKernelType.InterNodeV1LL.value:
             mp = self._handle_info["multi_processor_count"]
             self._launch_multi(
-                [f"EpDispatchCopyToStaging_{sfx}", f"EpDispatchInterNodeV1KernelLowLatency_{sfx}"],
+                [
+                    f"EpDispatchCopyToStaging_{sfx}",
+                    f"EpDispatchInterNodeV1KernelLowLatency_{sfx}",
+                ],
                 [mp, actual_bn],
                 [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
                 [0, shared_mem],
-                stream, args_ptr,
+                stream,
+                args_ptr,
             )
         elif kt == EpDispatchCombineKernelType.IntraNode.value:
             self._launch(
@@ -407,11 +415,18 @@ class EpDispatchCombineOp:
                 args_ptr,
             )
         elif kt == EpDispatchCombineKernelType.AsyncLL.value:
-            self._launch(
-                f"EpDispatchLowLatencyAsyncSend_{sfx}",
-                grid,
-                block,
-                shared_mem,
+            mp = self._handle_info["multi_processor_count"]
+            mp_aligned = mp // self.config.world_size * self.config.world_size
+            mb_block = WARP_SIZE * 16
+            self._launch_multi(
+                [
+                    f"EpDispatchLowLatencyAsyncSendCopySlotAssign_{sfx}",
+                    f"EpDispatchLowLatencyAsyncSendCopyMultiBlock_{sfx}",
+                    f"EpDispatchLowLatencyAsyncSendTransfer_{sfx}",
+                ],
+                [mp_aligned, mp_aligned, self.config.world_size],
+                [mb_block, mb_block, WARP_SIZE * actual_wpb],
+                [0, 0, 0],
                 stream,
                 args_ptr,
             )
@@ -451,7 +466,9 @@ class EpDispatchCombineOp:
             scales,
             indices,
             block_num=self.auto_block_num if self.auto_block_num else block_num,
-            warp_per_block=self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
+            warp_per_block=(
+                self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block
+            ),
         )
 
     def dispatch_recv(
@@ -459,9 +476,7 @@ class EpDispatchCombineOp:
         block_num: int = -1,
         warp_per_block: int = -1,
     ):
-        actual_bn, _, actual_wpb = self._resolve_launch_params(
-            block_num, 0, warp_per_block
-        )
+        _, _, actual_wpb = self._resolve_launch_params(block_num, 0, warp_per_block)
         stream = _current_stream()
         sfx = _DTYPE_SUFFIX[self.config.data_type]
         kt = self.config.kernel_type.value
@@ -476,15 +491,18 @@ class EpDispatchCombineOp:
             indices_ptr=0,
             rdma_block_num=0,
         )
-        grid = (actual_bn,)
-        block = (WARP_SIZE * actual_wpb,)
-        shared_mem = self._dispatch_shared_mem(actual_wpb)
         if kt == EpDispatchCombineKernelType.AsyncLL.value:
-            self._launch(
-                f"EpDispatchLowLatencyAsyncRecv_{sfx}",
-                grid,
-                block,
-                shared_mem,
+            mp = self._handle_info["multi_processor_count"]
+            mp_aligned = mp // self.config.world_size * self.config.world_size
+            mb_block = WARP_SIZE * 16
+            self._launch_multi(
+                [
+                    f"EpDispatchLowLatencyAsyncRecvTransfer_{sfx}",
+                    f"EpDispatchLowLatencyAsyncRecvCopyMultiBlock_{sfx}",
+                ],
+                [self.config.world_size, mp_aligned],
+                [WARP_SIZE * actual_wpb, mb_block],
+                [0, 0],
                 stream,
                 args_ptr,
             )
@@ -548,23 +566,33 @@ class EpDispatchCombineOp:
             mp = self._handle_info["multi_processor_count"]
             bsz = WARP_SIZE * actual_wpb
             self._launch_multi(
-                [f"EpCombineSync_{sfx}", f"EpCombineSyncBarrier_{sfx}",
-                 f"EpCombineInterNodeV1Kernel_{sfx}", f"EpCombineAll_{sfx}"],
+                [
+                    f"EpCombineSync_{sfx}",
+                    f"EpCombineSyncBarrier_{sfx}",
+                    f"EpCombineInterNodeV1Kernel_{sfx}",
+                    f"EpCombineAll_{sfx}",
+                ],
                 [mp, 1, actual_bn, mp],
                 [bsz, WARP_SIZE, bsz, bsz],
                 [0, 0, shared_mem, shared_mem],
-                stream, args_ptr,
+                stream,
+                args_ptr,
             )
         elif kt == EpDispatchCombineKernelType.InterNodeV1LL.value:
             mp = self._handle_info["multi_processor_count"]
             bsz = WARP_SIZE * actual_wpb
             self._launch_multi(
-                [f"EpCombineSync_{sfx}", f"EpCombineSyncBarrier_{sfx}",
-                 f"EpCombineInterNodeV1KernelLowLatency_{sfx}", f"EpCombineAll_{sfx}"],
+                [
+                    f"EpCombineSync_{sfx}",
+                    f"EpCombineSyncBarrier_{sfx}",
+                    f"EpCombineInterNodeV1KernelLowLatency_{sfx}",
+                    f"EpCombineAll_{sfx}",
+                ],
                 [mp, 1, actual_bn, mp],
                 [bsz, WARP_SIZE, bsz, bsz],
                 [0, 0, shared_mem, shared_mem],
-                stream, args_ptr,
+                stream,
+                args_ptr,
             )
         elif kt == EpDispatchCombineKernelType.IntraNode.value:
             if actual_use_ext:
@@ -600,22 +628,30 @@ class EpDispatchCombineOp:
                     args_ptr,
                 )
         elif kt == EpDispatchCombineKernelType.AsyncLL.value:
+            mp = self._handle_info["multi_processor_count"]
+            mp_aligned = mp // self.config.world_size * self.config.world_size
             quant_type = _normalize_quant_type(self.config.quant_type)
             if sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8DirectCast:
-                self._launch(
-                    "EpCombineLowLatencyAsyncSend_bf16_fp8cast",
-                    grid,
-                    block,
-                    shared_mem,
+                self._launch_multi(
+                    [
+                        "EpCombineLowLatencyAsyncSendCopy_bf16_fp8cast",
+                        "EpCombineLowLatencyAsyncSendTransfer_bf16_fp8cast",
+                    ],
+                    [mp_aligned, self.config.world_size],
+                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [0, 0],
                     stream,
                     args_ptr,
                 )
             else:
-                self._launch(
-                    f"EpCombineLowLatencyAsyncSend_{sfx}",
-                    grid,
-                    block,
-                    shared_mem,
+                self._launch_multi(
+                    [
+                        f"EpCombineLowLatencyAsyncSendCopy_{sfx}",
+                        f"EpCombineLowLatencyAsyncSendTransfer_{sfx}",
+                    ],
+                    [mp_aligned, self.config.world_size],
+                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [0, 0],
                     stream,
                     args_ptr,
                 )
@@ -656,7 +692,9 @@ class EpDispatchCombineOp:
             weights,
             indices,
             block_num=self.auto_block_num if self.auto_block_num else block_num,
-            warp_per_block=self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
+            warp_per_block=(
+                self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block
+            ),
         )
 
     def combine_recv(
@@ -664,9 +702,7 @@ class EpDispatchCombineOp:
         block_num: int = -1,
         warp_per_block: int = -1,
     ):
-        actual_bn, _, actual_wpb = self._resolve_launch_params(
-            block_num, 0, warp_per_block
-        )
+        _, _, actual_wpb = self._resolve_launch_params(block_num, 0, warp_per_block)
         stream = _current_stream()
         sfx = _DTYPE_SUFFIX[self.config.data_type]
         kt = self.config.kernel_type.value
@@ -681,26 +717,32 @@ class EpDispatchCombineOp:
             indices_ptr=0,
             rdma_block_num=0,
         )
-        grid = (actual_bn,)
-        block = (WARP_SIZE * actual_wpb,)
         shared_mem = self._combine_shared_mem(actual_wpb)
         if kt == EpDispatchCombineKernelType.AsyncLL.value:
+            mp = self._handle_info["multi_processor_count"]
+            mp_aligned = mp // self.config.world_size * self.config.world_size
             quant_type = _normalize_quant_type(self.config.quant_type)
             if sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8DirectCast:
-                self._launch(
-                    "EpCombineLowLatencyAsyncRecv_bf16_fp8cast",
-                    grid,
-                    block,
-                    shared_mem,
+                self._launch_multi(
+                    [
+                        "EpCombineLowLatencyAsyncRecvTransfer_bf16_fp8cast",
+                        "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8cast",
+                    ],
+                    [self.config.world_size, mp_aligned],
+                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [0, shared_mem],
                     stream,
                     args_ptr,
                 )
             else:
-                self._launch(
-                    f"EpCombineLowLatencyAsyncRecv_{sfx}",
-                    grid,
-                    block,
-                    shared_mem,
+                self._launch_multi(
+                    [
+                        f"EpCombineLowLatencyAsyncRecvTransfer_{sfx}",
+                        f"EpCombineLowLatencyAsyncRecvCopy_{sfx}",
+                    ],
+                    [self.config.world_size, mp_aligned],
+                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [0, shared_mem],
                     stream,
                     args_ptr,
                 )

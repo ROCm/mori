@@ -174,12 +174,12 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
       config.maxMsgSge > 0 ? std::optional<uint32_t>(static_cast<uint32_t>(config.maxMsgSge))
                            : std::nullopt;
 
-  env::Override("MORI_IO_QP_MAX_SEND_WR", desiredSendWr, env::detail::ParsePositiveU32);
-  env::Override("MORI_IO_QP_MAX_RECV_WR", desiredRecvWr, env::detail::ParsePositiveU32);
-  env::Override("MORI_IO_QP_MAX_CQE", desiredCqe, env::detail::ParsePositiveU32);
-  env::Override("MORI_IO_QP_MAX_MSG_SGE", desiredMsgSge, env::detail::ParsePositiveU32);
+  env::Override("MORI_IO_QP_MAX_SEND_WR", desiredSendWr, mori::env::detail::ParsePositiveU32);
+  env::Override("MORI_IO_QP_MAX_RECV_WR", desiredRecvWr, mori::env::detail::ParsePositiveU32);
+  env::Override("MORI_IO_QP_MAX_CQE", desiredCqe, mori::env::detail::ParsePositiveU32);
+  env::Override("MORI_IO_QP_MAX_MSG_SGE", desiredMsgSge, mori::env::detail::ParsePositiveU32);
   // Alias for convenience: keep both MORI_IO_QP_MAX_MSG_SGE and MORI_IO_QP_MAX_SGE.
-  env::Override("MORI_IO_QP_MAX_SGE", desiredMsgSge, env::detail::ParsePositiveU32);
+  env::Override("MORI_IO_QP_MAX_SGE", desiredMsgSge, mori::env::detail::ParsePositiveU32);
 
   epConfig.maxMsgsNum = std::min(desiredSendWr, maxQpWr);
   // RQ must fit NotifManager's pre-posted recv WQEs (notifPerQp=1024) when notification is
@@ -744,7 +744,8 @@ bool RdmaBackendSession::Alive() const { return true; }
 RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
                          const RdmaBackendConfig& beConfig)
     : myEngKey(k), config(beConfig) {
-  env::Override("MORI_IO_ENABLE_NOTIFICATION", config.enableNotification, env::detail::ParseBool);
+  env::Override("MORI_IO_ENABLE_NOTIFICATION", config.enableNotification,
+                mori::env::detail::ParseBool);
 
   application::RdmaContext* ctx =
       new application::RdmaContext(application::RdmaBackendType::IBVerbs);

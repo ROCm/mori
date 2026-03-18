@@ -282,7 +282,7 @@ bool XgmiBackendSession::Alive() const { return true; }
 XgmiBackend::XgmiBackend(EngineKey k, const IOEngineConfig& engConfig,
                          const XgmiBackendConfig& beConfig)
     : myEngKey(k), config(beConfig) {
-  if (auto nodeId = env::GetString("MORI_IO_NODE_ID"); nodeId.has_value()) {
+  if (auto nodeId = mori::env::GetString("MORI_IO_NODE_ID"); nodeId.has_value()) {
     myNodeId = *nodeId;
   }
   char hostname[HOST_NAME_MAX];

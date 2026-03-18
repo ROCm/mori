@@ -293,7 +293,7 @@ class EpDispatchCombineTestCase:
         return rank_counts, rank_counts_remote_recv, rank_counts_remote_send
 
     def run_dispatch(self, op, token, weights, scales, indices):
-        if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+        if op.config.kernel_type in (mori.ops.EpDispatchCombineKernelType.AsyncLL,):
             ret = op.dispatch_send(token, weights, scales, indices)
             op.dispatch_recv()
         else:
@@ -301,7 +301,7 @@ class EpDispatchCombineTestCase:
         return ret
 
     def run_combine(self, op, token, weights, indices):
-        if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+        if op.config.kernel_type in (mori.ops.EpDispatchCombineKernelType.AsyncLL,):
             ret = op.combine_send(token, weights, indices)
             op.combine_recv()
         else:
@@ -379,7 +379,7 @@ class EpDispatchCombineTestCase:
             print(f"Node {self.rank // self.gpu_per_node} Dispatch Pass")
 
         # NOTE: weight combine not implemented yet
-        if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+        if op.config.kernel_type in (mori.ops.EpDispatchCombineKernelType.AsyncLL,):
             dispatch_weights = None
         combine_output, combine_output_weight = self.run_combine(
             op, dispatch_output, dispatch_weights, all_rank_indices[self.rank]
@@ -709,9 +709,9 @@ class EpDispatchCombineTestCase:
             if self.rank == 0:
                 print(f"WarmUp Round {i} begin")
             self.run_test_once(op, test_data, error_round, i)
-        assert len(error_round) == 0, (
-            f"Warmup failed with errors in rounds: {error_round}"
-        )
+        assert (
+            len(error_round) == 0
+        ), f"Warmup failed with errors in rounds: {error_round}"
 
         (
             disp_duration,

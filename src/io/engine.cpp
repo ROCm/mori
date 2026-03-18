@@ -321,7 +321,7 @@ std::optional<BackendType> IOEngine::QueryRouteCache(const RouteCacheKey& key) c
 }
 
 std::string IOEngine::ResolveNodeId(const std::string& hostname) const {
-  if (auto nodeId = env::GetString("MORI_IO_NODE_ID"); nodeId.has_value()) {
+  if (auto nodeId = mori::env::GetString("MORI_IO_NODE_ID"); nodeId.has_value()) {
     return *nodeId;
   }
   return hostname;
