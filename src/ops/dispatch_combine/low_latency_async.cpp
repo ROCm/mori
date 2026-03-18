@@ -117,10 +117,11 @@ __device__ void EpDispatchLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs
           (config.MaxNumTokensToSendPerRank() * myPe + tokenChunkNum * qpId) * xferBytes;
       size_t localOffset =
           (config.MaxNumTokensToSendPerRank() * destPe + tokenChunkNum * qpId) * xferBytes;
-      if (destPe != myPe)
-        shmem::ShmemPutMemNbiWarp(args.shmemDispatchInpTokMemObj, remoteOffset,
-                                  args.shmemStagingTokMemObj, localOffset,
-                                  thisChunkTokenNum * xferBytes, destPe, qpId);
+      if ((destPe != myPe) && (laneId == 0) && (thisChunkTokenNum > 0)) {
+        shmem::ShmemPutMemNbiThread(args.shmemDispatchInpTokMemObj, remoteOffset,
+                                    args.shmemStagingTokMemObj, localOffset,
+                                    thisChunkTokenNum * xferBytes, destPe, qpId);
+      }
       // TODO(ditian12): index value is wrong if signal completion here, investigate the reason
       // shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
       //     args.recvTokenNumMemObj, (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
@@ -138,11 +139,15 @@ __device__ void EpDispatchLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs
 template <typename T>
 __device__ void EpDispatchLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
-
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       if (laneId == 0) {
-        shmem::ShmemQuietThread(destPe, qpId);
+        if (destPe / config.gpuPerNode == myNode) {
+          shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
+            destPe, args.shmemDispatchInpTokMemObj);
+        } else {
+          shmem::ShmemQuietThread(destPe, qpId);
+        }
         int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
         shmem::ShmemPutUint64ImmNbiThread(args.recvTokenNumMemObj,
                                           (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
@@ -169,7 +174,6 @@ __device__ void EpDispatchLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs
 template <typename T>
 __device__ void EpDispatchLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
-
   int blocksPerPe = blockNum / npes;
   int destPe = blockId / blocksPerPe;
   int localBlockId = blockId % blocksPerPe;
@@ -323,10 +327,10 @@ __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<
           (config.MaxNumTokensToSendPerRank() * myPe + tokenChunkNum * qpId) * tokHiddenBytes;
       size_t localOffset =
           (config.MaxNumTokensToSendPerRank() * destPe + tokenChunkNum * qpId) * tokHiddenBytes;
-      if (destPe != myPe)
-        shmem::ShmemPutMemNbiWarp(args.shmemCombineInpTokMemObj, remoteOffset,
-                                  args.shmemStagingTokMemObj, localOffset,
-                                  thisChunkTokenNum * tokHiddenBytes, destPe, qpId);
+      if ((destPe != myPe) && (laneId == 0) && (thisChunkTokenNum > 0))
+        shmem::ShmemPutMemNbiThread(args.shmemCombineInpTokMemObj, remoteOffset,
+                                    args.shmemStagingTokMemObj, localOffset,
+                                    thisChunkTokenNum * tokHiddenBytes, destPe, qpId);
       // if (laneId == 0)
       // shmem::ShmemQuietThread(destPe, qpId);
       // shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
@@ -351,7 +355,12 @@ __device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       if (laneId == 0) {
-        shmem::ShmemQuietThread(destPe, qpId);
+        if (destPe / config.gpuPerNode == myNode) {
+          shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
+            destPe, args.shmemCombineInpTokMemObj);
+        } else {
+          shmem::ShmemQuietThread(destPe, qpId);
+        }
         uint64_t flag = args.crossDeviceBarrierFlag[0];
         shmem::ShmemPutUint64ImmNbiThread(args.crossDeviceBarrierMemObj,
                                           (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),

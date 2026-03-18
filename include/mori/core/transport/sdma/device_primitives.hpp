@@ -53,15 +53,31 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
    char* srcPtr = reinterpret_cast<char*>(srcBuf);
    char* dstPtr = reinterpret_cast<char*>(dstBuf);
 
-   anvil::SdmaQueueDeviceHandle handle = **(deviceHandles+qId);
+   // printf("[SDMA DBG] qId=%u srcBuf=%p dstBuf=%p copy_size=%zu signalAddr=%p\n",
+   //        qId, srcBuf, dstBuf, copy_size, (void*)signalAddr);
+
+   anvil::SdmaQueueDeviceHandle* handlePtr = *(deviceHandles+qId);
+   // printf("[SDMA DBG] qId=%u deviceHandles=%p handlePtr=%p\n",
+   //        qId, (void*)deviceHandles, (void*)handlePtr);
+   // if (handlePtr == nullptr) {
+   //    printf("[SDMA ERR] qId=%u handlePtr is NULL!\n", qId);
+   //    assert(false);
+   // }
+   anvil::SdmaQueueDeviceHandle handle = *handlePtr;
+   // printf("[SDMA DBG] qId=%u queueBuf=%p wptr=%p rptr=%p doorbell=%p\n",
+   //        qId, (void*)handle.queueBuf, (void*)handle.wptr, (void*)handle.rptr, (void*)handle.doorbell);
+
    base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR), offset);
    pendingWptr = base;
    startBase = base;
+   // printf("[SDMA DBG] qId=%u after 1st reserve: base=%lu offset=%lu\n", qId, base, offset);
 
    auto packet_d = anvil::CreateCopyPacket(srcPtr, dstPtr, copy_size);
    handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet_d, pendingWptr, offset);
 
    base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), offset);
+   // printf("[SDMA DBG] qId=%u after 2nd reserve: base=%lu startBase=%lu gap=%ld\n",
+   //        qId, base, startBase, (long)(base - pendingWptr));
    pendingWptr = base;
    auto packet_s = anvil::CreateAtomicIncPacket(signalAddr + qId);
    handle.template placePacket<SDMA_PKT_ATOMIC>(packet_s, pendingWptr, offset);

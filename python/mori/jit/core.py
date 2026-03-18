@@ -218,6 +218,8 @@ def _hipcc_genco(
         f"--offload-arch={cfg.arch}",
         "-std=c++17",
         "-O2",
+        # "-g",
+        # "-O0",
         "-D__HIP_PLATFORM_AMD__",
         "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
         *_nic_defines(),
