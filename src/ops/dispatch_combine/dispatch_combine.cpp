@@ -47,11 +47,11 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
   int shmemNumQpPerPe = ShmemNumQpPerPe();
   if (config.numQpPerPe > shmemNumQpPerPe) {
     config.numQpPerPe = shmemNumQpPerPe;
-    MORI_OPS_INFO("numQpPerPe %d larger than shmem numQpPerPe %d, set to %d", config.numQpPerPe,
+    MORI_OPS_INFO("numQpPerPe {} larger than shmem numQpPerPe {}, set to {}", config.numQpPerPe,
                   shmemNumQpPerPe, shmemNumQpPerPe);
   }
   config.enableSdma = env::IsEnvVarEnabled("MORI_ENABLE_SDMA");
-  MORI_OPS_INFO("EpDispatchCombine SDMA %s (currently only effective for AsyncLL kernel type)",
+  MORI_OPS_INFO("EpDispatchCombine SDMA {} (currently only effective for AsyncLL kernel type)",
                 config.enableSdma ? "enabled" : "disabled");
   InitializeShmemBuf();
   InitializeTokenNumSignalBuf();
