@@ -22,6 +22,7 @@
 #include <cassert>
 #include <iostream>
 #include <thread>
+#include <vector>
 
 #include "umbp/block_index/block_index.h"
 
