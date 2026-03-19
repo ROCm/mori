@@ -28,7 +28,7 @@
 #include <utility>
 #include <vector>
 
-#include "umbp/block_index.h"
+#include "umbp/block_index/global_block_index.h"
 #include "umbp/client_registry.h"
 
 namespace mori::umbp {
@@ -52,7 +52,7 @@ std::map<TierType, TierCapacity> MakeTierCapacities(uint64_t total_bytes,
 }  // namespace
 
 TEST(BlockIndexTest, RegisterLookupIdempotent) {
-  BlockIndex index;
+  GlobalBlockIndex index;
   const Location loc = MakeLocation("node-a", "loc-1", 4096, TierType::HBM);
 
   index.Register("node-a", "key-1", loc);
@@ -64,7 +64,7 @@ TEST(BlockIndexTest, RegisterLookupIdempotent) {
 }
 
 TEST(BlockIndexTest, MetricsInitializedAndUpdatedOnAccess) {
-  BlockIndex index;
+  GlobalBlockIndex index;
   const Location loc = MakeLocation("node-a", "loc-1", 4096, TierType::HBM);
 
   index.Register("node-a", "key-1", loc);
@@ -84,7 +84,7 @@ TEST(BlockIndexTest, MetricsInitializedAndUpdatedOnAccess) {
 }
 
 TEST(BlockIndexTest, RegisterNewReplicaUpdatesLastAccessedMetrics) {
-  BlockIndex index;
+  GlobalBlockIndex index;
   const Location loc_a = MakeLocation("node-a", "loc-1", 4096, TierType::HBM);
   const Location loc_b = MakeLocation("node-b", "loc-2", 4096, TierType::HBM);
 
@@ -103,7 +103,7 @@ TEST(BlockIndexTest, RegisterNewReplicaUpdatesLastAccessedMetrics) {
 }
 
 TEST(BlockIndexTest, UnregisterRemovesKeyWhenLastReplicaRemoved) {
-  BlockIndex index;
+  GlobalBlockIndex index;
   const Location loc_a = MakeLocation("node-a", "loc-a", 4096, TierType::HBM);
   const Location loc_b = MakeLocation("node-b", "loc-b", 4096, TierType::HBM);
 
@@ -122,7 +122,7 @@ TEST(BlockIndexTest, UnregisterRemovesKeyWhenLastReplicaRemoved) {
 }
 
 TEST(BlockIndexTest, UnregisterByNodeRemovesMatchingReplicasOnly) {
-  BlockIndex index;
+  GlobalBlockIndex index;
 
   index.Register("node-a", "key-1", MakeLocation("node-a", "loc-a1", 1024, TierType::HBM));
   index.Register("node-a", "key-1", MakeLocation("node-a", "loc-a2", 1024, TierType::DRAM));
@@ -137,7 +137,7 @@ TEST(BlockIndexTest, UnregisterByNodeRemovesMatchingReplicasOnly) {
 }
 
 TEST(BlockIndexTest, UnregisterByNodeUpdatesRegistryOwnershipTracking) {
-  BlockIndex index;
+  GlobalBlockIndex index;
   ClientRegistry registry(ClientRegistryConfig{}, index);
   index.SetClientRegistry(&registry);
 
@@ -152,7 +152,7 @@ TEST(BlockIndexTest, UnregisterByNodeUpdatesRegistryOwnershipTracking) {
 }
 
 TEST(BlockIndexTest, BatchRegisterAndBatchUnregister) {
-  BlockIndex index;
+  GlobalBlockIndex index;
 
   const Location key1_a = MakeLocation("node-a", "k1-a", 1024, TierType::HBM);
   const Location key1_b = MakeLocation("node-a", "k1-b", 1024, TierType::DRAM);
@@ -182,7 +182,7 @@ TEST(BlockIndexTest, BatchRegisterAndBatchUnregister) {
 }
 
 TEST(BlockIndexTest, ClientRegistryUnregisterCleansIndexEntriesForClient) {
-  BlockIndex index;
+  GlobalBlockIndex index;
   ClientRegistry registry(ClientRegistryConfig{}, index);
   index.SetClientRegistry(&registry);
 

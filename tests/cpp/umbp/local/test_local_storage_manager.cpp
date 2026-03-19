@@ -84,7 +84,7 @@ void test_dram_full_auto_demote_to_ssd() {
   config.ssd.storage_dir = "/tmp/umbp_test_ssd_autodemote";
   config.ssd.capacity_bytes = 10 * 1024 * 1024;
 
-  BlockIndexClient index;
+  mori::umbp::LocalBlockIndex index;
   LocalStorageManager mgr(config, &index);
 
   // Write 512 bytes — fits in DRAM
@@ -153,7 +153,7 @@ void test_demote_promote_with_index() {
   config.ssd.capacity_bytes = 10 * 1024 * 1024;
   config.eviction.auto_promote_on_read = false;
 
-  BlockIndexClient index;
+  mori::umbp::LocalBlockIndex index;
   LocalStorageManager mgr(config, &index);
 
   // Write to DRAM
@@ -239,8 +239,8 @@ void test_write_from_ptr() {
 }
 
 // Regression test: SSD was previously self-evicting keys without notifying
-// BlockIndexClient, leaving the index in a dirty state.  After the fix,
-// SSD tier never self-evicts; LocalStorageManager::Write() drives eviction
+// mori::umbp::LocalBlockIndex, leaving the index in a dirty state.  After the fix,
+// SSDTier never self-evicts; LocalStorageManager::Write() drives eviction
 // with full index synchronization.
 void test_ssd_full_evicts_with_index_sync() {
   std::cout << "test_ssd_full_evicts_with_index_sync... ";
@@ -251,7 +251,7 @@ void test_ssd_full_evicts_with_index_sync() {
   config.ssd.storage_dir = "/tmp/umbp_test_ssd_idxsync";
   config.ssd.capacity_bytes = 1024;  // tiny: 1 KB
 
-  BlockIndexClient index;
+  mori::umbp::LocalBlockIndex index;
   LocalStorageManager mgr(config, &index);
 
   // Fill SSD with two 512-byte blocks (already demoted from DRAM)

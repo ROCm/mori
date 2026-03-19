@@ -203,7 +203,8 @@ bool LocalStorageManager::WriteFromPtrWithDepth(const std::string& key, uintptr_
   return ok;
 }
 
-LocalStorageManager::LocalStorageManager(const UMBPConfig& config, BlockIndexClient* index)
+LocalStorageManager::LocalStorageManager(const UMBPConfig& config,
+                                         mori::umbp::LocalBlockIndex* index)
     : config_(config), role_(config.ResolveRole()), index_(index) {
   std::string error_message;
   if (!config_.Validate(&error_message)) {

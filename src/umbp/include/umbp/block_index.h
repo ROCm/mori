@@ -19,62 +19,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+// Backward-compatibility shim — prefer including the new path directly:
+//   #include "umbp/block_index/global_block_index.h"
 #pragma once
-
-#include <optional>
-#include <shared_mutex>
-#include <string>
-#include <unordered_map>
-#include <utility>
-#include <vector>
-
-#include "umbp/types.h"
-
-namespace mori::umbp {
-
-class ClientRegistry;
-
-struct BlockEntry {
-  std::vector<Location> locations;
-  BlockMetrics metrics;
-};
-
-class BlockIndex {
- public:
-  BlockIndex() = default;
-  ~BlockIndex() = default;
-
-  BlockIndex(const BlockIndex&) = delete;
-  BlockIndex& operator=(const BlockIndex&) = delete;
-
-  void SetClientRegistry(ClientRegistry* registry);
-
-  // --- Mutators ---
-  void Register(const std::string& node_id, const std::string& key, const Location& location);
-
-  bool Unregister(const std::string& node_id, const std::string& key, const Location& location);
-
-  size_t UnregisterByNode(const std::string& key, const std::string& node_id);
-
-  // Batch variants — single lock acquisition for the entire batch.
-  size_t BatchRegister(const std::string& node_id,
-                       const std::vector<std::pair<std::string, Location>>& entries);
-  size_t BatchUnregister(const std::string& node_id,
-                         const std::vector<std::pair<std::string, Location>>& entries);
-
-  // Bump last_accessed_at and access_count. Called by Router on RouteGet.
-  void RecordAccess(const std::string& key);
-
-  // --- Queries ---
-  std::vector<Location> Lookup(const std::string& key) const;
-
-  // Returns metrics for a key, or nullopt if the key doesn't exist.
-  std::optional<BlockMetrics> GetMetrics(const std::string& key) const;
-
- private:
-  mutable std::shared_mutex mutex_;
-  std::unordered_map<std::string, BlockEntry> entries_;
-  ClientRegistry* registry_ = nullptr;
-};
-
-}  // namespace mori::umbp
+#include "umbp/block_index/global_block_index.h"

@@ -38,7 +38,7 @@
 
 namespace mori::umbp {
 
-class BlockIndex;
+class GlobalBlockIndex;
 
 struct AllocateResult {
   std::string peer_address;
@@ -63,13 +63,13 @@ struct ClientRegistryConfig {
 class ClientRegistry {
  public:
   explicit ClientRegistry(const ClientRegistryConfig& config);
-  ClientRegistry(const ClientRegistryConfig& config, BlockIndex& index);
+  ClientRegistry(const ClientRegistryConfig& config, GlobalBlockIndex& index);
   ~ClientRegistry();
 
   ClientRegistry(const ClientRegistry&) = delete;
   ClientRegistry& operator=(const ClientRegistry&) = delete;
 
-  void SetBlockIndex(BlockIndex* index);
+  void SetBlockIndex(GlobalBlockIndex* index);
 
   // --- Client lifecycle ---
   // Returns false when a live node with the same id already exists.
@@ -98,8 +98,8 @@ class ClientRegistry {
   // --- PoolClient allocation ---
   std::optional<AllocateResult> AllocateForPut(const std::string& node_id, TierType tier,
                                                uint64_t size);
-  void DeallocateForUnregister(const std::string& node_id, TierType tier,
-                               uint32_t buffer_index, uint64_t offset, uint64_t size);
+  void DeallocateForUnregister(const std::string& node_id, TierType tier, uint32_t buffer_index,
+                               uint64_t offset, uint64_t size);
   std::optional<ClientIOInfo> GetClientIOInfo(const std::string& node_id,
                                               uint32_t buffer_index = 0) const;
 
@@ -116,7 +116,7 @@ class ClientRegistry {
 
  private:
   ClientRegistryConfig config_;
-  BlockIndex* index_ = nullptr;
+  GlobalBlockIndex* index_ = nullptr;
 
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, ClientRecord> clients_;

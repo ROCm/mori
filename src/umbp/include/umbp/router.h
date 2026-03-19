@@ -25,7 +25,7 @@
 #include <optional>
 #include <string>
 
-#include "umbp/block_index.h"
+#include "umbp/block_index/global_block_index.h"
 #include "umbp/client_registry.h"
 #include "umbp/route_get_strategy.h"
 #include "umbp/route_put_strategy.h"
@@ -38,7 +38,7 @@ class Router {
   /// If either strategy is nullptr, a default is created:
   ///   RouteGet  -> RandomRouteGetStrategy
   ///   RoutePut  -> TierAwareMostAvailableStrategy
-  Router(BlockIndex& index, ClientRegistry& registry,
+  Router(GlobalBlockIndex& index, ClientRegistry& registry,
          std::unique_ptr<RouteGetStrategy> get_strategy = nullptr,
          std::unique_ptr<RoutePutStrategy> put_strategy = nullptr);
   ~Router() = default;
@@ -57,7 +57,7 @@ class Router {
                                          uint64_t block_size);
 
  private:
-  BlockIndex& index_;
+  GlobalBlockIndex& index_;
   ClientRegistry& registry_;
   std::unique_ptr<RouteGetStrategy> get_strategy_;
   std::unique_ptr<RoutePutStrategy> put_strategy_;

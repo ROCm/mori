@@ -53,7 +53,7 @@ std::map<TierType, TierCapacity> MakeCaps(uint64_t hbm_total, uint64_t hbm_avail
   return caps;
 }
 
-// ---- Fixture that sets up BlockIndex + ClientRegistry + Router ----
+// ---- Fixture that sets up GlobalBlockIndex + ClientRegistry + Router ----
 
 class RouterTest : public ::testing::Test {
  protected:
@@ -62,7 +62,7 @@ class RouterTest : public ::testing::Test {
     router_ = std::make_unique<Router>(index_, registry_);
   }
 
-  BlockIndex index_;
+  GlobalBlockIndex index_;
   ClientRegistry registry_{ClientRegistryConfig{}, index_};
   std::unique_ptr<Router> router_;
 };
@@ -138,8 +138,7 @@ TEST_F(RouterTest, RoutePutPicksMostAvailableNode) {
 }
 
 TEST_F(RouterTest, RoutePutFallsThroughTiers) {
-  registry_.RegisterClient("node-a", "addr-a",
-                           MakeCaps(80 * GB, 0, 512 * GB, 200 * GB));
+  registry_.RegisterClient("node-a", "addr-a", MakeCaps(80 * GB, 0, 512 * GB, 200 * GB));
 
   auto result = router_->RoutePut("key-1", "requester", 4096);
   ASSERT_TRUE(result.has_value());
@@ -157,8 +156,7 @@ TEST_F(RouterTest, RoutePutReturnsNulloptWhenAllFull) {
 
 class AlwaysFirstGetStrategy : public RouteGetStrategy {
  public:
-  Location Select(const std::vector<Location>& locations,
-                  const std::string& /*node_id*/) override {
+  Location Select(const std::vector<Location>& locations, const std::string& /*node_id*/) override {
     return locations[0];
   }
 };
@@ -172,7 +170,7 @@ class AlwaysNulloptPutStrategy : public RoutePutStrategy {
 };
 
 TEST(RouterCustomStrategyTest, UsesInjectedGetStrategy) {
-  BlockIndex index;
+  GlobalBlockIndex index;
   ClientRegistry registry(ClientRegistryConfig{}, index);
   index.SetClientRegistry(&registry);
 
@@ -190,7 +188,7 @@ TEST(RouterCustomStrategyTest, UsesInjectedGetStrategy) {
 }
 
 TEST(RouterCustomStrategyTest, UsesInjectedPutStrategy) {
-  BlockIndex index;
+  GlobalBlockIndex index;
   ClientRegistry registry(ClientRegistryConfig{}, index);
   index.SetClientRegistry(&registry);
 
@@ -206,7 +204,7 @@ TEST(RouterCustomStrategyTest, UsesInjectedPutStrategy) {
 // ---- Default strategy creation ----
 
 TEST(RouterDefaultStrategyTest, NullStrategiesCreateDefaults) {
-  BlockIndex index;
+  GlobalBlockIndex index;
   ClientRegistry registry(ClientRegistryConfig{}, index);
   index.SetClientRegistry(&registry);
 

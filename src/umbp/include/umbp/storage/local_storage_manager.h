@@ -28,14 +28,15 @@
 #include <utility>
 #include <vector>
 
-#include "umbp/block_index/block_index.h"
+#include "umbp/block_index/local_block_index.h"
 #include "umbp/common/config.h"
 #include "umbp/storage/tier_backend.h"
 
 class LocalStorageManager {
  public:
   // index may be nullptr if index updates are not needed (testing).
-  explicit LocalStorageManager(const UMBPConfig& config, BlockIndexClient* index = nullptr);
+  explicit LocalStorageManager(const UMBPConfig& config,
+                               mori::umbp::LocalBlockIndex* index = nullptr);
 
   // Write to the specified tier.
   // When writing to DRAM and space is insufficient, automatically demotes
@@ -75,7 +76,7 @@ class LocalStorageManager {
  private:
   UMBPConfig config_;
   UMBPRole role_;
-  BlockIndexClient* index_;  // non-owning, may be nullptr
+  mori::umbp::LocalBlockIndex* index_;  // non-owning, may be nullptr
 
   // Ordered fastest-to-slowest: [{CPU_DRAM, dram}, {LOCAL_SSD, ssd}, ...]
   struct TierEntry {

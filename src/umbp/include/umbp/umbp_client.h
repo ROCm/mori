@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-#include "umbp/block_index/block_index.h"
+#include "umbp/block_index/local_block_index.h"
 #include "umbp/common/config.h"
 #include "umbp/storage/copy_pipeline.h"
 #include "umbp/storage/local_storage_manager.h"
@@ -65,7 +65,7 @@ class UMBPClient {
   void Clear();
 
   // Access sub-modules (for testing/debugging)
-  BlockIndexClient& Index();
+  mori::umbp::LocalBlockIndex& Index();
   LocalStorageManager& Storage();
 
  private:
@@ -73,7 +73,7 @@ class UMBPClient {
 
   UMBPConfig config_;
   UMBPRole role_;
-  BlockIndexClient index_;
+  mori::umbp::LocalBlockIndex index_;
   LocalStorageManager storage_;
   std::unique_ptr<CopyPipeline> copy_pipeline_;
 };

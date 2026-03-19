@@ -30,7 +30,9 @@
 
 #include "umbp/common/storage_tier.h"
 
-class BlockIndexClient {
+namespace mori::umbp {
+
+class LocalBlockIndex {
  public:
   // Index operations
   bool MayExist(const std::string& key) const;
@@ -45,3 +47,5 @@ class BlockIndexClient {
   mutable std::shared_mutex mu_;
   std::unordered_map<std::string, LocalLocation> index_;
 };
+
+}  // namespace mori::umbp

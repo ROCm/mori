@@ -19,33 +19,32 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "umbp/block_index.h"
-
 #include <algorithm>
 #include <chrono>
 #include <mutex>
 #include <unordered_set>
 
+#include "umbp/block_index/global_block_index.h"
 #include "umbp/client_registry.h"
 
 namespace mori::umbp {
 
-void BlockIndex::SetClientRegistry(ClientRegistry* registry) {
+void GlobalBlockIndex::SetClientRegistry(ClientRegistry* registry) {
   std::unique_lock lock(mutex_);
   registry_ = registry;
 }
 
-void BlockIndex::Register(const std::string& node_id, const std::string& key,
-                          const Location& location) {
+void GlobalBlockIndex::Register(const std::string& node_id, const std::string& key,
+                                const Location& location) {
   (void)BatchRegister(node_id, {{key, location}});
 }
 
-bool BlockIndex::Unregister(const std::string& node_id, const std::string& key,
-                            const Location& location) {
+bool GlobalBlockIndex::Unregister(const std::string& node_id, const std::string& key,
+                                  const Location& location) {
   return BatchUnregister(node_id, {{key, location}}) > 0;
 }
 
-size_t BlockIndex::UnregisterByNode(const std::string& key, const std::string& node_id) {
+size_t GlobalBlockIndex::UnregisterByNode(const std::string& key, const std::string& node_id) {
   size_t removed = 0;
   bool should_untrack = false;
   ClientRegistry* registry = nullptr;
@@ -82,8 +81,8 @@ size_t BlockIndex::UnregisterByNode(const std::string& key, const std::string& n
   return removed;
 }
 
-size_t BlockIndex::BatchRegister(const std::string& node_id,
-                                 const std::vector<std::pair<std::string, Location>>& entries) {
+size_t GlobalBlockIndex::BatchRegister(
+    const std::string& node_id, const std::vector<std::pair<std::string, Location>>& entries) {
   if (entries.empty()) {
     return 0;
   }
@@ -131,8 +130,8 @@ size_t BlockIndex::BatchRegister(const std::string& node_id,
   return inserted;
 }
 
-size_t BlockIndex::BatchUnregister(const std::string& node_id,
-                                   const std::vector<std::pair<std::string, Location>>& entries) {
+size_t GlobalBlockIndex::BatchUnregister(
+    const std::string& node_id, const std::vector<std::pair<std::string, Location>>& entries) {
   if (entries.empty()) {
     return 0;
   }
@@ -183,7 +182,7 @@ size_t BlockIndex::BatchUnregister(const std::string& node_id,
   return removed_count;
 }
 
-void BlockIndex::RecordAccess(const std::string& key) {
+void GlobalBlockIndex::RecordAccess(const std::string& key) {
   std::unique_lock lock(mutex_);
 
   auto it = entries_.find(key);
@@ -195,7 +194,7 @@ void BlockIndex::RecordAccess(const std::string& key) {
   ++it->second.metrics.access_count;
 }
 
-std::vector<Location> BlockIndex::Lookup(const std::string& key) const {
+std::vector<Location> GlobalBlockIndex::Lookup(const std::string& key) const {
   std::shared_lock lock(mutex_);
 
   auto it = entries_.find(key);
@@ -206,7 +205,7 @@ std::vector<Location> BlockIndex::Lookup(const std::string& key) const {
   return it->second.locations;
 }
 
-std::optional<BlockMetrics> BlockIndex::GetMetrics(const std::string& key) const {
+std::optional<BlockMetrics> GlobalBlockIndex::GetMetrics(const std::string& key) const {
   std::shared_lock lock(mutex_);
 
   auto it = entries_.find(key);

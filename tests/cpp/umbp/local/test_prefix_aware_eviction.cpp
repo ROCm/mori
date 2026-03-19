@@ -25,7 +25,7 @@
 #include <thread>
 #include <vector>
 
-#include "umbp/block_index/block_index.h"
+#include "umbp/block_index/local_block_index.h"
 #include "umbp/storage/local_storage_manager.h"
 #include "umbp/umbp_client.h"
 
@@ -64,7 +64,7 @@ void test_depth_biased_eviction() {
   // DRAM holds exactly 2 × 512 B.  Insert prefix (depth 0) then suffix (depth 5).
   // The 3rd write cannot fit → must evict one.  suffix (depth 5) should be evicted.
   UMBPConfig cfg = MakePrefixAwareConfig(2 * 512);
-  BlockIndexClient index;
+  mori::umbp::LocalBlockIndex index;
   LocalStorageManager mgr(cfg, &index);
 
   std::string prefix_hash = FakeHash(1);
@@ -380,7 +380,7 @@ void test_ssd_prefix_aware_index_sync() {
   cfg.eviction.policy = "prefix_aware_lru";
   cfg.eviction.candidate_window = 16;
 
-  BlockIndexClient index;
+  mori::umbp::LocalBlockIndex index;
   LocalStorageManager mgr(cfg, &index);
 
   std::vector<char> d1(512, 'A'), d2(512, 'B'), d3(512, 'C');

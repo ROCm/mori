@@ -24,12 +24,13 @@
 #include <thread>
 #include <vector>
 
-#include "umbp/block_index/block_index.h"
+#include "umbp/block_index/local_block_index.h"
+using mori::umbp::LocalBlockIndex;
 
 void test_insert_lookup() {
   std::cout << "test_insert_lookup... ";
 
-  BlockIndexClient idx;
+  LocalBlockIndex idx;
   assert(idx.Count() == 0);
 
   // Insert
@@ -58,7 +59,7 @@ void test_insert_lookup() {
 void test_remove() {
   std::cout << "test_remove... ";
 
-  BlockIndexClient idx;
+  LocalBlockIndex idx;
   idx.Insert("key1", {StorageTier::CPU_DRAM, 0, 100});
 
   auto removed = idx.Remove("key1");
@@ -76,7 +77,7 @@ void test_remove() {
 void test_update_tier() {
   std::cout << "test_update_tier... ";
 
-  BlockIndexClient idx;
+  LocalBlockIndex idx;
   idx.Insert("key1", {StorageTier::CPU_DRAM, 0, 100});
 
   bool ok = idx.UpdateTier("key1", StorageTier::LOCAL_SSD);
@@ -94,7 +95,7 @@ void test_update_tier() {
 void test_clear() {
   std::cout << "test_clear... ";
 
-  BlockIndexClient idx;
+  LocalBlockIndex idx;
   idx.Insert("key1", {StorageTier::CPU_DRAM, 0, 100});
   idx.Insert("key2", {StorageTier::LOCAL_SSD, 0, 200});
   assert(idx.Count() == 2);
@@ -109,7 +110,7 @@ void test_clear() {
 void test_concurrent_access() {
   std::cout << "test_concurrent_access... ";
 
-  BlockIndexClient idx;
+  LocalBlockIndex idx;
   const int num_threads = 8;
   const int ops_per_thread = 1000;
 

@@ -1,11 +1,12 @@
 # C++ unit tests
-add_executable(test_umbp_local_block_index test_block_index.cpp)
+add_executable(test_umbp_local_block_index test_local_block_index.cpp)
 target_link_libraries(test_umbp_local_block_index PRIVATE umbp_core)
 add_test(NAME umbp_local_block_index COMMAND test_umbp_local_block_index)
 
 add_executable(test_umbp_local_storage_manager test_local_storage_manager.cpp)
 target_link_libraries(test_umbp_local_storage_manager PRIVATE umbp_core)
-add_test(NAME umbp_local_storage_manager COMMAND test_umbp_local_storage_manager)
+add_test(NAME umbp_local_storage_manager
+         COMMAND test_umbp_local_storage_manager)
 
 add_executable(test_umbp_local_client test_umbp_client.cpp)
 target_link_libraries(test_umbp_local_client PRIVATE umbp_core)

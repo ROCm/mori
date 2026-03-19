@@ -25,7 +25,7 @@
 
 namespace mori::umbp {
 
-Router::Router(BlockIndex& index, ClientRegistry& registry,
+Router::Router(GlobalBlockIndex& index, ClientRegistry& registry,
                std::unique_ptr<RouteGetStrategy> get_strategy,
                std::unique_ptr<RoutePutStrategy> put_strategy)
     : index_(index), registry_(registry) {
@@ -46,8 +46,8 @@ std::optional<Location> Router::RouteGet(const std::string& key, const std::stri
   Location selected = get_strategy_->Select(locations, node_id);
   index_.RecordAccess(key);
 
-  spdlog::debug("[Router] RouteGet key='{}': selected node={}, location={}", key,
-                selected.node_id, selected.location_id);
+  spdlog::debug("[Router] RouteGet key='{}': selected node={}, location={}", key, selected.node_id,
+                selected.location_id);
   return selected;
 }
 
@@ -75,14 +75,13 @@ std::optional<RoutePutResult> Router::RoutePut(const std::string& key, const std
       result->dram_memory_desc_bytes = std::move(alloc->dram_memory_desc_bytes);
       result->allocated_offset = alloc->allocated_offset;
       result->buffer_index = alloc->buffer_index;
-      spdlog::debug("[Router] RoutePut key='{}' from={}: selected node={}, tier={}, offset={}",
-                    key, node_id, result->node_id, TierTypeName(result->tier),
-                    result->allocated_offset);
+      spdlog::debug("[Router] RoutePut key='{}' from={}: selected node={}, tier={}, offset={}", key,
+                    node_id, result->node_id, TierTypeName(result->tier), result->allocated_offset);
       return result;
     }
 
-    spdlog::debug("[Router] RoutePut key='{}': allocation failed on node={} tier={}, retrying",
-                  key, result->node_id, TierTypeName(result->tier));
+    spdlog::debug("[Router] RoutePut key='{}': allocation failed on node={} tier={}, retrying", key,
+                  result->node_id, TierTypeName(result->tier));
     for (auto& c : candidates) {
       if (c.node_id == result->node_id) {
         c.tier_capacities.erase(result->tier);

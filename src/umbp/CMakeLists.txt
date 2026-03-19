@@ -1,7 +1,7 @@
 # Core static library
 add_library(
   umbp_core STATIC
-  block_index/block_index.cpp
+  block_index/local_block_index.cpp
   storage/io/storage_io_driver.cpp
   storage/io/posix_storage_io_driver.cpp
   storage/io/io_uring_storage_io_driver.cpp
@@ -133,8 +133,8 @@ add_custom_command(
   VERBATIM)
 
 add_custom_command(
-  OUTPUT ${UMBP_PEER_PROTO_SRCS} ${UMBP_PEER_PROTO_HDRS}
-         ${UMBP_PEER_GRPC_SRCS} ${UMBP_PEER_GRPC_HDRS}
+  OUTPUT ${UMBP_PEER_PROTO_SRCS} ${UMBP_PEER_PROTO_HDRS} ${UMBP_PEER_GRPC_SRCS}
+         ${UMBP_PEER_GRPC_HDRS}
   COMMAND
     ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
     --cpp_out=${UMBP_PROTO_GEN_DIR} --grpc_out=${UMBP_PROTO_GEN_DIR}
@@ -171,11 +171,11 @@ target_include_directories(
          ${UMBP_PROTO_GEN_DIR} # umbp.pb.h, umbp.grpc.pb.h
          ${_PROTOBUF_INCLUDE_DIR})
 
-# mori_io is needed for IOEngine RDMA data plane in PoolClient.
-# However, mori_io -> mori_application -> Torch propagates Torch's bundled
-# protobuf headers which conflict with the system protobuf used by protoc.
-# Work around: create a high-priority include directory that resolves to the
-# system protobuf, overriding Torch's version.
+# mori_io is needed for IOEngine RDMA data plane in PoolClient. However, mori_io
+# -> mori_application -> Torch propagates Torch's bundled protobuf headers which
+# conflict with the system protobuf used by protoc. Work around: create a
+# high-priority include directory that resolves to the system protobuf,
+# overriding Torch's version.
 set(_PROTOBUF_COMPAT_DIR "${CMAKE_CURRENT_BINARY_DIR}/protobuf_compat")
 if(NOT EXISTS "${_PROTOBUF_COMPAT_DIR}/google")
   file(MAKE_DIRECTORY "${_PROTOBUF_COMPAT_DIR}")

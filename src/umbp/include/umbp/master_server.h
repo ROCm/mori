@@ -24,7 +24,7 @@
 #include <memory>
 #include <string>
 
-#include "umbp/block_index.h"
+#include "umbp/block_index/global_block_index.h"
 #include "umbp/client_registry.h"
 #include "umbp/route_get_strategy.h"
 #include "umbp/route_put_strategy.h"
@@ -57,7 +57,7 @@ class MasterServer {
 
  private:
   MasterServerConfig config_;
-  BlockIndex index_;
+  GlobalBlockIndex index_;
   ClientRegistry registry_;
   Router router_;
 

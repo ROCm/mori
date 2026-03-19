@@ -272,6 +272,6 @@ void UMBPClient::Clear() {
   storage_.Clear();
 }
 
-BlockIndexClient& UMBPClient::Index() { return index_; }
+mori::umbp::LocalBlockIndex& UMBPClient::Index() { return index_; }
 
 LocalStorageManager& UMBPClient::Storage() { return storage_; }

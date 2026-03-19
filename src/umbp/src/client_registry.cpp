@@ -25,29 +25,29 @@
 
 #include <algorithm>
 
-#include "umbp/block_index.h"
+#include "umbp/block_index/global_block_index.h"
 
 namespace mori::umbp {
 
 ClientRegistry::ClientRegistry(const ClientRegistryConfig& config) : config_(config) {}
 
-ClientRegistry::ClientRegistry(const ClientRegistryConfig& config, BlockIndex& index)
+ClientRegistry::ClientRegistry(const ClientRegistryConfig& config, GlobalBlockIndex& index)
     : config_(config), index_(&index) {}
 
 ClientRegistry::~ClientRegistry() { StopReaper(); }
 
-void ClientRegistry::SetBlockIndex(BlockIndex* index) {
+void ClientRegistry::SetBlockIndex(GlobalBlockIndex* index) {
   std::unique_lock lock(mutex_);
   index_ = index;
 }
 
-bool ClientRegistry::RegisterClient(const std::string& node_id, const std::string& node_address,
-                                    const std::map<TierType, TierCapacity>& tier_capacities,
-                                    const std::string& peer_address,
-                                    const std::vector<uint8_t>& engine_desc_bytes,
-                                    const std::vector<std::vector<uint8_t>>& dram_memory_desc_bytes_list,
-                                    const std::vector<uint64_t>& dram_buffer_sizes,
-                                    const std::vector<uint64_t>& ssd_store_capacities) {
+bool ClientRegistry::RegisterClient(
+    const std::string& node_id, const std::string& node_address,
+    const std::map<TierType, TierCapacity>& tier_capacities, const std::string& peer_address,
+    const std::vector<uint8_t>& engine_desc_bytes,
+    const std::vector<std::vector<uint8_t>>& dram_memory_desc_bytes_list,
+    const std::vector<uint64_t>& dram_buffer_sizes,
+    const std::vector<uint64_t>& ssd_store_capacities) {
   std::unique_lock lock(mutex_);
   auto now = std::chrono::steady_clock::now();
 
@@ -118,13 +118,13 @@ bool ClientRegistry::RegisterClient(const std::string& node_id, const std::strin
   clients_[node_id] = std::move(record);
   client_keys_[node_id];
 
-  spdlog::info("[Registry] Registered node: {} at {} (dram_buffers={}, ssd_stores={})",
-               node_id, node_address,
+  spdlog::info("[Registry] Registered node: {} at {} (dram_buffers={}, ssd_stores={})", node_id,
+               node_address,
                dram_buffer_sizes.empty() ? (tier_capacities.count(TierType::DRAM) ? 1u : 0u)
                                          : static_cast<unsigned>(dram_buffer_sizes.size()),
                static_cast<unsigned>(ssd_store_capacities.empty()
-                   ? (tier_capacities.count(TierType::SSD) ? 1u : 0u)
-                   : ssd_store_capacities.size()));
+                                         ? (tier_capacities.count(TierType::SSD) ? 1u : 0u)
+                                         : ssd_store_capacities.size()));
   return true;
 }
 
@@ -241,7 +241,7 @@ std::vector<ClientRecord> ClientRegistry::GetAliveClients() const {
 }
 
 std::optional<AllocateResult> ClientRegistry::AllocateForPut(const std::string& node_id,
-                                                              TierType tier, uint64_t size) {
+                                                             TierType tier, uint64_t size) {
   std::unique_lock lock(mutex_);
   auto it = clients_.find(node_id);
   if (it == clients_.end() || it->second.status != ClientStatus::ALIVE) {
