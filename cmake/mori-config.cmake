@@ -1,6 +1,3 @@
-# Copyright © Advanced Micro Devices, Inc. All rights reserved.
-# MIT License
-#
 # mori-config.cmake — CMake package config for mori.
 #
 # After find_package(mori), the following imported targets are available:

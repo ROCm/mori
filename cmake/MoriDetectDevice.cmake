@@ -1,6 +1,3 @@
-# Copyright © Advanced Micro Devices, Inc. All rights reserved.
-# MIT License
-#
 # MoriDetectDevice.cmake — Auto-detect GPU architecture and RDMA NIC type.
 #
 # Provides:
