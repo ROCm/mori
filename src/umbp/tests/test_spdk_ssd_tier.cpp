@@ -19,18 +19,24 @@ static UMBPConfig MakeTestConfig() {
     cfg.ssd_capacity_bytes = 512ULL * 1024 * 1024;  // 512 MB
 
     const char* bdev = std::getenv("UMBP_SPDK_BDEV");
-    if (bdev) {
+    const char* pci = std::getenv("UMBP_SPDK_NVME_PCI");
+    const char* ctrl = std::getenv("UMBP_SPDK_NVME_CTRL");
+
+    if (pci && pci[0]) {
+        cfg.spdk_nvme_pci_addr = pci;
+        if (ctrl) cfg.spdk_nvme_ctrl_name = ctrl;
+        cfg.spdk_bdev_name = bdev ? bdev : (cfg.spdk_nvme_ctrl_name + "n1");
+    } else if (bdev) {
         cfg.spdk_bdev_name = bdev;
     } else {
         cfg.spdk_bdev_name = "Malloc0";
     }
+
     const char* mask = std::getenv("UMBP_SPDK_REACTOR_MASK");
     if (mask) cfg.spdk_reactor_mask = mask;
     const char* mem = std::getenv("UMBP_SPDK_MEM_MB");
     if (mem) cfg.spdk_mem_size_mb = std::atoi(mem);
     else cfg.spdk_mem_size_mb = 256;
-    const char* pci = std::getenv("UMBP_SPDK_NVME_PCI");
-    if (pci) cfg.spdk_nvme_pci_addr = pci;
 
     return cfg;
 }
