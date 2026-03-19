@@ -297,11 +297,17 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
                             0, p.aligned_size - sizes[idx]);
 
             auto& req = reqs[slot];
-            req = {};
             req.op = umbp::SpdkIoRequest::WRITE;
             req.buf = dma_bufs[slot];
             req.offset = p.handle.address();
             req.nbytes = p.aligned_size;
+            req.src_data = nullptr;
+            req.src_iov = nullptr;
+            req.src_iovcnt = 0;
+            req.dst_iov = nullptr;
+            req.dst_iovcnt = 0;
+            req.completed.store(false, std::memory_order_release);
+            req.success = false;
 
             batch_ptrs[batch_count++] = &req;
             ++head;
@@ -436,11 +442,17 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
 
             auto& ri = items[head];
             auto& req = reqs[slot];
-            req = {};
             req.op = umbp::SpdkIoRequest::READ;
             req.buf = dma_bufs[slot];
             req.offset = ri.offset;
             req.nbytes = ri.aligned_size;
+            req.src_data = nullptr;
+            req.src_iov = nullptr;
+            req.src_iovcnt = 0;
+            req.dst_iov = nullptr;
+            req.dst_iovcnt = 0;
+            req.completed.store(false, std::memory_order_release);
+            req.success = false;
 
             batch_ptrs[batch_count++] = &req;
             ++head;
