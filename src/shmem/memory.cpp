@@ -75,7 +75,7 @@ static void* AllocateVMMHeap(ShmemStates* states, size_t size) {
 
   MORI_SHMEM_ERROR(
       "Failed to allocate {} bytes in VMM heap. Hint: Increase via MORI_SHMEM_HEAP_SIZE (default: "
-      "8GB) or MORI_SHMEM_VMM_CHUNK_SIZE (default: 64MB)",
+      "16GB) or MORI_SHMEM_VMM_CHUNK_SIZE (default: 64MB)",
       size);
   return nullptr;
 }
