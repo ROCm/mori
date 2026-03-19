@@ -263,11 +263,14 @@ static BandwidthResult BenchTierBatch(SpdkSsdTier& tier, size_t value_size,
         for (auto& k : keys) tier.Evict(k);
     }
 
+    if (!is_write) {
+        for (auto& b : bufs) std::memset(b.data(), 0, b.size());
+    }
+
     auto t0 = Clock::now();
     if (is_write) {
         tier.BatchWrite(keys, wptrs, sizes);
     } else {
-        for (auto& b : bufs) std::memset(b.data(), 0, b.size());
         tier.BatchReadIntoPtr(keys, rptrs, sizes);
     }
     double secs = std::chrono::duration<double>(Clock::now() - t0).count();
