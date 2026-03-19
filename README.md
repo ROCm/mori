@@ -96,20 +96,64 @@ Benchmark result on the following configurations:
 
 ## Installation
 
-### Prerequisites
+### Docker (recommended for MI355X)
 
-- pytorch:rocm >= 6.4.0
-- Linux packages: see packages in dockerfile
+Build a self-contained image with all dependencies pre-installed:
 
-Or build docker image with:
-```
-cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
+```bash
+cd mori
+docker build -t rocm/mori:benchmark -f docker/Dockerfile.dev .
 ```
 
-### Install with Python
+Launch a container with GPU access:
+
+```bash
+bash docker/run_benchmark.sh
+# or manually:
+docker run --rm -it \
+  --device=/dev/kfd --device=/dev/dri \
+  --ipc=host --security-opt seccomp=unconfined \
+  --cap-add=SYS_PTRACE --group-add video --group-add render \
+  rocm/mori:benchmark bash
 ```
-# NOTE: for venv build, add --no-build-isolation at the end
-cd mori && pip install -r requirements-build.txt && git submodule update --init --recursive && pip3 install .
+
+Run CCL benchmarks inside the container:
+
+```bash
+# AllReduce sweep (2-256 MB)
+bash tests/python/ccl/bench_allreduce_sweep.sh
+
+# AllGather / ReduceScatter standalone latency sweep
+bash tests/python/ccl/bench_allgather_sweep.sh
+bash tests/python/ccl/bench_reducescatter_sweep.sh
+
+# AllGather / ReduceScatter + GEMM overlap sweep
+bash tests/python/ccl/bench_ag_overlap_sweep.sh
+bash tests/python/ccl/bench_rs_overlap_sweep.sh
+```
+
+> **Note**: The default `MORI_GPU_ARCHS` is `gfx950` (MI355X). To build for MI300X, pass `--build-arg MORI_GPU_ARCHS=gfx942`.
+
+### Install without Docker
+
+Prerequisites:
+- PyTorch with ROCm (version must match your system ROCm, e.g. `pip install torch --index-url https://download.pytorch.org/whl/rocm7.1`)
+- Linux packages: `git`, `cython3`, `ibverbs-utils`, `openmpi-bin`, `libopenmpi-dev`, `libpci-dev`, `cmake`, `libdw1`, `locales`
+- For GEMM overlap tests: `pip install amd-aiter ninja`
+
+```bash
+cd mori
+pip install -r requirements-build.txt
+git submodule update --init --recursive
+export MORI_GPU_ARCHS=gfx950   # or gfx942 for MI300X
+pip3 install .                  # add --no-build-isolation if using venv
+```
+
+Required environment variables:
+
+```bash
+export PYTHONPATH=/path/to/mori:$PYTHONPATH
+export HSA_NO_SCRATCH_RECLAIM=1
 ```
 
 ### Test dispatch / combine
