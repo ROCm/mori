@@ -243,11 +243,13 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
     }
 
     auto reqs = std::make_unique<umbp::SpdkIoRequest[]>(qd);
+    auto batch_ptrs = std::make_unique<umbp::SpdkIoRequest*[]>(qd);
     std::vector<bool> io_ok(pending_count, false);
 
     int head = 0, tail = 0;
     while (tail < pending_count) {
-        // Fill the pipeline up to QD
+        // Fill the pipeline up to QD, accumulate batch for submission
+        int batch_count = 0;
         while (head < pending_count && (head - tail) < qd) {
             int slot = head % qd;
             if (!dma_bufs[slot]) { ++head; continue; }
@@ -274,15 +276,23 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
             req.completed.store(false, std::memory_order_release);
             req.success = false;
 
-            env.SubmitIoAsync(&req);
+            batch_ptrs[batch_count++] = &req;
             ++head;
+
+            if (batch_count >= 8) {
+                env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
+                batch_count = 0;
+            }
         }
 
-        // Drain oldest completion
-        if (tail < head) {
+        if (batch_count > 0)
+            env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
+
+        // Drain oldest completions
+        while (tail < head) {
             int slot = tail % qd;
-            while (!reqs[slot].completed.load(std::memory_order_acquire))
-                CPU_PAUSE();
+            if (!reqs[slot].completed.load(std::memory_order_acquire))
+                break;
             io_ok[tail] = reqs[slot].success;
             ++tail;
         }
@@ -380,11 +390,13 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
     }
 
     auto reqs = std::make_unique<umbp::SpdkIoRequest[]>(qd);
+    auto batch_ptrs = std::make_unique<umbp::SpdkIoRequest*[]>(qd);
     std::vector<bool> io_ok(item_count, false);
 
     int head = 0, tail = 0;
     while (tail < item_count) {
-        // Fill pipeline
+        // Fill pipeline, accumulate batch for submission
+        int batch_count = 0;
         while (head < item_count && (head - tail) < qd) {
             int slot = head % qd;
             if (!dma_bufs[slot]) { ++head; continue; }
@@ -403,15 +415,23 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
             req.completed.store(false, std::memory_order_release);
             req.success = false;
 
-            env.SubmitIoAsync(&req);
+            batch_ptrs[batch_count++] = &req;
             ++head;
+
+            if (batch_count >= 8) {
+                env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
+                batch_count = 0;
+            }
         }
 
+        if (batch_count > 0)
+            env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
+
         // Drain oldest: copy from DMA to user buffer on calling thread
-        if (tail < head) {
+        while (tail < head) {
             int slot = tail % qd;
-            while (!reqs[slot].completed.load(std::memory_order_acquire))
-                CPU_PAUSE();
+            if (!reqs[slot].completed.load(std::memory_order_acquire))
+                break;
 
             if (reqs[slot].success) {
                 auto& ri = items[tail];
