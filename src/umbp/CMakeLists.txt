@@ -15,13 +15,13 @@ if(USE_SPDK)
     endif()
 
     execute_process(
-      COMMAND pkg-config --cflags spdk_event spdk_event_bdev
+      COMMAND pkg-config --cflags spdk_event spdk_event_bdev spdk_env_dpdk
       OUTPUT_VARIABLE SPDK_CFLAGS
       OUTPUT_STRIP_TRAILING_WHITESPACE
       RESULT_VARIABLE SPDK_CFLAGS_RC
       ERROR_QUIET)
     execute_process(
-      COMMAND pkg-config --libs --static spdk_event spdk_event_bdev
+      COMMAND pkg-config --libs --static spdk_event spdk_event_bdev spdk_env_dpdk
       OUTPUT_VARIABLE SPDK_LDFLAGS
       OUTPUT_STRIP_TRAILING_WHITESPACE
       RESULT_VARIABLE SPDK_LDFLAGS_RC
@@ -61,7 +61,11 @@ if(HAVE_SPDK)
   target_compile_definitions(umbp_core PUBLIC USE_SPDK)
   separate_arguments(SPDK_CFLAGS_LIST UNIX_COMMAND "${SPDK_CFLAGS}")
   target_compile_options(umbp_core PUBLIC ${SPDK_CFLAGS_LIST})
-  target_link_libraries(umbp_core PUBLIC ${SPDK_LDFLAGS})
+
+  separate_arguments(SPDK_LDFLAGS_LIST UNIX_COMMAND "${SPDK_LDFLAGS}")
+  target_link_libraries(umbp_core PUBLIC
+    -Wl,--whole-archive ${SPDK_LDFLAGS_LIST} -Wl,--no-whole-archive
+    -lnuma -ldl -lrt -luuid -lcrypto -lm -laio -lpthread)
 
   # SPDK test executables
   add_executable(test_spdk_env tests/test_spdk_env.cpp)
