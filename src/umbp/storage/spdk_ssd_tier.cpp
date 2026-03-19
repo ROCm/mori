@@ -22,7 +22,7 @@
 // Construction / destruction
 // ---------------------------------------------------------------------------
 SpdkSsdTier::SpdkSsdTier(const UMBPConfig& config)
-    : TierBackend(StorageTier::SSD) {
+    : TierBackend(StorageTier::LOCAL_SSD) {
     auto& env = umbp::SpdkEnv::Instance();
     if (!env.IsInitialized()) {
         umbp::SpdkEnvConfig ecfg;
