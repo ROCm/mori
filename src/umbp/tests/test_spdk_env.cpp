@@ -15,7 +15,13 @@
 static umbp::SpdkEnvConfig ConfigFromEnv() {
     umbp::SpdkEnvConfig cfg;
     const char* bdev = std::getenv("UMBP_SPDK_BDEV");
-    if (bdev) {
+    const char* nvme_pci = std::getenv("UMBP_SPDK_NVME_PCI");
+    if (nvme_pci && nvme_pci[0]) {
+        cfg.nvme_pci_addr = nvme_pci;
+        const char* ctrl = std::getenv("UMBP_SPDK_NVME_CTRL");
+        if (ctrl) cfg.nvme_ctrl_name = ctrl;
+        cfg.bdev_name = bdev ? bdev : (cfg.nvme_ctrl_name + "n1");
+    } else if (bdev) {
         cfg.bdev_name = bdev;
     } else {
         cfg.use_malloc_bdev = true;
