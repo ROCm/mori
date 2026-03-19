@@ -71,13 +71,16 @@ std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
         return {{i, 1}};
       }
     }
+    MORI_IO_WARN("No matching NIC found for GPU {}, nicName: {}", key.deviceId, nicName);
   } else if (key.loc == MemoryLocationType::CPU) {
     if (availDevices.empty()) return {};
     int idx = (roundRobinCounter.fetch_add(1, std::memory_order_relaxed) % availDevices.size());
     return {{idx, 1}};
   }
-  assert(false && "topo searching for device other than CPU/GPU is not implemented yet");
-  return {};
+  MORI_IO_ERROR(
+      "topo searching for device other than CPU/GPU is not implemented yet, returning default "
+      "device 0");
+  return {{0, 1}};
 }
 
 /* ----------------------------------- Local Memory Management ---------------------------------- */
