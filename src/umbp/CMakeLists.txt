@@ -65,7 +65,7 @@ if(HAVE_SPDK)
   separate_arguments(SPDK_LDFLAGS_LIST UNIX_COMMAND "${SPDK_LDFLAGS}")
   target_link_libraries(umbp_core PUBLIC
     -Wl,--whole-archive ${SPDK_LDFLAGS_LIST} -Wl,--no-whole-archive
-    -lfuse3 -lnuma -ldl -lrt -luuid -lcrypto -lm -laio -lpthread)
+    -lisal -lssl -lcrypto -lfuse3 -lnuma -ldl -lrt -luuid -lm -laio -lpthread -lelf)
 
   # SPDK test executables
   add_executable(test_spdk_env tests/test_spdk_env.cpp)
