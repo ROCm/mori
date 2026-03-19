@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <numeric>
 #include <string>
 #include <thread>
@@ -30,6 +31,7 @@
 #include "umbp/common/log.h"
 #include "umbp/spdk/spdk_env.h"
 #include "umbp/storage/spdk_ssd_tier.h"
+#include "umbp/storage/ssd_tier.h"
 
 using Clock = std::chrono::high_resolution_clock;
 
@@ -393,6 +395,78 @@ int main(int argc, char** argv) {
                        TrimmedMean(wbw), TrimmedMean(rbw));
             }
         }
+    }
+
+    // ---- POSIX SSDTier batch throughput (comparison baseline) ----
+    {
+        PrintHeader("POSIX SSDTier BATCH THROUGHPUT (fsync per key)");
+
+        std::string posix_dir = "/tmp/umbp_posix_bench";
+        std::filesystem::create_directories(posix_dir);
+
+        printf("%12s %8s %12s %12s\n",
+               "ValueSize", "Count", "Write MB/s", "Read MB/s");
+
+        struct TierTest { size_t value_size; int count; };
+        TierTest tests[] = {
+            {4096, 4096},
+            {16384, 2048},
+            {65536, 1024},
+            {262144, 512},
+            {524288, 256},
+            {1048576, 128},
+            {2097152, 64},
+        };
+
+        for (auto& t : tests) {
+            std::vector<double> wbw, rbw;
+            for (int iter = 0; iter < bench.iterations; ++iter) {
+                SSDTier posix_tier(posix_dir, 8ULL * 1024 * 1024 * 1024);
+
+                std::vector<std::string> keys(t.count);
+                std::vector<std::vector<char>> bufs(t.count);
+                std::vector<const void*> wptrs(t.count);
+                std::vector<uintptr_t> rptrs(t.count);
+                std::vector<size_t> sizes(t.count, t.value_size);
+
+                for (int i = 0; i < t.count; ++i) {
+                    keys[i] = "posix_" + std::to_string(i);
+                    bufs[i].resize(t.value_size);
+                    FillPattern(bufs[i].data(), t.value_size,
+                                static_cast<uint32_t>(i));
+                    wptrs[i] = bufs[i].data();
+                    rptrs[i] = reinterpret_cast<uintptr_t>(bufs[i].data());
+                }
+
+                // Write benchmark
+                auto t0 = Clock::now();
+                for (int i = 0; i < t.count; ++i)
+                    posix_tier.Write(keys[i], wptrs[i], sizes[i]);
+                double wsecs =
+                    std::chrono::duration<double>(Clock::now() - t0).count();
+                double wb = static_cast<double>(t.count) * t.value_size /
+                            wsecs / (1024.0 * 1024.0);
+                wbw.push_back(wb);
+
+                // Read benchmark
+                for (auto& b : bufs) std::memset(b.data(), 0, b.size());
+                auto t1 = Clock::now();
+                for (int i = 0; i < t.count; ++i)
+                    posix_tier.ReadIntoPtr(keys[i], rptrs[i], sizes[i]);
+                double rsecs =
+                    std::chrono::duration<double>(Clock::now() - t1).count();
+                double rb = static_cast<double>(t.count) * t.value_size /
+                            rsecs / (1024.0 * 1024.0);
+                rbw.push_back(rb);
+
+                posix_tier.Clear();
+            }
+            printf("%10zuKB %8d %10.0f %10.0f\n",
+                   t.value_size / 1024, t.count,
+                   TrimmedMean(wbw), TrimmedMean(rbw));
+        }
+
+        std::filesystem::remove_all(posix_dir);
     }
 
     printf("\nDone.\n");
