@@ -240,7 +240,7 @@ void test_write_from_ptr() {
 
 // Regression test: SSD was previously self-evicting keys without notifying
 // BlockIndexClient, leaving the index in a dirty state.  After the fix,
-// SSDTier never self-evicts; LocalStorageManager::Write() drives eviction
+// SSD tier never self-evicts; LocalStorageManager::Write() drives eviction
 // with full index synchronization.
 void test_ssd_full_evicts_with_index_sync() {
   std::cout << "test_ssd_full_evicts_with_index_sync... ";

@@ -30,6 +30,20 @@ enum class UMBPRole : int {
   SharedSSDFollower = 2,
 };
 
+enum class UMBPSsdLayoutMode : int {
+  SegmentedLog = 1,
+};
+
+enum class UMBPIoBackend : int {
+  PThread = 0,
+  IoUring = 1,
+};
+
+enum class UMBPDurabilityMode : int {
+  Strict = 0,
+  Relaxed = 1,
+};
+
 struct UMBPConfig {
   // DRAM
   size_t dram_capacity_bytes = 4ULL * 1024 * 1024 * 1024;  // 4 GB
@@ -40,6 +54,14 @@ struct UMBPConfig {
   bool ssd_enabled = true;
   std::string ssd_storage_dir = "/tmp/umbp_ssd";
   size_t ssd_capacity_bytes = 32ULL * 1024 * 1024 * 1024;
+  UMBPSsdLayoutMode ssd_layout_mode = UMBPSsdLayoutMode::SegmentedLog;
+  UMBPIoBackend ssd_io_backend = UMBPIoBackend::IoUring;
+  UMBPDurabilityMode ssd_durability_mode = UMBPDurabilityMode::Strict;
+  size_t ssd_segment_size_bytes = 256ULL * 1024 * 1024;
+  size_t ssd_batch_max_ops = 128;
+  size_t ssd_queue_depth = 4096;
+  size_t ssd_writer_threads = 2;
+  bool ssd_enable_background_gc = true;
 
   // Policy: "lru" (default) or "prefix_aware_lru"
   std::string eviction_policy = "lru";
@@ -57,6 +79,8 @@ struct UMBPConfig {
   // New code should set `role` instead.
   bool follower_mode = false;
   bool force_ssd_copy_on_write = false;
+  bool copy_to_ssd_async = true;
+  size_t copy_to_ssd_queue_depth = 4096;
 
   UMBPRole ResolveRole() const {
     if (role != UMBPRole::Standalone) {

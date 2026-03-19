@@ -36,12 +36,33 @@ void RegisterMoriUmbp(py::module_& m) {
       .value("SharedSSDFollower", UMBPRole::SharedSSDFollower)
       .export_values();
 
+  py::enum_<UMBPSsdLayoutMode>(m, "UMBPSsdLayoutMode")
+      .value("SegmentedLog", UMBPSsdLayoutMode::SegmentedLog)
+      .export_values();
+
+  py::enum_<UMBPIoBackend>(m, "UMBPIoBackend")
+      .value("PThread", UMBPIoBackend::PThread)
+      .value("IoUring", UMBPIoBackend::IoUring)
+      .export_values();
+
+  py::enum_<UMBPDurabilityMode>(m, "UMBPDurabilityMode")
+      .value("Strict", UMBPDurabilityMode::Strict)
+      .value("Relaxed", UMBPDurabilityMode::Relaxed)
+      .export_values();
+
   py::class_<UMBPConfig>(m, "UMBPConfig")
       .def(py::init<>())
       .def_readwrite("dram_capacity_bytes", &UMBPConfig::dram_capacity_bytes)
       .def_readwrite("ssd_enabled", &UMBPConfig::ssd_enabled)
       .def_readwrite("ssd_storage_dir", &UMBPConfig::ssd_storage_dir)
       .def_readwrite("ssd_capacity_bytes", &UMBPConfig::ssd_capacity_bytes)
+      .def_readwrite("ssd_io_backend", &UMBPConfig::ssd_io_backend)
+      .def_readwrite("ssd_durability_mode", &UMBPConfig::ssd_durability_mode)
+      .def_readwrite("ssd_segment_size_bytes", &UMBPConfig::ssd_segment_size_bytes)
+      .def_readwrite("ssd_batch_max_ops", &UMBPConfig::ssd_batch_max_ops)
+      .def_readwrite("ssd_queue_depth", &UMBPConfig::ssd_queue_depth)
+      .def_readwrite("ssd_writer_threads", &UMBPConfig::ssd_writer_threads)
+      .def_readwrite("ssd_enable_background_gc", &UMBPConfig::ssd_enable_background_gc)
       .def_readwrite("eviction_policy", &UMBPConfig::eviction_policy)
       .def_readwrite("auto_promote_on_read", &UMBPConfig::auto_promote_on_read)
       .def_readwrite("use_shared_memory", &UMBPConfig::use_shared_memory)
@@ -51,6 +72,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("role", &UMBPConfig::role)
       .def_readwrite("follower_mode", &UMBPConfig::follower_mode)
       .def_readwrite("force_ssd_copy_on_write", &UMBPConfig::force_ssd_copy_on_write)
+      .def_readwrite("copy_to_ssd_async", &UMBPConfig::copy_to_ssd_async)
+      .def_readwrite("copy_to_ssd_queue_depth", &UMBPConfig::copy_to_ssd_queue_depth)
       .def_readwrite("eviction_candidate_window", &UMBPConfig::eviction_candidate_window);
 
   py::class_<UMBPClient>(m, "UMBPClient")
@@ -66,6 +89,7 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("batch_get_into_ptr", &UMBPClient::BatchGetIntoPtr, py::arg("keys"), py::arg("ptrs"),
            py::arg("sizes"))
       .def("batch_exists", &UMBPClient::BatchExists, py::arg("keys"))
+      .def("batch_exists_consecutive", &UMBPClient::BatchExistsConsecutive, py::arg("keys"))
       .def("clear", &UMBPClient::Clear);
 }
 

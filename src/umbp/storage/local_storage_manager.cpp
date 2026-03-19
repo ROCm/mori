@@ -25,7 +25,7 @@
 #include <stdexcept>
 
 #include "umbp/storage/dram_tier.h"
-#include "umbp/storage/ssd_tier.h"
+#include "umbp/storage/segmented_ssd_tier.h"
 
 // ---------------------------------------------------------------------------
 // ExtractBaseHash
@@ -212,13 +212,14 @@ LocalStorageManager::LocalStorageManager(const UMBPConfig& config, BlockIndexCli
 
   // SSD tier is optional (slower)
   if (config_.ssd_enabled) {
-    SSDAccessMode ssd_access_mode = SSDAccessMode::ReadWrite;
+    SegmentedSsdAccessMode segmented_access_mode = SegmentedSsdAccessMode::ReadWrite;
     if (role_ == UMBPRole::SharedSSDFollower) {
-      ssd_access_mode = SSDAccessMode::ReadOnlyShared;
+      segmented_access_mode = SegmentedSsdAccessMode::ReadOnlyShared;
     }
-    tiers_.push_back({StorageTier::LOCAL_SSD,
-                      std::make_unique<SSDTier>(config_.ssd_storage_dir, config_.ssd_capacity_bytes,
-                                                ssd_access_mode)});
+    tiers_.push_back(
+        {StorageTier::LOCAL_SSD,
+         std::make_unique<SegmentedSsdTier>(config_.ssd_storage_dir, config_.ssd_capacity_bytes,
+                                            config_, segmented_access_mode)});
   }
 }
 
@@ -265,13 +266,21 @@ TierBackend* LocalStorageManager::NextFasterTier(StorageTier current) {
 }
 
 bool LocalStorageManager::MoveKey(const std::string& key, TierBackend* from, TierBackend* to) {
+  // Fast path for DRAM->slower movement to avoid an intermediate vector copy.
+  if (auto* dram = dynamic_cast<DRAMTier*>(from)) {
+    size_t sz = 0;
+    const void* ptr = dram->ReadPtr(key, &sz);
+    if (ptr && sz > 0 && to->Write(key, ptr, sz)) {
+      from->Evict(key);
+      UpsertIndexTier(key, to->tier_id(), sz);
+      return true;
+    }
+  }
+
   auto data = from->Read(key);
   if (data.empty()) return false;
-
   if (!to->Write(key, data.data(), data.size())) return false;
-
   from->Evict(key);
-
   UpsertIndexTier(key, to->tier_id(), data.size());
   return true;
 }
@@ -337,6 +346,20 @@ bool LocalStorageManager::WriteFromPtr(const std::string& key, uintptr_t src, si
 }
 
 bool LocalStorageManager::ReadIntoPtr(const std::string& key, uintptr_t dst, size_t size) {
+  if (index_) {
+    auto loc = index_->Lookup(key);
+    if (loc) {
+      TierBackend* hinted = GetTier(loc->tier);
+      if (hinted && hinted->Exists(key)) {
+        bool ok = hinted->ReadIntoPtr(key, dst, size);
+        if (ok && hinted->tier_id() != StorageTier::CPU_DRAM && config_.auto_promote_on_read) {
+          MaybeAutoPromote(key);
+        }
+        if (ok) return true;
+      }
+    }
+  }
+
   for (size_t i = 0; i < tiers_.size(); ++i) {
     if (tiers_[i].backend->Exists(key)) {
       bool ok = tiers_[i].backend->ReadIntoPtr(key, dst, size);
@@ -449,10 +472,12 @@ bool LocalStorageManager::CopyToSSD(const std::string& key) {
   // Already on SSD
   if (ssd->Exists(key)) return true;
 
-  auto data = dram->Read(key);
-  if (data.empty()) return false;
+  // Zero-copy: get a raw pointer into mmap'd DRAM instead of allocating a copy.
+  size_t data_size = 0;
+  const void* ptr = static_cast<DRAMTier*>(dram)->ReadPtr(key, &data_size);
+  if (!ptr || data_size == 0) return false;
 
-  if (ssd->Write(key, data.data(), data.size())) return true;
+  if (ssd->Write(key, ptr, data_size)) return true;
 
   // SSD full — evict SSD LRU entries to make room.
   // If a victim is only on SSD (no DRAM copy), we must also update the index.
@@ -476,8 +501,49 @@ bool LocalStorageManager::CopyToSSD(const std::string& key) {
       // Only clear metadata if key is gone from all tiers (data loss).
       if (only_on_ssd) RemoveDepthAndGroup(k);
     }
-    if (ssd->Write(key, data.data(), data.size())) return true;
+    if (ssd->Write(key, ptr, data_size)) return true;
   }
+}
+
+bool LocalStorageManager::CopyToSSDBatch(const std::vector<std::string>& keys) {
+  if (role_ == UMBPRole::SharedSSDFollower) return false;
+
+  TierBackend* dram = GetTier(StorageTier::CPU_DRAM);
+  TierBackend* ssd = GetTier(StorageTier::LOCAL_SSD);
+  if (!dram || !ssd) return false;
+
+  auto* ssd_seg = dynamic_cast<SegmentedSsdTier*>(ssd);
+
+  // Gather zero-copy pointers for keys not yet on SSD.
+  std::vector<std::string> batch_keys;
+  std::vector<const void*> batch_ptrs;
+  std::vector<size_t> batch_sizes;
+  std::vector<std::string> fallback_keys;
+
+  for (const auto& key : keys) {
+    if (ssd->Exists(key)) continue;
+    size_t sz = 0;
+    const void* ptr = static_cast<DRAMTier*>(dram)->ReadPtr(key, &sz);
+    if (!ptr || sz == 0) continue;
+    batch_keys.push_back(key);
+    batch_ptrs.push_back(ptr);
+    batch_sizes.push_back(sz);
+  }
+
+  if (batch_keys.empty()) return true;
+
+  // Try batch write if SegmentedSsdTier is available.
+  if (ssd_seg && batch_keys.size() > 1) {
+    if (ssd_seg->WriteBatch(batch_keys, batch_ptrs, batch_sizes)) return true;
+    // Batch failed (likely capacity) — fall through to per-key CopyToSSD.
+  }
+
+  // Fallback: per-key CopyToSSD.
+  bool all_ok = true;
+  for (const auto& key : batch_keys) {
+    if (!CopyToSSD(key)) all_ok = false;
+  }
+  return all_ok;
 }
 
 void LocalStorageManager::MaybeAutoPromote(const std::string& key) {

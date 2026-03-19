@@ -53,9 +53,10 @@ class LocalStorageManager {
   bool Evict(const std::string& key);
   std::pair<size_t, size_t> Capacity(StorageTier tier) const;
 
-  bool Demote(const std::string& key);     // Move to next-slower tier
-  bool Promote(const std::string& key);    // Move to next-faster tier
-  bool CopyToSSD(const std::string& key);  // Non-destructive DRAM→SSD copy
+  bool Demote(const std::string& key);                        // Move to next-slower tier
+  bool Promote(const std::string& key);                       // Move to next-faster tier
+  bool CopyToSSD(const std::string& key);                     // Non-destructive DRAM→SSD copy
+  bool CopyToSSDBatch(const std::vector<std::string>& keys);  // Batched DRAM→SSD copy
   void Clear();
 
   // Access tiers generically

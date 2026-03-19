@@ -21,7 +21,14 @@
 // SOFTWARE.
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "umbp/block_index/block_index.h"
@@ -31,6 +38,7 @@
 class UMBPClient {
  public:
   explicit UMBPClient(const UMBPConfig& config = UMBPConfig{});
+  ~UMBPClient();
 
   // Core API
   bool Put(const std::string& key, const void* data, size_t size);
@@ -53,6 +61,9 @@ class UMBPClient {
                                     const std::vector<uintptr_t>& ptrs,
                                     const std::vector<size_t>& sizes);
   std::vector<bool> BatchExists(const std::vector<std::string>& keys) const;
+  // Returns the number of keys that exist consecutively from index 0.
+  // Stops at the first key that does not exist (early-stop).
+  size_t BatchExistsConsecutive(const std::vector<std::string>& keys) const;
 
   void Clear();
 
@@ -61,10 +72,25 @@ class UMBPClient {
   LocalStorageManager& Storage();
 
  private:
+  struct CopyTask {
+    std::string key;
+  };
+
   static UMBPConfig NormalizeConfig(const UMBPConfig& config);
+  bool MaybeCopyToSharedSSD(const std::string& key);
+  void MaybeBatchCopyToSharedSSD(const std::vector<std::string>& keys);
+  bool EnqueueCopyToSSD(const std::string& key);
+  size_t EnqueueCopyToSSDBatch(const std::vector<std::string>& keys);
+  void CopyWorkerLoop();
 
   UMBPConfig config_;
   UMBPRole role_;
   BlockIndexClient index_;
   LocalStorageManager storage_;
+
+  std::atomic<bool> stop_copy_worker_{false};
+  std::vector<std::thread> copy_workers_;
+  std::mutex copy_mu_;
+  std::condition_variable copy_cv_;
+  std::deque<CopyTask> copy_queue_;
 };
