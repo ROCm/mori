@@ -21,143 +21,26 @@
 // SOFTWARE.
 #include "umbp/umbp_client.h"
 
-#include <algorithm>
-#include <future>
+#include <stdexcept>
 
 UMBPConfig UMBPClient::NormalizeConfig(const UMBPConfig& config) {
   UMBPConfig normalized = config;
   normalized.role = config.ResolveRole();
   normalized.follower_mode = (normalized.role == UMBPRole::SharedSSDFollower);
   normalized.force_ssd_copy_on_write = (normalized.role == UMBPRole::SharedSSDLeader);
+  std::string error_message;
+  if (!normalized.Validate(&error_message)) {
+    throw std::runtime_error("invalid UMBP config: " + error_message);
+  }
   return normalized;
 }
 
 UMBPClient::UMBPClient(const UMBPConfig& config)
     : config_(NormalizeConfig(config)), role_(config_.ResolveRole()), storage_(config_, &index_) {
-  if (role_ == UMBPRole::SharedSSDLeader && config_.copy_to_ssd_async) {
-    const size_t n_workers = std::max<size_t>(1, config_.ssd_writer_threads);
-    copy_workers_.reserve(n_workers);
-    for (size_t i = 0; i < n_workers; ++i) {
-      copy_workers_.emplace_back(&UMBPClient::CopyWorkerLoop, this);
-    }
-  }
+  copy_pipeline_ = std::make_unique<CopyPipeline>(storage_, config_.copy_pipeline, role_);
 }
 
-UMBPClient::~UMBPClient() {
-  if (!copy_workers_.empty()) {
-    {
-      std::lock_guard<std::mutex> lock(copy_mu_);
-      stop_copy_worker_.store(true);
-    }
-    copy_cv_.notify_all();
-    for (auto& w : copy_workers_) {
-      if (w.joinable()) w.join();
-    }
-  }
-}
-
-bool UMBPClient::EnqueueCopyToSSD(const std::string& key) {
-  std::unique_lock<std::mutex> lock(copy_mu_);
-  if (copy_queue_.size() >= config_.copy_to_ssd_queue_depth) {
-    return false;
-  }
-  copy_queue_.push_back({key});
-  lock.unlock();
-  copy_cv_.notify_one();
-  return true;
-}
-
-void UMBPClient::CopyWorkerLoop() {
-  const size_t batch_max = std::max<size_t>(1, config_.ssd_batch_max_ops);
-  while (true) {
-    std::vector<std::string> batch;
-    {
-      std::unique_lock<std::mutex> lock(copy_mu_);
-      copy_cv_.wait(lock, [&]() { return stop_copy_worker_.load() || !copy_queue_.empty(); });
-      if (stop_copy_worker_.load() && copy_queue_.empty()) return;
-      // Drain up to batch_max entries.
-      size_t n = std::min(batch_max, copy_queue_.size());
-      batch.reserve(n);
-      for (size_t i = 0; i < n; ++i) {
-        batch.push_back(std::move(copy_queue_.front().key));
-        copy_queue_.pop_front();
-      }
-    }
-    if (batch.size() == 1) {
-      storage_.CopyToSSD(batch[0]);
-    } else {
-      storage_.CopyToSSDBatch(batch);
-    }
-  }
-}
-
-bool UMBPClient::MaybeCopyToSharedSSD(const std::string& key) {
-  if (role_ != UMBPRole::SharedSSDLeader) return true;
-  if (!config_.copy_to_ssd_async) {
-    storage_.CopyToSSD(key);
-    return true;
-  }
-  if (!EnqueueCopyToSSD(key)) {
-    // Queue is full, back to sync path to preserve write-through behavior.
-    storage_.CopyToSSD(key);
-  }
-  return true;
-}
-
-size_t UMBPClient::EnqueueCopyToSSDBatch(const std::vector<std::string>& keys) {
-  std::unique_lock<std::mutex> lock(copy_mu_);
-  size_t remaining = (config_.copy_to_ssd_queue_depth > copy_queue_.size())
-                         ? config_.copy_to_ssd_queue_depth - copy_queue_.size()
-                         : 0;
-  size_t to_enqueue = std::min(keys.size(), remaining);
-  for (size_t i = 0; i < to_enqueue; ++i) {
-    copy_queue_.push_back({keys[i]});
-  }
-  lock.unlock();
-  if (to_enqueue > 0) {
-    copy_cv_.notify_all();  // wake all workers for parallel drain
-  }
-  return to_enqueue;
-}
-
-void UMBPClient::MaybeBatchCopyToSharedSSD(const std::vector<std::string>& keys) {
-  if (role_ != UMBPRole::SharedSSDLeader || keys.empty()) return;
-
-  if (!config_.copy_to_ssd_async) {
-    storage_.CopyToSSDBatch(keys);
-    return;
-  }
-  size_t enqueued = EnqueueCopyToSSDBatch(keys);
-  if (enqueued < keys.size()) {
-    // Overflow: sync fallback for remaining keys.
-    std::vector<std::string> overflow(keys.begin() + enqueued, keys.end());
-    storage_.CopyToSSDBatch(overflow);
-  }
-}
-
-namespace {
-template <typename Fn>
-void RunParallelFor(size_t n, size_t workers, Fn&& fn) {
-  if (n == 0) return;
-  if (workers <= 1 || n == 1) {
-    for (size_t i = 0; i < n; ++i) fn(i);
-    return;
-  }
-  size_t chunks = std::min(workers, n);
-  size_t chunk_size = (n + chunks - 1) / chunks;
-  std::vector<std::future<void>> futures;
-  futures.reserve(chunks);
-  for (size_t c = 0; c < chunks; ++c) {
-    size_t begin = c * chunk_size;
-    if (begin >= n) break;
-    size_t end = std::min(n, begin + chunk_size);
-    futures.push_back(std::async(std::launch::async, [begin, end, &fn]() {
-      for (size_t i = begin; i < end; ++i) fn(i);
-    }));
-  }
-  for (auto& f : futures) f.get();
-}
-}  // namespace
+UMBPClient::~UMBPClient() = default;
 
 bool UMBPClient::Put(const std::string& key, const void* data, size_t size) {
   if (role_ == UMBPRole::SharedSSDFollower) return false;
@@ -170,7 +53,7 @@ bool UMBPClient::Put(const std::string& key, const void* data, size_t size) {
   if (!storage_.Write(key, data, size)) return false;
 
   index_.Insert(key, {StorageTier::CPU_DRAM, 0, size});
-  MaybeCopyToSharedSSD(key);
+  copy_pipeline_->MaybeCopyToSharedSSD(key);
   return true;
 }
 
@@ -181,7 +64,7 @@ bool UMBPClient::PutFromPtr(const std::string& key, uintptr_t src, size_t size) 
   if (!storage_.WriteFromPtr(key, src, size)) return false;
 
   index_.Insert(key, {StorageTier::CPU_DRAM, 0, size});
-  MaybeCopyToSharedSSD(key);
+  copy_pipeline_->MaybeCopyToSharedSSD(key);
   return true;
 }
 
@@ -265,7 +148,7 @@ std::vector<bool> UMBPClient::BatchPutFromPtr(const std::vector<std::string>& ke
     for (size_t i = 0; i < keys.size(); ++i) {
       if (results[i]) ssd_keys.push_back(keys[i]);
     }
-    MaybeBatchCopyToSharedSSD(ssd_keys);
+    copy_pipeline_->MaybeBatchCopyToSharedSSD(ssd_keys);
   }
   return results;
 }
@@ -295,7 +178,7 @@ std::vector<bool> UMBPClient::BatchPutFromPtrWithDepth(const std::vector<std::st
     for (size_t i = 0; i < keys.size(); ++i) {
       if (results[i]) ssd_keys.push_back(keys[i]);
     }
-    MaybeBatchCopyToSharedSSD(ssd_keys);
+    copy_pipeline_->MaybeBatchCopyToSharedSSD(ssd_keys);
   }
   return results;
 }

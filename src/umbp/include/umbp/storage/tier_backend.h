@@ -29,6 +29,11 @@
 
 #include "umbp/common/storage_tier.h"
 
+struct TierCapabilities {
+  bool zero_copy_read = false;
+  bool batch_write = false;
+};
+
 // Abstract base class for storage tier backends (DRAM, SSD, NVM, ...).
 // All tiers share a common interface for write/read/evict; tier-specific
 // extensions (e.g., DRAMTier::ReadPtr) live in the concrete subclass.
@@ -66,6 +71,13 @@ class TierBackend {
   // Read full data into a newly allocated buffer.
   // Default returns empty vector. Override in subclasses that track per-key sizes.
   virtual std::vector<char> Read(const std::string& key);
+
+  // Optional capability-based extensions.
+  virtual TierCapabilities Capabilities() const;
+  virtual const void* ReadPtr(const std::string& key, size_t* out_size);
+  virtual bool WriteBatch(const std::vector<std::string>& keys,
+                          const std::vector<const void*>& data_ptrs,
+                          const std::vector<size_t>& sizes);
 
   // Return the LRU key, or empty string if empty.
   // Default returns "". Override in tiers with LRU tracking.

@@ -21,18 +21,15 @@
 // SOFTWARE.
 #pragma once
 
-#include <atomic>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
-#include <mutex>
+#include <memory>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "umbp/block_index/block_index.h"
 #include "umbp/common/config.h"
+#include "umbp/storage/copy_pipeline.h"
 #include "umbp/storage/local_storage_manager.h"
 
 class UMBPClient {
@@ -72,25 +69,11 @@ class UMBPClient {
   LocalStorageManager& Storage();
 
  private:
-  struct CopyTask {
-    std::string key;
-  };
-
   static UMBPConfig NormalizeConfig(const UMBPConfig& config);
-  bool MaybeCopyToSharedSSD(const std::string& key);
-  void MaybeBatchCopyToSharedSSD(const std::vector<std::string>& keys);
-  bool EnqueueCopyToSSD(const std::string& key);
-  size_t EnqueueCopyToSSDBatch(const std::vector<std::string>& keys);
-  void CopyWorkerLoop();
 
   UMBPConfig config_;
   UMBPRole role_;
   BlockIndexClient index_;
   LocalStorageManager storage_;
-
-  std::atomic<bool> stop_copy_worker_{false};
-  std::vector<std::thread> copy_workers_;
-  std::mutex copy_mu_;
-  std::condition_variable copy_cv_;
-  std::deque<CopyTask> copy_queue_;
+  std::unique_ptr<CopyPipeline> copy_pipeline_;
 };

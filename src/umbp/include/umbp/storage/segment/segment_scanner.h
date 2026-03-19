@@ -19,29 +19,20 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "umbp/storage/tier_backend.h"
+#pragma once
 
-bool TierBackend::WriteFromPtr(const std::string& key, uintptr_t src_ptr, size_t size) {
-  return Write(key, reinterpret_cast<const void*>(src_ptr), size);
-}
+#include <string>
 
-std::vector<char> TierBackend::Read(const std::string& key) { return {}; }
+#include "umbp/storage/io/storage_io_driver.h"
+#include "umbp/storage/segment/segment_index.h"
 
-TierCapabilities TierBackend::Capabilities() const { return {}; }
+namespace segment {
 
-const void* TierBackend::ReadPtr(const std::string& key, size_t* out_size) { return nullptr; }
+class Scanner {
+ public:
+  bool RefreshFromDisk(const std::string& dir, StorageIoDriver& io_driver, Index& index,
+                       bool read_only_shared, bool force_full_rescan,
+                       std::string* error_message) const;
+};
 
-bool TierBackend::WriteBatch(const std::vector<std::string>& keys,
-                             const std::vector<const void*>& data_ptrs,
-                             const std::vector<size_t>& sizes) {
-  return false;
-}
-
-std::string TierBackend::GetLRUKey() const { return ""; }
-
-std::vector<std::string> TierBackend::GetLRUCandidates(size_t max_candidates) const {
-  if (max_candidates == 0) max_candidates = 1;
-  std::string lru = GetLRUKey();
-  if (lru.empty()) return {};
-  return {lru};
-}
+}  // namespace segment

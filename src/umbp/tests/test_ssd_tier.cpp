@@ -31,10 +31,10 @@ void test_segmented_recovery() {
   const std::string dir = "/tmp/umbp_test_segmented_recovery";
 
   UMBPConfig cfg;
-  cfg.dram_capacity_bytes = 1024 * 1024;
-  cfg.ssd_enabled = true;
-  cfg.ssd_storage_dir = dir;
-  cfg.ssd_capacity_bytes = 64 * 1024 * 1024;
+  cfg.dram.capacity_bytes = 1024 * 1024;
+  cfg.ssd.enabled = true;
+  cfg.ssd.storage_dir = dir;
+  cfg.ssd.capacity_bytes = 64 * 1024 * 1024;
 
   {
     LocalStorageManager mgr(cfg);
@@ -57,10 +57,10 @@ void test_segmented_overwrite_generation() {
   const std::string dir = "/tmp/umbp_test_segmented_overwrite";
 
   UMBPConfig cfg;
-  cfg.dram_capacity_bytes = 1024 * 1024;
-  cfg.ssd_enabled = true;
-  cfg.ssd_storage_dir = dir;
-  cfg.ssd_capacity_bytes = 64 * 1024 * 1024;
+  cfg.dram.capacity_bytes = 1024 * 1024;
+  cfg.ssd.enabled = true;
+  cfg.ssd.storage_dir = dir;
+  cfg.ssd.capacity_bytes = 64 * 1024 * 1024;
 
   LocalStorageManager mgr(cfg);
   std::vector<char> a(1024, 'A');
@@ -80,10 +80,10 @@ void test_segmented_follower_refresh() {
   const std::string dir = "/tmp/umbp_test_segmented_follower";
 
   UMBPConfig leader_cfg;
-  leader_cfg.dram_capacity_bytes = 1024 * 1024;
-  leader_cfg.ssd_enabled = true;
-  leader_cfg.ssd_storage_dir = dir;
-  leader_cfg.ssd_capacity_bytes = 64 * 1024 * 1024;
+  leader_cfg.dram.capacity_bytes = 1024 * 1024;
+  leader_cfg.ssd.enabled = true;
+  leader_cfg.ssd.storage_dir = dir;
+  leader_cfg.ssd.capacity_bytes = 64 * 1024 * 1024;
 
   leader_cfg.role = UMBPRole::SharedSSDLeader;
 
@@ -111,14 +111,14 @@ void test_segmented_io_uring_backend() {
   const std::string dir = "/tmp/umbp_test_segmented_io_uring";
 
   UMBPConfig cfg;
-  cfg.dram_capacity_bytes = 1024 * 1024;
-  cfg.ssd_enabled = true;
-  cfg.ssd_storage_dir = dir;
-  cfg.ssd_capacity_bytes = 64 * 1024 * 1024;
+  cfg.dram.capacity_bytes = 1024 * 1024;
+  cfg.ssd.enabled = true;
+  cfg.ssd.storage_dir = dir;
+  cfg.ssd.capacity_bytes = 64 * 1024 * 1024;
 
-  cfg.ssd_io_backend = UMBPIoBackend::IoUring;
-  cfg.ssd_durability_mode = UMBPDurabilityMode::Strict;
-  cfg.ssd_queue_depth = 128;
+  cfg.ssd.io.backend = UMBPIoBackend::IoUring;
+  cfg.ssd.durability.mode = UMBPDurabilityMode::Strict;
+  cfg.ssd.io.queue_depth = 128;
 
   LocalStorageManager mgr(cfg);
   std::vector<char> payload(4096, 'U');

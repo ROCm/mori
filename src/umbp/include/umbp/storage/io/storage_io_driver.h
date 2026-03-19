@@ -19,29 +19,49 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "umbp/storage/tier_backend.h"
+#pragma once
 
-bool TierBackend::WriteFromPtr(const std::string& key, uintptr_t src_ptr, size_t size) {
-  return Write(key, reinterpret_cast<const void*>(src_ptr), size);
-}
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <vector>
 
-std::vector<char> TierBackend::Read(const std::string& key) { return {}; }
+#include "umbp/common/config.h"
+#include "umbp/storage/io/status.h"
 
-TierCapabilities TierBackend::Capabilities() const { return {}; }
+struct IoWriteOp {
+  int fd = -1;
+  const void* data = nullptr;
+  size_t size = 0;
+  uint64_t offset = 0;
+};
 
-const void* TierBackend::ReadPtr(const std::string& key, size_t* out_size) { return nullptr; }
+struct IoReadOp {
+  int fd = -1;
+  void* data = nullptr;
+  size_t size = 0;
+  uint64_t offset = 0;
+};
 
-bool TierBackend::WriteBatch(const std::vector<std::string>& keys,
-                             const std::vector<const void*>& data_ptrs,
-                             const std::vector<size_t>& sizes) {
-  return false;
-}
+struct IoCapabilities {
+  bool thread_safe = true;
+  bool batch_write = false;
+  bool batch_read = false;
+  bool native_async = false;
+};
 
-std::string TierBackend::GetLRUKey() const { return ""; }
+class StorageIoDriver {
+ public:
+  virtual ~StorageIoDriver() = default;
 
-std::vector<std::string> TierBackend::GetLRUCandidates(size_t max_candidates) const {
-  if (max_candidates == 0) max_candidates = 1;
-  std::string lru = GetLRUKey();
-  if (lru.empty()) return {};
-  return {lru};
-}
+  virtual IoStatus WriteAt(int fd, const void* data, size_t size, uint64_t offset) = 0;
+  virtual IoStatus ReadAt(int fd, void* data, size_t size, uint64_t offset) = 0;
+  virtual IoStatus Sync(int fd) = 0;
+  virtual IoCapabilities Capabilities() const = 0;
+
+  virtual IoStatus WriteBatch(const std::vector<IoWriteOp>& ops);
+  virtual IoStatus ReadBatch(const std::vector<IoReadOp>& ops);
+  virtual IoStatus SyncMany(const std::vector<int>& fds);
+};
+
+std::unique_ptr<StorageIoDriver> CreateStorageIoDriver(UMBPIoBackend backend, uint32_t queue_depth);

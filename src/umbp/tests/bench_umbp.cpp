@@ -58,7 +58,7 @@
 #include "umbp/common/storage_tier.h"
 #include "umbp/storage/dram_tier.h"
 #include "umbp/storage/local_storage_manager.h"
-#include "umbp/storage/segmented_ssd_tier.h"
+#include "umbp/storage/ssd_tier.h"
 #include "umbp/umbp_client.h"
 
 namespace fs = std::filesystem;
@@ -348,14 +348,14 @@ static void BenchSSDTier(const BenchConfig& cfg, const std::vector<std::string>&
   PrintHeader("SSD Tier");
 
   UMBPConfig ucfg;
-  ucfg.ssd_io_backend = UMBPIoBackend::PThread;
-  ucfg.ssd_durability_mode = UMBPDurabilityMode::Relaxed;
-  ucfg.ssd_segment_size_bytes = cfg.segment_size;
+  ucfg.ssd.io.backend = UMBPIoBackend::PThread;
+  ucfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+  ucfg.ssd.segment_size_bytes = cfg.segment_size;
 
   // Write
   {
     ScopedTempDir tmp(cfg.base_dir + "/ssd_tier_write");
-    SegmentedSsdTier tier(tmp.path, cfg.ssd_capacity, ucfg);
+    SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
 
     // Warmup
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
@@ -395,7 +395,7 @@ static void BenchSSDTier(const BenchConfig& cfg, const std::vector<std::string>&
   // Read
   {
     ScopedTempDir tmp(cfg.base_dir + "/ssd_tier_read");
-    SegmentedSsdTier tier(tmp.path, cfg.ssd_capacity, ucfg);
+    SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
 
     // Pre-fill
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -448,14 +448,14 @@ static void BenchBatchWrite(const BenchConfig& cfg, const std::vector<std::strin
   PrintHeader("Batch vs Single Write");
 
   UMBPConfig ucfg;
-  ucfg.ssd_io_backend = UMBPIoBackend::PThread;
-  ucfg.ssd_durability_mode = UMBPDurabilityMode::Relaxed;
-  ucfg.ssd_segment_size_bytes = cfg.segment_size;
+  ucfg.ssd.io.backend = UMBPIoBackend::PThread;
+  ucfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+  ucfg.ssd.segment_size_bytes = cfg.segment_size;
 
   // Sequential single-key write
   {
     ScopedTempDir tmp(cfg.base_dir + "/batch_seq");
-    SegmentedSsdTier tier(tmp.path, cfg.ssd_capacity, ucfg);
+    SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
 
     // Warmup
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
@@ -495,7 +495,7 @@ static void BenchBatchWrite(const BenchConfig& cfg, const std::vector<std::strin
   // WriteBatch
   {
     ScopedTempDir tmp(cfg.base_dir + "/batch_batch");
-    SegmentedSsdTier tier(tmp.path, cfg.ssd_capacity, ucfg);
+    SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
 
     // Warmup
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
@@ -565,17 +565,17 @@ static void BenchCopyToSSD(const BenchConfig& cfg, const std::vector<std::string
     ScopedTempDir tmp(cfg.base_dir + "/copy_single");
 
     UMBPConfig ucfg;
-    ucfg.dram_capacity_bytes = cfg.dram_capacity;
-    ucfg.ssd_enabled = true;
-    ucfg.ssd_storage_dir = tmp.path + "/ssd";
-    ucfg.ssd_capacity_bytes = cfg.ssd_capacity;
+    ucfg.dram.capacity_bytes = cfg.dram_capacity;
+    ucfg.ssd.enabled = true;
+    ucfg.ssd.storage_dir = tmp.path + "/ssd";
+    ucfg.ssd.capacity_bytes = cfg.ssd_capacity;
 
-    ucfg.ssd_io_backend = UMBPIoBackend::PThread;
-    ucfg.ssd_durability_mode = UMBPDurabilityMode::Relaxed;
-    ucfg.ssd_segment_size_bytes = cfg.segment_size;
-    ucfg.auto_promote_on_read = false;
+    ucfg.ssd.io.backend = UMBPIoBackend::PThread;
+    ucfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+    ucfg.ssd.segment_size_bytes = cfg.segment_size;
+    ucfg.eviction.auto_promote_on_read = false;
 
-    fs::create_directories(ucfg.ssd_storage_dir);
+    fs::create_directories(ucfg.ssd.storage_dir);
     LocalStorageManager mgr(ucfg);
 
     // Pre-fill DRAM
@@ -620,17 +620,17 @@ static void BenchCopyToSSD(const BenchConfig& cfg, const std::vector<std::string
     ScopedTempDir tmp(cfg.base_dir + "/copy_batch");
 
     UMBPConfig ucfg;
-    ucfg.dram_capacity_bytes = cfg.dram_capacity;
-    ucfg.ssd_enabled = true;
-    ucfg.ssd_storage_dir = tmp.path + "/ssd";
-    ucfg.ssd_capacity_bytes = cfg.ssd_capacity;
+    ucfg.dram.capacity_bytes = cfg.dram_capacity;
+    ucfg.ssd.enabled = true;
+    ucfg.ssd.storage_dir = tmp.path + "/ssd";
+    ucfg.ssd.capacity_bytes = cfg.ssd_capacity;
 
-    ucfg.ssd_io_backend = UMBPIoBackend::PThread;
-    ucfg.ssd_durability_mode = UMBPDurabilityMode::Relaxed;
-    ucfg.ssd_segment_size_bytes = cfg.segment_size;
-    ucfg.auto_promote_on_read = false;
+    ucfg.ssd.io.backend = UMBPIoBackend::PThread;
+    ucfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+    ucfg.ssd.segment_size_bytes = cfg.segment_size;
+    ucfg.eviction.auto_promote_on_read = false;
 
-    fs::create_directories(ucfg.ssd_storage_dir);
+    fs::create_directories(ucfg.ssd.storage_dir);
     LocalStorageManager mgr(ucfg);
 
     // Pre-fill DRAM
@@ -688,19 +688,19 @@ static void BenchIOBackend(const BenchConfig& cfg, const std::vector<std::string
 
   auto run_backend = [&](UMBPIoBackend backend, const std::string& label) {
     UMBPConfig ucfg;
-    ucfg.ssd_io_backend = backend;
-    ucfg.ssd_durability_mode = UMBPDurabilityMode::Relaxed;
-    ucfg.ssd_segment_size_bytes = cfg.segment_size;
-    ucfg.ssd_queue_depth = 4096;
+    ucfg.ssd.io.backend = backend;
+    ucfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+    ucfg.ssd.segment_size_bytes = cfg.segment_size;
+    ucfg.ssd.io.queue_depth = 4096;
 
     std::string suffix = (backend == UMBPIoBackend::PThread) ? "posix" : "iouring";
 
     // Write
     {
       ScopedTempDir tmp(cfg.base_dir + "/io_" + suffix + "_w");
-      std::unique_ptr<SegmentedSsdTier> tier;
+      std::unique_ptr<SSDTier> tier;
       try {
-        tier = std::make_unique<SegmentedSsdTier>(tmp.path, cfg.ssd_capacity, ucfg);
+        tier = std::make_unique<SSDTier>(tmp.path, cfg.ssd_capacity, ucfg);
       } catch (const std::exception& e) {
         std::printf("[SKIP] %s not available: %s\n", label.c_str(), e.what());
         return;
@@ -744,9 +744,9 @@ static void BenchIOBackend(const BenchConfig& cfg, const std::vector<std::string
     // Read
     {
       ScopedTempDir tmp(cfg.base_dir + "/io_" + suffix + "_r");
-      std::unique_ptr<SegmentedSsdTier> tier;
+      std::unique_ptr<SSDTier> tier;
       try {
-        tier = std::make_unique<SegmentedSsdTier>(tmp.path, cfg.ssd_capacity, ucfg);
+        tier = std::make_unique<SSDTier>(tmp.path, cfg.ssd_capacity, ucfg);
       } catch (const std::exception& e) {
         std::printf("[SKIP] %s not available: %s\n", label.c_str(), e.what());
         return;
@@ -808,12 +808,12 @@ static void BenchDurability(const BenchConfig& cfg, const std::vector<std::strin
 
   auto run_mode = [&](UMBPDurabilityMode mode, const std::string& label) {
     UMBPConfig ucfg;
-    ucfg.ssd_io_backend = UMBPIoBackend::PThread;
-    ucfg.ssd_durability_mode = mode;
-    ucfg.ssd_segment_size_bytes = cfg.segment_size;
+    ucfg.ssd.io.backend = UMBPIoBackend::PThread;
+    ucfg.ssd.durability.mode = mode;
+    ucfg.ssd.segment_size_bytes = cfg.segment_size;
 
     ScopedTempDir tmp(cfg.base_dir + "/dur_" + label);
-    SegmentedSsdTier tier(tmp.path, cfg.ssd_capacity, ucfg);
+    SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
 
     // Warmup
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
@@ -868,19 +868,19 @@ static void BenchConcurrent(const BenchConfig& cfg, const std::vector<std::strin
     ScopedTempDir tmp(cfg.base_dir + "/concurrent_" + std::to_string(nthreads));
 
     UMBPConfig ucfg;
-    ucfg.dram_capacity_bytes = cfg.dram_capacity;
-    ucfg.ssd_enabled = true;
-    ucfg.ssd_storage_dir = tmp.path + "/ssd";
-    ucfg.ssd_capacity_bytes = cfg.ssd_capacity;
+    ucfg.dram.capacity_bytes = cfg.dram_capacity;
+    ucfg.ssd.enabled = true;
+    ucfg.ssd.storage_dir = tmp.path + "/ssd";
+    ucfg.ssd.capacity_bytes = cfg.ssd_capacity;
 
-    ucfg.ssd_io_backend = UMBPIoBackend::PThread;
-    ucfg.ssd_durability_mode = UMBPDurabilityMode::Relaxed;
-    ucfg.ssd_segment_size_bytes = cfg.segment_size;
+    ucfg.ssd.io.backend = UMBPIoBackend::PThread;
+    ucfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+    ucfg.ssd.segment_size_bytes = cfg.segment_size;
     ucfg.role = UMBPRole::Standalone;
-    ucfg.copy_to_ssd_async = false;
-    ucfg.auto_promote_on_read = false;
+    ucfg.copy_pipeline.async_enabled = false;
+    ucfg.eviction.auto_promote_on_read = false;
 
-    fs::create_directories(ucfg.ssd_storage_dir);
+    fs::create_directories(ucfg.ssd.storage_dir);
     UMBPClient client(ucfg);
 
     size_t keys_per_thread = keys.size() / static_cast<size_t>(nthreads);
@@ -1016,19 +1016,19 @@ static void BenchLeaderMode(const BenchConfig& cfg, const std::vector<std::strin
     ScopedTempDir tmp(cfg.base_dir + "/leader_" + label);
 
     UMBPConfig ucfg;
-    ucfg.dram_capacity_bytes = cfg.dram_capacity;
-    ucfg.ssd_enabled = true;
-    ucfg.ssd_storage_dir = tmp.path + "/ssd";
-    ucfg.ssd_capacity_bytes = cfg.ssd_capacity;
+    ucfg.dram.capacity_bytes = cfg.dram_capacity;
+    ucfg.ssd.enabled = true;
+    ucfg.ssd.storage_dir = tmp.path + "/ssd";
+    ucfg.ssd.capacity_bytes = cfg.ssd_capacity;
 
-    ucfg.ssd_io_backend = UMBPIoBackend::PThread;
-    ucfg.ssd_durability_mode = UMBPDurabilityMode::Relaxed;
-    ucfg.ssd_segment_size_bytes = cfg.segment_size;
+    ucfg.ssd.io.backend = UMBPIoBackend::PThread;
+    ucfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+    ucfg.ssd.segment_size_bytes = cfg.segment_size;
     ucfg.role = UMBPRole::SharedSSDLeader;
-    ucfg.copy_to_ssd_async = async_copy;
-    ucfg.auto_promote_on_read = false;
+    ucfg.copy_pipeline.async_enabled = async_copy;
+    ucfg.eviction.auto_promote_on_read = false;
 
-    fs::create_directories(ucfg.ssd_storage_dir);
+    fs::create_directories(ucfg.ssd.storage_dir);
 
     // Warmup
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
@@ -1087,18 +1087,18 @@ static void BenchCapacityPressure(const BenchConfig& cfg, const std::vector<std:
   ScopedTempDir tmp(cfg.base_dir + "/pressure");
 
   UMBPConfig ucfg;
-  ucfg.dram_capacity_bytes = pressure_dram;
-  ucfg.ssd_enabled = true;
-  ucfg.ssd_storage_dir = tmp.path + "/ssd";
-  ucfg.ssd_capacity_bytes = cfg.ssd_capacity;
-  ucfg.ssd_io_backend = UMBPIoBackend::PThread;
-  ucfg.ssd_durability_mode = UMBPDurabilityMode::Relaxed;
-  ucfg.ssd_segment_size_bytes = cfg.segment_size;
+  ucfg.dram.capacity_bytes = pressure_dram;
+  ucfg.ssd.enabled = true;
+  ucfg.ssd.storage_dir = tmp.path + "/ssd";
+  ucfg.ssd.capacity_bytes = cfg.ssd_capacity;
+  ucfg.ssd.io.backend = UMBPIoBackend::PThread;
+  ucfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+  ucfg.ssd.segment_size_bytes = cfg.segment_size;
   ucfg.role = UMBPRole::Standalone;
-  ucfg.copy_to_ssd_async = false;
-  ucfg.auto_promote_on_read = false;
+  ucfg.copy_pipeline.async_enabled = false;
+  ucfg.eviction.auto_promote_on_read = false;
 
-  fs::create_directories(ucfg.ssd_storage_dir);
+  fs::create_directories(ucfg.ssd.storage_dir);
 
   // No pressure: first half, DRAM not full
   {

@@ -23,15 +23,27 @@
 from mori.cpp import (
     UMBPClient,
     UMBPConfig,
+    UMBPCopyPipelineConfig,
+    UMBPDramConfig,
     UMBPDurabilityMode,
     UMBPIoBackend,
+    UMBPIoConfig,
     UMBPRole,
+    UMBPSsdConfig,
+    UMBPEvictionConfig,
+    UMBPDurabilityConfig,
 )
 
 __all__ = [
     "UMBPClient",
     "UMBPConfig",
+    "UMBPCopyPipelineConfig",
+    "UMBPDramConfig",
+    "UMBPDurabilityConfig",
     "UMBPDurabilityMode",
     "UMBPIoBackend",
+    "UMBPIoConfig",
     "UMBPRole",
+    "UMBPSsdConfig",
+    "UMBPEvictionConfig",
 ]

@@ -19,29 +19,40 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "umbp/storage/tier_backend.h"
+#pragma once
 
-bool TierBackend::WriteFromPtr(const std::string& key, uintptr_t src_ptr, size_t size) {
-  return Write(key, reinterpret_cast<const void*>(src_ptr), size);
-}
+#include <cstring>
+#include <string>
+#include <vector>
 
-std::vector<char> TierBackend::Read(const std::string& key) { return {}; }
+#include "umbp/storage/io/storage_io_driver.h"
+#include "umbp/storage/segment/segment_format.h"
+#include "umbp/storage/segment/segment_index.h"
 
-TierCapabilities TierBackend::Capabilities() const { return {}; }
+namespace segment {
 
-const void* TierBackend::ReadPtr(const std::string& key, size_t* out_size) { return nullptr; }
+struct PreparedRecord {
+  std::vector<char> record;
+  WriteReservation reservation;
+};
 
-bool TierBackend::WriteBatch(const std::vector<std::string>& keys,
-                             const std::vector<const void*>& data_ptrs,
-                             const std::vector<size_t>& sizes) {
-  return false;
-}
+class Writer {
+ public:
+  explicit Writer(StorageIoDriver& io_driver) : io_driver_(io_driver) {}
 
-std::string TierBackend::GetLRUKey() const { return ""; }
+  // Phase 1 (caller holds mu_): prepare record buffer and reserve index space.
+  // Returns false if capacity is exhausted.
+  bool Prepare(const std::string& key, const void* data, size_t size, Meta* segment_meta,
+               Index& index, PreparedRecord* out) const;
 
-std::vector<std::string> TierBackend::GetLRUCandidates(size_t max_candidates) const {
-  if (max_candidates == 0) max_candidates = 1;
-  std::string lru = GetLRUKey();
-  if (lru.empty()) return {};
-  return {lru};
-}
+  // Phase 2 (caller holds io_mu_ only): write the prepared record to disk.
+  IoStatus WriteRecord(int fd, const PreparedRecord& pr, bool should_sync) const;
+
+  // Phase 2 batch variant: write multiple prepared records to disk.
+  IoStatus WriteRecords(int fd, const std::vector<PreparedRecord>& records, bool should_sync) const;
+
+ private:
+  StorageIoDriver& io_driver_;
+};
+
+}  // namespace segment

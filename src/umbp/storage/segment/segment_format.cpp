@@ -19,29 +19,31 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "umbp/storage/tier_backend.h"
+#include "umbp/storage/segment/segment_format.h"
 
-bool TierBackend::WriteFromPtr(const std::string& key, uintptr_t src_ptr, size_t size) {
-  return Write(key, reinterpret_cast<const void*>(src_ptr), size);
+#include <string>
+
+namespace segment {
+
+uint32_t CrcUpdate(const void* data, size_t size, uint32_t crc) {
+  const uint8_t* p = static_cast<const uint8_t*>(data);
+  for (size_t i = 0; i < size; ++i) {
+    crc ^= static_cast<uint32_t>(p[i]);
+    for (int j = 0; j < 8; ++j) {
+      const uint32_t mask = -(crc & 1u);
+      crc = (crc >> 1) ^ (0xEDB88320u & mask);
+    }
+  }
+  return crc;
 }
 
-std::vector<char> TierBackend::Read(const std::string& key) { return {}; }
-
-TierCapabilities TierBackend::Capabilities() const { return {}; }
-
-const void* TierBackend::ReadPtr(const std::string& key, size_t* out_size) { return nullptr; }
-
-bool TierBackend::WriteBatch(const std::vector<std::string>& keys,
-                             const std::vector<const void*>& data_ptrs,
-                             const std::vector<size_t>& sizes) {
-  return false;
+uint32_t ComputeRecordCrc32(const std::string& key, const void* value, size_t value_size) {
+  uint32_t crc = CrcUpdate(key.data(), key.size());
+  return ~CrcUpdate(value, value_size, crc);
 }
 
-std::string TierBackend::GetLRUKey() const { return ""; }
-
-std::vector<std::string> TierBackend::GetLRUCandidates(size_t max_candidates) const {
-  if (max_candidates == 0) max_candidates = 1;
-  std::string lru = GetLRUKey();
-  if (lru.empty()) return {};
-  return {lru};
+std::string BuildFileName(uint64_t segment_id) {
+  return "segment_" + std::to_string(segment_id) + ".log";
 }
+
+}  // namespace segment

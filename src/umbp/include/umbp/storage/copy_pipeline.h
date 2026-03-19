@@ -19,29 +19,44 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "umbp/storage/tier_backend.h"
+#pragma once
 
-bool TierBackend::WriteFromPtr(const std::string& key, uintptr_t src_ptr, size_t size) {
-  return Write(key, reinterpret_cast<const void*>(src_ptr), size);
-}
+#include <atomic>
+#include <condition_variable>
+#include <cstddef>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
 
-std::vector<char> TierBackend::Read(const std::string& key) { return {}; }
+#include "umbp/common/config.h"
+#include "umbp/storage/local_storage_manager.h"
 
-TierCapabilities TierBackend::Capabilities() const { return {}; }
+class CopyPipeline {
+ public:
+  CopyPipeline(LocalStorageManager& storage, const UMBPCopyPipelineConfig& config, UMBPRole role);
+  ~CopyPipeline();
 
-const void* TierBackend::ReadPtr(const std::string& key, size_t* out_size) { return nullptr; }
+  bool MaybeCopyToSharedSSD(const std::string& key);
+  void MaybeBatchCopyToSharedSSD(const std::vector<std::string>& keys);
 
-bool TierBackend::WriteBatch(const std::vector<std::string>& keys,
-                             const std::vector<const void*>& data_ptrs,
-                             const std::vector<size_t>& sizes) {
-  return false;
-}
+ private:
+  struct CopyTask {
+    std::string key;
+  };
 
-std::string TierBackend::GetLRUKey() const { return ""; }
+  bool EnqueueCopyToSSD(const std::string& key);
+  size_t EnqueueCopyToSSDBatch(const std::vector<std::string>& keys);
+  void CopyWorkerLoop();
 
-std::vector<std::string> TierBackend::GetLRUCandidates(size_t max_candidates) const {
-  if (max_candidates == 0) max_candidates = 1;
-  std::string lru = GetLRUKey();
-  if (lru.empty()) return {};
-  return {lru};
-}
+  LocalStorageManager& storage_;
+  UMBPCopyPipelineConfig config_;
+  UMBPRole role_;
+
+  std::atomic<bool> stop_copy_worker_{false};
+  std::vector<std::thread> copy_workers_;
+  std::mutex copy_mu_;
+  std::condition_variable copy_cv_;
+  std::deque<CopyTask> copy_queue_;
+};

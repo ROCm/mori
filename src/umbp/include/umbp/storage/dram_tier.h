@@ -54,6 +54,7 @@ class DRAMTier : public TierBackend {
   void Clear() override;
 
   // Extended interface overrides
+  TierCapabilities Capabilities() const override;
   std::vector<char> Read(const std::string& key) override;
   std::string GetLRUKey() const override;
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
@@ -61,7 +62,7 @@ class DRAMTier : public TierBackend {
   // DRAM-specific: zero-copy read returning internal pointer.
   // Only safe for in-process mmap'd memory. Caller must not hold
   // the returned pointer across Evict/Write calls.
-  const void* ReadPtr(const std::string& key, size_t* out_size);
+  const void* ReadPtr(const std::string& key, size_t* out_size) override;
 
  private:
   void* base_ptr_;  // mmap base address

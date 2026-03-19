@@ -27,7 +27,7 @@
 #include <thread>
 #include <vector>
 
-#include "umbp/storage/segmented_ssd_tier.h"
+#include "umbp/storage/ssd_tier.h"
 #include "umbp/umbp_client.h"
 
 namespace fs = std::filesystem;
@@ -42,9 +42,9 @@ static void cleanup_dir(const std::string& dir) {
 
 static UMBPConfig make_ssd_config() {
   UMBPConfig cfg;
-  cfg.ssd_io_backend = UMBPIoBackend::PThread;
-  cfg.ssd_durability_mode = UMBPDurabilityMode::Relaxed;
-  cfg.ssd_segment_size_bytes = 4 * 1024 * 1024;
+  cfg.ssd.io.backend = UMBPIoBackend::PThread;
+  cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+  cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
   return cfg;
 }
 
@@ -55,20 +55,19 @@ void test_ssd_follower_exists_fallback() {
   auto cfg = make_ssd_config();
 
   // Leader writes a key
-  SegmentedSsdTier leader(SHARED_SSD_DIR, 1 * 1024 * 1024, cfg, SegmentedSsdAccessMode::ReadWrite);
+  SSDTier leader(SHARED_SSD_DIR, 1 * 1024 * 1024, cfg, SSDAccessMode::ReadWrite);
   std::vector<char> data(4096, 'X');
   assert(leader.Write("shared_k", data.data(), data.size()));
   assert(leader.Exists("shared_k"));
 
   // Follower can discover it via segment scan
-  SegmentedSsdTier follower(SHARED_SSD_DIR, 1 * 1024 * 1024, cfg,
-                            SegmentedSsdAccessMode::ReadOnlyShared);
+  SSDTier follower(SHARED_SSD_DIR, 1 * 1024 * 1024, cfg, SSDAccessMode::ReadOnlyShared);
   assert(follower.Exists("shared_k"));
   assert(!follower.Exists("nonexistent"));
 
-  // Non-follower SegmentedSsdTier at same dir would see leader's key
+  // Non-follower SSDTier at same dir would see leader's key
   // (segments are scanned on construction)
-  SegmentedSsdTier normal(SHARED_SSD_DIR, 1 * 1024 * 1024, cfg, SegmentedSsdAccessMode::ReadWrite);
+  SSDTier normal(SHARED_SSD_DIR, 1 * 1024 * 1024, cfg, SSDAccessMode::ReadWrite);
   assert(normal.Exists("shared_k"));
 
   cleanup_dir(SHARED_SSD_DIR);
@@ -82,14 +81,13 @@ void test_ssd_follower_read_fallback() {
   auto cfg = make_ssd_config();
 
   // Leader writes data
-  SegmentedSsdTier leader(SHARED_SSD_DIR, 1 * 1024 * 1024, cfg, SegmentedSsdAccessMode::ReadWrite);
+  SSDTier leader(SHARED_SSD_DIR, 1 * 1024 * 1024, cfg, SSDAccessMode::ReadWrite);
   std::vector<char> data(4096);
   for (size_t i = 0; i < data.size(); ++i) data[i] = static_cast<char>(i % 256);
   assert(leader.Write("read_k", data.data(), data.size()));
 
   // Follower reads via segment scan
-  SegmentedSsdTier follower(SHARED_SSD_DIR, 1 * 1024 * 1024, cfg,
-                            SegmentedSsdAccessMode::ReadOnlyShared);
+  SSDTier follower(SHARED_SSD_DIR, 1 * 1024 * 1024, cfg, SSDAccessMode::ReadOnlyShared);
   std::vector<char> buf(4096, 0);
   assert(follower.ReadIntoPtr("read_k", reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
   assert(buf == data);
@@ -104,8 +102,7 @@ void test_ssd_follower_read_fallback() {
   assert(!follower.ReadIntoPtr("read_k", reinterpret_cast<uintptr_t>(buf3.data()), buf3.size()));
 
   // Read() (vector version) should also work
-  SegmentedSsdTier follower2(SHARED_SSD_DIR, 1 * 1024 * 1024, cfg,
-                             SegmentedSsdAccessMode::ReadOnlyShared);
+  SSDTier follower2(SHARED_SSD_DIR, 1 * 1024 * 1024, cfg, SSDAccessMode::ReadOnlyShared);
   auto read_data = follower2.Read("read_k");
   assert(read_data.size() == data.size());
   assert(read_data == data);
@@ -121,13 +118,12 @@ void test_ssd_follower_evict_no_delete() {
   auto cfg = make_ssd_config();
 
   // Leader writes
-  SegmentedSsdTier leader(SHARED_SSD_DIR, 1 * 1024 * 1024, cfg, SegmentedSsdAccessMode::ReadWrite);
+  SSDTier leader(SHARED_SSD_DIR, 1 * 1024 * 1024, cfg, SSDAccessMode::ReadWrite);
   std::vector<char> data(4096, 'Y');
   assert(leader.Write("evict_k", data.data(), data.size()));
 
   // Follower reads
-  SegmentedSsdTier follower(SHARED_SSD_DIR, 1 * 1024 * 1024, cfg,
-                            SegmentedSsdAccessMode::ReadOnlyShared);
+  SSDTier follower(SHARED_SSD_DIR, 1 * 1024 * 1024, cfg, SSDAccessMode::ReadOnlyShared);
   assert(follower.Exists("evict_k"));
   std::vector<char> buf(4096, 0);
   assert(follower.ReadIntoPtr("evict_k", reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
@@ -152,8 +148,7 @@ void test_ssd_follower_evict_no_delete() {
   assert(!follower.Exists("evict_k"));
 
   // But a fresh follower instance will find it via full initial scan.
-  SegmentedSsdTier follower2(SHARED_SSD_DIR, 1 * 1024 * 1024, cfg,
-                             SegmentedSsdAccessMode::ReadOnlyShared);
+  SSDTier follower2(SHARED_SSD_DIR, 1 * 1024 * 1024, cfg, SSDAccessMode::ReadOnlyShared);
   assert(follower2.Exists("evict_k"));
 
   cleanup_dir(SHARED_SSD_DIR);
@@ -166,14 +161,14 @@ void test_follower_stale_index_after_evict() {
 
   // Leader writes to shared SSD (via copy-on-write)
   UMBPConfig leader_cfg;
-  leader_cfg.dram_capacity_bytes = 1 * 1024 * 1024;
-  leader_cfg.ssd_enabled = true;
-  leader_cfg.ssd_storage_dir = SHARED_SSD_DIR;
-  leader_cfg.ssd_capacity_bytes = 4 * 1024 * 1024;
-  leader_cfg.ssd_io_backend = UMBPIoBackend::PThread;
-  leader_cfg.ssd_durability_mode = UMBPDurabilityMode::Relaxed;
-  leader_cfg.ssd_segment_size_bytes = 4 * 1024 * 1024;
-  leader_cfg.copy_to_ssd_async = false;
+  leader_cfg.dram.capacity_bytes = 1 * 1024 * 1024;
+  leader_cfg.ssd.enabled = true;
+  leader_cfg.ssd.storage_dir = SHARED_SSD_DIR;
+  leader_cfg.ssd.capacity_bytes = 4 * 1024 * 1024;
+  leader_cfg.ssd.io.backend = UMBPIoBackend::PThread;
+  leader_cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+  leader_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
+  leader_cfg.copy_pipeline.async_enabled = false;
   leader_cfg.role = UMBPRole::SharedSSDLeader;
   UMBPClient leader(leader_cfg);
 
@@ -182,15 +177,15 @@ void test_follower_stale_index_after_evict() {
 
   // Follower reads from SSD but does NOT auto-promote into DRAM.
   UMBPConfig follower_cfg;
-  follower_cfg.dram_capacity_bytes = 512 * 1024;
-  follower_cfg.ssd_enabled = true;
-  follower_cfg.ssd_storage_dir = SHARED_SSD_DIR;
-  follower_cfg.ssd_capacity_bytes = 4 * 1024 * 1024;
-  follower_cfg.ssd_io_backend = UMBPIoBackend::PThread;
-  follower_cfg.ssd_durability_mode = UMBPDurabilityMode::Relaxed;
-  follower_cfg.ssd_segment_size_bytes = 4 * 1024 * 1024;
+  follower_cfg.dram.capacity_bytes = 512 * 1024;
+  follower_cfg.ssd.enabled = true;
+  follower_cfg.ssd.storage_dir = SHARED_SSD_DIR;
+  follower_cfg.ssd.capacity_bytes = 4 * 1024 * 1024;
+  follower_cfg.ssd.io.backend = UMBPIoBackend::PThread;
+  follower_cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+  follower_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
   follower_cfg.role = UMBPRole::SharedSSDFollower;
-  follower_cfg.auto_promote_on_read = false;
+  follower_cfg.eviction.auto_promote_on_read = false;
   UMBPClient follower(follower_cfg);
 
   std::vector<char> buf(4096, 0);
@@ -224,14 +219,14 @@ void test_leader_copy_to_ssd() {
   cleanup_dir(SHARED_SSD_DIR);
 
   UMBPConfig cfg;
-  cfg.dram_capacity_bytes = 1 * 1024 * 1024;
-  cfg.ssd_enabled = true;
-  cfg.ssd_storage_dir = SHARED_SSD_DIR;
-  cfg.ssd_capacity_bytes = 4 * 1024 * 1024;
-  cfg.ssd_io_backend = UMBPIoBackend::PThread;
-  cfg.ssd_durability_mode = UMBPDurabilityMode::Relaxed;
-  cfg.ssd_segment_size_bytes = 4 * 1024 * 1024;
-  cfg.copy_to_ssd_async = false;
+  cfg.dram.capacity_bytes = 1 * 1024 * 1024;
+  cfg.ssd.enabled = true;
+  cfg.ssd.storage_dir = SHARED_SSD_DIR;
+  cfg.ssd.capacity_bytes = 4 * 1024 * 1024;
+  cfg.ssd.io.backend = UMBPIoBackend::PThread;
+  cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+  cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
+  cfg.copy_pipeline.async_enabled = false;
   cfg.role = UMBPRole::SharedSSDLeader;
 
   UMBPClient leader(cfg);
@@ -257,8 +252,7 @@ void test_leader_copy_to_ssd() {
 
   // Verify data on SSD is correct via a follower read
   auto ssd_cfg = make_ssd_config();
-  SegmentedSsdTier ssd_check(SHARED_SSD_DIR, 4 * 1024 * 1024, ssd_cfg,
-                             SegmentedSsdAccessMode::ReadOnlyShared);
+  SSDTier ssd_check(SHARED_SSD_DIR, 4 * 1024 * 1024, ssd_cfg, SSDAccessMode::ReadOnlyShared);
   auto ssd_data = ssd_check.Read("copy_k");
   assert(ssd_data.size() == data.size());
   assert(ssd_data == data);
@@ -273,29 +267,29 @@ void test_e2e_leader_follower() {
 
   // Leader config
   UMBPConfig leader_cfg;
-  leader_cfg.dram_capacity_bytes = 1 * 1024 * 1024;
-  leader_cfg.ssd_enabled = true;
-  leader_cfg.ssd_storage_dir = SHARED_SSD_DIR;
-  leader_cfg.ssd_capacity_bytes = 4 * 1024 * 1024;
-  leader_cfg.ssd_io_backend = UMBPIoBackend::PThread;
-  leader_cfg.ssd_durability_mode = UMBPDurabilityMode::Relaxed;
-  leader_cfg.ssd_segment_size_bytes = 4 * 1024 * 1024;
-  leader_cfg.copy_to_ssd_async = false;
+  leader_cfg.dram.capacity_bytes = 1 * 1024 * 1024;
+  leader_cfg.ssd.enabled = true;
+  leader_cfg.ssd.storage_dir = SHARED_SSD_DIR;
+  leader_cfg.ssd.capacity_bytes = 4 * 1024 * 1024;
+  leader_cfg.ssd.io.backend = UMBPIoBackend::PThread;
+  leader_cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+  leader_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
+  leader_cfg.copy_pipeline.async_enabled = false;
   leader_cfg.role = UMBPRole::SharedSSDLeader;
 
   UMBPClient leader(leader_cfg);
 
   // Follower config — separate DRAM, shared SSD dir
   UMBPConfig follower_cfg;
-  follower_cfg.dram_capacity_bytes = 512 * 1024;
-  follower_cfg.ssd_enabled = true;
-  follower_cfg.ssd_storage_dir = SHARED_SSD_DIR;
-  follower_cfg.ssd_capacity_bytes = 4 * 1024 * 1024;
-  follower_cfg.ssd_io_backend = UMBPIoBackend::PThread;
-  follower_cfg.ssd_durability_mode = UMBPDurabilityMode::Relaxed;
-  follower_cfg.ssd_segment_size_bytes = 4 * 1024 * 1024;
+  follower_cfg.dram.capacity_bytes = 512 * 1024;
+  follower_cfg.ssd.enabled = true;
+  follower_cfg.ssd.storage_dir = SHARED_SSD_DIR;
+  follower_cfg.ssd.capacity_bytes = 4 * 1024 * 1024;
+  follower_cfg.ssd.io.backend = UMBPIoBackend::PThread;
+  follower_cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+  follower_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
   follower_cfg.role = UMBPRole::SharedSSDFollower;
-  follower_cfg.auto_promote_on_read = true;
+  follower_cfg.eviction.auto_promote_on_read = true;
 
   UMBPClient follower(follower_cfg);
 
@@ -337,26 +331,26 @@ void test_follower_batch_exists() {
 
   // Leader
   UMBPConfig leader_cfg;
-  leader_cfg.dram_capacity_bytes = 1 * 1024 * 1024;
-  leader_cfg.ssd_enabled = true;
-  leader_cfg.ssd_storage_dir = SHARED_SSD_DIR;
-  leader_cfg.ssd_capacity_bytes = 4 * 1024 * 1024;
-  leader_cfg.ssd_io_backend = UMBPIoBackend::PThread;
-  leader_cfg.ssd_durability_mode = UMBPDurabilityMode::Relaxed;
-  leader_cfg.ssd_segment_size_bytes = 4 * 1024 * 1024;
-  leader_cfg.copy_to_ssd_async = false;
+  leader_cfg.dram.capacity_bytes = 1 * 1024 * 1024;
+  leader_cfg.ssd.enabled = true;
+  leader_cfg.ssd.storage_dir = SHARED_SSD_DIR;
+  leader_cfg.ssd.capacity_bytes = 4 * 1024 * 1024;
+  leader_cfg.ssd.io.backend = UMBPIoBackend::PThread;
+  leader_cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+  leader_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
+  leader_cfg.copy_pipeline.async_enabled = false;
   leader_cfg.role = UMBPRole::SharedSSDLeader;
   UMBPClient leader(leader_cfg);
 
   // Follower
   UMBPConfig follower_cfg;
-  follower_cfg.dram_capacity_bytes = 512 * 1024;
-  follower_cfg.ssd_enabled = true;
-  follower_cfg.ssd_storage_dir = SHARED_SSD_DIR;
-  follower_cfg.ssd_capacity_bytes = 4 * 1024 * 1024;
-  follower_cfg.ssd_io_backend = UMBPIoBackend::PThread;
-  follower_cfg.ssd_durability_mode = UMBPDurabilityMode::Relaxed;
-  follower_cfg.ssd_segment_size_bytes = 4 * 1024 * 1024;
+  follower_cfg.dram.capacity_bytes = 512 * 1024;
+  follower_cfg.ssd.enabled = true;
+  follower_cfg.ssd.storage_dir = SHARED_SSD_DIR;
+  follower_cfg.ssd.capacity_bytes = 4 * 1024 * 1024;
+  follower_cfg.ssd.io.backend = UMBPIoBackend::PThread;
+  follower_cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+  follower_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
   follower_cfg.role = UMBPRole::SharedSSDFollower;
   UMBPClient follower(follower_cfg);
 
@@ -392,14 +386,14 @@ void test_follower_autopromote_no_writeback() {
   cleanup_dir(SHARED_SSD_DIR);
 
   UMBPConfig leader_cfg;
-  leader_cfg.dram_capacity_bytes = 1 * 1024 * 1024;
-  leader_cfg.ssd_enabled = true;
-  leader_cfg.ssd_storage_dir = SHARED_SSD_DIR;
-  leader_cfg.ssd_capacity_bytes = 4 * 1024 * 1024;
-  leader_cfg.ssd_io_backend = UMBPIoBackend::PThread;
-  leader_cfg.ssd_durability_mode = UMBPDurabilityMode::Relaxed;
-  leader_cfg.ssd_segment_size_bytes = 4 * 1024 * 1024;
-  leader_cfg.copy_to_ssd_async = false;
+  leader_cfg.dram.capacity_bytes = 1 * 1024 * 1024;
+  leader_cfg.ssd.enabled = true;
+  leader_cfg.ssd.storage_dir = SHARED_SSD_DIR;
+  leader_cfg.ssd.capacity_bytes = 4 * 1024 * 1024;
+  leader_cfg.ssd.io.backend = UMBPIoBackend::PThread;
+  leader_cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+  leader_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
+  leader_cfg.copy_pipeline.async_enabled = false;
   leader_cfg.role = UMBPRole::SharedSSDLeader;
   UMBPClient leader(leader_cfg);
 
@@ -422,16 +416,16 @@ void test_follower_autopromote_no_writeback() {
   assert(before_size > 0);
 
   UMBPConfig follower_cfg;
-  follower_cfg.dram_capacity_bytes = 4096;  // fit one block only
-  follower_cfg.ssd_enabled = true;
-  follower_cfg.ssd_storage_dir = SHARED_SSD_DIR;
-  follower_cfg.ssd_capacity_bytes = 4 * 1024 * 1024;
-  follower_cfg.ssd_io_backend = UMBPIoBackend::PThread;
-  follower_cfg.ssd_durability_mode = UMBPDurabilityMode::Relaxed;
-  follower_cfg.ssd_segment_size_bytes = 4 * 1024 * 1024;
+  follower_cfg.dram.capacity_bytes = 4096;  // fit one block only
+  follower_cfg.ssd.enabled = true;
+  follower_cfg.ssd.storage_dir = SHARED_SSD_DIR;
+  follower_cfg.ssd.capacity_bytes = 4 * 1024 * 1024;
+  follower_cfg.ssd.io.backend = UMBPIoBackend::PThread;
+  follower_cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+  follower_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
   follower_cfg.role = UMBPRole::SharedSSDFollower;
-  follower_cfg.auto_promote_on_read = true;
-  follower_cfg.dram_high_watermark = 2.0;  // force promote path on every read
+  follower_cfg.eviction.auto_promote_on_read = true;
+  follower_cfg.dram.high_watermark = 2.0;  // force promote path on every read
   UMBPClient follower(follower_cfg);
 
   std::vector<char> buf(4096, 0);

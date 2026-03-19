@@ -30,8 +30,8 @@ void test_put_get() {
   std::cout << "test_put_get... ";
 
   UMBPConfig config;
-  config.dram_capacity_bytes = 1 * 1024 * 1024;
-  config.ssd_enabled = false;
+  config.dram.capacity_bytes = 1 * 1024 * 1024;
+  config.ssd.enabled = false;
 
   UMBPClient client(config);
 
@@ -50,8 +50,8 @@ void test_put_dedup() {
   std::cout << "test_put_dedup... ";
 
   UMBPConfig config;
-  config.dram_capacity_bytes = 1 * 1024 * 1024;
-  config.ssd_enabled = false;
+  config.dram.capacity_bytes = 1 * 1024 * 1024;
+  config.ssd.enabled = false;
 
   UMBPClient client(config);
 
@@ -74,8 +74,8 @@ void test_remove() {
   std::cout << "test_remove... ";
 
   UMBPConfig config;
-  config.dram_capacity_bytes = 1 * 1024 * 1024;
-  config.ssd_enabled = false;
+  config.dram.capacity_bytes = 1 * 1024 * 1024;
+  config.ssd.enabled = false;
 
   UMBPClient client(config);
 
@@ -94,8 +94,8 @@ void test_batch_put_get() {
   std::cout << "test_batch_put_get... ";
 
   UMBPConfig config;
-  config.dram_capacity_bytes = 1 * 1024 * 1024;
-  config.ssd_enabled = false;
+  config.dram.capacity_bytes = 1 * 1024 * 1024;
+  config.ssd.enabled = false;
 
   UMBPClient client(config);
 
@@ -143,8 +143,8 @@ void test_clear() {
   std::cout << "test_clear... ";
 
   UMBPConfig config;
-  config.dram_capacity_bytes = 1 * 1024 * 1024;
-  config.ssd_enabled = false;
+  config.dram.capacity_bytes = 1 * 1024 * 1024;
+  config.ssd.enabled = false;
 
   UMBPClient client(config);
 
@@ -165,8 +165,8 @@ void test_put_from_ptr_get_into_ptr() {
   std::cout << "test_put_from_ptr_get_into_ptr... ";
 
   UMBPConfig config;
-  config.dram_capacity_bytes = 1 * 1024 * 1024;
-  config.ssd_enabled = false;
+  config.dram.capacity_bytes = 1 * 1024 * 1024;
+  config.ssd.enabled = false;
 
   UMBPClient client(config);
 
@@ -186,10 +186,10 @@ void test_dram_full_demote_with_index() {
   std::cout << "test_dram_full_demote_with_index... ";
 
   UMBPConfig config;
-  config.dram_capacity_bytes = 1024;  // 1 KB
-  config.ssd_enabled = true;
-  config.ssd_storage_dir = "/tmp/umbp_test_client_demote";
-  config.ssd_capacity_bytes = 10 * 1024 * 1024;
+  config.dram.capacity_bytes = 1024;  // 1 KB
+  config.ssd.enabled = true;
+  config.ssd.storage_dir = "/tmp/umbp_test_client_demote";
+  config.ssd.capacity_bytes = 10 * 1024 * 1024;
 
   UMBPClient client(config);
 

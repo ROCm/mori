@@ -19,29 +19,32 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "umbp/storage/tier_backend.h"
+#pragma once
 
-bool TierBackend::WriteFromPtr(const std::string& key, uintptr_t src_ptr, size_t size) {
-  return Write(key, reinterpret_cast<const void*>(src_ptr), size);
-}
+#include <cstddef>
+#include <cstdint>
+#include <string>
 
-std::vector<char> TierBackend::Read(const std::string& key) { return {}; }
+namespace segment {
 
-TierCapabilities TierBackend::Capabilities() const { return {}; }
+constexpr uint32_t kRecordMagic = 0x554D4250;  // "UMBP"
+constexpr uint16_t kRecordVersion = 1;
+constexpr uint16_t kFlagCommitted = 1;
 
-const void* TierBackend::ReadPtr(const std::string& key, size_t* out_size) { return nullptr; }
+struct RecordHeader {
+  uint32_t magic = 0;
+  uint16_t version = 1;
+  uint16_t flags = 0;
+  uint32_t key_len = 0;
+  uint32_t value_size = 0;
+  uint32_t crc32 = 0;
+  uint32_t reserved = 0;
+  uint64_t generation = 0;
+};
+static_assert(sizeof(RecordHeader) == 32, "unexpected padding in RecordHeader");
 
-bool TierBackend::WriteBatch(const std::vector<std::string>& keys,
-                             const std::vector<const void*>& data_ptrs,
-                             const std::vector<size_t>& sizes) {
-  return false;
-}
+uint32_t CrcUpdate(const void* data, size_t size, uint32_t crc = 0xFFFFFFFFu);
+uint32_t ComputeRecordCrc32(const std::string& key, const void* value, size_t value_size);
+std::string BuildFileName(uint64_t segment_id);
 
-std::string TierBackend::GetLRUKey() const { return ""; }
-
-std::vector<std::string> TierBackend::GetLRUCandidates(size_t max_candidates) const {
-  if (max_candidates == 0) max_candidates = 1;
-  std::string lru = GetLRUKey();
-  if (lru.empty()) return {};
-  return {lru};
-}
+}  // namespace segment

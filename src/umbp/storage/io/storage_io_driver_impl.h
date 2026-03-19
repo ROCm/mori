@@ -19,29 +19,12 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "umbp/storage/tier_backend.h"
+#pragma once
 
-bool TierBackend::WriteFromPtr(const std::string& key, uintptr_t src_ptr, size_t size) {
-  return Write(key, reinterpret_cast<const void*>(src_ptr), size);
-}
+#include <cstdint>
+#include <memory>
 
-std::vector<char> TierBackend::Read(const std::string& key) { return {}; }
+#include "umbp/storage/io/storage_io_driver.h"
 
-TierCapabilities TierBackend::Capabilities() const { return {}; }
-
-const void* TierBackend::ReadPtr(const std::string& key, size_t* out_size) { return nullptr; }
-
-bool TierBackend::WriteBatch(const std::vector<std::string>& keys,
-                             const std::vector<const void*>& data_ptrs,
-                             const std::vector<size_t>& sizes) {
-  return false;
-}
-
-std::string TierBackend::GetLRUKey() const { return ""; }
-
-std::vector<std::string> TierBackend::GetLRUCandidates(size_t max_candidates) const {
-  if (max_candidates == 0) max_candidates = 1;
-  std::string lru = GetLRUKey();
-  if (lru.empty()) return {};
-  return {lru};
-}
+std::unique_ptr<StorageIoDriver> CreatePosixStorageIoDriver();
+std::unique_ptr<StorageIoDriver> CreateIoUringStorageIoDriver(uint32_t queue_depth);

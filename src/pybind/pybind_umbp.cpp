@@ -50,31 +50,56 @@ void RegisterMoriUmbp(py::module_& m) {
       .value("Relaxed", UMBPDurabilityMode::Relaxed)
       .export_values();
 
+  py::class_<UMBPDramConfig>(m, "UMBPDramConfig")
+      .def(py::init<>())
+      .def_readwrite("capacity_bytes", &UMBPDramConfig::capacity_bytes)
+      .def_readwrite("use_shared_memory", &UMBPDramConfig::use_shared_memory)
+      .def_readwrite("shm_name", &UMBPDramConfig::shm_name)
+      .def_readwrite("high_watermark", &UMBPDramConfig::high_watermark)
+      .def_readwrite("low_watermark", &UMBPDramConfig::low_watermark);
+
+  py::class_<UMBPIoConfig>(m, "UMBPIoConfig")
+      .def(py::init<>())
+      .def_readwrite("backend", &UMBPIoConfig::backend)
+      .def_readwrite("queue_depth", &UMBPIoConfig::queue_depth);
+
+  py::class_<UMBPDurabilityConfig>(m, "UMBPDurabilityConfig")
+      .def(py::init<>())
+      .def_readwrite("mode", &UMBPDurabilityConfig::mode)
+      .def_readwrite("enable_background_gc", &UMBPDurabilityConfig::enable_background_gc);
+
+  py::class_<UMBPSsdConfig>(m, "UMBPSsdConfig")
+      .def(py::init<>())
+      .def_readwrite("enabled", &UMBPSsdConfig::enabled)
+      .def_readwrite("storage_dir", &UMBPSsdConfig::storage_dir)
+      .def_readwrite("capacity_bytes", &UMBPSsdConfig::capacity_bytes)
+      .def_readwrite("layout_mode", &UMBPSsdConfig::layout_mode)
+      .def_readwrite("segment_size_bytes", &UMBPSsdConfig::segment_size_bytes)
+      .def_readwrite("io", &UMBPSsdConfig::io)
+      .def_readwrite("durability", &UMBPSsdConfig::durability);
+
+  py::class_<UMBPEvictionConfig>(m, "UMBPEvictionConfig")
+      .def(py::init<>())
+      .def_readwrite("policy", &UMBPEvictionConfig::policy)
+      .def_readwrite("candidate_window", &UMBPEvictionConfig::candidate_window)
+      .def_readwrite("auto_promote_on_read", &UMBPEvictionConfig::auto_promote_on_read);
+
+  py::class_<UMBPCopyPipelineConfig>(m, "UMBPCopyPipelineConfig")
+      .def(py::init<>())
+      .def_readwrite("async_enabled", &UMBPCopyPipelineConfig::async_enabled)
+      .def_readwrite("queue_depth", &UMBPCopyPipelineConfig::queue_depth)
+      .def_readwrite("worker_threads", &UMBPCopyPipelineConfig::worker_threads)
+      .def_readwrite("batch_max_ops", &UMBPCopyPipelineConfig::batch_max_ops);
+
   py::class_<UMBPConfig>(m, "UMBPConfig")
       .def(py::init<>())
-      .def_readwrite("dram_capacity_bytes", &UMBPConfig::dram_capacity_bytes)
-      .def_readwrite("ssd_enabled", &UMBPConfig::ssd_enabled)
-      .def_readwrite("ssd_storage_dir", &UMBPConfig::ssd_storage_dir)
-      .def_readwrite("ssd_capacity_bytes", &UMBPConfig::ssd_capacity_bytes)
-      .def_readwrite("ssd_io_backend", &UMBPConfig::ssd_io_backend)
-      .def_readwrite("ssd_durability_mode", &UMBPConfig::ssd_durability_mode)
-      .def_readwrite("ssd_segment_size_bytes", &UMBPConfig::ssd_segment_size_bytes)
-      .def_readwrite("ssd_batch_max_ops", &UMBPConfig::ssd_batch_max_ops)
-      .def_readwrite("ssd_queue_depth", &UMBPConfig::ssd_queue_depth)
-      .def_readwrite("ssd_writer_threads", &UMBPConfig::ssd_writer_threads)
-      .def_readwrite("ssd_enable_background_gc", &UMBPConfig::ssd_enable_background_gc)
-      .def_readwrite("eviction_policy", &UMBPConfig::eviction_policy)
-      .def_readwrite("auto_promote_on_read", &UMBPConfig::auto_promote_on_read)
-      .def_readwrite("use_shared_memory", &UMBPConfig::use_shared_memory)
-      .def_readwrite("shm_name", &UMBPConfig::shm_name)
-      .def_readwrite("dram_high_watermark", &UMBPConfig::dram_high_watermark)
-      .def_readwrite("dram_low_watermark", &UMBPConfig::dram_low_watermark)
+      .def_readwrite("dram", &UMBPConfig::dram)
+      .def_readwrite("ssd", &UMBPConfig::ssd)
+      .def_readwrite("eviction", &UMBPConfig::eviction)
+      .def_readwrite("copy_pipeline", &UMBPConfig::copy_pipeline)
       .def_readwrite("role", &UMBPConfig::role)
       .def_readwrite("follower_mode", &UMBPConfig::follower_mode)
-      .def_readwrite("force_ssd_copy_on_write", &UMBPConfig::force_ssd_copy_on_write)
-      .def_readwrite("copy_to_ssd_async", &UMBPConfig::copy_to_ssd_async)
-      .def_readwrite("copy_to_ssd_queue_depth", &UMBPConfig::copy_to_ssd_queue_depth)
-      .def_readwrite("eviction_candidate_window", &UMBPConfig::eviction_candidate_window);
+      .def_readwrite("force_ssd_copy_on_write", &UMBPConfig::force_ssd_copy_on_write);
 
   py::class_<UMBPClient>(m, "UMBPClient")
       .def(py::init<const UMBPConfig&>(), py::arg("config") = UMBPConfig{})

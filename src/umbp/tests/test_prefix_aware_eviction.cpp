@@ -47,10 +47,10 @@ static std::string FakeHash(int index) {
 
 static UMBPConfig MakePrefixAwareConfig(size_t dram_bytes, size_t window = 16) {
   UMBPConfig cfg;
-  cfg.dram_capacity_bytes = dram_bytes;
-  cfg.ssd_enabled = false;
-  cfg.eviction_policy = "prefix_aware_lru";
-  cfg.eviction_candidate_window = window;
+  cfg.dram.capacity_bytes = dram_bytes;
+  cfg.ssd.enabled = false;
+  cfg.eviction.policy = "prefix_aware_lru";
+  cfg.eviction.candidate_window = window;
   return cfg;
 }
 
@@ -297,7 +297,7 @@ void test_concurrent_depth_map_access() {
   std::cout << "test_concurrent_depth_map_access... ";
 
   UMBPConfig cfg = MakePrefixAwareConfig(256 * 1024);  // 256 KB
-  cfg.eviction_policy = "prefix_aware_lru";
+  cfg.eviction.policy = "prefix_aware_lru";
   LocalStorageManager mgr(cfg);
 
   constexpr int kThreads = 4;
@@ -335,10 +335,10 @@ void test_umbp_client_batch_put_with_depth() {
   std::cout << "test_umbp_client_batch_put_with_depth... ";
 
   UMBPConfig cfg;
-  cfg.dram_capacity_bytes = 4 * 1024;
-  cfg.ssd_enabled = false;
-  cfg.eviction_policy = "prefix_aware_lru";
-  cfg.eviction_candidate_window = 16;
+  cfg.dram.capacity_bytes = 4 * 1024;
+  cfg.ssd.enabled = false;
+  cfg.eviction.policy = "prefix_aware_lru";
+  cfg.eviction.candidate_window = 16;
 
   UMBPClient client(cfg);
 
@@ -373,12 +373,12 @@ void test_ssd_prefix_aware_index_sync() {
   std::cout << "test_ssd_prefix_aware_index_sync... ";
 
   UMBPConfig cfg;
-  cfg.dram_capacity_bytes = 4 * 1024 * 1024;  // large DRAM — no DRAM pressure
-  cfg.ssd_enabled = true;
-  cfg.ssd_storage_dir = "/tmp/umbp_test_prefix_ssd";
-  cfg.ssd_capacity_bytes = 1024;  // tiny SSD: 1 KB
-  cfg.eviction_policy = "prefix_aware_lru";
-  cfg.eviction_candidate_window = 16;
+  cfg.dram.capacity_bytes = 4 * 1024 * 1024;  // large DRAM — no DRAM pressure
+  cfg.ssd.enabled = true;
+  cfg.ssd.storage_dir = "/tmp/umbp_test_prefix_ssd";
+  cfg.ssd.capacity_bytes = 1024;  // tiny SSD: 1 KB
+  cfg.eviction.policy = "prefix_aware_lru";
+  cfg.eviction.candidate_window = 16;
 
   BlockIndexClient index;
   LocalStorageManager mgr(cfg, &index);
@@ -416,12 +416,12 @@ void test_follower_no_ssd_write() {
   std::cout << "test_follower_no_ssd_write... ";
 
   UMBPConfig cfg;
-  cfg.dram_capacity_bytes = 1 * 1024 * 1024;
-  cfg.ssd_enabled = true;
-  cfg.ssd_storage_dir = "/tmp/umbp_test_prefix_follower";
-  cfg.ssd_capacity_bytes = 32 * 1024 * 1024;
-  cfg.eviction_policy = "prefix_aware_lru";
-  cfg.eviction_candidate_window = 16;
+  cfg.dram.capacity_bytes = 1 * 1024 * 1024;
+  cfg.ssd.enabled = true;
+  cfg.ssd.storage_dir = "/tmp/umbp_test_prefix_follower";
+  cfg.ssd.capacity_bytes = 32 * 1024 * 1024;
+  cfg.eviction.policy = "prefix_aware_lru";
+  cfg.eviction.candidate_window = 16;
   cfg.role = UMBPRole::SharedSSDFollower;
 
   LocalStorageManager mgr(cfg);
