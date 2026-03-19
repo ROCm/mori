@@ -22,6 +22,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdlib>
 #include <string>
 
 enum class UMBPRole : int {
@@ -50,6 +51,14 @@ struct UMBPConfig {
   double dram_high_watermark = 0.9;
   double dram_low_watermark = 0.7;
 
+  // SPDK SSD tier configuration (only used when ssd_backend == "spdk")
+  std::string ssd_backend = "posix";       // "posix" or "spdk"
+  std::string spdk_bdev_name;              // e.g. "Malloc0" or "NVMe0n1"
+  std::string spdk_reactor_mask = "0x1";   // CPU core mask for SPDK reactors
+  int spdk_mem_size_mb = 256;              // DPDK hugepage limit (MB)
+  std::string spdk_nvme_pci_addr;          // PCI BDF, e.g. "0000:47:00.0"
+  std::string spdk_nvme_ctrl_name = "NVMe0";
+
   // Role is the source of truth for runtime behavior.
   UMBPRole role = UMBPRole::Standalone;
 
@@ -69,5 +78,42 @@ struct UMBPConfig {
       return UMBPRole::SharedSSDLeader;
     }
     return UMBPRole::Standalone;
+  }
+
+  static UMBPConfig FromEnvironment() {
+    UMBPConfig cfg;
+    auto getenv_str = [](const char* name, const std::string& def) -> std::string {
+      const char* v = std::getenv(name);
+      return v ? v : def;
+    };
+    auto getenv_size = [](const char* name, size_t def) -> size_t {
+      const char* v = std::getenv(name);
+      return v ? static_cast<size_t>(std::stoull(v)) : def;
+    };
+    auto getenv_int = [](const char* name, int def) -> int {
+      const char* v = std::getenv(name);
+      return v ? std::atoi(v) : def;
+    };
+    auto getenv_double = [](const char* name, double def) -> double {
+      const char* v = std::getenv(name);
+      return v ? std::atof(v) : def;
+    };
+
+    cfg.dram_capacity_bytes = getenv_size("UMBP_DRAM_CAPACITY", cfg.dram_capacity_bytes);
+    cfg.ssd_enabled = getenv_int("UMBP_SSD_ENABLED", cfg.ssd_enabled ? 1 : 0) != 0;
+    cfg.ssd_storage_dir = getenv_str("UMBP_SSD_DIR", cfg.ssd_storage_dir);
+    cfg.ssd_capacity_bytes = getenv_size("UMBP_SSD_CAPACITY", cfg.ssd_capacity_bytes);
+    cfg.eviction_policy = getenv_str("UMBP_EVICTION_POLICY", cfg.eviction_policy);
+    cfg.dram_high_watermark = getenv_double("UMBP_DRAM_HIGH_WM", cfg.dram_high_watermark);
+    cfg.dram_low_watermark = getenv_double("UMBP_DRAM_LOW_WM", cfg.dram_low_watermark);
+
+    cfg.ssd_backend = getenv_str("UMBP_SSD_BACKEND", cfg.ssd_backend);
+    cfg.spdk_bdev_name = getenv_str("UMBP_SPDK_BDEV", cfg.spdk_bdev_name);
+    cfg.spdk_reactor_mask = getenv_str("UMBP_SPDK_REACTOR_MASK", cfg.spdk_reactor_mask);
+    cfg.spdk_mem_size_mb = getenv_int("UMBP_SPDK_MEM_MB", cfg.spdk_mem_size_mb);
+    cfg.spdk_nvme_pci_addr = getenv_str("UMBP_SPDK_NVME_PCI", cfg.spdk_nvme_pci_addr);
+    cfg.spdk_nvme_ctrl_name = getenv_str("UMBP_SPDK_NVME_CTRL", cfg.spdk_nvme_ctrl_name);
+
+    return cfg;
   }
 };

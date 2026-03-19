@@ -26,6 +26,9 @@
 
 #include "umbp/storage/dram_tier.h"
 #include "umbp/storage/ssd_tier.h"
+#ifdef USE_SPDK
+#include "umbp/storage/spdk_ssd_tier.h"
+#endif
 
 // ---------------------------------------------------------------------------
 // ExtractBaseHash
@@ -212,13 +215,31 @@ LocalStorageManager::LocalStorageManager(const UMBPConfig& config, BlockIndexCli
 
   // SSD tier is optional (slower)
   if (config_.ssd_enabled) {
-    SSDAccessMode ssd_access_mode = SSDAccessMode::ReadWrite;
-    if (role_ == UMBPRole::SharedSSDFollower) {
-      ssd_access_mode = SSDAccessMode::ReadOnlyShared;
+    std::unique_ptr<TierBackend> ssd_backend;
+    if (config_.ssd_backend == "spdk" && role_ != UMBPRole::SharedSSDFollower) {
+#ifdef USE_SPDK
+      auto spdk_tier = std::make_unique<SpdkSsdTier>(config_);
+      if (spdk_tier->IsValid()) {
+        ssd_backend = std::move(spdk_tier);
+      } else {
+        fprintf(stderr, "[UMBP WARN] SpdkSsdTier init failed, falling back to POSIX SSD\n");
+      }
+#else
+      fprintf(stderr,
+              "[UMBP WARN] UMBP_SSD_BACKEND=spdk requested, but this build was compiled "
+              "without SPDK support (SPDK not found at build time). Falling back to POSIX SSD.\n"
+              "  To enable SPDK: install SPDK with pkg-config, then rebuild.\n");
+#endif
     }
-    tiers_.push_back({StorageTier::LOCAL_SSD,
-                      std::make_unique<SSDTier>(config_.ssd_storage_dir, config_.ssd_capacity_bytes,
-                                                ssd_access_mode)});
+    if (!ssd_backend) {
+      SSDAccessMode ssd_access_mode = SSDAccessMode::ReadWrite;
+      if (role_ == UMBPRole::SharedSSDFollower) {
+        ssd_access_mode = SSDAccessMode::ReadOnlyShared;
+      }
+      ssd_backend = std::make_unique<SSDTier>(
+          config_.ssd_storage_dir, config_.ssd_capacity_bytes, ssd_access_mode);
+    }
+    tiers_.push_back({StorageTier::LOCAL_SSD, std::move(ssd_backend)});
   }
 }
 
@@ -552,4 +573,34 @@ void LocalStorageManager::Clear() {
   std::unique_lock<std::shared_mutex> lock(depth_mu_);
   depth_map_.clear();
   group_map_.clear();
+}
+
+std::vector<bool> LocalStorageManager::BatchWrite(
+    const std::vector<std::string>& keys,
+    const std::vector<const void*>& data_ptrs,
+    const std::vector<size_t>& sizes,
+    StorageTier tier) {
+  TierBackend* target = GetTier(tier);
+  if (!target) return std::vector<bool>(keys.size(), false);
+
+  auto results = target->BatchWrite(keys, data_ptrs, sizes);
+
+  // Fallback: retry failed items one-by-one with eviction support
+  for (size_t i = 0; i < results.size(); ++i) {
+    if (!results[i]) {
+      results[i] = Write(keys[i], data_ptrs[i], sizes[i], tier);
+    }
+  }
+  return results;
+}
+
+std::vector<bool> LocalStorageManager::BatchReadIntoPtr(
+    const std::vector<std::string>& keys,
+    const std::vector<uintptr_t>& dst_ptrs,
+    const std::vector<size_t>& sizes) {
+  std::vector<bool> results(keys.size(), false);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    results[i] = ReadIntoPtr(keys[i], dst_ptrs[i], sizes[i]);
+  }
+  return results;
 }

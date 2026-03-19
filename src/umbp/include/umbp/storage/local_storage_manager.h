@@ -58,6 +58,15 @@ class LocalStorageManager {
   bool CopyToSSD(const std::string& key);  // Non-destructive DRAM→SSD copy
   void Clear();
 
+  // Batch operations — delegates to tier backend's batch methods.
+  std::vector<bool> BatchWrite(const std::vector<std::string>& keys,
+                               const std::vector<const void*>& data_ptrs,
+                               const std::vector<size_t>& sizes,
+                               StorageTier tier = StorageTier::CPU_DRAM);
+  std::vector<bool> BatchReadIntoPtr(const std::vector<std::string>& keys,
+                                     const std::vector<uintptr_t>& dst_ptrs,
+                                     const std::vector<size_t>& sizes);
+
   // Access tiers generically
   TierBackend* GetTier(StorageTier tier);
   const TierBackend* GetTier(StorageTier tier) const;

@@ -125,9 +125,42 @@ bool UMBPClient::Remove(const std::string& key) {
 std::vector<bool> UMBPClient::BatchPutFromPtr(const std::vector<std::string>& keys,
                                               const std::vector<uintptr_t>& ptrs,
                                               const std::vector<size_t>& sizes) {
-  std::vector<bool> results(keys.size(), false);
-  for (size_t i = 0; i < keys.size(); ++i) {
-    results[i] = PutFromPtr(keys[i], ptrs[i], sizes[i]);
+  const size_t count = keys.size();
+  std::vector<bool> results(count, false);
+  if (role_ == UMBPRole::SharedSSDFollower) return results;
+
+  // Phase 1: Dedup check — mark existing keys as success
+  std::vector<std::string> new_keys;
+  std::vector<const void*> new_ptrs;
+  std::vector<size_t> new_sizes;
+  std::vector<size_t> new_indices;
+
+  for (size_t i = 0; i < count; ++i) {
+    if (index_.MayExist(keys[i])) {
+      results[i] = true;
+    } else {
+      new_keys.push_back(keys[i]);
+      new_ptrs.push_back(reinterpret_cast<const void*>(ptrs[i]));
+      new_sizes.push_back(sizes[i]);
+      new_indices.push_back(i);
+    }
+  }
+
+  if (new_keys.empty()) return results;
+
+  // Phase 2: Batch write to DRAM
+  auto write_results = storage_.BatchWrite(new_keys, new_ptrs, new_sizes);
+
+  // Phase 3: Update index + optional SSD copy
+  for (size_t j = 0; j < new_keys.size(); ++j) {
+    size_t orig_i = new_indices[j];
+    if (write_results[j]) {
+      results[orig_i] = true;
+      index_.Insert(new_keys[j], {StorageTier::CPU_DRAM, 0, new_sizes[j]});
+      if (role_ == UMBPRole::SharedSSDLeader) {
+        storage_.CopyToSSD(new_keys[j]);
+      }
+    }
   }
   return results;
 }
