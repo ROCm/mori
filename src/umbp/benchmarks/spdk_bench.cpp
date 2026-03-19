@@ -73,7 +73,14 @@ static std::string BuildCoreMask(int num_cores) {
 static umbp::SpdkEnvConfig MakeEnvConfig(int cores) {
     umbp::SpdkEnvConfig cfg;
     const char* bdev = std::getenv("UMBP_SPDK_BDEV");
-    if (bdev) {
+    const char* pci = std::getenv("UMBP_SPDK_NVME_PCI");
+    const char* ctrl = std::getenv("UMBP_SPDK_NVME_CTRL");
+
+    if (pci && pci[0]) {
+        cfg.nvme_pci_addr = pci;
+        if (ctrl) cfg.nvme_ctrl_name = ctrl;
+        cfg.bdev_name = bdev ? bdev : (cfg.nvme_ctrl_name + "n1");
+    } else if (bdev) {
         cfg.bdev_name = bdev;
     } else {
         cfg.use_malloc_bdev = true;
@@ -85,10 +92,6 @@ static umbp::SpdkEnvConfig MakeEnvConfig(int cores) {
     cfg.reactor_mask = mask ? mask : BuildCoreMask(cores);
     const char* mem = std::getenv("UMBP_SPDK_MEM_MB");
     cfg.mem_size_mb = mem ? std::atoi(mem) : 256;
-    const char* pci = std::getenv("UMBP_SPDK_NVME_PCI");
-    if (pci) cfg.nvme_pci_addr = pci;
-    const char* ctrl = std::getenv("UMBP_SPDK_NVME_CTRL");
-    if (ctrl) cfg.nvme_ctrl_name = ctrl;
     return cfg;
 }
 
