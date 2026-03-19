@@ -63,6 +63,8 @@ class SpdkSsdTier : public TierBackend {
 
     void TouchLRU(const std::string& key);
     void RemoveLRU(const std::string& key);
+    void AllocDmaRing(size_t buf_size);
+    void FreeDmaRing();
 
     bool initialized_ = false;
     std::shared_ptr<umbp::offset_allocator::OffsetAllocator> allocator_;
@@ -75,4 +77,10 @@ class SpdkSsdTier : public TierBackend {
     std::unordered_map<std::string, std::list<std::string>::iterator> lru_iter_;
 
     static constexpr int kMaxQueueDepth = 128;
+
+    // Pre-allocated DMA ring buffers to avoid per-batch pool alloc overhead
+    std::mutex dma_ring_mu_;
+    void** dma_ring_ = nullptr;
+    size_t dma_ring_buf_size_ = 0;
+    int dma_ring_count_ = 0;
 };

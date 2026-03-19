@@ -52,21 +52,48 @@ SpdkSsdTier::SpdkSsdTier(const UMBPConfig& config)
         return;
     }
 
-    int prewarm_count = std::min(kMaxQueueDepth, 256);
-    size_t prewarm_size = std::min(static_cast<size_t>(2ULL * 1024 * 1024),
-                                    capacity_ / 64);
-    prewarm_size = AlignUp(prewarm_size);
-    if (prewarm_size > 0 && prewarm_count > 0) {
-        env.DmaPoolPrewarm(prewarm_size, prewarm_count);
-    }
+    // Pre-allocate DMA ring buffers (2MB each, kMaxQueueDepth slots)
+    size_t ring_buf_size = 2ULL * 1024 * 1024;
+    AllocDmaRing(ring_buf_size);
 
     initialized_ = true;
-    UMBP_LOG_INFO("SpdkSsdTier: ready — capacity=%zuMB block_size=%u",
-                  capacity_ / (1024 * 1024), block_size_);
+    UMBP_LOG_INFO("SpdkSsdTier: ready — capacity=%zuMB block_size=%u dma_ring=%d×%zuKB",
+                  capacity_ / (1024 * 1024), block_size_,
+                  dma_ring_count_, dma_ring_buf_size_ / 1024);
 }
 
 SpdkSsdTier::~SpdkSsdTier() {
     Clear();
+    FreeDmaRing();
+}
+
+void SpdkSsdTier::AllocDmaRing(size_t buf_size) {
+    auto& env = umbp::SpdkEnv::Instance();
+    if (!env.IsInitialized()) return;
+
+    dma_ring_buf_size_ = buf_size;
+    dma_ring_count_ = kMaxQueueDepth;
+    dma_ring_ = new void*[dma_ring_count_];
+
+    int got = env.DmaPoolAllocBatch(dma_ring_, dma_ring_buf_size_,
+                                     dma_ring_count_);
+    if (got < dma_ring_count_) {
+        UMBP_LOG_WARN("SpdkSsdTier: DMA ring partial %d/%d", got, dma_ring_count_);
+        for (int i = got; i < dma_ring_count_; ++i)
+            dma_ring_[i] = nullptr;
+        dma_ring_count_ = got;
+    }
+}
+
+void SpdkSsdTier::FreeDmaRing() {
+    if (!dma_ring_) return;
+    auto& env = umbp::SpdkEnv::Instance();
+    if (env.IsInitialized() && dma_ring_count_ > 0) {
+        env.DmaPoolFreeBatch(dma_ring_, dma_ring_buf_size_, dma_ring_count_);
+    }
+    delete[] dma_ring_;
+    dma_ring_ = nullptr;
+    dma_ring_count_ = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -229,17 +256,25 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
     const int pending_count = static_cast<int>(pending.size());
     const int qd = std::min(pending_count, kMaxQueueDepth);
 
-    // Find max aligned size to allocate uniform DMA buffers
     size_t max_aligned = 0;
     for (auto& p : pending)
         max_aligned = std::max(max_aligned, p.aligned_size);
 
-    auto dma_bufs = std::make_unique<void*[]>(qd);
-    int got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned, qd);
-    if (got < qd) {
-        UMBP_LOG_ERROR("SpdkSsdTier::BatchWrite: DMA alloc short %d/%d", got, qd);
-        for (int i = got; i < qd; ++i)
-            dma_bufs[i] = nullptr;
+    // Use pre-allocated DMA ring if buffers are large enough; else fallback
+    bool use_ring = (max_aligned <= dma_ring_buf_size_ && qd <= dma_ring_count_);
+    void** dma_bufs;
+    std::unique_ptr<void*[]> dma_fallback;
+    if (use_ring) {
+        dma_bufs = dma_ring_;
+    } else {
+        dma_fallback = std::make_unique<void*[]>(qd);
+        int got = env.DmaPoolAllocBatch(dma_fallback.get(), max_aligned, qd);
+        if (got < qd) {
+            UMBP_LOG_ERROR("SpdkSsdTier::BatchWrite: DMA alloc short %d/%d", got, qd);
+            for (int i = got; i < qd; ++i)
+                dma_fallback[i] = nullptr;
+        }
+        dma_bufs = dma_fallback.get();
     }
 
     auto reqs = std::make_unique<umbp::SpdkIoRequest[]>(qd);
@@ -248,7 +283,6 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
 
     int head = 0, tail = 0;
     while (tail < pending_count) {
-        // Fill the pipeline up to QD, accumulate batch for submission
         int batch_count = 0;
         while (head < pending_count && (head - tail) < qd) {
             int slot = head % qd;
@@ -257,24 +291,17 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
             auto& p = pending[head];
             int idx = p.idx;
 
-            // memcpy on calling thread
             std::memcpy(dma_bufs[slot], data_ptrs[idx], sizes[idx]);
             if (p.aligned_size > sizes[idx])
                 std::memset(static_cast<char*>(dma_bufs[slot]) + sizes[idx],
                             0, p.aligned_size - sizes[idx]);
 
             auto& req = reqs[slot];
+            req = {};
             req.op = umbp::SpdkIoRequest::WRITE;
             req.buf = dma_bufs[slot];
             req.offset = p.handle.address();
             req.nbytes = p.aligned_size;
-            req.src_data = nullptr;
-            req.src_iov = nullptr;
-            req.src_iovcnt = 0;
-            req.dst_iov = nullptr;
-            req.dst_iovcnt = 0;
-            req.completed.store(false, std::memory_order_release);
-            req.success = false;
 
             batch_ptrs[batch_count++] = &req;
             ++head;
@@ -288,7 +315,6 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
         if (batch_count > 0)
             env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
 
-        // Drain oldest completions
         while (tail < head) {
             int slot = tail % qd;
             if (!reqs[slot].completed.load(std::memory_order_acquire))
@@ -298,8 +324,8 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
         }
     }
 
-    // Return DMA buffers to pool
-    env.DmaPoolFreeBatch(dma_bufs.get(), max_aligned, qd);
+    if (!use_ring)
+        env.DmaPoolFreeBatch(dma_bufs, max_aligned, qd);
 
     // --- Phase 3: Update metadata (lock held) ---
     {
@@ -381,12 +407,20 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
     for (auto& ri : items)
         max_aligned = std::max(max_aligned, ri.aligned_size);
 
-    auto dma_bufs = std::make_unique<void*[]>(qd);
-    int got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned, qd);
-    if (got < qd) {
-        UMBP_LOG_ERROR("SpdkSsdTier::BatchRead: DMA alloc short %d/%d", got, qd);
-        for (int i = got; i < qd; ++i)
-            dma_bufs[i] = nullptr;
+    bool use_ring = (max_aligned <= dma_ring_buf_size_ && qd <= dma_ring_count_);
+    void** dma_bufs;
+    std::unique_ptr<void*[]> dma_fallback;
+    if (use_ring) {
+        dma_bufs = dma_ring_;
+    } else {
+        dma_fallback = std::make_unique<void*[]>(qd);
+        int got = env.DmaPoolAllocBatch(dma_fallback.get(), max_aligned, qd);
+        if (got < qd) {
+            UMBP_LOG_ERROR("SpdkSsdTier::BatchRead: DMA alloc short %d/%d", got, qd);
+            for (int i = got; i < qd; ++i)
+                dma_fallback[i] = nullptr;
+        }
+        dma_bufs = dma_fallback.get();
     }
 
     auto reqs = std::make_unique<umbp::SpdkIoRequest[]>(qd);
@@ -395,7 +429,6 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
 
     int head = 0, tail = 0;
     while (tail < item_count) {
-        // Fill pipeline, accumulate batch for submission
         int batch_count = 0;
         while (head < item_count && (head - tail) < qd) {
             int slot = head % qd;
@@ -403,17 +436,11 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
 
             auto& ri = items[head];
             auto& req = reqs[slot];
+            req = {};
             req.op = umbp::SpdkIoRequest::READ;
             req.buf = dma_bufs[slot];
             req.offset = ri.offset;
             req.nbytes = ri.aligned_size;
-            req.src_data = nullptr;
-            req.src_iov = nullptr;
-            req.src_iovcnt = 0;
-            req.dst_iov = nullptr;
-            req.dst_iovcnt = 0;
-            req.completed.store(false, std::memory_order_release);
-            req.success = false;
 
             batch_ptrs[batch_count++] = &req;
             ++head;
@@ -427,7 +454,6 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
         if (batch_count > 0)
             env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
 
-        // Drain oldest: copy from DMA to user buffer on calling thread
         while (tail < head) {
             int slot = tail % qd;
             if (!reqs[slot].completed.load(std::memory_order_acquire))
@@ -443,7 +469,8 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
         }
     }
 
-    env.DmaPoolFreeBatch(dma_bufs.get(), max_aligned, qd);
+    if (!use_ring)
+        env.DmaPoolFreeBatch(dma_bufs, max_aligned, qd);
 
     // --- Phase 3: Update LRU (lock held) ---
     {
