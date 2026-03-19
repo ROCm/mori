@@ -363,8 +363,7 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
 // BatchReadIntoPtr — deep-queue NVMe read pipeline
 //
 // Phase 1 (lock):   look up entries, collect offsets and sizes
-// Phase 2 (unlock): submit reads + drain + memcpy to user on calling thread
-// Phase 3 (lock):   touch LRU for accessed keys
+// Phase 2 (unlock): submit reads + drain + memcpy DMA→user (pipelined)
 // ===========================================================================
 std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
     const std::vector<std::string>& keys,
@@ -435,6 +434,8 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
 
     int head = 0, tail = 0;
     while (tail < item_count) {
+        // Submit all available items at once (no early flush for reads —
+        // no pre-submit memcpy needed, and fewer cross-thread messages)
         int batch_count = 0;
         while (head < item_count && (head - tail) < qd) {
             int slot = head % qd;
@@ -456,20 +457,24 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
 
             batch_ptrs[batch_count++] = &req;
             ++head;
-
-            if (batch_count >= 8) {
-                env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
-                batch_count = 0;
-            }
         }
 
         if (batch_count > 0)
             env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
 
+        // Drain: memcpy DMA→user overlaps with outstanding NVMe reads.
+        // Spin-wait on current tail — NVMe sequential completions are in-order,
+        // and spinning keeps the pipeline tight (no re-entering submit loop).
+        // For count > QD, break after draining at least one slot so submit
+        // loop can refill.
+        bool drained_any = false;
         while (tail < head) {
             int slot = tail % qd;
-            if (!reqs[slot].completed.load(std::memory_order_acquire))
-                break;
+            if (!reqs[slot].completed.load(std::memory_order_acquire)) {
+                if (head < item_count && drained_any) break;
+                CPU_PAUSE();
+                continue;
+            }
 
             if (reqs[slot].success) {
                 auto& ri = items[tail];
@@ -478,22 +483,17 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
                 io_ok[tail] = true;
             }
             ++tail;
+            drained_any = true;
         }
     }
 
     if (!use_ring)
         env.DmaPoolFreeBatch(dma_bufs, max_aligned, qd);
 
-    // --- Phase 3: Update LRU (lock held) ---
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (int j = 0; j < item_count; ++j) {
-            int idx = items[j].idx;
-            if (io_ok[j]) {
-                TouchLRU(keys[idx]);
-                results[idx] = true;
-            }
-        }
+    // Phase 3: mark results (LRU update skipped for batch reads —
+    // upper layer (LocalStorageManager) handles LRU/promotion policy)
+    for (int j = 0; j < item_count; ++j) {
+        if (io_ok[j]) results[items[j].idx] = true;
     }
 
     return results;
