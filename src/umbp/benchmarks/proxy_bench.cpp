@@ -23,39 +23,42 @@ static double NowSec() {
     return std::chrono::duration<double>(tp.time_since_epoch()).count();
 }
 
-static void RunBatch(SpdkProxyTier& tier, const char* label,
+static void RunBatch(SpdkProxyTier& tier, uint32_t rank_id,
                      size_t value_size, int count, int iterations) {
-    // Prepare data
-    std::vector<std::string> keys(count);
+    std::string prefix = "r" + std::to_string(rank_id) + "_pb_" +
+                         std::to_string(value_size) + "_";
+
     std::vector<std::vector<char>> datas(count);
     std::vector<const void*> ptrs(count);
     std::vector<size_t> sizes(count, value_size);
 
     for (int i = 0; i < count; ++i) {
-        keys[i] = "pbench_" + std::to_string(value_size) + "_" + std::to_string(i);
         datas[i].resize(value_size, static_cast<char>((i + 1) & 0xFF));
         ptrs[i] = datas[i].data();
     }
 
     double total_bytes = static_cast<double>(value_size) * count;
 
-    // Write benchmark
+    // Write benchmark — unique keys per iteration to avoid dedup
     double best_write = 0;
     for (int iter = 0; iter < iterations; ++iter) {
-        tier.Clear();
+        std::vector<std::string> wkeys(count);
+        for (int i = 0; i < count; ++i)
+            wkeys[i] = prefix + "w" + std::to_string(iter) + "_" + std::to_string(i);
         double t0 = NowSec();
-        auto wr = tier.BatchWrite(keys, ptrs, sizes);
+        auto wr = tier.BatchWrite(wkeys, ptrs, sizes);
         double t1 = NowSec();
+        int ok = 0;
+        for (auto b : wr) ok += b;
         double mbps = (total_bytes / (1024.0 * 1024.0)) / (t1 - t0);
-        if (mbps > best_write) best_write = mbps;
+        if (ok == count && mbps > best_write) best_write = mbps;
     }
 
-    // Read benchmark (data already written from last write iteration)
-    // Re-write to ensure data is present
-    {
-        tier.Clear();
-        tier.BatchWrite(keys, ptrs, sizes);
-    }
+    // Write read-benchmark keys (fixed set, no iter suffix)
+    std::vector<std::string> rkeys(count);
+    for (int i = 0; i < count; ++i)
+        rkeys[i] = prefix + "r_" + std::to_string(i);
+    tier.BatchWrite(rkeys, ptrs, sizes);
 
     std::vector<std::vector<char>> read_bufs(count, std::vector<char>(value_size, 0));
     std::vector<uintptr_t> dst_ptrs(count);
@@ -63,23 +66,28 @@ static void RunBatch(SpdkProxyTier& tier, const char* label,
         dst_ptrs[i] = reinterpret_cast<uintptr_t>(read_bufs[i].data());
 
     double best_read = 0;
+    int best_read_ok = 0;
     for (int iter = 0; iter < iterations; ++iter) {
         for (auto& b : read_bufs) std::memset(b.data(), 0, b.size());
         double t0 = NowSec();
-        auto rr = tier.BatchReadIntoPtr(keys, dst_ptrs, sizes);
+        auto rr = tier.BatchReadIntoPtr(rkeys, dst_ptrs, sizes);
         double t1 = NowSec();
+        int ok = 0;
+        for (auto b : rr) ok += b;
         double mbps = (total_bytes / (1024.0 * 1024.0)) / (t1 - t0);
-        if (mbps > best_read) best_read = mbps;
+        if (mbps > best_read) { best_read = mbps; best_read_ok = ok; }
     }
 
-    // Size label
     char sz_label[16];
     if (value_size >= 1024 * 1024)
         snprintf(sz_label, sizeof(sz_label), "%zuMB", value_size / (1024 * 1024));
     else
         snprintf(sz_label, sizeof(sz_label), "%zuKB", value_size / 1024);
 
-    printf("  %8s  %6d  %10.0f  %10.0f\n", sz_label, count, best_write, best_read);
+    printf("  %8s  %6d  %10.0f  %10.0f", sz_label, count, best_write, best_read);
+    if (best_read_ok != count)
+        printf("  *** READ %d/%d", best_read_ok, count);
+    printf("\n");
 }
 
 int main() {
@@ -122,7 +130,7 @@ int main() {
     printf("  %8s  %6s  %10s  %10s\n", "ValSize", "Count", "Write MB/s", "Read MB/s");
 
     for (auto& s : specs) {
-        RunBatch(tier, "", s.size, s.count, iterations);
+        RunBatch(tier, cfg.spdk_proxy_rank_id, s.size, s.count, iterations);
     }
 
     printf("\n");
