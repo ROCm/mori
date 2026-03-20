@@ -39,10 +39,11 @@ using Clock = std::chrono::high_resolution_clock;
 // Config
 // ============================================================================
 struct BenchConfig {
-    int threads = 4;
+    int threads = 1;
     int iodepth = 128;
     int iterations = 3;
-    size_t total_bytes = 2ULL * 1024 * 1024 * 1024;
+    size_t total_bytes = 512ULL * 1024 * 1024;
+    size_t backend_keys = 2000;
 };
 
 // ============================================================================
@@ -311,9 +312,10 @@ int main(int argc, char** argv) {
     if (argc > 1) bench.threads = std::atoi(argv[1]);
     if (argc > 2) bench.iodepth = std::atoi(argv[2]);
     if (argc > 3) bench.iterations = std::atoi(argv[3]);
+    if (argc > 4) bench.backend_keys = std::atoi(argv[4]);
 
-    printf("SPDK Benchmark — threads=%d iodepth=%d iterations=%d\n",
-           bench.threads, bench.iodepth, bench.iterations);
+    printf("SPDK Benchmark — threads=%d iodepth=%d iterations=%d keys=%zu\n",
+           bench.threads, bench.iodepth, bench.iterations, bench.backend_keys);
 
     // ---- Initialize SPDK ----
     auto ecfg = MakeEnvConfig(2);
@@ -336,20 +338,38 @@ int main(int argc, char** argv) {
         PrintHeader("RAW SPDK SEQUENTIAL BANDWIDTH");
         printf("%12s %12s %12s\n", "ChunkSize", "Write MB/s", "Read MB/s");
 
-        size_t chunks[] = {4096, 16384, 65536, 262144, 524288,
-                           1048576, 2097152, 4194304};
+        size_t chunks[] = {
+            4096, 32 * 1024, 128 * 1024, 512 * 1024,
+            1024 * 1024, 2ULL * 1024 * 1024,
+            8ULL * 1024 * 1024, 16ULL * 1024 * 1024,
+            32ULL * 1024 * 1024, 64ULL * 1024 * 1024,
+            128ULL * 1024 * 1024, 256ULL * 1024 * 1024,
+            512ULL * 1024 * 1024};
+        uint64_t bdev_size = env.GetBdevSize();
         for (size_t chunk : chunks) {
+            size_t half_bdev = static_cast<size_t>(bdev_size / 2);
+            size_t min_for_threads =
+                std::min(chunk * static_cast<size_t>(bench.threads), half_bdev);
+            size_t effective_total =
+                std::max({bench.total_bytes, chunk * 2, min_for_threads});
+            effective_total = std::min(effective_total, half_bdev);
+
             std::vector<double> wbw, rbw;
             for (int iter = 0; iter < bench.iterations; ++iter) {
-                auto wr = BenchRawSpdk(chunk, bench.total_bytes, true,
+                auto wr = BenchRawSpdk(chunk, effective_total, true,
                                         bench.iodepth, bench.threads);
-                auto rd = BenchRawSpdk(chunk, bench.total_bytes, false,
+                auto rd = BenchRawSpdk(chunk, effective_total, false,
                                         bench.iodepth, bench.threads);
                 wbw.push_back(wr.BW_MBps());
                 rbw.push_back(rd.BW_MBps());
             }
-            printf("%10zuKB %10.0f %10.0f\n",
-                   chunk / 1024, TrimmedMean(wbw), TrimmedMean(rbw));
+            if (chunk >= 1024 * 1024) {
+                printf("%10zuMB %10.0f %10.0f\n",
+                       chunk / (1024 * 1024), TrimmedMean(wbw), TrimmedMean(rbw));
+            } else {
+                printf("%10zuKB %10.0f %10.0f\n",
+                       chunk / 1024, TrimmedMean(wbw), TrimmedMean(rbw));
+            }
         }
     }
 
@@ -373,29 +393,46 @@ int main(int argc, char** argv) {
             printf("%12s %8s %12s %12s\n",
                    "ValueSize", "Count", "Write MB/s", "Read MB/s");
 
-            struct TierTest { size_t value_size; int count; };
-            TierTest tests[] = {
-                {4096, 4096},
-                {16384, 2048},
-                {65536, 1024},
-                {262144, 512},
-                {524288, 256},
-                {1048576, 128},
-                {2097152, 64},
-            };
+            size_t value_sizes[] = {
+                4096, 32 * 1024, 128 * 1024, 512 * 1024,
+                1024 * 1024, 2ULL * 1024 * 1024,
+                8ULL * 1024 * 1024, 16ULL * 1024 * 1024,
+                32ULL * 1024 * 1024, 64ULL * 1024 * 1024,
+                128ULL * 1024 * 1024, 256ULL * 1024 * 1024,
+                512ULL * 1024 * 1024};
 
-            for (auto& t : tests) {
+            uint64_t bdev_cap = env.GetBdevSize();
+            constexpr size_t kMaxTotalData = 512ULL * 1024 * 1024;
+
+            for (size_t vsz : value_sizes) {
+                size_t effective_keys = bench.backend_keys;
+                if (vsz > 0) {
+                    size_t max_by_data = std::max<size_t>(2, kMaxTotalData / vsz);
+                    effective_keys = std::min(effective_keys, max_by_data);
+                }
+                size_t per_key_overhead = vsz + 4096 + 64;
+                size_t max_by_bdev = std::max<size_t>(4,
+                    static_cast<size_t>(bdev_cap / per_key_overhead / 2));
+                effective_keys = std::min(effective_keys, max_by_bdev);
+                int count = static_cast<int>(effective_keys);
+
                 std::vector<double> wbw, rbw;
                 for (int iter = 0; iter < bench.iterations; ++iter) {
                     tier.Clear();
-                    auto wr = BenchTierBatch(tier, t.value_size, t.count, true);
-                    auto rd = BenchTierBatch(tier, t.value_size, t.count, false);
+                    auto wr = BenchTierBatch(tier, vsz, count, true);
+                    auto rd = BenchTierBatch(tier, vsz, count, false);
                     wbw.push_back(wr.BW_MBps());
                     rbw.push_back(rd.BW_MBps());
                 }
-                printf("%10zuKB %8d %10.0f %10.0f\n",
-                       t.value_size / 1024, t.count,
-                       TrimmedMean(wbw), TrimmedMean(rbw));
+                if (vsz >= 1024 * 1024) {
+                    printf("%10zuMB %8d %10.0f %10.0f\n",
+                           vsz / (1024 * 1024), count,
+                           TrimmedMean(wbw), TrimmedMean(rbw));
+                } else {
+                    printf("%10zuKB %8d %10.0f %10.0f\n",
+                           vsz / 1024, count,
+                           TrimmedMean(wbw), TrimmedMean(rbw));
+                }
             }
         }
     }
@@ -410,63 +447,65 @@ int main(int argc, char** argv) {
         printf("%12s %8s %12s %12s\n",
                "ValueSize", "Count", "Write MB/s", "Read MB/s");
 
-        struct TierTest { size_t value_size; int count; };
-        TierTest tests[] = {
-            {4096, 4096},
-            {16384, 2048},
-            {65536, 1024},
-            {262144, 512},
-            {524288, 256},
-            {1048576, 128},
-            {2097152, 64},
-        };
+        size_t posix_sizes[] = {
+            4096, 32 * 1024, 128 * 1024, 512 * 1024,
+            1024 * 1024, 2ULL * 1024 * 1024};
+        constexpr size_t kPosixMaxTotal = 512ULL * 1024 * 1024;
 
-        for (auto& t : tests) {
+        for (size_t vsz : posix_sizes) {
+            size_t ek = std::min(bench.backend_keys,
+                                 std::max<size_t>(2, kPosixMaxTotal / vsz));
+            int count = static_cast<int>(ek);
+
             std::vector<double> wbw, rbw;
             for (int iter = 0; iter < bench.iterations; ++iter) {
                 SSDTier posix_tier(posix_dir, 8ULL * 1024 * 1024 * 1024);
 
-                std::vector<std::string> keys(t.count);
-                std::vector<std::vector<char>> bufs(t.count);
-                std::vector<const void*> wptrs(t.count);
-                std::vector<uintptr_t> rptrs(t.count);
-                std::vector<size_t> sizes(t.count, t.value_size);
+                std::vector<std::string> keys(count);
+                std::vector<std::vector<char>> bufs(count);
+                std::vector<const void*> wptrs(count);
+                std::vector<uintptr_t> rptrs(count);
+                std::vector<size_t> sizes(count, vsz);
 
-                for (int i = 0; i < t.count; ++i) {
+                for (int i = 0; i < count; ++i) {
                     keys[i] = "posix_" + std::to_string(i);
-                    bufs[i].resize(t.value_size);
-                    FillPattern(bufs[i].data(), t.value_size,
+                    bufs[i].resize(vsz);
+                    FillPattern(bufs[i].data(), vsz,
                                 static_cast<uint32_t>(i));
                     wptrs[i] = bufs[i].data();
                     rptrs[i] = reinterpret_cast<uintptr_t>(bufs[i].data());
                 }
 
-                // Write benchmark
                 auto t0 = Clock::now();
-                for (int i = 0; i < t.count; ++i)
+                for (int i = 0; i < count; ++i)
                     posix_tier.Write(keys[i], wptrs[i], sizes[i]);
                 double wsecs =
                     std::chrono::duration<double>(Clock::now() - t0).count();
-                double wb = static_cast<double>(t.count) * t.value_size /
+                double wb = static_cast<double>(count) * vsz /
                             wsecs / (1024.0 * 1024.0);
                 wbw.push_back(wb);
 
-                // Read benchmark
                 for (auto& b : bufs) std::memset(b.data(), 0, b.size());
                 auto t1 = Clock::now();
-                for (int i = 0; i < t.count; ++i)
+                for (int i = 0; i < count; ++i)
                     posix_tier.ReadIntoPtr(keys[i], rptrs[i], sizes[i]);
                 double rsecs =
                     std::chrono::duration<double>(Clock::now() - t1).count();
-                double rb = static_cast<double>(t.count) * t.value_size /
+                double rb = static_cast<double>(count) * vsz /
                             rsecs / (1024.0 * 1024.0);
                 rbw.push_back(rb);
 
                 posix_tier.Clear();
             }
-            printf("%10zuKB %8d %10.0f %10.0f\n",
-                   t.value_size / 1024, t.count,
-                   TrimmedMean(wbw), TrimmedMean(rbw));
+            if (vsz >= 1024 * 1024) {
+                printf("%10zuMB %8d %10.0f %10.0f\n",
+                       vsz / (1024 * 1024), count,
+                       TrimmedMean(wbw), TrimmedMean(rbw));
+            } else {
+                printf("%10zuKB %8d %10.0f %10.0f\n",
+                       vsz / 1024, count,
+                       TrimmedMean(wbw), TrimmedMean(rbw));
+            }
         }
 
         std::filesystem::remove_all(posix_dir);
