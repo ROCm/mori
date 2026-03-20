@@ -605,15 +605,10 @@ void SpdkEnv::DmaPoolPrewarm(size_t buf_size, int count, size_t align) {
 
 void SpdkEnv::DmaPoolDrain() {
     std::lock_guard<std::mutex> lk(dma_pool_mutex_);
-    size_t total_bytes = 0;
     for (auto &e : dma_pool_) {
-        total_bytes += e.size;
         spdk_dma_free(e.buf);
     }
-    size_t n = dma_pool_.size();
     dma_pool_.clear();
-    UMBP_LOG_WARN("SpdkEnv: DMA pool drained %zu buffers (%zuMB)",
-                  n, total_bytes / (1024*1024));
 }
 
 }  // namespace umbp
