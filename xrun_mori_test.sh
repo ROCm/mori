@@ -107,17 +107,19 @@ export XLA_FLAGS="--xla_gpu_enable_cublaslt=true \
            --xla_gpu_memory_limit_slop_factor=95 \
            --xla_gpu_autotune_gemm_rtol=0.01"
 
-NumProcs=1
+NumProcs=8
 TotalGpus=8
 
 #HIPLIB=/tf/clr/build/hipamd/lib/libamdhip64.so
 #export LD_LIBRARY_PATH=/usr/rocm/lib:/usr/local/lib/python3.12/dist-packages/torch/lib
 
 # this is go get rid of 'request to allocate mask for invalid number: Invalid argument'
-#export LD_PRELOAD=/lib/x86_64-linux-gnu/libnuma.so.1:$HIPLIB:/opt/rocm/lib/libroctracer64.so
+# export LD_PRELOAD=/tf/rccl/build/librccl.so
+#/lib/x86_64-linux-gnu/libnuma.so.1:$HIPLIB:/opt/rocm/lib/libroctracer64.so
 # export MORI_SHMEM_MODE=ISOLATION
 export MORI_SHMEM_HEAP_SIZE=16G
 export MORI_KERNEL_DIR=/tf/mori/build/lib/gfx942_mlx5
+# export MALLOC_CHECK_=3
 # export MORI_APP_LOG_LEVEL=DEBUG
 # export MORI_SHMEM_LOG_LEVEL=DEBUG
 # export MORI_CORE_LOG_LEVEL=DEBUG
@@ -129,8 +131,8 @@ export MORI_KERNEL_DIR=/tf/mori/build/lib/gfx942_mlx5
 #TEST=mori_playground.py
 # TEST=jax_playground.py
 #TEST=torch_test_dc.py
-TEST=examples/ops/dispatch_combine/test_dispatch_combine.py
-# TEST=examples/ops/dispatch_combine/test_dispatch_combine_jax.py
+# TEST=examples/ops/dispatch_combine/test_dispatch_combine.py
+TEST=examples/ops/dispatch_combine/test_dispatch_combine_jax.py
 # TEST=tests/python/ops/test_dispatch_combine.py
 
 XBASE=$(basename $TEST)
@@ -139,8 +141,8 @@ rm -f $XLA_DIR/zzout_*.log
 
 # PYEXEC=$(which pytest)
 # PYTHONPATH=/tf/mori $PYEXEC -s $TEST
-$PYEXEC $TEST 2>&1 | tee $XLA_DIR/zzout_0.log
-exit 0
+# $PYEXEC $TEST 2>&1 | tee $XLA_DIR/zzout_0.log
+# exit 0
 
 for ((pid = 0; pid < $NumProcs; pid++ )); do
   last_id=$(($NumProcs - 1))
