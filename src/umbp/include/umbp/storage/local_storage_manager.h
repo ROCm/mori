@@ -36,6 +36,7 @@ class LocalStorageManager {
  public:
   // index may be nullptr if index updates are not needed (testing).
   explicit LocalStorageManager(const UMBPConfig& config, BlockIndexClient* index = nullptr);
+  ~LocalStorageManager();
 
   // Write to the specified tier.
   // When writing to DRAM and space is insufficient, automatically demotes
@@ -131,4 +132,10 @@ class LocalStorageManager {
   void UpsertIndexTier(const std::string& key, StorageTier tier, size_t size_hint);
 
   void MaybeAutoPromote(const std::string& key);
+
+#ifdef __linux__
+  int proxy_child_pid_ = -1;
+  std::string proxy_shm_name_;
+  int SpawnProxyDaemon();
+#endif
 };

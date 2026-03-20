@@ -46,9 +46,11 @@ class SpdkProxyTier : public TierBackend {
     std::string GetLRUKey() const override;
     std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
 
+    // Wait for the proxy daemon to become READY (polls SHM).
+    // Returns true if READY within timeout, false on timeout or ERROR.
+    static bool WaitForProxy(const std::string& shm_name, int timeout_ms);
+
    private:
-    // Submit a single request and wait for completion.
-    // Returns the result code.
     umbp::proxy::ResultCode SubmitAndWait(
         umbp::proxy::RequestType type,
         const std::string& key,
@@ -57,7 +59,6 @@ class SpdkProxyTier : public TierBackend {
         uint64_t* out_result_size = nullptr,
         uint64_t* out_result_aux = nullptr) const;
 
-    // Submit a batch request (BATCH_WRITE or BATCH_READ).
     std::vector<bool> SubmitBatch(
         umbp::proxy::RequestType type,
         const std::vector<std::string>& keys,
@@ -66,6 +67,9 @@ class SpdkProxyTier : public TierBackend {
         const std::vector<size_t>& sizes) const;
 
     uint32_t NextSeqId() const;
+
+    // Check if the proxy daemon is still alive by examining its heartbeat.
+    bool IsProxyAlive() const;
 
     bool connected_ = false;
     uint32_t rank_id_ = 0;

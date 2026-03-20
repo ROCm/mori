@@ -22,8 +22,12 @@
 #include "umbp/storage/local_storage_manager.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstring>
 #include <stdexcept>
+#include <thread>
 
+#include "umbp/common/log.h"
 #include "umbp/storage/dram_tier.h"
 #include "umbp/storage/ssd_tier.h"
 #ifdef USE_SPDK
@@ -31,6 +35,11 @@
 #endif
 #ifdef __linux__
 #include "umbp/storage/spdk_proxy_tier.h"
+#include "umbp/proxy/spdk_proxy_shm.h"
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 // ---------------------------------------------------------------------------
@@ -209,6 +218,121 @@ bool LocalStorageManager::WriteFromPtrWithDepth(const std::string& key, uintptr_
   return ok;
 }
 
+// ---------------------------------------------------------------------------
+// Destructor — graceful proxy shutdown if we spawned it
+// ---------------------------------------------------------------------------
+LocalStorageManager::~LocalStorageManager() {
+#ifdef __linux__
+  // Destroy all tiers FIRST so SpdkProxyTier deregisters (active_ranks--)
+  // before we signal the proxy to shut down.
+  tiers_.clear();
+
+  if (proxy_child_pid_ > 0) {
+    // Set the shutdown flag in SHM so proxy knows it can exit
+    umbp::proxy::ProxyShmRegion shm;
+    if (shm.Attach(proxy_shm_name_) == 0) {
+      shm.Header()->shutdown_requested.store(1, std::memory_order_release);
+    }
+
+    // Wait for proxy to exit gracefully (up to 10 seconds)
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool exited = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+      int status = 0;
+      pid_t r = waitpid(proxy_child_pid_, &status, WNOHANG);
+      if (r == proxy_child_pid_ || r == -1) {
+        exited = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    if (!exited) {
+      UMBP_LOG_WARN("LSM: proxy pid=%d did not exit in time, sending SIGKILL",
+                     proxy_child_pid_);
+      kill(proxy_child_pid_, SIGKILL);
+      waitpid(proxy_child_pid_, nullptr, 0);
+    }
+    proxy_child_pid_ = -1;
+  }
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Auto-fork proxy daemon (Linux only)
+// ---------------------------------------------------------------------------
+#ifdef __linux__
+static std::string FindProxyBinary(const std::string& explicit_path) {
+  if (!explicit_path.empty()) {
+    if (access(explicit_path.c_str(), X_OK) == 0) return explicit_path;
+    UMBP_LOG_WARN("LSM: UMBP_SPDK_PROXY_BIN='%s' not executable",
+                   explicit_path.c_str());
+  }
+
+  // Try same directory as current executable
+  char exe_buf[4096];
+  ssize_t len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+  if (len > 0) {
+    exe_buf[len] = '\0';
+    std::string dir(exe_buf);
+    size_t slash = dir.rfind('/');
+    if (slash != std::string::npos) {
+      dir.resize(slash + 1);
+      std::string candidate = dir + "spdk_proxy";
+      if (access(candidate.c_str(), X_OK) == 0) return candidate;
+    }
+  }
+
+  // Fall back to PATH search (execlp will handle it)
+  return "spdk_proxy";
+}
+
+int LocalStorageManager::SpawnProxyDaemon() {
+  // Check if a proxy is already running on this SHM name
+  int probe = umbp::proxy::ProxyShmRegion::ProbeExisting(proxy_shm_name_);
+  if (probe == 1) {
+    UMBP_LOG_INFO("LSM: proxy already running on SHM '%s', skipping spawn",
+                   proxy_shm_name_.c_str());
+    return 0;
+  }
+  if (probe == -1) {
+    UMBP_LOG_INFO("LSM: proxy exists but not yet READY, waiting...");
+    return 0;  // Let WaitForProxy handle it
+  }
+
+  // Clean stale SHM from a previous crash
+  umbp::proxy::ProxyShmRegion::CleanupStale(proxy_shm_name_);
+
+  std::string bin = FindProxyBinary(config_.spdk_proxy_bin);
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    UMBP_LOG_ERROR("LSM: fork() failed: %s", strerror(errno));
+    return -1;
+  }
+
+  if (pid == 0) {
+    // ---- Child process ----
+    std::string spawner_pid_str = std::to_string(getppid());
+    execlp(bin.c_str(), "spdk_proxy",
+           "--spawner-pid", spawner_pid_str.c_str(),
+           static_cast<char*>(nullptr));
+    // exec failed
+    fprintf(stderr, "[UMBP ERROR] execlp('%s') failed: %s\n",
+            bin.c_str(), strerror(errno));
+    _exit(127);
+  }
+
+  // ---- Parent process ----
+  proxy_child_pid_ = pid;
+  UMBP_LOG_INFO("LSM: spawned spdk_proxy daemon pid=%d", pid);
+  return 0;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Constructor
+// ---------------------------------------------------------------------------
 LocalStorageManager::LocalStorageManager(const UMBPConfig& config, BlockIndexClient* index)
     : config_(config), role_(config.ResolveRole()), index_(index) {
   // DRAM tier is always present (fastest)
@@ -236,12 +360,29 @@ LocalStorageManager::LocalStorageManager(const UMBPConfig& config, BlockIndexCli
     }
 #ifdef __linux__
     if (config_.ssd_backend == "spdk_proxy") {
-      auto proxy_tier = std::make_unique<SpdkProxyTier>(config_);
-      if (proxy_tier->IsValid()) {
-        ssd_backend = std::move(proxy_tier);
-      } else {
+      proxy_shm_name_ = config_.spdk_proxy_shm_name;
+      if (proxy_shm_name_.empty())
+        proxy_shm_name_ = umbp::proxy::kDefaultShmName;
+
+      // Rank 0 is responsible for auto-spawning the proxy daemon.
+      // Other ranks wait for it to become READY.
+      if (config_.spdk_proxy_rank_id == 0) {
+        SpawnProxyDaemon();
+      }
+
+      bool proxy_ready = SpdkProxyTier::WaitForProxy(
+          proxy_shm_name_, config_.spdk_proxy_startup_timeout_ms);
+
+      if (proxy_ready) {
+        auto proxy_tier = std::make_unique<SpdkProxyTier>(config_);
+        if (proxy_tier->IsValid()) {
+          ssd_backend = std::move(proxy_tier);
+        }
+      }
+
+      if (!ssd_backend) {
         fprintf(stderr,
-                "[UMBP WARN] SpdkProxyTier connect failed (is spdk_proxy running?). "
+                "[UMBP WARN] SpdkProxyTier connect failed. "
                 "Falling back to POSIX SSD.\n");
       }
     }

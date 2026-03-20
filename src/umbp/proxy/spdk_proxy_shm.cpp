@@ -8,6 +8,7 @@
 
 #ifdef __linux__
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -18,15 +19,12 @@ namespace proxy {
 
 ProxyShmRegion::~ProxyShmRegion() { Detach(); }
 
-// Derive hugepage file path from SHM name.
-// "/umbp_spdk_proxy" → "/dev/hugepages/umbp_spdk_proxy"
 static std::string HugepagePath(const std::string& name) {
     if (!name.empty() && name[0] == '/')
         return "/dev/hugepages" + name;
     return "/dev/hugepages/" + name;
 }
 
-// Round up to 2MB hugepage boundary.
 static size_t AlignToHugepage(size_t size) {
     return (size + kHugepageSize - 1) & ~(kHugepageSize - 1);
 }
@@ -43,12 +41,10 @@ int ProxyShmRegion::Create(const std::string& name, uint32_t max_ranks,
     is_server_ = true;
     is_hugepage_ = false;
 
-    // --- Try hugepage-backed file first ---
     if (try_hugepage) {
         hp_path_ = HugepagePath(name);
         size_t hp_size = AlignToHugepage(size_);
 
-        // Remove stale file
         unlink(hp_path_.c_str());
 
         fd_ = open(hp_path_.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0666);
@@ -74,7 +70,6 @@ int ProxyShmRegion::Create(const std::string& name, uint32_t max_ranks,
         }
     }
 
-    // --- Fallback: regular POSIX shared memory ---
     if (!is_hugepage_) {
         shm_unlink(name_.c_str());
         fd_ = shm_open(name_.c_str(), O_CREAT | O_RDWR | O_EXCL, 0666);
@@ -122,6 +117,14 @@ int ProxyShmRegion::Create(const std::string& name, uint32_t max_ranks,
     hdr->capacity_used.store(0, std::memory_order_relaxed);
     hdr->capacity_total.store(0, std::memory_order_relaxed);
 
+    hdr->proxy_pid.store(0, std::memory_order_relaxed);
+    hdr->spawner_pid.store(0, std::memory_order_relaxed);
+    hdr->active_ranks.store(0, std::memory_order_relaxed);
+    hdr->shutdown_requested.store(0, std::memory_order_relaxed);
+    hdr->proxy_heartbeat_ms.store(0, std::memory_order_relaxed);
+    for (uint32_t r = 0; r < kMaxRanks; ++r)
+        hdr->rank_pids[r].store(0, std::memory_order_relaxed);
+
     for (uint32_t r = 0; r < max_ranks; ++r) {
         auto* ch = Channel(r);
         ch->head.store(0, std::memory_order_relaxed);
@@ -148,7 +151,6 @@ int ProxyShmRegion::Attach(const std::string& name) {
     is_server_ = false;
     is_hugepage_ = false;
 
-    // Try hugepage path first
     hp_path_ = HugepagePath(name);
     fd_ = open(hp_path_.c_str(), O_RDWR);
     if (fd_ >= 0) {
@@ -159,7 +161,6 @@ int ProxyShmRegion::Attach(const std::string& name) {
         if (fd_ < 0) return -errno;
     }
 
-    // Read header to get total size
     ProxyShmHeader tmp_hdr;
     if (pread(fd_, &tmp_hdr, sizeof(tmp_hdr), 0) !=
         static_cast<ssize_t>(sizeof(tmp_hdr))) {
@@ -212,6 +213,41 @@ void ProxyShmRegion::Detach() {
     base_ = nullptr;
     size_ = 0;
     fd_ = -1;
+}
+
+// ---------------------------------------------------------------------------
+// ProbeExisting — check if a live proxy is already running on this SHM name.
+// ---------------------------------------------------------------------------
+int ProxyShmRegion::ProbeExisting(const std::string& name) {
+#ifndef __linux__
+    return 0;
+#else
+    ProxyShmRegion probe;
+    int rc = probe.Attach(name);
+    if (rc != 0) return 0;
+
+    auto* hdr = probe.Header();
+    uint32_t pid = hdr->proxy_pid.load(std::memory_order_acquire);
+    if (pid == 0) return 0;
+
+    if (kill(static_cast<pid_t>(pid), 0) != 0) return 0;
+
+    uint32_t st = hdr->state.load(std::memory_order_acquire);
+    if (st == static_cast<uint32_t>(ProxyState::READY)) return 1;
+
+    return -1;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// CleanupStale — forcefully remove SHM artifacts from a dead proxy.
+// ---------------------------------------------------------------------------
+void ProxyShmRegion::CleanupStale(const std::string& name) {
+#ifdef __linux__
+    std::string hp = HugepagePath(name);
+    unlink(hp.c_str());
+    shm_unlink(name.c_str());
+#endif
 }
 
 }  // namespace proxy

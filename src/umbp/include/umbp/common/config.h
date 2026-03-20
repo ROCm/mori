@@ -63,6 +63,10 @@ struct UMBPConfig {
   // SPDK Proxy configuration (ssd_backend == "spdk_proxy")
   std::string spdk_proxy_shm_name = "/umbp_spdk_proxy";
   uint32_t spdk_proxy_rank_id = 0;
+  uint32_t spdk_proxy_max_ranks = 8;
+  size_t spdk_proxy_data_per_rank_mb = 512;    // MB of SHM data region per rank
+  std::string spdk_proxy_bin;                  // Path to spdk_proxy binary (empty = search PATH)
+  int spdk_proxy_startup_timeout_ms = 30000;   // Max ms to wait for proxy READY
 
   // Role is the source of truth for runtime behavior.
   UMBPRole role = UMBPRole::Standalone;
@@ -123,6 +127,11 @@ struct UMBPConfig {
     cfg.spdk_proxy_shm_name = getenv_str("UMBP_SPDK_PROXY_SHM", cfg.spdk_proxy_shm_name);
     cfg.spdk_proxy_rank_id = static_cast<uint32_t>(
         getenv_int("UMBP_SPDK_PROXY_RANK", static_cast<int>(cfg.spdk_proxy_rank_id)));
+    cfg.spdk_proxy_max_ranks = static_cast<uint32_t>(
+        getenv_int("UMBP_SPDK_PROXY_MAX_RANKS", static_cast<int>(cfg.spdk_proxy_max_ranks)));
+    cfg.spdk_proxy_data_per_rank_mb = getenv_size("UMBP_SPDK_PROXY_DATA_MB", cfg.spdk_proxy_data_per_rank_mb);
+    cfg.spdk_proxy_bin = getenv_str("UMBP_SPDK_PROXY_BIN", cfg.spdk_proxy_bin);
+    cfg.spdk_proxy_startup_timeout_ms = getenv_int("UMBP_SPDK_PROXY_TIMEOUT_MS", cfg.spdk_proxy_startup_timeout_ms);
 
     return cfg;
   }

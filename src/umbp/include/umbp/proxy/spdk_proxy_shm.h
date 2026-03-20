@@ -62,6 +62,17 @@ class ProxyShmRegion {
     void* Base() { return base_; }
     size_t Size() const { return size_; }
 
+    // ---- Lifecycle helpers (static, for use before attach) ----
+
+    // Probe whether a live proxy already owns SHM |name|.
+    //   1 = proxy alive and READY
+    //   0 = no SHM or proxy is dead (caller should clean stale SHM)
+    //  -1 = SHM exists, proxy alive but not yet READY
+    static int ProbeExisting(const std::string& name);
+
+    // Forcefully unlink any stale SHM (hugepage file + shm_open).
+    static void CleanupStale(const std::string& name);
+
    private:
     void* base_ = nullptr;
     size_t size_ = 0;

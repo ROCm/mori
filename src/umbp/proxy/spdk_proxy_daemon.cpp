@@ -5,17 +5,27 @@
 // Rank processes communicate via POSIX shared memory (hugepage-backed for
 // zero-copy DMA when available).
 //
-// Usage:
-//   UMBP_SPDK_NVME_PCI=0000:07:00.0 UMBP_SPDK_MEM_MB=4096 \
-//   UMBP_SPDK_REACTOR_MASK=0x3 UMBP_SPDK_PROXY_MAX_RANKS=8 \
-//   ./spdk_proxy
+// Self-managed lifecycle:
+//   - Stores proxy_pid in SHM header for liveness detection.
+//   - Updates proxy_heartbeat_ms ~every 500ms so clients detect crashes.
+//   - Periodically checks rank PIDs; dead ranks are reaped automatically.
+//   - Exits when: (shutdown_requested OR spawner dead) AND active_ranks==0.
+//   - Accepts --spawner-pid for auto-fork mode (monitors parent process).
+//
+// Usage (manual):
+//   UMBP_SPDK_NVME_PCI=0000:07:00.0 UMBP_SPDK_MEM_MB=4096 ./spdk_proxy
+//
+// Usage (auto-fork — launched by LocalStorageManager):
+//   UMBP_SPDK_NVME_PCI=... ./spdk_proxy --spawner-pid 12345
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "umbp/common/config.h"
@@ -23,6 +33,11 @@
 #include "umbp/proxy/spdk_proxy_protocol.h"
 #include "umbp/proxy/spdk_proxy_shm.h"
 #include "umbp/storage/spdk_ssd_tier.h"
+
+#ifdef __linux__
+#include <sys/prctl.h>
+#include <unistd.h>
+#endif
 
 #ifdef USE_SPDK
 extern "C" {
@@ -111,7 +126,7 @@ static void ProcessSingleRequest(SpdkSsdTier& tier, RingSlot& slot,
 }
 
 // ---------------------------------------------------------------------------
-// Process a batch request — zero-copy or fallback
+// Process a batch request — zero-copy streaming or memcpy fallback
 // ---------------------------------------------------------------------------
 static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
                                 void* data_region, size_t region_size,
@@ -145,7 +160,6 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
 
         std::vector<bool> results;
         if (zero_copy) {
-            // STREAMING: proxy starts NVMe as client copies; items_ready signals progress
             results = tier.BatchWriteDmaStreaming(keys, dma_ptrs, sizes,
                                                   &desc->items_ready);
         } else {
@@ -162,7 +176,6 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
 
         std::vector<bool> results;
         if (zero_copy) {
-            // STREAMING: proxy signals items_done so client copies in parallel
             results = tier.BatchReadDmaStreaming(keys, dma_ptrs, sizes,
                                                  &desc->items_done);
         } else {
@@ -176,14 +189,19 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
 }
 
 // ---------------------------------------------------------------------------
-// Main poll loop
+// Main poll loop — with heartbeat, dead-rank reap, and shutdown logic
 // ---------------------------------------------------------------------------
-static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm, bool zero_copy) {
+static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm, bool zero_copy,
+                     pid_t spawner_pid) {
     auto* hdr = shm.Header();
     uint32_t max_ranks = hdr->max_ranks;
 
-    UMBP_LOG_INFO("spdk_proxy: entering poll loop (max_ranks=%u, zero_copy=%s)",
-                  max_ranks, zero_copy ? "ON" : "OFF");
+    UMBP_LOG_INFO("spdk_proxy: entering poll loop (max_ranks=%u, zero_copy=%s, spawner=%d)",
+                  max_ranks, zero_copy ? "ON" : "OFF",
+                  static_cast<int>(spawner_pid));
+
+    auto last_heartbeat = std::chrono::steady_clock::now();
+    auto last_reap = last_heartbeat;
 
     while (g_running.load(std::memory_order_relaxed)) {
         bool any_work = false;
@@ -219,6 +237,65 @@ static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm, bool zero_copy) {
             ch->tail.store((t + 1) % kRingSize, std::memory_order_release);
         }
 
+        auto now = std::chrono::steady_clock::now();
+
+        // ---- Heartbeat update (~every 500ms) ----
+        auto since_hb = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - last_heartbeat);
+        if (since_hb.count() > 500) {
+            hdr->proxy_heartbeat_ms.store(NowEpochMs(),
+                                          std::memory_order_relaxed);
+            last_heartbeat = now;
+        }
+
+        // ---- Dead-rank reaping (~every 5 seconds) ----
+        auto since_reap = std::chrono::duration_cast<std::chrono::seconds>(
+            now - last_reap);
+        if (since_reap.count() >= 5) {
+#ifdef __linux__
+            for (uint32_t r = 0; r < max_ranks; ++r) {
+                uint32_t rpid = hdr->rank_pids[r].load(std::memory_order_relaxed);
+                if (rpid > 0 && kill(static_cast<pid_t>(rpid), 0) != 0) {
+                    UMBP_LOG_WARN("spdk_proxy: rank %u pid %u appears dead, cleaning up",
+                                  r, rpid);
+                    hdr->rank_pids[r].store(0, std::memory_order_relaxed);
+                    hdr->active_ranks.fetch_sub(1, std::memory_order_relaxed);
+                    auto* ch = shm.Channel(r);
+                    ch->connected = 0;
+                    // Drain any pending slots for this rank
+                    uint32_t t = ch->tail.load(std::memory_order_relaxed);
+                    uint32_t h = ch->head.load(std::memory_order_relaxed);
+                    while (t != h) {
+                        auto& s = ch->slots[t % kRingSize];
+                        s.result = static_cast<int32_t>(ResultCode::ERROR);
+                        s.state.store(static_cast<uint32_t>(SlotState::COMPLETED),
+                                      std::memory_order_release);
+                        t = (t + 1) % kRingSize;
+                    }
+                    ch->tail.store(t, std::memory_order_release);
+                }
+            }
+#endif
+            last_reap = now;
+        }
+
+        // ---- Check exit conditions ----
+        uint32_t active = hdr->active_ranks.load(std::memory_order_acquire);
+        bool shutdown = hdr->shutdown_requested.load(std::memory_order_acquire) != 0;
+
+        if (shutdown && active == 0) {
+            UMBP_LOG_INFO("spdk_proxy: shutdown requested and all ranks disconnected");
+            break;
+        }
+
+#ifdef __linux__
+        if (spawner_pid > 0 && kill(spawner_pid, 0) != 0 && active == 0) {
+            UMBP_LOG_INFO("spdk_proxy: spawner (pid=%d) is dead and no active ranks",
+                          static_cast<int>(spawner_pid));
+            break;
+        }
+#endif
+
         if (!any_work) {
 #if defined(__x86_64__) || defined(_M_X64)
             for (int i = 0; i < 32; ++i) _mm_pause();
@@ -230,14 +307,39 @@ static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm, bool zero_copy) {
 }
 
 // ---------------------------------------------------------------------------
+// Parse command-line arguments
+// ---------------------------------------------------------------------------
+static pid_t ParseSpawnerPid(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--spawner-pid") == 0 && i + 1 < argc) {
+            return static_cast<pid_t>(std::atoi(argv[++i]));
+        }
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
-
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+
+    pid_t spawner_pid = ParseSpawnerPid(argc, argv);
+
+#ifdef __linux__
+    // If auto-spawned, arrange to receive SIGTERM when parent dies.
+    // This is a safety net — the poll loop also checks spawner liveness.
+    if (spawner_pid > 0) {
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        // Re-check: if parent already died between fork and prctl,
+        // getppid() will have changed (to 1 or a subreaper).
+        if (getppid() != spawner_pid) {
+            fprintf(stderr, "spdk_proxy: spawner already dead before prctl, exiting\n");
+            return 1;
+        }
+    }
+#endif
 
     auto getenv_str = [](const char* name, const char* def) -> std::string {
         const char* v = std::getenv(name);
@@ -271,7 +373,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Step 1: Create shared memory (try hugepage for zero-copy DMA)
+    // Step 1: Create shared memory
     ProxyShmRegion shm;
     int rc = shm.Create(shm_name, max_ranks, data_per_rank, /*try_hugepage=*/true);
     if (rc != 0) {
@@ -279,11 +381,20 @@ int main(int argc, char** argv) {
                 shm_name.c_str(), rc);
         return 1;
     }
-    UMBP_LOG_INFO("spdk_proxy: SHM created '%s' — %u ranks, %zuMB/rank, total=%zuMB, hugepage=%s",
+
+    // Record proxy PID and spawner PID in header immediately so that
+    // clients can detect our process even during SPDK initialization.
+    auto* hdr = shm.Header();
+    hdr->proxy_pid.store(static_cast<uint32_t>(getpid()), std::memory_order_relaxed);
+    hdr->spawner_pid.store(static_cast<uint32_t>(spawner_pid), std::memory_order_relaxed);
+    hdr->proxy_heartbeat_ms.store(NowEpochMs(), std::memory_order_relaxed);
+
+    UMBP_LOG_INFO("spdk_proxy: SHM created '%s' — %u ranks, %zuMB/rank, total=%zuMB, hugepage=%s, pid=%d",
                   shm_name.c_str(), max_ranks,
                   data_per_rank / (1024 * 1024),
                   shm.Size() / (1024 * 1024),
-                  shm.IsHugepage() ? "YES" : "NO");
+                  shm.IsHugepage() ? "YES" : "NO",
+                  static_cast<int>(getpid()));
 
     // Step 2: Initialize SPDK via SpdkSsdTier
     UMBPConfig cfg;
@@ -300,6 +411,11 @@ int main(int argc, char** argv) {
     SpdkSsdTier tier(cfg);
     if (!tier.IsValid()) {
         fprintf(stderr, "spdk_proxy: SpdkSsdTier init failed\n");
+        hdr->state.store(static_cast<uint32_t>(ProxyState::ERROR),
+                         std::memory_order_release);
+        // Keep SHM alive briefly so clients can read ERROR state
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        shm.Detach();
         return 1;
     }
 
@@ -318,13 +434,13 @@ int main(int argc, char** argv) {
     }
 #endif
 
-    // Step 4: Update SHM header
+    // Step 4: Publish READY state
     auto [used, total] = tier.Capacity();
-    auto* hdr = shm.Header();
     hdr->bdev_size = total;
     hdr->block_size = 4096;
     hdr->capacity_used.store(used, std::memory_order_relaxed);
     hdr->capacity_total.store(total, std::memory_order_relaxed);
+    hdr->proxy_heartbeat_ms.store(NowEpochMs(), std::memory_order_relaxed);
     hdr->state.store(static_cast<uint32_t>(ProxyState::READY),
                      std::memory_order_release);
 
@@ -333,8 +449,8 @@ int main(int argc, char** argv) {
                   total / (1024 * 1024), zero_copy ? "ON" : "OFF");
     fflush(stdout);
 
-    // Step 5: Enter main poll loop
-    PollLoop(tier, shm, zero_copy);
+    // Step 5: Enter main poll loop (returns when shutdown conditions met)
+    PollLoop(tier, shm, zero_copy, spawner_pid);
 
     // Step 6: Shutdown
     hdr->state.store(static_cast<uint32_t>(ProxyState::SHUTDOWN),

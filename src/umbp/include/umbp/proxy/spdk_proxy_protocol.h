@@ -7,6 +7,13 @@
 //   spdk_proxy daemon (1 process) owns SPDK + NVMe device.
 //   N rank processes communicate via POSIX shared memory.
 //
+// Lifecycle:
+//   Leader (rank 0) auto-forks spdk_proxy daemon.
+//   Daemon creates SHM, initializes SPDK, sets state=READY.
+//   All ranks attach SHM, register via active_ranks + rank_pids.
+//   On shutdown, ranks deregister; daemon exits when active_ranks==0
+//   and shutdown_requested is set (or spawner process is dead).
+//
 // Memory layout:
 //   [ProxyShmHeader]          — global state, offsets to channels and data
 //   [RankChannel × max_ranks] — per-rank request/response ring buffers
@@ -15,6 +22,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 
@@ -23,7 +31,7 @@ namespace proxy {
 
 // ---- Constants ----
 static constexpr uint64_t kProxyShmMagic = 0x554D4250534B5058ULL;  // "UMBPSKPX"
-static constexpr uint32_t kProxyVersion = 1;
+static constexpr uint32_t kProxyVersion = 2;
 static constexpr uint32_t kMaxKeyLen = 256;
 static constexpr uint32_t kRingSize = 256;
 static constexpr uint32_t kMaxRanks = 16;
@@ -31,8 +39,19 @@ static constexpr size_t kDefaultDataRegionPerRank = 256ULL * 1024 * 1024;  // 25
 static constexpr size_t kDmaAlignment = 4096;  // NVMe sector alignment for zero-copy DMA
 static constexpr size_t kHugepageSize = 2ULL * 1024 * 1024;  // 2MB hugepage
 
-// Default shared memory name
 static constexpr const char* kDefaultShmName = "/umbp_spdk_proxy";
+
+// Heartbeat stale threshold: clients treat the proxy as dead if
+// proxy_heartbeat_ms hasn't been updated for this many milliseconds.
+static constexpr uint64_t kHeartbeatStaleMs = 5000;
+
+// ---- Epoch-millisecond helper (cross-process safe) ----
+inline uint64_t NowEpochMs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
 
 // ---- Enums ----
 
@@ -40,6 +59,7 @@ enum class ProxyState : uint32_t {
     UNINIT = 0,
     READY = 1,
     SHUTDOWN = 2,
+    ERROR = 3,
 };
 
 enum class SlotState : uint32_t {
@@ -125,9 +145,7 @@ struct BatchDescriptor {
     uint32_t _reserved;
     uint64_t total_data_size;
     // Streaming signals — separate cache lines to avoid false sharing
-    // Write streaming: client increments after copying each key's data
     alignas(64) std::atomic<uint32_t> items_ready;
-    // Read streaming: proxy increments after each key's NVMe read completes
     alignas(64) std::atomic<uint32_t> items_done;
 
     BatchEntry entries[];
@@ -135,36 +153,47 @@ struct BatchDescriptor {
 
 // ---- Global shared memory header ----
 struct ProxyShmHeader {
+    // ---- Identity ----
     uint64_t magic;
     uint32_t version;
     std::atomic<uint32_t> state;    // ProxyState
 
+    // ---- Device info ----
     uint32_t max_ranks;
     uint32_t block_size;            // NVMe block size (set by proxy after SPDK init)
     uint32_t hugepage;              // 1 = data region is hugepage-backed (zero-copy DMA capable)
     uint32_t _pad0;
     uint64_t bdev_size;             // NVMe device size in bytes
 
-    // Layout offsets (from start of shared memory)
+    // ---- Layout offsets (from start of shared memory) ----
     uint64_t channels_offset;
     uint64_t data_region_offset;
     uint64_t data_region_per_rank;
     uint64_t total_shm_size;
 
-    // Capacity info (updated by proxy)
+    // ---- Capacity info (updated by proxy) ----
     std::atomic<uint64_t> capacity_used;
     std::atomic<uint64_t> capacity_total;
 
-    char _reserved[128];
+    // ---- Lifecycle management ----
+    std::atomic<uint32_t> proxy_pid;          // PID of proxy daemon
+    std::atomic<uint32_t> spawner_pid;        // PID of the process that auto-spawned proxy (0 = manual)
+    std::atomic<uint32_t> active_ranks;       // Number of currently connected rank processes
+    std::atomic<uint32_t> shutdown_requested; // 1 = graceful shutdown requested by spawner
+    std::atomic<uint64_t> proxy_heartbeat_ms; // Epoch ms, updated ~every 500ms by proxy
+
+    // Per-rank PID tracking: proxy periodically checks if rank PIDs are alive
+    // to detect crashed ranks and reclaim their resources.
+    std::atomic<uint32_t> rank_pids[kMaxRanks];
+
+    char _reserved2[40];
 };
 
 // ---- Helper: compute total shared memory size ----
 inline size_t ComputeShmSize(uint32_t max_ranks, size_t data_per_rank) {
     size_t header_size = sizeof(ProxyShmHeader);
-    // Align channels to page boundary
     size_t channels_offset = (header_size + 4095) & ~4095ULL;
     size_t channels_size = sizeof(RankChannel) * max_ranks;
-    // Align data region to page boundary
     size_t data_offset = (channels_offset + channels_size + 4095) & ~4095ULL;
     size_t data_size = data_per_rank * max_ranks;
     return data_offset + data_size;
