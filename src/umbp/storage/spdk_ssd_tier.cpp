@@ -572,6 +572,135 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
 }
 
 // ===========================================================================
+// BatchReadIntoPtrStreaming — DMA-ring read with per-item progress signaling
+//
+// Same I/O path as BatchReadIntoPtr (NVMe → DMA ring → memcpy to dst),
+// but uses a single-worker pipeline so items complete in order and
+// *items_done is incremented as soon as each item's data is fully in dst.
+// QD=128 still saturates NVMe read bandwidth.
+// ===========================================================================
+std::vector<bool> SpdkSsdTier::BatchReadIntoPtrStreaming(
+    const std::vector<std::string>& keys,
+    const std::vector<uintptr_t>& dst_ptrs,
+    const std::vector<size_t>& sizes,
+    std::atomic<uint32_t>* items_done) {
+    const int count = static_cast<int>(keys.size());
+    std::vector<bool> results(count, false);
+    if (!initialized_ || count == 0) return results;
+
+    auto& env = umbp::SpdkEnv::Instance();
+
+    struct ReadItem { int idx; uint64_t offset; size_t aligned_size; size_t data_size; };
+    std::vector<ReadItem> items;
+    items.reserve(count);
+
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (int i = 0; i < count; ++i) {
+            auto it = entries_.find(keys[i]);
+            if (it == entries_.end()) continue;
+            size_t rd = std::min(sizes[i], it->second.data_size);
+            items.push_back({i, it->second.handle.address(), AlignUp(rd), rd});
+        }
+    }
+
+    if (items.empty()) {
+        if (items_done) items_done->store(count, std::memory_order_release);
+        return results;
+    }
+
+    const int item_count = static_cast<int>(items.size());
+    const size_t chunk_sz = dma_ring_buf_size_;
+
+    struct ReadChunk {
+        int item_idx; uint64_t offset; size_t nbytes; size_t data_offset; size_t data_bytes;
+    };
+    std::vector<ReadChunk> chunks;
+    chunks.reserve(item_count);
+    for (int i = 0; i < item_count; ++i) {
+        auto& ri = items[i];
+        size_t rem_a = ri.aligned_size, rem_d = ri.data_size, dst_off = 0;
+        uint64_t dev_off = ri.offset;
+        while (rem_a > 0) {
+            size_t ca = std::min(rem_a, chunk_sz);
+            size_t cd = std::min(rem_d, ca);
+            chunks.push_back({i, dev_off, ca, dst_off, cd});
+            rem_a -= ca; rem_d = (rem_d > cd) ? rem_d - cd : 0;
+            dst_off += cd; dev_off += ca;
+        }
+    }
+
+    const int chunk_count = static_cast<int>(chunks.size());
+    auto chunk_ok = std::make_unique<uint8_t[]>(chunk_count);
+    std::memset(chunk_ok.get(), 0, chunk_count);
+
+    {
+        std::lock_guard<std::mutex> dma_lk(dma_ring_mu_);
+        int qd = std::min({chunk_count, kMaxQueueDepth, dma_ring_count_});
+        auto lreqs = std::make_unique<umbp::SpdkIoRequest[]>(qd);
+        auto lbatch = std::make_unique<umbp::SpdkIoRequest*[]>(qd);
+        int head = 0, tail = 0;
+        int items_signaled = 0;
+
+        while (tail < chunk_count) {
+            int bc = 0;
+            while (head < chunk_count && (head - tail) < qd) {
+                int slot = head % qd;
+                auto& c = chunks[head];
+                auto& req = lreqs[slot];
+                req.op = umbp::SpdkIoRequest::READ;
+                req.buf = dma_ring_[slot];
+                req.offset = c.offset;
+                req.nbytes = c.nbytes;
+                req.src_data = nullptr;
+                req.src_iov = nullptr; req.src_iovcnt = 0;
+                req.dst_iov = nullptr; req.dst_iovcnt = 0;
+                req.completed.store(false, std::memory_order_release);
+                req.success = false;
+                lbatch[bc++] = &req;
+                ++head;
+                if (bc >= 8) { env.SubmitIoBatchAsync(lbatch.get(), bc); bc = 0; }
+            }
+            if (bc > 0) env.SubmitIoBatchAsync(lbatch.get(), bc);
+
+            while (tail < head) {
+                int slot = tail % qd;
+                if (!lreqs[slot].completed.load(std::memory_order_acquire)) break;
+                if (lreqs[slot].success) {
+                    auto& c = chunks[tail];
+                    auto& ri = items[c.item_idx];
+                    char* dst = reinterpret_cast<char*>(dst_ptrs[ri.idx]) + c.data_offset;
+                    std::memcpy(dst, dma_ring_[slot], c.data_bytes);
+                    chunk_ok[tail] = 1;
+                }
+                ++tail;
+
+                int cur_item = chunks[tail - 1].item_idx;
+                bool item_done = (tail >= chunk_count) ||
+                                 (chunks[tail].item_idx != cur_item);
+                if (item_done && cur_item >= items_signaled) {
+                    items_signaled = cur_item + 1;
+                    if (items_done)
+                        items_done->store(static_cast<uint32_t>(items_signaled),
+                                          std::memory_order_release);
+                }
+            }
+        }
+    }
+
+    if (items_done)
+        items_done->store(count, std::memory_order_release);
+
+    std::vector<bool> item_ok(item_count, true);
+    for (int j = 0; j < chunk_count; ++j)
+        if (!chunk_ok[j]) item_ok[chunks[j].item_idx] = false;
+    for (int j = 0; j < item_count; ++j)
+        if (item_ok[j]) results[items[j].idx] = true;
+
+    return results;
+}
+
+// ===========================================================================
 // BatchWriteDmaDirect — zero-copy write pipeline
 //
 // Same as BatchWrite, but dma_ptrs are already DMA-registered + 4KB-aligned.

@@ -42,6 +42,16 @@ class SpdkSsdTier : public TierBackend {
         const std::vector<uintptr_t>& dst_ptrs,
         const std::vector<size_t>& sizes) override;
 
+    // DMA-ring read with per-item streaming progress.
+    // Single-worker pipeline (QD=128, saturates NVMe) signals *items_done
+    // after each item's data is memcpy'd to dst_ptrs, enabling the caller to
+    // overlap downstream copies with remaining NVMe reads.
+    std::vector<bool> BatchReadIntoPtrStreaming(
+        const std::vector<std::string>& keys,
+        const std::vector<uintptr_t>& dst_ptrs,
+        const std::vector<size_t>& sizes,
+        std::atomic<uint32_t>* items_done);
+
     // Zero-copy DMA variants: data_ptrs must be DMA-registered, 4KB-aligned,
     // with AlignUp(size) bytes of writable space per key.
     // Skips the DMA ring + memcpy entirely — SPDK DMAs directly from/to the buffers.

@@ -126,13 +126,10 @@ static void ProcessSingleRequest(SpdkSsdTier& tier, RingSlot& slot,
 // ---------------------------------------------------------------------------
 // Process a batch request.
 //
-// When total data volume is large (≥ kStreamingThreshold), use sub-batch
-// streaming so client memcpy overlaps with NVMe I/O.
-// For small batches, process everything at once to avoid per-group overhead.
+// Read:  uses BatchReadIntoPtrStreaming — single pipeline call with per-item
+//        items_done signaling so client overlaps SHM→user copy with NVMe I/O.
+// Write: waits for all client data, then single BatchWrite call.
 // ---------------------------------------------------------------------------
-static constexpr uint32_t kBatchGroupSize = 128;
-static constexpr size_t   kStreamingThreshold = 64ULL * 1024 * 1024; // 64 MB
-
 static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
                                 void* data_region, size_t region_size) {
     auto type = static_cast<RequestType>(slot.type);
@@ -148,85 +145,38 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
     size_t data_base_offset = (desc_total + kDmaAlignment - 1) & ~(kDmaAlignment - 1);
     char* data_base = static_cast<char*>(data_region) + data_base_offset;
 
-    const bool use_streaming = (count > kBatchGroupSize) &&
-                               (desc->total_data_size >= kStreamingThreshold);
+    std::vector<std::string> keys(count);
+    std::vector<size_t> sizes(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        auto& e = desc->entries[i];
+        keys[i] = std::string(e.key, e.key_len);
+        sizes[i] = e.data_size;
+    }
 
     if (type == RequestType::BATCH_WRITE) {
-        if (use_streaming) {
-            for (uint32_t g = 0; g < count; g += kBatchGroupSize) {
-                uint32_t gc = std::min(kBatchGroupSize, count - g);
-                while (desc->items_ready.load(std::memory_order_acquire) < g + gc) {
+        while (desc->items_ready.load(std::memory_order_acquire) < count) {
 #if defined(__x86_64__) || defined(_M_X64)
-                    _mm_pause();
+            _mm_pause();
 #endif
-                }
-                std::vector<std::string> sub_keys(gc);
-                std::vector<const void*> sub_ptrs(gc);
-                std::vector<size_t> sub_sizes(gc);
-                for (uint32_t i = 0; i < gc; ++i) {
-                    auto& e = desc->entries[g + i];
-                    sub_keys[i] = std::string(e.key, e.key_len);
-                    sub_ptrs[i] = data_base + e.data_offset;
-                    sub_sizes[i] = e.data_size;
-                }
-                auto results = tier.BatchWrite(sub_keys, sub_ptrs, sub_sizes);
-                for (uint32_t i = 0; i < gc; ++i)
-                    desc->entries[g + i].result = results[i] ? 1 : 0;
-            }
-        } else {
-            while (desc->items_ready.load(std::memory_order_acquire) < count) {
-#if defined(__x86_64__) || defined(_M_X64)
-                _mm_pause();
-#endif
-            }
-            std::vector<std::string> keys(count);
-            std::vector<const void*> cptrs(count);
-            std::vector<size_t> sizes(count);
-            for (uint32_t i = 0; i < count; ++i) {
-                auto& e = desc->entries[i];
-                keys[i] = std::string(e.key, e.key_len);
-                cptrs[i] = data_base + e.data_offset;
-                sizes[i] = e.data_size;
-            }
-            auto results = tier.BatchWrite(keys, cptrs, sizes);
-            for (uint32_t i = 0; i < count; ++i)
-                desc->entries[i].result = results[i] ? 1 : 0;
         }
+
+        std::vector<const void*> cptrs(count);
+        for (uint32_t i = 0; i < count; ++i)
+            cptrs[i] = data_base + desc->entries[i].data_offset;
+
+        auto results = tier.BatchWrite(keys, cptrs, sizes);
+        for (uint32_t i = 0; i < count; ++i)
+            desc->entries[i].result = results[i] ? 1 : 0;
     } else {
-        if (use_streaming) {
-            for (uint32_t g = 0; g < count; g += kBatchGroupSize) {
-                uint32_t gc = std::min(kBatchGroupSize, count - g);
-                std::vector<std::string> sub_keys(gc);
-                std::vector<uintptr_t> sub_ptrs(gc);
-                std::vector<size_t> sub_sizes(gc);
-                for (uint32_t i = 0; i < gc; ++i) {
-                    auto& e = desc->entries[g + i];
-                    sub_keys[i] = std::string(e.key, e.key_len);
-                    sub_ptrs[i] = reinterpret_cast<uintptr_t>(
-                        data_base + e.data_offset);
-                    sub_sizes[i] = e.data_size;
-                }
-                auto results = tier.BatchReadIntoPtr(sub_keys, sub_ptrs, sub_sizes);
-                for (uint32_t i = 0; i < gc; ++i)
-                    desc->entries[g + i].result = results[i] ? 1 : 0;
-                desc->items_done.store(g + gc, std::memory_order_release);
-            }
-        } else {
-            std::vector<std::string> keys(count);
-            std::vector<uintptr_t> dma_ptrs(count);
-            std::vector<size_t> sizes(count);
-            for (uint32_t i = 0; i < count; ++i) {
-                auto& e = desc->entries[i];
-                keys[i] = std::string(e.key, e.key_len);
-                dma_ptrs[i] = reinterpret_cast<uintptr_t>(
-                    data_base + e.data_offset);
-                sizes[i] = e.data_size;
-            }
-            auto results = tier.BatchReadIntoPtr(keys, dma_ptrs, sizes);
-            for (uint32_t i = 0; i < count; ++i)
-                desc->entries[i].result = results[i] ? 1 : 0;
-            desc->items_done.store(count, std::memory_order_release);
-        }
+        std::vector<uintptr_t> dma_ptrs(count);
+        for (uint32_t i = 0; i < count; ++i)
+            dma_ptrs[i] = reinterpret_cast<uintptr_t>(
+                data_base + desc->entries[i].data_offset);
+
+        auto results = tier.BatchReadIntoPtrStreaming(
+            keys, dma_ptrs, sizes, &desc->items_done);
+        for (uint32_t i = 0; i < count; ++i)
+            desc->entries[i].result = results[i] ? 1 : 0;
     }
 
     slot.result = static_cast<int32_t>(ResultCode::OK);
