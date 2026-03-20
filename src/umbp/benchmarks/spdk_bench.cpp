@@ -210,7 +210,7 @@ static BandwidthResult BenchRawSpdk(size_t chunk_size, size_t total_bytes,
         size_t my_ops = (t == threads - 1) ? (total_ops - ops_per_thread * t)
                                            : ops_per_thread;
         size_t my_range = my_ops * chunk_size;
-        int per_qd = iodepth / threads;
+        int per_qd = iodepth;
         if (per_qd < 1) per_qd = 1;
         constexpr size_t kMaxDmaPerThread = 512ULL * 1024 * 1024;
         int max_by_mem = static_cast<int>(kMaxDmaPerThread / aligned_io);

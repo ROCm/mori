@@ -75,7 +75,7 @@ void SpdkSsdTier::AllocDmaRing(size_t buf_size) {
     if (!env.IsInitialized()) return;
 
     dma_ring_buf_size_ = buf_size;
-    dma_ring_count_ = kMaxQueueDepth;
+    dma_ring_count_ = kMaxQueueDepth * std::max(1, num_io_workers_);
     dma_ring_ = new void*[dma_ring_count_];
 
     int got = env.DmaPoolAllocBatch(dma_ring_, dma_ring_buf_size_,
