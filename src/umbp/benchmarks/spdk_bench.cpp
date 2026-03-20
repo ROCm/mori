@@ -374,6 +374,7 @@ int main(int argc, char** argv) {
                 printf("%10zuKB %10.0f %10.0f\n",
                        chunk / 1024, TrimmedMean(wbw), TrimmedMean(rbw));
             }
+            env.DmaPoolDrain();
         }
     }
 
