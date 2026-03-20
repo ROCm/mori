@@ -287,6 +287,9 @@ int SpdkEnv::Init(const SpdkEnvConfig &config) {
     }
 
     config_ = config;
+    if (config_.bdev_name.empty() && !config_.nvme_pci_addr.empty()) {
+        config_.bdev_name = config_.nvme_ctrl_name + "n1";
+    }
     init_complete_ = false;
     init_result_ = -1;
 
