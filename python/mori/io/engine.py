@@ -23,6 +23,10 @@ from mori import cpp as mori_cpp
 import torch
 import ctypes
 
+_PyCapsule_New = ctypes.pythonapi.PyCapsule_New
+_PyCapsule_New.restype = ctypes.py_object
+_PyCapsule_New.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+
 TORCH_DEVICE_TYPE_MAP = {
     "cpu": mori_cpp.MemoryLocationType.CPU,
     "cuda": mori_cpp.MemoryLocationType.GPU,
@@ -107,7 +111,7 @@ class IOEngine:
     def register_memory(
         self, ptr: int, size: int, device_id: int, mem_loc: mori_cpp.MemoryLocationType
     ):
-        data = ctypes.pythonapi.PyCapsule_New(ctypes.c_void_p(ptr), None, None)
+        data = _PyCapsule_New(ctypes.c_void_p(ptr), None, None)
         return self._engine.RegisterMemory(data, size, device_id, mem_loc)
 
     def register_torch_tensor(self, tensor: torch.Tensor):
