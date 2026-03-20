@@ -455,7 +455,11 @@ int main(int argc, char** argv) {
 
         size_t posix_sizes[] = {
             4096, 32 * 1024, 128 * 1024, 512 * 1024,
-            1024 * 1024, 2ULL * 1024 * 1024};
+            1024 * 1024, 2ULL * 1024 * 1024,
+            8ULL * 1024 * 1024, 16ULL * 1024 * 1024,
+            32ULL * 1024 * 1024, 64ULL * 1024 * 1024,
+            128ULL * 1024 * 1024, 256ULL * 1024 * 1024,
+            512ULL * 1024 * 1024};
         constexpr size_t kPosixMaxTotal = 512ULL * 1024 * 1024;
 
         for (size_t vsz : posix_sizes) {
