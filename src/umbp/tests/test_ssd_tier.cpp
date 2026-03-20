@@ -131,12 +131,153 @@ void test_segmented_io_uring_backend() {
   std::cout << "PASSED" << std::endl;
 }
 
+void test_ssd_batch_read() {
+  std::cout << "test_ssd_batch_read... ";
+  const std::string dir = "/tmp/umbp_test_ssd_batch_read";
+
+  UMBPConfig cfg;
+  cfg.dram.capacity_bytes = 1024 * 1024;
+  cfg.ssd.enabled = true;
+  cfg.ssd.storage_dir = dir;
+  cfg.ssd.capacity_bytes = 64 * 1024 * 1024;
+
+  LocalStorageManager mgr(cfg);
+
+  // Write 10 keys to SSD.
+  constexpr size_t kNumKeys = 10;
+  constexpr size_t kValueSize = 4096;
+  std::vector<std::vector<char>> payloads(kNumKeys);
+  std::vector<std::string> keys(kNumKeys);
+  for (size_t i = 0; i < kNumKeys; ++i) {
+    keys[i] = "batch_read_key_" + std::to_string(i);
+    payloads[i].assign(kValueSize, static_cast<char>('A' + i));
+    assert(mgr.Write(keys[i], payloads[i].data(), payloads[i].size(), StorageTier::LOCAL_SSD));
+  }
+
+  // Batch read all 10 via ReadBatchIntoPtr.
+  auto* ssd = mgr.GetTier(StorageTier::LOCAL_SSD);
+  assert(ssd != nullptr);
+
+  std::vector<std::vector<char>> buffers(kNumKeys, std::vector<char>(kValueSize, 0));
+  std::vector<uintptr_t> ptrs(kNumKeys);
+  std::vector<size_t> sizes(kNumKeys, kValueSize);
+  for (size_t i = 0; i < kNumKeys; ++i) {
+    ptrs[i] = reinterpret_cast<uintptr_t>(buffers[i].data());
+  }
+
+  auto results = ssd->ReadBatchIntoPtr(keys, ptrs, sizes);
+  for (size_t i = 0; i < kNumKeys; ++i) {
+    assert(results[i]);
+    assert(buffers[i] == payloads[i]);
+  }
+
+  mgr.Clear();
+  std::cout << "PASSED" << std::endl;
+}
+
+void test_ssd_batch_read_partial() {
+  std::cout << "test_ssd_batch_read_partial... ";
+  const std::string dir = "/tmp/umbp_test_ssd_batch_read_partial";
+
+  UMBPConfig cfg;
+  cfg.dram.capacity_bytes = 1024 * 1024;
+  cfg.ssd.enabled = true;
+  cfg.ssd.storage_dir = dir;
+  cfg.ssd.capacity_bytes = 64 * 1024 * 1024;
+
+  LocalStorageManager mgr(cfg);
+
+  // Write only 5 keys to SSD.
+  constexpr size_t kExist = 5;
+  constexpr size_t kTotal = 7;
+  constexpr size_t kValueSize = 2048;
+  std::vector<std::string> keys(kTotal);
+  std::vector<std::vector<char>> payloads(kExist);
+  for (size_t i = 0; i < kTotal; ++i) {
+    keys[i] = "partial_key_" + std::to_string(i);
+  }
+  for (size_t i = 0; i < kExist; ++i) {
+    payloads[i].assign(kValueSize, static_cast<char>('X' + i));
+    assert(mgr.Write(keys[i], payloads[i].data(), payloads[i].size(), StorageTier::LOCAL_SSD));
+  }
+
+  // Batch read all 7 keys — first 5 should succeed, last 2 fail.
+  auto* ssd = mgr.GetTier(StorageTier::LOCAL_SSD);
+  assert(ssd != nullptr);
+
+  std::vector<std::vector<char>> buffers(kTotal, std::vector<char>(kValueSize, 0));
+  std::vector<uintptr_t> ptrs(kTotal);
+  std::vector<size_t> sizes(kTotal, kValueSize);
+  for (size_t i = 0; i < kTotal; ++i) {
+    ptrs[i] = reinterpret_cast<uintptr_t>(buffers[i].data());
+  }
+
+  auto results = ssd->ReadBatchIntoPtr(keys, ptrs, sizes);
+  for (size_t i = 0; i < kExist; ++i) {
+    assert(results[i]);
+    assert(buffers[i] == payloads[i]);
+  }
+  for (size_t i = kExist; i < kTotal; ++i) {
+    assert(!results[i]);
+  }
+
+  mgr.Clear();
+  std::cout << "PASSED" << std::endl;
+}
+
+void test_ssd_batch_read_io_uring() {
+  std::cout << "test_ssd_batch_read_io_uring... ";
+  const std::string dir = "/tmp/umbp_test_ssd_batch_read_uring";
+
+  UMBPConfig cfg;
+  cfg.dram.capacity_bytes = 1024 * 1024;
+  cfg.ssd.enabled = true;
+  cfg.ssd.storage_dir = dir;
+  cfg.ssd.capacity_bytes = 64 * 1024 * 1024;
+  cfg.ssd.io.backend = UMBPIoBackend::IoUring;
+  cfg.ssd.io.queue_depth = 128;
+
+  LocalStorageManager mgr(cfg);
+
+  constexpr size_t kNumKeys = 8;
+  constexpr size_t kValueSize = 8192;
+  std::vector<std::vector<char>> payloads(kNumKeys);
+  std::vector<std::string> keys(kNumKeys);
+  for (size_t i = 0; i < kNumKeys; ++i) {
+    keys[i] = "uring_batch_" + std::to_string(i);
+    payloads[i].assign(kValueSize, static_cast<char>('0' + i));
+    assert(mgr.Write(keys[i], payloads[i].data(), payloads[i].size(), StorageTier::LOCAL_SSD));
+  }
+
+  auto* ssd = mgr.GetTier(StorageTier::LOCAL_SSD);
+  assert(ssd != nullptr);
+
+  std::vector<std::vector<char>> buffers(kNumKeys, std::vector<char>(kValueSize, 0));
+  std::vector<uintptr_t> ptrs(kNumKeys);
+  std::vector<size_t> sizes(kNumKeys, kValueSize);
+  for (size_t i = 0; i < kNumKeys; ++i) {
+    ptrs[i] = reinterpret_cast<uintptr_t>(buffers[i].data());
+  }
+
+  auto results = ssd->ReadBatchIntoPtr(keys, ptrs, sizes);
+  for (size_t i = 0; i < kNumKeys; ++i) {
+    assert(results[i]);
+    assert(buffers[i] == payloads[i]);
+  }
+
+  mgr.Clear();
+  std::cout << "PASSED" << std::endl;
+}
+
 int main() {
   std::cout << "=== Segmented SSD Tier Tests ===" << std::endl;
   test_segmented_recovery();
   test_segmented_overwrite_generation();
   test_segmented_follower_refresh();
   test_segmented_io_uring_backend();
+  test_ssd_batch_read();
+  test_ssd_batch_read_partial();
+  test_ssd_batch_read_io_uring();
   std::cout << "All Segmented SSD Tier tests passed!" << std::endl;
   return 0;
 }

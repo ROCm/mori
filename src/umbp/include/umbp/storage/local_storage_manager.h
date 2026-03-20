@@ -49,6 +49,9 @@ class LocalStorageManager {
                              StorageTier tier = StorageTier::CPU_DRAM);
 
   bool ReadIntoPtr(const std::string& key, uintptr_t dst, size_t size);
+  std::vector<bool> ReadBatchIntoPtr(const std::vector<std::string>& keys,
+                                     const std::vector<uintptr_t>& dst_ptrs,
+                                     const std::vector<size_t>& sizes);
   bool Exists(const std::string& key) const;
   bool Evict(const std::string& key);
   std::pair<size_t, size_t> Capacity(StorageTier tier) const;

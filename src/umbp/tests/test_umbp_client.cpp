@@ -225,6 +225,103 @@ void test_dram_full_demote_with_index() {
   std::cout << "PASSED" << std::endl;
 }
 
+void test_batch_get_ssd_tier() {
+  std::cout << "test_batch_get_ssd_tier... ";
+
+  UMBPConfig config;
+  config.dram.capacity_bytes = 1024;  // Tiny DRAM: forces SSD demotion
+  config.ssd.enabled = true;
+  config.ssd.storage_dir = "/tmp/umbp_test_batch_get_ssd";
+  config.ssd.capacity_bytes = 10 * 1024 * 1024;
+
+  UMBPClient client(config);
+
+  // Write 10 x 512-byte values; DRAM holds ~2, rest auto-demote to SSD.
+  constexpr int N = 10;
+  constexpr size_t kSize = 512;
+  std::vector<std::string> keys(N);
+  std::vector<std::vector<char>> data(N);
+  for (int i = 0; i < N; ++i) {
+    keys[i] = "ssd_batch_" + std::to_string(i);
+    data[i].assign(kSize, static_cast<char>('A' + i));
+    assert(client.Put(keys[i], data[i].data(), data[i].size()));
+  }
+
+  // Batch read all 10 — mix of DRAM and SSD.
+  std::vector<std::vector<char>> bufs(N, std::vector<char>(kSize, 0));
+  std::vector<uintptr_t> ptrs(N);
+  std::vector<size_t> sizes(N, kSize);
+  for (int i = 0; i < N; ++i) {
+    ptrs[i] = reinterpret_cast<uintptr_t>(bufs[i].data());
+  }
+
+  auto results = client.BatchGetIntoPtr(keys, ptrs, sizes);
+  for (int i = 0; i < N; ++i) {
+    assert(results[i]);
+    assert(bufs[i] == data[i]);
+  }
+
+  client.Clear();
+  std::cout << "PASSED" << std::endl;
+}
+
+void test_batch_get_follower() {
+  std::cout << "test_batch_get_follower... ";
+
+  const std::string ssd_dir = "/tmp/umbp_test_batch_get_follower";
+
+  // Leader: writes to DRAM + copies to shared SSD.
+  UMBPConfig leader_cfg;
+  leader_cfg.dram.capacity_bytes = 1024 * 1024;
+  leader_cfg.ssd.enabled = true;
+  leader_cfg.ssd.storage_dir = ssd_dir;
+  leader_cfg.ssd.capacity_bytes = 10 * 1024 * 1024;
+  leader_cfg.role = UMBPRole::SharedSSDLeader;
+  leader_cfg.force_ssd_copy_on_write = true;
+  leader_cfg.copy_pipeline.async_enabled = false;  // sync copy for determinism
+
+  constexpr int N = 5;
+  constexpr size_t kSize = 2048;
+  std::vector<std::string> keys(N);
+  std::vector<std::vector<char>> data(N);
+
+  {
+    UMBPClient leader(leader_cfg);
+    for (int i = 0; i < N; ++i) {
+      keys[i] = "follower_batch_" + std::to_string(i);
+      data[i].assign(kSize, static_cast<char>('P' + i));
+      assert(leader.Put(keys[i], data[i].data(), data[i].size()));
+    }
+  }  // leader destructor drains copy pipeline
+
+  // Follower: reads from shared SSD via BatchGetIntoPtr.
+  UMBPConfig follower_cfg;
+  follower_cfg.dram.capacity_bytes = 1024 * 1024;
+  follower_cfg.ssd.enabled = true;
+  follower_cfg.ssd.storage_dir = ssd_dir;
+  follower_cfg.ssd.capacity_bytes = 10 * 1024 * 1024;
+  follower_cfg.role = UMBPRole::SharedSSDFollower;
+  follower_cfg.follower_mode = true;
+
+  UMBPClient follower(follower_cfg);
+
+  std::vector<std::vector<char>> bufs(N, std::vector<char>(kSize, 0));
+  std::vector<uintptr_t> ptrs(N);
+  std::vector<size_t> sizes(N, kSize);
+  for (int i = 0; i < N; ++i) {
+    ptrs[i] = reinterpret_cast<uintptr_t>(bufs[i].data());
+  }
+
+  auto results = follower.BatchGetIntoPtr(keys, ptrs, sizes);
+  for (int i = 0; i < N; ++i) {
+    assert(results[i]);
+    assert(bufs[i] == data[i]);
+  }
+
+  follower.Clear();
+  std::cout << "PASSED" << std::endl;
+}
+
 int main() {
   std::cout << "=== UMBPClient Tests ===" << std::endl;
   test_put_get();
@@ -234,6 +331,8 @@ int main() {
   test_clear();
   test_put_from_ptr_get_into_ptr();
   test_dram_full_demote_with_index();
+  test_batch_get_ssd_tier();
+  test_batch_get_follower();
   std::cout << "All UMBPClient tests passed!" << std::endl;
   return 0;
 }

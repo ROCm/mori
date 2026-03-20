@@ -187,9 +187,68 @@ std::vector<bool> UMBPClient::BatchGetIntoPtr(const std::vector<std::string>& ke
                                               const std::vector<uintptr_t>& ptrs,
                                               const std::vector<size_t>& sizes) {
   std::vector<bool> results(keys.size(), false);
+  if (keys.empty()) return results;
+
+  // Phase 1: Index pre-check — filter out keys that cannot possibly exist.
+  std::vector<size_t> read_indices;  // indices into keys/ptrs/sizes to actually read
+  std::vector<bool> was_in_index(keys.size(), false);
+  read_indices.reserve(keys.size());
+
   for (size_t i = 0; i < keys.size(); ++i) {
-    results[i] = GetIntoPtr(keys[i], ptrs[i], sizes[i]);
+    was_in_index[i] = index_.MayExist(keys[i]);
+    if (!was_in_index[i] && role_ != UMBPRole::SharedSSDFollower) {
+      // Non-follower: key not in index → guaranteed miss.
+      continue;
+    }
+    read_indices.push_back(i);
   }
+
+  if (read_indices.empty()) return results;
+
+  // Phase 2: Batch storage read.
+  std::vector<std::string> batch_keys;
+  std::vector<uintptr_t> batch_ptrs;
+  std::vector<size_t> batch_sizes;
+  batch_keys.reserve(read_indices.size());
+  batch_ptrs.reserve(read_indices.size());
+  batch_sizes.reserve(read_indices.size());
+  for (size_t idx : read_indices) {
+    batch_keys.push_back(keys[idx]);
+    batch_ptrs.push_back(ptrs[idx]);
+    batch_sizes.push_back(sizes[idx]);
+  }
+
+  auto batch_results = storage_.ReadBatchIntoPtr(batch_keys, batch_ptrs, batch_sizes);
+
+  // Phase 3: Post-read index maintenance (mirrors GetIntoPtr per-key logic).
+  for (size_t j = 0; j < read_indices.size(); ++j) {
+    size_t i = read_indices[j];
+    bool ok = batch_results[j];
+    results[i] = ok;
+
+    if (role_ == UMBPRole::SharedSSDFollower) {
+      if (ok) {
+        StorageTier tier = StorageTier::LOCAL_SSD;
+        auto* dram = storage_.GetTier(StorageTier::CPU_DRAM);
+        if (dram && dram->Exists(keys[i])) {
+          tier = StorageTier::CPU_DRAM;
+        }
+        if (!index_.UpdateTier(keys[i], tier)) {
+          index_.Insert(keys[i], {tier, 0, sizes[i]});
+        }
+      } else {
+        if (was_in_index[i] && !storage_.Exists(keys[i])) {
+          index_.Remove(keys[i]);
+        }
+        if (!was_in_index[i] && !storage_.Exists(keys[i])) {
+          index_.Remove(keys[i]);
+        }
+      }
+    } else if (!ok && was_in_index[i] && !storage_.Exists(keys[i])) {
+      index_.Remove(keys[i]);
+    }
+  }
+
   return results;
 }
 

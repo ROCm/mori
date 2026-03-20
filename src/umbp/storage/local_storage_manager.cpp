@@ -378,6 +378,99 @@ bool LocalStorageManager::ReadIntoPtr(const std::string& key, uintptr_t dst, siz
   return false;
 }
 
+std::vector<bool> LocalStorageManager::ReadBatchIntoPtr(const std::vector<std::string>& keys,
+                                                        const std::vector<uintptr_t>& dst_ptrs,
+                                                        const std::vector<size_t>& sizes) {
+  std::vector<bool> results(keys.size(), false);
+  if (keys.empty()) return results;
+
+  // Partition keys by tier using index hints.
+  // tier_indices[t] holds original indices for keys hinted to tier t.
+  // Use the integer value of StorageTier as array index (0=DRAM, 1=SSD).
+  constexpr int kNumTiers = 2;
+  std::vector<size_t> tier_indices[kNumTiers];
+  std::vector<size_t> no_hint_indices;
+
+  for (size_t i = 0; i < keys.size(); ++i) {
+    bool has_hint = false;
+    if (index_) {
+      auto loc = index_->Lookup(keys[i]);
+      if (loc) {
+        int t = static_cast<int>(loc->tier);
+        if (t >= 0 && t < kNumTiers) {
+          tier_indices[t].push_back(i);
+          has_hint = true;
+        }
+      }
+    }
+    if (!has_hint) {
+      no_hint_indices.push_back(i);
+    }
+  }
+
+  // Dispatch per-tier batch reads.
+  for (int t = 0; t < kNumTiers; ++t) {
+    auto& indices = tier_indices[t];
+    if (indices.empty()) continue;
+
+    StorageTier tier_id = static_cast<StorageTier>(t);
+    TierBackend* tier = GetTier(tier_id);
+    if (!tier) {
+      for (size_t idx : indices) no_hint_indices.push_back(idx);
+      continue;
+    }
+
+    if (tier->Capabilities().batch_read && indices.size() > 1) {
+      std::vector<std::string> batch_keys;
+      std::vector<uintptr_t> batch_ptrs;
+      std::vector<size_t> batch_sizes;
+      batch_keys.reserve(indices.size());
+      batch_ptrs.reserve(indices.size());
+      batch_sizes.reserve(indices.size());
+      for (size_t idx : indices) {
+        batch_keys.push_back(keys[idx]);
+        batch_ptrs.push_back(dst_ptrs[idx]);
+        batch_sizes.push_back(sizes[idx]);
+      }
+      auto batch_results = tier->ReadBatchIntoPtr(batch_keys, batch_ptrs, batch_sizes);
+      for (size_t j = 0; j < indices.size(); ++j) {
+        if (batch_results[j]) {
+          results[indices[j]] = true;
+          if (tier_id != StorageTier::CPU_DRAM && config_.eviction.auto_promote_on_read) {
+            MaybeAutoPromote(keys[indices[j]]);
+          }
+        } else {
+          no_hint_indices.push_back(indices[j]);
+        }
+      }
+    } else {
+      for (size_t idx : indices) {
+        if (tier->Exists(keys[idx])) {
+          bool ok = tier->ReadIntoPtr(keys[idx], dst_ptrs[idx], sizes[idx]);
+          if (ok) {
+            results[idx] = true;
+            if (tier_id != StorageTier::CPU_DRAM && config_.eviction.auto_promote_on_read) {
+              MaybeAutoPromote(keys[idx]);
+            }
+          } else {
+            no_hint_indices.push_back(idx);
+          }
+        } else {
+          no_hint_indices.push_back(idx);
+        }
+      }
+    }
+  }
+
+  // Fallback: full tier scan for keys without hints or that failed hinted read.
+  for (size_t idx : no_hint_indices) {
+    if (results[idx]) continue;  // already resolved
+    results[idx] = ReadIntoPtr(keys[idx], dst_ptrs[idx], sizes[idx]);
+  }
+
+  return results;
+}
+
 bool LocalStorageManager::Exists(const std::string& key) const {
   return FindTierHolding(key) != nullptr;
 }

@@ -32,6 +32,7 @@
 struct TierCapabilities {
   bool zero_copy_read = false;
   bool batch_write = false;
+  bool batch_read = false;
 };
 
 // Abstract base class for storage tier backends (DRAM, SSD, NVM, ...).
@@ -78,6 +79,9 @@ class TierBackend {
   virtual bool WriteBatch(const std::vector<std::string>& keys,
                           const std::vector<const void*>& data_ptrs,
                           const std::vector<size_t>& sizes);
+  virtual std::vector<bool> ReadBatchIntoPtr(const std::vector<std::string>& keys,
+                                             const std::vector<uintptr_t>& dst_ptrs,
+                                             const std::vector<size_t>& sizes);
 
   // Return the LRU key, or empty string if empty.
   // Default returns "". Override in tiers with LRU tracking.

@@ -238,10 +238,110 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
     return IoStatus::Ok();
   }
 
+  IoStatus ReadBatch(const std::vector<IoReadOp>& ops) override {
+    if (!ready_ || ops.empty()) {
+      return ops.empty() ? IoStatus::Ok() : IoStatus::Unavailable("io_uring unavailable");
+    }
+
+    constexpr size_t kChunkBytes = 1 << 20;
+    struct SqeDesc {
+      int fd;
+      uint64_t file_offset;
+      struct iovec iov;
+    };
+
+    std::vector<SqeDesc> descs;
+    descs.reserve(ops.size());
+    for (const auto& op : ops) {
+      size_t remaining = op.size;
+      size_t buf_offset = 0;
+      while (remaining > 0) {
+        size_t chunk = std::min(kChunkBytes, remaining);
+        SqeDesc d;
+        d.fd = op.fd;
+        d.file_offset = op.offset + buf_offset;
+        d.iov.iov_base = static_cast<char*>(op.data) + buf_offset;
+        d.iov.iov_len = chunk;
+        descs.push_back(d);
+        buf_offset += chunk;
+        remaining -= chunk;
+      }
+    }
+
+    const size_t total_sqes = descs.size();
+    const uint32_t ring_cap = *sq_ring_entries_ptr_;
+    const uint32_t max_inflight = (ring_cap > 1) ? (ring_cap - 1) : 1;
+
+    size_t submit_idx = 0;
+    size_t complete_cnt = 0;
+    size_t inflight = 0;
+
+    while (complete_cnt < total_sqes) {
+      uint32_t tail = *sq_tail_;
+      uint32_t head = *sq_head_;
+      uint32_t avail = ring_cap - (tail - head);
+      size_t remain_cap = static_cast<size_t>(avail);
+      size_t inflight_cap = static_cast<size_t>(max_inflight) - inflight;
+      size_t remaining_ops = total_sqes - submit_idx;
+      uint32_t can_submit =
+          static_cast<uint32_t>(std::min(remain_cap, std::min(inflight_cap, remaining_ops)));
+
+      for (uint32_t s = 0; s < can_submit; ++s) {
+        uint32_t idx = tail & *sq_ring_mask_;
+        struct io_uring_sqe* sqe = &sqes_[idx];
+        std::memset(sqe, 0, sizeof(*sqe));
+        sqe->opcode = IORING_OP_READV;
+        sqe->fd = descs[submit_idx].fd;
+        sqe->off = descs[submit_idx].file_offset;
+        sqe->addr = reinterpret_cast<uint64_t>(&descs[submit_idx].iov);
+        sqe->len = 1;
+        sqe->user_data = static_cast<uint64_t>(submit_idx + 1);
+        sq_array_[idx] = idx;
+        ++tail;
+        ++submit_idx;
+      }
+
+      if (can_submit > 0) {
+        std::atomic_thread_fence(std::memory_order_release);
+        *sq_tail_ = tail;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        inflight += can_submit;
+        IoStatus status = SubmitAndWait(can_submit, 0);
+        if (!status.ok()) return status;
+      }
+
+      if (inflight > 0) {
+        IoStatus status = SubmitAndWait(0, 1);
+        if (!status.ok()) return status;
+      }
+
+      uint32_t cq_h = *cq_head_;
+      uint32_t cq_t = *cq_tail_;
+      while (cq_h != cq_t) {
+        uint32_t cidx = cq_h & *cq_ring_mask_;
+        struct io_uring_cqe* cqe = &cqes_[cidx];
+        if (cqe->user_data == 0) return IoStatus::Corruption("io_uring cqe user_data missing");
+        size_t op_idx = static_cast<size_t>(cqe->user_data - 1);
+        if (op_idx >= total_sqes)
+          return IoStatus::Corruption("io_uring cqe user_data out of range");
+        if (cqe->res < 0) return IoStatus::IoError("io_uring batch read failed", -cqe->res);
+        if (static_cast<size_t>(cqe->res) != descs[op_idx].iov.iov_len) {
+          return IoStatus::ShortRead("io_uring batch read completed partially");
+        }
+        ++complete_cnt;
+        --inflight;
+        ++cq_h;
+      }
+      *cq_head_ = cq_h;
+    }
+    return IoStatus::Ok();
+  }
+
   IoCapabilities Capabilities() const override {
     IoCapabilities caps;
     caps.thread_safe = false;
     caps.batch_write = true;
+    caps.batch_read = true;
     caps.native_async = ready_;
     return caps;
   }

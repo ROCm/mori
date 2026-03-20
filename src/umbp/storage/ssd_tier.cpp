@@ -285,6 +285,127 @@ bool SSDTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t size
                           read_fd);
 }
 
+std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys,
+                                            const std::vector<uintptr_t>& dst_ptrs,
+                                            const std::vector<size_t>& sizes) {
+  std::vector<bool> results(keys.size(), false);
+  if (keys.empty()) return results;
+
+  // Per-key lookup result for Phase 2/3.
+  struct ReadLookup {
+    size_t orig_idx;
+    int fd;
+    uint64_t offset;
+    uint32_t expected_crc;
+    size_t size;
+    void* dst;
+  };
+
+  std::vector<ReadLookup> lookups;
+  lookups.reserve(keys.size());
+
+  // Phase 1 (mu_ held): batch index lookup + metadata extraction.
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+
+    // Follower: do a single refresh if any key is missing.
+    if (IsReadOnlyShared()) {
+      bool any_missing = false;
+      for (size_t i = 0; i < keys.size(); ++i) {
+        if (!index_.FindKey(keys[i])) {
+          any_missing = true;
+          break;
+        }
+      }
+      if (any_missing) {
+        RefreshFromDiskLocked(false);
+      }
+    }
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+      auto* meta = index_.FindKey(keys[i]);
+      if (!meta) continue;
+      if (sizes[i] != meta->size) continue;
+      auto* seg = GetSegmentLocked(meta->segment_id);
+      if (!seg || seg->fd < 0) continue;
+      index_.TouchLRU(keys[i]);
+      lookups.push_back({i, seg->fd, meta->value_offset, meta->crc32, sizes[i],
+                         reinterpret_cast<void*>(dst_ptrs[i])});
+    }
+  }
+
+  if (lookups.empty()) return results;
+
+  // Phase 2 (io_mu_ if needed): batch I/O.
+  const bool needs_io_lock = !io_driver_->Capabilities().thread_safe;
+  const bool use_batch = io_driver_->Capabilities().batch_read && lookups.size() > 1;
+
+  std::vector<bool> io_ok(lookups.size(), false);
+
+  if (use_batch) {
+    std::vector<IoReadOp> ops;
+    ops.reserve(lookups.size());
+    for (const auto& lk : lookups) {
+      ops.push_back({lk.fd, lk.dst, lk.size, lk.offset});
+    }
+
+    IoStatus status;
+    if (needs_io_lock) {
+      std::lock_guard<std::mutex> io_lock(io_mu_);
+      status = io_driver_->ReadBatch(ops);
+    } else {
+      status = io_driver_->ReadBatch(ops);
+    }
+
+    if (status.ok()) {
+      // All I/O succeeded; mark all as ok for CRC check.
+      std::fill(io_ok.begin(), io_ok.end(), true);
+    } else {
+      // Batch failed — fall back to per-key reads.
+      RememberStatus(std::move(status));
+      for (size_t j = 0; j < lookups.size(); ++j) {
+        const auto& lk = lookups[j];
+        IoStatus s;
+        if (needs_io_lock) {
+          std::lock_guard<std::mutex> io_lock(io_mu_);
+          s = io_driver_->ReadAt(lk.fd, lk.dst, lk.size, lk.offset);
+        } else {
+          s = io_driver_->ReadAt(lk.fd, lk.dst, lk.size, lk.offset);
+        }
+        io_ok[j] = s.ok();
+        if (!s.ok()) RememberStatus(std::move(s));
+      }
+    }
+  } else {
+    // Serial path (single key or no batch_read capability).
+    for (size_t j = 0; j < lookups.size(); ++j) {
+      const auto& lk = lookups[j];
+      IoStatus s;
+      if (needs_io_lock) {
+        std::lock_guard<std::mutex> io_lock(io_mu_);
+        s = io_driver_->ReadAt(lk.fd, lk.dst, lk.size, lk.offset);
+      } else {
+        s = io_driver_->ReadAt(lk.fd, lk.dst, lk.size, lk.offset);
+      }
+      io_ok[j] = s.ok();
+      if (!s.ok()) RememberStatus(std::move(s));
+    }
+  }
+
+  // Phase 3 (no lock): per-key CRC verification.
+  for (size_t j = 0; j < lookups.size(); ++j) {
+    if (!io_ok[j]) continue;
+    const auto& lk = lookups[j];
+    if (segment::ComputeRecordCrc32(keys[lk.orig_idx], lk.dst, lk.size) != lk.expected_crc) {
+      RememberStatus(IoStatus::Corruption("segment CRC mismatch"));
+      continue;
+    }
+    results[lk.orig_idx] = true;
+  }
+
+  return results;
+}
+
 bool SSDTier::Exists(const std::string& key) const {
   std::lock_guard<std::mutex> lock(mu_);
   if (index_.HasKey(key)) return true;
@@ -353,6 +474,7 @@ std::vector<char> SSDTier::Read(const std::string& key) {
 TierCapabilities SSDTier::Capabilities() const {
   TierCapabilities caps;
   caps.batch_write = true;
+  caps.batch_read = true;
   return caps;
 }
 
