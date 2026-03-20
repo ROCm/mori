@@ -367,36 +367,46 @@ static void CleanupResidualSpdk() {
     system("rm -f /var/tmp/spdk_pid*.lock 2>/dev/null");
 }
 
+// Run in a forked child so that SpdkEnv singleton (which holds NVMe core
+// locks) is destroyed when the child exits — preventing it from blocking
+// subsequent proxy tests in the parent process.
 static bool test_spdk_standalone_write_read() {
-    // This test requires USE_SPDK compiled in and SPDK env set
-    UMBPConfig cfg;
-    cfg.ssd_backend = "spdk";
-    cfg.role = UMBPRole::Standalone;
-    cfg.dram_capacity_bytes = 64ULL * 1024 * 1024;
-    cfg.ssd_capacity_bytes = 1024ULL * 1024 * 1024;
+    pid_t pid = fork();
+    if (pid == 0) {
+        UMBPConfig cfg;
+        cfg.ssd_backend = "spdk";
+        cfg.role = UMBPRole::Standalone;
+        cfg.dram_capacity_bytes = 64ULL * 1024 * 1024;
+        cfg.ssd_capacity_bytes = 1024ULL * 1024 * 1024;
 
-    // Read SPDK config from env
-    auto env_cfg = UMBPConfig::FromEnvironment();
-    cfg.spdk_nvme_pci_addr = env_cfg.spdk_nvme_pci_addr;
-    cfg.spdk_reactor_mask = env_cfg.spdk_reactor_mask;
-    cfg.spdk_mem_size_mb = env_cfg.spdk_mem_size_mb;
-    cfg.spdk_io_workers = env_cfg.spdk_io_workers;
+        auto env_cfg = UMBPConfig::FromEnvironment();
+        cfg.spdk_nvme_pci_addr = env_cfg.spdk_nvme_pci_addr;
+        cfg.spdk_reactor_mask = env_cfg.spdk_reactor_mask;
+        cfg.spdk_mem_size_mb = env_cfg.spdk_mem_size_mb;
+        cfg.spdk_io_workers = env_cfg.spdk_io_workers;
 
-    UMBPClient client(cfg);
+        UMBPClient client(cfg);
 
-    auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
-    CHECK(ssd != nullptr);
+        auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
+        if (!ssd) _exit(1);
 
-    const size_t sz = 65536;
-    std::vector<char> data(sz, 'Z');
-    CHECK(ssd->Write("spdk_standalone_1", data.data(), data.size()));
+        const size_t sz = 65536;
+        std::vector<char> data(sz, 'Z');
+        if (!ssd->Write("spdk_standalone_1", data.data(), data.size()))
+            _exit(2);
 
-    std::vector<char> buf(sz, 0);
-    CHECK(ssd->ReadIntoPtr("spdk_standalone_1",
-          reinterpret_cast<uintptr_t>(buf.data()), sz));
-    CHECK(buf == data);
+        std::vector<char> buf(sz, 0);
+        if (!ssd->ReadIntoPtr("spdk_standalone_1",
+              reinterpret_cast<uintptr_t>(buf.data()), sz))
+            _exit(3);
+        if (buf != data) _exit(4);
 
-    client.Clear();
+        client.Clear();
+        _exit(0);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     return true;
 }
 
