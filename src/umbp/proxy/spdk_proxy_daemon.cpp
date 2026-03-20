@@ -194,10 +194,16 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
                 desc->entries[i].result = results[i] ? 1 : 0;
         }
     } else {
+        std::vector<std::string> keys(count);
         std::vector<uintptr_t> dma_ptrs(count);
-        for (uint32_t i = 0; i < count; ++i)
+        std::vector<size_t> sizes(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            auto& e = desc->entries[i];
+            keys[i] = std::string(e.key, e.key_len);
             dma_ptrs[i] = reinterpret_cast<uintptr_t>(
-                data_base + desc->entries[i].data_offset);
+                data_base + e.data_offset);
+            sizes[i] = e.data_size;
+        }
 
         auto results = tier.BatchReadIntoPtrStreaming(
             keys, dma_ptrs, sizes, &desc->items_done);
