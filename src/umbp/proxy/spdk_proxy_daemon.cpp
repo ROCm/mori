@@ -128,12 +128,11 @@ static void ProcessSingleRequest(SpdkSsdTier& tier, RingSlot& slot,
 //
 // Read:  uses BatchReadIntoPtrStreaming — single pipeline call with per-item
 //        items_done signaling so client overlaps SHM→user copy with NVMe I/O.
-// Write: for large batches (≥64MB, >256 items), sub-batch streaming overlaps
-//        client memcpy→SHM with daemon NVMe writes.  Small batches use a
-//        single BatchWrite call.
+// Write: adaptive sub-batch streaming overlaps client memcpy→SHM with daemon
+//        NVMe writes.  Group size adapts to ensure ~4 pipeline stages.
 // ---------------------------------------------------------------------------
-static constexpr uint32_t kWriteGroupSize = 256;
-static constexpr size_t   kWriteStreamThreshold = 64ULL * 1024 * 1024;
+static constexpr uint32_t kWriteGroupSizeMax = 64;
+static constexpr size_t   kWriteStreamThreshold = 32ULL * 1024 * 1024;
 
 static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
                                 void* data_region, size_t region_size) {
@@ -151,11 +150,12 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
     char* data_base = static_cast<char*>(data_region) + data_base_offset;
 
     if (type == RequestType::BATCH_WRITE) {
-        const bool stream_write = (count > kWriteGroupSize) &&
+        const bool stream_write = (count >= 4) &&
                                   (desc->total_data_size >= kWriteStreamThreshold);
         if (stream_write) {
-            for (uint32_t g = 0; g < count; g += kWriteGroupSize) {
-                uint32_t gc = std::min(kWriteGroupSize, count - g);
+            uint32_t grp = std::max(1U, std::min(kWriteGroupSizeMax, count / 4));
+            for (uint32_t g = 0; g < count; g += grp) {
+                uint32_t gc = std::min(grp, count - g);
                 while (desc->items_ready.load(std::memory_order_acquire) < g + gc) {
 #if defined(__x86_64__) || defined(_M_X64)
                     _mm_pause();
