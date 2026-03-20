@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -23,10 +24,18 @@ static double NowSec() {
     return std::chrono::duration<double>(tp.time_since_epoch()).count();
 }
 
+static std::string MakeSessionId() {
+    std::random_device rd;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%08x", rd());
+    return buf;
+}
+
 static void RunBatch(SpdkProxyTier& tier, uint32_t rank_id,
+                     const std::string& session,
                      size_t value_size, int count, int iterations) {
-    std::string prefix = "r" + std::to_string(rank_id) + "_pb_" +
-                         std::to_string(value_size) + "_";
+    std::string prefix = "r" + std::to_string(rank_id) + "_" + session +
+                         "_" + std::to_string(value_size) + "_";
 
     std::vector<std::vector<char>> datas(count);
     std::vector<const void*> ptrs(count);
@@ -123,14 +132,15 @@ int main() {
     };
 
     const int iterations = 3;
+    std::string session = MakeSessionId();
 
-    printf("\n%s\n SpdkProxyTier BATCH THROUGHPUT (rank=%u)\n%s\n",
+    printf("\n%s\n SpdkProxyTier BATCH THROUGHPUT (rank=%u session=%s)\n%s\n",
            std::string(72, '-').c_str(), cfg.spdk_proxy_rank_id,
-           std::string(72, '-').c_str());
+           session.c_str(), std::string(72, '-').c_str());
     printf("  %8s  %6s  %10s  %10s\n", "ValSize", "Count", "Write MB/s", "Read MB/s");
 
     for (auto& s : specs) {
-        RunBatch(tier, cfg.spdk_proxy_rank_id, s.size, s.count, iterations);
+        RunBatch(tier, cfg.spdk_proxy_rank_id, session, s.size, s.count, iterations);
     }
 
     printf("\n");
