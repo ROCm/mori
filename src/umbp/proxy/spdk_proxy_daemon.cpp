@@ -28,6 +28,10 @@
 #include <thread>
 #include <vector>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 #include "umbp/common/config.h"
 #include "umbp/common/log.h"
 #include "umbp/proxy/spdk_proxy_protocol.h"
@@ -37,12 +41,6 @@
 #ifdef __linux__
 #include <sys/prctl.h>
 #include <unistd.h>
-#endif
-
-#ifdef USE_SPDK
-extern "C" {
-#include <spdk/env.h>
-}
 #endif
 
 using namespace umbp::proxy;
@@ -126,11 +124,10 @@ static void ProcessSingleRequest(SpdkSsdTier& tier, RingSlot& slot,
 }
 
 // ---------------------------------------------------------------------------
-// Process a batch request — zero-copy streaming or memcpy fallback
+// Process a batch request — wait for client data, then use DMA ring path
 // ---------------------------------------------------------------------------
 static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
-                                void* data_region, size_t region_size,
-                                bool zero_copy) {
+                                void* data_region, size_t region_size) {
     auto type = static_cast<RequestType>(slot.type);
     auto* desc = static_cast<BatchDescriptor*>(data_region);
     uint32_t count = desc->count;
@@ -154,18 +151,19 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
     }
 
     if (type == RequestType::BATCH_WRITE) {
-        std::vector<void*> dma_ptrs(count);
-        for (uint32_t i = 0; i < count; ++i)
-            dma_ptrs[i] = data_base + desc->entries[i].data_offset;
-
-        std::vector<bool> results;
-        if (zero_copy) {
-            results = tier.BatchWriteDmaStreaming(keys, dma_ptrs, sizes,
-                                                  &desc->items_ready);
-        } else {
-            std::vector<const void*> cptrs(dma_ptrs.begin(), dma_ptrs.end());
-            results = tier.BatchWrite(keys, cptrs, sizes);
+        // Wait for client to finish copying all data into SHM before reading.
+        // The client increments items_ready per key; we need all of them.
+        while (desc->items_ready.load(std::memory_order_acquire) < count) {
+#if defined(__x86_64__) || defined(_M_X64)
+            _mm_pause();
+#endif
         }
+
+        std::vector<const void*> cptrs(count);
+        for (uint32_t i = 0; i < count; ++i)
+            cptrs[i] = data_base + desc->entries[i].data_offset;
+
+        auto results = tier.BatchWrite(keys, cptrs, sizes);
         for (uint32_t i = 0; i < count; ++i)
             desc->entries[i].result = results[i] ? 1 : 0;
     } else {
@@ -174,15 +172,10 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
             dma_ptrs[i] = reinterpret_cast<uintptr_t>(
                 data_base + desc->entries[i].data_offset);
 
-        std::vector<bool> results;
-        if (zero_copy) {
-            results = tier.BatchReadDmaStreaming(keys, dma_ptrs, sizes,
-                                                 &desc->items_done);
-        } else {
-            results = tier.BatchReadIntoPtr(keys, dma_ptrs, sizes);
-        }
+        auto results = tier.BatchReadIntoPtr(keys, dma_ptrs, sizes);
         for (uint32_t i = 0; i < count; ++i)
             desc->entries[i].result = results[i] ? 1 : 0;
+        desc->items_done.store(count, std::memory_order_release);
     }
 
     slot.result = static_cast<int32_t>(ResultCode::OK);
@@ -191,14 +184,13 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
 // ---------------------------------------------------------------------------
 // Main poll loop — with heartbeat, dead-rank reap, and shutdown logic
 // ---------------------------------------------------------------------------
-static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm, bool zero_copy,
+static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm,
                      pid_t spawner_pid) {
     auto* hdr = shm.Header();
     uint32_t max_ranks = hdr->max_ranks;
 
-    UMBP_LOG_INFO("spdk_proxy: entering poll loop (max_ranks=%u, zero_copy=%s, spawner=%d)",
-                  max_ranks, zero_copy ? "ON" : "OFF",
-                  static_cast<int>(spawner_pid));
+    UMBP_LOG_INFO("spdk_proxy: entering poll loop (max_ranks=%u, spawner=%d)",
+                  max_ranks, static_cast<int>(spawner_pid));
 
     auto last_heartbeat = std::chrono::steady_clock::now();
     auto last_reap = last_heartbeat;
@@ -226,8 +218,7 @@ static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm, bool zero_copy,
             auto rtype = static_cast<RequestType>(slot.type);
             if (rtype == RequestType::BATCH_WRITE ||
                 rtype == RequestType::BATCH_READ) {
-                ProcessBatchRequest(tier, slot, data_region, region_size,
-                                    zero_copy);
+                ProcessBatchRequest(tier, slot, data_region, region_size);
             } else {
                 ProcessSingleRequest(tier, slot, data_region, region_size);
             }
@@ -419,22 +410,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Step 3: Register SHM with SPDK for zero-copy DMA (hugepage only)
-    bool zero_copy = false;
-#ifdef USE_SPDK
-    if (shm.IsHugepage()) {
-        rc = spdk_mem_register(shm.Base(), shm.Size());
-        if (rc == 0) {
-            zero_copy = true;
-            UMBP_LOG_INFO("spdk_proxy: SHM registered for DMA — ZERO-COPY enabled");
-        } else {
-            UMBP_LOG_WARN("spdk_proxy: spdk_mem_register failed rc=%d — "
-                          "falling back to memcpy mode", rc);
-        }
-    }
-#endif
-
-    // Step 4: Publish READY state
+    // Step 3: Publish READY state
     auto [used, total] = tier.Capacity();
     hdr->bdev_size = total;
     hdr->block_size = 4096;
@@ -444,23 +420,16 @@ int main(int argc, char** argv) {
     hdr->state.store(static_cast<uint32_t>(ProxyState::READY),
                      std::memory_order_release);
 
-    UMBP_LOG_INFO("spdk_proxy: READY — capacity=%zuMB, zero_copy=%s, "
-                  "waiting for connections...",
-                  total / (1024 * 1024), zero_copy ? "ON" : "OFF");
+    UMBP_LOG_INFO("spdk_proxy: READY — capacity=%zuMB, waiting for connections...",
+                  total / (1024 * 1024));
     fflush(stdout);
 
-    // Step 5: Enter main poll loop (returns when shutdown conditions met)
-    PollLoop(tier, shm, zero_copy, spawner_pid);
+    // Step 4: Enter main poll loop (returns when shutdown conditions met)
+    PollLoop(tier, shm, spawner_pid);
 
-    // Step 6: Shutdown
+    // Step 5: Shutdown
     hdr->state.store(static_cast<uint32_t>(ProxyState::SHUTDOWN),
                      std::memory_order_release);
-
-#ifdef USE_SPDK
-    if (zero_copy) {
-        spdk_mem_unregister(shm.Base(), shm.Size());
-    }
-#endif
 
     UMBP_LOG_INFO("spdk_proxy: shutting down");
     shm.Detach();
