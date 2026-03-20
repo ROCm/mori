@@ -437,6 +437,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Re-register signal handlers — spdk_app_start() overrides them
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
     // Step 3: Publish READY state
     auto [used, total] = tier.Capacity();
     hdr->bdev_size = total;
