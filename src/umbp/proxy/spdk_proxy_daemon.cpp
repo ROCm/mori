@@ -1,0 +1,353 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+// MIT License
+//
+// spdk_proxy: Standalone daemon that exclusively owns SPDK + NVMe device.
+// Rank processes communicate via POSIX shared memory (hugepage-backed for
+// zero-copy DMA when available).
+//
+// Usage:
+//   UMBP_SPDK_NVME_PCI=0000:07:00.0 UMBP_SPDK_MEM_MB=4096 \
+//   UMBP_SPDK_REACTOR_MASK=0x3 UMBP_SPDK_PROXY_MAX_RANKS=8 \
+//   ./spdk_proxy
+
+#include <atomic>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "umbp/common/config.h"
+#include "umbp/common/log.h"
+#include "umbp/proxy/spdk_proxy_protocol.h"
+#include "umbp/proxy/spdk_proxy_shm.h"
+#include "umbp/storage/spdk_ssd_tier.h"
+
+#ifdef USE_SPDK
+extern "C" {
+#include <spdk/env.h>
+}
+#endif
+
+using namespace umbp::proxy;
+
+static std::atomic<bool> g_running{true};
+
+static void signal_handler(int) { g_running.store(false, std::memory_order_relaxed); }
+
+// ---------------------------------------------------------------------------
+// Process a single non-batch request
+// ---------------------------------------------------------------------------
+static void ProcessSingleRequest(SpdkSsdTier& tier, RingSlot& slot,
+                                 void* data_region, size_t region_size) {
+    std::string key(slot.key, slot.key_len);
+    auto type = static_cast<RequestType>(slot.type);
+
+    switch (type) {
+        case RequestType::WRITE: {
+            if (slot.data_size > region_size) {
+                slot.result = static_cast<int32_t>(ResultCode::ERROR);
+                break;
+            }
+            bool ok = tier.Write(key, data_region, slot.data_size);
+            slot.result = ok ? static_cast<int32_t>(ResultCode::OK)
+                             : static_cast<int32_t>(ResultCode::NO_SPACE);
+            break;
+        }
+        case RequestType::READ: {
+            auto dst = reinterpret_cast<uintptr_t>(data_region);
+            size_t max_read = std::min(static_cast<size_t>(slot.data_size),
+                                       region_size);
+            if (max_read == 0) max_read = region_size;
+            bool ok = tier.ReadIntoPtr(key, dst, max_read);
+            slot.result = ok ? static_cast<int32_t>(ResultCode::OK)
+                             : static_cast<int32_t>(ResultCode::NOT_FOUND);
+            if (ok) slot.result_size = max_read;
+            break;
+        }
+        case RequestType::EXISTS: {
+            bool ok = tier.Exists(key);
+            slot.result = ok ? static_cast<int32_t>(ResultCode::OK)
+                             : static_cast<int32_t>(ResultCode::NOT_FOUND);
+            break;
+        }
+        case RequestType::EVICT: {
+            bool ok = tier.Evict(key);
+            slot.result = ok ? static_cast<int32_t>(ResultCode::OK)
+                             : static_cast<int32_t>(ResultCode::NOT_FOUND);
+            break;
+        }
+        case RequestType::CLEAR: {
+            tier.Clear();
+            slot.result = static_cast<int32_t>(ResultCode::OK);
+            break;
+        }
+        case RequestType::CAPACITY: {
+            auto [used, total] = tier.Capacity();
+            slot.result = static_cast<int32_t>(ResultCode::OK);
+            slot.result_size = used;
+            slot.result_aux = total;
+            break;
+        }
+        case RequestType::GET_LRU_KEY: {
+            std::string lru = tier.GetLRUKey();
+            if (lru.empty()) {
+                slot.result = static_cast<int32_t>(ResultCode::NOT_FOUND);
+                slot.result_size = 0;
+            } else {
+                size_t copy_len = std::min(lru.size(), region_size - 1);
+                std::memcpy(data_region, lru.data(), copy_len);
+                static_cast<char*>(data_region)[copy_len] = '\0';
+                slot.result = static_cast<int32_t>(ResultCode::OK);
+                slot.result_size = copy_len;
+            }
+            break;
+        }
+        default:
+            slot.result = static_cast<int32_t>(ResultCode::ERROR);
+            break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Process a batch request — zero-copy or fallback
+// ---------------------------------------------------------------------------
+static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
+                                void* data_region, size_t region_size,
+                                bool zero_copy) {
+    auto type = static_cast<RequestType>(slot.type);
+    auto* desc = static_cast<BatchDescriptor*>(data_region);
+    uint32_t count = desc->count;
+
+    if (count == 0) {
+        slot.result = static_cast<int32_t>(ResultCode::OK);
+        return;
+    }
+
+    size_t desc_total = sizeof(BatchDescriptor) + count * sizeof(BatchEntry);
+    size_t data_base_offset = (desc_total + kDmaAlignment - 1) & ~(kDmaAlignment - 1);
+    char* data_base = static_cast<char*>(data_region) + data_base_offset;
+
+    std::vector<std::string> keys(count);
+    std::vector<size_t> sizes(count);
+
+    for (uint32_t i = 0; i < count; ++i) {
+        auto& e = desc->entries[i];
+        keys[i] = std::string(e.key, e.key_len);
+        sizes[i] = e.data_size;
+    }
+
+    if (type == RequestType::BATCH_WRITE) {
+        std::vector<void*> dma_ptrs(count);
+        for (uint32_t i = 0; i < count; ++i)
+            dma_ptrs[i] = data_base + desc->entries[i].data_offset;
+
+        std::vector<bool> results;
+        if (zero_copy) {
+            // STREAMING: proxy starts NVMe as client copies; items_ready signals progress
+            results = tier.BatchWriteDmaStreaming(keys, dma_ptrs, sizes,
+                                                  &desc->items_ready);
+        } else {
+            std::vector<const void*> cptrs(dma_ptrs.begin(), dma_ptrs.end());
+            results = tier.BatchWrite(keys, cptrs, sizes);
+        }
+        for (uint32_t i = 0; i < count; ++i)
+            desc->entries[i].result = results[i] ? 1 : 0;
+    } else {
+        std::vector<uintptr_t> dma_ptrs(count);
+        for (uint32_t i = 0; i < count; ++i)
+            dma_ptrs[i] = reinterpret_cast<uintptr_t>(
+                data_base + desc->entries[i].data_offset);
+
+        std::vector<bool> results;
+        if (zero_copy) {
+            // STREAMING: proxy signals items_done so client copies in parallel
+            results = tier.BatchReadDmaStreaming(keys, dma_ptrs, sizes,
+                                                 &desc->items_done);
+        } else {
+            results = tier.BatchReadIntoPtr(keys, dma_ptrs, sizes);
+        }
+        for (uint32_t i = 0; i < count; ++i)
+            desc->entries[i].result = results[i] ? 1 : 0;
+    }
+
+    slot.result = static_cast<int32_t>(ResultCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// Main poll loop
+// ---------------------------------------------------------------------------
+static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm, bool zero_copy) {
+    auto* hdr = shm.Header();
+    uint32_t max_ranks = hdr->max_ranks;
+
+    UMBP_LOG_INFO("spdk_proxy: entering poll loop (max_ranks=%u, zero_copy=%s)",
+                  max_ranks, zero_copy ? "ON" : "OFF");
+
+    while (g_running.load(std::memory_order_relaxed)) {
+        bool any_work = false;
+
+        for (uint32_t r = 0; r < max_ranks; ++r) {
+            auto* ch = shm.Channel(r);
+            if (!ch->connected) continue;
+
+            uint32_t t = ch->tail.load(std::memory_order_relaxed);
+            uint32_t h = ch->head.load(std::memory_order_acquire);
+            if (t == h) continue;
+
+            auto& slot = ch->slots[t % kRingSize];
+            uint32_t st = slot.state.load(std::memory_order_acquire);
+            if (st != static_cast<uint32_t>(SlotState::PENDING)) continue;
+
+            any_work = true;
+
+            void* data_region = shm.DataRegion(r);
+            size_t region_size = hdr->data_region_per_rank;
+
+            auto rtype = static_cast<RequestType>(slot.type);
+            if (rtype == RequestType::BATCH_WRITE ||
+                rtype == RequestType::BATCH_READ) {
+                ProcessBatchRequest(tier, slot, data_region, region_size,
+                                    zero_copy);
+            } else {
+                ProcessSingleRequest(tier, slot, data_region, region_size);
+            }
+
+            slot.state.store(static_cast<uint32_t>(SlotState::COMPLETED),
+                             std::memory_order_release);
+            ch->tail.store((t + 1) % kRingSize, std::memory_order_release);
+        }
+
+        if (!any_work) {
+#if defined(__x86_64__) || defined(_M_X64)
+            for (int i = 0; i < 32; ++i) _mm_pause();
+#endif
+        }
+    }
+
+    UMBP_LOG_INFO("spdk_proxy: exiting poll loop");
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+int main(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    auto getenv_str = [](const char* name, const char* def) -> std::string {
+        const char* v = std::getenv(name);
+        return v ? v : def;
+    };
+    auto getenv_int = [](const char* name, int def) -> int {
+        const char* v = std::getenv(name);
+        return v ? std::atoi(v) : def;
+    };
+    auto getenv_size = [](const char* name, size_t def) -> size_t {
+        const char* v = std::getenv(name);
+        return v ? static_cast<size_t>(std::stoull(v)) : def;
+    };
+
+    std::string nvme_pci = getenv_str("UMBP_SPDK_NVME_PCI", "");
+    std::string nvme_ctrl = getenv_str("UMBP_SPDK_NVME_CTRL", "NVMe0");
+    std::string bdev_name = getenv_str("UMBP_SPDK_BDEV", "");
+    std::string reactor_mask = getenv_str("UMBP_SPDK_REACTOR_MASK", "0x3");
+    int mem_mb = getenv_int("UMBP_SPDK_MEM_MB", 4096);
+    int io_workers = getenv_int("UMBP_SPDK_IO_WORKERS", 4);
+    size_t ssd_cap = getenv_size("UMBP_SSD_CAPACITY", 0);
+
+    std::string shm_name = getenv_str("UMBP_SPDK_PROXY_SHM", kDefaultShmName);
+    int max_ranks = getenv_int("UMBP_SPDK_PROXY_MAX_RANKS", 8);
+    size_t data_per_rank_mb = getenv_size("UMBP_SPDK_PROXY_DATA_MB", 512);
+    size_t data_per_rank = data_per_rank_mb * 1024 * 1024;
+
+    if (nvme_pci.empty() && bdev_name.empty()) {
+        fprintf(stderr,
+                "spdk_proxy: UMBP_SPDK_NVME_PCI or UMBP_SPDK_BDEV required\n");
+        return 1;
+    }
+
+    // Step 1: Create shared memory (try hugepage for zero-copy DMA)
+    ProxyShmRegion shm;
+    int rc = shm.Create(shm_name, max_ranks, data_per_rank, /*try_hugepage=*/true);
+    if (rc != 0) {
+        fprintf(stderr, "spdk_proxy: failed to create SHM '%s' rc=%d\n",
+                shm_name.c_str(), rc);
+        return 1;
+    }
+    UMBP_LOG_INFO("spdk_proxy: SHM created '%s' — %u ranks, %zuMB/rank, total=%zuMB, hugepage=%s",
+                  shm_name.c_str(), max_ranks,
+                  data_per_rank / (1024 * 1024),
+                  shm.Size() / (1024 * 1024),
+                  shm.IsHugepage() ? "YES" : "NO");
+
+    // Step 2: Initialize SPDK via SpdkSsdTier
+    UMBPConfig cfg;
+    cfg.ssd_backend = "spdk";
+    cfg.spdk_bdev_name = bdev_name;
+    cfg.spdk_reactor_mask = reactor_mask;
+    cfg.spdk_mem_size_mb = mem_mb;
+    cfg.spdk_nvme_pci_addr = nvme_pci;
+    cfg.spdk_nvme_ctrl_name = nvme_ctrl;
+    cfg.spdk_io_workers = io_workers;
+    if (ssd_cap > 0) cfg.ssd_capacity_bytes = ssd_cap;
+    else cfg.ssd_capacity_bytes = static_cast<size_t>(-1);
+
+    SpdkSsdTier tier(cfg);
+    if (!tier.IsValid()) {
+        fprintf(stderr, "spdk_proxy: SpdkSsdTier init failed\n");
+        return 1;
+    }
+
+    // Step 3: Register SHM with SPDK for zero-copy DMA (hugepage only)
+    bool zero_copy = false;
+#ifdef USE_SPDK
+    if (shm.IsHugepage()) {
+        rc = spdk_mem_register(shm.Base(), shm.Size());
+        if (rc == 0) {
+            zero_copy = true;
+            UMBP_LOG_INFO("spdk_proxy: SHM registered for DMA — ZERO-COPY enabled");
+        } else {
+            UMBP_LOG_WARN("spdk_proxy: spdk_mem_register failed rc=%d — "
+                          "falling back to memcpy mode", rc);
+        }
+    }
+#endif
+
+    // Step 4: Update SHM header
+    auto [used, total] = tier.Capacity();
+    auto* hdr = shm.Header();
+    hdr->bdev_size = total;
+    hdr->block_size = 4096;
+    hdr->capacity_used.store(used, std::memory_order_relaxed);
+    hdr->capacity_total.store(total, std::memory_order_relaxed);
+    hdr->state.store(static_cast<uint32_t>(ProxyState::READY),
+                     std::memory_order_release);
+
+    UMBP_LOG_INFO("spdk_proxy: READY — capacity=%zuMB, zero_copy=%s, "
+                  "waiting for connections...",
+                  total / (1024 * 1024), zero_copy ? "ON" : "OFF");
+    fflush(stdout);
+
+    // Step 5: Enter main poll loop
+    PollLoop(tier, shm, zero_copy);
+
+    // Step 6: Shutdown
+    hdr->state.store(static_cast<uint32_t>(ProxyState::SHUTDOWN),
+                     std::memory_order_release);
+
+#ifdef USE_SPDK
+    if (zero_copy) {
+        spdk_mem_unregister(shm.Base(), shm.Size());
+    }
+#endif
+
+    UMBP_LOG_INFO("spdk_proxy: shutting down");
+    shm.Detach();
+
+    return 0;
+}

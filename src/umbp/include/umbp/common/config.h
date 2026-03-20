@@ -60,6 +60,10 @@ struct UMBPConfig {
   std::string spdk_nvme_ctrl_name = "NVMe0";
   int spdk_io_workers = 4;                     // Internal I/O worker threads for SpdkSsdTier batch ops
 
+  // SPDK Proxy configuration (ssd_backend == "spdk_proxy")
+  std::string spdk_proxy_shm_name = "/umbp_spdk_proxy";
+  uint32_t spdk_proxy_rank_id = 0;
+
   // Role is the source of truth for runtime behavior.
   UMBPRole role = UMBPRole::Standalone;
 
@@ -115,6 +119,10 @@ struct UMBPConfig {
     cfg.spdk_nvme_pci_addr = getenv_str("UMBP_SPDK_NVME_PCI", cfg.spdk_nvme_pci_addr);
     cfg.spdk_nvme_ctrl_name = getenv_str("UMBP_SPDK_NVME_CTRL", cfg.spdk_nvme_ctrl_name);
     cfg.spdk_io_workers = getenv_int("UMBP_SPDK_IO_WORKERS", cfg.spdk_io_workers);
+
+    cfg.spdk_proxy_shm_name = getenv_str("UMBP_SPDK_PROXY_SHM", cfg.spdk_proxy_shm_name);
+    cfg.spdk_proxy_rank_id = static_cast<uint32_t>(
+        getenv_int("UMBP_SPDK_PROXY_RANK", static_cast<int>(cfg.spdk_proxy_rank_id)));
 
     return cfg;
   }

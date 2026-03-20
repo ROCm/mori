@@ -47,6 +47,13 @@ set(UMBP_CORE_SRCS
   storage/ssd_tier.cpp storage/local_storage_manager.cpp umbp_client.cpp
   allocator/offset_allocator.cpp)
 
+# SPDK Proxy client (shared memory IPC, no SPDK dependency — Linux only)
+if(UNIX)
+  list(APPEND UMBP_CORE_SRCS
+    proxy/spdk_proxy_shm.cpp
+    storage/spdk_proxy_tier.cpp)
+endif()
+
 if(HAVE_SPDK)
   list(APPEND UMBP_CORE_SRCS
     storage/spdk/spdk_env.cpp
@@ -56,6 +63,9 @@ endif()
 add_library(umbp_core STATIC ${UMBP_CORE_SRCS})
 target_include_directories(umbp_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(umbp_core PRIVATE pthread)
+if(UNIX)
+  target_link_libraries(umbp_core PRIVATE rt)
+endif()
 
 if(HAVE_SPDK)
   target_compile_definitions(umbp_core PUBLIC USE_SPDK)
@@ -77,6 +87,16 @@ if(HAVE_SPDK)
   # SPDK benchmark
   add_executable(spdk_bench benchmarks/spdk_bench.cpp)
   target_link_libraries(spdk_bench PRIVATE umbp_core)
+
+  # SPDK Proxy daemon (owns SPDK, serves ranks via SHM IPC)
+  add_executable(spdk_proxy proxy/spdk_proxy_daemon.cpp)
+  target_link_libraries(spdk_proxy PRIVATE umbp_core)
+endif()
+
+# SPDK Proxy benchmark (no SPDK dependency, only SHM — Linux only)
+if(UNIX)
+  add_executable(proxy_bench benchmarks/proxy_bench.cpp)
+  target_link_libraries(proxy_bench PRIVATE umbp_core)
 endif()
 
 # Python bindings are registered in src/pybind/pybind_umbp.cpp (compiled into

@@ -29,6 +29,9 @@
 #ifdef USE_SPDK
 #include "umbp/storage/spdk_ssd_tier.h"
 #endif
+#ifdef __linux__
+#include "umbp/storage/spdk_proxy_tier.h"
+#endif
 
 // ---------------------------------------------------------------------------
 // ExtractBaseHash
@@ -231,6 +234,18 @@ LocalStorageManager::LocalStorageManager(const UMBPConfig& config, BlockIndexCli
               "  To enable SPDK: install SPDK with pkg-config, then rebuild.\n");
 #endif
     }
+#ifdef __linux__
+    if (config_.ssd_backend == "spdk_proxy") {
+      auto proxy_tier = std::make_unique<SpdkProxyTier>(config_);
+      if (proxy_tier->IsValid()) {
+        ssd_backend = std::move(proxy_tier);
+      } else {
+        fprintf(stderr,
+                "[UMBP WARN] SpdkProxyTier connect failed (is spdk_proxy running?). "
+                "Falling back to POSIX SSD.\n");
+      }
+    }
+#endif
     if (!ssd_backend) {
       SSDAccessMode ssd_access_mode = SSDAccessMode::ReadWrite;
       if (role_ == UMBPRole::SharedSSDFollower) {
