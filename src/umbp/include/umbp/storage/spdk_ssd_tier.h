@@ -42,6 +42,18 @@ class SpdkSsdTier : public TierBackend {
         const std::vector<uintptr_t>& dst_ptrs,
         const std::vector<size_t>& sizes) override;
 
+    // DMA-ring write with byte-level streaming from shared memory.
+    // Identical to BatchWrite except that before memcpy-ing each DMA chunk,
+    // the pipeline waits for *bytes_ready >= item_shm_offset[i] + chunk_end.
+    // item_shm_offsets[i] is the absolute byte offset of item i's data within
+    // the SHM data area (caller computes from BatchEntry::data_offset).
+    std::vector<bool> BatchWriteStreaming(
+        const std::vector<std::string>& keys,
+        const std::vector<const void*>& data_ptrs,
+        const std::vector<size_t>& sizes,
+        std::atomic<uint64_t>* bytes_ready,
+        const std::vector<size_t>& item_shm_offsets);
+
     // DMA-ring read with per-item streaming progress.
     // Single-worker pipeline (QD=128, saturates NVMe) signals *items_done
     // after each item's data is memcpy'd to dst_ptrs, enabling the caller to

@@ -144,9 +144,15 @@ struct BatchDescriptor {
     uint32_t count;
     uint32_t _reserved;
     uint64_t total_data_size;
-    // Streaming signals — separate cache lines to avoid false sharing
+    // Streaming signals — separate cache lines to avoid false sharing.
+    // items_ready / items_done: per-item granularity (existing).
+    // bytes_ready: byte-level granularity for intra-item write streaming.
+    //   Updated by client as it copies data chunks to SHM, checked by daemon
+    //   before reading each DMA-ring chunk.  Allows NVMe writes to overlap
+    //   with client memcpy even for single large items (e.g. 512MB × 1).
     alignas(64) std::atomic<uint32_t> items_ready;
     alignas(64) std::atomic<uint32_t> items_done;
+    alignas(64) std::atomic<uint64_t> bytes_ready;
 
     BatchEntry entries[];
 };

@@ -277,6 +277,7 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(
         desc->total_data_size = total_data;
         desc->items_ready.store(0, std::memory_order_relaxed);
         desc->items_done.store(0, std::memory_order_relaxed);
+        desc->bytes_ready.store(0, std::memory_order_relaxed);
 
         size_t data_cursor = 0;
         char* data_base = static_cast<char*>(data_region) + data_start;
@@ -323,14 +324,25 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(
         ch->head.store((h + 1) % kRingSize, std::memory_order_release);
 
         if (type == RequestType::BATCH_WRITE) {
-            // STREAMING WRITE: copy data per-key, signal items_ready.
+            // STREAMING WRITE: copy data in 2MB chunks, update bytes_ready
+            // so daemon can start NVMe writes before the full item is copied.
+            constexpr size_t kCopyChunk = 2ULL * 1024 * 1024;
             for (int i = 0; i < sub_count; ++i) {
                 int gi = base + i;
                 if (!data_ptrs.empty() && data_ptrs[gi] != nullptr) {
-                    std::memcpy(data_base + desc->entries[i].data_offset,
-                                data_ptrs[gi], sizes[gi]);
+                    const char* src = static_cast<const char*>(data_ptrs[gi]);
+                    char* dst = data_base + desc->entries[i].data_offset;
+                    size_t item_sz = sizes[gi];
+                    size_t copied = 0;
+                    while (copied < item_sz) {
+                        size_t chunk = std::min(kCopyChunk, item_sz - copied);
+                        std::memcpy(dst + copied, src + copied, chunk);
+                        copied += chunk;
+                        desc->bytes_ready.store(
+                            desc->entries[i].data_offset + copied,
+                            std::memory_order_release);
+                    }
                 }
-                // Use sub-batch-local index (i+1), NOT global (gi+1)
                 desc->items_ready.store(static_cast<uint32_t>(i + 1),
                                         std::memory_order_release);
             }

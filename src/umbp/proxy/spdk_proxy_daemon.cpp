@@ -128,12 +128,11 @@ static void ProcessSingleRequest(SpdkSsdTier& tier, RingSlot& slot,
 //
 // Read:  uses BatchReadIntoPtrStreaming — single pipeline call with per-item
 //        items_done signaling so client overlaps SHM→user copy with NVMe I/O.
-// Write: adaptive sub-batch streaming overlaps client memcpy→SHM with daemon
-//        NVMe writes.  Group size adapts to ensure ~4 pipeline stages.
+// Write: always uses BatchWriteStreaming with byte-level bytes_ready gating.
+//        Client copies data in 2MB chunks and updates bytes_ready; daemon
+//        starts NVMe writes as soon as each DMA chunk's data arrives in SHM.
+//        This gives full overlap even for single large items (e.g. 512MB×1).
 // ---------------------------------------------------------------------------
-static constexpr uint32_t kWriteGroupSizeMax = 64;
-static constexpr size_t   kWriteStreamThreshold = 32ULL * 1024 * 1024;
-
 static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
                                 void* data_region, size_t region_size) {
     auto type = static_cast<RequestType>(slot.type);
@@ -150,49 +149,21 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
     char* data_base = static_cast<char*>(data_region) + data_base_offset;
 
     if (type == RequestType::BATCH_WRITE) {
-        const bool stream_write = (count >= 4) &&
-                                  (desc->total_data_size >= kWriteStreamThreshold);
-        if (stream_write) {
-            uint32_t grp = std::max(1U, std::min(kWriteGroupSizeMax, count / 4));
-            for (uint32_t g = 0; g < count; g += grp) {
-                uint32_t gc = std::min(grp, count - g);
-                while (desc->items_ready.load(std::memory_order_acquire) < g + gc) {
-#if defined(__x86_64__) || defined(_M_X64)
-                    _mm_pause();
-#endif
-                }
-                std::vector<std::string> sk(gc);
-                std::vector<const void*> sp(gc);
-                std::vector<size_t> ss(gc);
-                for (uint32_t i = 0; i < gc; ++i) {
-                    auto& e = desc->entries[g + i];
-                    sk[i] = std::string(e.key, e.key_len);
-                    sp[i] = data_base + e.data_offset;
-                    ss[i] = e.data_size;
-                }
-                auto r = tier.BatchWrite(sk, sp, ss);
-                for (uint32_t i = 0; i < gc; ++i)
-                    desc->entries[g + i].result = r[i] ? 1 : 0;
-            }
-        } else {
-            while (desc->items_ready.load(std::memory_order_acquire) < count) {
-#if defined(__x86_64__) || defined(_M_X64)
-                _mm_pause();
-#endif
-            }
-            std::vector<std::string> keys(count);
-            std::vector<const void*> cptrs(count);
-            std::vector<size_t> sizes(count);
-            for (uint32_t i = 0; i < count; ++i) {
-                auto& e = desc->entries[i];
-                keys[i] = std::string(e.key, e.key_len);
-                cptrs[i] = data_base + e.data_offset;
-                sizes[i] = e.data_size;
-            }
-            auto results = tier.BatchWrite(keys, cptrs, sizes);
-            for (uint32_t i = 0; i < count; ++i)
-                desc->entries[i].result = results[i] ? 1 : 0;
+        std::vector<std::string> keys(count);
+        std::vector<const void*> cptrs(count);
+        std::vector<size_t> sizes(count);
+        std::vector<size_t> shm_offsets(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            auto& e = desc->entries[i];
+            keys[i] = std::string(e.key, e.key_len);
+            cptrs[i] = data_base + e.data_offset;
+            sizes[i] = e.data_size;
+            shm_offsets[i] = e.data_offset;
         }
+        auto results = tier.BatchWriteStreaming(
+            keys, cptrs, sizes, &desc->bytes_ready, shm_offsets);
+        for (uint32_t i = 0; i < count; ++i)
+            desc->entries[i].result = results[i] ? 1 : 0;
     } else {
         std::vector<std::string> keys(count);
         std::vector<uintptr_t> dma_ptrs(count);
@@ -415,7 +386,7 @@ int main(int argc, char** argv) {
 
     std::string shm_name = getenv_str("UMBP_SPDK_PROXY_SHM", kDefaultShmName);
     int max_ranks = getenv_int("UMBP_SPDK_PROXY_MAX_RANKS", 8);
-    size_t data_per_rank_mb = getenv_size("UMBP_SPDK_PROXY_DATA_MB", 512);
+    size_t data_per_rank_mb = getenv_size("UMBP_SPDK_PROXY_DATA_MB", 2048);
     size_t data_per_rank = data_per_rank_mb * 1024 * 1024;
 
     if (nvme_pci.empty() && bdev_name.empty()) {

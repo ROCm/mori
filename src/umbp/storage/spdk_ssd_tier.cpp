@@ -394,6 +394,236 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
 }
 
 // ===========================================================================
+// BatchWriteStreaming — byte-level streaming write from shared memory.
+//
+// Same allocation + metadata logic as BatchWrite.
+// In Phase 2 the pipeline waits for *bytes_ready >= absolute_chunk_end
+// before memcpy-ing each DMA chunk, allowing the NVMe write pipeline to
+// overlap with the client's memcpy into SHM.
+// ===========================================================================
+std::vector<bool> SpdkSsdTier::BatchWriteStreaming(
+    const std::vector<std::string>& keys,
+    const std::vector<const void*>& data_ptrs,
+    const std::vector<size_t>& sizes,
+    std::atomic<uint64_t>* bytes_ready,
+    const std::vector<size_t>& item_shm_offsets) {
+    const int count = static_cast<int>(keys.size());
+    std::vector<bool> results(count, false);
+    if (!initialized_ || count == 0) return results;
+
+    auto& env = umbp::SpdkEnv::Instance();
+
+    // --- Phase 1: Allocate space (lock held) ---
+    struct PendingItem {
+        int idx;
+        size_t aligned_size;
+        umbp::offset_allocator::OffsetAllocationHandle handle;
+    };
+    std::vector<PendingItem> pending;
+    pending.reserve(count);
+
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+
+        std::vector<size_t> alloc_sizes;
+        std::vector<int> new_indices;
+        alloc_sizes.reserve(count);
+        new_indices.reserve(count);
+
+        for (int i = 0; i < count; ++i) {
+            auto eit = entries_.find(keys[i]);
+            if (eit != entries_.end()) {
+                results[i] = true;
+                lru_list_.splice(lru_list_.begin(),
+                                 lru_list_, eit->second.lru_pos);
+                continue;
+            }
+            size_t aligned = AlignUp(sizes[i]);
+            new_indices.push_back(i);
+            alloc_sizes.push_back(aligned);
+        }
+
+        if (!alloc_sizes.empty()) {
+            auto handles = allocator_->batch_allocate(alloc_sizes);
+            for (size_t j = 0; j < handles.size(); ++j) {
+                if (handles[j].has_value()) {
+                    PendingItem item;
+                    item.idx = new_indices[j];
+                    item.aligned_size = alloc_sizes[j];
+                    item.handle = std::move(handles[j].value());
+                    pending.push_back(std::move(item));
+                } else {
+                    for (size_t k = j; k < new_indices.size(); ++k)
+                        results[new_indices[k]] = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (pending.empty()) return results;
+
+    // --- Phase 2: Chunked pipeline with bytes_ready gating ---
+    const int pending_count = static_cast<int>(pending.size());
+    const size_t chunk_sz = dma_ring_buf_size_;
+
+    struct WriteChunk {
+        int item_idx;
+        uint64_t offset;
+        size_t nbytes;
+        size_t data_offset;
+        size_t data_bytes;
+    };
+    std::vector<WriteChunk> chunks;
+    chunks.reserve(pending_count);
+    for (int i = 0; i < pending_count; ++i) {
+        auto& p = pending[i];
+        size_t rem_aligned = p.aligned_size;
+        size_t rem_data = sizes[p.idx];
+        size_t src_off = 0;
+        uint64_t dev_off = p.handle.address();
+        while (rem_aligned > 0) {
+            size_t ca = std::min(rem_aligned, chunk_sz);
+            size_t cd = std::min(rem_data, ca);
+            chunks.push_back({i, dev_off, ca, src_off, cd});
+            rem_aligned -= ca;
+            rem_data = (rem_data > cd) ? rem_data - cd : 0;
+            src_off += cd;
+            dev_off += ca;
+        }
+    }
+
+    const int chunk_count = static_cast<int>(chunks.size());
+    auto chunk_ok = std::make_unique<uint8_t[]>(chunk_count);
+    std::memset(chunk_ok.get(), 0, chunk_count);
+
+    {
+        std::lock_guard<std::mutex> dma_lk(dma_ring_mu_);
+
+        constexpr int kMinChunksPerWorker = 16;
+        int max_w = std::min(num_io_workers_, dma_ring_count_ / 2);
+        int num_workers = std::clamp(chunk_count / kMinChunksPerWorker, 1, max_w);
+        int bufs_per = dma_ring_count_ / num_workers;
+
+        auto run_pipeline = [&](int c_begin, int c_end,
+                                void** bufs, int local_qd) {
+            auto lreqs = std::make_unique<umbp::SpdkIoRequest[]>(local_qd);
+            auto lbatch = std::make_unique<umbp::SpdkIoRequest*[]>(local_qd);
+            int head = c_begin, tail = c_begin;
+
+            while (tail < c_end) {
+                int bc = 0;
+                while (head < c_end && (head - tail) < local_qd) {
+                    int slot = (head - c_begin) % local_qd;
+                    auto& c = chunks[head];
+                    int idx = pending[c.item_idx].idx;
+
+                    if (bytes_ready && c.data_bytes > 0) {
+                        uint64_t abs_end =
+                            item_shm_offsets[idx] + c.data_offset + c.data_bytes;
+                        while (bytes_ready->load(std::memory_order_acquire) < abs_end)
+                            CPU_PAUSE();
+                    }
+
+                    const char* src =
+                        static_cast<const char*>(data_ptrs[idx]) + c.data_offset;
+                    std::memcpy(bufs[slot], src, c.data_bytes);
+                    if (c.nbytes > c.data_bytes)
+                        std::memset(static_cast<char*>(bufs[slot]) + c.data_bytes,
+                                    0, c.nbytes - c.data_bytes);
+
+                    auto& req = lreqs[slot];
+                    req.op = umbp::SpdkIoRequest::WRITE;
+                    req.buf = bufs[slot];
+                    req.offset = c.offset;
+                    req.nbytes = c.nbytes;
+                    req.src_data = nullptr;
+                    req.src_iov = nullptr;
+                    req.src_iovcnt = 0;
+                    req.dst_iov = nullptr;
+                    req.dst_iovcnt = 0;
+                    req.completed.store(false, std::memory_order_release);
+                    req.success = false;
+
+                    lbatch[bc++] = &req;
+                    ++head;
+
+                    if (bc >= 8) {
+                        env.SubmitIoBatchAsync(lbatch.get(), bc);
+                        bc = 0;
+                    }
+                }
+                if (bc > 0)
+                    env.SubmitIoBatchAsync(lbatch.get(), bc);
+
+                while (tail < head) {
+                    int slot = (tail - c_begin) % local_qd;
+                    if (!lreqs[slot].completed.load(std::memory_order_acquire))
+                        break;
+                    chunk_ok[tail] = lreqs[slot].success ? 1 : 0;
+                    ++tail;
+                }
+            }
+        };
+
+        if (num_workers <= 1) {
+            int qd = std::min({chunk_count, kMaxQueueDepth, dma_ring_count_});
+            run_pipeline(0, chunk_count, dma_ring_, qd);
+        } else {
+            std::vector<std::thread> workers;
+            workers.reserve(num_workers - 1);
+            for (int w = 0; w < num_workers; ++w) {
+                int cb = chunk_count * w / num_workers;
+                int ce = chunk_count * (w + 1) / num_workers;
+                void** wb = dma_ring_ + w * bufs_per;
+                int wq = (w == num_workers - 1)
+                    ? (dma_ring_count_ - w * bufs_per) : bufs_per;
+                if (w < num_workers - 1) {
+                    workers.emplace_back([&, cb, ce, wb, wq]() {
+                        run_pipeline(cb, ce, wb, wq);
+                    });
+                } else {
+                    run_pipeline(cb, ce, wb, wq);
+                }
+            }
+            for (auto& t : workers) t.join();
+        }
+    }
+
+    // --- Phase 3: Update metadata (lock held) ---
+    std::vector<bool> item_ok(pending_count, true);
+    for (int j = 0; j < chunk_count; ++j)
+        if (!chunk_ok[j]) item_ok[chunks[j].item_idx] = false;
+
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (int j = 0; j < pending_count; ++j) {
+            int idx = pending[j].idx;
+            if (item_ok[j]) {
+                Entry entry;
+                entry.handle = std::move(pending[j].handle);
+                entry.data_size = sizes[idx];
+
+                auto [it, inserted] = entries_.try_emplace(
+                    keys[idx], std::move(entry));
+                if (inserted) {
+                    lru_list_.push_front(keys[idx]);
+                    it->second.lru_pos = lru_list_.begin();
+                } else {
+                    it->second.handle = std::move(entry.handle);
+                    it->second.data_size = entry.data_size;
+                    lru_list_.splice(lru_list_.begin(),
+                                     lru_list_, it->second.lru_pos);
+                }
+                results[idx] = true;
+            }
+        }
+    }
+
+    return results;
+}
+
+// ===========================================================================
 // BatchReadIntoPtr — deep-queue NVMe read pipeline
 //
 // Phase 1 (lock):   look up entries, collect offsets and sizes
