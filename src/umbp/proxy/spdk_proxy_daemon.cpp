@@ -128,8 +128,13 @@ static void ProcessSingleRequest(SpdkSsdTier& tier, RingSlot& slot,
 //
 // Read:  uses BatchReadIntoPtrStreaming — single pipeline call with per-item
 //        items_done signaling so client overlaps SHM→user copy with NVMe I/O.
-// Write: waits for all client data, then single BatchWrite call.
+// Write: for large batches (≥64MB, >256 items), sub-batch streaming overlaps
+//        client memcpy→SHM with daemon NVMe writes.  Small batches use a
+//        single BatchWrite call.
 // ---------------------------------------------------------------------------
+static constexpr uint32_t kWriteGroupSize = 256;
+static constexpr size_t   kWriteStreamThreshold = 64ULL * 1024 * 1024;
+
 static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
                                 void* data_region, size_t region_size) {
     auto type = static_cast<RequestType>(slot.type);
@@ -145,28 +150,49 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
     size_t data_base_offset = (desc_total + kDmaAlignment - 1) & ~(kDmaAlignment - 1);
     char* data_base = static_cast<char*>(data_region) + data_base_offset;
 
-    std::vector<std::string> keys(count);
-    std::vector<size_t> sizes(count);
-    for (uint32_t i = 0; i < count; ++i) {
-        auto& e = desc->entries[i];
-        keys[i] = std::string(e.key, e.key_len);
-        sizes[i] = e.data_size;
-    }
-
     if (type == RequestType::BATCH_WRITE) {
-        while (desc->items_ready.load(std::memory_order_acquire) < count) {
+        const bool stream_write = (count > kWriteGroupSize) &&
+                                  (desc->total_data_size >= kWriteStreamThreshold);
+        if (stream_write) {
+            for (uint32_t g = 0; g < count; g += kWriteGroupSize) {
+                uint32_t gc = std::min(kWriteGroupSize, count - g);
+                while (desc->items_ready.load(std::memory_order_acquire) < g + gc) {
 #if defined(__x86_64__) || defined(_M_X64)
-            _mm_pause();
+                    _mm_pause();
 #endif
+                }
+                std::vector<std::string> sk(gc);
+                std::vector<const void*> sp(gc);
+                std::vector<size_t> ss(gc);
+                for (uint32_t i = 0; i < gc; ++i) {
+                    auto& e = desc->entries[g + i];
+                    sk[i] = std::string(e.key, e.key_len);
+                    sp[i] = data_base + e.data_offset;
+                    ss[i] = e.data_size;
+                }
+                auto r = tier.BatchWrite(sk, sp, ss);
+                for (uint32_t i = 0; i < gc; ++i)
+                    desc->entries[g + i].result = r[i] ? 1 : 0;
+            }
+        } else {
+            while (desc->items_ready.load(std::memory_order_acquire) < count) {
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#endif
+            }
+            std::vector<std::string> keys(count);
+            std::vector<const void*> cptrs(count);
+            std::vector<size_t> sizes(count);
+            for (uint32_t i = 0; i < count; ++i) {
+                auto& e = desc->entries[i];
+                keys[i] = std::string(e.key, e.key_len);
+                cptrs[i] = data_base + e.data_offset;
+                sizes[i] = e.data_size;
+            }
+            auto results = tier.BatchWrite(keys, cptrs, sizes);
+            for (uint32_t i = 0; i < count; ++i)
+                desc->entries[i].result = results[i] ? 1 : 0;
         }
-
-        std::vector<const void*> cptrs(count);
-        for (uint32_t i = 0; i < count; ++i)
-            cptrs[i] = data_base + desc->entries[i].data_offset;
-
-        auto results = tier.BatchWrite(keys, cptrs, sizes);
-        for (uint32_t i = 0; i < count; ++i)
-            desc->entries[i].result = results[i] ? 1 : 0;
     } else {
         std::vector<uintptr_t> dma_ptrs(count);
         for (uint32_t i = 0; i < count; ++i)
