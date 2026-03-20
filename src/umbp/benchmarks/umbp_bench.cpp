@@ -6,11 +6,11 @@
 //
 // Modes:
 //   Single process (default):
-//     UMBP_SSD_BACKEND=posix ./umbp_bench
-//     UMBP_SSD_BACKEND=spdk  ./umbp_bench              # Standalone SPDK
+//     ./umbp_bench
+//     UMBP_SPDK_NVME_PCI=... ./umbp_bench              # Standalone SPDK
 //
 //   Multi-process auto-fork (Linux only):
-//     UMBP_SSD_BACKEND=spdk  ./umbp_bench --ranks=4    # Leader auto-forks proxy+followers
+//     UMBP_SPDK_NVME_PCI=... ./umbp_bench --ranks=4    # Leader auto-forks proxy
 //
 // The benchmark writes directly to SSD tier to measure disk I/O bandwidth,
 // bypassing the DRAM cache layer.
@@ -56,33 +56,39 @@ static const SizeSpec kSpecs[] = {
     {32ULL * 1024 * 1024, 16},
     {64ULL * 1024 * 1024, 8},
     {128ULL * 1024 * 1024, 4},
+    {256ULL * 1024 * 1024, 2},
+    {512ULL * 1024 * 1024, 2},
 };
 
-static void RunBatch(UMBPClient& client, int rank_id,
-                     const std::string& session,
-                     size_t value_size, int count, int iterations) {
+struct BenchResult {
+    size_t value_size;
+    int count;
+    double write_mbps;
+    double read_mbps;
+    int read_ok;
+};
+
+static BenchResult RunBatch(UMBPClient& client, int rank_id,
+                            const std::string& session,
+                            size_t value_size, int count, int iterations) {
     std::string prefix = "bench_r" + std::to_string(rank_id) + "_" + session +
                          "_" + std::to_string(value_size) + "_";
 
     std::vector<std::vector<char>> datas(count);
-    std::vector<uintptr_t> src_ptrs(count);
     std::vector<size_t> sizes(count, value_size);
 
-    for (int i = 0; i < count; ++i) {
+    for (int i = 0; i < count; ++i)
         datas[i].resize(value_size, static_cast<char>((i + 1) & 0xFF));
-        src_ptrs[i] = reinterpret_cast<uintptr_t>(datas[i].data());
-    }
 
     double total_bytes = static_cast<double>(value_size) * count;
 
     auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
-    if (!ssd) return;
+    if (!ssd) return {value_size, count, 0, 0, 0};
 
     std::vector<const void*> cptrs(count);
     for (int i = 0; i < count; ++i)
         cptrs[i] = datas[i].data();
 
-    // Write benchmark — unique keys per iteration, directly to SSD
     double best_write = 0;
     for (int iter = 0; iter < iterations; ++iter) {
         std::vector<std::string> wkeys(count);
@@ -99,13 +105,11 @@ static void RunBatch(UMBPClient& client, int rank_id,
         if (ok == count && mbps > best_write) best_write = mbps;
     }
 
-    // Write read-benchmark keys (fixed set)
     std::vector<std::string> rkeys(count);
     for (int i = 0; i < count; ++i)
         rkeys[i] = prefix + "r_" + std::to_string(i);
     ssd->BatchWrite(rkeys, cptrs, sizes);
 
-    // Read benchmark
     std::vector<std::vector<char>> read_bufs(count, std::vector<char>(value_size, 0));
     std::vector<uintptr_t> dst_ptrs(count);
     for (int i = 0; i < count; ++i)
@@ -126,23 +130,57 @@ static void RunBatch(UMBPClient& client, int rank_id,
         if (mbps > best_read) { best_read = mbps; best_read_ok = ok; }
     }
 
-    char sz_label[16];
-    if (value_size >= 1024 * 1024)
-        snprintf(sz_label, sizeof(sz_label), "%zuMB", value_size / (1024 * 1024));
-    else
-        snprintf(sz_label, sizeof(sz_label), "%zuKB", value_size / 1024);
+    return {value_size, count, best_write, best_read, best_read_ok};
+}
 
-    printf("  %8s  %6d  %10.0f  %10.0f", sz_label, count, best_write, best_read);
-    if (best_read_ok != count)
-        printf("  *** READ %d/%d", best_read_ok, count);
+static void PrintResults(int rank_id, int num_ranks, const char* role_str,
+                         const char* backend,
+                         const std::vector<BenchResult>& results) {
     printf("\n");
+    printf("========================================================\n");
+    printf(" UMBPClient E2E Benchmark — rank=%d/%d role=%s backend=%s\n",
+           rank_id, num_ranks, role_str, backend);
+    printf("========================================================\n");
+    printf("  %8s  %6s  %10s  %10s\n", "ValSize", "Count", "Write MB/s", "Read MB/s");
+
+    for (const auto& r : results) {
+        char sz_label[16];
+        if (r.value_size >= 1024 * 1024)
+            snprintf(sz_label, sizeof(sz_label), "%zuMB", r.value_size / (1024 * 1024));
+        else
+            snprintf(sz_label, sizeof(sz_label), "%zuKB", r.value_size / 1024);
+
+        printf("  %8s  %6d  %10.0f  %10.0f", sz_label, r.count, r.write_mbps, r.read_mbps);
+        if (r.read_ok != r.count)
+            printf("  *** READ %d/%d", r.read_ok, r.count);
+        printf("\n");
+    }
     fflush(stdout);
 }
 
-static int RunBenchmarkProcess(int rank_id, int num_ranks) {
+#ifdef __linux__
+// Write all results to a pipe so the parent can collect and print them
+// sequentially, avoiding interleaved output from concurrent ranks.
+static void WriteResultsToPipe(int fd, const std::vector<BenchResult>& results) {
+    uint32_t n = static_cast<uint32_t>(results.size());
+    (void)!write(fd, &n, sizeof(n));
+    for (const auto& r : results)
+        (void)!write(fd, &r, sizeof(r));
+}
+
+static std::vector<BenchResult> ReadResultsFromPipe(int fd) {
+    uint32_t n = 0;
+    if (read(fd, &n, sizeof(n)) != sizeof(n)) return {};
+    std::vector<BenchResult> results(n);
+    for (uint32_t i = 0; i < n; ++i)
+        (void)!read(fd, &results[i], sizeof(BenchResult));
+    return results;
+}
+#endif
+
+static int RunBenchmarkProcess(int rank_id, int num_ranks, int pipe_fd) {
     auto cfg = UMBPConfig::FromEnvironment();
-    // For multi-rank: override DRAM to small so we test SSD path
-    cfg.dram_capacity_bytes = 64ULL * 1024 * 1024;  // 64MB DRAM cache
+    cfg.dram_capacity_bytes = 64ULL * 1024 * 1024;
 
     UMBPClient client(cfg);
 
@@ -151,21 +189,23 @@ static int RunBenchmarkProcess(int rank_id, int num_ranks) {
                            (role == UMBPRole::SharedSSDLeader) ? "Leader" : "Follower";
     const char* backend = cfg.ssd_backend.c_str();
 
-    printf("\n");
-    printf("========================================================\n");
-    printf(" UMBPClient E2E Benchmark — rank=%d/%d role=%s backend=%s\n",
-           rank_id, num_ranks, role_str, backend);
-    printf("========================================================\n");
-    printf("  %8s  %6s  %10s  %10s\n", "ValSize", "Count", "Write MB/s", "Read MB/s");
-
     const int iterations = 3;
     std::string session = MakeSessionId();
 
-    for (const auto& s : kSpecs) {
-        RunBatch(client, rank_id, session, s.size, s.count, iterations);
+    std::vector<BenchResult> results;
+    for (const auto& s : kSpecs)
+        results.push_back(RunBatch(client, rank_id, session, s.size, s.count, iterations));
+
+    if (pipe_fd >= 0) {
+#ifdef __linux__
+        WriteResultsToPipe(pipe_fd, results);
+#endif
+    } else {
+        PrintResults(rank_id, num_ranks, role_str, backend, results);
     }
 
-    printf("\n");
+    (void)role_str;
+    (void)backend;
     return 0;
 }
 
@@ -178,34 +218,76 @@ int main(int argc, char** argv) {
     }
 
     if (num_ranks <= 1) {
-        return RunBenchmarkProcess(0, 1);
+        return RunBenchmarkProcess(0, 1, -1);
     }
 
 #ifdef __linux__
     printf("Launching %d ranks...\n", num_ranks);
+    fflush(stdout);
 
-    std::vector<pid_t> children;
+    struct RankInfo {
+        pid_t pid;
+        int pipe_fd;    // parent reads from this
+        int rank_id;
+    };
+    std::vector<RankInfo> ranks;
+
     for (int r = 0; r < num_ranks; ++r) {
+        int pipefd[2];
+        if (pipe(pipefd) != 0) {
+            fprintf(stderr, "pipe() failed for rank %d\n", r);
+            continue;
+        }
+
         pid_t pid = fork();
         if (pid == 0) {
-            // Child sets LOCAL_RANK → auto-deduced role
+            close(pipefd[0]);
             char rank_str[16];
             snprintf(rank_str, sizeof(rank_str), "%d", r);
             setenv("LOCAL_RANK", rank_str, 1);
-            _exit(RunBenchmarkProcess(r, num_ranks));
+            int rc = RunBenchmarkProcess(r, num_ranks, pipefd[1]);
+            close(pipefd[1]);
+            _exit(rc);
         }
         if (pid < 0) {
             fprintf(stderr, "fork() failed for rank %d: %s\n", r, strerror(errno));
+            close(pipefd[0]);
+            close(pipefd[1]);
             continue;
         }
-        children.push_back(pid);
+        close(pipefd[1]);
+        ranks.push_back({pid, pipefd[0], r});
     }
 
     int failures = 0;
-    for (auto pid : children) {
+    struct RankResult {
+        int rank_id;
+        std::vector<BenchResult> results;
+        bool ok;
+    };
+    std::vector<RankResult> all_results;
+
+    for (auto& ri : ranks) {
         int status;
-        waitpid(pid, &status, 0);
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) failures++;
+        waitpid(ri.pid, &status, 0);
+        bool ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        auto results = ReadResultsFromPipe(ri.pipe_fd);
+        close(ri.pipe_fd);
+        all_results.push_back({ri.rank_id, std::move(results), ok});
+        if (!ok) failures++;
+    }
+
+    // Determine role/backend from environment for display
+    auto cfg = UMBPConfig::FromEnvironment();
+    const char* backend = cfg.ssd_backend.c_str();
+
+    for (auto& rr : all_results) {
+        const char* role_str = (rr.rank_id == 0) ? "Leader" : "Follower";
+        if (rr.ok && !rr.results.empty()) {
+            PrintResults(rr.rank_id, num_ranks, role_str, backend, rr.results);
+        } else {
+            printf("\n[rank %d] FAILED (no results)\n", rr.rank_id);
+        }
     }
 
     printf("\n=== %d/%d ranks completed successfully ===\n",
