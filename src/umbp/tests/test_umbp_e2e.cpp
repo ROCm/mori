@@ -430,6 +430,24 @@ static int ForkAndRun(const char* local_rank, const char* backend,
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
+// Signal file paths for leader-follower coordination.
+// Two-phase handshake: leader signals "data ready", follower signals "done".
+static constexpr const char* kLeaderReadyFile  = "/tmp/umbp_e2e_leader_ready";
+static constexpr const char* kFollowerDoneFile = "/tmp/umbp_e2e_follower_done";
+
+static bool WaitForFile(const char* path, int timeout_ms) {
+    for (int elapsed = 0; elapsed < timeout_ms; elapsed += 100) {
+        if (access(path, F_OK) == 0) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+}
+
+static void TouchFile(const char* path) {
+    int fd = open(path, O_CREAT | O_WRONLY, 0644);
+    if (fd >= 0) close(fd);
+}
+
 static int leader_write_and_wait(const char*) {
     auto cfg = UMBPConfig::FromEnvironment();
     cfg.dram_capacity_bytes = 64ULL * 1024 * 1024;
@@ -438,32 +456,38 @@ static int leader_write_and_wait(const char*) {
     auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
     if (!ssd) return 1;
 
-    // Write 10 keys
     for (int i = 0; i < 10; ++i) {
         std::string key = "proxy_shared_" + std::to_string(i);
         std::vector<char> data(4096, static_cast<char>('A' + i));
         if (!ssd->Write(key, data.data(), data.size())) return 2;
     }
 
-    // Wait for follower (signaled via file)
-    for (int i = 0; i < 100; ++i) {
-        if (access("/tmp/umbp_e2e_follower_done", F_OK) == 0) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // Tell follower data is ready
+    TouchFile(kLeaderReadyFile);
+
+    // Keep UMBPClient (and proxy daemon) alive until follower finishes (60s)
+    if (!WaitForFile(kFollowerDoneFile, 60000)) {
+        fprintf(stderr, "    leader: timed out waiting for follower\n");
     }
-    unlink("/tmp/umbp_e2e_follower_done");
     return 0;
 }
 
 static int follower_read_and_verify(const char*) {
-    // Small delay to let leader start
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+    // Wait until leader signals that data is written (30s)
+    if (!WaitForFile(kLeaderReadyFile, 30000)) {
+        fprintf(stderr, "    follower: timed out waiting for leader ready\n");
+        return 5;
+    }
 
     auto cfg = UMBPConfig::FromEnvironment();
     cfg.dram_capacity_bytes = 64ULL * 1024 * 1024;
     UMBPClient client(cfg);
 
     auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
-    if (!ssd) return 1;
+    if (!ssd) {
+        TouchFile(kFollowerDoneFile);
+        return 1;
+    }
 
     int ok = 0;
     for (int i = 0; i < 10; ++i) {
@@ -475,17 +499,14 @@ static int follower_read_and_verify(const char*) {
         }
     }
 
-    // Signal leader we're done
-    int fd = open("/tmp/umbp_e2e_follower_done", O_CREAT | O_WRONLY, 0644);
-    if (fd >= 0) close(fd);
-
+    TouchFile(kFollowerDoneFile);
     return (ok == 10) ? 0 : 3;
 }
 
 static bool test_proxy_auto_fork_leader_follower() {
-    unlink("/tmp/umbp_e2e_follower_done");
+    unlink(kLeaderReadyFile);
+    unlink(kFollowerDoneFile);
 
-    // Launch leader and follower concurrently
     pid_t leader = fork();
     if (leader == 0) {
         unsetenv("UMBP_ROLE");
@@ -507,6 +528,9 @@ static bool test_proxy_auto_fork_leader_follower() {
     int lstatus, fstatus;
     waitpid(leader, &lstatus, 0);
     waitpid(follower, &fstatus, 0);
+
+    unlink(kLeaderReadyFile);
+    unlink(kFollowerDoneFile);
 
     bool leader_ok = WIFEXITED(lstatus) && WEXITSTATUS(lstatus) == 0;
     bool follower_ok = WIFEXITED(fstatus) && WEXITSTATUS(fstatus) == 0;
