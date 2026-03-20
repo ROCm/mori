@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <thread>
 
 #include "umbp/common/log.h"
 #include "umbp/spdk/spdk_env.h"
@@ -52,14 +53,16 @@ SpdkSsdTier::SpdkSsdTier(const UMBPConfig& config)
         return;
     }
 
+    num_io_workers_ = std::max(1, config.spdk_io_workers);
+
     // Pre-allocate DMA ring buffers (2MB each, kMaxQueueDepth slots)
     size_t ring_buf_size = 2ULL * 1024 * 1024;
     AllocDmaRing(ring_buf_size);
 
     initialized_ = true;
-    UMBP_LOG_INFO("SpdkSsdTier: ready — capacity=%zuMB block_size=%u dma_ring=%d×%zuKB",
+    UMBP_LOG_INFO("SpdkSsdTier: ready — capacity=%zuMB block_size=%u dma_ring=%d×%zuKB io_workers=%d",
                   capacity_ / (1024 * 1024), block_size_,
-                  dma_ring_count_, dma_ring_buf_size_ / 1024);
+                  dma_ring_count_, dma_ring_buf_size_ / 1024, num_io_workers_);
 }
 
 SpdkSsdTier::~SpdkSsdTier() {
@@ -285,59 +288,92 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
     }
 
     const int chunk_count = static_cast<int>(chunks.size());
-    const int qd = std::min({chunk_count, kMaxQueueDepth, dma_ring_count_});
-    void** dma_bufs = dma_ring_;
+    auto chunk_ok = std::make_unique<uint8_t[]>(chunk_count);
+    std::memset(chunk_ok.get(), 0, chunk_count);
 
-    auto reqs = std::make_unique<umbp::SpdkIoRequest[]>(qd);
-    auto batch_ptrs = std::make_unique<umbp::SpdkIoRequest*[]>(qd);
-    std::vector<bool> chunk_ok(chunk_count, false);
+    {
+        std::lock_guard<std::mutex> dma_lk(dma_ring_mu_);
 
-    int head = 0, tail = 0;
-    while (tail < chunk_count) {
-        int batch_count = 0;
-        while (head < chunk_count && (head - tail) < qd) {
-            int slot = head % qd;
-            auto& c = chunks[head];
-            int idx = pending[c.item_idx].idx;
+        constexpr int kMinChunksPerWorker = 16;
+        int max_w = std::min(num_io_workers_, dma_ring_count_ / 2);
+        int num_workers = std::clamp(chunk_count / kMinChunksPerWorker, 1, max_w);
+        int bufs_per = dma_ring_count_ / num_workers;
 
-            const char* src =
-                static_cast<const char*>(data_ptrs[idx]) + c.data_offset;
-            std::memcpy(dma_bufs[slot], src, c.data_bytes);
-            if (c.nbytes > c.data_bytes)
-                std::memset(static_cast<char*>(dma_bufs[slot]) + c.data_bytes,
-                            0, c.nbytes - c.data_bytes);
+        auto run_pipeline = [&](int c_begin, int c_end,
+                                void** bufs, int local_qd) {
+            auto lreqs = std::make_unique<umbp::SpdkIoRequest[]>(local_qd);
+            auto lbatch = std::make_unique<umbp::SpdkIoRequest*[]>(local_qd);
+            int head = c_begin, tail = c_begin;
 
-            auto& req = reqs[slot];
-            req.op = umbp::SpdkIoRequest::WRITE;
-            req.buf = dma_bufs[slot];
-            req.offset = c.offset;
-            req.nbytes = c.nbytes;
-            req.src_data = nullptr;
-            req.src_iov = nullptr;
-            req.src_iovcnt = 0;
-            req.dst_iov = nullptr;
-            req.dst_iovcnt = 0;
-            req.completed.store(false, std::memory_order_release);
-            req.success = false;
+            while (tail < c_end) {
+                int bc = 0;
+                while (head < c_end && (head - tail) < local_qd) {
+                    int slot = (head - c_begin) % local_qd;
+                    auto& c = chunks[head];
+                    int idx = pending[c.item_idx].idx;
 
-            batch_ptrs[batch_count++] = &req;
-            ++head;
+                    const char* src =
+                        static_cast<const char*>(data_ptrs[idx]) + c.data_offset;
+                    std::memcpy(bufs[slot], src, c.data_bytes);
+                    if (c.nbytes > c.data_bytes)
+                        std::memset(static_cast<char*>(bufs[slot]) + c.data_bytes,
+                                    0, c.nbytes - c.data_bytes);
 
-            if (batch_count >= 8) {
-                env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
-                batch_count = 0;
+                    auto& req = lreqs[slot];
+                    req.op = umbp::SpdkIoRequest::WRITE;
+                    req.buf = bufs[slot];
+                    req.offset = c.offset;
+                    req.nbytes = c.nbytes;
+                    req.src_data = nullptr;
+                    req.src_iov = nullptr;
+                    req.src_iovcnt = 0;
+                    req.dst_iov = nullptr;
+                    req.dst_iovcnt = 0;
+                    req.completed.store(false, std::memory_order_release);
+                    req.success = false;
+
+                    lbatch[bc++] = &req;
+                    ++head;
+
+                    if (bc >= 8) {
+                        env.SubmitIoBatchAsync(lbatch.get(), bc);
+                        bc = 0;
+                    }
+                }
+                if (bc > 0)
+                    env.SubmitIoBatchAsync(lbatch.get(), bc);
+
+                while (tail < head) {
+                    int slot = (tail - c_begin) % local_qd;
+                    if (!lreqs[slot].completed.load(std::memory_order_acquire))
+                        break;
+                    chunk_ok[tail] = lreqs[slot].success ? 1 : 0;
+                    ++tail;
+                }
             }
-        }
+        };
 
-        if (batch_count > 0)
-            env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
-
-        while (tail < head) {
-            int slot = tail % qd;
-            if (!reqs[slot].completed.load(std::memory_order_acquire))
-                break;
-            chunk_ok[tail] = reqs[slot].success;
-            ++tail;
+        if (num_workers <= 1) {
+            int qd = std::min({chunk_count, kMaxQueueDepth, dma_ring_count_});
+            run_pipeline(0, chunk_count, dma_ring_, qd);
+        } else {
+            std::vector<std::thread> workers;
+            workers.reserve(num_workers - 1);
+            for (int w = 0; w < num_workers; ++w) {
+                int cb = chunk_count * w / num_workers;
+                int ce = chunk_count * (w + 1) / num_workers;
+                void** wb = dma_ring_ + w * bufs_per;
+                int wq = (w == num_workers - 1)
+                    ? (dma_ring_count_ - w * bufs_per) : bufs_per;
+                if (w < num_workers - 1) {
+                    workers.emplace_back([&, cb, ce, wb, wq]() {
+                        run_pipeline(cb, ce, wb, wq);
+                    });
+                } else {
+                    run_pipeline(cb, ce, wb, wq);
+                }
+            }
+            for (auto& t : workers) t.join();
         }
     }
 
@@ -447,59 +483,92 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
     }
 
     const int chunk_count = static_cast<int>(chunks.size());
-    const int qd = std::min({chunk_count, kMaxQueueDepth, dma_ring_count_});
-    void** dma_bufs = dma_ring_;
+    auto chunk_ok = std::make_unique<uint8_t[]>(chunk_count);
+    std::memset(chunk_ok.get(), 0, chunk_count);
 
-    auto reqs = std::make_unique<umbp::SpdkIoRequest[]>(qd);
-    auto batch_ptrs = std::make_unique<umbp::SpdkIoRequest*[]>(qd);
-    std::vector<bool> chunk_ok(chunk_count, false);
+    {
+        std::lock_guard<std::mutex> dma_lk(dma_ring_mu_);
 
-    int head = 0, tail = 0;
-    while (tail < chunk_count) {
-        int batch_count = 0;
-        while (head < chunk_count && (head - tail) < qd) {
-            int slot = head % qd;
-            auto& c = chunks[head];
+        constexpr int kMinChunksPerWorker = 16;
+        int max_w = std::min(num_io_workers_, dma_ring_count_ / 2);
+        int num_workers = std::clamp(chunk_count / kMinChunksPerWorker, 1, max_w);
+        int bufs_per = dma_ring_count_ / num_workers;
 
-            auto& req = reqs[slot];
-            req.op = umbp::SpdkIoRequest::READ;
-            req.buf = dma_bufs[slot];
-            req.offset = c.offset;
-            req.nbytes = c.nbytes;
-            req.src_data = nullptr;
-            req.src_iov = nullptr;
-            req.src_iovcnt = 0;
-            req.dst_iov = nullptr;
-            req.dst_iovcnt = 0;
-            req.completed.store(false, std::memory_order_release);
-            req.success = false;
+        auto run_pipeline = [&](int c_begin, int c_end,
+                                void** bufs, int local_qd) {
+            auto lreqs = std::make_unique<umbp::SpdkIoRequest[]>(local_qd);
+            auto lbatch = std::make_unique<umbp::SpdkIoRequest*[]>(local_qd);
+            int head = c_begin, tail = c_begin;
 
-            batch_ptrs[batch_count++] = &req;
-            ++head;
+            while (tail < c_end) {
+                int bc = 0;
+                while (head < c_end && (head - tail) < local_qd) {
+                    int slot = (head - c_begin) % local_qd;
+                    auto& c = chunks[head];
 
-            if (batch_count >= 8) {
-                env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
-                batch_count = 0;
+                    auto& req = lreqs[slot];
+                    req.op = umbp::SpdkIoRequest::READ;
+                    req.buf = bufs[slot];
+                    req.offset = c.offset;
+                    req.nbytes = c.nbytes;
+                    req.src_data = nullptr;
+                    req.src_iov = nullptr;
+                    req.src_iovcnt = 0;
+                    req.dst_iov = nullptr;
+                    req.dst_iovcnt = 0;
+                    req.completed.store(false, std::memory_order_release);
+                    req.success = false;
+
+                    lbatch[bc++] = &req;
+                    ++head;
+
+                    if (bc >= 8) {
+                        env.SubmitIoBatchAsync(lbatch.get(), bc);
+                        bc = 0;
+                    }
+                }
+                if (bc > 0)
+                    env.SubmitIoBatchAsync(lbatch.get(), bc);
+
+                while (tail < head) {
+                    int slot = (tail - c_begin) % local_qd;
+                    if (!lreqs[slot].completed.load(std::memory_order_acquire))
+                        break;
+
+                    if (lreqs[slot].success) {
+                        auto& c = chunks[tail];
+                        auto& ri = items[c.item_idx];
+                        char* dst = reinterpret_cast<char*>(dst_ptrs[ri.idx])
+                                    + c.data_offset;
+                        std::memcpy(dst, bufs[slot], c.data_bytes);
+                        chunk_ok[tail] = 1;
+                    }
+                    ++tail;
+                }
             }
-        }
+        };
 
-        if (batch_count > 0)
-            env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
-
-        while (tail < head) {
-            int slot = tail % qd;
-            if (!reqs[slot].completed.load(std::memory_order_acquire))
-                break;
-
-            if (reqs[slot].success) {
-                auto& c = chunks[tail];
-                auto& ri = items[c.item_idx];
-                char* dst = reinterpret_cast<char*>(dst_ptrs[ri.idx])
-                            + c.data_offset;
-                std::memcpy(dst, dma_bufs[slot], c.data_bytes);
-                chunk_ok[tail] = true;
+        if (num_workers <= 1) {
+            int qd = std::min({chunk_count, kMaxQueueDepth, dma_ring_count_});
+            run_pipeline(0, chunk_count, dma_ring_, qd);
+        } else {
+            std::vector<std::thread> workers;
+            workers.reserve(num_workers - 1);
+            for (int w = 0; w < num_workers; ++w) {
+                int cb = chunk_count * w / num_workers;
+                int ce = chunk_count * (w + 1) / num_workers;
+                void** wb = dma_ring_ + w * bufs_per;
+                int wq = (w == num_workers - 1)
+                    ? (dma_ring_count_ - w * bufs_per) : bufs_per;
+                if (w < num_workers - 1) {
+                    workers.emplace_back([&, cb, ce, wb, wq]() {
+                        run_pipeline(cb, ce, wb, wq);
+                    });
+                } else {
+                    run_pipeline(cb, ce, wb, wq);
+                }
             }
-            ++tail;
+            for (auto& t : workers) t.join();
         }
     }
 

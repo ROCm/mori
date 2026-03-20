@@ -77,6 +77,7 @@ class SpdkSsdTier : public TierBackend {
     std::unordered_map<std::string, std::list<std::string>::iterator> lru_iter_;
 
     static constexpr int kMaxQueueDepth = 128;
+    int num_io_workers_ = 1;
 
     // Pre-allocated DMA ring buffers to avoid per-batch pool alloc overhead
     std::mutex dma_ring_mu_;

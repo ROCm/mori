@@ -39,7 +39,7 @@ using Clock = std::chrono::high_resolution_clock;
 // Config
 // ============================================================================
 struct BenchConfig {
-    int threads = 1;
+    int threads = 4;
     int iodepth = 128;
     int iterations = 3;
     size_t total_bytes = 512ULL * 1024 * 1024;
@@ -388,6 +388,7 @@ int main(int argc, char** argv) {
         tier_cfg.spdk_mem_size_mb = ecfg.mem_size_mb;
         tier_cfg.spdk_nvme_pci_addr = ecfg.nvme_pci_addr;
         tier_cfg.spdk_nvme_ctrl_name = ecfg.nvme_ctrl_name;
+        tier_cfg.spdk_io_workers = bench.threads;
         tier_cfg.ssd_capacity_bytes = env.GetBdevSize();
 
         SpdkSsdTier tier(tier_cfg);

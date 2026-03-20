@@ -58,6 +58,7 @@ struct UMBPConfig {
   int spdk_mem_size_mb = 256;              // DPDK hugepage limit (MB)
   std::string spdk_nvme_pci_addr;          // PCI BDF, e.g. "0000:47:00.0"
   std::string spdk_nvme_ctrl_name = "NVMe0";
+  int spdk_io_workers = 4;                     // Internal I/O worker threads for SpdkSsdTier batch ops
 
   // Role is the source of truth for runtime behavior.
   UMBPRole role = UMBPRole::Standalone;
@@ -113,6 +114,7 @@ struct UMBPConfig {
     cfg.spdk_mem_size_mb = getenv_int("UMBP_SPDK_MEM_MB", cfg.spdk_mem_size_mb);
     cfg.spdk_nvme_pci_addr = getenv_str("UMBP_SPDK_NVME_PCI", cfg.spdk_nvme_pci_addr);
     cfg.spdk_nvme_ctrl_name = getenv_str("UMBP_SPDK_NVME_CTRL", cfg.spdk_nvme_ctrl_name);
+    cfg.spdk_io_workers = getenv_int("UMBP_SPDK_IO_WORKERS", cfg.spdk_io_workers);
 
     return cfg;
   }
