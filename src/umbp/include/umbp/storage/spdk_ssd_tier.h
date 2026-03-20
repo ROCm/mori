@@ -49,6 +49,7 @@ class SpdkSsdTier : public TierBackend {
     struct Entry {
         umbp::offset_allocator::OffsetAllocationHandle handle;
         size_t data_size = 0;
+        std::list<std::string>::iterator lru_pos;
 
         Entry() = default;
         Entry(Entry&&) = default;
@@ -61,8 +62,6 @@ class SpdkSsdTier : public TierBackend {
         return (size + block_size_ - 1) & ~(static_cast<size_t>(block_size_) - 1);
     }
 
-    void TouchLRU(const std::string& key);
-    void RemoveLRU(const std::string& key);
     void AllocDmaRing(size_t buf_size);
     void FreeDmaRing();
 
@@ -74,7 +73,6 @@ class SpdkSsdTier : public TierBackend {
     mutable std::mutex mu_;
     std::unordered_map<std::string, Entry> entries_;
     std::list<std::string> lru_list_;
-    std::unordered_map<std::string, std::list<std::string>::iterator> lru_iter_;
 
     static constexpr int kMaxQueueDepth = 128;
     int num_io_workers_ = 1;

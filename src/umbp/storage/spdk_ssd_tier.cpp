@@ -100,26 +100,6 @@ void SpdkSsdTier::FreeDmaRing() {
 }
 
 // ---------------------------------------------------------------------------
-// LRU helpers (caller must hold mu_)
-// ---------------------------------------------------------------------------
-void SpdkSsdTier::TouchLRU(const std::string& key) {
-    auto it = lru_iter_.find(key);
-    if (it != lru_iter_.end()) {
-        lru_list_.erase(it->second);
-    }
-    lru_list_.push_front(key);
-    lru_iter_[key] = lru_list_.begin();
-}
-
-void SpdkSsdTier::RemoveLRU(const std::string& key) {
-    auto it = lru_iter_.find(key);
-    if (it != lru_iter_.end()) {
-        lru_list_.erase(it->second);
-        lru_iter_.erase(it);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Single-key Write — wrapper around BatchWrite for simplicity.
 // ---------------------------------------------------------------------------
 bool SpdkSsdTier::Write(const std::string& key, const void* data, size_t size) {
@@ -154,8 +134,8 @@ bool SpdkSsdTier::Evict(const std::string& key) {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = entries_.find(key);
     if (it == entries_.end()) return false;
-    RemoveLRU(key);
-    entries_.erase(it);  // handle destroyed → space freed via RAII
+    lru_list_.erase(it->second.lru_pos);
+    entries_.erase(it);
     return true;
 }
 
@@ -169,7 +149,6 @@ void SpdkSsdTier::Clear() {
     std::lock_guard<std::mutex> lk(mu_);
     entries_.clear();
     lru_list_.clear();
-    lru_iter_.clear();
 }
 
 std::string SpdkSsdTier::GetLRUKey() const {
@@ -225,8 +204,11 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
         new_indices.reserve(count);
 
         for (int i = 0; i < count; ++i) {
-            if (entries_.count(keys[i])) {
+            auto eit = entries_.find(keys[i]);
+            if (eit != entries_.end()) {
                 results[i] = true;
+                lru_list_.splice(lru_list_.begin(),
+                                 lru_list_, eit->second.lru_pos);
                 continue;
             }
             size_t aligned = AlignUp(sizes[i]);
@@ -394,16 +376,14 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
 
                 auto [it, inserted] = entries_.try_emplace(
                     keys[idx], std::move(entry));
-                if (!inserted) it->second = std::move(entry);
-
                 if (inserted) {
                     lru_list_.push_front(keys[idx]);
-                    lru_iter_.emplace(keys[idx], lru_list_.begin());
+                    it->second.lru_pos = lru_list_.begin();
                 } else {
-                    auto lit = lru_iter_.find(keys[idx]);
-                    if (lit != lru_iter_.end())
-                        lru_list_.splice(lru_list_.begin(),
-                                         lru_list_, lit->second);
+                    it->second.handle = std::move(entry.handle);
+                    it->second.data_size = entry.data_size;
+                    lru_list_.splice(lru_list_.begin(),
+                                     lru_list_, it->second.lru_pos);
                 }
                 results[idx] = true;
             }
@@ -444,6 +424,9 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
         for (int i = 0; i < count; ++i) {
             auto it = entries_.find(keys[i]);
             if (it == entries_.end()) continue;
+
+            lru_list_.splice(lru_list_.begin(),
+                             lru_list_, it->second.lru_pos);
 
             size_t read_size = std::min(sizes[i], it->second.data_size);
             ReadItem ri;
