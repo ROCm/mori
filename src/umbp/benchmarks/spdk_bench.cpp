@@ -212,6 +212,10 @@ static BandwidthResult BenchRawSpdk(size_t chunk_size, size_t total_bytes,
         size_t my_range = my_ops * chunk_size;
         int per_qd = iodepth / threads;
         if (per_qd < 1) per_qd = 1;
+        constexpr size_t kMaxDmaPerThread = 512ULL * 1024 * 1024;
+        int max_by_mem = static_cast<int>(kMaxDmaPerThread / aligned_io);
+        if (max_by_mem < 1) max_by_mem = 1;
+        if (per_qd > max_by_mem) per_qd = max_by_mem;
 
         pool.emplace_back(SeqDirectWorker, std::ref(env), chunk_size,
                           aligned_io, is_write, offset, my_range,

@@ -252,55 +252,66 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
 
     if (pending.empty()) return results;
 
-    // --- Phase 2: Deep-queue I/O pipeline (no lock) ---
+    // --- Phase 2: Chunked deep-queue I/O pipeline (no lock) ---
+    // Split large values into DMA-ring-sized chunks so we always use the
+    // pre-allocated ring and never need large contiguous DMA allocations.
     const int pending_count = static_cast<int>(pending.size());
-    const int qd = std::min(pending_count, kMaxQueueDepth);
+    const size_t chunk_sz = dma_ring_buf_size_;
 
-    size_t max_aligned = 0;
-    for (auto& p : pending)
-        max_aligned = std::max(max_aligned, p.aligned_size);
-
-    // Use pre-allocated DMA ring if buffers are large enough; else fallback
-    bool use_ring = (max_aligned <= dma_ring_buf_size_ && qd <= dma_ring_count_);
-    void** dma_bufs;
-    std::unique_ptr<void*[]> dma_fallback;
-    if (use_ring) {
-        dma_bufs = dma_ring_;
-    } else {
-        dma_fallback = std::make_unique<void*[]>(qd);
-        int got = env.DmaPoolAllocBatch(dma_fallback.get(), max_aligned, qd);
-        if (got < qd) {
-            UMBP_LOG_ERROR("SpdkSsdTier::BatchWrite: DMA alloc short %d/%d", got, qd);
-            for (int i = got; i < qd; ++i)
-                dma_fallback[i] = nullptr;
+    struct WriteChunk {
+        int item_idx;
+        uint64_t offset;
+        size_t nbytes;
+        size_t data_offset;
+        size_t data_bytes;
+    };
+    std::vector<WriteChunk> chunks;
+    chunks.reserve(pending_count);
+    for (int i = 0; i < pending_count; ++i) {
+        auto& p = pending[i];
+        size_t rem_aligned = p.aligned_size;
+        size_t rem_data = sizes[p.idx];
+        size_t src_off = 0;
+        uint64_t dev_off = p.handle.address();
+        while (rem_aligned > 0) {
+            size_t ca = std::min(rem_aligned, chunk_sz);
+            size_t cd = std::min(rem_data, ca);
+            chunks.push_back({i, dev_off, ca, src_off, cd});
+            rem_aligned -= ca;
+            rem_data = (rem_data > cd) ? rem_data - cd : 0;
+            src_off += cd;
+            dev_off += ca;
         }
-        dma_bufs = dma_fallback.get();
     }
+
+    const int chunk_count = static_cast<int>(chunks.size());
+    const int qd = std::min({chunk_count, kMaxQueueDepth, dma_ring_count_});
+    void** dma_bufs = dma_ring_;
 
     auto reqs = std::make_unique<umbp::SpdkIoRequest[]>(qd);
     auto batch_ptrs = std::make_unique<umbp::SpdkIoRequest*[]>(qd);
-    std::vector<bool> io_ok(pending_count, false);
+    std::vector<bool> chunk_ok(chunk_count, false);
 
     int head = 0, tail = 0;
-    while (tail < pending_count) {
+    while (tail < chunk_count) {
         int batch_count = 0;
-        while (head < pending_count && (head - tail) < qd) {
+        while (head < chunk_count && (head - tail) < qd) {
             int slot = head % qd;
-            if (!dma_bufs[slot]) { ++head; continue; }
+            auto& c = chunks[head];
+            int idx = pending[c.item_idx].idx;
 
-            auto& p = pending[head];
-            int idx = p.idx;
-
-            std::memcpy(dma_bufs[slot], data_ptrs[idx], sizes[idx]);
-            if (p.aligned_size > sizes[idx])
-                std::memset(static_cast<char*>(dma_bufs[slot]) + sizes[idx],
-                            0, p.aligned_size - sizes[idx]);
+            const char* src =
+                static_cast<const char*>(data_ptrs[idx]) + c.data_offset;
+            std::memcpy(dma_bufs[slot], src, c.data_bytes);
+            if (c.nbytes > c.data_bytes)
+                std::memset(static_cast<char*>(dma_bufs[slot]) + c.data_bytes,
+                            0, c.nbytes - c.data_bytes);
 
             auto& req = reqs[slot];
             req.op = umbp::SpdkIoRequest::WRITE;
             req.buf = dma_bufs[slot];
-            req.offset = p.handle.address();
-            req.nbytes = p.aligned_size;
+            req.offset = c.offset;
+            req.nbytes = c.nbytes;
             req.src_data = nullptr;
             req.src_iov = nullptr;
             req.src_iovcnt = 0;
@@ -325,20 +336,22 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
             int slot = tail % qd;
             if (!reqs[slot].completed.load(std::memory_order_acquire))
                 break;
-            io_ok[tail] = reqs[slot].success;
+            chunk_ok[tail] = reqs[slot].success;
             ++tail;
         }
     }
 
-    if (!use_ring)
-        env.DmaPoolFreeBatch(dma_bufs, max_aligned, qd);
-
     // --- Phase 3: Update metadata (lock held) ---
+    // All chunks of an item must succeed for it to be valid.
+    std::vector<bool> item_ok(pending_count, true);
+    for (int j = 0; j < chunk_count; ++j)
+        if (!chunk_ok[j]) item_ok[chunks[j].item_idx] = false;
+
     {
         std::lock_guard<std::mutex> lk(mu_);
         for (int j = 0; j < pending_count; ++j) {
             int idx = pending[j].idx;
-            if (io_ok[j]) {
+            if (item_ok[j]) {
                 Entry entry;
                 entry.handle = std::move(pending[j].handle);
                 entry.data_size = sizes[idx];
@@ -352,7 +365,6 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
                 TouchLRU(keys[idx]);
                 results[idx] = true;
             }
-            // Failed: handle destroyed on scope exit → space freed
         }
     }
 
@@ -404,47 +416,56 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
 
     if (items.empty()) return results;
 
-    // --- Phase 2: Deep-queue I/O pipeline (no lock) ---
+    // --- Phase 2: Chunked deep-queue I/O pipeline (no lock) ---
     const int item_count = static_cast<int>(items.size());
-    const int qd = std::min(item_count, kMaxQueueDepth);
+    const size_t chunk_sz = dma_ring_buf_size_;
 
-    size_t max_aligned = 0;
-    for (auto& ri : items)
-        max_aligned = std::max(max_aligned, ri.aligned_size);
-
-    bool use_ring = (max_aligned <= dma_ring_buf_size_ && qd <= dma_ring_count_);
-    void** dma_bufs;
-    std::unique_ptr<void*[]> dma_fallback;
-    if (use_ring) {
-        dma_bufs = dma_ring_;
-    } else {
-        dma_fallback = std::make_unique<void*[]>(qd);
-        int got = env.DmaPoolAllocBatch(dma_fallback.get(), max_aligned, qd);
-        if (got < qd) {
-            UMBP_LOG_ERROR("SpdkSsdTier::BatchRead: DMA alloc short %d/%d", got, qd);
-            for (int i = got; i < qd; ++i)
-                dma_fallback[i] = nullptr;
+    struct ReadChunk {
+        int item_idx;
+        uint64_t offset;
+        size_t nbytes;
+        size_t data_offset;
+        size_t data_bytes;
+    };
+    std::vector<ReadChunk> chunks;
+    chunks.reserve(item_count);
+    for (int i = 0; i < item_count; ++i) {
+        auto& ri = items[i];
+        size_t rem_aligned = ri.aligned_size;
+        size_t rem_data = ri.data_size;
+        size_t dst_off = 0;
+        uint64_t dev_off = ri.offset;
+        while (rem_aligned > 0) {
+            size_t ca = std::min(rem_aligned, chunk_sz);
+            size_t cd = std::min(rem_data, ca);
+            chunks.push_back({i, dev_off, ca, dst_off, cd});
+            rem_aligned -= ca;
+            rem_data = (rem_data > cd) ? rem_data - cd : 0;
+            dst_off += cd;
+            dev_off += ca;
         }
-        dma_bufs = dma_fallback.get();
     }
+
+    const int chunk_count = static_cast<int>(chunks.size());
+    const int qd = std::min({chunk_count, kMaxQueueDepth, dma_ring_count_});
+    void** dma_bufs = dma_ring_;
 
     auto reqs = std::make_unique<umbp::SpdkIoRequest[]>(qd);
     auto batch_ptrs = std::make_unique<umbp::SpdkIoRequest*[]>(qd);
-    std::vector<bool> io_ok(item_count, false);
+    std::vector<bool> chunk_ok(chunk_count, false);
 
     int head = 0, tail = 0;
-    while (tail < item_count) {
+    while (tail < chunk_count) {
         int batch_count = 0;
-        while (head < item_count && (head - tail) < qd) {
+        while (head < chunk_count && (head - tail) < qd) {
             int slot = head % qd;
-            if (!dma_bufs[slot]) { ++head; continue; }
+            auto& c = chunks[head];
 
-            auto& ri = items[head];
             auto& req = reqs[slot];
             req.op = umbp::SpdkIoRequest::READ;
             req.buf = dma_bufs[slot];
-            req.offset = ri.offset;
-            req.nbytes = ri.aligned_size;
+            req.offset = c.offset;
+            req.nbytes = c.nbytes;
             req.src_data = nullptr;
             req.src_iov = nullptr;
             req.src_iovcnt = 0;
@@ -471,22 +492,23 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
                 break;
 
             if (reqs[slot].success) {
-                auto& ri = items[tail];
-                std::memcpy(reinterpret_cast<void*>(dst_ptrs[ri.idx]),
-                            dma_bufs[slot], ri.data_size);
-                io_ok[tail] = true;
+                auto& c = chunks[tail];
+                auto& ri = items[c.item_idx];
+                char* dst = reinterpret_cast<char*>(dst_ptrs[ri.idx])
+                            + c.data_offset;
+                std::memcpy(dst, dma_bufs[slot], c.data_bytes);
+                chunk_ok[tail] = true;
             }
             ++tail;
         }
     }
 
-    if (!use_ring)
-        env.DmaPoolFreeBatch(dma_bufs, max_aligned, qd);
-
-    // Phase 3: mark results only (no LRU — upper layer handles eviction)
-    for (int j = 0; j < item_count; ++j) {
-        if (io_ok[j]) results[items[j].idx] = true;
-    }
+    // Phase 3: mark results (all chunks must succeed per item)
+    std::vector<bool> item_ok(item_count, true);
+    for (int j = 0; j < chunk_count; ++j)
+        if (!chunk_ok[j]) item_ok[chunks[j].item_idx] = false;
+    for (int j = 0; j < item_count; ++j)
+        if (item_ok[j]) results[items[j].idx] = true;
 
     return results;
 }
