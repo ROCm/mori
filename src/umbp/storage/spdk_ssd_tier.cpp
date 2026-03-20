@@ -813,7 +813,9 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtrStreaming(
     const std::vector<std::string>& keys,
     const std::vector<uintptr_t>& dst_ptrs,
     const std::vector<size_t>& sizes,
-    std::atomic<uint32_t>* items_done) {
+    std::atomic<uint32_t>* items_done,
+    std::atomic<uint64_t>* bytes_done,
+    const std::vector<size_t>* item_shm_offsets) {
     const int count = static_cast<int>(keys.size());
     std::vector<bool> results(count, false);
     if (!initialized_ || count == 0) return results;
@@ -902,6 +904,12 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtrStreaming(
                     char* dst = reinterpret_cast<char*>(dst_ptrs[ri.idx]) + c.data_offset;
                     std::memcpy(dst, dma_ring_[slot], c.data_bytes);
                     chunk_ok[tail] = 1;
+
+                    if (bytes_done && item_shm_offsets) {
+                        uint64_t abs = (*item_shm_offsets)[ri.idx]
+                                       + c.data_offset + c.data_bytes;
+                        bytes_done->store(abs, std::memory_order_release);
+                    }
                 }
                 ++tail;
 

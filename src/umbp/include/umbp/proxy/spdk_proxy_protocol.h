@@ -153,6 +153,7 @@ struct BatchDescriptor {
     alignas(64) std::atomic<uint32_t> items_ready;
     alignas(64) std::atomic<uint32_t> items_done;
     alignas(64) std::atomic<uint64_t> bytes_ready;
+    alignas(64) std::atomic<uint64_t> bytes_done;
 
     BatchEntry entries[];
 };

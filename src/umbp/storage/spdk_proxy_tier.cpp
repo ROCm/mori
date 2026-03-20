@@ -278,6 +278,7 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(
         desc->items_ready.store(0, std::memory_order_relaxed);
         desc->items_done.store(0, std::memory_order_relaxed);
         desc->bytes_ready.store(0, std::memory_order_relaxed);
+        desc->bytes_done.store(0, std::memory_order_relaxed);
 
         size_t data_cursor = 0;
         char* data_base = static_cast<char*>(data_region) + data_start;
@@ -365,31 +366,50 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(
                 results[base + i] = (desc->entries[i].result != 0);
 
         } else {
-            // STREAMING READ: poll items_done, copy as keys complete.
-            int copied = 0;
+            // STREAMING READ: copy data in 2MB chunks using bytes_done,
+            // overlapping client memcpy with daemon NVMe reads at sub-item
+            // granularity. Falls back to items_done for small items.
+            constexpr size_t kReadChunk = 2ULL * 1024 * 1024;
+            int current_item = 0;
+            size_t item_copied = 0;
             int spin = 0;
-            while (copied < sub_count) {
-                uint32_t done = desc->items_done.load(std::memory_order_acquire);
-                while (copied < static_cast<int>(done) && copied < sub_count) {
-                    int gi = base + copied;
-                    if (!dst_ptrs.empty()) {
-                        void* dst = reinterpret_cast<void*>(dst_ptrs[gi]);
-                        std::memcpy(dst,
-                                    data_base + desc->entries[copied].data_offset,
-                                    sizes[gi]);
+
+            while (current_item < sub_count) {
+                int gi = base + current_item;
+                auto& entry = desc->entries[current_item];
+                size_t item_sz = sizes[gi];
+
+                if (!dst_ptrs.empty() && item_sz > 0) {
+                    char* dst = reinterpret_cast<char*>(dst_ptrs[gi]);
+                    char* src = data_base + entry.data_offset;
+
+                    while (item_copied < item_sz) {
+                        size_t want = std::min(kReadChunk, item_sz - item_copied);
+                        uint64_t need = entry.data_offset + item_copied + want;
+                        uint64_t bd = desc->bytes_done.load(
+                            std::memory_order_acquire);
+
+                        if (bd >= need) {
+                            std::memcpy(dst + item_copied, src + item_copied,
+                                        want);
+                            item_copied += want;
+                            spin = 0;
+                        } else {
+                            CPU_PAUSE();
+                            if (++spin % 8192 == 0 && !IsProxyAlive()) {
+                                UMBP_LOG_ERROR(
+                                    "SpdkProxyTier: proxy dead during batch read");
+                                slot.state.store(
+                                    static_cast<uint32_t>(SlotState::EMPTY),
+                                    std::memory_order_release);
+                                return results;
+                            }
+                        }
                     }
-                    results[gi] = true;
-                    ++copied;
                 }
-                if (copied < sub_count) {
-                    CPU_PAUSE();
-                    if (++spin % 8192 == 0 && !IsProxyAlive()) {
-                        UMBP_LOG_ERROR("SpdkProxyTier: proxy dead during batch read");
-                        slot.state.store(static_cast<uint32_t>(SlotState::EMPTY),
-                                         std::memory_order_release);
-                        return results;
-                    }
-                }
+
+                ++current_item;
+                item_copied = 0;
             }
 
             // Wait for overall slot completion
@@ -399,9 +419,11 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(
                 if (st == static_cast<uint32_t>(SlotState::COMPLETED)) break;
                 CPU_PAUSE();
                 if (++spin % 8192 == 0 && !IsProxyAlive()) {
-                    UMBP_LOG_ERROR("SpdkProxyTier: proxy dead waiting for read completion");
-                    slot.state.store(static_cast<uint32_t>(SlotState::EMPTY),
-                                     std::memory_order_release);
+                    UMBP_LOG_ERROR(
+                        "SpdkProxyTier: proxy dead waiting for read completion");
+                    slot.state.store(
+                        static_cast<uint32_t>(SlotState::EMPTY),
+                        std::memory_order_release);
                     return results;
                 }
             }

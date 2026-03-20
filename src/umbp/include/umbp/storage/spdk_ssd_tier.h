@@ -54,15 +54,21 @@ class SpdkSsdTier : public TierBackend {
         std::atomic<uint64_t>* bytes_ready,
         const std::vector<size_t>& item_shm_offsets);
 
-    // DMA-ring read with per-item streaming progress.
-    // Single-worker pipeline (QD=128, saturates NVMe) signals *items_done
-    // after each item's data is memcpy'd to dst_ptrs, enabling the caller to
-    // overlap downstream copies with remaining NVMe reads.
+    // DMA-ring read with streaming progress at two granularities:
+    //   *items_done  — incremented after each item's data is fully in dst.
+    //   *bytes_done  — updated after each 2MB DMA chunk is memcpy'd to dst,
+    //                  using absolute SHM offsets so the caller can overlap
+    //                  downstream copies at sub-item granularity.
+    // item_shm_offsets[i] is the byte offset of item i's data in the SHM
+    // data area (from BatchEntry::data_offset).  May be nullptr to disable
+    // byte-level signaling.
     std::vector<bool> BatchReadIntoPtrStreaming(
         const std::vector<std::string>& keys,
         const std::vector<uintptr_t>& dst_ptrs,
         const std::vector<size_t>& sizes,
-        std::atomic<uint32_t>* items_done);
+        std::atomic<uint32_t>* items_done,
+        std::atomic<uint64_t>* bytes_done = nullptr,
+        const std::vector<size_t>* item_shm_offsets = nullptr);
 
     // Zero-copy DMA variants: data_ptrs must be DMA-registered, 4KB-aligned,
     // with AlignUp(size) bytes of writable space per key.
