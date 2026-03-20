@@ -227,10 +227,6 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
         for (int i = 0; i < count; ++i) {
             if (entries_.count(keys[i])) {
                 results[i] = true;
-                auto lit = lru_iter_.find(keys[i]);
-                if (lit != lru_iter_.end())
-                    lru_list_.splice(lru_list_.begin(),
-                                     lru_list_, lit->second);
                 continue;
             }
             size_t aligned = AlignUp(sizes[i]);
@@ -582,23 +578,12 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
         }
     }
 
-    // Phase 3: mark results + batch LRU refresh
+    // Phase 3: mark results
     std::vector<bool> item_ok(item_count, true);
     for (int j = 0; j < chunk_count; ++j)
         if (!chunk_ok[j]) item_ok[chunks[j].item_idx] = false;
-
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (int j = 0; j < item_count; ++j) {
-            if (item_ok[j]) {
-                results[items[j].idx] = true;
-                auto lit = lru_iter_.find(keys[items[j].idx]);
-                if (lit != lru_iter_.end())
-                    lru_list_.splice(lru_list_.begin(),
-                                     lru_list_, lit->second);
-            }
-        }
-    }
+    for (int j = 0; j < item_count; ++j)
+        if (item_ok[j]) results[items[j].idx] = true;
 
     return results;
 }
