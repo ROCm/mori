@@ -125,7 +125,8 @@ struct RankChannel {
     alignas(64) uint32_t rank_id;
     uint32_t is_leader;                         // 1 = leader (can write), 0 = follower (read-only)
     uint32_t connected;                         // 1 = rank is connected
-    char _pad[52];
+    std::atomic<uint32_t> owner_pid;            // 0 = free slot, >0 = PID that owns this slot (CAS allocation)
+    char _pad[48];
 
     RingSlot slots[kRingSize];
 };

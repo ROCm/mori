@@ -288,19 +288,27 @@ static std::string FindProxyBinary(const std::string& explicit_path) {
 }
 
 int LocalStorageManager::SpawnProxyDaemon() {
-  // Check if a proxy is already running on this SHM name
+  // Always clean-start: kill any existing daemon, then fork a fresh one.
   int probe = umbp::proxy::ProxyShmRegion::ProbeExisting(proxy_shm_name_);
-  if (probe == 1) {
-    UMBP_LOG_INFO("LSM: proxy already running on SHM '%s', skipping spawn",
-                   proxy_shm_name_.c_str());
-    return 0;
-  }
-  if (probe == -1) {
-    UMBP_LOG_INFO("LSM: proxy exists but not yet READY, waiting...");
-    return 0;  // Let WaitForProxy handle it
+  if (probe == 1 || probe == -1) {
+    UMBP_LOG_INFO("LSM: killing existing proxy on SHM '%s'", proxy_shm_name_.c_str());
+    umbp::proxy::ProxyShmRegion tmp;
+    if (tmp.Attach(proxy_shm_name_) == 0) {
+      auto* hdr = tmp.Header();
+      uint32_t old_pid = hdr->proxy_pid.load(std::memory_order_relaxed);
+      if (old_pid > 0) {
+        hdr->shutdown_requested.store(1, std::memory_order_release);
+        kill(static_cast<pid_t>(old_pid), SIGTERM);
+        for (int i = 0; i < 50 && kill(static_cast<pid_t>(old_pid), 0) == 0; ++i)
+          usleep(100000);  // 5s total
+        if (kill(static_cast<pid_t>(old_pid), 0) == 0) {
+          UMBP_LOG_WARN("LSM: old proxy pid=%u did not exit, sending SIGKILL", old_pid);
+          kill(static_cast<pid_t>(old_pid), SIGKILL);
+        }
+      }
+    }
   }
 
-  // Clean stale SHM from a previous crash
   umbp::proxy::ProxyShmRegion::CleanupStale(proxy_shm_name_);
 
   std::string bin = FindProxyBinary(config_.spdk_proxy_bin);
@@ -317,13 +325,11 @@ int LocalStorageManager::SpawnProxyDaemon() {
     execlp(bin.c_str(), "spdk_proxy",
            "--spawner-pid", spawner_pid_str.c_str(),
            static_cast<char*>(nullptr));
-    // exec failed
     fprintf(stderr, "[UMBP ERROR] execlp('%s') failed: %s\n",
             bin.c_str(), strerror(errno));
     _exit(127);
   }
 
-  // ---- Parent process ----
   proxy_child_pid_ = pid;
   UMBP_LOG_INFO("LSM: spawned spdk_proxy daemon pid=%d", pid);
   return 0;
@@ -343,30 +349,44 @@ LocalStorageManager::LocalStorageManager(const UMBPConfig& config, BlockIndexCli
   // SSD tier is optional (slower)
   if (config_.ssd_enabled) {
     std::unique_ptr<TierBackend> ssd_backend;
-    if (config_.ssd_backend == "spdk" && role_ != UMBPRole::SharedSSDFollower) {
+    bool use_proxy = false;
+
+    if (config_.ssd_backend == "spdk") {
+      if (role_ == UMBPRole::Standalone) {
+        // Direct in-process SPDK (best perf, single process only)
 #ifdef USE_SPDK
-      auto spdk_tier = std::make_unique<SpdkSsdTier>(config_);
-      if (spdk_tier->IsValid()) {
-        ssd_backend = std::move(spdk_tier);
-      } else {
-        fprintf(stderr, "[UMBP WARN] SpdkSsdTier init failed, falling back to POSIX SSD\n");
-      }
+        auto spdk_tier = std::make_unique<SpdkSsdTier>(config_);
+        if (spdk_tier->IsValid()) {
+          ssd_backend = std::move(spdk_tier);
+        } else {
+          fprintf(stderr, "[UMBP WARN] SpdkSsdTier init failed, falling back to POSIX SSD\n");
+        }
 #else
-      fprintf(stderr,
-              "[UMBP WARN] UMBP_SSD_BACKEND=spdk requested, but this build was compiled "
-              "without SPDK support (SPDK not found at build time). Falling back to POSIX SSD.\n"
-              "  To enable SPDK: install SPDK with pkg-config, then rebuild.\n");
+        fprintf(stderr,
+                "[UMBP WARN] UMBP_SSD_BACKEND=spdk requested, but this build was compiled "
+                "without SPDK support. Falling back to POSIX SSD.\n");
 #endif
+      } else {
+        // Leader or Follower → use proxy daemon for multi-process SPDK
+        use_proxy = true;
+      }
+    } else if (config_.ssd_backend == "spdk_proxy") {
+      use_proxy = true;  // backward compatible explicit proxy
     }
+
 #ifdef __linux__
-    if (config_.ssd_backend == "spdk_proxy") {
+    if (use_proxy && !ssd_backend) {
       proxy_shm_name_ = config_.spdk_proxy_shm_name;
       if (proxy_shm_name_.empty())
         proxy_shm_name_ = umbp::proxy::kDefaultShmName;
 
-      // Rank 0 is responsible for auto-spawning the proxy daemon.
-      // Other ranks wait for it to become READY.
-      if (config_.spdk_proxy_rank_id == 0) {
+      bool should_spawn =
+          (role_ == UMBPRole::SharedSSDLeader) ||
+          (config_.ssd_backend == "spdk_proxy" && config_.spdk_proxy_rank_id == 0);
+
+      if (should_spawn) {
+        if (config_.spdk_proxy_rank_id == kAutoRankId)
+          config_.spdk_proxy_rank_id = 0;
         SpawnProxyDaemon();
       }
 
@@ -382,8 +402,7 @@ LocalStorageManager::LocalStorageManager(const UMBPConfig& config, BlockIndexCli
 
       if (!ssd_backend) {
         fprintf(stderr,
-                "[UMBP WARN] SpdkProxyTier connect failed. "
-                "Falling back to POSIX SSD.\n");
+                "[UMBP WARN] SPDK proxy connect failed. Falling back to POSIX SSD.\n");
       }
     }
 #endif

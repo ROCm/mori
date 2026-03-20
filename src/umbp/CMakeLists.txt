@@ -97,6 +97,14 @@ endif()
 if(UNIX)
   add_executable(proxy_bench benchmarks/proxy_bench.cpp)
   target_link_libraries(proxy_bench PRIVATE umbp_core)
+
+  # E2E benchmark using UMBPClient (auto Leader/Follower fork)
+  add_executable(umbp_bench benchmarks/umbp_bench.cpp)
+  target_link_libraries(umbp_bench PRIVATE umbp_core)
+
+  # E2E integration test (one command, all backends)
+  add_executable(test_umbp_e2e tests/test_umbp_e2e.cpp)
+  target_link_libraries(test_umbp_e2e PRIVATE umbp_core)
 endif()
 
 # Python bindings are registered in src/pybind/pybind_umbp.cpp (compiled into

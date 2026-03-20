@@ -287,6 +287,7 @@ static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm,
                     hdr->active_ranks.fetch_sub(1, std::memory_order_relaxed);
                     auto* ch = shm.Channel(r);
                     ch->connected = 0;
+                    ch->owner_pid.store(0, std::memory_order_release);
                     uint32_t t = ch->tail.load(std::memory_order_relaxed);
                     uint32_t h = ch->head.load(std::memory_order_relaxed);
                     while (t != h) {
@@ -317,6 +318,26 @@ static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm,
             UMBP_LOG_INFO("spdk_proxy: spawner (pid=%d) is dead and no active ranks",
                           static_cast<int>(spawner_pid));
             break;
+        }
+
+        // Orphan self-termination: if spawner is dead, start a 60s countdown.
+        // This handles cases where ranks crash without deregistering.
+        {
+            static auto orphan_start = std::chrono::steady_clock::time_point{};
+            if (spawner_pid > 0 && kill(spawner_pid, 0) != 0) {
+                if (orphan_start == std::chrono::steady_clock::time_point{}) {
+                    orphan_start = now;
+                    UMBP_LOG_WARN("spdk_proxy: spawner dead, starting 60s orphan countdown");
+                }
+                auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                    now - orphan_start).count();
+                if (secs >= 60) {
+                    UMBP_LOG_WARN("spdk_proxy: orphaned 60s, force exit");
+                    break;
+                }
+            } else {
+                orphan_start = std::chrono::steady_clock::time_point{};
+            }
         }
 #endif
 

@@ -32,6 +32,8 @@ enum class UMBPRole : int {
   SharedSSDFollower = 2,
 };
 
+static constexpr uint32_t kAutoRankId = UINT32_MAX;
+
 struct UMBPConfig {
   // DRAM
   size_t dram_capacity_bytes = 4ULL * 1024 * 1024 * 1024;  // 4 GB
@@ -126,13 +128,31 @@ struct UMBPConfig {
     cfg.spdk_io_workers = getenv_int("UMBP_SPDK_IO_WORKERS", cfg.spdk_io_workers);
 
     cfg.spdk_proxy_shm_name = getenv_str("UMBP_SPDK_PROXY_SHM", cfg.spdk_proxy_shm_name);
-    cfg.spdk_proxy_rank_id = static_cast<uint32_t>(
-        getenv_int("UMBP_SPDK_PROXY_RANK", static_cast<int>(cfg.spdk_proxy_rank_id)));
+    const char* rank_env = std::getenv("UMBP_SPDK_PROXY_RANK");
+    cfg.spdk_proxy_rank_id = rank_env ? static_cast<uint32_t>(std::atoi(rank_env)) : kAutoRankId;
     cfg.spdk_proxy_max_ranks = static_cast<uint32_t>(
         getenv_int("UMBP_SPDK_PROXY_MAX_RANKS", static_cast<int>(cfg.spdk_proxy_max_ranks)));
     cfg.spdk_proxy_data_per_rank_mb = getenv_size("UMBP_SPDK_PROXY_DATA_MB", cfg.spdk_proxy_data_per_rank_mb);
     cfg.spdk_proxy_bin = getenv_str("UMBP_SPDK_PROXY_BIN", cfg.spdk_proxy_bin);
     cfg.spdk_proxy_startup_timeout_ms = getenv_int("UMBP_SPDK_PROXY_TIMEOUT_MS", cfg.spdk_proxy_startup_timeout_ms);
+
+    // --- Role auto-deduction ---
+    std::string role_str = getenv_str("UMBP_ROLE", "");
+    if (role_str == "leader") cfg.role = UMBPRole::SharedSSDLeader;
+    else if (role_str == "follower") cfg.role = UMBPRole::SharedSSDFollower;
+    else if (role_str == "standalone") cfg.role = UMBPRole::Standalone;
+    else if (role_str.empty() && cfg.role == UMBPRole::Standalone) {
+      const char* local_rank = nullptr;
+      for (const char* name : {"LOCAL_RANK", "OMPI_COMM_WORLD_LOCAL_RANK",
+                                "SLURM_LOCALID", "MPI_LOCALRANKID"}) {
+        local_rank = std::getenv(name);
+        if (local_rank) break;
+      }
+      if (local_rank) {
+        cfg.role = (std::atoi(local_rank) == 0)
+            ? UMBPRole::SharedSSDLeader : UMBPRole::SharedSSDFollower;
+      }
+    }
 
     return cfg;
   }

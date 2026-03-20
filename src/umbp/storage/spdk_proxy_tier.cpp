@@ -56,6 +56,30 @@ SpdkProxyTier::SpdkProxyTier(const UMBPConfig& config)
         return;
     }
 
+    uint32_t my_pid = 0;
+#ifdef __linux__
+    my_pid = static_cast<uint32_t>(getpid());
+#endif
+
+    // CAS rank slot allocation when rank_id is not explicitly set
+    if (rank_id_ == kAutoRankId) {
+        for (uint32_t r = 0; r < hdr->max_ranks; ++r) {
+            auto* ch = shm_.Channel(r);
+            uint32_t expected = 0;
+            if (ch->owner_pid.compare_exchange_strong(
+                    expected, my_pid, std::memory_order_acq_rel)) {
+                rank_id_ = r;
+                break;
+            }
+        }
+        if (rank_id_ == kAutoRankId) {
+            UMBP_LOG_ERROR("SpdkProxyTier: all %u rank slots occupied",
+                           hdr->max_ranks);
+            shm_.Detach();
+            return;
+        }
+    }
+
     if (rank_id_ >= hdr->max_ranks) {
         UMBP_LOG_ERROR("SpdkProxyTier: rank_id %u >= max_ranks %u",
                        rank_id_, hdr->max_ranks);
@@ -63,14 +87,13 @@ SpdkProxyTier::SpdkProxyTier(const UMBPConfig& config)
         return;
     }
 
-    // Register this rank
     auto* ch = shm_.Channel(rank_id_);
     ch->rank_id = rank_id_;
     ch->connected = 1;
+    ch->owner_pid.store(my_pid, std::memory_order_release);
 
 #ifdef __linux__
-    hdr->rank_pids[rank_id_].store(static_cast<uint32_t>(getpid()),
-                                   std::memory_order_relaxed);
+    hdr->rank_pids[rank_id_].store(my_pid, std::memory_order_relaxed);
 #endif
     hdr->active_ranks.fetch_add(1, std::memory_order_release);
 
@@ -87,7 +110,10 @@ SpdkProxyTier::~SpdkProxyTier() {
     if (connected_ && shm_.IsValid()) {
         auto* hdr = shm_.Header();
         auto* ch = shm_.Channel(rank_id_);
-        if (ch) ch->connected = 0;
+        if (ch) {
+            ch->connected = 0;
+            ch->owner_pid.store(0, std::memory_order_release);
+        }
 
         hdr->rank_pids[rank_id_].store(0, std::memory_order_relaxed);
         hdr->active_ranks.fetch_sub(1, std::memory_order_release);
