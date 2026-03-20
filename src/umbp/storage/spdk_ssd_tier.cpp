@@ -406,7 +406,8 @@ std::vector<bool> SpdkSsdTier::BatchWriteStreaming(
     const std::vector<const void*>& data_ptrs,
     const std::vector<size_t>& sizes,
     std::atomic<uint64_t>* bytes_ready,
-    const std::vector<size_t>& item_shm_offsets) {
+    const std::vector<size_t>& item_shm_offsets,
+    void** ext_dma_bufs, int ext_dma_count) {
     const int count = static_cast<int>(keys.size());
     std::vector<bool> results(count, false);
     if (!initialized_ || count == 0) return results;
@@ -497,16 +498,27 @@ std::vector<bool> SpdkSsdTier::BatchWriteStreaming(
     auto chunk_ok = std::make_unique<uint8_t[]>(chunk_count);
     std::memset(chunk_ok.get(), 0, chunk_count);
 
-    {
-        std::lock_guard<std::mutex> dma_lk(dma_ring_mu_);
+    // Select DMA buffers: external (per-rank, no lock) or internal ring (global lock)
+    std::unique_lock<std::mutex> dma_lk;
+    void** bufs;
+    int total_bufs;
+    if (ext_dma_bufs && ext_dma_count > 0) {
+        bufs = ext_dma_bufs;
+        total_bufs = ext_dma_count;
+    } else {
+        dma_lk = std::unique_lock<std::mutex>(dma_ring_mu_);
+        bufs = dma_ring_;
+        total_bufs = dma_ring_count_;
+    }
 
+    {
         constexpr int kMinChunksPerWorker = 16;
-        int max_w = std::min(num_io_workers_, dma_ring_count_ / 2);
+        int max_w = std::min(num_io_workers_, total_bufs / 2);
         int num_workers = std::clamp(chunk_count / kMinChunksPerWorker, 1, max_w);
-        int bufs_per = dma_ring_count_ / num_workers;
+        int bufs_per = total_bufs / num_workers;
 
         auto run_pipeline = [&](int c_begin, int c_end,
-                                void** bufs, int local_qd) {
+                                void** wbufs, int local_qd) {
             auto lreqs = std::make_unique<umbp::SpdkIoRequest[]>(local_qd);
             auto lbatch = std::make_unique<umbp::SpdkIoRequest*[]>(local_qd);
             int head = c_begin, tail = c_begin;
@@ -527,14 +539,14 @@ std::vector<bool> SpdkSsdTier::BatchWriteStreaming(
 
                     const char* src =
                         static_cast<const char*>(data_ptrs[idx]) + c.data_offset;
-                    std::memcpy(bufs[slot], src, c.data_bytes);
+                    std::memcpy(wbufs[slot], src, c.data_bytes);
                     if (c.nbytes > c.data_bytes)
-                        std::memset(static_cast<char*>(bufs[slot]) + c.data_bytes,
+                        std::memset(static_cast<char*>(wbufs[slot]) + c.data_bytes,
                                     0, c.nbytes - c.data_bytes);
 
                     auto& req = lreqs[slot];
                     req.op = umbp::SpdkIoRequest::WRITE;
-                    req.buf = bufs[slot];
+                    req.buf = wbufs[slot];
                     req.offset = c.offset;
                     req.nbytes = c.nbytes;
                     req.src_data = nullptr;
@@ -567,17 +579,17 @@ std::vector<bool> SpdkSsdTier::BatchWriteStreaming(
         };
 
         if (num_workers <= 1) {
-            int qd = std::min({chunk_count, kMaxQueueDepth, dma_ring_count_});
-            run_pipeline(0, chunk_count, dma_ring_, qd);
+            int qd = std::min({chunk_count, kMaxQueueDepth, total_bufs});
+            run_pipeline(0, chunk_count, bufs, qd);
         } else {
             std::vector<std::thread> workers;
             workers.reserve(num_workers - 1);
             for (int w = 0; w < num_workers; ++w) {
                 int cb = chunk_count * w / num_workers;
                 int ce = chunk_count * (w + 1) / num_workers;
-                void** wb = dma_ring_ + w * bufs_per;
+                void** wb = bufs + w * bufs_per;
                 int wq = (w == num_workers - 1)
-                    ? (dma_ring_count_ - w * bufs_per) : bufs_per;
+                    ? (total_bufs - w * bufs_per) : bufs_per;
                 if (w < num_workers - 1) {
                     workers.emplace_back([&, cb, ce, wb, wq]() {
                         run_pipeline(cb, ce, wb, wq);
@@ -589,6 +601,8 @@ std::vector<bool> SpdkSsdTier::BatchWriteStreaming(
             for (auto& t : workers) t.join();
         }
     }
+
+    if (dma_lk.owns_lock()) dma_lk.unlock();
 
     // --- Phase 3: Update metadata (lock held) ---
     std::vector<bool> item_ok(pending_count, true);
@@ -815,7 +829,8 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtrStreaming(
     const std::vector<size_t>& sizes,
     std::atomic<uint32_t>* items_done,
     std::atomic<uint64_t>* bytes_done,
-    const std::vector<size_t>* item_shm_offsets) {
+    const std::vector<size_t>* item_shm_offsets,
+    void** ext_dma_bufs, int ext_dma_count) {
     const int count = static_cast<int>(keys.size());
     std::vector<bool> results(count, false);
     if (!initialized_ || count == 0) return results;
@@ -866,9 +881,21 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtrStreaming(
     auto chunk_ok = std::make_unique<uint8_t[]>(chunk_count);
     std::memset(chunk_ok.get(), 0, chunk_count);
 
+    // Select DMA buffers: external (per-rank, no lock) or internal ring (global lock)
+    std::unique_lock<std::mutex> dma_lk;
+    void** bufs;
+    int total_bufs;
+    if (ext_dma_bufs && ext_dma_count > 0) {
+        bufs = ext_dma_bufs;
+        total_bufs = ext_dma_count;
+    } else {
+        dma_lk = std::unique_lock<std::mutex>(dma_ring_mu_);
+        bufs = dma_ring_;
+        total_bufs = dma_ring_count_;
+    }
+
     {
-        std::lock_guard<std::mutex> dma_lk(dma_ring_mu_);
-        int qd = std::min({chunk_count, kMaxQueueDepth, dma_ring_count_});
+        int qd = std::min({chunk_count, kMaxQueueDepth, total_bufs});
         auto lreqs = std::make_unique<umbp::SpdkIoRequest[]>(qd);
         auto lbatch = std::make_unique<umbp::SpdkIoRequest*[]>(qd);
         int head = 0, tail = 0;
@@ -881,7 +908,7 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtrStreaming(
                 auto& c = chunks[head];
                 auto& req = lreqs[slot];
                 req.op = umbp::SpdkIoRequest::READ;
-                req.buf = dma_ring_[slot];
+                req.buf = bufs[slot];
                 req.offset = c.offset;
                 req.nbytes = c.nbytes;
                 req.src_data = nullptr;
@@ -902,7 +929,7 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtrStreaming(
                     auto& c = chunks[tail];
                     auto& ri = items[c.item_idx];
                     char* dst = reinterpret_cast<char*>(dst_ptrs[ri.idx]) + c.data_offset;
-                    std::memcpy(dst, dma_ring_[slot], c.data_bytes);
+                    std::memcpy(dst, bufs[slot], c.data_bytes);
                     chunk_ok[tail] = 1;
 
                     if (bytes_done && item_shm_offsets) {

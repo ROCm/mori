@@ -52,7 +52,8 @@ class SpdkSsdTier : public TierBackend {
         const std::vector<const void*>& data_ptrs,
         const std::vector<size_t>& sizes,
         std::atomic<uint64_t>* bytes_ready,
-        const std::vector<size_t>& item_shm_offsets);
+        const std::vector<size_t>& item_shm_offsets,
+        void** ext_dma_bufs = nullptr, int ext_dma_count = 0);
 
     // DMA-ring read with streaming progress at two granularities:
     //   *items_done  — incremented after each item's data is fully in dst.
@@ -68,7 +69,8 @@ class SpdkSsdTier : public TierBackend {
         const std::vector<size_t>& sizes,
         std::atomic<uint32_t>* items_done,
         std::atomic<uint64_t>* bytes_done = nullptr,
-        const std::vector<size_t>* item_shm_offsets = nullptr);
+        const std::vector<size_t>* item_shm_offsets = nullptr,
+        void** ext_dma_bufs = nullptr, int ext_dma_count = 0);
 
     // Zero-copy DMA variants: data_ptrs must be DMA-registered, 4KB-aligned,
     // with AlignUp(size) bytes of writable space per key.

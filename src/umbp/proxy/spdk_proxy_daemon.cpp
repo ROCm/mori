@@ -36,6 +36,7 @@
 #include "umbp/common/log.h"
 #include "umbp/proxy/spdk_proxy_protocol.h"
 #include "umbp/proxy/spdk_proxy_shm.h"
+#include "umbp/spdk/spdk_env.h"
 #include "umbp/storage/spdk_ssd_tier.h"
 
 #ifdef __linux__
@@ -134,7 +135,8 @@ static void ProcessSingleRequest(SpdkSsdTier& tier, RingSlot& slot,
 //        This gives full overlap even for single large items (e.g. 512MB×1).
 // ---------------------------------------------------------------------------
 static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
-                                void* data_region, size_t region_size) {
+                                void* data_region, size_t region_size,
+                                void** dma_bufs = nullptr, int dma_count = 0) {
     auto type = static_cast<RequestType>(slot.type);
     auto* desc = static_cast<BatchDescriptor*>(data_region);
     uint32_t count = desc->count;
@@ -161,7 +163,8 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
             shm_offsets[i] = e.data_offset;
         }
         auto results = tier.BatchWriteStreaming(
-            keys, cptrs, sizes, &desc->bytes_ready, shm_offsets);
+            keys, cptrs, sizes, &desc->bytes_ready, shm_offsets,
+            dma_bufs, dma_count);
         for (uint32_t i = 0; i < count; ++i)
             desc->entries[i].result = results[i] ? 1 : 0;
     } else {
@@ -181,7 +184,8 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
         desc->bytes_done.store(0, std::memory_order_relaxed);
         auto results = tier.BatchReadIntoPtrStreaming(
             keys, dma_ptrs, sizes, &desc->items_done,
-            &desc->bytes_done, &shm_offsets);
+            &desc->bytes_done, &shm_offsets,
+            dma_bufs, dma_count);
         desc->bytes_done.store(desc->total_data_size,
                                std::memory_order_release);
         for (uint32_t i = 0; i < count; ++i)
@@ -192,6 +196,43 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
 }
 
 // ---------------------------------------------------------------------------
+// Per-rank DMA buffer pool — allows concurrent batch I/O without lock contention
+// on SpdkSsdTier's global dma_ring_mu_.
+// ---------------------------------------------------------------------------
+static constexpr int kDmaBufsPerRank = 128;
+static constexpr size_t kDmaBufSize = 2ULL * 1024 * 1024;
+
+struct RankDmaPool {
+    void** bufs = nullptr;
+    int count = 0;
+};
+
+static void AllocRankDmaPools(RankDmaPool* pools, int max_ranks) {
+    auto& env = umbp::SpdkEnv::Instance();
+    for (int r = 0; r < max_ranks; ++r) {
+        pools[r].bufs = new void*[kDmaBufsPerRank];
+        int got = env.DmaPoolAllocBatch(pools[r].bufs, kDmaBufSize, kDmaBufsPerRank);
+        pools[r].count = got;
+        if (got < kDmaBufsPerRank) {
+            for (int i = got; i < kDmaBufsPerRank; ++i) pools[r].bufs[i] = nullptr;
+        }
+    }
+    UMBP_LOG_INFO("spdk_proxy: allocated %d DMA bufs/rank × %d ranks (%zuMB each)",
+                  kDmaBufsPerRank, max_ranks, kDmaBufSize / (1024 * 1024));
+}
+
+static void FreeRankDmaPools(RankDmaPool* pools, int max_ranks) {
+    auto& env = umbp::SpdkEnv::Instance();
+    for (int r = 0; r < max_ranks; ++r) {
+        if (pools[r].bufs && pools[r].count > 0)
+            env.DmaPoolFreeBatch(pools[r].bufs, kDmaBufSize, pools[r].count);
+        delete[] pools[r].bufs;
+        pools[r].bufs = nullptr;
+        pools[r].count = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main poll loop — with heartbeat, dead-rank reap, and shutdown logic.
 // Batch requests are dispatched to per-rank worker threads so that multiple
 // ranks can perform disk I/O concurrently without head-of-line blocking.
@@ -199,7 +240,7 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
 static constexpr int kMaxConcurrentRanks = 64;
 
 static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm,
-                     pid_t spawner_pid) {
+                     pid_t spawner_pid, RankDmaPool* rank_dma) {
     auto* hdr = shm.Header();
     uint32_t max_ranks = std::min(hdr->max_ranks,
                                   static_cast<uint32_t>(kMaxConcurrentRanks));
@@ -240,11 +281,13 @@ static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm,
                 rtype == RequestType::BATCH_READ) {
                 if (batch_worker[r].joinable()) batch_worker[r].join();
                 batch_inflight[r].store(true, std::memory_order_relaxed);
+                void** dma_bufs = rank_dma[r].bufs;
+                int dma_count = rank_dma[r].count;
                 batch_worker[r] = std::thread(
                     [&tier, &slot, data_region, region_size, ch, t, r,
-                     &batch_inflight]() {
+                     &batch_inflight, dma_bufs, dma_count]() {
                         ProcessBatchRequest(tier, slot, data_region,
-                                            region_size);
+                                            region_size, dma_bufs, dma_count);
                         slot.state.store(
                             static_cast<uint32_t>(SlotState::COMPLETED),
                             std::memory_order_release);
@@ -482,14 +525,21 @@ int main(int argc, char** argv) {
     hdr->state.store(static_cast<uint32_t>(ProxyState::READY),
                      std::memory_order_release);
 
+    // Step 3b: Allocate per-rank DMA buffer pools for concurrent I/O
+    auto* rank_dma = new RankDmaPool[max_ranks];
+    AllocRankDmaPools(rank_dma, max_ranks);
+
     UMBP_LOG_INFO("spdk_proxy: READY — capacity=%zuMB, waiting for connections...",
                   total / (1024 * 1024));
     fflush(stdout);
 
     // Step 4: Enter main poll loop (returns when shutdown conditions met)
-    PollLoop(tier, shm, spawner_pid);
+    PollLoop(tier, shm, spawner_pid, rank_dma);
 
     // Step 5: Shutdown
+    FreeRankDmaPools(rank_dma, max_ranks);
+    delete[] rank_dma;
+
     hdr->state.store(static_cast<uint32_t>(ProxyState::SHUTDOWN),
                      std::memory_order_release);
 

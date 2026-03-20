@@ -108,7 +108,17 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id,
     std::vector<std::string> rkeys(count);
     for (int i = 0; i < count; ++i)
         rkeys[i] = prefix + "r_" + std::to_string(i);
-    ssd->BatchWrite(rkeys, cptrs, sizes);
+
+    // Write read-benchmark keys with retry to ensure all are present
+    int write_ok = 0;
+    for (int attempt = 0; attempt < 3 && write_ok < count; ++attempt) {
+        auto wr = ssd->BatchWrite(rkeys, cptrs, sizes);
+        write_ok = 0;
+        for (auto b : wr) write_ok += b;
+        if (write_ok < count && attempt < 2)
+            fprintf(stderr, "  [rank %d] read-key write %d/%d, retrying...\n",
+                    rank_id, write_ok, count);
+    }
 
     std::vector<std::vector<char>> read_bufs(count, std::vector<char>(value_size, 0));
     std::vector<uintptr_t> dst_ptrs(count);
