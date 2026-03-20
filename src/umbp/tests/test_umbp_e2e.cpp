@@ -351,6 +351,22 @@ static bool test_posix_large_value() {
 // =========================================================================
 
 #ifdef __linux__
+
+// Kill any residual spdk_proxy daemon and clean stale SHM before tests.
+// SPDK takes an exclusive lock on NVMe cores — leftover processes from
+// previous runs (manual daemon, crashed test, etc.) will block all SPDK init.
+static void CleanupResidualSpdk() {
+    // Kill any lingering spdk_proxy processes
+    system("pkill -9 -x spdk_proxy 2>/dev/null");
+    usleep(500000);  // 500ms for process to die
+
+    // Remove stale SHM files
+    umbp::proxy::ProxyShmRegion::CleanupStale(umbp::proxy::kDefaultShmName);
+
+    // Also remove SPDK's per-pid lock files that may be stale
+    system("rm -f /var/tmp/spdk_pid*.lock 2>/dev/null");
+}
+
 static bool test_spdk_standalone_write_read() {
     // This test requires USE_SPDK compiled in and SPDK env set
     UMBPConfig cfg;
@@ -704,15 +720,26 @@ int main() {
     // --- SPDK tests ---
 #ifdef __linux__
     if (have_spdk) {
+        printf("[CLEANUP] Killing residual SPDK processes...\n");
+        CleanupResidualSpdk();
+
         printf("[SPDK] SPDK standalone tests\n");
         RUN_TEST(test_spdk_standalone_write_read);
         printf("\n");
 
+        // SPDK cleanup is not instant — wait for lock files to be released
+        printf("[CLEANUP] Waiting for SPDK lock release...\n");
+        CleanupResidualSpdk();
+
         printf("[PROXY] SPDK proxy auto-fork tests\n");
         RUN_TEST(test_proxy_batch_write_read);
+        CleanupResidualSpdk();
         RUN_TEST(test_proxy_auto_fork_leader_follower);
+        CleanupResidualSpdk();
         RUN_TEST(test_proxy_daemon_cleanup_after_leader_exit);
+        CleanupResidualSpdk();
         RUN_TEST(test_proxy_cas_rank_allocation);
+        CleanupResidualSpdk();
         printf("\n");
     } else {
         printf("[SPDK] Skipped (UMBP_SPDK_NVME_PCI not set)\n");
