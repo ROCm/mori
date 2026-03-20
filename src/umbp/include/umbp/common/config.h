@@ -120,6 +120,12 @@ struct UMBPConfig {
     cfg.dram_low_watermark = getenv_double("UMBP_DRAM_LOW_WM", cfg.dram_low_watermark);
 
     cfg.ssd_backend = getenv_str("UMBP_SSD_BACKEND", cfg.ssd_backend);
+    // Auto-detect: if UMBP_SPDK_NVME_PCI is set but UMBP_SSD_BACKEND is not,
+    // default to "spdk" so users don't have to specify both.
+    if (cfg.ssd_backend == "posix" && !std::getenv("UMBP_SSD_BACKEND") &&
+        std::getenv("UMBP_SPDK_NVME_PCI")) {
+      cfg.ssd_backend = "spdk";
+    }
     cfg.spdk_bdev_name = getenv_str("UMBP_SPDK_BDEV", cfg.spdk_bdev_name);
     cfg.spdk_reactor_mask = getenv_str("UMBP_SPDK_REACTOR_MASK", cfg.spdk_reactor_mask);
     cfg.spdk_mem_size_mb = getenv_int("UMBP_SPDK_MEM_MB", cfg.spdk_mem_size_mb);
