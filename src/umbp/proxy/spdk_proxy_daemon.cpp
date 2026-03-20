@@ -182,12 +182,20 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
 }
 
 // ---------------------------------------------------------------------------
-// Main poll loop — with heartbeat, dead-rank reap, and shutdown logic
+// Main poll loop — with heartbeat, dead-rank reap, and shutdown logic.
+// Batch requests are dispatched to per-rank worker threads so that multiple
+// ranks can perform disk I/O concurrently without head-of-line blocking.
 // ---------------------------------------------------------------------------
+static constexpr int kMaxConcurrentRanks = 64;
+
 static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm,
                      pid_t spawner_pid) {
     auto* hdr = shm.Header();
-    uint32_t max_ranks = hdr->max_ranks;
+    uint32_t max_ranks = std::min(hdr->max_ranks,
+                                  static_cast<uint32_t>(kMaxConcurrentRanks));
+
+    std::atomic<bool> batch_inflight[kMaxConcurrentRanks] = {};
+    std::thread       batch_worker[kMaxConcurrentRanks];
 
     UMBP_LOG_INFO("spdk_proxy: entering poll loop (max_ranks=%u, spawner=%d)",
                   max_ranks, static_cast<int>(spawner_pid));
@@ -199,6 +207,8 @@ static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm,
         bool any_work = false;
 
         for (uint32_t r = 0; r < max_ranks; ++r) {
+            if (batch_inflight[r].load(std::memory_order_acquire)) continue;
+
             auto* ch = shm.Channel(r);
             if (!ch->connected) continue;
 
@@ -218,14 +228,27 @@ static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm,
             auto rtype = static_cast<RequestType>(slot.type);
             if (rtype == RequestType::BATCH_WRITE ||
                 rtype == RequestType::BATCH_READ) {
-                ProcessBatchRequest(tier, slot, data_region, region_size);
+                if (batch_worker[r].joinable()) batch_worker[r].join();
+                batch_inflight[r].store(true, std::memory_order_relaxed);
+                batch_worker[r] = std::thread(
+                    [&tier, &slot, data_region, region_size, ch, t, r,
+                     &batch_inflight]() {
+                        ProcessBatchRequest(tier, slot, data_region,
+                                            region_size);
+                        slot.state.store(
+                            static_cast<uint32_t>(SlotState::COMPLETED),
+                            std::memory_order_release);
+                        ch->tail.store((t + 1) % kRingSize,
+                                       std::memory_order_release);
+                        batch_inflight[r].store(false,
+                                                std::memory_order_release);
+                    });
             } else {
                 ProcessSingleRequest(tier, slot, data_region, region_size);
+                slot.state.store(static_cast<uint32_t>(SlotState::COMPLETED),
+                                 std::memory_order_release);
+                ch->tail.store((t + 1) % kRingSize, std::memory_order_release);
             }
-
-            slot.state.store(static_cast<uint32_t>(SlotState::COMPLETED),
-                             std::memory_order_release);
-            ch->tail.store((t + 1) % kRingSize, std::memory_order_release);
         }
 
         auto now = std::chrono::steady_clock::now();
@@ -245,6 +268,7 @@ static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm,
         if (since_reap.count() >= 5) {
 #ifdef __linux__
             for (uint32_t r = 0; r < max_ranks; ++r) {
+                if (batch_inflight[r].load(std::memory_order_relaxed)) continue;
                 uint32_t rpid = hdr->rank_pids[r].load(std::memory_order_relaxed);
                 if (rpid > 0 && kill(static_cast<pid_t>(rpid), 0) != 0) {
                     UMBP_LOG_WARN("spdk_proxy: rank %u pid %u appears dead, cleaning up",
@@ -253,7 +277,6 @@ static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm,
                     hdr->active_ranks.fetch_sub(1, std::memory_order_relaxed);
                     auto* ch = shm.Channel(r);
                     ch->connected = 0;
-                    // Drain any pending slots for this rank
                     uint32_t t = ch->tail.load(std::memory_order_relaxed);
                     uint32_t h = ch->head.load(std::memory_order_relaxed);
                     while (t != h) {
@@ -292,6 +315,10 @@ static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm,
             for (int i = 0; i < 32; ++i) _mm_pause();
 #endif
         }
+    }
+
+    for (uint32_t r = 0; r < max_ranks; ++r) {
+        if (batch_worker[r].joinable()) batch_worker[r].join();
     }
 
     UMBP_LOG_INFO("spdk_proxy: exiting poll loop");
