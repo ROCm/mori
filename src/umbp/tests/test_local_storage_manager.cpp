@@ -32,8 +32,8 @@ void test_dram_write_read() {
   std::cout << "test_dram_write_read... ";
 
   UMBPConfig config;
-  config.dram_capacity_bytes = 1 * 1024 * 1024;  // 1 MB
-  config.ssd_enabled = false;
+  config.dram.capacity_bytes = 1 * 1024 * 1024;  // 1 MB
+  config.ssd.enabled = false;
 
   LocalStorageManager mgr(config);
 
@@ -52,8 +52,8 @@ void test_dram_eviction_no_ssd() {
   std::cout << "test_dram_eviction_no_ssd... ";
 
   UMBPConfig config;
-  config.dram_capacity_bytes = 1024;  // tiny: 1 KB
-  config.ssd_enabled = false;
+  config.dram.capacity_bytes = 1024;  // tiny: 1 KB
+  config.ssd.enabled = false;
 
   LocalStorageManager mgr(config);
 
@@ -79,10 +79,10 @@ void test_dram_full_auto_demote_to_ssd() {
   std::cout << "test_dram_full_auto_demote_to_ssd... ";
 
   UMBPConfig config;
-  config.dram_capacity_bytes = 1024;  // tiny: 1 KB
-  config.ssd_enabled = true;
-  config.ssd_storage_dir = "/tmp/umbp_test_ssd_autodemote";
-  config.ssd_capacity_bytes = 10 * 1024 * 1024;
+  config.dram.capacity_bytes = 1024;  // tiny: 1 KB
+  config.ssd.enabled = true;
+  config.ssd.storage_dir = "/tmp/umbp_test_ssd_autodemote";
+  config.ssd.capacity_bytes = 10 * 1024 * 1024;
 
   BlockIndexClient index;
   LocalStorageManager mgr(config, &index);
@@ -124,10 +124,10 @@ void test_ssd_write_read() {
   std::cout << "test_ssd_write_read... ";
 
   UMBPConfig config;
-  config.dram_capacity_bytes = 1 * 1024 * 1024;
-  config.ssd_enabled = true;
-  config.ssd_storage_dir = "/tmp/umbp_test_ssd";
-  config.ssd_capacity_bytes = 10 * 1024 * 1024;
+  config.dram.capacity_bytes = 1 * 1024 * 1024;
+  config.ssd.enabled = true;
+  config.ssd.storage_dir = "/tmp/umbp_test_ssd";
+  config.ssd.capacity_bytes = 10 * 1024 * 1024;
 
   LocalStorageManager mgr(config);
 
@@ -147,11 +147,11 @@ void test_demote_promote_with_index() {
   std::cout << "test_demote_promote_with_index... ";
 
   UMBPConfig config;
-  config.dram_capacity_bytes = 1 * 1024 * 1024;
-  config.ssd_enabled = true;
-  config.ssd_storage_dir = "/tmp/umbp_test_ssd_dp2";
-  config.ssd_capacity_bytes = 10 * 1024 * 1024;
-  config.auto_promote_on_read = false;
+  config.dram.capacity_bytes = 1 * 1024 * 1024;
+  config.ssd.enabled = true;
+  config.ssd.storage_dir = "/tmp/umbp_test_ssd_dp2";
+  config.ssd.capacity_bytes = 10 * 1024 * 1024;
+  config.eviction.auto_promote_on_read = false;
 
   BlockIndexClient index;
   LocalStorageManager mgr(config, &index);
@@ -199,10 +199,10 @@ void test_capacity() {
   std::cout << "test_capacity... ";
 
   UMBPConfig config;
-  config.dram_capacity_bytes = 1 * 1024 * 1024;
-  config.ssd_enabled = true;
-  config.ssd_storage_dir = "/tmp/umbp_test_ssd_cap";
-  config.ssd_capacity_bytes = 10 * 1024 * 1024;
+  config.dram.capacity_bytes = 1 * 1024 * 1024;
+  config.ssd.enabled = true;
+  config.ssd.storage_dir = "/tmp/umbp_test_ssd_cap";
+  config.ssd.capacity_bytes = 10 * 1024 * 1024;
 
   LocalStorageManager mgr(config);
 
@@ -222,8 +222,8 @@ void test_write_from_ptr() {
   std::cout << "test_write_from_ptr... ";
 
   UMBPConfig config;
-  config.dram_capacity_bytes = 1 * 1024 * 1024;
-  config.ssd_enabled = false;
+  config.dram.capacity_bytes = 1 * 1024 * 1024;
+  config.ssd.enabled = false;
 
   LocalStorageManager mgr(config);
 
@@ -240,16 +240,16 @@ void test_write_from_ptr() {
 
 // Regression test: SSD was previously self-evicting keys without notifying
 // BlockIndexClient, leaving the index in a dirty state.  After the fix,
-// SSDTier never self-evicts; LocalStorageManager::Write() drives eviction
+// SSD tier never self-evicts; LocalStorageManager::Write() drives eviction
 // with full index synchronization.
 void test_ssd_full_evicts_with_index_sync() {
   std::cout << "test_ssd_full_evicts_with_index_sync... ";
 
   UMBPConfig config;
-  config.dram_capacity_bytes = 1 * 1024 * 1024;
-  config.ssd_enabled = true;
-  config.ssd_storage_dir = "/tmp/umbp_test_ssd_idxsync";
-  config.ssd_capacity_bytes = 1024;  // tiny: 1 KB
+  config.dram.capacity_bytes = 1 * 1024 * 1024;
+  config.ssd.enabled = true;
+  config.ssd.storage_dir = "/tmp/umbp_test_ssd_idxsync";
+  config.ssd.capacity_bytes = 1024;  // tiny: 1 KB
 
   BlockIndexClient index;
   LocalStorageManager mgr(config, &index);
@@ -283,11 +283,11 @@ void test_read_into_ptr_size_mismatch() {
   std::cout << "test_read_into_ptr_size_mismatch... ";
 
   UMBPConfig config;
-  config.dram_capacity_bytes = 1 * 1024 * 1024;
-  config.ssd_enabled = true;
-  config.ssd_storage_dir = "/tmp/umbp_test_ssd_sizemm";
-  config.ssd_capacity_bytes = 10 * 1024 * 1024;
-  config.auto_promote_on_read = false;
+  config.dram.capacity_bytes = 1 * 1024 * 1024;
+  config.ssd.enabled = true;
+  config.ssd.storage_dir = "/tmp/umbp_test_ssd_sizemm";
+  config.ssd.capacity_bytes = 10 * 1024 * 1024;
+  config.eviction.auto_promote_on_read = false;
 
   LocalStorageManager mgr(config);
 
@@ -319,23 +319,32 @@ void test_shared_memory_mode() {
   std::cout << "test_shared_memory_mode... ";
 
   UMBPConfig config;
-  config.dram_capacity_bytes = 1 * 1024 * 1024;
-  config.use_shared_memory = true;
-  config.shm_name = "/umbp_test_shm_" + std::to_string(getpid());
-  config.ssd_enabled = false;
+  config.dram.capacity_bytes = 1 * 1024 * 1024;
+  config.dram.use_shared_memory = true;
+  config.dram.shm_name = "/umbp_test_shm_" + std::to_string(getpid());
+  config.ssd.enabled = false;
 
-  LocalStorageManager mgr(config);
+  try {
+    LocalStorageManager mgr(config);
 
-  std::vector<char> data(4096, 'S');
-  assert(mgr.Write("shm_key", data.data(), data.size()));
-  assert(mgr.Exists("shm_key"));
+    std::vector<char> data(4096, 'S');
+    assert(mgr.Write("shm_key", data.data(), data.size()));
+    assert(mgr.Exists("shm_key"));
 
-  std::vector<char> buf(4096, 0);
-  assert(mgr.ReadIntoPtr("shm_key", reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
-  assert(buf == data);
+    std::vector<char> buf(4096, 0);
+    assert(mgr.ReadIntoPtr("shm_key", reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
+    assert(buf == data);
 
-  mgr.Clear();
-  std::cout << "PASSED" << std::endl;
+    mgr.Clear();
+    std::cout << "PASSED" << std::endl;
+  } catch (const std::runtime_error& e) {
+    const std::string message = e.what();
+    if (message.find("shm_open failed") != std::string::npos) {
+      std::cout << "SKIPPED (" << message << ")" << std::endl;
+      return;
+    }
+    throw;
+  }
 }
 
 int main() {

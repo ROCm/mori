@@ -30,25 +30,66 @@ enum class UMBPRole : int {
   SharedSSDFollower = 2,
 };
 
-struct UMBPConfig {
-  // DRAM
-  size_t dram_capacity_bytes = 4ULL * 1024 * 1024 * 1024;  // 4 GB
-  bool use_shared_memory = false;                          // shm_open vs MAP_ANONYMOUS
-  std::string shm_name = "/umbp_dram";                     // only used when use_shared_memory=true
+enum class UMBPSsdLayoutMode : int {
+  SegmentedLog = 1,
+};
 
-  // SSD
-  bool ssd_enabled = true;
-  std::string ssd_storage_dir = "/tmp/umbp_ssd";
-  size_t ssd_capacity_bytes = 32ULL * 1024 * 1024 * 1024;
+enum class UMBPIoBackend : int {
+  PThread = 0,
+  IoUring = 1,
+};
 
-  // Policy: "lru" (default) or "prefix_aware_lru"
-  std::string eviction_policy = "lru";
-  // Number of LRU-tail candidates inspected when eviction_policy == "prefix_aware_lru".
-  // Must be >= 1; values of 0 are treated as 1.
-  size_t eviction_candidate_window = 16;
+enum class UMBPDurabilityMode : int {
+  Strict = 0,
+  Relaxed = 1,
+};
+
+struct UMBPDramConfig {
+  size_t capacity_bytes = 4ULL * 1024 * 1024 * 1024;
+  bool use_shared_memory = false;
+  std::string shm_name = "/umbp_dram";
+  double high_watermark = 0.9;
+  double low_watermark = 0.7;
+};
+
+struct UMBPIoConfig {
+  UMBPIoBackend backend = UMBPIoBackend::IoUring;
+  size_t queue_depth = 4096;
+};
+
+struct UMBPDurabilityConfig {
+  UMBPDurabilityMode mode = UMBPDurabilityMode::Strict;
+  bool enable_background_gc = true;
+};
+
+struct UMBPSsdConfig {
+  bool enabled = true;
+  std::string storage_dir = "/tmp/umbp_ssd";
+  size_t capacity_bytes = 32ULL * 1024 * 1024 * 1024;
+  UMBPSsdLayoutMode layout_mode = UMBPSsdLayoutMode::SegmentedLog;
+  size_t segment_size_bytes = 256ULL * 1024 * 1024;
+  UMBPIoConfig io;
+  UMBPDurabilityConfig durability;
+};
+
+struct UMBPEvictionConfig {
+  std::string policy = "lru";
+  size_t candidate_window = 16;
   bool auto_promote_on_read = true;
-  double dram_high_watermark = 0.9;
-  double dram_low_watermark = 0.7;
+};
+
+struct UMBPCopyPipelineConfig {
+  bool async_enabled = true;
+  size_t queue_depth = 4096;
+  size_t worker_threads = 2;
+  size_t batch_max_ops = 128;
+};
+
+struct UMBPConfig {
+  UMBPDramConfig dram;
+  UMBPSsdConfig ssd;
+  UMBPEvictionConfig eviction;
+  UMBPCopyPipelineConfig copy_pipeline;
 
   // Role is the source of truth for runtime behavior.
   UMBPRole role = UMBPRole::Standalone;
@@ -69,5 +110,35 @@ struct UMBPConfig {
       return UMBPRole::SharedSSDLeader;
     }
     return UMBPRole::Standalone;
+  }
+
+  bool Validate(std::string* error_message = nullptr) const {
+    if (dram.capacity_bytes == 0) {
+      if (error_message) *error_message = "dram.capacity_bytes must be > 0";
+      return false;
+    }
+    if (ssd.enabled) {
+      if (ssd.capacity_bytes == 0) {
+        if (error_message) *error_message = "ssd.capacity_bytes must be > 0";
+        return false;
+      }
+      if (ssd.segment_size_bytes == 0) {
+        if (error_message) *error_message = "ssd.segment_size_bytes must be > 0";
+        return false;
+      }
+    }
+    if (copy_pipeline.queue_depth == 0) {
+      if (error_message) *error_message = "copy_pipeline.queue_depth must be > 0";
+      return false;
+    }
+    if (copy_pipeline.worker_threads == 0) {
+      if (error_message) *error_message = "copy_pipeline.worker_threads must be > 0";
+      return false;
+    }
+    if (copy_pipeline.batch_max_ops == 0) {
+      if (error_message) *error_message = "copy_pipeline.batch_max_ops must be > 0";
+      return false;
+    }
+    return true;
   }
 };

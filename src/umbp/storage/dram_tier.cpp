@@ -212,6 +212,12 @@ std::vector<char> DRAMTier::Read(const std::string& key) {
   return buf;
 }
 
+TierCapabilities DRAMTier::Capabilities() const {
+  TierCapabilities caps;
+  caps.zero_copy_read = true;
+  return caps;
+}
+
 bool DRAMTier::Exists(const std::string& key) const {
   std::lock_guard<std::mutex> lock(mu_);
   return slots_.count(key) > 0;

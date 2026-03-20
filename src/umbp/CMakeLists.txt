@@ -1,8 +1,20 @@
 # Core static library
 add_library(
   umbp_core STATIC
-  block_index/block_index.cpp storage/tier_backend.cpp storage/dram_tier.cpp
-  storage/ssd_tier.cpp storage/local_storage_manager.cpp umbp_client.cpp)
+  block_index/block_index.cpp
+  storage/io/storage_io_driver.cpp
+  storage/io/posix_storage_io_driver.cpp
+  storage/io/io_uring_storage_io_driver.cpp
+  storage/copy_pipeline.cpp
+  storage/segment/segment_format.cpp
+  storage/segment/segment_index.cpp
+  storage/segment/segment_scanner.cpp
+  storage/segment/segment_writer.cpp
+  storage/tier_backend.cpp
+  storage/dram_tier.cpp
+  storage/ssd_tier.cpp
+  storage/local_storage_manager.cpp
+  umbp_client.cpp)
 target_include_directories(umbp_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(umbp_core PRIVATE pthread)
 

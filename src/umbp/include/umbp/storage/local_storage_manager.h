@@ -49,13 +49,17 @@ class LocalStorageManager {
                              StorageTier tier = StorageTier::CPU_DRAM);
 
   bool ReadIntoPtr(const std::string& key, uintptr_t dst, size_t size);
+  std::vector<bool> ReadBatchIntoPtr(const std::vector<std::string>& keys,
+                                     const std::vector<uintptr_t>& dst_ptrs,
+                                     const std::vector<size_t>& sizes);
   bool Exists(const std::string& key) const;
   bool Evict(const std::string& key);
   std::pair<size_t, size_t> Capacity(StorageTier tier) const;
 
-  bool Demote(const std::string& key);     // Move to next-slower tier
-  bool Promote(const std::string& key);    // Move to next-faster tier
-  bool CopyToSSD(const std::string& key);  // Non-destructive DRAM→SSD copy
+  bool Demote(const std::string& key);                        // Move to next-slower tier
+  bool Promote(const std::string& key);                       // Move to next-faster tier
+  bool CopyToSSD(const std::string& key);                     // Non-destructive DRAM→SSD copy
+  bool CopyToSSDBatch(const std::vector<std::string>& keys);  // Batched DRAM→SSD copy
   void Clear();
 
   // Access tiers generically

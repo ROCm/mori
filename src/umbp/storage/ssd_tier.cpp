@@ -25,346 +25,465 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <algorithm>
-#include <cstring>
+#include <cstdio>
 #include <filesystem>
 #include <stdexcept>
+#include <vector>
+
+#include "umbp/storage/segment/segment_format.h"
 
 namespace fs = std::filesystem;
 
-namespace {
-inline size_t SaturatingSub(size_t a, size_t b) { return (a >= b) ? (a - b) : 0; }
-}  // namespace
-
-SSDTier::SSDTier(const std::string& dir, size_t capacity, SSDAccessMode access_mode)
+SSDTier::SSDTier(const std::string& dir, size_t capacity, const UMBPConfig& config,
+                 SSDAccessMode access_mode)
     : TierBackend(StorageTier::LOCAL_SSD),
       dir_(dir),
       capacity_(capacity),
-      used_(0),
-      access_mode_(access_mode) {
+      config_(config),
+      access_mode_(access_mode),
+      io_driver_(CreateStorageIoDriver(config.ssd.io.backend,
+                                       static_cast<uint32_t>(config.ssd.io.queue_depth))),
+      index_(capacity) {
+  std::string error_message;
+  if (!config_.Validate(&error_message)) {
+    throw std::runtime_error("invalid UMBP config: " + error_message);
+  }
+  if (config_.ssd.io.backend == UMBPIoBackend::IoUring &&
+      !io_driver_->Capabilities().native_async) {
+    throw std::runtime_error("UMBP io_uring backend requested but initialization failed");
+  }
+  writer_ = std::make_unique<segment::Writer>(*io_driver_);
   fs::create_directories(dir_);
+  std::lock_guard<std::mutex> lock(mu_);
+  RefreshFromDiskLocked(true);
+  if (!IsReadOnlyShared() && index_.Segments().empty()) {
+    OpenOrCreateSegmentLocked(0);
+  }
 }
 
 SSDTier::~SSDTier() {
-  // Don't clean up files on destruction — let Clear() handle explicit cleanup
-}
-
-std::string SSDTier::KeyToPath(const std::string& key) const { return dir_ + "/" + key + ".bin"; }
-
-bool SSDTier::FileExistsOnDisk(const std::string& key) const {
-  std::string path = KeyToPath(key);
-  struct stat st;
-  return (::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode));
-}
-
-void SSDTier::TouchLRU(const std::string& key) {
-  auto it = lru_map_.find(key);
-  if (it != lru_map_.end()) {
-    lru_list_.erase(it->second);
-  }
-  lru_list_.push_front(key);
-  lru_map_[key] = lru_list_.begin();
-}
-
-void SSDTier::EvictLRU() {
-  if (lru_list_.empty()) return;
-
-  const std::string& victim = lru_list_.back();
-  auto key_it = keys_.find(victim);
-  if (key_it != keys_.end()) {
-    if (!IsReadOnlyShared()) {
-      std::string path = KeyToPath(victim);
-      std::remove(path.c_str());
+  std::lock_guard<std::mutex> lock(mu_);
+  for (auto& kv : index_.MutableSegments()) {
+    if (kv.second.fd >= 0) {
+      close(kv.second.fd);
+      kv.second.fd = -1;
     }
-    used_ = SaturatingSub(used_, key_it->second);
-    keys_.erase(key_it);
   }
-  lru_map_.erase(victim);
-  lru_list_.pop_back();
+}
+
+segment::Meta* SSDTier::GetSegmentLocked(uint64_t segment_id) {
+  return index_.FindSegment(segment_id);
+}
+
+const segment::Meta* SSDTier::GetSegmentLocked(uint64_t segment_id) const {
+  return index_.FindSegment(segment_id);
+}
+
+void SSDTier::RememberStatus(IoStatus status) const { last_io_status_ = std::move(status); }
+
+bool SSDTier::OpenOrCreateSegmentLocked(uint64_t segment_id) {
+  segment::Meta seg;
+  seg.id = segment_id;
+  seg.path = dir_ + "/" + segment::BuildFileName(segment_id);
+
+  int flags = IsReadOnlyShared() ? O_RDONLY : (O_RDWR | O_CREAT);
+  seg.fd = open(seg.path.c_str(), flags, 0644);
+  if (seg.fd < 0) return false;
+
+  struct stat st;
+  if (fstat(seg.fd, &st) != 0) {
+    close(seg.fd);
+    return false;
+  }
+
+  seg.write_offset = static_cast<uint64_t>(st.st_size);
+  index_.MutableSegments()[segment_id] = seg;
+  index_.MarkKnownSegment(segment_id);
+  index_.AdvanceNextSegmentId(segment_id + 1);
+  if (!IsReadOnlyShared()) {
+    index_.set_active_segment_id(std::max(index_.active_segment_id(), segment_id));
+  }
+  return true;
+}
+
+bool SSDTier::EnsureActiveSegment(size_t need_bytes) {
+  auto* seg = GetSegmentLocked(index_.active_segment_id());
+  if (!seg) {
+    if (!OpenOrCreateSegmentLocked(index_.next_segment_id())) return false;
+    index_.set_active_segment_id(index_.next_segment_id() - 1);
+    seg = GetSegmentLocked(index_.active_segment_id());
+  }
+  if (!seg) return false;
+
+  if (seg->write_offset + need_bytes <= config_.ssd.segment_size_bytes) return true;
+
+  uint64_t new_id = index_.next_segment_id();
+  if (!OpenOrCreateSegmentLocked(new_id)) return false;
+  index_.set_active_segment_id(new_id);
+  return true;
+}
+
+bool SSDTier::RefreshFromDiskLocked(bool force_full_rescan) {
+  if (force_full_rescan) {
+    for (auto& kv : index_.MutableSegments()) {
+      if (kv.second.fd >= 0) {
+        close(kv.second.fd);
+        kv.second.fd = -1;
+      }
+    }
+    index_.ResetAll();
+  }
+
+  std::string error_message;
+  bool ok = scanner_.RefreshFromDisk(dir_, *io_driver_, index_, IsReadOnlyShared(),
+                                     force_full_rescan, &error_message);
+  if (!ok && !error_message.empty()) {
+    RememberStatus(IoStatus::IoError(error_message));
+  }
+  return ok;
+}
+
+bool SSDTier::RefreshFollowerLocked() const {
+  return const_cast<SSDTier*>(this)->RefreshFromDiskLocked(false);
 }
 
 bool SSDTier::Write(const std::string& key, const void* data, size_t size) {
-  std::lock_guard<std::mutex> lock(mu_);
+  if (IsReadOnlyShared()) return false;
 
-  if (IsReadOnlyShared()) {
-    return false;
+  const size_t record_size = sizeof(segment::RecordHeader) + key.size() + size;
+  segment::PreparedRecord pr;
+  int write_fd = -1;
+  {
+    // Phase 1: reserve index space and build record buffer under mu_
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!EnsureActiveSegment(record_size)) return false;
+    auto* seg = GetSegmentLocked(index_.active_segment_id());
+    if (!seg) return false;
+    if (!writer_->Prepare(key, data, size, seg, index_, &pr)) return false;
+    write_fd = seg->fd;
   }
 
-  // Existing key will be atomically replaced by rename().
-  auto existing = keys_.find(key);
-  size_t existing_size = (existing == keys_.end()) ? 0 : existing->second;
-
-  // Do NOT self-evict — return false if no space.
-  // Upper layer (LocalStorageManager) is responsible for demoting keys
-  // with index synchronization, just as it does for DRAMTier.
-  if (SaturatingSub(used_, existing_size) + size > capacity_) {
-    return false;
+  // Phase 2: perform I/O outside mu_ (io_mu_ serializes non-thread-safe backends)
+  const bool needs_io_lock = !io_driver_->Capabilities().thread_safe;
+  IoStatus status;
+  if (needs_io_lock) {
+    std::lock_guard<std::mutex> io_lock(io_mu_);
+    status = writer_->WriteRecord(write_fd, pr, ShouldSyncOnWrite());
+  } else {
+    status = writer_->WriteRecord(write_fd, pr, ShouldSyncOnWrite());
   }
 
-  // Atomic write: write to .tmp then rename, so followers never see partial files
-  std::string path = KeyToPath(key);
-  std::string tmp_path = path + ".tmp";
-  int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (fd < 0) return false;
+  if (!status.ok()) {
+    std::lock_guard<std::mutex> lock(mu_);
+    index_.RollbackWrite(pr.reservation);
+    RememberStatus(std::move(status));
+    return false;
+  }
+  return true;
+}
 
-  size_t written = 0;
-  while (written < size) {
-    ssize_t n = ::write(fd, static_cast<const char*>(data) + written, size - written);
-    if (n < 0) {
-      close(fd);
-      std::remove(tmp_path.c_str());
-      return false;
+bool SSDTier::WriteBatch(const std::vector<std::string>& keys,
+                         const std::vector<const void*>& data_ptrs,
+                         const std::vector<size_t>& sizes) {
+  if (keys.empty()) return true;
+  if (IsReadOnlyShared()) return false;
+
+  size_t total_bytes = 0;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    total_bytes += sizeof(segment::RecordHeader) + keys[i].size() + sizes[i];
+  }
+  if (total_bytes > config_.ssd.segment_size_bytes) {
+    bool all_ok = true;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (!Write(keys[i], data_ptrs[i], sizes[i])) all_ok = false;
     }
-    written += n;
-  }
-  // Flush data to disk before rename so followers see complete content
-  // once the file appears under its final name.
-  fsync(fd);
-  close(fd);
-
-  if (rename(tmp_path.c_str(), path.c_str()) != 0) {
-    std::remove(tmp_path.c_str());
-    return false;
+    return all_ok;
   }
 
-  if (existing != keys_.end()) {
-    auto lru_it = lru_map_.find(key);
-    if (lru_it != lru_map_.end()) {
-      lru_list_.erase(lru_it->second);
-      lru_map_.erase(lru_it);
+  std::vector<segment::PreparedRecord> prepared;
+  int write_fd = -1;
+  {
+    // Phase 1: reserve index space and build record buffers under mu_
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!EnsureActiveSegment(total_bytes)) return false;
+    auto* seg = GetSegmentLocked(index_.active_segment_id());
+    if (!seg) return false;
+    write_fd = seg->fd;
+
+    prepared.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+      segment::PreparedRecord pr;
+      if (!writer_->Prepare(keys[i], data_ptrs[i], sizes[i], seg, index_, &pr)) continue;
+      prepared.push_back(std::move(pr));
     }
   }
 
-  keys_[key] = size;
-  used_ = SaturatingSub(used_, existing_size) + size;
-  TouchLRU(key);
+  if (prepared.empty()) return true;
+
+  // Phase 2: perform I/O outside mu_
+  const bool needs_io_lock = !io_driver_->Capabilities().thread_safe;
+  IoStatus status;
+  if (needs_io_lock) {
+    std::lock_guard<std::mutex> io_lock(io_mu_);
+    status = writer_->WriteRecords(write_fd, prepared, ShouldSyncOnWrite());
+  } else {
+    status = writer_->WriteRecords(write_fd, prepared, ShouldSyncOnWrite());
+  }
+
+  if (!status.ok()) {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (const auto& pr : prepared) index_.RollbackWrite(pr.reservation);
+    RememberStatus(std::move(status));
+    return false;
+  }
+  return true;
+}
+
+bool SSDTier::ReadRecordLocked(const std::string& key, void* dst, size_t size,
+                               uint32_t expected_crc, uint64_t value_offset, int read_fd) const {
+  const bool needs_external_lock = !io_driver_->Capabilities().thread_safe;
+  IoStatus status;
+  if (needs_external_lock) {
+    std::lock_guard<std::mutex> io_lock(io_mu_);
+    status = io_driver_->ReadAt(read_fd, dst, size, value_offset);
+  } else {
+    status = io_driver_->ReadAt(read_fd, dst, size, value_offset);
+  }
+  if (!status.ok()) {
+    RememberStatus(std::move(status));
+    return false;
+  }
+
+  if (segment::ComputeRecordCrc32(key, dst, size) != expected_crc) {
+    RememberStatus(IoStatus::Corruption("segment CRC mismatch"));
+    return false;
+  }
   return true;
 }
 
 bool SSDTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t size) {
-  std::lock_guard<std::mutex> lock(mu_);
-
-  auto it = keys_.find(key);
-  if (it != keys_.end()) {
-    // Fast path: key tracked locally
-    if (size != it->second) return false;
-
-    std::string path = KeyToPath(key);
-    int fd = open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
-      // File disappeared; drop local tracking to avoid permanent false positives.
-      used_ = SaturatingSub(used_, it->second);
-      keys_.erase(it);
-      auto lru_it = lru_map_.find(key);
-      if (lru_it != lru_map_.end()) {
-        lru_list_.erase(lru_it->second);
-        lru_map_.erase(lru_it);
-      }
-      return false;
+  int read_fd = -1;
+  uint64_t value_offset = 0;
+  uint32_t expected_crc = 0;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto* meta = index_.FindKey(key);
+    if (!meta && IsReadOnlyShared()) {
+      RefreshFromDiskLocked(false);
+      meta = index_.FindMutableKey(key);
     }
+    if (!meta) return false;
+    if (size != meta->size) return false;
+    auto* seg = GetSegmentLocked(meta->segment_id);
+    if (!seg || seg->fd < 0) return false;
+    read_fd = seg->fd;
+    value_offset = meta->value_offset;
+    expected_crc = meta->crc32;
+    index_.TouchLRU(key);
+  }
+  return ReadRecordLocked(key, reinterpret_cast<void*>(dst_ptr), size, expected_crc, value_offset,
+                          read_fd);
+}
 
-    size_t total_read = 0;
-    while (total_read < size) {
-      ssize_t n =
-          pread(fd, reinterpret_cast<char*>(dst_ptr) + total_read, size - total_read, total_read);
-      if (n <= 0) {
-        close(fd);
-        used_ = SaturatingSub(used_, it->second);
-        keys_.erase(key);
-        auto lru_it = lru_map_.find(key);
-        if (lru_it != lru_map_.end()) {
-          lru_list_.erase(lru_it->second);
-          lru_map_.erase(lru_it);
+std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys,
+                                            const std::vector<uintptr_t>& dst_ptrs,
+                                            const std::vector<size_t>& sizes) {
+  std::vector<bool> results(keys.size(), false);
+  if (keys.empty()) return results;
+
+  // Per-key lookup result for Phase 2/3.
+  struct ReadLookup {
+    size_t orig_idx;
+    int fd;
+    uint64_t offset;
+    uint32_t expected_crc;
+    size_t size;
+    void* dst;
+  };
+
+  std::vector<ReadLookup> lookups;
+  lookups.reserve(keys.size());
+
+  // Phase 1 (mu_ held): batch index lookup + metadata extraction.
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+
+    // Follower: do a single refresh if any key is missing.
+    if (IsReadOnlyShared()) {
+      bool any_missing = false;
+      for (size_t i = 0; i < keys.size(); ++i) {
+        if (!index_.FindKey(keys[i])) {
+          any_missing = true;
+          break;
         }
-        return false;
       }
-      total_read += n;
-    }
-    close(fd);
-
-    TouchLRU(key);
-    return true;
-  }
-
-  // Read-only shared fallback: key not in local map, try filesystem
-  if (!IsReadOnlyShared()) return false;
-
-  std::string path = KeyToPath(key);
-  int fd = open(path.c_str(), O_RDONLY);
-  if (fd < 0) return false;
-
-  struct stat st;
-  if (fstat(fd, &st) < 0 || static_cast<size_t>(st.st_size) != size) {
-    close(fd);
-    return false;
-  }
-
-  size_t total_read = 0;
-  while (total_read < size) {
-    ssize_t n =
-        pread(fd, reinterpret_cast<char*>(dst_ptr) + total_read, size - total_read, total_read);
-    if (n <= 0) {
-      close(fd);
-      return false;
-    }
-    total_read += n;
-  }
-  close(fd);
-
-  // Register in local map for future fast-path lookups.
-  // Do not increment used_ — disk space is owned by leader.
-  keys_[key] = size;
-  TouchLRU(key);
-  return true;
-}
-
-std::vector<char> SSDTier::Read(const std::string& key) {
-  std::lock_guard<std::mutex> lock(mu_);
-
-  auto it = keys_.find(key);
-  if (it != keys_.end()) {
-    // Fast path: known key
-    std::string path = KeyToPath(key);
-    int fd = open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
-      // File disappeared; drop local tracking to avoid permanent false positives.
-      used_ = SaturatingSub(used_, it->second);
-      keys_.erase(it);
-      auto lru_it = lru_map_.find(key);
-      if (lru_it != lru_map_.end()) {
-        lru_list_.erase(lru_it->second);
-        lru_map_.erase(lru_it);
+      if (any_missing) {
+        RefreshFromDiskLocked(false);
       }
-      return {};
     }
 
-    size_t file_size = it->second;
-    std::vector<char> buf(file_size);
-    size_t total_read = 0;
-    while (total_read < file_size) {
-      ssize_t n = ::read(fd, buf.data() + total_read, file_size - total_read);
-      if (n <= 0) {
-        close(fd);
-        used_ = SaturatingSub(used_, it->second);
-        keys_.erase(key);
-        auto lru_it = lru_map_.find(key);
-        if (lru_it != lru_map_.end()) {
-          lru_list_.erase(lru_it->second);
-          lru_map_.erase(lru_it);
+    for (size_t i = 0; i < keys.size(); ++i) {
+      auto* meta = index_.FindKey(keys[i]);
+      if (!meta) continue;
+      if (sizes[i] != meta->size) continue;
+      auto* seg = GetSegmentLocked(meta->segment_id);
+      if (!seg || seg->fd < 0) continue;
+      index_.TouchLRU(keys[i]);
+      lookups.push_back({i, seg->fd, meta->value_offset, meta->crc32, sizes[i],
+                         reinterpret_cast<void*>(dst_ptrs[i])});
+    }
+  }
+
+  if (lookups.empty()) return results;
+
+  // Phase 2 (io_mu_ if needed): batch I/O.
+  const bool needs_io_lock = !io_driver_->Capabilities().thread_safe;
+  const bool use_batch = io_driver_->Capabilities().batch_read && lookups.size() > 1;
+
+  std::vector<bool> io_ok(lookups.size(), false);
+
+  if (use_batch) {
+    std::vector<IoReadOp> ops;
+    ops.reserve(lookups.size());
+    for (const auto& lk : lookups) {
+      ops.push_back({lk.fd, lk.dst, lk.size, lk.offset});
+    }
+
+    IoStatus status;
+    if (needs_io_lock) {
+      std::lock_guard<std::mutex> io_lock(io_mu_);
+      status = io_driver_->ReadBatch(ops);
+    } else {
+      status = io_driver_->ReadBatch(ops);
+    }
+
+    if (status.ok()) {
+      // All I/O succeeded; mark all as ok for CRC check.
+      std::fill(io_ok.begin(), io_ok.end(), true);
+    } else {
+      // Batch failed — fall back to per-key reads.
+      RememberStatus(std::move(status));
+      for (size_t j = 0; j < lookups.size(); ++j) {
+        const auto& lk = lookups[j];
+        IoStatus s;
+        if (needs_io_lock) {
+          std::lock_guard<std::mutex> io_lock(io_mu_);
+          s = io_driver_->ReadAt(lk.fd, lk.dst, lk.size, lk.offset);
+        } else {
+          s = io_driver_->ReadAt(lk.fd, lk.dst, lk.size, lk.offset);
         }
-        return {};
+        io_ok[j] = s.ok();
+        if (!s.ok()) RememberStatus(std::move(s));
       }
-      total_read += n;
     }
-    close(fd);
-
-    TouchLRU(key);
-    return buf;
-  }
-
-  // Read-only shared fallback
-  if (!IsReadOnlyShared()) return {};
-
-  std::string path = KeyToPath(key);
-  int fd = open(path.c_str(), O_RDONLY);
-  if (fd < 0) return {};
-
-  struct stat st;
-  if (fstat(fd, &st) < 0 || st.st_size <= 0) {
-    close(fd);
-    return {};
-  }
-
-  size_t file_size = static_cast<size_t>(st.st_size);
-  std::vector<char> buf(file_size);
-  size_t total_read = 0;
-  while (total_read < file_size) {
-    ssize_t n = ::read(fd, buf.data() + total_read, file_size - total_read);
-    if (n <= 0) {
-      close(fd);
-      return {};
+  } else {
+    // Serial path (single key or no batch_read capability).
+    for (size_t j = 0; j < lookups.size(); ++j) {
+      const auto& lk = lookups[j];
+      IoStatus s;
+      if (needs_io_lock) {
+        std::lock_guard<std::mutex> io_lock(io_mu_);
+        s = io_driver_->ReadAt(lk.fd, lk.dst, lk.size, lk.offset);
+      } else {
+        s = io_driver_->ReadAt(lk.fd, lk.dst, lk.size, lk.offset);
+      }
+      io_ok[j] = s.ok();
+      if (!s.ok()) RememberStatus(std::move(s));
     }
-    total_read += n;
   }
-  close(fd);
 
-  keys_[key] = file_size;
-  TouchLRU(key);
-  return buf;
-}
-
-std::vector<std::string> SSDTier::GetLRUCandidates(size_t max_candidates) const {
-  if (max_candidates == 0) max_candidates = 1;
-  std::lock_guard<std::mutex> lock(mu_);
-  std::vector<std::string> result;
-  result.reserve(std::min(max_candidates, lru_list_.size()));
-  auto it = lru_list_.rbegin();
-  for (size_t i = 0; i < max_candidates && it != lru_list_.rend(); ++i, ++it) {
-    result.push_back(*it);
+  // Phase 3 (no lock): per-key CRC verification.
+  for (size_t j = 0; j < lookups.size(); ++j) {
+    if (!io_ok[j]) continue;
+    const auto& lk = lookups[j];
+    if (segment::ComputeRecordCrc32(keys[lk.orig_idx], lk.dst, lk.size) != lk.expected_crc) {
+      RememberStatus(IoStatus::Corruption("segment CRC mismatch"));
+      continue;
+    }
+    results[lk.orig_idx] = true;
   }
-  return result;
-}
 
-std::string SSDTier::GetLRUKey() const {
-  std::lock_guard<std::mutex> lock(mu_);
-  if (lru_list_.empty()) return "";
-  return lru_list_.back();
+  return results;
 }
 
 bool SSDTier::Exists(const std::string& key) const {
   std::lock_guard<std::mutex> lock(mu_);
-  if (keys_.count(key) > 0) {
-    if (!IsReadOnlyShared()) return true;
-    // In read-only shared mode, local keys_ may be stale if leader evicted the file.
-    // Always consult the filesystem as the source of truth.
-    return FileExistsOnDisk(key);
-  }
-  if (IsReadOnlyShared()) return FileExistsOnDisk(key);
-  return false;
+  if (index_.HasKey(key)) return true;
+  if (!IsReadOnlyShared()) return false;
+  RefreshFollowerLocked();
+  return index_.HasKey(key);
 }
 
 bool SSDTier::Evict(const std::string& key) {
   std::lock_guard<std::mutex> lock(mu_);
-
-  auto it = keys_.find(key);
-  if (it == keys_.end()) return false;
-
-  if (!IsReadOnlyShared()) {
-    // Leader/normal: delete the file
-    std::string path = KeyToPath(key);
-    std::remove(path.c_str());
-  }
-  // Read-only shared: only remove from local tracking, do NOT delete file
-
-  used_ = SaturatingSub(used_, it->second);
-  keys_.erase(it);
-
-  auto lru_it = lru_map_.find(key);
-  if (lru_it != lru_map_.end()) {
-    lru_list_.erase(lru_it->second);
-    lru_map_.erase(lru_it);
-  }
-  return true;
+  return index_.EraseKey(key);
 }
 
 std::pair<size_t, size_t> SSDTier::Capacity() const {
   std::lock_guard<std::mutex> lock(mu_);
-  return {used_, capacity_};
+  return index_.Capacity();
 }
 
 void SSDTier::Clear() {
   std::lock_guard<std::mutex> lock(mu_);
-
-  if (!IsReadOnlyShared()) {
-    // Leader/normal: delete all files
-    for (auto& [key, _] : keys_) {
-      std::string path = KeyToPath(key);
-      std::remove(path.c_str());
+  for (auto& kv : index_.MutableSegments()) {
+    if (kv.second.fd >= 0) {
+      close(kv.second.fd);
+      kv.second.fd = -1;
+    }
+    if (!IsReadOnlyShared()) {
+      std::remove(kv.second.path.c_str());
     }
   }
-  // Read-only shared: only clear local tracking
-  keys_.clear();
-  lru_list_.clear();
-  lru_map_.clear();
-  used_ = 0;
+  index_.ResetAll();
+  if (!IsReadOnlyShared()) {
+    OpenOrCreateSegmentLocked(0);
+  } else {
+    RefreshFromDiskLocked(true);
+  }
+}
+
+std::vector<char> SSDTier::Read(const std::string& key) {
+  int read_fd = -1;
+  uint64_t value_offset = 0;
+  uint32_t read_size = 0;
+  uint32_t expected_crc = 0;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto* meta = index_.FindKey(key);
+    if (!meta && IsReadOnlyShared()) {
+      RefreshFromDiskLocked(false);
+      meta = index_.FindMutableKey(key);
+    }
+    if (!meta) return {};
+    auto* seg = GetSegmentLocked(meta->segment_id);
+    if (!seg || seg->fd < 0) return {};
+    read_fd = seg->fd;
+    value_offset = meta->value_offset;
+    read_size = meta->size;
+    expected_crc = meta->crc32;
+    index_.TouchLRU(key);
+  }
+
+  std::vector<char> out(read_size);
+  if (!ReadRecordLocked(key, out.data(), out.size(), expected_crc, value_offset, read_fd))
+    return {};
+  return out;
+}
+
+TierCapabilities SSDTier::Capabilities() const {
+  TierCapabilities caps;
+  caps.batch_write = true;
+  caps.batch_read = true;
+  return caps;
+}
+
+std::string SSDTier::GetLRUKey() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return index_.GetLRUKey();
+}
+
+std::vector<std::string> SSDTier::GetLRUCandidates(size_t max_candidates) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return index_.GetLRUCandidates(max_candidates);
 }

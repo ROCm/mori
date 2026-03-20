@@ -18,3 +18,11 @@ add_test(NAME test_follower_mode COMMAND test_follower_mode)
 add_executable(test_prefix_aware_eviction test_prefix_aware_eviction.cpp)
 target_link_libraries(test_prefix_aware_eviction PRIVATE umbp_core)
 add_test(NAME test_prefix_aware_eviction COMMAND test_prefix_aware_eviction)
+
+add_executable(test_ssd_tier test_ssd_tier.cpp)
+target_link_libraries(test_ssd_tier PRIVATE umbp_core)
+add_test(NAME test_ssd_tier COMMAND test_ssd_tier)
+
+# Benchmark (manual run only, not registered as a test)
+add_executable(bench_umbp bench_umbp.cpp)
+target_link_libraries(bench_umbp PRIVATE umbp_core)

@@ -159,11 +159,11 @@ std::vector<std::string> LocalStorageManager::GetGroup(const std::string& key) c
 // Falls back to plain LRU when no depth metadata is available.
 // ---------------------------------------------------------------------------
 std::string LocalStorageManager::SelectVictim(TierBackend* tier) {
-  if (config_.eviction_policy != "prefix_aware_lru") {
+  if (config_.eviction.policy != "prefix_aware_lru") {
     return tier->GetLRUKey();
   }
 
-  size_t window = config_.eviction_candidate_window;
+  size_t window = config_.eviction.candidate_window;
   if (window == 0) window = 1;
 
   std::vector<std::string> candidates = tier->GetLRUCandidates(window);
@@ -205,20 +205,25 @@ bool LocalStorageManager::WriteFromPtrWithDepth(const std::string& key, uintptr_
 
 LocalStorageManager::LocalStorageManager(const UMBPConfig& config, BlockIndexClient* index)
     : config_(config), role_(config.ResolveRole()), index_(index) {
+  std::string error_message;
+  if (!config_.Validate(&error_message)) {
+    throw std::runtime_error("invalid UMBP config: " + error_message);
+  }
   // DRAM tier is always present (fastest)
-  tiers_.push_back({StorageTier::CPU_DRAM,
-                    std::make_unique<DRAMTier>(config_.dram_capacity_bytes,
-                                               config_.use_shared_memory, config_.shm_name)});
+  tiers_.push_back(
+      {StorageTier::CPU_DRAM,
+       std::make_unique<DRAMTier>(config_.dram.capacity_bytes, config_.dram.use_shared_memory,
+                                  config_.dram.shm_name)});
 
   // SSD tier is optional (slower)
-  if (config_.ssd_enabled) {
-    SSDAccessMode ssd_access_mode = SSDAccessMode::ReadWrite;
+  if (config_.ssd.enabled) {
+    SSDAccessMode segmented_access_mode = SSDAccessMode::ReadWrite;
     if (role_ == UMBPRole::SharedSSDFollower) {
-      ssd_access_mode = SSDAccessMode::ReadOnlyShared;
+      segmented_access_mode = SSDAccessMode::ReadOnlyShared;
     }
     tiers_.push_back({StorageTier::LOCAL_SSD,
-                      std::make_unique<SSDTier>(config_.ssd_storage_dir, config_.ssd_capacity_bytes,
-                                                ssd_access_mode)});
+                      std::make_unique<SSDTier>(config_.ssd.storage_dir, config_.ssd.capacity_bytes,
+                                                config_, segmented_access_mode)});
   }
 }
 
@@ -265,13 +270,21 @@ TierBackend* LocalStorageManager::NextFasterTier(StorageTier current) {
 }
 
 bool LocalStorageManager::MoveKey(const std::string& key, TierBackend* from, TierBackend* to) {
+  // Fast path for DRAM->slower movement to avoid an intermediate vector copy.
+  if (from->Capabilities().zero_copy_read) {
+    size_t sz = 0;
+    const void* ptr = from->ReadPtr(key, &sz);
+    if (ptr && sz > 0 && to->Write(key, ptr, sz)) {
+      from->Evict(key);
+      UpsertIndexTier(key, to->tier_id(), sz);
+      return true;
+    }
+  }
+
   auto data = from->Read(key);
   if (data.empty()) return false;
-
   if (!to->Write(key, data.data(), data.size())) return false;
-
   from->Evict(key);
-
   UpsertIndexTier(key, to->tier_id(), data.size());
   return true;
 }
@@ -337,17 +350,125 @@ bool LocalStorageManager::WriteFromPtr(const std::string& key, uintptr_t src, si
 }
 
 bool LocalStorageManager::ReadIntoPtr(const std::string& key, uintptr_t dst, size_t size) {
+  if (index_) {
+    auto loc = index_->Lookup(key);
+    if (loc) {
+      TierBackend* hinted = GetTier(loc->tier);
+      if (hinted && hinted->Exists(key)) {
+        bool ok = hinted->ReadIntoPtr(key, dst, size);
+        if (ok && hinted->tier_id() != StorageTier::CPU_DRAM &&
+            config_.eviction.auto_promote_on_read) {
+          MaybeAutoPromote(key);
+        }
+        if (ok) return true;
+      }
+    }
+  }
+
   for (size_t i = 0; i < tiers_.size(); ++i) {
     if (tiers_[i].backend->Exists(key)) {
       bool ok = tiers_[i].backend->ReadIntoPtr(key, dst, size);
       // Auto-promote if read from a slower tier
-      if (ok && i > 0 && config_.auto_promote_on_read) {
+      if (ok && i > 0 && config_.eviction.auto_promote_on_read) {
         MaybeAutoPromote(key);
       }
       return ok;
     }
   }
   return false;
+}
+
+std::vector<bool> LocalStorageManager::ReadBatchIntoPtr(const std::vector<std::string>& keys,
+                                                        const std::vector<uintptr_t>& dst_ptrs,
+                                                        const std::vector<size_t>& sizes) {
+  std::vector<bool> results(keys.size(), false);
+  if (keys.empty()) return results;
+
+  // Partition keys by tier using index hints.
+  // tier_indices[t] holds original indices for keys hinted to tier t.
+  // Use the integer value of StorageTier as array index (0=DRAM, 1=SSD).
+  constexpr int kNumTiers = 2;
+  std::vector<size_t> tier_indices[kNumTiers];
+  std::vector<size_t> no_hint_indices;
+
+  for (size_t i = 0; i < keys.size(); ++i) {
+    bool has_hint = false;
+    if (index_) {
+      auto loc = index_->Lookup(keys[i]);
+      if (loc) {
+        int t = static_cast<int>(loc->tier);
+        if (t >= 0 && t < kNumTiers) {
+          tier_indices[t].push_back(i);
+          has_hint = true;
+        }
+      }
+    }
+    if (!has_hint) {
+      no_hint_indices.push_back(i);
+    }
+  }
+
+  // Dispatch per-tier batch reads.
+  for (int t = 0; t < kNumTiers; ++t) {
+    auto& indices = tier_indices[t];
+    if (indices.empty()) continue;
+
+    StorageTier tier_id = static_cast<StorageTier>(t);
+    TierBackend* tier = GetTier(tier_id);
+    if (!tier) {
+      for (size_t idx : indices) no_hint_indices.push_back(idx);
+      continue;
+    }
+
+    if (tier->Capabilities().batch_read && indices.size() > 1) {
+      std::vector<std::string> batch_keys;
+      std::vector<uintptr_t> batch_ptrs;
+      std::vector<size_t> batch_sizes;
+      batch_keys.reserve(indices.size());
+      batch_ptrs.reserve(indices.size());
+      batch_sizes.reserve(indices.size());
+      for (size_t idx : indices) {
+        batch_keys.push_back(keys[idx]);
+        batch_ptrs.push_back(dst_ptrs[idx]);
+        batch_sizes.push_back(sizes[idx]);
+      }
+      auto batch_results = tier->ReadBatchIntoPtr(batch_keys, batch_ptrs, batch_sizes);
+      for (size_t j = 0; j < indices.size(); ++j) {
+        if (batch_results[j]) {
+          results[indices[j]] = true;
+          if (tier_id != StorageTier::CPU_DRAM && config_.eviction.auto_promote_on_read) {
+            MaybeAutoPromote(keys[indices[j]]);
+          }
+        } else {
+          no_hint_indices.push_back(indices[j]);
+        }
+      }
+    } else {
+      for (size_t idx : indices) {
+        if (tier->Exists(keys[idx])) {
+          bool ok = tier->ReadIntoPtr(keys[idx], dst_ptrs[idx], sizes[idx]);
+          if (ok) {
+            results[idx] = true;
+            if (tier_id != StorageTier::CPU_DRAM && config_.eviction.auto_promote_on_read) {
+              MaybeAutoPromote(keys[idx]);
+            }
+          } else {
+            no_hint_indices.push_back(idx);
+          }
+        } else {
+          no_hint_indices.push_back(idx);
+        }
+      }
+    }
+  }
+
+  // Fallback: full tier scan for keys without hints or that failed hinted read.
+  for (size_t idx : no_hint_indices) {
+    if (results[idx]) continue;  // already resolved
+    results[idx] = ReadIntoPtr(keys[idx], dst_ptrs[idx], sizes[idx]);
+  }
+
+  return results;
 }
 
 bool LocalStorageManager::Exists(const std::string& key) const {
@@ -449,10 +570,12 @@ bool LocalStorageManager::CopyToSSD(const std::string& key) {
   // Already on SSD
   if (ssd->Exists(key)) return true;
 
-  auto data = dram->Read(key);
-  if (data.empty()) return false;
+  // Zero-copy: get a raw pointer into mmap'd DRAM instead of allocating a copy.
+  size_t data_size = 0;
+  const void* ptr = dram->ReadPtr(key, &data_size);
+  if (!ptr || data_size == 0) return false;
 
-  if (ssd->Write(key, data.data(), data.size())) return true;
+  if (ssd->Write(key, ptr, data_size)) return true;
 
   // SSD full — evict SSD LRU entries to make room.
   // If a victim is only on SSD (no DRAM copy), we must also update the index.
@@ -476,12 +599,51 @@ bool LocalStorageManager::CopyToSSD(const std::string& key) {
       // Only clear metadata if key is gone from all tiers (data loss).
       if (only_on_ssd) RemoveDepthAndGroup(k);
     }
-    if (ssd->Write(key, data.data(), data.size())) return true;
+    if (ssd->Write(key, ptr, data_size)) return true;
   }
 }
 
+bool LocalStorageManager::CopyToSSDBatch(const std::vector<std::string>& keys) {
+  if (role_ == UMBPRole::SharedSSDFollower) return false;
+
+  TierBackend* dram = GetTier(StorageTier::CPU_DRAM);
+  TierBackend* ssd = GetTier(StorageTier::LOCAL_SSD);
+  if (!dram || !ssd) return false;
+
+  // Gather zero-copy pointers for keys not yet on SSD.
+  std::vector<std::string> batch_keys;
+  std::vector<const void*> batch_ptrs;
+  std::vector<size_t> batch_sizes;
+  std::vector<std::string> fallback_keys;
+
+  for (const auto& key : keys) {
+    if (ssd->Exists(key)) continue;
+    size_t sz = 0;
+    const void* ptr = dram->ReadPtr(key, &sz);
+    if (!ptr || sz == 0) continue;
+    batch_keys.push_back(key);
+    batch_ptrs.push_back(ptr);
+    batch_sizes.push_back(sz);
+  }
+
+  if (batch_keys.empty()) return true;
+
+  // Try batch write if SSDTier is available.
+  if (ssd->Capabilities().batch_write && batch_keys.size() > 1) {
+    if (ssd->WriteBatch(batch_keys, batch_ptrs, batch_sizes)) return true;
+    // Batch failed (likely capacity) — fall through to per-key CopyToSSD.
+  }
+
+  // Fallback: per-key CopyToSSD.
+  bool all_ok = true;
+  for (const auto& key : batch_keys) {
+    if (!CopyToSSD(key)) all_ok = false;
+  }
+  return all_ok;
+}
+
 void LocalStorageManager::MaybeAutoPromote(const std::string& key) {
-  if (!config_.auto_promote_on_read) return;
+  if (!config_.eviction.auto_promote_on_read) return;
 
   // Only promote if key is not in the fastest tier
   if (tiers_.empty()) return;
@@ -491,7 +653,7 @@ void LocalStorageManager::MaybeAutoPromote(const std::string& key) {
   // Check fastest tier watermark before promoting
   auto [used, total] = fastest->Capacity();
   double utilization = static_cast<double>(used) / total;
-  if (utilization >= config_.dram_high_watermark) return;
+  if (utilization >= config_.dram.high_watermark) return;
 
   // Best-effort promote
   if (role_ == UMBPRole::SharedSSDFollower) {

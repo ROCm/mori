@@ -23,13 +23,18 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <list>
+#include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "umbp/common/config.h"
+#include "umbp/storage/io/status.h"
+#include "umbp/storage/io/storage_io_driver.h"
+#include "umbp/storage/segment/segment_index.h"
+#include "umbp/storage/segment/segment_scanner.h"
+#include "umbp/storage/segment/segment_writer.h"
 #include "umbp/storage/tier_backend.h"
 
 enum class SSDAccessMode : int {
@@ -37,42 +42,59 @@ enum class SSDAccessMode : int {
   ReadOnlyShared = 1,
 };
 
-// SSD Tier: per-key file storage
 class SSDTier : public TierBackend {
  public:
-  SSDTier(const std::string& dir, size_t capacity,
+  SSDTier(const std::string& dir, size_t capacity, const UMBPConfig& config,
           SSDAccessMode access_mode = SSDAccessMode::ReadWrite);
   ~SSDTier() override;
 
-  // Non-copyable
   SSDTier(const SSDTier&) = delete;
   SSDTier& operator=(const SSDTier&) = delete;
 
-  // TierBackend interface
   bool Write(const std::string& key, const void* data, size_t size) override;
+  bool WriteBatch(const std::vector<std::string>& keys, const std::vector<const void*>& data_ptrs,
+                  const std::vector<size_t>& sizes) override;
   bool ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t size) override;
+  std::vector<bool> ReadBatchIntoPtr(const std::vector<std::string>& keys,
+                                     const std::vector<uintptr_t>& dst_ptrs,
+                                     const std::vector<size_t>& sizes) override;
   bool Exists(const std::string& key) const override;
   bool Evict(const std::string& key) override;
   std::pair<size_t, size_t> Capacity() const override;
   void Clear() override;
-
-  // Extended interface overrides
   std::vector<char> Read(const std::string& key) override;
+  TierCapabilities Capabilities() const override;
   std::string GetLRUKey() const override;
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
+  const IoStatus& LastIoStatus() const { return last_io_status_; }
 
  private:
-  std::string dir_;
-  size_t capacity_, used_;
-  SSDAccessMode access_mode_;
-  std::unordered_map<std::string, size_t> keys_;  // key -> file size
-  std::list<std::string> lru_list_;
-  std::unordered_map<std::string, std::list<std::string>::iterator> lru_map_;
-  mutable std::mutex mu_;
-
   bool IsReadOnlyShared() const { return access_mode_ == SSDAccessMode::ReadOnlyShared; }
-  std::string KeyToPath(const std::string& key) const;
-  bool FileExistsOnDisk(const std::string& key) const;
-  void TouchLRU(const std::string& key);
-  void EvictLRU();
+  bool ShouldSyncOnWrite() const {
+    return config_.ssd.durability.mode == UMBPDurabilityMode::Strict;
+  }
+
+  bool EnsureActiveSegment(size_t need_bytes);
+  bool RefreshFromDiskLocked(bool force_full_rescan);
+  bool OpenOrCreateSegmentLocked(uint64_t segment_id);
+
+  bool RefreshFollowerLocked() const;
+  segment::Meta* GetSegmentLocked(uint64_t segment_id);
+  const segment::Meta* GetSegmentLocked(uint64_t segment_id) const;
+  bool ReadRecordLocked(const std::string& key, void* dst, size_t size, uint32_t expected_crc,
+                        uint64_t value_offset, int read_fd) const;
+  void RememberStatus(IoStatus status) const;
+
+  std::string dir_;
+  size_t capacity_;
+  UMBPConfig config_;
+  SSDAccessMode access_mode_;
+
+  mutable std::mutex mu_;
+  mutable std::mutex io_mu_;
+  std::unique_ptr<StorageIoDriver> io_driver_;
+  segment::Index index_;
+  segment::Scanner scanner_;
+  std::unique_ptr<segment::Writer> writer_;
+  mutable IoStatus last_io_status_;
 };

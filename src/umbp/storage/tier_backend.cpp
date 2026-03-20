@@ -27,6 +27,26 @@ bool TierBackend::WriteFromPtr(const std::string& key, uintptr_t src_ptr, size_t
 
 std::vector<char> TierBackend::Read(const std::string& key) { return {}; }
 
+TierCapabilities TierBackend::Capabilities() const { return {}; }
+
+const void* TierBackend::ReadPtr(const std::string& key, size_t* out_size) { return nullptr; }
+
+bool TierBackend::WriteBatch(const std::vector<std::string>& keys,
+                             const std::vector<const void*>& data_ptrs,
+                             const std::vector<size_t>& sizes) {
+  return false;
+}
+
+std::vector<bool> TierBackend::ReadBatchIntoPtr(const std::vector<std::string>& keys,
+                                                const std::vector<uintptr_t>& dst_ptrs,
+                                                const std::vector<size_t>& sizes) {
+  std::vector<bool> results(keys.size(), false);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    results[i] = ReadIntoPtr(keys[i], dst_ptrs[i], sizes[i]);
+  }
+  return results;
+}
+
 std::string TierBackend::GetLRUKey() const { return ""; }
 
 std::vector<std::string> TierBackend::GetLRUCandidates(size_t max_candidates) const {
