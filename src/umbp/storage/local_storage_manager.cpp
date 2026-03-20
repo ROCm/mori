@@ -380,9 +380,14 @@ LocalStorageManager::LocalStorageManager(const UMBPConfig& config, BlockIndexCli
       if (proxy_shm_name_.empty())
         proxy_shm_name_ = umbp::proxy::kDefaultShmName;
 
-      bool should_spawn =
-          (role_ == UMBPRole::SharedSSDLeader) ||
-          (config_.ssd_backend == "spdk_proxy" && config_.spdk_proxy_rank_id == 0);
+      // Leader always spawns. For Standalone with explicit "spdk_proxy" backend,
+      // spawn if no daemon is already running (auto-elect as spawner).
+      bool should_spawn = (role_ == UMBPRole::SharedSSDLeader);
+      if (!should_spawn && config_.ssd_backend == "spdk_proxy" &&
+          role_ == UMBPRole::Standalone) {
+        int probe = umbp::proxy::ProxyShmRegion::ProbeExisting(proxy_shm_name_);
+        if (probe == 0) should_spawn = true;  // no daemon → we spawn
+      }
 
       if (should_spawn) {
         if (config_.spdk_proxy_rank_id == kAutoRankId)

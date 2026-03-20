@@ -3,10 +3,11 @@
 //
 // proxy_bench: Benchmark for SpdkProxyTier (shared memory IPC to spdk_proxy).
 // Measures batch write/read throughput at various value sizes.
+// Rank slot is auto-allocated via CAS — no manual RANK env needed.
 //
 // Requires: spdk_proxy daemon running.
 // Usage:
-//   UMBP_SPDK_PROXY_RANK=0 ./proxy_bench
+//   ./proxy_bench
 
 #include <chrono>
 #include <cstdio>
@@ -103,14 +104,15 @@ int main() {
     auto cfg = UMBPConfig::FromEnvironment();
     cfg.ssd_backend = "spdk_proxy";
 
-    printf("SpdkProxyTier Benchmark — rank=%u shm='%s'\n",
-           cfg.spdk_proxy_rank_id, cfg.spdk_proxy_shm_name.c_str());
-
     SpdkProxyTier tier(cfg);
     if (!tier.IsValid()) {
         fprintf(stderr, "FAILED: cannot connect to spdk_proxy daemon\n");
         return 1;
     }
+
+    uint32_t rank_id = tier.rank_id();
+    printf("SpdkProxyTier Benchmark — rank=%u shm='%s'\n",
+           rank_id, cfg.spdk_proxy_shm_name.c_str());
 
     auto [used, total] = tier.Capacity();
     printf("  capacity: used=%zuMB total=%zuMB\n",
@@ -137,12 +139,12 @@ int main() {
     std::string session = MakeSessionId();
 
     printf("\n%s\n SpdkProxyTier BATCH THROUGHPUT (rank=%u session=%s)\n%s\n",
-           std::string(72, '-').c_str(), cfg.spdk_proxy_rank_id,
+           std::string(72, '-').c_str(), rank_id,
            session.c_str(), std::string(72, '-').c_str());
     printf("  %8s  %6s  %10s  %10s\n", "ValSize", "Count", "Write MB/s", "Read MB/s");
 
     for (auto& s : specs) {
-        RunBatch(tier, cfg.spdk_proxy_rank_id, session, s.size, s.count, iterations);
+        RunBatch(tier, rank_id, session, s.size, s.count, iterations);
     }
 
     printf("\n");

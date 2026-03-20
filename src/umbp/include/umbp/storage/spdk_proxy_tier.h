@@ -25,6 +25,7 @@ class SpdkProxyTier : public TierBackend {
     ~SpdkProxyTier() override;
 
     bool IsValid() const { return connected_; }
+    uint32_t rank_id() const { return rank_id_; }
 
     bool Write(const std::string& key, const void* data, size_t size) override;
     bool ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t size) override;

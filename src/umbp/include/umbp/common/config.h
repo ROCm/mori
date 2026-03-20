@@ -63,9 +63,9 @@ struct UMBPConfig {
   std::string spdk_nvme_ctrl_name = "NVMe0";
   int spdk_io_workers = 4;                     // Internal I/O worker threads for SpdkSsdTier batch ops
 
-  // SPDK Proxy configuration (ssd_backend == "spdk_proxy")
+  // SPDK Proxy configuration
   std::string spdk_proxy_shm_name = "/umbp_spdk_proxy";
-  uint32_t spdk_proxy_rank_id = 0;
+  uint32_t spdk_proxy_rank_id = kAutoRankId;   // kAutoRankId = CAS auto-allocate (default)
   uint32_t spdk_proxy_max_ranks = 8;
   size_t spdk_proxy_data_per_rank_mb = 512;    // MB of SHM data region per rank
   std::string spdk_proxy_bin;                  // Path to spdk_proxy binary (empty = search PATH)

@@ -3,9 +3,10 @@
 //
 // Integration test for SPDK Proxy IPC.
 // Tests the shared memory protocol and SpdkProxyTier client.
+// Rank slot is auto-allocated via CAS — no manual RANK env needed.
 //
 // Requires: spdk_proxy daemon running with the default SHM name.
-// Run: UMBP_SPDK_PROXY_RANK=0 ./test_spdk_proxy
+// Run: ./test_spdk_proxy
 //
 // If spdk_proxy is not running, all tests are skipped gracefully.
 
@@ -18,10 +19,10 @@
 #include "umbp/common/config.h"
 #include "umbp/storage/spdk_proxy_tier.h"
 
-static UMBPConfig MakeProxyConfig(uint32_t rank = 0) {
+static UMBPConfig MakeProxyConfig() {
     auto cfg = UMBPConfig::FromEnvironment();
     cfg.ssd_backend = "spdk_proxy";
-    cfg.spdk_proxy_rank_id = rank;
+    // rank auto-allocated via CAS (spdk_proxy_rank_id == kAutoRankId from env)
     if (cfg.spdk_proxy_shm_name.empty())
         cfg.spdk_proxy_shm_name = "/umbp_spdk_proxy";
     return cfg;
@@ -29,7 +30,7 @@ static UMBPConfig MakeProxyConfig(uint32_t rank = 0) {
 
 static void test_connect() {
     printf("  test_connect...\n");
-    auto cfg = MakeProxyConfig(0);
+    auto cfg = MakeProxyConfig();
     SpdkProxyTier tier(cfg);
     if (!tier.IsValid()) {
         printf("    SKIPPED (proxy not running)\n");
@@ -40,7 +41,7 @@ static void test_connect() {
 
 static void test_single_write_read() {
     printf("  test_single_write_read...\n");
-    auto cfg = MakeProxyConfig(0);
+    auto cfg = MakeProxyConfig();
     SpdkProxyTier tier(cfg);
     if (!tier.IsValid()) {
         printf("    SKIPPED\n");
@@ -61,7 +62,7 @@ static void test_single_write_read() {
 
 static void test_batch_write_read() {
     printf("  test_batch_write_read...\n");
-    auto cfg = MakeProxyConfig(0);
+    auto cfg = MakeProxyConfig();
     SpdkProxyTier tier(cfg);
     if (!tier.IsValid()) {
         printf("    SKIPPED\n");
@@ -110,7 +111,7 @@ static void test_batch_write_read() {
 
 static void test_evict() {
     printf("  test_evict...\n");
-    auto cfg = MakeProxyConfig(0);
+    auto cfg = MakeProxyConfig();
     SpdkProxyTier tier(cfg);
     if (!tier.IsValid()) {
         printf("    SKIPPED\n");
@@ -128,7 +129,7 @@ static void test_evict() {
 
 static void test_capacity() {
     printf("  test_capacity...\n");
-    auto cfg = MakeProxyConfig(0);
+    auto cfg = MakeProxyConfig();
     SpdkProxyTier tier(cfg);
     if (!tier.IsValid()) {
         printf("    SKIPPED\n");
