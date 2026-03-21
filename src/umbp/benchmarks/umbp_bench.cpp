@@ -152,7 +152,7 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id,
     double first_read = 0;
     double cache_read = 0;
     double cold_t0 = 0, cold_t1 = 0;
-    double cache_best_t0 = 0, cache_best_t1 = 0;
+    double cache_last_t0 = 0, cache_last_t1 = 0;
     int best_read_ok = 0;
     int corrupt = 0;
     for (int iter = 0; iter < iterations; ++iter) {
@@ -187,15 +187,15 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id,
                 }
             }
         } else {
-            if (ok > 0 && mbps > cache_read) {
+            if (ok > 0) {
                 cache_read = mbps;
-                cache_best_t0 = t0; cache_best_t1 = t1;
+                cache_last_t0 = t0; cache_last_t1 = t1;
             }
         }
     }
 
     return {value_size, count, best_write, first_read, cache_read,
-            best_read_ok, corrupt, cold_t0, cold_t1, cache_best_t0, cache_best_t1};
+            best_read_ok, corrupt, cold_t0, cold_t1, cache_last_t0, cache_last_t1};
 }
 
 // ---------------------------------------------------------------------------
@@ -283,9 +283,9 @@ static BenchResult RunBatchPhased(UMBPClient& client, int rank_id,
         dst_ptrs[i] = reinterpret_cast<uintptr_t>(read_bufs[i].data());
 
     double first_read = 0;   // iteration 0: cold read (real business scenario)
-    double cache_read = 0;   // best of iteration 1+: heap cache read
+    double cache_read = 0;   // last cache iteration (steady-state)
     double cold_t0 = 0, cold_t1 = 0;
-    double cache_best_t0 = 0, cache_best_t1 = 0;
+    double cache_last_t0 = 0, cache_last_t1 = 0;
     int best_read_ok = 0;
     int corrupt = 0;
     for (int iter = 0; iter < iterations; ++iter) {
@@ -319,9 +319,9 @@ static BenchResult RunBatchPhased(UMBPClient& client, int rank_id,
                 }
             }
         } else {
-            if (ok > 0 && mbps > cache_read) {
+            if (ok > 0) {
                 cache_read = mbps;
-                cache_best_t0 = t0; cache_best_t1 = t1;
+                cache_last_t0 = t0; cache_last_t1 = t1;
             }
         }
     }
@@ -333,7 +333,7 @@ static BenchResult RunBatchPhased(UMBPClient& client, int rank_id,
         sched_yield();
 
     return {value_size, count, best_write, first_read, cache_read,
-            best_read_ok, corrupt, cold_t0, cold_t1, cache_best_t0, cache_best_t1};
+            best_read_ok, corrupt, cold_t0, cold_t1, cache_last_t0, cache_last_t1};
 }
 #endif
 
