@@ -116,19 +116,24 @@ SpdkProxyTier::SpdkProxyTier(const UMBPConfig& config)
 
     connected_ = true;
 
-    // Per-client heap read cache (default 8GB, override via UMBP_SPDK_READ_CACHE_MB)
-    const char* rcmb = std::getenv("UMBP_SPDK_READ_CACHE_MB");
-    size_t cache_mb = rcmb ? static_cast<size_t>(std::atol(rcmb)) : 8192;
-    heap_cache_max_bytes_ = cache_mb * 1024ULL * 1024ULL;
+    // Per-client heap read cache — disabled by default.
+    // Enable: UMBP_SPDK_READ_CACHE=1  (max size via UMBP_SPDK_READ_CACHE_MB, default 8GB)
+    const char* rc_env = std::getenv("UMBP_SPDK_READ_CACHE");
+    heap_cache_enabled_ = (rc_env && std::string(rc_env) == "1");
+    if (heap_cache_enabled_) {
+        const char* rcmb = std::getenv("UMBP_SPDK_READ_CACHE_MB");
+        size_t cache_mb = rcmb ? static_cast<size_t>(std::atol(rcmb)) : 8192;
+        heap_cache_max_bytes_ = cache_mb * 1024ULL * 1024ULL;
+    }
 
     UMBP_LOG_INFO("SpdkProxyTier: connected rank=%u shm='%s' "
                   "bdev_size=%zuMB block_size=%u data_region=%zuMB "
-                  "read_cache=%zuMB",
+                  "read_cache=%s",
                   rank_id_, shm_name.c_str(),
                   static_cast<size_t>(hdr->bdev_size / (1024 * 1024)),
                   hdr->block_size,
                   static_cast<size_t>(hdr->data_region_per_rank / (1024 * 1024)),
-                  cache_mb);
+                  heap_cache_enabled_ ? "ON" : "OFF");
 }
 
 SpdkProxyTier::~SpdkProxyTier() {
@@ -519,21 +524,21 @@ bool SpdkProxyTier::Write(const std::string& key, const void* data, size_t size)
 
 bool SpdkProxyTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr,
                                 size_t size) {
-    // Fast path 1: heap cache (private memory)
-    if (HeapCacheGet(key, dst_ptr, size)) return true;
+    if (heap_cache_enabled_) {
+        if (HeapCacheGet(key, dst_ptr, size)) return true;
+    }
 
-    // Fast path 2: SHM shared cache
     if (TryShmCacheReadOne(key, dst_ptr, size)) {
-        HeapCachePut(key, reinterpret_cast<const void*>(dst_ptr), size);
+        if (heap_cache_enabled_)
+            HeapCachePut(key, reinterpret_cast<const void*>(dst_ptr), size);
         return true;
     }
 
-    // Slow path: daemon
     uint64_t actual_size = 0;
     auto rc = SubmitAndWait(RequestType::READ, key, nullptr, 0,
                             reinterpret_cast<void*>(dst_ptr), size,
                             &actual_size);
-    if (rc == ResultCode::OK)
+    if (rc == ResultCode::OK && heap_cache_enabled_)
         HeapCachePut(key, reinterpret_cast<const void*>(dst_ptr), size);
     return rc == ResultCode::OK;
 }
@@ -580,7 +585,7 @@ bool SpdkProxyTier::Flush() {
 // ---------------------------------------------------------------------------
 void SpdkProxyTier::HeapCachePut(const std::string& key,
                                   const void* data, size_t size) {
-    if (heap_cache_max_bytes_ == 0 || size == 0) return;
+    if (!heap_cache_enabled_ || size == 0) return;
 
     // Update existing entry (move to front)
     auto it = heap_cache_.find(key);
@@ -622,6 +627,7 @@ void SpdkProxyTier::HeapCachePut(const std::string& key,
 
 bool SpdkProxyTier::HeapCacheGet(const std::string& key,
                                   uintptr_t dst, size_t size) const {
+    if (!heap_cache_enabled_) return false;
     auto it = heap_cache_.find(key);
     if (it == heap_cache_.end()) return false;
     if (it->second.size != size) return false;
@@ -672,8 +678,8 @@ std::vector<bool> SpdkProxyTier::BatchWrite(
 }
 
 // ---------------------------------------------------------------------------
-// BatchReadIntoPtr — three-tier read: heap cache → ShmCache → daemon.
-// Per-item granularity: hits are served immediately, only misses go deeper.
+// BatchReadIntoPtr — per-item: heap cache → ShmCache → daemon.
+// Heap cache controlled by UMBP_SPDK_READ_CACHE=1 (default OFF).
 // ---------------------------------------------------------------------------
 std::vector<bool> SpdkProxyTier::BatchReadIntoPtr(
     const std::vector<std::string>& keys,
@@ -682,245 +688,51 @@ std::vector<bool> SpdkProxyTier::BatchReadIntoPtr(
     const int count = static_cast<int>(keys.size());
     std::vector<bool> results(count, false);
 
-    // Phase 1: heap cache (private memory, zero contention)
+    // Phase 1: heap cache (only when enabled)
     std::vector<int> miss1;
     miss1.reserve(count);
     for (int i = 0; i < count; ++i) {
-        if (HeapCacheGet(keys[i], dst_ptrs[i], sizes[i]))
+        if (heap_cache_enabled_ && HeapCacheGet(keys[i], dst_ptrs[i], sizes[i]))
             results[i] = true;
         else
             miss1.push_back(i);
     }
     if (miss1.empty()) return results;
 
-    // Phase 2: ShmCache per-item (shared memory, single memcpy)
+    // Phase 2: ShmCache per-item
     std::vector<int> miss2;
     miss2.reserve(miss1.size());
     for (int i : miss1) {
         if (TryShmCacheReadOne(keys[i], dst_ptrs[i], sizes[i])) {
             results[i] = true;
-            HeapCachePut(keys[i],
-                         reinterpret_cast<const void*>(dst_ptrs[i]), sizes[i]);
+            if (heap_cache_enabled_)
+                HeapCachePut(keys[i],
+                             reinterpret_cast<const void*>(dst_ptrs[i]), sizes[i]);
         } else {
             miss2.push_back(i);
         }
     }
     if (miss2.empty()) return results;
 
-    // Phase 3: daemon (NVMe read) — build sub-batch of remaining misses.
-    // Pre-allocate heap cache buffers so we can pipeline fill during streaming.
-    const size_t nm = miss2.size();
-    std::vector<std::string> m_keys(nm);
-    std::vector<uintptr_t>   m_dst(nm);
-    std::vector<size_t>      m_sizes(nm);
-    std::vector<std::unique_ptr<char[]>> heap_bufs(nm);
-
-    bool do_cache = (heap_cache_max_bytes_ > 0);
-    for (size_t j = 0; j < nm; ++j) {
+    // Phase 3: daemon (NVMe)
+    std::vector<std::string> m_keys(miss2.size());
+    std::vector<uintptr_t>   m_dst(miss2.size());
+    std::vector<size_t>      m_sizes(miss2.size());
+    for (size_t j = 0; j < miss2.size(); ++j) {
         int i = miss2[j];
         m_keys[j]  = keys[i];
         m_dst[j]   = dst_ptrs[i];
         m_sizes[j] = sizes[i];
-        if (do_cache && sizes[i] <= heap_cache_max_bytes_)
-            heap_bufs[j] = std::make_unique<char[]>(sizes[i]);
     }
-
-    // SubmitBatch with per-chunk heap cache pipeline
-    auto m_results = SubmitBatchWithCacheFill(
-        m_keys, m_dst, m_sizes, heap_bufs);
-
-    for (size_t j = 0; j < nm; ++j) {
+    auto m_results = SubmitBatch(RequestType::BATCH_READ,
+                                 m_keys, {}, m_dst, m_sizes);
+    for (size_t j = 0; j < miss2.size(); ++j) {
         int i = miss2[j];
         results[i] = m_results[j];
-        if (results[i] && heap_bufs[j]) {
-            HeapEntry entry;
-            entry.data = std::move(heap_bufs[j]);
-            entry.size = sizes[i];
-
-            // Evict if needed
-            while (heap_cache_bytes_ + sizes[i] > heap_cache_max_bytes_
-                   && !heap_lru_.empty()) {
-                auto& vk = heap_lru_.back();
-                auto vit = heap_cache_.find(vk);
-                if (vit != heap_cache_.end()) {
-                    heap_cache_bytes_ -= vit->second.size;
-                    heap_cache_.erase(vit);
-                }
-                heap_lru_.pop_back();
-            }
-            heap_lru_.push_front(keys[i]);
-            entry.lru_pos = heap_lru_.begin();
-            heap_cache_bytes_ += sizes[i];
-            heap_cache_.emplace(keys[i], std::move(entry));
-        }
+        if (results[i] && heap_cache_enabled_)
+            HeapCachePut(keys[i],
+                         reinterpret_cast<const void*>(dst_ptrs[i]), sizes[i]);
     }
-    return results;
-}
-
-// ---------------------------------------------------------------------------
-// BATCH_READ with per-chunk heap cache pipeline.
-// Same as SubmitBatch read path, but after each 2MB SHM→user memcpy,
-// immediately copies the same chunk to a pre-allocated heap buffer
-// while data is still L2-hot (~0.04ms/chunk vs ~0.14ms cold).
-// ---------------------------------------------------------------------------
-std::vector<bool> SpdkProxyTier::SubmitBatchWithCacheFill(
-    const std::vector<std::string>& keys,
-    const std::vector<uintptr_t>& dst_ptrs,
-    const std::vector<size_t>& sizes,
-    const std::vector<std::unique_ptr<char[]>>& heap_bufs) const {
-    const int total = static_cast<int>(keys.size());
-    std::vector<bool> results(total, false);
-    if (!connected_ || total == 0) return results;
-
-    std::lock_guard<std::mutex> lock(submit_mu_);
-
-    auto* hdr = shm_.Header();
-    size_t region_size = hdr->data_region_per_rank;
-    char* data_region = static_cast<char*>(shm_.DataRegion(rank_id_));
-
-    int base = 0;
-    while (base < total) {
-        size_t desc_overhead = sizeof(BatchDescriptor);
-        size_t data_start = 0;
-        int sub_count = 0;
-        size_t total_data = 0;
-
-        for (int i = base; i < total; ++i) {
-            size_t entry_overhead = sizeof(BatchEntry);
-            size_t new_desc = desc_overhead + (sub_count + 1) * entry_overhead;
-            size_t new_data_start = (new_desc + kDmaAlignment - 1) & ~(kDmaAlignment - 1);
-            size_t aligned_data = (sizes[i] + kDmaAlignment - 1) & ~(kDmaAlignment - 1);
-            if (new_data_start + total_data + aligned_data > region_size) break;
-            data_start = new_data_start;
-            sub_count++;
-            total_data += aligned_data;
-        }
-
-        if (sub_count == 0) { results[base] = false; base++; continue; }
-
-        auto* desc = static_cast<BatchDescriptor*>(
-            static_cast<void*>(data_region));
-        desc->count = sub_count;
-        desc->total_data_size = total_data;
-        desc->items_ready.store(0, std::memory_order_relaxed);
-        desc->items_done.store(0, std::memory_order_relaxed);
-        desc->bytes_ready.store(0, std::memory_order_relaxed);
-        desc->bytes_done.store(0, std::memory_order_relaxed);
-
-        size_t data_cursor = 0;
-        char* data_base = data_region + data_start;
-
-        for (int i = 0; i < sub_count; ++i) {
-            int gi = base + i;
-            auto& entry = desc->entries[i];
-            entry.key_len = std::min(static_cast<uint16_t>(keys[gi].size()),
-                                     static_cast<uint16_t>(kMaxKeyLen - 1));
-            std::memcpy(entry.key, keys[gi].data(), entry.key_len);
-            entry.key[entry.key_len] = '\0';
-            entry.data_offset = data_cursor;
-            entry.data_size = sizes[gi];
-            entry.result = 0;
-            size_t aligned = (sizes[gi] + kDmaAlignment - 1) & ~(kDmaAlignment - 1);
-            data_cursor += aligned;
-        }
-
-        auto* ch = shm_.Channel(rank_id_);
-        uint32_t h = ch->head.load(std::memory_order_relaxed);
-
-        int ring_spin = 0;
-        while (((h + 1) % kRingSize) ==
-               ch->tail.load(std::memory_order_acquire)) {
-            CPU_PAUSE();
-            if (++ring_spin % 8192 == 0 && !IsProxyAlive()) {
-                UMBP_LOG_ERROR("SpdkProxyTier: proxy dead waiting for ring slot");
-                return results;
-            }
-        }
-
-        auto& slot = ch->slots[h % kRingSize];
-        slot.type = static_cast<uint32_t>(RequestType::BATCH_READ);
-        slot.seq_id = NextSeqId();
-        slot.key_len = 0;
-        slot.data_offset = 0;
-        slot.data_size = data_start + data_cursor;
-        slot.batch_count = sub_count;
-        slot.flags = 0;
-
-        slot.state.store(static_cast<uint32_t>(SlotState::PENDING),
-                         std::memory_order_release);
-        ch->head.store((h + 1) % kRingSize, std::memory_order_release);
-
-        // Streaming read with per-chunk heap cache pipeline
-        constexpr size_t kReadChunk = 2ULL * 1024 * 1024;
-        int current_item = 0;
-        size_t item_copied = 0;
-        int spin = 0;
-
-        while (current_item < sub_count) {
-            int gi = base + current_item;
-            auto& entry = desc->entries[current_item];
-            size_t item_sz = sizes[gi];
-
-            if (item_sz > 0) {
-                char* dst = reinterpret_cast<char*>(dst_ptrs[gi]);
-                char* src = data_base + entry.data_offset;
-                char* hbuf = (gi < static_cast<int>(heap_bufs.size()) && heap_bufs[gi])
-                             ? heap_bufs[gi].get() : nullptr;
-
-                while (item_copied < item_sz) {
-                    size_t want = std::min(kReadChunk, item_sz - item_copied);
-                    uint64_t need = entry.data_offset + item_copied + want;
-                    uint64_t bd = desc->bytes_done.load(std::memory_order_acquire);
-
-                    if (bd >= need) {
-                        std::memcpy(dst + item_copied, src + item_copied, want);
-                        // Pipeline: copy to heap cache buffer while data is L2-hot
-                        if (hbuf)
-                            std::memcpy(hbuf + item_copied,
-                                        dst + item_copied, want);
-                        item_copied += want;
-                        spin = 0;
-                    } else {
-                        CPU_PAUSE();
-                        if (++spin % 8192 == 0 && !IsProxyAlive()) {
-                            UMBP_LOG_ERROR(
-                                "SpdkProxyTier: proxy dead during batch read");
-                            slot.state.store(
-                                static_cast<uint32_t>(SlotState::EMPTY),
-                                std::memory_order_release);
-                            return results;
-                        }
-                    }
-                }
-            }
-
-            ++current_item;
-            item_copied = 0;
-        }
-
-        // Wait for overall slot completion
-        spin = 0;
-        while (true) {
-            uint32_t st = slot.state.load(std::memory_order_acquire);
-            if (st == static_cast<uint32_t>(SlotState::COMPLETED)) break;
-            CPU_PAUSE();
-            if (++spin % 8192 == 0 && !IsProxyAlive()) {
-                UMBP_LOG_ERROR(
-                    "SpdkProxyTier: proxy dead waiting for read completion");
-                slot.state.store(static_cast<uint32_t>(SlotState::EMPTY),
-                                 std::memory_order_release);
-                return results;
-            }
-        }
-
-        for (int i = 0; i < sub_count; ++i)
-            results[base + i] = (desc->entries[i].result != 0);
-
-        slot.state.store(static_cast<uint32_t>(SlotState::EMPTY),
-                         std::memory_order_release);
-        base += sub_count;
-    }
-
     return results;
 }
 

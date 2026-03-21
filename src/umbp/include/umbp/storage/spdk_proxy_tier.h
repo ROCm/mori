@@ -49,12 +49,8 @@ class SpdkProxyTier : public TierBackend {
     std::string GetLRUKey() const override;
     std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
 
-    // Block until all prior write-back NVMe flushes for this rank complete.
-    // In write-through mode this is a fast no-op round-trip.
     bool Flush() override;
 
-    // Wait for the proxy daemon to become READY (polls SHM).
-    // Returns true if READY within timeout, false on timeout or ERROR.
     static bool WaitForProxy(const std::string& shm_name, int timeout_ms);
 
    private:
@@ -74,24 +70,14 @@ class SpdkProxyTier : public TierBackend {
         const std::vector<size_t>& sizes) const;
 
     uint32_t NextSeqId() const;
-
-    // Check if the proxy daemon is still alive by examining its heartbeat.
     bool IsProxyAlive() const;
-
-    // BATCH_READ variant that pipelines heap cache fill per-chunk during
-    // streaming reads (data is L2-hot right after SHM→user copy).
-    std::vector<bool> SubmitBatchWithCacheFill(
-        const std::vector<std::string>& keys,
-        const std::vector<uintptr_t>& dst_ptrs,
-        const std::vector<size_t>& sizes,
-        const std::vector<std::unique_ptr<char[]>>& heap_bufs) const;
 
     // Per-item ShmCache read — seqlock, returns true on hit.
     bool TryShmCacheReadOne(const std::string& key, uintptr_t dst, size_t size) const;
 
-    // ---- Per-client heap read cache (analogous to POSIX page cache) ----
-    // Private to each rank process — zero contention, single memcpy on hit.
-    // Populated on writes (write-through) and on reads (back-fill).
+    // ---- Per-client heap read cache ----
+    // Controlled by UMBP_SPDK_READ_CACHE=1 (default OFF).
+    // When enabled, first read back-fills the cache; subsequent reads hit.
     struct HeapEntry {
         std::unique_ptr<char[]> data;
         size_t size;
@@ -100,6 +86,7 @@ class SpdkProxyTier : public TierBackend {
     void HeapCachePut(const std::string& key, const void* data, size_t size);
     bool HeapCacheGet(const std::string& key, uintptr_t dst, size_t size) const;
 
+    bool heap_cache_enabled_ = false;
     mutable std::unordered_map<std::string, HeapEntry> heap_cache_;
     mutable std::list<std::string> heap_lru_;
     mutable size_t heap_cache_bytes_ = 0;
