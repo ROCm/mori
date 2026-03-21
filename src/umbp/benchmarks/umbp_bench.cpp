@@ -81,6 +81,7 @@ struct BenchResult {
 struct alignas(64) BenchCoord {
     std::atomic<int> write_gen;       // Leader sets to size_idx+1 after writing
     std::atomic<int> reads_complete;  // All ranks increment after reading
+    std::atomic<int> iter_barrier;    // Sync ranks between read iterations
     int num_ranks;
     char session[16];                 // Shared session ID
 };
@@ -289,6 +290,13 @@ static BenchResult RunBatchPhased(UMBPClient& client, int rank_id,
     int best_read_ok = 0;
     int corrupt = 0;
     for (int iter = 0; iter < iterations; ++iter) {
+        if (iter > 0) {
+            coord->iter_barrier.fetch_add(1, std::memory_order_acq_rel);
+            int sync = (size_idx * (iterations - 1) + iter) * coord->num_ranks;
+            while (coord->iter_barrier.load(std::memory_order_acquire) < sync)
+                sched_yield();
+        }
+
         for (auto& b : read_bufs) std::memset(b.data(), 0, b.size());
 
         double t0 = NowSec();
@@ -464,6 +472,7 @@ int main(int argc, char** argv) {
              MAP_SHARED | MAP_ANONYMOUS, -1, 0));
     coord->write_gen.store(0, std::memory_order_relaxed);
     coord->reads_complete.store(0, std::memory_order_relaxed);
+    coord->iter_barrier.store(0, std::memory_order_relaxed);
     coord->num_ranks = num_ranks;
     std::string session = MakeSessionId();
     strncpy(coord->session, session.c_str(), sizeof(coord->session) - 1);
