@@ -52,6 +52,7 @@
 using namespace umbp::proxy;
 
 static std::atomic<bool> g_running{true};
+static std::atomic<int> g_pending_wb_flushes{0};
 static std::string g_shm_name;
 
 static void signal_handler(int) { g_running.store(false, std::memory_order_relaxed); }
@@ -208,7 +209,9 @@ static void ProcessBatchRequest(SpdkSsdTier& tier,
         }
 
         if (write_back) {
-            // Write-Back: populate SHM cache only, skip NVMe.
+            // Write-Back: populate ShmCache → return success → async NVMe flush.
+            // Client sees memory-speed writes; NVMe persistence follows in background
+            // so that subsequent reads (on cache miss) find data in entries_.
             uint64_t total = desc->total_data_size;
             while (desc->bytes_ready.load(std::memory_order_acquire) < total)
                 ;
@@ -216,6 +219,27 @@ static void ProcessBatchRequest(SpdkSsdTier& tier,
                 WriteShmCache(shm, keys[i], cptrs[i], sizes[i]);
                 desc->entries[i].result = 1;
             }
+
+            // Stage data to heap so SHM DataRegion can be reused immediately.
+            auto flush_keys = std::make_shared<std::vector<std::string>>(std::move(keys));
+            auto flush_sizes = std::make_shared<std::vector<size_t>>(std::move(sizes));
+            auto flush_offsets = std::make_shared<std::vector<size_t>>(std::move(shm_offsets));
+            auto flush_bufs = std::make_shared<std::vector<std::vector<char>>>(count);
+            auto flush_ptrs = std::make_shared<std::vector<const void*>>(count);
+            for (uint32_t i = 0; i < count; ++i) {
+                (*flush_bufs)[i].assign(
+                    static_cast<const char*>(cptrs[i]),
+                    static_cast<const char*>(cptrs[i]) + (*flush_sizes)[i]);
+                (*flush_ptrs)[i] = (*flush_bufs)[i].data();
+            }
+
+            g_pending_wb_flushes.fetch_add(1, std::memory_order_relaxed);
+            std::thread([flush_keys, flush_bufs, flush_ptrs, flush_sizes,
+                         flush_offsets, &tier]() {
+                tier.BatchWriteStreaming(*flush_keys, *flush_ptrs, *flush_sizes,
+                                        nullptr, *flush_offsets, nullptr, 0);
+                g_pending_wb_flushes.fetch_sub(1, std::memory_order_relaxed);
+            }).detach();
         } else {
             // Write-Through: NVMe write + parallel ShmCache population
             std::thread shm_cache_thread([&shm, &keys, &cptrs, &sizes, count, desc]() {
@@ -644,6 +668,15 @@ int main(int argc, char** argv) {
     fflush(stdout);
 
     PollLoop(tier, shm, spawner_pid, rank_dma, write_back);
+
+    // Wait for any pending Write-Back background flushes to complete
+    // before tearing down the SpdkSsdTier / DMA pools.
+    int pending = g_pending_wb_flushes.load(std::memory_order_relaxed);
+    if (pending > 0) {
+        UMBP_LOG_INFO("spdk_proxy: draining %d pending WB flush(es)...", pending);
+        while (g_pending_wb_flushes.load(std::memory_order_relaxed) > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
 
     FreeRankDmaPools(rank_dma, max_ranks);
     delete[] rank_dma;
