@@ -780,17 +780,18 @@ std::vector<bool> SpdkProxyTier::SubmitBatchWithCacheFill(
 
     int base = 0;
     while (base < total) {
-        size_t data_start = sizeof(BatchDescriptor) +
-                            sizeof(BatchEntry) * std::min(total - base,
-                            static_cast<int>(kMaxBatchSize));
-        data_start = (data_start + kDmaAlignment - 1) & ~(kDmaAlignment - 1);
-
+        size_t desc_overhead = sizeof(BatchDescriptor);
+        size_t data_start = 0;
         int sub_count = 0;
         size_t total_data = 0;
-        for (int i = base; i < total && sub_count < static_cast<int>(kMaxBatchSize); ++i) {
+
+        for (int i = base; i < total; ++i) {
+            size_t entry_overhead = sizeof(BatchEntry);
+            size_t new_desc = desc_overhead + (sub_count + 1) * entry_overhead;
+            size_t new_data_start = (new_desc + kDmaAlignment - 1) & ~(kDmaAlignment - 1);
             size_t aligned_data = (sizes[i] + kDmaAlignment - 1) & ~(kDmaAlignment - 1);
-            size_t new_data_start = data_start + total_data + aligned_data;
-            if (new_data_start > region_size) break;
+            if (new_data_start + total_data + aligned_data > region_size) break;
+            data_start = new_data_start;
             sub_count++;
             total_data += aligned_data;
         }
