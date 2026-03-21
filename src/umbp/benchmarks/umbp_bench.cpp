@@ -72,6 +72,8 @@ struct BenchResult {
     double cache_read_mbps; // best of subsequent iterations (heap cache)
     int read_ok;
     int corrupt;
+    double cold_t0, cold_t1;     // wall-clock timestamps for cold read
+    double cache_t0, cache_t1;   // wall-clock timestamps for best cache read
 };
 
 // Coordination structure for multi-rank phased benchmark.
@@ -103,7 +105,7 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id,
     double total_bytes = static_cast<double>(value_size) * count;
 
     auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
-    if (!ssd) return {value_size, count, 0, 0, 0, 0, 0};
+    if (!ssd) return {value_size, count, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
     std::vector<const void*> cptrs(count);
     for (int i = 0; i < count; ++i)
@@ -149,6 +151,8 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id,
 
     double first_read = 0;
     double cache_read = 0;
+    double cold_t0 = 0, cold_t1 = 0;
+    double cache_best_t0 = 0, cache_best_t1 = 0;
     int best_read_ok = 0;
     int corrupt = 0;
     for (int iter = 0; iter < iterations; ++iter) {
@@ -164,6 +168,7 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id,
 
         if (iter == 0) {
             if (ok > 0) { first_read = mbps; best_read_ok = ok; }
+            cold_t0 = t0; cold_t1 = t1;
             for (int i = 0; i < count; ++i) {
                 if (!rr[i]) continue;
                 char expected = static_cast<char>((seed + i + 1) & 0xFF);
@@ -182,11 +187,15 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id,
                 }
             }
         } else {
-            if (ok > 0 && mbps > cache_read) cache_read = mbps;
+            if (ok > 0 && mbps > cache_read) {
+                cache_read = mbps;
+                cache_best_t0 = t0; cache_best_t1 = t1;
+            }
         }
     }
 
-    return {value_size, count, best_write, first_read, cache_read, best_read_ok, corrupt};
+    return {value_size, count, best_write, first_read, cache_read,
+            best_read_ok, corrupt, cold_t0, cold_t1, cache_best_t0, cache_best_t1};
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +216,7 @@ static BenchResult RunBatchPhased(UMBPClient& client, int rank_id,
 
     double total_bytes = static_cast<double>(value_size) * count;
     auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
-    if (!ssd) return {value_size, count, 0, 0, 0, 0};
+    if (!ssd) return {value_size, count, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
     double best_write = 0;
 
@@ -275,6 +284,8 @@ static BenchResult RunBatchPhased(UMBPClient& client, int rank_id,
 
     double first_read = 0;   // iteration 0: cold read (real business scenario)
     double cache_read = 0;   // best of iteration 1+: heap cache read
+    double cold_t0 = 0, cold_t1 = 0;
+    double cache_best_t0 = 0, cache_best_t1 = 0;
     int best_read_ok = 0;
     int corrupt = 0;
     for (int iter = 0; iter < iterations; ++iter) {
@@ -290,6 +301,7 @@ static BenchResult RunBatchPhased(UMBPClient& client, int rank_id,
 
         if (iter == 0) {
             if (ok > 0) { first_read = mbps; best_read_ok = ok; }
+            cold_t0 = t0; cold_t1 = t1;
             for (int i = 0; i < count; ++i) {
                 if (!rr[i]) continue;
                 char expected = static_cast<char>((seed + i + 1) & 0xFF);
@@ -307,7 +319,10 @@ static BenchResult RunBatchPhased(UMBPClient& client, int rank_id,
                 }
             }
         } else {
-            if (ok > 0 && mbps > cache_read) cache_read = mbps;
+            if (ok > 0 && mbps > cache_read) {
+                cache_read = mbps;
+                cache_best_t0 = t0; cache_best_t1 = t1;
+            }
         }
     }
 
@@ -317,7 +332,8 @@ static BenchResult RunBatchPhased(UMBPClient& client, int rank_id,
     while (coord->reads_complete.load(std::memory_order_acquire) < target)
         sched_yield();
 
-    return {value_size, count, best_write, first_read, cache_read, best_read_ok, corrupt};
+    return {value_size, count, best_write, first_read, cache_read,
+            best_read_ok, corrupt, cold_t0, cold_t1, cache_best_t0, cache_best_t1};
 }
 #endif
 
@@ -540,17 +556,39 @@ int main(int argc, char** argv) {
     printf("  %8s  %10s  %10s  %12s\n",
            "ValSize", "Write MB/s", "Read MB/s", "CacheRd MB/s");
     for (size_t s = 0; s < num_specs; ++s) {
-        double sum_w = 0, sum_r = 0, sum_cr = 0;
+        double sum_w = 0;
+        double min_cold_t0 = 1e18, max_cold_t1 = 0;
+        double min_cache_t0 = 1e18, max_cache_t1 = 0;
+        double total_cold_bytes = 0, total_cache_bytes = 0;
         for (auto& rr : all_results) {
             if (!rr.ok || s >= rr.results.size()) continue;
+            auto& r = rr.results[s];
             if (is_phased) {
-                if (rr.rank_id == 0) sum_w = rr.results[s].write_mbps;
+                if (rr.rank_id == 0) sum_w = r.write_mbps;
             } else {
-                sum_w += rr.results[s].write_mbps;
+                sum_w += r.write_mbps;
             }
-            sum_r += rr.results[s].read_mbps;
-            sum_cr += rr.results[s].cache_read_mbps;
+
+            double bytes = static_cast<double>(r.value_size) * r.count;
+            if (r.cold_t0 > 0 && r.cold_t1 > r.cold_t0) {
+                if (r.cold_t0 < min_cold_t0) min_cold_t0 = r.cold_t0;
+                if (r.cold_t1 > max_cold_t1) max_cold_t1 = r.cold_t1;
+                total_cold_bytes += bytes;
+            }
+            if (r.cache_t0 > 0 && r.cache_t1 > r.cache_t0) {
+                if (r.cache_t0 < min_cache_t0) min_cache_t0 = r.cache_t0;
+                if (r.cache_t1 > max_cache_t1) max_cache_t1 = r.cache_t1;
+                total_cache_bytes += bytes;
+            }
         }
+
+        double wall_read = (max_cold_t1 > min_cold_t0)
+            ? (total_cold_bytes / (1024.0 * 1024.0)) / (max_cold_t1 - min_cold_t0)
+            : 0;
+        double wall_cache = (max_cache_t1 > min_cache_t0)
+            ? (total_cache_bytes / (1024.0 * 1024.0)) / (max_cache_t1 - min_cache_t0)
+            : 0;
+
         char sz_label[16];
         if (kSpecs[s].size >= 1024 * 1024)
             snprintf(sz_label, sizeof(sz_label), "%zuMB",
@@ -558,7 +596,8 @@ int main(int argc, char** argv) {
         else
             snprintf(sz_label, sizeof(sz_label), "%zuKB",
                      kSpecs[s].size / 1024);
-        printf("  %8s  %10.0f  %10.0f  %12.0f\n", sz_label, sum_w, sum_r, sum_cr);
+        printf("  %8s  %10.0f  %10.0f  %12.0f\n",
+               sz_label, sum_w, wall_read, wall_cache);
     }
     fflush(stdout);
 
