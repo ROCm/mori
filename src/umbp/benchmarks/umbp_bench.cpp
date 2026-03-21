@@ -66,6 +66,7 @@ struct BenchResult {
     double write_mbps;
     double read_mbps;
     int read_ok;
+    int corrupt;
 };
 
 static BenchResult RunBatch(UMBPClient& client, int rank_id,
@@ -130,6 +131,7 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id,
 
     double best_read = 0;
     int best_read_ok = 0;
+    int corrupt = 0;
     for (int iter = 0; iter < iterations; ++iter) {
         for (auto& b : read_bufs) std::memset(b.data(), 0, b.size());
 
@@ -141,9 +143,29 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id,
         for (auto b : rr) ok += b;
         double mbps = (total_bytes / (1024.0 * 1024.0)) / (t1 - t0);
         if (ok > 0 && mbps > best_read) { best_read = mbps; best_read_ok = ok; }
+
+        // Verify data integrity on first successful iteration
+        if (iter == 0) {
+            for (int i = 0; i < count; ++i) {
+                if (!rr[i]) continue;
+                char expected = static_cast<char>((i + 1) & 0xFF);
+                const char* buf = read_bufs[i].data();
+                if (buf[0] != expected ||
+                    buf[value_size - 1] != expected) {
+                    ++corrupt;
+                    if (corrupt <= 3)
+                        fprintf(stderr,
+                            "  [rank %d] CORRUPT: key %d, expected 0x%02x, "
+                            "got first=0x%02x last=0x%02x\n",
+                            rank_id, i, (unsigned char)expected,
+                            (unsigned char)buf[0],
+                            (unsigned char)buf[value_size - 1]);
+                }
+            }
+        }
     }
 
-    return {value_size, count, best_write, best_read, best_read_ok};
+    return {value_size, count, best_write, best_read, best_read_ok, corrupt};
 }
 
 static void PrintResults(int rank_id, int num_ranks, const char* role_str,
@@ -166,6 +188,8 @@ static void PrintResults(int rank_id, int num_ranks, const char* role_str,
         printf("  %8s  %6d  %10.0f  %10.0f", sz_label, r.count, r.write_mbps, r.read_mbps);
         if (r.read_ok != r.count)
             printf("  *** READ %d/%d", r.read_ok, r.count);
+        if (r.corrupt > 0)
+            printf("  *** CORRUPT %d", r.corrupt);
         printf("\n");
     }
     fflush(stdout);
