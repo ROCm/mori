@@ -337,6 +337,7 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, ProxyCache& cache,
                                 ProxyShmRegion& shm,
                                 RingSlot& slot,
                                 void* data_region, size_t region_size,
+                                bool write_back,
                                 void** dma_bufs = nullptr, int dma_count = 0) {
     auto type = static_cast<RequestType>(slot.type);
     auto* desc = static_cast<BatchDescriptor*>(data_region);
@@ -363,33 +364,43 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, ProxyCache& cache,
             sizes[i] = e.data_size;
             shm_offsets[i] = e.data_offset;
         }
-        // Start async cache population BEFORE NVMe write so memcpy to
-        // cache runs in parallel with DMA streaming to NVMe.
-        // The cache thread reads from SHM which is being written by the
-        // client via bytes_ready streaming — we wait for full data arrival
-        // inside the thread before copying each item.
-        std::thread cache_thread;
-        if (cache.enabled()) {
-            cache_thread = std::thread(
-                [&cache, &keys, &cptrs, &sizes, count, desc]() {
-                    uint64_t total = desc->total_data_size;
-                    while (desc->bytes_ready.load(std::memory_order_acquire) < total)
-                        ;  // spin until all data is in SHM
-                    for (uint32_t i = 0; i < count; ++i)
-                        cache.Put(keys[i], cptrs[i], sizes[i]);
-                });
-        }
 
-        auto results = tier.BatchWriteStreaming(
-            keys, cptrs, sizes, &desc->bytes_ready, shm_offsets,
-            dma_bufs, dma_count);
-
-        if (cache_thread.joinable()) cache_thread.join();
-
-        for (uint32_t i = 0; i < count; ++i) {
-            desc->entries[i].result = results[i] ? 1 : 0;
-            if (results[i])
+        if (write_back) {
+            // Write-Back: populate SHM cache + heap cache, skip NVMe.
+            // Reads are served entirely from cache. NVMe is not written.
+            uint64_t total = desc->total_data_size;
+            while (desc->bytes_ready.load(std::memory_order_acquire) < total)
+                ;
+            for (uint32_t i = 0; i < count; ++i) {
+                cache.Put(keys[i], cptrs[i], sizes[i]);
                 WriteShmCache(shm, keys[i], cptrs[i], sizes[i]);
+                desc->entries[i].result = 1;
+            }
+        } else {
+            // Write-Through: NVMe write + parallel cache population
+            std::thread cache_thread;
+            if (cache.enabled()) {
+                cache_thread = std::thread(
+                    [&cache, &keys, &cptrs, &sizes, count, desc]() {
+                        uint64_t total = desc->total_data_size;
+                        while (desc->bytes_ready.load(std::memory_order_acquire) < total)
+                            ;
+                        for (uint32_t i = 0; i < count; ++i)
+                            cache.Put(keys[i], cptrs[i], sizes[i]);
+                    });
+            }
+
+            auto results = tier.BatchWriteStreaming(
+                keys, cptrs, sizes, &desc->bytes_ready, shm_offsets,
+                dma_bufs, dma_count);
+
+            if (cache_thread.joinable()) cache_thread.join();
+
+            for (uint32_t i = 0; i < count; ++i) {
+                desc->entries[i].result = results[i] ? 1 : 0;
+                if (results[i])
+                    WriteShmCache(shm, keys[i], cptrs[i], sizes[i]);
+            }
         }
     } else {
         // BATCH_READ — try cache first
@@ -500,7 +511,8 @@ static constexpr int kMaxConcurrentRanks = 64;
 
 static void PollLoop(SpdkSsdTier& tier, ProxyCache& cache,
                      ProxyShmRegion& shm,
-                     pid_t spawner_pid, RankDmaPool* rank_dma) {
+                     pid_t spawner_pid, RankDmaPool* rank_dma,
+                     bool write_back) {
     auto* hdr = shm.Header();
     uint32_t max_ranks = std::min(hdr->max_ranks,
                                   static_cast<uint32_t>(kMaxConcurrentRanks));
@@ -545,9 +557,9 @@ static void PollLoop(SpdkSsdTier& tier, ProxyCache& cache,
                 int dma_count = rank_dma[r].count;
                 batch_worker[r] = std::thread(
                     [&tier, &cache, &shm, &slot, data_region, region_size, ch, t, r,
-                     &batch_inflight, dma_bufs, dma_count]() {
+                     &batch_inflight, dma_bufs, dma_count, write_back]() {
                         ProcessBatchRequest(tier, cache, shm, slot, data_region,
-                                            region_size, dma_bufs, dma_count);
+                                            region_size, write_back, dma_bufs, dma_count);
                         slot.state.store(
                             static_cast<uint32_t>(SlotState::COMPLETED),
                             std::memory_order_release);
@@ -710,6 +722,7 @@ int main(int argc, char** argv) {
     size_t data_per_rank_mb = getenv_size("UMBP_SPDK_PROXY_DATA_MB", 2048);
     size_t data_per_rank = data_per_rank_mb * 1024 * 1024;
     size_t cache_mb = getenv_size("UMBP_SPDK_PROXY_CACHE_MB", 8192);
+    bool write_back = getenv_int("UMBP_SPDK_PROXY_WRITE_BACK", 0) != 0;
 
     if (nvme_pci.empty() && bdev_name.empty()) {
         fprintf(stderr,
@@ -786,13 +799,14 @@ int main(int argc, char** argv) {
 
     ProxyCache cache(cache_mb * 1024 * 1024);
 
-    UMBP_LOG_INFO("spdk_proxy: READY — capacity=%zuMB, heap_cache=%zuMB, shm_cache=%u×%zuMB=%zuMB, waiting for connections...",
+    UMBP_LOG_INFO("spdk_proxy: READY — capacity=%zuMB, heap_cache=%zuMB, shm_cache=%u×%zuMB=%zuMB, write_back=%s",
                   total / (1024 * 1024), cache_mb,
                   cache_slots, cache_slot_sz / (1024 * 1024),
-                  (size_t)cache_slots * cache_slot_sz / (1024 * 1024));
+                  (size_t)cache_slots * cache_slot_sz / (1024 * 1024),
+                  write_back ? "ON" : "OFF");
     fflush(stdout);
 
-    PollLoop(tier, cache, shm, spawner_pid, rank_dma);
+    PollLoop(tier, cache, shm, spawner_pid, rank_dma, write_back);
 
     FreeRankDmaPools(rank_dma, max_ranks);
     delete[] rank_dma;
