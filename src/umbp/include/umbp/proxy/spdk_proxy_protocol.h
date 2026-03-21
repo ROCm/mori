@@ -152,12 +152,11 @@ struct BatchDescriptor {
     uint32_t count;
     uint32_t _reserved;
     uint64_t total_data_size;
+    // Non-zero: daemon placed read data directly in ring buffer at this
+    // absolute offset.  Client should read from ring instead of data_region.
+    // Zero (default): data is in data_region as before.
+    uint64_t ring_data_base;
     // Streaming signals — separate cache lines to avoid false sharing.
-    // items_ready / items_done: per-item granularity (existing).
-    // bytes_ready: byte-level granularity for intra-item write streaming.
-    //   Updated by client as it copies data chunks to SHM, checked by daemon
-    //   before reading each DMA-ring chunk.  Allows NVMe writes to overlap
-    //   with client memcpy even for single large items (e.g. 512MB × 1).
     alignas(64) std::atomic<uint32_t> items_ready;
     alignas(64) std::atomic<uint32_t> items_done;
     alignas(64) std::atomic<uint64_t> bytes_ready;
@@ -336,6 +335,28 @@ inline char* GetCacheRingData(void* shm_base, const ProxyShmHeader* hdr) {
 inline const char* GetCacheRingData(const void* shm_base, const ProxyShmHeader* hdr) {
     size_t off = CacheRingDataOffset(hdr);
     return off ? (static_cast<const char*>(shm_base) + off) : nullptr;
+}
+
+// Allocate a contiguous block in the ring buffer (CAS loop).
+// Pads past the wrap-around boundary to guarantee contiguous memory.
+// Returns the absolute ring offset, or UINT64_MAX if size is too large.
+inline uint64_t AllocRingContiguous(CacheRingControl* ctrl, size_t size) {
+    if (!ctrl || size == 0) return UINT64_MAX;
+    uint64_t cap = ctrl->capacity;
+    size_t aligned = (size + kCacheRingAlign - 1) & ~(kCacheRingAlign - 1);
+    if (aligned > (cap * 3) / 4) return UINT64_MAX;
+
+    uint64_t expected = ctrl->write_pos.load(std::memory_order_relaxed);
+    while (true) {
+        uint64_t alloc_start = expected;
+        size_t off = static_cast<size_t>(expected % cap);
+        if (off + aligned > cap)
+            alloc_start = expected + (cap - off);
+        uint64_t new_pos = alloc_start + aligned;
+        if (ctrl->write_pos.compare_exchange_weak(
+                expected, new_pos, std::memory_order_acq_rel))
+            return alloc_start;
+    }
 }
 
 }  // namespace proxy

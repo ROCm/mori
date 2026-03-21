@@ -346,6 +346,7 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(
         auto* desc = static_cast<BatchDescriptor*>(data_region);
         desc->count = sub_count;
         desc->total_data_size = total_data;
+        desc->ring_data_base = 0;
         desc->items_ready.store(0, std::memory_order_relaxed);
         desc->items_done.store(0, std::memory_order_relaxed);
         desc->bytes_ready.store(0, std::memory_order_relaxed);
@@ -437,10 +438,23 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(
                 results[base + i] = (desc->entries[i].result != 0);
 
         } else {
-            // STREAMING READ: copy data in 2MB chunks using bytes_done,
-            // overlapping client memcpy with daemon NVMe reads at sub-item
-            // granularity. Falls back to items_done for small items.
+            // STREAMING READ: copy data in 2MB chunks using bytes_done.
+            // If daemon placed data in ring buffer (ring_data_base != 0),
+            // read from ring; otherwise read from data_region.
             constexpr size_t kReadChunk = 2ULL * 1024 * 1024;
+
+            char* read_base = data_base;
+            if (desc->ring_data_base != 0) {
+                auto* hdr = shm_.Header();
+                auto* ctrl = GetCacheRingControl(shm_.Base(), hdr);
+                if (ctrl) {
+                    char* ring_data = GetCacheRingData(shm_.Base(), hdr);
+                    uint64_t cap = ctrl->capacity;
+                    read_base = ring_data +
+                        static_cast<size_t>(desc->ring_data_base % cap);
+                }
+            }
+
             int current_item = 0;
             size_t item_copied = 0;
             int spin = 0;
@@ -452,7 +466,7 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(
 
                 if (!dst_ptrs.empty() && item_sz > 0) {
                     char* dst = reinterpret_cast<char*>(dst_ptrs[gi]);
-                    char* src = data_base + entry.data_offset;
+                    char* src = read_base + entry.data_offset;
 
                     while (item_copied < item_sz) {
                         size_t want = std::min(kReadChunk, item_sz - item_copied);

@@ -206,6 +206,35 @@ static void WriteShmCache(ProxyShmRegion& shm, const std::string& key,
 }
 
 // ---------------------------------------------------------------------------
+// Update ring cache index only (data already in ring via DMA path).
+// Same seqlock+CAS protocol as WriteShmCache but no data copy / write_pos advance.
+// ---------------------------------------------------------------------------
+static void UpdateRingCacheIndex(ProxyShmRegion& shm, const std::string& key,
+                                  uint64_t ring_offset, size_t size) {
+    auto* hdr = shm.Header();
+    auto* index = GetCacheIndex(shm.Base(), hdr);
+    if (!index || hdr->cache_index_slots == 0) return;
+
+    uint32_t idx = CacheIndexHash(key.data(),
+                                  static_cast<uint32_t>(key.size()),
+                                  hdr->cache_index_slots);
+    auto& entry = index[idx];
+
+    uint64_t old_gen = entry.gen.load(std::memory_order_relaxed);
+    if (old_gen & 1) return;
+    if (!entry.gen.compare_exchange_strong(old_gen, old_gen + 1,
+                                           std::memory_order_acq_rel))
+        return;
+
+    entry.key_len = static_cast<uint32_t>(key.size());
+    std::memcpy(entry.key, key.data(), key.size());
+    entry.ring_offset = ring_offset;
+    entry.data_size = size;
+
+    entry.gen.store(old_gen + 2, std::memory_order_release);
+}
+
+// ---------------------------------------------------------------------------
 // Process a single non-batch request
 // ---------------------------------------------------------------------------
 static void ProcessSingleRequest(SpdkSsdTier& tier,
@@ -300,7 +329,8 @@ static void ProcessBatchRequest(SpdkSsdTier& tier,
                                 void* data_region, size_t region_size,
                                 bool write_back,
                                 void** dma_bufs = nullptr, int dma_count = 0,
-                                WbFlushTask* wb_out = nullptr) {
+                                WbFlushTask* wb_out = nullptr,
+                                bool ring_read = false) {
     auto type = static_cast<RequestType>(slot.type);
     auto* desc = static_cast<BatchDescriptor*>(data_region);
     uint32_t count = desc->count;
@@ -380,27 +410,56 @@ static void ProcessBatchRequest(SpdkSsdTier& tier,
             }
         }
     } else {
-        // BATCH_READ — NVMe streaming read + ShmCache back-fill
+        // BATCH_READ — NVMe streaming read.
+        // If ring_read is enabled and ring cache has capacity, DMA into
+        // ring buffer directly so data is cached with zero extra memcpy.
+        // Otherwise, DMA into data_region and back-fill ring afterwards.
         std::vector<std::string> keys(count);
-        std::vector<void*> dst_ptrs(count);
         std::vector<size_t> sizes(count);
         for (uint32_t i = 0; i < count; ++i) {
             auto& e = desc->entries[i];
             keys[i] = std::string(e.key, e.key_len);
-            dst_ptrs[i] = static_cast<void*>(data_base + e.data_offset);
             sizes[i] = e.data_size;
         }
 
         desc->bytes_done.store(0, std::memory_order_relaxed);
         desc->items_done.store(0, std::memory_order_relaxed);
 
+        auto* hdr = shm.Header();
+        auto* ctrl = GetCacheRingControl(shm.Base(), hdr);
+        uint64_t ring_base = UINT64_MAX;
+        char* ring_data = nullptr;
+        uint64_t ring_cap = 0;
+
+        if (ring_read && ctrl) {
+            ring_cap = ctrl->capacity;
+            ring_base = AllocRingContiguous(ctrl, desc->total_data_size);
+            if (ring_base != UINT64_MAX)
+                ring_data = GetCacheRingData(shm.Base(), hdr);
+        }
+
+        bool use_ring = (ring_base != UINT64_MAX && ring_data != nullptr);
+
         std::vector<uintptr_t> dma_ptrs(count);
         std::vector<size_t> shm_offsets(count);
-        for (uint32_t i = 0; i < count; ++i) {
-            auto& e = desc->entries[i];
-            dma_ptrs[i] = reinterpret_cast<uintptr_t>(
-                data_base + e.data_offset);
-            shm_offsets[i] = e.data_offset;
+
+        if (use_ring) {
+            char* ring_block = ring_data + static_cast<size_t>(ring_base % ring_cap);
+            for (uint32_t i = 0; i < count; ++i) {
+                auto& e = desc->entries[i];
+                dma_ptrs[i] = reinterpret_cast<uintptr_t>(
+                    ring_block + e.data_offset);
+                shm_offsets[i] = e.data_offset;
+            }
+            desc->ring_data_base = ring_base;
+        } else {
+            for (uint32_t i = 0; i < count; ++i) {
+                auto& e = desc->entries[i];
+                dma_ptrs[i] = reinterpret_cast<uintptr_t>(
+                    data_base + e.data_offset);
+                shm_offsets[i] = e.data_offset;
+            }
+            desc->ring_data_base = 0;
         }
 
         auto results = tier.BatchReadIntoPtrStreaming(
@@ -424,11 +483,18 @@ static void ProcessBatchRequest(SpdkSsdTier& tier,
                           keys[0].substr(0, 64).c_str(), first_exists);
         }
 
-        // Read-back-fill: populate ShmCache so subsequent reads by other
-        // ranks can hit the SHM shared cache directly.
-        for (uint32_t i = 0; i < count; ++i) {
-            if (results[i])
-                WriteShmCache(shm, keys[i], dst_ptrs[i], sizes[i]);
+        if (use_ring) {
+            for (uint32_t i = 0; i < count; ++i) {
+                if (results[i])
+                    UpdateRingCacheIndex(shm, keys[i],
+                        ring_base + desc->entries[i].data_offset, sizes[i]);
+            }
+        } else {
+            for (uint32_t i = 0; i < count; ++i) {
+                if (results[i])
+                    WriteShmCache(shm, keys[i],
+                        data_base + desc->entries[i].data_offset, sizes[i]);
+            }
         }
     }
 
@@ -486,7 +552,7 @@ static constexpr int kMaxConcurrentRanks = 64;
 static void PollLoop(SpdkSsdTier& tier,
                      ProxyShmRegion& shm,
                      pid_t spawner_pid, RankDmaPool* rank_dma,
-                     bool write_back) {
+                     bool write_back, bool ring_read) {
     auto* hdr = shm.Header();
     uint32_t max_ranks = std::min(hdr->max_ranks,
                                   static_cast<uint32_t>(kMaxConcurrentRanks));
@@ -540,14 +606,15 @@ static void PollLoop(SpdkSsdTier& tier,
                 batch_worker[r] = std::thread(
                     [&tier, &shm, &slot, data_region, region_size, ch, t, r,
                      &batch_inflight, dma_bufs, dma_count, write_back, rtype,
-                     wbq]() {
+                     wbq, ring_read]() {
                         bool is_wb_write = write_back &&
                             rtype == RequestType::BATCH_WRITE;
                         WbFlushTask wb_task;
                         ProcessBatchRequest(tier, shm, slot, data_region,
                                             region_size, write_back,
                                             dma_bufs, dma_count,
-                                            is_wb_write ? &wb_task : nullptr);
+                                            is_wb_write ? &wb_task : nullptr,
+                                            ring_read);
                         slot.state.store(
                             static_cast<uint32_t>(SlotState::COMPLETED),
                             std::memory_order_release);
@@ -722,6 +789,7 @@ int main(int argc, char** argv) {
     size_t data_per_rank_mb = getenv_size("UMBP_SPDK_PROXY_DATA_MB", 2048);
     size_t data_per_rank = data_per_rank_mb * 1024 * 1024;
     bool write_back = getenv_int("UMBP_SPDK_PROXY_WRITE_BACK", 0) != 0;
+    bool ring_read = getenv_int("UMBP_SPDK_RING_READ", 1) != 0;
 
     if (nvme_pci.empty() && bdev_name.empty()) {
         fprintf(stderr,
@@ -791,14 +859,16 @@ int main(int argc, char** argv) {
     auto* rank_dma = new RankDmaPool[max_ranks];
     AllocRankDmaPools(rank_dma, max_ranks);
 
-    UMBP_LOG_INFO("spdk_proxy: READY — capacity=%zuMB, ring_cache=%zuMB (index=%u slots), write_back=%s",
+    UMBP_LOG_INFO("spdk_proxy: READY — capacity=%zuMB, ring_cache=%zuMB (index=%u slots), "
+                  "write_back=%s, ring_read=%s",
                   total / (1024 * 1024),
                   shm_cache_mb,
                   hdr->cache_index_slots,
-                  write_back ? "ON" : "OFF");
+                  write_back ? "ON" : "OFF",
+                  ring_read ? "ON" : "OFF");
     fflush(stdout);
 
-    PollLoop(tier, shm, spawner_pid, rank_dma, write_back);
+    PollLoop(tier, shm, spawner_pid, rank_dma, write_back, ring_read);
 
     FreeRankDmaPools(rank_dma, max_ranks);
     delete[] rank_dma;
