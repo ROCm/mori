@@ -514,8 +514,6 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(
 // ---------------------------------------------------------------------------
 bool SpdkProxyTier::Write(const std::string& key, const void* data, size_t size) {
     auto rc = SubmitAndWait(RequestType::WRITE, key, data, size, nullptr, 0);
-    if (rc == ResultCode::OK && data)
-        HeapCachePut(key, data, size);
     return rc == ResultCode::OK;
 }
 
@@ -670,13 +668,7 @@ std::vector<bool> SpdkProxyTier::BatchWrite(
     const std::vector<std::string>& keys,
     const std::vector<const void*>& data_ptrs,
     const std::vector<size_t>& sizes) {
-    auto results = SubmitBatch(RequestType::BATCH_WRITE, keys, data_ptrs, {}, sizes);
-    // Populate heap read cache for every successful write
-    for (size_t i = 0; i < results.size(); ++i) {
-        if (results[i] && data_ptrs[i])
-            HeapCachePut(keys[i], data_ptrs[i], sizes[i]);
-    }
-    return results;
+    return SubmitBatch(RequestType::BATCH_WRITE, keys, data_ptrs, {}, sizes);
 }
 
 // ---------------------------------------------------------------------------
