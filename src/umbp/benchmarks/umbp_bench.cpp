@@ -119,6 +119,9 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id,
             fprintf(stderr, "  [rank %d] read-key write %d/%d, retrying...\n",
                     rank_id, write_ok, count);
     }
+    if (write_ok < count)
+        fprintf(stderr, "  [rank %d] WARNING: only wrote %d/%d read-keys for %zuKB\n",
+                rank_id, write_ok, count, value_size / 1024);
 
     std::vector<std::vector<char>> read_bufs(count, std::vector<char>(value_size, 0));
     std::vector<uintptr_t> dst_ptrs(count);
@@ -137,7 +140,7 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id,
         int ok = 0;
         for (auto b : rr) ok += b;
         double mbps = (total_bytes / (1024.0 * 1024.0)) / (t1 - t0);
-        if (mbps > best_read) { best_read = mbps; best_read_ok = ok; }
+        if (ok > 0 && mbps > best_read) { best_read = mbps; best_read_ok = ok; }
     }
 
     return {value_size, count, best_write, best_read, best_read_ok};
@@ -302,6 +305,35 @@ int main(int argc, char** argv) {
             printf("\n[rank %d] FAILED (no results)\n", rr.rank_id);
         }
     }
+
+    // Aggregate bandwidth across all ranks
+    size_t num_specs = sizeof(kSpecs) / sizeof(kSpecs[0]);
+    printf("\n========================================================\n");
+    printf(" AGGREGATE Bandwidth (sum of %d ranks)\n", num_ranks);
+    printf("========================================================\n");
+    printf("  %8s  %10s  %10s\n", "ValSize", "Write MB/s", "Read MB/s");
+    for (size_t s = 0; s < num_specs; ++s) {
+        double sum_w = 0, sum_r = 0;
+        int valid = 0;
+        for (auto& rr : all_results) {
+            if (rr.ok && s < rr.results.size()) {
+                sum_w += rr.results[s].write_mbps;
+                sum_r += rr.results[s].read_mbps;
+                ++valid;
+            }
+        }
+        if (valid == 0) continue;
+        char sz_label[16];
+        if (kSpecs[s].size >= 1024 * 1024)
+            snprintf(sz_label, sizeof(sz_label), "%zuMB",
+                     kSpecs[s].size / (1024 * 1024));
+        else
+            snprintf(sz_label, sizeof(sz_label), "%zuKB",
+                     kSpecs[s].size / 1024);
+        printf("  %8s  %10.0f  %10.0f\n", sz_label, sum_w, sum_r);
+    }
+    fflush(stdout);
+
     return failures > 0 ? 1 : 0;
 #else
     fprintf(stderr, "Multi-rank mode requires Linux\n");
