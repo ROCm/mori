@@ -6,9 +6,10 @@
 // zero-copy DMA when available).
 //
 // SHM shared cache: on write, data is persisted to NVMe and simultaneously
-// cached in seqlock-protected SHM slots.  Client ranks can read these slots
-// directly (single memcpy, no daemon IPC) for cache hits.  Cache misses fall
-// through to NVMe.  Controlled by UMBP_SPDK_PROXY_CACHE_MB (default 8192).
+// cached in a ring buffer in SHM.  Client ranks look up a hash index then
+// memcpy directly from the ring — zero daemon involvement on cache hit.
+// Cache misses fall through to NVMe.
+// Controlled by UMBP_SPDK_PROXY_CACHE_MB (default 8192).
 //
 // Self-managed lifecycle:
 //   - Stores proxy_pid in SHM header for liveness detection.
@@ -145,59 +146,63 @@ static void atexit_cleanup() {
 }
 
 // ---------------------------------------------------------------------------
-// Write data into a specific SHM cache slot (seqlock-protected).
+// Ring buffer memcpy helper (handles wrap-around).
 // ---------------------------------------------------------------------------
-static void WriteShmCacheSlotAt(ProxyShmRegion& shm, uint32_t idx,
-                                const std::string& key,
-                                const void* data, size_t size) {
-    auto* hdr = shm.Header();
-    auto* slot = GetCacheSlot(shm.Base(), hdr, idx);
-    char* slot_data = GetCacheSlotData(shm.Base(), hdr, idx);
-
-    uint64_t old = slot->gen.load(std::memory_order_relaxed);
-    slot->gen.store(old + 1, std::memory_order_release);          // odd → writing
-
-    slot->key_len = static_cast<uint32_t>(key.size());
-    std::memcpy(slot->key, key.data(), key.size());
-    slot->data_size = size;
-    std::memcpy(slot_data, data, size);
-
-    slot->gen.store(old + 2, std::memory_order_release);          // even → stable
+static void RingMemcpyIn(char* ring_data, uint64_t capacity,
+                         uint64_t abs_offset, const void* src, size_t size) {
+    size_t off = static_cast<size_t>(abs_offset % capacity);
+    if (off + size <= capacity) {
+        std::memcpy(ring_data + off, src, size);
+    } else {
+        size_t first = static_cast<size_t>(capacity - off);
+        std::memcpy(ring_data + off, src, first);
+        std::memcpy(ring_data, static_cast<const char*>(src) + first, size - first);
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Write a key/value into the SHM shared cache.
-// Items ≤ slot capacity go into a single slot (hash-indexed).
-// Larger items are chunked into ≤cap pieces placed at contiguous slots
-// starting from hash(original_key), eliminating self-collision.
+// Write a key/value into the SHM ring buffer cache.
+//
+// Thread-safe: multiple batch_worker threads may call this concurrently.
+//   - write_pos: atomically advanced via fetch_add (each writer gets a
+//     unique, non-overlapping region in the ring).
+//   - index entry: protected by CAS on gen (even → odd).  If another thread
+//     is writing the same index slot, the late-comer skips silently — the
+//     data is still in the ring and will be indexed on the next write.
 // ---------------------------------------------------------------------------
 static void WriteShmCache(ProxyShmRegion& shm, const std::string& key,
                           const void* data, size_t size) {
     auto* hdr = shm.Header();
-    if (hdr->cache_num_slots == 0 || size == 0) return;
-    size_t cap = CacheSlotDataCapacity(hdr);
-    uint32_t ns = hdr->cache_num_slots;
+    auto* ctrl = GetCacheRingControl(shm.Base(), hdr);
+    if (!ctrl || size == 0) return;
 
-    if (size <= cap) {
-        uint32_t idx = CacheSlotIndex(key.data(),
-                                      static_cast<uint32_t>(key.size()), ns);
-        WriteShmCacheSlotAt(shm, idx, key, data, size);
-        return;
-    }
+    uint64_t cap = ctrl->capacity;
+    if (size > cap) return;
 
-    uint32_t base = CacheSlotIndex(key.data(),
-                                   static_cast<uint32_t>(key.size()), ns);
-    const char* src = static_cast<const char*>(data);
-    size_t remaining = size;
-    for (uint32_t ci = 0; remaining > 0; ++ci) {
-        size_t chunk_sz = std::min(cap, remaining);
-        std::string ck = key + ":c" + std::to_string(ci);
-        if (ck.size() > kMaxKeyLen) return;
-        uint32_t idx = (base + ci) % ns;
-        WriteShmCacheSlotAt(shm, idx, ck, src, chunk_sz);
-        src += chunk_sz;
-        remaining -= chunk_sz;
-    }
+    size_t aligned = (size + kCacheRingAlign - 1) & ~(kCacheRingAlign - 1);
+    uint64_t pos = ctrl->write_pos.fetch_add(aligned, std::memory_order_relaxed);
+
+    char* ring_data = GetCacheRingData(shm.Base(), hdr);
+    RingMemcpyIn(ring_data, cap, pos, data, size);
+
+    auto* index = GetCacheIndex(shm.Base(), hdr);
+    uint32_t idx = CacheIndexHash(key.data(),
+                                  static_cast<uint32_t>(key.size()),
+                                  hdr->cache_index_slots);
+    auto& entry = index[idx];
+
+    uint64_t old_gen = entry.gen.load(std::memory_order_relaxed);
+    if (old_gen & 1) return;  // another writer active on this index slot
+    if (!entry.gen.compare_exchange_strong(old_gen, old_gen + 1,
+                                           std::memory_order_acq_rel))
+        return;  // lost CAS race
+
+    entry.key_len = static_cast<uint32_t>(key.size());
+    std::memcpy(entry.key, key.data(), key.size());
+    entry.ring_offset = pos;
+    entry.data_size = size;
+
+    entry.gen.store(old_gen + 2, std::memory_order_release);   // even → stable
 }
 
 // ---------------------------------------------------------------------------
@@ -727,19 +732,11 @@ int main(int argc, char** argv) {
     g_shm_name = shm_name;
     std::atexit(atexit_cleanup);
 
-    // SHM shared cache: direct-mapped, seqlock per slot.
-    // Slot total = 2MB data capacity + 4KB metadata so that 2MB items fit.
-    static constexpr size_t kDefaultCacheSlotSize =
-        2ULL * 1024 * 1024 + umbp::proxy::kCacheSlotMetaSize;
     size_t shm_cache_mb = getenv_size("UMBP_SPDK_PROXY_CACHE_MB", 8192);
-    size_t cache_slot_sz = kDefaultCacheSlotSize;
-    uint32_t cache_slots = (shm_cache_mb > 0)
-        ? static_cast<uint32_t>((shm_cache_mb * 1024 * 1024) / cache_slot_sz)
-        : 0;
 
     ProxyShmRegion shm;
     int rc = shm.Create(shm_name, max_ranks, data_per_rank, /*try_hugepage=*/true,
-                        cache_slot_sz, cache_slots);
+                        shm_cache_mb);
     if (rc != 0) {
         fprintf(stderr, "spdk_proxy: failed to create SHM '%s' rc=%d\n",
                 shm_name.c_str(), rc);
@@ -794,10 +791,10 @@ int main(int argc, char** argv) {
     auto* rank_dma = new RankDmaPool[max_ranks];
     AllocRankDmaPools(rank_dma, max_ranks);
 
-    UMBP_LOG_INFO("spdk_proxy: READY — capacity=%zuMB, shm_cache=%u×%zuMB=%zuMB, write_back=%s",
+    UMBP_LOG_INFO("spdk_proxy: READY — capacity=%zuMB, ring_cache=%zuMB (index=%u slots), write_back=%s",
                   total / (1024 * 1024),
-                  cache_slots, cache_slot_sz / (1024 * 1024),
-                  (size_t)cache_slots * cache_slot_sz / (1024 * 1024),
+                  shm_cache_mb,
+                  hdr->cache_index_slots,
                   write_back ? "ON" : "OFF");
     fflush(stdout);
 

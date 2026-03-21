@@ -18,6 +18,9 @@
 //   [ProxyShmHeader]          — global state, offsets to channels and data
 //   [RankChannel × max_ranks] — per-rank request/response ring buffers
 //   [DataRegion]              — bulk data transfer area (per-rank sections)
+//   [CacheRingControl]        — ring buffer write pointer and capacity
+//   [CacheRingIndex]          — hash index: key → ring position
+//   [CacheRingData]           — ring buffer data (FIFO, daemon writes, clients read)
 //
 #pragma once
 
@@ -31,7 +34,7 @@ namespace proxy {
 
 // ---- Constants ----
 static constexpr uint64_t kProxyShmMagic = 0x554D4250534B5058ULL;  // "UMBPSKPX"
-static constexpr uint32_t kProxyVersion = 2;
+static constexpr uint32_t kProxyVersion = 3;
 static constexpr uint32_t kMaxKeyLen = 256;
 static constexpr uint32_t kRingSize = 256;
 static constexpr uint32_t kMaxRanks = 16;
@@ -163,30 +166,40 @@ struct BatchDescriptor {
     BatchEntry entries[];
 };
 
-// ---- SHM shared cache slot (seqlock-protected, inline data) ----
+// ---- SHM shared cache: ring buffer with hash index ----
 //
-// Direct-mapped hash table in SHM.  Daemon writes slots; clients read them
-// directly — zero daemon involvement on cache hit (single memcpy).
+// Single-producer (daemon) multi-consumer (rank clients).
+// Daemon appends data to a ring buffer and updates a hash index table.
+// Clients look up the index, validate that the ring region is still live,
+// then memcpy out.
 //
-// Seqlock protocol:
-//   gen == 0       → empty slot
-//   gen odd        → daemon is writing (client must spin or bail)
-//   gen even != 0  → data is stable; client may read
-//   Client: read gen (must be even), copy data, re-read gen (must be same).
+// Index entry seqlock:
+//   gen == 0       → empty
+//   gen odd        → daemon is updating (client must bail)
+//   gen even != 0  → stable; client may read
 //
-static constexpr size_t kCacheSlotMetaSize = 4096;  // metadata area per slot (page-aligned)
+// Ring liveness: data at absolute offset P is live iff write_pos - P <= capacity.
+//
+static constexpr size_t kCacheRingAlign = 64;  // data alignment in ring buffer
 
-struct ShmCacheSlot {
-    std::atomic<uint64_t> gen;   // seqlock generation
-    uint32_t key_len;
-    uint32_t _pad0;
-    uint64_t data_size;
-    char key[kMaxKeyLen];
-    // Remaining bytes up to kCacheSlotMetaSize are reserved padding.
-    // Inline data starts at byte offset kCacheSlotMetaSize from slot start.
+struct alignas(64) CacheRingControl {
+    std::atomic<uint64_t> write_pos;  // absolute monotonic write position (daemon-only)
+    uint64_t capacity;                // ring data capacity in bytes
+    char _pad[48];
 };
 
-inline uint32_t CacheSlotIndex(const char* key, uint32_t key_len, uint32_t num_slots) {
+struct alignas(64) CacheRingIndexEntry {
+    std::atomic<uint64_t> gen;  // seqlock generation
+    uint32_t key_len;
+    uint32_t _pad0;
+    uint64_t ring_offset;       // absolute position when written
+    uint64_t data_size;
+    char key[kMaxKeyLen];
+    char _pad1[32];
+};
+static_assert(sizeof(CacheRingIndexEntry) == 320, "CacheRingIndexEntry size mismatch");
+
+inline uint32_t CacheIndexHash(const char* key, uint32_t key_len, uint32_t num_slots) {
     uint64_t h = 14695981039346656037ULL;
     for (uint32_t i = 0; i < key_len; ++i) {
         h ^= static_cast<uint64_t>(static_cast<unsigned char>(key[i]));
@@ -230,10 +243,10 @@ struct ProxyShmHeader {
     // to detect crashed ranks and reclaim their resources.
     std::atomic<uint32_t> rank_pids[kMaxRanks];
 
-    // ---- Shared cache (seqlock direct-mapped, appended after data regions) ----
-    uint64_t cache_region_offset;     // 0 = no shared cache
-    uint64_t cache_slot_size;         // total bytes per slot (meta + data)
-    uint32_t cache_num_slots;
+    // ---- Shared cache (ring buffer + hash index, appended after data regions) ----
+    uint64_t cache_region_offset;     // 0 = no cache; else offset to CacheRingControl
+    uint64_t cache_ring_capacity;     // ring data area capacity in bytes
+    uint32_t cache_index_slots;       // number of hash index entries
     uint32_t _pad_cache;
 
     char _reserved2[16];
@@ -281,23 +294,48 @@ inline const void* GetDataRegion(const void* shm_base, const ProxyShmHeader* hdr
     return base + hdr->data_region_offset + rank * hdr->data_region_per_rank;
 }
 
-// ---- Helpers: shared cache slot access ----
-inline ShmCacheSlot* GetCacheSlot(void* shm_base, const ProxyShmHeader* hdr,
-                                  uint32_t slot_idx) {
-    auto* base = static_cast<char*>(shm_base) + hdr->cache_region_offset;
-    return reinterpret_cast<ShmCacheSlot*>(base + slot_idx * hdr->cache_slot_size);
+// ---- Helpers: ring buffer cache access ----
+inline CacheRingControl* GetCacheRingControl(void* shm_base, const ProxyShmHeader* hdr) {
+    if (hdr->cache_region_offset == 0) return nullptr;
+    return reinterpret_cast<CacheRingControl*>(
+        static_cast<char*>(shm_base) + hdr->cache_region_offset);
 }
 
-inline char* GetCacheSlotData(void* shm_base, const ProxyShmHeader* hdr,
-                              uint32_t slot_idx) {
-    auto* base = static_cast<char*>(shm_base) + hdr->cache_region_offset;
-    return base + slot_idx * hdr->cache_slot_size + kCacheSlotMetaSize;
+inline const CacheRingControl* GetCacheRingControl(const void* shm_base,
+                                                    const ProxyShmHeader* hdr) {
+    if (hdr->cache_region_offset == 0) return nullptr;
+    return reinterpret_cast<const CacheRingControl*>(
+        static_cast<const char*>(shm_base) + hdr->cache_region_offset);
 }
 
-inline size_t CacheSlotDataCapacity(const ProxyShmHeader* hdr) {
-    return hdr->cache_slot_size > kCacheSlotMetaSize
-               ? hdr->cache_slot_size - kCacheSlotMetaSize
-               : 0;
+inline CacheRingIndexEntry* GetCacheIndex(void* shm_base, const ProxyShmHeader* hdr) {
+    if (hdr->cache_region_offset == 0) return nullptr;
+    return reinterpret_cast<CacheRingIndexEntry*>(
+        static_cast<char*>(shm_base) + hdr->cache_region_offset + sizeof(CacheRingControl));
+}
+
+inline const CacheRingIndexEntry* GetCacheIndex(const void* shm_base,
+                                                 const ProxyShmHeader* hdr) {
+    if (hdr->cache_region_offset == 0) return nullptr;
+    return reinterpret_cast<const CacheRingIndexEntry*>(
+        static_cast<const char*>(shm_base) + hdr->cache_region_offset + sizeof(CacheRingControl));
+}
+
+inline size_t CacheRingDataOffset(const ProxyShmHeader* hdr) {
+    if (hdr->cache_region_offset == 0) return 0;
+    size_t idx_end = hdr->cache_region_offset + sizeof(CacheRingControl)
+                   + static_cast<size_t>(hdr->cache_index_slots) * sizeof(CacheRingIndexEntry);
+    return (idx_end + 4095) & ~4095ULL;
+}
+
+inline char* GetCacheRingData(void* shm_base, const ProxyShmHeader* hdr) {
+    size_t off = CacheRingDataOffset(hdr);
+    return off ? (static_cast<char*>(shm_base) + off) : nullptr;
+}
+
+inline const char* GetCacheRingData(const void* shm_base, const ProxyShmHeader* hdr) {
+    size_t off = CacheRingDataOffset(hdr);
+    return off ? (static_cast<const char*>(shm_base) + off) : nullptr;
 }
 
 }  // namespace proxy

@@ -31,13 +31,26 @@ static size_t AlignToHugepage(size_t size) {
 
 int ProxyShmRegion::Create(const std::string& name, uint32_t max_ranks,
                            size_t data_per_rank, bool try_hugepage,
-                           size_t cache_slot_size, uint32_t cache_num_slots) {
+                           size_t cache_budget_mb) {
 #ifndef __linux__
     return -ENOTSUP;
 #else
     if (max_ranks > kMaxRanks) return -EINVAL;
 
-    size_t cache_total = cache_slot_size * cache_num_slots;
+    uint32_t cache_index_slots = 0;
+    size_t cache_ring_cap = 0;
+    size_t cache_total = 0;
+    if (cache_budget_mb > 0) {
+        size_t budget = cache_budget_mb * 1024ULL * 1024ULL;
+        cache_index_slots = static_cast<uint32_t>(budget / 32768);
+        if (cache_index_slots < 4096) cache_index_slots = 4096;
+        size_t ctrl_and_idx = sizeof(CacheRingControl)
+            + static_cast<size_t>(cache_index_slots) * sizeof(CacheRingIndexEntry);
+        size_t ctrl_and_idx_aligned = (ctrl_and_idx + 4095) & ~4095ULL;
+        cache_ring_cap = (budget > ctrl_and_idx_aligned)
+                             ? budget - ctrl_and_idx_aligned : 0;
+        cache_total = ctrl_and_idx_aligned + cache_ring_cap;
+    }
     size_ = ComputeShmSize(max_ranks, data_per_rank, cache_total);
     name_ = name;
     is_server_ = true;
@@ -127,15 +140,20 @@ int ProxyShmRegion::Create(const std::string& name, uint32_t max_ranks,
     for (uint32_t r = 0; r < kMaxRanks; ++r)
         hdr->rank_pids[r].store(0, std::memory_order_relaxed);
 
-    if (cache_num_slots > 0 && cache_slot_size >= kCacheSlotMetaSize) {
+    if (cache_index_slots > 0 && cache_ring_cap > 0) {
         size_t base_before_cache = ComputeShmSize(max_ranks, data_per_rank, 0);
         hdr->cache_region_offset = (base_before_cache + 4095) & ~4095ULL;
-        hdr->cache_slot_size = cache_slot_size;
-        hdr->cache_num_slots = cache_num_slots;
+        hdr->cache_ring_capacity = cache_ring_cap;
+        hdr->cache_index_slots = cache_index_slots;
+
+        auto* ctrl = reinterpret_cast<CacheRingControl*>(
+            static_cast<char*>(base_) + hdr->cache_region_offset);
+        ctrl->write_pos.store(0, std::memory_order_relaxed);
+        ctrl->capacity = cache_ring_cap;
     } else {
         hdr->cache_region_offset = 0;
-        hdr->cache_slot_size = 0;
-        hdr->cache_num_slots = 0;
+        hdr->cache_ring_capacity = 0;
+        hdr->cache_index_slots = 0;
     }
 
     for (uint32_t r = 0; r < max_ranks; ++r) {

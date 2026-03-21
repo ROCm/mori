@@ -637,57 +637,64 @@ bool SpdkProxyTier::HeapCacheGet(const std::string& key,
 }
 
 // ---------------------------------------------------------------------------
-// Per-item ShmCache read — seqlock protocol, returns true on hit.
-// Items > slot capacity are read as chunked entries at contiguous slots
-// starting from hash(original_key), matching the write-side layout.
+// Per-item ShmCache read — ring buffer with seqlock + liveness validation.
+//
+// Protocol:
+//   1. Read index entry gen (must be even & non-zero).
+//   2. Match key and size.
+//   3. Validate ring_offset hasn't been overwritten (write_pos - offset <= cap).
+//   4. memcpy from ring (handle wrap-around).
+//   5. Re-check gen and write_pos for consistency.
 // ---------------------------------------------------------------------------
 bool SpdkProxyTier::TryShmCacheReadOne(const std::string& key,
                                         uintptr_t dst, size_t size) const {
     using namespace umbp::proxy;
     if (!connected_) return false;
+
     auto* hdr = shm_.Header();
-    if (hdr->cache_num_slots == 0) return false;
-    size_t cap = CacheSlotDataCapacity(hdr);
-    uint32_t ns = hdr->cache_num_slots;
+    if (hdr->cache_index_slots == 0) return false;
 
-    void* shm_base = shm_.Base();
+    auto* ctrl = GetCacheRingControl(shm_.Base(), hdr);
+    if (!ctrl) return false;
 
-    auto read_slot_at = [&](uint32_t idx, const std::string& k,
-                            uintptr_t d, size_t sz) -> bool {
-        auto* slot = GetCacheSlot(shm_base, hdr, idx);
+    auto* index = GetCacheIndex(shm_.Base(), hdr);
+    uint32_t idx = CacheIndexHash(key.data(),
+                                  static_cast<uint32_t>(key.size()),
+                                  hdr->cache_index_slots);
+    auto& entry = index[idx];
 
-        uint64_t g1 = slot->gen.load(std::memory_order_acquire);
-        if (g1 == 0 || (g1 & 1)) return false;
-        if (slot->key_len != k.size() ||
-            std::memcmp(slot->key, k.data(), k.size()) != 0 ||
-            slot->data_size != sz)
-            return false;
+    uint64_t g1 = entry.gen.load(std::memory_order_acquire);
+    if (g1 == 0 || (g1 & 1)) return false;
 
-        char* src = GetCacheSlotData(shm_base, hdr, idx);
-        std::memcpy(reinterpret_cast<void*>(d), src, sz);
+    if (entry.key_len != key.size() ||
+        std::memcmp(entry.key, key.data(), key.size()) != 0 ||
+        entry.data_size != size)
+        return false;
 
-        uint64_t g2 = slot->gen.load(std::memory_order_acquire);
-        return g1 == g2;
-    };
+    uint64_t ring_off = entry.ring_offset;
 
-    uint32_t base = CacheSlotIndex(key.data(),
-                                   static_cast<uint32_t>(key.size()), ns);
+    uint64_t wp = ctrl->write_pos.load(std::memory_order_acquire);
+    if (wp - ring_off > ctrl->capacity) return false;
 
-    if (size <= cap)
-        return read_slot_at(base, key, dst, size);
+    const char* ring_data = GetCacheRingData(shm_.Base(), hdr);
+    uint64_t cap = ctrl->capacity;
+    size_t off = static_cast<size_t>(ring_off % cap);
+    auto* out = reinterpret_cast<char*>(dst);
 
-    // Chunked read: contiguous slots from base
-    size_t remaining = size;
-    uintptr_t out = dst;
-    for (uint32_t ci = 0; remaining > 0; ++ci) {
-        size_t chunk_sz = std::min(cap, remaining);
-        std::string ck = key + ":c" + std::to_string(ci);
-        uint32_t idx = (base + ci) % ns;
-        if (!read_slot_at(idx, ck, out, chunk_sz))
-            return false;
-        out += chunk_sz;
-        remaining -= chunk_sz;
+    if (off + size <= cap) {
+        std::memcpy(out, ring_data + off, size);
+    } else {
+        size_t first = static_cast<size_t>(cap - off);
+        std::memcpy(out, ring_data + off, first);
+        std::memcpy(out + first, ring_data, size - first);
     }
+
+    uint64_t g2 = entry.gen.load(std::memory_order_acquire);
+    if (g1 != g2) return false;
+
+    uint64_t wp2 = ctrl->write_pos.load(std::memory_order_acquire);
+    if (wp2 - ring_off > ctrl->capacity) return false;
+
     return true;
 }
 
