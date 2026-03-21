@@ -47,8 +47,16 @@
 using namespace umbp::proxy;
 
 static std::atomic<bool> g_running{true};
+static std::string g_shm_name;
 
 static void signal_handler(int) { g_running.store(false, std::memory_order_relaxed); }
+
+static void atexit_cleanup() {
+#ifdef __linux__
+    if (!g_shm_name.empty())
+        ProxyShmRegion::CleanupStale(g_shm_name);
+#endif
+}
 
 // ---------------------------------------------------------------------------
 // Process a single non-batch request
@@ -471,6 +479,10 @@ int main(int argc, char** argv) {
                 "spdk_proxy: UMBP_SPDK_NVME_PCI or UMBP_SPDK_BDEV required\n");
         return 1;
     }
+
+    // Register atexit cleanup so SHM is removed even on unexpected exit()
+    g_shm_name = shm_name;
+    std::atexit(atexit_cleanup);
 
     // Step 1: Create shared memory
     ProxyShmRegion shm;

@@ -254,6 +254,10 @@ LocalStorageManager::~LocalStorageManager() {
       waitpid(proxy_child_pid_, nullptr, 0);
     }
     proxy_child_pid_ = -1;
+
+    // Safety net: always remove SHM after proxy has exited.
+    // Covers kill -9 on daemon where it couldn't run its own shm_unlink.
+    umbp::proxy::ProxyShmRegion::CleanupStale(proxy_shm_name_);
   }
 #endif
 }
