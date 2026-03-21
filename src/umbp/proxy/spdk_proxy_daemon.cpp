@@ -291,17 +291,28 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, ProxyCache& cache,
             sizes[i] = e.data_size;
             shm_offsets[i] = e.data_offset;
         }
+        // Start async cache population BEFORE NVMe write so memcpy to
+        // cache runs in parallel with DMA streaming to NVMe.
+        // The cache thread reads from SHM which is being written by the
+        // client via bytes_ready streaming — we wait for full data arrival
+        // inside the thread before copying each item.
+        std::thread cache_thread;
+        if (cache.enabled()) {
+            cache_thread = std::thread(
+                [&cache, &keys, &cptrs, &sizes, count, desc]() {
+                    uint64_t total = desc->total_data_size;
+                    while (desc->bytes_ready.load(std::memory_order_acquire) < total)
+                        ;  // spin until all data is in SHM
+                    for (uint32_t i = 0; i < count; ++i)
+                        cache.Put(keys[i], cptrs[i], sizes[i]);
+                });
+        }
+
         auto results = tier.BatchWriteStreaming(
             keys, cptrs, sizes, &desc->bytes_ready, shm_offsets,
             dma_bufs, dma_count);
 
-        // Write-through: cache every successfully written item
-        if (cache.enabled()) {
-            for (uint32_t i = 0; i < count; ++i) {
-                if (results[i])
-                    cache.Put(keys[i], cptrs[i], sizes[i]);
-            }
-        }
+        if (cache_thread.joinable()) cache_thread.join();
 
         for (uint32_t i = 0; i < count; ++i)
             desc->entries[i].result = results[i] ? 1 : 0;
