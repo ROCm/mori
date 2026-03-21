@@ -62,6 +62,10 @@ static const SizeSpec kSpecs[] = {
     {128ULL * 1024 * 1024, 4},
     {256ULL * 1024 * 1024, 2},
     {512ULL * 1024 * 1024, 2},
+    // Single-item tests: real-world scenario (one large KV per Prefill/Decode)
+    // No cross-item collision → validates true ShmCache chunking performance.
+    {288ULL * 1024 * 1024, 1},
+    {512ULL * 1024 * 1024, 1},
 };
 
 struct BenchResult {
