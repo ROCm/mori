@@ -208,17 +208,24 @@ struct RankDmaPool {
 };
 
 static void AllocRankDmaPools(RankDmaPool* pools, int max_ranks) {
+    // Scale per-rank buffer count so total DMA stays within ~2GB budget
+    static constexpr int kTotalDmaBudget = 1024;
+    int per_rank = std::min(kDmaBufsPerRank,
+                            std::max(16, kTotalDmaBudget / std::max(1, max_ranks)));
+
     auto& env = umbp::SpdkEnv::Instance();
     for (int r = 0; r < max_ranks; ++r) {
-        pools[r].bufs = new void*[kDmaBufsPerRank];
-        int got = env.DmaPoolAllocBatch(pools[r].bufs, kDmaBufSize, kDmaBufsPerRank);
+        pools[r].bufs = new void*[per_rank];
+        int got = env.DmaPoolAllocBatch(pools[r].bufs, kDmaBufSize, per_rank);
         pools[r].count = got;
-        if (got < kDmaBufsPerRank) {
-            for (int i = got; i < kDmaBufsPerRank; ++i) pools[r].bufs[i] = nullptr;
+        if (got < per_rank) {
+            for (int i = got; i < per_rank; ++i) pools[r].bufs[i] = nullptr;
+            if (got == 0)
+                UMBP_LOG_WARN("spdk_proxy: rank %d: 0 DMA bufs allocated!", r);
         }
     }
     UMBP_LOG_INFO("spdk_proxy: allocated %d DMA bufs/rank × %d ranks (%zuMB each)",
-                  kDmaBufsPerRank, max_ranks, kDmaBufSize / (1024 * 1024));
+                  per_rank, max_ranks, kDmaBufSize / (1024 * 1024));
 }
 
 static void FreeRankDmaPools(RankDmaPool* pools, int max_ranks) {

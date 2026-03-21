@@ -390,8 +390,6 @@ LocalStorageManager::LocalStorageManager(const UMBPConfig& config, BlockIndexCli
       }
 
       if (should_spawn) {
-        if (config_.spdk_proxy_rank_id == kAutoRankId)
-          config_.spdk_proxy_rank_id = 0;
         SpawnProxyDaemon();
       }
 
