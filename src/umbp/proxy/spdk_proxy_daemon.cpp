@@ -699,8 +699,10 @@ int main(int argc, char** argv) {
     g_shm_name = shm_name;
     std::atexit(atexit_cleanup);
 
-    // SHM shared cache: direct-mapped, seqlock per slot, default 2MB/slot
-    static constexpr size_t kDefaultCacheSlotSize = 2ULL * 1024 * 1024;
+    // SHM shared cache: direct-mapped, seqlock per slot.
+    // Slot total = 2MB data capacity + 4KB metadata so that 2MB items fit.
+    static constexpr size_t kDefaultCacheSlotSize =
+        2ULL * 1024 * 1024 + umbp::proxy::kCacheSlotMetaSize;
     size_t shm_cache_mb = getenv_size("UMBP_SPDK_PROXY_CACHE_MB", 8192);
     size_t cache_slot_sz = kDefaultCacheSlotSize;
     uint32_t cache_slots = (shm_cache_mb > 0)
