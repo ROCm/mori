@@ -125,6 +125,41 @@ public:
         return true;
     }
 
+    // Streaming version: copies in 2MB chunks, updating bytes_done and
+    // items_done atomics so the client can overlap SHM→user memcpy with
+    // the daemon's cache→SHM memcpy.
+    bool BatchGetStreaming(const std::vector<std::string>& keys,
+                           const std::vector<void*>& dsts,
+                           const std::vector<size_t>& sizes,
+                           std::atomic<uint64_t>* bytes_done,
+                           std::atomic<uint32_t>* items_done) {
+        if (!enabled()) return false;
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            auto it = index_.find(keys[i]);
+            if (it == index_.end() || it->second->data.size() != sizes[i])
+                return false;
+        }
+        constexpr size_t kChunk = 2ULL * 1024 * 1024;
+        size_t total = 0;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            const char* src = index_.at(keys[i])->data.data();
+            char* dst = static_cast<char*>(dsts[i]);
+            size_t sz = sizes[i];
+            for (size_t off = 0; off < sz; off += kChunk) {
+                size_t chunk = std::min(kChunk, sz - off);
+                std::memcpy(dst + off, src + off, chunk);
+                total += chunk;
+                if (bytes_done)
+                    bytes_done->store(total, std::memory_order_release);
+            }
+            if (items_done)
+                items_done->store(static_cast<uint32_t>(i + 1),
+                                  std::memory_order_release);
+        }
+        return true;
+    }
+
     bool Get(const std::string& key, void* dst, size_t size) {
         if (!enabled()) return false;
         std::shared_lock<std::shared_mutex> lk(mu_);
@@ -331,11 +366,15 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, ProxyCache& cache,
             sizes[i] = e.data_size;
         }
 
-        if (cache.BatchGet(keys, dst_ptrs, sizes)) {
-            // All keys served from memory cache — skip NVMe entirely
+        desc->bytes_done.store(0, std::memory_order_relaxed);
+        desc->items_done.store(0, std::memory_order_relaxed);
+
+        if (cache.BatchGetStreaming(keys, dst_ptrs, sizes,
+                                     &desc->bytes_done, &desc->items_done)) {
+            // All keys served from cache with streaming — client can overlap
+            // its SHM→user memcpy with our cache→SHM memcpy via bytes_done.
             for (uint32_t i = 0; i < count; ++i)
                 desc->entries[i].result = 1;
-            desc->items_done.store(count, std::memory_order_release);
             desc->bytes_done.store(desc->total_data_size,
                                    std::memory_order_release);
         } else {
