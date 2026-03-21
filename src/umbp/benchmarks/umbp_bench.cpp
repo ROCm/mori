@@ -287,6 +287,9 @@ int main(int argc, char** argv) {
         if (!ok) failures++;
     }
 
+    printf("\n=== %d/%d ranks completed successfully ===\n",
+           num_ranks - failures, num_ranks);
+
     // Determine role/backend from environment for display
     auto cfg = UMBPConfig::FromEnvironment();
     const char* backend = cfg.ssd_backend.c_str();
@@ -299,9 +302,6 @@ int main(int argc, char** argv) {
             printf("\n[rank %d] FAILED (no results)\n", rr.rank_id);
         }
     }
-
-    printf("\n=== %d/%d ranks completed successfully ===\n",
-           num_ranks - failures, num_ranks);
     return failures > 0 ? 1 : 0;
 #else
     fprintf(stderr, "Multi-rank mode requires Linux\n");
