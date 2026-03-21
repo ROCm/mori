@@ -78,8 +78,12 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id,
     std::vector<std::vector<char>> datas(count);
     std::vector<size_t> sizes(count, value_size);
 
+    // Derive a per-session seed so the pattern changes every run
+    uint32_t seed = 0;
+    for (char c : session) seed = seed * 31 + static_cast<uint8_t>(c);
+
     for (int i = 0; i < count; ++i)
-        datas[i].resize(value_size, static_cast<char>((i + 1) & 0xFF));
+        datas[i].resize(value_size, static_cast<char>((seed + i + 1) & 0xFF));
 
     double total_bytes = static_cast<double>(value_size) * count;
 
@@ -148,9 +152,10 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id,
         if (iter == 0) {
             for (int i = 0; i < count; ++i) {
                 if (!rr[i]) continue;
-                char expected = static_cast<char>((i + 1) & 0xFF);
+                char expected = static_cast<char>((seed + i + 1) & 0xFF);
                 const char* buf = read_bufs[i].data();
                 if (buf[0] != expected ||
+                    buf[value_size / 2] != expected ||
                     buf[value_size - 1] != expected) {
                     ++corrupt;
                     if (corrupt <= 3)
