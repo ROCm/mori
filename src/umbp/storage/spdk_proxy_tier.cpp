@@ -638,7 +638,8 @@ bool SpdkProxyTier::HeapCacheGet(const std::string& key,
 
 // ---------------------------------------------------------------------------
 // Per-item ShmCache read — seqlock protocol, returns true on hit.
-// Items > slot capacity are read as chunked entries ("key:c0", "key:c1", ...).
+// Items > slot capacity are read as chunked entries at contiguous slots
+// starting from hash(original_key), matching the write-side layout.
 // ---------------------------------------------------------------------------
 bool SpdkProxyTier::TryShmCacheReadOne(const std::string& key,
                                         uintptr_t dst, size_t size) const {
@@ -647,14 +648,13 @@ bool SpdkProxyTier::TryShmCacheReadOne(const std::string& key,
     auto* hdr = shm_.Header();
     if (hdr->cache_num_slots == 0) return false;
     size_t cap = CacheSlotDataCapacity(hdr);
+    uint32_t ns = hdr->cache_num_slots;
 
-    void* base = shm_.Base();
+    void* shm_base = shm_.Base();
 
-    auto read_slot = [&](const std::string& k, uintptr_t d, size_t sz) -> bool {
-        uint32_t idx = CacheSlotIndex(k.data(),
-                                      static_cast<uint32_t>(k.size()),
-                                      hdr->cache_num_slots);
-        auto* slot = GetCacheSlot(base, hdr, idx);
+    auto read_slot_at = [&](uint32_t idx, const std::string& k,
+                            uintptr_t d, size_t sz) -> bool {
+        auto* slot = GetCacheSlot(shm_base, hdr, idx);
 
         uint64_t g1 = slot->gen.load(std::memory_order_acquire);
         if (g1 == 0 || (g1 & 1)) return false;
@@ -663,23 +663,27 @@ bool SpdkProxyTier::TryShmCacheReadOne(const std::string& key,
             slot->data_size != sz)
             return false;
 
-        char* src = GetCacheSlotData(base, hdr, idx);
+        char* src = GetCacheSlotData(shm_base, hdr, idx);
         std::memcpy(reinterpret_cast<void*>(d), src, sz);
 
         uint64_t g2 = slot->gen.load(std::memory_order_acquire);
         return g1 == g2;
     };
 
-    if (size <= cap)
-        return read_slot(key, dst, size);
+    uint32_t base = CacheSlotIndex(key.data(),
+                                   static_cast<uint32_t>(key.size()), ns);
 
-    // Chunked read: reassemble from "key:c0", "key:c1", ...
+    if (size <= cap)
+        return read_slot_at(base, key, dst, size);
+
+    // Chunked read: contiguous slots from base
     size_t remaining = size;
     uintptr_t out = dst;
     for (uint32_t ci = 0; remaining > 0; ++ci) {
         size_t chunk_sz = std::min(cap, remaining);
         std::string ck = key + ":c" + std::to_string(ci);
-        if (!read_slot(ck, out, chunk_sz))
+        uint32_t idx = (base + ci) % ns;
+        if (!read_slot_at(idx, ck, out, chunk_sz))
             return false;
         out += chunk_sz;
         remaining -= chunk_sz;
