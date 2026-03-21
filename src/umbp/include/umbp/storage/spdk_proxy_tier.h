@@ -78,6 +78,14 @@ class SpdkProxyTier : public TierBackend {
     // Check if the proxy daemon is still alive by examining its heartbeat.
     bool IsProxyAlive() const;
 
+    // BATCH_READ variant that pipelines heap cache fill per-chunk during
+    // streaming reads (data is L2-hot right after SHM→user copy).
+    std::vector<bool> SubmitBatchWithCacheFill(
+        const std::vector<std::string>& keys,
+        const std::vector<uintptr_t>& dst_ptrs,
+        const std::vector<size_t>& sizes,
+        const std::vector<std::unique_ptr<char[]>>& heap_bufs) const;
+
     // Per-item ShmCache read — seqlock, returns true on hit.
     bool TryShmCacheReadOne(const std::string& key, uintptr_t dst, size_t size) const;
 
