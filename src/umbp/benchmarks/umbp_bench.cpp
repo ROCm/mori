@@ -497,10 +497,8 @@ int main(int argc, char** argv) {
            num_ranks - failures, num_ranks);
 
     auto cfg = UMBPConfig::FromEnvironment();
-    UMBPRole resolved_role = cfg.ResolveRole();
     const char* backend = cfg.ssd_backend.c_str();
-    bool is_phased = (resolved_role == UMBPRole::SharedSSDLeader ||
-                      resolved_role == UMBPRole::SharedSSDFollower);
+    bool is_phased = (cfg.ssd_backend == "spdk" && num_ranks > 1);
 
     for (auto& rr : all_results) {
         const char* role_str;

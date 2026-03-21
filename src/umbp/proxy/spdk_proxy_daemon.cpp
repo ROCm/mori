@@ -232,8 +232,17 @@ static void ProcessBatchRequest(SpdkSsdTier& tier,
 
             shm_cache_thread.join();
 
-            for (uint32_t i = 0; i < count; ++i)
+            int write_ok = 0;
+            for (uint32_t i = 0; i < count; ++i) {
                 desc->entries[i].result = results[i] ? 1 : 0;
+                if (results[i]) ++write_ok;
+            }
+            if (write_ok < static_cast<int>(count)) {
+                auto [used, total] = tier.Capacity();
+                UMBP_LOG_WARN("spdk_proxy: BATCH_WRITE %u keys — only %d succeeded "
+                              "(cap %zuMB/%zuMB)",
+                              count, write_ok, used / (1024*1024), total / (1024*1024));
+            }
         }
     } else {
         // BATCH_READ — NVMe streaming read + ShmCache back-fill
@@ -265,8 +274,20 @@ static void ProcessBatchRequest(SpdkSsdTier& tier,
             dma_bufs, dma_count);
         desc->bytes_done.store(desc->total_data_size,
                                std::memory_order_release);
-        for (uint32_t i = 0; i < count; ++i)
+
+        int read_hits = 0;
+        for (uint32_t i = 0; i < count; ++i) {
             desc->entries[i].result = results[i] ? 1 : 0;
+            if (results[i]) ++read_hits;
+        }
+        if (read_hits == 0 && count > 0) {
+            auto [used, total] = tier.Capacity();
+            bool first_exists = tier.Exists(keys[0]);
+            UMBP_LOG_WARN("spdk_proxy: BATCH_READ %u keys — 0 NVMe hits! "
+                          "capacity=%zuMB/%zuMB exists('%s')=%d",
+                          count, used / (1024*1024), total / (1024*1024),
+                          keys[0].substr(0, 64).c_str(), first_exists);
+        }
 
         // Read-back-fill: populate ShmCache so subsequent reads by other
         // ranks can hit the SHM shared cache directly.
