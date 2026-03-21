@@ -19,6 +19,7 @@
 #include "umbp/common/log.h"
 
 #ifdef __linux__
+#include <csignal>
 #include <unistd.h>
 #endif
 
@@ -71,6 +72,21 @@ SpdkProxyTier::SpdkProxyTier(const UMBPConfig& config)
                 rank_id_ = r;
                 break;
             }
+#ifdef __linux__
+            // Slot occupied — reclaim if the owning process is dead
+            if (expected > 0 && kill(static_cast<pid_t>(expected), 0) != 0) {
+                if (ch->owner_pid.compare_exchange_strong(
+                        expected, my_pid, std::memory_order_acq_rel)) {
+                    ch->connected = 0;
+                    ch->head.store(0, std::memory_order_relaxed);
+                    ch->tail.store(0, std::memory_order_relaxed);
+                    rank_id_ = r;
+                    UMBP_LOG_WARN("SpdkProxyTier: reclaimed dead slot %u (pid %u)",
+                                  r, expected);
+                    break;
+                }
+            }
+#endif
         }
         if (rank_id_ == kAutoRankId) {
             UMBP_LOG_ERROR("SpdkProxyTier: all %u rank slots occupied",
@@ -136,6 +152,21 @@ bool SpdkProxyTier::WaitForProxy(const std::string& shm_name, int timeout_ms) {
             auto* hdr = probe.Header();
             uint32_t st = hdr->state.load(std::memory_order_acquire);
             if (st == static_cast<uint32_t>(ProxyState::READY)) {
+#ifdef __linux__
+                uint32_t ppid = hdr->proxy_pid.load(std::memory_order_relaxed);
+                if (ppid > 0 && kill(static_cast<pid_t>(ppid), 0) != 0) {
+                    probe.Detach();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    auto elapsed = std::chrono::steady_clock::now() - start;
+                    if (std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+                            >= timeout_ms) {
+                        UMBP_LOG_ERROR("SpdkProxyTier: timed out — proxy pid %u is dead (stale SHM)",
+                                       ppid);
+                        return false;
+                    }
+                    continue;
+                }
+#endif
                 return true;
             }
             if (st == static_cast<uint32_t>(ProxyState::ERROR)) {
