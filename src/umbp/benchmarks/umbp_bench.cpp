@@ -16,6 +16,7 @@
 // The benchmark writes directly to SSD tier to measure disk I/O bandwidth,
 // bypassing the DRAM cache layer.
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
