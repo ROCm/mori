@@ -632,7 +632,7 @@ int main(int argc, char** argv) {
     int max_ranks = getenv_int("UMBP_SPDK_PROXY_MAX_RANKS", 8);
     size_t data_per_rank_mb = getenv_size("UMBP_SPDK_PROXY_DATA_MB", 2048);
     size_t data_per_rank = data_per_rank_mb * 1024 * 1024;
-    size_t cache_mb = getenv_size("UMBP_SPDK_PROXY_CACHE_MB", 4096);
+    size_t cache_mb = getenv_size("UMBP_SPDK_PROXY_CACHE_MB", 8192);
 
     if (nvme_pci.empty() && bdev_name.empty()) {
         fprintf(stderr,
