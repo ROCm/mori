@@ -145,16 +145,11 @@ static void atexit_cleanup() {
 }
 
 // ---------------------------------------------------------------------------
-// Write a key/value into the SHM shared cache (seqlock-protected).
-// Items larger than the slot data capacity are silently skipped.
+// Write a single ≤cap item into one SHM cache slot (seqlock-protected).
 // ---------------------------------------------------------------------------
-static void WriteShmCache(ProxyShmRegion& shm, const std::string& key,
-                          const void* data, size_t size) {
+static void WriteShmCacheSlot(ProxyShmRegion& shm, const std::string& key,
+                              const void* data, size_t size) {
     auto* hdr = shm.Header();
-    if (hdr->cache_num_slots == 0) return;
-    size_t cap = CacheSlotDataCapacity(hdr);
-    if (size > cap || size == 0) return;
-
     uint32_t idx = CacheSlotIndex(key.data(),
                                   static_cast<uint32_t>(key.size()),
                                   hdr->cache_num_slots);
@@ -170,6 +165,35 @@ static void WriteShmCache(ProxyShmRegion& shm, const std::string& key,
     std::memcpy(slot_data, data, size);
 
     slot->gen.store(old + 2, std::memory_order_release);          // even → stable
+}
+
+// ---------------------------------------------------------------------------
+// Write a key/value into the SHM shared cache.
+// Items ≤ slot capacity go into a single slot.
+// Larger items are transparently chunked into ≤cap pieces with keys
+// "original_key:c0", "original_key:c1", etc.
+// ---------------------------------------------------------------------------
+static void WriteShmCache(ProxyShmRegion& shm, const std::string& key,
+                          const void* data, size_t size) {
+    auto* hdr = shm.Header();
+    if (hdr->cache_num_slots == 0 || size == 0) return;
+    size_t cap = CacheSlotDataCapacity(hdr);
+
+    if (size <= cap) {
+        WriteShmCacheSlot(shm, key, data, size);
+        return;
+    }
+
+    const char* src = static_cast<const char*>(data);
+    size_t remaining = size;
+    for (uint32_t ci = 0; remaining > 0; ++ci) {
+        size_t chunk_sz = std::min(cap, remaining);
+        std::string ck = key + ":c" + std::to_string(ci);
+        if (ck.size() > kMaxKeyLen) return;
+        WriteShmCacheSlot(shm, ck, src, chunk_sz);
+        src += chunk_sz;
+        remaining -= chunk_sz;
+    }
 }
 
 // ---------------------------------------------------------------------------

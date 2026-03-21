@@ -638,33 +638,53 @@ bool SpdkProxyTier::HeapCacheGet(const std::string& key,
 
 // ---------------------------------------------------------------------------
 // Per-item ShmCache read — seqlock protocol, returns true on hit.
+// Items > slot capacity are read as chunked entries ("key:c0", "key:c1", ...).
 // ---------------------------------------------------------------------------
 bool SpdkProxyTier::TryShmCacheReadOne(const std::string& key,
                                         uintptr_t dst, size_t size) const {
+    using namespace umbp::proxy;
     if (!connected_) return false;
     auto* hdr = shm_.Header();
     if (hdr->cache_num_slots == 0) return false;
     size_t cap = CacheSlotDataCapacity(hdr);
-    if (size > cap) return false;
 
     void* base = shm_.Base();
-    uint32_t idx = CacheSlotIndex(key.data(),
-                                  static_cast<uint32_t>(key.size()),
-                                  hdr->cache_num_slots);
-    auto* slot = GetCacheSlot(base, hdr, idx);
 
-    uint64_t g1 = slot->gen.load(std::memory_order_acquire);
-    if (g1 == 0 || (g1 & 1)) return false;
-    if (slot->key_len != key.size() ||
-        std::memcmp(slot->key, key.data(), key.size()) != 0 ||
-        slot->data_size != size)
-        return false;
+    auto read_slot = [&](const std::string& k, uintptr_t d, size_t sz) -> bool {
+        uint32_t idx = CacheSlotIndex(k.data(),
+                                      static_cast<uint32_t>(k.size()),
+                                      hdr->cache_num_slots);
+        auto* slot = GetCacheSlot(base, hdr, idx);
 
-    char* src = GetCacheSlotData(base, hdr, idx);
-    std::memcpy(reinterpret_cast<void*>(dst), src, size);
+        uint64_t g1 = slot->gen.load(std::memory_order_acquire);
+        if (g1 == 0 || (g1 & 1)) return false;
+        if (slot->key_len != k.size() ||
+            std::memcmp(slot->key, k.data(), k.size()) != 0 ||
+            slot->data_size != sz)
+            return false;
 
-    uint64_t g2 = slot->gen.load(std::memory_order_acquire);
-    return g1 == g2;
+        char* src = GetCacheSlotData(base, hdr, idx);
+        std::memcpy(reinterpret_cast<void*>(d), src, sz);
+
+        uint64_t g2 = slot->gen.load(std::memory_order_acquire);
+        return g1 == g2;
+    };
+
+    if (size <= cap)
+        return read_slot(key, dst, size);
+
+    // Chunked read: reassemble from "key:c0", "key:c1", ...
+    size_t remaining = size;
+    uintptr_t out = dst;
+    for (uint32_t ci = 0; remaining > 0; ++ci) {
+        size_t chunk_sz = std::min(cap, remaining);
+        std::string ck = key + ":c" + std::to_string(ci);
+        if (!read_slot(ck, out, chunk_sz))
+            return false;
+        out += chunk_sz;
+        remaining -= chunk_sz;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
