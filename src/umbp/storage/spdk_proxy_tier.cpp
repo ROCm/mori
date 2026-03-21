@@ -439,21 +439,10 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(
 
         } else {
             // STREAMING READ: copy data in 2MB chunks using bytes_done.
-            // If daemon placed data in ring buffer (ring_data_base != 0),
-            // read from ring; otherwise read from data_region.
+            // read_base is resolved lazily after the first bytes_done
+            // acquire to avoid racing with daemon's ring_data_base write.
             constexpr size_t kReadChunk = 2ULL * 1024 * 1024;
-
-            char* read_base = data_base;
-            if (desc->ring_data_base != 0) {
-                auto* hdr = shm_.Header();
-                auto* ctrl = GetCacheRingControl(shm_.Base(), hdr);
-                if (ctrl) {
-                    char* ring_data = GetCacheRingData(shm_.Base(), hdr);
-                    uint64_t cap = ctrl->capacity;
-                    read_base = ring_data +
-                        static_cast<size_t>(desc->ring_data_base % cap);
-                }
-            }
+            char* read_base = nullptr;
 
             int current_item = 0;
             size_t item_copied = 0;
@@ -466,7 +455,6 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(
 
                 if (!dst_ptrs.empty() && item_sz > 0) {
                     char* dst = reinterpret_cast<char*>(dst_ptrs[gi]);
-                    char* src = read_base + entry.data_offset;
 
                     while (item_copied < item_sz) {
                         size_t want = std::min(kReadChunk, item_sz - item_copied);
@@ -475,6 +463,26 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(
                             std::memory_order_acquire);
 
                         if (bd >= need) {
+                            if (!read_base) {
+                                if (desc->ring_data_base != 0) {
+                                    auto* hdr = shm_.Header();
+                                    auto* ctrl = GetCacheRingControl(
+                                        shm_.Base(), hdr);
+                                    if (ctrl) {
+                                        char* rd = GetCacheRingData(
+                                            shm_.Base(), hdr);
+                                        uint64_t cap = ctrl->capacity;
+                                        read_base = rd +
+                                            static_cast<size_t>(
+                                                desc->ring_data_base % cap);
+                                    } else {
+                                        read_base = data_base;
+                                    }
+                                } else {
+                                    read_base = data_base;
+                                }
+                            }
+                            char* src = read_base + entry.data_offset;
                             std::memcpy(dst + item_copied, src + item_copied,
                                         want);
                             item_copied += want;
