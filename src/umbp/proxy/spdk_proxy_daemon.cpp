@@ -210,7 +210,10 @@ static void ProcessSingleRequest(SpdkSsdTier& tier, ProxyCache& cache,
             bool ok = tier.ReadIntoPtr(key, dst, max_read);
             slot.result = ok ? static_cast<int32_t>(ResultCode::OK)
                              : static_cast<int32_t>(ResultCode::NOT_FOUND);
-            if (ok) slot.result_size = max_read;
+            if (ok) {
+                slot.result_size = max_read;
+                cache.Put(key, data_region, max_read);
+            }
             break;
         }
         case RequestType::EXISTS: {
@@ -355,6 +358,15 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, ProxyCache& cache,
                                    std::memory_order_release);
             for (uint32_t i = 0; i < count; ++i)
                 desc->entries[i].result = results[i] ? 1 : 0;
+
+            // Read-back-fill: cache data that was just read from NVMe so
+            // subsequent reads by other ranks hit the cache.
+            if (cache.enabled()) {
+                for (uint32_t i = 0; i < count; ++i) {
+                    if (results[i])
+                        cache.Put(keys[i], dst_ptrs[i], sizes[i]);
+                }
+            }
         }
     }
 
