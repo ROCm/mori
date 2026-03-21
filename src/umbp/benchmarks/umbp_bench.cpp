@@ -379,7 +379,11 @@ static int RunBenchmarkProcess(int rank_id, int num_ranks, int pipe_fd,
 
 #ifdef __linux__
     auto* coord = static_cast<BenchCoord*>(coord_ptr);
-    if (coord) {
+    // SPDK Leader/Follower: phased mode (Leader writes → barrier → all read same data)
+    // POSIX / Standalone:   per-rank mode (each rank writes and reads independently)
+    bool use_phased = coord && (role == UMBPRole::SharedSSDLeader ||
+                                role == UMBPRole::SharedSSDFollower);
+    if (use_phased) {
         for (size_t s = 0; s < sizeof(kSpecs) / sizeof(kSpecs[0]); ++s)
             results.push_back(RunBatchPhased(client, rank_id, kSpecs[s].size,
                                               kSpecs[s].count, iterations,
@@ -493,10 +497,17 @@ int main(int argc, char** argv) {
            num_ranks - failures, num_ranks);
 
     auto cfg = UMBPConfig::FromEnvironment();
+    UMBPRole resolved_role = cfg.ResolveRole();
     const char* backend = cfg.ssd_backend.c_str();
+    bool is_phased = (resolved_role == UMBPRole::SharedSSDLeader ||
+                      resolved_role == UMBPRole::SharedSSDFollower);
 
     for (auto& rr : all_results) {
-        const char* role_str = (rr.rank_id == 0) ? "Leader" : "Follower";
+        const char* role_str;
+        if (is_phased)
+            role_str = (rr.rank_id == 0) ? "Leader" : "Follower";
+        else
+            role_str = "Standalone";
         if (rr.ok && !rr.results.empty()) {
             PrintResults(rr.rank_id, num_ranks, role_str, backend, rr.results);
         } else {
@@ -504,17 +515,26 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Aggregate: write = Leader only, read = sum of all ranks
     size_t num_specs = sizeof(kSpecs) / sizeof(kSpecs[0]);
-    printf("\n========================================================\n");
-    printf(" AGGREGATE (Leader write / %d-rank concurrent read)\n", num_ranks);
-    printf("========================================================\n");
+    if (is_phased) {
+        printf("\n========================================================\n");
+        printf(" AGGREGATE (Leader write / %d-rank concurrent read)\n", num_ranks);
+        printf("========================================================\n");
+    } else {
+        printf("\n========================================================\n");
+        printf(" AGGREGATE (sum of %d independent ranks)\n", num_ranks);
+        printf("========================================================\n");
+    }
     printf("  %8s  %10s  %10s\n", "ValSize", "Write MB/s", "Read MB/s");
     for (size_t s = 0; s < num_specs; ++s) {
-        double leader_w = 0, sum_r = 0;
+        double sum_w = 0, sum_r = 0;
         for (auto& rr : all_results) {
             if (!rr.ok || s >= rr.results.size()) continue;
-            if (rr.rank_id == 0) leader_w = rr.results[s].write_mbps;
+            if (is_phased) {
+                if (rr.rank_id == 0) sum_w = rr.results[s].write_mbps;
+            } else {
+                sum_w += rr.results[s].write_mbps;
+            }
             sum_r += rr.results[s].read_mbps;
         }
         char sz_label[16];
@@ -524,7 +544,7 @@ int main(int argc, char** argv) {
         else
             snprintf(sz_label, sizeof(sz_label), "%zuKB",
                      kSpecs[s].size / 1024);
-        printf("  %8s  %10.0f  %10.0f\n", sz_label, leader_w, sum_r);
+        printf("  %8s  %10.0f  %10.0f\n", sz_label, sum_w, sum_r);
     }
     fflush(stdout);
 
