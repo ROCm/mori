@@ -5,6 +5,11 @@
 // Rank processes communicate via POSIX shared memory (hugepage-backed for
 // zero-copy DMA when available).
 //
+// Write-through cache: data written to NVMe is also kept in host memory.
+// Subsequent reads by other ranks (e.g. Decode workers reading KV cache
+// produced by Prefill) are served from memory at ~12 GB/s instead of NVMe.
+// Controlled by UMBP_SPDK_PROXY_CACHE_MB (default 4096, 0 = disabled).
+//
 // Self-managed lifecycle:
 //   - Stores proxy_pid in SHM header for liveness detection.
 //   - Updates proxy_heartbeat_ms ~every 500ms so clients detect crashes.
@@ -24,8 +29,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <list>
+#include <shared_mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -59,9 +67,120 @@ static void atexit_cleanup() {
 }
 
 // ---------------------------------------------------------------------------
+// Write-through read cache (1-write-N-read optimization).
+//
+// On BATCH_WRITE: data is written to NVMe AND cached in host memory.
+// On BATCH_READ:  if ALL keys hit cache, serve from memory (skip NVMe).
+//                 Otherwise fall through to NVMe for the entire batch.
+//
+// Uses std::shared_mutex so multiple readers (Decode ranks) can read the
+// cache concurrently without blocking each other.  Only writes need exclusive
+// access, and writes only happen during the write phase (single Leader rank).
+// ---------------------------------------------------------------------------
+class ProxyCache {
+public:
+    explicit ProxyCache(size_t max_bytes) : max_bytes_(max_bytes) {}
+
+    bool enabled() const { return max_bytes_ > 0; }
+
+    void Put(const std::string& key, const void* data, size_t size) {
+        if (!enabled() || size == 0) return;
+        std::unique_lock<std::shared_mutex> lk(mu_);
+
+        auto it = index_.find(key);
+        if (it != index_.end()) {
+            total_bytes_ -= it->second->data.size();
+            fifo_.erase(it->second);
+            index_.erase(it);
+        }
+
+        while (total_bytes_ + size > max_bytes_ && !fifo_.empty()) {
+            auto& oldest = fifo_.front();
+            total_bytes_ -= oldest.data.size();
+            index_.erase(oldest.key);
+            fifo_.pop_front();
+        }
+        if (size > max_bytes_) return;
+
+        fifo_.push_back({key, {static_cast<const char*>(data),
+                               static_cast<const char*>(data) + size}});
+        index_[key] = std::prev(fifo_.end());
+        total_bytes_ += size;
+    }
+
+    // Returns true iff ALL keys are present with matching sizes.
+    // On success, copies all data to dsts[].
+    bool BatchGet(const std::vector<std::string>& keys,
+                  const std::vector<void*>& dsts,
+                  const std::vector<size_t>& sizes) {
+        if (!enabled()) return false;
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            auto it = index_.find(keys[i]);
+            if (it == index_.end() || it->second->data.size() != sizes[i])
+                return false;
+        }
+        for (size_t i = 0; i < keys.size(); ++i)
+            std::memcpy(dsts[i], index_.at(keys[i])->data.data(), sizes[i]);
+        return true;
+    }
+
+    bool Get(const std::string& key, void* dst, size_t size) {
+        if (!enabled()) return false;
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        auto it = index_.find(key);
+        if (it == index_.end() || it->second->data.size() != size) return false;
+        std::memcpy(dst, it->second->data.data(), size);
+        return true;
+    }
+
+    void Evict(const std::string& key) {
+        if (!enabled()) return;
+        std::unique_lock<std::shared_mutex> lk(mu_);
+        auto it = index_.find(key);
+        if (it != index_.end()) {
+            total_bytes_ -= it->second->data.size();
+            fifo_.erase(it->second);
+            index_.erase(it);
+        }
+    }
+
+    void Clear() {
+        if (!enabled()) return;
+        std::unique_lock<std::shared_mutex> lk(mu_);
+        index_.clear();
+        fifo_.clear();
+        total_bytes_ = 0;
+    }
+
+    size_t TotalBytes() const {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        return total_bytes_;
+    }
+
+    size_t EntryCount() const {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        return index_.size();
+    }
+
+private:
+    struct Entry {
+        std::string key;
+        std::vector<char> data;
+    };
+
+    mutable std::shared_mutex mu_;
+    std::list<Entry> fifo_;
+    std::unordered_map<std::string, std::list<Entry>::iterator> index_;
+    size_t total_bytes_ = 0;
+    size_t max_bytes_;
+};
+
+// ---------------------------------------------------------------------------
 // Process a single non-batch request
 // ---------------------------------------------------------------------------
-static void ProcessSingleRequest(SpdkSsdTier& tier, RingSlot& slot,
+static void ProcessSingleRequest(SpdkSsdTier& tier, ProxyCache& cache,
+                                 RingSlot& slot,
                                  void* data_region, size_t region_size) {
     std::string key(slot.key, slot.key_len);
     auto type = static_cast<RequestType>(slot.type);
@@ -75,13 +194,19 @@ static void ProcessSingleRequest(SpdkSsdTier& tier, RingSlot& slot,
             bool ok = tier.Write(key, data_region, slot.data_size);
             slot.result = ok ? static_cast<int32_t>(ResultCode::OK)
                              : static_cast<int32_t>(ResultCode::NO_SPACE);
+            if (ok) cache.Put(key, data_region, slot.data_size);
             break;
         }
         case RequestType::READ: {
-            auto dst = reinterpret_cast<uintptr_t>(data_region);
             size_t max_read = std::min(static_cast<size_t>(slot.data_size),
                                        region_size);
             if (max_read == 0) max_read = region_size;
+            if (cache.Get(key, data_region, max_read)) {
+                slot.result = static_cast<int32_t>(ResultCode::OK);
+                slot.result_size = max_read;
+                break;
+            }
+            auto dst = reinterpret_cast<uintptr_t>(data_region);
             bool ok = tier.ReadIntoPtr(key, dst, max_read);
             slot.result = ok ? static_cast<int32_t>(ResultCode::OK)
                              : static_cast<int32_t>(ResultCode::NOT_FOUND);
@@ -95,12 +220,14 @@ static void ProcessSingleRequest(SpdkSsdTier& tier, RingSlot& slot,
             break;
         }
         case RequestType::EVICT: {
+            cache.Evict(key);
             bool ok = tier.Evict(key);
             slot.result = ok ? static_cast<int32_t>(ResultCode::OK)
                              : static_cast<int32_t>(ResultCode::NOT_FOUND);
             break;
         }
         case RequestType::CLEAR: {
+            cache.Clear();
             tier.Clear();
             slot.result = static_cast<int32_t>(ResultCode::OK);
             break;
@@ -133,16 +260,10 @@ static void ProcessSingleRequest(SpdkSsdTier& tier, RingSlot& slot,
 }
 
 // ---------------------------------------------------------------------------
-// Process a batch request.
-//
-// Read:  uses BatchReadIntoPtrStreaming — single pipeline call with per-item
-//        items_done signaling so client overlaps SHM→user copy with NVMe I/O.
-// Write: always uses BatchWriteStreaming with byte-level bytes_ready gating.
-//        Client copies data in 2MB chunks and updates bytes_ready; daemon
-//        starts NVMe writes as soon as each DMA chunk's data arrives in SHM.
-//        This gives full overlap even for single large items (e.g. 512MB×1).
+// Process a batch request with optional cache acceleration.
 // ---------------------------------------------------------------------------
-static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
+static void ProcessBatchRequest(SpdkSsdTier& tier, ProxyCache& cache,
+                                RingSlot& slot,
                                 void* data_region, size_t region_size,
                                 void** dma_bufs = nullptr, int dma_count = 0) {
     auto type = static_cast<RequestType>(slot.type);
@@ -173,31 +294,57 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, RingSlot& slot,
         auto results = tier.BatchWriteStreaming(
             keys, cptrs, sizes, &desc->bytes_ready, shm_offsets,
             dma_bufs, dma_count);
+
+        // Write-through: cache every successfully written item
+        if (cache.enabled()) {
+            for (uint32_t i = 0; i < count; ++i) {
+                if (results[i])
+                    cache.Put(keys[i], cptrs[i], sizes[i]);
+            }
+        }
+
         for (uint32_t i = 0; i < count; ++i)
             desc->entries[i].result = results[i] ? 1 : 0;
     } else {
+        // BATCH_READ — try cache first
         std::vector<std::string> keys(count);
-        std::vector<uintptr_t> dma_ptrs(count);
+        std::vector<void*> dst_ptrs(count);
         std::vector<size_t> sizes(count);
-        std::vector<size_t> shm_offsets(count);
         for (uint32_t i = 0; i < count; ++i) {
             auto& e = desc->entries[i];
             keys[i] = std::string(e.key, e.key_len);
-            dma_ptrs[i] = reinterpret_cast<uintptr_t>(
-                data_base + e.data_offset);
+            dst_ptrs[i] = static_cast<void*>(data_base + e.data_offset);
             sizes[i] = e.data_size;
-            shm_offsets[i] = e.data_offset;
         }
 
-        desc->bytes_done.store(0, std::memory_order_relaxed);
-        auto results = tier.BatchReadIntoPtrStreaming(
-            keys, dma_ptrs, sizes, &desc->items_done,
-            &desc->bytes_done, &shm_offsets,
-            dma_bufs, dma_count);
-        desc->bytes_done.store(desc->total_data_size,
-                               std::memory_order_release);
-        for (uint32_t i = 0; i < count; ++i)
-            desc->entries[i].result = results[i] ? 1 : 0;
+        if (cache.BatchGet(keys, dst_ptrs, sizes)) {
+            // All keys served from memory cache — skip NVMe entirely
+            for (uint32_t i = 0; i < count; ++i)
+                desc->entries[i].result = 1;
+            desc->items_done.store(count, std::memory_order_release);
+            desc->bytes_done.store(desc->total_data_size,
+                                   std::memory_order_release);
+        } else {
+            // Cache miss — fall through to NVMe streaming read
+            std::vector<uintptr_t> dma_ptrs(count);
+            std::vector<size_t> shm_offsets(count);
+            for (uint32_t i = 0; i < count; ++i) {
+                auto& e = desc->entries[i];
+                dma_ptrs[i] = reinterpret_cast<uintptr_t>(
+                    data_base + e.data_offset);
+                shm_offsets[i] = e.data_offset;
+            }
+
+            desc->bytes_done.store(0, std::memory_order_relaxed);
+            auto results = tier.BatchReadIntoPtrStreaming(
+                keys, dma_ptrs, sizes, &desc->items_done,
+                &desc->bytes_done, &shm_offsets,
+                dma_bufs, dma_count);
+            desc->bytes_done.store(desc->total_data_size,
+                                   std::memory_order_release);
+            for (uint32_t i = 0; i < count; ++i)
+                desc->entries[i].result = results[i] ? 1 : 0;
+        }
     }
 
     slot.result = static_cast<int32_t>(ResultCode::OK);
@@ -216,7 +363,6 @@ struct RankDmaPool {
 };
 
 static void AllocRankDmaPools(RankDmaPool* pools, int max_ranks) {
-    // Scale per-rank buffer count so total DMA stays within ~2GB budget
     static constexpr int kTotalDmaBudget = 1024;
     int per_rank = std::min(kDmaBufsPerRank,
                             std::max(16, kTotalDmaBudget / std::max(1, max_ranks)));
@@ -248,13 +394,12 @@ static void FreeRankDmaPools(RankDmaPool* pools, int max_ranks) {
 }
 
 // ---------------------------------------------------------------------------
-// Main poll loop — with heartbeat, dead-rank reap, and shutdown logic.
-// Batch requests are dispatched to per-rank worker threads so that multiple
-// ranks can perform disk I/O concurrently without head-of-line blocking.
+// Main poll loop
 // ---------------------------------------------------------------------------
 static constexpr int kMaxConcurrentRanks = 64;
 
-static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm,
+static void PollLoop(SpdkSsdTier& tier, ProxyCache& cache,
+                     ProxyShmRegion& shm,
                      pid_t spawner_pid, RankDmaPool* rank_dma) {
     auto* hdr = shm.Header();
     uint32_t max_ranks = std::min(hdr->max_ranks,
@@ -299,9 +444,9 @@ static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm,
                 void** dma_bufs = rank_dma[r].bufs;
                 int dma_count = rank_dma[r].count;
                 batch_worker[r] = std::thread(
-                    [&tier, &slot, data_region, region_size, ch, t, r,
+                    [&tier, &cache, &slot, data_region, region_size, ch, t, r,
                      &batch_inflight, dma_bufs, dma_count]() {
-                        ProcessBatchRequest(tier, slot, data_region,
+                        ProcessBatchRequest(tier, cache, slot, data_region,
                                             region_size, dma_bufs, dma_count);
                         slot.state.store(
                             static_cast<uint32_t>(SlotState::COMPLETED),
@@ -312,7 +457,7 @@ static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm,
                                                 std::memory_order_release);
                     });
             } else {
-                ProcessSingleRequest(tier, slot, data_region, region_size);
+                ProcessSingleRequest(tier, cache, slot, data_region, region_size);
                 slot.state.store(static_cast<uint32_t>(SlotState::COMPLETED),
                                  std::memory_order_release);
                 ch->tail.store((t + 1) % kRingSize, std::memory_order_release);
@@ -321,7 +466,6 @@ static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm,
 
         auto now = std::chrono::steady_clock::now();
 
-        // ---- Heartbeat update (~every 500ms) ----
         auto since_hb = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - last_heartbeat);
         if (since_hb.count() > 500) {
@@ -330,7 +474,6 @@ static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm,
             last_heartbeat = now;
         }
 
-        // ---- Dead-rank reaping (~every 5 seconds) ----
         auto since_reap = std::chrono::duration_cast<std::chrono::seconds>(
             now - last_reap);
         if (since_reap.count() >= 5) {
@@ -362,7 +505,6 @@ static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm,
             last_reap = now;
         }
 
-        // ---- Check exit conditions ----
         uint32_t active = hdr->active_ranks.load(std::memory_order_acquire);
         bool shutdown = hdr->shutdown_requested.load(std::memory_order_acquire) != 0;
 
@@ -378,8 +520,6 @@ static void PollLoop(SpdkSsdTier& tier, ProxyShmRegion& shm,
             break;
         }
 
-        // Orphan self-termination: if spawner is dead, start a 60s countdown.
-        // This handles cases where ranks crash without deregistering.
         {
             static auto orphan_start = std::chrono::steady_clock::time_point{};
             if (spawner_pid > 0 && kill(spawner_pid, 0) != 0) {
@@ -435,12 +575,8 @@ int main(int argc, char** argv) {
     pid_t spawner_pid = ParseSpawnerPid(argc, argv);
 
 #ifdef __linux__
-    // If auto-spawned, arrange to receive SIGTERM when parent dies.
-    // This is a safety net — the poll loop also checks spawner liveness.
     if (spawner_pid > 0) {
         prctl(PR_SET_PDEATHSIG, SIGTERM);
-        // Re-check: if parent already died between fork and prctl,
-        // getppid() will have changed (to 1 or a subreaper).
         if (getppid() != spawner_pid) {
             fprintf(stderr, "spdk_proxy: spawner already dead before prctl, exiting\n");
             return 1;
@@ -473,6 +609,7 @@ int main(int argc, char** argv) {
     int max_ranks = getenv_int("UMBP_SPDK_PROXY_MAX_RANKS", 8);
     size_t data_per_rank_mb = getenv_size("UMBP_SPDK_PROXY_DATA_MB", 2048);
     size_t data_per_rank = data_per_rank_mb * 1024 * 1024;
+    size_t cache_mb = getenv_size("UMBP_SPDK_PROXY_CACHE_MB", 4096);
 
     if (nvme_pci.empty() && bdev_name.empty()) {
         fprintf(stderr,
@@ -480,11 +617,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Register atexit cleanup so SHM is removed even on unexpected exit()
     g_shm_name = shm_name;
     std::atexit(atexit_cleanup);
 
-    // Step 1: Create shared memory
     ProxyShmRegion shm;
     int rc = shm.Create(shm_name, max_ranks, data_per_rank, /*try_hugepage=*/true);
     if (rc != 0) {
@@ -493,8 +628,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Record proxy PID and spawner PID in header immediately so that
-    // clients can detect our process even during SPDK initialization.
     auto* hdr = shm.Header();
     hdr->proxy_pid.store(static_cast<uint32_t>(getpid()), std::memory_order_relaxed);
     hdr->spawner_pid.store(static_cast<uint32_t>(spawner_pid), std::memory_order_relaxed);
@@ -507,7 +640,6 @@ int main(int argc, char** argv) {
                   shm.IsHugepage() ? "YES" : "NO",
                   static_cast<int>(getpid()));
 
-    // Step 2: Initialize SPDK via SpdkSsdTier
     UMBPConfig cfg;
     cfg.ssd_backend = "spdk";
     cfg.spdk_bdev_name = bdev_name;
@@ -524,17 +656,14 @@ int main(int argc, char** argv) {
         fprintf(stderr, "spdk_proxy: SpdkSsdTier init failed\n");
         hdr->state.store(static_cast<uint32_t>(ProxyState::ERROR),
                          std::memory_order_release);
-        // Keep SHM alive briefly so clients can read ERROR state
         std::this_thread::sleep_for(std::chrono::seconds(2));
         shm.Detach();
         return 1;
     }
 
-    // Re-register signal handlers — spdk_app_start() overrides them
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    // Step 3: Publish READY state
     auto [used, total] = tier.Capacity();
     hdr->bdev_size = total;
     hdr->block_size = 4096;
@@ -544,25 +673,26 @@ int main(int argc, char** argv) {
     hdr->state.store(static_cast<uint32_t>(ProxyState::READY),
                      std::memory_order_release);
 
-    // Step 3b: Allocate per-rank DMA buffer pools for concurrent I/O
     auto* rank_dma = new RankDmaPool[max_ranks];
     AllocRankDmaPools(rank_dma, max_ranks);
 
-    UMBP_LOG_INFO("spdk_proxy: READY — capacity=%zuMB, waiting for connections...",
-                  total / (1024 * 1024));
+    ProxyCache cache(cache_mb * 1024 * 1024);
+
+    UMBP_LOG_INFO("spdk_proxy: READY — capacity=%zuMB, cache=%zuMB (%s), waiting for connections...",
+                  total / (1024 * 1024), cache_mb,
+                  cache.enabled() ? "enabled" : "disabled");
     fflush(stdout);
 
-    // Step 4: Enter main poll loop (returns when shutdown conditions met)
-    PollLoop(tier, shm, spawner_pid, rank_dma);
+    PollLoop(tier, cache, shm, spawner_pid, rank_dma);
 
-    // Step 5: Shutdown
     FreeRankDmaPools(rank_dma, max_ranks);
     delete[] rank_dma;
 
     hdr->state.store(static_cast<uint32_t>(ProxyState::SHUTDOWN),
                      std::memory_order_release);
 
-    UMBP_LOG_INFO("spdk_proxy: shutting down");
+    UMBP_LOG_INFO("spdk_proxy: shutting down (cache: %zu entries, %zuMB used)",
+                  cache.EntryCount(), cache.TotalBytes() / (1024 * 1024));
     shm.Detach();
 
     return 0;

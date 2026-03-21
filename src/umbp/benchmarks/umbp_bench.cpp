@@ -2,15 +2,16 @@
 // MIT License
 //
 // umbp_bench: End-to-end benchmark using UMBPClient (full stack).
-// Simulates real business scenario: write KV cache blocks, then read them back.
 //
 // Modes:
 //   Single process (default):
-//     ./umbp_bench
-//     UMBP_SPDK_NVME_PCI=... ./umbp_bench              # Standalone SPDK
+//     ./umbp_bench                                            # POSIX
+//     UMBP_SPDK_NVME_PCI=... ./umbp_bench                    # SPDK Standalone
 //
-//   Multi-process auto-fork (Linux only):
-//     UMBP_SPDK_NVME_PCI=... ./umbp_bench --ranks=4    # Leader auto-forks proxy
+//   Multi-process real-scenario (Linux only):
+//     UMBP_SPDK_NVME_PCI=... ./umbp_bench --ranks=8
+//       → Leader writes → barrier → all ranks concurrently read SAME data
+//       → barrier → next size.  Simulates Prefill/Decode KV cache pattern.
 //
 // The benchmark writes directly to SSD tier to measure disk I/O bandwidth,
 // bypassing the DRAM cache layer.
@@ -24,6 +25,8 @@
 #include <vector>
 
 #ifdef __linux__
+#include <sched.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -69,26 +72,36 @@ struct BenchResult {
     int corrupt;
 };
 
+// Coordination structure for multi-rank phased benchmark.
+// Shared between forked processes via anonymous mmap.
+struct alignas(64) BenchCoord {
+    std::atomic<int> write_gen;       // Leader sets to size_idx+1 after writing
+    std::atomic<int> reads_complete;  // All ranks increment after reading
+    int num_ranks;
+    char session[16];                 // Shared session ID
+};
+
+// ---------------------------------------------------------------------------
+// Single-rank benchmark: same process writes and reads (original behavior)
+// ---------------------------------------------------------------------------
 static BenchResult RunBatch(UMBPClient& client, int rank_id,
                             const std::string& session,
                             size_t value_size, int count, int iterations) {
     std::string prefix = "bench_r" + std::to_string(rank_id) + "_" + session +
                          "_" + std::to_string(value_size) + "_";
 
-    std::vector<std::vector<char>> datas(count);
-    std::vector<size_t> sizes(count, value_size);
-
-    // Derive a per-session seed so the pattern changes every run
     uint32_t seed = 0;
     for (char c : session) seed = seed * 31 + static_cast<uint8_t>(c);
 
+    std::vector<std::vector<char>> datas(count);
+    std::vector<size_t> sizes(count, value_size);
     for (int i = 0; i < count; ++i)
         datas[i].resize(value_size, static_cast<char>((seed + i + 1) & 0xFF));
 
     double total_bytes = static_cast<double>(value_size) * count;
 
     auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
-    if (!ssd) return {value_size, count, 0, 0, 0};
+    if (!ssd) return {value_size, count, 0, 0, 0, 0};
 
     std::vector<const void*> cptrs(count);
     for (int i = 0; i < count; ++i)
@@ -114,7 +127,6 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id,
     for (int i = 0; i < count; ++i)
         rkeys[i] = prefix + "r_" + std::to_string(i);
 
-    // Write read-benchmark keys with retry to ensure all are present
     int write_ok = 0;
     for (int attempt = 0; attempt < 3 && write_ok < count; ++attempt) {
         auto wr = ssd->BatchWrite(rkeys, cptrs, sizes);
@@ -148,7 +160,6 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id,
         double mbps = (total_bytes / (1024.0 * 1024.0)) / (t1 - t0);
         if (ok > 0 && mbps > best_read) { best_read = mbps; best_read_ok = ok; }
 
-        // Verify data integrity on first successful iteration
         if (iter == 0) {
             for (int i = 0; i < count; ++i) {
                 if (!rr[i]) continue;
@@ -173,6 +184,134 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id,
     return {value_size, count, best_write, best_read, best_read_ok, corrupt};
 }
 
+// ---------------------------------------------------------------------------
+// Multi-rank phased benchmark (real Prefill/Decode scenario)
+//   Phase 1: Leader writes data (measure write bandwidth)
+//   Phase 2: All ranks concurrently read the SAME data (measure read bandwidth)
+//   Phase 3: Barrier — sync before next size
+// ---------------------------------------------------------------------------
+#ifdef __linux__
+static BenchResult RunBatchPhased(UMBPClient& client, int rank_id,
+                                   size_t value_size, int count, int iterations,
+                                   int size_idx, BenchCoord* coord) {
+    std::string session(coord->session);
+    std::string prefix = "bench_" + session + "_" + std::to_string(value_size) + "_";
+
+    uint32_t seed = 0;
+    for (char c : session) seed = seed * 31 + static_cast<uint8_t>(c);
+
+    double total_bytes = static_cast<double>(value_size) * count;
+    auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
+    if (!ssd) return {value_size, count, 0, 0, 0, 0};
+
+    double best_write = 0;
+
+    // === WRITE PHASE (Leader only, others wait) ===
+    if (rank_id == 0) {
+        std::vector<std::vector<char>> datas(count);
+        std::vector<size_t> sizes(count, value_size);
+        for (int i = 0; i < count; ++i)
+            datas[i].resize(value_size, static_cast<char>((seed + i + 1) & 0xFF));
+
+        std::vector<const void*> cptrs(count);
+        for (int i = 0; i < count; ++i) cptrs[i] = datas[i].data();
+
+        for (int iter = 0; iter < iterations; ++iter) {
+            std::vector<std::string> wkeys(count);
+            for (int i = 0; i < count; ++i)
+                wkeys[i] = prefix + "w" + std::to_string(iter) + "_" + std::to_string(i);
+
+            double t0 = NowSec();
+            auto wr = ssd->BatchWrite(wkeys, cptrs, sizes);
+            double t1 = NowSec();
+
+            int ok = 0;
+            for (auto b : wr) ok += b;
+            double mbps = (total_bytes / (1024.0 * 1024.0)) / (t1 - t0);
+            if (ok == count && mbps > best_write) best_write = mbps;
+        }
+
+        // Write the read-benchmark keys (data all ranks will read)
+        std::vector<std::string> rkeys(count);
+        for (int i = 0; i < count; ++i)
+            rkeys[i] = prefix + "r_" + std::to_string(i);
+
+        int write_ok = 0;
+        for (int attempt = 0; attempt < 3 && write_ok < count; ++attempt) {
+            auto wr = ssd->BatchWrite(rkeys, cptrs, sizes);
+            write_ok = 0;
+            for (auto b : wr) write_ok += b;
+        }
+        if (write_ok < count)
+            fprintf(stderr, "  [Leader] WARNING: wrote %d/%d read-keys for %zuKB\n",
+                    write_ok, count, value_size / 1024);
+
+        coord->write_gen.store(size_idx + 1, std::memory_order_release);
+    }
+
+    // === WAIT for Leader to finish writing ===
+    while (coord->write_gen.load(std::memory_order_acquire) < size_idx + 1)
+        sched_yield();
+
+    // === READ PHASE (All ranks read the SAME data concurrently) ===
+    std::vector<std::string> rkeys(count);
+    for (int i = 0; i < count; ++i)
+        rkeys[i] = prefix + "r_" + std::to_string(i);
+
+    std::vector<std::vector<char>> read_bufs(count, std::vector<char>(value_size, 0));
+    std::vector<uintptr_t> dst_ptrs(count);
+    std::vector<size_t> sizes(count, value_size);
+    for (int i = 0; i < count; ++i)
+        dst_ptrs[i] = reinterpret_cast<uintptr_t>(read_bufs[i].data());
+
+    double best_read = 0;
+    int best_read_ok = 0;
+    int corrupt = 0;
+    for (int iter = 0; iter < iterations; ++iter) {
+        for (auto& b : read_bufs) std::memset(b.data(), 0, b.size());
+
+        double t0 = NowSec();
+        auto rr = ssd->BatchReadIntoPtr(rkeys, dst_ptrs, sizes);
+        double t1 = NowSec();
+
+        int ok = 0;
+        for (auto b : rr) ok += b;
+        double mbps = (total_bytes / (1024.0 * 1024.0)) / (t1 - t0);
+        if (ok > 0 && mbps > best_read) { best_read = mbps; best_read_ok = ok; }
+
+        if (iter == 0) {
+            for (int i = 0; i < count; ++i) {
+                if (!rr[i]) continue;
+                char expected = static_cast<char>((seed + i + 1) & 0xFF);
+                const char* buf = read_bufs[i].data();
+                if (buf[0] != expected || buf[value_size / 2] != expected ||
+                    buf[value_size - 1] != expected) {
+                    ++corrupt;
+                    if (corrupt <= 3)
+                        fprintf(stderr,
+                            "  [rank %d] CORRUPT: key %d, expected 0x%02x, "
+                            "got first=0x%02x last=0x%02x\n",
+                            rank_id, i, (unsigned char)expected,
+                            (unsigned char)buf[0],
+                            (unsigned char)buf[value_size - 1]);
+                }
+            }
+        }
+    }
+
+    // === BARRIER: all ranks done reading this size ===
+    coord->reads_complete.fetch_add(1, std::memory_order_acq_rel);
+    int target = (size_idx + 1) * coord->num_ranks;
+    while (coord->reads_complete.load(std::memory_order_acquire) < target)
+        sched_yield();
+
+    return {value_size, count, best_write, best_read, best_read_ok, corrupt};
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Output formatting
+// ---------------------------------------------------------------------------
 static void PrintResults(int rank_id, int num_ranks, const char* role_str,
                          const char* backend,
                          const std::vector<BenchResult>& results) {
@@ -190,7 +329,10 @@ static void PrintResults(int rank_id, int num_ranks, const char* role_str,
         else
             snprintf(sz_label, sizeof(sz_label), "%zuKB", r.value_size / 1024);
 
-        printf("  %8s  %6d  %10.0f  %10.0f", sz_label, r.count, r.write_mbps, r.read_mbps);
+        if (r.write_mbps > 0)
+            printf("  %8s  %6d  %10.0f  %10.0f", sz_label, r.count, r.write_mbps, r.read_mbps);
+        else
+            printf("  %8s  %6d  %10s  %10.0f", sz_label, r.count, "-", r.read_mbps);
         if (r.read_ok != r.count)
             printf("  *** READ %d/%d", r.read_ok, r.count);
         if (r.corrupt > 0)
@@ -201,8 +343,6 @@ static void PrintResults(int rank_id, int num_ranks, const char* role_str,
 }
 
 #ifdef __linux__
-// Write all results to a pipe so the parent can collect and print them
-// sequentially, avoiding interleaved output from concurrent ranks.
 static void WriteResultsToPipe(int fd, const std::vector<BenchResult>& results) {
     uint32_t n = static_cast<uint32_t>(results.size());
     (void)!write(fd, &n, sizeof(n));
@@ -220,7 +360,8 @@ static std::vector<BenchResult> ReadResultsFromPipe(int fd) {
 }
 #endif
 
-static int RunBenchmarkProcess(int rank_id, int num_ranks, int pipe_fd) {
+static int RunBenchmarkProcess(int rank_id, int num_ranks, int pipe_fd,
+                               void* coord_ptr) {
     auto cfg = UMBPConfig::FromEnvironment();
     cfg.dram_capacity_bytes = 64ULL * 1024 * 1024;
 
@@ -232,11 +373,25 @@ static int RunBenchmarkProcess(int rank_id, int num_ranks, int pipe_fd) {
     const char* backend = cfg.ssd_backend.c_str();
 
     const int iterations = 3;
-    std::string session = MakeSessionId();
 
     std::vector<BenchResult> results;
-    for (const auto& s : kSpecs)
-        results.push_back(RunBatch(client, rank_id, session, s.size, s.count, iterations));
+
+#ifdef __linux__
+    auto* coord = static_cast<BenchCoord*>(coord_ptr);
+    if (coord) {
+        for (size_t s = 0; s < sizeof(kSpecs) / sizeof(kSpecs[0]); ++s)
+            results.push_back(RunBatchPhased(client, rank_id, kSpecs[s].size,
+                                              kSpecs[s].count, iterations,
+                                              static_cast<int>(s), coord));
+    } else
+#endif
+    {
+        (void)coord_ptr;
+        std::string session = MakeSessionId();
+        for (const auto& s : kSpecs)
+            results.push_back(RunBatch(client, rank_id, session,
+                                       s.size, s.count, iterations));
+    }
 
     if (pipe_fd >= 0) {
 #ifdef __linux__
@@ -260,16 +415,28 @@ int main(int argc, char** argv) {
     }
 
     if (num_ranks <= 1) {
-        return RunBenchmarkProcess(0, 1, -1);
+        return RunBenchmarkProcess(0, 1, -1, nullptr);
     }
 
 #ifdef __linux__
-    printf("Launching %d ranks...\n", num_ranks);
+    printf("Launching %d ranks (phased: Leader writes → barrier → all read)...\n",
+           num_ranks);
     fflush(stdout);
+
+    // Shared coordination via anonymous mmap (inherited by fork children)
+    auto* coord = static_cast<BenchCoord*>(
+        mmap(nullptr, sizeof(BenchCoord), PROT_READ | PROT_WRITE,
+             MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+    coord->write_gen.store(0, std::memory_order_relaxed);
+    coord->reads_complete.store(0, std::memory_order_relaxed);
+    coord->num_ranks = num_ranks;
+    std::string session = MakeSessionId();
+    strncpy(coord->session, session.c_str(), sizeof(coord->session) - 1);
+    coord->session[sizeof(coord->session) - 1] = '\0';
 
     struct RankInfo {
         pid_t pid;
-        int pipe_fd;    // parent reads from this
+        int pipe_fd;
         int rank_id;
     };
     std::vector<RankInfo> ranks;
@@ -287,7 +454,7 @@ int main(int argc, char** argv) {
             char rank_str[16];
             snprintf(rank_str, sizeof(rank_str), "%d", r);
             setenv("LOCAL_RANK", rank_str, 1);
-            int rc = RunBenchmarkProcess(r, num_ranks, pipefd[1]);
+            int rc = RunBenchmarkProcess(r, num_ranks, pipefd[1], coord);
             close(pipefd[1]);
             _exit(rc);
         }
@@ -319,10 +486,11 @@ int main(int argc, char** argv) {
         if (!ok) failures++;
     }
 
+    munmap(coord, sizeof(BenchCoord));
+
     printf("\n=== %d/%d ranks completed successfully ===\n",
            num_ranks - failures, num_ranks);
 
-    // Determine role/backend from environment for display
     auto cfg = UMBPConfig::FromEnvironment();
     const char* backend = cfg.ssd_backend.c_str();
 
@@ -335,23 +503,19 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Aggregate bandwidth across all ranks
+    // Aggregate: write = Leader only, read = sum of all ranks
     size_t num_specs = sizeof(kSpecs) / sizeof(kSpecs[0]);
     printf("\n========================================================\n");
-    printf(" AGGREGATE Bandwidth (sum of %d ranks)\n", num_ranks);
+    printf(" AGGREGATE (Leader write / %d-rank concurrent read)\n", num_ranks);
     printf("========================================================\n");
     printf("  %8s  %10s  %10s\n", "ValSize", "Write MB/s", "Read MB/s");
     for (size_t s = 0; s < num_specs; ++s) {
-        double sum_w = 0, sum_r = 0;
-        int valid = 0;
+        double leader_w = 0, sum_r = 0;
         for (auto& rr : all_results) {
-            if (rr.ok && s < rr.results.size()) {
-                sum_w += rr.results[s].write_mbps;
-                sum_r += rr.results[s].read_mbps;
-                ++valid;
-            }
+            if (!rr.ok || s >= rr.results.size()) continue;
+            if (rr.rank_id == 0) leader_w = rr.results[s].write_mbps;
+            sum_r += rr.results[s].read_mbps;
         }
-        if (valid == 0) continue;
         char sz_label[16];
         if (kSpecs[s].size >= 1024 * 1024)
             snprintf(sz_label, sizeof(sz_label), "%zuMB",
@@ -359,7 +523,7 @@ int main(int argc, char** argv) {
         else
             snprintf(sz_label, sizeof(sz_label), "%zuKB",
                      kSpecs[s].size / 1024);
-        printf("  %8s  %10.0f  %10.0f\n", sz_label, sum_w, sum_r);
+        printf("  %8s  %10.0f  %10.0f\n", sz_label, leader_w, sum_r);
     }
     fflush(stdout);
 
