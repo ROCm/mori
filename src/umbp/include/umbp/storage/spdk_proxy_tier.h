@@ -8,9 +8,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -47,6 +49,10 @@ class SpdkProxyTier : public TierBackend {
     std::string GetLRUKey() const override;
     std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
 
+    // Block until all prior write-back NVMe flushes for this rank complete.
+    // In write-through mode this is a fast no-op round-trip.
+    bool Flush() override;
+
     // Wait for the proxy daemon to become READY (polls SHM).
     // Returns true if READY within timeout, false on timeout or ERROR.
     static bool WaitForProxy(const std::string& shm_name, int timeout_ms);
@@ -72,12 +78,24 @@ class SpdkProxyTier : public TierBackend {
     // Check if the proxy daemon is still alive by examining its heartbeat.
     bool IsProxyAlive() const;
 
-    // Try to serve a batch read entirely from the SHM shared cache.
-    // Returns true if ALL keys hit; false on any miss (caller must fall back).
-    bool TryShmCacheBatchRead(
-        const std::vector<std::string>& keys,
-        const std::vector<uintptr_t>& dst_ptrs,
-        const std::vector<size_t>& sizes) const;
+    // Per-item ShmCache read — seqlock, returns true on hit.
+    bool TryShmCacheReadOne(const std::string& key, uintptr_t dst, size_t size) const;
+
+    // ---- Per-client heap read cache (analogous to POSIX page cache) ----
+    // Private to each rank process — zero contention, single memcpy on hit.
+    // Populated on writes (write-through) and on reads (back-fill).
+    struct HeapEntry {
+        std::unique_ptr<char[]> data;
+        size_t size;
+        std::list<std::string>::iterator lru_pos;
+    };
+    void HeapCachePut(const std::string& key, const void* data, size_t size);
+    bool HeapCacheGet(const std::string& key, uintptr_t dst, size_t size) const;
+
+    mutable std::unordered_map<std::string, HeapEntry> heap_cache_;
+    mutable std::list<std::string> heap_lru_;
+    mutable size_t heap_cache_bytes_ = 0;
+    size_t heap_cache_max_bytes_ = 0;
 
     bool connected_ = false;
     uint32_t rank_id_ = 0;

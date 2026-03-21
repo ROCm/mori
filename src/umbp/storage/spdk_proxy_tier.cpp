@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 
@@ -114,12 +115,20 @@ SpdkProxyTier::SpdkProxyTier(const UMBPConfig& config)
     hdr->active_ranks.fetch_add(1, std::memory_order_release);
 
     connected_ = true;
+
+    // Per-client heap read cache (default 8GB, override via UMBP_SPDK_READ_CACHE_MB)
+    const char* rcmb = std::getenv("UMBP_SPDK_READ_CACHE_MB");
+    size_t cache_mb = rcmb ? static_cast<size_t>(std::atol(rcmb)) : 8192;
+    heap_cache_max_bytes_ = cache_mb * 1024ULL * 1024ULL;
+
     UMBP_LOG_INFO("SpdkProxyTier: connected rank=%u shm='%s' "
-                  "bdev_size=%zuMB block_size=%u data_region=%zuMB",
+                  "bdev_size=%zuMB block_size=%u data_region=%zuMB "
+                  "read_cache=%zuMB",
                   rank_id_, shm_name.c_str(),
                   static_cast<size_t>(hdr->bdev_size / (1024 * 1024)),
                   hdr->block_size,
-                  static_cast<size_t>(hdr->data_region_per_rank / (1024 * 1024)));
+                  static_cast<size_t>(hdr->data_region_per_rank / (1024 * 1024)),
+                  cache_mb);
 }
 
 SpdkProxyTier::~SpdkProxyTier() {
@@ -505,35 +514,29 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(
 // ---------------------------------------------------------------------------
 bool SpdkProxyTier::Write(const std::string& key, const void* data, size_t size) {
     auto rc = SubmitAndWait(RequestType::WRITE, key, data, size, nullptr, 0);
+    if (rc == ResultCode::OK && data)
+        HeapCachePut(key, data, size);
     return rc == ResultCode::OK;
 }
 
 bool SpdkProxyTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr,
                                 size_t size) {
-    // Fast path: SHM shared cache
-    if (connected_) {
-        auto* hdr = shm_.Header();
-        if (hdr->cache_num_slots > 0 && size <= CacheSlotDataCapacity(hdr)) {
-            uint32_t idx = CacheSlotIndex(key.data(),
-                                          static_cast<uint32_t>(key.size()),
-                                          hdr->cache_num_slots);
-            auto* slot = GetCacheSlot(shm_.Base(), hdr, idx);
-            uint64_t g1 = slot->gen.load(std::memory_order_acquire);
-            if (g1 != 0 && !(g1 & 1) &&
-                slot->key_len == key.size() &&
-                std::memcmp(slot->key, key.data(), key.size()) == 0 &&
-                slot->data_size == size) {
-                char* src = GetCacheSlotData(shm_.Base(), hdr, idx);
-                std::memcpy(reinterpret_cast<void*>(dst_ptr), src, size);
-                uint64_t g2 = slot->gen.load(std::memory_order_acquire);
-                if (g1 == g2) return true;
-            }
-        }
+    // Fast path 1: heap cache (private memory)
+    if (HeapCacheGet(key, dst_ptr, size)) return true;
+
+    // Fast path 2: SHM shared cache
+    if (TryShmCacheReadOne(key, dst_ptr, size)) {
+        HeapCachePut(key, reinterpret_cast<const void*>(dst_ptr), size);
+        return true;
     }
+
+    // Slow path: daemon
     uint64_t actual_size = 0;
     auto rc = SubmitAndWait(RequestType::READ, key, nullptr, 0,
                             reinterpret_cast<void*>(dst_ptr), size,
                             &actual_size);
+    if (rc == ResultCode::OK)
+        HeapCachePut(key, reinterpret_cast<const void*>(dst_ptr), size);
     return rc == ResultCode::OK;
 }
 
@@ -543,6 +546,12 @@ bool SpdkProxyTier::Exists(const std::string& key) const {
 }
 
 bool SpdkProxyTier::Evict(const std::string& key) {
+    auto it = heap_cache_.find(key);
+    if (it != heap_cache_.end()) {
+        heap_cache_bytes_ -= it->second.size;
+        heap_lru_.erase(it->second.lru_pos);
+        heap_cache_.erase(it);
+    }
     auto rc = SubmitAndWait(RequestType::EVICT, key, nullptr, 0, nullptr, 0);
     return rc == ResultCode::OK;
 }
@@ -556,65 +565,176 @@ std::pair<size_t, size_t> SpdkProxyTier::Capacity() const {
 }
 
 void SpdkProxyTier::Clear() {
+    heap_cache_.clear();
+    heap_lru_.clear();
+    heap_cache_bytes_ = 0;
     SubmitAndWait(RequestType::CLEAR, "", nullptr, 0, nullptr, 0);
 }
 
+bool SpdkProxyTier::Flush() {
+    auto rc = SubmitAndWait(RequestType::FLUSH, "", nullptr, 0, nullptr, 0);
+    return rc == ResultCode::OK;
+}
+
+// ---------------------------------------------------------------------------
+// Per-client heap read cache — analogous to POSIX page cache.
+// Private to each rank process: zero contention, single memcpy on hit.
+// ---------------------------------------------------------------------------
+void SpdkProxyTier::HeapCachePut(const std::string& key,
+                                  const void* data, size_t size) {
+    if (heap_cache_max_bytes_ == 0 || size == 0) return;
+
+    // Update existing entry (move to front)
+    auto it = heap_cache_.find(key);
+    if (it != heap_cache_.end()) {
+        if (it->second.size == size) {
+            std::memcpy(it->second.data.get(), data, size);
+            heap_lru_.splice(heap_lru_.begin(), heap_lru_, it->second.lru_pos);
+            return;
+        }
+        // Size changed — remove and re-insert
+        heap_cache_bytes_ -= it->second.size;
+        heap_lru_.erase(it->second.lru_pos);
+        heap_cache_.erase(it);
+    }
+
+    // Evict LRU entries until there is room
+    while (heap_cache_bytes_ + size > heap_cache_max_bytes_ && !heap_lru_.empty()) {
+        auto& victim_key = heap_lru_.back();
+        auto vit = heap_cache_.find(victim_key);
+        if (vit != heap_cache_.end()) {
+            heap_cache_bytes_ -= vit->second.size;
+            heap_cache_.erase(vit);
+        }
+        heap_lru_.pop_back();
+    }
+
+    if (size > heap_cache_max_bytes_) return;
+
+    HeapEntry entry;
+    entry.data = std::make_unique<char[]>(size);
+    std::memcpy(entry.data.get(), data, size);
+    entry.size = size;
+
+    heap_lru_.push_front(key);
+    entry.lru_pos = heap_lru_.begin();
+    heap_cache_bytes_ += size;
+    heap_cache_.emplace(key, std::move(entry));
+}
+
+bool SpdkProxyTier::HeapCacheGet(const std::string& key,
+                                  uintptr_t dst, size_t size) const {
+    auto it = heap_cache_.find(key);
+    if (it == heap_cache_.end()) return false;
+    if (it->second.size != size) return false;
+    std::memcpy(reinterpret_cast<void*>(dst), it->second.data.get(), size);
+    heap_lru_.splice(heap_lru_.begin(), heap_lru_, it->second.lru_pos);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Per-item ShmCache read — seqlock protocol, returns true on hit.
+// ---------------------------------------------------------------------------
+bool SpdkProxyTier::TryShmCacheReadOne(const std::string& key,
+                                        uintptr_t dst, size_t size) const {
+    if (!connected_) return false;
+    auto* hdr = shm_.Header();
+    if (hdr->cache_num_slots == 0) return false;
+    size_t cap = CacheSlotDataCapacity(hdr);
+    if (size > cap) return false;
+
+    void* base = shm_.Base();
+    uint32_t idx = CacheSlotIndex(key.data(),
+                                  static_cast<uint32_t>(key.size()),
+                                  hdr->cache_num_slots);
+    auto* slot = GetCacheSlot(base, hdr, idx);
+
+    uint64_t g1 = slot->gen.load(std::memory_order_acquire);
+    if (g1 == 0 || (g1 & 1)) return false;
+    if (slot->key_len != key.size() ||
+        std::memcmp(slot->key, key.data(), key.size()) != 0 ||
+        slot->data_size != size)
+        return false;
+
+    char* src = GetCacheSlotData(base, hdr, idx);
+    std::memcpy(reinterpret_cast<void*>(dst), src, size);
+
+    uint64_t g2 = slot->gen.load(std::memory_order_acquire);
+    return g1 == g2;
+}
+
+// ---------------------------------------------------------------------------
+// BatchWrite — write-through: send to daemon AND populate heap read cache.
+// ---------------------------------------------------------------------------
 std::vector<bool> SpdkProxyTier::BatchWrite(
     const std::vector<std::string>& keys,
     const std::vector<const void*>& data_ptrs,
     const std::vector<size_t>& sizes) {
-    return SubmitBatch(RequestType::BATCH_WRITE, keys, data_ptrs, {}, sizes);
+    auto results = SubmitBatch(RequestType::BATCH_WRITE, keys, data_ptrs, {}, sizes);
+    // Populate heap read cache for every successful write
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (results[i] && data_ptrs[i])
+            HeapCachePut(keys[i], data_ptrs[i], sizes[i]);
+    }
+    return results;
 }
 
+// ---------------------------------------------------------------------------
+// BatchReadIntoPtr — three-tier read: heap cache → ShmCache → daemon.
+// Per-item granularity: hits are served immediately, only misses go deeper.
+// ---------------------------------------------------------------------------
 std::vector<bool> SpdkProxyTier::BatchReadIntoPtr(
     const std::vector<std::string>& keys,
     const std::vector<uintptr_t>& dst_ptrs,
     const std::vector<size_t>& sizes) {
-    // Fast path: try SHM shared cache (zero daemon involvement, single memcpy)
-    if (TryShmCacheBatchRead(keys, dst_ptrs, sizes)) {
-        return std::vector<bool>(keys.size(), true);
+    const int count = static_cast<int>(keys.size());
+    std::vector<bool> results(count, false);
+
+    // Phase 1: heap cache (private memory, zero contention)
+    std::vector<int> miss1;
+    miss1.reserve(count);
+    for (int i = 0; i < count; ++i) {
+        if (HeapCacheGet(keys[i], dst_ptrs[i], sizes[i]))
+            results[i] = true;
+        else
+            miss1.push_back(i);
     }
-    return SubmitBatch(RequestType::BATCH_READ, keys, {}, dst_ptrs, sizes);
-}
+    if (miss1.empty()) return results;
 
-// ---------------------------------------------------------------------------
-// SHM shared cache read — seqlock protocol, lock-free, single memcpy
-// ---------------------------------------------------------------------------
-bool SpdkProxyTier::TryShmCacheBatchRead(
-    const std::vector<std::string>& keys,
-    const std::vector<uintptr_t>& dst_ptrs,
-    const std::vector<size_t>& sizes) const {
-    if (!connected_) return false;
-    auto* hdr = shm_.Header();
-    if (hdr->cache_num_slots == 0) return false;
-
-    void* base = shm_.Base();
-    size_t cap = CacheSlotDataCapacity(hdr);
-
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (sizes[i] > cap) return false;
-
-        uint32_t idx = CacheSlotIndex(keys[i].data(),
-                                      static_cast<uint32_t>(keys[i].size()),
-                                      hdr->cache_num_slots);
-        auto* slot = GetCacheSlot(base, hdr, idx);
-
-        uint64_t g1 = slot->gen.load(std::memory_order_acquire);
-        if (g1 == 0 || (g1 & 1)) return false;
-
-        if (slot->key_len != keys[i].size() ||
-            std::memcmp(slot->key, keys[i].data(), keys[i].size()) != 0 ||
-            slot->data_size != sizes[i])
-            return false;
-
-        char* src = GetCacheSlotData(base, hdr, idx);
-        char* dst = reinterpret_cast<char*>(dst_ptrs[i]);
-        std::memcpy(dst, src, sizes[i]);
-
-        uint64_t g2 = slot->gen.load(std::memory_order_acquire);
-        if (g1 != g2) return false;
+    // Phase 2: ShmCache per-item (shared memory, single memcpy)
+    std::vector<int> miss2;
+    miss2.reserve(miss1.size());
+    for (int i : miss1) {
+        if (TryShmCacheReadOne(keys[i], dst_ptrs[i], sizes[i])) {
+            results[i] = true;
+            HeapCachePut(keys[i],
+                         reinterpret_cast<const void*>(dst_ptrs[i]), sizes[i]);
+        } else {
+            miss2.push_back(i);
+        }
     }
-    return true;
+    if (miss2.empty()) return results;
+
+    // Phase 3: daemon (NVMe read) — build sub-batch of remaining misses
+    std::vector<std::string> m_keys(miss2.size());
+    std::vector<uintptr_t>   m_dst(miss2.size());
+    std::vector<size_t>      m_sizes(miss2.size());
+    for (size_t j = 0; j < miss2.size(); ++j) {
+        int i = miss2[j];
+        m_keys[j]  = keys[i];
+        m_dst[j]   = dst_ptrs[i];
+        m_sizes[j] = sizes[i];
+    }
+    auto m_results = SubmitBatch(RequestType::BATCH_READ,
+                                 m_keys, {}, m_dst, m_sizes);
+    for (size_t j = 0; j < miss2.size(); ++j) {
+        int i = miss2[j];
+        results[i] = m_results[j];
+        if (results[i])
+            HeapCachePut(keys[i],
+                         reinterpret_cast<const void*>(dst_ptrs[i]), sizes[i]);
+    }
+    return results;
 }
 
 std::string SpdkProxyTier::GetLRUKey() const {

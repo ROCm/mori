@@ -757,6 +757,14 @@ void LocalStorageManager::Clear() {
   group_map_.clear();
 }
 
+bool LocalStorageManager::Flush() {
+  bool ok = true;
+  for (auto& entry : tiers_) {
+    if (!entry.backend->Flush()) ok = false;
+  }
+  return ok;
+}
+
 std::vector<bool> LocalStorageManager::BatchWrite(
     const std::vector<std::string>& keys,
     const std::vector<const void*>& data_ptrs,

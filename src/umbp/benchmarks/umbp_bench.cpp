@@ -247,6 +247,10 @@ static BenchResult RunBatchPhased(UMBPClient& client, int rank_id,
             fprintf(stderr, "  [Leader] WARNING: wrote %d/%d read-keys for %zuKB\n",
                     write_ok, count, value_size / 1024);
 
+        // Ensure all write-back NVMe flushes are complete before the barrier
+        // so that Follower reads can find every key in entries_.
+        client.Flush();
+
         coord->write_gen.store(size_idx + 1, std::memory_order_release);
     }
 

@@ -80,6 +80,10 @@ enum class RequestType : uint32_t {
     GET_LRU_CANDIDATES = 8,
     BATCH_WRITE = 9,
     BATCH_READ = 10,
+    // Flush: no-op that serializes after the previous batch request.
+    // In Write-Back mode, guarantees all prior NVMe writes for this rank
+    // are complete and visible in entries_ before returning COMPLETED.
+    FLUSH = 11,
 };
 
 enum class ResultCode : int32_t {

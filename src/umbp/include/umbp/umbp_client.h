@@ -56,6 +56,10 @@ class UMBPClient {
 
   void Clear();
 
+  // Ensure all pending write-back data is persisted and visible to other ranks.
+  // Must be called before any cross-rank read barrier in write-back mode.
+  bool Flush();
+
   // Access sub-modules (for testing/debugging)
   BlockIndexClient& Index();
   LocalStorageManager& Storage();

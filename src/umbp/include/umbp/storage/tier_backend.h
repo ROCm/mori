@@ -88,6 +88,11 @@ class TierBackend {
       const std::vector<uintptr_t>& dst_ptrs,
       const std::vector<size_t>& sizes);
 
+  // Ensure all prior writes are durable and visible to readers.
+  // Default is a no-op (write-through tiers are always consistent).
+  // SpdkProxyTier overrides this to drain pending write-back NVMe flushes.
+  virtual bool Flush() { return true; }
+
   // Which StorageTier does this backend represent?
   StorageTier tier_id() const { return tier_id_; }
 

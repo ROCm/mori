@@ -25,10 +25,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
 #include <vector>
@@ -52,8 +55,85 @@
 using namespace umbp::proxy;
 
 static std::atomic<bool> g_running{true};
-static std::atomic<int> g_pending_wb_flushes{0};
 static std::string g_shm_name;
+
+// Staged data for a single Write-Back deferred NVMe flush.
+struct WbFlushTask {
+    std::vector<std::string> keys;
+    std::vector<std::vector<char>> staged_bufs;
+    std::vector<const void*> ptrs;
+    std::vector<size_t> sizes;
+    std::vector<size_t> offsets;
+};
+
+// Per-rank background flush queue.
+// Allows batch_worker to return immediately after ShmCache + COMPLETED,
+// while NVMe I/O runs asynchronously in a dedicated flush thread.
+// Flush() drains the queue, guaranteeing cross-rank read-after-write visibility.
+class WbFlushQueue {
+   public:
+    void Start(SpdkSsdTier* tier) {
+        tier_ = tier;
+        thread_ = std::thread([this] { Run(); });
+    }
+    void Stop() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stop_ = true;
+        }
+        cv_.notify_one();
+        if (thread_.joinable()) thread_.join();
+    }
+    void Push(WbFlushTask&& task) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            queue_.push(std::move(task));
+            ++pending_;
+            ++submit_seq_;
+        }
+        cv_.notify_one();
+    }
+    // Block until all tasks submitted before this call are flushed to NVMe.
+    void Drain() {
+        std::unique_lock<std::mutex> lk(mu_);
+        uint64_t target = submit_seq_;
+        done_cv_.wait(lk, [&] { return done_seq_ >= target || stop_; });
+    }
+
+   private:
+    void Run() {
+        while (true) {
+            WbFlushTask task;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [&] { return !queue_.empty() || stop_; });
+                if (stop_ && queue_.empty()) break;
+                task = std::move(queue_.front());
+                queue_.pop();
+            }
+            tier_->BatchWriteStreaming(
+                task.keys, task.ptrs, task.sizes,
+                nullptr, task.offsets, nullptr, 0);
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                --pending_;
+                ++done_seq_;
+            }
+            done_cv_.notify_all();
+        }
+    }
+
+    SpdkSsdTier* tier_ = nullptr;
+    std::thread thread_;
+    std::mutex mu_;
+    std::condition_variable cv_;       // wakes flush thread
+    std::condition_variable done_cv_;  // wakes Drain() callers
+    std::queue<WbFlushTask> queue_;
+    int pending_ = 0;
+    uint64_t submit_seq_ = 0;   // incremented on Push
+    uint64_t done_seq_ = 0;     // incremented on flush complete
+    bool stop_ = false;
+};
 
 static void signal_handler(int) { g_running.store(false, std::memory_order_relaxed); }
 
@@ -153,6 +233,11 @@ static void ProcessSingleRequest(SpdkSsdTier& tier,
             slot.result_aux = total;
             break;
         }
+        case RequestType::FLUSH: {
+            // The actual drain happens in PollLoop before this is called.
+            slot.result = static_cast<int32_t>(ResultCode::OK);
+            break;
+        }
         case RequestType::GET_LRU_KEY: {
             std::string lru = tier.GetLRUKey();
             if (lru.empty()) {
@@ -181,7 +266,8 @@ static void ProcessBatchRequest(SpdkSsdTier& tier,
                                 RingSlot& slot,
                                 void* data_region, size_t region_size,
                                 bool write_back,
-                                void** dma_bufs = nullptr, int dma_count = 0) {
+                                void** dma_bufs = nullptr, int dma_count = 0,
+                                WbFlushTask* wb_out = nullptr) {
     auto type = static_cast<RequestType>(slot.type);
     auto* desc = static_cast<BatchDescriptor*>(data_region);
     uint32_t count = desc->count;
@@ -208,10 +294,11 @@ static void ProcessBatchRequest(SpdkSsdTier& tier,
             shm_offsets[i] = e.data_offset;
         }
 
-        if (write_back) {
-            // Write-Back: populate ShmCache → return success → async NVMe flush.
-            // Client sees memory-speed writes; NVMe persistence follows in background
-            // so that subsequent reads (on cache miss) find data in entries_.
+        if (write_back && wb_out) {
+            // Write-Back fast path: ShmCache + results + stage data to heap.
+            // The caller pushes the staged task to a background flush queue,
+            // then immediately releases the rank (batch_inflight=false).
+            // NVMe persistence runs asynchronously; Flush() drains the queue.
             uint64_t total = desc->total_data_size;
             while (desc->bytes_ready.load(std::memory_order_acquire) < total)
                 ;
@@ -220,26 +307,17 @@ static void ProcessBatchRequest(SpdkSsdTier& tier,
                 desc->entries[i].result = 1;
             }
 
-            // Stage data to heap so SHM DataRegion can be reused immediately.
-            auto flush_keys = std::make_shared<std::vector<std::string>>(std::move(keys));
-            auto flush_sizes = std::make_shared<std::vector<size_t>>(std::move(sizes));
-            auto flush_offsets = std::make_shared<std::vector<size_t>>(std::move(shm_offsets));
-            auto flush_bufs = std::make_shared<std::vector<std::vector<char>>>(count);
-            auto flush_ptrs = std::make_shared<std::vector<const void*>>(count);
+            wb_out->keys = std::move(keys);
+            wb_out->sizes = std::move(sizes);
+            wb_out->offsets = std::move(shm_offsets);
+            wb_out->staged_bufs.resize(count);
+            wb_out->ptrs.resize(count);
             for (uint32_t i = 0; i < count; ++i) {
-                (*flush_bufs)[i].assign(
+                wb_out->staged_bufs[i].assign(
                     static_cast<const char*>(cptrs[i]),
-                    static_cast<const char*>(cptrs[i]) + (*flush_sizes)[i]);
-                (*flush_ptrs)[i] = (*flush_bufs)[i].data();
+                    static_cast<const char*>(cptrs[i]) + wb_out->sizes[i]);
+                wb_out->ptrs[i] = wb_out->staged_bufs[i].data();
             }
-
-            g_pending_wb_flushes.fetch_add(1, std::memory_order_relaxed);
-            std::thread([flush_keys, flush_bufs, flush_ptrs, flush_sizes,
-                         flush_offsets, &tier]() {
-                tier.BatchWriteStreaming(*flush_keys, *flush_ptrs, *flush_sizes,
-                                        nullptr, *flush_offsets, nullptr, 0);
-                g_pending_wb_flushes.fetch_sub(1, std::memory_order_relaxed);
-            }).detach();
         } else {
             // Write-Through: NVMe write + parallel ShmCache population
             std::thread shm_cache_thread([&shm, &keys, &cptrs, &sizes, count, desc]() {
@@ -383,6 +461,13 @@ static void PollLoop(SpdkSsdTier& tier,
     std::atomic<bool> batch_inflight[kMaxConcurrentRanks] = {};
     std::thread       batch_worker[kMaxConcurrentRanks];
 
+    // Per-rank background flush queues (WB mode only).
+    WbFlushQueue wb_queues[kMaxConcurrentRanks];
+    if (write_back) {
+        for (uint32_t r = 0; r < max_ranks; ++r)
+            wb_queues[r].Start(&tier);
+    }
+
     UMBP_LOG_INFO("spdk_proxy: entering poll loop (max_ranks=%u, spawner=%d)",
                   max_ranks, static_cast<int>(spawner_pid));
 
@@ -418,20 +503,34 @@ static void PollLoop(SpdkSsdTier& tier,
                 batch_inflight[r].store(true, std::memory_order_relaxed);
                 void** dma_bufs = rank_dma[r].bufs;
                 int dma_count = rank_dma[r].count;
+                WbFlushQueue* wbq = write_back ? &wb_queues[r] : nullptr;
                 batch_worker[r] = std::thread(
                     [&tier, &shm, &slot, data_region, region_size, ch, t, r,
-                     &batch_inflight, dma_bufs, dma_count, write_back]() {
+                     &batch_inflight, dma_bufs, dma_count, write_back, rtype,
+                     wbq]() {
+                        bool is_wb_write = write_back &&
+                            rtype == RequestType::BATCH_WRITE;
+                        WbFlushTask wb_task;
                         ProcessBatchRequest(tier, shm, slot, data_region,
-                                            region_size, write_back, dma_bufs, dma_count);
+                                            region_size, write_back,
+                                            dma_bufs, dma_count,
+                                            is_wb_write ? &wb_task : nullptr);
                         slot.state.store(
                             static_cast<uint32_t>(SlotState::COMPLETED),
                             std::memory_order_release);
                         ch->tail.store((t + 1) % kRingSize,
                                        std::memory_order_release);
+                        if (is_wb_write && wbq && !wb_task.keys.empty())
+                            wbq->Push(std::move(wb_task));
                         batch_inflight[r].store(false,
                                                 std::memory_order_release);
                     });
             } else {
+                if (rtype == RequestType::FLUSH && write_back) {
+                    // Drain all pending WB NVMe flushes for this rank
+                    // before signaling COMPLETED.
+                    wb_queues[r].Drain();
+                }
                 ProcessSingleRequest(tier, shm, slot, data_region, region_size);
                 slot.state.store(static_cast<uint32_t>(SlotState::COMPLETED),
                                  std::memory_order_release);
@@ -523,6 +622,11 @@ static void PollLoop(SpdkSsdTier& tier,
 
     for (uint32_t r = 0; r < max_ranks; ++r) {
         if (batch_worker[r].joinable()) batch_worker[r].join();
+    }
+
+    if (write_back) {
+        for (uint32_t r = 0; r < max_ranks; ++r)
+            wb_queues[r].Stop();
     }
 
     UMBP_LOG_INFO("spdk_proxy: exiting poll loop");
@@ -668,15 +772,6 @@ int main(int argc, char** argv) {
     fflush(stdout);
 
     PollLoop(tier, shm, spawner_pid, rank_dma, write_back);
-
-    // Wait for any pending Write-Back background flushes to complete
-    // before tearing down the SpdkSsdTier / DMA pools.
-    int pending = g_pending_wb_flushes.load(std::memory_order_relaxed);
-    if (pending > 0) {
-        UMBP_LOG_INFO("spdk_proxy: draining %d pending WB flush(es)...", pending);
-        while (g_pending_wb_flushes.load(std::memory_order_relaxed) > 0)
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
 
     FreeRankDmaPools(rank_dma, max_ranks);
     delete[] rank_dma;

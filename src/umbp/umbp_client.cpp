@@ -215,6 +215,8 @@ void UMBPClient::Clear() {
   storage_.Clear();
 }
 
+bool UMBPClient::Flush() { return storage_.Flush(); }
+
 BlockIndexClient& UMBPClient::Index() { return index_; }
 
 LocalStorageManager& UMBPClient::Storage() { return storage_; }

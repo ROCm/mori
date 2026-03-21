@@ -59,6 +59,9 @@ class LocalStorageManager {
   bool CopyToSSD(const std::string& key);  // Non-destructive DRAM→SSD copy
   void Clear();
 
+  // Flush all tiers — ensures pending write-back data is durable.
+  bool Flush();
+
   // Batch operations — delegates to tier backend's batch methods.
   std::vector<bool> BatchWrite(const std::vector<std::string>& keys,
                                const std::vector<const void*>& data_ptrs,
