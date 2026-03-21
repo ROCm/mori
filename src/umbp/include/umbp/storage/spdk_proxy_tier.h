@@ -72,6 +72,13 @@ class SpdkProxyTier : public TierBackend {
     // Check if the proxy daemon is still alive by examining its heartbeat.
     bool IsProxyAlive() const;
 
+    // Try to serve a batch read entirely from the SHM shared cache.
+    // Returns true if ALL keys hit; false on any miss (caller must fall back).
+    bool TryShmCacheBatchRead(
+        const std::vector<std::string>& keys,
+        const std::vector<uintptr_t>& dst_ptrs,
+        const std::vector<size_t>& sizes) const;
+
     bool connected_ = false;
     uint32_t rank_id_ = 0;
     mutable umbp::proxy::ProxyShmRegion shm_;

@@ -25,10 +25,14 @@ class ProxyShmRegion {
     // Server: create and initialize shared memory.
     // If try_hugepage=true, attempts /dev/hugepages/ for DMA-capable zero-copy.
     // Falls back to regular shm_open if hugepages unavailable.
+    // cache_slot_size: per-slot size (meta + data).  0 = no shared cache.
+    // cache_num_slots: number of direct-mapped cache slots.
     // Returns 0 on success, -errno on failure.
     int Create(const std::string& name, uint32_t max_ranks,
                size_t data_per_rank = kDefaultDataRegionPerRank,
-               bool try_hugepage = true);
+               bool try_hugepage = true,
+               size_t cache_slot_size = 0,
+               uint32_t cache_num_slots = 0);
 
     // Client: attach to existing shared memory created by server.
     // Returns 0 on success, -errno on failure.

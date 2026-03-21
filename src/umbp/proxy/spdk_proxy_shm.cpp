@@ -30,13 +30,15 @@ static size_t AlignToHugepage(size_t size) {
 }
 
 int ProxyShmRegion::Create(const std::string& name, uint32_t max_ranks,
-                           size_t data_per_rank, bool try_hugepage) {
+                           size_t data_per_rank, bool try_hugepage,
+                           size_t cache_slot_size, uint32_t cache_num_slots) {
 #ifndef __linux__
     return -ENOTSUP;
 #else
     if (max_ranks > kMaxRanks) return -EINVAL;
 
-    size_ = ComputeShmSize(max_ranks, data_per_rank);
+    size_t cache_total = cache_slot_size * cache_num_slots;
+    size_ = ComputeShmSize(max_ranks, data_per_rank, cache_total);
     name_ = name;
     is_server_ = true;
     is_hugepage_ = false;
@@ -124,6 +126,17 @@ int ProxyShmRegion::Create(const std::string& name, uint32_t max_ranks,
     hdr->proxy_heartbeat_ms.store(0, std::memory_order_relaxed);
     for (uint32_t r = 0; r < kMaxRanks; ++r)
         hdr->rank_pids[r].store(0, std::memory_order_relaxed);
+
+    if (cache_num_slots > 0 && cache_slot_size >= kCacheSlotMetaSize) {
+        size_t base_before_cache = ComputeShmSize(max_ranks, data_per_rank, 0);
+        hdr->cache_region_offset = (base_before_cache + 4095) & ~4095ULL;
+        hdr->cache_slot_size = cache_slot_size;
+        hdr->cache_num_slots = cache_num_slots;
+    } else {
+        hdr->cache_region_offset = 0;
+        hdr->cache_slot_size = 0;
+        hdr->cache_num_slots = 0;
+    }
 
     for (uint32_t r = 0; r < max_ranks; ++r) {
         auto* ch = Channel(r);

@@ -159,6 +159,38 @@ struct BatchDescriptor {
     BatchEntry entries[];
 };
 
+// ---- SHM shared cache slot (seqlock-protected, inline data) ----
+//
+// Direct-mapped hash table in SHM.  Daemon writes slots; clients read them
+// directly — zero daemon involvement on cache hit (single memcpy).
+//
+// Seqlock protocol:
+//   gen == 0       → empty slot
+//   gen odd        → daemon is writing (client must spin or bail)
+//   gen even != 0  → data is stable; client may read
+//   Client: read gen (must be even), copy data, re-read gen (must be same).
+//
+static constexpr size_t kCacheSlotMetaSize = 4096;  // metadata area per slot (page-aligned)
+
+struct ShmCacheSlot {
+    std::atomic<uint64_t> gen;   // seqlock generation
+    uint32_t key_len;
+    uint32_t _pad0;
+    uint64_t data_size;
+    char key[kMaxKeyLen];
+    // Remaining bytes up to kCacheSlotMetaSize are reserved padding.
+    // Inline data starts at byte offset kCacheSlotMetaSize from slot start.
+};
+
+inline uint32_t CacheSlotIndex(const char* key, uint32_t key_len, uint32_t num_slots) {
+    uint64_t h = 14695981039346656037ULL;
+    for (uint32_t i = 0; i < key_len; ++i) {
+        h ^= static_cast<uint64_t>(static_cast<unsigned char>(key[i]));
+        h *= 1099511628211ULL;
+    }
+    return static_cast<uint32_t>(h % num_slots);
+}
+
 // ---- Global shared memory header ----
 struct ProxyShmHeader {
     // ---- Identity ----
@@ -194,17 +226,29 @@ struct ProxyShmHeader {
     // to detect crashed ranks and reclaim their resources.
     std::atomic<uint32_t> rank_pids[kMaxRanks];
 
-    char _reserved2[40];
+    // ---- Shared cache (seqlock direct-mapped, appended after data regions) ----
+    uint64_t cache_region_offset;     // 0 = no shared cache
+    uint64_t cache_slot_size;         // total bytes per slot (meta + data)
+    uint32_t cache_num_slots;
+    uint32_t _pad_cache;
+
+    char _reserved2[16];
 };
 
 // ---- Helper: compute total shared memory size ----
-inline size_t ComputeShmSize(uint32_t max_ranks, size_t data_per_rank) {
+inline size_t ComputeShmSize(uint32_t max_ranks, size_t data_per_rank,
+                             size_t cache_total_bytes = 0) {
     size_t header_size = sizeof(ProxyShmHeader);
     size_t channels_offset = (header_size + 4095) & ~4095ULL;
     size_t channels_size = sizeof(RankChannel) * max_ranks;
     size_t data_offset = (channels_offset + channels_size + 4095) & ~4095ULL;
     size_t data_size = data_per_rank * max_ranks;
-    return data_offset + data_size;
+    size_t base = data_offset + data_size;
+    if (cache_total_bytes > 0) {
+        base = (base + 4095) & ~4095ULL;
+        base += cache_total_bytes;
+    }
+    return base;
 }
 
 // ---- Helper: get channel pointer from header ----
@@ -231,6 +275,25 @@ inline const void* GetDataRegion(const void* shm_base, const ProxyShmHeader* hdr
     if (rank >= hdr->max_ranks) return nullptr;
     auto* base = static_cast<const char*>(shm_base);
     return base + hdr->data_region_offset + rank * hdr->data_region_per_rank;
+}
+
+// ---- Helpers: shared cache slot access ----
+inline ShmCacheSlot* GetCacheSlot(void* shm_base, const ProxyShmHeader* hdr,
+                                  uint32_t slot_idx) {
+    auto* base = static_cast<char*>(shm_base) + hdr->cache_region_offset;
+    return reinterpret_cast<ShmCacheSlot*>(base + slot_idx * hdr->cache_slot_size);
+}
+
+inline char* GetCacheSlotData(void* shm_base, const ProxyShmHeader* hdr,
+                              uint32_t slot_idx) {
+    auto* base = static_cast<char*>(shm_base) + hdr->cache_region_offset;
+    return base + slot_idx * hdr->cache_slot_size + kCacheSlotMetaSize;
+}
+
+inline size_t CacheSlotDataCapacity(const ProxyShmHeader* hdr) {
+    return hdr->cache_slot_size > kCacheSlotMetaSize
+               ? hdr->cache_slot_size - kCacheSlotMetaSize
+               : 0;
 }
 
 }  // namespace proxy

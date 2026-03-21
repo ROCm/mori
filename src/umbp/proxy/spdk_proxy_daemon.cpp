@@ -212,9 +212,38 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// Write a key/value into the SHM shared cache (seqlock-protected).
+// Items larger than the slot data capacity are silently skipped.
+// ---------------------------------------------------------------------------
+static void WriteShmCache(ProxyShmRegion& shm, const std::string& key,
+                          const void* data, size_t size) {
+    auto* hdr = shm.Header();
+    if (hdr->cache_num_slots == 0) return;
+    size_t cap = CacheSlotDataCapacity(hdr);
+    if (size > cap || size == 0) return;
+
+    uint32_t idx = CacheSlotIndex(key.data(),
+                                  static_cast<uint32_t>(key.size()),
+                                  hdr->cache_num_slots);
+    auto* slot = GetCacheSlot(shm.Base(), hdr, idx);
+    char* slot_data = GetCacheSlotData(shm.Base(), hdr, idx);
+
+    uint64_t old = slot->gen.load(std::memory_order_relaxed);
+    slot->gen.store(old + 1, std::memory_order_release);          // odd → writing
+
+    slot->key_len = static_cast<uint32_t>(key.size());
+    std::memcpy(slot->key, key.data(), key.size());
+    slot->data_size = size;
+    std::memcpy(slot_data, data, size);
+
+    slot->gen.store(old + 2, std::memory_order_release);          // even → stable
+}
+
+// ---------------------------------------------------------------------------
 // Process a single non-batch request
 // ---------------------------------------------------------------------------
 static void ProcessSingleRequest(SpdkSsdTier& tier, ProxyCache& cache,
+                                 ProxyShmRegion& shm,
                                  RingSlot& slot,
                                  void* data_region, size_t region_size) {
     std::string key(slot.key, slot.key_len);
@@ -229,7 +258,10 @@ static void ProcessSingleRequest(SpdkSsdTier& tier, ProxyCache& cache,
             bool ok = tier.Write(key, data_region, slot.data_size);
             slot.result = ok ? static_cast<int32_t>(ResultCode::OK)
                              : static_cast<int32_t>(ResultCode::NO_SPACE);
-            if (ok) cache.Put(key, data_region, slot.data_size);
+            if (ok) {
+                cache.Put(key, data_region, slot.data_size);
+                WriteShmCache(shm, key, data_region, slot.data_size);
+            }
             break;
         }
         case RequestType::READ: {
@@ -248,6 +280,7 @@ static void ProcessSingleRequest(SpdkSsdTier& tier, ProxyCache& cache,
             if (ok) {
                 slot.result_size = max_read;
                 cache.Put(key, data_region, max_read);
+                WriteShmCache(shm, key, data_region, max_read);
             }
             break;
         }
@@ -301,6 +334,7 @@ static void ProcessSingleRequest(SpdkSsdTier& tier, ProxyCache& cache,
 // Process a batch request with optional cache acceleration.
 // ---------------------------------------------------------------------------
 static void ProcessBatchRequest(SpdkSsdTier& tier, ProxyCache& cache,
+                                ProxyShmRegion& shm,
                                 RingSlot& slot,
                                 void* data_region, size_t region_size,
                                 void** dma_bufs = nullptr, int dma_count = 0) {
@@ -352,8 +386,11 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, ProxyCache& cache,
 
         if (cache_thread.joinable()) cache_thread.join();
 
-        for (uint32_t i = 0; i < count; ++i)
+        for (uint32_t i = 0; i < count; ++i) {
             desc->entries[i].result = results[i] ? 1 : 0;
+            if (results[i])
+                WriteShmCache(shm, keys[i], cptrs[i], sizes[i]);
+        }
     } else {
         // BATCH_READ — try cache first
         std::vector<std::string> keys(count);
@@ -400,10 +437,11 @@ static void ProcessBatchRequest(SpdkSsdTier& tier, ProxyCache& cache,
 
             // Read-back-fill: cache data that was just read from NVMe so
             // subsequent reads by other ranks hit the cache.
-            if (cache.enabled()) {
-                for (uint32_t i = 0; i < count; ++i) {
-                    if (results[i])
+            for (uint32_t i = 0; i < count; ++i) {
+                if (results[i]) {
+                    if (cache.enabled())
                         cache.Put(keys[i], dst_ptrs[i], sizes[i]);
+                    WriteShmCache(shm, keys[i], dst_ptrs[i], sizes[i]);
                 }
             }
         }
@@ -506,9 +544,9 @@ static void PollLoop(SpdkSsdTier& tier, ProxyCache& cache,
                 void** dma_bufs = rank_dma[r].bufs;
                 int dma_count = rank_dma[r].count;
                 batch_worker[r] = std::thread(
-                    [&tier, &cache, &slot, data_region, region_size, ch, t, r,
+                    [&tier, &cache, &shm, &slot, data_region, region_size, ch, t, r,
                      &batch_inflight, dma_bufs, dma_count]() {
-                        ProcessBatchRequest(tier, cache, slot, data_region,
+                        ProcessBatchRequest(tier, cache, shm, slot, data_region,
                                             region_size, dma_bufs, dma_count);
                         slot.state.store(
                             static_cast<uint32_t>(SlotState::COMPLETED),
@@ -519,7 +557,7 @@ static void PollLoop(SpdkSsdTier& tier, ProxyCache& cache,
                                                 std::memory_order_release);
                     });
             } else {
-                ProcessSingleRequest(tier, cache, slot, data_region, region_size);
+                ProcessSingleRequest(tier, cache, shm, slot, data_region, region_size);
                 slot.state.store(static_cast<uint32_t>(SlotState::COMPLETED),
                                  std::memory_order_release);
                 ch->tail.store((t + 1) % kRingSize, std::memory_order_release);
@@ -682,8 +720,16 @@ int main(int argc, char** argv) {
     g_shm_name = shm_name;
     std::atexit(atexit_cleanup);
 
+    // SHM shared cache: direct-mapped, seqlock per slot, default 2MB/slot
+    static constexpr size_t kDefaultCacheSlotSize = 2ULL * 1024 * 1024;
+    size_t cache_slot_sz = kDefaultCacheSlotSize;
+    uint32_t cache_slots = (cache_mb > 0)
+        ? static_cast<uint32_t>((cache_mb * 1024 * 1024) / cache_slot_sz)
+        : 0;
+
     ProxyShmRegion shm;
-    int rc = shm.Create(shm_name, max_ranks, data_per_rank, /*try_hugepage=*/true);
+    int rc = shm.Create(shm_name, max_ranks, data_per_rank, /*try_hugepage=*/true,
+                        cache_slot_sz, cache_slots);
     if (rc != 0) {
         fprintf(stderr, "spdk_proxy: failed to create SHM '%s' rc=%d\n",
                 shm_name.c_str(), rc);
@@ -740,9 +786,10 @@ int main(int argc, char** argv) {
 
     ProxyCache cache(cache_mb * 1024 * 1024);
 
-    UMBP_LOG_INFO("spdk_proxy: READY — capacity=%zuMB, cache=%zuMB (%s), waiting for connections...",
+    UMBP_LOG_INFO("spdk_proxy: READY — capacity=%zuMB, heap_cache=%zuMB, shm_cache=%u×%zuMB=%zuMB, waiting for connections...",
                   total / (1024 * 1024), cache_mb,
-                  cache.enabled() ? "enabled" : "disabled");
+                  cache_slots, cache_slot_sz / (1024 * 1024),
+                  (size_t)cache_slots * cache_slot_sz / (1024 * 1024));
     fflush(stdout);
 
     PollLoop(tier, cache, shm, spawner_pid, rank_dma);

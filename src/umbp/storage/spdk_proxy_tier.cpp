@@ -510,6 +510,26 @@ bool SpdkProxyTier::Write(const std::string& key, const void* data, size_t size)
 
 bool SpdkProxyTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr,
                                 size_t size) {
+    // Fast path: SHM shared cache
+    if (connected_) {
+        auto* hdr = shm_.Header();
+        if (hdr->cache_num_slots > 0 && size <= CacheSlotDataCapacity(hdr)) {
+            uint32_t idx = CacheSlotIndex(key.data(),
+                                          static_cast<uint32_t>(key.size()),
+                                          hdr->cache_num_slots);
+            auto* slot = GetCacheSlot(shm_.Base(), hdr, idx);
+            uint64_t g1 = slot->gen.load(std::memory_order_acquire);
+            if (g1 != 0 && !(g1 & 1) &&
+                slot->key_len == key.size() &&
+                std::memcmp(slot->key, key.data(), key.size()) == 0 &&
+                slot->data_size == size) {
+                char* src = GetCacheSlotData(shm_.Base(), hdr, idx);
+                std::memcpy(reinterpret_cast<void*>(dst_ptr), src, size);
+                uint64_t g2 = slot->gen.load(std::memory_order_acquire);
+                if (g1 == g2) return true;
+            }
+        }
+    }
     uint64_t actual_size = 0;
     auto rc = SubmitAndWait(RequestType::READ, key, nullptr, 0,
                             reinterpret_cast<void*>(dst_ptr), size,
@@ -550,7 +570,51 @@ std::vector<bool> SpdkProxyTier::BatchReadIntoPtr(
     const std::vector<std::string>& keys,
     const std::vector<uintptr_t>& dst_ptrs,
     const std::vector<size_t>& sizes) {
+    // Fast path: try SHM shared cache (zero daemon involvement, single memcpy)
+    if (TryShmCacheBatchRead(keys, dst_ptrs, sizes)) {
+        return std::vector<bool>(keys.size(), true);
+    }
     return SubmitBatch(RequestType::BATCH_READ, keys, {}, dst_ptrs, sizes);
+}
+
+// ---------------------------------------------------------------------------
+// SHM shared cache read — seqlock protocol, lock-free, single memcpy
+// ---------------------------------------------------------------------------
+bool SpdkProxyTier::TryShmCacheBatchRead(
+    const std::vector<std::string>& keys,
+    const std::vector<uintptr_t>& dst_ptrs,
+    const std::vector<size_t>& sizes) const {
+    if (!connected_) return false;
+    auto* hdr = shm_.Header();
+    if (hdr->cache_num_slots == 0) return false;
+
+    void* base = shm_.Base();
+    size_t cap = CacheSlotDataCapacity(hdr);
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (sizes[i] > cap) return false;
+
+        uint32_t idx = CacheSlotIndex(keys[i].data(),
+                                      static_cast<uint32_t>(keys[i].size()),
+                                      hdr->cache_num_slots);
+        auto* slot = GetCacheSlot(base, hdr, idx);
+
+        uint64_t g1 = slot->gen.load(std::memory_order_acquire);
+        if (g1 == 0 || (g1 & 1)) return false;
+
+        if (slot->key_len != keys[i].size() ||
+            std::memcmp(slot->key, keys[i].data(), keys[i].size()) != 0 ||
+            slot->data_size != sizes[i])
+            return false;
+
+        char* src = GetCacheSlotData(base, hdr, idx);
+        char* dst = reinterpret_cast<char*>(dst_ptrs[i]);
+        std::memcpy(dst, src, sizes[i]);
+
+        uint64_t g2 = slot->gen.load(std::memory_order_acquire);
+        if (g1 != g2) return false;
+    }
+    return true;
 }
 
 std::string SpdkProxyTier::GetLRUKey() const {
