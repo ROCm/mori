@@ -24,7 +24,7 @@
 
 #include "src/pybind/mori.hpp"
 #include "umbp/common/config.h"
-#include "umbp/umbp_client.h"
+#include "umbp/local/umbp_client.h"
 
 namespace py = pybind11;
 

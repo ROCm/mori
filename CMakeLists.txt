@@ -309,15 +309,16 @@ if(BUILD_IO)
   add_subdirectory(src/io)
 endif()
 
-if(BUILD_UMBP)
-  add_subdirectory(src/umbp)
-endif()
-
 if(BUILD_PYBINDS)
   add_subdirectory(src/pybind)
 endif()
 
+if(BUILD_UMBP)
+  add_subdirectory(src/umbp)
+endif()
+
 if(BUILD_TESTS)
+  enable_testing()
   add_subdirectory(tests/cpp)
 endif()
 
@@ -351,3 +352,4 @@ install(FILES
 if(TARGET spdlog)
   install(TARGETS spdlog ARCHIVE DESTINATION lib)
 endif()
+
