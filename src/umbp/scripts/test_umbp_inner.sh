@@ -3,6 +3,10 @@ set -e
 
 # Inner script that runs inside the docker container.
 # Called by test_umbp_integration.sh — not meant to be run directly on the host.
+#
+# Usage: test_umbp_inner.sh [branch]
+
+MORI_BRANCH="${1:-main}"
 
 # ===========================================================================
 # Helper functions
@@ -122,7 +126,7 @@ echo "=== Step 1/3: Updating sglang ==="
 cd /sgl-workspace/sglang/ && git pull
 
 echo "=== Step 2/3: Building mori with UMBP ==="
-cd /sgl-workspace/mori && git checkout feat_ump_dist && git pull
+cd /sgl-workspace/mori && git checkout "$MORI_BRANCH" && git pull --rebase
 BUILD_UMBP=ON BUILD_TESTS=ON pip3 install -e /apps/ditian12/mori --no-build-isolation -v
 
 echo "=== Step 3/3: Running hicache benchmark ==="

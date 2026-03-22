@@ -5,9 +5,11 @@ set -e
 # Launches docker container, rebuilds mori with UMBP, and runs hicache benchmarks.
 #
 # Usage:
-#   bash test_umbp_integration.sh
+#   bash test_umbp_integration.sh [branch]
+#   bash test_umbp_integration.sh feat_ump_dist
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MORI_BRANCH="${1:-main}"
 IMAGE_NAME=rocm/pytorch-private:sglang-0.5.9-rocm700-mi35x-20260316-hicache
 
 echo "=== UMBP Integration Test ==="
@@ -34,4 +36,4 @@ sudo docker run -i \
     -v /it-share:/it-share \
     -v /usr/sbin/nicctl:/usr/sbin/nicctl \
     --shm-size 32G \
-    ${IMAGE_NAME} /bin/bash "${SCRIPT_DIR}/test_umbp_inner.sh"
+    ${IMAGE_NAME} /bin/bash "${SCRIPT_DIR}/test_umbp_inner.sh" "${MORI_BRANCH}"
