@@ -266,6 +266,16 @@ static BenchResult RunBatchPhased(UMBPClient& client, int rank_id,
         // so that Follower reads can find every key in entries_.
         client.Flush();
 
+        // Drop OS page cache if UMBP_DROP_CACHES=1 so that the first
+        // read iteration measures true cold-read from disk (POSIX only).
+        static bool drop_caches = (std::getenv("UMBP_DROP_CACHES") &&
+                                   std::string(std::getenv("UMBP_DROP_CACHES")) == "1");
+        if (drop_caches) {
+            sync();
+            FILE* dc = fopen("/proc/sys/vm/drop_caches", "w");
+            if (dc) { fprintf(dc, "3\n"); fclose(dc); }
+        }
+
         coord->write_gen.store(size_idx + 1, std::memory_order_release);
     }
 
