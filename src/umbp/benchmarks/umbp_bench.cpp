@@ -538,7 +538,7 @@ int main(int argc, char** argv) {
 
     auto cfg = UMBPConfig::FromEnvironment();
     const char* backend = cfg.ssd_backend.c_str();
-    bool is_phased = (cfg.ssd_backend == "spdk" && num_ranks > 1);
+    bool is_phased = (num_ranks > 1);
 
     for (auto& rr : all_results) {
         const char* role_str;
