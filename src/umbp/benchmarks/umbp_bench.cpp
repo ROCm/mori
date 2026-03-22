@@ -4,18 +4,17 @@
 // umbp_bench: End-to-end benchmark using UMBPClient (full stack).
 //
 // Modes:
-//   Single process (default):
-//     ./umbp_bench                                            # POSIX
-//     UMBP_SPDK_NVME_PCI=... ./umbp_bench                    # SPDK Standalone
+//   Throughput (default):
+//     ./umbp_bench                                            # POSIX single
+//     UMBP_SPDK_NVME_PCI=... ./umbp_bench --ranks=8          # SPDK multi
 //
-//   Multi-process real-scenario (Linux only):
-//     UMBP_SPDK_NVME_PCI=... ./umbp_bench --ranks=8
-//       → Leader writes → barrier → all ranks concurrently read SAME data
-//       → barrier → next size.  Simulates Prefill/Decode KV cache pattern.
+//   Latency (single-thread QD=1, per-op timing):
+//     ./umbp_bench --latency                                  # POSIX
+//     UMBP_SPDK_NVME_PCI=... ./umbp_bench --latency          # SPDK
 //
-// The benchmark writes directly to SSD tier to measure disk I/O bandwidth,
-// bypassing the DRAM cache layer.
+// Cold reads use O_DIRECT (POSIX) or bypass ring cache (SPDK).
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -455,13 +454,149 @@ static int RunBenchmarkProcess(int rank_id, int num_ranks, int pipe_fd,
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Latency benchmark: single-thread QD=1, per-op timing
+// ---------------------------------------------------------------------------
+static const SizeSpec kLatencySpecs[] = {
+    {4 * 1024, 500},
+    {32 * 1024, 500},
+    {128 * 1024, 200},
+    {512 * 1024, 100},
+    {1024 * 1024, 50},
+    {2ULL * 1024 * 1024, 50},
+    {4ULL * 1024 * 1024, 30},
+    {8ULL * 1024 * 1024, 20},
+    {16ULL * 1024 * 1024, 10},
+};
+
+struct LatencyStats {
+    double avg_us, p50_us, p99_us, max_us;
+};
+
+static LatencyStats ComputeStats(std::vector<double>& samples_us) {
+    if (samples_us.empty()) return {0, 0, 0, 0};
+    std::sort(samples_us.begin(), samples_us.end());
+    size_t n = samples_us.size();
+    double sum = 0;
+    for (double v : samples_us) sum += v;
+    return {
+        sum / static_cast<double>(n),
+        samples_us[n / 2],
+        samples_us[std::min(n - 1, static_cast<size_t>(n * 0.99))],
+        samples_us[n - 1]
+    };
+}
+
+static int RunLatencyBench() {
+    auto cfg = UMBPConfig::FromEnvironment();
+    cfg.dram_capacity_bytes = 64ULL * 1024 * 1024;
+    UMBPClient client(cfg);
+
+    auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
+    if (!ssd) {
+        fprintf(stderr, "ERROR: no SSD tier available\n");
+        return 1;
+    }
+
+    const char* backend = cfg.ssd_backend.c_str();
+    std::string session = MakeSessionId();
+
+    printf("\n================================================================\n");
+    printf(" LATENCY Benchmark — backend=%s  (single-thread QD=1)\n", backend);
+    printf("================================================================\n");
+    printf("  %8s  %7s  %5s  %10s  %10s  %10s  %10s\n",
+           "ValSize", "Op", "Count", "Avg(us)", "P50(us)", "P99(us)", "Max(us)");
+
+    for (const auto& spec : kLatencySpecs) {
+        size_t vsize = spec.size;
+        int count = spec.count;
+
+        char sz_label[16];
+        if (vsize >= 1024 * 1024)
+            snprintf(sz_label, sizeof(sz_label), "%zuMB", vsize / (1024 * 1024));
+        else
+            snprintf(sz_label, sizeof(sz_label), "%zuKB", vsize / 1024);
+
+        std::string prefix = "lat_" + session + "_" + std::to_string(vsize) + "_";
+
+        std::vector<char> data(vsize);
+        for (size_t j = 0; j < vsize; ++j)
+            data[j] = static_cast<char>((j + 1) & 0xFF);
+
+        std::vector<char> read_buf(vsize, 0);
+        uintptr_t dst = reinterpret_cast<uintptr_t>(read_buf.data());
+
+        // --- Write latency ---
+        {
+            std::vector<double> samples;
+            samples.reserve(count);
+            for (int i = 0; i < count; ++i) {
+                std::string key = prefix + std::to_string(i);
+                double t0 = NowSec();
+                ssd->Write(key, data.data(), vsize);
+                double t1 = NowSec();
+                samples.push_back((t1 - t0) * 1e6);
+            }
+            auto st = ComputeStats(samples);
+            printf("  %8s  %7s  %5d  %10.1f  %10.1f  %10.1f  %10.1f\n",
+                   sz_label, "Write", count, st.avg_us, st.p50_us, st.p99_us, st.max_us);
+        }
+
+        ssd->Flush();
+
+        // --- Cold read latency (O_DIRECT / bypass cache) ---
+        {
+            ssd->SetColdRead(true);
+            std::vector<double> samples;
+            samples.reserve(count);
+            for (int i = 0; i < count; ++i) {
+                std::string key = prefix + std::to_string(i);
+                double t0 = NowSec();
+                ssd->ReadIntoPtr(key, dst, vsize);
+                double t1 = NowSec();
+                samples.push_back((t1 - t0) * 1e6);
+            }
+            ssd->SetColdRead(false);
+            auto st = ComputeStats(samples);
+            printf("  %8s  %7s  %5d  %10.1f  %10.1f  %10.1f  %10.1f\n",
+                   sz_label, "ColdRd", count, st.avg_us, st.p50_us, st.p99_us, st.max_us);
+        }
+
+        // --- Hot read latency (page cache / ring cache) ---
+        {
+            std::vector<double> samples;
+            samples.reserve(count);
+            for (int i = 0; i < count; ++i) {
+                std::string key = prefix + std::to_string(i);
+                double t0 = NowSec();
+                ssd->ReadIntoPtr(key, dst, vsize);
+                double t1 = NowSec();
+                samples.push_back((t1 - t0) * 1e6);
+            }
+            auto st = ComputeStats(samples);
+            printf("  %8s  %7s  %5d  %10.1f  %10.1f  %10.1f  %10.1f\n",
+                   sz_label, "HotRd", count, st.avg_us, st.p50_us, st.p99_us, st.max_us);
+        }
+    }
+
+    printf("================================================================\n");
+    fflush(stdout);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     int num_ranks = 1;
+    bool latency_mode = false;
     for (int i = 1; i < argc; ++i) {
         if (strncmp(argv[i], "--ranks=", 8) == 0) {
             num_ranks = std::atoi(argv[i] + 8);
+        } else if (strcmp(argv[i], "--latency") == 0) {
+            latency_mode = true;
         }
     }
+
+    if (latency_mode)
+        return RunLatencyBench();
 
     if (num_ranks <= 1) {
         return RunBenchmarkProcess(0, 1, -1, nullptr);
