@@ -364,8 +364,7 @@ static void ProcessBatchRequest(SpdkSsdTier& tier,
                                 void* data_region, size_t region_size,
                                 bool write_back,
                                 void** dma_bufs = nullptr, int dma_count = 0,
-                                WbFlushTask* wb_out = nullptr,
-                                bool ring_read = false) {
+                                WbFlushTask* wb_out = nullptr) {
     auto type = static_cast<RequestType>(slot.type);
     auto* desc = static_cast<BatchDescriptor*>(data_region);
     uint32_t count = desc->count;
@@ -483,9 +482,8 @@ static void ProcessBatchRequest(SpdkSsdTier& tier,
         }
     } else {
         // BATCH_READ — NVMe streaming read.
-        // If ring_read is enabled and ring cache has capacity, DMA into
-        // ring buffer directly so data is cached with zero extra memcpy.
-        // Otherwise, DMA into data_region and back-fill ring afterwards.
+        // DMA into ring buffer directly so data is cached with zero extra
+        // memcpy. Falls back to data_region only if ring alloc fails.
         std::vector<std::string> keys(count);
         std::vector<size_t> sizes(count);
         for (uint32_t i = 0; i < count; ++i) {
@@ -503,7 +501,7 @@ static void ProcessBatchRequest(SpdkSsdTier& tier,
         char* ring_data = nullptr;
         uint64_t ring_cap = 0;
 
-        if (ring_read && ctrl) {
+        if (ctrl) {
             ring_cap = ctrl->capacity;
             ring_base = AllocRingContiguous(ctrl, desc->total_data_size);
             if (ring_base != UINT64_MAX)
@@ -624,7 +622,7 @@ static constexpr int kMaxConcurrentRanks = 64;
 static void PollLoop(SpdkSsdTier& tier,
                      ProxyShmRegion& shm,
                      pid_t spawner_pid, RankDmaPool* rank_dma,
-                     bool write_back, bool ring_read) {
+                     bool write_back) {
     auto* hdr = shm.Header();
     uint32_t max_ranks = std::min(hdr->max_ranks,
                                   static_cast<uint32_t>(kMaxConcurrentRanks));
@@ -678,15 +676,14 @@ static void PollLoop(SpdkSsdTier& tier,
                 batch_worker[r] = std::thread(
                     [&tier, &shm, &slot, data_region, region_size, ch, t, r,
                      &batch_inflight, dma_bufs, dma_count, write_back, rtype,
-                     wbq, ring_read]() {
+                     wbq]() {
                         bool is_wb_write = write_back &&
                             rtype == RequestType::BATCH_WRITE;
                         WbFlushTask wb_task;
                         ProcessBatchRequest(tier, shm, slot, data_region,
                                             region_size, write_back,
                                             dma_bufs, dma_count,
-                                            is_wb_write ? &wb_task : nullptr,
-                                            ring_read);
+                                            is_wb_write ? &wb_task : nullptr);
                         slot.state.store(
                             static_cast<uint32_t>(SlotState::COMPLETED),
                             std::memory_order_release);
@@ -859,7 +856,6 @@ int main(int argc, char** argv) {
     std::string shm_name = getenv_str("UMBP_SPDK_PROXY_SHM", kDefaultShmName);
     int max_ranks = getenv_int("UMBP_SPDK_PROXY_MAX_RANKS", 8);
     bool write_back = getenv_int("UMBP_SPDK_PROXY_WRITE_BACK", 0) != 0;
-    bool ring_read = getenv_int("UMBP_SPDK_RING_READ", 1) != 0;
 
     if (nvme_pci.empty() && bdev_name.empty()) {
         fprintf(stderr,
@@ -953,16 +949,15 @@ int main(int argc, char** argv) {
     AllocRankDmaPools(rank_dma, max_ranks);
 
     UMBP_LOG_INFO("spdk_proxy: READY — capacity=%zuMB, ring=%zuMB (index=%u slots), "
-                  "data_region=%zuMB/rank, write_back=%s, ring_read=%s",
+                  "data_region=%zuMB/rank, write_back=%s",
                   total / (1024 * 1024),
                   ring_mb,
                   hdr->cache_index_slots,
                   data_per_rank_mb,
-                  write_back ? "ON" : "OFF",
-                  ring_read ? "ON" : "OFF");
+                  write_back ? "ON" : "OFF");
     fflush(stdout);
 
-    PollLoop(tier, shm, spawner_pid, rank_dma, write_back, ring_read);
+    PollLoop(tier, shm, spawner_pid, rank_dma, write_back);
 
     FreeRankDmaPools(rank_dma, max_ranks);
     delete[] rank_dma;
