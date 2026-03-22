@@ -25,7 +25,7 @@
 #include <string>
 #include <vector>
 
-#include "umbp/route_get_strategy.h"
+#include "umbp/distributed/routing/route_get_strategy.h"
 
 namespace mori::umbp {
 namespace {

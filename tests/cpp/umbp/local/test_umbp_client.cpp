@@ -24,7 +24,7 @@
 #include <iostream>
 #include <vector>
 
-#include "umbp/umbp_client.h"
+#include "umbp/local/umbp_client.h"
 
 void test_put_get() {
   std::cout << "test_put_get... ";

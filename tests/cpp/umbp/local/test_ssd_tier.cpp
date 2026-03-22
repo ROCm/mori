@@ -24,7 +24,7 @@
 #include <iostream>
 #include <vector>
 
-#include "umbp/storage/local_storage_manager.h"
+#include "umbp/local/storage/local_storage_manager.h"
 
 void test_segmented_recovery() {
   std::cout << "test_segmented_recovery... ";

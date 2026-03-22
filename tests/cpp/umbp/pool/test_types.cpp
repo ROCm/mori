@@ -21,7 +21,7 @@
 // SOFTWARE.
 #include <gtest/gtest.h>
 
-#include "umbp/types.h"
+#include "umbp/common/types.h"
 
 namespace mori::umbp {
 

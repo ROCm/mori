@@ -1,3 +1,24 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 #include <gtest/gtest.h>
 
 #include <cstring>
@@ -7,9 +28,9 @@
 #include <thread>
 #include <vector>
 
-#include "umbp/master_server.h"
-#include "umbp/pool_client.h"
-#include "umbp/route_put_strategy.h"
+#include "umbp/distributed/master/master_server.h"
+#include "umbp/distributed/pool_client.h"
+#include "umbp/distributed/routing/route_put_strategy.h"
 
 namespace mori::umbp {
 namespace {
@@ -29,12 +50,10 @@ class LocalOnlyPutStrategy : public RoutePutStrategy {
   LocalOnlyPutStrategy(std::string node_id, TierType tier)
       : local_node_id_(std::move(node_id)), tier_(tier) {}
 
-  std::optional<RoutePutResult> Select(
-      const std::vector<ClientRecord>& alive_clients,
-      uint64_t block_size) override {
+  std::optional<RoutePutResult> Select(const std::vector<ClientRecord>& alive_clients,
+                                       uint64_t block_size) override {
     for (const auto& c : alive_clients) {
-      if (c.node_id == local_node_id_ &&
-          c.tier_capacities.count(tier_) > 0) {
+      if (c.node_id == local_node_id_ && c.tier_capacities.count(tier_) > 0) {
         return RoutePutResult{c.node_id, c.node_address, tier_};
       }
     }
@@ -54,8 +73,7 @@ class PoolClientDramTest : public ::testing::Test {
     MasterServerConfig master_config;
     master_config.listen_address = "0.0.0.0:" + std::to_string(port_);
     master_config.registry_config.heartbeat_ttl = std::chrono::seconds(30);
-    master_config.put_strategy =
-        std::make_unique<LocalOnlyPutStrategy>(node_id_, TierType::DRAM);
+    master_config.put_strategy = std::make_unique<LocalOnlyPutStrategy>(node_id_, TierType::DRAM);
 
     master_ = std::make_unique<MasterServer>(std::move(master_config));
     master_thread_ = std::thread([this] { master_->Run(); });
@@ -66,10 +84,8 @@ class PoolClientDramTest : public ::testing::Test {
     client_config.master_config.node_id = node_id_;
     client_config.master_config.node_address = "localhost";
     client_config.master_config.auto_heartbeat = false;
-    client_config.dram_buffers.push_back(
-        {dram_buffer_.data(), dram_buffer_.size()});
-    client_config.tier_capacities[TierType::DRAM] = {
-        dram_buffer_.size(), dram_buffer_.size()};
+    client_config.dram_buffers.push_back({dram_buffer_.data(), dram_buffer_.size()});
+    client_config.tier_capacities[TierType::DRAM] = {dram_buffer_.size(), dram_buffer_.size()};
 
     client_ = std::make_unique<PoolClient>(std::move(client_config));
     ASSERT_TRUE(client_->Init());
@@ -135,15 +151,13 @@ class PoolClientSsdTest : public ::testing::Test {
     master_addr_ = "localhost:" + std::to_string(port_);
 
     ssd_dir_ = std::filesystem::temp_directory_path() /
-               ("umbp_test_ssd_pool_" + std::to_string(getpid()) + "_" +
-                std::to_string(port_));
+               ("umbp_test_ssd_pool_" + std::to_string(getpid()) + "_" + std::to_string(port_));
     std::filesystem::create_directories(ssd_dir_);
 
     MasterServerConfig master_config;
     master_config.listen_address = "0.0.0.0:" + std::to_string(port_);
     master_config.registry_config.heartbeat_ttl = std::chrono::seconds(30);
-    master_config.put_strategy =
-        std::make_unique<LocalOnlyPutStrategy>(node_id_, TierType::SSD);
+    master_config.put_strategy = std::make_unique<LocalOnlyPutStrategy>(node_id_, TierType::SSD);
 
     master_ = std::make_unique<MasterServer>(std::move(master_config));
     master_thread_ = std::thread([this] { master_->Run(); });
@@ -155,8 +169,7 @@ class PoolClientSsdTest : public ::testing::Test {
     client_config.master_config.node_address = "localhost";
     client_config.master_config.auto_heartbeat = false;
     client_config.ssd_stores.push_back({ssd_dir_.string(), 10 * 1024 * 1024});
-    client_config.tier_capacities[TierType::SSD] = {
-        10ULL * 1024 * 1024, 10ULL * 1024 * 1024};
+    client_config.tier_capacities[TierType::SSD] = {10ULL * 1024 * 1024, 10ULL * 1024 * 1024};
 
     client_ = std::make_unique<PoolClient>(std::move(client_config));
     ASSERT_TRUE(client_->Init());
@@ -231,9 +244,8 @@ class PoolClientMultiSsdTest : public ::testing::Test {
     port_ = AllocPort();
     master_addr_ = "localhost:" + std::to_string(port_);
 
-    std::string base = std::filesystem::temp_directory_path().string() +
-                       "/umbp_test_multi_ssd_" + std::to_string(getpid()) + "_" +
-                       std::to_string(port_);
+    std::string base = std::filesystem::temp_directory_path().string() + "/umbp_test_multi_ssd_" +
+                       std::to_string(getpid()) + "_" + std::to_string(port_);
     ssd_dir_0_ = base + "_0";
     ssd_dir_1_ = base + "_1";
     std::filesystem::create_directories(ssd_dir_0_);
@@ -242,8 +254,7 @@ class PoolClientMultiSsdTest : public ::testing::Test {
     MasterServerConfig master_config;
     master_config.listen_address = "0.0.0.0:" + std::to_string(port_);
     master_config.registry_config.heartbeat_ttl = std::chrono::seconds(30);
-    master_config.put_strategy =
-        std::make_unique<LocalOnlyPutStrategy>(node_id_, TierType::SSD);
+    master_config.put_strategy = std::make_unique<LocalOnlyPutStrategy>(node_id_, TierType::SSD);
 
     master_ = std::make_unique<MasterServer>(std::move(master_config));
     master_thread_ = std::thread([this] { master_->Run(); });
@@ -296,8 +307,7 @@ TEST_F(PoolClientMultiSsdTest, DistributesAcrossStores) {
     std::string data = "data-" + std::to_string(i) + "-payload";
     std::vector<char> src(data.begin(), data.end());
 
-    ASSERT_TRUE(client_->Put(key, src.data(), src.size()))
-        << "Put failed for key=" << key;
+    ASSERT_TRUE(client_->Put(key, src.data(), src.size())) << "Put failed for key=" << key;
     keys.push_back(key);
 
     std::vector<char> dst(src.size(), 0);
@@ -326,9 +336,8 @@ class PoolClientSsdFullTest : public ::testing::Test {
     port_ = AllocPort();
     master_addr_ = "localhost:" + std::to_string(port_);
 
-    std::string base = std::filesystem::temp_directory_path().string() +
-                       "/umbp_test_ssd_full_" + std::to_string(getpid()) + "_" +
-                       std::to_string(port_);
+    std::string base = std::filesystem::temp_directory_path().string() + "/umbp_test_ssd_full_" +
+                       std::to_string(getpid()) + "_" + std::to_string(port_);
     ssd_dir_0_ = base + "_0";
     ssd_dir_1_ = base + "_1";
     std::filesystem::create_directories(ssd_dir_0_);
@@ -337,8 +346,7 @@ class PoolClientSsdFullTest : public ::testing::Test {
     MasterServerConfig master_config;
     master_config.listen_address = "0.0.0.0:" + std::to_string(port_);
     master_config.registry_config.heartbeat_ttl = std::chrono::seconds(30);
-    master_config.put_strategy =
-        std::make_unique<LocalOnlyPutStrategy>(node_id_, TierType::SSD);
+    master_config.put_strategy = std::make_unique<LocalOnlyPutStrategy>(node_id_, TierType::SSD);
 
     master_ = std::make_unique<MasterServer>(std::move(master_config));
     master_thread_ = std::thread([this] { master_->Run(); });
@@ -497,8 +505,7 @@ class PoolClientMultiDramTest : public ::testing::Test {
     MasterServerConfig master_config;
     master_config.listen_address = "0.0.0.0:" + std::to_string(port_);
     master_config.registry_config.heartbeat_ttl = std::chrono::seconds(30);
-    master_config.put_strategy =
-        std::make_unique<LocalOnlyPutStrategy>(node_id_, TierType::DRAM);
+    master_config.put_strategy = std::make_unique<LocalOnlyPutStrategy>(node_id_, TierType::DRAM);
 
     master_ = std::make_unique<MasterServer>(std::move(master_config));
     master_thread_ = std::thread([this] { master_->Run(); });

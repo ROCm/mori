@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-#include "umbp/route_put_strategy.h"
+#include "umbp/distributed/routing/route_put_strategy.h"
 
 namespace mori::umbp {
 namespace {
@@ -51,8 +51,8 @@ TEST(TierAwareMostAvailableTest, PrefersHBMOverDRAM) {
   TierAwareMostAvailableStrategy strategy;
 
   std::vector<ClientRecord> clients = {
-      MakeClient("node-a", "addr-a", {{TierType::HBM, {80 * GB, 10 * GB}},
-                                       {TierType::DRAM, {512 * GB, 400 * GB}}}),
+      MakeClient("node-a", "addr-a",
+                 {{TierType::HBM, {80 * GB, 10 * GB}}, {TierType::DRAM, {512 * GB, 400 * GB}}}),
   };
 
   auto result = strategy.Select(clients, 4096);
@@ -65,8 +65,8 @@ TEST(TierAwareMostAvailableTest, FallsThroughToDRAMWhenHBMFull) {
   TierAwareMostAvailableStrategy strategy;
 
   std::vector<ClientRecord> clients = {
-      MakeClient("node-a", "addr-a", {{TierType::HBM, {80 * GB, 0}},
-                                       {TierType::DRAM, {512 * GB, 200 * GB}}}),
+      MakeClient("node-a", "addr-a",
+                 {{TierType::HBM, {80 * GB, 0}}, {TierType::DRAM, {512 * GB, 200 * GB}}}),
   };
 
   auto result = strategy.Select(clients, 4096);
@@ -78,9 +78,10 @@ TEST(TierAwareMostAvailableTest, FallsThroughToSSDWhenHBMAndDRAMFull) {
   TierAwareMostAvailableStrategy strategy;
 
   std::vector<ClientRecord> clients = {
-      MakeClient("node-a", "addr-a", {{TierType::HBM, {80 * GB, 0}},
-                                       {TierType::DRAM, {512 * GB, 0}},
-                                       {TierType::SSD, {4096 * GB, 3000 * GB}}}),
+      MakeClient("node-a", "addr-a",
+                 {{TierType::HBM, {80 * GB, 0}},
+                  {TierType::DRAM, {512 * GB, 0}},
+                  {TierType::SSD, {4096 * GB, 3000 * GB}}}),
   };
 
   auto result = strategy.Select(clients, 4096);
@@ -92,9 +93,10 @@ TEST(TierAwareMostAvailableTest, ReturnsNulloptWhenAllFull) {
   TierAwareMostAvailableStrategy strategy;
 
   std::vector<ClientRecord> clients = {
-      MakeClient("node-a", "addr-a", {{TierType::HBM, {80 * GB, 0}},
-                                       {TierType::DRAM, {512 * GB, 0}},
-                                       {TierType::SSD, {4096 * GB, 0}}}),
+      MakeClient("node-a", "addr-a",
+                 {{TierType::HBM, {80 * GB, 0}},
+                  {TierType::DRAM, {512 * GB, 0}},
+                  {TierType::SSD, {4096 * GB, 0}}}),
   };
 
   auto result = strategy.Select(clients, 4096);
@@ -132,8 +134,8 @@ TEST(TierAwareMostAvailableTest, HBMPreferredEvenIfDRAMHasMoreSpace) {
   TierAwareMostAvailableStrategy strategy;
 
   std::vector<ClientRecord> clients = {
-      MakeClient("node-a", "addr-a", {{TierType::HBM, {80 * GB, 5 * GB}},
-                                       {TierType::DRAM, {512 * GB, 400 * GB}}}),
+      MakeClient("node-a", "addr-a",
+                 {{TierType::HBM, {80 * GB, 5 * GB}}, {TierType::DRAM, {512 * GB, 400 * GB}}}),
   };
 
   auto result = strategy.Select(clients, 4096);

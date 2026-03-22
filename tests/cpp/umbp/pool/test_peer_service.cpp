@@ -1,5 +1,26 @@
-#include <gtest/gtest.h>
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 #include <grpcpp/grpcpp.h>
+#include <gtest/gtest.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -9,7 +30,7 @@
 #include <thread>
 #include <vector>
 
-#include "umbp/peer_service.h"
+#include "umbp/distributed/peer/peer_service.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
@@ -31,8 +52,8 @@ class PeerServiceTest : public ::testing::Test {
     ASSERT_NE(staging_buffer_, nullptr);
     std::memset(staging_buffer_, 0, kStagingSize);
 
-    ssd_dir_ = std::filesystem::temp_directory_path() / ("umbp_test_ssd_" + std::to_string(getpid())
-               + "_" + std::to_string(AllocPort()));
+    ssd_dir_ = std::filesystem::temp_directory_path() /
+               ("umbp_test_ssd_" + std::to_string(getpid()) + "_" + std::to_string(AllocPort()));
     std::filesystem::create_directories(ssd_dir_);
 
     ssd_staging_mem_desc_ = {0xD0, 0xE0, 0xF0};
@@ -40,10 +61,8 @@ class PeerServiceTest : public ::testing::Test {
     port_ = AllocPort();
 
     server_ = std::make_unique<PeerServiceServer>(
-        staging_buffer_, kStagingSize,
-        ssd_staging_mem_desc_,
-        std::vector<std::string>{ssd_dir_.string()},
-        std::vector<size_t>{kSsdCapacity});
+        staging_buffer_, kStagingSize, ssd_staging_mem_desc_,
+        std::vector<std::string>{ssd_dir_.string()}, std::vector<size_t>{kSsdCapacity});
     server_->Start(port_);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
@@ -196,10 +215,8 @@ TEST_F(PeerServiceTest, PrepareSsdReadNotFound) {
 
 TEST_F(PeerServiceTest, CommitSsdWriteOverCapacity) {
   auto server_small = std::make_unique<PeerServiceServer>(
-      staging_buffer_, kStagingSize,
-      ssd_staging_mem_desc_,
-      std::vector<std::string>{ssd_dir_.string()},
-      std::vector<size_t>{16});
+      staging_buffer_, kStagingSize, ssd_staging_mem_desc_,
+      std::vector<std::string>{ssd_dir_.string()}, std::vector<size_t>{16});
   uint16_t small_port = AllocPort();
   server_small->Start(small_port);
   std::this_thread::sleep_for(std::chrono::milliseconds(200));

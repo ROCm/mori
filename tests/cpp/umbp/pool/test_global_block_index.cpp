@@ -28,8 +28,8 @@
 #include <utility>
 #include <vector>
 
-#include "umbp/block_index/global_block_index.h"
-#include "umbp/client_registry.h"
+#include "umbp/distributed/master/client_registry.h"
+#include "umbp/distributed/master/global_block_index.h"
 
 namespace mori::umbp {
 namespace {

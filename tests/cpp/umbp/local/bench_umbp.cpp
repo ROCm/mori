@@ -63,11 +63,11 @@
 
 #include "umbp/common/config.h"
 #include "umbp/common/storage_tier.h"
-#include "umbp/storage/dram_tier.h"
-#include "umbp/storage/io/storage_io_driver.h"
-#include "umbp/storage/local_storage_manager.h"
-#include "umbp/storage/ssd_tier.h"
-#include "umbp/umbp_client.h"
+#include "umbp/local/storage/dram_tier.h"
+#include "umbp/local/storage/io/storage_io_driver.h"
+#include "umbp/local/storage/local_storage_manager.h"
+#include "umbp/local/storage/ssd_tier.h"
+#include "umbp/local/umbp_client.h"
 
 namespace fs = std::filesystem;
 

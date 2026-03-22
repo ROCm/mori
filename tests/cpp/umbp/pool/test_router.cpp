@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-#include "umbp/router.h"
+#include "umbp/distributed/routing/router.h"
 
 namespace mori::umbp {
 namespace {

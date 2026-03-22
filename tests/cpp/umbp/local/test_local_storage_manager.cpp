@@ -26,7 +26,7 @@
 #include <iostream>
 #include <vector>
 
-#include "umbp/storage/local_storage_manager.h"
+#include "umbp/local/storage/local_storage_manager.h"
 
 void test_dram_write_read() {
   std::cout << "test_dram_write_read... ";

@@ -27,7 +27,7 @@
 #include <thread>
 #include <vector>
 
-#include "umbp/client_registry.h"
+#include "umbp/distributed/master/client_registry.h"
 
 namespace mori::umbp {
 namespace {

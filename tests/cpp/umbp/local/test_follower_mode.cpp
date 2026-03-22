@@ -27,8 +27,8 @@
 #include <thread>
 #include <vector>
 
-#include "umbp/storage/ssd_tier.h"
-#include "umbp/umbp_client.h"
+#include "umbp/local/storage/ssd_tier.h"
+#include "umbp/local/umbp_client.h"
 
 namespace fs = std::filesystem;
 

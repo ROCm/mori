@@ -1,20 +1,20 @@
 # Core static library
 add_library(
   umbp_core STATIC
-  block_index/local_block_index.cpp
-  storage/io/storage_io_driver.cpp
-  storage/io/posix_storage_io_driver.cpp
-  storage/io/io_uring_storage_io_driver.cpp
-  storage/copy_pipeline.cpp
-  storage/segment/segment_format.cpp
-  storage/segment/segment_index.cpp
-  storage/segment/segment_scanner.cpp
-  storage/segment/segment_writer.cpp
-  storage/tier_backend.cpp
-  storage/dram_tier.cpp
-  storage/ssd_tier.cpp
-  storage/local_storage_manager.cpp
-  umbp_client.cpp)
+  local/block_index/local_block_index.cpp
+  local/storage/io/storage_io_driver.cpp
+  local/storage/io/posix_storage_io_driver.cpp
+  local/storage/io/io_uring_storage_io_driver.cpp
+  local/storage/copy_pipeline.cpp
+  local/storage/segment/segment_format.cpp
+  local/storage/segment/segment_index.cpp
+  local/storage/segment/segment_scanner.cpp
+  local/storage/segment/segment_writer.cpp
+  local/storage/tier_backend.cpp
+  local/storage/dram_tier.cpp
+  local/storage/ssd_tier.cpp
+  local/storage/local_storage_manager.cpp
+  local/umbp_client.cpp)
 target_include_directories(umbp_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(umbp_core PRIVATE pthread)
 
@@ -105,7 +105,7 @@ endif()
 
 # ---------- Proto compilation -------------------------------------------------
 
-set(UMBP_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
+set(UMBP_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/distributed/proto")
 set(UMBP_PROTO_FILE "${UMBP_PROTO_DIR}/umbp.proto")
 set(UMBP_PEER_PROTO_FILE "${UMBP_PROTO_DIR}/umbp_peer.proto")
 set(UMBP_PROTO_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/proto_gen")
@@ -153,16 +153,16 @@ add_library(
   ${UMBP_GRPC_SRCS}
   ${UMBP_PEER_PROTO_SRCS}
   ${UMBP_PEER_GRPC_SRCS}
-  src/types.cpp
-  src/block_index.cpp
-  src/client_registry.cpp
-  src/route_get_strategy.cpp
-  src/route_put_strategy.cpp
-  src/router.cpp
-  src/peer_service.cpp
-  src/pool_client.cpp
-  src/master_client.cpp
-  src/master_server.cpp)
+  distributed/common/types.cpp
+  distributed/master/global_block_index.cpp
+  distributed/master/client_registry.cpp
+  distributed/master/master_server.cpp
+  distributed/master/master_client.cpp
+  distributed/routing/router.cpp
+  distributed/routing/route_get_strategy.cpp
+  distributed/routing/route_put_strategy.cpp
+  distributed/peer/peer_service.cpp
+  distributed/pool_client.cpp)
 
 target_include_directories(
   umbp_common
@@ -190,7 +190,7 @@ target_compile_features(umbp_common PUBLIC cxx_std_17)
 
 # ---------- Master executable -------------------------------------------------
 
-add_executable(umbp_master src/master_main.cpp)
+add_executable(umbp_master distributed/bin/master_main.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   # Prevent lld/as-needed from discarding protobuf when symbols come from static
   # archives (libumbp_common.a -> generated *.pb.o).
@@ -201,7 +201,7 @@ target_link_libraries(umbp_master PRIVATE umbp_common ${_PROTOBUF_LIBS}
 
 # ---------- Client executable -------------------------------------------------
 
-add_executable(umbp_client src/client_main.cpp)
+add_executable(umbp_client distributed/bin/client_main.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   # Same linker retention rule as umbp_master.
   target_link_options(umbp_client PRIVATE -Wl,--no-as-needed)
@@ -211,7 +211,7 @@ target_link_libraries(umbp_client PRIVATE umbp_common ${_PROTOBUF_LIBS}
 
 # ---------- PoolClient demo executable ----------------------------------------
 
-add_executable(umbp_pool_client src/pool_client_main.cpp)
+add_executable(umbp_pool_client distributed/bin/pool_client_main.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_link_options(umbp_pool_client PRIVATE -Wl,--no-as-needed)
 endif()
