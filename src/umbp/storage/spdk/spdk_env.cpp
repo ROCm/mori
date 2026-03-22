@@ -360,15 +360,21 @@ int SpdkEnv::Init(const SpdkEnvConfig &config) {
             }
 
             if (use_raid) {
-                // Create RAID0 bdev on top of all NVMe base bdevs.
+                // UMBP_SPDK_RAID_STRIP_KB: strip size in KB (default 2048 = 2MB).
+                // Larger strips reduce sub-I/O count for large sequential workloads.
+                const char* strip_env = std::getenv("UMBP_SPDK_RAID_STRIP_KB");
+                int strip_kb = strip_env ? std::atoi(strip_env) : 2048;
+                if (strip_kb < 4) strip_kb = 4;
+
                 fprintf(f,
                     "      {\n"
                     "        \"method\": \"bdev_raid_create\",\n"
                     "        \"params\": {\n"
                     "          \"name\": \"Raid0\",\n"
-                    "          \"strip_size_kb\": 64,\n"
+                    "          \"strip_size_kb\": %d,\n"
                     "          \"raid_level\": \"raid0\",\n"
-                    "          \"base_bdevs\": [");
+                    "          \"base_bdevs\": [",
+                    strip_kb);
                 for (size_t i = 0; i < pci_addrs.size(); ++i) {
                     if (i > 0) fprintf(f, ", ");
                     fprintf(f, "\"NVMe%zun1\"", i);
@@ -376,8 +382,8 @@ int SpdkEnv::Init(const SpdkEnvConfig &config) {
                 fprintf(f, "]\n"
                     "        }\n"
                     "      }\n");
-                UMBP_LOG_INFO("SpdkEnv: RAID0 bdev — %zu disks, strip_size=64KB",
-                              pci_addrs.size());
+                UMBP_LOG_INFO("SpdkEnv: RAID0 bdev — %zu disks, strip_size=%dKB",
+                              pci_addrs.size(), strip_kb);
             } else {
                 // Remove trailing comma for single-disk case: rewind past ",\n"
                 fseek(f, -2, SEEK_CUR);
