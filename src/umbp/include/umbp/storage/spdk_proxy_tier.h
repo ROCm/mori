@@ -8,11 +8,8 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <list>
-#include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -72,25 +69,8 @@ class SpdkProxyTier : public TierBackend {
     uint32_t NextSeqId() const;
     bool IsProxyAlive() const;
 
-    // Per-item ShmCache read — seqlock, returns true on hit.
+    // Per-item ring cache read — seqlock, returns true on hit.
     bool TryShmCacheReadOne(const std::string& key, uintptr_t dst, size_t size) const;
-
-    // ---- Per-client heap read cache ----
-    // Controlled by UMBP_SPDK_READ_CACHE=1 (default OFF).
-    // When enabled, first read back-fills the cache; subsequent reads hit.
-    struct HeapEntry {
-        std::unique_ptr<char[]> data;
-        size_t size;
-        std::list<std::string>::iterator lru_pos;
-    };
-    void HeapCachePut(const std::string& key, const void* data, size_t size);
-    bool HeapCacheGet(const std::string& key, uintptr_t dst, size_t size) const;
-
-    bool heap_cache_enabled_ = false;
-    mutable std::unordered_map<std::string, HeapEntry> heap_cache_;
-    mutable std::list<std::string> heap_lru_;
-    mutable size_t heap_cache_bytes_ = 0;
-    size_t heap_cache_max_bytes_ = 0;
 
     bool connected_ = false;
     bool cold_read_ = false;    // UMBP_SPDK_COLD_READ=1: skip ring cache, always read from NVMe

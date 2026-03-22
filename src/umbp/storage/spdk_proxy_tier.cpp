@@ -116,28 +116,17 @@ SpdkProxyTier::SpdkProxyTier(const UMBPConfig& config)
 
     connected_ = true;
 
-    // Per-client heap read cache — disabled by default.
-    // Enable: UMBP_SPDK_READ_CACHE=1  (max size via UMBP_SPDK_READ_CACHE_MB, default 8GB)
-    const char* rc_env = std::getenv("UMBP_SPDK_READ_CACHE");
-    heap_cache_enabled_ = (rc_env && std::string(rc_env) == "1");
-    if (heap_cache_enabled_) {
-        const char* rcmb = std::getenv("UMBP_SPDK_READ_CACHE_MB");
-        size_t cache_mb = rcmb ? static_cast<size_t>(std::atol(rcmb)) : 8192;
-        heap_cache_max_bytes_ = cache_mb * 1024ULL * 1024ULL;
-    }
-
     // Cold-read mode: skip ring cache lookup, every read hits NVMe.
     const char* cold_env = std::getenv("UMBP_SPDK_COLD_READ");
     cold_read_ = (cold_env && std::string(cold_env) == "1");
 
     UMBP_LOG_INFO("SpdkProxyTier: connected rank=%u shm='%s' "
                   "bdev_size=%zuMB block_size=%u data_region=%zuMB "
-                  "read_cache=%s cold_read=%s",
+                  "cold_read=%s",
                   rank_id_, shm_name.c_str(),
                   static_cast<size_t>(hdr->bdev_size / (1024 * 1024)),
                   hdr->block_size,
                   static_cast<size_t>(hdr->data_region_per_rank / (1024 * 1024)),
-                  heap_cache_enabled_ ? "ON" : "OFF",
                   cold_read_ ? "ON" : "OFF");
 }
 
@@ -599,22 +588,13 @@ bool SpdkProxyTier::Write(const std::string& key, const void* data, size_t size)
 
 bool SpdkProxyTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr,
                                 size_t size) {
-    if (!cold_read_ && heap_cache_enabled_) {
-        if (HeapCacheGet(key, dst_ptr, size)) return true;
-    }
-
-    if (TryShmCacheReadOne(key, dst_ptr, size)) {
-        if (heap_cache_enabled_)
-            HeapCachePut(key, reinterpret_cast<const void*>(dst_ptr), size);
+    if (TryShmCacheReadOne(key, dst_ptr, size))
         return true;
-    }
 
     uint64_t actual_size = 0;
     auto rc = SubmitAndWait(RequestType::READ, key, nullptr, 0,
                             reinterpret_cast<void*>(dst_ptr), size,
                             &actual_size);
-    if (rc == ResultCode::OK && !cold_read_ && heap_cache_enabled_)
-        HeapCachePut(key, reinterpret_cast<const void*>(dst_ptr), size);
     return rc == ResultCode::OK;
 }
 
@@ -624,12 +604,6 @@ bool SpdkProxyTier::Exists(const std::string& key) const {
 }
 
 bool SpdkProxyTier::Evict(const std::string& key) {
-    auto it = heap_cache_.find(key);
-    if (it != heap_cache_.end()) {
-        heap_cache_bytes_ -= it->second.size;
-        heap_lru_.erase(it->second.lru_pos);
-        heap_cache_.erase(it);
-    }
     auto rc = SubmitAndWait(RequestType::EVICT, key, nullptr, 0, nullptr, 0);
     return rc == ResultCode::OK;
 }
@@ -643,9 +617,6 @@ std::pair<size_t, size_t> SpdkProxyTier::Capacity() const {
 }
 
 void SpdkProxyTier::Clear() {
-    heap_cache_.clear();
-    heap_lru_.clear();
-    heap_cache_bytes_ = 0;
     SubmitAndWait(RequestType::CLEAR, "", nullptr, 0, nullptr, 0);
 }
 
@@ -655,64 +626,7 @@ bool SpdkProxyTier::Flush() {
 }
 
 // ---------------------------------------------------------------------------
-// Per-client heap read cache — analogous to POSIX page cache.
-// Private to each rank process: zero contention, single memcpy on hit.
-// ---------------------------------------------------------------------------
-void SpdkProxyTier::HeapCachePut(const std::string& key,
-                                  const void* data, size_t size) {
-    if (!heap_cache_enabled_ || size == 0) return;
-
-    // Update existing entry (move to front)
-    auto it = heap_cache_.find(key);
-    if (it != heap_cache_.end()) {
-        if (it->second.size == size) {
-            std::memcpy(it->second.data.get(), data, size);
-            heap_lru_.splice(heap_lru_.begin(), heap_lru_, it->second.lru_pos);
-            return;
-        }
-        // Size changed — remove and re-insert
-        heap_cache_bytes_ -= it->second.size;
-        heap_lru_.erase(it->second.lru_pos);
-        heap_cache_.erase(it);
-    }
-
-    // Evict LRU entries until there is room
-    while (heap_cache_bytes_ + size > heap_cache_max_bytes_ && !heap_lru_.empty()) {
-        auto& victim_key = heap_lru_.back();
-        auto vit = heap_cache_.find(victim_key);
-        if (vit != heap_cache_.end()) {
-            heap_cache_bytes_ -= vit->second.size;
-            heap_cache_.erase(vit);
-        }
-        heap_lru_.pop_back();
-    }
-
-    if (size > heap_cache_max_bytes_) return;
-
-    HeapEntry entry;
-    entry.data = std::make_unique<char[]>(size);
-    std::memcpy(entry.data.get(), data, size);
-    entry.size = size;
-
-    heap_lru_.push_front(key);
-    entry.lru_pos = heap_lru_.begin();
-    heap_cache_bytes_ += size;
-    heap_cache_.emplace(key, std::move(entry));
-}
-
-bool SpdkProxyTier::HeapCacheGet(const std::string& key,
-                                  uintptr_t dst, size_t size) const {
-    if (!heap_cache_enabled_) return false;
-    auto it = heap_cache_.find(key);
-    if (it == heap_cache_.end()) return false;
-    if (it->second.size != size) return false;
-    std::memcpy(reinterpret_cast<void*>(dst), it->second.data.get(), size);
-    heap_lru_.splice(heap_lru_.begin(), heap_lru_, it->second.lru_pos);
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// Per-item ShmCache read — ring buffer with seqlock + liveness validation.
+// Per-item ring cache read — ring buffer with seqlock + liveness validation.
 //
 // Protocol:
 //   1. Read index entry gen (must be even & non-zero).
@@ -774,7 +688,7 @@ bool SpdkProxyTier::TryShmCacheReadOne(const std::string& key,
 }
 
 // ---------------------------------------------------------------------------
-// BatchWrite — write-through: send to daemon AND populate heap read cache.
+// BatchWrite — write-through to daemon via ring buffer.
 // ---------------------------------------------------------------------------
 std::vector<bool> SpdkProxyTier::BatchWrite(
     const std::vector<std::string>& keys,
@@ -784,8 +698,7 @@ std::vector<bool> SpdkProxyTier::BatchWrite(
 }
 
 // ---------------------------------------------------------------------------
-// BatchReadIntoPtr — per-item: heap cache → ShmCache → daemon.
-// Heap cache controlled by UMBP_SPDK_READ_CACHE=1 (default OFF).
+// BatchReadIntoPtr — per-item: ring cache → daemon (NVMe).
 // ---------------------------------------------------------------------------
 std::vector<bool> SpdkProxyTier::BatchReadIntoPtr(
     const std::vector<std::string>& keys,
@@ -794,51 +707,32 @@ std::vector<bool> SpdkProxyTier::BatchReadIntoPtr(
     const int count = static_cast<int>(keys.size());
     std::vector<bool> results(count, false);
 
-    // Phase 1: heap cache (skip in cold-read mode)
-    std::vector<int> miss1;
-    miss1.reserve(count);
+    // Phase 1: ring cache (TryShmCacheReadOne returns false in cold-read mode)
+    std::vector<int> misses;
+    misses.reserve(count);
     for (int i = 0; i < count; ++i) {
-        if (!cold_read_ && heap_cache_enabled_ &&
-            HeapCacheGet(keys[i], dst_ptrs[i], sizes[i]))
+        if (TryShmCacheReadOne(keys[i], dst_ptrs[i], sizes[i]))
             results[i] = true;
         else
-            miss1.push_back(i);
+            misses.push_back(i);
     }
-    if (miss1.empty()) return results;
+    if (misses.empty()) return results;
 
-    // Phase 2: ShmCache per-item (TryShmCacheReadOne returns false in cold-read)
-    std::vector<int> miss2;
-    miss2.reserve(miss1.size());
-    for (int i : miss1) {
-        if (TryShmCacheReadOne(keys[i], dst_ptrs[i], sizes[i])) {
-            results[i] = true;
-            if (heap_cache_enabled_)
-                HeapCachePut(keys[i],
-                             reinterpret_cast<const void*>(dst_ptrs[i]), sizes[i]);
-        } else {
-            miss2.push_back(i);
-        }
-    }
-    if (miss2.empty()) return results;
-
-    // Phase 3: daemon (NVMe)
-    std::vector<std::string> m_keys(miss2.size());
-    std::vector<uintptr_t>   m_dst(miss2.size());
-    std::vector<size_t>      m_sizes(miss2.size());
-    for (size_t j = 0; j < miss2.size(); ++j) {
-        int i = miss2[j];
+    // Phase 2: daemon (NVMe)
+    std::vector<std::string> m_keys(misses.size());
+    std::vector<uintptr_t>   m_dst(misses.size());
+    std::vector<size_t>      m_sizes(misses.size());
+    for (size_t j = 0; j < misses.size(); ++j) {
+        int i = misses[j];
         m_keys[j]  = keys[i];
         m_dst[j]   = dst_ptrs[i];
         m_sizes[j] = sizes[i];
     }
     auto m_results = SubmitBatch(RequestType::BATCH_READ,
                                  m_keys, {}, m_dst, m_sizes);
-    for (size_t j = 0; j < miss2.size(); ++j) {
-        int i = miss2[j];
+    for (size_t j = 0; j < misses.size(); ++j) {
+        int i = misses[j];
         results[i] = m_results[j];
-        if (results[i] && !cold_read_ && heap_cache_enabled_)
-            HeapCachePut(keys[i],
-                         reinterpret_cast<const void*>(dst_ptrs[i]), sizes[i]);
     }
     return results;
 }
