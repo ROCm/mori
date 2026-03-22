@@ -562,21 +562,6 @@ static int RunLatencyBench() {
                    sz_label, "ColdRd", count, st.avg_us, st.p50_us, st.p99_us, st.max_us);
         }
 
-        // --- Hot read latency (page cache / ring cache) ---
-        {
-            std::vector<double> samples;
-            samples.reserve(count);
-            for (int i = 0; i < count; ++i) {
-                std::string key = prefix + std::to_string(i);
-                double t0 = NowSec();
-                ssd->ReadIntoPtr(key, dst, vsize);
-                double t1 = NowSec();
-                samples.push_back((t1 - t0) * 1e6);
-            }
-            auto st = ComputeStats(samples);
-            printf("  %8s  %7s  %5d  %10.1f  %10.1f  %10.1f  %10.1f\n",
-                   sz_label, "HotRd", count, st.avg_us, st.p50_us, st.p99_us, st.max_us);
-        }
     }
 
     printf("================================================================\n");
