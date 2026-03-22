@@ -29,6 +29,8 @@
 #include "umbp/common/config.h"
 #include "umbp/local/storage/io/status.h"
 
+namespace mori::umbp {
+
 struct IoWriteOp {
   int fd = -1;
   const void* data = nullptr;
@@ -65,3 +67,5 @@ class StorageIoDriver {
 };
 
 std::unique_ptr<StorageIoDriver> CreateStorageIoDriver(UMBPIoBackend backend, uint32_t queue_depth);
+
+}  // namespace mori::umbp

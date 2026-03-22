@@ -26,7 +26,7 @@
 #include "umbp/local/storage/io/storage_io_driver.h"
 #include "umbp/local/storage/segment/segment_index.h"
 
-namespace segment {
+namespace mori::umbp::segment {
 
 class Scanner {
  public:
@@ -35,4 +35,4 @@ class Scanner {
                        std::string* error_message) const;
 };
 
-}  // namespace segment
+}  // namespace mori::umbp::segment

@@ -153,7 +153,6 @@ add_library(
   ${UMBP_GRPC_SRCS}
   ${UMBP_PEER_PROTO_SRCS}
   ${UMBP_PEER_GRPC_SRCS}
-  distributed/common/types.cpp
   distributed/master/global_block_index.cpp
   distributed/master/client_registry.cpp
   distributed/master/master_server.cpp

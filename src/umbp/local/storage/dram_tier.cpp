@@ -29,6 +29,8 @@
 #include <cstring>
 #include <stdexcept>
 
+namespace mori::umbp {
+
 DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name)
     : TierBackend(StorageTier::CPU_DRAM),
       base_ptr_(nullptr),
@@ -274,3 +276,5 @@ std::string DRAMTier::GetLRUKey() const {
   if (lru_list_.empty()) return "";
   return lru_list_.back();
 }
+
+}  // namespace mori::umbp

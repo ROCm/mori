@@ -32,6 +32,8 @@
 #include "umbp/local/storage/copy_pipeline.h"
 #include "umbp/local/storage/local_storage_manager.h"
 
+namespace mori::umbp {
+
 class UMBPClient {
  public:
   explicit UMBPClient(const UMBPConfig& config = UMBPConfig{});
@@ -77,3 +79,5 @@ class UMBPClient {
   LocalStorageManager storage_;
   std::unique_ptr<CopyPipeline> copy_pipeline_;
 };
+
+}  // namespace mori::umbp

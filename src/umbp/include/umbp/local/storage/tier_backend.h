@@ -29,6 +29,8 @@
 
 #include "umbp/common/storage_tier.h"
 
+namespace mori::umbp {
+
 struct TierCapabilities {
   bool zero_copy_read = false;
   bool batch_write = false;
@@ -100,3 +102,5 @@ class TierBackend {
  private:
   StorageTier tier_id_;
 };
+
+}  // namespace mori::umbp

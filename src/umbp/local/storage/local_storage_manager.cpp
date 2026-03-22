@@ -27,6 +27,8 @@
 #include "umbp/local/storage/dram_tier.h"
 #include "umbp/local/storage/ssd_tier.h"
 
+namespace mori::umbp {
+
 // ---------------------------------------------------------------------------
 // ExtractBaseHash
 //
@@ -716,3 +718,5 @@ void LocalStorageManager::Clear() {
   depth_map_.clear();
   group_map_.clear();
 }
+
+}  // namespace mori::umbp

@@ -32,6 +32,8 @@
 
 #include "umbp/local/storage/tier_backend.h"
 
+namespace mori::umbp {
+
 // DRAM Tier: mmap pre-allocated large memory block with offset allocator
 class DRAMTier : public TierBackend {
  public:
@@ -97,3 +99,5 @@ class DRAMTier : public TierBackend {
   void EvictLRU();                              // Evict least recently used
   void TouchLRU(const std::string& key);        // Update LRU position
 };
+
+}  // namespace mori::umbp

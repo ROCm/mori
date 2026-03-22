@@ -37,6 +37,8 @@
 #include "umbp/local/storage/segment/segment_writer.h"
 #include "umbp/local/storage/tier_backend.h"
 
+namespace mori::umbp {
+
 enum class SSDAccessMode : int {
   ReadWrite = 0,
   ReadOnlyShared = 1,
@@ -98,3 +100,5 @@ class SSDTier : public TierBackend {
   std::unique_ptr<segment::Writer> writer_;
   mutable IoStatus last_io_status_;
 };
+
+}  // namespace mori::umbp

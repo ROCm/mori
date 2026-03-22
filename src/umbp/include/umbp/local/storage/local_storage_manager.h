@@ -32,6 +32,8 @@
 #include "umbp/local/block_index/local_block_index.h"
 #include "umbp/local/storage/tier_backend.h"
 
+namespace mori::umbp {
+
 class LocalStorageManager {
  public:
   // index may be nullptr if index updates are not needed (testing).
@@ -128,3 +130,5 @@ class LocalStorageManager {
 
   void MaybeAutoPromote(const std::string& key);
 };
+
+}  // namespace mori::umbp

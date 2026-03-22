@@ -29,7 +29,7 @@
 #include "umbp/local/storage/segment/segment_format.h"
 #include "umbp/local/storage/segment/segment_index.h"
 
-namespace segment {
+namespace mori::umbp::segment {
 
 struct PreparedRecord {
   std::vector<char> record;
@@ -55,4 +55,4 @@ class Writer {
   StorageIoDriver& io_driver_;
 };
 
-}  // namespace segment
+}  // namespace mori::umbp::segment

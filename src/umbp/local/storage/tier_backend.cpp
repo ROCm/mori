@@ -21,6 +21,8 @@
 // SOFTWARE.
 #include "umbp/local/storage/tier_backend.h"
 
+namespace mori::umbp {
+
 bool TierBackend::WriteFromPtr(const std::string& key, uintptr_t src_ptr, size_t size) {
   return Write(key, reinterpret_cast<const void*>(src_ptr), size);
 }
@@ -55,3 +57,5 @@ std::vector<std::string> TierBackend::GetLRUCandidates(size_t max_candidates) co
   if (lru.empty()) return {};
   return {lru};
 }
+
+}  // namespace mori::umbp

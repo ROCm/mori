@@ -23,6 +23,8 @@
 
 #include <stdexcept>
 
+namespace mori::umbp {
+
 UMBPConfig UMBPClient::NormalizeConfig(const UMBPConfig& config) {
   UMBPConfig normalized = config;
   normalized.role = config.ResolveRole();
@@ -275,3 +277,5 @@ void UMBPClient::Clear() {
 mori::umbp::LocalBlockIndex& UMBPClient::Index() { return index_; }
 
 LocalStorageManager& UMBPClient::Storage() { return storage_; }
+
+}  // namespace mori::umbp
